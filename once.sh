@@ -14,11 +14,11 @@ this=$(basename $This)
 
 once.version()              # prints out the hard coded version tag of $This | to update the script use e.g. once update here http://192.168.178.49:8080
 {
- console.log "$0 version: 20210813 13:14"
+ console.log "$0 version: 20211007 17:56"
 }
 
 if ! [ -x "$(command -v warn.log)" ]; then
-    echo "no warn.log.... mitigated using internal functions...status: ok"
+    #echo "no warn.log.... mitigated using internal functions...status: ok"
     silentDebug.log() {
         if [ "ON" = "$DEBUG" ]; then
             #test -t 1 && tput setf 7     
@@ -67,10 +67,10 @@ if ! [ -x "$(command -v warn.log)" ]; then
 fi
 
 if [ -x "$(command -v debug)" ]; then
-  echo "sourcing $(which debug)"
+  #echo "sourcing $(which debug)"
   source debug
   export STEP_DEBUG=OFF
-  warn.log "DEBUG is $DEBUG"  
+  #warn.log "DEBUG is $DEBUG"  
 else
   debug.version()              # prints out the hard coded version tag of $This 
   {
@@ -396,12 +396,15 @@ once.discover()             # discovers the environment the current once instanc
   startDir=$(pwd)
 
   once.isInDocker
+  once.v
   
   echo "Once.discover:
   current shell : $SHELL  (level $(($SHLVL/2)))
           script: $0
+          args  : $@
           dir   : $startDir
           home  : $USERHOME
+
         hostname: $HOSTNAME
           type  : $HOSTTYPE
           OS    : $OSTYPE"
@@ -416,47 +419,107 @@ once.discover()             # discovers the environment the current once instanc
       #console.log "emergency read once state from user home"
       if [ -f ~/.once ]; then
         source ~/.once
+        local result=$?
+        if [ $result -ne 0 ]; then
+          error.log "sourcing .once failed: $result"
+          exit $result
+        fi
       else
-        once.stage not.installed $@
-
+        once.stage state.not.installed $@
       fi
   fi
 
 
   if [ -f $ONCE_DEFAULT_SCENARIO/.once ]; then
 	  source $ONCE_DEFAULT_SCENARIO/.once
+    local result=$?
+    if [ $result -ne 0 ]; then
+      error.log "sourcing .once failed: $result"
+      exit $result
+    fi
+    cd $ONCE_REPO_PREFIX/$ONCE_REPO_NAME
     echo "          PM    : $ONCE_PM
+
+          repo  : $ONCE_REPO_PREFIX/$ONCE_REPO_NAME
+          branch: $(git branch --contains HEAD)
     "
 	  console.log "Once.init with: $ONCE_DEFAULT_SCENARIO/.once"
     once.update.variables
     #console.log "once stage to: $ONCE_STATE"
 	  #once.stage $ONCE_STATE 
-    stop.log "ONCE_DOMAIN=$ONCE_DOMAIN"
+    #stop.log "ONCE_DOMAIN=$ONCE_DOMAIN"
   else
-    once stage not.installed $@
+    if [ "$1" = "startlog" ]; then
+      once.startlog
+    else
+      once.stage state.not.installed $@
+    fi
     #once.init "$@"
     #once.stage
   fi
   #checkAndFix "is privileged" " ~ = '/root' " "" "ONCE_PRIVILIDGE=root"
 }
 
-once.not.installed()
+once.state.not.installed()
 {
         console.log "no .once nor sceanrio discovered: exiting!   ($1)"
         console.log "To INSTALL once please run: once init"
-        if [ "$1" = "init" ]; then
-          shift
-          #stop.log "now going to once.init"
-          once.init "$@"
-        else
-          if [ "$1" = "" ]; then
+        case $1 in
+          init)
+            shift
+            #stop.log "now going to once.init"
+            once.init "$@"
+            once.check.privileges
+            warn.log "returned form: once.check.privileges   .... should EXIT now after: once start"
+            #set -x
+            links.fix
+            #set +x
+            
+            docker network connect once-woda-network $(hostname)
+            stop.log "type once test"  #whitespace is totally important
+            cd 
+            bash
+
+            exit 1
+            ;;
+          docker.build)
+            shift
+            #stop.log "now going to once.init"
+
+            once.init
+            once.check.privileges
+            warn.log "returned form: once.check.privileges   .... should EXIT now after: once docker.build"
+            exit 0
+            ;;
+          start)
+            shift
+            #stop.log "now going to once.init"
+            once.docker.woda
+            exit 1
+            ;;
+          docker.woda.start)
+            shift
+            #stop.log "now going to once.init"
+            #once.links.fix
+            
+            #once.scenario.fix 
+            #once.docker.postgesql.start
+            once.docker.woda.start
+            
+            #docker run woda-nodejs:16.x
+            exit 1
+            ;;
+          
+          *)
+            if [ "$1" = "" ]; then
+              rm ~/.once
+              exit 1 
+            fi
+            once.stage $@
             rm ~/.once
-            exit 1 
-          fi
-          once.stage $@
-          rm ~/.once
-          exit 1
-        fi
+            exit 1
+            ;;
+        esac
 }
 
 once.v()                    # prints out the current version of once - alias for once version 
@@ -518,12 +581,12 @@ once.localhost.certificates() # creates localhost cerifikates for the Once Serve
   mkcert -cert-file once.cert.pem -key-file once.key.pem -p12-file once.pfx  server.localhost localhost 127.0.0.1 ::1
 }
 
-once.scu()
-{
-  once.copy.cerbot.certificates "$1"
-  shift
-  RETURN=$1
-}
+# once.scu()
+# {
+#   once.copy.cerbot.certificates "$1"
+#   shift
+#   RETURN=$1
+# }
 
 once.copy.cerbot.certificates()
 {
@@ -537,8 +600,8 @@ once.copy.cerbot.certificates()
   checkAndFix "delete once.cert.pem" -f "once.cert.pem" "rm once.cert.pem" 
   checkAndFix "delete once.key.pem" -f "once.key.pem" "rm once.key.pem" 
 
-  checkAndFix "$hostname once.cert.pem" -L "once.cert.pem" "ln -s ../../Docker/CertBot/1.7.0/config/conf/archive/$hostname/cert1.pem once.cert.pem" 
-  checkAndFix "$hostname once.key.pem" -L "once.key.pem" "ln -s ../../Docker/CertBot/1.7.0/config/conf/archive/$hostname/privkey1.pem once.key.pem" 
+  checkAndFix "$hostname once.cert.pem" -L "once.cert.pem" "ln -s ../../Docker/CertBot/1.7.0/config/conf/live/$hostname/cert.pem once.cert.pem" 
+  checkAndFix "$hostname once.key.pem" -L "once.key.pem" "ln -s ../../Docker/CertBot/1.7.0/config/conf/live/$hostname/privkey.pem once.key.pem" 
 }
 
 
@@ -620,7 +683,7 @@ once.help()                 # prints a list of all commands for once
   if [ -n "$detail" ]; then
     shift
   fi
-  grep "^once\.$detail.*()" $This | sort
+  grep "^once\.$detail.*()" $This | sed 's/^\(once\.\)\(.*\)/\2/' | sort
 }
 
 once.superuser()            # prints a list of all the advanced superuser functions in once.sh
@@ -630,12 +693,12 @@ once.superuser()            # prints a list of all the advanced superuser functi
     shift
   fi
   console.log "This are the advanced funtions for superusers in $This:"
-  grep "^function once\.$detail.*()" $This | sort
+  grep "^function once\.$detail.*()" $This | sed 's/^\(function once\.\)\(.*\)/\2/' | sort
   #exit 0
 }
 once.su()                   # alias to once.superuser to list advanced functions ot $This
 {
-  once.superuser
+  once.superuser "$@"
 }
 
 function checkAndFix()      # checkes and fixing/adding files
@@ -681,6 +744,7 @@ once.cmd()                  # checks if the <command> is available or is being i
           case $current in
             eamd)
               once.load $current tla/EAMD/UcpComponentSupport/1.0.0/src/sh/eamd
+              export PATH=$PATH:$ONCE_LOAD_DIR
               hash -d eamd    #clears the command cache for eamd
               #hash -r   #clears the command cache completley
               ;;
@@ -698,6 +762,9 @@ once.cmd()                  # checks if the <command> is available or is being i
               ;;
             mkcert)
               once.mkcert.install
+              ;;
+            update)
+              apt-get update
               ;;
             *)
               $ONCE_PM $package
@@ -721,6 +788,8 @@ once.load()                 # loads ONCE Object Oriented SHell components (scrip
     rm $1.*
     console.log "WARNING: the file is already downloaded: $ONCE_LOAD_DIR/$1"
     console.log "Please add it to the PATH with running:   . once path"
+    PATH=$PATH:$ONCE_LOAD_DIR
+    hash -d eamd
   else
     #once.path
     once.cmd wget
@@ -738,6 +807,7 @@ once.load()                 # loads ONCE Object Oriented SHell components (scrip
 
 function once.npm.install() 
 {
+      once.cmd curl
       curl -sL https://deb.nodesource.com/setup_16.x | bash -
       $ONCE_PM nodejs
       once.npm.update.shell
@@ -805,26 +875,246 @@ function once.pm()                   # calls package manager
   RETURN=$1
 }
 
+once.scenario()
+{
+  once.scenario.check
+  tree -L 6 $ONCE_SCENARIO
+} 
+
+once.scenario.create()    # creates a Scenario directory in the current $ONCE_SCENARIO
+{
+  scenarioName=$1
+  shift
+
+  if [ -n "$1" ]; then
+    scenarioVersion=$1
+    shift
+  else
+    scenarioVersion=1.0.0
+  fi
+
+  if [ -n "$1" ]; then
+    scenarioPath=$1.$scenarioVersion
+    shift
+  else
+    warn.log "no scenarioPath specified"
+    RETURN=$1
+    return 1
+  fi
+  
+  if [ -n "$1" ]; then
+    scenarioImage=$1
+    shift
+  else
+    scenarioImage=$scenarioName-image:$scenarioVersion
+  fi
+
+  if [ -n "$1" ]; then
+    scenarioContainer=$1
+    shift
+  else
+    scenarioContainer=$scenarioName-app:$scenarioVersion
+
+  fi
+
+
+
+  once.scenario.map.load
+
+  let i=${#SCENARIO_MAP_KEYS[@]}
+
+  SCENARIO_MAP_KEYS[$i]=${scenarioName}
+  SCENARIO_MAP_VERSION[$i]=${scenarioVersion}
+  SCENARIO_MAP_DC_NAME[$i]=${scenarioContainer}
+  SCENARIO_MAP_DI_NAME[$i]=${scenarioImage}
+  SCENARIO_MAP_VALUES[$i]=${scenarioPath}
+  
+  once.scenario.map.save      
+
+  if [ -n "$scenarioPath" ]; then
+    console.log "create Scenario: $ONCE_SCENARIO/$scenarioPath/$scenarioName.$scenarioVersion"
+    once.path.create $ONCE_SCENARIO/$scenarioPath/$scenarioName.$scenarioVersion
+
+  else 
+    warn.log "no scenarioPath provided"
+  fi
+  
+  RETURN=$1
+}
+
+once.scenario.map.save() 
+{
+
+  once.scenario.map.load
+
+  cd $ONCE_DEFAULT_SCENARIO
+  {
+    for (( i=0; $i < "${#SCENARIO_MAP_KEYS[@]}"; i+=1 )); do
+      echo  SCENARIO_MAP_KEYS[$i]=${SCENARIO_MAP_KEYS[$i]}
+      echo  SCENARIO_MAP_VERSION[$i]=${SCENARIO_MAP_VERSION[$i]}
+      echo  SCENARIO_MAP_DC_NAME[$i]=${SCENARIO_MAP_DC_NAME[$i]}
+      echo  SCENARIO_MAP_DI_NAME[$i]=${SCENARIO_MAP_DI_NAME[$i]}
+      echo  SCENARIO_MAP_VALUES[$i]=${SCENARIO_MAP_VALUES[$i]}
+      echo
+    done 
+  } >scenario.map
+}
+
+once.scenario.map.list() 
+{
+  once.scenario.map.load
+  cat $ONCE_DEFAULT_SCENARIO/scenario.map
+}
+
+once.scenario.map.edit() 
+{
+  once.scenario.map.load
+  vim $ONCE_DEFAULT_SCENARIO/scenario.map
+}
+
+once.scenario.map.load() 
+{
+  if [ -f "$ONCE_DEFAULT_SCENARIO/scenario.map" ]; then
+    source $ONCE_DEFAULT_SCENARIO/scenario.map
+  else
+    once.scenario.map.init
+  fi
+}
+once.scenario.map.delete() 
+{
+  if [ -f "$ONCE_DEFAULT_SCENARIO/scenario.map" ]; then
+    rm $ONCE_DEFAULT_SCENARIO/scenario.map
+  fi
+}
+
+once.scenario.map.init() {
+  #declare -a SCENARIO_MAP_KEYS
+  #declare -a SCENARIO_MAP_VALUES
+  SCENARIO_MAP_KEYS[0]=pg
+  SCENARIO_MAP_VERSION[0]="12.2"
+  SCENARIO_MAP_DC_NAME[0]="once-postgresql"
+  SCENARIO_MAP_DI_NAME[0]="postgresql:${SCENARIO_MAP_VERSION[0]}" 
+  SCENARIO_MAP_VALUES[0]="/EAM/1_infrastructure/Once/latestServer/PostgreSQL.${SCENARIO_MAP_VERSION[0]}"
+  
+  SCENARIO_MAP_KEYS[1]=pgadmin
+  SCENARIO_MAP_VALUES[1]="/EAM/1_infrastructure/Docker/pgAdmin.4.18/" 
+  
+  SCENARIO_MAP_KEYS[2]=woda
+  SCENARIO_MAP_VERSION[2]="4.3.0"
+  SCENARIO_MAP_DC_NAME[2]="woda"
+  SCENARIO_MAP_DI_NAME[2]="woda-nodejs:16.x" 
+  SCENARIO_MAP_VALUES[2]="/EAM/2_systems/WODA.${SCENARIO_MAP_VERSION[2]}" 
+
+  SCENARIO_MAP_KEYS[3]=cert
+  SCENARIO_MAP_VALUES[3]="/EAM/1_infrastructure/Docker/CertBot/1.7.0"
+
+  SCENARIO_MAP_KEYS[4]=pgv
+  SCENARIO_MAP_VERSION[4]="12.2"
+  SCENARIO_MAP_DC_NAME[4]="once-postgresql"
+  SCENARIO_MAP_DI_NAME[4]="postgresql:${SCENARIO_MAP_VERSION[0]}" 
+  SCENARIO_MAP_VALUES[4]="/EAM/1_infrastructure/Once/latestServer/PostgreSQLv.${SCENARIO_MAP_VERSION[0]}" 
+
+  #declare -a
+}
+
+function once.scenario.map() {
+  scenarioName=$1
+  shift
+
+  if [ -z "$scenarioName" ] &&  [ "$scenarioName" = "$SELECTED_SCENARIO" ]; then
+      echo Scenario $scenarioName in $ONCE_SCENARIO$SELECTED_SCENARIO
+      cd $ONCE_SCENARIO$SELECTED_SCENARIO
+      return 0
+  fi
+
+  once.scenario.map.load
+
+  found="not found"
+  let i=0
+  for index in "${SCENARIO_MAP_KEYS[@]}"; do
+    #echo looping ${SCENARIO_MAP_KEYS[$index]}  at $i
+    if [ "$scenarioName" == "${SCENARIO_MAP_KEYS[$i]}" ]; then
+      found=$i
+      #echo found at $i
+      break;
+    fi
+    let i++
+  done
+
+  if [ "$found" = "not found" ]; then
+    warn.log "Scenario \"$scenarioName\" not found!!!"
+    return 1
+  else
+  
+    echo Select Scenario \'$scenarioName\' Path:  ${SCENARIO_MAP_VALUES[$found]}
+    SELECTED_SCENARIO_NAME=${scenarioName}
+    SELECTED_SCENARIO=${SCENARIO_MAP_VALUES[$found]}
+    SELECTED_SCENARIO_VERSION=${SCENARIO_MAP_VERSION[$found]}
+    SELECTED_SCENARIO_DC_NAME=${SCENARIO_MAP_DC_NAME[$found]}
+    SELECTED_SCENARIO_DI_NAME=${SCENARIO_MAP_DI_NAME[$found]}
+
+    once.path.create $ONCE_SCENARIO$SELECTED_SCENARIO
+    cd $ONCE_SCENARIO$SELECTED_SCENARIO
+    #ls -al
+    RETURN=$1
+  fi
+
+}
+
+once.scenario.delete()    # creates a Scenario directory in the current $ONCE_SCENARIO
+{
+  local scenarioPath=$1
+  shift
+  local assurance=$1
+  shift
+
+  if [ -n "$scenarioPath" ]; then
+    tree $ONCE_SCENARIO/$scenarioPath
+    if [ -z "$assurance" ]; then
+      assurance=echo
+      warn.log "second parameter has to be \"yes\" or it will only preview the deletion command"
+    else
+      unset assurance
+    fi
+    $assurance rm -r $ONCE_SCENARIO/$scenarioPath
+  else 
+    warn.log "no scenarioPath provided"
+  fi
+  
+  RETURN=$1
+}
 
 once.scenario.check()     # prints out the current set scenario without changing it
 {
   if [ -z "$ONCE_DEFAULT_SCENARIO" ]; then
+    if [ -z "$SCENARIOS_DIR" ]; then
+      SCENARIOS_DIR=/var/dev/EAMD.ucp/Scenarios
+      ONCE_SCENARIO=$SCENARIOS_DIR/localhost
+    fi
     console.log "Setting ONCE_DEFAULT_SCENARIO to: $SCENARIOS_DIR/localhost/EAM/1_infrastructure/Once/latestServer"
     export ONCE_DEFAULT_SCENARIO=$SCENARIOS_DIR/localhost/EAM/1_infrastructure/Once/latestServer
+    console.log "Current ONCE_DEFAULT_SCENARIO                   is: $ONCE_DEFAULT_SCENARIO"
+    console.log "        ONCE_SCENARIO                           is: $ONCE_SCENARIO"
+
     once.hibernate update
   else
-    console.log "Current ONCE_DEFAULT_SCENARIO is: $ONCE_DEFAULT_SCENARIO"
-    console.log "        ONCE_SCENARIO         is: $ONCE_SCENARIO"
+    console.log "Current ONCE_DEFAULT_SCENARIO                   is: $ONCE_DEFAULT_SCENARIO"
+    console.log "        ONCE_SCENARIO                           is: $ONCE_SCENARIO"
+    
+    warn.log " ONCE_DEFAULT_SCENARIO_DOCKER is deprecated: $ONCE_DEFAULT_SCENARIO_DOCKER"
   fi
 }
 
 once.scenario.fix()        # if the scenario is not correct you can force it to update with this command. First parameter is the optional domain e.g. test.wo-da.de
 {
   once.scenario.check
+  OLD_SCENARIO=$ONCE_DEFAULT_SCENARIO
+  once.scenario.discover $1
 
-  once.scenario $1
-  if [ -n "ONCE_SCENARIO" ]; then
-      ONCE_SCENARIO=$SCENARIOS_DIR/$(cat $ONCE_DEFAULT_SCENARIO/once.scenario)
+  if [ -n "$SCENARIOS_DIR" ]; then
+      ONCE_SCENARIO=$SCENARIOS_DIR/$(cat $OLD_SCENARIO/once.scenario)
+  else
+      ONCE_SCENARIO=/var/dev/EAMD.ucp/Scenarios/$(cat ./once.scenario)
   fi 
   stop.log    "NEW current ONCE_DEFAULT_SCENARIO is: $ONCE_DEFAULT_SCENARIO"
   console.log "                   ONCE_SCENARIO         is: $ONCE_SCENARIO"
@@ -832,7 +1122,7 @@ once.scenario.fix()        # if the scenario is not correct you can force it to 
   once.hibernate update
 }
 
-once.scenario()             # forces re-discovery of the current environment and scenario configuration, but does not change settings (use scenario.fix to change settings) 
+once.scenario.discover()             # forces re-discovery of the current environment and scenario configuration, but does not change settings (use scenario.fix to change settings) 
 {
   once.cmd eamd
   #once.path
@@ -913,17 +1203,208 @@ function once.check.installation()   # checks for a once installation in given p
 
   fi
   
-  once.stage installed
+  once.stage state.installed
 }
 
-function once.installed()            # prints where the repository has been installed 
+function once.state.installed()            # prints where the repository has been installed 
 {
 
+  #once.cmd nslookup dnsutils
+  #once.cmd telnet inetutils-telnet
+  export DEBIAN_FRONTEND=noninteractive
+  apt install -y dnsutils
+  apt install -y inetutils-telnet
+  apt install -y inetutils-ping
+
+  once.docker.install
+  once.cmd npm
+
   console.log "Repository is installed at: $ONCE_REPO_PREFIX/$ONCE_REPO_NAME"
-  once.stage server.start
+  #once.stage server.start
+  once.ca
+  once.cu
+
+  once.docker.postgresql.createdc
+  once.docker.postgresql.start
+
+  apt-get install sudo
+  #once.user.developer
+  #chown developer:dev /var/run
+  #chown developer:dev /var/run/docker.sock
+
+  #docker network connect once-postgresql $HOSTNAME
+
+  once.bind.docker
+  cp /var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/NewUserStuff/scripts/templates/.bashrc ~/.bashrc
+  #once.user.rc.fix
+  once.completion.install
+
+  #set password for developer with
+  # root> passwd developer (default is dev)
+  once.status
+
+  console.log "Once is installed and ready for: once start    ....now testing"
+  #once.stage test
+  echo once test
+  
 }
 
-function once.build.successful() 
+function once.bind.docker() 
+{
+  if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "in docker....making everything localhost"
+    export ONCE_DIRECT_HTTPS_URL=https://localhost:8443
+    export ONCE_DEFAULT_URL=https://localhost:8443
+    
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@once-postgresql:5432/oncestore
+    export ONCE_DEFAULT_UDE_STORE=https://localhost:8443
+
+    export ONCE_STRUCTR_SERVER=https://test.wo-da.de:8083
+    once.hibernate update
+  fi
+    RETURN=$1
+}
+
+function once.bind.local() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "in docker....making everything localhost"
+    export ONCE_DIRECT_HTTPS_URL=https://localhost:8443
+    export ONCE_DEFAULT_UDE_STORE=https://localhost:8443
+    
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@localhost:5433/oncestore
+    export ONCE_DEFAULT_URL=https://localhost:8443
+    
+    export ONCE_STRUCTR_SERVER=https://test.wo-da.de:8083
+    once.hibernate update
+  #fi
+    RETURN=$1
+}
+
+function once.bind.structr.local() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "in docker....making everything localhost"
+    export ONCE_DIRECT_HTTPS_URL=https://localhost:8443
+    export ONCE_DEFAULT_UDE_STORE=https://localhost:8443
+    
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@localhost:5433/oncestore
+    export ONCE_DEFAULT_URL=https://localhost:8443
+    
+    export ONCE_STRUCTR_SERVER=https://localhost:8082
+    once.hibernate update
+  #fi
+    RETURN=$1
+}
+
+function once.bind.structr.test() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "in docker....making everything localhost"
+
+    export ONCE_STRUCTR_SERVER=https://test.wo-da.de:8083
+    once.hibernate update
+  #fi
+    RETURN=$1
+}
+
+
+function once.bind.structr.proxy.local() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "in docker....making everything localhost"
+    export ONCE_DIRECT_HTTPS_URL=https://localhost:8443
+    export ONCE_DEFAULT_UDE_STORE=https://localhost:8443
+    
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@localhost:5433/oncestore
+    export ONCE_DEFAULT_URL=https://localhost:8443
+    
+    export ONCE_REVERSE_PROXY_CONFIG='[["auth","test.wo-da.de"],["snet","test.wo-da.de"],["structr","localhost:8082"]]'
+    export ONCE_STRUCTR_SERVER=http://localhost:5002
+    once.hibernate update
+  #fi
+    RETURN=$1
+}
+
+function once.bind.structr.proxy.http.test() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "for localhost only....using http reverse proxy for structr on localhost"
+    export ONCE_DIRECT_HTTPS_URL=https://localhost:8443
+    export ONCE_DEFAULT_UDE_STORE=https://localhost:8443
+    
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@localhost:5433/oncestore
+    export ONCE_DEFAULT_URL=https://localhost:8443
+    
+    export ONCE_REVERSE_PROXY_CONFIG='[["auth","test.wo-da.de"],["snet","test.wo-da.de"],["structr","test.wo-da.de"]]'
+    export ONCE_STRUCTR_SERVER=http://localhost:5002
+    once.hibernate update
+  #fi
+    RETURN=$1
+}
+
+function once.bind.structr.proxy.https.test() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "for localhost only....using https reverse proxy for structr on test.wo-da.de"
+    export ONCE_DIRECT_HTTPS_URL=https://localhost:8443
+    export ONCE_DEFAULT_UDE_STORE=https://localhost:8443
+    
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@localhost:5433/oncestore
+    export ONCE_DEFAULT_URL=https://localhost:8443
+    
+    export ONCE_REVERSE_PROXY_CONFIG='[["auth","test.wo-da.de"],["snet","test.wo-da.de"],["structr","test.wo-da.de"]]'
+    export ONCE_STRUCTR_SERVER=https://localhost:5005
+    once.hibernate update
+  #fi
+    RETURN=$1
+}
+
+function once.bind.Q.test() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "for localhost only....using https reverse proxy for structr on test.wo-da.de and auth for woda.q-nnect.com"
+    export ONCE_DIRECT_HTTPS_URL=https://test.wo-da.de:8443
+    export ONCE_DEFAULT_UDE_STORE=https://test.wo-da.de:8443
+    
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@localhost:5433/oncestore
+    export ONCE_DEFAULT_URL=https://localhost:8443
+    
+    export ONCE_REVERSE_PROXY_CONFIG='[["auth","woda.q-nnect.com"],["snet","test.wo-da.de"],["structr","test.wo-da.de"]]'
+    export ONCE_STRUCTR_SERVER=https://localhost:5005
+    once.hibernate update
+  #fi
+    RETURN=$1
+}
+
+function once.bind.test() 
+{
+  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
+    warn.log "in docker....binidng DB and Structr on test.wo-da.de"
+    export ONCE_DIRECT_HTTPS_URL=https://test.wo-da.de:8443
+    export ONCE_DEFAULT_URL=https://test.wo-da.de
+
+    export ONCE_POSTGRES_CONNECTION_STRING=postgresql://root:qazwsx123@test.wo-da.de:5433/oncestore
+    export ONCE_DEFAULT_UDE_STORE=https://test.wo-da.de
+
+    export ONCE_STRUCTR_SERVER=https://test.wo-da.de:8083
+    once.hibernate update
+  #fi
+      RETURN=$1
+}
+
+once.server.config()
+{
+  once.$1
+  shift
+  RETURN=$1
+}
+function once.server.config.completion()
+{
+  once.completion.discover $1 su #| sed 's/\(bind\.\)\(.*\)/\2/'
+}
+
+function once.state.build.successful() 
 {
   console.log "BUILD successfull, not starting once"
 }
@@ -936,18 +1417,22 @@ function once.build.successful()
 
 function once.server.start()         # starts the once server if not already up and running
 {
+  stop.log "current state is: $ONCE_STATE"
+  if [ "$ONCE_STATE" = "state.not.installed" ]; then
+    once.init
+  fi
   once.isInDocker
   console.log "once start in mode $ONCE_MODE with option $@"
 
   if [ "$ONCE_BUILD" = "BUILDING" ]; then
     unset ONCE_BUILD
-    once.stage build.successful
+    once.stage state.build.successful
     exit 0
   fi
 
   if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
     if [ -f /.dockerenv ]; then
-      once.server.start.inDocker
+      once.server.start.inDocker "$@"
       return
     else
       once.server.start.docker
@@ -979,6 +1464,7 @@ function once.server.start.local()
   if [ -n "$ONCE_SERVER_PID" ]; then
     if [ "$1" != "new" ]; then  
       console.log "Server is already up: $ONCE_SERVER_PID";
+      once.hibernate update
       once.cat
       shift
       RETURN=$1
@@ -1008,13 +1494,14 @@ function once.server.start.local()
 }
 function once.server.start.docker()
 {
-  cd $COMPONENTS_DIR/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/1.0.0/Alpine/3.13.2/Nodejs/14
-  console.log "Starting Once Server in: $(pwd)"
-  runDocker
+  #cd $COMPONENTS_DIR/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/1.0.0/Alpine/3.13.2/Nodejs/14
+  #console.log "Starting Once Server in: $(pwd)"
+  #runDocker
+  once.docker.woda.start
 }
 function once.server.start.inDocker()
 {
-  once.server.start.local
+  once.server.start.local "$@"
 }
 
 function once.server.stop()          # stops the server 
@@ -1049,9 +1536,10 @@ function once.server.stop()          # stops the server
 
 function once.server.stop.docker()   
 {
-  cd $COMPONENTS_DIR/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/1.0.0/Alpine/3.13.2/Nodejs/14
-  console.log "stoping Once Server Docker Container from: $(pwd)"
-  docker-compose stop
+  #cd $COMPONENTS_DIR/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/1.0.0/Alpine/3.13.2/Nodejs/14
+  #console.log "stoping Once Server Docker Container from: $(pwd)"
+  #docker-compose stop
+  once.docker.woda.stop
 }
 
 function once.server.stop.process()          # stops the server 
@@ -1060,13 +1548,20 @@ function once.server.stop.process()          # stops the server
     console.log "Setting Once Server PID to: $1"
     ONCE_SERVER_PID=$1
   fi
-  console.log "Stopping Once Server with PID: $ONCE_SERVER_PID"
   
-  kill -SIGTERM $ONCE_SERVER_PID
-  
-  ONCE_STATE=check.installation
-  ONCE_SERVER_PID=
-  once.hibernate update
+  if [ -n "$ONCE_SERVER_PID" ]; then
+    console.log "Stopping Once Server with PID: $ONCE_SERVER_PID"
+    
+    kill -SIGTERM $ONCE_SERVER_PID
+    
+    ONCE_STATE=check.installation
+    ONCE_SERVER_PID=
+    once.hibernate update
+  else
+    warn.log  "no Server PID found: $ONCE_SERVER_PID"
+    once.find
+    docker ps
+  fi
 }
 once.state()                # lists the current state of the once server and the current configuration alias to once state 
 {
@@ -1091,6 +1586,32 @@ once.state()                # lists the current state of the once server and the
   Once Server is down...
     ";
   fi
+}
+
+once.states()
+{
+  declare -ar ONCE_STATES='(\
+  [0]="init" \ 
+  [1]="user" \
+  [2]="user.installation" \
+  [2]="user.installation.checked" \
+  [3]="user.not.installed" \
+  [4]="user.repo.installed" \
+  [5]="user.installed" \
+  [11]="root" \
+  [12]="root.installation" \
+  [12]="root.installation.checked" \
+  [13]="root.not.installed" \
+  [14]="root.repo.installed" \
+  [15]="root.installed" \
+  [20]="scenario.updated" \
+  [21]="db.started" \
+  [22]="once.tested" \
+  [23]="once.test.stoped" \
+  [24]="once.started" \
+  [25]="once.stoped" \
+  [26]="db.stoped" \
+  )' 
 }
 
 once.server()
@@ -1139,17 +1660,19 @@ function once.check.privileges()     # checks the administrative rights of the c
 {
 
   if [ "$USERHOME" != "/root" ]; then
-    once.stage user
+    once.stage state.user
   else
-    once.stage root
+    once.stage state.root
   fi
   once.update.variables
   once.hibernate update
 
+  warn.log "check.priviledges done: stahe to $ONCE_STATE"
   once.stage
+  warn.log "END of check.priviledges"
 }
 
-function once.root()                 # populates the environmental variables with root administrative rights 
+function once.state.root()                 # populates the environmental variables with root administrative rights 
 {
     ONCE_PRIVILEGE=root
     ONCE_REPO_PREFIX=/var/dev
@@ -1161,7 +1684,7 @@ function once.root.installation()    # installs the repo as root user
   once.check.installation
 }
 
-function once.user()                 # populates the environmental variables with user administrative rights 
+function once.state.user()                 # populates the environmental variables with user administrative rights 
 {
     ONCE_PRIVILEGE=user
     ONCE_REPO_PREFIX=$USERHOME/dev
@@ -1169,17 +1692,22 @@ function once.user()                 # populates the environmental variables wit
     if [ -z "ONCE_SUDO" ]; then 
       ONCE_SUDO="sudo"
     fi
-    ONCE_PM="sudo $ONCE_PM"
+    ONCE_PM="$ONCE_SUDO $ONCE_PM"
 
 }
 
-once.user.developer() 
+function once.user.developer() # creates the user developer:dev with th discovered UID and GID from the host user
 {
-  if [ -d $REPO_DIR ]; then
+  if [ ! -d $REPO_DIR ]; then
     once.user.discover
     case $custom_uid in
       root)
         warn.log "$REPO_DIR is owned by root"
+        
+        groupadd dev
+        once.user.create developer
+        $ONCE_SUDO usermod -a -G dev developer
+        once.user.developer.fix.rights
         ;;
       developer)
         warn.log "user developer already exists"
@@ -1188,7 +1716,7 @@ once.user.developer()
         warn.log "custom_uid is not a number: uid=$custom_uid gid=$custom_gid"
         ;;
       *)
-        #groupadd dev
+        groupadd dev
         once.user.create developer $custom_uid $custom_gid
         ;;
     esac
@@ -1197,10 +1725,24 @@ once.user.developer()
   fi
 }
 
-once.user.init()
+function once.user.developer.fix.rights()
 {
-    local username=$1
+        chown developer:dev /var/run
+        chown developer:dev /var/run/docker.sock
+        chown -Rv developer:dev /var/dev/EAMD.ucp
+}
+
+once.user.init()    # sets up the .bashrc and scripts of user $1  
+{
+    local name=$1
     shift
+    local group=$1
+    shift
+
+    if [ -z "$name" ]; then
+      name=$(whoami)
+    fi
+
     if [ -d /var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/NewUserStuff/scripts ]; then
       $ONCE_SUDO usermod -a -G sudo $name
       #useradd -g dev $name 
@@ -1263,21 +1805,21 @@ once.user.init()
           #link for mac osx
           ln -s .bashrc .bash_profile
           . $userHome/.bashrc
-      else
-          if [ -w $userHome/scripts/templates/bashrc_addonTemplate ]; then
-              #console.log "improving .bashrc"
-              #cat $userHome/scripts/templates/bashrc_addonTemplate >>$userHome/.bashrc
-              #rm $userHome/scripts/templates/bashrc_addonTemplate
-              warn.log "prevented bash enhancement"
-          else 
-              console.log ".bashrc already improved"
-          fi
+      #else
+          # if [ -w $userHome/scripts/templates/bashrc_addonTemplate ]; then
+          #     #console.log "improving .bashrc"
+          #     #cat $userHome/scripts/templates/bashrc_addonTemplate >>$userHome/.bashrc
+          #     #rm $userHome/scripts/templates/bashrc_addonTemplate
+          #     warn.log "prevented bash enhancement"
+          # else 
+          #     console.log ".bashrc already improved"
+          # fi
       fi
     fi
-
+    RETURN=$1
 }
 
-once.user.create()                   # expets name <uid gid> and creates a new user with home dir
+function once.user.create()                   # expets "name <uid gid>" and creates a new user with home dir
 {
 
   local name=$1
@@ -1293,13 +1835,17 @@ once.user.create()                   # expets name <uid gid> and creates a new u
     shift
   fi
 
+  if [ -d $REPO_DIR ]; then
+    warn.log "Repository does not exist: $REPO_DIR"
+  fi
+
   if [ -n "$custom_uid" ]; then
     $ONCE_SUDO useradd -m $name -u$custom_uid -g$custom_gid -s /bin/bash
   else
     $ONCE_SUDO useradd -m $name -s /bin/bash
   fi
   $ONCE_SUDO usermod -aG sudo $name
-  #useradd -g dev $name 
+  useradd -g dev $name 
   once.user.init $name
   
 
@@ -1312,6 +1858,10 @@ function once.user.discover()
   cd $REPO_DIR
   local filename=check.user.txt
   touch $filename
+  # for mac
+  #  custom_gid=$(ls -al $REPO_DIR/$filename | cut -f 4 -d ' ')
+  #  custom_gid=$(ls -al $REPO_DIR/$filename | cut -f 6 -d ' ')
+  # for ubuntu
   custom_uid=$(ls -al $REPO_DIR/$filename | cut -f 3 -d ' ')
   custom_gid=$(ls -al $REPO_DIR/$filename | cut -f 4 -d ' ')
 
@@ -1339,14 +1889,14 @@ function once.group.discover.id()   # finds the custom_gid for a group name
   RETURN=$1
 }
 
-function once.group.discover.id()   # finds the custom_gid for a group name
-{
-  local groupname=$1
-  shift
-  once.group.discover.id $groupname
+# function once.group.discover.id()   # finds the custom_gid for a group name
+# {
+#   local groupname=$1
+#   shift
+#   once.group.discover.id $groupname
 
-  RETURN=$1
-}
+#   RETURN=$1
+# }
 
 function once.path.create()          # creates respective paths
 {
@@ -1386,7 +1936,7 @@ function once.createDir()            # creates respective directory requested in
 
 function once.ssh.init() 
 {
-  once.path
+  once.paths.reset
   rm scripts.zip*
   
   eamd v
@@ -1394,6 +1944,7 @@ function once.ssh.init()
 
   
   if [ ! "$?" = "0" ]; then
+    warn.log "exitiong with code $?"
     exit $?
   fi
   
@@ -1494,6 +2045,22 @@ once.path()                 # sets the path to the scripts to be loaded by once 
     "
 
     ONCE_PATHS=$ONCE_DEFAULT_SCENARIO/paths
+    once.user.rc.fix
+    ONCE_PATHS=$ONCE_DEFAULT_SCENARIO/paths
+    hash -r ## rescan PATH
+    NEW=" entering $ONCE_SHELL"
+
+    once.hibernate update
+  else
+    console.log "PATH will be loaded from $ONCE_PATHS"
+    console.log "current PATH=$PATH"
+  fi
+
+  #once.done
+}
+
+function once.user.rc.fix() 
+{
     checkAndFix "set ONCE_SHELL_RC: $ONCE_SHELL_RC" "-n" "$ONCE_SHELL_RC" "export ONCE_SHELL_RC=$HOME/.$(basename $SHELL)rc"
     
     echo "
@@ -1508,17 +2075,6 @@ once.path()                 # sets the path to the scripts to be loaded by once 
     
     '
     " >>$ONCE_SHELL_RC
-    ONCE_PATHS=$ONCE_DEFAULT_SCENARIO/paths
-    hash -r ## rescan PATH
-    NEW=" entering $ONCE_SHELL"
-
-    once.hibernate update
-  else
-    console.log "PATH will be loaded from $ONCE_PATHS"
-    console.log "current PATH=$PATH"
-  fi
-
-  #once.done
 }
 
 function once.paths.reset()                # reset path 
@@ -1540,7 +2096,7 @@ once.clean()                # uninstalls once and removes the current .once conf
   #mv $ONCE_DEFAULT_SCENARIO/paths $ONCE_DEFAULT_SCENARIO/paths.bak
   #rm ~/scripts/eamd
   local this=$0
-  checkAndFix "remove once alias $this" "! -L" "$(dirname $this)/once" "rm $(dirname $this)/once" 
+  #checkAndFix "remove once alias $this" "! -L" "$(dirname $this)/once" "rm $(dirname $this)/once" 
   rm -Rf $ONCE_LOAD_DIR
   if [ "$1" = "all" ]; then
     console.log "force deleting $SCENARIOS_DIR"
@@ -1766,7 +2322,7 @@ once.paths.load()           # loading all paths
 function once.mv()                   # to be deleted: moves the Repo prefix...just a test 
 {
 
-  REPO_PREFIX_UNDO=$ONCE_REPO_PREFIX
+  export REPO_PREFIX_UNDO=$ONCE_REPO_PREFIX
   if [ -n "$1" ]; then
     ONCE_REPO_PREFIX=$1
   fi
@@ -1774,17 +2330,27 @@ function once.mv()                   # to be deleted: moves the Repo prefix...ju
   once.config.list
   echo
   echo REPO_PREFIX_UNDO=$REPO_PREFIX_UNDO
+  echo ONCE_REPO_PREFIX=$ONCE_REPO_PREFIX
+  cat $ONCE_DEFAULT_SCENARIO/.once | sed "s/$(echo "$REPO_PREFIX_UNDO" | sed 's/\//\\\//g')/$(echo "$ONCE_REPO_PREFIX" | sed 's/\//\\\//g')/" >$ONCE_DEFAULT_SCENARIO/.once
+
+  once.unset
 }
 
 once.links.fix()            # checks that the once and once.sh are links to the latest files after repo.init
 {
   local DIR=$(dirname $This)
-  if [ "$DIR" = "." ]; then
-    DIR=$startDir
-  fi
+  if [ -z "$1" ]; then
+  
+    if [ "$DIR" = "." ]; then
+      DIR=$startDir
+    fi
 
-  if [ "$DIR" = "$ONCE_DIR/src/sh" ]; then
-    DIR=/usr/local/sbin
+    if [ "$DIR" = "$ONCE_DIR/src/sh" ]; then
+      DIR=/usr/local/sbin
+    fi
+  else
+    DIR="$1"
+    console.log "fixing links in: $DIR"
   fi
 
   if [ "$DIR" = "/usr/local/sbin" ]; then
@@ -1792,6 +2358,8 @@ once.links.fix()            # checks that the once and once.sh are links to the 
   else
     checkAndFix "make once.sh a live link into the repository $This" -L "$(dirname $This)/once.sh" "links.fix" 
     once.links
+
+    links.fix
   fi
 
 }
@@ -1802,13 +2370,20 @@ function links.fix()        # checks that the once and once.sh are links to the 
     err.log "Cannot fix links in $DIR"
     return
   fi
-  #rm $DIR/once.sh
+  if [ "$DIR" = "/usr/local/sbin" ]; then
+    DIR="~/scripts"
+  fi
+  
+  warn.log "fixing links in $DIR"
+  rm ~/once.sh
   rm $DIR/once*
   rm $DIR/eamd*
+  rm $DIR/debug*
   rm /var/dev/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once/latestServer/oosh/eamd*
   ln -s /var/dev/EAMD.ucp/Components/tla/EAMD/UcpComponentSupport/1.0.0/src/sh/eamd /var/dev/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once/latestServer/oosh/eamd
   ln -s /var/dev/EAMD.ucp/Components/tla/EAMD/UcpComponentSupport/1.0.0/src/sh/eamd $DIR/eamd
   ln -s $ONCE_DIR/src/sh/once.sh $DIR/once.sh
+  ln -s $ONCE_DIR/src/sh/debug $DIR/debug
   pushd .
   cd $DIR
   ln -s ./once.sh once
@@ -1822,6 +2397,8 @@ once.links()                  # lists the most important links
     ls -alF $DIR/once*
     which eamd
     ls -alF $DIR/eamd*
+    which debug
+    ls -alF $DIR/debug*
 }
 
 function once.links.replace() # replace the once links by a hardcopy of the latest version form the repo
@@ -1844,7 +2421,16 @@ function once.links.replace() # replace the once links by a hardcopy of the late
   fi
 }
 
-once.docker(){
+once.structr.woda2local.start() {
+  cd /Users/Shared/dev/EAMD.ucp/3rdPartyComponents/org/structr/StructrServer/woda2.local/docker/local/structr/1.0.0
+  runDocker
+}
+once.structr.start() {
+  cd /Users/Shared/dev/EAMD.ucp/3rdPartyComponents/org/structr/StructrServer/2.1.4/src/nginx_samba_structr
+  docker-compose up
+}
+
+once.docker.old(){
 
     if [ "$1" = "WODA" ] || [ "$1" = "woda" ]; then
       if [ "$2" = "server" ] || [ "$2" = "Server" ]; then
@@ -1945,40 +2531,14 @@ once.docker(){
     fi
 }
 
-function once.better.docker()
-{
-    case $1 in
-      WODA)
-        shift
-        once.docker.woda
-        "$@"
-        ;;
-      nodejs)
-        shift
-        once.docker.nodejs
-        "$@"
-        ;;
-      structr)
-        once.docker.structr "$@"
-        ;;
-      '')
-        debug.log "$0: EXIT"
-        #exit 0
-        return
-        ;;
-      *)
-        console.log "once.stage to: $@"
-        once.stage docker.$1 "$@"
-    esac
-}
-
 
 function once.docker.install(){
   if [ -z "$USERNAME" ]; then
-    export USERNAME="${USER}"
+    export USERNAME="$(whoami)"
   fi
   if [ ! $USERNAME = "root" ]; then
     echo "Super User Permissin Required..! Re-run it with super user"
+    once.double.line
     exit 0;
   fi
   if [ -x "$(command -v brew)" ]; then
@@ -1993,14 +2553,18 @@ function once.docker.install(){
             apk add docker-compose
         elif [ -x "$(command -v apt-get)" ]; then
             echo "Installing Docker & Docker Compose..."
-            apt-get -y install curl apt-transport-https ca-certificates curl gnupg2 software-properties-common
-            curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
-            add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable"
             apt-get update
-            apt-get -y install docker-ce docker-ce-cli containerd.io
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y docker docker-compose
+            # apt-get -y install curl apt-transport-https ca-certificates curl gnupg2 software-properties-common
+            # curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
+            # add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable"
+            # apt-get update
+            # apt-get -y install docker-ce docker-ce-cli containerd.io
+            echo usermod -aG docker $USERNAME
             usermod -aG docker $USERNAME
-            curl -L "https://github.com/docker/compose/releases/download/1.27.4/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            chmod +x /usr/local/bin/docker-compose
+            # curl -L "https://github.com/docker/compose/releases/download/1.27.4/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            # chmod +x /usr/local/bin/docker-compose
             docker --version
             docker-compose --version
         elif [ -x "$(command -v pacman)" ]; then
@@ -2017,10 +2581,836 @@ function once.docker.install(){
         fi
 }
 
+once.docker.config(){
+  if [ $1 = "pgadmin" ]; then
+    once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
+    if [ -f "pgAdmin.env" ]; then
+      echo "pgAdmin.env file already exists...";
+    else
+    
+      echo "Creating pgAdmin.env file"
+      {
+        echo "PGADMIN_DEFAULT_EMAIL=admin@admin.com"
+        echo "PGADMIN_DEFAULT_PASSWORD=qazwsx123"
+      } >> pgAdmin.env
+      echo 
+      echo "pgAdmin.env file created..."
+      cat pgAdmin.env
+      echo 
+
+    fi
+    if [ -f "docker-compose.yml" ]; then
+      echo "docker-compose file already exists...";
+    else
+
+      {
+        echo 'version: "3.7"'
+        echo 'services:'
+        echo '  pgadmin:'
+        echo '    container_name: once-pgadmin'
+        echo '    image: dpage/pgadmin4:4.18'
+        echo '    restart: always'
+        echo '    env_file:'
+        echo '      - pgAdmin.env'
+        echo '    volumes:'
+            
+        echo '      - ./pgadmin-data:/var/lib/pgadmin'
+        echo '    ports:'
+        echo '      - "8099:80"'
+        echo '      - "7443:443"'
+        echo  ''      
+        echo  ''      
+        # echo 'volumes:'
+        # echo '  pgadmin-data:'
+        echo 'networks:'
+        echo '  default:'
+        echo '    external:'
+        echo '      name: once-woda-network'
+      } >> docker-compose.yml
+
+      echo 
+      echo "docker-compose.yml file created..."
+      cat docker-compose.yml
+      echo
+    fi    
+    once.docker.build pgadmin
+  elif [ $1 = "postgresql" ]; then
+    once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2
+    if [ -f "postgresql.env" ]; then
+      echo "postgresql.env file already exists...";
+    else
+      echo "Creating postgresql.env file"
+      {
+        echo "POSTGRES_USER=root"
+        echo "POSTGRES_PASSWORD=qazwsx123"
+        echo "POSTGRES_DB=oncestore"
+        echo "APP_DB_USER=once"
+        echo "APP_DB_PASS=qazwsx123"
+        echo "APP_DB_NAME=oncestore"
+      } >> postgresql.env
+      echo 
+      echo "postgresql.env file created..."
+      cat postgresql.env
+      echo 
+
+    fi
+    if [ -f "docker-compose.yml" ]; then
+      echo "docker-compose file already exists...";
+    else
+
+      {
+        echo 'version: "3.7"'
+        echo 'services:'
+        echo '  postgresql-db-12:'
+        echo '    container_name: once-postgresql'
+        echo '    image: postgres:12.2'
+        echo '    restart: always'
+        echo '    env_file:'
+        echo '      - postgresql.env'
+        echo '    volumes:'
+        if [ ! -d "db.init" ]; then
+          mkdir -p db.init
+          cd db.init
+          wget https://test.wo-da.de/EAMD.ucp/3rdPartyComponents/org/postgresql/PostgreSQL/12.2/db/01-init.sh
+          chmod +x 01-init.sh
+          cd ..
+        fi
+        
+        echo '      - ./db.init:/docker-entrypoint-initdb.d/'
+        echo '      - ./oncestore.db:/var/lib/postgresql/data'
+        echo '    ports:'
+        echo '      - "5433:5432"'
+        echo  ''      
+        echo  ''      
+        echo 'networks:'
+        echo '  default:'
+        echo '    external:'
+        echo '      name: once-woda-network'
+      } >> docker-compose.yml
+
+      echo 
+      echo "docker-compose.yml file created..."
+      cat docker-compose.yml
+      echo
+    fi
+    once.docker.build postgresql
+  elif [ $1 = "woda" ]; then
+    once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
+    if [ -f "current.env" ]; then
+      rm current.env
+      echo ONCE_DOCKER_HOST=$HOSTNAME >> current.env
+      export ONCE_DOCKER_HOST=$HOSTNAME
+    else
+      echo ONCE_DOCKER_HOST=$HOSTNAME >> current.env
+      export ONCE_DOCKER_HOST=$HOSTNAME
+    fi
+
+    echo 
+    echo "current.env file created..."
+    cat current.env
+    echo
+    if [ ! -f "once.sh" ]; then
+      cp /var/dev/EAMD.ucp/Components/tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/once.sh ./
+    else
+      rm ./once.sh
+      cp /var/dev/EAMD.ucp/Components/tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/once.sh ./
+    fi
+    if [ -f "docker-compose.yml" ]; then
+      echo "docker-compose file already exists...";
+    else
+
+      {
+        echo "version: '3'"
+        echo "services:"
+        echo "  woda-app:"
+        echo "    container_name: woda"
+        echo "    build: './'"
+        echo "    image: woda-nodejs:16.x"            
+        echo "    env_file:"
+        echo "      - current.env"
+        echo "    ports:"
+        echo "      - 8080:8080"
+        echo "      - 8443:8443"
+        echo "      - 5001:5001"
+        echo "      - 5002:5002"
+        echo "      - 5005:5005"
+        echo "    volumes:"
+        echo "      - /var/dev/EAMD.ucp/Components/tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/:/usr/local/sbin/"
+        echo "      - /var/dev/EAMD.ucp/Components:/var/dev/EAMD.ucp/Components"
+        echo "      - /var/run/docker.sock:/var/run/docker.sock"
+        echo "    command: 'once startlog'"
+        echo "networks:"
+        echo "  default:"
+        echo "    external:"
+        echo "      name: once-woda-network"
+      } >> docker-compose.yml
+      
+      echo 
+      echo "docker-compose.yml file created..."
+      cat docker-compose.yml
+      echo
+    fi
+    if [ -f "Dockerfile" ]; then
+      echo "Dockerfile already exists........."
+    else
+      echo "Creating Dockerfile......."
+      {
+        echo "# Pull base image."
+        echo "FROM ubuntu:20.04"
+        
+        echo "ENV ONCE_DOCKER_HOST $HOSTNAME"
+
+        echo "WORKDIR /root/"
+        echo "ADD ./once.sh ./once.sh"
+        echo "RUN chmod +x ./once.sh"
+        echo "RUN ./once.sh docker.build"
+
+        echo "CMD [ "/bin/bash" ]"
+        echo "# Expose ports."
+        echo "EXPOSE 8080"
+      } >> Dockerfile    
+      
+      echo 
+      echo "Dockerfile file created..."
+      cat Dockerfile
+      echo
+    fi
+    once.docker.build woda
+  elif [ $1 = "all" ]; then
+    once.docker.config postgresql
+    once.docker.config pgadmin
+    once.docker.config woda
+
+  else
+    echo 
+    echo "No Docker config found with Name: '$1'";
+    echo
+    echo "Try one of the following commands...";
+    echo "1. For pgAdmin 'once docker.config pgadmin'";
+    echo "2. For PostgreSQL 'once docker.config postgresql'";
+    echo "3. For WODA 'once docker.config woda'";
+    echo
+  fi
+
+}
+
+
+once.docker.reconfig(){
+  if [ $1 = "pgadmin" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/
+    if [ -d "./4.18" ]; then
+      echo "Removing old docker config files..."
+      rm -r ./4.18
+      once.docker.config pgadmin
+    else
+      echo "Creating new docker config files...."
+      once.docker.config pgadmin
+    fi
+  elif [ $1 = "postgresql" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/
+    if [ -d "./12.2" ]; then
+      echo "Removing old docker config files..."
+      rm -r ./12.2
+      once.docker.config postgresql
+    else
+      echo "Creating new docker config files...."
+      once.docker.config postgresql
+    fi
+  elif [ $1 = "woda" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/
+    if [ -d "./4.3.0" ]; then
+      echo "Removing old docker config files..."
+      rm -r ./4.3.0
+      once.docker.config woda
+    else
+      echo "Creating new docker config files...."
+      once.docker.config woda
+    fi
+    
+  elif [ $1 = "all" ]; then
+    once.docker.reconfig postgresql
+    once.docker.reconfig pgadmin
+    once.docker.reconfig woda
+  else
+    echo 
+    echo "No Docker config found with Name: '$1'";
+    echo
+    echo "Try one of the following commands...";
+    echo "1. For pgAdmin 'once docker.reconfig pgadmin'";
+    echo "2. For PostgreSQL 'once docker.reconfig postgresql'";
+    echo "3. For WODA 'once docker.reconfig woda'";
+    echo
+  fi
+
+}
+
+once.dc.create()
+{
+  once.scenario.map $1
+  let result=$?
+  if [ -z "$1" ]; then
+    warn.log "no SCENARIO provided! use one of: ${SCENARIO_MAP_KEYS[@]}"
+    return 1
+  fi
+  DOCKER_SCENARIO=$1
+  shift 
+
+  once.dc.stop $DOCKER_SCENARIO
+  once.dc.create.$DOCKER_SCENARIO
+  once.dc.start $DOCKER_SCENARIO
+  ls -al
+  docker ps
+}
+
+once.dc.delete()
+{
+  once.scenario.map $1
+  let result=$?
+  if [ -z "$1" ]; then
+    warn.log "no SCENARIO provided! use one of: ${SCENARIO_MAP_KEYS[@]}"
+    return 1
+  fi
+  DOCKER_SCENARIO=$1
+  shift 
+
+  once.dc.stop $DOCKER_SCENARIO
+  once.dc.delete.$DOCKER_SCENARIO
+  once.scenario.delete $SELECTED_SCENARIO yes
+}
+
+
+once.dc.start()
+{
+  if once.scenario.map $1; then
+    echo scenario $1
+  else
+    echo no scenario $1...$?
+    return
+  fi
+
+  docker-compose ps --services --filter "status=running" | grep $SELECTED_SCENARIO_NAME-service
+  export status=$?
+  if [ $status = 0 ]; then
+    echo "Container $SELECTED_SCENARIO_DC_NAME is runing...";
+    docker exec -it $SELECTED_SCENARIO_DC_NAME bash
+  else
+    echo "Container is not runing...";
+    echo "Re-Building image and container...";
+
+    docker-compose up --build --remove-orphans --force-recreate -d
+  fi
+
+}
+
+once.dc.stop()
+{
+  if once.scenario.map $1; then
+    echo scenario $1
+  else
+    echo no scenario $1...$?
+    return
+  fi
+
+  docker-compose ps --services --filter "status=running" | grep $SELECTED_SCENARIO_NAME-service
+  local status=$?
+  if [ $status = 0 ]; then
+    echo "Container $SELECTED_SCENARIO_DC_NAME is runing...";
+    docker-compose down
+  else
+    echo "Container $SELECTED_SCENARIO_DC_NAME is not runing...";
+    docker ps
+  fi
+
+}
+
+function once.dc.delete.pg()
+{
+    docker image rm $SELECTED_SCENARIO_DI_NAME
+    docker container rm $SELECTED_SCENARIO_DC_NAME
+    docker volume rm $SELECTED_SCENARIO_NAME-volume
+
+    NETWORK_NAME=once-woda-network
+    if [ -z $(docker network ls --filter name=^${NETWORK_NAME}$ --format="{{ .Name }}") ] ; then 
+        echo "${NETWORK_NAME} not exists, creating new..."
+        docker network delete ${NETWORK_NAME} ; 
+    fi
+
+
+    if [ -d "$ONCE_SCENARIO$SELECTED_SCENARIO" ]; then
+      console.log "Removing old docker config files...: $ONCE_SCENARIO$SELECTED_SCENARIO"
+      rm -r $ONCE_SCENARIO$SELECTED_SCENARIO
+      once.path.create $ONCE_SCENARIO$SELECTED_SCENARIO
+      cd $ONCE_SCENARIO$SELECTED_SCENARIO
+    fi
+    
+    if [ -f "postgresql.env" ]; then
+      echo "postgresql.env file already exists...";
+      rm postgresql.env
+    fi
+
+    if [ -f "docker-compose.yml" ]; then
+      echo "docker-compose file already exists...";
+      rm docker-compose.yml
+    fi
+
+}
+
+function once.dc.delete.pgv()
+{
+    docker image rm $SELECTED_SCENARIO_DI_NAME
+    docker container rm $SELECTED_SCENARIO_DC_NAME
+    docker volume rm $SELECTED_SCENARIO_NAME-volume
+
+    NETWORK_NAME=once-woda-network
+    if [ -z $(docker network ls --filter name=^${NETWORK_NAME}$ --format="{{ .Name }}") ] ; then 
+        echo "${NETWORK_NAME} not exists, creating new..."
+        docker network delete ${NETWORK_NAME} ; 
+    fi
+
+
+    if [ -d "$ONCE_SCENARIO$SELECTED_SCENARIO" ]; then
+      console.log "Removing old docker config files...: $ONCE_SCENARIO$SELECTED_SCENARIO"
+      rm -r $ONCE_SCENARIO$SELECTED_SCENARIO
+      once.path.create $ONCE_SCENARIO$SELECTED_SCENARIO
+      cd $ONCE_SCENARIO$SELECTED_SCENARIO
+    fi
+    
+    if [ -f "postgresql.env" ]; then
+      echo "postgresql.env file already exists...";
+      rm postgresql.env
+    fi
+
+    if [ -f "docker-compose.yml" ]; then
+      echo "docker-compose file already exists...";
+      rm docker-compose.yml
+    fi
+
+}
+
+function once.dc.create.pgv()
+{
+    once.dc.delete.pgv
+
+  NETWORK_NAME=once-woda-network
+  if [ -z $(docker network ls --filter name=^${NETWORK_NAME}$ --format="{{ .Name }}") ] ; then 
+      echo "${NETWORK_NAME} not exists, creating new..."
+      docker network create ${NETWORK_NAME} ; 
+      echo "${NETWORK_NAME} docker network created."
+      echo
+      docker network connect ${NETWORK_NAME} $(hostname)
+  else
+    echo "Docker Network '${NETWORK_NAME}' Already Exists..."
+  fi
+
+    echo "Creating postgresql.env file"
+    {
+      echo "POSTGRES_USER=root"
+      echo "POSTGRES_PASSWORD=qazwsx123"
+      echo "POSTGRES_DB=oncestore"
+      echo "APP_DB_USER=once"
+      echo "APP_DB_PASS=qazwsx123"
+      echo "APP_DB_NAME=oncestore"
+    } >> postgresql.env
+    echo 
+    warn.log "postgresql.env file created..."
+    cat postgresql.env
+    echo 
+
+
+    # if [ -f "docker-compose.yml" ]; then
+    #   echo "docker-compose file already exists...";
+    #   rm docker-compose.yml
+    # fi
+
+    {
+      echo 'version: "3.7"'
+      echo 'services:'
+      echo "  $SELECTED_SCENARIO_NAME-service:"
+      echo "    container_name: $SELECTED_SCENARIO_DC_NAME"
+      echo '    image: postgres:12.2'
+      echo '    restart: always'
+      echo '    env_file:'
+      echo '      - postgresql.env'
+      echo '    volumes:'
+      if [ ! -d "db.init" ]; then
+        mkdir -p db.init
+        cd db.init
+        wget https://test.wo-da.de/EAMD.ucp/3rdPartyComponents/org/postgresql/PostgreSQL/12.2/db/01-init.sh
+        chmod +x 01-init.sh
+        cd ..
+      fi
+      
+      echo '      - ./db.init:/docker-entrypoint-initdb.d/'
+      echo "      - $SELECTED_SCENARIO_NAME-volume:/var/lib/postgresql/data"
+      echo '    ports:'
+      echo '      - "5433:5432"'
+      echo  ''      
+      echo  ''      
+      echo 'volumes:'
+      echo "  $SELECTED_SCENARIO_NAME-volume:"
+      echo 'networks:'
+      echo '  default:'
+      echo '    external:'
+      echo '      name: once-woda-network'
+    } >> docker-compose.yml
+
+    echo 
+    warn.log "docker-compose.yml file created..."
+    cat docker-compose.yml
+    echo
+}
+
+
+function once.dc.create.pg()
+{
+  once.dc.delete.pg
+
+  NETWORK_NAME=once-woda-network
+  if [ -z $(docker network ls --filter name=^${NETWORK_NAME}$ --format="{{ .Name }}") ] ; then 
+      echo "${NETWORK_NAME} not exists, creating new..."
+      docker network create ${NETWORK_NAME} ; 
+      echo "${NETWORK_NAME} docker network created."
+      echo
+      docker network connect ${NETWORK_NAME} $(hostname)
+  else
+    echo "Docker Network '${NETWORK_NAME}' Already Exists..."
+  fi
+
+    echo "Creating postgresql.env file"
+    {
+      echo "POSTGRES_USER=root"
+      echo "POSTGRES_PASSWORD=qazwsx123"
+      echo "POSTGRES_DB=oncestore"
+      echo "APP_DB_USER=once"
+      echo "APP_DB_PASS=qazwsx123"
+      echo "APP_DB_NAME=oncestore"
+    } >> postgresql.env
+    echo 
+    warn.log "postgresql.env file created..."
+    cat postgresql.env
+    echo 
+
+    {
+      echo 'version: "3.7"'
+      echo 'services:'
+      echo "  $SELECTED_SCENARIO_NAME-service:"
+      echo "    container_name: $SELECTED_SCENARIO_DC_NAME"
+      echo '    image: postgres:12.2'
+      echo '    restart: always'
+      echo '    env_file:'
+      echo '      - postgresql.env'
+      echo '    volumes:'
+      if [ ! -d "db.init" ]; then
+        mkdir -p db.init
+        cd db.init
+        wget https://test.wo-da.de/EAMD.ucp/3rdPartyComponents/org/postgresql/PostgreSQL/12.2/db/01-init.sh
+        chmod +x 01-init.sh
+        cd ..
+      fi
+      
+      echo '      - ./db.init:/docker-entrypoint-initdb.d/'
+      echo '      - ./oncestore.db:/var/lib/postgresql/data'
+      echo '    ports:'
+      echo '      - "5433:5432"'
+      echo  ''      
+      echo  ''      
+      echo 'networks:'
+      echo '  default:'
+      echo '    external:'
+      echo '      name: once-woda-network'
+    } >> docker-compose.yml
+
+    echo 
+    warn.log "docker-compose.yml file created..."
+    cat docker-compose.yml
+    echo
+}
+
+function once.dc.delete.woda()
+{
+    docker image rm $SELECTED_SCENARIO_DI_NAME
+    docker container rm $SELECTED_SCENARIO_DC_NAME
+
+    if [ -f "current.env" ]; then
+      rm current.env
+    fi
+
+    if [ -f "./once.sh" ]; then
+      rm ./once.sh
+    fi
+
+    if [ -f "docker-compose.yml" ]; then
+      rm docker-compose.yml
+    fi
+
+    if [ -f "Dockerfile" ]; then
+      echo "Dockerfile already exists........."
+      rm Dockerfile
+    fi
+}
+
+function once.dc.create.woda()
+{
+    once.dc.delete.woda
+
+    if [ -f "current.env" ]; then
+      rm current.env
+      echo ONCE_DOCKER_HOST=$HOSTNAME >> current.env
+      export ONCE_DOCKER_HOST=$HOSTNAME
+    else
+      echo ONCE_DOCKER_HOST=$HOSTNAME >> current.env
+      export ONCE_DOCKER_HOST=$HOSTNAME
+    fi
+    echo 
+    echo "current.env file created..."
+    cat current.env
+    echo
+    if [ ! -f "./once.sh" ]; then
+      cp $(dirname $This)/once.sh ./
+    else
+      rm ./once.sh
+      cp $(dirname $This)/once.sh ./
+    fi
+    echo copied $(dirname $This)/once.sh tp $(pwd)
+
+
+
+    {
+      echo "version: '3'"
+      echo "services:"
+      echo "  $SELECTED_SCENARIO_NAME-service:"
+      echo "    container_name: $SELECTED_SCENARIO_DC_NAME"
+      echo "    build: './'"
+      echo "    image: $SELECTED_SCENARIO_DI_NAME"            
+      echo "    env_file:"
+      echo "      - current.env"
+      echo "    ports:"
+      echo "      - 8080:8080"
+      echo "      - 8443:8443"
+      echo "      - 5001:5001"
+      echo "      - 5002:5002"
+      echo "      - 5005:5005"
+      echo "    volumes:"
+      echo "      - /var/dev/EAMD.ucp/Components/tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/:/usr/local/sbin/"
+      #echo "      - /var/dev/EAMD.ucp/Components:/var/dev/EAMD.ucp/Components"
+      echo "      - /var/run/docker.sock:/var/run/docker.sock"
+      echo "    command: 'once startlog'"
+      echo "networks:"
+      echo "  default:"
+      echo "    external:"
+      echo "      name: once-woda-network"
+    } >> docker-compose.yml
+    
+    echo 
+    warn.log "docker-compose.yml file created..."
+    cat docker-compose.yml
+    echo
+
+
+    echo "Creating Dockerfile......."
+    {
+      echo "# Pull base image."
+      echo "FROM ubuntu:20.04"
+      
+      echo "ENV ONCE_DOCKER_HOST $HOSTNAME"
+
+      echo "WORKDIR /root/"
+      echo "ADD ./once.sh ./once.sh"
+      echo "RUN chmod +x ./once.sh"
+      echo "RUN ./once.sh docker.build"
+
+      echo "CMD [ "/bin/bash" ]"
+      echo "# Expose ports."
+      echo "EXPOSE 8080"
+    } >> Dockerfile    
+    
+    echo 
+    echo "Dockerfile file created..."
+    cat Dockerfile
+    echo
+}
+
+
+
+once.docker.build(){
+  once.docker.network
+  if [ $1 = "pgadmin" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
+    docker-compose build
+  elif [ $1 = "postgresql" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2/
+    docker-compose build
+  elif [ $1 = "woda" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0/
+    docker-compose build
+  elif [ $1 = "all" ]; then
+    once.docker.build postgresql
+    once.docker.build pgadmin
+    once.docker.build woda
+  else
+    echo 
+    echo "No Docker config found with Name: '$1'";
+    echo
+    echo "Try one of the following commands...";
+    echo "1. For pgAdmin 'once docker.build pgadmin'";
+    echo "2. For PostgreSQL 'once docker.build postgresql'";
+    echo "3. For WODA 'once docker.build woda'";
+    echo
+  fi
+
+}
+
+once.docker.rebuild(){
+  once.docker.network
+  if [ $1 = "pgadmin" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
+    docker-compose build --no-cache
+  elif [ $1 = "postgresql" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2/
+    docker-compose build --no-cache
+  elif [ $1 = "woda" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0/
+    docker-compose build --no-cache
+  elif [ $1 = "all" ]; then
+    once.docker.rebuild postgresql
+    once.docker.rebuild pgadmin
+    once.docker.rebuild woda
+  else
+    echo 
+    echo "No Docker config found with Name: '$1'";
+    echo
+    echo "Try one of the following commands...";
+    echo "1. For pgAdmin 'once docker.rebuild pgadmin'";
+    echo "2. For PostgreSQL 'once docker.rebuild postgresql'";
+    echo "3. For WODA 'once docker.rebuild woda'";
+    echo
+  fi
+
+}
+
+
+once.docker.start(){
+  once.docker.network
+  if [ $1 = "pgadmin" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
+    if [ "$(docker inspect --format='{{.State.Running}}' once-pgadmin)" = "true" ]; then
+      echo
+      echo "pgAdmin Container is running....";
+      echo
+      echo "Entering in pgAdmin Container...";
+      echo
+      docker exec -it once-pgadmin sh
+    else
+      docker-compose up
+    fi
+  elif [ $1 = "postgresql" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2/
+    # $result= "$(docker inspect --format="{{.State.Running}}" once-postgresql)
+    if [ "$(docker inspect --format='{{.State.Running}}' once-postgresql)" = "true" ]; then
+      echo
+      echo "PostgreSQL Container is running....";
+      echo
+      echo "Entering in PostgreSQL Container...";
+      echo
+      docker exec -it once-postgresql bash
+    else
+      docker-compose up
+    fi
+    
+  elif [ $1 = "woda" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0/
+    if [ "$(docker inspect --format='{{.State.Running}}' woda)" = "true" ]; then
+      echo
+      echo "WODA Container is running....";
+      echo
+      echo "Entering in WODA Container...";
+      echo
+      docker exec -it woda bash
+    else
+      docker-compose up
+    fi
+  elif [ $1 = "all" ]; then
+    once.docker.start postgresql
+    once.docker.start pgadmin
+    once.docker.start woda
+  else
+    echo 
+    echo "No Docker config found with Name: '$1'";
+    echo
+    echo "Try one of the following commands...";
+    echo "1. For pgAdmin 'once docker.start pgadmin'";
+    echo "2. For PostgreSQL 'once docker.start postgresql'";
+    echo "3. For WODA 'once docker.start woda'";
+    echo
+  fi
+
+}
+
+
+once.docker.restart(){
+  if [ $1 = "pgadmin" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
+    once.docker.stop pgadmin
+    once.docker.start pgadmin
+  elif [ $1 = "postgresql" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2/
+    once.docker.stop postgresql
+    once.docker.start postgresql
+  elif [ $1 = "woda" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0/
+    once.docker.stop woda
+    once.docker.start woda
+  elif [ $1 = "all" ]; then
+    once.docker.restart postgresql
+    once.docker.restart pgadmin
+    once.docker.restart woda
+  else
+    echo 
+    echo "No Docker config found with Name: '$1'";
+    echo
+    echo "Try one of the following commands...";
+    echo "1. For pgAdmin 'once docker.restart pgadmin'";
+    echo "2. For PostgreSQL 'once docker.restart postgresql'";
+    echo "3. For WODA 'once docker.restart woda'";
+    echo
+  fi
+
+}
+
+
+once.docker.stop(){
+  if [ $1 = "pgadmin" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
+    docker-compose down
+  elif [ $1 = "postgresql" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2/
+    docker-compose down
+  elif [ $1 = "woda" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0/
+    docker-compose down
+  elif [ $1 = "all" ]; then
+    once.docker.stop woda
+    once.docker.stop pgadmin
+    once.docker.stop postgresql
+  else
+    echo 
+    echo "No Docker config found with Name: '$1'";
+    echo
+    echo "Try one of the following commands...";
+    echo "1. For pgAdmin 'once docker.stop pgadmin'";
+    echo "2. For PostgreSQL 'once docker.stop postgresql'";
+    echo "3. For WODA 'once docker.stop woda'";
+    echo
+  fi
+
+}
 
 function once.check.installation.mode() {
   #stop.log "once.check.installation.mode $COMMANDS"
-  local mode=$COMMANDS
+  local mode=$@
   if [ -z "$mode" ]; then 
         console.log "once.check.installation.mode with no parameters!"
         mode=DOCKER
@@ -2028,16 +3418,16 @@ function once.check.installation.mode() {
 
   case $mode in
     docker.build)
-      console.log "once installation mode: $COMMANDS"
+      console.log "once installation mode: $mode"
       export ONCE_BUILD=BUILDING
       warn.log "once is in mode: during Dockerfile build"
       return 0
       ;;
     LOCAL)
-      console.log "once installation mode: $COMMANDS"
+      console.log "once installation mode: $mode"
       ;;
     DOCKER)
-      console.log "once installation mode: $COMMANDS"
+      console.log "once installation mode: $mode"
       ;;      
   esac
   
@@ -2050,9 +3440,10 @@ once.init()                 # forces reinitialisation
 {
   #stop.log "entered once.init"
   export PS4='+${LINENO}: '
-  clear
+  #clear
   unset NEW
   once.version
+  stop.log "check installation mode"
   once.check.installation.mode "$@"
 
   console.log "initialize Once"
@@ -2064,10 +3455,11 @@ once.init()                 # forces reinitialisation
   #for once.load
   #ONCE_LOCAL_SERVER=http://192.168.178.49:8080
   
-  ONCE_DEFAULT_SERVER=test.wo-da.de
+  ONCE_DEFAULT_HOST=test.wo-da.de
   ONCE_SHELL=$SHELL
   #ONCE_USERHOME=$(cd;pwd)
 
+  ONCE_REPO_PREFIX=/var/dev
   ONCE_REPO_NAME=EAMD.ucp
   ONCE_REPO_COMPONENTS=Components
   ONCE_REPO_SCENARIOS=Scenarios
@@ -2077,12 +3469,14 @@ once.init()                 # forces reinitialisation
     ONCE_INITIAL_PATH=$PATH
   fi
 
-  ONCE_LATEST_BRANCH=test/sprint21
-  ONCE_SCENARIO_BRANCH=test/WODA
+  ONCE_LATEST_BRANCH=test/sprint25
+  ONCE_SCENARIO_BRANCH=temp/ShifterNetwork-4.3.0
 
   ONCE_REVERSE_PROXY_CONFIG='[["auth","test.wo-da.de"],["snet","test.wo-da.de"],["structr","test.wo-da.de"]]'
   ONCE_REV_PROXY_HOST=127.0.0.1
   ONCE_REV_PROXY_PORT=5002
+  ONCE_REV_PROXY_HTTPS_PORT=5005
+  
   ONCE_PROXY_HOST=127.0.0.1
   ONCE_PROXY_PORT=5001
 
@@ -2102,10 +3496,8 @@ once.init()                 # forces reinitialisation
     ONCE_STATE=user.installation
   fi
  
-  once.check.privileges
-
-
-
+  warn.log "all environment variables newly initialized"
+  
   #once.stage
 }
 
@@ -2119,7 +3511,7 @@ function once.update.variables()     # updates the environmental variables: REPO
   ONCE_DIR=$COMPONENTS_DIR/tla/EAM/layer1/Thinglish/Once/latestServer
   
   if [ ! -d "$ONCE_DEFAULT_SCENARIO" ]; then 
-    console.log "no default scenario, using localhost"
+    warn.log "no default scenario, using localhost"
     ONCE_DEFAULT_SCENARIO=$SCENARIOS_DIR/localhost/EAM/1_infrastructure/Once/latestServer
   fi
   
@@ -2127,19 +3519,20 @@ function once.update.variables()     # updates the environmental variables: REPO
 
   if [ -z "$ONCE_STRUCTR_SERVER" ]; then 
     console.log "no default ONCE_STRUCTR_SERVER"
-    ONCE_STRUCTR_SERVER=https://$ONCE_DEFAULT_SERVER:$ONCE_REV_PROXY_PORT
-    console.log "  setting: $ONCE_STRUCTR_SERVER"
+    # ONCE_STRUCTR_SERVER=https://$ONCE_DEFAULT_HOST:$ONCE_REV_PROXY_HTTPS_PORT
+    ONCE_STRUCTR_SERVER=https://test.wo-da.de:8083
+    console.log "  setting: $ONCE_STRUCTR_HOST"
   fi
 
-  if [ -z "$ONCE_DEFAULT_HOST" ] ; then
-    ONCE_DEFAULT_HOST=$ONCE_DEFAULT_SERVER
-    warn.log "ONCE_DEFAULT_SERVER is deprecated: pleas usee ONCE_DEFAULT_HOST or ONCE_DEFAULT_URL instead"
-  fi
+  # if [ -z "$ONCE_DEFAULT_HOST" ] ; then
+  #   ONCE_DEFAULT_HOST=$ONCE_DEFAULT_SERVER
+  #   warn.log "ONCE_DEFAULT_SERVER is deprecated: pleas usee ONCE_DEFAULT_HOST or ONCE_DEFAULT_URL instead"
+  # fi
 
-  if [ -z "$ONCE_DEFAULT_SERVER" ] ; then
+  #if [ -z "$ONCE_DEFAULT_SERVER" ] ; then
     #ONCE_DEFAULT_SERVER=$ONCE_DEFAULT_HOST
-    warn.log "ONCE_DEFAULT_SERVER is deprecated: please use ONCE_DEFAULT_HOST or ONCE_DEFAULT_URL instead"
-  fi
+    #warn.log "ONCE_DEFAULT_SERVER is deprecated: please use ONCE_DEFAULT_HOST instead"
+  #fi
   
   if [ -z "$ONCE_DEFAULT_URL" ] ; then
     ONCE_DEFAULT_URL=https://$ONCE_DEFAULT_HOST
@@ -2154,17 +3547,18 @@ function once.update.variables()     # updates the environmental variables: REPO
   fi
 
 
-  if [ -z "$ONCE_DEFAULT_DOCKER_POSTGRESQL" ] ; then
-    export ONCE_DEFAULT_DOCKER_POSTGRESQL=/var/dev/EAMD.ucp/3rdPartyComponents/org/postgresql/PostgreSQL/12.2/
-  fi
+  # if [ -z "$ONCE_DEFAULT_DOCKER_POSTGRESQL" ] ; then
+  #   export ONCE_DEFAULT_DOCKER_POSTGRESQL=/var/dev/EAMD.ucp/3rdPartyComponents/org/postgresql/PostgreSQL/12.2/
+  # fi
 
-  if [ -z "$ONCE_DEFAULT_DOCKER_WODA" ] ; then
-    export ONCE_DEFAULT_DOCKER_WODA=/var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/2.0.0/Ubuntu/20.04/Nodejs/16
-  fi
+  # if [ -z "$ONCE_DEFAULT_DOCKER_WODA" ] ; then
+  #   export ONCE_DEFAULT_DOCKER_WODA=/var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/2.0.0/Ubuntu/20.04/Nodejs/16
+  # fi
   
-  if [ -z "$ONCE_DEFAULT_SCENARIO_DOCKER" ] ; then
-    export ONCE_DEFAULT_SCENARIO_DOCKER="${ONCE_DEFAULT_SCENARIO:0:${#ONCE_DEFAULT_SCENARIO}-17}"
-  fi
+  # if [ -z "$ONCE_DEFAULT_SCENARIO_DOCKER" ] ; then
+  #   warn.log "please refactor....deprecated....see once sceanrio.check"
+  #   export ONCE_DEFAULT_SCENARIO_DOCKER="${ONCE_DEFAULT_SCENARIO:0:${#ONCE_DEFAULT_SCENARIO}-17}"
+  # fi
 
   if [ -z "$ONCE_DEFAULT_UDE_STORE" ] ; then
     ONCE_DEFAULT_UDE_STORE=https://localhost:8443
@@ -2212,8 +3606,8 @@ once.unset()
   stop.log "list current new: $ONCE_DEFAULT_SCENARIO/.once"
   cat $ONCE_DEFAULT_SCENARIO/.once.new
 
-  stop.log "entering shell with the new config"
-  once.sh
+  warn.log "entering shell with the new config"
+  once.shell
 
 }
 
@@ -2242,7 +3636,7 @@ function once.stage()                # transitions to the next state of th ONCE 
   #if [ "ON" = "$DEBUG" ]; then 
   #  stepDebugger ON
   #fi
-
+  stop.log "docker.build check"
   once.$ONCE_STATE "$@"
   if [ "$?" = "0" ]; then
     return $?
@@ -2266,6 +3660,7 @@ function once.hibernate()            # save environmental variables and puts onc
   
 
   set | grep "^\(export \)*ONCE_" | sed 's/^\(export \)*\(ONCE_\)\(.*\)=\(.*\)/export \2\3=\4/' >$ONCE_DEFAULT_SCENARIO/.once
+
   echo export ONCE_DEFAULT_SCENARIO=$ONCE_DEFAULT_SCENARIO >~/.once
   echo . $ONCE_DEFAULT_SCENARIO/.once >>~/.once
   echo PATH=$PATH >>~/.once
@@ -2276,8 +3671,14 @@ function once.hibernate()            # save environmental variables and puts onc
   fi
 }
 
-function once.sh() {
+function once.shell()     # enters a new shell with the current once config in the directory provided as 1st parameter
+{
   stop.log "entering once shell level $(($SHLVL/2+1))"  #whitespace is totally important
+  if [ -n "$1" ]; then
+    cd "$1"
+  fi
+  shopt -s histappend
+  PROMPT_COMMAND='history -a;history -n '
   bash
   stop.log "back to once shell level $(($SHLVL/2))"
   if [ $SHLVL == 2 ]; then
@@ -2285,18 +3686,18 @@ function once.sh() {
   fi
 }
 
-function once.sh.exit()                           # exits until at shell level 1 
-{
-    if [ $SHLVL == 2 ]; then
-      stop.log "back to once shell level $SHLVL"
-      console.log "bottom reached .... not exiting shell"
-      return      
-    else
-      stop.log "back to once shell level $SHLVL"
-      exit
-    fi
-    source $ONCE_DEFAULT_SCENARIO/.once
-}
+# function once.shell.exit()                           # exits until at shell level 1 
+# {
+#     if [ $SHLVL == 2 ]; then
+#       stop.log "back to once shell level $SHLVL"
+#       console.log "bottom reached .... not exiting shell"
+#       return      
+#     else
+#       stop.log "back to once shell level $SHLVL"
+#       exit
+#     fi
+#     source $ONCE_DEFAULT_SCENARIO/.once
+# }
 
 once.mode()                 # sets the mode to either LOCAL or DOCKER and defines if "once start" tries to use local npm oder npm in a docker container
 {
@@ -2334,6 +3735,10 @@ once.test()
 once.start()                # starts the Once Server in the background and remembers its PID; that is if no ohter instance of once is running (the forceful start of another once server is on a dynamic port counting upward from 8080)
 {
   COMMANDS="$@"
+  if [ "$1" = "completion.discover" ]; then 
+    shift
+    once.completion.discover "$@"
+  fi
   #stop.log "once.discover $COMMANDS"
   once.discover "$@"
   if [ -z "$1" ]; then 
@@ -2359,6 +3764,7 @@ once.start()                # starts the Once Server in the background and remem
         fi
         ;;
       start)
+        stop.log "once start"
         once.server.start "$@"
         ;;
       X)
@@ -2397,43 +3803,68 @@ once.start()                # starts the Once Server in the background and remem
 
 function once.startlog(){
   # once.sh
+  if [ -z "$ONCE_SERVER_PID" ]; then
+    once.server.stop
+  fi
+
+  # once.unset
+  # once.init
+  # once.update.variables
+  # once.hibernate update
+
   once.links.fix
-  once.server.stop
+  once.bind.docker
+
+  once.status
+  
+  docker network connect once-woda-network $(hostname)
+
+  ONCE_SERVER_PID=
   once.server.start.inDocker
+
   once.log
   # tail -f /var/dev/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once/latestServer/.once
 }
 
 function once.docker.network(){
-  
+  once.check.install docker
+  once.check.install docker-compose
   echo "Checking Docker Network Status..."
   NETWORK_NAME=once-woda-network
   if [ -z $(docker network ls --filter name=^${NETWORK_NAME}$ --format="{{ .Name }}") ] ; then 
-      echo "once-woda-network not exissts, creating new..."
+      echo "${NETWORK_NAME} not exists, creating new..."
       docker network create ${NETWORK_NAME} ; 
-      echo "once-woda-network docker network created."
+      echo "${NETWORK_NAME} docker network created."
       echo
+      docker network connect ${NETWORK_NAME} $(hostname)
   else
-    echo "Docker Network 'once-woda-network' Already Exists..."
+    echo "Docker Network '${NETWORK_NAME}' Already Exists..."
   fi
 }
 
 # once.clone.3rdpartycomponents(){
 
 # }
-function once.docker.folder.check(){
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER;
-  if [ -d "./Docker" ]; then
-    echo "Docker Directory in Scenario Default Location exists....";
-  else
-    echo "Creating 'Docker/' directory In Scenario Default Location.....";
-    mkdir -p Docker
+
+function once.check.install(){
+  if ! [ -x "$(command -v $1)" ]; then
+    echo 
+    echo 'Error: Required Package is not installed.' >&2
+    once.double.line
+    echo "Trying to install....."
+    once.docker.install
+    once.double.line
+    
   fi
+}
+
+function once.docker.folder.check(){
+    checkAndFix  "default Docker Sceanrios location ONCE_SCENARIO/EAM/1_infrastructure/Docker" "-d" "$ONCE_SCENARIO/EAM/1_infrastructure/Docker" "once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker"
 }
 
 function once.docker.pgadmin.createdc(){
   once.docker.folder.check
-  cd ${ONCE_DEFAULT_SCENARIO_DOCKER}/Docker/
+  cd ${ONCE_SCENARIO}/EAM/1_infrastructure/Docker/
   if [ -d "./pgAdmin" ]; then
     echo "pgAdmin Directory in Scenario Default Location exists....";
   else
@@ -2500,9 +3931,21 @@ function once.docker.pgadmin.createdc(){
   tree
 }
 
+function once.docker.pgadmin.recreatedc(){
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker
+  rm -r ./pgAdmin
+  once.docker.pgadmin.createdc
+}
+
+function once.docker.postgresql.recreatedc(){
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker
+  rm -r ./PostgreSQL
+  once.docker.postgresql.createdc
+}
+
 function once.docker.postgresql.createdc(){
   once.docker.folder.check
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker
   if [ -d "./PostgreSQL" ]; then
     echo "PostgreSQL Directory in Scenario Default Location exists....";
   else
@@ -2544,20 +3987,18 @@ function once.docker.postgresql.createdc(){
       mkdir -p db.init
       cd db.init
       wget https://test.wo-da.de/EAMD.ucp/3rdPartyComponents/org/postgresql/PostgreSQL/12.2/db/01-init.sh
+      chmod +x 01-init.sh
       cd ..
-      echo '      - ./db.init:/docker-entrypoint-initdb.d/' >> docker-compose.yml
-    else
-      echo '      - ./db.init:/docker-entrypoint-initdb.d/' >> docker-compose.yml
-      # echo '      - /var/dev/EAMD.ucp/3rdPartyComponents/org/postgresql/PostgreSQL/12.2/db:/docker-entrypoint-initdb.d/' >> docker-compose.yml
     fi
     
+    echo '      - ./db.init:/docker-entrypoint-initdb.d/' >> docker-compose.yml
     echo '      - ./oncestore.db:/var/lib/postgresql/data' >> docker-compose.yml
     echo '    ports:' >> docker-compose.yml
     echo '      - "5433:5432"'  >> docker-compose.yml
     echo  ''      >> docker-compose.yml
     echo  ''      >> docker-compose.yml
-    echo 'volumes:' >> docker-compose.yml
-    echo '  db-data:' >> docker-compose.yml
+    #echo 'volumes:' >> docker-compose.yml
+    # echo '  db-data:' >> docker-compose.yml
     # echo '  pgadmin-data:' >> docker-compose.yml
     echo 'networks:' >> docker-compose.yml
     echo '  default:' >> docker-compose.yml
@@ -2571,12 +4012,13 @@ function once.docker.postgresql.createdc(){
   echo "docker-compose file created with config details:"
   echo
   cat docker-compose.yml
-  tree
+  ls -AlF
   
 }
 
 once.docker.dc.setup() #to setup PostgreSQL, pgAdmin & WODA docker in default scenario
 {
+
   echo "Creating Docker Network......"
   echo "==================================================================="
   once.docker.network
@@ -2607,7 +4049,7 @@ once.docker.dc.setup() #to setup PostgreSQL, pgAdmin & WODA docker in default sc
 
 function once.docker.pgadmin.build(){
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/pgAdmin/4.18/
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
   echo "Checking docker status...."
   docker-compose ps --services --filter "status=running" | grep once-pgadmin 
   export status=$?
@@ -2621,8 +4063,10 @@ function once.docker.pgadmin.build(){
 }
 
 function once.docker.pgadmin.rebuild(){
+  once.docker.pgadmin.stop
+  once.docker.postgresql.recreatedc
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/pgAdmin/4.18/
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
   echo "Checking docker status...."
   docker-compose ps --services --filter "status=running" | grep once-pgadmin 
   export status=$?
@@ -2637,12 +4081,14 @@ function once.docker.pgadmin.rebuild(){
 
 function once.docker.pgadmin.start(){
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/pgAdmin/4.18/
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
   echo "Checking docker status...."
   docker-compose ps --services --filter "status=running" | grep once-pgadmin 
   export status=$?
   if [ $status = 0 ]; then
     echo "Container is runing...";
+    echo "Entering in container...";
+    docker exec -it once-pgadmin sh
   else
     echo "Container is not runing...";
     echo "Building container...";
@@ -2654,7 +4100,7 @@ function once.docker.pgadmin.start(){
 
 function once.docker.postgresql.build(){
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/PostgreSQL/12.2
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2
   echo "Checking docker status...."
   docker-compose ps --services --filter "status=running" | grep once-postgresql 
   export status=$?
@@ -2668,8 +4114,10 @@ function once.docker.postgresql.build(){
 }
 
 function once.docker.postgresql.rebuild(){
+  once.docker.postgresql.stop
+  once.docker.postgresql.recreatedc
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/PostgreSQL/12.2
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2
   docker-compose ps --services --filter "status=running" | grep once-postgresql 
   export status=$?
   if [ $status = 0 ]; then
@@ -2677,22 +4125,28 @@ function once.docker.postgresql.rebuild(){
   else
     echo "Container is not runing...";
     echo "Building container...";
-    docker-compose build --no-cache
+    docker image rm postgres:12.2
+    rm -r ./oncestore.db
+    docker-compose up --build --force-recreate -d
   fi
 }
 
 
 function once.docker.postgresql.start(){
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/PostgreSQL/12.2
+  once.docker.postgresql.createdc
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2
+  
   docker-compose ps --services --filter "status=running" | grep once-postgresql 
   export status=$?
-  if [ $status = 0 ]; then
+  if [ $status = 1 ]; then
     echo "Container is runing...";
+    echo "Entering in container...";
+    docker exec -it once-postgresql bash
   else
     echo "Container is not runing...";
     echo "Starting container...";
-    docker-compose up --build
+    docker-compose up -d
   fi
 }
 
@@ -2701,7 +4155,7 @@ function once.docker.postgresql.start(){
 
 
 function once.get_current_env(){
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/WODA/4.3.0
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
   if [ -f "current.env" ]; then
     rm current.env
   else
@@ -2711,30 +4165,37 @@ function once.get_current_env(){
 }
 
 function once.copy_once_to_default_woda_docker(){
-  if [ -f "$ONCE_DEFAULT_DOCKER_WODA/once.sh" ]; then
-    rm $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/WODA/4.3.0/once.sh
+  if [ -f "$ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0/once.sh" ]; then
+    rm $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0/once.sh
   fi
-  cp $ONCE_DIR/src/sh/once.sh $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/WODA/4.3.0
+  cp /var/dev/EAMD.ucp/Components/tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/once.sh $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
+}
+
+function once.docker.woda.recreatedc(){
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/
+  rm -r ./WODA
+  once.docker.woda.createdc
 }
 
 function once.docker.woda.createdc(){
-  once.docker.folder.check
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/
-  if [ -d "./WODA" ]; then
-    echo "WODA Directory in Scenario Default Location exists....";
-  else
-    echo "Creating 'WODA/' directory In Scenario Default Location.....";
-    mkdir -p WODA
-    mkdir -p WODA/4.3.0    
-  fi
-  cd WODA/4.3.0
+  # once.docker.folder.check
+  once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
+  # if [ -d "./WODA" ]; then
+  #   echo "WODA Directory in Scenario Default Location exists....";
+  # else
+  #   echo "Creating 'WODA/' directory In Scenario Default Location.....";
+  #   mkdir -p WODA
+  #   mkdir -p WODA/4.3.0    
+  #   #once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
+  # fi
+  # cd WODA/4.3.0
   if [ -f "current.env" ]; then
     rm current.env
   fi
   echo ONCE_DOCKER_HOST=$HOSTNAME >> current.env
   export ONCE_DOCKER_HOST=$HOSTNAME
   cat current.env
-  tree
   if [ ! -f "once.sh" ]; then
       cp /var/dev/EAMD.ucp/Components/tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/once.sh ./
   fi
@@ -2753,12 +4214,14 @@ function once.docker.woda.createdc(){
     echo "      - current.env" >> docker-compose.yml
     echo "    ports:" >> docker-compose.yml
     echo "      - 8080:8080" >> docker-compose.yml
-    echo "      - 8643:8443" >> docker-compose.yml
-    echo "      - 6001:5001" >> docker-compose.yml
-    echo "      - 6002:5002" >> docker-compose.yml
+    echo "      - 8443:8443" >> docker-compose.yml
+    echo "      - 5001:5001" >> docker-compose.yml
+    echo "      - 5002:5002" >> docker-compose.yml
+    echo "      - 5005:5005" >> docker-compose.yml
     echo "    volumes:" >> docker-compose.yml
     echo "      - /var/dev/EAMD.ucp/Components/tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/:/usr/local/sbin/" >> docker-compose.yml
-    echo "      - /var/dev/EAMD.ucp:/var/dev/EAMD.ucp" >> docker-compose.yml
+#    echo "      - /var/dev/EAMD.ucp:/var/dev/EAMD.ucp" >> docker-compose.yml
+    echo "      - /var/run/docker.sock:/var/run/docker.sock" >> docker-compose.yml
     echo "    command: 'once startlog'" >> docker-compose.yml
     echo "networks:" >> docker-compose.yml
     echo "  default:" >> docker-compose.yml
@@ -2773,26 +4236,29 @@ function once.docker.woda.createdc(){
     echo "Creating Dockerfile......."
     echo "# Pull base image." >> Dockerfile
     echo "FROM ubuntu:20.04" >> Dockerfile
-
+    
+    echo "ENV ONCE_DOCKER_HOST $HOSTNAME" >> Dockerfile
 
     echo "WORKDIR /root/" >> Dockerfile
     echo "ADD ./once.sh ./once.sh" >> Dockerfile
     echo "RUN chmod +x ./once.sh" >> Dockerfile
     echo "RUN ./once.sh docker.build" >> Dockerfile
-    echo "RUN ./once.sh links.fix" >> Dockerfile
+    # echo "RUN ./once.sh init" >> Dockerfile
+    # echo "RUN ./once.sh links.fix" >> Dockerfile
     # RUN curl -sL https://deb.nodesource.com/setup_16.x | bash -
 
     echo "CMD [ "/bin/bash" ]" >> Dockerfile
     echo "# Expose ports." >> Dockerfile
     echo "EXPOSE 8080" >> Dockerfile    
     cat Dockerfile
-    tree
+    ls
+    pwd
   fi
 }
 
 function once.docker.woda.build(){
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/WODA/4.3.0
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
   docker-compose ps --services --filter "status=running" | grep woda
   export status=$?
   if [ $status = 0 ]; then
@@ -2807,7 +4273,14 @@ function once.docker.woda.build(){
 
 function once.docker.woda.rebuild(){
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/WODA/4.3.0
+  unset ONCE_DEFAULT_SCENARIO
+  unset SCENARIOS_DIR
+  once.scenario.fix
+
+  once.scenario.map woda
+
+  once.docker.woda.recreatedc
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
   docker-compose ps --services --filter "status=running" | grep woda
   export status=$?
   if [ $status = 0 ]; then
@@ -2815,14 +4288,15 @@ function once.docker.woda.rebuild(){
   else
     once.copy_once_to_default_woda_docker
     # once.get_current_env
-    docker-compose build --no-cache
+    docker-compose up --build --force-recreate
   fi
   
 }
 
 function once.docker.woda.start(){
   once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/WODA/4.3.0
+  once.docker.woda.createdc
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
   echo "Checking docker status...."
   docker-compose ps --services --filter "status=running" | grep woda
   export status=$?
@@ -2834,6 +4308,10 @@ function once.docker.woda.start(){
     once.copy_once_to_default_woda_docker
     # once.get_current_env
     # pwd
+
+    #docker network connect once-woda-network $(hostname)
+    once.docker.postgresql.start
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
     docker-compose up
   fi
   
@@ -2848,9 +4326,9 @@ once.docker.postgresql()  #to setup postgresql docker in default scenerio
   once.docker.postgresql.start
 }
 
-function once.docker.postgresql.down(){
+function once.docker.postgresql.stop(){
   # once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/PostgreSQL/12.2
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/PostgreSQL/12.2
   docker-compose ps --services --filter "status=running" | grep once-postgresql 
   export status=$?
   if [ $status = 1 ]; then
@@ -2868,9 +4346,9 @@ once.docker.pgadmin() #to setup pgAdmin docker in default scenerio
   once.docker.pgadmin.start
 }
 
-function once.docker.pgadmin.down(){
+function once.docker.pgadmin.stop(){
   # once.docker.network
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/pgAdmin/4.18/
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/pgAdmin/4.18/
   echo "Checking docker status...."
   docker-compose ps --services --filter "status=running" | grep once-pgadmin 
   export status=$?
@@ -2884,13 +4362,14 @@ function once.docker.pgadmin.down(){
 
 once.docker.woda()  #to setup WODA docker in default scenerio
 {
+  once.scenario.check
   once.docker.woda.createdc
-  # once.docker.woda.build
+  once.docker.woda.build
   once.docker.woda.start
 }
 
-function once.docker.woda.down(){
-  cd $ONCE_DEFAULT_SCENARIO_DOCKER/Docker/WODA/4.3.0
+function once.docker.woda.stop(){
+  cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/WODA/4.3.0
   echo "Checking docker status...."
   docker-compose ps --services --filter "status=running" | grep woda
   export status=$?
@@ -2901,7 +4380,7 @@ function once.docker.woda.down(){
   else
       echo "Docker Container is not running..."
   fi
-  
+  once.docker.postgresql.stop
 }
 
 function once.1() {
@@ -2936,7 +4415,8 @@ function once.3() {
   shift
   RETURN=$1
 }
-function once.4(){
+
+function once.4() {
   grep -w '$1' /root/scripts/once
   export st=$?
   if [ $st = 1 ] && [ $1 != 'cmd']; then
@@ -2946,6 +4426,402 @@ function once.4(){
     once cmd $1
     shift
   fi
+  RETURN=$1
 }
+
+
+
+
+
+
+
+function once.double.line(){
+  echo 
+  echo "================================================================================"
+  echo
+}
+
+
+once.users.list () #To List All System Users
+{
+    cd /home/
+    i=1;
+    declare -a array;
+    array[ 0 ]="root"
+    for userName in $(ls); do
+        if [ -f "./$userName/.profile" ]; then
+            array[ $i ]=$userName;
+            ((i++))
+        fi
+    done
+    once.double.line 
+    echo "List Of System Users: "
+    echo 
+    count=1;
+    for i in "${array[@]}"
+    do 
+        echo "$count. $i";
+        ((count++))
+    done
+    once.arrayToStr ${array[@]}
+  once.double.line
+}
+
+function once.user.new () # To Add New User With Home Directory
+{
+  
+  if [ -z $1 ]; then
+    once.double.line
+    echo "Please Specify New Username:........."
+    echo "e.g once add.new.user {username}"
+    once.double.line
+  else
+    once.users.list
+    once.strToArray "$arrayString"
+    i=0;
+    for userName in "${array[@]}"
+    do 
+        
+        if [ "$userName" = "$1" ]; then          
+          
+          ((i++))        
+        fi
+
+    done
+    if [ $i -eq 1 ]; then
+      echo "$1 User Already exists....";                
+      # once.double.line
+    else
+      echo  "Creating New User With Username $1";
+      if [ "$(whoami)" = "root" ]; then
+        useradd -m -G sudo $1
+        passwd $1
+        array[ $i ]=$1;
+      else
+        echo 
+        echo "Root Login required to setup new user...."                
+        # once.double.line
+      fi
+    fi
+    once.users.list
+  fi
+}
+
+
+function once.arrayToStr(){
+    array=($@)
+
+    arrayString=""
+    for (( i=0; i<${#array[@]}; i++ )); do
+        if [[ $i == 0 ]]; then
+            arrayString="\"${array[i]}\""
+        else
+            arrayString="${arrayString} \"${array[i]}\""
+        fi
+    done
+
+    export arrayString="(${arrayString})"
+}
+
+function once.strToArray(){
+    str=$1
+
+    array=${str//\"/}
+    array=(${array//[()]/""})
+
+    export array=${array[@]}
+}
+
+function once.ssh.oinit (){
+  once.users.list
+  once.strToArray "$arrayString"  
+  echo "Checking All Users SSH Config: "
+  echo 
+  count=1;
+  for i in "${array[@]}"
+  do 
+      echo "$count. $i";
+      echo "Checking SSH Config...";
+      once.ssh $i
+      # setup_ssh $i;
+      # setup_dev_dir $i
+      ((count++))
+  done
+}
+
+once.ssh () #To Setup Users SSH Access
+{
+  if [ -z $1 ]; then
+    echo 
+    echo "Please Specify Username:........."
+    echo "e.g once ssh {username}"
+    once.double.line
+  else
+    if [ "$1" = "root" ]; then            
+      if [ "$USER" = "root" ]; then
+        if [ ! -e "/$1/.ssh/id_rsa" ]; then
+            cd /
+            if [ ! -d "/$1/scripts/" ]; then
+                curl http://wo-da.de/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/NewUserStuff/scripts.zip -o scripts.zip
+                if [ ! -d "./scripts" ]; then   
+                    unzip scripts.zip                
+                    mv scripts /root/scripts
+                else
+                    rm -r scripts;
+                    unzip scripts.zip
+                fi
+            fi
+            mkdir -p /$1/.ssh
+            cp -r /$1/scripts/templates/developking.ssh/* /$1/.ssh/
+            chown $1:$1 /$1/.ssh/ 
+            chmod 750 /$1/.ssh/
+            chmod 600 /$1/.ssh/id_rsa
+            chmod 644 /$1/.ssh/id_rsa.pub
+            # tree -L 5
+            export SSH_PATH="/$1/.ssh/id_rsa";
+            echo "SSH PATH: "$SSH_PATH;
+            echo
+        else
+            export SSH_PATH="/$1/.ssh/id_rsa";
+            echo "SSH PATH: "$SSH_PATH;
+            echo 
+        fi
+      else
+        echo "Root Login required to setup root user...."
+        echo
+      fi
+    else
+        if [ ! -e "/home/$1/.ssh/id_rsa" ]; then
+            cd /
+            if [ ! -e "scripts.zip" ]; then
+                curl http://wo-da.de/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/NewUserStuff/scripts.zip -o scripts.zip
+                if [ ! -d "./scripts" ]; then  
+                    unzip scripts.zip
+                else
+                    rm -r scripts;
+                    unzip scripts.zip
+                fi
+            fi
+            
+            mkdir -p /home/$1/.ssh
+            cp -r ./scripts/templates/developking.ssh/* /home/$1/.ssh/
+            chown $1:$1 /home/$1/.ssh/ 
+            chmod 700 /home/$1/.ssh/
+            chmod 600 /home/$1/.ssh/id_rsa
+            chmod 644 /home/$1/.ssh/id_rsa.pub
+            # tree -L 5
+            export SSH_PATH="/home/$1/.ssh/id_rsa";
+            echo "SSH PATH: "$SSH_PATH;
+            echo
+        else
+            echo "SSH Config Exists..."
+            export SSH_PATH="/home/$1/.ssh/id_rsa";
+            echo "SSH PATH: "$SSH_PATH;
+            echo 
+        fi
+    fi
+  
+  fi
+  once.double.line
+}
+
+function once.current.user.ssh.path(){
+  if [ "$USERNAME" = "root" ] || [ "$USERNAME" = "freemiumUser" ]; then
+      export SSH_PATH="/root/.ssh/id_rsa"
+  else
+      export SSH_PATH="/home/${USERNAME}/.ssh/id_rsa"
+  fi
+
+  # if [ -f $SSH_PATH ]; then
+  #     echo $SSH_PATH
+  # else
+  #     echo "NA"
+  # fi
+}
+
+function once.check.user(){
+  if [ ! "$USER" = "root" ]; then
+    echo
+    echo "Root Login or sudo required...."
+    once.double.line
+    exit
+  fi
+}
+
+function once.mkdir.dev(){
+  once.check.user
+    if [ ! -f "/var/dev" ]; then
+      
+      cd /var/
+      mkdir -p dev
+      groupadd dev
+      useradd -m -g dev $USER
+      chgrp -R dev /var/dev/      
+      chown -R $USER /var/dev/
+      # chown -R $USER:dev /var/dev
+    else
+      echo "/var/dev Directory already exists.........."
+      once.double.line
+    fi
+}
+
+function once.git.init() {
+  once.clone.components
+  once.clone.3rdpartycomponents
+}
+
+# function once.EAMD.ucp(){
+#   once.components  
+# }
+
+# function once.EAMD.ucp()   # expect "init" as an optional parameter and will force reinstallation of the EAMD.ucp directory
+# {
+#   once.clone.components $1
+# }
+
+once.components(){
+  if [ ! -f "/home/$USER/.ssh/id_rsa" ]; then
+    once.ssh $USER
+  else
+    if [ -d "/var/dev/EAMD.ucp" ] && [ "$1" = "init" ]; then
+        cd /var/dev
+        export file_name="EAMD.ucp.bkp."$(date +"%Y%m%d%H%M%S")
+        mv EAMD.ucp $file_name
+        message "Installing EAMD.ucp...."
+
+        message "Creating New EAMD.ucp..."
+
+        GIT_SSH_COMMAND='ssh -i $SSH_PATH -o IdentitiesOnly=yes' git clone git@bitbucket.org:donges/eamd.ucp.git EAMD.ucp
+        cd EAMD.ucp
+        git checkout -t origin/$ONCE_LATEST_BRANCH
+        cd /
+        rm ./EAMD.ucp
+        ln -s /var/dev/EAMD.ucp
+    elif [ ! -d "/var/dev/EAMD.ucp" ]; then
+        message "Creating EAMD.ucp..."
+        cd /var/dev
+        GIT_SSH_COMMAND='ssh -i $SSH_PATH -o IdentitiesOnly=yes' git clone git@bitbucket.org:donges/eamd.ucp.git EAMD.ucp
+        cd EAMD.ucp
+        git checkout -t origin/$ONCE_LATEST_BRANCH
+        cd /
+        rm ./EAMD.ucp
+        ln -s /var/dev/EAMD.ucp
+    else
+        echo "EAMD.ucp Already Exists...."
+    fi
+  fi
+}
+
+once.repo.clone.3rdpartycomponents(){
+  cd $REPO_DIR
+  if [ -d "$REPO_DIR/3rdPartyComponents/com" ] && [ ! "$1" = "force" ]; then
+    warn.log "3rdPartyComponents aready present"
+  else
+    if [ -d "$REPO_DIR/3rdPartyComponents/" ]; then
+      mv $REPO_DIR/3rdPartyComponents $REPO_DIR/3rdPartyComponents.bak
+    fi
+    git clone git@bitbucket.org:donges/3rdpartycomponents.git 3rdPartyComponents
+  fi
+}
+
+function once.repo.clone.3rdpartycomponents.completion(){
+  echo "force check"
+}
+
+
+once.clone.3rdpartycomponents(){
+  # export $SSH_PATH="$(once.current.user.ssh.path)"
+  once.current.user.ssh.path
+  if [ ! -f "$SSH_PATH" ]; then
+    once.ssh $USER
+  else
+    if [ -d "/var/dev/EAMD.ucp/3rdPartyComponents/com" ] && [ "$1" = "init" ]; then
+        message "Installing 3rdPartyComponents..."
+        cd /var/dev/EAMD.ucp
+        rm -r 3rdPartyComponents
+        GIT_SSH_COMMAND='ssh -i $SSH_PATH -o IdentitiesOnly=yes' git clone git@bitbucket.org:donges/3rdpartycomponents.git 3rdPartyComponents
+    else
+        message "Creating New EAMD.ucp/3rdPartyComponents...."
+        cd /var/dev/EAMD.ucp
+        rm -r 3rdPartyComponents
+        GIT_SSH_COMMAND='ssh -i $SSH_PATH -o IdentitiesOnly=yes' git clone git@bitbucket.org:donges/3rdpartycomponents.git 3rdPartyComponents
+    fi
+  fi
+}
+
+once.completion.discover() 
+{
+  local detail=$1
+  if [ -n "$detail" ]; then
+    shift
+  fi
+
+  local prev=$1
+  if [ "$prev" = "once" ]; then
+    prev=""
+  fi
+  
+  if [ -n "$prev" ]; then
+    shift
+    once.$prev.completion $detail
+  else 
+    grep "^once\.$detail.*()" ~/scripts/once | sed 's/^\(once\.\)\(.*\)\(().*\)/\2/' | sort
+  fi
+
+  exit 0
+}
+
+once.dc.list() {
+  once.scenario.map.load
+  echo ${SCENARIO_MAP_KEYS[@]}
+}
+
+once.su.completion() {
+  grep "^function once\.$1.*()" ~/scripts/once | sed 's/^\(function once\.\)\(.*\)\(().*\)/\2/' | sort
+}
+
+once.dc.stop.completion() {
+  once.scenario.map.load
+  compgen -W "$(echo ${SCENARIO_MAP_KEYS[@]})" -- $1
+}
+once.dc.start.completion() {
+  once.dc.stop.completion $1
+}
+once.dc.create.completion() {
+  once.dc.stop.completion $1
+}
+once.dc.delete.completion() {
+  once.dc.stop.completion $1
+}
+
+once.completion.install() 
+{
+  DIR=${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions
+  once.path.create $DIR
+  echo "
+_once_commands()
+{
+    #echo processing once completion
+    local cur prev opts
+    #local IFS=$'\\n'
+
+    COMPREPLY=()
+    cur="\${COMP_WORDS[COMP_CWORD]}"
+    prev="\${COMP_WORDS[COMP_CWORD-1]}"
+    #opts=\$(grep \"^once\.\${cur}.*()\" ~/scripts/once | sed 's/^\(once\.\)\(.*\)\(().*\)/\2/')
+    opts=\$(once completion.discover \${cur} \${prev})
+    #echo cool \${opts}
+
+    COMPREPLY=( "\${opts}" )
+    return 0
+}
+complete -F _once_commands once  
+  " >$DIR/_once_commands
+  if [ ! -f ~/.bashrc.bak.without.completion ]; then
+    cp ~/.bashrc ~/.bashrc.bak.without.completion 
+  fi
+  cp /var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/NewUserStuff/scripts/templates/.bashrc ~/.bashrc
+} 
+
 
 once.start "$@"
