@@ -2,7 +2,7 @@
 
 # ONCE 4.3.0 test/sprint23
 
-#export PS4='+${LINENO}: '
+export PS4='\033[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \033[0m'
 #source 'lib.trap.sh'
 #DEBUG=ON
 set -E
@@ -244,7 +244,7 @@ else
   function setTrap() {
     echo "trap DEBUG set to step"
     #export PS4='\033[37m+${LINENO}: \033[0m'
-    export PS4='\033[90m+${LINENO}: '
+    export PS4='\033[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \033[0m'
     
     #( trap step DEBUG ) 2>/dev/null
     trap step DEBUG 
@@ -763,9 +763,6 @@ once.cmd()                  # checks if the <command> is available or is being i
             mkcert)
               once.mkcert.install
               ;;
-            update)
-              apt-get update
-              ;;
             *)
               $ONCE_PM $package
             esac
@@ -1014,6 +1011,11 @@ once.scenario.map.init() {
   SCENARIO_MAP_DI_NAME[4]="postgresql:${SCENARIO_MAP_VERSION[0]}" 
   SCENARIO_MAP_VALUES[4]="/EAM/1_infrastructure/Once/latestServer/PostgreSQLv.${SCENARIO_MAP_VERSION[0]}" 
 
+
+  SCENARIO_MAP_VERSION[5]="1.7.0"
+  SCENARIO_MAP_DC_NAME[5]="certbot"
+  SCENARIO_MAP_DI_NAME[5]="certbot:${SCENARIO_MAP_VERSION[0]}" 
+  SCENARIO_MAP_VALUES[5]="/EAM/1_infrastructure/Once/latestServer/Certbotv.${SCENARIO_MAP_VERSION[0]}" 
   #declare -a
 }
 
@@ -1296,18 +1298,6 @@ function once.bind.structr.local()
   #fi
     RETURN=$1
 }
-
-function once.bind.structr.test() 
-{
-  #if [ "$ONCE_MODE" = "IN_DOCKER" ]; then
-    warn.log "in docker....making everything localhost"
-
-    export ONCE_STRUCTR_SERVER=https://test.wo-da.de:8083
-    once.hibernate update
-  #fi
-    RETURN=$1
-}
-
 
 function once.bind.structr.proxy.local() 
 {
@@ -2339,18 +2329,12 @@ function once.mv()                   # to be deleted: moves the Repo prefix...ju
 once.links.fix()            # checks that the once and once.sh are links to the latest files after repo.init
 {
   local DIR=$(dirname $This)
-  if [ -z "$1" ]; then
-  
-    if [ "$DIR" = "." ]; then
-      DIR=$startDir
-    fi
+  if [ "$DIR" = "." ]; then
+    DIR=$startDir
+  fi
 
-    if [ "$DIR" = "$ONCE_DIR/src/sh" ]; then
-      DIR=/usr/local/sbin
-    fi
-  else
-    DIR="$1"
-    console.log "fixing links in: $DIR"
+  if [ "$DIR" = "$ONCE_DIR/src/sh" ]; then
+    DIR=/usr/local/sbin
   fi
 
   if [ "$DIR" = "/usr/local/sbin" ]; then
@@ -2779,6 +2763,234 @@ once.docker.config(){
       echo
     fi
     once.docker.build woda
+  elif [ $1 = "ssl" ]; then
+    once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker/Nginx/1.15/src
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/Nginx/1.15/src
+    if [ -f "app.conf" ]; then
+      rm app.conf
+    fi
+      {
+        echo "  map $http_upgrade $connection_upgrade {"
+        echo "  default upgrade;"
+        echo "  '' close;"
+        echo "  }"
+      
+
+        echo "upstream structr_server  {"
+        echo "    server 127.0.0.1:8082 fail_timeout=0;"
+        echo "    server localhost:8082 fail_timeout=0;"
+        echo "    server $2:8082 fail_timeout=0;"
+        echo "}
+
+
+        echo "upstream http_server  {""
+            # enable sticky session based on IP
+        echo "    ip_hash;"
+
+        echo "    server 127.0.0.1:8080 fail_timeout=0;"
+        echo "    server localhost:8080 fail_timeout=0;"
+        echo "    server $1:8080 fail_timeout=0;"
+        echo "}"
+
+        echo "upstream https_server  {"
+            # enable sticky session based on IP
+        echo "    ip_hash;"
+
+        echo "    server $1:8443 fail_timeout=0;"
+            #server 127.0.0.1:8443 fail_timeout=0;
+            #server localhost:8443 fail_timeout=0;
+        echo "}"
+          # ============================================================
+          # Caching Proxy Settings
+          # - everything up to point comes from default nginx Settings
+          # ============================================================
+
+          # Specifies the cache_status log format.
+        echo "  log_format cache_status '[$time_local] \"$request\" $upstream_cache_status';"
+          # access_log /var/log/nginx/access.log cache_status;
+        echo "  access_log /var/log/nginx/cache_access.log cache_status;"
+
+          # Proxy
+          # http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_path
+          # Store max 10GB for 1y of inactive resource
+        echo "  proxy_cache_path /var/cache/nginx use_temp_path=off levels=1:2 keys_zone=cache_zone:100m max_size=10g inactive=1y;"
+
+
+        # server {
+        #     listen 80;
+        #     server_name test.wo-da.de;
+        #     server_tokens off;
+        #     root /var/dev;
+        #     location /.well-known/acme-challenge/ {
+        #         root /var/www/certbot;
+        #     }
+
+
+        #     location /structr {        
+        #         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        #         proxy_set_header Host $host;
+        #         proxy_set_header X-Real-IP $remote_addr;
+
+        #         proxy_max_temp_file_size 0;     
+        #         proxy_buffering off;
+        #         proxy_connect_timeout 30;
+        #         proxy_send_timeout 30;
+        #         proxy_read_timeout 30;
+        #         proxy_pass http://structr_server;
+        #     }
+
+        #     location / {                      
+        #         autoindex on;
+        #         proxy_pass  http://http_server;
+        #         proxy_set_header    Host                $http_host;
+        #         proxy_set_header    X-Real-IP           $remote_addr;
+        #         proxy_set_header    X-Forwarded-For     $proxy_add_x_forwarded_for;
+
+
+        #     }
+        #     location /woda {        
+        #         autoindex on;
+        #         expires max;
+        #         proxy_cache cache_zone;
+        #         proxy_cache_valid 200 302 301 1y;
+        #         proxy_cache_key $scheme://$host$request_uri;
+        #         proxy_pass  http://http_server/woda;
+        #         #proxy_pass $scheme://$host$request_uri;
+        #         proxy_set_header Host $http_host;
+        #         proxy_set_header X-Real-IP $remote_addr;
+        #         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        #         add_header X-Cached $upstream_cache_status;
+        #         add_header X-Cache-Server "nginx-cache";
+        #         proxy_ignore_headers "Set-Cookie"; 
+        #     }
+        #     location /EAMD.ucp {        
+        #         autoindex on;
+        #         proxy_pass  http://http_server/EAMD.ucp;
+        #         proxy_set_header    Host                $http_host;
+        #         proxy_set_header    X-Real-IP           $remote_addr;
+        #         proxy_set_header    X-Forwarded-For     $proxy_add_x_forwarded_for;
+        #     }
+
+
+        #     location /auth/ {
+        #             proxy_pass http://test.wo-da.de:9080/auth/;
+
+        #           proxy_http_version 1.1;
+
+        #           proxy_set_header Host               $host;
+        #           proxy_set_header X-Real-IP          $remote_addr;
+        #           proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;
+        #           proxy_set_header X-Forwarded-Proto  $scheme;
+        #     }  
+        # }
+
+      echo "  server {"
+      echo "      proxy_busy_buffers_size   512k;"
+      echo "      proxy_buffers   4 512k;"
+      echo "      proxy_buffer_size   256k;"
+      echo "      # rest of nginx config #"
+      echo "      listen 443 ssl;""
+      echo "      server_name $2;""
+      echo "      server_tokens off;"
+      echo "      root /var/dev;"
+      echo "      ssl_certificate /etc/letsencrypt/live/$2/fullchain.pem;"
+      echo "      ssl_certificate_key /etc/letsencrypt/live/$2/privkey.pem;"
+      echo "      include /etc/letsencrypt/options-ssl-nginx.conf;"
+      echo "      ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+      echo "      ssl_protocols       TLSv1 TLSv1.1 TLSv1.2;"
+      echo "      ssl_ciphers         HIGH:!aNULL:!MD5;"
+
+      echo "      location / {"
+      echo "          proxy_pass  https://https_server;"
+      echo "          proxy_set_header    Host                $http_host;"
+      echo "          proxy_set_header    X-Real-IP           $remote_addr;"
+      echo "          proxy_set_header    X-Forwarded-For     $proxy_add_x_forwarded_for;"
+      echo "          proxy_http_version 1.1;"
+      echo "          proxy_set_header Upgrade $http_upgrade;"
+      echo "          proxy_set_header Connection "upgrade";"
+                    
+      echo "      }"
+      echo "      location /woda {        "
+      echo "          autoindex on;"
+      echo "          expires max;"
+      echo "          proxy_cache cache_zone;"
+      echo "          proxy_cache_valid 200 302 301 1y;"
+      echo "          proxy_cache_key $scheme://$host$request_uri;"
+      echo "          proxy_pass  https://https_server/woda;"
+                #proxy_pass $scheme://$host$request_uri;
+      echo "          proxy_set_header Host $http_host;"
+      echo "          proxy_set_header X-Real-IP $remote_addr;"
+      echo "          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+      echo "          add_header X-Cached $upstream_cache_status;"
+      echo "          add_header X-Cache-Server "nginx-cache";"
+      echo "          proxy_ignore_headers "Set-Cookie";       "
+      echo "          proxy_http_version 1.1;"
+      echo "          proxy_set_header Upgrade $http_upgrade;"
+      echo "          proxy_set_header Connection $connection_upgrade;"
+
+      echo "      }"
+      echo "      location /structr/ {        "
+      echo "          proxy_pass http://structr_server/structr/;"
+
+      echo "            proxy_http_version 1.1;"
+
+      echo "            proxy_set_header Host               $host;"
+      echo "            proxy_set_header X-Real-IP          $remote_addr;"
+      echo "            proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;"
+      echo "            proxy_set_header X-Forwarded-Proto  $scheme;"
+      echo "      }"
+
+      echo "      location /auth/ {"
+      echo "              proxy_pass http://$2:9080/auth/;"
+
+      echo "            proxy_http_version 1.1;"
+
+      echo "            proxy_set_header Host               $host;"
+      echo "            proxy_set_header X-Real-IP          $remote_addr;"
+      echo "            proxy_set_header X-Forwarded-For    $proxy_add_x_forwarded_for;"
+      echo "            proxy_set_header X-Forwarded-Proto  $scheme;"
+      echo "      }  "
+      echo "  }"
+    
+      } >> app.conf
+    
+    once.path.create $ONCE_SCENARIO/EAM/1_infrastructure/Docker/Nginx/1.15/Certbot/1.7.0/$2
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/Nginx/1.15/Certbot/1.7.0/$2
+    if [ -f "docker-compose.yml" ]; then
+      rm docker-compose.yml
+    fi
+      {
+        echo "version: '3'"
+
+        echo "services:"
+        echo "  nginx:"
+        echo "    image: nginx:1.15-alpine"
+        echo "    restart: unless-stopped"
+        echo "    volumes:"
+        echo "      - $ONCE_SCENARIO/EAM/1_infrastructure/Docker/Nginx/1.15/src/:/etc/nginx/conf.d"
+        echo "      - ./data/certbot/conf:/etc/letsencrypt"
+        echo "      - ./data/certbot/www:/var/www/certbot"
+        echo "    ports:"
+        echo "      - '80:80'"
+        echo "      - '443:443'"
+        echo "    command: \"/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g daemon off;'\""
+        echo "  certbot:"
+        echo "    image: certbot/certbot"
+        echo "    restart: unless-stopped"
+        echo "    volumes:"
+        echo "      - ./data/certbot/conf:/etc/letsencrypt"
+        echo "      - ./data/certbot/www:/var/www/certbot"
+        echo "    entrypoint: \"/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'\""
+      } >> docker-compose.yml
+
+      echo 
+      warn.log "docker-compose.yml file created..."
+      cat docker-compose.yml
+      echo
+      # wget https://test.wo-da.de/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/1.0.0/Alpine/3.13.2/Nginx/1.15/certbot/1.7.0/test.wo-da.de/init-letsencrypt.sh
+      chmod 777 ./init-letsencrypt.sh
+      ./init-letsencrypt.sh
+
   elif [ $1 = "all" ]; then
     once.docker.config postgresql
     once.docker.config pgadmin
@@ -2925,6 +3137,93 @@ once.dc.stop()
   fi
 
 }
+
+
+function once.dc.create.ssl()
+{
+    once.dc.delete.ssl
+
+  NETWORK_NAME=once-woda-network
+  if [ -z $(docker network ls --filter name=^${NETWORK_NAME}$ --format="{{ .Name }}") ] ; then 
+      echo "${NETWORK_NAME} not exists, creating new..."
+      docker network create ${NETWORK_NAME} ; 
+      echo "${NETWORK_NAME} docker network created."
+      echo
+      docker network connect ${NETWORK_NAME} $(hostname)
+  else
+    echo "Docker Network '${NETWORK_NAME}' Already Exists..."
+  fi
+
+
+    # if [ -f "docker-compose.yml" ]; then
+    #   echo "docker-compose file already exists...";
+    #   rm docker-compose.yml
+    # fi
+
+    {
+      echo "version: '3'"
+
+      echo "services:"
+      echo "  nginx:"
+      echo "    image: nginx:1.15-alpine"
+      echo "    restart: unless-stopped"
+      echo "    volumes:"
+      echo "      - /var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/1.0.0/Alpine/3.13.2/Nginx/1.15/src/:/etc/nginx/conf.d"
+      echo "      - ./data/certbot/conf:/etc/letsencrypt"
+      echo "      - ./data/certbot/www:/var/www/certbot"
+      echo "    ports:"
+      echo "      - '80:80'"
+      echo "      - '443:443'"
+      echo "    command: \"/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g \"daemon off;\"'\""
+      echo "  certbot:"
+      echo "    image: certbot/certbot"
+      echo "    restart: unless-stopped"
+      echo "    volumes:"
+      echo "      - ./data/certbot/conf:/etc/letsencrypt"
+      echo "      - ./data/certbot/www:/var/www/certbot"
+      echo "    entrypoint: \"/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'\""
+    } >> docker-compose.yml
+
+    echo 
+    warn.log "docker-compose.yml file created..."
+    cat docker-compose.yml
+    echo
+    wget https://test.wo-da.de/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces/WODA/1.0.0/Alpine/3.13.2/Nginx/1.15/certbot/1.7.0/test.wo-da.de/init-letsencrypt.sh
+    chmod 777 ./init-letsencrypt.sh
+}
+
+function once.dc.delete.ssl()
+{
+    docker image rm $SELECTED_SCENARIO_DI_NAME
+    docker container rm $SELECTED_SCENARIO_DC_NAME
+    docker volume rm $SELECTED_SCENARIO_NAME-volume
+
+    NETWORK_NAME=once-woda-network
+    if [ -z $(docker network ls --filter name=^${NETWORK_NAME}$ --format="{{ .Name }}") ] ; then 
+        echo "${NETWORK_NAME} not exists, creating new..."
+        docker network delete ${NETWORK_NAME} ; 
+    fi
+
+
+    if [ -d "$ONCE_SCENARIO$SELECTED_SCENARIO" ]; then
+      console.log "Removing old docker config files...: $ONCE_SCENARIO$SELECTED_SCENARIO"
+      rm -r $ONCE_SCENARIO$SELECTED_SCENARIO
+      once.path.create $ONCE_SCENARIO$SELECTED_SCENARIO
+      cd $ONCE_SCENARIO$SELECTED_SCENARIO
+    fi
+    
+    # if [ -f "postgresql.env" ]; then
+    #   echo "postgresql.env file already exists...";
+    #   rm postgresql.env
+    # fi
+
+    if [ -f "docker-compose.yml" ]; then
+      echo "docker-compose file already exists...";
+      rm docker-compose.yml
+    fi
+
+}
+
 
 function once.dc.delete.pg()
 {
@@ -3332,6 +3631,17 @@ once.docker.start(){
     else
       docker-compose up
     fi
+  elif [ $1 == "ssl" ]; then
+    cd $ONCE_SCENARIO/EAM/1_infrastructure/Docker/Nginx/1.15/Certbot/1.7.0/$2
+    if [ "$(docker inspect --format='{{.State.Running}}' woda)" = "certbot" ]; then
+      echo
+      echo "Nginx & Cretbot Container is running....";
+      echo
+      docker exec -it certbot bash
+    else
+      docker-compose up
+    fi
+    
   elif [ $1 = "all" ]; then
     once.docker.start postgresql
     once.docker.start pgadmin
@@ -3439,7 +3749,7 @@ function once.check.installation.mode() {
 once.init()                 # forces reinitialisation
 {
   #stop.log "entered once.init"
-  export PS4='+${LINENO}: '
+  #export PS4='+${LINENO}: '
   #clear
   unset NEW
   once.version
@@ -3671,14 +3981,8 @@ function once.hibernate()            # save environmental variables and puts onc
   fi
 }
 
-function once.shell()     # enters a new shell with the current once config in the directory provided as 1st parameter
-{
+function once.shell() {
   stop.log "entering once shell level $(($SHLVL/2+1))"  #whitespace is totally important
-  if [ -n "$1" ]; then
-    cd "$1"
-  fi
-  shopt -s histappend
-  PROMPT_COMMAND='history -a;history -n '
   bash
   stop.log "back to once shell level $(($SHLVL/2))"
   if [ $SHLVL == 2 ]; then
@@ -4712,22 +5016,9 @@ once.components(){
   fi
 }
 
-once.repo.clone.3rdpartycomponents(){
-  cd $REPO_DIR
-  if [ -d "$REPO_DIR/3rdPartyComponents/com" ] && [ ! "$1" = "force" ]; then
-    warn.log "3rdPartyComponents aready present"
-  else
-    if [ -d "$REPO_DIR/3rdPartyComponents/" ]; then
-      mv $REPO_DIR/3rdPartyComponents $REPO_DIR/3rdPartyComponents.bak
-    fi
-    git clone git@bitbucket.org:donges/3rdpartycomponents.git 3rdPartyComponents
-  fi
+function once.3rdpartycomponents(){
+  once.clone.3rdpartycomponents $1
 }
-
-function once.repo.clone.3rdpartycomponents.completion(){
-  echo "force check"
-}
-
 
 once.clone.3rdpartycomponents(){
   # export $SSH_PATH="$(once.current.user.ssh.path)"
