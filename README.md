@@ -8,5 +8,7 @@ wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oo
 chmod 700 oosh
 ./oosh
 
+
+or
 cat oosh | sh -x
 ```
