@@ -5,5 +5,8 @@ Unified shell environment for UCP components and ONCE the Object Network Communi
 ## use it anywhere
 ```
 wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh ;
-cat oosh | bash -x
+chmod 700 oosh
+./oosh
+
+cat oosh | sh -x
 ```
