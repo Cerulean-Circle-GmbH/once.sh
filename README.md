@@ -25,6 +25,8 @@ cat oosh | sh -x
 ### you do not have curl or wget: try
 
 ```
+sudo apt update
+
 sudo apt install curl
 
 or 
