@@ -21,15 +21,26 @@ cat oosh | sh -x
 | **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
 
 
-
 ### you do not have curl or wget: try
 
 ```
 sudo apt update
-
 sudo apt install curl
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)
 
-or 
+or as root
 
-sudo apt install wget
+apt update
+apt install curl
+sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"
+```
+
+
+## Advanced usage
+
+setup a once server management environment
+
+```
+    oosh/init/once
+    
 ```
