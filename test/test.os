@@ -18,24 +18,24 @@ log.level $level
 competionArray=(once config list file ite)
 source oo
 
-test.ooTest() 
+test.os() 
 {
 ((TEST_COUNTER++))
 console.log "
 
 
-Test 0: ooTest \"$*\"
+Test 0: os \"$*\"
 ===================================================================="
-ooTest.start "$@"
+os.start "$@"
 console.log "RETURN: $RETURN_VALUE  Result: $RESULT 
 ===================================================================="
 }
 
-test.case - "ooTest test start" \
-   ooTest $*
+test.case - "os test start" \
+   os $*
 expect 0 "*" "Test start"
 
-source ooTest
+source os
 
 ### test.method
 
