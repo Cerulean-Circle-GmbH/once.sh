@@ -66,7 +66,7 @@ os.usage()
       ----      --------------------------"
   this.help
   echo "
-  
+  ${NO_COLOR}
   Examples
     $this v
     $this init
