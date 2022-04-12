@@ -22,7 +22,7 @@ os.info() {
     "
 }
 
-os.check() { # <methodn> # is true if an OS was detected. LOG LEVEL 4 to see output. 
+os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see output. 
   info.log "detecting OS:  $OSTYPE" 
   local method="$1"
   if [ -n "$1" ]; then
@@ -70,6 +70,18 @@ os.usage()
   Examples
     $this v
     $this init
+
+    code:${GREEN}
+    source os
+
+    if os.check ossh.service.status; then
+      echo Will call ossh.service.status.detectedOS
+      $RESULT "$@"
+    else
+      important.log "$RESULT is not supported"
+    fi  
+
+
   "
 }
 
