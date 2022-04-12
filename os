@@ -22,7 +22,7 @@ os.info() {
     "
 }
 
-os.check() {
+os.check() { # <methodn> # is true if an OS was detected. LOG LEVEL 4 to see output. 
   info.log "detecting OS:  $OSTYPE" 
   local method="$1"
   if [ -n "$1" ]; then
@@ -35,6 +35,7 @@ os.check() {
       ;;
     linux*)
       info.log "      Linux detected"
+      method="$method.linux"
       ;;
     *)
       important.log "  could not determine OS... please contribute to os.check"
@@ -62,7 +63,9 @@ os.usage()
       usage     prints this dialog while it will print the status when there are no parameters          
       v         print version information
       init      initializes ...nothing yet
-      ----      --------------------------
+      ----      --------------------------"
+  this.help
+  echo "
   
   Examples
     $this v
