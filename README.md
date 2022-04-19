@@ -61,7 +61,7 @@ Basically you will follow a state machine
     once v                                  # gives you the current once version
     once init                               # create a ONCE configuration for the current user
 
-    follow the state machine....once told you in once init what to do next
+    **follow the state machine....*** once told you in `once init` what to do next
     once domain.set <your.domain.com>       # sets the domain for this installation. 
                                             # user localhost if its a development installation
     once domain.discover                    # gets the domain from the host configuration
@@ -72,7 +72,7 @@ Basically you will follow a state machine
     once stage next                         # tries to stage one step in the state list
 
     once check.STATE_NAME                   # checks if this state is already reached
-    e.g.            
+    e.g.                                    # TAB completion should work. press TAB TAB to see all options
     once check.domain.set
 
     TROUBLE SHOOTING
