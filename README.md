@@ -77,5 +77,7 @@ Basically you will follow a state machine
 
     TROUBLE SHOOTING
     once state.su.set <stateNameOrNumber>   # sets the state hard so that you can skip states 
+
+    once bind test.wo-da.de                 # binds the config to keycloak on test.wo-da.de
     
 ```
