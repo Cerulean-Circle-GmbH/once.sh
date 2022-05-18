@@ -20,7 +20,7 @@ os.info() {
                 type  : $HOSTTYPE
                 OS    : $OSTYPE
 
-                Name  : $PRETTY_NAME
+                Name  : ${GREEN}$PRETTY_NAME${NORMAL}
 
        package manager: $OOSH_PM
     "
