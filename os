@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #clear
-#export PS4='\033[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \033[0m'
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
 #set -x
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
 ### new.method
 
-os.info() {
+os.info() { # <verbose> # shows info abut the running os. add v to get more details
+  source /etc/os-release
   echo "              
           shell level: $SHLVL
 
@@ -18,8 +19,14 @@ os.info() {
               hostname: $HOSTNAME
                 type  : $HOSTTYPE
                 OS    : $OSTYPE
+
+                Name  : ${GREEN}$PRETTY_NAME${NORMAL}
+
        package manager: $OOSH_PM
     "
+  if [ -n "$1" ]; then
+    cat /etc/os-release
+  fi
 }
 
 os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see output. 
