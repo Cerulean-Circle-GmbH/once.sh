@@ -19,6 +19,7 @@ os.info() {
               hostname: $HOSTNAME
                 type  : $HOSTTYPE
                 OS    : $OSTYPE
+
                 Name  : $PRETTY_NAME
 
        package manager: $OOSH_PM
