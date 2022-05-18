@@ -7,7 +7,7 @@
 
 ### new.method
 
-os.info() {
+os.info() { # <verbose> # shows info abut the running os. add v to get more details
   source /etc/os-release
   echo "              
           shell level: $SHLVL
