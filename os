@@ -8,6 +8,7 @@
 ### new.method
 
 os.info() {
+  source /etc/os-release
   echo "              
           shell level: $SHLVL
 
@@ -18,8 +19,13 @@ os.info() {
               hostname: $HOSTNAME
                 type  : $HOSTTYPE
                 OS    : $OSTYPE
+                Name  : $PRETTY_NAME
+
        package manager: $OOSH_PM
     "
+  if [ -n "$1" ]; then
+    cat /etc/os-release
+  fi
 }
 
 os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see output. 
