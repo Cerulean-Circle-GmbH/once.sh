@@ -53,12 +53,11 @@ fs.OS_user_home() # <?user> #
 
   if [[ -n $target ]]; then
     create.result 0 "$target"
-    printf "$target" 2> /dev/null
-    exit "$(result)"
+    return "$(result)"
   else
     create.result 1 "No recognised home directory for $user"
     echo "No recognised home directory for $user"
-    exit "$(result)"
+    return "$(result)"
   fi
 
 }
