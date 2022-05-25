@@ -27,6 +27,42 @@ fs.ln()     # <$lnMode> <$thePath> <?$targetDir> <?$called> <?$group> <$allUsers
  return $(result)
 }
 
+fs.OS_user_home() # <?user> #
+{
+  local user="$1"
+  shift
+
+  if [[ -z $user ]]; then
+    user="$(whoami)"
+  fi
+
+  local target
+  if [[ "$OOSH_OS" == "linux-gnu"* ]]; then
+    target="/home/$user"
+  elif [[ "$OOSH_OS" == "darwin"* ]]; then
+    target="/users/$user"
+  elif [[ "$OOSH_OS" == "cygwin" ]]; then
+    target=""
+  elif [[ "$OOSH_OS" == "msys" ]]; then
+    target=""
+  elif [[ "$OOSH_OS" == "win32" ]]; then
+    target=""
+  elif [[ "$OOSH_OS" == "freebsd"* ]]; then
+    target=""
+  fi
+
+  if [[ -n $target ]]; then
+    create.result 0 "$target"
+    printf "$target" 2> /dev/null
+    exit "$(result)"
+  else
+    create.result 1 "No recognised home directory for $user"
+    echo "No recognised home directory for $user"
+    exit "$(result)"
+  fi
+
+}
+
 ### new.method
 
 fs.usage()
