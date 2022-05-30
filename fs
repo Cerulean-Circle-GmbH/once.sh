@@ -27,28 +27,41 @@ fs.ln()     # <$lnMode> <$thePath> <?$targetDir> <?$called> <?$group> <$allUsers
  return $(result)
 }
 
-fs.OS_user_home() # <?user> #
+fs.user_home() # <?user> #
 {
   local user="$1"
   shift
 
-  if [[ -z $user ]]; then
-    user="$(whoami)"
-  fi
-
   local target
-  if [[ "$OOSH_OS" == "linux-gnu"* ]]; then
-    target="/home/$user"
-  elif [[ "$OOSH_OS" == "darwin"* ]]; then
-    target="/users/$user"
-  elif [[ "$OOSH_OS" == "cygwin" ]]; then
-    target=""
-  elif [[ "$OOSH_OS" == "msys" ]]; then
-    target=""
-  elif [[ "$OOSH_OS" == "win32" ]]; then
-    target=""
-  elif [[ "$OOSH_OS" == "freebsd"* ]]; then
-    target=""
+  if [[ -z $user || $user == "$(whoami)" ]]; then
+    target=$HOME
+  else
+    case "$OOSH_OS" in
+      darwin*)
+        target="/users/$user"
+        info.log "Mac OS detected thus home is $target for user $user"
+        ;;
+      linux-gnu*)
+        target="/home/$user"
+        info.log "Linux detected thus home is $target for user $user"
+        ;;
+      cygwin)
+        target=""
+        info.log "cygwin detected thus home is $target for user $user"
+        ;;
+      msys)
+        target=""
+        info.log "msys detected thus home is $target for user $user"
+        ;;
+      win32)
+        target=""
+        info.log "win32 detected thus home is $target for user $user"
+        ;;
+      freebsd)
+        target=""
+        info.log "freebsd detected thus home is $target for user $user"
+        ;;
+    esac
   fi
 
   if [[ -n $target ]]; then
