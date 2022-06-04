@@ -7,7 +7,7 @@
 
 ### new.method
 
-os.info() { # <verbose> # shows info abut the running os. add v to get more details
+os.info() { # <verbose:> # shows info abut the running os. add v to get more details
   source /etc/os-release
   echo "              
           shell level: $SHLVL
@@ -55,6 +55,46 @@ os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see outp
     create.result 1 "$method.unknown" "$1"
   fi
   return $(result)
+}
+
+os.check.env() # #
+{
+
+  if [ -z "$OOSH_OS" ]; then
+
+    case "$OSTYPE" in
+      darwin*)
+        info.log "      Mac OS detected"
+        export OOSH_OS="darwin"
+        ;;
+      linux-gnu*)
+        info.log "      Linux detected"
+        export OOSH_OS="linux-gnu"
+        ;;
+      cygwin)
+        info.log "      cygwin detected"
+        export OOSH_OS="cygwin"
+        ;;
+      msys)
+        info.log "      msys detected"
+        export OOSH_OS="msys"
+        ;;
+      win32)
+        info.log "      win32 detected"
+        export OOSH_OS="win32"
+        ;;
+      freebsd)
+        info.log "      freebsd detected"
+        export OOSH_OS="freebsd"
+        ;;
+      *)
+        important.log "  could not determine OS... please contribute to os.check"
+        return 1
+      ;;
+    esac
+  fi
+  return 0
+
 }
 
 

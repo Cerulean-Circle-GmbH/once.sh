@@ -18,24 +18,32 @@ log.level $level
 competionArray=(once config list file ite)
 source oo
 
-test.new_script() 
+test.fs() 
 {
 ((TEST_COUNTER++))
 console.log "
 
 
-Test 0: new_script \"$*\"
+Test 0: fs \"$*\"
 ===================================================================="
-new_script.start "$@"
+fs.start "$@"
 console.log "RETURN: $RETURN_VALUE  Result: $RESULT 
 ===================================================================="
 }
 
-test.case - "new_script test start" \
-  new_script $*
+test.case - "fs test start" \
+   fs $*
 expect 0 "*" "Test start"
 
-source new_script
+source fs
+
+
+console.log "
+Test 1 
+===================================================================="
+
+test.case - "Test if a ln is created"    fs.lnCreate /var/dev ~/ snetDev snetDev snet admin
+expect 0 ""
 
 ### test.method
 
