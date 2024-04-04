@@ -4,7 +4,7 @@ Unified shell environment for UCP components and ONCE the Object Network Communi
 
 This Repo consists of two main topics
 1. The oosh object oriented bash envitonment with completion, logging and debugging
-1. the once bash script to manage a ONCE installation into eny environment
+1. the once bash script to manage a ONCE installation into any environment
 1. 1. Supportetd envionments currently are
     * Mac OS
     * Ubuntu
