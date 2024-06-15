@@ -7,12 +7,11 @@
 
 ### new.method
 
-os.info()  # <verbose:> # shows info abut the running os. add v to get more details
-{
+os.info() { # <verbose:> # shows info abut the running os. add v to get more details
   if [ -f /etc/os-release ]; then
     source /etc/os-release
   fi
-  echo "              
+  echo "
           shell level: $SHLVL
 
                 script: $0
@@ -32,8 +31,8 @@ os.info()  # <verbose:> # shows info abut the running os. add v to get more deta
   fi
 }
 
-os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see output. 
-  info.log "detecting OS:  $OSTYPE" 
+os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see output.
+  info.log "detecting OS:  $OSTYPE"
   local method="$1"
   if [ -n "$1" ]; then
     shift
@@ -49,9 +48,9 @@ os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see outp
       ;;
     *)
       important.log "  could not determine OS... please contribute to os.check"
-    ;;
+      ;;
   esac
-  
+
   if this.functionExists "$method"; then
     create.result 0 "$method" "$1"
   else
@@ -60,11 +59,8 @@ os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see outp
   return $(result)
 }
 
-os.check.env() # #
-{
-
+os.check.env() { # #
   if [ -z "$OOSH_OS" ]; then
-
     case "$OSTYPE" in
       darwin*)
         info.log "      Mac OS detected"
@@ -93,24 +89,21 @@ os.check.env() # #
       *)
         important.log "  could not determine OS... please contribute to os.check"
         return 1
-      ;;
+        ;;
     esac
   fi
   return 0
-
 }
 
-
-os.usage()
-{
+os.usage() {
   local this=${0##*/}
-  echo "You started" 
+  echo "You started"
   echo "$0
 
   Usage:
   $this: command   description and Parameter
 
-      usage     prints this dialog while it will print the status when there are no parameters          
+      usage     prints this dialog while it will print the status when there are no parameters
       v         print version information
       init      initializes ...nothing yet
       ----      --------------------------"
@@ -129,14 +122,11 @@ os.usage()
       $RESULT "$@"
     else
       important.log "$RESULT is not supported"
-    fi  
-
-
+    fi
   "
 }
 
-os.start()
-{
+os.start() {
   #echo "sourcing init"
   source this
 
@@ -149,4 +139,3 @@ os.start()
 }
 
 os.start "$@"
-
