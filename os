@@ -8,6 +8,7 @@
 ### new.method
 
 os.info() { # <verbose:> # shows info abut the running os. add v to get more details
+  # <<EOD
   if [ -f /etc/os-release ]; then
     source /etc/os-release
   fi
@@ -32,6 +33,7 @@ os.info() { # <verbose:> # shows info abut the running os. add v to get more det
 }
 
 os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see output.
+  # <<EOD
   info.log "detecting OS:  $OSTYPE"
   local method="$1"
   if [ -n "$1" ]; then
@@ -60,6 +62,7 @@ os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see outp
 }
 
 os.check.env() { # #
+  # <<EOD
   if [ -z "$OOSH_OS" ]; then
     case "$OSTYPE" in
       darwin*)
@@ -96,6 +99,7 @@ os.check.env() { # #
 }
 
 os.usage() {
+  # <<EOD
   local this=${0##*/}
   echo "You started"
   echo "$0
@@ -127,6 +131,7 @@ os.usage() {
 }
 
 os.start() {
+  # <<EOD
   #echo "sourcing init"
   source this
 
