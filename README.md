@@ -4,7 +4,7 @@ Unified shell environment for UCP components and ONCE the Object Network Communi
 
 This Repo consists of two main topics
 1. The oosh object oriented bash envitonment with completion, logging and debugging
-1. the once bash script to manage a ONCE installation into eny environment
+1. the once bash script to manage a ONCE installation into any environment
 1. 1. Supportetd envionments currently are
     * Mac OS
     * Ubuntu
@@ -16,9 +16,9 @@ This Repo consists of two main topics
 
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `env -i sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
-| **wget**  | `env -i sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"`   |
-| **fetch** | `env -i sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
+| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
+| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"`   |
+| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
 
 
 ### More detailed logging for debugging is available with these commands
@@ -56,7 +56,7 @@ cat oosh | sh -x
 ```
 sudo apt update
 sudo apt install curl
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"
 
 or as root
 
