@@ -20,6 +20,26 @@ This Repo consists of two main topics
 | **wget**  | `env -i sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"`   |
 | **fetch** | `env -i sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
 
+
+### More detailed logging for debugging is available with these commands
+```
+unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)" | tee install.log.txt
+
+> or if already available loacally
+unbuffer env -i sh -x init/oosh | tee install.log.txt 
+
+> to view the file use 
+
+less -r install.log.txt
+
+> install unbuffer in one of the following ways
+brew install expect
+oo cmd expect
+sudo apt-get install expect
+
+```
+in VSCODE use [use the ANSI Colors plugin](https://marketplace.visualstudio.com/items?itemName=iliazeus.vscode-ansi)
+
 ## manual install
 ```
 wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh ;
