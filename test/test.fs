@@ -9,16 +9,26 @@ if [ -z "$level" ]; then
 fi
 echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
-#echo "sourcing init"
 source this
 source test.suite
 
 log.level $level
 
-competionArray=(once config list file ite)
-source oo
+# Check if fs script exists
+if ! [ -f "$OOSH_DIR/fs" ] && ! [ -f "$OOSH_DIR/old/fs" ]; then
+  echo -e "\e[1;33m  ⚠ SKIPPED: fs script not available (deprecated)\e[0m"
+  test.suite.save.results
+  exit 0
+fi
 
-test.fs() 
+# Source from old/ if that's where it is
+if [ -f "$OOSH_DIR/old/fs" ]; then
+  source "$OOSH_DIR/old/fs"
+else
+  source fs
+fi
+
+test.fs()
 {
 ((TEST_COUNTER++))
 console.log "
@@ -27,15 +37,13 @@ console.log "
 Test 0: fs \"$*\"
 ===================================================================="
 fs.start "$@"
-console.log "RETURN: $RETURN_VALUE  Result: $RESULT 
+console.log "RETURN: $RETURN_VALUE  Result: $RESULT
 ===================================================================="
 }
 
 test.case - "fs test start" \
    fs $*
 expect 0 "*" "Test start"
-
-source fs
 
 
 console.log "

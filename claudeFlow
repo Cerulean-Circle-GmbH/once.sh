@@ -608,6 +608,693 @@ claudeFlow.hive.shutdown() # # shutdown the hive mind
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TMUX AGENT COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Environment defaults
+: ${CLAUDE_AGENTS_SESSION:=claude-agents}
+: ${CLAUDE_MAIN_PANE_SIZE:=80}
+: ${CLAUDE_AGENT_LAYOUT:=mainH}
+
+claudeFlow.tmux() # <subcommand> # tmux agent management commands
+{
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    init|spawn|agents|focus|kill|killAll|main|status|layout|bind|pane|run|list|task|lower)
+      claudeFlow.tmux.$cmd "$@"
+      ;;
+    *)
+      error.log "Unknown tmux command: $cmd"
+      echo "Available: init, task, lower, spawn, agents, focus, kill, killAll, main, status, layout, bind, pane, run, list"
+      return 1
+      ;;
+  esac
+}
+
+claudeFlow.tmux.init() # # initialize two-pane layout: main (top) + task-agent (bottom)
+{
+  # Check if already initialized (look for task-agent pane)
+  if tmux list-panes -F "#{pane_title}" 2>/dev/null | grep -q "task-agent"; then
+    info.log "Task agent workspace already initialized"
+    echo "Layout: Main Claude (top) + Task Agent (bottom)"
+    echo ""
+    echo "Run task: claudeFlow tmux.task 'your prompt here'"
+    echo "Switch:   Ctrl+b ↑/↓  or  claudeFlow tmux.main/lower"
+    return 0
+  fi
+
+  # Check if already in tmux
+  if [ -z "$TMUX" ]; then
+    info.log "Creating new tmux session: $CLAUDE_AGENTS_SESSION"
+    tmux new-session -d -s "$CLAUDE_AGENTS_SESSION" -n main
+    tmux split-window -v -p 30 -t "$CLAUDE_AGENTS_SESSION:main"
+
+    # Mark panes: top = main Claude, bottom = task agent
+    tmux select-pane -t "$CLAUDE_AGENTS_SESSION:main.0" -T "claude-main"
+    tmux select-pane -t "$CLAUDE_AGENTS_SESSION:main.1" -T "task-agent"
+
+    # Focus main pane (top)
+    tmux select-pane -t "$CLAUDE_AGENTS_SESSION:main.0"
+
+    # Add key bindings
+    tmux bind-key -T prefix m select-pane -t "$CLAUDE_AGENTS_SESSION:main.0"
+    tmux bind-key -T prefix t select-pane -t "$CLAUDE_AGENTS_SESSION:main.1"
+
+    info.log "Attach with: tmux attach -t $CLAUDE_AGENTS_SESSION"
+    echo ""
+    echo "Layout:"
+    echo "  ┌─────────────────────────┐"
+    echo "  │  Main Claude (70%)      │  ← You are here"
+    echo "  │  claude-main            │"
+    echo "  ├─────────────────────────┤"
+    echo "  │  Task Agent (30%)       │  ← Tasks run here"
+    echo "  │  task-agent             │"
+    echo "  └─────────────────────────┘"
+    echo ""
+    echo "Commands:"
+    echo "  claudeFlow tmux.task 'prompt'  - Run task in lower pane"
+    echo "  claudeFlow tmux.main           - Switch to main (top)"
+    echo "  claudeFlow tmux.lower          - Switch to task (bottom)"
+    echo ""
+    echo "Keys: Ctrl+b m (main) | Ctrl+b t (task) | Ctrl+b ↑/↓ (navigate)"
+  else
+    info.log "Already in tmux, creating task-agent layout"
+
+    # Split: 70% top (main), 30% bottom (task agent)
+    tmux split-window -v -p 30
+
+    # Mark panes
+    tmux select-pane -t .0 -T "claude-main"
+    tmux select-pane -t .1 -T "task-agent"
+
+    # Add bindings
+    tmux bind-key -T prefix m select-pane -t .0
+    tmux bind-key -T prefix t select-pane -t .1
+
+    # Focus main (top)
+    tmux select-pane -t .0
+
+    success.log "Task agent layout initialized"
+    echo ""
+    echo "Layout:"
+    echo "  Top:    claude-main (this session)"
+    echo "  Bottom: task-agent (run: claudeFlow tmux.task 'prompt')"
+    echo ""
+    echo "Keys: Ctrl+b m (main) | Ctrl+b t (task) | Ctrl+b ↑/↓ (navigate)"
+  fi
+}
+
+claudeFlow.tmux.spawn() # <type> <task> # spawn agent in new tmux pane
+{
+  local agent_type="$1"
+  local task="$2"
+
+  if [ -z "$agent_type" ] || [ -z "$task" ]; then
+    error.log "Usage: claudeFlow tmux.spawn <type> <task>"
+    echo "Types: coder, researcher, reviewer, planner, tester"
+    return 1
+  fi
+
+  # Generate agent ID
+  local agent_id="agent-$(date +%s | tail -c 5)"
+
+  # Check if in tmux
+  if [ -z "$TMUX" ]; then
+    error.log "Not in tmux. Run 'claudeFlow tmux.init' first or attach to session"
+    return 1
+  fi
+
+  # Create new pane for agent
+  local pane_id=$(tmux split-window -h -P -F "#{pane_id}" \
+    "claude-flow agent spawn -t $agent_type --id $agent_id -d '$task'; echo 'Agent $agent_id finished. Press Enter to close.'; read")
+
+  # Mark the pane
+  tmux select-pane -t "$pane_id" -T "$agent_id"
+
+  # Apply layout
+  tmux select-layout "$CLAUDE_AGENT_LAYOUT" 2>/dev/null || tmux select-layout tiled
+
+  success.log "Spawned $agent_type agent: $agent_id"
+  echo "Pane: $pane_id"
+  echo "Focus with: claudeFlow tmux.focus $agent_id"
+}
+claudeFlow.tmux.spawn.completion.type() {
+  echo "coder"
+  echo "researcher"
+  echo "reviewer"
+  echo "planner"
+  echo "tester"
+}
+
+claudeFlow.tmux.agents() # # list all agent panes
+{
+  echo "Agent Panes:"
+  echo "─────────────────────────────────────────"
+
+  # List panes with their titles
+  tmux list-panes -a -F "#{pane_id} #{pane_title} #{pane_current_command}" 2>/dev/null | \
+    grep -E "agent-|claude-main|agent-status" | \
+    while read pane_id title cmd; do
+      local status="running"
+      [ "$cmd" = "bash" ] && status="idle"
+      printf "%-12s %-20s %s\n" "$pane_id" "$title" "$status"
+    done
+
+  echo "─────────────────────────────────────────"
+  echo ""
+  echo "Navigate: Ctrl+b then arrow keys"
+  echo "Zoom pane: Ctrl+b z"
+}
+
+claudeFlow.tmux.focus() # <agent-id> # focus on specific agent pane
+{
+  local agent_id="$1"
+
+  if [ -z "$agent_id" ]; then
+    error.log "Usage: claudeFlow tmux.focus <agent-id>"
+    return 1
+  fi
+
+  # Find pane by title
+  local pane=$(tmux list-panes -a -F "#{pane_id} #{pane_title}" | grep "$agent_id" | awk '{print $1}' | head -1)
+
+  if [ -n "$pane" ]; then
+    tmux select-pane -t "$pane"
+    success.log "Focused on $agent_id"
+  else
+    error.log "Agent pane not found: $agent_id"
+    echo "Available panes:"
+    claudeFlow.tmux.agents
+    return 1
+  fi
+}
+
+claudeFlow.tmux.kill() # <agent-id> # kill agent and close its pane
+{
+  local agent_id="$1"
+
+  if [ -z "$agent_id" ]; then
+    error.log "Usage: claudeFlow tmux.kill <agent-id>"
+    return 1
+  fi
+
+  # Find pane by title
+  local pane=$(tmux list-panes -a -F "#{pane_id} #{pane_title}" | grep "$agent_id" | awk '{print $1}' | head -1)
+
+  if [ -n "$pane" ]; then
+    # Kill the agent via claude-flow
+    claude-flow agent stop "$agent_id" 2>/dev/null
+
+    # Kill the pane
+    tmux kill-pane -t "$pane"
+    success.log "Killed agent and pane: $agent_id"
+  else
+    error.log "Agent pane not found: $agent_id"
+    return 1
+  fi
+}
+
+claudeFlow.tmux.killAll() # # kill all agent panes, keep main
+{
+  # Get all agent panes (not main or status)
+  local panes=$(tmux list-panes -a -F "#{pane_id} #{pane_title}" | grep "^%.*agent-[0-9]" | awk '{print $1}')
+
+  local count=0
+  for pane in $panes; do
+    tmux kill-pane -t "$pane" 2>/dev/null && ((count++))
+  done
+
+  # Kill all agents via claude-flow
+  claude-flow agent list --format json 2>/dev/null | \
+    grep -o '"id":"[^"]*"' | \
+    cut -d'"' -f4 | \
+    while read aid; do
+      claude-flow agent stop "$aid" 2>/dev/null
+    done
+
+  success.log "Killed $count agent panes"
+}
+
+claudeFlow.tmux.main() # # return focus to main Claude pane
+{
+  # Find main pane
+  local pane=$(tmux list-panes -a -F "#{pane_id} #{pane_title}" | grep "claude-main" | awk '{print $1}' | head -1)
+
+  if [ -n "$pane" ]; then
+    tmux select-pane -t "$pane"
+  else
+    # Fallback to pane 0
+    tmux select-pane -t .0
+  fi
+}
+
+claudeFlow.tmux.status() # # refresh agent status display
+{
+  claude-flow agent list
+  echo ""
+  echo "─────────────────────────────────────────"
+  claudeFlow.tmux.agents
+}
+
+claudeFlow.tmux.bind() # <?mode> # setup quick-switch key bindings (alt or ctrl)
+{
+  local mode="${1:-alt}"
+
+  case "$mode" in
+    alt)
+      # Bind Alt+1-9 to switch to agent panes directly (no prefix needed)
+      for i in 1 2 3 4 5 6 7 8 9; do
+        tmux bind-key -n M-$i select-pane -t $i 2>/dev/null
+      done
+      tmux bind-key -n M-0 select-pane -t 0
+      tmux bind-key -n M-n select-pane -t :.+
+      tmux bind-key -n M-p select-pane -t :.-
+      tmux bind-key -n M-z resize-pane -Z
+
+      success.log "Alt-key bindings set:"
+      echo "  Alt+0     → Main pane"
+      echo "  Alt+1-9   → Agent panes by index"
+      echo "  Alt+n/p   → Next/Previous pane"
+      echo "  Alt+z     → Toggle zoom"
+      ;;
+
+    ctrl)
+      # Ctrl-based bindings for environments without Alt key access
+      # Ctrl+Space = show pane selector (display-panes with extended timeout)
+      tmux bind-key -n C-Space display-panes -d 5000
+
+      # Ctrl+] = next pane, Ctrl+[ = previous pane (vim-like)
+      tmux bind-key -n C-] select-pane -t :.+
+      tmux bind-key -n 'C-[' select-pane -t :.- 2>/dev/null || true
+
+      # Ctrl+\ = toggle zoom
+      tmux bind-key -n 'C-\' resize-pane -Z
+
+      # Ctrl+_ = return to main pane (pane 0)
+      tmux bind-key -n C-_ select-pane -t 0
+
+      # Prefix-based alternatives (Ctrl+b then key)
+      tmux bind-key Tab select-pane -t :.+
+      tmux bind-key BTab select-pane -t :.-
+      tmux bind-key Space display-panes -d 5000
+
+      success.log "Ctrl-key bindings set:"
+      echo "  Ctrl+Space    → Show pane selector (press number to switch)"
+      echo "  Ctrl+]        → Next pane"
+      echo "  Ctrl+\\        → Toggle zoom"
+      echo "  Ctrl+_        → Main pane (pane 0)"
+      echo ""
+      echo "  Ctrl+b Tab    → Next pane"
+      echo "  Ctrl+b Shift+Tab → Previous pane"
+      echo "  Ctrl+b Space  → Show pane selector"
+      ;;
+
+    *)
+      echo "Usage: claudeFlow tmux.bind [alt|ctrl]"
+      echo "  alt  - Alt+0-9 bindings (default)"
+      echo "  ctrl - Ctrl-based bindings for restricted environments"
+      return 1
+      ;;
+  esac
+}
+claudeFlow.tmux.bind.completion.mode() {
+  echo "alt"
+  echo "ctrl"
+}
+
+claudeFlow.tmux.pane() # <name> <?command> # create named pane for agent/command
+{
+  local name="$1"
+  local cmd="${2:-bash}"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: claudeFlow tmux.pane <name> [command]"
+    return 1
+  fi
+
+  if [ -z "$TMUX" ]; then
+    error.log "Not in tmux"
+    return 1
+  fi
+
+  # Create pane and capture its ID
+  local pane_id=$(tmux split-window -h -P -F "#{pane_id}" "$cmd")
+
+  # Set pane title
+  tmux select-pane -t "$pane_id" -T "$name"
+
+  # Apply layout
+  tmux select-layout tiled 2>/dev/null
+
+  # Get pane index for keybinding info
+  local pane_idx=$(tmux display-message -p -t "$pane_id" "#{pane_index}")
+
+  success.log "Created pane '$name' (index: $pane_idx)"
+  echo "Switch with: Alt+$pane_idx"
+}
+
+claudeFlow.tmux.run() # <name> <command...> # run command in new named pane
+{
+  local name="$1"
+  shift
+  local cmd="$*"
+
+  if [ -z "$name" ] || [ -z "$cmd" ]; then
+    error.log "Usage: claudeFlow tmux.run <name> <command...>"
+    return 1
+  fi
+
+  # Create pane with command, keep open after completion
+  claudeFlow.tmux.pane "$name" "$cmd; echo ''; echo '─── $name finished ───'; read -p 'Press Enter to close'"
+}
+
+claudeFlow.tmux.list() # # list panes with quick-switch indices
+{
+  echo "Pane Quick-Switch Reference:"
+  echo "─────────────────────────────────────────"
+  tmux list-panes -F "  Alt+#{pane_index}  →  #{pane_title} (#{pane_current_command})"
+  echo "─────────────────────────────────────────"
+  echo "  Alt+n/p  →  Next/Previous"
+  echo "  Alt+z    →  Toggle zoom"
+}
+
+claudeFlow.tmux.layout() # <type> # change agent pane layout
+{
+  local layout="$1"
+
+  if [ -z "$layout" ]; then
+    echo "Layouts: mainH, mainV, evenH, evenV, tiled"
+    return 0
+  fi
+
+  case "$layout" in
+    mainH)  tmux select-layout main-horizontal ;;
+    mainV)  tmux select-layout main-vertical ;;
+    evenH)  tmux select-layout even-horizontal ;;
+    evenV)  tmux select-layout even-vertical ;;
+    tiled)  tmux select-layout tiled ;;
+    *)
+      error.log "Unknown layout: $layout"
+      echo "Layouts: mainH, mainV, evenH, evenV, tiled"
+      return 1
+      ;;
+  esac
+
+  success.log "Applied layout: $layout"
+}
+claudeFlow.tmux.layout.completion.type() {
+  echo "mainH"
+  echo "mainV"
+  echo "evenH"
+  echo "evenV"
+  echo "tiled"
+}
+
+claudeFlow.tmux.task() # <prompt> <?model> # run claude task in lower pane
+{
+  local prompt="$1"
+  local model="${2:-haiku}"
+
+  if [ -z "$prompt" ]; then
+    error.log "Usage: claudeFlow tmux.task <prompt> [model]"
+    echo "  model: haiku (default, fast), sonnet, opus"
+    echo "Example: claudeFlow tmux.task 'explore the config module' sonnet"
+    return 1
+  fi
+
+  if [ -z "$TMUX" ]; then
+    error.log "Not in tmux. Start tmux or run: claudeFlow tmux.init"
+    return 1
+  fi
+
+  # Find or create lower pane for task agents
+  local lower_pane=$(tmux list-panes -F "#{pane_id} #{pane_title}" | grep "task-agent" | awk '{print $1}' | head -1)
+
+  if [ -z "$lower_pane" ]; then
+    # Create lower pane if it doesn't exist
+    lower_pane=$(tmux split-window -v -p 30 -P -F "#{pane_id}" "bash")
+    tmux select-pane -t "$lower_pane" -T "task-agent"
+    # Return focus to upper pane
+    tmux select-pane -t .0
+  fi
+
+  # Clear previous output and run new task
+  tmux send-keys -t "$lower_pane" C-c 2>/dev/null  # Kill any running process
+  tmux send-keys -t "$lower_pane" "clear" Enter
+
+  # Build the claude command (use permission-mode for safer execution)
+  local claude_cmd="claude --model $model --print"
+
+  # Add permission mode if not root (dangerously-skip-permissions fails as root)
+  if [ "$(id -u)" != "0" ]; then
+    claude_cmd="$claude_cmd --dangerously-skip-permissions"
+  fi
+
+  claude_cmd="$claude_cmd '$prompt'"
+
+  # Send to lower pane
+  tmux send-keys -t "$lower_pane" "$claude_cmd" Enter
+
+  success.log "Task started in lower pane (model: $model)"
+  echo "Lower pane: $lower_pane"
+  echo "Switch to it: Ctrl+b ↓  or  claudeFlow tmux.lower"
+  echo "Return here:  Ctrl+b ↑  or  claudeFlow tmux.main"
+}
+claudeFlow.tmux.task.completion.model() {
+  echo "haiku"
+  echo "sonnet"
+  echo "opus"
+}
+
+claudeFlow.tmux.lower() # # switch focus to lower task pane
+{
+  if [ -z "$TMUX" ]; then
+    error.log "Not in tmux"
+    return 1
+  fi
+
+  # Find task-agent pane or last pane
+  local lower_pane=$(tmux list-panes -F "#{pane_id} #{pane_title}" | grep "task-agent" | awk '{print $1}' | head -1)
+
+  if [ -n "$lower_pane" ]; then
+    tmux select-pane -t "$lower_pane"
+  else
+    # Fallback to last pane (usually lower)
+    tmux select-pane -t :.+
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE CODE SETTINGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+: ${CLAUDE_SETTINGS_GLOBAL:=$HOME/.claude/settings.json}
+: ${CLAUDE_SETTINGS_PROJECT:=.claude/settings.json}
+: ${CLAUDE_STATUSLINE_BACKUP:=$HOME/.claude/statusline-backup.json}
+
+claudeFlow.statusline() # <subcommand> # manage Claude Code statusline display
+{
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    toggle|on|off|status|set|preview|config)
+      claudeFlow.statusline.$cmd "$@"
+      ;;
+    *)
+      error.log "Unknown statusline command: $cmd"
+      echo "Available: toggle, on, off, status, set, preview, config"
+      return 1
+      ;;
+  esac
+}
+
+claudeFlow.statusline.toggle() # # toggle Claude Flow V3 statusline footer on/off
+{
+  if claudeFlow.statusline.status --quiet; then
+    claudeFlow.statusline.off
+  else
+    claudeFlow.statusline.on
+  fi
+}
+
+claudeFlow.statusline.status() # <?--quiet> # check if statusline is configured
+{
+  local quiet=""
+  [ "$1" = "--quiet" ] && quiet=1
+
+  # Check project settings first (Claude Flow V3 footer)
+  if [ -f "$CLAUDE_SETTINGS_PROJECT" ] && grep -q '"statusLine"' "$CLAUDE_SETTINGS_PROJECT" 2>/dev/null; then
+    [ -z "$quiet" ] && echo "Statusline: ON (project - Claude Flow V3)"
+    return 0
+  fi
+
+  # Fallback to global settings
+  if [ -f "$CLAUDE_SETTINGS_GLOBAL" ] && grep -q '"statusLine"' "$CLAUDE_SETTINGS_GLOBAL" 2>/dev/null; then
+    [ -z "$quiet" ] && echo "Statusline: ON (global)"
+    return 0
+  fi
+
+  [ -z "$quiet" ] && echo "Statusline: OFF (not in config)"
+  return 1
+}
+
+claudeFlow.statusline.off() # # disable statusline (removes statusLine from config)
+{
+  # Handle project settings (Claude Flow V3 footer)
+  if [ -f "$CLAUDE_SETTINGS_PROJECT" ] && grep -q '"statusLine"' "$CLAUDE_SETTINGS_PROJECT"; then
+    # Backup entire file
+    cp "$CLAUDE_SETTINGS_PROJECT" "${CLAUDE_SETTINGS_PROJECT}.statusline-backup" 2>/dev/null || true
+
+    if command -v jq &>/dev/null; then
+      # Remove statusLine object entirely (proper way to disable)
+      jq 'del(.statusLine)' "$CLAUDE_SETTINGS_PROJECT" > "${CLAUDE_SETTINGS_PROJECT}.tmp" && \
+        mv "${CLAUDE_SETTINGS_PROJECT}.tmp" "$CLAUDE_SETTINGS_PROJECT"
+      success.log "Claude Flow V3 footer disabled (removed from config)"
+    else
+      error.log "jq required to safely edit settings. Install with: apt install jq"
+      return 1
+    fi
+    return 0
+  fi
+
+  # Fallback to global settings
+  if [ -f "$CLAUDE_SETTINGS_GLOBAL" ] && grep -q '"statusLine"' "$CLAUDE_SETTINGS_GLOBAL"; then
+    cp "$CLAUDE_SETTINGS_GLOBAL" "$CLAUDE_STATUSLINE_BACKUP" 2>/dev/null || true
+    if command -v jq &>/dev/null; then
+      jq 'del(.statusLine)' "$CLAUDE_SETTINGS_GLOBAL" > "${CLAUDE_SETTINGS_GLOBAL}.tmp" && \
+        mv "${CLAUDE_SETTINGS_GLOBAL}.tmp" "$CLAUDE_SETTINGS_GLOBAL"
+    else
+      echo '{}' > "$CLAUDE_SETTINGS_GLOBAL"
+    fi
+    success.log "Global statusline disabled"
+    return 0
+  fi
+
+  echo "Statusline already disabled (not in config)"
+}
+
+claudeFlow.statusline.on() # # enable statusline (restore from backup)
+{
+  # Check if already has statusLine
+  if [ -f "$CLAUDE_SETTINGS_PROJECT" ] && grep -q '"statusLine"' "$CLAUDE_SETTINGS_PROJECT"; then
+    echo "Statusline already enabled in project settings"
+    return 0
+  fi
+
+  # Restore project settings from backup
+  if [ -f "${CLAUDE_SETTINGS_PROJECT}.statusline-backup" ]; then
+    if command -v jq &>/dev/null; then
+      # Extract statusLine from backup and merge into current settings
+      local statusline_json=$(jq '.statusLine' "${CLAUDE_SETTINGS_PROJECT}.statusline-backup")
+      if [ "$statusline_json" != "null" ]; then
+        jq --argjson sl "$statusline_json" '.statusLine = $sl' "$CLAUDE_SETTINGS_PROJECT" > "${CLAUDE_SETTINGS_PROJECT}.tmp" && \
+          mv "${CLAUDE_SETTINGS_PROJECT}.tmp" "$CLAUDE_SETTINGS_PROJECT"
+        success.log "Claude Flow V3 footer restored from backup"
+        return 0
+      fi
+    fi
+  fi
+
+  # Fallback to global settings
+  if [ -f "$CLAUDE_STATUSLINE_BACKUP" ]; then
+    local statusline_cmd=$(jq -r '.statusLine.command // empty' "$CLAUDE_STATUSLINE_BACKUP" 2>/dev/null)
+    if [ -n "$statusline_cmd" ]; then
+      [ ! -f "$CLAUDE_SETTINGS_GLOBAL" ] && echo '{}' > "$CLAUDE_SETTINGS_GLOBAL"
+      jq --arg cmd "$statusline_cmd" '.statusLine = {"type": "command", "command": $cmd}' "$CLAUDE_SETTINGS_GLOBAL" > "${CLAUDE_SETTINGS_GLOBAL}.tmp" && \
+        mv "${CLAUDE_SETTINGS_GLOBAL}.tmp" "$CLAUDE_SETTINGS_GLOBAL"
+      success.log "Global statusline restored"
+      return 0
+    fi
+  fi
+
+  error.log "No backup found to restore statusline from"
+  echo "Use 'claudeFlow statusline.set <command>' to configure a new statusline"
+  return 1
+}
+
+claudeFlow.statusline.set() # <command> # set custom statusline command
+{
+  local cmd="$1"
+
+  if [ -z "$cmd" ]; then
+    error.log "Usage: claudeFlow statusline.set <command>"
+    echo "Example: claudeFlow statusline.set 'echo \$(pwd)'"
+    return 1
+  fi
+
+  if [ ! -f "$CLAUDE_SETTINGS_FILE" ]; then
+    echo '{}' > "$CLAUDE_SETTINGS_FILE"
+  fi
+
+  if command -v jq &>/dev/null; then
+    jq --arg cmd "$cmd" '.statusLine = {"type": "command", "command": $cmd}' "$CLAUDE_SETTINGS_FILE" > "$CLAUDE_SETTINGS_FILE.tmp" && \
+      mv "$CLAUDE_SETTINGS_FILE.tmp" "$CLAUDE_SETTINGS_FILE"
+  else
+    local statusline_config="\"statusLine\": {\"type\": \"command\", \"command\": \"$cmd\"}"
+    if grep -q '"statusLine"' "$CLAUDE_SETTINGS_FILE" 2>/dev/null; then
+      sed -i "s/\"statusLine\"[^}]*}/$statusline_config/g" "$CLAUDE_SETTINGS_FILE" 2>/dev/null || \
+      sed -i '' "s/\"statusLine\"[^}]*}/$statusline_config/g" "$CLAUDE_SETTINGS_FILE" 2>/dev/null
+    else
+      sed -i "s/}$/, $statusline_config}/g" "$CLAUDE_SETTINGS_FILE" 2>/dev/null || \
+      sed -i '' "s/}$/, $statusline_config}/g" "$CLAUDE_SETTINGS_FILE" 2>/dev/null
+    fi
+  fi
+
+  success.log "Statusline set: $cmd (changes apply on next prompt)"
+}
+
+claudeFlow.statusline.preview() # # preview what the statusline would display
+{
+  local cmd=""
+
+  # Check project settings first
+  if [ -f "$CLAUDE_SETTINGS_PROJECT" ]; then
+    cmd=$(grep -o '"command"[^"]*"[^"]*"' "$CLAUDE_SETTINGS_PROJECT" 2>/dev/null | head -1 | cut -d'"' -f4)
+  fi
+
+  # Fallback to global
+  if [ -z "$cmd" ] && [ -f "$CLAUDE_SETTINGS_GLOBAL" ]; then
+    cmd=$(grep -o '"command"[^"]*"[^"]*"' "$CLAUDE_SETTINGS_GLOBAL" 2>/dev/null | head -1 | cut -d'"' -f4)
+  fi
+
+  if [ -z "$cmd" ]; then
+    echo "Statusline: OFF (no command configured)"
+    return 1
+  fi
+
+  echo "Statusline command: $cmd"
+  echo "Preview output:"
+  echo "─────────────────────────────────────────"
+  eval "$cmd" 2>&1
+  echo ""
+  echo "─────────────────────────────────────────"
+}
+
+claudeFlow.statusline.config() # # show current statusline configuration
+{
+  echo "Project settings: $CLAUDE_SETTINGS_PROJECT"
+  echo "Global settings:  $CLAUDE_SETTINGS_GLOBAL"
+  echo ""
+
+  if [ -f "$CLAUDE_SETTINGS_PROJECT" ]; then
+    echo "Project .claude/settings.json (statusLine section):"
+    echo "─────────────────────────────────────────"
+    grep -A10 '"statusLine"' "$CLAUDE_SETTINGS_PROJECT" 2>/dev/null | head -12 || echo "(no statusLine)"
+    echo "─────────────────────────────────────────"
+  fi
+
+  echo ""
+  if [ -f "$CLAUDE_SETTINGS_GLOBAL" ]; then
+    echo "Global ~/.claude/settings.json:"
+    echo "─────────────────────────────────────────"
+    cat "$CLAUDE_SETTINGS_GLOBAL"
+    echo ""
+    echo "─────────────────────────────────────────"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HOOKS COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -779,6 +1466,16 @@ claudeFlow.usage()
       hive.broadcast  broadcast message
       hive.shutdown   shutdown hive
 
+  TMUX AGENTS:
+      tmux.init       initialize agent workspace
+      tmux.spawn      spawn agent in tmux pane
+      tmux.agents     list agent panes
+      tmux.focus      focus on agent pane
+      tmux.kill       kill agent and pane
+      tmux.killAll    kill all agent panes
+      tmux.main       return to main pane
+      tmux.layout     change pane layout
+
   OUTPUT:
       verbose         verbose output
       quiet           suppressed output
@@ -794,6 +1491,8 @@ claudeFlow.usage()
     $this swarm.v3                     # init V3 swarm
     $this memory.search 'patterns'     # semantic search
     $this hive.spawn -n 5              # spawn 5 workers
+    $this tmux.init                    # setup agent workspace
+    $this tmux.spawn coder 'Add auth'  # spawn in tmux pane
   "
 }
 

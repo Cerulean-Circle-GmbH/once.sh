@@ -1,5 +1,47 @@
 # OOSH - Object Oriented Shell
 
+## Agent Per-Prompt Checklist
+
+Before responding, especially as context grows:
+
+- [ ] **Run tests/commands in tmux lower pane** (see Tmux Workflow below)
+- [ ] Update `sessions/agent.context.md` with current work
+- [ ] Note files modified and key fixes
+- [ ] Document any patterns learned
+- [ ] List pending/blocked items
+
+**Context file:** `sessions/agent.context.md`
+
+---
+
+## Tmux Workflow (MANDATORY)
+
+**All Task agents, tests, and long-running commands MUST run in the tmux lower pane.**
+
+### Setup
+```bash
+./claudeFlow tmux.init    # Creates main (top 70%) + task (bottom 30%)
+```
+
+### Running commands in lower pane
+```bash
+tmux send-keys -t %28 "./test.suite run state 1" Enter
+sleep 5
+tmux capture-pane -t %28 -p | tail -30   # Capture output
+```
+
+### Navigation
+- `Ctrl+b ↑/↓` - Switch between panes
+- `./claudeFlow tmux.main` - Focus main pane
+- `./claudeFlow tmux.lower` - Focus task pane
+
+### Why?
+- User can see task progress in real-time
+- Main Claude session stays responsive
+- Visual separation of concerns
+
+---
+
 ## Overview
 
 OOSH is a bash framework that provides pseudo-object-oriented programming through naming conventions. Each script acts as a "class" with methods following the pattern `scriptname.methodname()`.
@@ -164,9 +206,85 @@ export LOG_DEVICE=/dev/stderr
 export LOG_LEVEL=0
 ```
 
+## State Machine Tool
+
+The `state` tool manages multi-step workflows with validation and branching.
+
+### Current Machine Concept
+
+The state tool tracks a "current machine". Once set, commands operate on it:
+```bash
+state of PDCA              # Sets PDCA as current machine
+state current              # Shows current machine info (machine, state, stateValue, etc.)
+state list                 # Lists states of current machine
+state next                 # Advances current machine
+```
+
+### Command Calling Convention
+
+**Command line** (space notation):
+```bash
+state machine.create PDCA scrumMaster
+state add planning silent
+```
+
+**Inside scripts** after sourcing (dot notation):
+```bash
+source $OOSH_DIR/state
+state.machine.create PDCA scrumMaster
+state.add planning silent
+```
+
+### State Machine Workflow
+
+1. **Create**: `state machine.create PDCA scrumMaster` - creates PDCA, associates script, sets as current
+2. **Add states**: `state add planning silent` - adds to current machine, sequentially from slot [11]
+3. **Add transitions**: `state add 20 silent` - number value creates jump to state ID 20
+4. **Start**: `state machine.start scrumMaster` - starts CURRENT machine, validates script has `private.check.*`
+5. **Advance**: `state next` - advances current machine, calls `private.check.<statename>`
+
+### The private.check Pattern
+
+Each state can have a validation function:
+```bash
+private.check.<statename>() {
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  # Return message to continue normally:
+  create.result 0 "success"
+  return $(result)
+
+  # Or return state ID to branch:
+  create.result 0 30  # Jump to state [30]
+  return $(result)
+}
+```
+
+### State Machine Files
+
+- `$CONFIG_PATH/stateMachines/<name>.states.env` - Machine definition
+- `$CONFIG_PATH/current.state.machine.env` - Currently selected machine cache
+
+### Key Commands
+
+| Command | Description |
+|---------|-------------|
+| `state list.machines` | List all machines |
+| `state of <machine>` | Select machine as current |
+| `state current` | Show current machine info |
+| `state name <?machine>` | Get current state name |
+| `state id <?machine>` | Get current state ID |
+| `state set <?machine> <state>` | Set state directly |
+| `state diagnose` | Full diagnostic output |
+
+See [docs/state.md](docs/state.md) for complete documentation.
+
 ## File Locations
 
 - `~/config/user.env` - Main user configuration
 - `~/.bashrc` - Modified to source oosh on shell start
 - `$OOSH_DIR/templates/` - Script and config templates
 - `$OOSH_DIR/test/` - Test suite
+- `$CONFIG_PATH/stateMachines/` - State machine definitions
