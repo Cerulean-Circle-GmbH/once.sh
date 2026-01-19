@@ -5,12 +5,12 @@
 Before responding, especially as context grows:
 
 - [ ] **Run tests/commands in tmux lower pane** (see Tmux Workflow below)
-- [ ] Update `sessions/agent.context.md` with current work
-- [ ] Note files modified and key fixes
-- [ ] Document any patterns learned
-- [ ] List pending/blocked items
+- [ ] **Update `.claude/settings.json` permissions** for any new commands used
+- [ ] Update `sessions/agent.context.md` if goals change
+- [ ] Keep output clean (no debug pollution)
 
 **Context file:** `sessions/agent.context.md`
+**Permissions:** `.claude/settings.json` → `permissions.allow[]`
 
 ---
 
