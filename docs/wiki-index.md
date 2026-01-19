@@ -18,8 +18,9 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - Advanced usage and troubleshooting guides
 - Contribution and extension guidelines
 
-## State Machine System
+## Core Tools
 
+- [Log System Documentation](log.md) - Logging levels, live logging, debug breakpoints, and capture modes
 - [State Machine Documentation](state.md) - Creating and managing state machines for multi-step workflows
 
 ## Core Concepts
