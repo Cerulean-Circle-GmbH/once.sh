@@ -1,0 +1,519 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+### new.method
+
+# ============================================================================
+# hiveMind - Multi-agent orchestrator for oosh
+# Manages REAL Claude Code agents in tmux panes using agentRoom backend
+# ============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+: ${HIVEMIND_SESSION:=hivemind}
+: ${HIVEMIND_MAIN_PANE_SIZE:=60}
+: ${HIVEMIND_BASE_PORT:=11080}
+
+# Default agent roles
+HIVEMIND_DEFAULT_AGENTS=(
+  "orchestrator"
+  "coder"
+  "tester"
+  "reviewer"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.get.agents() {
+  # Get all agent IDs from agentRoom
+  agentRoom list.ids 2>/dev/null
+}
+
+private.hiveMind.get.agent.port() {
+  local agent_id="$1"
+  agentRoom list 2>/dev/null | grep "^$agent_id " | awk '{print $2}'
+}
+
+private.hiveMind.pane.for.agent() {
+  local agent_id="$1"
+  tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | grep "$agent_id" | awk '{print $1}' | head -1
+}
+
+private.hiveMind.create.agent.pane() {
+  local agent_id="$1"
+  local port="$2"
+  local workdir="${3:-$(pwd)}"
+  local window="${4:-agents}"
+
+  # Select or create agents window
+  if ! tmux list-windows -F "#{window_name}" 2>/dev/null | grep -q "^${window}$"; then
+    tmux new-window -n "$window"
+  else
+    tmux select-window -t "$window"
+  fi
+
+  # Create new pane
+  tmux split-window -h
+  tmux select-layout tiled
+
+  # Get the new pane
+  local pane_id=$(tmux display-message -p "#{pane_id}")
+
+  # Set pane title
+  tmux select-pane -t "$pane_id" -T "$agent_id"
+
+  # Start Claude Code in the pane with agent role
+  tmux send-keys -t "$pane_id" "cd '$workdir' && claude --dangerously-skip-permissions" Enter
+
+  echo "$pane_id"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER COMPLETIONS (shared across all methods)
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.parameter.completion.agentId() {
+  hiveMind.list
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INITIALIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.init() # <?agents:orchestrator,coder,tester,reviewer> <?workdir:.> # initialize hivemind with real Claude agents
+{
+  local agents="${1:-orchestrator,coder,tester,reviewer}"
+  local workdir="${2:-$(pwd)}"
+
+  info.log "Initializing HiveMind with agents: $agents"
+
+  # Ensure agentRoom is available
+  if ! command -v agentRoom &>/dev/null && [ ! -f "$OOSH_DIR/agentRoom" ]; then
+    error.log "agentRoom script not found. Ensure OOSH is properly set up."
+    return 1
+  fi
+
+  # Start agentRoom backend
+  info.log "Starting agentRoom backend..."
+  agentRoom backend.start "$HIVEMIND_BASE_PORT"
+
+  sleep 2
+
+  # Check if in tmux or create session
+  if [ -z "$TMUX" ]; then
+    info.log "Creating tmux session: $HIVEMIND_SESSION"
+    tmux new-session -d -s "$HIVEMIND_SESSION" -n "main"
+
+    # Main pane for orchestrator
+    tmux select-pane -T "orchestrator"
+  fi
+
+  # Start each agent
+  IFS=',' read -ra agent_array <<< "$agents"
+  local port=$((HIVEMIND_BASE_PORT + 1))
+
+  for agent_id in "${agent_array[@]}"; do
+    info.log "Starting agent: $agent_id on port $port"
+
+    # Start agentRoom agent backend
+    agentRoom agent.start "$agent_id" "$port" "$workdir" "$agent_id"
+
+    # Create tmux pane for agent
+    hiveMind.createPane "$agent_id" "$workdir"
+
+    ((port++))
+    sleep 1
+  done
+
+  success.log "HiveMind initialized!"
+  echo ""
+  echo "Agents running:"
+  agentRoom list
+  echo ""
+  echo "Tmux session: $HIVEMIND_SESSION"
+  [ -z "$TMUX" ] && echo "Attach with: tmux attach -t $HIVEMIND_SESSION"
+}
+
+hiveMind.init.completion.agents() {
+  echo "orchestrator,coder,tester,reviewer"
+  echo "coder,tester"
+  echo "orchestrator,coder,tester,reviewer,researcher"
+}
+
+hiveMind.createPane() # <agentId> <?workdir:.> # create tmux pane with Claude Code for agent
+{
+  local agent_id="$1"
+  local workdir="${2:-$(pwd)}"
+
+  if [ -z "$agent_id" ]; then
+    error.log "Usage: hiveMind createPane <agentId> <?workdir>"
+    return 1
+  fi
+
+  # Check if pane already exists
+  local existing_pane=$(private.hiveMind.pane.for.agent "$agent_id")
+  if [ -n "$existing_pane" ]; then
+    info.log "Pane for $agent_id already exists: $existing_pane"
+    return 0
+  fi
+
+  info.log "Creating pane for $agent_id..."
+
+  # Get agent port
+  local port=$(private.hiveMind.get.agent.port "$agent_id")
+
+  # Create pane in agents window
+  if [ -n "$TMUX" ]; then
+    # Check if agents window exists
+    if ! tmux list-windows -F "#{window_name}" | grep -q "^agents$"; then
+      tmux new-window -n "agents"
+    else
+      tmux select-window -t agents
+    fi
+
+    # Split and create new pane
+    tmux split-window -h -t agents
+    tmux select-layout -t agents tiled
+
+    # Set title
+    tmux select-pane -T "$agent_id"
+
+    # Get system prompt for role
+    local system_prompt="You are the $agent_id agent. Focus on your specialized role."
+
+    # Start Claude Code with role context
+    tmux send-keys "cd '$workdir'" Enter
+    tmux send-keys "echo '=== $agent_id Agent (port: $port) ==='" Enter
+    tmux send-keys "claude --dangerously-skip-permissions -p 'You are $agent_id. Introduce yourself briefly.'" Enter
+
+    success.log "Created pane for $agent_id"
+  else
+    warn.log "Not in tmux session. Run: hiveMind attach first"
+    return 1
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.attach() # # attach to hivemind tmux session
+{
+  if tmux has-session -t "$HIVEMIND_SESSION" 2>/dev/null; then
+    tmux attach -t "$HIVEMIND_SESSION"
+  else
+    warn.log "HiveMind session not found. Run: hiveMind init"
+    return 1
+  fi
+}
+
+hiveMind.detach() # # detach from current session
+{
+  tmux detach-client
+}
+
+hiveMind.kill() # # shutdown hivemind completely
+{
+  info.log "Shutting down HiveMind..."
+
+  # Stop all agentRoom agents
+  agentRoom stop.all 2>/dev/null
+
+  # Kill tmux session
+  if tmux has-session -t "$HIVEMIND_SESSION" 2>/dev/null; then
+    tmux kill-session -t "$HIVEMIND_SESSION"
+    success.log "HiveMind session killed"
+  else
+    info.log "No HiveMind tmux session found"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.spawn() # <agentId> <?workdir:.> # spawn a new agent with pane
+{
+  local agent_id="$1"
+  local workdir="${2:-$(pwd)}"
+
+  if [ -z "$agent_id" ]; then
+    error.log "Usage: hiveMind spawn <agentId> <?workdir>"
+    return 1
+  fi
+
+  # Find next free port
+  local used_ports=$(agentRoom list.ports 2>/dev/null | sort -n | tail -1)
+  local port=$((used_ports + 1))
+  [ -z "$used_ports" ] && port=$((HIVEMIND_BASE_PORT + 1))
+
+  info.log "Spawning agent $agent_id on port $port..."
+
+  # Start agent backend
+  agentRoom agent.start "$agent_id" "$port" "$workdir" "$agent_id"
+
+  # Create pane
+  hiveMind.createPane "$agent_id" "$workdir"
+
+  success.log "Agent $agent_id spawned"
+}
+
+hiveMind.list() # # list all agents
+{
+  private.hiveMind.get.agents
+}
+
+hiveMind.status() # <?pane:0> # show hivemind status (0=here, 1=lower pane)
+{
+  local pane=${1:-0}
+
+  local output=""
+  output+="╔════════════════════════════════════════════════════════════╗\n"
+  output+="║              HiveMind Status                               ║\n"
+  output+="╠════════════════════════════════════════════════════════════╣\n"
+
+  # AgentRoom status
+  if agentRoom backend.status &>/dev/null; then
+    output+="║ Backend: running                                           ║\n"
+  else
+    output+="║ Backend: stopped                                           ║\n"
+  fi
+
+  output+="╠════════════════════════════════════════════════════════════╣\n"
+  output+="║ Agents:                                                     ║\n"
+
+  # List agents
+  agentRoom list 2>/dev/null
+
+  output+="╚════════════════════════════════════════════════════════════╝\n"
+
+  if [ "$pane" = "0" ] || [ -z "$TMUX" ]; then
+    echo -e "$output"
+    agentRoom list 2>/dev/null
+  else
+    local target=$(otmux pane.get.target 2>/dev/null)
+    otmux send "$pane" "agentRoom list" Enter
+    info.log "Status displayed in pane $pane"
+  fi
+}
+hiveMind.status.completion.pane() {
+  echo "0"
+  echo "1"
+  echo "D"
+}
+
+hiveMind.focus() # <agentId> # focus on specific agent pane
+{
+  local agent_id="$1"
+
+  if [ -z "$agent_id" ]; then
+    error.log "Usage: hiveMind focus <agentId>"
+    return 1
+  fi
+
+  local pane=$(private.hiveMind.pane.for.agent "$agent_id")
+
+  if [ -n "$pane" ]; then
+    tmux select-pane -t "$pane"
+    success.log "Focused on $agent_id"
+  else
+    error.log "No pane found for agent: $agent_id"
+    return 1
+  fi
+}
+
+hiveMind.send() # <agentId> <message> # send message to agent pane
+{
+  local agent_id="$1"
+  shift
+  local message="$*"
+
+  if [ -z "$agent_id" ] || [ -z "$message" ]; then
+    error.log "Usage: hiveMind send <agentId> <message>"
+    return 1
+  fi
+
+  local pane=$(private.hiveMind.pane.for.agent "$agent_id")
+
+  if [ -n "$pane" ]; then
+    tmux send-keys -t "$pane" "$message" Enter
+    info.log "Sent to $agent_id: $message"
+  else
+    error.log "No pane found for agent: $agent_id"
+    return 1
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.task() # <agentId> <description> # send task to specific agent
+{
+  local agent_id="$1"
+  shift
+  local description="$*"
+
+  if [ -z "$agent_id" ] || [ -z "$description" ]; then
+    error.log "Usage: hiveMind task <agentId> <description>"
+    return 1
+  fi
+
+  info.log "Sending task to $agent_id: $description"
+
+  # Send via tmux pane
+  local pane=$(private.hiveMind.pane.for.agent "$agent_id")
+  if [ -n "$pane" ]; then
+    tmux send-keys -t "$pane" "$description" Enter
+  else
+    # Fallback to API
+    agentRoom chat "$agent_id" "$description"
+  fi
+}
+
+hiveMind.broadcast() # <message> # send message to all agents
+{
+  local message="$1"
+
+  if [ -z "$message" ]; then
+    error.log "Usage: hiveMind broadcast <message>"
+    return 1
+  fi
+
+  info.log "Broadcasting: $message"
+
+  for agent_id in $(hiveMind.list); do
+    hiveMind.send "$agent_id" "$message"
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCOVERY
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.discover() # # discover all agents as JSON
+{
+  agentRoom discover
+}
+
+hiveMind.panes() # # list all agent panes
+{
+  echo "HiveMind Agent Panes:"
+  echo "─────────────────────────────────────────"
+  tmux list-panes -a -F "#{pane_id} #{pane_title} #{pane_current_command}" 2>/dev/null | \
+    while read pane_id title cmd; do
+      # Filter to only show agent panes
+      if echo "$title" | grep -qE "orchestrator|coder|tester|reviewer|researcher"; then
+        printf "%-12s %-20s %s\n" "$pane_id" "$title" "$cmd"
+      fi
+    done
+  echo "─────────────────────────────────────────"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE CODE INTEGRATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.claude() # <agentId> <?prompt> # interact with agent via Claude Code
+{
+  local agent_id="$1"
+  shift
+  local prompt="$*"
+
+  if [ -z "$agent_id" ]; then
+    error.log "Usage: hiveMind claude <agentId> <?prompt>"
+    return 1
+  fi
+
+  local pane=$(private.hiveMind.pane.for.agent "$agent_id")
+
+  if [ -z "$pane" ]; then
+    error.log "No pane found for agent: $agent_id"
+    return 1
+  fi
+
+  if [ -z "$prompt" ]; then
+    # Focus on agent pane
+    tmux select-pane -t "$pane"
+  else
+    # Send prompt to agent
+    tmux send-keys -t "$pane" "$prompt" Enter
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USAGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  hiveMind - Multi-agent orchestrator for oosh
+  Manages REAL Claude Code agents in tmux panes using agentRoom backend
+
+  Usage:
+  $this command     Description
+  ─────────────────────────────────────────────────────
+  INITIALIZATION:
+      init          initialize hivemind with real Claude agents
+      attach        attach to hivemind session
+      detach        detach from session
+      kill          shutdown hivemind completely
+
+  AGENTS:
+      spawn         spawn a new agent with pane
+      list          list all agents
+      status        show hivemind status
+      focus         focus on agent pane
+      panes         list all agent panes
+
+  TASKS:
+      send          send message to agent pane
+      task          send task to specific agent
+      broadcast     broadcast message to all agents
+
+  DISCOVERY:
+      discover      discover agents as JSON
+
+  CLAUDE CODE:
+      claude        interact with agent via Claude Code
+      createPane    create tmux pane for agent
+  ─────────────────────────────────────────────────────
+
+  Examples:
+    $this init                        # init with default agents
+    $this init coder,tester           # init with specific agents
+    $this spawn researcher            # add new agent
+    $this list                        # list agents
+    $this focus coder                 # focus coder pane
+    $this send coder 'fix the bug'    # send message
+    $this task tester 'write tests'   # assign task
+    $this broadcast 'status update'   # message all
+  "
+}
+
+hiveMind.start()
+{
+  #echo "sourcing init"
+  source this
+
+  if [ -z "$1" ]; then
+    hiveMind.status 0
+    return 0
+  fi
+
+  this.start "$@"
+}
+
+hiveMind.start "$@"

@@ -20,8 +20,20 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 
 ## Core Tools
 
+- [OOSH Quick Reference](oosh.md) - Framework basics and quick start guide
+- [OOSH Architecture](oosh-architecture.md) - Complete technical reference
 - [Log System Documentation](log.md) - Logging levels, live logging, debug breakpoints, and capture modes
+- [Config System Documentation](config.md) - Environment configuration persistence and management
+- [Debug System Documentation](debug.md) - Interactive step debugger, stack traces, and trap handlers
+- [OO Framework Documentation](oo.md) - Script creation, version control, package management
 - [State Machine Documentation](state.md) - Creating and managing state machines for multi-step workflows
+
+## Agent Orchestration
+
+- [HiveMind](hivemind.md) - Multi-agent orchestrator for distributed task execution
+- `claudeFlow` - Claude Flow wrapper with hive-mind commands
+- `claudeCode` - Claude Code session management
+- `otmux` - Tmux wrapper for pane management
 
 ## Core Concepts
 
