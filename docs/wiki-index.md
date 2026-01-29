@@ -23,6 +23,7 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [OOSH Quick Reference](oosh.md) - Framework basics and quick start guide
 - [OOSH Architecture](oosh-architecture.md) - Complete technical reference
 - [Log System Documentation](log.md) - Logging levels, live logging, debug breakpoints, and capture modes
+- [Log Levels and Testing](log-levels-and-testing.md) - Diagnostic reference: log level 0-7 details, config.save pollution bug, set +x bug, debugging guide, and proposed fixes
 - [Config System Documentation](config.md) - Environment configuration persistence and management
 - [Debug System Documentation](debug.md) - Interactive step debugger, stack traces, and trap handlers
 - [OO Framework Documentation](oo.md) - Script creation, version control, package management
