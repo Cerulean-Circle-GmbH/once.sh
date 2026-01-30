@@ -44,102 +44,126 @@ HiveMind orchestrates Claude Flow's hive-mind system with tmux integration:
 
 | Command | Description |
 |---------|-------------|
-| `init <?workers> <?topology>` | Initialize hivemind session |
+| `init <?agents> <?workdir>` | Initialize hivemind with agents |
 | `attach` | Attach to hivemind tmux session |
 | `detach` | Detach from current session |
 | `kill` | Shutdown hivemind completely |
 
 ```bash
 # Examples
-./hiveMind init                    # Default: 3 workers
-./hiveMind init 5                  # 5 workers
-./hiveMind init 8 hierarchical-mesh  # 8 workers, mesh topology
+./hiveMind init                              # Default agents
+./hiveMind init oosh-expert,oosh-tester      # Specific agents
 ```
 
 ### Agent Management
 
 | Command | Description |
 |---------|-------------|
-| `list` | List all agents (queen + workers) |
-| `workers` | List worker agents only |
-| `queen` | Show queen agent ID |
-| `spawn <count> <?type>` | Spawn additional workers |
+| `list` | List all agents |
+| `spawn <agentId> <?workdir>` | Spawn a new agent with pane |
 | `focus <agentId>` | Focus on agent's tmux pane |
-| `send <agentId> <command>` | Send command to agent's pane |
+| `send <agentId> <message>` | Send message to agent's pane |
+| `status <?pane>` | Show hivemind status |
+| `panes` | List all agent tmux panes |
+
+### Role Management
+
+| Command | Description |
+|---------|-------------|
+| `roles` | Show all role descriptions |
+| `role.list` | List roles from `.claude/agents/` |
+| `role.prompt <role>` | Output teaching prompt for role |
+| `role.teach <pane> <role>` | Teach role to existing pane |
 
 ```bash
 # Examples
-./hiveMind list                    # Show all agent IDs
-./hiveMind spawn 3 coder           # Spawn 3 coder agents
-./hiveMind focus queen-1234        # Focus queen pane
-./hiveMind send hive-worker-abc "ls -la"
+./hiveMind role.list                 # List all available roles
+./hiveMind role.prompt oosh-expert   # Show expert's teaching prompt
+./hiveMind role.teach 0.1 oosh-expert # Teach expert role to pane
+```
+
+### Agent Lifecycle
+
+| Command | Description |
+|---------|-------------|
+| `agent.bootstrap <role> <?session> <?pane>` | Full bootstrap: create pane, start Claude, teach role |
+| `agent.verify <pane>` | Check if agent is alive and processing |
+
+```bash
+# Examples
+./hiveMind agent.bootstrap scrum-master         # Bootstrap in default session
+./hiveMind agent.bootstrap oosh-expert mySession # Bootstrap in specific session
+./hiveMind agent.verify cursorOrchestrator:0.1   # Verify expert is alive
+```
+
+### Team Setup
+
+| Command | Description |
+|---------|-------------|
+| `team.setup.oosh <?session>` | Create 3-pane team (Teacher + Expert + Tester) |
+| `team.setup.full <?session>` | Create 4-pane team (+ ScrumMaster) |
+| `team.status <?session>` | Show status of all team members |
+| `teach <pane> <role>` | Teach an agent its specialized role |
+
+```bash
+# Examples
+./hiveMind team.setup.full                    # Full 4-agent team
+./hiveMind team.setup.full mySession          # In specific session
+./hiveMind team.status                        # Check all agents
+```
+
+### Monitoring
+
+| Command | Description |
+|---------|-------------|
+| `monitor.approve <pane> <?option:2>` | Approve permission prompt in pane |
+
+```bash
+# Examples
+./hiveMind monitor.approve cursorOrchestrator:0.1     # Approve with option 2
+./hiveMind monitor.approve cursorOrchestrator:0.1 3   # Reject with option 3
 ```
 
 ### Task Management
 
 | Command | Description |
 |---------|-------------|
-| `task <description> <?priority>` | Submit task to hive |
-| `broadcast <message>` | Send message to all workers |
-| `docs` | Task hive with documentation creation |
-
-```bash
-# Examples
-./hiveMind task "Implement login feature" high
-./hiveMind broadcast "Focus on testing"
-./hiveMind docs                    # Create OOSH docs
-```
-
-### Status & Monitoring
-
-| Command | Description |
-|---------|-------------|
-| `status <?pane>` | Show hive status (0=here, 1=status pane) |
-| `refresh` | Refresh agent panes to match hive |
-| `panes` | List all agent tmux panes |
+| `task <agentId> <description>` | Send task to specific agent |
+| `broadcast <message>` | Send message to all agents |
 
 ### Claude Code Integration
 
 | Command | Description |
 |---------|-------------|
-| `claude <?prompt> <?model>` | Run Claude Code in main pane |
-| `join <sessionId>` | Join existing Claude Code session |
-
-```bash
-# Examples
-./hiveMind claude "explain the state machine" sonnet
-./hiveMind join abc123-def456
-```
+| `claude <agentId> <?prompt>` | Interact with agent via Claude Code |
+| `createPane <agentId> <?workdir>` | Create tmux pane for agent |
 
 ---
 
-## Tmux Layout
+## Tmux Layouts
 
-When initialized, HiveMind creates:
+### Full Team (`team.setup.full`)
 
 ```
 ┌─────────────────────────────────────────┐
-│ Window: hive                            │
-├─────────────────────────────────────────┤
-│                                         │
-│  claude-main (60%)                      │
-│  Main Claude Code session               │
-│                                         │
-├─────────────────────────────────────────┤
-│  hive-status (40%)                      │
-│  Status/control pane                    │
-│                                         │
+│ Pane 0.0 - AGENT TEACHER                │
+├───────────────────────┬─────────────────┤
+│ Pane 0.2 - EXPERT     │ Pane 0.3 - TEST │
+│ (oosh-expert)         │ (oosh-tester)   │
+├───────────────────────┴─────────────────┤
+│ Pane 0.1 - SCRUMMASTER                  │
 └─────────────────────────────────────────┘
+```
 
+### OOSH Team (`team.setup.oosh`)
+
+```
 ┌─────────────────────────────────────────┐
-│ Window: agents                          │
-├──────────────────┬──────────────────────┤
-│ worker-1         │ worker-2             │
-│                  │                      │
-├──────────────────┼──────────────────────┤
-│ worker-3         │ worker-4             │
-│                  │                      │
-└──────────────────┴──────────────────────┘
+│ Pane 0.0 - ORCHESTRATOR                 │
+├───────────────────────┬─────────────────┤
+│ Pane 0.1 - EXPERT     │ Pane 0.2 - TEST │
+│ (oosh-expert)         │ (oosh-tester)   │
+└───────────────────────┴─────────────────┘
 ```
 
 ---

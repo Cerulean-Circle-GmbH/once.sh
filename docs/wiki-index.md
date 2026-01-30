@@ -33,8 +33,24 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 
 - [HiveMind](hivemind.md) - Multi-agent orchestrator for distributed task execution
 - `claudeFlow` - Claude Flow wrapper with hive-mind commands
-- `claudeCode` - Claude Code session management
+- `claudeCode` - Claude Code session management and agent support
 - `otmux` - Tmux wrapper for pane management
+
+### Agent Roles (`.claude/agents/`)
+
+All agent role definitions live in `.claude/agents/<role>/SKILL.md`:
+
+| Role | Purpose |
+|------|---------|
+| `agent-teacher` | Train agents, delegate tasks, improve tools |
+| `oosh-expert` | Framework architecture & development |
+| `oosh-tester` | Testing & quality assurance |
+| `scrum-master` | Continuous monitoring, permission approval |
+| `product-owner` | OOSH principles quality guardian |
+| `script-product-owner` | Per-script lifecycle guardian (template) |
+| `developer` | Implementation capacity (template) |
+
+Cursor reads these via symlinks at `.cursor/skills/` (DRY — single source of truth).
 
 ## Core Concepts
 
