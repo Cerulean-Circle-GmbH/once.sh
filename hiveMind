@@ -23,9 +23,11 @@
 # ── Naming conventions ────────────────────────────────────────────────────────
 # tmux session  : <teamName>            e.g. cursorOrchestrator, ooshTeam
 # tmux window   : team                  window 0 is always "team"
-# tmux pane     : <role>                pane title = role name
 # env per pane  : HIVEMIND_ROLE=<role>  exported before Claude Code starts
+# role registry : /tmp/hivemind.roles   maps pane targets → role names
+#                 (pane titles are unreliable — Claude Code overwrites them)
 : ${HIVEMIND_WINDOW_NAME:=team}
+: ${HIVEMIND_REGISTRY:=/tmp/hivemind.roles}
 
 # Default agent roles
 HIVEMIND_DEFAULT_AGENTS=(
@@ -71,12 +73,61 @@ private.hiveMind.get.role.prompt() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 private.hiveMind.pane.identify() {
-  # Set pane title and export HIVEMIND_ROLE env var in a tmux pane
+  # Register role for a pane: write to registry, set pane title, export env var
   # Usage: private.hiveMind.pane.identify <target> <role>
   local target="$1"
   local role="$2"
+  private.hiveMind.registry.set "$target" "$role"
   ./otmux pane.title "$target" "$role"
   ./otmux sendEnter "$target" "export HIVEMIND_ROLE=$role"
+}
+
+# ── Role Registry ─────────────────────────────────────────────────────────────
+# File-based mapping: pane target → role name.
+# Survives Claude Code overwriting pane titles.
+# Format: target|role  (one per line, e.g. cursorOrchestrator:0.2|oosh-expert)
+
+private.hiveMind.registry.set() {
+  # Add or update a target→role mapping
+  local target="$1"
+  local role="$2"
+  [ -z "$target" ] || [ -z "$role" ] && return 1
+  # Remove old entry for this target, then append new one
+  if [ -f "$HIVEMIND_REGISTRY" ]; then
+    grep -v "^${target}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
+    mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
+  fi
+  echo "${target}|${role}" >> "$HIVEMIND_REGISTRY"
+}
+
+private.hiveMind.registry.get() {
+  # Look up role for a given pane target
+  local target="$1"
+  [ -f "$HIVEMIND_REGISTRY" ] || return 1
+  grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
+}
+
+private.hiveMind.registry.find() {
+  # Find pane target by role name (case-insensitive partial match)
+  local name="$1"
+  local session="$2"
+  [ -f "$HIVEMIND_REGISTRY" ] || return 1
+  if [ -n "$session" ]; then
+    grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | grep -i "$name" | head -1 | cut -d'|' -f1
+  else
+    grep -i "$name" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f1
+  fi
+}
+
+private.hiveMind.registry.list() {
+  # List all entries, optionally filtered by session
+  local session="$1"
+  [ -f "$HIVEMIND_REGISTRY" ] || return 0
+  if [ -n "$session" ]; then
+    grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null
+  else
+    cat "$HIVEMIND_REGISTRY" 2>/dev/null
+  fi
 }
 
 private.hiveMind.get.agents() {
@@ -364,12 +415,16 @@ hiveMind.queen() # # show queen (orchestrator) agent ID
 
 hiveMind.status() # <?session> # show one-line hivemind overview
 {
-  local session="${1:-${HIVEMIND_SESSION:-cursorOrchestrator}}"
+  local session="${1:-cursorOrchestrator}"
 
   if tmux has-session -t "$session" 2>/dev/null; then
-    local agent_count
-    agent_count=$(tmux list-panes -t "$session" -s 2>/dev/null | wc -l | tr -d ' ')
-    echo "$session: $agent_count agents"
+    local pane_count
+    pane_count=$(tmux list-panes -t "$session" -s 2>/dev/null | wc -l | tr -d ' ')
+    local role_count=0
+    if [ -f "$HIVEMIND_REGISTRY" ]; then
+      role_count=$(grep -c "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null || echo 0)
+    fi
+    echo "$session: $pane_count panes, $role_count registered agents"
   else
     echo "$session: not running"
   fi
@@ -402,37 +457,30 @@ hiveMind.focus.completion.agentId() {
   hiveMind.list
 }
 
-hiveMind.resolve() # <name> <?session> # resolve agent name to pane target (session:window.pane)
+hiveMind.resolve() # <name> <?session> # resolve agent name to pane target via role registry
 {
   local name="$1"
-  local session="${2:-${HIVEMIND_SESSION:-cursorOrchestrator}}"
+  local session="${2:-cursorOrchestrator}"
 
   if [ -z "$name" ]; then
     error.log "Usage: hiveMind resolve <name>"
     return 1
   fi
 
-  if ! tmux has-session -t "$session" 2>/dev/null; then
-    error.log "Session '$session' not found"
-    return 1
-  fi
-
   local match
-  match=$(tmux list-panes -t "$session" -s \
-    -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" 2>/dev/null | \
-    grep -i "$name" | head -1 | cut -d'|' -f1)
+  match=$(private.hiveMind.registry.find "$name" "$session")
 
   if [ -n "$match" ]; then
     echo "$match"
   else
-    error.log "No agent matching '$name' in session $session"
+    error.log "No agent matching '$name' in registry (session: $session)"
     return 1
   fi
 }
 
 hiveMind.resolve.completion.name() {
-  local session="${HIVEMIND_SESSION:-cursorOrchestrator}"
-  tmux list-panes -t "$session" -s -F "#{pane_title}" 2>/dev/null
+  local session="cursorOrchestrator"
+  [ -f "$HIVEMIND_REGISTRY" ] && grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2
 }
 
 hiveMind.send() # <name> <message> # send message to agent by name or pane title
@@ -1012,14 +1060,14 @@ hiveMind.team.status() # <?session:cursorOrchestrator> # show team members as tr
 
   local pane_lines
   pane_lines=$(tmux list-panes -t "$session" -s \
-    -F "#{window_index}.#{pane_index}|#{pane_title}|#{pane_current_command}|#{pane_active}" 2>/dev/null)
+    -F "#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_active}" 2>/dev/null)
 
   local total
   total=$(echo "$pane_lines" | wc -l | tr -d ' ')
   local count=0
 
   echo "$session"
-  while IFS='|' read -r addr pane_title pane_cmd pane_active; do
+  while IFS='|' read -r addr pane_cmd pane_active; do
     count=$((count + 1))
 
     local state=""
@@ -1032,7 +1080,10 @@ hiveMind.team.status() # <?session:cursorOrchestrator> # show team members as tr
     local prefix="├──"
     [ "$count" -eq "$total" ] && prefix="└──"
 
-    local label="${pane_title:-pane $addr}"
+    # Look up role from registry; fall back to pane address
+    local role
+    role=$(private.hiveMind.registry.get "${session}:${addr}")
+    local label="${role:-pane $addr}"
     echo "$prefix $addr  $label ($state)"
   done <<< "$pane_lines"
 }
