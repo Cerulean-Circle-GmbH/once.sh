@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T15:35Z
+**Updated**: 2026-02-01T16:00Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (was 0.2 — team layout expanded to 7 panes)
 
@@ -74,10 +74,17 @@
 - Verified `hiveMind.monitor()` calls `hiveMind.resolve()` at line 1146 for name-based lookup
 - Both fully pane-agnostic via registry. No hard-coded pane numbers anywhere.
 
+### Rename agent-teacher registry key to orchestrator (DONE — commit 40e6ffb)
+- Consolidated `orchestrator|oosh-orchestrator|agent-teacher` into single case entry with backward-compatible aliases
+- All `pane.identify` calls and role prompts now use `"orchestrator"` as registry key
+- Directory remains `.claude/agents/agent-teacher/` unchanged
+- Updated `spawn.completion.type`, `workers`, `panes`, `roles` display
+- Added `agent-trainer` to completion and pane filter lists
+
 ## Current Team Layout (7 panes)
 ```
 /tmp/hivemind.roles:
-cursorOrchestrator:0.0|agent-teacher
+cursorOrchestrator:0.0|orchestrator
 cursorOrchestrator:0.1|product-owner
 cursorOrchestrator:0.2|agent-trainer
 cursorOrchestrator:0.3|test-shell
@@ -87,7 +94,7 @@ cursorOrchestrator:0.6|scrum-master
 ```
 
 ## Key Architecture Decisions
-- **Role registry**: `/tmp/hivemind.roles` — format `session:window.pane|role` per line. Survives Claude Code title overwrites. Written by `private.hiveMind.pane.identify()`, read by `resolve`, `team.status`, `status`.
+- **Role registry**: `/tmp/hivemind.roles` — format `session:window.pane|role` per line. Survives Claude Code title overwrites. Written by `private.hiveMind.pane.identify()`, read by `resolve`, `team.status`, `status`. Registry key for Agent Teacher is `orchestrator` (not `agent-teacher`); directory remains `agent-teacher/`.
 - **Session ID discovery**: `private.hiveMind.pane.session.id()` uses TTY→PID mapping, then checks `--resume` flag in command line, then `lsof` for `~/.claude/tasks/<UUID>/` directory.
 - **Bash 3.2**: No `declare -A` — use `private.hiveMind.get.role.prompt()` case function instead.
 - **HIVEMIND_AGENTS_DIR**: Computed from `${OOSH_DIR}/../../../.claude/agents` (workspace root is 3 levels up from dev.claude).
@@ -98,7 +105,7 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `795b6bf`
+- Latest commit: `40e6ffb`
 - `session/` directory now tracked in git
 
 ## Pending
