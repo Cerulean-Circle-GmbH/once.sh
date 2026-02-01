@@ -6,10 +6,10 @@ I am the OOSH Tester Agent in the hiveMind team. I run tests and report results.
 
 ## Current State
 
-**Status:** Standing by. Full suite **180/181** across 11 suites (1 intentional failure in test.suite self-test).
+**Status:** Standing by. Full suite **180/181**. OOSH-only rule verified in all 8 SKILL.md files.
 **Last updated:** 2026-01-31
 
-## Completed Work (25 items)
+## Completed Work (27 items)
 
 1. **Code review** of hiveMind.team.setup.oosh -- PASSES
 2. **hiveMind tests** run 5 times -- was stable at **26/33 pass, 7 fail** (4 pre-existing + 3 bash 3.2 declare -A)
@@ -37,6 +37,8 @@ I am the OOSH Tester Agent in the hiveMind team. I run tests and report results.
 23. **Full 9-suite test run** -- hiveMind 33, ossh 8, log 23, c2 16, line 16, config 20, oo 20, state 10, this 10. Total: 156/156, 0 failures.
 24. **Full 10-suite test run** -- hiveMind 33, ossh 8, log 23, c2 16, line 16, config 20, oo 20, state 10, this 10, debug 20. Total: 176/176, 0 failures.
 25. **Full 11-suite test run** -- hiveMind 33, ossh 8, log 23, c2 16, line 16, config 20, oo 20, state 10, this 10, debug 20, test.suite 4/5. **Total: 180/181, 0 real failures.** test.suite 1 failure is intentional (self-test verifying expect.fail counter logic).
+26. **OOSH-only rule delegation** -- Sent task to Agent Teacher (pane 0.0) to add OOSH-only enforcement rule to all SKILL.md files. Rule: no raw tmux, always use hiveMind send/monitor/resolve and otmux wrappers. Also noted agent-trainer symlink created.
+27. **OOSH-only rule verification** -- PASSES. All 8 SKILL.md files contain "OOSH-Only Rule (MANDATORY)" section with tmux→OOSH wrapper mapping table. Files: agent-teacher, agent-trainer, developer, oosh-expert, oosh-tester, product-owner, script-product-owner, scrum-master.
 
 ## 0 Real Test Failures
 
