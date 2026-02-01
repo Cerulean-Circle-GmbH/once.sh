@@ -6,10 +6,10 @@ I am the OOSH Tester Agent in the hiveMind team. I run tests and report results.
 
 ## Current State
 
-**Status:** Standing by. Full suite **180/181**. team.status pane state fix verified. Team now 7 panes. I am now on pane 0.5 (was 0.3).
+**Status:** Standing by. Full suite **180/181**. TASK-15/16 verified. Team now 7 panes. I am on pane 0.5.
 **Last updated:** 2026-02-01
 
-## Completed Work (28 items)
+## Completed Work (29 items)
 
 1. **Code review** of hiveMind.team.setup.oosh -- PASSES
 2. **hiveMind tests** run 5 times -- was stable at **26/33 pass, 7 fail** (4 pre-existing + 3 bash 3.2 declare -A)
@@ -32,6 +32,7 @@ I am the OOSH Tester Agent in the hiveMind team. I run tests and report results.
 26. **OOSH-only rule delegation** -- sent to Agent Teacher
 27. **OOSH-only rule verification** -- all 8 SKILL.md files have MANDATORY rule
 28. **team.status pane state fix** -- PASSES. Shows real states (active/shell), role names from registry, session IDs in brackets. Team expanded to 7 panes. 180/181 no regressions.
+29. **TASK-15/16 verification (send.enter + object.verb refactoring)** -- send.enter works end-to-end, pane.create exists with OOSH signature, no public camelCase methods remain (createPane/sendEnter gone), hiveMind 33/33. All 4 checks PASS. Note: otmux still uses sendEnter (separate scope).
 
 ## Current Pane Layout (7 panes)
 
