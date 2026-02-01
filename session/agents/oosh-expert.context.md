@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T15:20Z
+**Updated**: 2026-02-01T15:35Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (was 0.2 — team layout expanded to 7 panes)
 
@@ -98,8 +98,8 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `de0a992`
-- Untracked: `session/` directory
+- Latest commit: `795b6bf`
+- `session/` directory now tracked in git
 
 ## Pending
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
