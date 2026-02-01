@@ -71,6 +71,11 @@
 - Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
 - Notification: `TASK PLAN READY: TASK-<number> — <title>`
 
+### Task 16: Tester DRY violation detection (DONE)
+- Added responsibility #6 "DRY Violation Detection" to oosh-tester SKILL.md
+- Added "DRY Violation Reporting" subsection: spot duplicates → report to Task Agent → Task Agent plans → Expert fixes
+- Explicit prohibition: do NOT fix DRY violations yourself, report them for tracking
+
 ### Task 15: Task Agent ownership clarification (DONE)
 - Updated Orchestrator SKILL.md: delegation workflow and pattern now say "pass to Task Agent" not "create task file"
 - Added explicit "You do NOT create task files" prohibition to Orchestrator
