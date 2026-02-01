@@ -124,8 +124,12 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `9ec0742`
+- Latest commit: `55d90a4`
 - `session/` directory tracked in git
+
+## Next Tasks (assigned by Agent Teacher, do after compact)
+1. **Fix hiveMind team.status fake idle status** — replace with real detection
+2. **Object.verb notation enforcement** — details TBD from Agent Teacher
 
 ## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
