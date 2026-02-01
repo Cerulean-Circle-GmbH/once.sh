@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T16:00Z
+**Updated**: 2026-02-01T16:15Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (was 0.2 — team layout expanded to 7 panes)
 
@@ -105,10 +105,13 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `40e6ffb`
+- Latest commit: `896e53f`
 - `session/` directory now tracked in git
 
-## Pending
+## Next Tasks (assigned by Agent Teacher, do after compact)
+1. **Fix otmux sendEnter reliability for accept-edits prompts** — investigate and fix
+2. **Fix hiveMind send exit code 1 issue** — `./hiveMind send` returns 1 even on success
+
+## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
 - ossh tests NOT written for config.create fixes
-- Awaiting next task from Agent Teacher
