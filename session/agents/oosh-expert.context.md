@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T17:30Z
+**Updated**: 2026-02-01T18:30Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -108,13 +108,32 @@
 - Removed unused `pane_active` from tmux format string and read statement
 - `permission` state is key for ScrumMaster — shows which panes are blocked on approval
 
+### Task 15: hiveMind send/send.enter pair (DONE — commit 461c6e1)
+- Split `hiveMind.send()` into two methods mirroring the otmux send/sendEnter pattern:
+  - `hiveMind.send()` — raw keys via `./otmux send` (no Enter appended)
+  - `hiveMind.send.enter()` — literal text + Enter via `./otmux sendEnter`
+- Both resolve agent name via `hiveMind.resolve()` with completion functions
+- Updated `hiveMind.broadcast()` to use `send.enter`
+- Fixed `hiveMind.task()` raw `tmux send-keys` → `./otmux sendEnter` (OOSH-Only violation)
+
+### Task 15 additions: task-agent role (DONE — commit 461c6e1)
+- Added `task-agent` to `private.hiveMind.get.role.prompt()` case function
+- Added to `hiveMind.spawn.completion.type()`
+- Added to `hiveMind.panes()` filter grep
+- Added to `hiveMind.roles()` display
+
+### Task 16: object.verb notation refactor (DONE — commit 461c6e1)
+- `hiveMind.createPane()` → `hiveMind.pane.create()` (definition + 2 callers + error msg + usage text)
+- `hiveMind.sendEnter()` → `hiveMind.send.enter()` (definition + 1 caller + error msg + usage text)
+- Updated all usage/help text and examples in `hiveMind.usage()`
+
 ## Current Team Layout (7 panes)
 ```
 /tmp/hivemind.roles:
 cursorOrchestrator:0.0|orchestrator
 cursorOrchestrator:0.1|product-owner
 cursorOrchestrator:0.2|agent-trainer
-cursorOrchestrator:0.3|test-shell
+cursorOrchestrator:0.3|task-agent
 cursorOrchestrator:0.4|oosh-expert      <- this agent
 cursorOrchestrator:0.5|oosh-tester
 cursorOrchestrator:0.6|scrum-master
@@ -128,6 +147,8 @@ cursorOrchestrator:0.6|scrum-master
 - **Bash 3.2**: No `declare -A` — use `private.hiveMind.get.role.prompt()` case function instead.
 - **HIVEMIND_AGENTS_DIR**: Computed from `${OOSH_DIR}/../../../.claude/agents` (workspace root is 3 levels up from dev.claude).
 - **Activity detection**: `private.hiveMind.pane.activity()` captures pane content (last 5 lines) and pattern-matches for permission prompts, idle prompt, or defaults to active. Used by `team.status()`.
+- **send/send.enter pair**: `hiveMind.send()` sends raw keys (no Enter) via `./otmux send`. `hiveMind.send.enter()` sends text+Enter via `./otmux sendEnter`. Mirrors the otmux send/sendEnter pattern.
+- **object.verb naming**: All public methods use dot notation. camelCase → dot: `createPane` → `pane.create`, `sendEnter` → `send.enter`.
 - **agentRoom guards**: Always check both `command -v agentRoom` AND `agentRoom backend.status` output text.
 
 ## Key Rules
@@ -135,13 +156,17 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `3c8fc00`
+- Latest commit: `461c6e1`
 - `session/` directory tracked in git
 
 ## Next Tasks (assigned by Agent Teacher)
 1. ~~**Fix hiveMind team.status fake idle status**~~ — DONE (commit 3c8fc00)
-2. **Object.verb notation enforcement** — details TBD from Agent Teacher
+2. ~~**hiveMind sendEnter command**~~ — DONE (commit 461c6e1)
+3. ~~**Object.verb notation enforcement**~~ — DONE (commit 461c6e1)
+4. ~~**Add task-agent to hiveMind**~~ — DONE (commit 461c6e1)
+5. Awaiting next assignment from Orchestrator
 
 ## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
 - ossh tests NOT written for config.create fixes
+- ScrumMaster noted: `hiveMind.agent.bootstrap()` uses `--dangerously-skip-permissions` at line ~967 — violates NO-SKIP-PERMISSIONS rule
