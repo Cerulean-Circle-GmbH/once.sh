@@ -1,8 +1,8 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T16:15Z
+**Updated**: 2026-02-01T17:00Z
 **Role**: OOSH Expert (implementation & architecture)
-**Pane**: 0.4 in cursorOrchestrator (was 0.2 — team layout expanded to 7 panes)
+**Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
 ## Recovery Steps
 1. Read this file first
@@ -70,8 +70,8 @@
 - Agent Trainer SKILL.md later updated (by Agent Trainer) with OOSH-Only Rule: never use raw tmux, always use `./otmux` and `./hiveMind` wrappers
 
 ### ScrumMaster verification: hiveMind.send and hiveMind.monitor (DONE — no changes needed)
-- Verified `hiveMind.send()` calls `hiveMind.resolve()` at line 529 → `private.hiveMind.registry.find()` → `/tmp/hivemind.roles`
-- Verified `hiveMind.monitor()` calls `hiveMind.resolve()` at line 1146 for name-based lookup
+- Verified `hiveMind.send()` calls `hiveMind.resolve()` → `private.hiveMind.registry.find()` → `/tmp/hivemind.roles`
+- Verified `hiveMind.monitor()` calls `hiveMind.resolve()` for name-based lookup
 - Both fully pane-agnostic via registry. No hard-coded pane numbers anywhere.
 
 ### Rename agent-teacher registry key to orchestrator (DONE — commit 40e6ffb)
@@ -81,6 +81,23 @@
 - Updated `spawn.completion.type`, `workers`, `panes`, `roles` display
 - Added `agent-trainer` to completion and pane filter lists
 
+### Task 10: Fix otmux sendEnter TUI reliability (DONE — commit 9ec0742)
+- **otmux.sendEnter()**: Split into two `send-keys` calls — literal text (`-l` flag) + 50ms delay + Enter separately
+  - `-l` flag prevents tmux key name interpretation in message text (e.g., "Escape" or "Up" sent as literal text)
+  - 50ms delay between text and Enter gives Claude Code TUI time to process
+  - Guards empty text (sends Enter only when no text)
+- **New otmux.sendKeys()**: Sends each key argument separately with 50ms inter-key delays
+  - Designed for TUI interactions: `./otmux sendKeys <pane> Down Enter`
+  - Also available as `./otmux send.tui <pane> Down Enter`
+  - ScrumMaster should use this for Claude Code permission/accept-edits prompts
+
+### Task 11: Fix hiveMind send exit code 1 (DONE — commit 9ec0742)
+- **Root cause 1**: `info.log` at end of `hiveMind.send()` leaked its exit code — added explicit `return 0`
+- **Root cause 2**: `hiveMind.resolve()` lacked explicit `return 0` on success — added it
+- **Root cause 3**: After registry rename, `hiveMind send agent-teacher` failed because registry has `orchestrator`
+  - Added `private.hiveMind.resolve.alias()` — maps `agent-teacher`/`oosh-orchestrator` → `orchestrator`
+  - `hiveMind.resolve()` now falls back to alias lookup when direct registry search fails
+
 ## Current Team Layout (7 panes)
 ```
 /tmp/hivemind.roles:
@@ -88,14 +105,16 @@ cursorOrchestrator:0.0|orchestrator
 cursorOrchestrator:0.1|product-owner
 cursorOrchestrator:0.2|agent-trainer
 cursorOrchestrator:0.3|test-shell
-cursorOrchestrator:0.4|oosh-expert      ← this agent
+cursorOrchestrator:0.4|oosh-expert      <- this agent
 cursorOrchestrator:0.5|oosh-tester
 cursorOrchestrator:0.6|scrum-master
 ```
 
 ## Key Architecture Decisions
 - **Role registry**: `/tmp/hivemind.roles` — format `session:window.pane|role` per line. Survives Claude Code title overwrites. Written by `private.hiveMind.pane.identify()`, read by `resolve`, `team.status`, `status`. Registry key for Agent Teacher is `orchestrator` (not `agent-teacher`); directory remains `agent-teacher/`.
+- **Alias resolution**: `private.hiveMind.resolve.alias()` maps legacy names to canonical registry keys. `hiveMind.resolve()` tries direct lookup first, then alias fallback.
 - **Session ID discovery**: `private.hiveMind.pane.session.id()` uses TTY→PID mapping, then checks `--resume` flag in command line, then `lsof` for `~/.claude/tasks/<UUID>/` directory.
+- **TUI key sending**: `otmux.sendKeys()` / `otmux.send.tui()` sends keys with 50ms inter-key delays for Claude Code TUI reliability. `otmux.sendEnter()` uses `-l` literal flag + split calls.
 - **Bash 3.2**: No `declare -A` — use `private.hiveMind.get.role.prompt()` case function instead.
 - **HIVEMIND_AGENTS_DIR**: Computed from `${OOSH_DIR}/../../../.claude/agents` (workspace root is 3 levels up from dev.claude).
 - **agentRoom guards**: Always check both `command -v agentRoom` AND `agentRoom backend.status` output text.
@@ -105,12 +124,8 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `896e53f`
-- `session/` directory now tracked in git
-
-## Next Tasks (assigned by Agent Teacher, do after compact)
-1. **Fix otmux sendEnter reliability for accept-edits prompts** — investigate and fix
-2. **Fix hiveMind send exit code 1 issue** — `./hiveMind send` returns 1 even on success
+- Latest commit: `9ec0742`
+- `session/` directory tracked in git
 
 ## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
