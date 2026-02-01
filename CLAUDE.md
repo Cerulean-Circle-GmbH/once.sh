@@ -162,6 +162,35 @@ The `c2` script (in `ng/c2`) provides Tab completion for oosh methods:
 
 ---
 
+## Logging Configuration
+
+**Use `console.log` for user-facing output** - it respects the oosh logging system.
+
+### If console.log produces no output:
+
+```bash
+# Check LOG_DEVICE (should be /dev/tty)
+echo $LOG_DEVICE
+
+# If pointing to a file, reset to terminal:
+log device /dev/tty
+
+# Start fresh shell
+exit && bash
+```
+
+### Log function requirements:
+
+| Function | Min LOG_LEVEL | Writes to |
+|----------|---------------|-----------|
+| `console.log` | 3 | LOG_DEVICE |
+| `important.log` | 2 | LOG_DEVICE |
+| `error.log` | 1 | LOG_DEVICE |
+
+**See:** [docs/log.md](docs/log.md) for full documentation
+
+---
+
 ## Key Documentation References
 
 | Topic | Document |

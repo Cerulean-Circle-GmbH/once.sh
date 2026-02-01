@@ -258,6 +258,67 @@ Tests cover:
 - Clear functions
 - Color initialization
 
+## Troubleshooting
+
+### No Output from console.log or important.log
+
+If `console.log` or `important.log` produce no visible output, check `LOG_DEVICE`:
+
+```bash
+# Check current device
+echo $LOG_DEVICE
+
+# If it's pointing to a file (e.g., /tmp/test.log.device.12345)
+# Reset to terminal:
+log device /dev/tty
+
+# Start a new shell to pick up the change
+exit
+bash
+```
+
+**Why this happens:**
+- All logging functions write to `$LOG_DEVICE`
+- Default is `/dev/tty` (the terminal)
+- During testing, it may be redirected to a temp file for capture
+- The `log device` command persists to `~/config/log.env`
+
+### Understanding LOG_DEVICE and LOG_LIVE
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LOG_DEVICE` | Where log output goes (terminal or file) | `/dev/tty` |
+| `LOG_LIVE` | Additional file for live monitoring | (unset) |
+
+The logging functions use `tee` to write to both destinations when `LOG_LIVE` is set:
+1. Primary output → `LOG_DEVICE`
+2. Duplicate for monitoring → `LOG_LIVE`
+
+### Checking Log Configuration
+
+```bash
+# Show all log settings
+cat ~/config/log.env
+
+# Key variables to check:
+# LOG_DEVICE - should be /dev/tty for terminal output
+# LOG_LEVEL - should be 3 (default) for console.log to work
+# LOG_LIVE - optional, for real-time file capture
+```
+
+### Reset to Defaults
+
+```bash
+# Reset log device to terminal
+log device /dev/tty
+
+# Reset log level to default
+log level 3
+
+# Start fresh shell
+exit && bash
+```
+
 ## See Also
 
 - [State Machine Documentation](state.md)
