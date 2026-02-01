@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T17:00Z
+**Updated**: 2026-02-01T17:30Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -98,6 +98,16 @@
   - Added `private.hiveMind.resolve.alias()` — maps `agent-teacher`/`oosh-orchestrator` → `orchestrator`
   - `hiveMind.resolve()` now falls back to alias lookup when direct registry search fails
 
+### Task 12: Fix hiveMind team.status fake idle detection (DONE — commit 3c8fc00)
+- **Problem**: `team.status()` used `pane_active` (tmux pane focus) — all non-focused panes showed "idle" regardless of real activity
+- **Fix**: New `private.hiveMind.pane.activity()` helper (hiveMind:171-202) captures last 5 lines of pane content and detects:
+  - `permission` — Both "Allow" and "Deny" present (Claude Code tool approval dialog)
+  - `idle` — Last non-empty line is input prompt (`>` or `❯`)
+  - `active` — Default (generating text, running tools, streaming)
+  - `unknown` — Empty pane or capture failed
+- Removed unused `pane_active` from tmux format string and read statement
+- `permission` state is key for ScrumMaster — shows which panes are blocked on approval
+
 ## Current Team Layout (7 panes)
 ```
 /tmp/hivemind.roles:
@@ -117,6 +127,7 @@ cursorOrchestrator:0.6|scrum-master
 - **TUI key sending**: `otmux.sendKeys()` / `otmux.send.tui()` sends keys with 50ms inter-key delays for Claude Code TUI reliability. `otmux.sendEnter()` uses `-l` literal flag + split calls.
 - **Bash 3.2**: No `declare -A` — use `private.hiveMind.get.role.prompt()` case function instead.
 - **HIVEMIND_AGENTS_DIR**: Computed from `${OOSH_DIR}/../../../.claude/agents` (workspace root is 3 levels up from dev.claude).
+- **Activity detection**: `private.hiveMind.pane.activity()` captures pane content (last 5 lines) and pattern-matches for permission prompts, idle prompt, or defaults to active. Used by `team.status()`.
 - **agentRoom guards**: Always check both `command -v agentRoom` AND `agentRoom backend.status` output text.
 
 ## Key Rules
@@ -124,11 +135,11 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `55d90a4`
+- Latest commit: `3c8fc00`
 - `session/` directory tracked in git
 
-## Next Tasks (assigned by Agent Teacher, do after compact)
-1. **Fix hiveMind team.status fake idle status** — replace with real detection
+## Next Tasks (assigned by Agent Teacher)
+1. ~~**Fix hiveMind team.status fake idle status**~~ — DONE (commit 3c8fc00)
 2. **Object.verb notation enforcement** — details TBD from Agent Teacher
 
 ## Pending (not yet assigned)
