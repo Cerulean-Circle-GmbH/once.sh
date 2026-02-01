@@ -71,6 +71,15 @@
 - Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
 - Notification: `TASK PLAN READY: TASK-<number> — <title>`
 
+### Task 14: File-Based Communication (DONE) — Task 19
+- Added `## File-Based Communication (MANDATORY)` to ALL 9 SKILL.md files
+- Rule: tasks defined in `session/tasks/Task.{N}.{YYYYMMDDHHMM}.md`, messages are short notifications only
+- Orchestrator: delegation pattern — create task file → send short notification to SM
+- ScrumMaster: relay rule — forward short notifications only, never copy task descriptions
+- Task Agent: creator role — create task files, send `TASK PLAN READY: <path>` notification
+- Workers (Expert, Tester, Developer, PO, Trainer): read task file on notification
+- Added to agent-trainer Key Learnings to Propagate list
+
 ### Task 13: Quota Awareness rule (DONE)
 - Added `## Quota Awareness (MANDATORY)` to ALL 9 SKILL.md files
 - Rule: 80%+ usage → throttle (reduce frequency, batch messages, essential only); 90%+ → stand down completely
