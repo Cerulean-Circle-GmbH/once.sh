@@ -71,6 +71,12 @@
 - Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
 - Notification: `TASK PLAN READY: TASK-<number> — <title>`
 
+### Task 13: Quota Awareness rule (DONE)
+- Added `## Quota Awareness (MANDATORY)` to ALL 9 SKILL.md files
+- Rule: 80%+ usage → throttle (reduce frequency, batch messages, essential only); 90%+ → stand down completely
+- Role-tailored 80% actions (SM: 30s+ cycles; Tester: reduce test runs; PO: reduce audits; etc.)
+- Added to agent-trainer Key Learnings to Propagate list
+
 ### Task 12: Named Sessions rule (DONE)
 - Added `## Named Sessions (MANDATORY)` to ALL 9 SKILL.md files
 - Rule: every Claude Code session must have a name matching the agent role, no unnamed sessions
