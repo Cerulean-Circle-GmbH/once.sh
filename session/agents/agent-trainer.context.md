@@ -71,6 +71,13 @@
 - Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
 - Notification: `TASK PLAN READY: TASK-<number> — <title>`
 
+### Task 15: Task Agent ownership clarification (DONE)
+- Updated Orchestrator SKILL.md: delegation workflow and pattern now say "pass to Task Agent" not "create task file"
+- Added explicit "You do NOT create task files" prohibition to Orchestrator
+- Updated Task Agent SKILL.md: receives from Orchestrator (not PO directly)
+- Corrected flow: User → PO → Orchestrator → Task Agent → task file → Orchestrator executes
+- Updated Task Agent communication, workflow, and recovery sections
+
 ### Task 14: File-Based Communication (DONE) — Task 19
 - Added `## File-Based Communication (MANDATORY)` to ALL 9 SKILL.md files
 - Rule: tasks defined in `session/tasks/Task.{N}.{YYYYMMDDHHMM}.md`, messages are short notifications only
