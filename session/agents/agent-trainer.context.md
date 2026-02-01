@@ -58,18 +58,45 @@
 - Updated scrum-master communication chain to include PO quality gate
 - Role directory: self-reference now `orchestrator` (directory still `agent-teacher/`)
 
+### Task 9: Context Preservation rule (DONE)
+- Added `## Context Preservation (MANDATORY)` to ALL 8 SKILL.md files
+- Rule: at 20% context, STOP work, save state to session/agents/<role>.context.md, run /compact
+- Role-specific context file paths and save instructions in each file
+- Added to agent-trainer Key Learnings to Propagate list
+
+### Task 10: Create Task Agent SKILL.md (DONE)
+- Created `.claude/agents/task-agent/SKILL.md` (new role, 9th agent)
+- Role: receive directives from PO, create task files quoting verbatim, write headline plans
+- Task file format: `session/tasks/TASK-<number>-<short-name>.md`
+- Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
+- Notification: `TASK PLAN READY: TASK-<number> — <title>`
+
+### Task 12: Named Sessions rule (DONE)
+- Added `## Named Sessions (MANDATORY)` to ALL 9 SKILL.md files
+- Rule: every Claude Code session must have a name matching the agent role, no unnamed sessions
+- Each file includes the specific session name for that role (e.g., `orchestrator`, `scrum-master`)
+- script-product-owner adapted: agents performing audits use their own role-named session
+- Added to agent-trainer Key Learnings to Propagate list
+
+### Task 11: Save-before-compact rule (DONE)
+- Added "NEVER run `/compact` without saving state first" to ALL 9 SKILL.md files
+- Rule text: "Auto-compacting without saving loses your current work permanently. The sequence is always: STOP → SAVE → `/compact`. No exceptions."
+- Added to agent-trainer Key Learnings to Propagate list as "Save Before Compact"
+
 ### Git Setup
-- Initialized workspace root repo at `/Users/Shared/Workspaces/AI/Claude/`
+- Initialized workspace root repo at `/Users/Shared/Workspaces/AI/Claude/` (local only, no remote)
 - .gitignore: excludes components/ (nested repos), .cursor/ (symlinks), session/ (transient)
 - Commit c4ba649: Initial commit with all 8 SKILL.md files + hooks + settings
 - Commit f55cd4e: Orchestrator rename across all files
+- Commit e2663a9: Context Preservation + Task Agent role
 
 ## Pending
-- Expert needs to update hiveMind code: register `orchestrator` instead of `agent-teacher`
 - Expert needs to remove `--dangerously-skip-permissions` from hiveMind team setup functions
+- task-agent needs adding to hiveMind `private.hiveMind.get.role.prompt()` (Expert task)
+- task-agent needs adding to Orchestrator team table in agent-teacher/SKILL.md
 - Standing by for SKILL.md improvement tasks from Orchestrator
 
 ## Key Files
-- All SKILL.md files: `/Users/Shared/Workspaces/AI/Claude/.claude/agents/*/SKILL.md`
-- Workspace git repo: `/Users/Shared/Workspaces/AI/Claude/.git/`
+- All SKILL.md files: `/Users/Shared/Workspaces/AI/Claude/.claude/agents/*/SKILL.md` (now 9 roles)
+- Workspace git repo: `/Users/Shared/Workspaces/AI/Claude/.git/` (local only)
 - This context file: `session/agents/agent-trainer.context.md`
