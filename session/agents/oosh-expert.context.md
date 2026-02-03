@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-03T10:00Z
+**Updated**: 2026-02-03T12:15Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -149,6 +149,20 @@
 - Tab completion: `hiveMind.agent.send.completion.name()`
 - Usage section renamed from "TASKS" to "MESSAGING", `agent.send` listed first with example
 
+### Task 25: Naming convention audit and enforcement (DONE — commit 04a6587)
+- **Audit**: Found 89 camelCase violations across 6 files (otmux: 76, claudeCode: 5, osx: 4, c2: 2, claudeFlow: 1, hiveMind callers: 29)
+- **otmux** (biggest change):
+  - 82 old camelCase method definitions → `private.` prefix (implementation preserved, hidden from tab completion)
+  - 15 camelCase-within-dot-notation → fixed (e.g., `pane.splitH` → `pane.split.h`, `layout.evenH` → `layout.even.h`)
+  - Added `otmux.split.h()` and `otmux.split.v()` top-level shorthands
+  - Dot-notation wrappers (lines ~1138+) now call `private.otmux.*` implementations
+- **hiveMind**: 29 caller updates — `./otmux sendEnter` → `./otmux send.enter`, `splitV` → `split.v`, `splitH` → `split.h`
+- **claudeCode**: `allowedTools` → `tools.allowed`, `disallowedTools` → `tools.disallowed`, `maxTurns` → `turns.max`, `systemPrompt` → `system.prompt`, `appendSystemPrompt` → `system.prompt.append`
+- **claudeFlow**: `tmux.killAll` → `tmux.kill.all` (definition + case dispatch + usage text)
+- **osx**: `listFileMetadata` → `file.metadata.list`, `timeMachine` → `timemachine`, `bySize` → `by.size`, `byName` → `by.name`
+- **ng/c2**: `buildinCommands` → `buildin.commands`
+- **Known exceptions**: 3 completion parameter names (`completion.agentId`) — tied to c2 completion system parameter matching
+
 ## Current Team Layout (7 panes)
 ```
 /tmp/hivemind.roles:
@@ -165,12 +179,13 @@ cursorOrchestrator:0.6|scrum-master
 - **Role registry**: `/tmp/hivemind.roles` — format `session:window.pane|role` per line. Survives Claude Code title overwrites. Written by `private.hiveMind.pane.identify()`, read by `resolve`, `team.status`, `status`. Registry key for Agent Teacher is `orchestrator` (not `agent-teacher`); directory remains `agent-teacher/`.
 - **Alias resolution**: `private.hiveMind.resolve.alias()` maps legacy names to canonical registry keys. `hiveMind.resolve()` tries direct lookup first, then alias fallback.
 - **Session ID discovery**: Delegated to `claudeCode` wrapper (DRY). `claudeCode.process.find` uses `ps args` (not `comm`) for reliable PID lookup. `claudeCode.session.id` chains `--resume` flag → lsof `~/.claude/tasks/` methods. hiveMind calls `./claudeCode session.id <pane>`.
-- **TUI key sending**: `otmux.sendKeys()` / `otmux.send.tui()` sends keys with 50ms inter-key delays for Claude Code TUI reliability. `otmux.sendEnter()` uses `-l` literal flag + split calls.
+- **TUI key sending**: `private.otmux.sendKeys()` / `otmux.send.tui()` sends keys with 50ms inter-key delays. `private.otmux.sendEnter()` uses `-l` literal flag + split calls. Public API: `otmux.send.enter`, `otmux.send.tui`.
 - **Bash 3.2**: No `declare -A` — use `private.hiveMind.get.role.prompt()` case function instead.
 - **HIVEMIND_AGENTS_DIR**: Computed from `${OOSH_DIR}/../../../.claude/agents` (workspace root is 3 levels up from dev.claude).
 - **Activity detection**: `private.hiveMind.pane.activity()` captures pane content (last 5 lines) and pattern-matches for permission prompts, idle prompt, or defaults to active. Used by `team.status()`.
-- **send/send.enter pair**: `hiveMind.send()` sends raw keys (no Enter) via `./otmux send`. `hiveMind.send.enter()` sends text+Enter via `./otmux sendEnter`. Mirrors the otmux send/sendEnter pattern.
-- **object.verb naming**: All public methods use dot notation. camelCase → dot: `createPane` → `pane.create`, `sendEnter` → `send.enter`.
+- **send/send.enter pair**: `hiveMind.send()` sends raw keys (no Enter) via `./otmux send`. `hiveMind.send.enter()` sends text+Enter via `./otmux send.enter`. Mirrors the otmux pattern.
+- **object.verb naming**: All public methods use dot notation. Old camelCase methods in otmux prefixed with `private.`. Callers updated: `./otmux sendEnter` → `./otmux send.enter`, `./otmux splitV` → `./otmux split.v`.
+- **otmux dual API**: Old camelCase implementations now `private.otmux.*` (lines ~139-1073). Dot-notation public API (lines ~1138+) delegates to private implementations.
 - **agentRoom guards**: Always check both `command -v agentRoom` AND `agentRoom backend.status` output text.
 - **Transport-independent messaging**: `hiveMind.agent.send()` resolves via `private.hiveMind.channel.resolve()` → `transport|target` format. Pane channel preferred, API fallback. Future transports added to case statement.
 
@@ -179,7 +194,7 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `d93fa89`
+- Latest commit: `04a6587`
 - `session/` directory tracked in git
 
 ## Next Tasks (assigned by Agent Teacher)
@@ -189,7 +204,8 @@ cursorOrchestrator:0.6|scrum-master
 4. ~~**Add task-agent to hiveMind**~~ — DONE (commit 461c6e1)
 5. ~~**Fix session ID detection + shell false positive**~~ — DONE (commit e2b5515)
 6. ~~**hiveMind agent.send — transport-independent messaging**~~ — DONE (commit d93fa89)
-7. Awaiting next assignment from Orchestrator
+7. ~~**Naming convention audit and enforcement (Task 25)**~~ — DONE (commit 04a6587)
+8. Awaiting next assignment from Orchestrator
 
 ## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
