@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T18:30Z
+**Updated**: 2026-02-01T19:15Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -127,6 +127,16 @@
 - `hiveMind.sendEnter()` → `hiveMind.send.enter()` (definition + 1 caller + error msg + usage text)
 - Updated all usage/help text and examples in `hiveMind.usage()`
 
+### Task 20: Fix session ID detection + shell false positive (DONE — commit e2b5515)
+- **DRY refactor**: Moved session detection from `private.hiveMind.pane.session.id()` to `claudeCode` wrapper:
+  - `claudeCode.process.find <pane>` — finds Claude PID using `ps -eo pid,tty,args` (full command line, not truncated `comm`)
+  - `claudeCode.process.running <pane>` — boolean check wrapping `process.find`
+  - `claudeCode.session.id <pane>` — gets session UUID via PID → `--resume` / lsof chain
+- **Shell false positive fix**: `team.status()` now checks `./claudeCode process.running` for `bash|zsh` panes before labeling as "shell"
+- **Root cause**: `ps -eo comm` truncates long paths (e.g., `~/.local/bin/claude` → `/Users/donges/.l`). Using `args` field instead gives full command line.
+- Removed `private.hiveMind.pane.session.id()` from hiveMind — DRY via claudeCode wrapper
+- Note: session ID still unavailable for sessions without `--resume` flag AND without `~/.claude/tasks/` open in lsof
+
 ## Current Team Layout (7 panes)
 ```
 /tmp/hivemind.roles:
@@ -142,7 +152,7 @@ cursorOrchestrator:0.6|scrum-master
 ## Key Architecture Decisions
 - **Role registry**: `/tmp/hivemind.roles` — format `session:window.pane|role` per line. Survives Claude Code title overwrites. Written by `private.hiveMind.pane.identify()`, read by `resolve`, `team.status`, `status`. Registry key for Agent Teacher is `orchestrator` (not `agent-teacher`); directory remains `agent-teacher/`.
 - **Alias resolution**: `private.hiveMind.resolve.alias()` maps legacy names to canonical registry keys. `hiveMind.resolve()` tries direct lookup first, then alias fallback.
-- **Session ID discovery**: `private.hiveMind.pane.session.id()` uses TTY→PID mapping, then checks `--resume` flag in command line, then `lsof` for `~/.claude/tasks/<UUID>/` directory.
+- **Session ID discovery**: Delegated to `claudeCode` wrapper (DRY). `claudeCode.process.find` uses `ps args` (not `comm`) for reliable PID lookup. `claudeCode.session.id` chains `--resume` flag → lsof `~/.claude/tasks/` methods. hiveMind calls `./claudeCode session.id <pane>`.
 - **TUI key sending**: `otmux.sendKeys()` / `otmux.send.tui()` sends keys with 50ms inter-key delays for Claude Code TUI reliability. `otmux.sendEnter()` uses `-l` literal flag + split calls.
 - **Bash 3.2**: No `declare -A` — use `private.hiveMind.get.role.prompt()` case function instead.
 - **HIVEMIND_AGENTS_DIR**: Computed from `${OOSH_DIR}/../../../.claude/agents` (workspace root is 3 levels up from dev.claude).
@@ -156,7 +166,7 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `461c6e1`
+- Latest commit: `e2b5515`
 - `session/` directory tracked in git
 
 ## Next Tasks (assigned by Agent Teacher)
@@ -164,7 +174,8 @@ cursorOrchestrator:0.6|scrum-master
 2. ~~**hiveMind sendEnter command**~~ — DONE (commit 461c6e1)
 3. ~~**Object.verb notation enforcement**~~ — DONE (commit 461c6e1)
 4. ~~**Add task-agent to hiveMind**~~ — DONE (commit 461c6e1)
-5. Awaiting next assignment from Orchestrator
+5. ~~**Fix session ID detection + shell false positive**~~ — DONE (commit e2b5515)
+6. Awaiting next assignment from Orchestrator
 
 ## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
