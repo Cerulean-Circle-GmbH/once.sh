@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-03T12:15Z
+**Updated**: 2026-02-03T14:30Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -149,6 +149,17 @@
 - Tab completion: `hiveMind.agent.send.completion.name()`
 - Usage section renamed from "TASKS" to "MESSAGING", `agent.send` listed first with example
 
+### Task 22 Steps 1-2: Context schema + validate (DONE)
+- **Step 1**: Created `docs/context-schema.md` — formal schema v1.0 with required metadata (Updated, Role, Pane), required sections (Recovery Steps, Completed Work), recommended sections (Pending, Key Files), and optional sections
+- **Step 2**: Implemented `context` OOSH script with 4 methods:
+  - `context.schema` — display schema to console
+  - `context.validate <file>` — validate single file (errors + warnings)
+  - `context.validate.all` — validate all `session/agents/*.context.md` files
+  - Tab completion via `context.validate.completion.file()`
+- Validation checks: line-1 title format, metadata in header region (lines 1-6), ISO date format, Recovery Steps numbered items (via awk), Completed Work prefix match
+- Current results: 2/4 pass (expert + trainer), 2/4 fail (tester: missing metadata fields; scrum-master: title format + section naming)
+- Steps 3-4 (SKILL.md updates + migration) assigned to Agent Trainer and Tester
+
 ### Task 25: Naming convention audit and enforcement (DONE — commit 04a6587)
 - **Audit**: Found 89 camelCase violations across 6 files (otmux: 76, claudeCode: 5, osx: 4, c2: 2, claudeFlow: 1, hiveMind callers: 29)
 - **otmux** (biggest change):
@@ -205,7 +216,7 @@ cursorOrchestrator:0.6|scrum-master
 5. ~~**Fix session ID detection + shell false positive**~~ — DONE (commit e2b5515)
 6. ~~**hiveMind agent.send — transport-independent messaging**~~ — DONE (commit d93fa89)
 7. ~~**Naming convention audit and enforcement (Task 25)**~~ — DONE (commit 04a6587)
-8. Awaiting next assignment from Orchestrator
+8. **Task 22 Steps 1-2: Define context schema + implement context.validate** — DONE
 
 ## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
