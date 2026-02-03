@@ -176,6 +176,72 @@ Use the `context` script to validate:
 
 ---
 
+## Lifecycle (Automated Save-Before-Compact)
+
+The `context` script provides a lifecycle state machine to automate the save-before-compact workflow.
+
+### State Machine
+
+Each agent role gets its own state machine tracking where it is in the save/compact cycle:
+
+```
+active → saving → saved → compacting → recovering → active (loop)
+```
+
+| State | Meaning |
+|-------|---------|
+| `active` | Normal work — agent is operating |
+| `saving` | Context write triggered (transitional) |
+| `saved` | Context file written and validated against schema |
+| `compacting` | `/compact` is running |
+| `recovering` | Post-compact, agent re-reading context |
+
+Machine stored at: `$CONFIG_PATH/stateMachines/<machine_name>.states.env`
+Machine naming: role with hyphens replaced by underscores (e.g., `oosh-expert` → `oosh_expert`)
+
+### Lifecycle Commands
+
+```bash
+# Initialize lifecycle for a role
+./context lifecycle.init oosh-expert
+
+# Save context (validates + transitions to saved)
+./context lifecycle.save oosh-expert
+
+# Check status (single role or all)
+./context lifecycle.status oosh-expert
+./context lifecycle.status
+
+# Pre-compact check (uses HIVEMIND_ROLE env var)
+./context lifecycle.pre.compact
+
+# Recover after compact (transitions back to active)
+./context lifecycle.recover oosh-expert
+```
+
+### PreCompact Hook
+
+A PreCompact hook at `.claude/hooks/pre-compact.sh` runs automatically before `/compact`:
+
+- Checks if `HIVEMIND_ROLE` is set
+- Validates context file exists with required sections
+- Outputs warnings if context isn't saved
+- Auto-marks state as `saved` if context passes validation
+- Always exits 0 (PreCompact cannot block)
+
+Hook configured in `.claude/settings.local.json`.
+
+### Typical Flow
+
+1. Agent works normally (state: `active`)
+2. Before `/compact`, agent runs `./context lifecycle.save <role>`
+3. Validation passes → state becomes `saved`
+4. `/compact` runs → PreCompact hook confirms context is saved
+5. After compact, agent runs `./context lifecycle.recover <role>`
+6. State returns to `active`
+
+---
+
 ## Migration Guide
 
 To migrate an existing context file to this schema:
