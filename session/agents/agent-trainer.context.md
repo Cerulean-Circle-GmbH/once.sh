@@ -71,6 +71,13 @@
 - Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
 - Notification: `TASK PLAN READY: TASK-<number> — <title>`
 
+### Task 17: Context schema references (DONE) — Task 22 Step 3
+- Updated ALL 9 SKILL.md Context Preservation sections: SAVE step now references `docs/context-schema.md`
+- Listed required sections (Title, Metadata, Recovery Steps, Completed Work) and recommended (Pending, Key Files)
+- Updated ALL 9 Context Recovery sections: added `docs/context-schema.md` read step
+- Fixed stale context file paths (e.g., `session/agent.context.md` → `session/agents/<role>.context.md`)
+- Added to agent-trainer Key Learnings to Propagate list
+
 ### Task 16: Tester DRY violation detection (DONE)
 - Added responsibility #6 "DRY Violation Detection" to oosh-tester SKILL.md
 - Added "DRY Violation Reporting" subsection: spot duplicates → report to Task Agent → Task Agent plans → Expert fixes
