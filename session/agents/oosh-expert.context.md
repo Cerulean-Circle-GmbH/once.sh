@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-01T19:15Z
+**Updated**: 2026-02-03T10:00Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -137,6 +137,18 @@
 - Removed `private.hiveMind.pane.session.id()` from hiveMind — DRY via claudeCode wrapper
 - Note: session ID still unavailable for sessions without `--resume` flag AND without `~/.claude/tasks/` open in lsof
 
+### Task 18: hiveMind agent.send — transport-independent messaging (DONE — commit d93fa89)
+- **New method `hiveMind.agent.send()`** (hiveMind:624-660) — sends message via best available channel, caller doesn't specify transport
+- **New helper `private.hiveMind.channel.resolve()`** (hiveMind:597-622) — resolves agent name to `transport|target` format:
+  - Channel 1: `pane|<pane_target>` — tmux pane via registry (`hiveMind.resolve`)
+  - Channel 2: `api|<name>` — agentRoom API (guarded by `command -v` + output text grep)
+  - Extensible for future transports (pipe, socket, etc.) via case statement
+- Uses `|` separator (not `:`) because pane targets contain `:`
+- `pane` transport dispatches via `./otmux sendEnter` (OOSH-Only compliant)
+- `api` transport dispatches via `agentRoom chat`
+- Tab completion: `hiveMind.agent.send.completion.name()`
+- Usage section renamed from "TASKS" to "MESSAGING", `agent.send` listed first with example
+
 ## Current Team Layout (7 panes)
 ```
 /tmp/hivemind.roles:
@@ -160,13 +172,14 @@ cursorOrchestrator:0.6|scrum-master
 - **send/send.enter pair**: `hiveMind.send()` sends raw keys (no Enter) via `./otmux send`. `hiveMind.send.enter()` sends text+Enter via `./otmux sendEnter`. Mirrors the otmux send/sendEnter pattern.
 - **object.verb naming**: All public methods use dot notation. camelCase → dot: `createPane` → `pane.create`, `sendEnter` → `send.enter`.
 - **agentRoom guards**: Always check both `command -v agentRoom` AND `agentRoom backend.status` output text.
+- **Transport-independent messaging**: `hiveMind.agent.send()` resolves via `private.hiveMind.channel.resolve()` → `transport|target` format. Pane channel preferred, API fallback. Future transports added to case statement.
 
 ## Key Rules
 - **OOSH-Only**: Never use raw `tmux` commands. Always use `./otmux` and `./hiveMind` wrappers.
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `e2b5515`
+- Latest commit: `d93fa89`
 - `session/` directory tracked in git
 
 ## Next Tasks (assigned by Agent Teacher)
@@ -175,9 +188,11 @@ cursorOrchestrator:0.6|scrum-master
 3. ~~**Object.verb notation enforcement**~~ — DONE (commit 461c6e1)
 4. ~~**Add task-agent to hiveMind**~~ — DONE (commit 461c6e1)
 5. ~~**Fix session ID detection + shell false positive**~~ — DONE (commit e2b5515)
-6. Awaiting next assignment from Orchestrator
+6. ~~**hiveMind agent.send — transport-independent messaging**~~ — DONE (commit d93fa89)
+7. Awaiting next assignment from Orchestrator
 
 ## Pending (not yet assigned)
 - Log level fixes NOT implemented (documented in `docs/log-levels-and-testing.md`)
 - ossh tests NOT written for config.create fixes
 - ScrumMaster noted: `hiveMind.agent.bootstrap()` uses `--dangerously-skip-permissions` at line ~967 — violates NO-SKIP-PERMISSIONS rule
+- Session ID detection still unavailable for sessions without `--resume` AND without `~/.claude/tasks/` in lsof — documented limitation
