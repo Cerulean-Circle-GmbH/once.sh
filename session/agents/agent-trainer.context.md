@@ -71,6 +71,11 @@
 - Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
 - Notification: `TASK PLAN READY: TASK-<number> — <title>`
 
+### Task 20: Hardcode no-garbled-messages as MANDATORY (DONE) — instructions-trainer-hardcode-rule.md
+- Replaced WARNING with full `## MANDATORY: No Long Messages via otmux/hiveMind send (CRITICAL)` in ALL 9 SKILL.md files
+- Includes forbidden examples, correct approach, PO enforcement statement
+- Standalone section placed before File-Based Communication
+
 ### Task 18: Metrics pattern propagation (DONE) — from woda-writer
 - Updated scrum-master SKILL.md: added Metrics Collection as responsibility #5
 - Added full Metrics Collection section with regex patterns, agent states table, storage format, known limitation
