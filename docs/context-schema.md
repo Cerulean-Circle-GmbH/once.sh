@@ -231,14 +231,39 @@ A PreCompact hook at `.claude/hooks/pre-compact.sh` runs automatically before `/
 
 Hook configured in `.claude/settings.local.json`.
 
+### Deterministic Recovery
+
+After compact, agents call `context.recover` for a deterministic, role-agnostic recovery sequence:
+
+```bash
+# Deterministic recovery (outputs context inline + checklist)
+./context recover oosh-expert
+
+# Auto-detects role from HIVEMIND_ROLE
+./context recover
+```
+
+**What `context.recover <role>` does:**
+
+1. Resolves `session/agents/<role>.context.md` and validates it exists
+2. Outputs a numbered recovery checklist (same for every role)
+3. Prints the SKILL.md path (`.claude/agents/<role>/SKILL.md`)
+4. Prints the architecture doc path (`docs/oosh-architecture.md`)
+5. Displays the full context file inline (agent reads it immediately)
+6. Transitions lifecycle state to `active` (if state machine exists, silently skipped otherwise)
+7. Outputs completion message
+
+Falls back to `$HIVEMIND_ROLE` if no role argument is provided.
+
 ### Typical Flow
 
 1. Agent works normally (state: `active`)
 2. Before `/compact`, agent runs `./context lifecycle.save <role>`
 3. Validation passes → state becomes `saved`
 4. `/compact` runs → PreCompact hook confirms context is saved
-5. After compact, agent runs `./context lifecycle.recover <role>`
-6. State returns to `active`
+5. After compact, agent runs `./context recover <role>`
+6. Agent reads inline context, follows checklist steps 2-5
+7. State returns to `active`
 
 ---
 
