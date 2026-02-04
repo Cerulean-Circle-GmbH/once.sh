@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+# PDCA counters are stored in $CONFIG_PATH/stateMachines/<machine>.pdca.env
+# to survive across subprocess calls when state.check re-sources this script
+
+### new.method
+
+# Helper: Load PDCA counters from file
+private.pdca.config.load() {
+  local machine=${1:-PDCA}
+  local configFile="$CONFIG_PATH/stateMachines/${machine}.pdca.env"
+  if [ -f "$configFile" ]; then
+    source "$configFile"
+  else
+    PDCA_MAX_ITERATIONS=5
+    PDCA_ERROR_COUNT=0
+    PDCA_ITERATION=0
+  fi
+}
+
+# Helper: Save PDCA counters to file
+private.pdca.config.save() {
+  local machine=${1:-PDCA}
+  local configFile="$CONFIG_PATH/stateMachines/${machine}.pdca.env"
+  {
+    echo "PDCA_MAX_ITERATIONS=$PDCA_MAX_ITERATIONS"
+    echo "PDCA_ERROR_COUNT=$PDCA_ERROR_COUNT"
+    echo "PDCA_ITERATION=$PDCA_ITERATION"
+  } > "$configFile"
+}
+
+scrumMaster.pdca.start() # <?machineName:PDCA> <?errorCount:0> # creates and starts a new PDCA cycle state machine
+{
+  local machineName=${1:-PDCA}
+  shift 2>/dev/null
+  local errorCount=${1:-0}
+
+  source state
+
+  # Initialize PDCA counters and save to file
+  PDCA_MAX_ITERATIONS=5
+  PDCA_ERROR_COUNT=$errorCount
+  PDCA_ITERATION=0
+  private.pdca.config.save $machineName
+
+  # Delete existing machine if present
+  if state.machine.exists $machineName 2>/dev/null; then
+    state.machine.delete $machineName 2>/dev/null
+  fi
+
+  console.log "Creating PDCA state machine: $machineName"
+
+  # Create PDCA state machine using proper state tool pattern (like oo does)
+  # Structure after state.add:
+  #   [11] = planning (P)
+  #   [12] = doing (D)
+  #   [13] = checking (C)
+  #   [14] = acting (A)
+  #   [15] = finished    # Terminal: Check passed
+  #   [16] = error.max.iterations  # Error: too many iterations
+  # Note: Acting loops back to Checking via private.check.acting returning 13
+
+  state.machine.create $machineName scrumMaster
+  state.add planning               silent
+  state.add doing                  silent
+  state.add checking               silent
+  state.add acting                 silent
+  state.add finished               silent
+  state.add error.max.iterations   silent
+  state.add 99                     silent  # Transition to finished - closes the state sequence
+
+  # Start the machine (validates private.check.* exist)
+  state.machine.start scrumMaster
+
+  # Move to first PDCA state (planning)
+  state.next
+
+  success.log "PDCA cycle started: $machineName (errors=$errorCount, max_iterations=$PDCA_MAX_ITERATIONS)"
+  create.result 0 "PLANNING"
+}
+
+scrumMaster.pdca.state() # <?machineName:PDCA> # shows the current PDCA state (PLANNING, DOING, CHECKING, ACTING, FINISHED)
+{
+  local machineName=${1:-PDCA}
+
+  source state
+
+  if ! state machine.exists $machineName 2>/dev/null; then
+    error.log "PDCA machine '$machineName' does not exist. Run: scrumMaster pdca.start"
+    create.result 1 "NOT_STARTED"
+    return 1
+  fi
+
+  local currentState=$(state name $machineName)
+  local upperState=$(echo "$currentState" | tr '[:lower:]' '[:upper:]' | tr '.' '_')
+
+  echo "$upperState"
+  create.result 0 "$upperState"
+}
+
+scrumMaster.pdca.next() # <?machineName:PDCA> # advances to the next PDCA state with validation
+{
+  local machineName=${1:-PDCA}
+
+  source state
+
+  if ! state machine.exists $machineName 2>/dev/null; then
+    error.log "PDCA machine '$machineName' does not exist"
+    return 1
+  fi
+
+  # Select the machine first, then call state.next without script arg
+  # state.check will use PDCA_CUSTOM_SCRIPT=scrumMaster from the env file
+  state of $machineName
+  state next
+
+  local currentState=$(state name $machineName)
+  create.result 0 "$currentState"
+}
+
+scrumMaster.pdca.errors() # <?machineName:PDCA> <?count> # gets or sets the error count for Check phase
+{
+  local machineName=${1:-PDCA}
+  shift 2>/dev/null
+  local count=$1
+
+  if [ -n "$count" ]; then
+    export PDCA_ERROR_COUNT=$count
+    console.log "Set PDCA_ERROR_COUNT=$count"
+  fi
+
+  echo $PDCA_ERROR_COUNT
+  create.result 0 "$PDCA_ERROR_COUNT"
+}
+
+scrumMaster.pdca.iteration() # <?machineName:PDCA> # shows the current C→A iteration count
+{
+  echo $PDCA_ITERATION
+  create.result 0 "$PDCA_ITERATION"
+}
+
+scrumMaster.pdca.reset() # <?machineName:PDCA> # resets the PDCA state machine
+{
+  local machineName=${1:-PDCA}
+
+  source state
+
+  if state machine.exists $machineName 2>/dev/null; then
+    state machine.delete $machineName
+  fi
+
+  export PDCA_ERROR_COUNT=0
+  export PDCA_ITERATION=0
+
+  success.log "PDCA machine '$machineName' reset"
+  create.result 0 "RESET"
+}
+
+scrumMaster.pdca.run() # <?machineName:PDCA> <?errorCount:0> # runs complete PDCA cycle until finished or max iterations
+{
+  local machineName=${1:-PDCA}
+  shift 2>/dev/null
+  local errorCount=${1:-0}
+
+  scrumMaster.pdca.start $machineName $errorCount
+
+  local maxSteps=20  # Safety limit
+  local step=0
+
+  while [ $step -lt $maxSteps ]; do
+    local currentState=$(scrumMaster.pdca.state $machineName)
+    console.log "Step $step: $currentState"
+
+    if [ "$currentState" = "FINISHED" ] || [ "$currentState" = "ERROR_MAX_ITERATIONS" ]; then
+      break
+    fi
+
+    scrumMaster.pdca.next $machineName
+    ((step++))
+  done
+
+  local finalState=$(scrumMaster.pdca.state $machineName)
+  create.result 0 "$finalState"
+}
+
+# ============================================================================
+# private.check.* implementations for PDCA state transitions
+# ============================================================================
+
+private.check.planning() # <script> <stageTo> <stateFound> # P: Plan phase - always succeeds
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  console.log "PLAN: Defining objectives and success criteria"
+  create.result 0 "planning complete"
+  return $(result)
+}
+
+private.check.doing() # <script> <stageTo> <stateFound> # D: Do phase - execute the plan
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  console.log "DO: Executing the plan"
+  create.result 0 "doing complete"
+  return $(result)
+}
+
+private.check.checking() # <script> <stageTo> <stateFound> # C: Check phase - verify results, may loop to Act
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  # Load counters from file (survives re-sourcing)
+  private.pdca.config.load PDCA
+
+  console.log "CHECK: Iteration $PDCA_ITERATION, Errors=$PDCA_ERROR_COUNT"
+
+  if [ "$PDCA_ERROR_COUNT" -gt 0 ]; then
+    console.log "CHECK: Found $PDCA_ERROR_COUNT errors - transitioning to Act"
+    create.result 0 14  # → [14]=acting
+    return $(result)
+  fi
+
+  console.log "CHECK: No errors - success!"
+  create.result 0 15  # → [15]=finished
+  return $(result)
+}
+
+private.check.acting() # <script> <stageTo> <stateFound> # A: Act phase - fix issues, then back to Check
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  # Load counters from file
+  private.pdca.config.load PDCA
+
+  # Increment iteration on each act→check loop
+  ((PDCA_ITERATION++))
+  info.log "ACT: iteration $PDCA_ITERATION of $PDCA_MAX_ITERATIONS, errors=$PDCA_ERROR_COUNT"
+
+  # Guard against infinite loops
+  if [ "$PDCA_ITERATION" -ge "$PDCA_MAX_ITERATIONS" ]; then
+    private.pdca.config.save PDCA
+    warn.log "ACT: Max iterations ($PDCA_MAX_ITERATIONS) reached!"
+    create.result 0 16  # → [16]=error.max.iterations
+    return $(result)
+  fi
+
+  if [ "$PDCA_ERROR_COUNT" -gt 0 ]; then
+    ((PDCA_ERROR_COUNT--))
+    private.pdca.config.save PDCA
+    console.log "ACT: Fixed 1 error, $PDCA_ERROR_COUNT remaining - looping back to Check"
+    create.result 0 13  # → [13]=checking
+    return $(result)
+  fi
+
+  # No more errors - proceed to finished
+  private.pdca.config.save PDCA
+  console.log "ACT: All errors fixed - proceeding to Finished"
+  create.result 0 15  # → [15]=finished
+  return $(result)
+}
+
+private.check.finished() # <script> <stageTo> <stateFound> # Terminal state - checks if really done or needs more C→A loops
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  # Load counters from file
+  private.pdca.config.load PDCA
+
+  # Check if we came from acting and still have errors - loop back to checking
+  if [ "$PDCA_ERROR_COUNT" -gt 0 ]; then
+    ((PDCA_ITERATION++))
+    private.pdca.config.save PDCA
+
+    # Guard against infinite loops
+    if [ "$PDCA_ITERATION" -ge "$PDCA_MAX_ITERATIONS" ]; then
+      warn.log "FINISHED: Max iterations ($PDCA_MAX_ITERATIONS) reached!"
+      create.result 0 16  # → [16]=error.max.iterations
+      return $(result)
+    fi
+
+    console.log "FINISHED: Still have $PDCA_ERROR_COUNT errors - back to checking"
+    create.result 0 13  # → [13]=checking (loop back)
+    return $(result)
+  fi
+
+  success.log "PDCA cycle completed successfully!"
+  create.result 0 "finished"
+  return $(result)
+}
+
+private.check.error.max.iterations() # <script> <stageTo> <stateFound> # Error state - max iterations exceeded
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  error.log "PDCA cycle failed: Max iterations exceeded"
+  create.result 0 "error.max.iterations"
+  return $(result)
+}
+
+private.check.next.custom.state() # <script> <stageTo> <stateFound> # Placeholder state - pass through
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  create.result 0 "next.custom.state"
+  return $(result)
+}
+
+scrumMaster.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  scrumMaster - PDCA State Machine Manager
+
+  Implements the CMM3-compliant PDCA cycle:
+  P → D → C → A → C → A → C → A ... → finished
+
+  After Check, you Act (fix). Then re-Check.
+  Loop C→A until Check passes or max iterations.
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+
+  Examples
+    $this pdca.start              # Start new PDCA cycle
+    $this pdca.start MYPDCA 3     # Start with 3 errors to fix
+    $this pdca.state              # Show current state
+    $this pdca.next               # Advance to next state
+    $this pdca.errors             # Show error count
+    $this pdca.errors MYPDCA 5    # Set 5 errors
+    $this pdca.run                # Run complete cycle
+    $this pdca.reset              # Reset machine
+  "
+}
+
+scrumMaster.start()
+{
+  #echo "sourcing init"
+  source this
+
+  # if [ -z "$1" ]; then
+  #   status.discover "$@"
+  #   return 0
+  # fi
+
+  this.start "$@"
+}
+
+scrumMaster.start "$@"
+
