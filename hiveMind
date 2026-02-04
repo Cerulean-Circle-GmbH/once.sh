@@ -28,6 +28,7 @@
 #                 (pane titles are unreliable — Claude Code overwrites them)
 : ${HIVEMIND_WINDOW_NAME:=team}
 : ${HIVEMIND_REGISTRY:=/tmp/hivemind.roles}
+: ${HIVEMIND_SESSIONS:=/tmp/hivemind.sessions}
 
 # Default agent roles
 HIVEMIND_DEFAULT_AGENTS=(
@@ -128,6 +129,31 @@ private.hiveMind.registry.list() {
   else
     cat "$HIVEMIND_REGISTRY" 2>/dev/null
   fi
+}
+
+# ── Session Tracking ──────────────────────────────────────────────────────────
+# File-based mapping: role name → Claude session UUID.
+# Allows rejoining a session after the Claude process exits.
+# Format: role|session-uuid  (one per line)
+
+private.hiveMind.session.store() {
+  # Store or update role → session UUID mapping
+  local role="$1"
+  local session_id="$2"
+  [ -z "$role" ] || [ -z "$session_id" ] && return 1
+  # Remove old entry for this role, then append new one
+  if [ -f "$HIVEMIND_SESSIONS" ]; then
+    grep -v "^${role}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+    mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+  fi
+  echo "${role}|${session_id}" >> "$HIVEMIND_SESSIONS"
+}
+
+private.hiveMind.session.lookup() {
+  # Look up stored session UUID for a given role
+  local role="$1"
+  [ -f "$HIVEMIND_SESSIONS" ] || return 1
+  grep "^${role}|" "$HIVEMIND_SESSIONS" 2>/dev/null | tail -1 | cut -d'|' -f2
 }
 
 private.hiveMind.resolve.alias() {
@@ -368,6 +394,60 @@ hiveMind.detach() # # detach from current session
   tmux detach-client
 }
 
+hiveMind.join() # <name> # rejoin an agent's Claude session by role name
+{
+  local name="$1"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: hiveMind join <name>"
+    echo "  Use 'hiveMind role.list' to see available roles"
+    return 1
+  fi
+
+  # Resolve agent name to pane target
+  local target
+  target=$(hiveMind.resolve "$name")
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  # Try to find session ID from a running Claude process first
+  local session_id
+  session_id=$(./claudeCode session.id "$target" 2>/dev/null)
+
+  if [ -n "$session_id" ]; then
+    # Claude is still running — store the session ID and inform user
+    private.hiveMind.session.store "$name" "$session_id"
+    info.log "Claude is already running in $target (session: ${session_id:0:8}...)"
+    echo "Session $session_id is active in pane $target"
+    return 0
+  fi
+
+  # Process not running — look up stored session ID
+  session_id=$(private.hiveMind.session.lookup "$name")
+
+  if [ -z "$session_id" ]; then
+    error.log "No session found for agent '$name'"
+    echo "  The agent may not have been started yet, or session data was lost."
+    echo "  Start fresh with: hiveMind agent.bootstrap $name"
+    return 1
+  fi
+
+  info.log "Resuming session ${session_id:0:8}... for $name in pane $target"
+
+  # Send resume command to the pane (use -l for literal text)
+  tmux send-keys -t "$target" -l "claude --resume $session_id"
+  sleep 0.05
+  tmux send-keys -t "$target" Enter
+
+  success.log "Sent resume command for $name (session: ${session_id:0:8}...)"
+  return 0
+}
+
+hiveMind.join.completion.name() {
+  hiveMind.resolve.completion.name
+}
+
 hiveMind.kill() # # shutdown hivemind completely
 {
   info.log "Shutting down HiveMind..."
@@ -541,13 +621,13 @@ hiveMind.resolve.completion.name() {
   [ -f "$HIVEMIND_REGISTRY" ] && grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2
 }
 
-hiveMind.send() # <name> <keys...> # send raw keys to agent by name (no Enter appended)
+hiveMind.send() # <name> <text...> # send literal text to agent by name (no Enter appended)
 {
   local name="$1"
   shift
 
   if [ -z "$name" ] || [ -z "$*" ]; then
-    error.log "Usage: hiveMind send <name> <keys...>"
+    error.log "Usage: hiveMind send <name> <text...>"
     return 1
   fi
 
@@ -557,8 +637,10 @@ hiveMind.send() # <name> <keys...> # send raw keys to agent by name (no Enter ap
     return 1
   fi
 
-  ./otmux send "$target" $*
-  info.log "Sent keys to $name ($target)"
+  # Use -l flag to send literal text, preserving spaces
+  # Without -l, tmux interprets words as key names and strips spaces
+  tmux send-keys -t "$target" -l "$*"
+  info.log "Sent to $name ($target): $*"
   return 0
 }
 hiveMind.send.completion.name() {
@@ -1260,7 +1342,11 @@ hiveMind.team.status() # <?session:cursorOrchestrator> # show team members as tr
     if [ "$is_claude" = "true" ]; then
       local sid
       sid=$(./claudeCode session.id "${session}:${addr}")
-      [ -n "$sid" ] && sid_label="  [${sid:0:8}]"
+      if [ -n "$sid" ]; then
+        sid_label="  [${sid:0:8}]"
+        # Passively track session IDs for hiveMind.join
+        [ -n "$role" ] && private.hiveMind.session.store "$role" "$sid"
+      fi
     fi
 
     echo "$prefix $addr  $label ($state)${sid_label}"
@@ -1375,6 +1461,7 @@ hiveMind.usage()
       init              initialize hivemind with agents
       attach            attach to hivemind session
       detach            detach from session
+      join              rejoin agent's Claude session by role name
       kill              shutdown hivemind completely
 
   AGENTS:
@@ -1433,6 +1520,7 @@ hiveMind.usage()
     $this monitor 10                  # capture 10 lines per pane
     $this role.list                   # list available roles
     $this agent.bootstrap oosh-expert # bootstrap an expert
+    $this join product-owner          # rejoin PO's Claude session
     $this team.setup.full             # create full team
   "
 }
