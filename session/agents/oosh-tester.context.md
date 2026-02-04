@@ -1,15 +1,20 @@
-# OOSH Tester Agent - Recovery Context
+# OOSH Tester Agent — Session Context
 
-## Role
-
-I am the OOSH Tester Agent in the hiveMind team. I run tests and report results. I do NOT fix code -- that is the Expert's role. My SKILL.md is at `WORKSPACE_ROOT/.claude/agents/oosh-tester/SKILL.md` (resolve via `${OOSH_DIR}/../../..`). Working directory: `/Users/Shared/Workspaces/AI/Claude/components/OOSH/dev.claude/`
+**Updated**: 2026-02-03T15:00Z
+**Role**: oosh-tester (testing & validation)
+**Pane**: 0.5 in cursorOrchestrator
 
 ## Current State
 
-**Status:** Standing by. Full suite **180/181**. TASK-15/16 verified. Team now 7 panes. I am on pane 0.5.
-**Last updated:** 2026-02-01
+**Status:** Standing by. Full suite **180/181**. Task 20 verified. Team now 8 panes (0.7 added).
+SKILL.md: `WORKSPACE_ROOT/.claude/agents/oosh-tester/SKILL.md` (resolve via `${OOSH_DIR}/../../..`). Working directory: `/Users/Shared/Workspaces/AI/Claude/components/OOSH/dev.claude/`
 
-## Completed Work (29 items)
+## Pending
+
+- Task.22 Step 4: validate all context files pass schema check
+- Task.25 regression testing needed (naming audit commit 04a6587)
+
+## Completed Work (30 items)
 
 1. **Code review** of hiveMind.team.setup.oosh -- PASSES
 2. **hiveMind tests** run 5 times -- was stable at **26/33 pass, 7 fail** (4 pre-existing + 3 bash 3.2 declare -A)
@@ -33,18 +38,20 @@ I am the OOSH Tester Agent in the hiveMind team. I run tests and report results.
 27. **OOSH-only rule verification** -- all 8 SKILL.md files have MANDATORY rule
 28. **team.status pane state fix** -- PASSES. Shows real states (active/shell), role names from registry, session IDs in brackets. Team expanded to 7 panes. 180/181 no regressions.
 29. **TASK-15/16 verification (send.enter + object.verb refactoring)** -- send.enter works end-to-end, pane.create exists with OOSH signature, no public camelCase methods remain (createPane/sendEnter gone), hiveMind 33/33. All 4 checks PASS. Note: otmux still uses sendEnter (separate scope).
+30. **Task 20 verification (commit e2b5515)** -- claudeCode.process.find, process.running, session.id all functional. Shell false positive fix PASSES: 7/7 active Claude panes show "active", zero false "shell". Session IDs show for 3/7 (those started with --resume). DRY: old private.hiveMind.pane.session.id removed, delegates to claudeCode wrapper. hiveMind 33/33 no regressions.
 
-## Current Pane Layout (7 panes)
+## Current Pane Layout (8 panes)
 
 ```
 cursorOrchestrator
-├── 0.0  orchestrator (active)
+├── 0.0  orchestrator (active)  [5b6cced8]
 ├── 0.1  product-owner (active)
-├── 0.2  agent-trainer (active)
-├── 0.3  test-shell (shell)
-├── 0.4  oosh-expert (active)
-├── 0.5  oosh-tester (shell)  <-- ME
-└── 0.6  scrum-master (active)
+├── 0.2  agent-trainer (active)  [f0facde3]
+├── 0.3  task-agent (active)
+├── 0.4  oosh-expert (active)  [a536512e]
+├── 0.5  oosh-tester (active)  <-- ME
+├── 0.6  scrum-master (active)
+└── 0.7  pane 0.7 (shell)
 ```
 
 ## 0 Real Test Failures
