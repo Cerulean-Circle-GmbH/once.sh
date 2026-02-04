@@ -71,6 +71,13 @@
 - Includes all mandatory sections: OOSH-Only, No Skip Permissions, Context Preservation, Communication
 - Notification: `TASK PLAN READY: TASK-<number> — <title>`
 
+### Task 18: Metrics pattern propagation (DONE) — from woda-writer
+- Updated scrum-master SKILL.md: added Metrics Collection as responsibility #5
+- Added full Metrics Collection section with regex patterns, agent states table, storage format, known limitation
+- Updated oosh-expert SKILL.md: added Metrics Integration (Task 27) section with prototype reference and integration target
+- Added to agent-trainer Key Learnings to Propagate list
+- Source: `/tmp/measure_pane.sh` prototype by woda-writer
+
 ### Task 17: Context schema references (DONE) — Task 22 Step 3
 - Updated ALL 9 SKILL.md Context Preservation sections: SAVE step now references `docs/context-schema.md`
 - Listed required sections (Title, Metadata, Recovery Steps, Completed Work) and recommended (Pending, Key Files)
