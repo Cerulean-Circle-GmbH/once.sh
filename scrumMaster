@@ -743,6 +743,207 @@ scrumMaster.measure.subscription.completion.session() # # tmux session names
   tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
+# ============================================================================
+# Measurement — OAuth API subscription metrics (CMM4, Task 29)
+# ============================================================================
+# The methods above (measure.pane, measure.team, etc.) scrape pane output for
+# per-agent activity metrics (tokens visible in TUI, timing, activity state).
+# The method below calls the Anthropic OAuth usage API for real subscription
+# utilization percentages — the actual rate-limit data.
+
+private.measure.subscription.api.auth() # # extract OAuth access token from macOS Keychain
+{
+  local raw_creds
+  raw_creds=$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$raw_creds" ]; then
+    error.log "Cannot access macOS Keychain for Claude Code credentials"
+    return 1
+  fi
+
+  local token
+  if command -v python3 >/dev/null 2>&1; then
+    token=$(echo "$raw_creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+  elif command -v jq >/dev/null 2>&1; then
+    token=$(echo "$raw_creds" | jq -r '.claudeAiOauth.accessToken' 2>/dev/null)
+  else
+    error.log "Neither python3 nor jq available for JSON parsing"
+    return 1
+  fi
+
+  if [ -z "$token" ] || [ "$token" = "null" ]; then
+    error.log "Failed to extract OAuth token from Keychain credentials"
+    return 1
+  fi
+
+  echo "$token"
+  return 0
+}
+
+private.measure.subscription.api.parse() # <json_response> # parse OAuth usage API response, sets SUBSCRIPTION_* variables
+{
+  local json="$1"
+  [ -z "$json" ] && return 1
+
+  SUBSCRIPTION_FIVE_HOUR_UTIL=""
+  SUBSCRIPTION_FIVE_HOUR_RESETS=""
+  SUBSCRIPTION_SEVEN_DAY_UTIL=""
+  SUBSCRIPTION_SEVEN_DAY_RESETS=""
+  SUBSCRIPTION_OPUS_UTIL=""
+  SUBSCRIPTION_OPUS_RESETS=""
+  SUBSCRIPTION_SONNET_UTIL=""
+  SUBSCRIPTION_SONNET_RESETS=""
+  SUBSCRIPTION_EXTRA_ENABLED="false"
+
+  local parsed
+  if command -v python3 >/dev/null 2>&1; then
+    parsed=$(echo "$json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    fh = d.get('five_hour') or {}
+    sd = d.get('seven_day') or {}
+    op = d.get('seven_day_opus') or {}
+    sn = d.get('seven_day_sonnet') or {}
+    ex = d.get('extra_usage') or {}
+    print(fh.get('utilization', '') if fh.get('utilization') is not None else '')
+    print(fh.get('resets_at', ''))
+    print(sd.get('utilization', '') if sd.get('utilization') is not None else '')
+    print(sd.get('resets_at', ''))
+    print(op.get('utilization', '') if isinstance(op, dict) and op.get('utilization') is not None else '')
+    print(op.get('resets_at', '') if isinstance(op, dict) else '')
+    print(sn.get('utilization', '') if isinstance(sn, dict) and sn.get('utilization') is not None else '')
+    print(sn.get('resets_at', '') if isinstance(sn, dict) else '')
+    print(str(ex.get('is_enabled', False)).lower())
+except Exception:
+    for _ in range(9): print('')
+" 2>/dev/null)
+  elif command -v jq >/dev/null 2>&1; then
+    parsed=$(echo "$json" | jq -r '
+      (.five_hour.utilization // ""),
+      (.five_hour.resets_at // ""),
+      (.seven_day.utilization // ""),
+      (.seven_day.resets_at // ""),
+      (if .seven_day_opus then (.seven_day_opus.utilization // "") else "" end),
+      (if .seven_day_opus then (.seven_day_opus.resets_at // "") else "" end),
+      (if .seven_day_sonnet then (.seven_day_sonnet.utilization // "") else "" end),
+      (if .seven_day_sonnet then (.seven_day_sonnet.resets_at // "") else "" end),
+      (.extra_usage.is_enabled // false)
+    ' 2>/dev/null)
+  else
+    error.log "Neither python3 nor jq available for JSON parsing"
+    return 1
+  fi
+
+  [ -z "$parsed" ] && return 1
+
+  local i=0
+  while IFS= read -r line; do
+    case $i in
+      0) SUBSCRIPTION_FIVE_HOUR_UTIL="$line" ;;
+      1) SUBSCRIPTION_FIVE_HOUR_RESETS="$line" ;;
+      2) SUBSCRIPTION_SEVEN_DAY_UTIL="$line" ;;
+      3) SUBSCRIPTION_SEVEN_DAY_RESETS="$line" ;;
+      4) SUBSCRIPTION_OPUS_UTIL="$line" ;;
+      5) SUBSCRIPTION_OPUS_RESETS="$line" ;;
+      6) SUBSCRIPTION_SONNET_UTIL="$line" ;;
+      7) SUBSCRIPTION_SONNET_RESETS="$line" ;;
+      8) SUBSCRIPTION_EXTRA_ENABLED="$line" ;;
+    esac
+    i=$((i + 1))
+  done <<< "$parsed"
+
+  return 0
+}
+
+scrumMaster.measure.subscription.api() # # real subscription utilization from Anthropic OAuth API
+{
+  # Step 1: Authenticate via macOS Keychain
+  local token
+  token=$(private.measure.subscription.api.auth)
+  if [ $? -ne 0 ]; then
+    create.result 1 "auth failed"
+    return $(result)
+  fi
+
+  # Step 2: Call the OAuth usage API
+  local response
+  response=$(curl -s -f \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "Accept: application/json" \
+    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+
+  if [ $? -ne 0 ] || [ -z "$response" ]; then
+    error.log "OAuth usage API call failed"
+    create.result 1 "api call failed"
+    return $(result)
+  fi
+
+  # Step 3: Parse JSON response
+  private.measure.subscription.api.parse "$response"
+  if [ $? -ne 0 ]; then
+    error.log "Failed to parse API response"
+    create.result 1 "parse failed"
+    return $(result)
+  fi
+
+  # Step 4: Display results
+  echo "Subscription Utilization (OAuth API)"
+  echo "═══════════════════════════════════════════════"
+  echo "  5-hour window:   ${SUBSCRIPTION_FIVE_HOUR_UTIL:-n/a}%"
+  [ -n "$SUBSCRIPTION_FIVE_HOUR_RESETS" ] && \
+    echo "    resets at:     $SUBSCRIPTION_FIVE_HOUR_RESETS"
+  echo "  7-day window:    ${SUBSCRIPTION_SEVEN_DAY_UTIL:-n/a}%"
+  [ -n "$SUBSCRIPTION_SEVEN_DAY_RESETS" ] && \
+    echo "    resets at:     $SUBSCRIPTION_SEVEN_DAY_RESETS"
+  [ -n "$SUBSCRIPTION_OPUS_UTIL" ] && \
+    echo "  7-day opus:      ${SUBSCRIPTION_OPUS_UTIL}%"
+  [ -n "$SUBSCRIPTION_SONNET_UTIL" ] && \
+    echo "  7-day sonnet:    ${SUBSCRIPTION_SONNET_UTIL}%"
+  echo "  extra usage:     ${SUBSCRIPTION_EXTRA_ENABLED}"
+  echo "═══════════════════════════════════════════════"
+
+  # Step 5: Alert on high utilization
+  local five_hour_int
+  five_hour_int=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+
+  if [ "$five_hour_int" -ge 90 ] 2>/dev/null; then
+    error.log "CRITICAL: 5-hour utilization at ${SUBSCRIPTION_FIVE_HOUR_UTIL}% — throttle all agents!"
+  elif [ "$five_hour_int" -ge 80 ] 2>/dev/null; then
+    console.log "WARNING: 5-hour utilization at ${SUBSCRIPTION_FIVE_HOUR_UTIL}% — reduce activity"
+  fi
+
+  local seven_day_int
+  seven_day_int=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+
+  if [ "$seven_day_int" -ge 90 ] 2>/dev/null; then
+    error.log "CRITICAL: 7-day utilization at ${SUBSCRIPTION_SEVEN_DAY_UTIL}% — stop non-essential work!"
+  elif [ "$seven_day_int" -ge 80 ] 2>/dev/null; then
+    console.log "WARNING: 7-day utilization at ${SUBSCRIPTION_SEVEN_DAY_UTIL}% — reduce activity"
+  fi
+
+  # Step 6: Persist to ~/config/metrics/
+  local metrics_dir="${CONFIG_PATH:-$HOME/config}/metrics"
+  [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  {
+    echo "METRIC_TYPE=\"subscription.api\""
+    echo "METRIC_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "SUBSCRIPTION_FIVE_HOUR_UTIL=\"${SUBSCRIPTION_FIVE_HOUR_UTIL:-}\""
+    echo "SUBSCRIPTION_FIVE_HOUR_RESETS=\"${SUBSCRIPTION_FIVE_HOUR_RESETS:-}\""
+    echo "SUBSCRIPTION_SEVEN_DAY_UTIL=\"${SUBSCRIPTION_SEVEN_DAY_UTIL:-}\""
+    echo "SUBSCRIPTION_SEVEN_DAY_RESETS=\"${SUBSCRIPTION_SEVEN_DAY_RESETS:-}\""
+    echo "SUBSCRIPTION_OPUS_UTIL=\"${SUBSCRIPTION_OPUS_UTIL:-}\""
+    echo "SUBSCRIPTION_SONNET_UTIL=\"${SUBSCRIPTION_SONNET_UTIL:-}\""
+    echo "SUBSCRIPTION_EXTRA_ENABLED=\"${SUBSCRIPTION_EXTRA_ENABLED:-false}\""
+  } > "$metrics_dir/subscription.${timestamp}.env"
+  info.log "Metrics saved: $metrics_dir/subscription.${timestamp}.env"
+
+  create.result 0 "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}"
+  return $(result)
+}
+
 scrumMaster.usage()
 {
   local this=${0##*/}
@@ -774,12 +975,15 @@ scrumMaster.usage()
     $this pdca.run                # Run complete cycle
     $this pdca.reset              # Reset machine
 
-  Measurement Examples:
+  Measurement Examples (agent activity — pane scraping):
     $this measure.pane oosh-expert       # Metrics for one agent
     $this measure.team                   # Metrics for all agents
     $this measure.context oosh-expert    # Token consumption
     $this measure.speed oosh-expert      # Token rate (tokens/sec)
-    $this measure.subscription           # Subscription-wide usage
+    $this measure.subscription           # Pane-scraped token totals
+
+  Subscription API (real utilization — OAuth):
+    $this measure.subscription.api       # Real utilization % from Anthropic API
   "
 }
 
