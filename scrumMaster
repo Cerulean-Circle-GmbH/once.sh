@@ -8,6 +8,12 @@
 # PDCA counters are stored in $CONFIG_PATH/stateMachines/<machine>.pdca.env
 # to survive across subprocess calls when state.check re-sources this script
 
+# ============================================================================
+# Measurement configuration (CMM4)
+# ============================================================================
+: ${SCRUMMASTER_METRICS_DIR:=${OOSH_DIR:+${OOSH_DIR}/session/metrics}}
+: ${SCRUMMASTER_CAPTURE_LINES:=30}
+
 ### new.method
 
 # Helper: Load PDCA counters from file
@@ -324,26 +330,441 @@ private.check.next.custom.state() # <script> <stageTo> <stateFound> # Placeholde
   return $(result)
 }
 
+# ============================================================================
+# Measurement — private parsing methods (CMM4)
+# ============================================================================
+
+private.scrumMaster.parse.normalize.k() # <value> # convert "4.6k" to 4600, pass through plain numbers
+{
+  local val="$1"
+  if echo "$val" | grep -q 'k$'; then
+    local num="${val%k}"
+    echo "$num" | awk '{printf "%d", $1 * 1000}'
+  else
+    echo "$val"
+  fi
+}
+
+private.scrumMaster.parse.tokens() # <pane_content> # extract token counts, sets METRIC_TOKENS_UP/DOWN/UP_RAW/DOWN_RAW
+{
+  local content="$1"
+
+  METRIC_TOKENS_UP_RAW=""
+  METRIC_TOKENS_DOWN_RAW=""
+  METRIC_TOKENS_UP=0
+  METRIC_TOKENS_DOWN=0
+
+  # Pattern: ↑ 20.3k tokens  or  ↑ 590 tokens
+  local up_raw
+  up_raw=$(echo "$content" | grep -o '↑ [0-9][0-9.]*k\{0,1\} tokens' | tail -1 | sed 's/↑ //;s/ tokens//')
+  if [ -n "$up_raw" ]; then
+    METRIC_TOKENS_UP_RAW="$up_raw"
+    METRIC_TOKENS_UP=$(private.scrumMaster.parse.normalize.k "$up_raw")
+  fi
+
+  # Pattern: ↓ 7.9k tokens  or  ↓ 590 tokens
+  local down_raw
+  down_raw=$(echo "$content" | grep -o '↓ [0-9][0-9.]*k\{0,1\} tokens' | tail -1 | sed 's/↓ //;s/ tokens//')
+  if [ -n "$down_raw" ]; then
+    METRIC_TOKENS_DOWN_RAW="$down_raw"
+    METRIC_TOKENS_DOWN=$(private.scrumMaster.parse.normalize.k "$down_raw")
+  fi
+}
+
+private.scrumMaster.parse.timing() # <pane_content> # extract timing info, sets METRIC_THINK_TIME_S/WALL_TIME/WALL_TIME_S/TOOL_USES
+{
+  local content="$1"
+
+  METRIC_THINK_TIME_S=0
+  METRIC_WALL_TIME=""
+  METRIC_WALL_TIME_S=0
+  METRIC_TOOL_USES=0
+
+  # Pattern: "thought for 33s" or "Thought for 33s"
+  local think
+  think=$(echo "$content" | grep -oE '[Tt]hought for [0-9]+s' | tail -1 | grep -oE '[0-9]+')
+  [ -n "$think" ] && METRIC_THINK_TIME_S="$think"
+
+  # Pattern: "(4m 9s" or "(1m 16s" — wall time in parentheses
+  local wall
+  wall=$(echo "$content" | grep -oE '\([0-9]+m [0-9]+s' | tail -1 | sed 's/(//')
+  if [ -n "$wall" ]; then
+    METRIC_WALL_TIME="$wall"
+    local mins secs
+    mins=$(echo "$wall" | grep -oE '^[0-9]+')
+    secs=$(echo "$wall" | grep -oE '[0-9]+s$' | tr -d 's')
+    METRIC_WALL_TIME_S=$(( mins * 60 + secs ))
+  fi
+
+  # Pattern: "14 tool uses" or "1 tool use"
+  local tools
+  tools=$(echo "$content" | grep -oE '[0-9]+ tool uses?' | tail -1 | grep -oE '[0-9]+')
+  [ -n "$tools" ] && METRIC_TOOL_USES="$tools"
+}
+
+private.scrumMaster.parse.state() # <pane_content> # detect activity state, sets METRIC_ACTIVITY/METRIC_STATE
+{
+  local content="$1"
+
+  METRIC_ACTIVITY="none"
+  METRIC_STATE="unknown"
+
+  # Check for completed verbs (past-tense spinner text)
+  if echo "$content" | grep -qiE '(Brewed|Churned|Cooked|Crisped|Baked|Distilled|Rendered|Forged|Sauteed) '; then
+    METRIC_ACTIVITY=$(echo "$content" | grep -oiE '(Brewed|Churned|Cooked|Crisped|Baked|Distilled|Rendered|Forged|Sauteed)' | tail -1)
+    METRIC_STATE="completed"
+    return 0
+  fi
+
+  # Check for active verbs (present-tense spinner text)
+  if echo "$content" | grep -qiE '(Composing|Musing|Thinking|Cascading|Incubating|Frosting|Kneading|Ideating|Seasoning|Noodling|Transmuting|Fluttering|Cerebrating|Orbiting|Running|Reading)'; then
+    METRIC_ACTIVITY=$(echo "$content" | grep -oiE '(Composing|Musing|Thinking|Cascading|Incubating|Frosting|Kneading|Ideating|Seasoning|Noodling|Transmuting|Fluttering|Cerebrating|Orbiting|Running|Reading)' | tail -1)
+    METRIC_STATE="active"
+    return 0
+  fi
+
+  # Check for permission prompt
+  if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
+    METRIC_ACTIVITY="permission-prompt"
+    METRIC_STATE="permission"
+    return 0
+  fi
+
+  # Check for idle prompt (> or ❯)
+  local last_line
+  last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
+  if echo "$last_line" | grep -qE '^[[:space:]]*>[[:space:]]*$' || echo "$last_line" | grep -q '^[[:space:]]*❯[[:space:]]*$'; then
+    METRIC_ACTIVITY="idle-prompt"
+    METRIC_STATE="idle"
+    return 0
+  fi
+
+  return 0
+}
+
+private.scrumMaster.resolve.pane() # <agent_name> <?session:cursorOrchestrator> # resolve agent name to pane target
+{
+  local name="$1"
+  local session="${2:-cursorOrchestrator}"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: private.scrumMaster.resolve.pane <agent_name>"
+    return 1
+  fi
+
+  local target
+  target=$("$OOSH_DIR/hiveMind" resolve "$name" "$session" 2>/dev/null)
+  if [ -n "$target" ]; then
+    echo "$target"
+    return 0
+  fi
+
+  error.log "Cannot resolve agent '$name' to pane target"
+  return 1
+}
+
+private.scrumMaster.metrics.save() # <agent_name> <target> # persist METRIC_ variables to session/metrics/
+{
+  local agent="$1"
+  local target="$2"
+  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$OOSH_DIR/session/metrics}"
+
+  [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
+
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  local filename="${agent}.${timestamp}.env"
+
+  {
+    echo "METRIC_TARGET=\"${target}\""
+    echo "METRIC_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "METRIC_TOKENS_UP=\"${METRIC_TOKENS_UP:-0}\""
+    echo "METRIC_TOKENS_DOWN=\"${METRIC_TOKENS_DOWN:-0}\""
+    echo "METRIC_TOKENS_UP_RAW=\"${METRIC_TOKENS_UP_RAW:-}\""
+    echo "METRIC_TOKENS_DOWN_RAW=\"${METRIC_TOKENS_DOWN_RAW:-}\""
+    echo "METRIC_WALL_TIME=\"${METRIC_WALL_TIME:-}\""
+    echo "METRIC_WALL_TIME_S=\"${METRIC_WALL_TIME_S:-0}\""
+    echo "METRIC_THINK_TIME_S=\"${METRIC_THINK_TIME_S:-0}\""
+    echo "METRIC_TOOL_USES=\"${METRIC_TOOL_USES:-0}\""
+    echo "METRIC_ACTIVITY=\"${METRIC_ACTIVITY:-none}\""
+    echo "METRIC_STATE=\"${METRIC_STATE:-unknown}\""
+  } > "$metrics_dir/$filename"
+
+  info.log "Metrics saved: $metrics_dir/$filename"
+  echo "$metrics_dir/$filename"
+}
+
+# ============================================================================
+# Measurement — public API (CMM4)
+# ============================================================================
+
+scrumMaster.measure.pane() # <agent_name> <?session:cursorOrchestrator> # capture and parse metrics for one agent pane
+{
+  local agent="$1"
+  local session="${2:-cursorOrchestrator}"
+
+  if [ -z "$agent" ]; then
+    error.log "Usage: scrumMaster measure.pane <agent_name>"
+    create.result 1 "missing agent name"
+    return $(result)
+  fi
+
+  local target
+  target=$(private.scrumMaster.resolve.pane "$agent" "$session")
+  if [ $? -ne 0 ]; then
+    create.result 1 "cannot resolve $agent"
+    return $(result)
+  fi
+
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}")
+
+  if [ -z "$content" ]; then
+    warn.log "Empty pane content for $agent ($target)"
+    create.result 1 "empty pane"
+    return $(result)
+  fi
+
+  private.scrumMaster.parse.tokens "$content"
+  private.scrumMaster.parse.timing "$content"
+  private.scrumMaster.parse.state "$content"
+
+  local saved_file
+  saved_file=$(private.scrumMaster.metrics.save "$agent" "$target")
+
+  echo "$agent ($target):"
+  echo "  tokens: up=${METRIC_TOKENS_UP:-0} down=${METRIC_TOKENS_DOWN:-0}"
+  echo "  timing: wall=${METRIC_WALL_TIME:-n/a} think=${METRIC_THINK_TIME_S:-0}s"
+  echo "  tools:  ${METRIC_TOOL_USES:-0}"
+  echo "  state:  ${METRIC_STATE:-unknown} (${METRIC_ACTIVITY:-none})"
+
+  create.result 0 "$saved_file"
+  return $(result)
+}
+
+scrumMaster.measure.pane.completion.agent_name() # # agent names from hiveMind registry
+{
+  [ -f "${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}" ] && cut -d'|' -f2 "${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}" 2>/dev/null
+}
+
+scrumMaster.measure.pane.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.measure.team() # <?session:cursorOrchestrator> # capture metrics for all agents in a session
+{
+  local session="${1:-cursorOrchestrator}"
+  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+
+  if [ ! -f "$registry" ]; then
+    error.log "No hiveMind registry found"
+    create.result 1 "no registry"
+    return $(result)
+  fi
+
+  echo "═══════════════════════════════════════════════"
+  echo " Team Metrics — session: $session"
+  echo "═══════════════════════════════════════════════"
+
+  local count=0
+  while IFS='|' read -r target role; do
+    [ -z "$role" ] && continue
+    echo "───────────────────────────────────────────────"
+    scrumMaster.measure.pane "$role" "$session"
+    count=$((count + 1))
+  done < <(grep "^${session}:" "$registry" 2>/dev/null)
+
+  echo "═══════════════════════════════════════════════"
+  echo " Measured $count agents"
+  echo "═══════════════════════════════════════════════"
+
+  create.result 0 "$count agents measured"
+  return $(result)
+}
+
+scrumMaster.measure.team.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.measure.context() # <agent_name> <?session:cursorOrchestrator> # show context/token consumption for an agent
+{
+  local agent="$1"
+  local session="${2:-cursorOrchestrator}"
+
+  if [ -z "$agent" ]; then
+    error.log "Usage: scrumMaster measure.context <agent_name>"
+    create.result 1 "missing agent name"
+    return $(result)
+  fi
+
+  local target
+  target=$(private.scrumMaster.resolve.pane "$agent" "$session")
+  if [ $? -ne 0 ]; then
+    create.result 1 "cannot resolve $agent"
+    return $(result)
+  fi
+
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}")
+
+  private.scrumMaster.parse.tokens "$content"
+
+  local total=$(( ${METRIC_TOKENS_UP:-0} + ${METRIC_TOKENS_DOWN:-0} ))
+
+  echo "$agent context consumption:"
+  echo "  input (down):  ${METRIC_TOKENS_DOWN:-0} tokens (${METRIC_TOKENS_DOWN_RAW:-0})"
+  echo "  output (up):   ${METRIC_TOKENS_UP:-0} tokens (${METRIC_TOKENS_UP_RAW:-0})"
+  echo "  total:         $total tokens"
+
+  create.result 0 "$total"
+  return $(result)
+}
+
+scrumMaster.measure.context.completion.agent_name() # # agent names from hiveMind registry
+{
+  scrumMaster.measure.pane.completion.agent_name
+}
+
+scrumMaster.measure.context.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.measure.speed() # <agent_name> <?session:cursorOrchestrator> # show token rate for an agent
+{
+  local agent="$1"
+  local session="${2:-cursorOrchestrator}"
+
+  if [ -z "$agent" ]; then
+    error.log "Usage: scrumMaster measure.speed <agent_name>"
+    create.result 1 "missing agent name"
+    return $(result)
+  fi
+
+  local target
+  target=$(private.scrumMaster.resolve.pane "$agent" "$session")
+  if [ $? -ne 0 ]; then
+    create.result 1 "cannot resolve $agent"
+    return $(result)
+  fi
+
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}")
+
+  private.scrumMaster.parse.tokens "$content"
+  private.scrumMaster.parse.timing "$content"
+
+  local rate="n/a"
+  if [ "${METRIC_WALL_TIME_S:-0}" -gt 0 ] && [ "${METRIC_TOKENS_UP:-0}" -gt 0 ]; then
+    rate=$(echo "${METRIC_TOKENS_UP} ${METRIC_WALL_TIME_S}" | awk '{printf "%.1f", $1 / $2}')
+  fi
+
+  echo "$agent token rate:"
+  echo "  output tokens: ${METRIC_TOKENS_UP:-0}"
+  echo "  wall time:     ${METRIC_WALL_TIME:-n/a} (${METRIC_WALL_TIME_S:-0}s)"
+  echo "  rate:          ${rate} tokens/sec"
+
+  create.result 0 "$rate"
+  return $(result)
+}
+
+scrumMaster.measure.speed.completion.agent_name() # # agent names from hiveMind registry
+{
+  scrumMaster.measure.pane.completion.agent_name
+}
+
+scrumMaster.measure.speed.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.measure.subscription() # <?session:cursorOrchestrator> # show overall subscription usage across all agents
+{
+  local session="${1:-cursorOrchestrator}"
+  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+
+  if [ ! -f "$registry" ]; then
+    error.log "No hiveMind registry found"
+    create.result 1 "no registry"
+    return $(result)
+  fi
+
+  local total_up=0
+  local total_down=0
+  local agent_count=0
+
+  while IFS='|' read -r target role; do
+    [ -z "$role" ] && continue
+
+    local content
+    content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}" 2>/dev/null)
+    [ -z "$content" ] && continue
+
+    private.scrumMaster.parse.tokens "$content"
+
+    total_up=$((total_up + ${METRIC_TOKENS_UP:-0}))
+    total_down=$((total_down + ${METRIC_TOKENS_DOWN:-0}))
+    agent_count=$((agent_count + 1))
+  done < <(grep "^${session}:" "$registry" 2>/dev/null)
+
+  local total=$((total_up + total_down))
+
+  echo "Subscription Usage — session: $session"
+  echo "═══════════════════════════════════════════════"
+  echo "  agents measured: $agent_count"
+  echo "  total input:     $total_down tokens"
+  echo "  total output:    $total_up tokens"
+  echo "  combined:        $total tokens"
+  echo "═══════════════════════════════════════════════"
+
+  # Save subscription-level metric
+  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$OOSH_DIR/session/metrics}"
+  [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  {
+    echo "METRIC_TYPE=\"subscription\""
+    echo "METRIC_SESSION=\"$session\""
+    echo "METRIC_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "METRIC_AGENT_COUNT=\"$agent_count\""
+    echo "METRIC_TOKENS_UP_TOTAL=\"$total_up\""
+    echo "METRIC_TOKENS_DOWN_TOTAL=\"$total_down\""
+    echo "METRIC_TOKENS_COMBINED=\"$total\""
+  } > "$metrics_dir/subscription.${timestamp}.env"
+
+  create.result 0 "$total"
+  return $(result)
+}
+
+scrumMaster.measure.subscription.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
 scrumMaster.usage()
 {
   local this=${0##*/}
   echo "You started"
   echo "$0
 
-  scrumMaster - PDCA State Machine Manager
+  scrumMaster - PDCA State Machine Manager + CMM4 Measurement
 
-  Implements the CMM3-compliant PDCA cycle:
+  PDCA (CMM3):
   P → D → C → A → C → A → C → A ... → finished
-
-  After Check, you Act (fix). Then re-Check.
   Loop C→A until Check passes or max iterations.
+
+  MEASUREMENT (CMM4):
+  Extract metrics from agent panes — tokens, timing, activity state.
+  Persist to session/metrics/ for trend analysis.
 
   Usage:
   $this: command   Parameter and Description"
   this.help
   echo "
 
-  Examples
+  PDCA Examples:
     $this pdca.start              # Start new PDCA cycle
     $this pdca.start MYPDCA 3     # Start with 3 errors to fix
     $this pdca.state              # Show current state
@@ -352,6 +773,13 @@ scrumMaster.usage()
     $this pdca.errors MYPDCA 5    # Set 5 errors
     $this pdca.run                # Run complete cycle
     $this pdca.reset              # Reset machine
+
+  Measurement Examples:
+    $this measure.pane oosh-expert       # Metrics for one agent
+    $this measure.team                   # Metrics for all agents
+    $this measure.context oosh-expert    # Token consumption
+    $this measure.speed oosh-expert      # Token rate (tokens/sec)
+    $this measure.subscription           # Subscription-wide usage
   "
 }
 
