@@ -5,7 +5,105 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+# SSH ControlMaster socket path for connection reuse (single password entry)
+: ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
+
 ### new.method
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONNECTION MANAGEMENT (SSH ControlMaster)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ossh.connection.open() # <host> # open persistent SSH connection (enter password once)
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "Usage: ossh connection.open <host>"; return 1; }
+
+  # Check if connection already open
+  if ssh -O check -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null; then
+    info.log "Connection to $host already open"
+    return 0
+  fi
+
+  # Open master connection in background, persist for 10 min
+  ssh -o ControlMaster=yes \
+      -o ControlPath="$OSSH_CONTROL_PATH" \
+      -o ControlPersist=600 \
+      -o StrictHostKeyChecking=accept-new \
+      -N -f "$host"
+
+  if [ $? -eq 0 ]; then
+    success.log "Connection to $host established (reusable for 10 min)"
+    return 0
+  else
+    error.log "Failed to connect to $host"
+    return 1
+  fi
+}
+ossh.connection.open.completion.host() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.connection.close() # <host> # close the persistent SSH connection
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "Usage: ossh connection.close <host>"; return 1; }
+  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null
+  info.log "Connection to $host closed"
+}
+ossh.connection.close.completion.host() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.connection.status() # <host> # check if persistent connection is open
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "Usage: ossh connection.status <host>"; return 1; }
+  if ssh -O check -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null; then
+    echo "open"
+    return 0
+  else
+    echo "closed"
+    return 1
+  fi
+}
+ossh.connection.status.completion.host() {
+  ossh.config.get.completion "$@"
+}
+
+private.ossh.rsync() # <src> <dest> # rsync with ControlMaster and auto-mkdir
+{
+  local src="$1"
+  local dest="$2"
+  local ssh_opts="ssh -o ControlPath=$OSSH_CONTROL_PATH -o StrictHostKeyChecking=accept-new"
+
+  # Try rsync with --mkpath (rsync 3.2.3+)
+  if rsync --version 2>/dev/null | grep -qE 'version [3-9]\.[2-9]'; then
+    rsync -avz --mkpath -e "$ssh_opts" "$src" "$dest"
+  else
+    # Fallback for older rsync: use --rsync-path to create dirs
+    local remote_dir
+    remote_dir=$(echo "$dest" | sed 's|.*:||' | xargs dirname)
+    rsync -avz --rsync-path="mkdir -p $remote_dir && rsync" -e "$ssh_opts" "$src" "$dest"
+  fi
+}
+
+private.ossh.rsync.pull() # <src> <dest> # rsync pull with ControlMaster
+{
+  local src="$1"
+  local dest="$2"
+  local ssh_opts="ssh -o ControlPath=$OSSH_CONTROL_PATH -o StrictHostKeyChecking=accept-new"
+  rsync -avz -e "$ssh_opts" "$src" "$dest"
+}
+
+private.ossh.ssh() # <host> <command...> # ssh with ControlMaster
+{
+  local host="$1"
+  shift
+  ssh -o ControlPath="$OSSH_CONTROL_PATH" -o StrictHostKeyChecking=accept-new "$host" "$@"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 ossh.list() {
   ossh.config.get.completion "$@" | line find "$1" | line replace "$1" "${CYAN}$1${NORMAL}"
@@ -216,19 +314,19 @@ private.push.init.oosh() {
   local file="$HOME/.ssh/public_keys/$( ossh.get.file.name ).public_key"
   info.log "file=$file"
 
-  if scp -o StrictHostKeyChecking=accept-new $OOSH_DIR/init/oosh $file $sshConfigHost:.; then
+  # Open persistent connection (password entered once)
+  ossh.connection.open "$sshConfigHost"
+
+  if private.ossh.rsync "$OOSH_DIR/init/oosh" "$sshConfigHost:." && \
+     private.ossh.rsync "$file" "$sshConfigHost:."; then
     success.log "successfully copied oosh"
-    #scp $OOSH_DIR/.ssh/oosh $sshConfigHost:/home/$user
-    #scp $OOSH_DIR/.ssh/oosh $sshConfigHost:.
-  #set -x
-    ssh $sshConfigHost "./oosh mode ssh $sshConfigHost $OOSH_SSH_CONFIG_HOST $OOSH_MODE"
-  #set -x
+    private.ossh.ssh "$sshConfigHost" "./oosh mode ssh $sshConfigHost $OOSH_SSH_CONFIG_HOST $OOSH_MODE"
 
     important.log "remote installation done: $?"
   else
     problem.log "maybe already installed?"
 
-    ssh $sshConfigHost "bash /home/$user/oosh/ossh continue.local.install from $(ossh.get.url)"
+    private.ossh.ssh "$sshConfigHost" "bash /home/$user/oosh/ossh continue.local.install from $(ossh.get.url)"
   fi
 
   source $CONFIG
@@ -847,8 +945,9 @@ ossh.push.config() { # <toHost> <sshConfigName> # adds the config <configName> t
   fi
 
 
-  scp $CONFIG_PATH/tmp.ssh.config.$configName $toHost:config/tmp.ssh.config.$configName
-  ssh $toHost "cat config/tmp.ssh.config.$configName >>.ssh/config; rm ~/config/tmp.ssh.config.$configName"
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$CONFIG_PATH/tmp.ssh.config.$configName" "$toHost:config/tmp.ssh.config.$configName"
+  private.ossh.ssh "$toHost" "cat config/tmp.ssh.config.$configName >>.ssh/config; rm ~/config/tmp.ssh.config.$configName"
   rm ~/config/tmp.ssh.config.$configName
 }
 
@@ -878,7 +977,8 @@ ossh.push.key() { #  <toHost> <?keyName> # adds your key to host <toHost> option
   fi
 
   echo $HOME/.ssh/public_keys/$keyName $toHost:.ssh/public_keys/$keyName
-  scp $HOME/.ssh/public_keys/$keyName $toHost:.ssh/public_keys/$keyName
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$HOME/.ssh/public_keys/$keyName" "$toHost:.ssh/public_keys/$keyName"
   ossh.exec $toHost "user update.authorized_keys"
   #ssh $toHost "user update.authorized_keys"
 }
@@ -953,7 +1053,8 @@ ossh.push.dir() { # <toHost> <dir> # adds the config <configName> to the configs
     return 1
   fi
 
-  scp -r $dir $toHost:.
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$dir" "$toHost:."
 }
 
 
@@ -986,7 +1087,8 @@ ossh.pull.dir() { # <fromHost> <dir> # gets te directory <dir> <fromHost> into t
   fi
 
   important.log "copying from $toHost:$dir"
-  scp -r $toHost:$dir .
+  ossh.connection.open "$toHost"
+  private.ossh.rsync.pull "$toHost:$dir" "."
   #ssh $toHost "user update.authorized_keys"
 }
 
@@ -1009,7 +1111,8 @@ ossh.pull.key() { # <fromHost> <dir> # gets te directory <dir> <fromHost> into t
     #return 1
   fi
 
-  scp -r $toHost:.ssh/public_keys/$keyName.public_key $HOME/.ssh/public_keys/$keyName.public_key.pulled
+  ossh.connection.open "$toHost"
+  private.ossh.rsync.pull "$toHost:.ssh/public_keys/$keyName.public_key" "$HOME/.ssh/public_keys/$keyName.public_key.pulled"
   #ssh $toHost "user update.authorized_keys"
 }
 
@@ -1093,7 +1196,8 @@ ossh.push.id() # <toHost> <id> # puches the <id> <toHost>
     shift
   fi
 
-  scp -r $idDir $toHost:~/.ssh/ids/
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$idDir" "$toHost:~/.ssh/ids/"
 }
 
 ossh.get.server.port() {
