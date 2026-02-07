@@ -772,11 +772,31 @@ private.claudeCode.context.parse() {
   # Claude Code TUI shows: "Context left until auto-compact: NN%"
   local content="$1"
   local pct
-  pct=$(echo "$content" | grep -oE 'Context left until auto-compact: [0-9]+%' | grep -oE '[0-9]+')
+
+  # Strip ANSI escape codes first
+  local clean
+  clean=$(echo "$content" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+
+  # Pattern 1: "Context left until auto-compact: NN%"
+  pct=$(echo "$clean" | grep -oE 'Context left until auto-compact: [0-9]+%' | grep -oE '[0-9]+' | head -1)
   [ -n "$pct" ] && echo "$pct" && return 0
-  # Fallback: any "context" line with a percentage
-  pct=$(echo "$content" | grep -iE 'context.*[0-9]+%' | grep -oE '[0-9]+' | head -1)
+
+  # Pattern 2: "context: NN%" or "Context: NN%"
+  pct=$(echo "$clean" | grep -oiE 'context:\s*[0-9]+%' | grep -oE '[0-9]+' | head -1)
   [ -n "$pct" ] && echo "$pct" && return 0
+
+  # Pattern 3: Any line with "context" and a percentage nearby
+  pct=$(echo "$clean" | grep -iE 'context.*[0-9]+%' | grep -oE '[0-9]+' | head -1)
+  [ -n "$pct" ] && echo "$pct" && return 0
+
+  # Pattern 4: Look for percentage near bottom of pane (status bar area)
+  pct=$(echo "$clean" | tail -10 | grep -oE '[0-9]+%' | grep -oE '[0-9]+' | head -1)
+  [ -n "$pct" ] && echo "$pct" && return 0
+
+  # Debug: log what we captured if parsing fails
+  debug.log "context.parse failed. First 5 lines: $(echo "$clean" | head -5)"
+  debug.log "context.parse failed. Last 5 lines: $(echo "$clean" | tail -5)"
+
   return 1
 }
 
@@ -788,10 +808,16 @@ claudeCode.context.read() # <pane> # read context percentage from Claude Code TU
     return 1
   fi
 
-  # Capture enough lines to see the status bar
+  # Capture FULL pane content — context info can be anywhere
+  # Use tmux capture-pane with -S - for full scrollback, or large depth
   local content
-  content=$("$OOSH_DIR/otmux" pane.capture "$pane" 50)
+  content=$(tmux capture-pane -t "$pane" -p -S -200 2>/dev/null)
 
+  # Also check visible area (bottom of pane where status bar lives)
+  local visible
+  visible=$(tmux capture-pane -t "$pane" -p 2>/dev/null)
+
+  # Try parsing full content first
   local pct
   pct=$(private.claudeCode.context.parse "$content")
   if [ -n "$pct" ]; then
@@ -800,9 +826,19 @@ claudeCode.context.read() # <pane> # read context percentage from Claude Code TU
     return 0
   fi
 
-  RESULT="above-threshold"
-  echo "above-threshold"
-  return 0
+  # Try visible area (may have fresher status bar)
+  pct=$(private.claudeCode.context.parse "$visible")
+  if [ -n "$pct" ]; then
+    RESULT="$pct"
+    echo "$pct"
+    return 0
+  fi
+
+  # No context info found — return "unknown" not "above-threshold"
+  # Absence of info is not the same as context being high
+  RESULT="unknown"
+  echo "unknown"
+  return 1
 }
 claudeCode.context.read.completion.pane() {
   tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
@@ -821,7 +857,9 @@ claudeCode.context.alert() # <pane> <?threshold:20> # alert if context below thr
   claudeCode.context.read "$pane" > /dev/null
   local pct="$RESULT"
 
-  if [ "$pct" = "above-threshold" ]; then
+  # Can't alert if context is unknown
+  if [ "$pct" = "unknown" ]; then
+    debug.log "Cannot alert $pane — context unknown"
     return 1
   fi
 
