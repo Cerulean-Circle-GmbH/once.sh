@@ -1177,6 +1177,141 @@ scrumMaster.measure.evaluate() # # single health check — subscription + veloci
 }
 scrumMaster.measure.evaluate.completion() { :; }
 
+# ============================================================================
+# Structured KPI Logging — per-cycle metrics (Task from PO)
+# ============================================================================
+# Logs: (1) tokens/hour per agent, (2) max tokens per model, (3) velocity,
+#       (4) time until compact prediction, (5) CMM4 velocity/wait per agent
+
+scrumMaster.metrics.cycle() # <?session:cursorOrchestrator> # log structured KPIs for all agents
+{
+  local session="${1:-cursorOrchestrator}"
+  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$OOSH_DIR/session/metrics}"
+  local kpi_log="$metrics_dir/kpi.log"
+
+  [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  local epoch
+  epoch=$(date +%s)
+
+  # Model max tokens (Claude limits)
+  local CLAUDE_OPUS_MAX=200000
+  local CLAUDE_SONNET_MAX=200000
+  local CLAUDE_HAIKU_MAX=200000
+
+  # Get subscription velocity (cached from API)
+  local vel_five=0 vel_seven=0 vel_burn="unknown"
+  local latest_sub="${CONFIG_PATH:-$HOME/config}/metrics"
+  latest_sub=$(ls -t "$latest_sub"/subscription.*.env 2>/dev/null | head -1)
+  if [ -n "$latest_sub" ]; then
+    source "$latest_sub"
+    vel_five=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+    vel_seven=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+  fi
+  vel_burn=$(scrumMaster.measure.velocity.target 2>/dev/null)
+
+  # Start KPI entry
+  {
+    echo "───────────────────────────────────────────────"
+    echo "CYCLE_TIMESTAMP=$timestamp"
+    echo "SESSION=$session"
+    echo ""
+    echo "# Subscription Velocity"
+    echo "VELOCITY_FIVE_HOUR_PCT=$vel_five"
+    echo "VELOCITY_SEVEN_DAY_PCT=$vel_seven"
+    echo "VELOCITY_BURN_RATE=$vel_burn"
+    echo "MODEL_OPUS_MAX_TOKENS=$CLAUDE_OPUS_MAX"
+    echo "MODEL_SONNET_MAX_TOKENS=$CLAUDE_SONNET_MAX"
+    echo ""
+    echo "# Per-Agent KPIs"
+  } >> "$kpi_log"
+
+  # Iterate all agents
+  if [ -f "$registry" ]; then
+    while IFS='|' read -r target role; do
+      [ -z "$role" ] && continue
+      [[ "$target" != "$session:"* ]] && continue
+
+      local content
+      content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}" 2>/dev/null)
+      [ -z "$content" ] && continue
+
+      # Parse metrics
+      private.scrumMaster.parse.tokens "$content"
+      private.scrumMaster.parse.timing "$content"
+      private.scrumMaster.parse.state "$content"
+
+      # Tokens per hour calculation
+      local tokens_total=$(( ${METRIC_TOKENS_UP:-0} + ${METRIC_TOKENS_DOWN:-0} ))
+      local wall_secs=${METRIC_WALL_TIME_S:-0}
+      local tokens_per_hour=0
+      if [ "$wall_secs" -gt 0 ]; then
+        tokens_per_hour=$(echo "$tokens_total $wall_secs" | awk '{printf "%d", ($1 / $2) * 3600}')
+      fi
+
+      # Context percentage (time until compact prediction)
+      local context_pct
+      context_pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+      [ -z "$context_pct" ] && context_pct="above-threshold"
+
+      # Time until compact prediction (rough estimate)
+      # Assume ~1% context per 30s of active work
+      local compact_eta="n/a"
+      if [ "$context_pct" != "above-threshold" ] && [ "$context_pct" -gt 0 ] 2>/dev/null; then
+        if [ "${METRIC_STATE:-unknown}" = "active" ] && [ "$tokens_per_hour" -gt 0 ]; then
+          # Estimate: remaining context / burn rate
+          local mins_remaining=$(( context_pct * 2 ))  # ~2 mins per percent at active rate
+          compact_eta="${mins_remaining}m"
+        elif [ "$context_pct" -le 20 ]; then
+          compact_eta="CRITICAL"
+        fi
+      fi
+
+      # CMM4 velocity/wait state
+      local cmm4_state="idle"
+      case "${METRIC_STATE:-unknown}" in
+        active)     cmm4_state="working" ;;
+        completed)  cmm4_state="ready" ;;
+        permission) cmm4_state="blocked" ;;
+        idle)       cmm4_state="waiting" ;;
+      esac
+
+      {
+        echo ""
+        echo "[$role]"
+        echo "  target=$target"
+        echo "  tokens_up=${METRIC_TOKENS_UP:-0}"
+        echo "  tokens_down=${METRIC_TOKENS_DOWN:-0}"
+        echo "  tokens_per_hour=$tokens_per_hour"
+        echo "  wall_time=${METRIC_WALL_TIME:-n/a}"
+        echo "  think_time=${METRIC_THINK_TIME_S:-0}s"
+        echo "  context_pct=$context_pct"
+        echo "  compact_eta=$compact_eta"
+        echo "  cmm4_state=$cmm4_state"
+        echo "  activity=${METRIC_ACTIVITY:-none}"
+      } >> "$kpi_log"
+
+    done < "$registry"
+  fi
+
+  {
+    echo ""
+    echo "═══════════════════════════════════════════════"
+    echo ""
+  } >> "$kpi_log"
+
+  # Also output summary to console
+  echo "KPIs logged: $kpi_log"
+  echo "  velocity: ${vel_five}% 5h, ${vel_seven}% 7d, burn=$vel_burn"
+
+  create.result 0 "$kpi_log"
+  return $(result)
+}
+scrumMaster.metrics.cycle.completion() { :; }
+
 scrumMaster.usage()
 {
   local this=${0##*/}
