@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-04T14:00Z
+**Updated**: 2026-02-05T09:00Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -10,55 +10,70 @@
 3. Read `docs/oosh-architecture.md` for framework reference
 4. Check with Orchestrator for next assignment
 
-## Completed Work This Session (2026-02-04)
+## Completed Work This Session (2026-02-05)
+
+### Pane title lock (commit 1a26e3a)
+- `otmux pane.lock <target> <title>` — locks pane title via `pane-title-changed` hook
+- `otmux pane.unlock <target>` — removes hook, restores default
+- Finding: `allow-rename off` alone insufficient — Claude Code uses `tmux select-pane -T`, not escape sequences
+- All 7 agent panes locked with role names
+
+### Task 30: otmux send Enter fix (commit 064c184)
+- Root cause: `tmux send-keys` delivers text+Enter too fast for Claude Code TUI
+- Fix: `otmux.send` detects trailing `Enter` arg, splits call with 50ms delay
+- Matches pattern already proven in `private.otmux.sendEnter`
+
+### Task 33: hiveMind sweep/unblock/sweep.loop (commit 593acfe)
+- `hiveMind.sweep` — batch-capture all registered panes, return status table
+- `hiveMind.unblock <name|all>` — detect stuck prompts (permission, queued, rate-limit, autocomplete), resolve with keystrokes
+- `hiveMind.sweep.loop <seconds>` — continuous sweep + unblock at interval
+- `private.hiveMind.sweep.detect` — 7 states: active, idle, permission, queued, rate-limit, autocomplete, unknown
+- One OOSH method = one permission approval instead of 6+
+
+### Task 37: Peer context monitoring (commit 18756ba)
+- `claudeCode context.read <pane>` — extract context % from TUI status bar
+- `claudeCode context.alert <pane> <threshold>` — warn agent if below threshold
+- Enhanced `scrumMaster.measure.context` — TUI percentage + persistence + burn rate tracking
+- "Two Gather" pattern: agents can't self-measure context, peers can
+
+### Permissions fix (commit 8d79b31 on main)
+- Added `Bash(bash *)` and `Bash(git *)` to `.claude/settings.json` allowlist
+
+## Completed Work Previous Sessions (2026-02-04)
 
 ### hiveMind.join + send fix (commit 0586630)
 - `hiveMind.join <name>` — rejoin agent Claude session by role name
-- Session tracking: `private.hiveMind.session.store/lookup` in `/tmp/hivemind.sessions`
-- Tab completion for role names on join
-- Bug fix: `hiveMind.send` now uses `tmux -l "$*"` to preserve spaces (root cause of garbled messages)
-- `team.status` passively stores session IDs when detected
+- Session tracking in `/tmp/hivemind.sessions`
+- Bug fix: `hiveMind.send` garbled spaces → uses `tmux -l "$*"`
 
 ### Task 29: scrumMaster.measure.subscription.api (commit 2c7cf52)
-- `scrumMaster.measure.subscription.api` — calls Anthropic OAuth usage API for real utilization %
-- `private.measure.subscription.api.auth` — extracts OAuth token from macOS Keychain
-- `private.measure.subscription.api.parse` — parses JSON via python3/jq
-- Alerts: >=80% warning via console.log, >=90% error via error.log
-- Persists to ~/config/metrics/subscription.<timestamp>.env
-- Existing Task.27 pane-scraping methods unchanged (agent activity metrics)
+- OAuth API call for real subscription utilization %
 
-## Completed Work Previous Sessions
-
-### Task 27: ScrumMaster Measurement Capabilities (commit 4ae6e56)
-- Steps 1-8 done: private parsing, public measure.* API, Tab completions, persistence
-- 14/14 tests pass, 9/9 PDCA no regression
-
-### Earlier tasks (see git log for details)
-- Task 22: Context schema + validate (context script)
-- Task 25: Naming convention audit (object.verb enforcement)
-- Task 20: Session ID detection (claudeCode wrapper DRY refactor)
-- Task 18: Transport-independent messaging (hiveMind.agent.send)
-- Tasks 2-16: hiveMind core infrastructure (registry, resolve, team.status, send/send.enter, bootstrap)
+### Earlier tasks (see git log)
+- Task 27: ScrumMaster measurement (commit 4ae6e56)
+- Task 22-25: Context schema, naming audit, session ID, messaging
+- Tasks 2-16: hiveMind core infrastructure
 
 ## Key Files Modified This Session
-- `components/OOSH/dev.claude/hiveMind` — join method, send fix, session tracking
-- `components/OOSH/dev.claude/scrumMaster` — subscription API measurement (Task 29)
+- `otmux` — pane.lock/unlock, send Enter fix
+- `hiveMind` — sweep, unblock, sweep.loop
+- `claudeCode` — context.read, context.alert
+- `scrumMaster` — enhanced measure.context
+- `.claude/settings.json` (workspace root) — permissions allowlist
 
 ## Pending
-- Task 29 Steps 4-6: Tester validation (API call, thresholds, error handling)
-- Task 24 Steps 3-4: Tester validation of context.recover
-- No other tasks assigned to expert
+- No tasks currently assigned to expert
+- Waiting for next assignment via hiveMind message
 
 ## Key Architecture Decisions
 - **Role registry**: `/tmp/hivemind.roles` — `session:window.pane|role` per line
-- **Session registry**: `/tmp/hivemind.sessions` — `role|session-uuid` per line (NEW)
-- **Alias resolution**: `private.hiveMind.resolve.alias()` maps legacy names to canonical keys
-- **Session ID discovery**: Delegated to `claudeCode` wrapper (DRY). Chains PID→`--resume`/lsof
-- **TUI key sending**: `-l` literal flag + split calls in `otmux.send.enter`
-- **Bash 3.2**: No `declare -A` — case function lookups
-- **HIVEMIND_AGENTS_DIR**: `${OOSH_DIR}/../../../.claude/agents`
+- **Session registry**: `/tmp/hivemind.sessions` — `role|session-uuid` per line
+- **Pane title lock**: `pane-title-changed` hook (not just `allow-rename off`)
+- **Send Enter fix**: Detect trailing `Enter` arg, split with 50ms delay
+- **Sweep detect**: Enhanced `pane.activity` with 7 states + action recommendations
+- **Context monitoring**: Peer-only via pane capture (agents can't read own TUI status)
+- **Bash 3.2**: No `declare -A` — case function lookups, `${@:1:count}` for arg slicing
 - **object.verb naming**: All public methods use dot notation
-- **Subscription API**: `scrumMaster.measure.subscription.api` calls OAuth endpoint; pane-scraping methods are agent activity metrics only
 
 ## Current Team Layout (7 panes)
 ```
@@ -73,4 +88,4 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commits: `0586630` (hiveMind.join), `2c7cf52` (Task 29)
+- Latest commit: `18756ba` (Task 37: peer context monitoring)

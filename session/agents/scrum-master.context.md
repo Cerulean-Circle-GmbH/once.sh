@@ -1,62 +1,101 @@
 # ScrumMaster — Session Context
 
-**Updated**: 2026-02-04T14:00Z
+**Updated**: 2026-02-07T23:30Z
 **Role**: ScrumMaster
 **Pane**: 0.6 in cursorOrchestrator
 
-## Current Team Layout (8 panes)
+## DUAL SESSION MONITORING
+
+Monitor BOTH sessions every 30s:
+```bash
+hiveMind sweep cursorOrchestrator && hiveMind sweep claudeWoda && hiveMind unblock all claudeWoda
+```
+**No ./ prefix** — user corrected this. Use `hiveMind` not `./hiveMind`.
+
+## Current Team Layout
+
+### cursorOrchestrator (7 panes)
 
 | Pane | Role | Status |
 |------|------|--------|
-| 0.0 | Orchestrator | Just compacted, recovering. Monitoring SM context. |
-| 0.1 | Product Owner | Active, checking team status. Wants SM to compact. |
-| 0.2 | Agent Trainer | Standing by. |
-| 0.3 | Task Agent | Active, checking Expert progress. |
-| 0.4 | Expert | Implemented 4 hiveMind tasks (send fix, session tracking, join, team.status). Committing. |
-| 0.5 | Tester | 95% limit. Standing by. Needs restart. |
-| 0.6 | ScrumMaster | Me — about to compact. |
-| 0.7 | (empty) | Shell |
+| 0.0 | Orchestrator | Idle. Git diff panels keep opening. |
+| 0.1 | Product Owner | **DO NOT MESSAGE** — Tron's input pane. |
+| 0.2 | Agent Trainer | Idle. Standing by. |
+| 0.3 | Task Agent | Idle. Git diff panels keep opening. |
+| 0.4 | Expert | Interrupted state. Task 50 complete. |
+| 0.5 | Tester | Background tasks panel keeps opening. |
+| 0.6 | ScrumMaster | Me — 30s dual-session sweeps. |
+
+### claudeWoda (5 panes)
+
+| Pane | Role | Status |
+|------|------|--------|
+| 0.0 | woda-writer | Idle. Git diff panels keep opening. |
+| 0.1 | woda-scribe | Working on cleanup (13 files +61 -1524). |
+| 0.2 | zsh.commands | Shell. |
+| 0.3 | zsh.split | Shell. |
+| 0.4 | oosh.shell | Shell. |
 
 ## CRITICAL Rules
 
-- Use ONLY `./otmux pane.capture` and `./otmux send` — NO raw tmux commands
-- `./otmux send <pane> Down` then SEPARATE `./otmux send <pane> Enter` for option 2
-- Keep messages SHORT — write to files for long instructions
-- Monitor ALL panes including PO (0.1)
-- ALWAYS check real pane state before reporting — never report from memory
+- Use `hiveMind sweep` (NO ./ prefix) for all sweeps
+- `otmux send <pane> Down` then SEPARATE `otmux send <pane> Enter` for option 2
+- ALWAYS select option 2 ("allow always") when available
+- Close UI panels (git diff, background tasks) with Escape IMMEDIATELY
+- Do NOT submit idle "stand by" loops (Expert, Tester) — only submit real work
+- **NEVER send messages to PO (0.1)** — report to Orchestrator (0.0) or write to task files
+- Velocity measurement every 3rd sweep: `scrumMaster measure.subscription.api`
 
-## Completed Work
+## Known Issues
 
-1. Approved 30+ Expert permission prompts across Tasks 23, 24, 26, 27, 28, hiveMind join
-2. Validated Task.28 Steps 3-4: otmux tree PASS (all 4 checks)
-3. Validated Task.24 Step 4: context.recover PASS (all 6 checks)
-4. Recovered PO from bash shell back into Claude Code
-5. Prevented Expert from deleting dev.claude branch
-6. Forwarded tasks between agents, corrected role violations
-7. Saved context, reported status to Task Agent
-8. Expert completed: Task.23, Task.24, Task.26, Task.27, Task.28, hiveMind join tasks
-9. Expert committing hiveMind.send fix + session tracking + join method
+1. **UI panels keep opening spontaneously** — git diff, background tasks, file pickers. Send Escape repeatedly.
+2. **Most agents in "Interrupted" state** — normal after compacts, will resume when given work.
+3. **Disk space CRITICAL** — system at 100% (171MB free). Temp file errors occurring.
+
+## Completed Work (This Session — 2026-02-07)
+
+1. Recovered from compact, resumed 30s sweep monitoring
+2. **Task 49 ALL PASS (Watchdog Supervisor)**: 11/11 tests passed, commit 3a1e18c
+3. **Task 50/56 ALL PASS (ossh scp-to-rsync)**: Fixed, marked in bug tracker
+4. **Task 51 ALL PASS**: test.suite all loop fix
+5. **Task 52 ALL PASS (claudeCode context.read)**: ANSI stripping fix, commit 33b7b08
+6. **Task 53 ALL PASS (oo new.method macOS)**: BSD awk compatibility, commits 4b1db92, 2d06459, e9a8b7e
+7. **Task 54 ALL PASS (c2 completion standalone)**: Completion system working, commit d990efd
+8. **Task 55 ALL PASS (State machine cleanup)**: 10/10 tests, no ghost refs
+9. **Task 57 ALL PASS (Compound command wrappers)**: 7/7 tests, commit a8422a4
+   - hiveMind.sweep.cycle
+   - hiveMind.monitor.cycle
+   - scrumMaster.cycle
+10. Approved 30+ permission prompts
+11. Sent /compact to Orchestrator (at 11%) and Expert (at 12%) and Tester (at 12%)
+12. Velocity: 30% five_hour, 42% seven_day, 9 tasks today
+
+## Prior Session Work (summary)
+
+- Tasks 40.1-40.5 all validated ALL PASS
+- Tasks 46-48 validated ALL PASS
+- Writer completed Ch2-Ch8 of CMM4 journey
+- hiveMind multi-team support working
 
 ## Pending
 
-- Task.29 (subscription measurement fix via OAuth API): Queued, Expert at 98% limit
-- Task.27 Step 10: Tester validation needed
-- Tester (0.5): Needs fresh restart
-- Expert hiveMind commit: In progress
+- Team standing by, session at 92% limit
+- Remaining open bugs: OAuth (external), permission reset (Claude Code), compound commands (architectural)
+- Next: Continue monitoring when session resets
 
 ## Recovery Steps
 
-1. Read this file + `.claude/agents/scrum-master/SKILL.md`
+1. Read this file
 2. `cd /Users/Shared/Workspaces/AI/Claude/components/OOSH/dev.claude`
-3. Read `session/tasks/recovery-all-agents.md`
-4. Capture ALL panes: `./otmux pane.capture cursorOrchestrator:0.X 15`
-5. Approve prompts with SEPARATE Down then Enter
-6. Check Expert commit status, Tester viability, Orchestrator recovery
-7. Report to Orchestrator via `./hiveMind send orchestrator`
+3. Sweep BOTH sessions: `hiveMind sweep cursorOrchestrator && hiveMind sweep claudeWoda`
+4. Close ALL UI panels with Escape on every pane
+5. Check Orchestrator — help with /compact if at low context
+6. Check for permission prompts — approve option 2
+7. Velocity: `scrumMaster measure.subscription.api`
+8. Do NOT submit idle loops
 
 ## Key Files
 
 - `/tmp/hivemind.roles` — agent registry
 - `session/tasks/` — task files and instructions
-- `session/tasks/Task.29.202602041323.md` — next priority task
-- `session/tasks/recovery-all-agents.md` — team recovery instructions
+- `.claude/agents/scrum-master/SKILL.md` — my role definition

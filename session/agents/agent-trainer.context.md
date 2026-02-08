@@ -1,6 +1,6 @@
 # Agent Trainer — Session Context
 
-**Updated**: 2026-02-01
+**Updated**: 2026-02-08
 **Role**: Agent Trainer (SKILL.md maintenance only)
 **Pane**: assigned dynamically via hiveMind
 
@@ -129,6 +129,30 @@
 - Rule text: "Auto-compacting without saving loses your current work permanently. The sequence is always: STOP → SAVE → `/compact`. No exceptions."
 - Added to agent-trainer Key Learnings to Propagate list as "Save Before Compact"
 
+### Task 21: agent-overview.md + SM upgrade (DONE)
+- Created `.claude/agents/agent-overview.md` — team checklist in tree format
+- Upgraded ScrumMaster: Impediment Removal as #1 responsibility, dynamic pane discovery, Layout Adaptation section
+- Updated my SKILL.md to maintain agent-overview.md alongside SKILL.md files
+- Commit: `c55b382`
+
+### CMM4 Feedback Loop (DONE) — instructions-trainer-skill-updates.md
+- Added `## CMM4 Measurement Duties` to scrum-master SKILL.md (30-min health checks, threshold alerts)
+- Added `## CMM4 Response Protocol` to orchestrator SKILL.md (THROTTLE/INCREASE/QUOTA/STAND DOWN responses)
+- Updated agent-overview.md with CMM4 responsibilities for both roles
+- Commit: `f7cba70`
+
+### Task 52: Peer Monitoring (DONE) — Task.52.peer-monitoring-sleep-cycles.md
+- Added `## Peer Monitoring (CMM4)` to orchestrator SKILL.md
+- Added `## Peer Monitoring (CMM4)` to scrum-master SKILL.md
+- Key pattern: "Two Gather" — peers monitor each other's context %, alert at <20%
+- Resume prompts after peer compacts
+- Updated agent-overview.md with peer monitoring rule
+- Commit: `06f0596`
+
+### Role Reminder (DONE)
+- Created `session/tasks/role-reminder-all-agents.md` with current pane assignments
+- Sent to all 6 agents: Orchestrator, PO, Task Agent, Expert, Tester, ScrumMaster
+
 ### Git Setup
 - Initialized workspace root repo at `/Users/Shared/Workspaces/AI/Claude/` (local only, no remote)
 - .gitignore: excludes components/ (nested repos), .cursor/ (symlinks), session/ (transient)
@@ -139,7 +163,6 @@
 ## Pending
 - Expert needs to remove `--dangerously-skip-permissions` from hiveMind team setup functions
 - task-agent needs adding to hiveMind `private.hiveMind.get.role.prompt()` (Expert task)
-- task-agent needs adding to Orchestrator team table in agent-teacher/SKILL.md
 - Standing by for SKILL.md improvement tasks from Orchestrator
 
 ## Key Files
