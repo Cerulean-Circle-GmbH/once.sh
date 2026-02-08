@@ -1,6 +1,6 @@
 # OOSH Expert Agent — Session Context
 
-**Updated**: 2026-02-05T09:00Z
+**Updated**: 2026-02-08T12:20Z
 **Role**: OOSH Expert (implementation & architecture)
 **Pane**: 0.4 in cursorOrchestrator (team layout: 7 panes)
 
@@ -10,7 +10,28 @@
 3. Read `docs/oosh-architecture.md` for framework reference
 4. Check with Orchestrator for next assignment
 
-## Completed Work This Session (2026-02-05)
+## Completed Work This Session (2026-02-08)
+
+### Improvement #9: Context velocity tracking (commit b2f6892)
+- `claudeCode.context.velocity` — tokens/hr from JSONL timestamps
+- `claudeCode.context.dashboard` — velocity dashboard for all active sessions
+- `scrumMaster.metrics.cycle` — structured KPI logging (tokens/hr, context%, CMM4 state per agent)
+
+### Improvements #4-5: Auto-commit + cycle automation (commit dea9b54)
+- `hiveMind.auto.commit` — auto-commit if changes exist
+- `hiveMind.cycle.full` — sweep + unblock + context check + auto-commit
+
+### Task 58: Context.read bugfix (commit ea22cb2)
+- Fixed optional param triggering debugger in `this` line 704
+- Guard `this.call "$@"` with `[ -n "$1" ]`
+
+### Earlier tasks (git log)
+- Task 57: sweep.cycle + monitor.cycle
+- Task 56: accept-edits handler fix
+- Task 55: ghost state machine cleanup
+- Tasks 49-54: watchdog, c2 standalone, ossh fixes
+
+## Completed Work Previous Sessions (2026-02-05)
 
 ### Pane title lock (commit 1a26e3a)
 - `otmux pane.lock <target> <title>` — locks pane title via `pane-title-changed` hook
@@ -63,7 +84,8 @@
 
 ## Pending
 - No tasks currently assigned to expert
-- Waiting for next assignment via hiveMind message
+- Standing by for Orchestrator assignment
+- CMM improvements #6-8 remain (not assigned to expert)
 
 ## Key Architecture Decisions
 - **Role registry**: `/tmp/hivemind.roles` — `session:window.pane|role` per line
@@ -88,4 +110,5 @@ cursorOrchestrator:0.6|scrum-master
 
 ## Git Status
 - Branch: `dev.claude` — up to date with `origin/dev.claude`
-- Latest commit: `18756ba` (Task 37: peer context monitoring)
+- Latest commit: `7557702` (scrumMaster.metrics.cycle for structured KPIs)
+- All improvements #4-5, #9 committed and pushed
