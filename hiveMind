@@ -1398,6 +1398,376 @@ hiveMind.team.status.completion.session() {
   tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
+hiveMind.team.save() # <session> <file> # save team topology (roles, sessions, layout) to file
+{
+  local session="$1"
+  local file="$2"
+
+  if [ -z "$session" ] || [ -z "$file" ]; then
+    error.log "usage: hiveMind team.save <session> <file>"
+    create.result 1 "missing arguments"
+    return $(result)
+  fi
+
+  if ! tmux -u has-session -t "$session" 2>/dev/null; then
+    error.log "session not found: $session"
+    create.result 1 "session not found"
+    return $(result)
+  fi
+
+  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+  local sessions_file="${HIVEMIND_SESSIONS:-/tmp/hivemind.sessions}"
+
+  # Save tmux layout via otmux.session.save
+  local tmux_file="${file%.md}.tmux"
+  source "$OOSH_DIR/otmux"
+  otmux.session.save "$session" "$tmux_file"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "failed to save tmux layout"
+    create.result 1 "tmux save failed"
+    return $(result)
+  fi
+
+  # Build the topology markdown
+  {
+    echo "# Team Topology"
+    echo "*Saved: $(date '+%Y-%m-%d %H:%M')*"
+    echo ""
+    echo "## Session"
+    echo "name: $session"
+    echo "layout: $tmux_file"
+    echo ""
+    echo "## Agents"
+    echo "| Pane | Role | Claude Session | Status | Context File |"
+    echo "|------|------|---------------|--------|--------------|"
+
+    # Iterate panes in this session from the registry
+    if [ -f "$registry" ]; then
+      grep "^${session}:" "$registry" 2>/dev/null | while IFS='|' read -r target role; do
+        [ -z "$target" ] || [ -z "$role" ] && continue
+        local addr="${target#*:}"
+
+        # Look up Claude session UUID
+        local sid=""
+        if [ -f "$sessions_file" ]; then
+          sid=$(grep "^${role}|" "$sessions_file" 2>/dev/null | tail -1 | cut -d'|' -f2)
+        fi
+
+        # Detect status
+        local status="unknown"
+        if tmux -u has-session -t "$session" 2>/dev/null; then
+          local pane_cmd
+          pane_cmd=$(tmux -u display-message -t "$target" -p "#{pane_current_command}" 2>/dev/null)
+          case "$pane_cmd" in
+            claude*) status="claude" ;;
+            bash|zsh) status="shell" ;;
+            *) status="${pane_cmd:-unknown}" ;;
+          esac
+        fi
+
+        local context_file="session/agents/${role}.context.md"
+        echo "| $addr | $role | ${sid:-n/a} | $status | $context_file |"
+      done
+    fi
+  } > "$file"
+
+  console.log "saved team topology to $file (layout: $tmux_file)"
+  create.result 0 "$file"
+  return $(result)
+}
+hiveMind.team.save.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.team.restore() # <file> # restore team from topology file (panes + registries, no Claude)
+{
+  local file="$1"
+
+  if [ -z "$file" ]; then
+    error.log "usage: hiveMind team.restore <file>"
+    create.result 1 "missing file argument"
+    return $(result)
+  fi
+
+  if [ ! -f "$file" ]; then
+    error.log "file not found: $file"
+    create.result 1 "file not found"
+    return $(result)
+  fi
+
+  # Parse session name from topology
+  local session=""
+  session=$(grep "^name:" "$file" 2>/dev/null | head -1 | sed 's/^name: *//')
+  if [ -z "$session" ]; then
+    error.log "invalid topology file: missing session name"
+    create.result 1 "missing session name"
+    return $(result)
+  fi
+
+  # Parse tmux layout file path
+  local tmux_file=""
+  tmux_file=$(grep "^layout:" "$file" 2>/dev/null | head -1 | sed 's/^layout: *//')
+  if [ -z "$tmux_file" ] || [ ! -f "$tmux_file" ]; then
+    error.log "tmux layout file not found: $tmux_file"
+    create.result 1 "layout file not found"
+    return $(result)
+  fi
+
+  # Restore tmux layout
+  source "$OOSH_DIR/otmux"
+  otmux.session.restore "$tmux_file"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "failed to restore tmux layout: $RESULT"
+    create.result 1 "tmux restore failed"
+    return $(result)
+  fi
+
+  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+  local sessions_file="${HIVEMIND_SESSIONS:-/tmp/hivemind.sessions}"
+
+  # Rebuild role registry from topology table
+  # Remove old entries for this session first
+  if [ -f "$registry" ]; then
+    grep -v "^${session}:" "$registry" > "${registry}.tmp" 2>/dev/null
+    mv "${registry}.tmp" "$registry"
+  fi
+
+  # Rebuild sessions file — clear old entries for roles in this topology
+  local roles_to_clear=""
+
+  # Parse the markdown table (skip header rows)
+  local in_table=false
+  while IFS= read -r line; do
+    # Detect table start
+    if echo "$line" | grep -q "^| Pane"; then
+      in_table=true
+      continue
+    fi
+    # Skip separator
+    echo "$line" | grep -q "^|---" && continue
+    # Parse data rows
+    if [ "$in_table" = true ] && echo "$line" | grep -q "^|"; then
+      local addr role sid status context
+      addr=$(echo "$line" | cut -d'|' -f2 | sed 's/^ *//;s/ *$//')
+      role=$(echo "$line" | cut -d'|' -f3 | sed 's/^ *//;s/ *$//')
+      sid=$(echo "$line" | cut -d'|' -f4 | sed 's/^ *//;s/ *$//')
+
+      [ -z "$addr" ] || [ -z "$role" ] && continue
+
+      # Write role registry entry
+      echo "${session}:${addr}|${role}" >> "$registry"
+
+      # Write session UUID if available
+      if [ -n "$sid" ] && [ "$sid" != "n/a" ]; then
+        if [ -f "$sessions_file" ]; then
+          grep -v "^${role}|" "$sessions_file" > "${sessions_file}.tmp" 2>/dev/null
+          mv "${sessions_file}.tmp" "$sessions_file"
+        fi
+        echo "${role}|${sid}" >> "$sessions_file"
+      fi
+    fi
+  done < "$file"
+
+  console.log "restored team '$session' from $file (panes + registries rebuilt)"
+  create.result 0 "$session"
+  return $(result)
+}
+
+hiveMind.team.shutdown() # <session> <?--keep-session> # graceful shutdown: save state, stop agents, preserve topology
+{
+  local session="$1"
+  local keep_session=false
+  [ "$2" = "--keep-session" ] && keep_session=true
+
+  if [ -z "$session" ]; then
+    error.log "usage: hiveMind team.shutdown <session> [--keep-session]"
+    create.result 1 "missing session argument"
+    return $(result)
+  fi
+
+  if ! tmux -u has-session -t "$session" 2>/dev/null; then
+    error.log "session not found: $session"
+    create.result 1 "session not found"
+    return $(result)
+  fi
+
+  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+  if [ ! -f "$registry" ]; then
+    error.log "no role registry found at $registry"
+    create.result 1 "no registry"
+    return $(result)
+  fi
+
+  local project_dir
+  project_dir=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  local topology_file="$project_dir/session/topology.md"
+
+  console.log "=== TEAM SHUTDOWN: $session ==="
+
+  # Step 1: Tell each agent to save state
+  console.log "Step 1: Sending save-state message to agents..."
+  grep "^${session}:" "$registry" 2>/dev/null | while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    tmux -u send-keys -t "$target" -l "Save your current state to session/agents/${role}.context.md now — shutting down in 10 seconds." 2>/dev/null
+    tmux -u send-keys -t "$target" Enter 2>/dev/null
+    console.log "  notified: $role ($target)"
+  done
+
+  # Step 2: Wait for agents to write context files
+  console.log "Step 2: Waiting 10 seconds for agents to save state..."
+  sleep 10
+
+  # Step 3: Save team topology
+  console.log "Step 3: Saving team topology..."
+  hiveMind.team.save "$session" "$topology_file"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    warn.log "team.save had issues but continuing shutdown"
+  fi
+
+  # Step 4: Auto-commit
+  console.log "Step 4: Auto-committing..."
+  hiveMind.auto.commit "Team shutdown: $session $(date '+%Y-%m-%d %H:%M')"
+
+  # Step 5: Gracefully stop each agent (Ctrl-C then /exit)
+  console.log "Step 5: Stopping agents..."
+  grep "^${session}:" "$registry" 2>/dev/null | while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    # Send Ctrl-C to interrupt any running operation
+    tmux -u send-keys -t "$target" C-c 2>/dev/null
+    sleep 1
+    # Send /exit to quit Claude gracefully
+    tmux -u send-keys -t "$target" "/exit" Enter 2>/dev/null
+    console.log "  stopped: $role ($target)"
+  done
+
+  # Give agents a moment to exit
+  sleep 3
+
+  # Step 6: Optionally kill tmux session
+  if [ "$keep_session" = false ]; then
+    console.log "Step 6: Killing tmux session..."
+    tmux -u kill-session -t "$session" 2>/dev/null
+    console.log "Session '$session' killed"
+  else
+    console.log "Step 6: Keeping tmux session (--keep-session)"
+  fi
+
+  console.log "=== SHUTDOWN COMPLETE ==="
+  console.log "Topology saved to: $topology_file"
+  console.log "Resume with: hiveMind team.startup $topology_file"
+  create.result 0 "$topology_file"
+  return $(result)
+}
+hiveMind.team.shutdown.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.team.startup() # <file> # restore team from topology, start Claude agents, send boot prompts
+{
+  local file="$1"
+
+  if [ -z "$file" ]; then
+    error.log "usage: hiveMind team.startup <file>"
+    create.result 1 "missing file argument"
+    return $(result)
+  fi
+
+  if [ ! -f "$file" ]; then
+    error.log "file not found: $file"
+    create.result 1 "file not found"
+    return $(result)
+  fi
+
+  # Parse session name from topology
+  local session=""
+  session=$(grep "^name:" "$file" 2>/dev/null | head -1 | sed 's/^name: *//')
+  if [ -z "$session" ]; then
+    error.log "invalid topology file: missing session name"
+    create.result 1 "missing session name"
+    return $(result)
+  fi
+
+  console.log "=== TEAM STARTUP: $session ==="
+
+  # Step 1: Restore team (panes + registries)
+  console.log "Step 1: Restoring team layout and registries..."
+  hiveMind.team.restore "$file"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "failed to restore team: $RESULT"
+    create.result 1 "restore failed"
+    return $(result)
+  fi
+
+  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+  local sessions_file="${HIVEMIND_SESSIONS:-/tmp/hivemind.sessions}"
+  local started=0
+  local failed=0
+
+  # Step 2: Start Claude in each agent pane
+  console.log "Step 2: Starting Claude agents..."
+  grep "^${session}:" "$registry" 2>/dev/null | while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+
+    # Check for stored Claude session UUID for --resume
+    local sid=""
+    if [ -f "$sessions_file" ]; then
+      sid=$(grep "^${role}|" "$sessions_file" 2>/dev/null | tail -1 | cut -d'|' -f2)
+    fi
+
+    local claude_cmd="claude"
+    if [ -n "$sid" ]; then
+      claude_cmd="claude --resume $sid"
+    fi
+
+    console.log "  starting $role ($target): $claude_cmd"
+    tmux -u send-keys -t "$target" "$claude_cmd" Enter 2>/dev/null
+
+    # Wait for Claude TUI to initialize
+    sleep 3
+  done
+
+  # Step 3: Send boot file prompts
+  console.log "Step 3: Sending boot prompts..."
+  grep "^${session}:" "$registry" 2>/dev/null | while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+
+    local boot_file="session/boot/${role}.md"
+    local boot_msg="Read $boot_file — you are resuming after shutdown. Do NOT read other files unless the boot file says to."
+    tmux -u send-keys -t "$target" -l "$boot_msg" 2>/dev/null
+    tmux -u send-keys -t "$target" Enter 2>/dev/null
+    console.log "  booted: $role ($target)"
+
+    # Brief pause between agents
+    sleep 1
+  done
+
+  # Step 4: Verify agents (with brief wait for them to process boot prompt)
+  console.log "Step 4: Verifying agents (waiting 5s for boot processing)..."
+  sleep 5
+
+  grep "^${session}:" "$registry" 2>/dev/null | while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    if hiveMind.agent.verify "$target" >/dev/null 2>&1; then
+      console.log "  ✓ $role ($target) — alive"
+    else
+      warn.log "  ? $role ($target) — status unknown (may still be starting)"
+    fi
+  done
+
+  # Step 5: Print startup summary
+  console.log "=== STARTUP COMPLETE ==="
+  console.log "Session: $session"
+  local agent_count
+  agent_count=$(grep -c "^${session}:" "$registry" 2>/dev/null || echo 0)
+  console.log "Agents: $agent_count"
+  console.log ""
+  console.log "Monitor with: hiveMind team.status $session"
+  console.log "Sweep with:   hiveMind sweep $session"
+
+  create.result 0 "$session"
+  return $(result)
+}
+
 hiveMind.monitor() # <?name-or-lines:5> <?session-or-lines> # capture pane output; name=specific agent, number=line count for all panes
 {
   local first="${1:-5}"
