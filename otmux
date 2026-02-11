@@ -1379,6 +1379,158 @@ otmux.session.details() # <session> # show all windows and panes with titles, co
 }
 otmux.session.details.completion.session() { private.complete.sessions; }
 
+otmux.session.save() # <session> <file> # save tmux session layout to sourceable bash file
+{
+  local session="$1"
+  local file="$2"
+
+  if [ -z "$session" ] || [ -z "$file" ]; then
+    error.log "usage: otmux session.save <session> <file>"
+    create.result 1 "missing arguments"
+    return $(result)
+  fi
+
+  if ! $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+    error.log "session not found: $session"
+    create.result 1 "session not found"
+    return $(result)
+  fi
+
+  local window_count
+  window_count=$($TMUX_CMD list-windows -t "$session" -F "#{window_index}" 2>/dev/null | wc -l | tr -d ' ')
+
+  {
+    echo "# otmux session snapshot -- $(date '+%Y-%m-%d %H:%M')"
+    echo "SESSION=\"$session\""
+    echo "WINDOW_COUNT=$window_count"
+    echo ""
+
+    local seq_idx=0
+    $TMUX_CMD list-windows -t "$session" -F "#{window_index}|#{window_name}|#{window_layout}" 2>/dev/null | \
+      while IFS='|' read -r win_idx win_name win_layout; do
+        echo "# Window $seq_idx (tmux index $win_idx)"
+        echo "W${seq_idx}_NAME=\"$win_name\""
+        echo "W${seq_idx}_LAYOUT=\"$win_layout\""
+
+        local pane_count
+        pane_count=$($TMUX_CMD list-panes -t "$session:$win_idx" -F "#{pane_index}" 2>/dev/null | wc -l | tr -d ' ')
+        echo "W${seq_idx}_PANE_COUNT=$pane_count"
+
+        local pane_seq=0
+        $TMUX_CMD list-panes -t "$session:$win_idx" -F "#{pane_current_path}" 2>/dev/null | \
+          while IFS='|' read -r pane_dir; do
+            echo "W${seq_idx}_P${pane_seq}_DIR=\"$pane_dir\""
+            pane_seq=$((pane_seq + 1))
+          done
+
+        echo ""
+        seq_idx=$((seq_idx + 1))
+      done
+  } > "$file"
+
+  console.log "saved session '$session' to $file ($window_count windows)"
+  create.result 0 "$file"
+  return $(result)
+}
+otmux.session.save.completion.session() { private.complete.sessions; }
+
+otmux.session.restore() # <file> # restore tmux session from saved layout file
+{
+  local file="$1"
+
+  if [ -z "$file" ]; then
+    error.log "usage: otmux session.restore <file>"
+    create.result 1 "missing file argument"
+    return $(result)
+  fi
+
+  if [ ! -f "$file" ]; then
+    error.log "file not found: $file"
+    create.result 1 "file not found"
+    return $(result)
+  fi
+
+  # Source the topology file to load variables
+  source "$file"
+
+  if [ -z "$SESSION" ] || [ -z "$WINDOW_COUNT" ]; then
+    error.log "invalid topology file: missing SESSION or WINDOW_COUNT"
+    create.result 1 "invalid topology file"
+    return $(result)
+  fi
+
+  # Guard: do not clobber existing session
+  if $TMUX_CMD has-session -t "$SESSION" 2>/dev/null; then
+    error.log "session '$SESSION' already exists — will not clobber"
+    create.result 1 "session already exists"
+    return $(result)
+  fi
+
+  # Create session with first pane of first window
+  local first_dir_var="W0_P0_DIR"
+  local first_dir="${!first_dir_var:-.}"
+  local first_name_var="W0_NAME"
+  local first_name="${!first_name_var:-main}"
+
+  $TMUX_CMD new-session -d -s "$SESSION" -n "$first_name" -c "$first_dir"
+
+  # Get actual first window index (respects base-index config)
+  local first_win
+  first_win=$($TMUX_CMD list-windows -t "$SESSION" -F "#{window_index}" 2>/dev/null | head -1)
+
+  # Create additional panes in first window
+  local pane_count_var="W0_PANE_COUNT"
+  local pane_count="${!pane_count_var:-1}"
+  local p
+  for (( p=1; p<pane_count; p++ )); do
+    local dir_var="W0_P${p}_DIR"
+    local dir="${!dir_var:-.}"
+    $TMUX_CMD split-window -t "$SESSION:$first_win" -c "$dir"
+  done
+
+  # Apply layout for first window
+  local layout_var="W0_LAYOUT"
+  local layout="${!layout_var}"
+  if [ -n "$layout" ]; then
+    $TMUX_CMD select-layout -t "$SESSION:$first_win" "$layout" 2>/dev/null
+  fi
+
+  # Create additional windows (1..WINDOW_COUNT-1)
+  local w actual_win
+  for (( w=1; w<WINDOW_COUNT; w++ )); do
+    local w_name_var="W${w}_NAME"
+    local w_name="${!w_name_var:-window${w}}"
+    local w_first_dir_var="W${w}_P0_DIR"
+    local w_first_dir="${!w_first_dir_var:-.}"
+
+    # -P -F prints the new window's index
+    actual_win=$($TMUX_CMD new-window -t "$SESSION" -n "$w_name" -c "$w_first_dir" -P -F "#{window_index}")
+
+    # Create additional panes in this window
+    local w_pane_count_var="W${w}_PANE_COUNT"
+    local w_pane_count="${!w_pane_count_var:-1}"
+    for (( p=1; p<w_pane_count; p++ )); do
+      local w_dir_var="W${w}_P${p}_DIR"
+      local w_dir="${!w_dir_var:-.}"
+      $TMUX_CMD split-window -t "$SESSION:$actual_win" -c "$w_dir"
+    done
+
+    # Apply layout for this window
+    local w_layout_var="W${w}_LAYOUT"
+    local w_layout="${!w_layout_var}"
+    if [ -n "$w_layout" ]; then
+      $TMUX_CMD select-layout -t "$SESSION:$actual_win" "$w_layout" 2>/dev/null
+    fi
+  done
+
+  # Select first window
+  $TMUX_CMD select-window -t "$SESSION:$first_win"
+
+  console.log "restored session '$SESSION' ($WINDOW_COUNT windows) from $file"
+  create.result 0 "$SESSION"
+  return $(result)
+}
+
 # --- WINDOW ALIASES ---
 
 otmux.window.new() # <?name> <?command> # create window; name=window title
