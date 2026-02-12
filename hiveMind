@@ -24,11 +24,13 @@
 # tmux session  : <teamName>            e.g. cursorOrchestrator, ooshTeam
 # tmux window   : team                  window 0 is always "team"
 # env per pane  : HIVEMIND_ROLE=<role>  exported before Claude Code starts
-# role registry : /tmp/hivemind.roles   maps pane targets → role names
-#                 (pane titles are unreliable — Claude Code overwrites them)
+# role registry : ~/config/hivemind.roles.env  maps pane targets → role names
+#                 format: target|role  (persistent, survives reboot)
+# session store : ~/config/hivemind.sessions.env  maps role → Claude session UUID
+#                 format: role|session-uuid  (allows session rejoin)
 : ${HIVEMIND_WINDOW_NAME:=team}
-: ${HIVEMIND_REGISTRY:=/tmp/hivemind.roles}
-: ${HIVEMIND_SESSIONS:=/tmp/hivemind.sessions}
+: ${HIVEMIND_REGISTRY:=${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}
+: ${HIVEMIND_SESSIONS:=${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}
 
 # Default agent roles
 HIVEMIND_DEFAULT_AGENTS=(
@@ -45,8 +47,8 @@ HIVEMIND_OOSH_AGENTS=(
 )
 
 # Canonical location for agent role definitions
-# Derives from OOSH_DIR (set by 'source this') → workspace root is 3 levels up
-HIVEMIND_AGENTS_DIR="${HIVEMIND_AGENTS_DIR:-${OOSH_DIR:+${OOSH_DIR}/../../../.claude/agents}}"
+# Resolved at runtime by private.hiveMind.find.agents.dir (searches upward from OOSH_DIR)
+# Override via env or config: HIVEMIND_AGENTS_DIR=/path/to/.claude/agents
 
 # Agent role descriptions (used for system prompts)
 # Bash 3.2 compatible — uses function lookup instead of declare -A
@@ -73,6 +75,26 @@ private.hiveMind.get.role.prompt() {
 # PRIVATE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+private.hiveMind.find.agents.dir() {
+  # Search upward from OOSH_DIR for .claude/agents containing SKILL.md files
+  # Resolves symlinks to find the correct workspace regardless of symlink depth
+  local start_dir
+  start_dir=$(realpath "${OOSH_DIR:-.}" 2>/dev/null || echo "${OOSH_DIR:-.}")
+  local dir="$start_dir"
+  while [ "$dir" != "/" ]; do
+    if [ -d "$dir/.claude/agents" ]; then
+      # Verify it contains actual SKILL.md role definitions
+      local has_skills=false
+      for f in "$dir/.claude/agents"/*/SKILL.md; do
+        [ -f "$f" ] && has_skills=true && break
+      done
+      [ "$has_skills" = "true" ] && echo "$dir/.claude/agents" && return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
 private.hiveMind.pane.identify() {
   # Register role for a pane: write to registry, set pane title, export env var
   # Usage: private.hiveMind.pane.identify <target> <role>
@@ -87,12 +109,46 @@ private.hiveMind.pane.identify() {
 # File-based mapping: pane target → role name.
 # Survives Claude Code overwriting pane titles.
 # Format: target|role  (one per line, e.g. cursorOrchestrator:0.2|oosh-expert)
+# Location: ~/config/hivemind.roles.env (persistent, OOSH config pattern)
+
+private.hiveMind.registry.migrate() {
+  # Migrate old /tmp/ registry to ~/config/ pattern (one-time, backward compat)
+  local old_registry="/tmp/hivemind.roles"
+  [ -f "$old_registry" ] || return 0
+  [ "$HIVEMIND_REGISTRY" = "$old_registry" ] && return 0
+  if [ ! -f "$HIVEMIND_REGISTRY" ] || [ ! -s "$HIVEMIND_REGISTRY" ]; then
+    local config_dir
+    config_dir=$(dirname "$HIVEMIND_REGISTRY")
+    mkdir -p "$config_dir" 2>/dev/null
+    cp "$old_registry" "$HIVEMIND_REGISTRY"
+    info.log "Migrated registry from $old_registry to $HIVEMIND_REGISTRY"
+  fi
+}
+
+private.hiveMind.sessions.migrate() {
+  # Migrate old /tmp/ sessions to ~/config/ pattern (one-time, backward compat)
+  local old_sessions="/tmp/hivemind.sessions"
+  [ -f "$old_sessions" ] || return 0
+  [ "$HIVEMIND_SESSIONS" = "$old_sessions" ] && return 0
+  if [ ! -f "$HIVEMIND_SESSIONS" ] || [ ! -s "$HIVEMIND_SESSIONS" ]; then
+    local config_dir
+    config_dir=$(dirname "$HIVEMIND_SESSIONS")
+    mkdir -p "$config_dir" 2>/dev/null
+    cp "$old_sessions" "$HIVEMIND_SESSIONS"
+    info.log "Migrated sessions from $old_sessions to $HIVEMIND_SESSIONS"
+  fi
+}
 
 private.hiveMind.registry.set() {
   # Add or update a target→role mapping
   local target="$1"
   local role="$2"
   [ -z "$target" ] || [ -z "$role" ] && return 1
+  private.hiveMind.registry.migrate
+  # Ensure config directory exists
+  local config_dir
+  config_dir=$(dirname "$HIVEMIND_REGISTRY")
+  mkdir -p "$config_dir" 2>/dev/null
   # Remove old entry for this target, then append new one
   if [ -f "$HIVEMIND_REGISTRY" ]; then
     grep -v "^${target}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
@@ -104,6 +160,7 @@ private.hiveMind.registry.set() {
 private.hiveMind.registry.get() {
   # Look up role for a given pane target
   local target="$1"
+  private.hiveMind.registry.migrate
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
 }
@@ -112,6 +169,7 @@ private.hiveMind.registry.find() {
   # Find pane target by role name (case-insensitive partial match)
   local name="$1"
   local session="$2"
+  private.hiveMind.registry.migrate
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   if [ -n "$session" ]; then
     grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | grep -i "$name" | head -1 | cut -d'|' -f1
@@ -123,6 +181,7 @@ private.hiveMind.registry.find() {
 private.hiveMind.registry.list() {
   # List all entries, optionally filtered by session
   local session="$1"
+  private.hiveMind.registry.migrate
   [ -f "$HIVEMIND_REGISTRY" ] || return 0
   if [ -n "$session" ]; then
     grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null
@@ -141,6 +200,11 @@ private.hiveMind.session.store() {
   local role="$1"
   local session_id="$2"
   [ -z "$role" ] || [ -z "$session_id" ] && return 1
+  private.hiveMind.sessions.migrate
+  # Ensure config directory exists
+  local config_dir
+  config_dir=$(dirname "$HIVEMIND_SESSIONS")
+  mkdir -p "$config_dir" 2>/dev/null
   # Remove old entry for this role, then append new one
   if [ -f "$HIVEMIND_SESSIONS" ]; then
     grep -v "^${role}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
@@ -152,6 +216,7 @@ private.hiveMind.session.store() {
 private.hiveMind.session.lookup() {
   # Look up stored session UUID for a given role
   local role="$1"
+  private.hiveMind.sessions.migrate
   [ -f "$HIVEMIND_SESSIONS" ] || return 1
   grep "^${role}|" "$HIVEMIND_SESSIONS" 2>/dev/null | tail -1 | cut -d'|' -f2
 }
@@ -1917,7 +1982,7 @@ hiveMind.cycle.full.completion() { :; }
 hiveMind.dashboard() # <?session:cursorOrchestrator> # write consolidated team state to session/dashboard.md
 {
   local session="${1:-cursorOrchestrator}"
-  local registry="${HIVEMIND_REGISTRY:-/tmp/hivemind.roles}"
+  local registry="$HIVEMIND_REGISTRY"
   local dashboard_file="$OOSH_DIR/session/dashboard.md"
 
   local timestamp
