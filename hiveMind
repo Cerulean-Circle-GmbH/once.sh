@@ -1313,19 +1313,23 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
         printf "%-24s (session not running)\n" "$team"
         continue
       fi
-      local agent_count=0 active_count=0 idle_count=0
+      local agent_count=0 active_count=0 idle_count=0 blocked_count=0
       while IFS='|' read -r target role; do
         [ -z "$target" ] || [ -z "$role" ] && continue
         case "$target" in "${team}:"*) ;; *) continue ;; esac
         agent_count=$((agent_count + 1))
-        local activity
-        activity=$(private.hiveMind.pane.activity "$target" 2>/dev/null)
+        local detect_raw activity
+        detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+        activity="${detect_raw%%|*}"
         case "$activity" in
-          idle|shell) idle_count=$((idle_count + 1)) ;;
+          idle|shell|shell-escaped|unknown) idle_count=$((idle_count + 1)) ;;
+          permission|rate-limit|accept-edits|queued|panel|overlay|autocomplete) blocked_count=$((blocked_count + 1)) ;;
           *) active_count=$((active_count + 1)) ;;
         esac
       done < "$HIVEMIND_REGISTRY"
-      printf "%-24s %d agents  (%d active, %d idle)\n" "$team" "$agent_count" "$active_count" "$idle_count"
+      local summary="${active_count} active, ${idle_count} idle"
+      [ "$blocked_count" -gt 0 ] && summary="${summary}, ${blocked_count} blocked"
+      printf "%-24s %d agents  (%s)\n" "$team" "$agent_count" "$summary"
     done <<< "$teams"
     return 0
   fi
@@ -1348,16 +1352,21 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
   while IFS='|' read -r addr pane_cmd; do
     count=$((count + 1))
 
-    local state=""
+    local state="" detect_raw=""
     local is_claude=false
     case "$pane_cmd" in
-      claude*|[0-9].[0-9]*) is_claude=true; state=$(private.hiveMind.pane.activity "${session}:${addr}") ;;
+      claude*|[0-9].[0-9]*)
+        is_claude=true
+        detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
+        state="${detect_raw%%|*}"
+        ;;
       bash|zsh)
         # Shell reported — but Claude Code may still be running on this TTY.
         # tmux pane_current_command can misreport idle Claude as 'bash'.
         if ./claudeCode process.running "${session}:${addr}"; then
           is_claude=true
-          state=$(private.hiveMind.pane.activity "${session}:${addr}")
+          detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
+          state="${detect_raw%%|*}"
         else
           state="shell"
         fi
@@ -1396,6 +1405,160 @@ hiveMind.team.list.completion.session() {
 }
 hiveMind.team.status.completion.session() {
   tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane status of all registered agents (optional sleep before sweep)
+{
+  local session="$1"
+  local interval="$2"
+
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind team.sweep <session> <?interval>"
+    return 1
+  fi
+
+  # Sleep first if interval provided (avoids compound commands that trigger permission prompts)
+  if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+    sleep "$interval"
+  fi
+
+  if [ ! -f "$HIVEMIND_REGISTRY" ]; then
+    error.log "No role registry found at $HIVEMIND_REGISTRY"
+    return 1
+  fi
+
+  # Identify own pane to skip self
+  local own_pane=""
+  [ -n "$TMUX_PANE" ] && own_pane="$TMUX_PANE"
+
+  while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    case "$target" in "${session}:"*) ;; *) continue ;; esac
+
+    local addr="${target#*:}"
+
+    # Skip self
+    if [ -n "$own_pane" ]; then
+      local pane_id
+      pane_id=$(tmux display-message -t "$target" -p "#{pane_id}" 2>/dev/null)
+      [ "$pane_id" = "$own_pane" ] && continue
+    fi
+
+    # Capture last 15 lines
+    local content
+    content=$(otmux pane.capture "$target" 15 2>/dev/null)
+
+    # Determine state and details
+    local state="IDLE"
+    local details=""
+
+    # Check for empty/unreachable pane
+    local trimmed
+    trimmed=$(echo "$content" | tr -d '[:space:]')
+    if [ -z "$trimmed" ]; then
+      state="UNKNOWN"
+      printf "%-5s %-22s %s\n" "$addr" "$role" "$state"
+      continue
+    fi
+
+    # PERMISSION — "Allow"+"Deny" or "Do you want to proceed?"
+    if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
+      state="PERMISSION"
+      details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
+    elif echo "$content" | grep -q 'Do you want to proceed?'; then
+      state="PERMISSION"
+
+    # CONTEXT_LOW — "Context left until auto-compact: N%" or "N% remaining"
+    elif echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
+      state="CONTEXT_LOW"
+      details=$(echo "$content" | grep -oE '[0-9]+%' | tail -1)
+    elif echo "$content" | grep -qE '[0-9]+% remaining'; then
+      state="CONTEXT_LOW"
+      details=$(echo "$content" | grep -oE '[0-9]+%' | tail -1)
+
+    # ACTIVE — creative verb spinner or "thinking"
+    elif echo "$content" | grep -qiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running'; then
+      state="ACTIVE"
+      details=$(echo "$content" | grep -oiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running' | tail -1)
+      # Try to capture elapsed time if present (e.g. "(14m)")
+      local elapsed
+      elapsed=$(echo "$content" | grep -oE '\([0-9]+[ms]\)' | tail -1)
+      [ -n "$elapsed" ] && details="$details $elapsed"
+
+    # COMPLETED — past-tense verb (Baked, Brewed, Cooked, etc.)
+    elif echo "$content" | grep -qiE 'Baked|Brewed|Cooked|Simmered|Distilled|Woven|Crafted|Composed|Frosted|Incubated|Cascaded'; then
+      state="COMPLETED"
+
+    else
+      # Check last non-empty line for prompt state
+      local last_line
+      last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
+
+      # INPUT — text after prompt
+      if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
+        state="INPUT"
+        details=$(echo "$last_line" | sed -E 's/^[[:space:]]*(>|❯)[[:space:]]+//')
+        # Truncate long input
+        [ ${#details} -gt 40 ] && details="${details:0:37}..."
+        details="\"$details\""
+
+      # IDLE — clean prompt
+      elif echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
+        state="IDLE"
+
+      # Shell escaped
+      elif echo "$last_line" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
+        state="SHELL"
+
+      # Default: unknown activity
+      else
+        state="ACTIVE"
+      fi
+    fi
+
+    if [ -n "$details" ]; then
+      printf "%-5s %-22s %-14s %s\n" "$addr" "$role" "$state" "$details"
+    else
+      printf "%-5s %-22s %s\n" "$addr" "$role" "$state"
+    fi
+  done < "$HIVEMIND_REGISTRY"
+}
+hiveMind.team.sweep.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+hiveMind.team.sweep.completion.interval() {
+  echo "15"
+  echo "30"
+  echo "60"
+  echo "120"
+}
+
+hiveMind.team.loop() # <session> <?interval:30> # continuous team.sweep at interval
+{
+  local session="$1"
+  local interval="${2:-30}"
+
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind team.loop <session> <?interval>"
+    return 1
+  fi
+
+  console.log "Team loop: $session every ${interval}s (Ctrl+C to stop)"
+
+  while true; do
+    echo ""
+    echo "── team.sweep @ $(date '+%H:%M:%S') ──────────────────────────────"
+    hiveMind.team.sweep "$session"
+    sleep "$interval"
+  done
+}
+hiveMind.team.loop.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+hiveMind.team.loop.completion.interval() {
+  echo "15"
+  echo "30"
+  echo "60"
 }
 
 hiveMind.monitor() # <?name-or-lines:5> <?session-or-lines> # capture pane output; name=specific agent, number=line count for all panes
@@ -1637,9 +1800,15 @@ private.hiveMind.unblock.pane() {
   esac
 }
 
-hiveMind.sweep() # <?session:cursorOrchestrator> # show last lines of each agent pane
+hiveMind.sweep() # <?session:cursorOrchestrator> <?interval> # show last lines of each agent pane (optional sleep before sweep)
 {
   local session="${1:-cursorOrchestrator}"
+  local interval="$2"
+
+  # Sleep first if interval provided (avoids compound commands that trigger permission prompts)
+  if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+    sleep "$interval"
+  fi
 
   if [ ! -f "$HIVEMIND_REGISTRY" ]; then
     error.log "No role registry found at $HIVEMIND_REGISTRY"
@@ -1658,6 +1827,12 @@ hiveMind.sweep() # <?session:cursorOrchestrator> # show last lines of each agent
 }
 hiveMind.sweep.completion.session() {
   tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+hiveMind.sweep.completion.interval() {
+  echo "15"
+  echo "30"
+  echo "60"
+  echo "120"
 }
 
 hiveMind.sweep.cycle() # <?session> <?interval:0> # run one sweep+unblock cycle with optional sleep
@@ -2094,7 +2269,7 @@ hiveMind.usage()
   MONITORING:
       monitor           capture pane output (by name or all)
       monitor.approve   approve permission prompt in pane
-      sweep             batch-capture all panes, return status table
+      sweep <s> <?sec>  batch-capture all panes (optional sleep before)
       unblock <name>    detect and resolve stuck prompts (or 'all')
       sweep.loop <sec>  continuous sweep + unblock at interval
 
