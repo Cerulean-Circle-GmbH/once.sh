@@ -413,7 +413,7 @@ hiveMind.join() # <name> # rejoin an agent's Claude session by role name
 
   # Try to find session ID from a running Claude process first
   local session_id
-  session_id=$(./claudeCode session.id "$target" 2>/dev/null)
+  session_id=$(claudeCode session.id "$target" 2>/dev/null)
 
   if [ -n "$session_id" ]; then
     # Claude is still running — store the session ID and inform user
@@ -1363,7 +1363,7 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
       bash|zsh)
         # Shell reported — but Claude Code may still be running on this TTY.
         # tmux pane_current_command can misreport idle Claude as 'bash'.
-        if ./claudeCode process.running "${session}:${addr}"; then
+        if claudeCode process.running "${session}:${addr}"; then
           is_claude=true
           detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
           state="${detect_raw%%|*}"
@@ -1386,7 +1386,7 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
     local sid_label=""
     if [ "$is_claude" = "true" ]; then
       local sid
-      sid=$(./claudeCode session.id "${session}:${addr}")
+      sid=$(claudeCode session.id "${session}:${addr}")
       if [ -n "$sid" ]; then
         sid_label="  [${sid:0:8}]"
         [ -n "$role" ] && private.hiveMind.session.store "$role" "$sid"
@@ -2059,25 +2059,79 @@ hiveMind.unblock.completion.name() {
   echo "all"
 }
 
-hiveMind.monitor.cycle() # <?session> # capture, detect, and unblock all panes in one call
+hiveMind.monitor.cycle() # <?session> # full monitoring cycle: context health, velocity, detect blockers, unblock, log
 {
   local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
 
-  # Get all panes
-  local panes
-  panes=$(tmux list-panes -t "${session}:0" -F "#{pane_index}" 2>/dev/null)
-  [ -z "$panes" ] && { error.log "No panes found for $session"; return 1; }
+  # List all panes across all windows (-s = session-wide)
+  local pane_lines
+  pane_lines=$(tmux list-panes -t "$session" -s \
+    -F "#{window_index}.#{pane_index}|#{pane_current_command}" 2>/dev/null)
+  [ -z "$pane_lines" ] && { error.log "No panes found for $session"; return 1; }
 
-  local pane status
-  for pane in $panes; do
-    local result
-    result=$(private.hiveMind.sweep.detect "${session}:0.${pane}")
-    status="${result%%|*}"
-    case "$status" in
-      active|idle|unknown) ;; # skip
-      *) private.hiveMind.unblock.pane "${session}:0.${pane}" "pane-${pane}" ;;
+  local checked=0 blocked=0 low_context=0
+
+  while IFS='|' read -r addr pane_cmd; do
+    local target="${session}:${addr}"
+    local is_claude=false
+
+    case "$pane_cmd" in
+      claude*|[0-9].[0-9]*)
+        is_claude=true ;;
+      bash|zsh)
+        "$OOSH_DIR/claudeCode" process.running "$target" && is_claude=true ;;
     esac
-  done
+
+    [ "$is_claude" = "false" ] && continue
+    checked=$((checked + 1))
+
+    # Step 1: Context health check
+    local pct
+    pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+    [ -z "$pct" ] && pct="unknown"
+
+    # Step 2: Velocity (tokens/hr, time-to-compact)
+    local velocity tokens_hr ttc
+    velocity=$("$OOSH_DIR/claudeCode" context.velocity "$target" 2>/dev/null)
+    tokens_hr=$(echo "$velocity" | grep -oE '^[0-9]+ tokens/hr' || echo "-")
+    ttc=$(echo "$velocity" | grep -oE '~[0-9]+min' || echo "-")
+
+    # Step 3: Alert if context low (<25%)
+    if [ "$pct" != "unknown" ] && [ "$pct" -le 25 ] 2>/dev/null; then
+      low_context=$((low_context + 1))
+      warn.log "$target: ${pct}% context — triggering alert"
+      "$OOSH_DIR/claudeCode" context.alert "$target" 25
+    fi
+
+    # Step 4: Detect blockers and unblock
+    local detect_raw status
+    detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    status="${detect_raw%%|*}"
+    case "$status" in
+      active|idle|unknown) ;; # healthy — skip
+      *) blocked=$((blocked + 1))
+         private.hiveMind.unblock.pane "$target" "${addr}" ;;
+    esac
+
+    # Step 5: Log to burn-log
+    local workspace
+    workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+    if [ -n "$workspace" ]; then
+      local logfile="${workspace}/session/context-burn-log.md"
+      local ts
+      ts=$(date '+%H:%M')
+      if [ ! -f "$logfile" ]; then
+        echo "| Time | Pane | % | State | Velocity | TTC |" > "$logfile"
+        echo "|------|------|---|-------|----------|-----|" >> "$logfile"
+      fi
+      echo "| $ts | $addr | ${pct}% | $status | $tokens_hr | $ttc |" >> "$logfile"
+    fi
+
+  done <<< "$pane_lines"
+
+  info.log "Monitor cycle: $checked checked, $blocked blocked, $low_context low-context"
+  create.result 0 "$checked"
+  return $(result)
 }
 hiveMind.monitor.cycle.completion() { :; }
 
