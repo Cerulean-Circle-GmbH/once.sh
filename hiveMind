@@ -1567,7 +1567,7 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
         activity="${detect_raw%%|*}"
         case "$activity" in
           idle|shell|shell-escaped|unknown) idle_count=$((idle_count + 1)) ;;
-          permission|rate-limit|accept-edits|queued|panel|overlay|autocomplete) blocked_count=$((blocked_count + 1)) ;;
+          permission|rate-limit|subscription-limit|accept-edits|queued|panel|overlay|autocomplete|tool-confirm|mcp-error|api-error|crash) blocked_count=$((blocked_count + 1)) ;;
           *) active_count=$((active_count + 1)) ;;
         esac
       done < "$HIVEMIND_REGISTRY"
@@ -1596,13 +1596,13 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
   while IFS='|' read -r addr pane_cmd; do
     count=$((count + 1))
 
-    local state="" detect_raw=""
+    local state="" detect_raw="" severity="" detail=""
     local is_claude=false
     case "$pane_cmd" in
       claude*|[0-9].[0-9]*)
         is_claude=true
         detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
-        state="${detect_raw%%|*}"
+        IFS='|' read -r state _ severity detail <<< "$detect_raw"
         ;;
       bash|zsh)
         # Shell reported — but Claude Code may still be running on this TTY.
@@ -1610,12 +1610,13 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
         if claudeCode process.running "${session}:${addr}"; then
           is_claude=true
           detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
-          state="${detect_raw%%|*}"
+          IFS='|' read -r state _ severity detail <<< "$detect_raw"
         else
           state="shell"
+          severity="info"
         fi
         ;;
-      *) state="$pane_cmd" ;;
+      *) state="$pane_cmd"; severity="info" ;;
     esac
 
     local prefix="├──"
@@ -1640,7 +1641,14 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
       fi
     fi
 
-    echo "$prefix $addr  $label ($state)${sid_label}"
+    # Add severity marker and detail for non-info states
+    local state_display="$state"
+    case "$severity" in
+      critical) state_display="$state !!" ;;
+      blocker)  [ -n "$detail" ] && state_display="$state — $detail" ;;
+      warning)  [ -n "$detail" ] && state_display="$state — $detail" ;;
+    esac
+    echo "$prefix $addr  $label ($state_display)${sid_label}"
   done <<< "$pane_lines"
 }
 
@@ -1702,7 +1710,7 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
     local content
     content=$(otmux pane.capture "$target" 15 2>/dev/null)
 
-    # Determine state and details
+    # Determine state and details using sweep.detect + verb enrichment
     local state="IDLE"
     local details=""
 
@@ -1715,60 +1723,89 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
       continue
     fi
 
-    # PERMISSION — "Allow"+"Deny" or "Do you want to proceed?"
-    if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
-      state="PERMISSION"
-      details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
-    elif echo "$content" | grep -q 'Do you want to proceed?'; then
-      state="PERMISSION"
+    # Use sweep.detect for structured detection (handles all blocker types)
+    local detect_raw detect_status detect_severity detect_detail
+    detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    IFS='|' read -r detect_status _ detect_severity detect_detail <<< "$detect_raw"
 
-    # CONTEXT_LOW — "Context left until auto-compact: N%" or "N% remaining"
-    elif echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
-      state="CONTEXT_LOW"
-      details=$(echo "$content" | grep -oE '[0-9]+%' | tail -1)
-    elif echo "$content" | grep -qE '[0-9]+% remaining'; then
-      state="CONTEXT_LOW"
-      details=$(echo "$content" | grep -oE '[0-9]+%' | tail -1)
-
-    # ACTIVE — creative verb spinner or "thinking"
-    elif echo "$content" | grep -qiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running'; then
-      state="ACTIVE"
-      details=$(echo "$content" | grep -oiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running' | tail -1)
-      # Try to capture elapsed time if present (e.g. "(14m)")
-      local elapsed
-      elapsed=$(echo "$content" | grep -oE '\([0-9]+[ms]\)' | tail -1)
-      [ -n "$elapsed" ] && details="$details $elapsed"
-
-    # COMPLETED — past-tense verb (Baked, Brewed, Cooked, etc.)
-    elif echo "$content" | grep -qiE 'Baked|Brewed|Cooked|Simmered|Distilled|Woven|Crafted|Composed|Frosted|Incubated|Cascaded'; then
-      state="COMPLETED"
-
-    else
-      # Check last non-empty line for prompt state
-      local last_line
-      last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
-
-      # INPUT — text after prompt
-      if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
+    case "$detect_status" in
+      permission)
+        state="PERMISSION"
+        details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
+        ;;
+      tool-confirm)
+        state="TOOL_CONFIRM"
+        details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
+        ;;
+      rate-limit)
+        state="RATE_LIMIT"
+        [ -n "$detect_detail" ] && details="$detect_detail"
+        ;;
+      subscription-limit)
+        state="SUB_LIMIT !!"
+        ;;
+      accept-edits)
+        state="ACCEPT_EDITS"
+        [ -n "$detect_detail" ] && [ "$detect_detail" != "0" ] && details="${detect_detail} pending"
+        ;;
+      context-warning)
+        state="CONTEXT_LOW"
+        [ -n "$detect_detail" ] && details="$detect_detail"
+        ;;
+      just-compacted)
+        state="COMPACTED"
+        ;;
+      overlay)
+        state="OVERLAY"
+        ;;
+      panel)
+        state="PANEL"
+        ;;
+      autocomplete)
+        state="AUTOCOMPLETE"
+        ;;
+      mcp-error)
+        state="MCP_ERROR"
+        ;;
+      api-error)
+        state="API_ERROR"
+        [ -n "$detect_detail" ] && details="$detect_detail"
+        ;;
+      crash)
+        state="CRASH !!"
+        ;;
+      shell-escaped)
+        state="SHELL"
+        ;;
+      queued)
         state="INPUT"
+        local last_line
+        last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
         details=$(echo "$last_line" | sed -E 's/^[[:space:]]*(>|❯)[[:space:]]+//')
-        # Truncate long input
         [ ${#details} -gt 40 ] && details="${details:0:37}..."
         details="\"$details\""
-
-      # IDLE — clean prompt
-      elif echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
+        ;;
+      idle)
         state="IDLE"
-
-      # Shell escaped
-      elif echo "$last_line" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
-        state="SHELL"
-
-      # Default: unknown activity
-      else
-        state="ACTIVE"
-      fi
-    fi
+        ;;
+      active)
+        # Enrich with verb detection for active agents
+        if echo "$content" | grep -qiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running'; then
+          state="ACTIVE"
+          details=$(echo "$content" | grep -oiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running' | tail -1)
+          local elapsed
+          elapsed=$(echo "$content" | grep -oE '\([0-9]+[ms]\)' | tail -1)
+          [ -n "$elapsed" ] && details="$details $elapsed"
+        elif echo "$content" | grep -qiE 'Baked|Brewed|Cooked|Simmered|Distilled|Woven|Crafted|Composed|Frosted|Incubated|Cascaded'; then
+          state="COMPLETED"
+        else
+          state="ACTIVE"
+        fi
+        ;;
+      *)
+        state="${detect_status:-UNKNOWN}"
+        ;;
+    esac
 
     if [ -n "$details" ]; then
       printf "%-5s %-22s %-14s %s\n" "$addr" "$role" "$state" "$details"
@@ -1904,72 +1941,139 @@ hiveMind.monitor.approve.completion.option() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 private.hiveMind.sweep.detect() {
-  # Enhanced blocker detection — returns status|action
-  # Statuses: active, idle, permission, accept-edits, context-warning, just-compacted,
-  #           queued, rate-limit, autocomplete, shell-escaped, shell, unknown
-  # Actions: none, enter, escape
+  # Enhanced blocker detection — returns status|action|severity[|detail]
+  #
+  # Statuses (18):
+  #   active, idle, permission, accept-edits, context-warning, just-compacted,
+  #   queued, rate-limit, subscription-limit, autocomplete, shell-escaped, shell,
+  #   overlay, panel, mcp-error, api-error, tool-confirm, crash, unknown
+  #
+  # Actions: none, enter, escape, down-enter, wait
+  #
+  # Severity: critical, blocker, warning, info
+  #   critical  — needs immediate human intervention (crash, subscription-limit)
+  #   blocker   — auto-resolvable or needs approval (permission, accept-edits, rate-limit)
+  #   warning   — may need attention soon (context-warning, just-compacted)
+  #   info      — normal operational states (active, idle)
+  #
+  # Detail (optional 4th field): extra context (percentage, count, retry time)
+  #
+  # Backward-compatible: callers using ${result%%|*} for status still work.
+
   local target="$1"
-  [ -z "$target" ] && echo "unknown|none" && return 1
+  [ -z "$target" ] && echo "unknown|none|info" && return 1
 
   local content
-  content=$(tmux capture-pane -t "$target" -p -S -10 2>/dev/null)
+  content=$(tmux capture-pane -t "$target" -p -S -20 2>/dev/null)
 
   local trimmed
   trimmed=$(echo "$content" | tr -d '[:space:]')
-  [ -z "$trimmed" ] && echo "unknown|none" && return 0
+  [ -z "$trimmed" ] && echo "unknown|none|info" && return 0
 
-  # Background tasks overlay — more specific than permission, check first
+  # ── Overlays and panels (dismiss with Escape) ──────────────────────────
+
+  # Background tasks overlay
   if echo "$content" | grep -q 'Background tasks'; then
-    echo "overlay|escape"
+    echo "overlay|escape|blocker"
     return 0
   fi
 
   # Git diff/status panel — needs Escape to close
   if echo "$content" | grep -qE 'files \+[0-9]+ -[0-9]+|Uncommitted changes|git diff|Esc close|PR #[0-9]+'; then
-    echo "panel|escape"
+    echo "panel|escape|blocker"
     return 0
   fi
+
+  # ── Error states (most urgent first) ───────────────────────────────────
+
+  # Crash / exited: Claude Code process terminated unexpectedly
+  if echo "$content" | grep -qiE 'claude.*exited|process.*terminated|segmentation fault|SIGKILL|SIGTERM|core dumped|fatal error'; then
+    echo "crash|none|critical"
+    return 0
+  fi
+
+  # API error: network/server errors from Anthropic API
+  if echo "$content" | grep -qiE 'APIConnectionError|APIStatusError|ECONNREFUSED|ETIMEDOUT|502 Bad Gateway|503 Service|529 Overloaded|internal server error|network error|connection reset'; then
+    local retry_detail
+    retry_detail=$(echo "$content" | grep -oiE 'retry.*(in |after )[0-9]+\s*s(ec)?' | tail -1)
+    echo "api-error|wait|blocker|${retry_detail:-transient}"
+    return 0
+  fi
+
+  # MCP connection error: MCP server connection/reconnect issues
+  if echo "$content" | grep -qiE 'MCP.*error|MCP.*disconnect|MCP.*reconnect|MCP.*timeout|MCP server.*not responding|failed to connect.*MCP'; then
+    echo "mcp-error|wait|warning"
+    return 0
+  fi
+
+  # ── Permission and confirmation prompts ────────────────────────────────
 
   # Permission prompt: "Allow" + "Deny" or "Do you want to proceed?" with Yes/No
   if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
-    echo "permission|enter"
+    echo "permission|down-enter|blocker"
     return 0
   fi
   if echo "$content" | grep -q 'Do you want to proceed?' && echo "$content" | grep -qE '^\s*(❯\s*)?[0-9]+\.\s*(Yes|No)'; then
-    echo "permission|enter"
+    echo "permission|enter|blocker"
     return 0
   fi
 
-  # Rate limit: message about limits
-  if echo "$content" | grep -qiE 'rate.limit|usage.limit|try again.*(in |later)|too many requests'; then
-    echo "rate-limit|enter"
+  # Tool-use confirmation: specific tool approval prompts
+  if echo "$content" | grep -qE 'Run (this |the )?command|Execute.*\?|Create (this |the )?file|Write to|Delete.*\?'; then
+    if echo "$content" | grep -qE '^\s*(❯\s*)?[0-9]+\.\s*(Yes|No|Allow|Deny)'; then
+      echo "tool-confirm|enter|blocker"
+      return 0
+    fi
+  fi
+
+  # ── Rate and subscription limits ───────────────────────────────────────
+
+  # Subscription limit: quota/subscription exhausted (distinct from rate-limit)
+  if echo "$content" | grep -qiE 'subscription.*limit|daily.*limit.*reached|monthly.*limit|quota.*exhausted|billing.*limit|plan.*limit.*exceeded'; then
+    echo "subscription-limit|none|critical"
     return 0
   fi
+
+  # Rate limit: temporary throttling
+  if echo "$content" | grep -qiE 'rate.limit|usage.limit|try again.*(in |later)|too many requests|throttl|request limit|capacity|overloaded.*try'; then
+    local retry_time
+    retry_time=$(echo "$content" | grep -oiE '(in |after )[0-9]+ ?(sec|min|second|minute)s?' | tail -1)
+    echo "rate-limit|wait|blocker|${retry_time:-unknown}"
+    return 0
+  fi
+
+  # ── Edit and acceptance prompts ────────────────────────────────────────
 
   # Accept edits prompt: ⏵⏵ accept edits on · N bash(es)
   if echo "$content" | grep -q '⏵⏵ accept'; then
     local edit_count
     edit_count=$(echo "$content" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
     [ -z "$edit_count" ] && edit_count=0
-    echo "accept-edits|enter|$edit_count"
+    echo "accept-edits|enter|blocker|$edit_count"
     return 0
   fi
 
+  # ── Context and compact states ─────────────────────────────────────────
+
   # Context warning: "Context left until auto-compact: N%"
   if echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
-    echo "context-warning|none"
+    local ctx_pct
+    ctx_pct=$(echo "$content" | grep -oE 'auto-compact: [0-9]+%' | grep -oE '[0-9]+' | tail -1)
+    echo "context-warning|none|warning|${ctx_pct:-unknown}%"
     return 0
   fi
 
   # Just compacted: "Compacted" in recent output
   if echo "$content" | grep -qiE 'Compacted|auto-compact.*completed'; then
-    echo "just-compacted|none"
+    echo "just-compacted|none|warning"
     return 0
   fi
 
+  # ── UI states ──────────────────────────────────────────────────────────
+
   # Autocomplete stuck: completion menu visible (e.g. /compact dropdown)
   if echo "$content" | grep -qE '^\s*/\w+.*─'; then
-    echo "autocomplete|escape"
+    echo "autocomplete|escape|blocker"
     return 0
   fi
 
@@ -1978,41 +2082,39 @@ private.hiveMind.sweep.detect() {
 
   # Shell-escaped: bare $ prompt (agent left Claude Code)
   if echo "$last_line" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
-    echo "shell-escaped|none"
+    echo "shell-escaped|none|critical"
     return 0
   fi
 
   # Idle: clean prompt (just ❯ or > with no text after)
   if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
-    echo "idle|none"
+    echo "idle|none|info"
     return 0
   fi
 
   # Queued: text after prompt not submitted
   if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
-    echo "queued|enter"
+    echo "queued|enter|blocker"
     return 0
   fi
 
   # Active (generating/running tools/indeterminate)
-  echo "active|none"
+  echo "active|none|info"
   return 0
 }
 
 private.hiveMind.unblock.pane() {
   # Detect and resolve blocker on a single pane
+  # Handles new sweep.detect format: status|action|severity[|detail]
   local target="$1"
   local label="$2"
 
   local result
   result=$(private.hiveMind.sweep.detect "$target")
-  local status="${result%%|*}"
-  local action="${result#*|}"
 
-  # Parse result — may have 3 fields: status|action|count
-  local count="${result#*|}"
-  count="${count#*|}"  # Get third field if present
-  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  # Parse fields: status|action|severity|detail
+  local status action severity detail
+  IFS='|' read -r status action severity detail <<< "$result"
 
   case "$status" in
     permission)
@@ -2022,8 +2124,15 @@ private.hiveMind.unblock.pane() {
       "$OOSH_DIR/otmux" send "$target" Enter
       console.log "Unblocked $label ($status) → Down+Enter (option 2)"
       ;;
+    tool-confirm)
+      # Tool confirmation — just accept with Enter
+      "$OOSH_DIR/otmux" send "$target" Enter
+      console.log "Unblocked $label ($status) → Enter"
+      ;;
     accept-edits)
       # Accept pending edits — Enter for each stacked edit + base
+      local count=0
+      [[ "$detail" =~ ^[0-9]+$ ]] && count="$detail"
       local i
       for ((i=0; i<=count; i++)); do
         "$OOSH_DIR/otmux" send "$target" Enter
@@ -2036,17 +2145,49 @@ private.hiveMind.unblock.pane() {
       "$OOSH_DIR/otmux" send "$target" Escape
       console.log "Unblocked $label ($status) → Escape"
       ;;
+    autocomplete)
+      # Dismiss stuck autocomplete menu
+      "$OOSH_DIR/otmux" send "$target" Escape
+      console.log "Unblocked $label ($status) → Escape"
+      ;;
+    queued)
+      # Submit queued text
+      "$OOSH_DIR/otmux" send "$target" Enter
+      console.log "Unblocked $label ($status) → Enter"
+      ;;
+    rate-limit|api-error)
+      # Transient — just wait, auto-recovers
+      console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
+      ;;
+    subscription-limit|crash|shell-escaped)
+      # Critical — cannot auto-resolve, log warning
+      warn.log "CRITICAL $label ($status) — needs human intervention"
+      ;;
+    mcp-error)
+      # MCP errors often self-recover
+      console.log "Waiting $label ($status) — MCP reconnecting"
+      ;;
     *)
+      # Fallback: use action field
       case "$action" in
         enter)
           "$OOSH_DIR/otmux" send "$target" Enter
           console.log "Unblocked $label ($status) → Enter"
+          ;;
+        down-enter)
+          "$OOSH_DIR/otmux" send "$target" Down
+          sleep 0.3
+          "$OOSH_DIR/otmux" send "$target" Enter
+          console.log "Unblocked $label ($status) → Down+Enter"
           ;;
         escape)
           "$OOSH_DIR/otmux" send "$target" Escape
           sleep 0.1
           "$OOSH_DIR/otmux" send "$target" Enter
           console.log "Unblocked $label ($status) → Escape+Enter"
+          ;;
+        wait)
+          console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
           ;;
         none) ;;
       esac
