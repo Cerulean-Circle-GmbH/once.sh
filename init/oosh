@@ -4,6 +4,7 @@
 export PS4='sh debug> '
 if [ -z "$SH_OPT" ]; then export SH_OPT="-x"; echo "SH_OPT set to: $SH_OPT"; fi
 
+
 # find all set -x
 #  '^ *[^#] *set -x'
 set $SH_OPT
@@ -12,9 +13,32 @@ set $SH_OPT
 #unset SHELL
 oosh_get_running_shell() 
 {
-  #SHELLNAME="$(ps -o pid,args | grep "\w*$$ [^g]*sh" | awk '{$1=$1};1' | cut -d\  -f2 | sed s/-//)"
-  SHELLPS="$(ps -o pid,args | grep "\w*$$ [^g]*/sh")"
-  SHELL=$(which "$SHELLNAME")
+  if [ -n "$BASH_VERSION" ]; then
+     SHELLNAME="bash"
+     if [ -n "$BASH" ]; then
+       SHELL="$BASH"
+     else
+       SHELL="$(which bash)"
+     fi
+     return
+  fi
+
+  # Fallback for sh/dash/etc
+  SHELLPS="$(ps -o pid,args | grep "\w*$$ [^g]*/sh" 2>/dev/null)"
+  if [ -n "$SHELLPS" ]; then
+      # Try to extract shell path/name. This is brittle.
+      local shell_path=$(echo "$SHELLPS" | awk '{print $2}')
+      if [ -n "$shell_path" ]; then
+          SHELLNAME=$(basename "$shell_path")
+          SHELL="$shell_path"
+      fi
+  fi
+  
+  # Last resort
+  if [ -z "$SHELLNAME" ]; then
+      SHELLNAME="sh" # Assume sh if we started with shebang
+      SHELL="$(which sh)"
+  fi
 }
 
 log()
@@ -131,10 +155,12 @@ oosh_install_oosh()
   oosh_cmd git
   oosh_cmd rsync
   cd ~
-  #if [ -z "$OOSH_DIR" ]; then
+  # Ensure OOSH_DIR is always an absolute path
+  if [ "$(uname -s)" = "Linux" ]; then
+    OOSH_DIR="$(readlink -f "./oosh")"
+  else
     OOSH_DIR="$(pwd)/oosh"
-  #fi
-
+  fi
 
   if ! [ -d "$OOSH_DIR" ]; then
     #set -x # force debug
@@ -172,6 +198,11 @@ oosh_install_oosh()
 
 oosh_status()
 {
+  # Ensure LOG_LEVEL has a default value to avoid [ -gt ] errors
+  if [ -z "$LOG_LEVEL" ]; then
+    LOG_LEVEL=3
+  fi
+
   echo "
   SHELL: $SHELL
        : $SHELLNAME
@@ -196,6 +227,52 @@ oosh_status()
     SUDO=""
   else
     SUDO="sudo -S"
+  fi
+}
+
+# New function for remote installation orchestration
+oosh_install_remote() {
+  local install_mode="$1"
+  local ssh_config_name_used_for_local="$2" # This corresponds to $configName from client
+  local ssh_config_from_remote="${3:-}"    # This corresponds to $OOSH_SSH_CONFIG_HOST from client
+
+  echo "Remote installation initiated with mode: $install_mode"
+
+  oosh_install_oosh # Always clone/update the oosh repository first
+  
+  # Ensure OOSH_DIR is in PATH so short source names work
+  PATH="$OOSH_DIR:$PATH"
+
+  # Now that the repo is cloned, source dependencies (short names, OOSH_DIR is in PATH)
+  source debug
+  source user
+  source ossh
+  source os
+  source oo
+
+
+  if [ "$install_mode" = "root" ]; then
+    echo "Installing for root..."
+    user.root.install
+    "$BASH_FILE" -xc "$OOSH_DIR/this call ossh install.continue.local $ssh_config_name_used_for_local $ssh_config_from_remote"
+    echo "Done with ROOT installation."
+    return 0
+  elif [ "$install_mode" = "user" ]; then
+    echo "Installing for user ($USER)..."
+    "$BASH_FILE" -xc "$OOSH_DIR/this call ossh install.continue.local $ssh_config_name_used_for_local $ssh_config_from_remote"
+    echo "Done with USER installation."
+    return 0
+  elif [ "$install_mode" = "both" ]; then
+    echo "Installing for both root and user ($USER)..."
+    echo "Installing for root..."
+    user.root.install
+    echo "Installing for user ($USER)..."
+    "$BASH_FILE" -xc "$OOSH_DIR/this call ossh install.continue.local $ssh_config_name_used_for_local $ssh_config_from_remote"
+    echo "Done with BOTH installation."
+    return 0
+  else
+    error.log "Unknown INSTALL_MODE: $install_mode"
+    return 1
   fi
 }
 
@@ -231,35 +308,68 @@ oosh_parse_shellps()
 
 oosh_start() 
 {
+  oosh_get_running_shell
+  
+  # Only try to parse ps if we haven't already identified the shell as bash
+  # oosh_parse_shellps can clobber SHELL if SHELLPS is empty
+  if [ "$SHELLNAME" != "bash" ]; then
+      oosh_parse_shellps $SHELLPS
+      if [ -n "$SHELL" ]; then
+        SHELLNAME=$(basename $SHELL)
+      fi
+  fi
+
+  BASH_FILE=$(which bash)
+  
+  if [ "$SHELLNAME" != "bash" ]; then
+    echo "Current shell ($SHELLNAME) is not bash. Ensuring bash is installed..."
+    oosh_check_all_pm
+    if [ -z "$BASH_FILE" ]; then
+      oosh_cmd bash
+      BASH_FILE=$(which bash)
+    fi
+    if [ -n "$BASH_FILE" ]; then
+      echo "Re-executing with $BASH_FILE..."
+      exec "$BASH_FILE" "$0" "$@"
+    else
+      echo "ERROR: bash not found and could not be installed."
+      return 1
+    fi
+  fi
+
+  # Now we are guaranteed to be in bash
   if [ -n "$1" ]; then
     echo "got parameters: $@"
     while [ -n "$1" ]; do
       case $1 in
         mode)
           echo "got: $*"
-          shift
-          INSTALL_MODE="$1"
-          shift
-          echo "having: $*"
+          # Assign based on fixed positions after 'mode'
+          # Command: ./oosh mode <install_mode> <name_local> <config_remote>
+          install_remote_mode="$2"
+          install_remote_name_local="$3"
+          install_remote_config_remote="$4"
           
-          if [ -n "$1" ]; then
-            echo "name used by remote for this ssh connection: $1"
-            export SSH_CONFIG_NAME_USED_FOR_LOCAL="$1"
-            shift
-          fi
+          oosh_install_remote "$install_remote_mode" "$install_remote_name_local" "$install_remote_config_remote"
+          return $?
+        ;;
+        localInstall)
+          oosh_check_all_pm
+          oosh_status
+          oosh_install_oosh
+          oo state
+          user get home # HACK needed to get the package manager right for the first time
+          important.log "
           
-          if [ -n "$1" ]; then
-            echo "name of the remote ssh connection: $1"
-            export SSH_CONFIG_FROM_REMOTE="$1"
-            shift
-          fi
+          still during oosh installation
 
-          if [ "$1" = "dev" ]; then
-            echo "dev mode: $1"
-            export DEV_MODE="$1"
-            shift
-          fi
-          break
+          continue with:
+
+            state
+            state next
+
+          "
+          return 0
         ;;
         *)
           echo "this.call to: $*"
@@ -281,10 +391,6 @@ oosh_start()
   # for testing: Docker install from OOSH_INSTALL_SOURCE
   # export OOSH_INSTALL_SOURCE=/opt/once.sh
 
-  oosh_get_running_shell
-  oosh_parse_shellps $SHELLPS
-  SHELLNAME=$(basename $SHELL)
-  BASH_FILE=$(which bash)
   if [ -n "$BASH_FILE" ]; then
     echo BASH_MAJOR_VERSION=$("$BASH_FILE" -c "echo \"\${BASH_VERSINFO[0]}\"")
     BASH_MAJOR_VERSION=$("$BASH_FILE" -c "echo \"\${BASH_VERSINFO[0]}\"")
@@ -295,40 +401,7 @@ oosh_start()
   oosh_status
   oosh_install_oosh
 
-  #set
-
-  if [ "$INSTALL_MODE" = "ssh" ]; then
-    echo done with SSH installation....
-    echo try to continue local....
-    "$BASH_FILE" -xc "$OOSH_DIR/this call ossh install.continue.local $SSH_CONFIG_FROM_REMOTE $SSH_CONFIG_NAME_USED_FOR_LOCAL $DEV_MODE"
-    echo done with ssh installation....
-    echo Bye
-    return 0
-  fi
-
-  if [ "$INSTALL_MODE" = "user" ]; then
-    echo done with USER installation....
-    echo try to continue local as root....
-    "$BASH_FILE" -xc "$OOSH_DIR/this call ossh install.continue.local $SSH_CONFIG_FROM_REMOTE $SSH_CONFIG_NAME_USED_FOR_LOCAL $DEV_MODE"
-    echo done with user installation....
-    echo Bye
-    return 0
-  fi
-
-  if [ "$SHELLNAME" = "bash" ]; then
-    echo "BASH Version: $BASH_VERSION[@]"
-  else
-    echo "not in bash ($SHELLNAME): bash is in $BASH_FILE"
-    if [ -n "$BASH_FILE" ]; then
-      echo "starting bash $SH_OPT $OOSH_DIR/this localInstall"
-      "$BASH_FILE" "$SH_OPT" "$OOSH_DIR"/this localInstall
-    else
-      oosh_cmd bash
-      export BASH_FILE=$(which bash)
-      echo "starting bash $SH_OPT $OOSH_DIR/this localInstall"
-      "$BASH_FILE" "$SH_OPT" "$OOSH_DIR"/this localInstall
-    fi
-  fi
+  echo "BASH Version: $BASH_VERSION[@]"
 }
 
 oosh_start "$@"
