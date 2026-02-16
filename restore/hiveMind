@@ -26,13 +26,9 @@
 # env per pane  : HIVEMIND_ROLE=<role>  exported before Claude Code starts
 # role registry : ~/config/hivemind.roles.env  maps pane targets → role names
 #                 format: target|role  (persistent, survives reboot)
-# session store : ~/config/hivemind.sessions.env  maps role → Claude session UUID
-#                 format: role|session-uuid  (allows session rejoin)
 : ${HIVEMIND_WINDOW_NAME:=team}
 : ${HIVEMIND_REGISTRY:=${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}
 : ${HIVEMIND_SESSIONS:=${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}
-: ${HIVEMIND_TEAMS:=${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}
-: ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 
 # Default agent roles
 HIVEMIND_DEFAULT_AGENTS=(
@@ -49,8 +45,8 @@ HIVEMIND_OOSH_AGENTS=(
 )
 
 # Canonical location for agent role definitions
-# Resolved at runtime by private.hiveMind.find.agents.dir (searches upward from OOSH_DIR)
-# Override via env or config: HIVEMIND_AGENTS_DIR=/path/to/.claude/agents
+# Derives from OOSH_DIR (set by 'source this') → workspace root is 3 levels up
+HIVEMIND_AGENTS_DIR="${HIVEMIND_AGENTS_DIR:-${OOSH_DIR:+${OOSH_DIR}/../../../.claude/agents}}"
 
 # Agent role descriptions (used for system prompts)
 # Bash 3.2 compatible — uses function lookup instead of declare -A
@@ -69,6 +65,8 @@ private.hiveMind.get.role.prompt() {
     developer)           echo "You are a Developer agent. Read .claude/agents/developer/SKILL.md to learn your role. Implement assigned work following OOSH patterns." ;;
     agent-trainer)       echo "You are the Agent Trainer. Read .claude/agents/agent-trainer/SKILL.md to learn your role. Improve all agent SKILL.md files based on team learnings. You do NOT implement features or run tests." ;;
     task-agent)          echo "You are a Task Agent. Read .claude/agents/task-agent/SKILL.md to learn your role. Execute assigned tasks autonomously within your designated scope." ;;
+    woda-writer)         echo "You are the WODA Writer. Read .claude/agents/woda-writer/SKILL.md to learn your role. Write chapters, maintain learnings, and monitor your scribe peer." ;;
+    woda-scribe)         echo "You are the WODA Scribe. Read .claude/agents/woda-scribe/SKILL.md to learn your role. Monitor the writer, maintain the knowledge base, implement improvements, and track context health." ;;
     *)                   return 1 ;;
   esac
 }
@@ -76,33 +74,6 @@ private.hiveMind.get.role.prompt() {
 # ─────────────────────────────────────────────────────────────────────────────
 # PRIVATE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-private.hiveMind.find.agents.dir() {
-  # Search upward from multiple starting points for .claude/agents with SKILL.md files
-  # Tries: CWD, OOSH_DIR (resolved), symlink source — handles cross-repo layouts
-  local search_dirs=()
-  [ -n "$PWD" ] && search_dirs+=("$PWD")
-  local resolved
-  resolved=$(realpath "${OOSH_DIR:-.}" 2>/dev/null)
-  [ -n "$resolved" ] && search_dirs+=("$resolved")
-  [ -n "$OOSH_DIR" ] && [ "$OOSH_DIR" != "$resolved" ] && search_dirs+=("$OOSH_DIR")
-
-  local start_dir
-  for start_dir in "${search_dirs[@]}"; do
-    local dir="$start_dir"
-    while [ "$dir" != "/" ]; do
-      if [ -d "$dir/.claude/agents" ]; then
-        local has_skills=false
-        for f in "$dir/.claude/agents"/*/SKILL.md; do
-          [ -f "$f" ] && has_skills=true && break
-        done
-        [ "$has_skills" = "true" ] && echo "$dir/.claude/agents" && return 0
-      fi
-      dir=$(dirname "$dir")
-    done
-  done
-  return 1
-}
 
 private.hiveMind.pane.identify() {
   # Register role for a pane: write to registry, set pane title, export env var
@@ -121,7 +92,7 @@ private.hiveMind.pane.identify() {
 # Location: ~/config/hivemind.roles.env (persistent, OOSH config pattern)
 
 private.hiveMind.registry.migrate() {
-  # Migrate old /tmp/ registry to ~/config/ pattern (one-time, backward compat)
+  # Migrate old /tmp/ registry to config pattern (one-time, backward compat)
   local old_registry="/tmp/hivemind.roles"
   [ -f "$old_registry" ] || return 0
   [ "$HIVEMIND_REGISTRY" = "$old_registry" ] && return 0
@@ -131,20 +102,6 @@ private.hiveMind.registry.migrate() {
     mkdir -p "$config_dir" 2>/dev/null
     cp "$old_registry" "$HIVEMIND_REGISTRY"
     info.log "Migrated registry from $old_registry to $HIVEMIND_REGISTRY"
-  fi
-}
-
-private.hiveMind.sessions.migrate() {
-  # Migrate old /tmp/ sessions to ~/config/ pattern (one-time, backward compat)
-  local old_sessions="/tmp/hivemind.sessions"
-  [ -f "$old_sessions" ] || return 0
-  [ "$HIVEMIND_SESSIONS" = "$old_sessions" ] && return 0
-  if [ ! -f "$HIVEMIND_SESSIONS" ] || [ ! -s "$HIVEMIND_SESSIONS" ]; then
-    local config_dir
-    config_dir=$(dirname "$HIVEMIND_SESSIONS")
-    mkdir -p "$config_dir" 2>/dev/null
-    cp "$old_sessions" "$HIVEMIND_SESSIONS"
-    info.log "Migrated sessions from $old_sessions to $HIVEMIND_SESSIONS"
   fi
 }
 
@@ -209,11 +166,6 @@ private.hiveMind.session.store() {
   local role="$1"
   local session_id="$2"
   [ -z "$role" ] || [ -z "$session_id" ] && return 1
-  private.hiveMind.sessions.migrate
-  # Ensure config directory exists
-  local config_dir
-  config_dir=$(dirname "$HIVEMIND_SESSIONS")
-  mkdir -p "$config_dir" 2>/dev/null
   # Remove old entry for this role, then append new one
   if [ -f "$HIVEMIND_SESSIONS" ]; then
     grep -v "^${role}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
@@ -225,49 +177,8 @@ private.hiveMind.session.store() {
 private.hiveMind.session.lookup() {
   # Look up stored session UUID for a given role
   local role="$1"
-  private.hiveMind.sessions.migrate
   [ -f "$HIVEMIND_SESSIONS" ] || return 1
   grep "^${role}|" "$HIVEMIND_SESSIONS" 2>/dev/null | tail -1 | cut -d'|' -f2
-}
-
-# ── Active Team ───────────────────────────────────────────────────────────────
-# Single source of truth for which team session is "current".
-# Replaces all hardcoded cursorOrchestrator defaults.
-
-private.hiveMind.active.team() {
-  # Return the active team name. Falls back to first registered team, then cursorOrchestrator.
-  if [ -f "$HIVEMIND_ACTIVE_TEAM_FILE" ] && [ -s "$HIVEMIND_ACTIVE_TEAM_FILE" ]; then
-    cat "$HIVEMIND_ACTIVE_TEAM_FILE"
-    return 0
-  fi
-  # Fall back to first registered team from teams file
-  if [ -f "$HIVEMIND_TEAMS" ] && [ -s "$HIVEMIND_TEAMS" ]; then
-    head -1 "$HIVEMIND_TEAMS" | cut -d'|' -f1
-    return 0
-  fi
-  # Fall back to first team found in roles registry
-  if [ -f "$HIVEMIND_REGISTRY" ] && [ -s "$HIVEMIND_REGISTRY" ]; then
-    head -1 "$HIVEMIND_REGISTRY" | cut -d':' -f1
-    return 0
-  fi
-  # Ultimate fallback
-  echo "cursorOrchestrator"
-}
-
-# ── Team Registry ────────────────────────────────────────────────────────────
-# File-based list of known team sessions with descriptions.
-# Format: session_name|description  (one per line)
-# Location: ~/config/hivemind.teams.env
-
-private.hiveMind.teams.ensure.dir() {
-  local config_dir
-  config_dir=$(dirname "$HIVEMIND_TEAMS")
-  mkdir -p "$config_dir" 2>/dev/null
-}
-
-private.hiveMind.teams.complete() {
-  # Shared completion helper: registered teams + running tmux sessions, deduplicated
-  { [ -f "$HIVEMIND_TEAMS" ] && cut -d'|' -f1 "$HIVEMIND_TEAMS" 2>/dev/null; tmux list-sessions -F "#{session_name}" 2>/dev/null; } | sort -u
 }
 
 private.hiveMind.resolve.alias() {
@@ -280,9 +191,9 @@ private.hiveMind.resolve.alias() {
 }
 
 # Session ID detection delegated to claudeCode wrapper (DRY).
-# Use: ./claudeCode process.find <pane>    — get Claude PID
-#      ./claudeCode process.running <pane> — boolean check
-#      ./claudeCode session.id <pane>      — get session UUID
+# Use: claudeCode process.find <pane>    — get Claude PID
+#      claudeCode process.running <pane> — boolean check
+#      claudeCode session.id <pane>      — get session UUID
 
 private.hiveMind.pane.activity() {
   # Detect real Claude Code activity state from pane content.
@@ -356,7 +267,7 @@ private.hiveMind.create.agent.pane() {
   private.hiveMind.pane.identify "$pane_id" "$agent_id"
 
   # Start Claude Code in the pane with agent role
-  otmux send "$pane_id" "cd '$workdir' && claude --dangerously-skip-permissions" Enter
+  otmux send "$pane_id" "cd '$workdir' && claude" Enter
 
   echo "$pane_id"
 }
@@ -480,7 +391,7 @@ hiveMind.pane.create() # <agentId> <?workdir:.> # create tmux pane with Claude C
     # Start Claude Code with role context
     otmux send "$pane_id" "cd '$workdir'" Enter
     otmux send "$pane_id" "echo '=== $agent_id Agent (port: $port) ==='" Enter
-    otmux send "$pane_id" "claude --dangerously-skip-permissions -p '$system_prompt'" Enter
+    otmux send "$pane_id" "claude -p '$system_prompt'" Enter
 
     success.log "Created pane for $agent_id"
   else
@@ -625,7 +536,7 @@ hiveMind.list() # # list all agents
     private.hiveMind.get.agents
   else
     # Fall back to tmux pane titles when agentRoom is unavailable
-    local session="${HIVEMIND_SESSION:-$(private.hiveMind.active.team)}"
+    local session="${HIVEMIND_SESSION:-cursorOrchestrator}"
     if tmux has-session -t "$session" 2>/dev/null; then
       tmux list-panes -t "$session" -F "#{pane_title}" 2>/dev/null
     else
@@ -639,7 +550,7 @@ hiveMind.workers() # # list worker agents (non-orchestrator panes)
   if command -v agentRoom &>/dev/null && agentRoom backend.status &>/dev/null 2>&1; then
     agentRoom list.ids 2>/dev/null | grep -v "queen"
   else
-    local session="${HIVEMIND_SESSION:-$(private.hiveMind.active.team)}"
+    local session="${HIVEMIND_SESSION:-cursorOrchestrator}"
     tmux list-panes -t "$session" -F "#{pane_title}" 2>/dev/null | grep -v -E "^(orchestrator|queen)$"
   fi
 }
@@ -655,7 +566,7 @@ hiveMind.queen() # # show queen (orchestrator) agent ID
 
 hiveMind.status() # <?session> # show one-line hivemind overview
 {
-  local session="${1:-$(private.hiveMind.active.team)}"
+  local session="${1:-cursorOrchestrator}"
 
   if tmux has-session -t "$session" 2>/dev/null; then
     local pane_count
@@ -670,7 +581,7 @@ hiveMind.status() # <?session> # show one-line hivemind overview
   fi
 }
 hiveMind.status.completion.session() {
-  private.hiveMind.teams.complete
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.focus() # <agentId> # focus on specific agent pane
@@ -700,7 +611,7 @@ hiveMind.focus.completion.agentId() {
 hiveMind.resolve() # <name> <?session> # resolve agent name to pane target via role registry
 {
   local name="$1"
-  local session="${2:-$(private.hiveMind.active.team)}"
+  local session="${2:-cursorOrchestrator}"
 
   if [ -z "$name" ]; then
     error.log "Usage: hiveMind resolve <name>"
@@ -729,12 +640,8 @@ hiveMind.resolve() # <name> <?session> # resolve agent name to pane target via r
 }
 
 hiveMind.resolve.completion.name() {
-  local session
-  session=$(private.hiveMind.active.team)
+  local session="cursorOrchestrator"
   [ -f "$HIVEMIND_REGISTRY" ] && grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2
-}
-hiveMind.resolve.completion.session() {
-  private.hiveMind.teams.complete
 }
 
 hiveMind.send() # <name> <text...> # send literal text to agent by name (no Enter appended)
@@ -961,9 +868,9 @@ hiveMind.claude() # <agentId> <?prompt> # interact with agent via Claude Code
 # OOSH SPECIALIST AGENTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-hiveMind.oosh.init() # <?session> # initialize OOSH expert and tester agents in existing session
+hiveMind.oosh.init() # <?session:cursorOrchestrator> # initialize OOSH expert and tester agents in existing session
 {
-  local session="${1:-$(private.hiveMind.active.team)}"
+  local session="${1:-cursorOrchestrator}"
   
   info.log "Initializing OOSH specialist agents in session: $session"
   
@@ -986,9 +893,9 @@ hiveMind.oosh.init() # <?session> # initialize OOSH expert and tester agents in 
   echo "  hiveMind.task <agentId> <task>  # Assign task to agent"
 }
 
-hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-orchestrator, expert, and tester agents
+hiveMind.team.setup.oosh() # <?session:cursorOrchestrator> # create 3-pane tmux session with oosh-orchestrator, expert, and tester agents
 {
-  local session="${1:-$(private.hiveMind.active.team)}"
+  local session="${1:-cursorOrchestrator}"
 
   info.log "Setting up OOSH team in session: $session"
 
@@ -1020,6 +927,10 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   # Split pane 1 horizontally → pane 1 (lower-left) + pane 2 (lower-right)
   otmux split.h -t "${session}:0.1"
 
+  # Enable pane border labels (agent names on top border, bold if active)
+  tmux set -g pane-border-status top
+  tmux set -g pane-border-format " #{?pane_active,#[bold],}#T#[default] "
+
   # Set pane titles and export role env vars
   private.hiveMind.pane.identify "${session}:0.0" "oosh-orchestrator"
   private.hiveMind.pane.identify "${session}:0.1" "oosh-expert"
@@ -1028,11 +939,11 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   # ── Start Claude Code in each pane ─────────────────────────────────────
   info.log "Starting Claude Code in all panes..."
 
-  otmux send.enter "${session}:0.0" "claude --dangerously-skip-permissions"
+  otmux send.enter "${session}:0.0" "claude"
   sleep 2
-  otmux send.enter "${session}:0.1" "claude --dangerously-skip-permissions"
+  otmux send.enter "${session}:0.1" "claude"
   sleep 2
-  otmux send.enter "${session}:0.2" "claude --dangerously-skip-permissions"
+  otmux send.enter "${session}:0.2" "claude"
 
   # Wait for Claude Code to initialize
   info.log "Waiting for Claude Code agents to initialize..."
@@ -1062,7 +973,9 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
 }
 
 hiveMind.team.setup.oosh.completion.session() {
-  private.hiveMind.teams.complete
+  echo "cursorOrchestrator"
+  echo "ooshTeam"
+  echo "hivemind"
 }
 
 hiveMind.teach() # <pane> <role> # teach an agent its specialized role via SKILL.md
@@ -1106,45 +1019,31 @@ hiveMind.teach.completion.role() {
   hiveMind.role.list 2>/dev/null || echo "oosh-expert"
 }
 
-hiveMind.roles() # [filter] # list available agent roles with descriptions (from SKILL.md)
+hiveMind.roles() # # list available agent roles with descriptions
 {
-  local filter="$1"
-  local count=0
-
-  if [ ! -d "$HIVEMIND_AGENTS_DIR" ]; then
-    error.log "Agents directory not found: $HIVEMIND_AGENTS_DIR"
-    return 1
-  fi
-
-  echo "Available HiveMind Roles:"
-  echo "─────────────────────────"
-
-  for role_dir in "$HIVEMIND_AGENTS_DIR"/*/; do
-    [ -d "$role_dir" ] || continue
-    local role_name=$(basename "$role_dir")
-    local skill_file="$role_dir/SKILL.md"
-    [ -f "$skill_file" ] || continue
-
-    # Apply filter if given
-    if [ -n "$filter" ] && [[ "$role_name" != *"$filter"* ]]; then
-      continue
-    fi
-
-    # Extract description from SKILL.md YAML frontmatter
-    local desc=""
-    desc=$(grep '^description:' "$skill_file" | head -1 | sed 's/^description: *//; s/^"//; s/"$//')
-
-    # Truncate long descriptions
-    if [ ${#desc} -gt 60 ]; then
-      desc="${desc:0:57}..."
-    fi
-
-    printf "  %-25s %s\n" "$role_name" "— $desc"
-    count=$((count + 1))
-  done
-
-  echo "─────────────────────────"
-  echo "$count roles found"
+  echo "╔════════════════════════════════════════════════════════════╗"
+  echo "║              Available HiveMind Roles                      ║"
+  echo "╠════════════════════════════════════════════════════════════╣"
+  echo "║ Team Roles:                                                ║"
+  echo "║   orchestrator        - Train agents, delegate, improve     ║"
+  echo "║   scrum-master        - Monitor, approve, enforce roles    ║"
+  echo "║   product-owner       - First principles & governance       ║"
+  echo "╠════════════════════════════════════════════════════════════╣"
+  echo "║ OOSH Specialists (expert+tester own scripts):              ║"
+  echo "║   oosh-expert         - Framework architecture & dev       ║"
+  echo "║   oosh-tester         - Testing & quality assurance        ║"
+  echo "╠════════════════════════════════════════════════════════════╣"
+  echo "║ References:                                                ║"
+  echo "║   script-product-owner - Ownership contract (not a role)  ║"
+  echo "║   developer            - Implementation capacity           ║"
+  echo "║   task-agent           - Autonomous task execution         ║"
+  echo "╠════════════════════════════════════════════════════════════╣"
+  echo "║ General Roles:                                             ║"
+  echo "║   orchestrator - Coordinates tasks between agents          ║"
+  echo "║   coder        - Implements features and writes code       ║"
+  echo "║   tester       - Writes and runs tests                     ║"
+  echo "║   reviewer     - Reviews code for quality                  ║"
+  echo "╚════════════════════════════════════════════════════════════╝"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1208,10 +1107,10 @@ hiveMind.role.teach.completion.role() {
 # AGENT LIFECYCLE
 # ─────────────────────────────────────────────────────────────────────────────
 
-hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create pane, start bash, launch claude, teach role
+hiveMind.agent.bootstrap() # <role> <?session:cursorOrchestrator> <?pane> # full bootstrap: create pane, start bash, launch claude, teach role
 {
   local role="$1"
-  local session="${2:-$(private.hiveMind.active.team)}"
+  local session="${2:-cursorOrchestrator}"
   local target_pane="$3"
 
   if [ -z "$role" ]; then
@@ -1252,7 +1151,7 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
 
   # Step 3: Start Claude Code
   info.log "Starting Claude Code in pane $target_pane..."
-  otmux send.enter "$target_pane" "claude --dangerously-skip-permissions"
+  otmux send.enter "$target_pane" "claude"
 
   # Step 4: Wait for startup
   info.log "Waiting for Claude Code to initialize..."
@@ -1275,7 +1174,7 @@ hiveMind.agent.bootstrap.completion.role() {
 }
 
 hiveMind.agent.bootstrap.completion.session() {
-  private.hiveMind.teams.complete
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.agent.verify() # <pane> # check if agent is alive and processing
@@ -1326,9 +1225,9 @@ hiveMind.agent.verify() # <pane> # check if agent is alive and processing
 # TEAM SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 
-hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + Expert + Tester + ScrumMaster
+hiveMind.team.setup.full() # <?session:cursorOrchestrator> # bootstrap full team: Agent Teacher + Expert + Tester + ScrumMaster
 {
-  local session="${1:-$(private.hiveMind.active.team)}"
+  local session="${1:-cursorOrchestrator}"
 
   info.log "Setting up full OOSH team in session: $session"
 
@@ -1365,6 +1264,10 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   # Split pane 0 vertically again → add pane 3 below for ScrumMaster
   otmux split.v -t "${session}:0.0"
 
+  # Enable pane border labels (agent names on top border, bold if active)
+  tmux set -g pane-border-status top
+  tmux set -g pane-border-format " #{?pane_active,#[bold],}#T#[default] "
+
   # Set pane titles and export role env vars
   private.hiveMind.pane.identify "${session}:0.0" "orchestrator"
   private.hiveMind.pane.identify "${session}:0.1" "scrum-master"
@@ -1374,13 +1277,13 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   # ── Start Claude Code in each pane ─────────────────────────────────────
   info.log "Starting Claude Code in all panes..."
 
-  otmux send.enter "${session}:0.0" "claude --dangerously-skip-permissions"
+  otmux send.enter "${session}:0.0" "claude"
   sleep 2
-  otmux send.enter "${session}:0.1" "claude --dangerously-skip-permissions"
+  otmux send.enter "${session}:0.1" "claude"
   sleep 2
-  otmux send.enter "${session}:0.2" "claude --dangerously-skip-permissions"
+  otmux send.enter "${session}:0.2" "claude"
   sleep 2
-  otmux send.enter "${session}:0.3" "claude --dangerously-skip-permissions"
+  otmux send.enter "${session}:0.3" "claude"
 
   # Wait for Claude Code to initialize
   info.log "Waiting for Claude Code agents to initialize..."
@@ -1414,154 +1317,95 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
 }
 
 hiveMind.team.setup.full.completion.session() {
-  private.hiveMind.teams.complete
+  echo "cursorOrchestrator"
+  echo "ooshTeam"
+  echo "hivemind"
 }
 
-hiveMind.team.register() # <session> <?description> # register a team session in the team registry
+hiveMind.team.sonnet1() # <?session:sonnet1m> # start a tmux session with Sonnet 4.5 1M context and correct colors
+{
+  local base="${1:-sonnet1m}"
+  local workdir="/Users/Shared/Workspaces/AI/Claude"
+
+  # Find next available session name: base.1, base.2, etc.
+  local session="${base}.1"
+  local n=1
+  while tmux has-session -t "$session" 2>/dev/null; do
+    n=$((n + 1))
+    session="${base}.${n}"
+  done
+
+  info.log "Creating Sonnet 1M session: $session"
+
+  # Create detached tmux session in the workspace directory
+  tmux new-session -d -s "$session" -c "$workdir"
+  tmux rename-window -t "${session}:0" "$HIVEMIND_WINDOW_NAME"
+
+  # Start Claude Code with sonnet[1m] model and 256-color mode for Apple Terminal
+  # Use CLAUDE_CMD directly to avoid bracket interpretation issues through tmux
+  otmux send.enter "${session}:0.0" "FORCE_COLOR=2 \$HOME/.local/bin/claude --model 'sonnet[1m]'"
+
+  # Wait for Claude Code to initialize
+  info.log "Waiting for Claude Code to initialize..."
+  sleep 8
+
+  # Open a macOS Terminal window attached to the session
+  osascript -e "tell application \"Terminal\" to do script \"tmux attach -t $session\""
+
+  success.log "Sonnet 1M session created: $session"
+  echo ""
+  echo "Model:     sonnet[1m] (claude-sonnet-4-5-20250929[1m])"
+  echo "Context:   1M tokens"
+  echo "Colors:    256-color (FORCE_COLOR=2)"
+  echo "Workspace: $workdir"
+  echo ""
+  echo "Detach with: Ctrl-b d"
+  echo "Reattach:    tmux attach -t $session"
+}
+
+hiveMind.team.sonnet1.completion.session() {
+  echo "sonnet1m"
+  echo "claude1m"
+  echo "longctx"
+}
+
+hiveMind.pane.titles() # <?session> # set pane border titles for all registered agents from hivemind.roles
 {
   local session="$1"
-  shift
-  local description="${*:-}"
 
-  if [ -z "$session" ]; then
-    error.log "Usage: hiveMind team.register <session> <?description>"
+  if [ ! -f "$HIVEMIND_REGISTRY" ]; then
+    error.log "No role registry found at $HIVEMIND_REGISTRY"
     return 1
   fi
 
-  private.hiveMind.teams.ensure.dir
+  # Enable pane border labels if not already on
+  tmux set -g pane-border-status top 2>/dev/null
+  tmux set -g pane-border-format " #{?pane_active,#[bold],}#T#[default] " 2>/dev/null
 
-  # Check if already registered
-  if [ -f "$HIVEMIND_TEAMS" ] && grep -q "^${session}|" "$HIVEMIND_TEAMS" 2>/dev/null; then
-    # Update description if provided
-    if [ -n "$description" ]; then
-      grep -v "^${session}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null
-      mv "${HIVEMIND_TEAMS}.tmp" "$HIVEMIND_TEAMS"
-      echo "${session}|${description}" >> "$HIVEMIND_TEAMS"
-      info.log "Updated team: $session — $description"
-    else
-      info.log "Team $session already registered"
+  local count=0
+  while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    # Filter by session if specified
+    if [ -n "$session" ]; then
+      case "$target" in "${session}:"*) ;; *) continue ;; esac
     fi
-    return 0
-  fi
+    otmux pane.title "$target" "$role"
+    count=$((count + 1))
+  done < "$HIVEMIND_REGISTRY"
 
-  echo "${session}|${description}" >> "$HIVEMIND_TEAMS"
-  success.log "Registered team: $session"
-
-  # Auto-switch to first registered team if none active
-  if [ ! -f "$HIVEMIND_ACTIVE_TEAM_FILE" ] || [ ! -s "$HIVEMIND_ACTIVE_TEAM_FILE" ]; then
-    echo "$session" > "$HIVEMIND_ACTIVE_TEAM_FILE"
-    info.log "Auto-switched active team to: $session"
-  fi
+  console.log "Set $count pane titles from registry"
 }
-hiveMind.team.register.completion.session() {
-  private.hiveMind.teams.complete
-}
-
-hiveMind.team.remove() # <session> # unregister a team session
-{
-  local session="$1"
-
-  if [ -z "$session" ]; then
-    error.log "Usage: hiveMind team.remove <session>"
-    return 1
-  fi
-
-  if [ ! -f "$HIVEMIND_TEAMS" ]; then
-    error.log "No team registry found"
-    return 1
-  fi
-
-  if ! grep -q "^${session}|" "$HIVEMIND_TEAMS" 2>/dev/null; then
-    error.log "Team $session not registered"
-    return 1
-  fi
-
-  grep -v "^${session}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null
-  mv "${HIVEMIND_TEAMS}.tmp" "$HIVEMIND_TEAMS"
-  success.log "Removed team: $session"
-
-  # Clear active team if it was the removed one
-  local active
-  active=$(private.hiveMind.active.team)
-  if [ "$active" = "$session" ]; then
-    rm -f "$HIVEMIND_ACTIVE_TEAM_FILE"
-    info.log "Active team cleared (was $session)"
-  fi
-}
-hiveMind.team.remove.completion.session() {
-  [ -f "$HIVEMIND_TEAMS" ] && cut -d'|' -f1 "$HIVEMIND_TEAMS" 2>/dev/null
-}
-
-hiveMind.team.switch() # <session> # set the active team context
-{
-  local session="$1"
-
-  if [ -z "$session" ]; then
-    error.log "Usage: hiveMind team.switch <session>"
-    echo "  Registered teams:"
-    hiveMind.team.list 2>/dev/null | sed 's/^/    /'
-    return 1
-  fi
-
-  # Verify session exists in tmux or in team registry
-  if ! tmux has-session -t "$session" 2>/dev/null; then
-    if [ -f "$HIVEMIND_TEAMS" ] && grep -q "^${session}|" "$HIVEMIND_TEAMS" 2>/dev/null; then
-      warn.log "Team $session is registered but tmux session is not running"
-    else
-      warn.log "Session $session not found in tmux or team registry"
-    fi
-  fi
-
-  # Auto-register if not already in team registry
-  if [ ! -f "$HIVEMIND_TEAMS" ] || ! grep -q "^${session}|" "$HIVEMIND_TEAMS" 2>/dev/null; then
-    hiveMind.team.register "$session"
-  fi
-
-  private.hiveMind.teams.ensure.dir
-  echo "$session" > "$HIVEMIND_ACTIVE_TEAM_FILE"
-  success.log "Active team: $session"
-}
-hiveMind.team.switch.completion.session() {
-  # Registered teams + running tmux sessions
-  private.hiveMind.teams.complete
-}
-
-hiveMind.team.active() # # show the current active team
-{
-  local active
-  active=$(private.hiveMind.active.team)
-  echo "$active"
+hiveMind.pane.titles.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.team.list() # # list all registered team sessions
 {
-  # Prefer team registry if it exists
-  if [ -f "$HIVEMIND_TEAMS" ] && [ -s "$HIVEMIND_TEAMS" ]; then
-    local active
-    active=$(private.hiveMind.active.team)
-    while IFS='|' read -r session description; do
-      [ -z "$session" ] && continue
-      local marker=" "
-      [ "$session" = "$active" ] && marker="*"
-      local running=""
-      tmux has-session -t "$session" 2>/dev/null && running="running" || running="stopped"
-      if [ -n "$description" ]; then
-        printf " %s %-24s %-10s %s\n" "$marker" "$session" "($running)" "$description"
-      else
-        printf " %s %-24s %s\n" "$marker" "$session" "($running)"
-      fi
-    done < "$HIVEMIND_TEAMS"
-    return 0
+  if [ ! -f "$HIVEMIND_REGISTRY" ]; then
+    error.log "No role registry found at $HIVEMIND_REGISTRY"
+    return 1
   fi
-
-  # Fall back to deriving teams from role registry
-  if [ -f "$HIVEMIND_REGISTRY" ]; then
-    cut -d: -f1 "$HIVEMIND_REGISTRY" | sort -u
-    return 0
-  fi
-
-  error.log "No team or role registry found"
-  return 1
+  cut -d: -f1 "$HIVEMIND_REGISTRY" | sort -u
 }
 
 hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane details (with session)
@@ -1579,23 +1423,19 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
         printf "%-24s (session not running)\n" "$team"
         continue
       fi
-      local agent_count=0 active_count=0 idle_count=0 blocked_count=0
+      local agent_count=0 active_count=0 idle_count=0
       while IFS='|' read -r target role; do
         [ -z "$target" ] || [ -z "$role" ] && continue
         case "$target" in "${team}:"*) ;; *) continue ;; esac
         agent_count=$((agent_count + 1))
-        local detect_raw activity
-        detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
-        activity="${detect_raw%%|*}"
+        local activity
+        activity=$(private.hiveMind.pane.activity "$target" 2>/dev/null)
         case "$activity" in
-          idle|shell|shell-escaped|unknown) idle_count=$((idle_count + 1)) ;;
-          permission|rate-limit|subscription-limit|accept-edits|queued|panel|overlay|autocomplete|tool-confirm|mcp-error|api-error|crash) blocked_count=$((blocked_count + 1)) ;;
+          idle|shell) idle_count=$((idle_count + 1)) ;;
           *) active_count=$((active_count + 1)) ;;
         esac
       done < "$HIVEMIND_REGISTRY"
-      local summary="${active_count} active, ${idle_count} idle"
-      [ "$blocked_count" -gt 0 ] && summary="${summary}, ${blocked_count} blocked"
-      printf "%-24s %d agents  (%s)\n" "$team" "$agent_count" "$summary"
+      printf "%-24s %d agents  (%d active, %d idle)\n" "$team" "$agent_count" "$active_count" "$idle_count"
     done <<< "$teams"
     return 0
   fi
@@ -1618,27 +1458,21 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
   while IFS='|' read -r addr pane_cmd; do
     count=$((count + 1))
 
-    local state="" detect_raw="" severity="" detail=""
+    local state=""
     local is_claude=false
     case "$pane_cmd" in
-      claude*|[0-9].[0-9]*)
-        is_claude=true
-        detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
-        IFS='|' read -r state _ severity detail <<< "$detect_raw"
-        ;;
+      claude*|[0-9].[0-9]*) is_claude=true; state=$(private.hiveMind.pane.activity "${session}:${addr}") ;;
       bash|zsh)
         # Shell reported — but Claude Code may still be running on this TTY.
         # tmux pane_current_command can misreport idle Claude as 'bash'.
         if claudeCode process.running "${session}:${addr}"; then
           is_claude=true
-          detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
-          IFS='|' read -r state _ severity detail <<< "$detect_raw"
+          state=$(private.hiveMind.pane.activity "${session}:${addr}")
         else
           state="shell"
-          severity="info"
         fi
         ;;
-      *) state="$pane_cmd"; severity="info" ;;
+      *) state="$pane_cmd" ;;
     esac
 
     local prefix="├──"
@@ -1663,51 +1497,28 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
       fi
     fi
 
-    # Add severity marker and detail for non-info states
-    local state_display="$state"
-    case "$severity" in
-      critical) state_display="$state !!" ;;
-      blocker)  [ -n "$detail" ] && state_display="$state — $detail" ;;
-      warning)  [ -n "$detail" ] && state_display="$state — $detail" ;;
-    esac
-    echo "$prefix $addr  $label ($state_display)${sid_label}"
+    echo "$prefix $addr  $label ($state)${sid_label}"
   done <<< "$pane_lines"
 }
 
 hiveMind.team.list.completion.session() {
-  private.hiveMind.teams.complete
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 hiveMind.team.status.completion.session() {
-  private.hiveMind.teams.complete
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
-hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane status of all registered agents (optional sleep before sweep)
+hiveMind.team.sweep() # <session> # structured one-line-per-pane status of all registered agents
 {
   local session="$1"
-  local interval="$2"
 
   if [ -z "$session" ]; then
-    error.log "Usage: hiveMind team.sweep <session> <?interval>"
+    error.log "Usage: hiveMind team.sweep <session>"
     return 1
-  fi
-
-  # Sleep first if interval provided (avoids compound commands that trigger permission prompts)
-  if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
-    sleep "$interval"
   fi
 
   if [ ! -f "$HIVEMIND_REGISTRY" ]; then
     error.log "No role registry found at $HIVEMIND_REGISTRY"
-    return 1
-  fi
-
-  if ! tmux has-session -t "$session" 2>/dev/null; then
-    error.log "Session $session not found"
-    return 1
-  fi
-
-  if ! grep -q "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null; then
-    error.log "No agents registered for session $session"
     return 1
   fi
 
@@ -1732,7 +1543,7 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
     local content
     content=$(otmux pane.capture "$target" 15 2>/dev/null)
 
-    # Determine state and details using sweep.detect + verb enrichment
+    # Determine state and details
     local state="IDLE"
     local details=""
 
@@ -1745,89 +1556,60 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
       continue
     fi
 
-    # Use sweep.detect for structured detection (handles all blocker types)
-    local detect_raw detect_status detect_severity detect_detail
-    detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
-    IFS='|' read -r detect_status _ detect_severity detect_detail <<< "$detect_raw"
+    # PERMISSION — "Allow"+"Deny" or "Do you want to proceed?"
+    if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
+      state="PERMISSION"
+      details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
+    elif echo "$content" | grep -q 'Do you want to proceed?'; then
+      state="PERMISSION"
 
-    case "$detect_status" in
-      permission)
-        state="PERMISSION"
-        details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
-        ;;
-      tool-confirm)
-        state="TOOL_CONFIRM"
-        details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
-        ;;
-      rate-limit)
-        state="RATE_LIMIT"
-        [ -n "$detect_detail" ] && details="$detect_detail"
-        ;;
-      subscription-limit)
-        state="SUB_LIMIT !!"
-        ;;
-      accept-edits)
-        state="ACCEPT_EDITS"
-        [ -n "$detect_detail" ] && [ "$detect_detail" != "0" ] && details="${detect_detail} pending"
-        ;;
-      context-warning)
-        state="CONTEXT_LOW"
-        [ -n "$detect_detail" ] && details="$detect_detail"
-        ;;
-      just-compacted)
-        state="COMPACTED"
-        ;;
-      overlay)
-        state="OVERLAY"
-        ;;
-      panel)
-        state="PANEL"
-        ;;
-      autocomplete)
-        state="AUTOCOMPLETE"
-        ;;
-      mcp-error)
-        state="MCP_ERROR"
-        ;;
-      api-error)
-        state="API_ERROR"
-        [ -n "$detect_detail" ] && details="$detect_detail"
-        ;;
-      crash)
-        state="CRASH !!"
-        ;;
-      shell-escaped)
-        state="SHELL"
-        ;;
-      queued)
+    # CONTEXT_LOW — "Context left until auto-compact: N%" or "N% remaining"
+    elif echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
+      state="CONTEXT_LOW"
+      details=$(echo "$content" | grep -oE '[0-9]+%' | tail -1)
+    elif echo "$content" | grep -qE '[0-9]+% remaining'; then
+      state="CONTEXT_LOW"
+      details=$(echo "$content" | grep -oE '[0-9]+%' | tail -1)
+
+    # ACTIVE — creative verb spinner or "thinking"
+    elif echo "$content" | grep -qiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running'; then
+      state="ACTIVE"
+      details=$(echo "$content" | grep -oiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running' | tail -1)
+      # Try to capture elapsed time if present (e.g. "(14m)")
+      local elapsed
+      elapsed=$(echo "$content" | grep -oE '\([0-9]+[ms]\)' | tail -1)
+      [ -n "$elapsed" ] && details="$details $elapsed"
+
+    # COMPLETED — past-tense verb (Baked, Brewed, Cooked, etc.)
+    elif echo "$content" | grep -qiE 'Baked|Brewed|Cooked|Simmered|Distilled|Woven|Crafted|Composed|Frosted|Incubated|Cascaded'; then
+      state="COMPLETED"
+
+    else
+      # Check last non-empty line for prompt state
+      local last_line
+      last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
+
+      # INPUT — text after prompt
+      if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
         state="INPUT"
-        local last_line
-        last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
         details=$(echo "$last_line" | sed -E 's/^[[:space:]]*(>|❯)[[:space:]]+//')
+        # Truncate long input
         [ ${#details} -gt 40 ] && details="${details:0:37}..."
         details="\"$details\""
-        ;;
-      idle)
+
+      # IDLE — clean prompt
+      elif echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
         state="IDLE"
-        ;;
-      active)
-        # Enrich with verb detection for active agents
-        if echo "$content" | grep -qiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running'; then
-          state="ACTIVE"
-          details=$(echo "$content" | grep -oiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running' | tail -1)
-          local elapsed
-          elapsed=$(echo "$content" | grep -oE '\([0-9]+[ms]\)' | tail -1)
-          [ -n "$elapsed" ] && details="$details $elapsed"
-        elif echo "$content" | grep -qiE 'Baked|Brewed|Cooked|Simmered|Distilled|Woven|Crafted|Composed|Frosted|Incubated|Cascaded'; then
-          state="COMPLETED"
-        else
-          state="ACTIVE"
-        fi
-        ;;
-      *)
-        state="${detect_status:-UNKNOWN}"
-        ;;
-    esac
+
+      # Shell escaped
+      elif echo "$last_line" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
+        state="SHELL"
+
+      # Default: unknown activity
+      else
+        state="ACTIVE"
+      fi
+    fi
 
     if [ -n "$details" ]; then
       printf "%-5s %-22s %-14s %s\n" "$addr" "$role" "$state" "$details"
@@ -1837,13 +1619,7 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
   done < "$HIVEMIND_REGISTRY"
 }
 hiveMind.team.sweep.completion.session() {
-  private.hiveMind.teams.complete
-}
-hiveMind.team.sweep.completion.interval() {
-  echo "15"
-  echo "30"
-  echo "60"
-  echo "120"
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.team.loop() # <session> <?interval:30> # continuous team.sweep at interval
@@ -1866,7 +1642,7 @@ hiveMind.team.loop() # <session> <?interval:30> # continuous team.sweep at inter
   done
 }
 hiveMind.team.loop.completion.session() {
-  private.hiveMind.teams.complete
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 hiveMind.team.loop.completion.interval() {
   echo "15"
@@ -1899,7 +1675,7 @@ hiveMind.monitor() # <?name-or-lines:5> <?session-or-lines> # capture pane outpu
 
   # All-pane monitoring (existing behavior)
   local lines="$first"
-  local session="${second:-${HIVEMIND_SESSION:-$(private.hiveMind.active.team)}}"
+  local session="${second:-${HIVEMIND_SESSION:-cursorOrchestrator}}"
 
   if ! tmux has-session -t "$session" 2>/dev/null; then
     error.log "Session '$session' not found"
@@ -1934,7 +1710,7 @@ hiveMind.monitor() # <?name-or-lines:5> <?session-or-lines> # capture pane outpu
 }
 
 hiveMind.monitor.completion.session() {
-  private.hiveMind.teams.complete
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.monitor.approve() # <pane> <?option:2> # approve a permission prompt in a pane
@@ -1948,7 +1724,7 @@ hiveMind.monitor.approve() # <pane> <?option:2> # approve a permission prompt in
   fi
 
   info.log "Sending approval option $option to pane $pane..."
-  otmux send.enter "$pane" "$option"
+  otmux send "$pane" "$option"
   success.log "Sent option $option to pane $pane"
 }
 
@@ -1963,139 +1739,72 @@ hiveMind.monitor.approve.completion.option() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 private.hiveMind.sweep.detect() {
-  # Enhanced blocker detection — returns status|action|severity[|detail]
-  #
-  # Statuses (18):
-  #   active, idle, permission, accept-edits, context-warning, just-compacted,
-  #   queued, rate-limit, subscription-limit, autocomplete, shell-escaped, shell,
-  #   overlay, panel, mcp-error, api-error, tool-confirm, crash, unknown
-  #
-  # Actions: none, enter, escape, down-enter, wait
-  #
-  # Severity: critical, blocker, warning, info
-  #   critical  — needs immediate human intervention (crash, subscription-limit)
-  #   blocker   — auto-resolvable or needs approval (permission, accept-edits, rate-limit)
-  #   warning   — may need attention soon (context-warning, just-compacted)
-  #   info      — normal operational states (active, idle)
-  #
-  # Detail (optional 4th field): extra context (percentage, count, retry time)
-  #
-  # Backward-compatible: callers using ${result%%|*} for status still work.
-
+  # Enhanced blocker detection — returns status|action
+  # Statuses: active, idle, permission, accept-edits, context-warning, just-compacted,
+  #           queued, rate-limit, autocomplete, shell-escaped, shell, unknown
+  # Actions: none, enter, escape
   local target="$1"
-  [ -z "$target" ] && echo "unknown|none|info" && return 1
+  [ -z "$target" ] && echo "unknown|none" && return 1
 
   local content
-  content=$(tmux capture-pane -t "$target" -p -S -20 2>/dev/null)
+  content=$(tmux capture-pane -t "$target" -p -S -10 2>/dev/null)
 
   local trimmed
   trimmed=$(echo "$content" | tr -d '[:space:]')
-  [ -z "$trimmed" ] && echo "unknown|none|info" && return 0
+  [ -z "$trimmed" ] && echo "unknown|none" && return 0
 
-  # ── Overlays and panels (dismiss with Escape) ──────────────────────────
-
-  # Background tasks overlay
+  # Background tasks overlay — more specific than permission, check first
   if echo "$content" | grep -q 'Background tasks'; then
-    echo "overlay|escape|blocker"
+    echo "overlay|escape"
     return 0
   fi
 
   # Git diff/status panel — needs Escape to close
   if echo "$content" | grep -qE 'files \+[0-9]+ -[0-9]+|Uncommitted changes|git diff|Esc close|PR #[0-9]+'; then
-    echo "panel|escape|blocker"
+    echo "panel|escape"
     return 0
   fi
-
-  # ── Error states (most urgent first) ───────────────────────────────────
-
-  # Crash / exited: Claude Code process terminated unexpectedly
-  if echo "$content" | grep -qiE 'claude.*exited|process.*terminated|segmentation fault|SIGKILL|SIGTERM|core dumped|fatal error'; then
-    echo "crash|none|critical"
-    return 0
-  fi
-
-  # API error: network/server errors from Anthropic API
-  if echo "$content" | grep -qiE 'APIConnectionError|APIStatusError|ECONNREFUSED|ETIMEDOUT|502 Bad Gateway|503 Service|529 Overloaded|internal server error|network error|connection reset'; then
-    local retry_detail
-    retry_detail=$(echo "$content" | grep -oiE 'retry.*(in |after )[0-9]+\s*s(ec)?' | tail -1)
-    echo "api-error|wait|blocker|${retry_detail:-transient}"
-    return 0
-  fi
-
-  # MCP connection error: MCP server connection/reconnect issues
-  if echo "$content" | grep -qiE 'MCP.*error|MCP.*disconnect|MCP.*reconnect|MCP.*timeout|MCP server.*not responding|failed to connect.*MCP'; then
-    echo "mcp-error|wait|warning"
-    return 0
-  fi
-
-  # ── Permission and confirmation prompts ────────────────────────────────
 
   # Permission prompt: "Allow" + "Deny" or "Do you want to proceed?" with Yes/No
   if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
-    echo "permission|down-enter|blocker"
+    echo "permission|enter"
     return 0
   fi
   if echo "$content" | grep -q 'Do you want to proceed?' && echo "$content" | grep -qE '^\s*(❯\s*)?[0-9]+\.\s*(Yes|No)'; then
-    echo "permission|enter|blocker"
+    echo "permission|enter"
     return 0
   fi
 
-  # Tool-use confirmation: specific tool approval prompts
-  if echo "$content" | grep -qE 'Run (this |the )?command|Execute.*\?|Create (this |the )?file|Write to|Delete.*\?'; then
-    if echo "$content" | grep -qE '^\s*(❯\s*)?[0-9]+\.\s*(Yes|No|Allow|Deny)'; then
-      echo "tool-confirm|enter|blocker"
-      return 0
-    fi
-  fi
-
-  # ── Rate and subscription limits ───────────────────────────────────────
-
-  # Subscription limit: quota/subscription exhausted (distinct from rate-limit)
-  if echo "$content" | grep -qiE 'subscription.*limit|daily.*limit.*reached|monthly.*limit|quota.*exhausted|billing.*limit|plan.*limit.*exceeded'; then
-    echo "subscription-limit|none|critical"
+  # Rate limit: message about limits
+  if echo "$content" | grep -qiE 'rate.limit|usage.limit|try again.*(in |later)|too many requests'; then
+    echo "rate-limit|enter"
     return 0
   fi
-
-  # Rate limit: temporary throttling
-  if echo "$content" | grep -qiE 'rate.limit|usage.limit|try again.*(in |later)|too many requests|throttl|request limit|capacity|overloaded.*try'; then
-    local retry_time
-    retry_time=$(echo "$content" | grep -oiE '(in |after )[0-9]+ ?(sec|min|second|minute)s?' | tail -1)
-    echo "rate-limit|wait|blocker|${retry_time:-unknown}"
-    return 0
-  fi
-
-  # ── Edit and acceptance prompts ────────────────────────────────────────
 
   # Accept edits prompt: ⏵⏵ accept edits on · N bash(es)
   if echo "$content" | grep -q '⏵⏵ accept'; then
     local edit_count
     edit_count=$(echo "$content" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
     [ -z "$edit_count" ] && edit_count=0
-    echo "accept-edits|enter|blocker|$edit_count"
+    echo "accept-edits|enter|$edit_count"
     return 0
   fi
 
-  # ── Context and compact states ─────────────────────────────────────────
-
   # Context warning: "Context left until auto-compact: N%"
   if echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
-    local ctx_pct
-    ctx_pct=$(echo "$content" | grep -oE 'auto-compact: [0-9]+%' | grep -oE '[0-9]+' | tail -1)
-    echo "context-warning|none|warning|${ctx_pct:-unknown}%"
+    echo "context-warning|none"
     return 0
   fi
 
   # Just compacted: "Compacted" in recent output
   if echo "$content" | grep -qiE 'Compacted|auto-compact.*completed'; then
-    echo "just-compacted|none|warning"
+    echo "just-compacted|none"
     return 0
   fi
 
-  # ── UI states ──────────────────────────────────────────────────────────
-
   # Autocomplete stuck: completion menu visible (e.g. /compact dropdown)
   if echo "$content" | grep -qE '^\s*/\w+.*─'; then
-    echo "autocomplete|escape|blocker"
+    echo "autocomplete|escape"
     return 0
   fi
 
@@ -2104,39 +1813,41 @@ private.hiveMind.sweep.detect() {
 
   # Shell-escaped: bare $ prompt (agent left Claude Code)
   if echo "$last_line" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
-    echo "shell-escaped|none|critical"
+    echo "shell-escaped|none"
     return 0
   fi
 
   # Idle: clean prompt (just ❯ or > with no text after)
   if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
-    echo "idle|none|info"
+    echo "idle|none"
     return 0
   fi
 
   # Queued: text after prompt not submitted
   if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
-    echo "queued|enter|blocker"
+    echo "queued|enter"
     return 0
   fi
 
   # Active (generating/running tools/indeterminate)
-  echo "active|none|info"
+  echo "active|none"
   return 0
 }
 
 private.hiveMind.unblock.pane() {
   # Detect and resolve blocker on a single pane
-  # Handles new sweep.detect format: status|action|severity[|detail]
   local target="$1"
   local label="$2"
 
   local result
   result=$(private.hiveMind.sweep.detect "$target")
+  local status="${result%%|*}"
+  local action="${result#*|}"
 
-  # Parse fields: status|action|severity|detail
-  local status action severity detail
-  IFS='|' read -r status action severity detail <<< "$result"
+  # Parse result — may have 3 fields: status|action|count
+  local count="${result#*|}"
+  count="${count#*|}"  # Get third field if present
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
 
   case "$status" in
     permission)
@@ -2146,15 +1857,8 @@ private.hiveMind.unblock.pane() {
       otmux send "$target" Enter
       console.log "Unblocked $label ($status) → Down+Enter (option 2)"
       ;;
-    tool-confirm)
-      # Tool confirmation — just accept with Enter
-      otmux send "$target" Enter
-      console.log "Unblocked $label ($status) → Enter"
-      ;;
     accept-edits)
       # Accept pending edits — Enter for each stacked edit + base
-      local count=0
-      [[ "$detail" =~ ^[0-9]+$ ]] && count="$detail"
       local i
       for ((i=0; i<=count; i++)); do
         otmux send "$target" Enter
@@ -2167,40 +1871,11 @@ private.hiveMind.unblock.pane() {
       otmux send "$target" Escape
       console.log "Unblocked $label ($status) → Escape"
       ;;
-    autocomplete)
-      # Dismiss stuck autocomplete menu
-      otmux send "$target" Escape
-      console.log "Unblocked $label ($status) → Escape"
-      ;;
-    queued)
-      # Submit queued text
-      otmux send "$target" Enter
-      console.log "Unblocked $label ($status) → Enter"
-      ;;
-    rate-limit|api-error)
-      # Transient — just wait, auto-recovers
-      console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
-      ;;
-    subscription-limit|crash|shell-escaped)
-      # Critical — cannot auto-resolve, log warning
-      warn.log "CRITICAL $label ($status) — needs human intervention"
-      ;;
-    mcp-error)
-      # MCP errors often self-recover
-      console.log "Waiting $label ($status) — MCP reconnecting"
-      ;;
     *)
-      # Fallback: use action field
       case "$action" in
         enter)
           otmux send "$target" Enter
           console.log "Unblocked $label ($status) → Enter"
-          ;;
-        down-enter)
-          otmux send "$target" Down
-          sleep 0.3
-          otmux send "$target" Enter
-          console.log "Unblocked $label ($status) → Down+Enter"
           ;;
         escape)
           otmux send "$target" Escape
@@ -2208,37 +1883,18 @@ private.hiveMind.unblock.pane() {
           otmux send "$target" Enter
           console.log "Unblocked $label ($status) → Escape+Enter"
           ;;
-        wait)
-          console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
-          ;;
         none) ;;
       esac
       ;;
   esac
 }
 
-hiveMind.sweep() # <?session> <?interval> # show last lines of each agent pane (optional sleep before sweep)
+hiveMind.sweep() # <?session:cursorOrchestrator> # show last lines of each agent pane
 {
-  local session="${1:-$(private.hiveMind.active.team)}"
-  local interval="$2"
-
-  # Sleep first if interval provided (avoids compound commands that trigger permission prompts)
-  if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
-    sleep "$interval"
-  fi
+  local session="${1:-cursorOrchestrator}"
 
   if [ ! -f "$HIVEMIND_REGISTRY" ]; then
     error.log "No role registry found at $HIVEMIND_REGISTRY"
-    return 1
-  fi
-
-  if ! tmux has-session -t "$session" 2>/dev/null; then
-    error.log "Session $session not found"
-    return 1
-  fi
-
-  if ! grep -q "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null; then
-    error.log "No agents registered for session $session"
     return 1
   fi
 
@@ -2253,13 +1909,7 @@ hiveMind.sweep() # <?session> <?interval> # show last lines of each agent pane (
   done < "$HIVEMIND_REGISTRY"
 }
 hiveMind.sweep.completion.session() {
-  private.hiveMind.teams.complete
-}
-hiveMind.sweep.completion.interval() {
-  echo "15"
-  echo "30"
-  echo "60"
-  echo "120"
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.sweep.cycle() # <?session> <?interval:0> # run one sweep+unblock cycle with optional sleep
@@ -2278,29 +1928,27 @@ hiveMind.auto.commit() # <?message> # auto-commit uncommitted changes if any exi
 {
   local msg="${1:-Auto-commit: cycle checkpoint $(date '+%Y-%m-%d %H:%M')}"
 
-  # Only add tracked files that changed (never untracked — avoids committing secrets)
-  # Also add session/ files which are safe to commit
-  local has_changes=false
-
+  # Check for uncommitted changes (staged or unstaged tracked files)
   if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-    git add -u
-    has_changes=true
+    git add -A
+    git commit -m "$msg
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+    git push 2>/dev/null &
+    console.log "Auto-committed: $msg"
+    return 0
   fi
 
-  # Check for untracked session files (safe path)
+  # Check for untracked session files
   local untracked
   untracked=$(git ls-files --others --exclude-standard -- session/ 2>/dev/null | head -5)
   if [ -n "$untracked" ]; then
     git add session/
-    has_changes=true
-  fi
-
-  if [ "$has_changes" = "true" ]; then
     git commit -m "$msg
 
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
     git push 2>/dev/null &
-    console.log "Auto-committed: $msg"
+    console.log "Auto-committed session files: $msg"
     return 0
   fi
 
@@ -2343,122 +1991,14 @@ hiveMind.cycle.full() # <?session> # run full monitoring cycle: sweep + unblock 
 }
 hiveMind.cycle.full.completion() { :; }
 
-hiveMind.dashboard() # <?session> # write consolidated team state to session/dashboard.md
+hiveMind.dashboard() # <?session:cursorOrchestrator> # DEPRECATED — use scrumMaster dashboard
 {
-  local session="${1:-$(private.hiveMind.active.team)}"
-  local registry="$HIVEMIND_REGISTRY"
-  local dashboard_file="$OOSH_DIR/session/dashboard.md"
-
-  local timestamp
-  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-  local local_time
-  local_time=$(date '+%Y-%m-%d %H:%M %Z')
-
-  # Git status
-  local git_branch git_status git_commit
-  git_branch=$(git -C "$OOSH_DIR" branch --show-current 2>/dev/null)
-  git_commit=$(git -C "$OOSH_DIR" log -1 --oneline 2>/dev/null)
-  if git -C "$OOSH_DIR" diff --quiet 2>/dev/null && git -C "$OOSH_DIR" diff --cached --quiet 2>/dev/null; then
-    git_status="clean"
-  else
-    git_status="uncommitted changes"
-  fi
-
-  # Subscription velocity (from cached metrics)
-  local vel_five="-" vel_seven="-"
-  local latest_sub
-  latest_sub=$(ls -t "${CONFIG_PATH:-$HOME/config}/metrics"/subscription.*.scenario.env 2>/dev/null | head -1)
-  if [ -n "$latest_sub" ] && [ -f "$latest_sub" ]; then
-    source "$latest_sub"
-    vel_five="${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}%"
-    vel_seven="${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}%"
-  fi
-
-  # Start dashboard
-  {
-    echo "# Team Dashboard"
-    echo ""
-    echo "**Updated**: $timestamp ($local_time)"
-    echo "**Session**: $session"
-    echo ""
-    echo "## Git Status"
-    echo ""
-    echo "| Field | Value |"
-    echo "|-------|-------|"
-    echo "| Branch | \`$git_branch\` |"
-    echo "| Status | $git_status |"
-    echo "| Last commit | \`$git_commit\` |"
-    echo ""
-    echo "## Subscription"
-    echo ""
-    echo "| Metric | Value |"
-    echo "|--------|-------|"
-    echo "| 5-hour usage | $vel_five |"
-    echo "| 7-day usage | $vel_seven |"
-    echo ""
-    echo "## Team Status"
-    echo ""
-    echo "| Agent | Pane | Context | State | Activity |"
-    echo "|-------|------|---------|-------|----------|"
-  } > "$dashboard_file"
-
-  # Iterate all agents
-  if [ -f "$registry" ]; then
-    while IFS='|' read -r target role; do
-      [ -z "$role" ] && continue
-      [[ "$target" != "$session:"* ]] && continue
-
-      local pane="${target##*.}"
-      local context_pct state activity
-
-      # Get context
-      context_pct=$(claudeCode context.read "$target" 2>/dev/null)
-      [ -z "$context_pct" ] && context_pct="-"
-      [ "$context_pct" != "-" ] && context_pct="${context_pct}%"
-
-      # Get state via sweep detect
-      local detect_result
-      detect_result=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
-      state="${detect_result%%|*}"
-      [ -z "$state" ] && state="unknown"
-
-      # Get activity from pane capture
-      local content
-      content=$(otmux pane.capture "$target" 5 2>/dev/null | tail -3)
-      activity=$(echo "$content" | grep -oE '(Reading|Writing|Thinking|Running|Editing|Searching|waiting|idle)' | tail -1)
-      [ -z "$activity" ] && activity="-"
-
-      echo "| $role | 0.$pane | $context_pct | $state | $activity |" >> "$dashboard_file"
-    done < "$registry"
-  fi
-
-  # Recent commits
-  {
-    echo ""
-    echo "## Recent Commits"
-    echo ""
-    echo "\`\`\`"
-    git -C "$OOSH_DIR" log --oneline -5 2>/dev/null
-    echo "\`\`\`"
-    echo ""
-    echo "## Recovery"
-    echo ""
-    echo "After \`/compact\`, read:"
-    echo "1. This file (\`session/dashboard.md\`)"
-    echo "2. Your role's context file (\`session/agents/<role>.context.md\`)"
-    echo "3. Your SKILL.md (\`.claude/agents/<role>/SKILL.md\`)"
-    echo ""
-    echo "---"
-    echo "*Generated by \`hiveMind dashboard\`*"
-  } >> "$dashboard_file"
-
-  console.log "Dashboard updated: $dashboard_file"
-  create.result 0 "$dashboard_file"
-  return $(result)
+  warn.log "hiveMind dashboard is deprecated — use: scrumMaster dashboard $*"
+  "$OOSH_DIR/scrumMaster" dashboard "$@"
 }
 hiveMind.dashboard.completion() { :; }
 
-hiveMind.unblock() # <name> <?session> # detect and resolve stuck prompt; name=agent name or 'all'
+hiveMind.unblock() # <name> <?session:cursorOrchestrator> # detect and resolve stuck prompt; name=agent name or 'all'
 {
   local name="$1"
   if [ -z "$name" ]; then
@@ -2466,7 +2006,7 @@ hiveMind.unblock() # <name> <?session> # detect and resolve stuck prompt; name=a
     return 1
   fi
 
-  local session="${2:-$(private.hiveMind.active.team)}"
+  local session="${2:-cursorOrchestrator}"
 
   if [ "$name" = "all" ]; then
     while IFS='|' read -r target role; do
@@ -2487,186 +2027,28 @@ hiveMind.unblock.completion.name() {
   hiveMind.resolve.completion.name
   echo "all"
 }
-hiveMind.unblock.completion.session() {
-  private.hiveMind.teams.complete
-}
 
-hiveMind.monitor.cycle() # <?session> # full monitoring cycle: context health, velocity, detect blockers, unblock, log
+hiveMind.monitor.cycle() # <?session> # capture, detect, and unblock all panes in one call
 {
   local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
 
-  # List all panes across all windows (-s = session-wide)
-  local pane_lines
-  pane_lines=$(tmux list-panes -t "$session" -s \
-    -F "#{window_index}.#{pane_index}|#{pane_current_command}" 2>/dev/null)
-  [ -z "$pane_lines" ] && { error.log "No panes found for $session"; return 1; }
+  # Get all panes
+  local panes
+  panes=$(tmux list-panes -t "${session}:0" -F "#{pane_index}" 2>/dev/null)
+  [ -z "$panes" ] && { error.log "No panes found for $session"; return 1; }
 
-  local checked=0 blocked=0 low_context=0
-
-  # Workspace for burn-log (computed once outside loop)
-  local workspace
-  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
-  local logfile=""
-  if [ -n "$workspace" ]; then
-    logfile="${workspace}/session/context-burn-log.md"
-    if [ ! -f "$logfile" ]; then
-      echo "| Time | Pane | % | State | Velocity | TTC |" > "$logfile"
-      echo "|------|------|---|-------|----------|-----|" >> "$logfile"
-    fi
-  fi
-
-  while IFS='|' read -r addr pane_cmd; do
-    local target="${session}:${addr}"
-    local is_claude=false
-
-    case "$pane_cmd" in
-      claude*|[0-9].[0-9]*)
-        is_claude=true ;;
-      bash|zsh)
-        "$OOSH_DIR/claudeCode" process.running "$target" && is_claude=true ;;
-    esac
-
-    [ "$is_claude" = "false" ] && continue
-    checked=$((checked + 1))
-
-    # Step 1: Context health check
-    local pct
-    pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
-    [ -z "$pct" ] && pct="unknown"
-
-    # Step 2: Velocity (tokens/hr, time-to-compact)
-    local velocity tokens_hr ttc
-    velocity=$("$OOSH_DIR/claudeCode" context.velocity "$target" 2>/dev/null)
-    tokens_hr=$(echo "$velocity" | grep -oE '^[0-9]+ tokens/hr' || echo "-")
-    ttc=$(echo "$velocity" | grep -oE '~[0-9]+min' || echo "-")
-
-    # Step 3: Alert if context low (<25%)
-    if [ "$pct" != "unknown" ] && [ "$pct" -le 25 ] 2>/dev/null; then
-      low_context=$((low_context + 1))
-      warn.log "$target: ${pct}% context — triggering alert"
-      "$OOSH_DIR/claudeCode" context.alert "$target" 25
-    fi
-
-    # Step 4: Detect blockers and unblock
-    local detect_raw status
-    detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
-    status="${detect_raw%%|*}"
+  local pane status
+  for pane in $panes; do
+    local result
+    result=$(private.hiveMind.sweep.detect "${session}:0.${pane}")
+    status="${result%%|*}"
     case "$status" in
-      active|idle|unknown) ;; # healthy — skip
-      *) blocked=$((blocked + 1))
-         private.hiveMind.unblock.pane "$target" "${addr}" ;;
+      active|idle|unknown) ;; # skip
+      *) private.hiveMind.unblock.pane "${session}:0.${pane}" "pane-${pane}" ;;
     esac
-
-    # Step 5: Log to burn-log
-    if [ -n "$logfile" ]; then
-      local ts
-      ts=$(date '+%H:%M')
-      echo "| $ts | $addr | ${pct}% | $status | $tokens_hr | $ttc |" >> "$logfile"
-    fi
-
-  done <<< "$pane_lines"
-
-  info.log "Monitor cycle: $checked checked, $blocked blocked, $low_context low-context"
-  create.result 0 "$checked"
-  return $(result)
+  done
 }
 hiveMind.monitor.cycle.completion() { :; }
-
-hiveMind.peer.compact() # <name-or-pane> <?session> # trigger seamless compact for a peer agent
-{
-  local name="$1"
-  local session="${2:-$(private.hiveMind.active.team)}"
-
-  if [ -z "$name" ]; then
-    error.log "Usage: hiveMind peer.compact <agent-name-or-pane> <?session>"
-    return 1
-  fi
-
-  # Resolve name to pane target
-  local target
-  if [[ "$name" == *":"* ]] || [[ "$name" == *"."* ]]; then
-    target="$name"
-    [[ "$target" != *":"* ]] && target="${session}:${target}"
-  else
-    target=$(hiveMind.resolve "$name" "$session" 2>/dev/null)
-  fi
-
-  if [ -z "$target" ]; then
-    error.log "Cannot resolve '$name' to a pane target"
-    return 1
-  fi
-
-  local role
-  role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
-  [ -z "$role" ] && role="$name"
-
-  info.log "Compacting peer: $role at $target"
-
-  # Step 1: Capture peer state (30 lines)
-  local pane_content
-  pane_content=$("$OOSH_DIR/otmux" pane.capture "$target" 30 2>/dev/null)
-  if [ -z "$pane_content" ]; then
-    warn.log "Could not capture $target — pane may be empty"
-  fi
-
-  # Step 2: Check context % before compact
-  local pct
-  pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
-  info.log "$role context: ${pct:-unknown}%"
-
-  # Step 3: Kill rogue resume hook processes
-  local addr="${target#*:}"
-  local pid_file="/tmp/resume-${addr}.pid"
-  if [ -f "$pid_file" ]; then
-    local old_pid
-    old_pid=$(cat "$pid_file" 2>/dev/null)
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-      info.log "Killing rogue hook process $old_pid"
-      kill "$old_pid" 2>/dev/null
-    fi
-    rm -f "$pid_file" 2>/dev/null
-  fi
-
-  # Step 4: Clear input line
-  "$OOSH_DIR/otmux" send "$target" C-u
-
-  # Step 5: Send /compact
-  "$OOSH_DIR/otmux" send "$target" "/compact" Enter
-  sleep 2
-  "$OOSH_DIR/otmux" send "$target" "" Enter
-
-  # Step 6: Wait for hook to process
-  info.log "Waiting for compact to complete..."
-  local waited=0
-  while [ "$waited" -lt 30 ]; do
-    sleep 5
-    waited=$((waited + 5))
-    local check
-    check=$("$OOSH_DIR/otmux" pane.capture "$target" 5 2>/dev/null)
-    if echo "$check" | grep -qE 'Compacted|auto-compact|resumed'; then
-      info.log "Compact confirmed after ${waited}s"
-      break
-    fi
-  done
-
-  # Step 7: Verify recovery
-  local verify
-  verify=$("$OOSH_DIR/otmux" pane.capture "$target" 10 2>/dev/null)
-  if echo "$verify" | grep -qE 'Compacted|❯'; then
-    console.log "peer.compact: $role at $target — OK"
-    create.result 0 "compacted"
-  else
-    warn.log "peer.compact: $role — compact may not have completed"
-    create.result 1 "unverified"
-  fi
-  return $(result)
-}
-hiveMind.peer.compact.completion.name_or_pane() {
-  hiveMind.resolve.completion.name 2>/dev/null
-}
-hiveMind.peer.compact.completion.session() {
-  tmux list-sessions -F "#{session_name}" 2>/dev/null
-}
 
 hiveMind.sweep.loop() # <?seconds:30> # continuous sweep + unblock all sessions at interval
 {
@@ -2695,7 +2077,7 @@ hiveMind.sweep.loop.completion.seconds() {
   echo "120"
 }
 hiveMind.sweep.loop.completion.session() {
-  private.hiveMind.teams.complete
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2722,7 +2104,7 @@ hiveMind.watchdog() # <?seconds:30> # start external sweep+unblock loop in a new
 
   # Spawn a new pane running plain bash (no Claude Code = no permission prompts)
   tmux split-window -t "${session}:0" -v -l 5 \
-    "echo \$\$ > '$HIVEMIND_WATCHDOG_PID_FILE' && while true; do touch '$HIVEMIND_WATCHDOG_HEARTBEAT'; echo \"── watchdog @ \$(date '+%H:%M:%S') ──\" >> '$HIVEMIND_WATCHDOG_LOG'; for team in \$(hiveMind team.list 2>/dev/null); do hiveMind unblock all \"\$team\" >> '$HIVEMIND_WATCHDOG_LOG' 2>&1; done; sleep $interval; done"
+    "cd '$OOSH_DIR' && echo \$\$ > '$HIVEMIND_WATCHDOG_PID_FILE' && while true; do touch '$HIVEMIND_WATCHDOG_HEARTBEAT'; echo \"── watchdog @ \$(date '+%H:%M:%S') ──\" >> '$HIVEMIND_WATCHDOG_LOG'; for team in \$(hiveMind team.list 2>/dev/null); do hiveMind unblock all \"\$team\" >> '$HIVEMIND_WATCHDOG_LOG' 2>&1; done; sleep $interval; done"
 
   # Lock the pane title
   sleep 0.5
@@ -2848,11 +2230,6 @@ hiveMind.usage()
       agent.verify      check if agent is alive
 
   TEAM:
-      team.register     register a team session
-      team.remove       unregister a team session
-      team.switch       set the active team context
-      team.active       show the current active team
-      team.list         list registered teams (with status)
       team.setup.oosh   create 3-pane oosh team
       team.setup.full   create 4-pane full team
       team.status       show team members as tree
@@ -2864,7 +2241,7 @@ hiveMind.usage()
   MONITORING:
       monitor           capture pane output (by name or all)
       monitor.approve   approve permission prompt in pane
-      sweep <s> <?sec>  batch-capture all panes (optional sleep before)
+      sweep             batch-capture all panes, return status table
       unblock <name>    detect and resolve stuck prompts (or 'all')
       sweep.loop <sec>  continuous sweep + unblock at interval
 
@@ -2884,21 +2261,20 @@ hiveMind.usage()
   ─────────────────────────────────────────────────────
 
   Examples:
-    $this team.register projectTeam 'OOSH dev team'  # register a team
-    $this team.register claudeWoda 'Story team'      # register another
-    $this team.switch projectTeam    # set active team context
-    $this team.active                # show active team
-    $this team.list                  # list all teams with status
-    $this team.status                # tree view of active team agents
-    $this team.status projectTeam    # tree view of specific team
-    $this resolve expert             # find expert's pane in active team
-    $this agent.send expert 'fix bug' # send to expert (active team)
+    $this status                      # one-line overview
+    $this team.status                 # tree view of all agents
+    $this resolve expert              # find expert's pane target
+    $this agent.send expert 'fix bug'  # transport-independent (prefers pane, falls back to API)
     $this send.enter expert 'fix bug' # send message by name (with Enter)
-    $this monitor expert             # capture 5 lines from expert
-    $this role.list                  # list available roles
+    $this send expert Down Enter      # send raw keys by name
+    $this monitor expert              # capture 5 lines from expert
+    $this monitor expert 10           # capture 10 lines from expert
+    $this monitor                     # capture 5 lines from all panes
+    $this monitor 10                  # capture 10 lines per pane
+    $this role.list                   # list available roles
     $this agent.bootstrap oosh-expert # bootstrap an expert
-    $this join product-owner         # rejoin PO's Claude session
-    $this team.setup.full            # create full team
+    $this join product-owner          # rejoin PO's Claude session
+    $this team.setup.full             # create full team
   "
 }
 
@@ -2912,10 +2288,8 @@ hiveMind.start()
   #echo "sourcing init"
   source this
 
-  # Resolve HIVEMIND_AGENTS_DIR by searching upward for .claude/agents with SKILL.md files
-  if [ -z "$HIVEMIND_AGENTS_DIR" ]; then
-    HIVEMIND_AGENTS_DIR=$(private.hiveMind.find.agents.dir)
-  fi
+  # Ensure HIVEMIND_AGENTS_DIR is set after 'source this' provides OOSH_DIR
+  : ${HIVEMIND_AGENTS_DIR:=${OOSH_DIR}/../../../.claude/agents}
 
   if [ -z "$1" ]; then
     hiveMind.status

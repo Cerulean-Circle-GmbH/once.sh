@@ -1,7 +1,7 @@
 # Team Dashboard
 
-**Updated**: 2026-02-08T12:15:57Z (2026-02-08 13:15 CET)
-**Session**: cursorOrchestrator
+**Updated**: 2026-02-16T10:19:08Z (2026-02-16 11:19 CET)
+**Session**: projectTeam
 
 ## Git Status
 
@@ -9,35 +9,39 @@
 |-------|-------|
 | Branch | `dev.claude` |
 | Status | uncommitted changes |
-| Last commit | `167570a Update oosh-expert context after compact` |
+| Last commit | `315c173 Fix claudeCode missing space in monitor.cycle, cycle.full, dashboard` |
 
 ## Subscription
 
 | Metric | Value |
 |--------|-------|
-| 5-hour usage | 30.0% |
-| 7-day usage | 42.0% |
+| 5-hour usage | 38.0% |
+| 7-day usage | 43.0% |
 
 ## Team Status
 
 | Agent | Pane | Context | State | Activity |
 |-------|------|---------|-------|----------|
-| orchestrator | 0.0 | 73.5% | accept-edits | - |
-| product-owner | 0.1 | 52.4% | accept-edits | - |
-| agent-trainer | 0.2 | 52.4% | accept-edits | - |
-| task-agent | 0.3 | 52.4% | active | - |
-| oosh-expert | 0.4 | 73.5% | accept-edits | - |
-| oosh-tester | 0.5 | 73.5% | accept-edits | - |
-| scrum-master | 0.6 | 73.5% | accept-edits | - |
+| orchestrator | 0.0 | 52.2% | panel | - |
+| oosh-expert | 0.1 | 48.8% | panel | - |
+| oosh-tester | 0.2 | 29.5% | panel | - |
+| scrum-master | 0.3 | 18.0% | accept-edits | - |
+| product-owner | 0.4 | 68.1% | panel | - |
+| agent-trainer | 0.5 | 60.8% | panel | - |
+| task-agent | 0.2 | 17.3% | panel | - |
+| woda-writer | 0.0 | 100.0% | accept-edits | - |
+| woda-scribe | 0.1 | 71.0% | accept-edits | - |
+| developer | 0.3 | 26.3% | panel | - |
+| script-product-owner | 0.4 | 68.5% | panel | - |
 
 ## Recent Commits
 
 ```
-167570a Update oosh-expert context after compact
-7557702 Add scrumMaster.metrics.cycle() for structured KPI logging
-b2f6892 Improvement #9: Context velocity tracking — tokens/hr + time-until-compact
-dea9b54 Improvements #4-5: Auto-commit + automated cycle method
-ea22cb2 Task 58 bugfix: Fix context.read optional param triggering debugger
+315c173 Fix claudeCode missing space in monitor.cycle, cycle.full, dashboard
+d3ce9d0 Task 40.3: Unified tab completion for team selection across all commands
+dcf2b9a Task 40.2: Enhanced sweep.detect with 18 states, severity classification, and structured output
+fdeffb2 Fix active.team fallback to use roles registry
+e82fee1 Add multi-team support to hiveMind (Task 40.1)
 ```
 
 ## Recovery
