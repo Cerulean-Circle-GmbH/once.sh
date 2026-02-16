@@ -385,8 +385,18 @@ ossh.install.continue.local() { # <remoteSshConfigName> <sshConfigNameUsedForLoc
   oo update
   #source user
   oo state
-  state next
-  #state next
+  state next      # root.dev.keys.installed (stub)
+  state next      # root.installation.done (stub)
+  # transition auto-jumps to 40
+  state next      # user.shared.dev.folder.linked → symlinks root config/oosh
+  state next      # user.state.machine.synced.with.root (stub)
+  # transition auto-jumps to 50
+  state next      # headless.setup.started (stub)
+  state next      # headless.setup.finished (stub)
+  # transition auto-jumps to 60
+  state next      # once.setup.started → once init
+  state next      # once.setup.finished (stub)
+  # → 99 = finished
 
   source $CONFIG
   config list
@@ -449,7 +459,7 @@ ossh.install.finish.local() {
   fi
 }
 
-ossh.install.user.remote() { # <sshConfigHost> <user> # sets up oosh for <user> on <sshConfigHost> (git clone + config + bashrc + ssh keys)
+ossh.install.user.remote() { # <sshConfigHost> <user> # sets up oosh for <user> on <sshConfigHost> using shared folder model
   local sshConfigHost="$1"
   if [ -n "$1" ]; then
     shift
@@ -466,7 +476,7 @@ ossh.install.user.remote() { # <sshConfigHost> <user> # sets up oosh for <user> 
     return 1
   fi
 
-  important.log "Setting up oosh for user '$targetUser' on $sshConfigHost..."
+  important.log "Setting up oosh for user '$targetUser' on $sshConfigHost (shared folder model)..."
 
   # NOTE: The SSH ControlMaster connection logs in as the SSH config user,
   # which IS the target user. So we run commands directly — no sudo needed.
@@ -477,59 +487,58 @@ ossh.install.user.remote() { # <sshConfigHost> <user> # sets up oosh for <user> 
     return 1
   }
 
-  # 2. Get user's home directory
-  local remoteHome
-  remoteHome=$(private.ossh.ssh "$sshConfigHost" "echo \$HOME")
-  if [ -z "$remoteHome" ]; then
-    error.log "Could not determine home directory for '$targetUser'"
+  # 2. Get shared paths from developking's home (created by state machine state 21)
+  local devHome
+  devHome=$(private.ossh.ssh "$sshConfigHost" "eval echo ~developking 2>/dev/null")
+  if [ -z "$devHome" ]; then
+    error.log "developking user not found on $sshConfigHost — root install may not have completed"
     return 1
   fi
-  info.log "Remote home for $targetUser: $remoteHome"
+  local dir
+  dir=$(private.ossh.ssh "$sshConfigHost" "dirname '$devHome'")
+  local sharedConfig="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
+  local sharedOosh="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/dev"
+  info.log "Shared config: $sharedConfig"
+  info.log "Shared oosh:   $sharedOosh"
 
-  # 3. Git clone oosh for the user (same repo as oosh_install_oosh uses)
+  # 3. Verify shared infrastructure exists
+  private.ossh.ssh "$sshConfigHost" "[ -d '$sharedOosh' ]" || {
+    error.log "Shared oosh not found at $sharedOosh — run 'ossh install $sshConfigHost' (root) first"
+    return 1
+  }
+
+  # 4. Remove leftover init/oosh bootstrap file if present (placed during root install)
   private.ossh.ssh "$sshConfigHost" "
-    # Remove leftover init/oosh bootstrap file if present (placed during root install)
-    if [ -f '$remoteHome/oosh' ] && [ ! -d '$remoteHome/oosh' ]; then
+    if [ -f \"\$HOME/oosh\" ] && [ ! -d \"\$HOME/oosh\" ]; then
       echo 'Removing leftover init/oosh bootstrap file'
-      rm -f '$remoteHome/oosh'
+      rm -f \"\$HOME/oosh\"
     fi
-    # Remove leftover partial clone if present
-    if [ -d '$remoteHome/once.sh' ]; then
-      echo 'Removing leftover once.sh directory'
-      rm -rf '$remoteHome/once.sh'
+  "
+
+  # 5. Symlink config and oosh to shared folders (mirrors state 25: user.shared.dev.folder.linked)
+  private.ossh.ssh "$sshConfigHost" "
+    cd \$HOME
+    # Back up existing config if not already symlinked
+    if [ -d config ] && [ ! -L config ]; then
+      mv config config.orig
     fi
-    if [ -d '$remoteHome/oosh' ]; then
-      echo 'oosh already exists — updating via git pull'
-      cd '$remoteHome/oosh' && git pull
-    else
-      cd '$remoteHome'
-      git clone https://github.com/Cerulean-Circle-GmbH/once.sh.git
-      mv '$remoteHome/once.sh' '$remoteHome/oosh'
+    if [ ! -L config ]; then
+      ln -s '$sharedConfig' config
+    fi
+    # Back up existing oosh dir/file if not already symlinked
+    if [ -d oosh ] && [ ! -L oosh ]; then
+      mv oosh oosh.orig
+    fi
+    if [ ! -L oosh ]; then
+      ln -s '$sharedOosh' oosh
     fi
   " || {
-    error.log "Failed to clone oosh for $targetUser"
+    error.log "Failed to create symlinks for $targetUser"
     return 1
   }
-  success.log "oosh cloned to $remoteHome/oosh"
+  success.log "Symlinked ~/config and ~/oosh to shared folders for $targetUser"
 
-  # 4. Create config directory and user.env
-  # Use ssh cat to write the file — avoids heredoc escaping issues
-  printf '%s\n' \
-    'export CONFIG_PATH="$HOME/config"' \
-    'export CONFIG_FILE="user.env"' \
-    'export CONFIG="$HOME/config/user.env"' \
-    'export OOSH_DIR="$HOME/oosh"' \
-    'export PATH="$HOME/oosh:$PATH"' \
-    "export OOSH_SSH_CONFIG_HOST=\"$sshConfigHost\"" \
-    'export LOG_LEVEL=3' \
-    'export LOG_DEVICE=/dev/tty' \
-  | private.ossh.ssh "$sshConfigHost" "mkdir -p \"\$HOME/config\" && cat > \"\$HOME/config/user.env\"" || {
-    error.log "Failed to create config for $targetUser"
-    return 1
-  }
-  success.log "Created config/user.env for $targetUser"
-
-  # 5. Install bashrc_template (or append source line)
+  # 6. Install bashrc_template (or append source line)
   private.ossh.ssh "$sshConfigHost" "
     if [ -f \"\$HOME/.bashrc\" ] && [ ! -f \"\$HOME/.bashrc.pre-oosh\" ]; then
       cp \"\$HOME/.bashrc\" \"\$HOME/.bashrc.pre-oosh\"
@@ -547,7 +556,7 @@ ossh.install.user.remote() { # <sshConfigHost> <user> # sets up oosh for <user> 
     warn.log "Failed to update .bashrc for $targetUser"
   }
 
-  # 6. Create SSH key folders
+  # 7. Create SSH key folders
   private.ossh.ssh "$sshConfigHost" "
     if [ ! -d \"\$HOME/.ssh\" ]; then
       mkdir -p \"\$HOME/.ssh\"
@@ -560,7 +569,7 @@ ossh.install.user.remote() { # <sshConfigHost> <user> # sets up oosh for <user> 
     warn.log "Failed to create SSH key folders for $targetUser"
   }
 
-  # 7. Push local public key to user's authorized_keys
+  # 8. Push local public key to user's authorized_keys
   local keyFile="$HOME/.ssh/public_keys/$( ossh.get.file.name ).public_key"
   if [ -f "$keyFile" ]; then
     private.ossh.ssh "$sshConfigHost" "mkdir -p \"\$HOME/.ssh/public_keys\""
