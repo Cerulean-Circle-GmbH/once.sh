@@ -601,25 +601,46 @@ claudeCode.session.id() # <pane_target> # get Claude Code session UUID for a tmu
   sid=$(lsof -p "$claude_pid" 2>/dev/null | grep '\.claude/tasks/' | head -1 | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
   [ -n "$sid" ] && echo "$sid" && return 0
 
-  # Method 3: find most recent session file for the project
+  # Method 3: match pane title to JSONL custom-title (e.g. pane "oosh-expert" → "oosh-expert@sonnet")
+  local pane_title
+  pane_title=$(tmux display-message -t "$target" -p "#{pane_title}" 2>/dev/null)
+
   local cwd
   cwd=$(lsof -p "$claude_pid" 2>/dev/null | awk '/cwd/ {print $NF}')
+
+  if [ -n "$pane_title" ] && [ -n "$cwd" ]; then
+    local project_path
+    project_path=$(echo "$cwd" | sed 's/[^a-zA-Z0-9]/-/g')
+    local projects_dir="$HOME/.claude/projects/$project_path"
+
+    if [ -d "$projects_dir" ]; then
+      for jsonl_file in "$projects_dir"/*.jsonl; do
+        [ -f "$jsonl_file" ] || continue
+        local ct
+        ct=$(grep '"custom-title"' "$jsonl_file" 2>/dev/null | tail -1 | jq -r '.customTitle // empty' 2>/dev/null)
+        ct="${ct%%$'\n'*}"
+        if [ -n "$ct" ] && [[ "$ct" == "${pane_title}@"* ]]; then
+          sid=$(basename "$jsonl_file" .jsonl)
+          echo "$sid"
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  # Method 4: find most recent session file for the project (fallback, unreliable for multi-agent)
   [ -z "$cwd" ] && return 1
 
-  # Convert path to project format: /Users/foo/bar.baz → -Users-foo-bar-baz
-  # Claude converts all non-alphanumeric chars to dashes
   local project_path
   project_path=$(echo "$cwd" | sed 's/[^a-zA-Z0-9]/-/g')
 
   local projects_dir="$HOME/.claude/projects/$project_path"
   [ -d "$projects_dir" ] || return 1
 
-  # Find most recently modified .jsonl file
   local newest_file
   newest_file=$(ls -t "$projects_dir"/*.jsonl 2>/dev/null | head -1)
   [ -z "$newest_file" ] && return 1
 
-  # Extract UUID from filename (remove path and .jsonl)
   sid=$(basename "$newest_file" .jsonl)
   [ -n "$sid" ] && echo "$sid" && return 0
 
@@ -627,6 +648,72 @@ claudeCode.session.id() # <pane_target> # get Claude Code session UUID for a tmu
 }
 claudeCode.session.id.completion.pane_target() {
   tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.session.name() # <sessionId> # get session name by UUID (customTitle from /rename, or firstPrompt)
+{
+  local sid="$1"
+  [ -z "$sid" ] && return 1
+
+  local CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+  local name=""
+
+  # Method 1: look up in sessions-index.json (customTitle preferred, firstPrompt fallback)
+  for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json; do
+    [ -f "$index_file" ] || continue
+    name=$(jq -r --arg sid "$sid" '
+      .entries[] | select(.sessionId == $sid) |
+      if .customTitle and .customTitle != "" then .customTitle
+      elif .firstPrompt and .firstPrompt != "" then .firstPrompt[0:40]
+      else empty end
+    ' "$index_file" 2>/dev/null)
+    [ -n "$name" ] && break
+  done
+
+  if [ -n "$name" ]; then
+    echo "$name"
+    return 0
+  fi
+
+  # Method 2: check JSONL for custom-title entry (from /rename, more current than index)
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+    local jsonl_file="${project_dir}${sid}.jsonl"
+    [ -f "$jsonl_file" ] || continue
+    name=$(grep '"custom-title"' "$jsonl_file" 2>/dev/null | tail -1 \
+      | jq -r '.customTitle // empty' 2>/dev/null \
+      | head -1)
+    name="${name%%$'\n'*}"
+    [ -n "$name" ] && break
+  done
+
+  if [ -n "$name" ]; then
+    echo "$name"
+    return 0
+  fi
+
+  # Method 3: read firstPrompt directly from JSONL file (for sessions not yet in index)
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+    local jsonl_file="${project_dir}${sid}.jsonl"
+    [ -f "$jsonl_file" ] || continue
+    name=$(head -20 "$jsonl_file" \
+      | jq -r 'select(.type == "user") | .message.content // empty' 2>/dev/null \
+      | sed 's/<[^>]*>//g; s/^[[:space:]]*//; /^$/d' \
+      | grep -vi '^caveat:' \
+      | grep -v '^/clear' \
+      | grep -vi '^clear$' \
+      | head -1)
+    [ -n "$name" ] && name="${name:0:40}" && break
+  done
+
+  if [ -n "$name" ]; then
+    echo "$name"
+    return 0
+  fi
+
+  return 1
+}
+claudeCode.session.name.completion.sessionId() {
+  claudeCode.join.completion.session
 }
 
 claudeCode.agent.start() # <?workdir:.> <?--model:sonnet> # start Claude Code with optional model
@@ -642,7 +729,7 @@ claudeCode.agent.start() # <?workdir:.> <?--model:sonnet> # start Claude Code wi
     esac
   done
 
-  local cmd="$CLAUDE_CMD --dangerously-skip-permissions"
+  local cmd="$CLAUDE_CMD"
   [ -n "$model" ] && cmd="$cmd --model $model"
 
   if [ -n "$TMUX" ]; then
@@ -1169,6 +1256,67 @@ except:
   done
 }
 claudeCode.context.dashboard.completion() { :; }
+
+claudeCode.context.check() # <pane> # check context health: percentage, velocity, log, alert if low
+{
+  local pane="$1"
+
+  if [ -z "$pane" ]; then
+    error.log "Usage: claudeCode context.check <pane>"
+    return 1
+  fi
+
+  # 1. Get context percentage
+  local pct
+  pct=$(claudeCode.context.read "$pane" 2>/dev/null)
+  [ -z "$pct" ] && pct="unknown"
+
+  # 2. Get velocity
+  local velocity ttc tokens_hr
+  velocity=$(claudeCode.context.velocity "$pane" 2>/dev/null)
+  tokens_hr=$(echo "$velocity" | grep -oE '^[0-9]+ tokens/hr' || echo "-")
+  ttc=$(echo "$velocity" | grep -oE '~[0-9]+min' || echo "-")
+
+  # 3. Determine state
+  local state="ok"
+  if [ "$pct" = "unknown" ]; then
+    state="unknown"
+  elif [ "$pct" -le 10 ] 2>/dev/null; then
+    state="CRITICAL"
+  elif [ "$pct" -le 25 ] 2>/dev/null; then
+    state="LOW"
+  fi
+
+  # 4. Log to burn log
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -n "$workspace" ]; then
+    local logfile="${workspace}/session/context-burn-log.md"
+    local ts
+    ts=$(date '+%H:%M')
+    if [ ! -f "$logfile" ]; then
+      echo "| Time | Pane | % | State | Velocity | TTC |" > "$logfile"
+      echo "|------|------|---|-------|----------|-----|" >> "$logfile"
+    fi
+    echo "| $ts | $pane | ${pct}% | $state | $tokens_hr | $ttc |" >> "$logfile"
+  fi
+
+  # 5. Alert if low
+  if [ "$state" = "LOW" ]; then
+    warn.log "$pane: ${pct}% context — alert peer"
+  elif [ "$state" = "CRITICAL" ]; then
+    warn.log "$pane: ${pct}% context — CRITICAL, triggering compact"
+    claudeCode.context.alert "$pane" 10
+  fi
+
+  # 6. Output summary
+  console.log "$pane: ${pct}% | $tokens_hr | $ttc | $state"
+  create.result 0 "$pct"
+  return $(result)
+}
+claudeCode.context.check.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
 
 claudeCode.context.alert() # <pane> <?threshold:20> # alert if context below threshold; sends warning to pane
 {
