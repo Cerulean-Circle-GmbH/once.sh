@@ -896,8 +896,9 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
       done
     fi
   fi
-  # Fallback: global newest (no pane specified or session lookup failed)
-  if [ -z "$jsonl_file" ]; then
+  # Fallback: global newest ONLY if no pane specified
+  # If pane was specified but session lookup failed, don't use global (wrong agent's data)
+  if [ -z "$jsonl_file" ] && [ -z "$pane" ]; then
     jsonl_file=$(claudeCode.context.jsonl)
   fi
   if [ -n "$jsonl_file" ] && [ -f "$jsonl_file" ]; then
@@ -1021,8 +1022,10 @@ claudeCode.context.velocity() # <?pane_or_jsonl> # calculate context burn rate (
       done
     fi
   fi
-  # Fallback: global newest
-  [ -z "$jsonl_file" ] && jsonl_file=$(claudeCode.context.jsonl)
+  # Fallback: global newest ONLY if no pane specified
+  if [ -z "$jsonl_file" ] && [ -z "$arg" ]; then
+    jsonl_file=$(claudeCode.context.jsonl)
+  fi
   [ -z "$jsonl_file" ] || [ ! -f "$jsonl_file" ] && { echo "unknown"; return 1; }
 
   # Use python3 to parse timestamps and token counts from assistant messages
@@ -1042,8 +1045,9 @@ with open('$jsonl_file') as f:
                     ts = d.get('timestamp', '')
                     input_t = usage['input_tokens']
                     cache_create = usage.get('cache_creation_input_tokens', 0)
-                    cache_read = usage.get('cache_read_input_tokens', 0)
-                    total = input_t + cache_create + cache_read
+                    output_t = usage.get('output_tokens', 0)
+                    # input_tokens already includes cache_read — don't double-count
+                    total = input_t + cache_create + output_t
                     messages.append({'ts': ts, 'tokens': total})
         except:
             pass
@@ -1194,6 +1198,81 @@ claudeCode.context.alert() # <pane> <?threshold:20> # alert if context below thr
   return 1
 }
 claudeCode.context.alert.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.recover() # <pane> # post-compact recovery: read identity files, check peer, resume work
+{
+  local pane="$1"
+
+  if [ -z "$pane" ]; then
+    error.log "Usage: claudeCode recover <pane>"
+    return 1
+  fi
+
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$workspace" ]; then
+    error.log "Cannot determine workspace root"
+    return 1
+  fi
+
+  # Resolve role from registry
+  local role
+  role=$("$OOSH_DIR/hiveMind" resolve.reverse "$pane" 2>/dev/null)
+  if [ -z "$role" ]; then
+    local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+    [ -f "$reg" ] && role=$(grep "^${pane}|" "$reg" 2>/dev/null | cut -d'|' -f2)
+  fi
+
+  if [ -z "$role" ]; then
+    warn.log "Cannot resolve role for $pane — skipping identity files"
+  fi
+
+  # Step 1: Check identity files exist
+  local learnings_file="${workspace}/session/agents/${role}/learnings.md"
+  local context_file="${workspace}/session/agents/${role}/context.md"
+  local boot_file="${workspace}/session/boot/${role}.md"
+
+  local files_found=0
+  if [ -n "$role" ]; then
+    [ -f "$boot_file" ] && { info.log "Boot file: $boot_file"; files_found=$((files_found + 1)); }
+    [ -f "$learnings_file" ] && { info.log "Learnings: $learnings_file"; files_found=$((files_found + 1)); }
+    [ -f "$context_file" ] && { info.log "Context: $context_file"; files_found=$((files_found + 1)); }
+  fi
+
+  # Step 2: Send boot file read to the recovering pane
+  if [ -f "$boot_file" ]; then
+    local rel_boot="session/boot/${role}.md"
+    "$OOSH_DIR/otmux" send "$pane" "Read ${rel_boot}" Enter
+    info.log "Sent boot file to $pane"
+  elif [ -f "$context_file" ]; then
+    local rel_ctx="session/agents/${role}/context.md"
+    "$OOSH_DIR/otmux" send "$pane" "Read ${rel_ctx}" Enter
+    info.log "Sent context file to $pane"
+  else
+    warn.log "No boot or context file found for $role"
+  fi
+
+  # Step 3: Check context health
+  local pct
+  pct=$(claudeCode.context.read "$pane" 2>/dev/null)
+  info.log "$pane context: ${pct:-unknown}%"
+
+  # Step 4: Verify agent responded (wait briefly, then capture)
+  sleep 3
+  local verify
+  verify=$("$OOSH_DIR/otmux" pane.capture "$pane" 10 2>/dev/null)
+  if echo "$verify" | grep -qE 'Read|boot|context|❯'; then
+    console.log "recover: $role at $pane — resumed ($files_found files, ${pct:-?}% context)"
+    create.result 0 "recovered"
+  else
+    warn.log "recover: $role at $pane — may not have resumed"
+    create.result 1 "unverified"
+  fi
+  return $(result)
+}
+claudeCode.recover.completion.pane() {
   tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
 }
 

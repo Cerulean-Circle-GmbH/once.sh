@@ -887,6 +887,80 @@ hiveMind.task() # <agentId> <description> # send task to specific agent
   fi
 }
 
+hiveMind.delegate() # <name> <description> <?from:PO> # write task file and send file-read nudge to agent
+{
+  local name="$1"
+  local description="$2"
+  local from="${3:-PO}"
+
+  if [ -z "$name" ] || [ -z "$description" ]; then
+    error.log "Usage: hiveMind delegate <agent-name> <description> <?from>"
+    return 1
+  fi
+
+  local session
+  session="$(private.hiveMind.active.team)"
+
+  # Resolve agent → pane
+  local target
+  target=$(hiveMind.resolve "$name" "$session" 2>/dev/null)
+  if [ -z "$target" ]; then
+    error.log "Cannot resolve '$name' to a pane target"
+    return 1
+  fi
+
+  # Generate task file
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$workspace" ]; then
+    error.log "Cannot determine workspace root"
+    return 1
+  fi
+
+  local tasks_dir="${workspace}/session/tasks"
+  mkdir -p "$tasks_dir" 2>/dev/null
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  local task_file="${tasks_dir}/${timestamp}.task.md"
+
+  {
+    echo "# Task: $description"
+    echo ""
+    echo "**From**: $from"
+    echo "**To**: $name"
+    echo "**Priority**: NORMAL"
+    echo "**Date**: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo ""
+    echo "## Description"
+    echo ""
+    echo "$description"
+    echo ""
+    echo "## Acceptance Criteria"
+    echo ""
+    echo "- [ ] Task completed as described"
+  } > "$task_file"
+
+  # Send file-read nudge (not inline text — avoids tmux garbling)
+  local relative_path="session/tasks/${timestamp}.task.md"
+  otmux send "$target" "Read ${relative_path}" Enter
+
+  # Verify nudge landed
+  sleep 1
+  local verify
+  verify=$("$OOSH_DIR/otmux" pane.capture "$target" 5 2>/dev/null)
+  if echo "$verify" | grep -q "$relative_path"; then
+    console.log "Delegated to $name: $task_file"
+    create.result 0 "$task_file"
+  else
+    warn.log "Nudge may not have landed — verify manually"
+    create.result 0 "$task_file"
+  fi
+  return $(result)
+}
+hiveMind.delegate.completion.name() {
+  hiveMind.resolve.completion.name 2>/dev/null
+}
+
 hiveMind.broadcast() # <message> # send message to all agents
 {
   local message="$1"
@@ -1588,8 +1662,9 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
         detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
         activity="${detect_raw%%|*}"
         case "$activity" in
-          idle|shell|shell-escaped|unknown) idle_count=$((idle_count + 1)) ;;
-          permission|rate-limit|subscription-limit|accept-edits|queued|panel|overlay|autocomplete|tool-confirm|mcp-error|api-error|crash) blocked_count=$((blocked_count + 1)) ;;
+          idle|queued|unknown) idle_count=$((idle_count + 1)) ;;
+          shell|shell-escaped|crash|subscription-limit) idle_count=$((idle_count + 1)) ;;
+          permission|rate-limit|accept-edits|panel|overlay|autocomplete|tool-confirm|mcp-error|api-error|context-warning) blocked_count=$((blocked_count + 1)) ;;
           *) active_count=$((active_count + 1)) ;;
         esac
       done < "$HIVEMIND_REGISTRY"
@@ -1663,12 +1738,27 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
       fi
     fi
 
-    # Add severity marker and detail for non-info states
-    local state_display="$state"
+    # Map raw states to 7-state vocabulary:
+    #   active, idle, accept-edits, stuck-prompt, context-limit, compacting, offline
+    local display_state="$state"
+    case "$state" in
+      active)                          display_state="active" ;;
+      idle|queued)                     display_state="idle" ;;
+      accept-edits)                    display_state="accept-edits" ;;
+      permission|tool-confirm|panel|overlay|autocomplete)
+                                       display_state="stuck-prompt" ;;
+      context-warning)                 display_state="context-limit" ;;
+      just-compacted)                  display_state="compacting" ;;
+      shell|shell-escaped|crash)       display_state="offline" ;;
+      rate-limit|api-error|mcp-error)  display_state="stuck-prompt" ;;
+      subscription-limit)              display_state="offline" ;;
+    esac
+
+    local state_display="$display_state"
     case "$severity" in
-      critical) state_display="$state !!" ;;
-      blocker)  [ -n "$detail" ] && state_display="$state — $detail" ;;
-      warning)  [ -n "$detail" ] && state_display="$state — $detail" ;;
+      critical) state_display="$display_state !!" ;;
+      blocker)  [ -n "$detail" ] && state_display="$display_state — $detail" ;;
+      warning)  [ -n "$detail" ] && state_display="$display_state — $detail" ;;
     esac
     echo "$prefix $addr  $label ($state_display)${sid_label}"
   done <<< "$pane_lines"
@@ -2001,7 +2091,12 @@ private.hiveMind.sweep.detect() {
   fi
 
   # Git diff/status panel — needs Escape to close
-  if echo "$content" | grep -qE 'files \+[0-9]+ -[0-9]+|Uncommitted changes|git diff|Esc close|PR #[0-9]+'; then
+  # Note: 'files +N -N' also appears in the normal status bar — only match with Esc close
+  if echo "$content" | grep -qE 'Esc close'; then
+    echo "panel|escape|blocker"
+    return 0
+  fi
+  if echo "$content" | grep -qE 'Uncommitted changes|git diff' && echo "$content" | grep -qE '^\s*[+-]{3}\s|^diff --git'; then
     echo "panel|escape|blocker"
     return 0
   fi
@@ -2130,6 +2225,7 @@ private.hiveMind.unblock.pane() {
   # Handles new sweep.detect format: status|action|severity[|detail]
   local target="$1"
   local label="$2"
+  local attempt="${3:-1}"
 
   local result
   result=$(private.hiveMind.sweep.detect "$target")
@@ -2137,6 +2233,11 @@ private.hiveMind.unblock.pane() {
   # Parse fields: status|action|severity|detail
   local status action severity detail
   IFS='|' read -r status action severity detail <<< "$result"
+
+  # Skip if already healthy
+  case "$status" in
+    active|idle|unknown) return 0 ;;
+  esac
 
   case "$status" in
     permission)
@@ -2215,6 +2316,27 @@ private.hiveMind.unblock.pane() {
       esac
       ;;
   esac
+
+  # Verify: re-detect after action (skip for wait-only states)
+  case "$status" in
+    rate-limit|api-error|subscription-limit|crash|shell-escaped|mcp-error) return 0 ;;
+  esac
+
+  if [ "$attempt" -le 1 ]; then
+    sleep 1
+    local recheck
+    recheck=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    local new_status="${recheck%%|*}"
+    case "$new_status" in
+      active|idle|unknown)
+        debug.log "Verified: $label cleared ($status → $new_status)"
+        ;;
+      *)
+        warn.log "$label still blocked ($new_status) — retrying once"
+        private.hiveMind.unblock.pane "$target" "$label" 2
+        ;;
+    esac
+  fi
 }
 
 hiveMind.sweep() # <?session> <?interval> # show last lines of each agent pane (optional sleep before sweep)
