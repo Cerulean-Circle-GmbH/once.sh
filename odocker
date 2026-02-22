@@ -64,6 +64,121 @@ odocker.list() # # list images
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FILE DISCOVERY
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.odocker.resolve.image() {
+  # Given a container name or image name, return the image name
+  local input="$1"
+  local image
+
+  # Try as container first — get image from running/stopped container
+  image=$(docker inspect --format '{{.Config.Image}}' "$input" 2>/dev/null)
+  if [ -n "$image" ]; then
+    echo "$image"
+    return 0
+  fi
+
+  # Try as image directly
+  if docker image inspect "$input" >/dev/null 2>&1; then
+    echo "$input"
+    return 0
+  fi
+
+  return 1
+}
+
+odocker.file.find() # <container-or-image> # find Dockerfile that built a container or image
+{
+  local input="$1"
+  if [ -z "$input" ]; then
+    error.log "Usage: odocker file.find <container-or-image>"
+    return 1
+  fi
+
+  # Resolve to image name
+  local image
+  image=$(private.odocker.resolve.image "$input")
+  if [ $? -ne 0 ]; then
+    error.log "Not found as container or image: $input"
+    return 1
+  fi
+
+  # --- Tier 1: Label check ---
+  local label_path
+  label_path=$(docker inspect --format '{{index .Config.Labels "dockerfile.path"}}' "$image" 2>/dev/null)
+  if [ -n "$label_path" ] && [ "$label_path" != "<no value>" ]; then
+    if [ -f "$label_path" ]; then
+      console.log "Image: $image"
+      console.log "Dockerfile: $label_path"
+      console.log "Directory: $(dirname "$label_path")"
+      RESULT="$label_path"
+      return 0
+    fi
+  fi
+
+  local label_dir
+  label_dir=$(docker inspect --format '{{index .Config.Labels "dockerfile.dir"}}' "$image" 2>/dev/null)
+  if [ -n "$label_dir" ] && [ "$label_dir" != "<no value>" ]; then
+    if [ -f "$label_dir/Dockerfile" ]; then
+      console.log "Image: $image"
+      console.log "Dockerfile: $label_dir/Dockerfile"
+      console.log "Directory: $label_dir"
+      RESULT="$label_dir/Dockerfile"
+      return 0
+    fi
+  fi
+
+  # --- Tier 2: Compose label ---
+  local compose_dir
+  compose_dir=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$image" 2>/dev/null)
+  if [ -n "$compose_dir" ] && [ "$compose_dir" != "<no value>" ]; then
+    if [ -f "$compose_dir/Dockerfile" ]; then
+      console.log "Image: $image"
+      console.log "Dockerfile: $compose_dir/Dockerfile"
+      console.log "Directory: $compose_dir"
+      console.log "Source: docker-compose label"
+      RESULT="$compose_dir/Dockerfile"
+      return 0
+    fi
+  fi
+
+  # --- Tier 3: Filesystem search in DockerWorkspaces ---
+  local base="$ODOCKER_WORKSPACES"
+  if [ -d "$base" ]; then
+    local dir
+    for dir in "$base"/*/Dockerfile "$base"/*/*/Dockerfile; do
+      [ -f "$dir" ] || continue
+      local ws_dir=$(dirname "$dir")
+      local ws_tag
+      ws_tag=$(private.odocker.image.from.workspace "${ws_dir#$base/}")
+      if [ "$ws_tag" = "$image" ] || [ "$ws_tag" = "${image%%:*}" ]; then
+        console.log "Image: $image"
+        console.log "Dockerfile: $dir"
+        console.log "Directory: $ws_dir"
+        console.log "Source: workspace name match"
+        RESULT="$dir"
+        return 0
+      fi
+    done
+  fi
+
+  # --- Tier 4: History reconstruct ---
+  console.log "Image: $image"
+  console.log "Dockerfile: NOT FOUND"
+  console.log "Build history (reconstruct manually):"
+  docker image history --no-trunc --format '  {{.CreatedBy}}' "$image" 2>/dev/null \
+    | sed 's|/bin/sh -c #(nop)  ||g; s|/bin/sh -c ||g' \
+    | tac
+  RESULT=""
+  return 1
+}
+odocker.file.find.completion.container-or-image() {
+  private.odocker.all.containers
+  private.odocker.images
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BUILD & RUN
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -86,8 +201,14 @@ odocker.build() # <workspace> # build image from DockerWorkspaces directory
   local image_tag
   image_tag=$(private.odocker.image.from.workspace "$workspace")
 
+  local dockerfile_path
+  dockerfile_path=$(cd "$workspace_dir" && pwd -P)/Dockerfile
+
   console.log "Building image: $image_tag from $workspace_dir"
-  docker build -t "$image_tag" "$workspace_dir"
+  docker build \
+    --label "dockerfile.path=$dockerfile_path" \
+    --label "dockerfile.dir=$(dirname "$dockerfile_path")" \
+    -t "$image_tag" "$workspace_dir"
   local rc=$?
 
   if [ $rc -eq 0 ]; then
@@ -275,6 +396,7 @@ odocker.usage()
     $this build nakedUbuntu/20.04.sshd
     $this run.sshd naked_ubuntu_20_04_sshd
     $this exec fervent_ritchie
+    $this file.find fervent_ritchie
     $this stop fervent_ritchie
     $this log fervent_ritchie
     ----------
