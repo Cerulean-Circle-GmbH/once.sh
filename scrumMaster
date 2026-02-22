@@ -757,85 +757,144 @@ scrumMaster.subscription.json.completion() { :; }
 
 scrumMaster.subscription() # # show subscription status with alert thresholds
 {
-  local json
+  # --- Primary source: rate-limit-cache.json (written by Claude TUI, reflects real API headers) ---
+  local cache_file="$HOME/.claude/rate-limit-cache.json"
+  local have_cache=false
+  local cache_pct_5h=0 cache_pct_7d=0 cache_reset_5h=0 cache_reset_7d=0 cache_ts=0
+
+  if [ -f "$cache_file" ]; then
+    cache_pct_5h=$(jq -r '.session5h // 0' "$cache_file" 2>/dev/null)
+    cache_pct_7d=$(jq -r '.weekly7d // 0' "$cache_file" 2>/dev/null)
+    cache_reset_5h=$(jq -r '.reset5h // 0' "$cache_file" 2>/dev/null)
+    cache_reset_7d=$(jq -r '.reset7d // 0' "$cache_file" 2>/dev/null)
+    cache_ts=$(jq -r '.timestamp // 0' "$cache_file" 2>/dev/null)
+    [ "$cache_reset_5h" != "0" ] && [ "$cache_reset_5h" != "null" ] && have_cache=true
+  fi
+
+  # Check cache freshness (stale if >10 min old)
+  local cache_age_s=9999
+  if $have_cache; then
+    local now_ms=$(($(date +%s) * 1000))
+    cache_age_s=$(( (now_ms - cache_ts) / 1000 ))
+  fi
+
+  # --- Secondary source: ccusage (for token counts, costs, models) ---
+  local json total_tokens=0 cost_usd=0 burn_rate=0 models=""
   json=$(scrumMaster.subscription.json 2>/dev/null)
-  if [ $? -ne 0 ] || [ -z "$json" ]; then
-    error.log "Cannot get subscription data — is ccusage available?"
+  if [ -n "$json" ] && [ "$json" != "{}" ]; then
+    total_tokens=$(echo "$json" | jq -r '.blocks[0].totalTokens // 0' 2>/dev/null)
+    cost_usd=$(echo "$json" | jq -r '.blocks[0].costUSD // 0' 2>/dev/null)
+    burn_rate=$(echo "$json" | jq -r '.blocks[0].burnRate.tokensPerMinute // 0' 2>/dev/null)
+    models=$(echo "$json" | jq -r '.blocks[0].models | join(", ")' 2>/dev/null)
+  fi
+
+  if ! $have_cache && [ -z "$json" ]; then
+    error.log "No data sources available (neither rate-limit-cache.json nor ccusage)"
     return 1
   fi
 
-  # Parse with jq
-  local start_time end_time is_active total_tokens cost_usd
-  local burn_rate remaining_min projected_cost projected_tokens
+  # --- Compute times from rate-limit-cache (ground truth) ---
+  local now_epoch reset_epoch remaining_min pct_used block_start_epoch
+  local reset_local reset_utc start_local start_utc
+  local is_active="true"
+  now_epoch=$(date +%s)
 
-  start_time=$(echo "$json" | jq -r '.blocks[0].startTime // empty' 2>/dev/null)
-  end_time=$(echo "$json" | jq -r '.blocks[0].endTime // empty' 2>/dev/null)
-  is_active=$(echo "$json" | jq -r '.blocks[0].isActive // false' 2>/dev/null)
-  total_tokens=$(echo "$json" | jq -r '.blocks[0].totalTokens // 0' 2>/dev/null)
-  cost_usd=$(echo "$json" | jq -r '.blocks[0].costUSD // 0' 2>/dev/null)
-  burn_rate=$(echo "$json" | jq -r '.blocks[0].burnRate.tokensPerMinute // 0' 2>/dev/null)
-  remaining_min=$(echo "$json" | jq -r '.blocks[0].projection.remainingMinutes // 0' 2>/dev/null)
-  projected_cost=$(echo "$json" | jq -r '.blocks[0].projection.totalCost // 0' 2>/dev/null)
-  projected_tokens=$(echo "$json" | jq -r '.blocks[0].projection.totalTokens // 0' 2>/dev/null)
-  local models
-  models=$(echo "$json" | jq -r '.blocks[0].models | join(", ")' 2>/dev/null)
+  if $have_cache; then
+    reset_epoch="$cache_reset_5h"
+    remaining_min=$(( (reset_epoch - now_epoch) / 60 ))
+    [ "$remaining_min" -lt 0 ] && remaining_min=0 && is_active="false"
+    pct_used=$(echo "$cache_pct_5h" | awk '{printf "%d", $1 * 100}')
+    block_start_epoch=$(( reset_epoch - (5 * 3600) ))
+    reset_local=$(date -r "$reset_epoch" "+%H:%M %Z")
+    reset_utc=$(date -r "$reset_epoch" -u "+%H:%M UTC")
+    start_local=$(date -r "$block_start_epoch" "+%H:%M %Z")
+    start_utc=$(date -r "$block_start_epoch" -u "+%H:%M UTC")
+  else
+    # Fallback: derive from ccusage (less accurate)
+    local cc_end cc_start cc_remaining
+    cc_end=$(echo "$json" | jq -r '.blocks[0].endTime // empty' 2>/dev/null)
+    cc_start=$(echo "$json" | jq -r '.blocks[0].startTime // empty' 2>/dev/null)
+    cc_remaining=$(echo "$json" | jq -r '.blocks[0].projection.remainingMinutes // 0' 2>/dev/null)
+    remaining_min="${cc_remaining}"
+    pct_used=$(echo "$json" | jq -r '
+      .blocks[0] | if .projection.totalTokens > 0
+      then ((.totalTokens / .projection.totalTokens) * 100 | floor)
+      else 0 end' 2>/dev/null)
+    reset_utc=$(echo "$cc_end" | grep -oE 'T[0-9]{2}:[0-9]{2}' | tr -d T)
+    reset_utc="${reset_utc} UTC (ccusage — may be inaccurate)"
+    start_utc=$(echo "$cc_start" | grep -oE 'T[0-9]{2}:[0-9]{2}' | tr -d T)
+    start_utc="${start_utc} UTC"
+    reset_local="$reset_utc"
+    start_local="$start_utc"
+  fi
 
-  # Format times for display (extract HH:MM)
-  local start_hm end_hm
-  start_hm=$(echo "$start_time" | grep -oE 'T[0-9]{2}:[0-9]{2}' | tr -d T)
-  end_hm=$(echo "$end_time" | grep -oE 'T[0-9]{2}:[0-9]{2}' | tr -d T)
-
-  # Determine alert level based on projected usage
+  # --- Alert level based on real percentage and remaining time ---
   local alert="OK"
-  local block_hours=5
-  if [ "$is_active" = "true" ] && [ "$remaining_min" -gt 0 ] 2>/dev/null; then
-    local elapsed_min=$(( (block_hours * 60) - remaining_min ))
-    if [ "$elapsed_min" -gt 0 ] 2>/dev/null; then
-      local pct_used
-      pct_used=$(echo "$total_tokens $projected_tokens" | awk '{if($2>0) printf "%d", ($1/$2)*100; else print 0}')
-      if [ "$pct_used" -ge 95 ] 2>/dev/null; then
-        alert="CRITICAL (${pct_used}% tokens used)"
-      elif [ "$pct_used" -ge 80 ] 2>/dev/null; then
-        alert="WARNING (${pct_used}% tokens used)"
-      fi
+  if [ "$remaining_min" -le 0 ] 2>/dev/null; then
+    alert="EXHAUSTED (block ended)"
+  elif [ "$remaining_min" -le 5 ] 2>/dev/null; then
+    alert="CRITICAL (${remaining_min} min left, ${pct_used}% used)"
+  elif [ "$remaining_min" -le 15 ] 2>/dev/null; then
+    alert="WARNING (${remaining_min} min left, ${pct_used}% used)"
+  elif [ "$pct_used" -ge 90 ] 2>/dev/null; then
+    alert="WARNING (${pct_used}% used, ${remaining_min} min left)"
+  fi
+
+  # Weekly quota check
+  local weekly_pct=0
+  if $have_cache; then
+    weekly_pct=$(echo "$cache_pct_7d" | awk '{printf "%d", $1 * 100}')
+    if [ "$weekly_pct" -ge 90 ] 2>/dev/null; then
+      alert="CRITICAL-WEEKLY (${weekly_pct}% of weekly quota)"
     fi
   fi
 
   # Status label
   local status_label="INACTIVE"
   [ "$is_active" = "true" ] && status_label="ACTIVE"
+  local source_label="rate-limit-cache"
+  $have_cache || source_label="ccusage (fallback)"
+  local stale_warning=""
+  [ "$cache_age_s" -gt 600 ] && stale_warning=" (stale: ${cache_age_s}s ago)"
 
   echo "Subscription Status:"
-  echo "  Block: ${start_hm}-${end_hm} UTC ($status_label)"
-  echo "  Tokens: ${total_tokens} / ${remaining_min} min remaining"
-  echo "  Burn rate: ${burn_rate%.*} tokens/min"
-  echo "  Cost: \$${cost_usd} (projected: \$${projected_cost})"
-  echo "  Models: ${models}"
+  echo "  Block: ${start_local} — ${reset_local} ($status_label)"
+  echo "  Reset: ${reset_utc} / ${reset_local}"
+  echo "  Used: ${pct_used}% of 5h block / ${remaining_min} min remaining"
+  $have_cache && echo "  Weekly: ${weekly_pct}% of 7d quota (resets $(date -r "$cache_reset_7d" "+%a %H:%M %Z"))"
+  echo "  Tokens: ${total_tokens} / burn ${burn_rate%.*} tok/min"
+  local cost_fmt
+  cost_fmt=$(echo "$cost_usd" | awk '{printf "%.2f", $1}')
+  echo "  Cost: \$${cost_fmt}"
+  [ -n "$models" ] && echo "  Models: ${models}"
   echo "  Alert: ${alert}"
+  echo "  Source: ${source_label}${stale_warning}"
 
   # Save to metrics for dashboard pickup
   local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics}"
   [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
-  local timestamp
-  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  local ts_label
+  ts_label=$(date -u "+%Y%m%dT%H%M%SZ")
   {
     echo "export SUBSCRIPTION_ACTIVE=\"$is_active\""
-    echo "export SUBSCRIPTION_BLOCK_START=\"$start_time\""
-    echo "export SUBSCRIPTION_BLOCK_END=\"$end_time\""
+    echo "export SUBSCRIPTION_BLOCK_START=\"$start_utc\""
+    echo "export SUBSCRIPTION_BLOCK_END=\"$reset_utc\""
     echo "export SUBSCRIPTION_TOKENS=\"$total_tokens\""
     echo "export SUBSCRIPTION_COST_USD=\"$cost_usd\""
     echo "export SUBSCRIPTION_BURN_RATE=\"${burn_rate%.*}\""
     echo "export SUBSCRIPTION_REMAINING_MIN=\"$remaining_min\""
-    echo "export SUBSCRIPTION_PROJECTED_COST=\"$projected_cost\""
-    echo "export SUBSCRIPTION_PROJECTED_TOKENS=\"$projected_tokens\""
+    echo "export SUBSCRIPTION_PCT_USED=\"$pct_used\""
+    echo "export SUBSCRIPTION_WEEKLY_PCT=\"$weekly_pct\""
     echo "export SUBSCRIPTION_ALERT=\"$alert\""
-    echo "export SUBSCRIPTION_FIVE_HOUR_UTIL=\"$(echo "$total_tokens $projected_tokens" | awk '{if($2>0) printf "%d", ($1/$2)*100; else print 0}')\""
-  } > "$metrics_dir/subscription.${timestamp}.scenario.env"
+    echo "export SUBSCRIPTION_SOURCE=\"$source_label\""
+    $have_cache && echo "export SUBSCRIPTION_RESET_EPOCH=\"$cache_reset_5h\""
+    $have_cache && echo "export SUBSCRIPTION_RESET_LOCAL=\"$reset_local\""
+  } > "$metrics_dir/subscription.${ts_label}.scenario.env"
 
   # Also save to config metrics for dashboard
   local config_metrics="${CONFIG_PATH:-$HOME/config}/metrics"
   mkdir -p "$config_metrics" 2>/dev/null
-  cp "$metrics_dir/subscription.${timestamp}.scenario.env" "$config_metrics/subscription.${timestamp}.scenario.env"
+  cp "$metrics_dir/subscription.${ts_label}.scenario.env" "$config_metrics/subscription.${ts_label}.scenario.env"
 
   create.result 0 "$alert"
   return $(result)
