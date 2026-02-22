@@ -20,12 +20,103 @@ OOSH achieves pseudo-object-oriented programming in Bash through **naming conven
 | **Private methods** | Functions prefixed `private.` |
 | **Inheritance** | Sourcing other scripts to access their methods |
 
-### Method Naming Convention
+### OOSH Naming Standard (MANDATORY)
+
+**One rule: camelCase + dots. No dashes. No underscores. Everywhere.**
+
+This applies to method names, parameter names, variable names, completion
+functions, and private helpers. Dashes are a bash syntax error in identifiers.
+Underscores are banned for consistency — OOSH uses dots for hierarchy and
+camelCase for multi-word names.
+
+#### Method Names: `script.methodName`
+
+Dots separate hierarchy levels. Multi-word segments use camelCase.
 
 ```bash
-scriptname.method()           # Public API method
-scriptname.method.completion.param()  # Tab completion for param
-private.helper()              # Internal/private function
+# CORRECT
+odocker.file.find()                    # dot-separated hierarchy, camelCase
+hiveMind.agent.context.status()        # deep hierarchy is fine
+scrumMaster.subscription()             # camelCase script name
+private.odocker.resolve.image()        # private prefix + dots
+
+# WRONG
+odocker.file-find()                    # dash in method name
+hive_mind.agent_status()               # underscores
+odocker.FILE.FIND()                    # uppercase segments
+```
+
+#### Parameter Names: `<camelCase>`
+
+OOSH converts `<paramName>` to bash variable `PARAM_paramName`. Dashes crash bash.
+Underscores technically work but are banned for consistency.
+
+```bash
+# CORRECT
+odocker.file.find() # <containerOrImage> # find Dockerfile
+odocker.run() # <image> <?name> # run container
+scrumMaster.measure.context() # <agentName> <?session> # measure context
+
+# WRONG — all of these break OOSH or violate convention
+odocker.file.find() # <container-or-image> # CRASH: PARAM_container-or-image
+ossh.key.create() # <ssh-dir> # CRASH: PARAM_ssh-dir
+myScript.run() # <agent_name> # BANNED: use agentName
+myScript.find() # <3letterCode> # CRASH: cannot start with number
+```
+
+#### Completion Functions: `script.method.completion.paramName`
+
+Must exactly match the parameter name from the method signature.
+
+```bash
+# CORRECT — paramName matches in signature and completion function
+odocker.file.find() # <containerOrImage> # find Dockerfile
+odocker.file.find.completion.containerOrImage() {
+  docker ps -a --format '{{.Names}}'
+  docker images --format '{{.Repository}}:{{.Tag}}'
+}
+
+# WRONG — dash in function name is invalid bash
+odocker.file.find.completion.container-or-image() { ... }
+```
+
+#### Local Variables: camelCase
+
+```bash
+# CORRECT
+local imageName wsPath totalCount
+local isActive=true
+
+# WRONG
+local image_name ws_path total_count    # underscores
+local image-name                        # bash syntax error
+```
+
+#### Summary Table
+
+| Element | Pattern | Example |
+|---------|---------|---------|
+| Script file | lowercase or camelCase | `odocker`, `scrumMaster`, `hiveMind` |
+| Public method | `script.methodName()` | `odocker.file.find()` |
+| Private method | `private.script.methodName()` | `private.odocker.resolve.image()` |
+| Parameter | `<camelCase>` | `<containerOrImage>` |
+| Completion | `script.method.completion.paramName()` | `odocker.file.find.completion.containerOrImage()` |
+| Local variable | `camelCase` | `local imageName` |
+| Environment var | `UPPER_SNAKE` (bash convention) | `ODOCKER_WORKSPACES` |
+
+**Environment variables are the one exception** — they follow standard bash
+convention (`UPPER_SNAKE_CASE`) because they interact with the shell environment.
+
+**Detection commands:**
+```bash
+# Find dashes in parameter names
+grep -E '# <[a-zA-Z0-9]*-' scriptname
+
+# Find dashes in function names
+grep -E '^[a-zA-Z].*-.*\(\)' scriptname
+
+# Find underscores in method names (excluding private. and UPPER_CASE)
+grep -E '^[a-z].*_.*\(\)' scriptname
 ```
 
 ### Calling Convention
@@ -323,45 +414,6 @@ myScript.copy.completion.flags() {
   echo "-f"
 }
 ```
-
-### Parameter Naming Rules (MANDATORY)
-
-OOSH converts method signature parameters into bash variables (`PARAM_<name>`).
-Parameter names **must be valid bash identifiers**. This is a framework-level
-constraint, not a style preference.
-
-**Rules:**
-1. **camelCase only** — multi-word params use camelCase
-2. **Dashes FORBIDDEN** — bash cannot assign `PARAM_some-name` (syntax error)
-3. **No underscores** — use camelCase instead of snake_case for consistency
-4. **Cannot start with a number**
-5. **Completion function names must match** — `method.completion.<paramName>()`
-
-| WRONG | WHY | CORRECT |
-|-------|-----|---------|
-| `<container-or-image>` | `PARAM_container-or-image` crashes bash | `<containerOrImage>` |
-| `<ssh-dir>` | `PARAM_ssh-dir` is invalid | `<sshDir>` |
-| `<name_or_pane>` | Underscores break convention | `<nameOrPane>` |
-| `<3letter>` | Cannot start with number | `<threeLetterCode>` |
-
-**Completion functions must match the parameter name exactly:**
-
-```bash
-# CORRECT — parameter and completion function both use camelCase
-myScript.find() # <containerOrImage> # find something
-{ ... }
-myScript.find.completion.containerOrImage() {
-  docker ps -a --format '{{.Names}}'
-}
-
-# WRONG — dash in completion function name
-myScript.find.completion.container-or-image() {  # INVALID bash identifier
-  ...
-}
-```
-
-**If you find a violation:** fix it immediately. Use `grep -E '# <[a-zA-Z0-9]*-' scriptname`
-to detect dashes in parameter names across any script.
 
 ---
 
