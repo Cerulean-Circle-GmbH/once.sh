@@ -307,7 +307,7 @@ Defined in `templates/user/2c.intsall`:
 ### Comment Syntax for Completion
 
 ```bash
-# Format: # <required-param> <?optional-param> # description
+# Format: # <requiredParam> <?optionalParam> # description
 
 myScript.copy() # <source> <dest> <?flags> # copy files from source to dest
 {
@@ -323,6 +323,45 @@ myScript.copy.completion.flags() {
   echo "-f"
 }
 ```
+
+### Parameter Naming Rules (MANDATORY)
+
+OOSH converts method signature parameters into bash variables (`PARAM_<name>`).
+Parameter names **must be valid bash identifiers**. This is a framework-level
+constraint, not a style preference.
+
+**Rules:**
+1. **camelCase only** — multi-word params use camelCase
+2. **Dashes FORBIDDEN** — bash cannot assign `PARAM_some-name` (syntax error)
+3. **No underscores** — use camelCase instead of snake_case for consistency
+4. **Cannot start with a number**
+5. **Completion function names must match** — `method.completion.<paramName>()`
+
+| WRONG | WHY | CORRECT |
+|-------|-----|---------|
+| `<container-or-image>` | `PARAM_container-or-image` crashes bash | `<containerOrImage>` |
+| `<ssh-dir>` | `PARAM_ssh-dir` is invalid | `<sshDir>` |
+| `<name_or_pane>` | Underscores break convention | `<nameOrPane>` |
+| `<3letter>` | Cannot start with number | `<threeLetterCode>` |
+
+**Completion functions must match the parameter name exactly:**
+
+```bash
+# CORRECT — parameter and completion function both use camelCase
+myScript.find() # <containerOrImage> # find something
+{ ... }
+myScript.find.completion.containerOrImage() {
+  docker ps -a --format '{{.Names}}'
+}
+
+# WRONG — dash in completion function name
+myScript.find.completion.container-or-image() {  # INVALID bash identifier
+  ...
+}
+```
+
+**If you find a violation:** fix it immediately. Use `grep -E '# <[a-zA-Z0-9]*-' scriptname`
+to detect dashes in parameter names across any script.
 
 ---
 
