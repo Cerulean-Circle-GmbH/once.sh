@@ -1490,7 +1490,140 @@ hiveMind.agent.verify() # <pane> # check if agent is alive and processing
   return 1
 }
 
-hiveMind.agent.context.status() # <?session> # show context % for all registered agents in a team
+hiveMind.agent.context.status() # <agent> <?session> # show context % for one agent by role name
+{
+  local agent="$1"
+  local session="${2:-$(private.hiveMind.active.team)}"
+
+  if [ -z "$agent" ]; then
+    echo "Usage: hiveMind agent.context.status <agent-name> [session]"
+    return 1
+  fi
+
+  # Find the agent in the registry
+  local target=""
+  while IFS='|' read -r t r; do
+    [ -z "$t" ] || [ -z "$r" ] && continue
+    case "$t" in "${session}:"*) ;; *) continue ;; esac
+    if [ "$r" = "$agent" ]; then
+      target="$t"
+      break
+    fi
+  done < <(private.hiveMind.registry.list "$session")
+
+  if [ -z "$target" ]; then
+    echo "Agent '$agent' not found in $session"
+    return 1
+  fi
+
+  local pane_short="${target#${session}:}"
+  local self_pane
+  self_pane=$(tmux display-message -p "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+
+  # Self detection
+  if [ "$target" = "$self_pane" ]; then
+    printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "—" "—" "SELF"
+    return 0
+  fi
+
+  # Tron pane — never touch
+  if [ "$pane_short" = "0.4" ]; then
+    printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "—" "—" "TRON-SKIP"
+    return 0
+  fi
+
+  # Capture pane
+  local content
+  content=$(tmux capture-pane -t "$target" -p -S -20 2>/dev/null)
+  if [ $? -ne 0 ]; then
+    printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "—" "—" "NO-PANE"
+    return 1
+  fi
+
+  # Check if Claude is running
+  if ! echo "$content" | grep -qE '❯|tool use|tokens|Composing|Musing|Thinking|Cascading|Incubating|Frosting|Kneading|Ideating|Seasoning|Noodling|Transmuting|Fluttering|Cerebrating|Orbiting|Running|Reading|Allow.*Deny|esc to interrupt'; then
+    printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "—" "—" "NO-CLAUDE"
+    return 1
+  fi
+
+  # Detect state
+  local state="unknown"
+  local bottom
+  bottom=$(echo "$content" | tail -10)
+  if echo "$bottom" | grep -qE '^[[:space:]]*❯|^[[:space:]]*>[[:space:]]*$'; then
+    state="idle"
+  elif echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
+    state="permission"
+  elif echo "$content" | grep -qiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Kneading|Ideating|Seasoning|Noodling|Transmuting|Fluttering|Cerebrating|Orbiting|Running|Reading'; then
+    state="active"
+  fi
+
+  # Only send /context to idle agents
+  if [ "$state" != "idle" ]; then
+    printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "—" "—" "BUSY:$state"
+    return 0
+  fi
+
+  # Send /context, wait, capture result
+  tmux send-keys -t "$target" -l "/context"
+  sleep 0.3
+  tmux send-keys -t "$target" Enter
+  sleep 0.3
+  tmux send-keys -t "$target" Enter
+  sleep 5
+
+  local ctx_output
+  ctx_output=$(tmux capture-pane -t "$target" -p -S - 2>/dev/null)
+
+  # Parse token line
+  local token_line pct tokens
+  token_line=$(echo "$ctx_output" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr '\n' ' ' | grep -oE '[0-9]+k/[0-9]+k tokens \([0-9]+%\)' | tail -1)
+
+  if [ -n "$token_line" ]; then
+    pct=$(echo "$token_line" | grep -oE '\([0-9]+%\)' | grep -oE '[0-9]+')
+    tokens=$(echo "$token_line" | grep -oE '[0-9]+k/[0-9]+k')
+  else
+    local clean fallback_line
+    clean=$(echo "$ctx_output" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+    fallback_line=$(echo "$clean" | grep -iE 'token|context' | grep -E '[0-9]+%' | head -1)
+    pct=$(echo "$fallback_line" | grep -oE '[0-9]+%' | grep -oE '[0-9]+' | head -1)
+    if echo "$fallback_line" | grep -qi 'remaining'; then
+      local pct_is_remaining="yes"
+    fi
+    tokens="—"
+  fi
+
+  if [ -z "$pct" ]; then
+    printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "?" "parse-fail" "UNKNOWN"
+    return 1
+  fi
+
+  local remaining
+  if [ "${pct_is_remaining:-}" = "yes" ]; then
+    remaining=$pct
+  else
+    remaining=$((100 - pct))
+  fi
+
+  local threshold="OK"
+  if [ "$remaining" -lt 25 ]; then
+    threshold="DANGER"
+  elif [ "$remaining" -lt 35 ]; then
+    threshold="CRITICAL"
+  elif [ "$remaining" -lt 50 ]; then
+    threshold="WARN"
+  fi
+
+  printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "${remaining}%" "$tokens" "$threshold"
+}
+hiveMind.agent.context.status.completion.agent() {
+  private.hiveMind.roles.complete
+}
+hiveMind.agent.context.status.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.team.context.status() # <?session> # show context % for all registered agents in a team
 {
   local session="${1:-$(private.hiveMind.active.team)}"
   local self_pane
@@ -1637,7 +1770,7 @@ hiveMind.agent.context.status() # <?session> # show context % for all registered
     echo "No alerts."
   fi
 }
-hiveMind.agent.context.status.completion.session() {
+hiveMind.team.context.status.completion.session() {
   private.hiveMind.teams.complete
 }
 

@@ -36,7 +36,7 @@ Dots separate hierarchy levels. Multi-word segments use camelCase.
 ```bash
 # CORRECT
 odocker.file.find()                    # dot-separated hierarchy, camelCase
-hiveMind.agent.context.status()        # deep hierarchy is fine
+hiveMind.team.context.status()         # deep hierarchy is fine
 scrumMaster.subscription()             # camelCase script name
 private.odocker.resolve.image()        # private prefix + dots
 
@@ -174,7 +174,8 @@ subject, the method describes what it does to what.
 ```bash
 # CORRECT — object.verb / object.noun.verb
 odocker.file.find()           # odocker finds a file
-hiveMind.agent.context.status()  # hiveMind reports agent context status
+hiveMind.agent.context.status()  # hiveMind reports one agent's context
+hiveMind.team.context.status()   # hiveMind reports all agents' context
 scrumMaster.velocity()        # scrumMaster reports velocity
 config.set()                  # config sets a value
 log.level()                   # log sets the level
