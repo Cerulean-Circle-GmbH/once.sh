@@ -119,11 +119,7 @@ ossh.list.ids() # <?id> <?sshDir:~/.ssh> # list available ids
   shift 2>/dev/null
   private.get.sshDir "$1"
   local sshDir="$RESULT"
-  if [ -n "$id" ]; then
-    tree -L 1 "$sshDir/ids" | line find "$id"
-  else
-    tree -L 1 "$sshDir/ids"
-  fi
+  tree -L 1 $sshDir/ids | line find "$id"
 }
 
 ossh.get.public.id() # <?id> <?sshDir:~/.ssh> # prints the public key of <id> to the console
@@ -337,84 +333,59 @@ ossh.create.and.install() { #  <sshConfigHost> <url> # creates a config <sshConf
   
 }
 
-ossh.install() { # <sshConfigHost> <?user> # installs oosh on <sshConfigHost>, optionally sets up oosh for <user>
+ossh.install() { # <sshConfigHost> # pushes the oosh installer to the <sshConfigHost>
   local sshConfigHost="$1"
   if [ -n "$1" ]; then
     shift
+    ossh.config.parse $sshConfigHost private.push.init.oosh
+    return $?
   else
     error.log "no sshConfigHost was specified"
     return 1
   fi
-
-  # Optional: target user for oosh setup after root install
-  OSSH_INSTALL_TARGET_USER="$1"
-  if [ -n "$1" ]; then
-    shift
+  
+  if [ -z "$url" ]; then
+    error.log "no url"
+    return 1
   fi
 
-  ossh.config.parse $sshConfigHost private.push.init.oosh
-  return $?
+  if [ -z "$user" ]; then
+    ossh.config.parse.url $url private.push.init.oosh
+  else
+    private.push.init.oosh
+  fi
+
 }
 
 private.push.init.oosh() {
 
   private.get.sshDir
   local file="$RESULT/public_keys/$( ossh.get.file.name ).public_key"
-  local keyFileName="$( ossh.get.file.name ).public_key"
   info.log "file=$file"
 
   # Open persistent connection (password entered once)
-  ossh.connection.open "$sshConfigHost" || {
-    error.log "Failed to open SSH connection to $sshConfigHost"
-    return 1
-  }
+  ossh.connection.open "$sshConfigHost"
 
-  # Transfer init/oosh via ssh cat (no rsync needed on remote)
-  info.log "Transferring init/oosh to $sshConfigHost via SSH..."
-  private.ossh.ssh "$sshConfigHost" "cat > ~/oosh && chmod +x ~/oosh" < "$OOSH_DIR/init/oosh" || {
-    error.log "Failed to transfer init/oosh to $sshConfigHost"
-    return 1
-  }
+  if private.ossh.rsync "$OOSH_DIR/init/oosh" "$sshConfigHost:." && \
+     private.ossh.rsync "$file" "$sshConfigHost:."; then
+    success.log "successfully copied oosh"
+    private.ossh.ssh "$sshConfigHost" "./oosh mode ssh $sshConfigHost $OOSH_SSH_CONFIG_HOST $OOSH_MODE"
 
-  # Transfer public key via ssh cat
-  info.log "Transferring public key to $sshConfigHost..."
-  private.ossh.ssh "$sshConfigHost" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/$keyFileName" < "$file" || {
-    error.log "Failed to transfer public key to $sshConfigHost"
-    return 1
-  }
+    important.log "remote installation done: $?"
+  else
+    problem.log "maybe already installed?"
 
-  success.log "Successfully transferred init files to $sshConfigHost"
-
-  # Run remote installer — always installs to root
-  # Pass current git branch as argument (not env var — init/oosh shebang uses env -i which wipes environment)
-  local currentBranch
-  currentBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  info.log "Running remote oosh installer (root mode, branch: $currentBranch)..."
-  # Use '_' placeholder for empty OOSH_SSH_CONFIG_HOST — empty args get lost across SSH + shebang chain
-  private.ossh.ssh "$sshConfigHost" "./oosh mode root $sshConfigHost ${OOSH_SSH_CONFIG_HOST:-_} $currentBranch"
-  local remote_rc=$?
-
-  if [ $remote_rc -ne 0 ]; then
-    error.log "Remote installation failed (exit code: $remote_rc)"
-    return 1
+    private.ossh.ssh "$sshConfigHost" "bash /home/$user/oosh/ossh continue.local.install from $(ossh.get.url)"
   fi
-
-  important.log "Remote installation done"
-
-  # Fix hardcoded /root paths in shared config files so non-root users can source them
-  # config save during state machine writes CONFIG_PATH="/root/config" (root's symlink to shared)
-  # Replace with $HOME/config which resolves correctly for any user
-  private.ossh.ssh "$sshConfigHost" "
-    sed -i 's|/root/config|\$HOME/config|g' ~/config/user.env
-    sed -i 's|/root/oosh|\$HOME/oosh|g' ~/config/user.env
-  " || {
-    warn.log "Failed to fix hardcoded paths in shared user.env"
-  }
 
   source $CONFIG
   config list
+  
+  # problem.log "ossh 
+  # in private.push.init.oosh
+  # before ossh.install.finish.local $sshConfigHost"
 
-  ossh.install.finish.local $sshConfigHost "$OSSH_INSTALL_TARGET_USER"
+  ossh.install.finish.local $sshConfigHost
 
 }
 
@@ -445,16 +416,11 @@ ossh.install.continue.local() { # <remoteSshConfigName> <sshConfigNameUsedForLoc
     fi
   fi
 
-  # Detect branch from initial clone and export for state 21's git checkout
-  if [ -z "$OOSH_BRANCH" ]; then
-    OOSH_BRANCH=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
-    export OOSH_BRANCH
-    important.log "Detected OOSH_BRANCH=$OOSH_BRANCH from $OOSH_DIR"
-  fi
-
   oo update
   #source user
   oo state
+  state next
+  #state next
 
   source $CONFIG
   config list
@@ -491,177 +457,10 @@ ossh.install.finish.local() { # # finishes local oosh installation
     return 1
   fi
 
-  local targetUser="$1"
-  if [ -n "$1" ]; then
-    shift
-  fi
-
-  ossh.push.config $sshConfigHost || {
-    warn.log "Failed to push config to $sshConfigHost — continuing"
-  }
-
-  local remoteKeyName
+  ossh.push.config $sshConfigHost
   remoteKeyName=$( ossh.exec $sshConfigHost "ossh get.key.name" )
-  if [ -z "$remoteKeyName" ]; then
-    warn.log "Could not get remote key name from $sshConfigHost — skipping key pull"
-  else
-    ossh.pull.key $sshConfigHost $remoteKeyName || {
-      warn.log "Failed to pull key from $sshConfigHost — continuing"
-    }
-    ossh.update.authorized_keys
-  fi
-
-  # If a target user was specified, set up oosh for that user
-  if [ -n "$targetUser" ]; then
-    ossh.install.user.remote $sshConfigHost "$targetUser"
-  fi
-}
-
-ossh.install.user.remote() { # <sshConfigHost> <user> # sets up oosh for <user> on <sshConfigHost> using shared folder model
-  local sshConfigHost="$1"
-  if [ -n "$1" ]; then
-    shift
-  else
-    error.log "no sshConfigHost was specified"
-    return 1
-  fi
-
-  local targetUser="$1"
-  if [ -n "$1" ]; then
-    shift
-  else
-    error.log "no target user was specified"
-    return 1
-  fi
-
-  important.log "Setting up oosh for user '$targetUser' on $sshConfigHost (shared folder model)..."
-
-  # NOTE: The SSH ControlMaster connection logs in as the SSH config user,
-  # which IS the target user. So we run commands directly — no sudo needed.
-
-  # 1. Verify user exists on remote
-  private.ossh.ssh "$sshConfigHost" "id '$targetUser'" >/dev/null 2>&1 || {
-    error.log "User '$targetUser' does not exist on $sshConfigHost"
-    return 1
-  }
-
-  # 2. Get shared paths from developking's home (created by state machine state 21)
-  local devHome
-  devHome=$(private.ossh.ssh "$sshConfigHost" "eval echo ~developking 2>/dev/null")
-  if [ -z "$devHome" ]; then
-    error.log "developking user not found on $sshConfigHost — root install may not have completed"
-    return 1
-  fi
-  local dir
-  dir=$(private.ossh.ssh "$sshConfigHost" "dirname '$devHome'")
-  local sharedConfig="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-  local sharedOosh="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/dev"
-  info.log "Shared config: $sharedConfig"
-  info.log "Shared oosh:   $sharedOosh"
-
-  # 3. Verify shared infrastructure exists
-  private.ossh.ssh "$sshConfigHost" "[ -d '$sharedOosh' ]" || {
-    error.log "Shared oosh not found at $sharedOosh — run 'ossh install $sshConfigHost' (root) first"
-    return 1
-  }
-
-  # 4. Remove leftover init/oosh bootstrap file if present (placed during root install)
-  private.ossh.ssh "$sshConfigHost" "
-    if [ -f \"\$HOME/oosh\" ] && [ ! -d \"\$HOME/oosh\" ]; then
-      echo 'Removing leftover init/oosh bootstrap file'
-      rm -f \"\$HOME/oosh\"
-    fi
-  "
-
-  # 5. Symlink config and oosh to shared folders (mirrors state 25: user.shared.dev.folder.linked)
-  private.ossh.ssh "$sshConfigHost" "
-    cd \$HOME
-    # Back up existing config if not already symlinked
-    if [ -d config ] && [ ! -L config ]; then
-      mv config config.orig
-    fi
-    if [ ! -L config ]; then
-      ln -s '$sharedConfig' config
-    fi
-    # Back up existing oosh dir/file if not already symlinked
-    if [ -d oosh ] && [ ! -L oosh ]; then
-      mv oosh oosh.orig
-    fi
-    if [ ! -L oosh ]; then
-      ln -s '$sharedOosh' oosh
-    fi
-  " || {
-    error.log "Failed to create symlinks for $targetUser"
-    return 1
-  }
-  success.log "Symlinked ~/config and ~/oosh to shared folders for $targetUser"
-
-  # 6. Install bashrc_template (or append source line)
-  private.ossh.ssh "$sshConfigHost" "
-    if [ -f \"\$HOME/.bashrc\" ] && [ ! -f \"\$HOME/.bashrc.pre-oosh\" ]; then
-      cp \"\$HOME/.bashrc\" \"\$HOME/.bashrc.pre-oosh\"
-    fi
-    if [ -f \"\$HOME/oosh/templates/user/bashrc_template\" ]; then
-      cp \"\$HOME/oosh/templates/user/bashrc_template\" \"\$HOME/.bashrc\"
-    else
-      if ! grep -q 'config/user.env' \"\$HOME/.bashrc\" 2>/dev/null; then
-        echo '' >> \"\$HOME/.bashrc\"
-        echo '# oosh environment' >> \"\$HOME/.bashrc\"
-        echo '[ -f ~/config/user.env ] && source ~/config/user.env' >> \"\$HOME/.bashrc\"
-      fi
-    fi
-  " || {
-    warn.log "Failed to update .bashrc for $targetUser"
-  }
-
-  # 6b. Add git safe.directory for shared oosh repo (owned by root/developking)
-  private.ossh.ssh "$sshConfigHost" "
-    git config --global --add safe.directory '$sharedOosh'
-  " || {
-    warn.log "Failed to add git safe.directory for $targetUser"
-  }
-
-  # 7. Verify state machine from user's perspective
-  # The shared config means user inherits root's state machine at [99]
-  # Use $CONFIG_PATH-relative paths to avoid /root/config permission errors
-  private.ossh.ssh "$sshConfigHost" "
-    if [ -f \"\$HOME/config/user.env\" ] && [ -f \"\$HOME/config/current.state.machine.env\" ]; then
-      source \"\$HOME/config/user.env\" 2>/dev/null
-      source \"\$HOME/config/current.state.machine.env\" 2>/dev/null
-      echo \"State machine SETUP_SERVER at [\${state:-unknown}] for user \$(whoami)\"
-    fi
-  " || {
-    warn.log "State machine verification skipped for $targetUser"
-  }
-
-  # 8. Create SSH key folders
-  private.ossh.ssh "$sshConfigHost" "
-    if [ ! -d \"\$HOME/.ssh\" ]; then
-      mkdir -p \"\$HOME/.ssh\"
-      chmod 700 \"\$HOME/.ssh\"
-      ssh-keygen -t rsa -q -f \"\$HOME/.ssh/id_rsa\" -N ''
-    fi
-    mkdir -p \"\$HOME/.ssh/public_keys\" 2>/dev/null
-    mkdir -p \"\$HOME/.ssh/private_key\" 2>/dev/null
-  " || {
-    warn.log "Failed to create SSH key folders for $targetUser"
-  }
-
-  # 8. Push local public key to user's authorized_keys
-  local keyFile="$HOME/.ssh/public_keys/$( ossh.get.file.name ).public_key"
-  if [ -f "$keyFile" ]; then
-    private.ossh.ssh "$sshConfigHost" "mkdir -p \"\$HOME/.ssh/public_keys\""
-    private.ossh.ssh "$sshConfigHost" "cat > \"\$HOME/.ssh/public_keys/$(basename $keyFile)\"" < "$keyFile"
-    private.ossh.ssh "$sshConfigHost" "
-      cat \"\$HOME/.ssh/public_keys\"/* > \"\$HOME/.ssh/authorized_keys\" 2>/dev/null
-      chmod 600 \"\$HOME/.ssh/authorized_keys\" 2>/dev/null
-    "
-    success.log "Pushed public key to $targetUser's authorized_keys"
-  else
-    warn.log "No local public key found at $keyFile — skipping key push"
-  fi
-
-  success.log "oosh setup complete for user '$targetUser' on $sshConfigHost"
+  ossh.pull.key $sshConfigHost $remoteKeyName
+  ossh.update.authorized_keys
 }
 
 ossh.update.authorized_keys() # <?sshDir:~/.ssh> # updates authorized_keys from public_keys dir
@@ -747,7 +546,7 @@ ossh.install.completion() {
 ossh.parameter.completion.sshConfigHost() {
     private.get.sshDir
     local sshDir="$RESULT"
-    grep '^Host ' $sshDir/config $sshDir/config.d/* 2>/dev/null | cut -d ' ' -f 2- | grep -v '^\*'
+    grep '^Host' $sshDir/config $sshDir/config.d/* 2>/dev/null | cut -d ' ' -f 2-
 }
 
 ossh.parameter.completion.keyName() {
@@ -970,7 +769,7 @@ private.get.sshDir() {
   shift
 
   create.result 0 "$sshDir" "$1"
-  info.log "$RESULT"
+  echo "$RESULT"
   return $(result)
 }
 
@@ -1580,7 +1379,7 @@ ossh.exec() { # <toHost> <command> # executes the command on host <toHost>
   fi
 
 
-  ssh -o ControlPath="$OSSH_CONTROL_PATH" $toHost "[ -f config/user.env ] && source config/user.env; [ -d ~/oosh ] && export PATH=~/oosh:\$PATH; $@"
+  ssh -o ControlPath="$OSSH_CONTROL_PATH" $toHost "source config/user.env; $@"
 }
 
 
