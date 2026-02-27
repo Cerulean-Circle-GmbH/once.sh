@@ -12,11 +12,13 @@ Every log function gates output with `if [ "$LOG_LEVEL" -gt N ]`. Higher levels 
 | 0 | Silent | — | None | Suppress all output |
 | 1 | Errors | `> 0` | `error.log`, `test.console.log`, `test.success.log`, `error.details.log` | CI / test runs |
 | 2 | Warnings | `> 1` | + `warn.log`, `important.log`, `problem.log` | Notice problems |
-| 3 | Console | `> 2` | + `console.log`, `success.log`, `silent.log` | **Default** — normal operation |
+| 3 | Console | `> 2` | + `console.log`, `success.log`, `silent.log` | **Default** — normal operation (see note) |
 | 4 | Info | `> 3` | + `info.log`, `stop.log` | See method dispatch internals |
 | 5 | Debug | `> 4` | + `debug.log` | Full debug messages |
 | 6 | Trace | `> 5` | + `set -x` PS4 tracing via `seq.puml.log()` | Bash execution trace |
 | 7 | Step | `> 6` | + `STEP_DEBUG=ON` interactive breakpoints | Interactive debugging |
+
+> **Note:** During installation, LOG_LEVEL defaults to 1 (errors only). The `LOG_INSTALL` system captures full-density logs to file regardless of LOG_LEVEL.
 
 ### Where the functions are defined
 

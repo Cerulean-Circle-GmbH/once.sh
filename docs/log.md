@@ -323,6 +323,16 @@ exit && bash
 
 Install logging captures a full-density log of every oosh log call during an install, regardless of `LOG_LEVEL`. This is useful for post-mortem debugging of failed installs.
 
+### Default LOG_LEVEL During Install
+
+During installation, `LOG_LEVEL` defaults to **1** (errors only) — keeping the terminal quiet while `LOG_INSTALL` captures everything to file. Interactive sessions default to **3** (set by `this` and `oo`).
+
+To override for a verbose install:
+
+```bash
+./ossh install <host> <user> 5    # LOG_LEVEL=5 for debug output
+```
+
 ### Environment Variable
 
 | Variable | Default | Description |
