@@ -217,19 +217,54 @@ oo.stage.to.prod() # # RELEASES and merges dev to prod
 }
 
 private.oo.worktree.base() {
-  if [ -d "/Users/Shared/Workspaces/AI/Claude.All/components/OOSH" ]; then
-    echo "/Users/Shared/Workspaces/AI/Claude.All/components/OOSH"
-  else
-    dirname "$OOSH_DIR"
+  # Strategy 1: Explicit config override
+  if [ -n "$OOSH_WORKTREE_BASE" ] && [ -d "$OOSH_WORKTREE_BASE" ]; then
+    echo "$OOSH_WORKTREE_BASE"
+    return 0
   fi
+
+  # Strategy 2: Use git worktree list to find main worktree, derive base as its parent
+  if [ -d "$OOSH_DIR/.git" ] || [ -f "$OOSH_DIR/.git" ]; then
+    local main_wt
+    main_wt=$(git -C "$OOSH_DIR" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
+    if [ -n "$main_wt" ]; then
+      local main_base
+      main_base=$(basename "$main_wt")
+      if [ "$main_base" = "main" ]; then
+        dirname "$main_wt"
+        return 0
+      fi
+    fi
+  fi
+
+  # Strategy 3: Check if OOSH_DIR is inside a worktree (has .git file with gitdir: pointer)
+  if [ -f "$OOSH_DIR/.git" ]; then
+    local parent
+    parent=$(dirname "$OOSH_DIR")
+    if [ -d "$parent/main" ]; then
+      echo "$parent"
+      return 0
+    fi
+  fi
+
+  # Strategy 4: Fall back to dirname if sibling "main" directory exists
+  local parent
+  parent=$(dirname "$OOSH_DIR")
+  if [ -d "$parent/main" ] && [ "$parent/main" != "$OOSH_DIR" ]; then
+    echo "$parent"
+    return 0
+  fi
+
+  # No worktree structure detected
+  return 1
 }
 
 oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
 {
   local WORKTREE_BASE
   WORKTREE_BASE=$(private.oo.worktree.base)
+  local has_worktrees=$?
   local OOSH_LINK="$HOME/oosh"
-  local MAIN_DIR="$WORKTREE_BASE/main"
   local branch="$1"
 
   if [ -z "$branch" ]; then
@@ -238,11 +273,24 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
     current_name=$(basename "$(readlink "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")")
     echo "Mode: $current_name"
     echo "Path: $OOSH_DIR"
+    if [ -n "$WORKTREE_BASE" ]; then
+      echo "Worktree base: $WORKTREE_BASE"
+    else
+      echo "Worktree base: (none — run 'oo mode.setup' to enable branch switching)"
+    fi
     if [ -d "$OOSH_DIR" ]; then
       (cd "$OOSH_DIR" && git status --short --branch 2>/dev/null)
     fi
     return 0
   fi
+
+  # Require worktree structure for switching
+  if [ $has_worktrees -ne 0 ] || [ -z "$WORKTREE_BASE" ]; then
+    error.log "No worktree structure detected. Run 'oo mode.setup' to convert your install."
+    return 1
+  fi
+
+  local MAIN_DIR="$WORKTREE_BASE/main"
 
   # Switch to named branch
   local target_dir="$WORKTREE_BASE/$branch"
@@ -260,19 +308,127 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
   if [ -L "$OOSH_LINK" ]; then
     rm "$OOSH_LINK"
   elif [ -d "$OOSH_LINK" ]; then
-    error.log "$OOSH_LINK is a real directory, not a symlink — refusing to switch"
+    error.log "$OOSH_LINK is a real directory, not a symlink. Run 'oo mode.setup' first."
     return 1
   fi
   ln -s "$target_dir" "$OOSH_LINK"
 
   export OOSH_MODE="$branch"
   export OOSH_DIR="$target_dir"
+  config save oosh OOSH 2>/dev/null
   echo "Switched to: $branch ($target_dir)"
 }
+
+oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure for branch switching
+{
+  local OOSH_LINK="$HOME/oosh"
+  local current_dir
+  current_dir=$(readlink -f "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
+
+  # Check if already set up
+  local existing_base
+  existing_base=$(private.oo.worktree.base 2>/dev/null)
+  if [ $? -eq 0 ] && [ -n "$existing_base" ]; then
+    echo "Worktree structure already exists at: $existing_base"
+    return 0
+  fi
+
+  # Determine worktree base directory
+  local base="${1:-$(dirname "$current_dir")}"
+  local main_dir="$base/main"
+
+  # Detect current branch
+  local current_branch
+  current_branch=$(git -C "$current_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ -z "$current_branch" ]; then
+    error.log "Cannot detect current branch in $current_dir"
+    return 1
+  fi
+
+  echo "Setting up worktree structure..."
+  echo "  Source: $current_dir (branch: $current_branch)"
+  echo "  Base:   $base"
+
+  if [ "$current_branch" = "main" ]; then
+    # On main: just move the directory
+    if [ "$current_dir" = "$main_dir" ]; then
+      echo "Already at $main_dir — nothing to move"
+    else
+      echo "Moving $current_dir → $main_dir"
+      mv "$current_dir" "$main_dir"
+    fi
+  else
+    # On a feature branch: move to main dir, checkout main, then worktree add for the branch
+    echo "Moving $current_dir → $main_dir"
+    mv "$current_dir" "$main_dir"
+
+    echo "Switching $main_dir to main branch..."
+    (cd "$main_dir" && git checkout main 2>/dev/null) || {
+      # If main doesn't exist locally, create it from origin/main
+      (cd "$main_dir" && git checkout -b main origin/main 2>/dev/null) || {
+        error.log "Failed to checkout main branch. Restoring original location."
+        mv "$main_dir" "$current_dir"
+        return 1
+      }
+    }
+
+    echo "Creating worktree for $current_branch..."
+    (cd "$main_dir" && git worktree add -B "$current_branch" "../$current_branch" "$current_branch") || {
+      error.log "Failed to create worktree for '$current_branch'. Restoring original location."
+      (cd "$main_dir" && git checkout "$current_branch" 2>/dev/null)
+      mv "$main_dir" "$current_dir"
+      return 1
+    }
+  fi
+
+  # Create symlink
+  local target_dir
+  if [ "$current_branch" = "main" ]; then
+    target_dir="$main_dir"
+  else
+    target_dir="$base/$current_branch"
+  fi
+
+  if [ -L "$OOSH_LINK" ]; then
+    rm "$OOSH_LINK"
+  fi
+  # At this point the original directory was moved, so OOSH_LINK path is free
+  ln -s "$target_dir" "$OOSH_LINK"
+
+  # Update environment
+  export OOSH_WORKTREE_BASE="$base"
+  export OOSH_DIR="$target_dir"
+  export OOSH_MODE="$current_branch"
+  config save oosh OOSH 2>/dev/null
+
+  echo ""
+  echo "Worktree structure created:"
+  echo "  Base:    $base"
+  echo "  Main:    $main_dir"
+  if [ "$current_branch" != "main" ]; then
+    echo "  Branch:  $target_dir"
+  fi
+  echo "  Symlink: $OOSH_LINK → $target_dir"
+  echo ""
+  echo "Use 'oo mode <branch>' to switch branches."
+}
+
 oo.mode.completion.branch() {
   local WORKTREE_BASE
-  WORKTREE_BASE=$(private.oo.worktree.base)
-  ls -d "$WORKTREE_BASE"/*/ 2>/dev/null | xargs -I{} basename {} | grep -v '^\.'
+  WORKTREE_BASE=$(private.oo.worktree.base 2>/dev/null)
+
+  # List local worktree directories
+  if [ -n "$WORKTREE_BASE" ]; then
+    ls -d "$WORKTREE_BASE"/*/ 2>/dev/null | xargs -I{} basename {} | grep -v '^\.'
+  fi
+
+  # Add remote branches that don't have local worktrees yet
+  local git_dir="${WORKTREE_BASE:-$OOSH_DIR}"
+  git -C "$git_dir" branch -r 2>/dev/null | sed 's|.*origin/||' | grep -v 'HEAD' | while read -r rb; do
+    if [ -z "$WORKTREE_BASE" ] || [ ! -d "$WORKTREE_BASE/$rb" ]; then
+      echo "$rb"
+    fi
+  done
 }
 
 oo.use() # <branch> <command> [args...] # run a command from a specific branch without switching
@@ -317,8 +473,12 @@ oo.use() # <branch> <command> [args...] # run a command from a specific branch w
 }
 oo.use.completion.branch() {
   local WORKTREE_BASE
-  WORKTREE_BASE=$(private.oo.worktree.base)
-  ls -d "$WORKTREE_BASE"/*/ 2>/dev/null | xargs -I{} basename {} | grep -v '^\.'
+  WORKTREE_BASE=$(private.oo.worktree.base 2>/dev/null)
+
+  # List local worktree directories (oo.use only works with existing worktrees)
+  if [ -n "$WORKTREE_BASE" ]; then
+    ls -d "$WORKTREE_BASE"/*/ 2>/dev/null | xargs -I{} basename {} | grep -v '^\.'
+  fi
 }
 oo.use.completion.command() {
   # In completion context, $1 is $cur (word being completed), not the branch.
