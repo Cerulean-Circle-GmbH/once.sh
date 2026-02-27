@@ -160,6 +160,11 @@ private.hiveMind.registry.set() {
     warn.log "registry.set: invalid pane target '$target' — expected session:window.pane"
     return 1
   fi
+  # Validate role name: reject boot prompt garbage (>30 chars or contains spaces)
+  if [ "${#role}" -gt 30 ] || echo "$role" | grep -q ' '; then
+    warn.log "registry.set: rejecting invalid role name '${role:0:40}...' — too long or contains spaces"
+    return 1
+  fi
   private.hiveMind.registry.migrate
   # Ensure config directory exists
   local config_dir
@@ -1233,6 +1238,20 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   info.log "Waiting for Claude Code agents to initialize..."
   sleep 8
 
+  # ── Capture UUIDs for identity tracking ─────────────────────────────────
+  info.log "Capturing session UUIDs..."
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local _roles=("oosh-orchestrator" "oosh-expert" "oosh-tester")
+  local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2")
+  for i in 0 1 2; do
+    local _sid
+    _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
+    if [ -n "$_sid" ]; then
+      grep -v "^${_roles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
+      echo "${_roles[$i]}|${_sid}" >> "$ses"
+    fi
+  done
+
   # ── Send role prompts ──────────────────────────────────────────────────
   info.log "Sending role prompts to agents..."
 
@@ -1432,6 +1451,93 @@ hiveMind.registry.fix() # # clean up invalid entries in roles registry (raw %NNN
 }
 hiveMind.registry.fix.completion() { :; }
 
+hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessions from /status ground truth
+{
+  local session="${1:-$(private.hiveMind.active.team)}"
+  [ -z "$session" ] && session=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local updated=0
+
+  # Prune entries for panes that no longer exist in tmux
+  if [ -f "$reg" ]; then
+    local clean=""
+    while IFS='|' read -r pt rl; do
+      [ -z "$pt" ] && continue
+      if tmux display-message -t "$pt" -p "#{pane_id}" >/dev/null 2>&1; then
+        clean="${clean}${pt}|${rl}\n"
+      else
+        info.log "  Pruning dead pane: $pt ($rl)"
+      fi
+    done < "$reg"
+    printf '%b' "$clean" > "$reg"
+  fi
+
+  local pane_list
+  pane_list=$(tmux list-panes -t "$session" -a \
+    -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+
+  while IFS= read -r pane_target; do
+    [ -z "$pane_target" ] && continue
+
+    # Only probe panes with a Claude process
+    claudeCode process.find "$pane_target" >/dev/null 2>&1 || continue
+
+    # Probe: get ground-truth UUID from /status (bypasses stale env files)
+    local sid
+    sid=$(claudeCode session.probe "$pane_target" 2>/dev/null)
+    [ -z "$sid" ] && continue
+
+    # Get session name — only use /rename'd names (role@model format)
+    local name
+    name=$(claudeCode session.name "$sid" 2>/dev/null)
+
+    # Remove stale entry for this pane regardless
+    if [ -f "$reg" ]; then
+      grep -v "^${pane_target}|" "$reg" > "${reg}.tmp" 2>/dev/null
+      mv "${reg}.tmp" "$reg"
+    fi
+
+    # Only write back if we have a proper role@model name
+    [ -z "$name" ] && continue
+    [[ "$name" != *"@"* ]] && continue
+    local role="${name%%@*}"
+
+    # Write roles registry: pane → role
+    echo "${pane_target}|${role}" >> "$reg"
+
+    # Write sessions file: role → uuid
+    if [ -f "$ses" ]; then
+      grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
+      mv "${ses}.tmp" "$ses"
+    fi
+    echo "${role}|${sid}" >> "$ses"
+
+    updated=$((updated + 1))
+    info.log "  $pane_target → $role [$sid]"
+  done <<< "$pane_list"
+
+  # Detect duplicate UUIDs across roles (potential data corruption)
+  if [ -f "$ses" ]; then
+    local dup_uuids
+    dup_uuids=$(awk -F'|' '{print $2}' "$ses" 2>/dev/null | sort | uniq -d)
+    if [ -n "$dup_uuids" ]; then
+      while IFS= read -r dup_sid; do
+        [ -z "$dup_sid" ] && continue
+        local dup_roles
+        dup_roles=$(grep "|${dup_sid}" "$ses" 2>/dev/null | cut -d'|' -f1 | tr '\n' ', ')
+        warn.log "DUPLICATE UUID ${dup_sid:0:8}... shared by roles: ${dup_roles%, }"
+      done <<< "$dup_uuids"
+    fi
+  fi
+
+  success.log "Registry refreshed: $updated entries"
+}
+hiveMind.registry.refresh.completion.session() {
+  private.hiveMind.teams.complete
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT LIFECYCLE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1485,6 +1591,19 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
   # Step 4: Wait for startup
   info.log "Waiting for Claude Code to initialize..."
   sleep 8
+
+  # Step 4b: Capture UUID and write to sessions file
+  local new_sid
+  new_sid=$(claudeCode session.probe "$target_pane" 2>/dev/null)
+  if [ -n "$new_sid" ]; then
+    local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+    if [ -f "$ses" ]; then
+      grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
+      mv "${ses}.tmp" "$ses"
+    fi
+    echo "${role}|${new_sid}" >> "$ses"
+    info.log "Captured session UUID for $role: ${new_sid:0:8}..."
+  fi
 
   # Step 5: Teach role
   local full_prompt
@@ -1578,7 +1697,7 @@ hiveMind.agent.context.status() # <agent> <?session> # show context % for one ag
 
   local pane_short="${target#${session}:}"
   local self_pane
-  self_pane=$(tmux display-message -p "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+  self_pane=$("$OOSH_DIR/otmux" pane.get.target 2>/dev/null)
 
   # Self detection
   if [ "$target" = "$self_pane" ]; then
@@ -1594,8 +1713,8 @@ hiveMind.agent.context.status() # <agent> <?session> # show context % for one ag
 
   # Capture pane
   local content
-  content=$(tmux capture-pane -t "$target" -p -S -20 2>/dev/null)
-  if [ $? -ne 0 ]; then
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" 20 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$content" ]; then
     printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "—" "—" "NO-PANE"
     return 1
   fi
@@ -1625,14 +1744,14 @@ hiveMind.agent.context.status() # <agent> <?session> # show context % for one ag
   fi
 
   # Send /context, wait, capture result
-  tmux send-keys -t "$target" -l "/context"
+  # Double-Enter: first accepts autocomplete dropdown, second submits
+  "$OOSH_DIR/otmux" send.enter "$target" "/context"
   sleep 0.3
-  tmux send-keys -t "$target" Enter
-  sleep 0.3
-  tmux send-keys -t "$target" Enter
+  "$OOSH_DIR/otmux" send "$target" Enter
   sleep 5
 
   local ctx_output
+  # Full scrollback — otmux pane.capture doesn't support -S -, raw tmux required
   ctx_output=$(tmux capture-pane -t "$target" -p -S - 2>/dev/null)
 
   # Parse token line
@@ -1687,7 +1806,7 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
 {
   local session="${1:-$(private.hiveMind.active.team)}"
   local self_pane
-  self_pane=$(tmux display-message -p "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+  self_pane=$("$OOSH_DIR/otmux" pane.get.target 2>/dev/null)
 
   echo "Agent Context Status — $session"
   echo "──────────────────────────────────────────"
@@ -1695,12 +1814,17 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
   echo "──────────────────────────────────────────"
 
   local alerts=""
-  local entry target role
+  local target role pane_title
 
-  while IFS='|' read -r target role; do
-    [ -z "$target" ] || [ -z "$role" ] && continue
+  # Enumerate actual tmux panes (not just registry) — shows unregistered panes too
+  while IFS=$'\t' read -r target pane_title _rest; do
+    [ -z "$target" ] && continue
     # Filter to requested session
     case "$target" in "${session}:"*) ;; *) continue ;; esac
+
+    # Look up role from registry; fall back to pane title or "(unregistered)"
+    role=$(grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2)
+    [ -z "$role" ] && role="${pane_title:-(unregistered)}"
 
     local pane_short="${target#${session}:}"
 
@@ -1718,8 +1842,8 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
 
     # Capture pane to detect state
     local content
-    content=$(tmux capture-pane -t "$target" -p -S -20 2>/dev/null)
-    if [ $? -ne 0 ]; then
+    content=$("$OOSH_DIR/otmux" pane.capture "$target" 20 2>/dev/null)
+    if [ $? -ne 0 ] || [ -z "$content" ]; then
       printf "%-20s %-8s %-6s %-12s %s\n" "$role" "$pane_short" "—" "—" "NO-PANE"
       continue
     fi
@@ -1752,20 +1876,17 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
     fi
 
     # Send /context, wait, capture result
-    # Slash commands trigger TUI autocomplete dropdown. Escape failed to
-    # dismiss it reliably. Instead: type text, first Enter accepts the
-    # autocomplete selection (/context), second Enter submits the command.
-    # If no autocomplete: first Enter submits, second Enter is harmless.
-    tmux send-keys -t "$target" -l "/context"
+    # Slash commands trigger TUI autocomplete dropdown. First Enter accepts
+    # the autocomplete selection, second Enter submits. Double-Enter is safe.
+    "$OOSH_DIR/otmux" send.enter "$target" "/context"
     sleep 0.3
-    tmux send-keys -t "$target" Enter
-    sleep 0.3
-    tmux send-keys -t "$target" Enter
+    "$OOSH_DIR/otmux" send "$target" Enter
     sleep 5
 
     local ctx_output
-    # Capture full scrollback — token line is at TOP of /context output,
-    # ~400+ lines above bottom (agent defs, skills listed below it)
+    # Full scrollback capture — token line is at TOP of /context output,
+    # ~400+ lines above bottom. otmux pane.capture doesn't support full
+    # scrollback (-S -), so raw tmux is required here.
     ctx_output=$(tmux capture-pane -t "$target" -p -S - 2>/dev/null)
 
     # Parse token line: "claude-opus-4-6 · 79k/200k tokens (40%)"
@@ -1819,7 +1940,7 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
     fi
 
     printf "%-20s %-8s %-6s %-12s %s\n" "$role" "$pane_short" "${remaining}%" "$tokens" "$threshold"
-  done < <(private.hiveMind.registry.list "$session")
+  done < <("$OOSH_DIR/otmux" pane.list "$session" 2>/dev/null)
 
   echo "──────────────────────────────────────────"
 
@@ -1897,6 +2018,20 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   # Wait for Claude Code to initialize
   info.log "Waiting for Claude Code agents to initialize..."
   sleep 8
+
+  # ── Capture UUIDs for identity tracking ─────────────────────────────────
+  info.log "Capturing session UUIDs..."
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local _roles=("orchestrator" "scrum-master" "oosh-expert" "oosh-tester")
+  local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2" "${session}:0.3")
+  for i in 0 1 2 3; do
+    local _sid
+    _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
+    if [ -n "$_sid" ]; then
+      grep -v "^${_roles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
+      echo "${_roles[$i]}|${_sid}" >> "$ses"
+    fi
+  done
 
   # ── Send role prompts ──────────────────────────────────────────────────
   info.log "Sending role prompts to agents..."
@@ -3839,6 +3974,70 @@ hiveMind.metrics.summary() # <?lines:20> # summarize recent sweep-log: trends, b
 
   create.result 0 "entries=$total_rows at_risk=$at_risk blocked=$blocked"
   return 0
+}
+
+hiveMind.plan.create() # <slug> # link a plan from ~/.claude/plans/ to session/plans/ with timestamp, symlink back, git commit
+{
+  local slug="$1"
+  local plans_dir="$HOME/.claude/plans"
+  local source_file="$plans_dir/${slug}.md"
+
+  if [ -z "$slug" ]; then
+    error.log "Usage: hiveMind plan.create <slug>"
+    return 1
+  fi
+
+  if [ ! -f "$source_file" ]; then
+    error.log "Plan not found: $source_file"
+    return 1
+  fi
+
+  if [ -L "$source_file" ]; then
+    error.log "Already linked (symlink): $source_file"
+    return 1
+  fi
+
+  # Find session/plans/ dir relative to git workspace
+  local workspace
+  workspace=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -z "$workspace" ]; then
+    error.log "Not in a git repository"
+    return 1
+  fi
+
+  local session_plans="$workspace/session/plans"
+  mkdir -p "$session_plans"
+
+  # Generate timestamped filename
+  local timestamp
+  timestamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  local target_name="${timestamp}.${slug}.plan.md"
+  local target_path="$session_plans/$target_name"
+
+  # Copy to session/plans/
+  cp "$source_file" "$target_path"
+
+  # Replace original with symlink
+  rm "$source_file"
+  ln -s "$target_path" "$source_file"
+
+  # Git add + commit
+  (cd "$workspace" && git add "session/plans/$target_name" && \
+   git commit -m "Plan linked: $target_name
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>")
+
+  success.log "Plan linked: session/plans/$target_name"
+  RESULT="session/plans/$target_name"
+}
+hiveMind.plan.create.completion.slug() {
+  # List non-symlink .md files in ~/.claude/plans/ (plans not yet linked)
+  local plans_dir="$HOME/.claude/plans"
+  [ -d "$plans_dir" ] || return
+  local f
+  for f in "$plans_dir"/*.md; do
+    [ -f "$f" ] && [ ! -L "$f" ] && basename "$f" .md
+  done
 }
 
 hiveMind.fix.path() # # verify OOSH PATH works, scan SKILL.md files for stale export patterns
