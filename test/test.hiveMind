@@ -430,6 +430,256 @@ else
 fi
 
 # ============================================================================
+# IDENTITY CHAIN CONSISTENCY TESTS
+# Cross-compare all identity sources to catch drift between the 4 layers:
+#   Layer 1: Pane → Role       (~/config/hivemind.roles.env)
+#   Layer 2: Role → UUID       (~/config/hivemind.sessions.env)
+#   Layer 3: UUID → Name       (~/.claude/projects/*/sessions-index.json)
+#   Layer 4: PID → UUID        (ps args: --resume <uuid>)
+# ============================================================================
+
+REG_FILE="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+SES_FILE="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+AGENTS_BASE="${HIVEMIND_AGENTS_DIR:-${CLAUDE_PROJECT_DIR:-$WORKSPACE_ROOT}/.claude/agents}"
+
+# Detect a live session with Claude agents for testing
+CONSIST_SESSION=""
+for sess in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+  pane_count=$(tmux list-panes -t "$sess" -F '#{pane_index}' 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$pane_count" -ge 2 ]; then
+    # Check if at least one pane has a registry entry
+    if grep -q "^${sess}:" "$REG_FILE" 2>/dev/null; then
+      CONSIST_SESSION="$sess"
+      break
+    fi
+  fi
+done
+
+# ── T-CONSIST-1: team.context.status shows ALL panes ─────────────────────
+# Every pane in otmux pane.list must appear in team.context.status output.
+# Bug 9: unregistered panes are invisible.
+
+if [ -n "$CONSIST_SESSION" ]; then
+  test.case $level "T-CONSIST-1: team.context.status shows all panes for $CONSIST_SESSION" \
+    echo "checking pane coverage"
+
+  # Get actual pane count from tmux
+  ACTUAL_PANES=$(tmux list-panes -t "$CONSIST_SESSION" -F '#{window_index}.#{pane_index}' 2>/dev/null | wc -l | tr -d ' ')
+
+  # Get reported pane count from team.context.status (count non-header, non-separator, non-alert lines)
+  STATUS_OUTPUT=$(hiveMind team.context.status "$CONSIST_SESSION" 2>/dev/null)
+  REPORTED_PANES=$(echo "$STATUS_OUTPUT" | grep -cE '^\S+\s+[0-9]+\.[0-9]+')
+
+  if [ "$REPORTED_PANES" -ge "$ACTUAL_PANES" ]; then
+    expect.pass "team.context.status shows $REPORTED_PANES panes (actual: $ACTUAL_PANES)"
+  else
+    expect.fail "team.context.status shows only $REPORTED_PANES of $ACTUAL_PANES panes — unregistered panes invisible"
+  fi
+else
+  test.case $level "T-CONSIST-1: team.context.status pane coverage (skipped - no session with agents)" \
+    echo "skipped"
+  expect.pass "skipped — no live session with registered agents"
+fi
+
+# ── T-CONSIST-2: team.context.status uses OOSH wrappers (no raw tmux) ────
+# Bug 8: raw tmux calls violate OOSH-only rule.
+
+test.case $level "T-CONSIST-2: team.context.status has no raw tmux calls" \
+  echo "checking hiveMind source"
+
+# Extract team.context.status function body
+# Extract function body: from declaration to next function declaration
+TCS_START=$(grep -n '^hiveMind\.team\.context\.status()' "$OOSH_DIR/hiveMind" | head -1 | cut -d: -f1)
+TCS_END=$(awk "NR>$TCS_START && /^hiveMind\./{print NR; exit}" "$OOSH_DIR/hiveMind")
+if [ -n "$TCS_START" ] && [ -n "$TCS_END" ]; then
+  RAW_TMUX_COUNT=$(sed -n "${TCS_START},${TCS_END}p" "$OOSH_DIR/hiveMind" | grep -cE '(^|[^a-zA-Z])tmux ' || true)
+else
+  RAW_TMUX_COUNT=0
+fi
+
+if [ "$RAW_TMUX_COUNT" -eq 0 ]; then
+  expect.pass "team.context.status uses 0 raw tmux calls (OOSH-only compliant)"
+else
+  expect.fail "team.context.status has $RAW_TMUX_COUNT raw tmux calls — should use otmux wrappers"
+fi
+
+# ── T-CONSIST-3: Registry role names are valid ───────────────────────────
+# Every role must be < 30 chars, no spaces, and match a .claude/agents/<role>/ directory.
+# Bug 4: boot prompt text leaking into registry.
+
+CONSIST3_TESTED=0
+CONSIST3_FAILED=0
+
+if [ -f "$REG_FILE" ]; then
+  while IFS='|' read -r pane_target role; do
+    [ -z "$role" ] && continue
+    CONSIST3_TESTED=$((CONSIST3_TESTED + 1))
+
+    test.case $level "T-CONSIST-3: registry role valid: $pane_target → $role" \
+      echo "role='$role'"
+
+    # Check length
+    if [ "${#role}" -gt 30 ]; then
+      expect.fail "registry GARBAGE $pane_target: role ${#role} chars — '${role:0:40}...'"
+      CONSIST3_FAILED=$((CONSIST3_FAILED + 1))
+      continue
+    fi
+
+    # Check no spaces
+    if echo "$role" | grep -q ' '; then
+      expect.fail "registry GARBAGE $pane_target: role has spaces: '$role'"
+      CONSIST3_FAILED=$((CONSIST3_FAILED + 1))
+      continue
+    fi
+
+    # Check agent dir exists
+    if [ -d "$AGENTS_BASE/$role" ]; then
+      expect.pass "registry $pane_target = '$role' (valid)"
+    else
+      expect.fail "registry ORPHAN $pane_target: '$role' has no agent directory"
+      CONSIST3_FAILED=$((CONSIST3_FAILED + 1))
+    fi
+  done < "$REG_FILE"
+
+  echo "  T-CONSIST-3 summary: $CONSIST3_TESTED entries, $CONSIST3_FAILED invalid"
+fi
+
+# ── T-CONSIST-4: Registry entries match live panes ───────────────────────
+# Every pane in the registry must still exist in tmux.
+# Bug 5: stale entries persist for dead panes.
+
+CONSIST4_TESTED=0
+CONSIST4_STALE=0
+
+if [ -f "$REG_FILE" ]; then
+  while IFS='|' read -r pane_target role; do
+    [ -z "$pane_target" ] && continue
+    CONSIST4_TESTED=$((CONSIST4_TESTED + 1))
+
+    test.case $level "T-CONSIST-4: registry pane exists in tmux: $pane_target" \
+      echo "checking $pane_target ($role)"
+
+    if tmux display-message -t "$pane_target" -p "#{pane_id}" >/dev/null 2>&1; then
+      expect.pass "registry $pane_target ($role) — pane exists"
+    else
+      expect.fail "registry STALE $pane_target ($role) — pane gone from tmux"
+      CONSIST4_STALE=$((CONSIST4_STALE + 1))
+    fi
+  done < "$REG_FILE"
+
+  echo "  T-CONSIST-4 summary: $CONSIST4_TESTED entries, $CONSIST4_STALE stale"
+fi
+
+# ── T-CONSIST-5: otmux tree titles vs registry roles ────────────────────
+# Pane titles (set by pane.identify) should match registry role names.
+
+if [ -n "$CONSIST_SESSION" ]; then
+  CONSIST5_TESTED=0
+  CONSIST5_MISMATCH=0
+
+  while IFS='|' read -r pane_target role; do
+    [ -z "$pane_target" ] && continue
+    # Only test panes in our consist session
+    echo "$pane_target" | grep -q "^${CONSIST_SESSION}:" || continue
+
+    CONSIST5_TESTED=$((CONSIST5_TESTED + 1))
+
+    # Get pane title from tmux
+    pane_title=$(tmux display-message -t "$pane_target" -p '#{pane_title}' 2>/dev/null)
+
+    test.case $level "T-CONSIST-5: pane title vs registry for $pane_target" \
+      echo "title='$pane_title' registry='$role'"
+
+    # Pane title should contain or match the registry role
+    if [ "$pane_title" = "$role" ]; then
+      expect.pass "title matches registry: $role"
+    elif echo "$pane_title" | grep -qi "$role"; then
+      expect.pass "title '$pane_title' contains registry role '$role'"
+    else
+      expect.fail "title MISMATCH $pane_target: title='$pane_title' registry='$role'"
+      CONSIST5_MISMATCH=$((CONSIST5_MISMATCH + 1))
+    fi
+  done < "$REG_FILE"
+
+  echo "  T-CONSIST-5 summary: $CONSIST5_TESTED tested, $CONSIST5_MISMATCH mismatched"
+fi
+
+# ── T-CONSIST-6: team.status agrees with team.context.status ────────────
+# Both commands describe the same panes — agent names and pane count must match.
+
+if [ -n "$CONSIST_SESSION" ]; then
+  test.case $level "T-CONSIST-6: team.status vs team.context.status agent count" \
+    echo "comparing for $CONSIST_SESSION"
+
+  # Get agent names from team.context.status
+  TCS_AGENTS=$(hiveMind team.context.status "$CONSIST_SESSION" 2>/dev/null | grep -E '^\S+\s+[0-9]+\.[0-9]+' | awk '{print $1}' | sort)
+  TCS_COUNT=$(echo "$TCS_AGENTS" | grep -c . || true)
+
+  # Get agent names from team.status
+  TS_OUTPUT=$(hiveMind team.status "$CONSIST_SESSION" 2>/dev/null)
+  TS_COUNT=$(echo "$TS_OUTPUT" | grep -cE '^\s*(├|└|│).*[0-9]+\.[0-9]+' || true)
+
+  if [ "$TCS_COUNT" -gt 0 ] && [ "$TCS_COUNT" -eq "$TS_COUNT" ]; then
+    expect.pass "both show $TCS_COUNT agents for $CONSIST_SESSION"
+  elif [ "$TCS_COUNT" -eq 0 ] && [ "$TS_COUNT" -eq 0 ]; then
+    expect.pass "both show 0 agents (no registered agents)"
+  else
+    expect.fail "count MISMATCH: team.context.status=$TCS_COUNT team.status=$TS_COUNT"
+  fi
+fi
+
+# ── T-CONSIST-7: registry.set rejects invalid role names ────────────────
+# Bug 4 fix: registry.set should reject entries > 30 chars or with spaces.
+
+test.case $level "T-CONSIST-7: registry.set rejects garbage role name" \
+  echo "testing validation"
+
+# Source hiveMind to get access to private functions
+source hiveMind 2>/dev/null
+
+# Test: role name with spaces (simulating boot prompt leak)
+GARBAGE_ROLE="You are oosh-expert on projectTeam"
+private.hiveMind.registry.set "__test_garbage:0.0" "$GARBAGE_ROLE" 2>/dev/null
+GARBAGE_EXIT=$?
+
+if [ "$GARBAGE_EXIT" -ne 0 ]; then
+  expect.pass "registry.set correctly rejected garbage role (exit $GARBAGE_EXIT)"
+else
+  # Check if it was actually written
+  if grep -q "__test_garbage" "$REG_FILE" 2>/dev/null; then
+    # Clean up
+    grep -v "__test_garbage" "$REG_FILE" > "${REG_FILE}.tmp" 2>/dev/null && mv "${REG_FILE}.tmp" "$REG_FILE"
+    expect.fail "registry.set ACCEPTED garbage role — validation missing"
+  else
+    expect.pass "registry.set did not write garbage role (silent rejection)"
+  fi
+fi
+
+# Test: valid role name should be accepted
+private.hiveMind.registry.set "__test_valid:0.0" "oosh-expert" 2>/dev/null
+VALID_EXIT=$?
+
+test.case $level "T-CONSIST-7: registry.set accepts valid role name" \
+  echo "testing valid name"
+
+if [ "$VALID_EXIT" -eq 0 ] || grep -q "__test_valid.*oosh-expert" "$REG_FILE" 2>/dev/null; then
+  expect.pass "registry.set accepted valid role name 'oosh-expert'"
+else
+  expect.fail "registry.set rejected valid role name 'oosh-expert' (exit $VALID_EXIT)"
+fi
+
+# Clean up test entry
+grep -v "__test_valid" "$REG_FILE" > "${REG_FILE}.tmp" 2>/dev/null && mv "${REG_FILE}.tmp" "$REG_FILE"
+
+# ============================================================================
+# Consistency Tests Summary
+# ============================================================================
+
+echo ""
+echo "  === Identity Consistency Tests Complete ==="
+echo ""
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 
