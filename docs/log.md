@@ -319,6 +319,61 @@ log level 3
 exit && bash
 ```
 
+## Install Logging
+
+Install logging captures a full-density log of every oosh log call during an install, regardless of `LOG_LEVEL`. This is useful for post-mortem debugging of failed installs.
+
+### Environment Variable
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_INSTALL` | (unset) | Path to install log file. When set, all log functions append to this file unconditionally. |
+
+### Lifecycle
+
+```bash
+# Start install logging (creates file, sets LOG_INSTALL)
+log.install.init ~/config/install.log
+
+# ... run install process ...
+# All log functions (console.log, error.log, etc.) automatically
+# append full-density entries to $LOG_INSTALL
+
+# Finalize (writes summary, unsets LOG_INSTALL)
+log.install.finish
+```
+
+### Inspection Methods
+
+| Command | Description |
+|---------|-------------|
+| `log.install` | View the full install log (`cat`) |
+| `log.install.errors` | Show only ERROR lines from the install log |
+| `log.install.live` | Follow the install log in real-time (`tail -f`) during an active install |
+| `log.install.init [path]` | Start install logging to a file |
+| `log.install.finish` | Finalize the install log and report summary |
+
+### Usage Examples
+
+```bash
+# After an install completes, view the log
+./log install
+
+# Check for errors only
+./log install.errors
+
+# During an install, follow in another terminal
+./log install.live
+```
+
+### Remote Inspection
+
+When using `ossh` to install on remote servers, the install log can be inspected via:
+
+```bash
+ossh install.log    # View install log from remote server
+```
+
 ## See Also
 
 - [State Machine Documentation](state.md)
