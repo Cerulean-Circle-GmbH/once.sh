@@ -671,6 +671,123 @@ fi
 # Clean up test entry
 grep -v "__test_valid" "$REG_FILE" > "${REG_FILE}.tmp" 2>/dev/null && mv "${REG_FILE}.tmp" "$REG_FILE"
 
+# ── T-CONSIST-8: session.id matches otmux tree.detailed UUID (BUG-10) ────
+# For each Claude pane, claudeCode session.id should return a UUID whose
+# first 8 chars match the truncated UUID shown by otmux tree.detailed.
+# tree.detailed shows [8-char-hex] from ps args (ground truth for --resume).
+# If session.id disagrees, it's returning stale data.
+
+# Scan ALL sessions for Claude panes (not just CONSIST_SESSION)
+CONSIST8_TESTED=0
+CONSIST8_PASSED=0
+CONSIST8_FAILED=0
+
+TREE_OUTPUT=$(otmux tree.detailed 2>/dev/null)
+CURRENT_SESS=""
+
+while IFS= read -r line; do
+  # Session header: "├── sessionName (...)" or "└── sessionName (...)"
+  if echo "$line" | grep -qE '^[├└]── '; then
+    CURRENT_SESS=$(echo "$line" | sed 's/^[├└]── //' | sed 's/ (.*//')
+    continue
+  fi
+
+  # Pane line with Claude version: must have [digits.digits.digits]
+  echo "$line" | grep -qE '\[[0-9]+\.[0-9]+\.[0-9]+\]' || continue
+
+  # Extract pane address
+  PANE_ADDR=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  [ -z "$PANE_ADDR" ] && continue
+  [ -z "$CURRENT_SESS" ] && continue
+
+  FULL_PANE="${CURRENT_SESS}:${PANE_ADDR}"
+
+  # Extract truncated UUID from tree.detailed: [8-hex-chars] on sub-lines
+  # tree.detailed shows UUIDs like [75ce660f] on the line BELOW the pane line
+  # But some formats put it inline. Check both: full UUID or 8-char truncated
+  TREE_UUID_FULL=$(echo "$line" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -1)
+  TREE_UUID_SHORT=""
+
+  # If no full UUID on this line, we'll check below
+  if [ -z "$TREE_UUID_FULL" ]; then
+    # Read ahead: the next line(s) may have the truncated UUID in brackets [8hexchars]
+    continue
+  fi
+
+  # Get what session.id returns
+  SID_UUID=$(claudeCode session.id "$FULL_PANE" 2>/dev/null)
+
+  CONSIST8_TESTED=$((CONSIST8_TESTED + 1))
+
+  test.case $level "T-CONSIST-8: session.id vs tree.detailed for $FULL_PANE" \
+    echo "sid=${SID_UUID:-empty} tree=${TREE_UUID_FULL:0:8}"
+
+  if [ -z "$SID_UUID" ]; then
+    expect.fail "session.id returned EMPTY for $FULL_PANE (tree shows ${TREE_UUID_FULL:0:8}...)"
+    CONSIST8_FAILED=$((CONSIST8_FAILED + 1))
+  elif [ "$SID_UUID" = "$TREE_UUID_FULL" ]; then
+    expect.pass "session.id $FULL_PANE = ${SID_UUID:0:8}... (exact match)"
+    CONSIST8_PASSED=$((CONSIST8_PASSED + 1))
+  elif [ "${SID_UUID:0:8}" = "${TREE_UUID_FULL:0:8}" ]; then
+    expect.pass "session.id $FULL_PANE = ${SID_UUID:0:8}... (prefix match)"
+    CONSIST8_PASSED=$((CONSIST8_PASSED + 1))
+  else
+    expect.fail "session.id STALE $FULL_PANE: sid=${SID_UUID:0:8}... tree=${TREE_UUID_FULL:0:8}..."
+    CONSIST8_FAILED=$((CONSIST8_FAILED + 1))
+  fi
+done <<< "$TREE_OUTPUT"
+
+# Also check sub-lines with truncated UUIDs: [8hexchars]
+# tree.detailed puts UUID on indent lines like "│     └ role-name  [75ce660f]"
+CURRENT_SESS=""
+LAST_PANE=""
+
+while IFS= read -r line; do
+  if echo "$line" | grep -qE '^[├└]── '; then
+    CURRENT_SESS=$(echo "$line" | sed 's/^[├└]── //' | sed 's/ (.*//')
+    LAST_PANE=""
+    continue
+  fi
+
+  # Track pane addresses from pane lines
+  if echo "$line" | grep -qE '\[[0-9]+\.[0-9]+\.[0-9]+\]'; then
+    LAST_PANE=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    continue
+  fi
+
+  # Sub-line with truncated UUID: "│     └ name  [8hexchars]"
+  SHORT_UUID=$(echo "$line" | grep -oE '\[[0-9a-f]{8}\]' | tr -d '[]')
+  [ -z "$SHORT_UUID" ] && continue
+  [ -z "$LAST_PANE" ] && continue
+  [ -z "$CURRENT_SESS" ] && continue
+
+  FULL_PANE="${CURRENT_SESS}:${LAST_PANE}"
+
+  # Skip if already tested with full UUID
+  # Get what session.id returns
+  SID_UUID=$(claudeCode session.id "$FULL_PANE" 2>/dev/null)
+
+  CONSIST8_TESTED=$((CONSIST8_TESTED + 1))
+
+  test.case $level "T-CONSIST-8: session.id prefix vs tree for $FULL_PANE" \
+    echo "sid=${SID_UUID:-empty} tree_short=${SHORT_UUID}"
+
+  if [ -z "$SID_UUID" ]; then
+    expect.fail "session.id returned EMPTY for $FULL_PANE (tree shows ${SHORT_UUID})"
+    CONSIST8_FAILED=$((CONSIST8_FAILED + 1))
+  elif [ "${SID_UUID:0:8}" = "$SHORT_UUID" ]; then
+    expect.pass "session.id $FULL_PANE prefix ${SID_UUID:0:8} matches tree ${SHORT_UUID}"
+    CONSIST8_PASSED=$((CONSIST8_PASSED + 1))
+  else
+    expect.fail "session.id STALE $FULL_PANE: sid=${SID_UUID:0:8} != tree=${SHORT_UUID}"
+    CONSIST8_FAILED=$((CONSIST8_FAILED + 1))
+  fi
+
+  LAST_PANE=""  # reset to avoid double-testing
+done <<< "$TREE_OUTPUT"
+
+echo "  T-CONSIST-8 summary: $CONSIST8_TESTED tested, $CONSIST8_PASSED passed, $CONSIST8_FAILED failed"
+
 # ============================================================================
 # Consistency Tests Summary
 # ============================================================================
