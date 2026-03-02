@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# hiveMind.registry — registry, sessions, pane identity
+# Sourced by hiveMind.start()
+
+private.hiveMind.pane.identify() {
+  # Register role for a pane: write to registry, set pane title, export env var
+  # Usage: private.hiveMind.pane.identify <target> <role>
+  local target="$1"
+  local role="$2"
+  private.hiveMind.registry.set "$target" "$role"
+  otmux pane.title "$target" "$role"
+  otmux send.enter "$target" "export HIVEMIND_ROLE=$role"
+}
+
+# ── Role Registry ─────────────────────────────────────────────────────────────
+# File-based mapping: pane target → role name.
+# Survives Claude Code overwriting pane titles.
+# Format: target|role  (one per line, e.g. cursorOrchestrator:0.2|oosh-expert)
+# Location: ~/config/hivemind.roles.env (persistent, OOSH config pattern)
+
+private.hiveMind.registry.migrate() {
+  # Migrate old /tmp/ registry to ~/config/ pattern (one-time, backward compat)
+  local old_registry="/tmp/hivemind.roles"
+  [ -f "$old_registry" ] || return 0
+  [ "$HIVEMIND_REGISTRY" = "$old_registry" ] && return 0
+  if [ ! -f "$HIVEMIND_REGISTRY" ] || [ ! -s "$HIVEMIND_REGISTRY" ]; then
+    local config_dir
+    config_dir=$(dirname "$HIVEMIND_REGISTRY")
+    mkdir -p "$config_dir" 2>/dev/null
+    cp "$old_registry" "$HIVEMIND_REGISTRY"
+    info.log "Migrated registry from $old_registry to $HIVEMIND_REGISTRY"
+  fi
+}
+
+private.hiveMind.sessions.migrate() {
+  # Migrate old /tmp/ sessions to ~/config/ pattern (one-time, backward compat)
+  local old_sessions="/tmp/hivemind.sessions"
+  [ -f "$old_sessions" ] || return 0
+  [ "$HIVEMIND_SESSIONS" = "$old_sessions" ] && return 0
+  if [ ! -f "$HIVEMIND_SESSIONS" ] || [ ! -s "$HIVEMIND_SESSIONS" ]; then
+    local config_dir
+    config_dir=$(dirname "$HIVEMIND_SESSIONS")
+    mkdir -p "$config_dir" 2>/dev/null
+    cp "$old_sessions" "$HIVEMIND_SESSIONS"
+    info.log "Migrated sessions from $old_sessions to $HIVEMIND_SESSIONS"
+  fi
+}
+
+private.hiveMind.registry.set() {
+  # Add or update a target→role mapping
+  local target="$1"
+  local role="$2"
+  [ -z "$target" ] || [ -z "$role" ] && return 1
+  # Validate pane target format: session:window.pane (e.g. projectTeam:0.3)
+  if ! echo "$target" | grep -qE '^[a-zA-Z0-9_-]+:[0-9]+\.[0-9]+$'; then
+    warn.log "registry.set: invalid pane target '$target' — expected session:window.pane"
+    return 1
+  fi
+  # Validate role name: reject boot prompt garbage (>30 chars or contains spaces)
+  if [ "${#role}" -gt 30 ] || echo "$role" | grep -q ' '; then
+    warn.log "registry.set: rejecting invalid role name '${role:0:40}...' — too long or contains spaces"
+    return 1
+  fi
+  private.hiveMind.registry.migrate
+  # Ensure config directory exists
+  local config_dir
+  config_dir=$(dirname "$HIVEMIND_REGISTRY")
+  mkdir -p "$config_dir" 2>/dev/null
+  # Remove old entry for this target, then append new one
+  if [ -f "$HIVEMIND_REGISTRY" ]; then
+    grep -v "^${target}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
+    mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
+  fi
+  echo "${target}|${role}" >> "$HIVEMIND_REGISTRY"
+}
+
+private.hiveMind.registry.get() {
+  # Look up role for a given pane target
+  local target="$1"
+  private.hiveMind.registry.migrate
+  [ -f "$HIVEMIND_REGISTRY" ] || return 1
+  grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
+}
+
+private.hiveMind.registry.find() {
+  # Find pane target by role name (case-insensitive partial match)
+  local name="$1"
+  local session="$2"
+  private.hiveMind.registry.migrate
+  [ -f "$HIVEMIND_REGISTRY" ] || return 1
+  if [ -n "$session" ]; then
+    grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | grep -i "$name" | head -1 | cut -d'|' -f1
+  else
+    grep -i "$name" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f1
+  fi
+}
+
+private.hiveMind.registry.list() {
+  # List all entries, optionally filtered by session
+  local session="$1"
+  private.hiveMind.registry.migrate
+  [ -f "$HIVEMIND_REGISTRY" ] || return 0
+  if [ -n "$session" ]; then
+    grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null
+  else
+    cat "$HIVEMIND_REGISTRY" 2>/dev/null
+  fi
+}
+
+# ── Session Tracking ──────────────────────────────────────────────────────────
+# File-based mapping: role name → Claude session UUID.
+# Allows rejoining a session after the Claude process exits.
+# Format: role|session-uuid  (one per line)
+
+private.hiveMind.session.store() {
+  # Store or update role → session UUID mapping
+  local role="$1"
+  local session_id="$2"
+  [ -z "$role" ] || [ -z "$session_id" ] && return 1
+  private.hiveMind.sessions.migrate
+  # Ensure config directory exists
+  local config_dir
+  config_dir=$(dirname "$HIVEMIND_SESSIONS")
+  mkdir -p "$config_dir" 2>/dev/null
+  # Remove old entry for this role, then append new one
+  if [ -f "$HIVEMIND_SESSIONS" ]; then
+    grep -v "^${role}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+    mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+  fi
+  echo "${role}|${session_id}" >> "$HIVEMIND_SESSIONS"
+}
+
+private.hiveMind.session.lookup() {
+  # Look up stored session UUID for a given role
+  local role="$1"
+  private.hiveMind.sessions.migrate
+  [ -f "$HIVEMIND_SESSIONS" ] || return 1
+  grep "^${role}|" "$HIVEMIND_SESSIONS" 2>/dev/null | tail -1 | cut -d'|' -f2
+}
+
+hiveMind.join() # <name> # rejoin an agent's Claude session by role name
+{
+  local name="$1"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: hiveMind join <name>"
+    echo "  Use 'hiveMind role.list' to see available roles"
+    return 1
+  fi
+
+  # Resolve agent name to pane target
+  local target
+  target=$(hiveMind.resolve "$name")
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  # Try to find session ID from a running Claude process first
+  local session_id
+  session_id=$(claudeCode session.id "$target" 2>/dev/null)
+
+  if [ -n "$session_id" ]; then
+    # Claude is still running — store the session ID and inform user
+    private.hiveMind.session.store "$name" "$session_id"
+    info.log "Claude is already running in $target (session: ${session_id:0:8}...)"
+    echo "Session $session_id is active in pane $target"
+    return 0
+  fi
+
+  # Process not running — look up stored session ID
+  session_id=$(private.hiveMind.session.lookup "$name")
+
+  if [ -z "$session_id" ]; then
+    error.log "No session found for agent '$name'"
+    echo "  The agent may not have been started yet, or session data was lost."
+    echo "  Start fresh with: hiveMind agent.bootstrap $name"
+    return 1
+  fi
+
+  info.log "Resuming session ${session_id:0:8}... for $name in pane $target"
+
+  # Send resume command to the pane
+  otmux send "$target" "claude --resume $session_id" Enter
+
+  success.log "Sent resume command for $name (session: ${session_id:0:8}...)"
+  return 0
+}
+
+hiveMind.join.completion.name() {
+  hiveMind.resolve.completion.name
+}
+
+hiveMind.registry.fix() # # clean up invalid entries in roles registry (raw %NNN pane IDs)
+{
+  local registry="$HIVEMIND_REGISTRY"
+  [ -f "$registry" ] || { error.log "No registry file"; return 1; }
+
+  local tmpfile="${registry}.tmp"
+  local fixed=0 dropped=0
+  > "$tmpfile"
+
+  while IFS='|' read -r pane role; do
+    [ -z "$pane" ] || [ -z "$role" ] && continue
+    # Skip entries with raw pane IDs (%NNN format)
+    if echo "$pane" | grep -qE '^%[0-9]+$'; then
+      local resolved
+      resolved=$(tmux display-message -t "$pane" -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+      if [ -n "$resolved" ] && echo "$resolved" | grep -qE '^[a-zA-Z0-9_-]+:[0-9]+\.[0-9]+$'; then
+        echo "${resolved}|${role}" >> "$tmpfile"
+        fixed=$((fixed + 1))
+        info.log "Fixed: $pane → $resolved ($role)"
+      else
+        dropped=$((dropped + 1))
+        warn.log "Dropped: $pane|$role (pane no longer exists)"
+      fi
+      continue
+    fi
+    echo "${pane}|${role}" >> "$tmpfile"
+  done < "$registry"
+
+  mv "$tmpfile" "$registry"
+  console.log "Registry fix: $fixed resolved, $dropped dropped"
+}
+hiveMind.registry.fix.completion() { :; }
+
+hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessions from /status ground truth
+{
+  local session="${1:-$(private.hiveMind.active.team)}"
+  [ -z "$session" ] && session=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local updated=0
+
+  # Prune entries for panes that no longer exist in tmux
+  if [ -f "$reg" ]; then
+    local clean=""
+    while IFS='|' read -r pt rl; do
+      [ -z "$pt" ] && continue
+      if tmux display-message -t "$pt" -p "#{pane_id}" >/dev/null 2>&1; then
+        clean="${clean}${pt}|${rl}\n"
+      else
+        info.log "  Pruning dead pane: $pt ($rl)"
+      fi
+    done < "$reg"
+    printf '%b' "$clean" > "$reg"
+  fi
+
+  local pane_list
+  pane_list=$(tmux list-panes -t "$session" -a \
+    -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+
+  while IFS= read -r pane_target; do
+    [ -z "$pane_target" ] && continue
+
+    # Only probe panes with a Claude process
+    claudeCode process.find "$pane_target" >/dev/null 2>&1 || continue
+
+    # Probe: get ground-truth UUID from /status (bypasses stale env files)
+    local sid
+    sid=$(claudeCode session.probe "$pane_target" 2>/dev/null)
+    [ -z "$sid" ] && continue
+
+    # Get session name — only use /rename'd names (role@model format)
+    local name
+    name=$(claudeCode session.name "$sid" 2>/dev/null)
+
+    # Remove stale entry for this pane regardless
+    if [ -f "$reg" ]; then
+      grep -v "^${pane_target}|" "$reg" > "${reg}.tmp" 2>/dev/null
+      mv "${reg}.tmp" "$reg"
+    fi
+
+    # Only write back if we have a proper role@model name
+    [ -z "$name" ] && continue
+    [[ "$name" != *"@"* ]] && continue
+    local role="${name%%@*}"
+
+    # Write roles registry: pane → role
+    echo "${pane_target}|${role}" >> "$reg"
+
+    # Write sessions file: role → uuid
+    if [ -f "$ses" ]; then
+      grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
+      mv "${ses}.tmp" "$ses"
+    fi
+    echo "${role}|${sid}" >> "$ses"
+
+    updated=$((updated + 1))
+    info.log "  $pane_target → $role [$sid]"
+  done <<< "$pane_list"
+
+  # Detect duplicate UUIDs across roles (potential data corruption)
+  if [ -f "$ses" ]; then
+    local dup_uuids
+    dup_uuids=$(awk -F'|' '{print $2}' "$ses" 2>/dev/null | sort | uniq -d)
+    if [ -n "$dup_uuids" ]; then
+      while IFS= read -r dup_sid; do
+        [ -z "$dup_sid" ] && continue
+        local dup_roles
+        dup_roles=$(grep "|${dup_sid}" "$ses" 2>/dev/null | cut -d'|' -f1 | tr '\n' ', ')
+        warn.log "DUPLICATE UUID ${dup_sid:0:8}... shared by roles: ${dup_roles%, }"
+      done <<< "$dup_uuids"
+    fi
+  fi
+
+  success.log "Registry refreshed: $updated entries"
+}
+hiveMind.registry.refresh.completion.session() {
+  private.hiveMind.teams.complete
+}

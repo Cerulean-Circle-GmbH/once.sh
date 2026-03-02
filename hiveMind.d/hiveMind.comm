@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# hiveMind.comm — messaging, delegation, broadcast
+# Sourced by hiveMind.start()
+
+hiveMind.send() # <name> <text...> # send literal text to agent by name (no Enter appended)
+{
+  local name="$1"
+  shift
+
+  if [ -z "$name" ] || [ -z "$*" ]; then
+    error.log "Usage: hiveMind send <name> <text...>"
+    return 1
+  fi
+
+  local target
+  target=$(hiveMind.resolve "$name")
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  # Detect trailing tmux key names (Enter, C-u, Tab, etc.)
+  # These must be sent as keypresses, not literal text.
+  # The -l flag is needed for text (preserves spaces) but breaks key names.
+  local last="${@: -1}"
+  local is_key=false
+  [[ "$last" =~ ^(Enter|Escape|Tab|Space|BSpace|DC|IC|C-[a-z]|M-[a-z]|Up|Down|Left|Right|Home|End|PPage|NPage|F[0-9]+)$ ]] && is_key=true
+
+  if $is_key && [ $# -gt 1 ]; then
+    # Text + trailing key: send text literally, then key as keypress
+    local text_args=("${@:1:$#-1}")
+    otmux send "$target" -l "${text_args[*]}"
+    sleep 0.05
+    otmux send "$target" "$last"
+  elif $is_key && [ $# -eq 1 ]; then
+    # Single key only: send as keypress (no -l)
+    otmux send "$target" "$last"
+  else
+    # Text only: send literally (preserving spaces)
+    otmux send "$target" -l "$*"
+  fi
+  info.log "Sent to $name ($target): $*"
+  return 0
+}
+hiveMind.send.completion.name() {
+  hiveMind.resolve.completion.name
+}
+
+hiveMind.send.enter() # <name> <message> # send message to agent by name, followed by Enter
+{
+  local name="$1"
+  shift
+  local message="$*"
+
+  if [ -z "$name" ] || [ -z "$message" ]; then
+    error.log "Usage: hiveMind send.enter <name> <message>"
+    return 1
+  fi
+
+  local target
+  target=$(hiveMind.resolve "$name")
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  otmux send.enter "$target" "$message"
+  info.log "Sent to $name ($target): $message"
+  return 0
+}
+hiveMind.send.enter.completion.name() {
+  hiveMind.resolve.completion.name
+}
+
+hiveMind.send.message() # <name> <message> # safe send: pre-check, clear blockers, send with verification
+{
+  local name="$1"
+  shift
+  local message="$*"
+
+  if [ -z "$name" ] || [ -z "$message" ]; then
+    error.log "Usage: hiveMind send.message <name> <message>"
+    return 1
+  fi
+
+  local session
+  session="$(private.hiveMind.active.team)"
+  local target
+  target=$(hiveMind.resolve "$name" "$session" 2>/dev/null)
+  if [ -z "$target" ]; then
+    error.log "Cannot resolve '$name' to a pane target"
+    return 1
+  fi
+
+  # Step 1: Capture target pane — assess current state
+  local capture
+  capture=$("$OOSH_DIR/otmux" pane.capture "$target" 15 2>/dev/null)
+
+  # Step 2: If blocker detected, try to clear it first
+  local detect
+  detect=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+  local status="${detect%%|*}"
+  case "$status" in
+    permission|tool-confirm|panel|overlay|autocomplete)
+      info.log "Blocker detected on $name ($status) — clearing first"
+      private.hiveMind.unblock.pane "$target" "$name" 1
+      sleep 1
+      ;;
+  esac
+
+  # Step 3: Clear input line
+  "$OOSH_DIR/otmux" send "$target" C-u
+
+  # Step 4: Send message with verification
+  local result
+  "$OOSH_DIR/otmux" send.verified "$target" "$message" 3
+  result=$?
+
+  if [ $result -eq 0 ]; then
+    info.log "Message delivered to $name ($target)"
+    create.result 0 "DELIVERED"
+    return 0
+  fi
+
+  # Step 5+6: Verify failed — try sending Enter and re-verify
+  warn.log "Initial send may have failed — retrying Enter"
+  "$OOSH_DIR/otmux" send "$target" Enter
+  sleep 2
+
+  local after
+  after=$("$OOSH_DIR/otmux" pane.capture "$target" 10 2>/dev/null)
+  if echo "$after" | grep -qF "$message"; then
+    info.log "Message visible on $name after Enter retry"
+    create.result 0 "DELIVERED_RETRY"
+    return 0
+  fi
+
+  # Pane changed = likely consumed
+  warn.log "Message may have been consumed by $name — verify manually"
+  create.result 0 "UNCERTAIN"
+  return 0
+}
+hiveMind.send.message.completion.name() {
+  hiveMind.resolve.completion.name 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSPORT-INDEPENDENT MESSAGING
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.channel.resolve() # <name> # resolve agent name to best available communication channel
+{
+  local name="$1"
+  [ -z "$name" ] && return 1
+
+  # Channel 1: tmux pane via registry
+  local pane_target
+  pane_target=$(hiveMind.resolve "$name" 2>/dev/null)
+  if [ -n "$pane_target" ]; then
+    echo "pane|${pane_target}"
+    return 0
+  fi
+
+  # Channel 2: agentRoom API (if backend is running)
+  if command -v agentRoom >/dev/null 2>&1; then
+    local status
+    status=$(agentRoom backend.status 2>/dev/null)
+    if ! echo "$status" | grep -q "not running"; then
+      echo "api|${name}"
+      return 0
+    fi
+  fi
+
+  # No channel available
+  return 1
+}
+
+hiveMind.agent.send() # <name> <message> # send message to agent via best available channel
+{
+  local name="$1"
+  shift
+  local message="$*"
+
+  if [ -z "$name" ] || [ -z "$message" ]; then
+    error.log "Usage: hiveMind agent.send <name> <message>"
+    return 1
+  fi
+
+  local channel
+  channel=$(private.hiveMind.channel.resolve "$name")
+  if [ $? -ne 0 ]; then
+    error.log "No communication channel available for agent '$name'"
+    return 1
+  fi
+
+  local transport="${channel%%|*}"
+  local target="${channel#*|}"
+
+  case "$transport" in
+    pane)
+      otmux send.enter "$target" "$message"
+      ;;
+    api)
+      agentRoom chat "$target" "$message"
+      ;;
+    *)
+      error.log "Unknown transport: $transport"
+      return 1
+      ;;
+  esac
+
+  info.log "Sent to $name via $transport ($target): $message"
+  return 0
+}
+hiveMind.agent.send.completion.name() {
+  hiveMind.resolve.completion.name
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.task() # <agentId> <description> # send task to specific agent
+{
+  local agent_id="$1"
+  shift
+  local description="$*"
+
+  if [ -z "$agent_id" ] || [ -z "$description" ]; then
+    error.log "Usage: hiveMind task <agentId> <description>"
+    return 1
+  fi
+
+  info.log "Sending task to $agent_id: $description"
+
+  # Send via tmux pane
+  local pane=$(private.hiveMind.pane.for.agent "$agent_id")
+  if [ -n "$pane" ]; then
+    otmux send.enter "$pane" "$description"
+  else
+    # Fallback to API
+    agentRoom chat "$agent_id" "$description"
+  fi
+}
+
+hiveMind.delegate() # <name> <description> <?from:PO> # write task file and send file-read nudge to agent
+{
+  local name="$1"
+  local description="$2"
+  local from="${3:-PO}"
+
+  if [ -z "$name" ] || [ -z "$description" ]; then
+    error.log "Usage: hiveMind delegate <agent-name> <description> <?from>"
+    return 1
+  fi
+
+  local session
+  session="$(private.hiveMind.active.team)"
+
+  # Resolve agent → pane
+  local target
+  target=$(hiveMind.resolve "$name" "$session" 2>/dev/null)
+  if [ -z "$target" ]; then
+    error.log "Cannot resolve '$name' to a pane target"
+    return 1
+  fi
+
+  # Generate task file
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$workspace" ]; then
+    error.log "Cannot determine workspace root"
+    return 1
+  fi
+
+  local tasks_dir="${workspace}/session/tasks"
+  mkdir -p "$tasks_dir" 2>/dev/null
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  local task_file="${tasks_dir}/${timestamp}.task.md"
+
+  {
+    echo "# Task: $description"
+    echo ""
+    echo "**From**: $from"
+    echo "**To**: $name"
+    echo "**Priority**: NORMAL"
+    echo "**Date**: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo ""
+    echo "## Description"
+    echo ""
+    echo "$description"
+    echo ""
+    echo "## Acceptance Criteria"
+    echo ""
+    echo "- [ ] Task completed as described"
+  } > "$task_file"
+
+  # Send file-read nudge (not inline text — avoids tmux garbling)
+  local relative_path="session/tasks/${timestamp}.task.md"
+  otmux send "$target" "Read ${relative_path}" Enter
+
+  # Verify nudge landed
+  sleep 1
+  local verify
+  verify=$("$OOSH_DIR/otmux" pane.capture "$target" 5 2>/dev/null)
+  if echo "$verify" | grep -q "$relative_path"; then
+    console.log "Delegated to $name: $task_file"
+    create.result 0 "$task_file"
+  else
+    warn.log "Nudge may not have landed — verify manually"
+    create.result 0 "$task_file"
+  fi
+  return $(result)
+}
+hiveMind.delegate.completion.name() {
+  hiveMind.resolve.completion.name 2>/dev/null
+}
+
+hiveMind.broadcast() # <message> # send message to all agents
+{
+  local message="$1"
+
+  if [ -z "$message" ]; then
+    error.log "Usage: hiveMind broadcast <message>"
+    return 1
+  fi
+
+  info.log "Broadcasting: $message"
+
+  for agent_id in $(hiveMind.list); do
+    hiveMind.send.enter "$agent_id" "$message"
+  done
+}

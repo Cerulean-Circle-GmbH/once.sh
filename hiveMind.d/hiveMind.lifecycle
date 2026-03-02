@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# hiveMind.lifecycle — agent bootstrap, verify
+# Sourced by hiveMind.start()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT LIFECYCLE
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create pane, start bash, launch claude, teach role
+{
+  local role="$1"
+  local session="${2:-$(private.hiveMind.active.team)}"
+  local target_pane="$3"
+
+  if [ -z "$role" ]; then
+    error.log "Usage: hiveMind agent.bootstrap <role> <?session> <?pane>"
+    echo "  Use 'hiveMind role.list' to see available roles"
+    return 1
+  fi
+
+  # Verify role exists
+  local prompt
+  prompt=$(private.hiveMind.get.role.prompt "$role")
+  if [ -z "$prompt" ]; then
+    error.log "Unknown role: $role"
+    return 1
+  fi
+
+  # Check session exists
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    error.log "Session $session not found"
+    return 1
+  fi
+
+  info.log "Bootstrapping $role agent in session $session..."
+
+  # Step 1: Create pane if not specified
+  if [ -z "$target_pane" ]; then
+    # Get first window index (respects base-index config)
+    local first_win
+    first_win=$(tmux list-windows -t "$session" -F '#{window_index}' 2>/dev/null | head -1)
+    [ -z "$first_win" ] && first_win=0
+
+    # Split from the last pane in the first window
+    tmux split-window -t "${session}:${first_win}" -h
+    tmux select-layout -t "${session}:${first_win}" tiled
+    # Get the new pane address
+    local last_pane_addr
+    last_pane_addr=$(tmux list-panes -t "${session}:${first_win}" -F "#{window_index}.#{pane_index}" | sort -n | tail -1)
+    target_pane="${session}:${last_pane_addr}"
+    info.log "Created new pane: $target_pane"
+  fi
+
+  # Step 2: Set pane title and export role env var
+  private.hiveMind.pane.identify "$target_pane" "$role"
+
+  # Step 3: Start Claude Code
+  info.log "Starting Claude Code in pane $target_pane..."
+  otmux send.enter "$target_pane" "claude --dangerously-skip-permissions"
+
+  # Step 4: Wait for startup
+  info.log "Waiting for Claude Code to initialize..."
+  sleep 8
+
+  # Step 4b: Capture UUID and write to sessions file
+  local new_sid
+  new_sid=$(claudeCode session.probe "$target_pane" 2>/dev/null)
+  if [ -n "$new_sid" ]; then
+    local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+    if [ -f "$ses" ]; then
+      grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
+      mv "${ses}.tmp" "$ses"
+    fi
+    echo "${role}|${new_sid}" >> "$ses"
+    info.log "Captured session UUID for $role: ${new_sid:0:8}..."
+  fi
+
+  # Step 5: Teach role
+  local full_prompt
+  full_prompt=$(hiveMind.role.prompt "$role")
+  otmux send.enter "$target_pane" "$full_prompt"
+
+  # Step 6: Wait briefly for processing
+  sleep 3
+
+  success.log "Agent $role bootstrapped in pane $target_pane"
+  echo "Verify with: hiveMind agent.verify $target_pane"
+}
+
+hiveMind.agent.bootstrap.completion.role() {
+  hiveMind.role.list 2>/dev/null
+}
+
+hiveMind.agent.bootstrap.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.agent.verify() # <pane> # check if agent is alive and processing
+{
+  local pane="$1"
+
+  if [ -z "$pane" ]; then
+    error.log "Usage: hiveMind agent.verify <pane>"
+    return 1
+  fi
+
+  info.log "Verifying agent in pane $pane..."
+
+  local output
+  output=$(tmux capture-pane -t "$pane" -p -S -15 2>/dev/null)
+
+  if [ $? -ne 0 ]; then
+    error.log "Cannot capture pane: $pane"
+    return 1
+  fi
+
+  # Check for processing indicators
+  if echo "$output" | grep -qiE "Composing|Musing|Thinking|Cascading|Incubating|Frosting|Reading.*files"; then
+    success.log "Agent in $pane is PROCESSING"
+    echo "$output" | tail -5
+    return 0
+  fi
+
+  # Check for idle Claude prompt
+  if echo "$output" | grep -qE "^>|❯"; then
+    info.log "Agent in $pane is IDLE (ready for input)"
+    return 0
+  fi
+
+  # Check for Claude Code running
+  if echo "$output" | grep -qi "claude"; then
+    info.log "Agent in $pane appears ACTIVE"
+    echo "$output" | tail -5
+    return 0
+  fi
+
+  warn.log "Agent in $pane status UNKNOWN"
+  echo "$output" | tail -5
+  return 1
+}

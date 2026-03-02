@@ -1,0 +1,987 @@
+#!/usr/bin/env bash
+# hiveMind.recovery — handoff, compact, cold-recover, train, metrics
+# Sourced by hiveMind.start()
+
+hiveMind.auto.commit() # <?message> # auto-commit uncommitted changes if any exist
+{
+  local msg="${1:-Auto-commit: cycle checkpoint $(date '+%Y-%m-%d %H:%M')}"
+
+  # Only add tracked files that changed (never untracked — avoids committing secrets)
+  # Also add session/ files which are safe to commit
+  local has_changes=false
+
+  if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+    git add -u
+    has_changes=true
+  fi
+
+  if [ "$has_changes" = "true" ]; then
+    git commit -m "$msg
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+    git push 2>/dev/null &
+    console.log "Auto-committed: $msg"
+    return 0
+  fi
+
+  console.log "Nothing to commit"
+  return 0
+}
+hiveMind.auto.commit.completion() { :; }
+
+hiveMind.cycle.full() # <?session> # run full monitoring cycle: sweep + unblock + context check + auto-commit
+{
+  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+
+  # Step 1: Sweep and unblock
+  console.log "Cycle: sweep $session"
+  hiveMind.sweep "$session" 2>/dev/null
+  hiveMind.unblock all "$session" 2>/dev/null
+
+  # Step 2: Check context for all panes
+  console.log "Cycle: context check"
+  local pane_addrs
+  pane_addrs=$(tmux list-panes -t "$session" -F "#{window_index}.#{pane_index}" 2>/dev/null)
+  for addr in $pane_addrs; do
+    local ctx
+    ctx=$(claudeCode context.read "${session}:${addr}" 2>/dev/null)
+    if [ -n "$ctx" ] && [ "$ctx" != "unknown" ]; then
+      # Alert if below 25%
+      local remaining
+      remaining=$(echo "$ctx" | grep -oE '[0-9]+' | head -1)
+      if [ -n "$remaining" ] && [ "$remaining" -lt 25 ] 2>/dev/null; then
+        console.log "ALERT: ${session}:${addr} context at ${remaining}%"
+      fi
+    fi
+  done
+
+  # Step 3: Auto-commit if changes
+  console.log "Cycle: auto-commit"
+  hiveMind.auto.commit "Cycle checkpoint $(date '+%H:%M')" 2>/dev/null
+
+  console.log "Cycle complete for $session"
+}
+hiveMind.cycle.full.completion() { :; }
+
+hiveMind.dashboard() # <?session> # write consolidated team state to session/dashboard.md
+{
+  local session="${1:-$(private.hiveMind.active.team)}"
+  local registry="$HIVEMIND_REGISTRY"
+  local dashboard_file="$(git rev-parse --show-toplevel 2>/dev/null)/session/dashboard.md"
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  local local_time
+  local_time=$(date '+%Y-%m-%d %H:%M %Z')
+
+  # Git status
+  local git_branch git_status git_commit
+  git_branch=$(git -C "$OOSH_DIR" branch --show-current 2>/dev/null)
+  git_commit=$(git -C "$OOSH_DIR" log -1 --oneline 2>/dev/null)
+  if git -C "$OOSH_DIR" diff --quiet 2>/dev/null && git -C "$OOSH_DIR" diff --cached --quiet 2>/dev/null; then
+    git_status="clean"
+  else
+    git_status="uncommitted changes"
+  fi
+
+  # Subscription velocity (from cached metrics)
+  local vel_five="-" vel_seven="-"
+  local latest_sub
+  latest_sub=$(ls -t "${CONFIG_PATH:-$HOME/config}/metrics"/subscription.*.scenario.env 2>/dev/null | head -1)
+  if [ -n "$latest_sub" ] && [ -f "$latest_sub" ]; then
+    source "$latest_sub"
+    vel_five="${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}%"
+    vel_seven="${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}%"
+  fi
+
+  # Start dashboard
+  {
+    echo "# Team Dashboard"
+    echo ""
+    echo "**Updated**: $timestamp ($local_time)"
+    echo "**Session**: $session"
+    echo ""
+    echo "## Git Status"
+    echo ""
+    echo "| Field | Value |"
+    echo "|-------|-------|"
+    echo "| Branch | \`$git_branch\` |"
+    echo "| Status | $git_status |"
+    echo "| Last commit | \`$git_commit\` |"
+    echo ""
+    echo "## Subscription"
+    echo ""
+    echo "| Metric | Value |"
+    echo "|--------|-------|"
+    echo "| 5-hour usage | $vel_five |"
+    echo "| 7-day usage | $vel_seven |"
+    echo ""
+    echo "## Team Status"
+    echo ""
+    echo "| Agent | Pane | Context | State | Activity |"
+    echo "|-------|------|---------|-------|----------|"
+  } > "$dashboard_file"
+
+  # Iterate all agents
+  if [ -f "$registry" ]; then
+    while IFS='|' read -r target role; do
+      [ -z "$role" ] && continue
+      [[ "$target" != "$session:"* ]] && continue
+
+      local pane="${target##*.}"
+      local context_pct state activity
+
+      # Get context
+      context_pct=$(claudeCode context.read "$target" 2>/dev/null)
+      [ -z "$context_pct" ] && context_pct="-"
+      [ "$context_pct" != "-" ] && context_pct="${context_pct}%"
+
+      # Get state via sweep detect
+      local detect_result
+      detect_result=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+      state="${detect_result%%|*}"
+      [ -z "$state" ] && state="unknown"
+
+      # Get activity from pane capture
+      local content
+      content=$(otmux pane.capture "$target" 5 2>/dev/null | tail -3)
+      activity=$(echo "$content" | grep -oE '(Reading|Writing|Thinking|Running|Editing|Searching|waiting|idle)' | tail -1)
+      [ -z "$activity" ] && activity="-"
+
+      echo "| $role | 0.$pane | $context_pct | $state | $activity |" >> "$dashboard_file"
+    done < "$registry"
+  fi
+
+  # Recent commits
+  {
+    echo ""
+    echo "## Recent Commits"
+    echo ""
+    echo "\`\`\`"
+    git -C "$OOSH_DIR" log --oneline -5 2>/dev/null
+    echo "\`\`\`"
+    echo ""
+    echo "## Recovery"
+    echo ""
+    echo "After \`/compact\`, read:"
+    echo "1. This file (\`session/dashboard.md\`)"
+    echo "2. Your role's context file (\`session/agents/<role>.context.md\`)"
+    echo "3. Your SKILL.md (\`agents/<role>/SKILL.md\`)"
+    echo ""
+    echo "---"
+    echo "*Generated by \`hiveMind dashboard\`*"
+  } >> "$dashboard_file"
+
+  console.log "Dashboard updated: $dashboard_file"
+  create.result 0 "$dashboard_file"
+  return $(result)
+}
+hiveMind.dashboard.completion() { :; }
+
+hiveMind.peer.compact() # <target> <?session> # trigger seamless compact for a peer agent
+{
+  local name="$1"
+  local session="${2:-$(private.hiveMind.active.team)}"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: hiveMind peer.compact <target> <?session>"
+    return 1
+  fi
+
+  # Resolve name to pane target
+  local target
+  if [[ "$name" == *":"* ]] || [[ "$name" == *"."* ]]; then
+    target="$name"
+    [[ "$target" != *":"* ]] && target="${session}:${target}"
+  else
+    target=$(hiveMind.resolve "$name" "$session" 2>/dev/null)
+  fi
+
+  if [ -z "$target" ]; then
+    error.log "Cannot resolve '$name' to a pane target"
+    return 1
+  fi
+
+  local role
+  role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+  [ -z "$role" ] && role="$name"
+
+  info.log "Compacting peer: $role at $target"
+
+  # Step 1: Capture peer state (30 lines)
+  local pane_content
+  pane_content=$("$OOSH_DIR/otmux" pane.capture "$target" 30 2>/dev/null)
+  if [ -z "$pane_content" ]; then
+    warn.log "Could not capture $target — pane may be empty"
+  fi
+
+  # Step 2: Check context % before compact
+  local pct
+  pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+  info.log "$role context: ${pct:-unknown}%"
+
+  # Step 3: Kill rogue resume hook processes
+  local addr="${target#*:}"
+  local pid_file="/tmp/resume-${addr}.pid"
+  if [ -f "$pid_file" ]; then
+    local old_pid
+    old_pid=$(cat "$pid_file" 2>/dev/null)
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      info.log "Killing rogue hook process $old_pid"
+      kill "$old_pid" 2>/dev/null
+    fi
+    rm -f "$pid_file" 2>/dev/null
+  fi
+
+  # Step 4: Clear input line and screen (so grep only sees new output)
+  "$OOSH_DIR/otmux" send "$target" C-u
+  "$OOSH_DIR/otmux" send "$target" C-l
+  sleep 0.5
+
+  # Step 5: Send /compact
+  "$OOSH_DIR/otmux" send "$target" "/compact" Enter
+  sleep 2
+  "$OOSH_DIR/otmux" send "$target" "" Enter
+
+  # Step 6: Wait for hook to process
+  info.log "Waiting for compact to complete..."
+  local waited=0
+  while [ "$waited" -lt 30 ]; do
+    sleep 5
+    waited=$((waited + 5))
+    local check
+    check=$("$OOSH_DIR/otmux" pane.capture "$target" 5 2>/dev/null)
+    if echo "$check" | grep -qE 'Compacted|auto-compact|resumed'; then
+      info.log "Compact confirmed after ${waited}s"
+      break
+    fi
+  done
+
+  # Step 7: Verify recovery — check pane content AND context % improvement
+  local verify
+  verify=$("$OOSH_DIR/otmux" pane.capture "$target" 10 2>/dev/null)
+  local post_pct
+  post_pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+
+  if echo "$verify" | grep -qE 'Compacted|❯'; then
+    if [ -n "$pct" ] && [ -n "$post_pct" ] && [ "$post_pct" -gt "${pct:-0}" ] 2>/dev/null; then
+      console.log "peer.compact: $role at $target — OK (${pct:-?}% → ${post_pct}%)"
+    else
+      console.log "peer.compact: $role at $target — OK"
+    fi
+    create.result 0 "compacted"
+  else
+    warn.log "peer.compact: $role — compact may not have completed"
+    create.result 1 "unverified"
+  fi
+  return $(result)
+}
+hiveMind.peer.compact.completion.target() {
+  hiveMind.resolve.completion.name 2>/dev/null
+}
+hiveMind.peer.compact.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.handoff() # <target> <?session> # full generational handoff: detect low context, compact, verify recovery
+{
+  local name="$1"
+  local session="${2:-$(private.hiveMind.active.team)}"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: hiveMind handoff <target> <?session>"
+    return 1
+  fi
+
+  # Resolve name to pane
+  local target
+  if [[ "$name" == *":"* ]] || [[ "$name" == *"."* ]]; then
+    target="$name"
+    [[ "$target" != *":"* ]] && target="${session}:${target}"
+  else
+    target=$(hiveMind.resolve "$name" "$session" 2>/dev/null)
+  fi
+
+  if [ -z "$target" ]; then
+    error.log "Cannot resolve '$name' to a pane target"
+    return 1
+  fi
+
+  local role
+  role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+  [ -z "$role" ] && role="$name"
+
+  # ── Phase 1: Detect ──────────────────────────────────────────────────
+  local pct
+  pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+  info.log "Handoff check: $role at $target — context: ${pct:-unknown}%"
+
+  # If context is healthy (>15%), nothing to do
+  if [ -n "$pct" ] && [ "$pct" -gt 15 ] 2>/dev/null; then
+    console.log "handoff: $role has ${pct}% context — no handoff needed"
+    create.result 0 "healthy"
+    return 0
+  fi
+
+  # Alert agent to save state
+  info.log "Context low (${pct:-?}%) — alerting $role to save state"
+  "$OOSH_DIR/otmux" send "$target" C-u
+  "$OOSH_DIR/otmux" send "$target" "Save your context and run /compact NOW. You are at ${pct:-low}%." Enter
+
+  # Wait for agent to save context file
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  local context_file="${workspace}/session/agents/${role}/context.md"
+  local waited=0
+  local context_saved=false
+  local pre_pct="$pct"
+  while [ "$waited" -lt 15 ]; do
+    sleep 3
+    waited=$((waited + 3))
+    # Check if context file was updated recently (within last 30s)
+    if [ -f "$context_file" ]; then
+      local age file_mtime
+      file_mtime=$(private.hiveMind.file.mtime "$context_file" 2>/dev/null || echo 0)
+      age=$(( $(date +%s) - file_mtime ))
+      if [ "$age" -lt 30 ]; then
+        context_saved=true
+        info.log "Context file saved (${age}s ago)"
+        break
+      fi
+    fi
+  done
+
+  if [ "$context_saved" = false ]; then
+    warn.log "Context file not updated — proceeding with compact anyway"
+  fi
+
+  # ── Phase 2: Trigger ─────────────────────────────────────────────────
+  # Check if agent already ran /compact (may have self-compacted from our message)
+  local check
+  check=$("$OOSH_DIR/otmux" pane.capture "$target" 10 2>/dev/null)
+  if echo "$check" | grep -qE 'Compacted|auto-compact'; then
+    info.log "Agent already compacted — skipping trigger"
+  else
+    info.log "Triggering compact via peer.compact"
+    hiveMind.peer.compact "$target" "$session"
+  fi
+
+  # ── Phase 3: Verify ──────────────────────────────────────────────────
+  sleep 3
+  info.log "Verifying recovery..."
+  "$OOSH_DIR/claudeCode" recover "$target"
+  local recover_result=$?
+
+  # Check if context actually increased after compact
+  local post_pct
+  post_pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+  if [ -n "$post_pct" ] && [ -n "$pre_pct" ] && [ "$post_pct" -gt "$pre_pct" ] 2>/dev/null; then
+    info.log "handoff: $role — context restored (${pre_pct}% → ${post_pct}%)"
+  elif [ -n "$post_pct" ] && [ -n "$pre_pct" ]; then
+    warn.log "handoff: $role — context did not increase after compact (${pre_pct}% → ${post_pct}%)"
+  fi
+
+  if [ $recover_result -eq 0 ]; then
+    console.log "handoff: $role — complete (detect → compact → recover)"
+    create.result 0 "handoff_complete"
+  else
+    warn.log "handoff: $role — recovery uncertain, may need manual intervention"
+    create.result 1 "recovery_uncertain"
+  fi
+  return $(result)
+}
+hiveMind.handoff.completion.target() {
+  hiveMind.resolve.completion.name 2>/dev/null
+}
+hiveMind.handoff.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.cold.recover() # <?session> # cold-start recovery: reconcile registry with live infrastructure, nudge agents
+{
+  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+
+  if [ -z "$session" ]; then
+    error.log "No tmux session found — are you inside tmux?"
+    return 1
+  fi
+
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+
+  info.log "Cold-start recovery for session: $session"
+
+  # Step 1-2: Discover live infrastructure
+  local live_panes
+  live_panes=$(tmux list-panes -t "$session" -s \
+    -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_title}" 2>/dev/null)
+
+  if [ -z "$live_panes" ]; then
+    error.log "No panes found in session $session"
+    return 1
+  fi
+
+  local pane_count
+  pane_count=$(echo "$live_panes" | wc -l | tr -d ' ')
+  info.log "Found $pane_count live panes"
+
+  # Step 3-5: Reconcile registry with reality
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local stale_count=0
+  local live_count=0
+  local recovered_count=0
+
+  # Remove registry entries for panes that no longer exist
+  if [ -f "$reg" ]; then
+    local old_entries
+    old_entries=$(grep "^${session}:" "$reg" 2>/dev/null)
+    while IFS= read -r entry; do
+      [ -z "$entry" ] && continue
+      local reg_pane="${entry%%|*}"
+      if ! echo "$live_panes" | grep -q "^${reg_pane}|"; then
+        info.log "Stale registry entry: $entry — removing"
+        grep -v "^${reg_pane}|" "$reg" > "${reg}.tmp" 2>/dev/null
+        mv "${reg}.tmp" "$reg"
+        stale_count=$((stale_count + 1))
+      fi
+    done <<< "$old_entries"
+  fi
+
+  # Walk live panes, identify agents
+  while IFS='|' read -r pane_addr cmd title; do
+    [ -z "$pane_addr" ] && continue
+
+    local role
+    role=$(private.hiveMind.registry.get "$pane_addr" 2>/dev/null)
+
+    # Check if pane is running Claude Code (node = claude process)
+    local is_claude=false
+    case "$cmd" in
+      node) is_claude=true ;;
+    esac
+
+    if [ "$is_claude" = true ]; then
+      live_count=$((live_count + 1))
+
+      if [ -z "$role" ]; then
+        # Unregistered Claude pane — try to identify from title or capture
+        local capture
+        capture=$("$OOSH_DIR/otmux" pane.capture "$pane_addr" 10 2>/dev/null)
+        # Check if it mentions a role name
+        local guessed_role=""
+        for candidate in orchestrator oosh-expert oosh-tester scrum-master agent-teacher product-owner developer; do
+          if echo "$capture" | grep -qi "$candidate"; then
+            guessed_role="$candidate"
+            break
+          fi
+        done
+        if [ -n "$guessed_role" ]; then
+          info.log "Identified $pane_addr as $guessed_role (from pane content)"
+          private.hiveMind.registry.set "$pane_addr" "$guessed_role"
+          role="$guessed_role"
+        else
+          warn.log "Unidentified Claude pane at $pane_addr — register manually"
+        fi
+      fi
+
+      # Step 6-10: Nudge agents that need recovery
+      if [ -n "$role" ] && [ -n "$workspace" ]; then
+        local boot_file="${workspace}/session/boot/${role}.md"
+        local context_file="${workspace}/session/agents/${role}/context.md"
+
+        # Check if agent looks stuck or just booted
+        local state
+        state=$(private.hiveMind.sweep.detect "$pane_addr" 2>/dev/null)
+        local status="${state%%|*}"
+
+        case "$status" in
+          active|idle)
+            info.log "$role at $pane_addr: $status — no recovery needed"
+            ;;
+          *)
+            info.log "$role at $pane_addr: $status — sending recovery nudge"
+            if [ -f "$boot_file" ]; then
+              "$OOSH_DIR/otmux" send "$pane_addr" C-u
+              "$OOSH_DIR/otmux" send "$pane_addr" "Read session/boot/${role}.md" Enter
+            elif [ -f "$context_file" ]; then
+              "$OOSH_DIR/otmux" send "$pane_addr" C-u
+              "$OOSH_DIR/otmux" send "$pane_addr" "Read session/agents/${role}/context.md" Enter
+            fi
+            recovered_count=$((recovered_count + 1))
+            ;;
+        esac
+      fi
+    fi
+  done <<< "$live_panes"
+
+  console.log "cold.recover: session=$session panes=$pane_count claude=$live_count stale=$stale_count recovered=$recovered_count"
+  create.result 0 "panes=$pane_count claude=$live_count stale=$stale_count recovered=$recovered_count"
+  return 0
+}
+hiveMind.cold.recover.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.train() # <role> <?session> # train agent: verify reading list, send training task, monitor, verify completion
+{
+  local role="$1"
+  local session="${2:-$(private.hiveMind.active.team)}"
+
+  if [ -z "$role" ]; then
+    error.log "Usage: hiveMind train <role> <?session>"
+    return 1
+  fi
+
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$workspace" ]; then
+    error.log "Cannot determine workspace root"
+    return 1
+  fi
+
+  # Resolve role to pane
+  local target
+  target=$(hiveMind.resolve "$role" "$session" 2>/dev/null)
+  if [ -z "$target" ]; then
+    error.log "Cannot resolve '$role' — is the agent bootstrapped?"
+    return 1
+  fi
+
+  info.log "Training $role at $target"
+
+  # Step 1: Verify SKILL.md has a Reading List
+  local agents_dir
+  agents_dir=$(private.hiveMind.find.agents.dir 2>/dev/null)
+  local skill_file="${agents_dir}/${role}/SKILL.md"
+  if [ -z "$agents_dir" ] || [ ! -f "$skill_file" ]; then
+    error.log "No SKILL.md found for role $role (tried $skill_file)"
+    return 1
+  fi
+
+  if ! grep -q "## Reading List" "$skill_file" 2>/dev/null; then
+    warn.log "SKILL.md for $role has no Reading List section — agent may not know what to read"
+  else
+    info.log "SKILL.md has Reading List section"
+  fi
+
+  # Step 2: Write training task file
+  local tasks_dir="${workspace}/session/tasks"
+  mkdir -p "$tasks_dir" 2>/dev/null
+  local task_file="${tasks_dir}/${role}-training.md"
+
+  local rel_skill
+  rel_skill=$(echo "$skill_file" | sed "s|^${workspace}/||")
+
+  {
+    echo "# Training: $role"
+    echo ""
+    echo "**From**: agent-trainer"
+    echo "**To**: $role"
+    echo "**Priority**: HIGH"
+    echo "**Date**: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo ""
+    echo "## Instructions"
+    echo ""
+    echo "1. Read your SKILL.md: \`${rel_skill}\`"
+    echo "2. Follow the Reading List section — read each file in order"
+    echo "3. After reading all files, write your context to \`session/agents/${role}/context.md\`"
+    echo "4. Check \`session/tasks/\` for assigned work"
+    echo "5. Report training complete with files-read count"
+  } > "$task_file"
+
+  # Send task to agent
+  "$OOSH_DIR/otmux" send "$target" C-u
+  "$OOSH_DIR/otmux" send "$target" "Read session/tasks/${role}-training.md" Enter
+
+  # Step 3: Monitor progress — wait up to 60s for file reads
+  info.log "Monitoring training progress..."
+  local waited=0
+  local trained=false
+  while [ "$waited" -lt 60 ]; do
+    sleep 10
+    waited=$((waited + 10))
+
+    local capture
+    capture=$("$OOSH_DIR/otmux" pane.capture "$target" 15 2>/dev/null)
+
+    # Check for signs of completion
+    if echo "$capture" | grep -qE 'files read|training complete|context.*written|TaskList|session/tasks'; then
+      trained=true
+      info.log "Training activity detected after ${waited}s"
+      break
+    fi
+
+    # Check if agent is actively reading (tool use activity)
+    local state
+    state=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    local status="${state%%|*}"
+    if [ "$status" = "active" ]; then
+      debug.log "Agent active at ${waited}s — still training"
+    fi
+  done
+
+  # Step 4: Verify completion
+  local context_file="${workspace}/session/agents/${role}/context.md"
+  if [ -f "$context_file" ]; then
+    local age file_mtime
+    file_mtime=$(private.hiveMind.file.mtime "$context_file" 2>/dev/null || echo 0)
+    age=$(( $(date +%s) - file_mtime ))
+    if [ "$age" -lt 120 ]; then
+      info.log "Context file written (${age}s ago)"
+      trained=true
+    fi
+  fi
+
+  # Step 5: Report result
+  if [ "$trained" = true ]; then
+    console.log "train: $role at $target — trained and ready for work"
+    create.result 0 "trained"
+  else
+    warn.log "train: $role at $target — training may still be in progress (waited 60s)"
+    create.result 0 "in_progress"
+  fi
+  return 0
+}
+hiveMind.train.completion.role() {
+  hiveMind.role.list 2>/dev/null
+}
+hiveMind.train.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.improvement() # <?action:next|done|list> <?number> # CMM improvement workflow: find next, mark done, list status
+{
+  local action="${1:-next}"
+  local number="$2"
+
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$workspace" ]; then
+    error.log "Cannot determine workspace root"
+    return 1
+  fi
+
+  local imp_file="${workspace}/session/cmm.improvement.md"
+  local pipeline_file="${workspace}/session/knowledge-base/cmm-pipeline.md"
+
+  # Ensure improvement file exists
+  if [ ! -f "$imp_file" ]; then
+    if [ "$action" = "next" ] || [ "$action" = "list" ]; then
+      warn.log "No improvement file at $imp_file"
+      create.result 1 "no_file"
+      return 1
+    fi
+  fi
+
+  case "$action" in
+
+    next)
+      # Step 1: Find top unchecked improvement
+      # Format: lines with "- [ ]" are unchecked, "- [x]" are done
+      local next_item
+      next_item=$(grep -n '\- \[ \]' "$imp_file" 2>/dev/null | head -1)
+      if [ -z "$next_item" ]; then
+        console.log "improvement: all items checked — pipeline empty"
+        create.result 0 "all_done"
+        return 0
+      fi
+
+      local line_num="${next_item%%:*}"
+      local item_text="${next_item#*:}"
+      # Strip leading whitespace and checkbox
+      item_text=$(echo "$item_text" | sed 's/^[[:space:]]*- \[ \] //')
+
+      info.log "Next improvement (line $line_num): $item_text"
+
+      # Step 2: Extract KPIs — read lines after the item until next item or section
+      local kpis=""
+      local kpi_line=$((line_num + 1))
+      local total_lines
+      total_lines=$(wc -l < "$imp_file" | tr -d ' ')
+      while [ "$kpi_line" -le "$total_lines" ]; do
+        local line
+        line=$(sed -n "${kpi_line}p" "$imp_file")
+        # Stop at next item, blank line after KPIs, or section header
+        case "$line" in
+          "- ["*|"## "*|"# "*) break ;;
+          "") break ;;
+          *) kpis="${kpis}${line}"$'\n' ;;
+        esac
+        kpi_line=$((kpi_line + 1))
+      done
+
+      if [ -n "$kpis" ]; then
+        echo "KPIs:"
+        echo "$kpis"
+      fi
+
+      console.log "improvement next: $item_text"
+      create.result 0 "$item_text"
+      ;;
+
+    done)
+      # Steps 5-8: Mark improvement as done, commit
+      if [ -z "$number" ]; then
+        # Default: mark first unchecked item
+        local first_unchecked
+        first_unchecked=$(grep -n '\- \[ \]' "$imp_file" 2>/dev/null | head -1)
+        if [ -z "$first_unchecked" ]; then
+          warn.log "No unchecked items to mark done"
+          return 1
+        fi
+        number="${first_unchecked%%:*}"
+      fi
+
+      # Mark the checkbox at line $number
+      if sed -n "${number}p" "$imp_file" | grep -q '\- \[ \]'; then
+        sed -i '' "${number}s/- \[ \]/- [x]/" "$imp_file"
+        info.log "Marked line $number as done"
+      else
+        warn.log "Line $number is not an unchecked item"
+        return 1
+      fi
+
+      # Update pipeline status if it exists
+      if [ -f "$pipeline_file" ]; then
+        info.log "Remember to update $pipeline_file status"
+      fi
+
+      # Step 8: Commit
+      (cd "$workspace" && git add -f session/cmm.improvement.md session/knowledge-base/cmm-pipeline.md 2>/dev/null && \
+       git commit -m "CMM improvement done (line $number)" 2>/dev/null)
+      local commit_result=$?
+      if [ $commit_result -eq 0 ]; then
+        console.log "improvement done: line $number — committed"
+      else
+        console.log "improvement done: line $number — marked (nothing to commit)"
+      fi
+      create.result 0 "done"
+      ;;
+
+    list)
+      # Show status summary
+      local total checked unchecked
+      total=$(grep -c '\- \[' "$imp_file" 2>/dev/null || echo 0)
+      checked=$(grep -c '\- \[x\]' "$imp_file" 2>/dev/null || echo 0)
+      unchecked=$(grep -c '\- \[ \]' "$imp_file" 2>/dev/null || echo 0)
+      echo "CMM Improvements: $checked/$total done, $unchecked remaining"
+      grep '\- \[' "$imp_file" 2>/dev/null
+      create.result 0 "$checked/$total"
+      ;;
+
+    *)
+      error.log "Usage: hiveMind improvement [next|done|list] <?line-number>"
+      return 1
+      ;;
+  esac
+  return 0
+}
+hiveMind.improvement.completion.action() {
+  echo "next done list"
+}
+
+hiveMind.metrics.log() # <?session> # log sweep metrics per agent + flag context/subscription thresholds
+{
+  local session="${1:-$(private.hiveMind.active.team)}"
+
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$workspace" ]; then
+    error.log "Cannot determine workspace root"
+    return 1
+  fi
+
+  local logfile="${workspace}/session/metrics/sweep-log.md"
+  mkdir -p "$(dirname "$logfile")" 2>/dev/null
+
+  # Initialize log with header if new
+  if [ ! -f "$logfile" ]; then
+    echo "| Time | Agent | Pane | Context% | State | Velocity | TTC |" > "$logfile"
+    echo "|------|-------|------|----------|-------|----------|-----|" >> "$logfile"
+  fi
+
+  local pane_lines
+  pane_lines=$(tmux list-panes -t "$session" -s \
+    -F "#{window_index}.#{pane_index}|#{pane_current_command}" 2>/dev/null)
+  [ -z "$pane_lines" ] && { error.log "No panes for $session"; return 1; }
+
+  local ts logged=0 alerts=""
+  ts=$(date -u '+%H:%M')
+
+  while IFS='|' read -r addr cmd; do
+    local target="${session}:${addr}"
+
+    # Only log Claude panes
+    local is_claude=false
+    case "$cmd" in
+      node) is_claude=true ;;
+    esac
+    [ "$is_claude" = false ] && continue
+
+    local role
+    role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+    [ -z "$role" ] && role="$addr"
+
+    # Context %
+    local pct
+    pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+    [ -z "$pct" ] && pct="?"
+
+    # State
+    local detect status
+    detect=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    status="${detect%%|*}"
+
+    # Velocity
+    local velocity tokens_hr ttc
+    velocity=$("$OOSH_DIR/claudeCode" context.velocity "$target" 2>/dev/null)
+    tokens_hr=$(echo "$velocity" | grep -oE '^[0-9]+ tokens/hr' || echo "-")
+    ttc=$(echo "$velocity" | grep -oE '~[0-9]+min' || echo "-")
+
+    # Log row
+    echo "| $ts | $role | $addr | ${pct}% | $status | $tokens_hr | $ttc |" >> "$logfile"
+    logged=$((logged + 1))
+
+    # Flag: context > 80% used (i.e. <20% remaining)
+    if [ "$pct" != "?" ] && [ "$pct" -le 20 ] 2>/dev/null; then
+      alerts="${alerts}CONTEXT: $role at ${pct}% — save state now\n"
+      "$OOSH_DIR/claudeCode" context.alert "$target" 20
+
+      # Auto-compact: when context critically low AND agent is idle
+      if [ "$pct" -le 15 ] && [ "$status" = "idle" ]; then
+        info.log "Auto-compacting $role (${pct}% context, idle)"
+        hiveMind.peer.compact "$target" "$session" &
+      fi
+    fi
+
+  done <<< "$pane_lines"
+
+  # Flag: subscription threshold
+  local sub_pct
+  sub_pct=$("$OOSH_DIR/scrumMaster" subscription 2>/dev/null | grep -oE '[0-9]+%' | head -1 | tr -d '%')
+  if [ -n "$sub_pct" ] && [ "$sub_pct" -ge 80 ] 2>/dev/null; then
+    alerts="${alerts}SUBSCRIPTION: ${sub_pct}% — throttle team\n"
+  fi
+
+  if [ -n "$alerts" ]; then
+    warn.log "Metric alerts:\n$alerts"
+  fi
+
+  console.log "metrics.log: $logged agents logged to sweep-log.md"
+  create.result 0 "$logged"
+  return 0
+}
+hiveMind.metrics.log.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+hiveMind.metrics.summary() # <?lines:20> # summarize recent sweep-log: trends, burn rates, projections
+{
+  local lines="${1:-20}"
+
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -z "$workspace" ]; then
+    error.log "Cannot determine workspace root"
+    return 1
+  fi
+
+  local logfile="${workspace}/session/metrics/sweep-log.md"
+  if [ ! -f "$logfile" ]; then
+    warn.log "No sweep-log.md — run hiveMind metrics.log first"
+    return 1
+  fi
+
+  local total_rows
+  total_rows=$(grep -c '^|' "$logfile" | tr -d ' ')
+  total_rows=$((total_rows - 2))  # subtract header rows
+
+  echo "=== Metrics Summary (last $lines entries of $total_rows total) ==="
+  echo ""
+
+  # Show recent entries
+  tail -"$lines" "$logfile"
+  echo ""
+
+  # Count agents at risk (context <=20%)
+  local at_risk
+  at_risk=$(tail -"$lines" "$logfile" | grep -oE '[0-9]+%' | while read pct; do
+    p="${pct%\%}"
+    [ "$p" -le 20 ] 2>/dev/null && echo "$p"
+  done | wc -l | tr -d ' ')
+
+  # Count blocked agents
+  local blocked
+  blocked=$(tail -"$lines" "$logfile" | grep -cE 'permission|stuck|panel|overlay' || echo 0)
+
+  echo "At risk (<=20% context): $at_risk"
+  echo "Blocked states: $blocked"
+  echo "Total rows in log: $total_rows"
+
+  create.result 0 "entries=$total_rows at_risk=$at_risk blocked=$blocked"
+  return 0
+}
+
+hiveMind.plan.create() # <slug> # link a plan from ~/.claude/plans/ to session/plans/ with timestamp, symlink back, git commit
+{
+  local slug="$1"
+  local plans_dir="$HOME/.claude/plans"
+  local source_file="$plans_dir/${slug}.md"
+
+  if [ -z "$slug" ]; then
+    error.log "Usage: hiveMind plan.create <slug>"
+    return 1
+  fi
+
+  if [ ! -f "$source_file" ]; then
+    error.log "Plan not found: $source_file"
+    return 1
+  fi
+
+  if [ -L "$source_file" ]; then
+    error.log "Already linked (symlink): $source_file"
+    return 1
+  fi
+
+  # Find session/plans/ dir relative to git workspace
+  local workspace
+  workspace=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -z "$workspace" ]; then
+    error.log "Not in a git repository"
+    return 1
+  fi
+
+  local session_plans="$workspace/session/plans"
+  mkdir -p "$session_plans"
+
+  # Generate timestamped filename
+  local timestamp
+  timestamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  local target_name="${timestamp}.${slug}.plan.md"
+  local target_path="$session_plans/$target_name"
+
+  # Copy to session/plans/
+  cp "$source_file" "$target_path"
+
+  # Replace original with symlink
+  rm "$source_file"
+  ln -s "$target_path" "$source_file"
+
+  # Git add + commit
+  (cd "$workspace" && git add "session/plans/$target_name" && \
+   git commit -m "Plan linked: $target_name
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>")
+
+  success.log "Plan linked: session/plans/$target_name"
+  RESULT="session/plans/$target_name"
+}
+hiveMind.plan.create.completion.slug() {
+  # List non-symlink .md files in ~/.claude/plans/ (plans not yet linked)
+  local plans_dir="$HOME/.claude/plans"
+  [ -d "$plans_dir" ] || return
+  local f
+  for f in "$plans_dir"/*.md; do
+    [ -f "$f" ] && [ ! -L "$f" ] && basename "$f" .md
+  done
+}

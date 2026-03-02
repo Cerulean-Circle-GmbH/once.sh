@@ -1,0 +1,1046 @@
+#!/usr/bin/env bash
+# hiveMind.sweep — blocker detection, unblocking, monitoring
+# Sourced by hiveMind.start()
+
+hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane status of all registered agents (optional sleep before sweep)
+{
+  local session="$1"
+  local interval="$2"
+
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind team.sweep <session> <?interval>"
+    return 1
+  fi
+
+  # Sleep first if interval provided (avoids compound commands that trigger permission prompts)
+  if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+    sleep "$interval"
+  fi
+
+  if [ ! -f "$HIVEMIND_REGISTRY" ]; then
+    error.log "No role registry found at $HIVEMIND_REGISTRY"
+    return 1
+  fi
+
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    error.log "Session $session not found"
+    return 1
+  fi
+
+  if ! grep -q "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null; then
+    error.log "No agents registered for session $session"
+    return 1
+  fi
+
+  # Identify own pane to skip self
+  local own_pane=""
+  [ -n "$TMUX_PANE" ] && own_pane="$TMUX_PANE"
+
+  while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    case "$target" in "${session}:"*) ;; *) continue ;; esac
+
+    local addr="${target#*:}"
+
+    # Skip self
+    if [ -n "$own_pane" ]; then
+      local pane_id
+      pane_id=$(tmux display-message -t "$target" -p "#{pane_id}" 2>/dev/null)
+      [ "$pane_id" = "$own_pane" ] && continue
+    fi
+
+    # Capture last 15 lines
+    local content
+    content=$(otmux pane.capture "$target" 15 2>/dev/null)
+
+    # Determine state and details using sweep.detect + verb enrichment
+    local state="IDLE"
+    local details=""
+
+    # Check for empty/unreachable pane
+    local trimmed
+    trimmed=$(echo "$content" | tr -d '[:space:]')
+    if [ -z "$trimmed" ]; then
+      state="UNKNOWN"
+      printf "%-5s %-22s %s\n" "$addr" "$role" "$state"
+      continue
+    fi
+
+    # Use sweep.detect for structured detection (handles all blocker types)
+    local detect_raw detect_status detect_severity detect_detail
+    detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    IFS='|' read -r detect_status _ detect_severity detect_detail <<< "$detect_raw"
+
+    case "$detect_status" in
+      permission)
+        state="PERMISSION"
+        details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
+        ;;
+      tool-confirm)
+        state="TOOL_CONFIRM"
+        details=$(echo "$content" | grep -oE '"[^"]*"' | tail -1)
+        ;;
+      rate-limit)
+        state="RATE_LIMIT"
+        [ -n "$detect_detail" ] && details="$detect_detail"
+        ;;
+      subscription-limit)
+        state="SUB_LIMIT !!"
+        ;;
+      accept-edits)
+        state="ACCEPT_EDITS"
+        [ -n "$detect_detail" ] && [ "$detect_detail" != "0" ] && details="${detect_detail} pending"
+        ;;
+      context-warning)
+        state="CONTEXT_LOW"
+        [ -n "$detect_detail" ] && details="$detect_detail"
+        ;;
+      just-compacted)
+        state="COMPACTED"
+        ;;
+      overlay)
+        state="OVERLAY"
+        ;;
+      panel)
+        state="PANEL"
+        ;;
+      autocomplete)
+        state="AUTOCOMPLETE"
+        ;;
+      mcp-error)
+        state="MCP_ERROR"
+        ;;
+      api-error)
+        state="API_ERROR"
+        [ -n "$detect_detail" ] && details="$detect_detail"
+        ;;
+      crash)
+        state="CRASH !!"
+        ;;
+      shell-escaped)
+        state="SHELL"
+        ;;
+      queued)
+        state="INPUT"
+        local last_line
+        last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
+        details=$(echo "$last_line" | sed -E 's/^[[:space:]]*(>|❯)[[:space:]]+//')
+        [ ${#details} -gt 40 ] && details="${details:0:37}..."
+        details="\"$details\""
+        ;;
+      idle)
+        state="IDLE"
+        ;;
+      active)
+        # Enrich with verb detection for active agents
+        if echo "$content" | grep -qiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running'; then
+          state="ACTIVE"
+          details=$(echo "$content" | grep -oiE 'Composing|Musing|Thinking|Cascading|Incubating|Frosting|Misting|Brewing|Baking|Cooking|Simmering|Distilling|Weaving|Crafting|Processing|Reading|Writing|Editing|Searching|Running' | tail -1)
+          local elapsed
+          elapsed=$(echo "$content" | grep -oE '\([0-9]+[ms]\)' | tail -1)
+          [ -n "$elapsed" ] && details="$details $elapsed"
+        elif echo "$content" | grep -qiE 'Baked|Brewed|Cooked|Simmered|Distilled|Woven|Crafted|Composed|Frosted|Incubated|Cascaded'; then
+          state="COMPLETED"
+        else
+          state="ACTIVE"
+        fi
+        ;;
+      *)
+        state="${detect_status:-UNKNOWN}"
+        ;;
+    esac
+
+    if [ -n "$details" ]; then
+      printf "%-5s %-22s %-14s %s\n" "$addr" "$role" "$state" "$details"
+    else
+      printf "%-5s %-22s %s\n" "$addr" "$role" "$state"
+    fi
+  done < "$HIVEMIND_REGISTRY"
+}
+hiveMind.team.sweep.completion.session() {
+  private.hiveMind.teams.complete
+}
+hiveMind.team.sweep.completion.interval() {
+  echo "15"
+  echo "30"
+  echo "60"
+  echo "120"
+}
+
+hiveMind.team.loop() # <session> <?interval:30> # continuous team.sweep at interval
+{
+  local session="$1"
+  local interval="${2:-30}"
+
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind team.loop <session> <?interval>"
+    return 1
+  fi
+
+  console.log "Team loop: $session every ${interval}s (Ctrl+C to stop)"
+
+  while true; do
+    echo ""
+    echo "── team.sweep @ $(date '+%H:%M:%S') ──────────────────────────────"
+    hiveMind.team.sweep "$session"
+    sleep "$interval"
+  done
+}
+hiveMind.team.loop.completion.session() {
+  private.hiveMind.teams.complete
+}
+hiveMind.team.loop.completion.interval() {
+  echo "15"
+  echo "30"
+  echo "60"
+}
+
+hiveMind.monitor() # <?name-or-lines:5> <?session-or-lines> # capture pane output; name=specific agent, number=line count for all panes
+{
+  local first="${1:-5}"
+  local second="$2"
+
+  # If first arg is not a number, treat as agent name (monitor single agent)
+  if [ -n "$first" ] && ! echo "$first" | grep -qE '^[0-9]+$'; then
+    local name="$first"
+    local lines="${second:-5}"
+    local target
+    target=$(hiveMind.resolve "$name")
+    if [ $? -ne 0 ]; then
+      return 1
+    fi
+
+    echo "───────────────────────────────────────────────────────────"
+    echo " $name ($target) — last $lines lines"
+    echo "───────────────────────────────────────────────────────────"
+    otmux pane.capture "$target" "$lines"
+    echo ""
+    return 0
+  fi
+
+  # All-pane monitoring (existing behavior)
+  local lines="$first"
+  local session="${second:-${HIVEMIND_SESSION:-$(private.hiveMind.active.team)}}"
+
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    error.log "Session '$session' not found"
+    return 1
+  fi
+
+  local own_pane=""
+  if [ -n "$TMUX_PANE" ]; then
+    own_pane="$TMUX_PANE"
+  fi
+
+  echo "═══════════════════════════════════════════════════════════"
+  echo " hiveMind monitor — session: $session (last $lines lines)"
+  echo "═══════════════════════════════════════════════════════════"
+
+  tmux list-panes -t "$session" -F "#{pane_id}|#{window_index}.#{pane_index}|#{pane_title}" 2>/dev/null | \
+    while IFS='|' read -r pane_id pane_addr pane_title; do
+      if [ -n "$own_pane" ] && [ "$pane_id" = "$own_pane" ]; then
+        continue
+      fi
+
+      local label="${pane_title:-pane $pane_addr}"
+      echo "───────────────────────────────────────────────────────────"
+      echo " [$pane_addr] $label"
+      echo "───────────────────────────────────────────────────────────"
+      otmux pane.capture "${session}:${pane_addr}" "$lines"
+      echo ""
+    done
+
+  info.log "Monitored $session"
+  return 0
+}
+
+hiveMind.monitor.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.monitor.approve() # <pane> <?option:2> # approve a permission prompt in a pane
+{
+  local pane="$1"
+  local option="${2:-2}"
+
+  if [ -z "$pane" ]; then
+    error.log "Usage: hiveMind monitor.approve <pane> <?option:2>"
+    return 1
+  fi
+
+  info.log "Sending approval option $option to pane $pane..."
+  otmux send.enter "$pane" "$option"
+  success.log "Sent option $option to pane $pane"
+}
+
+hiveMind.monitor.approve.completion.option() {
+  echo "2"
+  echo "1"
+  echo "3"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SWEEP & UNBLOCK
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.sweep.classify() {
+  # Pure content classifier — takes text as $1 or stdin, returns status|action|severity[|detail]
+  # Testable without tmux — all pattern matching, no side effects.
+  #
+  # Statuses (18):
+  #   active, idle, permission, accept-edits, context-warning, just-compacted,
+  #   queued, rate-limit, subscription-limit, autocomplete, shell-escaped,
+  #   overlay, panel, mcp-error, api-error, tool-confirm, crash, unknown
+  #
+  # Actions: none, enter, escape, down-enter, wait
+  #
+  # Severity: critical, blocker, warning, info
+  #   critical  — needs immediate human intervention (crash, subscription-limit)
+  #   blocker   — auto-resolvable or needs approval (permission, accept-edits, rate-limit)
+  #   warning   — may need attention soon (context-warning, just-compacted)
+  #   info      — normal operational states (active, idle)
+  #
+  # Detail (optional 4th field): extra context (percentage, count, retry time)
+
+  local content="${1:-$(cat -)}"
+
+  # Strip ANSI escape codes for reliable matching
+  content=$(printf '%s' "$content" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
+
+  local trimmed
+  trimmed=$(echo "$content" | tr -d '[:space:]')
+  [ -z "$trimmed" ] && echo "unknown|none|info" && return 0
+
+  # ── Overlays and panels (dismiss with Escape) ──────────────────────────
+
+  # Background tasks overlay
+  if echo "$content" | grep -qiE 'Background tasks|[0-9]+ background|task[s]? running'; then
+    echo "overlay|escape|blocker"
+    return 0
+  fi
+
+  # Git diff/status panel — needs Escape to close
+  if echo "$content" | grep -qE 'Esc close'; then
+    echo "panel|escape|blocker"
+    return 0
+  fi
+  if echo "$content" | grep -qE 'Uncommitted changes|git diff' && echo "$content" | grep -qE '^\s*[+-]{3}\s|^diff --git'; then
+    echo "panel|escape|blocker"
+    return 0
+  fi
+
+  # ── Error states (most urgent first) ───────────────────────────────────
+
+  # Crash / exited: Claude Code process terminated unexpectedly
+  if echo "$content" | grep -qiE 'claude.*exited|process.*terminated|segmentation fault|SIGKILL|SIGTERM|core dumped|fatal error'; then
+    echo "crash|none|critical"
+    return 0
+  fi
+
+  # API error: network/server errors from Anthropic API
+  if echo "$content" | grep -qiE 'APIConnectionError|APIStatusError|ECONNREFUSED|ETIMEDOUT|502 Bad Gateway|503 Service|529 Overloaded|internal server error|network error|connection reset'; then
+    local retry_detail
+    retry_detail=$(echo "$content" | grep -oiE 'retry.*(in |after )[0-9]+\s*s(ec)?' | tail -1)
+    echo "api-error|wait|blocker|${retry_detail:-transient}"
+    return 0
+  fi
+
+  # MCP connection error: MCP server connection/reconnect issues
+  if echo "$content" | grep -qiE 'MCP.*error|MCP.*disconnect|MCP.*reconnect|MCP.*timeout|MCP server.*not responding|failed to connect.*MCP'; then
+    echo "mcp-error|wait|warning"
+    return 0
+  fi
+
+  # ── Permission and confirmation prompts ────────────────────────────────
+
+  # Permission prompt: "Allow" + "Deny" or numbered Yes/No options with permission context
+  if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
+    echo "permission|down-enter|blocker"
+    return 0
+  fi
+  if echo "$content" | grep -q 'Do you want to proceed?' && echo "$content" | grep -qE '^\s*(❯\s*)?[0-9]+\.\s*(Yes|No)'; then
+    echo "permission|enter|blocker"
+    return 0
+  fi
+  # Fallback: numbered options with permission/allow/approve keywords nearby
+  if echo "$content" | grep -qiE 'permission|approve|authorize' && echo "$content" | grep -qE '^\s*❯?\s*[0-9]+\.\s*(Yes|Allow)'; then
+    echo "permission|enter|blocker"
+    return 0
+  fi
+
+  # Tool-use confirmation: specific tool approval prompts
+  if echo "$content" | grep -qE 'Run (this |the )?command|Execute.*\?|Create (this |the )?file|Write to|Delete.*\?'; then
+    if echo "$content" | grep -qE '^\s*(❯\s*)?[0-9]+\.\s*(Yes|No|Allow|Deny)'; then
+      echo "tool-confirm|enter|blocker"
+      return 0
+    fi
+  fi
+
+  # ── Rate and subscription limits ───────────────────────────────────────
+
+  # Subscription limit: quota/subscription exhausted (distinct from rate-limit)
+  if echo "$content" | grep -qiE 'subscription.*limit|daily.*limit.*reached|monthly.*limit|quota.*exhausted|billing.*limit|plan.*limit.*exceeded'; then
+    echo "subscription-limit|none|critical"
+    return 0
+  fi
+
+  # Rate limit: temporary throttling
+  if echo "$content" | grep -qiE 'rate.limit|usage.limit|try again.*(in |later)|too many requests|throttl|request limit|capacity|overloaded.*try'; then
+    local retry_time
+    retry_time=$(echo "$content" | grep -oiE '(in |after )[0-9]+ ?(sec|min|second|minute)s?' | tail -1)
+    echo "rate-limit|wait|blocker|${retry_time:-unknown}"
+    return 0
+  fi
+
+  # ── Edit and acceptance prompts ────────────────────────────────────────
+
+  # Accept edits prompt: ⏵⏵ accept edits on · N bash(es) — also match without emoji prefix
+  if echo "$content" | grep -qE '⏵⏵ accept|accept edits'; then
+    local edit_count
+    edit_count=$(echo "$content" | grep -oE '[0-9]+ (bash|file|edit)' | head -1 | grep -oE '[0-9]+')
+    [ -z "$edit_count" ] && edit_count=0
+    echo "accept-edits|enter|blocker|$edit_count"
+    return 0
+  fi
+
+  # ── Context and compact states ─────────────────────────────────────────
+
+  # Context warning: "Context left until auto-compact: N%"
+  if echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
+    local ctx_pct
+    ctx_pct=$(echo "$content" | grep -oE 'auto-compact: [0-9]+%' | grep -oE '[0-9]+' | tail -1)
+    echo "context-warning|none|warning|${ctx_pct:-unknown}%"
+    return 0
+  fi
+
+  # Just compacted: "Compacted" in recent output
+  if echo "$content" | grep -qiE 'Compacted|auto-compact.*completed'; then
+    echo "just-compacted|none|warning"
+    return 0
+  fi
+
+  # ── UI states ──────────────────────────────────────────────────────────
+
+  # Autocomplete stuck: completion menu visible (e.g. /compact dropdown)
+  if echo "$content" | grep -qE '^\s*/\w+.*─'; then
+    echo "autocomplete|escape|blocker"
+    return 0
+  fi
+
+  local last_line
+  last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
+
+  # Shell-escaped: bare $ prompt (agent left Claude Code)
+  if echo "$last_line" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
+    echo "shell-escaped|none|critical"
+    return 0
+  fi
+
+  # Idle: clean prompt (just ❯ or > with no text after)
+  if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
+    echo "idle|none|info"
+    return 0
+  fi
+
+  # Queued: text after prompt not submitted
+  if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
+    echo "queued|enter|blocker"
+    return 0
+  fi
+
+  # ── Fallback: unknown interactive menu ─────────────────────────────────
+  # Numbered list with cursor marker — catches new/unknown prompts
+  if echo "$content" | grep -qE '^\s*❯?\s*[0-9]+\.' && echo "$content" | grep -q '❯'; then
+    echo "menu|enter|blocker"
+    return 0
+  fi
+
+  # Active (generating/running tools/indeterminate)
+  echo "active|none|info"
+  return 0
+}
+
+private.hiveMind.sweep.detect() {
+  # Thin wrapper: capture pane content, delegate to classify
+  # Returns status|action|severity[|detail]
+  # Backward-compatible: callers using ${result%%|*} for status still work.
+
+  local target="$1"
+  [ -z "$target" ] && echo "unknown|none|info" && return 1
+
+  local content
+  content=$(tmux capture-pane -t "$target" -p -S -20 2>/dev/null)
+
+  private.hiveMind.sweep.classify "$content"
+}
+
+private.hiveMind.unblock.pane() {
+  # Detect and resolve blocker on a single pane
+  # Handles sweep.detect format: status|action|severity[|detail]
+  # Pre-action guard: re-detects before sending keys to prevent race conditions
+  local target="$1"
+  local label="$2"
+  local attempt="${3:-1}"
+
+  local result
+  result=$(private.hiveMind.sweep.detect "$target")
+
+  # Parse fields: status|action|severity|detail
+  local status action severity detail
+  IFS='|' read -r status action severity detail <<< "$result"
+
+  # Skip if already healthy
+  case "$status" in
+    active|idle|unknown) return 0 ;;
+  esac
+
+  # Skip wait-only and critical states before guard (no keys to send)
+  case "$status" in
+    rate-limit|api-error|mcp-error)
+      console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
+      return 0
+      ;;
+    subscription-limit|crash|shell-escaped)
+      warn.log "CRITICAL $label ($status) — needs human intervention"
+      return 0
+      ;;
+  esac
+
+  # PRE-ACTION GUARD: re-detect to confirm state hasn't changed
+  sleep 0.2
+  local confirm
+  confirm=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+  local confirm_status="${confirm%%|*}"
+  if [ "$confirm_status" != "$status" ]; then
+    info.log "$label state changed ($status → $confirm_status) — skipping action"
+    return 0
+  fi
+
+  case "$status" in
+    permission)
+      # Select option 2 ("Yes, and don't ask again") — Down then Enter
+      otmux send "$target" Down
+      sleep 0.3
+      otmux send "$target" Enter
+      console.log "Unblocked $label ($status) → Down+Enter (option 2)"
+      ;;
+    tool-confirm|menu)
+      # Tool confirmation or unknown menu — accept with Enter
+      otmux send "$target" Enter
+      console.log "Unblocked $label ($status) → Enter"
+      ;;
+    accept-edits)
+      # Accept pending edits — Enter for each stacked edit + base
+      local count=0
+      [[ "$detail" =~ ^[0-9]+$ ]] && count="$detail"
+      local i
+      for ((i=0; i<=count; i++)); do
+        otmux send "$target" Enter
+        sleep 0.5
+      done
+      console.log "Unblocked $label ($status) → $((count+1))x Enter (accept edits)"
+      ;;
+    overlay|panel)
+      # Dismiss overlay or git panel
+      otmux send "$target" Escape
+      console.log "Unblocked $label ($status) → Escape"
+      ;;
+    autocomplete)
+      # Dismiss stuck autocomplete menu
+      otmux send "$target" Escape
+      console.log "Unblocked $label ($status) → Escape"
+      ;;
+    queued)
+      # Submit queued text
+      otmux send "$target" Enter
+      console.log "Unblocked $label ($status) → Enter"
+      ;;
+    *)
+      # Fallback: use action field
+      case "$action" in
+        enter)
+          otmux send "$target" Enter
+          console.log "Unblocked $label ($status) → Enter"
+          ;;
+        down-enter)
+          otmux send "$target" Down
+          sleep 0.3
+          otmux send "$target" Enter
+          console.log "Unblocked $label ($status) → Down+Enter"
+          ;;
+        escape)
+          otmux send "$target" Escape
+          sleep 0.1
+          otmux send "$target" Enter
+          console.log "Unblocked $label ($status) → Escape+Enter"
+          ;;
+        wait)
+          console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
+          ;;
+        none) ;;
+      esac
+      ;;
+  esac
+
+  # Post-action verify: re-detect to confirm resolution (both attempts)
+  sleep 1
+  local recheck
+  recheck=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+  local new_status="${recheck%%|*}"
+  case "$new_status" in
+    active|idle|unknown)
+      debug.log "Verified: $label cleared ($status → $new_status)"
+      ;;
+    *)
+      if [ "$attempt" -le 1 ]; then
+        warn.log "$label still blocked ($new_status) — retrying once"
+        private.hiveMind.unblock.pane "$target" "$label" 2
+      else
+        warn.log "$label still blocked ($new_status) after retry — giving up"
+      fi
+      ;;
+  esac
+}
+
+hiveMind.sweep() # <?session> <?interval> # show last lines of each agent pane (optional sleep before sweep)
+{
+  local session="${1:-$(private.hiveMind.active.team)}"
+  local interval="$2"
+
+  # Sleep first if interval provided (avoids compound commands that trigger permission prompts)
+  if [ -n "$interval" ] && [ "$interval" -gt 0 ] 2>/dev/null; then
+    sleep "$interval"
+  fi
+
+  if [ ! -f "$HIVEMIND_REGISTRY" ]; then
+    error.log "No role registry found at $HIVEMIND_REGISTRY"
+    return 1
+  fi
+
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    error.log "Session $session not found"
+    return 1
+  fi
+
+  if ! grep -q "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null; then
+    error.log "No agents registered for session $session"
+    return 1
+  fi
+
+  while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    case "$target" in "${session}:"*) ;; *) continue ;; esac
+
+    local addr="${target#*:}"
+    echo "=== $role ($addr) ==="
+    otmux pane.capture "$target" 8
+    echo ""
+  done < "$HIVEMIND_REGISTRY"
+}
+hiveMind.sweep.completion.session() {
+  private.hiveMind.teams.complete
+}
+hiveMind.sweep.completion.interval() {
+  echo "15"
+  echo "30"
+  echo "60"
+  echo "120"
+}
+
+hiveMind.sweep.cycle() # <?session> <?interval:0> # run one sweep+unblock cycle with optional sleep
+{
+  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+  local interval="${2:-0}"
+
+  [ "$interval" -gt 0 ] 2>/dev/null && sleep "$interval"
+
+  hiveMind.sweep "$session"
+  hiveMind.unblock all "$session"
+}
+hiveMind.sweep.cycle.completion() { :; }
+
+hiveMind.unblock() # <name> <?session> # detect and resolve stuck prompt; name=agent name or 'all'
+{
+  local name="$1"
+  if [ -z "$name" ]; then
+    error.log "Usage: hiveMind unblock <name|all>"
+    return 1
+  fi
+
+  local session="${2:-$(private.hiveMind.active.team)}"
+
+  if [ "$name" = "all" ]; then
+    while IFS='|' read -r target role; do
+      [ -z "$target" ] || [ -z "$role" ] && continue
+      case "$target" in "${session}:"*) ;; *) continue ;; esac
+      private.hiveMind.unblock.pane "$target" "$role"
+    done < "$HIVEMIND_REGISTRY"
+    return 0
+  fi
+
+  # Single agent
+  local target
+  target=$(hiveMind.resolve "$name")
+  [ $? -ne 0 ] && return 1
+  private.hiveMind.unblock.pane "$target" "$name"
+}
+hiveMind.unblock.completion.name() {
+  hiveMind.resolve.completion.name
+  echo "all"
+}
+hiveMind.unblock.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.monitor.cycle() # <?session> # full monitoring cycle: context health, velocity, detect blockers, unblock, log
+{
+  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+
+  # List all panes across all windows (-s = session-wide)
+  local pane_lines
+  pane_lines=$(tmux list-panes -t "$session" -s \
+    -F "#{window_index}.#{pane_index}|#{pane_current_command}" 2>/dev/null)
+  [ -z "$pane_lines" ] && { error.log "No panes found for $session"; return 1; }
+
+  local checked=0 blocked=0 low_context=0
+
+  # Workspace for burn-log (computed once outside loop)
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  local logfile=""
+  if [ -n "$workspace" ]; then
+    logfile="${workspace}/session/context-burn-log.md"
+    if [ ! -f "$logfile" ]; then
+      echo "| Time | Pane | % | State | Velocity | TTC |" > "$logfile"
+      echo "|------|------|---|-------|----------|-----|" >> "$logfile"
+    fi
+  fi
+
+  while IFS='|' read -r addr pane_cmd; do
+    local target="${session}:${addr}"
+    local is_claude=false
+
+    case "$pane_cmd" in
+      claude*|[0-9].[0-9]*)
+        is_claude=true ;;
+      bash|zsh)
+        "$OOSH_DIR/claudeCode" process.running "$target" && is_claude=true ;;
+    esac
+
+    [ "$is_claude" = "false" ] && continue
+    checked=$((checked + 1))
+
+    # Step 1: Context health check
+    local pct
+    pct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+    [ -z "$pct" ] && pct="unknown"
+
+    # Step 2: Velocity (tokens/hr, time-to-compact)
+    local velocity tokens_hr ttc
+    velocity=$("$OOSH_DIR/claudeCode" context.velocity "$target" 2>/dev/null)
+    tokens_hr=$(echo "$velocity" | grep -oE '^[0-9]+ tokens/hr' || echo "-")
+    ttc=$(echo "$velocity" | grep -oE '~[0-9]+min' || echo "-")
+
+    # Step 3: Alert if context low (<25%)
+    if [ "$pct" != "unknown" ] && [ "$pct" -le 25 ] 2>/dev/null; then
+      low_context=$((low_context + 1))
+      warn.log "$target: ${pct}% context — triggering alert"
+      "$OOSH_DIR/claudeCode" context.alert "$target" 25
+    fi
+
+    # Step 4: Detect blockers and unblock
+    local detect_raw status
+    detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    status="${detect_raw%%|*}"
+    case "$status" in
+      active|idle|unknown) ;; # healthy — skip
+      *) blocked=$((blocked + 1))
+         private.hiveMind.unblock.pane "$target" "${addr}" ;;
+    esac
+
+    # Step 5: Log to burn-log
+    if [ -n "$logfile" ]; then
+      local ts
+      ts=$(date '+%H:%M')
+      echo "| $ts | $addr | ${pct}% | $status | $tokens_hr | $ttc |" >> "$logfile"
+    fi
+
+  done <<< "$pane_lines"
+
+  info.log "Monitor cycle: $checked checked, $blocked blocked, $low_context low-context"
+  create.result 0 "$checked"
+  return $(result)
+}
+hiveMind.monitor.cycle.completion() { :; }
+
+hiveMind.sweep.loop() # <?seconds:30> # continuous sweep + unblock all sessions at interval
+{
+  local interval="${1:-30}"
+
+  console.log "Starting sweep loop every ${interval}s across all sessions (Ctrl+C to stop)"
+
+  while true; do
+    echo ""
+    echo "── sweep @ $(date '+%H:%M:%S') ──────────────────────────────────"
+    local teams
+    teams=$(hiveMind.team.list 2>/dev/null)
+    if [ -n "$teams" ]; then
+      while read -r session; do
+        hiveMind.sweep "$session"
+        hiveMind.unblock all "$session"
+      done <<< "$teams"
+    fi
+    sleep "$interval"
+  done
+}
+hiveMind.sweep.loop.completion.seconds() {
+  echo "15"
+  echo "30"
+  echo "60"
+  echo "120"
+}
+hiveMind.sweep.loop.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WATCHDOG — external sweep/unblock loop (runs outside Claude Code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+: ${HIVEMIND_WATCHDOG_PID_FILE:=/tmp/hivemind.watchdog.pid}
+: ${HIVEMIND_WATCHDOG_LOG:=/tmp/hivemind.watchdog.log}
+: ${HIVEMIND_WATCHDOG_HEARTBEAT:=/tmp/hivemind.watchdog.heartbeat}
+: ${HIVEMIND_WATCHDOG_STATE:=/tmp/hivemind.watchdog.state}
+
+# Portable file mtime — works on both Linux and macOS
+private.hiveMind.file.mtime() {
+  local file="$1"
+  if stat -c %Y "$file" 2>/dev/null; then
+    return 0
+  fi
+  stat -f %m "$file" 2>/dev/null
+}
+
+# Per-agent failure tracking for adaptive backoff
+private.hiveMind.watchdog.get.fail.count() {
+  local target="$1"
+  grep "^${target}|" "$HIVEMIND_WATCHDOG_STATE" 2>/dev/null | cut -d'|' -f2
+}
+
+private.hiveMind.watchdog.set.fail.count() {
+  local target="$1"
+  local count="$2"
+  local status="$3"
+  # Remove old entry, append new
+  grep -v "^${target}|" "$HIVEMIND_WATCHDOG_STATE" > "${HIVEMIND_WATCHDOG_STATE}.tmp" 2>/dev/null || true
+  echo "${target}|${count}|${status}" >> "${HIVEMIND_WATCHDOG_STATE}.tmp"
+  mv "${HIVEMIND_WATCHDOG_STATE}.tmp" "$HIVEMIND_WATCHDOG_STATE"
+}
+
+private.hiveMind.watchdog.reset() {
+  local target="$1"
+  grep -v "^${target}|" "$HIVEMIND_WATCHDOG_STATE" > "${HIVEMIND_WATCHDOG_STATE}.tmp" 2>/dev/null || true
+  mv "${HIVEMIND_WATCHDOG_STATE}.tmp" "$HIVEMIND_WATCHDOG_STATE"
+}
+
+hiveMind.watchdog() # <?seconds:30> # start external sweep+unblock loop in a new tmux pane
+{
+  local interval="${1:-30}"
+
+  # Check if already running
+  if hiveMind.watchdog.status > /dev/null 2>&1; then
+    console.log "Watchdog already running (PID $(cat "$HIVEMIND_WATCHDOG_PID_FILE"))"
+    return 0
+  fi
+
+  local session
+  session=$(tmux display-message -p "#{session_name}" 2>/dev/null)
+  [ -z "$session" ] && { error.log "Not inside a tmux session"; return 1; }
+
+  # Initialize watchdog state file
+  : > "$HIVEMIND_WATCHDOG_STATE"
+
+  # Get first window index (respects base-index config)
+  local first_win
+  first_win=$(tmux list-windows -t "$session" -F '#{window_index}' 2>/dev/null | head -1)
+  [ -z "$first_win" ] && first_win=$(private.hiveMind.tmux.base.window)
+
+  # Spawn a new pane running plain bash (no Claude Code = no permission prompts)
+  tmux split-window -t "${session}:${first_win}" -v -l 5 \
+    "echo \$\$ > '$HIVEMIND_WATCHDOG_PID_FILE' && while true; do touch '$HIVEMIND_WATCHDOG_HEARTBEAT'; echo \"── watchdog @ \$(date '+%H:%M:%S') ──\" >> '$HIVEMIND_WATCHDOG_LOG'; for team in \$(hiveMind team.list 2>/dev/null); do hiveMind watchdog.cycle \"\$team\" >> '$HIVEMIND_WATCHDOG_LOG' 2>&1; done; sleep $interval; done"
+
+  # Lock the pane title
+  sleep 0.5
+  local watchdog_addr
+  watchdog_addr=$(tmux list-panes -t "${session}:${first_win}" -F "#{window_index}.#{pane_index}" 2>/dev/null | tail -1)
+  otmux pane.lock "${session}:${watchdog_addr}" "watchdog" 2>/dev/null
+
+  console.log "Watchdog started in ${session}:${watchdog_addr} (every ${interval}s)"
+  console.log "Log: $HIVEMIND_WATCHDOG_LOG"
+}
+hiveMind.watchdog.completion() { :; }
+
+hiveMind.watchdog.start() # <session> <?seconds:30> # start watchdog targeting a specific session (for use from team.setup)
+{
+  local session="$1"
+  local interval="${2:-30}"
+
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind watchdog.start <session> <?seconds>"
+    return 1
+  fi
+
+  # Check if already running
+  if hiveMind.watchdog.status > /dev/null 2>&1; then
+    info.log "Watchdog already running (PID $(cat "$HIVEMIND_WATCHDOG_PID_FILE"))"
+    return 0
+  fi
+
+  # Initialize watchdog state file
+  : > "$HIVEMIND_WATCHDOG_STATE"
+
+  # Get first window index (respects base-index config)
+  local first_win
+  first_win=$(tmux list-windows -t "$session" -F '#{window_index}' 2>/dev/null | head -1)
+  [ -z "$first_win" ] && first_win=$(private.hiveMind.tmux.base.window)
+
+  # Spawn a new pane running plain bash (no Claude Code = no permission prompts)
+  tmux split-window -t "${session}:${first_win}" -v -l 5 \
+    "echo \$\$ > '$HIVEMIND_WATCHDOG_PID_FILE' && while true; do touch '$HIVEMIND_WATCHDOG_HEARTBEAT'; echo \"── watchdog @ \$(date '+%H:%M:%S') ──\" >> '$HIVEMIND_WATCHDOG_LOG'; for team in \$(hiveMind team.list 2>/dev/null); do hiveMind watchdog.cycle \"\$team\" >> '$HIVEMIND_WATCHDOG_LOG' 2>&1; done; sleep $interval; done"
+
+  # Lock the pane title
+  sleep 0.5
+  local watchdog_addr
+  watchdog_addr=$(tmux list-panes -t "${session}:${first_win}" -F "#{window_index}.#{pane_index}" 2>/dev/null | tail -1)
+  otmux pane.lock "${session}:${watchdog_addr}" "watchdog" 2>/dev/null
+
+  info.log "Watchdog started in ${session}:${watchdog_addr} (every ${interval}s)"
+}
+hiveMind.watchdog.start.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.watchdog.cycle() # <session> # adaptive sweep+unblock with per-agent backoff
+{
+  local session="$1"
+  [ -z "$session" ] && { error.log "Usage: hiveMind watchdog.cycle <session>"; return 1; }
+  [ ! -f "$HIVEMIND_REGISTRY" ] && return 1
+
+  while IFS='|' read -r target role; do
+    [ -z "$target" ] || [ -z "$role" ] && continue
+    case "$target" in "${session}:"*) ;; *) continue ;; esac
+
+    local result
+    result=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+    local status="${result%%|*}"
+
+    case "$status" in
+      active|idle|unknown)
+        # Healthy — reset failure count
+        private.hiveMind.watchdog.reset "$target"
+        ;;
+      *)
+        # Blocked — check failure count for backoff
+        local fail_count
+        fail_count=$(private.hiveMind.watchdog.get.fail.count "$target")
+        fail_count="${fail_count:-0}"
+
+        if [ "$fail_count" -lt 3 ]; then
+          # Normal: attempt unblock
+          private.hiveMind.unblock.pane "$target" "$role"
+          private.hiveMind.watchdog.set.fail.count "$target" $((fail_count + 1)) "$status"
+        elif [ "$fail_count" -lt 10 ]; then
+          # Back off: skip this agent for (fail_count - 2) cycles
+          local skip=$((fail_count - 2))
+          local cycle_count
+          cycle_count=$(( (fail_count - 3) % skip ))
+          if [ "$cycle_count" -eq 0 ]; then
+            info.log "Backoff retry $role (attempt $((fail_count + 1)))"
+            private.hiveMind.unblock.pane "$target" "$role"
+          else
+            info.log "Backing off $role (attempt $fail_count, skip $skip cycles)"
+          fi
+          private.hiveMind.watchdog.set.fail.count "$target" $((fail_count + 1)) "$status"
+        else
+          # Escalate: stop retrying, log critical
+          warn.log "ESCALATE $role ($target) — stuck after $fail_count attempts ($status)"
+          private.hiveMind.watchdog.set.fail.count "$target" $((fail_count + 1)) "$status"
+        fi
+        ;;
+    esac
+  done < "$HIVEMIND_REGISTRY"
+}
+hiveMind.watchdog.cycle.completion() { :; }
+
+hiveMind.watchdog.stop() # # stop the external watchdog loop
+{
+  if [ ! -f "$HIVEMIND_WATCHDOG_PID_FILE" ]; then
+    error.log "No watchdog PID file found"
+    return 1
+  fi
+
+  local pid
+  pid=$(cat "$HIVEMIND_WATCHDOG_PID_FILE")
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    rm -f "$HIVEMIND_WATCHDOG_PID_FILE" "$HIVEMIND_WATCHDOG_HEARTBEAT" "$HIVEMIND_WATCHDOG_STATE"
+    console.log "Watchdog stopped (PID $pid)"
+  else
+    rm -f "$HIVEMIND_WATCHDOG_PID_FILE" "$HIVEMIND_WATCHDOG_HEARTBEAT" "$HIVEMIND_WATCHDOG_STATE"
+    console.log "Watchdog was not running (stale PID file cleaned)"
+  fi
+}
+hiveMind.watchdog.stop.completion() { :; }
+
+hiveMind.watchdog.status() # # check if watchdog is running
+{
+  if [ ! -f "$HIVEMIND_WATCHDOG_PID_FILE" ]; then
+    echo "not running"
+    return 1
+  fi
+
+  local pid
+  pid=$(cat "$HIVEMIND_WATCHDOG_PID_FILE")
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "running (PID $pid)"
+    return 0
+  else
+    echo "not running (stale PID file)"
+    rm -f "$HIVEMIND_WATCHDOG_PID_FILE"
+    return 1
+  fi
+}
+hiveMind.watchdog.status.completion() { :; }
+
+hiveMind.watchdog.supervisor() # <?interval:30> # check watchdog health and restart if dead/stale
+{
+  local watchdog_interval="${1:-30}"
+  local max_stale=$((watchdog_interval * 3))  # 3x interval = stale
+
+  # Check if watchdog is running (PID alive)
+  if ! hiveMind.watchdog.status > /dev/null 2>&1; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') SUPERVISOR: Watchdog dead, restarting..." >> "$HIVEMIND_WATCHDOG_LOG"
+    hiveMind.watchdog "$watchdog_interval"
+    return $?
+  fi
+
+  # Check heartbeat freshness (detect stuck watchdog)
+  if [ -f "$HIVEMIND_WATCHDOG_HEARTBEAT" ]; then
+    local last_beat now age
+    last_beat=$(private.hiveMind.file.mtime "$HIVEMIND_WATCHDOG_HEARTBEAT")
+    now=$(date +%s)
+    age=$(( now - last_beat ))
+    if [ "$age" -gt "$max_stale" ]; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') SUPERVISOR: Watchdog stale (${age}s > ${max_stale}s), restarting..." >> "$HIVEMIND_WATCHDOG_LOG"
+      hiveMind.watchdog.stop
+      hiveMind.watchdog "$watchdog_interval"
+      return $?
+    fi
+  fi
+
+  console.log "Watchdog healthy"
+  return 0
+}
+hiveMind.watchdog.supervisor.completion() { :; }
+
+# ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+
+TEST_CATEGORY="core"
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+source hiveMind
+
+log.level $level
+
+# ============================================================================
+# sweep.classify — pure function unit tests
+# Tests all 18 detection states + edge cases
+# ============================================================================
+
+# Helper: classify content and return the result
+classify() {
+  private.hiveMind.sweep.classify "$1"
+}
+
+# Helper: assert status field (first pipe-delimited field)
+assert_status() {
+  local expected="$1"
+  local result="$2"
+  local msg="$3"
+  local actual="${result%%|*}"
+  if [ "$actual" = "$expected" ]; then
+    expect.pass "$msg (got $actual)"
+  else
+    expect.fail "$msg — expected '$expected' got '$actual' (full: $result)"
+  fi
+}
+
+# Helper: assert full result matches expected prefix
+assert_result() {
+  local expected="$1"
+  local result="$2"
+  local msg="$3"
+  # Compare up to the length of expected (allows extra detail fields)
+  local trimmed="${result:0:${#expected}}"
+  if [ "$trimmed" = "$expected" ]; then
+    expect.pass "$msg"
+  else
+    expect.fail "$msg — expected '$expected' got '$result'"
+  fi
+}
+
+# ── 1. Permission prompt ─────────────────────────────────────────────────
+
+test.case $level "classify: permission — Allow + Deny" \
+  echo "testing permission detection"
+
+RESULT=$(classify "Some tool output
+Allow this action for the session
+  1. Allow once
+  ❯ 2. Allow always
+  3. Deny")
+
+assert_result "permission|down-enter|blocker" "$RESULT" "permission prompt detected"
+
+# ── 2. Permission prompt — Do you want to proceed? ───────────────────────
+
+test.case $level "classify: permission — Do you want to proceed?" \
+  echo "testing proceed prompt"
+
+RESULT=$(classify "Changes detected in workspace
+Do you want to proceed?
+  ❯ 1. Yes
+  2. No")
+
+assert_result "permission|enter|blocker" "$RESULT" "proceed prompt detected"
+
+# ── 3. Tool confirmation ─────────────────────────────────────────────────
+
+test.case $level "classify: tool-confirm — Run this command?" \
+  echo "testing tool confirm"
+
+RESULT=$(classify "Run this command?
+  git push origin main
+  1. Yes
+  2. No")
+
+assert_result "tool-confirm|enter|blocker" "$RESULT" "tool-confirm detected"
+
+# ── 4. Accept edits ──────────────────────────────────────────────────────
+
+test.case $level "classify: accept-edits — with ⏵⏵ prefix" \
+  echo "testing accept edits"
+
+RESULT=$(classify "⏵⏵ accept edits on · 3 bashes")
+
+assert_result "accept-edits|enter|blocker|3" "$RESULT" "accept-edits with count 3"
+
+# ── 5. Accept edits — without emoji prefix ───────────────────────────────
+
+test.case $level "classify: accept-edits — plain text fallback" \
+  echo "testing accept edits fallback"
+
+RESULT=$(classify "accept edits on 2 files")
+
+assert_result "accept-edits|enter|blocker|2" "$RESULT" "accept-edits without emoji, count 2"
+
+# ── 6. Overlay — Background tasks ────────────────────────────────────────
+
+test.case $level "classify: overlay — Background tasks" \
+  echo "testing overlay detection"
+
+RESULT=$(classify "Background tasks
+  Task 1: running
+  Task 2: completed")
+
+assert_result "overlay|escape|blocker" "$RESULT" "background tasks overlay"
+
+# ── 7. Overlay — numeric background pattern ──────────────────────────────
+
+test.case $level "classify: overlay — N background tasks" \
+  echo "testing numeric background"
+
+RESULT=$(classify "3 background tasks running")
+
+assert_result "overlay|escape|blocker" "$RESULT" "numeric background overlay"
+
+# ── 8. Panel — Esc close ─────────────────────────────────────────────────
+
+test.case $level "classify: panel — Esc close" \
+  echo "testing panel detection"
+
+RESULT=$(classify "  ─────────
+  file.ts +10 -5
+  Esc close | Enter select")
+
+assert_result "panel|escape|blocker" "$RESULT" "panel with Esc close"
+
+# ── 9. Panel — git diff ──────────────────────────────────────────────────
+
+test.case $level "classify: panel — git diff" \
+  echo "testing git diff panel"
+
+RESULT=$(classify "Uncommitted changes
+diff --git a/file.ts b/file.ts
+--- a/file.ts
++++ b/file.ts")
+
+assert_result "panel|escape|blocker" "$RESULT" "git diff panel"
+
+# ── 10. Rate limit ───────────────────────────────────────────────────────
+
+test.case $level "classify: rate-limit — try again in 30 seconds" \
+  echo "testing rate limit"
+
+RESULT=$(classify "Rate limit exceeded. Please try again in 30 seconds.")
+
+assert_status "rate-limit" "$RESULT" "rate limit detected"
+
+# ── 11. Rate limit — with retry time extraction ──────────────────────────
+
+test.case $level "classify: rate-limit — retry time extracted" \
+  echo "testing rate limit detail"
+
+RESULT=$(classify "Too many requests. try again in 45 seconds")
+
+IFS='|' read -r s a sev detail <<< "$RESULT"
+if [ "$s" = "rate-limit" ] && echo "$detail" | grep -q "45"; then
+  expect.pass "rate-limit with retry time: $detail"
+else
+  expect.fail "rate-limit detail — expected 45 seconds, got: $RESULT"
+fi
+
+# ── 12. API error ────────────────────────────────────────────────────────
+
+test.case $level "classify: api-error — APIConnectionError" \
+  echo "testing api error"
+
+RESULT=$(classify "APIConnectionError: connection refused to api.anthropic.com")
+
+assert_status "api-error" "$RESULT" "API connection error"
+
+# ── 13. API error — 529 Overloaded ───────────────────────────────────────
+
+test.case $level "classify: api-error — 529 Overloaded" \
+  echo "testing 529 error"
+
+RESULT=$(classify "529 Overloaded — retry after 10 seconds")
+
+assert_status "api-error" "$RESULT" "529 overloaded error"
+
+# ── 14. MCP error ────────────────────────────────────────────────────────
+
+test.case $level "classify: mcp-error — MCP server not responding" \
+  echo "testing mcp error"
+
+RESULT=$(classify "MCP server not responding — attempting reconnect")
+
+assert_result "mcp-error|wait|warning" "$RESULT" "MCP error detected"
+
+# ── 15. Subscription limit ───────────────────────────────────────────────
+
+test.case $level "classify: subscription-limit — quota exhausted" \
+  echo "testing subscription limit"
+
+RESULT=$(classify "Your subscription limit has been reached for this billing period")
+
+assert_result "subscription-limit|none|critical" "$RESULT" "subscription limit detected"
+
+# ── 16. Crash ────────────────────────────────────────────────────────────
+
+test.case $level "classify: crash — claude exited" \
+  echo "testing crash detection"
+
+RESULT=$(classify "claude exited with code 1
+\$")
+
+assert_result "crash|none|critical" "$RESULT" "crash detected"
+
+# ── 17. Context warning ──────────────────────────────────────────────────
+
+test.case $level "classify: context-warning — auto-compact: 15%" \
+  echo "testing context warning"
+
+RESULT=$(classify "Context left until auto-compact: 15%
+>")
+
+assert_result "context-warning|none|warning|15%" "$RESULT" "context warning at 15%"
+
+# ── 18. Just compacted ───────────────────────────────────────────────────
+
+test.case $level "classify: just-compacted — Compacted" \
+  echo "testing just compacted"
+
+RESULT=$(classify "Compacted conversation — context restored
+>")
+
+assert_result "just-compacted|none|warning" "$RESULT" "just-compacted detected"
+
+# ── 19. Autocomplete ─────────────────────────────────────────────────────
+
+test.case $level "classify: autocomplete — /search menu" \
+  echo "testing autocomplete"
+
+RESULT=$(classify "  /search ─────────────────
+  /search files
+  /search code")
+
+assert_result "autocomplete|escape|blocker" "$RESULT" "autocomplete menu detected"
+
+# ── 20. Shell-escaped ────────────────────────────────────────────────────
+
+test.case $level "classify: shell-escaped — bare \$ prompt" \
+  echo "testing shell escaped"
+
+RESULT=$(classify "some old output
+\$")
+
+# shell-escaped triggers AFTER crash check — this content doesn't match crash patterns
+# so it should fall through to shell-escaped
+RESULT=$(classify "
+\$ ")
+
+assert_result "shell-escaped|none|critical" "$RESULT" "shell-escaped detected"
+
+# ── 21. Queued ────────────────────────────────────────────────────────────
+
+test.case $level "classify: queued — text after prompt" \
+  echo "testing queued"
+
+RESULT=$(classify "> fix the bug in auth.ts")
+
+assert_result "queued|enter|blocker" "$RESULT" "queued text detected"
+
+# ── 22. Idle ──────────────────────────────────────────────────────────────
+
+test.case $level "classify: idle — clean > prompt" \
+  echo "testing idle"
+
+RESULT=$(classify "Previous output done.
+>")
+
+assert_result "idle|none|info" "$RESULT" "idle prompt detected"
+
+# ── 23. Idle — ❯ prompt ──────────────────────────────────────────────────
+
+test.case $level "classify: idle — clean ❯ prompt" \
+  echo "testing idle unicode"
+
+RESULT=$(classify "
+❯")
+
+assert_result "idle|none|info" "$RESULT" "idle ❯ prompt detected"
+
+# ── 24. Active (working) ─────────────────────────────────────────────────
+
+test.case $level "classify: active — Reading file.ts" \
+  echo "testing active"
+
+RESULT=$(classify "Reading file.ts (2s)
+Processing changes...")
+
+assert_result "active|none|info" "$RESULT" "active state detected"
+
+# ── 25. Unknown — empty/whitespace ────────────────────────────────────────
+
+test.case $level "classify: unknown — empty content" \
+  echo "testing empty content"
+
+RESULT=$(classify "
+   ")
+
+assert_result "unknown|none|info" "$RESULT" "unknown for whitespace"
+
+# ── 26. Unknown — truly empty ─────────────────────────────────────────────
+
+test.case $level "classify: unknown — empty string" \
+  echo "testing empty string"
+
+RESULT=$(classify "")
+
+assert_result "unknown|none|info" "$RESULT" "unknown for empty string"
+
+# ============================================================================
+# Edge Cases
+# ============================================================================
+
+# ── E1. Multiple patterns — priority order ────────────────────────────────
+# When content matches multiple patterns, crash should win over shell-escaped
+
+test.case $level "classify: priority — crash before shell-escaped" \
+  echo "testing priority"
+
+RESULT=$(classify "claude exited with code 137 SIGKILL
+\$")
+
+assert_status "crash" "$RESULT" "crash takes priority over shell-escaped"
+
+# ── E2. Multiple patterns — overlay before permission ─────────────────────
+
+test.case $level "classify: priority — overlay before permission" \
+  echo "testing overlay priority"
+
+RESULT=$(classify "Background tasks
+Allow this action
+Deny")
+
+assert_status "overlay" "$RESULT" "overlay takes priority over permission"
+
+# ── E3. Content with ANSI escape codes ────────────────────────────────────
+
+test.case $level "classify: ANSI — codes stripped before matching" \
+  echo "testing ANSI stripping"
+
+# Simulate ANSI-colored "Allow" and "Deny"
+ANSI_CONTENT=$'\e[32mAllow\e[0m this action\n\e[31mDeny\e[0m'
+RESULT=$(classify "$ANSI_CONTENT")
+
+assert_status "permission" "$RESULT" "ANSI codes stripped, permission detected"
+
+# ── E4. Unicode content — emoji prompts ───────────────────────────────────
+
+test.case $level "classify: unicode — emoji in prompt" \
+  echo "testing unicode"
+
+RESULT=$(classify "✅ Task complete
+❯ ")
+
+assert_status "idle" "$RESULT" "idle detected with unicode content"
+
+# ── E5. Very long lines — no hang ─────────────────────────────────────────
+
+test.case $level "classify: long lines — no hang" \
+  echo "testing long lines"
+
+LONG_LINE=$(printf 'x%.0s' {1..2000})
+RESULT=$(classify "$LONG_LINE
+>")
+
+assert_status "idle" "$RESULT" "handles long lines without hanging"
+
+# ── E6. Fallback menu classifier ──────────────────────────────────────────
+
+test.case $level "classify: fallback — unknown numbered menu" \
+  echo "testing fallback menu"
+
+RESULT=$(classify "Choose an option:
+  ❯ 1. First choice
+  2. Second choice
+  3. Third choice")
+
+assert_status "menu" "$RESULT" "fallback menu classifier triggered"
+
+# ── E7. Accept edits — edit count with 'file' word ────────────────────────
+
+test.case $level "classify: accept-edits — count with 'file' word" \
+  echo "testing accept edits file count"
+
+RESULT=$(classify "⏵⏵ accept edits on · 5 file changes")
+
+assert_result "accept-edits|enter|blocker|5" "$RESULT" "accept-edits counts 'file' keyword"
+
+# ── E8. Subscription limit — daily limit ──────────────────────────────────
+
+test.case $level "classify: subscription-limit — daily limit reached" \
+  echo "testing daily limit"
+
+RESULT=$(classify "Your daily limit has been reached. Please try again tomorrow.")
+
+assert_result "subscription-limit|none|critical" "$RESULT" "daily limit detected as subscription-limit"
+
+# ── E9. Permission — fallback with approve keyword ────────────────────────
+
+test.case $level "classify: permission — approve keyword fallback" \
+  echo "testing permission fallback"
+
+RESULT=$(classify "Do you approve this change?
+  ❯ 1. Yes
+  2. No")
+
+assert_status "permission" "$RESULT" "permission via approve keyword fallback"
+
+# ── E10. Active vs queued — no false positive ─────────────────────────────
+
+test.case $level "classify: active — tool output not mistaken for prompt" \
+  echo "testing active vs queued"
+
+RESULT=$(classify "Running tests...
+  > test_auth passed
+  > test_login passed
+Thinking about next steps")
+
+assert_status "active" "$RESULT" "tool output > not mistaken for prompt"
+
+# ============================================================================
+# Test sweep.detect wrapper exists and delegates
+# ============================================================================
+
+test.case $level "sweep.detect function exists" \
+  type -t private.hiveMind.sweep.detect
+
+if type -t private.hiveMind.sweep.detect &>/dev/null; then
+  expect.pass "private.hiveMind.sweep.detect function exists"
+else
+  expect.fail "private.hiveMind.sweep.detect should be defined"
+fi
+
+test.case $level "sweep.classify function exists" \
+  type -t private.hiveMind.sweep.classify
+
+if type -t private.hiveMind.sweep.classify &>/dev/null; then
+  expect.pass "private.hiveMind.sweep.classify function exists"
+else
+  expect.fail "private.hiveMind.sweep.classify should be defined"
+fi
+
+# ============================================================================
+# Test Summary
+# ============================================================================
+
+test.suite.save.results
