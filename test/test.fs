@@ -14,19 +14,14 @@ source test.suite
 
 log.level $level
 
-# Check if fs script exists
-if ! [ -f "$OOSH_DIR/fs" ] && ! [ -f "$OOSH_DIR/old/fs" ]; then
+# Check if fs script exists (skip if only in old/ - deprecated)
+if ! [ -f "$OOSH_DIR/fs" ] && ! type fs &>/dev/null; then
   echo -e "\e[1;33m  ⚠ SKIPPED: fs script not available (deprecated)\e[0m"
   test.suite.save.results
   exit 0
 fi
 
-# Source from old/ if that's where it is
-if [ -f "$OOSH_DIR/old/fs" ]; then
-  source "$OOSH_DIR/old/fs"
-else
-  source fs
-fi
+source fs
 
 test.fs()
 {
