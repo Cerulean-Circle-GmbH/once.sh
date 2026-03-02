@@ -10,6 +10,27 @@ private.hiveMind.tmux.base.pane() {
   tmux show-options -gv pane-base-index 2>/dev/null || echo 0
 }
 
+# Wait for Claude Code to be ready (showing input prompt) in a pane
+# Checks both the ❯ prompt marker AND that claude is the running command (not bash)
+private.hiveMind.wait.for.ready() {
+  local pane="$1"
+  local timeout="${2:-60}"
+  local elapsed=0
+
+  while [ "$elapsed" -lt "$timeout" ]; do
+    local cmd
+    cmd=$(tmux display-message -t "$pane" -p "#{pane_current_command}" 2>/dev/null)
+    if [ "$cmd" = "claude" ] && tmux capture-pane -t "$pane" -p 2>/dev/null | grep -qF "❯"; then
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  warn.log "Timed out waiting for Claude Code ready in $pane (${timeout}s)"
+  return 1
+}
+
 hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-orchestrator, expert, and tester agents
 {
   local session="${1:-$(private.hiveMind.active.team)}"
@@ -63,39 +84,49 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   sleep 2
   otmux send.enter "${session}:${wi}.$((pi+2))" "claude --dangerously-skip-permissions"
 
-  # Wait for Claude Code to initialize
+  # Wait for Claude Code to initialize in all panes
   info.log "Waiting for Claude Code agents to initialize..."
-  sleep 8
+  local ooshPanes=("${session}:${wi}.${pi}" "${session}:${wi}.$((pi+1))" "${session}:${wi}.$((pi+2))")
+  for p in "${ooshPanes[@]}"; do
+    private.hiveMind.wait.for.ready "$p" 60
+  done
 
   # ── Auto-unblock startup prompts ─────────────────────────────────────
   info.log "Clearing startup prompts..."
   hiveMind.unblock all "$session" 2>/dev/null
   sleep 3
   hiveMind.unblock all "$session" 2>/dev/null
-  sleep 5
+  sleep 2
 
   # ── Capture UUIDs for identity tracking ─────────────────────────────────
   info.log "Capturing session UUIDs..."
   local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-  local _roles=("oosh-orchestrator" "oosh-expert" "oosh-tester")
-  local _panes=("${session}:${wi}.${pi}" "${session}:${wi}.$((pi+1))" "${session}:${wi}.$((pi+2))")
+  local roles=("oosh-orchestrator" "oosh-expert" "oosh-tester")
   for i in 0 1 2; do
-    local _sid
-    _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
-    if [ -n "$_sid" ]; then
-      grep -v "^${_roles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
-      echo "${_roles[$i]}|${_sid}" >> "$ses"
+    local sid
+    sid=$(claudeCode session.probe "${ooshPanes[$i]}" 2>/dev/null)
+    if [ -n "$sid" ]; then
+      grep -v "^${roles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
+      echo "${roles[$i]}|${sid}" >> "$ses"
     fi
   done
 
   # ── Send role prompts ──────────────────────────────────────────────────
   info.log "Sending role prompts to agents..."
 
-  otmux send.enter "${session}:${wi}.${pi}" "$(hiveMind.role.prompt oosh-orchestrator)"
-  sleep 1
-  otmux send.enter "${session}:${wi}.$((pi+1))" "$(hiveMind.role.prompt oosh-expert)"
-  sleep 1
-  otmux send.enter "${session}:${wi}.$((pi+2))" "$(hiveMind.role.prompt oosh-tester)"
+  for i in 0 1 2; do
+    local target="${ooshPanes[$i]}"
+    # If Claude Code crashed, restart it
+    local cmd
+    cmd=$(tmux display-message -t "$target" -p "#{pane_current_command}" 2>/dev/null)
+    if [ "$cmd" != "claude" ]; then
+      warn.log "Claude Code not running in $target ($cmd) — restarting..."
+      otmux send.enter "$target" "claude --dangerously-skip-permissions"
+    fi
+    private.hiveMind.wait.for.ready "$target" 60
+    otmux send.enter "$target" "$(hiveMind.role.prompt "${roles[$i]}")"
+    sleep 1
+  done
 
   # ── Start watchdog ───────────────────────────────────────────────────
   info.log "Starting watchdog for auto-monitoring..."
@@ -595,9 +626,13 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Orchestrator + Ex
   sleep 2
   otmux send.enter "${session}:${wi}.$((pi+3))" "claude --dangerously-skip-permissions"
 
-  # Wait for Claude Code to initialize
+  # Wait for Claude Code to initialize in all panes
   info.log "Waiting for Claude Code agents to initialize..."
-  sleep 8
+  local fullRoles=("orchestrator" "scrum-master" "oosh-expert" "oosh-tester")
+  local fullPanes=("${session}:${wi}.${pi}" "${session}:${wi}.$((pi+1))" "${session}:${wi}.$((pi+2))" "${session}:${wi}.$((pi+3))")
+  for p in "${fullPanes[@]}"; do
+    private.hiveMind.wait.for.ready "$p" 60
+  done
 
   # ── Auto-unblock startup prompts ─────────────────────────────────────
   info.log "Clearing startup prompts..."
@@ -605,32 +640,36 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Orchestrator + Ex
   sleep 3
   # Second pass in case some prompts were slow to appear
   hiveMind.unblock all "$session" 2>/dev/null
-  sleep 5
+  sleep 2
 
   # ── Capture UUIDs for identity tracking ─────────────────────────────────
   info.log "Capturing session UUIDs..."
   local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-  local _roles=("orchestrator" "scrum-master" "oosh-expert" "oosh-tester")
-  local _panes=("${session}:${wi}.${pi}" "${session}:${wi}.$((pi+1))" "${session}:${wi}.$((pi+2))" "${session}:${wi}.$((pi+3))")
   for i in 0 1 2 3; do
-    local _sid
-    _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
-    if [ -n "$_sid" ]; then
-      grep -v "^${_roles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
-      echo "${_roles[$i]}|${_sid}" >> "$ses"
+    local sid
+    sid=$(claudeCode session.probe "${fullPanes[$i]}" 2>/dev/null)
+    if [ -n "$sid" ]; then
+      grep -v "^${fullRoles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
+      echo "${fullRoles[$i]}|${sid}" >> "$ses"
     fi
   done
 
   # ── Send role prompts ──────────────────────────────────────────────────
   info.log "Sending role prompts to agents..."
 
-  otmux send.enter "${session}:${wi}.${pi}" "$(hiveMind.role.prompt orchestrator)"
-  sleep 1
-  otmux send.enter "${session}:${wi}.$((pi+1))" "$(hiveMind.role.prompt scrum-master)"
-  sleep 1
-  otmux send.enter "${session}:${wi}.$((pi+2))" "$(hiveMind.role.prompt oosh-expert)"
-  sleep 1
-  otmux send.enter "${session}:${wi}.$((pi+3))" "$(hiveMind.role.prompt oosh-tester)"
+  for i in 0 1 2 3; do
+    local target="${fullPanes[$i]}"
+    # If Claude Code crashed, restart it
+    local cmd
+    cmd=$(tmux display-message -t "$target" -p "#{pane_current_command}" 2>/dev/null)
+    if [ "$cmd" != "claude" ]; then
+      warn.log "Claude Code not running in $target ($cmd) — restarting..."
+      otmux send.enter "$target" "claude --dangerously-skip-permissions"
+    fi
+    private.hiveMind.wait.for.ready "$target" 60
+    otmux send.enter "$target" "$(hiveMind.role.prompt "${fullRoles[$i]}")"
+    sleep 1
+  done
 
   # ── Start watchdog ───────────────────────────────────────────────────
   info.log "Starting watchdog for auto-monitoring..."
