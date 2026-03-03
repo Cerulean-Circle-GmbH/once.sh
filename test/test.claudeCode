@@ -145,6 +145,462 @@ else
 fi
 
 # ============================================================================
+# LIVE BEHAVIORAL TESTS — session.id accuracy vs /status ground truth
+# Parse `otmux` (no params) to find ALL panes running a Claude session
+# (version pattern [x.y.z] in the tree output). For each, send /status,
+# parse the real Session ID, and compare against claudeCode session.id.
+# Bug: when an agent is restarted (killed + new session, same role name),
+# the new claude process still holds lsof handles to OLD task dirs from
+# previous incarnations. session.id picks the stale UUID, not the current.
+# ============================================================================
+
+# Parse otmux output: lines like "│   ├── 0.3   oosh-expert   [2.1.39]"
+# Extract session:window.pane for every pane whose bracket content matches
+# a Claude version pattern [digits.digits.digits]
+LIVE_PANES=""
+CURRENT_SESSION=""
+
+while IFS= read -r line; do
+  # Session line: "├── sessionName (attached, Feb 26)" or "└── sessionName (Feb 10)"
+  if echo "$line" | grep -qE '^[├└]── '; then
+    CURRENT_SESSION=$(echo "$line" | sed 's/^[├└]── //' | sed 's/ (.*//')
+    continue
+  fi
+  # Pane line: "│   ├── 0.3   title   [2.1.39]"
+  # Match lines containing a version-like bracket [digits.digits.digits]
+  if echo "$line" | grep -qE '\[[0-9]+\.[0-9]+\.[0-9]+\]'; then
+    # Extract pane address (e.g. "0.3")
+    PANE_ADDR=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$CURRENT_SESSION" ] && [ -n "$PANE_ADDR" ]; then
+      LIVE_PANES="$LIVE_PANES ${CURRENT_SESSION}:${PANE_ADDR}"
+    fi
+  fi
+done < <(otmux 2>/dev/null)
+
+LIVE_TESTED=0
+LIVE_PASSED=0
+LIVE_FAILED=0
+
+for pane in $LIVE_PANES; do
+  # Skip if no claude PID found
+  claude_pid=$(claudeCode process.find "$pane" 2>/dev/null)
+  [ -z "$claude_pid" ] && continue
+
+  test.case $level "session.id matches /status for $pane" \
+    echo "checking $pane (PID $claude_pid)"
+
+  # Get what session.id thinks
+  SID_RESULT=$(claudeCode session.id "$pane" 2>/dev/null)
+  if [ -z "$SID_RESULT" ]; then
+    expect.fail "session.id returned empty for active Claude pane $pane"
+    LIVE_TESTED=$((LIVE_TESTED + 1))
+    LIVE_FAILED=$((LIVE_FAILED + 1))
+    continue
+  fi
+
+  # Get ground truth: send /status, wait, capture, parse Session ID
+  otmux send "$pane" "/status" Enter 2>/dev/null
+  sleep 4
+
+  STATUS_CAPTURE=$(otmux pane.capture "$pane" 40 2>/dev/null | tr '\n' ' ')
+
+  # Dismiss the /status dialog
+  otmux send "$pane" Escape 2>/dev/null
+
+  # Parse "Session ID: <uuid>" from captured output
+  REAL_SID=$(echo "$STATUS_CAPTURE" | grep -oE 'Session ID: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+  if [ -z "$REAL_SID" ]; then
+    expect.fail "could not parse Session ID from /status for $pane (agent may be busy)"
+    LIVE_TESTED=$((LIVE_TESTED + 1))
+    LIVE_FAILED=$((LIVE_FAILED + 1))
+    continue
+  fi
+
+  if [ "$SID_RESULT" = "$REAL_SID" ]; then
+    expect.pass "session.id $pane = ${SID_RESULT:0:8}... (matches /status)"
+    LIVE_PASSED=$((LIVE_PASSED + 1))
+  else
+    expect.fail "session.id MISMATCH $pane: got ${SID_RESULT:0:8}... but /status says ${REAL_SID:0:8}..."
+    LIVE_FAILED=$((LIVE_FAILED + 1))
+  fi
+
+  LIVE_TESTED=$((LIVE_TESTED + 1))
+done
+
+if [ "$LIVE_TESTED" -eq 0 ]; then
+  test.case $level "session.id live test (skipped - no active Claude agents)" \
+    echo "skipped"
+  expect.pass "session.id live test skipped (no active Claude agents found)"
+else
+  echo ""
+  echo "  session.id live summary: $LIVE_TESTED tested, $LIVE_PASSED passed, $LIVE_FAILED failed"
+  echo ""
+fi
+
+# ============================================================================
+# T-IDLE: session.id returns exit 1 for idle (non-Claude) pane
+# ============================================================================
+
+# Find a pane NOT in LIVE_PANES that runs a plain shell
+IDLE_PANE=""
+while IFS= read -r line; do
+  # Pane lines with [bash] or [zsh] — no Claude version
+  if echo "$line" | grep -qE '\[(bash|zsh)\]'; then
+    PANE_ADDR=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$CURRENT_SESSION" ] && [ -n "$PANE_ADDR" ]; then
+      candidate="${CURRENT_SESSION}:${PANE_ADDR}"
+      # Verify no claude PID behind it
+      if ! claudeCode process.find "$candidate" &>/dev/null; then
+        IDLE_PANE="$candidate"
+        break
+      fi
+    fi
+  fi
+  # Track current session for context
+  if echo "$line" | grep -qE '^[├└]── '; then
+    CURRENT_SESSION=$(echo "$line" | sed 's/^[├└]── //' | sed 's/ (.*//')
+  fi
+done < <(otmux 2>/dev/null)
+
+if [ -n "$IDLE_PANE" ]; then
+  test.case $level "session.id returns exit 1 for idle pane $IDLE_PANE" \
+    claudeCode session.id "$IDLE_PANE"
+
+  claudeCode session.id "$IDLE_PANE" >/dev/null 2>&1
+  IDLE_EXIT=$?
+  IDLE_OUTPUT=$(claudeCode session.id "$IDLE_PANE" 2>/dev/null)
+
+  if [ "$IDLE_EXIT" -ne 0 ] && [ -z "$IDLE_OUTPUT" ]; then
+    expect.pass "session.id correctly returns exit 1 + empty for idle pane $IDLE_PANE"
+  else
+    expect.fail "session.id should return exit 1 + empty for idle pane, got exit=$IDLE_EXIT output='$IDLE_OUTPUT'"
+  fi
+else
+  test.case $level "session.id idle pane test (skipped - no idle pane found)" \
+    echo "skipped"
+  expect.pass "session.id idle pane test skipped"
+fi
+
+# ============================================================================
+# T-REGISTRY: hiveMind registry matches live session identity for ALL panes
+# ============================================================================
+
+REG_FILE="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+if [ -f "$REG_FILE" ]; then
+  for pane in $LIVE_PANES; do
+    # Get registry role for this pane
+    REG_ROLE=$(grep "^${pane}|" "$REG_FILE" 2>/dev/null | cut -d'|' -f2)
+    [ -z "$REG_ROLE" ] && continue
+
+    # Get actual session name
+    SID=$(claudeCode session.id "$pane" 2>/dev/null)
+    [ -z "$SID" ] && continue
+    SNAME=$(claudeCode session.name "$SID" 2>/dev/null)
+    [ -z "$SNAME" ] && continue
+
+    # Extract role from session name (role@model format)
+    if [[ "$SNAME" == *"@"* ]]; then
+      ACTUAL_ROLE="${SNAME%%@*}"
+    else
+      # Not a /rename'd session — skip registry check (can't compare)
+      continue
+    fi
+
+    test.case $level "registry matches session.name for $pane" \
+      echo "registry='$REG_ROLE' session='$ACTUAL_ROLE'"
+
+    if [ "$REG_ROLE" = "$ACTUAL_ROLE" ]; then
+      expect.pass "registry $pane = $REG_ROLE (matches session.name)"
+    else
+      expect.fail "registry MISMATCH $pane: registry='$REG_ROLE' but session='$ACTUAL_ROLE'"
+    fi
+  done
+fi
+
+# ============================================================================
+# IDENTITY ALIGNMENT TESTS — 4-layer chain integrity
+# Layer 1: Pane → Registry Role (hivemind.roles.env)
+# Layer 2: Role → Session UUID (hivemind.sessions.env)
+# Layer 3: session.id output → actual process UUID (ps --resume args)
+# Layer 4: Registry role name validity (not boot prompt garbage)
+#
+# These tests discover when the identity chain is broken. They don't
+# need /status (slow, intrusive) — they compare what the system CLAIMS
+# against what ps and the file system actually show.
+# ============================================================================
+
+REG_FILE="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+SES_FILE="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+
+ALIGN_TESTED=0
+ALIGN_PASSED=0
+ALIGN_FAILED=0
+
+# ── T-ALIGN-1: session.id matches --resume UUID from ps ──────────────────
+# For every Claude pane that was started with --resume, the UUID in ps args
+# is ground truth. session.id MUST return the same value.
+
+for pane in $LIVE_PANES; do
+  claude_pid=$(claudeCode process.find "$pane" 2>/dev/null)
+  [ -z "$claude_pid" ] && continue
+
+  # Get the --resume UUID from ps args (ground truth when available)
+  resume_uuid=$(ps -p "$claude_pid" -o args= 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+  [ -z "$resume_uuid" ] && continue  # skip panes without --resume
+
+  sid_result=$(claudeCode session.id "$pane" 2>/dev/null)
+
+  test.case $level "session.id matches --resume UUID for $pane" \
+    echo "sid=$sid_result resume=$resume_uuid"
+
+  ALIGN_TESTED=$((ALIGN_TESTED + 1))
+  if [ "$sid_result" = "$resume_uuid" ]; then
+    expect.pass "session.id $pane = ${sid_result:0:8}... matches --resume"
+    ALIGN_PASSED=$((ALIGN_PASSED + 1))
+  else
+    expect.fail "session.id STALE $pane: returns ${sid_result:0:8}... but --resume is ${resume_uuid:0:8}..."
+    ALIGN_FAILED=$((ALIGN_FAILED + 1))
+  fi
+done
+
+# ── T-ALIGN-2: Registry role names are valid (not boot prompt garbage) ────
+# A valid role name matches an agent directory in .claude/agents/.
+# Boot prompt text leaking into the registry is a known bug.
+
+AGENTS_BASE="${CLAUDE_PROJECT_DIR:-/Users/Shared/Workspaces/AI/Claude}/.claude/agents"
+
+if [ -f "$REG_FILE" ]; then
+  while IFS='|' read -r pane_target role; do
+    [ -z "$role" ] && continue
+
+    test.case $level "registry role is valid agent name: $pane_target" \
+      echo "role='$role'"
+
+    ALIGN_TESTED=$((ALIGN_TESTED + 1))
+
+    # Check 1: role name should be short (agent names are < 30 chars)
+    if [ "${#role}" -gt 30 ]; then
+      expect.fail "registry GARBAGE $pane_target: role is ${#role} chars — likely boot prompt text: '${role:0:40}...'"
+      ALIGN_FAILED=$((ALIGN_FAILED + 1))
+      continue
+    fi
+
+    # Check 2: role name should not contain spaces (agent names use hyphens)
+    if echo "$role" | grep -q ' '; then
+      expect.fail "registry GARBAGE $pane_target: role contains spaces: '$role'"
+      ALIGN_FAILED=$((ALIGN_FAILED + 1))
+      continue
+    fi
+
+    # Check 3: role directory should exist
+    if [ -d "$AGENTS_BASE/$role" ]; then
+      expect.pass "registry $pane_target = '$role' (agent dir exists)"
+      ALIGN_PASSED=$((ALIGN_PASSED + 1))
+    else
+      expect.fail "registry ORPHAN $pane_target: role='$role' has no .claude/agents/$role/ directory"
+      ALIGN_FAILED=$((ALIGN_FAILED + 1))
+    fi
+  done < "$REG_FILE"
+fi
+
+# ── T-ALIGN-3: No duplicate role→UUID in sessions file ───────────────────
+# Each role should map to exactly one UUID. Duplicates mean stale entries.
+
+if [ -f "$SES_FILE" ]; then
+  DUP_ROLES=$(cut -d'|' -f1 "$SES_FILE" | sort | uniq -d)
+  test.case $level "sessions file has no duplicate role entries" \
+    echo "checking $SES_FILE"
+
+  ALIGN_TESTED=$((ALIGN_TESTED + 1))
+  if [ -z "$DUP_ROLES" ]; then
+    expect.pass "no duplicate role entries in sessions file"
+    ALIGN_PASSED=$((ALIGN_PASSED + 1))
+  else
+    expect.fail "duplicate roles in sessions file: $DUP_ROLES"
+    ALIGN_FAILED=$((ALIGN_FAILED + 1))
+  fi
+fi
+
+# ── T-ALIGN-4: Sessions file UUIDs exist in sessions-index.json ──────────
+# Every UUID in the sessions file should be a real Claude Code session.
+
+CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+if [ -f "$SES_FILE" ]; then
+  while IFS='|' read -r role sid; do
+    [ -z "$sid" ] && continue
+
+    test.case $level "sessions UUID exists in Claude index: $role" \
+      echo "sid=$sid"
+
+    ALIGN_TESTED=$((ALIGN_TESTED + 1))
+
+    # Search all sessions-index.json files
+    found=0
+    for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json; do
+      [ -f "$index_file" ] || continue
+      if jq -e --arg sid "$sid" '.entries[] | select(.sessionId == $sid)' "$index_file" >/dev/null 2>&1; then
+        found=1
+        break
+      fi
+    done
+
+    if [ "$found" -eq 1 ]; then
+      expect.pass "sessions file $role → ${sid:0:8}... found in Claude index"
+      ALIGN_PASSED=$((ALIGN_PASSED + 1))
+    else
+      expect.fail "sessions file $role → ${sid:0:8}... NOT in any sessions-index.json (phantom UUID)"
+      ALIGN_FAILED=$((ALIGN_FAILED + 1))
+    fi
+  done < "$SES_FILE"
+fi
+
+# ── T-ALIGN-5: Registry pane targets still exist in tmux ─────────────────
+# Stale entries for dead sessions/panes should not persist.
+
+if [ -f "$REG_FILE" ]; then
+  while IFS='|' read -r pane_target role; do
+    [ -z "$pane_target" ] && continue
+
+    test.case $level "registry pane still exists: $pane_target" \
+      echo "checking tmux pane"
+
+    ALIGN_TESTED=$((ALIGN_TESTED + 1))
+
+    if tmux display-message -t "$pane_target" -p "#{pane_id}" >/dev/null 2>&1; then
+      expect.pass "registry $pane_target ($role) — pane exists"
+      ALIGN_PASSED=$((ALIGN_PASSED + 1))
+    else
+      expect.fail "registry STALE $pane_target ($role) — pane no longer exists in tmux"
+      ALIGN_FAILED=$((ALIGN_FAILED + 1))
+    fi
+  done < "$REG_FILE"
+fi
+
+# ── T-ALIGN-6: claudeCode.join writes UUID back to sessions file ─────────
+# When a session is resumed via claudeCode join, the new UUID should be
+# reflected in the sessions file. Check panes started with 'claudeCode join'.
+
+for pane in $LIVE_PANES; do
+  claude_pid=$(claudeCode process.find "$pane" 2>/dev/null)
+  [ -z "$claude_pid" ] && continue
+
+  # Check if this was started via 'claudeCode join <uuid>'
+  full_cmd=$(ps -p "$claude_pid" -o args= 2>/dev/null)
+  echo "$full_cmd" | grep -q 'claudeCode join' || continue
+
+  resume_uuid=$(echo "$full_cmd" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+  [ -z "$resume_uuid" ] && continue
+
+  # Get registry role for this pane
+  reg_role=$(grep "^${pane}|" "$REG_FILE" 2>/dev/null | cut -d'|' -f2)
+  [ -z "$reg_role" ] && continue
+
+  # Check if sessions file has THIS uuid for this role
+  ses_uuid=$(grep "^${reg_role}|" "$SES_FILE" 2>/dev/null | tail -1 | cut -d'|' -f2)
+
+  test.case $level "join UUID in sessions file for $pane ($reg_role)" \
+    echo "resume=$resume_uuid sessions=$ses_uuid"
+
+  ALIGN_TESTED=$((ALIGN_TESTED + 1))
+  if [ "$ses_uuid" = "$resume_uuid" ]; then
+    expect.pass "sessions file $reg_role → ${resume_uuid:0:8}... matches join UUID"
+    ALIGN_PASSED=$((ALIGN_PASSED + 1))
+  else
+    expect.fail "sessions file STALE $reg_role: has ${ses_uuid:0:8}... but claudeCode join used ${resume_uuid:0:8}..."
+    ALIGN_FAILED=$((ALIGN_FAILED + 1))
+  fi
+done
+
+# ── T-ALIGN-7: session.id Method 0 vs Method 1 consistency ───────────────
+# Method 0 (registry lookup) and Method 1 (ps args) should agree.
+# If they disagree, Method 0 is returning stale data.
+
+for pane in $LIVE_PANES; do
+  claude_pid=$(claudeCode process.find "$pane" 2>/dev/null)
+  [ -z "$claude_pid" ] && continue
+
+  # Method 1: ps args UUID
+  ps_uuid=$(ps -p "$claude_pid" -o args= 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+  [ -z "$ps_uuid" ] && continue  # can only compare if --resume was used
+
+  # Method 0: registry → sessions file
+  reg_role=$(grep "^${pane}|" "$REG_FILE" 2>/dev/null | cut -d'|' -f2)
+  [ -z "$reg_role" ] && continue
+  m0_uuid=$(grep "^${reg_role}|" "$SES_FILE" 2>/dev/null | tail -1 | cut -d'|' -f2)
+  [ -z "$m0_uuid" ] && continue
+
+  test.case $level "Method 0 vs Method 1 agree for $pane" \
+    echo "M0=${m0_uuid:0:8} M1=${ps_uuid:0:8}"
+
+  ALIGN_TESTED=$((ALIGN_TESTED + 1))
+  if [ "$m0_uuid" = "$ps_uuid" ]; then
+    expect.pass "Methods agree for $pane: ${ps_uuid:0:8}..."
+    ALIGN_PASSED=$((ALIGN_PASSED + 1))
+  else
+    expect.fail "Method CONFLICT $pane: M0(registry)=${m0_uuid:0:8}... M1(ps)=${ps_uuid:0:8}... — M0 is stale"
+    ALIGN_FAILED=$((ALIGN_FAILED + 1))
+  fi
+done
+
+echo ""
+echo "  identity alignment summary: $ALIGN_TESTED tested, $ALIGN_PASSED passed, $ALIGN_FAILED failed"
+echo ""
+
+# ── T-ALIGN-8: No duplicate UUIDs across different panes ────────────────
+# Two different panes should NEVER share the same session.id.
+# Bug 6: projectTeam:1.2, 1.3, 1.4 all returned 5fff44f4 — stale mapping.
+
+echo ""
+echo "=== T-ALIGN-8: Duplicate UUID detection across panes ==="
+echo ""
+
+DUP_TESTED=0
+DUP_PASSED=0
+DUP_FAILED=0
+
+# Collect all pane→UUID mappings from live sessions
+declare -A UUID_MAP  # uuid → first pane that had it
+DUP_REPORT=""
+
+for sess in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
+  for pane in $(tmux list-panes -t "$sess" -s -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null); do
+    sid=$(claudeCode session.id "$pane" 2>/dev/null)
+    [ -z "$sid" ] && continue
+
+    short="${sid:0:8}"
+    if [ -n "${UUID_MAP[$sid]+x}" ]; then
+      # Duplicate found
+      DUP_REPORT="${DUP_REPORT}  DUPLICATE: $pane and ${UUID_MAP[$sid]} share UUID ${short}\n"
+    else
+      UUID_MAP[$sid]="$pane"
+    fi
+  done
+done
+
+UNIQUE_COUNT=${#UUID_MAP[@]}
+test.case $level "no duplicate session.id UUIDs across panes ($UNIQUE_COUNT unique)" \
+  echo "scanning all panes"
+
+DUP_TESTED=1
+if [ -z "$DUP_REPORT" ]; then
+  expect.pass "all $UNIQUE_COUNT session.id UUIDs are unique across panes"
+  DUP_PASSED=1
+else
+  expect.fail "duplicate UUIDs found:"
+  echo -e "$DUP_REPORT"
+  DUP_FAILED=1
+fi
+
+ALIGN_TESTED=$((ALIGN_TESTED + DUP_TESTED))
+ALIGN_PASSED=$((ALIGN_PASSED + DUP_PASSED))
+ALIGN_FAILED=$((ALIGN_FAILED + DUP_FAILED))
+
+echo ""
+echo "  duplicate UUID summary: $DUP_TESTED tested, $DUP_PASSED passed, $DUP_FAILED failed"
+echo ""
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 
