@@ -146,30 +146,21 @@ fi
 
 # ============================================================================
 # LIVE BEHAVIORAL TESTS — session.id accuracy vs /status ground truth
-# Parse `otmux` (no params) to find ALL panes running a Claude session
-# (version pattern [x.y.z] in the tree output). For each, send /status,
-# parse the real Session ID, and compare against claudeCode session.id.
-# Bug: when an agent is restarted (killed + new session, same role name),
-# the new claude process still holds lsof handles to OLD task dirs from
-# previous incarnations. session.id picks the stale UUID, not the current.
-# ============================================================================
+# DISABLED: These tests send /status to every Claude pane, which:
+#   1. Disrupts running agents (sends commands to their active sessions)
+#   2. Only works on this specific machine with the current tmux layout
+#   3. Takes ~4s per pane — very slow for large session counts
+# TODO: Redesign as fixture-based test using ooshDebug with known panes.
+# Use T-ALIGN-1 (ps --resume UUID comparison) instead — non-disruptive.
 
-# Parse otmux output: lines like "│   ├── 0.3   oosh-expert   [2.1.39]"
-# Extract session:window.pane for every pane whose bracket content matches
-# a Claude version pattern [digits.digits.digits]
-LIVE_PANES=""
+LIVE_PANES=""  # Still needed by T-IDLE and T-ALIGN tests below
 CURRENT_SESSION=""
-
 while IFS= read -r line; do
-  # Session line: "├── sessionName (attached, Feb 26)" or "└── sessionName (Feb 10)"
   if echo "$line" | grep -qE '^[├└]── '; then
     CURRENT_SESSION=$(echo "$line" | sed 's/^[├└]── //' | sed 's/ (.*//')
     continue
   fi
-  # Pane line: "│   ├── 0.3   title   [2.1.39]"
-  # Match lines containing a version-like bracket [digits.digits.digits]
   if echo "$line" | grep -qE '\[[0-9]+\.[0-9]+\.[0-9]+\]'; then
-    # Extract pane address (e.g. "0.3")
     PANE_ADDR=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+' | head -1)
     if [ -n "$CURRENT_SESSION" ] && [ -n "$PANE_ADDR" ]; then
       LIVE_PANES="$LIVE_PANES ${CURRENT_SESSION}:${PANE_ADDR}"
@@ -181,62 +172,9 @@ LIVE_TESTED=0
 LIVE_PASSED=0
 LIVE_FAILED=0
 
-for pane in $LIVE_PANES; do
-  # Skip if no claude PID found
-  claude_pid=$(claudeCode process.find "$pane" 2>/dev/null)
-  [ -z "$claude_pid" ] && continue
-
-  test.case $level "session.id matches /status for $pane" \
-    echo "checking $pane (PID $claude_pid)"
-
-  # Get what session.id thinks
-  SID_RESULT=$(claudeCode session.id "$pane" 2>/dev/null)
-  if [ -z "$SID_RESULT" ]; then
-    expect.fail "session.id returned empty for active Claude pane $pane"
-    LIVE_TESTED=$((LIVE_TESTED + 1))
-    LIVE_FAILED=$((LIVE_FAILED + 1))
-    continue
-  fi
-
-  # Get ground truth: send /status, wait, capture, parse Session ID
-  otmux send "$pane" "/status" Enter 2>/dev/null
-  sleep 4
-
-  STATUS_CAPTURE=$(otmux pane.capture "$pane" 40 2>/dev/null | tr '\n' ' ')
-
-  # Dismiss the /status dialog
-  otmux send "$pane" Escape 2>/dev/null
-
-  # Parse "Session ID: <uuid>" from captured output
-  REAL_SID=$(echo "$STATUS_CAPTURE" | grep -oE 'Session ID: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-
-  if [ -z "$REAL_SID" ]; then
-    expect.fail "could not parse Session ID from /status for $pane (agent may be busy)"
-    LIVE_TESTED=$((LIVE_TESTED + 1))
-    LIVE_FAILED=$((LIVE_FAILED + 1))
-    continue
-  fi
-
-  if [ "$SID_RESULT" = "$REAL_SID" ]; then
-    expect.pass "session.id $pane = ${SID_RESULT:0:8}... (matches /status)"
-    LIVE_PASSED=$((LIVE_PASSED + 1))
-  else
-    expect.fail "session.id MISMATCH $pane: got ${SID_RESULT:0:8}... but /status says ${REAL_SID:0:8}..."
-    LIVE_FAILED=$((LIVE_FAILED + 1))
-  fi
-
-  LIVE_TESTED=$((LIVE_TESTED + 1))
-done
-
-if [ "$LIVE_TESTED" -eq 0 ]; then
-  test.case $level "session.id live test (skipped - no active Claude agents)" \
-    echo "skipped"
-  expect.pass "session.id live test skipped (no active Claude agents found)"
-else
-  echo ""
-  echo "  session.id live summary: $LIVE_TESTED tested, $LIVE_PASSED passed, $LIVE_FAILED failed"
-  echo ""
-fi
+test.case $level "session.id /status live test (DISABLED — disruptive to agents)" \
+  echo "skipped"
+expect.pass "session.id /status live test skipped (use T-ALIGN-1 for non-disruptive UUID validation)"
 
 # ============================================================================
 # T-IDLE: session.id returns exit 1 for idle (non-Claude) pane
@@ -550,6 +488,9 @@ echo ""
 # ── T-ALIGN-8: No duplicate UUIDs across different panes ────────────────
 # Two different panes should NEVER share the same session.id.
 # Bug 6: projectTeam:1.2, 1.3, 1.4 all returned 5fff44f4 — stale mapping.
+# Shows tmux session start date per pane so you can distinguish:
+#   - Same agent --resumed in a newer session (benign if old pane is dead)
+#   - Stale session.id returning cached UUID for a different/dead pane (bug)
 
 echo ""
 echo "=== T-ALIGN-8: Duplicate UUID detection across panes ==="
@@ -559,35 +500,76 @@ DUP_TESTED=0
 DUP_PASSED=0
 DUP_FAILED=0
 
-# Collect all pane→UUID mappings from live sessions
-declare -A UUID_MAP  # uuid → first pane that had it
+# Pre-collect session creation dates
+declare -A SESS_DATES
+for sess_info in $(tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null); do
+  s_name="${sess_info%%|*}"
+  s_epoch="${sess_info##*|}"
+  s_date=$(date -r "$s_epoch" "+%b %-d" 2>/dev/null || date -d "@$s_epoch" "+%b %-d" 2>/dev/null || echo "?")
+  SESS_DATES[$s_name]="$s_date"
+done
+
+# Collect all pane→UUID mappings with metadata
+declare -A UUID_MAP      # uuid → first pane that had it
+declare -A UUID_HAS_PID  # uuid → 1 if first pane has a live Claude PID
 DUP_REPORT=""
+DUP_COUNT=0
 
 for sess in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
+  sess_date="${SESS_DATES[$sess]:-?}"
   for pane in $(tmux list-panes -t "$sess" -s -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null); do
     sid=$(claudeCode session.id "$pane" 2>/dev/null)
     [ -z "$sid" ] && continue
 
     short="${sid:0:8}"
+    # Check if this pane has a live Claude process
+    has_pid=0
+    claude_pid=$(claudeCode process.find "$pane" 2>/dev/null)
+    [ -n "$claude_pid" ] && has_pid=1
+
     if [ -n "${UUID_MAP[$sid]+x}" ]; then
-      # Duplicate found
-      DUP_REPORT="${DUP_REPORT}  DUPLICATE: $pane and ${UUID_MAP[$sid]} share UUID ${short}\n"
+      # Duplicate found — get the first pane's info
+      first_pane="${UUID_MAP[$sid]}"
+      first_sess="${first_pane%%:*}"
+      first_date="${SESS_DATES[$first_sess]:-?}"
+      first_has_pid="${UUID_HAS_PID[$sid]:-0}"
+
+      # Determine severity
+      severity="STALE"
+      if [ "$has_pid" -eq 1 ] && [ "$first_has_pid" -eq 1 ]; then
+        severity="CONFLICT"  # both panes have live Claude — real problem
+      elif [ "$has_pid" -eq 1 ] || [ "$first_has_pid" -eq 1 ]; then
+        severity="STALE"     # one is live, one is dead — stale mapping
+      else
+        severity="GHOST"     # neither has Claude — both are stale
+      fi
+
+      pid_label_1=""
+      pid_label_2=""
+      [ "$first_has_pid" -eq 1 ] && pid_label_1=" (LIVE)"
+      [ "$has_pid" -eq 1 ] && pid_label_2=" (LIVE)"
+
+      DUP_REPORT="${DUP_REPORT}  ${severity}: ${short} shared by:\n"
+      DUP_REPORT="${DUP_REPORT}    ${first_pane} (${first_date})${pid_label_1}\n"
+      DUP_REPORT="${DUP_REPORT}    ${pane} (${sess_date})${pid_label_2}\n"
+      DUP_COUNT=$((DUP_COUNT + 1))
     else
       UUID_MAP[$sid]="$pane"
+      UUID_HAS_PID[$sid]="$has_pid"
     fi
   done
 done
 
 UNIQUE_COUNT=${#UUID_MAP[@]}
-test.case $level "no duplicate session.id UUIDs across panes ($UNIQUE_COUNT unique)" \
+test.case $level "no duplicate session.id UUIDs across panes ($UNIQUE_COUNT unique, $DUP_COUNT duplicates)" \
   echo "scanning all panes"
 
 DUP_TESTED=1
-if [ -z "$DUP_REPORT" ]; then
+if [ "$DUP_COUNT" -eq 0 ]; then
   expect.pass "all $UNIQUE_COUNT session.id UUIDs are unique across panes"
   DUP_PASSED=1
 else
-  expect.fail "duplicate UUIDs found:"
+  expect.fail "$DUP_COUNT duplicate UUID(s) found:"
   echo -e "$DUP_REPORT"
   DUP_FAILED=1
 fi
