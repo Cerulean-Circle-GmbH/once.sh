@@ -273,7 +273,7 @@ source debug
 ## Error Handling
 
 The `debug.onError` trap provides:
-- Error code translation via `errno` command
+- Error code translation via `errno` function (uses python3)
 - Source file and line number
 - Stack trace at level 4+
 - Special handling for `ERROR_CODE_RECONFIG`

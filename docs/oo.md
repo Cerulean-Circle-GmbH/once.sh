@@ -195,12 +195,12 @@ Ensures a command is installed, installing it if missing.
 ```bash
 ./oo cmd wget           # Install wget if missing
 ./oo cmd tree           # Install tree if missing
-./oo cmd errno moreutils  # Install moreutils for errno
+./oo cmd errno python3    # Install python3 for errno
 ```
 
 Special cases:
 - `update` - Runs `apt-get update`
-- `errno` - Installs moreutils
+- `errno` - Installs python3
 - `eamd`, `oosh`, `once` - Loads from ONCE repository
 
 ### oo.find.cmd
