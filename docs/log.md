@@ -121,6 +121,31 @@ log.live.file ~/config/live.log
 | `log.live.result` | Tail ~/config/result.txt |
 | `log.live.error` | Tail ~/config/error.txt |
 
+### Live Monitoring Dashboard
+
+Open all three live log streams in a single tmux session:
+
+```bash
+# Open the 4-pane monitoring dashboard
+./log live panes
+
+# Stop the monitoring session
+./log live panes.stop
+```
+
+Layout:
+```
+┌──────────────────┬──────────────────┐
+│                  │   log live       │
+│   Interactive    │   (all logs)     │
+│   Shell          ├─────────┬────────┤
+│                  │  live.  │ live.  │
+│                  │  result │ error  │
+└──────────────────┴─────────┴────────┘
+```
+
+The session is named `ooshlog`. Running `./log live panes` again while it's active will re-attach to the existing session.
+
 ### Clear Commands
 
 | Command | Description |
