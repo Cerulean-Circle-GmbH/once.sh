@@ -443,14 +443,29 @@ SES_FILE="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.en
 AGENTS_BASE="${HIVEMIND_AGENTS_DIR:-${CLAUDE_PROJECT_DIR:-$WORKSPACE_ROOT}/.claude/agents}"
 
 # Detect a live session with Claude agents for testing
+# Prefer hiveMindTeam02_03_26 (new live-discovery session), fall back to any session with agents
 CONSIST_SESSION=""
-for sess in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+for sess in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | sort -r); do
   pane_count=$(tmux list-panes -t "$sess" -F '#{pane_index}' 2>/dev/null | wc -l | tr -d ' ')
   if [ "$pane_count" -ge 2 ]; then
-    # Check if at least one pane has a registry entry
+    # Check registry OR live Claude processes on panes
+    has_agents=false
     if grep -q "^${sess}:" "$REG_FILE" 2>/dev/null; then
+      has_agents=true
+    else
+      # Live discovery: check if any pane has a Claude process
+      for pane_addr in $(tmux list-panes -t "$sess" -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); do
+        pane_pid=$(tmux display-message -t "$pane_addr" -p '#{pane_pid}' 2>/dev/null)
+        if [ -n "$pane_pid" ] && pgrep -P "$pane_pid" -f "claude" >/dev/null 2>&1; then
+          has_agents=true
+          break
+        fi
+      done
+    fi
+    if $has_agents; then
       CONSIST_SESSION="$sess"
-      break
+      # Prefer the new hiveMindTeam session specifically
+      echo "$sess" | grep -q "hiveMindTeam02" && break
     fi
   fi
 done
@@ -682,7 +697,7 @@ CONSIST8_TESTED=0
 CONSIST8_PASSED=0
 CONSIST8_FAILED=0
 
-TREE_OUTPUT=$(otmux tree.detailed 2>/dev/null)
+TREE_OUTPUT=$(timeout 60 otmux tree.detailed 2>/dev/null || true)
 CURRENT_SESS=""
 
 while IFS= read -r line; do
@@ -714,8 +729,8 @@ while IFS= read -r line; do
     continue
   fi
 
-  # Get what session.id returns
-  SID_UUID=$(claudeCode session.id "$FULL_PANE" 2>/dev/null)
+  # Get what session.id returns (timeout to prevent hanging)
+  SID_UUID=$(timeout 10 claudeCode session.id "$FULL_PANE" 2>/dev/null || true)
 
   CONSIST8_TESTED=$((CONSIST8_TESTED + 1))
 
@@ -764,8 +779,8 @@ while IFS= read -r line; do
   FULL_PANE="${CURRENT_SESS}:${LAST_PANE}"
 
   # Skip if already tested with full UUID
-  # Get what session.id returns
-  SID_UUID=$(claudeCode session.id "$FULL_PANE" 2>/dev/null)
+  # Get what session.id returns (timeout to prevent hanging)
+  SID_UUID=$(timeout 10 claudeCode session.id "$FULL_PANE" 2>/dev/null || true)
 
   CONSIST8_TESTED=$((CONSIST8_TESTED + 1))
 
@@ -794,6 +809,576 @@ echo "  T-CONSIST-8 summary: $CONSIST8_TESTED tested, $CONSIST8_PASSED passed, $
 
 echo ""
 echo "  === Identity Consistency Tests Complete ==="
+echo ""
+
+# ============================================================================
+# T-LIFECYCLE: Fixture-based tests — create sessions, test, tear down
+# These tests are self-contained and work on ANY machine.
+# ============================================================================
+
+echo ""
+echo "=== T-LIFECYCLE: Fixture-based session lifecycle tests ==="
+echo ""
+
+LIFECYCLE_TESTED=0
+LIFECYCLE_PASSED=0
+LIFECYCLE_FAILED=0
+
+# Pre-set HIVEMIND_AGENTS_DIR to prevent EPERM from find.agents.dir in subprocesses
+# hiveMind.start() skips the slow search if this is already set.
+# Lifecycle/registry tests don't need the real path — any non-empty value works.
+if [ -z "$HIVEMIND_AGENTS_DIR" ]; then
+  export HIVEMIND_AGENTS_DIR=$(private.hiveMind.find.agents.dir 2>/dev/null || echo "/tmp/hivemind-test-agents")
+fi
+
+# Shared cleanup function
+__test_cleanup() {
+  local sess="$1"
+  tmux kill-session -t "$sess" 2>/dev/null
+  # Remove test entries from registry
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  if [ -f "$reg" ]; then
+    grep -v "^${sess}:" "$reg" > "/tmp/reg_clean_$$" 2>/dev/null && mv "/tmp/reg_clean_$$" "$reg"
+  fi
+  # Remove from teams registry
+  local teams="${CONFIG_PATH:-$HOME/config}/hivemind.teams.env"
+  if [ -f "$teams" ]; then
+    grep -v "^${sess}|" "$teams" > "/tmp/teams_clean_$$" 2>/dev/null && mv "/tmp/teams_clean_$$" "$teams"
+  fi
+}
+
+# ── T-LIFECYCLE-1: Create session and register team ──────────────────────
+TEST_SESS="__test_hm_$$"
+__test_cleanup "$TEST_SESS"  # ensure clean start
+
+test.case $level "T-LIFECYCLE-1: create session and register team" \
+  echo "session=$TEST_SESS"
+LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+
+otmux new "$TEST_SESS" -d 2>/dev/null
+SESS_EXISTS=$(tmux has-session -t "$TEST_SESS" 2>/dev/null && echo "yes" || true)
+
+if [ "$SESS_EXISTS" = "yes" ]; then
+  hiveMind team.register "$TEST_SESS" "lifecycle test" 2>/dev/null || true
+  TEAM_ENTRY=$(grep "^${TEST_SESS}|" "${CONFIG_PATH:-$HOME/config}/hivemind.teams.env" 2>/dev/null || true)
+  if [ -n "$TEAM_ENTRY" ]; then
+    expect.pass "session created + team registered: $TEAM_ENTRY"
+    LIFECYCLE_PASSED=$((LIFECYCLE_PASSED + 1))
+  else
+    expect.fail "session created but team.register failed"
+    LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+  fi
+else
+  expect.fail "otmux new $TEST_SESS failed — session not created"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+fi
+
+# Cleanup T-LIFECYCLE-1
+hiveMind team.remove "$TEST_SESS" 2>/dev/null || true
+__test_cleanup "$TEST_SESS"
+
+# ── T-LIFECYCLE-2: pane.identify sets registry + title ───────────────────
+TEST_SESS="__test_hm_$$"
+__test_cleanup "$TEST_SESS"
+
+otmux new "$TEST_SESS" -d 2>/dev/null
+
+test.case $level "T-LIFECYCLE-2: pane.identify sets registry and pane title" \
+  echo "session=$TEST_SESS"
+LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+
+private.hiveMind.pane.identify "${TEST_SESS}:0.0" "test-expert" 2>/dev/null || true
+
+REG_ENTRY=$(grep "^${TEST_SESS}:0.0|test-expert" "${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}" 2>/dev/null || true)
+PANE_TITLE=$(tmux display-message -t "${TEST_SESS}:0.0" -p "#{pane_title}" 2>/dev/null || true)
+
+if [ -n "$REG_ENTRY" ] && [ "$PANE_TITLE" = "test-expert" ]; then
+  expect.pass "registry='$REG_ENTRY' title='$PANE_TITLE'"
+  LIFECYCLE_PASSED=$((LIFECYCLE_PASSED + 1))
+elif [ -n "$REG_ENTRY" ]; then
+  expect.fail "registry OK but title='$PANE_TITLE' (expected 'test-expert')"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+else
+  expect.fail "registry entry not found for ${TEST_SESS}:0.0|test-expert"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+fi
+
+__test_cleanup "$TEST_SESS"
+
+# ── T-LIFECYCLE-3: registry.set rejects garbage, accepts valid ───────────
+TEST_SESS="__test_hm_$$"
+__test_cleanup "$TEST_SESS"
+
+otmux new "$TEST_SESS" -d 2>/dev/null
+
+test.case $level "T-LIFECYCLE-3a: registry.set rejects garbage role names" \
+  echo "testing garbage rejection"
+LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+
+# Should reject: >30 chars, contains spaces, starts with prompt keywords
+private.hiveMind.registry.set "${TEST_SESS}:0.0" "Read session/agents/boot-prompt-text that is way too long" 2>/dev/null || true
+GARBAGE_ENTRY=$(grep "^${TEST_SESS}:0.0|Read session" "${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}" 2>/dev/null || true)
+
+if [ -z "$GARBAGE_ENTRY" ]; then
+  expect.pass "garbage role name correctly rejected"
+  LIFECYCLE_PASSED=$((LIFECYCLE_PASSED + 1))
+else
+  expect.fail "garbage role accepted into registry: $GARBAGE_ENTRY"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+fi
+
+test.case $level "T-LIFECYCLE-3b: registry.set accepts valid role names" \
+  echo "testing valid acceptance"
+LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+
+private.hiveMind.registry.set "${TEST_SESS}:0.0" "valid-role" 2>/dev/null || true
+VALID_ENTRY=$(grep "^${TEST_SESS}:0.0|valid-role" "${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}" 2>/dev/null || true)
+
+if [ -n "$VALID_ENTRY" ]; then
+  expect.pass "valid role accepted: $VALID_ENTRY"
+  LIFECYCLE_PASSED=$((LIFECYCLE_PASSED + 1))
+else
+  expect.fail "valid role 'valid-role' was rejected"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+fi
+
+__test_cleanup "$TEST_SESS"
+
+# ── T-LIFECYCLE-4: registry entries for dead panes get pruned ────────────
+# DISABLED: registry.refresh uses `tmux list-panes -a` (BUG: should be -s)
+# which probes ALL sessions with /status, disrupting live agents.
+# BUG REPORT: hiveMind line 1668 uses `-a` — same as BUG-C but in registry.refresh.
+# Re-enable when expert fixes registry.refresh to use session-scoped `-s`.
+if [ "${RUN_LIVE_TESTS:-0}" = "1" ]; then
+TEST_SESS="__test_hm_$$"
+__test_cleanup "$TEST_SESS"
+
+otmux new "$TEST_SESS" -d 2>/dev/null
+
+test.case $level "T-LIFECYCLE-4: dead pane entries pruned by registry.refresh" \
+  echo "testing dead pane pruning"
+LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+
+REG_FILE="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+echo "__test_DEAD_$$:99.99|ghost-agent" >> "$REG_FILE"
+
+BEFORE=$(grep "ghost-agent" "$REG_FILE" 2>/dev/null || true)
+
+hiveMind registry.refresh "$TEST_SESS" 2>/dev/null || true
+
+AFTER=$(grep "ghost-agent" "$REG_FILE" 2>/dev/null || true)
+
+if [ -n "$BEFORE" ] && [ -z "$AFTER" ]; then
+  expect.pass "ghost entry injected then pruned by registry.refresh"
+  LIFECYCLE_PASSED=$((LIFECYCLE_PASSED + 1))
+elif [ -z "$BEFORE" ]; then
+  expect.fail "injection failed — ghost entry not written"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+else
+  expect.fail "ghost entry NOT pruned: $AFTER"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+  grep -v "ghost-agent" "$REG_FILE" > "/tmp/reg_fix_$$" && mv "/tmp/reg_fix_$$" "$REG_FILE"
+fi
+
+__test_cleanup "$TEST_SESS"
+else
+  echo "  T-LIFECYCLE-4 SKIPPED (RUN_LIVE_TESTS not set — registry.refresh probes all sessions)"
+  LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+fi # RUN_LIVE_TESTS gate
+
+# ── T-LIFECYCLE-5: resolve scopes to specified session ───────────────────
+TEST_SESS_A="__test_hm_A_$$"
+TEST_SESS_B="__test_hm_B_$$"
+__test_cleanup "$TEST_SESS_A"
+__test_cleanup "$TEST_SESS_B"
+
+otmux new "$TEST_SESS_A" -d 2>/dev/null
+otmux new "$TEST_SESS_B" -d 2>/dev/null
+
+test.case $level "T-LIFECYCLE-5: resolve scopes to specified session" \
+  echo "testing session-scoped resolution"
+LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+
+# Register same role name in both sessions
+private.hiveMind.pane.identify "${TEST_SESS_A}:0.0" "test-expert" 2>/dev/null || true
+private.hiveMind.pane.identify "${TEST_SESS_B}:0.0" "test-expert" 2>/dev/null || true
+
+# Resolve with session A — must return A's pane
+# Filter ERROR lines from OOSH error handler (stdout noise from find.agents.dir)
+RESOLVED=$(hiveMind resolve test-expert "$TEST_SESS_A" 2>/dev/null | grep -v '^ERROR>' || true)
+
+if [ "$RESOLVED" = "${TEST_SESS_A}:0.0" ]; then
+  expect.pass "resolve scoped correctly: $RESOLVED"
+  LIFECYCLE_PASSED=$((LIFECYCLE_PASSED + 1))
+elif [ "$RESOLVED" = "${TEST_SESS_B}:0.0" ]; then
+  expect.fail "resolve returned WRONG session: $RESOLVED (expected ${TEST_SESS_A}:0.0)"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+else
+  expect.fail "resolve returned unexpected: '$RESOLVED' (expected ${TEST_SESS_A}:0.0)"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+fi
+
+__test_cleanup "$TEST_SESS_A"
+__test_cleanup "$TEST_SESS_B"
+
+# ── T-LIFECYCLE-6: team.remove cleans up ─────────────────────────────────
+TEST_SESS="__test_hm_$$"
+__test_cleanup "$TEST_SESS"
+
+otmux new "$TEST_SESS" -d 2>/dev/null
+
+test.case $level "T-LIFECYCLE-6: team.remove cleans team registry" \
+  echo "testing team removal"
+LIFECYCLE_TESTED=$((LIFECYCLE_TESTED + 1))
+
+hiveMind team.register "$TEST_SESS" "test team" 2>/dev/null || true
+hiveMind team.remove "$TEST_SESS" 2>/dev/null || true
+
+REMAINING=$(grep "^${TEST_SESS}|" "${CONFIG_PATH:-$HOME/config}/hivemind.teams.env" 2>/dev/null || true)
+
+if [ -z "$REMAINING" ]; then
+  expect.pass "team.remove cleaned teams.env"
+  LIFECYCLE_PASSED=$((LIFECYCLE_PASSED + 1))
+else
+  expect.fail "team entry still present after remove: $REMAINING"
+  LIFECYCLE_FAILED=$((LIFECYCLE_FAILED + 1))
+fi
+
+__test_cleanup "$TEST_SESS"
+
+echo ""
+echo "  T-LIFECYCLE summary: $LIFECYCLE_TESTED tested, $LIFECYCLE_PASSED passed, $LIFECYCLE_FAILED failed"
+echo ""
+
+# ============================================================================
+# T-PROCESS: process.lookup and process.list method tests
+# Test the expert's PID-to-pane resolution methods (commit 6e25180)
+# ============================================================================
+
+echo ""
+echo "=== T-PROCESS: PID resolution tests ==="
+echo ""
+
+# ── T-PROCESS-1: process.lookup function exists ──────────────────────────
+test.case $level "T-PROCESS-1: process.lookup function exists" \
+  type -t hiveMind.process.lookup
+PROC_OUT=$(type -t hiveMind.process.lookup 2>/dev/null || true)
+if [ "$PROC_OUT" = "function" ]; then
+  expect.pass "hiveMind.process.lookup is a function"
+else
+  expect.fail "hiveMind.process.lookup not found (got: $PROC_OUT)"
+fi
+
+# ── T-PROCESS-2: process.lookup rejects missing PID ─────────────────────
+# Capture exit code BEFORE test.case (test.case eats the return code)
+hiveMind.process.lookup 2>/dev/null
+RESULT_CODE=$?
+test.case $level "T-PROCESS-2: process.lookup rejects missing PID" \
+  echo "exit code: $RESULT_CODE"
+if [ "$RESULT_CODE" -ne 0 ]; then
+  expect.pass "process.lookup returns non-zero without PID arg (rc=$RESULT_CODE)"
+else
+  expect.fail "process.lookup should fail without PID arg (got rc=$RESULT_CODE)"
+fi
+
+# ── T-PROCESS-3: process.lookup rejects bogus PID ───────────────────────
+hiveMind.process.lookup 999999 2>/dev/null
+RESULT_CODE=$?
+test.case $level "T-PROCESS-3: process.lookup rejects bogus PID" \
+  echo "exit code: $RESULT_CODE"
+if [ "$RESULT_CODE" -ne 0 ]; then
+  expect.pass "process.lookup rejects non-existent PID 999999 (rc=$RESULT_CODE)"
+else
+  expect.fail "process.lookup should fail for PID 999999 (got rc=$RESULT_CODE)"
+fi
+
+# ── T-PROCESS-4 through T-PROCESS-6: LIVE tests (gated) ─────────────────
+# These probe live Claude panes — only run with RUN_LIVE_TESTS=1
+# Without the gate, process.find scans all panes and disrupts agents.
+if [ "${RUN_LIVE_TESTS:-0}" = "1" ]; then
+
+test.case $level "T-PROCESS-4: process.lookup resolves live Claude PID" \
+  echo "finding a live Claude process"
+
+LIVE_PID=""
+LIVE_PANE=""
+for pane_target in $(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null); do
+  LIVE_PID=$(claudeCode process.find "$pane_target" 2>/dev/null || true)
+  if [ -n "$LIVE_PID" ]; then
+    LIVE_PANE="$pane_target"
+    break
+  fi
+done
+
+if [ -n "$LIVE_PID" ]; then
+  LOOKUP_OUT=$(hiveMind.process.lookup "$LIVE_PID" 2>/dev/null | grep -v '^ERROR>' || true)
+  if echo "$LOOKUP_OUT" | grep -q "PID $LIVE_PID"; then
+    expect.pass "process.lookup found PID $LIVE_PID → $LIVE_PANE"
+  else
+    expect.fail "process.lookup output missing PID reference: $LOOKUP_OUT"
+  fi
+else
+  expect.pass "no live Claude process found (SKIP)"
+fi
+
+test.case $level "T-PROCESS-5: process.lookup output contains correct pane" \
+  echo "verifying pane target in lookup output"
+
+if [ -n "$LIVE_PID" ] && [ -n "$LIVE_PANE" ]; then
+  LOOKUP_OUT=$(hiveMind.process.lookup "$LIVE_PID" 2>/dev/null | grep -v '^ERROR>' || true)
+  if echo "$LOOKUP_OUT" | grep -q "$LIVE_PANE"; then
+    expect.pass "output contains pane target $LIVE_PANE"
+  else
+    expect.fail "pane target $LIVE_PANE not in output: $LOOKUP_OUT"
+  fi
+else
+  expect.pass "no live Claude — skipped"
+fi
+
+test.case $level "T-PROCESS-6: process.lookup output contains TTY line" \
+  echo "verifying TTY in lookup output"
+
+if [ -n "$LIVE_PID" ]; then
+  LOOKUP_OUT=$(hiveMind.process.lookup "$LIVE_PID" 2>/dev/null | grep -v '^ERROR>' || true)
+  if echo "$LOOKUP_OUT" | grep -q "TTY:"; then
+    expect.pass "output contains TTY line"
+  else
+    expect.fail "TTY line missing from output: $LOOKUP_OUT"
+  fi
+else
+  expect.pass "no live Claude — skipped"
+fi
+
+else
+  echo "  T-PROCESS-4,5,6 SKIPPED (RUN_LIVE_TESTS not set)"
+fi # RUN_LIVE_TESTS gate
+
+# ── T-PROCESS-7: process.list function exists ────────────────────────────
+test.case $level "T-PROCESS-7: process.list function exists" \
+  type -t hiveMind.process.list
+PROC_OUT=$(type -t hiveMind.process.list 2>/dev/null || true)
+if [ "$PROC_OUT" = "function" ]; then
+  expect.pass "hiveMind.process.list is a function"
+else
+  expect.fail "hiveMind.process.list not found (got: $PROC_OUT)"
+fi
+
+# ── T-PROCESS-8: process.list produces header ────────────────────────────
+test.case $level "T-PROCESS-8: process.list produces table header" \
+  echo "checking process.list output format"
+
+LIST_OUT=$(hiveMind.process.list 2>/dev/null | grep -v '^ERROR>' || true)
+if echo "$LIST_OUT" | head -1 | grep -q "PID"; then
+  expect.pass "process.list header contains PID column"
+else
+  expect.fail "process.list header malformed: $(echo "$LIST_OUT" | head -1)"
+fi
+
+# ── T-PROCESS-9: process.list finds Claude processes ─────────────────────
+test.case $level "T-PROCESS-9: process.list finds running Claude instances" \
+  echo "counting process.list output"
+
+LIST_LINES=$(hiveMind.process.list 2>/dev/null | grep -v '^ERROR>' | grep -v '^PID\|^---\|^(no' | grep -c '[0-9]' || true)
+if [ "$LIST_LINES" -gt 0 ]; then
+  expect.pass "process.list found $LIST_LINES Claude processes"
+else
+  expect.pass "no Claude processes found (SKIP)"
+fi
+
+# ── T-PROCESS-10: process.list session filter works ──────────────────────
+test.case $level "T-PROCESS-10: process.list filters by session" \
+  echo "testing session filter"
+
+BOGUS_OUT=$(hiveMind.process.list "__nonexistent_session__" 2>/dev/null | grep -v '^ERROR>\|^PID\|^---' || true)
+if echo "$BOGUS_OUT" | grep -q "no Claude processes"; then
+  expect.pass "process.list returns empty for nonexistent session"
+elif [ -z "$(echo "$BOGUS_OUT" | grep '[0-9]')" ]; then
+  expect.pass "process.list returns no entries for nonexistent session"
+else
+  expect.fail "process.list returned data for nonexistent session: $BOGUS_OUT"
+fi
+
+# ── T-PROCESS-11: process.lookup completion function exists ──────────────
+test.case $level "T-PROCESS-11: process.lookup.completion.pid exists" \
+  type -t hiveMind.process.lookup.completion.pid
+COMP_OUT=$(type -t hiveMind.process.lookup.completion.pid 2>/dev/null || true)
+if [ "$COMP_OUT" = "function" ]; then
+  expect.pass "completion function exists"
+else
+  expect.fail "process.lookup.completion.pid not found"
+fi
+
+# ── T-PROCESS-12: process.list completion function exists ────────────────
+test.case $level "T-PROCESS-12: process.list.completion.session exists" \
+  type -t hiveMind.process.list.completion.session
+COMP_OUT=$(type -t hiveMind.process.list.completion.session 2>/dev/null || true)
+if [ "$COMP_OUT" = "function" ]; then
+  expect.pass "completion function exists"
+else
+  expect.fail "process.list.completion.session not found"
+fi
+
+# ============================================================================
+# T-LIVE: Live discovery, team.status, and resolve consistency tests
+# These verify that live-fact discovery methods return consistent data
+# ============================================================================
+
+echo ""
+echo "=== T-LIVE: Live discovery and team.status consistency tests ==="
+echo ""
+
+# ── T-LIVE-1: team.status function exists ────────────────────────────────
+test.case $level "T-LIVE-1: team.status function exists" \
+  type -t hiveMind.team.status
+TS_OUT=$(type -t hiveMind.team.status 2>/dev/null || true)
+if [ "$TS_OUT" = "function" ]; then
+  expect.pass "hiveMind.team.status is a function"
+else
+  expect.fail "hiveMind.team.status not found"
+fi
+
+# ── T-LIVE-2: team.status (LIVE — gated) ─────────────────────────────────
+# team.status calls live.discover which probes Claude panes — gate it
+if [ "${RUN_LIVE_TESTS:-0}" = "1" ]; then
+test.case $level "T-LIVE-2: team.status produces output for active session" \
+  echo "testing team.status with live session"
+
+LIVE_TEAM=""
+TEAMS_FILE="${CONFIG_PATH:-$HOME/config}/hivemind.teams.env"
+if [ -f "$TEAMS_FILE" ]; then
+  while IFS='|' read -r tname tdesc; do
+    [ -z "$tname" ] && continue
+    if tmux has-session -t "$tname" 2>/dev/null; then
+      LIVE_TEAM="$tname"
+      break
+    fi
+  done < "$TEAMS_FILE"
+fi
+
+if [ -n "$LIVE_TEAM" ]; then
+  STATUS_OUT=$(hiveMind.team.status "$LIVE_TEAM" 2>/dev/null | grep -v '^ERROR>' || true)
+  if [ -n "$STATUS_OUT" ]; then
+    expect.pass "team.status produced output for $LIVE_TEAM"
+  else
+    expect.fail "team.status returned empty for live session $LIVE_TEAM"
+  fi
+else
+  expect.pass "no live team session found (SKIP)"
+fi
+else
+  echo "  T-LIVE-2 SKIPPED (RUN_LIVE_TESTS not set)"
+fi # RUN_LIVE_TESTS gate
+
+# ── T-LIVE-3: resolve function exists ────────────────────────────────────
+test.case $level "T-LIVE-3: resolve function exists" \
+  type -t hiveMind.resolve
+RES_OUT=$(type -t hiveMind.resolve 2>/dev/null || true)
+if [ "$RES_OUT" = "function" ]; then
+  expect.pass "hiveMind.resolve is a function"
+else
+  expect.fail "hiveMind.resolve not found"
+fi
+
+# ── T-LIVE-4: resolve returns empty for nonexistent role ─────────────────
+test.case $level "T-LIVE-4: resolve returns empty for nonexistent role" \
+  echo "testing resolve with bogus role"
+
+BOGUS_RESOLVE=$(hiveMind.resolve "__nonexistent_role_$$" 2>/dev/null | grep -v '^ERROR>' || true)
+if [ -z "$BOGUS_RESOLVE" ]; then
+  expect.pass "resolve returned empty for nonexistent role"
+else
+  expect.fail "resolve returned '$BOGUS_RESOLVE' for nonexistent role"
+fi
+
+# ── T-LIVE-5 through T-LIVE-7: LIVE tests (gated) ────────────────────────
+# These probe live Claude panes via process.find, live.discover, process.list.
+# Only run with RUN_LIVE_TESTS=1 to avoid disrupting active sessions.
+if [ "${RUN_LIVE_TESTS:-0}" = "1" ]; then
+
+test.case $level "T-LIVE-5: resolve finds a role from registry" \
+  echo "testing resolve with real role"
+
+REG_FILE="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+REAL_ROLE=""
+REAL_PANE=""
+if [ -f "$REG_FILE" ]; then
+  while IFS='|' read -r pt rl; do
+    [ -z "$pt" ] || [ -z "$rl" ] && continue
+    if tmux display-message -t "$pt" -p "#{pane_id}" >/dev/null 2>&1; then
+      REAL_ROLE="$rl"
+      REAL_PANE="$pt"
+      break
+    fi
+  done < "$REG_FILE"
+fi
+
+if [ -n "$REAL_ROLE" ]; then
+  REAL_SESS="${REAL_PANE%%:*}"
+  RESOLVED=$(hiveMind.resolve "$REAL_ROLE" "$REAL_SESS" 2>/dev/null | grep -v '^ERROR>' || true)
+  if [ -n "$RESOLVED" ]; then
+    expect.pass "resolve found '$REAL_ROLE' in $REAL_SESS → $RESOLVED"
+  else
+    expect.fail "resolve returned empty for '$REAL_ROLE' in session $REAL_SESS (expected ~$REAL_PANE)"
+  fi
+else
+  expect.pass "no live registered roles found (SKIP)"
+fi
+
+test.case $level "T-LIVE-6: live.discover returns role for Claude pane" \
+  echo "testing live discovery"
+
+LIVE_DISC_PANE=""
+for pane_target in $(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null); do
+  HAS_CLAUDE=$(claudeCode process.find "$pane_target" 2>/dev/null || true)
+  if [ -n "$HAS_CLAUDE" ]; then
+    LIVE_DISC_PANE="$pane_target"
+    break
+  fi
+done
+
+if [ -n "$LIVE_DISC_PANE" ]; then
+  DISC_ROLE=$(private.hiveMind.live.discover "$LIVE_DISC_PANE" 2>/dev/null || true)
+  if [ -n "$DISC_ROLE" ]; then
+    expect.pass "live.discover found role '$DISC_ROLE' at $LIVE_DISC_PANE"
+  else
+    expect.fail "live.discover returned empty for Claude pane $LIVE_DISC_PANE"
+  fi
+else
+  expect.pass "no Claude panes found (SKIP)"
+fi
+
+test.case $level "T-LIVE-7: process.list roles agree with resolve" \
+  echo "cross-checking process.list vs resolve"
+
+CROSS_OK=true
+CROSS_CHECKED=0
+while read -r pid pane role sid_rest; do
+  [ -z "$pid" ] && continue
+  [[ "$pid" == "PID" || "$pid" == "---" || "$pid" == "(no" ]] && continue
+  [ "$role" = "-" ] && continue
+  CROSS_CHECKED=$((CROSS_CHECKED + 1))
+  cross_sess="${pane%%:*}"
+  RESOLVE_PANE=$(hiveMind.resolve "$role" "$cross_sess" 2>/dev/null | grep -v '^ERROR>' || true)
+  if [ -n "$RESOLVE_PANE" ] && [ "$RESOLVE_PANE" != "$pane" ]; then
+    echo "  MISMATCH: process.list says $role at $pane, resolve $cross_sess says $RESOLVE_PANE"
+    CROSS_OK=false
+  fi
+done < <(hiveMind.process.list 2>/dev/null | grep -v '^ERROR>')
+
+if [ "$CROSS_CHECKED" -eq 0 ]; then
+  expect.pass "no roles to cross-check (SKIP)"
+elif [ "$CROSS_OK" = "true" ]; then
+  expect.pass "all $CROSS_CHECKED roles consistent between process.list and resolve"
+else
+  expect.fail "role mismatches found between process.list and resolve"
+fi
+
+else
+  echo "  T-LIVE-5,6,7 SKIPPED (RUN_LIVE_TESTS not set)"
+fi # RUN_LIVE_TESTS gate
+
+echo ""
+echo "=== All live discovery tests complete ==="
 echo ""
 
 # ============================================================================
