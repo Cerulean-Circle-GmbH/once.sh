@@ -7,11 +7,11 @@
 
 ## Background
 
-Main branch has not been updated since Mexico. All active development is on `hannes-v2`. We need a structured branching strategy and an automated pipeline that promotes code through stages (dev -> test -> prod), gated by install tests passing on all supported platforms.
+Main branch has not been updated by Hannes. All active development is on `hannes-v2`. We need a structured branching strategy and an automated pipeline that promotes code through stages (dev -> test -> prod), gated by install tests passing on all supported platforms.
 
 ## Current State
 
-- `main` — stale, last real commit was pre-Mexico
+- `main` — stale
 - `hannes-v2` — active development, 230+ commits ahead
 - `dev`, `dev.claude` — older dev branches
 - Platform test branches exist: `test/macos`, `test/ish`, `test/windows`, `stable/bash4`
