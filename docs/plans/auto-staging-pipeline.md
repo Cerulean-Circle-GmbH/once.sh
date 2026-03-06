@@ -213,8 +213,13 @@ container lifecycle without raw commands. Analysis of existing manual workflow r
   - Convenience for update-and-rebuild workflow
 - [x] 3.8 Created `docs/odocker.md` with all methods, workflow examples, workspace naming convention
 - [x] 3.9 Updated `docs/wiki-index.md` with links to odocker, supported-platforms, and branching docs
-- [x] 3.9a Added tests for new methods to `test/test.odocker` (reset, rebuild, completions) — 37/37 pass
-- [x] 3.9b Added tests for new methods to `test/test.ossh` (known.hosts.remove, completion, graceful handling) — 15/15 pass
+- [x] 3.9a Added tests for new methods to `test/test.odocker` (reset, rebuild, completions)
+- [x] 3.9b Added tests for new methods to `test/test.ossh` (known.hosts.remove, completion, graceful handling)
+- [x] 3.9c Strengthened workspace tests in `test/test.odocker`:
+  - `ODOCKER_WORKSPACES` resolves to an existing directory
+  - All must-pass platform Dockerfiles exist (nakedUbuntu/24.04, nakedDebian/12, nakedAlma/9.sshd, nakedAlpine/3.19)
+  - Image name derivation verified for all must-pass platforms
+  - Workspace completion now fails (not silently passes) when workspaces are missing
 
 ### 3C: Install Test Script (oosh style)
 
