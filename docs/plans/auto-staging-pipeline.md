@@ -31,35 +31,35 @@ Agree on and document which branches exist, what they mean, and how code flows b
 
 ### Decisions Required
 
-- [ ] 1.1 Decide branch naming:
+- [x] 1.1 Decide branch naming:
   - Option A: `dev` / `test` / `main` (main = prod)
   - Option B: `dev` / `test` / `prod` (separate prod branch, main untouched)
   - Option C: `hannes-v2` stays as-is / `staging` / `main` (minimal rename)
-  - **Decision:** ____________
-- [ ] 1.2 Decide what happens to current `hannes-v2`:
+  - **Decision:** Option B — `dev` / `test` / `prod`. `main` stays as-is (legacy).
+- [x] 1.2 Decide what happens to current `hannes-v2`:
   - Rename to `dev`?
   - Keep as `hannes-v2` and just define it as the dev branch?
-  - **Decision:** ____________
-- [ ] 1.3 Decide what happens to current `main`:
+  - **Decision:** Rename `hannes-v2` → `dev`. Archive old `dev` branch first.
+- [x] 1.3 Decide what happens to current `main`:
   - Becomes prod (update it via first merge)?
   - Archive as `main-legacy` and create fresh prod?
-  - **Decision:** ____________
-- [ ] 1.4 Decide where feature branches fork from:
+  - **Decision:** Leave `main` as-is. It has no active role; `prod` is the new production branch.
+- [x] 1.4 Decide where feature branches fork from:
   - Always from dev?
   - From test for hotfixes?
-  - **Decision:** ____________
+  - **Decision:** Feature branches from `dev`. Hotfix branches from `prod`, merged back into both `prod` and `dev`.
 
 ### Implementation Steps
 
-- [ ] 1.5 Create `docs/branching.md` documenting:
+- [x] 1.5 Create `docs/branching.md` documenting:
   - Branch names and their purpose
   - Flow diagram: dev -> test -> prod
   - Rules for each branch (who merges, when, etc.)
   - Feature branch conventions
-- [ ] 1.6 Create the new branches in git (if renaming)
-- [ ] 1.7 Update any hardcoded branch references in scripts (grep for `hannes-v2`, `main`, `dev` in ossh, oo, etc.)
-- [ ] 1.8 Update remote tracking (`origin`) to reflect new branch structure
-- [ ] 1.9 Communicate branch strategy to all contributors
+- [x] 1.6 Create the new branches in git: archived old `dev` → `archive/dev-old`, renamed `hannes-v2` → `dev`, created `test` and `prod` from dev HEAD
+- [x] 1.7 Update hardcoded branch references: `oo` stage.to.prod now targets `prod`, worktree setup uses `dev` as base, `ossh` branch checks updated from `main` to `dev`
+- [x] 1.8 Update remote tracking: pushed `dev`, `stage`, `prod` to origin with upstream tracking. Renamed `test` → `stage` to avoid conflict with existing `test/*` remote branches.
+- [x] 1.9 Communicate branch strategy to all contributors — done via this session with Hannes
 
 ### Done When
 
