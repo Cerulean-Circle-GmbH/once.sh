@@ -183,11 +183,11 @@ Existing workspaces in `$ODOCKER_WORKSPACES`:
   - [x] `nakedUbuntu/24.04` — minimal, has SSH + sudo only. OK.
   - [x] `nakedAlma/9.sshd` — minimal, has SSH + sudo + wget. OK.
   - Decision: naked images stay minimal. oosh install must bootstrap everything.
-- [ ] 3.4 Build all platform images via `odocker build`:
-  - [ ] `odocker build nakedUbuntu/24.04`
-  - [ ] `odocker build nakedDebian/12`
-  - [ ] `odocker build nakedAlma/9.sshd`
-  - [ ] `odocker build nakedAlpine/3.19`
+- [x] 3.4 Build all platform images via `odocker build`:
+  - [x] `odocker build nakedUbuntu/24.04` — 218MB
+  - [x] `odocker build nakedDebian/12` — 172MB
+  - [x] `odocker build nakedAlma/9.sshd` — 229MB
+  - [x] `odocker build nakedAlpine/3.19` — 15.7MB
 
 ### 3B: odocker + ossh Enhancements
 
