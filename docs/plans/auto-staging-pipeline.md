@@ -34,10 +34,7 @@ Agree on and document which branches exist, what they mean, and how code flows b
 ### Decisions Required
 
 - [x] 1.1 Decide branch naming:
-  - Option A: `dev` / `test` / `main` (main = prod)
-  - Option B: `dev` / `test` / `prod` (separate prod branch, main untouched)
-  - Option C: `hannes-v2` stays as-is / `staging` / `main` (minimal rename)
-  - **Decision:** Option B — `dev` / `stage` / `prod`. `main` stays as-is (legacy). (Originally `test`, renamed to `stage` to avoid conflict with `test/*` remote branches.)
+  - **Decision:** `dev` / `stage` / `prod`. `main` stays as-is (legacy). Originally considered `test` instead of `stage`, renamed to avoid conflict with `test/*` remote branches.
 - [x] 1.2 Decide what happens to current `hannes-v2`:
   - Rename to `dev`?
   - Keep as `hannes-v2` and just define it as the dev branch?
