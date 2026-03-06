@@ -29,6 +29,12 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [OO Framework Documentation](oo.md) - Script creation, version control, package management
 - [State Machine Documentation](state.md) - Creating and managing state machines for multi-step workflows
 
+## Infrastructure Tools
+
+- [Docker Wrapper (odocker)](odocker.md) - Docker image/container management, workspace builds, container reset
+- [Supported Platforms](supported-platforms.md) - Platform matrix, tiers, and install requirements
+- [Branching Strategy](branching.md) - Branch naming, promotion flow, feature/hotfix conventions
+
 ## Agent Orchestration
 
 - [HiveMind](hivemind.md) - Multi-agent orchestrator for distributed task execution

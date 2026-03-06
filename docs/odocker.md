@@ -1,0 +1,134 @@
+# odocker — Docker Wrapper for oosh
+
+The `odocker` script wraps Docker commands following oosh conventions: positional parameters, tab completion, method signatures with descriptions.
+
+## Overview
+
+- Manages Docker images and containers via oosh methods
+- Dockerfiles live in `DockerWorkspaces` (EAMD convention), referenced via `$ODOCKER_WORKSPACES`
+- Naming: `tmux→otmux, ssh→ossh, docker→odocker`
+
+## Configuration
+
+```bash
+# Set DockerWorkspaces path (persists in ~/config/user.env)
+config set ODOCKER_WORKSPACES "/var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces"
+
+# Default (if not set): /var/dev/EAMD.ucp/.../DockerWorkspaces
+```
+
+## Quick Start
+
+```bash
+# List available workspaces
+odocker workspace.list
+
+# Build an image from a workspace
+odocker build nakedUbuntu/24.04
+
+# Run container with SSH for remote access
+odocker run.sshd naked_ubuntu_24_04
+
+# Reset: stop old container, clear SSH key, start fresh
+odocker reset naked_ubuntu_24_04
+
+# Then use ossh to install oosh into the container
+ossh config.create mycontainer test@localhost:8022
+ossh config.save.last
+ossh push.key mycontainer
+ossh install mycontainer test
+ossh login mycontainer
+```
+
+## Methods
+
+### Workspace Management
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `workspace.list` | | List all Dockerfile workspaces and their build status |
+
+### Build
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `build <workspace>` | workspace path (e.g., `nakedUbuntu/24.04`) | Build image from DockerWorkspaces directory |
+| `build.all` | | Build all workspaces that have a Dockerfile |
+| `rebuild <workspace>` | workspace path | Remove old image and rebuild from Dockerfile |
+
+### Run
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `run <image>` | image name, optional container name | Run container interactively |
+| `run.sshd <image>` | image name, optional container name | Run container detached with SSH port mappings (8022:22, 8080, 8443, 5001, 5002, 5005) |
+| `reset <image>` | image name, optional SSH port (default: 8022) | Stop container on SSH port, remove it, clear host key, start fresh |
+
+### Container Operations
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `exec <container>` | container name, optional shell (default: bash) | Shell into running container |
+| `stop <container>` | container name | Stop a running container |
+| `rm <container>` | container name | Remove a stopped container |
+| `log <container>` | container name, optional line count (default: 50) | Show container logs |
+
+### Image Operations
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `list` | | List all Docker images |
+| `rmi <image>` | image name | Remove an image |
+| `file.find <containerOrImage>` | container or image name | Find the Dockerfile that built a container or image |
+
+### Status & Maintenance
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `ps` | | List running containers |
+| `status` | | Show Docker overview: images, containers, disk usage |
+| `disk` | | Show Docker disk usage details |
+| `prune` | | Remove dangling images and stopped containers |
+| `prune.all` | | Full system prune including unused images and volumes |
+
+## Workspace Naming Convention
+
+Workspaces in DockerWorkspaces follow camelCase directory naming. The image tag is derived automatically:
+
+| Workspace path | Image tag |
+|---------------|-----------|
+| `nakedUbuntu/24.04` | `naked_ubuntu_24_04` |
+| `nakedAlma/9.sshd` | `naked_alma_9_sshd` |
+| `nakedDebian/12` | `naked_debian_12` |
+| `nakedAlpine/3.19` | `naked_alpine_3_19` |
+
+## Typical Workflow: Platform Install Test
+
+```bash
+# 1. Build the image (once)
+odocker build nakedUbuntu/24.04
+
+# 2. Reset and start fresh container
+odocker reset naked_ubuntu_24_04
+
+# 3. Configure SSH access via ossh
+ossh config.create ubuntu24 test@localhost:8022
+ossh config.save.last
+ossh push.key ubuntu24
+
+# 4. Install oosh remotely
+ossh install ubuntu24 test
+
+# 5. Login and verify
+ossh login ubuntu24
+
+# 6. When done, clean up
+odocker stop <container_name>
+odocker rm <container_name>
+```
+
+## See Also
+
+- [Supported Platforms](supported-platforms.md)
+- [Branching Strategy](branching.md)
+- [Config System](config.md)

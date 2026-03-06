@@ -37,7 +37,7 @@ Agree on and document which branches exist, what they mean, and how code flows b
   - Option A: `dev` / `test` / `main` (main = prod)
   - Option B: `dev` / `test` / `prod` (separate prod branch, main untouched)
   - Option C: `hannes-v2` stays as-is / `staging` / `main` (minimal rename)
-  - **Decision:** Option B — `dev` / `test` / `prod`. `main` stays as-is (legacy).
+  - **Decision:** Option B — `dev` / `stage` / `prod`. `main` stays as-is (legacy). (Originally `test`, renamed to `stage` to avoid conflict with `test/*` remote branches.)
 - [x] 1.2 Decide what happens to current `hannes-v2`:
   - Rename to `dev`?
   - Keep as `hannes-v2` and just define it as the dev branch?
@@ -58,7 +58,7 @@ Agree on and document which branches exist, what they mean, and how code flows b
   - Flow diagram: dev -> stage -> prod
   - Rules for each branch (who merges, when, etc.)
   - Feature branch conventions
-- [x] 1.6 Create the new branches in git: archived old `dev` → `archive/dev-old`, renamed `hannes-v2` → `dev`, created `test` and `prod` from dev HEAD
+- [x] 1.6 Create the new branches in git: archived old `dev` → `archive/dev-old`, renamed `hannes-v2` → `dev`, created `stage` and `prod` from dev HEAD
 - [x] 1.7 Update hardcoded branch references: `oo` stage.to.prod now targets `prod`, worktree setup uses `dev` as base, `ossh` branch checks updated from `main` to `dev`
 - [x] 1.8 Update remote tracking: pushed `dev`, `stage`, `prod` to origin with upstream tracking. Renamed `test` → `stage` to avoid conflict with existing `test/*` remote branches.
 - [x] 1.9 Communicate branch strategy to all contributors — done via this session with Hannes
@@ -153,7 +153,7 @@ Nail down exactly which platforms must pass install tests before code can be pro
 
 **Priority:** High — the build work
 **Depends on:** Ticket 2 (platform matrix)
-**Estimated effort:** Medium-Large
+**Estimated effort:** Medium
 
 ### Goal
 
@@ -163,92 +163,110 @@ For each supported platform, create a reproducible environment that can:
 3. Run tests
 4. Report pass/fail
 
-### 3A: Docker-based Linux Platforms
+All Docker operations use `odocker`. Dockerfiles live in `DockerWorkspaces` (EAMD convention).
 
-- [ ] 3.1 Create directory structure:
-  ```
-  docker/
-    platforms/
-      ubuntu-24.04/Dockerfile
-      almalinux-9/Dockerfile
-      alpine-3.19/Dockerfile
-      ...
-  ```
-- [ ] 3.2 Write base Dockerfile template with:
-  - [ ] Clean OS install
-  - [ ] Required base packages (git, bash, curl)
-  - [ ] Non-root test user (to test multi-user install)
-  - [ ] No pre-installed oosh
-- [ ] 3.3 Create `ubuntu-24.04/Dockerfile`:
-  - [ ] FROM ubuntu:24.04
-  - [ ] Install git, bash, curl, sudo
-  - [ ] Create test user with sudo access
-  - [ ] Verify bash version
-- [ ] 3.4 Create `almalinux-9/Dockerfile`:
-  - [ ] FROM almalinux:9
-  - [ ] Install git, bash, curl, sudo
-  - [ ] Create test user with sudo access
-- [ ] 3.5 Create `alpine-3.19/Dockerfile` (if Alpine is in matrix):
-  - [ ] FROM alpine:3.19
-  - [ ] Install git, bash, curl, sudo
-  - [ ] Create test user
-- [ ] 3.6 Add additional platform Dockerfiles as per platform matrix
+### 3A: DockerWorkspaces Setup
 
-### 3B: Install Test Script
+Existing workspaces in `$ODOCKER_WORKSPACES`:
+- `nakedUbuntu/24.04` — exists, has SSH + test user
+- `nakedAlma/9.sshd` — exists, has SSH + test user
+- `nakedAlpine/3.13.2` — exists, but wrong version (need 3.19)
 
-- [ ] 3.7 Create `docker/install-test.sh` — the script that runs inside each container:
-  ```bash
-  #!/usr/bin/env bash
-  # Inputs: OOSH_BRANCH (branch to install from)
-  # Outputs: exit 0 on success, exit 1 on failure
+- [x] 3.1 Fix `ODOCKER_WORKSPACES` path:
+  - Created symlink `/var/dev` → `/home/hannesn/WODA.2023/_var_dev`
+  - Changed default in `odocker` to canonical `/var/dev/EAMD.ucp/.../DockerWorkspaces`
+  - Persisted via `config set ODOCKER_WORKSPACES` in `~/config/user.env`
+- [x] 3.2 Add missing workspaces to DockerWorkspaces:
+  - [x] `nakedDebian/12/Dockerfile` — Debian 12 with SSH + test user
+  - [x] `nakedAlpine/3.19/Dockerfile` — Alpine 3.19 with SSH + test user
+- [x] 3.3 Verify existing workspaces are minimal (oosh install handles dependencies):
+  - [x] `nakedUbuntu/24.04` — minimal, has SSH + sudo only. OK.
+  - [x] `nakedAlma/9.sshd` — minimal, has SSH + sudo + wget. OK.
+  - Decision: naked images stay minimal. oosh install must bootstrap everything.
+- [ ] 3.4 Build all platform images via `odocker build`:
+  - [ ] `odocker build nakedUbuntu/24.04`
+  - [ ] `odocker build nakedDebian/12`
+  - [ ] `odocker build nakedAlma/9.sshd`
+  - [ ] `odocker build nakedAlpine/3.19`
 
-  # 1. Clone the repo at the specified branch
-  # 2. Run the install process (oo install or init/oosh)
-  # 3. Verify oosh is functional (source this, basic method calls)
-  # 4. Run test.suite all 1
-  # 5. Report results
-  ```
-- [ ] 3.8 Test the script manually on each platform:
-  - [ ] Ubuntu
-  - [ ] AlmaLinux
-  - [ ] Alpine
-- [ ] 3.9 Create `docker/run-platform-test.sh` — host-side script that:
-  - [ ] Builds the Docker image for a given platform
-  - [ ] Runs the container with the install test
-  - [ ] Captures exit code and logs
-  - [ ] Cleans up the container
+### 3B: odocker + ossh Enhancements
 
-### 3C: macOS Testing (if in matrix)
+Before building the install test, `odocker` and `ossh` need methods that cover the full
+container lifecycle without raw commands. Analysis of existing manual workflow revealed gaps.
 
-- [ ] 3.10 Decide macOS test approach:
+- [x] 3.5 Add `odocker.reset <workspace_or_image>` method:
+  - Stops any container running on the SSH ports (8022 etc.)
+  - Removes the stopped container
+  - Clears stale SSH host key via `ossh known.hosts.remove`
+  - Starts fresh container via `odocker run.sshd`
+  - Reports new container name and SSH connection info
+  - Tab completion for workspace/image names
+  - Replaces the manual 4-line reset block
+- [x] 3.6 Add `ossh.known.hosts.remove <host> <?port>` method:
+  - Wraps `ssh-keygen -f ~/.ssh/known_hosts -R '[host]:port'`
+  - Called by `odocker.reset` automatically
+  - Defaults: host=localhost, port=8022
+  - Tab completion for hosts
+- [x] 3.7 Add `odocker.rebuild <workspace>` method:
+  - Removes old image via `odocker rmi`
+  - Rebuilds from Dockerfile via `odocker build`
+  - Convenience for update-and-rebuild workflow
+- [x] 3.8 Created `docs/odocker.md` with all methods, workflow examples, workspace naming convention
+- [x] 3.9 Updated `docs/wiki-index.md` with links to odocker, supported-platforms, and branching docs
+- [x] 3.9a Added tests for new methods to `test/test.odocker` (reset, rebuild, completions) — 37/37 pass
+- [x] 3.9b Added tests for new methods to `test/test.ossh` (known.hosts.remove, completion, graceful handling) — 15/15 pass
+
+### 3C: Install Test Script (oosh style)
+
+Uses `odocker reset` + `ossh install` workflow — treats containers like remote servers.
+
+- [ ] 3.10 Create oosh install test script (e.g., `oInstallTest`) with `source this`:
+  - Method: `oInstallTest.run <platform>`:
+    1. `odocker reset <platform_image>` — fresh container with SSH
+    2. `ossh config.create <platform> test@localhost:8022` — configure SSH
+    3. `ossh config.save.last` — persist SSH config
+    4. `ossh push.key <platform>` — push SSH key
+    5. `ossh install <platform> test` — install oosh via SSH
+    6. Verify: run `test.suite all 1` on the remote container
+    7. Capture results, stop container via `odocker stop` / `odocker rm`
+    8. Report pass/fail using `console.log` / `error.log`
+  - Method: `oInstallTest.run.all`:
+    - Reads platform matrix from `defaults/platforms.env` + `~/config/platforms.env`
+    - Runs install test on each platform sequentially
+    - Collects results, prints summary:
+      ```
+      Platform Install Test Results
+      ============================
+      ubuntu-24.04    PASS
+      almalinux-9     PASS
+      alpine-3.19     FAIL (see logs)
+      ```
+    - Exits 0 only if all must-pass platforms pass
+- [ ] 3.11 Add tab completion:
+  - `oInstallTest.run` completes platform names from matrix
+- [ ] 3.12 Test manually on each must-pass platform:
+  - [ ] Ubuntu 24.04
+  - [ ] Debian 12
+  - [ ] AlmaLinux 9
+  - [ ] Alpine 3.19
+
+### 3D: macOS Testing
+
+- [ ] 3.13 Decide macOS test approach:
   - Option A: Dedicated Mac host tested via `ossh`
   - Option B: GitHub Actions macOS runner
   - Option C: Manual testing checklist
   - **Decision:** ____________
-- [ ] 3.11 Implement chosen approach
-- [ ] 3.12 Document how to run macOS install test
-
-### 3D: Integration
-
-- [ ] 3.13 Create `docker/test-all-platforms.sh` that:
-  - [ ] Reads platform matrix from `defaults/platforms.env`, then overrides from `~/config/platforms.env`
-  - [ ] Runs install test on each platform
-  - [ ] Collects results into a summary
-  - [ ] Exits 0 only if ALL platforms pass
-  - [ ] Prints clear report:
-    ```
-    Platform Install Test Results
-    ============================
-    ubuntu-24.04    PASS
-    almalinux-9     PASS
-    alpine-3.19     FAIL (test.install failed, see logs/alpine-3.19.log)
-    ```
-- [ ] 3.14 Test the full pipeline end-to-end
+- [ ] 3.14 Implement chosen approach
+- [ ] 3.15 Document how to run macOS install test
 
 ### Done When
 
-- Can run a single command to test install on all supported Linux platforms
-- Each platform test starts clean, installs, and runs tests
+- `odocker reset <image>` replaces manual container reset workflow
+- `oInstallTest run <platform>` tests a single platform via `odocker` + `ossh`
+- `oInstallTest run.all` tests all must-pass platforms, reports results
+- All Docker operations go through `odocker`, all SSH through `ossh`
+- New methods documented in `docs/`
 - Results are clear and actionable
 
 ---
@@ -286,12 +304,12 @@ Create an oosh script that automates branch promotion through the pipeline, foll
   prod   8e16e6b  2026-03-06 (0 commits behind stage)
   ```
 - [ ] 4.4 Implement `<script>.platform.test <platform>`:
-  - Run install test on a single platform
-  - Uses infrastructure from Ticket 3
+  - Delegates to `oInstallTest run <platform>` (Ticket 3)
+  - Uses `odocker` for all container operations
   - Returns pass/fail
 - [ ] 4.5 Implement `<script>.platform.test.all`:
-  - Run install test on all platforms in the matrix
-  - Parallel execution where possible
+  - Delegates to `oInstallTest run.all` (Ticket 3)
+  - Reads platform matrix from `defaults/platforms.env` + `~/config/platforms.env`
   - Collect and display results
 - [ ] 4.6 Implement `<script>.promote.stage`:
   - Pre-check: current branch must be dev
@@ -465,8 +483,10 @@ Ticket 6 is a future enhancement.
 
 ## Notes
 
-- All scripts should follow oosh conventions: `source this`, method signatures with `#` comments, tab completion
-- The staging script should use `odocker` wrapper where applicable for Docker operations
-- Consider using `ossh` for remote platform testing (macOS, real hardware)
+- All scripts follow oosh conventions: `source this`, method signatures with `#` comments, tab completion
+- All Docker operations use `odocker` — never raw `docker` commands in oosh scripts
+- Dockerfiles live in `DockerWorkspaces` (EAMD convention), not in the oosh repo
+- Use `ossh` for remote platform testing (macOS, real hardware)
+- Use `config save/get/set` for persistent configuration (oosh config convention)
 - Keep install test logs for debugging failed promotions
 - The pipeline should be usable manually (CLI) even if CI is added later
