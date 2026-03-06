@@ -1390,17 +1390,24 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
       sid=$("$OOSH_DIR/claudeCode" session.probe "$pane_target" 2>/dev/null)
     fi
 
-    # Role from live discovery or registry
+    # Title from tmux
+    local title="${title_map[$pane_target]:-}"
+
+    # Role from live discovery → registry → title fallback
     local role
     role=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
     if [ -z "$role" ]; then
       role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
     fi
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      role="${title}"
+      role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"; role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
+      role="${role%%@*}"
+      role=$(echo "$role" | tr -d '[:space:]' | head -c 30)
+      [ -z "$role" ] && role="unknown"
+    fi
 
-    # Title from tmux
-    local title="${title_map[$pane_target]:-}"
-
-    echo "${sess}|${addr}|${role:-unknown}|${sid:-}|${title:-}" >> "$outfile"
+    echo "${sess}|${addr}|${role}|${sid:-}|${title:-}" >> "$outfile"
     count=$((count + 1))
   done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
 
@@ -1520,6 +1527,116 @@ hiveMind.team.activate() # <session> # set active team (alias for team.switch)
 }
 
 hiveMind.team.activate.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.consistency.audit() # <?session> # cross-compare all identity sources and show mismatches
+{
+  local filter_session="$1"
+
+  # Load registry file
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  # Load sessions.env (role|uuid)
+  local sess_file="${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env"
+
+  # Build pane TTY map
+  local -A tty_map title_map
+  while IFS='|' read -r pane_tty pane_ref pane_title; do
+    tty_map["$pane_tty"]="$pane_ref"
+    title_map["$pane_ref"]="$pane_title"
+  done < <(tmux list-panes -a -F "#{pane_tty}|#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" 2>/dev/null)
+
+  echo "Identity Consistency Audit"
+  printf '%.0s═' {1..85}; echo
+  printf "%-28s %-16s %-16s %-13s %-16s %s\n" "PANE" "TITLE" "REGISTRY" "SESS.ENV" "LIVE UUID" "MATCH"
+  printf '%.0s─' {1..85}; echo
+
+  local consistent=0 inconsistent=0
+  local -A seen_uuids
+
+  while read -r pid tty comm rest; do
+    [ -z "$pid" ] && continue
+    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
+    local tty_dev="/dev/$tty"
+    local pane_target="${tty_map[$tty_dev]:-}"
+    [ -z "$pane_target" ] && continue
+
+    # Filter by session
+    if [ -n "$filter_session" ] && [[ "$pane_target" != "${filter_session}:"* ]]; then
+      continue
+    fi
+
+    local title="${title_map[$pane_target]:-}"
+    local title_short="${title:0:14}"
+    [ ${#title} -gt 14 ] && title_short="${title_short}.."
+
+    # Registry role
+    local reg_role=""
+    [ -f "$reg" ] && reg_role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+    local reg_display="${reg_role:-MISSING}"
+
+    # Sessions.env UUID (look up by registry role or title-derived role)
+    local sess_uuid=""
+    local lookup_role="${reg_role}"
+    if [ -z "$lookup_role" ]; then
+      lookup_role="${title}"; lookup_role="${lookup_role#✳ }"; lookup_role="${lookup_role#⠐ }"
+      lookup_role="${lookup_role#⠂ }"; lookup_role="${lookup_role#✻ }"; lookup_role="${lookup_role#✢ }"; lookup_role="${lookup_role#✶ }"
+      lookup_role="${lookup_role%%@*}"; lookup_role=$(echo "$lookup_role" | tr -d '[:space:]')
+    fi
+    if [ -n "$lookup_role" ] && [ -f "$sess_file" ]; then
+      sess_uuid=$(grep "^${lookup_role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+    fi
+    local sess_short="${sess_uuid:0:8}"
+
+    # Live UUID from ps args → session.id
+    local live_uuid
+    live_uuid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$live_uuid" ]; then
+      live_uuid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+    fi
+    local live_short="${live_uuid:0:8}"
+
+    # Consistency checks
+    local issues=()
+    [ -z "$reg_role" ] && issues+=("no registry")
+    if [ -n "$reg_role" ] && [ -n "$title" ]; then
+      echo "$title" | grep -qi "$reg_role" 2>/dev/null || issues+=("title≠reg")
+    fi
+    if [ -n "$sess_uuid" ] && [ -n "$live_uuid" ] && [ "$sess_uuid" != "$live_uuid" ]; then
+      issues+=("UUID stale")
+    fi
+    if [ -n "$live_uuid" ]; then
+      if [ -n "${seen_uuids[$live_uuid]:-}" ]; then
+        issues+=("dup UUID")
+      fi
+      seen_uuids["$live_uuid"]="$pane_target"
+    fi
+    if [ -n "$reg_role" ]; then
+      [[ ${#reg_role} -gt 30 ]] && issues+=("role>30")
+      [[ "$reg_role" == *" "* ]] && issues+=("role has space")
+    fi
+
+    local match="✓"
+    local issue_str=""
+    if [ ${#issues[@]} -gt 0 ]; then
+      match="✗"
+      issue_str=$(IFS=', '; echo "${issues[*]}")
+      inconsistent=$((inconsistent + 1))
+    else
+      consistent=$((consistent + 1))
+    fi
+
+    printf "%-28s %-16s %-16s %-13s %-16s %s %s\n" \
+      "$pane_target" "$title_short" "$reg_display" "${sess_short:--}" "${live_short:--}" "$match" "$issue_str"
+
+  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+
+  printf '%.0s─' {1..85}; echo
+  echo "Summary: $consistent consistent, $inconsistent inconsistent"
+  return 0
+}
+
+hiveMind.consistency.audit.completion.session() {
   private.hiveMind.teams.complete
 }
 
@@ -4709,6 +4826,7 @@ hiveMind.usage()
       registry.set      set registry entry for a pane
       registry.remove   remove registry entry for a pane
       team.activate     set active team (alias for team.switch)
+      consistency.audit cross-compare all identity sources, show mismatches
   ─────────────────────────────────────────────────────
 
   Examples:
