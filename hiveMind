@@ -1326,9 +1326,12 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
       continue
     fi
 
-    # Extract UUID from args
+    # Extract UUID from --resume args (primary) or claudeCode session.id (fallback)
     local sid
     sid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$sid" ]; then
+      sid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+    fi
     local sid_short="${sid:0:8}${sid:+...}"
 
     # Get role
@@ -1344,6 +1347,173 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
 }
 
 hiveMind.process.list.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.teams.save() # # snapshot all Claude processes for restore after restart
+{
+  local config_path="${CONFIG_PATH:-$HOME/config}"
+  local outfile="${config_path}/hivemind.snapshot.$(date +%Y%m%dT%H%M%S).env"
+
+  # Build pane TTY map
+  local -A tty_map title_map
+  while IFS='|' read -r pane_tty pane_ref pane_title; do
+    tty_map["$pane_tty"]="$pane_ref"
+    title_map["$pane_ref"]="$pane_title"
+  done < <(tmux list-panes -a -F "#{pane_tty}|#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" 2>/dev/null)
+
+  local count=0
+  echo "# hiveMind snapshot $(date +%Y-%m-%dT%H:%M:%S)" > "$outfile"
+  echo "# session|address|role|uuid|title" >> "$outfile"
+
+  while read -r pid tty comm rest; do
+    [ -z "$pid" ] && continue
+    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
+    local tty_dev="/dev/$tty"
+    local pane_target="${tty_map[$tty_dev]:-}"
+    [ -z "$pane_target" ] && continue
+
+    # Parse pane target → session + address
+    local sess="${pane_target%%:*}"
+    local addr="${pane_target#*:}"
+
+    # UUID from --resume args or claudeCode session.id
+    local sid
+    sid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$sid" ]; then
+      sid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+    fi
+
+    # Role from live discovery or registry
+    local role
+    role=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
+    if [ -z "$role" ]; then
+      role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
+    fi
+
+    # Title from tmux
+    local title="${title_map[$pane_target]:-}"
+
+    echo "${sess}|${addr}|${role:-unknown}|${sid:-}|${title:-}" >> "$outfile"
+    count=$((count + 1))
+  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+
+  echo "Saved $count agents to $outfile"
+  cat "$outfile"
+  return 0
+}
+
+hiveMind.teams.restore() # <?snapshot_file> # restore teams from snapshot (dry-run by default)
+{
+  local snapfile="$1"
+  if [ -z "$snapfile" ]; then
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+  fi
+  if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
+    error.log "No snapshot found. Usage: hiveMind teams.restore <?file>"
+    return 1
+  fi
+
+  echo "Restoring from: $snapfile"
+  echo ""
+
+  local prev_sess=""
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$sess" ] && continue
+
+    # Create session if new
+    if [ "$sess" != "$prev_sess" ]; then
+      if ! tmux has-session -t "$sess" 2>/dev/null; then
+        echo "Creating session: $sess"
+        tmux new-session -d -s "$sess" -x 200 -y 50 2>/dev/null
+      fi
+      prev_sess="$sess"
+    fi
+
+    local pane_target="${sess}:${addr}"
+
+    # Ensure pane exists (split if needed)
+    if ! tmux display-message -t "$pane_target" -p "#{pane_id}" >/dev/null 2>&1; then
+      local win="${addr%%.*}"
+      # Create window if needed
+      if ! tmux display-message -t "${sess}:${win}" -p "#{window_id}" >/dev/null 2>&1; then
+        tmux new-window -t "${sess}" 2>/dev/null
+      fi
+      tmux split-window -t "${sess}:${win}" -h 2>/dev/null
+    fi
+
+    # Resume Claude if UUID available
+    if [ -n "$uuid" ]; then
+      echo "  ${pane_target}: resuming ${role:-unknown} (${uuid:0:8}...)"
+      tmux send-keys -t "$pane_target" "claude --resume $uuid" Enter 2>/dev/null
+    else
+      echo "  ${pane_target}: ${role:-unknown} (no UUID — start manually)"
+    fi
+
+    # Set pane title
+    if [ -n "$title" ]; then
+      tmux select-pane -t "$pane_target" -T "$title" 2>/dev/null
+    fi
+
+    # Update registry
+    if [ -n "$role" ] && [ "$role" != "unknown" ]; then
+      private.hiveMind.registry.set "$pane_target" "$role" 2>/dev/null
+    fi
+
+  done < "$snapfile"
+
+  echo ""
+  echo "Restore complete. Check with: hiveMind team.status"
+  return 0
+}
+
+hiveMind.teams.restore.completion.snapshot_file() {
+  ls "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null
+}
+
+hiveMind.registry.set() # <pane> <role> # set registry entry for a pane
+{
+  local target="$1" role="$2"
+  if [ -z "$target" ] || [ -z "$role" ]; then
+    error.log "Usage: hiveMind registry.set <pane> <role>"
+    return 1
+  fi
+  private.hiveMind.registry.set "$target" "$role"
+  echo "Registry: $target → $role"
+}
+
+hiveMind.registry.remove() # <pane> # remove registry entry for a pane
+{
+  local target="$1"
+  if [ -z "$target" ]; then
+    error.log "Usage: hiveMind registry.remove <pane>"
+    return 1
+  fi
+  local reg="$HIVEMIND_REGISTRY"
+  if [ -f "$reg" ] && grep -q "^${target}|" "$reg" 2>/dev/null; then
+    grep -v "^${target}|" "$reg" > "${reg}.tmp" && mv "${reg}.tmp" "$reg"
+    echo "Removed $target from registry"
+  else
+    error.log "No registry entry for $target"
+    return 1
+  fi
+}
+
+hiveMind.registry.set.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+hiveMind.registry.remove.completion.pane() {
+  [ -f "$HIVEMIND_REGISTRY" ] && cut -d'|' -f1 "$HIVEMIND_REGISTRY" 2>/dev/null
+}
+
+hiveMind.team.activate() # <session> # set active team (alias for team.switch)
+{
+  hiveMind.team.switch "$@"
+}
+
+hiveMind.team.activate.completion.session() {
   private.hiveMind.teams.complete
 }
 
@@ -4528,6 +4698,11 @@ hiveMind.usage()
       pane.create       create tmux pane for agent
       process.lookup    resolve Claude PID to pane, role, UUID
       process.list      list all Claude processes with pane mappings
+      teams.save        snapshot all agents for restore after restart
+      teams.restore     restore teams from snapshot file
+      registry.set      set registry entry for a pane
+      registry.remove   remove registry entry for a pane
+      team.activate     set active team (alias for team.switch)
   ─────────────────────────────────────────────────────
 
   Examples:
