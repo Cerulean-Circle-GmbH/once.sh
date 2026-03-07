@@ -167,11 +167,34 @@ claudeCode.list.json() # # output session list as JSON
   echo "]"
 }
 
-claudeCode.join() # <session> # resume a specific session by name or ID
+claudeCode.join() # <session> # resume a specific session by name or UUID
 {
   local session="$1"
   if [ -n "$session" ]; then
     shift
+    # If not a UUID, try sessions.env lookup by role name
+    if ! [[ "$session" =~ ^[0-9a-f]{8}-[0-9a-f]{4} ]]; then
+      local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+      local found_uuid
+      found_uuid=$(grep "^${session}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
+      if [ -n "$found_uuid" ]; then
+        session="$found_uuid"
+      fi
+    fi
+    # Update sessions file with the UUID being resumed
+    local pane_target
+    pane_target=$(tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+    if [ -n "$pane_target" ]; then
+      local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+      local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+      local role
+      role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | cut -d'|' -f2)
+      if [ -n "$role" ] && [ -n "$ses" ]; then
+        grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
+        mv "${ses}.tmp" "$ses"
+        echo "${role}|${session}" >> "$ses"
+      fi
+    fi
     "$CLAUDE_CMD" --resume "$session" "$@"
   else
     # No session specified, show picker
@@ -625,66 +648,57 @@ claudeCode.process.running() # <pane_target> # check if Claude Code is running i
   claudeCode.process.find "$1" > /dev/null 2>&1
 }
 
+claudeCode.session.probe() # <pane_target> # get current session UUID from /status (ground truth, slow ~3s)
+{
+  local target="$1"
+  [ -z "$target" ] && return 1
+
+  # Send /status, wait for TUI to render, capture, dismiss
+  otmux send "$target" "/status" Enter
+  sleep 3
+  local capture
+  capture=$(otmux pane.capture "$target" 40 2>/dev/null)
+  otmux send "$target" Escape
+
+  # Parse "Session ID: <uuid>"
+  local sid
+  sid=$(echo "$capture" | grep -oE 'Session ID: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+  [ -n "$sid" ] && echo "$sid" && return 0
+
+  return 1
+}
+claudeCode.session.probe.completion.pane_target() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
 claudeCode.session.id() # <pane_target> # get Claude Code session UUID for a tmux pane
 {
   local target="$1"
   [ -z "$target" ] && return 1
 
+  # Method 1 (FIRST): extract session UUID from process args — ground truth
+  # Matches: --resume <UUID>, claudeCode join <UUID>
   local claude_pid
   claude_pid=$(claudeCode.process.find "$target")
-  [ -z "$claude_pid" ] && return 1
-
-  # Method 1: extract --resume <UUID> from command line
-  local sid
-  sid=$(ps -p "$claude_pid" -o args= 2>/dev/null | grep -oE '\-\-resume [0-9a-f-]{36}' | awk '{print $2}')
-  [ -n "$sid" ] && echo "$sid" && return 0
-
-  # Method 2: extract from lsof — Claude keeps ~/.claude/tasks/<sessionId>/ open
-  sid=$(lsof -p "$claude_pid" 2>/dev/null | grep '\.claude/tasks/' | head -1 | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-  [ -n "$sid" ] && echo "$sid" && return 0
-
-  # Method 3: match pane title to JSONL custom-title (e.g. pane "oosh-expert" → "oosh-expert@sonnet")
-  local pane_title
-  pane_title=$(tmux display-message -t "$target" -p "#{pane_title}" 2>/dev/null)
-
-  local cwd
-  cwd=$(lsof -p "$claude_pid" 2>/dev/null | awk '/cwd/ {print $NF}')
-
-  if [ -n "$pane_title" ] && [ -n "$cwd" ]; then
-    local project_path
-    project_path=$(echo "$cwd" | sed 's/[^a-zA-Z0-9]/-/g')
-    local projects_dir="$HOME/.claude/projects/$project_path"
-
-    if [ -d "$projects_dir" ]; then
-      for jsonl_file in "$projects_dir"/*.jsonl; do
-        [ -f "$jsonl_file" ] || continue
-        local ct
-        ct=$(grep '"custom-title"' "$jsonl_file" 2>/dev/null | tail -1 | jq -r '.customTitle // empty' 2>/dev/null)
-        ct="${ct%%$'\n'*}"
-        if [ -n "$ct" ] && [[ "$ct" == "${pane_title}@"* ]]; then
-          sid=$(basename "$jsonl_file" .jsonl)
-          echo "$sid"
-          return 0
-        fi
-      done
-    fi
+  if [ -n "$claude_pid" ]; then
+    local sid
+    sid=$(ps -p "$claude_pid" -o args= 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    [ -n "$sid" ] && echo "$sid" && return 0
   fi
 
-  # Method 4: find most recent session file for the project (fallback, unreliable for multi-agent)
-  [ -z "$cwd" ] && return 1
-
-  local project_path
-  project_path=$(echo "$cwd" | sed 's/[^a-zA-Z0-9]/-/g')
-
-  local projects_dir="$HOME/.claude/projects/$project_path"
-  [ -d "$projects_dir" ] || return 1
-
-  local newest_file
-  newest_file=$(ls -t "$projects_dir"/*.jsonl 2>/dev/null | head -1)
-  [ -z "$newest_file" ] && return 1
-
-  sid=$(basename "$newest_file" .jsonl)
-  [ -n "$sid" ] && echo "$sid" && return 0
+  # Method 0 (FALLBACK): look up pane → role → session UUID from env config files
+  # Only reached when process has no --resume UUID (e.g. fresh claude without resume)
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  if [ -f "$reg" ] && [ -f "$ses" ]; then
+    local role
+    role=$(grep "^${target}|" "$reg" 2>/dev/null | cut -d'|' -f2)
+    if [ -n "$role" ]; then
+      local sid
+      sid=$(grep "^${role}|" "$ses" 2>/dev/null | tail -1 | cut -d'|' -f2)
+      [ -n "$sid" ] && echo "$sid" && return 0
+    fi
+  fi
 
   return 1
 }
@@ -1570,9 +1584,7 @@ claudeCode.start()
   source this
 
   if [ -z "$1" ]; then
-    # No arguments - start interactive claude
-
-    "$CLAUDE_CMD"
+    claudeCode.usage
     return 0
   fi
 
