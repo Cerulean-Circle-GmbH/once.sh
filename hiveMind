@@ -1640,6 +1640,142 @@ hiveMind.consistency.audit.completion.session() {
   private.hiveMind.teams.complete
 }
 
+hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from live truth
+{
+  local filter_session="$1"
+
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local sess_file="${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env"
+
+  # Ensure files exist
+  [ -f "$reg" ] || touch "$reg"
+  [ -f "$sess_file" ] || touch "$sess_file"
+
+  # Build pane TTY map
+  local -A tty_map title_map
+  while IFS='|' read -r pane_tty pane_ref pane_title; do
+    tty_map["$pane_tty"]="$pane_ref"
+    title_map["$pane_ref"]="$pane_title"
+  done < <(tmux list-panes -a -F "#{pane_tty}|#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" 2>/dev/null)
+
+  echo "Fixing identity consistency..."
+  echo
+
+  local fixed_reg=0 fixed_sess=0 skipped=0 dup_resolved=0
+  local -A seen_uuids role_for_uuid
+
+  while read -r pid tty comm rest; do
+    [ -z "$pid" ] && continue
+    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
+    local tty_dev="/dev/$tty"
+    local pane_target="${tty_map[$tty_dev]:-}"
+    [ -z "$pane_target" ] && continue
+
+    # Filter by session
+    if [ -n "$filter_session" ] && [[ "$pane_target" != "${filter_session}:"* ]]; then
+      continue
+    fi
+
+    # --- 1. Get LIVE UUID (ground truth) ---
+    local live_uuid
+    live_uuid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$live_uuid" ]; then
+      live_uuid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+    fi
+    if [ -z "$live_uuid" ]; then
+      live_uuid=$("$OOSH_DIR/claudeCode" session.probe "$pane_target" 2>/dev/null)
+    fi
+
+    # --- 2. Get role name (ground truth) ---
+    local role=""
+    # Try registry first
+    [ -f "$reg" ] && role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+
+    # Try pane title fallback
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      local title="${title_map[$pane_target]:-}"
+      role="${title}"
+      role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"
+      role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
+      role="${role%%@*}"
+      role=$(echo "$role" | tr -d '[:space:]' | head -c 30)
+    fi
+
+    # Try live.discover
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      local discover_result
+      discover_result=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
+      if [ -n "$discover_result" ]; then
+        role=$(echo "$discover_result" | cut -d'|' -f4)
+        role="${role%%@*}"
+      fi
+    fi
+
+    # Can't determine role — skip
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      printf "%-28s %-16s SKIPPED (can't determine role from title)\n" "$pane_target" "${title_map[$pane_target]:0:14}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    local line_parts=()
+
+    # --- 3a. Fix missing/stale registry ---
+    local existing_reg=""
+    existing_reg=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+    if [ -z "$existing_reg" ]; then
+      private.hiveMind.registry.set "$pane_target" "$role"
+      line_parts+=("registry.set ✓")
+      fixed_reg=$((fixed_reg + 1))
+    else
+      line_parts+=("registry ✓")
+    fi
+
+    # --- 3b. Fix sessions.env UUID ---
+    if [ -n "$live_uuid" ]; then
+      # Check for duplicate UUID
+      if [ -n "${seen_uuids[$live_uuid]:-}" ]; then
+        local dup_role="${role_for_uuid[$live_uuid]:-}"
+        echo "⚠ DUPLICATE UUID: $dup_role and $role both have ${live_uuid:0:8}"
+        dup_resolved=$((dup_resolved + 1))
+      fi
+      seen_uuids["$live_uuid"]="$pane_target"
+      role_for_uuid["$live_uuid"]="$role"
+
+      local old_uuid=""
+      old_uuid=$(grep "^${role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+      if [ -z "$old_uuid" ]; then
+        # Add new entry
+        echo "${role}|${live_uuid}" >> "$sess_file"
+        line_parts+=("sessions.env → ${live_uuid:0:8} ✓")
+        fixed_sess=$((fixed_sess + 1))
+      elif [ "$old_uuid" != "$live_uuid" ]; then
+        # Replace stale UUID
+        sed -i '' "s|^${role}|${old_uuid}$|${role}|${live_uuid}|" "$sess_file"
+        line_parts+=("sessions.env → ${live_uuid:0:8} ✓  (was ${old_uuid:0:8} STALE)")
+        fixed_sess=$((fixed_sess + 1))
+      else
+        line_parts+=("sessions.env ✓")
+      fi
+    else
+      line_parts+=("sessions.env — (no live UUID)")
+    fi
+
+    printf "%-28s %-16s %s\n" "$pane_target" "$role" "$(IFS='  '; echo "${line_parts[*]}")"
+
+  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+
+  echo
+  echo "Fixed: $fixed_reg registry entries, $fixed_sess session UUIDs, $dup_resolved duplicates flagged"
+  [ $skipped -gt 0 ] && echo "Skipped: $skipped (unknown role)"
+  echo "Run hiveMind consistency.audit to verify."
+  return 0
+}
+
+hiveMind.consistency.fix.completion.session() {
+  private.hiveMind.teams.complete
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # OOSH SPECIALIST AGENTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4827,6 +4963,7 @@ hiveMind.usage()
       registry.remove   remove registry entry for a pane
       team.activate     set active team (alias for team.switch)
       consistency.audit cross-compare all identity sources, show mismatches
+      consistency.fix  auto-repair identity mismatches from live truth
   ─────────────────────────────────────────────────────
 
   Examples:
