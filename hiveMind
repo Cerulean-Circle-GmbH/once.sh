@@ -100,6 +100,23 @@ private.hiveMind.pane.count() { # <target> # count panes in a window or session
   tmux list-panes -t "$1" ${2:+-s} 2>/dev/null | wc -l | tr -d ' '
 }
 
+private.hiveMind.claude.processes() { # # list Claude processes with pane targets: pid|tty|paneTarget|title|args
+  local -A ttyMap titleMap
+  while IFS='|' read -r paneTty paneRef paneTitle; do
+    ttyMap["$paneTty"]="$paneRef"
+    titleMap["$paneRef"]="$paneTitle"
+  done < <(private.hiveMind.list.panes tty+title)
+  while read -r pid tty comm rest; do
+    [ -z "$pid" ] && continue
+    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
+    local ttyDev="/dev/$tty"
+    local paneTarget="${ttyMap[$ttyDev]:-}"
+    [ -z "$paneTarget" ] && continue
+    local title="${titleMap[$paneTarget]:-}"
+    echo "${pid}|${tty}|${paneTarget}|${title}|${rest}"
+  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+}
+
 private.hiveMind.ensure.pane() { # <session:window.pane> # create session/window/pane if missing
   local target="$1"
   local sess="${target%%:*}"
@@ -1348,28 +1365,16 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
 {
   local session="$1"
 
-  # Build pane TTY map: tty → pane_target
-  local -A tty_map
-  while IFS=' ' read -r pane_tty pane_ref; do
-    tty_map["$pane_tty"]="$pane_ref"
-  done < <(private.hiveMind.list.panes tty)
-
   # Header
   printf "%-8s %-34s %-20s %s\n" "PID" "PANE" "ROLE" "SESSION UUID"
   printf "%-8s %-34s %-20s %s\n" "---" "----" "----" "------------"
 
-  # Find all Claude processes (skip bash wrappers — only show the actual claude binary)
   local found=0
-  while read -r pid tty comm rest; do
+  while IFS='|' read -r pid tty paneTarget title rest; do
     [ -z "$pid" ] && continue
-    # Only keep actual claude binary (skip bash wrappers, node MCP servers, etc.)
-    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
-    local tty_dev="/dev/$tty"
-    local pane_target="${tty_map[$tty_dev]:-}"
-    [ -z "$pane_target" ] && continue
 
     # Filter by session if specified
-    if [ -n "$session" ] && [[ "$pane_target" != "${session}:"* ]]; then
+    if [ -n "$session" ] && [[ "$paneTarget" != "${session}:"* ]]; then
       continue
     fi
 
@@ -1377,20 +1382,20 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
     local sid
     sid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
     if [ -z "$sid" ]; then
-      sid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+      sid=$("$OOSH_DIR/claudeCode" session.id "$paneTarget" 2>/dev/null)
     fi
     if [ -z "$sid" ]; then
-      sid=$("$OOSH_DIR/claudeCode" session.probe "$pane_target" 2>/dev/null)
+      sid=$("$OOSH_DIR/claudeCode" session.probe "$paneTarget" 2>/dev/null)
     fi
-    local sid_short="${sid:0:8}${sid:+...}"
+    local sidShort="${sid:0:8}${sid:+...}"
 
     # Get role
     local role
-    role=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
+    role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
 
-    printf "%-8s %-34s %-20s %s\n" "$pid" "$pane_target" "${role:--}" "${sid_short:--}"
+    printf "%-8s %-34s %-20s %s\n" "$pid" "$paneTarget" "${role:--}" "${sidShort:--}"
     found=$((found + 1))
-  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+  done < <(private.hiveMind.claude.processes)
 
   [ "$found" -eq 0 ] && echo "(no Claude processes found)"
   return 0
@@ -1402,49 +1407,35 @@ hiveMind.process.list.completion.session() {
 
 hiveMind.teams.save() # # snapshot all Claude processes for restore after restart
 {
-  local config_path="${CONFIG_PATH:-$HOME/config}"
-  local outfile="${config_path}/hivemind.snapshot.$(date +%Y%m%dT%H%M%S).env"
-
-  # Build pane TTY map
-  local -A tty_map title_map
-  while IFS='|' read -r pane_tty pane_ref pane_title; do
-    tty_map["$pane_tty"]="$pane_ref"
-    title_map["$pane_ref"]="$pane_title"
-  done < <(private.hiveMind.list.panes tty+title)
+  local configPath="${CONFIG_PATH:-$HOME/config}"
+  local outfile="${configPath}/hivemind.snapshot.$(date +%Y%m%dT%H%M%S).env"
 
   local count=0
   echo "# hiveMind snapshot $(date +%Y-%m-%dT%H:%M:%S)" > "$outfile"
   echo "# session|address|role|uuid|title" >> "$outfile"
 
-  while read -r pid tty comm rest; do
+  while IFS='|' read -r pid tty paneTarget title rest; do
     [ -z "$pid" ] && continue
-    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
-    local tty_dev="/dev/$tty"
-    local pane_target="${tty_map[$tty_dev]:-}"
-    [ -z "$pane_target" ] && continue
 
     # Parse pane target → session + address
-    local sess="${pane_target%%:*}"
-    local addr="${pane_target#*:}"
+    local sess="${paneTarget%%:*}"
+    local addr="${paneTarget#*:}"
 
     # UUID from --resume args → session.id → session.probe (last resort)
     local sid
     sid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
     if [ -z "$sid" ]; then
-      sid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+      sid=$("$OOSH_DIR/claudeCode" session.id "$paneTarget" 2>/dev/null)
     fi
     if [ -z "$sid" ]; then
-      sid=$("$OOSH_DIR/claudeCode" session.probe "$pane_target" 2>/dev/null)
+      sid=$("$OOSH_DIR/claudeCode" session.probe "$paneTarget" 2>/dev/null)
     fi
-
-    # Title from tmux
-    local title="${title_map[$pane_target]:-}"
 
     # Role from live discovery → registry → title fallback
     local role
-    role=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
+    role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
     if [ -z "$role" ]; then
-      role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
+      role=$(private.hiveMind.registry.get "$paneTarget" 2>/dev/null)
     fi
     if [ -z "$role" ] || [ "$role" = "unknown" ]; then
       role="${title}"
@@ -1456,7 +1447,7 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
 
     echo "${sess}|${addr}|${role}|${sid:-}|${title:-}" >> "$outfile"
     count=$((count + 1))
-  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+  done < <(private.hiveMind.claude.processes)
 
   # BUG-Q: Also include dead agents from registry+sessions.env
   local reg="$HIVEMIND_REGISTRY"
@@ -1471,7 +1462,7 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
       local dead_addr="${pane_target#*:}"
       local dead_uuid=""
       [ -f "$ses" ] && dead_uuid=$(grep "^${reg_role}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
-      local dead_title="${title_map[$pane_target]:-${reg_role}}"
+      local dead_title="${reg_role}"
       echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${dead_title} (dead)" >> "$outfile"
       dead_count=$((dead_count + 1))
     done < "$reg"
@@ -1703,13 +1694,6 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
   # Load sessions.env (role|uuid)
   local sess_file="$HIVEMIND_SESSIONS"
 
-  # Build pane TTY map
-  local -A tty_map title_map
-  while IFS='|' read -r pane_tty pane_ref pane_title; do
-    tty_map["$pane_tty"]="$pane_ref"
-    title_map["$pane_ref"]="$pane_title"
-  done < <(private.hiveMind.list.panes tty+title)
-
   echo -e "${BOLD_CYAN}Identity Consistency Audit${NORMAL}"
   echo -e "${GRAY}$(printf '%.0s═' {1..85})${NORMAL}"
   printf "${BOLD_WHITE}%-28s %-16s %-16s %-13s %-16s %s${NORMAL}\n" "PANE" "TITLE" "REGISTRY" "SESS.ENV" "LIVE UUID" "MATCH"
@@ -1718,19 +1702,14 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
   local consistent=0 inconsistent=0
   local -A seen_uuids
 
-  while read -r pid tty comm rest; do
+  while IFS='|' read -r pid tty pane_target title rest; do
     [ -z "$pid" ] && continue
-    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
-    local tty_dev="/dev/$tty"
-    local pane_target="${tty_map[$tty_dev]:-}"
-    [ -z "$pane_target" ] && continue
 
     # Filter by session
     if [ -n "$filter_session" ] && [[ "$pane_target" != "${filter_session}:"* ]]; then
       continue
     fi
 
-    local title="${title_map[$pane_target]:-}"
     local title_short="${title:0:14}"
     [ ${#title} -gt 14 ] && title_short="${title_short}.."
 
@@ -1793,7 +1772,7 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
     printf "%-28s %-16s %-16b %-13s %-16s %b %b\n" \
       "$pane_target" "$title_short" "$reg_display" "${sess_short:--}" "${live_short:--}" "$match" "$issue_str"
 
-  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+  done < <(private.hiveMind.claude.processes)
 
   echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
   echo -e "Summary: ${BOLD_GREEN}$consistent consistent${NORMAL}, ${BOLD_RED}$inconsistent inconsistent${NORMAL}"
@@ -1815,25 +1794,14 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
   [ -f "$reg" ] || touch "$reg"
   [ -f "$sess_file" ] || touch "$sess_file"
 
-  # Build pane TTY map
-  local -A tty_map title_map
-  while IFS='|' read -r pane_tty pane_ref pane_title; do
-    tty_map["$pane_tty"]="$pane_ref"
-    title_map["$pane_ref"]="$pane_title"
-  done < <(private.hiveMind.list.panes tty+title)
-
   echo -e "${BOLD_CYAN}Fixing identity consistency...${NORMAL}"
   echo
 
   local fixed_reg=0 fixed_sess=0 skipped=0 dup_resolved=0
   local -A seen_uuids role_for_uuid
 
-  while read -r pid tty comm rest; do
+  while IFS='|' read -r pid tty pane_target title rest; do
     [ -z "$pid" ] && continue
-    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
-    local tty_dev="/dev/$tty"
-    local pane_target="${tty_map[$tty_dev]:-}"
-    [ -z "$pane_target" ] && continue
 
     # Filter by session
     if [ -n "$filter_session" ] && [[ "$pane_target" != "${filter_session}:"* ]]; then
@@ -1857,7 +1825,6 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
 
     # Try pane title fallback
     if [ -z "$role" ] || [ "$role" = "unknown" ]; then
-      local title="${title_map[$pane_target]:-}"
       role="${title}"
       role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"
       role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
@@ -1877,7 +1844,7 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
 
     # Can't determine role — skip
     if [ -z "$role" ] || [ "$role" = "unknown" ]; then
-      printf "${BOLD_YELLOW}%-28s %-16s SKIPPED (can't determine role)${NORMAL}\n" "$pane_target" "${title_map[$pane_target]:0:14}"
+      printf "${BOLD_YELLOW}%-28s %-16s SKIPPED (can't determine role)${NORMAL}\n" "$pane_target" "${title:0:14}"
       skipped=$((skipped + 1))
       continue
     fi
@@ -1927,7 +1894,7 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
 
     printf "%-28s %-16s %b\n" "$pane_target" "$role" "$(IFS='  '; echo "${line_parts[*]}")"
 
-  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+  done < <(private.hiveMind.claude.processes)
 
   echo
   echo -e "Fixed: ${BOLD_GREEN}$fixed_reg${NORMAL} registry, ${BOLD_GREEN}$fixed_sess${NORMAL} sessions, ${BOLD_RED}$dup_resolved${NORMAL} duplicates"
