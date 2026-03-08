@@ -1449,6 +1449,13 @@ hiveMind.teams.restore() # <?snapshot_file> # restore teams from snapshot (dry-r
   echo "Restoring from: $snapfile"
   echo ""
 
+  # Ensure tmux server is running (BUG-Z1)
+  local RESTORE_CLEANUP_SESSION=""
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    "$OOSH_DIR/otmux" new __restore_init 2>/dev/null
+    RESTORE_CLEANUP_SESSION="__restore_init"
+  fi
+
   local prev_sess=""
   while IFS='|' read -r sess addr role uuid title; do
     [[ "$sess" == "#"* ]] && continue
@@ -1503,12 +1510,89 @@ hiveMind.teams.restore() # <?snapshot_file> # restore teams from snapshot (dry-r
 
   done < "$snapfile"
 
+  # Clean up init session if we created it
+  if [ -n "$RESTORE_CLEANUP_SESSION" ]; then
+    tmux kill-session -t "$RESTORE_CLEANUP_SESSION" 2>/dev/null
+  fi
+
   echo ""
   echo "Restore complete. Check with: hiveMind team.status"
   return 0
 }
 
 hiveMind.teams.restore.completion.snapshot_file() {
+  ls "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null
+}
+
+hiveMind.teams.migrate() # <ossh-host> <?snapshot_file> # migrate team to remote machine via ossh
+{
+  local host="$1"
+  local snapfile="$2"
+
+  if [ -z "$host" ]; then
+    error.log "Usage: hiveMind teams.migrate <ossh-host> <?snapshot_file>"
+    return 1
+  fi
+
+  # 1. Validate snapshot
+  if [ -z "$snapfile" ]; then
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+  fi
+  if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
+    echo "No snapshot found. Running teams.save first..."
+    hiveMind.teams.save
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+  fi
+  echo "Using snapshot: $snapfile"
+
+  # 2. Transfer config files
+  echo ""
+  echo "Transferring config to $host..."
+  "$OOSH_DIR/ossh" push.dir "$host" ~/config
+
+  # 3. Sync oosh code on remote
+  echo ""
+  echo "Syncing oosh on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "cd ~/oosh && git pull" 2>/dev/null || \
+    "$OOSH_DIR/ossh" push.dir "$host" "$OOSH_DIR"
+
+  # 4. Check prerequisites on remote
+  echo ""
+  echo "Checking prerequisites on $host..."
+  local missing=""
+  missing=$("$OOSH_DIR/ossh" exec "$host" '
+    errors=""
+    command -v tmux >/dev/null 2>&1 || { test -x /opt/homebrew/bin/tmux && export PATH=/opt/homebrew/bin:$PATH; } || errors="${errors}tmux "
+    command -v claude >/dev/null 2>&1 || test -x ~/.local/bin/claude || errors="${errors}claude "
+    echo "$errors"
+  ' 2>/dev/null)
+  if [ -n "$missing" ]; then
+    error.log "Missing on $host: $missing"
+    return 1
+  fi
+  echo "Prerequisites OK"
+
+  # 5. Ensure tmux server running + restore on remote
+  echo ""
+  echo "Running teams.restore on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore"
+
+  # 6. Verify
+  echo ""
+  echo "Verifying on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind team.status" 2>/dev/null
+
+  echo ""
+  echo "Migration to $host complete."
+  echo "Connect with: ossh login $host"
+  return 0
+}
+
+hiveMind.teams.migrate.completion.ossh_host() {
+  "$OOSH_DIR/ossh" config.get.completion 2>/dev/null
+}
+
+hiveMind.teams.migrate.completion.snapshot_file() {
   ls "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null
 }
 
@@ -4986,6 +5070,7 @@ hiveMind.usage()
       process.list      list all Claude processes with pane mappings
       teams.save        snapshot all agents for restore after restart
       teams.restore     restore teams from snapshot file
+      teams.migrate     migrate team to remote machine via ossh
       registry.set      set registry entry for a pane
       registry.remove   remove registry entry for a pane
       team.activate     set active team (alias for team.switch)
