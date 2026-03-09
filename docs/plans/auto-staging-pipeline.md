@@ -273,6 +273,8 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
   - Added `TEST_CATEGORY=core` and missing `test.suite.save.results`
   - All 15 assertions pass, `test.suite core 1` passes (223/223 + 1 intentional meta-test)
 - [ ] 3.14 Test manually on each must-pass platform:
+  - Prerequisite fixes applied: odocker snake_case→camelCase, port-passing bug fixed, os uses root SSH
+  - Dockerfile changes deferred (user will handle separately)
   - [ ] Ubuntu 24.04
   - [ ] Debian 12
   - [ ] AlmaLinux 9
