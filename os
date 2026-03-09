@@ -32,11 +32,11 @@ private.os.platform.parse() {
   fi
   # Parse from edges inward: workspace:...:pm:tier
   PLATFORM_TIER="${value##*:}"
-  local without_tier="${value%:*}"
-  PLATFORM_PM="${without_tier##*:}"
-  local without_pm="${without_tier%:*}"
-  PLATFORM_WORKSPACE="${without_pm%%:*}"
-  PLATFORM_BASE_IMAGE="${without_pm#*:}"
+  local withoutTier="${value%:*}"
+  PLATFORM_PM="${withoutTier##*:}"
+  local withoutPm="${withoutTier%:*}"
+  PLATFORM_WORKSPACE="${withoutPm%%:*}"
+  PLATFORM_BASE_IMAGE="${withoutPm#*:}"
 }
 
 private.os.platform.image.from.workspace() {
@@ -45,15 +45,15 @@ private.os.platform.image.from.workspace() {
 
 private.os.platform.cleanup() {
   local port="$1"
-  local container_id
-  container_id=$(docker ps -q --filter "publish=$port" 2>/dev/null)
-  if [ -n "$container_id" ]; then
-    docker stop "$container_id" 2>/dev/null
-    docker rm "$container_id" 2>/dev/null
+  local containerId
+  containerId=$(docker ps -q --filter "publish=$port" 2>/dev/null)
+  if [ -n "$containerId" ]; then
+    docker stop "$containerId" 2>/dev/null
+    docker rm "$containerId" 2>/dev/null
   fi
-  container_id=$(docker ps -aq --filter "publish=$port" 2>/dev/null)
-  if [ -n "$container_id" ]; then
-    docker rm "$container_id" 2>/dev/null
+  containerId=$(docker ps -aq --filter "publish=$port" 2>/dev/null)
+  if [ -n "$containerId" ]; then
+    docker rm "$containerId" 2>/dev/null
   fi
 }
 
@@ -89,18 +89,18 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
     return 1
   fi
 
-  local image_tag ssh_port rc
-  image_tag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
-  ssh_port=8022
+  local imageTag sshPort rc
+  imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
+  sshPort=8022
 
-  console.log "Testing platform: $platform (image: $image_tag)"
+  console.log "Testing platform: $platform (image: $imageTag)"
 
   # Fresh container
-  odocker reset "$image_tag" "$ssh_port"
+  odocker reset "$imageTag" "$sshPort"
   sleep 2
 
   # SSH setup
-  ossh config.create "$platform" "test@localhost:$ssh_port"
+  ossh config.create "$platform" "test@localhost:$sshPort"
   ossh config.save.last
   ossh push.key "$platform"
 
@@ -112,7 +112,7 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   rc=$?
 
   # Cleanup
-  private.os.platform.cleanup "$ssh_port"
+  private.os.platform.cleanup "$sshPort"
 
   if [ $rc -eq 0 ]; then
     console.log "PASS: $platform"
