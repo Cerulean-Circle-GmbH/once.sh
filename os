@@ -107,19 +107,28 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   # Install oosh
   ossh install "$platform" test
 
-  # Run tests
+  # Run tests as root (needs -tt for sudo TTY)
+  console.log "Running core tests as root..."
+  ssh -tt -o StrictHostKeyChecking=accept-new "$platform" \
+    "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'"
+  local rcRoot=$?
+
+  # Run tests as test user
+  console.log "Running core tests as user test..."
   ossh exec "$platform" "test.suite core 1"
-  rc=$?
+  local rcUser=$?
 
   # Cleanup
   private.os.platform.cleanup "$sshPort"
 
-  if [ $rc -eq 0 ]; then
-    console.log "PASS: $platform"
+  if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
+    console.log "PASS: $platform (root=$rcRoot, user=$rcUser)"
     create.result 0 "PASS"
+    rc=0
   else
-    error.log "FAIL: $platform (exit $rc)"
+    error.log "FAIL: $platform (root=$rcRoot, user=$rcUser)"
     create.result 1 "FAIL"
+    rc=1
   fi
   return $rc
 }
