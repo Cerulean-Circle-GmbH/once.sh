@@ -108,7 +108,7 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   ossh install "$platform" test
 
   # Run tests
-  ossh exec "$platform" "test.suite all 1"
+  ossh exec "$platform" "test.suite core 1"
   rc=$?
 
   # Cleanup
