@@ -218,17 +218,27 @@ container lifecycle without raw commands. Analysis of existing manual workflow r
   - Image name derivation verified for all must-pass platforms
   - Workspace completion now fails (not silently passes) when workspaces are missing
 
-### 3C: Platform Install Test Methods in `oo`
+### 3C: Platform Install Test Methods in `os`
 
-**Design decision:** No separate `oInstallTest` script. Platform testing belongs in `oo` —
-the framework lifecycle manager. `oo` already handles create, update, commit, release.
-Testing platforms before release is a lifecycle concern.
+**Design decision:** Platform testing belongs in `os` — the OS/platform script. `os` already
+exists with OS detection methods (`os.check`, `os.check.env`, `os.info`). Platform testing
+extends this existing responsibility. The oosh philosophy is "a script can call a script" —
+each script is a class with single responsibility. OS/platform concerns live in `os`, not
+in `oo` (the lifecycle manager). Existing patterns confirm this: `ossh` sources `os` for
+OS-specific method resolution, `user` calls `os.check` for platform-specific getters.
+
+The delegation chain: `oo promote.stage` → `os platform.test.all` → `odocker` + `ossh`
+(all via CLI calls, the script-calls-script pattern).
 
 Uses `odocker reset` + `ossh install` workflow — treats containers like remote servers.
 
-- [ ] 3.10 Add `oo.platform.test <platform>` method to `oo`:
+- [ ] 3.10 Add `os.platform.test <platform>` method to `os`:
   - Reads platform config from `defaults/platforms.env` + `~/config/platforms.env`
   - Resolves platform name to Docker image and workspace
+  - Private helpers:
+    - `private.os.platform.load` — loads platform config (defaults + overrides)
+    - `private.os.platform.parse` — parses `PLATFORM_*` env vars into fields
+    - `private.os.platform.names` — returns list of platform names
   - Steps:
     1. `odocker reset <image>` — fresh container with SSH
     2. `ossh config.create <platform> test@localhost:8022` — configure SSH
@@ -238,10 +248,10 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
     6. `ossh exec <platform> "test.suite all 1"` — run tests remotely
     7. Capture results, `odocker stop` / `odocker rm` — cleanup
     8. Report pass/fail using `console.log` / `error.log`
-  - Completion: `oo.platform.test.completion.platform()` — lists platform names from matrix
-- [ ] 3.11 Add `oo.platform.test.all` method to `oo`:
+  - Completion: `os.platform.test.completion.platform()` — lists platform names from matrix
+- [ ] 3.11 Add `os.platform.test.all` method to `os`:
   - Reads platform matrix from `defaults/platforms.env` + `~/config/platforms.env`
-  - Runs `oo.platform.test` on each platform sequentially
+  - Runs `os.platform.test` on each platform sequentially
   - Collects results, prints summary:
     ```
     Platform Install Test Results
@@ -251,9 +261,15 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
     alpine_3_19     FAIL (see logs)
     ```
   - Exits 0 only if all must-pass platforms pass
-- [ ] 3.12 Add `oo.platform.list` method to `oo`:
+- [ ] 3.12 Add `os.platform.list` method to `os`:
   - Reads platform matrix, displays with tier (must-pass / best-effort)
-- [ ] 3.13 Test manually on each must-pass platform:
+- [ ] 3.13 Add platform tests to `test/test.os`:
+  - Test `os.platform.list` output
+  - Test `os.platform.test` argument handling
+  - Test `private.os.platform.load` config loading
+  - Test `private.os.platform.parse` field extraction
+  - Test `private.os.platform.names` name listing
+- [ ] 3.14 Test manually on each must-pass platform:
   - [ ] Ubuntu 24.04
   - [ ] Debian 12
   - [ ] AlmaLinux 9
@@ -261,21 +277,22 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
 
 ### 3D: macOS Testing
 
-- [ ] 3.14 Decide macOS test approach:
+- [ ] 3.15 Decide macOS test approach:
   - Option A: Dedicated Mac host tested via `ossh`
   - Option B: GitHub Actions macOS runner
   - Option C: Manual testing checklist
   - **Decision:** ____________
-- [ ] 3.15 Implement chosen approach
-- [ ] 3.16 Document how to run macOS install test
+- [ ] 3.16 Implement chosen approach
+- [ ] 3.17 Document how to run macOS install test
 
 ### Done When
 
 - `odocker reset <image>` replaces manual container reset workflow
-- `oo platform.test <platform>` tests a single platform via `odocker` + `ossh`
-- `oo platform.test.all` tests all must-pass platforms, reports results
+- `os platform.test <platform>` tests a single platform via `odocker` + `ossh`
+- `os platform.test.all` tests all must-pass platforms, reports results
 - All Docker operations go through `odocker`, all SSH through `ossh`
 - Methods follow oosh conventions: signatures, completion, help
+- Platform tests in `test/test.os`
 - Results are clear and actionable
 
 ---
@@ -299,6 +316,8 @@ state machine. No new script — `oo` already owns create, update, commit, relea
   - ~~Option C: `oStage` (new standalone script)~~
   - **Decision:** Option B. `oo` is the lifecycle manager. Release/promote is lifecycle.
     The existing `oo.release` and `oo.stage.to.prod` are already in `oo`.
+    Platform methods live in `os` (the OS/platform script), promote methods in `oo`.
+    `oo` delegates to `os` for platform testing via CLI (script-calls-script pattern).
 
 ### PROMOTE State Machine Design
 
@@ -391,7 +410,7 @@ oo promote.stage reset
   - `private.check.target.checked` — validate source branch, return branch state ID
   - `private.check.uncommitted.checked` — `git status --porcelain` is empty
   - `private.check.test.suite.passed` — run `test.suite all 1`, gate on result
-  - `private.check.platform.tests.passed` — run `oo.platform.test.all`, gate on result
+  - `private.check.platform.tests.passed` — run `os platform.test.all` (delegates to `os`), gate on result
   - `private.check.confirmation.received` — show diff stats, prompt yes/no
   - `private.check.merged.to.stage` — `git checkout stage && git merge dev`
   - `private.check.stage.tagged` — `git tag stage-$(date +%Y-%m-%d)`
@@ -437,36 +456,43 @@ oo promote.stage reset
   - Show last test run results per platform
   - Show promotion history (from git tags)
 
-### Implementation: Platform Management Methods
+### Implementation: Platform Management Methods (in `os`)
 
-- [ ] 4.10a Add `oo.platform.list`:
+Platform management is an OS concern — these methods live in `os`, not `oo`.
+
+- [ ] 4.10a Add `os.platform.list`:
   - Show all platforms with their tier (must-pass / best-effort)
-- [ ] 4.10b Add `oo.platform.tier <platform> <tier>`:
+- [ ] 4.10b Add `os.platform.tier <platform> <tier>`:
   - Move a platform between tiers (must-pass / best-effort)
   - Updates via `config save platforms PLATFORM` → `~/config/platforms.env`
-- [ ] 4.10c Add `oo.platform.add <name> <dockerImage> <packageManager> <tier>`:
+- [ ] 4.10c Add `os.platform.add <name> <dockerImage> <packageManager> <tier>`:
   - Add a new platform to the matrix
-- [ ] 4.10d Add `oo.platform.remove <platform>`:
+- [ ] 4.10d Add `os.platform.remove <platform>`:
   - Remove a platform from the matrix
 
 ### Implementation: Completion and Help
 
 - [ ] 4.11 Add tab completion for all new methods:
-  - `oo.promote.stage.completion` — no params (or `reset`)
-  - `oo.promote.prod.completion` — no params (or `reset`)
-  - `oo.platform.test.completion.platform` — platform names from matrix
-  - `oo.platform.tier.completion.platform` — platform names
-  - `oo.platform.tier.completion.tier` — `must-pass` / `best-effort`
+  - In `oo`: `oo.promote.stage.completion` — no params (or `reset`)
+  - In `oo`: `oo.promote.prod.completion` — no params (or `reset`)
+  - In `os`: `os.platform.test.completion.platform` — platform names from matrix
+  - In `os`: `os.platform.tier.completion.platform` — platform names
+  - In `os`: `os.platform.tier.completion.tier` — `must-pass` / `best-effort`
 - [ ] 4.12 All methods have `# <param> # description` doc comments
 
 ### Testing
 
-- [ ] 4.13 Add promote/platform tests to `test/test.oo`:
-  - Test `oo.promote.status` output
-  - Test `oo.platform.list` output
-  - Test PROMOTE state machine creation
-  - Test `private.check.*` functions individually
-  - Test merge logic using temp branches (isolated)
+- [ ] 4.13 Add tests:
+  - In `test/test.os` — platform tests:
+    - Test `os.platform.list` output
+    - Test `os.platform.test` argument handling
+    - Test `os.platform.tier` tier changes
+    - Test `os.platform.add` / `os.platform.remove`
+  - In `test/test.oo` — promote/state tests:
+    - Test `oo.promote.status` output
+    - Test PROMOTE state machine creation
+    - Test `private.check.*` functions individually
+    - Test merge logic using temp branches (isolated)
 - [ ] 4.14 Run full `test.suite all 1` including new tests
 
 ### Done When
@@ -475,9 +501,11 @@ oo promote.stage reset
 - `oo promote.prod` promotes stage → prod, gated by verification
 - PROMOTE state machine tracks progress and enables resume after failure
 - `oo promote.status` shows pipeline state and branch diffs
-- `oo platform.test <platform>` tests a single platform end-to-end
-- `oo platform.list` shows platform matrix
+- `os platform.test <platform>` tests a single platform end-to-end
+- `os platform.list` shows platform matrix with tiers
+- `os platform.tier/add/remove` manage the platform matrix
 - All methods have tab completion and help text
+- Platform tests in `test/test.os`, promote/state tests in `test/test.oo`
 - Existing `oo release` and `oo stage.to.prod` updated as wrappers
 
 ---
@@ -497,13 +525,13 @@ Get the prod branch up to date with dev for the first time. This validates the e
 - [ ] 5.1 Run `test.suite all 1` on dev — fix any failures
   - Current test count: ~305 assertions
   - All must pass
-- [ ] 5.2 Run `oo platform.test` on each platform — fix any failures:
+- [ ] 5.2 Run `os platform.test` on each platform — fix any failures:
   - [ ] Ubuntu 24.04
   - [ ] Debian 12
   - [ ] AlmaLinux 9
   - [ ] Alpine 3.19
 - [ ] 5.3 Fix any install issues discovered during platform testing
-- [ ] 5.4 Re-run `oo platform.test.all` after fixes
+- [ ] 5.4 Re-run `os platform.test.all` after fixes
 
 ### Promotion
 
@@ -588,7 +616,9 @@ Ticket 6 is a future enhancement.
 
 ## Notes
 
-- All methods live in `oo` — the framework lifecycle manager. No separate scripts.
+- Platform methods live in `os` — the OS/platform script. `oo` delegates to `os` for platform testing (script-calls-script pattern).
+- The `os` script already provides OS detection (`os.check`, `os.check.env`) — platform testing extends this existing responsibility
+- Promote/lifecycle methods live in `oo` — the framework lifecycle manager
 - All methods follow oosh conventions: `source this`, method signatures with `#` comments, tab completion
 - All Docker operations use `odocker` — never raw `docker` commands
 - All SSH operations use `ossh` — never raw `ssh` commands
