@@ -11,17 +11,17 @@
 # PLATFORM CONFIG HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-private.os.platform.load() {
+private.os.platform.load() { # # loads platform config from defaults and user overrides
   source "$OOSH_DIR/defaults/platforms.env"
   [ -f "$HOME/config/platforms.env" ] && source "$HOME/config/platforms.env"
 }
 
-private.os.platform.names() {
+private.os.platform.names() { # # returns sorted list of platform names
   private.os.platform.load
   env | grep '^PLATFORM_' | sed 's/^PLATFORM_//' | cut -d= -f1 | sort
 }
 
-private.os.platform.parse() {
+private.os.platform.parse() { # <platform> # parses platform config into PLATFORM_* variables
   local platform="$1"
   local varname="PLATFORM_${platform}"
   private.os.platform.load
@@ -39,11 +39,11 @@ private.os.platform.parse() {
   PLATFORM_BASE_IMAGE="${withoutPm#*:}"
 }
 
-private.os.platform.image.from.workspace() {
+private.os.platform.image.from.workspace() { # <workspace> # converts workspace path to Docker image tag
   echo "$1" | sed 's/\([a-z]\)\([A-Z]\)/\1_\2/g' | tr '[:upper:]/' '[:lower:]_' | tr '.' '_'
 }
 
-private.os.platform.cleanup() {
+private.os.platform.cleanup() { # <port> # stops and removes Docker container on given port
   local port="$1"
   local containerId
   containerId=$(docker ps -q --filter "publish=$port" 2>/dev/null)
@@ -114,8 +114,7 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
 
   # Run tests as root (needs -tt for sudo TTY)
   console.log "Running core tests as root..."
-  ssh -tt -o StrictHostKeyChecking=accept-new "$platform" \
-    "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'"
+  ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'"
   local rcRoot=$?
 
   # Cleanup
