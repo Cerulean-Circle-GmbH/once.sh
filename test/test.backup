@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+# Comprehensive tests for the backup script
+# Tests: config.create, config.save, config.register, config.unregister,
+#        config.discover, config.list.all, run, verify.sync,
+#        normalize.filename, normalize.file, normalize.revert
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+source backup
+
+log.level $level
+
+# ============================================================================
+# Test setup — isolated directories
+# ============================================================================
+TEST_SOURCE="$OOSH_DIR/test/test.data/test.backup.source"
+TEST_TARGET="$OOSH_DIR/test/test.data/test.backup.target"
+
+# Save original state
+ORIGINAL_BACKUP_SOURCE="$BACKUP_SOURCE"
+ORIGINAL_BACKUP_TARGET="$BACKUP_TARGET"
+ORIGINAL_BACKUP_STRATEGY="$BACKUP_STRATEGY"
+ORIGINAL_BACKUP_CAPTURE_LOG_MODE="$BACKUP_CAPTURE_LOG_MODE"
+ORIGINAL_DIR="$(pwd)"
+
+cleanupTestBackup() {
+  # Restore original backup config
+  export BACKUP_SOURCE="$ORIGINAL_BACKUP_SOURCE"
+  export BACKUP_TARGET="$ORIGINAL_BACKUP_TARGET"
+  export BACKUP_STRATEGY="$ORIGINAL_BACKUP_STRATEGY"
+  export BACKUP_CAPTURE_LOG_MODE="$ORIGINAL_BACKUP_CAPTURE_LOG_MODE"
+
+  # Clean test artifacts
+  rm -f "$TEST_SOURCE/.backup.env" 2>/dev/null
+  rm -rf "$TEST_TARGET"/* "$TEST_TARGET"/.backup.env 2>/dev/null
+
+  # Unregister test config from tracking dir
+  local link linkTarget
+  for link in "$BACKUP_CONFIGS_DIR"/*; do
+    if [ -L "$link" ]; then
+      linkTarget=$(readlink "$link")
+      if [[ "$linkTarget" == *"test.backup.source"* ]]; then
+        rm "$link" 2>/dev/null
+      fi
+    fi
+  done
+
+  # Restore working directory
+  cd "$ORIGINAL_DIR"
+}
+
+setupTestBackup() {
+  cleanupTestBackup
+
+  # Ensure test dirs exist with content
+  mkdir -p "$TEST_SOURCE/subdir1" "$TEST_SOURCE/subdir2" "$TEST_TARGET"
+  echo "file1 content" > "$TEST_SOURCE/file1.txt"
+  echo "file2 content" > "$TEST_SOURCE/file2.txt"
+  echo "sub1 file" > "$TEST_SOURCE/subdir1/nested1.txt"
+  echo "sub2 file" > "$TEST_SOURCE/subdir2/nested2.txt"
+
+  cd "$TEST_SOURCE"
+}
+
+setupTestBackup
+
+# ============================================================================
+# T1: config.create with local target — BACKUP_TARGET should be exact path
+# ============================================================================
+test.case - "T1: config.create with local target sets correct BACKUP_TARGET" \
+  backup.config.create "$TEST_TARGET"
+
+if [ "$BACKUP_TARGET" = "$TEST_TARGET" ]; then
+  create.result 0 "target correct"
+else
+  create.result 1 "got: $BACKUP_TARGET expected: $TEST_TARGET"
+fi
+expect 0 "target correct" "config.create local target = exact path given"
+
+cleanupTestBackup
+setupTestBackup
+
+# ============================================================================
+# T2: config.create with remote target — concatenation is correct
+# ============================================================================
+test.case - "T2: config.create with remote target appends pwd" \
+  backup.config.create "user@host:/remote/base"
+
+expectedRemote="user@host:/remote/base$TEST_SOURCE"
+if [ "$BACKUP_TARGET" = "$expectedRemote" ]; then
+  create.result 0 "remote target correct"
+else
+  create.result 1 "got: $BACKUP_TARGET expected: $expectedRemote"
+fi
+expect 0 "remote target correct" "config.create remote target appends pwd"
+
+cleanupTestBackup
+setupTestBackup
+
+# ============================================================================
+# T3: config.save creates .backup.env with correct variables
+# ============================================================================
+export BACKUP_SOURCE="$TEST_SOURCE"
+export BACKUP_TARGET="$TEST_TARGET"
+export BACKUP_STRATEGY="full"
+export BACKUP_CAPTURE_LOG_MODE="full"
+
+test.case - "T3: config.save creates .backup.env" \
+  backup.config.save local
+
+if [ -f "$TEST_SOURCE/.backup.env" ]; then
+  create.result 0 "config file created"
+else
+  create.result 1 "config file missing"
+fi
+expect 0 "config file created" "config.save creates local .backup.env"
+
+# ============================================================================
+# T4: config.save writes correct BACKUP_TARGET
+# ============================================================================
+test.case - "T4: .backup.env contains correct BACKUP_TARGET" \
+  echo "checking .backup.env content"
+
+savedTarget=$(grep 'BACKUP_TARGET=' "$TEST_SOURCE/.backup.env" | cut -d'"' -f2)
+if [ "$savedTarget" = "$TEST_TARGET" ]; then
+  create.result 0 "target saved correctly"
+else
+  create.result 1 "saved: $savedTarget expected: $TEST_TARGET"
+fi
+expect 0 "target saved correctly" ".backup.env has correct BACKUP_TARGET"
+
+# ============================================================================
+# T5: config.register creates symlink in tracking dir
+# ============================================================================
+test.case - "T5: config.register creates symlink" \
+  backup.config.register "$TEST_SOURCE/.backup.env"
+
+found=0
+for link in "$BACKUP_CONFIGS_DIR"/*; do
+  if [ -L "$link" ]; then
+    linkTarget=$(readlink "$link")
+    if [ "$linkTarget" = "$TEST_SOURCE/.backup.env" ]; then
+      found=1
+      break
+    fi
+  fi
+done
+if [ "$found" -eq 1 ]; then
+  create.result 0 "symlink registered"
+else
+  create.result 1 "symlink not found in $BACKUP_CONFIGS_DIR"
+fi
+expect 0 "symlink registered" "config.register creates symlink in tracking dir"
+
+# ============================================================================
+# T6: config.unregister removes symlink
+# ============================================================================
+test.case - "T6: config.unregister removes symlink" \
+  backup.config.unregister "$TEST_SOURCE/.backup.env"
+
+stillFound=0
+for link in "$BACKUP_CONFIGS_DIR"/*; do
+  if [ -L "$link" ]; then
+    linkTarget=$(readlink "$link")
+    if [ "$linkTarget" = "$TEST_SOURCE/.backup.env" ]; then
+      stillFound=1
+      break
+    fi
+  fi
+done
+if [ "$stillFound" -eq 0 ]; then
+  create.result 0 "symlink removed"
+else
+  create.result 1 "symlink still exists"
+fi
+expect 0 "symlink removed" "config.unregister removes symlink from tracking dir"
+
+# ============================================================================
+# T7: config.discover finds .backup.env walking upward
+# ============================================================================
+# Re-create config for discover test
+export BACKUP_SOURCE="$TEST_SOURCE"
+export BACKUP_TARGET="$TEST_TARGET"
+backup.config.save local 2>/dev/null
+
+test.case - "T7: config.discover finds .backup.env" \
+  backup.config.discover
+
+if [[ "$RESULT" == *"test.backup.source/.backup.env"* ]]; then
+  create.result 0 "discovered"
+else
+  create.result 1 "got: $RESULT"
+fi
+expect 0 "discovered" "config.discover finds .backup.env walking upward"
+
+# ============================================================================
+# T8: backup.run syncs files to local target
+# ============================================================================
+export BACKUP_SOURCE="$TEST_SOURCE"
+export BACKUP_TARGET="$TEST_TARGET"
+
+test.case - "T8: backup.run syncs files to target" \
+  backup.run
+
+if [ -f "$TEST_TARGET/file1.txt" ] && [ -f "$TEST_TARGET/subdir1/nested1.txt" ]; then
+  create.result 0 "files synced"
+else
+  create.result 1 "files missing in target"
+fi
+expect 0 "files synced" "backup.run copies source files to local target"
+
+# ============================================================================
+# T9: backup.run excludes .backup.env from target
+# ============================================================================
+test.case - "T9: backup.run does NOT sync .backup.env to target" \
+  echo "checking target for .backup.env"
+
+if [ ! -f "$TEST_TARGET/.backup.env" ]; then
+  create.result 0 "excluded"
+else
+  create.result 1 ".backup.env found in target"
+fi
+expect 0 "excluded" "backup.run excludes .backup.env from sync"
+
+# ============================================================================
+# T10: backup to updates target, registry stays consistent
+# ============================================================================
+# First register
+backup.config.register "$TEST_SOURCE/.backup.env" 2>/dev/null
+
+newTarget="/tmp/test.backup.newtarget.$$"
+test.case - "T10: backup to updates target" \
+  backup.to "$newTarget"
+
+updatedTarget=$(grep 'BACKUP_TARGET=' "$TEST_SOURCE/.backup.env" | cut -d'"' -f2)
+if [ "$updatedTarget" = "$newTarget" ]; then
+  create.result 0 "target updated"
+else
+  create.result 1 "saved: $updatedTarget expected: $newTarget"
+fi
+expect 0 "target updated" "backup to updates .backup.env and registry is consistent"
+
+# Restore for remaining tests
+export BACKUP_TARGET="$TEST_TARGET"
+backup.config.save local 2>/dev/null
+
+# ============================================================================
+# T11: normalize.filename replaces bad chars (colon)
+# ============================================================================
+test.case - "T11: normalize.filename replaces colons" \
+  backup.normalize.filename "my:file.txt"
+
+if [ "$RESULT" = "my_file.txt" ]; then
+  create.result 0 "normalized"
+else
+  create.result 1 "got: $RESULT"
+fi
+expect 0 "normalized" "normalize.filename replaces colons with underscore"
+
+# ============================================================================
+# T12: normalize.file creates symlink from original to normalized name
+# ============================================================================
+badFile="$TEST_SOURCE/bad:name.txt"
+echo "test content" > "$badFile"
+
+test.case - "T12: normalize.file normalizes and creates symlink" \
+  backup.normalize.file "$badFile"
+
+normalizedName="bad_name.txt"
+if [ -L "$badFile" ] && [ -f "$TEST_SOURCE/$normalizedName" ]; then
+  create.result 0 "normalized and linked"
+else
+  create.result 1 "symlink: $(test -L "$badFile" && echo yes || echo no), file: $(test -f "$TEST_SOURCE/$normalizedName" && echo yes || echo no)"
+fi
+expect 0 "normalized and linked" "normalize.file creates symlink from original to normalized"
+
+# ============================================================================
+# T13: normalize.revert restores original filename
+# ============================================================================
+test.case - "T13: normalize.revert restores original" \
+  backup.normalize.revert "$badFile"
+
+if [ -f "$badFile" ] && [ ! -L "$badFile" ]; then
+  create.result 0 "reverted"
+else
+  create.result 1 "still symlink or missing"
+fi
+expect 0 "reverted" "normalize.revert restores original filename"
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+rm -f "$badFile" "$TEST_SOURCE/$normalizedName" 2>/dev/null
+cleanupTestBackup
+setupTestBackup
+
+# ============================================================================
+# T14: config.create signature uses camelCase parameter name (targetBase)
+# ============================================================================
+test.case - "T14: config.create param is camelCase targetBase" \
+  echo "checking signature"
+
+# Read the function signature line from the backup script
+sigLine=$(grep 'backup.config.create()' "$OOSH_DIR/backup" | head -1)
+if [[ "$sigLine" == *"targetBase"* ]] && [[ "$sigLine" != *"target_base"* ]]; then
+  create.result 0 "camelCase param"
+else
+  create.result 1 "signature: $sigLine"
+fi
+expect 0 "camelCase param" "config.create uses camelCase targetBase, not target_base"
+
+# ============================================================================
+# T15: config.repair detects and fixes double-path in remote target
+# ============================================================================
+# Create a broken config with double-path
+export BACKUP_SOURCE="$TEST_SOURCE"
+brokenRemote="user@host:/remote/base${TEST_SOURCE}${TEST_SOURCE}"
+export BACKUP_TARGET="$brokenRemote"
+backup.config.save local 2>/dev/null
+
+test.case - "T15: config.repair fixes double-path remote target" \
+  backup.config.repair "$TEST_SOURCE/.backup.env"
+
+repairedTarget=$(grep 'BACKUP_TARGET=' "$TEST_SOURCE/.backup.env" | cut -d'"' -f2)
+expectedFixed="user@host:/remote/base${TEST_SOURCE}"
+if [ "$repairedTarget" = "$expectedFixed" ]; then
+  create.result 0 "repaired"
+else
+  create.result 1 "got: $repairedTarget expected: $expectedFixed"
+fi
+expect 0 "repaired" "config.repair fixes double-path in remote target"
+
+cleanupTestBackup
+setupTestBackup
+
+# ============================================================================
+# T16: config.repair leaves correct configs unchanged
+# ============================================================================
+export BACKUP_SOURCE="$TEST_SOURCE"
+correctTarget="user@host:/remote/base${TEST_SOURCE}"
+export BACKUP_TARGET="$correctTarget"
+backup.config.save local 2>/dev/null
+
+test.case - "T16: config.repair leaves correct config unchanged" \
+  backup.config.repair "$TEST_SOURCE/.backup.env"
+
+unchangedTarget=$(grep 'BACKUP_TARGET=' "$TEST_SOURCE/.backup.env" | cut -d'"' -f2)
+if [ "$unchangedTarget" = "$correctTarget" ]; then
+  create.result 0 "unchanged"
+else
+  create.result 1 "got: $unchangedTarget expected: $correctTarget"
+fi
+expect 0 "unchanged" "config.repair leaves correct config unchanged"
+
+cleanupTestBackup
+setupTestBackup
+
+# ============================================================================
+# T17: config.repair fixes double-path in local target
+# ============================================================================
+export BACKUP_SOURCE="$TEST_SOURCE"
+brokenLocal="${TEST_TARGET}${TEST_SOURCE}"
+export BACKUP_TARGET="$brokenLocal"
+backup.config.save local 2>/dev/null
+
+test.case - "T17: config.repair fixes double-path local target" \
+  backup.config.repair "$TEST_SOURCE/.backup.env"
+
+repairedLocal=$(grep 'BACKUP_TARGET=' "$TEST_SOURCE/.backup.env" | cut -d'"' -f2)
+if [ "$repairedLocal" = "$TEST_TARGET" ]; then
+  create.result 0 "repaired local"
+else
+  create.result 1 "got: $repairedLocal expected: $TEST_TARGET"
+fi
+expect 0 "repaired local" "config.repair fixes double-path in local target"
+
+# ============================================================================
+# T18: backup list shows active config file location (DRY — uses config.discover)
+# ============================================================================
+export BACKUP_SOURCE="$TEST_SOURCE"
+export BACKUP_TARGET="$TEST_TARGET"
+backup.config.save local 2>/dev/null
+
+cd "$TEST_SOURCE"
+
+test.case - "T18: backup list shows active config file location" \
+  echo "checking list output"
+
+# backup.list.config uses console.log — capture stdout directly
+listOutput=$(LOG_LEVEL=3 backup.list.config 2>&1)
+if [[ "$listOutput" == *".backup.env"* ]]; then
+  create.result 0 "config location shown"
+else
+  create.result 1 "no .backup.env in output"
+fi
+expect 0 "config location shown" "backup list shows active config file path"
+
+cleanupTestBackup
+setupTestBackup
+
+# ============================================================================
+# T19: config.disable renames .backup.env to disabled.backup.env
+# ============================================================================
+export BACKUP_SOURCE="$TEST_SOURCE"
+export BACKUP_TARGET="$TEST_TARGET"
+backup.config.save local 2>/dev/null
+backup.config.register "$TEST_SOURCE/.backup.env" 2>/dev/null
+
+test.case - "T19: config.disable renames .backup.env" \
+  backup.config.disable "$TEST_SOURCE/.backup.env"
+
+if [ -f "$TEST_SOURCE/disabled.backup.env" ] && [ ! -f "$TEST_SOURCE/.backup.env" ]; then
+  create.result 0 "disabled"
+else
+  create.result 1 "disable failed: .backup.env=$(test -f "$TEST_SOURCE/.backup.env" && echo exists || echo gone), disabled=$(test -f "$TEST_SOURCE/disabled.backup.env" && echo exists || echo gone)"
+fi
+expect 0 "disabled" "config.disable renames .backup.env to disabled.backup.env"
+
+# ============================================================================
+# T20: config.list.all shows disabled config with [disabled] label
+# ============================================================================
+test.case - "T20: config.list.all shows disabled label" \
+  echo "checking list output"
+
+listAllOutput=$(LOG_LEVEL=3 backup.config.list.all 2>&1)
+if [[ "$listAllOutput" == *"disabled"* ]]; then
+  create.result 0 "disabled label shown"
+else
+  create.result 1 "no disabled label in list output"
+fi
+expect 0 "disabled label shown" "config.list.all shows disabled config with label"
+
+# ============================================================================
+# T21: config.enable renames disabled.backup.env back to .backup.env
+# ============================================================================
+test.case - "T21: config.enable restores .backup.env" \
+  backup.config.enable "$TEST_SOURCE/.backup.env"
+
+if [ -f "$TEST_SOURCE/.backup.env" ] && [ ! -f "$TEST_SOURCE/disabled.backup.env" ]; then
+  create.result 0 "enabled"
+else
+  create.result 1 "enable failed: .backup.env=$(test -f "$TEST_SOURCE/.backup.env" && echo exists || echo gone), disabled=$(test -f "$TEST_SOURCE/disabled.backup.env" && echo exists || echo gone)"
+fi
+expect 0 "enabled" "config.enable restores .backup.env from disabled.backup.env"
+
+# ============================================================================
+# T22: config.enable on already-enabled config is a no-op
+# ============================================================================
+test.case - "T22: config.enable on active config is no-op" \
+  backup.config.enable "$TEST_SOURCE/.backup.env"
+
+if [ -f "$TEST_SOURCE/.backup.env" ]; then
+  create.result 0 "still enabled"
+else
+  create.result 1 ".backup.env missing after enable on active"
+fi
+expect 0 "still enabled" "config.enable on already-enabled config is safe no-op"
+
+cleanupTestBackup
+setupTestBackup
+
+# ============================================================================
+# T23: config.disable completion only lists enabled configs
+# ============================================================================
+export BACKUP_SOURCE="$TEST_SOURCE"
+export BACKUP_TARGET="$TEST_TARGET"
+backup.config.save local 2>/dev/null
+backup.config.register "$TEST_SOURCE/.backup.env" 2>/dev/null
+
+test.case - "T23: disable completion lists enabled configs" \
+  echo "checking disable completion"
+
+disableCompletions=$(backup.config.disable.completion.configPath "")
+if [[ "$disableCompletions" == *"$TEST_SOURCE/.backup.env"* ]]; then
+  create.result 0 "enabled config listed"
+else
+  create.result 1 "enabled config not in completion: $disableCompletions"
+fi
+expect 0 "enabled config listed" "disable completion offers enabled configs"
+
+# ============================================================================
+# T24: config.enable completion only lists disabled configs (not enabled)
+# ============================================================================
+# Disable the config first
+backup.config.disable "$TEST_SOURCE/.backup.env" 2>/dev/null
+
+test.case - "T24: enable completion lists disabled configs" \
+  echo "checking enable completion"
+
+enableCompletions=$(backup.config.enable.completion.configPath "")
+if [[ "$enableCompletions" == *"$TEST_SOURCE/.backup.env"* ]]; then
+  create.result 0 "disabled config listed"
+else
+  create.result 1 "disabled config not in completion: $enableCompletions"
+fi
+expect 0 "disabled config listed" "enable completion offers disabled configs"
+
+# Re-enable for cleanup
+backup.config.enable "$TEST_SOURCE/.backup.env" 2>/dev/null
+
+# ============================================================================
+# T25: config.disable completion does NOT list disabled configs
+# ============================================================================
+# Disable again
+backup.config.disable "$TEST_SOURCE/.backup.env" 2>/dev/null
+
+test.case - "T25: disable completion excludes disabled configs" \
+  echo "checking disable completion excludes disabled"
+
+disableCompletions2=$(backup.config.disable.completion.configPath "")
+if [[ "$disableCompletions2" != *"$TEST_SOURCE/.backup.env"* ]]; then
+  create.result 0 "disabled config excluded"
+else
+  create.result 1 "disabled config still in disable completion"
+fi
+expect 0 "disabled config excluded" "disable completion excludes already-disabled configs"
+
+# Re-enable for cleanup
+backup.config.enable "$TEST_SOURCE/.backup.env" 2>/dev/null
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+cleanupTestBackup
+
+# ============================================================================
+# Save results
+# ============================================================================
+test.suite.save.results
