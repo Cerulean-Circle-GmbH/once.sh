@@ -7,6 +7,162 @@
 
 ### new.method
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PLATFORM CONFIG HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.os.platform.load() {
+  source "$OOSH_DIR/defaults/platforms.env"
+  [ -f "$HOME/config/platforms.env" ] && source "$HOME/config/platforms.env"
+}
+
+private.os.platform.names() {
+  private.os.platform.load
+  env | grep '^PLATFORM_' | sed 's/^PLATFORM_//' | cut -d= -f1 | sort
+}
+
+private.os.platform.parse() {
+  local platform="$1"
+  local varname="PLATFORM_${platform}"
+  private.os.platform.load
+  local value="${!varname}"
+  if [ -z "$value" ]; then
+    error.log "Unknown platform: $platform"
+    return 1
+  fi
+  # Parse from edges inward: workspace:...:pm:tier
+  PLATFORM_TIER="${value##*:}"
+  local without_tier="${value%:*}"
+  PLATFORM_PM="${without_tier##*:}"
+  local without_pm="${without_tier%:*}"
+  PLATFORM_WORKSPACE="${without_pm%%:*}"
+  PLATFORM_BASE_IMAGE="${without_pm#*:}"
+}
+
+private.os.platform.image.from.workspace() {
+  echo "$1" | sed 's/\([a-z]\)\([A-Z]\)/\1_\2/g' | tr '[:upper:]/' '[:lower:]_' | tr '.' '_'
+}
+
+private.os.platform.cleanup() {
+  local port="$1"
+  local container_id
+  container_id=$(docker ps -q --filter "publish=$port" 2>/dev/null)
+  if [ -n "$container_id" ]; then
+    docker stop "$container_id" 2>/dev/null
+    docker rm "$container_id" 2>/dev/null
+  fi
+  container_id=$(docker ps -aq --filter "publish=$port" 2>/dev/null)
+  if [ -n "$container_id" ]; then
+    docker rm "$container_id" 2>/dev/null
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLATFORM TESTING
+# ─────────────────────────────────────────────────────────────────────────────
+
+os.platform.list() # # lists all platforms with tier info
+{
+  private.os.platform.load
+  printf "%-20s %-25s %-10s %s\n" "PLATFORM" "WORKSPACE" "PM" "TIER"
+  printf "%-20s %-25s %-10s %s\n" "--------" "---------" "--" "----"
+  local name
+  for name in $(private.os.platform.names); do
+    private.os.platform.parse "$name"
+    printf "%-20s %-25s %-10s %s\n" "$name" "$PLATFORM_WORKSPACE" "$PLATFORM_PM" "$PLATFORM_TIER"
+  done
+}
+
+os.platform.test() # <platform> # tests oosh installation on a single platform
+{
+  local platform="$1"
+  if [ -z "$platform" ]; then
+    error.log "Usage: os platform.test <platform>"
+    return 1
+  fi
+
+  private.os.platform.parse "$platform" || return 1
+
+  if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+    console.log "SKIP: $platform is a native platform (no Docker test)"
+    create.result 1 "SKIP"
+    return 1
+  fi
+
+  local image_tag ssh_port rc
+  image_tag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
+  ssh_port=8022
+
+  console.log "Testing platform: $platform (image: $image_tag)"
+
+  # Fresh container
+  odocker reset "$image_tag" "$ssh_port"
+  sleep 2
+
+  # SSH setup
+  ossh config.create "$platform" "test@localhost:$ssh_port"
+  ossh config.save.last
+  ossh push.key "$platform"
+
+  # Install oosh
+  ossh install "$platform" test
+
+  # Run tests
+  ossh exec "$platform" "test.suite all 1"
+  rc=$?
+
+  # Cleanup
+  private.os.platform.cleanup "$ssh_port"
+
+  if [ $rc -eq 0 ]; then
+    console.log "PASS: $platform"
+    create.result 0 "PASS"
+  else
+    error.log "FAIL: $platform (exit $rc)"
+    create.result 1 "FAIL"
+  fi
+  return $rc
+}
+os.platform.test.completion.platform() {
+  private.os.platform.names
+}
+
+os.platform.test.all() # # tests all must-pass platforms, reports summary
+{
+  private.os.platform.load
+  local name results=() pass=0 fail=0 skip=0
+
+  for name in $(private.os.platform.names); do
+    private.os.platform.parse "$name"
+    if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+      results+=("SKIP  $name (native)")
+      skip=$((skip + 1))
+      continue
+    fi
+
+    if os.platform.test "$name"; then
+      results+=("PASS  $name")
+      pass=$((pass + 1))
+    else
+      results+=("FAIL  $name ($PLATFORM_TIER)")
+      if [ "$PLATFORM_TIER" = "must-pass" ]; then
+        fail=$((fail + 1))
+      fi
+    fi
+  done
+
+  console.log ""
+  console.log "=== Platform Test Summary ==="
+  local line
+  for line in "${results[@]}"; do
+    console.log "  $line"
+  done
+  console.log ""
+  console.log "Passed: $pass  Failed (must-pass): $fail  Skipped: $skip"
+
+  [ $fail -eq 0 ]
+}
+
 os.info()  # <verbose:> # shows info abut the running os. add v to get more details
 {
   if [ -f /etc/os-release ]; then
@@ -120,6 +276,9 @@ os.usage()
   Examples
     $this v
     $this init
+    $this platform.list
+    $this platform.test ubuntu_24_04
+    $this platform.test.all
 
     code:${GREEN}
     source os

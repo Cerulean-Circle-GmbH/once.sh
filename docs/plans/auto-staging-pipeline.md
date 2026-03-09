@@ -232,13 +232,15 @@ The delegation chain: `oo promote.stage` → `os platform.test.all` → `odocker
 
 Uses `odocker reset` + `ossh install` workflow — treats containers like remote servers.
 
-- [ ] 3.10 Add `os.platform.test <platform>` method to `os`:
+- [x] 3.10 Add `os.platform.test <platform>` method to `os`:
   - Reads platform config from `defaults/platforms.env` + `~/config/platforms.env`
   - Resolves platform name to Docker image and workspace
   - Private helpers:
     - `private.os.platform.load` — loads platform config (defaults + overrides)
     - `private.os.platform.parse` — parses `PLATFORM_*` env vars into fields
     - `private.os.platform.names` — returns list of platform names
+    - `private.os.platform.image.from.workspace` — derives image tag from workspace path
+    - `private.os.platform.cleanup` — stops/removes container by SSH port
   - Steps:
     1. `odocker reset <image>` — fresh container with SSH
     2. `ossh config.create <platform> test@localhost:8022` — configure SSH
@@ -246,29 +248,30 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
     4. `ossh push.key <platform>` — push SSH key
     5. `ossh install <platform> test` — install oosh via SSH
     6. `ossh exec <platform> "test.suite all 1"` — run tests remotely
-    7. Capture results, `odocker stop` / `odocker rm` — cleanup
+    7. Capture results, cleanup container via `private.os.platform.cleanup`
     8. Report pass/fail using `console.log` / `error.log`
   - Completion: `os.platform.test.completion.platform()` — lists platform names from matrix
-- [ ] 3.11 Add `os.platform.test.all` method to `os`:
+  - Also updated `defaults/platforms.env` format to include workspace field
+- [x] 3.11 Add `os.platform.test.all` method to `os`:
   - Reads platform matrix from `defaults/platforms.env` + `~/config/platforms.env`
   - Runs `os.platform.test` on each platform sequentially
-  - Collects results, prints summary:
-    ```
-    Platform Install Test Results
-    ============================
-    ubuntu_24_04    PASS
-    debian_12       PASS
-    alpine_3_19     FAIL (see logs)
-    ```
-  - Exits 0 only if all must-pass platforms pass
-- [ ] 3.12 Add `os.platform.list` method to `os`:
-  - Reads platform matrix, displays with tier (must-pass / best-effort)
-- [ ] 3.13 Add platform tests to `test/test.os`:
-  - Test `os.platform.list` output
-  - Test `os.platform.test` argument handling
+  - Skips native platforms automatically
+  - Collects results, prints summary table
+  - Exits 0 only if all must-pass platforms pass; best-effort failures don't block
+- [x] 3.12 Add `os.platform.list` method to `os`:
+  - Reads platform matrix, displays formatted table with PLATFORM, WORKSPACE, PM, TIER columns
+- [x] 3.13 Add platform tests to `test/test.os`:
   - Test `private.os.platform.load` config loading
-  - Test `private.os.platform.parse` field extraction
-  - Test `private.os.platform.names` name listing
+  - Test `private.os.platform.names` name listing (verifies all must-pass platforms)
+  - Test `private.os.platform.parse` field extraction (ubuntu, alpine, macos, unknown)
+  - Test `private.os.platform.image.from.workspace` (matches odocker logic)
+  - Test `os platform.list` runs without error
+  - Test `os platform.test` requires parameter
+  - Test `os platform.test macos` skips native
+  - Test completion function exists
+  - Fixed pre-existing test failure (old test passed log level as method name)
+  - Added `TEST_CATEGORY=core` and missing `test.suite.save.results`
+  - All 15 assertions pass, `test.suite core 1` passes (223/223 + 1 intentional meta-test)
 - [ ] 3.14 Test manually on each must-pass platform:
   - [ ] Ubuntu 24.04
   - [ ] Debian 12
