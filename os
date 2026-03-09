@@ -109,13 +109,15 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
 
   # Run user tests first (clean shared config state)
   console.log "Running core tests as user test..."
-  ossh exec "$platform" "test.suite core 1"
-  local rcUser=$?
+  local userLog="/tmp/oosh-platform-test-user-$platform.log"
+  ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$userLog"
+  local rcUser=${PIPESTATUS[0]}
 
   # Run tests as root (needs -tt for sudo TTY)
   console.log "Running core tests as root..."
-  ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'"
-  local rcRoot=$?
+  local rootLog="/tmp/oosh-platform-test-root-$platform.log"
+  ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
+  local rcRoot=${PIPESTATUS[0]}
 
   # Cleanup
   private.os.platform.cleanup "$sshPort"
@@ -123,9 +125,20 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
     console.log "PASS: $platform (root=$rcRoot, user=$rcUser)"
     create.result 0 "PASS"
+    rm -f "$userLog" "$rootLog"
     rc=0
   else
     error.log "FAIL: $platform (root=$rcRoot, user=$rcUser)"
+    if [ $rcUser -ne 0 ]; then
+      error.log "--- USER test failures (grep FAIL) ---"
+      grep -i "FAIL\|✗" "$userLog" 2>/dev/null
+      error.log "--- Full user log: $userLog ---"
+    fi
+    if [ $rcRoot -ne 0 ]; then
+      error.log "--- ROOT test failures (grep FAIL) ---"
+      grep -i "FAIL\|✗" "$rootLog" 2>/dev/null
+      error.log "--- Full root log: $rootLog ---"
+    fi
     create.result 1 "FAIL"
     rc=1
   fi
