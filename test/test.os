@@ -157,9 +157,11 @@ unset _macosResult
 # Test: missing gh CLI gives clear FAIL result
 # ─────────────────────────────────────────────────────────────────────────────
 (
-  PATH="/usr/bin:/bin"
+  emptyDir=$(mktemp -d)
+  PATH="$emptyDir"
   private.os.platform.test.ci macos 2>/dev/null
   echo "$RESULT"
+  rmdir "$emptyDir"
 ) | grep -q "FAIL"
 if [ $? -eq 0 ]; then
   expect.pass "missing gh CLI returns FAIL result"
