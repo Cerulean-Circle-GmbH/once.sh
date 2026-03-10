@@ -2568,6 +2568,104 @@ hiveMind.agent.context.status.completion.session() {
   private.hiveMind.teams.complete
 }
 
+hiveMind.agent.restart.remote() # <role> <host> <?pane> # restart agent on remote machine by copying session JSONL
+{
+  local role="$1"
+  local host="$2"
+  local remotePane="$3"
+
+  if [ -z "$role" ] || [ -z "$host" ]; then
+    error.log "Usage: hiveMind agent.restart.remote <role> <host> <?pane>"
+    return 1
+  fi
+
+  # 1. Resolve role → UUID (prefer sessions.env, fallback to pane → session.id)
+  local uuid=""
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  if [ -f "$ses" ]; then
+    uuid=$(grep "^${role}|" "$ses" 2>/dev/null | tail -1 | cut -d'|' -f2)
+  fi
+  if [ -z "$uuid" ]; then
+    # Fallback: resolve role → pane → session.id
+    local localPane
+    localPane=$(hiveMind.resolve "$role" 2>/dev/null)
+    if [ -n "$localPane" ]; then
+      uuid=$("$OOSH_DIR/claudeCode" session.id "$localPane" 2>/dev/null)
+    fi
+  fi
+  if [ -z "$uuid" ]; then
+    error.log "Could not resolve UUID for role '$role'"
+    return 1
+  fi
+  info.log "UUID: $uuid"
+
+  # 2. Find JSONL file
+  local jsonlFile=""
+  local claudeProjectsDir="$HOME/.claude/projects"
+  for dir in "$claudeProjectsDir"/*/; do
+    if [ -f "${dir}${uuid}.jsonl" ]; then
+      jsonlFile="${dir}${uuid}.jsonl"
+      break
+    fi
+  done
+  if [ -z "$jsonlFile" ]; then
+    error.log "JSONL not found for UUID $uuid"
+    return 1
+  fi
+  info.log "JSONL: $jsonlFile"
+
+  # 3. SCP to remote host (same path)
+  info.log "Copying JSONL to $host..."
+  if ! scp "$jsonlFile" "${host}:${jsonlFile}" 2>/dev/null; then
+    error.log "scp failed — check SSH config for host '$host'"
+    return 1
+  fi
+  success.log "JSONL copied to $host"
+
+  # 4. Resolve remote pane (if not given, try local registry — remote may have same layout)
+  if [ -z "$remotePane" ]; then
+    remotePane=$(hiveMind.resolve "$role" 2>/dev/null)
+    if [ -z "$remotePane" ]; then
+      error.log "Could not resolve pane for '$role' — provide pane explicitly"
+      return 1
+    fi
+    info.log "Remote pane (from local registry): $remotePane"
+  fi
+
+  # 5. Determine project directory
+  # Use CLAUDE_PROJECT_DIR if set, otherwise derive from JSONL path hash
+  local projectDir="${CLAUDE_PROJECT_DIR:-}"
+  if [ -z "$projectDir" ]; then
+    local projectHash
+    projectHash=$(basename "$(dirname "$jsonlFile")")
+    # Hash format: -Users-Shared-... → /Users/Shared/... (only works for paths without hyphens)
+    projectDir=$(echo "$projectHash" | sed 's/^-/\//' | sed 's/-/\//g')
+  fi
+  info.log "Project dir: $projectDir"
+
+  # 6. Send cd + join to remote pane
+  "$OOSH_DIR/otmux" send "$remotePane" "cd '$projectDir'" Enter
+  sleep 0.5
+  "$OOSH_DIR/otmux" send "$remotePane" "claudeCode join $uuid" Enter
+  success.log "Sent join command to $remotePane on $host"
+
+  # 7. Wait and verify
+  sleep 5
+  local capture
+  capture=$("$OOSH_DIR/otmux" pane.capture "$remotePane" 10 2>/dev/null)
+  if echo "$capture" | grep -qE '❯|tool use|tokens|esc to interrupt|Composing|Thinking'; then
+    success.log "Agent '$role' resumed on $host ($remotePane)"
+  else
+    warn.log "Could not confirm Claude UI on $remotePane — check manually"
+  fi
+}
+hiveMind.agent.restart.remote.completion.role() {
+  private.hiveMind.roles.complete
+}
+hiveMind.agent.restart.remote.completion.host() {
+  grep '^Host ' ~/.ssh/config 2>/dev/null | awk '{print $2}'
+}
+
 hiveMind.team.context.status() # <?session> # show context % for all registered agents in a team
 {
   local session="${1:-$(private.hiveMind.active.team)}"
