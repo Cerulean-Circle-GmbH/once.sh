@@ -1,7 +1,8 @@
 # Plan: Automated Branch Staging Pipeline
 
 **Created:** 2026-03-05
-**Status:** Draft - Pending Review
+**Status:** In Progress — Tickets 1-3 done, Ticket 4 next
+**Last Updated:** 2026-03-10
 **Owner:** Hannes / Marcel
 **Branch:** dev (formerly hannes-v2)
 
@@ -15,8 +16,8 @@ Main branch has not been updated by Hannes. All active development is on `dev` (
 - `dev` — active development (renamed from `hannes-v2`)
 - `stage` — staging branch (new)
 - `prod` — production branch (new)
-- `dev.claude` — older dev branch
-- Platform test branches exist: `test/macos`, `test/ish`, `test/windows`, `stable/bash4`
+- `dev.claude` — **merged into `dev`** on 2026-03-10 (58 commits: backup, claudeCode, hiveMind, otmux improvements)
+- Platform test branches exist: `test/macos`, `test/ish`, `test/windows`, `stable/bash4` — likely obsolete, candidates for deletion
 - Install support: apt-get (Ubuntu/Debian), dnf/yum (RHEL/AlmaLinux), apk (Alpine), brew (macOS)
 - Test suite: `test.suite all 1` with 30+ test scripts including `test.install`
 
@@ -272,13 +273,14 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
   - Fixed pre-existing test failure (old test passed log level as method name)
   - Added `TEST_CATEGORY=core` and missing `test.suite.save.results`
   - All 15 assertions pass, `test.suite core 1` passes (223/223 + 1 intentional meta-test)
-- [ ] 3.14 Test manually on each must-pass platform:
+- [x] 3.14 Test manually on each must-pass platform:
   - Prerequisite fixes applied: odocker snake_case→camelCase, port-passing bug fixed, os uses root SSH
-  - Dockerfile changes deferred (user will handle separately)
-  - [ ] Ubuntu 24.04
-  - [ ] Debian 12
-  - [ ] AlmaLinux 9
-  - [ ] Alpine 3.19
+  - All 4 platforms pass 218/219 assertions (1 intentional meta-test failure)
+  - Verified 2026-03-10 after dev.claude merge
+  - [x] Ubuntu 24.04
+  - [x] Debian 12
+  - [x] AlmaLinux 9
+  - [x] Alpine 3.19
 
 ### 3D: macOS Testing
 

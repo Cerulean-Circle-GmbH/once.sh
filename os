@@ -123,7 +123,7 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   private.os.platform.cleanup "$sshPort"
 
   if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
-    console.log "PASS: $platform (root=$rcRoot, user=$rcUser)"
+    important.log "PASS: $platform (root=$rcRoot, user=$rcUser)"
     create.result 0 "PASS"
     rm -f "$userLog" "$rootLog"
     rc=0
