@@ -1,7 +1,7 @@
 # Plan: Automated Branch Staging Pipeline
 
 **Created:** 2026-03-05
-**Status:** In Progress — Tickets 1-3 done, Ticket 4 next
+**Status:** In Progress — Tickets 1-3 (incl. 3D macOS) done, Ticket 4 next
 **Last Updated:** 2026-03-10
 **Owner:** Hannes / Marcel
 **Branch:** dev (formerly hannes-v2)
@@ -284,13 +284,21 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
 
 ### 3D: macOS Testing
 
-- [ ] 3.15 Decide macOS test approach:
+- [x] 3.15 Decide macOS test approach:
   - Option A: Dedicated Mac host tested via `ossh`
   - Option B: GitHub Actions macOS runner
   - Option C: Manual testing checklist
-  - **Decision:** ____________
-- [ ] 3.16 Implement chosen approach
-- [ ] 3.17 Document how to run macOS install test
+  - **Decision:** Option B — GitHub Actions macOS runner. Public repos get free macOS minutes.
+- [x] 3.16 Implement chosen approach:
+  - Created `.github/workflows/macos-test.yml` with `workflow_dispatch` trigger
+  - Added `private.os.platform.test.ci` to `os` — triggers workflow via `gh` CLI, watches run, reports PASS/FAIL
+  - Updated `os.platform.test` to route macOS to CI instead of skipping
+  - Updated `os.platform.test.all` to let macOS flow through to `os.platform.test`
+  - Added tests to `test/test.os` for CI function, non-SKIP result, missing-gh error
+- [x] 3.17 Document how to run macOS install test:
+  - Install `gh` CLI: `oo cmd gh` then `gh auth login`
+  - Run: `os platform.test macos` — triggers GitHub Actions, waits, reports PASS/FAIL
+  - Or run all: `os platform.test.all` — includes macOS alongside Docker tests
 
 ### Done When
 

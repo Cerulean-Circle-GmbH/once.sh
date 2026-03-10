@@ -57,6 +57,63 @@ private.os.platform.cleanup() { # <port> # stops and removes Docker container on
   fi
 }
 
+private.os.platform.test.ci() # <platform> # triggers CI workflow for native platform testing
+{
+  local platform="$1"
+
+  if ! command -v gh >/dev/null 2>&1; then
+    error.log "gh CLI not found — install with: oo cmd gh"
+    create.result 1 "FAIL"
+    return 1
+  fi
+
+  local branch
+  branch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ -z "$branch" ]; then
+    error.log "Could not determine current git branch"
+    create.result 1 "FAIL"
+    return 1
+  fi
+
+  console.log "Triggering macOS CI test on branch: $branch"
+
+  # Trigger the workflow and capture the run
+  local repo="Cerulean-Circle-GmbH/once.sh"
+  if ! gh workflow run macos-test.yml -R "$repo" -r "$branch" -f branch="$branch"; then
+    error.log "Failed to trigger macOS CI workflow"
+    create.result 1 "FAIL"
+    return 1
+  fi
+
+  # Wait for the run to appear (GHA has a brief delay)
+  sleep 5
+
+  # Find the run we just triggered
+  local runId
+  runId=$(gh run list -R "$repo" -w "macos-test.yml" --branch "$branch" -L 1 --json databaseId -q '.[0].databaseId' 2>/dev/null)
+  if [ -z "$runId" ]; then
+    error.log "Could not find triggered workflow run"
+    create.result 1 "FAIL"
+    return 1
+  fi
+
+  console.log "Watching CI run $runId..."
+  gh run watch "$runId" -R "$repo" --exit-status 2>&1
+  local rc=$?
+
+  if [ $rc -eq 0 ]; then
+    printf "PASS: %s (ci=%d)\n" "$platform" "$rc"
+    important.log "PASS: $platform (ci=$rc)"
+    create.result 0 "PASS"
+  else
+    printf "FAIL: %s (ci=%d)\n" "$platform" "$rc"
+    error.log "FAIL: $platform (ci=$rc)"
+    error.log "View details: gh run view $runId -R $repo --log"
+    create.result 1 "FAIL"
+  fi
+  return $rc
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PLATFORM TESTING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +141,10 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   private.os.platform.parse "$platform" || return 1
 
   if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+    if [ "$platform" = "macos" ]; then
+      private.os.platform.test.ci "$platform"
+      return $?
+    fi
     console.log "SKIP: $platform is a native platform (no Docker test)"
     create.result 1 "SKIP"
     return 1
@@ -158,9 +219,11 @@ os.platform.test.all() # # tests all must-pass platforms, reports summary
   for name in $(private.os.platform.names); do
     private.os.platform.parse "$name"
     if [ "$PLATFORM_WORKSPACE" = "native" ]; then
-      results+=("SKIP  $name (native)")
-      skip=$((skip + 1))
-      continue
+      if [ "$name" != "macos" ]; then
+        results+=("SKIP  $name (native)")
+        skip=$((skip + 1))
+        continue
+      fi
     fi
 
     if os.platform.test "$name"; then

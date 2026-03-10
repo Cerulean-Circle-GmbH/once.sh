@@ -133,14 +133,38 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test: os platform.test macos returns non-zero (native skip)
+# Test: private.os.platform.test.ci function is defined
 # ─────────────────────────────────────────────────────────────────────────────
-test.case $level "os platform.test macos skips native" \
-  os platform.test macos
-if [ "$RETURN_VALUE" -ne 0 ]; then
-  expect.pass "os platform.test macos returns non-zero (native skip)"
+if type private.os.platform.test.ci >/dev/null 2>&1; then
+  expect.pass "private.os.platform.test.ci is defined"
 else
-  expect.fail "os platform.test macos should return non-zero for native platform"
+  expect.fail "private.os.platform.test.ci should be defined"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: os platform.test macos does NOT return SKIP
+# ─────────────────────────────────────────────────────────────────────────────
+os platform.test macos 2>/dev/null
+_macosResult="$RESULT"
+if [ "$_macosResult" != "SKIP" ]; then
+  expect.pass "os platform.test macos does not SKIP (result=$_macosResult)"
+else
+  expect.fail "os platform.test macos should not SKIP — should route to CI"
+fi
+unset _macosResult
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: missing gh CLI gives clear FAIL result
+# ─────────────────────────────────────────────────────────────────────────────
+(
+  PATH="/usr/bin:/bin"
+  private.os.platform.test.ci macos 2>/dev/null
+  echo "$RESULT"
+) | grep -q "FAIL"
+if [ $? -eq 0 ]; then
+  expect.pass "missing gh CLI returns FAIL result"
+else
+  expect.fail "missing gh CLI should return FAIL result"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
