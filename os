@@ -111,6 +111,8 @@ private.os.platform.test.ci() # <platform> # triggers CI workflow for native pla
     error.log "View details: gh run view $runId -R $repo --log"
     create.result 1 "FAIL"
   fi
+  printf "\nJob Summary: https://github.com/%s/actions/runs/%s\n" "$repo" "$runId"
+  printf "Open in browser: gh run view %s -R %s --web\n" "$runId" "$repo"
   return $rc
 }
 
