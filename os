@@ -123,11 +123,13 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   private.os.platform.cleanup "$sshPort"
 
   if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
-    error.log "PASS: $platform (root=$rcRoot, user=$rcUser)"
+    printf "PASS: %s (root=%d, user=%d)\n" "$platform" "$rcRoot" "$rcUser"
+    important.log "PASS: $platform (root=$rcRoot, user=$rcUser)"
     create.result 0 "PASS"
     rm -f "$userLog" "$rootLog"
     rc=0
   else
+    printf "FAIL: %s (root=%d, user=%d)\n" "$platform" "$rcRoot" "$rcUser"
     error.log "FAIL: $platform (root=$rcRoot, user=$rcUser)"
     if [ $rcUser -ne 0 ]; then
       error.log "--- USER test failures (grep FAIL) ---"
