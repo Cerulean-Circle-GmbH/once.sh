@@ -216,37 +216,84 @@ os.platform.test.completion.platform() {
 os.platform.test.all() # # tests all must-pass platforms, reports summary
 {
   private.os.platform.load
-  local name results=() pass=0 fail=0 skip=0
+  local name pass=0 fail=0 skip=0
+  local platformNames=() platformResults=() platformDetails=()
 
   for name in $(private.os.platform.names); do
     private.os.platform.parse "$name"
     if [ "$PLATFORM_WORKSPACE" = "native" ]; then
       if [ "$name" != "macos" ]; then
-        results+=("SKIP  $name (native)")
+        platformNames+=("$name")
+        platformResults+=("SKIP")
+        platformDetails+=("native — no Docker test")
         skip=$((skip + 1))
         continue
       fi
     fi
 
-    if os.platform.test "$name"; then
-      results+=("PASS  $name")
+    local testLog="/tmp/oosh-platform-test-all-$name.log"
+    os.platform.test "$name" 2>&1 | tee "$testLog"
+    local testRc=${PIPESTATUS[0]}
+
+    # Extract GHA URL if present (macos CI tests print "Job Summary: <url>")
+    local ghaUrl=""
+    ghaUrl=$(grep "^Job Summary:" "$testLog" 2>/dev/null | sed 's/Job Summary: //')
+    rm -f "$testLog"
+
+    platformNames+=("$name")
+    if [ $testRc -eq 0 ]; then
+      platformResults+=("PASS")
+      platformDetails+=("$ghaUrl")
       pass=$((pass + 1))
     else
-      results+=("FAIL  $name ($PLATFORM_TIER)")
+      platformResults+=("FAIL")
+      platformDetails+=("$PLATFORM_TIER")
       if [ "$PLATFORM_TIER" = "must-pass" ]; then
         fail=$((fail + 1))
       fi
     fi
   done
 
-  console.log ""
-  console.log "=== Platform Test Summary ==="
-  local line
-  for line in "${results[@]}"; do
-    console.log "  $line"
+  # Summary table
+  echo ""
+  echo -e "\e[1;35m╔════════════════════════════════════════════════════════════════════╗\e[0m"
+  echo -e "\e[1;35m║                    PLATFORM TEST SUMMARY\e[0m"
+  echo -e "\e[1;35m╚════════════════════════════════════════════════════════════════════╝\e[0m"
+  echo ""
+  printf "  %-20s %s\n" "PLATFORM" "RESULT"
+  printf "  %-20s %s\n" "────────────────────" "──────"
+
+  local i
+  for i in "${!platformNames[@]}"; do
+    local color="\e[1;32m"
+    if [ "${platformResults[$i]}" = "FAIL" ]; then
+      color="\e[1;31m"
+    elif [ "${platformResults[$i]}" = "SKIP" ]; then
+      color="\e[1;33m"
+    fi
+    printf "  %-20s " "${platformNames[$i]}"
+    echo -e "${color}${platformResults[$i]}\e[0m"
+    if [ -n "${platformDetails[$i]}" ]; then
+      echo -e "                       \e[0;90m${platformDetails[$i]}\e[0m"
+    fi
   done
-  console.log ""
-  console.log "Passed: $pass  Failed (must-pass): $fail  Skipped: $skip"
+
+  echo ""
+  if [ $fail -eq 0 ] && [ $skip -eq 0 ]; then
+    echo -e "  Passed:  \e[1;32m$pass\e[0m"
+  else
+    echo -e "  Passed: \e[1;32m$pass\e[0m  Failed: \e[1;31m$fail\e[0m  Skipped: \e[1;33m$skip\e[0m"
+  fi
+
+  if [ $fail -eq 0 ]; then
+    echo ""
+    echo -e "  \e[1;32m╔══════════════════════════════════════════════════════════════════╗\e[0m"
+    echo -e "  \e[1;32m║  ✓ ALL PLATFORMS PASSED\e[0m"
+    echo -e "  \e[1;32m╚══════════════════════════════════════════════════════════════════╝\e[0m"
+  else
+    echo ""
+    echo -e "  \e[1;31m✗ $fail PLATFORM(S) FAILED\e[0m"
+  fi
 
   [ $fail -eq 0 ]
 }
