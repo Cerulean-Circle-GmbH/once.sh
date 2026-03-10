@@ -1473,18 +1473,24 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
   return 0
 }
 
-hiveMind.teams.restore() # <?snapshot_file> # restore teams from snapshot (dry-run by default)
+hiveMind.teams.restore() # <?snapshot_file> <?--fork> # restore teams from snapshot; --fork uses fork instead of join (cross-machine)
 {
-  local snapfile="$1"
+  local snapfile="" forkMode=""
+  for arg in "$@"; do
+    case "$arg" in
+      --fork) forkMode="yes" ;;
+      *) [ -z "$snapfile" ] && snapfile="$arg" ;;
+    esac
+  done
   if [ -z "$snapfile" ]; then
     snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
   fi
   if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
-    error.log "No snapshot found. Usage: hiveMind teams.restore <?file>"
+    error.log "No snapshot found. Usage: hiveMind teams.restore <?file> <?--fork>"
     return 1
   fi
 
-  echo "Restoring from: $snapfile"
+  echo "Restoring from: $snapfile${forkMode:+ (fork mode)}"
   echo ""
 
   # Ensure tmux server is running (BUG-Z1)
@@ -1520,8 +1526,10 @@ hiveMind.teams.restore() # <?snapshot_file> # restore teams from snapshot (dry-r
 
     # Resume Claude if UUID available
     if [ -n "$uuid" ]; then
-      echo "  ${pane_target}: resuming ${role:-unknown} (${uuid:0:8}...)"
-      "$OOSH_DIR/otmux" send "$pane_target" "claudeCode join $uuid" Enter
+      local joinCmd="join"
+      [ "$forkMode" = "yes" ] && joinCmd="fork"
+      echo "  ${pane_target}: ${joinCmd}ing ${role:-unknown} (${uuid:0:8}...)"
+      "$OOSH_DIR/otmux" send "$pane_target" "claudeCode $joinCmd $uuid" Enter
       # Send boot prompt after resume
       if [ -n "$role" ] && [ "$role" != "unknown" ]; then
         sleep 5
@@ -1581,13 +1589,33 @@ hiveMind.teams.migrate() # <ossh-host> <?snapshot_file> # migrate team to remote
   echo "Transferring config to $host..."
   "$OOSH_DIR/ossh" push.dir "$host" ~/config
 
-  # 3. Sync oosh code on remote
+  # 3. Transfer JSONL session files
+  echo ""
+  echo "Transferring session JSONL files to $host..."
+  local claudeProjectsDir="$HOME/.claude/projects"
+  local transferCount=0
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$uuid" ] && continue
+    for dir in "$claudeProjectsDir"/*/; do
+      if [ -f "${dir}${uuid}.jsonl" ]; then
+        local remotePath="${dir}${uuid}.jsonl"
+        # Ensure remote directory exists
+        "$OOSH_DIR/ossh" exec "$host" "mkdir -p '$(dirname "$remotePath")'" 2>/dev/null
+        scp "$remotePath" "${host}:${remotePath}" 2>/dev/null && transferCount=$((transferCount + 1))
+        break
+      fi
+    done
+  done < "$snapfile"
+  echo "Transferred $transferCount JSONL files"
+
+  # 4. Sync oosh code on remote
   echo ""
   echo "Syncing oosh on $host..."
   "$OOSH_DIR/ossh" exec "$host" "cd ~/oosh && git pull" 2>/dev/null || \
     "$OOSH_DIR/ossh" push.dir "$host" "$OOSH_DIR"
 
-  # 4. Check prerequisites on remote
+  # 4b. Check prerequisites on remote
   echo ""
   echo "Checking prerequisites on $host..."
   local missing=""
@@ -1603,12 +1631,20 @@ hiveMind.teams.migrate() # <ossh-host> <?snapshot_file> # migrate team to remote
   fi
   echo "Prerequisites OK"
 
-  # 5. Ensure tmux server running + restore on remote
-  echo ""
-  echo "Running teams.restore on $host..."
-  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore"
+  # 5. Model compatibility check — opus[1m] blocks ALL API calls on some subscriptions
+  local badModel
+  badModel=$("$OOSH_DIR/ossh" exec "$host" 'grep -o "opus\[1m\]" ~/.claude/settings.json 2>/dev/null' 2>/dev/null)
+  if [ -n "$badModel" ]; then
+    warn.log "Remote has opus[1m] model — fixing to opus (200k)"
+    "$OOSH_DIR/ossh" exec "$host" "sed -i.bak 's/opus\[1m\]/opus/g' ~/.claude/settings.json" 2>/dev/null
+  fi
 
-  # 6. Verify
+  # 6. Ensure tmux server running + restore on remote (--fork for cross-machine)
+  echo ""
+  echo "Running teams.restore --fork on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore --fork"
+
+  # 7. Verify
   echo ""
   echo "Verifying on $host..."
   "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind team.status" 2>/dev/null
