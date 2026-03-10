@@ -24,8 +24,8 @@
 # tmux session  : <teamName>            e.g. cursorOrchestrator, ooshTeam
 # tmux window   : team                  window 0 is always "team"
 # env per pane  : HIVEMIND_ROLE=<role>  exported before Claude Code starts
-# role registry : ~/config/hivemind.roles.env  maps pane targets → role names
-#                 format: target|role  (persistent, survives reboot)
+# role registry : ~/config/hivemind.roles.env  write-through cache: pane targets → role names
+#                 format: target|role  (fallback — live discovery is primary)
 # session store : ~/config/hivemind.sessions.env  maps role → Claude session UUID
 #                 format: role|session-uuid  (allows session rejoin)
 : ${HIVEMIND_WINDOW_NAME:=team}
@@ -56,28 +56,110 @@ HIVEMIND_OOSH_AGENTS=(
 # Bash 3.2 compatible — uses function lookup instead of declare -A
 # Roles with SKILL.md files get auto-loaded from .claude/agents/<role>/SKILL.md
 private.hiveMind.get.role.prompt() {
-  case "$1" in
-    orchestrator|oosh-orchestrator|agent-teacher) echo "You are the Agent Teacher. Read .claude/agents/agent-teacher/SKILL.md to learn your role. Train agents, delegate tasks, improve tools, and maintain context in session/agent.context.md." ;;
-    coder)               echo "You implement features and write code." ;;
-    tester)              echo "You write and run tests." ;;
-    reviewer)            echo "You review code for quality and best practices." ;;
-    oosh-expert)         echo "You are an OOSH framework expert. Read .claude/agents/oosh-expert/SKILL.md to learn your role. Specialize in architecture, method patterns, completion system (c2), and framework development." ;;
-    oosh-tester)         echo "You are an OOSH testing specialist. Read .claude/agents/oosh-tester/SKILL.md to learn your role. Specialize in test.suite, writing tests, and validating oosh scripts." ;;
-    scrum-master)        echo "You are the ScrumMaster. Read .claude/agents/scrum-master/SKILL.md to learn your role. Monitor agent panes, approve permissions, enforce role boundaries, and report issues." ;;
-    product-owner)       echo "You are the Product Owner. Read .claude/agents/product-owner/SKILL.md to learn your role. Uphold first principles, govern script ownership by expert+tester pairs, enforce the usability contract." ;;
-    script-product-owner) echo "Read .claude/agents/script-product-owner/SKILL.md — this is the script ownership contract, not a separate agent role. Expert+tester pairs own scripts; the Product Owner governs first principles." ;;
-    developer)           echo "You are a Developer agent. Read .claude/agents/developer/SKILL.md to learn your role. Implement assigned work following OOSH patterns." ;;
-    agent-trainer)       echo "You are the Agent Trainer. Read .claude/agents/agent-trainer/SKILL.md to learn your role. Improve all agent SKILL.md files based on team learnings. You do NOT implement features or run tests." ;;
-    task-agent)          echo "You are a Task Agent. Read .claude/agents/task-agent/SKILL.md to learn your role. Execute assigned tasks autonomously within your designated scope." ;;
-    backup-expert)       echo "You are the backup script expert. Read .claude/agents/backup-expert/SKILL.md to learn your role. Specialize in backup script architecture, config discovery, and initialization." ;;
-    backup-tester)       echo "You are the backup test specialist. Read .claude/agents/backup-tester/SKILL.md to learn your role. Test backup operations, config handling, and initialization scenarios." ;;
-    *)                   return 1 ;;
+  local role="$1"
+  [ -z "$role" ] && return 1
+
+  # Resolve agents dir if not set
+  local agents_dir="$HIVEMIND_AGENTS_DIR"
+  if [ -z "$agents_dir" ]; then
+    agents_dir=$(private.hiveMind.find.agents.dir 2>/dev/null) || true
+  fi
+
+  # Role aliases: map alternate names to canonical role directories
+  case "$role" in
+    orchestrator|oosh-orchestrator) role="agent-teacher" ;;
   esac
+
+  # Dynamic SKILL.md lookup
+  local skill_file="$agents_dir/$role/SKILL.md"
+  if [ -n "$agents_dir" ] && [ -f "$skill_file" ]; then
+    # Extract description from YAML frontmatter (line starting with description:)
+    local desc
+    desc=$(sed -n '/^---$/,/^---$/p' "$skill_file" | grep '^description:' | head -1 | sed 's/^description: *//; s/^"//; s/"$//')
+    if [ -n "$desc" ]; then
+      echo "You are the $role. Read .claude/agents/$role/SKILL.md to learn your role. $desc"
+    else
+      echo "You are the $role. Read .claude/agents/$role/SKILL.md to learn your role."
+    fi
+    return 0
+  fi
+
+  # No SKILL.md found — unknown role
+  return 1
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRIVATE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.current.session() { # # return current tmux session name
+  otmux pane.get '#{session_name}' 2>/dev/null || return 1
+}
+
+private.hiveMind.pane.count() { # <target> # count panes in a window or session
+  otmux panes -t "$1" ${2:+-s} 2>/dev/null | wc -l | tr -d ' '
+}
+
+private.hiveMind.claude.processes() { # # list Claude processes with pane targets: pid|tty|paneTarget|title|args
+  local -A ttyMap titleMap
+  while IFS='|' read -r paneTty paneRef paneTitle; do
+    ttyMap["$paneTty"]="$paneRef"
+    titleMap["$paneRef"]="$paneTitle"
+  done < <(private.hiveMind.list.panes tty+title)
+  while read -r pid tty comm rest; do
+    [ -z "$pid" ] && continue
+    [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
+    local ttyDev="/dev/$tty"
+    local paneTarget="${ttyMap[$ttyDev]:-}"
+    [ -z "$paneTarget" ] && continue
+    local title="${titleMap[$paneTarget]:-}"
+    echo "${pid}|${tty}|${paneTarget}|${title}|${rest}"
+  done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
+}
+
+private.hiveMind.ensure.pane() { # <session:window.pane> # create session/window/pane if missing
+  local target="$1"
+  local sess="${target%%:*}"
+  local rest="${target#*:}"
+  local win="${rest%%.*}"
+  local pane="${rest#*.}"
+  # Ensure session
+  if ! otmux has "$sess" 2>/dev/null; then
+    otmux new "$sess" -d -x 200 -y 50 2>/dev/null || return 1
+  fi
+  # Ensure window at exact index
+  if ! otmux windows -t "$sess" -F "#{window_index}" 2>/dev/null | grep -qx "$win"; then
+    otmux window.new -d -t "${sess}:${win}" 2>/dev/null || return 1
+  fi
+  # Ensure pane (split until enough)
+  local current needed=$((pane + 1))
+  current=$(private.hiveMind.pane.count "${sess}:${win}")
+  while [ "$current" -lt "$needed" ]; do
+    otmux split -d -t "${sess}:${win}" 2>/dev/null || break
+    otmux tiled "${sess}:${win}" 2>/dev/null
+    current=$(private.hiveMind.pane.count "${sess}:${win}")
+  done
+  [ "$current" -ge "$needed" ]
+}
+
+private.hiveMind.list.panes() { # <format> <?scope> # list panes with standard format strings
+  # format: tty, tty+title, addr+cmd, addr, or raw tmux format string
+  # scope: -a (all sessions, default) or session name
+  local format="$1" scope="${2:--a}"
+  local fmtStr
+  case "$format" in
+    tty)       fmtStr="#{pane_tty} #{session_name}:#{window_index}.#{pane_index}" ;;
+    tty+title) fmtStr="#{pane_tty}|#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" ;;
+    addr+cmd)  fmtStr="#{window_index}.#{pane_index}|#{pane_current_command}" ;;
+    addr)      fmtStr="#{session_name}:#{window_index}.#{pane_index}" ;;
+    *)         fmtStr="$format" ;;
+  esac
+  if [ "$scope" = "-a" ]; then
+    otmux panes -a -F "$fmtStr" 2>/dev/null
+  else
+    otmux panes -t "$scope" -s -F "$fmtStr" 2>/dev/null
+  fi
+}
 
 private.hiveMind.find.agents.dir() {
   # Search upward from multiple starting points for .claude/agents with SKILL.md files
@@ -103,7 +185,7 @@ private.hiveMind.find.agents.dir() {
       dir=$(dirname "$dir")
     done
   done
-  return 1
+  return 0
 }
 
 private.hiveMind.pane.identify() {
@@ -113,12 +195,14 @@ private.hiveMind.pane.identify() {
   local role="$2"
   private.hiveMind.registry.set "$target" "$role"
   otmux pane.title "$target" "$role"
+  otmux send.enter "$target" "export FORCE_COLOR=2; unset COLORTERM; unset CLAUDECODE"
   otmux send.enter "$target" "export HIVEMIND_ROLE=$role"
 }
 
 # ── Role Registry ─────────────────────────────────────────────────────────────
-# File-based mapping: pane target → role name.
-# Survives Claude Code overwriting pane titles.
+# Write-through cache: pane target → role name.
+# PRIMARY source of truth is live discovery (process → session UUID → customTitle).
+# This file is the FALLBACK for panes where Claude isn't running yet.
 # Format: target|role  (one per line, e.g. cursorOrchestrator:0.2|oosh-expert)
 # Location: ~/config/hivemind.roles.env (persistent, OOSH config pattern)
 
@@ -180,7 +264,13 @@ private.hiveMind.registry.set() {
 
 private.hiveMind.registry.get() {
   # Look up role for a given pane target
+  # PRIMARY: live discovery from running Claude process
+  # FALLBACK: static file (for panes where Claude isn't running yet)
   local target="$1"
+  local role
+  role=$(private.hiveMind.live.discover "$target" 2>/dev/null)
+  [ -n "$role" ] && echo "$role" && return 0
+  # Fallback to static registry file
   private.hiveMind.registry.migrate
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
@@ -188,8 +278,16 @@ private.hiveMind.registry.get() {
 
 private.hiveMind.registry.find() {
   # Find pane target by role name (case-insensitive partial match)
+  # PRIMARY: live discovery — scan panes for matching role
+  # FALLBACK: static file
   local name="$1"
   local session="$2"
+  if [ -n "$session" ]; then
+    local match
+    match=$(private.hiveMind.live.discover.session "$session" 2>/dev/null | grep -i "$name" | head -1 | cut -d'|' -f1)
+    [ -n "$match" ] && echo "$match" && return 0
+  fi
+  # Fallback to static registry file
   private.hiveMind.registry.migrate
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   if [ -n "$session" ]; then
@@ -201,7 +299,15 @@ private.hiveMind.registry.find() {
 
 private.hiveMind.registry.list() {
   # List all entries, optionally filtered by session
+  # PRIMARY: live discovery from running Claude processes
+  # FALLBACK: static file (for listing across all sessions or offline sessions)
   local session="$1"
+  if [ -n "$session" ] && otmux has "$session" 2>/dev/null; then
+    local live
+    live=$(private.hiveMind.live.discover.session "$session" 2>/dev/null)
+    [ -n "$live" ] && echo "$live" && return 0
+  fi
+  # Fallback to static registry file
   private.hiveMind.registry.migrate
   [ -f "$HIVEMIND_REGISTRY" ] || return 0
   if [ -n "$session" ]; then
@@ -209,6 +315,66 @@ private.hiveMind.registry.list() {
   else
     cat "$HIVEMIND_REGISTRY" 2>/dev/null
   fi
+}
+
+# ── Live Discovery ────────────────────────────────────────────────────────────
+# Discover agent roles from live process state (tmux panes + Claude session names).
+# Primary source of truth — no static file needed.
+# A pane is just a view; an agent is a Claude process with a session UUID.
+# The role is stored in the Claude session's customTitle (via /rename).
+
+private.hiveMind.live.discover() {
+  # Discover role for a pane from live Claude process + session data
+  # Returns: role name (e.g. "hiveMind-expert") or empty
+  local target="$1"
+  [ -z "$target" ] && return 1
+
+  # 1. Find Claude PID on this pane's TTY
+  local pid
+  pid=$(claudeCode process.find "$target" 2>/dev/null) || return 1
+
+  # 2. Extract session UUID from process args
+  local sid
+  sid=$(ps -p "$pid" -o args= 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+  [ -z "$sid" ] && return 1
+
+  # 3. Get session name (customTitle from /rename, or firstPrompt)
+  local name
+  name=$(claudeCode session.name "$sid" 2>/dev/null)
+  [ -z "$name" ] && return 1
+
+  # 4. Extract role from role@model format (set by /rename during bootstrap)
+  if [[ "$name" == *"@"* ]]; then
+    local role="${name%%@*}"
+    # Validate: reject garbage (same guards as registry.refresh)
+    [[ "$role" == *" "* ]] && return 1
+    [[ ${#role} -gt 30 ]] && return 1
+    [[ "$role" =~ ^(Read|You|I\ am|Write|Edit|Help|Search|Find|Look|Check|Run|Show) ]] && return 1
+    echo "$role"
+    return 0
+  fi
+
+  return 1
+}
+
+private.hiveMind.live.discover.session() {
+  # Discover all roles in a tmux session from live process state
+  # Outputs: pane_target|role per line (same format as registry file)
+  local session="$1"
+  [ -z "$session" ] && return 1
+
+  local pane_list
+  pane_list=$(private.hiveMind.list.panes addr "$session")
+  [ -z "$pane_list" ] && return 1
+
+  while IFS= read -r pane_target; do
+    [ -z "$pane_target" ] && continue
+    local role
+    role=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
+    if [ -n "$role" ]; then
+      echo "${pane_target}|${role}"
+    fi
+  done <<< "$pane_list"
 }
 
 # ── Session Tracking ──────────────────────────────────────────────────────────
@@ -279,7 +445,7 @@ private.hiveMind.teams.ensure.dir() {
 
 private.hiveMind.teams.complete() {
   # Shared completion helper: registered teams + running tmux sessions + default, deduplicated
-  { echo "cursorOrchestrator"; [ -f "$HIVEMIND_TEAMS" ] && cut -d'|' -f1 "$HIVEMIND_TEAMS" 2>/dev/null; tmux list-sessions -F "#{session_name}" 2>/dev/null; } | sort -u
+  { echo "cursorOrchestrator"; [ -f "$HIVEMIND_TEAMS" ] && cut -d'|' -f1 "$HIVEMIND_TEAMS" 2>/dev/null; otmux sessions -F "#{session_name}" 2>/dev/null; } | sort -u
 }
 
 private.hiveMind.roles.complete() {
@@ -287,22 +453,22 @@ private.hiveMind.roles.complete() {
   local session
   session=$(private.hiveMind.active.team 2>/dev/null)
   {
-    # Source 1: Registry (canonical)
-    if [ -f "$HIVEMIND_REGISTRY" ] && [ -n "$session" ]; then
-      grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2
-    elif [ -f "$HIVEMIND_REGISTRY" ]; then
-      cut -d'|' -f2 "$HIVEMIND_REGISTRY" 2>/dev/null
+    # Source 1: Registry (canonical) — live discovery + file fallback
+    if [ -n "$session" ]; then
+      private.hiveMind.registry.list "$session" 2>/dev/null | cut -d'|' -f2
+    else
+      private.hiveMind.registry.list 2>/dev/null | cut -d'|' -f2
     fi
 
     # Source 2: Pane titles (for unregistered panes)
     if [ -n "$session" ]; then
       local pane title
       while IFS= read -r pane; do
-        title=$(tmux display-message -t "$pane" -p '#{pane_title}' 2>/dev/null)
+        title=$(otmux pane.get "$pane" '#{pane_title}' 2>/dev/null)
         if [ -n "$title" ] && ! grep -q "|${title}$" "$HIVEMIND_REGISTRY" 2>/dev/null; then
           echo "$title"
         fi
-      done < <(tmux list-panes -s -t "$session" -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+      done < <(otmux panes -s -t "$session" -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
     fi
   } | sort -u
 }
@@ -328,7 +494,7 @@ private.hiveMind.pane.activity() {
   [ -z "$target" ] && echo "unknown" && return 1
 
   local content
-  content=$(tmux capture-pane -t "$target" -p -S -5 2>/dev/null)
+  content=$(otmux pane.capture "$target" 5 2>/dev/null)
 
   # Empty or whitespace-only → unknown
   local trimmed
@@ -366,7 +532,7 @@ private.hiveMind.get.agent.port() {
 
 private.hiveMind.pane.for.agent() {
   local agent_id="$1"
-  tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | grep "$agent_id" | awk '{print $1}' | head -1
+  private.hiveMind.list.panes "#{pane_id} #{pane_title}" | grep "$agent_id" | awk '{print $1}' | head -1
 }
 
 private.hiveMind.create.agent.pane() {
@@ -376,18 +542,18 @@ private.hiveMind.create.agent.pane() {
   local window="${4:-agents}"
 
   # Select or create agents window
-  if ! tmux list-windows -F "#{window_name}" 2>/dev/null | grep -q "^${window}$"; then
-    tmux new-window -n "$window"
+  if ! otmux windows -F "#{window_name}" 2>/dev/null | grep -q "^${window}$"; then
+    otmux window.new "$window"
   else
-    tmux select-window -t "$window"
+    otmux window.select "$window"
   fi
 
   # Create new pane
-  tmux split-window -h
-  tmux select-layout tiled
+  otmux split.h
+  otmux tiled
 
   # Get the new pane
-  local pane_id=$(tmux display-message -p "#{pane_id}")
+  local pane_id=$(otmux pane.get %)
 
   # Set pane title and export role env var
   private.hiveMind.pane.identify "$pane_id" "$agent_id"
@@ -432,7 +598,7 @@ hiveMind.init() # <?agents:orchestrator,coder,tester,reviewer> <?workdir:.> # in
   # Check if in tmux or create session
   if [ -z "$TMUX" ]; then
     info.log "Creating tmux session: $HIVEMIND_SESSION"
-    tmux new-session -d -s "$HIVEMIND_SESSION" -n "main"
+    otmux new "$HIVEMIND_SESSION" -d -n "main"
 
     # Main pane for orchestrator
     private.hiveMind.pane.identify "${HIVEMIND_SESSION}:0.0" "orchestrator"
@@ -461,7 +627,7 @@ hiveMind.init() # <?agents:orchestrator,coder,tester,reviewer> <?workdir:.> # in
   agentRoom list
   echo ""
   echo "Tmux session: $HIVEMIND_SESSION"
-  [ -z "$TMUX" ] && echo "Attach with: tmux attach -t $HIVEMIND_SESSION"
+  [ -z "$TMUX" ] && echo "Attach with: otmux attach $HIVEMIND_SESSION"
 }
 
 hiveMind.init.completion.agents() {
@@ -496,18 +662,18 @@ hiveMind.pane.create() # <agentId> <?workdir:.> # create tmux pane with Claude C
   # Create pane in agents window
   if [ -n "$TMUX" ]; then
     # Check if agents window exists
-    if ! tmux list-windows -F "#{window_name}" | grep -q "^agents$"; then
-      tmux new-window -n "agents"
+    if ! otmux windows -F "#{window_name}" | grep -q "^agents$"; then
+      otmux window.new "agents"
     else
-      tmux select-window -t agents
+      otmux window.select agents
     fi
 
     # Split and create new pane
-    tmux split-window -h -t agents
-    tmux select-layout -t agents tiled
+    otmux split.h -t agents
+    otmux tiled agents
 
     # Set title and export role env var
-    local pane_id=$(tmux display-message -p "#{pane_id}")
+    local pane_id=$(otmux pane.get %)
     private.hiveMind.pane.identify "$pane_id" "$agent_id"
 
     # Get system prompt for role (use role-specific or generic)
@@ -532,8 +698,8 @@ hiveMind.pane.create() # <agentId> <?workdir:.> # create tmux pane with Claude C
 
 hiveMind.attach() # # attach to hivemind tmux session
 {
-  if tmux has-session -t "$HIVEMIND_SESSION" 2>/dev/null; then
-    tmux attach -t "$HIVEMIND_SESSION"
+  if otmux has "$HIVEMIND_SESSION" 2>/dev/null; then
+    otmux attach "$HIVEMIND_SESSION"
   else
     warn.log "HiveMind session not found. Run: hiveMind init"
     return 1
@@ -542,7 +708,7 @@ hiveMind.attach() # # attach to hivemind tmux session
 
 hiveMind.detach() # # detach from current session
 {
-  tmux detach-client
+  otmux detach
 }
 
 hiveMind.join() # <name> # rejoin an agent's Claude session by role name
@@ -605,8 +771,8 @@ hiveMind.kill() # # shutdown hivemind completely
   agentRoom stop.all 2>/dev/null
 
   # Kill tmux session
-  if tmux has-session -t "$HIVEMIND_SESSION" 2>/dev/null; then
-    tmux kill-session -t "$HIVEMIND_SESSION"
+  if otmux has "$HIVEMIND_SESSION" 2>/dev/null; then
+    otmux kill "$HIVEMIND_SESSION"
     success.log "HiveMind session killed"
   else
     info.log "No HiveMind tmux session found"
@@ -663,8 +829,8 @@ hiveMind.list() # # list all agents
   else
     # Fall back to tmux pane titles when agentRoom is unavailable
     local session="${HIVEMIND_SESSION:-$(private.hiveMind.active.team)}"
-    if tmux has-session -t "$session" 2>/dev/null; then
-      tmux list-panes -t "$session" -F "#{pane_title}" 2>/dev/null
+    if otmux has "$session" 2>/dev/null; then
+      otmux panes -t "$session" -F "#{pane_title}" 2>/dev/null
     else
       echo "queen"
     fi
@@ -677,7 +843,7 @@ hiveMind.workers() # # list worker agents (non-orchestrator panes)
     agentRoom list.ids 2>/dev/null | grep -v "queen"
   else
     local session="${HIVEMIND_SESSION:-$(private.hiveMind.active.team)}"
-    tmux list-panes -t "$session" -F "#{pane_title}" 2>/dev/null | grep -v -E "^(orchestrator|queen)$"
+    otmux panes -t "$session" -F "#{pane_title}" 2>/dev/null | grep -v -E "^(orchestrator|queen)$"
   fi
 }
 
@@ -694,9 +860,9 @@ hiveMind.status() # <?session> # show one-line hivemind overview
 {
   local session="${1:-$(private.hiveMind.active.team)}"
 
-  if tmux has-session -t "$session" 2>/dev/null; then
+  if otmux has "$session" 2>/dev/null; then
     local pane_count
-    pane_count=$(tmux list-panes -t "$session" -s 2>/dev/null | wc -l | tr -d ' ')
+    pane_count=$(private.hiveMind.pane.count "$session" -s)
     local role_count=0
     if [ -f "$HIVEMIND_REGISTRY" ]; then
       role_count=$(grep -c "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null || echo 0)
@@ -722,7 +888,7 @@ hiveMind.focus() # <agentId> # focus on specific agent pane
   local pane=$(private.hiveMind.pane.for.agent "$agent_id")
 
   if [ -n "$pane" ]; then
-    tmux select-pane -t "$pane"
+    otmux pane.select "$pane"
     success.log "Focused on $agent_id"
   else
     error.log "No pane found for agent: $agent_id"
@@ -768,7 +934,7 @@ hiveMind.resolve() # <name> <?session> # resolve agent name to pane target via r
 hiveMind.resolve.completion.name() {
   local session
   session=$(private.hiveMind.active.team)
-  [ -f "$HIVEMIND_REGISTRY" ] && grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2
+  private.hiveMind.registry.list "$session" 2>/dev/null | cut -d'|' -f2
 }
 hiveMind.resolve.completion.session() {
   private.hiveMind.teams.complete
@@ -817,26 +983,9 @@ hiveMind.send.completion.name() {
   hiveMind.resolve.completion.name
 }
 
-hiveMind.send.enter() # <name> <message> # send message to agent by name, followed by Enter
+hiveMind.send.enter() # <name> <message> # send message to agent by name (delegates to send.message)
 {
-  local name="$1"
-  shift
-  local message="$*"
-
-  if [ -z "$name" ] || [ -z "$message" ]; then
-    error.log "Usage: hiveMind send.enter <name> <message>"
-    return 1
-  fi
-
-  local target
-  target=$(hiveMind.resolve "$name")
-  if [ $? -ne 0 ]; then
-    return 1
-  fi
-
-  otmux send.enter "$target" "$message"
-  info.log "Sent to $name ($target): $message"
-  return 0
+  hiveMind.send.message "$@"
 }
 hiveMind.send.enter.completion.name() {
   hiveMind.resolve.completion.name
@@ -1116,7 +1265,7 @@ hiveMind.panes() # # list all agent panes
 {
   echo "HiveMind Agent Panes:"
   echo "─────────────────────────────────────────"
-  tmux list-panes -a -F "#{pane_id} #{pane_title} #{pane_current_command}" 2>/dev/null | \
+  private.hiveMind.list.panes "#{pane_id} #{pane_title} #{pane_current_command}" | \
     while read pane_id title cmd; do
       # Filter to only show agent panes
       if echo "$title" | grep -qE "orchestrator|coder|tester|reviewer|researcher|oosh-expert|oosh-tester|scrum-master|product-owner|developer|agent-trainer|task-agent"; then
@@ -1150,11 +1299,619 @@ hiveMind.claude() # <agentId> <?prompt> # interact with agent via Claude Code
 
   if [ -z "$prompt" ]; then
     # Focus on agent pane
-    tmux select-pane -t "$pane"
+    otmux pane.select "$pane"
   else
     # Send prompt to agent
     otmux send "$pane" "$prompt" Enter
   fi
+}
+
+hiveMind.process.lookup() # <pid> # resolve Claude PID to pane target, role, and session UUID
+{
+  local pid="$1"
+  if [ -z "$pid" ]; then
+    error.log "Usage: hiveMind process.lookup <pid>"
+    return 1
+  fi
+
+  # 1. Verify PID exists and get TTY
+  local tty
+  tty=$(ps -p "$pid" -o tty= 2>/dev/null)
+  tty="${tty// /}"
+  if [ -z "$tty" ] || [ "$tty" = "??" ]; then
+    error.log "PID $pid not found or has no TTY"
+    return 1
+  fi
+
+  # 2. Find tmux pane matching this TTY
+  local pane_target=""
+  local tty_dev="/dev/$tty"
+  while IFS=' ' read -r pane_tty pane_ref; do
+    if [ "$pane_tty" = "$tty_dev" ]; then
+      pane_target="$pane_ref"
+      break
+    fi
+  done < <(private.hiveMind.list.panes tty)
+
+  if [ -z "$pane_target" ]; then
+    error.log "PID $pid (TTY $tty) not found in any tmux pane"
+    return 1
+  fi
+
+  # 3. Extract session UUID from process args
+  local sid
+  sid=$(ps -p "$pid" -o args= 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+
+  # 4. Get role via live discovery
+  local role
+  role=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
+
+  # Output
+  if [ -n "$role" ]; then
+    echo "PID $pid → $pane_target ($role)"
+  else
+    echo "PID $pid → $pane_target"
+  fi
+  [ -n "$sid" ] && echo "Session: $sid"
+  echo "TTY: $tty_dev"
+  return 0
+}
+
+hiveMind.process.lookup.completion.pid() {
+  ps -eo pid,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1}'
+}
+
+hiveMind.process.list() # <?session> # list all Claude processes with pane targets, roles, UUIDs
+{
+  local session="$1"
+
+  # Header
+  printf "%-8s %-34s %-20s %s\n" "PID" "PANE" "ROLE" "SESSION UUID"
+  printf "%-8s %-34s %-20s %s\n" "---" "----" "----" "------------"
+
+  local found=0
+  while IFS='|' read -r pid tty paneTarget title rest; do
+    [ -z "$pid" ] && continue
+
+    # Filter by session if specified
+    if [ -n "$session" ] && [[ "$paneTarget" != "${session}:"* ]]; then
+      continue
+    fi
+
+    # Extract UUID from --resume args → session.id → session.probe
+    local sid
+    sid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$sid" ]; then
+      sid=$("$OOSH_DIR/claudeCode" session.id "$paneTarget" 2>/dev/null)
+    fi
+    if [ -z "$sid" ]; then
+      sid=$("$OOSH_DIR/claudeCode" session.probe "$paneTarget" 2>/dev/null)
+    fi
+    local sidShort="${sid:0:8}${sid:+...}"
+
+    # Get role
+    local role
+    role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
+
+    printf "%-8s %-34s %-20s %s\n" "$pid" "$paneTarget" "${role:--}" "${sidShort:--}"
+    found=$((found + 1))
+  done < <(private.hiveMind.claude.processes)
+
+  [ "$found" -eq 0 ] && echo "(no Claude processes found)"
+  return 0
+}
+
+hiveMind.process.list.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.teams.save() # # snapshot all Claude processes for restore after restart
+{
+  local configPath="${CONFIG_PATH:-$HOME/config}"
+  local outfile="${configPath}/hivemind.snapshot.$(date +%Y%m%dT%H%M%S).env"
+
+  local count=0
+  echo "# hiveMind snapshot $(date +%Y-%m-%dT%H:%M:%S)" > "$outfile"
+  echo "# session|address|role|uuid|title" >> "$outfile"
+
+  while IFS='|' read -r pid tty paneTarget title rest; do
+    [ -z "$pid" ] && continue
+
+    # Parse pane target → session + address
+    local sess="${paneTarget%%:*}"
+    local addr="${paneTarget#*:}"
+
+    # UUID from --resume args → session.id → session.probe (last resort)
+    local sid
+    sid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$sid" ]; then
+      sid=$("$OOSH_DIR/claudeCode" session.id "$paneTarget" 2>/dev/null)
+    fi
+    if [ -z "$sid" ]; then
+      sid=$("$OOSH_DIR/claudeCode" session.probe "$paneTarget" 2>/dev/null)
+    fi
+
+    # Role from live discovery → registry → title fallback
+    local role
+    role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
+    if [ -z "$role" ]; then
+      role=$(private.hiveMind.registry.get "$paneTarget" 2>/dev/null)
+    fi
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      role="${title}"
+      role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"; role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
+      role="${role%%@*}"
+      role=$(echo "$role" | tr -d '[:space:]' | head -c 30)
+      [ -z "$role" ] && role="unknown"
+    fi
+
+    echo "${sess}|${addr}|${role}|${sid:-}|${title:-}" >> "$outfile"
+    count=$((count + 1))
+  done < <(private.hiveMind.claude.processes)
+
+  # BUG-Q: Also include dead agents from registry+sessions.env
+  local reg="$HIVEMIND_REGISTRY"
+  local ses="$HIVEMIND_SESSIONS"
+  local dead_count=0
+  if [ -f "$reg" ]; then
+    while IFS='|' read -r pane_target reg_role; do
+      [ -z "$pane_target" ] || [ -z "$reg_role" ] && continue
+      # Skip if already captured from live processes
+      grep -q "|${reg_role}|" "$outfile" 2>/dev/null && continue
+      local dead_sess="${pane_target%%:*}"
+      local dead_addr="${pane_target#*:}"
+      local dead_uuid=""
+      [ -f "$ses" ] && dead_uuid=$(grep "^${reg_role}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
+      local dead_title="${reg_role}"
+      echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${dead_title} (dead)" >> "$outfile"
+      dead_count=$((dead_count + 1))
+    done < "$reg"
+  fi
+
+  echo "Saved $count live + $dead_count dead agents to $outfile"
+  cat "$outfile"
+  return 0
+}
+
+hiveMind.teams.restore() # <?snapshot_file> # restore teams from snapshot (dry-run by default)
+{
+  local snapfile="$1"
+  if [ -z "$snapfile" ]; then
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+  fi
+  if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
+    error.log "No snapshot found. Usage: hiveMind teams.restore <?file>"
+    return 1
+  fi
+
+  echo "Restoring from: $snapfile"
+  echo ""
+
+  # Ensure tmux server is running (BUG-Z1)
+  local RESTORE_CLEANUP_SESSION=""
+  if ! otmux sessions >/dev/null 2>&1; then
+    otmux new __restore_init -d -x 200 -y 50 2>/dev/null
+    RESTORE_CLEANUP_SESSION="__restore_init"
+  fi
+
+  local prev_sess=""
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$sess" ] && continue
+
+    # Create session if new
+    if [ "$sess" != "$prev_sess" ]; then
+      if ! otmux has "$sess" 2>/dev/null; then
+        echo "Creating session: $sess"
+        otmux new "$sess" -d -x 200 -y 50 2>/dev/null
+      fi
+      prev_sess="$sess"
+    fi
+
+    local pane_target="${sess}:${addr}"
+
+    # Ensure pane exists (create window + split until target pane index exists)
+    private.hiveMind.ensure.pane "$pane_target"
+
+    # Set pane title
+    if [ -n "$title" ]; then
+      "$OOSH_DIR/otmux" pane.title "$pane_target" "$title" 2>/dev/null
+    fi
+
+    # Resume Claude if UUID available
+    if [ -n "$uuid" ]; then
+      echo "  ${pane_target}: resuming ${role:-unknown} (${uuid:0:8}...)"
+      "$OOSH_DIR/otmux" send "$pane_target" "claudeCode join $uuid" Enter
+      # Send boot prompt after resume
+      if [ -n "$role" ] && [ "$role" != "unknown" ]; then
+        sleep 5
+        local boot_file="session/agents/${role}/boot.md"
+        if [ -f "$HIVEMIND_AGENTS_DIR/../../$boot_file" ] 2>/dev/null; then
+          "$OOSH_DIR/otmux" send "$pane_target" "Read $boot_file" Enter
+        fi
+      fi
+    else
+      echo "  ${pane_target}: ${role:-unknown} (no UUID — start manually)"
+    fi
+
+    # Update registry
+    if [ -n "$role" ] && [ "$role" != "unknown" ]; then
+      private.hiveMind.registry.set "$pane_target" "$role" 2>/dev/null
+    fi
+
+  done < "$snapfile"
+
+  # Clean up init session if we created it
+  if [ -n "$RESTORE_CLEANUP_SESSION" ]; then
+    otmux kill "$RESTORE_CLEANUP_SESSION" 2>/dev/null
+  fi
+
+  echo ""
+  echo "Restore complete. Check with: hiveMind team.status"
+  return 0
+}
+
+hiveMind.teams.restore.completion.snapshot_file() {
+  ls "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null
+}
+
+hiveMind.teams.migrate() # <ossh-host> <?snapshot_file> # migrate team to remote machine via ossh
+{
+  local host="$1"
+  local snapfile="$2"
+
+  if [ -z "$host" ]; then
+    error.log "Usage: hiveMind teams.migrate <ossh-host> <?snapshot_file>"
+    return 1
+  fi
+
+  # 1. Validate snapshot
+  if [ -z "$snapfile" ]; then
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+  fi
+  if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
+    echo "No snapshot found. Running teams.save first..."
+    hiveMind.teams.save
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+  fi
+  echo "Using snapshot: $snapfile"
+
+  # 2. Transfer config files
+  echo ""
+  echo "Transferring config to $host..."
+  "$OOSH_DIR/ossh" push.dir "$host" ~/config
+
+  # 3. Sync oosh code on remote
+  echo ""
+  echo "Syncing oosh on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "cd ~/oosh && git pull" 2>/dev/null || \
+    "$OOSH_DIR/ossh" push.dir "$host" "$OOSH_DIR"
+
+  # 4. Check prerequisites on remote
+  echo ""
+  echo "Checking prerequisites on $host..."
+  local missing=""
+  missing=$("$OOSH_DIR/ossh" exec "$host" '
+    errors=""
+    command -v tmux >/dev/null 2>&1 || { test -x /opt/homebrew/bin/tmux && export PATH=/opt/homebrew/bin:$PATH; } || errors="${errors}tmux "
+    command -v claude >/dev/null 2>&1 || test -x ~/.local/bin/claude || errors="${errors}claude "
+    echo "$errors"
+  ' 2>/dev/null)
+  if [ -n "$missing" ]; then
+    error.log "Missing on $host: $missing"
+    return 1
+  fi
+  echo "Prerequisites OK"
+
+  # 5. Ensure tmux server running + restore on remote
+  echo ""
+  echo "Running teams.restore on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore"
+
+  # 6. Verify
+  echo ""
+  echo "Verifying on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind team.status" 2>/dev/null
+
+  echo ""
+  echo "Migration to $host complete."
+  echo "Connect with: ossh login $host"
+  return 0
+}
+
+hiveMind.teams.migrate.completion.ossh_host() {
+  "$OOSH_DIR/ossh" config.get.completion 2>/dev/null
+}
+
+hiveMind.teams.migrate.completion.snapshot_file() {
+  ls "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null
+}
+
+hiveMind.registry.set() # <pane> <role> # set registry entry for a pane
+{
+  local target="$1" role="$2"
+  if [ -z "$target" ] || [ -z "$role" ]; then
+    error.log "Usage: hiveMind registry.set <pane> <role>"
+    return 1
+  fi
+  private.hiveMind.registry.set "$target" "$role"
+  echo "Registry: $target → $role"
+}
+
+hiveMind.registry.remove() # <pane> # remove registry entry for a pane
+{
+  local target="$1"
+  if [ -z "$target" ]; then
+    error.log "Usage: hiveMind registry.remove <pane>"
+    return 1
+  fi
+  local reg="$HIVEMIND_REGISTRY"
+  if [ -f "$reg" ] && grep -q "^${target}|" "$reg" 2>/dev/null; then
+    grep -v "^${target}|" "$reg" > "${reg}.tmp" && mv "${reg}.tmp" "$reg"
+    echo "Removed $target from registry"
+  else
+    error.log "No registry entry for $target"
+    return 1
+  fi
+}
+
+hiveMind.registry.set.completion.pane() {
+  private.hiveMind.list.panes addr
+}
+
+hiveMind.registry.set.completion.role() {
+  hiveMind.role.list 2>/dev/null
+}
+
+hiveMind.registry.remove.completion.pane() {
+  [ -f "$HIVEMIND_REGISTRY" ] && cut -d'|' -f1 "$HIVEMIND_REGISTRY" 2>/dev/null
+}
+
+hiveMind.registry.list() # <?session> # list registry entries (live discovery + file fallback)
+{
+  private.hiveMind.registry.list "$1"
+}
+
+hiveMind.registry.list.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.team.activate() # <session> # set active team (alias for team.switch)
+{
+  hiveMind.team.switch "$@"
+}
+
+hiveMind.team.activate.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.consistency.audit() # <?session> # cross-compare all identity sources and show mismatches
+{
+  local filter_session="$1"
+
+  # Load registry file
+  local reg="$HIVEMIND_REGISTRY"
+  # Load sessions.env (role|uuid)
+  local sess_file="$HIVEMIND_SESSIONS"
+
+  echo -e "${BOLD_CYAN}Identity Consistency Audit${NORMAL}"
+  echo -e "${GRAY}$(printf '%.0s═' {1..85})${NORMAL}"
+  printf "${BOLD_WHITE}%-28s %-16s %-16s %-13s %-16s %s${NORMAL}\n" "PANE" "TITLE" "REGISTRY" "SESS.ENV" "LIVE UUID" "MATCH"
+  echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
+
+  local consistent=0 inconsistent=0
+  local -A seen_uuids
+
+  while IFS='|' read -r pid tty pane_target title rest; do
+    [ -z "$pid" ] && continue
+
+    # Filter by session
+    if [ -n "$filter_session" ] && [[ "$pane_target" != "${filter_session}:"* ]]; then
+      continue
+    fi
+
+    local title_short="${title:0:14}"
+    [ ${#title} -gt 14 ] && title_short="${title_short}.."
+
+    # Registry role
+    local reg_role=""
+    [ -f "$reg" ] && reg_role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+    local reg_display="${reg_role:-${BOLD_YELLOW}MISSING${NORMAL}}"
+
+    # Sessions.env UUID (look up by registry role or title-derived role)
+    local sess_uuid=""
+    local lookup_role="${reg_role}"
+    if [ -z "$lookup_role" ]; then
+      lookup_role="${title}"; lookup_role="${lookup_role#✳ }"; lookup_role="${lookup_role#⠐ }"
+      lookup_role="${lookup_role#⠂ }"; lookup_role="${lookup_role#✻ }"; lookup_role="${lookup_role#✢ }"; lookup_role="${lookup_role#✶ }"
+      lookup_role="${lookup_role%%@*}"; lookup_role=$(echo "$lookup_role" | tr -d '[:space:]')
+    fi
+    if [ -n "$lookup_role" ] && [ -f "$sess_file" ]; then
+      sess_uuid=$(grep "^${lookup_role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+    fi
+    local sess_short="${sess_uuid:0:8}"
+
+    # Live UUID from ps args → session.id
+    local live_uuid
+    live_uuid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$live_uuid" ]; then
+      live_uuid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+    fi
+    local live_short="${live_uuid:0:8}"
+
+    # Consistency checks
+    local issues=()
+    [ -z "$reg_role" ] && issues+=("no registry")
+    if [ -n "$reg_role" ] && [ -n "$title" ]; then
+      echo "$title" | grep -qi "$reg_role" 2>/dev/null || issues+=("title≠reg")
+    fi
+    if [ -n "$sess_uuid" ] && [ -n "$live_uuid" ] && [ "$sess_uuid" != "$live_uuid" ]; then
+      issues+=("UUID stale")
+    fi
+    if [ -n "$live_uuid" ]; then
+      if [ -n "${seen_uuids[$live_uuid]:-}" ]; then
+        issues+=("dup UUID")
+      fi
+      seen_uuids["$live_uuid"]="$pane_target"
+    fi
+    if [ -n "$reg_role" ]; then
+      [[ ${#reg_role} -gt 30 ]] && issues+=("role>30")
+      [[ "$reg_role" == *" "* ]] && issues+=("role has space")
+    fi
+
+    local match="${BOLD_GREEN}✓${NORMAL}"
+    local issue_str=""
+    if [ ${#issues[@]} -gt 0 ]; then
+      match="${BOLD_RED}✗${NORMAL}"
+      issue_str="${BOLD_RED}$(IFS=', '; echo "${issues[*]}")${NORMAL}"
+      inconsistent=$((inconsistent + 1))
+    else
+      consistent=$((consistent + 1))
+    fi
+
+    printf "%-28s %-16s %-16b %-13s %-16s %b %b\n" \
+      "$pane_target" "$title_short" "$reg_display" "${sess_short:--}" "${live_short:--}" "$match" "$issue_str"
+
+  done < <(private.hiveMind.claude.processes)
+
+  echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
+  echo -e "Summary: ${BOLD_GREEN}$consistent consistent${NORMAL}, ${BOLD_RED}$inconsistent inconsistent${NORMAL}"
+  return 0
+}
+
+hiveMind.consistency.audit.completion.session() {
+  private.hiveMind.teams.complete
+}
+
+hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from live truth
+{
+  local filter_session="$1"
+
+  local reg="$HIVEMIND_REGISTRY"
+  local sess_file="$HIVEMIND_SESSIONS"
+
+  # Ensure files exist
+  [ -f "$reg" ] || touch "$reg"
+  [ -f "$sess_file" ] || touch "$sess_file"
+
+  echo -e "${BOLD_CYAN}Fixing identity consistency...${NORMAL}"
+  echo
+
+  local fixed_reg=0 fixed_sess=0 fixed_title=0 skipped=0 dup_resolved=0
+  local -A seen_uuids role_for_uuid
+
+  while IFS='|' read -r pid tty pane_target title rest; do
+    [ -z "$pid" ] && continue
+
+    # Filter by session
+    if [ -n "$filter_session" ] && [[ "$pane_target" != "${filter_session}:"* ]]; then
+      continue
+    fi
+
+    # --- 1. Get LIVE UUID (ground truth) ---
+    local live_uuid
+    live_uuid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    if [ -z "$live_uuid" ]; then
+      live_uuid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+    fi
+    if [ -z "$live_uuid" ]; then
+      live_uuid=$("$OOSH_DIR/claudeCode" session.probe "$pane_target" 2>/dev/null)
+    fi
+
+    # --- 2. Get role name (ground truth) ---
+    local role=""
+    # Try registry first
+    [ -f "$reg" ] && role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+
+    # Try pane title fallback
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      role="${title}"
+      role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"
+      role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
+      role="${role%%@*}"
+      role=$(echo "$role" | tr -d '[:space:]' | head -c 30)
+    fi
+
+    # Try live.discover
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      local discover_result
+      discover_result=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
+      if [ -n "$discover_result" ]; then
+        role=$(echo "$discover_result" | cut -d'|' -f4)
+        role="${role%%@*}"
+      fi
+    fi
+
+    # Can't determine role — skip
+    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+      printf "${BOLD_YELLOW}%-28s %-16s SKIPPED (can't determine role)${NORMAL}\n" "$pane_target" "${title:0:14}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    local line_parts=()
+
+    # --- 3a. Fix missing/stale registry ---
+    local existing_reg=""
+    existing_reg=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+    if [ -z "$existing_reg" ]; then
+      private.hiveMind.registry.set "$pane_target" "$role"
+      line_parts+=("${BOLD_GREEN}registry.set ✓${NORMAL}")
+      fixed_reg=$((fixed_reg + 1))
+    else
+      line_parts+=("${GREEN}registry ✓${NORMAL}")
+    fi
+
+    # --- 3b. Fix sessions.env UUID ---
+    if [ -n "$live_uuid" ]; then
+      # Check for duplicate UUID
+      if [ -n "${seen_uuids[$live_uuid]:-}" ]; then
+        local dup_role="${role_for_uuid[$live_uuid]:-}"
+        echo -e "${BOLD_RED}⚠ DUPLICATE UUID: $dup_role and $role both have ${live_uuid:0:8}${NORMAL}"
+        dup_resolved=$((dup_resolved + 1))
+      fi
+      seen_uuids["$live_uuid"]="$pane_target"
+      role_for_uuid["$live_uuid"]="$role"
+
+      local old_uuid=""
+      old_uuid=$(grep "^${role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+      if [ -z "$old_uuid" ]; then
+        # Add new entry
+        echo "${role}|${live_uuid}" >> "$sess_file"
+        line_parts+=("${BOLD_GREEN}sessions.env → ${live_uuid:0:8} ✓${NORMAL}")
+        fixed_sess=$((fixed_sess + 1))
+      elif [ "$old_uuid" != "$live_uuid" ]; then
+        # Replace stale UUID
+        sed -i '' "s#^${role}|${old_uuid}\$#${role}|${live_uuid}#" "$sess_file"
+        line_parts+=("${BOLD_GREEN}sessions.env → ${live_uuid:0:8} ✓${NORMAL}  ${BOLD_YELLOW}(was ${old_uuid:0:8} STALE)${NORMAL}")
+        fixed_sess=$((fixed_sess + 1))
+      else
+        line_parts+=("${GREEN}sessions.env ✓${NORMAL}")
+      fi
+    else
+      line_parts+=("${BOLD_YELLOW}sessions.env — (no live UUID)${NORMAL}")
+    fi
+
+    # --- 3c. Fix pane title if it doesn't match role ---
+    if ! echo "$title" | grep -qi "$role" 2>/dev/null; then
+      otmux pane.lock "$pane_target" "$role"
+      line_parts+=("${BOLD_GREEN}title → $role ✓ (locked)${NORMAL}")
+      fixed_title=$((fixed_title + 1))
+    fi
+
+    printf "%-28s %-16s %b\n" "$pane_target" "$role" "$(IFS='  '; echo "${line_parts[*]}")"
+
+  done < <(private.hiveMind.claude.processes)
+
+  echo
+  echo -e "Fixed: ${BOLD_GREEN}$fixed_reg${NORMAL} registry, ${BOLD_GREEN}$fixed_sess${NORMAL} sessions, ${BOLD_GREEN}$fixed_title${NORMAL} titles, ${BOLD_RED}$dup_resolved${NORMAL} duplicates"
+  [ $skipped -gt 0 ] && echo -e "${BOLD_YELLOW}Skipped: $skipped (unknown role)${NORMAL}"
+  echo "Run hiveMind consistency.audit to verify."
+  return 0
+}
+
+hiveMind.consistency.fix.completion.session() {
+  private.hiveMind.teams.complete
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1168,13 +1925,13 @@ hiveMind.oosh.init() # <?session> # initialize OOSH expert and tester agents in 
   info.log "Initializing OOSH specialist agents in session: $session"
   
   # Check if session exists
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! otmux has "$session" 2>/dev/null; then
     error.log "Session $session not found. Create it first with otmux new $session"
     return 1
   fi
   
   # List existing panes
-  local pane_count=$(tmux list-panes -t "$session" -F "#{pane_id}" | wc -l | tr -d ' ')
+  local pane_count=$(private.hiveMind.pane.count "$session")
   info.log "Session has $pane_count panes"
   
   success.log "OOSH agents ready in session: $session"
@@ -1193,10 +1950,10 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   info.log "Setting up OOSH team in session: $session"
 
   # Check if session already exists
-  if tmux has-session -t "$session" 2>/dev/null; then
+  if otmux has "$session" 2>/dev/null; then
     warn.log "Session '$session' already exists"
-    echo "  Kill it first:  tmux kill-session -t $session"
-    echo "  Or attach to it: tmux attach -t $session"
+    echo "  Kill it first:  otmux kill $session"
+    echo "  Or attach to it: otmux attach $session"
     return 1
   fi
 
@@ -1212,7 +1969,7 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   otmux new "$session" -d
 
   # Name window 0
-  tmux rename-window -t "${session}:0" "$HIVEMIND_WINDOW_NAME"
+  otmux window.rename "${session}:0" "$HIVEMIND_WINDOW_NAME"
 
   # Split pane 0 vertically → pane 0 (upper) + pane 1 (lower)
   otmux split.v -t "${session}:0.0"
@@ -1240,7 +1997,7 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
 
   # ── Capture UUIDs for identity tracking ─────────────────────────────────
   info.log "Capturing session UUIDs..."
-  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local ses="$HIVEMIND_SESSIONS"
   local _roles=("oosh-orchestrator" "oosh-expert" "oosh-tester")
   local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2")
   for i in 0 1 2; do
@@ -1272,7 +2029,7 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   echo "│ (oosh-expert)         │ (oosh-tester)   │"
   echo "└───────────────────────┴─────────────────┘"
   echo ""
-  echo "Attach with: tmux attach -t $session"
+  echo "Attach with: otmux attach $session"
 }
 
 hiveMind.team.setup.oosh.completion.session() {
@@ -1432,7 +2189,7 @@ hiveMind.registry.fix() # # clean up invalid entries in roles registry (raw %NNN
     # Skip entries with raw pane IDs (%NNN format)
     if echo "$pane" | grep -qE '^%[0-9]+$'; then
       local resolved
-      resolved=$(tmux display-message -t "$pane" -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+      resolved=$(otmux pane.get "$pane" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
       if [ -n "$resolved" ] && echo "$resolved" | grep -qE '^[a-zA-Z0-9_-]+:[0-9]+\.[0-9]+$'; then
         echo "${resolved}|${role}" >> "$tmpfile"
         fixed=$((fixed + 1))
@@ -1454,10 +2211,10 @@ hiveMind.registry.fix.completion() { :; }
 hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessions from /status ground truth
 {
   local session="${1:-$(private.hiveMind.active.team)}"
-  [ -z "$session" ] && session=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  [ -z "$session" ] && session=$(private.hiveMind.current.session)
 
-  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local reg="$HIVEMIND_REGISTRY"
+  local ses="$HIVEMIND_SESSIONS"
   local updated=0
 
   # Prune entries for panes that no longer exist in tmux
@@ -1465,7 +2222,7 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
     local clean=""
     while IFS='|' read -r pt rl; do
       [ -z "$pt" ] && continue
-      if tmux display-message -t "$pt" -p "#{pane_id}" >/dev/null 2>&1; then
+      if otmux pane.get "$pt" % >/dev/null 2>&1; then
         clean="${clean}${pt}|${rl}\n"
       else
         info.log "  Pruning dead pane: $pt ($rl)"
@@ -1475,8 +2232,7 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
   fi
 
   local pane_list
-  pane_list=$(tmux list-panes -t "$session" -a \
-    -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+  pane_list=$(private.hiveMind.list.panes addr "$session")
 
   while IFS= read -r pane_target; do
     [ -z "$pane_target" ] && continue
@@ -1503,6 +2259,11 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
     [ -z "$name" ] && continue
     [[ "$name" != *"@"* ]] && continue
     local role="${name%%@*}"
+
+    # Validate role: reject garbage from firstPrompt leaking into session names
+    [[ "$role" == *" "* ]] && { warn.log "  $pane_target: rejected role with spaces: $role"; continue; }
+    [[ ${#role} -gt 30 ]] && { warn.log "  $pane_target: rejected role >30 chars: ${role:0:30}..."; continue; }
+    [[ "$role" =~ ^(Read|You|I\ am|Write|Edit|Help|Search|Find|Look|Check|Run|Show) ]] && { warn.log "  $pane_target: rejected prompt-like role: $role"; continue; }
 
     # Write roles registry: pane → role
     echo "${pane_target}|${role}" >> "$reg"
@@ -1563,7 +2324,7 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
   fi
 
   # Check session exists
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! otmux has "$session" 2>/dev/null; then
     error.log "Session $session not found"
     return 1
   fi
@@ -1573,10 +2334,10 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
   # Step 1: Create pane if not specified
   if [ -z "$target_pane" ]; then
     # Split from the last pane in window 0
-    tmux split-window -t "${session}:0" -h
-    tmux select-layout -t "${session}:0" tiled
+    otmux split.h -t "${session}:0"
+    otmux tiled "${session}:0"
     # Get the new pane index
-    local pane_count=$(tmux list-panes -t "${session}:0" -F "#{pane_index}" | sort -n | tail -1)
+    local pane_count=$(otmux panes -t "${session}:0" -F "#{pane_index}" | sort -n | tail -1)
     target_pane="${session}:0.${pane_count}"
     info.log "Created new pane: $target_pane"
   fi
@@ -1586,7 +2347,7 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
 
   # Step 3: Start Claude Code
   info.log "Starting Claude Code in pane $target_pane..."
-  otmux send.enter "$target_pane" "claude --dangerously-skip-permissions"
+  "$OOSH_DIR/otmux" send.enter "$target_pane" "claudeCode new"
 
   # Step 4: Wait for startup
   info.log "Waiting for Claude Code to initialize..."
@@ -1596,7 +2357,7 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
   local new_sid
   new_sid=$(claudeCode session.probe "$target_pane" 2>/dev/null)
   if [ -n "$new_sid" ]; then
-    local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+    local ses="$HIVEMIND_SESSIONS"
     if [ -f "$ses" ]; then
       grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
       mv "${ses}.tmp" "$ses"
@@ -1604,6 +2365,11 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
     echo "${role}|${new_sid}" >> "$ses"
     info.log "Captured session UUID for $role: ${new_sid:0:8}..."
   fi
+
+  # Step 4c: Set session name via /rename so registry.refresh can identify this agent
+  info.log "Setting session name to ${role}@opus..."
+  otmux send.enter "$target_pane" "/rename ${role}@opus"
+  sleep 2
 
   # Step 5: Teach role
   local full_prompt
@@ -1637,7 +2403,7 @@ hiveMind.agent.verify() # <pane> # check if agent is alive and processing
   info.log "Verifying agent in pane $pane..."
 
   local output
-  output=$(tmux capture-pane -t "$pane" -p -S -15 2>/dev/null)
+  output=$(otmux pane.capture "$pane" 15 2>/dev/null)
 
   if [ $? -ne 0 ]; then
     error.log "Cannot capture pane: $pane"
@@ -1751,8 +2517,8 @@ hiveMind.agent.context.status() # <agent> <?session> # show context % for one ag
   sleep 5
 
   local ctx_output
-  # Full scrollback — otmux pane.capture doesn't support -S -, raw tmux required
-  ctx_output=$(tmux capture-pane -t "$target" -p -S - 2>/dev/null)
+  # Full scrollback — use large line count for complete /context output
+  ctx_output=$(otmux pane.capture "$target" 32767 2>/dev/null)
 
   # Parse token line
   local token_line pct tokens
@@ -1819,11 +2585,9 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
   # Enumerate actual panes via otmux (not just registry) — shows unregistered panes too
   while IFS=$'\t' read -r target pane_title _rest; do
     [ -z "$target" ] && continue
-    # Filter to requested session
-    case "$target" in "${session}:"*) ;; *) continue ;; esac
 
     # Look up role from registry; fall back to pane title or "(unregistered)"
-    role=$(grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2)
+    role=$(private.hiveMind.registry.get "$target")
     [ -z "$role" ] && role="${pane_title:-(unregistered)}"
 
     local pane_short="${target#${session}:}"
@@ -1939,7 +2703,7 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
     fi
 
     printf "%-20s %-8s %-6s %-12s %s\n" "$role" "$pane_short" "${remaining}%" "$tokens" "$threshold"
-  done < <("$OOSH_DIR/otmux" pane.list "$session" 2>/dev/null)
+  done < <(tmux list-panes -t "$session" -s -F "#{session_name}:#{window_index}.#{pane_index}	#{pane_title}	#{pane_current_command}" 2>/dev/null)
 
   echo "──────────────────────────────────────────"
 
@@ -1965,10 +2729,10 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   info.log "Setting up full OOSH team in session: $session"
 
   # Check if session already exists
-  if tmux has-session -t "$session" 2>/dev/null; then
+  if otmux has "$session" 2>/dev/null; then
     warn.log "Session '$session' already exists"
-    echo "  Kill it first:  tmux kill-session -t $session"
-    echo "  Or attach to it: tmux attach -t $session"
+    echo "  Kill it first:  otmux kill $session"
+    echo "  Or attach to it: otmux attach $session"
     return 1
   fi
 
@@ -1986,7 +2750,7 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   otmux new "$session" -d
 
   # Name window 0
-  tmux rename-window -t "${session}:0" "$HIVEMIND_WINDOW_NAME"
+  otmux window.rename "${session}:0" "$HIVEMIND_WINDOW_NAME"
 
   # Split pane 0 vertically → pane 0 (upper) + pane 1 (lower)
   otmux split.v -t "${session}:0.0"
@@ -2020,7 +2784,7 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
 
   # ── Capture UUIDs for identity tracking ─────────────────────────────────
   info.log "Capturing session UUIDs..."
-  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local ses="$HIVEMIND_SESSIONS"
   local _roles=("orchestrator" "scrum-master" "oosh-expert" "oosh-tester")
   local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2" "${session}:0.3")
   for i in 0 1 2 3; do
@@ -2056,7 +2820,7 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   echo "│ Pane 0.1 - SCRUMMASTER                  │"
   echo "└─────────────────────────────────────────┘"
   echo ""
-  echo "Attach with: tmux attach -t $session"
+  echo "Attach with: otmux attach $session"
 }
 
 hiveMind.team.setup.full.completion.session() {
@@ -2150,7 +2914,7 @@ hiveMind.team.switch() # <session> # set the active team context
   fi
 
   # Verify session exists in tmux or in team registry
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! otmux has "$session" 2>/dev/null; then
     if [ -f "$HIVEMIND_TEAMS" ] && grep -q "^${session}|" "$HIVEMIND_TEAMS" 2>/dev/null; then
       warn.log "Team $session is registered but tmux session is not running"
     else
@@ -2190,7 +2954,7 @@ hiveMind.team.list() # # list all registered team sessions
       local marker=" "
       [ "$session" = "$active" ] && marker="*"
       local running=""
-      tmux has-session -t "$session" 2>/dev/null && running="running" || running="stopped"
+      otmux has "$session" 2>/dev/null && running="running" || running="stopped"
       if [ -n "$description" ]; then
         printf " %s %-24s %-10s %s\n" "$marker" "$session" "($running)" "$description"
       else
@@ -2221,7 +2985,7 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
     [ -z "$teams" ] && { error.log "No teams registered"; return 1; }
 
     while read -r team; do
-      if ! tmux has-session -t "$team" 2>/dev/null; then
+      if ! otmux has "$team" 2>/dev/null; then
         printf "%-24s (session not running)\n" "$team"
         continue
       fi
@@ -2248,14 +3012,13 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
   fi
 
   # With argument: show detailed per-pane tree (existing behavior)
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! otmux has "$session" 2>/dev/null; then
     error.log "Session $session not found"
     return 1
   fi
 
   local pane_lines
-  pane_lines=$(tmux list-panes -t "$session" -s \
-    -F "#{window_index}.#{pane_index}|#{pane_current_command}" 2>/dev/null)
+  pane_lines=$(private.hiveMind.list.panes addr+cmd "$session")
 
   local total
   total=$(echo "$pane_lines" | wc -l | tr -d ' ')
@@ -2363,7 +3126,7 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
     return 1
   fi
 
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! otmux has "$session" 2>/dev/null; then
     error.log "Session $session not found"
     return 1
   fi
@@ -2386,7 +3149,7 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
     # Skip self
     if [ -n "$own_pane" ]; then
       local pane_id
-      pane_id=$(tmux display-message -t "$target" -p "#{pane_id}" 2>/dev/null)
+      pane_id=$(otmux pane.get "$target" % 2>/dev/null)
       [ "$pane_id" = "$own_pane" ] && continue
     fi
 
@@ -2563,7 +3326,7 @@ hiveMind.monitor() # <?name-or-lines:5> <?session-or-lines> # capture pane outpu
   local lines="$first"
   local session="${second:-${HIVEMIND_SESSION:-$(private.hiveMind.active.team)}}"
 
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! otmux has "$session" 2>/dev/null; then
     error.log "Session '$session' not found"
     return 1
   fi
@@ -2577,7 +3340,7 @@ hiveMind.monitor() # <?name-or-lines:5> <?session-or-lines> # capture pane outpu
   echo " hiveMind monitor — session: $session (last $lines lines)"
   echo "═══════════════════════════════════════════════════════════"
 
-  tmux list-panes -t "$session" -F "#{pane_id}|#{pane_index}|#{pane_title}" 2>/dev/null | \
+  otmux panes -t "$session" -F "#{pane_id}|#{pane_index}|#{pane_title}" 2>/dev/null | \
     while IFS='|' read -r pane_id pane_idx pane_title; do
       if [ -n "$own_pane" ] && [ "$pane_id" = "$own_pane" ]; then
         continue
@@ -2648,7 +3411,7 @@ private.hiveMind.sweep.detect() {
   [ -z "$target" ] && echo "unknown|none|info" && return 1
 
   local content
-  content=$(tmux capture-pane -t "$target" -p -S -20 2>/dev/null)
+  content=$(otmux pane.capture "$target" 20 2>/dev/null)
 
   local trimmed
   trimmed=$(echo "$content" | tr -d '[:space:]')
@@ -2926,7 +3689,7 @@ hiveMind.sweep() # <?session> <?interval> # show last lines of each agent pane (
     return 1
   fi
 
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! otmux has "$session" 2>/dev/null; then
     error.log "Session $session not found"
     return 1
   fi
@@ -2958,7 +3721,7 @@ hiveMind.sweep.completion.interval() {
 
 hiveMind.sweep.cycle() # <?session> <?interval:0> # run one sweep+unblock cycle with optional sleep
 {
-  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+  local session="${1:-$(private.hiveMind.current.session)}"
   local interval="${2:-0}"
 
   [ "$interval" -gt 0 ] 2>/dev/null && sleep "$interval"
@@ -2997,7 +3760,7 @@ hiveMind.auto.commit.completion() { :; }
 
 hiveMind.cycle.full() # <?session> # run full monitoring cycle: sweep + unblock + context check + auto-commit
 {
-  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+  local session="${1:-$(private.hiveMind.current.session)}"
 
   # Step 1: Sweep and unblock
   console.log "Cycle: sweep $session"
@@ -3007,7 +3770,7 @@ hiveMind.cycle.full() # <?session> # run full monitoring cycle: sweep + unblock 
   # Step 2: Check context for all panes
   console.log "Cycle: context check"
   local panes
-  panes=$(tmux list-panes -t "${session}:0" -F "#{pane_index}" 2>/dev/null)
+  panes=$(otmux panes -t "${session}:0" -F "#{pane_index}" 2>/dev/null)
   for pane in $panes; do
     local ctx
     ctx=$(claudeCode context.read "${session}:0.${pane}" 2>/dev/null)
@@ -3179,12 +3942,11 @@ hiveMind.unblock.completion.session() {
 
 hiveMind.monitor.cycle() # <?session> # full monitoring cycle: context health, velocity, detect blockers, unblock, log
 {
-  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+  local session="${1:-$(private.hiveMind.current.session)}"
 
   # List all panes across all windows (-s = session-wide)
   local pane_lines
-  pane_lines=$(tmux list-panes -t "$session" -s \
-    -F "#{window_index}.#{pane_index}|#{pane_current_command}" 2>/dev/null)
+  pane_lines=$(private.hiveMind.list.panes addr+cmd "$session")
   [ -z "$pane_lines" ] && { error.log "No panes found for $session"; return 1; }
 
   local checked=0 blocked=0 low_context=0
@@ -3351,7 +4113,7 @@ hiveMind.peer.compact.completion.target() {
   hiveMind.resolve.completion.name 2>/dev/null
 }
 hiveMind.peer.compact.completion.session() {
-  tmux list-sessions -F "#{session_name}" 2>/dev/null
+  otmux sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.handoff() # <target> <?session> # full generational handoff: detect low context, compact, verify recovery
@@ -3454,12 +4216,12 @@ hiveMind.handoff.completion.target() {
   hiveMind.resolve.completion.name 2>/dev/null
 }
 hiveMind.handoff.completion.session() {
-  tmux list-sessions -F "#{session_name}" 2>/dev/null
+  otmux sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.cold.recover() # <?session> # cold-start recovery: reconcile registry with live infrastructure, nudge agents
 {
-  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+  local session="${1:-$(private.hiveMind.current.session)}"
 
   if [ -z "$session" ]; then
     error.log "No tmux session found — are you inside tmux?"
@@ -3473,8 +4235,7 @@ hiveMind.cold.recover() # <?session> # cold-start recovery: reconcile registry w
 
   # Step 1-2: Discover live infrastructure
   local live_panes
-  live_panes=$(tmux list-panes -t "$session" -s \
-    -F "#{session_name}:#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_title}" 2>/dev/null)
+  live_panes=$(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_title}" "$session")
 
   if [ -z "$live_panes" ]; then
     error.log "No panes found in session $session"
@@ -3486,7 +4247,7 @@ hiveMind.cold.recover() # <?session> # cold-start recovery: reconcile registry w
   info.log "Found $pane_count live panes"
 
   # Step 3-5: Reconcile registry with reality
-  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local reg="$HIVEMIND_REGISTRY"
   local stale_count=0
   local live_count=0
   local recovered_count=0
@@ -3579,7 +4340,7 @@ hiveMind.cold.recover() # <?session> # cold-start recovery: reconcile registry w
   return 0
 }
 hiveMind.cold.recover.completion.session() {
-  tmux list-sessions -F "#{session_name}" 2>/dev/null
+  otmux sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.train() # <role> <?session> # train agent: verify reading list, send training task, monitor, verify completion
@@ -3705,7 +4466,7 @@ hiveMind.train.completion.role() {
   hiveMind.role.list 2>/dev/null
 }
 hiveMind.train.completion.session() {
-  tmux list-sessions -F "#{session_name}" 2>/dev/null
+  otmux sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.improvement() # <?action:next|done|list> <?number> # CMM improvement workflow: find next, mark done, list status
@@ -3860,8 +4621,7 @@ hiveMind.metrics.log() # <?session> # log sweep metrics per agent + flag context
   fi
 
   local pane_lines
-  pane_lines=$(tmux list-panes -t "$session" -s \
-    -F "#{window_index}.#{pane_index}|#{pane_current_command}" 2>/dev/null)
+  pane_lines=$(private.hiveMind.list.panes addr+cmd "$session")
   [ -z "$pane_lines" ] && { error.log "No panes for $session"; return 1; }
 
   local ts logged=0 alerts=""
@@ -3925,7 +4685,7 @@ hiveMind.metrics.log() # <?session> # log sweep metrics per agent + flag context
   return 0
 }
 hiveMind.metrics.log.completion.session() {
-  tmux list-sessions -F "#{session_name}" 2>/dev/null
+  otmux sessions -F "#{session_name}" 2>/dev/null
 }
 
 hiveMind.metrics.summary() # <?lines:20> # summarize recent sweep-log: trends, burn rates, projections
@@ -4064,7 +4824,7 @@ hiveMind.fix.path() # # verify OOSH PATH works, scan SKILL.md files for stale ex
 
   # Step 2: Verify direct command works (no export prefix needed)
   local test_result
-  test_result=$(otmux pane.capture "$(tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}')" 1 2>/dev/null)
+  test_result=$(otmux pane.capture "$(otmux pane.get.target)" 1 2>/dev/null)
   if [ $? -eq 0 ]; then
     info.log "Direct otmux command: OK"
   else
@@ -4161,17 +4921,17 @@ hiveMind.watchdog() # <?seconds:30> # start external sweep+unblock loop in a new
   fi
 
   local session
-  session=$(tmux display-message -p "#{session_name}" 2>/dev/null)
+  session=$(private.hiveMind.current.session)
   [ -z "$session" ] && { error.log "Not inside a tmux session"; return 1; }
 
   # Spawn a new pane running plain bash (no Claude Code = no permission prompts)
-  tmux split-window -t "${session}:0" -v -l 5 \
+  otmux split.v -t "${session}:0" -l 5 \
     "echo \$\$ > '$HIVEMIND_WATCHDOG_PID_FILE' && while true; do touch '$HIVEMIND_WATCHDOG_HEARTBEAT'; echo \"── watchdog @ \$(date '+%H:%M:%S') ──\" >> '$HIVEMIND_WATCHDOG_LOG'; for team in \$(hiveMind team.list 2>/dev/null); do hiveMind unblock all \"\$team\" >> '$HIVEMIND_WATCHDOG_LOG' 2>&1; done; sleep $interval; done"
 
   # Lock the pane title
   sleep 0.5
   local watchdog_pane
-  watchdog_pane=$(tmux list-panes -t "${session}:0" -F "#{pane_index}" | tail -1)
+  watchdog_pane=$(otmux panes -t "${session}:0" -F "#{pane_index}" | tail -1)
   otmux pane.lock "${session}:0.${watchdog_pane}" "watchdog" 2>/dev/null
 
   console.log "Watchdog started in ${session}:0.${watchdog_pane} (every ${interval}s)"
@@ -4325,6 +5085,18 @@ hiveMind.usage()
   CLAUDE CODE:
       claude            interact with agent via Claude Code
       pane.create       create tmux pane for agent
+      process.lookup    resolve Claude PID to pane, role, UUID
+      process.list      list all Claude processes with pane mappings
+      teams.save        snapshot all agents for restore after restart
+      teams.restore     restore teams from snapshot file
+      teams.migrate     migrate team to remote machine via ossh
+      registry.set      set registry entry for a pane
+      registry.remove   remove registry entry for a pane
+      registry.list     list registry entries (live discovery + file)
+      registry.fix      clean up invalid entries in registry
+      team.activate     set active team (alias for team.switch)
+      consistency.audit cross-compare all identity sources, show mismatches
+      consistency.fix  auto-repair identity mismatches from live truth
   ─────────────────────────────────────────────────────
 
   Examples:
@@ -4358,7 +5130,7 @@ hiveMind.start()
 
   # Resolve HIVEMIND_AGENTS_DIR by searching upward for .claude/agents with SKILL.md files
   if [ -z "$HIVEMIND_AGENTS_DIR" ]; then
-    HIVEMIND_AGENTS_DIR=$(private.hiveMind.find.agents.dir)
+    HIVEMIND_AGENTS_DIR=$(private.hiveMind.find.agents.dir 2>/dev/null) || true
   fi
 
   if [ -z "$1" ]; then

@@ -22,7 +22,8 @@ OTMUX_CONFIG="${OOSH_DIR:-$(dirname "$0")}/tmux.conf"
 
 # Ensure color support for Claude Code and other modern CLI apps
 # FORCE_COLOR=1 is needed because NO_COLOR might be set elsewhere
-export FORCE_COLOR=1
+export FORCE_COLOR=2 
+unset  COLORTERM 
 #export COLORTERM=truecolor   # truecolor is not supported on mac just 256 colors
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -255,12 +256,14 @@ otmux.kw() # <?window> # shorthand for killWindow
   private.otmux.killWindow "$@"
 }
 
-private.otmux.renameWindow() # <newName> # rename current window
+private.otmux.renameWindow() # <target|name> <?name> # rename window; 2 args = target + name, 1 arg = name only
 {
-  if [ -n "$1" ]; then
+  if [ $# -ge 2 ]; then
+    $TMUX_CMD rename-window -t "$1" "$2"
+  elif [ -n "$1" ]; then
     $TMUX_CMD rename-window "$1"
   else
-    error.log "usage: otmux renameWindow <new-name>"
+    error.log "usage: otmux renameWindow <new-name> OR otmux renameWindow <target> <new-name>"
     return 1
   fi
 }
@@ -507,13 +510,9 @@ private.otmux.clearHistory() # # clear pane history
 # LAYOUT COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
-otmux.layout() # <layout> # set window layout
+otmux.layout() # <layout> <?target> # set window layout; pass all args through
 {
-  if [ -n "$1" ]; then
-    $TMUX_CMD select-layout "$1"
-  else
-    $TMUX_CMD select-layout
-  fi
+  $TMUX_CMD select-layout "$@"
 }
 otmux.layout.completion.layout() {
   echo "even-horizontal"
@@ -543,9 +542,9 @@ private.otmux.mainV() # # set main-vertical layout
   $TMUX_CMD select-layout main-vertical
 }
 
-otmux.tiled() # # set tiled layout
+otmux.tiled() # <?target> # set tiled layout; target=optional window target
 {
-  $TMUX_CMD select-layout tiled
+  $TMUX_CMD select-layout ${1:+-t "$1"} tiled
 }
 
 private.otmux.nextLayout() # # cycle to next layout
@@ -1248,7 +1247,18 @@ otmux.tree() # # show formatted tree of all sessions, panes, titles and commands
       local pane_connector="├──"
       [ "$pane_i" -eq "$pane_count" ] && pane_connector="└──"
 
-      printf "%s%s %-5s %-24s [%s]\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$pane_cmd"
+      # When pane_cmd is bash/zsh, check for Claude child process and show version
+      local display_cmd="$pane_cmd"
+      if [[ "$pane_cmd" == "bash" || "$pane_cmd" == "zsh" ]]; then
+        local pane_target="${sess_name}:${win_idx}.${pane_idx}"
+        if "$OOSH_DIR/claudeCode" process.running "$pane_target" 2>/dev/null; then
+          local ver
+          ver=$("$OOSH_DIR/claudeCode" version "$pane_target" 2>/dev/null)
+          ver="${ver%% (*}"  # trim " (Claude Code)" suffix
+          [ -n "$ver" ] && display_cmd="$ver"
+        fi
+      fi
+      printf "%s%s %-5s %-24s [%s]\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$display_cmd"
     done
 
     echo "${pane_prefix}"
@@ -1325,20 +1335,42 @@ otmux.tree.detailed() # # show three-level tree with Claude session IDs per pane
       local pane_connector="├──"
       [ "$pane_i" -eq "$pane_count" ] && pane_connector="└──"
 
-      printf "%s%s %-5s %-24s [%s]\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$pane_cmd"
+      # When pane_cmd is bash/zsh, check for Claude child process and show version
+      local display_cmd="$pane_cmd"
+      if [[ "$pane_cmd" == "bash" || "$pane_cmd" == "zsh" ]]; then
+        local pane_target_ver="${sess_name}:${win_idx}.${pane_idx}"
+        if "$oosh_dir/claudeCode" process.running "$pane_target_ver" 2>/dev/null; then
+          local ver
+          ver=$("$oosh_dir/claudeCode" version "$pane_target_ver" 2>/dev/null)
+          ver="${ver%% (*}"  # trim " (Claude Code)" suffix
+          [ -n "$ver" ] && display_cmd="$ver"
+        fi
+      fi
+      printf "%s%s %-5s %-24s [%s]\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$display_cmd"
 
       # Third level: detect Claude agent and show session info
       local pane_target="${sess_name}:${win_idx}.${pane_idx}"
       local is_agent=0
       local agent_name="" agent_sid=""
 
-      if [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || [[ "$pane_cmd" == "claude" ]]; then
+      if [[ "$pane_cmd" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || [[ "$pane_cmd" == "claude" ]] || \
+         { [[ "$pane_cmd" == "bash" || "$pane_cmd" == "zsh" ]] && "$oosh_dir/claudeCode" process.find "$pane_target" >/dev/null 2>&1; }; then
         is_agent=1
         agent_sid=$("$oosh_dir/claudeCode" session.id "$pane_target" 2>/dev/null)
-        # Look up role from hiveMind registry
-        local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-        if [ -f "$reg" ]; then
-          agent_name=$(grep "^${pane_target}|" "$reg" 2>/dev/null | cut -d'|' -f2)
+        # Get name from session — only use if it's a proper role@model name (from /rename)
+        if [ -n "$agent_sid" ]; then
+          agent_name=$("$oosh_dir/claudeCode" session.name "$agent_sid" 2>/dev/null)
+          # Reject firstPrompt garbage — only keep role@model format
+          if [ -n "$agent_name" ] && [[ "$agent_name" != *"@"* ]]; then
+            agent_name=""
+          fi
+        fi
+        # Fallback to hiveMind registry
+        if [ -z "$agent_name" ]; then
+          local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+          if [ -f "$reg" ]; then
+            agent_name=$(grep "^${pane_target}|" "$reg" 2>/dev/null | cut -d'|' -f2)
+          fi
         fi
       elif [ "$pane_cmd" = "node" ] && echo "$pane_title" | grep -qi "cursor"; then
         is_agent=1
@@ -1541,7 +1573,7 @@ otmux.window.kill() # <?target> # kill window; target=[session:]window index/nam
 }
 otmux.window.kill.completion.target() { private.complete.windows; }
 
-otmux.window.rename() # <name> # rename current window; name=new window title
+otmux.window.rename() # <target|name> <?name> # rename window; 2 args = target + name, 1 arg = name only
 {
   private.otmux.renameWindow "$@"
 }
@@ -1614,19 +1646,24 @@ otmux.pane.list() # <?session> # list panes with addresses and titles; session=f
 }
 otmux.pane.list.completion.session() { private.complete.sessions; }
 
-otmux.pane.get() # <?format:%> # get current pane target; format=% for pane_id, # for index
+otmux.pane.get() # <?target> <?format:%> # get pane info; 2 args = target + format, 1 arg = format, 0 = pane_id
 {
-  local format="${1:-%}"
+  local target_args=(-t "${TMUX_PANE:-}") format="%"
+  if [ $# -ge 2 ]; then
+    target_args=(-t "$1"); format="$2"
+  elif [ $# -eq 1 ]; then
+    format="$1"
+  fi
   case "$format" in
-    %)  $TMUX_CMD display-message -p "#{pane_id}" ;;
-    \#) $TMUX_CMD display-message -p "#{pane_index}" ;;
-    *)  $TMUX_CMD display-message -p "$format" ;;
+    %)  $TMUX_CMD display-message "${target_args[@]}" -p "#{pane_id}" ;;
+    \#) $TMUX_CMD display-message "${target_args[@]}" -p "#{pane_index}" ;;
+    *)  $TMUX_CMD display-message "${target_args[@]}" -p "$format" ;;
   esac
 }
 
-otmux.pane.get.target() # # get current pane in target format (session:window.pane)
+otmux.pane.get.target() # # get executing pane in target format (session:window.pane)
 {
-  $TMUX_CMD display-message -p "#{session_name}:#{window_index}.#{pane_index}"
+  $TMUX_CMD display-message -t "${TMUX_PANE:-}" -p "#{session_name}:#{window_index}.#{pane_index}"
 }
 
 otmux.pane.select() # <target> # select pane; target=U/D/L/R direction or index (0,1,2)
@@ -1749,6 +1786,17 @@ otmux.pane.capture.full() # <target> # capture full scrollback of a pane; target
 }
 otmux.pane.capture.full.completion.target() { private.complete.panes; }
 
+otmux.pane.capture.visible() # <target> # capture only the visible pane area (no scrollback)
+{
+  local target=$(private.resolve.target "$1")
+  if [ -z "$target" ]; then
+    error.log "usage: otmux pane.capture.visible <target>"
+    return 1
+  fi
+  $TMUX_CMD capture-pane -t "$target" -p 2>/dev/null
+}
+otmux.pane.capture.visible.completion.target() { private.complete.panes; }
+
 otmux.pane.history.clear() # # clear pane scrollback history
 {
   private.otmux.clearHistory "$@"
@@ -1780,6 +1828,8 @@ otmux.pane.lock() # <target> <title> # lock pane title; prevents Claude Code fro
     error.log "usage: otmux pane.lock <target> <title>"
     return 1
   fi
+  # Remove old hook first (prevents old hook from reverting the new title)
+  $TMUX_CMD set-hook -up -t "$target" pane-title-changed 2>/dev/null
   # Set the title
   $TMUX_CMD select-pane -t "$target" -T "$title"
   # Block escape-sequence-based renaming
