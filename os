@@ -158,6 +158,16 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
 
   console.log "Testing platform: $platform (image: $imageTag)"
 
+  # Auto-build if image doesn't exist
+  if ! docker image inspect "$imageTag" &>/dev/null; then
+    console.log "Image $imageTag not found — building from $PLATFORM_WORKSPACE..."
+    if ! odocker build "$PLATFORM_WORKSPACE"; then
+      error.log "Failed to build image for $platform"
+      create.result 1 "FAIL"
+      return 1
+    fi
+  fi
+
   # Fresh container
   odocker reset "$imageTag" "$sshPort"
   sleep 2
