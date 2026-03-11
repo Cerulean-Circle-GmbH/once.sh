@@ -1,7 +1,7 @@
 # Plan: Automated Branch Staging Pipeline
 
 **Created:** 2026-03-05
-**Status:** In Progress — Tickets 1-4 done, Ticket 5 next
+**Status:** In Progress — Tickets 1-5 done, Ticket 6 (CI) future
 **Last Updated:** 2026-03-11
 **Owner:** Hannes / Marcel
 **Branch:** dev (formerly hannes-v2)
@@ -538,14 +538,17 @@ Get the prod branch up to date with dev for the first time. This validates the e
   - 247 assertions, 246 passed, 1 intentional meta-test failure
   - All core tests pass
   - Note: `test.suite all` is problematic; `core` is the gate for dev→stage
-- [ ] 5.2 Run `os platform.test.all` to verify platforms before first promotion
+- [x] 5.2 Run `os platform.test.all` to verify platforms before first promotion
   - Platform tests gate stage→prod (not dev→stage)
-  - [ ] Ubuntu 24.04
-  - [ ] Debian 12
-  - [ ] AlmaLinux 9
-  - [ ] Alpine 3.19
-  - [ ] macOS (via GitHub Actions CI)
-- [ ] 5.3 Fix any install issues discovered during platform testing
+  - [x] Ubuntu 24.04 — PASS
+  - [x] Debian 12 — PASS
+  - [x] AlmaLinux 9 — PASS
+  - [x] Alpine 3.19 — PASS
+  - [x] macOS (via GitHub Actions CI) — PASS (after mkdir -p fix for stateMachines dir)
+- [x] 5.3 Fix any install issues discovered during platform testing
+  - Added auto-build for missing Docker images in `os.platform.test`
+  - Fixed `promote.config.save` to `mkdir -p` the stateMachines directory (macOS CI fix)
+  - Fixed sparse array lookup bug in `state.next`/`state.check`/`state.set`
 
 ### Promotion
 
@@ -556,14 +559,23 @@ Get the prod branch up to date with dev for the first time. This validates the e
     - test.suite corrupts PROMOTE state machine context (re-select after tests)
     - test.promote deletes PROMOTE machine (save/restore around test.suite)
     - Locally-modified tracked files block checkout (stash/unstash around merge)
-- [ ] 5.5b Promote stage → prod (separate session — requires platform tests)
-- [ ] 5.6 Tag the release:
-  - [ ] Choose version scheme (semver? date-based?)
-  - [ ] Tag applied automatically by PROMOTE state machine
-- [ ] 5.7 Verify prod branch is correct:
-  - [ ] `test.suite core 1` passes on prod branch
-  - [ ] Install from prod branch works on at least one platform
-- [ ] 5.8 Push prod branch and tags to origin (done by state machine)
+- [x] 5.5b Promote stage → prod
+  - All 5 platforms passed (4 Docker + macOS CI)
+  - Merged 111 commits from stage into prod (fast-forward)
+  - Tagged `v1.0.0`, pushed to origin
+  - State machine advancement bug discovered and fixed:
+    - `state.next` passed state NAME to `state.check`, which used `private.loop.states` for name lookup
+    - `private.loop.states` uses sequential counter incompatible with sparse arrays (indices 21-26 unreachable after transition jumps)
+    - Fix: pass numeric index instead, resolve to name in `state.check` for check function dispatch
+    - Also fixed stale cache in `state.set` (missing `private.state.update.current.machine` call)
+  - Promotion completed: merge + tag + push done manually after state machine fix committed
+- [x] 5.6 Tag the release:
+  - [x] Semver scheme: `v1.0.0` — first production release
+  - [x] Tag applied (manually due to state machine bug; fixed for future promotions)
+- [x] 5.7 Verify prod branch is correct:
+  - [x] `test.suite core 1` passes on all platforms (242/242, 1 intentional)
+  - [x] Install verified on 4 Docker platforms + macOS
+- [x] 5.8 Push prod branch and tags to origin
 
 ### Post-merge
 
