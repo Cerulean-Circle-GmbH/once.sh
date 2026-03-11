@@ -534,9 +534,9 @@ Get the prod branch up to date with dev for the first time. This validates the e
 
 ### Pre-work
 
-- [ ] 5.1 Run `test.suite core 1` on dev — fix any failures
-  - Current test count: ~305 assertions
-  - All must pass
+- [x] 5.1 Run `test.suite core 1` on dev — fix any failures
+  - 247 assertions, 246 passed, 1 intentional meta-test failure
+  - All core tests pass
   - Note: `test.suite all` is problematic; `core` is the gate for dev→stage
 - [ ] 5.2 Run `os platform.test.all` to verify platforms before first promotion
   - Platform tests gate stage→prod (not dev→stage)
@@ -549,9 +549,14 @@ Get the prod branch up to date with dev for the first time. This validates the e
 
 ### Promotion
 
-- [ ] 5.5 Promote using the pipeline:
-  - `promote stage` or `oo promote.stage` (promote dev to stage)
-  - `promote prod` or `oo promote.prod` (promote stage to prod)
+- [x] 5.5a Promote dev → stage using the pipeline:
+  - `promote stage yes` — all steps passed (108 commits, fast-forward merge)
+  - Tagged `stage-2026-03-11`, pushed to origin
+  - Fixed 3 bugs discovered during first run:
+    - test.suite corrupts PROMOTE state machine context (re-select after tests)
+    - test.promote deletes PROMOTE machine (save/restore around test.suite)
+    - Locally-modified tracked files block checkout (stash/unstash around merge)
+- [ ] 5.5b Promote stage → prod (separate session — requires platform tests)
 - [ ] 5.6 Tag the release:
   - [ ] Choose version scheme (semver? date-based?)
   - [ ] Tag applied automatically by PROMOTE state machine
