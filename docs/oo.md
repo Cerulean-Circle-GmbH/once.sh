@@ -261,6 +261,50 @@ States include:
 | 31-34 | root.* | Root installation steps |
 | 40+ | shared/headless/once | Advanced setup stages |
 
+## Promotion Pipeline
+
+The promotion pipeline promotes code through stages: dev -> stage -> prod, gated by tests.
+The pipeline is implemented in the `promote` script with a PROMOTE state machine.
+`oo` provides thin wrappers that delegate to `promote`.
+
+### Promotion Commands (via `oo` wrappers)
+
+```bash
+./oo promote.stage          # Promote dev → stage (gated by tests)
+./oo promote.stage reset    # Restart promotion from scratch
+./oo promote.stage yes      # Skip confirmations (PROMOTE_FORCE)
+./oo promote.prod           # Promote stage → prod
+./oo promote.status         # Show pipeline state and branch diffs
+./oo promote.report         # Show promotion history from git tags
+```
+
+### Legacy Aliases
+
+```bash
+./oo release                # Alias for promote.stage (updated from old merge behavior)
+./oo stage.to.prod          # Alias for promote.prod (updated from old merge behavior)
+```
+
+### Direct `promote` Usage
+
+```bash
+./promote stage             # Same as oo promote.stage
+./promote prod              # Same as oo promote.prod
+./promote status            # Pipeline state and branch diffs
+./promote report            # Promotion history from tags
+```
+
+### State Machine
+
+The PROMOTE state machine has two paths:
+- **Stage path** [13]-[19]: uncommitted check → test suite → platform tests → confirmation → merge → tag → push
+- **Prod path** [21]-[25]: stage verified → confirmation → merge → tag → push
+
+The pipeline is **resumable** — if a check fails, the machine stays at that state.
+Re-running `promote stage` resumes from the failing step.
+
+See `docs/plans/auto-staging-pipeline.md` Ticket 4 for full state machine layout.
+
 ## Utility Commands
 
 ### oo.su

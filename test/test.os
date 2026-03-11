@@ -142,16 +142,14 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test: os platform.test macos does NOT return SKIP
+# Test: macos routes to CI (workspace=native), without triggering actual CI
 # ─────────────────────────────────────────────────────────────────────────────
-os platform.test macos 2>/dev/null
-_macosResult="$RESULT"
-if [ "$_macosResult" != "SKIP" ]; then
-  expect.pass "os platform.test macos does not SKIP (result=$_macosResult)"
+private.os.platform.parse macos
+if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+  expect.pass "macos routes to CI (workspace=native, not Docker)"
 else
-  expect.fail "os platform.test macos should not SKIP — should route to CI"
+  expect.fail "macos should have workspace=native, got: $PLATFORM_WORKSPACE"
 fi
-unset _macosResult
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: missing gh CLI gives clear FAIL result

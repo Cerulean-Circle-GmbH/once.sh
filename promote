@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+promote.stage() # <?reset> # promote dev branch to stage, gated by tests
+{
+  local arg1="$1"
+  source state
+
+  private.promote.config.load
+  PROMOTE_TARGET=stage
+
+  if [ "$arg1" = "reset" ]; then
+    if state.machine.exists PROMOTE 2>/dev/null; then
+      state.machine.delete PROMOTE 2>/dev/null
+    fi
+    private.init.promote.state.machine
+    private.promote.config.save
+  elif [ "$arg1" = "yes" ]; then
+    PROMOTE_FORCE=yes
+    private.promote.config.save
+  else
+    private.promote.config.save
+  fi
+
+  if ! state.machine.exists PROMOTE 2>/dev/null; then
+    private.init.promote.state.machine
+  fi
+
+  state of PROMOTE
+  source $CONFIG_PATH/current.state.machine.env
+
+  # If finished or on prod path (state >= 21): reset to [11]
+  if [ $state -ge 99 ] || [ $state -ge 21 ]; then
+    state set - 11
+    source $CONFIG_PATH/current.state.machine.env
+  fi
+
+  # Advancement loop
+  local i=0
+  while [ $state -lt 99 ] && [ $i -lt 30 ]; do
+    local prevState=$state
+    state next
+    source $CONFIG_PATH/current.state.machine.env
+    if [ $state -le $prevState ]; then
+      error.log "State machine stuck at [$state]"
+      break
+    fi
+    ((i++))
+  done
+
+  if [ $state -ge 99 ]; then
+    success.log "Promotion to stage complete"
+  fi
+}
+
+promote.prod() # <?reset> # promote stage branch to prod
+{
+  local arg1="$1"
+  source state
+
+  private.promote.config.load
+  PROMOTE_TARGET=prod
+
+  if [ "$arg1" = "reset" ]; then
+    if state.machine.exists PROMOTE 2>/dev/null; then
+      state.machine.delete PROMOTE 2>/dev/null
+    fi
+    private.init.promote.state.machine
+    private.promote.config.save
+  elif [ "$arg1" = "yes" ]; then
+    PROMOTE_FORCE=yes
+    private.promote.config.save
+  else
+    private.promote.config.save
+  fi
+
+  if ! state.machine.exists PROMOTE 2>/dev/null; then
+    private.init.promote.state.machine
+  fi
+
+  state of PROMOTE
+  source $CONFIG_PATH/current.state.machine.env
+
+  # If finished or on stage path (13 <= state <= 19): reset to [11]
+  if [ $state -ge 99 ] || { [ $state -ge 13 ] && [ $state -le 19 ]; }; then
+    state set - 11
+    source $CONFIG_PATH/current.state.machine.env
+  fi
+
+  # Advancement loop
+  local i=0
+  while [ $state -lt 99 ] && [ $i -lt 30 ]; do
+    local prevState=$state
+    state next
+    source $CONFIG_PATH/current.state.machine.env
+    if [ $state -le $prevState ]; then
+      error.log "State machine stuck at [$state]"
+      break
+    fi
+    ((i++))
+  done
+
+  if [ $state -ge 99 ]; then
+    success.log "Promotion to prod complete"
+  fi
+}
+
+promote.status() # # show PROMOTE pipeline state and branch diffs
+{
+  source state
+
+  if state.machine.exists PROMOTE 2>/dev/null; then
+    state of PROMOTE list all
+  else
+    important.log "No PROMOTE state machine exists yet"
+    [ "${LOG_LEVEL:-3}" -lt 2 ] 2>/dev/null && echo "No active promotion"
+  fi
+
+  echo
+  important.log "Branch Status"
+  echo "============="
+
+  local devHead stageHead prodHead
+  devHead=$(git -C "$OOSH_DIR" log -1 --format='%h  %ci' dev 2>/dev/null || echo "not found")
+  stageHead=$(git -C "$OOSH_DIR" log -1 --format='%h  %ci' stage 2>/dev/null || echo "not found")
+  prodHead=$(git -C "$OOSH_DIR" log -1 --format='%h  %ci' prod 2>/dev/null || echo "not found")
+
+  local devAheadOfStage stageAheadOfProd
+  devAheadOfStage=$(git -C "$OOSH_DIR" rev-list --count stage..dev 2>/dev/null || echo "?")
+  stageAheadOfProd=$(git -C "$OOSH_DIR" rev-list --count prod..stage 2>/dev/null || echo "?")
+
+  echo "dev    $devHead"
+  echo "stage  $stageHead  ($devAheadOfStage commits behind dev)"
+  echo "prod   $prodHead  ($stageAheadOfProd commits behind stage)"
+}
+
+promote.report() # # show promotion history from git tags
+{
+  important.log "Stage promotions (stage-* tags):"
+  git -C "$OOSH_DIR" tag -l 'stage-*' --sort=-creatordate --format='  %(creatordate:short)  %(refname:short)' 2>/dev/null || echo "  (none)"
+
+  echo
+  important.log "Prod releases (v* tags):"
+  git -C "$OOSH_DIR" tag -l 'v*' --sort=-creatordate --format='  %(creatordate:short)  %(refname:short)' 2>/dev/null || echo "  (none)"
+}
+
+### new.method
+
+# ============================================================================
+# Private config helpers
+# ============================================================================
+
+private.promote.config.load() {
+  local configFile="$CONFIG_PATH/stateMachines/PROMOTE.promote.env"
+  if [ -f "$configFile" ]; then
+    source "$configFile"
+  else
+    PROMOTE_TARGET=""
+    PROMOTE_FORCE=""
+  fi
+}
+
+private.promote.config.save() {
+  local configFile="$CONFIG_PATH/stateMachines/PROMOTE.promote.env"
+  {
+    echo "PROMOTE_TARGET=$PROMOTE_TARGET"
+    echo "PROMOTE_FORCE=$PROMOTE_FORCE"
+  } > "$configFile"
+}
+
+# ============================================================================
+# State machine init
+# ============================================================================
+
+private.init.promote.state.machine() {
+  local machine=PROMOTE
+  console.log "initialising state machine: ${machine}"
+
+  source state
+
+  state.machine.create ${machine} promote
+
+  # Stage path states [11]-[18]
+  state.add promote.started              silent
+  state.add target.checked               silent
+  state.add uncommitted.checked          silent
+  state.add test.suite.passed            silent
+  state.add confirmation.received        silent
+  state.add merged.to.stage              silent
+  state.add stage.tagged                 silent
+  state.add stage.pushed                 silent
+
+  # After 8 state.add calls: [11]-[18] filled, [19]=next.custom.state
+  # Re-source to get the full array into current scope
+  # (state.add modifies a local copy due to declare -a scoping)
+  source $CONFIG_PATH/stateMachines/PROMOTE.states.env
+
+  # Manually set [19]=99 transition (end of stage path)
+  # and prod path states [21]-[25] via printf -v (state.add can't
+  # resume after manual intervention on next.custom.state)
+  printf -v "PROMOTE_STATES[19]" '%s' '99'
+  printf -v "PROMOTE_STATES[21]" '%s' 'platform.tests.passed'
+  printf -v "PROMOTE_STATES[22]" '%s' 'confirmation.received.prod'
+  printf -v "PROMOTE_STATES[23]" '%s' 'merged.to.prod'
+  printf -v "PROMOTE_STATES[24]" '%s' 'prod.tagged'
+  printf -v "PROMOTE_STATES[25]" '%s' 'prod.pushed'
+  printf -v "PROMOTE_STATES[26]" '%s' '99'
+  private.state.machine.update
+
+  # Advance through template states: [2]setup -> [3]all.states.added -> [4]started
+  # Set state directly to [3] since next.custom.state was already replaced manually
+  state.set - 3
+  state.machine.start promote
+}
+
+# ============================================================================
+# private.check.* functions for state transitions
+# ============================================================================
+
+private.check.promote.started() # <script> <stageTo> <stateFound> # verify PROMOTE_TARGET is set
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  private.promote.config.load
+  if [ -n "$PROMOTE_TARGET" ]; then
+    create.result 0 "PROMOTE_TARGET=$PROMOTE_TARGET"
+  else
+    create.result 1 "PROMOTE_TARGET not set — call promote stage or promote prod"
+  fi
+  return $(result)
+}
+
+private.check.target.checked() # <script> <stageTo> <stateFound> # branch to stage or prod path
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  private.promote.config.load
+  if [ "$PROMOTE_TARGET" = "stage" ]; then
+    console.log "Target: stage — following stage promotion path"
+    create.result 0 13
+  elif [ "$PROMOTE_TARGET" = "prod" ]; then
+    console.log "Target: prod — following prod promotion path"
+    create.result 0 21
+  else
+    create.result 1 "Unknown PROMOTE_TARGET: $PROMOTE_TARGET"
+  fi
+  return $(result)
+}
+
+private.check.uncommitted.checked() # <script> <stageTo> <stateFound> # verify clean working tree
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  local dirty
+  dirty=$(git -C "$OOSH_DIR" status --porcelain 2>/dev/null)
+  if [ -z "$dirty" ]; then
+    create.result 0 "Working tree is clean"
+  else
+    create.result 1 "Uncommitted changes detected — commit or stash first"
+  fi
+  return $(result)
+}
+
+private.check.test.suite.passed() # <script> <stageTo> <stateFound> # run test.suite core 1
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  console.log "Running test.suite core 1..."
+  if test.suite core 1; then
+    create.result 0 "All core tests passed"
+  else
+    create.result 1 "Core test suite failed — fix failures and re-run promote"
+  fi
+  return $(result)
+}
+
+private.check.platform.tests.passed() # <script> <stageTo> <stateFound> # run os platform.test.all
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  console.log "Running os platform.test.all..."
+  if os platform.test.all; then
+    create.result 0 "All platform tests passed"
+  else
+    create.result 1 "Platform tests failed — fix failures and re-run promote"
+  fi
+  return $(result)
+}
+
+private.check.confirmation.received() # <script> <stageTo> <stateFound> # confirm merge dev to stage
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  private.promote.config.load
+  if [ "$PROMOTE_FORCE" = "yes" ]; then
+    console.log "PROMOTE_FORCE=yes — skipping confirmation"
+    create.result 0 "auto-confirmed"
+    return $(result)
+  fi
+
+  important.log "Commits to be merged (dev → stage):"
+  git -C "$OOSH_DIR" log --oneline stage..dev 2>/dev/null
+
+  echo
+  local answer
+  read -p "Proceed with merge to stage? [y/N] " answer
+  if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+    create.result 0 "confirmed"
+  else
+    create.result 1 "Merge cancelled by user"
+  fi
+  return $(result)
+}
+
+private.check.merged.to.stage() # <script> <stageTo> <stateFound> # merge dev into stage
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  local originalBranch
+  originalBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+  if git -C "$OOSH_DIR" checkout stage 2>/dev/null; then
+    if git -C "$OOSH_DIR" merge dev --no-edit 2>/dev/null; then
+      create.result 0 "Merged dev into stage"
+    else
+      error.log "Merge conflict — aborting"
+      git -C "$OOSH_DIR" merge --abort 2>/dev/null
+      git -C "$OOSH_DIR" checkout "$originalBranch" 2>/dev/null
+      create.result 1 "Merge failed — resolve conflicts manually"
+    fi
+  else
+    create.result 1 "Could not checkout stage branch"
+  fi
+  return $(result)
+}
+
+private.check.stage.tagged() # <script> <stageTo> <stateFound> # tag stage with date
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  local tagBase="stage-$(date +%Y-%m-%d)"
+  local tag="$tagBase"
+  local counter=1
+  while git -C "$OOSH_DIR" tag -l "$tag" | grep -q "$tag"; do
+    tag="${tagBase}.${counter}"
+    ((counter++))
+  done
+
+  if git -C "$OOSH_DIR" tag "$tag" 2>/dev/null; then
+    create.result 0 "Tagged: $tag"
+    success.log "Tagged: $tag"
+  else
+    create.result 1 "Failed to create tag: $tag"
+  fi
+  return $(result)
+}
+
+private.check.stage.pushed() # <script> <stageTo> <stateFound> # push stage and tags, return to dev
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  if git -C "$OOSH_DIR" push origin stage --tags 2>/dev/null; then
+    git -C "$OOSH_DIR" checkout dev 2>/dev/null
+    create.result 0 "Pushed stage with tags, back on dev"
+    success.log "Stage promotion complete"
+  else
+    create.result 1 "Failed to push stage — check remote access"
+  fi
+  return $(result)
+}
+
+
+private.check.confirmation.received.prod() # <script> <stageTo> <stateFound> # confirm merge stage to prod
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  private.promote.config.load
+  if [ "$PROMOTE_FORCE" = "yes" ]; then
+    console.log "PROMOTE_FORCE=yes — skipping confirmation"
+    create.result 0 "auto-confirmed"
+    return $(result)
+  fi
+
+  important.log "Commits to be merged (stage → prod):"
+  git -C "$OOSH_DIR" log --oneline prod..stage 2>/dev/null
+
+  echo
+  local answer
+  read -p "Proceed with merge to prod? [y/N] " answer
+  if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+    create.result 0 "confirmed"
+  else
+    create.result 1 "Merge cancelled by user"
+  fi
+  return $(result)
+}
+
+private.check.merged.to.prod() # <script> <stageTo> <stateFound> # merge stage into prod
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  local originalBranch
+  originalBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+  if git -C "$OOSH_DIR" checkout prod 2>/dev/null; then
+    if git -C "$OOSH_DIR" merge stage --no-edit 2>/dev/null; then
+      create.result 0 "Merged stage into prod"
+    else
+      error.log "Merge conflict — aborting"
+      git -C "$OOSH_DIR" merge --abort 2>/dev/null
+      git -C "$OOSH_DIR" checkout "$originalBranch" 2>/dev/null
+      create.result 1 "Merge failed — resolve conflicts manually"
+    fi
+  else
+    create.result 1 "Could not checkout prod branch"
+  fi
+  return $(result)
+}
+
+private.check.prod.tagged() # <script> <stageTo> <stateFound> # tag prod with semver
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  # Find latest v* tag and auto-increment patch
+  local latestTag
+  latestTag=$(git -C "$OOSH_DIR" tag -l 'v*' --sort=-version:refname | head -1)
+
+  local newTag
+  if [ -n "$latestTag" ]; then
+    # Parse semver and increment patch
+    local major minor patch
+    major=$(echo "$latestTag" | sed 's/^v//' | cut -d. -f1)
+    minor=$(echo "$latestTag" | sed 's/^v//' | cut -d. -f2)
+    patch=$(echo "$latestTag" | sed 's/^v//' | cut -d. -f3)
+    patch=${patch:-0}
+    ((patch++))
+    newTag="v${major}.${minor}.${patch}"
+  else
+    newTag="v1.0.0"
+  fi
+
+  private.promote.config.load
+  if [ "$PROMOTE_FORCE" != "yes" ]; then
+    local answer
+    read -p "Tag as $newTag? [Y/n/custom] " answer
+    if [ "$answer" = "n" ] || [ "$answer" = "N" ]; then
+      create.result 1 "Tagging cancelled by user"
+      return $(result)
+    elif [ -n "$answer" ] && [ "$answer" != "y" ] && [ "$answer" != "Y" ]; then
+      newTag="$answer"
+    fi
+  fi
+
+  if git -C "$OOSH_DIR" tag "$newTag" 2>/dev/null; then
+    create.result 0 "Tagged: $newTag"
+    success.log "Tagged: $newTag"
+  else
+    create.result 1 "Failed to create tag: $newTag"
+  fi
+  return $(result)
+}
+
+private.check.prod.pushed() # <script> <stageTo> <stateFound> # push prod and tags, return to dev
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  if git -C "$OOSH_DIR" push origin prod --tags 2>/dev/null; then
+    git -C "$OOSH_DIR" checkout dev 2>/dev/null
+    export OOSH_MODE="released"
+    config save oosh OOSH 2>/dev/null
+    create.result 0 "Pushed prod with tags, back on dev"
+    success.log "Prod promotion complete"
+  else
+    create.result 1 "Failed to push prod — check remote access"
+  fi
+  return $(result)
+}
+
+private.check.finished() # <script> <stageTo> <stateFound> # terminal state
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  create.result 0 "finished"
+  return $(result)
+}
+
+private.check.next.custom.state() # <script> <stageTo> <stateFound> # placeholder pass-through
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  create.result 0 "next.custom.state"
+  return $(result)
+}
+
+# ============================================================================
+# Completion functions
+# ============================================================================
+
+promote.stage.completion.reset() { echo "reset"; echo "yes"; }
+promote.prod.completion.reset() { echo "reset"; echo "yes"; }
+
+promote.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  promote - Release Pipeline (PROMOTE State Machine)
+
+  Gated promotion: dev -> stage -> prod
+  Each step requires passing tests before advancing.
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+
+  Examples
+    $this stage        promote dev -> stage (gated by tests)
+    $this stage reset  restart promotion from scratch
+    $this stage yes    skip confirmations
+    $this prod         promote stage -> prod
+    $this status       show pipeline state and branch diffs
+    $this report       show promotion history from git tags
+    ----------
+  "
+}
+
+promote.start()
+{
+  #echo "sourcing init"
+  source this
+
+  this.start "$@"
+}
+
+promote.start "$@"

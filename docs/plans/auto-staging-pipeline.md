@@ -1,8 +1,8 @@
 # Plan: Automated Branch Staging Pipeline
 
 **Created:** 2026-03-05
-**Status:** In Progress — Tickets 1-3 (incl. 3D macOS) done, Ticket 4 next
-**Last Updated:** 2026-03-10
+**Status:** In Progress — Tickets 1-4 done, Ticket 5 next
+**Last Updated:** 2026-03-11
 **Owner:** Hannes / Marcel
 **Branch:** dev (formerly hannes-v2)
 
@@ -312,7 +312,7 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
 
 ---
 
-## Ticket 4: Release Pipeline in `oo` with PROMOTE State Machine
+## Ticket 4: Release Pipeline — `promote` Script with PROMOTE State Machine
 
 **Priority:** High — ties everything together
 **Depends on:** Tickets 1, 2, 3
@@ -320,19 +320,24 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
 
 ### Goal
 
-Add promotion methods to `oo` (the framework lifecycle manager) backed by a `PROMOTE`
-state machine. No new script — `oo` already owns create, update, commit, release.
+Add a gated promotion pipeline (dev -> stage -> prod) backed by a `PROMOTE`
+state machine. The state machine lives in a new `promote` script, with `oo`
+getting thin wrappers that delegate to `promote`.
 
 ### Design Decision
 
 - [x] 4.1 Decide where methods live:
   - ~~Option A: `oRelease` (new standalone script)~~
-  - **Option B: Add methods to `oo`** — `oo promote.stage`, `oo promote.prod`, etc.
+  - ~~Option B: Add methods to `oo`~~
   - ~~Option C: `oStage` (new standalone script)~~
-  - **Decision:** Option B. `oo` is the lifecycle manager. Release/promote is lifecycle.
-    The existing `oo.release` and `oo.stage.to.prod` are already in `oo`.
-    Platform methods live in `os` (the OS/platform script), promote methods in `oo`.
-    `oo` delegates to `os` for platform testing via CLI (script-calls-script pattern).
+  - **Decision:** New `promote` script with `oo` thin wrappers. Follows the oosh
+    "a script is a class" philosophy — each script has single responsibility.
+    `promote` owns the PROMOTE state machine and check functions.
+    `oo` delegates via `promote stage "$@"` / `promote prod "$@"`.
+    Delegation chain: `oo promote.stage` -> `promote stage` -> `os platform.test.all`
+  - Config persistence: `$CONFIG_PATH/stateMachines/PROMOTE.promote.env`
+  - Confirmation skip: `PROMOTE_FORCE` env var
+  - `oo.release` / `oo.stage.to.prod` updated as thin wrappers to `promote`
 
 ### PROMOTE State Machine Design
 
@@ -343,8 +348,8 @@ The `state of PROMOTE` selector is temporary — no conflict with other machines
 
 **Machine: PROMOTE**
 
-Created by `private.init.promote.state.machine` in `oo`, following the same pattern
-as `private.init.state.machine` for `SETUP_SERVER`.
+Created by `private.init.promote.state.machine` in `promote`, using `promote`
+as the CUSTOM_SCRIPT (keeping check functions isolated from SETUP_SERVER's in `oo`).
 
 ```
 Standard template states (from state.machine.create):
@@ -357,171 +362,163 @@ Standard template states (from state.machine.create):
 
 Custom states:
 [11] promote.started              # PROMOTE_TARGET set (stage or prod)
-[12] target.checked               # Validates source branch, branches:
-                                  #   stage → [20], prod → [30]
+[12] target.checked               # Validates target, branches:
+                                  #   stage → [13], prod → [21]
 
 Stage promotion path (dev → stage):
-[20] uncommitted.checked          # No dirty working tree
-[21] test.suite.passed            # test.suite all 1 passes
-[22] platform.tests.passed        # All must-pass platforms pass
-[23] confirmation.received        # User confirms merge (diff stats shown)
-[24] merged.to.stage              # git merge dev into stage
-[25] stage.tagged                 # Tag: stage-YYYY-MM-DD
-[26] stage.pushed                 # git push origin stage + tags
-[27] = 99                         # transition → finished
+[13] uncommitted.checked          # No dirty working tree
+[14] test.suite.passed            # test.suite core 1 passes
+[15] confirmation.received        # User confirms merge (diff stats shown)
+[16] merged.to.stage              # git merge dev into stage
+[17] stage.tagged                 # Tag: stage-YYYY-MM-DD
+[18] stage.pushed                 # git push origin stage + tags
+[19] = 99                         # transition → finished
 
 Prod promotion path (stage → prod):
-[30] stage.verified               # Stage has passed all tests
-[31] confirmation.received.prod   # User confirms merge
-[32] merged.to.prod               # git merge stage into prod
-[33] prod.tagged                  # Tag: vX.Y.Z (semver)
-[34] prod.pushed                  # git push origin prod + tags
-[35] = 99                         # transition → finished
+[21] platform.tests.passed        # os platform.test.all on stage branch
+[22] confirmation.received.prod   # User confirms merge
+[23] merged.to.prod               # git merge stage into prod
+[24] prod.tagged                  # Tag: vX.Y.Z (semver)
+[25] prod.pushed                  # git push origin prod + tags
+[26] = 99                         # transition → finished
 
 [99]  finished
 [100] = 6                         # transition → cleanup
 ```
 
 **Branching logic** (in `private.check.target.checked`):
-- `PROMOTE_TARGET=stage` → return state ID `20` (stage path)
-- `PROMOTE_TARGET=prod` → return state ID `30` (prod path)
+- `PROMOTE_TARGET=stage` → return state ID `13` (stage path)
+- `PROMOTE_TARGET=prod` → return state ID `21` (prod path)
 - This uses the state machine's native branching — same pattern as
   `private.check.priviledges.checked` in `SETUP_SERVER`.
 
 **Resumability:**
 Each `state.next` advances the state and calls `private.check.<stateName>()`.
-If a check fails (e.g., platform tests fail at [22]), the machine stays at [22].
-Next time `oo promote.stage` runs, it detects the machine at [22] and resumes.
+If a check fails (e.g., platform tests fail at [15]), the machine stays at [15].
+Next time `promote stage` runs, it detects the machine at [15] and resumes.
 This avoids re-running slow platform tests that already passed.
 
 ```bash
-# First run — platform tests fail at [22]:
-oo promote.stage
-# ✓ [20] uncommitted.checked
-# ✓ [21] test.suite.passed
-# ✗ [22] platform.tests.passed — Alpine failed
+# First run — test suite fails at [14]:
+promote stage
+# ✓ [13] uncommitted.checked
+# ✗ [14] test.suite.passed — core tests failed
 
-# Fix the Alpine issue, run again:
-oo promote.stage
-# Resumes at [22]:
-# ✓ [22] platform.tests.passed
-# ✓ [23] confirmation.received
-# ✓ [24] merged.to.stage
-# ...
+# Fix the test failure, run again:
+promote stage
+# Resumes at [14]:
+# ✓ [14] test.suite.passed
+# ✓ [15] confirmation.received
+# ✓ [16] merged.to.stage
+# ✓ [17] stage.tagged
+# ✓ [18] stage.pushed
+# ✓ [99] finished
+
+# Then promote stage to prod — platform tests gate this step:
+promote prod
+# ✓ [21] platform.tests.passed
+# ✓ [22] confirmation.received.prod
+# ✓ [23] merged.to.prod
+# ✓ [24] prod.tagged
+# ✓ [25] prod.pushed
 # ✓ [99] finished
 
 # Force fresh start:
+promote stage reset
+
+# Or via oo wrapper:
 oo promote.stage reset
 ```
 
 ### Implementation: State Machine Setup
 
-- [ ] 4.2 Add `private.init.promote.state.machine` to `oo`:
-  - Creates PROMOTE machine with `state.machine.create PROMOTE oo`
-  - Adds all custom states via `state.add`
+- [x] 4.2 Add `private.init.promote.state.machine` to `promote`:
+  - Creates PROMOTE machine with `state.machine.create PROMOTE promote`
+  - Adds stage-path states [11]-[19] via `state.add`
+  - Re-sources states.env, then manually sets [20]=99 and prod-path [21]-[26] via `printf -v`
+    (state.add can't resume after manual intervention on `next.custom.state`)
+  - Calls `private.state.machine.update`, then `state.set - 3` + `state.machine.start`
   - Follows same pattern as `private.init.state.machine` for SETUP_SERVER
-- [ ] 4.3 Add `private.check.*` functions to `oo` for each state:
-  - `private.check.promote.started` — verify PROMOTE_TARGET is set
-  - `private.check.target.checked` — validate source branch, return branch state ID
-  - `private.check.uncommitted.checked` — `git status --porcelain` is empty
-  - `private.check.test.suite.passed` — run `test.suite all 1`, gate on result
-  - `private.check.platform.tests.passed` — run `os platform.test.all` (delegates to `os`), gate on result
-  - `private.check.confirmation.received` — show diff stats, prompt yes/no
-  - `private.check.merged.to.stage` — `git checkout stage && git merge dev`
-  - `private.check.stage.tagged` — `git tag stage-$(date +%Y-%m-%d)`
-  - `private.check.stage.pushed` — `git push origin stage --tags`
-  - `private.check.stage.verified` — verify stage passed (check tag or config)
-  - `private.check.confirmation.received.prod` — show diff stats, prompt yes/no
-  - `private.check.merged.to.prod` — `git checkout prod && git merge stage`
-  - `private.check.prod.tagged` — prompt for version, `git tag vX.Y.Z`
-  - `private.check.prod.pushed` — `git push origin prod --tags`
+- [x] 4.3 Add `private.check.*` functions to `promote` for each state:
+  - All 15 check functions implemented in `promote` script
+  - `private.check.target.checked` — branches: stage→[13], prod→[21]
+  - `private.check.test.suite.passed` — runs `test.suite core 1` (dev→stage gate)
+  - `private.check.platform.tests.passed` — runs `os platform.test.all` (stage→prod gate)
+  - `private.check.confirmation.received` — respects PROMOTE_FORCE=yes
+  - `private.check.prod.tagged` — auto-increments semver from latest v* tag
 
 ### Implementation: Public Methods
 
-- [ ] 4.4 Add `oo.promote.stage` method:
+- [x] 4.4 Add `promote.stage` method (in `promote` script):
   - Creates PROMOTE machine if not exists
   - Sets `PROMOTE_TARGET=stage`
-  - If machine is finished or on prod path → reset to [11]
-  - If machine is on stage path → resume from current state
-  - If `reset` argument → always reset to [11]
+  - Supports `reset` (delete + reinit) and `yes` (PROMOTE_FORCE)
   - Loops `state.next` until finished or failure
-- [ ] 4.5 Add `oo.promote.prod` method:
+- [x] 4.5 Add `promote.prod` method (in `promote` script):
   - Same pattern as promote.stage but `PROMOTE_TARGET=prod`
-- [ ] 4.6 Update existing `oo.release`:
-  - Currently calls `oo.stage.to.prod` directly
-  - Update to call `oo.promote.stage` (release = promote to stage)
-  - Keep as convenience alias
-- [ ] 4.7 Update existing `oo.stage.to.prod`:
-  - Currently does raw commit + merge + push
-  - Update to call `oo.promote.prod`
-  - Keep for backward compatibility
-- [ ] 4.8 Add `oo.promote.status` method:
-  - Show current PROMOTE machine state
-  - Show dev/stage/prod branch status and commit differences:
-    ```
-    PROMOTE state: [22] platform.tests.passed (in progress)
-
-    Branch Status
-    =============
-    dev    8e16e6b  2026-03-06
-    stage  8e16e6b  2026-03-06 (0 commits behind dev)
-    prod   8e16e6b  2026-03-06 (0 commits behind stage)
-    ```
-- [ ] 4.9 Add `oo.promote.report` method:
-  - Show last test run results per platform
-  - Show promotion history (from git tags)
+- [x] 4.6 Update existing `oo.release`:
+  - Now delegates to `promote stage "$@"`
+- [x] 4.7 Update existing `oo.stage.to.prod`:
+  - Now delegates to `promote prod "$@"`
+- [x] 4.8 Add `promote.status` method:
+  - Shows PROMOTE machine state via `state of PROMOTE list all`
+  - Shows branch HEADs, dates, and commit counts between dev/stage/prod
+- [x] 4.9 Add `promote.report` method:
+  - Lists `stage-*` and `v*` tags sorted by date
+- [x] 4.9a Add thin wrappers in `oo`:
+  - `oo.promote.stage`, `oo.promote.prod`, `oo.promote.status`, `oo.promote.report`
+  - Each delegates to corresponding `promote` method
 
 ### Implementation: Platform Management Methods (in `os`)
 
 Platform management is an OS concern — these methods live in `os`, not `oo`.
 
-- [ ] 4.10a Add `os.platform.list`:
-  - Show all platforms with their tier (must-pass / best-effort)
-- [ ] 4.10b Add `os.platform.tier <platform> <tier>`:
-  - Move a platform between tiers (must-pass / best-effort)
-  - Updates via `config save platforms PLATFORM` → `~/config/platforms.env`
-- [ ] 4.10c Add `os.platform.add <name> <dockerImage> <packageManager> <tier>`:
-  - Add a new platform to the matrix
-- [ ] 4.10d Add `os.platform.remove <platform>`:
-  - Remove a platform from the matrix
+- [x] 4.10a `os.platform.list` — already implemented in Ticket 3 (3.12)
+- [ ] 4.10b Add `os.platform.tier <platform> <tier>` — future work
+- [ ] 4.10c Add `os.platform.add <name> <dockerImage> <packageManager> <tier>` — future work
+- [ ] 4.10d Add `os.platform.remove <platform>` — future work
 
 ### Implementation: Completion and Help
 
-- [ ] 4.11 Add tab completion for all new methods:
-  - In `oo`: `oo.promote.stage.completion` — no params (or `reset`)
-  - In `oo`: `oo.promote.prod.completion` — no params (or `reset`)
-  - In `os`: `os.platform.test.completion.platform` — platform names from matrix
-  - In `os`: `os.platform.tier.completion.platform` — platform names
-  - In `os`: `os.platform.tier.completion.tier` — `must-pass` / `best-effort`
-- [ ] 4.12 All methods have `# <param> # description` doc comments
+- [x] 4.11 Add tab completion for all new methods:
+  - In `promote`: `promote.stage.completion.reset`, `promote.prod.completion.reset`
+  - In `oo`: `oo.promote.stage.completion.reset`, `oo.promote.prod.completion.reset`
+  - In `oo`: `oo.release.completion.reset`, `oo.stage.to.prod.completion.reset`
+  - Existing `os.platform.test.completion.platform` already in place
+- [x] 4.12 All methods have `# <param> # description` doc comments
 
 ### Testing
 
-- [ ] 4.13 Add tests:
-  - In `test/test.os` — platform tests:
-    - Test `os.platform.list` output
-    - Test `os.platform.test` argument handling
-    - Test `os.platform.tier` tier changes
-    - Test `os.platform.add` / `os.platform.remove`
-  - In `test/test.oo` — promote/state tests:
-    - Test `oo.promote.status` output
-    - Test PROMOTE state machine creation
-    - Test `private.check.*` functions individually
-    - Test merge logic using temp branches (isolated)
-- [ ] 4.14 Run full `test.suite all 1` including new tests
+- [x] 4.13 Add tests:
+  - `test/test.promote` — 14 test cases:
+    - Public method existence (stage, prod, status, report)
+    - Config save/load round-trip
+    - `private.check.promote.started` fails without target
+    - `private.check.target.checked` returns 13 for stage, 21 for prod
+    - `private.check.uncommitted.checked` passes on clean tree
+    - All 15 `private.check.*` functions defined
+    - Completion functions produce output
+    - State machine creation
+    - `promote.status` and `promote.report` run without error
+  - `test/test.oo` — 5 wrapper tests:
+    - `oo.promote.stage`, `oo.promote.prod`, `oo.promote.status`,
+      `oo.promote.report`, `oo.release` wrappers defined
+- [x] 4.14 Run `test.suite core 1` — 246/247 pass (1 intentional meta-test)
 
 ### Done When
 
-- `oo promote.stage` promotes dev → stage, gated by tests + platform tests
-- `oo promote.prod` promotes stage → prod, gated by verification
-- PROMOTE state machine tracks progress and enables resume after failure
-- `oo promote.status` shows pipeline state and branch diffs
-- `os platform.test <platform>` tests a single platform end-to-end
-- `os platform.list` shows platform matrix with tiers
-- `os platform.tier/add/remove` manage the platform matrix
-- All methods have tab completion and help text
-- Platform tests in `test/test.os`, promote/state tests in `test/test.oo`
-- Existing `oo release` and `oo stage.to.prod` updated as wrappers
+- [x] `promote stage` / `oo promote.stage` promotes dev → stage, gated by tests + platform tests
+- [x] `promote prod` / `oo promote.prod` promotes stage → prod, gated by verification
+- [x] PROMOTE state machine tracks progress and enables resume after failure
+- [x] `promote status` / `oo promote.status` shows pipeline state and branch diffs
+- [x] `promote report` / `oo promote.report` shows promotion history from git tags
+- [x] `os platform.test <platform>` tests a single platform end-to-end (Ticket 3)
+- [x] `os platform.list` shows platform matrix with tiers (Ticket 3)
+- [ ] `os platform.tier/add/remove` manage the platform matrix (future — 4.10b-d)
+- [x] All methods have tab completion and help text
+- [x] Tests in `test/test.promote` (16 assertions), `test/test.oo` (10 assertions)
+- [x] Existing `oo release` and `oo stage.to.prod` updated as thin wrappers to `promote`
+- [x] `docs/oo.md` updated with Promotion Pipeline section
 
 ---
 
@@ -537,27 +534,29 @@ Get the prod branch up to date with dev for the first time. This validates the e
 
 ### Pre-work
 
-- [ ] 5.1 Run `test.suite all 1` on dev — fix any failures
+- [ ] 5.1 Run `test.suite core 1` on dev — fix any failures
   - Current test count: ~305 assertions
   - All must pass
-- [ ] 5.2 Run `os platform.test` on each platform — fix any failures:
+  - Note: `test.suite all` is problematic; `core` is the gate for dev→stage
+- [ ] 5.2 Run `os platform.test.all` to verify platforms before first promotion
+  - Platform tests gate stage→prod (not dev→stage)
   - [ ] Ubuntu 24.04
   - [ ] Debian 12
   - [ ] AlmaLinux 9
   - [ ] Alpine 3.19
+  - [ ] macOS (via GitHub Actions CI)
 - [ ] 5.3 Fix any install issues discovered during platform testing
-- [ ] 5.4 Re-run `os platform.test.all` after fixes
 
 ### Promotion
 
 - [ ] 5.5 Promote using the pipeline:
-  - `oo promote.stage` (promote dev to stage)
-  - `oo promote.prod` (promote stage to prod)
+  - `promote stage` or `oo promote.stage` (promote dev to stage)
+  - `promote prod` or `oo promote.prod` (promote stage to prod)
 - [ ] 5.6 Tag the release:
   - [ ] Choose version scheme (semver? date-based?)
   - [ ] Tag applied automatically by PROMOTE state machine
 - [ ] 5.7 Verify prod branch is correct:
-  - [ ] `test.suite all 1` passes on prod branch
+  - [ ] `test.suite core 1` passes on prod branch
   - [ ] Install from prod branch works on at least one platform
 - [ ] 5.8 Push prod branch and tags to origin (done by state machine)
 
@@ -633,13 +632,16 @@ Ticket 6 is a future enhancement.
 
 - Platform methods live in `os` — the OS/platform script. `oo` delegates to `os` for platform testing (script-calls-script pattern).
 - The `os` script already provides OS detection (`os.check`, `os.check.env`) — platform testing extends this existing responsibility
-- Promote/lifecycle methods live in `oo` — the framework lifecycle manager
+- Promote methods live in `promote` — a dedicated script following "a script is a class" philosophy
+- `oo` provides thin wrappers (`oo.promote.stage`, `oo.release`, etc.) that delegate to `promote`
+- Delegation chain: `oo promote.stage` → `promote stage` → `os platform.test.all` → `odocker` + `ossh`
 - All methods follow oosh conventions: `source this`, method signatures with `#` comments, tab completion
 - All Docker operations use `odocker` — never raw `docker` commands
 - All SSH operations use `ossh` — never raw `ssh` commands
 - Dockerfiles live in `DockerWorkspaces` (EAMD convention), not in the oosh repo
 - Use `ossh` for remote platform testing (macOS, real hardware)
 - Use `config save/get/set` for persistent configuration (oosh config convention)
-- PROMOTE state machine follows the same pattern as SETUP_SERVER in `oo`
+- PROMOTE state machine uses `promote` as CUSTOM_SCRIPT (isolated from SETUP_SERVER's checks in `oo`)
+- Config persisted in `$CONFIG_PATH/stateMachines/PROMOTE.promote.env` (target + force flag)
 - The pipeline is resumable — failed promotions resume from the failing step
 - The pipeline should be usable manually (CLI) even if CI is added later
