@@ -297,8 +297,8 @@ The pipeline is implemented in the `promote` script with a PROMOTE state machine
 ### State Machine
 
 The PROMOTE state machine has two paths:
-- **Stage path** [13]-[19]: uncommitted check → test suite → platform tests → confirmation → merge → tag → push
-- **Prod path** [21]-[25]: stage verified → confirmation → merge → tag → push
+- **Stage path** [13]-[18]: uncommitted check → core tests → confirmation → merge → tag → push
+- **Prod path** [21]-[25]: platform tests → confirmation → merge → tag → push
 
 The pipeline is **resumable** — if a check fails, the machine stays at that state.
 Re-running `promote stage` resumes from the failing step.
