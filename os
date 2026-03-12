@@ -190,12 +190,13 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
 
   # Open ControlMaster with sshpass (first connection, no keys yet)
+  # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
   SSHPASS=test sshpass -e ssh \
     -o ControlMaster=yes \
     -o ControlPath="$OSSH_CONTROL_PATH" \
     -o ControlPersist=600 \
     -o StrictHostKeyChecking=accept-new \
-    -N -f "$platform"
+    "$platform" true
 
   # Push key — reuses ControlMaster socket, no password prompt
   ossh push.key "$platform"
