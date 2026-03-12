@@ -6,25 +6,26 @@ The `oo` script is the management interface for the oosh environment, providing 
 
 The oo framework supports:
 - **Script creation** with templates and completion support
-- **Git-based version control** with dev/main workflow
+- **Git-based version control** with dev/stage/prod workflow
 - **Package manager detection** across multiple platforms
 - **External script installation** via symlinks
 - **Server setup state machine** for automated deployment
+- **Promotion pipeline** for gated code promotion
 
 ## Quick Start
 
 ```bash
 # Create a new oosh script
-./oo new myscript
+oo new myscript
 
 # Add a method to existing script
-./oo new.method myscript.mymethod
+oo new.method myscript.mymethod
 
 # Update oosh from GitHub
-./oo update
+oo update
 
 # Check current mode/branch
-./oo mode
+oo mode
 ```
 
 ## OOSH Lifecycle
@@ -32,12 +33,13 @@ The oo framework supports:
 The recommended development workflow:
 
 ```
-1. oo mode.dev   → Switch to dev branch for development
-2. oo update     → Pull latest changes from GitHub
-3. [develop]     → Make your changes
-4. oo commit     → Commit and push to dev branch
-5. oo release    → Merge dev to main for production
-6. oo mode.dev   → Return to dev for next cycle
+1. oo mode.dev        → Switch to dev branch for development
+2. oo update          → Pull latest changes from GitHub
+3. [develop]          → Make your changes
+4. oo commit          → Commit and push to dev branch
+5. oo promote.stage   → Promote dev to stage (gated by core tests)
+6. oo promote.prod    → Promote stage to prod (gated by platform tests)
+7. oo mode.dev        → Return to dev for next cycle
 ```
 
 ## Script Creation
@@ -47,7 +49,7 @@ The recommended development workflow:
 Creates a new oosh script from template with completion support.
 
 ```bash
-./oo new myscript
+oo new myscript
 ```
 
 This:
@@ -61,7 +63,7 @@ This:
 Adds a new method to an existing script (interactive).
 
 ```bash
-./oo new.method myscript.mymethod
+oo new.method myscript.mymethod
 ```
 
 Prompts for:
@@ -75,7 +77,7 @@ Prompts for:
 Creates a test file for a script.
 
 ```bash
-./oo new.test myscript
+oo new.test myscript
 ```
 
 Creates `test/test.myscript` from `templates/code/new_script_test`.
@@ -87,7 +89,7 @@ Creates `test/test.myscript` from `templates/code/new_script_test`.
 Shows current branch status and git remote configuration.
 
 ```bash
-./oo mode
+oo mode
 # Output:
 # git branch is: * dev
 # OOSH_MODE=dev
@@ -98,7 +100,7 @@ Shows current branch status and git remote configuration.
 Switches to the dev branch for development.
 
 ```bash
-./oo mode.dev
+oo mode.dev
 ```
 
 Sets `OOSH_MODE=dev` and saves to config.
@@ -108,7 +110,7 @@ Sets `OOSH_MODE=dev` and saves to config.
 Pulls latest changes from GitHub.
 
 ```bash
-./oo update
+oo update
 ```
 
 ### oo.commit
@@ -116,31 +118,26 @@ Pulls latest changes from GitHub.
 Commits and pushes changes (requires dev branch).
 
 ```bash
-./oo commit         # Normal commit (dev branch only)
-./oo commit force   # Force commit (any branch)
+oo commit         # Normal commit (dev branch only)
+oo commit force   # Force commit (any branch)
 ```
 
 ### oo.release
 
-Releases dev to main branch.
+Delegates to `promote stage` — promotes dev to stage with gated tests.
 
 ```bash
-./oo release
+oo release
 ```
 
-Equivalent to `oo.stage.to.prod`:
-1. Commits current changes
-2. Checks out main
-3. Merges dev
-4. Pushes to remote
-5. Sets `OOSH_MODE=released`
+This is a legacy alias. Prefer `oo promote.stage` for clarity.
 
 ### oo.remote.update
 
 Updates oosh on a remote host via SSH.
 
 ```bash
-./oo remote.update myserver
+oo remote.update myserver
 ```
 
 ### oo.branches.check
@@ -148,7 +145,7 @@ Updates oosh on a remote host via SSH.
 Analyzes branch status for a feature branch workflow.
 
 ```bash
-./oo branches.check feature/ dev/neom abc123
+oo branches.check feature/ dev/neom abc123
 ```
 
 Parameters:
@@ -163,7 +160,7 @@ Parameters:
 Shows package manager configuration status.
 
 ```bash
-./oo pm
+oo pm
 # Output:
 # package manager is set:
 # for OOSH: apt-get -y install
@@ -175,7 +172,7 @@ Shows package manager configuration status.
 Detects OS and sets appropriate package manager.
 
 ```bash
-./oo pm.discover
+oo pm.discover
 ```
 
 Detects and configures:
@@ -193,9 +190,9 @@ Detects and configures:
 Ensures a command is installed, installing it if missing.
 
 ```bash
-./oo cmd wget           # Install wget if missing
-./oo cmd tree           # Install tree if missing
-./oo cmd errno python3    # Install python3 for errno
+oo cmd wget           # Install wget if missing
+oo cmd tree           # Install tree if missing
+oo cmd errno python3    # Install python3 for errno
 ```
 
 Special cases:
@@ -208,7 +205,7 @@ Special cases:
 Searches apt repositories for a command.
 
 ```bash
-./oo find.cmd htpasswd
+oo find.cmd htpasswd
 ```
 
 ## Installation
@@ -218,7 +215,7 @@ Searches apt repositories for a command.
 Installs an external oosh script as a symlink.
 
 ```bash
-./oo install myscript /path/to/scripts
+oo install myscript /path/to/scripts
 ```
 
 Creates `$OOSH_DIR/external/myscript` → `/path/to/scripts/myscript`
@@ -228,7 +225,7 @@ Creates `$OOSH_DIR/external/myscript` → `/path/to/scripts/myscript`
 Removes oosh and cleans up configurations.
 
 ```bash
-./oo deinstall
+oo deinstall
 ```
 
 **Warning**: This removes:
@@ -244,7 +241,7 @@ Removes oosh and cleans up configurations.
 Initializes or shows the server setup state machine.
 
 ```bash
-./oo state
+oo state
 ```
 
 State machine: `SETUP_SERVER`
@@ -263,35 +260,37 @@ States include:
 
 ## Promotion Pipeline
 
-The promotion pipeline promotes code through stages: dev -> stage -> prod, gated by tests.
+The promotion pipeline promotes code through stages: dev → stage → prod, gated by tests.
 The pipeline is implemented in the `promote` script with a PROMOTE state machine.
 `oo` provides thin wrappers that delegate to `promote`.
+
+See [Promotion Pipeline (promote)](promote.md) for full documentation.
 
 ### Promotion Commands (via `oo` wrappers)
 
 ```bash
-./oo promote.stage          # Promote dev → stage (gated by tests)
-./oo promote.stage reset    # Restart promotion from scratch
-./oo promote.stage yes      # Skip confirmations (PROMOTE_FORCE)
-./oo promote.prod           # Promote stage → prod
-./oo promote.status         # Show pipeline state and branch diffs
-./oo promote.report         # Show promotion history from git tags
+oo promote.stage          # Promote dev → stage (gated by tests)
+oo promote.stage reset    # Restart promotion from scratch
+oo promote.stage yes      # Skip confirmations (PROMOTE_FORCE)
+oo promote.prod           # Promote stage → prod
+oo promote.status         # Show pipeline state and branch diffs
+oo promote.report         # Show promotion history from git tags
 ```
 
 ### Legacy Aliases
 
 ```bash
-./oo release                # Alias for promote.stage (updated from old merge behavior)
-./oo stage.to.prod          # Alias for promote.prod (updated from old merge behavior)
+oo release                # Alias for promote.stage (updated from old merge behavior)
+oo stage.to.prod          # Alias for promote.prod (updated from old merge behavior)
 ```
 
 ### Direct `promote` Usage
 
 ```bash
-./promote stage             # Same as oo promote.stage
-./promote prod              # Same as oo promote.prod
-./promote status            # Pipeline state and branch diffs
-./promote report            # Promotion history from tags
+promote stage             # Same as oo promote.stage
+promote prod              # Same as oo promote.prod
+promote status            # Pipeline state and branch diffs
+promote report            # Promotion history from tags
 ```
 
 ### State Machine
@@ -303,7 +302,7 @@ The PROMOTE state machine has two paths:
 The pipeline is **resumable** — if a check fails, the machine stays at that state.
 Re-running `promote stage` resumes from the failing step.
 
-See `docs/plans/auto-staging-pipeline.md` Ticket 4 for full state machine layout.
+See [promote.md](promote.md) for the full state machine layout.
 
 ## Utility Commands
 
@@ -312,7 +311,7 @@ See `docs/plans/auto-staging-pipeline.md` Ticket 4 for full state machine layout
 Switches to root user for privileged operations.
 
 ```bash
-./oo su
+oo su
 ```
 
 If not root, attempts `sudo su`.
@@ -322,7 +321,7 @@ If not root, attempts `sudo su`.
 Displays help and usage information.
 
 ```bash
-./oo usage
+oo usage
 ```
 
 ## Environment Variables
@@ -353,14 +352,14 @@ Templates are located in `$OOSH_DIR/templates/code/`:
 
 ```bash
 # Create script
-./oo new mycmd
+oo new mycmd
 
 # Add methods
-./oo new.method mycmd.hello
-./oo new.method mycmd.goodbye
+oo new.method mycmd.hello
+oo new.method mycmd.goodbye
 
 # Run tests
-./test.suite run mycmd
+test.suite run mycmd
 
 # Enable completion
 reconfigure
@@ -370,40 +369,40 @@ reconfigure
 
 ```bash
 # Switch to dev mode
-./oo mode.dev
+oo mode.dev
 
 # Pull latest
-./oo update
+oo update
 
 # Check status
-./oo mode
+oo mode
 
 # Make changes...
 
 # Commit when ready
-./oo commit
+oo commit
 ```
 
 ### Installing Missing Tools
 
 ```bash
 # Install common tools
-./oo cmd git
-./oo cmd curl
-./oo cmd jq
+oo cmd git
+oo cmd curl
+oo cmd jq
 
 # Check package manager
-./oo pm
+oo pm
 ```
 
 ### Installing External Scripts
 
 ```bash
 # Install script from external location
-./oo install myexternal /var/dev/myproject
+oo install myexternal /var/dev/myproject
 
 # Now accessible as:
-./myexternal method args
+myexternal method args
 ```
 
 ## Private Functions
@@ -421,6 +420,8 @@ Internal functions (not for direct use):
 
 ## See Also
 
+- [Promotion Pipeline (promote)](promote.md)
+- [OS & Platform Testing (os)](os.md)
 - [Log System Documentation](log.md)
 - [Config System Documentation](config.md)
 - [Debug System Documentation](debug.md)

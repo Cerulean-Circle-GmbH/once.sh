@@ -21,16 +21,26 @@ feature/xxx ──> dev ──> stage ──> prod
 
 ### Promotion: `dev` → `stage`
 
-1. `test.suite all 1` passes on `dev`
-2. Platform install tests pass on all supported platforms
-3. Merge `dev` into `stage` (fast-forward or merge commit)
-4. Tag the `stage` branch (e.g., `stage-2026-03-05`)
+Run `promote stage` (or `oo promote.stage`):
+
+1. Clean working tree (no uncommitted changes)
+2. `test.suite core 1` passes on `dev`
+3. User confirms merge (diff stats shown)
+4. Merge `dev` into `stage` (fast-forward or merge commit)
+5. Tag the `stage` branch (e.g., `stage-2026-03-05`)
+6. Push `stage` branch and tags to origin
 
 ### Promotion: `stage` → `prod`
 
-1. `stage` branch has passed all platform install tests
-2. Merge `stage` into `prod`
-3. Tag the `prod` branch (e.g., `v2.0.0`)
+Run `promote prod` (or `oo promote.prod`):
+
+1. `os platform.test.all` passes (all must-pass platforms)
+2. User confirms merge
+3. Merge `stage` into `prod`
+4. Tag the `prod` branch with semver (e.g., `v1.0.0`)
+5. Push `prod` branch and tags to origin
+
+See [Promotion Pipeline](promote.md) for full state machine details.
 
 ## Feature Branches
 

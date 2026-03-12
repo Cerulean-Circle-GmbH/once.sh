@@ -3,24 +3,26 @@ Unified shell environment for UCP components and ONCE the Object Network Communi
 
 
 This Repo consists of two main topics
-1. The oosh object oriented bash envitonment with completion, logging and debugging
+1. The oosh object oriented bash environment with completion, logging and debugging
 1. the once bash script to manage a ONCE installation into any environment
 1. 1. Supported environments — see [Supported Platforms](docs/supported-platforms.md) for the full matrix
+
+Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branching Strategy](docs/branching.md) for details.
 
 ## fast install - use it anywhere
 
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
-| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"`   |
-| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
+| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
+| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
 
 
 ### More detailed logging for debugging is available with these commands
 ```
-unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)" | tee install.log.txt
+unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" | tee install.log.txt
 
-> or if already available loacally
+> or if already available locally
 unbuffer env -i sh -x init/oosh | tee install.log.txt 
 
 > to view the file use 
@@ -37,7 +39,7 @@ in VSCODE use [use the ANSI Colors plugin](https://marketplace.visualstudio.com/
 
 ## manual install
 ```
-wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh ;
+wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh ;
 chmod 700 oosh
 ./oosh
 
@@ -51,13 +53,13 @@ cat oosh | sh -x
 ```
 sudo apt update
 sudo apt install curl
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 
 or as root
 
 apt update
 apt install curl
-sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"
+sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 ```
 
 

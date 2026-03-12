@@ -579,9 +579,25 @@ Get the prod branch up to date with dev for the first time. This validates the e
 
 ### Post-merge
 
-- [ ] 5.9 Update README if it references specific branches
+- [x] 5.9 Update README:
+  - [x] 5.9a Change install URLs from `main` → `prod` (6 URL occurrences)
+  - [x] 5.9b Add brief pipeline mention with link to `docs/branching.md`
+  - [x] 5.9c Fix typos: "envitonment" → "environment", "loacally" → "locally"
 - [ ] 5.10 Notify team that prod is updated
 - [ ] 5.11 Archive or clean up stale branches if needed
+- [x] 5.12 Post-pipeline documentation:
+  - [x] 5.12a Create `docs/promote.md` — standalone promote script documentation
+  - [x] 5.12b Create `docs/os.md` — OS detection and platform testing documentation
+  - [x] 5.12c Update `docs/oo.md` — fix `./` prefix, update oo.release section, add promote.md cross-ref
+  - [x] 5.12d Update `docs/wiki-index.md` — add promote and os doc links
+  - [x] 5.12e Update `docs/branching.md` — fix test command, fix gating description
+- [x] 5.13 Add `skip` parameter and resumability tests:
+  - Added `PROMOTE_SKIP` to config save/load
+  - Added `skip` arg to `promote.stage` and `promote.prod` — advances past current stuck state
+  - `skip` also sets `PROMOTE_FORCE=yes` to auto-confirm remaining prompts
+  - Updated completion functions and usage
+  - Added T-PROMOTE-15 through T-PROMOTE-18 resumability tests
+  - Updated `docs/promote.md` with skip documentation
 
 ### Done When
 
@@ -589,6 +605,12 @@ Get the prod branch up to date with dev for the first time. This validates the e
 - Install verified on all supported platforms
 - Tagged release exists
 - Team notified
+- README install URLs point to `prod` branch
+- `docs/promote.md` documents the promote script
+- `docs/os.md` documents OS detection and platform testing
+- All docs use correct gating rules (core tests gate dev→stage; platform tests gate stage→prod)
+- No `./` prefix on oosh commands in documentation
+- `docs/wiki-index.md` links to all new docs
 
 ---
 
