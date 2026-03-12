@@ -71,14 +71,20 @@ fi
 
 ### Platform Test Flow (Docker platforms)
 
-For each Docker-testable platform, `os platform.test` runs:
+For each Docker-testable platform, `os platform.test` runs fully automated (no interactive prompts):
 
 1. `odocker reset <image>` — Fresh container with SSH access
-2. `ossh config.create` / `ossh config.save.last` / `ossh push.key` — SSH setup
-3. `ossh install <platform> test` — Install oosh remotely
-4. `ossh exec <platform> "test.suite core 1"` — Run tests as user
-5. `ossh exec.tty <platform> "sudo ... test.suite core 1"` — Run tests as root
-6. Cleanup container
+2. `ossh config.create` / `ossh config.save.last` — SSH config setup
+3. Clean stale ControlMaster socket from any previous run
+4. `sshpass` opens a ControlMaster connection (password via `$SSHPASS` env var, runs `true` to avoid background fork race)
+5. `ossh push.key` — Pushes SSH key, reusing the ControlMaster socket (no password prompt)
+6. Configure `NOPASSWD` sudo on the ephemeral container (appended to `/etc/sudoers`)
+7. `ossh install <platform> test` — Install oosh remotely
+8. `ossh exec <platform> "test.suite core 1"` — Run tests as user
+9. `ossh exec.tty <platform> "sudo ... test.suite core 1"` — Run tests as root
+10. `ossh connection.close` + container cleanup
+
+Non-interactive `ssh-keygen` (`-N ''`) is handled in `user`/`ossh` so key generation never prompts.
 
 ### macOS Testing (CI)
 
