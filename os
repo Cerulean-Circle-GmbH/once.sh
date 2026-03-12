@@ -201,7 +201,8 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   ossh push.key "$platform"
 
   # Configure passwordless sudo for automated testing (container is ephemeral)
-  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/test-nopasswd && chmod 440 /etc/sudoers.d/test-nopasswd'"
+  # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
+  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
   # Install oosh
   ossh install "$platform" test
