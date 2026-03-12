@@ -156,6 +156,12 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
   sshPort=8022
 
+  # Ensure sshpass is available for automated first-connection password
+  if ! command -v sshpass >/dev/null 2>&1; then
+    console.log "Installing sshpass for automated platform testing..."
+    oo cmd sshpass
+  fi
+
   console.log "Testing platform: $platform (image: $imageTag)"
 
   # Auto-build if image doesn't exist
@@ -175,7 +181,19 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   # SSH setup
   ossh config.create "$platform" "test@localhost:$sshPort"
   ossh config.save.last
+  # Open ControlMaster with sshpass (first connection, no keys yet)
+  SSHPASS=test sshpass -e ssh \
+    -o ControlMaster=yes \
+    -o ControlPath="$OSSH_CONTROL_PATH" \
+    -o ControlPersist=600 \
+    -o StrictHostKeyChecking=accept-new \
+    -N -f "$platform"
+
+  # Push key — reuses ControlMaster socket, no password prompt
   ossh push.key "$platform"
+
+  # Configure passwordless sudo for automated testing (container is ephemeral)
+  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/test-nopasswd && chmod 440 /etc/sudoers.d/test-nopasswd'"
 
   # Install oosh
   ossh install "$platform" test
@@ -193,6 +211,7 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   local rcRoot=${PIPESTATUS[0]}
 
   # Cleanup
+  ossh connection.close "$platform" 2>/dev/null
   private.os.platform.cleanup "$sshPort"
 
   if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
