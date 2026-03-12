@@ -162,6 +162,10 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
     oo cmd sshpass
   fi
 
+  # Set control path so sshpass and ossh subprocesses share the same socket
+  : ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
+  export OSSH_CONTROL_PATH
+
   console.log "Testing platform: $platform (image: $imageTag)"
 
   # Auto-build if image doesn't exist
