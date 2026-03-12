@@ -185,6 +185,10 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   # SSH setup
   ossh config.create "$platform" "test@localhost:$sshPort"
   ossh config.save.last
+  # Clean up any stale ControlMaster socket from a previous test run
+  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
+  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+
   # Open ControlMaster with sshpass (first connection, no keys yet)
   SSHPASS=test sshpass -e ssh \
     -o ControlMaster=yes \
