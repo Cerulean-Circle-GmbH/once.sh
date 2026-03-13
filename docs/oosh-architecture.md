@@ -499,7 +499,7 @@ See [docs/log.md](log.md) for complete documentation.
 
 ## Completion System
 
-Defined in `templates/user/2c.intsall`:
+Defined in `templates/user/c2.install`:
 
 ### Comment Syntax for Completion
 
@@ -593,7 +593,7 @@ $OOSH_DIR/
 └── templates/
     ├── code/         # Script templates
     └── user/
-        └── 2c.intsall  # Completion system setup
+        └── c2.install  # Completion system setup
 ```
 
 ---

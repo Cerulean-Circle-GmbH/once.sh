@@ -53,7 +53,7 @@ oo new myscript
 ```
 
 This:
-1. Creates `$OOSH_DIR/myscript` from `templates/code/new_script`
+1. Creates `$OOSH_DIR/myscript` from `templates/code/newScript`
 2. Makes it executable
 3. Automatically creates `test/test.myscript`
 4. Prompts to run `reconfigure` for completion
@@ -80,7 +80,7 @@ Creates a test file for a script.
 oo new.test myscript
 ```
 
-Creates `test/test.myscript` from `templates/code/new_script_test`.
+Creates `test/test.myscript` from `templates/code/newScriptTest`.
 
 ## Version Control
 
@@ -341,10 +341,10 @@ Templates are located in `$OOSH_DIR/templates/code/`:
 
 | Template | Purpose |
 |----------|---------|
-| `new_script` | New oosh script template |
-| `new_script_test` | New test script template |
-| `new_method` | Method template for existing scripts |
-| `new_method_test` | Test method template |
+| `newScript` | New oosh script template |
+| `newScriptTest` | New test script template |
+| `newMethod` | Method template for existing scripts |
+| `newMethodTest` | Test method template |
 
 ## Usage Examples
 
