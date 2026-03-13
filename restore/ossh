@@ -1,0 +1,1457 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+# SSH ControlMaster socket path for connection reuse (single password entry)
+: ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
+
+### new.method
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONNECTION MANAGEMENT (SSH ControlMaster)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ossh.connection.open() # <host> # open persistent SSH connection (enter password once)
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "Usage: ossh connection.open <host>"; return 1; }
+
+  # Check if connection already open
+  if ssh -O check -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null; then
+    info.log "Connection to $host already open"
+    return 0
+  fi
+
+  # Open master connection in background, persist for 10 min
+  ssh -o ControlMaster=yes \
+      -o ControlPath="$OSSH_CONTROL_PATH" \
+      -o ControlPersist=600 \
+      -o StrictHostKeyChecking=accept-new \
+      -N -f "$host"
+
+  if [ $? -eq 0 ]; then
+    success.log "Connection to $host established (reusable for 10 min)"
+    return 0
+  else
+    error.log "Failed to connect to $host"
+    return 1
+  fi
+}
+ossh.connection.open.completion.host() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.connection.close() # <host> # close the persistent SSH connection
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "Usage: ossh connection.close <host>"; return 1; }
+  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null
+  info.log "Connection to $host closed"
+}
+ossh.connection.close.completion.host() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.connection.status() # <host> # check if persistent connection is open
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "Usage: ossh connection.status <host>"; return 1; }
+  if ssh -O check -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null; then
+    echo "open"
+    return 0
+  else
+    echo "closed"
+    return 1
+  fi
+}
+ossh.connection.status.completion.host() {
+  ossh.config.get.completion "$@"
+}
+
+private.ossh.rsync() # <src> <dest> # rsync with ControlMaster and auto-mkdir
+{
+  local src="$1"
+  local dest="$2"
+  local ssh_opts="ssh -o ControlPath=$OSSH_CONTROL_PATH -o StrictHostKeyChecking=accept-new"
+
+  # Extract host and remote path for mkdir
+  local host="${dest%%:*}"
+  local remote_path="${dest#*:}"
+  local remote_dir
+  remote_dir=$(dirname "$remote_path")
+
+  # Create remote directory first (works with both GNU rsync and openrsync)
+  if [ "$remote_dir" != "." ] && [ "$remote_dir" != "~" ]; then
+    ssh -o ControlPath="$OSSH_CONTROL_PATH" -o StrictHostKeyChecking=accept-new "$host" "mkdir -p '$remote_dir'" 2>/dev/null
+  fi
+
+  # Now rsync (compatible with openrsync on macOS)
+  rsync -avz -e "$ssh_opts" "$src" "$dest"
+}
+
+private.ossh.rsync.pull() # <src> <dest> # rsync pull with ControlMaster
+{
+  local src="$1"
+  local dest="$2"
+  local ssh_opts="ssh -o ControlPath=$OSSH_CONTROL_PATH -o StrictHostKeyChecking=accept-new"
+  rsync -avz -e "$ssh_opts" "$src" "$dest"
+}
+
+private.ossh.ssh() # <host> <command...> # ssh with ControlMaster
+{
+  local host="$1"
+  shift
+  ssh -o ControlPath="$OSSH_CONTROL_PATH" -o StrictHostKeyChecking=accept-new "$host" "$@"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+ossh.list() { # # lists all ossh methods
+  ossh.config.get.completion "$@" | line find "$1" | line replace "$1" "${CYAN}$1${NORMAL}"
+}
+
+ossh.list.ids() # <?id> <?sshDir:~/.ssh> # list available ids
+{
+  local id="$1"
+  shift 2>/dev/null
+  private.get.sshDir "$1"
+  local sshDir="$RESULT"
+  tree -L 1 $sshDir/ids | line find "$id"
+}
+
+ossh.get.public.id() # <?id> <?sshDir:~/.ssh> # prints the public key of <id> to the console
+{
+  local idName="$1"
+  [ -n "$1" ] && shift
+  private.get.sshDir "$1"
+  local sshDir="$RESULT"
+  local idFile
+  if [ -z "$idName" ]; then
+    private.detect.ssh.key.type "$sshDir"
+    local keyType="${RESULT:-id_rsa}"
+    idFile="$sshDir/${keyType}.pub"
+    idName=user
+  else
+    private.detect.ssh.key.type "$sshDir/ids/$idName"
+    local keyType="${RESULT:-id_rsa}"
+    idFile="$sshDir/ids/$idName/${keyType}.pub"
+  fi
+  echo $idFile
+
+  cat "$idFile"
+}
+
+ossh.id.create.fromKey() # <idName> <sourceSshDir> <?sshDir:~/.ssh> # creates a new key pair in <sshDir>/ids/<idName> from a given .ssh-dir with auto-detected key
+{
+  if [ -z "$1" ]; then
+    error.log "no idName"
+    return 1
+  else
+    idName="$1"
+    shift
+  fi
+
+  if [ -z "$1" ]; then
+    error.log "no sshdir"
+    return 1
+  else
+    sshdir="$1"
+    shift
+  fi
+
+  if ! private.detect.ssh.key "$sshdir"; then
+    error.log "no ssh key found in $sshdir"
+    return 1
+  fi
+  local sourceKey="$RESULT"
+  local keyType="${sourceKey##*/}"
+
+  if [ ! -f "${sourceKey}.pub" ]; then
+    error.log "missing public key ${sourceKey}.pub"
+    return 1
+  fi
+
+  private.get.sshDir "$1"
+  [ -n "$1" ] && shift
+  local sshBase="$RESULT"
+
+  echo "create $sshBase/ids/$idName/$keyType"
+  mkdir -p $sshBase/ids/$idName
+  cp "$sourceKey" "$sshBase/ids/$idName/"
+  cp "${sourceKey}.pub" "$sshBase/ids/$idName/"
+
+  mkdir -p $sshBase/ids/$idName/public_keys
+  mkdir -p $sshBase/ids/$idName/private_key
+
+  cp "$sshBase/ids/$idName/$keyType" "$sshBase/ids/$idName/private_key/$idName.private_key"
+  cp "$sshBase/ids/$idName/${keyType}.pub" "$sshBase/ids/$idName/public_keys/$idName.public_key"
+}
+
+ossh.id.create() # <idName> <?sshDir:~/.ssh> # creates a new ed25519 ssh key pair in <sshDir>/ids/<idName>
+{
+  if [ -z "$1" ]; then
+    error.log "no idName"
+    return 1
+  else
+    idName="$1"
+    shift
+  fi
+
+  private.get.sshDir "$1"
+  [ -n "$1" ] && shift
+  local sshBase="$RESULT"
+  local keyType="id_ed25519"
+
+  echo "create $sshBase/ids/$idName/$keyType"
+  mkdir -p $sshBase/ids/$idName
+  ssh-keygen -t ed25519 -f "$sshBase/ids/$idName/$keyType"
+
+  mkdir -p $sshBase/ids/$idName/public_keys
+  mkdir -p $sshBase/ids/$idName/private_key
+
+  cp "$sshBase/ids/$idName/$keyType" "$sshBase/ids/$idName/private_key/$idName.private_key"
+  cp "$sshBase/ids/$idName/${keyType}.pub" "$sshBase/ids/$idName/public_keys/$idName.public_key"
+}
+
+ossh.config.create() { # <?sshConfigName|user@host> <?url> <?id> # creates a ssh config. Single user@host arg auto-parses. Two args: <alias> <user@host>
+  #set -x
+  local sshConfigHost=""
+  local url=""
+  local id=""
+
+  # Smart detection: if $1 contains @ and $2 is empty, treat $1 as URL and derive alias
+  if [[ "$1" == *@* ]] && [ -z "$2" ]; then
+    url="$1"
+    sshConfigHost="${1#*@}"         # strip user@ prefix → "host" or "host:port"
+    sshConfigHost="${sshConfigHost%%:*}"   # strip :port if present
+    shift
+  else
+    # Two-arg form: <alias> <url>, or no args for system defaults
+    if [ -n "$1" ]; then
+      sshConfigHost="$1"
+      shift
+    else
+      sshConfigHost="$OOSH_SSH_CONFIG_HOST"
+      if [ -z "$sshConfigHost" ]; then
+        sshConfigHost="$HOSTNAME"
+      fi
+    fi
+
+    if [ -n "$1" ]; then
+      url="$1"
+      shift
+    else
+      url="$USER@$(hostname):$( ossh.server.get.port )"
+    fi
+  fi
+
+  if [ -n "$1" ]; then
+    id="$1"
+    shift
+  else
+    private.get.sshDir
+    if private.detect.ssh.key "$RESULT"; then
+      id="$RESULT"
+    else
+      id="$RESULT/id_ed25519"
+    fi
+  fi
+
+  if [ ! -f "$id" ]; then
+    private.get.sshDir
+    local idName="$id"
+    if private.detect.ssh.key "$RESULT/ids/$idName"; then
+      id="$RESULT"
+    else
+      id="$RESULT/ids/$idName/id_ed25519"
+    fi
+  fi
+
+  ossh.config.parse.url "$url"
+
+}
+
+ossh.create.key.folders() { # <?sshDir:~/.ssh> # if the .ssh folder was not created with ossh it fixes its structure
+  private.get.sshDir "$1"
+  if [ -n "$1" ]; then
+    shift
+  fi
+  local sshDir="$RESULT"
+  
+  mkdir -p $sshDir/public_keys                                      
+  mkdir -p $sshDir/private_key
+  if ! private.detect.ssh.key "$sshDir"; then
+    error.log "no ssh key found in $sshDir"
+    return 1
+  fi
+  local keyFile="$RESULT"
+  local keyType="${keyFile##*/}"
+  ossh.get.key.name                                   
+  local sshKeyName="$RESULT"
+  cp "$keyFile" "$sshDir/private_key/$sshKeyName.private_key"
+  cp "${keyFile}.pub" "$sshDir/public_keys/$sshKeyName.public_key"
+  ossh.status
+}
+
+ossh.delete.key.folders() { # <?sshDir:~/.ssh> # cleans the .ssh folder to a standard layout....may cause data loss!
+  private.get.sshDir "$1"
+  if [ -n "$1" ]; then
+    shift
+  fi
+  local sshDir="$RESULT"
+  problem.log "are you shure to delete the key folders in: $sshDir"
+  rm -rf  $sshDir/public_keys                                      
+  rm -rf $sshDir/private_key
+  ossh.status
+}
+
+ossh.create.and.install() { #  <sshConfigHost> <url> # creates a config <sshConfigName> for <url> and pushes the oosh there 
+
+  local sshConfigHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no sshConfigHost was specified"
+    return 1
+  fi
+
+  local url="$1"
+  if [ -n "$1" ]; then
+    url="$1"
+    shift
+  else
+    error.log "no url was specified"
+    return 1
+  fi
+
+  ossh.config.create $sshConfigHost
+  ossh.config.save.last
+  ossh.config.parse.url $url ossh.install
+  
+}
+
+ossh.install() { # <sshConfigHost> # pushes the oosh installer to the <sshConfigHost>
+  local sshConfigHost="$1"
+  if [ -n "$1" ]; then
+    shift
+    ossh.config.parse $sshConfigHost private.push.init.oosh
+    return $?
+  else
+    error.log "no sshConfigHost was specified"
+    return 1
+  fi
+  
+  if [ -z "$url" ]; then
+    error.log "no url"
+    return 1
+  fi
+
+  if [ -z "$user" ]; then
+    ossh.config.parse.url $url private.push.init.oosh
+  else
+    private.push.init.oosh
+  fi
+
+}
+
+private.push.init.oosh() {
+
+  private.get.sshDir
+  local file="$RESULT/public_keys/$( ossh.get.file.name ).public_key"
+  info.log "file=$file"
+
+  # Open persistent connection (password entered once)
+  ossh.connection.open "$sshConfigHost"
+
+  if private.ossh.rsync "$OOSH_DIR/init/oosh" "$sshConfigHost:." && \
+     private.ossh.rsync "$file" "$sshConfigHost:."; then
+    success.log "successfully copied oosh"
+    private.ossh.ssh "$sshConfigHost" "./oosh mode ssh $sshConfigHost $OOSH_SSH_CONFIG_HOST $OOSH_MODE"
+
+    important.log "remote installation done: $?"
+  else
+    problem.log "maybe already installed?"
+
+    private.ossh.ssh "$sshConfigHost" "bash /home/$user/oosh/ossh continue.local.install from $(ossh.get.url)"
+  fi
+
+  source $CONFIG
+  config list
+  
+  # problem.log "ossh 
+  # in private.push.init.oosh
+  # before ossh.install.finish.local $sshConfigHost"
+
+  ossh.install.finish.local $sshConfigHost
+
+}
+
+ossh.install.continue.local() { # <remoteSshConfigName> <sshConfigNameUsedForLocal> #
+  success.log "remote inititialized over ssh....
+  
+  here we go: 
+  $CONFIG
+  $*"
+  #set -x 
+  source $CONFIG
+
+  local remoteSshConfigName="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    remoteSshConfigName="unknownRemote"
+  fi
+
+  local sshConfigNameUsedForLocal="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    if [ -n "$OOSH_SSH_CONFIG_HOST" ]; then
+      sshConfigNameUsedForLocal="$OOSH_SSH_CONFIG_HOST"
+    else
+      sshConfigNameUsedForLocal="$HOSTNAME"
+    fi
+  fi
+
+  oo update
+  #source user
+  oo state
+  state next
+  #state next
+
+  source $CONFIG
+  config list
+  #problem.log "returned from state transition: $?   -$sshConfigNameUsedForLocal"
+
+  config ssh.set.config.host "$sshConfigNameUsedForLocal"
+
+  check dir $HOME/ssh.original not exists \
+    call user ssh.backup original
+  
+  user init
+
+  check dir $HOME/ssh.$USER.$sshConfigNameUsedForLocal.for.$remoteSshConfigName not exists \
+    call user ssh.backup $USER.$sshConfigNameUsedForLocal.for.$remoteSshConfigName
+  
+  mv $HOME/*.public_key $HOME/.ssh/public_keys
+
+  user update.authorized_keys
+  #state set 12
+  #scp -r $HOME/ssh.original 
+  create.result 0 "ossh.install.continue.local done successful" "$1" 
+  return $(result)
+
+}
+
+ossh.install.finish.local() { # # finishes local oosh installation
+  important.log "entering ossh.install.finish.local"
+
+  local sshConfigHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no sshConfigHost was specified"
+    return 1
+  fi
+
+  ossh.push.config $sshConfigHost
+  remoteKeyName=$( ossh.exec $sshConfigHost "ossh get.key.name" )
+  ossh.pull.key $sshConfigHost $remoteKeyName
+  ossh.update.authorized_keys
+}
+
+ossh.update.authorized_keys() # <?sshDir:~/.ssh> # updates authorized_keys from public_keys dir
+{
+
+  private.get.sshDir "$1"
+  if [ -n "$1" ]; then
+    shift
+  fi
+  local sshDir="$RESULT"
+
+  if ossh.isInstalled "" "$sshDir"; then
+    info.log "updating $sshDir/authorized_keys"
+    rm $sshDir/authorized_keys
+    cat $sshDir/public_keys/* >>$sshDir/authorized_keys
+
+    chmod 700 $sshDir
+    chmod 600 $sshDir/authorized_keys
+    if private.detect.ssh.key "$sshDir"; then
+      chmod 600 "$RESULT"
+    fi
+  fi
+}
+
+
+
+
+
+ossh.fix.rights() { # <?sshDir:~/.ssh> # fixes file permissions in sshDir
+  private.get.sshDir "$1"
+  if [ -n "$1" ]; then
+    shift
+  fi
+  local sshDir="$RESULT"
+
+  if ossh.isInstalled "" "$sshDir"; then
+    chmod 700 $sshDir
+    [ -f $sshDir/authorized_keys ] && chmod 600 $sshDir/authorized_keys
+    chmod +X,go+r $sshDir/*
+    if private.detect.ssh.key "$sshDir"; then
+      chmod 600 "$RESULT"
+    fi
+    tree -p $sshDir
+  fi
+}
+
+ossh.get.current.key.file.name() { # # gets the actual file name (instead of the best key name from get.key.name )
+  ossh.get.file.name
+}
+
+ossh.get.file.name() { # # gets the actual file name (instead of the best key name from get.key.name )
+  local sshDir="$1"
+  if [ -z "$1" ]; then
+    sshDir="$CURRENT_SSH_DIR"
+  fi
+  if [ -z "$sshDir" ]; then
+    sshDir="$HOME/.ssh"
+  fi
+  shift
+
+
+  local sshKeyName="$(ls $sshDir/private_key/ | sed 's/\.private_key//')"
+  if [ -z "$sshKeyName" ]; then
+    error.log "get.file.name: file not found..."
+    important.log "recovering by generating key.name for file"
+    sshKeyName="$( ossh.get.key.name )"
+  fi
+
+  create.result 0 "$sshKeyName" "$1"
+  echo "$RESULT"
+  return $(result)
+}
+
+ossh.show() { # # shows ossh status and available configs
+  #sed -n -e '/Host PI/,/Host / p' .ssh/config 
+  awk "/Host $1$/,/^$/" .ssh/config 
+}
+
+ossh.install.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.parameter.completion.sshConfigHost() {
+    private.get.sshDir
+    local sshDir="$RESULT"
+    grep '^Host' $sshDir/config $sshDir/config.d/* 2>/dev/null | cut -d ' ' -f 2-
+}
+
+ossh.parameter.completion.keyName() {
+  private.get.sshDir
+  ls $RESULT/public_keys/
+}
+
+ossh.parameter.completion.toHost() {
+    ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.parameter.completion.formHost() {
+    ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.parameter.completion.sshConfigName() {
+    ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.parameter.completion.sshDir() {
+  echo "$HOME/.ssh"
+  ls -d $HOME/.ssh/ids/*/ 2>/dev/null
+}
+
+ossh.parameter.completion.id() {
+  private.get.sshDir
+  ls $RESULT/ids
+}
+
+ossh.parameter.completion.file() {
+  important.log "ossh.parameter.completion.file $*"
+  c2 files.completion "$1"
+  private.get.sshDir
+  echo $RESULT/config
+}
+
+ossh.parameter.completion.dir() {
+  important.log "ossh.parameter.completion.file $*"
+  c2 folders.completion "$1"
+  private.get.sshDir
+  echo $RESULT/
+}
+
+ossh.config.get.completion() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.config.get() { # <sshConfigHost> <?file:~/.ssh/config> <?sshDir:~/.ssh>  # outputs the ssh config
+  local host="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    ossh.config.create
+    #error.log "no host was specified"
+    return $?
+  fi
+
+  local file="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    private.get.sshDir
+    file="$RESULT/config"
+  fi
+  echo ""
+  cat $file | line.find "Host $host$" "^$" | tee $CONFIG_PATH/result.txt
+
+  if [ -s $CONFIG_PATH/result.txt ]; then
+    create.result 0 "config $host found" 
+  else
+
+    create.result 2 "config $host not found" 
+    warn.log "$RESULT"
+
+  fi
+
+
+  #awk "/Host $host$/,/^$/" $file 
+  #grep -A "5" "Host $host$" .ssh/config 
+  return $(result)
+}
+
+
+
+ossh.config.parse.url() {  # <url>  <?method> # parses the url and shows config values. Then calls optional method that has acces to the paresed values
+  local url="$1"
+  if [ -n "$1" ]; then
+    url="$1"
+    shift
+  else
+    url="$USER@$(hostname):22"
+  fi
+
+  local call="$1"
+  if [ -n "$1" ]; then
+    call="$1"
+    shift
+  else
+    call=""
+  fi
+
+
+  local user="$( echo $url | cut -d"@" -f1  )"
+  local hostAndPort="$( echo $url | cut -d"@" -f2  )"
+
+  local hostname="$( echo $hostAndPort | cut -d":" -f1  )"
+  local port="$( echo $hostAndPort | cut -d":" -f2  )"
+  if ! this.isNumber $port; then
+    path=$port
+    SSH_CONFIG_Port=22
+    port="$SSH_CONFIG_Port"
+  fi
+  
+  if [ -z "$id" ]; then
+    private.get.sshDir
+    if private.detect.ssh.key "$RESULT"; then
+      id="$RESULT"
+    else
+      id="$RESULT/id_ed25519"
+    fi
+  fi
+
+  private.config.create
+  $call
+}
+
+ossh.config.parse() { # <sshConfigHost>  <?method:private.config.create> # parses the config and shows config values. Then calls optional <method> that has acces to the paresed values
+
+  #set -x
+  local sshConfigHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no sshConfigHost was specified"
+    return 1
+  fi
+
+
+  local call="$1"
+  if [ -n "$1" ]; then
+    call="$1"
+    shift
+  else
+    call="private.config.create"
+  fi
+
+  ossh.config.get $sshConfigHost | line.trim | line.split | line.unquote | line.format "declare -- SSH_CONFIG_%s=%s\n" >$CONFIG_PATH/result.env
+  source $CONFIG_PATH/result.env
+
+  local sshConfigHost="$SSH_CONFIG_Host"
+  local user="$SSH_CONFIG_User"
+  local hostname="$SSH_CONFIG_HostName"
+  
+  local path=""
+  local port="$SSH_CONFIG_Port"
+  if ! this.isNumber port; then
+    path=$port
+    SSH_CONFIG_Port=22
+    port="$SSH_CONFIG_Port"
+  fi
+  local id="$SSH_CONFIG_IdentityFile"
+
+  $call
+}
+
+private.config.create() {
+  {
+    echo ""
+    echo "Host $sshConfigHost"
+    echo " User $user"
+    echo " Port $port"
+    echo " HostName $hostname"
+    echo " IdentityFile $id"
+    echo ""
+  } >$CONFIG_PATH/result.txt
+  ossh.config.show.last
+  create.result 0 "$sshConfigHost"
+}
+
+ossh.get.url() { # <sshConfigHost> # gets the URL for the given <sshConfigHost>
+  local sshConfigHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    echo "$USER@$HOSTNAME"
+    #error.log "no sshConfigHost was specified"
+    #return 0
+  fi
+  ossh.config.parse $sshConfigHost private.get.url
+}
+
+ossh.get.ssh.parameter() { # <sshConfigHost> # gets the ssh paramerters for the given <sshConfigHost>
+  local sshConfigHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    echo "$USER@$HOSTNAME -p=22"
+    return 0
+  fi
+  ossh.config.parse $sshConfigHost private.get.ssh.parameter
+  
+}
+
+private.get.url() {
+  echo "$SSH_CONFIG_User@$SSH_CONFIG_HostName:$SSH_CONFIG_Port"
+}
+
+private.get.ssh.parameter() {
+  echo "$SSH_CONFIG_User@$SSH_CONFIG_HostName -p $SSH_CONFIG_Port"
+}
+
+private.get.sshDir() {
+  local sshDir="$1"
+  if [ -z "$1" ]; then
+    sshDir="$CURRENT_SSH_DIR"
+  fi
+  if [ -z "$sshDir" ]; then
+    sshDir="$HOME/.ssh"
+  fi
+  shift
+
+  create.result 0 "$sshDir" "$1"
+  echo "$RESULT"
+  return $(result)
+}
+
+ossh.get.url.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.get.ssh.parameter.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.config.parse.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.get.config.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.login() { # <sshConfigHost> # like normal ssh connect
+  local sshConfigHost="$1"
+  if [ -n "$1" ]; then
+    sshConfigHost="$1"
+    shift
+  else
+    error.log "no sshConfigHost was specified"
+    return 1
+  fi
+
+  private.get.sshDir
+  local sshConfigHostIP=$(grep -A3 "$sshConfigHost" "$RESULT/config" | grep -A0 HostName | awk '{print $2}')
+  ssh -o ControlPath="$OSSH_CONTROL_PATH" -o StrictHostKeyChecking=accept-new "$sshConfigHost"
+  # if ssh-keygen -F "$sshConfigHostIP" > /dev/null; then
+  #   ssh "$sshConfigHost"
+  # else
+  #   local loop=true
+  #   while [[ $loop == true ]]
+  #   do
+  #     local answer
+  #     # echo "Are you sure you want to continue connecting and add remote fingerprint to known_hosts (Y[es]/N[o])?"
+  #     # read -e -i "yes" answer
+  #     info.log "Choice to add fingerprint to known_hosts answer: $answer"
+  #     answer=$(echo $answer | awk '{print tolower($0)}')
+
+  #     if [ $answer = "yes" -o $answer = "y" ]; then
+  #       loop=false
+  #       ssh -o StrictHostKeyChecking=accept-new "$sshConfigHost"
+  #     elif [ $answer = "no" -o $answer = "n" ]; then
+  #       echo "Do you want to use a fingerprint without adding it to known_hosts (Y[es] or abort with N[o])?"
+  #       read -e -i "no" answer
+  #       info.log "Using fingerpint without adding to known_hosts answer: $answer"
+  #       answer=$(echo $answer | awk '{print tolower($0)}')
+
+  #       if [ $answer = "yes" -o $answer = "y" ]; then
+          
+  #         echo "Give fingerprint"
+  #         read -e answer
+  #         info.log "Fingerprint answer: $answer"
+
+  #         if [[ "$(ssh-keyscan "$sshConfigHostIP")" =~ "$answer" ]]; then
+  #           loop=false
+  #           echo "Given fingerprint maches"
+  #           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -q "$sshConfigHost"
+  #           info.log "Given fingerprint matches"
+  #         else
+  #           echo "Given fingerprint doesn't match. Starting from the beginning again"
+  #           info.log "Given fingerprint doesn't match. Starting from the beginning again"
+  #         fi
+
+  #       elif [ $answer = "no" -o $answer = "n" ]; then
+  #         loop=false
+  #         echo "Aborting ssh login"
+  #         info.log "Aborted ssh login"
+  #       else
+  #         echo "Unkown response, please try again"
+  #         info.log "Restarted ssh login"
+  #       fi
+  #     else
+  #       echo "Unkown response, please try again"
+  #       info.log "Restarted ssh login"
+  #     fi
+  #   done
+
+  # fi
+  RETURN=$1
+}
+
+ossh.login.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.get.config() { # <sshConfigHost> <?file:$HOME/.ssh/config> # same as config.get
+  ossh.config.get "$@"
+}
+
+
+ossh.get.server.ip() {
+  ossh.server.get.ip "$@"
+}
+
+ossh.get.server.port() {
+  ossh.server.get.port "$@"
+}
+
+ossh.config.show.last() {
+  cat $CONFIG_PATH/result.txt
+}
+
+ossh.config.save.last() {  # <?file> # appends the config to file
+  local file="$1"
+  if [ -n "$1" ]; then
+    file="$1"
+    shift
+  else
+    private.get.sshDir
+    file="$RESULT/config"
+  fi
+
+  # Check for duplicate Host entry before appending
+  local hostEntry=$(grep "^Host " "$CONFIG_PATH/result.txt" 2>/dev/null | head -1 | sed 's/^Host //')
+  if [ -n "$hostEntry" ] && grep -q "^Host ${hostEntry}$" "$file" 2>/dev/null; then
+    warn.log "Host '$hostEntry' already exists in $file — not appending duplicate"
+    return 1
+  fi
+
+  cat $CONFIG_PATH/result.txt >>$file
+  important.log "appended last config to $file"
+}
+
+
+ossh.config.edit() { # <?file> # opens the config file in an editor
+  local file="$1"
+  if [ -n "$1" ]; then
+    file="$1"
+    shift
+  else
+    private.get.sshDir
+    file="$RESULT/config"
+  fi
+  oo cmd vim
+  vim $file
+}
+
+ossh.config.list() { # <?file> # prints the config file
+  local file="$1"
+  if [ -n "$1" ]; then
+    file="$1"
+    shift
+  else
+    private.get.sshDir
+    file="$RESULT/config"
+  fi
+
+  cat $file
+}
+
+ossh.status() { # # checks if the users .ssh is configures and if the ssh service is up
+  source os
+  source oo
+  oo.cmd tree
+  oo.cmd sshd openssh-server
+  private.get.sshDir
+  local sshDir="$RESULT"
+  if user ssh.status log "$sshDir"; then
+    tree -p "$sshDir"
+  fi
+
+  if os.check ossh.service.status; then
+    $RESULT "$@"
+  else
+    source $CONFIG_PATH/result.env
+    important.log "$RESULT is not supported"
+  fi  
+
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEY TYPE AUTO-DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.detect.ssh.key() # <sshDir> # auto-detects the private key in sshDir. Sets RESULT to full path (e.g. /path/id_ed25519). Returns 1 if none found.
+{
+  local sshDir="$1"
+  local keyType
+  for keyType in id_ed25519 id_ecdsa id_rsa id_dsa; do
+    if [ -f "$sshDir/$keyType" ]; then
+      RESULT="$sshDir/$keyType"
+      return 0
+    fi
+  done
+  RESULT=""
+  return 1
+}
+
+private.detect.ssh.key.type() # <sshDir> # like private.detect.ssh.key but RESULT is just the key type name (e.g. id_ed25519)
+{
+  private.detect.ssh.key "$1"
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    RESULT="${RESULT##*/}"
+  fi
+  return $rc
+}
+
+ossh.isInstalled() # <?log> <?sshDir:~/.ssh> # returns 1 if there is no ssh init. use log as argument if you want to see the output
+{
+  local logArg=""
+  if [ "$1" == "log" ]; then
+    logArg="log"
+    shift
+  fi
+
+  private.get.sshDir "$1"
+  [ -n "$1" ] && shift
+  local sshDir="$RESULT"
+
+  if private.detect.ssh.key "$sshDir"; then
+    create.result 0 "ssh is initialized for $USER in $sshDir ($(basename $RESULT))" "$1"
+    if ! [ -d $sshDir/public_keys ]; then
+      user ssh.create.folders "$sshDir"
+    fi
+  else
+    create.result 1 "ssh does not exist for $USER in $sshDir" "$1"
+  fi
+
+  if [ "$logArg" == "log" ]; then
+    echo "$RESULT"
+    RETURN=$1
+  else
+    info.log "$RESULT"
+  fi
+  return "$(result)"
+}
+
+ossh.service.status.unknown() {
+  warn.log "could not determine OS....assuming linux"
+  ossh.service.status.linux
+}
+
+ossh.service.status.linux() {
+  if  [ -x "$(command -v service)" ]; then
+    if ! service ssh status; then
+      service ssh restart
+    fi
+    return $?
+  fi
+  if  [ -x "$(command -v systemctl)" ]; then
+    if ! systemctl status sshd; then
+      systemctl restart sshd
+    fi
+    return $?
+  fi
+  sshd &
+}
+
+ossh.service.status.darwin() {
+  if ! $SUDO systemsetup -getremotelogin; then
+    $SUDO launchctl stop com.openssh.sshd
+    $SUDO launchctl start com.openssh.sshd
+    #sudo systemsetup -setremotelogin on
+  fi
+}
+
+ossh.config.push() { # # alias for push.config
+  ossh.push.config "$@"
+}
+
+ossh.push.config() { # <toHost> <sshConfigName> # adds the config <configName> to the configs on host <toHost>
+
+
+  local toHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no toHost was specified"
+    return 1
+  fi
+
+  local configName="$1"
+  if [ -n "$1" ]; then
+    shift
+      ossh.get.config $configName >$CONFIG_PATH/tmp.ssh.config.$configName
+  else
+    ossh.config.create >$CONFIG_PATH/tmp.ssh.config.$configName
+  fi
+
+
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$CONFIG_PATH/tmp.ssh.config.$configName" "$toHost:config/tmp.ssh.config.$configName"
+  private.ossh.ssh "$toHost" "cat config/tmp.ssh.config.$configName >>.ssh/config; rm ~/config/tmp.ssh.config.$configName"
+  rm ~/config/tmp.ssh.config.$configName
+}
+
+ossh.push.config.completion() {
+  ossh.config.get.completion "$@"
+}
+
+
+ossh.config.push.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.push.key() { #  <toHost> <?keyName> <?sshDir:~/.ssh> # adds your key to host <toHost> optional you can specify another <?keyName> from <sshDir>/public_keys/
+  local toHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no toHost was specified"
+    return 1
+  fi
+
+  local keyName="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    keyName="$( ossh.get.file.name ).public_key"
+  fi
+
+  private.get.sshDir "$1"
+  [ -n "$1" ] && shift
+  local sshDir="$RESULT"
+
+  echo $sshDir/public_keys/$keyName $toHost:.ssh/public_keys/$keyName
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$sshDir/public_keys/$keyName" "$toHost:.ssh/public_keys/$keyName"
+  ossh.exec $toHost "user update.authorized_keys"
+}
+
+ossh.get.key.name() { # # creates a good key name fot this user and host
+  local sshKeyName="$SSH_KEY_NAME"
+
+  # if [ -z "$SSH_KEY_NAME" ]; then
+  #   source config
+  #   config.load ssh.info
+  # fi
+
+  if [ -z "$sshKeyName" ]; then
+    if [ -n "$OOSH_SSH_CONFIG_HOST" ]; then
+      ossh.set.key.name "$USER.$OOSH_SSH_CONFIG_HOST"
+    else
+      ossh.set.key.name "$USER.$(hostname -f)"
+    fi
+  fi
+
+  create.result 0 "$RESULT" "$1"
+  echo "$RESULT"
+  return $(result)
+}
+
+
+ossh.set.key.name() {  # <?sshKeyName> # sets the key name to sshKeyName and saves it in $CONFIG_PATH/ssh.info.env
+  local sshKeyName="$1"
+  if [ -z "$sshKeyName" ]; then
+    export SSH_KEY_NAME="$USER.$(hostname -f)"
+  fi
+  config save "ssh.info" "SSH_" >/dev/null
+  stop.log "$SSH_KEY_NAME - $sshKeyName"
+  create.result 0 "$sshKeyName" "$1"
+  return $(result)
+}
+
+# ossh.get.file.name() { # # gets the actual key file name (instead of the best key name from get.key.name )
+#   local sshDir="$1"
+#   if [ -z "$1" ]; then
+#     sshDir="$CURRENT_SSH_DIR"
+#   fi
+#   if [ -z "$sshDir" ]; then
+#     sshDir="$HOME/.ssh"
+#   fi
+#   shift
+
+
+#   local sshKeyName="$(ls $sshDir/private_key/ | sed 's/\.private_key//')"
+
+#   create.result 0 "$sshKeyName" "$1"
+#   echo "$RESULT"
+#   return $(result)
+# }
+
+
+ossh.push.dir() { # <toHost> <dir> # adds the config <configName> to the configs on host <toHost>
+
+  local toHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no toHost was specified"
+    return 1
+  fi
+
+  local dir="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no dir was specified"
+    return 1
+  fi
+
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$dir" "$toHost:."
+}
+
+
+ossh.push.dir.completion() {
+  ossh.config.get.completion "$@"
+}
+
+
+ossh.push.key.completion() {
+  #ls $HOME/.ssh/public_keys/$1*
+    ossh.config.get.completion "$@"
+}
+
+ossh.pull.dir() { # <fromHost> <dir> # gets te directory <dir> <fromHost> into the CURRENT LOCAL dirrectory
+
+  local toHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no toHost was specified"
+    return 1
+  fi
+
+  local dir="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no dir was specified"
+    return 1
+  fi
+
+  important.log "copying from $toHost:$dir"
+  ossh.connection.open "$toHost"
+  private.ossh.rsync.pull "$toHost:$dir" "."
+  #ssh $toHost "user update.authorized_keys"
+}
+
+ossh.pull.key() { # <fromHost> <dir> # gets te directory <dir> <fromHost> into the CURRENT LOCAL dirrectory
+
+  local toHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no toHost was specified"
+    return 1
+  fi
+
+  local keyName="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    keyName=$( ossh exec $toHost "ossh get.file.name" )
+    error.log "no dir was specified: using $keyName"
+    #return 1
+  fi
+
+  ossh.connection.open "$toHost"
+  private.get.sshDir
+  private.ossh.rsync.pull "$toHost:.ssh/public_keys/$keyName.public_key" "$RESULT/public_keys/$keyName.public_key.pulled"
+  #ssh $toHost "user update.authorized_keys"
+}
+
+ossh.pull.config() { # <fromHost> <sshConfigName> <?file> # pulls a config from remote and seves it
+  local fromHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no fromHost was specified"
+    return 1
+  fi
+
+  local sshConfigName="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+
+    error.log "no sshConfigName was specified."
+    important.log "available remote ssh configs:"
+    ossh exec $fromHost "ossh config.list"
+    return 1
+  fi
+
+  local file="$1"
+  if [ -n "$1" ]; then
+    file="$1"
+    shift
+  else
+    private.get.sshDir
+    file="$RESULT/config"
+  fi
+
+  ossh exec $fromHost "ossh get.config $sshConfigName" >>$file
+}
+
+ossh.pull.id() # <fromHost> <?file> <?sshDir> # pulls the .ssh dir <formHost> to <sshDir>/ids and renames it
+# TODO get remote user and rename to ssh.$remoteUser.$fromHost
+{
+  local fromHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no fromHost was specified"
+    return 1
+  fi
+
+  local id=$( ossh exec $fromHost "ossh get.key.name" )
+
+  local file="$1"
+  if [ -n "$1" ]; then
+    file="$1"
+    shift
+  else
+    private.get.sshDir
+    file="$RESULT/config"
+  fi
+
+  private.get.sshDir "$1"
+  [ -n "$1" ] && shift
+  local sshDir="$RESULT"
+
+  if ! [ -d $sshDir/ids ]; then
+    mkdir -p $sshDir/ids
+  fi
+
+  cd $sshDir/ids
+  ossh pull.dir $fromHost ".ssh"
+  mv .ssh ssh.$id
+}
+
+ossh.push.id() # <toHost> <id> <?sshDir> # pushes the <id> <toHost>
+{
+  local toHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no toHost was specified"
+    return 1
+  fi
+
+  if [ -z "$1" ]; then
+    error.log "no id was specified"
+    return 1
+  else
+    idName="$1"
+    shift
+  fi
+
+  private.get.sshDir "$1"
+  [ -n "$1" ] && shift
+  local sshDir="$RESULT"
+  local idDir="$sshDir/ids/$idName"
+
+  ossh.connection.open "$toHost"
+  private.ossh.rsync "$idDir" "$toHost:~/.ssh/ids/"
+}
+
+ossh.get.server.port() {
+  if [ -f /etc/ssh/sshd_config ]; then
+    cat /etc/ssh/sshd_config | line find 'Port ' | line split | line select 2
+  else
+    echo 22
+  fi
+}
+
+ossh.server.get.port() {
+  ossh.get.server.port
+}
+
+ossh.server.get.ip() {
+  if os.check ossh.server.get.ip; then
+    $RESULT "$@"
+  else
+    important.log "$RESULT is not supported"
+  fi  
+}
+
+ossh.server.get.ip.darwin() {
+  ifconfig | line find 192 | line split | line select 2
+}
+
+ossh.server.get.ip.linux() {
+  hostname -I
+}
+
+ossh.server.config.edit() {
+  vim /etc/ssh/sshd_config 
+}
+
+ossh.tunnel() # <toHost> <portMap:> # maps the ports on localhost <toHost>
+# eg ossh tunnel someHost  8093:127.0.0.1:8080
+{
+  ssh -o ControlPath="$OSSH_CONTROL_PATH" $1 -L $2
+}
+
+ossh.list.open.ports() { # # lists open ports an their applications and users
+  lsof -Pn -i4
+}
+
+ossh.exec() { # <toHost> <command> # executes the command on host <toHost>
+
+  local toHost="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no toHost was specified"
+    return 1
+  fi
+
+
+  ssh -o ControlPath="$OSSH_CONTROL_PATH" $toHost "source config/user.env; $@"
+}
+
+
+ossh.exec.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.test() {
+  this.isSourced
+  echo this.isSourced=$?
+  echo "this: $this"
+  echo "caller: $caller"
+  echo "callerFunction: $callerFunction"
+  echo "This: $This"
+  #echo "this.this: $(this.this)"
+}
+
+ossh.usage()
+{
+  local this=${0##*/}
+  echo "You started" 
+  echo "$0
+
+  Usage:
+  $this: command   description and Parameter
+
+      usage     prints this dialog while it will print the status when there are no parameters          
+      v         print version information
+      init      initializes ...nothing yet
+
+      config.get          <sshConfigHost> <?file:\"$HOME/.ssh/config\">   outputs the ssh config
+
+      config.create       <sshConfigHost> <?url> <privateKey:\"$HOME/.ssh/id_rsa\">
+      config.show.last    shows \$CONFIG_PATH: $CONFIG_PATH/result.txt
+      config.save.last    <?file:\"$HOME/.ssh/config\">
+
+      config.parse.url    <?url> parses a url and shows a resulting config
+
+      install             <?url> installs password free access to the user in the url 
+
+      ----      --------------------------"
+  this.help
+  echo "${GREEN}
+  
+  Examples
+
+    $this config.create iMac
+    $this config.create dockerSSH test@localhost:8022
+    $this config.show.last
+    $this config.save.last
+
+  "
+}
+
+ossh.start()
+{
+  #echo "sourcing init"
+  if [ -z "$CONFIG" ]; then
+    CONFIG=$HOME/config/user.env
+    source $CONFIG
+  fi
+  source this
+  source line
+  source os
+
+  # if [ -z "$1" ]; then
+  #   status.discover "$@"
+  #   return 0
+  # fi
+
+  this.start "$@"
+}
+
+ossh.start "$@"
+
