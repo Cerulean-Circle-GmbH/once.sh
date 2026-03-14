@@ -1874,6 +1874,7 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
     if [ -n "$reg_role" ]; then
       [[ ${#reg_role} -gt 30 ]] && issues+=("role>30")
       [[ "$reg_role" == *" "* ]] && issues+=("role has space")
+      [[ "$reg_role" == "ClaudeCode" || "$reg_role" == "claude" ]] && issues+=("generic role")
     fi
 
     local match="${BOLD_GREEN}✓${NORMAL}"
@@ -1914,6 +1915,22 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
   echo -e "${BOLD_CYAN}Fixing identity consistency...${NORMAL}"
   echo
 
+  # --- 0. Clean up garbage entries in sessions.env ---
+  # Remove: lines where role looks like a UUID, empty lines, generic "ClaudeCode" entries
+  if [ -f "$sess_file" ]; then
+    local garbage_count=0
+    # UUIDs used as role names (e.g. "f5de0cee-...$|f5de0cee-...")
+    local gc
+    gc=$(grep -cE '^[0-9a-f]{8}-' "$sess_file" 2>/dev/null) && garbage_count=$((garbage_count + gc))
+    sed -i '' '/^[0-9a-f]\{8\}-/d' "$sess_file"
+    # Generic "ClaudeCode" role entries
+    gc=$(grep -cE '^ClaudeCode\|' "$sess_file" 2>/dev/null) && garbage_count=$((garbage_count + gc))
+    sed -i '' '/^ClaudeCode|/d' "$sess_file"
+    # Empty lines
+    sed -i '' '/^$/d' "$sess_file"
+    [ $garbage_count -gt 0 ] && echo -e "${BOLD_GREEN}Cleaned $garbage_count garbage entries from sessions.env${NORMAL}"
+  fi
+
   local fixed_reg=0 fixed_sess=0 fixed_title=0 skipped=0 dup_resolved=0
   local -A seen_uuids role_for_uuid
 
@@ -1940,8 +1957,8 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
     # Try registry first
     [ -f "$reg" ] && role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
 
-    # Try pane title fallback
-    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+    # Try pane title fallback (reject generic "ClaudeCode" — not a real role)
+    if [ -z "$role" ] || [ "$role" = "unknown" ] || [ "$role" = "ClaudeCode" ]; then
       role="${title}"
       role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"
       role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
@@ -1949,7 +1966,12 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
       role=$(echo "$role" | tr -d '[:space:]' | head -c 30)
     fi
 
-    # Try live.discover
+    # Reject generic role names — they indicate unbootstrapped panes
+    if [ "$role" = "ClaudeCode" ] || [ "$role" = "claude" ]; then
+      role=""
+    fi
+
+    # Try live.discover (extracts role from session name set by /rename during bootstrap)
     if [ -z "$role" ] || [ "$role" = "unknown" ]; then
       local discover_result
       discover_result=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
@@ -1960,7 +1982,7 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
     fi
 
     # Can't determine role — skip
-    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
+    if [ -z "$role" ] || [ "$role" = "unknown" ] || [ "$role" = "ClaudeCode" ]; then
       printf "${BOLD_YELLOW}%-28s %-16s SKIPPED (can't determine role)${NORMAL}\n" "$pane_target" "${title:0:14}"
       skipped=$((skipped + 1))
       continue
@@ -1981,11 +2003,22 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
 
     # --- 3b. Fix sessions.env UUID ---
     if [ -n "$live_uuid" ]; then
-      # Check for duplicate UUID
+      # Check for duplicate UUID — purge OTHER roles that had this UUID (they're stale)
       if [ -n "${seen_uuids[$live_uuid]:-}" ]; then
         local dup_role="${role_for_uuid[$live_uuid]:-}"
         echo -e "${BOLD_RED}⚠ DUPLICATE UUID: $dup_role and $role both have ${live_uuid:0:8}${NORMAL}"
         dup_resolved=$((dup_resolved + 1))
+      fi
+      # Purge all OTHER sessions.env entries that share this UUID (stale from agent moves/restarts)
+      local dup_roles
+      dup_roles=$(grep "|${live_uuid}$" "$sess_file" 2>/dev/null | cut -d'|' -f1 | grep -v "^${role}$")
+      if [ -n "$dup_roles" ]; then
+        while IFS= read -r stale_role; do
+          [ -z "$stale_role" ] && continue
+          sed -i '' "/^${stale_role}|${live_uuid}\$/d" "$sess_file"
+          line_parts+=("${BOLD_YELLOW}purged dup ${stale_role}|${live_uuid:0:8}${NORMAL}")
+          dup_resolved=$((dup_resolved + 1))
+        done <<< "$dup_roles"
       fi
       seen_uuids["$live_uuid"]="$pane_target"
       role_for_uuid["$live_uuid"]="$role"
