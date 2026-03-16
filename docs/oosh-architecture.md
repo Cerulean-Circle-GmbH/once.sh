@@ -55,7 +55,7 @@ Underscores technically work but are banned for consistency.
 # CORRECT
 odocker.file.find() # <containerOrImage> # find Dockerfile
 odocker.run() # <image> <?name> # run container
-scrumMaster.measure.context() # <agentName> <?session> # measure context
+scrumMaster.context.measure() # <agentName> <?session> # measure context
 
 # WRONG — all of these break OOSH or violate convention
 odocker.file.find() # <container-or-image> # CRASH: PARAM_container-or-image
