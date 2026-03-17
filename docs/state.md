@@ -262,6 +262,38 @@ After `source $OOSH_DIR/state`, use dot notation: `state.machine.create`, `state
 - `$CONFIG_PATH/stateMachines/<name>.states.env` - State machine definition
 - `$CONFIG_PATH/current.state.machine.env` - Cache of currently selected machine
 
+## Limitations and Workarounds
+
+### Transition to [99] via `state.entry.add`
+
+`state.entry.add 99` does **not** create a transition to `[99]=finished`. The template pre-sets `[99]="finished"`, so adding `99` as a state name tries to occupy a slot that already exists.
+
+**Workaround**: Use manual `printf -v` to set transition states that point to 99:
+
+```bash
+source $CONFIG_PATH/stateMachines/MYMACHINE.states.env
+printf -v "MYMACHINE_STATES[19]" '%s' '99'   # [19] → jumps to [99]=finished
+private.state.machine.update                   # persist changes
+```
+
+See `promote` for a full example of this pattern (stage path [19]=99, prod path [26]=99).
+
+### Branching via Check Functions
+
+Check functions can return a numeric `RESULT` to branch forward or backward:
+
+```bash
+private.check.target.checked() {
+  if [ "$TARGET" = "stage" ]; then
+    create.result 0 13   # Branch forward to [13]
+  elif [ "$TARGET" = "prod" ]; then
+    create.result 0 20   # Branch forward to [20]
+  fi
+}
+```
+
+**Important**: Backward branches (returning a lower state ID) work but are **not compatible with "stuck detection" advancement loops** — loops that break when `state <= prevState` will exit on a backward branch. Use backward branches only in machines with custom advancement logic (like scrumMaster's PDCA cycle).
+
 ## Best Practices
 
 1. **Always use `silent`** when adding states to avoid verbose output
