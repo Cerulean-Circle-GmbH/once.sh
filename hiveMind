@@ -26,8 +26,8 @@
 # env per pane  : HIVEMIND_ROLE=<role>  exported before Claude Code starts
 # role registry : ~/config/hivemind.roles.env  write-through cache: pane targets → role names
 #                 format: target|role  (fallback — live discovery is primary)
-# session store : ~/config/hivemind.sessions.env  maps role → Claude session UUID
-#                 format: role|session-uuid  (allows session rejoin)
+# session store : ~/config/hivemind.sessions.env  maps pane → Claude session UUID
+#                 format: pane|session-uuid  (allows session rejoin, pane-scoped)
 : ${HIVEMIND_WINDOW_NAME:=team}
 : ${HIVEMIND_REGISTRY:=${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}
 : ${HIVEMIND_SESSIONS:=${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}
@@ -427,34 +427,34 @@ private.hiveMind.live.discover.session() {
 }
 
 # ── Session Tracking ──────────────────────────────────────────────────────────
-# File-based mapping: role name → Claude session UUID.
+# File-based mapping: pane target → Claude session UUID.
 # Allows rejoining a session after the Claude process exits.
-# Format: role|session-uuid  (one per line)
+# Format: pane|session-uuid  (one per line, e.g. projectTeam:0.2|a2c6b6c4-...)
 
 private.hiveMind.session.store() {
-  # Store or update role → session UUID mapping
-  local role="$1"
-  local session_id="$2"
-  [ -z "$role" ] || [ -z "$session_id" ] && return 1
+  # Store or update pane → session UUID mapping
+  local pane="$1"
+  local sessionId="$2"
+  [ -z "$pane" ] || [ -z "$sessionId" ] && return 1
   private.hiveMind.sessions.migrate
   # Ensure config directory exists
-  local config_dir
-  config_dir=$(dirname "$HIVEMIND_SESSIONS")
-  mkdir -p "$config_dir" 2>/dev/null
-  # Remove old entry for this role, then append new one
+  local configDir
+  configDir=$(dirname "$HIVEMIND_SESSIONS")
+  mkdir -p "$configDir" 2>/dev/null
+  # Remove old entry for this pane, then append new one
   if [ -f "$HIVEMIND_SESSIONS" ]; then
-    grep -v "^${role}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+    grep -v "^${pane}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
     mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
   fi
-  echo "${role}|${session_id}" >> "$HIVEMIND_SESSIONS"
+  echo "${pane}|${sessionId}" >> "$HIVEMIND_SESSIONS"
 }
 
 private.hiveMind.session.lookup() {
-  # Look up stored session UUID for a given role
-  local role="$1"
+  # Look up stored session UUID for a given pane target
+  local pane="$1"
   private.hiveMind.sessions.migrate
   [ -f "$HIVEMIND_SESSIONS" ] || return 1
-  grep "^${role}|" "$HIVEMIND_SESSIONS" 2>/dev/null | tail -1 | cut -d'|' -f2
+  grep "^${pane}|" "$HIVEMIND_SESSIONS" 2>/dev/null | tail -1 | cut -d'|' -f2
 }
 
 # ── Active Team ───────────────────────────────────────────────────────────────
@@ -783,14 +783,14 @@ hiveMind.join() # <name> # rejoin an agent's Claude session by role name
 
   if [ -n "$session_id" ]; then
     # Claude is still running — store the session ID and inform user
-    private.hiveMind.session.store "$name" "$session_id"
+    private.hiveMind.session.store "$target" "$session_id"
     info.log "Claude is already running in $target (session: ${session_id:0:8}...)"
     echo "Session $session_id is active in pane $target"
     return 0
   fi
 
   # Process not running — look up stored session ID
-  session_id=$(private.hiveMind.session.lookup "$name")
+  session_id=$(private.hiveMind.session.lookup "$target")
 
   if [ -z "$session_id" ]; then
     error.log "No session found for agent '$name'"
@@ -1589,7 +1589,7 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
       local dead_sess="${pane_target%%:*}"
       local dead_addr="${pane_target#*:}"
       local dead_uuid=""
-      [ -f "$ses" ] && dead_uuid=$(grep "^${reg_role}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
+      [ -f "$ses" ] && dead_uuid=$(grep "^${pane_target}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
       local dead_title="${reg_role}"
       echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${dead_title} (dead)" >> "$outfile"
       dead_count=$((dead_count + 1))
@@ -1910,14 +1910,10 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
 
     local regDisplay="${regRole:-${BOLD_YELLOW}MISSING${NORMAL}}"
 
-    # Sessions.env UUID (look up by registry role or title-derived role)
+    # Sessions.env UUID (look up by pane target)
     local sessUuid=""
-    local lookupRole="${regRole}"
-    if [ -z "$lookupRole" ]; then
-      lookupRole=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
-    fi
-    if [ -n "$lookupRole" ] && [ -f "$sess_file" ]; then
-      sessUuid=$(grep "^${lookupRole}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+    if [ -f "$sess_file" ]; then
+      sessUuid=$(grep "^${pane_target}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
     fi
     local sessShort="${sessUuid:0:8}"
 
@@ -1989,19 +1985,24 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
   echo
 
   # --- 0. Clean up garbage entries in sessions.env ---
-  # Remove: lines where role looks like a UUID, empty lines, generic "ClaudeCode" entries
+  # Clean garbage: UUIDs as keys, generic roles, old role-keyed entries (pre-schema-change), empty lines
   if [ -f "$sess_file" ]; then
     local garbageCount=0
-    # UUIDs used as role names (e.g. "f5de0cee-...$|f5de0cee-...")
     local gc
+    # UUIDs used as keys
     gc=$(grep -cE '^[0-9a-f]{8}-' "$sess_file" 2>/dev/null) && garbageCount=$((garbageCount + gc))
     sed -i '' '/^[0-9a-f]\{8\}-/d' "$sess_file"
-    # Generic "ClaudeCode" role entries
+    # Generic "ClaudeCode" entries
     gc=$(grep -cE '^ClaudeCode\|' "$sess_file" 2>/dev/null) && garbageCount=$((garbageCount + gc))
     sed -i '' '/^ClaudeCode|/d' "$sess_file"
+    # Legacy role-keyed entries (keys without ':' are old role names, not pane targets)
+    gc=$(grep -cvE '^[^|]*:[0-9]' "$sess_file" 2>/dev/null) && garbageCount=$((garbageCount + gc))
+    local paneOnly
+    paneOnly=$(sed -n '/^[^|]*:[0-9]/p' "$sess_file")
+    echo "$paneOnly" > "$sess_file"
     # Empty lines
     sed -i '' '/^$/d' "$sess_file"
-    [ $garbageCount -gt 0 ] && echo -e "${BOLD_GREEN}Cleaned $garbageCount garbage entries from sessions.env${NORMAL}"
+    [ $garbageCount -gt 0 ] && echo -e "${BOLD_GREEN}Cleaned $garbageCount garbage/legacy entries from sessions.env${NORMAL}"
   fi
 
   local fixedReg=0 fixedSess=0 fixedTitle=0 skipped=0 dupResolved=0
@@ -2079,28 +2080,24 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
         echo -e "${BOLD_RED}⚠ DUP UUID: $dupRole and $role share ${liveUuid:0:8}${NORMAL}"
         dupResolved=$((dupResolved + 1))
       fi
-      # Purge stale entries sharing this UUID (only if role has no live process)
-      local dupRoles
-      dupRoles=$(grep "|${liveUuid}$" "$sess_file" 2>/dev/null | cut -d'|' -f1 | grep -v "^${role}$")
-      if [ -n "$dupRoles" ]; then
-        while IFS= read -r staleRole; do
-          [ -z "$staleRole" ] && continue
-          local stalePane=""
-          [ -f "$reg" ] && stalePane=$(grep "|${staleRole}$" "$reg" 2>/dev/null | head -1 | cut -d'|' -f1)
-          if [ -n "$stalePane" ] && [ -n "${claudeProcs[$stalePane]:-}" ]; then
+      # Purge stale entries sharing this UUID (only if pane has no live process)
+      local dupPanes
+      dupPanes=$(grep "|${liveUuid}$" "$sess_file" 2>/dev/null | cut -d'|' -f1 | grep -v "^${paneTarget}$")
+      if [ -n "$dupPanes" ]; then
+        while IFS= read -r stalePane; do
+          [ -z "$stalePane" ] && continue
+          if [ -n "${claudeProcs[$stalePane]:-}" ]; then
             continue  # Live process — shared session, not stale
           fi
-          private.hiveMind.env.del "$sess_file" "$staleRole" "$liveUuid"
-          lineParts+=("${BOLD_YELLOW}purged ${staleRole}|${liveUuid:0:8}${NORMAL}")
+          private.hiveMind.env.del "$sess_file" "$stalePane" "$liveUuid"
+          lineParts+=("${BOLD_YELLOW}purged ${stalePane}|${liveUuid:0:8}${NORMAL}")
           dupResolved=$((dupResolved + 1))
-        done <<< "$dupRoles"
+        done <<< "$dupPanes"
       fi
       seenUuids["$liveUuid"]="$paneTarget"
       roleForUuid["$liveUuid"]="$role"
 
-      if private.hiveMind.env.set "$sess_file" "$role" "$liveUuid"; then
-        local oldUuid
-        oldUuid=$(grep "^${role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+      if private.hiveMind.env.set "$sess_file" "$paneTarget" "$liveUuid"; then
         lineParts+=("${BOLD_GREEN}sessions.env → ${liveUuid:0:8} ✓${NORMAL}")
         fixedSess=$((fixedSess + 1))
       else
@@ -2223,14 +2220,12 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   # ── Capture UUIDs for identity tracking ─────────────────────────────────
   info.log "Capturing session UUIDs..."
   local ses="$HIVEMIND_SESSIONS"
-  local _roles=("oosh-orchestrator" "oosh-expert" "oosh-tester")
   local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2")
   for i in 0 1 2; do
     local _sid
     _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
     if [ -n "$_sid" ]; then
-      grep -v "^${_roles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
-      echo "${_roles[$i]}|${_sid}" >> "$ses"
+      private.hiveMind.session.store "${_panes[$i]}" "$_sid"
     fi
   done
 
@@ -2493,12 +2488,12 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
     # Write roles registry: pane → role
     echo "${pane_target}|${role}" >> "$reg"
 
-    # Write sessions file: role → uuid
+    # Write sessions file: pane → uuid
     if [ -f "$ses" ]; then
-      grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
+      grep -v "^${pane_target}|" "$ses" > "${ses}.tmp" 2>/dev/null
       mv "${ses}.tmp" "$ses"
     fi
-    echo "${role}|${sid}" >> "$ses"
+    echo "${pane_target}|${sid}" >> "$ses"
 
     updated=$((updated + 1))
     info.log "  $pane_target → $role [$sid]"
@@ -2511,9 +2506,9 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
     if [ -n "$dup_uuids" ]; then
       while IFS= read -r dup_sid; do
         [ -z "$dup_sid" ] && continue
-        local dup_roles
-        dup_roles=$(grep "|${dup_sid}" "$ses" 2>/dev/null | cut -d'|' -f1 | tr '\n' ', ')
-        warn.log "DUPLICATE UUID ${dup_sid:0:8}... shared by roles: ${dup_roles%, }"
+        local dupPanes
+        dupPanes=$(grep "|${dup_sid}" "$ses" 2>/dev/null | cut -d'|' -f1 | tr '\n' ', ')
+        warn.log "DUPLICATE UUID ${dup_sid:0:8}... shared by panes: ${dupPanes%, }"
       done <<< "$dup_uuids"
     fi
   fi
@@ -2582,13 +2577,8 @@ hiveMind.agent.bootstrap() # <role> <?session> <?pane> # full bootstrap: create 
   local new_sid
   new_sid=$(claudeCode session.probe "$target_pane" 2>/dev/null)
   if [ -n "$new_sid" ]; then
-    local ses="$HIVEMIND_SESSIONS"
-    if [ -f "$ses" ]; then
-      grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
-      mv "${ses}.tmp" "$ses"
-    fi
-    echo "${role}|${new_sid}" >> "$ses"
-    info.log "Captured session UUID for $role: ${new_sid:0:8}..."
+    private.hiveMind.session.store "$target_pane" "$new_sid"
+    info.log "Captured session UUID for $role ($target_pane): ${new_sid:0:8}..."
   fi
 
   # Step 4c: Set session name via /rename so registry.refresh can identify this agent
@@ -2804,19 +2794,13 @@ hiveMind.agent.restart.remote() # <role> <host> <?pane> # restart agent on remot
     return 1
   fi
 
-  # 1. Resolve role → UUID (prefer sessions.env, fallback to pane → session.id)
+  # 1. Resolve role → pane → UUID
+  local localPane
+  localPane=$(hiveMind.resolve "$role" 2>/dev/null)
   local uuid=""
-  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-  if [ -f "$ses" ]; then
-    uuid=$(grep "^${role}|" "$ses" 2>/dev/null | tail -1 | cut -d'|' -f2)
-  fi
-  if [ -z "$uuid" ]; then
-    # Fallback: resolve role → pane → session.id
-    local localPane
-    localPane=$(hiveMind.resolve "$role" 2>/dev/null)
-    if [ -n "$localPane" ]; then
-      uuid=$("$OOSH_DIR/claudeCode" session.id "$localPane" 2>/dev/null)
-    fi
+  if [ -n "$localPane" ]; then
+    uuid=$(private.hiveMind.session.lookup "$localPane")
+    [ -z "$uuid" ] && uuid=$("$OOSH_DIR/claudeCode" session.id "$localPane" 2>/dev/null)
   fi
   if [ -z "$uuid" ]; then
     error.log "Could not resolve UUID for role '$role'"
@@ -3108,14 +3092,12 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   # ── Capture UUIDs for identity tracking ─────────────────────────────────
   info.log "Capturing session UUIDs..."
   local ses="$HIVEMIND_SESSIONS"
-  local _roles=("orchestrator" "scrum-master" "oosh-expert" "oosh-tester")
   local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2" "${session}:0.3")
   for i in 0 1 2 3; do
     local _sid
     _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
     if [ -n "$_sid" ]; then
-      grep -v "^${_roles[$i]}|" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
-      echo "${_roles[$i]}|${_sid}" >> "$ses"
+      private.hiveMind.session.store "${_panes[$i]}" "$_sid"
     fi
   done
 
@@ -3389,9 +3371,9 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
       sid=$(claudeCode session.id "${session}:${addr}")
       if [ -n "$sid" ]; then
         sid_label="  [${sid:0:8}]"
-        [ -n "$role" ] && private.hiveMind.session.store "$role" "$sid"
-      elif [ -n "$role" ]; then
-        sid=$(private.hiveMind.session.lookup "$role")
+        private.hiveMind.session.store "${session}:${addr}" "$sid"
+      else
+        sid=$(private.hiveMind.session.lookup "${session}:${addr}")
         [ -n "$sid" ] && sid_label="  [${sid:0:8}*]"
       fi
     fi
