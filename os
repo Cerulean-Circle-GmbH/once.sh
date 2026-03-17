@@ -208,10 +208,16 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   # Install oosh
   ossh install "$platform" test
 
-  # Close ControlMaster so new sessions pick up dev group membership
+  # Refresh ControlMaster so new sessions pick up dev group membership
   # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
   ossh connection.close "$platform" 2>/dev/null
   rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+  SSHPASS=test sshpass -e ssh \
+    -o ControlMaster=yes \
+    -o ControlPath="$OSSH_CONTROL_PATH" \
+    -o ControlPersist=600 \
+    -o StrictHostKeyChecking=accept-new \
+    "$platform" true
 
   # Run user tests first (clean shared config state)
   console.log "Running core tests as user test..."
