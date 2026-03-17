@@ -45,8 +45,8 @@ The state tool tracks a "current machine". Once set, commands operate on it with
 ```bash
 state of PDCA              # Sets PDCA as current machine
 state current              # Shows current machine info
-state list                 # Lists states of current machine (PDCA)
-state next                 # Advances current machine (PDCA)
+state entry.list           # Lists states of current machine (PDCA)
+state transition.next      # Advances current machine (PDCA)
 ```
 
 ### Command Line vs Script Usage
@@ -54,14 +54,14 @@ state next                 # Advances current machine (PDCA)
 **Command line** (space notation):
 ```bash
 state machine.create PDCA scrumMaster
-state add planning silent
+state entry.add planning silent
 ```
 
 **Inside scripts** after `source $OOSH_DIR/state` (dot notation):
 ```bash
 source $OOSH_DIR/state
 state.machine.create PDCA scrumMaster
-state.add planning silent
+state.entry.add planning silent
 ```
 
 ---
@@ -83,17 +83,17 @@ This:
 The machine must be in state [2]="setup" to add states. Commands operate on current machine:
 
 ```bash
-state add planning               silent
-state add doing                  silent
-state add checking               silent
-state add acting                 silent
-state add finished               silent
-state add error.max.iterations   silent
+state entry.add planning               silent
+state entry.add doing                  silent
+state entry.add checking               silent
+state entry.add acting                 silent
+state entry.add finished               silent
+state entry.add error.max.iterations   silent
 ```
 
 States are added sequentially starting at slot [11]:
-- `state add planning` → [11]="planning"
-- `state add doing` → [12]="doing"
+- `state entry.add planning` → [11]="planning"
+- `state entry.add doing` → [12]="doing"
 - etc.
 
 ### Step 3: Add Transition States
@@ -101,7 +101,7 @@ States are added sequentially starting at slot [11]:
 To create a transition (a state that jumps to another state ID):
 
 ```bash
-state add 20 silent  # Creates a state with VALUE "20" that jumps to state ID 20
+state entry.add 20 silent  # Creates a state with VALUE "20" that jumps to state ID 20
 ```
 
 **Important**: When you add a number, it creates a state where:
@@ -123,7 +123,7 @@ Note: The script parameter tells which script has the validation functions, not 
 ### Step 5: Advance Through States
 
 ```bash
-state next
+state transition.next
 ```
 
 This advances the CURRENT machine:
@@ -187,22 +187,22 @@ private.init.state.machine() {
   state.machine.create ${machine} oo
 
   # Add custom states (sequentially assigned IDs starting at 11)
-  state.add remote.install.started               silent   # [11]
-  state.add local.install.started                silent   # [12]
-  state.add priviledges.checked                  silent   # [13]
-  state.add 20                                   silent   # [14]="20" - transition to [20]
-  state.add user.rights.only                     silent   # [15]
-  state.add user.installation.done               silent   # [16]
-  state.add 30                                   silent   # [17]="30" - transition to [30]
-  state.add root.rights                          silent   # [18]
-  state.add root.shared.dev.folder.created       silent   # [19]
+  state.entry.add remote.install.started               silent   # [11]
+  state.entry.add local.install.started                silent   # [12]
+  state.entry.add priviledges.checked                  silent   # [13]
+  state.entry.add 20                                   silent   # [14]="20" - transition to [20]
+  state.entry.add user.rights.only                     silent   # [15]
+  state.entry.add user.installation.done               silent   # [16]
+  state.entry.add 30                                   silent   # [17]="30" - transition to [30]
+  state.entry.add root.rights                          silent   # [18]
+  state.entry.add root.shared.dev.folder.created       silent   # [19]
   # ... more states
 
   # Advance past setup states and start the machine
-  state.next                    # Move through initial states
-  state.machine.start oo        # Validate private.check.* exist, set state to [4]=started
-  state.next                    # Advance to first custom state
-  state.next                    # Continue advancing
+  state.transition.next              # Move through initial states
+  state.machine.start oo             # Validate private.check.* exist, set state to [4]=started
+  state.transition.next              # Advance to first custom state
+  state.transition.next              # Continue advancing
 }
 ```
 
@@ -212,30 +212,30 @@ Command line usage (space notation). Signatures from method comments:
 
 | Command | Signature | Description |
 |---------|-----------|-------------|
-| `state list.machines` | `<?nameFilter>` | Lists all available state machines |
+| `state machine.list` | `<?nameFilter>` | Lists all available state machines |
 | `state of` | `<machine> <?method>` | Selects machine as current, optionally calls method |
 | `state current` | `<?print>` | Load current state cache, print if no arg |
-| `state list` | `<?machine> <listOption:all>` | Lists states |
+| `state entry.list` | `<?machine> <listOption:all>` | Lists states |
 | `state machine.create` | `<machine> <?script>` | Creates a new state machine |
 | `state machine.exists` | `<machine>` | Checks if machine exists |
 | `state machine.delete` | `<machine>` | Deletes a state machine (no warning) |
 | `state machine.start` | `<?machine> <script>` | Validates private.check.* and starts |
 | `state machine.declaration` | `<?machine>` | Shows machine declaration |
 | `state machine.edit` | `<machine>` | Edit machine in editor |
-| `state add` | `<?machine> <newStateName> <print>` | Adds state (must be in setup) |
-| `state set` | `<?machine> <state>` | Sets state directly |
-| `state next` | `<?machine> <state>` | Advances to next state with check |
-| `state stage` | `<?machine> <state>` | Stage a state change |
-| `state check` | `<?machine> <allStates> <?script:state>` | Checks if state can be set |
-| `state find` | `<?machine> <allStates> <alwaysReturnId>` | Returns state ID for name |
-| `state rename` | `<?machine> <allStates> <newStateName:> <print:>` | Rename a state |
+| `state machine.diagnose` | | Shows full diagnostics and cache |
+| `state entry.add` | `<?machine> <newStateName> <print>` | Adds state (must be in setup) |
+| `state entry.set` | `<?machine> <state>` | Sets state directly |
+| `state entry.find` | `<?machine> <allStates> <alwaysReturnId>` | Returns state ID for name |
+| `state entry.rename` | `<?machine> <allStates> <newStateName:> <print:>` | Rename a state |
+| `state transition.next` | `<?machine> <state>` | Advances to next state with check |
+| `state transition.stage` | `<?machine> <state>` | Stage a state change |
+| `state transition.check` | `<?machine> <allStates> <?script:state>` | Checks if state can be set |
 | `state name` | `<?machine>` | Returns current state name |
 | `state id` | `<?machine>` | Returns current state ID |
 | `state declaration` | `<?machine>` | Shows machine declaration |
 | `state edit` | `<?machine>` | Edit current machine |
-| `state diagnose` | | Shows full diagnostics and cache |
 
-After `source $OOSH_DIR/state`, use dot notation: `state.machine.create`, `state.add`, etc.
+After `source $OOSH_DIR/state`, use dot notation: `state.machine.create`, `state.entry.add`, etc.
 
 ## State Lifecycle
 
@@ -244,7 +244,7 @@ After `source $OOSH_DIR/state`, use dot notation: `state.machine.create`, `state
     ↓
 [2] setup (can add states here)
     ↓
-[3] all.states.added (after state.add calls)
+[3] all.states.added (after state.entry.add calls)
     ↓
 [4] started (after state.machine.start)
     ↓
@@ -267,8 +267,8 @@ After `source $OOSH_DIR/state`, use dot notation: `state.machine.create`, `state
 1. **Always use `silent`** when adding states to avoid verbose output
 2. **Implement `private.check.*`** for each state that needs validation
 3. **Use number transitions** sparingly - prefer check function branching
-4. **Test the workflow** by stepping through `state.next` calls
-5. **Use `state diagnose`** for debugging state machine issues
+4. **Test the workflow** by stepping through `state.transition.next` calls
+5. **Use `state machine.diagnose`** for debugging state machine issues
 
 ## See Also
 

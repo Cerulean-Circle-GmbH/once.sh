@@ -461,7 +461,7 @@ oo promote.stage reset
 - [x] 4.7 Update existing `oo.stage.to.prod`:
   - Now delegates to `promote prod "$@"`
 - [x] 4.8 Add `promote.status` method:
-  - Shows PROMOTE machine state via `state of PROMOTE list all`
+  - Shows PROMOTE machine state via `state of PROMOTE entry.list all`
   - Shows branch HEADs, dates, and commit counts between dev/stage/prod
 - [x] 4.9 Add `promote.report` method:
   - Lists `stage-*` and `v*` tags sorted by date
