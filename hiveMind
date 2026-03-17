@@ -96,6 +96,55 @@ private.hiveMind.current.session() { # # return current tmux session name
   otmux pane.get '#{session_name}' 2>/dev/null || return 1
 }
 
+private.hiveMind.role.isGeneric() { # <role> # true if role is a generic placeholder
+  local r="$1"
+  [ -z "$r" ] || [ "$r" = "unknown" ] || [ "$r" = "ClaudeCode" ] || [ "$r" = "claude" ]
+}
+
+private.hiveMind.role.fromTitle() { # <title> # extract role name from pane title, stripping prefixes
+  local r="$1"
+  r="${r#✳ }"; r="${r#⠐ }"; r="${r#⠂ }"
+  r="${r#✻ }"; r="${r#✢ }"; r="${r#✶ }"
+  r="${r%%@*}"
+  r=$(echo "$r" | tr -d '[:space:]' | head -c 30)
+  private.hiveMind.role.isGeneric "$r" && return 1
+  echo "$r"
+}
+
+private.hiveMind.env.set() { # <file> <key> <value> # set key|value in env file (add or replace)
+  local file="$1" key="$2" value="$3"
+  local old
+  old=$(grep "^${key}|" "$file" 2>/dev/null | head -1 | cut -d'|' -f2)
+  if [ -z "$old" ]; then
+    echo "${key}|${value}" >> "$file"
+  elif [ "$old" != "$value" ]; then
+    sed -i '' "s#^${key}|${old}\$#${key}|${value}#" "$file"
+  else
+    return 1  # no change needed
+  fi
+  return 0
+}
+
+private.hiveMind.env.del() { # <file> <key> <?value> # delete matching line from env file
+  local file="$1" key="$2" value="$3"
+  if [ -n "$value" ]; then
+    sed -i '' "/^${key}|${value}\$/d" "$file"
+  else
+    sed -i '' "/^${key}|/d" "$file"
+  fi
+}
+
+private.hiveMind.liveUuid() { # <paneTarget> <?procArgs> # get live session UUID, skipping fork parents
+  local target="$1" procArgs="$2"
+  # Skip ps-args UUID for forked sessions (--fork-session makes --resume UUID stale)
+  if [ -n "$procArgs" ] && ! echo "$procArgs" | grep -q '\-\-fork-session'; then
+    local uuid
+    uuid=$(echo "$procArgs" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    [ -n "$uuid" ] && echo "$uuid" && return 0
+  fi
+  "$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null
+}
+
 private.hiveMind.pane.count() { # <target> # count panes in a window or session
   otmux panes -t "$1" ${2:+-s} 2>/dev/null | wc -l | tr -d ' '
 }
@@ -1816,14 +1865,14 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
   printf "${BOLD_WHITE}%-28s %-16s %-16s %-13s %-16s %s${NORMAL}\n" "PANE" "TITLE" "REGISTRY" "SESS.ENV" "LIVE UUID" "MATCH"
   echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
 
-  local consistent=0 inconsistent=0 no_agent=0
-  local -A seen_uuids
+  local consistent=0 inconsistent=0 noAgent=0
+  local -A seenUuids
 
-  # Build lookup of Claude processes by pane target: pane_target → "pid|args"
-  local -A claude_procs
-  while IFS='|' read -r pid tty pane_target title rest; do
+  # Build lookup of Claude processes by pane target
+  local -A claudeProcs
+  while IFS='|' read -r pid tty paneTarget title rest; do
     [ -z "$pid" ] && continue
-    claude_procs["$pane_target"]="${pid}|${rest}"
+    claudeProcs["$paneTarget"]="${pid}|${rest}"
   done < <(private.hiveMind.claude.processes)
 
   # Enumerate ALL panes (not just Claude-running ones)
@@ -1836,99 +1885,88 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
     fi
 
     local title="${pane_title}"
-    local title_short="${title:0:14}"
-    [ ${#title} -gt 14 ] && title_short="${title_short}.."
+    local titleShort="${title:0:14}"
+    [ ${#title} -gt 14 ] && titleShort="${titleShort}.."
 
     # Check if this pane has a Claude process
-    local has_claude=""
-    local proc_rest=""
-    if [ -n "${claude_procs[$pane_target]:-}" ]; then
-      has_claude="yes"
-      proc_rest="${claude_procs[$pane_target]#*|}"
+    local hasClaude=""
+    local procRest=""
+    if [ -n "${claudeProcs[$pane_target]:-}" ]; then
+      hasClaude="yes"
+      procRest="${claudeProcs[$pane_target]#*|}"
     fi
 
     # Registry role
-    local reg_role=""
-    [ -f "$reg" ] && reg_role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+    local regRole=""
+    [ -f "$reg" ] && regRole=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
 
     # Non-Claude pane with no registry entry — show as "no agent" (not an error)
-    if [ -z "$has_claude" ] && [ -z "$reg_role" ]; then
+    if [ -z "$hasClaude" ] && [ -z "$regRole" ]; then
       printf "%-28s %-16s ${GRAY}%-16s %-13s %-16s %s${NORMAL}\n" \
-        "$pane_target" "$title_short" "—" "—" "—" "no agent"
-      no_agent=$((no_agent + 1))
+        "$pane_target" "$titleShort" "—" "—" "—" "no agent"
+      noAgent=$((noAgent + 1))
       continue
     fi
 
-    local reg_display="${reg_role:-${BOLD_YELLOW}MISSING${NORMAL}}"
+    local regDisplay="${regRole:-${BOLD_YELLOW}MISSING${NORMAL}}"
 
     # Sessions.env UUID (look up by registry role or title-derived role)
-    local sess_uuid=""
-    local lookup_role="${reg_role}"
-    if [ -z "$lookup_role" ]; then
-      lookup_role="${title}"; lookup_role="${lookup_role#✳ }"; lookup_role="${lookup_role#⠐ }"
-      lookup_role="${lookup_role#⠂ }"; lookup_role="${lookup_role#✻ }"; lookup_role="${lookup_role#✢ }"; lookup_role="${lookup_role#✶ }"
-      lookup_role="${lookup_role%%@*}"; lookup_role=$(echo "$lookup_role" | tr -d '[:space:]')
+    local sessUuid=""
+    local lookupRole="${regRole}"
+    if [ -z "$lookupRole" ]; then
+      lookupRole=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
     fi
-    if [ -n "$lookup_role" ] && [ -f "$sess_file" ]; then
-      sess_uuid=$(grep "^${lookup_role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+    if [ -n "$lookupRole" ] && [ -f "$sess_file" ]; then
+      sessUuid=$(grep "^${lookupRole}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
     fi
-    local sess_short="${sess_uuid:0:8}"
+    local sessShort="${sessUuid:0:8}"
 
-    # Live UUID from ps args → session.id
-    # Skip ps-args UUID for forked sessions (--fork-session makes --resume UUID stale)
-    local live_uuid=""
-    if [ -n "$has_claude" ]; then
-      if ! echo "$proc_rest" | grep -q '\-\-fork-session'; then
-        live_uuid=$(echo "$proc_rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-      fi
-    fi
-    if [ -z "$live_uuid" ]; then
-      live_uuid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
-    fi
-    local live_short="${live_uuid:0:8}"
+    # Live UUID
+    local liveUuid=""
+    liveUuid=$(private.hiveMind.liveUuid "$pane_target" "$procRest")
+    local liveShort="${liveUuid:0:8}"
 
     # Consistency checks
     local issues=()
-    [ -z "$reg_role" ] && issues+=("no registry")
-    if [ -n "$reg_role" ] && [ -n "$title" ]; then
-      echo "$title" | grep -qi "$reg_role" 2>/dev/null || issues+=("title≠reg")
+    [ -z "$regRole" ] && issues+=("no registry")
+    if [ -n "$regRole" ] && [ -n "$title" ]; then
+      echo "$title" | grep -qi "$regRole" 2>/dev/null || issues+=("title≠reg")
     fi
-    if [ -n "$sess_uuid" ] && [ -n "$live_uuid" ] && [ "$sess_uuid" != "$live_uuid" ]; then
+    if [ -n "$sessUuid" ] && [ -n "$liveUuid" ] && [ "$sessUuid" != "$liveUuid" ]; then
       issues+=("UUID stale")
     fi
-    if [ -n "$live_uuid" ]; then
-      if [ -n "${seen_uuids[$live_uuid]:-}" ]; then
+    if [ -n "$liveUuid" ]; then
+      if [ -n "${seenUuids[$liveUuid]:-}" ]; then
         issues+=("dup UUID")
       fi
-      seen_uuids["$live_uuid"]="$pane_target"
+      seenUuids["$liveUuid"]="$pane_target"
     fi
-    if [ -n "$reg_role" ]; then
-      [[ ${#reg_role} -gt 30 ]] && issues+=("role>30")
-      [[ "$reg_role" == *" "* ]] && issues+=("role has space")
-      [[ "$reg_role" == "ClaudeCode" || "$reg_role" == "claude" ]] && issues+=("generic role")
+    if [ -n "$regRole" ]; then
+      [[ ${#regRole} -gt 30 ]] && issues+=("role>30")
+      [[ "$regRole" == *" "* ]] && issues+=("role has space")
+      private.hiveMind.role.isGeneric "$regRole" && issues+=("generic role")
     fi
-    # Registered pane but no Claude process running
-    if [ -z "$has_claude" ] && [ -n "$reg_role" ]; then
+    if [ -z "$hasClaude" ] && [ -n "$regRole" ]; then
       issues+=("no process")
     fi
 
     local match="${BOLD_GREEN}✓${NORMAL}"
-    local issue_str=""
+    local issueStr=""
     if [ ${#issues[@]} -gt 0 ]; then
       match="${BOLD_RED}✗${NORMAL}"
-      issue_str="${BOLD_RED}$(IFS=', '; echo "${issues[*]}")${NORMAL}"
+      issueStr="${BOLD_RED}$(IFS=', '; echo "${issues[*]}")${NORMAL}"
       inconsistent=$((inconsistent + 1))
     else
       consistent=$((consistent + 1))
     fi
 
     printf "%-28s %-16s %-16b %-13s %-16s %b %b\n" \
-      "$pane_target" "$title_short" "$reg_display" "${sess_short:--}" "${live_short:--}" "$match" "$issue_str"
+      "$pane_target" "$titleShort" "$regDisplay" "${sessShort:--}" "${liveShort:--}" "$match" "$issueStr"
 
   done < <(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" "${filter_session:--a}")
 
   echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
-  echo -e "Summary: ${BOLD_GREEN}$consistent consistent${NORMAL}, ${BOLD_RED}$inconsistent inconsistent${NORMAL}, ${GRAY}$no_agent no agent${NORMAL}"
+  echo -e "Summary: ${BOLD_GREEN}$consistent consistent${NORMAL}, ${BOLD_RED}$inconsistent inconsistent${NORMAL}, ${GRAY}$noAgent no agent${NORMAL}"
   return 0
 }
 
@@ -1953,146 +1991,145 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
   # --- 0. Clean up garbage entries in sessions.env ---
   # Remove: lines where role looks like a UUID, empty lines, generic "ClaudeCode" entries
   if [ -f "$sess_file" ]; then
-    local garbage_count=0
+    local garbageCount=0
     # UUIDs used as role names (e.g. "f5de0cee-...$|f5de0cee-...")
     local gc
-    gc=$(grep -cE '^[0-9a-f]{8}-' "$sess_file" 2>/dev/null) && garbage_count=$((garbage_count + gc))
+    gc=$(grep -cE '^[0-9a-f]{8}-' "$sess_file" 2>/dev/null) && garbageCount=$((garbageCount + gc))
     sed -i '' '/^[0-9a-f]\{8\}-/d' "$sess_file"
     # Generic "ClaudeCode" role entries
-    gc=$(grep -cE '^ClaudeCode\|' "$sess_file" 2>/dev/null) && garbage_count=$((garbage_count + gc))
+    gc=$(grep -cE '^ClaudeCode\|' "$sess_file" 2>/dev/null) && garbageCount=$((garbageCount + gc))
     sed -i '' '/^ClaudeCode|/d' "$sess_file"
     # Empty lines
     sed -i '' '/^$/d' "$sess_file"
-    [ $garbage_count -gt 0 ] && echo -e "${BOLD_GREEN}Cleaned $garbage_count garbage entries from sessions.env${NORMAL}"
+    [ $garbageCount -gt 0 ] && echo -e "${BOLD_GREEN}Cleaned $garbageCount garbage entries from sessions.env${NORMAL}"
   fi
 
-  local fixed_reg=0 fixed_sess=0 fixed_title=0 skipped=0 dup_resolved=0
-  local -A seen_uuids role_for_uuid
+  local fixedReg=0 fixedSess=0 fixedTitle=0 skipped=0 dupResolved=0
+  local -A seenUuids roleForUuid claudeProcs
 
-  while IFS='|' read -r pid tty pane_target title rest; do
+  # Build lookup of Claude processes by pane target
+  while IFS='|' read -r pid tty paneTarget title rest; do
     [ -z "$pid" ] && continue
+    claudeProcs["$paneTarget"]="${pid}|${rest}"
+  done < <(private.hiveMind.claude.processes)
 
-    # Filter by session
-    if [ -n "$filter_session" ] && [[ "$pane_target" != "${filter_session}:"* ]]; then
+  # Iterate ALL panes
+  while IFS='|' read -r paneTarget title; do
+    [ -z "$paneTarget" ] && continue
+
+    if [ -n "$filter_session" ] && [[ "$paneTarget" != "${filter_session}:"* ]]; then
       continue
     fi
 
-    # --- 1. Get LIVE UUID (ground truth) ---
-    # Skip ps-args UUID for forked sessions (--fork-session makes --resume UUID stale)
-    local live_uuid=""
-    if ! echo "$rest" | grep -q '\-\-fork-session'; then
-      live_uuid=$(echo "$rest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-    fi
-    if [ -z "$live_uuid" ]; then
-      live_uuid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
-    fi
-    if [ -z "$live_uuid" ]; then
-      live_uuid=$("$OOSH_DIR/claudeCode" session.probe "$pane_target" 2>/dev/null)
+    # Check Claude process
+    local hasClaude="" procRest=""
+    if [ -n "${claudeProcs[$paneTarget]:-}" ]; then
+      hasClaude="yes"
+      procRest="${claudeProcs[$paneTarget]#*|}"
     fi
 
-    # --- 2. Get role name (ground truth) ---
-    local role=""
-    # Try registry first
-    [ -f "$reg" ] && role=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
-
-    # Try pane title fallback (reject generic "ClaudeCode" — not a real role)
-    if [ -z "$role" ] || [ "$role" = "unknown" ] || [ "$role" = "ClaudeCode" ]; then
-      role="${title}"
-      role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"
-      role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
-      role="${role%%@*}"
-      role=$(echo "$role" | tr -d '[:space:]' | head -c 30)
+    # Non-Claude pane with no registry — skip
+    local curReg=""
+    [ -f "$reg" ] && curReg=$(grep "^${paneTarget}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+    if [ -z "$hasClaude" ] && [ -z "$curReg" ]; then
+      continue
     fi
 
-    # Reject generic role names — they indicate unbootstrapped panes
-    if [ "$role" = "ClaudeCode" ] || [ "$role" = "claude" ]; then
-      role=""
-    fi
+    # --- 1. Live UUID ---
+    local liveUuid=""
+    liveUuid=$(private.hiveMind.liveUuid "$paneTarget" "$procRest")
 
-    # Try live.discover (extracts role from session name set by /rename during bootstrap)
-    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
-      local discover_result
-      discover_result=$(private.hiveMind.live.discover "$pane_target" 2>/dev/null)
-      if [ -n "$discover_result" ]; then
-        role=$(echo "$discover_result" | cut -d'|' -f4)
-        role="${role%%@*}"
+    # --- 2. Resolve role (ground truth) ---
+    local role="$curReg"
+    if private.hiveMind.role.isGeneric "$role"; then
+      role=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
+    fi
+    if [ -z "$role" ]; then
+      local discoverResult
+      discoverResult=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
+      if [ -n "$discoverResult" ]; then
+        role="${discoverResult%%@*}"
       fi
     fi
-
-    # Can't determine role — skip
-    if [ -z "$role" ] || [ "$role" = "unknown" ] || [ "$role" = "ClaudeCode" ]; then
-      printf "${BOLD_YELLOW}%-28s %-16s SKIPPED (can't determine role)${NORMAL}\n" "$pane_target" "${title:0:14}"
+    if [ -z "$role" ] || private.hiveMind.role.isGeneric "$role"; then
+      printf "${BOLD_YELLOW}%-28s %-16s SKIPPED (can't determine role)${NORMAL}\n" "$paneTarget" "${title:0:14}"
       skipped=$((skipped + 1))
       continue
     fi
 
-    local line_parts=()
+    local lineParts=()
 
-    # --- 3a. Fix missing/stale registry ---
-    local existing_reg=""
-    existing_reg=$(grep "^${pane_target}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
-    if [ -z "$existing_reg" ]; then
-      private.hiveMind.registry.set "$pane_target" "$role"
-      line_parts+=("${BOLD_GREEN}registry.set ✓${NORMAL}")
-      fixed_reg=$((fixed_reg + 1))
+    # --- 3a. Fix registry ---
+    if [ -z "$curReg" ]; then
+      private.hiveMind.registry.set "$paneTarget" "$role"
+      lineParts+=("${BOLD_GREEN}registry.set ✓${NORMAL}")
+      fixedReg=$((fixedReg + 1))
+    elif [ "$curReg" != "$role" ]; then
+      private.hiveMind.env.set "$reg" "$paneTarget" "$role"
+      lineParts+=("${BOLD_GREEN}registry ${curReg} → ${role} ✓${NORMAL}")
+      fixedReg=$((fixedReg + 1))
     else
-      line_parts+=("${GREEN}registry ✓${NORMAL}")
+      lineParts+=("${GREEN}registry ✓${NORMAL}")
     fi
 
     # --- 3b. Fix sessions.env UUID ---
-    if [ -n "$live_uuid" ]; then
-      # Check for duplicate UUID — purge OTHER roles that had this UUID (they're stale)
-      if [ -n "${seen_uuids[$live_uuid]:-}" ]; then
-        local dup_role="${role_for_uuid[$live_uuid]:-}"
-        echo -e "${BOLD_RED}⚠ DUPLICATE UUID: $dup_role and $role both have ${live_uuid:0:8}${NORMAL}"
-        dup_resolved=$((dup_resolved + 1))
+    if [ -n "$liveUuid" ]; then
+      if [ -n "${seenUuids[$liveUuid]:-}" ]; then
+        local dupRole="${roleForUuid[$liveUuid]:-}"
+        echo -e "${BOLD_RED}⚠ DUP UUID: $dupRole and $role share ${liveUuid:0:8}${NORMAL}"
+        dupResolved=$((dupResolved + 1))
       fi
-      # Purge all OTHER sessions.env entries that share this UUID (stale from agent moves/restarts)
-      local dup_roles
-      dup_roles=$(grep "|${live_uuid}$" "$sess_file" 2>/dev/null | cut -d'|' -f1 | grep -v "^${role}$")
-      if [ -n "$dup_roles" ]; then
-        while IFS= read -r stale_role; do
-          [ -z "$stale_role" ] && continue
-          sed -i '' "/^${stale_role}|${live_uuid}\$/d" "$sess_file"
-          line_parts+=("${BOLD_YELLOW}purged dup ${stale_role}|${live_uuid:0:8}${NORMAL}")
-          dup_resolved=$((dup_resolved + 1))
-        done <<< "$dup_roles"
+      # Purge stale entries sharing this UUID (only if role has no live process)
+      local dupRoles
+      dupRoles=$(grep "|${liveUuid}$" "$sess_file" 2>/dev/null | cut -d'|' -f1 | grep -v "^${role}$")
+      if [ -n "$dupRoles" ]; then
+        while IFS= read -r staleRole; do
+          [ -z "$staleRole" ] && continue
+          local stalePane=""
+          [ -f "$reg" ] && stalePane=$(grep "|${staleRole}$" "$reg" 2>/dev/null | head -1 | cut -d'|' -f1)
+          if [ -n "$stalePane" ] && [ -n "${claudeProcs[$stalePane]:-}" ]; then
+            continue  # Live process — shared session, not stale
+          fi
+          private.hiveMind.env.del "$sess_file" "$staleRole" "$liveUuid"
+          lineParts+=("${BOLD_YELLOW}purged ${staleRole}|${liveUuid:0:8}${NORMAL}")
+          dupResolved=$((dupResolved + 1))
+        done <<< "$dupRoles"
       fi
-      seen_uuids["$live_uuid"]="$pane_target"
-      role_for_uuid["$live_uuid"]="$role"
+      seenUuids["$liveUuid"]="$paneTarget"
+      roleForUuid["$liveUuid"]="$role"
 
-      local old_uuid=""
-      old_uuid=$(grep "^${role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
-      if [ -z "$old_uuid" ]; then
-        # Add new entry
-        echo "${role}|${live_uuid}" >> "$sess_file"
-        line_parts+=("${BOLD_GREEN}sessions.env → ${live_uuid:0:8} ✓${NORMAL}")
-        fixed_sess=$((fixed_sess + 1))
-      elif [ "$old_uuid" != "$live_uuid" ]; then
-        # Replace stale UUID
-        sed -i '' "s#^${role}|${old_uuid}\$#${role}|${live_uuid}#" "$sess_file"
-        line_parts+=("${BOLD_GREEN}sessions.env → ${live_uuid:0:8} ✓${NORMAL}  ${BOLD_YELLOW}(was ${old_uuid:0:8} STALE)${NORMAL}")
-        fixed_sess=$((fixed_sess + 1))
+      if private.hiveMind.env.set "$sess_file" "$role" "$liveUuid"; then
+        local oldUuid
+        oldUuid=$(grep "^${role}|" "$sess_file" 2>/dev/null | head -1 | cut -d'|' -f2)
+        lineParts+=("${BOLD_GREEN}sessions.env → ${liveUuid:0:8} ✓${NORMAL}")
+        fixedSess=$((fixedSess + 1))
       else
-        line_parts+=("${GREEN}sessions.env ✓${NORMAL}")
+        lineParts+=("${GREEN}sessions.env ✓${NORMAL}")
       fi
     else
-      line_parts+=("${BOLD_YELLOW}sessions.env — (no live UUID)${NORMAL}")
+      lineParts+=("${BOLD_YELLOW}sessions.env — (no live UUID)${NORMAL}")
     fi
 
-    # --- 3c. Fix pane title if it doesn't match role ---
-    if ! echo "$title" | grep -qi "$role" 2>/dev/null; then
-      otmux pane.lock "$pane_target" "$role"
-      line_parts+=("${BOLD_GREEN}title → $role ✓ (locked)${NORMAL}")
-      fixed_title=$((fixed_title + 1))
+    # --- 3c. Fix pane title ---
+    if [ -n "$hasClaude" ] && ! echo "$title" | grep -qi "$role" 2>/dev/null; then
+      otmux pane.lock "$paneTarget" "$role"
+      lineParts+=("${BOLD_GREEN}title → $role ✓${NORMAL}")
+      fixedTitle=$((fixedTitle + 1))
     fi
 
-    printf "%-28s %-16s %b\n" "$pane_target" "$role" "$(IFS='  '; echo "${line_parts[*]}")"
+    # --- 3d. Deregister dead panes ---
+    if [ -z "$hasClaude" ] && [ -n "$curReg" ]; then
+      private.hiveMind.env.del "$reg" "$paneTarget"
+      lineParts+=("${BOLD_YELLOW}deregistered (no process)${NORMAL}")
+      fixedReg=$((fixedReg + 1))
+    fi
 
-  done < <(private.hiveMind.claude.processes)
+    printf "%-28s %-16s %b\n" "$paneTarget" "$role" "$(IFS='  '; echo "${lineParts[*]}")"
+
+  done < <(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" "${filter_session:--a}")
 
   echo
-  echo -e "Fixed: ${BOLD_GREEN}$fixed_reg${NORMAL} registry, ${BOLD_GREEN}$fixed_sess${NORMAL} sessions, ${BOLD_GREEN}$fixed_title${NORMAL} titles, ${BOLD_RED}$dup_resolved${NORMAL} duplicates"
+  echo -e "Fixed: ${BOLD_GREEN}$fixedReg${NORMAL} registry, ${BOLD_GREEN}$fixedSess${NORMAL} sessions, ${BOLD_GREEN}$fixedTitle${NORMAL} titles, ${BOLD_RED}$dupResolved${NORMAL} duplicates"
   [ $skipped -gt 0 ] && echo -e "${BOLD_YELLOW}Skipped: $skipped (unknown role)${NORMAL}"
   echo "Run hiveMind consistency.audit to verify."
   return 0
