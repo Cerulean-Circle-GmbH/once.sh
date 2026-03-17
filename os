@@ -208,6 +208,9 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   # Install oosh
   ossh install "$platform" test
 
+  # DEBUG: Check permissions before running tests
+  ossh exec "$platform" "echo '=== DEBUG: id ===' && id && echo '=== DEBUG: ls -la ~/config/ ===' && ls -la ~/config/ && echo '=== DEBUG: ls -la ~/config/stateMachines/ ===' && ls -la ~/config/stateMachines/ 2>/dev/null && echo '=== DEBUG: stat ~/config ===' && stat ~/config && echo '=== DEBUG: ls -la /home/shared/ ===' && ls -la /home/shared/ 2>/dev/null | head -5"
+
   # Run user tests first (clean shared config state)
   console.log "Running core tests as user test..."
   local userLog="/tmp/oosh-platform-test-user-$platform.log"
