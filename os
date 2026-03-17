@@ -199,7 +199,7 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
     "$platform" true
 
   # Push key — reuses ControlMaster socket, no password prompt
-  ossh push.key "$platform"
+  ossh key.push "$platform"
 
   # Configure passwordless sudo for automated testing (container is ephemeral)
   # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
@@ -208,8 +208,10 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   # Install oosh
   ossh install "$platform" test
 
-  # DEBUG: Check permissions before running tests
-  ossh exec "$platform" "echo '=== DEBUG: id ===' && id && echo '=== DEBUG: ls -la ~/config/ ===' && ls -la ~/config/ && echo '=== DEBUG: ls -la ~/config/stateMachines/ ===' && ls -la ~/config/stateMachines/ 2>/dev/null && echo '=== DEBUG: stat ~/config ===' && stat ~/config && echo '=== DEBUG: ls -la /home/shared/ ===' && ls -la /home/shared/ 2>/dev/null | head -5"
+  # Close ControlMaster so new sessions pick up dev group membership
+  # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
+  ossh connection.close "$platform" 2>/dev/null
+  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
 
   # Run user tests first (clean shared config state)
   console.log "Running core tests as user test..."
