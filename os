@@ -219,9 +219,6 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
     -o StrictHostKeyChecking=accept-new \
     "$platform" true
 
-  # Verify group membership before tests
-  ossh exec "$platform" "id; ls -la ~/config/ | head -3"
-
   # Run user tests first (clean shared config state)
   console.log "Running core tests as user test..."
   local userLog="/tmp/oosh-platform-test-user-$platform.log"
