@@ -66,7 +66,7 @@ fi
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `os platform.list` | | List all platforms with workspace, package manager, and tier |
-| `os platform.test` | `<platform>` | Test oosh installation on a single platform |
+| `os platform.test` | `<platform> <?terminal>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests |
 | `os platform.test.all` | | Test all platforms, report summary. Exit 0 only if all must-pass platforms pass |
 
 ### Platform Test Flow (Docker platforms)
@@ -93,6 +93,35 @@ macOS is tested via GitHub Actions (`macos-test.yml`):
 1. `os platform.test macos` triggers the workflow via `gh` CLI
 2. Watches the run and reports PASS/FAIL
 3. Requires `gh` CLI authenticated (`gh auth login`)
+
+### Interactive Terminal (tmate)
+
+After tests complete, you can open an interactive SSH session on the runner to inspect the oosh installation:
+
+```bash
+os platform.test macos terminal
+```
+
+This adds a tmate step to the CI workflow. After tests finish:
+
+1. Open the GitHub Actions run in browser (URL printed in terminal)
+2. Click the **"Interactive terminal (tmate)"** step
+3. Copy the SSH command (e.g. `ssh XKCLq...@nyc1.tmate.io`)
+4. Run it in your local terminal
+
+**Important:** tmate starts bash with `--norc --noprofile`, so no startup files are sourced. After connecting, run:
+
+```bash
+source ~/.bashrc
+```
+
+This loads the full oosh environment (PATH, prompt, completion, colors). Then you can run any oosh command.
+
+The session has a **30-minute timeout** and is restricted to the GitHub user who triggered the workflow.
+
+For Docker platforms, `terminal` opens an interactive SSH session via `ossh exec.tty` after tests — oosh is loaded automatically there.
+
+**Note:** On a real macOS install (not tmate), oosh works automatically. The installer creates `~/.bash_profile` that sources `~/.bashrc`, so Terminal.app loads oosh on every new shell.
 
 ## Platform Configuration
 
