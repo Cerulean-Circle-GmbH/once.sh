@@ -57,9 +57,10 @@ private.os.platform.cleanup() { # <port> # stops and removes Docker container on
   fi
 }
 
-private.os.platform.test.ci() # <platform> # triggers CI workflow for native platform testing
+private.os.platform.test.ci() # <platform> <?terminal> # triggers CI workflow for native platform testing
 {
   local platform="$1"
+  local terminal="$2"
 
   if ! command -v gh >/dev/null 2>&1; then
     error.log "gh CLI not found — install with: oo cmd gh"
@@ -79,7 +80,7 @@ private.os.platform.test.ci() # <platform> # triggers CI workflow for native pla
 
   # Trigger the workflow and capture the run
   local repo="Cerulean-Circle-GmbH/once.sh"
-  if ! gh workflow run macos-test.yml -R "$repo" -r "$branch" -f branch="$branch"; then
+  if ! gh workflow run macos-test.yml -R "$repo" -r "$branch" -f branch="$branch" -f terminal="${terminal:-}"; then
     error.log "Failed to trigger macOS CI workflow"
     create.result 1 "FAIL"
     return 1
@@ -132,19 +133,22 @@ os.platform.list() # # lists all platforms with tier info
   done
 }
 
-os.platform.test() # <platform> # tests oosh installation on a single platform
+os.platform.test() # <platform> <?terminal> # tests oosh installation on a single platform
 {
   local platform="$1"
   if [ -z "$platform" ]; then
     error.log "Usage: os platform.test <platform>"
     return 1
   fi
+  shift
+  local terminal="$1"
+  if [ -n "$1" ]; then shift; fi
 
   private.os.platform.parse "$platform" || return 1
 
   if [ "$PLATFORM_WORKSPACE" = "native" ]; then
     if [ "$platform" = "macos" ]; then
-      private.os.platform.test.ci "$platform"
+      private.os.platform.test.ci "$platform" "$terminal"
       return $?
     fi
     console.log "SKIP: $platform is a native platform (no Docker test)"
@@ -231,6 +235,13 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
   ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
   local rcRoot=${PIPESTATUS[0]}
 
+  # Interactive terminal — drop into shell before cleanup
+  if [ -n "$terminal" ]; then
+    console.log "Opening interactive terminal on $platform..."
+    console.log "Type 'exit' to end the session and clean up."
+    ossh exec.tty "$platform" "bash -l"
+  fi
+
   # Cleanup
   ossh connection.close "$platform" 2>/dev/null
   private.os.platform.cleanup "$sshPort"
@@ -261,6 +272,10 @@ os.platform.test() # <platform> # tests oosh installation on a single platform
 }
 os.platform.test.completion.platform() {
   private.os.platform.names
+}
+
+os.platform.test.completion.terminal() {
+  echo "terminal"
 }
 
 os.platform.test.all() # # tests all must-pass platforms, reports summary

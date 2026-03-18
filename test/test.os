@@ -9,7 +9,7 @@ level=$1
 if [ -z "$level" ]; then
   level=1
 fi
-echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
+info.log "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
 #echo "sourcing init"
 source this
@@ -17,7 +17,7 @@ source test.suite
 
 log.level $level
 
-competionArray=(once config list file ite)
+completionArray=(once config list file ite)
 source oo
 
 test.case $level "os info runs" \
@@ -175,6 +175,37 @@ if type os.platform.test.completion.platform >/dev/null 2>&1; then
 else
   expect.fail "os.platform.test.completion.platform should be defined"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: terminal completion function exists
+# ─────────────────────────────────────────────────────────────────────────────
+if type os.platform.test.completion.terminal >/dev/null 2>&1; then
+  expect.pass "os.platform.test.completion.terminal is defined"
+else
+  expect.fail "os.platform.test.completion.terminal should be defined"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: terminal completion returns "terminal"
+# ─────────────────────────────────────────────────────────────────────────────
+_TERMINAL_COMP=$(os.platform.test.completion.terminal)
+if echo "$_TERMINAL_COMP" | grep -q "terminal"; then
+  expect.pass "terminal completion suggests 'terminal'"
+else
+  expect.fail "terminal completion should suggest 'terminal', got: $_TERMINAL_COMP"
+fi
+unset _TERMINAL_COMP
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: os.platform.test signature includes terminal parameter
+# ─────────────────────────────────────────────────────────────────────────────
+_SIG=$(c2 function.get.with.documentation os platform.test 2>/dev/null)
+if echo "$_SIG" | grep -q "terminal"; then
+  expect.pass "os.platform.test signature includes terminal parameter"
+else
+  expect.fail "os.platform.test signature should include terminal parameter"
+fi
+unset _SIG
 
 ### test.method
 
