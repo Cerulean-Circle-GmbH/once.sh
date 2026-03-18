@@ -199,7 +199,7 @@ unset _TERMINAL_COMP
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: os.platform.test signature includes terminal parameter
 # ─────────────────────────────────────────────────────────────────────────────
-_SIG=$(c2 function.get.with.documentation os platform.test 2>/dev/null)
+_SIG=$(grep "^os.platform.test()" "$OOSH_DIR/os" 2>/dev/null)
 if echo "$_SIG" | grep -q "terminal"; then
   expect.pass "os.platform.test signature includes terminal parameter"
 else
