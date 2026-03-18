@@ -7,7 +7,7 @@ The `promote` script implements a gated promotion pipeline (dev → stage → pr
 - Promotes code through stages: `dev` → `stage` → `prod`
 - Each promotion is gated by automated checks (tests, clean tree, confirmations)
 - Uses the oosh `state` machine framework for resumable, step-by-step advancement
-- `oo` provides thin wrappers (`oo promote.stage`, `oo release`, etc.) that delegate to `promote`
+- `oo` provides thin wrappers (`oo dev.to.stage`, `oo release`, etc.) that delegate to `promote`
 
 ## Quick Start
 
@@ -120,12 +120,11 @@ These `oo` methods delegate directly to `promote`:
 
 | oo command | Equivalent |
 |-----------|------------|
-| `oo promote.stage` | `promote stage` |
-| `oo promote.prod` | `promote prod` |
+| `oo dev.to.stage` | `promote stage` |
+| `oo stage.to.prod` | `promote prod` |
 | `oo promote.status` | `promote status` |
 | `oo promote.report` | `promote report` |
 | `oo release` | `promote stage` (legacy alias) |
-| `oo stage.to.prod` | `promote prod` (legacy alias) |
 
 ## See Also
 

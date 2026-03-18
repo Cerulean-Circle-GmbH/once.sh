@@ -37,8 +37,8 @@ The recommended development workflow:
 2. oo update          → Pull latest changes from GitHub
 3. [develop]          → Make your changes
 4. oo commit          → Commit and push to dev branch
-5. oo promote.stage   → Promote dev to stage (gated by core tests)
-6. oo promote.prod    → Promote stage to prod (gated by platform tests)
+5. oo dev.to.stage    → Promote dev to stage (gated by core tests)
+6. oo stage.to.prod   → Promote stage to prod (gated by platform tests)
 7. oo mode.dev        → Return to dev for next cycle
 ```
 
@@ -130,7 +130,7 @@ Delegates to `promote stage` — promotes dev to stage with gated tests.
 oo release
 ```
 
-This is a legacy alias. Prefer `oo promote.stage` for clarity.
+This is a legacy alias. Prefer `oo dev.to.stage` for clarity.
 
 ### oo.remote.update
 
@@ -269,10 +269,10 @@ See [Promotion Pipeline (promote)](promote.md) for full documentation.
 ### Promotion Commands (via `oo` wrappers)
 
 ```bash
-oo promote.stage          # Promote dev → stage (gated by tests)
-oo promote.stage reset    # Restart promotion from scratch
-oo promote.stage yes      # Skip confirmations (PROMOTE_FORCE)
-oo promote.prod           # Promote stage → prod
+oo dev.to.stage           # Promote dev → stage (gated by tests)
+oo dev.to.stage reset     # Restart promotion from scratch
+oo dev.to.stage yes       # Skip confirmations (PROMOTE_FORCE)
+oo stage.to.prod          # Promote stage → prod
 oo promote.status         # Show pipeline state and branch diffs
 oo promote.report         # Show promotion history from git tags
 ```
@@ -280,15 +280,14 @@ oo promote.report         # Show promotion history from git tags
 ### Legacy Aliases
 
 ```bash
-oo release                # Alias for promote.stage (updated from old merge behavior)
-oo stage.to.prod          # Alias for promote.prod (updated from old merge behavior)
+oo release                # Alias for dev.to.stage (legacy)
 ```
 
 ### Direct `promote` Usage
 
 ```bash
-promote stage             # Same as oo promote.stage
-promote prod              # Same as oo promote.prod
+promote stage             # Same as oo dev.to.stage
+promote prod              # Same as oo stage.to.prod
 promote status            # Pipeline state and branch diffs
 promote report            # Promotion history from tags
 ```

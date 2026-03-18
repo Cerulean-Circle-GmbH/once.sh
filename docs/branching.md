@@ -21,7 +21,7 @@ feature/xxx ──> dev ──> stage ──> prod
 
 ### Promotion: `dev` → `stage`
 
-Run `promote stage` (or `oo promote.stage`):
+Run `promote stage` (or `oo dev.to.stage`):
 
 1. Clean working tree (no uncommitted changes)
 2. `test.suite core 1` passes on `dev`
@@ -32,7 +32,7 @@ Run `promote stage` (or `oo promote.stage`):
 
 ### Promotion: `stage` → `prod`
 
-Run `promote prod` (or `oo promote.prod`):
+Run `promote prod` (or `oo stage.to.prod`):
 
 1. `os platform.test.all` passes (all must-pass platforms)
 2. User confirms merge
