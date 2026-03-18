@@ -1,28 +1,28 @@
 # promote — Release Pipeline for oosh
 
-The `promote` script implements a gated promotion pipeline (dev → stage → prod) backed by a PROMOTE state machine. It ensures code passes tests before advancing to the next branch.
+The `promote` script implements a gated promotion pipeline (dev → testing → prod) backed by a PROMOTE state machine. It ensures code passes tests before advancing to the next branch.
 
 ## Overview
 
-- Promotes code through stages: `dev` → `stage` → `prod`
+- Promotes code through stages: `dev` → `testing` → `prod`
 - Each promotion is gated by automated checks (tests, clean tree, confirmations)
 - Uses the oosh `state` machine framework for resumable, step-by-step advancement
-- `oo` provides thin wrappers (`oo dev.to.stage`, `oo release`, etc.) that delegate to `promote`
+- `oo` provides thin wrappers (`oo dev.to.testing`, `oo release`, etc.) that delegate to `promote`
 
 ## Quick Start
 
 ```bash
-# Promote dev to stage (gated by core tests)
-promote stage
+# Promote dev to testing (gated by core tests)
+promote testing
 
 # Skip confirmations
-promote stage yes
+promote testing yes
 
-# Promote stage to prod (gated by platform tests)
+# Promote testing to prod (gated by platform tests)
 promote prod
 
 # Skip a stuck state (e.g., you already ran tests manually)
-promote stage skip
+promote testing skip
 
 # Show pipeline state and branch diffs
 promote status
@@ -35,8 +35,8 @@ promote report
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `promote stage` | `<?reset\|yes\|skip>` | Promote dev → stage, gated by core tests |
-| `promote prod` | `<?reset\|yes\|skip>` | Promote stage → prod, gated by platform tests |
+| `promote testing` | `<?reset\|yes\|skip>` | Promote dev → testing, gated by core tests |
+| `promote prod` | `<?reset\|yes\|skip>` | Promote testing → prod, gated by platform tests |
 | `promote status` | | Show PROMOTE machine state and branch diffs |
 | `promote report` | | Show promotion history from git tags |
 
@@ -51,10 +51,10 @@ promote report
 The PROMOTE state machine has two promotion paths that share a common entry and exit:
 
 ```
-[11] promote.started         ← PROMOTE_TARGET set (stage or prod)
-[12] target.checked          ← Branches to stage or prod path
+[11] promote.started         ← PROMOTE_TARGET set (testing or prod)
+[12] target.checked          ← Branches to testing or prod path
 
-Stage path (dev → stage):
+Testing path (dev → testing):
   [13] uncommitted.checked   ← Clean working tree required
   [14] test.suite.passed     ← test.suite core 1 must pass
   [15] confirmation.received ← User confirms merge (diff stats shown)
@@ -62,7 +62,7 @@ Stage path (dev → stage):
   [17] stage.tagged          ← Tag: stage-YYYY-MM-DD
   [18] stage.pushed          ← git push origin stage + tags
 
-Prod path (stage → prod):
+Prod path (testing → prod):
   [20] prod.path.started     ← Pass-through to platform tests
   [21] platform.tests.passed ← os platform.test.all must pass
   [22] confirmation.received.prod ← User confirms merge
@@ -75,16 +75,16 @@ Prod path (stage → prod):
 
 ### Resumability
 
-If a check fails (e.g., tests fail at state [14]), the machine stays at that state. Re-running `promote stage` resumes from the failing step — no need to re-run checks that already passed.
+If a check fails (e.g., tests fail at state [14]), the machine stays at that state. Re-running `promote testing` resumes from the failing step — no need to re-run checks that already passed.
 
 ```bash
 # First run — core tests fail:
-promote stage
+promote testing
 # ✓ [13] uncommitted.checked
 # ✗ [14] test.suite.passed — fix the failing test
 
 # Fix the test, run again — resumes at [14]:
-promote stage
+promote testing
 # ✓ [14] test.suite.passed
 # ✓ [15] confirmation.received
 # ... continues to completion
@@ -94,7 +94,7 @@ promote stage
 
 If a check fails and you want to bypass it (e.g., you already verified tests pass manually):
 
-    promote stage skip
+    promote testing skip
 
 This advances past the current pending state without running its check function.
 It also sets `PROMOTE_FORCE=yes` to auto-confirm remaining prompts.
@@ -103,9 +103,9 @@ It also sets `PROMOTE_FORCE=yes` to auto-confirm remaining prompts.
 
 | Promotion | Gate | Command |
 |-----------|------|---------|
-| dev → stage | Core test suite | `test.suite core 1` |
-| dev → stage | Clean working tree | `git status --porcelain` |
-| stage → prod | Platform install tests | `os platform.test.all` |
+| dev → testing | Core test suite | `test.suite core 1` |
+| dev → testing | Clean working tree | `git status --porcelain` |
+| testing → prod | Platform install tests | `os platform.test.all` |
 
 ## Configuration
 
@@ -120,11 +120,11 @@ These `oo` methods delegate directly to `promote`:
 
 | oo command | Equivalent |
 |-----------|------------|
-| `oo dev.to.stage` | `promote stage` |
-| `oo stage.to.prod` | `promote prod` |
+| `oo dev.to.testing` | `promote testing` |
+| `oo testing.to.prod` | `promote prod` |
 | `oo promote.status` | `promote status` |
 | `oo promote.report` | `promote report` |
-| `oo release` | `promote stage` (legacy alias) |
+| `oo release` | `promote testing` (legacy alias) |
 
 ## See Also
 

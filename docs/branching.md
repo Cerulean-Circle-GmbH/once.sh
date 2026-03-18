@@ -5,7 +5,7 @@
 | Branch | Purpose | Stability |
 |--------|---------|-----------|
 | `dev` | Active development. All feature branches merge here. | Unstable |
-| `stage` | Staging / QA. Code promoted from `dev` after tests pass. | Semi-stable |
+| `stage` | Testing / QA. Code promoted from `dev` after tests pass. | Semi-stable |
 | `prod` | Production-ready releases. Promoted from `stage` after platform install tests pass. | Stable |
 | `main` | Legacy. Not actively used — kept for historical reference. | Frozen |
 
@@ -19,9 +19,9 @@ feature/xxx ──> dev ──> stage ──> prod
                  └─────────┘
 ```
 
-### Promotion: `dev` → `stage`
+### Promotion: `dev` → `testing`
 
-Run `promote stage` (or `oo dev.to.stage`):
+Run `promote testing` (or `oo dev.to.testing`):
 
 1. Clean working tree (no uncommitted changes)
 2. `test.suite core 1` passes on `dev`
@@ -30,9 +30,9 @@ Run `promote stage` (or `oo dev.to.stage`):
 5. Tag the `stage` branch (e.g., `stage-2026-03-05`)
 6. Push `stage` branch and tags to origin
 
-### Promotion: `stage` → `prod`
+### Promotion: `testing` → `prod`
 
-Run `promote prod` (or `oo stage.to.prod`):
+Run `promote prod` (or `oo testing.to.prod`):
 
 1. `os platform.test.all` passes (all must-pass platforms)
 2. User confirms merge

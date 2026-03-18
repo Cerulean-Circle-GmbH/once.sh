@@ -37,8 +37,8 @@ The recommended development workflow:
 2. oo update          → Pull latest changes from GitHub
 3. [develop]          → Make your changes
 4. oo commit          → Commit and push to dev branch
-5. oo dev.to.stage    → Promote dev to stage (gated by core tests)
-6. oo stage.to.prod   → Promote stage to prod (gated by platform tests)
+5. oo dev.to.testing  → Promote dev to testing (gated by core tests)
+6. oo testing.to.prod → Promote testing to prod (gated by platform tests)
 7. oo mode.dev        → Return to dev for next cycle
 ```
 
@@ -124,13 +124,13 @@ oo commit force   # Force commit (any branch)
 
 ### oo.release
 
-Delegates to `promote stage` — promotes dev to stage with gated tests.
+Delegates to `promote testing` — promotes dev to testing with gated tests.
 
 ```bash
 oo release
 ```
 
-This is a legacy alias. Prefer `oo dev.to.stage` for clarity.
+This is a legacy alias. Prefer `oo dev.to.testing` for clarity.
 
 ### oo.remote.update
 
@@ -260,7 +260,7 @@ States include:
 
 ## Promotion Pipeline
 
-The promotion pipeline promotes code through stages: dev → stage → prod, gated by tests.
+The promotion pipeline promotes code through stages: dev → testing → prod, gated by tests.
 The pipeline is implemented in the `promote` script with a PROMOTE state machine.
 `oo` provides thin wrappers that delegate to `promote`.
 
@@ -269,10 +269,10 @@ See [Promotion Pipeline (promote)](promote.md) for full documentation.
 ### Promotion Commands (via `oo` wrappers)
 
 ```bash
-oo dev.to.stage           # Promote dev → stage (gated by tests)
-oo dev.to.stage reset     # Restart promotion from scratch
-oo dev.to.stage yes       # Skip confirmations (PROMOTE_FORCE)
-oo stage.to.prod          # Promote stage → prod
+oo dev.to.testing         # Promote dev → testing (gated by tests)
+oo dev.to.testing reset   # Restart promotion from scratch
+oo dev.to.testing yes     # Skip confirmations (PROMOTE_FORCE)
+oo testing.to.prod        # Promote testing → prod
 oo promote.status         # Show pipeline state and branch diffs
 oo promote.report         # Show promotion history from git tags
 ```
@@ -280,14 +280,14 @@ oo promote.report         # Show promotion history from git tags
 ### Legacy Aliases
 
 ```bash
-oo release                # Alias for dev.to.stage (legacy)
+oo release                # Alias for dev.to.testing (legacy)
 ```
 
 ### Direct `promote` Usage
 
 ```bash
-promote stage             # Same as oo dev.to.stage
-promote prod              # Same as oo stage.to.prod
+promote testing           # Same as oo dev.to.testing
+promote prod              # Same as oo testing.to.prod
 promote status            # Pipeline state and branch diffs
 promote report            # Promotion history from tags
 ```
@@ -295,11 +295,11 @@ promote report            # Promotion history from tags
 ### State Machine
 
 The PROMOTE state machine has two paths:
-- **Stage path** [13]-[18]: uncommitted check → core tests → confirmation → merge → tag → push
+- **Testing path** [13]-[18]: uncommitted check → core tests → confirmation → merge → tag → push
 - **Prod path** [21]-[25]: platform tests → confirmation → merge → tag → push
 
 The pipeline is **resumable** — if a check fails, the machine stays at that state.
-Re-running `promote stage` resumes from the failing step.
+Re-running `promote testing` resumes from the failing step.
 
 See [promote.md](promote.md) for the full state machine layout.
 
