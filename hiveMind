@@ -588,6 +588,64 @@ private.hiveMind.pane.activity() {
   return 0
 }
 
+# ── Shared Agent Discovery (SINGLE SOURCE — DRY) ─────────────────────────
+# Returns: pane_target|role|state|uuid|title|is_claude
+# Non-invasive: uses Claude process lookup + registry + sweep.detect
+# ALL methods that need agent data MUST call this — no duplicate discovery
+
+private.hiveMind.agents.discover() # <?session_filter> # discover all agents, output pane|role|state|uuid|title|is_claude
+{
+  local filter="$1"
+
+  # Build Claude process lookup (non-invasive)
+  local -A claudeProcs
+  while IFS='|' read -r pid tty paneTarget title rest; do
+    [ -z "$pid" ] && continue
+    claudeProcs["$paneTarget"]="${pid}|${rest}"
+  done < <(private.hiveMind.claude.processes)
+
+  # Enumerate all panes
+  while IFS='|' read -r pane_target pane_title; do
+    [ -z "$pane_target" ] && continue
+
+    # Filter by session if requested
+    if [ -n "$filter" ] && [[ "$pane_target" != "${filter}:"* ]]; then
+      continue
+    fi
+
+    local is_claude="no"
+    local procRest=""
+    if [ -n "${claudeProcs[$pane_target]:-}" ]; then
+      is_claude="yes"
+      procRest="${claudeProcs[$pane_target]#*|}"
+    fi
+
+    # Role: registry → pane title → "pane N"
+    local role
+    role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
+    if [ -z "$role" ]; then
+      role="$pane_title"
+      [ -z "$role" ] || [ "$role" = "bash" ] || [ "$role" = "zsh" ] && role=""
+    fi
+
+    # State: sweep.detect for Claude panes, "shell" for others
+    local state="shell"
+    if [ "$is_claude" = "yes" ]; then
+      local detect
+      detect=$(private.hiveMind.sweep.detect "$pane_target" 2>/dev/null)
+      state="${detect%%|*}"
+    fi
+
+    # UUID: from process args (non-invasive, no probing)
+    local uuid=""
+    if [ -n "$procRest" ]; then
+      uuid=$(echo "$procRest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    fi
+
+    echo "${pane_target}|${role:-}|${state}|${uuid:-}|${pane_title:-}|${is_claude}"
+  done < <(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" -a)
+}
+
 private.hiveMind.get.agents() {
   # Get all agent IDs from agentRoom
   agentRoom list.ids 2>/dev/null
@@ -892,22 +950,9 @@ hiveMind.agent.spawn.completion.type() {
 
 hiveMind.list() # # list all active agent role names across all sessions
 {
-  # Same discovery as panes — non-invasive Claude process lookup
-  local -A claudeProcs
-  while IFS='|' read -r pid tty paneTarget title rest; do
-    [ -z "$pid" ] && continue
-    claudeProcs["$paneTarget"]="1"
-  done < <(private.hiveMind.claude.processes)
-
-  # For each Claude pane, output the role name
-  while IFS='|' read -r pane_target pane_title; do
-    [ -z "$pane_target" ] && continue
-    [ -z "${claudeProcs[$pane_target]:-}" ] && continue
-    local role
-    role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
-    [ -z "$role" ] && role="${pane_title}"
-    [ -n "$role" ] && echo "$role"
-  done < <(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" -a)
+  while IFS='|' read -r pane role state uuid title is_claude; do
+    [ "$is_claude" = "yes" ] && [ -n "$role" ] && echo "$role"
+  done < <(private.hiveMind.agents.discover)
 }
 
 hiveMind.workers() # # list worker agents (non-orchestrator panes)
@@ -1388,49 +1433,23 @@ hiveMind.panes() # # list all active agent panes across all sessions
   printf "${BOLD_WHITE}%-28s %-22s %-14s %s${NORMAL}\n" "PANE" "ROLE" "STATE" "UUID"
   echo -e "${GRAY}$(printf '%.0s─' {1..75})${NORMAL}"
 
-  # Non-invasive: build Claude process lookup (same as consistency.audit)
-  local -A claudeProcs
-  while IFS='|' read -r pid tty paneTarget title rest; do
-    [ -z "$pid" ] && continue
-    claudeProcs["$paneTarget"]="${pid}|${rest}"
-  done < <(private.hiveMind.claude.processes)
-
   local count=0
-  while IFS='|' read -r pane_target pane_title; do
-    [ -z "$pane_target" ] && continue
+  while IFS='|' read -r pane role state uuid title is_claude; do
+    [ "$is_claude" = "yes" ] || continue
 
-    # Skip non-Claude panes
-    [ -z "${claudeProcs[$pane_target]:-}" ] && continue
-
-    # Role from registry or live discovery
-    local role
-    role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
-    [ -z "$role" ] && role="${pane_title}"
-    [ -z "$role" ] && role="unknown"
-
-    # State from sweep.detect (non-invasive pane capture)
-    local detect state_display state_color
-    detect=$(private.hiveMind.sweep.detect "$pane_target" 2>/dev/null)
-    local raw_state="${detect%%|*}"
-    case "$raw_state" in
-      active)        state_display="active";       state_color="${BOLD_GREEN}" ;;
-      idle|queued)   state_display="idle";          state_color="${GRAY}" ;;
-      accept-edits)  state_display="accept-edits";  state_color="${BOLD_CYAN}" ;;
+    local state_color="${NORMAL}"
+    case "$state" in
+      active)        state_color="${BOLD_GREEN}" ;;
+      idle|queued)   state_color="${GRAY}" ;;
+      accept-edits)  state_color="${BOLD_CYAN}" ;;
       permission|tool-confirm|panel|overlay|autocomplete)
-                     state_display="stuck";         state_color="${BOLD_RED}" ;;
-      *)             state_display="${raw_state:-?}"; state_color="${NORMAL}" ;;
+                     state_color="${BOLD_RED}" ;;
     esac
 
-    # UUID from process args (non-invasive)
-    local procRest="${claudeProcs[$pane_target]#*|}"
-    local uuid
-    uuid=$(echo "$procRest" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-    local uuidShort="${uuid:0:8}"
-
     printf "%-28s ${BOLD_WHITE}%-22s${NORMAL} ${state_color}%-14s${NORMAL} ${GRAY}%s${NORMAL}\n" \
-      "$pane_target" "$role" "$state_display" "${uuidShort:--}"
+      "$pane" "${role:-unknown}" "$state" "${uuid:0:8}"
     count=$((count + 1))
-  done < <(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" -a)
+  done < <(private.hiveMind.agents.discover)
 
   echo -e "${GRAY}$(printf '%.0s─' {1..75})${NORMAL}"
   echo -e "${BOLD_WHITE}$count${NORMAL} active agents"
@@ -3417,20 +3436,15 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
         continue
       fi
       local agent_count=0 active_count=0 idle_count=0 blocked_count=0
-      while IFS='|' read -r target role; do
-        [ -z "$target" ] || [ -z "$role" ] && continue
-        case "$target" in "${team}:"*) ;; *) continue ;; esac
+      while IFS='|' read -r pane role state uuid title is_claude; do
+        [ "$is_claude" = "yes" ] || continue
         agent_count=$((agent_count + 1))
-        local detect_raw activity
-        detect_raw=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
-        activity="${detect_raw%%|*}"
-        case "$activity" in
-          idle|queued|unknown) idle_count=$((idle_count + 1)) ;;
-          shell|shell-escaped|crash|subscription-limit) idle_count=$((idle_count + 1)) ;;
+        case "$state" in
+          idle|queued|unknown|shell|shell-escaped|crash|subscription-limit) idle_count=$((idle_count + 1)) ;;
           permission|rate-limit|accept-edits|panel|overlay|autocomplete|tool-confirm|mcp-error|api-error|context-warning) blocked_count=$((blocked_count + 1)) ;;
           *) active_count=$((active_count + 1)) ;;
         esac
-      done < "$HIVEMIND_REGISTRY"
+      done < <(private.hiveMind.agents.discover "$team")
       local summary="${active_count} active, ${idle_count} idle"
       [ "$blocked_count" -gt 0 ] && summary="${summary}, ${blocked_count} blocked"
       local blocked_color=""
@@ -3442,107 +3456,50 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
     return 0
   fi
 
-  # With argument: show detailed per-pane tree (existing behavior)
+  # With argument: show detailed per-pane tree using shared discovery
   if ! otmux has "$session" 2>/dev/null; then
     error.log "Session $session not found"
     return 1
   fi
 
-  local pane_lines
-  pane_lines=$(private.hiveMind.list.panes addr+cmd "$session")
-
+  # Collect discovery data for this session
+  local data
+  data=$(private.hiveMind.agents.discover "$session")
   local total
-  total=$(echo "$pane_lines" | wc -l | tr -d ' ')
+  total=$(echo "$data" | grep -c '|' 2>/dev/null || echo 0)
   local count=0
 
   echo -e "${BOLD_CYAN}${session}${NORMAL}"
-  while IFS='|' read -r addr pane_cmd; do
+  while IFS='|' read -r pane_target role state uuid title is_claude; do
+    [ -z "$pane_target" ] && continue
     count=$((count + 1))
 
-    local state="" detect_raw="" severity="" detail=""
-    local is_claude=false
-    case "$pane_cmd" in
-      claude*|[0-9].[0-9]*)
-        is_claude=true
-        detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
-        IFS='|' read -r state _ severity detail <<< "$detect_raw"
-        ;;
-      bash|zsh)
-        # Shell reported — but Claude Code may still be running on this TTY.
-        # tmux pane_current_command can misreport idle Claude as 'bash'.
-        if claudeCode process.running "${session}:${addr}"; then
-          is_claude=true
-          detect_raw=$(private.hiveMind.sweep.detect "${session}:${addr}" 2>/dev/null)
-          IFS='|' read -r state _ severity detail <<< "$detect_raw"
-        else
-          state="shell"
-          severity="info"
-        fi
-        ;;
-      *) state="$pane_cmd"; severity="info" ;;
-    esac
+    local addr="${pane_target#*:}"
+    local label="${role:-${title:-pane $addr}}"
 
     local prefix="├──"
     [ "$count" -eq "$total" ] && prefix="└──"
 
-    # Look up role from registry; fall back to pane title, then address
-    local role
-    role=$(private.hiveMind.registry.get "${session}:${addr}")
-    local label="$role"
-    if [ -z "$label" ]; then
-      label=$(otmux pane.get "${session}:${addr}" '#{pane_title}' 2>/dev/null)
-      [ -z "$label" ] || [ "$label" = "bash" ] || [ "$label" = "zsh" ] && label="pane $addr"
-    fi
-
-    # Get Claude Code session ID — live detection with stored fallback
     local sid_label=""
-    if [ "$is_claude" = "true" ]; then
-      local sid
-      sid=$(claudeCode session.id "${session}:${addr}")
-      if [ -n "$sid" ]; then
-        sid_label="  [${sid:0:8}]"
-        private.hiveMind.session.store "${session}:${addr}" "$sid"
-      else
-        sid=$(private.hiveMind.session.lookup "${session}:${addr}")
-        [ -n "$sid" ] && sid_label="  [${sid:0:8}*]"
-      fi
-    fi
+    [ -n "$uuid" ] && sid_label="  [${uuid:0:8}]"
 
-    # Map raw states to 7-state vocabulary:
-    #   active, idle, accept-edits, stuck-prompt, context-limit, compacting, offline
-    local display_state="$state"
+    # Map state to display vocabulary + color
+    local display_state="$state" state_color="${NORMAL}"
     case "$state" in
-      active)                          display_state="active" ;;
-      idle|queued)                     display_state="idle" ;;
-      accept-edits)                    display_state="accept-edits" ;;
+      active)                          display_state="active";       state_color="${BOLD_GREEN}" ;;
+      idle|queued)                     display_state="idle";          state_color="${GRAY}" ;;
+      accept-edits)                    display_state="accept-edits";  state_color="${BOLD_CYAN}" ;;
       permission|tool-confirm|panel|overlay|autocomplete)
-                                       display_state="stuck-prompt" ;;
-      context-warning)                 display_state="context-limit" ;;
-      just-compacted)                  display_state="compacting" ;;
-      shell|shell-escaped|crash)       display_state="offline" ;;
-      rate-limit|api-error|mcp-error)  display_state="stuck-prompt" ;;
-      subscription-limit)              display_state="offline" ;;
+                                       display_state="stuck-prompt"; state_color="${BOLD_RED}" ;;
+      context-warning)                 display_state="context-limit"; state_color="${BOLD_YELLOW}" ;;
+      just-compacted)                  display_state="compacting";    state_color="${BOLD_YELLOW}" ;;
+      shell|shell-escaped|crash)       display_state="offline";       state_color="${BOLD_RED}" ;;
+      rate-limit|api-error|mcp-error)  display_state="stuck-prompt"; state_color="${BOLD_RED}" ;;
+      subscription-limit)              display_state="offline";       state_color="${BOLD_RED}" ;;
     esac
 
-    local state_display="$display_state"
-    case "$severity" in
-      critical) state_display="$display_state !!" ;;
-      blocker)  [ -n "$detail" ] && state_display="$display_state — $detail" ;;
-      warning)  [ -n "$detail" ] && state_display="$display_state — $detail" ;;
-    esac
-    # Colorize state
-    local state_color="${NORMAL}"
-    case "$display_state" in
-      active)        state_color="${BOLD_GREEN}" ;;
-      idle)          state_color="${GRAY}" ;;
-      stuck-prompt)  state_color="${BOLD_RED}" ;;
-      context-limit) state_color="${BOLD_YELLOW}" ;;
-      compacting)    state_color="${BOLD_YELLOW}" ;;
-      offline)       state_color="${BOLD_RED}" ;;
-      accept-edits)  state_color="${BOLD_CYAN}" ;;
-    esac
-    echo -e "${GRAY}${prefix}${NORMAL} ${GRAY}${addr}${NORMAL}  ${BOLD_WHITE}${label}${NORMAL} ${state_color}(${state_display})${NORMAL}${GRAY}${sid_label}${NORMAL}"
-  done <<< "$pane_lines"
+    echo -e "${GRAY}${prefix}${NORMAL} ${GRAY}${addr}${NORMAL}  ${BOLD_WHITE}${label}${NORMAL} ${state_color}(${display_state})${NORMAL}${GRAY}${sid_label}${NORMAL}"
+  done <<< "$data"
 }
 
 hiveMind.team.list.completion.session() {
