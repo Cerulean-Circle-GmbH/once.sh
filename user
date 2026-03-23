@@ -498,35 +498,44 @@ user.create()  # <username> <?uid> <?gid> # creates a new user with home dir
   #   warn.log "Repository does not exist: $REPO_DIR"
   # fi
 
-  # useradd may be in /usr/sbin which is not in PATH on Debian
-  local _useradd
-  _useradd=$(command -v useradd 2>/dev/null || echo /usr/sbin/useradd)
-  if [ -x "$_useradd" ]; then
-    # GNU useradd (Debian, Ubuntu, RHEL, AlmaLinux)
-    if [ -n "$customUid" ]; then
-      $SUDO "$_useradd" -m $name -u$customUid -g$customGid -s /bin/bash
-    else
-      $SUDO "$_useradd" -m $name -s /bin/bash
-    fi
-  elif command -v adduser >/dev/null 2>&1; then
-    # BusyBox adduser (Alpine)
-    if [ -n "$customUid" ]; then
-      $SUDO adduser -s /bin/bash -h /home/$name -u $customUid -G $customGid -D $name
-    else
-      $SUDO adduser -s /bin/bash -h /home/$name -D $name
-    fi
+  os.check.env
+  if [ "$OOSH_OS" = "darwin" ]; then
+    # macOS: use sysadminctl for user creation
+    $SUDO sysadminctl -addUser $name -password "" -shell /bin/bash
   else
-    error.log "Neither useradd nor adduser found — cannot create user $name"
-    return 1
+    # useradd may be in /usr/sbin which is not in PATH on Debian
+    local _useradd
+    _useradd=$(command -v useradd 2>/dev/null || echo /usr/sbin/useradd)
+    if [ -x "$_useradd" ]; then
+      # GNU useradd (Debian, Ubuntu, RHEL, AlmaLinux)
+      if [ -n "$customUid" ]; then
+        $SUDO "$_useradd" -m $name -u$customUid -g$customGid -s /bin/bash
+      else
+        $SUDO "$_useradd" -m $name -s /bin/bash
+      fi
+    elif command -v adduser >/dev/null 2>&1; then
+      # BusyBox adduser (Alpine)
+      if [ -n "$customUid" ]; then
+        $SUDO adduser -s /bin/bash -h /home/$name -u $customUid -G $customGid -D $name
+      else
+        $SUDO adduser -s /bin/bash -h /home/$name -D $name
+      fi
+    else
+      error.log "Neither useradd, adduser, nor sysadminctl found — cannot create user $name"
+      return 1
+    fi
   fi
-  # Add to sudo/wheel group (RHEL/AlmaLinux use 'wheel', Debian/Ubuntu use 'sudo')
-  if getent group wheel >/dev/null 2>&1; then
+  # Add to sudo/wheel/admin group
+  if private.user.check.group wheel; then
     user.group.add wheel $name
-  elif getent group sudo >/dev/null 2>&1; then
+  elif private.user.check.group sudo; then
     user.group.add sudo $name
+  elif private.user.check.group admin; then
+    # macOS uses 'admin' group for sudo privileges
+    user.group.add admin $name
   fi
   # Add to dev group if it exists
-  if getent group dev >/dev/null 2>&1; then
+  if private.user.check.group dev; then
     user.group.add dev $name
   fi
   
@@ -546,10 +555,15 @@ user.linux.delete() { # <username> # removes the user and all its files
 private.user.delete.linux() { # <username> # removes the user and all its files
   local username="$1"
   if [ -n "$1" ]; then shift; fi
-  # userdel may be in /usr/sbin which is not in PATH on Debian
-  local _userdel
-  _userdel=$(command -v userdel 2>/dev/null || echo /usr/sbin/userdel)
-  $SUDO "$_userdel" -rf $username
+  os.check.env
+  if [ "$OOSH_OS" = "darwin" ]; then
+    $SUDO sysadminctl -deleteUser "$username"
+  else
+    # userdel may be in /usr/sbin which is not in PATH on Debian
+    local _userdel
+    _userdel=$(command -v userdel 2>/dev/null || echo /usr/sbin/userdel)
+    $SUDO "$_userdel" -rf $username
+  fi
 }
 
 # duplicat
@@ -612,15 +626,23 @@ user.group.add() # <groupName> <?toUsername> # adds <toUsername> to group <group
     console.log "no ${YELLOW}toUsername${NORMAL} was specified"
   fi 
 
+  os.check.env
   if private.user.check.group "$groupName"; then
     info.log "groupName already exists: $groupName"
   else
-    console.log "creating groupName: $OS_CMD_GROUP_ADD $groupName"
-    $SUDO $OS_CMD_GROUP_ADD $groupName
+    if [ "$OOSH_OS" = "darwin" ]; then
+      $SUDO dseditgroup -o create -q "$groupName" 2>/dev/null
+    else
+      console.log "creating groupName: $OS_CMD_GROUP_ADD $groupName"
+      $SUDO $OS_CMD_GROUP_ADD $groupName
+    fi
   fi
 
   if [ -n "$toUsername" ]; then
-    if [ "$OS_CMD_USER_MOD" = "addgroup" ]; then
+    if [ "$OOSH_OS" = "darwin" ]; then
+      # macOS: use dseditgroup for group membership
+      $SUDO dseditgroup -o edit -a "$toUsername" -t user "$groupName" 2>/dev/null
+    elif [ "$OS_CMD_USER_MOD" = "addgroup" ]; then
       # Alpine: addgroup <user> <group> (reversed order)
       $SUDO $OS_CMD_USER_MOD "$toUsername" "$groupName"
     else
@@ -643,6 +665,17 @@ user.group.check() # <groupName> # checks if a group exists
 
 private.user.check.group() # <groupName> # checks if a group exists
 {
+  os.check.env
+  if [ "$OOSH_OS" = "darwin" ]; then
+    # macOS: use dscl to check group existence
+    if dscl . -read /Groups/"$1" &>/dev/null; then
+      success.log "group exists: $1"
+      return 0
+    else
+      warn.log "group does ${RED}NOT${YELLOW} exist: ${RED}$1${NORMAL}"
+      return 1
+    fi
+  fi
   source line
   local result=$( compgen -g "$1" | line.format "%s:" | line.find "$1:" | line.count )
   if this.isNumber "$result"; then
@@ -761,35 +794,44 @@ private.user.init() {
   if [ -f $CONFIG_PATH/os.commands.env ]; then
     source $CONFIG_PATH/os.commands.env
   else
-    # On Debian, sbin commands (useradd, groupadd, etc.) may not be in PATH
-    if [ -x "$(command -v adduser 2>/dev/null)" ]; then
-      export OS_CMD_USER_ADD="adduser"
-    fi
-    local _useradd
-    _useradd=$(command -v useradd 2>/dev/null || echo /usr/sbin/useradd)
-    if [ -x "$_useradd" ]; then
-      export OS_CMD_USER_ADD="$_useradd"
-    fi
-    local _userdel
-    _userdel=$(command -v userdel 2>/dev/null || echo /usr/sbin/userdel)
-    if [ -x "$_userdel" ]; then
-      export OS_CMD_USER_DEL="$_userdel"
-    fi
-    local _usermod
-    _usermod=$(command -v usermod 2>/dev/null || echo /usr/sbin/usermod)
-    if [ -x "$_usermod" ]; then
-      export OS_CMD_USER_MOD="$_usermod -a -G"
-    elif [ -x "$(command -v addgroup 2>/dev/null)" ]; then
-      export OS_CMD_USER_MOD="addgroup"
-    fi
+    os.check.env
+    if [ "$OOSH_OS" = "darwin" ]; then
+      # macOS: use Directory Services and sysadminctl
+      export OS_CMD_USER_ADD="sysadminctl -addUser"
+      export OS_CMD_USER_DEL="sysadminctl -deleteUser"
+      export OS_CMD_USER_MOD="dseditgroup -o edit -a"
+      export OS_CMD_GROUP_ADD="dseditgroup -o create -q"
+    else
+      # Linux: discover sbin tools (may not be in PATH on Debian)
+      if [ -x "$(command -v adduser 2>/dev/null)" ]; then
+        export OS_CMD_USER_ADD="adduser"
+      fi
+      local _useradd
+      _useradd=$(command -v useradd 2>/dev/null || echo /usr/sbin/useradd)
+      if [ -x "$_useradd" ]; then
+        export OS_CMD_USER_ADD="$_useradd"
+      fi
+      local _userdel
+      _userdel=$(command -v userdel 2>/dev/null || echo /usr/sbin/userdel)
+      if [ -x "$_userdel" ]; then
+        export OS_CMD_USER_DEL="$_userdel"
+      fi
+      local _usermod
+      _usermod=$(command -v usermod 2>/dev/null || echo /usr/sbin/usermod)
+      if [ -x "$_usermod" ]; then
+        export OS_CMD_USER_MOD="$_usermod -a -G"
+      elif [ -x "$(command -v addgroup 2>/dev/null)" ]; then
+        export OS_CMD_USER_MOD="addgroup"
+      fi
 
-    if [ -x "$(command -v addgroup 2>/dev/null)" ]; then
-      export OS_CMD_GROUP_ADD="addgroup"
-    fi
-    local _groupadd
-    _groupadd=$(command -v groupadd 2>/dev/null || echo /usr/sbin/groupadd)
-    if [ -x "$_groupadd" ]; then
-      export OS_CMD_GROUP_ADD="$_groupadd"
+      if [ -x "$(command -v addgroup 2>/dev/null)" ]; then
+        export OS_CMD_GROUP_ADD="addgroup"
+      fi
+      local _groupadd
+      _groupadd=$(command -v groupadd 2>/dev/null || echo /usr/sbin/groupadd)
+      if [ -x "$_groupadd" ]; then
+        export OS_CMD_GROUP_ADD="$_groupadd"
+      fi
     fi
     oo pm.discover
   fi
