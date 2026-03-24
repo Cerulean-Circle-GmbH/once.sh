@@ -163,114 +163,90 @@ private.hiveMind.liveUuid() { # <paneTarget> <?procArgs> <?probe> # get live ses
   return 1
 }
 
-private.hiveMind.session.resolve.uuid() # <pane> # UUID discovery — handles forks AND autocompact
+private.hiveMind.session.resolve.uuid() # <pane> # UUID discovery — pure bash, handles forks + autocompact
 {
   local target="$1"
   [ -z "$target" ] && return 1
 
-  # 1. Find Claude process
+  local UUID_RE='[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}'
+  local projectsDir="$HOME/.claude/projects"
+  local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+
+  # 1. Find Claude process + args
   local claudePid
   claudePid=$("$OOSH_DIR/claudeCode" process.find "$target" 2>/dev/null) || return 1
   local procArgs
   procArgs=$(ps -p "$claudePid" -o args= 2>/dev/null)
 
-  # 2. Get candidate UUID from process args (may be stale after autocompact or wrong for forks)
-  local argsUuid=""
-  if ! echo "$procArgs" | grep -qE '\-\-fork-session|claudeCode fork'; then
-    argsUuid=$(echo "$procArgs" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-  fi
-
-  # 3. Find the REAL active JSONL — most recently modified with matching customTitle
-  # Catches: forks (wrong parent UUID), autocompact (new session file), renamed sessions
-  local roleFile="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-  local roleName=""
-  [ -f "$roleFile" ] && roleName=$(grep "^${target}|" "$roleFile" 2>/dev/null | head -1 | cut -d'|' -f2)
-
   local isForked=""
   echo "$procArgs" | grep -qE '\-\-fork-session|claudeCode fork' && isForked="yes"
 
-  if command -v python3 >/dev/null 2>&1; then
-    local projectsDir="$HOME/.claude/projects"
-    local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-    local sid
-    sid=$(python3 -c "
-import json, glob, os
-role = '${roleName:-}'
-args_uuid = '${argsUuid:-}'
-is_forked = '${isForked:-}'
-ses_file = '$sesFile'
-target = '$target'
+  local argsUuid=""
+  [ -z "$isForked" ] && argsUuid=$(echo "$procArgs" | grep -oE "$UUID_RE" | head -1)
 
-# Load sessions.env: which UUIDs belong to OTHER panes
-other_uuids = set()
-if os.path.isfile(ses_file):
-    for line in open(ses_file):
-        parts = line.strip().split('|')
-        if len(parts) == 2 and parts[0] != target:
-            other_uuids.add(parts[1])
+  # Build set of UUIDs assigned to OTHER panes (for exclusion)
+  local otherUuids=""
+  [ -f "$sesFile" ] && otherUuids=$(grep -v "^${target}|" "$sesFile" 2>/dev/null | cut -d'|' -f2 | tr '\n' '|')
 
-best_sid = ''
+  local bestSid=""
 
-if is_forked == 'yes' and role:
-    # FORK: find most recent JSONL with matching customTitle
-    best_mtime = 0
-    for f in glob.glob('$projectsDir/*/*.jsonl'):
-        try:
-            mtime = os.path.getmtime(f)
-            if mtime <= best_mtime: continue
-            sid = json.loads(open(f).readline()).get('sessionId', '')
-            if not sid or sid in other_uuids: continue
-            for line in open(f):
-                d = json.loads(line)
-                if d.get('type') == 'custom-title' and d.get('customTitle') == role:
-                    best_sid, best_mtime = sid, mtime
-                    break
-        except: pass
-elif args_uuid:
-    # NON-FORK: check if process args JSONL is still the most recent
-    # If a newer JSONL exists (autocompact), use that instead
-    args_file = None
-    for f in glob.glob('$projectsDir/*/' + args_uuid + '.jsonl'):
-        args_file = f
+  if [ "$isForked" = "yes" ]; then
+    # FORK: find most recent JSONL with matching customTitle (role name)
+    local roleFile="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+    local roleName=""
+    [ -f "$roleFile" ] && roleName=$(grep "^${target}|" "$roleFile" 2>/dev/null | head -1 | cut -d'|' -f2)
+    if [ -n "$roleName" ]; then
+      local f sid
+      for f in $(ls -t "$projectsDir"/*/*.jsonl 2>/dev/null); do
+        grep -q "\"customTitle\":\"${roleName}\"" "$f" 2>/dev/null || continue
+        sid=$(head -1 "$f" | grep -oE "$UUID_RE" | head -1)
+        [ -z "$sid" ] && continue
+        echo "$otherUuids" | grep -q "$sid" && continue
+        bestSid="$sid"
         break
-    if args_file:
-        args_mtime = os.path.getmtime(args_file)
-        args_dir = os.path.dirname(args_file)
-        # Find newest JSONL in same project dir
-        newest_f, newest_mtime = args_file, args_mtime
-        for f in glob.glob(os.path.join(args_dir, '*.jsonl')):
-            m = os.path.getmtime(f)
-            sid = json.loads(open(f).readline()).get('sessionId', '')
-            if m > newest_mtime and sid and sid not in other_uuids:
-                newest_f, newest_mtime = f, m
-        if newest_f != args_file:
-            best_sid = json.loads(open(newest_f).readline()).get('sessionId', '')
-
-if best_sid: print(best_sid)
-" 2>/dev/null)
-    if [ -n "$sid" ]; then
-      # Write-through: update sessions.env
-      local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-      if [ -f "$sesFile" ]; then
-        grep -v "^${target}|" "$sesFile" > "${sesFile}.tmp" 2>/dev/null && mv "${sesFile}.tmp" "$sesFile"
-      fi
-      echo "${target}|${sid}" >> "$sesFile"
-      echo "$sid"
-      return 0
+      done
+    fi
+  elif [ -n "$argsUuid" ]; then
+    # NON-FORK: check if a newer JSONL exists in same project dir (autocompact)
+    local argsFile="" d
+    for d in "$projectsDir"/*/; do
+      [ -f "${d}${argsUuid}.jsonl" ] && argsFile="${d}${argsUuid}.jsonl" && break
+    done
+    if [ -n "$argsFile" ]; then
+      local argsDir f sid
+      argsDir=$(dirname "$argsFile")
+      # Find newest UNASSIGNED JSONL that's newer than the process args file
+      for f in $(ls -t "$argsDir"/*.jsonl 2>/dev/null); do
+        [ "$f" = "$argsFile" ] && break  # reached args file = no newer unassigned
+        sid=$(head -1 "$f" | grep -oE "$UUID_RE" | head -1)
+        [ -z "$sid" ] && continue
+        echo "$otherUuids" | grep -q "$sid" && continue  # assigned to another pane
+        bestSid="$sid"
+        break
+      done
     fi
   fi
 
-  # 4. Fallback: sessions.env (may have correct UUID from prior resolve)
-  local sesFile2="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-  if [ -f "$sesFile2" ]; then
+  # Write-through if we found a better UUID
+  if [ -n "$bestSid" ]; then
+    if [ -f "$sesFile" ]; then
+      grep -v "^${target}|" "$sesFile" > "${sesFile}.tmp" 2>/dev/null && mv "${sesFile}.tmp" "$sesFile"
+    fi
+    echo "${target}|${bestSid}" >> "$sesFile"
+    echo "$bestSid"
+    return 0
+  fi
+
+  # Fallback: sessions.env
+  if [ -f "$sesFile" ]; then
     local sesSid
-    sesSid=$(grep "^${target}|" "$sesFile2" 2>/dev/null | tail -1 | cut -d'|' -f2)
+    sesSid=$(grep "^${target}|" "$sesFile" 2>/dev/null | tail -1 | cut -d'|' -f2)
     [ -n "$sesSid" ] && echo "$sesSid" && return 0
   fi
 
-  # 5. Last resort: process args UUID (may be stale after autocompact)
-  local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-  [ -f "$sesFile" ] && grep "^${target}|" "$sesFile" 2>/dev/null | tail -1 | cut -d'|' -f2
+  # Last resort: process args UUID
+  [ -n "$argsUuid" ] && echo "$argsUuid" && return 0
+  return 1
 }
 
 private.hiveMind.pane.count() { # <target> # count panes in a window or session
