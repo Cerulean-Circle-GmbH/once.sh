@@ -1912,6 +1912,163 @@ hiveMind.teams.migrate.completion.snapshot_file() {
   ls "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REMOTE PULL — reverse of teams.migrate (pull FROM remote, restart locally)
+# ─────────────────────────────────────────────────────────────────────────────
+
+hiveMind.team.pull() # <sshConfigName> # pull team config from remote machine
+{
+  local host="$1"
+  if [ -z "$host" ]; then
+    error.log "Usage: hiveMind team.pull <sshConfigName>"
+    return 1
+  fi
+
+  local pullDir="${CONFIG_PATH:-$HOME/config}/hivemind.pull.${host}"
+  local claudeProjectsDir="$HOME/.claude/projects"
+
+  echo -e "${BOLD_CYAN}Pulling team config from $host${NORMAL}"
+
+  # 1. Open persistent SSH connection
+  "$OOSH_DIR/ossh" connection.open "$host" || { error.log "Cannot connect to $host"; return 1; }
+
+  # 2. Run remote teams.save
+  echo "Creating snapshot on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "hiveMind teams.save" 2>/dev/null
+
+  # 3. Create local pull directory
+  mkdir -p "$pullDir"
+
+  # 4. Pull config files from remote
+  echo "Pulling config files..."
+  scp "$host:~/config/hivemind.roles.env" "$pullDir/roles.env" 2>/dev/null
+  scp "$host:~/config/hivemind.sessions.env" "$pullDir/sessions.env" 2>/dev/null
+  scp "$host:~/config/hivemind.teams.env" "$pullDir/teams.env" 2>/dev/null
+
+  # 5. Pull latest snapshot
+  local remoteSnap
+  remoteSnap=$("$OOSH_DIR/ossh" exec "$host" "ls -t ~/config/hivemind.snapshot.*.env 2>/dev/null | head -1" 2>/dev/null)
+  if [ -n "$remoteSnap" ]; then
+    scp "$host:$remoteSnap" "$pullDir/snapshot.env" 2>/dev/null
+  else
+    error.log "No snapshot found on $host"
+    return 1
+  fi
+
+  # 6. Pull JSONL files for each UUID in snapshot
+  local transferCount=0
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$uuid" ] && continue
+
+    # Find JSONL path on remote
+    local remotePath
+    remotePath=$("$OOSH_DIR/ossh" exec "$host" "ls ~/.claude/projects/*/${uuid}.jsonl 2>/dev/null | head -1" 2>/dev/null)
+    [ -z "$remotePath" ] && continue
+
+    # Create local directory matching remote structure
+    local localDir
+    localDir=$(dirname "$remotePath")
+    mkdir -p "$localDir" 2>/dev/null
+
+    # Transfer
+    scp "$host:$remotePath" "$remotePath" 2>/dev/null && transferCount=$((transferCount + 1))
+  done < "$pullDir/snapshot.env"
+
+  # 7. Write timestamp
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$pullDir/pulled.timestamp"
+
+  echo ""
+  success.log "Pulled from $host → $pullDir"
+  echo -e "  Config files: ${BOLD_WHITE}roles.env, sessions.env, teams.env, snapshot.env${NORMAL}"
+  echo -e "  JSONL files:  ${BOLD_WHITE}$transferCount${NORMAL} transferred"
+  echo ""
+  echo "Restart agents with: hiveMind agent.restart $pullDir"
+}
+hiveMind.team.pull.completion.sshConfigName() {
+  grep '^Host ' ~/.ssh/config ~/.ssh/config.d/* 2>/dev/null | sed 's/.*Host //' | grep -v '^\*'
+}
+
+hiveMind.agent.restart() # <pullDir> # restart agents locally from pulled config directory
+{
+  local pullDir="$1"
+  if [ -z "$pullDir" ] || [ ! -f "$pullDir/snapshot.env" ]; then
+    error.log "Usage: hiveMind agent.restart <pullDir>"
+    echo "  Available: $(ls -d "${CONFIG_PATH:-$HOME/config}"/hivemind.pull.*/ 2>/dev/null | tr '\n' ' ')"
+    return 1
+  fi
+
+  local hostName
+  hostName=$(basename "$pullDir" | sed 's/^hivemind\.pull\.//')
+
+  echo -e "${BOLD_CYAN}Restarting agents from $pullDir${NORMAL}"
+
+  local prevSess="" agentCount=0
+
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$sess" ] && continue
+
+    # Session naming: prefix with host if collision
+    local localSess="$sess"
+    if otmux has "$sess" 2>/dev/null && [ "$sess" != "$prevSess" ]; then
+      localSess="${hostName}.${sess}"
+    fi
+
+    # Create session if new
+    if [ "$localSess" != "$prevSess" ]; then
+      if ! otmux has "$localSess" 2>/dev/null; then
+        echo "  Creating session: $localSess"
+        otmux new "$localSess" 2>/dev/null
+      fi
+      prevSess="$localSess"
+    fi
+
+    local paneTarget="${localSess}:${addr}"
+
+    # Create pane
+    private.hiveMind.ensure.pane "$paneTarget"
+
+    # Set identity
+    if [ -n "$role" ] && [ "$role" != "unknown" ]; then
+      private.hiveMind.pane.identify "$paneTarget" "$role"
+    fi
+
+    # Fork session if UUID available
+    if [ -n "$uuid" ]; then
+      # Verify JSONL exists locally
+      local hasJsonl=""
+      for d in "$HOME/.claude/projects"/*/; do
+        [ -f "${d}${uuid}.jsonl" ] && hasJsonl="yes" && break
+      done
+
+      if [ "$hasJsonl" = "yes" ]; then
+        echo -e "  ${GRAY}${addr}${NORMAL} ${BOLD_WHITE}${role:-unknown}${NORMAL} → fork ${uuid:0:8}..."
+        otmux send.enter "$paneTarget" "claudeCode fork $uuid"
+        agentCount=$((agentCount + 1))
+        sleep 2
+      else
+        echo -e "  ${GRAY}${addr}${NORMAL} ${BOLD_WHITE}${role:-unknown}${NORMAL} → ${BOLD_YELLOW}no JSONL (start fresh)${NORMAL}"
+        otmux send.enter "$paneTarget" "claudeCode opus"
+        agentCount=$((agentCount + 1))
+        sleep 2
+      fi
+    else
+      echo -e "  ${GRAY}${addr}${NORMAL} ${BOLD_WHITE}${role:-unknown}${NORMAL} → ${GRAY}no UUID (skip)${NORMAL}"
+    fi
+  done < "$pullDir/snapshot.env"
+
+  # Register team
+  hiveMind.team.register "$prevSess" "Pulled from $hostName" 2>/dev/null
+
+  echo ""
+  success.log "Restarted $agentCount agents from $hostName"
+  echo "Check with: hiveMind team.status $prevSess"
+}
+hiveMind.agent.restart.completion.pullDir() {
+  ls -d "${CONFIG_PATH:-$HOME/config}"/hivemind.pull.*/ 2>/dev/null
+}
+
 hiveMind.registry.set() # <pane> <role> # set registry entry for a pane
 {
   local target="$1" role="$2"
