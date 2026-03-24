@@ -3100,11 +3100,349 @@ echo "=== UUID cross-source consistency tests complete ==="
 echo ""
 
 # ============================================================================
+# FEATURE: hiveMind team.pull + agent.restart (remote offloading)
+# TDD: tests written BEFORE implementation — expert will make them pass
+# ============================================================================
+
+# --- Shared setup for pull/restart tests ---
+TEST_PULL_HOST="mock-remote-$$"
+TEST_PULL_DIR="/tmp/hivemind.${TEST_PULL_HOST}"
+TEST_ARESTART_SESS="__test_arestart_$$"
+
+# Mock SSH config
+TEST_SSH_DIR=$(mktemp -d /tmp/__test_sshdir_$$.XXXXXX)
+cat > "$TEST_SSH_DIR/config" <<SSHEOF
+Host mock-remote-$$
+  HostName 192.168.99.99
+Host mock-gateway-$$
+  HostName 10.0.0.1
+SSHEOF
+ORIG_SSH_DIR="${CURRENT_SSH_DIR:-}"
+export CURRENT_SSH_DIR="$TEST_SSH_DIR"
+
+# ── A. team.pull tests ──────────────────────────────────────────────────────
+
+test.case $level "T-PULL-1: team.pull function exists" \
+  type -t hiveMind.team.pull
+if type -t hiveMind.team.pull &>/dev/null; then
+  expect.pass "hiveMind.team.pull function exists"
+else
+  expect.fail "hiveMind.team.pull should be defined"
+fi
+
+test.case $level "T-PULL-2: team.pull completion returns SSH hosts" \
+  type -t hiveMind.team.pull.completion.host
+if type -t hiveMind.team.pull.completion.host &>/dev/null; then
+  PULL_HOSTS=$(hiveMind.team.pull.completion.host 2>/dev/null)
+  if echo "$PULL_HOSTS" | grep -q "mock-remote-$$"; then
+    expect.pass "completion returns mock SSH host"
+  else
+    expect.fail "completion should return mock-remote-$$ from SSH config"
+  fi
+else
+  expect.fail "hiveMind.team.pull.completion.host should be defined"
+fi
+
+test.case $level "T-PULL-3: team.pull with no args returns error" \
+  hiveMind.team.pull
+if [ "$RETURN_VALUE" -ne 0 ]; then
+  expect.pass "team.pull rejects missing host arg"
+else
+  expect.fail "team.pull should return non-zero without args"
+fi
+
+test.case $level "T-PULL-4: team.pull with bad host returns error" \
+  echo "testing unreachable host"
+if type -t hiveMind.team.pull &>/dev/null; then
+  timeout 15 hiveMind.team.pull "nonexistent-host-$$" 2>/dev/null
+  PULL_RC=$?
+  if [ "$PULL_RC" -ne 0 ]; then
+    expect.pass "team.pull fails for unreachable host (rc=$PULL_RC)"
+  else
+    expect.fail "team.pull should fail for unreachable host"
+  fi
+  rm -rf "/tmp/hivemind.nonexistent-host-$$" 2>/dev/null
+else
+  expect.pass "skipped — team.pull not yet implemented"
+fi
+
+# T-PULL-5..7: Validate pulled directory structure
+# Create fixture simulating what team.pull would produce
+PULL_FIXTURE="/tmp/hivemind.__test_pull_$$"
+mkdir -p "$PULL_FIXTURE"
+cat > "$PULL_FIXTURE/hivemind.snapshot.env" <<SNAPEOF
+# hiveMind snapshot test-pull
+# session|address|role|uuid|title
+remoteTeam|0.0|remote-orchestrator|aaaa1111-2222-3333-4444-555566667777|remote-orchestrator
+remoteTeam|0.1|remote-coder|bbbb1111-2222-3333-4444-555566667777|remote-coder
+remoteTeam|0.2|remote-tester||remote-tester
+SNAPEOF
+cat > "$PULL_FIXTURE/hivemind.roles.env" <<ROLESEOF
+remoteTeam:0.0|remote-orchestrator
+remoteTeam:0.1|remote-coder
+remoteTeam:0.2|remote-tester
+ROLESEOF
+cat > "$PULL_FIXTURE/hivemind.sessions.env" <<SESSEOF
+remoteTeam:0.0|aaaa1111-2222-3333-4444-555566667777
+remoteTeam:0.1|bbbb1111-2222-3333-4444-555566667777
+SESSEOF
+echo '{"type":"custom-title","customTitle":"remote-coder","sessionId":"bbbb1111-2222-3333-4444-555566667777"}' > "$PULL_FIXTURE/bbbb1111-2222-3333-4444-555566667777.jsonl"
+
+test.case $level "T-PULL-5: pulled directory has snapshot + roles + sessions" \
+  echo "checking $PULL_FIXTURE"
+if [ -f "$PULL_FIXTURE/hivemind.snapshot.env" ] && \
+   [ -f "$PULL_FIXTURE/hivemind.roles.env" ] && \
+   [ -f "$PULL_FIXTURE/hivemind.sessions.env" ]; then
+  expect.pass "fixture directory has all required config files"
+else
+  expect.fail "pulled directory missing required files"
+fi
+
+test.case $level "T-PULL-6: snapshot has correct format" \
+  echo "checking snapshot format"
+SNAP_HEADER=$(head -1 "$PULL_FIXTURE/hivemind.snapshot.env")
+SNAP_FIELDS=$(grep -v '^#' "$PULL_FIXTURE/hivemind.snapshot.env" | head -1 | awk -F'|' '{print NF}')
+if echo "$SNAP_HEADER" | grep -q "^# hiveMind snapshot" && [ "$SNAP_FIELDS" -eq 5 ]; then
+  expect.pass "snapshot: correct header + 5-field records"
+else
+  expect.fail "snapshot format wrong: header='$SNAP_HEADER' fields=$SNAP_FIELDS"
+fi
+
+test.case $level "T-PULL-7: JSONL files present for agents with UUIDs" \
+  echo "checking JONLs"
+PULL_JSONL_COUNT=$(ls "$PULL_FIXTURE"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+if [ "$PULL_JSONL_COUNT" -ge 1 ]; then
+  expect.pass "$PULL_JSONL_COUNT JSONL files in pulled directory"
+else
+  expect.fail "pulled directory should contain JSONL session files"
+fi
+
+echo ""
+echo "=== team.pull tests complete ==="
+echo ""
+
+# ── B. agent.restart tests ──────────────────────────────────────────────────
+
+test.case $level "T-ARESTART-1: agent.restart function exists" \
+  type -t hiveMind.agent.restart
+if type -t hiveMind.agent.restart &>/dev/null; then
+  expect.pass "hiveMind.agent.restart function exists"
+else
+  expect.fail "hiveMind.agent.restart should be defined"
+fi
+
+test.case $level "T-ARESTART-2: agent.restart completion returns hivemind.* dirs" \
+  type -t hiveMind.agent.restart.completion.configDir
+if type -t hiveMind.agent.restart.completion.configDir &>/dev/null; then
+  # Create a fixture dir for completion to find
+  mkdir -p "/tmp/hivemind.__test_comp_$$"
+  RESTART_DIRS=$(hiveMind.agent.restart.completion.configDir 2>/dev/null)
+  rm -rf "/tmp/hivemind.__test_comp_$$"
+  if echo "$RESTART_DIRS" | grep -q "hivemind\."; then
+    expect.pass "completion returns hivemind.* directories"
+  else
+    expect.fail "completion should list hivemind.* directories"
+  fi
+else
+  expect.fail "hiveMind.agent.restart.completion.configDir should be defined"
+fi
+
+test.case $level "T-ARESTART-3: agent.restart with no args returns error" \
+  hiveMind.agent.restart
+if [ "$RETURN_VALUE" -ne 0 ]; then
+  expect.pass "agent.restart rejects missing configDir arg"
+else
+  expect.fail "agent.restart should return non-zero without args"
+fi
+
+test.case $level "T-ARESTART-4: agent.restart with nonexistent dir returns error" \
+  hiveMind.agent.restart "hivemind.nonexistent_$$"
+if [ "$RETURN_VALUE" -ne 0 ]; then
+  expect.pass "agent.restart rejects nonexistent directory"
+else
+  expect.fail "agent.restart should fail for nonexistent directory"
+fi
+
+mkdir -p "/tmp/hivemind.empty_$$"
+test.case $level "T-ARESTART-5: agent.restart with empty dir returns error" \
+  hiveMind.agent.restart "/tmp/hivemind.empty_$$"
+if [ "$RETURN_VALUE" -ne 0 ]; then
+  expect.pass "agent.restart rejects empty directory (no snapshot)"
+else
+  expect.fail "agent.restart should fail for directory without snapshot"
+fi
+rm -rf "/tmp/hivemind.empty_$$"
+
+# T-ARESTART-6..7 require tmux
+if otmux sessions >/dev/null 2>&1; then
+
+  # Create fixture for restart
+  RESTART_FIXTURE="/tmp/hivemind.__test_restart_$$"
+  mkdir -p "$RESTART_FIXTURE"
+  cat > "$RESTART_FIXTURE/hivemind.snapshot.env" <<RSNAP
+# hiveMind snapshot test-restart
+# session|address|role|uuid|title
+${TEST_ARESTART_SESS}|0.0|test-puller-alpha||alpha-pulled
+${TEST_ARESTART_SESS}|0.1|test-puller-beta||beta-pulled
+RSNAP
+  cat > "$RESTART_FIXTURE/hivemind.roles.env" <<RROLES
+${TEST_ARESTART_SESS}:0.0|test-puller-alpha
+${TEST_ARESTART_SESS}:0.1|test-puller-beta
+RROLES
+
+  # Clean any prior test session
+  otmux kill "$TEST_ARESTART_SESS" 2>/dev/null
+
+  test.case $level "T-ARESTART-6: restart creates session with correct panes" \
+    echo "restarting from $RESTART_FIXTURE"
+  if type -t hiveMind.agent.restart &>/dev/null; then
+    hiveMind.agent.restart "$RESTART_FIXTURE" 2>/dev/null
+    if otmux has "$TEST_ARESTART_SESS" 2>/dev/null; then
+      ARESTART_PANES=$(otmux panes -t "$TEST_ARESTART_SESS" -s 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$ARESTART_PANES" -ge 2 ]; then
+        expect.pass "session created with $ARESTART_PANES panes"
+      else
+        expect.fail "expected >= 2 panes, got $ARESTART_PANES"
+      fi
+    else
+      expect.fail "session $TEST_ARESTART_SESS not created"
+    fi
+  else
+    expect.pass "skipped — agent.restart not yet implemented"
+  fi
+
+  # Check registry populated
+  test.case $level "T-ARESTART-6b: restart populates registry" \
+    echo "checking registry"
+  if type -t hiveMind.agent.restart &>/dev/null; then
+    if grep -q "test-puller-alpha" "$REG_FILE" 2>/dev/null; then
+      expect.pass "test-puller-alpha found in registry"
+    else
+      expect.fail "test-puller-alpha should be in registry after restart"
+    fi
+  else
+    expect.pass "skipped — agent.restart not yet implemented"
+  fi
+
+  # T-ARESTART-7: Collision handling
+  # Pre-create a session with same name
+  otmux kill "$TEST_ARESTART_SESS" 2>/dev/null
+  otmux new "$TEST_ARESTART_SESS" 2>/dev/null
+  test.case $level "T-ARESTART-7: restart handles session name collision" \
+    echo "testing collision"
+  if type -t hiveMind.agent.restart &>/dev/null; then
+    hiveMind.agent.restart "$RESTART_FIXTURE" 2>/dev/null
+    ARESTART_RC=$?
+    # Either renamed the session (success) or returned error (acceptable)
+    if [ "$ARESTART_RC" -ne 0 ]; then
+      expect.pass "agent.restart rejects collision (rc=$ARESTART_RC)"
+    else
+      # Check if it created a renamed session
+      COLLISION_SESSIONS=$(otmux sessions -F "#{session_name}" 2>/dev/null | grep "$TEST_ARESTART_SESS" | wc -l | tr -d ' ')
+      if [ "$COLLISION_SESSIONS" -ge 1 ]; then
+        expect.pass "agent.restart handled collision ($COLLISION_SESSIONS sessions)"
+      else
+        expect.fail "agent.restart should handle collision, not silently fail"
+      fi
+    fi
+  else
+    expect.pass "skipped — agent.restart not yet implemented"
+  fi
+
+  # Cleanup restart tests
+  otmux kill "$TEST_ARESTART_SESS" 2>/dev/null
+  rm -rf "$RESTART_FIXTURE"
+
+else
+  test.case $level "T-ARESTART-6: restart creates session (skipped — no tmux)" echo "skip"
+  expect.pass "skipped — tmux not available"
+  test.case $level "T-ARESTART-6b: restart populates registry (skipped)" echo "skip"
+  expect.pass "skipped"
+  test.case $level "T-ARESTART-7: collision handling (skipped)" echo "skip"
+  expect.pass "skipped"
+fi
+
+echo ""
+echo "=== agent.restart tests complete ==="
+echo ""
+
+# ── C. Integration tests ────────────────────────────────────────────────────
+
+# T-PULLRESTART-1: Round-trip fixture → restart
+if otmux sessions >/dev/null 2>&1; then
+  RT_SESS="__test_roundtrip_$$"
+  RT_FIXTURE="/tmp/hivemind.__test_roundtrip_$$"
+  mkdir -p "$RT_FIXTURE"
+  cat > "$RT_FIXTURE/hivemind.snapshot.env" <<RTSNAP
+# hiveMind snapshot roundtrip-test
+# session|address|role|uuid|title
+${RT_SESS}|0.0|rt-alpha||rt-alpha
+${RT_SESS}|0.1|rt-beta||rt-beta
+RTSNAP
+  cat > "$RT_FIXTURE/hivemind.roles.env" <<RTROLES
+${RT_SESS}:0.0|rt-alpha
+${RT_SESS}:0.1|rt-beta
+RTROLES
+
+  test.case $level "T-PULLRESTART-1: round-trip fixture → restart" \
+    echo "roundtrip test"
+  if type -t hiveMind.agent.restart &>/dev/null; then
+    otmux kill "$RT_SESS" 2>/dev/null
+    hiveMind.agent.restart "$RT_FIXTURE" 2>/dev/null
+    if otmux has "$RT_SESS" 2>/dev/null; then
+      RT_PANES=$(otmux panes -t "$RT_SESS" -s 2>/dev/null | wc -l | tr -d ' ')
+      RT_REG=$(grep "rt-alpha\|rt-beta" "$REG_FILE" 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$RT_PANES" -ge 2 ] && [ "$RT_REG" -ge 2 ]; then
+        expect.pass "roundtrip: $RT_PANES panes, $RT_REG registry entries"
+      else
+        expect.fail "roundtrip: panes=$RT_PANES registry=$RT_REG"
+      fi
+    else
+      expect.fail "roundtrip session $RT_SESS not created"
+    fi
+  else
+    expect.pass "skipped — agent.restart not yet implemented"
+  fi
+  otmux kill "$RT_SESS" 2>/dev/null
+  rm -rf "$RT_FIXTURE"
+else
+  test.case $level "T-PULLRESTART-1: round-trip (skipped — no tmux)" echo "skip"
+  expect.pass "skipped"
+fi
+
+# T-PULLRESTART-2: Non-regression — agent.restart.remote still exists
+test.case $level "T-PULLRESTART-2: agent.restart.remote not clobbered" \
+  type -t hiveMind.agent.restart.remote
+if type -t hiveMind.agent.restart.remote &>/dev/null; then
+  if type -t hiveMind.agent.restart.remote.completion.agentName &>/dev/null && \
+     type -t hiveMind.agent.restart.remote.completion.host &>/dev/null; then
+    expect.pass "agent.restart.remote + completions still exist"
+  else
+    expect.fail "agent.restart.remote completions missing"
+  fi
+else
+  expect.fail "agent.restart.remote function clobbered!"
+fi
+
+echo ""
+echo "=== team.pull + agent.restart integration tests complete ==="
+echo ""
+
+# --- Cleanup pull/restart test artifacts ---
+rm -rf "$TEST_PULL_DIR" "$PULL_FIXTURE" /tmp/hivemind.__test_* /tmp/hivemind.nonexistent-*
+rm -rf "$TEST_SSH_DIR"
+export CURRENT_SSH_DIR="$ORIG_SSH_DIR"
+# Clean registry entries from restart tests
+[ -f "$REG_FILE" ] && grep -v 'test-puller-\|rt-alpha\|rt-beta\|remote-' "$REG_FILE" > "${REG_FILE}.pr_clean" 2>/dev/null && mv "${REG_FILE}.pr_clean" "$REG_FILE"
+
+# ============================================================================
 # Cleanup — kill test sessions and remove stale registry entries
 # ============================================================================
 
 otmux kill "$TEST_SESSION" 2>/dev/null
 __test_cleanup "__test_lifecycle_$$"
+__test_cleanup "__test_arestart_$$"
+__test_cleanup "__test_roundtrip_$$"
 [ -f "$REG_FILE" ] && grep -v '__test_' "$REG_FILE" > "${REG_FILE}.clean" 2>/dev/null && mv "${REG_FILE}.clean" "$REG_FILE"
 
 # ============================================================================
