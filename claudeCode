@@ -35,8 +35,8 @@ private.claudeCode.complete.sessionIds() {
   done
 }
 private.claudeCode.complete.roleNames() {
-  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-  [ -f "$ses" ] && cut -d'|' -f1 "$ses" 2>/dev/null
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] && cut -d'|' -f2 "$reg" 2>/dev/null | sort -u
 }
 
 claudeCode.sessions() # # list all available sessions (interactive picker)
@@ -193,28 +193,31 @@ claudeCode.join() # <session> # resume a specific session by name or UUID
   local session="$1"
   if [ -n "$session" ]; then
     shift
-    # If not a UUID, try sessions.env lookup by role name
+    # If not a UUID, try role→pane→UUID or pane→UUID lookup
     if ! [[ "$session" =~ ^[0-9a-f]{8}-[0-9a-f]{4} ]]; then
+      local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
       local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-      local foundUuid
-      foundUuid=$(grep "^${session}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
-      if [ -n "$foundUuid" ]; then
-        session="$foundUuid"
+      local foundUuid=""
+      # Try as pane target first (new schema: pane|UUID)
+      [ -f "$ses" ] && foundUuid=$(grep "^${session}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
+      # Try as role name: resolve role→pane→UUID
+      if [ -z "$foundUuid" ] && [ -f "$reg" ]; then
+        local pane
+        pane=$(grep "|${session}$" "$reg" 2>/dev/null | head -1 | cut -d'|' -f1)
+        [ -n "$pane" ] && [ -f "$ses" ] && foundUuid=$(grep "^${pane}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
       fi
+      [ -n "$foundUuid" ] && session="$foundUuid"
     fi
-    # Update sessions file with the UUID being resumed
+    # Update sessions file with the UUID being resumed (keyed by pane)
     local paneTarget
     paneTarget=$(otmux pane.get.target 2>/dev/null)
     if [ -n "$paneTarget" ]; then
-      local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
       local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-      local role
-      role=$(grep "^${paneTarget}|" "$reg" 2>/dev/null | cut -d'|' -f2)
-      if [ -n "$role" ] && [ -n "$ses" ]; then
-        grep -v "^${role}|" "$ses" > "${ses}.tmp" 2>/dev/null
+      if [ -f "$ses" ]; then
+        grep -v "^${paneTarget}|" "$ses" > "${ses}.tmp" 2>/dev/null
         mv "${ses}.tmp" "$ses"
-        echo "${role}|${session}" >> "$ses"
       fi
+      echo "${paneTarget}|${session}" >> "$ses"
     fi
     "$CLAUDE_CMD" --resume "$session" "$@"
   else
@@ -237,16 +240,24 @@ claudeCode.join.byID.completion.sessionId() {
   private.claudeCode.complete.sessionIds
 }
 
-claudeCode.join.byName() # <name> # resume session by role name (lookup in sessions.env)
+claudeCode.join.byName() # <name> # resume session by role name (role→pane→UUID lookup)
 {
   local name="$1"
   [ -z "$name" ] && { error.log "usage: claudeCode join.byName <name>"; return 1; }
   shift
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
   local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  # Resolve role → pane → UUID
+  local pane
+  pane=$(grep "|${name}$" "$reg" 2>/dev/null | head -1 | cut -d'|' -f1)
+  if [ -z "$pane" ]; then
+    error.log "no pane found for role '$name' in registry"
+    return 1
+  fi
   local foundUuid
-  foundUuid=$(grep "^${name}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
+  foundUuid=$(grep "^${pane}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
   if [ -z "$foundUuid" ]; then
-    error.log "no session found for role '$name' in $ses"
+    error.log "no session UUID found for pane '$pane' (role '$name')"
     return 1
   fi
   "$CLAUDE_CMD" --resume "$foundUuid" "$@"
@@ -748,26 +759,27 @@ claudeCode.session.id() # <pane> # get Claude Code session UUID for a tmux pane
 
   # Method 1 (FIRST): extract session UUID from process args — ground truth
   # Matches: --resume <UUID>, claudeCode join <UUID>
+  # SKIP for forked sessions: --fork-session makes --resume UUID stale (it's the parent UUID)
   local claudePid
   claudePid=$(claudeCode.process.find "$target")
   if [ -n "$claudePid" ]; then
-    local sid
-    sid=$(ps -p "$claudePid" -o args= 2>/dev/null | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-    [ -n "$sid" ] && echo "$sid" && return 0
-  fi
-
-  # Method 0 (FALLBACK): look up pane → role → session UUID from env config files
-  # Only reached when process has no --resume UUID (e.g. fresh claude without resume)
-  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-  if [ -f "$reg" ] && [ -f "$ses" ]; then
-    local role
-    role=$(grep "^${target}|" "$reg" 2>/dev/null | cut -d'|' -f2)
-    if [ -n "$role" ]; then
+    local proc_args
+    proc_args=$(ps -p "$claudePid" -o args= 2>/dev/null)
+    if ! echo "$proc_args" | grep -q '\-\-fork-session'; then
       local sid
-      sid=$(grep "^${role}|" "$ses" 2>/dev/null | tail -1 | cut -d'|' -f2)
+      sid=$(echo "$proc_args" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
       [ -n "$sid" ] && echo "$sid" && return 0
     fi
+    # Forked session: fall through to registry/sessions.env lookup
+  fi
+
+  # Method 0 (FALLBACK): look up pane → session UUID from sessions.env
+  # Only reached when process has no --resume UUID (e.g. fresh claude without resume)
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  if [ -f "$ses" ]; then
+    local sid
+    sid=$(grep "^${target}|" "$ses" 2>/dev/null | tail -1 | cut -d'|' -f2)
+    [ -n "$sid" ] && echo "$sid" && return 0
   fi
 
   return 1

@@ -8,6 +8,9 @@ TEST_CATEGORY=core
 level=$1
 if [ -z "$level" ]; then
   level=1
+else 
+  # remove the level parameter
+  shift
 fi
 info.log "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
