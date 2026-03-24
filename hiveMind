@@ -163,7 +163,7 @@ private.hiveMind.liveUuid() { # <paneTarget> <?procArgs> <?probe> # get live ses
   return 1
 }
 
-private.hiveMind.session.resolve.uuid() # <pane> # fork-aware UUID discovery — single source of truth
+private.hiveMind.session.resolve.uuid() # <pane> # UUID discovery — handles forks AND autocompact
 {
   local target="$1"
   [ -z "$target" ] && return 1
@@ -174,41 +174,60 @@ private.hiveMind.session.resolve.uuid() # <pane> # fork-aware UUID discovery —
   local procArgs
   procArgs=$(ps -p "$claudePid" -o args= 2>/dev/null)
 
-  # 2. Non-forked: UUID from process args (fast, reliable)
+  # 2. Get candidate UUID from process args (may be stale after autocompact or wrong for forks)
+  local argsUuid=""
   if ! echo "$procArgs" | grep -qE '\-\-fork-session|claudeCode fork'; then
-    local sid
-    sid=$(echo "$procArgs" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-    [ -n "$sid" ] && echo "$sid" && return 0
+    argsUuid=$(echo "$procArgs" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
   fi
 
-  # 3. Forked: find REAL JSONL by customTitle (role name) — most recently modified
+  # 3. Find the REAL active JSONL — most recently modified with matching customTitle
+  # Catches: forks (wrong parent UUID), autocompact (new session file), renamed sessions
   local roleFile="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
   local roleName=""
   [ -f "$roleFile" ] && roleName=$(grep "^${target}|" "$roleFile" 2>/dev/null | head -1 | cut -d'|' -f2)
 
-  if [ -n "$roleName" ] && command -v python3 >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1; then
     local projectsDir="$HOME/.claude/projects"
+    local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
     local sid
     sid=$(python3 -c "
 import json, glob, os
-role = '$roleName'
+role = '${roleName:-}'
+args_uuid = '${argsUuid:-}'
+ses_file = '$sesFile'
+target = '$target'
+
+# Load sessions.env to know which UUIDs belong to other panes
+other_uuids = set()
+if os.path.isfile(ses_file):
+    for line in open(ses_file):
+        parts = line.strip().split('|')
+        if len(parts) == 2 and parts[0] != target:
+            other_uuids.add(parts[1])
+
 best_sid, best_mtime = '', 0
-for f in glob.glob('$projectsDir/*/*.jsonl'):
+for f in sorted(glob.glob('$projectsDir/*/*.jsonl'), key=os.path.getmtime, reverse=True):
     try:
         mtime = os.path.getmtime(f)
-        with open(f) as fh:
-            for line in fh:
+        sid = json.loads(open(f).readline()).get('sessionId', '')
+        if not sid or sid in other_uuids:
+            continue
+        # Strategy 1: match by customTitle (role name)
+        if role:
+            for line in open(f):
                 d = json.loads(line)
                 if d.get('type') == 'custom-title' and d.get('customTitle') == role:
-                    sid = json.loads(open(f).readline()).get('sessionId', '')
-                    if mtime > best_mtime and sid:
+                    if mtime > best_mtime:
                         best_sid, best_mtime = sid, mtime
                     break
+        # Strategy 2: if args UUID is stale, take the most recent unassigned JSONL
+        if not best_sid and args_uuid and sid != args_uuid and mtime > best_mtime:
+            best_sid, best_mtime = sid, mtime
     except: pass
 if best_sid: print(best_sid)
 " 2>/dev/null)
     if [ -n "$sid" ]; then
-      # Write-through: update sessions.env with correct fork UUID
+      # Write-through: update sessions.env
       local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
       if [ -f "$sesFile" ]; then
         grep -v "^${target}|" "$sesFile" > "${sesFile}.tmp" 2>/dev/null && mv "${sesFile}.tmp" "$sesFile"
@@ -219,7 +238,10 @@ if best_sid: print(best_sid)
     fi
   fi
 
-  # 4. Fallback: sessions.env (may be stale for forks, but better than nothing)
+  # 4. Fallback: process args UUID (non-forked, no autocompact detected)
+  [ -n "$argsUuid" ] && echo "$argsUuid" && return 0
+
+  # 5. Last resort: sessions.env
   local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
   [ -f "$sesFile" ] && grep "^${target}|" "$sesFile" 2>/dev/null | tail -1 | cut -d'|' -f2
 }
