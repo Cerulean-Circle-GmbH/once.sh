@@ -163,6 +163,67 @@ private.hiveMind.liveUuid() { # <paneTarget> <?procArgs> <?probe> # get live ses
   return 1
 }
 
+private.hiveMind.session.resolve.uuid() # <pane> # fork-aware UUID discovery — single source of truth
+{
+  local target="$1"
+  [ -z "$target" ] && return 1
+
+  # 1. Find Claude process
+  local claudePid
+  claudePid=$("$OOSH_DIR/claudeCode" process.find "$target" 2>/dev/null) || return 1
+  local procArgs
+  procArgs=$(ps -p "$claudePid" -o args= 2>/dev/null)
+
+  # 2. Non-forked: UUID from process args (fast, reliable)
+  if ! echo "$procArgs" | grep -qE '\-\-fork-session|claudeCode fork'; then
+    local sid
+    sid=$(echo "$procArgs" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+    [ -n "$sid" ] && echo "$sid" && return 0
+  fi
+
+  # 3. Forked: find REAL JSONL by customTitle (role name) — most recently modified
+  local roleFile="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local roleName=""
+  [ -f "$roleFile" ] && roleName=$(grep "^${target}|" "$roleFile" 2>/dev/null | head -1 | cut -d'|' -f2)
+
+  if [ -n "$roleName" ] && command -v python3 >/dev/null 2>&1; then
+    local projectsDir="$HOME/.claude/projects"
+    local sid
+    sid=$(python3 -c "
+import json, glob, os
+role = '$roleName'
+best_sid, best_mtime = '', 0
+for f in glob.glob('$projectsDir/*/*.jsonl'):
+    try:
+        mtime = os.path.getmtime(f)
+        with open(f) as fh:
+            for line in fh:
+                d = json.loads(line)
+                if d.get('type') == 'custom-title' and d.get('customTitle') == role:
+                    sid = json.loads(open(f).readline()).get('sessionId', '')
+                    if mtime > best_mtime and sid:
+                        best_sid, best_mtime = sid, mtime
+                    break
+    except: pass
+if best_sid: print(best_sid)
+" 2>/dev/null)
+    if [ -n "$sid" ]; then
+      # Write-through: update sessions.env with correct fork UUID
+      local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+      if [ -f "$sesFile" ]; then
+        grep -v "^${target}|" "$sesFile" > "${sesFile}.tmp" 2>/dev/null && mv "${sesFile}.tmp" "$sesFile"
+      fi
+      echo "${target}|${sid}" >> "$sesFile"
+      echo "$sid"
+      return 0
+    fi
+  fi
+
+  # 4. Fallback: sessions.env (may be stale for forks, but better than nothing)
+  local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  [ -f "$sesFile" ] && grep "^${target}|" "$sesFile" 2>/dev/null | tail -1 | cut -d'|' -f2
+}
+
 private.hiveMind.pane.count() { # <target> # count panes in a window or session
   otmux panes -t "$1" ${2:+-s} 2>/dev/null | wc -l | tr -d ' '
 }
@@ -616,10 +677,10 @@ private.hiveMind.agents.discover() # <?session_filter> # discover all agents, ou
       state="${detect%%|*}"
     fi
 
-    # UUID: delegate to claudeCode.session.id (DRY — handles forks, sessions.env, args)
+    # UUID: single source of truth (DRY — handles forks, sessions.env, args)
     local uuid=""
     if [ "$is_claude" = "yes" ]; then
-      uuid=$("$OOSH_DIR/claudeCode" session.id "$pane_target" 2>/dev/null)
+      uuid=$(private.hiveMind.session.resolve.uuid "$pane_target" 2>/dev/null)
     fi
 
     echo "${pane_target}|${role:-}|${state}|${uuid:-}|${pane_title:-}|${is_claude}"
