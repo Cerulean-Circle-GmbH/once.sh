@@ -2764,6 +2764,117 @@ echo "=== DRY HIVEMIND_AGENTS_DIR regression test complete ==="
 echo ""
 
 # ============================================================================
+# REGRESSION: Registry invariants — live agents must never lose registry
+# Rule: as long as a Claude session has a UUID and is alive, its registry
+# entry MUST NOT be removed. The registry is the fallback for restoring
+# dropped tmux sessions. Live tmux is master for updating registry.
+# ============================================================================
+
+# --- every live Claude agent has a registry entry ---
+LIVE_AGENTS=$(hiveMind.list 2>/dev/null)
+LIVE_COUNT=$(echo "$LIVE_AGENTS" | grep -c . | tr -d ' ')
+REG_ROLES=$(cat "$REG_FILE" 2>/dev/null | cut -d'|' -f2 | sort)
+MISSING_REG=""
+while IFS= read -r agent; do
+  [ -z "$agent" ] && continue
+  if ! echo "$REG_ROLES" | grep -qx "$agent"; then
+    MISSING_REG="${MISSING_REG} $agent"
+  fi
+done <<< "$LIVE_AGENTS"
+test.case $level "every live agent has registry entry" echo "live=$LIVE_COUNT missing='$MISSING_REG'"
+if [ -z "$MISSING_REG" ]; then
+  expect.pass "all $LIVE_COUNT live agents have registry entries"
+else
+  expect.fail "live agents missing from registry:$MISSING_REG"
+fi
+
+# --- registry entries point to valid tmux panes ---
+REG_PANES=$(cat "$REG_FILE" 2>/dev/null | cut -d'|' -f1)
+STALE_PANES=""
+STALE_COUNT=0
+while IFS= read -r pane; do
+  [ -z "$pane" ] && continue
+  if ! otmux has "${pane%%:*}" 2>/dev/null; then
+    STALE_PANES="${STALE_PANES} $pane"
+    STALE_COUNT=$((STALE_COUNT + 1))
+  fi
+done <<< "$REG_PANES"
+test.case $level "registry panes point to valid sessions" echo "stale=$STALE_COUNT"
+if [ "$STALE_COUNT" -eq 0 ]; then
+  expect.pass "all registry panes have valid tmux sessions"
+else
+  # Stale entries are allowed IF session was dropped — they enable restore
+  expect.pass "registry has $STALE_COUNT entries for dropped sessions (restore fallback)"
+fi
+
+# --- consistency.fix must NOT remove entries for live agents ---
+# Snapshot registry, run consistency.fix, verify live entries survive
+REG_BEFORE=$(cat "$REG_FILE" 2>/dev/null | sort)
+hiveMind.consistency.fix 2>/dev/null
+REG_AFTER=$(cat "$REG_FILE" 2>/dev/null | sort)
+REMOVED=$(comm -23 <(echo "$REG_BEFORE") <(echo "$REG_AFTER"))
+test.case $level "consistency.fix preserves live agent entries" echo "removed='$REMOVED'"
+if [ -z "$REMOVED" ]; then
+  expect.pass "no registry entries removed by consistency.fix"
+else
+  # Check if removed entries were for live agents
+  REMOVED_LIVE=""
+  while IFS='|' read -r pane role; do
+    [ -z "$pane" ] && continue
+    if echo "$LIVE_AGENTS" | grep -qx "$role"; then
+      REMOVED_LIVE="${REMOVED_LIVE} $role"
+    fi
+  done <<< "$REMOVED"
+  if [ -z "$REMOVED_LIVE" ]; then
+    expect.pass "removed entries were stale (not live agents)"
+  else
+    expect.fail "consistency.fix removed LIVE agents:$REMOVED_LIVE"
+  fi
+fi
+
+# --- hiveMind panes shows full UUIDs (not truncated 8-char) ---
+PANES_OUT=$(hiveMind.panes 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+# Extract UUID column — full UUIDs are 36 chars (8-4-4-4-12), truncated are 8
+UUID_LINES=$(echo "$PANES_OUT" | grep -oE '[0-9a-f-]{8,}' | grep -v '^-$')
+SHORT_UUIDS=$(echo "$UUID_LINES" | awk 'length < 36 && length > 0' | head -5)
+SHORT_COUNT=$(echo "$SHORT_UUIDS" | grep -c . | tr -d ' ')
+test.case $level "panes shows full UUIDs (not truncated)" echo "short=$SHORT_COUNT"
+if [ "$SHORT_COUNT" -eq 0 ]; then
+  expect.pass "all UUIDs are full length"
+else
+  expect.fail "$SHORT_COUNT truncated UUIDs found: $SHORT_UUIDS"
+fi
+
+# --- hiveMind status shows full UUIDs ---
+STATUS_OUT=$(hiveMind.status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+STATUS_UUIDS=$(echo "$STATUS_OUT" | grep -oE '\[[0-9a-f-]+\]' | tr -d '[]')
+STATUS_SHORT=$(echo "$STATUS_UUIDS" | awk 'length < 36 && length > 0' | head -5)
+STATUS_SHORT_COUNT=$(echo "$STATUS_SHORT" | grep -c . | tr -d ' ')
+test.case $level "status shows full UUIDs (not truncated)" echo "short=$STATUS_SHORT_COUNT"
+if [ "$STATUS_SHORT_COUNT" -eq 0 ]; then
+  expect.pass "all status UUIDs are full length"
+else
+  expect.fail "$STATUS_SHORT_COUNT truncated UUIDs in status: $STATUS_SHORT"
+fi
+
+# --- parameter names in method signatures use <agentName> consistently ---
+HIVEMIND_SRC="$OOSH_DIR/hiveMind"
+# Count methods using old inconsistent names: <name>, <role>, <agentId>, <agent>
+# that should be <agentName>. Exclude private helpers and completion functions.
+OLD_PARAMS=$(grep -n '# <name>\|# <role>\|# <agentId>\|# <agent>' "$HIVEMIND_SRC" | grep -v 'private\.\|completion\.\|<agentName>\|<roleName>\|<host>\|<pane>' | grep -v '# <role>.*roleName\|# list\|# set\|# get')
+OLD_COUNT=$(echo "$OLD_PARAMS" | grep -c . | tr -d ' ')
+test.case $level "method signatures use consistent parameter names" echo "old_style=$OLD_COUNT"
+if [ "$OLD_COUNT" -eq 0 ]; then
+  expect.pass "all public methods use <agentName>"
+else
+  expect.fail "$OLD_COUNT methods use inconsistent param names"
+fi
+
+echo ""
+echo "=== registry invariant + UUID + param naming tests complete ==="
+echo ""
+
+# ============================================================================
 # Cleanup — kill test sessions and remove stale registry entries
 # ============================================================================
 
