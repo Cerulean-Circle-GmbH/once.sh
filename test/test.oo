@@ -444,13 +444,21 @@ else
   expect.fail "oo.parameter.completion.branch should exist"
 fi
 
+# Platform-aware test using $OSTYPE (bash built-in, no sourcing needed)
 test.case $level "oo.parameter.completion.baseBranch returns branches" \
   oo.parameter.completion.baseBranch
 COMP_OUTPUT=$(oo.parameter.completion.baseBranch 2>/dev/null)
+COMP_RC=$?
 if echo "$COMP_OUTPUT" | grep -qE "main|dev|master"; then
   expect.pass "baseBranch completion returns git branches"
+elif [ "$COMP_RC" -ne 0 ] && [[ "$OSTYPE" == linux* ]]; then
+  expect.pass "baseBranch completion not available in this environment (rc=$COMP_RC)"
+elif [ "$COMP_RC" -ne 0 ] && [[ "$OSTYPE" == darwin* ]]; then
+  expect.fail "baseBranch completion failed on darwin (rc=$COMP_RC) — check SSH keychain"
+elif [ -n "$COMP_OUTPUT" ]; then
+  expect.pass "baseBranch completion returns branches (names vary)"
 else
-  expect.pass "baseBranch completion runs (branch names may vary)"
+  expect.pass "baseBranch completion callable (empty output)"
 fi
 
 test.case $level "oo.parameter.completion.cmd exists" \
@@ -468,5 +476,261 @@ if type -t oo.parameter.completion.packageName &>/dev/null; then
 else
   expect.fail "oo.parameter.completion.packageName should exist"
 fi
+
+# ============================================================================
+# T-SHIM-5..8: findLatest edge cases (own fixture, ooShim already sourced above)
+# ============================================================================
+
+SHIM_FIXTURE="/tmp/test.oo.shim.$$"
+SAVE_SHIM_HOME="$HOME"
+SAVE_SHIM_OOSH_WORKTREE_BASE="$OOSH_WORKTREE_BASE"
+
+# ============================================================================
+# T-SHIM-5: findLatest picks most recently modified git dir
+# ============================================================================
+test.oo.shim.mostRecent() {
+  mkdir -p "$SHIM_FIXTURE/base/main" "$SHIM_FIXTURE/base/older" "$SHIM_FIXTURE/base/newer"
+  git init "$SHIM_FIXTURE/base/older" >/dev/null 2>&1
+  git init "$SHIM_FIXTURE/base/main"  >/dev/null 2>&1
+  git init "$SHIM_FIXTURE/base/newer" >/dev/null 2>&1
+  # Make older/ the oldest by mtime
+  touch -t 202501010000 "$SHIM_FIXTURE/base/older"
+  # Make newer/ the most recent
+  sleep 1
+  touch "$SHIM_FIXTURE/base/newer"
+
+  HOME="$SHIM_FIXTURE/base"
+  # Create oosh symlink pointing into the base so dirname resolves to base/
+  ln -sf "$SHIM_FIXTURE/base/main" "$SHIM_FIXTURE/base/oosh"
+
+  local result
+  result=$(private.oo.shim.findLatest)
+  HOME="$SAVE_SHIM_HOME"
+
+  local name
+  name=$(basename "$result")
+  if [ "$name" = "newer" ]; then
+    create.result 0 "$name"
+  else
+    create.result 1 "expected newer got $name"
+  fi
+}
+test.case - "T-SHIM-5: findLatest picks most recently modified git dir" \
+  test.oo.shim.mostRecent
+expect 0 "newer" "findLatest returns the most recently modified git directory"
+rm -rf "$SHIM_FIXTURE"
+
+# ============================================================================
+# T-SHIM-6: findLatest returns ooshReal when no valid dirs
+# ============================================================================
+test.oo.shim.noValidDirs() {
+  mkdir -p "$SHIM_FIXTURE/base/main" "$SHIM_FIXTURE/base/dirA" "$SHIM_FIXTURE/base/dirB"
+  # main/ exists so the loop runs, but no dir has .git
+  ln -sf "$SHIM_FIXTURE/base/main" "$SHIM_FIXTURE/base/oosh"
+  HOME="$SHIM_FIXTURE/base"
+  unset OOSH_WORKTREE_BASE
+
+  local result
+  result=$(private.oo.shim.findLatest)
+  HOME="$SAVE_SHIM_HOME"
+  export OOSH_WORKTREE_BASE="$SAVE_SHIM_OOSH_WORKTREE_BASE"
+
+  # Should fall back to ooshReal (resolved symlink target = base/main)
+  if [ "$result" = "$SHIM_FIXTURE/base/main" ]; then
+    create.result 0 "$result"
+  else
+    create.result 1 "expected $SHIM_FIXTURE/base/main got $result"
+  fi
+}
+test.case - "T-SHIM-6: findLatest returns ooshReal when no valid dirs" \
+  test.oo.shim.noValidDirs
+expect 0 "*" "findLatest falls back to ooshReal when no .git dirs found"
+rm -rf "$SHIM_FIXTURE"
+
+# ============================================================================
+# T-SHIM-7: findLatest skips dirs without .git
+# ============================================================================
+test.oo.shim.skipNonGit() {
+  mkdir -p "$SHIM_FIXTURE/base/main" "$SHIM_FIXTURE/base/nogit" "$SHIM_FIXTURE/base/hasgit"
+  git init "$SHIM_FIXTURE/base/main"   >/dev/null 2>&1
+  git init "$SHIM_FIXTURE/base/hasgit" >/dev/null 2>&1
+  # nogit has no .git — make it the newest to prove it gets skipped
+  sleep 1
+  touch "$SHIM_FIXTURE/base/nogit"
+
+  ln -sf "$SHIM_FIXTURE/base/main" "$SHIM_FIXTURE/base/oosh"
+  HOME="$SHIM_FIXTURE/base"
+
+  local result
+  result=$(private.oo.shim.findLatest)
+  HOME="$SAVE_SHIM_HOME"
+
+  local name
+  name=$(basename "$result")
+  # Should be hasgit or main, never nogit
+  if [ "$name" = "hasgit" ] || [ "$name" = "main" ]; then
+    create.result 0 "$name"
+  else
+    create.result 1 "expected hasgit or main, got $name"
+  fi
+}
+test.case - "T-SHIM-7: findLatest skips dirs without .git" \
+  test.oo.shim.skipNonGit
+expect 0 "*" "findLatest only returns directories containing .git"
+rm -rf "$SHIM_FIXTURE"
+
+# ============================================================================
+# T-SHIM-8: findLatest uses OOSH_WORKTREE_BASE when main/ missing
+# ============================================================================
+test.oo.shim.worktreeBase() {
+  # Create a HOME/oosh that is a regular dir with NO sibling main/
+  mkdir -p "$SHIM_FIXTURE/home/oosh/.git"
+  # Create a separate worktree base with main/ and a git dir
+  mkdir -p "$SHIM_FIXTURE/worktrees/main" "$SHIM_FIXTURE/worktrees/feature"
+  git init "$SHIM_FIXTURE/worktrees/main"    >/dev/null 2>&1
+  git init "$SHIM_FIXTURE/worktrees/feature" >/dev/null 2>&1
+  # Make feature/ the most recent
+  sleep 1
+  touch "$SHIM_FIXTURE/worktrees/feature"
+
+  HOME="$SHIM_FIXTURE/home"
+  export OOSH_WORKTREE_BASE="$SHIM_FIXTURE/worktrees"
+
+  local result
+  result=$(private.oo.shim.findLatest)
+  HOME="$SAVE_SHIM_HOME"
+  export OOSH_WORKTREE_BASE="$SAVE_SHIM_OOSH_WORKTREE_BASE"
+
+  local name
+  name=$(basename "$result")
+  if [ "$name" = "feature" ]; then
+    create.result 0 "$name"
+  else
+    create.result 1 "expected feature got $name"
+  fi
+}
+test.case - "T-SHIM-8: findLatest uses OOSH_WORKTREE_BASE when main/ missing" \
+  test.oo.shim.worktreeBase
+expect 0 "feature" "findLatest delegates to OOSH_WORKTREE_BASE when no main/ sibling"
+rm -rf "$SHIM_FIXTURE"
+
+# ============================================================================
+# T-SETUP-1..4: oo.mode.setup tests
+# ============================================================================
+
+SETUP_FIXTURE="/tmp/test.oo.setup.$$"
+SAVE_SETUP_OOSH_DIR="$OOSH_DIR"
+SAVE_SETUP_OOSH_MODE="$OOSH_MODE"
+SAVE_SETUP_OOSH_COMPONENTS_DIR="$OOSH_COMPONENTS_DIR"
+SAVE_SETUP_PATH="$PATH"
+SAVE_SETUP_HOME="$HOME"
+
+# ============================================================================
+# T-SETUP-1: oo.mode.setup function exists
+# ============================================================================
+test.case $level "T-SETUP-1: oo.mode.setup function exists" \
+  type -t oo.mode.setup
+if type -t oo.mode.setup &>/dev/null; then
+  expect.pass "oo.mode.setup function exists"
+else
+  expect.fail "oo.mode.setup should be defined"
+fi
+
+# ============================================================================
+# T-SETUP-2: mode.setup rejects non-git directory
+# ============================================================================
+test.oo.setup.nonGit() {
+  mkdir -p "$SETUP_FIXTURE/nogit"
+  export OOSH_DIR="$SETUP_FIXTURE/nogit"
+  export OOSH_COMPONENTS_DIR="$SETUP_FIXTURE"
+  oo.mode.setup "$SETUP_FIXTURE" 2>/dev/null
+}
+expect.error 1
+test.case - "T-SETUP-2: mode.setup rejects non-git directory" \
+  test.oo.setup.nonGit
+expect 1 "*" "mode.setup returns error for directory without git"
+rm -rf "$SETUP_FIXTURE"
+export OOSH_DIR="$SAVE_SETUP_OOSH_DIR"
+export OOSH_MODE="$SAVE_SETUP_OOSH_MODE"
+export OOSH_COMPONENTS_DIR="$SAVE_SETUP_OOSH_COMPONENTS_DIR"
+export PATH="$SAVE_SETUP_PATH"
+
+# ============================================================================
+# T-SETUP-3: mode.setup detects already-set-up worktrees
+# ============================================================================
+test.oo.setup.alreadyExists() {
+  mkdir -p "$SETUP_FIXTURE/base/dev/.git" "$SETUP_FIXTURE/base/main/.git"
+  export OOSH_DIR="$SETUP_FIXTURE/base/dev"
+  export OOSH_COMPONENTS_DIR="$SETUP_FIXTURE/base"
+  # Pre-set mode base so oo.mode.base.get returns our fixture
+  config set oosh OOSH_COMPONENTS_DIR "$SETUP_FIXTURE/base" 2>/dev/null
+  local output
+  output=$(oo.mode.setup "$SETUP_FIXTURE/base" 2>&1)
+  local rc=$?
+  if [ $rc -eq 0 ] && echo "$output" | grep -qi "already exists"; then
+    create.result 0 "already exists detected"
+  else
+    create.result 1 "rc=$rc output=$output"
+  fi
+}
+test.case - "T-SETUP-3: mode.setup detects already-set-up worktrees" \
+  test.oo.setup.alreadyExists
+expect 0 "already exists detected" "mode.setup recognizes existing worktree structure"
+rm -rf "$SETUP_FIXTURE"
+export OOSH_DIR="$SAVE_SETUP_OOSH_DIR"
+export OOSH_MODE="$SAVE_SETUP_OOSH_MODE"
+export OOSH_COMPONENTS_DIR="$SAVE_SETUP_OOSH_COMPONENTS_DIR"
+export PATH="$SAVE_SETUP_PATH"
+config save oosh OOSH 2>/dev/null
+
+# ============================================================================
+# T-SETUP-4: mode.setup creates dev dir from plain clone
+# ============================================================================
+test.oo.setup.createDev() {
+  local CLONE_DIR="$SETUP_FIXTURE/repo"
+  local BASE_DIR="$SETUP_FIXTURE/base"
+  mkdir -p "$BASE_DIR"
+  # Create a real git repo on the dev branch
+  git init "$CLONE_DIR" >/dev/null 2>&1
+  (cd "$CLONE_DIR" && \
+   git config user.email "test@test" && git config user.name "test" && \
+   git checkout -b dev 2>/dev/null && \
+   git commit --allow-empty -m "init" >/dev/null 2>&1)
+
+  # Move clone into the base directory to simulate the plain clone layout
+  mv "$CLONE_DIR" "$BASE_DIR/oosh-clone"
+
+  export OOSH_DIR="$BASE_DIR/oosh-clone"
+  # Force OOSH_COMPONENTS_DIR to empty so mode.base.get won't find stale worktrees
+  export OOSH_COMPONENTS_DIR=""
+  config set oosh OOSH_COMPONENTS_DIR "" 2>/dev/null
+
+  HOME="$BASE_DIR"
+  # Create the symlink that mode.setup expects
+  ln -sf "$BASE_DIR/oosh-clone" "$BASE_DIR/oosh"
+
+  local output
+  output=$(oo.mode.setup "$BASE_DIR" 2>&1)
+  local rc=$?
+  HOME="$SAVE_SETUP_HOME"
+
+  if [ $rc -eq 0 ] && [ -d "$BASE_DIR/dev" ]; then
+    create.result 0 "dev dir created"
+  else
+    create.result 1 "rc=$rc dev_exists=$([ -d "$BASE_DIR/dev" ] && echo yes || echo no) output=$output"
+  fi
+}
+test.case - "T-SETUP-4: mode.setup creates dev dir from plain clone" \
+  test.oo.setup.createDev
+expect 0 "dev dir created" "mode.setup moves clone to dev/ directory"
+
+# Teardown setup fixture
+rm -rf "$SETUP_FIXTURE"
+export OOSH_DIR="$SAVE_SETUP_OOSH_DIR"
+export OOSH_MODE="$SAVE_SETUP_OOSH_MODE"
+export OOSH_COMPONENTS_DIR="$SAVE_SETUP_OOSH_COMPONENTS_DIR"
+export PATH="$SAVE_SETUP_PATH"
+HOME="$SAVE_SETUP_HOME"
+config save oosh OOSH 2>/dev/null
 
 test.suite.save.results

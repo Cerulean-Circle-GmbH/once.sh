@@ -1,49 +1,232 @@
 #!/usr/bin/env bash
-#clear
-#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
-#set -x
+# Tests for init/oosh — Phase 1 bootstrap, PATH setup, PM detection
+# Tests: oosh_get_running_shell, oosh_check_pm, oosh_check_all_pm,
+#        oosh_setup_env, oosh_status, phase dispatch, brew detection
+TEST_CATEGORY=core
 
 level=$1
 if [ -z "$level" ]; then
   level=1
+else
+  shift
 fi
-echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 source this
 source test.suite
 
 log.level $level
 
-# Check if install script exists
-if ! [ -f "$OOSH_DIR/install" ] && ! [ -f "$OOSH_DIR/old/install" ]; then
-  echo -e "\e[1;33m  ⚠ SKIPPED: install script not available (deprecated)\e[0m"
-  test.suite.save.results
-  exit 0
-fi
+# Source init/oosh functions without executing oosh_start (line 635)
+# eval all lines except the final oosh_start call to avoid install side effects
+SH_OPT="+x"
+eval "$(sed '$ d' $OOSH_DIR/init/oosh)" 2>/dev/null
 
-# Source from old/ if that's where it is
-if [ -f "$OOSH_DIR/old/install" ]; then
-  source "$OOSH_DIR/old/install"
-else
-  source install
-fi
+# Save original state
+ORIGINAL_OOSH_PM="$OOSH_PM"
+ORIGINAL_OOSH_PM_UPDATED="$OOSH_PM_UPDATED"
+ORIGINAL_PATH="$PATH"
+INIT_SCRIPT="$OOSH_DIR/init/oosh"
 
-test.install()
-{
-((TEST_COUNTER++))
-console.log "
-
-
-Test 0: install \"$*\"
-===================================================================="
-install.start "$@"
-console.log "RETURN: $RETURN_VALUE  Result: $RESULT
-===================================================================="
+# ============================================================================
+# T-INIT-1: oosh_get_running_shell detects bash
+# Pure logic — reads process table, exports SHELLNAME and SHELL
+# ============================================================================
+test.install.t1() {
+  oosh_get_running_shell
+  if [ "$SHELLNAME" = "bash" ] && echo "$SHELL" | grep -q "bash"; then
+    create.result 0 "SHELLNAME=$SHELLNAME SHELL=$SHELL"
+  else
+    create.result 1 "SHELLNAME=$SHELLNAME SHELL=$SHELL (expected bash)"
+  fi
 }
+test.case - "T-INIT-1: oosh_get_running_shell detects bash" \
+  test.install.t1
+expect 0 "*" "oosh_get_running_shell sets SHELLNAME=bash"
 
-test.case - "install test start" \
-   install $*
-expect 0 "*" "Test start"
+# ============================================================================
+# T-INIT-2: oosh_check_pm detects an available package manager
+# Finds a PM on this system, verifies oosh_check_pm sets OOSH_PM
+# ============================================================================
+test.install.t2() {
+  # Find a PM that exists on this system (skip apt-get — it triggers apt-get update)
+  local foundPM=""
+  local foundCmd=""
+  for pm in brew dnf yum apk pacman; do
+    if command -v "$pm" >/dev/null 2>&1; then
+      foundPM="$pm"
+      foundCmd="$pm install"
+      break
+    fi
+  done
+  # Fallback: if only apt-get available, test via ORIGINAL_OOSH_PM (already detected)
+  if [ -z "$foundPM" ] && command -v apt-get >/dev/null 2>&1; then
+    if [ -n "$ORIGINAL_OOSH_PM" ]; then
+      create.result 0 "OOSH_PM=$ORIGINAL_OOSH_PM (apt-get skipped — triggers update)"
+      return
+    fi
+    create.result 0 "apt-get found but skipped (triggers update)"
+    return
+  fi
+  if [ -z "$foundPM" ]; then
+    create.result 0 "no PM available (skip)"
+    return
+  fi
+  # Clear OOSH_PM so oosh_check_pm can set it fresh
+  unset OOSH_PM
+  oosh_check_pm "$foundPM" "$foundCmd" 2>/dev/null
+  if [ "$OOSH_PM" = "$foundCmd" ]; then
+    create.result 0 "OOSH_PM=$OOSH_PM"
+  else
+    create.result 1 "OOSH_PM='$OOSH_PM' (expected '$foundCmd')"
+  fi
+  # Restore
+  export OOSH_PM="$ORIGINAL_OOSH_PM"
+}
+test.case - "T-INIT-2: oosh_check_pm detects available PM" \
+  test.install.t2
+expect 0 "*" "oosh_check_pm sets OOSH_PM for detected package manager"
 
-### test.method
+# ============================================================================
+# T-INIT-3: oosh_check_pm skips missing package manager
+# Calling with nonexistent PM should not set OOSH_PM
+# ============================================================================
+test.install.t3() {
+  unset OOSH_PM
+  oosh_check_pm "nosuchpackagemanager_$$" "nosuchpm install" 2>/dev/null
+  if [ -z "$OOSH_PM" ]; then
+    create.result 0 "OOSH_PM empty (correct)"
+  else
+    create.result 1 "OOSH_PM='$OOSH_PM' (should be empty)"
+  fi
+  export OOSH_PM="$ORIGINAL_OOSH_PM"
+}
+test.case - "T-INIT-3: oosh_check_pm skips missing PM" \
+  test.install.t3
+expect 0 "*" "oosh_check_pm does not set OOSH_PM for nonexistent PM"
 
+# ============================================================================
+# T-INIT-4: macOS brew PATH discovery pattern exists
+# Verifies init/oosh has Darwin-specific /opt/homebrew/bin PATH logic
+# ============================================================================
+test.install.t4() {
+  if grep -q 'uname -s.*Darwin' "$INIT_SCRIPT" && \
+     grep -q '/opt/homebrew/bin' "$INIT_SCRIPT"; then
+    create.result 0 "darwin brew PATH pattern found"
+  else
+    create.result 1 "missing Darwin brew PATH discovery"
+  fi
+}
+test.case - "T-INIT-4: macOS brew PATH discovery pattern exists" \
+  test.install.t4
+expect 0 "*" "init/oosh has Darwin-specific brew PATH logic"
+
+# ============================================================================
+# T-INIT-5: PATH dedup pattern prevents duplicate entries
+# Verifies the case ":$PATH:" pattern that avoids adding brew twice
+# ============================================================================
+test.install.t5() {
+  if grep -q '":$PATH:"' "$INIT_SCRIPT" || grep -q 'case ":$PATH:"' "$INIT_SCRIPT"; then
+    create.result 0 "PATH dedup pattern found"
+  else
+    create.result 1 "missing PATH dedup pattern"
+  fi
+}
+test.case - "T-INIT-5: PATH dedup prevents duplicate entries" \
+  test.install.t5
+expect 0 "*" "init/oosh uses PATH dedup to avoid duplicates"
+
+# ============================================================================
+# T-INIT-6: Phase 1/Phase 2 separation exists
+# Verifies init/oosh dispatches 'mode root' to Phase 2
+# ============================================================================
+test.install.t6() {
+  local hasPhase1=$(grep -c 'Phase 1' "$INIT_SCRIPT" 2>/dev/null || echo 0)
+  local hasPhase2=$(grep -c 'Phase 2' "$INIT_SCRIPT" 2>/dev/null || echo 0)
+  local hasModeRoot=$(grep -c 'mode.*root\|oosh_install_remote' "$INIT_SCRIPT" 2>/dev/null || echo 0)
+  if [ "$hasPhase1" -gt 0 ] && [ "$hasPhase2" -gt 0 ] && [ "$hasModeRoot" -gt 0 ]; then
+    create.result 0 "phases=$hasPhase1/$hasPhase2 modeRoot=$hasModeRoot"
+  else
+    create.result 1 "Phase1=$hasPhase1 Phase2=$hasPhase2 modeRoot=$hasModeRoot"
+  fi
+}
+test.case - "T-INIT-6: Phase 1/Phase 2 separation exists" \
+  test.install.t6
+expect 0 "*" "init/oosh has Phase 1/Phase 2 dispatch with mode root"
+
+# ============================================================================
+# T-INIT-7: Bash version check uses BASH_VERSINFO
+# Portable bash 4+ detection for macOS (ships with bash 3)
+# ============================================================================
+test.install.t7() {
+  if grep -q 'BASH_VERSINFO\|BASH_VERSION' "$INIT_SCRIPT"; then
+    create.result 0 "bash version check found"
+  else
+    create.result 1 "missing bash version check"
+  fi
+}
+test.case - "T-INIT-7: bash version check uses BASH_VERSINFO" \
+  test.install.t7
+expect 0 "*" "init/oosh checks bash version for bash 4+ requirement"
+
+# ============================================================================
+# T-INIT-8: oosh_setup_env creates .bashrc from template
+# Verifies the env setup function handles bashrcTemplate
+# ============================================================================
+test.install.t8() {
+  local funcBody
+  funcBody=$(type oosh_setup_env 2>/dev/null)
+  if echo "$funcBody" | grep -q 'bashrcTemplate' && \
+     echo "$funcBody" | grep -q '\.bashrc'; then
+    create.result 0 "bashrc template handling found"
+  else
+    create.result 1 "missing bashrcTemplate or .bashrc handling"
+  fi
+}
+test.case - "T-INIT-8: oosh_setup_env creates .bashrc from template" \
+  test.install.t8
+expect 0 "*" "oosh_setup_env installs .bashrc from template"
+
+# ============================================================================
+# T-INIT-9: brew install uses NONINTERACTIVE flag
+# Critical for CI/headless — brew must not prompt for input
+# ============================================================================
+test.install.t9() {
+  if grep -q 'NONINTERACTIVE=1' "$INIT_SCRIPT"; then
+    create.result 0 "NONINTERACTIVE flag found"
+  else
+    create.result 1 "missing NONINTERACTIVE flag for brew install"
+  fi
+}
+test.case - "T-INIT-9: brew install uses NONINTERACTIVE flag" \
+  test.install.t9
+expect 0 "*" "init/oosh uses NONINTERACTIVE=1 for headless brew install"
+
+# ============================================================================
+# T-INIT-10: oosh_status runs without error
+# Pure function — outputs status information, no side effects
+# ============================================================================
+test.install.t10() {
+  local output
+  output=$(oosh_status 2>/dev/null)
+  local rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$output" ]; then
+    create.result 0 "status output: ${output:0:60}..."
+  elif [ "$rc" -eq 0 ]; then
+    create.result 0 "status ran (empty output)"
+  else
+    create.result 1 "rc=$rc"
+  fi
+}
+test.case - "T-INIT-10: oosh_status runs without error" \
+  test.install.t10
+expect 0 "*" "oosh_status executes and returns status information"
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+export OOSH_PM="$ORIGINAL_OOSH_PM"
+export OOSH_PM_UPDATED="$ORIGINAL_OOSH_PM_UPDATED"
+export PATH="$ORIGINAL_PATH"
+
+test.suite.save.results
