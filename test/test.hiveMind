@@ -3406,6 +3406,103 @@ RROLES
   [ -f "$REG_FILE" ] && grep -v 'test-puller-' "$REG_FILE" > "${REG_FILE}.ar_clean" 2>/dev/null && mv "${REG_FILE}.ar_clean" "$REG_FILE"
   rm -rf "$RESTART_FIXTURE"
 
+  # T-ARESTART-8: Dotted hostname → session name must be tmux-safe
+  # Real bug: /tmp/hivemind.UpDown.ai/ → hostName=UpDown.ai → session "UpDown.ai.sess"
+  # tmux interprets dots as window.pane separators → "can't find session"
+  DOT_FIXTURE="/tmp/hivemind.__test_dot_my.server.com_$$"
+  DOT_SESS="__test_dotsess_$$"
+  mkdir -p "$DOT_FIXTURE"
+  cat > "$DOT_FIXTURE/hivemind.snapshot.env" <<DOTSNAP
+# hiveMind snapshot dot-test
+# session|address|role|uuid|title
+${DOT_SESS}|0.0|dot-tester||dot-tester
+DOTSNAP
+  cat > "$DOT_FIXTURE/hivemind.roles.env" <<DOTROLES
+${DOT_SESS}:0.0|dot-tester
+DOTROLES
+
+  # Pre-create session to force collision path → hostName prefix applied
+  otmux new "$DOT_SESS" 2>/dev/null
+  test.case $level "T-ARESTART-8: dotted hostname does not break tmux session creation" \
+    echo "testing dotted hostname collision"
+  AR8_OUTPUT=$(hiveMind.agent.restart "$DOT_FIXTURE" "dot-tester" 2>&1)
+  AR8_RC=$?
+  if [ "$AR8_RC" -eq 0 ]; then
+    # Check that session was actually created (not just rc=0 with tmux error)
+    AR8_SESSIONS=$(tmux list-sessions 2>/dev/null | grep -c "dot-tester\|dotsess" || true)
+    if [ "$AR8_SESSIONS" -ge 1 ]; then
+      expect.pass "session created despite dotted hostname"
+    else
+      expect.fail "rc=0 but no session found — dots in hostname likely broke tmux"
+    fi
+  else
+    # Check if failure message mentions session/dot issue
+    if echo "$AR8_OUTPUT" | grep -qi "session\|find\|dot"; then
+      expect.fail "dotted hostname broke session creation: $AR8_OUTPUT"
+    else
+      expect.fail "agent.restart failed (rc=$AR8_RC): $AR8_OUTPUT"
+    fi
+  fi
+  # Cleanup dot test
+  otmux kill "$DOT_SESS" 2>/dev/null
+  tmux list-sessions 2>/dev/null | grep "my.server.com\|dotsess" | cut -d: -f1 | while read s; do tmux kill-session -t "$s" 2>/dev/null; done
+  [ -f "$REG_FILE" ] && grep -v 'dot-tester' "$REG_FILE" > "${REG_FILE}.dot_clean" 2>/dev/null && mv "${REG_FILE}.dot_clean" "$REG_FILE"
+  rm -rf "$DOT_FIXTURE"
+
+  # T-ARESTART-9: JSONL lookup actually finds files when present
+  JSONL_FIXTURE="/tmp/hivemind.__test_jsonl_$$"
+  JSONL_SESS="__test_jsonlsess_$$"
+  JSONL_UUID="deadbeef-1234-5678-9abc-def012345678"
+  mkdir -p "$JSONL_FIXTURE"
+  cat > "$JSONL_FIXTURE/hivemind.snapshot.env" <<JSNAP
+# hiveMind snapshot jsonl-test
+# session|address|role|uuid|title
+${JSONL_SESS}|0.0|jsonl-tester|${JSONL_UUID}|jsonl-tester
+JSNAP
+  cat > "$JSONL_FIXTURE/hivemind.roles.env" <<JROLES
+${JSONL_SESS}:0.0|jsonl-tester
+JROLES
+  # Create a fake JSONL in a claude projects dir so the lookup finds it
+  JSONL_PROJECT_DIR="$HOME/.claude/projects/__test_jsonl_project_$$"
+  mkdir -p "$JSONL_PROJECT_DIR"
+  echo '{"type":"test"}' > "$JSONL_PROJECT_DIR/${JSONL_UUID}.jsonl"
+
+  test.case $level "T-ARESTART-9: JSONL present → agent.restart forks (not fresh)" \
+    echo "testing JSONL lookup"
+  AR9_OUTPUT=$(hiveMind.agent.restart "$JSONL_FIXTURE" "jsonl-tester" 2>&1)
+  AR9_RC=$?
+  if echo "$AR9_OUTPUT" | grep -q "fork"; then
+    expect.pass "agent.restart chose fork path when JSONL exists"
+  elif echo "$AR9_OUTPUT" | grep -q "fresh\|no JSONL"; then
+    expect.fail "JSONL exists at $JSONL_PROJECT_DIR/${JSONL_UUID}.jsonl but agent.restart chose fresh start"
+  else
+    expect.fail "unexpected output: $AR9_OUTPUT"
+  fi
+
+  # T-ARESTART-10: JSONL absent → agent.restart starts fresh
+  NOJSONL_UUID="00000000-0000-0000-0000-000000000000"
+  cat > "$JSONL_FIXTURE/hivemind.snapshot.env" <<NJSNAP
+# hiveMind snapshot no-jsonl-test
+# session|address|role|uuid|title
+${JSONL_SESS}|0.0|jsonl-tester|${NOJSONL_UUID}|jsonl-tester
+NJSNAP
+  otmux kill "$JSONL_SESS" 2>/dev/null
+  test.case $level "T-ARESTART-10: no JSONL → agent.restart starts fresh" \
+    echo "testing missing JSONL"
+  AR10_OUTPUT=$(hiveMind.agent.restart "$JSONL_FIXTURE" "jsonl-tester" 2>&1)
+  if echo "$AR10_OUTPUT" | grep -q "fresh\|no JSONL\|no UUID"; then
+    expect.pass "agent.restart chose fresh start when JSONL missing"
+  elif echo "$AR10_OUTPUT" | grep -q "fork"; then
+    expect.fail "no JSONL for $NOJSONL_UUID but agent.restart tried to fork"
+  else
+    expect.pass "agent.restart completed (output: $AR10_OUTPUT)"
+  fi
+
+  # Cleanup JSONL tests
+  otmux kill "$JSONL_SESS" 2>/dev/null
+  rm -rf "$JSONL_FIXTURE" "$JSONL_PROJECT_DIR"
+  [ -f "$REG_FILE" ] && grep -v 'jsonl-tester' "$REG_FILE" > "${REG_FILE}.jsonl_clean" 2>/dev/null && mv "${REG_FILE}.jsonl_clean" "$REG_FILE"
+
 else
   test.case $level "T-ARESTART-6: single-role restart (skipped — no tmux)" echo "skip"
   expect.pass "skipped — tmux not available"
@@ -3414,6 +3511,12 @@ else
   test.case $level "T-ARESTART-6c: only requested role (skipped)" echo "skip"
   expect.pass "skipped"
   test.case $level "T-ARESTART-7: collision handling (skipped)" echo "skip"
+  expect.pass "skipped"
+  test.case $level "T-ARESTART-8: dotted hostname (skipped)" echo "skip"
+  expect.pass "skipped"
+  test.case $level "T-ARESTART-9: JSONL fork (skipped)" echo "skip"
+  expect.pass "skipped"
+  test.case $level "T-ARESTART-10: no JSONL fresh (skipped)" echo "skip"
   expect.pass "skipped"
 fi
 
