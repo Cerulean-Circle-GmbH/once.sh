@@ -69,6 +69,8 @@ ossh login mycontainer
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `exec <container>` | container name, optional shell (default: bash) | Shell into running container |
+| `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
+| `create <image>` | image name, optional container name | Create container without starting |
 | `stop <container>` | container name | Stop a running container |
 | `rm <container>` | container name | Remove a stopped container |
 | `log <container>` | container name, optional line count (default: 50) | Show container logs |
@@ -81,12 +83,22 @@ ossh login mycontainer
 | `rmi <image>` | image name | Remove an image |
 | `file.find <containerOrImage>` | container or image name | Find the Dockerfile that built a container or image |
 
+### Docker Compose
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `compose` | optional service name | Show compose status or service details |
+| `up` | optional service name | Start compose services (detached) |
+| `down` | optional service name | Stop compose services |
+
 ### Status & Maintenance
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `ps` | | List running containers |
+| `list.running` | | List running containers (alias for ps) |
 | `status` | | Show Docker overview: images, containers, disk usage |
+| `lifecycle` | | Check health of containers, images, and compose services |
 | `disk` | | Show Docker disk usage details |
 | `prune` | | Remove dangling images and stopped containers |
 | `prune.all` | | Full system prune including unused images and volumes |
