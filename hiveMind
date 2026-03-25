@@ -1983,25 +1983,129 @@ hiveMind.team.pull() # <host> # pull team config from remote machine
   echo -e "  Config files: ${BOLD_WHITE}hivemind.roles.env, hivemind.sessions.env, hivemind.snapshot.env${NORMAL}"
   echo -e "  JSONL files:  ${BOLD_WHITE}$transferCount${NORMAL} transferred"
   echo ""
-  echo "Restart agents with: hiveMind agent.restart $pullDir"
+  echo "Restart one:  hiveMind agent.restart $pullDir <role>"
+  echo "Restart all:  hiveMind team.restart $pullDir"
 }
 hiveMind.team.pull.completion.host() {
   grep '^Host ' ~/.ssh/config ~/.ssh/config.d/* 2>/dev/null | sed 's/.*Host //' | grep -v '^\*'
 }
 
-hiveMind.agent.restart() # <configDir> # restart agents locally from pulled config directory
+hiveMind.agent.restart() # <configDir> <role> # restart single agent from pulled config
+{
+  local pullDir="$1"
+  local targetRole="$2"
+
+  if [ -z "$pullDir" ] || [ ! -f "$pullDir/hivemind.snapshot.env" ]; then
+    error.log "Usage: hiveMind agent.restart <configDir> <role>"
+    echo "  Available dirs: $(ls -d /tmp/hivemind.*/ "${CONFIG_PATH:-$HOME/config}"/hivemind.*/ 2>/dev/null | grep -v '__test_' | tr '\n' ' ')"
+    return 1
+  fi
+
+  if [ -z "$targetRole" ]; then
+    error.log "Usage: hiveMind agent.restart <configDir> <role>"
+    echo "  Available roles in $pullDir:"
+    while IFS='|' read -r sess addr role uuid title; do
+      [[ "$sess" == "#"* ]] && continue
+      [ -z "$role" ] && continue
+      echo "    $role"
+    done < "$pullDir/hivemind.snapshot.env"
+    return 1
+  fi
+
+  # Find matching line in snapshot
+  local matchLine=""
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ "$role" = "$targetRole" ] && matchLine="${sess}|${addr}|${role}|${uuid}|${title}" && break
+  done < "$pullDir/hivemind.snapshot.env"
+
+  if [ -z "$matchLine" ]; then
+    error.log "Role '$targetRole' not found in $pullDir/hivemind.snapshot.env"
+    return 1
+  fi
+
+  local sess addr role uuid title
+  IFS='|' read -r sess addr role uuid title <<< "$matchLine"
+
+  local hostName
+  hostName=$(basename "$pullDir" | sed 's/^hivemind\.//')
+
+  # Session naming: prefix with host if collision with existing different session
+  local localSess="$sess"
+  if otmux has "$sess" 2>/dev/null; then
+    # Check if it's a different team (not ours)
+    local existingDesc
+    existingDesc=$(hiveMind.team.active 2>/dev/null)
+    if [ "$existingDesc" != "$sess" ]; then
+      localSess="${hostName}.${sess}"
+    fi
+  fi
+
+  # Create session if needed
+  if ! otmux has "$localSess" 2>/dev/null; then
+    echo "  Creating session: $localSess"
+    otmux new "$localSess" 2>/dev/null
+  fi
+
+  local paneTarget="${localSess}:${addr}"
+
+  # Create pane
+  private.hiveMind.ensure.pane "$paneTarget"
+
+  # Set identity
+  if [ -n "$role" ] && [ "$role" != "unknown" ]; then
+    private.hiveMind.pane.identify "$paneTarget" "$role"
+  fi
+
+  # Fork session if UUID available
+  if [ -n "$uuid" ]; then
+    local hasJsonl=""
+    for d in "$HOME/.claude/projects"/*/; do
+      [ -f "${d}${uuid}.jsonl" ] && hasJsonl="yes" && break
+    done
+
+    if [ "$hasJsonl" = "yes" ]; then
+      echo -e "  ${BOLD_WHITE}${role}${NORMAL} → fork ${uuid:0:8}... in ${paneTarget}"
+      otmux send.enter "$paneTarget" "claudeCode fork $uuid"
+    else
+      echo -e "  ${BOLD_WHITE}${role}${NORMAL} → ${BOLD_YELLOW}no JSONL, starting fresh${NORMAL} in ${paneTarget}"
+      otmux send.enter "$paneTarget" "claudeCode opus"
+    fi
+  else
+    echo -e "  ${BOLD_WHITE}${role}${NORMAL} → ${GRAY}no UUID, starting fresh${NORMAL} in ${paneTarget}"
+    otmux send.enter "$paneTarget" "claudeCode opus"
+  fi
+
+  # Register in local registry
+  private.hiveMind.registry.set "$paneTarget" "$role"
+
+  success.log "Restarted $role in $paneTarget"
+}
+hiveMind.agent.restart.completion.configDir() {
+  ls -d /tmp/hivemind.*/ "${CONFIG_PATH:-$HOME/config}"/hivemind.*/ 2>/dev/null | grep -v '__test_'
+}
+hiveMind.agent.restart.completion.role() {
+  local pullDir="$1"
+  [ -f "$pullDir/hivemind.snapshot.env" ] || return
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -n "$role" ] && echo "$role"
+  done < "$pullDir/hivemind.snapshot.env"
+}
+
+hiveMind.team.restart() # <configDir> # restart ALL agents from pulled config directory
 {
   local pullDir="$1"
   if [ -z "$pullDir" ] || [ ! -f "$pullDir/hivemind.snapshot.env" ]; then
-    error.log "Usage: hiveMind agent.restart <configDir>"
+    error.log "Usage: hiveMind team.restart <configDir>"
     echo "  Available: $(ls -d /tmp/hivemind.*/ "${CONFIG_PATH:-$HOME/config}"/hivemind.*/ 2>/dev/null | grep -v '__test_' | tr '\n' ' ')"
     return 1
   fi
 
   local hostName
-  hostName=$(basename "$pullDir" | sed 's/^hivemind\.pull\.//')
+  hostName=$(basename "$pullDir" | sed 's/^hivemind\.//')
 
-  echo -e "${BOLD_CYAN}Restarting agents from $pullDir${NORMAL}"
+  echo -e "${BOLD_CYAN}Restarting ALL agents from $pullDir${NORMAL}"
 
   local prevSess="" agentCount=0
 
@@ -2036,7 +2140,6 @@ hiveMind.agent.restart() # <configDir> # restart agents locally from pulled conf
 
     # Fork session if UUID available
     if [ -n "$uuid" ]; then
-      # Verify JSONL exists locally
       local hasJsonl=""
       for d in "$HOME/.claude/projects"/*/; do
         [ -f "${d}${uuid}.jsonl" ] && hasJsonl="yes" && break
@@ -2065,7 +2168,7 @@ hiveMind.agent.restart() # <configDir> # restart agents locally from pulled conf
   success.log "Restarted $agentCount agents from $hostName"
   echo "Check with: hiveMind team.status $prevSess"
 }
-hiveMind.agent.restart.completion.configDir() {
+hiveMind.team.restart.completion.configDir() {
   ls -d /tmp/hivemind.*/ "${CONFIG_PATH:-$HOME/config}"/hivemind.*/ 2>/dev/null | grep -v '__test_'
 }
 
