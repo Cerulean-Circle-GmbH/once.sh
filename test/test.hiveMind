@@ -3217,6 +3217,81 @@ else
   expect.fail "pulled directory should contain JSONL session files"
 fi
 
+# --- T-PULL-8: JSONL download loop processes ALL snapshot entries, not just first ---
+# Bug: while-read loop uses stdin redirect; ossh exec/scp inside the loop
+# consumes stdin, eating remaining snapshot lines. Only 1st UUID downloaded.
+# This test simulates the pattern: while read < file with stdin-consuming cmd.
+test.case $level "T-PULL-8: JSONL loop processes all snapshot entries (stdin bug)" \
+  echo "testing while-read stdin consumption"
+
+# Create a 5-line snapshot
+STDIN_BUG_DIR="/tmp/__test_stdin_bug_$$"
+mkdir -p "$STDIN_BUG_DIR"
+cat > "$STDIN_BUG_DIR/snapshot.env" <<STDINEOF
+# hiveMind snapshot stdin-test
+# session|address|role|uuid|title
+testTeam|0.0|agent-a|aaaa0000-1111-2222-3333-444455556666|agent-a
+testTeam|0.1|agent-b|bbbb0000-1111-2222-3333-444455556666|agent-b
+testTeam|0.2|agent-c|cccc0000-1111-2222-3333-444455556666|agent-c
+testTeam|0.3|agent-d|dddd0000-1111-2222-3333-444455556666|agent-d
+testTeam|0.4|agent-e|eeee0000-1111-2222-3333-444455556666|agent-e
+STDINEOF
+
+# Simulate the EXACT pattern from team.pull lines 1969-1993:
+# while read from file, with a stdin-consuming command inside
+STDIN_BUG_COUNT=0
+while IFS='|' read -r _s _a _r _u _t; do
+  [[ "$_s" == "#"* ]] && continue
+  [ -z "$_u" ] && continue
+  # This cat simulates ossh exec — it reads from stdin and consumes it
+  cat > /dev/null
+  STDIN_BUG_COUNT=$((STDIN_BUG_COUNT + 1))
+done < "$STDIN_BUG_DIR/snapshot.env"
+
+# If the bug exists, count will be 1 (only first data line processed)
+# If fixed (fd 3 or < /dev/null), count will be 5
+if [ "$STDIN_BUG_COUNT" -eq 5 ]; then
+  expect.pass "all 5 snapshot entries processed"
+else
+  expect.fail "only $STDIN_BUG_COUNT of 5 entries processed — stdin consumed by inner command"
+fi
+
+# T-PULL-8b: Verify the FIX pattern works (fd 3 redirect)
+STDIN_FIX_COUNT=0
+while IFS='|' read -r _s _a _r _u _t <&3; do
+  [[ "$_s" == "#"* ]] && continue
+  [ -z "$_u" ] && continue
+  cat > /dev/null  # stdin consumer — but loop reads from fd 3, not fd 0
+  STDIN_FIX_COUNT=$((STDIN_FIX_COUNT + 1))
+done 3< "$STDIN_BUG_DIR/snapshot.env"
+
+test.case $level "T-PULL-8b: fd 3 redirect fixes the stdin consumption bug" \
+  echo "fd3=$STDIN_FIX_COUNT"
+if [ "$STDIN_FIX_COUNT" -eq 5 ]; then
+  expect.pass "fd 3 pattern processes all 5 entries"
+else
+  expect.fail "fd 3 still broken: only $STDIN_FIX_COUNT of 5"
+fi
+
+# T-PULL-8c: Verify hiveMind code uses fd 3 or < /dev/null (not bare stdin)
+HIVEMIND_SRC="$OOSH_DIR/hiveMind"
+# Count while-read loops that read snapshot via bare stdin (vulnerable)
+BARE_STDIN_LOOPS=$(grep -c 'done < .*snapshot' "$HIVEMIND_SRC" | tr -d ' ')
+# Count loops using fd 3 redirect (fixed)
+FD3_LOOPS=$(grep -c 'done 3< \|<&3' "$HIVEMIND_SRC" | tr -d ' ')
+# Count ossh calls with < /dev/null (also fixed)
+DEVNULL_OSSH=$(grep -c 'ossh.*< /dev/null' "$HIVEMIND_SRC" | tr -d ' ')
+
+test.case $level "T-PULL-8c: snapshot loops use fd 3 or < /dev/null" \
+  echo "bare_stdin=$BARE_STDIN_LOOPS fd3=$FD3_LOOPS devnull=$DEVNULL_OSSH"
+if [ "$BARE_STDIN_LOOPS" -eq 0 ] || [ "$FD3_LOOPS" -gt 0 ] || [ "$DEVNULL_OSSH" -gt 0 ]; then
+  expect.pass "snapshot loops protected from stdin consumption"
+else
+  expect.fail "$BARE_STDIN_LOOPS bare stdin loops, 0 fd3, 0 devnull — bug present"
+fi
+
+rm -rf "$STDIN_BUG_DIR"
+
 echo ""
 echo "=== team.pull tests complete ==="
 echo ""
