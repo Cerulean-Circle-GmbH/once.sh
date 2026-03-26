@@ -12,7 +12,10 @@ The `odocker` script wraps Docker commands following oosh conventions: positiona
 
 ```bash
 # Set DockerWorkspaces path (persists in ~/config/user.env)
-config set ODOCKER_WORKSPACES "/var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces"
+odocker workspace.set "/path/to/DockerWorkspaces"
+
+# Show current workspace directory
+odocker workspace.get
 
 # Default (if not set): /var/dev/EAMD.ucp/.../DockerWorkspaces
 ```
@@ -46,6 +49,8 @@ ossh login mycontainer
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
+| `workspace.get` | | Show current Docker workspaces directory |
+| `workspace.set <path>` | directory path | Set and persist Docker workspaces directory |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
 
 ### Build
@@ -88,8 +93,8 @@ ossh login mycontainer
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `compose` | optional service name | Show compose status or service details |
-| `up` | optional service name | Start compose services (detached) |
-| `down` | optional service name | Stop compose services |
+| `up <container>` | container or service name | Start a container or compose service |
+| `down <container>` | container or service name | Stop a container or compose service |
 
 ### Status & Maintenance
 
@@ -97,6 +102,8 @@ ossh login mycontainer
 |--------|-----------|-------------|
 | `ps` | | List running containers |
 | `list.running` | | List running containers (alias for ps) |
+| `container.list` | | List all containers (running and stopped) |
+| `image.list` | | List all images |
 | `status` | | Show Docker overview: images, containers, disk usage |
 | `lifecycle` | | Check health of containers, images, and compose services |
 | `disk` | | Show Docker disk usage details |
