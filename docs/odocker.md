@@ -93,7 +93,7 @@ ossh login mycontainer
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `compose` | optional service name | Show compose status or service details |
-| `up <container>` | container or service name | Start a container or compose service |
+| `up <container>` | container, image, or service name | Start a container, run an image (detached), or start a compose service |
 | `down <container>` | container or service name | Stop a container or compose service |
 
 ### Status & Maintenance
