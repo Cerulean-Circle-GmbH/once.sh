@@ -209,6 +209,12 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   # Install oosh as root — auto-creates "test" user via user.create
   ossh install "$rootConfig" test
 
+  # Configure passwordless sudo for test user (container is ephemeral)
+  ossh exec "$rootConfig" "echo 'test ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers"
+
+  # Set password for test user (needed for sshpass connection)
+  ossh exec "$rootConfig" "echo 'test:test' | chpasswd"
+
   # Close root connection
   ossh connection.close "$rootConfig" 2>/dev/null
 
