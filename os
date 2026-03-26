@@ -186,64 +186,65 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   odocker reset "$imageTag" "$sshPort"
   sleep 2
 
-  # SSH setup
-  ossh config.create "$platform" "test@localhost:$sshPort"
+  # SSH setup — connect as root for initial install
+  local rootConfig="${platform}_root"
+  local userConfig="${platform}_test"
+  ossh config.create "$rootConfig" "root@localhost:$sshPort"
   ossh config.save.last
-  # Clean up any stale ControlMaster socket from a previous test run
-  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
-  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+  # Clean up any stale ControlMaster sockets from a previous test run
+  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$rootConfig" 2>/dev/null
+  rm -f "/tmp/ossh-root@localhost:$sshPort" 2>/dev/null
 
-  # Open ControlMaster with sshpass (first connection, no keys yet)
-  # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
-  SSHPASS=test sshpass -e ssh \
+  # Open ControlMaster as root with sshpass
+  SSHPASS=root sshpass -e ssh \
     -o ControlMaster=yes \
     -o ControlPath="$OSSH_CONTROL_PATH" \
     -o ControlPersist=600 \
     -o StrictHostKeyChecking=accept-new \
-    "$platform" true
+    "$rootConfig" true
 
-  # Push key — reuses ControlMaster socket, no password prompt
-  ossh key.push "$platform"
+  # Push key to root
+  ossh key.push "$rootConfig"
 
-  # Configure passwordless sudo for automated testing (container is ephemeral)
-  # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
-  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
+  # Install oosh as root — auto-creates "test" user via user.create
+  ossh install "$rootConfig" test
 
-  # Install oosh
-  ossh install "$platform" test
+  # Close root connection
+  ossh connection.close "$rootConfig" 2>/dev/null
 
-  # Refresh ControlMaster so new sessions pick up dev group membership
-  # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
-  ossh connection.close "$platform" 2>/dev/null
+  # Create SSH config for test user and connect
+  ossh config.create "$userConfig" "test@localhost:$sshPort"
+  ossh config.save.last
   rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
   SSHPASS=test sshpass -e ssh \
     -o ControlMaster=yes \
     -o ControlPath="$OSSH_CONTROL_PATH" \
     -o ControlPersist=600 \
     -o StrictHostKeyChecking=accept-new \
-    "$platform" true
+    "$userConfig" true
 
   # Run user tests first (clean shared config state)
   console.log "Running core tests as user test..."
   local userLog="/tmp/oosh-platform-test-user-$platform.log"
-  ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$userLog"
+  ossh exec "$userConfig" "test.suite core 1" 2>&1 | tee "$userLog"
   local rcUser=${PIPESTATUS[0]}
 
-  # Run tests as root (needs -tt for sudo TTY)
+  # Run tests as root via sudo from test user
   console.log "Running core tests as root..."
   local rootLog="/tmp/oosh-platform-test-root-$platform.log"
-  ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
+  ossh exec.tty "$userConfig" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
   local rcRoot=${PIPESTATUS[0]}
 
   # Interactive terminal — drop into shell before cleanup
   if [ -n "$terminal" ]; then
     console.log "Opening interactive terminal on $platform..."
     console.log "Type 'exit' to end the session and clean up."
-    ossh exec.tty "$platform" "bash -l"
+    ossh exec.tty "$userConfig" "bash -l"
   fi
 
   # Cleanup
-  ossh connection.close "$platform" 2>/dev/null
+  ossh connection.close "$userConfig" 2>/dev/null
+  ossh connection.close "$rootConfig" 2>/dev/null
   private.os.platform.cleanup "$sshPort"
 
   if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
