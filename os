@@ -184,32 +184,9 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
 
   # Fresh container
   odocker reset "$imageTag" "$sshPort"
-
-  # Create test user via odocker exec (oosh not yet on container)
-  local containerName
-  containerName=$(docker ps --filter "publish=$sshPort" --format '{{.Names}}' 2>/dev/null | head -1)
-  if [ -n "$containerName" ]; then
-    # Enable SSH password auth and create test user
-    odocker exec "$containerName" sh -c "
-      echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
-      echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
-      kill -HUP 1 2>/dev/null || true
-    "
-    # Create user — platform-appropriate command
-    odocker exec "$containerName" sh -c "
-      if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ]; then
-        _useradd=\$(command -v useradd 2>/dev/null || echo /usr/sbin/useradd)
-        \$_useradd -m -s /bin/bash -G root test 2>/dev/null
-      elif command -v adduser >/dev/null 2>&1; then
-        adduser -s /bin/bash -h /home/test -D test 2>/dev/null
-      fi
-      echo 'test:test' | chpasswd
-      echo 'test ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
-    "
-  fi
   sleep 2
 
-  # SSH setup — connect as test user (old flow)
+  # SSH setup
   ossh config.create "$platform" "test@localhost:$sshPort"
   ossh config.save.last
   # Clean up any stale ControlMaster socket from a previous test run
@@ -217,6 +194,7 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
 
   # Open ControlMaster with sshpass (first connection, no keys yet)
+  # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
   SSHPASS=test sshpass -e ssh \
     -o ControlMaster=yes \
     -o ControlPath="$OSSH_CONTROL_PATH" \
@@ -227,10 +205,15 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   # Push key — reuses ControlMaster socket, no password prompt
   ossh key.push "$platform"
 
+  # Configure passwordless sudo for automated testing (container is ephemeral)
+  # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
+  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
+
   # Install oosh
   ossh install "$platform" test
 
   # Refresh ControlMaster so new sessions pick up dev group membership
+  # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
   ossh connection.close "$platform" 2>/dev/null
   rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
   SSHPASS=test sshpass -e ssh \
