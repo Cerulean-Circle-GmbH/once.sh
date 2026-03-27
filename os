@@ -185,83 +185,82 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   # Fresh container
   odocker reset "$imageTag" "$sshPort"
 
-  # Configure sshd for root login (docker exec — oosh not yet installed on container)
-  local containerId
-  containerId=$(docker ps -q --filter "publish=$sshPort" 2>/dev/null | head -1)
-  if [ -n "$containerId" ]; then
-    docker exec "$containerId" sh -c "
+  # Create test user via odocker exec (oosh not yet on container)
+  local containerName
+  containerName=$(docker ps --filter "publish=$sshPort" --format '{{.Names}}' 2>/dev/null | head -1)
+  if [ -n "$containerName" ]; then
+    # Enable SSH password auth and create test user
+    odocker exec "$containerName" sh -c "
       echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
       echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
       kill -HUP 1 2>/dev/null || true
     "
+    # Create user — platform-appropriate command
+    odocker exec "$containerName" sh -c "
+      if command -v useradd >/dev/null 2>&1 || [ -x /usr/sbin/useradd ]; then
+        _useradd=\$(command -v useradd 2>/dev/null || echo /usr/sbin/useradd)
+        \$_useradd -m -s /bin/bash -G root test 2>/dev/null
+      elif command -v adduser >/dev/null 2>&1; then
+        adduser -s /bin/bash -h /home/test -D test 2>/dev/null
+      fi
+      echo 'test:test' | chpasswd
+      echo 'test ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+    "
   fi
   sleep 2
 
-  # SSH setup — connect as root for initial install
-  local rootConfig="${platform}_root"
-  local userConfig="${platform}_test"
-  ossh config.create "$rootConfig" "root@localhost:$sshPort"
+  # SSH setup — connect as test user (old flow)
+  ossh config.create "$platform" "test@localhost:$sshPort"
   ossh config.save.last
-  # Clean up any stale ControlMaster sockets from a previous test run
-  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$rootConfig" 2>/dev/null
-  rm -f "/tmp/ossh-root@localhost:$sshPort" 2>/dev/null
+  # Clean up any stale ControlMaster socket from a previous test run
+  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
+  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
 
-  # Open ControlMaster as root with sshpass
-  SSHPASS=root sshpass -e ssh \
+  # Open ControlMaster with sshpass (first connection, no keys yet)
+  SSHPASS=test sshpass -e ssh \
     -o ControlMaster=yes \
     -o ControlPath="$OSSH_CONTROL_PATH" \
     -o ControlPersist=600 \
     -o StrictHostKeyChecking=accept-new \
-    "$rootConfig" true
+    "$platform" true
 
-  # Push key to root
-  ossh key.push "$rootConfig"
+  # Push key — reuses ControlMaster socket, no password prompt
+  ossh key.push "$platform"
 
-  # Install oosh as root — auto-creates "test" user via user.create
-  ossh install "$rootConfig" test
+  # Install oosh
+  ossh install "$platform" test
 
-  # Configure passwordless sudo for test user (container is ephemeral)
-  ossh exec "$rootConfig" "echo 'test ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers"
-
-  # Set password for test user (needed for sshpass connection)
-  ossh exec "$rootConfig" "echo 'test:test' | chpasswd"
-
-  # Close root connection
-  ossh connection.close "$rootConfig" 2>/dev/null
-
-  # Create SSH config for test user and connect
-  ossh config.create "$userConfig" "test@localhost:$sshPort"
-  ossh config.save.last
+  # Refresh ControlMaster so new sessions pick up dev group membership
+  ossh connection.close "$platform" 2>/dev/null
   rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
   SSHPASS=test sshpass -e ssh \
     -o ControlMaster=yes \
     -o ControlPath="$OSSH_CONTROL_PATH" \
     -o ControlPersist=600 \
     -o StrictHostKeyChecking=accept-new \
-    "$userConfig" true
+    "$platform" true
 
   # Run user tests first (clean shared config state)
   console.log "Running core tests as user test..."
   local userLog="/tmp/oosh-platform-test-user-$platform.log"
-  ossh exec "$userConfig" "test.suite core 1" 2>&1 | tee "$userLog"
+  ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$userLog"
   local rcUser=${PIPESTATUS[0]}
 
-  # Run tests as root via sudo from test user
+  # Run tests as root (needs -tt for sudo TTY)
   console.log "Running core tests as root..."
   local rootLog="/tmp/oosh-platform-test-root-$platform.log"
-  ossh exec.tty "$userConfig" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
+  ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
   local rcRoot=${PIPESTATUS[0]}
 
   # Interactive terminal — drop into shell before cleanup
   if [ -n "$terminal" ]; then
     console.log "Opening interactive terminal on $platform..."
     console.log "Type 'exit' to end the session and clean up."
-    ossh exec.tty "$userConfig" "bash -l"
+    ossh exec.tty "$platform" "bash -l"
   fi
 
   # Cleanup
-  ossh connection.close "$userConfig" 2>/dev/null
-  ossh connection.close "$rootConfig" 2>/dev/null
+  ossh connection.close "$platform" 2>/dev/null
   private.os.platform.cleanup "$sshPort"
 
   if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
