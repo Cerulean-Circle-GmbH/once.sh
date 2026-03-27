@@ -235,26 +235,49 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
   local rcRoot=${PIPESTATUS[0]}
 
-  # Interactive terminal — drop into shell before cleanup
+  # Test adding a second user via ossh install (auto-creates dev user)
+  console.log "Adding second user: dev"
+  ossh install "$platform" dev
+
+  # Reconnect as dev user and run tests
+  ossh connection.close "$platform" 2>/dev/null
+  local devConfig="${platform}_dev"
+  ossh config.create "$devConfig" "dev@localhost:$sshPort"
+  ossh config.save.last
+  rm -f "/tmp/ossh-dev@localhost:$sshPort" 2>/dev/null
+  SSHPASS=dev sshpass -e ssh \
+    -o ControlMaster=yes \
+    -o ControlPath="$OSSH_CONTROL_PATH" \
+    -o ControlPersist=600 \
+    -o StrictHostKeyChecking=accept-new \
+    "$devConfig" true
+
+  console.log "Running core tests as user dev..."
+  local devLog="/tmp/oosh-platform-test-dev-$platform.log"
+  ossh exec "$devConfig" "test.suite core 1" 2>&1 | tee "$devLog"
+  local rcDev=${PIPESTATUS[0]}
+
+  # Interactive terminal — drop into shell as dev before cleanup
   if [ -n "$terminal" ]; then
-    console.log "Opening interactive terminal on $platform..."
+    console.log "Opening interactive terminal as dev on $platform..."
     console.log "Type 'exit' to end the session and clean up."
-    ossh exec.tty "$platform" "bash -l"
+    ossh exec.tty "$devConfig" "bash -l"
   fi
 
   # Cleanup
+  ossh connection.close "$devConfig" 2>/dev/null
   ossh connection.close "$platform" 2>/dev/null
   private.os.platform.cleanup "$sshPort"
 
-  if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ]; then
-    printf "PASS: %s (root=%d, user=%d)\n" "$platform" "$rcRoot" "$rcUser"
-    important.log "PASS: $platform (root=$rcRoot, user=$rcUser)"
+  if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ] && [ $rcDev -eq 0 ]; then
+    printf "PASS: %s (root=%d, user=%d, dev=%d)\n" "$platform" "$rcRoot" "$rcUser" "$rcDev"
+    important.log "PASS: $platform (root=$rcRoot, user=$rcUser, dev=$rcDev)"
     create.result 0 "PASS"
-    rm -f "$userLog" "$rootLog"
+    rm -f "$userLog" "$rootLog" "$devLog"
     rc=0
   else
-    printf "FAIL: %s (root=%d, user=%d)\n" "$platform" "$rcRoot" "$rcUser"
-    error.log "FAIL: $platform (root=$rcRoot, user=$rcUser)"
+    printf "FAIL: %s (root=%d, user=%d, dev=%d)\n" "$platform" "$rcRoot" "$rcUser" "$rcDev"
+    error.log "FAIL: $platform (root=$rcRoot, user=$rcUser, dev=$rcDev)"
     if [ $rcUser -ne 0 ]; then
       error.log "--- USER test failures (grep FAIL) ---"
       grep -i "FAIL\|✗" "$userLog" 2>/dev/null
