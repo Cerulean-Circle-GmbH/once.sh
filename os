@@ -184,6 +184,17 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
 
   # Fresh container
   odocker reset "$imageTag" "$sshPort"
+
+  # Configure sshd for root login (docker exec — oosh not yet installed on container)
+  local containerId
+  containerId=$(docker ps -q --filter "publish=$sshPort" 2>/dev/null | head -1)
+  if [ -n "$containerId" ]; then
+    docker exec "$containerId" sh -c "
+      echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+      echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+      kill -HUP 1 2>/dev/null || true
+    "
+  fi
   sleep 2
 
   # SSH setup — connect as root for initial install
