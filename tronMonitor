@@ -6,6 +6,7 @@
 # Config file tracking screen windows → team sessions
 : ${TRON_MONITOR_ENV:=${CONFIG_PATH:-$HOME/config}/tronMonitor.env}
 : ${TRON_MONITOR_PANE:=TRONinterface:0.3}
+: ${TRON_MONITOR_SCREEN:=tronMon}
 
 private.tronMonitor.pane() {
   local pane
@@ -13,8 +14,13 @@ private.tronMonitor.pane() {
   echo "${pane:-$TRON_MONITOR_PANE}"
 }
 
+private.tronMonitor.screenSession() {
+  local sess
+  sess=$(config get TRON_MONITOR_SCREEN 2>/dev/null)
+  echo "${sess:-$TRON_MONITOR_SCREEN}"
+}
+
 private.tronMonitor.nextWindow() {
-  # Return next available screen window number
   local max=-1
   if [ -f "$TRON_MONITOR_ENV" ]; then
     while IFS='|' read -r num sess; do
@@ -24,7 +30,7 @@ private.tronMonitor.nextWindow() {
   echo $((max + 1))
 }
 
-private.tronMonitor.findWindow() { # <teamSession> # return window number for session or empty
+private.tronMonitor.findWindow() { # <teamSession> # return window number or empty
   [ -f "$TRON_MONITOR_ENV" ] || return 1
   grep "|${1}$" "$TRON_MONITOR_ENV" 2>/dev/null | head -1 | cut -d'|' -f1
 }
@@ -32,26 +38,23 @@ private.tronMonitor.findWindow() { # <teamSession> # return window number for se
 tronMonitor.setup() # <?monitorPane:TRONinterface:0.3> # start GNU screen in the monitor pane
 {
   local monitorPane="${1:-$(private.tronMonitor.pane)}"
+  local screenName=$(private.tronMonitor.screenSession)
 
-  # Store the pane in config
   config set TRON_MONITOR_PANE "$monitorPane"
 
   # Check if screen is already running
-  local cmd
-  cmd=$(otmux pane.get "$monitorPane" '#{pane_current_command}' 2>/dev/null)
-  if [ "$cmd" = "screen" ]; then
-    info.log "Screen already running in $monitorPane"
+  if screen -ls "$screenName" 2>/dev/null | grep -q "$screenName"; then
+    info.log "Screen session $screenName already running"
     return 0
   fi
 
-  # Start screen
-  otmux send.raw "$monitorPane" "screen" Enter
+  # Start named screen session in the monitor pane
+  otmux send.raw "$monitorPane" "screen -S $screenName" Enter
   sleep 1
 
-  # Initialize env file
   [ ! -f "$TRON_MONITOR_ENV" ] && touch "$TRON_MONITOR_ENV"
 
-  success.log "Screen started in $monitorPane"
+  success.log "Screen session $screenName started in $monitorPane"
 }
 tronMonitor.setup.completion.monitorPane() {
   otmux panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
@@ -73,28 +76,11 @@ tronMonitor.add() # <teamSession> # add a team session as a read-only screen win
     return 0
   fi
 
-  local monitorPane
-  monitorPane=$(private.tronMonitor.pane)
+  local screenName=$(private.tronMonitor.screenSession)
+  local windowNum=$(private.tronMonitor.nextWindow)
 
-  # Create new screen window: C-a c
-  otmux send.raw "$monitorPane" C-a
-  sleep 0.2
-  otmux send.raw "$monitorPane" c
-  sleep 0.5
-
-  # Detect the actual screen window number from the status bar
-  # Send C-a N (show window number), capture, parse
-  otmux send.raw "$monitorPane" C-a
-  sleep 0.1
-  otmux send.raw "$monitorPane" N
-  sleep 0.5
-  local windowNum
-  windowNum=$(otmux pane.capture "$monitorPane" 3 2>/dev/null | grep -oE 'Window [0-9]+' | grep -oE '[0-9]+')
-  [ -z "$windowNum" ] && windowNum=$(private.tronMonitor.nextWindow)
-
-  # Start read-only tmux attach in the new screen window
-  otmux send.raw "$monitorPane" "TMUX= tmux attach -t $teamSession -r" Enter
-  sleep 1
+  # Create new screen window with read-only tmux attach via screen -X
+  screen -S "$screenName" -X screen "$windowNum" bash -c "TMUX= tmux attach -t $teamSession -r; exec bash"
 
   # Track in config
   echo "${windowNum}|${teamSession}" >> "$TRON_MONITOR_ENV"
@@ -117,17 +103,13 @@ tronMonitor.switch() # <teamSession> # switch monitor to show a specific team
   windowNum=$(private.tronMonitor.findWindow "$teamSession")
 
   if [ -z "$windowNum" ]; then
-    # Not tracked — add it first
     tronMonitor.add "$teamSession"
     windowNum=$(private.tronMonitor.findWindow "$teamSession")
   fi
 
   if [ -n "$windowNum" ]; then
-    local monitorPane
-    monitorPane=$(private.tronMonitor.pane)
-    otmux send.raw "$monitorPane" C-a
-    sleep 0.1
-    otmux send.raw "$monitorPane" "$windowNum"
+    local screenName=$(private.tronMonitor.screenSession)
+    screen -S "$screenName" -X select "$windowNum"
     success.log "Switched to $teamSession (window $windowNum)"
   else
     error.log "Failed to switch to $teamSession"
@@ -173,20 +155,11 @@ tronMonitor.remove() # <teamSession> # remove a team from the monitor
   grep -v "|${teamSession}$" "$TRON_MONITOR_ENV" > "${TRON_MONITOR_ENV}.tmp" 2>/dev/null
   mv "${TRON_MONITOR_ENV}.tmp" "$TRON_MONITOR_ENV"
 
-  # Kill the screen window (C-a : kill)
-  local monitorPane
-  monitorPane=$(private.tronMonitor.pane)
-  # Switch to the window first
-  otmux send.raw "$monitorPane" C-a
-  sleep 0.1
-  otmux send.raw "$monitorPane" "$windowNum"
-  sleep 0.3
-  # Kill it
-  otmux send.raw "$monitorPane" C-a
-  sleep 0.1
-  otmux send.raw "$monitorPane" k
-  sleep 0.1
-  otmux send.raw "$monitorPane" y
+  # Kill the screen window via screen -X
+  local screenName=$(private.tronMonitor.screenSession)
+  screen -S "$screenName" -X select "$windowNum"
+  sleep 0.2
+  screen -S "$screenName" -X kill
 
   success.log "Removed $teamSession (was window $windowNum)"
 }
@@ -198,6 +171,7 @@ tronMonitor.reset() # # kill screen, clear tracking, restart with all tracked te
 {
   local monitorPane
   monitorPane=$(private.tronMonitor.pane)
+  local screenName=$(private.tronMonitor.screenSession)
 
   # Save current team list
   local teams=""
@@ -206,31 +180,29 @@ tronMonitor.reset() # # kill screen, clear tracking, restart with all tracked te
   fi
 
   # Kill screen session
-  otmux send.raw "$monitorPane" C-a
-  sleep 0.1
-  otmux send.raw "$monitorPane" "\\"
-  sleep 0.3
-  otmux send.raw "$monitorPane" y
+  screen -S "$screenName" -X quit 2>/dev/null
   sleep 1
 
   # Clear tracking
   echo -n "" > "$TRON_MONITOR_ENV"
 
   # Restart screen
-  otmux send.raw "$monitorPane" "screen" Enter
+  otmux send.raw "$monitorPane" "screen -S $screenName" Enter
   sleep 1
 
   # Re-add all tracked teams
+  local count=0
   if [ -n "$teams" ]; then
     local sess
     while read -r sess; do
       [ -z "$sess" ] && continue
       tronMonitor.add "$sess"
-      sleep 1
+      count=$((count + 1))
+      sleep 0.5
     done <<< "$teams"
   fi
 
-  success.log "Monitor reset — $(echo "$teams" | grep -c . ) teams re-added"
+  success.log "Monitor reset — $count teams re-added"
 }
 
 tronMonitor.usage()
@@ -250,6 +222,7 @@ tronMonitor.usage()
     $this switch UpDown_ai_projectTeam    # switch to team view
     $this list                            # show all tracked teams
     $this remove UpDown_ai_projectTeam    # remove team from monitor
+    $this reset                           # kill screen, re-add all teams
     ----------
   "
 }
