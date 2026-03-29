@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+### new.method
+
+# Config file tracking screen windows → team sessions
+: ${TRON_MONITOR_ENV:=${CONFIG_PATH:-$HOME/config}/tronMonitor.env}
+: ${TRON_MONITOR_PANE:=TRONinterface:0.3}
+
+private.tronMonitor.pane() {
+  local pane
+  pane=$(config get TRON_MONITOR_PANE 2>/dev/null)
+  echo "${pane:-$TRON_MONITOR_PANE}"
+}
+
+private.tronMonitor.nextWindow() {
+  # Return next available screen window number
+  local max=-1
+  if [ -f "$TRON_MONITOR_ENV" ]; then
+    while IFS='|' read -r num sess; do
+      [ "$num" -gt "$max" ] 2>/dev/null && max="$num"
+    done < "$TRON_MONITOR_ENV"
+  fi
+  echo $((max + 1))
+}
+
+private.tronMonitor.findWindow() { # <teamSession> # return window number for session or empty
+  [ -f "$TRON_MONITOR_ENV" ] || return 1
+  grep "|${1}$" "$TRON_MONITOR_ENV" 2>/dev/null | head -1 | cut -d'|' -f1
+}
+
+tronMonitor.setup() # <?monitorPane:TRONinterface:0.3> # start GNU screen in the monitor pane
+{
+  local monitorPane="${1:-$(private.tronMonitor.pane)}"
+
+  # Store the pane in config
+  config set TRON_MONITOR_PANE "$monitorPane"
+
+  # Check if screen is already running
+  local cmd
+  cmd=$(otmux pane.get "$monitorPane" '#{pane_current_command}' 2>/dev/null)
+  if [ "$cmd" = "screen" ]; then
+    info.log "Screen already running in $monitorPane"
+    return 0
+  fi
+
+  # Start screen
+  otmux send.raw "$monitorPane" "screen" Enter
+  sleep 1
+
+  # Initialize env file
+  [ ! -f "$TRON_MONITOR_ENV" ] && touch "$TRON_MONITOR_ENV"
+
+  success.log "Screen started in $monitorPane"
+}
+tronMonitor.setup.completion.monitorPane() {
+  otmux panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+tronMonitor.add() # <teamSession> # add a team session as a read-only screen window
+{
+  local teamSession="$1"
+  if [ -z "$teamSession" ]; then
+    error.log "Usage: tronMonitor add <teamSession>"
+    return 1
+  fi
+
+  # Check if already added
+  local existing
+  existing=$(private.tronMonitor.findWindow "$teamSession")
+  if [ -n "$existing" ]; then
+    info.log "$teamSession already in window $existing"
+    return 0
+  fi
+
+  local monitorPane
+  monitorPane=$(private.tronMonitor.pane)
+  local windowNum
+  windowNum=$(private.tronMonitor.nextWindow)
+
+  # Create new screen window: C-a c
+  otmux send.raw "$monitorPane" C-a
+  sleep 0.2
+  otmux send.raw "$monitorPane" c
+  sleep 0.5
+
+  # Start read-only tmux attach in the new screen window
+  otmux send.raw "$monitorPane" "TMUX= tmux attach -t $teamSession -r" Enter
+  sleep 1
+
+  # Track in config
+  echo "${windowNum}|${teamSession}" >> "$TRON_MONITOR_ENV"
+
+  success.log "Added $teamSession as screen window $windowNum"
+}
+tronMonitor.add.completion.teamSession() {
+  otmux sessions -F "#{session_name}" 2>/dev/null
+}
+
+tronMonitor.switch() # <teamSession> # switch monitor to show a specific team
+{
+  local teamSession="$1"
+  if [ -z "$teamSession" ]; then
+    error.log "Usage: tronMonitor switch <teamSession>"
+    return 1
+  fi
+
+  local windowNum
+  windowNum=$(private.tronMonitor.findWindow "$teamSession")
+
+  if [ -z "$windowNum" ]; then
+    # Not tracked — add it first
+    tronMonitor.add "$teamSession"
+    windowNum=$(private.tronMonitor.findWindow "$teamSession")
+  fi
+
+  if [ -n "$windowNum" ]; then
+    local monitorPane
+    monitorPane=$(private.tronMonitor.pane)
+    otmux send.raw "$monitorPane" C-a
+    sleep 0.1
+    otmux send.raw "$monitorPane" "$windowNum"
+    success.log "Switched to $teamSession (window $windowNum)"
+  else
+    error.log "Failed to switch to $teamSession"
+    return 1
+  fi
+}
+tronMonitor.switch.completion.teamSession() {
+  [ -f "$TRON_MONITOR_ENV" ] && cut -d'|' -f2 "$TRON_MONITOR_ENV" 2>/dev/null
+}
+
+tronMonitor.list() # # show tracked teams with screen window numbers
+{
+  if [ ! -f "$TRON_MONITOR_ENV" ] || [ ! -s "$TRON_MONITOR_ENV" ]; then
+    console.log "No teams tracked. Use: tronMonitor add <teamSession>"
+    return 0
+  fi
+
+  echo -e "${BOLD_CYAN}TRON Monitor Windows${NORMAL}"
+  echo -e "${GRAY}──────────────────────────────────${NORMAL}"
+  while IFS='|' read -r num sess; do
+    [ -z "$num" ] && continue
+    printf "  ${BOLD_WHITE}%s${NORMAL}: ${CYAN}%s${NORMAL}\n" "$num" "$sess"
+  done < "$TRON_MONITOR_ENV"
+}
+
+tronMonitor.remove() # <teamSession> # remove a team from the monitor
+{
+  local teamSession="$1"
+  if [ -z "$teamSession" ]; then
+    error.log "Usage: tronMonitor remove <teamSession>"
+    return 1
+  fi
+
+  local windowNum
+  windowNum=$(private.tronMonitor.findWindow "$teamSession")
+
+  if [ -z "$windowNum" ]; then
+    error.log "$teamSession not found in monitor"
+    return 1
+  fi
+
+  # Remove from tracking
+  grep -v "|${teamSession}$" "$TRON_MONITOR_ENV" > "${TRON_MONITOR_ENV}.tmp" 2>/dev/null
+  mv "${TRON_MONITOR_ENV}.tmp" "$TRON_MONITOR_ENV"
+
+  # Kill the screen window (C-a : kill)
+  local monitorPane
+  monitorPane=$(private.tronMonitor.pane)
+  # Switch to the window first
+  otmux send.raw "$monitorPane" C-a
+  sleep 0.1
+  otmux send.raw "$monitorPane" "$windowNum"
+  sleep 0.3
+  # Kill it
+  otmux send.raw "$monitorPane" C-a
+  sleep 0.1
+  otmux send.raw "$monitorPane" k
+  sleep 0.1
+  otmux send.raw "$monitorPane" y
+
+  success.log "Removed $teamSession (was window $windowNum)"
+}
+tronMonitor.remove.completion.teamSession() {
+  [ -f "$TRON_MONITOR_ENV" ] && cut -d'|' -f2 "$TRON_MONITOR_ENV" 2>/dev/null
+}
+
+tronMonitor.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+
+  Examples
+    $this setup                           # start screen in TRONinterface:0.3
+    $this add UpDown_ai_projectTeam       # add team to monitor
+    $this switch UpDown_ai_projectTeam    # switch to team view
+    $this list                            # show all tracked teams
+    $this remove UpDown_ai_projectTeam    # remove team from monitor
+    ----------
+  "
+}
+
+tronMonitor.start()
+{
+  source this
+  this.start "$@"
+}
+
+tronMonitor.start "$@"
