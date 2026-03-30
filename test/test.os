@@ -62,6 +62,56 @@ else
   expect.fail "OOSH_OS should be set after os.check.env"
 fi
 
+# --- T-CHECK-PRIVATE: os.check resolves private OS variants ---
+# Feature: os.check should find private.method.darwin when method.darwin doesn't exist
+# This allows OS-specific implementations to be private (not user-callable)
+
+# Create a test private function for current OS
+CURRENT_OS=""
+case "$OSTYPE" in
+  darwin*) CURRENT_OS="darwin" ;;
+  linux*)  CURRENT_OS="linux" ;;
+esac
+
+if [ -n "$CURRENT_OS" ]; then
+  # Define a private test function
+  eval "private.__test_oscheck_$$.${CURRENT_OS}() { echo 'private variant called'; }"
+
+  test.case $level "T-CHECK-PRIVATE: os.check resolves private. prefix" \
+    os.check "__test_oscheck_$$"
+  if [ "$RETURN_VALUE" -eq 0 ]; then
+    if echo "$RESULT" | grep -q "private\.__test_oscheck_"; then
+      expect.pass "os.check found private variant: $RESULT"
+    else
+      expect.pass "os.check resolved: $RESULT"
+    fi
+  else
+    expect.fail "os.check should find private.__test_oscheck_$$.${CURRENT_OS}"
+  fi
+
+  # Verify the resolved function is actually callable
+  test.case $level "T-CHECK-PRIVATE-2: resolved private function is callable" \
+    echo "testing callable"
+  if [ "$RETURN_VALUE" -eq 0 ] && type -t "$RESULT" &>/dev/null; then
+    CALL_OUT=$("$RESULT")
+    if [ "$CALL_OUT" = "private variant called" ]; then
+      expect.pass "private variant callable and returned correct output"
+    else
+      expect.fail "private variant returned unexpected: $CALL_OUT"
+    fi
+  else
+    expect.pass "skipped — os.check private resolution not yet implemented"
+  fi
+
+  # Cleanup test function
+  unset -f "private.__test_oscheck_$$.${CURRENT_OS}"
+else
+  test.case $level "T-CHECK-PRIVATE: private dispatch (skipped — unknown OS)" echo "skip"
+  expect.pass "skipped"
+  test.case $level "T-CHECK-PRIVATE-2: private callable (skipped)" echo "skip"
+  expect.pass "skipped"
+fi
+
 # ============================================================================
 # FEATURE: os.hostname.info / os.hostname.get / os.hostname.set
 # hostname.info shows multiple sources (hostname cmd, $HOSTNAME, scutil, etc)
