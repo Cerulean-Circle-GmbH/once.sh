@@ -132,7 +132,9 @@ fi
 test.case $level "T-HOST-1b: os.hostname.info has OS-specific variant" \
   echo "checking os.hostname.info.$OOSH_OS"
 if type -t "os.hostname.info.darwin" &>/dev/null || \
-   type -t "os.hostname.info.linux" &>/dev/null; then
+   type -t "os.hostname.info.linux" &>/dev/null || \
+   type -t "private.os.hostname.info.darwin" &>/dev/null || \
+   type -t "private.os.hostname.info.linux" &>/dev/null; then
   expect.pass "OS-specific hostname.info exists"
 else
   expect.fail "os.hostname.info.darwin or .linux should be defined"
