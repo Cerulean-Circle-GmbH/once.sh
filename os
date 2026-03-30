@@ -54,6 +54,8 @@ os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see outp
   
   if this.functionExists "$method"; then
     create.result 0 "$method" "$1"
+  elif this.functionExists "private.$method"; then
+    create.result 0 "private.$method" "$1"
   else
     create.result 1 "$method.unknown" "$1"
   fi
@@ -113,7 +115,7 @@ os.hostname.info() # # show hostname from all available sources
   fi
 }
 
-os.hostname.info.darwin() # # show hostname sources on macOS
+private.os.hostname.info.darwin() # # show hostname sources on macOS
 {
   echo -e "${BOLD_CYAN}Hostname Sources (macOS)${NORMAL}"
   echo "  hostname cmd:    $(hostname)"
@@ -123,7 +125,7 @@ os.hostname.info.darwin() # # show hostname sources on macOS
   echo "  HostName:        $(scutil --get HostName 2>/dev/null || echo '<not set>')"
 }
 
-os.hostname.info.linux() # # show hostname sources on Linux
+private.os.hostname.info.linux() # # show hostname sources on Linux
 {
   echo -e "${BOLD_CYAN}Hostname Sources (Linux)${NORMAL}"
   echo "  hostname cmd:    $(hostname)"
