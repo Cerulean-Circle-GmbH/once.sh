@@ -232,13 +232,12 @@ os.usage()
 
 os.start()
 {
-  #echo "sourcing init"
   source this
 
-  # if [ -z "$1" ]; then
-  #   status.discover "$@"
-  #   return 0
-  # fi
+  if [ -z "$1" ]; then
+    os.info
+    return 0
+  fi
 
   this.start "$@"
 }
