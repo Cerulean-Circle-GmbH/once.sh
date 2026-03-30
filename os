@@ -143,7 +143,7 @@ os.hostname.get() # # return the effective hostname
   fi
 }
 
-os.hostname.get.darwin() # # get hostname on macOS — prefer scutil HostName, fall back to ComputerName
+private.os.hostname.get.darwin() # # get hostname on macOS — prefer scutil HostName, fall back to ComputerName
 {
   local hn
   hn=$(scutil --get HostName 2>/dev/null)
@@ -153,7 +153,7 @@ os.hostname.get.darwin() # # get hostname on macOS — prefer scutil HostName, f
   hostname -s
 }
 
-os.hostname.get.linux() # # get hostname on Linux
+private.os.hostname.get.linux() # # get hostname on Linux
 {
   hostname -s 2>/dev/null || hostname
 }
@@ -173,7 +173,7 @@ os.hostname.set() # <hostname> # set the system hostname (may require sudo)
   fi
 }
 
-os.hostname.set.darwin() # <hostname> # set hostname on macOS via scutil
+private.os.hostname.set.darwin() # <hostname> # set hostname on macOS via scutil
 {
   local newHostname="$1"
   console.log "Setting macOS hostname to: $newHostname"
@@ -183,7 +183,7 @@ os.hostname.set.darwin() # <hostname> # set hostname on macOS via scutil
   success.log "Hostname set to: $newHostname (restart terminal to see effect)"
 }
 
-os.hostname.set.linux() # <hostname> # set hostname on Linux
+private.os.hostname.set.linux() # <hostname> # set hostname on Linux
 {
   local newHostname="$1"
   console.log "Setting Linux hostname to: $newHostname"
