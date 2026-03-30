@@ -239,6 +239,9 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   console.log "Adding second user: dev"
   ossh install "$platform" dev
 
+  # Configure passwordless sudo for dev (container is ephemeral)
+  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"dev ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
+
   # Reconnect as dev user and run tests
   ossh connection.close "$platform" 2>/dev/null
   local devConfig="${platform}_dev"
