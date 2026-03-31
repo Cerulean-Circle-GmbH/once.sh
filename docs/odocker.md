@@ -123,6 +123,7 @@ odocker up naked_ubuntu_24_04 9022
 | `exec <container>` | container name, optional shell (default: bash) | Shell into running container |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
+| `clone <container>` | container name, optional `<?portOrOffset:0>` | Clone a container with its filesystem state onto different ports |
 | `stop <container>` | container name | Stop a running container |
 | `rm <container>` | container name | Remove a stopped container |
 | `log <container>` | container name, optional line count (default: 50) | Show container logs |
