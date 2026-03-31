@@ -69,12 +69,13 @@ Commands `run.sshd`, `up`, and `reset` accept an optional `<?portOrOffset:0>` pa
 
 ### Examples
 
-| Input | Type | Offset | SSH | HTTP | HTTPS |
-|-------|------|--------|-----|------|-------|
-| (none) | offset | 0 | 8022 | 8080 | 8443 |
-| `1000` | offset | 1000 | 9022 | 9080 | 9443 |
-| `9022` | SSH port | 1000 | 9022 | 9080 | 9443 |
-| `11022` | SSH port | 3000 | 11022 | 11080 | 11443 |
+| Input | Type | Offset | SSH | HTTP | HTTPS | 5001 |
+|-------|------|--------|-----|------|-------|------|
+| (none) | offset | 0 | 8022 | 8080 | 8443 | 5001 |
+| `1000` | offset | 1000 | 9022 | 9080 | 9443 | 6001 |
+| `9022` | SSH port | 1000 | 9022 | 9080 | 9443 | 6001 |
+| `6022` | SSH port | -2000 | 6022 | 6080 | 6443 | 3001 |
+| `11022` | SSH port | 3000 | 11022 | 11080 | 11443 | 8001 |
 
 ### Running multiple containers
 
