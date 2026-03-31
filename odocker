@@ -28,6 +28,23 @@ private.odocker.container.list.all() {
   docker ps -a --format '{{.Names}}' 2>/dev/null
 }
 
+private.odocker.container.ports() {
+  docker inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostPort}}->{{$p}} {{end}}{{end}}' "$1" 2>/dev/null
+}
+
+private.odocker.port.offset() {
+  local value="${1:-0}"
+  # Non-numeric values default to 0
+  case "$value" in
+    *[!0-9]*) echo "0"; return ;;
+  esac
+  if [ "$value" -ge 1024 ]; then
+    echo $((value - 8022))
+  else
+    echo "$value"
+  fi
+}
+
 private.odocker.image.list() {
   docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>'
 }
@@ -109,7 +126,14 @@ odocker.workspace.list() # # list all Dockerfile workspaces and their build stat
 
 odocker.ps() # # list running containers
 {
-  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+  {
+    printf "NAMES\tIMAGE\tSTATUS\tPORTS\n"
+    local name image status ports
+    while IFS=$'\t' read -r name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\n" "$name" "$image" "$status" "$ports"
+    done < <(docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
 }
 
 odocker.list.running() # # list running containers
@@ -124,7 +148,14 @@ odocker.list() # # list images
 
 odocker.container.list() # # list all containers
 {
-  docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+  {
+    printf "NAMES\tIMAGE\tSTATUS\tPORTS\n"
+    local name image status ports
+    while IFS=$'\t' read -r name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\n" "$name" "$image" "$status" "$ports"
+    done < <(docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
 }
 
 odocker.image.list() # # list all images
@@ -342,27 +373,32 @@ odocker.run() # <image> <?name> # run container from image
   docker run -it $nameOpt "$image" bash
 }
 
-odocker.run.sshd() # <image> <?name> <?sshPort:8022> # run container with SSH port mappings (for sshd images)
+odocker.run.sshd() # <image> <?name> <?portOrOffset:0> # run container with port mappings (offset or SSH port, e.g. 1000 or 9022)
 {
   local image="$1"
   if [ -z "$image" ]; then
-    echo "Usage: odocker run.sshd <image> <?name> <?sshPort:8022>"
+    echo "Usage: odocker run.sshd <image> <?name> <?portOrOffset:0>"
     return 1
   fi
   shift
-  local name="${1:-$(echo "$image" | tr '/:' '_')_sshd}"
+  local name="$1"
   shift 2>/dev/null
-  local sshPort="${1:-8022}"
+  local portOffset=$(private.odocker.port.offset "$1")
+  local sshPort=$((8022 + portOffset))
+  if [ -z "$name" ]; then
+    name="$(echo "$image" | tr '/:' '_')_sshd"
+    [ "$portOffset" -ne 0 ] && name="${name}_${portOffset}"
+  fi
 
-  console.log "Running image: $image with SSH mappings as $name"
+  console.log "Running image: $image with port mappings as $name (offset: $portOffset)"
   docker run -d \
     --name "$name" \
     -p $sshPort:22 \
-    -p 8080:8080 \
-    -p 8443:8443 \
-    -p 5001:5001 \
-    -p 5002:5002 \
-    -p 5005:5005 \
+    -p $((8080 + portOffset)):8080 \
+    -p $((8443 + portOffset)):8443 \
+    -p $((5001 + portOffset)):5001 \
+    -p $((5002 + portOffset)):5002 \
+    -p $((5005 + portOffset)):5005 \
     "$image"
   local rc=$?
 
@@ -399,15 +435,16 @@ odocker.rebuild() # <workspace> # remove old image and rebuild from Dockerfile
   odocker.build "$workspace"
 }
 
-odocker.reset() # <image> <?sshPort:8022> # stop container on SSH port, remove it, clear host key, start fresh
+odocker.reset() # <image> <?portOrOffset:0> # stop container, remove it, clear host key, start fresh (offset or SSH port)
 {
   local image="$1"
   if [ -z "$image" ]; then
-    echo "Usage: odocker reset <image> <?sshPort:8022>"
+    echo "Usage: odocker reset <image> <?portOrOffset:0>"
     return 1
   fi
   shift
-  local sshPort="${1:-8022}"
+  local portOffset=$(private.odocker.port.offset "$1")
+  local sshPort=$((8022 + portOffset))
 
   # Step 1: Stop and remove any container on the SSH port
   local containerId
@@ -434,7 +471,7 @@ odocker.reset() # <image> <?sshPort:8022> # stop container on SSH port, remove i
 
   # Step 3: Start fresh container
   console.log "Starting fresh container from $image on port $sshPort..."
-  odocker.run.sshd "$image" "" "$sshPort"
+  odocker.run.sshd "$image" "" "$portOffset"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -630,26 +667,61 @@ odocker.compose.completion.service() {
   private.odocker.container.list.running
 }
 
-odocker.up() # <container> # start a container, run an image, or start a compose service
+odocker.up() # <container> <?portOrOffset:0> # start a container, run an image, or start a compose service (offset or SSH port)
 {
   local container="$1"
   if [ -z "$container" ]; then
-    echo "Usage: odocker up <container|image|service>"
+    echo "Usage: odocker up <container|image|service> <?portOrOffset:0>"
     echo ""
     odocker.container.list
     echo ""
     odocker.image.list
     return 0
   fi
+  shift
+  local portOffset=$(private.odocker.port.offset "$1")
 
   # Try as docker container first (container inspect, not generic inspect)
   if docker container inspect "$container" >/dev/null 2>&1; then
+    # If portOffset requested but container has no port bindings, offer to recreate
+    local existingPorts
+    existingPorts=$(private.odocker.container.ports "$container")
+    if [ "$portOffset" -ne 0 ] && [ -z "$existingPorts" ]; then
+      local image
+      image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+      console.log "Container $container has no port bindings."
+      console.log "Recreate from $image with port offset $portOffset?"
+      read -p "Continue? (y/N) " confirm
+      if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        docker rm -f "$container" 2>/dev/null
+        odocker.run.sshd "$image" "$container" "$portOffset"
+        return $?
+      else
+        console.log "Aborted"
+        return 0
+      fi
+    fi
     console.log "Starting container: $container"
     docker start "$container"
   elif docker image inspect "$container" >/dev/null 2>&1; then
-    # Try as image — run a new container
-    console.log "Running new container from image: $container"
-    docker run -d "$container"
+    # Check if a container from this image already exists (by auto-generated name)
+    local autoName="$(echo "$container" | tr '/:' '_')_sshd"
+    [ "$portOffset" -ne 0 ] && autoName="${autoName}_${portOffset}"
+    if docker container inspect "$autoName" >/dev/null 2>&1; then
+      console.log "Starting existing container: $autoName"
+      docker start "$autoName"
+      return $?
+    fi
+    # Try as image — use run.sshd if image exposes port 22, else run detached
+    local exposedPorts
+    exposedPorts=$(docker inspect --format '{{json .Config.ExposedPorts}}' "$container" 2>/dev/null)
+    if echo "$exposedPorts" | grep -q '"22/tcp"'; then
+      odocker.run.sshd "$container" "" "$portOffset"
+    else
+      console.log "Running new container from image: $container (detached)"
+      docker run -d "$container"
+    fi
+    return $?
   else
     # Try as compose service
     local composeFile
@@ -722,11 +794,24 @@ odocker.down.completion.container() {
 odocker.status() # # show Docker overview: images, containers, disk usage
 {
   console.log "=== Running Containers ==="
-  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null
+  {
+    printf "NAMES\tIMAGE\tSTATUS\tPORTS\n"
+    local name image status ports
+    while IFS=$'\t' read -r name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\n" "$name" "$image" "$status" "$ports"
+    done < <(docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
   echo ""
 
   console.log "=== Stopped Containers ==="
-  docker ps -a --filter "status=exited" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null
+  {
+    printf "NAMES\tIMAGE\tSTATUS\tPORTS\n"
+    while IFS=$'\t' read -r name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\n" "$name" "$image" "$status" "$ports"
+    done < <(docker ps -a --filter "status=exited" --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
   echo ""
 
   console.log "=== Images ==="
@@ -740,29 +825,34 @@ odocker.status() # # show Docker overview: images, containers, disk usage
 odocker.lifecycle() # # check health of containers, images, and compose services
 {
   console.log "=== Container Health ==="
-  printf "  %-30s %-25s %s\n" "CONTAINER" "IMAGE" "HEALTH"
-  printf "  %-30s %-25s %s\n" "---------" "-----" "------"
-  local container image health
-  while IFS= read -r container; do
-    [ -z "$container" ] && continue
-    image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
-    health=$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null)
-    if [ -z "$health" ] || [ "$health" = "<no value>" ]; then
-      health="no healthcheck"
-    fi
-    printf "  %-30s %-25s %s\n" "$container" "$image" "$health"
-  done < <(private.odocker.container.list.running)
+  {
+    printf "CONTAINER\tIMAGE\tHEALTH\tPORTS\n"
+    local container image health ports
+    while IFS= read -r container; do
+      [ -z "$container" ] && continue
+      image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+      health=$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null)
+      if [ -z "$health" ] || [ "$health" = "<no value>" ]; then
+        health="no healthcheck"
+      fi
+      ports=$(private.odocker.container.ports "$container")
+      printf "%s\t%s\t%s\t%s\n" "$container" "$image" "$health" "$ports"
+    done < <(private.odocker.container.list.running)
+  } | column -t -s $'\t'
   echo ""
 
   console.log "=== Stopped Containers ==="
-  printf "  %-30s %-25s %s\n" "CONTAINER" "IMAGE" "STATUS"
-  printf "  %-30s %-25s %s\n" "---------" "-----" "------"
+  local name status
   local stopped
   stopped=$(docker ps -a --filter "status=exited" --format '{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
   if [ -n "$stopped" ]; then
-    echo "$stopped" | while IFS=$'\t' read -r name image status; do
-      printf "  %-30s %-25s %s\n" "$name" "$image" "$status"
-    done
+    {
+      printf "CONTAINER\tIMAGE\tSTATUS\tPORTS\n"
+      echo "$stopped" | while IFS=$'\t' read -r name image status; do
+        ports=$(private.odocker.container.ports "$name")
+        printf "%s\t%s\t%s\t%s\n" "$name" "$image" "$status" "$ports"
+      done
+    } | column -t -s $'\t'
   else
     echo "  (none)"
   fi
@@ -803,20 +893,50 @@ odocker.disk() # # show Docker disk usage details
   docker system df -v 2>/dev/null
 }
 
-odocker.prune() # # remove dangling images and stopped containers
+odocker.prune() # <container> # remove a stopped container and its image
 {
-  console.log "Will remove:"
-  console.log "  - Stopped containers"
-  console.log "  - Dangling images"
-  console.log "  - Unused networks"
-  echo ""
+  local container="$1"
 
-  docker container prune -f 2>/dev/null
-  docker image prune -f 2>/dev/null
-  docker network prune -f 2>/dev/null
+  if [ -z "$container" ]; then
+    echo "Usage: odocker prune <container>"
+    echo ""
+    odocker.container.list
+    return 1
+  fi
 
-  success.log "Prune complete"
-  docker system df 2>/dev/null
+  # Selective prune: remove container and its image
+  local image
+  image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+
+  # Remove the container
+  docker rm -f "$container" 2>/dev/null
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "Container $container removed"
+  else
+    error.log "Failed to remove container: $container"
+    return $rc
+  fi
+
+  # Remove the image if no other containers use it
+  if [ -n "$image" ]; then
+    local others
+    others=$(docker ps -a --filter "ancestor=$image" --format '{{.Names}}' 2>/dev/null)
+    if [ -z "$others" ]; then
+      docker rmi "$image" 2>/dev/null
+      if [ $? -eq 0 ]; then
+        success.log "Image $image removed"
+      else
+        error.log "Failed to remove image: $image"
+      fi
+    else
+      console.log "Image $image still in use by: $others"
+    fi
+  fi
+}
+odocker.prune.completion.container() {
+  private.odocker.container.list.all
+  private.odocker.image.list
 }
 
 odocker.prune.all() # # full system prune including unused images and volumes
