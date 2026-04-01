@@ -48,24 +48,23 @@ ssh-keygen -t ed25519 -f ~/.ssh/deploy_keys/2cuGitHub -C "deploy@2cuGitHub" -N "
 - Stored only on the host and in container's shared volume
 - The existing `templates/user/developking.ssh/` keys are not authorized anywhere and pose no security risk
 
-### 2. Shared SSH Config
+### 2. Shared SSH Config — Reusing Existing oosh Methods
 
-**Location:** `/home/shared/.ssh/config`
+The SSH config block is generated using the **existing** oosh SSH config pipeline:
 
-**Content:**
+1. `ossh config.create 2cuGitHub git@github.com:22 /home/shared/.ssh/2cuGitHub` — writes Host block to `$CONFIG_PATH/result.txt` via `private.config.create()`
+2. `ossh config.save.last /home/shared/.ssh/config` — appends from `result.txt` to shared config (with built-in duplicate detection)
 
+**Idempotency** via existing `ossh config.get`:
+
+```bash
+if ! ossh config.get 2cuGitHub /home/shared/.ssh/config; then
+  ossh config.create 2cuGitHub git@github.com:22 "$sharedDir/2cuGitHub"
+  ossh config.save.last "$sharedDir/config"
+fi
 ```
-Host 2cuGitHub
-  User git
-  Port 22
-  HostName github.com
-  IdentityFile /home/shared/.ssh/2cuGitHub
-  StrictHostKeyChecking no
-```
 
-- `IdentityFile` points to the shared deploy key (not user-specific `~/.ssh/id_rsa`)
-- All users use the same authorized key
-- `StrictHostKeyChecking no` avoids interactive prompts in automated environments
+This reuses three existing oosh methods (`ossh.config.create`, `ossh.config.save.last`, `ossh.config.get`) instead of writing raw SSH config blocks with `echo`.
 
 **known_hosts:**
 
@@ -77,7 +76,7 @@ Host 2cuGitHub
 For each user (dev, test, root), during `ossh install`:
 
 - If `~/.ssh/config` doesn't exist: `ln -s /home/shared/.ssh/config ~/.ssh/config`
-- If `~/.ssh/config` already exists: append the `2cuGitHub` block (idempotent — check with `grep` first)
+- If `~/.ssh/config` already exists: append the `2cuGitHub` block using `ossh config.get` (idempotency check) + `ossh config.save.last` (append)
 - Same approach for `known_hosts`
 
 ### 4. New oosh Methods
@@ -86,31 +85,123 @@ For each user (dev, test, root), during `ossh install`:
 
 ```bash
 ossh.config.shared.create() # <?sharedDir:/home/shared/.ssh> # create shared SSH config with 2cuGitHub alias
-```
+{
+  local sharedDir="${1:-/home/shared/.ssh}"
 
-- Creates `/home/shared/.ssh/` directory if needed
-- Copies deploy key from host `~/.ssh/deploy_keys/2cuGitHub` to `$sharedDir/2cuGitHub` (if not already there)
-- Creates `/home/shared/.ssh/config` with `2cuGitHub` Host block (idempotent)
-- Runs `ssh-keyscan github.com` into `/home/shared/.ssh/known_hosts`
-- Sets permissions: `chmod 700` on dir, `chmod 600` on key and config
-- Uses `create.result` / `return $(result)` pattern
+  # Create shared SSH directory
+  mkdir -p "$sharedDir"
+  chmod 700 "$sharedDir"
+
+  # Copy deploy key if not already present
+  local deployKeySrc="$HOME/.ssh/deploy_keys/2cuGitHub"
+  local deployKeyDst="$sharedDir/2cuGitHub"
+  if [ ! -f "$deployKeyDst" ]; then
+    if [ ! -f "$deployKeySrc" ]; then
+      error.log "Deploy key not found at $deployKeySrc"
+      create.result 1 "deploy key missing"
+      return $(result)
+    fi
+    cp "$deployKeySrc" "$deployKeyDst"
+    chmod 600 "$deployKeyDst"
+    success.log "Deploy key copied to $deployKeyDst"
+  fi
+
+  # Create SSH config using existing oosh methods (idempotent)
+  if ! ossh config.get 2cuGitHub "$sharedDir/config" 2>/dev/null; then
+    ossh config.create 2cuGitHub git@github.com:22 "$deployKeyDst"
+    ossh config.save.last "$sharedDir/config"
+    chmod 600 "$sharedDir/config"
+    success.log "Created 2cuGitHub alias in $sharedDir/config"
+  else
+    info.log "2cuGitHub alias already exists in $sharedDir/config"
+  fi
+
+  # Pre-populate known_hosts
+  if [ ! -f "$sharedDir/known_hosts" ] || ! grep -q "github.com" "$sharedDir/known_hosts" 2>/dev/null; then
+    ssh-keyscan github.com >> "$sharedDir/known_hosts" 2>/dev/null
+    chmod 600 "$sharedDir/known_hosts"
+    success.log "Added github.com to $sharedDir/known_hosts"
+  fi
+
+  create.result 0 "$sharedDir"
+  return $(result)
+}
+ossh.config.shared.create.completion.sharedDir() {
+  compgen -d "$1"
+}
+```
 
 **`ossh.config.shared.link`** — links a user's SSH config to the shared config:
 
 ```bash
 ossh.config.shared.link() # <?user> <?sharedDir:/home/shared/.ssh> # link user SSH config to shared config
-```
+{
+  local targetUser="${1:-$(whoami)}"
+  local sharedDir="${2:-/home/shared/.ssh}"
+  local userHome
 
-- If no user specified, uses current user
-- Symlinks `~/.ssh/config` → `/home/shared/.ssh/config` (or appends if config already exists)
-- Symlinks or appends `known_hosts`
-- Uses `create.result` / `return $(result)` pattern
+  if [ "$targetUser" = "root" ]; then
+    userHome="/root"
+  else
+    userHome="/home/$targetUser"
+  fi
+
+  local userSshDir="$userHome/.ssh"
+  mkdir -p "$userSshDir"
+
+  # Link or append config
+  if [ ! -e "$userSshDir/config" ]; then
+    ln -s "$sharedDir/config" "$userSshDir/config"
+    success.log "Linked $userSshDir/config → $sharedDir/config"
+  elif [ ! -L "$userSshDir/config" ]; then
+    # Config exists and is a real file — append 2cuGitHub if missing
+    if ! ossh config.get 2cuGitHub "$userSshDir/config" 2>/dev/null; then
+      ossh config.create 2cuGitHub git@github.com:22 "$sharedDir/2cuGitHub"
+      ossh config.save.last "$userSshDir/config"
+      success.log "Appended 2cuGitHub to $userSshDir/config"
+    else
+      info.log "2cuGitHub already exists in $userSshDir/config"
+    fi
+  else
+    info.log "$userSshDir/config already linked"
+  fi
+
+  # Link or append known_hosts
+  if [ ! -e "$userSshDir/known_hosts" ]; then
+    ln -s "$sharedDir/known_hosts" "$userSshDir/known_hosts"
+    success.log "Linked $userSshDir/known_hosts → $sharedDir/known_hosts"
+  elif [ ! -L "$userSshDir/known_hosts" ]; then
+    if ! grep -q "github.com" "$userSshDir/known_hosts" 2>/dev/null; then
+      cat "$sharedDir/known_hosts" >> "$userSshDir/known_hosts"
+      success.log "Appended github.com to $userSshDir/known_hosts"
+    fi
+  fi
+
+  create.result 0 "$targetUser linked"
+  return $(result)
+}
+ossh.config.shared.link.completion.user() {
+  echo "dev"
+  echo "test"
+  echo "root"
+}
+ossh.config.shared.link.completion.sharedDir() {
+  compgen -d "$1"
+}
+```
 
 **Integration into `ossh install`:**
 
-- After SSH keys are transferred to the container
-- Call `ossh.config.shared.create` to set up shared config + deploy key
-- Call `ossh.config.shared.link` for each user (dev, test, root)
+After SSH keys are transferred to the container, add to `ossh.install.finish.local()` or the appropriate installation step:
+
+```bash
+# Set up shared SSH config for GitHub access
+ossh config.shared.create
+# Link for all container users
+ossh config.shared.link dev
+ossh config.shared.link test
+ossh config.shared.link root
+```
 
 ### 5. Testing
 
@@ -123,7 +214,7 @@ Tests in `test/test.ossh`, following existing oosh test patterns.
 | T-SHARED-3 | `ossh.config.shared.create` sets correct permissions (700 dir, 600 files) |
 | T-SHARED-4 | `ossh.config.shared.link` creates symlink for current user |
 | T-SHARED-5 | `ossh.config.shared.link` appends if config already exists (doesn't overwrite) |
-| T-SHARED-6 | Shared config contains valid `2cuGitHub` Host block |
+| T-SHARED-6 | Shared config contains valid `2cuGitHub` Host block (verified via `ossh config.get`) |
 
 All tests use temp directories as fixtures to avoid touching real `~/.ssh` or `/home/shared/.ssh`.
 
@@ -131,20 +222,24 @@ All tests use temp directories as fixtures to avoid touching real `~/.ssh` or `/
 
 | File | Changes |
 |------|---------|
-| `ossh` | Add `ossh.config.shared.create`, `ossh.config.shared.link`, integrate into `ossh.install` |
+| `ossh` | Add `ossh.config.shared.create` + completion, `ossh.config.shared.link` + completions, integrate into `ossh.install` |
 | `test/test.ossh` | Add T-SHARED-1 through T-SHARED-6 test cases |
 
 ## Prerequisites (Manual, One-Time)
 
 1. Generate deploy key: `ssh-keygen -t ed25519 -f ~/.ssh/deploy_keys/2cuGitHub -C "deploy@2cuGitHub" -N ""`
-2. Add public key to GitHub: `gh api repos/Cerulean-Circle-GmbH/once.sh/keys --method POST -f title="developking" -f key="$(cat ~/.ssh/deploy_keys/2cuGitHub.pub)" -F read_only=false`
+2. Add public key to GitHub: `gh api repos/Cerulean-Circle-GmbH/once.sh/keys --method POST -f title="2cuGitHub-deploy" -f key="$(cat ~/.ssh/deploy_keys/2cuGitHub.pub)" -F read_only=false`
 
 ## OOSH Compliance Checklist
 
 - [x] All new methods follow `script.noun.verb` naming pattern
-- [x] All parameter names are camelCase
-- [x] Completion functions for completable parameters
-- [x] Uses `create.result` / `return $(result)` pattern
-- [x] All user-facing output uses oosh logging
+- [x] All parameter names are camelCase (sharedDir, user)
+- [x] Completion function exists for each completable parameter
+- [x] Completion function names match parameter names exactly
+- [x] Uses `create.result` / `return $(result)` pattern throughout
+- [x] All user-facing output uses oosh logging (`success.log`, `info.log`, `error.log`)
+- [x] Reuses existing oosh methods: `ossh config.create`, `ossh config.save.last`, `ossh config.get`
+- [x] Idempotency via `ossh config.get` (not raw `grep`)
 - [x] Tests follow existing `test.ossh` patterns
 - [x] No private keys committed to git
+- [x] Local variables are camelCase (sharedDir, deployKeySrc, deployKeyDst, targetUser, userHome, userSshDir)
