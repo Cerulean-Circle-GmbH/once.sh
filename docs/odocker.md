@@ -90,6 +90,32 @@ odocker up naked_ubuntu_24_04 1000
 odocker up naked_ubuntu_24_04 9022
 ```
 
+## Docker Socket
+
+Commands `run`, `run.sshd`, `up`, `reset`, and `clone` accept an optional `docker` parameter as the last argument. When provided:
+
+1. Mounts `/var/run/docker.sock` into the container (socket forwarding)
+2. Installs Docker CLI inside the container (auto-detects OS via package manager)
+
+This allows the container to control the host's Docker daemon.
+
+### Usage
+
+```bash
+# Create container with Docker access
+odocker up naked_ubuntu_24_04:latest 0 docker
+
+# Standalone install (container must already have socket mounted)
+odocker install festive_einstein
+
+# Verify Docker works inside the container
+docker exec festive_einstein docker ps
+```
+
+### Security Note
+
+The Docker socket gives the container root-level access to the host's Docker daemon. Only use on trusted containers.
+
 ## Methods
 
 ### Workspace Management
@@ -112,9 +138,9 @@ odocker up naked_ubuntu_24_04 9022
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `run <image>` | image name, optional container name | Run container interactively |
-| `run.sshd <image>` | image name, optional name, optional `<?portOrOffset:0>` | Run container detached with port mappings (see [Port Mapping](#port-mapping)) |
-| `reset <image>` | image name, optional `<?portOrOffset:0>` | Stop container, remove it, clear host key, start fresh |
+| `run <image>` | image name, optional name, optional `docker` | Run container interactively |
+| `run.sshd <image>` | image name, optional name, optional `<?portOrOffset:0>`, optional `docker` | Run container detached with port mappings (see [Port Mapping](#port-mapping)) |
+| `reset <image>` | image name, optional `<?portOrOffset:0>`, optional `docker` | Stop container, remove it, clear host key, start fresh |
 
 ### Container Operations
 
@@ -123,7 +149,8 @@ odocker up naked_ubuntu_24_04 9022
 | `exec <container>` | container name, optional shell (default: bash) | Shell into running container |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
-| `clone <container>` | container name, optional `<?portOrOffset:0>` | Clone a container with its filesystem state onto different ports |
+| `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
+| `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount) |
 | `stop <container>` | container name | Stop a running container |
 | `rm <container>` | container name | Remove a stopped container |
 | `log <container>` | container name, optional line count (default: 50) | Show container logs |
@@ -141,7 +168,7 @@ odocker up naked_ubuntu_24_04 9022
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `compose` | optional service name | Show compose status or service details |
-| `up <container>` | container/image/service, optional `<?portOrOffset:0>` | Start a container, run an image (with port mappings), or start a compose service |
+| `up <container>` | container/image/service, optional `<?portOrOffset:0>`, optional `docker` | Start a container, run an image (with port mappings), or start a compose service |
 | `down <container>` | container or service name | Stop a container or compose service |
 
 ### Status & Maintenance
