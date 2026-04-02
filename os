@@ -133,22 +133,24 @@ os.platform.list() # # lists all platforms with tier info
   done
 }
 
-os.platform.test() # <platform> <?terminal> # tests oosh installation on a single platform
+os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation on a single platform
 {
   local platform="$1"
   if [ -z "$platform" ]; then
-    error.log "Usage: os platform.test <platform>"
+    error.log "Usage: os platform.test <platform> <?terminal> <?notests>"
     return 1
   fi
   shift
   local terminal="$1"
+  if [ -n "$1" ]; then shift; fi
+  local notests="$1"
   if [ -n "$1" ]; then shift; fi
 
   private.os.platform.parse "$platform" || return 1
 
   if [ "$PLATFORM_WORKSPACE" = "native" ]; then
     if [ "$platform" = "macos" ]; then
-      private.os.platform.test.ci "$platform" "$terminal"
+      private.os.platform.test.ci "$platform" "$terminal" "$notests"
       return $?
     fi
     console.log "SKIP: $platform is a native platform (no Docker test)"
@@ -223,17 +225,24 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
     -o StrictHostKeyChecking=accept-new \
     "$platform" true
 
-  # Run user tests first (clean shared config state)
-  console.log "Running core tests as user test..."
-  local userLog="/tmp/oosh-platform-test-user-$platform.log"
-  ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$userLog"
-  local rcUser=${PIPESTATUS[0]}
+  local rcUser=0 rcRoot=0 rcDev=0
+  local userLog="" rootLog="" devLog=""
 
-  # Run tests as root (needs -tt for sudo TTY)
-  console.log "Running core tests as root..."
-  local rootLog="/tmp/oosh-platform-test-root-$platform.log"
-  ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
-  local rcRoot=${PIPESTATUS[0]}
+  if [ -z "$notests" ]; then
+    # Run user tests first (clean shared config state)
+    console.log "Running core tests as user test..."
+    userLog="/tmp/oosh-platform-test-user-$platform.log"
+    ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$userLog"
+    rcUser=${PIPESTATUS[0]}
+
+    # Run tests as root (needs -tt for sudo TTY)
+    console.log "Running core tests as root..."
+    rootLog="/tmp/oosh-platform-test-root-$platform.log"
+    ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
+    rcRoot=${PIPESTATUS[0]}
+  else
+    console.log "Skipping tests (notests)"
+  fi
 
   # Test adding a second user via ossh install (auto-creates dev user)
   console.log "Adding second user: dev"
@@ -257,10 +266,12 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
     -o StrictHostKeyChecking=accept-new \
     "$devConfig" true
 
-  console.log "Running core tests as user dev..."
-  local devLog="/tmp/oosh-platform-test-dev-$platform.log"
-  ossh exec "$devConfig" "test.suite core 1" 2>&1 | tee "$devLog"
-  local rcDev=${PIPESTATUS[0]}
+  if [ -z "$notests" ]; then
+    console.log "Running core tests as user dev..."
+    devLog="/tmp/oosh-platform-test-dev-$platform.log"
+    ossh exec "$devConfig" "test.suite core 1" 2>&1 | tee "$devLog"
+    rcDev=${PIPESTATUS[0]}
+  fi
 
   # Interactive terminal — drop into shell as dev before cleanup
   if [ -n "$terminal" ]; then
@@ -274,7 +285,12 @@ os.platform.test() # <platform> <?terminal> # tests oosh installation on a singl
   ossh connection.close "$platform" 2>/dev/null
   private.os.platform.cleanup "$sshPort"
 
-  if [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ] && [ $rcDev -eq 0 ]; then
+  if [ -n "$notests" ]; then
+    printf "PASS: %s (tests=skipped)\n" "$platform"
+    important.log "PASS: $platform (tests=skipped)"
+    create.result 0 "PASS"
+    rc=0
+  elif [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ] && [ $rcDev -eq 0 ]; then
     printf "PASS: %s (root=%d, user=%d, dev=%d)\n" "$platform" "$rcRoot" "$rcUser" "$rcDev"
     important.log "PASS: $platform (root=$rcRoot, user=$rcUser, dev=$rcDev)"
     create.result 0 "PASS"
@@ -304,6 +320,10 @@ os.platform.test.completion.platform() {
 
 os.platform.test.completion.terminal() {
   echo "terminal"
+}
+
+os.platform.test.completion.notests() {
+  echo "notests"
 }
 
 os.platform.test.all() # # tests all must-pass platforms, reports summary
