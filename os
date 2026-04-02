@@ -57,10 +57,11 @@ private.os.platform.cleanup() { # <port> # stops and removes Docker container on
   fi
 }
 
-private.os.platform.test.ci() # <platform> <?terminal> # triggers CI workflow for native platform testing
+private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI workflow for native platform testing
 {
   local platform="$1"
   local terminal="$2"
+  local notests="$3"
 
   if ! command -v gh >/dev/null 2>&1; then
     error.log "gh CLI not found — install with: oo cmd gh"
@@ -80,7 +81,7 @@ private.os.platform.test.ci() # <platform> <?terminal> # triggers CI workflow fo
 
   # Trigger the workflow and capture the run
   local repo="Cerulean-Circle-GmbH/once.sh"
-  if ! gh workflow run macos-test.yml -R "$repo" -r "$branch" -f branch="$branch" -f terminal="${terminal:-}"; then
+  if ! gh workflow run macos-test.yml -R "$repo" -r "$branch" -f branch="$branch" -f terminal="${terminal:-}" -f notests="${notests:-}"; then
     error.log "Failed to trigger macOS CI workflow"
     create.result 1 "FAIL"
     return 1
