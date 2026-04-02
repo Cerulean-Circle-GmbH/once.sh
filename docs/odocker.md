@@ -221,6 +221,33 @@ odocker stop <container_name>
 odocker rm <container_name>
 ```
 
+## Troubleshooting
+
+### Docker Socket Permission Denied
+
+If you see `permission denied while trying to connect to the Docker daemon socket`, the Docker socket group may be wrong (e.g. `systemd-network` instead of `docker`).
+
+**Quick fix** (until next reboot):
+```bash
+sudo chgrp docker /var/run/docker.sock
+```
+
+**Permanent fix** (persists across reboots):
+```bash
+sudo mkdir -p /etc/systemd/system/docker.socket.d
+printf "[Socket]\nSocketGroup=docker\nSocketMode=0660\n" | sudo tee /etc/systemd/system/docker.socket.d/override.conf
+sudo systemctl daemon-reload
+sudo systemctl restart docker.socket
+```
+
+This overrides the systemd socket unit to always set the correct group. Verify with:
+```bash
+ls -la /var/run/docker.sock
+# Should show: srw-rw---- 1 root docker
+```
+
+**Note:** `odocker` automatically detects and fixes the socket group with `sudo` when running `build`, `rebuild`, `reset`, `run`, `run.sshd`, `up`, or `clone`. The permanent fix above avoids the sudo prompt entirely.
+
 ## See Also
 
 - [Supported Platforms](supported-platforms.md)
