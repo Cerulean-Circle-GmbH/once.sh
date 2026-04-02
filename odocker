@@ -796,26 +796,40 @@ odocker.install() # <container> # install Docker CLI inside a running container
 
   if [ $rc -eq 0 ]; then
     success.log "Docker CLI installed in $container"
-    # Create docker group matching the socket's GID and add all non-system users
-    # The socket is bind-mounted from the host — never chgrp it (breaks host permissions)
+    # Grant non-root users access to the bind-mounted Docker socket.
+    # Strategy: find or create a group matching the socket's GID, then add users to it.
+    # Never chgrp the socket — it's bind-mounted from the host and changing it breaks host perms.
     local socketGid
     socketGid=$(docker exec "$container" stat -c "%g" /var/run/docker.sock 2>/dev/null)
     if [ -z "$socketGid" ]; then
       info.log "Docker socket not found in $container — skipping group setup"
     else
+      # Find or create a group matching the socket's GID
+      local socketGroup
+      socketGroup=$(docker exec "$container" sh -c "getent group $socketGid 2>/dev/null | cut -d: -f1")
+      if [ -z "$socketGroup" ]; then
+        # No group with this GID — align existing docker group or create one
+        local existingGid
+        existingGid=$(docker exec "$container" sh -c "getent group docker 2>/dev/null | cut -d: -f3")
+        if [ -n "$existingGid" ] && [ "$existingGid" != "$socketGid" ]; then
+          # docker group exists with wrong GID — fix it
+          docker exec "$container" sh -c "groupmod -g $socketGid docker 2>/dev/null || { delgroup docker 2>/dev/null; addgroup -g $socketGid docker 2>/dev/null; }"
+        else
+          docker exec "$container" sh -c "groupadd -g $socketGid docker 2>/dev/null || addgroup -g $socketGid docker 2>/dev/null"
+        fi
+        socketGroup="docker"
+      fi
+      # Add all non-system users to the socket's group
       local ooshDir
       ooshDir=$(docker exec "$container" bash -c 'source ~/config/user.env 2>/dev/null; echo "$OOSH_DIR"' 2>/dev/null)
-      if [ -n "$ooshDir" ] && docker exec "$container" test -f "$ooshDir/user" 2>/dev/null; then
-        # oosh available — use user.group.add (handles Alpine/Darwin/Linux)
-        docker exec "$container" sh -c "getent group docker >/dev/null 2>&1 || { groupadd -g $socketGid docker 2>/dev/null || addgroup -g $socketGid docker 2>/dev/null; }"
-        local u
-        for u in $(docker exec "$container" awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
-          docker exec "$container" bash -c "source ~/config/user.env 2>/dev/null; \$OOSH_DIR/user group.add docker $u"
-        done
-      else
-        # No oosh — raw fallback with Alpine support
-        docker exec "$container" sh -c "getent group docker >/dev/null 2>&1 || { groupadd -g $socketGid docker 2>/dev/null || addgroup -g $socketGid docker 2>/dev/null; }; for u in \$(awk -F: '\$3 >= 1000 && \$3 < 65534 {print \$1}' /etc/passwd); do usermod -aG docker \"\$u\" 2>/dev/null || addgroup \"\$u\" docker 2>/dev/null; done"
-      fi
+      local u
+      for u in $(docker exec "$container" awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
+        if [ -n "$ooshDir" ] && docker exec "$container" test -f "$ooshDir/user" 2>/dev/null; then
+          docker exec "$container" bash -c "source ~/config/user.env 2>/dev/null; \$OOSH_DIR/user group.add $socketGroup $u"
+        else
+          docker exec "$container" sh -c "usermod -aG $socketGroup $u 2>/dev/null || addgroup $u $socketGroup 2>/dev/null"
+        fi
+      done
     fi
   else
     error.log "Docker CLI installation failed in $container (exit code: $rc)"
