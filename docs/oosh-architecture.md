@@ -17,8 +17,35 @@ OOSH achieves pseudo-object-oriented programming in Bash through **naming conven
 | **Instance** | The script itself when sourced or executed |
 | **Methods** | Functions named `scriptname.methodname()` |
 | **Constructor** | `scriptname.start()` entry point |
-| **Private methods** | Functions prefixed `private.` |
+| **Private methods** | `private.script.method()` — hidden from completion AND CLI |
+| **Protected methods** | `script.protected.method()` — hidden from completion, callable via CLI |
 | **Inheritance** | Sourcing other scripts to access their methods |
+
+### Method Visibility Levels
+
+| Prefix | Tab Completion | CLI Callable | Use Case |
+|--------|---------------|-------------|----------|
+| (none) | YES | YES | Public API (`hiveMind resolve`) |
+| `script.protected.method` | NO | YES | Inter-script events (`hiveMind protected.session.renamed`) |
+| `private.script.method` | NO | NO | Internal helpers (`private.hiveMind.agents.discover`) |
+
+### Completion System (Two Types)
+
+| Type | Trigger | How It Works |
+|------|---------|-------------|
+| **Method completion** | `script [Tab]` | c2 scans script for `scriptname.method()` signatures, filters out `private.`, `.protected.`, and `.completion` |
+| **Parameter completion** | `script method [Tab]` | c2 calls `scriptname.method.completion.paramName()` which returns one value per line |
+
+```bash
+# Method completion example: hiveMind [Tab]
+# c2 scans hiveMind for all public method signatures
+# Returns: resolve, send, panes, team.status, agent.monitor, ...
+
+# Parameter completion example: hiveMind resolve [Tab]
+# c2 finds hiveMind.resolve has param <agentName>
+# Calls hiveMind.resolve.completion.agentName()
+# Returns: oosh-expert, oosh-tester, scrum-master, ...
+```
 
 ### OOSH Naming Standard (MANDATORY)
 
