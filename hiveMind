@@ -184,28 +184,61 @@ private.hiveMind.session.resolve.uuid() # <pane> # UUID discovery — pure bash,
   local argsUuid=""
   [ -z "$isForked" ] && argsUuid=$(echo "$procArgs" | grep -oE "$UUID_RE" | head -1)
 
-  # Build set of UUIDs assigned to OTHER panes (for exclusion)
+  # Build set of UUIDs assigned to OTHER panes that currently have a live Claude process.
+  # Use claude.processes once (O(1) lookup) instead of per-line process.find calls.
+  # Stale sessions.env entries (no live Claude on that pane) don't block fresh resolution.
   local otherUuids=""
-  [ -f "$sesFile" ] && otherUuids=$(grep -v "^${target}|" "$sesFile" 2>/dev/null | cut -d'|' -f2 | tr '\n' '|')
+  if [ -f "$sesFile" ]; then
+    local livePanes
+    livePanes=$(private.hiveMind.claude.processes 2>/dev/null | cut -d'|' -f3 | tr '\n' '|')
+    while IFS='|' read -r otherPane otherUuid; do
+      [ -z "$otherPane" ] || [ "$otherPane" = "$target" ] && continue
+      [ -z "$otherUuid" ] && continue
+      # Only exclude if that pane still has a live Claude process
+      echo "$livePanes" | grep -q "|${otherPane}|" || continue
+      otherUuids="${otherUuids}${otherUuid}|"
+    done < "$sesFile"
+  fi
 
   local bestSid=""
 
   if [ "$isForked" = "yes" ]; then
-    # FORK: find most recent JSONL with matching customTitle (role name)
+    # FORK: anchor on process start time to disambiguate sister panes.
+    # The fork's JSONL is created at-or-after the process started.
+    # Filter by mtime >= procStart, then prefer customTitle match as tiebreaker.
     local roleFile="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
     local roleName=""
     [ -f "$roleFile" ] && roleName=$(grep "^${target}|" "$roleFile" 2>/dev/null | head -1 | cut -d'|' -f2)
-    if [ -n "$roleName" ]; then
-      local f sid
-      for f in $(ls -t "$projectsDir"/*/*.jsonl 2>/dev/null); do
-        grep -q "\"customTitle\":\"${roleName}\"" "$f" 2>/dev/null || continue
-        sid=$(basename "$f" .jsonl)
-        [ -z "$sid" ] && continue
-        echo "$otherUuids" | grep -q "$sid" && continue
+
+    # Process start time as epoch seconds (cross-platform)
+    local procStart=""
+    local procLstart
+    procLstart=$(ps -o lstart= -p "$claudePid" 2>/dev/null | sed 's/^ *//;s/ *$//')
+    if [ -n "$procLstart" ]; then
+      procStart=$(date -j -f "%a %b %e %T %Y" "$procLstart" +%s 2>/dev/null \
+                 || date -d "$procLstart" +%s 2>/dev/null)
+    fi
+
+    local f sid fileMtime
+    for f in $(ls -t "$projectsDir"/*/*.jsonl 2>/dev/null); do
+      sid=$(basename "$f" .jsonl)
+      [ -z "$sid" ] && continue
+      echo "$otherUuids" | grep -q "$sid" && continue
+
+      # Filter by process start time when available
+      if [ -n "$procStart" ]; then
+        fileMtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)
+        [ -z "$fileMtime" ] && continue
+        [ "$fileMtime" -lt "$procStart" ] && continue
+      fi
+
+      # Prefer JSONL whose customTitle matches the role (with or without @model suffix)
+      if [ -n "$roleName" ] && grep -qE "\"customTitle\":\"${roleName}(@[^\"]+)?\"" "$f" 2>/dev/null; then
         bestSid="$sid"
         break
-      done
-    fi
+      fi
+    done
+    # No fallback: if customTitle doesn't match, let the next layer (sessions.env) decide
   elif [ -n "$argsUuid" ]; then
     # NON-FORK: check if a newer JSONL exists in same project dir (autocompact)
     local argsFile="" d
@@ -492,13 +525,10 @@ private.hiveMind.live.discover() {
   local pid
   pid=$(claudeCode process.find "$target" 2>/dev/null) || return 1
 
-  # 2. Get session UUID — fork-aware, NON-INVASIVE (no /status probe)
-  #    For forked sessions: skips parent UUID, tries sessions.env lookup
-  #    Probe only used by consistency.fix (explicit manual call)
-  local procArgs
-  procArgs=$(ps -p "$pid" -o args= 2>/dev/null)
+  # 2. Get session UUID via shared resolver (DRY — same as agents.discover)
+  #    Fork-aware: PID+time disambiguation for sister panes, JSONL filename as UUID
   local sid
-  sid=$(private.hiveMind.liveUuid "$target" "$procArgs")
+  sid=$(private.hiveMind.session.resolve.uuid "$target" 2>/dev/null)
   [ -z "$sid" ] && return 1
 
   # 3. Get session name (customTitle from /rename, or firstPrompt)
@@ -672,7 +702,7 @@ private.hiveMind.pane.activity() {
 # Non-invasive: uses Claude process lookup + registry + sweep.detect
 # ALL methods that need agent data MUST call this — no duplicate discovery
 
-private.hiveMind.agents.discover() # <?session_filter> # discover all agents, output pane|role|state|uuid|title|is_claude
+hiveMind.protected.agents.discover() # <?session_filter> # shared discovery — output pane|role|state|uuid|title|is_claude (protected: CLI-callable, hidden from Tab)
 {
   local filter="$1"
 
@@ -723,6 +753,23 @@ private.hiveMind.agents.discover() # <?session_filter> # discover all agents, ou
 
     echo "${pane_target}|${role:-}|${state}|${uuid:-}|${pane_title:-}|${is_claude}"
   done < <(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" -a)
+}
+
+hiveMind.protected.agents.offline() # <session> # synthesize 6-field discovery rows from persisted state (roles.env + sessions.env) for offline teams
+{
+  local session="$1"
+  [ -z "$session" ] && return 1
+  local roleFile="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  [ -f "$roleFile" ] || return 1
+
+  while IFS='|' read -r pane role; do
+    [ -z "$pane" ] && continue
+    case "$pane" in "${session}:"*) ;; *) continue ;; esac
+    local uuid=""
+    [ -f "$sesFile" ] && uuid=$(grep "^${pane}|" "$sesFile" 2>/dev/null | tail -1 | cut -d'|' -f2)
+    echo "${pane}|${role}|offline|${uuid}||no"
+  done < "$roleFile"
 }
 
 private.hiveMind.get.agents() {
@@ -1157,7 +1204,7 @@ hiveMind.list() # # list all active agent role names across all sessions
 {
   while IFS='|' read -r pane role state uuid title is_claude; do
     [ "$is_claude" = "yes" ] && [ -n "$role" ] && echo "$role"
-  done < <(private.hiveMind.agents.discover)
+  done < <(hiveMind.protected.agents.discover)
 }
 
 hiveMind.workers() # # list worker agents (non-orchestrator panes)
@@ -1610,7 +1657,7 @@ hiveMind.panes() # # list all active agent panes across all sessions
     printf "%-28s ${BOLD_WHITE}%-22s${NORMAL} ${state_color}%-14s${NORMAL} ${GRAY}%s${NORMAL}\n" \
       "$pane" "${role:-unknown}" "$state" "${uuid:--}"
     count=$((count + 1))
-  done < <(private.hiveMind.agents.discover)
+  done < <(hiveMind.protected.agents.discover)
 
   echo -e "${GRAY}$(printf '%.0s─' {1..105})${NORMAL}"
   echo -e "${BOLD_WHITE}$count${NORMAL} active agents"
@@ -3798,7 +3845,9 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
 
     while read -r team; do
       if ! otmux has "$team" 2>/dev/null; then
-        printf "${BOLD_CYAN}%-24s${NORMAL} ${GRAY}(session not running)${NORMAL}\n" "$team"
+        local offline_count
+        offline_count=$(hiveMind.protected.agents.offline "$team" 2>/dev/null | grep -c '|' 2>/dev/null)
+        printf "${BOLD_CYAN}%-24s${NORMAL} ${GRAY}(offline — %s agents, tmux session gone)${NORMAL}\n" "$team" "${offline_count:-0}"
         continue
       fi
       local agent_count=0 active_count=0 idle_count=0 blocked_count=0
@@ -3810,7 +3859,7 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
           permission|rate-limit|accept-edits|panel|overlay|autocomplete|tool-confirm|mcp-error|api-error|context-warning) blocked_count=$((blocked_count + 1)) ;;
           *) active_count=$((active_count + 1)) ;;
         esac
-      done < <(private.hiveMind.agents.discover "$team")
+      done < <(hiveMind.protected.agents.discover "$team")
       local summary="${active_count} active, ${idle_count} idle"
       [ "$blocked_count" -gt 0 ] && summary="${summary}, ${blocked_count} blocked"
       local blocked_color=""
@@ -3823,19 +3872,26 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
   fi
 
   # With argument: show detailed per-pane tree using shared discovery
-  if ! otmux has "$session" 2>/dev/null; then
-    error.log "Session $session not found"
-    return 1
+  local data offline_mode="no"
+  if otmux has "$session" 2>/dev/null; then
+    data=$(hiveMind.protected.agents.discover "$session")
+  else
+    data=$(hiveMind.protected.agents.offline "$session")
+    if [ -z "$data" ]; then
+      error.log "Session $session not found (no live tmux session and no persisted agents)"
+      return 1
+    fi
+    offline_mode="yes"
   fi
-
-  # Collect discovery data for this session
-  local data
-  data=$(private.hiveMind.agents.discover "$session")
   local total
   total=$(echo "$data" | grep -c '|' 2>/dev/null || echo 0)
   local count=0
 
-  echo -e "${BOLD_CYAN}${session}${NORMAL}"
+  if [ "$offline_mode" = "yes" ]; then
+    echo -e "${BOLD_CYAN}${session}${NORMAL} ${BOLD_RED}(offline — tmux session not running)${NORMAL}"
+  else
+    echo -e "${BOLD_CYAN}${session}${NORMAL}"
+  fi
   while IFS='|' read -r pane_target role state uuid title is_claude; do
     [ -z "$pane_target" ] && continue
     count=$((count + 1))
