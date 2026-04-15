@@ -58,15 +58,15 @@ Testing path (dev → testing):
   [13] uncommitted.checked   ← Clean working tree required
   [14] test.suite.passed     ← test.suite core 1 must pass
   [15] confirmation.received ← User confirms merge (diff stats shown)
-  [16] merged.to.stage       ← git merge dev into stage
-  [17] stage.tagged          ← Tag: stage-YYYY-MM-DD
-  [18] stage.pushed          ← git push origin stage + tags
+  [16] merged.to.testing     ← git merge dev into testing
+  [17] testing.tagged        ← Tag: testing-YYYY-MM-DD
+  [18] testing.pushed        ← git push origin testing + tags
 
 Prod path (testing → prod):
   [20] prod.path.started     ← Pass-through to platform tests
   [21] platform.tests.passed ← os platform.test.all must pass
   [22] confirmation.received.prod ← User confirms merge
-  [23] merged.to.prod        ← git merge stage into prod
+  [23] merged.to.prod        ← git merge testing into prod
   [24] prod.tagged           ← Tag: vX.Y.Z (auto-incremented semver)
   [25] prod.pushed           ← git push origin prod + tags
 
