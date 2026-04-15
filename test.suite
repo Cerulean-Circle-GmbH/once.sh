@@ -42,6 +42,24 @@ test.suite.parameter.completion.test() # # completion function for test paramete
   test.suite.run.completion
 }
 
+# ─── test case filter helpers (framework, shared by run + list + completions) ───
+
+private.test.suite.list.names() { # <test> # emit test-case labels from a test file, one per line
+  local name="$1"
+  [ -z "$name" ] && return 1
+  local file="$OOSH_DIR/test/test.$name"
+  [ -f "$file" ] || return 1
+  # Match `test.case <something> "label" ...` and extract the FIRST quoted string.
+  # Use [^"]* before the first quote (non-greedy) — .*  is greedy and would grab
+  # the last quoted string (breaks on lines with a second quoted expect string).
+  grep -hE '^[[:space:]]*test\.case[[:space:]]' "$file" 2>/dev/null \
+    | sed -E 's/^[^"]*"([^"]+)".*/\1/'
+}
+
+private.test.suite.list.tags() { # <test> # emit tag-before-colon for each label (T-XXX: desc → T-XXX)
+  private.test.suite.list.names "$1" | awk -F: '{print $1}' | sort -u
+}
+
 test.suite.save.results() # # saves test results to config file and prints summary
 {
   source $OOSH_DIR/config
@@ -116,32 +134,36 @@ test.suite.init() # # initializes test suite counters and environment
   fi
 }
 
-test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
+test.suite.run() # <test> <?logLevel:1> <?filter> # runs a test, optionally filtered to cases whose label starts with <filter>
 {
   local command=$1
   shift
   local level=$1
   shift
-  local clear=$1
+  local filter=$1
   shift
 
   if [ -z "$level" ]; then
     level=1
   fi
 
+  # Export filter so test.case (in this shell) honors it. Empty = run all (back-compat).
+  export TEST_CASE_FILTER="$filter"
+
   # Print test header
   echo ""
   echo -e "\e[1;36m╔════════════════════════════════════════════════════════════════════╗\e[0m"
-  echo -e "\e[1;36m║  RUNNING TEST: test.$command\e[0m"
+  echo -e "\e[1;36m║  RUNNING TEST: test.$command${filter:+  [filter: $filter]}\e[0m"
   echo -e "\e[1;36m╚════════════════════════════════════════════════════════════════════╝\e[0m"
   echo ""
 
   if [ "$level" -gt 0 ]; then
-    important.log "starting test: $OOSH_DIR/test/test.$command -level:$level- -clear:$clear-"
-    $OOSH_DIR/test/test.$command $level $clear
+    important.log "starting test: $OOSH_DIR/test/test.$command -level:$level- -filter:${filter:-*}-"
+    $OOSH_DIR/test/test.$command $level
   else
-    $OOSH_DIR/test/test.$command $level $clear >/dev/null
+    $OOSH_DIR/test/test.$command $level >/dev/null
   fi
+  unset TEST_CASE_FILTER
 
   if check file $CONFIG_PATH/testresult.env exists; then
     source $CONFIG_PATH/testresult.env
@@ -162,6 +184,47 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
     return 1
   fi
 }
+test.suite.run.completion.test() { test.suite.run.completion "$@"; }
+test.suite.run.completion.logLevel() { for l in 0 1 2 3 4 5; do echo "$l"; done; }
+test.suite.run.completion.filter() {
+  # c2 calls with ($cur, $class, $method, $arg1, $arg2, …).
+  # arg1 is the already-typed <test> script name. $1 is the current word.
+  # We need the test script name — it's the first positional after $cur/class/method.
+  # Practical fallback: try $1 as script name, else last non-empty arg.
+  local test_name=""
+  # Walk through args, find an arg that maps to an existing test file
+  local a
+  for a in "$@"; do
+    [ -z "$a" ] && continue
+    [ -f "$OOSH_DIR/test/test.$a" ] && test_name="$a"
+  done
+  [ -z "$test_name" ] && return 0
+  # Emit full labels AND tag-only form so either prefix matches
+  {
+    private.test.suite.list.names "$test_name"
+    private.test.suite.list.tags  "$test_name"
+  } | sort -u | grep "^$1" 2>/dev/null
+}
+
+test.suite.list() # <test> # list all test-case labels from the test file
+{
+  local name="$1"
+  if [ -z "$name" ]; then
+    error.log "Usage: test.suite list <test>"
+    return 1
+  fi
+  local file="$OOSH_DIR/test/test.$name"
+  if [ ! -f "$file" ]; then
+    error.log "No test file: $file"
+    return 1
+  fi
+  # Annotate each label with its source-line number for navigation.
+  # Use [^"]* before the first quote (not .*) — .* is greedy and grabs the
+  # last quoted string when a test.case has both a label and an echo "$var".
+  grep -nE '^[[:space:]]*test\.case[[:space:]]' "$file" \
+    | sed -E 's|^([0-9]+):[^"]*"([^"]+)".*|\2\t(line \1)|'
+}
+test.suite.list.completion.test() { test.suite.run.completion "$@"; }
 
 test.suite.all() # <?logLevel:1> # runs all tests from the test folder
 {
@@ -308,8 +371,6 @@ test.suite.all() # <?logLevel:1> # runs all tests from the test folder
 
 test.case() # <logLevel:-> <testName> <testFunction> <testArguments> # runs a test case and captures result
 {
-  ((TEST_SUITE_TEST_COUNTER++))
-
   local level=$1
   shift
   export testName=$1
@@ -317,6 +378,26 @@ test.case() # <logLevel:-> <testName> <testFunction> <testArguments> # runs a te
   local testFunction="$1"
   shift
   local testArguments="$@"
+
+  # Framework filter: when TEST_CASE_FILTER is set, skip cases whose label or
+  # tag-before-colon does NOT start with the filter value. Skipped cases do
+  # NOT advance TEST_SUITE_TEST_COUNTER and produce no output. We also set
+  # TEST_CASE_SKIPPED=y so subsequent stray expect.pass/expect.fail calls
+  # (outside a case body but tied to it by convention) are no-ops.
+  if [ -n "${TEST_CASE_FILTER:-}" ]; then
+    local __tag="${testName%%:*}"
+    local __pass=""
+    case "$testName" in "$TEST_CASE_FILTER"*) __pass=y ;; esac
+    case "$__tag"     in "$TEST_CASE_FILTER"*) __pass=y ;; esac
+    if [ -z "$__pass" ]; then
+      export TEST_CASE_SKIPPED=y
+      return 0
+    fi
+  fi
+  # Case is (going to be) executed — clear the skip flag so later expects count.
+  export TEST_CASE_SKIPPED=""
+
+  ((TEST_SUITE_TEST_COUNTER++))
 
   if ! [ "$level" = "-" ]; then
     log.level $level
@@ -389,6 +470,7 @@ test.case.expect.error() # <errorCode> <testName> <testFunction> <testArguments>
 
 expect() # <returnValue> <expectedResult> <?message> # asserts test result matches expected
 {
+  [ "${TEST_CASE_SKIPPED:-}" = "y" ] && return 0
   ((TEST_SUITE_EXPECT_COUNTER++))
 
   let EXPECTED_RETURN_VALUE=$1
@@ -430,6 +512,7 @@ expect() # <returnValue> <expectedResult> <?message> # asserts test result match
 
 expect.pass() # <?message> # simple pass assertion with optional message
 {
+  [ "${TEST_CASE_SKIPPED:-}" = "y" ] && return 0
   ((TEST_SUITE_EXPECT_COUNTER++))
   ((TEST_SUITE_SUCCESS_COUNTER++))
 
@@ -442,6 +525,7 @@ expect.pass() # <?message> # simple pass assertion with optional message
 
 expect.fail() # <?message> # simple fail assertion with optional message
 {
+  [ "${TEST_CASE_SKIPPED:-}" = "y" ] && return 0
   ((TEST_SUITE_EXPECT_COUNTER++))
 
   local message="$1"
