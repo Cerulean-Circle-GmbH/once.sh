@@ -49,10 +49,10 @@ private.test.suite.list.names() { # <test> # emit test-case labels from a test f
   [ -z "$name" ] && return 1
   local file="$OOSH_DIR/test/test.$name"
   [ -f "$file" ] || return 1
-  # Match `test.case <something> "label" ...` and extract the FIRST quoted string.
+  # Match `test.case <something> "label" ...` AND `test.def "label" funcName`.
   # Use [^"]* before the first quote (non-greedy) — .*  is greedy and would grab
   # the last quoted string (breaks on lines with a second quoted expect string).
-  grep -hE '^[[:space:]]*test\.case[[:space:]]' "$file" 2>/dev/null \
+  grep -hE '^[[:space:]]*(test\.case|test\.def)[[:space:]]' "$file" 2>/dev/null \
     | sed -E 's/^[^"]*"([^"]+)".*/\1/'
 }
 
@@ -134,18 +134,32 @@ test.suite.init() # # initializes test suite counters and environment
   fi
 }
 
-test.suite.run() # <test> <?logLevel:1> <?filter> # runs a test, optionally filtered to cases whose label starts with <filter>
+test.suite.run() # <test> <?logLevel:3> <?filter> # runs a test, optionally filtered to cases whose label starts with <filter>
 {
-  local command=$1
-  shift
-  local level=$1
-  shift
-  local filter=$1
-  shift
+  # Args type-dispatched so users can put them in any order.
+  # First arg matching an existing test/test.<name> file → command.
+  # Bare digits 0-7 → log level. Anything else not yet claimed → filter.
+  local command="" level="" filter=""
+  local arg
+  for arg in "$@"; do
+    [ -z "$arg" ] && continue
+    if [ -z "$command" ] && [ -f "$OOSH_DIR/test/test.$arg" ]; then
+      command="$arg"
+    elif [ -z "$level" ] && [[ "$arg" =~ ^[0-7]$ ]]; then
+      level="$arg"
+    elif [ -z "$filter" ]; then
+      filter="$arg"
+    fi
+  done
 
-  if [ -z "$level" ]; then
-    level=1
+  if [ -z "$command" ]; then
+    error.log "Usage: test.suite run <test> [<logLevel:3>] [<filter>]"
+    error.log "  available: $(test.suite.run.completion 2>/dev/null | tr '\n' ' ')"
+    return 1
   fi
+
+  # Default log level — 3 (info) is the right default for human consumption.
+  [ -z "$level" ] && level=3
 
   # Export filter so test.case (in this shell) honors it. Empty = run all (back-compat).
   export TEST_CASE_FILTER="$filter"
@@ -219,9 +233,10 @@ test.suite.list() # <test> # list all test-case labels from the test file
     return 1
   fi
   # Annotate each label with its source-line number for navigation.
+  # Includes both legacy test.case and the newer test.def helpers.
   # Use [^"]* before the first quote (not .*) — .* is greedy and grabs the
   # last quoted string when a test.case has both a label and an echo "$var".
-  grep -nE '^[[:space:]]*test\.case[[:space:]]' "$file" \
+  grep -nE '^[[:space:]]*(test\.case|test\.def)[[:space:]]' "$file" \
     | sed -E 's|^([0-9]+):[^"]*"([^"]+)".*|\2\t(line \1)|'
 }
 test.suite.list.completion.test() { test.suite.run.completion "$@"; }
@@ -384,6 +399,9 @@ test.case() # <logLevel:-> <testName> <testFunction> <testArguments> # runs a te
   # NOT advance TEST_SUITE_TEST_COUNTER and produce no output. We also set
   # TEST_CASE_SKIPPED=y so subsequent stray expect.pass/expect.fail calls
   # (outside a case body but tied to it by convention) are no-ops.
+  # Reset RETURN_VALUE/RESULT to safe defaults so any inline `if [ "$RETURN_VALUE"
+  # -eq 0 ]` checks (which the test files write *after* a test.case call) don't
+  # crash with "integer expression expected".
   if [ -n "${TEST_CASE_FILTER:-}" ]; then
     local __tag="${testName%%:*}"
     local __pass=""
@@ -391,6 +409,8 @@ test.case() # <logLevel:-> <testName> <testFunction> <testArguments> # runs a te
     case "$__tag"     in "$TEST_CASE_FILTER"*) __pass=y ;; esac
     if [ -z "$__pass" ]; then
       export TEST_CASE_SKIPPED=y
+      RETURN_VALUE=0
+      RESULT=""
       return 0
     fi
   fi
@@ -452,6 +472,41 @@ test.case() # <logLevel:-> <testName> <testFunction> <testArguments> # runs a te
   if [ "$LOG_LEVEL" -gt "2" ]; then
     echo -e "\e[90m  ← RETURN: $RETURN_VALUE  Result: $RESULT\e[0m"
   fi
+}
+
+# ─── test.def: each test as a NAMED FUNCTION (callable directly) ──────────────
+# Pattern in a test file:
+#   __test_pull_8() {
+#     ... body ...
+#     # internal expect.pass / expect.fail
+#   }
+#   test.def "T-PULL-8: JSONL loop processes all snapshot entries" __test_pull_8
+#
+# Benefits over inline test.case:
+#   - The test body is a real bash function — callable from any shell for
+#     iteration: just run `__test_pull_8` directly.
+#   - Filter mode runs ONLY the matching function — no surrounding setup
+#     between cases re-executes (the function owns its own setup/teardown).
+#   - Counters and filter still flow through test.case for harness integration.
+#
+# test.def delegates to test.case so filter, counters, and skip-flag behavior
+# stay in one place. The function is independently invocable either way.
+test.def() # <label> <funcName> # register a test as a named, callable function
+{
+  local label="$1" fn="$2"
+  if [ -z "$label" ] || [ -z "$fn" ]; then
+    error.log "Usage: test.def <label> <funcName>"
+    return 1
+  fi
+  if ! type -t "$fn" >/dev/null 2>&1; then
+    error.log "test.def: function '$fn' is not defined — define it before calling test.def"
+    return 1
+  fi
+  test.case "-" "$label" "$fn"
+}
+test.def.completion.label() {
+  # Bash completes against current registry; functions follow OOSH conv.
+  echo "T-MY-CASE-1:"
 }
 
 test.case.expect.error() # <errorCode> <testName> <testFunction> <testArguments> # runs test case expecting specific error
