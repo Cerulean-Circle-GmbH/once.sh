@@ -605,19 +605,32 @@ private.hiveMind.session.lookup() {
 
 private.hiveMind.active.team() {
   # Return the active team name. Falls back to first registered team, then cursorOrchestrator.
+  # All candidates are validated against tmux — stale sessions are skipped.
+  local candidate
   if [ -f "$HIVEMIND_ACTIVE_TEAM_FILE" ] && [ -s "$HIVEMIND_ACTIVE_TEAM_FILE" ]; then
-    cat "$HIVEMIND_ACTIVE_TEAM_FILE"
-    return 0
+    candidate=$(cat "$HIVEMIND_ACTIVE_TEAM_FILE" 2>/dev/null)
+    if [ -n "$candidate" ] && otmux has "$candidate" 2>/dev/null; then
+      echo "$candidate"
+      return 0
+    fi
+    # Stale active-team file — ignore and fall through
   fi
-  # Fall back to first registered team from teams file
+  # Fall back to first LIVE registered team from teams file
   if [ -f "$HIVEMIND_TEAMS" ] && [ -s "$HIVEMIND_TEAMS" ]; then
-    head -1 "$HIVEMIND_TEAMS" | cut -d'|' -f1
-    return 0
+    while IFS='|' read -r candidate _rest; do
+      [ -z "$candidate" ] && continue
+      otmux has "$candidate" 2>/dev/null && echo "$candidate" && return 0
+    done < "$HIVEMIND_TEAMS"
   fi
-  # Fall back to first team found in roles registry
+  # Fall back to first LIVE team found in roles registry
   if [ -f "$HIVEMIND_REGISTRY" ] && [ -s "$HIVEMIND_REGISTRY" ]; then
-    head -1 "$HIVEMIND_REGISTRY" | cut -d':' -f1
-    return 0
+    local seen=""
+    while IFS= read -r candidate; do
+      [ -z "$candidate" ] && continue
+      case " $seen " in *" $candidate "*) continue;; esac
+      seen="$seen $candidate"
+      otmux has "$candidate" 2>/dev/null && echo "$candidate" && return 0
+    done < <(cut -d':' -f1 "$HIVEMIND_REGISTRY" 2>/dev/null)
   fi
   # Ultimate fallback
   echo "cursorOrchestrator"
@@ -1277,42 +1290,50 @@ hiveMind.pane.focus() # <agentName> # focus on specific agent pane
 hiveMind.resolve() # <agentName> <?session> # resolve agent name to pane target via role registry
 {
   local name="$1"
-  local session="${2:-$(private.hiveMind.active.team)}"
+  local explicitSession="$2"
+  local session="${explicitSession:-$(private.hiveMind.active.team)}"
 
   if [ -z "$name" ]; then
     error.log "Usage: hiveMind resolve <name>"
     return 1
   fi
 
-  local match
-  match=$(private.hiveMind.registry.find "$name" "$session")
+  local canonical
+  canonical=$(private.hiveMind.resolve.alias "$name")
+  local match=""
 
-  # If no direct match, try canonical alias (e.g. agent-teacher → orchestrator)
-  if [ -z "$match" ]; then
-    local canonical
-    canonical=$(private.hiveMind.resolve.alias "$name")
-    if [ "$canonical" != "$name" ]; then
-      match=$(private.hiveMind.registry.find "$canonical" "$session")
+  # Scope 1: active/explicit team — direct name then alias
+  match=$(private.hiveMind.registry.find "$name" "$session")
+  [ -n "$match" ] && { debug.log "resolve: $name → $match via active team $session"; echo "$match"; return 0; }
+  if [ "$canonical" != "$name" ]; then
+    match=$(private.hiveMind.registry.find "$canonical" "$session")
+    [ -n "$match" ] && { debug.log "resolve: $name → $match via active team $session (alias $canonical)"; echo "$match"; return 0; }
+  fi
+
+  # Scope 2: caller's current tmux session (when we're inside tmux) — only if no explicit session given
+  if [ -z "$explicitSession" ] && [ -n "$TMUX" ]; then
+    local callerSession
+    callerSession=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+    if [ -n "$callerSession" ] && [ "$callerSession" != "$session" ]; then
+      match=$(private.hiveMind.registry.find "$name" "$callerSession")
+      [ -n "$match" ] && { debug.log "resolve: $name → $match via caller session $callerSession"; echo "$match"; return 0; }
+      if [ "$canonical" != "$name" ]; then
+        match=$(private.hiveMind.registry.find "$canonical" "$callerSession")
+        [ -n "$match" ] && { debug.log "resolve: $name → $match via caller session $callerSession (alias $canonical)"; echo "$match"; return 0; }
+      fi
     fi
   fi
 
-  # If no match in specified session, search ALL sessions
-  if [ -z "$match" ]; then
-    match=$(private.hiveMind.registry.find "$name")
-  fi
-  if [ -z "$match" ]; then
-    local canonical
-    canonical=$(private.hiveMind.resolve.alias "$name")
-    [ "$canonical" != "$name" ] && match=$(private.hiveMind.registry.find "$canonical")
+  # Scope 3: cross-team fallback — any session (first live match)
+  match=$(private.hiveMind.registry.find "$name")
+  [ -n "$match" ] && { debug.log "resolve: $name → $match via cross-team fallback"; echo "$match"; return 0; }
+  if [ "$canonical" != "$name" ]; then
+    match=$(private.hiveMind.registry.find "$canonical")
+    [ -n "$match" ] && { debug.log "resolve: $name → $match via cross-team fallback (alias $canonical)"; echo "$match"; return 0; }
   fi
 
-  if [ -n "$match" ]; then
-    echo "$match"
-    return 0
-  else
-    error.log "No agent matching '$name' in any session"
-    return 1
-  fi
+  error.log "No agent matching '$name' in any session"
+  return 1
 }
 
 hiveMind.send() # <agentName> <text...> # send text/keys to agent by name (delegates to otmux send)
@@ -1805,20 +1826,13 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
     local sid
     sid=$(private.hiveMind.session.resolve.uuid "$paneTarget" 2>/dev/null)
 
-    # Role from live discovery → registry → title fallback
+    # Role priority (correct order): customTitle (live.discover) → registry → pane title → "unknown"
+    # DRY: role.fromTitle already strips prefixes / @model / whitespace / generic markers.
     local role
     role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
-    if [ -z "$role" ]; then
-      role=$(private.hiveMind.registry.get "$paneTarget" 2>/dev/null)
-    fi
-    if [ -z "$role" ] || [ "$role" = "unknown" ]; then
-      role="${title}"
-      role=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
-      role="${role#✳ }"; role="${role#⠐ }"; role="${role#⠂ }"; role="${role#✻ }"; role="${role#✢ }"; role="${role#✶ }"
-      role="${role%%@*}"
-      role=$(echo "$role" | tr -d '[:space:]' | head -c 30)
-      [ -z "$role" ] && role="unknown"
-    fi
+    [ -z "$role" ] && role=$(private.hiveMind.registry.get "$paneTarget" 2>/dev/null)
+    [ -z "$role" ] && role=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
+    [ -z "$role" ] && role="unknown"
 
     echo "${sess}|${addr}|${role}|${sid:-}|${role:-}" >> "$tmpEntries"
     count=$((count + 1))
@@ -4284,26 +4298,55 @@ hiveMind.agent.monitor() # <agentName> <?lines:30> # capture pane output for age
   otmux pane.capture "$target" "$lines"
   echo ""
 }
-hiveMind.team.monitor() # <?session> <?lines:30> # capture pane output for all agents in session
+hiveMind.team.monitor() # <?session> <?agentName> <?lines:30> # capture pane output for agents in session (optionally filtered by agent)
 {
   local session="${1:-$(private.hiveMind.active.team)}"
-  local lines="${2:-30}"
+  # $2 may be a line count (all digits) OR an agent-name filter
+  local filterAgent=""
+  local lines="30"
+  if [ -n "$2" ]; then
+    if [[ "$2" =~ ^[0-9]+$ ]]; then
+      lines="$2"
+    else
+      filterAgent="$2"
+      [ -n "$3" ] && lines="$3"
+    fi
+  fi
 
   if ! otmux has "$session" 2>/dev/null; then
     error.log "Session '$session' not found"
     return 1
   fi
 
+  # If agent filter given, resolve once and constrain to that single pane
+  local filterPaneIdx=""
+  if [ -n "$filterAgent" ]; then
+    local filterTarget
+    filterTarget=$(hiveMind.resolve "$filterAgent" "$session" 2>/dev/null)
+    local filterRc=$?
+    # error.log writes to stdout, so also validate the format before trusting
+    if [ "$filterRc" -ne 0 ] || ! [[ "$filterTarget" =~ ^[A-Za-z0-9_.-]+:[0-9]+\.[0-9]+$ ]]; then
+      error.log "Agent '$filterAgent' not found in session '$session'"
+      return 1
+    fi
+    filterPaneIdx="${filterTarget##*.}"
+  fi
+
   local own_pane=""
   [ -n "$TMUX_PANE" ] && own_pane="$TMUX_PANE"
 
   echo -e "${GRAY}═══════════════════════════════════════════════════════════${NORMAL}"
-  echo -e " ${BOLD_CYAN}team.monitor${NORMAL} — ${BOLD_WHITE}$session${NORMAL} ${GRAY}(last $lines lines)${NORMAL}"
+  if [ -n "$filterAgent" ]; then
+    echo -e " ${BOLD_CYAN}team.monitor${NORMAL} — ${BOLD_WHITE}$session${NORMAL} ${GRAY}/ $filterAgent (last $lines lines)${NORMAL}"
+  else
+    echo -e " ${BOLD_CYAN}team.monitor${NORMAL} — ${BOLD_WHITE}$session${NORMAL} ${GRAY}(last $lines lines)${NORMAL}"
+  fi
   echo -e "${GRAY}═══════════════════════════════════════════════════════════${NORMAL}"
 
   otmux panes -t "$session" -F "#{pane_id}|#{pane_index}|#{pane_title}" 2>/dev/null | \
     while IFS='|' read -r pane_id pane_idx pane_title; do
       [ -n "$own_pane" ] && [ "$pane_id" = "$own_pane" ] && continue
+      [ -n "$filterPaneIdx" ] && [ "$pane_idx" != "$filterPaneIdx" ] && continue
       local label="${pane_title:-pane $pane_idx}"
       echo -e "${GRAY}───────────────────────────────────────────────────────────${NORMAL}"
       echo -e " ${GRAY}[$pane_idx]${NORMAL} ${BOLD_WHITE}$label${NORMAL}"
@@ -4311,6 +4354,12 @@ hiveMind.team.monitor() # <?session> <?lines:30> # capture pane output for all a
       otmux pane.capture "${session}:0.${pane_idx}" "$lines"
       echo ""
     done
+}
+hiveMind.team.monitor.completion.session() {
+  private.hiveMind.teams.complete 2>/dev/null
+}
+hiveMind.team.monitor.completion.agentName() {
+  private.hiveMind.roles.complete 2>/dev/null
 }
 hiveMind.agent.approve() # <pane> <?option:2> # approve a permission prompt in a pane
 {
