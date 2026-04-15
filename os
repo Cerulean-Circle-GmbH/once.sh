@@ -64,9 +64,13 @@ private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI 
   local notests="$3"
 
   if ! command -v gh >/dev/null 2>&1; then
-    error.log "gh CLI not found — install with: oo cmd gh"
-    create.result 1 "FAIL"
-    return 1
+    console.log "Installing gh CLI for CI platform testing..."
+    oo cmd gh
+  fi
+
+  if ! gh auth status >/dev/null 2>&1; then
+    console.log "gh CLI is not authenticated — starting login..."
+    gh auth login
   fi
 
   local branch

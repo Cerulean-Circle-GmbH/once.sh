@@ -155,20 +155,20 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test: missing gh CLI gives clear FAIL result
+# Test: missing gh CLI triggers auto-install attempt
 # ─────────────────────────────────────────────────────────────────────────────
-(
+_AUTO_OUTPUT=$(
   emptyDir=$(mktemp -d)
   PATH="$emptyDir"
-  private.os.platform.test.ci macos 2>/dev/null
-  echo "$RESULT"
-  rmdir "$emptyDir"
-) | grep -q "FAIL"
-if [ $? -eq 0 ]; then
-  expect.pass "missing gh CLI returns FAIL result"
+  private.os.platform.test.ci macos 2>&1
+  rmdir "$emptyDir" 2>/dev/null
+)
+if echo "$_AUTO_OUTPUT" | grep -q "oo: command not found"; then
+  expect.pass "missing gh CLI triggers auto-install (oo cmd gh attempted)"
 else
-  expect.fail "missing gh CLI should return FAIL result"
+  expect.fail "missing gh CLI should trigger auto-install, got: $_AUTO_OUTPUT"
 fi
+unset _AUTO_OUTPUT
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: completion function exists
