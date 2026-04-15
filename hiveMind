@@ -33,6 +33,7 @@
 : ${HIVEMIND_SESSIONS:=${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}
 : ${HIVEMIND_TEAMS:=${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
+: ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
 
 # Default agent roles
 HIVEMIND_DEFAULT_AGENTS=(
@@ -3831,6 +3832,165 @@ hiveMind.team.list() # # list all registered team sessions
 
   error.log "No team or role registry found"
   return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT SNAPSHOTS — golden fork-source per role for re-forking trained agents
+# Storage: $HIVEMIND_SNAPSHOTS (role|uuid|timestamp|ctxRemainingPct)
+# See session/tasks/agent-persistence-and-forking.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.snapshots.ensure.dir() {
+  mkdir -p "$(dirname "$HIVEMIND_SNAPSHOTS")" 2>/dev/null
+}
+
+private.hiveMind.snapshot.get() { # <role> # echo "uuid|timestamp|ctxPct" or empty
+  local role="$1"
+  [ -z "$role" ] && return 1
+  [ -f "$HIVEMIND_SNAPSHOTS" ] || return 1
+  grep "^${role}|" "$HIVEMIND_SNAPSHOTS" 2>/dev/null | tail -1 | cut -d'|' -f2-
+}
+
+private.hiveMind.snapshot.set() { # <role> <uuid> <ctxPct> # upsert snapshot
+  local role="$1" uuid="$2" ctx="${3:-unknown}"
+  [ -z "$role" ] || [ -z "$uuid" ] && { error.log "snapshot.set: missing role or uuid"; return 1; }
+  private.hiveMind.snapshots.ensure.dir
+  local ts
+  ts=$(date +%Y-%m-%dT%H:%M:%S)
+  if [ -f "$HIVEMIND_SNAPSHOTS" ]; then
+    grep -v "^${role}|" "$HIVEMIND_SNAPSHOTS" > "${HIVEMIND_SNAPSHOTS}.tmp" 2>/dev/null
+    mv "${HIVEMIND_SNAPSHOTS}.tmp" "$HIVEMIND_SNAPSHOTS"
+  fi
+  echo "${role}|${uuid}|${ts}|${ctx}" >> "$HIVEMIND_SNAPSHOTS"
+}
+
+private.hiveMind.snapshot.jsonl.path() { # <uuid> # echo local JSONL path or empty
+  local uuid="$1"
+  [ -z "$uuid" ] && return 1
+  local d
+  for d in "$HOME/.claude/projects"/*/; do
+    [ -f "${d}${uuid}.jsonl" ] && echo "${d}${uuid}.jsonl" && return 0
+  done
+  return 1
+}
+
+hiveMind.agent.snapshot() # <agentName> # register current session UUID as role snapshot
+{
+  local name="$1"
+  [ -z "$name" ] && { error.log "Usage: hiveMind agent.snapshot <agentName>"; return 1; }
+
+  local target
+  target=$(hiveMind.resolve "$name" 2>/dev/null)
+  [ -z "$target" ] && { error.log "Cannot resolve agent '$name' to a pane"; return 1; }
+
+  local role
+  role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+  [ -z "$role" ] && { error.log "No role registered for pane $target"; return 1; }
+
+  local uuid
+  uuid=$(private.hiveMind.session.resolve.uuid "$target" 2>/dev/null)
+  [ -z "$uuid" ] && { error.log "Cannot resolve UUID for pane $target"; return 1; }
+
+  local jsonl
+  jsonl=$(private.hiveMind.snapshot.jsonl.path "$uuid" 2>/dev/null)
+  local ctx="unknown"
+  if [ -n "$jsonl" ] && [ -f "$jsonl" ]; then
+    ctx=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null || echo "unknown")
+    # Fallback: compute from JSONL directly
+    if [ "$ctx" = "unknown" ] && type -t private.claudeCode.context.from.jsonl &>/dev/null; then
+      ctx=$(private.claudeCode.context.from.jsonl "$jsonl" 2>/dev/null || echo "unknown")
+    fi
+  fi
+
+  private.hiveMind.snapshot.set "$role" "$uuid" "$ctx"
+  success.log "Snapshot: ${role} → ${uuid:0:8}... (ctx ${ctx}% remaining)"
+}
+hiveMind.agent.snapshot.completion.agentName() {
+  private.hiveMind.roles.complete 2>/dev/null
+}
+
+hiveMind.snapshot.list() # # list all registered agent snapshots with valid/stale flag
+{
+  if [ ! -f "$HIVEMIND_SNAPSHOTS" ] || [ ! -s "$HIVEMIND_SNAPSHOTS" ]; then
+    echo "No snapshots registered"
+    return 0
+  fi
+
+  echo ""
+  printf "${BOLD_WHITE}%-20s %-38s %-20s %-10s %s${NORMAL}\n" "ROLE" "UUID" "TIMESTAMP" "CTX%" "STATUS"
+  echo "─────────────────────────────────────────────────────────────────────────────────────────────"
+
+  local role uuid ts ctx jsonl color status
+  while IFS='|' read -r role uuid ts ctx; do
+    [ -z "$role" ] && continue
+    jsonl=$(private.hiveMind.snapshot.jsonl.path "$uuid" 2>/dev/null)
+    if [ -n "$jsonl" ]; then
+      color="${BOLD_GREEN}"
+      status="valid"
+    else
+      color="${BOLD_RED}"
+      status="stale"
+    fi
+    printf "${color}%-20s %-38s %-20s %-10s %s${NORMAL}\n" \
+      "$role" "$uuid" "$ts" "${ctx:-?}" "$status"
+  done < "$HIVEMIND_SNAPSHOTS"
+  echo ""
+}
+
+hiveMind.agent.respawn() # <agentName> # fork role snapshot into pane + /rename + re-register
+{
+  local name="$1"
+  [ -z "$name" ] && { error.log "Usage: hiveMind agent.respawn <agentName>"; return 1; }
+
+  local target
+  target=$(hiveMind.resolve "$name" 2>/dev/null)
+  [ -z "$target" ] && { error.log "Cannot resolve agent '$name' to a pane"; return 1; }
+
+  local role
+  role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+  [ -z "$role" ] && role="$name"  # name might already be the role
+
+  local snapLine
+  snapLine=$(private.hiveMind.snapshot.get "$role" 2>/dev/null)
+  [ -z "$snapLine" ] && { error.log "No snapshot registered for role '$role'. Run: hiveMind agent.snapshot $role"; return 1; }
+
+  local uuid
+  uuid=$(echo "$snapLine" | cut -d'|' -f1)
+  [ -z "$uuid" ] && { error.log "Corrupt snapshot entry for role '$role'"; return 1; }
+
+  # Validate JSONL still on disk
+  local jsonl
+  jsonl=$(private.hiveMind.snapshot.jsonl.path "$uuid" 2>/dev/null)
+  [ -z "$jsonl" ] && { error.log "Snapshot JSONL missing for role '$role' (uuid ${uuid:0:8}... stale). Re-snapshot a live agent."; return 1; }
+
+  # Safety: refuse if Claude still running in target pane
+  if "$OOSH_DIR/claudeCode" process.running "$target" 2>/dev/null; then
+    error.log "Claude already running in $target — send /exit first or kill the pane before respawn"
+    return 1
+  fi
+
+  info.log "Respawning ${role} in ${target} from snapshot ${uuid:0:8}..."
+  otmux send.enter "$target" "claudeCode fork $uuid"
+
+  # Give Claude a few seconds to start the forked session
+  sleep 5
+
+  # Write-through: capture the child UUID into sessions.env
+  local newUuid
+  newUuid=$(private.hiveMind.session.resolve.uuid "$target" 2>/dev/null)
+  [ -n "$newUuid" ] && info.log "Child UUID: ${newUuid:0:8}..."
+
+  # /rename inside Claude TUI so customTitle matches role
+  otmux send.raw "$target" "/rename $role" Enter 2>/dev/null
+  sleep 1
+
+  # Reaffirm pane↔role registration
+  private.hiveMind.registry.set "$target" "$role"
+
+  success.log "Respawned ${role} in ${target} (fork of ${uuid:0:8}... → ${newUuid:0:8}...)"
+}
+hiveMind.agent.respawn.completion.agentName() {
+  private.hiveMind.roles.complete 2>/dev/null
 }
 
 hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane details (with session)

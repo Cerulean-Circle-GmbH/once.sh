@@ -24,14 +24,38 @@ private.claudeCode.complete.panes() {
   tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
 }
 private.claudeCode.complete.sessionIds() {
+  # Filter: emit UUID only if LIVE (in a Claude process) OR REGISTERED (in hivemind.sessions.env).
+  # Orphan JSONLs (dead) are excluded from tab completion.
   local claudeProjectsDir="$HOME/.claude/projects"
+  local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  local liveUuids=""
+  local regUuids=""
+  if command -v ps &>/dev/null; then
+    liveUuids=$(ps -eo args= 2>/dev/null | grep -i 'claude' | grep -v grep | \
+      grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | sort -u)
+  fi
+  [ -f "$sesFile" ] && regUuids=$(cut -d'|' -f2 "$sesFile" 2>/dev/null | sort -u)
+
+  local sid
   for projectDir in "$claudeProjectsDir"/*; do
     [ ! -d "$projectDir" ] && continue
     local indexFile="$projectDir/sessions-index.json"
     if [ -f "$indexFile" ] && command -v jq &>/dev/null; then
-      jq -r '.entries[].sessionId' "$indexFile" 2>/dev/null
+      while read -r sid; do
+        [ -z "$sid" ] && continue
+        if echo "$liveUuids" | grep -q "$sid" || echo "$regUuids" | grep -q "$sid"; then
+          echo "$sid"
+        fi
+      done < <(jq -r '.entries[].sessionId' "$indexFile" 2>/dev/null)
     else
-      ls "$projectDir"/*.jsonl 2>/dev/null | xargs -I{} basename {} .jsonl
+      local f
+      for f in "$projectDir"/*.jsonl; do
+        [ -f "$f" ] || continue
+        sid=$(basename "$f" .jsonl)
+        if echo "$liveUuids" | grep -q "$sid" || echo "$regUuids" | grep -q "$sid"; then
+          echo "$sid"
+        fi
+      done
     fi
   done
 }
@@ -101,6 +125,13 @@ claudeCode.list() # <?--json> # list all Claude Code sessions on this host in tr
   local totalSessions=0
   local totalProjects=0
 
+  # Precompute live UUIDs once — used to detect DEAD (orphan JSONL) entries.
+  local liveUuids=""
+  if command -v ps &>/dev/null; then
+    liveUuids=$(ps -eo args= 2>/dev/null | grep -i 'claude' | grep -v grep | \
+      grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | sort -u)
+  fi
+
   for projectDir in "$CLAUDE_PROJECTS_DIR"/*; do
     [ ! -d "$projectDir" ] && continue
 
@@ -154,10 +185,29 @@ claudeCode.list() # <?--json> # list all Claude Code sessions on this host in tr
           # Last active from file mtime
           local lastActive
           lastActive=$(stat -f '%Sm' -t '%b %d %H:%M' "$f" 2>/dev/null || stat -c '%y' "$f" 2>/dev/null | cut -c1-16)
-          # Color: green=has pane (active), yellow=<24h, gray=old
+          # Color + status marker:
+          #   RED [DEAD]        — no pane AND no live process
+          #   CYAN [FORK-READY] — has pane + role + 60..80% ctx used (remaining 20..40)
+          #   GREEN             — has pane (active)
+          #   YELLOW            — no pane, mtime < 24h (recent)
+          #   GRAY              — old/inactive
           local color="${GRAY}"
-          if [ -n "$regPane" ]; then
+          local marker=""
+          if [ -z "$regPane" ] && ! echo "$liveUuids" | grep -q "$sid"; then
+            color="${BOLD_RED}"
+            marker=" [DEAD]"
+          elif [ -n "$regPane" ]; then
             color="${BOLD_GREEN}"
+            # Check fork-ready: role known + context remaining in 20..40 (= 60..80% used)
+            if [ -n "$regRole" ] && type -t private.claudeCode.context.from.jsonl &>/dev/null; then
+              local ctxR
+              ctxR=$(private.claudeCode.context.from.jsonl "$f" 2>/dev/null)
+              if [[ "$ctxR" =~ ^[0-9]+(\.[0-9]+)?$ ]] && \
+                 awk "BEGIN{exit !($ctxR>=20 && $ctxR<=40)}"; then
+                color="${BOLD_CYAN}"
+                marker=" [FORK-READY]"
+              fi
+            fi
           else
             local mtime_epoch
             mtime_epoch=$(stat -f '%m' "$f" 2>/dev/null || stat -c '%Y' "$f" 2>/dev/null)
@@ -168,7 +218,7 @@ claudeCode.list() # <?--json> # list all Claude Code sessions on this host in tr
             fi
           fi
           local RST=$'\e[0m'
-          printf "%s ${color}%-36s${RST}  ${BOLD_WHITE}%-16s${RST} ${BOLD_CYAN}%-18s${RST} ${color}%s${RST}\n" "$prefix" "$sid" "${label}" "${paneLabel}" "${lastActive}"
+          printf "%s ${color}%-36s${RST}  ${BOLD_WHITE}%-16s${RST} ${BOLD_CYAN}%-18s${RST} ${color}%s${RST}${color}%s${RST}\n" "$prefix" "$sid" "${label}" "${paneLabel}" "${lastActive}" "${marker}"
         done
       else
         echo "└── (no sessions)"
