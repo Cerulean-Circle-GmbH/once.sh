@@ -31,8 +31,9 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 
 ## Infrastructure Tools
 
+- [SSH Management (ossh)](ossh.md) - SSH keys, configs, remote installation, ProxyJump multi-hop
 - [Docker Wrapper (odocker)](odocker.md) - Docker image/container management, workspace builds, container reset
-- [Promotion Pipeline (promote)](promote.md) - Code promotion with gated tests (dev → stage → prod)
+- [Promotion Pipeline (promote)](promote.md) - Code promotion with gated tests (dev → testing → prod)
 - [OS & Platform Testing (os)](os.md) - OS detection, platform install tests
 - [Supported Platforms](supported-platforms.md) - Platform matrix, tiers, and install requirements
 - [Branching Strategy](branching.md) - Branch naming, promotion flow, feature/hotfix conventions
