@@ -694,7 +694,7 @@ ossh.install.log.completion.sshConfigHost() {
   ossh.config.get.completion "$@"
 }
 
-ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on <sshConfigHost> using shared folder model
+ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on <sshConfigHost>, delegating to the remote user.oosh.install
 {
   local sshConfigHost="$1"
   if [ -n "$1" ]; then
@@ -712,20 +712,39 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
     return 1
   fi
 
-  important.log "Setting up oosh for user '$targetUser' on $sshConfigHost (shared folder model)..."
+  important.log "Setting up oosh for user '$targetUser' on $sshConfigHost (delegating to remote user.oosh.install)..."
 
-  # 1. Create user on remote if it doesn't exist. user.create itself defaults
-  # the password to the username and applies it via user.password.set (cross-
-  # platform), so no manual chpasswd/dscl fallback is needed here.
+  # Caller's current oosh branch — passed to the remote so the target
+  # user's ~/oosh points at the same branch the caller is on.
+  local ooshBranch
+  ooshBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ -z "$ooshBranch" ] && ooshBranch="${OOSH_MODE:-dev}"
+
+  # 1. Create user on remote if missing. user.create auto-invokes
+  #    user.oosh.install at its tail (see user:567), so the "created-now"
+  #    branch is already fully populated when this returns.
+  local userExists=1
   if ! private.ossh.ssh "$sshConfigHost" "id '$targetUser'" >/dev/null 2>&1; then
-    important.log "User '$targetUser' does not exist on $sshConfigHost — creating..."
+    userExists=0
+    important.log "User '$targetUser' does not exist on $sshConfigHost — creating (auto-installs oosh)..."
     private.ossh.ssh -tt "$sshConfigHost" "sudo bash -lc 'source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; user create $targetUser'" || {
       error.log "Failed to create user '$targetUser' on $sshConfigHost"
       return 1
     }
   fi
 
-  # Resolve target user's home directory (may differ from $HOME if connected as different user)
+  # 2. If the user already existed, invoke user.oosh.install remotely with
+  #    the caller's branch. Runs as the SSH user (admin) — their env gives
+  #    $SUDO="sudo" — and user.oosh.install internally uses literal
+  #    `sudo -H -u <target>` so user-switching works regardless.
+  if [ "$userExists" = "1" ]; then
+    private.ossh.ssh -tt "$sshConfigHost" "bash -lc 'user oosh.install $targetUser $ooshBranch'" || {
+      error.log "user.oosh.install failed on $sshConfigHost for $targetUser"
+      return 1
+    }
+  fi
+
+  # 3. Resolve the target's home (needed for the remote key push below).
   local targetHome
   targetHome=$(private.ossh.ssh "$sshConfigHost" "
     if command -v getent >/dev/null 2>&1; then
@@ -736,208 +755,10 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
       awk -F: '\$1==\"$targetUser\" {print \$6}' /etc/passwd
     fi
   ")
-  if [ -z "$targetHome" ]; then
-    targetHome="/home/$targetUser"
-  fi
-  info.log "Target home: $targetHome"
+  [ -z "$targetHome" ] && targetHome="/home/$targetUser"
 
-  # 2. Get shared paths from developking's home (created by state machine state 21)
-  # getent is not available on macOS — use dscl as fallback
-  local devHome
-  devHome=$(private.ossh.ssh "$sshConfigHost" "if command -v getent >/dev/null 2>&1; then getent passwd developking 2>/dev/null | cut -d: -f6; else dscl . -read /Users/developking NFSHomeDirectory 2>/dev/null | cut -d' ' -f2; fi")
-  if [ -z "$devHome" ]; then
-    error.log "developking user not found on $sshConfigHost — root install may not have completed"
-    return 1
-  fi
-  local dir
-  dir=$(private.ossh.ssh "$sshConfigHost" "dirname '$devHome'")
-  local sharedConfig="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-  # Determine branch folder name from local git branch (matches what root install created)
-  local ooshBranch
-  ooshBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  local sharedOosh="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/$ooshBranch"
-  info.log "Shared config: $sharedConfig"
-  info.log "Shared oosh:   $sharedOosh"
-
-  # 3. Verify shared infrastructure exists
-  private.ossh.ssh "$sshConfigHost" "[ -d '$sharedOosh' ]" || {
-    error.log "Shared oosh not found at $sharedOosh — run 'ossh install $sshConfigHost' (root) first"
-    return 1
-  }
-
-  # 4-5. Remove leftover bootstrap, symlink config and oosh to shared folders
-  # Run as target user (sudo -H -u) so ~ resolves to target user's home, not SSH user's
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    cd ~
-    # Remove leftover init/oosh bootstrap file
-    if [ -f ~/oosh ] && [ ! -d ~/oosh ]; then
-      echo \"Removing leftover init/oosh bootstrap file\"
-      rm -f ~/oosh
-    fi
-    # Back up existing config if not already symlinked
-    if [ -d config ] && [ ! -L config ]; then
-      mv config config.orig
-    fi
-    if [ ! -L config ]; then
-      ln -s \"$sharedConfig\" config
-    fi
-    # Back up existing oosh dir/file if not already symlinked
-    if [ -d oosh ] && [ ! -L oosh ]; then
-      mv oosh oosh.orig
-    fi
-    if [ ! -L oosh ]; then
-      ln -s \"$sharedOosh\" oosh
-    fi
-  '" || {
-    error.log "Failed to create symlinks for $targetUser"
-    return 1
-  }
-  success.log "Symlinked ~/config and ~/oosh to shared folders for $targetUser"
-
-  # 5a1. Copy shared SSH config and deploy key to new user (SSH requires user-owned files)
-  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
-    basehome=\$(dirname \"$targetHome\")
-    [ \"\$basehome\" = / ] && basehome=/home
-    sharedSsh=\"\$basehome/shared/.ssh\"
-    if [ -f \"\$sharedSsh/config\" ]; then
-      mkdir -p \"$targetHome/.ssh\"
-      cp \"\$sharedSsh/config\" \"$targetHome/.ssh/config\" 2>/dev/null
-      cp \"\$sharedSsh/known_hosts\" \"$targetHome/.ssh/known_hosts\" 2>/dev/null
-      cp \"\$sharedSsh/2cuGitHub\" \"$targetHome/.ssh/2cuGitHub\" 2>/dev/null
-      chown -R \"$targetUser\" \"$targetHome/.ssh\" 2>/dev/null
-      chmod 600 \"$targetHome/.ssh/config\" \"$targetHome/.ssh/2cuGitHub\"
-      chmod 644 \"$targetHome/.ssh/known_hosts\"
-    fi
-  '" 2>/dev/null || {
-    warn.log "Could not copy SSH config for $targetUser — continuing"
-  }
-
-  # 5a2. Mark shared oosh as safe directory for git (owned by root, used by non-root user)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    resolved=\"$sharedOosh\"
-    if command -v osascript >/dev/null 2>&1; then
-      resolved=\$(osascript -e \"POSIX path of (POSIX file \\\"\$resolved\\\" as alias)\" 2>/dev/null | sed \"s:/$::\") || resolved=\"$sharedOosh\"
-    fi
-    git config --global --add safe.directory \"\$resolved\"
-  '"
-
-  # 5b. Add user to dev group for shared config write access
-  # usermod may be in /usr/sbin which is not in PATH on Debian
-  # macOS uses dseditgroup instead of usermod/addgroup
-  private.ossh.ssh -tt "$sshConfigHost" "
-    if command -v dseditgroup >/dev/null 2>&1; then
-      sudo dseditgroup -o edit -a '$targetUser' -t user dev 2>/dev/null
-    else
-      _usermod=\$(command -v usermod 2>/dev/null || echo /usr/sbin/usermod)
-      if [ -x \"\$_usermod\" ]; then
-        sudo \"\$_usermod\" -aG dev '$targetUser'
-      elif command -v addgroup >/dev/null 2>&1; then
-        sudo addgroup '$targetUser' dev
-      fi
-    fi
-  " 2>/dev/null || {
-    warn.log "Could not add $targetUser to dev group — shared config may be read-only"
-  }
-
-  # 5c. Add user to docker group if Docker CLI is installed (socket access)
-  private.ossh.ssh "$sshConfigHost" "
-    if command -v docker >/dev/null 2>&1; then
-      if command -v usermod >/dev/null 2>&1 || [ -x /usr/sbin/usermod ]; then
-        _usermod=\$(command -v usermod 2>/dev/null || echo /usr/sbin/usermod)
-        sudo \"\$_usermod\" -aG docker '$targetUser' 2>/dev/null
-      elif command -v addgroup >/dev/null 2>&1; then
-        sudo addgroup '$targetUser' docker 2>/dev/null
-      fi
-    fi
-  " 2>/dev/null
-
-  # 5d. macOS: add user to com.apple.access_ssh group if it already exists.
-  # IMPORTANT: 'dseditgroup -o create' on an existing group wipes its
-  # membership on macOS, which locks out every current member (including
-  # admin) the next time this runs. So: only add <targetUser> if the group
-  # already exists; if it doesn't, SSH is unrestricted — leave that policy
-  # alone. (Same defensive pattern as user.oosh.install.)
-  if private.ossh.ssh "$sshConfigHost" "command -v dseditgroup >/dev/null 2>&1 && dscl . -read /Groups/com.apple.access_ssh >/dev/null 2>&1"; then
-    private.ossh.ssh "$sshConfigHost" "
-      sudo dseditgroup -o edit -a '$targetUser' -t user com.apple.access_ssh
-    " 2>/dev/null || {
-      warn.log "Could not add $targetUser to com.apple.access_ssh — SSH access may be denied on macOS"
-    }
-  fi
-
-  # 6. Install bashrcTemplate (or append source line)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    if [ -f ~/.bashrc ] && [ ! -f ~/.bashrc.pre-oosh ]; then
-      cp ~/.bashrc ~/.bashrc.pre-oosh
-    fi
-    if [ -f ~/oosh/templates/user/bashrcTemplate ]; then
-      cp ~/oosh/templates/user/bashrcTemplate ~/.bashrc
-    else
-      if ! grep -q \"config/user.env\" ~/.bashrc 2>/dev/null; then
-        echo \"\" >> ~/.bashrc
-        echo \"# oosh environment\" >> ~/.bashrc
-        echo \"[ -f ~/config/user.env ] && source ~/config/user.env\" >> ~/.bashrc
-      fi
-    fi
-  '" || {
-    warn.log "Failed to update .bashrc for $targetUser"
-  }
-
-  # 6a2. Ensure .bash_profile sources .bashrc (login shells skip .bashrc without it)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    if [ ! -f ~/.bash_profile ]; then
-      echo \"[ -f ~/.bashrc ] && source ~/.bashrc\" > ~/.bash_profile
-    fi
-  '"
-
-  # 6b. Ensure login shell is bash (Alpine defaults to ash)
-  private.ossh.ssh -tt "$sshConfigHost" "
-    if command -v dscl >/dev/null 2>&1; then
-      currentShell=\$(dscl . -read /Users/'$targetUser' UserShell 2>/dev/null | awk '{print \$2}')
-    else
-      currentShell=\$(getent passwd '$targetUser' 2>/dev/null | cut -d: -f7)
-    fi
-    # Prefer BASH_FILE from user.env (points to brew bash on macOS)
-    userHome=\$(eval echo ~'$targetUser')
-    if [ -f \"\$userHome/config/user.env\" ]; then
-      bashPath=\$(grep '^export BASH_FILE=' \"\$userHome/config/user.env\" | head -1 | cut -d'\"' -f2)
-    fi
-    [ -z \"\$bashPath\" ] && bashPath=\$(command -v bash 2>/dev/null)
-    if [ -n \"\$bashPath\" ] && [ \"\$currentShell\" != \"\$bashPath\" ]; then
-      if command -v chsh >/dev/null 2>&1; then
-        sudo chsh -s \"\$bashPath\" '$targetUser'
-      else
-        # Fallback for Alpine (no chsh): edit /etc/passwd directly
-        sudo sed -i \"s|^$targetUser:\\(.*\\):[^:]*\\\$|$targetUser:\\1:\$bashPath|\" /etc/passwd
-      fi
-    fi
-  " 2>/dev/null || {
-    warn.log "Could not set bash as login shell for $targetUser"
-  }
-
-  # 6c. Add git safe.directory for shared oosh repo (owned by root/developking)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    resolved=\"$sharedOosh\"
-    if command -v osascript >/dev/null 2>&1; then
-      resolved=\$(osascript -e \"POSIX path of (POSIX file \\\"\$resolved\\\" as alias)\" 2>/dev/null | sed \"s:/$::\") || resolved=\"$sharedOosh\"
-    fi
-    git config --global --add safe.directory \"\$resolved\"
-  '" || {
-    warn.log "Failed to add git safe.directory for $targetUser"
-  }
-
-  # 7. Verify state machine from user's perspective
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    if [ -f ~/config/user.env ] && [ -f ~/config/current.state.machine.env ]; then
-      source ~/config/user.env 2>/dev/null
-      source ~/config/current.state.machine.env 2>/dev/null
-      echo \"State machine SETUP_SERVER at [\${state:-unknown}] for user \$(whoami)\"
-    fi
-  '" || {
-    warn.log "State machine verification skipped for $targetUser"
-  }
-
-  # 8. Create SSH key folders
+  # 4. Prep the target's key folders and generate id_rsa if missing.
+  #    (Remote-specific — not part of user.oosh.install's responsibilities.)
   private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
     if [ ! -d ~/.ssh ]; then
       mkdir -p ~/.ssh
@@ -950,7 +771,9 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
     warn.log "Failed to create SSH key folders for $targetUser"
   }
 
-  # 9. Push local public key to user's authorized_keys
+  # 5. Push the CALLER's public key into the TARGET's authorized_keys so
+  #    the caller can SSH in directly as the target user afterwards.
+  #    Remote-specific — no local analogue.
   local keyFile="$HOME/.ssh/public_keys/$( private.ossh.get.file.name ).public_key"
   if [ -f "$keyFile" ]; then
     private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' mkdir -p $targetHome/.ssh/public_keys"
