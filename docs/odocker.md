@@ -11,10 +11,13 @@ The `odocker` script wraps Docker commands following oosh conventions: positiona
 ## Configuration
 
 ```bash
-# Set DockerWorkspaces path (persists in ~/config/user.env)
+# Set DockerWorkspaces path. Canonicalised to absolute before being
+# persisted in $CONFIG_PATH/odocker.env, which user.env sources on
+# every shell startup. Relative paths (e.g. "./workspaces") are resolved
+# against the current cwd, not stored verbatim.
 odocker workspace.set "/path/to/DockerWorkspaces"
 
-# Show current workspace directory
+# Show current workspace directory (and its persistence location)
 odocker workspace.get
 
 # Default (if not set): /var/dev/EAMD.ucp/.../DockerWorkspaces
@@ -122,9 +125,14 @@ The Docker socket gives the container root-level access to the host's Docker dae
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `workspace.get` | | Show current Docker workspaces directory |
-| `workspace.set <path>` | directory path | Set and persist Docker workspaces directory |
+| `workspace.get` | | Show current Docker workspaces directory and where it's persisted |
+| `workspace.set <path>` | directory path | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`) |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
+
+> **Persistence:** `workspace.set` stores the setting in `$CONFIG_PATH/odocker.env`
+> and registers it with `config add` so every new shell inherits the value.
+> Legacy installs that had `ODOCKER_WORKSPACES=` in `user.env` are migrated on
+> the next `workspace.set` call — no dead keys are left behind.
 
 ### Build
 
