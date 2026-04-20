@@ -14,8 +14,10 @@ The `odocker` script wraps Docker commands following oosh conventions: positiona
 # Set DockerWorkspaces path. Canonicalised to absolute before being
 # persisted in $CONFIG_PATH/odocker.env, which user.env sources on
 # every shell startup. Relative paths (e.g. "./workspaces") are resolved
-# against the current cwd, not stored verbatim.
+# against the current cwd, not stored verbatim. With no argument it
+# resets to the platform default (/var/dev/EAMD.ucp/.../DockerWorkspaces).
 odocker workspace.set "/path/to/DockerWorkspaces"
+odocker workspace.set                               # reset to default
 
 # Show current workspace directory (and its persistence location)
 odocker workspace.get
@@ -126,7 +128,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `workspace.get` | | Show current Docker workspaces directory and where it's persisted |
-| `workspace.set <path>` | directory path | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`) |
+| `workspace.set <?path>` | directory path (optional — defaults to the platform default) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to `$ODOCKER_WORKSPACES_DEFAULT` |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
 
 > **Persistence:** `workspace.set` stores the setting in `$CONFIG_PATH/odocker.env`
