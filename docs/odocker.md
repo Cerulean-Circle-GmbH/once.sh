@@ -152,7 +152,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
 | `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount) |
 | `stop <container>` | container name | Stop a running container |
-| `rm <container>` | container name | Remove a stopped container |
+| `container.remove <container>` | container name | Remove a stopped container (old name: `rm`, still works) |
 | `log <container>` | container name, optional line count (default: 50) | Show container logs |
 
 ### Image Operations
@@ -160,7 +160,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `list` | | List all Docker images |
-| `rmi <image>` | image name | Remove an image |
+| `image.remove <image>` | image name | Remove an image (old name: `rmi`, still works) |
 | `file.find <containerOrImage>` | container or image name | Find the Dockerfile that built a container or image |
 
 ### Docker Compose
@@ -218,7 +218,7 @@ ossh login ubuntu24
 
 # 6. When done, clean up
 odocker stop <container_name>
-odocker rm <container_name>
+odocker container.remove <container_name>      # old name: `odocker rm` still works
 ```
 
 ## Troubleshooting
