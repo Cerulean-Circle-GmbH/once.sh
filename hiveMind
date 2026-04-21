@@ -1973,23 +1973,29 @@ hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote ma
     return 1
   fi
 
+  # Ensure LOG_LIVE exists so stderr can be captured for post-mortem.
+  # User watches live with:  log live   (tail -f $LOG_LIVE in another pane)
+  : ${LOG_LIVE:=$HOME/config/log.live.out}
+  touch "$LOG_LIVE" 2>>"$LOG_LIVE"
+  important.log "teams.migrate → $host (stderr captured to $LOG_LIVE — tail with: log live)"
+
   # 1. Validate snapshot
   if [ -z "$snapfile" ]; then
-    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>>"$LOG_LIVE" | head -1)
   fi
   if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
-    echo "No snapshot found. Running teams.save first..."
+    info.log "No snapshot found — running teams.save first"
     hiveMind.teams.save
-    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>>"$LOG_LIVE" | head -1)
   fi
-  echo "Using snapshot: $snapfile"
+  info.log "Using snapshot: $snapfile"
 
   # 2. Transfer ONLY hivemind config files (NOT entire ~/config — that would clobber user.env, PATH, creds)
   echo ""
-  echo "Transferring hiveMind config files to $host..."
-  "$OOSH_DIR/ossh" connection.open "$host" 2>/dev/null
+  important.log "Transferring hiveMind config files to $host..."
+  "$OOSH_DIR/ossh" connection.open "$host" 2>>"$LOG_LIVE"
   # Ensure remote ~/config exists (don't create the dir structure, just the folder)
-  "$OOSH_DIR/ossh" exec "$host" "mkdir -p ~/config" 2>/dev/null
+  "$OOSH_DIR/ossh" exec "$host" "mkdir -p ~/config" 2>>"$LOG_LIVE"
   local configPath="${CONFIG_PATH:-$HOME/config}"
   local pushCount=0 skipCount=0
   # Files we OWN and may safely overwrite on the remote:
@@ -2005,84 +2011,94 @@ hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote ma
            "$configPath"/hivemind.snapshot.*.env; do
     [ -f "$f" ] || { skipCount=$((skipCount + 1)); continue; }
     fname=$(basename "$f")
-    if "$OOSH_DIR/ossh" scp "$f" "${host}:config/${fname}"; then
+    if "$OOSH_DIR/ossh" scp "$f" "${host}:config/${fname}" 2>>"$LOG_LIVE"; then
       info.log "  pushed: $fname"
       pushCount=$((pushCount + 1))
     else
-      warn.log "  failed: $fname"
+      warn.log "  failed: $fname — see $LOG_LIVE"
     fi
   done
   # Also push the specific snapshot we are restoring (belt-and-suspenders if it's older than the glob range)
   local snapname
   snapname=$(basename "$snapfile")
-  if ! "$OOSH_DIR/ossh" exec "$host" "test -f ~/config/${snapname}" 2>/dev/null; then
-    "$OOSH_DIR/ossh" scp "$snapfile" "${host}:config/${snapname}" && pushCount=$((pushCount + 1))
+  if ! "$OOSH_DIR/ossh" exec "$host" "test -f ~/config/${snapname}" 2>>"$LOG_LIVE"; then
+    "$OOSH_DIR/ossh" scp "$snapfile" "${host}:config/${snapname}" 2>>"$LOG_LIVE" && pushCount=$((pushCount + 1))
   fi
-  echo "  Transferred $pushCount hiveMind file(s), skipped $skipCount (not present)"
+  info.log "Transferred $pushCount hiveMind file(s), skipped $skipCount (not present)"
 
   # 3. Transfer JSONL session files
   echo ""
-  echo "Transferring session JSONL files to $host..."
+  important.log "Transferring session JSONL files to $host..."
   local claudeProjectsDir="$HOME/.claude/projects"
-  local transferCount=0
+  local transferCount=0 seenUuids=""
   while IFS='|' read -r sess addr role uuid title <&3; do
     [[ "$sess" == "#"* ]] && continue
     [ -z "$uuid" ] && continue
+    echo "$seenUuids" | grep -q "$uuid" && continue
+    seenUuids="${seenUuids}${uuid} "
     for dir in "$claudeProjectsDir"/*/; do
       if [ -f "${dir}${uuid}.jsonl" ]; then
         local remotePath="${dir}${uuid}.jsonl"
         # Ensure remote directory exists
-        "ossh" exec "$host" "mkdir -p '$(dirname "$remotePath")'" 2>/dev/null
-        "ossh" scp "$remotePath" "${host}:${remotePath}" 2>/dev/null && transferCount=$((transferCount + 1))
+        "$OOSH_DIR/ossh" exec "$host" "mkdir -p '$(dirname "$remotePath")'" 2>>"$LOG_LIVE"
+        if "$OOSH_DIR/ossh" scp "$remotePath" "${host}:${remotePath}" 2>>"$LOG_LIVE"; then
+          info.log "  transferred: ${uuid:0:8}... ($role)"
+          transferCount=$((transferCount + 1))
+        else
+          warn.log "  transfer failed: ${uuid:0:8}... ($role) — see $LOG_LIVE"
+        fi
         break
       fi
     done
   done 3< "$snapfile"
-  echo "Transferred $transferCount JSONL files"
+  info.log "Transferred $transferCount JSONL file(s)"
 
   # 4. Sync oosh code on remote
   echo ""
-  echo "Syncing oosh on $host..."
-  "ossh" exec "$host" "cd ~/oosh && git pull" 2>/dev/null || \
-    "ossh" dir.push "$host" "$OOSH_DIR"
+  important.log "Syncing oosh on $host..."
+  if ! "$OOSH_DIR/ossh" exec "$host" "cd ~/oosh && git pull" 2>>"$LOG_LIVE"; then
+    warn.log "git pull failed on $host — falling back to dir.push"
+    "$OOSH_DIR/ossh" dir.push "$host" "$OOSH_DIR" 2>>"$LOG_LIVE"
+  fi
 
   # 4b. Check prerequisites on remote
   echo ""
-  echo "Checking prerequisites on $host..."
+  important.log "Checking prerequisites on $host..."
   local missing=""
-  missing=$("ossh" exec "$host" '
+  missing=$("$OOSH_DIR/ossh" exec "$host" '
     errors=""
     command -v tmux >/dev/null 2>&1 || { test -x /opt/homebrew/bin/tmux && export PATH=/opt/homebrew/bin:$PATH; } || errors="${errors}tmux "
     command -v claude >/dev/null 2>&1 || test -x ~/.local/bin/claude || errors="${errors}claude "
     echo "$errors"
-  ' 2>/dev/null)
+  ' 2>>"$LOG_LIVE")
   if [ -n "$missing" ]; then
-    error.log "Missing on $host: $missing"
+    error.log "Missing on $host: $missing (see $LOG_LIVE for details)"
     return 1
   fi
-  echo "Prerequisites OK"
+  info.log "Prerequisites OK"
 
   # 5. Model compatibility check — opus[1m] blocks ALL API calls on some subscriptions
   local badModel
-  badModel=$("ossh" exec "$host" 'grep -o "opus\[1m\]" ~/.claude/settings.json 2>/dev/null' 2>/dev/null)
+  badModel=$("$OOSH_DIR/ossh" exec "$host" 'grep -o "opus\[1m\]" ~/.claude/settings.json 2>/dev/null' 2>>"$LOG_LIVE")
   if [ -n "$badModel" ]; then
     warn.log "Remote has opus[1m] model — fixing to opus (200k)"
-    "ossh" exec "$host" "sed -i.bak 's/opus\[1m\]/opus/g' ~/.claude/settings.json" 2>/dev/null
+    "$OOSH_DIR/ossh" exec "$host" "sed -i.bak 's/opus\[1m\]/opus/g' ~/.claude/settings.json" 2>>"$LOG_LIVE"
   fi
 
   # 6. Ensure tmux server running + restore on remote (--fork for cross-machine)
   echo ""
-  echo "Running teams.restore --fork on $host..."
-  "ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore --fork"
+  important.log "Running teams.restore --fork on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore --fork" 2>>"$LOG_LIVE"
 
   # 7. Verify
   echo ""
-  echo "Verifying on $host..."
-  "ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind team.status" 2>/dev/null
+  important.log "Verifying on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind team.status" 2>>"$LOG_LIVE"
 
   echo ""
-  echo "Migration to $host complete."
-  echo "Connect with: ossh login $host"
+  success.log "Migration to $host complete."
+  info.log "Connect with: ossh login $host"
+  info.log "Captured stderr during migrate: $LOG_LIVE"
   return 0
 }
 
