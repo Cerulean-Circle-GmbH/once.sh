@@ -330,10 +330,31 @@ odocker.file.find() # <?containerOrImage> # find Dockerfile that built a contain
     done
   fi
 
-  # --- Tier 4: History reconstruct ---
+  # --- Tier 4: genuine miss — be honest and helpful ---
+  # All three location strategies above have failed. Rather than dumping
+  # `docker image history` as if it were a "reconstruct manually" Dockerfile
+  # (no FROM, base-image metadata interleaved, not valid syntax — the
+  # label misleads more than it informs), explain what we tried, what the
+  # likely origin is, and what the user can do next.
   echo "Image: $image"
   echo "Dockerfile: NOT FOUND"
-  echo "Build history (reconstruct manually):"
+  echo
+  echo "Tried:"
+  echo "  [1] dockerfile.path / dockerfile.dir labels — absent"
+  echo "  [2] docker-compose project working_dir label  — absent"
+  echo "  [3] workspace glob under \$ODOCKER_WORKSPACES — no match"
+  echo
+  echo "Likely origins:"
+  echo "  - pulled from a registry (no Dockerfile exists locally)"
+  echo "  - built with plain 'docker build' (no discovery labels were added)"
+  echo
+  echo "Next steps:"
+  echo "  - if you have the source dir, rebuild with 'odocker build <workspace>'"
+  echo "    which adds dockerfile.path/dir labels so file.find hits Tier 1 next time"
+  echo "  - if this came from a registry, 'docker inspect $image' may have hints"
+  echo
+  echo "Raw build history (NOT a valid Dockerfile — no FROM, base-image"
+  echo "metadata is mixed in; shown for expert inspection only):"
   docker image history --no-trunc --format '  {{.CreatedBy}}' "$image" 2>/dev/null \
     | sed 's|/bin/sh -c #(nop)  ||g; s|/bin/sh -c ||g' \
     | tac
@@ -467,28 +488,75 @@ odocker.run.sshd() # <image> <?name> <?portOrOffset:0> <?docker> # run container
   fi
 
   console.log "Running image: $image with port mappings (offset: $portOffset)"
-  local cid
-  cid=$(docker run -d \
-    $nameOpt \
-    $dockerOpt \
-    -p $sshPort:22 \
-    -p $((8080 + portOffset)):8080 \
-    -p $((8443 + portOffset)):8443 \
-    -p $((5001 + portOffset)):5001 \
-    -p $((5002 + portOffset)):5002 \
-    -p $((5005 + portOffset)):5005 \
-    "$image")
-  local rc=$?
 
-  if [ $rc -eq 0 ]; then
-    local cname
-    cname=$(private.odocker.container.name "$cid")
-    success.log "Container $cname (${cid:0:12}) started (SSH: ssh -p $sshPort root@localhost)"
-    if [ "$dockerArg" = "docker" ]; then
-      odocker.install "$cname"
+  # Inner helper: build + execute the port-mapped `docker run -d` call.
+  # Passing "$1" when non-empty overrides the image's CMD — used for the
+  # keep-alive fallback path below. Declared inside this method so it
+  # doesn't pollute the top-level function table.
+  private.odocker.run.sshd.launch() {
+    local overrideCmd="$1"
+    docker run -d \
+      $nameOpt \
+      $dockerOpt \
+      -p $sshPort:22 \
+      -p $((8080 + portOffset)):8080 \
+      -p $((8443 + portOffset)):8443 \
+      -p $((5001 + portOffset)):5001 \
+      -p $((5002 + portOffset)):5002 \
+      -p $((5005 + portOffset)):5005 \
+      "$image" $overrideCmd
+  }
+
+  # First attempt: let the image's own ENTRYPOINT/CMD run. Happy path for
+  # naked_*_sshd workspace images and anything built to start sshd.
+  local cid
+  cid=$(private.odocker.run.sshd.launch)
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    error.log "docker run failed with exit code $rc"
+    return $rc
+  fi
+
+  # Verify the container is actually Up after a brief settle. `docker run
+  # -d` returns 0 once the container has been started, but a short-lived
+  # default CMD (e.g. ubuntu:24.04 → bash, which exits immediately without
+  # stdin) will already have died by the time we check. Detect and retry
+  # with an explicit keep-alive so the "SSH in a moment" promise is kept.
+  sleep 2
+  if ! docker ps -q --no-trunc --filter "id=$cid" | grep -q .; then
+    warn.log "Container exited immediately — image has no long-running default CMD. Retrying with keep-alive…"
+    docker rm -f "$cid" >/dev/null 2>&1
+
+    # Prefer `sshd -D -e` (daemon, foreground, log to stderr) so the SSH
+    # port mapping is actually useful. Fall back to `sleep infinity` only
+    # if sshd isn't installed in the image — and warn that SSH won't work
+    # in that case (user can still `docker exec` into the container).
+    local keepAlive
+    if docker run --rm --entrypoint /bin/sh "$image" -c 'command -v sshd' >/dev/null 2>&1; then
+      keepAlive="/usr/sbin/sshd -D -e"
+    else
+      keepAlive="sleep infinity"
+      warn.log "$image has no sshd installed — container will stay Up but 'ssh -p $sshPort' won't connect (use 'docker exec' or install openssh-server in the image)"
     fi
-  else
-    error.log "Run failed with exit code $rc"
+    cid=$(private.odocker.run.sshd.launch "$keepAlive")
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      error.log "keep-alive retry failed (rc=$rc). Last logs:"
+      docker logs --tail 20 "$cid" 2>&1 | sed 's/^/  /'
+      return $rc
+    fi
+    sleep 1
+    if ! docker ps -q --no-trunc --filter "id=$cid" | grep -q .; then
+      error.log "container exited even with keep-alive CMD — inspect with 'docker logs $cid'"
+      return 1
+    fi
+  fi
+
+  local cname
+  cname=$(private.odocker.container.name "$cid")
+  success.log "Container $cname (${cid:0:12}) started (SSH: ssh -p $sshPort root@localhost)"
+  if [ "$dockerArg" = "docker" ]; then
+    odocker.install "$cname"
   fi
   return $rc
 }
