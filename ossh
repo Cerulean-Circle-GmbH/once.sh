@@ -446,7 +446,7 @@ private.push.init.oosh() {
   # Run remote installer — always installs to root
   # Pass current git branch as argument (not env var — init/oosh shebang uses env -i which wipes environment)
   local currentBranch
-  currentBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  currentBranch=$(this.git.branch.short "$OOSH_DIR")
   info.log "Running remote oosh installer (root mode, branch: $currentBranch)..."
   # Use '_' placeholder for empty OOSH_SSH_CONFIG_HOST — empty args get lost across SSH + shebang chain
   private.ossh.ssh -tt "$sshConfigHost" "./oosh mode root $sshConfigHost ${OOSH_SSH_CONFIG_HOST:-_} $currentBranch ${OSSH_INSTALL_LOG_LEVEL:-1}"
@@ -507,7 +507,7 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
 
   # Detect branch from initial clone and export for state 21's git checkout
   if [ -z "$OOSH_BRANCH" ]; then
-    OOSH_BRANCH=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    OOSH_BRANCH=$(this.git.branch.short "$OOSH_DIR")
     export OOSH_BRANCH
     important.log "Detected OOSH_BRANCH=$OOSH_BRANCH from $OOSH_DIR"
   fi
@@ -717,7 +717,7 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
   # Caller's current oosh branch — passed to the remote so the target
   # user's ~/oosh points at the same branch the caller is on.
   local ooshBranch
-  ooshBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  ooshBranch=$(this.git.branch.short "$OOSH_DIR")
   [ -z "$ooshBranch" ] && ooshBranch="${OOSH_MODE:-dev}"
 
   # Locate the shared `user` script on the remote. We can't rely on the
@@ -2060,6 +2060,266 @@ ossh.usage()
 
   "
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HARDENING — Debian/Ubuntu remote server hardening, invoked AFTER ossh install.
+# Each sub-method is independently callable; `ossh.harden` chains the five
+# that are safe-by-default. `ossh.harden.sshd.allowusers` is opt-in (empty or
+# wrong AllowUsers list locks unlisted users out).
+# ═══════════════════════════════════════════════════════════════════════════
+
+private.ossh.harden.preflight() # <sshConfigHost> # fail-fast if the remote isn't Debian/Ubuntu, or if key-auth isn't already working
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+
+  # Refuse to proceed if we can't reach the remote non-interactively.
+  # After hardening, PasswordAuthentication will be off; if the caller can
+  # only connect via password today, running harden would lock them out.
+  if ! private.ossh.ssh -o BatchMode=yes "$sshConfigHost" true 2>/dev/null; then
+    error.log "ossh.harden preflight: cannot SSH to $sshConfigHost in BatchMode (no working key). Aborting — hardening would disable password auth and lock you out. Fix your SSH key setup first."
+    return 1
+  fi
+
+  # Detect remote OS family. os.check only inspects the local caller, so we
+  # probe the remote directly — a macOS laptop hardening a Linux VPS is a
+  # normal flow.
+  local remoteOs
+  remoteOs=$(private.ossh.ssh "$sshConfigHost" "uname -s" 2>/dev/null | tr -d '\r\n')
+  if [ "$remoteOs" != "Linux" ]; then
+    error.log "ossh.harden preflight: remote uname -s returned '$remoteOs' — only Linux (Debian/Ubuntu) is supported. Aborting."
+    return 1
+  fi
+
+  local remoteId
+  remoteId=$(private.ossh.ssh "$sshConfigHost" ". /etc/os-release 2>/dev/null && echo \$ID" 2>/dev/null | tr -d '\r\n')
+  case "$remoteId" in
+    debian|ubuntu)
+      info.log "ossh.harden preflight: remote is $remoteId — supported"
+      return 0
+      ;;
+    *)
+      error.log "ossh.harden preflight: remote /etc/os-release ID='$remoteId' — only 'debian' or 'ubuntu' are supported. Aborting."
+      return 1
+      ;;
+  esac
+}
+
+ossh.harden.packages() # <sshConfigHost> # install unattended-upgrades, fail2ban, ufw, htop, nano, bzip2 on the remote (Debian/Ubuntu only)
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.packages: apt update + install on $sshConfigHost"
+  private.ossh.ssh -tt "$sshConfigHost" "sudo bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update &&
+    apt-get -y dist-upgrade &&
+    apt-get -y install unattended-upgrades fail2ban ufw htop nano bzip2
+  '"
+}
+
+ossh.harden.packages.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.unattended.upgrades() # <sshConfigHost> # configure unattended-upgrades: enable, auto-remove unused kernels/deps, reboot at 02:30
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.unattended.upgrades: writing 20auto-upgrades + 51-oosh-unattended-upgrades on $sshConfigHost"
+
+  # The original script used `dpkg-reconfigure --priority=low` for
+  # 20auto-upgrades — that's an interactive TUI. We write the same file
+  # directly, and drop our own settings into 51-oosh-unattended-upgrades
+  # (prefixed `51-` so it loads AFTER any 50-defaults). Idempotent: any
+  # previous identical content is just rewritten, and the per-line grep
+  # guards on the drop-in prevent duplicate appends.
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    cat >/etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists \"1\";
+APT::Periodic::Unattended-Upgrade \"1\";
+EOF
+    for line in \
+      '\''Unattended-Upgrade::Remove-Unused-Kernel-Packages \"true\";'\'' \
+      '\''Unattended-Upgrade::Remove-New-Unused-Dependencies \"true\";'\'' \
+      '\''Unattended-Upgrade::Remove-Unused-Dependencies \"true\";'\'' \
+      '\''Unattended-Upgrade::Automatic-Reboot \"true\";'\'' \
+      '\''Unattended-Upgrade::Automatic-Reboot-Time \"02:30\";'\'' \
+    ; do
+      grep -qF \"\$line\" /etc/apt/apt.conf.d/51-oosh-unattended-upgrades 2>/dev/null \
+        || echo \"\$line\" >>/etc/apt/apt.conf.d/51-oosh-unattended-upgrades
+    done
+  '"
+}
+
+ossh.harden.unattended.upgrades.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.fail2ban() # <sshConfigHost> # enable fail2ban with a minimal [sshd] jail using iptables-multiport
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.fail2ban: writing jail.local + enabling service on $sshConfigHost"
+
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    cat >/etc/fail2ban/jail.local <<EOF
+[sshd]
+enabled = true
+banaction = iptables-multiport
+EOF
+    systemctl enable fail2ban
+    systemctl restart fail2ban
+  '"
+}
+
+ossh.harden.fail2ban.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.firewall() # <sshConfigHost> <?extraPorts> # UFW: default deny-in / allow-out, always allow OpenSSH; extraPorts is a space-separated list of additional ports to open (e.g. "8080/tcp 8443/tcp")
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  shift
+  local extraPorts="$*"
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.firewall: configuring UFW on $sshConfigHost (extraPorts: ${extraPorts:-none})"
+
+  # ORDER MATTERS: allow OpenSSH BEFORE enabling UFW, or enable locks you
+  # out mid-session. `ufw --force enable` skips the interactive
+  # "Y/n proceed?" prompt — safe because OpenSSH is already allowed.
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow OpenSSH
+    for port in $extraPorts; do
+      [ -n \"\$port\" ] && ufw allow \"\$port\"
+    done
+    ufw --force enable
+    ufw status verbose
+  '"
+}
+
+ossh.harden.firewall.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.sshd() # <sshConfigHost> # harden sshd_config: no root, no password, keys only, no forwarding, max 4 auth tries. Does NOT touch AllowUsers — use ossh.harden.sshd.allowusers for that (opt-in to avoid locking users out)
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.sshd: applying sshd_config hardening toggles on $sshConfigHost"
+
+  # `systemctl reload sshd` is safe: active sessions (including ours)
+  # survive a reload; only NEW connections see the new policy.
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    sed -i -e \"/^\\(#\\|\\)PermitRootLogin/s/^.*\\\$/PermitRootLogin no/\"                               /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)PasswordAuthentication/s/^.*\\\$/PasswordAuthentication no/\"                 /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)KbdInteractiveAuthentication/s/^.*\\\$/KbdInteractiveAuthentication no/\"     /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)ChallengeResponseAuthentication/s/^.*\\\$/ChallengeResponseAuthentication no/\" /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)MaxAuthTries/s/^.*\\\$/MaxAuthTries 4/\"                                       /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)AllowTcpForwarding/s/^.*\\\$/AllowTcpForwarding no/\"                         /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)X11Forwarding/s/^.*\\\$/X11Forwarding no/\"                                    /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)AllowAgentForwarding/s/^.*\\\$/AllowAgentForwarding no/\"                     /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)AuthorizedKeysFile/s|^.*\\\$|AuthorizedKeysFile .ssh/authorized_keys|\"        /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)PubkeyAuthentication/s/^.*\\\$/PubkeyAuthentication yes/\"                    /etc/ssh/sshd_config
+    systemctl reload sshd
+  '"
+}
+
+ossh.harden.sshd.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.sshd.allowusers() # <sshConfigHost> <users> # restrict sshd to the given comma- or space-separated user list (appends AllowUsers line). OPT-IN: not invoked by ossh.harden. Include EVERY user who needs SSH access (developking, the ssh-config user, any other sudoer) — unlisted users will be locked out.
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  shift
+  local users="$*"
+  if [ -z "$users" ]; then
+    error.log "no ${YELLOW}users${NORMAL} were specified — refusing to run (empty AllowUsers would lock everyone out)"
+    return 1
+  fi
+  users=$(echo "$users" | tr ',' ' ')
+
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  warn.log "ossh.harden.sshd.allowusers: restricting SSH to: $users — anyone not in this list will be locked out"
+
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    if grep -q \"^AllowUsers \" /etc/ssh/sshd_config; then
+      sed -i -e \"s|^AllowUsers .*|AllowUsers $users|\" /etc/ssh/sshd_config
+    else
+      echo \"AllowUsers $users\" >> /etc/ssh/sshd_config
+    fi
+    systemctl reload sshd
+  '"
+}
+
+ossh.harden.sshd.allowusers.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden() # <sshConfigHost> # orchestrator — run all harden.* sub-methods on <sshConfigHost>. Invoke AFTER `ossh install` has set up users and pushed keys. Skip the AllowUsers restriction by default (use `ossh harden.sshd.allowusers` explicitly if you want it).
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden: hardening $sshConfigHost (packages → unattended-upgrades → fail2ban → firewall → sshd)"
+
+  ossh.harden.packages              "$sshConfigHost"  || { error.log "packages step failed";              return 1; }
+  ossh.harden.unattended.upgrades   "$sshConfigHost"  || { error.log "unattended-upgrades step failed";  return 1; }
+  ossh.harden.fail2ban              "$sshConfigHost"  || { error.log "fail2ban step failed";              return 1; }
+  ossh.harden.firewall              "$sshConfigHost"  || { error.log "firewall step failed";              return 1; }
+  ossh.harden.sshd                  "$sshConfigHost"  || { error.log "sshd step failed";                  return 1; }
+
+  success.log "ossh.harden complete on $sshConfigHost"
+  info.log   "Note: AllowUsers is NOT set — if you want to restrict SSH to specific users, run:"
+  info.log   "  ossh harden.sshd.allowusers $sshConfigHost <user1> <user2> …"
+  info.log   "Include every user who should retain SSH access (e.g. developking and the ssh-config user)."
+}
+
+ossh.harden.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
 
 ossh.start()
 {

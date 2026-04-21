@@ -180,6 +180,44 @@ If `~/.ssh/deploy_keys/2cuGitHub` exists on your machine, `ossh install` automat
 
 This enables `oo update` and `oo checkout` on the remote host.
 
+## Hardening
+
+`ossh.harden` is invoked **after** `ossh install` finishes, on Debian/Ubuntu
+remotes only. It applies a standard baseline: unattended-upgrades,
+fail2ban, UFW, and an opinionated sshd_config. User creation and SSH-key
+distribution are deliberately **not** repeated here — `ossh install` did
+that already; `ossh.harden` only adds the security layers.
+
+```bash
+ossh install myhost admin        # sets up users, keys, shared-oosh infrastructure
+ossh harden  myhost              # locks the box down (no AllowUsers yet — safe default)
+```
+
+Each concern is also callable standalone:
+
+| Method | What it does |
+|---|---|
+| `ossh.harden <host>` | Orchestrator: packages → unattended-upgrades → fail2ban → firewall → sshd. Does **not** touch `AllowUsers`. |
+| `ossh.harden.packages <host>` | `apt update && apt dist-upgrade -y && apt install unattended-upgrades fail2ban ufw htop nano bzip2` |
+| `ossh.harden.unattended.upgrades <host>` | Writes `/etc/apt/apt.conf.d/20auto-upgrades` + `/etc/apt/apt.conf.d/51-oosh-unattended-upgrades` (auto-remove kernels/deps, reboot at 02:30) |
+| `ossh.harden.fail2ban <host>` | Writes `/etc/fail2ban/jail.local` with `[sshd]` block, enables + restarts |
+| `ossh.harden.firewall <host> <?extraPorts>` | UFW default deny-in/allow-out + OpenSSH + any optional extras (e.g. `"8080/tcp 8443/tcp"`) |
+| `ossh.harden.sshd <host>` | sshd_config hardening toggles. Reloads sshd (existing sessions survive). |
+| `ossh.harden.sshd.allowusers <host> <users>` | **Opt-in only.** Appends `AllowUsers`. Include every user who needs SSH access — unlisted users will be locked out. |
+
+### Preflight safety gate
+
+Every `ossh.harden.*` method runs `private.ossh.harden.preflight` first,
+which refuses to proceed if:
+- The caller cannot SSH in `BatchMode` (only password auth works — hardening would lock them out).
+- The remote isn't Linux, or its `/etc/os-release` ID isn't `debian`/`ubuntu`.
+
+### Intentional non-goals
+
+- **No user creation.** `ossh install`'s `user.create` + `install.user.remote` covered this.
+- **No NOPASSWD sudoers drop-in.** One-liner if you need it: `echo "<user> ALL=(ALL) NOPASSWD:ALL" | ssh <host> sudo tee /etc/sudoers.d/<user>-nopasswd`.
+- **No `AllowUsers` in the orchestrator.** Dangerous default; opt-in via `.sshd.allowusers`.
+
 ## Shared SSH Config
 
 For multi-user environments (containers, shared servers):
@@ -210,6 +248,13 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh id.create` | Create new SSH key pair |
 | `ossh list` | List configured hosts |
 | `ossh list.ids` | List available key identities |
+| `ossh harden` | Harden Debian/Ubuntu remote (orchestrator; no AllowUsers) |
+| `ossh harden.packages` | Install the hardening package set |
+| `ossh harden.unattended.upgrades` | Enable + configure unattended-upgrades |
+| `ossh harden.fail2ban` | Enable fail2ban with [sshd] jail |
+| `ossh harden.firewall` | Configure UFW (default deny in / allow out + OpenSSH + optional extra ports) |
+| `ossh harden.sshd` | Harden sshd_config (no AllowUsers) |
+| `ossh harden.sshd.allowusers` | **Opt-in** AllowUsers restriction |
 
 ## See Also
 
