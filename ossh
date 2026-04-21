@@ -630,35 +630,9 @@ ossh.install.finish.local() # # finishes local oosh installation
     '" 2>/dev/null || {
       warn.log "Could not create shared SSH config — continuing"
     }
-    # Copy config, known_hosts, and deploy key to all users
-    # SSH requires all files owned by the user with strict permissions
-    private.ossh.ssh "$sshConfigHost" "sudo bash -c '
-      basehome=\$(dirname \"\$HOME\")
-      [ \"\$basehome\" = / ] && basehome=/home
-      sharedSsh=\"\$basehome/shared/.ssh\"
-      for u in \$(ls \"\$basehome\" 2>/dev/null | grep -v shared); do
-        h=\"\$basehome/\$u\"
-        [ -d \"\$h\" ] || continue
-        mkdir -p \"\$h/.ssh\"
-        cp \"\$sharedSsh/config\" \"\$h/.ssh/config\" 2>/dev/null
-        cp \"\$sharedSsh/known_hosts\" \"\$h/.ssh/known_hosts\" 2>/dev/null
-        cp \"\$sharedSsh/2cuGitHub\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-        chown \"\$u\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-        chmod 600 \"\$h/.ssh/config\" \"\$h/.ssh/2cuGitHub\"
-        chmod 644 \"\$h/.ssh/known_hosts\"
-      done
-      # Also handle root (home is outside basehome)
-      rootHome=\$(eval echo ~root)
-      if [ -d \"\$rootHome\" ]; then
-        mkdir -p \"\$rootHome/.ssh\"
-        cp \"\$sharedSsh/config\" \"\$rootHome/.ssh/config\" 2>/dev/null
-        cp \"\$sharedSsh/known_hosts\" \"\$rootHome/.ssh/known_hosts\" 2>/dev/null
-        cp \"\$sharedSsh/2cuGitHub\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-        chown root \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/known_hosts\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-        chmod 600 \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/2cuGitHub\"
-        chmod 644 \"\$rootHome/.ssh/known_hosts\"
-      fi
-    '" 2>/dev/null
+    # Propagate the shared .ssh artefacts to every user's ~/.ssh (extracted
+    # helper — same logic used by the developking-fallback else branch).
+    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
   else
     # Fallback: seed /home/shared/.ssh/ from developking's in-place key,
     # which state 31 populates from test.wo-da.de templates (see oo:1294).
@@ -694,42 +668,8 @@ ossh.install.finish.local() # # finishes local oosh installation
       fi
     '" 2>/dev/null || warn.log "Could not seed shared .ssh from developking — GitHub access won't propagate to other users"
 
-    # Propagate to every existing user (mirrors the caller-side copy-loop at
-    # ossh:635-661). Without this, files in <user>/.ssh/ end up root-owned
-    # and sshd/git can't read the private key. Use `chown <user>:` (trailing
-    # colon, no group) so chown sets the group to the user's login group —
-    # robust against users whose primary group isn't named the same as the
-    # user (e.g. platform.test containers create "test" with gid=0, no
-    # "test" group exists, so `chown test:test` errors with "invalid group").
-    private.ossh.ssh "$sshConfigHost" "sudo bash -c '
-      basehome=\$(dirname \"\$HOME\")
-      [ \"\$basehome\" = / ] && basehome=/home
-      sharedSsh=\"\$basehome/shared/.ssh\"
-      [ -f \"\$sharedSsh/2cuGitHub\" ] || exit 0
-      for u in \$(ls \"\$basehome\" 2>/dev/null | grep -v shared); do
-        h=\"\$basehome/\$u\"
-        [ -d \"\$h\" ] || continue
-        mkdir -p \"\$h/.ssh\"
-        cp \"\$sharedSsh/config\" \"\$h/.ssh/config\" 2>/dev/null
-        cp \"\$sharedSsh/known_hosts\" \"\$h/.ssh/known_hosts\" 2>/dev/null
-        cp \"\$sharedSsh/2cuGitHub\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-        chown \"\$u:\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-        chmod 700 \"\$h/.ssh\"
-        chmod 600 \"\$h/.ssh/config\" \"\$h/.ssh/2cuGitHub\"
-        chmod 644 \"\$h/.ssh/known_hosts\"
-      done
-      rootHome=\$(eval echo ~root)
-      if [ -d \"\$rootHome\" ]; then
-        mkdir -p \"\$rootHome/.ssh\"
-        cp \"\$sharedSsh/config\" \"\$rootHome/.ssh/config\" 2>/dev/null
-        cp \"\$sharedSsh/known_hosts\" \"\$rootHome/.ssh/known_hosts\" 2>/dev/null
-        cp \"\$sharedSsh/2cuGitHub\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-        chown root: \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/known_hosts\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-        chmod 700 \"\$rootHome/.ssh\"
-        chmod 600 \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/2cuGitHub\"
-        chmod 644 \"\$rootHome/.ssh/known_hosts\"
-      fi
-    '" 2>/dev/null
+    # Propagate to every existing user using the shared helper.
+    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
   fi
 
   local remoteKeyName
@@ -1491,6 +1431,54 @@ ossh.config.shared.link.completion.user() {
 }
 ossh.config.shared.link.completion.sharedDir() {
   compgen -d "$1"
+}
+
+private.ossh.shared.ssh.copy.to.all() # <sshConfigHost> # on <sshConfigHost>, copy /home/shared/.ssh/{config,known_hosts,2cuGitHub} to every existing user's ~/.ssh/ with owner=user (login group), perms 700/600/644. Single source of truth for the per-user propagation step shared by ossh.install.finish.local's caller-side path and its developking-fallback else branch.
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+
+  # One SSH roundtrip, sudo-wrapped remote bash. Files in /home/shared/.ssh/
+  # are assumed to already exist (seeded by either the caller's deploy_keys
+  # push or the developking fallback). If the shared key is missing, exit
+  # quietly — this method is idempotent/no-op in that case.
+  #
+  # `chown $u:` (trailing colon, no group) sets the group to the user's
+  # login group whatever it's named. Robust against platform.test containers
+  # where `test` has gid=0 and no `test` group exists; explicit `$u:$u`
+  # would error with "invalid group".
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    basehome=\$(dirname \"\$HOME\")
+    [ \"\$basehome\" = / ] && basehome=/home
+    sharedSsh=\"\$basehome/shared/.ssh\"
+    [ -f \"\$sharedSsh/2cuGitHub\" ] || exit 0
+    for u in \$(ls \"\$basehome\" 2>/dev/null | grep -v shared); do
+      h=\"\$basehome/\$u\"
+      [ -d \"\$h\" ] || continue
+      mkdir -p \"\$h/.ssh\"
+      cp \"\$sharedSsh/config\" \"\$h/.ssh/config\" 2>/dev/null
+      cp \"\$sharedSsh/known_hosts\" \"\$h/.ssh/known_hosts\" 2>/dev/null
+      cp \"\$sharedSsh/2cuGitHub\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
+      chown \"\$u:\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
+      chmod 700 \"\$h/.ssh\"
+      chmod 600 \"\$h/.ssh/config\" \"\$h/.ssh/2cuGitHub\"
+      chmod 644 \"\$h/.ssh/known_hosts\"
+    done
+    rootHome=\$(eval echo ~root)
+    if [ -d \"\$rootHome\" ]; then
+      mkdir -p \"\$rootHome/.ssh\"
+      cp \"\$sharedSsh/config\" \"\$rootHome/.ssh/config\" 2>/dev/null
+      cp \"\$sharedSsh/known_hosts\" \"\$rootHome/.ssh/known_hosts\" 2>/dev/null
+      cp \"\$sharedSsh/2cuGitHub\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
+      chown root: \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/known_hosts\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
+      chmod 700 \"\$rootHome/.ssh\"
+      chmod 600 \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/2cuGitHub\"
+      chmod 644 \"\$rootHome/.ssh/known_hosts\"
+    fi
+  '" 2>/dev/null
 }
 
 ossh.config.edit() # <?file> # opens the config file in an editor
