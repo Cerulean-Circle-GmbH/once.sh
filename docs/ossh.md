@@ -169,16 +169,17 @@ What happens during install:
 6. Creates user account and symlinks
 7. Sets login shell to bash 4+
 
-### Deploy Key
+### Deploy Key (GitHub access)
 
-If `~/.ssh/deploy_keys/2cuGitHub` exists on your machine, `ossh install` automatically:
+`ossh install` ensures every user on the target ends up with a working `2cuGitHub` SSH alias for cloning from `Cerulean-Circle-GmbH`. The deploy key reaches the shared `.ssh/` via one of two paths:
 
-- Copies the key to the remote host's shared SSH directory
-- Creates the `2cuGitHub` SSH config alias (pointing to github.com)
-- Adds github.com to known_hosts
-- Copies everything to all user accounts
+1. **Caller-supplied (wins when present).** If the caller has `~/.ssh/deploy_keys/2cuGitHub` locally, that exact key is transferred to `/home/shared/.ssh/2cuGitHub` on the remote. Use this when you rotate the deploy key on your laptop and want the new one pushed.
 
-This enables `oo update` and `oo checkout` on the remote host.
+2. **Fallback via `developking` (default).** If the caller doesn't have a local `deploy_keys/2cuGitHub`, `ossh.install.finish.local` seeds `/home/shared/.ssh/2cuGitHub` from `~developking/.ssh/id_rsa` — which was downloaded during state 31 from the oosh templates server (`test.wo-da.de`) or the local `templates/user/developking.ssh/` fallback. This is why "the connection happens automatically through developing": `developking` is always there, always has the key.
+
+Either way, `user.oosh.install` then copies `/home/shared/.ssh/`'s `2cuGitHub` + `config` (with the `Host 2cuGitHub` block) + `known_hosts` into every new user's own `~/.ssh/`, so `git clone 2cuGitHub:…`, `oo update`, and `oo checkout` just work for every oosh user.
+
+If both paths fail (test.wo-da.de unreachable AND no local templates AND no caller-side deploy key), install still succeeds — only the GitHub-access setup is skipped. A `warn.log` line flags this.
 
 ## Hardening
 
