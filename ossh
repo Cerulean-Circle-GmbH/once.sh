@@ -2080,7 +2080,10 @@ private.ossh.harden.preflight() # <sshConfigHost> # fail-fast if the remote isn'
   # Refuse to proceed if we can't reach the remote non-interactively.
   # After hardening, PasswordAuthentication will be off; if the caller can
   # only connect via password today, running harden would lock them out.
-  if ! private.ossh.ssh -o BatchMode=yes "$sshConfigHost" true 2>/dev/null; then
+  # NOTE: single-arg form `-oBatchMode=yes` (no space). private.ossh.ssh's
+  # flag parser only consumes args that start with `-`, so `-o BatchMode=yes`
+  # (two args) would have `BatchMode=yes` treated as the host.
+  if ! private.ossh.ssh -oBatchMode=yes "$sshConfigHost" true 2>/dev/null; then
     error.log "ossh.harden preflight: cannot SSH to $sshConfigHost in BatchMode (no working key). Aborting — hardening would disable password auth and lock you out. Fix your SSH key setup first."
     return 1
   fi
@@ -2187,8 +2190,12 @@ ossh.harden.fail2ban() # <sshConfigHost> # enable fail2ban with a minimal [sshd]
 enabled = true
 banaction = iptables-multiport
 EOF
-    systemctl enable fail2ban
-    systemctl restart fail2ban
+    # Prefer systemctl on real VPS; fall back to SysV service for containers
+    # or hosts without systemd running. jail.local is written regardless —
+    # only the live-service activation varies.
+    (systemctl enable fail2ban >/dev/null 2>&1 && systemctl restart fail2ban >/dev/null 2>&1) \
+      || service fail2ban restart >/dev/null 2>&1 \
+      || echo \"note: could not start fail2ban service (no init system); jail.local written\"
   '"
 }
 
@@ -2219,8 +2226,13 @@ ossh.harden.firewall() # <sshConfigHost> <?extraPorts> # UFW: default deny-in / 
     for port in $extraPorts; do
       [ -n \"\$port\" ] && ufw allow \"\$port\"
     done
-    ufw --force enable
-    ufw status verbose
+    # ufw --force enable can fail inside containers without NET_ADMIN
+    # (iptables-restore returns \"Permission denied\"). Rules are still
+    # written to /etc/ufw/user.rules — a real VPS (where this matters)
+    # will apply them. Note + continue so the rest of harden still runs.
+    ufw --force enable \
+      || echo \"note: ufw could not apply live rules (container without NET_ADMIN?); rules written to /etc/ufw/\"
+    ufw status verbose 2>/dev/null || true
   '"
 }
 
@@ -2252,7 +2264,15 @@ ossh.harden.sshd() # <sshConfigHost> # harden sshd_config: no root, no password,
     sed -i -e \"/^\\(#\\|\\)AllowAgentForwarding/s/^.*\\\$/AllowAgentForwarding no/\"                     /etc/ssh/sshd_config
     sed -i -e \"/^\\(#\\|\\)AuthorizedKeysFile/s|^.*\\\$|AuthorizedKeysFile .ssh/authorized_keys|\"        /etc/ssh/sshd_config
     sed -i -e \"/^\\(#\\|\\)PubkeyAuthentication/s/^.*\\\$/PubkeyAuthentication yes/\"                    /etc/ssh/sshd_config
-    systemctl reload sshd
+    # Reload sshd to pick up the new config. Try systemctl (ubuntu names
+    # the unit \"ssh\" or \"sshd\"), fall back to SysV service, last-ditch
+    # SIGHUP the sshd master process directly.
+    systemctl reload ssh  >/dev/null 2>&1 \
+      || systemctl reload sshd >/dev/null 2>&1 \
+      || service ssh reload  >/dev/null 2>&1 \
+      || service sshd reload >/dev/null 2>&1 \
+      || pkill -HUP -x sshd   2>/dev/null \
+      || echo \"note: sshd_config updated but live reload failed — restart sshd manually for changes to take effect\"
   '"
 }
 
@@ -2285,7 +2305,13 @@ ossh.harden.sshd.allowusers() # <sshConfigHost> <users> # restrict sshd to the g
     else
       echo \"AllowUsers $users\" >> /etc/ssh/sshd_config
     fi
-    systemctl reload sshd
+    # Reload sshd (same fallback chain as ossh.harden.sshd above)
+    systemctl reload ssh  >/dev/null 2>&1 \
+      || systemctl reload sshd >/dev/null 2>&1 \
+      || service ssh reload  >/dev/null 2>&1 \
+      || service sshd reload >/dev/null 2>&1 \
+      || pkill -HUP -x sshd   2>/dev/null \
+      || echo \"note: AllowUsers line updated but live sshd reload failed\"
   '"
 }
 
