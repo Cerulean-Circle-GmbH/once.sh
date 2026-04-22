@@ -32,6 +32,7 @@
 : ${HIVEMIND_REGISTRY:=${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}
 : ${HIVEMIND_SESSIONS:=${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}
 : ${HIVEMIND_TEAMS:=${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}
+: ${HIVEMIND_FORKS:=${CONFIG_PATH:-$HOME/config}/hivemind.forks.env}
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 : ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
 
@@ -1246,7 +1247,7 @@ hiveMind.queen() # # show queen (orchestrator) agent ID
   fi
 }
 
-hiveMind.status() # <?session> # show team status for one or all sessions
+hiveMind.status() # <?session> # show team status for one or all sessions (falls back to registry if no tmux)
 {
   if [ -n "$1" ]; then
     hiveMind.team.status "$1"
@@ -1256,15 +1257,37 @@ hiveMind.status() # <?session> # show team status for one or all sessions
   # No arg: show ALL tmux sessions with agents
   local sessions
   sessions=$(otmux sessions -F "#{session_name}" 2>/dev/null)
-  if [ -z "$sessions" ]; then
-    echo -e "${BOLD_YELLOW}No tmux sessions${NORMAL}"
-    return
+  if [ -n "$sessions" ]; then
+    while read -r sess; do
+      hiveMind.team.status "$sess" 2>/dev/null
+      echo ""
+    done <<< "$sessions"
+    return 0
   fi
 
-  while read -r sess; do
-    hiveMind.team.status "$sess" 2>/dev/null
-    echo ""
-  done <<< "$sessions"
+  # Cold start — tmux empty. Fall back to persisted team registry so the user
+  # can see what teams exist and can be restored/restarted.
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  if [ ! -f "$teamsFile" ] || [ ! -s "$teamsFile" ]; then
+    echo -e "${BOLD_YELLOW}No tmux sessions and no persisted teams in $teamsFile${NORMAL}"
+    return 0
+  fi
+
+  echo -e "${BOLD_CYAN}No tmux sessions running.${NORMAL}"
+  echo -e "${GRAY}Persisted teams from ${teamsFile}:${NORMAL}"
+  echo ""
+  printf "  %-30s %s\n" "TEAM" "DESCRIPTION"
+  printf "  ${GRAY}%-30s %s${NORMAL}\n" "----" "-----------"
+  local sess desc
+  while IFS='|' read -r sess desc; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$sess" ] && continue
+    printf "  ${BOLD_WHITE}%-30s${NORMAL} ${GRAY}%s${NORMAL}\n" "$sess" "${desc:-(no description)}"
+  done < "$teamsFile"
+  echo ""
+  echo -e "${GRAY}Start with:${NORMAL}  hiveMind teams.restore --fork"
+  echo -e "${GRAY}Restart one:${NORMAL}  hiveMind team.restart <configDir>"
+  echo -e "${GRAY}Pull remote:${NORMAL}  hiveMind team.pull <host>"
   return 0
 }
 hiveMind.pane.focus() # <agentName> # focus on specific agent pane
@@ -2008,6 +2031,7 @@ hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote ma
   for f in "$configPath"/hivemind.roles.env \
            "$configPath"/hivemind.sessions.env \
            "$configPath"/hivemind.teams.env \
+           "$configPath"/hivemind.forks.env \
            "$configPath"/hivemind.snapshot.*.env; do
     [ -f "$f" ] || { skipCount=$((skipCount + 1)); continue; }
     fname=$(basename "$f")
@@ -3086,16 +3110,27 @@ hiveMind.registry.fix() # # clean up invalid entries in roles registry (raw %NNN
   mv "$tmpfile" "$registry"
   console.log "Registry fix: $fixed resolved, $dropped dropped"
 }
-hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessions from /status ground truth
+hiveMind.registry.refresh() # <?session> # refresh roles + sessions cache using non-invasive claudeCode.session.discover (no /status hijack); appends to forks.env
 {
   local session="${1:-$(private.hiveMind.active.team)}"
   [ -z "$session" ] && session=$(private.hiveMind.current.session)
 
   local reg="$HIVEMIND_REGISTRY"
   local ses="$HIVEMIND_SESSIONS"
-  local updated=0
+  local forksFile="${HIVEMIND_FORKS:-${CONFIG_PATH:-$HOME/config}/hivemind.forks.env}"
+  local updated=0 broken=0
+  local ts
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-  # Prune entries for panes that no longer exist in tmux
+  # Ensure forks.env exists with header
+  if [ ! -f "$forksFile" ]; then
+    {
+      echo "# hiveMind fork lineage — append-only audit log"
+      echo "# timestamp|pane|role|uuid|state|parentUuid"
+    } > "$forksFile"
+  fi
+
+  # Prune entries for panes that no longer exist in tmux (both files)
   if [ -f "$reg" ]; then
     local clean=""
     while IFS='|' read -r pt rl; do
@@ -3103,10 +3138,22 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
       if otmux pane.get "$pt" % >/dev/null 2>&1; then
         clean="${clean}${pt}|${rl}\n"
       else
-        info.log "  Pruning dead pane: $pt ($rl)"
+        info.log "  Pruning dead pane from roles: $pt ($rl)"
       fi
     done < "$reg"
     printf '%b' "$clean" > "$reg"
+  fi
+  if [ -f "$ses" ]; then
+    local cleanS=""
+    while IFS='|' read -r pt sd; do
+      [ -z "$pt" ] && continue
+      if otmux pane.get "$pt" % >/dev/null 2>&1; then
+        cleanS="${cleanS}${pt}|${sd}\n"
+      else
+        info.log "  Pruning dead pane from sessions: $pt (uuid ${sd:0:8}...)"
+      fi
+    done < "$ses"
+    printf '%b' "$cleanS" > "$ses"
   fi
 
   local pane_list
@@ -3115,46 +3162,58 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
   while IFS= read -r pane_target; do
     [ -z "$pane_target" ] && continue
 
-    # Only probe panes with a Claude process
+    # Only refresh panes with a Claude process
     claudeCode process.find "$pane_target" >/dev/null 2>&1 || continue
 
-    # Probe: get ground-truth UUID from /status (bypasses stale env files)
-    local sid
-    sid=$(claudeCode session.probe "$pane_target" 2>/dev/null)
-    [ -z "$sid" ] && continue
+    # Non-invasive discover: prints "<uuid>|<state>|<customTitle>"
+    local discover uuid state title
+    discover=$("$OOSH_DIR/claudeCode" session.current "$pane_target" 2>/dev/null)
+    # For state + title we call the helper once more — cheap (JSONL + stat cached)
+    local discoverFull
+    discoverFull=$(bash -c "source '$OOSH_DIR/claudeCode' >/dev/null 2>&1; private.claudeCode.session.discover '$pane_target'" 2>/dev/null)
+    uuid="${discoverFull%%|*}"
+    local rest="${discoverFull#*|}"
+    state="${rest%%|*}"
+    title="${rest#*|}"
 
-    # Get session name — only use /rename'd names (role@model format)
-    local name
-    name=$(claudeCode session.name "$sid" 2>/dev/null)
+    # Skip empty + unknown
+    [ -z "$uuid" ] && continue
+    [ "$state" = "unknown" ] && continue
 
-    # Remove stale entry for this pane regardless
-    if [ -f "$reg" ]; then
-      grep -v "^${pane_target}|" "$reg" > "${reg}.tmp" 2>/dev/null
-      mv "${reg}.tmp" "$reg"
-    fi
-
-    # Only write back if we have a proper role@model name
-    [ -z "$name" ] && continue
-    [[ "$name" != *"@"* ]] && continue
-    local role="${name%%@*}"
-
-    # Validate role: reject garbage from firstPrompt leaking into session names
+    # Derive role from pane title (title field from discover).
+    # Accept bare role names — no role@model requirement. Still reject garbage.
+    local role="$title"
+    [ -z "$role" ] && continue
+    # Strip @model suffix if present (role@model form still valid but we store bare role)
+    role="${role%%@*}"
     [[ "$role" == *" "* ]] && { warn.log "  $pane_target: rejected role with spaces: $role"; continue; }
-    [[ ${#role} -gt 30 ]] && { warn.log "  $pane_target: rejected role >30 chars: ${role:0:30}..."; continue; }
+    [[ ${#role} -gt 40 ]] && { warn.log "  $pane_target: rejected role >40 chars: ${role:0:30}..."; continue; }
     [[ "$role" =~ ^(Read|You|I\ am|Write|Edit|Help|Search|Find|Look|Check|Run|Show) ]] && { warn.log "  $pane_target: rejected prompt-like role: $role"; continue; }
 
-    # Write roles registry: pane → role
-    echo "${pane_target}|${role}" >> "$reg"
+    # Remove stale pane entries from both caches
+    grep -v "^${pane_target}|" "$reg" > "${reg}.tmp" 2>/dev/null
+    mv "${reg}.tmp" "$reg"
+    grep -v "^${pane_target}|" "$ses" > "${ses}.tmp" 2>/dev/null
+    mv "${ses}.tmp" "$ses"
 
-    # Write sessions file: pane → uuid
-    if [ -f "$ses" ]; then
-      grep -v "^${pane_target}|" "$ses" > "${ses}.tmp" 2>/dev/null
-      mv "${ses}.tmp" "$ses"
+    # Write fresh cache entries
+    echo "${pane_target}|${role}" >> "$reg"
+    echo "${pane_target}|${uuid}" >> "$ses"
+
+    # Parent UUID from JSONL first line (if present) — lineage recorded in forks.env
+    local parentUuid=""
+    local jsonl_path
+    jsonl_path=$(find "$HOME/.claude/projects" -name "${uuid}.jsonl" 2>/dev/null | head -1)
+    if [ -n "$jsonl_path" ]; then
+      parentUuid=$(head -1 "$jsonl_path" 2>/dev/null | grep -oE '"parentUuid":"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
-    echo "${pane_target}|${sid}" >> "$ses"
+
+    # Append to forks.env — audit log of every refresh
+    echo "${ts}|${pane_target}|${role}|${uuid}|${state}|${parentUuid}" >> "$forksFile"
 
     updated=$((updated + 1))
-    info.log "  $pane_target → $role [$sid]"
+    [ "$state" = "broken" ] && broken=$((broken + 1))
+    info.log "  $pane_target → $role [$uuid] ($state)"
   done <<< "$pane_list"
 
   # Detect duplicate UUIDs across roles (potential data corruption)
@@ -3171,7 +3230,8 @@ hiveMind.registry.refresh() # <?session> # probe all panes, update roles + sessi
     fi
   fi
 
-  success.log "Registry refreshed: $updated entries"
+  success.log "Registry refreshed: $updated entries${broken:+ ($broken broken)}"
+  info.log "  fork lineage audit log: $forksFile"
 }
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT LIFECYCLE
