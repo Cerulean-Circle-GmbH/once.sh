@@ -136,30 +136,16 @@ private.hiveMind.env.del() { # <file> <key> <?value> # delete matching line from
   fi
 }
 
-private.hiveMind.liveUuid() { # <paneTarget> <?procArgs> <?probe> # get live session UUID, skipping fork parents
-  local target="$1" procArgs="$2" probe="${3:-}"
-  local isForked=""
-  [ -n "$procArgs" ] && echo "$procArgs" | grep -qE '\-\-fork-session|claudeCode fork' && isForked="yes"
-  # Non-forked: extract UUID from ps args (fast, reliable)
-  if [ -z "$isForked" ] && [ -n "$procArgs" ]; then
-    local uuid
-    uuid=$(echo "$procArgs" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-    [ -n "$uuid" ] && echo "$uuid" && return 0
-  fi
-  # All sessions: try session.id (sessions.env lookup — non-invasive)
-  # For forks: sessions.env may have child UUID from prior consistency.fix
+private.hiveMind.liveUuid() { # <paneTarget> <?procArgs:ignored> <?probe> # get live session UUID (thin wrapper over claudeCode.session.current)
+  # The procArgs parameter is retained for backward compatibility but ignored —
+  # session.current handles forks via JSONL customTitle match, not ps-args.
+  local target="$1" probe="${3:-}"
   local sid
-  sid=$("claudeCode" session.id "$target" 2>/dev/null)
-  # For forks: reject if UUID matches the parent (args UUID = fork parent)
-  if [ -n "$sid" ] && [ -n "$isForked" ]; then
-    local parentUuid
-    parentUuid=$(echo "$procArgs" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
-    [ "$sid" = "$parentUuid" ] && sid=""  # stale — still has parent UUID
-  fi
+  sid=$("$OOSH_DIR/claudeCode" session.current "$target" 2>/dev/null)
   [ -n "$sid" ] && echo "$sid" && return 0
-  # Last resort: invasive /status probe (slow ~3s, only in fix/explicit mode)
+  # Invasive fallback only when explicitly requested (e.g. consistency.fix).
   if [ "$probe" = "probe" ]; then
-    sid=$("claudeCode" session.probe "$target" 2>/dev/null)
+    sid=$("$OOSH_DIR/claudeCode" session.probe "$target" 2>/dev/null)
     [ -n "$sid" ] && echo "$sid" && return 0
   fi
   return 1
@@ -167,121 +153,31 @@ private.hiveMind.liveUuid() { # <paneTarget> <?procArgs> <?probe> # get live ses
 
 private.hiveMind.session.resolve.uuid() # <pane> # UUID discovery — pure bash, handles forks + autocompact
 {
+  # Thin wrapper over claudeCode.session.current. The complex fork/autocompact
+  # logic that used to live here is now centralized in session.discover (via
+  # customTitle JSONL correlation + cwd disambiguator + state classifier).
+  # This function retains ONLY the hiveMind-specific concern: write-through
+  # to sessions.env cache so subsequent session.id lookups are fast.
   local target="$1"
   [ -z "$target" ] && return 1
 
-  local UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-  local projectsDir="$HOME/.claude/projects"
+  local sid
+  sid=$("$OOSH_DIR/claudeCode" session.current "$target" 2>/dev/null)
+  [ -z "$sid" ] && return 1
+
+  # Write-through: update sessions.env if our resolved UUID differs from cache
   local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
-
-  # 1. Find Claude process + args
-  local claudePid
-  claudePid=$("claudeCode" process.find "$target" 2>/dev/null) || return 1
-  local procArgs
-  procArgs=$(ps -p "$claudePid" -o args= 2>/dev/null)
-
-  local isForked=""
-  echo "$procArgs" | grep -qE '\-\-fork-session|claudeCode fork' && isForked="yes"
-
-  local argsUuid=""
-  [ -z "$isForked" ] && argsUuid=$(echo "$procArgs" | grep -oE "$UUID_RE" | head -1)
-
-  # Build set of UUIDs assigned to OTHER panes that currently have a live Claude process.
-  # Use claude.processes once (O(1) lookup) instead of per-line process.find calls.
-  # Stale sessions.env entries (no live Claude on that pane) don't block fresh resolution.
-  local otherUuids=""
   if [ -f "$sesFile" ]; then
-    local livePanes
-    livePanes=$(private.hiveMind.claude.processes 2>/dev/null | cut -d'|' -f3 | tr '\n' '|')
-    while IFS='|' read -r otherPane otherUuid; do
-      [ -z "$otherPane" ] || [ "$otherPane" = "$target" ] && continue
-      [ -z "$otherUuid" ] && continue
-      # Only exclude if that pane still has a live Claude process
-      echo "$livePanes" | grep -q "|${otherPane}|" || continue
-      otherUuids="${otherUuids}${otherUuid}|"
-    done < "$sesFile"
-  fi
-
-  local bestSid=""
-
-  if [ "$isForked" = "yes" ]; then
-    # FORK: anchor on process start time to disambiguate sister panes.
-    # The fork's JSONL is created at-or-after the process started.
-    # Filter by mtime >= procStart, then prefer customTitle match as tiebreaker.
-    local roleFile="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-    local roleName=""
-    [ -f "$roleFile" ] && roleName=$(grep "^${target}|" "$roleFile" 2>/dev/null | head -1 | cut -d'|' -f2)
-
-    # Process start time as epoch seconds (cross-platform)
-    local procStart=""
-    local procLstart
-    procLstart=$(ps -o lstart= -p "$claudePid" 2>/dev/null | sed 's/^ *//;s/ *$//')
-    if [ -n "$procLstart" ]; then
-      procStart=$(date -j -f "%a %b %e %T %Y" "$procLstart" +%s 2>/dev/null \
-                 || date -d "$procLstart" +%s 2>/dev/null)
-    fi
-
-    local f sid fileMtime
-    for f in $(ls -t "$projectsDir"/*/*.jsonl 2>/dev/null); do
-      sid=$(basename "$f" .jsonl)
-      [ -z "$sid" ] && continue
-      echo "$otherUuids" | grep -q "$sid" && continue
-
-      # Filter by process start time when available
-      if [ -n "$procStart" ]; then
-        fileMtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)
-        [ -z "$fileMtime" ] && continue
-        [ "$fileMtime" -lt "$procStart" ] && continue
-      fi
-
-      # Prefer JSONL whose customTitle matches the role (with or without @model suffix)
-      if [ -n "$roleName" ] && grep -qE "\"customTitle\":\"${roleName}(@[^\"]+)?\"" "$f" 2>/dev/null; then
-        bestSid="$sid"
-        break
-      fi
-    done
-    # No fallback: if customTitle doesn't match, let the next layer (sessions.env) decide
-  elif [ -n "$argsUuid" ]; then
-    # NON-FORK: check if a newer JSONL exists in same project dir (autocompact)
-    local argsFile="" d
-    for d in "$projectsDir"/*/; do
-      [ -f "${d}${argsUuid}.jsonl" ] && argsFile="${d}${argsUuid}.jsonl" && break
-    done
-    if [ -n "$argsFile" ]; then
-      local argsDir f sid
-      argsDir=$(dirname "$argsFile")
-      # Find newest UNASSIGNED JSONL that's newer than the process args file
-      for f in $(ls -t "$argsDir"/*.jsonl 2>/dev/null); do
-        [ "$f" = "$argsFile" ] && break  # reached args file = no newer unassigned
-        sid=$(basename "$f" .jsonl)
-        [ -z "$sid" ] && continue
-        echo "$otherUuids" | grep -q "$sid" && continue  # assigned to another pane
-        bestSid="$sid"
-        break
-      done
-    fi
-  fi
-
-  # Write-through if we found a better UUID
-  if [ -n "$bestSid" ]; then
-    if [ -f "$sesFile" ]; then
+    local cached
+    cached=$(grep "^${target}|" "$sesFile" 2>/dev/null | head -1 | cut -d'|' -f2)
+    if [ "$cached" != "$sid" ]; then
       grep -v "^${target}|" "$sesFile" > "${sesFile}.tmp" 2>/dev/null && mv "${sesFile}.tmp" "$sesFile"
+      echo "${target}|${sid}" >> "$sesFile"
     fi
-    echo "${target}|${bestSid}" >> "$sesFile"
-    echo "$bestSid"
-    return 0
   fi
 
-  # Fallback: sessions.env
-  if [ -f "$sesFile" ]; then
-    local sesSid
-    sesSid=$(grep "^${target}|" "$sesFile" 2>/dev/null | tail -1 | cut -d'|' -f2)
-    [ -n "$sesSid" ] && echo "$sesSid" && return 0
-  fi
-
-  # Last resort: process args UUID
-  [ -n "$argsUuid" ] && echo "$argsUuid" && return 0
-  return 1
+  echo "$sid"
+  return 0
 }
 
 private.hiveMind.pane.count() { # <target> # count panes in a window or session
