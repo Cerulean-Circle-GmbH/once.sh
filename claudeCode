@@ -867,6 +867,120 @@ claudeCode.process.running() # <pane> # check if Claude Code is running in a tmu
   claudeCode.process.find "$1" > /dev/null 2>&1
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# UUID DISCOVERY — single source of truth for pane → session UUID
+# ─────────────────────────────────────────────────────────────────────────────
+# discover is the ONE non-invasive function. All other resolvers wrap it.
+# No /status TUI hijack. No ps-args (stale for forks). Correlates:
+#   pane customTitle (from otmux title) + cwd (from pane) + JSONL first-line
+# State classification:
+#   live    — JSONL exists, mtime < 120s, Claude process running in pane
+#   stable  — JSONL exists, Claude process running, mtime >= 120s
+#   stale   — JSONL exists but no Claude process (zombie after compact/exit)
+#   broken  — sessions.env references UUID but no JSONL anywhere
+#   unknown — no pane, no Claude, no JSONL match
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customTitle>" — single non-invasive source of truth
+{
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+
+  # Pane must exist
+  otmux pane.get "$pane" '#{pane_id}' >/dev/null 2>&1 || { echo "||unknown"; return 1; }
+
+  # Strip spinner/accept-edits markers from pane title
+  local title
+  title=$(otmux pane.get "$pane" '#{pane_title}' 2>/dev/null)
+  local cleanTitle="${title#✳ }"; cleanTitle="${cleanTitle# }"
+  cleanTitle="${cleanTitle#⏵⏵ }"; cleanTitle="${cleanTitle# }"
+
+  # Pane cwd — used to disambiguate multiple JSONLs sharing customTitle
+  local paneCwd
+  paneCwd=$(otmux pane.get "$pane" '#{pane_current_path}' 2>/dev/null)
+
+  # Claude process check
+  local pid
+  pid=$(claudeCode.process.find "$pane" 2>/dev/null)
+
+  # Find newest JSONL whose LATEST customTitle matches current pane title.
+  # Using the last customTitle (not any occurrence) is critical: JSONLs accumulate
+  # a new custom-title entry on every /rename, so a file may contain many historical
+  # titles. Only the final one reflects the session's current identity.
+  local bestUuid="" bestMtime=0 bestCwdMatch=0
+  local f uuid lastTitle cwdMatch m
+  if [ -n "$cleanTitle" ]; then
+    for f in "$HOME/.claude/projects"/*/*.jsonl; do
+      [ -f "$f" ] || continue
+      # Extract the last customTitle in this JSONL
+      lastTitle=$(grep -o '"customTitle":"[^"]*"' "$f" 2>/dev/null | tail -1 | sed 's/.*":"//;s/"$//')
+      [ -z "$lastTitle" ] && continue
+      [ "$lastTitle" = "$cleanTitle" ] || continue
+      uuid=$(basename "$f" .jsonl)
+      # cwd disambiguator — first line usually has "cwd":"/path"
+      cwdMatch=0
+      if [ -n "$paneCwd" ] && head -1 "$f" 2>/dev/null | grep -q "\"cwd\":\"${paneCwd}\""; then
+        cwdMatch=1
+      fi
+      m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)
+      [ -z "$m" ] && continue
+      # Rank: cwd-match first, then mtime
+      if [ "$cwdMatch" -gt "$bestCwdMatch" ] || { [ "$cwdMatch" -eq "$bestCwdMatch" ] && [ "$m" -gt "$bestMtime" ]; }; then
+        bestCwdMatch="$cwdMatch"
+        bestMtime="$m"
+        bestUuid="$uuid"
+      fi
+    done
+  fi
+
+  # Classify
+  local state="unknown"
+  if [ -n "$bestUuid" ]; then
+    local now age
+    now=$(date +%s)
+    age=$((now - bestMtime))
+    if [ -n "$pid" ] && [ "$age" -lt 120 ]; then
+      state="live"
+    elif [ -n "$pid" ]; then
+      state="stable"
+    else
+      state="stale"
+    fi
+  else
+    # No JSONL found — if sessions.env has an entry for this pane, it's broken
+    local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+    if [ -f "$ses" ]; then
+      local cachedUuid
+      cachedUuid=$(grep "^${pane}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
+      if [ -n "$cachedUuid" ]; then
+        bestUuid="$cachedUuid"
+        state="broken"
+      fi
+    fi
+  fi
+
+  echo "${bestUuid}|${state}|${cleanTitle}"
+  [ -n "$bestUuid" ] && return 0 || return 1
+}
+
+claudeCode.session.current() # <pane> # print current session UUID (non-invasive) — empty if unknown
+{
+  local out
+  out=$(private.claudeCode.session.discover "$1")
+  echo "${out%%|*}"
+  [ -n "${out%%|*}" ] && return 0 || return 1
+}
+claudeCode.session.current.completion.pane() { private.claudeCode.complete.panes; }
+
+claudeCode.session.state() # <pane> # print session state: live|stable|stale|broken|unknown
+{
+  local out field2
+  out=$(private.claudeCode.session.discover "$1")
+  field2="${out#*|}"
+  echo "${field2%%|*}"
+}
+claudeCode.session.state.completion.pane() { private.claudeCode.complete.panes; }
+
 claudeCode.session.probe() # <pane> # get current session UUID via /status + JSONL correlation (ground truth, slow ~3s)
 {
   local target="$1"
