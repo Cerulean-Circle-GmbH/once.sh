@@ -9,6 +9,22 @@ This Repo consists of two main topics
 
 Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branching Strategy](docs/branching.md) for details.
 
+## prereqs
+
+- **bash 4+** — macOS: `brew install bash` · Debian/Ubuntu/RHEL: already present
+- **git** — macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install git` · RHEL/Fedora: `sudo dnf install git`
+
+The installer checks both and exits with a one-line hint if either is missing.
+
+## drag-and-drop install (macOS)
+
+1. On GitHub, click **Code → Download ZIP** (or `git clone https://github.com/Cerulean-Circle-GmbH/once.sh.git`).
+2. Open the downloaded folder in Finder.
+3. Double-click **`Install oosh.command`** in the repo root.
+4. Terminal opens and runs the install. Enter your sudo password when prompted.
+
+> **First-run macOS prompt:** downloaded files carry Apple's quarantine flag. macOS will say "*Install oosh.command* cannot be opened because the developer cannot be verified." Right-click the file → **Open** → **Open** to confirm. After you approve it once, double-click works normally.
+
 ## fast install - use it anywhere
 
 | Method    | Command                                                                                           |

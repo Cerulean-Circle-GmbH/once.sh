@@ -1,649 +1,115 @@
-#!/bin/sh
-#http://www.etalabs.net/sh_tricks.html
+#!/usr/bin/env bash
+# oosh install bootstrap — shared by three delivery paths:
+#
+#   1. Curl one-liner       bash -c "$(curl .../init/oosh)"
+#   2. ossh install <host>  SCPs this file to remote and runs `./oosh mode root …`
+#   3. Drag-and-drop        double-click Install-oosh.command (it invokes ./init/oosh)
+#
+# All three converge on `ossh install.continue.local` (ossh:476) — the
+# mature state-machine entrypoint. This file's only job is: check
+# prereqs, resolve branch, clone if needed, move to ~/oosh, hand off.
+#
+# Prereqs:
+#   bash 4+   macOS: brew install bash        Debian/RHEL: already there
+#   git       macOS: xcode-select --install   Debian:      sudo apt install git
 
-export PS4='sh debug> '
-if [ -z "$SH_OPT" ]; then
-  if [ -n "$LOG_LEVEL" ] && [ "$LOG_LEVEL" -gt 5 ] 2>/dev/null; then
-    export SH_OPT="-x"
-  else
-    export SH_OPT="+x"
-  fi
+set -e
+
+die() { echo "oosh install: $*" >&2; exit 1; }
+
+# ─── Branch default ──────────────────────────────────────────────────────
+# Rewritten by `promote` during dev→testing→prod advancement
+# (see private.promote.rewrite.self.branch in promote:430).
+OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"
+: ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}
+
+# ─── Arg parsing ─────────────────────────────────────────────────────────
+# `ossh install` invokes us as:
+#   ./oosh mode root <sshHost> <configRemote|_> <branch> <logLevel>
+# Default path (curl one-liner / drag-and-drop) takes no args.
+MODE=""
+REMOTE_SSH_HOST=""
+CONFIG_REMOTE=""
+LOG_LEVEL_ARG=""
+if [ "$1" = "mode" ]; then
+  shift
+  [ "$1" = "root" ] || die "only 'mode root' is supported (got '$1')"
+  MODE=root; shift
+  REMOTE_SSH_HOST="${1:-}";   [ -n "$1" ] && shift
+  CONFIG_REMOTE="${1:-}";     [ -n "$1" ] && shift
+  [ "$CONFIG_REMOTE" = "_" ] && CONFIG_REMOTE=""
+  [ -n "$1" ] && OOSH_BRANCH="$1" && shift
+  [ -n "$1" ] && LOG_LEVEL_ARG="$1" && shift
 fi
 
-# find all set -x
-#  '^ *[^#] *set -x'
-set $SH_OPT
-# force debug
+# Sanitise branch (same strip chain as the old init/oosh; inlined because
+# at this point `this.git.branch.short` isn't sourceable yet)
+OOSH_BRANCH="${OOSH_BRANCH#refs/heads/}"
+OOSH_BRANCH="${OOSH_BRANCH#refs/remotes/origin/}"
+OOSH_BRANCH="${OOSH_BRANCH#heads/origin/}"
+OOSH_BRANCH="${OOSH_BRANCH#origin/}"
+export OOSH_BRANCH
 
-#unset SHELL
-oosh_get_running_shell()
-{
-  if [ -n "$BASH_VERSION" ]; then
-     SHELLNAME="bash"
-     if [ -n "$BASH" ]; then
-       SHELL="$BASH"
-     else
-       SHELL="$(command -v bash)"
-     fi
-     return
+# ─── Prereqs ─────────────────────────────────────────────────────────────
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] \
+  || die "bash 4+ required (found: ${BASH_VERSION:-unknown}). macOS: brew install bash"
+command -v git >/dev/null 2>&1 \
+  || die "git required. macOS: xcode-select --install. Debian/Ubuntu: sudo apt install git"
+
+# ─── Non-root → sudo re-exec ─────────────────────────────────────────────
+# `mode root` invocations come in already-root (enforced by SSH caller).
+# Default/curl/drag-and-drop paths need sudo.
+if [ "$(id -u)" -ne 0 ] && [ -z "$MODE" ]; then
+  echo "oosh install: re-executing as root via sudo (enter password if prompted)…"
+  exec sudo -H -E bash "$0" "$@"
+fi
+
+# ─── Resolve OOSH_DIR (where the repo lives or will live) ───────────────
+OOSH_DIR=""
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+if [ -f "$SCRIPT_PATH" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd -P)" || true
+  # Repo root is the parent of init/ when this file is init/oosh inside a clone
+  if [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../.git" ]; then
+    OOSH_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
   fi
+fi
+: ${OOSH_DIR:=$HOME/oosh}
 
-  # Fallback for sh/dash/etc
-  SHELLPS="$(ps -o pid,args | grep "\w*$$ [^g]*/sh" 2>/dev/null)"
-  if [ -n "$SHELLPS" ]; then
-      local shellPath=$(echo "$SHELLPS" | awk '{print $2}')
-      if [ -n "$shellPath" ]; then
-          SHELLNAME=$(basename "$shellPath")
-          SHELL="$shellPath"
-      fi
+# ─── Clone if no .git yet ────────────────────────────────────────────────
+if [ ! -d "$OOSH_DIR/.git" ]; then
+  REPO="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
+  echo "Cloning $REPO (branch=$OOSH_BRANCH) into $OOSH_DIR …"
+  git clone -b "$OOSH_BRANCH" "$REPO" "$OOSH_DIR" || die "git clone failed"
+fi
+
+# ─── Move repo to $HOME/oosh if it's elsewhere ──────────────────────────
+# Drag-and-drop from a ZIP extracted to ~/Downloads/once.sh-main/ would
+# land here with OOSH_DIR=that path — move it to $HOME/oosh so the rest
+# of oosh (which assumes canonical location) works.
+if [ "$OOSH_DIR" != "$HOME/oosh" ]; then
+  if [ -e "$HOME/oosh" ] && [ ! -L "$HOME/oosh" ]; then
+    die "$HOME/oosh already exists and isn't a symlink. Remove or rename it first."
   fi
+  rm -f "$HOME/oosh"
+  mv "$OOSH_DIR" "$HOME/oosh" || die "could not move $OOSH_DIR to $HOME/oosh"
+  OOSH_DIR="$HOME/oosh"
+  # Re-invoke from the canonical location so $0 and relative paths agree
+  exec bash "$OOSH_DIR/init/oosh" "$@"
+fi
 
-  # Last resort
-  if [ -z "$SHELLNAME" ]; then
-      SHELLNAME="sh"
-      SHELL="$(command -v sh)"
-  fi
-}
+# ─── Env + install log ──────────────────────────────────────────────────
+export OOSH_DIR
+export PATH="$OOSH_DIR:$PATH"
+export INSTALL_LOG="${INSTALL_LOG:-$HOME/config/install.log}"
+export BASH_FILE="${BASH_FILE:-$(command -v bash)}"
+mkdir -p "$(dirname "$INSTALL_LOG")"
+{ echo "# OOSH install log — $(date)"
+  echo "# init/oosh (thin bootstrap) handing off to ossh install.continue.local"
+} > "$INSTALL_LOG"
+[ -n "$LOG_LEVEL_ARG" ] && export LOG_LEVEL="$LOG_LEVEL_ARG"
 
-log()
-{
-  install_log "LOG: $*"
-  if [ "${LOG_LEVEL:-0}" -gt 4 ]; then
-    echo "$@"
-  fi
-}
-
-oosh_check_pm()             # checks for a package manager
-{
-    packageManager=$1
-    packageManagerCommand=$2
-
-
-    if [ -z "$packageManagerCommand" ]; then
-        package=$packageManager
-    fi   
-    if ! [ -x "$(command -v $packageManager)" ]; then
-        log "no $packageManager"
-    else
-        if [ -z "$OOSH_PM" ]; then
-            export OOSH_PM="$packageManagerCommand"
-            #export groupAddCommand=$2
-            #export userAddCommand=$3
-            log "Package Manager found: using $OOSH_PM somePackage"
-            if [ "$packageManager" = "apt-get" ]; then
-                if [ -z "$OOSH_PM_UPDATED" ]; then
-                  OOSH_PM_UPDATED="$SUDO apt-get update"
-                  if [ "$HOME" = "/root" ]; then
-                    $OOSH_PM_UPDATED
-                  else
-                    #sudo $OOSH_PM_UPDATED
-                    PM="sudo $PM"
-                    SUDO="sudo -S"
-                    $SUDO $OOSH_PM_UPDATED
-                  fi
-                else
-                  log "in case of installation errors try to call: apt-get update"
-                fi
-            fi
-        fi
-    fi
-}
-
-oosh_check_all_pm()         # adds tools and configurations to package manager (brew, apt-get, addgroup, adduser, dpkg, pkg)
-{
-    # Ensure Homebrew is discoverable on macOS (SSH sessions have minimal PATH)
-    if [ "$(uname -s)" = "Darwin" ]; then
-        for _brew_path in /opt/homebrew/bin /usr/local/bin; do
-            if [ -x "$_brew_path/brew" ]; then
-                case ":$PATH:" in
-                    *":$_brew_path:"*) ;;
-                    *) export PATH="$_brew_path:$PATH" ;;
-                esac
-                # Persist Homebrew PATH for path_helper (macOS login shells)
-                if [ ! -f /etc/paths.d/homebrew ]; then
-                    echo "$_brew_path" | $SUDO tee /etc/paths.d/homebrew >/dev/null
-                fi
-                break
-            fi
-        done
-    fi
-
-    oosh_check_pm brew "brew install"
-   #oosh_check_pm apt "apt add"
-    oosh_check_pm apt-get "apt-get -y install" "groupadd -f" "useradd -g dev"
-    oosh_check_pm dnf "dnf -y install" "groupadd -f" "useradd -g dev"
-    oosh_check_pm yum "yum -y install" "groupadd -f" "useradd -g dev"
-    oosh_check_pm apk "apk add" "addgroup" "adduser -g dev"
-    oosh_check_pm dpkg "dpkg install"
-    oosh_check_pm pkg "pkg install"
-    oosh_check_pm pacman "pacman -S"
- 
-}
-
-oosh_check_os() # check on which Operating System oosh is being deploid on #
-{
-  if ! [ -x "$( command -v oo )" ]; then
-   info.log "no os script class installed yet"
-   return 1
-  fi
-  if os check.env; then
-    info.log "OS detected and OOSH_OS populated with $OOSH_OS"
-  else
-    error.log "NO OS detected"
-  fi
-
-  exit 
-}
-
-oosh_cmd() 
-{
-    unset package
-    current=$1
-    shift
-    if [ -n "$1" ]; then
-      package=$1
-      shift
-    fi
-    if [ -z "$package" ]; then
-        package=$current
-    else
-      shift
-      package=$1
-    fi
-
-    if [ -z "$OOSH_OS" ]; then
-      log "no OS found (expected during bootstrap — oo not available yet)"
-    fi
-    
-    if [ -z "$OOSH_PM" ]; then
-      echo "no PM found...checking" 
-      oosh_check_all_pm
-    fi
-    if ! [ -x "$(command -v $current)" ]; then
-        echo "no $current"
-        case "$current" in
-          brew)
-            if [ "$(uname -s)" = "Darwin" ]; then
-              echo "Installing Homebrew..."
-              install_log "Installing Homebrew on macOS"
-              NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-              # Add brew to PATH for this session
-              for _brew_path in /opt/homebrew/bin /usr/local/bin; do
-                if [ -x "$_brew_path/brew" ]; then
-                  export PATH="$_brew_path:$PATH"
-                  break
-                fi
-              done
-              # Re-discover PM now that brew exists
-              oosh_check_all_pm
-            else
-              echo "brew is only available on macOS"
-            fi
-            ;;
-          *)
-            if [ -n "$OOSH_PM" ]; then
-              case "$OOSH_PM" in
-                brew*) $OOSH_PM $package ;;  # brew manages its own permissions, never sudo
-                *) $SUDO $OOSH_PM $package ;;
-              esac
-            else
-              echo "still no PM found: $OOSH_PM $package"
-            fi
-            ;;
-        esac
-    # else
-    #   echo "command $current exists"
-    fi
-}
-
-oosh_install_oosh()
-{
-
-  oosh_cmd git
-  oosh_cmd rsync
-  cd ~
-  # Ensure OOSH_DIR is always an absolute path
-  if [ "$(uname -s)" = "Linux" ]; then
-    OOSH_DIR="$(readlink -f "./oosh")"
-  else
-    OOSH_DIR="$(pwd)/oosh"
-  fi
-
-
-  if ! [ -d "$OOSH_DIR" ]; then
-    #set -x # force debug
-    mkdir -p ./init
-    if [ ! -z ${OOSH_INSTALL_SOURCE} ] && [ -d ${OOSH_INSTALL_SOURCE} ]; then
-      echo "<oosh> Install oosh from ${OOSH_INSTALL_SOURCE}"
-      rsync -a ${OOSH_INSTALL_SOURCE}/ oosh/
-    else
-      echo "<oosh> Install oosh from https://github.com/Cerulean-Circle-GmbH/once.sh.git"
-      git clone https://github.com/Cerulean-Circle-GmbH/once.sh.git
-      if [ -f ./oosh ]; then
-        mv ./oosh ./init
-        chmod +x ./init/oosh
-      fi
-      mv ./once.sh ./oosh
-
-      # Default OOSH_BRANCH to this init/oosh's own branch. The gated
-      # promotion (dev → testing → prod) rewrites OOSH_SELF_BRANCH when
-      # advancing a branch so the curl one-liner's /<branch>/init/oosh
-      # URL implicitly selects the matching worktree. Without this
-      # default, curl install (no env var, no DEV_MODE) skipped the
-      # worktree block below, /root/oosh stayed on main (git's default
-      # clone branch), and ossh.install.continue.local got sourced from
-      # main's outdated code — state 31 later swings /root/oosh → dev
-      # but by then the in-memory ossh.* functions are already the
-      # main-branch versions, so dev-branch fixes never executed.
-      OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"
-      : ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}
-
-      if [ ! -z "$DEV_MODE" ] || [ ! -z "${OOSH_BRANCH}" ]; then
-        echo "<oosh> Install oosh with branch ${OOSH_BRANCH}"
-
-        # Set up worktree structure: main/ + branch/ with ~/oosh as symlink
-        _wt_base="$(dirname "$OOSH_DIR")"
-
-        # Rename the clone from oosh/ to main/
-        mv ./oosh "${_wt_base}/main"
-
-        if [ "${OOSH_BRANCH}" = "main" ]; then
-          # Already on main — just symlink
-          ln -s "${_wt_base}/main" ./oosh
-        else
-          # Create worktree for the target branch
-          cd "${_wt_base}/main"
-          git fetch origin
-          git worktree add -B "${OOSH_BRANCH}" "../${OOSH_BRANCH}" "origin/${OOSH_BRANCH}"
-          cd ~
-          ln -s "${_wt_base}/${OOSH_BRANCH}" ./oosh
-        fi
-
-        OOSH_DIR="$(readlink -f ./oosh 2>/dev/null || echo "$(pwd)/oosh")"
-        OOSH_WORKTREE_BASE="${_wt_base}"
-        export OOSH_WORKTREE_BASE
-        unset _wt_base
-      fi
-    fi
-    cp -r ~/oosh/init/* ~/init
-  else
-    cd "$OOSH_DIR"
-    git pull
-    cd ..
-  fi
-}
-
-oosh_setup_env()
-{
-  # Minimal Phase 2: set up user environment files
-  # Full Phase 2 (state machine, SSH, shared config) only runs in 'mode root'.
-  # This ensures .bashrc and config exist for tests and basic usage.
-  install_log "Setting up user environment"
-
-  # Install .bashrc from template (pattern: oo:private.check.root.installation.done)
-  if [ -f "$OOSH_DIR/templates/user/bashrcTemplate" ]; then
-    if [ -f "$HOME/.bashrc" ] && [ ! -f "$HOME/.bashrc.pre-oosh" ]; then
-      cp "$HOME/.bashrc" "$HOME/.bashrc.pre-oosh"
-      install_log "Backed up existing .bashrc to .bashrc.pre-oosh"
-    fi
-    cp "$OOSH_DIR/templates/user/bashrcTemplate" "$HOME/.bashrc"
-    install_log "Installed .bashrc from template"
-
-    # macOS Terminal opens login shells which read .bash_profile, not .bashrc
-    # Ensure .bash_profile sources .bashrc so oosh works on all platforms
-    if [ ! -f "$HOME/.bash_profile" ] || ! grep -q '\.bashrc' "$HOME/.bash_profile" 2>/dev/null; then
-      echo '# Source .bashrc for login shells (required on macOS)
-[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc"' >> "$HOME/.bash_profile"
-      install_log "Added .bashrc source to .bash_profile"
-    fi
-  fi
-
-  # Ensure ~/config/user.env exists (pattern: config:config.init)
-  mkdir -p "$HOME/config"
-  if [ ! -f "$HOME/config/user.env" ]; then
-    touch "$HOME/config/user.env"
-    install_log "Created empty ~/config/user.env"
-  fi
-}
-
-oosh_status()
-{
-  # Ensure LOG_LEVEL has a default value to avoid [ -gt ] errors
-  if [ -z "$LOG_LEVEL" ]; then
-    LOG_LEVEL=1
-  fi
-
-  # Ensure USER is populated
-  if [ -z "$USER" ]; then
-    USER=$(id -u -n 2>/dev/null)
-  fi
-
-  # Compute BASH_MAJOR_VERSION if not set
-  if [ -z "$BASH_MAJOR_VERSION" ] && [ -n "$BASH_FILE" ]; then
-    BASH_MAJOR_VERSION=$("$BASH_FILE" -c "echo \"\${BASH_VERSINFO[0]}\"" 2>/dev/null)
-  fi
-
-  echo "
-  SHELL: $SHELL
-       : $SHELLNAME
-       : $SHELLPS
-    PWD: $(pwd)
-      0: $0
-
-     PM: $OOSH_PM${OOSH_PM_UPDATED:+
-         $OOSH_PM_UPDATED}
-
-   BASH: $BASH_FILE
-      v: ${BASH_MAJOR_VERSION:-unknown}
-
-   INSTALL_MODE: ${INSTALL_MODE:-not set}
-       DEV_MODE: ${DEV_MODE:-not set}
-
-   USER: $USER
-
-   PATH: $PATH
-  "
-  if [ "$HOME"  = "/root" ];then
-    SUDO=""
-  else
-    SUDO="sudo -S"
-  fi
-}
-
-# Remote installation — always installs to root, no menu
-oosh_install_remote() {
-  local sshConfigNameUsedForLocal="$1"
-  local sshConfigFromRemote="${2:-}"
-
-  echo "Remote installation initiated (root mode)"
-  install_log "Remote installation initiated (root mode)"
-
-  if [ "$(id -u)" = "0" ]; then
-    # Already root — install directly
-    oosh_check_all_pm
-    oosh_status
-    oosh_install_oosh
-    oosh_setup_env
-
-    # Use 'this call' for bootstrapped execution
-    # Pass OOSH_BRANCH inline so it survives the 'this' bootstrap (which resets env via config.init)
-    echo "Continuing installation via oosh bootstrap (branch: $OOSH_BRANCH)..."
-    install_log "Phase 1 complete, handing off to Phase 2"
-    "$BASH_FILE" -xc "export PATH=\"/usr/local/sbin:/usr/sbin:\$PATH\"; export BASH_FILE='$BASH_FILE'; export OOSH_BRANCH='$OOSH_BRANCH'; export INSTALL_LOG='$INSTALL_LOG'; $OOSH_DIR/this call ossh install.continue.local $sshConfigNameUsedForLocal $sshConfigFromRemote"
-
-    install_log "Done with ROOT installation."
-    echo "Done with ROOT installation."
-    return 0
-  else
-    # Not root — re-exec this script as root so oosh clones into root's home
-    echo "Re-executing as root via sudo..."
-    oosh_check_all_pm
-    oosh_status
-    # Determine root's home directory (Linux: /root, macOS: /var/root)
-    # Use directory services / passwd directly — $HOME via sudo is unreliable (macOS doesn't reset it)
-    local rootHome=""
-    if command -v dscl >/dev/null 2>&1; then
-      rootHome=$(dscl . -read /Users/root NFSHomeDirectory 2>/dev/null | awk '{print $2}')
-    fi
-    : ${rootHome:=$(awk -F: '$1 == "root" {print $6}' /etc/passwd 2>/dev/null)}
-    : ${rootHome:=/root}
-    # Copy init/oosh to a location root can access
-    $SUDO cp ~/oosh "$rootHome/oosh_init"
-    $SUDO chmod +x "$rootHome/oosh_init"
-    # Pass OOSH_BRANCH as both env var and positional arg $5 for robustness
-    # Use '_' placeholder for empty config_remote (empty args get lost in argument passing)
-    # Use 'env' after sudo to set HOME reliably (macOS sudo env_reset strips inline vars)
-    $SUDO env HOME="$rootHome" PATH="$PATH" OOSH_BRANCH="$OOSH_BRANCH" INSTALL_LOG="$rootHome/config/install.log" "$BASH_FILE" "$rootHome/oosh_init" mode root "$sshConfigNameUsedForLocal" "${sshConfigFromRemote:-_}" "$OOSH_BRANCH" "${LOG_LEVEL:-1}"
-    local rc=$?
-    # Fix shared config permissions so non-root users can write
-    local basehome
-    basehome="$(dirname "$HOME")"
-    $SUDO chgrp -R dev "$basehome/shared" 2>/dev/null
-    $SUDO chmod -R g+w "$basehome/shared" 2>/dev/null
-    $SUDO find "$basehome/shared" -type d -exec chmod g+s {} + 2>/dev/null
-    # usermod may be in /usr/sbin which is not in PATH on Debian
-    local _usermod
-    _usermod=$(command -v usermod 2>/dev/null || echo /usr/sbin/usermod)
-    if [ -x "$_usermod" ]; then
-      $SUDO "$_usermod" -aG dev "$(whoami)" 2>/dev/null || {
-        echo "WARNING: Could not add $(whoami) to dev group — shared config may be read-only"
-      }
-    elif command -v addgroup >/dev/null 2>&1; then
-      $SUDO addgroup "$(whoami)" dev 2>/dev/null || {
-        echo "WARNING: Could not add $(whoami) to dev group — shared config may be read-only"
-      }
-    elif command -v dseditgroup >/dev/null 2>&1; then
-      $SUDO dseditgroup -o edit -a "$(whoami)" -t user dev 2>/dev/null || {
-        echo "WARNING: Could not add $(whoami) to dev group — shared config may be read-only"
-      }
-    else
-      echo "WARNING: Neither usermod, addgroup, nor dseditgroup found — cannot add $(whoami) to dev group"
-    fi
-    $SUDO rm -f "$rootHome/oosh_init"
-    echo "Done with ROOT installation (from user context)."
-    return $rc
-  fi
-}
-
-oosh_parse_shellps()
-{
-  if [ -n "$1" ]; then
-    shell_pid=$1
-    shift
-  fi
-  script=$1
-  shell=$1
-  if [ "$(echo $script | cut -c 1)" = "{" ]; then
-    #echo script=$script
-    shift
-    shell=$1
-  else
-    #echo shell=$script
-    shell=$script
-    script=$2
-  fi
-  this=$2
-
-  log " 
-    shell: $shell
-      pid: $shell_pid
-   script: $script
-     this: $this
-  "
-  SHELL=$shell
-
-}
-
-
-install_log()
-{
-  if [ -n "$INSTALL_LOG" ]; then
-    echo "$*" >>"$INSTALL_LOG" 2>/dev/null
-  fi
-}
-
-oosh_start()
-{
-  # Phase 1 install log setup
-  INSTALL_LOG="$HOME/config/install.log"
-  mkdir -p "$HOME/config" 2>/dev/null
-  echo "# OOSH Install Log - $(date)" > "$INSTALL_LOG"
-  echo "# Phase 1: init/oosh bootstrap" >> "$INSTALL_LOG"
-  export INSTALL_LOG
-
-  oosh_get_running_shell
-
-  # Only try to parse ps if we haven't already identified the shell as bash
-  if [ "$SHELLNAME" != "bash" ]; then
-      oosh_parse_shellps $SHELLPS
-      if [ -n "$SHELL" ]; then
-        SHELLNAME=$(basename $SHELL)
-      fi
-  fi
-
-  BASH_FILE=$(command -v bash)
-
-  # Ensure we're running in bash — re-exec if not
-  if [ "$SHELLNAME" != "bash" ]; then
-    echo "Current shell ($SHELLNAME) is not bash. Ensuring bash is installed..."
-    # Set SUDO early so oosh_cmd can install packages as non-root
-    if [ "$HOME" != "/root" ] && [ -z "$SUDO" ]; then
-      SUDO="sudo"
-    fi
-    oosh_check_all_pm
-    if [ -z "$BASH_FILE" ]; then
-      oosh_cmd bash
-      BASH_FILE=$(command -v bash)
-    fi
-    if [ -n "$BASH_FILE" ]; then
-      echo "Re-executing with $BASH_FILE..."
-      exec "$BASH_FILE" "$0" "$@"
-    else
-      echo "ERROR: bash not found and could not be installed."
-      return 1
-    fi
-  fi
-
-  # Now we are guaranteed to be in bash — check version (macOS ships Bash 3.2)
-  if [ -n "$BASH_FILE" ]; then
-    BASH_MAJOR_VERSION=$("$BASH_FILE" -c "echo \"\${BASH_VERSINFO[0]}\"" 2>/dev/null)
-  fi
-  if [ "${BASH_MAJOR_VERSION:-0}" -lt 4 ]; then
-    echo "BASH_MAJOR_VERSION=$BASH_MAJOR_VERSION"
-    echo "Bash $BASH_MAJOR_VERSION is too old (oosh needs Bash 4+). Installing newer bash..."
-    # Ensure PM is available for install
-    if [ -z "$OOSH_PM" ]; then
-      if [ "$(id -u)" != "0" ] && [ -z "$SUDO" ]; then SUDO="sudo"; fi
-      oosh_check_all_pm
-    fi
-    # On macOS with no PM, install Homebrew first
-    if [ -z "$OOSH_PM" ] && [ "$(uname -s)" = "Darwin" ]; then
-      oosh_cmd brew
-    fi
-    if [ -n "$OOSH_PM" ]; then
-      case "$OOSH_PM" in
-        brew*) $OOSH_PM bash 2>/dev/null || true ;;  # may fail if Cellar owned by another user
-        *) $SUDO $OOSH_PM bash ;;
-      esac
-    fi
-    BASH_FILE=""
-    for _candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
-      if [ -x "$_candidate" ]; then
-        _ver=$("$_candidate" -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null)
-        if [ "${_ver:-0}" -ge 4 ]; then
-          BASH_FILE="$_candidate"
-          break
-        fi
-      fi
-    done
-    if [ -n "$BASH_FILE" ]; then
-      # Register new bash in /etc/shells (required for SSH login on macOS)
-      if [ -f /etc/shells ] && ! grep -q "$BASH_FILE" /etc/shells 2>/dev/null; then
-        echo "$BASH_FILE" | $SUDO tee -a /etc/shells >/dev/null
-      fi
-      echo "Re-executing with $BASH_FILE..."
-      exec "$BASH_FILE" "$0" "$@"
-    else
-      echo "WARNING: Could not find Bash 4+ after install. Continuing with Bash ${BASH_MAJOR_VERSION}..."
-      BASH_FILE=$(command -v bash)
-    fi
-  fi
-
-  if [ -n "$1" ]; then
-    echo "got parameters: $@"
-    while [ -n "$1" ]; do
-      case $1 in
-        mode)
-          echo "got: $*"
-          # Fixed positions: ./oosh mode <install_mode> <name_local> <config_remote> <branch> <logLevel>
-          # install_mode ($2) is accepted but always treated as root
-          install_remote_name_local="$3"
-          # '_' is a placeholder for empty values (empty args get lost across SSH + shebang chain)
-          install_remote_config_remote="$4"
-          if [ "$install_remote_config_remote" = "_" ]; then install_remote_config_remote=""; fi
-          # Branch passed as argument because shebang env -i wipes environment variables
-          if [ -n "$5" ]; then
-            export OOSH_BRANCH="$5"
-            # Sanitise: strip known ref prefixes. If the caller's local git
-            # state is degenerate (e.g. a local branch literally named
-            # "heads/origin/dev" created by `git worktree add <p> heads/origin/dev`),
-            # rev-parse returns the polluted name and downstream code here —
-            # "git worktree add … origin/${OOSH_BRANCH}" at line 247 — would
-            # construct "origin/heads/origin/dev" and fail with "invalid reference".
-            # init/oosh is the bootstrap so we can't source `this.git.branch.short`
-            # here (chicken-and-egg); inline the same strip chain.
-            OOSH_BRANCH="${OOSH_BRANCH#refs/heads/}"
-            OOSH_BRANCH="${OOSH_BRANCH#refs/remotes/origin/}"
-            OOSH_BRANCH="${OOSH_BRANCH#heads/origin/}"
-            OOSH_BRANCH="${OOSH_BRANCH#origin/}"
-            export OOSH_BRANCH
-            echo "OOSH_BRANCH set from argument: $OOSH_BRANCH"
-          fi
-          # Log level passed as argument to control verbosity
-          if [ -n "$6" ]; then
-            export LOG_LEVEL="$6"
-            if [ "$LOG_LEVEL" -gt 5 ] 2>/dev/null; then
-              export SH_OPT="-x"
-            else
-              export SH_OPT="+x"
-            fi
-            set $SH_OPT
-          fi
-
-          oosh_install_remote "$install_remote_name_local" "$install_remote_config_remote"
-          return $?
-        ;;
-        localInstall)
-          oosh_check_all_pm
-          oosh_status
-          oosh_install_oosh
-          oosh_setup_env
-
-          # Persist config directly (oosh scripts not bootstrapped yet — path/config would fail)
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export BASH_FILE OOSH_DIR
-          if [ -n "$BASH_FILE" ]; then
-            bashDir="$(dirname "$BASH_FILE")"
-            if [ "$bashDir" != "/usr/bin" ] && [ "$bashDir" != "/bin" ]; then
-              install_log "localInstall: appending brew bash ($BASH_FILE) to user.env"
-              printf 'export PATH="%s:$PATH"\n' "$bashDir" >> "$CONFIG"
-            fi
-          fi
-          if [ -n "$OOSH_DIR" ]; then
-            printf 'export OOSH_DIR="%s"\n' "$OOSH_DIR" >> "$CONFIG"
-          fi
-          return 0
-        ;;
-        *)
-          echo "this.call to: $*"
-          shift
-      esac
-    done
-  fi
-
-  if [ -z "$LOG_LEVEL" ]; then
-    LOG_LEVEL=1
-  fi
-
-  # Default invocation (curl/wget/fetch one-liner — no positional args):
-  # run a COMPLETE install. Previously this fallback ran only Phase 1
-  # (clone + config files) and stopped, leaving users with a non-functional
-  # setup where the state machine, developking, shared dirs, and GitHub
-  # deploy key propagation never ran.
-  #
-  # oosh_install_remote handles both cases correctly:
-  #   - root      → Phase 1 + ossh install.continue.local (full state machine)
-  #   - non-root  → re-exec as root via sudo with `mode root` args; the
-  #                 re-executed script parses those args at the `mode root`
-  #                 handler (~line 546) and re-enters oosh_install_remote's
-  #                 root branch.
-  #
-  # Users who want Phase-1-only (e.g. dev laptop, no server infra) can
-  # still invoke the explicit `localInstall` arg path (~line 586).
-  local_name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo localhost)"
-  oosh_install_remote "$local_name" ""
-  return $?
-}
-
-oosh_start "$@"
+# ─── Hand off to the state-machine entrypoint ───────────────────────────
+local_name="${REMOTE_SSH_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo localhost)}"
+echo "Handing off to ossh install.continue.local (branch=$OOSH_BRANCH, host=$local_name)…"
+exec "$OOSH_DIR/this" call ossh install.continue.local "$local_name" "$CONFIG_REMOTE"
