@@ -18,12 +18,17 @@ The installer checks both and exits with a one-line hint if either is missing.
 
 ## drag-and-drop install (macOS)
 
-1. On GitHub, click **Code → Download ZIP** (or `git clone https://github.com/Cerulean-Circle-GmbH/once.sh.git`).
-2. Open the downloaded folder in Finder.
-3. Double-click **`Install oosh.command`** in the repo root.
-4. Terminal opens and runs the install. Enter your sudo password when prompted.
+**One file, one double-click:**
+
+1. **[⬇ Download Install oosh.command](https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/Install%20oosh.command)** (right-click → Save Link As…)
+2. Double-click the file in Finder.
+3. Terminal opens and runs the install. Enter your sudo password when prompted.
+
+That's it — the `.command` file self-bootstraps: it fetches the bootstrap script from GitHub and runs it. No need to download the whole repo.
 
 > **First-run macOS prompt:** downloaded files carry Apple's quarantine flag. macOS will say "*Install oosh.command* cannot be opened because the developer cannot be verified." Right-click the file → **Open** → **Open** to confirm. After you approve it once, double-click works normally.
+
+> **Also works from a clone:** if you `git clone` the repo or download the ZIP, the same `Install oosh.command` in the repo root runs your local `init/oosh` instead of fetching from GitHub. Same UX either way.
 
 ## fast install - use it anywhere
 
