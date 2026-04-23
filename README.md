@@ -16,19 +16,23 @@ Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branchin
 
 The installer checks both and exits with a one-line hint if either is missing.
 
-## drag-and-drop install (macOS)
+## one-file install
 
-**One file, one double-click:**
+**One file, double-click (macOS) or `./` (Linux):**
 
-1. **[⬇ Download Install oosh.command](https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/Install%20oosh.command)** (right-click → Save Link As…)
-2. Double-click the file in Finder.
-3. Terminal opens and runs the install. Enter your sudo password when prompted.
+1. **[⬇ Download Install oosh.command](https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/Install%20oosh.command)** (right-click → Save Link As…)
+2. Run it:
+   - **macOS:** double-click in Finder.
+   - **Linux:** `chmod +x "Install oosh.command" && ./"Install oosh.command"`
+3. A terminal runs the install. Enter your sudo password when prompted.
 
 That's it — the `.command` file self-bootstraps: it fetches the bootstrap script from GitHub and runs it. No need to download the whole repo.
 
-> **First-run macOS prompt:** downloaded files carry Apple's quarantine flag. macOS will say "*Install oosh.command* cannot be opened because the developer cannot be verified." Right-click the file → **Open** → **Open** to confirm. After you approve it once, double-click works normally.
+> **First-run macOS prompt:** downloaded files carry Apple's quarantine flag. macOS will say "*Install oosh.command* cannot be opened because the developer cannot be verified." Right-click the file → **Open** → **Open** to confirm. After you approve it once, double-click works normally. Linux has no equivalent gate.
 
 > **Also works from a clone:** if you `git clone` the repo or download the ZIP, the same `Install oosh.command` in the repo root runs your local `init/oosh` instead of fetching from GitHub. Same UX either way.
+
+> **Current default branch: `dev`.** Until we promote the install flow to `prod`, the download link and the `.command`'s embedded fallback URL both point to `dev`. After promotion, both get rewritten to `prod` (by `promote`) and this link will be updated.
 
 ## fast install - use it anywhere
 
