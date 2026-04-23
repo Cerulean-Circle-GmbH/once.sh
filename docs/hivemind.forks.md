@@ -91,6 +91,21 @@ Legacy invasive method. Sends `/status` + Enter, waits, parses the dialog. Fallb
 
 Append-only, no retention policy. File grows linearly with refresh calls (4 panes × N refreshes ≈ negligible). Manual truncation only.
 
+### Broken UUID pruning
+
+`hiveMind consistency.fix [<session>]` runs a Stage 4 sweep: iterate `sessions.env`, for each `pane|uuid` check whether the JSONL file still exists anywhere under `~/.claude/projects`. If not — the UUID is broken — drop it from `sessions.env` and append a `|broken|` row to `forks.env`:
+
+```
+2026-04-23T09:02:03Z|ooshTeam:0.99|web4-tester|00000000-...|broken|
+```
+
+Use this when:
+- JSONLs were manually deleted
+- A project-directory move left stale cache pointers  
+- After long periods of no `registry.refresh` — stale entries accumulate
+
+Running `hiveMind consistency.audit` after the fix verifies the cleanup.
+
 ### Querying
 
 ```bash
@@ -166,10 +181,24 @@ This matters for cold recovery — you need to see what teams CAN be restored be
 
 ---
 
+## Cross-team resolve (related feature)
+
+The fresh `sessions.env` + `roles.env` caches (kept current by lifecycle `registry.refresh` hooks) make cross-team agent lookup fast. `hiveMind resolve <name>` now searches the full fleet by grepping the registry file in one pass, instead of per-session live discovery. Behavior:
+
+| Scenario | Result |
+|---|---|
+| Unique name across teams | Returns the pane target |
+| Ambiguous (same role in multiple teams), caller inside one of them | Silently prefers caller's session |
+| Ambiguous, caller not in any match (or outside tmux) | Errors with team list + disambiguation hint |
+| Explicit `<session>` passed | Searches only that session |
+| Not found | Clean error |
+
+This means callers like `hiveMind agent.monitor <name>`, `hiveMind send.message <name> ...`, `hiveMind delegate <name> ...` no longer require `hiveMind team.switch` before cross-team operations. See `session/tasks/hivemind-multi-team-resolve.md` for the bug report that drove this fix.
+
 ## Cross-reference
 
-- Implementation: `claudeCode:private.claudeCode.session.discover`, `hiveMind:hiveMind.registry.refresh`
-- Tests: `test/test.claudeCode` T-DISCOVER-1..9b, `test/test.hiveMind` T-REFRESH-1..8
+- Implementation: `claudeCode:private.claudeCode.session.discover`, `hiveMind:hiveMind.registry.refresh`, `hiveMind:hiveMind.resolve`, `hiveMind:hiveMind.consistency.fix`
+- Tests: `test/test.claudeCode` T-DISCOVER-1..9b, `test/test.hiveMind` T-REFRESH-1..8 (+ T-RESOLVE, T-FIX-BROKEN planned)
 - Related docs: `docs/hivemind.md`, `docs/claudeCode.sessions.md` (if present)
 - Schema files in `~/config/`: `hivemind.roles.env` (pane|role), `hivemind.sessions.env` (pane|uuid), `hivemind.teams.env` (session|description), `hivemind.forks.env` (audit log).
 
