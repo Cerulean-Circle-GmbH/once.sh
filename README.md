@@ -38,9 +38,11 @@ That's it — the `.command` file self-bootstraps: it fetches the bootstrap scri
 
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
-| **wget**  | `bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
-| **fetch** | `bash -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **curl**  | `bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"` |
+| **wget**  | `bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"`   |
+| **fetch** | `bash -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"` |
+
+> **Current default branch: `dev`.** The new thin-bootstrap install flow only lives on `dev` until it's promoted through `testing` to `prod`. Once promoted, these URLs get flipped back to `/prod/`.
 
 > **Note:** use `bash -c`, not `sh -c`. On Debian/Ubuntu `sh` is `dash`, and
 > the `sh -c "$(curl …)"` form hits a pre-existing bug in oosh's re-exec-via-bash
@@ -55,7 +57,7 @@ install from a non-default branch, e.g. `…/dev/init/oosh`.
 
 ### More detailed logging for debugging is available with these commands
 ```
-unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" | tee install.log.txt
+unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)" | tee install.log.txt
 
 > or if already available locally
 unbuffer env -i sh -x init/oosh | tee install.log.txt 
@@ -74,7 +76,7 @@ in VSCODE use [use the ANSI Colors plugin](https://marketplace.visualstudio.com/
 
 ## manual install
 ```
-wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh ;
+wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh ;
 chmod 700 oosh
 ./oosh
 
@@ -88,13 +90,13 @@ cat oosh | sh -x
 ```
 sudo apt update
 sudo apt install curl
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"
 
 or as root
 
 apt update
 apt install curl
-bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"
 ```
 
 
