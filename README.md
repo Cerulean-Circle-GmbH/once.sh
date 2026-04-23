@@ -13,9 +13,19 @@ Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branchin
 
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
-| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
-| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **curl**  | `bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **wget**  | `bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
+| **fetch** | `bash -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+
+> **Note:** use `bash -c`, not `sh -c`. On Debian/Ubuntu `sh` is `dash`, and
+> the `sh -c "$(curl …)"` form hits a pre-existing bug in oosh's re-exec-via-bash
+> step: inside a piped script `$0` is literally `"sh"` (not a filesystem path),
+> so `exec bash "$0" "$@"` becomes `exec bash sh` which bash resolves via PATH
+> to `/usr/bin/sh` and fails with "cannot execute binary file". `bash -c` starts
+> under bash directly so the re-exec is never attempted.
+
+Substitute the `prod` segment of the URL with `dev` (or any branch name) to
+install from a non-default branch, e.g. `…/dev/init/oosh`.
 
 
 ### More detailed logging for debugging is available with these commands
@@ -53,13 +63,13 @@ cat oosh | sh -x
 ```
 sudo apt update
 sudo apt install curl
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 
 or as root
 
 apt update
 apt install curl
-sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 ```
 
 
