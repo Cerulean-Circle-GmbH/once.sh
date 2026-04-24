@@ -38,6 +38,21 @@ pane.sweep / team.sweep or direct function call).
 | `idle.txt` | `idle\|none\|info` | Clean `❯` prompt on last line |
 | `unknown.txt` | `unknown\|none\|info` | Empty content |
 
+## F2.2 — False-positive fixtures (comment-aware prose-scrub)
+
+Source-code displays that mention trigger substrings only inside comments
+of various languages. The F2.1 scrub strips comment lines before substring
+matching — these must all fall through to `active|none|info`.
+
+| Fixture | Comment style | Must NOT trigger |
+|---------|---------------|------------------|
+| `fp-js-slashslash-comment.txt` | `//` (JS/TS/Go/Rust/Java/C++/Swift/CSS) | rate-limit, subscription-limit |
+| `fp-sql-dashdash-comment.txt` | `--` (SQL/Haskell/Lua/Ada/Elm) | subscription-limit |
+| `fp-c-block-comment.txt` | `/* ... */` + `*` continuation | api-error |
+| `fp-html-comment.txt` | `<!-- -->` (HTML/XML/Markdown) | mcp-error |
+| `fp-python-docstring.txt` | `#` (Python/Ruby/YAML) | api-error, rate-limit |
+| `fp-menu-text-not-live.txt` | n/a — prose describes menu | permission (needs live ❯) |
+
 ## Edge-case rationale (focus per PO directive)
 
 ### permission
