@@ -1753,33 +1753,79 @@ scrumMaster.metrics.collect.completion() { :; }
 # Answers management questions about subscription usage
 # ─────────────────────────────────────────────────────────────────────────────
 
-private.scrumMaster.subscription.api.call() # # fetch subscription data from OAuth API and cache
+private.scrumMaster.subscription.cacheFile() { # # canonical path for subscription cache env
+  echo "${CONFIG_PATH:-$HOME/config}/scrumMaster.subscription.env"
+}
+
+private.scrumMaster.subscription.api.call() # # fetch subscription data from OAuth API; on rate_limit/failure keeps existing cache marked stale
 {
+  local cacheFile
+  cacheFile=$(private.scrumMaster.subscription.cacheFile)
+
   # Auth
   local token
   token=$(private.scrumMaster.subscription.auth)
-  if [ $? -ne 0 ]; then return 1; fi
+  if [ $? -ne 0 ]; then
+    # No token — if we have any cache, load and mark stale; otherwise fail.
+    if [ -f "$cacheFile" ]; then
+      source "$cacheFile" 2>/dev/null
+      export SUBSCRIPTION_STALE=1
+      return 0
+    fi
+    return 1
+  fi
 
-  # API call
-  local response
-  response=$(curl -s -f \
+  # API call — split status from body so we can detect 429 / 5xx
+  local tmpBody
+  tmpBody=$(mktemp 2>/dev/null || echo "/tmp/scrumMaster.sub.$$.body")
+  local httpCode
+  httpCode=$(curl -s -o "$tmpBody" -w "%{http_code}" \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
     -H "Accept: application/json" \
     "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-  if [ $? -ne 0 ] || [ -z "$response" ]; then
-    error.log "OAuth usage API call failed"
+  local curlRc=$?
+  local response
+  response=$(cat "$tmpBody" 2>/dev/null)
+  rm -f "$tmpBody" 2>/dev/null
+
+  # Transient failure path — serve cache if available, mark stale
+  if [ "$curlRc" -ne 0 ] || [ -z "$response" ] || [ "$httpCode" != "200" ]; then
+    local reason="network"
+    [ "$httpCode" = "429" ] && reason="rate_limit"
+    [ "$httpCode" -ge 500 ] 2>/dev/null && reason="server_${httpCode}"
+    [ "$httpCode" -ge 400 ] 2>/dev/null && [ "$httpCode" -lt 500 ] && reason="client_${httpCode}"
+
+    if [ -f "$cacheFile" ]; then
+      source "$cacheFile" 2>/dev/null
+      export SUBSCRIPTION_STALE=1
+      export SUBSCRIPTION_STALE_REASON="$reason"
+      warn.log "OAuth usage API failed ($reason) — using cached data (age: $(scrumMaster.subscription.cache.age)s)"
+      return 0
+    fi
+    error.log "OAuth usage API failed ($reason) — no cache available"
     return 1
   fi
 
   # Parse into SUBSCRIPTION_* variables
   private.scrumMaster.subscription.parse "$response"
-  if [ $? -ne 0 ]; then return 1; fi
+  if [ $? -ne 0 ]; then
+    # Parse failure — same fallback as API failure
+    if [ -f "$cacheFile" ]; then
+      source "$cacheFile" 2>/dev/null
+      export SUBSCRIPTION_STALE=1
+      export SUBSCRIPTION_STALE_REASON="parse_error"
+      warn.log "OAuth response parse failed — using cached data"
+      return 0
+    fi
+    return 1
+  fi
 
-  # Cache for offline access
-  local cacheFile="${CONFIG_PATH:-$HOME/config}/scrumMaster.subscription.env"
+  # Fresh data — clear stale flags, write cache
+  unset SUBSCRIPTION_STALE SUBSCRIPTION_STALE_REASON
   {
     echo "SUBSCRIPTION_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "SUBSCRIPTION_TIMESTAMP_EPOCH=\"$(date +%s)\""
     echo "SUBSCRIPTION_FIVE_HOUR_UTIL=\"${SUBSCRIPTION_FIVE_HOUR_UTIL:-}\""
     echo "SUBSCRIPTION_FIVE_HOUR_RESETS=\"${SUBSCRIPTION_FIVE_HOUR_RESETS:-}\""
     echo "SUBSCRIPTION_SEVEN_DAY_UTIL=\"${SUBSCRIPTION_SEVEN_DAY_UTIL:-}\""
@@ -1790,6 +1836,32 @@ private.scrumMaster.subscription.api.call() # # fetch subscription data from OAu
   } > "$cacheFile"
   return 0
 }
+
+scrumMaster.subscription.cache.age() # # seconds since last fresh API read (or "no-cache" / "unknown")
+{
+  local cacheFile
+  cacheFile=$(private.scrumMaster.subscription.cacheFile)
+  [ ! -f "$cacheFile" ] && { echo "no-cache"; return 1; }
+
+  # Prefer epoch field (added 2026-04-24); fall back to parsing ISO timestamp
+  local ts_epoch
+  ts_epoch=$(grep -E '^SUBSCRIPTION_TIMESTAMP_EPOCH=' "$cacheFile" 2>/dev/null | cut -d'"' -f2)
+  if [ -z "$ts_epoch" ]; then
+    local ts_iso
+    ts_iso=$(grep -E '^SUBSCRIPTION_TIMESTAMP=' "$cacheFile" 2>/dev/null | cut -d'"' -f2)
+    [ -z "$ts_iso" ] && { echo "unknown"; return 1; }
+    # Convert ISO → epoch (BSD + GNU date compatible)
+    ts_epoch=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts_iso" '+%s' 2>/dev/null \
+            || date -d "$ts_iso" '+%s' 2>/dev/null)
+    [ -z "$ts_epoch" ] && { echo "unknown"; return 1; }
+  fi
+
+  local now
+  now=$(date +%s)
+  echo $((now - ts_epoch))
+  return 0
+}
+scrumMaster.subscription.cache.age.completion() { :; }
 
 private.scrumMaster.subscription.resets.in() # # calculate human-readable time until reset
 {
@@ -1840,7 +1912,14 @@ scrumMaster.subscription() # # one-liner subscription status — "are we OK?"
   local verdict
   verdict=$(private.scrumMaster.subscription.verdict "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}")
 
-  echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-?}% 5h | ${SUBSCRIPTION_SEVEN_DAY_UTIL:-?}% 7d | resets in ${resets_in} | ${verdict}"
+  local staleTag=""
+  if [ "${SUBSCRIPTION_STALE:-0}" = "1" ]; then
+    local age
+    age=$(scrumMaster.subscription.cache.age 2>/dev/null)
+    staleTag=" (cached ${age}s, ${SUBSCRIPTION_STALE_REASON:-stale})"
+  fi
+
+  echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-?}% 5h | ${SUBSCRIPTION_SEVEN_DAY_UTIL:-?}% 7d | resets in ${resets_in} | ${verdict}${staleTag}"
 }
 scrumMaster.subscription.completion() { :; }
 
