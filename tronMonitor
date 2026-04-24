@@ -40,8 +40,13 @@ private.tronMonitor.pane() {
 private.tronMonitor.pane.isValid() { # <pane> # return 0 if pane exists in tmux, 1 otherwise
   local pane="$1"
   [ -z "$pane" ] && return 1
-  # Accept if tmux can resolve it — session + pane address both valid
-  tmux display-message -t "$pane" -p '#{pane_id}' >/dev/null 2>&1
+  # Split pane target into session + rest (e.g. "TRONinterface:0.3" → "TRONinterface")
+  local sess="${pane%%:*}"
+  [ -z "$sess" ] || [ "$sess" = "$pane" ] && return 1  # malformed — must contain ':'
+  # Session must exist (has-session returns rc=1 if absent; reliable primitive)
+  tmux has-session -t "$sess" 2>/dev/null || return 1
+  # Pane index must exist within that session
+  tmux list-panes -t "$pane" -F '#{pane_id}' >/dev/null 2>&1
 }
 
 private.tronMonitor.screenSession() {
@@ -55,6 +60,36 @@ private.tronMonitor.fullScreenName() { # # return PID.name format for screen -X 
   local fullName
   fullName=$(screen -ls 2>/dev/null | grep "$shortName" | awk '{print $1}' | head -1 || echo "$shortName")
   echo "${fullName:-$shortName}"
+}
+
+private.tronMonitor.screen.isAlive() { # # return 0 if our screen session is running
+  local shortName=$(private.tronMonitor.screenSession)
+  screen -ls 2>/dev/null | grep -q "\.${shortName}[[:space:]]"
+}
+
+private.tronMonitor.screen.ensure() { # # if screen session died, restart it + re-add tracked teams
+  if private.tronMonitor.screen.isAlive; then
+    return 0
+  fi
+  warn.log "tronMonitor screen session '$(private.tronMonitor.screenSession)' is not running"
+  # Auto-recover: start fresh screen via setup, re-add tracked teams
+  local monitorPane
+  monitorPane=$(private.tronMonitor.pane)
+  local screenName=$(private.tronMonitor.screenSession)
+  info.log "auto-recovering: starting screen '$screenName' in $monitorPane"
+  otmux send.raw "$monitorPane" "screen -S $screenName" Enter 2>/dev/null
+  sleep 1
+  # Re-add any tracked teams from env
+  if [ -f "$TRON_MONITOR_ENV" ] && [ -s "$TRON_MONITOR_ENV" ]; then
+    local sess
+    while IFS='|' read -r num sess; do
+      [ -z "$num" ] && continue
+      [[ "$sess" == __test_* ]] && continue
+      if otmux has "$sess" 2>/dev/null; then
+        tronMonitor.add "$sess" 2>/dev/null
+      fi
+    done < "$TRON_MONITOR_ENV"
+  fi
 }
 
 private.tronMonitor.nextWindow() {
@@ -118,6 +153,12 @@ tronMonitor.add() # <teamSession> # add a team session as a read-only screen win
     return 1
   fi
 
+  # D1.6 resilience — if screen died, recover before acting
+  private.tronMonitor.screen.ensure || {
+    error.log "tronMonitor screen could not be recovered; try: tronMonitor setup"
+    return 1
+  }
+
   # Check if already added
   local existing
   existing=$(private.tronMonitor.findWindow "$teamSession")
@@ -155,6 +196,12 @@ tronMonitor.switch() # <teamSession> # switch monitor to show a specific team
     return 1
   fi
 
+  # D1.6 resilience — recover if screen died
+  private.tronMonitor.screen.ensure || {
+    error.log "tronMonitor screen could not be recovered; try: tronMonitor setup"
+    return 1
+  }
+
   local windowNum
   windowNum=$(private.tronMonitor.findWindow "$teamSession")
 
@@ -179,6 +226,14 @@ tronMonitor.switch.completion.teamSession() {
 tronMonitor.prune() # # drop env entries whose tmux session no longer exists + their screen windows
 {
   [ -f "$TRON_MONITOR_ENV" ] || { info.log "No tronMonitor.env — nothing to prune"; return 0; }
+
+  # D1.6 — if screen died, prune still cleans the env file but skips screen -X calls
+  local screenAlive=""
+  if private.tronMonitor.screen.isAlive; then
+    screenAlive="yes"
+  else
+    warn.log "screen session not running — cleaning env only (no window kills)"
+  fi
 
   local screenName
   screenName=$(private.tronMonitor.fullScreenName)
@@ -209,7 +264,7 @@ tronMonitor.prune() # # drop env entries whose tmux session no longer exists + t
     # Atomic window-targeted kill — `-p <num> -X kill` combines select+kill
     # safely without racing the currently-selected window (was EPERM cause).
     info.log "  dropping $drop_reason: window $num → '$sess'"
-    if [ -n "$screenName" ]; then
+    if [ "$screenAlive" = "yes" ] && [ -n "$screenName" ]; then
       screen -S "$screenName" -p "$num" -X kill 2>/dev/null
     fi
     dropped=$((dropped + 1))
@@ -254,11 +309,14 @@ tronMonitor.remove() # <teamSession> # remove a team from the monitor
   grep -v "|${teamSession}$" "$TRON_MONITOR_ENV" > "${TRON_MONITOR_ENV}.tmp" 2>/dev/null
   mv "${TRON_MONITOR_ENV}.tmp" "$TRON_MONITOR_ENV"
 
-  # Kill the screen window via screen -X
-  local screenName=$(private.tronMonitor.screenSession)
-  screen -S "$(private.tronMonitor.fullScreenName)" -X select "$windowNum"
-  sleep 0.2
-  screen -S "$(private.tronMonitor.fullScreenName)" -X kill
+  # Atomic window-targeted kill (D1.6 — same fix as prune; old select+kill
+  # raced the currently-selected window, sometimes killing window 0 and
+  # thereby terminating the screen session unexpectedly).
+  local screenName
+  screenName=$(private.tronMonitor.fullScreenName)
+  if [ -n "$screenName" ]; then
+    screen -S "$screenName" -p "$windowNum" -X kill 2>/dev/null
+  fi
 
   success.log "Removed $teamSession (was window $windowNum)"
 }
