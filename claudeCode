@@ -1362,13 +1362,64 @@ claudeCode.context.jsonl() # <?pane> # find .jsonl file for a pane (per-pane), o
 }
 claudeCode.context.jsonl.completion() { :; }
 
+private.claudeCode.max.tokens.for.jsonl() # <jsonlFile> # detect per-session context limit (1M for [1m] sessions, else 200k)
+{
+  # Detection priority:
+  # 1. ps args — if a running claude process for this sessionId has model flag
+  #    containing "[1m]", it's 1M context.
+  # 2. Observed max — if any usage in the JSONL exceeds 200k, it MUST be 1M
+  #    (200k-capped session would have been compacted before hitting this).
+  # 3. Default 200k (opus/sonnet/haiku without [1m] flag).
+  local jsonlFile="$1"
+  [ -f "$jsonlFile" ] || { echo 200000; return 0; }
+
+  local sid
+  sid=$(basename "$jsonlFile" .jsonl)
+
+  # 1. Live ps-args check — is this session running with [1m]?
+  if command -v ps &>/dev/null && [ -n "$sid" ]; then
+    if ps -eo args= 2>/dev/null | grep -F "$sid" | grep -q '\[1m\]'; then
+      echo 1000000
+      return 0
+    fi
+  fi
+
+  # 2. Observed-max auto-detect — if any single usage exceeded 200k, it's 1M
+  local observed_max
+  observed_max=$(tail -200 "$jsonlFile" 2>/dev/null | python3 -c "
+import sys, json
+m = 0
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+        if d.get('type') == 'assistant':
+            u = d.get('message', {}).get('usage', {})
+            if u and 'input_tokens' in u:
+                t = u['input_tokens'] + u.get('cache_creation_input_tokens', 0) + u.get('cache_read_input_tokens', 0)
+                if t > m: m = t
+    except: pass
+print(m)
+" 2>/dev/null)
+  if [ -n "$observed_max" ] && [ "$observed_max" -gt 200000 ] 2>/dev/null; then
+    echo 1000000
+    return 0
+  fi
+
+  # 3. Default (opus/sonnet/haiku at 200k)
+  echo 200000
+}
+
 private.claudeCode.context.from.jsonl() {
   # Read context percentage from JSONL token data
   local jsonlFile="$1"
   [ -f "$jsonlFile" ] || return 1
 
-  tail -50 "$jsonlFile" | python3 -c "
-import sys, json
+  local maxTokens
+  maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$jsonlFile")
+
+  tail -50 "$jsonlFile" | MAX_TOKENS="$maxTokens" python3 -c "
+import sys, json, os
+max_tokens = int(os.environ.get('MAX_TOKENS', 200000))
 last_usage = None
 for line in sys.stdin:
     try:
@@ -1383,7 +1434,7 @@ if last_usage:
     cache_create = last_usage.get('cache_creation_input_tokens', 0)
     cache_read = last_usage.get('cache_read_input_tokens', 0)
     total = input_t + cache_create + cache_read
-    pct = round((total / 200000) * 100, 1)
+    pct = round((total / max_tokens) * 100, 1)
     remaining = round(100 - pct, 1)
     print(f'{remaining}')
 else:
@@ -1599,9 +1650,14 @@ private.claudeCode.velocity.calculate() # <jsonlFile> # parse velocity from json
   local jsonlFile="$1"
   [ -z "$jsonlFile" ] || [ ! -f "$jsonlFile" ] && { echo "unknown"; return 1; }
 
-  python3 -c "
-import json, sys
+  local maxTokens
+  maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$jsonlFile")
+
+  MAX_TOKENS="$maxTokens" python3 -c "
+import json, sys, os
 from datetime import datetime
+
+max_tokens = int(os.environ.get('MAX_TOKENS', 200000))
 
 messages = []
 with open('$jsonlFile') as f:
@@ -1640,7 +1696,6 @@ try:
     tokens_per_hour = token_growth / hours
 
     current = last['tokens']
-    max_tokens = 200000
     threshold = int(max_tokens * 0.90)
     remaining = threshold - current
 
@@ -1688,13 +1743,18 @@ claudeCode.context.dashboard() # # show velocity dashboard for all active sessio
       uuid=$(basename "$latest" .jsonl)
       local short="${uuid:0:8}"
 
-      # Get velocity info
+      # Get velocity info (per-session max_tokens aware)
+      local maxTokens
+      maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$latest")
       local info
-      info=$(JSONL_FILE="$latest" python3 -c "
+      info=$(JSONL_FILE="$latest" MAX_TOKENS="$maxTokens" python3 -c "
 import json, sys, os
 from datetime import datetime
 
 jsonl_file = os.environ.get('JSONL_FILE', '')
+max_tokens = int(os.environ.get('MAX_TOKENS', 200000))
+threshold = int(max_tokens * 0.90)
+
 messages = []
 with open(jsonl_file) as f:
     for line in f:
@@ -1717,12 +1777,12 @@ try:
     t2 = datetime.fromisoformat(last['ts'].replace('Z', '+00:00'))
     hours = (t2 - t1).total_seconds() / 3600
     if hours <= 0:
-        print(f\"{round(last['tokens']/200000*100,1)}% | - | -\")
+        print(f\"{round(last['tokens']/max_tokens*100,1)}% | - | -\")
         sys.exit(0)
     rate = int((last['tokens'] - first['tokens']) / hours)
-    remaining = 180000 - last['tokens']
+    remaining = threshold - last['tokens']
     mins = int(remaining / rate * 60) if rate > 0 and remaining > 0 else 0
-    pct = round(last['tokens'] / 200000 * 100, 1)
+    pct = round(last['tokens'] / max_tokens * 100, 1)
     status = 'COMPACT!' if remaining <= 0 else f'{mins}min'
     print(f\"{pct}% | {rate}/hr | {status}\")
 except:
