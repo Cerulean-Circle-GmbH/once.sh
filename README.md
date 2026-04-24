@@ -11,10 +11,14 @@ Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branchin
 
 ## prereqs
 
-- **bash 4+** — macOS: `brew install bash` · Debian/Ubuntu/RHEL: already present
-- **git** — macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install git` · RHEL/Fedora: `sudo dnf install git`
+- **curl / wget / fetch** (only one, for the one-liner to fetch the installer)
+  — macOS: already present · Debian/Ubuntu: `apt-get install -y curl` · RHEL/Fedora: `dnf install -y curl` · Alpine: `apk add curl`
+- **bash 4+** — macOS: `brew install bash` · Debian/Ubuntu/RHEL: already present (Ubuntu 22/24 ships bash 5)
+- **git** — macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install git` · RHEL/Fedora: `sudo dnf install git` · Alpine: `apk add git`
 
-The installer checks both and exits with a one-line hint if either is missing.
+> **Why curl/wget/fetch is listed first:** the install one-liner below (`bash -c "$(curl …)"`) relies on bash's command-substitution to pull the installer from GitHub. If the fetcher is missing, bash silently runs `bash -c ""` and nothing happens — you'll see *`bash: curl: command not found`* with no framed error. Install a fetcher first (any one of curl / wget / fetch), then run the one-liner.
+>
+> The installer itself checks **bash 4+** and **git** and prints a consolidated error with per-platform install hints if either is missing.
 
 ## one-file install
 
