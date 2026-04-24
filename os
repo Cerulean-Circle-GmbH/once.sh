@@ -253,6 +253,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   ossh exec.tty "$platform" "user create oosh-user password oosh-user" || {
     error.log "Failed to create oosh-user on $platform"
   }
+  # Give oosh-user NOPASSWD sudo so test.suite can run without interactive
+  # prompts (some core tests exercise init/oosh's sudo re-exec path).
+  ossh exec "$platform" "echo 'oosh-user ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-oosh-user >/dev/null && sudo chmod 440 /etc/sudoers.d/99-oosh-user"
 
   console.log "Phase A.3: creating bash-user via raw useradd..."
   ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash -G sudo bash-user && echo bash-user:bash-user | sudo chpasswd && echo 'bash-user ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-bash-user >/dev/null" || {
@@ -281,16 +284,19 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
     rcRoot=${PIPESTATUS[0]}
 
-    # B.3 — oosh-user (via test+sudo+runuser; login-shell equivalent of `user login oosh-user`)
+    # B.3 — oosh-user (via test+sudo+runuser; login-shell equivalent of `user login oosh-user`).
+    # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
+    # early-exit for non-interactive shells would otherwise skip the PATH / user.env
+    # setup and `test.suite: command not found` fires.
     console.log "Running core tests as oosh-user..."
     ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u oosh-user -- bash -lc 'test.suite core 1'" 2>&1 | tee "$ooshUserLog"
+    ossh exec.tty "$platform" "sudo runuser -u oosh-user -- bash -c 'source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$ooshUserLog"
     rcOoshUser=${PIPESTATUS[0]}
 
     # B.4 — bash-user (same pattern)
     console.log "Running core tests as bash-user..."
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -lc 'test.suite core 1'" 2>&1 | tee "$bashUserLog"
+    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -c 'source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$bashUserLog"
     rcBashUser=${PIPESTATUS[0]}
   else
     console.log "Skipping tests (notests)"
