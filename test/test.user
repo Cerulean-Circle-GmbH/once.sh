@@ -318,31 +318,51 @@ fi
 # during install before USER_MOD / USER_DEL were computed). Reproduces the
 # hetzsim bug where `user.group.add dev bob` silently degraded and bob
 # never joined `dev`, breaking write access to log.live.out.
+#
+# CRITICAL: private.user.init transitively calls `config save`, which
+# writes to $CONFIG (NOT just $CONFIG_PATH). If we only override
+# CONFIG_PATH here, config save still hits the real user.env and can
+# poison it with the temp path. Run the whole helper inside a bash -c
+# subshell where BOTH CONFIG and CONFIG_PATH are redirected to the
+# throw-away dir. Results are captured via files written to that dir,
+# not via env vars that would leak back.
 # ============================================================================
 TUSR_SELF_HEAL=$(mktemp -d)
-_CONFIG_PATH_BACKUP="$CONFIG_PATH"
-export CONFIG_PATH="$TUSR_SELF_HEAL"
 cat > "$TUSR_SELF_HEAL/os.commands.env" <<'EOF'
 export declare OS_CMD_GROUP_ADD="groupadd -f"
 export declare OS_CMD_USER_ADD="useradd -g dev"
 EOF
-unset OS_CMD_USER_MOD OS_CMD_USER_DEL
-# Source user to pick up the updated private.user.init, then invoke it
-source $OOSH_DIR/user >/dev/null 2>&1 || true
-private.user.init >/dev/null 2>&1 || true
+
+# Run in a fully-isolated subshell: fresh CONFIG + CONFIG_PATH pointing at
+# the temp dir, private.user.init fires, we capture the resulting
+# OS_CMD_USER_MOD / OS_CMD_USER_DEL values into files we can grep from
+# the outer shell. No exports leak back to the caller's env.
+bash -c '
+  export CONFIG_PATH="'"$TUSR_SELF_HEAL"'"
+  export CONFIG="'"$TUSR_SELF_HEAL"'/user.env"
+  : > "$CONFIG"
+  unset OS_CMD_USER_MOD OS_CMD_USER_DEL OS_CMD_USER_ADD OS_CMD_GROUP_ADD
+  source "'"$OOSH_DIR"'/user" >/dev/null 2>&1 || true
+  private.user.init >/dev/null 2>&1 || true
+  printf "%s" "$OS_CMD_USER_MOD" > "'"$TUSR_SELF_HEAL"'/.result.USER_MOD"
+  printf "%s" "$OS_CMD_USER_DEL" > "'"$TUSR_SELF_HEAL"'/.result.USER_DEL"
+' >/dev/null 2>&1 || true
+
+_HEAL_USER_MOD=$(cat "$TUSR_SELF_HEAL/.result.USER_MOD" 2>/dev/null)
+_HEAL_USER_DEL=$(cat "$TUSR_SELF_HEAL/.result.USER_DEL" 2>/dev/null)
 
 test.case $level "T-USER-INIT-SELF-HEAL: fills missing OS_CMD_USER_MOD" \
-  echo "OS_CMD_USER_MOD=$OS_CMD_USER_MOD"
-if [ -n "$OS_CMD_USER_MOD" ]; then
-  expect.pass "OS_CMD_USER_MOD filled in: $OS_CMD_USER_MOD"
+  echo "OS_CMD_USER_MOD=$_HEAL_USER_MOD"
+if [ -n "$_HEAL_USER_MOD" ]; then
+  expect.pass "OS_CMD_USER_MOD filled in: $_HEAL_USER_MOD"
 else
   expect.fail "OS_CMD_USER_MOD still empty after private.user.init (self-heal broken)"
 fi
 
 test.case $level "T-USER-INIT-SELF-HEAL: fills missing OS_CMD_USER_DEL" \
-  echo "OS_CMD_USER_DEL=$OS_CMD_USER_DEL"
-if [ -n "$OS_CMD_USER_DEL" ]; then
-  expect.pass "OS_CMD_USER_DEL filled in: $OS_CMD_USER_DEL"
+  echo "OS_CMD_USER_DEL=$_HEAL_USER_DEL"
+if [ -n "$_HEAL_USER_DEL" ]; then
+  expect.pass "OS_CMD_USER_DEL filled in: $_HEAL_USER_DEL"
 else
   expect.fail "OS_CMD_USER_DEL still empty after private.user.init"
 fi
@@ -356,7 +376,15 @@ else
   expect.fail "os.commands.env not re-saved with complete set — future sessions still broken"
 fi
 
+test.case $level "T-USER-INIT-SELF-HEAL-ISOLATION: outer CONFIG_PATH unchanged" \
+  echo "CONFIG_PATH=$CONFIG_PATH"
+if [ "$CONFIG_PATH" != "$TUSR_SELF_HEAL" ] \
+   && ! grep -qE 'CONFIG_PATH="/tmp/tmp\.' "$CONFIG" 2>/dev/null; then
+  expect.pass "subshell isolation worked — outer CONFIG and user.env untouched"
+else
+  expect.fail "test poisoned outer config — CONFIG_PATH or user.env now references the temp dir"
+fi
+
 rm -rf "$TUSR_SELF_HEAL"
-export CONFIG_PATH="$_CONFIG_PATH_BACKUP"
 
 test.suite.save.results
