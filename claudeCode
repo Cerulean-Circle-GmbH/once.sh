@@ -19,6 +19,15 @@ export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=100
 unset  COLORTERM
 unset  CLAUDECODE
 
+# ── Context window limits — single source of truth ────────────────────────────
+# Used by context.*, velocity.*, dashboard. Detection logic (which value applies
+# to which session) lives in private.claudeCode.max.tokens.for.jsonl.
+# Exported so python subprocesses inherit the constants.
+: ${CLAUDE_MAX_TOKENS_DEFAULT:=200000}       # opus/sonnet/haiku base window
+: ${CLAUDE_MAX_TOKENS_1M:=1000000}           # sessions launched with [1m] flag
+: ${CLAUDE_COMPACT_THRESHOLD_PCT:=90}        # % at which "COMPACT NOW" fires
+export CLAUDE_MAX_TOKENS_DEFAULT CLAUDE_MAX_TOKENS_1M CLAUDE_COMPACT_THRESHOLD_PCT
+
 # ── Shared completion helpers ──────────────────────────────────────────────
 private.claudeCode.complete.panes() {
   tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
@@ -1362,16 +1371,15 @@ claudeCode.context.jsonl() # <?pane> # find .jsonl file for a pane (per-pane), o
 }
 claudeCode.context.jsonl.completion() { :; }
 
-private.claudeCode.max.tokens.for.jsonl() # <jsonlFile> # detect per-session context limit (1M for [1m] sessions, else 200k)
+private.claudeCode.max.tokens.for.jsonl() # <jsonlFile> # detect per-session context limit
 {
-  # Detection priority:
-  # 1. ps args — if a running claude process for this sessionId has model flag
-  #    containing "[1m]", it's 1M context.
-  # 2. Observed max — if any usage in the JSONL exceeds 200k, it MUST be 1M
-  #    (200k-capped session would have been compacted before hitting this).
-  # 3. Default 200k (opus/sonnet/haiku without [1m] flag).
+  # Detection priority (see CLAUDE_MAX_TOKENS_* constants at top of file):
+  # 1. ps args — running claude process for this sessionId with "[1m]" flag → 1M.
+  # 2. Observed max — any JSONL usage > default → must be 1M (default-capped
+  #    sessions would have compacted before exceeding their limit).
+  # 3. Fall back to default (opus/sonnet/haiku base window).
   local jsonlFile="$1"
-  [ -f "$jsonlFile" ] || { echo 200000; return 0; }
+  [ -f "$jsonlFile" ] || { echo "$CLAUDE_MAX_TOKENS_DEFAULT"; return 0; }
 
   local sid
   sid=$(basename "$jsonlFile" .jsonl)
@@ -1379,12 +1387,12 @@ private.claudeCode.max.tokens.for.jsonl() # <jsonlFile> # detect per-session con
   # 1. Live ps-args check — is this session running with [1m]?
   if command -v ps &>/dev/null && [ -n "$sid" ]; then
     if ps -eo args= 2>/dev/null | grep -F "$sid" | grep -q '\[1m\]'; then
-      echo 1000000
+      echo "$CLAUDE_MAX_TOKENS_1M"
       return 0
     fi
   fi
 
-  # 2. Observed-max auto-detect — if any single usage exceeded 200k, it's 1M
+  # 2. Observed-max auto-detect — any usage exceeding default means it's 1M
   local observed_max
   observed_max=$(tail -200 "$jsonlFile" 2>/dev/null | python3 -c "
 import sys, json
@@ -1400,13 +1408,13 @@ for line in sys.stdin:
     except: pass
 print(m)
 " 2>/dev/null)
-  if [ -n "$observed_max" ] && [ "$observed_max" -gt 200000 ] 2>/dev/null; then
-    echo 1000000
+  if [ -n "$observed_max" ] && [ "$observed_max" -gt "$CLAUDE_MAX_TOKENS_DEFAULT" ] 2>/dev/null; then
+    echo "$CLAUDE_MAX_TOKENS_1M"
     return 0
   fi
 
-  # 3. Default (opus/sonnet/haiku at 200k)
-  echo 200000
+  # 3. Default (opus/sonnet/haiku base window)
+  echo "$CLAUDE_MAX_TOKENS_DEFAULT"
 }
 
 private.claudeCode.context.from.jsonl() {
@@ -1419,7 +1427,7 @@ private.claudeCode.context.from.jsonl() {
 
   tail -50 "$jsonlFile" | MAX_TOKENS="$maxTokens" python3 -c "
 import sys, json, os
-max_tokens = int(os.environ.get('MAX_TOKENS', 200000))
+max_tokens = int(os.environ.get('MAX_TOKENS') or os.environ.get('CLAUDE_MAX_TOKENS_DEFAULT') or 200000)
 last_usage = None
 for line in sys.stdin:
     try:
@@ -1657,7 +1665,7 @@ private.claudeCode.velocity.calculate() # <jsonlFile> # parse velocity from json
 import json, sys, os
 from datetime import datetime
 
-max_tokens = int(os.environ.get('MAX_TOKENS', 200000))
+max_tokens = int(os.environ.get('MAX_TOKENS') or os.environ.get('CLAUDE_MAX_TOKENS_DEFAULT') or 200000)
 
 messages = []
 with open('$jsonlFile') as f:
@@ -1696,7 +1704,7 @@ try:
     tokens_per_hour = token_growth / hours
 
     current = last['tokens']
-    threshold = int(max_tokens * 0.90)
+    threshold = int(max_tokens * int(os.environ.get('CLAUDE_COMPACT_THRESHOLD_PCT') or 90) / 100)
     remaining = threshold - current
 
     if tokens_per_hour > 0 and remaining > 0:
@@ -1752,8 +1760,8 @@ import json, sys, os
 from datetime import datetime
 
 jsonl_file = os.environ.get('JSONL_FILE', '')
-max_tokens = int(os.environ.get('MAX_TOKENS', 200000))
-threshold = int(max_tokens * 0.90)
+max_tokens = int(os.environ.get('MAX_TOKENS') or os.environ.get('CLAUDE_MAX_TOKENS_DEFAULT') or 200000)
+threshold = int(max_tokens * int(os.environ.get('CLAUDE_COMPACT_THRESHOLD_PCT') or 90) / 100)
 
 messages = []
 with open(jsonl_file) as f:
