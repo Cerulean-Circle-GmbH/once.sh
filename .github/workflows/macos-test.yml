@@ -31,23 +31,14 @@ jobs:
         run: |
           export OOSH_INSTALL_SOURCE="$GITHUB_WORKSPACE"
 
-          # Install oosh's hard prereqs via brew. Mirrors what `oo prereqs.
-          # install` / `ossh prereqs.install <host>` does in real life — the
-          # user runs that first and it installs bash, git, curl. macOS GHA
-          # runners typically ship git/curl already (xcode-select), but
-          # naked alpine/debian images don't, and we want the workflow to
-          # match the documented prereq-install contract regardless. bash
-          # is the only must-install on macos-latest (default is 3.2;
-          # init/oosh requires 4+).
-          # Pre-oosh exception (same class as init/oosh's own pure-bash
-          # prereq check at init/oosh:60-142): direct brew install, no
-          # oosh primitives available.
-          for pkg in bash git curl; do
-            command -v "$pkg" >/dev/null 2>&1 \
-              && [ "$pkg" != "bash" -o "${BASH_VERSINFO[0]:-0}" -ge 4 ] \
-              && continue
-            brew install "$pkg"
-          done
+          # Pre-oosh exception: install brew bash so the runner shell can
+          # run ossh (oosh requires bash 4+; macOS /bin/bash is 3.2). git
+          # and curl ship with macos-latest already. Same class as
+          # init/oosh's pure-bash prereq check (init/oosh:60-142): no
+          # oosh primitives available yet.
+          if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+            brew install bash
+          fi
           export PATH="/opt/homebrew/bin:$PATH"
 
           # Clean up leftover state from a previous attempt on the same VM.
@@ -65,11 +56,7 @@ jobs:
           sudo chown -R root:wheel /var/root/oosh
 
           # Run init/oosh AS ROOT from the canonical location.
-          if [ -x /opt/homebrew/bin/bash ]; then
-            sudo -H /opt/homebrew/bin/bash /var/root/oosh/init/oosh
-          else
-            sudo -H bash /var/root/oosh/init/oosh
-          fi
+          sudo -H /opt/homebrew/bin/bash /var/root/oosh/init/oosh
 
           # Post-install: shared config + oosh tree are owned by root
           # (Bootstrap installer). Subsequent steps run as runner and need
@@ -78,11 +65,6 @@ jobs:
           # Chown the shared trees to runner so all subsequent ossh
           # invocations work without permission errors.
           sudo chown -R runner:staff /Users/shared 2>/dev/null || true
-          # Runner's per-user config dir (/Users/runner/config is a symlink
-          # to shared/sharedConfig) — touch the live-log file to ensure it
-          # exists and is owned by runner.
-          rm -f /Users/runner/config/log.live.out 2>/dev/null || true
-          touch /Users/runner/config/log.live.out 2>/dev/null || true
 
       - name: Generate SSH key
         run: |
@@ -101,12 +83,12 @@ jobs:
           sudo systemsetup -setremotelogin on
           sleep 2
 
-          # Create test user. Shell set to brew bash (installed by Bootstrap)
-          # because oosh's init/oosh asserts bash 4+; macOS /bin/bash is 3.2
-          # and ssh non-interactive sessions don't pick up /opt/homebrew/bin
-          # via login dotfiles. Mirrors what `ossh prereqs.install macos`
-          # would do in real-life (install brew bash, then re-login).
-          sudo sysadminctl -addUser test -password test -shell /opt/homebrew/bin/bash
+          # Create test user with default /bin/bash. After Phase A.1a-bis
+          # runs ossh prereqs.install macos, /etc/paths.d/oosh-homebrew
+          # makes /opt/homebrew/bin/bash discoverable for non-interactive
+          # ssh sessions, so init/oosh's `#!/usr/bin/env bash` resolves to
+          # bash 5+ and the bash-4 prereq passes regardless of login shell.
+          sudo sysadminctl -addUser test -password test -shell /bin/bash
           echo "test ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/test
 
           # StrictModes requires home dir 755 or stricter
@@ -127,30 +109,29 @@ jobs:
           ssh test@localhost true
           echo "SSH key-based auth verified"
 
+      - name: Phase A.1a-bis — ossh prereqs.install macos (bash + curl + git + paths.d)
+        run: |
+          source "$HOME/config/user.env" 2>/dev/null || true
+          # Non-interactive ssh on macOS doesn't source bashrc, so OOSH_DIR
+          # PATH wiring from oosh.env may not be active.
+          export PATH="$HOME/oosh:$PATH"
+          export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
+
+          # Same flow as Linux platform tests — establish the ossh config,
+          # open ControlMaster, then run prereqs.install. The brew branch
+          # (ossh:2199-2201, 2214-2222) installs bash + curl + git and
+          # writes /etc/paths.d/oosh-homebrew.
+          ossh config.create macos "test@localhost"
+          ossh config.save.last
+          ossh connection.open macos
+          ossh prereqs.install macos
+
       - name: Phase A.1b — Install oosh via ossh (root + test)
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
-          # GHA shells are non-login non-interactive; bashrc isn't sourced.
-          # Re-anchor per-user paths that user.env may have inherited from
-          # root (the Bootstrap installer wrote shared user.env with its
-          # own absolute paths). Without this, runner code tries to read
-          # /var/root/config/* (mode 750 root:wheel) and EACCES fires.
-          # Same class as the LOG_LIVE leak fix in this:215-227 / config:261;
-          # bashrcTemplate already does this anchoring at line 9 for
-          # interactive sessions — we mirror it here for non-interactive.
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export LOG_LIVE="/tmp/oosh-runner.log.live"
-          # Explicit PATH — runner's ~/oosh symlink points at the shared
-          # install per user.oosh.install at user:765-774.
           export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           export OOSH_INSTALL_SOURCE="$GITHUB_WORKSPACE"
-
-          ossh config.create macos "test@localhost"
-          ossh config.save.last
-
-          ossh connection.open macos
 
           ossh key.push macos
           ossh install macos test
@@ -170,24 +151,12 @@ jobs:
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
-          # GHA shells are non-login non-interactive; bashrc isn't sourced.
-          # Re-anchor per-user paths that user.env may have inherited from
-          # root (the Bootstrap installer wrote shared user.env with its
-          # own absolute paths). Without this, runner code tries to read
-          # /var/root/config/* (mode 750 root:wheel) and EACCES fires.
-          # Same class as the LOG_LIVE leak fix in this:215-227 / config:261;
-          # bashrcTemplate already does this anchoring at line 9 for
-          # interactive sessions — we mirror it here for non-interactive.
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export LOG_LIVE="/tmp/oosh-runner.log.live"
-          # Explicit PATH — runner's ~/oosh symlink points at the shared
-          # install per user.oosh.install at user:765-774.
           export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           # user.create on macOS dispatches via os.check → sysadminctl path
-          # at user:524. Default password = username; "oosh-user" is 9 chars
-          # so the macOS 4-char-min padding doesn't fire.
+          # at user:524 (with brew-bash shell selection). Default password
+          # = username; "oosh-user" is 9 chars so the macOS 4-char-min
+          # padding doesn't fire.
           ossh exec macos "user create oosh-user password oosh-user"
           # NOPASSWD sudo for oosh-user (matches Linux's pattern in os:260)
           echo "oosh-user ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/oosh-user >/dev/null
@@ -205,10 +174,10 @@ jobs:
         run: |
           # macOS equivalent of Linux's `useradd`. sysadminctl is the only
           # supported macOS user-add tool; see Phase A.1a's test-user
-          # creation for the same primitive.
-          # Same brew-bash shell choice as Phase A.1a — needed for init/oosh
-          # bash 4+ prereq when Phase A.4 runs `ossh install macos bash-user`.
-          sudo sysadminctl -addUser bash-user -password bash-user -shell /opt/homebrew/bin/bash
+          # creation for the same primitive. Default /bin/bash shell —
+          # /etc/paths.d/oosh-homebrew (wired by Phase A.1a-bis) ensures
+          # init/oosh on bash-user's session finds brew bash 5+ via PATH.
+          sudo sysadminctl -addUser bash-user -password bash-user -shell /bin/bash
           echo "bash-user ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/bash-user >/dev/null
           sudo dseditgroup -o edit -a bash-user -t user com.apple.access_ssh
           sudo mkdir -p /Users/bash-user/.ssh
@@ -223,24 +192,12 @@ jobs:
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
-          # GHA shells are non-login non-interactive; bashrc isn't sourced.
-          # Re-anchor per-user paths that user.env may have inherited from
-          # root (the Bootstrap installer wrote shared user.env with its
-          # own absolute paths). Without this, runner code tries to read
-          # /var/root/config/* (mode 750 root:wheel) and EACCES fires.
-          # Same class as the LOG_LIVE leak fix in this:215-227 / config:261;
-          # bashrcTemplate already does this anchoring at line 9 for
-          # interactive sessions — we mirror it here for non-interactive.
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export LOG_LIVE="/tmp/oosh-runner.log.live"
-          # Explicit PATH — runner's ~/oosh symlink points at the shared
-          # install per user.oosh.install at user:765-774.
           export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           # || true — install may exit non-zero if ControlMaster drops late
           # on macOS sshd + -tt; downstream test.suite (Phase B.4) is the
-          # real check.
+          # real check. prereqs are already installed system-wide on the
+          # host from Phase A.1a-bis; same machine, same brew, no re-install.
           ossh install macos bash-user || true
 
       - name: Phase B.1 — Run tests as test
@@ -249,19 +206,6 @@ jobs:
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
-          # GHA shells are non-login non-interactive; bashrc isn't sourced.
-          # Re-anchor per-user paths that user.env may have inherited from
-          # root (the Bootstrap installer wrote shared user.env with its
-          # own absolute paths). Without this, runner code tries to read
-          # /var/root/config/* (mode 750 root:wheel) and EACCES fires.
-          # Same class as the LOG_LIVE leak fix in this:215-227 / config:261;
-          # bashrcTemplate already does this anchoring at line 9 for
-          # interactive sessions — we mirror it here for non-interactive.
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export LOG_LIVE="/tmp/oosh-runner.log.live"
-          # Explicit PATH — runner's ~/oosh symlink points at the shared
-          # install per user.oosh.install at user:765-774.
           export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           ossh exec macos "test.suite core 1"
@@ -272,23 +216,11 @@ jobs:
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
-          # GHA shells are non-login non-interactive; bashrc isn't sourced.
-          # Re-anchor per-user paths that user.env may have inherited from
-          # root (the Bootstrap installer wrote shared user.env with its
-          # own absolute paths). Without this, runner code tries to read
-          # /var/root/config/* (mode 750 root:wheel) and EACCES fires.
-          # Same class as the LOG_LIVE leak fix in this:215-227 / config:261;
-          # bashrcTemplate already does this anchoring at line 9 for
-          # interactive sessions — we mirror it here for non-interactive.
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export LOG_LIVE="/tmp/oosh-runner.log.live"
-          # Explicit PATH — runner's ~/oosh symlink points at the shared
-          # install per user.oosh.install at user:765-774.
           export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
-          # Use brew bash explicitly — sudo resets PATH so 'bash' would resolve to /bin/bash (bash 3)
-          # -H sets HOME to root's home so ~ and $CONFIG_PATH stay consistent
+          # sudo resets PATH so 'bash' would resolve to /bin/bash (3.2);
+          # use brew bash explicitly here. -H sets HOME to root's home so
+          # this:209 derives CONFIG_PATH=/var/root/config dynamically.
           ossh exec macos "sudo -H /opt/homebrew/bin/bash -c 'source /var/root/config/user.env 2>/dev/null; test.suite core 1'"
 
       - name: Phase B.3 — Run tests as oosh-user
@@ -297,19 +229,6 @@ jobs:
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
-          # GHA shells are non-login non-interactive; bashrc isn't sourced.
-          # Re-anchor per-user paths that user.env may have inherited from
-          # root (the Bootstrap installer wrote shared user.env with its
-          # own absolute paths). Without this, runner code tries to read
-          # /var/root/config/* (mode 750 root:wheel) and EACCES fires.
-          # Same class as the LOG_LIVE leak fix in this:215-227 / config:261;
-          # bashrcTemplate already does this anchoring at line 9 for
-          # interactive sessions — we mirror it here for non-interactive.
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export LOG_LIVE="/tmp/oosh-runner.log.live"
-          # Explicit PATH — runner's ~/oosh symlink points at the shared
-          # install per user.oosh.install at user:765-774.
           export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           ossh config.create macos_oosh_user "oosh-user@localhost"
@@ -323,19 +242,6 @@ jobs:
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
-          # GHA shells are non-login non-interactive; bashrc isn't sourced.
-          # Re-anchor per-user paths that user.env may have inherited from
-          # root (the Bootstrap installer wrote shared user.env with its
-          # own absolute paths). Without this, runner code tries to read
-          # /var/root/config/* (mode 750 root:wheel) and EACCES fires.
-          # Same class as the LOG_LIVE leak fix in this:215-227 / config:261;
-          # bashrcTemplate already does this anchoring at line 9 for
-          # interactive sessions — we mirror it here for non-interactive.
-          export CONFIG_PATH="$HOME/config"
-          export CONFIG="$CONFIG_PATH/user.env"
-          export LOG_LIVE="/tmp/oosh-runner.log.live"
-          # Explicit PATH — runner's ~/oosh symlink points at the shared
-          # install per user.oosh.install at user:765-774.
           export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           ossh config.create macos_bash_user "bash-user@localhost"
