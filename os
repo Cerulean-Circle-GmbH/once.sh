@@ -285,23 +285,35 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
 
     # B.2 — root (via test+sudo, needs -tt for TTY)
     console.log "Running core tests as root..."
+    # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
+    # user's home). Same find-chdir-back hazard the runuser cases below
+    # describe — except for root, the direct `find` calls work because
+    # root reads anything; the failure mode is subprocesses (e.g. man-db's
+    # postinst, which drops to user `man`) inheriting /home/test as cwd.
     rootLog="/tmp/oosh-platform-test-root-$platform.log"
-    ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
+    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
     rcRoot=${PIPESTATUS[0]}
 
     # B.3 — oosh-user (via test+sudo+runuser; login-shell equivalent of `user login oosh-user`).
     # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
     # early-exit for non-interactive shells would otherwise skip the PATH / user.env
     # setup and `test.suite: command not found` fires.
+    # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
+    # home, mode 700 owned by test). After `runuser -u oosh-user`, the new
+    # user can't read /home/test, so any `find` invocation in test.suite
+    # (e.g. state.machine.exists at state:865) emits hundreds of
+    # `find: Failed to restore initial working directory: /home/test:
+    # Permission denied` lines on stderr. cd'ing to the new user's own
+    # home keeps find happy.
     console.log "Running core tests as oosh-user..."
     ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u oosh-user -- bash -c 'source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$ooshUserLog"
+    ossh exec.tty "$platform" "sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$ooshUserLog"
     rcOoshUser=${PIPESTATUS[0]}
 
-    # B.4 — bash-user (same pattern)
+    # B.4 — bash-user (same pattern; same cwd fix)
     console.log "Running core tests as bash-user..."
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -c 'source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$bashUserLog"
+    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$bashUserLog"
     rcBashUser=${PIPESTATUS[0]}
   else
     console.log "Skipping tests (notests)"
