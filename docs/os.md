@@ -114,12 +114,14 @@ macOS is tested via GitHub Actions (`macos-test.yml`) — same 4-user matrix as 
 2. Watches the run and reports PASS/FAIL
 3. Requires `gh` CLI authenticated (`gh auth login`)
 
-**macOS-specific differences from the Linux flow:**
+The macOS workflow follows the same `ossh prereqs.install → ossh install` pattern as Linux. `ossh prereqs.install macos` (called as Phase A.1a-bis) installs `bash + curl + git` via brew and writes `/etc/paths.d/oosh-homebrew` so non-interactive ssh sessions find brew bash. From that point on, `ossh install macos <user>` works identically to its Linux equivalents.
 
-- **`sysadminctl` instead of `useradd`** — macOS's user-add primitive. `user.create` already dispatches to it via the darwin branch at `user:524`; raw `bash-user` creation in the workflow uses it directly.
+**macOS-specific primitives (same primitives, different name from Linux):**
+
+- **`sysadminctl` instead of `useradd`** — macOS's user-add primitive. `user.create` dispatches to it via the darwin branch at `user:524` (with brew-bash shell selection); raw `bash-user` creation in the workflow uses it directly with default `/bin/bash` (PATH-discoverable brew bash takes over once `/etc/paths.d/oosh-homebrew` is in place).
 - **`com.apple.access_ssh` group + `dseditgroup`** — macOS gates SSH access via this group; each new user (oosh-user, bash-user) is added to it after creation.
 - **Per-user `ossh config.create macos_<user>` instead of `runuser`** — macOS doesn't ship util-linux's `runuser`. Phase B.3 and B.4 use a separate ossh config alias (`macos_oosh_user`, `macos_bash_user`) so `ossh exec` connects directly as that user via key-based SSH (key already pushed to their `authorized_keys` during their setup phase).
-- **Brew bash for root tests** — Phase B.2 uses `sudo -H /opt/homebrew/bin/bash -c` because sudo resets PATH and `/bin/bash` on macOS is bash 3.x; oosh needs bash 4+.
+- **Brew bash for root tests** — Phase B.2 uses `sudo -H /opt/homebrew/bin/bash -c` because sudo resets PATH; `path_helper` is per-shell, so `sudo -H bash` would resolve to system `/bin/bash` 3.2 unless we name the brew binary explicitly.
 
 ### Interactive Terminal (tmate)
 

@@ -173,10 +173,11 @@ What happens during install:
 
 If the remote is missing oosh's install-time tools, run `ossh prereqs.install <host>` first. It installs the package list appropriate to the remote's package manager (detected via `ossh pm.discover`):
 
-| PM | Packages installed |
-|---|---|
-| `apt-get`, `dnf`, `brew`, `pacman`, `pkg` | `curl`, `git` |
-| `apk` (Alpine) | `curl`, `git`, **`bash`**, **`shadow`**, **`util-linux`** + `chmod u+s /bin/busybox` |
+| PM | Packages installed | Post-install |
+|---|---|---|
+| `apt-get`, `dnf`, `pacman`, `pkg` | `curl`, `git` | — |
+| `apk` (Alpine) | `curl`, `git`, **`bash`**, **`shadow`**, **`util-linux`** | `chmod u+s /bin/busybox` |
+| `brew` (macOS) | `curl`, `git`, **`bash`** | write `/etc/paths.d/oosh-homebrew` |
 
 The Alpine extras are required because alpine's base image ships only busybox + ash:
 - `bash` — oosh's `#!/usr/bin/env bash` shebangs
@@ -184,7 +185,11 @@ The Alpine extras are required because alpine's base image ships only busybox + 
 - `util-linux` — `runuser`, used by `os platform.test` for user-switching
 - `chmod u+s /bin/busybox` — naked alpine ships busybox at mode 0755; the suid bit is needed for non-root `su -` (so `user login <user>` works from a regular user's shell). Real alpine deployments typically ship busybox suid by default. The same chmod also fires from `init/oosh` after its sudo re-exec, so curl/drag-and-drop install paths get the heal too.
 
-The remote install runs over ssh+sh (no bash on remote required), so this works on a fresh naked alpine box where bash doesn't yet exist.
+The macOS extras are required because Apple's `/bin/bash` is 3.2 (their last GPLv2 release) but oosh requires bash 4+:
+- `bash` — installs `/opt/homebrew/bin/bash` (5.x).
+- `/etc/paths.d/oosh-homebrew` — macOS sshd builds non-interactive PATH via `path_helper`, which reads `/etc/paths` + `/etc/paths.d/*`. `/opt/homebrew/bin` is NOT in either by default, so even with brew bash on disk, ssh-exec'd shebangs (`#!/usr/bin/env bash`) resolve to `/bin/bash` 3.2. Wiring the entry once via paths.d benefits every non-interactive ssh session on the host.
+
+The remote install runs over ssh+sh (no bash on remote required), so this works on a fresh naked alpine box where bash doesn't yet exist, and on a stock macOS where only the system 3.2 bash is present.
 
 ### Deploy Key (GitHub access)
 

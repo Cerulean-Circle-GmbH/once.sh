@@ -73,10 +73,24 @@ Saves environment variables to a config file.
 ```
 
 Without parameters, saves:
-- All CONFIG_* variables
-- PATH
+- All CONFIG_* variables (except per-user dynamic paths — see *Excluded variables* below)
 - BASH_FILE
 - Then calls `config.save oosh` and `config.save log`
+
+**PATH is intentionally NOT saved** — it must be built dynamically at login by `bashrcTemplate` (`this.path.add` + `OOSH_DIR` guard). Saving root's PATH would overwrite the user's PATH in subprocesses.
+
+**Excluded variables.** `config.save` skips per-user dynamic paths so they don't leak from one user's saved config into another user's environment. The `~/config` symlink usually points at a shared location (`…sharedConfig/`), so a value written by root would otherwise be sourced verbatim by every other user — typically pointing at a path they can't access (EACCES). The exclusion list:
+
+| Variable | Why excluded | Re-derived at shell init by |
+|---|---|---|
+| `LOG_INSTALL`, `INSTALL_LOG`, etc. | Install-only state — must not persist into user sessions | (none — only set during install) |
+| `LOG_LIVE` | `~/config/log.live.out` is per-user; saving root's path EACCES-cascades | `log:21-23` (re-anchored at every bashrc) |
+| `CONFIG_PATH` | `$HOME/config` — per-user | `this:209` (`: ${CONFIG_PATH:=$HOME/config}`) |
+| `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config:183` (derived from CONFIG_PATH) |
+| `OOSH_DIR` | per-user oosh tree path | `this:40-49` (resolved from script location) |
+| `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
+
+If you add a new persisted env var that resolves to an absolute per-user path, extend the same exclusion filter at `config:265`.
 
 ### Listing Configuration
 
