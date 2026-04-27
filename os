@@ -260,7 +260,10 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
   console.log "Phase A.3: creating bash-user via raw useradd..."
-  ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash -G sudo bash-user && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'" || {
+  # Note: no `-G sudo` — that group only exists on Debian/Ubuntu (RHEL/Alma use
+  # `wheel`, Alpine has neither by default). The NOPASSWD sudoers entry below
+  # grants sudo access without group membership, so portability beats group hygiene.
+  ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash bash-user && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'" || {
     error.log "Failed to create bash-user on $platform"
   }
 
