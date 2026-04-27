@@ -253,12 +253,14 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   ossh exec.tty "$platform" "user create oosh-user password oosh-user" || {
     error.log "Failed to create oosh-user on $platform"
   }
-  # Give oosh-user NOPASSWD sudo so test.suite can run without interactive
-  # prompts (some core tests exercise init/oosh's sudo re-exec path).
-  ossh exec "$platform" "echo 'oosh-user ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-oosh-user >/dev/null && sudo chmod 440 /etc/sudoers.d/99-oosh-user"
+  # Give oosh-user NOPASSWD sudo. Append to /etc/sudoers directly (not
+  # sudoers.d) — matches the existing pattern at os:217 for the test
+  # user; sudoers.d isn't always included on minimal images (alma's
+  # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
+  ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
   console.log "Phase A.3: creating bash-user via raw useradd..."
-  ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash -G sudo bash-user && echo bash-user:bash-user | sudo chpasswd && echo 'bash-user ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/99-bash-user >/dev/null" || {
+  ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash -G sudo bash-user && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'" || {
     error.log "Failed to create bash-user on $platform"
   }
 
