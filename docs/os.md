@@ -108,11 +108,18 @@ Non-interactive `ssh-keygen` (`-N ''`) is handled in `user`/`ossh` so key genera
 
 ### macOS Testing (CI)
 
-macOS is tested via GitHub Actions (`macos-test.yml`):
+macOS is tested via GitHub Actions (`macos-test.yml`) — same 4-user matrix as Linux (test → root → oosh-user → bash-user), same Phase A → Phase B contract (all 4 users installed before any test.suite runs).
 
 1. `os platform.test macos` triggers the workflow via `gh` CLI
 2. Watches the run and reports PASS/FAIL
 3. Requires `gh` CLI authenticated (`gh auth login`)
+
+**macOS-specific differences from the Linux flow:**
+
+- **`sysadminctl` instead of `useradd`** — macOS's user-add primitive. `user.create` already dispatches to it via the darwin branch at `user:524`; raw `bash-user` creation in the workflow uses it directly.
+- **`com.apple.access_ssh` group + `dseditgroup`** — macOS gates SSH access via this group; each new user (oosh-user, bash-user) is added to it after creation.
+- **Per-user `ossh config.create macos_<user>` instead of `runuser`** — macOS doesn't ship util-linux's `runuser`. Phase B.3 and B.4 use a separate ossh config alias (`macos_oosh_user`, `macos_bash_user`) so `ossh exec` connects directly as that user via key-based SSH (key already pushed to their `authorized_keys` during their setup phase).
+- **Brew bash for root tests** — Phase B.2 uses `sudo -H /opt/homebrew/bin/bash -c` because sudo resets PATH and `/bin/bash` on macOS is bash 3.x; oosh needs bash 4+.
 
 ### Interactive Terminal (tmate)
 
