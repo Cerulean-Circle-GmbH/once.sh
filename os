@@ -510,7 +510,10 @@ os.check.env() # #
         info.log "      Mac OS detected"
         export OOSH_OS="darwin"
         ;;
-      linux-gnu*)
+      linux*)
+        # Match linux-gnu (glibc), linux-musl (Alpine), and any future
+        # variants. Tag as "linux-gnu" — the historical value, kept for
+        # downstream consumers; mirrors the broader pattern in oo:1504.
         info.log "      Linux detected"
         export OOSH_OS="linux-gnu"
         ;;
