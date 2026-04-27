@@ -176,12 +176,13 @@ If the remote is missing oosh's install-time tools, run `ossh prereqs.install <h
 | PM | Packages installed |
 |---|---|
 | `apt-get`, `dnf`, `brew`, `pacman`, `pkg` | `curl`, `git` |
-| `apk` (Alpine) | `curl`, `git`, **`bash`**, **`shadow`**, **`util-linux`** |
+| `apk` (Alpine) | `curl`, `git`, **`bash`**, **`shadow`**, **`util-linux`** + `chmod u+s /bin/busybox` |
 
 The Alpine extras are required because alpine's base image ships only busybox + ash:
 - `bash` — oosh's `#!/usr/bin/env bash` shebangs
 - `shadow` — `useradd`/`chpasswd` (busybox `adduser` differs in flags)
 - `util-linux` — `runuser`, used by `os platform.test` for user-switching
+- `chmod u+s /bin/busybox` — naked alpine ships busybox at mode 0755; the suid bit is needed for non-root `su -` (so `user login <user>` works from a regular user's shell). Real alpine deployments typically ship busybox suid by default. The same chmod also fires from `init/oosh` after its sudo re-exec, so curl/drag-and-drop install paths get the heal too.
 
 The remote install runs over ssh+sh (no bash on remote required), so this works on a fresh naked alpine box where bash doesn't yet exist.
 
