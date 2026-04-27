@@ -88,20 +88,21 @@ For each Docker-testable platform, `os platform.test` runs fully automated (no i
 4. `sshpass` opens a ControlMaster connection (password via `$SSHPASS` env var, runs `true` to avoid background fork race)
 5. `ossh push.key` — pushes SSH key, reusing the ControlMaster socket (no password prompt)
 6. Configure `NOPASSWD` sudo for `test` on the ephemeral container
-7. **Phase A — installs:**
+7. `ossh prereqs.install <platform>` — installs `curl + git` on the remote (and additionally `bash + shadow + util-linux` on apk hosts like alpine, where the base image ships only busybox + ash)
+8. **Phase A — installs:**
    - `ossh install <platform> test` — root + test initial install
    - `ossh exec <platform> "user create oosh-user password oosh-user"` — creates oosh-user
    - Raw `useradd -m -G sudo bash-user` + NOPASSWD sudoers snippet — creates bash-user
    - `ossh install <platform> bash-user` — caller-initiated install for bash-user
-8. **Phase B — tests** (skipped when `notests` modifier is passed):
+9. **Phase B — tests** (skipped when `notests` modifier is passed):
    - `ossh exec <platform> "test.suite core 1"` → `test` log
    - `ossh exec.tty <platform> "sudo bash -lc '… test.suite core 1'"` → `root` log
    - `ossh exec.tty <platform> "sudo runuser -u oosh-user -- bash -lc 'test.suite core 1'"` → `oosh-user` log
    - `ossh exec.tty <platform> "sudo runuser -u bash-user -- bash -lc 'test.suite core 1'"` → `bash-user` log
-9. `terminal` modifier drops into an interactive `bash-user` shell before cleanup (same last-user-created convention as before)
-10. `ossh connection.close` + container cleanup
+10. `terminal` modifier drops into an interactive `bash-user` shell before cleanup (same last-user-created convention as before)
+11. `ossh connection.close` + container cleanup
 
-> **Why `sudo runuser -u <user> -- bash -lc …` for the two new users?** `user.login` itself (`env -i su - "$1"`) is interactive and can't be fed a command. `sudo runuser -u <user> -- bash -lc …` is functionally identical — login-shell (`-lc`), fresh env, explicit user-switch — and scripts cleanly over one ssh-tt session. `runuser` is util-linux and ships by default on every Linux target in the platform matrix.
+> **Why `sudo runuser -u <user> -- bash -lc …` for the two new users?** `user.login` itself (`env -i su - "$1"`) is interactive and can't be fed a command. `sudo runuser -u <user> -- bash -lc …` is functionally identical — login-shell (`-lc`), fresh env, explicit user-switch — and scripts cleanly over one ssh-tt session. `runuser` ships from `util-linux` on every Linux target — present in the base image on Debian-derivatives and RHEL, installed by step 7 (`ossh prereqs.install`) on Alpine.
 
 Non-interactive `ssh-keygen` (`-N ''`) is handled in `user`/`ossh` so key generation never prompts.
 
