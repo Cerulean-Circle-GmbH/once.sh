@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# E1.2 + E1.3 — End-to-end lifecycle test
+#   setup → register → save → kill → restore → verify
+# Covers C1/D2 integration: layout.save/restore + teams.save/restore +
+# tronMonitor observer triggered by team.register during restore.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+source hiveMind
+
+log.level $level
+
+# ── SELF-CONTAINED LIFECYCLE FIXTURE ──────────────────────────────────────
+# Tests must pass on a clean machine. All artifacts use __test_lc_ prefix so
+# D1.4 prune (and our own teardown) catches stragglers if anything escapes.
+# Shell-only panes (no Claude) — exercises the registry-fallback path in
+# hiveMind.teams.save and the kind=shell branch in hiveMind.teams.restore.
+
+TEST_SESSION="__test_lc_$$"
+TEST_ROLE_A="lifecycle-alpha"
+TEST_ROLE_B="lifecycle-beta"
+CONFIG_PATH_VAL="${CONFIG_PATH:-$HOME/config}"
+LIFECYCLE_SNAPFILE=""
+LIFECYCLE_TRON_CALLS=$(mktemp -t lc.tron.calls.XXXXXX 2>/dev/null || mktemp)
+
+# tronMonitor spy — bash function shadows the script on PATH, so the trigger
+# in hiveMind.team.register/remove (uses `command -v tronMonitor`) calls us.
+# Lets the test run on hosts without `screen` installed.
+tronMonitor() {
+  echo "$@" >> "$LIFECYCLE_TRON_CALLS"
+  return 0
+}
+
+__lc_teardown() {
+  unset -f tronMonitor 2>/dev/null
+  otmux kill "$TEST_SESSION" 2>/dev/null
+  for f in "$HIVEMIND_TEAMS" "$HIVEMIND_REGISTRY" "$HIVEMIND_SESSIONS"; do
+    [ -f "$f" ] || continue
+    grep -v '__test_lc_' "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+  done
+  if [ -f "$HIVEMIND_ACTIVE_TEAM_FILE" ] \
+     && grep -q "$TEST_SESSION" "$HIVEMIND_ACTIVE_TEAM_FILE" 2>/dev/null; then
+    rm -f "$HIVEMIND_ACTIVE_TEAM_FILE"
+  fi
+  [ -n "$LIFECYCLE_SNAPFILE" ] && [ -f "$LIFECYCLE_SNAPFILE" ] && rm -f "$LIFECYCLE_SNAPFILE"
+  rm -f "$LIFECYCLE_TRON_CALLS"
+  rm -f "${OTMUX_LAYOUT_DIR:-${CONFIG_PATH_VAL}/otmux}/${TEST_SESSION}.layout.env"
+}
+trap __lc_teardown EXIT
+
+# ── E1.2.1 — create test session with 2 shell panes ────────────────────────
+# Use pane.lock (not pane.title) — bash's prompt emits a title escape on each
+# redraw, racing pane.title and overwriting it. pane.lock sets allow-rename
+# off + a pane-level hook (or background enforcer) so the title sticks long
+# enough for layout.save to capture it.
+otmux new "$TEST_SESSION" -d -x 200 -y 50 2>/dev/null
+otmux split "${TEST_SESSION}:0.0" 2>/dev/null
+otmux pane.lock "${TEST_SESSION}:0.0" "$TEST_ROLE_A" >/dev/null 2>&1
+otmux pane.lock "${TEST_SESSION}:0.1" "$TEST_ROLE_B" >/dev/null 2>&1
+sleep 0.3   # let the lock hook/enforcer settle
+
+test.case $level "E1.2.1: test session created" \
+  otmux has "$TEST_SESSION"
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  pane_count=$(otmux panes -t "$TEST_SESSION" -F '#{pane_index}' 2>/dev/null | wc -l)
+  if [ "${pane_count:-0}" -eq 2 ]; then
+    expect.pass "session $TEST_SESSION exists with 2 panes"
+  else
+    expect.fail "expected 2 panes, got ${pane_count:-0}"
+  fi
+else
+  expect.fail "session $TEST_SESSION not created (rc=$RETURN_VALUE)"
+fi
+
+# ── E1.2.2 — register pane→role mappings + capture pre-state ───────────────
+private.hiveMind.registry.set "${TEST_SESSION}:0.0" "$TEST_ROLE_A"
+private.hiveMind.registry.set "${TEST_SESSION}:0.1" "$TEST_ROLE_B"
+
+test.case $level "E1.2.2: roles registered in hivemind registry" \
+  grep -q "^${TEST_SESSION}:0.0|${TEST_ROLE_A}$" "$HIVEMIND_REGISTRY"
+
+if [ "$RETURN_VALUE" -eq 0 ] && \
+   grep -q "^${TEST_SESSION}:0.1|${TEST_ROLE_B}$" "$HIVEMIND_REGISTRY" 2>/dev/null; then
+  expect.pass "both pane→role mappings written to registry"
+else
+  expect.fail "registry missing test entries: $(grep "$TEST_SESSION" "$HIVEMIND_REGISTRY" 2>/dev/null)"
+fi
+
+# ── E1.2.3 — register team (fires tronMonitor add via observer) ────────────
+> "$LIFECYCLE_TRON_CALLS"
+hiveMind.team.register "$TEST_SESSION" "lifecycle test" >/dev/null 2>&1
+
+test.case $level "E1.2.3: team registered + observer fired pre-save" \
+  grep -q "^${TEST_SESSION}|" "$HIVEMIND_TEAMS"
+
+if [ "$RETURN_VALUE" -eq 0 ] && grep -qx "add ${TEST_SESSION}" "$LIFECYCLE_TRON_CALLS"; then
+  expect.pass "team registered and tronMonitor observer fired"
+else
+  expect.fail "team=[$(grep "^${TEST_SESSION}|" "$HIVEMIND_TEAMS" 2>/dev/null)] calls=[$(tr '\n' ';' < "$LIFECYCLE_TRON_CALLS")]"
+fi
+
+# ── E1.2.4 — save layout + snapshot ────────────────────────────────────────
+otmux layout.save "$TEST_SESSION" >/dev/null 2>&1
+hiveMind.teams.save >/dev/null 2>&1
+
+# Find the freshly-created snapshot file
+LIFECYCLE_SNAPFILE=$(ls -t "$CONFIG_PATH_VAL"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+
+test.case $level "E1.2.4a: snapshot file created" \
+  test -f "$LIFECYCLE_SNAPFILE"
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "snapshot file: $LIFECYCLE_SNAPFILE"
+else
+  expect.fail "no snapshot file produced"
+fi
+
+# Verify our 2 panes are in the snapshot
+test.case $level "E1.2.4b: snapshot contains 2 entries for test session" \
+  grep -c "^${TEST_SESSION}|" "$LIFECYCLE_SNAPFILE"
+
+snap_lines=$(grep -c "^${TEST_SESSION}|" "$LIFECYCLE_SNAPFILE" 2>/dev/null)
+if [ "${snap_lines:-0}" -eq 2 ]; then
+  expect.pass "snapshot has 2 entries for $TEST_SESSION"
+else
+  expect.fail "expected 2 snapshot entries, got ${snap_lines:-0}"
+fi
+
+# Verify kind=shell (8th field of pipe-separated record).
+# Wrapped in a function — test.case word-splits $testArguments and would
+# break the awk script's spaces.
+__lc_check_kind_shell() {
+  local non_shell
+  non_shell=$(awk -F'|' -v sess="$TEST_SESSION" \
+    '$1==sess && $8!="shell"{print; n++} END{exit (n>0)}' \
+    "$LIFECYCLE_SNAPFILE")
+  return $?
+}
+
+test.case $level "E1.2.4c: snapshot entries are kind=shell" \
+  __lc_check_kind_shell
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "all entries kind=shell"
+else
+  expect.fail "snapshot has non-shell entries: $(grep "^${TEST_SESSION}|" "$LIFECYCLE_SNAPFILE")"
+fi
+
+# ── E1.2.5 — kill session + simulate cold-start (drop team registry entry) ─
+# Without removing the registry entry, restore's hiveMind.team.register hits
+# the "already registered" early return at line 3992 and the observer trigger
+# never fires — defeating the point of E1.3. A real cold restart loses tmux
+# state but team registry on disk persists; we test the observer-fires path
+# by simulating the case where tronMonitor.env was lost (or the entry is being
+# re-added). This mirrors how teams.restore would behave on a host where
+# `hivemind.teams.env` was rotated/cleaned but `hivemind.snapshot.*` survived.
+otmux kill "$TEST_SESSION" 2>/dev/null
+if [ -f "$HIVEMIND_TEAMS" ]; then
+  grep -v "^${TEST_SESSION}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null \
+    && mv "${HIVEMIND_TEAMS}.tmp" "$HIVEMIND_TEAMS"
+fi
+
+__lc_session_gone() { ! otmux has "$TEST_SESSION" 2>/dev/null; }
+
+test.case $level "E1.2.5: session killed (no longer exists)" \
+  __lc_session_gone
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "session $TEST_SESSION killed"
+else
+  expect.fail "session still exists after kill"
+fi
+
+# ── E1.2.6 + E1.3 — restore from snapshot ──────────────────────────────────
+> "$LIFECYCLE_TRON_CALLS"   # reset spy: we want only restore-time calls
+hiveMind.teams.restore "$LIFECYCLE_SNAPFILE" join >/dev/null 2>&1
+
+test.case $level "E1.2.6a: session restored from snapshot" \
+  otmux has "$TEST_SESSION"
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "session $TEST_SESSION exists after restore"
+else
+  expect.fail "restore did not recreate session"
+fi
+
+# Pane count
+restored_panes=$(otmux panes -t "$TEST_SESSION" -F '#{pane_index}' 2>/dev/null | wc -l)
+test.case - "E1.2.6b: pane count restored" true
+
+if [ "${restored_panes:-0}" -eq 2 ]; then
+  expect.pass "2 panes restored"
+else
+  expect.fail "expected 2 panes after restore, got ${restored_panes:-0}"
+fi
+
+# Pane titles — verify the LAYOUT FILE captured them (the contract of
+# layout.save/restore). Live `pane_title` is not stable: tmux refreshes it
+# from the bash prompt unless the pane is locked (otmux pane.lock), which
+# is a separate semantic outside teams.restore's scope. A snapshot can
+# only carry titles forward; preserving them at runtime is a lock concern.
+LAYOUT_FILE="${OTMUX_LAYOUT_DIR:-${CONFIG_PATH_VAL}/otmux}/${TEST_SESSION}.layout.env"
+
+__lc_layout_titles() {
+  [ -f "$LAYOUT_FILE" ] || return 1
+  grep -q "OTMUX_WINDOW_0_PANE_0_TITLE=\"${TEST_ROLE_A}\"" "$LAYOUT_FILE" \
+    && grep -q "OTMUX_WINDOW_0_PANE_1_TITLE=\"${TEST_ROLE_B}\"" "$LAYOUT_FILE"
+}
+
+test.case $level "E1.2.6c: layout file preserves pane titles" \
+  __lc_layout_titles
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "layout file has both pane titles (alpha, beta)"
+else
+  expect.fail "layout file missing titles: $(grep PANE.*TITLE "$LAYOUT_FILE" 2>/dev/null)"
+fi
+
+# Registry — restore re-registers via private.hiveMind.registry.set
+test.case $level "E1.2.6d: registry has both pane→role mappings post-restore" \
+  grep -q "^${TEST_SESSION}:0.0|${TEST_ROLE_A}$" "$HIVEMIND_REGISTRY"
+
+if [ "$RETURN_VALUE" -eq 0 ] && \
+   grep -q "^${TEST_SESSION}:0.1|${TEST_ROLE_B}$" "$HIVEMIND_REGISTRY" 2>/dev/null; then
+  expect.pass "registry has both restored roles"
+else
+  expect.fail "registry missing entries after restore: $(grep "$TEST_SESSION" "$HIVEMIND_REGISTRY" 2>/dev/null)"
+fi
+
+# Team re-registered (restore line 2080 of hiveMind)
+test.case $level "E1.2.6e: team re-registered in hivemind.teams.env" \
+  grep -q "^${TEST_SESSION}|" "$HIVEMIND_TEAMS"
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "team $TEST_SESSION re-registered after restore"
+else
+  expect.fail "team not re-registered after restore"
+fi
+
+# ── E1.3 — tronMonitor visibility post-restore ─────────────────────────────
+# The team.register call inside teams.restore (line 2080) must fire the observer
+# so tronMonitor's tracked-teams list shows the restored team.
+# Wrapped because test.case word-splits args; "add <session>" would split into
+# two grep operands and lose the pattern.
+__lc_observer_fired() {
+  grep -qx "add ${TEST_SESSION}" "$LIFECYCLE_TRON_CALLS"
+}
+
+test.case $level "E1.3: restore fired tronMonitor add for restored team" \
+  __lc_observer_fired
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "tronMonitor observer fired during restore (post-restore visibility)"
+else
+  expect.fail "no 'add ${TEST_SESSION}' in restore-time spy log: [$(tr '\n' ';' < "$LIFECYCLE_TRON_CALLS")]"
+fi
+
+test.suite.save.results
