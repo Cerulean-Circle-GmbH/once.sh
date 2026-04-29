@@ -17,7 +17,7 @@
 # Rewritten by `promote` during dev→testing→prod advancement
 # (see private.promote.rewrite.self.branch in promote). Must match the
 # same pattern init/oosh uses so the rewriter's regex matches this line.
-OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"
+OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-prod}"
 
 cd "$(dirname "$0")" || exit 1
 
