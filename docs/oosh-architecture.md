@@ -642,6 +642,45 @@ echo $LOG_LEVEL
 
 ---
 
+## Cross-Platform Install Heals
+
+Two non-obvious dual-site defenses are applied during install. Both are intentional and **must not** be removed by future cleanups thinking they're redundant.
+
+### Alpine / busybox-suid
+
+Naked alpine images ship `/bin/busybox` (which `/bin/su` symlinks to) at mode `0755`. busybox-su needs the binary suid for non-root identity switches; without it, `user login <user>` from a regular user's shell fails with `su: must be suid to work properly`. Real alpine deployments typically ship busybox suid by default — the naked image is the unusual case.
+
+The heal is applied at **both** install entry points:
+
+| Site | Path covered | Why both |
+|---|---|---|
+| `init/oosh:171–178` | curl one-liner + drag-and-drop. Runs locally as root after `init/oosh`'s sudo re-exec. | Curl-bootstrap doesn't go through `ossh prereqs.install`. Without this site, `user login` would fail post-install on those entry paths. |
+| `ossh.prereqs.install` (ossh:2210–2217) | `ossh install <host>` (caller-driven). Runs over ssh+sudo on the remote. | The platform test exercises this path and depends on the heal happening before the `terminal` modifier drops into `bash-user`. |
+
+Both fire under `ossh install <host>` (init/oosh runs on the remote regardless of caller). `chmod u+s` on an already-suid file is a no-op, so the idempotent overlap is intentional.
+
+Verified by `T-OSSH-PREREQS-APK-BUSYBOX-SUID` (test/test.ossh) and `T-INIT-ALPINE-BUSYBOX-SUID` (test/test.install).
+
+### `$SUDO` triple-defense
+
+`$SUDO` is set in **three** places, each covering a distinct code path:
+
+| Site | Path covered |
+|---|---|
+| `bashrcTemplate:21–25` | Interactive + non-interactive bash that sources bashrc (Debian's `SSH_SOURCE_BASHRC` patch covers ssh-with-command on Ubuntu/Debian/Alma). |
+| `this:51–66` | Every oosh script invocation that **didn't** go through bashrc — specifically ssh-with-command on Alpine/musl whose bash lacks the `SSH_SOURCE_BASHRC` patch. Self-heals via `id -u`. |
+| `bashrcTemplate:213–219` | PS1 conditional — *reads* `$SUDO` for prompt coloring; doesn't export. |
+
+Each defends a different code path; same-named variable, different sources of truth.
+
+Verified by `T-THIS-SUDO-SELF-HEAL` (test/test.oo).
+
+### `LOG_LIVE` per-user anchor
+
+In multi-user installs (`~/config` is a shared symlink), `LOG_LIVE` must always resolve to the *current* user's `~/config/log.live.out`. See [Log System / LOG_LIVE per-user anchor](log.md) for the read+write defenses (`log:22`, `this:215–227`, `config:261`).
+
+---
+
 ## See Also
 
 - [Wiki Index](wiki-index.md) - All documentation links

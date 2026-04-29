@@ -276,33 +276,59 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-test.case $level "T-REMOTE-4: install.user.remote handles both dseditgroup and usermod" \
-  echo "$FUNC_BODY"
+# After the refactor that collapses ossh.install.user.remote onto
+# user.oosh.install, dseditgroup/usermod, ln -s and git safe.directory
+# are no longer expected in the ossh body — they live in user.oosh.install
+# (via its .groups.{darwin,linux} helpers and main body). These tests now
+# target the canonical location.
+USER_INSTALL_START=$(grep -n '^user\.oosh\.install()' "$OOSH_DIR/user" | head -1 | cut -d: -f1)
+USER_INSTALL_END=$(awk "NR>$USER_INSTALL_START && /^[a-zA-Z].*()/ {print NR; exit}" "$OOSH_DIR/user")
+USER_INSTALL_BLOCK=$(sed -n "${USER_INSTALL_START},${USER_INSTALL_END}p" "$OOSH_DIR/user")
+# Also include the private helpers that user.oosh.install dispatches to via os.check
+USER_GROUPS_BLOCK=$(grep -E "^private\.user\.oosh\.install\.groups\." "$OOSH_DIR/user" | head -5)
+USER_HELPERS_BLOCK=$(awk '/^private\.user\.oosh\.install\./{flag=1} flag; /^}/ && flag{flag=0}' "$OOSH_DIR/user")
 
-if echo "$FUNC_BODY" | grep -q "dseditgroup" && echo "$FUNC_BODY" | grep -q "usermod"; then
-  expect.pass "function handles both dseditgroup (macOS) and usermod (Linux)"
+test.case $level "T-REMOTE-4: user.oosh.install handles both dseditgroup and usermod" \
+  echo "combined"
+
+if echo "$USER_INSTALL_BLOCK $USER_HELPERS_BLOCK" | grep -q "dseditgroup" \
+   && echo "$USER_INSTALL_BLOCK $USER_HELPERS_BLOCK" | grep -qE "usermod|user\.group\.add"; then
+  expect.pass "user.oosh.install (with helpers) handles both dseditgroup (macOS) and Linux group mgmt"
 else
-  expect.fail "function should handle both dseditgroup and usermod for group management"
+  expect.fail "user.oosh.install should handle both dseditgroup and usermod/user.group.add for group management"
 fi
 
 # ----------------------------------------------------------------------------
-test.case $level "T-REMOTE-5: install.user.remote creates symlinks (not copies)" \
-  echo "$FUNC_BODY"
+test.case $level "T-REMOTE-5: user.oosh.install creates symlinks (not copies)" \
+  echo "$USER_INSTALL_BLOCK"
 
-if echo "$FUNC_BODY" | grep -q "ln -s"; then
-  expect.pass "function uses ln -s to create symlinks"
+if echo "$USER_INSTALL_BLOCK" | grep -q "ln -s"; then
+  expect.pass "user.oosh.install uses ln -s to create symlinks"
 else
-  expect.fail "function should use ln -s for symlinks, not cp"
+  expect.fail "user.oosh.install should use ln -s for symlinks, not cp"
 fi
 
 # ----------------------------------------------------------------------------
-test.case $level "T-REMOTE-6: install.user.remote adds git safe.directory" \
+test.case $level "T-REMOTE-6: user.oosh.install adds git safe.directory" \
+  echo "$USER_INSTALL_BLOCK"
+
+if echo "$USER_INSTALL_BLOCK" | grep -q "safe\.directory"; then
+  expect.pass "user.oosh.install adds git safe.directory for shared oosh repo"
+else
+  expect.fail "user.oosh.install should add git safe.directory for cross-user shared repo"
+fi
+
+# ----------------------------------------------------------------------------
+test.case $level "T-REMOTE-7: ossh.install.user.remote delegates to user.oosh.install" \
   echo "$FUNC_BODY"
 
-if echo "$FUNC_BODY" | grep -q "safe\.directory"; then
-  expect.pass "function adds git safe.directory for shared oosh repo"
+# Match the invocation ` oosh.install <args>` (preceded by anything that
+# closes a command name — space, ", ', \"). Covers both the dispatcher form
+# `user oosh.install` and the absolute-path form `"$sharedOosh/user" oosh.install`.
+if echo "$FUNC_BODY" | grep -qE "[^a-zA-Z]oosh\.install[ 	]"; then
+  expect.pass "ossh.install.user.remote delegates via 'user oosh.install'"
 else
-  expect.fail "function should add git safe.directory for cross-user shared repo"
+  expect.fail "ossh.install.user.remote should delegate to 'user oosh.install' over SSH"
 fi
 
 # ============================================================================
@@ -529,6 +555,369 @@ if echo "$RESULT_CONTENT" | grep -q "ProxyJump"; then
   expect.fail "ProxyJump should not appear when param not given"
 else
   expect.pass "no ProxyJump in config without param"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-HARDEN-* : ossh.harden.* methods exist, signatures right, orchestrator
+# chains in order and doesn't silently invoke .sshd.allowusers. Pattern
+# mirrors T-REMOTE-* — grep the function body, not runtime behaviour.
+# ─────────────────────────────────────────────────────────────────────────────
+for m in harden harden.packages harden.unattended.upgrades harden.fail2ban harden.firewall harden.sshd harden.sshd.allowusers; do
+  test.case $level "T-HARDEN-DEF-$m: ossh.$m is defined" \
+    type ossh.$m
+  if [ "$RETURN_VALUE" -eq 0 ]; then
+    expect.pass "ossh.$m is a function"
+  else
+    expect.fail "ossh.$m not defined"
+  fi
+done
+
+# T-HARDEN-ORDER: orchestrator calls the five sub-methods in the documented order
+HARDEN_BODY=$(declare -f ossh.harden 2>/dev/null)
+test.case $level "T-HARDEN-ORDER: ossh.harden invokes sub-methods in order" \
+  echo "$HARDEN_BODY"
+if echo "$HARDEN_BODY" | awk '
+    /ossh\.harden\.packages /            {p=NR}
+    /ossh\.harden\.unattended\.upgrades/ {u=NR}
+    /ossh\.harden\.fail2ban/             {f=NR}
+    /ossh\.harden\.firewall/             {w=NR}
+    /ossh\.harden\.sshd /                {s=NR}
+    END {exit !(p<u && u<f && f<w && w<s)}
+'; then
+  expect.pass "orchestrator chains packages -> unattended -> fail2ban -> firewall -> sshd"
+else
+  expect.fail "sub-method call order in ossh.harden does not match the documented sequence"
+fi
+
+# T-HARDEN-NO-ALLOWUSERS: orchestrator must NOT call the AllowUsers sub-method
+test.case $level "T-HARDEN-NO-ALLOWUSERS: orchestrator does not silently call .sshd.allowusers" \
+  echo "$HARDEN_BODY"
+if ! echo "$HARDEN_BODY" | grep -q "ossh\.harden\.sshd\.allowusers"; then
+  expect.pass "ossh.harden does not silently call .sshd.allowusers"
+else
+  expect.fail "ossh.harden references .sshd.allowusers - it must stay opt-in to avoid lockouts"
+fi
+
+# T-HARDEN-PREFLIGHT: every top-level harden method calls private.ossh.harden.preflight
+for m in harden harden.packages harden.unattended.upgrades harden.fail2ban harden.firewall harden.sshd harden.sshd.allowusers; do
+  BODY=$(declare -f ossh.$m 2>/dev/null)
+  test.case $level "T-HARDEN-PREFLIGHT-$m: ossh.$m calls preflight" \
+    echo "$BODY"
+  if echo "$BODY" | grep -q "private\.ossh\.harden\.preflight"; then
+    expect.pass "ossh.$m gates entry on preflight"
+  else
+    expect.fail "ossh.$m bypasses preflight - would risk lockouts or non-Linux targets"
+  fi
+done
+
+# T-HARDEN-ALLOWUSERS-EMPTY: .sshd.allowusers refuses to run without users
+ALLOW_BODY=$(declare -f ossh.harden.sshd.allowusers 2>/dev/null)
+test.case $level "T-HARDEN-ALLOWUSERS-EMPTY: .sshd.allowusers rejects empty user list" \
+  echo "$ALLOW_BODY"
+if echo "$ALLOW_BODY" | grep -q "refusing to run"; then
+  expect.pass ".sshd.allowusers refuses to run with empty users arg"
+else
+  expect.fail ".sshd.allowusers must refuse empty users (else it locks everyone out)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-BRANCH-SHORT-* : this.git.branch.short strips the four known ref prefixes
+# and the rev-parse sites all delegate to it.
+# ─────────────────────────────────────────────────────────────────────────────
+BRANCH_BODY=$(declare -f this.git.branch.short 2>/dev/null)
+test.case $level "T-BRANCH-SHORT-EXISTS: this.git.branch.short is defined" \
+  type this.git.branch.short
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "this.git.branch.short is a function"
+else
+  expect.fail "this.git.branch.short not defined"
+fi
+
+for prefix in "refs/heads/" "refs/remotes/origin/" "heads/origin/" "origin/"; do
+  test.case $level "T-BRANCH-SHORT-STRIP-$prefix: body strips '$prefix' prefix" \
+    echo "$BRANCH_BODY"
+  if echo "$BRANCH_BODY" | grep -qF "\${b#$prefix}"; then
+    expect.pass "body strips $prefix"
+  else
+    expect.fail "body does not strip $prefix - polluted branch names will leak through"
+  fi
+done
+
+# T-BRANCH-SHORT-CALLER-*: every caller-side rev-parse site delegates to the helper
+for pair in "ossh:449" "ossh:510" "ossh:720" "oo:1233" "user:701" "promote:437" "promote:556"; do
+  file="${pair%:*}"
+  test.case $level "T-BRANCH-SHORT-CALLER-$pair: $file uses this.git.branch.short" \
+    echo "(grep below)"
+  if grep -q "this\.git\.branch\.short" "$OOSH_DIR/$file" 2>/dev/null; then
+    expect.pass "$file references this.git.branch.short"
+  else
+    expect.fail "$file has a rev-parse that wasn't migrated to this.git.branch.short"
+  fi
+done
+
+# T-BRANCH-SHORT-REMOTE-*: init/oosh and oo sanitise OOSH_BRANCH
+for file in init/oosh oo; do
+  test.case $level "T-BRANCH-SHORT-REMOTE-$file: $file strips OOSH_BRANCH prefixes" \
+    echo "(grep below)"
+  if grep -qE "OOSH_BRANCH=.*OOSH_BRANCH#(heads/origin/|origin/)" "$OOSH_DIR/$file" 2>/dev/null; then
+    expect.pass "$file has defence-in-depth OOSH_BRANCH stripping"
+  else
+    expect.fail "$file does not sanitise OOSH_BRANCH - a polluted caller will still break the worktree add"
+  fi
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-DEVELOPKING-FALLBACK : when caller has no ~/.ssh/deploy_keys/2cuGitHub,
+# ossh.install.finish.local falls back to seeding /home/shared/.ssh/ from
+# ~developking/.ssh/id_rsa. Pattern mirrors T-REMOTE-* at test.ossh:249-328.
+# ─────────────────────────────────────────────────────────────────────────────
+FINISH_BODY=$(declare -f ossh.install.finish.local 2>/dev/null)
+
+test.case $level "T-DEVELOPKING-FALLBACK-BRANCH: finish.local has an else branch for missing deploy_keys" \
+  echo "$FINISH_BODY"
+if echo "$FINISH_BODY" | grep -qE "delegating to ossh config\.shared\.create|falling back to developking"; then
+  expect.pass "finish.local falls back to developking's in-place key when deploy_keys/2cuGitHub is absent"
+else
+  expect.fail "finish.local has no fallback - if the caller lacks deploy_keys/2cuGitHub, GitHub access won't reach other users"
+fi
+
+test.case $level "T-DEVELOPKING-FALLBACK-SEEDS-2cuGitHub: fallback copies developking's id_rsa to shared/2cuGitHub" \
+  echo "$FINISH_BODY"
+if echo "$FINISH_BODY" | grep -q "developking/\\.ssh" && echo "$FINISH_BODY" | grep -q "sharedSsh/2cuGitHub"; then
+  expect.pass "fallback seeds shared/.ssh/2cuGitHub from developking/.ssh/id_rsa"
+else
+  expect.fail "fallback doesn't reference developking's .ssh or the shared 2cuGitHub path"
+fi
+
+test.case $level "T-DEVELOPKING-FALLBACK-CONFIG-BLOCK: fallback writes the Host 2cuGitHub SSH config block" \
+  echo "$FINISH_BODY"
+if echo "$FINISH_BODY" | grep -q "Host 2cuGitHub"; then
+  expect.pass "fallback appends the Host 2cuGitHub config block in the shared .ssh/config"
+else
+  expect.fail "fallback missing Host 2cuGitHub alias - clones by alias won't resolve"
+fi
+
+# T-SHARED-SSH-COPY: the extracted helper exists and both caller-side and
+# developking-fallback paths delegate to it (DRY — single source of truth
+# for the per-user copy+chown loop).
+test.case $level "T-SHARED-SSH-COPY-EXISTS: private.ossh.shared.ssh.copy.to.all is defined" \
+  type private.ossh.shared.ssh.copy.to.all
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "private.ossh.shared.ssh.copy.to.all is a function"
+else
+  expect.fail "private.ossh.shared.ssh.copy.to.all not defined"
+fi
+
+test.case $level "T-SHARED-SSH-COPY-CALLSITES: finish.local invokes the helper from both paths" \
+  echo "$FINISH_BODY"
+# Expect 2 call-sites: caller-side (if-branch) and developking-fallback (else-branch)
+if [ "$(echo "$FINISH_BODY" | grep -c "private\\.ossh\\.shared\\.ssh\\.copy\\.to\\.all")" -ge 2 ]; then
+  expect.pass "finish.local calls the helper from both the caller-side and fallback paths"
+else
+  expect.fail "finish.local has fewer than 2 call-sites for the helper - DRY extraction incomplete"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-INIT-* : init/oosh is the thin bootstrap that hands off to
+# ossh install.continue.local (the mature state-machine entrypoint).
+# No more sh→bash re-exec scaffolding, no more oosh_install_remote /
+# oosh_check_all_pm / etc. — those were all eliminated by declaring
+# bash 4+ and git as explicit prereqs.
+# ─────────────────────────────────────────────────────────────────────────────
+INIT_CONTENT=$(cat "$OOSH_DIR/init/oosh" 2>/dev/null)
+
+test.case $level "T-INIT-HANDS-OFF-TO-CONTINUE-LOCAL: init/oosh hands off to ossh install.continue.local" \
+  echo "(grep below)"
+if printf "%s" "$INIT_CONTENT" | grep -qE '"\$OOSH_DIR/this" +call +ossh +install\.continue\.local'; then
+  expect.pass "init/oosh hands off to ossh install.continue.local"
+else
+  expect.fail "init/oosh missing handoff to install.continue.local — install path broken"
+fi
+
+test.case $level "T-INIT-THIN-BOOTSTRAP: init/oosh no longer contains old sh→bash scaffolding" \
+  echo "(grep below)"
+if printf "%s" "$INIT_CONTENT" | grep -qE 'oosh_install_remote|oosh_check_all_pm|oosh_parse_shellps|oosh_setup_env|oosh_status'; then
+  expect.fail "init/oosh still contains old bootstrap scaffolding (oosh_* functions)"
+else
+  expect.pass "init/oosh is the thin bootstrap (old scaffolding removed)"
+fi
+
+# T-INIT-README-NO-SH-C : README no longer advertises `sh -c "$(curl/wget/fetch …)"`
+# — that form hits a pre-existing re-exec-via-bash bug when sh is dash.
+README_CONTENT=$(cat "$OOSH_DIR/README.md" 2>/dev/null)
+test.case $level "T-INIT-README-NO-SH-C: install one-liners in README use bash -c, not sh -c" \
+  echo "(grep below)"
+if printf "%s" "$README_CONTENT" \
+   | grep -v '^> ' \
+   | grep -qE '(^| )sh -c[[:space:]]+"\$\((curl|wget|fetch) '; then
+  expect.fail "README still advertises 'sh -c \"\$(curl/wget/fetch …)\"' — hits the re-exec-via-bash bug on dash-as-sh systems"
+else
+  expect.pass "README install one-liners use bash -c"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-GITHUB-SETUP-* : ossh.config.shared.create accepts a deploy-key source
+# argument; state 31 calls it (curl-install path); finish.local's else-branch
+# delegates to it (caller-no-deploy_keys path). Closes the "curl install
+# doesn't propagate 2cuGitHub" gap.
+# ─────────────────────────────────────────────────────────────────────────────
+SHARED_CREATE_BODY=$(declare -f ossh.config.shared.create 2>/dev/null)
+test.case $level "T-GITHUB-SETUP-DEPLOYKEYSRC-PARAM: ossh.config.shared.create honours a 2nd deployKeySrc arg" \
+  echo "(grep below)"
+if printf "%s" "$SHARED_CREATE_BODY" | grep -qE 'deployKeySrc.*\$\{2:'; then
+  expect.pass "ossh.config.shared.create uses \${2:-…} for deployKeySrc"
+else
+  expect.fail "ossh.config.shared.create signature doesn't accept an optional deployKeySrc param"
+fi
+
+STATE_CONTENT=$(cat "$OOSH_DIR/oo" 2>/dev/null)
+test.case $level "T-GITHUB-SETUP-FROM-STATE31: oo state 31 invokes ossh.config.shared.create" \
+  echo "(grep below)"
+if printf "%s" "$STATE_CONTENT" | grep -qE 'ossh[[:space:]]+config\.shared\.create .*developking/\.ssh/id_rsa'; then
+  expect.pass "state 31 body delegates to ossh.config.shared.create with developking's id_rsa"
+else
+  expect.fail "state 31 doesn't call ossh.config.shared.create — curl install path has no GitHub setup"
+fi
+
+FINISH_BODY=$(declare -f ossh.install.finish.local 2>/dev/null)
+test.case $level "T-GITHUB-SETUP-FROM-FINISH: finish.local's fallback delegates via SSH" \
+  echo "(grep below)"
+if printf "%s" "$FINISH_BODY" | grep -qE 'ossh config\.shared\.create .*developking'; then
+  expect.pass "finish.local fallback delegates to ossh config.shared.create"
+else
+  expect.fail "finish.local fallback still inlines the seed logic — DRY incomplete"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-OSSH-PREREQS-* : the remote prereq-install primitives exist and each has
+# the completion functions that completion.audit demands. Catches the same
+# class of drift the completion audit catches, but proactively in the ossh
+# suite itself so a broken wiring fails fast.
+# ─────────────────────────────────────────────────────────────────────────────
+test.case $level "T-OSSH-PREREQS-PRIMITIVES-PRESENT: ossh.pm.discover / ossh.cmd / ossh.prereqs.install all exist" \
+  echo "(grep)"
+_osshMissing=""
+for m in ossh.pm.discover ossh.cmd ossh.prereqs.install; do
+  grep -qE "^${m//./\\.}\(\)" "$OOSH_DIR/ossh" || _osshMissing+="$m "
+done
+if [ -z "$_osshMissing" ]; then
+  expect.pass "all three ossh prereq primitives defined"
+else
+  expect.fail "missing: $_osshMissing"
+fi
+
+test.case $level "T-OSSH-PREREQS-COMPLETION: each new ossh.* method has its completion functions" \
+  echo "(grep)"
+_osshCompMissing=""
+grep -qE '^ossh\.pm\.discover\.completion\.sshConfigHost'      "$OOSH_DIR/ossh" || _osshCompMissing+="pm.discover.sshConfigHost "
+grep -qE '^ossh\.cmd\.completion\.sshConfigHost'               "$OOSH_DIR/ossh" || _osshCompMissing+="cmd.sshConfigHost "
+grep -qE '^ossh\.cmd\.completion\.pkg'                          "$OOSH_DIR/ossh" || _osshCompMissing+="cmd.pkg "
+grep -qE '^ossh\.prereqs\.install\.completion\.sshConfigHost'  "$OOSH_DIR/ossh" || _osshCompMissing+="prereqs.install.sshConfigHost "
+if [ -z "$_osshCompMissing" ]; then
+  expect.pass "all completion functions present"
+else
+  expect.fail "missing completion: $_osshCompMissing"
+fi
+
+# T-OSSH-PREREQS-APK-EXTRAS : apk hosts (alpine) need bash + shadow + util-linux
+# in addition to the curl + git baseline; the alpine base ships only busybox so
+# `ossh install` would otherwise leave the remote without bash (oosh shebangs),
+# useradd (shadow), or runuser (util-linux). Catches drift to the apk branch.
+test.case $level "T-OSSH-PREREQS-APK-EXTRAS: ossh.prereqs.install adds bash/shadow/util-linux when remote pm is apk" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE 'apk add.*bash.*shadow.*util-linux|bash shadow util-linux'; then
+  expect.pass "ossh.prereqs.install body includes apk-only bash/shadow/util-linux package list"
+else
+  expect.fail "ossh.prereqs.install body missing apk-only extras (bash, shadow, util-linux) — alpine install path will leave the remote without bash/useradd/runuser"
+fi
+
+# T-OSSH-PREREQS-APK-BUSYBOX-SUID : apk hosts (alpine) need /bin/busybox suid so
+# `user login <user>` (env -i su -) works for non-root users. Naked alpine ships
+# busybox at mode 0755; without the suid bit, su fails with "must be suid to work
+# properly".
+test.case $level "T-OSSH-PREREQS-APK-BUSYBOX-SUID: ossh.prereqs.install sets suid on /bin/busybox for apk hosts" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE 'chmod u\+s /bin/busybox|chmod 4755 /bin/busybox'; then
+  expect.pass "ossh.prereqs.install body sets suid on /bin/busybox on apk hosts"
+else
+  expect.fail "ossh.prereqs.install body missing busybox-suid step — 'user login' from non-root will fail on alpine"
+fi
+
+# T-OSSH-PREREQS-BREW-BASH : brew hosts (macOS) need bash in addition to the
+# curl + git baseline; macOS /bin/bash is 3.2 (Apple's last GPLv2 release) and
+# oosh requires bash 4+, so without this the install fails init/oosh's prereq
+# check.
+test.case $level "T-OSSH-PREREQS-BREW-BASH: ossh.prereqs.install adds bash when remote pm is brew" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE 'brew install.*bash|"\$pkgs bash"'; then
+  expect.pass "ossh.prereqs.install body includes brew-only bash package"
+else
+  expect.fail "ossh.prereqs.install body missing brew bash addition — macOS install will fail init/oosh bash 4+ prereq"
+fi
+
+# T-OSSH-PREREQS-BREW-SHELLENV : `brew install bash` must be invoked with
+# `brew shellenv` sourced inline (or via absolute brew path), not as a bare
+# `brew` command. Non-interactive ssh on macOS builds PATH from launchd's
+# /usr/bin:/bin:/usr/sbin:/sbin and only sources /etc/paths.d via
+# path_helper from /etc/zprofile (login shells only). Right after the
+# Homebrew bootstrap, `private.ossh.ssh -tt "$host" "brew install bash"`
+# fails with `zsh:1: command not found: brew` and bash 4+ never lands.
+test.case $level "T-OSSH-PREREQS-BREW-SHELLENV: brew install bash is invoked with brew shellenv sourced inline" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE 'brew shellenv.*&&.*brew install bash'; then
+  expect.pass "ossh.prereqs.install sources brew shellenv before brew install bash"
+else
+  expect.fail "ossh.prereqs.install invokes 'brew install bash' as a bare command — non-interactive ssh PATH on macOS won't have brew, so bash 4+ install will fail with 'command not found: brew'"
+fi
+
+# T-OSSH-PREREQS-BREW-PATHSD : brew hosts (macOS) need /etc/paths.d/oosh-homebrew
+# wiring so non-interactive ssh sessions find /opt/homebrew/bin/bash. macOS sshd
+# builds PATH via path_helper which reads /etc/paths + /etc/paths.d/*; without
+# the entry, ssh-exec'd shebangs (#!/usr/bin/env bash) resolve to /bin/bash 3.2
+# even though brew bash is on disk.
+test.case $level "T-OSSH-PREREQS-BREW-PATHSD: ossh.prereqs.install wires /etc/paths.d/oosh-homebrew on brew hosts" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE '/etc/paths\.d/oosh-homebrew'; then
+  expect.pass "ossh.prereqs.install body wires /etc/paths.d/oosh-homebrew for brew"
+else
+  expect.fail "ossh.prereqs.install body missing /etc/paths.d/oosh-homebrew wiring — non-interactive ssh on macOS won't find brew bash"
+fi
+
+# T-OSSH-PREREQS-BREW-BOOTSTRAP : naked macOS images (cirruslabs/macos-sequoia-base,
+# fresh tart clones) ship with neither brew nor any other package manager, so
+# ossh.pm.discover returns empty and the install loop silently no-ops. The
+# brew-only post-install hook then never fires (case "$pmCmd" misses), bash 4+
+# is never installed, and the next `ossh install <host>` aborts at init/oosh's
+# bash prereq check. Bootstrap Homebrew non-interactively when no PM is
+# detected on Darwin so subsequent steps have something to install with.
+test.case $level "T-OSSH-PREREQS-BREW-BOOTSTRAP: ossh.prereqs.install bootstraps Homebrew on naked macOS hosts" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE 'NONINTERACTIVE=1.*Homebrew/install' \
+   && printf "%s" "$PREREQS_BODY" | grep -qE 'uname -s.*Darwin'; then
+  expect.pass "ossh.prereqs.install body bootstraps Homebrew when no PM is detected on macOS"
+else
+  expect.fail "ossh.prereqs.install body missing Homebrew bootstrap — naked macOS images (no PM) will silently no-op and bash 4+ never lands"
+fi
+
+# T-OSSH-CMD-PREFLIGHT-NOT-SILENCED : ossh.cmd's apt-get update preflight must
+# NOT redirect stdout/stderr — that hides sudo password prompts on remotes
+# without NOPASSWD configured, leaving the install to hang silently.
+# Pre-5ecd118 the preflight was silenced and `ossh install` hung on bob's box;
+# this guard catches future regressions to the silencing.
+test.case $level "T-OSSH-CMD-PREFLIGHT-NOT-SILENCED: ossh.cmd apt-get update doesn't redirect stdout/stderr" \
+  echo "(grep)"
+CMD_BODY=$(declare -f ossh.cmd 2>/dev/null)
+if printf "%s" "$CMD_BODY" | grep -qE 'apt-get\* *\)' \
+   && ! printf "%s" "$CMD_BODY" | grep -qE 'apt-get update.*>/dev/null|apt-get update.*2>&1'; then
+  expect.pass "ossh.cmd apt-get update preflight runs without output redirects"
+else
+  expect.fail "ossh.cmd apt-get update is silenced — sudo password prompts will hang on remotes without NOPASSWD"
 fi
 
 test.suite.save.results

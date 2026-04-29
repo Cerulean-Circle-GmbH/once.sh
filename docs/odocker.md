@@ -11,10 +11,15 @@ The `odocker` script wraps Docker commands following oosh conventions: positiona
 ## Configuration
 
 ```bash
-# Set DockerWorkspaces path (persists in ~/config/user.env)
+# Set DockerWorkspaces path. Canonicalised to absolute before being
+# persisted in $CONFIG_PATH/odocker.env, which user.env sources on
+# every shell startup. Relative paths (e.g. "./workspaces") are resolved
+# against the current cwd, not stored verbatim. With no argument it
+# resets to the platform default (/var/dev/EAMD.ucp/.../DockerWorkspaces).
 odocker workspace.set "/path/to/DockerWorkspaces"
+odocker workspace.set                               # reset to default
 
-# Show current workspace directory
+# Show current workspace directory (and its persistence location)
 odocker workspace.get
 
 # Default (if not set): /var/dev/EAMD.ucp/.../DockerWorkspaces
@@ -122,9 +127,14 @@ The Docker socket gives the container root-level access to the host's Docker dae
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `workspace.get` | | Show current Docker workspaces directory |
-| `workspace.set <path>` | directory path | Set and persist Docker workspaces directory |
+| `workspace.get` | | Show current Docker workspaces directory and where it's persisted |
+| `workspace.set <?path>` | directory path (optional — defaults to the platform default) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to `$ODOCKER_WORKSPACES_DEFAULT` |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
+
+> **Persistence:** `workspace.set` stores the setting in `$CONFIG_PATH/odocker.env`
+> and registers it with `config add` so every new shell inherits the value.
+> Legacy installs that had `ODOCKER_WORKSPACES=` in `user.env` are migrated on
+> the next `workspace.set` call — no dead keys are left behind.
 
 ### Build
 
@@ -152,7 +162,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
 | `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount) |
 | `stop <container>` | container name | Stop a running container |
-| `rm <container>` | container name | Remove a stopped container |
+| `container.remove <container>` | container name | Remove a stopped container (old name: `rm`, still works) |
 | `log <container>` | container name, optional line count (default: 50) | Show container logs |
 
 ### Image Operations
@@ -160,7 +170,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `list` | | List all Docker images |
-| `rmi <image>` | image name | Remove an image |
+| `image.remove <image>` | image name | Remove an image (old name: `rmi`, still works) |
 | `file.find <containerOrImage>` | container or image name | Find the Dockerfile that built a container or image |
 
 ### Docker Compose
@@ -218,7 +228,7 @@ ossh login ubuntu24
 
 # 6. When done, clean up
 odocker stop <container_name>
-odocker rm <container_name>
+odocker container.remove <container_name>      # old name: `odocker rm` still works
 ```
 
 ## Troubleshooting

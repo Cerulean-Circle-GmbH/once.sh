@@ -619,7 +619,7 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure
 
   # Detect current branch
   local currentBranch
-  currentBranch=$(git -C "$currentDir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  currentBranch=$(this.git.branch.short "$currentDir")
   if [ -z "$currentBranch" ]; then
     error.log "Cannot detect current branch in $currentDir"
     return 1
@@ -825,7 +825,25 @@ oo.checkout() # <version> # clone or add worktree for a remote branch
   return $(result)
 }
 oo.checkout.completion.version() {
-  git -C "${OOSH_DIR:-$HOME/oosh}" ls-remote --heads origin 2>/dev/null | sed 's|.*refs/heads/||'
+  # Try the canonical source first — `git ls-remote` reflects branches that
+  # may have been pushed since the last fetch. When origin is unreachable
+  # (offline laptop, VM without the 2cuGitHub SSH alias configured, expired
+  # token, no network), ls-remote fails silently with `2>/dev/null` and the
+  # caller would see no completions — c2's fallback then leaks the literal
+  # `addDefaultValue` placeholder from PARAM_version. Fall back to the
+  # locally-cached remote-tracking refs (`refs/remotes/origin/*`) so the user
+  # at least sees the branches they last fetched. Linux with a reachable
+  # origin gets the same output as before (out is non-empty → printed
+  # directly). Pure-additive change for the unreachable case.
+  local oosh="${OOSH_DIR:-$HOME/oosh}"
+  local out
+  out=$(git -C "$oosh" ls-remote --heads origin 2>/dev/null | sed 's|.*refs/heads/||')
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    git -C "$oosh" for-each-ref refs/remotes/origin --format='%(refname:short)' 2>/dev/null \
+      | sed 's|^origin/||'
+  fi
 }
 
 oo.use() # <branch> <command> # run a command from a specific branch without switching
@@ -1230,7 +1248,7 @@ private.check.root.shared.dev.folder.created() {
   
   if [ -z "${OOSH_BRANCH}" ]; then
     # Detect branch from initial $HOME/oosh clone before it gets symlinked
-    OOSH_BRANCH=$(git -C $HOME/oosh rev-parse --abbrev-ref HEAD 2>/dev/null)
+    OOSH_BRANCH=$(this.git.branch.short "$HOME/oosh")
     if [ -z "$OOSH_BRANCH" ] || [ "$OOSH_BRANCH" = "HEAD" ]; then
       OOSH_BRANCH=main
     fi
@@ -1333,10 +1351,26 @@ Host WODA.dev
       else
         important.log "<oo> Creating worktree for branch ${OOSH_BRANCH}"
         cd main
-        git fetch origin
-        git worktree add -B "${OOSH_BRANCH}" "../${OOSH_BRANCH}" "origin/${OOSH_BRANCH}"
+        git fetch origin 2>&1
         RETURN_VALUE=$?
-        if ! [ "$RETURN_VALUE" = "0" ]; then return $RETURN_VALUE; fi
+        if ! [ "$RETURN_VALUE" = "0" ]; then
+          error.log "state 31: 'git fetch origin' failed (rc=$RETURN_VALUE) in $(pwd)"
+          return $RETURN_VALUE
+        fi
+        # Defence in depth: if an older (unpatched) caller sent a polluted
+        # $OOSH_BRANCH like "heads/origin/dev", strip it here before we
+        # concatenate "origin/" below — otherwise git sees
+        # "origin/heads/origin/dev" and fails with "invalid reference".
+        OOSH_BRANCH="${OOSH_BRANCH#refs/heads/}"
+        OOSH_BRANCH="${OOSH_BRANCH#refs/remotes/origin/}"
+        OOSH_BRANCH="${OOSH_BRANCH#heads/origin/}"
+        OOSH_BRANCH="${OOSH_BRANCH#origin/}"
+        git worktree add -B "${OOSH_BRANCH}" "../${OOSH_BRANCH}" "origin/${OOSH_BRANCH}" 2>&1
+        RETURN_VALUE=$?
+        if ! [ "$RETURN_VALUE" = "0" ]; then
+          error.log "state 31: 'git worktree add -B ${OOSH_BRANCH} ../${OOSH_BRANCH} origin/${OOSH_BRANCH}' failed (rc=$RETURN_VALUE) in $(pwd)"
+          return $RETURN_VALUE
+        fi
         cd ..
       fi
     fi
@@ -1378,6 +1412,21 @@ Host WODA.dev
     chown -h $paramerUser:dev "$currentConfig"
     chown -R $paramerUser:dev "$dir/shared"
     chmod -R g+w "$dir/shared"
+
+    # Enable git's shared-repository mode on both worktrees so subsequent
+    # git operations (root's `git pull` on re-install at init/oosh:271,
+    # any dev-group user running `oo update`) create files with group rw
+    # and honour the setgid bit on .git directories. Without this, root's
+    # git ops write FETCH_HEAD/ORIG_HEAD/objects as root:root 644 and
+    # lock out dev-group users from further updates.
+    for _wt in "$onceShBase/main" "$onceShBase/${OOSH_BRANCH}"; do
+      if [ -e "$_wt/.git" ]; then
+        git -C "$_wt" config core.sharedRepository group 2>/dev/null || true
+      fi
+    done
+    # Propagate setgid to all .git dirs so new files inherit group=dev
+    find "$onceShBase/main/.git" -type d -exec chmod g+s {} + 2>/dev/null
+    chmod -R g+w "$onceShBase/main/.git" 2>/dev/null
     # Resolve canonical path — macOS case-insensitive FS needs exact case for safe.directory
     local resolvedOoshDir="$onceShBase/${OOSH_BRANCH}"
     if command -v osascript >/dev/null 2>&1; then
@@ -1428,6 +1477,22 @@ Host WODA.dev
 
 
   set +x
+    # Post-body verification: without this, a silent failure in git clone /
+    # worktree add leaves the state machine thinking state 31 succeeded while
+    # $sharedOosh never materialized, causing downstream user.oosh.install to
+    # time out polling for a dir that's never going to appear.
+    if [ ! -d "$onceShBase/${OOSH_BRANCH}" ]; then
+      error.log "state 31: body ran but $onceShBase/${OOSH_BRANCH} is missing — check git clone/worktree-add logs above"
+      create.result 1 "dev folder not created at $onceShBase/${OOSH_BRANCH}"
+      return $(result)
+    fi
+
+    # Seed /home/shared/.ssh/ via the same primitive the caller-side install
+    # path uses (single source of truth). Idempotent — finish.local's else
+    # branch re-invokes it and will skip if already present.
+    ossh config.shared.create "" "$dir/developking/.ssh/id_rsa" 2>&1 \
+      || warn.log "state 31: ossh config.shared.create failed (finish.local fallback will retry)"
+
     create.result 0 "root.shared.dev.folder.created" $1
   fi
 
@@ -1729,6 +1794,39 @@ oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installes it 
       esac
     fi
     RETURN=$1
+}
+
+oo.prereqs.install() # # install the oosh install-time prereqs locally — git and curl — plus bash 4+ if the running shell is older
+{
+  # Ensure we know the PM. Idempotent — `oo cmd` also calls this if needed.
+  [ -z "$OOSH_PM" ] && oo pm.discover
+
+  # Delegate to the existing `oo cmd <pkg>` primitive — it already handles
+  # "already installed" (command -v check), calls $SUDO $OOSH_PM <pkg>, and
+  # knows per-distro package-name quirks. No new package-install logic here.
+  local pkg rc=0
+  for pkg in curl git; do
+    if ! oo cmd "$pkg"; then
+      error.log "oo.prereqs.install: failed to install $pkg"
+      rc=1
+    fi
+  done
+
+  # bash 4+ case is subtle: `oo cmd bash` short-circuits when bash is
+  # already in PATH (oo:1689 `command -v` check), and macOS ships bash 3.2
+  # at /bin/bash — so oo cmd bash would NO-OP and the upgrade never fires.
+  # Bypass the existence check by dispatching directly to the PM. Same
+  # case-sudo split oo cmd does at oo:1756-1759 (brew runs as caller; all
+  # other PMs need $SUDO).
+  if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    [ -z "$OOSH_PM" ] && oo pm.discover
+    case "${OOSH_PM:-}" in
+      "brew install"*) $OOSH_PM bash || rc=1 ;;
+      *)               $SUDO $OOSH_PM bash || rc=1 ;;
+    esac
+    important.log "bash 4+ installed — re-exec the installer from a fresh shell to pick it up"
+  fi
+  return $rc
 }
 
 oo.pm() # # checks if the pm is well configured

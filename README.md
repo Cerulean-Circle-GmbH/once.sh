@@ -9,18 +9,59 @@ This Repo consists of two main topics
 
 Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branching Strategy](docs/branching.md) for details.
 
+## prereqs
+
+- **curl / wget / fetch** (only one, for the one-liner to fetch the installer)
+  — macOS: already present · Debian/Ubuntu: `apt-get install -y curl` · RHEL/Fedora: `dnf install -y curl` · Alpine: `apk add curl`
+- **bash 4+** — macOS: `brew install bash` · Debian/Ubuntu/RHEL: already present (Ubuntu 22/24 ships bash 5)
+- **git** — macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install git` · RHEL/Fedora: `sudo dnf install git` · Alpine: `apk add git`
+
+> **Why curl/wget/fetch is listed first:** the install one-liner below (`bash -c "$(curl …)"`) relies on bash's command-substitution to pull the installer from GitHub. If the fetcher is missing, bash silently runs `bash -c ""` and nothing happens — you'll see *`bash: curl: command not found`* with no framed error. Install a fetcher first (any one of curl / wget / fetch), then run the one-liner.
+>
+> The installer itself checks **bash 4+** and **git** and prints a consolidated error with per-platform install hints if either is missing.
+
+## one-file install
+
+**One file, double-click (macOS) or `./` (Linux):**
+
+1. **[⬇ Download Install oosh.command](https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/Install%20oosh.command)** (right-click → Save Link As…)
+2. Run it:
+   - **macOS:** double-click in Finder.
+   - **Linux:** `chmod +x "Install oosh.command" && ./"Install oosh.command"`
+3. A terminal runs the install. Enter your sudo password when prompted.
+
+That's it — the `.command` file self-bootstraps: it fetches the bootstrap script from GitHub and runs it. No need to download the whole repo.
+
+> **First-run macOS prompt:** downloaded files carry Apple's quarantine flag. macOS will say "*Install oosh.command* cannot be opened because the developer cannot be verified." Right-click the file → **Open** → **Open** to confirm. After you approve it once, double-click works normally. Linux has no equivalent gate.
+
+> **Also works from a clone:** if you `git clone` the repo or download the ZIP, the same `Install oosh.command` in the repo root runs your local `init/oosh` instead of fetching from GitHub. Same UX either way.
+
+> **Current default branch: `dev`.** Until we promote the install flow to `prod`, the download link and the `.command`'s embedded fallback URL both point to `dev`. After promotion, both get rewritten to `prod` (by `promote`) and this link will be updated.
+
 ## fast install - use it anywhere
 
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
-| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
-| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **curl**  | `bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"` |
+| **wget**  | `bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"`   |
+| **fetch** | `bash -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"` |
+
+> **Current default branch: `dev`.** The new thin-bootstrap install flow only lives on `dev` until it's promoted through `testing` to `prod`. Once promoted, these URLs get flipped back to `/prod/`.
+
+> **Note:** use `bash -c`, not `sh -c`. On Debian/Ubuntu `sh` is `dash`, and
+> the `sh -c "$(curl …)"` form hits a pre-existing bug in oosh's re-exec-via-bash
+> step: inside a piped script `$0` is literally `"sh"` (not a filesystem path),
+> so `exec bash "$0" "$@"` becomes `exec bash sh` which bash resolves via PATH
+> to `/usr/bin/sh` and fails with "cannot execute binary file". `bash -c` starts
+> under bash directly so the re-exec is never attempted.
+
+Substitute the `prod` segment of the URL with `dev` (or any branch name) to
+install from a non-default branch, e.g. `…/dev/init/oosh`.
 
 
 ### More detailed logging for debugging is available with these commands
 ```
-unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" | tee install.log.txt
+unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)" | tee install.log.txt
 
 > or if already available locally
 unbuffer env -i sh -x init/oosh | tee install.log.txt 
@@ -39,7 +80,7 @@ in VSCODE use [use the ANSI Colors plugin](https://marketplace.visualstudio.com/
 
 ## manual install
 ```
-wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh ;
+wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh ;
 chmod 700 oosh
 ./oosh
 
@@ -53,13 +94,13 @@ cat oosh | sh -x
 ```
 sudo apt update
 sudo apt install curl
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"
 
 or as root
 
 apt update
 apt install curl
-sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)"
 ```
 
 

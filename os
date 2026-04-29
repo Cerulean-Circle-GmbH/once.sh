@@ -216,6 +216,16 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
   ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
+  # Install prereqs (git + curl) on the target. Naked platform images are
+  # deliberately minimal — they ship bash/sudo/wget/runuser but not
+  # git/curl. init/oosh's prereq check would error out with the framed
+  # "missing prerequisite(s)" message; call prereqs.install first to
+  # satisfy them via the detected PM.
+  console.log "Installing prereqs (git, curl) on $platform..."
+  ossh prereqs.install "$platform" || {
+    error.log "Failed to install prereqs on $platform — ossh install will likely fail"
+  }
+
   # Install oosh
   ossh install "$platform" test
 
@@ -230,63 +240,93 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     -o StrictHostKeyChecking=accept-new \
     "$platform" true
 
-  local rcUser=0 rcRoot=0 rcDev=0
-  local userLog="" rootLog="" devLog=""
+  # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
+  # Covers every install path we support in one run:
+  #   test      — initial `ossh install <platform> test` (caller-side + user.oosh.install)
+  #   root      — sudo re-exec during the above state-machine install
+  #   oosh-user — `user create oosh-user password oosh-user` from test session
+  #               (oosh-native user creation; user.create calls user.oosh.install internally)
+  #   bash-user — raw `useradd` on remote, then `ossh install <platform> bash-user`
+  #               (caller-initiated install for a pre-existing account)
+
+  console.log "Phase A.2: creating oosh-user via 'user create' from test session..."
+  ossh exec.tty "$platform" "user create oosh-user password oosh-user" || {
+    error.log "Failed to create oosh-user on $platform"
+  }
+  # Give oosh-user NOPASSWD sudo. Append to /etc/sudoers directly (not
+  # sudoers.d) — matches the existing pattern at os:217 for the test
+  # user; sudoers.d isn't always included on minimal images (alma's
+  # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
+  ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
+
+  console.log "Phase A.3: creating bash-user via raw useradd..."
+  # Note: no `-G sudo` — that group only exists on Debian/Ubuntu (RHEL/Alma use
+  # `wheel`, Alpine has neither by default). The NOPASSWD sudoers entry below
+  # grants sudo access without group membership, so portability beats group hygiene.
+  ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash bash-user && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'" || {
+    error.log "Failed to create bash-user on $platform"
+  }
+
+  console.log "Phase A.4: installing oosh for bash-user from caller..."
+  ossh install "$platform" bash-user || {
+    error.log "Failed to install oosh for bash-user on $platform"
+  }
+
+  # ─── PHASE B: run test.suite core 1 on all 4 users ─────────────────────
+  local rcTest=0 rcRoot=0 rcOoshUser=0 rcBashUser=0
+  local testLog="" rootLog="" ooshUserLog="" bashUserLog=""
 
   if [ -z "$notests" ]; then
-    # Run user tests first (clean shared config state)
+    # B.1 — test
     console.log "Running core tests as user test..."
-    userLog="/tmp/oosh-platform-test-user-$platform.log"
-    ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$userLog"
-    rcUser=${PIPESTATUS[0]}
+    testLog="/tmp/oosh-platform-test-test-$platform.log"
+    ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$testLog"
+    rcTest=${PIPESTATUS[0]}
 
-    # Run tests as root (needs -tt for sudo TTY)
+    # B.2 — root (via test+sudo, needs -tt for TTY)
     console.log "Running core tests as root..."
+    # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
+    # user's home). Same find-chdir-back hazard the runuser cases below
+    # describe — except for root, the direct `find` calls work because
+    # root reads anything; the failure mode is subprocesses (e.g. man-db's
+    # postinst, which drops to user `man`) inheriting /home/test as cwd.
     rootLog="/tmp/oosh-platform-test-root-$platform.log"
-    ossh exec.tty "$platform" "sudo bash -lc 'source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
+    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
     rcRoot=${PIPESTATUS[0]}
+
+    # B.3 — oosh-user (via test+sudo+runuser; login-shell equivalent of `user login oosh-user`).
+    # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
+    # early-exit for non-interactive shells would otherwise skip the PATH / user.env
+    # setup and `test.suite: command not found` fires.
+    # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
+    # home, mode 700 owned by test). After `runuser -u oosh-user`, the new
+    # user can't read /home/test, so any `find` invocation in test.suite
+    # (e.g. state.machine.exists at state:865) emits hundreds of
+    # `find: Failed to restore initial working directory: /home/test:
+    # Permission denied` lines on stderr. cd'ing to the new user's own
+    # home keeps find happy.
+    console.log "Running core tests as oosh-user..."
+    ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
+    ossh exec.tty "$platform" "sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$ooshUserLog"
+    rcOoshUser=${PIPESTATUS[0]}
+
+    # B.4 — bash-user (same pattern; same cwd fix)
+    console.log "Running core tests as bash-user..."
+    bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
+    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$bashUserLog"
+    rcBashUser=${PIPESTATUS[0]}
   else
     console.log "Skipping tests (notests)"
   fi
 
-  # Test adding a second user via ossh install (auto-creates dev user)
-  console.log "Adding second user: dev"
-  ossh install "$platform" dev || {
-    error.log "Failed to add dev user on $platform"
-  }
-
-  # Configure passwordless sudo for dev (container is ephemeral)
-  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"dev ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
-
-  # Reconnect as dev user and run tests
-  ossh connection.close "$platform" 2>/dev/null
-  local devConfig="${platform}_dev"
-  ossh config.create "$devConfig" "dev@localhost:$sshPort"
-  ossh config.save.last
-  rm -f "/tmp/ossh-dev@localhost:$sshPort" 2>/dev/null
-  SSHPASS=dev sshpass -e ssh \
-    -o ControlMaster=yes \
-    -o ControlPath="$OSSH_CONTROL_PATH" \
-    -o ControlPersist=600 \
-    -o StrictHostKeyChecking=accept-new \
-    "$devConfig" true
-
-  if [ -z "$notests" ]; then
-    console.log "Running core tests as user dev..."
-    devLog="/tmp/oosh-platform-test-dev-$platform.log"
-    ossh exec "$devConfig" "test.suite core 1" 2>&1 | tee "$devLog"
-    rcDev=${PIPESTATUS[0]}
-  fi
-
-  # Interactive terminal — drop into shell as dev before cleanup
+  # Interactive terminal — drop into bash-user shell (last-user-created convention)
   if [ -n "$terminal" ]; then
-    console.log "Opening interactive terminal as dev on $platform..."
+    console.log "Opening interactive terminal as bash-user on $platform..."
     console.log "Type 'exit' to end the session and clean up."
-    ossh exec.tty "$devConfig" "bash -l"
+    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -l"
   fi
 
   # Cleanup
-  ossh connection.close "$devConfig" 2>/dev/null
   ossh connection.close "$platform" 2>/dev/null
   private.os.platform.cleanup "$sshPort"
 
@@ -295,25 +335,28 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     important.log "PASS: $platform (tests=skipped)"
     create.result 0 "PASS"
     rc=0
-  elif [ $rcRoot -eq 0 ] && [ $rcUser -eq 0 ] && [ $rcDev -eq 0 ]; then
-    printf "PASS: %s (root=%d, user=%d, dev=%d)\n" "$platform" "$rcRoot" "$rcUser" "$rcDev"
-    important.log "PASS: $platform (root=$rcRoot, user=$rcUser, dev=$rcDev)"
+  elif [ $rcTest -eq 0 ] && [ $rcRoot -eq 0 ] && [ $rcOoshUser -eq 0 ] && [ $rcBashUser -eq 0 ]; then
+    printf "PASS: %s (test=%d root=%d oosh-user=%d bash-user=%d)\n" "$platform" "$rcTest" "$rcRoot" "$rcOoshUser" "$rcBashUser"
+    important.log "PASS: $platform (test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser)"
     create.result 0 "PASS"
-    rm -f "$userLog" "$rootLog" "$devLog"
+    rm -f "$testLog" "$rootLog" "$ooshUserLog" "$bashUserLog"
     rc=0
   else
-    printf "FAIL: %s (root=%d, user=%d, dev=%d)\n" "$platform" "$rcRoot" "$rcUser" "$rcDev"
-    error.log "FAIL: $platform (root=$rcRoot, user=$rcUser, dev=$rcDev)"
-    if [ $rcUser -ne 0 ]; then
-      error.log "--- USER test failures (grep FAIL) ---"
-      grep -i "FAIL\|✗" "$userLog" 2>/dev/null
-      error.log "--- Full user log: $userLog ---"
-    fi
-    if [ $rcRoot -ne 0 ]; then
-      error.log "--- ROOT test failures (grep FAIL) ---"
-      grep -i "FAIL\|✗" "$rootLog" 2>/dev/null
-      error.log "--- Full root log: $rootLog ---"
-    fi
+    printf "FAIL: %s (test=%d root=%d oosh-user=%d bash-user=%d)\n" "$platform" "$rcTest" "$rcRoot" "$rcOoshUser" "$rcBashUser"
+    error.log "FAIL: $platform (test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser)"
+    local _u _l
+    for pair in "test:$testLog" "root:$rootLog" "oosh-user:$ooshUserLog" "bash-user:$bashUserLog"; do
+      _u="${pair%%:*}"; _l="${pair#*:}"
+      case "$_u" in
+        test)      [ $rcTest -eq 0 ]     && continue ;;
+        root)      [ $rcRoot -eq 0 ]     && continue ;;
+        oosh-user) [ $rcOoshUser -eq 0 ] && continue ;;
+        bash-user) [ $rcBashUser -eq 0 ] && continue ;;
+      esac
+      error.log "--- $_u test failures (grep FAIL) ---"
+      grep -i "FAIL\|✗" "$_l" 2>/dev/null
+      error.log "--- Full $_u log: $_l ---"
+    done
     create.result 1 "FAIL"
     rc=1
   fi
@@ -479,7 +522,10 @@ os.check.env() # #
         info.log "      Mac OS detected"
         export OOSH_OS="darwin"
         ;;
-      linux-gnu*)
+      linux*)
+        # Match linux-gnu (glibc), linux-musl (Alpine), and any future
+        # variants. Tag as "linux-gnu" — the historical value, kept for
+        # downstream consumers; mirrors the broader pattern in oo:1504.
         info.log "      Linux detected"
         export OOSH_OS="linux-gnu"
         ;;

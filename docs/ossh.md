@@ -169,16 +169,77 @@ What happens during install:
 6. Creates user account and symlinks
 7. Sets login shell to bash 4+
 
-### Deploy Key
+### Prereqs (`ossh prereqs.install`)
 
-If `~/.ssh/deploy_keys/2cuGitHub` exists on your machine, `ossh install` automatically:
+If the remote is missing oosh's install-time tools, run `ossh prereqs.install <host>` first. It installs the package list appropriate to the remote's package manager (detected via `ossh pm.discover`):
 
-- Copies the key to the remote host's shared SSH directory
-- Creates the `2cuGitHub` SSH config alias (pointing to github.com)
-- Adds github.com to known_hosts
-- Copies everything to all user accounts
+| PM | Packages installed | Post-install |
+|---|---|---|
+| `apt-get`, `dnf`, `pacman`, `pkg` | `curl`, `git` | — |
+| `apk` (Alpine) | `curl`, `git`, **`bash`**, **`shadow`**, **`util-linux`** | `chmod u+s /bin/busybox` |
+| `brew` (macOS) | `curl`, `git`, **`bash`** | write `/etc/paths.d/oosh-homebrew` |
 
-This enables `oo update` and `oo checkout` on the remote host.
+The Alpine extras are required because alpine's base image ships only busybox + ash:
+- `bash` — oosh's `#!/usr/bin/env bash` shebangs
+- `shadow` — `useradd`/`chpasswd` (busybox `adduser` differs in flags)
+- `util-linux` — `runuser`, used by `os platform.test` for user-switching
+- `chmod u+s /bin/busybox` — naked alpine ships busybox at mode 0755; the suid bit is needed for non-root `su -` (so `user login <user>` works from a regular user's shell). Real alpine deployments typically ship busybox suid by default. The same chmod also fires from `init/oosh` after its sudo re-exec, so curl/drag-and-drop install paths get the heal too.
+
+The macOS extras are required because Apple's `/bin/bash` is 3.2 (their last GPLv2 release) but oosh requires bash 4+:
+- `bash` — installs `/opt/homebrew/bin/bash` (5.x).
+- `/etc/paths.d/oosh-homebrew` — macOS sshd builds non-interactive PATH via `path_helper`, which reads `/etc/paths` + `/etc/paths.d/*`. `/opt/homebrew/bin` is NOT in either by default, so even with brew bash on disk, ssh-exec'd shebangs (`#!/usr/bin/env bash`) resolve to `/bin/bash` 3.2. Wiring the entry once via paths.d benefits every non-interactive ssh session on the host.
+
+The remote install runs over ssh+sh (no bash on remote required), so this works on a fresh naked alpine box where bash doesn't yet exist, and on a stock macOS where only the system 3.2 bash is present.
+
+### Deploy Key (GitHub access)
+
+`ossh install` ensures every user on the target ends up with a working `2cuGitHub` SSH alias for cloning from `Cerulean-Circle-GmbH`. The deploy key reaches the shared `.ssh/` via one of two paths:
+
+1. **Caller-supplied (wins when present).** If the caller has `~/.ssh/deploy_keys/2cuGitHub` locally, that exact key is transferred to `/home/shared/.ssh/2cuGitHub` on the remote. Use this when you rotate the deploy key on your laptop and want the new one pushed.
+
+2. **Fallback via `developking` (default).** If the caller doesn't have a local `deploy_keys/2cuGitHub`, `ossh.install.finish.local` seeds `/home/shared/.ssh/2cuGitHub` from `~developking/.ssh/id_rsa` — which was downloaded during state 31 from the oosh templates server (`test.wo-da.de`) or the local `templates/user/developking.ssh/` fallback. This is why "the connection happens automatically through developing": `developking` is always there, always has the key.
+
+Either way, `user.oosh.install` then copies `/home/shared/.ssh/`'s `2cuGitHub` + `config` (with the `Host 2cuGitHub` block) + `known_hosts` into every new user's own `~/.ssh/`, so `git clone 2cuGitHub:…`, `oo update`, and `oo checkout` just work for every oosh user.
+
+If both paths fail (test.wo-da.de unreachable AND no local templates AND no caller-side deploy key), install still succeeds — only the GitHub-access setup is skipped. A `warn.log` line flags this.
+
+## Hardening
+
+`ossh.harden` is invoked **after** `ossh install` finishes, on Debian/Ubuntu
+remotes only. It applies a standard baseline: unattended-upgrades,
+fail2ban, UFW, and an opinionated sshd_config. User creation and SSH-key
+distribution are deliberately **not** repeated here — `ossh install` did
+that already; `ossh.harden` only adds the security layers.
+
+```bash
+ossh install myhost admin        # sets up users, keys, shared-oosh infrastructure
+ossh harden  myhost              # locks the box down (no AllowUsers yet — safe default)
+```
+
+Each concern is also callable standalone:
+
+| Method | What it does |
+|---|---|
+| `ossh.harden <host>` | Orchestrator: packages → unattended-upgrades → fail2ban → firewall → sshd. Does **not** touch `AllowUsers`. |
+| `ossh.harden.packages <host>` | `apt update && apt dist-upgrade -y && apt install unattended-upgrades fail2ban ufw htop nano bzip2` |
+| `ossh.harden.unattended.upgrades <host>` | Writes `/etc/apt/apt.conf.d/20auto-upgrades` + `/etc/apt/apt.conf.d/51-oosh-unattended-upgrades` (auto-remove kernels/deps, reboot at 02:30) |
+| `ossh.harden.fail2ban <host>` | Writes `/etc/fail2ban/jail.local` with `[sshd]` block, enables + restarts |
+| `ossh.harden.firewall <host> <?extraPorts>` | UFW default deny-in/allow-out + OpenSSH + any optional extras (e.g. `"8080/tcp 8443/tcp"`) |
+| `ossh.harden.sshd <host>` | sshd_config hardening toggles. Reloads sshd (existing sessions survive). |
+| `ossh.harden.sshd.allowusers <host> <users>` | **Opt-in only.** Appends `AllowUsers`. Include every user who needs SSH access — unlisted users will be locked out. |
+
+### Preflight safety gate
+
+Every `ossh.harden.*` method runs `private.ossh.harden.preflight` first,
+which refuses to proceed if:
+- The caller cannot SSH in `BatchMode` (only password auth works — hardening would lock them out).
+- The remote isn't Linux, or its `/etc/os-release` ID isn't `debian`/`ubuntu`.
+
+### Intentional non-goals
+
+- **No user creation.** `ossh install`'s `user.create` + `install.user.remote` covered this.
+- **No NOPASSWD sudoers drop-in.** One-liner if you need it: `echo "<user> ALL=(ALL) NOPASSWD:ALL" | ssh <host> sudo tee /etc/sudoers.d/<user>-nopasswd`.
+- **No `AllowUsers` in the orchestrator.** Dangerous default; opt-in via `.sshd.allowusers`.
 
 ## Shared SSH Config
 
@@ -210,6 +271,13 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh id.create` | Create new SSH key pair |
 | `ossh list` | List configured hosts |
 | `ossh list.ids` | List available key identities |
+| `ossh harden` | Harden Debian/Ubuntu remote (orchestrator; no AllowUsers) |
+| `ossh harden.packages` | Install the hardening package set |
+| `ossh harden.unattended.upgrades` | Enable + configure unattended-upgrades |
+| `ossh harden.fail2ban` | Enable fail2ban with [sshd] jail |
+| `ossh harden.firewall` | Configure UFW (default deny in / allow out + OpenSSH + optional extra ports) |
+| `ossh harden.sshd` | Harden sshd_config (no AllowUsers) |
+| `ossh harden.sshd.allowusers` | **Opt-in** AllowUsers restriction |
 
 ## See Also
 

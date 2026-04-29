@@ -287,7 +287,11 @@ ossh.config.create() # <?sshConfigName|user@host> <?url> <?idOrProxyJump> <?prox
     fi
   fi
 
-  if [ ! -f "$id" ]; then
+  # Leading ~ means "each user's own home" — pass verbatim to the config
+  # file (sshd expands it at read time). Without this guard, `[ ! -f "~/..." ]`
+  # treats tilde as literal, fails, and the fallback builds a bogus path
+  # like /ids/~/.ssh/2cuGitHub/id_ed25519 into the config.
+  if [[ "$id" != "~"* ]] && [ ! -f "$id" ]; then
     private.get.sshDir
     local idName="$id"
     if private.detect.ssh.key "$RESULT/ids/$idName"; then
@@ -446,7 +450,7 @@ private.push.init.oosh() {
   # Run remote installer — always installs to root
   # Pass current git branch as argument (not env var — init/oosh shebang uses env -i which wipes environment)
   local currentBranch
-  currentBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  currentBranch=$(this.git.branch.short "$OOSH_DIR")
   info.log "Running remote oosh installer (root mode, branch: $currentBranch)..."
   # Use '_' placeholder for empty OOSH_SSH_CONFIG_HOST — empty args get lost across SSH + shebang chain
   private.ossh.ssh -tt "$sshConfigHost" "./oosh mode root $sshConfigHost ${OOSH_SSH_CONFIG_HOST:-_} $currentBranch ${OSSH_INSTALL_LOG_LEVEL:-1}"
@@ -507,7 +511,7 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
 
   # Detect branch from initial clone and export for state 21's git checkout
   if [ -z "$OOSH_BRANCH" ]; then
-    OOSH_BRANCH=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    OOSH_BRANCH=$(this.git.branch.short "$OOSH_DIR")
     export OOSH_BRANCH
     important.log "Detected OOSH_BRANCH=$OOSH_BRANCH from $OOSH_DIR"
   fi
@@ -538,6 +542,25 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
 
   user authorized.keys.update
 
+  # Re-add the 2cuGitHub alias to ~/.ssh/config. State 31's
+  # `private.install.dev.configs` added it earlier, but the backup step
+  # at line 529-530 (.ssh → ssh.original) followed by `user init`
+  # (line 532) created a fresh ~/.ssh/config with WODA-only entries on
+  # first install, discarding the 2cuGitHub block. Without this re-add,
+  # root's `oo update` / `git pull` fails with "Could not resolve
+  # hostname 2cugithub" because no Host alias matches.
+  local _basehomeForDk
+  _basehomeForDk="$(dirname "$HOME")"
+  [ "$_basehomeForDk" = / ] && _basehomeForDk=/home
+  if [ -f "$_basehomeForDk/developking/.ssh/id_rsa" ] \
+     && ! grep -q "^Host 2cuGitHub" "$HOME/.ssh/config" 2>/dev/null; then
+    ossh.config.create 2cuGitHub git@github.com:Cerulean-Circle-GmbH/once.sh.git "$_basehomeForDk/developking/.ssh/id_rsa"
+    ossh.config.save.last
+    if ! grep -q "github.com" "$HOME/.ssh/known_hosts" 2>/dev/null; then
+      ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+    fi
+  fi
+
   # Fix hardcoded root home paths in shared config so non-root users can source it
   # Runs as root here, so no permission issues with the shared config
   # Use $HOME to detect actual root home (/root on Linux, /var/root on macOS)
@@ -567,6 +590,15 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
         eval sed $sedFlag "'s|OOSH_WORKTREE_BASE=\"${rootHome}\"|OOSH_WORKTREE_BASE=\"\$HOME\"|g'" "'$f'"
       fi
     done
+  fi
+
+  # Backup seed of /home/shared/.ssh/ in case state 31's call didn't run.
+  # Idempotent via ossh.config.shared.create's own file-exists guards.
+  local _basehome
+  _basehome="$(dirname "$HOME")"
+  [ "$_basehome" = / ] && _basehome=/home
+  if [ -f "$_basehome/developking/.ssh/id_rsa" ] && [ ! -f "$_basehome/shared/.ssh/2cuGitHub" ]; then
+    ossh.config.shared.create "" "$_basehome/developking/.ssh/id_rsa"
   fi
 
   # Clear install-only logging — LOG_INSTALL must not persist into user sessions
@@ -630,41 +662,48 @@ ossh.install.finish.local() # # finishes local oosh installation
     '" 2>/dev/null || {
       warn.log "Could not create shared SSH config — continuing"
     }
-    # Copy config, known_hosts, and deploy key to all users
-    # SSH requires all files owned by the user with strict permissions
-    private.ossh.ssh "$sshConfigHost" "sudo bash -c '
-      basehome=\$(dirname \"\$HOME\")
-      [ \"\$basehome\" = / ] && basehome=/home
-      sharedSsh=\"\$basehome/shared/.ssh\"
-      for u in \$(ls \"\$basehome\" 2>/dev/null | grep -v shared); do
-        h=\"\$basehome/\$u\"
-        [ -d \"\$h\" ] || continue
-        mkdir -p \"\$h/.ssh\"
-        cp \"\$sharedSsh/config\" \"\$h/.ssh/config\" 2>/dev/null
-        cp \"\$sharedSsh/known_hosts\" \"\$h/.ssh/known_hosts\" 2>/dev/null
-        cp \"\$sharedSsh/2cuGitHub\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-        chown \"\$u\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-        chmod 600 \"\$h/.ssh/config\" \"\$h/.ssh/2cuGitHub\"
-        chmod 644 \"\$h/.ssh/known_hosts\"
-      done
-      # Also handle root (home is outside basehome)
-      rootHome=\$(eval echo ~root)
-      if [ -d \"\$rootHome\" ]; then
-        mkdir -p \"\$rootHome/.ssh\"
-        cp \"\$sharedSsh/config\" \"\$rootHome/.ssh/config\" 2>/dev/null
-        cp \"\$sharedSsh/known_hosts\" \"\$rootHome/.ssh/known_hosts\" 2>/dev/null
-        cp \"\$sharedSsh/2cuGitHub\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-        chown root \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/known_hosts\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-        chmod 600 \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/2cuGitHub\"
-        chmod 644 \"\$rootHome/.ssh/known_hosts\"
-      fi
-    '" 2>/dev/null
+    # Propagate the shared .ssh artefacts to every user's ~/.ssh (extracted
+    # helper — same logic used by the developking-fallback else branch).
+    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
+  else
+    # Fallback: seed /home/shared/.ssh/ from developking's in-place key,
+    # which state 31 populates from test.wo-da.de templates (see oo:1294).
+    # This closes the "every oosh user has GitHub access through developking
+    # automatically" expectation in the common case where the caller doesn't
+    # carry a local ~/.ssh/deploy_keys/2cuGitHub. user.oosh.install's
+    # existing copy-step (user:766-779) then propagates the seeded
+    # {2cuGitHub, config, known_hosts} into every new user's ~/.ssh/.
+    #
+    # If developking/.ssh/id_rsa is missing (test.wo-da.de unreachable AND
+    # no local templates) we emit a note and skip quietly — install still
+    # succeeds; only GitHub access ends up unconfigured.
+    # Caller has no local deploy_keys/2cuGitHub. Delegate to the oosh config
+    # primitive `ossh.config.shared.create`, sourced from developking's
+    # in-place id_rsa on the remote. State 31 also runs this method as part
+    # of its body, so in the normal caller-initiated flow the shared dir is
+    # ALREADY seeded when we get here — this else-branch then becomes a
+    # no-op thanks to ossh.config.shared.create's idempotency guards (file-
+    # exists check on the key, ossh.config.get on the Host alias, grep -q
+    # on known_hosts). Same single source of truth on both sides.
+    info.log "No local ~/.ssh/deploy_keys/2cuGitHub — delegating to ossh config.shared.create with developking's in-place key"
+    private.ossh.ssh "$sshConfigHost" "ossh config.shared.create \"\" \"~developking/.ssh/id_rsa\"" 2>/dev/null \
+      || warn.log "Could not seed shared .ssh from developking — GitHub access won't propagate to other users"
+
+    # Propagate to every existing user using the shared helper.
+    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
   fi
 
   local remoteKeyName
-  remoteKeyName=$( ossh.exec $sshConfigHost "ossh get.key.name" 2>/dev/null )
-  if [ -z "$remoteKeyName" ]; then
-    warn.log "Could not get remote key name from $sshConfigHost — skipping key pull"
+  # Strip ANSI escape sequences that leak into stdout when the remote's
+  # `ossh get.key.name` emits an error.log line alongside the actual name.
+  # Without this, a message like `\e[31mERROR> …\e[0m` ends up IN the
+  # captured $remoteKeyName and then as the filename passed to rsync —
+  # producing "link_stat \"/root/.ssh/public_keys/\\#033[31mERROR>.public_key\" failed".
+  remoteKeyName=$( ossh.exec $sshConfigHost "ossh get.key.name" 2>/dev/null | sed 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | tail -1 )
+  # Validate: a clean key name is a single token — no spaces, no "ERROR"/"WARN"
+  # markers. If what we got looks like a log message, treat as "no name".
+  if [ -z "$remoteKeyName" ] || echo "$remoteKeyName" | grep -qE "ERROR|WARN|[[:space:]]"; then
+    warn.log "Could not resolve remote key name from $sshConfigHost${remoteKeyName:+ (got: '$remoteKeyName')} — skipping key pull"
   else
     private.ossh.pull.key $sshConfigHost $remoteKeyName || {
       warn.log "Failed to pull key from $sshConfigHost — continuing"
@@ -694,7 +733,7 @@ ossh.install.log.completion.sshConfigHost() {
   ossh.config.get.completion "$@"
 }
 
-ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on <sshConfigHost> using shared folder model
+ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on <sshConfigHost>, delegating to the remote user.oosh.install
 {
   local sshConfigHost="$1"
   if [ -n "$1" ]; then
@@ -712,20 +751,66 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
     return 1
   fi
 
-  important.log "Setting up oosh for user '$targetUser' on $sshConfigHost (shared folder model)..."
+  important.log "Setting up oosh for user '$targetUser' on $sshConfigHost (delegating to remote user.oosh.install)..."
 
-  # 1. Create user on remote if it doesn't exist
+  # Caller's current oosh branch — passed to the remote so the target
+  # user's ~/oosh points at the same branch the caller is on.
+  local ooshBranch
+  ooshBranch=$(this.git.branch.short "$OOSH_DIR")
+  [ -z "$ooshBranch" ] && ooshBranch="${OOSH_MODE:-dev}"
+
+  # Locate the shared `user` script on the remote. We can't rely on the
+  # target user's ~/oosh/user — on a fresh install the symlink hasn't been
+  # made yet. Derive baseDir from the SSH user's own $HOME (whoever
+  # sshConfigHost resolves to) — matches the layout ossh.install.finish.local
+  # already uses at line 636 (`basehome=$(dirname $HOME)`). No hardcoded
+  # usernames — works before developking even exists.
+  local baseDir
+  baseDir=$(private.ossh.ssh "$sshConfigHost" 'dirname "$HOME"')
+  if [ -z "$baseDir" ] || [ "$baseDir" = "/" ]; then
+    # Edge case: SSH user's home is at filesystem root (e.g. root on some
+    # Linuxes lives at /root). Fall back to /home.
+    baseDir="/home"
+  fi
+  local sharedOosh="$baseDir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/$ooshBranch"
+  private.ossh.ssh "$sshConfigHost" "[ -x '$sharedOosh/user' ]" || {
+    error.log "Shared user script not found at $sharedOosh/user — run 'ossh install' (root) first"
+    return 1
+  }
+
+  # oosh's `user` script relies on `source this`, `source ossh`, etc. —
+  # those only resolve when OOSH_DIR is on PATH. When invoking the shared
+  # user script by absolute path (because the target's ~/oosh symlink
+  # doesn't exist yet), we export PATH and OOSH_DIR explicitly so the
+  # normal bootstrap succeeds.
+  local remoteInvoke="export OOSH_DIR='$sharedOosh'; export PATH='$sharedOosh':\$PATH"
+
+  # 1. Create user on remote if missing. Invoke via the shared script path
+  #    (target has no ~/oosh yet, and admin may not either on first install).
   if ! private.ossh.ssh "$sshConfigHost" "id '$targetUser'" >/dev/null 2>&1; then
     important.log "User '$targetUser' does not exist on $sshConfigHost — creating..."
-    private.ossh.ssh -tt "$sshConfigHost" "sudo bash -lc 'source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; user create $targetUser'" || {
+    private.ossh.ssh -tt "$sshConfigHost" "sudo bash -lc '$remoteInvoke; user create $targetUser'" || {
       error.log "Failed to create user '$targetUser' on $sshConfigHost"
       return 1
     }
-    # Set default password (same as username)
-    private.ossh.ssh -tt "$sshConfigHost" "sudo bash -c \"echo '$targetUser:$targetUser' | chpasswd\" 2>/dev/null || sudo -i dscl . -passwd /Users/'$targetUser' '$targetUser' 2>/dev/null || true"
   fi
 
-  # Resolve target user's home directory (may differ from $HOME if connected as different user)
+  # 2. (Re)run user.oosh.install with the caller's branch — idempotent.
+  #    `sudo bash -lc` makes us root on the remote; user.oosh.install uses
+  #    literal `sudo -H -u <target>` for user-switching (robust even when
+  #    $SUDO is empty because the caller is already root).
+  #
+  #    This is the known-flaky path on macOS (sshd + -tt sometimes drops the
+  #    ControlMaster mid-operation — see .github/workflows/macos-test.yml:124).
+  #    Treat a non-zero exit as a warning and CONTINUE to the key push. The
+  #    key push is the minimum contract this function must honour; with the
+  #    key present, the caller can SSH in afterwards and re-run `ossh install`
+  #    to converge (user.oosh.install is idempotent).
+  private.ossh.ssh -tt "$sshConfigHost" "sudo bash -lc '$remoteInvoke; user oosh.install $targetUser $ooshBranch'" || {
+    warn.log "user.oosh.install returned non-zero on $sshConfigHost for $targetUser — continuing to key push (idempotent on re-run)"
+  }
+
+  # 3. Resolve the target's home (needed for the remote key push below).
   local targetHome
   targetHome=$(private.ossh.ssh "$sshConfigHost" "
     if command -v getent >/dev/null 2>&1; then
@@ -736,204 +821,10 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
       awk -F: '\$1==\"$targetUser\" {print \$6}' /etc/passwd
     fi
   ")
-  if [ -z "$targetHome" ]; then
-    targetHome="/home/$targetUser"
-  fi
-  info.log "Target home: $targetHome"
+  [ -z "$targetHome" ] && targetHome="/home/$targetUser"
 
-  # 2. Get shared paths from developking's home (created by state machine state 21)
-  # getent is not available on macOS — use dscl as fallback
-  local devHome
-  devHome=$(private.ossh.ssh "$sshConfigHost" "if command -v getent >/dev/null 2>&1; then getent passwd developking 2>/dev/null | cut -d: -f6; else dscl . -read /Users/developking NFSHomeDirectory 2>/dev/null | cut -d' ' -f2; fi")
-  if [ -z "$devHome" ]; then
-    error.log "developking user not found on $sshConfigHost — root install may not have completed"
-    return 1
-  fi
-  local dir
-  dir=$(private.ossh.ssh "$sshConfigHost" "dirname '$devHome'")
-  local sharedConfig="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-  # Determine branch folder name from local git branch (matches what root install created)
-  local ooshBranch
-  ooshBranch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  local sharedOosh="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/$ooshBranch"
-  info.log "Shared config: $sharedConfig"
-  info.log "Shared oosh:   $sharedOosh"
-
-  # 3. Verify shared infrastructure exists
-  private.ossh.ssh "$sshConfigHost" "[ -d '$sharedOosh' ]" || {
-    error.log "Shared oosh not found at $sharedOosh — run 'ossh install $sshConfigHost' (root) first"
-    return 1
-  }
-
-  # 4-5. Remove leftover bootstrap, symlink config and oosh to shared folders
-  # Run as target user (sudo -H -u) so ~ resolves to target user's home, not SSH user's
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    cd ~
-    # Remove leftover init/oosh bootstrap file
-    if [ -f ~/oosh ] && [ ! -d ~/oosh ]; then
-      echo \"Removing leftover init/oosh bootstrap file\"
-      rm -f ~/oosh
-    fi
-    # Back up existing config if not already symlinked
-    if [ -d config ] && [ ! -L config ]; then
-      mv config config.orig
-    fi
-    if [ ! -L config ]; then
-      ln -s \"$sharedConfig\" config
-    fi
-    # Back up existing oosh dir/file if not already symlinked
-    if [ -d oosh ] && [ ! -L oosh ]; then
-      mv oosh oosh.orig
-    fi
-    if [ ! -L oosh ]; then
-      ln -s \"$sharedOosh\" oosh
-    fi
-  '" || {
-    error.log "Failed to create symlinks for $targetUser"
-    return 1
-  }
-  success.log "Symlinked ~/config and ~/oosh to shared folders for $targetUser"
-
-  # 5a1. Copy shared SSH config and deploy key to new user (SSH requires user-owned files)
-  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
-    basehome=\$(dirname \"$targetHome\")
-    [ \"\$basehome\" = / ] && basehome=/home
-    sharedSsh=\"\$basehome/shared/.ssh\"
-    if [ -f \"\$sharedSsh/config\" ]; then
-      mkdir -p \"$targetHome/.ssh\"
-      cp \"\$sharedSsh/config\" \"$targetHome/.ssh/config\" 2>/dev/null
-      cp \"\$sharedSsh/known_hosts\" \"$targetHome/.ssh/known_hosts\" 2>/dev/null
-      cp \"\$sharedSsh/2cuGitHub\" \"$targetHome/.ssh/2cuGitHub\" 2>/dev/null
-      chown \"$targetUser\" \"$targetHome/.ssh/config\" \"$targetHome/.ssh/known_hosts\" \"$targetHome/.ssh/2cuGitHub\" 2>/dev/null
-      chmod 600 \"$targetHome/.ssh/config\" \"$targetHome/.ssh/2cuGitHub\"
-      chmod 644 \"$targetHome/.ssh/known_hosts\"
-    fi
-  '" 2>/dev/null || {
-    warn.log "Could not copy SSH config for $targetUser — continuing"
-  }
-
-  # 5a2. Mark shared oosh as safe directory for git (owned by root, used by non-root user)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    resolved=\"$sharedOosh\"
-    if command -v osascript >/dev/null 2>&1; then
-      resolved=\$(osascript -e \"POSIX path of (POSIX file \\\"\$resolved\\\" as alias)\" 2>/dev/null | sed \"s:/$::\") || resolved=\"$sharedOosh\"
-    fi
-    git config --global --add safe.directory \"\$resolved\"
-  '"
-
-  # 5b. Add user to dev group for shared config write access
-  # usermod may be in /usr/sbin which is not in PATH on Debian
-  # macOS uses dseditgroup instead of usermod/addgroup
-  private.ossh.ssh -tt "$sshConfigHost" "
-    if command -v dseditgroup >/dev/null 2>&1; then
-      sudo dseditgroup -o edit -a '$targetUser' -t user dev 2>/dev/null
-    else
-      _usermod=\$(command -v usermod 2>/dev/null || echo /usr/sbin/usermod)
-      if [ -x \"\$_usermod\" ]; then
-        sudo \"\$_usermod\" -aG dev '$targetUser'
-      elif command -v addgroup >/dev/null 2>&1; then
-        sudo addgroup '$targetUser' dev
-      fi
-    fi
-  " 2>/dev/null || {
-    warn.log "Could not add $targetUser to dev group — shared config may be read-only"
-  }
-
-  # 5c. Add user to docker group if Docker CLI is installed (socket access)
-  private.ossh.ssh "$sshConfigHost" "
-    if command -v docker >/dev/null 2>&1; then
-      if command -v usermod >/dev/null 2>&1 || [ -x /usr/sbin/usermod ]; then
-        _usermod=\$(command -v usermod 2>/dev/null || echo /usr/sbin/usermod)
-        sudo \"\$_usermod\" -aG docker '$targetUser' 2>/dev/null
-      elif command -v addgroup >/dev/null 2>&1; then
-        sudo addgroup '$targetUser' docker 2>/dev/null
-      fi
-    fi
-  " 2>/dev/null
-
-  # 5d. macOS: add user to com.apple.access_ssh group (required for SSH login)
-  if private.ossh.ssh "$sshConfigHost" "command -v dseditgroup >/dev/null 2>&1"; then
-    private.ossh.ssh "$sshConfigHost" "
-      sudo dseditgroup -o create -q com.apple.access_ssh 2>/dev/null
-      sudo dseditgroup -o edit -a '$targetUser' -t user com.apple.access_ssh
-    " 2>/dev/null || {
-      warn.log "Could not add $targetUser to com.apple.access_ssh — SSH access may be denied on macOS"
-    }
-  fi
-
-  # 6. Install bashrcTemplate (or append source line)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    if [ -f ~/.bashrc ] && [ ! -f ~/.bashrc.pre-oosh ]; then
-      cp ~/.bashrc ~/.bashrc.pre-oosh
-    fi
-    if [ -f ~/oosh/templates/user/bashrcTemplate ]; then
-      cp ~/oosh/templates/user/bashrcTemplate ~/.bashrc
-    else
-      if ! grep -q \"config/user.env\" ~/.bashrc 2>/dev/null; then
-        echo \"\" >> ~/.bashrc
-        echo \"# oosh environment\" >> ~/.bashrc
-        echo \"[ -f ~/config/user.env ] && source ~/config/user.env\" >> ~/.bashrc
-      fi
-    fi
-  '" || {
-    warn.log "Failed to update .bashrc for $targetUser"
-  }
-
-  # 6a2. Ensure .bash_profile sources .bashrc (login shells skip .bashrc without it)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    if [ ! -f ~/.bash_profile ]; then
-      echo \"[ -f ~/.bashrc ] && source ~/.bashrc\" > ~/.bash_profile
-    fi
-  '"
-
-  # 6b. Ensure login shell is bash (Alpine defaults to ash)
-  private.ossh.ssh -tt "$sshConfigHost" "
-    if command -v dscl >/dev/null 2>&1; then
-      currentShell=\$(dscl . -read /Users/'$targetUser' UserShell 2>/dev/null | awk '{print \$2}')
-    else
-      currentShell=\$(getent passwd '$targetUser' 2>/dev/null | cut -d: -f7)
-    fi
-    # Prefer BASH_FILE from user.env (points to brew bash on macOS)
-    userHome=\$(eval echo ~'$targetUser')
-    if [ -f \"\$userHome/config/user.env\" ]; then
-      bashPath=\$(grep '^export BASH_FILE=' \"\$userHome/config/user.env\" | head -1 | cut -d'\"' -f2)
-    fi
-    [ -z \"\$bashPath\" ] && bashPath=\$(command -v bash 2>/dev/null)
-    if [ -n \"\$bashPath\" ] && [ \"\$currentShell\" != \"\$bashPath\" ]; then
-      if command -v chsh >/dev/null 2>&1; then
-        sudo chsh -s \"\$bashPath\" '$targetUser'
-      else
-        # Fallback for Alpine (no chsh): edit /etc/passwd directly
-        sudo sed -i \"s|^$targetUser:\\(.*\\):[^:]*\\\$|$targetUser:\\1:\$bashPath|\" /etc/passwd
-      fi
-    fi
-  " 2>/dev/null || {
-    warn.log "Could not set bash as login shell for $targetUser"
-  }
-
-  # 6c. Add git safe.directory for shared oosh repo (owned by root/developking)
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    resolved=\"$sharedOosh\"
-    if command -v osascript >/dev/null 2>&1; then
-      resolved=\$(osascript -e \"POSIX path of (POSIX file \\\"\$resolved\\\" as alias)\" 2>/dev/null | sed \"s:/$::\") || resolved=\"$sharedOosh\"
-    fi
-    git config --global --add safe.directory \"\$resolved\"
-  '" || {
-    warn.log "Failed to add git safe.directory for $targetUser"
-  }
-
-  # 7. Verify state machine from user's perspective
-  private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
-    if [ -f ~/config/user.env ] && [ -f ~/config/current.state.machine.env ]; then
-      source ~/config/user.env 2>/dev/null
-      source ~/config/current.state.machine.env 2>/dev/null
-      echo \"State machine SETUP_SERVER at [\${state:-unknown}] for user \$(whoami)\"
-    fi
-  '" || {
-    warn.log "State machine verification skipped for $targetUser"
-  }
-
-  # 8. Create SSH key folders
+  # 4. Prep the target's key folders and generate id_rsa if missing.
+  #    (Remote-specific — not part of user.oosh.install's responsibilities.)
   private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' bash -c '
     if [ ! -d ~/.ssh ]; then
       mkdir -p ~/.ssh
@@ -946,7 +837,9 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
     warn.log "Failed to create SSH key folders for $targetUser"
   }
 
-  # 9. Push local public key to user's authorized_keys
+  # 5. Push the CALLER's public key into the TARGET's authorized_keys so
+  #    the caller can SSH in directly as the target user afterwards.
+  #    Remote-specific — no local analogue.
   local keyFile="$HOME/.ssh/public_keys/$( private.ossh.get.file.name ).public_key"
   if [ -f "$keyFile" ]; then
     private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' mkdir -p $targetHome/.ssh/public_keys"
@@ -1454,19 +1347,25 @@ ossh.config.save.last() {  # <?file> # appends the config to file
   important.log "appended last config to $file"
 }
 
-ossh.config.shared.create() # <?sharedDir> # create shared SSH config with 2cuGitHub alias
+ossh.config.shared.create() # <?sharedDir> <?deployKeySrc:$HOME/.ssh/deploy_keys/2cuGitHub> # create shared SSH config + 2cuGitHub alias seeded from <deployKeySrc> (target-side callers like state 31 pass ~developking/.ssh/id_rsa)
 {
   local basehome
   basehome="$(dirname "$HOME")"
   [ "$basehome" = / ] && basehome=/home
   local sharedDir="${1:-$basehome/shared/.ssh}"
+  # Source path defaults to caller-side deploy_keys location. Passing an
+  # alternative (e.g. ~developking/.ssh/id_rsa) lets this method also be
+  # invoked from the target-side during state 31, where the caller's
+  # ~/.ssh/deploy_keys/2cuGitHub doesn't exist but developking's in-place
+  # id_rsa does (populated from test.wo-da.de templates or local
+  # $OOSH_DIR/templates/user/developking.ssh/).
+  local deployKeySrc="${2:-$HOME/.ssh/deploy_keys/2cuGitHub}"
 
   # Create shared SSH directory
   mkdir -p "$sharedDir"
   chmod 700 "$sharedDir"
 
   # Copy deploy key if not already present
-  local deployKeySrc="$HOME/.ssh/deploy_keys/2cuGitHub"
   local deployKeyDst="$sharedDir/2cuGitHub"
   if [ ! -f "$deployKeyDst" ]; then
     if [ ! -f "$deployKeySrc" ]; then
@@ -1476,7 +1375,7 @@ ossh.config.shared.create() # <?sharedDir> # create shared SSH config with 2cuGi
     fi
     cp "$deployKeySrc" "$deployKeyDst"
     chmod 600 "$deployKeyDst"
-    success.log "Deploy key copied to $deployKeyDst"
+    success.log "Deploy key copied to $deployKeyDst (from $deployKeySrc)"
   fi
 
   # Create SSH config using existing oosh methods (idempotent)
@@ -1501,6 +1400,12 @@ ossh.config.shared.create() # <?sharedDir> # create shared SSH config with 2cuGi
 }
 ossh.config.shared.create.completion.sharedDir() {
   compgen -d "$1"
+}
+ossh.config.shared.create.completion.deployKeySrc() {
+  # Completes a path to an SSH private key. Tab-completes files; the
+  # common values are $HOME/.ssh/deploy_keys/2cuGitHub (caller-side) and
+  # ~developking/.ssh/id_rsa (target-side state-31 flow).
+  compgen -f "$1"
 }
 
 ossh.config.shared.link() # <?user> <?sharedDir> # link user SSH config to shared config
@@ -1559,6 +1464,54 @@ ossh.config.shared.link.completion.user() {
 }
 ossh.config.shared.link.completion.sharedDir() {
   compgen -d "$1"
+}
+
+private.ossh.shared.ssh.copy.to.all() # <sshConfigHost> # on <sshConfigHost>, copy /home/shared/.ssh/{config,known_hosts,2cuGitHub} to every existing user's ~/.ssh/ with owner=user (login group), perms 700/600/644. Single source of truth for the per-user propagation step shared by ossh.install.finish.local's caller-side path and its developking-fallback else branch.
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+
+  # One SSH roundtrip, sudo-wrapped remote bash. Files in /home/shared/.ssh/
+  # are assumed to already exist (seeded by either the caller's deploy_keys
+  # push or the developking fallback). If the shared key is missing, exit
+  # quietly — this method is idempotent/no-op in that case.
+  #
+  # `chown $u:` (trailing colon, no group) sets the group to the user's
+  # login group whatever it's named. Robust against platform.test containers
+  # where `test` has gid=0 and no `test` group exists; explicit `$u:$u`
+  # would error with "invalid group".
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    basehome=\$(dirname \"\$HOME\")
+    [ \"\$basehome\" = / ] && basehome=/home
+    sharedSsh=\"\$basehome/shared/.ssh\"
+    [ -f \"\$sharedSsh/2cuGitHub\" ] || exit 0
+    for u in \$(ls \"\$basehome\" 2>/dev/null | grep -v shared); do
+      h=\"\$basehome/\$u\"
+      [ -d \"\$h\" ] || continue
+      mkdir -p \"\$h/.ssh\"
+      cp \"\$sharedSsh/config\" \"\$h/.ssh/config\" 2>/dev/null
+      cp \"\$sharedSsh/known_hosts\" \"\$h/.ssh/known_hosts\" 2>/dev/null
+      cp \"\$sharedSsh/2cuGitHub\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
+      chown \"\$u:\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
+      chmod 700 \"\$h/.ssh\"
+      chmod 600 \"\$h/.ssh/config\" \"\$h/.ssh/2cuGitHub\"
+      chmod 644 \"\$h/.ssh/known_hosts\"
+    done
+    rootHome=\$(eval echo ~root)
+    if [ -d \"\$rootHome\" ]; then
+      mkdir -p \"\$rootHome/.ssh\"
+      cp \"\$sharedSsh/config\" \"\$rootHome/.ssh/config\" 2>/dev/null
+      cp \"\$sharedSsh/known_hosts\" \"\$rootHome/.ssh/known_hosts\" 2>/dev/null
+      cp \"\$sharedSsh/2cuGitHub\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
+      chown root: \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/known_hosts\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
+      chmod 700 \"\$rootHome/.ssh\"
+      chmod 600 \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/2cuGitHub\"
+      chmod 644 \"\$rootHome/.ssh/known_hosts\"
+    fi
+  '" 2>/dev/null
 }
 
 ossh.config.edit() # <?file> # opens the config file in an editor
@@ -2160,6 +2113,177 @@ ossh.exec.tty.completion() {
   ossh.config.get.completion "$@"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Remote package-management primitives. Local counterparts are `oo pm.discover`
+# (oo:1808) and `oo cmd` (oo:1672). Same philosophy: detect PM, install if
+# missing, idempotent on second call. PM detection order and install-command
+# strings mirror private.check.all.pm (oo:1856-1864) byte-for-byte so local
+# and remote behaviours agree.
+# ─────────────────────────────────────────────────────────────────────────────
+ossh.pm.discover() # <sshConfigHost> # detect the package manager on the remote host and echo its install-command
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "ossh.pm.discover: no sshConfigHost specified"; return 1; }
+
+  private.ossh.ssh "$host" 'for pm in brew apt-get dnf yum apk pacman pkg; do
+    if command -v "$pm" >/dev/null 2>&1; then
+      case "$pm" in
+        brew)    echo "brew install" ;;
+        apt-get) echo "apt-get -y install" ;;
+        dnf|yum) echo "$pm -y install" ;;
+        apk)     echo "apk add" ;;
+        pacman)  echo "pacman -S --noconfirm" ;;
+        pkg)     echo "pkg install -y" ;;
+      esac
+      break
+    fi
+  done'
+}
+ossh.pm.discover.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.cmd() # <sshConfigHost> <pkg> # install pkg on the remote host if missing — remote counterpart of oo cmd
+{
+  local host="$1" pkg="$2"
+  [ -z "$host" ] && { error.log "ossh.cmd: no sshConfigHost specified"; return 1; }
+  [ -z "$pkg"  ] && { error.log "ossh.cmd: no package specified"; return 1; }
+
+  # Short-circuit if already present — matches `oo cmd`'s idempotency.
+  if private.ossh.ssh "$host" "command -v '$pkg' >/dev/null 2>&1" 2>/dev/null; then
+    info.log "$pkg already on $host"
+    return 0
+  fi
+
+  local pmCmd
+  pmCmd=$(ossh.pm.discover "$host")
+  if [ -z "$pmCmd" ]; then
+    error.log "ossh.cmd: no known package manager on $host"
+    return 1
+  fi
+
+  # apt-get needs `update` before first install on freshly-pulled images
+  # (cached repo metadata may be missing). Cheap no-op on already-updated
+  # boxes. Let stdout/stderr through so sudo's password prompt is visible
+  # when the remote's ssh user doesn't have NOPASSWD — silencing this
+  # used to silently hang waiting for a password nobody knew to type.
+  case "$pmCmd" in
+    apt-get*) private.ossh.ssh -tt "$host" "sudo apt-get update" || true ;;
+  esac
+
+  important.log "Installing '$pkg' on $host via: $pmCmd"
+  private.ossh.ssh -tt "$host" "sudo $pmCmd $pkg"
+}
+ossh.cmd.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+ossh.cmd.completion.pkg() {
+  compgen -W "bash curl git wget tree expect python3 jq" -- "$1"
+}
+
+ossh.prereqs.install() # <sshConfigHost> # install the oosh install-time prereqs on the remote host (curl, git; macOS hosts without brew get Homebrew bootstrapped first; apk hosts also get bash + shadow + util-linux + busybox suid; brew hosts also get bash + /etc/paths.d/oosh-homebrew)
+{
+  local host="$1"
+  [ -z "$host" ] && { error.log "ossh.prereqs.install: no sshConfigHost specified"; return 1; }
+
+  # Base prereqs every supported package manager needs.
+  local pkgs="curl git"
+
+  # Per-PM additions:
+  #   apk: ships only busybox + ash; oosh needs bash for its shebangs, shadow
+  #        for useradd/chpasswd (busybox `adduser` differs in flags), and
+  #        util-linux for runuser (used by `os platform.test` for user-switching).
+  #   brew: macOS /bin/bash is 3.2 (Apple's last GPLv2 release); oosh requires
+  #        bash 4+. Brew bash lands at /opt/homebrew/bin/bash — paths.d wiring
+  #        below ensures non-interactive ssh sessions actually find it.
+  # Detect by querying the remote's package-manager command — same primitive
+  # ossh.cmd uses to dispatch installs.
+  local pmCmd
+  pmCmd=$(ossh.pm.discover "$host")
+
+  # macOS bootstrap: naked images (cirruslabs/macos-sequoia-base, fresh tart
+  # clones, etc.) ship with neither brew nor any other PM, so ossh.pm.discover
+  # echoes nothing and the install loop below would silently no-op — bash 4+
+  # would never land and the next `ossh install <host>` would still abort at
+  # the bash prereq check. Bootstrap Homebrew non-interactively first so we
+  # have a PM to install bash 4+ with. Apple Silicon → /opt/homebrew/bin/brew;
+  # Intel → /usr/local/bin/brew. Either way a fresh non-interactive ssh PATH
+  # won't see brew yet (paths.d wiring happens further down), so re-detect by
+  # probing the binaries directly rather than calling ossh.pm.discover again.
+  if [ -z "$pmCmd" ] && private.ossh.ssh "$host" '[ "$(uname -s)" = "Darwin" ]' 2>/dev/null; then
+    important.log "bootstrapping Homebrew on $host (no PM detected on macOS) — this may take several minutes"
+    private.ossh.ssh -tt "$host" \
+      'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
+      || { error.log "Homebrew bootstrap failed on $host"; return 1; }
+    if private.ossh.ssh "$host" '[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]' 2>/dev/null; then
+      pmCmd="brew install"
+    else
+      error.log "Homebrew bootstrap reported success but brew binary not found at /opt/homebrew/bin or /usr/local/bin on $host"
+      return 1
+    fi
+  fi
+
+  case "$pmCmd" in
+    "apk add"*) pkgs="$pkgs bash shadow util-linux" ;;
+    # NB: brew's bash add is handled in the post-install hook below, not via
+    # the pkgs list. ossh.cmd's idempotency check (`command -v bash`) would
+    # short-circuit because macOS always ships /bin/bash 3.2 — the right
+    # check is "is /opt/homebrew/bin/bash 4+ present", not "is any bash present."
+  esac
+
+  local pkg rc=0
+  for pkg in $pkgs; do
+    ossh cmd "$host" "$pkg" || { error.log "failed to install $pkg on $host"; rc=1; }
+  done
+
+  # Per-PM post-install hooks:
+  case "$pmCmd" in
+    "apk add"*)
+      # Alpine: /bin/busybox is what /bin/su symlinks to. Naked alpine images
+      # ship busybox at mode 0755 (not suid); without the suid bit, non-root
+      # users can't run `su -`, which breaks `user login <other-user>` from a
+      # regular user's shell with "su: must be suid to work properly". Real
+      # alpine deployments typically ship busybox suid by default — restore
+      # that posture so user.login's `env -i su - "$1"` works after install.
+      private.ossh.ssh -tt "$host" "sudo chmod u+s /bin/busybox" \
+        || warn.log "could not set suid on /bin/busybox on $host — 'user login' from non-root will fail until set manually"
+    ;;
+    "brew install"*)
+      # 1) Install brew bash 4+ if absent. ossh.cmd's `command -v bash`
+      # idempotency check would always succeed (macOS ships /bin/bash 3.2),
+      # so we bypass it and check the brew-prefix path directly.
+      if ! private.ossh.ssh "$host" "[ -x /opt/homebrew/bin/bash ] || [ -x /usr/local/bin/bash ]" 2>/dev/null; then
+        # Source `brew shellenv` inline so `brew` is on PATH even when this
+        # ssh session isn't a login shell — macOS sshd builds PATH from
+        # launchd's hardcoded /usr/bin:/bin:/usr/sbin:/sbin and only
+        # consumes /etc/paths.d via path_helper from /etc/zprofile (login
+        # shells). Right after the Homebrew bootstrap above, the user's
+        # .zprofile entry doesn't help non-interactive sessions either.
+        # Try Apple Silicon prefix first, fall back to Intel.
+        private.ossh.ssh -tt "$host" \
+          'eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)" && brew install bash' \
+          || { error.log "failed to install brew bash on $host"; rc=1; }
+      else
+        info.log "brew bash 4+ already on $host"
+      fi
+      # 2) Wire /etc/paths.d/oosh-homebrew. macOS sshd builds non-interactive
+      # PATH via path_helper, which reads /etc/paths + /etc/paths.d/*.
+      # /opt/homebrew/bin is NOT in either by default, so even with brew
+      # bash on disk, ssh-exec'd shebangs (#!/usr/bin/env bash) resolve to
+      # /bin/bash 3.2 and fail oosh's bash-4+ prereq. Wiring it once via
+      # paths.d benefits every non-interactive ssh session on the host.
+      private.ossh.ssh -tt "$host" "echo /opt/homebrew/bin | sudo tee /etc/paths.d/oosh-homebrew >/dev/null && sudo chmod 644 /etc/paths.d/oosh-homebrew" \
+        || warn.log "could not wire /etc/paths.d/oosh-homebrew on $host — non-interactive ssh sessions may not find brew bash"
+    ;;
+  esac
+
+  [ "$rc" -eq 0 ] && success.log "prereqs installed on $host — now run: ossh install $host"
+  return $rc
+}
+ossh.prereqs.install.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
 ossh.test() {
   this.isSourced
   echo this.isSourced=$?
@@ -2206,6 +2330,303 @@ ossh.usage()
 
   "
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HARDENING — Debian/Ubuntu remote server hardening, invoked AFTER ossh install.
+# Each sub-method is independently callable; `ossh.harden` chains the five
+# that are safe-by-default. `ossh.harden.sshd.allowusers` is opt-in (empty or
+# wrong AllowUsers list locks unlisted users out).
+# ═══════════════════════════════════════════════════════════════════════════
+
+private.ossh.harden.preflight() # <sshConfigHost> # fail-fast if the remote isn't Debian/Ubuntu, or if key-auth isn't already working
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+
+  # Refuse to proceed if we can't reach the remote non-interactively.
+  # After hardening, PasswordAuthentication will be off; if the caller can
+  # only connect via password today, running harden would lock them out.
+  # NOTE: single-arg form `-oBatchMode=yes` (no space). private.ossh.ssh's
+  # flag parser only consumes args that start with `-`, so `-o BatchMode=yes`
+  # (two args) would have `BatchMode=yes` treated as the host.
+  if ! private.ossh.ssh -oBatchMode=yes "$sshConfigHost" true 2>/dev/null; then
+    error.log "ossh.harden preflight: cannot SSH to $sshConfigHost in BatchMode (no working key). Aborting — hardening would disable password auth and lock you out. Fix your SSH key setup first."
+    return 1
+  fi
+
+  # Detect remote OS family. os.check only inspects the local caller, so we
+  # probe the remote directly — a macOS laptop hardening a Linux VPS is a
+  # normal flow.
+  local remoteOs
+  remoteOs=$(private.ossh.ssh "$sshConfigHost" "uname -s" 2>/dev/null | tr -d '\r\n')
+  if [ "$remoteOs" != "Linux" ]; then
+    error.log "ossh.harden preflight: remote uname -s returned '$remoteOs' — only Linux (Debian/Ubuntu) is supported. Aborting."
+    return 1
+  fi
+
+  local remoteId
+  remoteId=$(private.ossh.ssh "$sshConfigHost" ". /etc/os-release 2>/dev/null && echo \$ID" 2>/dev/null | tr -d '\r\n')
+  case "$remoteId" in
+    debian|ubuntu)
+      info.log "ossh.harden preflight: remote is $remoteId — supported"
+      return 0
+      ;;
+    *)
+      error.log "ossh.harden preflight: remote /etc/os-release ID='$remoteId' — only 'debian' or 'ubuntu' are supported. Aborting."
+      return 1
+      ;;
+  esac
+}
+
+ossh.harden.packages() # <sshConfigHost> # install unattended-upgrades, fail2ban, ufw, htop, nano, bzip2 on the remote (Debian/Ubuntu only)
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.packages: apt update + install on $sshConfigHost"
+  private.ossh.ssh -tt "$sshConfigHost" "sudo bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update &&
+    apt-get -y dist-upgrade &&
+    apt-get -y install unattended-upgrades fail2ban ufw htop nano bzip2
+  '"
+}
+
+ossh.harden.packages.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.unattended.upgrades() # <sshConfigHost> # configure unattended-upgrades: enable, auto-remove unused kernels/deps, reboot at 02:30
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.unattended.upgrades: writing 20auto-upgrades + 51-oosh-unattended-upgrades on $sshConfigHost"
+
+  # The original script used `dpkg-reconfigure --priority=low` for
+  # 20auto-upgrades — that's an interactive TUI. We write the same file
+  # directly, and drop our own settings into 51-oosh-unattended-upgrades
+  # (prefixed `51-` so it loads AFTER any 50-defaults). Idempotent: any
+  # previous identical content is just rewritten, and the per-line grep
+  # guards on the drop-in prevent duplicate appends.
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    cat >/etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists \"1\";
+APT::Periodic::Unattended-Upgrade \"1\";
+EOF
+    for line in \
+      '\''Unattended-Upgrade::Remove-Unused-Kernel-Packages \"true\";'\'' \
+      '\''Unattended-Upgrade::Remove-New-Unused-Dependencies \"true\";'\'' \
+      '\''Unattended-Upgrade::Remove-Unused-Dependencies \"true\";'\'' \
+      '\''Unattended-Upgrade::Automatic-Reboot \"true\";'\'' \
+      '\''Unattended-Upgrade::Automatic-Reboot-Time \"02:30\";'\'' \
+    ; do
+      grep -qF \"\$line\" /etc/apt/apt.conf.d/51-oosh-unattended-upgrades 2>/dev/null \
+        || echo \"\$line\" >>/etc/apt/apt.conf.d/51-oosh-unattended-upgrades
+    done
+  '"
+}
+
+ossh.harden.unattended.upgrades.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.fail2ban() # <sshConfigHost> # enable fail2ban with a minimal [sshd] jail using iptables-multiport
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.fail2ban: writing jail.local + enabling service on $sshConfigHost"
+
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    cat >/etc/fail2ban/jail.local <<EOF
+[sshd]
+enabled = true
+banaction = iptables-multiport
+EOF
+    # Prefer systemctl on real VPS; fall back to SysV service for containers
+    # or hosts without systemd running. jail.local is written regardless —
+    # only the live-service activation varies.
+    (systemctl enable fail2ban >/dev/null 2>&1 && systemctl restart fail2ban >/dev/null 2>&1) \
+      || service fail2ban restart >/dev/null 2>&1 \
+      || echo \"note: could not start fail2ban service (no init system); jail.local written\"
+  '"
+}
+
+ossh.harden.fail2ban.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.firewall() # <sshConfigHost> <?extraPorts> # UFW: default deny-in / allow-out, always allow OpenSSH; extraPorts is a space-separated list of additional ports to open (e.g. "8080/tcp 8443/tcp")
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  shift
+  local extraPorts="$*"
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.firewall: configuring UFW on $sshConfigHost (extraPorts: ${extraPorts:-none})"
+
+  # ORDER MATTERS: allow OpenSSH BEFORE enabling UFW, or enable locks you
+  # out mid-session. `ufw --force enable` skips the interactive
+  # "Y/n proceed?" prompt — safe because OpenSSH is already allowed.
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow OpenSSH
+    for port in $extraPorts; do
+      [ -n \"\$port\" ] && ufw allow \"\$port\"
+    done
+    # ufw --force enable can fail inside containers without NET_ADMIN
+    # (iptables-restore returns \"Permission denied\"). Rules are still
+    # written to /etc/ufw/user.rules — a real VPS (where this matters)
+    # will apply them. Note + continue so the rest of harden still runs.
+    ufw --force enable \
+      || echo \"note: ufw could not apply live rules (container without NET_ADMIN?); rules written to /etc/ufw/\"
+    ufw status verbose 2>/dev/null || true
+  '"
+}
+
+ossh.harden.firewall.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+ossh.harden.firewall.completion.extraPorts() {
+  # Suggest common "<port>/<proto>" tokens. Users type a space-separated
+  # list (e.g. "8080/tcp 8443/tcp"); compgen completes the current word.
+  compgen -W "22/tcp 53/udp 80/tcp 443/tcp 8080/tcp 8443/tcp 3000/tcp 5432/tcp 5984/tcp 6379/tcp 8000/tcp 9000/tcp" -- "$1"
+}
+
+ossh.harden.sshd() # <sshConfigHost> # harden sshd_config: no root, no password, keys only, no forwarding, max 4 auth tries. Does NOT touch AllowUsers — use ossh.harden.sshd.allowusers for that (opt-in to avoid locking users out)
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden.sshd: applying sshd_config hardening toggles on $sshConfigHost"
+
+  # `systemctl reload sshd` is safe: active sessions (including ours)
+  # survive a reload; only NEW connections see the new policy.
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    sed -i -e \"/^\\(#\\|\\)PermitRootLogin/s/^.*\\\$/PermitRootLogin no/\"                               /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)PasswordAuthentication/s/^.*\\\$/PasswordAuthentication no/\"                 /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)KbdInteractiveAuthentication/s/^.*\\\$/KbdInteractiveAuthentication no/\"     /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)ChallengeResponseAuthentication/s/^.*\\\$/ChallengeResponseAuthentication no/\" /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)MaxAuthTries/s/^.*\\\$/MaxAuthTries 4/\"                                       /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)AllowTcpForwarding/s/^.*\\\$/AllowTcpForwarding no/\"                         /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)X11Forwarding/s/^.*\\\$/X11Forwarding no/\"                                    /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)AllowAgentForwarding/s/^.*\\\$/AllowAgentForwarding no/\"                     /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)AuthorizedKeysFile/s|^.*\\\$|AuthorizedKeysFile .ssh/authorized_keys|\"        /etc/ssh/sshd_config
+    sed -i -e \"/^\\(#\\|\\)PubkeyAuthentication/s/^.*\\\$/PubkeyAuthentication yes/\"                    /etc/ssh/sshd_config
+    # Reload sshd to pick up the new config. Try systemctl (ubuntu names
+    # the unit \"ssh\" or \"sshd\"), fall back to SysV service, last-ditch
+    # SIGHUP the sshd master process directly.
+    systemctl reload ssh  >/dev/null 2>&1 \
+      || systemctl reload sshd >/dev/null 2>&1 \
+      || service ssh reload  >/dev/null 2>&1 \
+      || service sshd reload >/dev/null 2>&1 \
+      || pkill -HUP -x sshd   2>/dev/null \
+      || echo \"note: sshd_config updated but live reload failed — restart sshd manually for changes to take effect\"
+  '"
+}
+
+ossh.harden.sshd.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.harden.sshd.allowusers() # <sshConfigHost> <users> # restrict sshd to the given comma- or space-separated user list (appends AllowUsers line). OPT-IN: not invoked by ossh.harden. Include EVERY user who needs SSH access (developking, the ssh-config user, any other sudoer) — unlisted users will be locked out.
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  shift
+  local users="$*"
+  if [ -z "$users" ]; then
+    error.log "no ${YELLOW}users${NORMAL} were specified — refusing to run (empty AllowUsers would lock everyone out)"
+    return 1
+  fi
+  users=$(echo "$users" | tr ',' ' ')
+
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  warn.log "ossh.harden.sshd.allowusers: restricting SSH to: $users — anyone not in this list will be locked out"
+
+  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
+    if grep -q \"^AllowUsers \" /etc/ssh/sshd_config; then
+      sed -i -e \"s|^AllowUsers .*|AllowUsers $users|\" /etc/ssh/sshd_config
+    else
+      echo \"AllowUsers $users\" >> /etc/ssh/sshd_config
+    fi
+    # Reload sshd (same fallback chain as ossh.harden.sshd above)
+    systemctl reload ssh  >/dev/null 2>&1 \
+      || systemctl reload sshd >/dev/null 2>&1 \
+      || service ssh reload  >/dev/null 2>&1 \
+      || service sshd reload >/dev/null 2>&1 \
+      || pkill -HUP -x sshd   2>/dev/null \
+      || echo \"note: AllowUsers line updated but live sshd reload failed\"
+  '"
+}
+
+ossh.harden.sshd.allowusers.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+ossh.harden.sshd.allowusers.completion.users() {
+  # Completes a space-separated list of local usernames. Uses the
+  # already-defined `user.list` helper (see user:~1070) — same source
+  # other `<method>.completion.username` helpers use.
+  user.list 2>/dev/null | grep -i "^${1:-}" 2>/dev/null
+}
+
+ossh.harden() # <sshConfigHost> # orchestrator — run all harden.* sub-methods on <sshConfigHost>. Invoke AFTER `ossh install` has set up users and pushed keys. Skip the AllowUsers restriction by default (use `ossh harden.sshd.allowusers` explicitly if you want it).
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+  private.ossh.harden.preflight "$sshConfigHost" || return 1
+
+  important.log "ossh.harden: hardening $sshConfigHost (packages → unattended-upgrades → fail2ban → firewall → sshd)"
+
+  ossh.harden.packages              "$sshConfigHost"  || { error.log "packages step failed";              return 1; }
+  ossh.harden.unattended.upgrades   "$sshConfigHost"  || { error.log "unattended-upgrades step failed";  return 1; }
+  ossh.harden.fail2ban              "$sshConfigHost"  || { error.log "fail2ban step failed";              return 1; }
+  ossh.harden.firewall              "$sshConfigHost"  || { error.log "firewall step failed";              return 1; }
+  ossh.harden.sshd                  "$sshConfigHost"  || { error.log "sshd step failed";                  return 1; }
+
+  success.log "ossh.harden complete on $sshConfigHost"
+  info.log   "Note: AllowUsers is NOT set — if you want to restrict SSH to specific users, run:"
+  info.log   "  ossh harden.sshd.allowusers $sshConfigHost <user1> <user2> …"
+  info.log   "Include every user who should retain SSH access (e.g. developking and the ssh-config user)."
+}
+
+ossh.harden.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
 
 ossh.start()
 {
