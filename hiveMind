@@ -572,7 +572,16 @@ private.hiveMind.monitor.switch() { # <paneTarget> # auto-switch tronMonitor to 
   local pane="$1"
   [ -z "$pane" ] && return
   local session="${pane%%:*}"
-  "tronMonitor" switch "$session" >/dev/null 2>&1 || true
+  # SM-reported bug: tronMonitor switch could hang/crash during screen auto-recovery
+  # after D1.6 — an agent.monitor call would stall, blocking PERMISSION inspection.
+  # Bound the call at 2s and swallow ALL failures (including signals). A failed
+  # visual switch is a UX nicety; it must never block callers like agent.monitor.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 2 "tronMonitor" switch "$session" >/dev/null 2>&1
+  else
+    "tronMonitor" switch "$session" >/dev/null 2>&1
+  fi
+  return 0
 }
 
 private.hiveMind.pane.activity() {
@@ -1184,7 +1193,7 @@ hiveMind.status() # <?session> # show team status for one or all sessions (falls
     printf "  ${BOLD_WHITE}%-30s${NORMAL} ${GRAY}%s${NORMAL}\n" "$sess" "${desc:-(no description)}"
   done < "$teamsFile"
   echo ""
-  echo -e "${GRAY}Start with:${NORMAL}  hiveMind teams.restore --fork"
+  echo -e "${GRAY}Start with:${NORMAL}  hiveMind teams.restore fork"
   echo -e "${GRAY}Restart one:${NORMAL}  hiveMind team.restart <configDir>"
   echo -e "${GRAY}Pull remote:${NORMAL}  hiveMind team.pull <host>"
   return 0
@@ -1793,13 +1802,55 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
   return 0
 }
 
-hiveMind.teams.save() # # snapshot all Claude processes for restore after restart
+private.hiveMind.pane.kind() # <paneTarget> # classify pane: claude | shell | monitor | unknown
+{
+  local target="$1"
+  [ -z "$target" ] && { echo unknown; return 0; }
+  local cmd
+  cmd=$(otmux pane.get "$target" '#{pane_current_command}' 2>/dev/null)
+  case "$cmd" in
+    node|claude) echo claude ;;
+    bash|zsh|sh|fish)
+      # bash/zsh parent could be hiding Claude; check via Model
+      if "$OOSH_DIR/claudeCode" process.running "$target" 2>/dev/null; then
+        echo claude
+      else
+        echo shell
+      fi
+      ;;
+    screen|screen-256color) echo monitor ;;
+    *) echo unknown ;;
+  esac
+}
+
+private.hiveMind.pane.model() # <paneTarget> # extract model flag from running claude's ps args
+{
+  local target="$1"
+  [ -z "$target" ] && return 0
+  local wrapperPid
+  wrapperPid=$("$OOSH_DIR/claudeCode" process.find "$target" 2>/dev/null)
+  [ -z "$wrapperPid" ] && return 0
+
+  # process.find returns the bash wrapper PID (claudeCode ...). The actual
+  # `claude --model X --resume UUID` is a child process. Walk children.
+  local childPid
+  childPid=$(pgrep -P "$wrapperPid" 2>/dev/null | head -1)
+  # Try the child first, fall back to wrapper (in case direct claude invocation)
+  local args
+  args=$(ps -p "${childPid:-$wrapperPid}" -o args= 2>/dev/null)
+  [ -z "$args" ] && [ -n "$wrapperPid" ] && args=$(ps -p "$wrapperPid" -o args= 2>/dev/null)
+  # Match claude-<model>-<version>[1m]? from --model flag
+  echo "$args" | grep -oE 'claude-(opus|sonnet|haiku)-[0-9a-z-]+(\[[0-9]+m\])?' | head -1
+}
+
+hiveMind.teams.save() # # snapshot all Claude processes + layout for cold-restart (schema: sess|addr|role|uuid|title|cwd|model|kind)
 {
   local configPath="${CONFIG_PATH:-$HOME/config}"
   local outfile="${configPath}/hivemind.snapshot.$(date +%Y%m%dT%H%M%S).env"
 
   local count=0
   local tmpEntries="${outfile}.unsorted.$$"
+  local seenSessions=""
 
   while IFS='|' read -r pid tty paneTarget title rest; do
     [ -z "$pid" ] && continue
@@ -1812,56 +1863,91 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
     local sid
     sid=$(private.hiveMind.session.resolve.uuid "$paneTarget" 2>/dev/null)
 
-    # Role priority (correct order): customTitle (live.discover) → registry → pane title → "unknown"
-    # DRY: role.fromTitle already strips prefixes / @model / whitespace / generic markers.
+    # Role priority: customTitle → registry → pane title → "unknown"
     local role
     role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
     [ -z "$role" ] && role=$(private.hiveMind.registry.get "$paneTarget" 2>/dev/null)
     [ -z "$role" ] && role=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
     [ -z "$role" ] && role="unknown"
 
-    echo "${sess}|${addr}|${role}|${sid:-}|${role:-}" >> "$tmpEntries"
+    # NEW C1 fields: cwd, model, kind
+    local cwd model kind
+    cwd=$(otmux pane.get "$paneTarget" '#{pane_current_path}' 2>/dev/null)
+    model=$(private.hiveMind.pane.model "$paneTarget" 2>/dev/null)
+    kind=$(private.hiveMind.pane.kind "$paneTarget" 2>/dev/null)
+
+    echo "${sess}|${addr}|${role}|${sid:-}|${role:-}|${cwd:-}|${model:-}|${kind:-unknown}" >> "$tmpEntries"
     count=$((count + 1))
+
+    # Track unique sessions for layout.save
+    echo "$seenSessions" | grep -q " ${sess} " || seenSessions="${seenSessions} ${sess} "
   done < <(private.hiveMind.claude.processes)
 
-  # Also include dead agents from registry+sessions.env
+  # Also include dead agents + shell panes from registry+sessions.env
   local reg="$HIVEMIND_REGISTRY"
   local ses="$HIVEMIND_SESSIONS"
   local dead_count=0
   if [ -f "$reg" ]; then
     while IFS='|' read -r pane_target reg_role; do
       [ -z "$pane_target" ] || [ -z "$reg_role" ] && continue
-      # Skip if already captured from live processes
       [ -f "$tmpEntries" ] && grep -q "|${reg_role}|" "$tmpEntries" 2>/dev/null && continue
       local dead_sess="${pane_target%%:*}"
       local dead_addr="${pane_target#*:}"
       local dead_uuid=""
       [ -f "$ses" ] && dead_uuid=$(grep "^${pane_target}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
-      local dead_title="${reg_role}"
-      echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${dead_title} (dead)" >> "$tmpEntries"
+      # Even dead/shell panes get cwd + kind captured
+      local dead_cwd dead_kind
+      dead_cwd=$(otmux pane.get "$pane_target" '#{pane_current_path}' 2>/dev/null)
+      dead_kind=$(private.hiveMind.pane.kind "$pane_target" 2>/dev/null)
+      echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${reg_role} (dead)|${dead_cwd:-}||${dead_kind:-shell}" >> "$tmpEntries"
       dead_count=$((dead_count + 1))
+      echo "$seenSessions" | grep -q " ${dead_sess} " || seenSessions="${seenSessions} ${dead_sess} "
     done < "$reg"
   fi
 
-  # Write sorted snapshot: header + entries sorted by session then address
+  # Write sorted snapshot
   {
     echo "# hiveMind snapshot $(date +%Y-%m-%dT%H:%M:%S)"
-    echo "# session|address|role|uuid|title"
+    echo "# session|address|role|uuid|title|cwd|model|kind"
     [ -f "$tmpEntries" ] && sort -t'|' -k1,1 -k2,2 "$tmpEntries"
   } > "$outfile"
   rm -f "$tmpEntries"
 
+  # C1: save layout for each session touched (View-layer persistence via B2)
+  local layout_count=0
+  for sess in $seenSessions; do
+    [ -z "$sess" ] && continue
+    if otmux has "$sess" 2>/dev/null; then
+      otmux layout.save "$sess" >/dev/null 2>&1 && layout_count=$((layout_count + 1))
+    fi
+  done
+
   echo "Saved $count live + $dead_count dead agents to $outfile"
+  echo "Saved $layout_count session layouts via otmux layout.save"
   cat "$outfile"
   return 0
 }
 
-hiveMind.teams.restore() # <?snapshotFile> <?--fork> # restore teams from snapshot; --fork uses fork instead of join (cross-machine)
+private.hiveMind.wait.for.claude() # <paneTarget> <?timeout:30> # poll until Claude process alive
+{
+  local target="$1" timeout="${2:-30}" waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if "$OOSH_DIR/claudeCode" process.running "$target" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> # cold-restart teams from snapshot + layout (compose B2 + claudeCode)
 {
   local snapfile="" forkMode=""
   for arg in "$@"; do
     case "$arg" in
-      --fork) forkMode="yes" ;;
+      fork) forkMode="yes" ;;
+      join) forkMode="" ;;
       *) [ -z "$snapfile" ] && snapfile="$arg" ;;
     esac
   done
@@ -1869,7 +1955,7 @@ hiveMind.teams.restore() # <?snapshotFile> <?--fork> # restore teams from snapsh
     snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
   fi
   if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
-    error.log "No snapshot found. Usage: hiveMind teams.restore <?file> <?--fork>"
+    error.log "No snapshot found. Usage: hiveMind teams.restore <?file> <?mode:join|fork>"
     return 1
   fi
 
@@ -1883,54 +1969,102 @@ hiveMind.teams.restore() # <?snapshotFile> <?--fork> # restore teams from snapsh
     RESTORE_CLEANUP_SESSION="__restore_init"
   fi
 
-  local prev_sess=""
-  while IFS='|' read -r sess addr role uuid title <&3; do
-    [[ "$sess" == "#"* ]] && continue
+  # C1 STEP 1: collect unique sessions, restore layout FIRST via B2 (geometry + titles + cwds)
+  local uniqueSessions
+  uniqueSessions=$(grep -v '^#' "$snapfile" 2>/dev/null | cut -d'|' -f1 | sort -u)
+  for sess in $uniqueSessions; do
     [ -z "$sess" ] && continue
-
-    # Create session if new
-    if [ "$sess" != "$prev_sess" ]; then
-      if ! otmux has "$sess" 2>/dev/null; then
-        echo "Creating session: $sess"
+    if otmux has "$sess" 2>/dev/null; then
+      # Idempotency: session exists → apply saved layout with --force (doesn't destroy panes)
+      otmux layout.restore "$sess" --force >/dev/null 2>&1 \
+        && echo "  layout.restore: $sess (session existed — applied saved layout)"
+    else
+      if otmux layout.restore "$sess" >/dev/null 2>&1; then
+        echo "  layout.restore: $sess (created from saved layout)"
+      else
+        # Fallback: no saved layout → create bare session
+        echo "  layout.restore: $sess (no layout file — creating bare session)"
         otmux new "$sess" -d -x 200 -y 50 2>/dev/null
       fi
-      prev_sess="$sess"
     fi
+  done
+
+  # C1 STEP 2: iterate snapshot entries — schema: sess|addr|role|uuid|title|cwd|model|kind
+  local claude_count=0 shell_count=0 skip_count=0
+  while IFS='|' read -r sess addr role uuid title cwd model kind <&3; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$sess" ] && continue
+    # Default kind for backward-compat with old 5-field snapshots
+    [ -z "$kind" ] && kind=$([ -n "$uuid" ] && echo claude || echo shell)
 
     local pane_target="${sess}:${addr}"
 
-    # Ensure pane exists (create window + split until target pane index exists)
+    # Pane should already exist from layout.restore; ensure anyway
     private.hiveMind.ensure.pane "$pane_target"
 
-    # Set pane title
+    # Set pane title (layout.restore may have done this; re-set for correctness)
     if [ -n "$title" ]; then
-      "otmux" pane.title "$pane_target" "$title" 2>/dev/null
+      otmux pane.title "$pane_target" "$title" 2>/dev/null
     fi
 
-    # Resume Claude if UUID available
-    if [ -n "$uuid" ]; then
-      local joinCmd="join"
-      [ "$forkMode" = "yes" ] && joinCmd="fork"
-      echo "  ${pane_target}: ${joinCmd}ing ${role:-unknown} (${uuid})"
-      "otmux" send.enter "$pane_target" "cd '${CLAUDE_PROJECT_DIR:-/Users/Shared/Workspaces/AI/Claude}'" Enter
-      sleep 0.5
-      "otmux" send.enter "$pane_target" "claudeCode $joinCmd $uuid" Enter
-      # Send boot prompt after resume
-      if [ -n "$role" ] && [ "$role" != "unknown" ]; then
-        sleep 5
-        local boot_file="session/agents/${role}/boot.md"
-        if [ -f "$HIVEMIND_AGENTS_DIR/../../$boot_file" ] 2>/dev/null; then
-          "otmux" send.enter "$pane_target" "Read $boot_file" Enter
+    # C1 STEP 5: kind-aware dispatch
+    case "$kind" in
+      shell)
+        # Shell panes stay bash — just cd if we have a saved cwd
+        if [ -n "$cwd" ]; then
+          otmux send.enter "$pane_target" "cd '${cwd}'" Enter 2>/dev/null
         fi
-      fi
-      # Auto-register child UUID after fork (join keeps same UUID)
-      if [ "$joinCmd" = "fork" ]; then
-        sleep 5
-        private.hiveMind.session.resolve.uuid "$pane_target" 2>/dev/null
-      fi
-    else
-      echo "  ${pane_target}: ${role:-unknown} (no UUID — start manually)"
-    fi
+        echo "  ${pane_target}: ${role} [shell] — left as bash${cwd:+ (cwd: $cwd)}"
+        shell_count=$((shell_count + 1))
+        ;;
+      monitor)
+        # tronMonitor setup handled separately (see tronMonitor.setup)
+        echo "  ${pane_target}: ${role} [monitor] — skipped (tronMonitor.setup handles)"
+        skip_count=$((skip_count + 1))
+        ;;
+      claude|*)
+        if [ -n "$uuid" ]; then
+          # C1 STEP 4: idempotency — skip if Claude already running
+          if "$OOSH_DIR/claudeCode" process.running "$pane_target" 2>/dev/null; then
+            echo "  ${pane_target}: ${role} already running (idempotent skip)"
+            private.hiveMind.registry.set "$pane_target" "$role" 2>/dev/null
+            skip_count=$((skip_count + 1))
+            continue
+          fi
+          local joinCmd="join"
+          [ "$forkMode" = "yes" ] && joinCmd="fork"
+          echo "  ${pane_target}: ${joinCmd}ing ${role} (${uuid:0:8}...)${model:+ model=$model}"
+          # Per-pane cwd (from snapshot, not hardcoded)
+          local restoreCwd="${cwd:-${CLAUDE_PROJECT_DIR:-/Users/Shared/Workspaces/AI/Claude}}"
+          otmux send.enter "$pane_target" "cd '${restoreCwd}'" Enter
+          sleep 0.3
+          # Model flag: use saved model or default to opus[1m]
+          local modelFlag="${model:-claude-opus-4-6[1m]}"
+          otmux send.enter "$pane_target" "claudeCode ${joinCmd}.byID ${uuid}" Enter
+          # C1 STEP 3: poll for Claude alive instead of fixed sleep
+          if private.hiveMind.wait.for.claude "$pane_target" 30; then
+            # Boot prompt for known role
+            if [ -n "$role" ] && [ "$role" != "unknown" ]; then
+              local boot_file="session/agents/${role}/boot.md"
+              if [ -f "$HIVEMIND_AGENTS_DIR/../../$boot_file" ] 2>/dev/null; then
+                otmux send.enter "$pane_target" "Read $boot_file" Enter
+              fi
+            fi
+            # Re-register child UUID for fork (join keeps same UUID)
+            if [ "$joinCmd" = "fork" ]; then
+              sleep 2
+              private.hiveMind.session.resolve.uuid "$pane_target" 2>/dev/null
+            fi
+            claude_count=$((claude_count + 1))
+          else
+            warn.log "${pane_target}: Claude did not start within 30s (timeout)"
+          fi
+        else
+          echo "  ${pane_target}: ${role} (no UUID — start manually)"
+          skip_count=$((skip_count + 1))
+        fi
+        ;;
+    esac
 
     # Update registry
     if [ -n "$role" ] && [ "$role" != "unknown" ]; then
@@ -1939,13 +2073,22 @@ hiveMind.teams.restore() # <?snapshotFile> <?--fork> # restore teams from snapsh
 
   done 3< "$snapfile"
 
+  # C1: re-register teams that were active
+  for sess in $uniqueSessions; do
+    [ -z "$sess" ] && continue
+    if otmux has "$sess" 2>/dev/null; then
+      hiveMind.team.register "$sess" "Restored from $(basename "$snapfile")" 2>/dev/null
+    fi
+  done
+
   # Clean up init session if we created it
   if [ -n "$RESTORE_CLEANUP_SESSION" ]; then
     otmux kill "$RESTORE_CLEANUP_SESSION" 2>/dev/null
   fi
 
   echo ""
-  echo "Restore complete. Check with: hiveMind team.status"
+  echo "Restore complete: ${claude_count} Claude resumed, ${shell_count} shells restored, ${skip_count} skipped."
+  echo "Check with: hiveMind team.status"
   return 0
 }
 
@@ -2072,10 +2215,10 @@ hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote ma
     "$OOSH_DIR/ossh" exec "$host" "sed -i.bak 's/opus\[1m\]/opus/g' ~/.claude/settings.json" 2>>"$LOG_LIVE"
   fi
 
-  # 6. Ensure tmux server running + restore on remote (--fork for cross-machine)
+  # 6. Ensure tmux server running + restore on remote (fork mode for cross-machine)
   echo ""
-  important.log "Running teams.restore --fork on $host..."
-  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore --fork" 2>>"$LOG_LIVE"
+  important.log "Running teams.restore fork on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore fork" 2>>"$LOG_LIVE"
 
   # 7. Verify
   echo ""
@@ -3867,6 +4010,15 @@ hiveMind.team.register() # <session> <?description> # register a team session in
     echo "$session" > "$HIVEMIND_ACTIVE_TEAM_FILE"
     info.log "Auto-switched active team to: $session"
   fi
+
+  # D2.1 — observer: notify tronMonitor to add a monitor window for this team.
+  # Same pattern as otmux.session.rename → hiveMind.protected.session.renamed.
+  # Soft-fail: if tronMonitor isn't installed or the add fails, registration
+  # still succeeds — monitoring is enhancement, not prerequisite.
+  if command -v tronMonitor >/dev/null 2>&1; then
+    tronMonitor add "$session" 2>/dev/null || \
+      info.log "tronMonitor add failed/skipped for $session (non-fatal)"
+  fi
 }
 hiveMind.team.remove() # <session> # unregister a team session
 {
@@ -3885,6 +4037,14 @@ hiveMind.team.remove() # <session> # unregister a team session
   if ! grep -q "^${session}|" "$HIVEMIND_TEAMS" 2>/dev/null; then
     error.log "Team $session not registered"
     return 1
+  fi
+
+  # D2.2 — observer: tell tronMonitor to remove its monitor window BEFORE we
+  # drop the team from the registry. If tronMonitor isn't installed or the
+  # team has no monitor window, soft-fail and continue with the unregister.
+  if command -v tronMonitor >/dev/null 2>&1; then
+    tronMonitor remove "$session" 2>/dev/null || \
+      info.log "tronMonitor remove failed/skipped for $session (non-fatal)"
   fi
 
   grep -v "^${session}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null
@@ -4547,9 +4707,21 @@ private.hiveMind.sweep.detect() {
   # regexes which match their own source). Structural checks below (menus,
   # ❯ arrow, prompt state) keep using $content because their signals are UI
   # shapes, not substrings, and don't collide with code.
+  # F2.1 — strip ALL common line-comment markers before substring matching.
+  # A source-code pane mentioning "rate limit" or "subscription limit" in a
+  # comment must not trigger the detector. Patterns stripped per first
+  # non-whitespace token:
+  #   #    — shell, Python, Ruby, Makefile, YAML, conf
+  #   //   — C, C++, JS, TS, Go, Rust, Java, Swift, CSS, Kotlin, Dart
+  #   --   — SQL, Haskell, Lua, Ada, Elm
+  #   /*   — C-family block comment open (single-line "/* … */" form)
+  #   *    — C-family block comment continuation line (e.g. "  * see also …")
+  #   <!-- — HTML/XML comment open
+  # Also drop shell control-flow, grep/sed/awk/echo calls (regex self-matches),
+  # and pipe continuations — unchanged from the original scrub.
   local prose
   prose=$(echo "$content" \
-    | grep -v '^[[:space:]]*#' \
+    | grep -vE '^[[:space:]]*(#|//|--|/\*|\*[^/]|<!--)' \
     | grep -vE "(grep|sed|awk|echo)[[:space:]]+-?[a-zA-Z]*[[:space:]]*['\"]" \
     | grep -vE "^[[:space:]]*(if|elif|fi|then|else|done|for|while|case|esac)[[:space:]]*[[(]" \
     | grep -vE "^[[:space:]]*\|[[:space:]]*(grep|sed|awk)|^[[:space:]]+\\\\$")

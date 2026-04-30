@@ -30,7 +30,7 @@ export CLAUDE_MAX_TOKENS_DEFAULT CLAUDE_MAX_TOKENS_1M CLAUDE_COMPACT_THRESHOLD_P
 
 # ── Shared completion helpers ──────────────────────────────────────────────
 private.claudeCode.complete.panes() {
-  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+  otmux panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
 }
 private.claudeCode.complete.sessionIds() {
   # Filter: emit UUID only if LIVE (in a Claude process) OR REGISTERED (in hivemind.sessions.env).
@@ -972,12 +972,14 @@ private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customT
   [ -n "$bestUuid" ] && return 0 || return 1
 }
 
-claudeCode.session.current() # <pane> # print current session UUID (non-invasive) — empty if unknown
+claudeCode.session.current() # <pane> # print current session UUID (non-invasive); rc=1 when unresolvable
 {
   local out
   out=$(private.claudeCode.session.discover "$1")
-  echo "${out%%|*}"
-  [ -n "${out%%|*}" ] && return 0 || return 1
+  local uuid="${out%%|*}"
+  [ -z "$uuid" ] && return 1
+  echo "$uuid"
+  return 0
 }
 claudeCode.session.current.completion.pane() { private.claudeCode.complete.panes; }
 
@@ -990,31 +992,26 @@ claudeCode.session.state() # <pane> # print session state: live|stable|stale|bro
 }
 claudeCode.session.state.completion.pane() { private.claudeCode.complete.panes; }
 
-claudeCode.session.probe() # <pane> # get current session UUID via /status + JSONL correlation (ground truth, slow ~3s)
+claudeCode.session.probe.fromCapture() # <captureText> # pure parser: extract UUID from /status output
+# Pure Model — no otmux, no tmux, no side effects. Takes captured TUI text via arg
+# or stdin, returns the session UUID. Testable with fixture strings.
+#
+# Parses two /status formats:
+#   1. Legacy (Claude Code < 2.1.x): "Session ID: <uuid>"
+#   2. Current (Claude Code 2.1.x+): "Session name: <customTitle>" — correlated
+#      to the newest JSONL in ~/.claude/projects/*/*.jsonl with matching customTitle
+#      (handles forks + /rename history).
 {
-  local target="$1"
-  [ -z "$target" ] && return 1
+  local capture="$1"
+  [ -z "$capture" ] && capture=$(cat)
+  [ -z "$capture" ] && return 1
 
-  # Skip if pane is not running Claude Code (prevents /status pollution in bash)
-  if ! claudeCode.process.running "$target" 2>/dev/null; then
-    return 1
-  fi
-
-  # Send /status, wait for TUI to render, capture, dismiss (raw sends — TUI commands)
-  otmux send.raw "$target" "/status" Enter
-  sleep 3
-  local capture
-  capture=$(otmux pane.capture "$target" 40 2>/dev/null)
-  otmux send.raw "$target" Escape
-
-  # 1. Try legacy format: "Session ID: <uuid>" (Claude Code < 2.1.x)
+  # 1. Legacy "Session ID:" — direct UUID extraction
   local sid
   sid=$(echo "$capture" | grep -oE 'Session ID: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
   [ -n "$sid" ] && echo "$sid" && return 0
 
-  # 2. Claude Code 2.1.x removed "Session ID:" — only "Session name:" remains.
-  # Correlate via customTitle in ~/.claude/projects/*/*.jsonl: newest JSONL
-  # with matching customTitle is the live session (handles forks too).
+  # 2. "Session name:" — correlate to newest JSONL with matching customTitle
   local name
   name=$(echo "$capture" | grep -oE 'Session name:[[:space:]]+[^[:space:]].*' | head -1 | sed -E 's/^Session name:[[:space:]]+//;s/[[:space:]]+$//')
   [ -z "$name" ] && return 1
@@ -1034,6 +1031,30 @@ claudeCode.session.probe() # <pane> # get current session UUID via /status + JSO
   [ -z "$newest" ] && return 1
   basename "$newest" .jsonl
   return 0
+}
+
+claudeCode.session.probe() # <pane> # get current session UUID via /status + JSONL correlation (ground truth, slow ~3s)
+# Composes: View (otmux send/capture) + Model (session.probe.fromCapture parser).
+# TODO A1.2 Fix #2b: move View-layer I/O to hiveMind.agent.session.probe; keep
+# fromCapture as the canonical Model parser. 8 callers currently bound to this name.
+{
+  local target="$1"
+  [ -z "$target" ] && return 1
+
+  # Skip if pane is not running Claude Code (prevents /status pollution in bash)
+  if ! claudeCode.process.running "$target" 2>/dev/null; then
+    return 1
+  fi
+
+  # View I/O — send /status, wait for TUI to render, capture, dismiss
+  otmux send.raw "$target" "/status" Enter
+  sleep 3
+  local capture
+  capture=$(otmux pane.capture "$target" 40 2>/dev/null)
+  otmux send.raw "$target" Escape
+
+  # Model parse — delegate to pure parser
+  claudeCode.session.probe.fromCapture "$capture"
 }
 claudeCode.session.probe.completion.pane() {
   private.claudeCode.complete.panes
@@ -1203,7 +1224,7 @@ claudeCode.session.save() # <?file:session/agent.context.md> # save current sess
 ## Recovery
 1. Read this file
 2. Read current task file
-3. Check agent panes with `tmux capture-pane`
+3. Check agent panes with `otmux pane.capture`
 4. Resume work
 TEMPLATE
     info.log "Created context template: $file"
@@ -1450,10 +1471,14 @@ else:
 " 2>/dev/null
 }
 
-claudeCode.context.self() # # read own context % using TMUX_PANE
+claudeCode.context.self() # # read own context % using TMUX_PANE — rc=1 if not in tmux
 {
+  if [ -z "$TMUX" ] && [ -z "$TMUX_PANE" ]; then
+    error.log "Not in a tmux pane (TMUX and TMUX_PANE both unset)"
+    return 1
+  fi
   local myPane
-  myPane=$(otmux pane.get.target)
+  myPane=$(otmux pane.get.target 2>/dev/null)
   if [ -z "$myPane" ]; then
     error.log "Not in a tmux pane"
     return 1
@@ -1895,80 +1920,11 @@ claudeCode.context.alert.completion.pane() {
   private.claudeCode.complete.panes
 }
 
-claudeCode.agent.recover() # <pane> # post-compact recovery: read identity files, check peer, resume work
-{
-  local pane="$1"
-
-  if [ -z "$pane" ]; then
-    error.log "Usage: claudeCode recover <pane>"
-    return 1
-  fi
-
-  local workspace
-  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
-  if [ -z "$workspace" ]; then
-    error.log "Cannot determine workspace root"
-    return 1
-  fi
-
-  # Resolve role from registry
-  local role
-  role=$("$OOSH_DIR/hiveMind" resolve.reverse "$pane" 2>/dev/null)
-  if [ -z "$role" ]; then
-    local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-    [ -f "$reg" ] && role=$(grep "^${pane}|" "$reg" 2>/dev/null | cut -d'|' -f2)
-  fi
-
-  if [ -z "$role" ]; then
-    warn.log "Cannot resolve role for $pane — skipping identity files"
-  fi
-
-  # Step 1: Check identity files exist
-  local learningsFile="${workspace}/session/agents/${role}/learnings.md"
-  local contextFile="${workspace}/session/agents/${role}/context.md"
-  local bootFile="${workspace}/session/boot/${role}.md"
-
-  local filesFound=0
-  if [ -n "$role" ]; then
-    [ -f "$bootFile" ] && { info.log "Boot file: $bootFile"; filesFound=$((filesFound + 1)); }
-    [ -f "$learningsFile" ] && { info.log "Learnings: $learningsFile"; filesFound=$((filesFound + 1)); }
-    [ -f "$contextFile" ] && { info.log "Context: $contextFile"; filesFound=$((filesFound + 1)); }
-  fi
-
-  # Step 2: Send boot file read to the recovering pane
-  if [ -f "$bootFile" ]; then
-    local relBoot="session/boot/${role}.md"
-    "$OOSH_DIR/otmux" send "$pane" "Read ${relBoot}" Enter
-    info.log "Sent boot file to $pane"
-  elif [ -f "$contextFile" ]; then
-    local relCtx="session/agents/${role}/context.md"
-    "$OOSH_DIR/otmux" send "$pane" "Read ${relCtx}" Enter
-    info.log "Sent context file to $pane"
-  else
-    warn.log "No boot or context file found for $role"
-  fi
-
-  # Step 3: Check context health
-  local pct
-  pct=$(claudeCode.context.read "$pane" 2>/dev/null)
-  info.log "$pane context: ${pct:-unknown}%"
-
-  # Step 4: Verify agent responded (wait briefly, then capture)
-  sleep 3
-  local verify
-  verify=$("$OOSH_DIR/otmux" pane.capture "$pane" 10 2>/dev/null)
-  if echo "$verify" | grep -qE 'Read|boot|context|❯'; then
-    console.log "recover: $role at $pane — resumed ($filesFound files, ${pct:-?}% context)"
-    create.result 0 "recovered"
-  else
-    warn.log "recover: $role at $pane — may not have resumed"
-    create.result 1 "unverified"
-  fi
-  return $(result)
-}
-claudeCode.agent.recover.completion.pane() {
-  private.claudeCode.complete.panes
-}
+# claudeCode.agent.recover was deleted in A1.2 fix 3 (duplicated hiveMind.agent.unblock
+# family). Controller equivalents:
+#   - hiveMind.agent.unblock <agentName>  — detect + resolve stuck prompts
+#   - hiveMind.agent.handoff <agentName>  — full generational handoff with verify
+# See task-a1.2-expert-view-leak-identification.md Leak 2.
 
 claudeCode.usage()
 {

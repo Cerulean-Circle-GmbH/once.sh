@@ -102,15 +102,29 @@ otmux.new() # <?name> <?command> # create a new session
   fi
 }
 
-otmux.attach() # <?target> # attach to session; target=session name or $id
+otmux.attach() # <?target> <?readonly> # attach to session; pass 'readonly' to attach with -r (no input, no resize)
 {
-  if [ -n "$1" ]; then
-    $TMUX_CMD attach-session -t "$1"
+  local target="" ro=""
+  for arg in "$@"; do
+    case "$arg" in
+      readonly|ro|-r) ro="-r" ;;
+      *) [ -z "$target" ] && target="$arg" ;;
+    esac
+  done
+  if [ -n "$target" ]; then
+    $TMUX_CMD attach-session $ro -t "$target"
   else
-    $TMUX_CMD attach-session
+    $TMUX_CMD attach-session $ro
   fi
 }
 otmux.attach.completion.target() { private.complete.sessions; }
+otmux.attach.completion.readonly() { echo "readonly"; }
+
+otmux.attach.readonly() # <?target> # convenience: attach in read-only mode (alias for attach <target> readonly)
+{
+  otmux.attach "$1" readonly
+}
+otmux.attach.readonly.completion.target() { private.complete.sessions; }
 
 otmux.detach() # # detach from current session
 {
@@ -509,6 +523,230 @@ private.otmux.prevLayout() # # cycle to previous layout
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LAYOUT PERSISTENCE (save / restore across server restart)
+# ─────────────────────────────────────────────────────────────────────────────
+# File format: ~/config/otmux/<session>.layout.env  (env-file, OOSH convention)
+#   OTMUX_LAYOUT_SESSION, OTMUX_LAYOUT_SAVED_AT
+#   OTMUX_LAYOUT_WINDOW_INDICES — space-separated list of window indices
+#   Per window W:
+#     OTMUX_WINDOW_<W>_NAME      — window name
+#     OTMUX_WINDOW_<W>_LAYOUT    — tmux native layout string (#{window_layout})
+#     OTMUX_WINDOW_<W>_PANE_INDICES — space-separated pane indices
+#   Per pane W.P:
+#     OTMUX_WINDOW_<W>_PANE_<P>_TITLE  — pane_title (set via select-pane -T)
+#     OTMUX_WINDOW_<W>_PANE_<P>_CWD    — pane_current_path
+#     OTMUX_WINDOW_<W>_PANE_<P>_CMD    — pane_current_command (info only)
+#
+# Agnostic to agents — purely geometry + labels. Controller (hiveMind) composes
+# layout.restore + content restoration (claude relaunch, role re-teaching, etc.)
+
+: ${OTMUX_LAYOUT_DIR:=${CONFIG_PATH:-$HOME/config}/otmux}
+
+otmux.layout.save() # <session> # serialize session layout (windows, panes, titles, cwds) to file
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.save <session>"
+    return 1
+  fi
+  if ! $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+    error.log "no tmux session: $session"
+    return 1
+  fi
+
+  mkdir -p "$OTMUX_LAYOUT_DIR"
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+
+  {
+    echo "# otmux layout for session: $session"
+    echo "# saved: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "OTMUX_LAYOUT_SESSION=\"$session\""
+    echo "OTMUX_LAYOUT_SAVED_AT=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+
+    local winIdxs
+    winIdxs=$($TMUX_CMD list-windows -t "$session" -F '#{window_index}' 2>/dev/null | tr '\n' ' ')
+    echo "OTMUX_LAYOUT_WINDOW_INDICES=\"${winIdxs% }\""
+
+    local w
+    for w in $winIdxs; do
+      local wname wlayout
+      wname=$($TMUX_CMD display-message -p -t "$session:$w" '#{window_name}' 2>/dev/null)
+      wlayout=$($TMUX_CMD display-message -p -t "$session:$w" '#{window_layout}' 2>/dev/null)
+      echo "OTMUX_WINDOW_${w}_NAME=\"${wname//\"/\\\"}\""
+      echo "OTMUX_WINDOW_${w}_LAYOUT=\"${wlayout//\"/\\\"}\""
+
+      local paneIdxs
+      paneIdxs=$($TMUX_CMD list-panes -t "$session:$w" -F '#{pane_index}' 2>/dev/null | tr '\n' ' ')
+      echo "OTMUX_WINDOW_${w}_PANE_INDICES=\"${paneIdxs% }\""
+
+      local p
+      for p in $paneIdxs; do
+        local ptitle pcwd pcmd
+        ptitle=$($TMUX_CMD display-message -p -t "$session:$w.$p" '#{pane_title}' 2>/dev/null)
+        pcwd=$($TMUX_CMD display-message -p -t "$session:$w.$p" '#{pane_current_path}' 2>/dev/null)
+        pcmd=$($TMUX_CMD display-message -p -t "$session:$w.$p" '#{pane_current_command}' 2>/dev/null)
+        echo "OTMUX_WINDOW_${w}_PANE_${p}_TITLE=\"${ptitle//\"/\\\"}\""
+        echo "OTMUX_WINDOW_${w}_PANE_${p}_CWD=\"${pcwd//\"/\\\"}\""
+        echo "OTMUX_WINDOW_${w}_PANE_${p}_CMD=\"${pcmd//\"/\\\"}\""
+      done
+    done
+  } > "$file"
+
+  success.log "Layout saved: $file"
+  RESULT="$file"
+  echo "$file"
+}
+otmux.layout.save.completion.session() { private.complete.sessions; }
+
+otmux.layout.restore() # <session> <?--force> # recreate session layout from saved file
+{
+  local session="$1"
+  local force="${2:-}"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.restore <session> <?--force>"
+    return 1
+  fi
+
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+  if [ ! -f "$file" ]; then
+    error.log "no layout file: $file"
+    return 1
+  fi
+
+  # Guard: refuse to overwrite an existing session unless --force
+  if $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+    if [ "$force" != "--force" ]; then
+      error.log "session '$session' already exists — pass --force to apply layout anyway"
+      return 1
+    fi
+    warn.log "session '$session' exists — applying saved layout with --force"
+  fi
+
+  # Source env file in a subshell scope to read vars
+  source "$file"
+
+  # Create session with first window + pane if missing
+  if ! $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+    $TMUX_CMD new-session -d -s "$session"
+    info.log "created session: $session"
+  fi
+
+  local w
+  for w in $OTMUX_LAYOUT_WINDOW_INDICES; do
+    local wname_var="OTMUX_WINDOW_${w}_NAME"
+    local wlayout_var="OTMUX_WINDOW_${w}_LAYOUT"
+    local pane_idx_var="OTMUX_WINDOW_${w}_PANE_INDICES"
+    local wname="${!wname_var}"
+    local wlayout="${!wlayout_var}"
+    local pane_indices="${!pane_idx_var}"
+
+    # Ensure window exists
+    if ! $TMUX_CMD list-windows -t "$session" -F '#{window_index}' 2>/dev/null | grep -q "^${w}$"; then
+      $TMUX_CMD new-window -t "$session:$w" -n "$wname" 2>/dev/null
+    else
+      $TMUX_CMD rename-window -t "$session:$w" "$wname" 2>/dev/null
+    fi
+
+    # Create panes to match saved count. Starting with 1 (from new-window/new-session),
+    # split-window N-1 times. Direction doesn't matter — select-layout reshapes.
+    local needed existing to_create
+    needed=$(echo "$pane_indices" | wc -w | tr -d ' ')
+    existing=$($TMUX_CMD list-panes -t "$session:$w" 2>/dev/null | wc -l | tr -d ' ')
+    to_create=$((needed - existing))
+    while [ "$to_create" -gt 0 ]; do
+      $TMUX_CMD split-window -t "$session:$w" 2>/dev/null
+      to_create=$((to_create - 1))
+    done
+
+    # Apply tmux-native layout string — reshapes to exact saved geometry
+    if [ -n "$wlayout" ]; then
+      $TMUX_CMD select-layout -t "$session:$w" "$wlayout" 2>/dev/null
+    fi
+
+    # Restore pane titles (one-shot; for persistent title use otmux pane.lock)
+    local p
+    for p in $pane_indices; do
+      local title_var="OTMUX_WINDOW_${w}_PANE_${p}_TITLE"
+      local title="${!title_var}"
+      if [ -n "$title" ]; then
+        $TMUX_CMD select-pane -t "$session:$w.$p" -T "$title" 2>/dev/null
+      fi
+    done
+  done
+
+  success.log "Layout restored for session '$session' from $file"
+}
+otmux.layout.restore.completion.session() {
+  [ -d "$OTMUX_LAYOUT_DIR" ] || return 0
+  local f
+  for f in "$OTMUX_LAYOUT_DIR"/*.layout.env; do
+    [ -f "$f" ] || continue
+    basename "$f" .layout.env
+  done
+}
+otmux.layout.restore.completion.force() { echo "--force"; }
+
+otmux.layout.list() # # list all saved layouts
+{
+  if [ ! -d "$OTMUX_LAYOUT_DIR" ]; then
+    info.log "no saved layouts (dir: $OTMUX_LAYOUT_DIR)"
+    return 0
+  fi
+  printf "%-30s %-22s %s\n" "SESSION" "SAVED" "FILE"
+  local f
+  for f in "$OTMUX_LAYOUT_DIR"/*.layout.env; do
+    [ -f "$f" ] || continue
+    local name saved
+    name=$(basename "$f" .layout.env)
+    saved=$(grep -oE 'OTMUX_LAYOUT_SAVED_AT="[^"]*"' "$f" | head -1 | sed 's/OTMUX_LAYOUT_SAVED_AT="//;s/"//')
+    printf "%-30s %-22s %s\n" "$name" "${saved:-unknown}" "$f"
+  done
+}
+otmux.layout.list.completion() { :; }
+
+otmux.layout.delete() # <session> # remove a saved layout file
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.delete <session>"
+    return 1
+  fi
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+  if [ ! -f "$file" ]; then
+    warn.log "no layout file for: $session"
+    return 1
+  fi
+  rm "$file"
+  success.log "deleted: $file"
+}
+otmux.layout.delete.completion.session() {
+  [ -d "$OTMUX_LAYOUT_DIR" ] || return 0
+  local f
+  for f in "$OTMUX_LAYOUT_DIR"/*.layout.env; do
+    [ -f "$f" ] || continue
+    basename "$f" .layout.env
+  done
+}
+
+otmux.layout.show() # <session> # display the saved layout file for a session
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.show <session>"
+    return 1
+  fi
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+  if [ ! -f "$file" ]; then
+    error.log "no layout file: $file"
+    return 1
+  fi
+  cat "$file"
+}
+otmux.layout.show.completion.session() {
+  otmux.layout.delete.completion.session
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BUFFER COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -754,7 +992,7 @@ otmux.config.reset() # # reset tmux config to default (overwrites existing)
 # SETUP — apply defaults to running server
 # ─────────────────────────────────────────────────────────────────────────────
 
-otmux.setup.default() # # apply sensible defaults to running server (pane headers, clipboard, mouse)
+otmux.setup.default() # # apply sensible defaults to running server (pane headers, clipboard, mouse, window-size)
 {
   # Pane title headers — show agent name at top, bold if active
   $TMUX_CMD set -g pane-border-status top
@@ -768,14 +1006,52 @@ otmux.setup.default() # # apply sensible defaults to running server (pane header
   $TMUX_CMD set -g history-limit 50000
   $TMUX_CMD set -g renumber-windows on
 
+  # window-size=largest — keep the geometry of the largest attached client
+  # (smaller clients scroll). Without this, tron + agent attach causes the smaller
+  # of the two to dictate window dimensions, often shrinking team layouts to 0-width
+  # panes. MANDATORY for multi-client team sessions. Requires tmux 2.9+.
+  $TMUX_CMD set -g window-size largest 2>/dev/null
+
+  # aggressive-resize=on — window-level safety net for the same multi-client
+  # scenario. Helps in edge cases where two clients attach with different
+  # geometries (only the active window resizes to the focused client).
+  $TMUX_CMD setw -g aggressive-resize on 2>/dev/null
+
   # OS-independent clipboard
   private.otmux.setup.clipboard
 
-  success.log "defaults applied to running server"
+  success.log "defaults applied to running server (incl. window-size=largest)"
 }
 
-private.otmux.setup.clipboard() # # detect OS and configure clipboard bindings
+otmux.window.size() # <?value:largest> # set server-wide window-size (largest|smallest|latest|manual)
 {
+  # Convenience for adjusting after setup.default. Useful when:
+  #   • Forcing latest/manual for testing or single-client sessions
+  #   • Re-applying largest if tmux config drift occurred
+  # Required for tronMonitor safety (see B4.2). Idempotent — safe to call repeatedly.
+  local value="${1:-largest}"
+  case "$value" in
+    largest|smallest|latest|manual) ;;
+    *) error.log "Invalid window-size: $value (use largest|smallest|latest|manual)"; return 1 ;;
+  esac
+  $TMUX_CMD set -g window-size "$value"
+  success.log "window-size set to: $value"
+}
+otmux.window.size.completion.value() {
+  echo "largest"
+  echo "smallest"
+  echo "latest"
+  echo "manual"
+}
+
+private.otmux.setup.clipboard() # # detect OS/SSH and configure clipboard bindings
+{
+  # Remote session: use OSC 52 so copy reaches the LOCAL machine's clipboard.
+  # pbcopy/xclip on the remote box would write to the remote clipboard (useless).
+  if [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_TTY" ] || [ -n "$SSH_CLIENT" ]; then
+    private.otmux.setup.clipboard.osc52
+    return
+  fi
   source "$OOSH_DIR/os"
   if os.check private.otmux.setup.clipboard; then
     $RESULT
@@ -784,14 +1060,14 @@ private.otmux.setup.clipboard() # # detect OS and configure clipboard bindings
   fi
 }
 
-private.otmux.setup.clipboard.darwin() # # macOS clipboard via pbcopy/pbpaste
+private.otmux.setup.clipboard.darwin() # # macOS clipboard via pbcopy/pbpaste (local session)
 {
   local copyCmd="pbcopy"
   local pasteCmd="pbpaste"
   private.otmux.setup.clipboard.apply "$copyCmd" "$pasteCmd"
 }
 
-private.otmux.setup.clipboard.linux() # # Linux clipboard via xclip, xsel, or termux
+private.otmux.setup.clipboard.linux() # # Linux clipboard via xclip, xsel, or termux (local session)
 {
   local copyCmd="" pasteCmd=""
   if command -v xclip &>/dev/null; then
@@ -810,7 +1086,34 @@ private.otmux.setup.clipboard.linux() # # Linux clipboard via xclip, xsel, or te
   private.otmux.setup.clipboard.apply "$copyCmd" "$pasteCmd"
 }
 
-private.otmux.setup.clipboard.apply() # <copyCmd> <pasteCmd> # bind tmux copy/paste to OS clipboard
+private.otmux.setup.clipboard.osc52() # # OSC 52 mode — tmux → terminal → LOCAL clipboard (for SSH sessions)
+{
+  # tmux emits OSC 52 escape sequences; the user's LOCAL terminal (iTerm2,
+  # WezTerm, kitty, modern Terminal.app) intercepts and writes to the local
+  # clipboard. No remote helper needed. Works through ssh transparently.
+  #
+  # Requires on the local terminal:
+  #   iTerm2:       Preferences → General → Selection → "Applications in
+  #                 terminal may access clipboard" = ON
+  #   WezTerm:      on by default
+  #   kitty:        clipboard_control write-clipboard write-primary (default)
+  #   Terminal.app: OSC 52 support is limited; use iTerm2 if possible
+  #
+  $TMUX_CMD set -g set-clipboard on            # tmux emits OSC 52 on copy
+  $TMUX_CMD set -g allow-passthrough on 2>/dev/null  # tmux 3.3+ (nested sessions)
+  $TMUX_CMD bind -T copy-mode-vi v send-keys -X begin-selection
+  # No external copy command — tmux uses set-clipboard=on to emit OSC 52
+  $TMUX_CMD bind -T copy-mode-vi y send-keys -X copy-selection-and-cancel
+  $TMUX_CMD bind -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel
+  $TMUX_CMD bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel
+  # Paste: local clipboard → terminal types it → tmux receives it naturally.
+  # No tmux binding needed for paste — user presses Cmd+V in local terminal.
+  # For paste from tmux's own buffer, keep the default prefix + ] binding.
+
+  info.log "clipboard: OSC 52 mode (remote-aware). Paste via local Cmd+V."
+}
+
+private.otmux.setup.clipboard.apply() # <copyCmd> <pasteCmd> # bind tmux copy/paste to OS clipboard (local session)
 {
   local copyCmd="$1"
   local pasteCmd="$2"
@@ -823,6 +1126,22 @@ private.otmux.setup.clipboard.apply() # <copyCmd> <pasteCmd> # bind tmux copy/pa
   $TMUX_CMD bind p run "$pasteCmd | tmux load-buffer - && tmux paste-buffer"
 
   info.log "clipboard: using $copyCmd / $pasteCmd"
+}
+
+otmux.setup.clipboard.remote() # # force OSC 52 (remote-aware) clipboard mode — for SSH sessions
+{
+  private.otmux.setup.clipboard.osc52
+}
+
+otmux.setup.clipboard.local() # # force local pbcopy/xclip clipboard mode
+{
+  source "$OOSH_DIR/os"
+  if os.check private.otmux.setup.clipboard; then
+    $RESULT
+  else
+    important.log "clipboard: unsupported OS ($OSTYPE)"
+    return 1
+  fi
 }
 
 otmux.install() # # install tmux via oo cmd and initialize config
@@ -1232,12 +1551,12 @@ otmux.commands() # # list all tmux commands
 
 otmux.256color() # <command> # force 256 color mode (stacks with UTF-8)
 {
-  tmux -u -2 "$@"
+  $TMUX_CMD -2 "$@"
 }
 
 otmux.control() # <?command> # start in control mode (stacks with UTF-8)
 {
-  tmux -u -C "$@"
+  $TMUX_CMD -C "$@"
 }
 
 otmux.utf8() # <command> # force UTF-8 mode (already default, provided for compatibility)
@@ -1247,28 +1566,28 @@ otmux.utf8() # <command> # force UTF-8 mode (already default, provided for compa
 
 otmux.verbose() # <command> # enable verbose logging (stacks with UTF-8)
 {
-  tmux -u -v "$@"
+  $TMUX_CMD -v "$@"
 }
 
 otmux.socket() # <name> <command> # use specific socket name (stacks with UTF-8)
 {
   local name="$1"
   shift
-  tmux -u -L "$name" "$@"
+  $TMUX_CMD -L "$name" "$@"
 }
 
 private.otmux.socketPath() # <path> <command> # use specific socket path (stacks with UTF-8)
 {
   local path="$1"
   shift
-  tmux -u -S "$path" "$@"
+  $TMUX_CMD -S "$path" "$@"
 }
 
 otmux.config() # <file> <command> # use specific config file (stacks with UTF-8)
 {
   local file="$1"
   shift
-  tmux -u -f "$file" "$@"
+  $TMUX_CMD -f "$file" "$@"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1841,7 +2160,7 @@ otmux.pane.send() # <target> <text> # send text + Enter to pane; target=session:
 }
 
 
-otmux.pane.lock() # <target> <title> # lock pane title; prevents Claude Code from overwriting
+otmux.pane.lock() # <target> <title> # lock pane title; idempotent — auto-unlocks first if already locked
 {
   local target=$(private.resolve.target "$1")
   local title="$2"
@@ -1849,6 +2168,12 @@ otmux.pane.lock() # <target> <title> # lock pane title; prevents Claude Code fro
     error.log "usage: otmux pane.lock <target> <title>"
     return 1
   fi
+
+  # B3.1 — auto-unlock first so pane.lock is idempotent and safe to retitle.
+  # Clears any prior hook + background enforcer + allow-rename state before
+  # we install the new lock. Silent: no info.log from the unlock step.
+  otmux.pane.unlock "$target" >/dev/null 2>&1
+
   # Set the title
   $TMUX_CMD select-pane -t "$target" -T "$title"
   # Block escape-sequence-based renaming
@@ -2155,18 +2480,16 @@ otmux.tronMonitor.setup() # <?session:TRONinterface> <?pane:0.3> # create TRON-M
     otmux.new "$session"
   fi
 
-  # Ensure pane exists
-  private.hiveMind.ensure.pane "$target" 2>/dev/null || {
-    # Fallback: split until we have enough panes
-    local current needed
-    needed=$((${paneIdx##*.} + 1))
+  # Ensure pane exists by splitting until we reach the requested index.
+  # B1.3 BOUNDARY-2: pure View — no cross-layer call to Controller helpers.
+  local current needed
+  needed=$((${paneIdx##*.} + 1))
+  current=$($TMUX_CMD list-panes -t "${session}:${paneIdx%%.*}" 2>/dev/null | wc -l | tr -d ' ')
+  while [ "${current:-0}" -lt "$needed" ]; do
+    $TMUX_CMD split-window -d -t "${session}:${paneIdx%%.*}" 2>/dev/null
+    $TMUX_CMD select-layout -t "${session}:${paneIdx%%.*}" tiled 2>/dev/null
     current=$($TMUX_CMD list-panes -t "${session}:${paneIdx%%.*}" 2>/dev/null | wc -l | tr -d ' ')
-    while [ "${current:-0}" -lt "$needed" ]; do
-      $TMUX_CMD split-window -d -t "${session}:${paneIdx%%.*}" 2>/dev/null
-      $TMUX_CMD select-layout -t "${session}:${paneIdx%%.*}" tiled 2>/dev/null
-      current=$($TMUX_CMD list-panes -t "${session}:${paneIdx%%.*}" 2>/dev/null | wc -l | tr -d ' ')
-    done
-  }
+  done
 
   # Run tronMonitor setup on the target pane
   "$OOSH_DIR/tronMonitor" setup "$target"

@@ -9,9 +9,44 @@
 : ${TRON_MONITOR_SCREEN:=tronMon}
 
 private.tronMonitor.pane() {
-  local pane
-  pane=$(config get TRON_MONITOR_PANE 2>/dev/null)
-  echo "${pane:-$TRON_MONITOR_PANE}"
+  # Resolution order (D1.5):
+  # 1. $TRON_MONITOR_PANE env var (set by script default or user export) if valid
+  # 2. config-persisted value if valid
+  # 3. hardcoded fallback: TRONinterface:0.3
+  # Validation: the pane must actually exist in tmux (session AND pane index).
+  # Prevents stale config from previous runs (e.g. UpDown_ai_po:0.1) from
+  # shadowing the correct default after the referenced session is gone.
+
+  local fallback="TRONinterface:0.3"
+
+  # Candidate 1 — env var (script-level `: ${TRON_MONITOR_PANE:=...}`)
+  local cand="${TRON_MONITOR_PANE:-}"
+  if [ -n "$cand" ] && private.tronMonitor.pane.isValid "$cand"; then
+    echo "$cand"
+    return 0
+  fi
+
+  # Candidate 2 — config-persisted (from previous setup call)
+  cand=$(config get TRON_MONITOR_PANE 2>/dev/null)
+  if [ -n "$cand" ] && private.tronMonitor.pane.isValid "$cand"; then
+    echo "$cand"
+    return 0
+  fi
+
+  # Candidate 3 — hardcoded fallback
+  echo "$fallback"
+}
+
+private.tronMonitor.pane.isValid() { # <pane> # return 0 if pane exists in tmux, 1 otherwise
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+  # Split pane target into session + rest (e.g. "TRONinterface:0.3" → "TRONinterface")
+  local sess="${pane%%:*}"
+  [ -z "$sess" ] || [ "$sess" = "$pane" ] && return 1  # malformed — must contain ':'
+  # Session must exist (has-session returns rc=1 if absent; reliable primitive)
+  tmux has-session -t "$sess" 2>/dev/null || return 1
+  # Pane index must exist within that session
+  tmux list-panes -t "$pane" -F '#{pane_id}' >/dev/null 2>&1
 }
 
 private.tronMonitor.screenSession() {
@@ -25,6 +60,36 @@ private.tronMonitor.fullScreenName() { # # return PID.name format for screen -X 
   local fullName
   fullName=$(screen -ls 2>/dev/null | grep "$shortName" | awk '{print $1}' | head -1 || echo "$shortName")
   echo "${fullName:-$shortName}"
+}
+
+private.tronMonitor.screen.isAlive() { # # return 0 if our screen session is running
+  local shortName=$(private.tronMonitor.screenSession)
+  screen -ls 2>/dev/null | grep -q "\.${shortName}[[:space:]]"
+}
+
+private.tronMonitor.screen.ensure() { # # if screen session died, restart it + re-add tracked teams
+  if private.tronMonitor.screen.isAlive; then
+    return 0
+  fi
+  warn.log "tronMonitor screen session '$(private.tronMonitor.screenSession)' is not running"
+  # Auto-recover: start fresh screen via setup, re-add tracked teams
+  local monitorPane
+  monitorPane=$(private.tronMonitor.pane)
+  local screenName=$(private.tronMonitor.screenSession)
+  info.log "auto-recovering: starting screen '$screenName' in $monitorPane"
+  otmux send.raw "$monitorPane" "screen -S $screenName" Enter 2>/dev/null
+  sleep 1
+  # Re-add any tracked teams from env
+  if [ -f "$TRON_MONITOR_ENV" ] && [ -s "$TRON_MONITOR_ENV" ]; then
+    local sess
+    while IFS='|' read -r num sess; do
+      [ -z "$num" ] && continue
+      [[ "$sess" == __test_* ]] && continue
+      if otmux has "$sess" 2>/dev/null; then
+        tronMonitor.add "$sess" 2>/dev/null
+      fi
+    done < "$TRON_MONITOR_ENV"
+  fi
 }
 
 private.tronMonitor.nextWindow() {
@@ -42,32 +107,78 @@ private.tronMonitor.findWindow() { # <teamSession> # return window number or emp
   grep "|${1}$" "$TRON_MONITOR_ENV" 2>/dev/null | head -1 | cut -d'|' -f1
 }
 
-tronMonitor.setup() # <?monitorPane:TRONinterface:0.3> # start GNU screen in the monitor pane
+private.tronMonitor.registry.teams() { # <?onlyLive> # echo team names from hivemind.teams.env
+  # Single source of truth: hivemind.teams.env is the canonical team registry.
+  # tronMonitor.env tracks LOCAL screen-window state and must stay in sync.
+  # If <onlyLive> is non-empty, filter to teams with a live tmux session.
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$teamsFile" ] || return 1
+  local onlyLive="${1:-}"
+  while IFS='|' read -r team desc; do
+    [[ "$team" == "#"* || -z "$team" ]] && continue
+    if [ -n "$onlyLive" ]; then
+      otmux has "$team" 2>/dev/null || continue
+    fi
+    echo "$team"
+  done < "$teamsFile"
+}
+
+private.tronMonitor.tracked.teams() { # # echo team names tracked in tronMonitor.env
+  [ -f "$TRON_MONITOR_ENV" ] || return 1
+  while IFS='|' read -r num sess; do
+    [ -z "$num" ] || [ -z "$sess" ] && continue
+    echo "$sess"
+  done < "$TRON_MONITOR_ENV"
+}
+
+tronMonitor.setup() # <?monitorPane:TRONinterface:0.3> # idempotent — start screen + sync with hiveMind teams (no-op if already set up)
 {
-  local monitorPane="${1:-$(private.tronMonitor.pane)}"
+  # D1.3/D1.10 — idempotent setup:
+  #   • If screen already alive on the right pane → just sync teams (no kill/restart)
+  #   • If screen dead or wrong pane → start fresh, then sync
+  # For destructive reset use tronMonitor.reset (existing).
+  #
+  # Proven Tron recipe (preserved):
+  #   start `screen -S tronMon` in monitor pane;
+  #   for each team in hivemind.teams.env that's live in tmux:
+  #     screen -S tronMon -X screen -t <team> bash -c "TMUX= tmux attach -r -t <team>; exec bash"
+  #   (TMUX= MANDATORY — unsets env so nested tmux works inside screen.
+  #    -r MANDATORY — read-only, prevents layout destruction.
+  #    exec bash MANDATORY — keeps screen window alive after detach.)
+  local userProvided="${1:-}"
+  local monitorPane="${userProvided:-$(private.tronMonitor.pane)}"
   local screenName=$(private.tronMonitor.screenSession)
 
-  config set TRON_MONITOR_PANE "$monitorPane"
+  # Persist config only when user explicitly passed a pane (D1.5)
+  if [ -n "$userProvided" ]; then
+    config set TRON_MONITOR_PANE "$monitorPane"
+  fi
 
-  # Check if screen is already running
-  if screen -ls "$screenName" 2>/dev/null | grep -q "$screenName"; then
-    info.log "Screen session $screenName already running"
+  # Idempotency check (D1.3): if screen already alive AND env file exists, sync only
+  if private.tronMonitor.screen.isAlive && [ -f "$TRON_MONITOR_ENV" ]; then
+    info.log "tronMon screen already running — syncing teams (idempotent)"
+    tronMonitor.sync
+    success.log "$screenName already set up (synced with hiveMind teams)"
     return 0
   fi
 
-  # Start named screen session in the monitor pane
-  otmux send.raw "$monitorPane" "screen -S $screenName" Enter
-  sleep 1
-
+  # Cold start: ensure env file exists (don't truncate — sync will reconcile)
   [ ! -f "$TRON_MONITOR_ENV" ] && touch "$TRON_MONITOR_ENV"
 
-  success.log "Screen session $screenName started in $monitorPane"
+  # Start fresh screen in the monitor pane
+  otmux send.raw "$monitorPane" "screen -S $screenName" Enter
+  sleep 1.5
+
+  # Sync with registry: add all live teams, drop stale entries
+  tronMonitor.sync
+
+  success.log "Screen session $screenName started in $monitorPane (synced with hiveMind teams)"
 }
 tronMonitor.setup.completion.monitorPane() {
   otmux panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
 }
 
-tronMonitor.add() # <teamSession> # add a team session as a read-only screen window
+tronMonitor.add() # <teamSession> # add a team as a named read-only screen window
 {
   local teamSession="$1"
   if [ -z "$teamSession" ]; then
@@ -75,44 +186,64 @@ tronMonitor.add() # <teamSession> # add a team session as a read-only screen win
     return 1
   fi
 
-  # Validate: teamSession must be a real tmux session name.
-  # Without this, error output (e.g. "ERROR> No agent matching ...") passed
-  # as the argument gets silently written to tronMonitor.env as a "team name".
+  # Validate: teamSession must be a real tmux session
   if ! otmux has "$teamSession" 2>/dev/null; then
-    error.log "Not a live tmux session: '$teamSession' — skipping. Run 'otmux sessions' to see valid names."
+    error.log "Not a live tmux session: '$teamSession' — skipping"
     return 1
   fi
 
-  # Check if already added
-  local existing
-  existing=$(private.tronMonitor.findWindow "$teamSession")
-  if [ -n "$existing" ]; then
-    info.log "$teamSession already in window $existing"
-    return 0
+  # Check screen session alive — don't auto-restart (recursion hazard from
+  # SM-reported bug). Caller must run `tronMonitor setup` first if screen died.
+  if ! private.tronMonitor.screen.isAlive; then
+    error.log "tronMon screen not running — run 'tronMonitor setup' first"
+    return 1
   fi
 
+  # Idempotent — skip if team already has a window
+  if private.tronMonitor.findWindow "$teamSession" >/dev/null 2>&1; then
+    local existing
+    existing=$(private.tronMonitor.findWindow "$teamSession")
+    [ -n "$existing" ] && { info.log "$teamSession already in tronMon (window $existing)"; return 0; }
+  fi
 
-  local windowNum=$(private.tronMonitor.nextWindow)
+  # D1.5 — window-size=largest on team session BEFORE attach. Default tmux
+  # clamps clients to smallest attached; largest tolerates small read-only
+  # monitor viewers without shrinking agent panes.
+  tmux set-option -t "$teamSession" window-size largest 2>/dev/null
 
-  # Create new screen window, then stuff the tmux attach command into it
-  screen -S "$(private.tronMonitor.fullScreenName)" -X screen "$windowNum"
+  # D1.10 — proven Tron recipe: create a NAMED screen window whose command
+  # is inline:
+  #   bash -c "TMUX= tmux attach -r -t <team>; exec bash"
+  #
+  # TMUX= unsets env so nested tmux attach works (required when screen runs
+  # inside a tmux pane). -r is MANDATORY (read-only; no layout destruction).
+  # exec bash keeps the window alive after tmux detaches, so screen doesn't
+  # auto-close the window.
+  local screenName
+  screenName=$(private.tronMonitor.fullScreenName)
+  screen -S "$screenName" -X screen -t "$teamSession" \
+    bash -c "TMUX= tmux attach -r -t $teamSession; exec bash" 2>/dev/null
   sleep 0.5
-  screen -S "$(private.tronMonitor.fullScreenName)" -X select "$windowNum"
-  sleep 0.3
-  screen -S "$(private.tronMonitor.fullScreenName)" -X stuff "TMUX= tmux attach -t $teamSession -r$(printf '\r')"
-  sleep 1
 
-  # Track in config
+  # Track in env. Window index is informational (screen assigns it) — we use
+  # names for select/kill. Format kept as "num|team" for backward compat;
+  # num is best-effort via screen's windows query, or "-" if unavailable.
+  local windowNum="-"
+  if command -v screen >/dev/null 2>&1; then
+    # Screen doesn't expose windows-by-name easily; use private.nextWindow
+    # as an approximation if needed. For now, keep it simple.
+    windowNum=$(private.tronMonitor.nextWindow)
+  fi
   echo "${windowNum}|${teamSession}" >> "$TRON_MONITOR_ENV"
 
   otmux pane.title "$(private.tronMonitor.pane)" "TRON-Monitor: $teamSession" 2>/dev/null
-  success.log "Added $teamSession as screen window $windowNum"
+  success.log "Added $teamSession to tronMon"
 }
 tronMonitor.add.completion.teamSession() {
   otmux sessions -F "#{session_name}" 2>/dev/null
 }
 
-tronMonitor.switch() # <teamSession> # switch monitor to show a specific team
+tronMonitor.switch() # <teamSession> # switch monitor to show a specific team (by name)
 {
   local teamSession="$1"
   if [ -z "$teamSession" ]; then
@@ -120,22 +251,25 @@ tronMonitor.switch() # <teamSession> # switch monitor to show a specific team
     return 1
   fi
 
-  local windowNum
-  windowNum=$(private.tronMonitor.findWindow "$teamSession")
-
-  if [ -z "$windowNum" ]; then
-    tronMonitor.add "$teamSession"
-    windowNum=$(private.tronMonitor.findWindow "$teamSession")
-  fi
-
-  if [ -n "$windowNum" ]; then
-    screen -S "$(private.tronMonitor.fullScreenName)" -X select "$windowNum"
-    otmux pane.title "$(private.tronMonitor.pane)" "TRON-Monitor: $teamSession" 2>/dev/null
-    success.log "Switched to $teamSession (window $windowNum)"
-  else
-    error.log "Failed to switch to $teamSession"
+  # Require screen to be running — caller should run setup first
+  if ! private.tronMonitor.screen.isAlive; then
+    error.log "tronMon screen not running — run 'tronMonitor setup' first"
     return 1
   fi
+
+  # Auto-add if not already tracked
+  if ! grep -q "|${teamSession}$" "$TRON_MONITOR_ENV" 2>/dev/null; then
+    tronMonitor.add "$teamSession" || return 1
+  fi
+
+  # D1.10 — select by NAME (the proven recipe uses named windows).
+  # screen's select command accepts window name or number.
+  local screenName
+  screenName=$(private.tronMonitor.fullScreenName)
+  screen -S "$screenName" -X select "$teamSession" 2>/dev/null
+
+  otmux pane.title "$(private.tronMonitor.pane)" "TRON-Monitor: $teamSession" 2>/dev/null
+  success.log "Switched to $teamSession"
 }
 tronMonitor.switch.completion.teamSession() {
   [ -f "$TRON_MONITOR_ENV" ] && cut -d'|' -f2 "$TRON_MONITOR_ENV" 2>/dev/null
@@ -145,6 +279,14 @@ tronMonitor.prune() # # drop env entries whose tmux session no longer exists + t
 {
   [ -f "$TRON_MONITOR_ENV" ] || { info.log "No tronMonitor.env — nothing to prune"; return 0; }
 
+  # D1.6 — if screen died, prune still cleans the env file but skips screen -X calls
+  local screenAlive=""
+  if private.tronMonitor.screen.isAlive; then
+    screenAlive="yes"
+  else
+    warn.log "screen session not running — cleaning env only (no window kills)"
+  fi
+
   local screenName
   screenName=$(private.tronMonitor.fullScreenName)
   local kept=0 dropped=0
@@ -152,28 +294,105 @@ tronMonitor.prune() # # drop env entries whose tmux session no longer exists + t
 
   while IFS='|' read -r num sess; do
     [ -z "$num" ] && continue
-    # Guard 1: session name must be sane (no spaces, no control characters)
-    # Guard 2: session must exist in tmux
-    if [[ "$sess" =~ [[:space:]] ]] || [ -z "$sess" ]; then
-      warn.log "  dropping malformed entry: window $num → '$sess'"
-      [ -n "$screenName" ] && screen -S "$screenName" -X kill 2>/dev/null && \
-        screen -S "$screenName" -X select "$num" 2>/dev/null
-      dropped=$((dropped + 1))
-      continue
+
+    # Guard 1 (NEW): explicit __test_* pattern — test leftovers always prune
+    # Guard 2: malformed entry — spaces, empty, or control chars
+    # Guard 3: tmux session must exist
+    local drop_reason=""
+    if [[ "$sess" == __test_* ]]; then
+      drop_reason="test leftover"
+    elif [[ "$sess" =~ [[:space:]] ]] || [ -z "$sess" ]; then
+      drop_reason="malformed"
+    elif ! otmux has "$sess" 2>/dev/null; then
+      drop_reason="dead session"
     fi
-    if otmux has "$sess" 2>/dev/null; then
+
+    if [ -z "$drop_reason" ]; then
       keep="${keep}${num}|${sess}"$'\n'
       kept=$((kept + 1))
-    else
-      info.log "  dropping dead session: window $num → $sess"
-      [ -n "$screenName" ] && screen -S "$screenName" -X select "$num" 2>/dev/null && \
-        screen -S "$screenName" -X kill 2>/dev/null
-      dropped=$((dropped + 1))
+      continue
     fi
+
+    # Atomic window-targeted kill — `-p <num> -X kill` combines select+kill
+    # safely without racing the currently-selected window (was EPERM cause).
+    info.log "  dropping $drop_reason: window $num → '$sess'"
+    if [ "$screenAlive" = "yes" ] && [ -n "$screenName" ]; then
+      screen -S "$screenName" -p "$num" -X kill 2>/dev/null
+    fi
+    dropped=$((dropped + 1))
   done < "$TRON_MONITOR_ENV"
 
   printf '%s' "$keep" > "$TRON_MONITOR_ENV"
   success.log "Pruned: $dropped dropped, $kept kept"
+}
+
+tronMonitor.sync() # <?dryRun> # reconcile tronMonitor.env with hiveMind team registry (single source of truth)
+{
+  # D1.2 — auto-sync with hiveMind:
+  #   • hivemind.teams.env is the canonical team registry (read-only here)
+  #   • tronMonitor.env tracks LOCAL screen-window state and must match registry
+  # Reconciliation:
+  #   1. Add: teams in registry that are live in tmux but missing from tronMonitor
+  #   2. Drop: tronMonitor entries not in registry (drift cleanup)
+  #   3. Drop: tronMonitor entries whose tmux session died (delegates to prune)
+  # Idempotent (no changes when already in sync). Use <?dryRun> = 'dry' to preview.
+  local dryRun="${1:-}"
+
+  # If screen not alive, env-only sync (matches prune semantics)
+  local screenAlive=""
+  private.tronMonitor.screen.isAlive && screenAlive="yes"
+
+  # Step 1 — Add live registered teams that aren't tracked yet
+  local toAdd=()
+  while IFS= read -r team; do
+    [ -z "$team" ] && continue
+    private.tronMonitor.findWindow "$team" >/dev/null && continue
+    toAdd+=("$team")
+  done < <(private.tronMonitor.registry.teams onlyLive)
+
+  # Step 2 — Find tracked entries not in registry (drift) for removal
+  local registered
+  registered=$(private.tronMonitor.registry.teams)  # all registered, live or not
+  local toRemove=()
+  while IFS= read -r tracked; do
+    [ -z "$tracked" ] && continue
+    if ! echo "$registered" | grep -qx "$tracked"; then
+      toRemove+=("$tracked")
+    fi
+  done < <(private.tronMonitor.tracked.teams)
+
+  # Dry-run preview
+  if [ "$dryRun" = "dry" ] || [ "$dryRun" = "--dry-run" ]; then
+    echo -e "${BOLD_CYAN}tronMonitor sync — DRY RUN${NORMAL}"
+    echo -e "  ${GREEN}+ to add (registered+live, not tracked):${NORMAL}"
+    [ ${#toAdd[@]} -eq 0 ] && echo "    (none)" || printf "    %s\n" "${toAdd[@]}"
+    echo -e "  ${RED}- to drop (tracked, not registered):${NORMAL}"
+    [ ${#toRemove[@]} -eq 0 ] && echo "    (none)" || printf "    %s\n" "${toRemove[@]}"
+    return 0
+  fi
+
+  # Step 3 — Apply changes (idempotent: existing add/remove handle no-op cases)
+  local added=0 removed=0
+  for team in "${toAdd[@]}"; do
+    [ -z "$screenAlive" ] && { warn.log "screen not alive — skipping add of $team"; continue; }
+    tronMonitor.add "$team" >/dev/null 2>&1 && added=$((added + 1))
+  done
+  for team in "${toRemove[@]}"; do
+    tronMonitor.remove "$team" >/dev/null 2>&1 && removed=$((removed + 1))
+  done
+
+  # Step 4 — Also prune dead-session entries (drift cleanup beyond registry mismatch)
+  tronMonitor.prune >/dev/null 2>&1
+
+  if [ "$added" -eq 0 ] && [ "$removed" -eq 0 ]; then
+    info.log "tronMonitor already in sync with hiveMind registry"
+  else
+    success.log "tronMonitor synced — $added added, $removed removed"
+  fi
+}
+tronMonitor.sync.completion.dryRun() {
+  echo "dry"
+  echo "--dry-run"
 }
 
 tronMonitor.list() # # show tracked teams with screen window numbers
@@ -191,7 +410,7 @@ tronMonitor.list() # # show tracked teams with screen window numbers
   done < "$TRON_MONITOR_ENV"
 }
 
-tronMonitor.remove() # <teamSession> # remove a team from the monitor
+tronMonitor.remove() # <teamSession> # idempotent — remove team from monitor (no-op if not tracked)
 {
   local teamSession="$1"
   if [ -z "$teamSession" ]; then
@@ -202,20 +421,26 @@ tronMonitor.remove() # <teamSession> # remove a team from the monitor
   local windowNum
   windowNum=$(private.tronMonitor.findWindow "$teamSession")
 
+  # D1.3 — idempotent: silent no-op if not tracked
   if [ -z "$windowNum" ]; then
-    error.log "$teamSession not found in monitor"
-    return 1
+    info.log "$teamSession not in tronMonitor — nothing to remove"
+    return 0
   fi
 
   # Remove from tracking
   grep -v "|${teamSession}$" "$TRON_MONITOR_ENV" > "${TRON_MONITOR_ENV}.tmp" 2>/dev/null
   mv "${TRON_MONITOR_ENV}.tmp" "$TRON_MONITOR_ENV"
 
-  # Kill the screen window via screen -X
-  local screenName=$(private.tronMonitor.screenSession)
-  screen -S "$(private.tronMonitor.fullScreenName)" -X select "$windowNum"
-  sleep 0.2
-  screen -S "$(private.tronMonitor.fullScreenName)" -X kill
+  # D1.10 — target by NAME. Screen's -p accepts window name; combined with
+  # -X kill this is atomic (no select race). If windowNum is known (tracking
+  # entry had numeric), try that first for maximum compatibility.
+  local screenName
+  screenName=$(private.tronMonitor.fullScreenName)
+  if [ -n "$screenName" ]; then
+    # Try by name (D1.10 preferred); fall back to index (legacy tracking entries)
+    screen -S "$screenName" -p "$teamSession" -X kill 2>/dev/null || \
+      { [ "$windowNum" != "-" ] && screen -S "$screenName" -p "$windowNum" -X kill 2>/dev/null; }
+  fi
 
   success.log "Removed $teamSession (was window $windowNum)"
 }
@@ -323,6 +548,9 @@ tronMonitor.usage()
   echo "
 
   Examples
+    $this setup                           # idempotent — start screen + sync teams
+    $this sync                            # reconcile with hiveMind registry
+    $this sync dry                        # preview sync without applying
     $this setup                           # start screen in TRONinterface:0.3
     $this add UpDown_ai_projectTeam       # add team to monitor
     $this switch UpDown_ai_projectTeam    # switch to team view
