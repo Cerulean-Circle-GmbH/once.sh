@@ -2181,7 +2181,7 @@ ossh.cmd.completion.pkg() {
   compgen -W "bash curl git wget tree expect python3 jq" -- "$1"
 }
 
-ossh.prereqs.install() # <sshConfigHost> # install the oosh install-time prereqs on the remote host (curl, git; apk hosts also get bash + shadow + util-linux + busybox suid; brew hosts also get bash + /etc/paths.d/oosh-homebrew)
+ossh.prereqs.install() # <sshConfigHost> # install the oosh install-time prereqs on the remote host (curl, git; macOS hosts without brew get Homebrew bootstrapped first; apk hosts also get bash + shadow + util-linux + busybox suid; brew hosts also get bash + /etc/paths.d/oosh-homebrew)
 {
   local host="$1"
   [ -z "$host" ] && { error.log "ossh.prereqs.install: no sshConfigHost specified"; return 1; }
@@ -2200,6 +2200,29 @@ ossh.prereqs.install() # <sshConfigHost> # install the oosh install-time prereqs
   # ossh.cmd uses to dispatch installs.
   local pmCmd
   pmCmd=$(ossh.pm.discover "$host")
+
+  # macOS bootstrap: naked images (cirruslabs/macos-sequoia-base, fresh tart
+  # clones, etc.) ship with neither brew nor any other PM, so ossh.pm.discover
+  # echoes nothing and the install loop below would silently no-op — bash 4+
+  # would never land and the next `ossh install <host>` would still abort at
+  # the bash prereq check. Bootstrap Homebrew non-interactively first so we
+  # have a PM to install bash 4+ with. Apple Silicon → /opt/homebrew/bin/brew;
+  # Intel → /usr/local/bin/brew. Either way a fresh non-interactive ssh PATH
+  # won't see brew yet (paths.d wiring happens further down), so re-detect by
+  # probing the binaries directly rather than calling ossh.pm.discover again.
+  if [ -z "$pmCmd" ] && private.ossh.ssh "$host" '[ "$(uname -s)" = "Darwin" ]' 2>/dev/null; then
+    important.log "bootstrapping Homebrew on $host (no PM detected on macOS) — this may take several minutes"
+    private.ossh.ssh -tt "$host" \
+      'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
+      || { error.log "Homebrew bootstrap failed on $host"; return 1; }
+    if private.ossh.ssh "$host" '[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]' 2>/dev/null; then
+      pmCmd="brew install"
+    else
+      error.log "Homebrew bootstrap reported success but brew binary not found at /opt/homebrew/bin or /usr/local/bin on $host"
+      return 1
+    fi
+  fi
+
   case "$pmCmd" in
     "apk add"*) pkgs="$pkgs bash shadow util-linux" ;;
     # NB: brew's bash add is handled in the post-install hook below, not via
@@ -2230,7 +2253,15 @@ ossh.prereqs.install() # <sshConfigHost> # install the oosh install-time prereqs
       # idempotency check would always succeed (macOS ships /bin/bash 3.2),
       # so we bypass it and check the brew-prefix path directly.
       if ! private.ossh.ssh "$host" "[ -x /opt/homebrew/bin/bash ] || [ -x /usr/local/bin/bash ]" 2>/dev/null; then
-        private.ossh.ssh -tt "$host" "brew install bash" \
+        # Source `brew shellenv` inline so `brew` is on PATH even when this
+        # ssh session isn't a login shell — macOS sshd builds PATH from
+        # launchd's hardcoded /usr/bin:/bin:/usr/sbin:/sbin and only
+        # consumes /etc/paths.d via path_helper from /etc/zprofile (login
+        # shells). Right after the Homebrew bootstrap above, the user's
+        # .zprofile entry doesn't help non-interactive sessions either.
+        # Try Apple Silicon prefix first, fall back to Intel.
+        private.ossh.ssh -tt "$host" \
+          'eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)" && brew install bash' \
           || { error.log "failed to install brew bash on $host"; rc=1; }
       else
         info.log "brew bash 4+ already on $host"

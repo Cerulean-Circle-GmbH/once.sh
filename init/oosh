@@ -18,9 +18,27 @@
 # aren't strictly oosh runtime prereqs, but `os platform.test` needs them
 # for its 4-user user-switching flow. See docs/ossh.md.
 
+die() { echo "oosh install: $*" >&2; exit 1; }
+
+# ─── Auto-run guard ──────────────────────────────────────────────────────
+# Sourcing this file (e.g. test/test.oosh) must NOT fire the installer
+# below — sudo re-exec, `mv $OOSH_DIR $HOME/oosh`, and state-machine
+# handoff have wiped user oosh trees in the past. Either opt-out works:
+# BASH_SOURCE[0] != $0 (sourced) or OOSH_NO_AUTORUN=1 (eval-strip loaders
+# that defeat BASH_SOURCE detection). `set -e` lives below the guard so
+# errexit doesn't leak into the sourcing shell.
+if [ "${BASH_SOURCE[0]:-$0}" != "$0" ] || [ "${OOSH_NO_AUTORUN:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 set -e
 
-die() { echo "oosh install: $*" >&2; exit 1; }
+# ─── Branch default ──────────────────────────────────────────────────────
+# Resolved early — the self-re-exec block below needs $OOSH_BRANCH for
+# the curl-pipe pre-clone fallback. `promote` rewrites this literal
+# (see private.promote.rewrite.self.branch in promote:430).
+OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"
+: ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}
 
 # ─── bash 4+ self-re-exec ────────────────────────────────────────────────
 # macOS ships /bin/bash 3.2 (Apple's last GPLv2 release). ssh non-login
@@ -33,22 +51,52 @@ die() { echo "oosh install: $*" >&2; exit 1; }
 #
 # Self-re-exec under brew bash if found. Same idea many other tools use
 # (uv, rye, etc.) when they need a specific runtime that may live outside
-# the default PATH.
+# the default PATH. When $0 isn't a real file (curl-pipe / standalone
+# .command — $0 == "bash"), pre-clone the repo to a temp dir first so
+# brew bash has a real script path to exec. Mirrors the sudo re-exec
+# block's no-real-file handling further down.
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   for _bashCandidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
     if [ -x "$_bashCandidate" ]; then
-      exec "$_bashCandidate" "$0" "$@"
+      if [ -f "$0" ]; then
+        exec "$_bashCandidate" "$0" "$@"
+      else
+        _oosh_tmp_clone="$(mktemp -d)"
+        REPO="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
+        echo "oosh install: re-executing under brew bash (pre-cloning $REPO @ $OOSH_BRANCH to $_oosh_tmp_clone)…" >&2
+        git clone -b "$OOSH_BRANCH" "$REPO" "$_oosh_tmp_clone/once.sh" >/dev/null 2>&1 \
+          || die "pre-re-exec clone failed (network issue?)"
+        exec "$_bashCandidate" "$_oosh_tmp_clone/once.sh/init/oosh" "$@"
+      fi
     fi
   done
   # If no brew bash found, fall through — the prereq check below will
   # produce the framed error message with install hints.
 fi
 
-# ─── Branch default ──────────────────────────────────────────────────────
-# Rewritten by `promote` during dev→testing→prod advancement
-# (see private.promote.rewrite.self.branch in promote:430).
-OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"
-: ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}
+# After re-exec (or even on Linux where BASH_VERSINFO already >=4 and
+# the block above no-op'd), ensure the running bash's directory is at
+# the front of PATH. Two reasons:
+#   1. `command -v bash` at this:801/this:927/init/oosh:255 picks the
+#      bash THIS process is running under, so BASH_FILE persists to a
+#      bash 4+ path. Without this, ssh-non-interactive on macOS finds
+#      /bin/bash 3.2 first via launchd's hardcoded PATH and BASH_FILE
+#      gets the wrong value, breaking shebang resolution for every
+#      oosh script invoked downstream (test.suite, etc.).
+#   2. Subprocesses spawned during install inherit this PATH and
+#      shebangs (#!/usr/bin/env bash) resolve consistently to the
+#      same bash version we're already running.
+_currentBashDir="$(dirname "$(command -v bash 2>/dev/null || echo bash)")"
+if [ -d "$BASH" -o -x "$BASH" ]; then
+  _currentBashDir="$(dirname "$BASH")"
+fi
+if [ -n "$_currentBashDir" ] && [ "$_currentBashDir" != "." ]; then
+  case ":$PATH:" in
+    *":$_currentBashDir:"*) ;;
+    *) export PATH="$_currentBashDir:$PATH" ;;
+  esac
+fi
+unset _currentBashDir
 
 # ─── Arg parsing ─────────────────────────────────────────────────────────
 # `ossh install` invokes us as:
