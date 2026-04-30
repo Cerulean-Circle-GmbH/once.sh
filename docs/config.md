@@ -73,23 +73,33 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 |---|---|---|
 | `~/config` symlink | `<user>:<user>` (NOT `<user>:dev`) | symlink |
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
-| `~/config` target (`…/sharedConfig/`) | `developking:dev` | `2775` (SGID) |
+| `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
+| `oosh.env` | first line: `: ${OOSH_DIR:="$(cd "$HOME/oosh" …)"}` | written by `config save oosh OOSH` |
+| `user.env` | first line: `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` | written by `config save` |
+
+The four `config init.*` repair methods plus `init.full` (which composes them)
+mirror the install steps at `oo:1456` (`config save`) and `oo:1462–1463`
+(`chown -R developking:dev` + `chmod -R g+w`). They explicitly do **not** add
+SGID 2775 — the dev team rejected that approach (see `oo:1273-1274`); group
+ownership on writes is enforced by every writer calling
+`private.ensure.groupWrite` (`this:79`).
 
 #### `config.init.full [<username>]`
 Repair end-to-end: runs `config.init.shared`, then `config.init.user`, then
-`config.init.check`. Defaults to the calling user. Idempotent.
+`config.init.env` (only for self / root), then `config.init.check`. Defaults to
+the calling user. Idempotent.
 
 ```bash
 ./config init.full           # repair self
-./config init.full root      # repair root (run from a root shell)
-./config init.full bob       # repair bob (sudoer caller)
+sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_MODE for the env-regen step)
+./config init.full bob       # repair bob (sudoer caller); env-regen skipped for bob
 ```
 
 #### `config.init.shared`
-Ensures the shared `sharedConfig/` directory has mode `2775`, group `dev`,
-recursively `g+w` on files, and removes any self-referential symlink at
-`sharedConfig/sharedConfig`. Idempotent.
+Ensures the shared `sharedConfig/` directory has group `dev`, recursively
+`g+w`, and removes any self-referential symlink at
+`sharedConfig/sharedConfig`. Mirrors install at `oo:1462–1463`. Idempotent.
 
 ```bash
 ./config init.shared
@@ -108,9 +118,27 @@ backup). Adds `<user>` to group `dev` if not already a member.
 ./config init.user bob       # bob (caller must be root or sudoer)
 ```
 
+#### `config.init.env`
+Regenerates `user.env`, `oosh.env`, and `log.env` by calling `config save`
+(no args) — the same flow the install uses at `oo:1456`. **Backs up
+`user.env` to `user.env.bak.<timestamp>` first** so any hand-edited
+customisations (custom non-`CONFIG_*` exports, hand-added source lines beyond
+what `config add` writes) are recoverable. Caller's shell must have `OOSH_DIR`
+and the relevant `OOSH_*`/`LOG_*` vars set — true for any normal `./config`
+invocation, but under `sudo` use `sudo -E` to preserve env.
+
+```bash
+./config init.env                 # repair self's env files
+sudo -E ./config init.env         # repair from root context (env preserved)
+```
+
+If you tampered with `oosh.env` or `user.env`, this is the canonical fix.
+After running, `./test.suite run config 1`'s T30/T31 (self-anchor checks)
+will pass.
+
 #### `config.init.check [<username>]`
 Diagnostic only — never modifies anything, always returns `0`. Reports the
-`~/config` symlink owner, the `sharedConfig/` mode and group, presence of any
+`~/config` symlink owner, the `sharedConfig/` group, presence of any
 self-referential symlink, and warns if the user is in `/etc/group`'s `dev`
 membership but the *running shell's* active group set doesn't include it (the
 classic post-install "log out fully and log back in" condition).
