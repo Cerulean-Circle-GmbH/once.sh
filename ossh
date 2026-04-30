@@ -2181,104 +2181,32 @@ ossh.cmd.completion.pkg() {
   compgen -W "bash curl git wget tree expect python3 jq" -- "$1"
 }
 
-ossh.prereqs.install() # <sshConfigHost> # install the oosh install-time prereqs on the remote host (curl, git; macOS hosts without brew get Homebrew bootstrapped first; apk hosts also get bash + shadow + util-linux + busybox suid; brew hosts also get bash + /etc/paths.d/oosh-homebrew)
+ossh.prereqs.install() # <sshConfigHost> # ship init/oosh to the host and run its self-install (single source of truth lives in init/oosh's POSIX prelude)
 {
+  # Thin wrapper: SCP `init/oosh` to the remote and run it. The new init/oosh
+  # has a POSIX-sh prelude that installs git + bash 4+ via the platform PM
+  # (or bootstraps Homebrew on naked macOS), so this function no longer
+  # duplicates that logic — it just delivers the script.
+  #
+  # Back-compat: `ossh install <host>` still works (it always SCPs init/oosh
+  # via its own path); this entry point exists so users / docs / CI scripts
+  # that already call `ossh prereqs.install <host>` keep working.
   local host="$1"
   [ -z "$host" ] && { error.log "ossh.prereqs.install: no sshConfigHost specified"; return 1; }
 
-  # Base prereqs every supported package manager needs.
-  local pkgs="curl git"
-
-  # Per-PM additions:
-  #   apk: ships only busybox + ash; oosh needs bash for its shebangs, shadow
-  #        for useradd/chpasswd (busybox `adduser` differs in flags), and
-  #        util-linux for runuser (used by `os platform.test` for user-switching).
-  #   brew: macOS /bin/bash is 3.2 (Apple's last GPLv2 release); oosh requires
-  #        bash 4+. Brew bash lands at /opt/homebrew/bin/bash — paths.d wiring
-  #        below ensures non-interactive ssh sessions actually find it.
-  # Detect by querying the remote's package-manager command — same primitive
-  # ossh.cmd uses to dispatch installs.
-  local pmCmd
-  pmCmd=$(ossh.pm.discover "$host")
-
-  # macOS bootstrap: naked images (cirruslabs/macos-sequoia-base, fresh tart
-  # clones, etc.) ship with neither brew nor any other PM, so ossh.pm.discover
-  # echoes nothing and the install loop below would silently no-op — bash 4+
-  # would never land and the next `ossh install <host>` would still abort at
-  # the bash prereq check. Bootstrap Homebrew non-interactively first so we
-  # have a PM to install bash 4+ with. Apple Silicon → /opt/homebrew/bin/brew;
-  # Intel → /usr/local/bin/brew. Either way a fresh non-interactive ssh PATH
-  # won't see brew yet (paths.d wiring happens further down), so re-detect by
-  # probing the binaries directly rather than calling ossh.pm.discover again.
-  if [ -z "$pmCmd" ] && private.ossh.ssh "$host" '[ "$(uname -s)" = "Darwin" ]' 2>/dev/null; then
-    important.log "bootstrapping Homebrew on $host (no PM detected on macOS) — this may take several minutes"
-    private.ossh.ssh -tt "$host" \
-      'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
-      || { error.log "Homebrew bootstrap failed on $host"; return 1; }
-    if private.ossh.ssh "$host" '[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]' 2>/dev/null; then
-      pmCmd="brew install"
-    else
-      error.log "Homebrew bootstrap reported success but brew binary not found at /opt/homebrew/bin or /usr/local/bin on $host"
-      return 1
-    fi
+  if [ ! -f "$OOSH_DIR/init/oosh" ]; then
+    error.log "ossh.prereqs.install: cannot find $OOSH_DIR/init/oosh — is OOSH_DIR set correctly?"
+    return 1
   fi
 
-  case "$pmCmd" in
-    "apk add"*) pkgs="$pkgs bash shadow util-linux" ;;
-    # NB: brew's bash add is handled in the post-install hook below, not via
-    # the pkgs list. ossh.cmd's idempotency check (`command -v bash`) would
-    # short-circuit because macOS always ships /bin/bash 3.2 — the right
-    # check is "is /opt/homebrew/bin/bash 4+ present", not "is any bash present."
-  esac
-
-  local pkg rc=0
-  for pkg in $pkgs; do
-    ossh cmd "$host" "$pkg" || { error.log "failed to install $pkg on $host"; rc=1; }
-  done
-
-  # Per-PM post-install hooks:
-  case "$pmCmd" in
-    "apk add"*)
-      # Alpine: /bin/busybox is what /bin/su symlinks to. Naked alpine images
-      # ship busybox at mode 0755 (not suid); without the suid bit, non-root
-      # users can't run `su -`, which breaks `user login <other-user>` from a
-      # regular user's shell with "su: must be suid to work properly". Real
-      # alpine deployments typically ship busybox suid by default — restore
-      # that posture so user.login's `env -i su - "$1"` works after install.
-      private.ossh.ssh -tt "$host" "sudo chmod u+s /bin/busybox" \
-        || warn.log "could not set suid on /bin/busybox on $host — 'user login' from non-root will fail until set manually"
-    ;;
-    "brew install"*)
-      # 1) Install brew bash 4+ if absent. ossh.cmd's `command -v bash`
-      # idempotency check would always succeed (macOS ships /bin/bash 3.2),
-      # so we bypass it and check the brew-prefix path directly.
-      if ! private.ossh.ssh "$host" "[ -x /opt/homebrew/bin/bash ] || [ -x /usr/local/bin/bash ]" 2>/dev/null; then
-        # Source `brew shellenv` inline so `brew` is on PATH even when this
-        # ssh session isn't a login shell — macOS sshd builds PATH from
-        # launchd's hardcoded /usr/bin:/bin:/usr/sbin:/sbin and only
-        # consumes /etc/paths.d via path_helper from /etc/zprofile (login
-        # shells). Right after the Homebrew bootstrap above, the user's
-        # .zprofile entry doesn't help non-interactive sessions either.
-        # Try Apple Silicon prefix first, fall back to Intel.
-        private.ossh.ssh -tt "$host" \
-          'eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)" && brew install bash' \
-          || { error.log "failed to install brew bash on $host"; rc=1; }
-      else
-        info.log "brew bash 4+ already on $host"
-      fi
-      # 2) Wire /etc/paths.d/oosh-homebrew. macOS sshd builds non-interactive
-      # PATH via path_helper, which reads /etc/paths + /etc/paths.d/*.
-      # /opt/homebrew/bin is NOT in either by default, so even with brew
-      # bash on disk, ssh-exec'd shebangs (#!/usr/bin/env bash) resolve to
-      # /bin/bash 3.2 and fail oosh's bash-4+ prereq. Wiring it once via
-      # paths.d benefits every non-interactive ssh session on the host.
-      private.ossh.ssh -tt "$host" "echo /opt/homebrew/bin | sudo tee /etc/paths.d/oosh-homebrew >/dev/null && sudo chmod 644 /etc/paths.d/oosh-homebrew" \
-        || warn.log "could not wire /etc/paths.d/oosh-homebrew on $host — non-interactive ssh sessions may not find brew bash"
-    ;;
-  esac
-
-  [ "$rc" -eq 0 ] && success.log "prereqs installed on $host — now run: ossh install $host"
-  return $rc
+  important.log "shipping init/oosh to $host and running its self-install"
+  local remoteTmp="/tmp/oosh-init.$$"
+  scp -q "$OOSH_DIR/init/oosh" "$host:$remoteTmp" \
+    || { error.log "scp of init/oosh to $host failed"; return 1; }
+  # -tt forces a pty so sudo prompts are visible if the remote needs them.
+  # `bash` invocation guarantees POSIX-prelude path even if /tmp/oosh-init.$$
+  # isn't executable. Cleanup runs after install regardless of exit code.
+  private.ossh.ssh -tt "$host" "bash $remoteTmp; _rc=\$?; rm -f $remoteTmp; exit \$_rc"
 }
 ossh.prereqs.install.completion.sshConfigHost() {
   ossh.parameter.completion.sshConfigHost "$@"
