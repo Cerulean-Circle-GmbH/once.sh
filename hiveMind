@@ -744,7 +744,7 @@ hiveMind.protected.agents.offline() # <session> # synthesize 6-field discovery r
   local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
   [ -f "$roleFile" ] || return 1
 
-  while IFS='|' read -r pane role; do
+  while IFS='|' read -r pane role _ts; do
     [ -z "$pane" ] && continue
     case "$pane" in "${session}:"*) ;; *) continue ;; esac
     local uuid=""
@@ -1405,9 +1405,18 @@ hiveMind.send() # <agentName> <text...> # send text/keys to agent by name (deleg
     return 1
   fi
 
-  local target
-  target=$(hiveMind.resolve "$name")
-  if [ $? -ne 0 ]; then
+  # Bug #4 defense: capture both stdout and rc; validate target format before
+  # using. error.log writes to stdout (GOTCHA), so a failed resolve can leave
+  # error text in $target — must check rc AND format.
+  local target resolveRc
+  target=$(hiveMind.resolve "$name" 2>/dev/null)
+  resolveRc=$?
+  if [ $resolveRc -ne 0 ] || [ -z "$target" ]; then
+    error.log "hiveMind.send: cannot resolve '$name' (rc=$resolveRc)"
+    return 1
+  fi
+  if ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    error.log "hiveMind.send: resolve returned malformed target for '$name': '$target'"
     return 1
   fi
   private.hiveMind.monitor.switch "$target"
@@ -1429,12 +1438,21 @@ hiveMind.send.message() # <agentName> <message> # safe send: resolve name across
     return 1
   fi
 
-  # Cross-team resolve. For disambiguation between same-named agents in
-  # multiple teams, caller must use hiveMind.resolve directly with a session.
-  local target
+  # Bug #4 fix: rc-aware + format-validated. The previous version checked
+  # only `[ -z "$target" ]`, which is fooled because error.log writes to
+  # stdout (gets captured into $target on failure). Result: malformed target
+  # (e.g. multi-line error message) was passed to tmux send-keys -t, which
+  # silently fell back to the focused pane, leaking content (digits/words)
+  # into whatever pane Tron was looking at.
+  local target resolveRc
   target=$(hiveMind.resolve "$name" 2>/dev/null)
-  if [ -z "$target" ]; then
-    error.log "Cannot resolve '$name' in any team"
+  resolveRc=$?
+  if [ $resolveRc -ne 0 ] || [ -z "$target" ]; then
+    error.log "hiveMind.send.message: cannot resolve '$name' in any team (rc=$resolveRc)"
+    return 1
+  fi
+  if ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    error.log "hiveMind.send.message: resolve returned malformed target for '$name': '$target'"
     return 1
   fi
   private.hiveMind.monitor.switch "$target"
@@ -1944,12 +1962,14 @@ hiveMind.teams.save() # # snapshot all Claude processes + layout for cold-restar
     echo "$seenSessions" | grep -q " ${sess} " || seenSessions="${seenSessions} ${sess} "
   done < <(private.hiveMind.claude.processes)
 
-  # Also include dead agents + shell panes from registry+sessions.env
+  # Also include dead agents + shell panes from registry+sessions.env.
+  # 3rd field _reg_ts absorbs the optional B5.1 TTL timestamp; absent for
+  # legacy 2-field entries (then _reg_ts is empty and is discarded).
   local reg="$HIVEMIND_REGISTRY"
   local ses="$HIVEMIND_SESSIONS"
   local dead_count=0
   if [ -f "$reg" ]; then
-    while IFS='|' read -r pane_target reg_role; do
+    while IFS='|' read -r pane_target reg_role _reg_ts; do
       [ -z "$pane_target" ] || [ -z "$reg_role" ] && continue
       [ -f "$tmpEntries" ] && grep -q "|${reg_role}|" "$tmpEntries" 2>/dev/null && continue
       local dead_sess="${pane_target%%:*}"
@@ -3413,7 +3433,7 @@ hiveMind.registry.fix() # # clean up invalid entries in roles registry (raw %NNN
   local fixed=0 dropped=0
   > "$tmpfile"
 
-  while IFS='|' read -r pane role; do
+  while IFS='|' read -r pane role _ts; do
     [ -z "$pane" ] || [ -z "$role" ] && continue
     # Skip entries with raw pane IDs (%NNN format)
     if echo "$pane" | grep -qE '^%[0-9]+$'; then
@@ -3697,7 +3717,7 @@ hiveMind.agent.context.status() # <agentName> <?session> # show context % for on
 
   # Find the agent in the registry
   local target=""
-  while IFS='|' read -r t r; do
+  while IFS='|' read -r t r _ts; do
     [ -z "$t" ] || [ -z "$r" ] && continue
     case "$t" in "${session}:"*) ;; *) continue ;; esac
     if [ "$r" = "$agent" ]; then
@@ -4590,7 +4610,7 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
   local own_pane=""
   [ -n "$TMUX_PANE" ] && own_pane="$TMUX_PANE"
 
-  while IFS='|' read -r target role; do
+  while IFS='|' read -r target role _ts; do
     [ -z "$target" ] || [ -z "$role" ] && continue
     case "$target" in "${session}:"*) ;; *) continue ;; esac
 
@@ -5162,7 +5182,7 @@ hiveMind.pane.sweep() # <?session> <?interval> # show last lines of each agent p
     return 1
   fi
 
-  while IFS='|' read -r target role; do
+  while IFS='|' read -r target role _ts; do
     [ -z "$target" ] || [ -z "$role" ] && continue
     case "$target" in "${session}:"*) ;; *) continue ;; esac
 
@@ -5300,7 +5320,7 @@ hiveMind.dashboard() # <?session> # write consolidated team state to session/das
 
   # Iterate all agents
   if [ -f "$registry" ]; then
-    while IFS='|' read -r target role; do
+    while IFS='|' read -r target role _ts; do
       [ -z "$role" ] && continue
       [[ "$target" != "$session:"* ]] && continue
 
@@ -5363,7 +5383,7 @@ hiveMind.agent.unblock() # <agentName> <?session> # detect and resolve stuck pro
   local session="${2:-$(private.hiveMind.active.team)}"
 
   if [ "$name" = "all" ]; then
-    while IFS='|' read -r target role; do
+    while IFS='|' read -r target role _ts; do
       [ -z "$target" ] || [ -z "$role" ] && continue
       case "$target" in "${session}:"*) ;; *) continue ;; esac
       private.hiveMind.agent.unblock.pane "$target" "$role"
