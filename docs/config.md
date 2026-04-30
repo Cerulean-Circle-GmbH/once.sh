@@ -56,6 +56,69 @@ Initializes the config environment. Creates `~/config/` directory if needed.
 ./config init
 ```
 
+### Repair (`config init.*`)
+
+A small family of repair primitives that brings a tampered or partially-set-up
+OOSH layout back to the canonical state produced by a fresh `init/oosh` install.
+**Fresh installs do not need these** — `init/oosh` (via `oo` state 31 and
+`user.oosh.install`) already produces the correct layout. Use these only when
+the box has been hand-edited after install (e.g. wrong symlink ownership,
+missing `dev`-group ACL on `sharedConfig/`, the self-referential
+`sharedConfig/sharedConfig` symlink, etc.) or when bringing a snapshot up to
+parity with another machine.
+
+Canonical state (what `init/oosh` produces and what these methods enforce):
+
+| Path | Owner | Mode |
+|---|---|---|
+| `~/config` symlink | `<user>:<user>` (NOT `<user>:dev`) | symlink |
+| `~/oosh` symlink   | `<user>:<user>` | symlink |
+| `~/config` target (`…/sharedConfig/`) | `developking:dev` | `2775` (SGID) |
+| files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
+
+#### `config.init.full [<username>]`
+Repair end-to-end: runs `config.init.shared`, then `config.init.user`, then
+`config.init.check`. Defaults to the calling user. Idempotent.
+
+```bash
+./config init.full           # repair self
+./config init.full root      # repair root (run from a root shell)
+./config init.full bob       # repair bob (sudoer caller)
+```
+
+#### `config.init.shared`
+Ensures the shared `sharedConfig/` directory has mode `2775`, group `dev`,
+recursively `g+w` on files, and removes any self-referential symlink at
+`sharedConfig/sharedConfig`. Idempotent.
+
+```bash
+./config init.shared
+```
+
+#### `config.init.user [<username>]`
+Ensures `<user>`'s `~/config` and `~/oosh` symlinks point at the canonical
+shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
+`~/oosh` directories are renamed to `~/config.orig.<timestamp>` (data
+preserved, never deleted). Installs `templates/user/bashrcTemplate` if the
+OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
+backup). Adds `<user>` to group `dev` if not already a member.
+
+```bash
+./config init.user           # self
+./config init.user bob       # bob (caller must be root or sudoer)
+```
+
+#### `config.init.check [<username>]`
+Diagnostic only — never modifies anything, always returns `0`. Reports the
+`~/config` symlink owner, the `sharedConfig/` mode and group, presence of any
+self-referential symlink, and warns if the user is in `/etc/group`'s `dev`
+membership but the *running shell's* active group set doesn't include it (the
+classic post-install "log out fully and log back in" condition).
+
+```bash
+./config init.check
+```
+
 ### Saving Configuration
 
 #### `config.save [name] [PREFIX]`
