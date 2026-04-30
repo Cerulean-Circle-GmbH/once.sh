@@ -36,6 +36,13 @@
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 : ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
 
+# B5.1 — TTL window during which manual registry.set takes priority over live
+# discovery. After registry.set, the entry is "fresh"; live discovery will not
+# overwrite it for HIVEMIND_REGISTRY_TTL seconds. After the window expires, live
+# discovery resumes priority (handles cases where the agent /rename'd to a
+# different role or moved panes externally).
+: ${HIVEMIND_REGISTRY_TTL:=30}
+
 # Default agent roles
 HIVEMIND_DEFAULT_AGENTS=(
   "orchestrator"
@@ -319,7 +326,9 @@ private.hiveMind.sessions.migrate() {
 }
 
 private.hiveMind.registry.set() {
-  # Add or update a target→role mapping
+  # Add or update a target→role mapping with timestamp (B5.1 TTL).
+  # Format: pane|role|epoch-timestamp (3 fields). Old 2-field entries are
+  # backward-compatible — readers default missing timestamp to 0 (= stale).
   local target="$1"
   local role="$2"
   [ -z "$target" ] || [ -z "$role" ] && return 1
@@ -338,41 +347,94 @@ private.hiveMind.registry.set() {
   local config_dir
   config_dir=$(dirname "$HIVEMIND_REGISTRY")
   mkdir -p "$config_dir" 2>/dev/null
-  # Remove old entry for this target, then append new one
+  # Remove old entry for this target, then append new one with timestamp
   if [ -f "$HIVEMIND_REGISTRY" ]; then
     grep -v "^${target}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
     mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
   fi
-  echo "${target}|${role}" >> "$HIVEMIND_REGISTRY"
+  local ts
+  ts=$(date +%s 2>/dev/null)
+  echo "${target}|${role}|${ts}" >> "$HIVEMIND_REGISTRY"
+}
+
+private.hiveMind.registry.isRecent() { # <pane> # 0 if file entry was set within TTL window
+  # B5.1 — true when manual registry.set should win over live discovery.
+  # Checks 3rd field (timestamp) against now − HIVEMIND_REGISTRY_TTL.
+  local target="$1"
+  [ -z "$target" ] && return 1
+  [ -f "$HIVEMIND_REGISTRY" ] || return 1
+  local ts
+  ts=$(grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f3)
+  [ -z "$ts" ] && return 1               # 2-field entry (legacy) — not recent
+  ! [[ "$ts" =~ ^[0-9]+$ ]] && return 1  # malformed timestamp
+  local now
+  now=$(date +%s 2>/dev/null)
+  [ -z "$now" ] && return 1
+  local age=$(( now - ts ))
+  [ "$age" -lt 0 ] && return 1           # clock skew safety
+  [ "$age" -le "${HIVEMIND_REGISTRY_TTL:-30}" ]
 }
 
 private.hiveMind.registry.get() {
-  # Look up role for a given pane target
-  # PRIMARY: live discovery from running Claude process
-  # FALLBACK: static file (for panes where Claude isn't running yet)
+  # Look up role for a given pane target.
+  # B5.1 priority order:
+  #   1. File entry IF set within HIVEMIND_REGISTRY_TTL (manual-set wins fresh)
+  #   2. Live discovery from running Claude process
+  #   3. File entry (any age) — fallback when live can't find role
   local target="$1"
+  [ -z "$target" ] && return 1
+  private.hiveMind.registry.migrate
+
+  # Priority 1 — recently-set file entry overrides live discovery
+  if private.hiveMind.registry.isRecent "$target"; then
+    grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
+    return 0
+  fi
+
+  # Priority 2 — live discovery (handles /rename'd agents not yet in registry)
   local role
   role=$(private.hiveMind.live.discover "$target" 2>/dev/null)
   [ -n "$role" ] && echo "$role" && return 0
-  # Fallback to static registry file
-  private.hiveMind.registry.migrate
+
+  # Priority 3 — any file entry (stale ok)
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
 }
 
 private.hiveMind.registry.find() {
-  # Find pane target by role name (case-insensitive partial match)
-  # PRIMARY: live discovery — scan panes for matching role
-  # FALLBACK: static file
+  # Find pane target by role name (case-insensitive partial match).
+  # B5.1 priority order:
+  #   1. Recently-set file entries (manual registry.set wins fresh)
+  #   2. Live discovery from running Claude processes
+  #   3. Any file entry (stale ok) — verified to exist in tmux
   local name="$1"
   local session="$2"
+  private.hiveMind.registry.migrate
+
+  # Priority 1 — scan file for recent entries matching role
+  if [ -f "$HIVEMIND_REGISTRY" ]; then
+    local recentCandidates
+    if [ -n "$session" ]; then
+      recentCandidates=$(grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | grep -i "$name" | cut -d'|' -f1)
+    else
+      recentCandidates=$(grep -i "$name" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f1)
+    fi
+    local cand
+    for cand in $recentCandidates; do
+      if private.hiveMind.registry.isRecent "$cand"; then
+        otmux has "${cand%%:*}" 2>/dev/null && echo "$cand" && return 0
+      fi
+    done
+  fi
+
+  # Priority 2 — live discovery
   if [ -n "$session" ]; then
     local match
     match=$(private.hiveMind.live.discover.session "$session" 2>/dev/null | grep -i "$name" | head -1 | cut -d'|' -f1)
     [ -n "$match" ] && echo "$match" && return 0
   fi
-  # Fallback to static registry file — verify pane exists in tmux
-  private.hiveMind.registry.migrate
+
+  # Priority 3 — any file entry (stale ok), verified to exist in tmux
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   local candidates
   if [ -n "$session" ]; then
@@ -382,7 +444,6 @@ private.hiveMind.registry.find() {
   fi
   local pane
   for pane in $candidates; do
-    # Verify pane exists in tmux (skip dead/stale entries)
     otmux has "${pane%%:*}" 2>/dev/null && echo "$pane" && return 0
   done
 }
@@ -2519,6 +2580,49 @@ hiveMind.protected.session.renamed() # <oldName> <newName> # update all env file
   [ -f "$active" ] && grep -q "^${old}$" "$active" 2>/dev/null && echo "$new" > "$active"
 
   info.log "Session renamed: $old → $new (env files updated)"
+}
+
+hiveMind.protected.pane.layout.changed() # <session> # B5.1 observer — refresh registry after pane add/move/join (View → Controller)
+{
+  # View notifies Controller after split/move/join because pane indices may have
+  # shifted. Controller reconciles by re-running live discovery for the session
+  # so any role-bearing panes (running Claude w/ /rename'd title) get re-mapped
+  # to their new indices. Registry entries set in the last $HIVEMIND_REGISTRY_TTL
+  # seconds are preserved (priority over live discovery — see registry.set TTL).
+  local session="$1"
+  [ -z "$session" ] && return 1
+  otmux has "$session" 2>/dev/null || return 0
+  # Best-effort refresh — silent if registry.refresh isn't available
+  if type -t hiveMind.registry.refresh >/dev/null 2>&1; then
+    hiveMind.registry.refresh "$session" 2>/dev/null
+  fi
+  info.log "Pane layout changed in $session — registry refreshed"
+}
+
+hiveMind.protected.pane.swap() # <paneA> <paneB> # B5.1 observer — swap role assignments after tmux swap-pane (agent moves with pane)
+{
+  # tmux swap-pane physically swaps pane CONTENT (the running shells/processes).
+  # An agent that was in paneA is now in paneB. The registry entries must swap
+  # to match — otherwise hiveMind.resolve returns the wrong pane for an agent.
+  local a="$1" b="$2"
+  [ -z "$a" ] || [ -z "$b" ] && return 1
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+
+  # Read current roles for both panes (may be empty if no entry exists)
+  local roleA roleB
+  roleA=$(grep "^${a}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  roleB=$(grep "^${b}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+
+  # Drop both old entries
+  grep -vE "^(${a}|${b})\|" "$reg" > "${reg}.tmp" 2>/dev/null
+  mv "${reg}.tmp" "$reg"
+
+  # Re-insert with swapped roles (preserve content where possible)
+  [ -n "$roleA" ] && private.hiveMind.registry.set "$b" "$roleA"
+  [ -n "$roleB" ] && private.hiveMind.registry.set "$a" "$roleB"
+
+  info.log "Pane swap: $a ⇄ $b (roles: ${roleA:-∅}|${roleB:-∅} → ${roleB:-∅}|${roleA:-∅})"
 }
 
 hiveMind.registry.set() # <pane> <role> # set registry entry for a pane
