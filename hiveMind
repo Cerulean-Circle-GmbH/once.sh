@@ -4986,8 +4986,13 @@ private.hiveMind.sweep.detect() {
 }
 
 private.hiveMind.agent.unblock.pane() {
-  # Detect and resolve blocker on a single pane
-  # Handles new sweep.detect format: status|action|severity[|detail]
+  # Detect and resolve blocker on a single pane.
+  # Bug #2 fix: STRICT ALLOWLIST — keys are sent ONLY to panes confirmed in a
+  # blocking state. Active/idle/completed/unknown/anything-else are no-ops.
+  # SM previously interrupted web4-po twice because the old fallback `*)` case
+  # forwarded $action (enter/down-enter) for non-blocked statuses.
+  #
+  # Handles sweep.detect format: status|action|severity[|detail]
   local target="$1"
   local label="$2"
   local attempt="${3:-1}"
@@ -4999,11 +5004,32 @@ private.hiveMind.agent.unblock.pane() {
   local status action severity detail
   IFS='|' read -r status action severity detail <<< "$result"
 
-  # Skip if already healthy
+  # Bug #2 ALLOWLIST — explicit list of statuses that trigger key sends.
+  # Per PO: permission, tool-confirm, accept-edits, queued.
+  # Wait-only statuses (rate-limit, mcp-error, …) are handled separately below.
+  # Anything not in either list is silently skipped — never send keys to an
+  # ACTIVE agent.
   case "$status" in
-    active|idle|unknown) return 0 ;;
+    permission|tool-confirm|accept-edits|queued)
+      ;;  # falls through to action handlers below
+    rate-limit|api-error|mcp-error)
+      console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
+      return 0
+      ;;
+    subscription-limit|crash|shell-escaped)
+      warn.log "CRITICAL $label ($status) — needs human intervention"
+      return 0
+      ;;
+    *)
+      # active|idle|completed|unknown|overlay|panel|autocomplete|<anything-new>
+      # → SKIP. No keys sent. Old fallback that read $action is REMOVED — that
+      # was the regression vector that interrupted web4-po.
+      debug.log "Skipping $label ($status) — not in unblock allowlist"
+      return 0
+      ;;
   esac
 
+  # Below here only runs for: permission, tool-confirm, accept-edits, queued.
   case "$status" in
     permission)
       # Select option 2 ("Yes, and don't ask again") — Down then Enter
@@ -5035,77 +5061,27 @@ private.hiveMind.agent.unblock.pane() {
       sleep 0.3
       console.log "Unblocked $label ($status) → $((count+1))x Enter + 2x BTab (back to normal)"
       ;;
-    overlay|panel)
-      # Dismiss overlay or git panel
-      otmux send.raw "$target" Escape
-      console.log "Unblocked $label ($status) → Escape"
-      ;;
-    autocomplete)
-      # Dismiss stuck autocomplete menu
-      otmux send.raw "$target" Escape
-      console.log "Unblocked $label ($status) → Escape"
-      ;;
     queued)
       # Submit queued text
       otmux send.raw "$target" Enter
       console.log "Unblocked $label ($status) → Enter"
       ;;
-    rate-limit|api-error)
-      # Transient — just wait, auto-recovers
-      console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
-      ;;
-    subscription-limit|crash|shell-escaped)
-      # Critical — cannot auto-resolve, log warning
-      warn.log "CRITICAL $label ($status) — needs human intervention"
-      ;;
-    mcp-error)
-      # MCP errors often self-recover
-      console.log "Waiting $label ($status) — MCP reconnecting"
-      ;;
-    *)
-      # Fallback: use action field
-      case "$action" in
-        enter)
-          otmux send.raw "$target" Enter
-          console.log "Unblocked $label ($status) → Enter"
-          ;;
-        down-enter)
-          otmux send.raw "$target" Down
-          sleep 0.3
-          otmux send.raw "$target" Enter
-          console.log "Unblocked $label ($status) → Down+Enter"
-          ;;
-        escape)
-          otmux send.raw "$target" Escape
-          sleep 0.1
-          otmux send.raw "$target" Enter
-          console.log "Unblocked $label ($status) → Escape+Enter"
-          ;;
-        wait)
-          console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
-          ;;
-        none) ;;
-      esac
-      ;;
   esac
 
-  # Verify: re-detect after action (skip for wait-only states)
-  case "$status" in
-    rate-limit|api-error|subscription-limit|crash|shell-escaped|mcp-error) return 0 ;;
-  esac
-
+  # Verify: re-detect after action. If still blocked with same/another
+  # actionable state, retry once. If now active/idle/completed/etc., we're done.
   if [ "$attempt" -le 1 ]; then
     sleep 1
     local recheck
     recheck=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
     local new_status="${recheck%%|*}"
     case "$new_status" in
-      active|idle|unknown)
-        debug.log "Verified: $label cleared ($status → $new_status)"
-        ;;
-      *)
+      permission|tool-confirm|accept-edits|queued)
         warn.log "$label still blocked ($new_status) — retrying once"
         private.hiveMind.agent.unblock.pane "$target" "$label" 2
+        ;;
+      *)
+        debug.log "Verified: $label cleared ($status → $new_status)"
         ;;
     esac
   fi
