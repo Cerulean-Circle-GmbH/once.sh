@@ -2599,11 +2599,51 @@ hiveMind.protected.panes.shifted() # <session> # B5.1 observer — registry refr
   info.log "Panes shifted in $session — registry refreshed"
 }
 
+private.hiveMind.pane.pushRoleEnv() { # <pane> <newRole> # Bug #3 — push HIVEMIND_ROLE update to pane shell
+  # After swap/move, the pane index has changed but the shell process retained
+  # its old HIVEMIND_ROLE export. The sender prefix in otmux uses that env var
+  # first (registry is fallback), so without an env update the prefix can be
+  # wrong (esp. after rename or in cases where roles diverge from sessions.env).
+  #
+  # Strategy: only push the export when pane is running a plain shell. Sending
+  # to a Claude Code TUI would inject text into the agent's input prompt —
+  # harmful. The shell's HIVEMIND_ROLE will inherit into any future Claude
+  # process started in that pane (bootstrap/respawn).
+  local pane="$1" newRole="$2"
+  [ -z "$pane" ] || [ -z "$newRole" ] && return 0
+  # Use raw tmux to avoid re-entering the OOSH dispatch chain (info.log noise
+  # would pollute $cmd at higher LOG_LEVEL). hiveMind already invokes tmux
+  # directly elsewhere via otmux which uses tmux -u; here we need a single
+  # display-message read, no flag stacking — plain `tmux` is fine.
+  local cmd
+  cmd=$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)
+  cmd="${cmd##*$'\n'}"   # last line only — defensive
+  case "$cmd" in
+    bash|zsh|sh|fish)
+      # Verify it's not a Claude Code child process running under bash
+      if "$OOSH_DIR/claudeCode" process.running "$pane" 2>/dev/null; then
+        debug.log "Skipping HIVEMIND_ROLE update on $pane — Claude running under shell"
+        return 0
+      fi
+      otmux send.enter "$pane" "export HIVEMIND_ROLE=$newRole" 2>/dev/null
+      debug.log "Pushed HIVEMIND_ROLE=$newRole to shell at $pane"
+      ;;
+    *)
+      # Claude/node/other TUI — env update would inject into prompt; skip.
+      # The registry is now correct; otmux send.prefix will fall back to file
+      # lookup if HIVEMIND_ROLE doesn't match registry (see otmux send.prefix).
+      debug.log "Skipping HIVEMIND_ROLE update on $pane (cmd=$cmd) — TUI"
+      ;;
+  esac
+}
+
 hiveMind.protected.panes.swapped() # <session> <paneA> <paneB> # B5.1 observer — swap registry entries after tmux swap-pane
 {
   # tmux swap-pane physically swaps pane CONTENT (the running shells/processes).
   # An agent that was in paneA is now in paneB. The registry must swap to match
   # — otherwise hiveMind.resolve returns the wrong pane for an agent.
+  # Bug #3: shells in those panes retain old HIVEMIND_ROLE — push the new value
+  # to each (only safe for plain shells; Claude TUIs are skipped).
   # <session> arg matches PUML spec but is informational here (panes already
   # carry their session prefix in session:window.pane format).
   local session="$1" a="$2" b="$3"
@@ -2621,6 +2661,11 @@ hiveMind.protected.panes.swapped() # <session> <paneA> <paneB> # B5.1 observer �
   [ -n "$roleA" ] && private.hiveMind.registry.set "$b" "$roleA"
   [ -n "$roleB" ] && private.hiveMind.registry.set "$a" "$roleB"
 
+  # Bug #3 — push HIVEMIND_ROLE to each pane shell (the agent moved with the
+  # pane, so paneB now holds roleA's agent and vice versa).
+  [ -n "$roleA" ] && private.hiveMind.pane.pushRoleEnv "$b" "$roleA"
+  [ -n "$roleB" ] && private.hiveMind.pane.pushRoleEnv "$a" "$roleB"
+
   info.log "Panes swapped: $a ⇄ $b (roles: ${roleA:-∅}|${roleB:-∅} → ${roleB:-∅}|${roleA:-∅})"
 }
 
@@ -2628,6 +2673,8 @@ hiveMind.protected.pane.moved() # <fromPane> <toPane> # B5.1 observer — pane m
 {
   # Called by otmux.pane.move and otmux.pane.join when a pane moves to a new
   # location. Renames the registry key from old pane target to new.
+  # Bug #3: also push HIVEMIND_ROLE refresh to the destination shell so the
+  # sender prefix is correct from the new pane location.
   local from="$1" to="$2"
   [ -z "$from" ] || [ -z "$to" ] && return 1
   local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
@@ -2639,6 +2686,8 @@ hiveMind.protected.pane.moved() # <fromPane> <toPane> # B5.1 observer — pane m
     grep -v "^${from}|" "$reg" > "${reg}.tmp" 2>/dev/null
     mv "${reg}.tmp" "$reg"
     private.hiveMind.registry.set "$to" "$role"
+    # Bug #3 — push HIVEMIND_ROLE to new pane location's shell
+    private.hiveMind.pane.pushRoleEnv "$to" "$role"
     info.log "Pane moved: $from → $to (role $role preserved)"
   fi
 }
