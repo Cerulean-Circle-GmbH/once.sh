@@ -2413,16 +2413,90 @@ otmux.buffer.choose() # # interactively choose buffer
 
 # --- CLIENT ALIASES ---
 
-otmux.client.list() # # list connected clients
+otmux.client.list() # # list connected clients with size, flags, session, idle (B6)
 {
-  otmux.clients "$@"
+  # B6: structured format with size + flags helps diagnose layout-crush from
+  # stale read-only/small clients (e.g. tronMonitor's 54x26 screen attaches).
+  if ! $TMUX_CMD list-clients >/dev/null 2>&1; then
+    echo "no tmux server"
+    return 1
+  fi
+  printf "%-18s %-22s %-9s %-44s %s\n" "TTY" "SESSION" "SIZE" "FLAGS" "IDLE"
+  $TMUX_CMD list-clients -F '#{client_tty}|#{client_session}|#{client_width}x#{client_height}|#{client_flags}|#{client_activity}' 2>/dev/null \
+    | while IFS='|' read -r tty sess size flags activity; do
+        local idle="-"
+        if [ -n "$activity" ] && [ "$activity" -gt 0 ] 2>/dev/null; then
+          local now
+          now=$(date +%s)
+          local secs=$((now - activity))
+          if [ "$secs" -ge 3600 ]; then
+            idle="$((secs / 3600))h $((secs % 3600 / 60))m"
+          elif [ "$secs" -ge 60 ]; then
+            idle="$((secs / 60))m"
+          else
+            idle="${secs}s"
+          fi
+        fi
+        printf "%-18s %-22s %-9s %-44s %s\n" "$tty" "$sess" "$size" "$flags" "$idle"
+      done
 }
 
-otmux.client.detach() # <?client> # detach client; client=client tty (e.g., /dev/pts/0)
+otmux.client.detach() # <?client> # detach client by tty; refreshes remaining clients to restore layout (B6)
 {
-  private.otmux.detachClient "$@"
+  # B6: after detach, refresh-client -S forces all remaining clients to
+  # re-sync sizes — crucial after killing a small read-only client that
+  # was forcing window-size=smallest behavior.
+  local target="$1"
+  if [ -n "$target" ]; then
+    if ! $TMUX_CMD detach-client -t "$target" 2>&1; then
+      error.log "client.detach: failed to detach '$target'"
+      return 1
+    fi
+    info.log "Detached client: $target"
+  else
+    $TMUX_CMD detach-client 2>&1
+  fi
+  # Trigger size re-sync on remaining clients (only if server still up)
+  if $TMUX_CMD list-clients >/dev/null 2>&1; then
+    $TMUX_CMD refresh-client -S 2>/dev/null
+  fi
+  return 0
 }
 otmux.client.detach.completion.client() { private.complete.clients; }
+
+otmux.client.cleanup() # <?filter:read-only> # detach stale clients matching <filter>; refresh layout
+{
+  # B6: bulk-detach clients whose flags include <filter>. Default 'read-only'
+  # targets monitoring clients (e.g. tronMonitor's screen→tmux attach -r) that
+  # crush layout when their terminal is small.
+  # Other useful filters: 'ignore-size' (won't grow but counted), or any flag.
+  local filter="${1:-read-only}"
+  if ! $TMUX_CMD list-clients >/dev/null 2>&1; then
+    echo "no tmux server"
+    return 1
+  fi
+  local detached=0 skipped=0
+  while IFS='|' read -r tty flags; do
+    [ -z "$tty" ] && continue
+    if echo "$flags" | grep -q "$filter"; then
+      info.log "client.cleanup: detaching $tty (matches '$filter') — flags=$flags"
+      $TMUX_CMD detach-client -t "$tty" 2>/dev/null && detached=$((detached + 1))
+    else
+      skipped=$((skipped + 1))
+    fi
+  done < <($TMUX_CMD list-clients -F '#{client_tty}|#{client_flags}' 2>/dev/null)
+  # Force layout re-sync on whatever survived (crucial — this restores widths)
+  if $TMUX_CMD list-clients >/dev/null 2>&1; then
+    $TMUX_CMD refresh-client -S 2>/dev/null
+  fi
+  success.log "client.cleanup: detached $detached, kept $skipped (filter='$filter')"
+}
+otmux.client.cleanup.completion.filter() {
+  echo "read-only"
+  echo "ignore-size"
+  echo "attached"
+  echo "focused"
+}
 
 otmux.client.suspend() # # suspend current client (Ctrl+Z)
 {
