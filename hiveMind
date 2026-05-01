@@ -1928,6 +1928,136 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
   return 0
 }
 
+hiveMind.roles.list.uuids() # <role> # list all session UUIDs that ever ran as <role>, sorted by recency (Epic J1)
+{
+  # Output: tab-separated rows + header. Status ∈ {live, dead, orphan}.
+  # Sources (DRY):
+  #   • JSONL scan for sessionId + tail customTitle + mtime (mirrors claudeCode list)
+  #   • ps for live UUID→pane (mirrors hiveMind process.list internals via private.claude.processes)
+  # Match: customTitle equal-or-prefix-of role|fallback-role (case-insensitive).
+  # Strips '@model' suffix on the title before comparison.
+  local role="$1"
+  if [ -z "$role" ]; then
+    error.log "Usage: hiveMind roles.list.uuids <role>"
+    return 1
+  fi
+
+  ROLE="$role" python3 << 'EOF'
+import os, glob, sys, re, time, subprocess
+
+role = os.environ.get('ROLE', '').lower()
+
+# 1. Live UUID → pane map via ps (same source private.hiveMind.claude.processes uses)
+live = {}  # uuid → pane
+try:
+    out = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, check=False).stdout
+    uuid_re = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    for line in out.splitlines():
+        if 'claude' not in line.lower():
+            continue
+        m = uuid_re.search(line)
+        if m:
+            live[m.group(0)] = '?'  # pane unknown without tmux cross-ref
+except Exception:
+    pass
+
+# Cross-ref pane via tmux (one tmux call, parse pane→tty + ps tty→uuid)
+try:
+    panes = subprocess.run(['tmux', 'list-panes', '-a', '-F', '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'],
+                            capture_output=True, text=True, check=False).stdout
+    tty_to_pane = {}
+    for line in panes.splitlines():
+        parts = line.split(' ', 1)
+        if len(parts) == 2:
+            tty_to_pane[parts[0].replace('/dev/', '')] = parts[1]
+    # Re-scan ps with tty for live UUIDs
+    psout = subprocess.run(['ps', '-eo', 'tty,args'], capture_output=True, text=True, check=False).stdout
+    for line in psout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        tty, args = parts
+        if 'claude' not in args.lower():
+            continue
+        m = uuid_re.search(args)
+        if not m:
+            continue
+        uuid = m.group(0)
+        pane = tty_to_pane.get(tty, '?')
+        if pane != '?':
+            live[uuid] = pane
+        elif uuid not in live:
+            live[uuid] = '?'
+except Exception:
+    pass
+
+# 2. Scan JSONL files for sessionId + customTitle + mtime
+projects_dir = os.path.expanduser('~/.claude/projects')
+ct_re = re.compile(r'"customTitle":"([^"]*)"')
+results = []
+
+for project_dir in glob.glob(os.path.join(projects_dir, '*')):
+    if not os.path.isdir(project_dir):
+        continue
+    if os.path.basename(project_dir) == '-':
+        continue
+    for f in glob.glob(os.path.join(project_dir, '*.jsonl')):
+        sid = os.path.basename(f)[:-len('.jsonl')]
+        try:
+            mtime = int(os.path.getmtime(f))
+        except OSError:
+            continue
+        # Read tail (last 64KB) for customTitle
+        title = ''
+        try:
+            with open(f, 'rb') as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 65536))
+                tail = fh.read().decode('utf-8', errors='ignore')
+            for ln in reversed(tail.split('\n')):
+                m = ct_re.search(ln)
+                if m:
+                    title = m.group(1)
+                    break
+        except OSError:
+            continue
+
+        # Strip '@model' for comparison
+        bare = title.split('@', 1)[0].lower()
+        if not (bare == role or bare == 'fallback-' + role):
+            continue
+
+        if sid in live:
+            status = 'live'
+            pane = live[sid]
+        else:
+            age = time.time() - mtime
+            status = 'dead' if age < 86400 else 'orphan'
+            pane = '—'
+
+        last_active = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(mtime))
+        results.append((sid, title, pane, last_active, status, mtime))
+
+# 3. Sort by mtime desc and print
+results.sort(key=lambda x: x[5], reverse=True)
+print(f'{"UUID":<36}  {"TITLE":<28}  {"PANE":<24}  {"LAST_ACTIVE":<19}  STATUS')
+for sid, title, pane, last_active, status, _ in results:
+    print(f'{sid:<36}  {title[:28]:<28}  {pane[:24]:<24}  {last_active:<19}  {status}')
+
+if not results:
+    sys.exit(1)
+EOF
+}
+
+hiveMind.roles.list.uuids.completion.role() {
+  # Live roles + offer fallback-<role> variants
+  local roles
+  roles=$("$OOSH_DIR/hiveMind" role.list 2>/dev/null)
+  echo "$roles"
+  echo "$roles" | sed 's/^/fallback-/'
+}
+
 private.hiveMind.pane.kind() # <paneTarget> # classify pane: claude | shell | monitor | unknown
 {
   local target="$1"
