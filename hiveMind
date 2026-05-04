@@ -2082,6 +2082,182 @@ hiveMind.roles.list.uuids.completion.role() {
   echo "$roles" | sed 's/^/fallback-/'
 }
 
+hiveMind.agent.fork.best() # <role> <targetPane> # find best-trained session for <role> and fork it into <targetPane> (Epic J2)
+{
+  # Selection per session/tasks/j2-fork-best-design.md:
+  #   • PRIMARY signal: JSONL file size (large = trained, small = boot/recovery attempt)
+  #   • Filter: skip <50KB (broken attempts)
+  #   • Tiebreaker: bare role name > fallback-* prefix; more recent > older
+  # Reuses the same JSONL+ps scan as roles.list.uuids (DRY logic, single python pass).
+  # After fork: wait for startup, send boot.md if exists, register in roles.env.
+  local role="$1"
+  local targetPane="$2"
+  if [ -z "$role" ] || [ -z "$targetPane" ]; then
+    error.log "Usage: hiveMind agent.fork.best <role> <targetPane>"
+    return 1
+  fi
+
+  # Pane target validity check (defence-in-depth — same as send methods)
+  if ! [[ "$targetPane" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    error.log "agent.fork.best: malformed targetPane '$targetPane'"
+    return 1
+  fi
+
+  local picked
+  picked=$(ROLE="$role" python3 << 'EOF'
+import os, glob, sys, re, time, subprocess
+
+role = os.environ.get('ROLE', '').lower()
+
+# Build live UUID set via ps (skip dead-process classification — fork.best
+# doesn't care about live status, only quality)
+live = set()
+try:
+    out = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, check=False).stdout
+    uuid_re = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    for line in out.splitlines():
+        if 'claude' not in line.lower():
+            continue
+        for m in uuid_re.findall(line):
+            live.add(m)
+except Exception:
+    pass
+
+projects_dir = os.path.expanduser('~/.claude/projects')
+ct_re = re.compile(r'"customTitle":"([^"]*)"')
+candidates = []  # (size, tools, mtime, uuid, title, prefer_bare)
+
+for project_dir in glob.glob(os.path.join(projects_dir, '*')):
+    if not os.path.isdir(project_dir) or os.path.basename(project_dir) == '-':
+        continue
+    for f in glob.glob(os.path.join(project_dir, '*.jsonl')):
+        sid = os.path.basename(f)[:-len('.jsonl')]
+        try:
+            size = os.path.getsize(f)
+            mtime = int(os.path.getmtime(f))
+        except OSError:
+            continue
+        # Read tail for customTitle
+        title = ''
+        try:
+            with open(f, 'rb') as fh:
+                fh.seek(0, 2)
+                total = fh.tell()
+                fh.seek(max(0, total - 65536))
+                tail = fh.read().decode('utf-8', errors='ignore')
+            for ln in reversed(tail.split('\n')):
+                m = ct_re.search(ln)
+                if m:
+                    title = m.group(1)
+                    break
+        except OSError:
+            continue
+        bare = title.split('@', 1)[0].lower()
+        is_bare = bare == role
+        is_fallback = bare == 'fallback-' + role
+        if not (is_bare or is_fallback):
+            continue
+        # Tool count via grep — cheap on text mode but we need a count
+        # Use subprocess for speed on large files (10MB+)
+        try:
+            tools = int(subprocess.run(['grep', '-c', '"tool_use"', f],
+                                        capture_output=True, text=True, check=False).stdout.strip() or 0)
+        except Exception:
+            tools = 0
+        prefer_bare = 1 if is_bare else 0
+        candidates.append((size, tools, mtime, sid, title, prefer_bare))
+
+if not candidates:
+    print('NO_CANDIDATES')
+    sys.exit(1)
+
+# Sort all by size desc for display
+candidates.sort(key=lambda x: x[0], reverse=True)
+
+THRESHOLD = 50000  # 50KB — design spec
+qualified = [c for c in candidates if c[0] >= THRESHOLD]
+
+# Display block to stderr (visible to caller)
+def fmt_size(s):
+    if s >= 1048576: return f'{s/1048576:.1f}MB'
+    if s >= 1024:    return f'{s//1024}KB'
+    return f'{s}B'
+
+print(f'\nCandidates for {role} ({len(candidates)} found):', file=sys.stderr)
+shown_best = False
+for c in candidates:
+    size, tools, mtime, sid, title, prefer_bare = c
+    when = time.strftime('%b %d %H:%M', time.localtime(mtime))
+    sized = fmt_size(size)
+    flag = ''
+    if size < THRESHOLD:
+        flag = 'SKIP'
+    elif not shown_best:
+        flag = 'BEST'
+        shown_best = True
+    live_mark = ' (LIVE)' if sid in live else ''
+    print(f'  {flag:>4} → {sid[:8]}  {sized:>7}  {tools:>5} tools  {title:<28}  {when}{live_mark}', file=sys.stderr)
+
+if not qualified:
+    # Fallback per design: warn + use most recent anyway
+    print('NO_QUALIFIED', file=sys.stderr)
+    candidates.sort(key=lambda x: x[2], reverse=True)  # most recent
+    pick = candidates[0]
+    print(f'  WARN: no candidate above 50KB — falling back to most recent ({pick[3][:8]})', file=sys.stderr)
+    print(pick[3])  # uuid to stdout
+    sys.exit(0)
+
+# Tiebreaker on top candidates within ±10% of best size
+best_size = qualified[0][0]
+top = [c for c in qualified if c[0] >= best_size * 0.9]
+# Within tied group: prefer bare > fallback, then more recent
+top.sort(key=lambda c: (-c[5], -c[2]))
+pick = top[0]
+print(pick[3])  # uuid to stdout
+EOF
+)
+  local rc=$?
+
+  if [ "$picked" = "NO_CANDIDATES" ] || [ -z "$picked" ]; then
+    error.log "No JSONL sessions found for role '$role'. Suggest: hiveMind agent.bootstrap $role"
+    return 1
+  fi
+
+  # Live process safety: refuse to fork a UUID that's currently alive
+  if ps -eo args= 2>/dev/null | grep -F "$picked" | grep -q claude; then
+    warn.log "Selected UUID $picked is currently LIVE — forking the live UUID will create a sibling, not recover. Confirm intent or pick a different one."
+  fi
+
+  info.log "Forking $picked into $targetPane..."
+
+  # Step 7: fork via Model. Cd handled by claudeCode internal resolve.
+  "$OOSH_DIR/otmux" send.enter "$targetPane" "claudeCode fork $picked"
+
+  # Step 8: wait for startup
+  sleep 8
+
+  # Step 9: send boot file if it exists (Controller knows where boot files live)
+  local workspace bootFile
+  workspace=$(git rev-parse --show-toplevel 2>/dev/null)
+  bootFile="${workspace}/session/agents/${role}/boot.md"
+  if [ -f "$bootFile" ]; then
+    "$OOSH_DIR/otmux" send "$targetPane" "Read session/agents/${role}/boot.md" Enter
+    info.log "Boot file sent: session/agents/${role}/boot.md"
+  else
+    info.log "No boot file at session/agents/${role}/boot.md — skipping"
+  fi
+
+  # Step 10: registry update
+  hiveMind.registry.set "$targetPane" "$role"
+  success.log "Registered $targetPane → $role"
+}
+hiveMind.agent.fork.best.completion.role() {
+  hiveMind.roles.list.uuids.completion.role
+}
+hiveMind.agent.fork.best.completion.targetPane() {
+  otmux panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
 private.hiveMind.pane.kind() # <paneTarget> # classify pane: claude | shell | monitor | unknown
 {
   local target="$1"
