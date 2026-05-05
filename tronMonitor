@@ -131,48 +131,97 @@ private.tronMonitor.tracked.teams() { # # echo team names tracked in tronMonitor
   done < "$TRON_MONITOR_ENV"
 }
 
-tronMonitor.setup() # <?monitorPane:TRONinterface:0.3> # idempotent — start screen + sync with hiveMind teams (no-op if already set up)
+tronMonitor.setup() # <?monitorPane:TRONinterface:0.3> # idempotent — start screen with one window per registered team
 {
-  # D1.3/D1.10 — idempotent setup:
-  #   • If screen already alive on the right pane → just sync teams (no kill/restart)
-  #   • If screen dead or wrong pane → start fresh, then sync
-  # For destructive reset use tronMonitor.reset (existing).
+  # D1.3/D1.10 — idempotent setup matching Tron's proven recipe:
   #
-  # Proven Tron recipe (preserved):
-  #   start `screen -S tronMon` in monitor pane;
-  #   for each team in hivemind.teams.env that's live in tmux:
-  #     screen -S tronMon -X screen -t <team> bash -c "TMUX= tmux attach -r -t <team>; exec bash"
-  #   (TMUX= MANDATORY — unsets env so nested tmux works inside screen.
-  #    -r MANDATORY — read-only, prevents layout destruction.
-  #    exec bash MANDATORY — keeps screen window alive after detach.)
+  # COLD START produces a screen session whose windows are EXCLUSIVELY team views
+  # (no bare shell window 0). Each window runs:
+  #   bash -c "TMUX= tmux attach -r -t <team>; exec bash"
+  #     • TMUX=    — clear env so nested tmux attach works inside screen
+  #     • -r        — read-only attach, never destroys agent layouts
+  #     • exec bash — keeps the screen window alive after the user detaches
+  #
+  # IDEMPOTENT path: if screen is already running, just sync new teams in.
+  # For a destructive reset (kill + recreate) use tronMonitor.reset.
   local userProvided="${1:-}"
   local monitorPane="${userProvided:-$(private.tronMonitor.pane)}"
   local screenName=$(private.tronMonitor.screenSession)
 
-  # Persist config only when user explicitly passed a pane (D1.5)
+  # Persist pane only when user explicitly passes one (D1.5)
   if [ -n "$userProvided" ]; then
     config set TRON_MONITOR_PANE "$monitorPane"
   fi
 
-  # Idempotency check (D1.3): if screen already alive AND env file exists, sync only
-  if private.tronMonitor.screen.isAlive && [ -f "$TRON_MONITOR_ENV" ]; then
+  # Idempotency check: screen alive + env populated → just sync
+  if private.tronMonitor.screen.isAlive && [ -s "$TRON_MONITOR_ENV" ]; then
     info.log "tronMon screen already running — syncing teams (idempotent)"
     tronMonitor.sync
     success.log "$screenName already set up (synced with hiveMind teams)"
     return 0
   fi
 
-  # Cold start: ensure env file exists (don't truncate — sync will reconcile)
-  [ ! -f "$TRON_MONITOR_ENV" ] && touch "$TRON_MONITOR_ENV"
+  # Cold start — gather live registered teams BEFORE creating screen so we know
+  # the first team's name (window 0 must be a real team view, not a bare shell).
+  local -a teams=()
+  while IFS= read -r t; do
+    [ -n "$t" ] && teams+=("$t")
+  done < <(private.tronMonitor.registry.teams onlyLive)
 
-  # Start fresh screen in the monitor pane
-  otmux send.raw "$monitorPane" "screen -S $screenName" Enter
+  if [ ${#teams[@]} -eq 0 ]; then
+    error.log "no live registered teams to monitor (check ~/config/hivemind.teams.env + tmux sessions)"
+    return 1
+  fi
+
+  # If a previous screen exists in a broken state, kill it first (cold-start contract)
+  if private.tronMonitor.screen.isAlive; then
+    info.log "killing existing $screenName screen for clean cold start"
+    screen -S "$(private.tronMonitor.fullScreenName)" -X quit 2>/dev/null
+    sleep 0.5
+  fi
+
+  # Truncate env — we're (re)building from scratch; numbering will match screen's
+  : > "$TRON_MONITOR_ENV"
+
+  # Start screen with FIRST team as window 0 (not bare shell — that was the bug)
+  local first="${teams[0]}"
+  tmux set-option -t "$first" window-size largest 2>/dev/null
+  otmux send.raw "$monitorPane" \
+    "screen -S $screenName -t $first bash -c \"TMUX= tmux attach -r -t $first; exec bash\"" Enter
   sleep 1.5
 
-  # Sync with registry: add all live teams, drop stale entries
-  tronMonitor.sync
+  # Wait for screen to register so subsequent -X commands hit a live socket
+  local tries=0
+  while [ $tries -lt 10 ] && ! private.tronMonitor.screen.isAlive; do
+    sleep 0.3
+    tries=$((tries + 1))
+  done
+  if ! private.tronMonitor.screen.isAlive; then
+    error.log "screen did not start within 3s — aborting setup"
+    return 1
+  fi
+  echo "0|$first" >> "$TRON_MONITOR_ENV"
 
-  success.log "Screen session $screenName started in $monitorPane (synced with hiveMind teams)"
+  # Add remaining teams as windows 1..N
+  local screenFull=$(private.tronMonitor.fullScreenName)
+  local i=1
+  local t
+  for t in "${teams[@]:1}"; do
+    tmux set-option -t "$t" window-size largest 2>/dev/null
+    screen -S "$screenFull" -X screen -t "$t" \
+      bash -c "TMUX= tmux attach -r -t $t; exec bash" 2>/dev/null
+    sleep 0.3
+    echo "${i}|$t" >> "$TRON_MONITOR_ENV"
+    i=$((i + 1))
+  done
+
+  # Force-select window 0 so the user sees the first team immediately.
+  # Screen sometimes lands on the most-recently-added window after `-X screen`;
+  # explicit select ensures predictable starting state.
+  screen -S "$screenFull" -X select 0 2>/dev/null
+
+  otmux pane.title "$monitorPane" "TRON-Monitor: $first" 2>/dev/null
+  success.log "tronMon started in $monitorPane — ${#teams[@]} team(s), showing $first"
 }
 tronMonitor.setup.completion.monitorPane() {
   otmux panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
@@ -211,33 +260,27 @@ tronMonitor.add() # <teamSession> # add a team as a named read-only screen windo
   # monitor viewers without shrinking agent panes.
   tmux set-option -t "$teamSession" window-size largest 2>/dev/null
 
-  # D1.10 — proven Tron recipe: create a NAMED screen window whose command
-  # is inline:
+  # Window numbering MUST match screen's actual assignment so switch by index
+  # works. Compute next index BEFORE creating the screen window — screen assigns
+  # sequentially in creation order, same as private.tronMonitor.nextWindow.
+  local windowNum
+  windowNum=$(private.tronMonitor.nextWindow)
+
+  # Proven Tron recipe — screen window runs:
   #   bash -c "TMUX= tmux attach -r -t <team>; exec bash"
-  #
-  # TMUX= unsets env so nested tmux attach works (required when screen runs
-  # inside a tmux pane). -r is MANDATORY (read-only; no layout destruction).
-  # exec bash keeps the window alive after tmux detaches, so screen doesn't
-  # auto-close the window.
+  #     TMUX=     unsets env so nested tmux attach works inside screen
+  #     -r         read-only — never destroys agent layouts
+  #     exec bash  keeps window alive after detach
   local screenName
   screenName=$(private.tronMonitor.fullScreenName)
   screen -S "$screenName" -X screen -t "$teamSession" \
     bash -c "TMUX= tmux attach -r -t $teamSession; exec bash" 2>/dev/null
   sleep 0.5
 
-  # Track in env. Window index is informational (screen assigns it) — we use
-  # names for select/kill. Format kept as "num|team" for backward compat;
-  # num is best-effort via screen's windows query, or "-" if unavailable.
-  local windowNum="-"
-  if command -v screen >/dev/null 2>&1; then
-    # Screen doesn't expose windows-by-name easily; use private.nextWindow
-    # as an approximation if needed. For now, keep it simple.
-    windowNum=$(private.tronMonitor.nextWindow)
-  fi
   echo "${windowNum}|${teamSession}" >> "$TRON_MONITOR_ENV"
 
   otmux pane.title "$(private.tronMonitor.pane)" "TRON-Monitor: $teamSession" 2>/dev/null
-  success.log "Added $teamSession to tronMon"
+  success.log "Added $teamSession to tronMon (window $windowNum)"
 }
 tronMonitor.add.completion.teamSession() {
   otmux sessions -F "#{session_name}" 2>/dev/null
@@ -262,14 +305,24 @@ tronMonitor.switch() # <teamSession> # switch monitor to show a specific team (b
     tronMonitor.add "$teamSession" || return 1
   fi
 
-  # D1.10 — select by NAME (the proven recipe uses named windows).
-  # screen's select command accepts window name or number.
+  # Look up window NUMBER from env. Screen's `-X select <name>` is unreliable
+  # across versions (especially old macOS screen); selecting by index works
+  # everywhere. Numbers in env file match screen's assignment because we
+  # truncate-and-recreate on cold start.
+  local windowNum
+  windowNum=$(grep "|${teamSession}$" "$TRON_MONITOR_ENV" 2>/dev/null | head -1 | cut -d'|' -f1)
+
+  if [ -z "$windowNum" ]; then
+    error.log "tronMonitor: no window tracked for '$teamSession' — try 'tronMonitor reset'"
+    return 1
+  fi
+
   local screenName
   screenName=$(private.tronMonitor.fullScreenName)
-  screen -S "$screenName" -X select "$teamSession" 2>/dev/null
+  screen -S "$screenName" -X select "$windowNum" 2>/dev/null
 
   otmux pane.title "$(private.tronMonitor.pane)" "TRON-Monitor: $teamSession" 2>/dev/null
-  success.log "Switched to $teamSession"
+  success.log "Switched to $teamSession (window $windowNum)"
 }
 tronMonitor.switch.completion.teamSession() {
   [ -f "$TRON_MONITOR_ENV" ] && cut -d'|' -f2 "$TRON_MONITOR_ENV" 2>/dev/null
