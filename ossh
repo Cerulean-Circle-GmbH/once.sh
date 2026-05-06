@@ -496,10 +496,10 @@ private.ossh.identity.stage() # <toHost> # stage runner email + id_ed25519 keypa
     return 1
   fi
 
-  local email
-  email="${USER_EMAIL:-$(git config --global user.email 2>/dev/null)}"
-  [ -z "$email" ] && email="$(git config user.email 2>/dev/null)"
-  [ -z "$email" ] && email="$(whoami)@$(hostname)"
+  local installerEmail
+  installerEmail="${USER_EMAIL:-$(git config --global user.email 2>/dev/null)}"
+  [ -z "$installerEmail" ] && installerEmail="$(git config user.email 2>/dev/null)"
+  [ -z "$installerEmail" ] && installerEmail="$(whoami)@$(hostname)"
 
   local privKey="$HOME/.ssh/id_ed25519"
   local pubKey="$HOME/.ssh/id_ed25519.pub"
@@ -508,17 +508,88 @@ private.ossh.identity.stage() # <toHost> # stage runner email + id_ed25519 keypa
     return 1
   fi
 
-  local role
-  for role in installer outer; do
-    printf '%s\n' "$email" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.${role}.email && chmod 600 /tmp/oosh.${role}.email" \
-      || { error.log "stage email -> /tmp/oosh.${role}.email failed"; return 1; }
-    private.ossh.ssh "$toHost" "cat > /tmp/oosh.${role}.id_ed25519 && chmod 600 /tmp/oosh.${role}.id_ed25519" < "$privKey" \
-      || { error.log "stage id_ed25519 -> /tmp/oosh.${role}.id_ed25519 failed"; return 1; }
-    private.ossh.ssh "$toHost" "cat > /tmp/oosh.${role}.id_ed25519.pub && chmod 644 /tmp/oosh.${role}.id_ed25519.pub" < "$pubKey" \
-      || { error.log "stage id_ed25519.pub -> /tmp/oosh.${role}.id_ed25519.pub failed"; return 1; }
-  done
+  # Stage installer (always the runner's full keypair).
+  printf '%s\n' "$installerEmail" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.installer.email && chmod 600 /tmp/oosh.installer.email" \
+    || { error.log "stage email -> /tmp/oosh.installer.email failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.installer.id_ed25519 && chmod 600 /tmp/oosh.installer.id_ed25519" < "$privKey" \
+    || { error.log "stage id_ed25519 -> /tmp/oosh.installer.id_ed25519 failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.installer.id_ed25519.pub && chmod 644 /tmp/oosh.installer.id_ed25519.pub" < "$pubKey" \
+    || { error.log "stage id_ed25519.pub -> /tmp/oosh.installer.id_ed25519.pub failed"; return 1; }
 
-  important.log "Staged identity on $toHost: /tmp/oosh.{installer,outer}.* (email=$email)"
+  # Stage outer. ProxyJump-aware: if $toHost is reached via ProxyJump, the
+  # outer is the jump host (a different identity); otherwise outer == installer
+  # (test-mode collapse — same bytes).
+  local jumpHost=""
+  if command -v ssh >/dev/null 2>&1; then
+    jumpHost=$(ssh -G "$toHost" 2>/dev/null | awk '/^proxyjump /{print $2; exit}')
+  fi
+
+  if [ -n "$jumpHost" ] && [ "$jumpHost" != "none" ]; then
+    important.log "ProxyJump detected for $toHost: outer = $jumpHost"
+    private.ossh.identity.stage.outer.proxyJump "$toHost" "$jumpHost" \
+      || { warn.log "ProxyJump outer staging failed; falling back to runner identity for outer"; private.ossh.identity.stage.outer.fromRunner "$toHost" "$installerEmail" "$privKey" "$pubKey"; }
+  else
+    private.ossh.identity.stage.outer.fromRunner "$toHost" "$installerEmail" "$privKey" "$pubKey" \
+      || return 1
+  fi
+
+  important.log "Staged identity on $toHost: /tmp/oosh.{installer,outer}.* (installer=$installerEmail)"
+  return 0
+}
+
+private.ossh.identity.stage.outer.fromRunner() # <toHost> <email> <privKey> <pubKey> # stage outer with the runner's full keypair (test-mode collapse)
+{
+  local toHost="$1" email="$2" privKey="$3" pubKey="$4"
+  printf '%s\n' "$email" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.email && chmod 600 /tmp/oosh.outer.email" \
+    || { error.log "stage email -> /tmp/oosh.outer.email failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.id_ed25519 && chmod 600 /tmp/oosh.outer.id_ed25519" < "$privKey" \
+    || { error.log "stage id_ed25519 -> /tmp/oosh.outer.id_ed25519 failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.id_ed25519.pub && chmod 644 /tmp/oosh.outer.id_ed25519.pub" < "$pubKey" \
+    || { error.log "stage id_ed25519.pub -> /tmp/oosh.outer.id_ed25519.pub failed"; return 1; }
+  return 0
+}
+
+private.ossh.identity.stage.outer.proxyJump() # <toHost> <jumpHost> # stage outer with the jump host's email + pubkey (no private — we don't have it)
+{
+  local toHost="$1" jumpHost="$2"
+
+  ossh.connection.open "$jumpHost" >/dev/null 2>&1 || true
+
+  # Pull email from jump host (git config preferred, whoami@hostname fallback).
+  local outerEmail
+  outerEmail=$(ossh.exec "$jumpHost" "git config --global user.email 2>/dev/null || git config user.email 2>/dev/null" 2>/dev/null \
+                | sed -E 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | awk 'NF{print; exit}')
+  if [ -z "$outerEmail" ]; then
+    outerEmail=$(ossh.exec "$jumpHost" "printf '%s@%s\n' \"\$(whoami)\" \"\$(hostname)\"" 2>/dev/null \
+                  | sed -E 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | awk 'NF{print; exit}')
+  fi
+  if [ -z "$outerEmail" ]; then
+    error.log "ProxyJump outer staging: could not resolve email on $jumpHost"
+    return 1
+  fi
+
+  # Pull pubkey from jump host (id_ed25519.pub preferred, id_rsa.pub fallback).
+  # Stash to a runner-side tmpfile so we can ssh-cat it onto the install target.
+  local outerPubLocal
+  outerPubLocal=$(mktemp 2>/dev/null) || outerPubLocal="/tmp/oosh.outer.pubkey.$$"
+  if ! ossh.exec "$jumpHost" "cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null" >"$outerPubLocal" 2>/dev/null \
+      || [ ! -s "$outerPubLocal" ]; then
+    error.log "ProxyJump outer staging: could not read a public key from $jumpHost"
+    rm -f "$outerPubLocal"
+    return 1
+  fi
+
+  # Stage email + pubkey only on the install target. Deliberately do NOT stage
+  # /tmp/oosh.outer.id_ed25519 — we don't have the jump host's private key, and
+  # role.outeruser will produce a pubkey-only ssh.outeruser/ from this.
+  printf '%s\n' "$outerEmail" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.email && chmod 600 /tmp/oosh.outer.email" \
+    || { error.log "stage outer email -> /tmp/oosh.outer.email failed"; rm -f "$outerPubLocal"; return 1; }
+  private.ossh.ssh "$toHost" "rm -f /tmp/oosh.outer.id_ed25519" 2>/dev/null
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.id_ed25519.pub && chmod 644 /tmp/oosh.outer.id_ed25519.pub" < "$outerPubLocal" \
+    || { error.log "stage outer pubkey -> /tmp/oosh.outer.id_ed25519.pub failed"; rm -f "$outerPubLocal"; return 1; }
+
+  rm -f "$outerPubLocal"
+  important.log "ProxyJump outer staging: $jumpHost identity = $outerEmail (pubkey-only)"
   return 0
 }
 
