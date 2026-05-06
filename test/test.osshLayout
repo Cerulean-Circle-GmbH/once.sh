@@ -378,27 +378,114 @@ else
   expect.fail "build did not produce outeruser identity"
 fi
 
-# With no email arg / no USER_EMAIL / no git config, build now falls back to
-# whoami@hostname (same chain as role.owner). Verify in a sandboxed HOME so
-# git can't read the real user config and sshDir can't slip to $HOME/.ssh.
-osshLayout.build.test.whoami_fallback() {
-  unset USER_EMAIL
-  local fakeHome="$TEST_OSSHLAYOUT_TMP/whoami-home"
-  mkdir -p "$fakeHome"
-  : > "$fakeHome/.gitconfig"
-  HOME="$fakeHome" GIT_CONFIG_GLOBAL="$fakeHome/.gitconfig" \
-    osshLayout.build "" "$TEST_BUILD_KEYSRC" "$TEST_OSSHLAYOUT_TMP/whoami-fresh"
-  return $?
+# ============================================================================
+# Test staged identity (the os.platform.test / ProxyJump production path).
+# Builds drive role.installer + role.outeruser from $OSSH_STAGE_DIR/oosh.<role>.*
+# files placed by ossh.install (private.ossh.identity.stage) before init/oosh.
+# ============================================================================
+
+# Helper: stage a role into <stageDir>/oosh.<role>.{email,id_ed25519,id_ed25519.pub}
+test.osshLayout.stage() {
+  local stageDir="$1" role="$2" email="$3" privKey="$4"
+  printf '%s\n' "$email" > "${stageDir}/oosh.${role}.email"
+  cp "$privKey" "${stageDir}/oosh.${role}.id_ed25519"
+  cp "${privKey}.pub" "${stageDir}/oosh.${role}.id_ed25519.pub"
+  chmod 600 "${stageDir}/oosh.${role}.id_ed25519"
 }
 
-test.case $level "build resolves installer email via whoami@hostname when nothing else is set" \
-  osshLayout.build.test.whoami_fallback
-WHOAMI_ID="$(whoami).$(hostname)"
-WHOAMI_ID="$(printf '%s' "$WHOAMI_ID" | tr '[:upper:]' '[:lower:]' | tr '@' '.')"
-if [ -d "$TEST_OSSHLAYOUT_TMP/whoami-fresh/ids/ssh.$WHOAMI_ID" ]; then
-  expect.pass "build produced ids/ssh.$WHOAMI_ID/ via whoami@hostname fallback"
+# --- Test mode collapse: same staged content for installer and outer ---
+TEST_STAGE_COLLAPSE="$TEST_OSSHLAYOUT_TMP/stage-collapse"
+mkdir -p "$TEST_STAGE_COLLAPSE"
+ssh-keygen -t ed25519 -f "$TEST_STAGE_COLLAPSE/host-key" -N '' -q
+test.osshLayout.stage "$TEST_STAGE_COLLAPSE" installer "host.runner@example.com" "$TEST_STAGE_COLLAPSE/host-key"
+test.osshLayout.stage "$TEST_STAGE_COLLAPSE" outer     "host.runner@example.com" "$TEST_STAGE_COLLAPSE/host-key"
+
+osshLayout.build.test.staged_collapse() {
+  export USER_EMAIL="container.user@example.com"
+  export OSSH_STAGE_DIR="$TEST_STAGE_COLLAPSE"
+  osshLayout.build "" "" "$TEST_OSSHLAYOUT_TMP/staged-collapse-fresh"
+  local rc=$?
+  unset USER_EMAIL OSSH_STAGE_DIR
+  return $rc
+}
+
+test.case $level "build with same staged installer + outer (test mode) — distinct folders, byte-identical" \
+  osshLayout.build.test.staged_collapse
+
+COLLAPSE_DIR="$TEST_OSSHLAYOUT_TMP/staged-collapse-fresh"
+# Owner identity comes from USER_EMAIL (container.user@example.com), not staging
+if [ -L "$COLLAPSE_DIR/private_key/ssh.container.user.example.com.private_key" ]; then
+  expect.pass "owner uses USER_EMAIL identity (container user), independent of staging"
 else
-  expect.fail "expected ids/ssh.$WHOAMI_ID/, build did not fall back to whoami"
+  expect.fail "owner symlink for container.user.example.com missing"
+fi
+
+# Installer identity comes from staged installer.email
+if [ -d "$COLLAPSE_DIR/ids/ssh.host.runner.example.com" ] \
+   && [ -L "$COLLAPSE_DIR/ids/ssh.host.runner.example.com/private_key/ssh.host.runner.example.com.private_key" ]; then
+  expect.pass "installer folder named after staged email (host.runner.example.com)"
+else
+  expect.fail "expected ids/ssh.host.runner.example.com/ from staged installer"
+fi
+
+# Outeruser symlinks named after staged outer.email (also host.runner.example.com here)
+if [ -L "$COLLAPSE_DIR/ids/ssh.outeruser/private_key/ssh.host.runner.example.com.private_key" ]; then
+  expect.pass "outeruser symlinks named after staged outer email (collapsed)"
+else
+  expect.fail "expected ssh.outeruser/private_key/ssh.host.runner.example.com.private_key"
+fi
+
+# Bytes identical (same staged file → same content)
+if cmp -s "$COLLAPSE_DIR/ids/ssh.host.runner.example.com/id_ed25519" \
+          "$COLLAPSE_DIR/ids/ssh.outeruser/id_ed25519"; then
+  expect.pass "installer and outeruser keypair are byte-identical (test-mode collapse)"
+else
+  expect.fail "installer and outeruser bytes differ — test-mode collapse broken"
+fi
+
+# Container user folder must NOT appear under ids/ — owner identity lives only at top level
+if [ ! -d "$COLLAPSE_DIR/ids/ssh.container.user.example.com" ]; then
+  expect.pass "no ids/ssh.<owner>/ folder (owner is top-level only)"
+else
+  expect.fail "owner identity should not appear under ids/"
+fi
+
+# --- ProxyJump shape: different staged content for installer and outer ---
+TEST_STAGE_PJ="$TEST_OSSHLAYOUT_TMP/stage-proxyjump"
+mkdir -p "$TEST_STAGE_PJ"
+ssh-keygen -t ed25519 -f "$TEST_STAGE_PJ/laptop-key" -N '' -q
+ssh-keygen -t ed25519 -f "$TEST_STAGE_PJ/jump-key"   -N '' -q
+test.osshLayout.stage "$TEST_STAGE_PJ" installer "alice@laptop.example.com" "$TEST_STAGE_PJ/laptop-key"
+test.osshLayout.stage "$TEST_STAGE_PJ" outer     "ops@jumphost.example.com" "$TEST_STAGE_PJ/jump-key"
+
+osshLayout.build.test.staged_proxyjump() {
+  export USER_EMAIL="prod.user@example.com"
+  export OSSH_STAGE_DIR="$TEST_STAGE_PJ"
+  osshLayout.build "" "" "$TEST_OSSHLAYOUT_TMP/staged-pj-fresh"
+  local rc=$?
+  unset USER_EMAIL OSSH_STAGE_DIR
+  return $rc
+}
+
+test.case $level "build with different staged installer + outer (ProxyJump shape) — distinct identities" \
+  osshLayout.build.test.staged_proxyjump
+
+PJ_DIR="$TEST_OSSHLAYOUT_TMP/staged-pj-fresh"
+if [ -d "$PJ_DIR/ids/ssh.alice.laptop.example.com" ]; then
+  expect.pass "installer folder uses laptop identity"
+else
+  expect.fail "expected ids/ssh.alice.laptop.example.com/"
+fi
+if [ -L "$PJ_DIR/ids/ssh.outeruser/private_key/ssh.ops.jumphost.example.com.private_key" ]; then
+  expect.pass "outeruser symlinks use jump host identity (distinct from installer)"
+else
+  expect.fail "outeruser symlinks should be named after jump host email"
+fi
+if ! cmp -s "$PJ_DIR/ids/ssh.alice.laptop.example.com/id_ed25519" \
+            "$PJ_DIR/ids/ssh.outeruser/id_ed25519"; then
+  expect.pass "installer (laptop) and outeruser (jump) keypair bytes differ — ProxyJump shape preserved"
+else
+  expect.fail "installer and outeruser bytes match — but they came from different staged keys"
 fi
 
 ### test.method

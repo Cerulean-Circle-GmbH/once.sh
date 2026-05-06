@@ -445,6 +445,15 @@ private.push.init.oosh() {
     return 1
   }
 
+  # Stage installer + outer identity (email + keypair) to /tmp on the remote so
+  # osshLayout build can populate ids/ssh.<installer-id>/ and ids/ssh.outeruser/
+  # with the runner's identity rather than the container user's. In test mode
+  # the runner is both installer and outer, so the same bytes go to both file
+  # sets. ProxyJump (future) will diverge runner-side; the consumer never collapses.
+  private.ossh.identity.stage "$sshConfigHost" || {
+    warn.log "Failed to stage installer identity on $sshConfigHost — osshLayout will fall back to whoami@hostname"
+  }
+
   success.log "Successfully transferred init files to $sshConfigHost"
 
   # Run remote installer — always installs to root
@@ -471,6 +480,46 @@ private.push.init.oosh() {
 
   ossh.install.finish.local $sshConfigHost "$OSSH_INSTALL_TARGET_USER"
 
+}
+
+private.ossh.identity.stage() # <toHost> # stage runner email + id_ed25519 keypair to /tmp/oosh.{installer,outer}.* on <toHost>
+# Used by ossh.install before init/oosh runs on the remote so osshLayout build
+# (called inside the install) can populate ids/ssh.<installer-id>/ and
+# ids/ssh.outeruser/ from the host runner's identity rather than the container
+# user's. Test mode: runner is both installer and outer, so the same bytes are
+# pushed to both file sets. ProxyJump (future) will diverge the two roles
+# runner-side; the consumer (osshLayout) never collapses.
+{
+  local toHost="$1"
+  if [ -z "$toHost" ]; then
+    error.log "private.ossh.identity.stage: <toHost> required"
+    return 1
+  fi
+
+  local email
+  email="${USER_EMAIL:-$(git config --global user.email 2>/dev/null)}"
+  [ -z "$email" ] && email="$(git config user.email 2>/dev/null)"
+  [ -z "$email" ] && email="$(whoami)@$(hostname)"
+
+  local privKey="$HOME/.ssh/id_ed25519"
+  local pubKey="$HOME/.ssh/id_ed25519.pub"
+  if [ ! -f "$privKey" ] || [ ! -f "$pubKey" ]; then
+    warn.log "private.ossh.identity.stage: $privKey or .pub missing — skipping identity staging"
+    return 1
+  fi
+
+  local role
+  for role in installer outer; do
+    printf '%s\n' "$email" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.${role}.email && chmod 600 /tmp/oosh.${role}.email" \
+      || { error.log "stage email -> /tmp/oosh.${role}.email failed"; return 1; }
+    private.ossh.ssh "$toHost" "cat > /tmp/oosh.${role}.id_ed25519 && chmod 600 /tmp/oosh.${role}.id_ed25519" < "$privKey" \
+      || { error.log "stage id_ed25519 -> /tmp/oosh.${role}.id_ed25519 failed"; return 1; }
+    private.ossh.ssh "$toHost" "cat > /tmp/oosh.${role}.id_ed25519.pub && chmod 644 /tmp/oosh.${role}.id_ed25519.pub" < "$pubKey" \
+      || { error.log "stage id_ed25519.pub -> /tmp/oosh.${role}.id_ed25519.pub failed"; return 1; }
+  done
+
+  important.log "Staged identity on $toHost: /tmp/oosh.{installer,outer}.* (email=$email)"
+  return 0
 }
 
 ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal> #
@@ -543,12 +592,11 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
   user authorized.keys.update
 
   # Build the prescribed .ssh/ layout: owner symlinks, ids/ssh.developking/,
-  # ids/ssh.<installer-id>/, ids/ssh.outeruser/. In phase-1 installs the
-  # runner's email/keypair is not propagated to the container, so installer
-  # collapses to whoami@hostname (i.e. installer ≡ owner ≡ outeruser inside
-  # `os platform.test` containers).
-  local _osshLayoutEmail="${USER_EMAIL:-$(whoami)@$(hostname)}"
-  if ! osshLayout build "$_osshLayoutEmail" "$HOME/.ssh" "$HOME/.ssh"; then
+  # ids/ssh.<installer-id>/, ids/ssh.outeruser/. With private.ossh.identity.stage
+  # having placed /tmp/oosh.{installer,outer}.* before init/oosh ran, the role
+  # methods auto-resolve the host runner's identity for installer + outer.
+  # Owner falls back to whoami@hostname for the running user (root here).
+  if ! osshLayout build; then
     warn.log "osshLayout build did not complete; continuing install"
   fi
 

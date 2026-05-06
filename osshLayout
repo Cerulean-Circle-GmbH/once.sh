@@ -54,6 +54,46 @@ private.osshLayout.owner.email() # # resolves owner email: $USER_EMAIL > git con
   create.result 0 "$email"
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Staged identity helpers — read /tmp/oosh.<role>.{email,id_ed25519,id_ed25519.pub}
+# placed by ossh.install (private.ossh.identity.stage) before the install
+# starts on the remote. Two role files: 'installer' (the user who triggered
+# the install) and 'outer' (the host of this environment). In os.platform.test
+# mode they hold the same bytes; in ProxyJump (future) they diverge.
+# ───────────────────────────────────────────────────────────────────────────
+
+private.osshLayout.staged.dir() # # echoes the staging directory ($OSSH_STAGE_DIR or /tmp)
+{
+  printf '%s\n' "${OSSH_STAGE_DIR:-/tmp}"
+}
+
+private.osshLayout.staged.email() # <role:installer|outer> # echoes the staged email for <role>, sets RESULT, returns 1 if not staged
+{
+  local role="$1"
+  local stageDir
+  stageDir="$(private.osshLayout.staged.dir)"
+  local emailFile="${stageDir}/oosh.${role}.email"
+  if [ ! -f "$emailFile" ]; then
+    create.result 1 ""
+    return 1
+  fi
+  local email
+  email="$(head -n1 "$emailFile" 2>/dev/null | tr -d '\r\n[:space:]')"
+  if [ -z "$email" ]; then
+    create.result 1 ""
+    return 1
+  fi
+  create.result 0 "$email"
+}
+
+private.osshLayout.staged.has.keypair() # <role:installer|outer> # returns 0 if <stageDir>/oosh.<role>.id_ed25519{,.pub} both exist
+{
+  local role="$1"
+  local stageDir
+  stageDir="$(private.osshLayout.staged.dir)"
+  [ -f "${stageDir}/oosh.${role}.id_ed25519" ] && [ -f "${stageDir}/oosh.${role}.id_ed25519.pub" ]
+}
+
 osshLayout.role.owner() # <?sshDir:~/.ssh> # ensures owner keypair exists and creates ssh.<owner-id>.{private_key,public_key} symlinks
 {
   local sshDir="${1:-$HOME/.ssh}"
@@ -124,15 +164,28 @@ osshLayout.role.developking() # <?sshDir:~/.ssh> # deploys the developking ident
 
 osshLayout.role.developking.completion.sshDir() { :; }
 
-osshLayout.role.installer() # <installerEmail> <?keypairSourceDir:$HOME/.ssh> <?sshDir:~/.ssh> # copies installer keypair from <keypairSourceDir> into <sshDir>/ids/ssh.<installer-id>/
+osshLayout.role.installer() # <?installerEmail> <?keypairSourceDir> <?sshDir:~/.ssh> # copies installer keypair into <sshDir>/ids/ssh.<installer-id>/; with no args reads from /tmp/oosh.installer.* (staged by ossh.install)
 {
   local email="$1"
-  local sourceDir="${2:-$HOME/.ssh}"
+  local sourceDir="$2"
   local sshDir="${3:-$HOME/.ssh}"
+  local stagedKeyFile=""
 
+  # No-args path: resolve from staged /tmp/oosh.installer.*
   if [ -z "$email" ]; then
-    error.log "usage: osshLayout role.installer <installerEmail> [keypairSourceDir] [sshDir]"
-    return 1
+    private.osshLayout.staged.email installer
+    if [ "$RETURN_VALUE" -ne 0 ]; then
+      error.log "osshLayout.role.installer: no email arg and no /tmp/oosh.installer.email staged"
+      return 1
+    fi
+    email="$RESULT"
+  fi
+  if [ -z "$sourceDir" ]; then
+    if private.osshLayout.staged.has.keypair installer; then
+      stagedKeyFile="$(private.osshLayout.staged.dir)/oosh.installer.id_ed25519"
+    else
+      sourceDir="$HOME/.ssh"
+    fi
   fi
 
   osshLayout.id.from.email "$email"
@@ -141,11 +194,20 @@ osshLayout.role.installer() # <installerEmail> <?keypairSourceDir:$HOME/.ssh> <?
   fi
   local id="$RESULT"
 
-  local privFile pubFile
-  if [ -f "$sourceDir/id_ed25519" ] && [ -f "$sourceDir/id_ed25519.pub" ]; then
+  local privSrc pubSrc privFile pubFile
+  if [ -n "$stagedKeyFile" ]; then
+    privSrc="$stagedKeyFile"
+    pubSrc="${stagedKeyFile}.pub"
+    privFile="id_ed25519"
+    pubFile="id_ed25519.pub"
+  elif [ -f "$sourceDir/id_ed25519" ] && [ -f "$sourceDir/id_ed25519.pub" ]; then
+    privSrc="$sourceDir/id_ed25519"
+    pubSrc="$sourceDir/id_ed25519.pub"
     privFile="id_ed25519"
     pubFile="id_ed25519.pub"
   elif [ -f "$sourceDir/id_rsa" ] && [ -f "$sourceDir/id_rsa.pub" ]; then
+    privSrc="$sourceDir/id_rsa"
+    pubSrc="$sourceDir/id_rsa.pub"
     privFile="id_rsa"
     pubFile="id_rsa.pub"
   else
@@ -156,14 +218,14 @@ osshLayout.role.installer() # <installerEmail> <?keypairSourceDir:$HOME/.ssh> <?
   local dst="$sshDir/ids/ssh.$id"
   mkdir -p "$dst/private_key" "$dst/public_keys"
 
-  cp "$sourceDir/$privFile" "$dst/$privFile"
-  cp "$sourceDir/$pubFile" "$dst/$pubFile"
+  cp "$privSrc" "$dst/$privFile"
+  cp "$pubSrc" "$dst/$pubFile"
   chmod 600 "$dst/$privFile"
 
   ln -sfn "../$privFile" "$dst/private_key/ssh.$id.private_key"
   ln -sfn "../$pubFile" "$dst/public_keys/ssh.$id.public_key"
 
-  console.log "installer: ssh.$id deployed at $dst (from $sourceDir/$privFile)"
+  console.log "installer: ssh.$id deployed at $dst (from $privSrc)"
   create.result 0 "ssh.$id"
 }
 
@@ -171,13 +233,46 @@ osshLayout.role.installer.completion.installerEmail() { :; }
 osshLayout.role.installer.completion.keypairSourceDir() { :; }
 osshLayout.role.installer.completion.sshDir() { :; }
 
-osshLayout.role.outeruser() # <sourceDir> <?sshDir:~/.ssh> # mirrors <sourceDir> as the outeruser identity at <sshDir>/ids/ssh.outeruser/ (passthrough copy preserving symlinks)
+osshLayout.role.outeruser() # <?sourceDir> <?sshDir:~/.ssh> # builds <sshDir>/ids/ssh.outeruser/; with no args reads /tmp/oosh.outer.* (staged); with sourceDir does a passthrough mirror of an already-formatted outer .ssh folder
 {
   local sourceDir="$1"
   local sshDir="${2:-$HOME/.ssh}"
+  local dst="$sshDir/ids/ssh.outeruser"
 
+  # Staged-keypair mode: no sourceDir given, but /tmp/oosh.outer.* exists.
+  # Build the outer identity from staged files, naming the renamed symlinks
+  # after the outer's email — independent of installer's email so ProxyJump
+  # (where outer ≠ installer) keeps the right names without code changes.
+  if [ -z "$sourceDir" ] && private.osshLayout.staged.has.keypair outer; then
+    private.osshLayout.staged.email outer
+    if [ "$RETURN_VALUE" -ne 0 ]; then
+      error.log "osshLayout.role.outeruser: /tmp/oosh.outer.id_ed25519 staged but no email"
+      return 3
+    fi
+    local outerEmail="$RESULT"
+    osshLayout.id.from.email "$outerEmail"
+    if [ "$RETURN_VALUE" -ne 0 ]; then
+      return 3
+    fi
+    local outerId="$RESULT"
+
+    local stageDir
+    stageDir="$(private.osshLayout.staged.dir)"
+    mkdir -p "$dst/private_key" "$dst/public_keys"
+    cp "${stageDir}/oosh.outer.id_ed25519" "$dst/id_ed25519"
+    cp "${stageDir}/oosh.outer.id_ed25519.pub" "$dst/id_ed25519.pub"
+    chmod 600 "$dst/id_ed25519"
+    ln -sfn "../id_ed25519"     "$dst/private_key/ssh.${outerId}.private_key"
+    ln -sfn "../id_ed25519.pub" "$dst/public_keys/ssh.${outerId}.public_key"
+
+    console.log "outeruser: ssh.outeruser populated from staged ${stageDir}/oosh.outer.* (outer-id=ssh.${outerId})"
+    create.result 0 "ssh.outeruser"
+    return 0
+  fi
+
+  # Passthrough-mirror mode: sourceDir is an already-formatted outer .ssh folder.
   if [ -z "$sourceDir" ]; then
-    error.log "usage: osshLayout role.outeruser <sourceDir> [sshDir]"
+    error.log "usage: osshLayout role.outeruser <sourceDir> [sshDir] (or stage \$OSSH_STAGE_DIR/oosh.outer.*)"
     return 1
   fi
   if [ ! -d "$sourceDir" ]; then
@@ -185,7 +280,6 @@ osshLayout.role.outeruser() # <sourceDir> <?sshDir:~/.ssh> # mirrors <sourceDir>
     return 2
   fi
 
-  local dst="$sshDir/ids/ssh.outeruser"
   mkdir -p "$dst"
   cp -a "$sourceDir/." "$dst/"
 
@@ -196,24 +290,11 @@ osshLayout.role.outeruser() # <sourceDir> <?sshDir:~/.ssh> # mirrors <sourceDir>
 osshLayout.role.outeruser.completion.sourceDir() { :; }
 osshLayout.role.outeruser.completion.sshDir() { :; }
 
-osshLayout.build() # <?installerEmail> <?installerKeypairSrc:$HOME/.ssh> <?sshDir:~/.ssh> # builds the prescribed layout: owner, developking, installer, outeruser (test-mode passthrough)
+osshLayout.build() # <?installerEmail> <?installerKeypairSrc> <?sshDir:~/.ssh> # builds the prescribed layout: owner, developking, installer, outeruser. Args are optional fallbacks; role methods prefer staged /tmp/oosh.{installer,outer}.* placed by ossh.install.
 {
   local installerEmail="$1"
-  local installerSrc="${2:-$HOME/.ssh}"
+  local installerSrc="$2"
   local sshDir="${3:-$HOME/.ssh}"
-
-  # Installer email defaults to the same resolution the owner uses:
-  # $USER_EMAIL > git config user.email > whoami@hostname. This collapses
-  # installer ≡ owner in test mode without requiring the install pipeline
-  # to thread the runner's email through every code path.
-  if [ -z "$installerEmail" ]; then
-    private.osshLayout.owner.email
-    installerEmail="$RESULT"
-  fi
-  if [ -z "$installerEmail" ]; then
-    error.log "osshLayout build: cannot resolve installer email (USER_EMAIL/git config/whoami all empty)"
-    return 1
-  fi
 
   osshLayout.role.owner "$sshDir"
   if [ "$RETURN_VALUE" -ne 0 ]; then
@@ -227,21 +308,29 @@ osshLayout.build() # <?installerEmail> <?installerKeypairSrc:$HOME/.ssh> <?sshDi
     return 3
   fi
 
+  # role.installer auto-resolves: staged /tmp/oosh.installer.* > explicit args > fallback chain.
+  # Explicit args (if passed) override staging — useful for unit tests.
   osshLayout.role.installer "$installerEmail" "$installerSrc" "$sshDir"
   if [ "$RETURN_VALUE" -ne 0 ]; then
     error.log "osshLayout.build: role.installer failed"
     return 4
   fi
+  local installerResult="$RESULT"
 
-  osshLayout.id.from.email "$installerEmail"
-  local installerId="$RESULT"
-  osshLayout.role.outeruser "$sshDir/ids/ssh.$installerId" "$sshDir"
+  # role.outeruser: prefer staged /tmp/oosh.outer.* (no args). If not staged,
+  # fall back to mirroring the installer ids folder (test-mode collapse for
+  # standalone use without staging — preserves backward compat).
+  if private.osshLayout.staged.has.keypair outer; then
+    osshLayout.role.outeruser "" "$sshDir"
+  else
+    osshLayout.role.outeruser "$sshDir/ids/$installerResult" "$sshDir"
+  fi
   if [ "$RETURN_VALUE" -ne 0 ]; then
     error.log "osshLayout.build: role.outeruser failed"
     return 5
   fi
 
-  important.log "✓ osshLayout build complete: $(whoami) at $sshDir (installer ssh.$installerId)"
+  important.log "✓ osshLayout build complete: $(whoami) at $sshDir (installer $installerResult)"
   create.result 0 "$sshDir"
 }
 
