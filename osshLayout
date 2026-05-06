@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+osshLayout.id.from.email() # <email> # converts an email address to an oosh ssh id by lowercasing and replacing @ with .
+{
+  local email="$1"
+  if [ -z "$email" ]; then
+    error.log "usage: osshLayout id.from.email <email>"
+    return 1
+  fi
+  if ! [[ "$email" == *@* ]]; then
+    error.log "email must contain @: '$email'"
+    return 2
+  fi
+
+  local id
+  id=$(echo "$email" | tr '[:upper:]' '[:lower:]' | tr '@' '.')
+  create.result 0 "$id"
+  return 0
+}
+
+osshLayout.id.from.email.completion.email() { :; }
+
+private.osshLayout.ensure.keypair() # <sshDir> # generates id_ed25519 keypair in <sshDir> if absent
+{
+  local sshDir="$1"
+  if [ -z "$sshDir" ]; then
+    error.log "private.osshLayout.ensure.keypair: sshDir required"
+    return 1
+  fi
+  if [ ! -f "$sshDir/id_ed25519" ]; then
+    mkdir -p "$sshDir"
+    ssh-keygen -t ed25519 -f "$sshDir/id_ed25519" -N '' -q
+    create.result 0 "generated $sshDir/id_ed25519"
+  else
+    create.result 0 "$sshDir/id_ed25519 already exists"
+  fi
+}
+
+private.osshLayout.owner.email() # # resolves owner email: $USER_EMAIL > git config user.email > whoami@hostname
+{
+  local email="$USER_EMAIL"
+  if [ -z "$email" ] && command -v git >/dev/null 2>&1; then
+    email="$(git config --global user.email 2>/dev/null)"
+    [ -z "$email" ] && email="$(git config user.email 2>/dev/null)"
+  fi
+  if [ -z "$email" ]; then
+    email="$(whoami)@$(hostname)"
+  fi
+  create.result 0 "$email"
+}
+
+osshLayout.role.owner() # <?sshDir:~/.ssh> # ensures owner keypair exists and creates ssh.<owner-id>.{private_key,public_key} symlinks
+{
+  local sshDir="${1:-$HOME/.ssh}"
+
+  private.osshLayout.owner.email
+  local ownerEmail="$RESULT"
+
+  osshLayout.id.from.email "$ownerEmail"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.role.owner: could not derive id from '$ownerEmail'"
+    return 1
+  fi
+  local ownerId="$RESULT"
+
+  private.osshLayout.ensure.keypair "$sshDir"
+
+  mkdir -p "$sshDir/private_key" "$sshDir/public_keys"
+  ln -sfn "../id_ed25519" "$sshDir/private_key/ssh.${ownerId}.private_key"
+  ln -sfn "../id_ed25519.pub" "$sshDir/public_keys/ssh.${ownerId}.public_key"
+
+  console.log "owner: ssh.${ownerId} -> id_ed25519 in $sshDir"
+  create.result 0 "ssh.${ownerId}"
+}
+
+osshLayout.role.owner.completion.sshDir() { :; }
+
+osshLayout.role.developking() # <?sshDir:~/.ssh> # deploys the developking identity bundle from templates/user/developking.ssh/ into <sshDir>/ids/ssh.developking/
+{
+  local sshDir="${1:-$HOME/.ssh}"
+  local src="$OOSH_DIR/templates/user/developking.ssh"
+  local dst="$sshDir/ids/ssh.developking"
+
+  if [ ! -d "$src" ]; then
+    error.log "osshLayout.role.developking: template not found at $src"
+    return 1
+  fi
+
+  mkdir -p "$dst"
+  cp -R "$src/." "$dst/"
+
+  console.log "developking: deployed to $dst"
+  create.result 0 "ssh.developking"
+}
+
+osshLayout.role.developking.completion.sshDir() { :; }
+
+osshLayout.role.installer() # <installerEmail> <?keypairSourceDir:$HOME/.ssh> <?sshDir:~/.ssh> # copies installer keypair from <keypairSourceDir> into <sshDir>/ids/ssh.<installer-id>/
+{
+  local email="$1"
+  local sourceDir="${2:-$HOME/.ssh}"
+  local sshDir="${3:-$HOME/.ssh}"
+
+  if [ -z "$email" ]; then
+    error.log "usage: osshLayout role.installer <installerEmail> [keypairSourceDir] [sshDir]"
+    return 1
+  fi
+
+  osshLayout.id.from.email "$email"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    return 1
+  fi
+  local id="$RESULT"
+
+  local privFile pubFile
+  if [ -f "$sourceDir/id_ed25519" ] && [ -f "$sourceDir/id_ed25519.pub" ]; then
+    privFile="id_ed25519"
+    pubFile="id_ed25519.pub"
+  elif [ -f "$sourceDir/id_rsa" ] && [ -f "$sourceDir/id_rsa.pub" ]; then
+    privFile="id_rsa"
+    pubFile="id_rsa.pub"
+  else
+    error.log "osshLayout.role.installer: no id_ed25519 or id_rsa keypair in $sourceDir"
+    return 2
+  fi
+
+  local dst="$sshDir/ids/ssh.$id"
+  mkdir -p "$dst/private_key" "$dst/public_keys"
+
+  cp "$sourceDir/$privFile" "$dst/$privFile"
+  cp "$sourceDir/$pubFile" "$dst/$pubFile"
+  chmod 600 "$dst/$privFile"
+
+  ln -sfn "../$privFile" "$dst/private_key/ssh.$id.private_key"
+  ln -sfn "../$pubFile" "$dst/public_keys/ssh.$id.public_key"
+
+  console.log "installer: ssh.$id deployed at $dst (from $sourceDir/$privFile)"
+  create.result 0 "ssh.$id"
+}
+
+osshLayout.role.installer.completion.installerEmail() { :; }
+osshLayout.role.installer.completion.keypairSourceDir() { :; }
+osshLayout.role.installer.completion.sshDir() { :; }
+
+osshLayout.role.outeruser() # <sourceDir> <?sshDir:~/.ssh> # mirrors <sourceDir> as the outeruser identity at <sshDir>/ids/ssh.outeruser/ (passthrough copy preserving symlinks)
+{
+  local sourceDir="$1"
+  local sshDir="${2:-$HOME/.ssh}"
+
+  if [ -z "$sourceDir" ]; then
+    error.log "usage: osshLayout role.outeruser <sourceDir> [sshDir]"
+    return 1
+  fi
+  if [ ! -d "$sourceDir" ]; then
+    error.log "osshLayout.role.outeruser: source not found: $sourceDir"
+    return 2
+  fi
+
+  local dst="$sshDir/ids/ssh.outeruser"
+  mkdir -p "$dst"
+  cp -a "$sourceDir/." "$dst/"
+
+  console.log "outeruser: mirrored from $sourceDir at $dst"
+  create.result 0 "ssh.outeruser"
+}
+
+osshLayout.role.outeruser.completion.sourceDir() { :; }
+osshLayout.role.outeruser.completion.sshDir() { :; }
+
+osshLayout.build() # <?installerEmail:$USER_EMAIL> <?installerKeypairSrc:$HOME/.ssh> <?sshDir:~/.ssh> # builds the prescribed layout: owner, developking, installer, outeruser (test-mode passthrough)
+{
+  local installerEmail="${1:-$USER_EMAIL}"
+  local installerSrc="${2:-$HOME/.ssh}"
+  local sshDir="${3:-$HOME/.ssh}"
+
+  if [ -z "$installerEmail" ]; then
+    error.log "osshLayout build: installer email required (set USER_EMAIL or pass as 1st arg)"
+    return 1
+  fi
+
+  osshLayout.role.owner "$sshDir"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.owner failed"
+    return 2
+  fi
+
+  osshLayout.role.developking "$sshDir"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.developking failed"
+    return 3
+  fi
+
+  osshLayout.role.installer "$installerEmail" "$installerSrc" "$sshDir"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.installer failed"
+    return 4
+  fi
+
+  osshLayout.id.from.email "$installerEmail"
+  local installerId="$RESULT"
+  osshLayout.role.outeruser "$sshDir/ids/ssh.$installerId" "$sshDir"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.outeruser failed"
+    return 5
+  fi
+
+  console.log "osshLayout.build: complete at $sshDir"
+  create.result 0 "$sshDir"
+}
+
+osshLayout.build.completion.installerEmail() { :; }
+osshLayout.build.completion.installerKeypairSrc() { :; }
+osshLayout.build.completion.sshDir() { :; }
+
+### new.method
+
+osshLayout.usage()
+{
+  local this=${0##*/}
+  echo "You started" 
+  echo "$0
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+  
+  Examples
+    $this v
+    $this init
+    ----------
+  "
+}
+
+osshLayout.start()
+{
+  #echo "sourcing init"
+  source this
+
+  # if [ -z "$1" ]; then
+  #   status.discover "$@"
+  #   return 0
+  # fi
+
+  this.start "$@"
+}
+
+osshLayout.start "$@"
+
