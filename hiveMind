@@ -1395,80 +1395,31 @@ hiveMind.resolve.completion.session() {
   private.hiveMind.teams.complete
 }
 
-hiveMind.send() # <agentName> <text...> # send text/keys to agent by name (delegates to otmux send)
+hiveMind.send() # <agentName> <text...> # DEPRECATED — context-aware wrapper around agent.send (Epic I Phase 2)
 {
+  # Epic I Phase 2 (PO decision 2): legacy hiveMind.send is now a thin wrapper
+  # around hiveMind.agent.send. Existing callers automatically gain state-aware
+  # routing — no longer interrupts active agents or sends into overlays. The
+  # original Bug #4 target-format validation lives inside agent.send / route.
   local name="$1"
   shift
-
   if [ -z "$name" ] || [ -z "$*" ]; then
     error.log "Usage: hiveMind send <name> <text...>"
     return 1
   fi
-
-  # Bug #4 defense: capture both stdout and rc; validate target format before
-  # using. error.log writes to stdout (GOTCHA), so a failed resolve can leave
-  # error text in $target — must check rc AND format.
-  local target resolveRc
-  target=$(hiveMind.resolve "$name" 2>/dev/null)
-  resolveRc=$?
-  if [ $resolveRc -ne 0 ] || [ -z "$target" ]; then
-    error.log "hiveMind.send: cannot resolve '$name' (rc=$resolveRc)"
-    return 1
-  fi
-  if ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
-    error.log "hiveMind.send: resolve returned malformed target for '$name': '$target'"
-    return 1
-  fi
-  private.hiveMind.monitor.switch "$target"
-
-  # Delegate all detection (keys, /commands, text+key combos) to otmux send
-  otmux send "$target" "$@"
-  info.log "Sent to $name ($target): $*"
-  return 0
+  hiveMind.agent.send "$name" "$@"
 }
 
-hiveMind.send.message() # <agentName> <message> # safe send: resolve name across ALL teams, delegate to otmux send
+hiveMind.send.message() # <agentName> <message> # DEPRECATED — context-aware wrapper around agent.send (Epic I Phase 2)
 {
+  # See hiveMind.send above. This entry point is preserved for back-compat.
   local name="$1"
   shift
-  local message="$*"
-
-  if [ -z "$name" ] || [ -z "$message" ]; then
+  if [ -z "$name" ] || [ -z "$*" ]; then
     error.log "Usage: hiveMind send.message <name> <message>"
     return 1
   fi
-
-  # Bug #4 fix: rc-aware + format-validated. The previous version checked
-  # only `[ -z "$target" ]`, which is fooled because error.log writes to
-  # stdout (gets captured into $target on failure). Result: malformed target
-  # (e.g. multi-line error message) was passed to tmux send-keys -t, which
-  # silently fell back to the focused pane, leaking content (digits/words)
-  # into whatever pane Tron was looking at.
-  local target resolveRc
-  target=$(hiveMind.resolve "$name" 2>/dev/null)
-  resolveRc=$?
-  if [ $resolveRc -ne 0 ] || [ -z "$target" ]; then
-    error.log "hiveMind.send.message: cannot resolve '$name' in any team (rc=$resolveRc)"
-    return 1
-  fi
-  if ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
-    error.log "hiveMind.send.message: resolve returned malformed target for '$name': '$target'"
-    return 1
-  fi
-  private.hiveMind.monitor.switch "$target"
-
-  # Delegate all tmux logic to otmux (DRY — accept-edits, C-u, verify all in one place)
-  "otmux" send "$target" "$message"
-  local rc=$?
-
-  if [ $rc -eq 0 ]; then
-    info.log "Message delivered to $name ($target)"
-    create.result 0 "DELIVERED"
-  else
-    warn.log "Message delivery uncertain for $name ($target)"
-    create.result 0 "UNCERTAIN"
-  fi
-  return $rc
+  hiveMind.agent.send "$name" "$@"
 }
 hiveMind.send.enter() { # <agentName> <message> # send message to agent (alias for send.message)
   hiveMind.send.message "$@"
@@ -1504,8 +1455,45 @@ private.hiveMind.channel.resolve() # <agentName> # resolve agent name to best av
   return 1
 }
 
-hiveMind.agent.send() # <agentName> <message> # send message to agent via best available channel
+private.hiveMind.agent.route() # <pane> # classify pane state → route name (inform|overlay|queue|unknown-state)
 {
+  # Epic I I1.1: maps sweep.detect's 18 states to one of 4 routes:
+  #   inform              — INFORM path (only when at idle ❯ prompt)
+  #   overlay             — REMOTE CONTROL allowed (modal needs approve/reject/dismiss/option)
+  #   queue               — agent busy or transient state, defer message
+  #   unknown-state       — sweep.detect couldn't classify (conservative queue)
+  local pane="$1"
+  [ -z "$pane" ] && { echo "unknown-state"; return 1; }
+
+  local detect status
+  detect=$(private.hiveMind.sweep.detect "$pane" 2>/dev/null)
+  status="${detect%%|*}"
+
+  case "$status" in
+    idle)
+      echo "inform"
+      ;;
+    permission|accept-edits|tool-confirm|overlay|panel|autocomplete|shell-escaped)
+      echo "overlay"
+      ;;
+    active|queued|context-warning|just-compacted|shell)
+      echo "queue"
+      ;;
+    rate-limit|subscription-limit|crash|api-error|mcp-error)
+      # Critical: neither send nor remote-control fixes these. Queue for later;
+      # drain will retry once state recovers (or human intervenes).
+      echo "queue"
+      ;;
+    ""|unknown|*)
+      echo "unknown-state"
+      ;;
+  esac
+}
+
+hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFORM, busy→QUEUE, overlay→reject (use approve/reject) [Epic I]
+{
+  # Epic I I1.1 router. Transport-aware (pane vs api) AND state-aware (only sends
+  # to idle agents; queues otherwise; rejects overlay states with guidance).
   local name="$1"
   shift
   local message="$*"
@@ -1519,27 +1507,52 @@ hiveMind.agent.send() # <agentName> <message> # send message to agent via best a
   channel=$(private.hiveMind.channel.resolve "$name")
   if [ $? -ne 0 ]; then
     error.log "No communication channel available for agent '$name'"
+    create.result 1 "no-channel: $name"
     return 1
   fi
 
   local transport="${channel%%|*}"
   local target="${channel#*|}"
 
-  case "$transport" in
-    pane)
-      otmux send.enter "$target" "$message"
+  # API transport — no pane state to detect. Send directly.
+  if [ "$transport" = "api" ]; then
+    agentRoom chat "$target" "$message"
+    info.log "Sent to $name via api ($target)"
+    create.result 0 "delivered $name $target via api"
+    return 0
+  fi
+
+  # Pane transport — route via state detection.
+  local route
+  route=$(private.hiveMind.agent.route "$target")
+
+  case "$route" in
+    inform)
+      otmux send "$target" "$message"
+      info.log "INFORM delivered to $name ($target)"
+      create.result 0 "delivered $name $target"
+      return 0
       ;;
-    api)
-      agentRoom chat "$target" "$message"
+    overlay)
+      error.log "rejected: $name is in overlay state — use hiveMind agent.approve/reject/dismiss/option"
+      create.result 1 "rejected: in-overlay"
+      return 1
+      ;;
+    queue|unknown-state)
+      # I1.1 stub — real queue persistence ships in I1.4. For now, log + indicate.
+      info.log "QUEUE: $name ($target) is busy (route=$route); message deferred (queue impl in I1.4)"
+      create.result 0 "queued $name (route=$route, persistence pending I1.4)"
+      return 0
       ;;
     *)
-      error.log "Unknown transport: $transport"
+      error.log "Internal: unknown route '$route' for $name"
+      create.result 1 "internal: unknown-route"
       return 1
       ;;
   esac
-
-  info.log "Sent to $name via $transport ($target): $message"
-  return 0
+}
+hiveMind.agent.send.completion.agentName() {
+  private.hiveMind.roles.complete
 }
 
 hiveMind.agent.session.probe() # <agentName|pane> <?session> # ground-truth UUID via /status + JSONL correlation (slow ~3s)
