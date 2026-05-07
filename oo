@@ -1047,7 +1047,12 @@ oo.state() # # initializes the state machine or shows the current state if alrea
     source $CONFIG_PATH/current.state.machine.env
     if [ $state -le $prevState ]; then
       error.log "State machine stuck at [$state] — aborting advancement"
-      break
+      # Propagate non-zero so init/oosh:518's `[ $rc -eq 0 ]` gate sees the
+      # failure and the post-state-machine non-root invoker block at
+      # init/oosh:536-561 correctly skips. Previously this `break` left
+      # the function returning 0, so init/oosh ran post-machine work on top
+      # of a broken install.
+      return 1
     fi
     ((i++))
   done
@@ -1255,11 +1260,21 @@ private.check.root.shared.dev.folder.created() {
   #set -x
 
 
+  # ─── state 31 [1/5: developking.created] ────────────────────────────────
+  # Create developking and put them in the dev group. user.create
+  # auto-invokes user.oosh.install, which (after f515903 + 4069475) gives
+  # developking the same OOSH experience as any other user — bashrc with
+  # completion, ~/oosh + ~/config symlinks, ed25519 keypair, WODA aliases.
   local devHome="$( user get home developking )"
   if [ -z "$devHome" ]; then
     user create developking
     user group.add dev developking
     devHome="$( user get home developking )"
+  fi
+  if [ -z "$devHome" ] || [ ! -d "$devHome" ]; then
+    error.log "state 31 [1/5: developking.created]: 'user create developking' failed — $devHome (basehome) does not exist"
+    create.result 1 "state 31 step 1/5 failed: developking not created"
+    return $(result)
   fi
   # echo  "absolutePath of \"$devHome\..\"..."
   # this.absolutePath "$devHome/.."
@@ -1284,18 +1299,25 @@ private.check.root.shared.dev.folder.created() {
     create.result 0 "root.shared.dev.folder.created" $1
   else
     console.log "creating shared infrastructure"
+
+    # ─── state 31 [2/5: shared.tree.created] ──────────────────────────────
     mkdir -p "$dir/shared/dev/Workspaces"
     mkdir -p "$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh"
     mkdir -p "$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
 
     $SUDO user group.add dev $USER
     #cp -r $HOME/oosh "$dir/shared/dev/."
-    
-    
+
     $SUDO chown -R developking:dev "$dir/shared/dev/"
     #find "$dir/shared/dev/oosh" -type d -print0 | xargs -0 chmod 2775
     #find "$dir/shared/dev/oosh" -type f -print0 | xargs -0 chmod +grwx
 
+    if [ ! -d "$dir/shared/EAMD.ucp" ] \
+       || [ ! -d "$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh" ]; then
+      error.log "state 31 [2/5: shared.tree.created]: $dir/shared/EAMD.ucp tree missing after mkdir -p"
+      create.result 1 "state 31 step 2/5 failed: shared tree not created"
+      return $(result)
+    fi
 
     cd "$dir/developking/"
     oo.cmd wget
@@ -1307,6 +1329,9 @@ private.check.root.shared.dev.folder.created() {
     # before this state-31 check. No fallback needed here — modern pipeline
     # guarantees ~/.ssh exists by the time we get here.
 
+    # ─── state 31 [3/5: dev.keys.deployed] ────────────────────────────────
+    # Try web download first; fall back to runner-bundled template. Step
+    # fails loud if neither produces ~developking/.ssh/id_rsa.
     export DEVELOPKING_SOURCE_SERVER=test.wo-da.de
 
     wget -r -np --cut-dirs=9 -R "index.html*" "https://${DEVELOPKING_SOURCE_SERVER}/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/NewUserStuff/scripts/templates/developking.ssh"
@@ -1324,8 +1349,21 @@ private.check.root.shared.dev.folder.created() {
       mv "$dir/developking/${DEVELOPKING_SOURCE_SERVER}/developking.ssh" "$dir/developking/.ssh"
       rm -rf "$dir/developking/${DEVELOPKING_SOURCE_SERVER}"
     fi
+    if [ ! -f "$dir/developking/.ssh/id_rsa" ]; then
+      error.log "state 31 [3/5: dev.keys.deployed]: $dir/developking/.ssh/id_rsa missing after wget+template fallback"
+      create.result 1 "state 31 step 3/5 failed: developking deploy keys not deployed"
+      return $(result)
+    fi
 
+    # ─── state 31 [4/5: shared.config.seeded] ─────────────────────────────
+    # private.install.dev.configs writes Host 2cuGitHub to root's
+    # ~/.ssh/config. Verify it landed.
     private.install.dev.configs
+    if ! grep -q "^Host 2cuGitHub" "$HOME/.ssh/config" 2>/dev/null; then
+      error.log "state 31 [4/5: shared.config.seeded]: Host 2cuGitHub missing from $HOME/.ssh/config after private.install.dev.configs"
+      create.result 1 "state 31 step 4/5 failed: 2cuGitHub Host alias not written"
+      return $(result)
+    fi
 
 
     cd "$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
@@ -1455,6 +1493,33 @@ private.check.root.shared.dev.folder.created() {
     console.log "CONFIG=$CONFIG"
     config save
 
+    # F3 absorption: template root-home paths in the just-saved shared
+    # config so non-root users can source it without hitting /root paths
+    # they can't read. Was at ossh:704-732 in ossh.install.continue.local
+    # (post-state-machine fixup); moved here so the state machine owns it.
+    if [ -f "$CONFIG" ]; then
+      local _rootHome="$HOME"
+      local _sedFlag="-i"
+      if [ "$(uname -s)" = "Darwin" ]; then _sedFlag="-i ''"; fi
+      eval sed $_sedFlag "'s|${_rootHome}/config|\$HOME/config|g'" "'$CONFIG'"
+      eval sed $_sedFlag "'s|${_rootHome}/oosh|\$HOME/oosh|g'" "'$CONFIG'"
+      if [ -n "$OOSH_BRANCH" ] && [ "$OOSH_BRANCH" != "dev" ]; then
+        eval sed $_sedFlag "'s|${_rootHome}/${OOSH_BRANCH}|\$HOME/oosh|g'" "'$CONFIG'"
+      fi
+      local _configDir
+      _configDir="$(dirname "$CONFIG")"
+      for _f in "$_configDir"/oosh.env "$_configDir"/log.env; do
+        if [ -f "$_f" ]; then
+          eval sed $_sedFlag "'s|${_rootHome}/config|\$HOME/config|g'" "'$_f'"
+          eval sed $_sedFlag "'s|${_rootHome}/oosh|\$HOME/oosh|g'" "'$_f'"
+          if [ -n "$OOSH_BRANCH" ] && [ "$OOSH_BRANCH" != "dev" ]; then
+            eval sed $_sedFlag "'s|${_rootHome}/${OOSH_BRANCH}|\$HOME/oosh|g'" "'$_f'"
+          fi
+          eval sed $_sedFlag "'s|OOSH_WORKTREE_BASE=\"${_rootHome}\"|OOSH_WORKTREE_BASE=\"\$HOME\"|g'" "'$_f'"
+        fi
+      done
+    fi
+
 
   set -x
     cd /root
@@ -1477,21 +1542,27 @@ private.check.root.shared.dev.folder.created() {
 
 
   set +x
+    # ─── state 31 [5/5: dev.repo.cloned] ─────────────────────────────────
     # Post-body verification: without this, a silent failure in git clone /
     # worktree add leaves the state machine thinking state 31 succeeded while
     # $sharedOosh never materialized, causing downstream user.oosh.install to
     # time out polling for a dir that's never going to appear.
     if [ ! -d "$onceShBase/${OOSH_BRANCH}" ]; then
-      error.log "state 31: body ran but $onceShBase/${OOSH_BRANCH} is missing — check git clone/worktree-add logs above"
-      create.result 1 "dev folder not created at $onceShBase/${OOSH_BRANCH}"
+      error.log "state 31 [5/5: dev.repo.cloned]: $onceShBase/${OOSH_BRANCH} missing — check git clone/worktree-add logs above"
+      create.result 1 "state 31 step 5/5 failed: dev folder not created at $onceShBase/${OOSH_BRANCH}"
       return $(result)
     fi
 
-    # Seed /home/shared/.ssh/ via the same primitive the caller-side install
-    # path uses (single source of truth). Idempotent — finish.local's else
-    # branch re-invokes it and will skip if already present.
-    ossh config.shared.create "" "$dir/developking/.ssh/id_rsa" 2>&1 \
-      || warn.log "state 31: ossh config.shared.create failed (finish.local fallback will retry)"
+    # Seed /<basehome>/shared/.ssh/ via the same primitive the caller-side
+    # install path uses (single source of truth). Idempotent. Was followed
+    # by a defensive re-invocation at ossh:735-743 (F4) — that's gone now;
+    # this call is fail-loud so any silent failure halts state 31.
+    ossh config.shared.create "" "$dir/developking/.ssh/id_rsa" 2>&1
+    if [ ! -f "$dir/shared/.ssh/2cuGitHub" ]; then
+      error.log "state 31 [5/5: dev.repo.cloned]: $dir/shared/.ssh/2cuGitHub missing after ossh config.shared.create"
+      create.result 1 "state 31 step 5/5 failed: shared SSH not seeded"
+      return $(result)
+    fi
 
     create.result 0 "root.shared.dev.folder.created" $1
   fi

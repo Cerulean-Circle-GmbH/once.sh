@@ -10,10 +10,11 @@
 |---|---|---|
 | F8 (parent audit said FIXUP) | Reclassified **LEGIT**; 110-line region refactored to 3-line dispatch + 2 helpers | `706950f` (sub-audit at [state-machine-fixup-audit-F8.md](state-machine-fixup-audit-F8.md)) |
 | §5 step 1: `user.init` destructive `> $sshDir/config` overwrite | **Fixed** — append-if-missing per WODA alias | `f515903` (plan at [plan-user-init-fix.md](plan-user-init-fix.md)) |
-| §5 step 2: F1 (`ossh:700–711`) + F2 (`ossh:719–727`) defensive re-adds | **Deleted** — verified safe in clean container (`os platform.test ubuntu_24_04`) after step 1 | this commit |
-| §5 steps 3–4: F3 path-rewrite sed, F4 defensive shared-seed | **Pending** — separate plans |
-| §5 step 5: F8 decompose | Superseded by F8 sub-audit's refactor (step 1–3 done in `706950f`) |
-| §5 step 6: state 31 + osshLayout (F5) ownership choices | **Pending** |
+| §5 step 2: F1 (`ossh:700–711`) + F2 (`ossh:719–727`) defensive re-adds | **Deleted** — verified safe in clean container (`os platform.test ubuntu_24_04`) after step 1 | `8ec11a5` |
+| §5 steps 3–4: F3 path-rewrite sed, F4 defensive shared-seed | **Deleted from `ossh.install.continue.local`** — F3 absorbed into state 31 (sed runs right after `config save` at oo:1494); F4 absorbed into state 31's now-fail-loud `ossh config.shared.create` at the bottom of state 31's body | this commit (state-machine fail-loud Phase 1) |
+| §5 step 5: F8 decompose | Superseded by F8 sub-audit's refactor | `706950f` |
+| §5 step 6: state 31 fail-loud + osshLayout (F5) ownership | State 31: **5 numbered sub-steps with rc-checks + error.log + create.result 1 + return $(result)** at each boundary (kept as one state per user direction; not split). osshLayout F5: **deferred** (still LEGIT). | this commit |
+| State-advancement loop (oo:1044+) | **Fixed** — `break` on stuck → `return 1` so init/oosh:518 propagates non-zero | this commit |
 
 ---
 
