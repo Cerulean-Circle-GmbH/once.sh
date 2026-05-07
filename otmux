@@ -1114,32 +1114,35 @@ private.otmux.size.lock.set() { # <session:win> <width> <height> # upsert lock e
   [ -z "$key" ] || [ -z "$w" ] || [ -z "$h" ] && return 1
   mkdir -p "$(dirname "$OTMUX_SIZE_LOCKS")" 2>/dev/null
   touch "$OTMUX_SIZE_LOCKS"
-  # Atomic upsert: drop existing entry for this key, append new one
-  grep -v "^${key}|" "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
+  # Atomic upsert via awk — fully literal match, immune to regex metachars in
+  # session names (orphan tmux sessions can have escape codes / brackets in
+  # their name; bug #1 fix).
+  awk -v k="${key}|" 'substr($0, 1, length(k)) != k' "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
   mv "${OTMUX_SIZE_LOCKS}.tmp" "$OTMUX_SIZE_LOCKS"
   echo "${key}|${w}|${h}|$(date +%s)" >> "$OTMUX_SIZE_LOCKS"
 }
 
-private.otmux.size.lock.remove() { # <session:win> # delete lock entry
+private.otmux.size.lock.remove() { # <session:win> # delete lock entry (literal-match, regex-safe)
   local key="$1"
   [ -z "$key" ] && return 1
   [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
-  grep -v "^${key}|" "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
+  awk -v k="${key}|" 'substr($0, 1, length(k)) != k' "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
   mv "${OTMUX_SIZE_LOCKS}.tmp" "$OTMUX_SIZE_LOCKS"
 }
 
-private.otmux.size.lock.has() { # <session:win> # 0 if locked, 1 otherwise
+private.otmux.size.lock.has() { # <session:win> # 0 if locked, 1 otherwise (literal-match)
   local key="$1"
   [ -z "$key" ] && return 1
   [ -f "$OTMUX_SIZE_LOCKS" ] || return 1
-  grep -q "^${key}|" "$OTMUX_SIZE_LOCKS"
+  awk -v k="${key}|" 'substr($0, 1, length(k)) == k {found=1; exit} END {exit !found}' "$OTMUX_SIZE_LOCKS"
 }
 
 private.otmux.size.lock.list() { # <?session> # list locked window keys (optionally filtered to session)
   [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
   local sess="${1:-}"
   if [ -n "$sess" ]; then
-    grep "^${sess}:" "$OTMUX_SIZE_LOCKS" 2>/dev/null | cut -d'|' -f1
+    # Literal prefix match: session-name + ':'
+    awk -v p="${sess}:" 'substr($0, 1, length(p)) == p' "$OTMUX_SIZE_LOCKS" 2>/dev/null | cut -d'|' -f1
   else
     cut -d'|' -f1 "$OTMUX_SIZE_LOCKS" 2>/dev/null
   fi
@@ -1216,7 +1219,7 @@ otmux.window.size.unlock() # <?session> # restore window-size=largest on locked 
 }
 otmux.window.size.unlock.completion.session() { private.complete.sessions; }
 
-otmux.window.size.status() # # tabular: SESSION:WINDOW SIZE LOCKED CLIENTS — collapsed=red, locked=yellow, healthy=green
+otmux.window.size.status() # # tabular: SESSION:WINDOW SIZE LOCKED CLIENTS — collapsed=red, locked=yellow, small=cyan, healthy=green
 {
   # First age out stale lock entries (sessions that no longer exist)
   private.otmux.size.lock.cleanup
@@ -1224,26 +1227,42 @@ otmux.window.size.status() # # tabular: SESSION:WINDOW SIZE LOCKED CLIENTS — c
   printf "  %-40s %-12s %-8s %s\n" "SESSION:WINDOW" "SIZE" "LOCKED" "CLIENTS"
   printf "  %-40s %-12s %-8s %s\n" "─────────────────────" "──────" "──────" "───────"
 
-  # Build client-by-session map first (one tmux call instead of per-row)
-  local clientsBySess
-  clientsBySess=$($TMUX_CMD list-clients -F '#{client_session}' 2>/dev/null | sort | uniq -c | sed 's/^[[:space:]]*//')
+  # Build client-by-session map first (one tmux call instead of per-row).
+  # Use #{session_attached} from list-sessions — more reliable than parsing
+  # list-clients (which may not see clients attached via switch-client).
+  local attachedBySess
+  attachedBySess=$($TMUX_CMD list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null)
 
   local fmt='#{session_name}:#{window_index}|#{window_width}|#{window_height}'
   local key cw ch sess clients locked color marker
   while IFS='|' read -r key cw ch; do
     [ -z "$key" ] && continue
     sess="${key%%:*}"
-    clients=$(echo "$clientsBySess" | awk -v s="$sess" '$2==s{print $1}')
+    # Lookup attached count for this session via literal awk match
+    clients=$(echo "$attachedBySess" | awk -F'|' -v s="$sess" '$1==s{print $2}')
     [ -z "$clients" ] && clients=0
 
     locked="no"
     private.otmux.size.lock.has "$key" && locked="yes"
 
+    # Classification (bug #2 fix):
+    #   COLLAPSED (red) — below floor AND no clients attached. Truly broken.
+    #   SMALL     (cyan)— below floor but client attached. User has a small
+    #                     terminal — that's their choice, not a bug.
+    #   LOCKED    (yellow) — explicit window-size=manual via lock command
+    #   HEALTHY   (green) — at-or-above floor, no lock
     color="${BOLD_GREEN}"
     marker=""
+    local belowFloor=false
     if [ "${cw:-0}" -lt "$OTMUX_SIZE_FLOOR_W" ] || [ "${ch:-0}" -lt "$OTMUX_SIZE_FLOOR_H" ]; then
+      belowFloor=true
+    fi
+    if [ "$belowFloor" = true ] && [ "${clients:-0}" -eq 0 ]; then
       color="${BOLD_RED}"
       marker=" [collapsed]"
+    elif [ "$belowFloor" = true ]; then
+      color="${BOLD_CYAN}"
+      marker=" [small client]"
     elif [ "$locked" = "yes" ]; then
       color="${BOLD_YELLOW}"
     fi
