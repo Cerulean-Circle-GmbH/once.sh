@@ -1,8 +1,19 @@
 # State-Machine Fixup Audit
 
-**Status:** research only — no code edits proposed yet. Untracked until reviewed.
+**Status:** research → in execution. Updated 2026-05-07 evening.
 **Date:** 2026-05-07
 **Triggered by:** WODA-regression session — user articulated the load-bearing principle that *the install state machine must own every step; defensive fixups running after it mask state-machine bugs*.
+
+## Status updates (2026-05-07)
+
+| Item | Status | Commit |
+|---|---|---|
+| F8 (parent audit said FIXUP) | Reclassified **LEGIT**; 110-line region refactored to 3-line dispatch + 2 helpers | `706950f` (sub-audit at [state-machine-fixup-audit-F8.md](state-machine-fixup-audit-F8.md)) |
+| §5 step 1: `user.init` destructive `> $sshDir/config` overwrite | **Fixed** — append-if-missing per WODA alias | `f515903` (plan at [plan-user-init-fix.md](plan-user-init-fix.md)) |
+| §5 step 2: F1 (`ossh:700–711`) + F2 (`ossh:719–727`) defensive re-adds | **Deleted** — verified safe in clean container (`os platform.test ubuntu_24_04`) after step 1 | this commit |
+| §5 steps 3–4: F3 path-rewrite sed, F4 defensive shared-seed | **Pending** — separate plans |
+| §5 step 5: F8 decompose | Superseded by F8 sub-audit's refactor (step 1–3 done in `706950f`) |
+| §5 step 6: state 31 + osshLayout (F5) ownership choices | **Pending** |
 
 ---
 
