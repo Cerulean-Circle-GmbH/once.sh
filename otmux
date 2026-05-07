@@ -1092,6 +1092,195 @@ otmux.window.size.completion.value() {
   echo "manual"
 }
 
+# ── window.size floor: prevent 0×0 collapse in unattached sessions (B8) ────────
+#
+# When window-size=largest is set (server default since B4.2) and NO clients are
+# attached, tmux has no client geometry to size against — windows collapse to
+# 1×1. This makes background/restored agents unreadable until a client attaches.
+#
+# Lock mechanism: per-window switch to window-size=manual + resize-window to a
+# floor (default 80×40). Persistence in OTMUX_SIZE_LOCKS so we know which windows
+# are user-locked vs server-default. Unlock = revert to largest.
+#
+# Lock semantics (per PO decision, Option A): explicit unlock only. Real-client
+# attach does NOT auto-unlock. Predictable + follows OOSH explicit > implicit.
+
+: ${OTMUX_SIZE_LOCKS:=${CONFIG_PATH:-$HOME/config}/otmux.size.locks.env}
+: ${OTMUX_SIZE_FLOOR_W:=80}
+: ${OTMUX_SIZE_FLOOR_H:=40}
+
+private.otmux.size.lock.set() { # <session:win> <width> <height> # upsert lock entry
+  local key="$1" w="$2" h="$3"
+  [ -z "$key" ] || [ -z "$w" ] || [ -z "$h" ] && return 1
+  mkdir -p "$(dirname "$OTMUX_SIZE_LOCKS")" 2>/dev/null
+  touch "$OTMUX_SIZE_LOCKS"
+  # Atomic upsert: drop existing entry for this key, append new one
+  grep -v "^${key}|" "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
+  mv "${OTMUX_SIZE_LOCKS}.tmp" "$OTMUX_SIZE_LOCKS"
+  echo "${key}|${w}|${h}|$(date +%s)" >> "$OTMUX_SIZE_LOCKS"
+}
+
+private.otmux.size.lock.remove() { # <session:win> # delete lock entry
+  local key="$1"
+  [ -z "$key" ] && return 1
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
+  grep -v "^${key}|" "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
+  mv "${OTMUX_SIZE_LOCKS}.tmp" "$OTMUX_SIZE_LOCKS"
+}
+
+private.otmux.size.lock.has() { # <session:win> # 0 if locked, 1 otherwise
+  local key="$1"
+  [ -z "$key" ] && return 1
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 1
+  grep -q "^${key}|" "$OTMUX_SIZE_LOCKS"
+}
+
+private.otmux.size.lock.list() { # <?session> # list locked window keys (optionally filtered to session)
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
+  local sess="${1:-}"
+  if [ -n "$sess" ]; then
+    grep "^${sess}:" "$OTMUX_SIZE_LOCKS" 2>/dev/null | cut -d'|' -f1
+  else
+    cut -d'|' -f1 "$OTMUX_SIZE_LOCKS" 2>/dev/null
+  fi
+}
+
+private.otmux.size.lock.cleanup() { # # drop entries whose session no longer exists
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
+  local kept="" key w h ts sess
+  while IFS='|' read -r key w h ts; do
+    [ -z "$key" ] && continue
+    sess="${key%%:*}"
+    if $TMUX_CMD has-session -t "$sess" 2>/dev/null; then
+      kept="${kept}${key}|${w}|${h}|${ts}"$'\n'
+    fi
+  done < "$OTMUX_SIZE_LOCKS"
+  printf '%s' "$kept" > "$OTMUX_SIZE_LOCKS"
+}
+
+otmux.window.size.lock() # <?session> <?width:80> <?height:40> # enforce floor + lock window-size=manual
+{
+  # Iterates windows in <?session> (or all sessions if omitted). Skips windows
+  # already wider AND taller than floor — never shrinks. Locks each modified
+  # window via window-size=manual + resize-window. Persists to OTMUX_SIZE_LOCKS.
+  # Idempotent: re-running on already-locked windows is a no-op.
+  local session="${1:-}"
+  local w="${2:-$OTMUX_SIZE_FLOOR_W}"
+  local h="${3:-$OTMUX_SIZE_FLOOR_H}"
+
+  local fmt='#{session_name}:#{window_index}|#{window_width}|#{window_height}'
+  local listArgs=()
+  if [ -n "$session" ]; then
+    $TMUX_CMD has-session -t "$session" 2>/dev/null || {
+      error.log "no such session: $session"
+      return 1
+    }
+    listArgs=(-t "$session")
+  else
+    listArgs=(-a)
+  fi
+
+  local locked=0 skipped=0
+  local line key cw ch
+  while IFS='|' read -r key cw ch; do
+    [ -z "$key" ] && continue
+    if [ "${cw:-0}" -ge "$w" ] && [ "${ch:-0}" -ge "$h" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    $TMUX_CMD set-window-option -t "$key" window-size manual 2>/dev/null
+    $TMUX_CMD resize-window -t "$key" -x "$w" -y "$h" 2>/dev/null
+    private.otmux.size.lock.set "$key" "$w" "$h"
+    locked=$((locked + 1))
+  done < <($TMUX_CMD list-windows "${listArgs[@]}" -F "$fmt" 2>/dev/null)
+
+  success.log "size.lock — $locked locked at ${w}×${h}, $skipped already ≥ floor"
+}
+otmux.window.size.lock.completion.session() { private.complete.sessions; }
+
+otmux.window.size.unlock() # <?session> # restore window-size=largest on locked windows
+{
+  # Reverts session windows (or all locked windows server-wide) to dynamic
+  # sizing. Removes persistence entries. Idempotent.
+  local session="${1:-}"
+  local unlocked=0
+  local key
+  while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    $TMUX_CMD set-window-option -t "$key" window-size largest 2>/dev/null
+    private.otmux.size.lock.remove "$key"
+    unlocked=$((unlocked + 1))
+  done < <(private.otmux.size.lock.list "$session")
+
+  success.log "size.unlock — $unlocked windows reverted to dynamic"
+}
+otmux.window.size.unlock.completion.session() { private.complete.sessions; }
+
+otmux.window.size.status() # # tabular: SESSION:WINDOW SIZE LOCKED CLIENTS — collapsed=red, locked=yellow, healthy=green
+{
+  # First age out stale lock entries (sessions that no longer exist)
+  private.otmux.size.lock.cleanup
+
+  printf "  %-40s %-12s %-8s %s\n" "SESSION:WINDOW" "SIZE" "LOCKED" "CLIENTS"
+  printf "  %-40s %-12s %-8s %s\n" "─────────────────────" "──────" "──────" "───────"
+
+  # Build client-by-session map first (one tmux call instead of per-row)
+  local clientsBySess
+  clientsBySess=$($TMUX_CMD list-clients -F '#{client_session}' 2>/dev/null | sort | uniq -c | sed 's/^[[:space:]]*//')
+
+  local fmt='#{session_name}:#{window_index}|#{window_width}|#{window_height}'
+  local key cw ch sess clients locked color marker
+  while IFS='|' read -r key cw ch; do
+    [ -z "$key" ] && continue
+    sess="${key%%:*}"
+    clients=$(echo "$clientsBySess" | awk -v s="$sess" '$2==s{print $1}')
+    [ -z "$clients" ] && clients=0
+
+    locked="no"
+    private.otmux.size.lock.has "$key" && locked="yes"
+
+    color="${BOLD_GREEN}"
+    marker=""
+    if [ "${cw:-0}" -lt "$OTMUX_SIZE_FLOOR_W" ] || [ "${ch:-0}" -lt "$OTMUX_SIZE_FLOOR_H" ]; then
+      color="${BOLD_RED}"
+      marker=" [collapsed]"
+    elif [ "$locked" = "yes" ]; then
+      color="${BOLD_YELLOW}"
+    fi
+
+    printf "  %s%-40s${NORMAL} %-12s %-8s %s%s\n" \
+      "$color" "$key" "${cw}×${ch}" "$locked" "$clients" "$marker"
+  done < <($TMUX_CMD list-windows -a -F "$fmt" 2>/dev/null)
+}
+otmux.window.size.status.completion() { :; }
+
+otmux.window.size.floor.apply() # <?width:80> <?height:40> # sweep all UNATTACHED collapsed sessions; lock at floor — idempotent self-heal
+{
+  # Cron-friendly self-healing: find every UNATTACHED session whose windows are
+  # below the floor, lock at floor. Sessions with ≥1 client are skipped — their
+  # client is sizing them (even if smaller than floor, that's the user's choice).
+  # For explicit per-session locking regardless of client state, use window.size.lock.
+  local w="${1:-$OTMUX_SIZE_FLOOR_W}"
+  local h="${2:-$OTMUX_SIZE_FLOOR_H}"
+  local locked=0 skipped_attached=0 skipped_ok=0
+
+  local sess attached cw ch
+  while IFS='|' read -r sess attached; do
+    [ -z "$sess" ] && continue
+    if [ "${attached:-0}" -gt 0 ]; then
+      skipped_attached=$((skipped_attached + 1))
+      continue
+    fi
+    # Run lock for this session — it skips already-floored windows internally
+    local before
+    before=$(otmux.window.size.lock "$sess" "$w" "$h" 2>&1 | grep -oE '[0-9]+ locked' | grep -oE '[0-9]+')
+    locked=$((locked + ${before:-0}))
+  done < <($TMUX_CMD list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null)
+
+  success.log "floor.apply — $locked windows locked at ${w}×${h} (skipped attached sessions)"
+}
+otmux.window.size.floor.apply.completion() { :; }
+
 private.otmux.setup.clipboard() # # detect OS/SSH and configure clipboard bindings
 {
   # Remote session: use OSC 52 so copy reaches the LOCAL machine's clipboard.
