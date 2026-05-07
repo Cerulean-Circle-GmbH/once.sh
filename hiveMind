@@ -35,6 +35,9 @@
 : ${HIVEMIND_FORKS:=${CONFIG_PATH:-$HOME/config}/hivemind.forks.env}
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 : ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
+: ${HIVEMIND_QUEUE_DIR:=${CONFIG_PATH:-$HOME/config}/hivemind.queue}
+: ${HIVEMIND_QUEUE_MAX_DEPTH:=50}
+: ${HIVEMIND_QUEUE_MAX_AGE_SEC:=3600}
 
 # B5.1 — TTL window during which manual registry.set takes priority over live
 # discovery. After registry.set, the entry is "fresh"; live discovery will not
@@ -1422,15 +1425,23 @@ hiveMind.send.enter() { # <agentName> <message> # send message to agent (alias f
 # TRANSPORT-INDEPENDENT MESSAGING
 # ─────────────────────────────────────────────────────────────────────────────
 
-private.hiveMind.channel.resolve() # <agentName> # resolve agent name to best available communication channel
+private.hiveMind.channel.resolve() # <agentName|pane> # resolve agent name to best available communication channel
 {
   local name="$1"
   [ -z "$name" ] && return 1
 
-  # Channel 1: tmux pane via registry
-  local pane_target
+  # Direct pane target — bypass registry resolve entirely
+  if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    echo "pane|${name}"
+    return 0
+  fi
+
+  # Channel 1: tmux pane via registry. Bug #4 gotcha: hiveMind.resolve writes
+  # error.log to stdout — `[ -n "$pane_target" ]` alone is fooled. Use rc + format.
+  local pane_target rc
   pane_target=$(hiveMind.resolve "$name" 2>/dev/null)
-  if [ -n "$pane_target" ]; then
+  rc=$?
+  if [ $rc -eq 0 ] && [[ "$pane_target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
     echo "pane|${pane_target}"
     return 0
   fi
@@ -1554,9 +1565,12 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
       return 1
       ;;
     queue|unknown-state)
-      # I1.1 stub — real queue persistence ships in I1.4. For now, log + indicate.
-      info.log "QUEUE: $name ($target) is busy (route=$route); message deferred (queue impl in I1.4)"
-      create.result 0 "queued $name (route=$route, persistence pending I1.4)"
+      # I1.4 — persist to queue file; drain happens via agent.unblock idle hook.
+      private.hiveMind.agent.queue.enqueue "$target" "inform" "$message"
+      local pos
+      pos=$(private.hiveMind.agent.queue.depth "$target")
+      info.log "QUEUE: $name ($target) busy (route=$route) — queued at position $pos"
+      create.result 0 "queued $name $pos (route=$route)"
       return 0
       ;;
     *)
@@ -5394,6 +5408,170 @@ hiveMind.agent.option() # <agent|pane> <N> # send arbitrary option N in current 
 hiveMind.agent.option.completion.agentName() { private.hiveMind.roles.complete; }
 hiveMind.agent.option.completion.N() { echo "1"; echo "2"; echo "3"; }
 
+# ── Epic I I1.4: QUEUE path — defer messages when agent busy, drain on idle ──
+
+private.hiveMind.agent.queue.path() { # <pane> # path to queue file for a pane (sanitize : and . to _)
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+  local safe="${pane//:/_}"
+  safe="${safe//./_}"
+  echo "${HIVEMIND_QUEUE_DIR}/${safe}.queue"
+}
+
+private.hiveMind.agent.queue.enqueue() { # <pane> <intent> <text> # append message; enforce depth bound
+  # Format: <epoch>|<intent>|<text>
+  # Atomic: append (>> is atomic for short writes per POSIX). Depth bound
+  # rotates by dropping oldest after append (warn on drop).
+  local pane="$1" intent="$2"
+  shift 2
+  local text="$*"
+  [ -z "$pane" ] || [ -z "$intent" ] && return 1
+  local f
+  f=$(private.hiveMind.agent.queue.path "$pane")
+  mkdir -p "$(dirname "$f")" 2>/dev/null
+  echo "$(date +%s)|${intent}|${text}" >> "$f"
+
+  # Depth bound — drop oldest if over limit
+  local depth
+  depth=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
+  if [ "${depth:-0}" -gt "$HIVEMIND_QUEUE_MAX_DEPTH" ]; then
+    local over=$((depth - HIVEMIND_QUEUE_MAX_DEPTH))
+    warn.log "queue ${pane}: depth ${depth} > max ${HIVEMIND_QUEUE_MAX_DEPTH}; dropping ${over} oldest"
+    tail -n "$HIVEMIND_QUEUE_MAX_DEPTH" "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+  fi
+}
+
+private.hiveMind.agent.queue.depth() { # <pane> # number of pending messages
+  local pane="$1"
+  local f
+  f=$(private.hiveMind.agent.queue.path "$pane")
+  [ -f "$f" ] || { echo 0; return 0; }
+  wc -l < "$f" 2>/dev/null | tr -d ' '
+}
+
+private.hiveMind.agent.queue.resolve() { # <agent|pane> # resolve to pane (used by public queue verbs)
+  local name="$1"
+  if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    echo "$name"
+    return 0
+  fi
+  local target rc
+  target=$(hiveMind.resolve "$name" 2>/dev/null)
+  rc=$?
+  if [ $rc -ne 0 ] || ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    return 1
+  fi
+  echo "$target"
+}
+
+hiveMind.agent.queue.list() # <agent|pane> # show pending messages with age (Epic I I1.4)
+{
+  local target
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.list: cannot resolve '$1'"; return 1; }
+  local f
+  f=$(private.hiveMind.agent.queue.path "$target")
+  if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+    info.log "queue $target: empty"
+    return 0
+  fi
+  local now
+  now=$(date +%s)
+  local epoch intent text age idx=0
+  printf "  %-4s %-8s %-12s %s\n" "#" "AGE" "INTENT" "MESSAGE"
+  while IFS='|' read -r epoch intent text; do
+    idx=$((idx + 1))
+    age=$((now - epoch))
+    printf "  %-4s %-8s %-12s %s\n" "$idx" "${age}s" "$intent" "$text"
+  done < "$f"
+}
+hiveMind.agent.queue.list.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.queue.clear() # <agent|pane> # cancel all pending queued messages (Epic I I1.4)
+{
+  local target
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.clear: cannot resolve '$1'"; return 1; }
+  local f
+  f=$(private.hiveMind.agent.queue.path "$target")
+  [ -f "$f" ] && rm -f "$f"
+  info.log "queue $target: cleared"
+}
+hiveMind.agent.queue.clear.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.queue.drain() # <agent|pane> # FIFO drain pending messages (re-checks state per message) (Epic I I1.4)
+{
+  # Drain semantics:
+  #   • FIFO order (oldest first)
+  #   • Re-check state per-message — if agent re-enters busy mid-drain, stop
+  #   • Drop messages older than HIVEMIND_QUEUE_MAX_AGE_SEC (warn each)
+  #   • Atomic per-message: read line, dispatch, rewrite file without that line
+  local target
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.drain: cannot resolve '$1'"; return 1; }
+  local f
+  f=$(private.hiveMind.agent.queue.path "$target")
+  [ -f "$f" ] && [ -s "$f" ] || { info.log "queue $target: nothing to drain"; return 0; }
+
+  local now drained=0 dropped_age=0 stopped_at=""
+  now=$(date +%s)
+
+  while [ -s "$f" ]; do
+    # Read first line
+    local first
+    first=$(head -1 "$f")
+    [ -z "$first" ] && { tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"; continue; }
+
+    local epoch intent text
+    IFS='|' read -r epoch intent text <<< "$first"
+
+    # Age check
+    if [ $((now - epoch)) -gt "$HIVEMIND_QUEUE_MAX_AGE_SEC" ]; then
+      warn.log "queue $target: dropping stale message (age=$((now - epoch))s, intent=$intent)"
+      tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+      dropped_age=$((dropped_age + 1))
+      continue
+    fi
+
+    # Re-check state — bail if agent re-entered busy
+    local route
+    route=$(private.hiveMind.agent.route "$target")
+    if [ "$route" != "inform" ]; then
+      stopped_at="state went $route mid-drain"
+      break
+    fi
+
+    # Dispatch per intent
+    case "$intent" in
+      inform)
+        private.hiveMind.agent.inform "$target" "$text" 2>/dev/null
+        ;;
+      remote-control:*)
+        local key="${intent#remote-control:}"
+        otmux send.raw "$target" "$key" 2>/dev/null
+        ;;
+      *)
+        warn.log "queue $target: unknown intent '$intent', dropping"
+        ;;
+    esac
+
+    # Remove first line on success
+    tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+    drained=$((drained + 1))
+    sleep 0.2
+  done
+
+  # Clean empty file
+  [ -f "$f" ] && [ ! -s "$f" ] && rm -f "$f"
+
+  if [ -n "$stopped_at" ]; then
+    info.log "queue $target: drained $drained, dropped $dropped_age stale; stopped — $stopped_at"
+  else
+    info.log "queue $target: drained $drained, dropped $dropped_age stale"
+  fi
+}
+hiveMind.agent.queue.drain.completion.agentName() { private.hiveMind.roles.complete; }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SWEEP & UNBLOCK
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5625,8 +5803,15 @@ private.hiveMind.agent.unblock.pane() {
       warn.log "CRITICAL $label ($status) — needs human intervention"
       return 0
       ;;
+    idle)
+      # Epic I I1.4 — agent at idle ❯ : drain any queued messages FIFO.
+      # Drain re-checks state per-message (will stop if agent re-enters busy
+      # mid-drain). Safe no-op if queue is empty.
+      private.hiveMind.agent.queue.drain "$target" 2>/dev/null
+      return 0
+      ;;
     *)
-      # active|idle|completed|unknown|overlay|panel|autocomplete|<anything-new>
+      # active|completed|unknown|overlay|panel|autocomplete|<anything-new>
       # → SKIP. No keys sent. Old fallback that read $action is REMOVED — that
       # was the regression vector that interrupted web4-po.
       debug.log "Skipping $label ($status) — not in unblock allowlist"
