@@ -259,11 +259,21 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
   ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
-  console.log "Phase A.3: creating bash-user via raw useradd..."
+  console.log "Phase A.3: creating bash-user via raw useradd/adduser..."
   # Note: no `-G sudo` — that group only exists on Debian/Ubuntu (RHEL/Alma use
   # `wheel`, Alpine has neither by default). The NOPASSWD sudoers entry below
   # grants sudo access without group membership, so portability beats group hygiene.
-  ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash bash-user && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'" || {
+  # Try useradd first (Debian/RHEL/Alma), fall back to adduser -D (Alpine/busybox);
+  # without this fallback, Alpine fails with `sudo: useradd: command not found`.
+  ossh exec.tty "$platform" "
+    if command -v useradd >/dev/null 2>&1; then
+      sudo useradd -m -s /bin/bash bash-user
+    elif command -v adduser >/dev/null 2>&1; then
+      sudo adduser -D -s /bin/bash bash-user
+    else
+      echo 'no useradd/adduser available' >&2; exit 127
+    fi && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'
+  " || {
     error.log "Failed to create bash-user on $platform"
   }
 
