@@ -317,13 +317,30 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # home keeps find happy.
     console.log "Running core tests as oosh-user..."
     ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$ooshUserLog"
+    # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
+    # (busybox doesn't ship it). Use a runtime detector that prefers
+    # runuser (less PAM friction) and falls back to `sudo -H -u`. Both
+    # give us "switch to <user>, reset HOME" semantics under the
+    # NOPASSWD sudoers entry installed in Phase A.
+    ossh exec.tty "$platform" "
+      if command -v runuser >/dev/null 2>&1; then
+        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      else
+        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      fi
+    " 2>&1 | tee "$ooshUserLog"
     rcOoshUser=${PIPESTATUS[0]}
 
     # B.4 — bash-user (same pattern; same cwd fix)
     console.log "Running core tests as bash-user..."
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$bashUserLog"
+    ossh exec.tty "$platform" "
+      if command -v runuser >/dev/null 2>&1; then
+        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      else
+        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      fi
+    " 2>&1 | tee "$bashUserLog"
     rcBashUser=${PIPESTATUS[0]}
   else
     console.log "Skipping tests (notests)"
@@ -333,7 +350,14 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   if [ -n "$terminal" ]; then
     console.log "Opening interactive terminal as bash-user on $platform..."
     console.log "Type 'exit' to end the session and clean up."
-    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -l"
+    # Same runuser-vs-sudo portability dance as the test invocations above.
+    ossh exec.tty "$platform" "
+      if command -v runuser >/dev/null 2>&1; then
+        sudo runuser -u bash-user -- bash -l
+      else
+        sudo -H -u bash-user bash -l
+      fi
+    "
   fi
 
   # Cleanup
