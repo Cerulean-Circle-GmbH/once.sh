@@ -800,117 +800,17 @@ ossh.install.finish.local() # # finishes local oosh installation
     warn.log "Failed to push config to $sshConfigHost — continuing"
   }
 
-  # Set up shared SSH config for GitHub access (all via private.ossh.ssh).
-  # The remote-side OSTYPE switch mirrors private.ossh.users.basehome (see
-  # its docstring): on macOS root's $HOME=/var/root → dirname=/var, the
-  # `[ basehome = / ] && basehome=/home` historical fallback doesn't fire,
-  # and the shared dir winds up at /var/shared instead of /Users/shared.
-  #
-  # Skip-when-already-seeded probe: ossh.install.continue.local runs the
-  # seed as root via ossh.config.shared.create at ossh:766-768, succeeding
-  # in the normal flow. This finish.local block runs FROM THE RUNNER and
-  # SSH-connects as the install user (often non-root, e.g. test@localhost
-  # in os.platform.test) — that user can't write/chmod /home/shared/.ssh.
-  # Without this probe, every install emits a wall of `Permission denied`
-  # / `Operation not permitted` lines before finally reporting success via
-  # ossh.config.shared.create's file-exists idempotency guards. Skipping
-  # cleanly when /<basehome>/shared/.ssh/2cuGitHub already exists is the
-  # OOSH-canonical idempotency pattern (detect, don't suppress).
-  local _sharedAlreadySeeded=0
-  if ossh.exec "$sshConfigHost" 'case "$OSTYPE" in darwin*) b=/Users ;; *) b=/home ;; esac; [ -f "$b/shared/.ssh/2cuGitHub" ]' 2>/dev/null; then
-    _sharedAlreadySeeded=1
-    info.log "Shared .ssh already seeded on $sshConfigHost — skipping deploy-key transfer"
-  fi
-  if [ $_sharedAlreadySeeded -eq 1 ]; then
-    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
-  elif [ -f "$HOME/.ssh/deploy_keys/2cuGitHub" ]; then
-    # Transfer deploy key to remote's shared location
-    private.ossh.ssh "$sshConfigHost" "
-      case \"\$OSTYPE\" in darwin*) basehome=/Users ;; *) basehome=/home ;; esac
-      sharedSsh=\"\$basehome/shared/.ssh\"
-      mkdir -p \"\$sharedSsh\" && chmod 750 \"\$sharedSsh\" && cat > \"\$sharedSsh/2cuGitHub\" && chmod 600 \"\$sharedSsh/2cuGitHub\"
-    " < "$HOME/.ssh/deploy_keys/2cuGitHub" || {
-      warn.log "Failed to transfer deploy key — continuing"
-    }
-    # Create shared SSH config and known_hosts (IdentityFile uses ~/.ssh/ so each user reads their own copy)
-    private.ossh.ssh "$sshConfigHost" "bash -c '
-      case \"\$OSTYPE\" in darwin*) basehome=/Users ;; *) basehome=/home ;; esac
-      sharedSsh=\"\$basehome/shared/.ssh\"
-      if ! grep -q \"^Host 2cuGitHub\" \"\$sharedSsh/config\" 2>/dev/null; then
-        printf \"\nHost 2cuGitHub\n User git\n Port 22\n HostName github.com\n IdentityFile ~/.ssh/2cuGitHub\n\n\" >> \"\$sharedSsh/config\"
-        chmod 644 \"\$sharedSsh/config\"
-      fi
-      if ! grep -q github.com \"\$sharedSsh/known_hosts\" 2>/dev/null; then
-        ssh-keyscan github.com >> \"\$sharedSsh/known_hosts\" 2>/dev/null
-        chmod 644 \"\$sharedSsh/known_hosts\"
-      fi
-    '" 2>/dev/null || {
-      warn.log "Could not create shared SSH config — continuing"
-    }
-    # Propagate the shared .ssh artefacts to every user's ~/.ssh (extracted
-    # helper — same logic used by the developking-fallback else branch).
-    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
+  # F8 — runner-side shared-SSH seeding + propagation. Each seeding helper
+  # contains its own skip-when-seeded probe and is safe to call repeatedly;
+  # the propagation helper is idempotent (append-if-missing per user). See
+  # docs/research/state-machine-fixup-audit-F8.md for the design rationale
+  # and the original 110-line region this 3-line dispatch replaces.
+  if [ -f "$HOME/.ssh/deploy_keys/2cuGitHub" ]; then
+    ossh.config.shared.seed.from.local.deploy.key "$sshConfigHost"
   else
-    # Fallback: seed /home/shared/.ssh/ from developking's in-place key,
-    # which state 31 populates from test.wo-da.de templates (see oo:1294).
-    # This closes the "every oosh user has GitHub access through developking
-    # automatically" expectation in the common case where the caller doesn't
-    # carry a local ~/.ssh/deploy_keys/2cuGitHub. user.oosh.install's
-    # existing copy-step (user:766-779) then propagates the seeded
-    # {2cuGitHub, config, known_hosts} into every new user's ~/.ssh/.
-    #
-    # If developking/.ssh/id_rsa is missing (test.wo-da.de unreachable AND
-    # no local templates) we emit a note and skip quietly — install still
-    # succeeds; only GitHub access ends up unconfigured.
-    # Caller has no local deploy_keys/2cuGitHub. Delegate to the oosh config
-    # primitive `ossh.config.shared.create`, sourced from developking's
-    # in-place id_rsa on the remote. State 31 also runs this method as part
-    # of its body, so in the normal caller-initiated flow the shared dir is
-    # ALREADY seeded when we get here — this else-branch then becomes a
-    # no-op thanks to ossh.config.shared.create's idempotency guards (file-
-    # exists check on the key, ossh.config.get on the Host alias, grep -q
-    # on known_hosts). Same single source of truth on both sides.
-    info.log "No local ~/.ssh/deploy_keys/2cuGitHub — delegating to ossh config.shared.create with developking's in-place key"
-    # Stderr is intentionally NOT suppressed any more — when this fails (e.g.
-    # macstudio installs where ~developking/.ssh/id_rsa isn't populated by
-    # state 31 for whatever reason), the warning that follows used to fire
-    # without telling us why. Now the actual error surfaces.
-    #
-    # Use ossh.exec — the OOSH-canonical primitive for remote oosh invocations.
-    # It expands inline to `[ -f config/user.env ] && source config/user.env;
-    # [ -d ~/oosh ] && export PATH=~/oosh:$PATH; <cmd>` on the remote shell, so
-    # PATH gets OOSH_DIR explicitly regardless of bash/zsh, login/non-login,
-    # interactive/non-interactive, and pam.d/login env loading. Earlier attempts
-    # used `private.ossh.ssh "$host" "ossh ..."` (broke on macOS where pam
-    # doesn't load OOSH_DIR into the SSH session env) and then `bash -lc 'ossh
-    # ...'` (broke on Linux because bashrcTemplate's early-return for non-
-    # interactive shells at templates/user/bashrcTemplate:27-30 fires before
-    # the PATH setup at line 195). ossh.exec sidesteps both — see ossh:2265.
-    if ! ossh.exec "$sshConfigHost" 'ossh config.shared.create "" "~developking/.ssh/id_rsa"'; then
-      # Self-heal: use the bundled developking template on the runner side.
-      # SCP $OOSH_DIR/templates/user/developking.ssh/id_rsa to /tmp on the
-      # remote and retry ossh.config.shared.create with that as the deploy
-      # key source. Same template state 31 falls back to (oo:1339-1342) when
-      # the web download from test.wo-da.de fails.
-      local _dkTemplate="$OOSH_DIR/templates/user/developking.ssh/id_rsa"
-      if [ -f "$_dkTemplate" ]; then
-        important.log "Retrying shared .ssh seed using runner-side developking template"
-        local _remoteTmp="/tmp/oosh-developking-id_rsa.$$"
-        if scp -q "$_dkTemplate" "$sshConfigHost:$_remoteTmp" \
-           && ossh.exec "$sshConfigHost" "ossh config.shared.create \"\" \"$_remoteTmp\"; rc=\$?; rm -f $_remoteTmp; exit \$rc"; then
-          success.log "Shared .ssh seeded from runner-side developking template"
-        else
-          warn.log "Could not seed shared .ssh from developking template either — GitHub access won't propagate to other users"
-          private.ossh.ssh "$sshConfigHost" "rm -f $_remoteTmp" 2>/dev/null
-        fi
-      else
-        warn.log "Could not seed shared .ssh from developking — runner-side template missing at $_dkTemplate"
-      fi
-    fi
-
-    # Propagate to every existing user using the shared helper.
-    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
+    ossh.config.shared.seed.fallback "$sshConfigHost"
   fi
+  private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
 
   local remoteKeyName
   # Strip ANSI escape sequences that leak into stdout when the remote's
@@ -1682,6 +1582,120 @@ ossh.config.shared.link.completion.user() {
 }
 ossh.config.shared.link.completion.sharedDir() {
   compgen -d "$1"
+}
+
+ossh.config.shared.seed.from.local.deploy.key() # <sshConfigHost> # seed /<basehome>/shared/.ssh/{2cuGitHub,config,known_hosts} on <sshConfigHost> from the runner's local ~/.ssh/deploy_keys/2cuGitHub. Idempotent: skip-when-seeded probe returns 0 if /<basehome>/shared/.ssh/2cuGitHub already exists. See docs/research/state-machine-fixup-audit-F8.md.
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+
+  # Skip-when-already-seeded probe (canonical OOSH idempotency: detect, don't
+  # suppress). The continue.local phase already seeds shared as root via
+  # ossh.config.shared.create at ossh:766-768; this finish.local path runs
+  # FROM THE RUNNER as the install user (often non-root, e.g. test@localhost
+  # in os.platform.test) which can't write/chmod /<basehome>/shared/.ssh.
+  if ossh.exec "$sshConfigHost" 'case "$OSTYPE" in darwin*) b=/Users ;; *) b=/home ;; esac; [ -f "$b/shared/.ssh/2cuGitHub" ]' 2>/dev/null; then
+    info.log "Shared .ssh already seeded on $sshConfigHost — skipping deploy-key transfer"
+    return 0
+  fi
+
+  if [ ! -f "$HOME/.ssh/deploy_keys/2cuGitHub" ]; then
+    error.log "no local ~/.ssh/deploy_keys/2cuGitHub to seed from — caller should have used ossh.config.shared.seed.fallback"
+    return 1
+  fi
+
+  # Transfer deploy key bytes to remote /<basehome>/shared/.ssh/2cuGitHub.
+  # OSTYPE switch mirrors private.ossh.users.basehome — on macOS root's
+  # $HOME=/var/root so the historical [ basehome = / ] && basehome=/home
+  # fallback resolves shared to /var/shared instead of /Users/shared.
+  private.ossh.ssh "$sshConfigHost" "
+    case \"\$OSTYPE\" in darwin*) basehome=/Users ;; *) basehome=/home ;; esac
+    sharedSsh=\"\$basehome/shared/.ssh\"
+    mkdir -p \"\$sharedSsh\" && chmod 750 \"\$sharedSsh\" && cat > \"\$sharedSsh/2cuGitHub\" && chmod 600 \"\$sharedSsh/2cuGitHub\"
+  " < "$HOME/.ssh/deploy_keys/2cuGitHub" || {
+    warn.log "Failed to transfer deploy key — continuing"
+  }
+
+  # Create shared config + known_hosts (append-if-missing — IdentityFile uses
+  # ~/.ssh/ so each user reads their own copy after copy.to.all propagates).
+  private.ossh.ssh "$sshConfigHost" "bash -c '
+    case \"\$OSTYPE\" in darwin*) basehome=/Users ;; *) basehome=/home ;; esac
+    sharedSsh=\"\$basehome/shared/.ssh\"
+    if ! grep -q \"^Host 2cuGitHub\" \"\$sharedSsh/config\" 2>/dev/null; then
+      printf \"\nHost 2cuGitHub\n User git\n Port 22\n HostName github.com\n IdentityFile ~/.ssh/2cuGitHub\n\n\" >> \"\$sharedSsh/config\"
+      chmod 644 \"\$sharedSsh/config\"
+    fi
+    if ! grep -q github.com \"\$sharedSsh/known_hosts\" 2>/dev/null; then
+      ssh-keyscan github.com >> \"\$sharedSsh/known_hosts\" 2>/dev/null
+      chmod 644 \"\$sharedSsh/known_hosts\"
+    fi
+  '" 2>/dev/null || {
+    warn.log "Could not create shared SSH config — continuing"
+  }
+
+  return 0
+}
+ossh.config.shared.seed.from.local.deploy.key.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.config.shared.seed.fallback() # <sshConfigHost> # seed /<basehome>/shared/.ssh on <sshConfigHost> when the runner has NO local ~/.ssh/deploy_keys/2cuGitHub: delegates to remote `ossh config.shared.create` using developking's in-place id_rsa, with self-heal via the runner-bundled template at $OOSH_DIR/templates/user/developking.ssh/id_rsa. Idempotent skip-when-seeded probe at the start.
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+
+  # Skip-when-already-seeded probe.
+  if ossh.exec "$sshConfigHost" 'case "$OSTYPE" in darwin*) b=/Users ;; *) b=/home ;; esac; [ -f "$b/shared/.ssh/2cuGitHub" ]' 2>/dev/null; then
+    info.log "Shared .ssh already seeded on $sshConfigHost — skipping fallback seed"
+    return 0
+  fi
+
+  # Stderr is intentionally NOT suppressed here — when this fails (e.g. macstudio
+  # installs where ~developking/.ssh/id_rsa isn't populated by state 31), the
+  # warning that follows used to fire without telling us why. Now the actual
+  # error surfaces. Use ossh.exec — the OOSH-canonical primitive for remote oosh
+  # invocations. It expands inline to `[ -f config/user.env ] && source config/user.env;
+  # [ -d ~/oosh ] && export PATH=~/oosh:$PATH; <cmd>` on the remote shell, so PATH
+  # gets OOSH_DIR explicitly regardless of bash/zsh, login/non-login, or pam.d/login
+  # env loading. Earlier attempts via raw `private.ossh.ssh "$h" "ossh ..."` broke
+  # on macOS (pam doesn't load OOSH_DIR into the SSH session env), and `bash -lc
+  # 'ossh ...'` broke on Linux (bashrcTemplate's early-return for non-interactive
+  # shells fires before its PATH setup). ossh.exec sidesteps both — see ossh:2265.
+  info.log "No local ~/.ssh/deploy_keys/2cuGitHub — delegating to ossh config.shared.create with developking's in-place key"
+  if ossh.exec "$sshConfigHost" 'ossh config.shared.create "" "~developking/.ssh/id_rsa"'; then
+    return 0
+  fi
+
+  # Self-heal: SCP the bundled developking template from the runner to the
+  # remote and retry ossh.config.shared.create with that as the deploy-key
+  # source. Same template state 31 falls back to (oo:1339-1342) when the web
+  # download from test.wo-da.de fails.
+  local _dkTemplate="$OOSH_DIR/templates/user/developking.ssh/id_rsa"
+  if [ ! -f "$_dkTemplate" ]; then
+    warn.log "Could not seed shared .ssh from developking — runner-side template missing at $_dkTemplate"
+    return 1
+  fi
+
+  important.log "Retrying shared .ssh seed using runner-side developking template"
+  local _remoteTmp="/tmp/oosh-developking-id_rsa.$$"
+  if scp -q "$_dkTemplate" "$sshConfigHost:$_remoteTmp" \
+     && ossh.exec "$sshConfigHost" "ossh config.shared.create \"\" \"$_remoteTmp\"; rc=\$?; rm -f $_remoteTmp; exit \$rc"; then
+    success.log "Shared .ssh seeded from runner-side developking template"
+    return 0
+  fi
+
+  warn.log "Could not seed shared .ssh from developking template either — GitHub access won't propagate to other users"
+  private.ossh.ssh "$sshConfigHost" "rm -f $_remoteTmp" 2>/dev/null
+  return 1
+}
+ossh.config.shared.seed.fallback.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
 }
 
 private.ossh.shared.ssh.copy.to.all() # <sshConfigHost> # on <sshConfigHost>, copy /home/shared/.ssh/{config,known_hosts,2cuGitHub} to every existing user's ~/.ssh/ with owner=user (login group), perms 700/600/644. Single source of truth for the per-user propagation step shared by ossh.install.finish.local's caller-side path and its developking-fallback else branch.
