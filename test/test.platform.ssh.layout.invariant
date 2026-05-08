@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+TEST_CATEGORY=platform
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# platform.ssh.layout.invariant — asserts every user's ~/.ssh matches the
+# canonical OOSH layout that root gets at install time. Run inside any
+# platform.test container (test/oosh-user/bash-user shell):
+#
+#   cd ~/oosh && ./test.suite run platform.ssh.layout.invariant 1
+#
+# Canonical layout (per `sudo tree -L 3 /root/.ssh` on a fresh install):
+#
+#   ~/.ssh/
+#   ├── id_ed25519, id_ed25519.pub      (the user's keypair)
+#   ├── 2cuGitHub                       (deploy key for git pulls)
+#   ├── config, known_hosts             (ssh client config)
+#   ├── ids/                            (oosh "identity bag")
+#   │   ├── ssh.developking/            (deploy-key role + nested keypair)
+#   │   │   ├── id_rsa, id_rsa.pub
+#   │   │   ├── known_hosts
+#   │   │   └── private_key/, public_keys/
+#   │   ├── ssh.<installer-id>/         (oosh installer role)
+#   │   └── ssh.outeruser/              (outer user role for proxy-jump)
+#   ├── private_key/<id>.private_key -> ../id_ed25519
+#   └── public_keys/<id>.public_key -> ../id_ed25519.pub
+#
+# Without this test, the gap that surfaced post-bisect (commit d9adb27
+# dropped osshLayout build for non-root users) could regress silently.
+# This test pins the invariant.
+
+sshDir="$HOME/.ssh"
+
+# (1) ~/.ssh exists, mode 700, owned by current user
+test.case $level "ssh.layout: ~/.ssh exists" test -d "$sshDir"
+if [ ! -d "$sshDir" ]; then
+  expect.fail "$sshDir missing"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "$sshDir present"
+fi
+
+owner=$(stat -c '%U' "$sshDir" 2>/dev/null) || owner=$(stat -f '%Su' "$sshDir" 2>/dev/null)
+mode=$(stat -c '%a' "$sshDir" 2>/dev/null) || mode=$(stat -f '%Lp' "$sshDir" 2>/dev/null)
+
+test.case $level "ssh.layout: owner=$USER" true
+if [ "$owner" = "$USER" ]; then
+  expect.pass "owner=$owner"
+else
+  expect.fail "owner=$owner expected $USER on $sshDir"
+fi
+
+test.case $level "ssh.layout: mode 700" true
+if [ "$mode" = "700" ]; then
+  expect.pass "mode=$mode"
+else
+  expect.fail "mode=$mode expected 700 on $sshDir (sshd StrictModes requires 700)"
+fi
+
+# (2) ids/ directory exists
+test.case $level "ssh.layout: ~/.ssh/ids/ exists" test -d "$sshDir/ids"
+if [ -d "$sshDir/ids" ]; then
+  expect.pass "$sshDir/ids/ present"
+else
+  expect.fail "$sshDir/ids/ missing — osshLayout build did not run for $USER"
+fi
+
+# (3) ids/ssh.developking/id_rsa exists (the deploy key)
+test.case $level "ssh.layout: ids/ssh.developking/id_rsa exists" \
+  test -f "$sshDir/ids/ssh.developking/id_rsa"
+if [ -f "$sshDir/ids/ssh.developking/id_rsa" ]; then
+  expect.pass "deploy key present"
+else
+  expect.fail "$sshDir/ids/ssh.developking/id_rsa missing"
+fi
+
+# (4) ids/ssh.developking/id_rsa.pub exists
+test.case $level "ssh.layout: ids/ssh.developking/id_rsa.pub exists" \
+  test -f "$sshDir/ids/ssh.developking/id_rsa.pub"
+if [ -f "$sshDir/ids/ssh.developking/id_rsa.pub" ]; then
+  expect.pass "deploy pubkey present"
+else
+  expect.fail "$sshDir/ids/ssh.developking/id_rsa.pub missing"
+fi
+
+# (5) ids/ has at least one installer-identity subdir (besides ssh.developking)
+installerCount=0
+if [ -d "$sshDir/ids" ]; then
+  for d in "$sshDir/ids"/ssh.*; do
+    [ -d "$d" ] || continue
+    [ "$(basename "$d")" = "ssh.developking" ] && continue
+    installerCount=$((installerCount + 1))
+  done
+fi
+test.case $level "ssh.layout: ids/ has installer identity besides ssh.developking" true
+if [ "$installerCount" -ge 1 ]; then
+  expect.pass "$installerCount additional identity dir(s) under ids/"
+else
+  expect.fail "ids/ has no installer identity (expected ssh.<installer> directory)"
+fi
+
+# (6) private_key/ contains at least one symlink → ../id_ed25519
+privateLinks=0
+if [ -d "$sshDir/private_key" ]; then
+  for f in "$sshDir/private_key"/*; do
+    [ -L "$f" ] || continue
+    target=$(readlink "$f")
+    case "$target" in
+      *id_ed25519|*id_rsa) privateLinks=$((privateLinks + 1)) ;;
+    esac
+  done
+fi
+test.case $level "ssh.layout: private_key/ has symlink to ../id_ed25519" true
+if [ "$privateLinks" -ge 1 ]; then
+  expect.pass "$privateLinks symlink(s) to private key"
+else
+  expect.fail "private_key/ has no symlink to ../id_ed25519 (root does — non-root should match)"
+fi
+
+# (7) public_keys/ contains at least one symlink → ../id_ed25519.pub
+publicLinks=0
+if [ -d "$sshDir/public_keys" ]; then
+  for f in "$sshDir/public_keys"/*; do
+    [ -L "$f" ] || continue
+    target=$(readlink "$f")
+    case "$target" in
+      *id_ed25519.pub|*id_rsa.pub) publicLinks=$((publicLinks + 1)) ;;
+    esac
+  done
+fi
+test.case $level "ssh.layout: public_keys/ has symlink to ../id_ed25519.pub" true
+if [ "$publicLinks" -ge 1 ]; then
+  expect.pass "$publicLinks symlink(s) to public key"
+else
+  expect.fail "public_keys/ has no symlink to ../id_ed25519.pub"
+fi
+
+# (8) 2cuGitHub deploy-key alias present
+test.case $level "ssh.layout: ~/.ssh/2cuGitHub deploy-key alias present" \
+  test -f "$sshDir/2cuGitHub"
+if [ -f "$sshDir/2cuGitHub" ]; then
+  expect.pass "$sshDir/2cuGitHub present"
+else
+  expect.fail "$sshDir/2cuGitHub missing — git pulls via 2cuGitHub Host alias will fail"
+fi
+
+test.suite.save.results
