@@ -267,17 +267,21 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # without this fallback, Alpine fails with `sudo: useradd: command not found`.
   #
   # Each step is independently idempotent — earlier versions chained
-  # everything with `&&`, which broke on Debian where the base image
-  # pre-creates bash-user (useradd returns 9 "user exists", `&&` short-
-  # circuits, chpasswd + sudoers grant never run, bash-user lacks
-  # NOPASSWD sudo, downstream test.suite invocations on bash-user hit a
-  # blocking password prompt).
+  # everything with `&&`, which short-circuits if any step returns
+  # non-zero. Important quirk: `command -v useradd` runs in the SSH
+  # session's PATH, which on non-interactive ssh excludes /usr/sbin
+  # — so the existence check ALWAYS failed on Debian, even though
+  # /usr/sbin/useradd is there. We probe via `sudo command -v`
+  # instead so sudo's `secure_path` (which DOES include /usr/sbin)
+  # resolves the binary. No `||` between the user-create branches and
+  # the chpasswd/sudoers grant — those run unconditionally afterwards
+  # so a user-already-exists path doesn't skip them.
   ossh exec.tty "$platform" "
     if id bash-user >/dev/null 2>&1; then
       echo 'bash-user already exists — skipping useradd'
-    elif command -v useradd >/dev/null 2>&1; then
+    elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then
       sudo useradd -m -s /bin/bash bash-user
-    elif command -v adduser >/dev/null 2>&1; then
+    elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then
       sudo adduser -D -s /bin/bash bash-user
     else
       echo 'no useradd/adduser available' >&2; exit 127
