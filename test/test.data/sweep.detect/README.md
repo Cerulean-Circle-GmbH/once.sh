@@ -23,6 +23,7 @@ pane.sweep / team.sweep or direct function call).
 | `subscription-limit-billing-variant.txt` | `subscription-limit\|none\|critical` | Billing cap variant |
 | `subscription-limit-false-positive-source.txt` | **NOT subscription-limit** | Source display with grep pattern |
 | `accept-edits.txt` | `accept-edits\|enter\|blocker\|2` | `⏵⏵ accept` with 2 queued bashes |
+| `fp-accept-edits-scrollback.txt` | **NOT accept-edits** (idle) | `⏵⏵ accept` text in scrollback; live status bar is `❯`. F2.2 — must match tail-only. |
 | `context-warning.txt` | `context-warning\|none\|warning\|18%` | Auto-compact at 18% |
 | `just-compacted.txt` | `just-compacted\|none\|warning` | "Compacted" marker |
 | `queued.txt` | `queued\|enter\|blocker` | Text after ❯ prompt, not submitted |
