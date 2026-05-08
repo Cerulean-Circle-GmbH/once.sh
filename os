@@ -265,14 +265,26 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # grants sudo access without group membership, so portability beats group hygiene.
   # Try useradd first (Debian/RHEL/Alma), fall back to adduser -D (Alpine/busybox);
   # without this fallback, Alpine fails with `sudo: useradd: command not found`.
+  #
+  # Each step is independently idempotent — earlier versions chained
+  # everything with `&&`, which broke on Debian where the base image
+  # pre-creates bash-user (useradd returns 9 "user exists", `&&` short-
+  # circuits, chpasswd + sudoers grant never run, bash-user lacks
+  # NOPASSWD sudo, downstream test.suite invocations on bash-user hit a
+  # blocking password prompt).
   ossh exec.tty "$platform" "
-    if command -v useradd >/dev/null 2>&1; then
+    if id bash-user >/dev/null 2>&1; then
+      echo 'bash-user already exists — skipping useradd'
+    elif command -v useradd >/dev/null 2>&1; then
       sudo useradd -m -s /bin/bash bash-user
     elif command -v adduser >/dev/null 2>&1; then
       sudo adduser -D -s /bin/bash bash-user
     else
       echo 'no useradd/adduser available' >&2; exit 127
-    fi && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'
+    fi
+    echo bash-user:bash-user | sudo chpasswd
+    sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers \
+      || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'
   " || {
     error.log "Failed to create bash-user on $platform"
   }
