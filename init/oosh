@@ -313,149 +313,27 @@ OOSH_BRANCH="${OOSH_BRANCH#heads/origin/}"
 OOSH_BRANCH="${OOSH_BRANCH#origin/}"
 export OOSH_BRANCH
 
-# ─── Prereqs ─────────────────────────────────────────────────────────────
-# Phase A's POSIX prelude already installed git and bash 4+ when a PM was
-# available. Try to auto-install any that are *still* missing (e.g. sudo,
-# curl, or bash on a host that landed here without a PM). Re-detect after
-# each attempt — only fall through to the framed error if installs fail.
+# ─── Prereqs (essentials only) ────────────────────────────────────────────
+# Phase A's POSIX prelude already installed git + bash 4+ via the platform
+# PM (or bootstrapped Homebrew on naked macOS). All OTHER runtime prereqs
+# (rsync, tree, etc.) install POST-clone via `ossh prereqs.install` (local
+# mode) or lazily via `oo cmd <pkg>` at use-sites — that's the OOSH-canonical
+# install primitive. init/oosh's only job is to get us TO the clone.
 #
-# Helper mirrors prelude's oosh_cmd_install but with bash arrays / locals
-# allowed and idempotent across the bash re-exec boundary.
-_oosh_install_one() {  # <cmd> [<pkg>] — install via $OOSH_PM if present, no-op if cmd already on PATH
-  _oosh_one_cmd="$1"; _oosh_one_pkg="${2:-$1}"
-  command -v "$_oosh_one_cmd" >/dev/null 2>&1 && return 0
-  if [ -z "${OOSH_PM:-}" ]; then
-    return 1
-  fi
-  echo "oosh install: installing $_oosh_one_pkg via '$OOSH_PM'…" >&2
-  # Same brew-aware logic as the prelude's oosh_cmd_install (line 119+).
-  # Phase B runs after sudo re-exec → we're root → `brew install` would
-  # fail with "Running Homebrew as root". Drop back to $SUDO_USER via
-  # login shell so brew runs unprivileged + finds itself via paths.d.
-  if [ "$OOSH_PM_BIN" = "brew" ]; then
-    if [ "$(id -u)" = "0" ] && [ -n "$SUDO_USER" ]; then
-      sudo -u "$SUDO_USER" -H bash -lc "$OOSH_PM '$_oosh_one_pkg'" || return 1
-    else
-      $OOSH_PM "$_oosh_one_pkg" || return 1
-    fi
-  else
-    $SUDO $OOSH_PM "$_oosh_one_pkg" || return 1
-  fi
-}
-
-# Auto-install pass: git, sudo (only when needed), curl (only when needed
-# for pre-sudo clone). bash 4+ install was attempted in the prelude; if
-# we're still on bash <4 here, the prelude couldn't install it (no PM, or
-# install failed) — only the framed error remains.
-_oosh_install_one git || true
-# rsync is needed by ossh.config.shared.create's runner→remote config push
-# (private.ossh.rsync at ossh:74). Preinstalled on Debian/RHEL/Alma; missing
-# on Alpine 3.x (busybox doesn't include rsync; needs `apk add rsync`).
-# _oosh_install_one short-circuits when the binary is on PATH, so this is
-# a no-op everywhere except Alpine and other minimal images.
-_oosh_install_one rsync || true
-# tree is used in many runtime paths (user.ssh.status at user:226, debug
-# helpers at debug:65+, ossh.status, state-31 progress dumps, etc.) plus
-# defensive `oo.cmd tree` JIT-installs at oo:1342 + ossh:1752. Preinstalled
-# on most Debian/Ubuntu/RHEL images but NOT on macOS (no Homebrew tree by
-# default) and NOT on Alpine busybox. Installing here at bootstrap means
-# every subsequent call site can rely on it without per-site `oo.cmd tree`
-# guards. _oosh_install_one is idempotent (no-op when binary on PATH).
-_oosh_install_one tree || true
-if [ "$(id -u)" -ne 0 ] && [ -z "$MODE" ]; then
-  _oosh_install_one sudo || true
-  [ ! -f "$0" ] && _oosh_install_one curl || true
-fi
-
-# Now collect anything still missing for the final framed-error fallback.
-# POSIX accumulator pattern: newline-delimited string instead of bash array.
-_oosh_missing=""
-_oosh_hints=""
-
-# Helper: append a single line to a named accumulator. Usage:
-#   _oosh_append _oosh_missing "git"
-# Sets the named var via printf -v equivalent (eval — POSIX-clean since
-# the caller controls the name). Each line is one entry.
-_oosh_append() {
-  _oosh_app_name="$1"
-  _oosh_app_line="$2"
-  eval "_oosh_app_cur=\"\${$_oosh_app_name}\""
-  if [ -z "$_oosh_app_cur" ]; then
-    eval "$_oosh_app_name=\"\$_oosh_app_line\""
-  else
-    eval "$_oosh_app_name=\"\${$_oosh_app_name}\${NL}\$_oosh_app_line\""
-  fi
-}
-
-if ! oosh_bash_ok; then
-  _bv_str="$(bash --version 2>/dev/null | head -1)"
-  [ -z "$_bv_str" ] && _bv_str="unknown"
-  _oosh_append _oosh_missing "bash 4+ (found: $_bv_str)"
-  _oosh_append _oosh_hints "  macOS:          brew install bash"
-  _oosh_append _oosh_hints "  Debian/Ubuntu:  apt-get install -y bash   (usually already >= 4)"
-  _oosh_append _oosh_hints "  RHEL/Fedora:    dnf install -y bash"
-  _oosh_append _oosh_hints "  Alpine:         apk add bash"
-  unset _bv_str
-fi
-
+# Three things still need to be present to make it past the clone+handoff:
+#   git    — to clone the repo
+#   bash 4+ — every framework script (#!/usr/bin/env bash) requires it
+#   sudo   — only when invoked non-root (we re-exec via sudo below)
+# If any of these is missing AFTER Phase A, fail fast with a hint pointing
+# at the canonical fix.
 if ! command -v git >/dev/null 2>&1; then
-  _oosh_append _oosh_missing "git"
-  _oosh_append _oosh_hints "  macOS:          xcode-select --install   (or: brew install git)"
-  _oosh_append _oosh_hints "  Debian/Ubuntu:  apt-get update && apt-get install -y git"
-  _oosh_append _oosh_hints "  RHEL/Fedora:    dnf install -y git"
-  _oosh_append _oosh_hints "  Alpine:         apk add git"
+  die "git missing after PM install attempt — install manually then re-run (apt/dnf/apk/brew install git)"
 fi
-
-if [ "$(id -u)" -ne 0 ] && [ -z "$MODE" ]; then
-  if ! command -v sudo >/dev/null 2>&1; then
-    _oosh_append _oosh_missing "sudo  (needed for non-root install — chicken-and-egg, can't auto-install without root)"
-    _oosh_append _oosh_hints "  Debian/Ubuntu:  apt-get install -y sudo      (or run this installer as root)"
-    _oosh_append _oosh_hints "  RHEL/Fedora:    dnf install -y sudo"
-    _oosh_append _oosh_hints "  Alpine:         apk add sudo"
-  fi
-  if [ ! -f "$0" ] && ! command -v curl >/dev/null 2>&1; then
-    _oosh_append _oosh_missing "curl  (needed to pre-clone the repo before sudo)"
-    _oosh_append _oosh_hints "  Debian/Ubuntu:  apt-get install -y curl"
-    _oosh_append _oosh_hints "  RHEL/Fedora:    dnf install -y curl"
-    _oosh_append _oosh_hints "  Alpine:         apk add curl"
-  fi
+if ! oosh_bash_ok; then
+  die "bash 4+ missing after PM install attempt — install manually then re-run (brew install bash on macOS; apt/dnf/apk install bash on Linux)"
 fi
-
-if [ -n "$_oosh_missing" ]; then
-  {
-    echo ""
-    echo "═══════════════════════════════════════════════════════════════════"
-    echo "  oosh install: missing prerequisite(s)"
-    echo "═══════════════════════════════════════════════════════════════════"
-    echo ""
-    echo "  Missing:"
-    printf '%s\n' "$_oosh_missing" | while IFS= read -r _m; do
-      [ -n "$_m" ] && echo "    • $_m"
-    done
-    echo ""
-    # MODE=root means we're inside `ossh install <host>`'s SCP-and-run
-    # flow. REMOTE_SSH_HOST was parsed from the `mode root <host> …`
-    # args. Lead with the one-command oosh fix; per-platform hints
-    # become the manual fallback.
-    if [ "$MODE" = "root" ] && [ -n "$REMOTE_SSH_HOST" ]; then
-      echo "  Quick fix — from your laptop:"
-      echo "    ossh prereqs.install $REMOTE_SSH_HOST"
-      echo "    ossh install $REMOTE_SSH_HOST"
-      echo ""
-      echo "  Or install manually on $REMOTE_SSH_HOST:"
-    else
-      echo "  Install manually, then re-run:"
-      echo "    sh -c \"\$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/${OOSH_BRANCH:-dev}/init/oosh)\""
-      echo ""
-      echo "  Install hints:"
-    fi
-    printf '%s\n' "$_oosh_hints" | while IFS= read -r _h; do
-      [ -n "$_h" ] && echo "$_h"
-    done
-    echo "═══════════════════════════════════════════════════════════════════"
-    echo ""
-  } >&2
-  exit 1
+if [ "$(id -u)" -ne 0 ] && [ -z "$MODE" ] && ! command -v sudo >/dev/null 2>&1; then
+  die "sudo missing for non-root install — install manually as root then re-run, or run this installer as root directly"
 fi
 
 # ─── Non-root → sudo re-exec ─────────────────────────────────────────────
@@ -553,6 +431,18 @@ mkdir -p "$(dirname "$INSTALL_LOG")"
   echo "# init/oosh (thin bootstrap) handing off to ossh install.continue.local"
 } > "$INSTALL_LOG"
 [ -n "$LOG_LEVEL_ARG" ] && export LOG_LEVEL="$LOG_LEVEL_ARG"
+
+# ─── Install post-clone prereqs via canonical oosh primitive ────────────
+# rsync (used by ossh.config.shared.create at ossh:74) and tree (used by
+# user.ssh.status, debug helpers, ossh.status) install here via `ossh
+# prereqs.install` LOCAL MODE — runs `oo cmd <pkg>` for each one. This is
+# the OOSH-canonical install path: now that we have the framework on disk
+# (post-clone) and bash 4+ on PATH, every other dep should install via
+# `oo cmd`, NOT via init/oosh's POSIX-sh duplicate. Keeping init/oosh
+# minimal per boss feedback (2026-05-08) — see memory
+# project_init_oosh_minimal_refactor.
+"$OOSH_DIR/this" call ossh prereqs.install || \
+  echo "WARNING: ossh prereqs.install (local mode) reported errors — install may still proceed" >&2
 
 # ─── Hand off to the state-machine entrypoint ───────────────────────────
 local_name="${REMOTE_SSH_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo localhost)}"
