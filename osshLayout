@@ -115,7 +115,36 @@ private.osshLayout.staged.has.privkey() # <role:installer|outer> # returns 0 if 
   [ -f "${stageDir}/oosh.${role}.id_ed25519" ]
 }
 
-osshLayout.role.owner() # <?sshDir:~/.ssh> # ensures owner keypair exists and creates ssh.<owner-id>.{private_key,public_key} symlinks
+private.osshLayout.perms.tighten() # <sshDir> # apply canonical SSH perms (700 dirs, 600 privkeys, 644 pubkeys) across <sshDir>; safe to call repeatedly. Required because OpenSSH StrictModes rejects keys whose containing directory chain isn't 0700, and the role.* helpers cp keys into nested ids/ssh.*/private_key/ subdirs that default to 0755.
+{
+  local sshDir="$1"
+  [ -d "$sshDir" ] || return 0
+  chmod 700 "$sshDir" 2>/dev/null
+  [ -d "$sshDir/ids" ] && chmod 700 "$sshDir/ids" 2>/dev/null
+  local d f fmode
+  for d in "$sshDir/ids"/ssh.* "$sshDir/private_key" "$sshDir/public_keys"; do
+    [ -d "$d" ] || continue
+    chmod 700 "$d" 2>/dev/null
+    [ -d "$d/private_key" ] && chmod 700 "$d/private_key" 2>/dev/null
+    [ -d "$d/public_keys" ] && chmod 700 "$d/public_keys" 2>/dev/null
+  done
+  # Private keys → 600 (real files only; skip symlinks since chmod follows
+  # the link and would change perms of the canonical id_ed25519 — we already
+  # set those at the call site with chmod 600 on the source file).
+  for f in "$sshDir"/id_ed25519 "$sshDir"/id_rsa \
+           "$sshDir/ids"/ssh.*/id_ed25519 "$sshDir/ids"/ssh.*/id_rsa \
+           "$sshDir"/private_key/* "$sshDir/ids"/ssh.*/private_key/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] && chmod 600 "$f" 2>/dev/null
+  done
+  # Public keys → 644 (real files only; same symlink reasoning)
+  for f in "$sshDir"/*.pub "$sshDir/ids"/ssh.*/*.pub \
+           "$sshDir"/public_keys/* "$sshDir/ids"/ssh.*/public_keys/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] && chmod 644 "$f" 2>/dev/null
+  done
+  return 0
+}
+
+osshLayout.role.owner() # <?sshDir:~/.ssh> # ensures owner keypair exists and creates ssh.<owner-id>.{private_key,public_key} files (real copies, mode 600/644)
 {
   local sshDir="${1:-$HOME/.ssh}"
 
@@ -132,8 +161,12 @@ osshLayout.role.owner() # <?sshDir:~/.ssh> # ensures owner keypair exists and cr
   private.osshLayout.ensure.keypair "$sshDir"
 
   mkdir -p "$sshDir/private_key" "$sshDir/public_keys"
-  ln -sfn "../id_ed25519" "$sshDir/private_key/ssh.${ownerId}.private_key"
-  ln -sfn "../id_ed25519.pub" "$sshDir/public_keys/ssh.${ownerId}.public_key"
+  # Real copies (not symlinks) — boss preference + eliminates fragile relative
+  # paths. Each file is self-contained: deleting the canonical id_ed25519
+  # doesn't break the aliases. Install rebuilds the layout from scratch so
+  # "edit once, propagate" doesn't matter here.
+  cp "$sshDir/id_ed25519"     "$sshDir/private_key/ssh.${ownerId}.private_key"
+  cp "$sshDir/id_ed25519.pub" "$sshDir/public_keys/ssh.${ownerId}.public_key"
 
   # Prune legacy entries left by user.init (which copies id_ed25519 into
   # private_key/<USER>.<hostname>.private_key with no ssh. prefix). The spec
@@ -243,8 +276,9 @@ osshLayout.role.installer() # <?installerEmail> <?keypairSourceDir> <?sshDir:~/.
   cp "$pubSrc" "$dst/$pubFile"
   chmod 600 "$dst/$privFile"
 
-  ln -sfn "../$privFile" "$dst/private_key/ssh.$id.private_key"
-  ln -sfn "../$pubFile" "$dst/public_keys/ssh.$id.public_key"
+  # Real copies (not symlinks) — see role.owner for rationale.
+  cp "$dst/$privFile" "$dst/private_key/ssh.$id.private_key"
+  cp "$dst/$pubFile"  "$dst/public_keys/ssh.$id.public_key"
 
   console.log "installer: ssh.$id deployed at $dst (from $privSrc)"
   create.result 0 "ssh.$id"
@@ -288,13 +322,14 @@ osshLayout.role.outeruser() # <?sourceDir> <?sshDir:~/.ssh> # builds <sshDir>/id
     stageDir="$(private.osshLayout.staged.dir)"
     mkdir -p "$dst/public_keys"
     cp "${stageDir}/oosh.outer.id_ed25519.pub" "$dst/id_ed25519.pub"
-    ln -sfn "../id_ed25519.pub" "$dst/public_keys/ssh.${outerId}.public_key"
+    # Real copies (not symlinks) — see role.owner for rationale.
+    cp "$dst/id_ed25519.pub" "$dst/public_keys/ssh.${outerId}.public_key"
 
     if private.osshLayout.staged.has.privkey outer; then
       mkdir -p "$dst/private_key"
       cp "${stageDir}/oosh.outer.id_ed25519" "$dst/id_ed25519"
       chmod 600 "$dst/id_ed25519"
-      ln -sfn "../id_ed25519" "$dst/private_key/ssh.${outerId}.private_key"
+      cp "$dst/id_ed25519" "$dst/private_key/ssh.${outerId}.private_key"
       console.log "outeruser: ssh.outeruser populated from staged ${stageDir}/oosh.outer.* (outer-id=ssh.${outerId}, full keypair)"
     else
       console.log "outeruser: ssh.outeruser populated from staged ${stageDir}/oosh.outer.* (outer-id=ssh.${outerId}, pubkey-only — ProxyJump shape)"
@@ -364,6 +399,12 @@ osshLayout.build() # <?installerEmail> <?installerKeypairSrc> <?sshDir:~/.ssh> #
     error.log "osshLayout.build: role.outeruser failed"
     return 5
   fi
+
+  # Canonical perms pass — sshd StrictModes rejects keys whose containing
+  # directory chain isn't 0700. Each role.* uses cp into nested ids/ssh.*/
+  # private_key/ subdirs that default to 0755; this single pass tightens
+  # everything before we hand the layout off.
+  private.osshLayout.perms.tighten "$sshDir"
 
   important.log "✓ osshLayout build complete: $(whoami) at $sshDir (installer $installerResult)"
   create.result 0 "$sshDir"
