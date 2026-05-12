@@ -293,6 +293,118 @@ private.hiveMind.pane.identify() {
   otmux send.enter "$target" "export HIVEMIND_ROLE=$role"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SC-B.1 — Event dispatch primitives (Sprint 1 state-correctness)
+# Function-table dispatch for cross-store state mutations. Per design §4 +
+# expert review Q5 answer, the table lives in hiveMind (not a new script) and
+# is in-process for hiveMind→hiveMind handlers. Cross-script observers still
+# use the B5.1 subprocess pattern: `hiveMind protected.<event>`.
+# PO-locked constraints:
+#   U1 — handler failure: log+continue, never abort the mutation (reconcile catches drift)
+# ─────────────────────────────────────────────────────────────────────────────
+
+: ${HIVEMIND_EVENTS_LOG:=${CONFIG_PATH:-$HOME/config}/hivemind.events.log}
+: ${HIVEMIND_EVENTS_LOG_MAX_BYTES:=1048576}   # 1 MiB before rotation (SC-B.2)
+
+# Backing store — associative: event name → space-separated handler list.
+# Declared once at script-load; idempotent under repeated source.
+if ! declare -p HIVEMIND_EVENT_HANDLERS 2>/dev/null | grep -q '^declare -A'; then
+  declare -gA HIVEMIND_EVENT_HANDLERS=()
+fi
+
+private.hiveMind.events.register() # <eventName> <handlerFunction> # idempotent — re-registering the same handler is a no-op
+{
+  local event="$1" handler="$2"
+  if [ -z "$event" ] || [ -z "$handler" ]; then
+    error.log "events.register: usage <eventName> <handlerFunction>"
+    return 1
+  fi
+  # Idempotent: only add if not already in the space-separated list
+  local current="${HIVEMIND_EVENT_HANDLERS[$event]:-}"
+  case " $current " in
+    *" $handler "*) return 0 ;;  # already registered
+  esac
+  HIVEMIND_EVENT_HANDLERS["$event"]="${current:+${current} }${handler}"
+  return 0
+}
+
+private.hiveMind.events.emit() # <eventName> <arg...> # fan-out to all registered handlers, log+continue on failure (U1)
+{
+  local event="$1"; shift
+  if [ -z "$event" ]; then
+    error.log "events.emit: usage <eventName> <arg...>"
+    return 1
+  fi
+  # Append to history log (SC-B.2 rotation)
+  private.hiveMind.events.history.append "$event" "$@"
+  local handlers="${HIVEMIND_EVENT_HANDLERS[$event]:-}"
+  [ -z "$handlers" ] && return 0   # no handlers = silent no-op
+  local h rc
+  for h in $handlers; do
+    # Each handler runs isolated — failure logs but doesn't abort siblings (U1)
+    "$h" "$@"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      error.log "events.emit: handler '$h' for event '$event' returned rc=$rc (continuing)"
+    fi
+  done
+  return 0
+}
+
+private.hiveMind.events.history.append() # <event> <arg...> # internal: append to log, rotate at 1 MiB
+{
+  local event="$1"; shift
+  local ts size
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  # Rotation: portable size check via wc -c (BSD + GNU compatible)
+  if [ -f "$HIVEMIND_EVENTS_LOG" ]; then
+    size=$(wc -c < "$HIVEMIND_EVENTS_LOG" 2>/dev/null | tr -d ' ')
+    if [ -n "$size" ] && [ "$size" -ge "${HIVEMIND_EVENTS_LOG_MAX_BYTES}" ] 2>/dev/null; then
+      mv "$HIVEMIND_EVENTS_LOG" "${HIVEMIND_EVENTS_LOG}.1" 2>/dev/null
+    fi
+  fi
+  printf '%s|%s|%s\n' "$ts" "$event" "$*" >> "$HIVEMIND_EVENTS_LOG" 2>/dev/null
+}
+
+hiveMind.protected.events.register() # <eventName> <handlerFunction> # CLI wrapper for tests
+{
+  private.hiveMind.events.register "$@"
+}
+
+hiveMind.protected.events.emit() # <eventName> <arg...> # CLI wrapper for tests + cross-script events
+{
+  private.hiveMind.events.emit "$@"
+}
+
+hiveMind.events.list() # # show registered events and handler counts
+{
+  if [ "${#HIVEMIND_EVENT_HANDLERS[@]}" -eq 0 ]; then
+    info.log "No events registered"
+    return 0
+  fi
+  printf '%-32s %4s  %s\n' "EVENT" "N" "HANDLERS"
+  printf '%-32s %4s  %s\n' "─────" "─" "────────"
+  local event handlers count
+  for event in "${!HIVEMIND_EVENT_HANDLERS[@]}"; do
+    handlers="${HIVEMIND_EVENT_HANDLERS[$event]}"
+    count=$(echo "$handlers" | wc -w | tr -d ' ')
+    printf '%-32s %4s  %s\n' "$event" "$count" "$handlers"
+  done | sort
+}
+
+hiveMind.events.history() # <?lines:50> # tail the events log
+{
+  local lines="${1:-50}"
+  if [ ! -f "$HIVEMIND_EVENTS_LOG" ]; then
+    info.log "No events log yet ($HIVEMIND_EVENTS_LOG)"
+    return 0
+  fi
+  tail -n "$lines" "$HIVEMIND_EVENTS_LOG"
+}
+hiveMind.events.history.completion.lines() {
+  for n in 10 25 50 100 200; do echo "$n"; done
+}
+
 # ── Role Registry ─────────────────────────────────────────────────────────────
 # Write-through cache: pane target → role name.
 # PRIMARY source of truth is live discovery (process → session UUID → customTitle).
