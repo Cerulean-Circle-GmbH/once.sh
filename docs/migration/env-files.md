@@ -6,18 +6,87 @@ This document compares two ground-truth captures: the `main` branch (HEAD `c3078
 
 ---
 
-## TL;DR
+## What changed in one paragraph
 
-The `main` baseline persists **absolute paths captured at install time** — `CONFIG="/home/test/config/user.env"`, `OOSH_DIR="/home/test/oosh"`, `LOG_DEVICE="/dev/stdout"`, `LOGNAME="test"`, the full `PATH`. That works for a single-user Docker container but breaks the moment a real install symlinks `~/config` and `~/oosh` to a **shared directory** where multiple users source from the same files: user-A's persisted `/home/A/...` becomes user-B's `EACCES`.
+The `main` baseline persists **absolute paths captured at install time** — `CONFIG="/home/test/config/user.env"`, `OOSH_DIR="/home/test/oosh"`, `LOG_DEVICE="/dev/stdout"`, `LOGNAME="test"`, the full `PATH`. That works for a single-user Docker container but breaks the moment a real install symlinks `~/config` and `~/oosh` to a **shared directory** where multiple users source the same files: user-A's persisted `/home/A/...` becomes user-B's `EACCES`. `dev` inverts the model: per-user paths are **re-anchored at every shell init** via two self-anchor lines — `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` at the top of `user.env` and `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` at the top of `oosh.env` — and `config.save` actively **strips** the volatile absolutes (`CONFIG=`, `CONFIG_PATH=`, `OOSH_DIR=`, `LOG_LIVE=`, `LOG_DEVICE=`, `OOSH_COMPONENTS_DIR=`, `INSTALL`) so they can never leak between users. What survives the filter is portable per-install state: `OOSH_BRANCH`, `OOSH_MODE`, `OOSH_OS`, `OOSH_PM`, `OOSH_PROMPT`, `OOSH_SHLVL`, `OOSH_STATUS`, `OOSH_SSH_CONFIG_HOST`, `LOG_LEVEL`, `LOG_LEVEL_RESET`, `BASH_FILE`, `CONFIG_FILE`. Non-interactive shells (CI, `ssh exec`, completion) that don't run `this` get working defaults via the self-anchors. Brew bash on macOS gets PATH priority through a separate block at the bottom of `oosh.env`. Shared installs work without cross-user leaks, and a small `config.init.{shared,user,check,env,full}` family of repair primitives exists to recover hosts whose env files pre-date the fixes.
 
-`dev` inverts the model. Per-user paths are **re-anchored at every shell init** via parameter-expansion defaults:
+> If you only read one section of this document, read the next one. The two self-anchor lines are the centrepiece of the entire shift.
 
-- `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` at the top of `user.env`
-- `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` at the top of `oosh.env`
+---
 
-And `config.save` actively **strips** volatile absolutes (`CONFIG=`, `CONFIG_PATH=`, `OOSH_DIR=`, `LOG_LIVE=`, `LOG_DEVICE=`, `OOSH_COMPONENTS_DIR=`, `INSTALL`). What survives is portable per-install state: `OOSH_BRANCH`, `OOSH_MODE`, `OOSH_OS`, `OOSH_PM`, `OOSH_PROMPT`, `OOSH_SHLVL`, `OOSH_STATUS`, `OOSH_SSH_CONFIG_HOST`, `LOG_LEVEL`, `LOG_LEVEL_RESET`, `BASH_FILE`, `CONFIG_FILE`.
+## The two self-anchor lines, line by line
 
-Non-interactive shells (CI, `ssh exec`, completion) that don't run `this` get working defaults via the self-anchors. Brew bash on macOS gets PATH priority. Shared installs work without cross-user leaks.
+These two lines are why everything else works. They make the env files **sourceable from anywhere** without any prior environment setup — solving the fundamental bootstrap problem of "how does a file tell you where it is without already being told where it is".
+
+### 1. `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` — top of `user.env`
+
+```bash
+: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}
+export BASH_FILE="/usr/bin/bash"
+export CONFIG_FILE="user.env"
+source $CONFIG_PATH/log.env
+source $CONFIG_PATH/oosh.env
+```
+
+Breaking the first line into pieces:
+
+- **`:`** — the shell's *null command*. It evaluates its arguments (with all expansion and side effects) but does nothing with the result. It's the idiomatic way to trigger parameter expansion for its side effects without calling `true` (which would fork on some shells) or `echo` (which would print).
+- **`${CONFIG_PATH:=…}`** — POSIX parameter expansion with the **assign-default** operator. The behaviour is:
+  - If `CONFIG_PATH` is unset *or* empty → assign the default value to `CONFIG_PATH` *and* substitute it.
+  - If `CONFIG_PATH` is already set to a non-empty value → leave it alone; just substitute it.
+  - The key word is *assign*: this is the only `${…}` form that has a side effect on the variable. `${VAR:-default}` (single dash) only substitutes; `${VAR:=default}` (equals sign) substitutes *and* mutates. We need the mutation so that the next line (`source $CONFIG_PATH/log.env`) sees the resolved value.
+- **`${BASH_SOURCE[0]%/*}`** — the default value, computed only if needed. Two pieces:
+  - **`BASH_SOURCE[0]`** is a bash-specific array containing the call stack of currently-sourcing files. Index `0` is the file being sourced *right now*. When `~/.bashrc` does `source ~/config/user.env`, `BASH_SOURCE[0]` inside `user.env` is the absolute path to `user.env` itself.
+  - **`%/*`** is POSIX parameter-expansion *suffix-removal*. It strips the shortest match of `/*` from the end of the value — effectively, it removes the trailing `/filename` and leaves the directory. So `/home/alice/config/user.env` becomes `/home/alice/config`. This is `dirname` done with pure shell-builtin expansion: no `fork()`, no `exec()`, no subshell.
+
+**What the whole line achieves.** A shell that sources `user.env` with `CONFIG_PATH` unset will, in one line, derive `CONFIG_PATH` from the *file's own filesystem location* — and that derived value will be exactly what's needed for the very next line, `source $CONFIG_PATH/log.env`, to succeed. The file becomes self-describing: drop it anywhere, source it, and the rest of the chain works.
+
+**What it specifically prevents.** Before this line existed (added in `099bb7b`, 2026-04-27), a shell that hadn't run `config.init` first would have `CONFIG_PATH` unset, making `source $CONFIG_PATH/log.env` expand to `source /log.env` — "No such file or directory". The whole sourcing chain collapsed. This bit non-interactive shells (CI, `ssh exec`) and any script that wanted to bootstrap from `user.env` without going through `this`. The self-anchor closes that hole.
+
+**Why these specific primitives.** `$0` inside a sourced file is the *outer* shell name (`bash`, `-bash`) — useless for locating the file. `$PWD` is the caller's working directory, also useless. Only `BASH_SOURCE[0]` reliably gives the path of the file currently being sourced. The `%/*` form is a deliberate choice over `$(dirname "$BASH_SOURCE[0]")` because the latter forks a process every time `user.env` is sourced, and `user.env` is sourced on every interactive shell startup.
+
+**Caveat.** `BASH_SOURCE` is a bash-specific array. A strict POSIX shell that sourced this file would see `BASH_SOURCE[0]` as unset and the self-anchor would fail. In practice this isn't an issue: the file uses `export` syntax throughout, and oosh's whole environment requires bash 4+. The first line is bash-only by design.
+
+### 2. `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` — top of `oosh.env`
+
+```bash
+: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}
+export declare OOSH_BRANCH="prod"
+...
+[ -f "$OOSH_DIR/log" ] && source "$OOSH_DIR/log"
+```
+
+Same `:` null command and same `${OOSH_DIR:=…}` assign-default operator as the user.env line. The interesting part is the default value:
+
+- **`$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")`** — a command substitution that either resolves the real path of `~/oosh` or falls back to the literal string `$HOME/oosh`.
+  - **`cd "$HOME/oosh" 2>/dev/null`** attempts to change directory into the user's `oosh` symlink, sending any error (e.g. directory doesn't exist) to `/dev/null`. The `cd` happens in a *subshell* (because we're inside `$(...)`), so it doesn't affect the calling shell's working directory.
+  - **`&& pwd -P`** runs only if `cd` succeeded. `pwd -P` prints the **physical** path — symlinks resolved. So if `~/oosh` is a symlink to `/home/shared/EAMD.ucp/.../Once.sh/dev`, `pwd -P` returns the real path, not the symlink.
+  - **`|| echo "$HOME/oosh"`** runs only if `cd` failed (i.e. `~/oosh` doesn't exist yet — fresh box, mid-install). Falls back to the literal `~/oosh` path as a best-effort. The system may not be functional yet at this point, but at least `OOSH_DIR` has *a* value rather than being empty.
+
+**Why resolve the symlink with `pwd -P`?** The user's `~/oosh` is almost always a symlink to a shared install dir like `/home/shared/EAMD.ucp/.../Once.sh/dev`. Without `pwd -P`, `OOSH_DIR` would be `/home/alice/oosh` (the symlink) rather than the real path. That looks fine until `bashrcTemplate`'s auto-sync logic later compares paths or re-creates symlinks — at which point a self-referential symlink (`/home/alice/oosh` → `/home/alice/oosh`) can be created. `pwd -P` collapses the indirection up front. This particular tightening came in `f4966bd` (2026-04-27); the earlier form just used the symlink path literally.
+
+**Why the fallback at all?** On a fresh, mid-install box `~/oosh` may not yet exist. Without the fallback, `OOSH_DIR` would be empty, and the trailing `[ -f "$OOSH_DIR/log" ] && source "$OOSH_DIR/log"` would evaluate `[ -f /log ]` and silently skip. That's fine *during* install, but the moment install completes and the user's first real shell starts, having a stale empty `OOSH_DIR` cached from the install-time source would cause confusion. The fallback ensures the value is *always* at least plausible, even on first boot.
+
+### Why the order matters
+
+Both self-anchors come **first** in their respective files, before any `export` line. That ordering is critical: the moment the parser starts evaluating the file, it needs `CONFIG_PATH` (in `user.env`) or `OOSH_DIR` (in `oosh.env`) to be set, because the next lines reference them. If the self-anchors came after the exports, those references would expand against the un-anchored values and the chain would break for non-interactive shells.
+
+### The whole sourcing flow
+
+This is what the self-anchors are protecting. The user's `~/.bashrc` template does:
+
+```text
+~/.bashrc
+└── source ~/config/user.env
+    ├── (self-anchor sets CONFIG_PATH from BASH_SOURCE[0])
+    ├── source $CONFIG_PATH/log.env       ← needs CONFIG_PATH resolved
+    └── source $CONFIG_PATH/oosh.env      ← needs CONFIG_PATH resolved
+        ├── (self-anchor sets OOSH_DIR from $HOME/oosh)
+        ├── (PATH builder block — see further down)
+        └── source $OOSH_DIR/log          ← needs OOSH_DIR resolved
+```
+
+Each link in the chain depends on a path resolved by the previous one. The self-anchors guarantee that the FIRST file (`user.env`) can bootstrap the chain with no environment input — and the SECOND file (`oosh.env`) does the same independently, so even a script that sources `oosh.env` alone (bypassing `user.env`) still works.
 
 ---
 
