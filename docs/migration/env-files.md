@@ -285,6 +285,8 @@ If any of those fail, the env files are from before April 27, 2026 and should be
 
 **What about the legacy `export declare X=` malformation?** Fixed in `bf69c59` and `beba799` (May 11–12, 2026). Today's `config.save` emits clean `export X=` lines, and `config.set` normalises legacy lines on update. Existing installs heal lazily as users `config.set` things, or instantly via `config init.env`.
 
+**Is there a similar migration path for a drifted `~/.ssh`?** Yes — see [`docs/ossh.md` § Repairing a Broken `~/.ssh`](../ossh.md#repairing-a-broken-ssh). Use `ossh folder.fix.check` to inspect drift read-only, then `ossh folder.fix` (or `ossh folder.fix strict` to also prune known-stale legacy files) to converge to canonical. Same idempotent design as `config init.env` for env files.
+
 ---
 
 ## Files involved

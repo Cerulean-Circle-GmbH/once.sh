@@ -149,6 +149,35 @@ ossh key.push myhost
 ossh config.push myhost
 ```
 
+## Repairing a Broken `~/.ssh`
+
+A fresh OOSH install lays down a canonical `~/.ssh` tree via `osshLayout build` (idempotent roles for owner, developking, installer, outeruser, closed by `private.osshLayout.perms.tighten`). On older machines that were installed before the Phase 2 layout work, the tree may have drifted — forbidden symlinks where real files are required, wrong perms (775/777 on private keys), legacy artifacts from earlier OOSH versions.
+
+Three commands handle this:
+
+```bash
+# Diagnose drift (read-only, returns 0 even with findings)
+ossh folder.fix.check
+
+# Repair: converge ~/.ssh to canonical state (conservative — never deletes)
+ossh folder.fix
+
+# Repair + also prune known-stale legacy artifacts (.bak.*, .previous, 2cuGitHub, no_deploy_keys, ssh-copy-id.*)
+ossh folder.fix strict
+
+# Re-assert canonical perms only (700 dirs, 600 privkeys, 644 pubkeys)
+ossh rights.fix
+```
+
+`ossh folder.fix` is idempotent and uses three-tier identity resolution. If the installer email is already known from existing `~/.ssh/ids/ssh.*/` directories, no args are needed — discovery happens automatically. Otherwise, pass the email explicitly:
+
+```bash
+ossh folder.fix me@example.com
+ossh folder.fix me@example.com ~/.ssh strict
+```
+
+Strict mode **never** deletes `authorized_keys`, `id_rsa`, or `config`. It only removes documented legacy patterns. User-authored content is always preserved.
+
 ## Remote Installation
 
 ```bash
