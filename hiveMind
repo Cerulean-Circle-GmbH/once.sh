@@ -405,6 +405,69 @@ hiveMind.events.history.completion.lines() {
   for n in 10 25 50 100 200; do echo "$n"; done
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SC-C — Event handlers (Sprint 1 design §4 catalog)
+# ─────────────────────────────────────────────────────────────────────────────
+# One handler per (event, target store). Registered at script-load below.
+# Failure of any handler logs+continues per U1 — the event.emit primitive
+# already wraps each call with rc capture, so handlers can return non-zero
+# safely.
+# Migration note: existing direct calls in mutation sites (e.g. agent.bootstrap
+# calling private.hiveMind.registry.set directly) are RETAINED during Sprint 1.
+# They become idempotent siblings of the event-driven path. Once SC-C tests
+# confirm handlers cover all paths reliably, a future refactor will remove the
+# direct calls and rely solely on event dispatch.
+
+# ── SC-C.1 agent.spawned ─── args: <pane> <role> <?uuid> ────────────────────
+
+private.hiveMind.handler.agent.spawned.registry() {
+  local pane="$1" role="$2"
+  [ -z "$pane" ] || [ -z "$role" ] && return 0
+  private.hiveMind.registry.set "$pane" "$role"
+}
+
+private.hiveMind.handler.agent.spawned.sessions() {
+  local pane="$1" role="$2" uuid="$3"
+  [ -z "$pane" ] || [ -z "$uuid" ] && return 0
+  private.hiveMind.session.store "$pane" "$uuid"
+}
+
+# ── SC-C.2 agent.killed ─── args: <pane> ────────────────────────────────────
+
+private.hiveMind.handler.agent.killed.registry() {
+  local pane="$1"
+  [ -z "$pane" ] && return 0
+  [ -f "$HIVEMIND_REGISTRY" ] || return 0
+  grep -v "^${pane}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
+  mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
+}
+
+private.hiveMind.handler.agent.killed.sessions() {
+  local pane="$1"
+  [ -z "$pane" ] && return 0
+  [ -f "$HIVEMIND_SESSIONS" ] || return 0
+  grep -v "^${pane}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+  mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+}
+
+private.hiveMind.handler.agent.killed.queue() {
+  local pane="$1"
+  [ -z "$pane" ] && return 0
+  # queue.path may not exist yet if queue helpers aren't sourced — soft-fail.
+  local qfile
+  qfile=$(private.hiveMind.agent.queue.path "$pane" 2>/dev/null) || return 0
+  [ -n "$qfile" ] && [ -f "$qfile" ] && rm -f "$qfile"
+  return 0
+}
+
+# ── Registration (script-load) ───────────────────────────────────────────────
+
+private.hiveMind.events.register "agent.spawned" "private.hiveMind.handler.agent.spawned.registry"
+private.hiveMind.events.register "agent.spawned" "private.hiveMind.handler.agent.spawned.sessions"
+private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.registry"
+private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.sessions"
+private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.queue"
+
 # ── Role Registry ─────────────────────────────────────────────────────────────
 # Write-through cache: pane target → role name.
 # PRIMARY source of truth is live discovery (process → session UUID → customTitle).
@@ -3300,6 +3363,9 @@ hiveMind.registry.remove() # <pane> # remove registry entry for a pane
   if [ -f "$reg" ] && grep -q "^${target}|" "$reg" 2>/dev/null; then
     grep -v "^${target}|" "$reg" > "${reg}.tmp" && mv "${reg}.tmp" "$reg"
     echo "Removed $target from registry"
+    # SC-C.2 — emit agent.killed. Handlers ensure sessions.env and queue file
+    # are also cleaned (the direct mutation above only touched roles.env).
+    private.hiveMind.events.emit "agent.killed" "$target"
   else
     error.log "No registry entry for $target"
     return 1
@@ -4666,6 +4732,10 @@ hiveMind.agent.bootstrap() # <agentName> <?session> <?pane> # full bootstrap: cr
   # Step 7: Lifecycle trigger — refresh the team's UUIDs so caches + forks.env
   # reflect this new agent immediately. Non-invasive.
   hiveMind.registry.refresh "$session" >/dev/null
+
+  # SC-C.1 — emit agent.spawned. Handlers (registry, sessions) replicate the
+  # direct calls above; harmless idempotent doubling during Sprint 1 transition.
+  private.hiveMind.events.emit "agent.spawned" "$target_pane" "$role" "${new_sid:-}"
 
   success.log "Agent $role bootstrapped in pane $target_pane"
   echo "Verify with: hiveMind agent.verify $target_pane"
