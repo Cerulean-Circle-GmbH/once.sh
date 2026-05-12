@@ -460,6 +460,64 @@ private.hiveMind.handler.agent.killed.queue() {
   return 0
 }
 
+# ── SC-C.3 agent.renamed ─── args: <pane> <oldName> <newName> ──────────────
+# Fires after /rename inside a Claude TUI. Handlers update:
+#   - S1 (roles.env): pane → newName (overwrite oldName)
+#   - title:           otmux pane.lock pins the new title
+#   - role.env:        push HIVEMIND_ROLE=newName to pane shell (Bug #3)
+
+private.hiveMind.handler.agent.renamed.registry() {
+  local pane="$1" newName="$3"
+  [ -z "$pane" ] || [ -z "$newName" ] && return 0
+  private.hiveMind.registry.set "$pane" "$newName"
+}
+
+private.hiveMind.handler.agent.renamed.title() {
+  local pane="$1" newName="$3"
+  [ -z "$pane" ] || [ -z "$newName" ] && return 0
+  # Defensive: skip if pane doesn't exist (test fixtures or stale agent.rename).
+  # pane.lock spawns a background enforcer; without this guard it'd churn.
+  tmux list-panes -t "$pane" -F '#{pane_id}' >/dev/null 2>&1 || return 0
+  otmux pane.lock "$pane" "$newName" 2>/dev/null
+  return 0
+}
+
+private.hiveMind.handler.agent.renamed.role_env() {
+  local pane="$1" newName="$3"
+  [ -z "$pane" ] || [ -z "$newName" ] && return 0
+  private.hiveMind.pane.pushRoleEnv "$pane" "$newName"
+}
+
+# ── SC-C.4 agent.forked ─── args: <pane> <role> <parentUuid> <childUuid> ───
+# Fires after a successful claudeCode fork. Handlers update:
+#   - S1 (roles.env): pane → role (reaffirm post-fork)
+#   - S2 (sessions.env): pane → childUuid
+#   - S5 (forks.env): append lineage row `ts|pane|role|childUuid|live|parentUuid`
+
+private.hiveMind.handler.agent.forked.registry() {
+  local pane="$1" role="$2"
+  [ -z "$pane" ] || [ -z "$role" ] && return 0
+  private.hiveMind.registry.set "$pane" "$role"
+}
+
+private.hiveMind.handler.agent.forked.sessions() {
+  local pane="$1" childUuid="$4"
+  [ -z "$pane" ] || [ -z "$childUuid" ] && return 0
+  private.hiveMind.session.store "$pane" "$childUuid"
+}
+
+private.hiveMind.handler.agent.forked.forks() {
+  local pane="$1" role="$2" parentUuid="$3" childUuid="$4"
+  [ -z "$pane" ] || [ -z "$childUuid" ] && return 0
+  local forksFile="${HIVEMIND_FORKS:-${CONFIG_PATH:-$HOME/config}/hivemind.forks.env}"
+  local dir
+  dir=$(dirname "$forksFile")
+  mkdir -p "$dir" 2>/dev/null
+  local ts
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  echo "${ts}|${pane}|${role}|${childUuid}|live|${parentUuid}" >> "$forksFile"
+}
+
 # ── SC-C.5 panes.shifted ─── args: <session> ───────────────────────────────
 # Fired after split/insert in a session — pane indices may have changed; live
 # discovery reconciles. queue.rename handler stub (future work — needs old→new
@@ -548,6 +606,13 @@ private.hiveMind.events.register "agent.spawned" "private.hiveMind.handler.agent
 private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.registry"
 private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.sessions"
 private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.queue"
+# Order matters: registry mutates first, role_env reads post-mutation
+private.hiveMind.events.register "agent.renamed" "private.hiveMind.handler.agent.renamed.registry"
+private.hiveMind.events.register "agent.renamed" "private.hiveMind.handler.agent.renamed.title"
+private.hiveMind.events.register "agent.renamed" "private.hiveMind.handler.agent.renamed.role_env"
+private.hiveMind.events.register "agent.forked"  "private.hiveMind.handler.agent.forked.registry"
+private.hiveMind.events.register "agent.forked"  "private.hiveMind.handler.agent.forked.sessions"
+private.hiveMind.events.register "agent.forked"  "private.hiveMind.handler.agent.forked.forks"
 private.hiveMind.events.register "panes.shifted" "private.hiveMind.handler.panes.shifted.registry"
 # Order matters: registry mutates first, role_env reads post-mutation state
 private.hiveMind.events.register "panes.swapped" "private.hiveMind.handler.panes.swapped.registry"
@@ -3454,6 +3519,11 @@ hiveMind.agent.rename() # <agentName> <newName> # rename agent: /rename + pane.l
   # a new custom-title entry in the JSONL; discover picks it up). Non-invasive.
   hiveMind.registry.refresh "$session" >/dev/null
 
+  # SC-C.3 — emit agent.renamed. Handlers (registry, title, role_env) replicate
+  # steps 2+3 idempotently AND push HIVEMIND_ROLE to the pane shell (which
+  # rename did NOT do before). Direct calls retained during Sprint 1 transition.
+  private.hiveMind.events.emit "agent.renamed" "$target" "$name" "$newName"
+
   success.log "Renamed $name → $newName ($target)"
 }
 hiveMind.team.activate() # <session> # set active team (alias for team.switch)
@@ -5633,6 +5703,12 @@ hiveMind.agent.respawn() # <agentName> # fork role snapshot into pane + /rename 
   # a new customTitle. Refresh so caches + forks.env record the new lineage.
   local sessionOfPane="${target%%:*}"
   hiveMind.registry.refresh "$sessionOfPane" >/dev/null
+
+  # SC-C.4 — emit agent.forked. Handlers update registry, sessions, forks.env.
+  # The registry.refresh above already wrote forks.env once for live discovery;
+  # the .forks handler appends a second row with explicit parent linkage (the
+  # `uuid` here is the parent — refresh only sees the child via JSONL parentUuid).
+  private.hiveMind.events.emit "agent.forked" "$target" "$role" "$uuid" "${newUuid:-}"
 
   success.log "Respawned ${role} in ${target} (fork of ${uuid:0:8}... → ${newUuid:0:8}...)"
 }
