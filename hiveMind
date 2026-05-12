@@ -3739,7 +3739,177 @@ hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sp
   return 0
 }
 
-hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from live truth
+hiveMind.consistency.fix() # <?session> # interactive y/N apply of consistency.audit findings (SC-D.1)
+{
+  # SC-D.1 — top-of-diff applier with interactive confirmation. Same primitive
+  # as consistency.audit (read-only) and consistency.reconcile (silent batch);
+  # this one shows the diff + prompts before mutating.
+  local filter_session="$1"
+  local diff_lines total
+  diff_lines=$(private.hiveMind.reconcile.diff 2>/dev/null)
+  if [ -n "$filter_session" ] && [ -n "$diff_lines" ]; then
+    diff_lines=$(echo "$diff_lines" | awk -F'|' -v s="$filter_session" '
+      $5 == s || index($5, s":") == 1 || $5 == "tronMonitor" { print }
+    ')
+  fi
+  total=0
+  [ -n "$diff_lines" ] && total=$(echo "$diff_lines" | grep -c '^[A-Z]' || true)
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${BOLD_GREEN}✓ CLEAN${NORMAL} — nothing to fix."
+    return 0
+  fi
+
+  # Show audit-style report so user knows what's being asked
+  hiveMind.consistency.audit "$filter_session" human 2>/dev/null
+  echo
+  echo -en "${BOLD_YELLOW}Apply $total fix(es)?${NORMAL} [y/N] "
+  local reply
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      echo -e "${GRAY}Aborted — no mutations performed.${NORMAL}"
+      return 1
+      ;;
+  esac
+
+  echo "$diff_lines" | private.hiveMind.reconcile.apply
+  return $?
+}
+hiveMind.consistency.fix.completion.session() { private.hiveMind.teams.complete; }
+
+hiveMind.consistency.reconcile() # <?session> <?mode:dry-run|apply> # silent batch reconciliation; dry-run by default (U3 lock)
+{
+  # SC-D.1 — cron/SM-cycle-friendly. Per U3 (PO-locked): dry-run unless 'apply'
+  # is explicitly passed. Output is minimal — total violation count + brief
+  # severity breakdown. Exit code = total PRE-apply violations (so SM-cycle
+  # can detect change-over-time).
+  local filter_session="$1"
+  local mode="${2:-dry-run}"
+
+  local diff_lines total c h m l
+  diff_lines=$(private.hiveMind.reconcile.diff 2>/dev/null)
+  if [ -n "$filter_session" ] && [ -n "$diff_lines" ]; then
+    diff_lines=$(echo "$diff_lines" | awk -F'|' -v s="$filter_session" '
+      $5 == s || index($5, s":") == 1 || $5 == "tronMonitor" { print }
+    ')
+  fi
+  total=0; c=0; h=0; m=0; l=0
+  if [ -n "$diff_lines" ]; then
+    c=$(echo "$diff_lines" | grep -c '^CRITICAL|' || true)
+    h=$(echo "$diff_lines" | grep -c '^HIGH|'     || true)
+    m=$(echo "$diff_lines" | grep -c '^MEDIUM|'   || true)
+    l=$(echo "$diff_lines" | grep -c '^LOW|'      || true)
+    total=$((c + h + m + l))
+  fi
+
+  if [ "$total" -eq 0 ]; then
+    echo "reconcile: clean (0 violations)"
+    return 0
+  fi
+
+  case "$mode" in
+    apply)
+      echo "reconcile: $total violations (C=$c H=$h M=$m L=$l) — applying..."
+      local applied
+      applied=$(echo "$diff_lines" | private.hiveMind.reconcile.apply | tail -1)
+      echo "reconcile: $applied"
+      ;;
+    dry-run|*)
+      echo "reconcile: $total violations (C=$c H=$h M=$m L=$l) — DRY RUN (use 'reconcile <?session> apply' to mutate)"
+      ;;
+  esac
+  return "$total"
+}
+hiveMind.consistency.reconcile.completion.session() { private.hiveMind.teams.complete; }
+hiveMind.consistency.reconcile.completion.mode() { echo "dry-run"; echo "apply"; }
+
+private.hiveMind.reconcile.apply() # # consume diff lines on stdin, apply each mutation; echo summary at end
+{
+  # Apply primitive — reads diff format from stdin:
+  #   <severity>|<invariant>|<store>|<op>|<key>|<expected>|<actual>
+  # Skip I5 (snapshot stale — needs re-snapshot, not safe auto-mutation)
+  # Skip I7 (tronMonitor display — Tron's call, not auto-apply)
+  local sev inv store op key expected actual
+  local applied=0 skipped=0
+  while IFS='|' read -r sev inv store op key expected actual; do
+    [ -z "$sev" ] && continue
+    case "$inv" in
+      I5|I7)
+        info.log "  SKIP $inv ($store $op $key) — not safe to auto-apply"
+        skipped=$((skipped + 1))
+        continue
+        ;;
+    esac
+    case "${store}:${op}" in
+      S1:REMOVE)
+        # Remove stale role entry — grep -v pattern
+        if [ -f "$HIVEMIND_REGISTRY" ]; then
+          grep -v "^${key}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
+          mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S2:REMOVE)
+        if [ -f "$HIVEMIND_SESSIONS" ]; then
+          grep -v "^${key}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+          mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S2:UPDATE)
+        # Replace cached UUID with live (key = pane, expected = liveUuid)
+        if [ -f "$HIVEMIND_SESSIONS" ]; then
+          grep -v "^${key}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+          echo "${key}|${expected}" >> "${HIVEMIND_SESSIONS}.tmp"
+          mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S3:REMOVE)
+        if [ -f "$HIVEMIND_TEAMS" ]; then
+          grep -v "^${key}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null
+          mv "${HIVEMIND_TEAMS}.tmp" "$HIVEMIND_TEAMS"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S8:REMOVE)
+        # tronMonitor.env — prefer tronMonitor.remove (handles screen window
+        # cleanup too) over raw file edit. Soft-fail if tronMonitor isn't on PATH.
+        if command -v tronMonitor >/dev/null 2>&1; then
+          tronMonitor remove "$key" >/dev/null 2>&1
+          applied=$((applied + 1))
+        elif [ -f "$TRON_MONITOR_ENV" ]; then
+          grep -v "|${key}$" "$TRON_MONITOR_ENV" > "${TRON_MONITOR_ENV}.tmp" 2>/dev/null
+          mv "${TRON_MONITOR_ENV}.tmp" "$TRON_MONITOR_ENV"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S6:REMOVE)
+        # Queue file — actual field is the full file path
+        if [ -f "$actual" ]; then
+          rm -f "$actual"
+          applied=$((applied + 1))
+        fi
+        ;;
+      *)
+        info.log "  SKIP unhandled mutation: ${store} ${op} ${key}"
+        skipped=$((skipped + 1))
+        ;;
+    esac
+  done
+  echo "applied=$applied skipped=$skipped"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# LEGACY consistency.fix.table — Sprint 0 per-pane hand-rolled reconciler.
+# Kept available for diagnostic use; SC-D.1 above (consistency.fix) is the
+# canonical Sprint 1 implementation on top of reconcile.diff primitive.
+# ────────────────────────────────────────────────────────────────────────────
+
+hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (kept for diagnostics)
 {
   local filter_session="$1"
 
@@ -3750,7 +3920,7 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
   [ -f "$reg" ] || touch "$reg"
   [ -f "$sess_file" ] || touch "$sess_file"
 
-  echo -e "${BOLD_CYAN}Fixing identity consistency...${NORMAL}"
+  echo -e "${BOLD_CYAN}Fixing identity consistency (legacy)...${NORMAL}"
   echo
 
   # --- 0. Clean up garbage entries in sessions.env ---
