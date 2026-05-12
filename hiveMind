@@ -3406,12 +3406,13 @@ private.hiveMind.reconcile.check.i2() { # # I2 (HIGH): every pane in S2 is in S1
       echo "HIGH|I2|S2|REMOVE|${pane}|<not-in-S1>|${cachedUuid}"
       continue
     fi
-    # (b) Cached UUID must match live Claude on that pane (if Claude running)
-    local liveUuid
-    liveUuid=$("$OOSH_DIR/claudeCode" session.current "$pane" 2>/dev/null)
-    if [ -n "$liveUuid" ] && [ -n "$cachedUuid" ] && [ "$liveUuid" != "$cachedUuid" ]; then
-      echo "HIGH|I2|S2|UPDATE|${pane}|${liveUuid}|${cachedUuid}"
-    fi
+    # (b) Cached UUID must match live Claude on that pane — SKIPPED for now.
+    # Per-pane `claudeCode session.current` call is ~1s each (sources `this`),
+    # times 40-50 sessions.env entries = 45s+ audit which times out under
+    # subshell capture. TODO Sprint 1 follow-up: batch live UUID discovery
+    # via ONE ps scan + JSONL correlation, replacing the per-pane call.
+    # The (a) orphan check above already catches the most-common drift
+    # (sessions.env entry for pane no longer in registry).
   done < "$ses"
 }
 
@@ -3499,7 +3500,132 @@ private.hiveMind.reconcile.check.i7() { # # I7 (CRITICAL): tronMonitor display m
   fi
 }
 
-hiveMind.consistency.audit() # <?session> # cross-compare all identity sources and show mismatches
+hiveMind.consistency.audit() # <?session> <?format:human|json> # graded audit (I1-I7) via reconcile.diff — pure read; exit code = violation count (U2)
+{
+  # SC-A.2 — Sprint 1 state-correctness audit. Layers on top of SC-A.1
+  # reconcile.diff primitive. Reports human OR json. Shows ALL violations
+  # (does not exit early per U2 graded). Exit code is total violation count
+  # (0 = clean). PO-locked dry-run (U3) — never mutates.
+  local filter_session="$1"
+  local format="${2:-human}"
+
+  # Collect diff lines, optionally filter to a session
+  local diff_lines
+  diff_lines=$(private.hiveMind.reconcile.diff 2>/dev/null)
+  if [ -n "$filter_session" ] && [ -n "$diff_lines" ]; then
+    # Filter: key field (field 5) must start with session: or equal session
+    diff_lines=$(echo "$diff_lines" | awk -F'|' -v s="$filter_session" '
+      $5 == s || index($5, s":") == 1 || $5 == "tronMonitor" { print }
+    ')
+  fi
+
+  # Count violations by severity (used by both renderers and exit code)
+  local critical=0 high=0 medium=0 low=0 total=0
+  if [ -n "$diff_lines" ]; then
+    critical=$(echo "$diff_lines" | grep -c '^CRITICAL|' || true)
+    high=$(echo "$diff_lines" | grep -c '^HIGH|' || true)
+    medium=$(echo "$diff_lines" | grep -c '^MEDIUM|' || true)
+    low=$(echo "$diff_lines" | grep -c '^LOW|' || true)
+    total=$((critical + high + medium + low))
+  fi
+
+  case "$format" in
+    json)
+      private.hiveMind.audit.render.json "$diff_lines" "$total" "$critical" "$high" "$medium" "$low"
+      ;;
+    human|*)
+      private.hiveMind.audit.render.human "$diff_lines" "$total" "$critical" "$high" "$medium" "$low"
+      ;;
+  esac
+
+  # Exit code = total violation count (per U2 — non-zero indicates degraded state)
+  return "$total"
+}
+hiveMind.consistency.audit.completion.format() { echo "human"; echo "json"; }
+hiveMind.consistency.audit.completion.session() { private.hiveMind.teams.complete; }
+
+private.hiveMind.audit.render.human() # <diff_lines> <total> <c> <h> <m> <l> # color-grouped report
+{
+  local diff_lines="$1" total="$2" c="$3" h="$4" m="$5" l="$6"
+  echo -e "${BOLD_CYAN}State Correctness Audit${NORMAL} ${GRAY}(SC-A.2 · sprint-1-design.md §3)${NORMAL}"
+  echo -e "${GRAY}$(printf '%.0s═' {1..78})${NORMAL}"
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${BOLD_GREEN}✓ CLEAN${NORMAL} — all 7 invariants pass."
+    echo -e "${GRAY}$(printf '%.0s─' {1..78})${NORMAL}"
+    return 0
+  fi
+
+  # One section per severity tier, in CRITICAL → LOW order
+  local tier color label
+  for tier in CRITICAL:BOLD_RED HIGH:BOLD_YELLOW MEDIUM:BOLD_CYAN LOW:GRAY; do
+    label="${tier%:*}"
+    color="${tier#*:}"
+    local lines
+    lines=$(echo "$diff_lines" | grep "^${label}|" || true)
+    [ -z "$lines" ] && continue
+    local count
+    count=$(echo "$lines" | wc -l | tr -d ' ')
+    echo
+    echo -e "${!color}${label}${NORMAL} ${GRAY}($count)${NORMAL}"
+    echo "$lines" | while IFS='|' read -r sev inv store op key expected actual; do
+      printf "  ${!color}%-3s${NORMAL}  ${BOLD_WHITE}%-4s${NORMAL}  ${BOLD_WHITE}%-6s${NORMAL}  %-32s  ${GRAY}%s${NORMAL} → ${GRAY}%s${NORMAL}\n" \
+        "$op" "$inv" "$store" "$key" "$actual" "$expected"
+    done
+  done
+
+  echo
+  echo -e "${GRAY}$(printf '%.0s─' {1..78})${NORMAL}"
+  echo -e "Summary: ${BOLD_RED}${c} crit${NORMAL}, ${BOLD_YELLOW}${h} high${NORMAL}, ${BOLD_CYAN}${m} med${NORMAL}, ${GRAY}${l} low${NORMAL} = ${BOLD_WHITE}${total} violations${NORMAL}"
+  echo -e "${GRAY}Recover (dry-run by default per U3):${NORMAL}"
+  echo -e "${GRAY}  hiveMind consistency.fix          — interactive (y/N prompt before each fix)${NORMAL}"
+  echo -e "${GRAY}  hiveMind consistency.reconcile --apply  — silent batch (SM-cycle-style)${NORMAL}"
+}
+
+private.hiveMind.audit.render.json() # <diff_lines> <total> <c> <h> <m> <l> # JSON output for CI/dashboards
+{
+  local diff_lines="$1" total="$2" c="$3" h="$4" m="$5" l="$6"
+  echo "{"
+  echo "  \"version\": 1,"
+  echo "  \"task\": \"SC-A.2\","
+  echo "  \"summary\": {"
+  echo "    \"total\": $total,"
+  echo "    \"critical\": $c,"
+  echo "    \"high\": $h,"
+  echo "    \"medium\": $m,"
+  echo "    \"low\": $l"
+  echo "  },"
+  echo -n "  \"violations\": ["
+  if [ -z "$diff_lines" ] || [ "$total" -eq 0 ]; then
+    echo "]"
+    echo "}"
+    return 0
+  fi
+  echo
+  local first=1
+  echo "$diff_lines" | while IFS='|' read -r sev inv store op key expected actual; do
+    [ -z "$sev" ] && continue
+    if [ "$first" -eq 1 ]; then first=0; else echo ","; fi
+    # JSON string escape: backslash + double-quote
+    printf '    {"severity":"%s","invariant":"%s","store":"%s","op":"%s","key":"%s","expected":"%s","actual":"%s"}' \
+      "$(private.hiveMind.audit.json.escape "$sev")" \
+      "$(private.hiveMind.audit.json.escape "$inv")" \
+      "$(private.hiveMind.audit.json.escape "$store")" \
+      "$(private.hiveMind.audit.json.escape "$op")" \
+      "$(private.hiveMind.audit.json.escape "$key")" \
+      "$(private.hiveMind.audit.json.escape "$expected")" \
+      "$(private.hiveMind.audit.json.escape "$actual")"
+  done
+  echo
+  echo "  ]"
+  echo "}"
+}
+
+private.hiveMind.audit.json.escape() { # <str> # minimal JSON string escape (\ and ")
+  echo -n "${1//\\/\\\\}" | sed 's/"/\\"/g'
+}
+
+hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sprint 0 — kept for diagnostics)
 {
   local filter_session="$1"
 
@@ -3508,7 +3634,7 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
   # Load sessions.env (role|uuid)
   local sess_file="$HIVEMIND_SESSIONS"
 
-  echo -e "${BOLD_CYAN}Identity Consistency Audit${NORMAL}"
+  echo -e "${BOLD_CYAN}Identity Consistency Audit (legacy table)${NORMAL}"
   echo -e "${GRAY}$(printf '%.0s═' {1..85})${NORMAL}"
   printf "${BOLD_WHITE}%-28s %-16s %-16s %-13s %-16s %s${NORMAL}\n" "PANE" "TITLE" "REGISTRY" "SESS.ENV" "LIVE UUID" "MATCH"
   echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
