@@ -562,97 +562,112 @@ tronMonitor.remove.completion.teamSession() {
   [ -f "$TRON_MONITOR_ENV" ] && cut -d'|' -f2 "$TRON_MONITOR_ENV" 2>/dev/null
 }
 
-tronMonitor.reset() # # kill screen, clear tracking, restart with all tracked teams
+tronMonitor.reset() # # destructive — kill screen + clear env, then delegate to setup for rebuild
 {
-  local monitorPane
-  monitorPane=$(private.tronMonitor.pane)
+  # NOTE: setup is the canonical cold-start path (d1.3 fix: window 0 must be a
+  # team, not a bare zsh). reset's previous direct `screen -S name` call
+  # produced the bare-zsh window 0 bug. Delegating to setup keeps the recipe
+  # in ONE place.
   local screenName=$(private.tronMonitor.screenSession)
 
-  # Save current team list
-  local teams=""
-  if [ -f "$TRON_MONITOR_ENV" ] && [ -s "$TRON_MONITOR_ENV" ]; then
-    teams=$(cut -d'|' -f2 "$TRON_MONITOR_ENV")
+  # Step 1 — kill existing screen
+  if private.tronMonitor.screen.isAlive; then
+    info.log "Killing existing $screenName screen session"
+    screen -S "$(private.tronMonitor.fullScreenName)" -X quit 2>/dev/null
+    sleep 1
   fi
 
-  # Kill screen session
-  screen -S "$(private.tronMonitor.fullScreenName)" -X quit 2>/dev/null
-  sleep 1
+  # Step 2 — clear env (so setup runs full cold-start, not idempotent no-op)
+  : > "$TRON_MONITOR_ENV"
 
-  # Clear tracking
-  echo -n "" > "$TRON_MONITOR_ENV"
-
-  # Restart screen
-  otmux send.raw "$monitorPane" "screen -S $screenName" Enter
-  sleep 1
-
-  # Re-add all tracked teams
-  local count=0
-  if [ -n "$teams" ]; then
-    local sess
-    while read -r sess; do
-      [ -z "$sess" ] && continue
-      tronMonitor.add "$sess"
-      count=$((count + 1))
-      sleep 0.5
-    done <<< "$teams"
-  fi
-
-  success.log "Monitor reset — $count teams re-added"
+  # Step 3 — delegate to setup (handles first-team-as-window-0 + sync)
+  tronMonitor.setup
 }
 
-tronMonitor.verify() # # ground-truth check: what team is the monitor currently displaying + does it match the title?
+tronMonitor.verify() # # informational status: per-window attach health + currently-displayed team
 {
-  local content
-  content=$(private.tronMonitor.screen.capture) || {
-    error.log "Cannot capture screen — is tronMon running?"
-    return 1
-  }
-
   echo -e "${BOLD_CYAN}TRON Monitor Verify${NORMAL}"
   echo -e "${GRAY}──────────────────────────────────${NORMAL}"
 
-  # Show last 3 non-empty content lines (what's on screen now)
-  echo "$content" | grep -v '^$' | tail -3
+  # Section A — per-window attach health (ps-based, non-invasive)
+  # Each tracked window should have a `tmux attach -r -t <team>` process running
+  # as a grandchild of the tronMon screen pid. If process exists → green; missing → red.
+  local screenPid
+  screenPid=$(screen -ls 2>/dev/null | grep -oE '[0-9]+\.'"$(private.tronMonitor.screenSession)" | head -1 | cut -d. -f1)
+  if [ -z "$screenPid" ]; then
+    echo -e "  ${BOLD_RED}screen session not running — run 'tronMonitor setup'${NORMAL}"
+    return 0
+  fi
 
-  echo -e "${GRAY}──────────────────────────────────${NORMAL}"
-
-  # Identify displayed team by searching capture for any tracked-team signature
-  local foundTeam="" foundNum=""
+  local total=0 healthy=0 broken=0
   if [ -f "$TRON_MONITOR_ENV" ] && [ -s "$TRON_MONITOR_ENV" ]; then
+    echo -e "${BOLD_WHITE}Per-window attach health:${NORMAL}"
     while IFS='|' read -r num sess; do
       [ -z "$sess" ] && continue
-      local prefix="${sess:0:10}"
-      if echo "$content" | grep -q "$prefix"; then
-        foundTeam="$sess"
-        foundNum="$num"
-        break
+      total=$((total + 1))
+      # Check ps for the exact tmux attach -r -t <sess> command
+      if ps -eo args= 2>/dev/null | grep -qE "tmux attach -r -t ${sess}\$"; then
+        printf "  ${BOLD_GREEN}✓${NORMAL} %-4s ${GREEN}%s${NORMAL}\n" "$num" "$sess"
+        healthy=$((healthy + 1))
+      else
+        printf "  ${BOLD_RED}✗${NORMAL} %-4s ${RED}%s${NORMAL} ${GRAY}(no attach process)${NORMAL}\n" "$num" "$sess"
+        broken=$((broken + 1))
       fi
     done < "$TRON_MONITOR_ENV"
-  fi
-
-  # Pane-title claim (what env+title say is displayed)
-  local titleClaim
-  titleClaim=$(otmux pane.get "$(private.tronMonitor.pane)" '#{pane_title}' 2>/dev/null | sed 's/^TRON-Monitor: *//')
-
-  if [ -n "$foundTeam" ]; then
-    echo -e "  Window:  ${BOLD_WHITE}$foundNum${NORMAL}"
-    echo -e "  Showing: ${BOLD_GREEN}$foundTeam${NORMAL}"
-    if [ -n "$titleClaim" ] && [ "$titleClaim" != "$foundTeam" ] && [ "$titleClaim" != "⚠ MISMATCH" ]; then
-      echo -e "  Title claims: ${BOLD_RED}$titleClaim${NORMAL} ${RED}(MISMATCH — title lies)${NORMAL}"
-      return 1
+    echo -e "${GRAY}──────────────────────────────────${NORMAL}"
+    if [ "$broken" -eq 0 ]; then
+      echo -e "  ${BOLD_GREEN}$healthy/$total windows healthy${NORMAL}"
+    else
+      echo -e "  ${BOLD_YELLOW}$healthy/$total healthy${NORMAL} — ${BOLD_RED}$broken broken${NORMAL} (run ${CYAN}tronMonitor reset${NORMAL} to rebuild)"
     fi
   else
-    local hasPrompt
-    hasPrompt=$(echo "$content" | grep -c 'oosh\|donges@\|root@') || true
-    if [ "$hasPrompt" -gt 0 ]; then
-      echo -e "  Showing: ${BOLD_YELLOW}bare shell (no tmux attach)${NORMAL}"
-    else
-      echo -e "  Showing: ${GRAY}unknown content${NORMAL}"
-    fi
-    [ -n "$titleClaim" ] && [ "$titleClaim" != "⚠ MISMATCH" ] && \
-      echo -e "  Title claims: ${BOLD_RED}$titleClaim${NORMAL} ${RED}(no matching team signature found)${NORMAL}"
-    return 1
+    echo -e "  ${GRAY}No teams tracked${NORMAL}"
   fi
+
+  # Section B — currently-displayed window (best-effort capture)
+  local content
+  content=$(private.tronMonitor.screen.capture)
+  if [ -n "$content" ]; then
+    echo -e "${GRAY}──────────────────────────────────${NORMAL}"
+    echo -e "${BOLD_WHITE}Currently displayed:${NORMAL}"
+
+    # Extract any tracked-team name appearing in capture. Handle tmux's
+    # 9-char truncation in status bar by progressively shortening prefix.
+    local foundTeam="" foundNum=""
+    while IFS='|' read -r num sess; do
+      [ -z "$sess" ] && continue
+      # Try full name first, then progressively shorter prefixes (down to 8 chars)
+      for len in ${#sess} 10 9 8; do
+        [ "$len" -gt "${#sess}" ] && continue
+        local prefix="${sess:0:$len}"
+        [ "${#prefix}" -lt 4 ] && continue
+        if echo "$content" | grep -qF "$prefix"; then
+          foundTeam="$sess"
+          foundNum="$num"
+          break 2
+        fi
+      done
+    done < "$TRON_MONITOR_ENV"
+
+    local titleClaim
+    titleClaim=$(otmux pane.get "$(private.tronMonitor.pane)" '#{pane_title}' 2>/dev/null | sed 's/^TRON-Monitor: *//')
+
+    if [ -n "$foundTeam" ]; then
+      echo -e "  ${BOLD_GREEN}window $foundNum → $foundTeam${NORMAL}"
+      if [ -n "$titleClaim" ] && [ "$titleClaim" != "$foundTeam" ] && [ "$titleClaim" != "⚠ MISMATCH" ]; then
+        echo -e "  ${BOLD_RED}title claims: $titleClaim — MISMATCH${NORMAL}"
+      fi
+    else
+      echo -e "  ${GRAY}(could not identify team from capture — content may be agent-pane prompt)${NORMAL}"
+      [ -n "$titleClaim" ] && [ "$titleClaim" != "⚠ MISMATCH" ] && echo -e "  title says: ${CYAN}$titleClaim${NORMAL}"
+    fi
+    # Show last 3 non-empty content lines for human inspection
+    echo -e "${GRAY}last 3 lines of capture:${NORMAL}"
+    echo "$content" | grep -v '^$' | tail -3 | sed 's/^/    /'
+  fi
+
+  # Verify is purely informational — no rc=1 so the trap doesn't spam EPERM.
+  return 0
 }
 
 tronMonitor.usage()
