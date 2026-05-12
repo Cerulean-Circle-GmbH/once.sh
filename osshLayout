@@ -165,6 +165,13 @@ osshLayout.role.owner() # <?sshDir:~/.ssh> # ensures owner keypair exists and cr
   # paths. Each file is self-contained: deleting the canonical id_ed25519
   # doesn't break the aliases. Install rebuilds the layout from scratch so
   # "edit once, propagate" doesn't matter here.
+  #
+  # rm -f before cp: if the destination is already a symlink back to the
+  # source (the pre-Phase-2 layout), cp would refuse with "are the same
+  # file". The rm forces cp to write a real file. Idempotent on the
+  # already-canonical case too (rm -f on a real file followed by cp).
+  rm -f "$sshDir/private_key/ssh.${ownerId}.private_key"
+  rm -f "$sshDir/public_keys/ssh.${ownerId}.public_key"
   cp "$sshDir/id_ed25519"     "$sshDir/private_key/ssh.${ownerId}.private_key"
   cp "$sshDir/id_ed25519.pub" "$sshDir/public_keys/ssh.${ownerId}.public_key"
 
@@ -228,7 +235,8 @@ osshLayout.role.installer() # <?installerEmail> <?keypairSourceDir> <?sshDir:~/.
   # Repair-mode tolerance: if no email arg + nothing staged, discover an
   # existing installer dir under <sshDir>/ids/. Exactly one non-role dir
   # (i.e. not ssh.developking / ssh.outeruser) with a keypair == the
-  # installer; reuse it as-is and let perms.tighten normalise it.
+  # installer. Re-normalise the dir's private_key/ + public_keys/ entries
+  # to real files (replacing any forbidden symlinks), then return.
   if [ -z "$email" ] && ! private.osshLayout.staged.has.keypair installer; then
     local _d _candidates=()
     for _d in "$sshDir/ids/ssh."*/; do
@@ -239,8 +247,26 @@ osshLayout.role.installer() # <?installerEmail> <?keypairSourceDir> <?sshDir:~/.
       _candidates+=("$_name")
     done
     if [ "${#_candidates[@]}" -eq 1 ]; then
-      important.log "osshLayout.role.installer: existing ${_candidates[0]} found at $sshDir/ids/ — repair-mode skip"
-      create.result 0 "${_candidates[0]}"
+      local _existing="${_candidates[0]}"
+      local _existingId="${_existing#ssh.}"
+      local _existingDir="$sshDir/ids/$_existing"
+      # Determine which keypair type lives in the dir (ed25519 or rsa).
+      local _priv _pub
+      if [ -f "$_existingDir/id_ed25519" ]; then
+        _priv="$_existingDir/id_ed25519"; _pub="$_existingDir/id_ed25519.pub"
+      else
+        _priv="$_existingDir/id_rsa"; _pub="$_existingDir/id_rsa.pub"
+      fi
+      # Normalize: replace any pre-existing symlinks at the canonical names
+      # with real-file copies. rm -f before cp so cp can't refuse with
+      # "are the same file" when the dest is a symlink to the source.
+      mkdir -p "$_existingDir/private_key" "$_existingDir/public_keys"
+      rm -f "$_existingDir/private_key/ssh.${_existingId}.private_key"
+      rm -f "$_existingDir/public_keys/ssh.${_existingId}.public_key"
+      [ -f "$_priv" ] && cp "$_priv" "$_existingDir/private_key/ssh.${_existingId}.private_key"
+      [ -f "$_pub" ]  && cp "$_pub"  "$_existingDir/public_keys/ssh.${_existingId}.public_key"
+      important.log "osshLayout.role.installer: existing $_existing normalised at $_existingDir — repair-mode"
+      create.result 0 "$_existing"
       return 0
     fi
   fi
@@ -315,11 +341,28 @@ osshLayout.role.outeruser() # <?sourceDir> <?sshDir:~/.ssh> # builds <sshDir>/id
   local dst="$sshDir/ids/ssh.outeruser"
 
   # Repair-mode tolerance: if no sourceDir + nothing staged + dst already
-  # populated (id_ed25519.pub present), reuse it as-is. perms.tighten will
-  # normalise. Skip-on-already-correct makes the role a true no-op when
-  # called on a post-install machine whose /tmp/oosh.outer.* is long gone.
+  # populated (id_ed25519.pub present), reuse it as-is. Normalise any
+  # forbidden symlinks inside private_key/ + public_keys/ to real files.
   if [ -z "$sourceDir" ] && ! private.osshLayout.staged.has.pubkey outer && [ -f "$dst/id_ed25519.pub" ]; then
-    important.log "osshLayout.role.outeruser: existing ssh.outeruser found at $dst — repair-mode skip"
+    # Look up the outer id from the existing public_keys/ssh.<id>.public_key file.
+    local _outerKey _outerId=""
+    for _outerKey in "$dst/public_keys/ssh."*.public_key; do
+      [ -f "$_outerKey" ] || continue
+      local _n="${_outerKey##*/}"; _n="${_n%.public_key}"; _outerId="${_n#ssh.}"; break
+    done
+    # Pubkey side: always replace with real-file copy.
+    if [ -n "$_outerId" ]; then
+      mkdir -p "$dst/public_keys"
+      rm -f "$dst/public_keys/ssh.${_outerId}.public_key"
+      cp "$dst/id_ed25519.pub" "$dst/public_keys/ssh.${_outerId}.public_key"
+    fi
+    # Privkey side: only if a private key actually lives here (test-mode shape).
+    if [ -f "$dst/id_ed25519" ] && [ -n "$_outerId" ]; then
+      mkdir -p "$dst/private_key"
+      rm -f "$dst/private_key/ssh.${_outerId}.private_key"
+      cp "$dst/id_ed25519" "$dst/private_key/ssh.${_outerId}.private_key"
+    fi
+    important.log "osshLayout.role.outeruser: existing ssh.outeruser normalised at $dst — repair-mode"
     create.result 0 "ssh.outeruser"
     return 0
   fi
@@ -417,10 +460,14 @@ osshLayout.build() # <?installerEmail> <?installerKeypairSrc> <?sshDir:~/.ssh> #
   local installerResult="$RESULT"
 
   # role.outeruser: prefer staged /tmp/oosh.outer.* (no args), which handles
-  # both full-keypair (test mode) and pubkey-only (ProxyJump) shapes. If
-  # nothing is staged at all, fall back to mirroring the installer ids folder
-  # (standalone use without staging — preserves backward compat).
+  # both full-keypair (test mode) and pubkey-only (ProxyJump) shapes. If the
+  # outer dir is already populated (repair scenario), call with no sourceDir
+  # so the tolerance branch fires and normalises symlinks in place. Only if
+  # NEITHER staging NOR an existing populated dir is available do we fall
+  # back to mirroring the installer ids folder.
   if private.osshLayout.staged.has.pubkey outer; then
+    osshLayout.role.outeruser "" "$sshDir"
+  elif [ -f "$sshDir/ids/ssh.outeruser/id_ed25519.pub" ]; then
     osshLayout.role.outeruser "" "$sshDir"
   else
     osshLayout.role.outeruser "$sshDir/ids/$installerResult" "$sshDir"
