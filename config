@@ -489,45 +489,6 @@ config.usage()
   #loop.list PATH print '---------------------: '
 }
 
-private.config.save.oosh.epilogue() # <oosh.env-path> # ensure oosh.env has the canonical OOSH_DIR self-anchor (prepended) + PATH-builder block + auto-source-log line (appended). Idempotent — checks for existing markers before adding. Required because config.save's grep -v strips OOSH_DIR + the supporting bootstrap lines, so any single-file save (e.g. `oo mode <branch>` → `config save oosh OOSH`) would leave fresh shells unable to resolve $OOSH_DIR.
-{
-  local cfg="$1"
-  [ -f "$cfg" ] || return 0
-
-  # Prepend OOSH_DIR self-anchor if missing. bashrcTemplate sources oosh.env
-  # BEFORE invoking `this`, and the trailing `source "$OOSH_DIR/log"` would
-  # expand to `source /log` without this line. Resolves $HOME/oosh symlink
-  # to its real shared-install path via cd -P to prevent self-loops on
-  # bashrcTemplate's auto-sync ln -s pass.
-  if ! head -1 "$cfg" 2>/dev/null | grep -q '${OOSH_DIR:='; then
-    local tmp="$cfg.tmp.$$"
-    {
-      echo ': ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}'
-      cat "$cfg"
-    } > "$tmp" && mv "$tmp" "$cfg"
-  fi
-
-  # Append PATH-builder + log auto-source if missing. Ensures OOSH_DIR and
-  # brew bash are on PATH for both interactive (bashrc) and non-interactive
-  # (CI, ssh exec, subprocess) shells.
-  if ! grep -q '# Ensure OOSH_DIR is in PATH' "$cfg" 2>/dev/null; then
-    {
-      echo '# Ensure OOSH_DIR is in PATH'
-      echo 'if [ -n "$OOSH_DIR" ] && [[ ":$PATH:" != *":$OOSH_DIR:"* ]]; then'
-      echo '  export PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH"'
-      echo 'fi'
-      echo '# Ensure BASH_FILE directory is first in PATH (e.g. brew bash on macOS)'
-      echo 'if [ -n "$BASH_FILE" ]; then'
-      echo '  _bashDir="$(dirname "$BASH_FILE")"'
-      echo '  if [[ "$PATH" != "$_bashDir:"* ]]; then'
-      echo '    export PATH="$_bashDir:$PATH"'
-      echo '  fi'
-      echo 'fi'
-      echo '[ -f "$OOSH_DIR/log" ] && source "$OOSH_DIR/log"'
-    } >> "$cfg"
-  fi
-}
-
 config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $CONFIG_PATH containing all env variables that match <ENV_PREFIX>
 # without parameters it inititlises the $CONFIG_PATH/user.env
 {
@@ -590,18 +551,6 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   } >$CONFIG
   private.ensure.groupWrite "$CONFIG"
 
-  # If we just rewrote oosh.env via the single-file path (e.g. `oo mode <branch>`
-  # calls `config save oosh OOSH`), the declare-dump alone has no OOSH_DIR
-  # self-anchor / PATH-builder / log auto-source — those are stripped by the
-  # grep -v filters above. Re-ensure the canonical oosh.env epilogue so that
-  # shells started fresh by OTHER users (sudo su / user login / etc.) still
-  # bootstrap correctly. Idempotent: helper checks for existing lines before
-  # adding. Without this, every `oo mode <branch>` silently breaks fresh
-  # shells for all other users on a shared-config install.
-  if [ "$file" = "oosh" ]; then
-    private.config.save.oosh.epilogue "$CONFIG"
-  fi
-
   if [ -z "$file" ]; then
     #problem.log "regenerate config"
 
@@ -643,10 +592,54 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
 
 
     config.save oosh OOSH
-    # config.save with file=oosh now calls private.config.save.oosh.epilogue
-    # internally (see addition above the `if [ -z "$file" ]` block), so the
-    # self-anchor + PATH-builder + auto-source-log lines are already in
-    # oosh.env at this point. No inline epilogue needed here.
+    # Self-anchor OOSH_DIR at the top of oosh.env. Same reasoning as the
+    # CONFIG_PATH self-anchor in user.env: we no longer persist OOSH_DIR's
+    # absolute value (saving user's $HOME/oosh leaks across users when the
+    # config is shared), but bashrcTemplate sources oosh.env BEFORE invoking
+    # `this`, and line 169's `source "$OOSH_DIR/log"` would expand to
+    # `source /log` without OOSH_DIR being set first.
+    #
+    # IMPORTANT: resolve the symlink ($HOME/oosh → real shared-install path)
+    # via `cd -P; pwd`. bashrcTemplate's auto-sync logic at line 177
+    # compares ACTUAL_TARGET=readlink -f $HOME/oosh against OOSH_DIR; if
+    # they differ AND $HOME/oosh is a symlink, it does `rm -f $HOME/oosh
+    # && ln -s "$OOSH_DIR" "$HOME/oosh"`. If we anchored to the literal
+    # `$HOME/oosh` (symlink path), that ln -s would create a self-loop —
+    # observed in the macOS bash-user docker test session manifesting as
+    # `Too many levels of symbolic links`.
+    #
+    # The :- no-op leaves an already-set OOSH_DIR untouched, so contexts
+    # that DID source `this` first (oosh script invocations from PATH) are
+    # unaffected.
+    {
+      echo ': ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}'
+    } | cat - "$CONFIG_PATH/oosh.env" > "$CONFIG_PATH/oosh.env.tmp" && mv "$CONFIG_PATH/oosh.env.tmp" "$CONFIG_PATH/oosh.env"
+    # Append PATH builders to oosh.env — ensures OOSH_DIR and brew bash are in PATH
+    # for both interactive (bashrc) and non-interactive (CI, subprocesses) shells
+    {
+      echo '# Ensure OOSH_DIR is in PATH'
+      echo 'if [ -n "$OOSH_DIR" ] && [[ ":$PATH:" != *":$OOSH_DIR:"* ]]; then'
+      echo '  export PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH"'
+      echo 'fi'
+      echo '# Ensure BASH_FILE directory is first in PATH (e.g. brew bash on macOS)'
+      echo 'if [ -n "$BASH_FILE" ]; then'
+      echo '  _bashDir="$(dirname "$BASH_FILE")"'
+      echo '  if [[ "$PATH" != "$_bashDir:"* ]]; then'
+      echo '    export PATH="$_bashDir:$PATH"'
+      echo '  fi'
+      echo 'fi'
+      # Default LOG_DEVICE / LOG_LIVE for non-bashrc contexts. log.env
+      # no longer persists LOG_DEVICE (it's per-session like LOG_LIVE —
+      # bleed-across-users + EACCES same as the LOG_LIVE class), so any
+      # consumer of $LOG_DEVICE that didn't go through bashrc (workflow
+      # steps, ssh exec, etc.) would otherwise hit `bash: $LOG_DEVICE:
+      # ambiguous redirect`. Sourcing the log script here invokes its
+      # auto-default block at log:11-19 (tty → /proc/self/fd/1 → /dev/null
+      # fallback chain) and the LOG_LIVE re-anchor at log:21-23. Cheap
+      # and idempotent — bashrcTemplate:169 sources it again, no-op the
+      # second time.
+      echo '[ -f "$OOSH_DIR/log" ] && source "$OOSH_DIR/log"'
+    } >> "$CONFIG_PATH/oosh.env"
     private.ensure.groupWrite "$CONFIG_PATH/oosh.env"
     config.save log LOG
     config.file user.env
