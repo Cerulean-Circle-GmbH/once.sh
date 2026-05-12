@@ -589,7 +589,53 @@ scrumMaster.team.capture.completion.session() # # tmux session names
   tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
-scrumMaster.cycle() # <?session> <?interval:0> # one measure+sweep+unblock cycle with optional sleep
+private.scrumMaster.sweep.isStable() # <?session> # 0 if safe to reconcile (no in-flight mutation), 1 otherwise
+{
+  # SC-D.2 stability gate. Conservative: any RECENT lifecycle/mutation process
+  # → skip reconcile this cycle. Reconcile is a safety net, not a hot path —
+  # one missed cycle is harmless; fighting a mid-flight mutation is destructive.
+  #
+  # CRITICAL: filter by RECENCY (etime < 60s). Long-running parent shells like
+  # `bash claudeCode fork ...` persist as agent wrappers — every running Claude
+  # agent looks like a "fork in progress" forever. Recency filter restricts to
+  # actual in-flight ops which finish within seconds.
+  #
+  # Three gate patterns (combined into one awk pass for performance):
+  #   1. claudeCode short-lived mutations: teams.save | teams.restore | session.probe
+  #      (NOT fork/join/new — those are agent wrappers that persist)
+  #   2. hiveMind agent lifecycle: bootstrap | respawn | restart | spawn | rename
+  #   3. tronMonitor lifecycle: setup | reset | add | sync | remove | prune
+  #   4. hiveMind consistency.* — anti-recursion (don't reconcile during reconcile)
+  local session="$1"  # reserved for future per-team gating; gates currently global
+  : "${session:=}"
+
+  local matched
+  matched=$(ps -eo etime,args 2>/dev/null | awk '
+    function et2s(e,   a) {
+      if (split(e, a, "-") == 2) return 86400 * a[1] + 3600*substr(a[2],1,2) + 60*substr(a[2],4,2) + substr(a[2],7,2)
+      if (split(e, a, ":") == 3) return 3600*a[1] + 60*a[2] + a[3]
+      if (split(e, a, ":") == 2) return 60*a[1] + a[2]
+      return e+0
+    }
+    NR == 1 { next }                                            # skip header
+    {
+      sec = et2s($1)
+      if (sec >= 60) next                                       # too old — likely a wrapper, not in-flight
+      line = $0
+      if (line ~ /claudeCode (teams\.(save|restore)|session\.probe)/) { print "claudeCode"; exit }
+      if (line ~ /hiveMind agent\.(bootstrap|respawn|restart|spawn|rename)/) { print "agent-lifecycle"; exit }
+      if (line ~ /tronMonitor (setup|reset|add|sync|remove|prune)/) { print "tronMonitor"; exit }
+      if (line ~ /hiveMind consistency\.(fix|reconcile|audit)/) { print "consistency"; exit }
+    }
+  ')
+  if [ -n "$matched" ]; then
+    debug.log "reconcile gate: recent $matched mutation in flight — skip"
+    return 1
+  fi
+  return 0
+}
+
+scrumMaster.cycle() # <?session> <?interval:0> # one measure+sweep+unblock+reconcile cycle with optional sleep
 {
   local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
   local interval="${2:-0}"
@@ -601,6 +647,16 @@ scrumMaster.cycle() # <?session> <?interval:0> # one measure+sweep+unblock cycle
   scrumMaster.dashboard "$session"
   "$OOSH_DIR/hiveMind" pane.sweep "$session"
   "$OOSH_DIR/hiveMind" agent.unblock all "$session"
+
+  # SC-D.2 — close the safety-net loop: SM sweeps → detects drift → reconcile fixes.
+  # Reconcile in apply mode after sweep+unblock have settled, gated by stability
+  # check so we never mutate against in-flight lifecycle ops. Output is a single
+  # line per the consistency.reconcile contract.
+  if private.scrumMaster.sweep.isStable "$session"; then
+    "$OOSH_DIR/hiveMind" consistency.reconcile "$session" apply
+  else
+    info.log "scrumMaster.cycle: reconcile skipped (mutation in flight)"
+  fi
 }
 scrumMaster.cycle.completion() { :; }
 
