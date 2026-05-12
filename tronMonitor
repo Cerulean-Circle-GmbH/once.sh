@@ -131,6 +131,31 @@ private.tronMonitor.tracked.teams() { # # echo team names tracked in tronMonitor
   done < "$TRON_MONITOR_ENV"
 }
 
+private.tronMonitor.screen.capture() { # <?lines:0> # capture current screen window via hardcopy
+  # Returns the rendered content of the CURRENTLY-SELECTED screen window. Used
+  # by switch.verify and verify methods to ground-truth what's actually displayed
+  # (screen window content is the single source of truth, not tronMonitor.env).
+  local screenName captureFile content
+  screenName=$(private.tronMonitor.fullScreenName)
+  [ -z "$screenName" ] && return 1
+  captureFile="/tmp/tronMon.capture.$$"
+  screen -S "$screenName" -X hardcopy "$captureFile" 2>/dev/null || return 1
+  [ -f "$captureFile" ] || return 1
+  content=$(strings "$captureFile" 2>/dev/null)
+  rm -f "$captureFile"
+  echo "$content"
+}
+
+private.tronMonitor.screen.showsTeam() { # <teamSession> # 0 if screen capture contains team's tmux status signature
+  # tmux status bar shows session name at the left; capture should contain it.
+  # Use first 10 chars to tolerate truncation in narrow panes.
+  local team="$1"
+  [ -z "$team" ] && return 1
+  local content
+  content=$(private.tronMonitor.screen.capture) || return 1
+  echo "$content" | grep -q "${team:0:10}"
+}
+
 tronMonitor.setup() # <?monitorPane:TRONinterface:0.3> # idempotent — start screen with one window per registered team
 {
   # D1.3/D1.10 — idempotent setup matching Tron's proven recipe:
@@ -296,15 +321,21 @@ tronMonitor.add.completion.teamSession() {
   otmux sessions -F "#{session_name}" 2>/dev/null
 }
 
-tronMonitor.switch() # <teamSession> # switch monitor to show a specific team (by name)
+tronMonitor.switch() # <teamSession> # switch monitor to show a team — verifies screen actually switched before updating title
 {
+  # MVC state-sync (Tron 3-bug fix):
+  #   1. SELECT screen window via index (-X select N — reliable across screen versions)
+  #   2. VERIFY screen capture contains team signature (ground truth, not env)
+  #   3. UPDATE pane title ONLY if verified (title was previously the lie that said
+  #      "upDownTeam" while screen still showed web4team)
+  # If verification fails: leave title unchanged + error.log + non-zero rc, so Tron
+  # sees the mismatch immediately rather than a wrong header.
   local teamSession="$1"
   if [ -z "$teamSession" ]; then
     error.log "Usage: tronMonitor switch <teamSession>"
     return 1
   fi
 
-  # Require screen to be running — caller should run setup first
   if ! private.tronMonitor.screen.isAlive; then
     error.log "tronMon screen not running — run 'tronMonitor setup' first"
     return 1
@@ -317,8 +348,8 @@ tronMonitor.switch() # <teamSession> # switch monitor to show a specific team (b
 
   # Look up window NUMBER from env. Screen's `-X select <name>` is unreliable
   # across versions (especially old macOS screen); selecting by index works
-  # everywhere. Numbers in env file match screen's assignment because we
-  # truncate-and-recreate on cold start.
+  # everywhere. Numbers in env file match screen's assignment because setup
+  # cold-start creates windows in registry order.
   local windowNum
   windowNum=$(grep "|${teamSession}$" "$TRON_MONITOR_ENV" 2>/dev/null | head -1 | cut -d'|' -f1)
 
@@ -329,10 +360,30 @@ tronMonitor.switch() # <teamSession> # switch monitor to show a specific team (b
 
   local screenName
   screenName=$(private.tronMonitor.fullScreenName)
-  screen -S "$screenName" -X select "$windowNum" 2>/dev/null
 
+  # Step 1: SELECT — fire-and-let-screen-render
+  screen -S "$screenName" -X select "$windowNum" 2>/dev/null
+  sleep 0.4   # give screen time to redraw the new window's content
+
+  # Step 2: VERIFY — capture screen content and check it shows the requested team.
+  # Without this, a stale env file (window N points to wrong team) silently
+  # produces wrong-header + wrong-content. With this, we surface the mismatch.
+  if ! private.tronMonitor.screen.showsTeam "$teamSession"; then
+    # One retry after a longer settle — first capture sometimes races render
+    sleep 0.6
+    if ! private.tronMonitor.screen.showsTeam "$teamSession"; then
+      error.log "tronMonitor: select($windowNum) for '$teamSession' did not produce expected display"
+      error.log "  screen content doesn't show team signature — env may be out of sync with screen windows"
+      error.log "  recover: tronMonitor sync OR tronMonitor reset"
+      # Refresh pane title to honest state (avoid lying "TRON-Monitor: x" header)
+      otmux pane.title "$(private.tronMonitor.pane)" "TRON-Monitor: ⚠ MISMATCH" 2>/dev/null
+      return 1
+    fi
+  fi
+
+  # Step 3: Verified — NOW it is safe to update the displayed-state tag
   otmux pane.title "$(private.tronMonitor.pane)" "TRON-Monitor: $teamSession" 2>/dev/null
-  success.log "Switched to $teamSession (window $windowNum)"
+  success.log "Switched to $teamSession (window $windowNum, verified)"
 }
 tronMonitor.switch.completion.teamSession() {
   [ -f "$TRON_MONITOR_ENV" ] && cut -d'|' -f2 "$TRON_MONITOR_ENV" 2>/dev/null
@@ -549,54 +600,59 @@ tronMonitor.reset() # # kill screen, clear tracking, restart with all tracked te
   success.log "Monitor reset — $count teams re-added"
 }
 
-tronMonitor.verify() # # show what team the monitor is currently displaying
+tronMonitor.verify() # # ground-truth check: what team is the monitor currently displaying + does it match the title?
 {
-  local captureFile="/tmp/tronMon.capture.$$"
-
-  # Capture screen content via hardcopy
-  screen -S "$(private.tronMonitor.fullScreenName)" -X hardcopy "$captureFile" 2>/dev/null || true
-  if [ ! -f "$captureFile" ]; then
+  local content
+  content=$(private.tronMonitor.screen.capture) || {
     error.log "Cannot capture screen — is tronMon running?"
     return 1
-  fi
+  }
 
   echo -e "${BOLD_CYAN}TRON Monitor Verify${NORMAL}"
   echo -e "${GRAY}──────────────────────────────────${NORMAL}"
 
-  # Show last 3 non-empty content lines
-  strings "$captureFile" 2>/dev/null | grep -v '^$' | tail -3
+  # Show last 3 non-empty content lines (what's on screen now)
+  echo "$content" | grep -v '^$' | tail -3
 
   echo -e "${GRAY}──────────────────────────────────${NORMAL}"
 
-  # Identify team: check each tracked team's content signature in the hardcopy
-  local foundTeam=""
+  # Identify displayed team by searching capture for any tracked-team signature
+  local foundTeam="" foundNum=""
   if [ -f "$TRON_MONITOR_ENV" ] && [ -s "$TRON_MONITOR_ENV" ]; then
-    local content
-    content=$(strings "$captureFile" 2>/dev/null)
     while IFS='|' read -r num sess; do
       [ -z "$sess" ] && continue
-      # tmux status bar truncates session names — check for prefix match
       local prefix="${sess:0:10}"
       if echo "$content" | grep -q "$prefix"; then
         foundTeam="$sess"
-        echo -e "  Window:  ${BOLD_WHITE}$num${NORMAL}"
-        echo -e "  Showing: ${BOLD_GREEN}$sess${NORMAL}"
+        foundNum="$num"
         break
       fi
     done < "$TRON_MONITOR_ENV"
   fi
 
-  if [ -z "$foundTeam" ]; then
+  # Pane-title claim (what env+title say is displayed)
+  local titleClaim
+  titleClaim=$(otmux pane.get "$(private.tronMonitor.pane)" '#{pane_title}' 2>/dev/null | sed 's/^TRON-Monitor: *//')
+
+  if [ -n "$foundTeam" ]; then
+    echo -e "  Window:  ${BOLD_WHITE}$foundNum${NORMAL}"
+    echo -e "  Showing: ${BOLD_GREEN}$foundTeam${NORMAL}"
+    if [ -n "$titleClaim" ] && [ "$titleClaim" != "$foundTeam" ] && [ "$titleClaim" != "⚠ MISMATCH" ]; then
+      echo -e "  Title claims: ${BOLD_RED}$titleClaim${NORMAL} ${RED}(MISMATCH — title lies)${NORMAL}"
+      return 1
+    fi
+  else
     local hasPrompt
-    hasPrompt=$(strings "$captureFile" 2>/dev/null | grep -c 'oosh\|donges@\|root@') || true
+    hasPrompt=$(echo "$content" | grep -c 'oosh\|donges@\|root@') || true
     if [ "$hasPrompt" -gt 0 ]; then
       echo -e "  Showing: ${BOLD_YELLOW}bare shell (no tmux attach)${NORMAL}"
     else
       echo -e "  Showing: ${GRAY}unknown content${NORMAL}"
     fi
+    [ -n "$titleClaim" ] && [ "$titleClaim" != "⚠ MISMATCH" ] && \
+      echo -e "  Title claims: ${BOLD_RED}$titleClaim${NORMAL} ${RED}(no matching team signature found)${NORMAL}"
+    return 1
   fi
-
-  rm -f "$captureFile"
 }
 
 tronMonitor.usage()
