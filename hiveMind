@@ -3239,6 +3239,154 @@ hiveMind.team.activate() # <session> # set active team (alias for team.switch)
   hiveMind.team.switch "$@"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SC-A.1 — reconcile.diff primitive (Sprint 1 state-correctness foundation)
+# Single source-of-truth diff between cached state (S1-S10) and ground truth
+# (L1-L3) per sprint-1-design.md §3. Pure: no writes, no side effects.
+# Used by: consistency.audit (read-only), consistency.fix (apply w/ confirm),
+#          consistency.reconcile (apply silently via --apply, SM-cycle caller).
+# Output format (one line per mutation):
+#   <severity>|<invariant>|<store>|<op>|<key>|<expected>|<actual>
+# Severities: CRITICAL / HIGH / MEDIUM / LOW (per U2 graded audit lock)
+# Ops: ADD / REMOVE / UPDATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.reconcile.diff() # <?invariant:all> # emit mutations needed to reconcile caches to live truth
+{
+  # Optional <?invariant> filter to check only one of i1..i7 (unit-test hook).
+  # Default 'all' runs every check in CRITICAL → HIGH → MEDIUM → LOW order
+  # (stable output: severity descending, then invariant id ascending within tier).
+  local only="${1:-all}"
+  if [ "$only" = "all" ] || [ "$only" = "i3" ]; then private.hiveMind.reconcile.check.i3; fi
+  if [ "$only" = "all" ] || [ "$only" = "i7" ]; then private.hiveMind.reconcile.check.i7; fi
+  if [ "$only" = "all" ] || [ "$only" = "i1" ]; then private.hiveMind.reconcile.check.i1; fi
+  if [ "$only" = "all" ] || [ "$only" = "i2" ]; then private.hiveMind.reconcile.check.i2; fi
+  if [ "$only" = "all" ] || [ "$only" = "i4" ]; then private.hiveMind.reconcile.check.i4; fi
+  if [ "$only" = "all" ] || [ "$only" = "i5" ]; then private.hiveMind.reconcile.check.i5; fi
+  if [ "$only" = "all" ] || [ "$only" = "i6" ]; then private.hiveMind.reconcile.check.i6; fi
+  return 0
+}
+private.hiveMind.reconcile.diff.completion.invariant() {
+  echo "all"; for i in 1 2 3 4 5 6 7; do echo "i$i"; done
+}
+
+private.hiveMind.reconcile.check.i1() { # # I1 (HIGH): every pane in S1 exists in L1
+  # Stale role entry for a pane that's no longer in tmux.
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  while IFS='|' read -r pane role rest; do
+    [ -z "$pane" ] || [[ "$pane" == "#"* ]] && continue
+    # L1 check — does the pane still exist?
+    if ! tmux list-panes -t "$pane" -F '#{pane_id}' >/dev/null 2>&1; then
+      echo "HIGH|I1|S1|REMOVE|${pane}|<not-in-tmux>|${role:-}"
+    fi
+  done < "$reg"
+}
+
+private.hiveMind.reconcile.check.i2() { # # I2 (HIGH): every pane in S2 is in S1, UUID matches live ps
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  [ -f "$ses" ] || return 0
+  while IFS='|' read -r pane cachedUuid rest; do
+    [ -z "$pane" ] || [[ "$pane" == "#"* ]] && continue
+    # (a) Pane must be in S1 (else S2 entry is orphan)
+    if [ -f "$reg" ] && ! grep -q "^${pane}|" "$reg" 2>/dev/null; then
+      echo "HIGH|I2|S2|REMOVE|${pane}|<not-in-S1>|${cachedUuid}"
+      continue
+    fi
+    # (b) Cached UUID must match live Claude on that pane (if Claude running)
+    local liveUuid
+    liveUuid=$("$OOSH_DIR/claudeCode" session.current "$pane" 2>/dev/null)
+    if [ -n "$liveUuid" ] && [ -n "$cachedUuid" ] && [ "$liveUuid" != "$cachedUuid" ]; then
+      echo "HIGH|I2|S2|UPDATE|${pane}|${liveUuid}|${cachedUuid}"
+    fi
+  done < "$ses"
+}
+
+private.hiveMind.reconcile.check.i3() { # # I3 (CRITICAL): every team in S3 is a live tmux session
+  # The Did/you/mean garbage class. Fixed at ingress (ebc8b5e) but reconcile
+  # catches anything that slipped past (e.g. legacy entries from before ebc8b5e).
+  local teams="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$teams" ] || return 0
+  while IFS='|' read -r session desc; do
+    [ -z "$session" ] || [[ "$session" == "#"* ]] && continue
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+      echo "CRITICAL|I3|S3|REMOVE|${session}|<not-in-tmux>|${desc:-}"
+    fi
+  done < "$teams"
+}
+
+private.hiveMind.reconcile.check.i4() { # # I4 (MEDIUM): tronMonitor.env (S8) ⊂ teams.env (S3)
+  local monEnv="${TRON_MONITOR_ENV:-${CONFIG_PATH:-$HOME/config}/tronMonitor.env}"
+  local teams="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$monEnv" ] || return 0
+  [ -f "$teams" ] || return 0
+  while IFS='|' read -r winNum session; do
+    [ -z "$winNum" ] || [ -z "$session" ] && continue
+    if ! grep -q "^${session}|" "$teams" 2>/dev/null; then
+      echo "MEDIUM|I4|S8|REMOVE|${session}|<not-in-S3>|window-${winNum}"
+    fi
+  done < "$monEnv"
+}
+
+private.hiveMind.reconcile.check.i5() { # # I5 (MEDIUM): snapshot UUID JSONL exists on disk
+  local snap="${HIVEMIND_SNAPSHOTS:-${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}"
+  [ -f "$snap" ] || return 0
+  while IFS='|' read -r role uuid ts ctxPct; do
+    [ -z "$role" ] || [[ "$role" == "#"* ]] && continue
+    [ -z "$uuid" ] && continue
+    # JSONL must exist somewhere under ~/.claude/projects/*/
+    local found=""
+    for dir in "$HOME/.claude/projects"/*/; do
+      [ -f "${dir}${uuid}.jsonl" ] && found="yes" && break
+    done
+    if [ -z "$found" ]; then
+      echo "MEDIUM|I5|S4|UPDATE|${role}|<jsonl-missing>|${uuid}"
+    fi
+  done < "$snap"
+}
+
+private.hiveMind.reconcile.check.i6() { # # I6 (LOW): queue files reference valid panes
+  local queueDir="${CONFIG_PATH:-$HOME/config}/hivemind.queue"
+  [ -d "$queueDir" ] || return 0
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local f base pane
+  for f in "$queueDir"/*.queue; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .queue)
+    # Queue filenames encode pane as 'session__win__pane' or 'session:win.pane'
+    # — accept either convention. Normalize __ → : / . for comparison.
+    pane=$(echo "$base" | sed 's/__/:/' | sed 's/__/./')
+    if [ -f "$reg" ] && ! grep -q "^${pane}|" "$reg" 2>/dev/null; then
+      echo "LOW|I6|S6|REMOVE|${base}|<pane-not-in-S1>|${f}"
+    fi
+  done
+}
+
+hiveMind.protected.reconcile.diff() # <?invariant:all> # CLI-callable wrapper for tests/diagnostics; SC-A.2 will layer consistency.audit on top
+{
+  private.hiveMind.reconcile.diff "$@"
+}
+hiveMind.protected.reconcile.diff.completion.invariant() {
+  private.hiveMind.reconcile.diff.completion.invariant
+}
+
+private.hiveMind.reconcile.check.i7() { # # I7 (CRITICAL): tronMonitor display matches title
+  # Active check — requires screen capture, slow (~0.5s). Skip if tronMonitor
+  # not running. tronMonitor.verify is the single source of truth here.
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  # tronMonitor.verify returns rc=1 on mismatch (added in aa7d6ac)
+  local verifyOut
+  verifyOut=$(tronMonitor verify 2>&1)
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Parse "Title claims: X (MISMATCH ...)" line for context
+    local claim
+    claim=$(echo "$verifyOut" | grep -oE "Title claims: [^ ]+" | head -1 | sed 's/Title claims: //')
+    echo "CRITICAL|I7|S8|UPDATE|tronMonitor|<screen-content>|${claim:-<unknown>}"
+  fi
+}
+
 hiveMind.consistency.audit() # <?session> # cross-compare all identity sources and show mismatches
 {
   local filter_session="$1"
