@@ -599,6 +599,124 @@ private.hiveMind.handler.pane.moved.role_env() {
   [ -n "$role" ] && private.hiveMind.pane.pushRoleEnv "$to" "$role"
 }
 
+# ── SC-C.8 team.created ─── args: <session> <?description> ─────────────────
+# Fired after team.register confirms a session is a valid live tmux team.
+# Handlers:
+#   - teams:       append session|description to teams.env (Idempotent — caller
+#                  already wrote the row; this handler is a write-through audit
+#                  hook in case future emitters bypass team.register)
+#   - tronMonitor: open a monitor window for the team (closes V→C event-gap —
+#                  was a direct call in team.register, now an event handler)
+
+private.hiveMind.handler.team.created.teams() {
+  local session="$1" description="$2"
+  [ -z "$session" ] && return 0
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  # Idempotent: only append if not already present (team.register's own write
+  # is the primary path; this catches emitters that bypass it).
+  [ -f "$teamsFile" ] && grep -q "^${session}|" "$teamsFile" 2>/dev/null && return 0
+  private.hiveMind.teams.ensure.dir 2>/dev/null
+  echo "${session}|${description}" >> "$teamsFile"
+}
+
+private.hiveMind.handler.team.created.tronMonitor() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  # Soft-fail per U1 — tronMonitor add may fail (screen not running, name
+  # collision); registration succeeded regardless.
+  tronMonitor add "$session" 2>/dev/null || \
+    info.log "tronMonitor add failed/skipped for $session (non-fatal)"
+}
+
+# ── SC-C.9 team.destroyed ─── args: <session> ──────────────────────────────
+# Fired after team.remove confirms the team is gone. Cascade-cleans:
+#   - teams:        remove row from teams.env (idempotent — caller may have
+#                   already done this; safe to re-run)
+#   - tronMonitor:  close monitor window
+#   - registry:     prune all pane entries belonging to this session (S1)
+#   - sessions:     prune all pane entries belonging to this session (S2)
+#   - queue:        remove queue files for panes in this session (S6)
+
+private.hiveMind.handler.team.destroyed.teams() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$teamsFile" ] || return 0
+  grep -v "^${session}|" "$teamsFile" > "${teamsFile}.tmp" 2>/dev/null
+  mv "${teamsFile}.tmp" "$teamsFile"
+}
+
+private.hiveMind.handler.team.destroyed.tronMonitor() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  tronMonitor remove "$session" 2>/dev/null || \
+    info.log "tronMonitor remove failed/skipped for $session (non-fatal)"
+}
+
+private.hiveMind.handler.team.destroyed.registry() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  grep -v "^${session}:" "$reg" > "${reg}.tmp" 2>/dev/null
+  mv "${reg}.tmp" "$reg"
+}
+
+private.hiveMind.handler.team.destroyed.sessions() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  local sess="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  [ -f "$sess" ] || return 0
+  grep -v "^${session}:" "$sess" > "${sess}.tmp" 2>/dev/null
+  mv "${sess}.tmp" "$sess"
+}
+
+private.hiveMind.handler.team.destroyed.queue() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  # queue files are at $CONFIG_PATH/hivemind.queue/<session>:<addr>.queue
+  local queueDir="${CONFIG_PATH:-$HOME/config}/hivemind.queue"
+  [ -d "$queueDir" ] || return 0
+  # Match files starting with "<session>:" prefix (literal colon). Use a
+  # glob expansion guard so unmatched-pattern returns no files cleanly.
+  local f
+  shopt -s nullglob
+  for f in "$queueDir/${session}:"*.queue; do
+    [ -f "$f" ] && rm -f "$f"
+  done
+  shopt -u nullglob
+  return 0
+}
+
+# ── SC-C.10 team.restored ─── args: <session> ──────────────────────────────
+# Fired after teams.restore re-creates a team from snapshot (B2 layout +
+# claudeCode join.byID per pane). Handlers:
+#   - teams:       ensure teams.env has the row (idempotent — teams.restore
+#                  calls team.register which writes; this handler is a
+#                  fallback if direct restore-paths bypass team.register)
+#   - tronMonitor: re-add monitor window for the restored team
+# NOTE: per-agent registry/sessions are repopulated by agent.spawned/agent.forked
+# events fired during the restore pass, not by team.restored.
+
+private.hiveMind.handler.team.restored.teams() {
+  local session="$1" description="$2"
+  [ -z "$session" ] && return 0
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$teamsFile" ] && grep -q "^${session}|" "$teamsFile" 2>/dev/null && return 0
+  private.hiveMind.teams.ensure.dir 2>/dev/null
+  echo "${session}|${description}" >> "$teamsFile"
+}
+
+private.hiveMind.handler.team.restored.tronMonitor() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  tronMonitor add "$session" 2>/dev/null || \
+    info.log "tronMonitor add failed/skipped for $session (non-fatal)"
+}
+
 # ── Registration (script-load) ───────────────────────────────────────────────
 
 private.hiveMind.events.register "agent.spawned" "private.hiveMind.handler.agent.spawned.registry"
@@ -617,6 +735,16 @@ private.hiveMind.events.register "panes.shifted" "private.hiveMind.handler.panes
 # Order matters: registry mutates first, role_env reads post-mutation state
 private.hiveMind.events.register "panes.swapped" "private.hiveMind.handler.panes.swapped.registry"
 private.hiveMind.events.register "panes.swapped" "private.hiveMind.handler.panes.swapped.role_env"
+# SC-C.8/9/10 team lifecycle — closes V→C event-gap for team.register/remove/restore
+private.hiveMind.events.register "team.created"   "private.hiveMind.handler.team.created.teams"
+private.hiveMind.events.register "team.created"   "private.hiveMind.handler.team.created.tronMonitor"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.teams"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.tronMonitor"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.registry"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.sessions"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.queue"
+private.hiveMind.events.register "team.restored"  "private.hiveMind.handler.team.restored.teams"
+private.hiveMind.events.register "team.restored"  "private.hiveMind.handler.team.restored.tronMonitor"
 private.hiveMind.events.register "pane.moved"    "private.hiveMind.handler.pane.moved.registry"
 private.hiveMind.events.register "pane.moved"    "private.hiveMind.handler.pane.moved.role_env"
 
@@ -2950,10 +3078,15 @@ hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> # cold-restart team
   done 3< "$snapfile"
 
   # C1: re-register teams that were active
+  # SC-C.10: team.register emits team.created (first creation semantics).
+  # We also emit team.restored per-team so handlers can apply restore-specific
+  # behavior (e.g. annotate as restored, run consistency reconcile). Both
+  # handler chains are idempotent; firing both is intentional.
   for sess in "${uniqueSessions[@]}"; do
     [ -z "$sess" ] && continue
     if otmux has "$sess" 2>/dev/null; then
       hiveMind.team.register "$sess" "Restored from $(basename "$snapfile")" 2>/dev/null
+      private.hiveMind.events.emit "team.restored" "$sess" "$(basename "$snapfile")"
     fi
   done
 
@@ -5457,14 +5590,10 @@ hiveMind.team.register() # <session> <?description> # register a team session in
     info.log "Auto-switched active team to: $session"
   fi
 
-  # D2.1 — observer: notify tronMonitor to add a monitor window for this team.
-  # Same pattern as otmux.session.rename → hiveMind.protected.session.renamed.
-  # Soft-fail: if tronMonitor isn't installed or the add fails, registration
-  # still succeeds — monitoring is enhancement, not prerequisite.
-  if command -v tronMonitor >/dev/null 2>&1; then
-    tronMonitor add "$session" 2>/dev/null || \
-      info.log "tronMonitor add failed/skipped for $session (non-fatal)"
-  fi
+  # SC-C.8 — emit team.created. Handlers fan out to teams.env (idempotent
+  # write-through audit) and tronMonitor.add. Replaces the prior direct
+  # `tronMonitor add` call (D2.1) which is now a handler.
+  private.hiveMind.events.emit "team.created" "$session" "$description"
 }
 hiveMind.team.remove() # <session> # unregister a team session
 {
@@ -5485,13 +5614,12 @@ hiveMind.team.remove() # <session> # unregister a team session
     return 1
   fi
 
-  # D2.2 — observer: tell tronMonitor to remove its monitor window BEFORE we
-  # drop the team from the registry. If tronMonitor isn't installed or the
-  # team has no monitor window, soft-fail and continue with the unregister.
-  if command -v tronMonitor >/dev/null 2>&1; then
-    tronMonitor remove "$session" 2>/dev/null || \
-      info.log "tronMonitor remove failed/skipped for $session (non-fatal)"
-  fi
+  # SC-C.9 — emit team.destroyed. Handlers fan out: teams.env row removal,
+  # tronMonitor.remove, plus full S1/S2/S6 cleanup (pane entries in roles.env,
+  # sessions.env, and queue files belonging to this session). The team.remove
+  # caller also writes to teams.env below for the legacy synchronous path,
+  # which the teams handler treats as idempotent.
+  private.hiveMind.events.emit "team.destroyed" "$session"
 
   grep -v "^${session}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null
   mv "${HIVEMIND_TEAMS}.tmp" "$HIVEMIND_TEAMS"
