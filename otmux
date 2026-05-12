@@ -1737,6 +1737,50 @@ private.otmux.send.prefix() # # return sender prefix [@role pane] or empty strin
   [ -n "$myRole" ] && echo "[@${myRole} ${myPane}] "
 }
 
+private.otmux.is.key() # <token> # 0 if token is a tmux key name (no prefix), 1 if prose
+{
+  # SINGLE SOURCE OF TRUTH for key-vs-prose detection. Called by otmux.send to
+  # decide whether to apply the sender prefix. Per PO directive (2026-05-12,
+  # Tron P0): prefix is for INFORM-path prose ONLY; every key send must be
+  # prefix-free. Detection covers:
+  #   1. Any single non-whitespace char (digits, letters, punctuation)
+  #   2. Named tmux keys (case-insensitive — covers user typos like 'enter')
+  #   3. Modifier-prefix combinations: C-x, M-x, S-x, C-M-Up, etc.
+  #   4. Plus-syntax shortcuts: Shift+Tab, Ctrl+C, Alt+M
+  local t="$1"
+  [ -z "$t" ] && return 1
+
+  # 1. Single non-whitespace char
+  [[ "$t" =~ ^[^[:space:]]$ ]] && return 0
+
+  # 2. Named tmux keys + common aliases (case-insensitive)
+  local tl="${t,,}"
+  case "$tl" in
+    up|down|left|right|home|end|space|tab|enter|escape|esc) return 0 ;;
+    bspace|backspace|bs|btab|backtab) return 0 ;;
+    dc|delete|del|ic|insert|ins) return 0 ;;
+    ppage|pageup|pgup|npage|pagedown|pgdn|pgdown) return 0 ;;
+    f1|f2|f3|f4|f5|f6|f7|f8|f9|f10|f11|f12) return 0 ;;
+    any) return 0 ;;   # tmux 'Any' keyword
+  esac
+
+  # 3. Modifier-prefix combinations (C/M/S, possibly stacked: C-M-x, C-M-S-x)
+  #    Tail must contain no spaces and no `-` (else collision with modifier).
+  #    For multi-modifier `C-M-Up`, tail is `Up` (no `-`). For combo like
+  #    `C-M-S-BTab`, tail is `BTab`.
+  if [[ "$t" =~ ^([CMS]-){1,3}[^[:space:]-]+$ ]]; then
+    return 0
+  fi
+
+  # 4. Plus-syntax (user-typed style): Shift+Tab, Ctrl+C, Alt+Enter,
+  #    Ctrl+Shift+X (allow up to 3 chained modifiers via plus).
+  if [[ "$t" =~ ^(Shift|Ctrl|Alt|Meta|Cmd|Super)(\+(Shift|Ctrl|Alt|Meta|Cmd|Super)){0,2}\+[^[:space:]]+$ ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
 otmux.send() # <target> <text...> # smart send: auto-detects keys, /commands, text+key combos
 {
   local target=$(private.resolve.target "$1")
@@ -1754,15 +1798,14 @@ otmux.send() # <target> <text...> # smart send: auto-detects keys, /commands, te
     return 1
   fi
 
-  # Detect trailing tmux key names (Enter, C-u, Tab, etc.) AND single-char
-  # menu keys (digits / letters). The single-char case fixes the PO-reported
-  # prefix leak: `otmux send <pane> 2` previously fell through to smart-prefix
-  # which sent "[@po pane] 2" into the agent's input prompt instead of the
-  # overlay menu. Single alphanumeric chars are now treated as raw key inputs
-  # — matching what `agent.approve/option` does internally.
+  # Detect tmux key tokens (Enter, BTab, C-u, Shift+Tab, single chars, etc.).
+  # Tron P0 (2026-05-12): prefix leaked on '[@role pane] Shift+Tab'. PO rule:
+  # prefix is ONLY for prose to idle agents (INFORM path); ALL key sends — by
+  # any name or modifier syntax — must be prefix-free. DRY: single is_key
+  # helper called from every dispatch case below.
   local last="${@: -1}"
   local is_key=false
-  [[ "$last" =~ ^(Enter|Escape|Tab|Space|BSpace|DC|IC|C-[a-z]|M-[a-z]|Up|Down|Left|Right|Home|End|PPage|NPage|F[0-9]+|[a-zA-Z0-9])$ ]] && is_key=true
+  private.otmux.is.key "$last" && is_key=true
 
   # Case 1: Single key only — raw keypress, no prefix
   if $is_key && [ $# -eq 1 ]; then
@@ -1771,13 +1814,13 @@ otmux.send() # <target> <text...> # smart send: auto-detects keys, /commands, te
   fi
 
   # Case 2: Text + trailing key — smart send text, then raw key
-  # BUT: if ALL args are single-char menu keys (e.g. `send pane Down Enter`,
-  # `send pane y Enter`), no prose to prefix — send them all raw in sequence.
+  # BUT: if ALL args are keys (e.g. `send pane Down Enter`, `send pane y Enter`,
+  # `send pane Shift+Tab Tab Enter`), no prose to prefix — send all raw.
   if $is_key && [ $# -gt 1 ]; then
     local all_keys=true
     local a
     for a in "$@"; do
-      [[ "$a" =~ ^(Enter|Escape|Tab|Space|BSpace|DC|IC|C-[a-z]|M-[a-z]|Up|Down|Left|Right|Home|End|PPage|NPage|F[0-9]+|[a-zA-Z0-9])$ ]] || { all_keys=false; break; }
+      private.otmux.is.key "$a" || { all_keys=false; break; }
     done
     if $all_keys; then
       # All-raw key chain (menu navigation) — no prefix
