@@ -110,14 +110,23 @@ promote.testing.to.prod() # <?reset|yes|skip> # promote testing to prod, gated b
   state of PROMOTE
   source $CONFIG_PATH/current.state.machine.env
 
-  # Reinit unless resuming an in-progress prod-path run (states 20-26)
-  if ! { [ $state -ge 20 ] && [ $state -le 26 ]; } || [ $state -ge 99 ]; then
+  # Reinit unless resuming an in-progress prod-path run. Upper bound is
+  # PROMOTE_PROD_LAST_STATE (set by private.promote.state.machine.init based
+  # on must-pass platform count + 1 for the '99' terminator slot). If the
+  # config file is missing or stale, default to a generous bound so we don't
+  # incorrectly re-init a valid in-flight machine.
+  local _prodMax="${PROMOTE_PROD_LAST_STATE:-99}"
+  if ! { [ $state -ge 20 ] && [ $state -le $((_prodMax + 1)) ]; } || [ $state -ge 99 ]; then
     state.machine.delete PROMOTE 2>/dev/null
     private.promote.state.machine.init
     private.promote.config.save
     state of PROMOTE
     source $CONFIG_PATH/current.state.machine.env
   fi
+
+  # Ensure per-platform check stubs are present in this shell. Init creates
+  # them at machine-creation time; on resume init is skipped, so re-source.
+  private.promote.platform.stubs.source
 
   # Handle skip: advance past current stuck state without running its check
   if [ "$PROMOTE_SKIP" = "yes" ]; then
@@ -168,19 +177,34 @@ promote.status() # # show PROMOTE pipeline state and branch diffs
       success.log "Last promotion completed — ready for next run"
     else
       private.promote.config.load
-      important.log "Promoting to: $PROMOTE_TARGET"
-      important.log "Current state: [$state] = ${PROMOTE_STATES[$state]:-unknown}"
+      # Pipeline state belongs in the user's answer — promote.status is a
+      # user-invoked query, plain echo so LOG_LEVEL=1 still shows the labels.
+      # This is what the bare integer leaking out of state.of's pre-fix echo
+      # used to (accidentally) hint at — now it's an explicit "State: [N] =
+      # <name>" line instead of an unexplained number.
+      echo "Promoting to: $PROMOTE_TARGET"
+      echo "Current state: [$state] = ${PROMOTE_STATES[$state]:-unknown}"
       local nextIdx=$((state + 1))
       local nextLabel="${PROMOTE_STATES[$nextIdx]:-finished}"
-      important.log "Next check: [$nextIdx] = $nextLabel"
+      echo "Next check: [$nextIdx] = $nextLabel"
     fi
   else
+    # Event-driven notice (no PROMOTE machine yet). important.log keeps the
+    # "no active promotion" message visible at LOG_LEVEL >= 2 — but the
+    # *branch status* block below still echoes plainly so the user gets
+    # their answer regardless of log level.
     important.log "No active promotion — run 'promote testing' or 'promote prod' to start"
   fi
 
+  # Status-command output is the user's expected return value, not a log
+  # event — must survive every LOG_LEVEL. Plain echo (stdout) is the OOSH
+  # idiom for user-invoked .status / .report methods. The Promoting-to /
+  # Current-state / Next-check lines above remain via important.log
+  # because those are pipeline-internal diagnostics, surfaced only when
+  # the user opts into LOG_LEVEL >= 2.
   echo
   echo "============="
-  important.log "Branch Status"
+  echo "Branch Status"
   echo "============="
 
   # Use full refs/heads/<name> so git doesn't get confused when a sibling
@@ -191,24 +215,45 @@ promote.status() # # show PROMOTE pipeline state and branch diffs
   testingHead=$(git -C "$OOSH_DIR" log -1 --format='%h  %ci' refs/heads/testing 2>/dev/null || echo "not found")
   prodHead=$(git -C "$OOSH_DIR" log -1 --format='%h  %ci' refs/heads/prod 2>/dev/null || echo "not found")
 
-  local devAheadOfTesting testingAheadOfProd
-  devAheadOfTesting=$(git -C "$OOSH_DIR" rev-list --count refs/heads/testing..refs/heads/dev 2>/dev/null || echo "?")
-  testingAheadOfProd=$(git -C "$OOSH_DIR" rev-list --count refs/heads/prod..refs/heads/testing 2>/dev/null || echo "?")
-
   echo "dev    $devHead"
-  if [ "$devAheadOfTesting" = "0" ]; then
-    echo "testing  $testingHead  (up to date with dev)"
-  else
-    echo "testing  $testingHead  ($devAheadOfTesting commits behind dev)"
-  fi
-  if [ "$testingAheadOfProd" = "0" ]; then
-    echo "prod   $prodHead  (up to date with testing)"
-  else
-    echo "prod   $prodHead  ($testingAheadOfProd commits behind testing)"
-  fi
+  promote.branch.alignment dev testing
+  echo "testing  $testingHead  ($RESULT)"
+  promote.branch.alignment testing prod
+  echo "prod   $prodHead  ($RESULT)"
 
   # Restore caller's GIT_PAGER
   if [ "$_git_pager_orig" = "__unset__" ]; then unset GIT_PAGER; else export GIT_PAGER="$_git_pager_orig"; fi
+}
+
+promote.branch.alignment() # <from> <to> # symmetric branch comparison; sets RESULT to one of: up to date, N commits ahead, N commits behind, diverged
+{
+  local from="$1"
+  local to="$2"
+  if [ -z "$from" ] || [ -z "$to" ]; then
+    create.result 1 "promote.branch.alignment requires <from> <to>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  # Verdict is from <to>'s perspective relative to <from>:
+  #   behindCount = commits on <from> not on <to>  (commits <to> is behind <from> by)
+  #   aheadCount  = commits on <to> not on <from>  (commits <to> is ahead of <from> by)
+  # Delegate raw git to the documented this.git.* namespace helper so
+  # promote keeps zero direct `git rev-list --count` call sites.
+  local behindCount aheadCount
+  this.git.commits.count "$OOSH_DIR" "$to"   "$from"; behindCount="$RESULT"
+  this.git.commits.count "$OOSH_DIR" "$from" "$to";   aheadCount="$RESULT"
+
+  if [ "$behindCount" = "0" ] && [ "$aheadCount" = "0" ]; then
+    create.result 0 "up to date with $from"
+  elif [ "$behindCount" = "0" ]; then
+    create.result 0 "$aheadCount commits ahead of $from"
+  elif [ "$aheadCount" = "0" ]; then
+    create.result 0 "$behindCount commits behind $from"
+  else
+    create.result 0 "diverged: $behindCount behind, $aheadCount ahead of $from"
+  fi
+  return $(result)
 }
 
 promote.report() # # show promotion history from git tags
@@ -241,6 +286,7 @@ private.promote.config.load() {
     PROMOTE_TARGET=""
     PROMOTE_FORCE=""
     PROMOTE_SKIP=""
+    PROMOTE_PROD_LAST_STATE=""
   fi
 }
 
@@ -251,6 +297,7 @@ private.promote.config.save() {
     echo "PROMOTE_TARGET=$PROMOTE_TARGET"
     echo "PROMOTE_FORCE=$PROMOTE_FORCE"
     echo "PROMOTE_SKIP=$PROMOTE_SKIP"
+    echo "PROMOTE_PROD_LAST_STATE=$PROMOTE_PROD_LAST_STATE"
   } > "$configFile"
 }
 
@@ -281,20 +328,54 @@ private.promote.state.machine.init() {
   # (state.add modifies a local copy due to declare -a scoping)
   source $CONFIG_PATH/stateMachines/PROMOTE.states.env
 
-  # Manual printf -v for [19]-[26]:
+  # Manual printf -v for [19]-[N]:
   #   state.add 99 can't work here because [99]="finished" is pre-set
   #   by the template — state.add would try to add at [99] which is
-  #   already occupied. We also need non-sequential IDs ([19], [20]-[26])
-  #   that state.add's auto-increment can't produce.
-  #   After modifying, private.state.machine.update persists the array.
+  #   already occupied. We also need non-sequential IDs ([19] terminates
+  #   the testing path, [20]+ start the prod path) that state.add's
+  #   auto-increment can't produce.
+  #
+  # Prod path is data-driven: one state per must-pass platform in
+  # defaults/platforms.env (plus user overrides). When platforms are
+  # added/removed via config, the next `promote ... reset` rebuilds the
+  # state list with no code edit.
   printf -v "PROMOTE_STATES[19]" '%s' '99'
-  printf -v "PROMOTE_STATES[20]" '%s' 'prod.path.started'
-  printf -v "PROMOTE_STATES[21]" '%s' 'platform.tests.passed'
-  printf -v "PROMOTE_STATES[22]" '%s' 'confirmation.received.prod'
-  printf -v "PROMOTE_STATES[23]" '%s' 'merged.to.prod'
-  printf -v "PROMOTE_STATES[24]" '%s' 'prod.tagged'
-  printf -v "PROMOTE_STATES[25]" '%s' 'prod.pushed'
-  printf -v "PROMOTE_STATES[26]" '%s' '99'
+
+  # Source os so private.os.platform.* are available, then load the platform matrix.
+  # No 2>/dev/null suppression — if os is missing or platform.load errors, surface
+  # it (first-principles.md transparency) rather than letting state-machine
+  # init succeed silently with an empty platform set.
+  source "$OOSH_DIR/os"
+  private.os.platform.load
+
+  local _id=20
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'prod.path.started';        _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'uncommitted.checked.prod'; _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'test.suite.passed.prod';   _id=$((_id+1))
+
+  local _p
+  for _p in $(private.os.platform.names); do
+    private.os.platform.parse "$_p"
+    [ "$PLATFORM_TIER" = "must-pass" ] || continue
+    printf -v "PROMOTE_STATES[$_id]" '%s' "platform.test.$_p"
+    _id=$((_id+1))
+  done
+  # Source per-platform check stubs into this shell so the advancement
+  # loop has them on the first init run. (On resume, the state machine
+  # already exists and init is skipped — callers must re-source the stubs
+  # themselves via private.promote.platform.stubs.source.)
+  private.promote.platform.stubs.source
+
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'confirmation.received.prod'; _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'merged.to.prod';             _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'prod.tagged';                _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'prod.pushed'
+  # Last advance-eligible state in the prod path is prod.pushed.
+  # Capture its ID before writing the '99' terminator slot.
+  PROMOTE_PROD_LAST_STATE=$_id
+  _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' '99'
+
   private.state.machine.update
 
   # Advance through template states: [2]setup -> [3]all.states.added -> [4]started
@@ -385,17 +466,71 @@ private.check.test.suite.passed() # <script> <stageTo> <stateFound> # run test.s
   return $(result)
 }
 
-private.check.platform.tests.passed() # <script> <stageTo> <stateFound> # run os platform.test.all
+# Prod-path thin wrappers — mirror state 13 (uncommitted.checked) and state 14
+# (test.suite.passed) of the dev→testing path. Keep the actual gate logic
+# centralised in the testing-path checks; the .prod aliases just give the
+# prod-path state machine the function name it expects.
+private.check.uncommitted.checked.prod() { private.check.uncommitted.checked "$@"; }
+private.check.test.suite.passed.prod()   { private.check.test.suite.passed "$@"; }
+
+# private.promote.platform.stubs.source
+# Source one private.check.platform.test.<name>() stub per must-pass platform
+# into the current shell. The stubs delegate to private.check.platform.test.dispatch.
+# Idempotent: re-sourcing redefines the functions identically. Must be called
+# before the state-machine advancement loop in both code paths:
+#   1. private.promote.state.machine.init (first-run / reset) — invokes this.
+#   2. promote.testing.to.prod (resume against existing PROMOTE machine) — invokes
+#      this explicitly because init is skipped when the machine already exists.
+# Without (2), resuming a per-platform run from a fresh shell hit
+# `promote.check.platform.test.<name> not found` and the state machine stuck
+# at the first per-platform state.
+private.promote.platform.stubs.source()
 {
+  # Precondition: $OOSH_DIR must be set + readable. This function is also
+  # invoked at top-level whenever `promote` is sourced — including from the
+  # interactive `oo` REPL, which sources scripts for completion *before*
+  # $OOSH_DIR is bootstrapped. When that happens the helper has nothing to
+  # do (no state machine in flight either) — return cleanly instead of
+  # crashing the sourcing shell with `source "/os": No such file`.
+  [ -n "$OOSH_DIR" ] && [ -d "$OOSH_DIR" ] || return 0
+
+  source "$OOSH_DIR/os"
+  private.os.platform.load
+  local _p
+  for _p in $(private.os.platform.names); do
+    private.os.platform.parse "$_p"
+    [ "$PLATFORM_TIER" = "must-pass" ] || continue
+    # Documented OOSH delegate-generation helper — defines
+    # private.check.platform.test.<name>() => private.check.platform.test.dispatch <name> "$@"
+    this.function.partial \
+      "private.check.platform.test.$_p" \
+      private.check.platform.test.dispatch \
+      "$_p"
+  done
+}
+
+# private.check.platform.test.dispatch <platformName> <script> <stageTo> <stateFound>
+# Shared body that every per-platform check function (generated dynamically by
+# private.promote.state.machine.init) delegates to. Returns 0 if `os platform.test
+# <platform>` passes, 1 otherwise — the state machine then stops at that
+# platform's state and re-running advances only when the same platform passes.
+# Uses important.log / error.log so progress is visible at LOG_LEVEL=1 (works
+# around the state framework swallowing console.log of check functions; see
+# project_promote_silent_output_bug.md).
+private.check.platform.test.dispatch()
+{
+  local platform=$1; shift
   local script=$1; shift
   local stageTo=$1; shift
   local stateFound=$1; shift
 
-  console.log "Running os platform.test.all..."
-  if os platform.test.all; then
-    create.result 0 "All platform tests passed"
+  important.log "Running os platform.test $platform ..."
+  if os platform.test "$platform"; then
+    create.result 0 "Platform test passed: $platform"
+    success.log "Platform $platform: PASS"
   else
-    create.result 1 "Platform tests failed — fix failures and re-run promote"
+    create.result 1 "Platform $platform FAILED — fix the platform, then re-run 'oo stage testing'"
+    error.log "Platform $platform: FAIL"
   fi
   return $(result)
 }
@@ -813,6 +948,8 @@ private.check.next.custom.state() # <script> <stageTo> <stateFound> # placeholde
 
 promote.dev.to.testing.completion.reset() { echo "reset"; echo "yes"; echo "skip"; }
 promote.testing.to.prod.completion.reset() { echo "reset"; echo "yes"; echo "skip"; }
+promote.branch.alignment.completion.from() { echo "dev"; echo "testing"; echo "prod"; }
+promote.branch.alignment.completion.to()   { echo "dev"; echo "testing"; echo "prod"; }
 
 # Backward compat aliases
 promote.testing() # <?reset|yes|skip> # [deprecated: use promote dev.to.testing] promote dev to testing
@@ -855,5 +992,15 @@ promote.start()
 
   this.start "$@"
 }
+
+# Source per-platform check stubs whenever this file is loaded. `state.check`
+# does `source $(command -v promote)` inside its own subshell to look up the
+# per-state private.check.<name> function — that subshell never enters
+# promote.testing.to.prod, so it would otherwise miss the dynamically
+# generated platform stubs and report `promote.check.platform.test.<name>
+# not found...`, sticking the state machine at state [23]. The helper is
+# idempotent. No 2>/dev/null — if os is unsourceable here, fail loudly
+# (first-principles.md transparency).
+private.promote.platform.stubs.source
 
 promote.start "$@"

@@ -170,24 +170,49 @@ else
 fi
 
 # ============================================================================
-# T-PROMOTE-10: All 14 private.check.* promote functions are defined
+# T-PROMOTE-10: All required private.check.* promote functions are defined
+# (Includes per-platform check functions generated dynamically by
+#  private.promote.state.machine.init for each must-pass platform.)
 # ============================================================================
+# Init the machine first so the dynamic per-platform check functions exist.
+private.promote.state.machine.init >/dev/null 2>&1
+
 _allChecksDefined=true
-for _checkName in \
-  initialization.checked target.checked uncommitted.checked \
-  test.suite.passed confirmation.received \
-  merged.to.testing testing.tagged testing.pushed \
-  platform.tests.passed confirmation.received.prod merged.to.prod \
-  prod.tagged prod.pushed finished; do
+_baseChecks=(
+  initialization.checked target.checked uncommitted.checked
+  test.suite.passed confirmation.received
+  merged.to.testing testing.tagged testing.pushed
+  uncommitted.checked.prod test.suite.passed.prod
+  platform.test.dispatch
+  confirmation.received.prod merged.to.prod
+  prod.tagged prod.pushed finished
+)
+for _checkName in "${_baseChecks[@]}"; do
   if ! type "private.check.$_checkName" >/dev/null 2>&1; then
     expect.fail "private.check.$_checkName not defined"
     _allChecksDefined=false
   fi
 done
+
+# Per-platform stubs — must-pass platforms only
+source $OOSH_DIR/os 2>/dev/null
+private.os.platform.load 2>/dev/null
+_mustPassPlatforms=()
+for _p in $(private.os.platform.names); do
+  private.os.platform.parse "$_p"
+  [ "$PLATFORM_TIER" = "must-pass" ] && _mustPassPlatforms+=("$_p")
+done
+for _p in "${_mustPassPlatforms[@]}"; do
+  if ! type "private.check.platform.test.$_p" >/dev/null 2>&1; then
+    expect.fail "private.check.platform.test.$_p not defined (must-pass platform)"
+    _allChecksDefined=false
+  fi
+done
+
 if [ "$_allChecksDefined" = true ]; then
-  expect.pass "all 14 private.check.* functions defined"
+  expect.pass "all required private.check.* functions defined (${#_baseChecks[@]} base + ${#_mustPassPlatforms[@]} per-platform)"
 fi
-unset _allChecksDefined _checkName
+unset _allChecksDefined _checkName _baseChecks _mustPassPlatforms _p
 
 # ============================================================================
 # T-PROMOTE-11: Completion functions produce output
@@ -356,11 +381,13 @@ fi
 
 private.promote.state.machine.init
 
-test.case $level "Full init creates all 17 custom states" \
+test.case $level "Full init creates all custom states" \
   state of PROMOTE list all
 source $CONFIG_PATH/current.state.machine.env
 
-# Verify testing path [11]-[18]
+# Build the expected state map. Testing path is fixed [11]-[19]. Prod path is
+# dynamic — driven by must-pass platforms from defaults/platforms.env, so the
+# assertions below mirror the same enumeration the init function uses.
 _allStatesOk=true
 declare -A _expectedStates=(
   [11]="initialization.checked"
@@ -373,14 +400,26 @@ declare -A _expectedStates=(
   [18]="testing.pushed"
   [19]="99"
   [20]="prod.path.started"
-  [21]="platform.tests.passed"
-  [22]="confirmation.received.prod"
-  [23]="merged.to.prod"
-  [24]="prod.tagged"
-  [25]="prod.pushed"
-  [26]="99"
+  [21]="uncommitted.checked.prod"
+  [22]="test.suite.passed.prod"
   [99]="finished"
 )
+
+# Append per-must-pass-platform states, then the closing prod-path states.
+source $OOSH_DIR/os 2>/dev/null
+private.os.platform.load 2>/dev/null
+_nextId=23
+for _p in $(private.os.platform.names); do
+  private.os.platform.parse "$_p"
+  [ "$PLATFORM_TIER" = "must-pass" ] || continue
+  _expectedStates[$_nextId]="platform.test.$_p"
+  _nextId=$((_nextId + 1))
+done
+_expectedStates[$_nextId]="confirmation.received.prod";  _nextId=$((_nextId + 1))
+_expectedStates[$_nextId]="merged.to.prod";              _nextId=$((_nextId + 1))
+_expectedStates[$_nextId]="prod.tagged";                 _nextId=$((_nextId + 1))
+_expectedStates[$_nextId]="prod.pushed";                 _nextId=$((_nextId + 1))
+_expectedStates[$_nextId]="99"
 
 for _id in "${!_expectedStates[@]}"; do
   _sName="PROMOTE_STATES[${_id}]"
@@ -392,9 +431,9 @@ for _id in "${!_expectedStates[@]}"; do
 done
 
 if [ "$_allStatesOk" = true ]; then
-  expect.pass "All 17 custom states + [99]=finished verified"
+  expect.pass "All ${#_expectedStates[@]} states verified (data-driven prod path)"
 fi
-unset _allStatesOk _expectedStates _id _sName _sValue
+unset _allStatesOk _expectedStates _id _sName _sValue _nextId _p
 
 # Clean up test machine
 if state.machine.exists PROMOTE 2>/dev/null; then
@@ -720,5 +759,213 @@ fi
 git -C "$PSB_AR_F" merge --abort 2>/dev/null
 rm -rf "$PSB_AR_F"
 unset _mergeRc _helperRc PSB_AR PSB_AR_F
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-PROMOTE-PLATFORM-* : per-platform dispatch returns 0/1 cleanly so the
+# state machine stops on a failing platform and advances on a passing one.
+# We mock the `os` function so test runs are fast and deterministic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Save the real os definition (it's a script on PATH, not a function — but
+# defining a local function shadows the script lookup inside this shell).
+_PROMOTE_PLATFORM_TEST_OUTCOME=pass
+os() {
+  if [ "$1" = "platform.test" ]; then
+    [ "$_PROMOTE_PLATFORM_TEST_OUTCOME" = "pass" ] && return 0 || return 1
+  fi
+  command os "$@"
+}
+
+# T-PROMOTE-PLATFORM-1: dispatch returns 0 on pass
+_PROMOTE_PLATFORM_TEST_OUTCOME=pass
+test.case $level "T-PROMOTE-PLATFORM-1: dispatch returns 0 when os platform.test passes" \
+  echo "(call dispatch)"
+private.check.platform.test.dispatch ubuntu_24_04 promote platform.test.ubuntu_24_04 0 >/dev/null 2>&1
+_rc=$?
+if [ "$_rc" -eq 0 ]; then
+  expect.pass "dispatch returned 0 on pass"
+else
+  expect.fail "dispatch returned $_rc on pass (expected 0)"
+fi
+
+# T-PROMOTE-PLATFORM-2: dispatch returns non-zero on fail
+_PROMOTE_PLATFORM_TEST_OUTCOME=fail
+test.case $level "T-PROMOTE-PLATFORM-2: dispatch returns non-zero when os platform.test fails" \
+  echo "(call dispatch)"
+private.check.platform.test.dispatch ubuntu_24_04 promote platform.test.ubuntu_24_04 0 >/dev/null 2>&1
+_rc=$?
+if [ "$_rc" -ne 0 ]; then
+  expect.pass "dispatch returned $_rc on fail (>0 as expected)"
+else
+  expect.fail "dispatch returned 0 on fail (expected non-zero so state machine stops)"
+fi
+
+# T-PROMOTE-PLATFORM-3: per-platform stub functions exist and delegate to dispatch
+test.case $level "T-PROMOTE-PLATFORM-3: per-platform stubs delegate to dispatch" \
+  echo "(call platform stub)"
+_PROMOTE_PLATFORM_TEST_OUTCOME=pass
+_mustPass=$(private.os.platform.names | while read _p; do private.os.platform.parse "$_p"; [ "$PLATFORM_TIER" = "must-pass" ] && echo "$_p"; done | head -1)
+if [ -n "$_mustPass" ]; then
+  "private.check.platform.test.$_mustPass" promote "platform.test.$_mustPass" 0 >/dev/null 2>&1
+  _rc=$?
+  if [ "$_rc" -eq 0 ]; then
+    expect.pass "platform.test.$_mustPass stub returned 0 via dispatch"
+  else
+    expect.fail "platform.test.$_mustPass stub returned $_rc (expected 0)"
+  fi
+else
+  expect.fail "no must-pass platforms found — defaults/platforms.env may be empty"
+fi
+
+# Restore real os (unset the shadow function)
+unset -f os
+unset _PROMOTE_PLATFORM_TEST_OUTCOME _rc _mustPass
+
+# ============================================================================
+# T-PROMOTE-BRANCH-ALIGN: promote.branch.alignment symmetric verdict
+# ----------------------------------------------------------------------------
+# Fixes the bug where `promote status` reported "up to date with dev" even
+# though testing was strictly *ahead* of dev — the prior one-sided rev-list
+# could not see commits the comparison branch had that the reference branch
+# lacked. The new OOSH method must report all four states: equal, ahead,
+# behind, diverged.
+# ============================================================================
+
+# Build a tiny throwaway repo with dev/testing/prod refs we control.
+PBA_REPO=$(mktemp -d -t oosh-promote-align.XXXXXX)
+git -C "$PBA_REPO" init -q
+git -C "$PBA_REPO" config user.email "test@example.com"
+git -C "$PBA_REPO" config user.name "test"
+echo "seed" > "$PBA_REPO/file"
+git -C "$PBA_REPO" add file
+git -C "$PBA_REPO" -c commit.gpgsign=false commit -q -m "seed"
+git -C "$PBA_REPO" branch -f dev
+git -C "$PBA_REPO" branch -f testing
+git -C "$PBA_REPO" branch -f prod
+
+# Save / override OOSH_DIR so promote.branch.alignment operates on the fixture.
+_PBA_OOSH_DIR_SAVE="$OOSH_DIR"
+OOSH_DIR="$PBA_REPO"
+
+# Case 1: identical SHAs → up to date
+test.case $level "T-PROMOTE-BRANCH-ALIGN-1: identical refs report 'up to date'" \
+  echo "(promote.branch.alignment dev testing on identical refs)"
+promote.branch.alignment dev testing
+if [ "$RESULT" = "up to date with dev" ]; then
+  expect.pass "identical refs → '$RESULT'"
+else
+  expect.fail "expected 'up to date with dev', got '$RESULT'"
+fi
+
+# Case 2: testing strictly behind dev (one extra commit on dev only)
+git -C "$PBA_REPO" checkout -q dev
+echo "dev-only" >> "$PBA_REPO/file"
+git -C "$PBA_REPO" -c commit.gpgsign=false commit -aq -m "dev-only"
+test.case $level "T-PROMOTE-BRANCH-ALIGN-2: testing behind dev reports 'behind'" \
+  echo "(promote.branch.alignment dev testing after dev advanced)"
+promote.branch.alignment dev testing
+if [[ "$RESULT" == *"behind dev"* ]] && [[ "$RESULT" != *"diverged"* ]]; then
+  expect.pass "behind → '$RESULT'"
+else
+  expect.fail "expected behind-only, got '$RESULT'"
+fi
+
+# Case 3: testing strictly ahead of dev (rewind dev one commit, advance testing)
+# Detach HEAD first — `branch -f dev` is refused while dev is checked out.
+git -C "$PBA_REPO" checkout -q --detach
+git -C "$PBA_REPO" branch -f dev HEAD~1
+git -C "$PBA_REPO" checkout -q testing
+echo "testing-only" >> "$PBA_REPO/file"
+git -C "$PBA_REPO" -c commit.gpgsign=false commit -aq -m "testing-only"
+test.case $level "T-PROMOTE-BRANCH-ALIGN-3: testing ahead of dev reports 'ahead'" \
+  echo "(promote.branch.alignment dev testing after testing advanced past dev)"
+promote.branch.alignment dev testing
+if [[ "$RESULT" == *"ahead of dev"* ]] && [[ "$RESULT" != *"diverged"* ]]; then
+  expect.pass "ahead → '$RESULT'"
+else
+  expect.fail "expected ahead-only, got '$RESULT'"
+fi
+
+# Case 4: diverged — dev gets its own commit on top of the pre-divergence base
+git -C "$PBA_REPO" checkout -q dev
+echo "dev-second" >> "$PBA_REPO/file"
+git -C "$PBA_REPO" -c commit.gpgsign=false commit -aq -m "dev-second"
+test.case $level "T-PROMOTE-BRANCH-ALIGN-4: divergent histories report 'diverged'" \
+  echo "(promote.branch.alignment dev testing on diverged histories)"
+promote.branch.alignment dev testing
+if [[ "$RESULT" == diverged:* ]]; then
+  expect.pass "diverged → '$RESULT'"
+else
+  expect.fail "expected 'diverged:*', got '$RESULT'"
+fi
+
+# Case 4b: diverged-label order. After T-4 testing is 1 behind and 1 ahead
+# of dev — symmetric, so a label swap would be invisible. Add ONE more
+# dev-side commit to make the counts asymmetric: testing should then be
+# 2 behind and 1 ahead of dev. Regression net for the label-swap bug
+# where behind/ahead variables were inverted in the diverged verdict.
+echo "dev-third" >> "$PBA_REPO/file"
+git -C "$PBA_REPO" -c commit.gpgsign=false commit -aq -m "dev-third"
+test.case $level "T-PROMOTE-BRANCH-ALIGN-4b: diverged label order matches actual behind/ahead counts" \
+  echo "(verifying behind/ahead numbers + labels are not swapped)"
+promote.branch.alignment dev testing
+if [[ "$RESULT" == "diverged: 2 behind, 1 ahead of dev" ]]; then
+  expect.pass "diverged order correct → '$RESULT'"
+else
+  expect.fail "diverged label/order mismatch (expected '2 behind, 1 ahead'): '$RESULT'"
+fi
+
+# Case 5: missing args → non-zero return value
+test.case $level "T-PROMOTE-BRANCH-ALIGN-5: missing args returns non-zero" \
+  echo "(promote.branch.alignment with no arguments)"
+promote.branch.alignment >/dev/null 2>&1
+if [ "$RETURN_VALUE" != "0" ]; then
+  expect.pass "missing args → RETURN_VALUE=$RETURN_VALUE"
+else
+  expect.fail "expected non-zero RETURN_VALUE, got 0"
+fi
+
+# Restore OOSH_DIR + clean fixture.
+OOSH_DIR="$_PBA_OOSH_DIR_SAVE"
+rm -rf "$PBA_REPO"
+unset PBA_REPO _PBA_OOSH_DIR_SAVE
+
+# ============================================================================
+# T-PROMOTE-STATUS-CLEAN: promote.status output is free of stray state ids
+# ----------------------------------------------------------------------------
+# Regression: `oo promote.status` used to leak the current state index (a bare
+# integer) onto its first stdout line because state.of (no-method) echoed.
+# ============================================================================
+test.case $level "T-PROMOTE-STATUS-CLEAN: first non-empty stdout line is not a bare integer" \
+  echo "(capturing first non-empty stdout line of promote.status)"
+_PS_FIRST=$(promote.status 2>/dev/null | awk 'NF{print; exit}')
+if [[ "$_PS_FIRST" =~ ^[0-9]+$ ]]; then
+  expect.fail "promote.status leaked bare integer as first line: '$_PS_FIRST'"
+else
+  expect.pass "promote.status first line OK: '$_PS_FIRST'"
+fi
+unset _PS_FIRST
+
+# ============================================================================
+# T-PROMOTE-STATUS-VISIBLE-AT-LL1: status produces visible stdout at LOG_LEVEL=1
+# ----------------------------------------------------------------------------
+# Regression: earlier OOSH-conformance refactor (6915877) replaced bare echo
+# in promote.status with console.log, which is gated at LOG_LEVEL >= 3 →
+# `oo promote.status` produced ZERO visible output at the user's working
+# LOG_LEVEL=1. User-invoked .status commands are command-return values, not
+# log events; they must use stdout regardless of log level.
+# ============================================================================
+_OLD_LL=$LOG_LEVEL
+log.level 1 >/dev/null 2>&1
+test.case 1 "T-PROMOTE-STATUS-VISIBLE-AT-LL1: status emits visible 'dev …' line at LOG_LEVEL=1" \
+  echo "(capture promote.status stdout at LOG_LEVEL=1)"
+_PS_LL1=$(promote.status 2>/dev/null)
+log.level $_OLD_LL >/dev/null 2>&1
+if [ -n "$_PS_LL1" ] && echo "$_PS_LL1" | grep -q '^dev    '; then
+  expect.pass "promote.status emitted visible 'dev …' line at LL=1"
+else
+  expect.fail "promote.status produced no visible 'dev …' line at LL=1: '$_PS_LL1'"
+fi
+unset _OLD_LL _PS_LL1
 
 test.suite.save.results
