@@ -110,8 +110,13 @@ promote.testing.to.prod() # <?reset|yes|skip> # promote testing to prod, gated b
   state of PROMOTE
   source $CONFIG_PATH/current.state.machine.env
 
-  # Reinit unless resuming an in-progress prod-path run (states 20-26)
-  if ! { [ $state -ge 20 ] && [ $state -le 26 ]; } || [ $state -ge 99 ]; then
+  # Reinit unless resuming an in-progress prod-path run. Upper bound is
+  # PROMOTE_PROD_LAST_STATE (set by private.promote.state.machine.init based
+  # on must-pass platform count + 1 for the '99' terminator slot). If the
+  # config file is missing or stale, default to a generous bound so we don't
+  # incorrectly re-init a valid in-flight machine.
+  local _prodMax="${PROMOTE_PROD_LAST_STATE:-99}"
+  if ! { [ $state -ge 20 ] && [ $state -le $((_prodMax + 1)) ]; } || [ $state -ge 99 ]; then
     state.machine.delete PROMOTE 2>/dev/null
     private.promote.state.machine.init
     private.promote.config.save
@@ -241,6 +246,7 @@ private.promote.config.load() {
     PROMOTE_TARGET=""
     PROMOTE_FORCE=""
     PROMOTE_SKIP=""
+    PROMOTE_PROD_LAST_STATE=""
   fi
 }
 
@@ -251,6 +257,7 @@ private.promote.config.save() {
     echo "PROMOTE_TARGET=$PROMOTE_TARGET"
     echo "PROMOTE_FORCE=$PROMOTE_FORCE"
     echo "PROMOTE_SKIP=$PROMOTE_SKIP"
+    echo "PROMOTE_PROD_LAST_STATE=$PROMOTE_PROD_LAST_STATE"
   } > "$configFile"
 }
 
@@ -281,20 +288,51 @@ private.promote.state.machine.init() {
   # (state.add modifies a local copy due to declare -a scoping)
   source $CONFIG_PATH/stateMachines/PROMOTE.states.env
 
-  # Manual printf -v for [19]-[26]:
+  # Manual printf -v for [19]-[N]:
   #   state.add 99 can't work here because [99]="finished" is pre-set
   #   by the template — state.add would try to add at [99] which is
-  #   already occupied. We also need non-sequential IDs ([19], [20]-[26])
-  #   that state.add's auto-increment can't produce.
-  #   After modifying, private.state.machine.update persists the array.
+  #   already occupied. We also need non-sequential IDs ([19] terminates
+  #   the testing path, [20]+ start the prod path) that state.add's
+  #   auto-increment can't produce.
+  #
+  # Prod path is data-driven: one state per must-pass platform in
+  # defaults/platforms.env (plus user overrides). When platforms are
+  # added/removed via config, the next `promote ... reset` rebuilds the
+  # state list with no code edit.
   printf -v "PROMOTE_STATES[19]" '%s' '99'
-  printf -v "PROMOTE_STATES[20]" '%s' 'prod.path.started'
-  printf -v "PROMOTE_STATES[21]" '%s' 'platform.tests.passed'
-  printf -v "PROMOTE_STATES[22]" '%s' 'confirmation.received.prod'
-  printf -v "PROMOTE_STATES[23]" '%s' 'merged.to.prod'
-  printf -v "PROMOTE_STATES[24]" '%s' 'prod.tagged'
-  printf -v "PROMOTE_STATES[25]" '%s' 'prod.pushed'
-  printf -v "PROMOTE_STATES[26]" '%s' '99'
+
+  # Source os so private.os.platform.* are available, then load the platform matrix.
+  source "$OOSH_DIR/os" 2>/dev/null
+  private.os.platform.load 2>/dev/null
+
+  local _id=20
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'prod.path.started';        _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'uncommitted.checked.prod'; _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'test.suite.passed.prod';   _id=$((_id+1))
+
+  local _p
+  for _p in $(private.os.platform.names); do
+    private.os.platform.parse "$_p"
+    [ "$PLATFORM_TIER" = "must-pass" ] || continue
+    printf -v "PROMOTE_STATES[$_id]" '%s' "platform.test.$_p"
+    # Generate the per-platform check at init time, closured on $_p.
+    # Using `source /dev/stdin` keeps quoting sane vs eval.
+    source /dev/stdin <<HEREDOC
+private.check.platform.test.$_p() { private.check.platform.test.dispatch "$_p" "\$@"; }
+HEREDOC
+    _id=$((_id+1))
+  done
+
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'confirmation.received.prod'; _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'merged.to.prod';             _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'prod.tagged';                _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' 'prod.pushed';                _id=$((_id+1))
+  printf -v "PROMOTE_STATES[$_id]" '%s' '99'
+
+  # Remember the prod-path bounds for the resume-window check in
+  # promote.testing.to.prod. _id-1 is the index of the '99' terminator;
+  # _id-2 is the last advance-eligible state (prod.pushed).
+  PROMOTE_PROD_LAST_STATE=$((_id - 2))
   private.state.machine.update
 
   # Advance through template states: [2]setup -> [3]all.states.added -> [4]started
@@ -385,17 +423,35 @@ private.check.test.suite.passed() # <script> <stageTo> <stateFound> # run test.s
   return $(result)
 }
 
-private.check.platform.tests.passed() # <script> <stageTo> <stateFound> # run os platform.test.all
+# Prod-path thin wrappers — mirror state 13 (uncommitted.checked) and state 14
+# (test.suite.passed) of the dev→testing path. Keep the actual gate logic
+# centralised in the testing-path checks; the .prod aliases just give the
+# prod-path state machine the function name it expects.
+private.check.uncommitted.checked.prod() { private.check.uncommitted.checked "$@"; }
+private.check.test.suite.passed.prod()   { private.check.test.suite.passed "$@"; }
+
+# private.check.platform.test.dispatch <platformName> <script> <stageTo> <stateFound>
+# Shared body that every per-platform check function (generated dynamically by
+# private.promote.state.machine.init) delegates to. Returns 0 if `os platform.test
+# <platform>` passes, 1 otherwise — the state machine then stops at that
+# platform's state and re-running advances only when the same platform passes.
+# Uses important.log / error.log so progress is visible at LOG_LEVEL=1 (works
+# around the state framework swallowing console.log of check functions; see
+# project_promote_silent_output_bug.md).
+private.check.platform.test.dispatch()
 {
+  local platform=$1; shift
   local script=$1; shift
   local stageTo=$1; shift
   local stateFound=$1; shift
 
-  console.log "Running os platform.test.all..."
-  if os platform.test.all; then
-    create.result 0 "All platform tests passed"
+  important.log "Running os platform.test $platform ..."
+  if os platform.test "$platform"; then
+    create.result 0 "Platform test passed: $platform"
+    success.log "Platform $platform: PASS"
   else
-    create.result 1 "Platform tests failed — fix failures and re-run promote"
+    create.result 1 "Platform $platform FAILED — fix the platform, then re-run 'oo stage testing'"
+    error.log "Platform $platform: FAIL"
   fi
   return $(result)
 }
