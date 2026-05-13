@@ -472,4 +472,165 @@ fi
 
 rm -rf "$PSB_TMP"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# T-PROMOTE-AUTO-RESOLVE-* : private.promote.try.resolve.self.branch.conflict
+# auto-resolves dev→testing (and testing→prod) merge conflicts whose only
+# conflicted paths are init/oosh and "Install oosh.command". Background: every
+# successful promote commits an OOSH_SELF_BRANCH rewrite onto the destination
+# branch, creating a permanent 1-line divergence that becomes a merge conflict
+# the moment source-branch refactors touch lines near it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Helper: seed a temp repo whose dev and testing branches both modify the
+# OOSH_SELF_BRANCH default line in init/oosh + Install oosh.command, so that
+# `git merge dev` from testing produces a conflict in exactly those two paths.
+# Optionally adds a foreign divergent file when $1 is "with-foreign".
+_seed_ar_repo() {
+  local mode="$1"
+  local d
+  d=$(mktemp -d)
+  git -C "$d" init -q -b testing
+  git -C "$d" -c user.email=t@t -c user.name=t config commit.gpgsign false
+  mkdir -p "$d/init"
+  # Ancestor has a neutral OOSH_SELF_BRANCH value so both branches diverge from it.
+  printf '#!/bin/sh\n# branch default\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-main}"\n' > "$d/init/oosh"
+  printf '#!/usr/bin/env bash\n# branch default\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-main}"\n' > "$d/Install oosh.command"
+  if [ "$mode" = "with-foreign" ]; then
+    printf 'common base\n' > "$d/OTHER.md"
+    git -C "$d" add init/oosh "Install oosh.command" OTHER.md
+  else
+    git -C "$d" add init/oosh "Install oosh.command"
+  fi
+  git -C "$d" -c user.email=t@t -c user.name=t commit -q -m "ancestor"
+  git -C "$d" branch dev
+
+  # testing side: rewrite OOSH_SELF_BRANCH to "testing" (simulates a prior promote rewrite commit)
+  printf '#!/bin/sh\n# branch default\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"\n' > "$d/init/oosh"
+  printf '#!/usr/bin/env bash\n# branch default\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"\n' > "$d/Install oosh.command"
+  if [ "$mode" = "with-foreign" ]; then
+    printf 'testing side\n' > "$d/OTHER.md"
+    git -C "$d" add init/oosh "Install oosh.command" OTHER.md
+  else
+    git -C "$d" add init/oosh "Install oosh.command"
+  fi
+  git -C "$d" -c user.email=t@t -c user.name=t commit -q -m "testing: prior promote rewrite"
+
+  # dev side: keep OOSH_SELF_BRANCH at "dev" but reshape the same line (simulates a refactor that touches the same hunk)
+  git -C "$d" checkout -q dev
+  printf '#!/bin/sh\n# branch default — overhauled\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\n' > "$d/init/oosh"
+  printf '#!/usr/bin/env bash\n# branch default — overhauled\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\n' > "$d/Install oosh.command"
+  if [ "$mode" = "with-foreign" ]; then
+    printf 'dev side\n' > "$d/OTHER.md"
+    git -C "$d" add init/oosh "Install oosh.command" OTHER.md
+  else
+    git -C "$d" add init/oosh "Install oosh.command"
+  fi
+  git -C "$d" -c user.email=t@t -c user.name=t commit -q -m "dev: refactor"
+
+  # Back to testing for the merge attempt
+  git -C "$d" checkout -q testing
+
+  echo "$d"
+}
+
+# T-PROMOTE-AUTO-RESOLVE-1: known-files conflict gets auto-resolved
+PSB_AR=$(_seed_ar_repo)
+git -C "$PSB_AR" merge dev --no-edit >/dev/null 2>&1
+_mergeRc=$?
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-1: setup produces a real merge conflict" \
+  echo "(merge rc: $_mergeRc)"
+if [ "$_mergeRc" -ne 0 ]; then
+  expect.pass "git merge dev failed as expected (conflict)"
+else
+  expect.fail "expected merge conflict but merge succeeded"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-2: helper resolves known-files conflict and returns 0" \
+  echo "(call helper)"
+private.promote.try.resolve.self.branch.conflict "$PSB_AR" "dev"
+_helperRc=$?
+if [ "$_helperRc" -eq 0 ]; then
+  expect.pass "helper returned 0 (resolved)"
+else
+  expect.fail "helper returned $_helperRc (expected 0)"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-3: working tree is clean after auto-resolve" \
+  echo "(status check)"
+if [ -z "$(git -C "$PSB_AR" status --porcelain 2>/dev/null)" ]; then
+  expect.pass "working tree clean"
+else
+  expect.fail "working tree dirty: $(git -C "$PSB_AR" status --porcelain 2>/dev/null)"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-4: init/oosh takes dev's value (theirs)" \
+  echo "(content check)"
+if grep -q 'OOSH_SELF_BRANCH:-dev' "$PSB_AR/init/oosh"; then
+  expect.pass "init/oosh got dev's OOSH_SELF_BRANCH value"
+else
+  expect.fail "init/oosh did not take theirs — content: $(grep OOSH_SELF_BRANCH "$PSB_AR/init/oosh")"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-5: Install oosh.command takes dev's value (theirs)" \
+  echo "(content check)"
+if grep -q 'OOSH_SELF_BRANCH:-dev' "$PSB_AR/Install oosh.command"; then
+  expect.pass "Install oosh.command got dev's OOSH_SELF_BRANCH value"
+else
+  expect.fail "Install oosh.command did not take theirs — content: $(grep OOSH_SELF_BRANCH "$PSB_AR/Install oosh.command")"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-6: auto-resolve merge commit exists with expected subject" \
+  echo "(log check)"
+if git -C "$PSB_AR" log --oneline -1 | grep -q "auto-resolved OOSH_SELF_BRANCH drift"; then
+  expect.pass "merge commit has auto-resolve marker"
+else
+  expect.fail "no auto-resolve commit found — last commit: $(git -C "$PSB_AR" log --oneline -1)"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-7: rewrite.self.branch restores destination value after auto-resolve" \
+  private.promote.rewrite.self.branch "$PSB_AR"
+if grep -q 'OOSH_SELF_BRANCH:-testing' "$PSB_AR/init/oosh"; then
+  expect.pass "init/oosh value restored to 'testing' after rewrite"
+else
+  expect.fail "rewrite did not restore destination value — content: $(grep OOSH_SELF_BRANCH "$PSB_AR/init/oosh")"
+fi
+
+rm -rf "$PSB_AR"
+
+# T-PROMOTE-AUTO-RESOLVE-FOREIGN: foreign-file conflict refuses to auto-resolve
+PSB_AR_F=$(_seed_ar_repo with-foreign)
+git -C "$PSB_AR_F" merge dev --no-edit >/dev/null 2>&1
+_mergeRc=$?
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-FOREIGN-1: setup produces multi-file merge conflict" \
+  echo "(merge rc: $_mergeRc)"
+if [ "$_mergeRc" -ne 0 ] && [ -n "$(git -C "$PSB_AR_F" diff --name-only --diff-filter=U 2>/dev/null | grep OTHER.md)" ]; then
+  expect.pass "merge conflict includes foreign file"
+else
+  expect.fail "expected conflict including OTHER.md"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-FOREIGN-2: helper refuses (returns non-zero) when foreign file conflicts" \
+  echo "(call helper)"
+private.promote.try.resolve.self.branch.conflict "$PSB_AR_F" "dev"
+_helperRc=$?
+if [ "$_helperRc" -ne 0 ]; then
+  expect.pass "helper returned $_helperRc (refused)"
+else
+  expect.fail "helper auto-resolved a foreign-file conflict (should have refused)"
+fi
+
+test.case $level "T-PROMOTE-AUTO-RESOLVE-FOREIGN-3: helper did not create a commit on refusal" \
+  echo "(log check)"
+if ! git -C "$PSB_AR_F" log --oneline -1 2>/dev/null | grep -q "auto-resolved"; then
+  expect.pass "no auto-resolve commit created"
+else
+  expect.fail "unexpected auto-resolve commit despite foreign conflict"
+fi
+
+git -C "$PSB_AR_F" merge --abort 2>/dev/null
+rm -rf "$PSB_AR_F"
+unset _mergeRc _helperRc PSB_AR PSB_AR_F
+
 test.suite.save.results
