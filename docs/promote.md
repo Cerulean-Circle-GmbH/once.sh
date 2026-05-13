@@ -39,7 +39,16 @@ promote report
 | `promote prod` | `<?reset\|yes\|skip>` | Promote testing → prod, gated by platform tests |
 | `promote status` | | Show PROMOTE machine state and branch diffs |
 | `promote report` | | Show promotion history from git tags |
-| `promote branch.alignment` | `<from> <to>` | Symmetric branch comparison; `$RESULT` is set to one of: `up to date with <from>` (identical commit) / `in sync with <from>` (`<to>` fully contains `<from>` plus its own bookkeeping commits — the post-promote steady state) / `N commits behind <from>` (`<from>` advanced; `<to>` needs a promote) / `diverged: M behind, N ahead of <from>` (genuine fork — needs manual reconciliation). Used by `promote status`. |
+| `promote branch.alignment` | `<from> <to>` | Symmetric branch comparison; `$RESULT` is set to one of four verdicts described below. Used by `promote status`. |
+
+### Branch alignment verdicts
+
+`promote.branch.alignment <from> <to>` describes `<to>`'s relationship to `<from>` from the promote-pipeline's perspective (where `<to>` is one stage downstream of `<from>` — e.g. `<from>=dev`, `<to>=testing`). The four verdicts:
+
+- **`up to date with <from>`** — Identical commit. `<to>` is the same tip as `<from>`. Rare; typically only right after a fresh clone or reset.
+- **`<from> merged in`** — `<to>`'s history fully contains `<from>` plus `<to>`-only bookkeeping (the merge commit + `OOSH_SELF_BRANCH` rewrite that `oo stage <from>` writes onto `<to>`). The post-promote steady state. The number of bookkeeping commits isn't actionable; the timestamp on the `<to>` line tells you when the merge happened.
+- **`N commits behind <from>`** — `<from>` advanced past `<to>`'s last merge point, and `<to>` has no own-side commits. `oo stage <from>` will pull the N commits in cleanly.
+- **`diverged: N behind <from>`** — Same as "N behind" but `<to>` also has its own bookkeeping commits from prior promotes (the merge commit + rewrites from a previous `oo stage <from>`). This is **not** a manual-reconciliation alarm in the OOSH promote workflow — it's the normal state between two consecutive promotes. `oo stage <from>` resolves it by merging the new `<from>` work in, after which the verdict flips to `<from> merged in`. The ahead-count is bookkeeping and intentionally omitted; only the behind-count (how far `<to>` needs to catch up) is shown.
 
 ### Parameters
 
