@@ -50,6 +50,27 @@ promote report
 - **`N commits behind <from>`** — `<from>` advanced past `<to>`'s last merge point, and `<to>` has no own-side commits. `oo stage <from>` will pull the N commits in cleanly.
 - **`diverged: N behind <from>`** — Same as "N behind" but `<to>` also has its own bookkeeping commits from prior promotes (the merge commit + rewrites from a previous `oo stage <from>`). This is **not** a manual-reconciliation alarm in the OOSH promote workflow — it's the normal state between two consecutive promotes. `oo stage <from>` resolves it by merging the new `<from>` work in, after which the verdict flips to `<from> merged in`. The ahead-count is bookkeeping and intentionally omitted; only the behind-count (how far `<to>` needs to catch up) is shown.
 
+### Status output
+
+`promote status` prints, regardless of `LOG_LEVEL`:
+
+```
+Promoting to: <target>
+Current state: [N] = <state name>
+Next check: [N+1] = <next state name>
+
+=============
+Branch Status
+=============
+dev    <sha>  <timestamp>
+testing  <sha>  <timestamp>  (<verdict-vs-dev>)
+prod   <sha>  <timestamp>  (<verdict-vs-testing>)
+```
+
+The `Promoting to:` / `Current state:` / `Next check:` header is present only when a PROMOTE machine exists (i.e. some `oo stage` has been started or is in progress). When no machine is active, those three lines are replaced by a single notice: `IMPORTANT> No active promotion — run 'promote testing' or 'promote prod' to start` (only visible at `LOG_LEVEL >= 2`).
+
+The Branch Status block is always shown, regardless of LOG_LEVEL — it's the command's primary answer. Each branch's verdict suffix is one of the four [branch alignment verdicts](#branch-alignment-verdicts) above.
+
 ### Parameters
 
 - `reset` — Delete and reinitialize the PROMOTE state machine (fresh start)
@@ -73,15 +94,34 @@ Testing path (dev → testing):
   [18] testing.pushed        ← git push origin testing + tags
 
 Prod path (testing → prod):
-  [20] prod.path.started     ← Pass-through to platform tests
-  [21] platform.tests.passed ← os platform.test.all must pass
-  [22] confirmation.received.prod ← User confirms merge
-  [23] merged.to.prod        ← git merge testing into prod
-  [24] prod.tagged           ← Tag: vX.Y.Z (auto-incremented semver)
-  [25] prod.pushed           ← git push origin prod + tags
+  [20] prod.path.started        ← Pass-through entry to the prod path
+  [21] uncommitted.checked.prod ← Clean working tree required
+  [22] test.suite.passed.prod   ← test.suite core 1 must pass
+  [23..N] platform.test.<name>  ← One state per must-pass platform from
+                                  defaults/platforms.env (data-driven via
+                                  private.os.platform.names + .parse). A
+                                  failing platform stops the machine at
+                                  that state; re-running `oo stage testing`
+                                  re-runs only that platform.
+  [N+1] confirmation.received.prod ← User confirms merge testing → prod
+  [N+2] merged.to.prod          ← git merge testing into prod (with
+                                  auto-resolve for OOSH_SELF_BRANCH drift
+                                  on init/oosh + Install oosh.command)
+  [N+3] prod.tagged             ← Tag: vX.Y.Z (auto-incremented semver)
+  [N+4] prod.pushed             ← git push origin prod + tags
 
 [99] finished
 ```
+
+> *The exact number of states in the prod path depends on how many
+> must-pass platforms are configured in `defaults/platforms.env`.
+> `PROMOTE_PROD_LAST_STATE` is persisted by
+> `private.promote.state.machine.init` and used by the resume-window
+> check in `promote.testing.to.prod` to adapt to platform count without
+> code edits. The per-platform check functions
+> (`private.check.platform.test.<name>`) are generated at machine-init
+> time via `this.function.partial` and re-sourced at the top of `promote`
+> so they're in scope whenever the script is loaded.*
 
 ### Resumability
 
