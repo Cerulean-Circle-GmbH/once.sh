@@ -39,7 +39,7 @@ promote report
 | `promote prod` | `<?reset\|yes\|skip>` | Promote testing → prod, gated by platform tests |
 | `promote status` | | Show PROMOTE machine state and branch diffs |
 | `promote report` | | Show promotion history from git tags |
-| `promote branch.alignment` | `<from> <to>` | Symmetric branch comparison; `$RESULT` is set to one of: `up to date with <from>` / `N commits ahead of <from>` / `N commits behind <from>` / `diverged: M behind, N ahead of <from>`. Used by `promote status` to report truthful relative state when branches have diverged. |
+| `promote branch.alignment` | `<from> <to>` | Symmetric branch comparison; `$RESULT` is set to one of: `up to date with <from>` (identical commit) / `in sync with <from>` (`<to>` fully contains `<from>` plus its own bookkeeping commits — the post-promote steady state) / `N commits behind <from>` (`<from>` advanced; `<to>` needs a promote) / `diverged: M behind, N ahead of <from>` (genuine fork — needs manual reconciliation). Used by `promote status`. |
 
 ### Parameters
 
