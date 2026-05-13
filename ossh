@@ -229,7 +229,28 @@ ossh.id.create() # <idName> <?sshDir:~/.ssh> # creates a new ed25519 ssh key pai
   cp "$sshBase/ids/$idName/${keyType}.pub" "$sshBase/ids/$idName/public_keys/$idName.public_key"
 }
 
-ossh.config.create() # <?sshConfigName|user@host> <?url> <?idOrProxyJump> <?proxyJump> # creates a ssh config. Single user@host arg auto-parses. Two args: alias user@host
+private.ossh.users.basehome() # # canonical base directory for system user homes on this OS — '/Users' on macOS, '/home' on Linux. Override via $OOSH_USERS_BASEHOME.
+{
+  # Why this exists: `dirname "$HOME"` is NOT portable for finding the
+  # system's user-home base. On Linux root's $HOME is /root → dirname=/ →
+  # the historical fallback `[ basehome = / ] && basehome=/home` patches
+  # that. On macOS root's $HOME is /var/root → dirname=/var, the / fallback
+  # doesn't fire, and code that builds /var/developking/... or /var/shared/...
+  # silently misses developking (in /Users/developking) and never creates
+  # /Users/shared/.ssh — which is exactly the seeding bug reproduced on
+  # macstudio installs. Using $OSTYPE (a bash builtin, no dependencies) is
+  # both correct and cheap.
+  if [ -n "$OOSH_USERS_BASEHOME" ]; then
+    printf '%s\n' "$OOSH_USERS_BASEHOME"
+    return 0
+  fi
+  case "$OSTYPE" in
+    darwin*) printf '/Users\n' ;;
+    *)       printf '/home\n' ;;
+  esac
+}
+
+ossh.config.create() # <?sshConfigName|user@host> <?url> <?idOrProxyJump> <?identitiesOnly> <?proxyJump> # creates a ssh config. Single user@host arg auto-parses. Two args: alias user@host. Trailing keyword 'identitiesOnly' adds an "IdentitiesOnly yes" line. Trailing 'proxyJump {jumpHostName}' adds a ProxyJump line.
 {
   #set -x
   local sshConfigHost=""
@@ -262,13 +283,19 @@ ossh.config.create() # <?sshConfigName|user@host> <?url> <?idOrProxyJump> <?prox
     fi
   fi
 
-  # Scan remaining args for proxyJump keyword, collect the rest as id
+  # Scan remaining args for proxyJump and identitiesOnly keywords, collect the rest as id.
+  # `proxyJump <jumpHost>` consumes the next arg as the jump host name.
+  # `identitiesOnly` is a bare keyword (no value) that toggles the IdentitiesOnly line.
   local proxyJump=""
+  local identitiesOnly=""
   local remainingArgs=()
   while [ -n "$1" ]; do
     if [ "$1" = "proxyJump" ]; then
       shift
       proxyJump="$1"
+      shift
+    elif [ "$1" = "identitiesOnly" ]; then
+      identitiesOnly="yes"
       shift
     else
       remainingArgs+=("$1")
@@ -445,6 +472,15 @@ private.push.init.oosh() {
     return 1
   }
 
+  # Stage installer + outer identity (email + keypair) to /tmp on the remote so
+  # osshLayout build can populate ids/ssh.<installer-id>/ and ids/ssh.outeruser/
+  # with the runner's identity rather than the container user's. In test mode
+  # the runner is both installer and outer, so the same bytes go to both file
+  # sets. ProxyJump (future) will diverge runner-side; the consumer never collapses.
+  private.ossh.identity.stage "$sshConfigHost" || {
+    warn.log "Failed to stage installer identity on $sshConfigHost — osshLayout will fall back to whoami@hostname"
+  }
+
   success.log "Successfully transferred init files to $sshConfigHost"
 
   # Run remote installer — always installs to root
@@ -471,6 +507,117 @@ private.push.init.oosh() {
 
   ossh.install.finish.local $sshConfigHost "$OSSH_INSTALL_TARGET_USER"
 
+}
+
+private.ossh.identity.stage() # <toHost> # stage runner email + id_ed25519 keypair to /tmp/oosh.{installer,outer}.* on <toHost>
+# Used by ossh.install before init/oosh runs on the remote so osshLayout build
+# (called inside the install) can populate ids/ssh.<installer-id>/ and
+# ids/ssh.outeruser/ from the host runner's identity rather than the container
+# user's. Test mode: runner is both installer and outer, so the same bytes are
+# pushed to both file sets. ProxyJump (future) will diverge the two roles
+# runner-side; the consumer (osshLayout) never collapses.
+{
+  local toHost="$1"
+  if [ -z "$toHost" ]; then
+    error.log "private.ossh.identity.stage: <toHost> required"
+    return 1
+  fi
+
+  local installerEmail
+  installerEmail="${USER_EMAIL:-$(git config --global user.email 2>/dev/null)}"
+  [ -z "$installerEmail" ] && installerEmail="$(git config user.email 2>/dev/null)"
+  [ -z "$installerEmail" ] && installerEmail="$(whoami)@$(hostname)"
+
+  local privKey="$HOME/.ssh/id_ed25519"
+  local pubKey="$HOME/.ssh/id_ed25519.pub"
+  if [ ! -f "$privKey" ] || [ ! -f "$pubKey" ]; then
+    warn.log "private.ossh.identity.stage: $privKey or .pub missing — skipping identity staging"
+    return 1
+  fi
+
+  # Stage installer (always the runner's full keypair).
+  printf '%s\n' "$installerEmail" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.installer.email && chmod 600 /tmp/oosh.installer.email" \
+    || { error.log "stage email -> /tmp/oosh.installer.email failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.installer.id_ed25519 && chmod 600 /tmp/oosh.installer.id_ed25519" < "$privKey" \
+    || { error.log "stage id_ed25519 -> /tmp/oosh.installer.id_ed25519 failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.installer.id_ed25519.pub && chmod 644 /tmp/oosh.installer.id_ed25519.pub" < "$pubKey" \
+    || { error.log "stage id_ed25519.pub -> /tmp/oosh.installer.id_ed25519.pub failed"; return 1; }
+
+  # Stage outer. ProxyJump-aware: if $toHost is reached via ProxyJump, the
+  # outer is the jump host (a different identity); otherwise outer == installer
+  # (test-mode collapse — same bytes).
+  local jumpHost=""
+  if command -v ssh >/dev/null 2>&1; then
+    jumpHost=$(ssh -G "$toHost" 2>/dev/null | awk '/^proxyjump /{print $2; exit}')
+  fi
+
+  if [ -n "$jumpHost" ] && [ "$jumpHost" != "none" ]; then
+    important.log "ProxyJump detected for $toHost: outer = $jumpHost"
+    private.ossh.identity.stage.outer.proxyJump "$toHost" "$jumpHost" \
+      || { warn.log "ProxyJump outer staging failed; falling back to runner identity for outer"; private.ossh.identity.stage.outer.fromRunner "$toHost" "$installerEmail" "$privKey" "$pubKey"; }
+  else
+    private.ossh.identity.stage.outer.fromRunner "$toHost" "$installerEmail" "$privKey" "$pubKey" \
+      || return 1
+  fi
+
+  important.log "Staged identity on $toHost: /tmp/oosh.{installer,outer}.* (installer=$installerEmail)"
+  return 0
+}
+
+private.ossh.identity.stage.outer.fromRunner() # <toHost> <email> <privKey> <pubKey> # stage outer with the runner's full keypair (test-mode collapse)
+{
+  local toHost="$1" email="$2" privKey="$3" pubKey="$4"
+  printf '%s\n' "$email" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.email && chmod 600 /tmp/oosh.outer.email" \
+    || { error.log "stage email -> /tmp/oosh.outer.email failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.id_ed25519 && chmod 600 /tmp/oosh.outer.id_ed25519" < "$privKey" \
+    || { error.log "stage id_ed25519 -> /tmp/oosh.outer.id_ed25519 failed"; return 1; }
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.id_ed25519.pub && chmod 644 /tmp/oosh.outer.id_ed25519.pub" < "$pubKey" \
+    || { error.log "stage id_ed25519.pub -> /tmp/oosh.outer.id_ed25519.pub failed"; return 1; }
+  return 0
+}
+
+private.ossh.identity.stage.outer.proxyJump() # <toHost> <jumpHost> # stage outer with the jump host's email + pubkey (no private — we don't have it)
+{
+  local toHost="$1" jumpHost="$2"
+
+  ossh.connection.open "$jumpHost" >/dev/null 2>&1 || true
+
+  # Pull email from jump host (git config preferred, whoami@hostname fallback).
+  local outerEmail
+  outerEmail=$(ossh.exec "$jumpHost" "git config --global user.email 2>/dev/null || git config user.email 2>/dev/null" 2>/dev/null \
+                | sed -E 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | awk 'NF{print; exit}')
+  if [ -z "$outerEmail" ]; then
+    outerEmail=$(ossh.exec "$jumpHost" "printf '%s@%s\n' \"\$(whoami)\" \"\$(hostname)\"" 2>/dev/null \
+                  | sed -E 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | awk 'NF{print; exit}')
+  fi
+  if [ -z "$outerEmail" ]; then
+    error.log "ProxyJump outer staging: could not resolve email on $jumpHost"
+    return 1
+  fi
+
+  # Pull pubkey from jump host (id_ed25519.pub preferred, id_rsa.pub fallback).
+  # Stash to a runner-side tmpfile so we can ssh-cat it onto the install target.
+  local outerPubLocal
+  outerPubLocal=$(mktemp 2>/dev/null) || outerPubLocal="/tmp/oosh.outer.pubkey.$$"
+  if ! ossh.exec "$jumpHost" "cat ~/.ssh/id_ed25519.pub 2>/dev/null || cat ~/.ssh/id_rsa.pub 2>/dev/null" >"$outerPubLocal" 2>/dev/null \
+      || [ ! -s "$outerPubLocal" ]; then
+    error.log "ProxyJump outer staging: could not read a public key from $jumpHost"
+    rm -f "$outerPubLocal"
+    return 1
+  fi
+
+  # Stage email + pubkey only on the install target. Deliberately do NOT stage
+  # /tmp/oosh.outer.id_ed25519 — we don't have the jump host's private key, and
+  # role.outeruser will produce a pubkey-only ssh.outeruser/ from this.
+  printf '%s\n' "$outerEmail" | private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.email && chmod 600 /tmp/oosh.outer.email" \
+    || { error.log "stage outer email -> /tmp/oosh.outer.email failed"; rm -f "$outerPubLocal"; return 1; }
+  private.ossh.ssh "$toHost" "rm -f /tmp/oosh.outer.id_ed25519" 2>/dev/null
+  private.ossh.ssh "$toHost" "cat > /tmp/oosh.outer.id_ed25519.pub && chmod 644 /tmp/oosh.outer.id_ed25519.pub" < "$outerPubLocal" \
+    || { error.log "stage outer pubkey -> /tmp/oosh.outer.id_ed25519.pub failed"; rm -f "$outerPubLocal"; return 1; }
+
+  rm -f "$outerPubLocal"
+  important.log "ProxyJump outer staging: $jumpHost identity = $outerEmail (pubkey-only)"
+  return 0
 }
 
 ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal> #
@@ -542,64 +689,32 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
 
   user authorized.keys.update
 
-  # Re-add the 2cuGitHub alias to ~/.ssh/config. State 31's
-  # `private.install.dev.configs` added it earlier, but the backup step
-  # at line 529-530 (.ssh → ssh.original) followed by `user init`
-  # (line 532) created a fresh ~/.ssh/config with WODA-only entries on
-  # first install, discarding the 2cuGitHub block. Without this re-add,
-  # root's `oo update` / `git pull` fails with "Could not resolve
-  # hostname 2cugithub" because no Host alias matches.
-  local _basehomeForDk
-  _basehomeForDk="$(dirname "$HOME")"
-  [ "$_basehomeForDk" = / ] && _basehomeForDk=/home
-  if [ -f "$_basehomeForDk/developking/.ssh/id_rsa" ] \
-     && ! grep -q "^Host 2cuGitHub" "$HOME/.ssh/config" 2>/dev/null; then
-    ossh.config.create 2cuGitHub git@github.com:Cerulean-Circle-GmbH/once.sh.git "$_basehomeForDk/developking/.ssh/id_rsa"
-    ossh.config.save.last
-    if ! grep -q "github.com" "$HOME/.ssh/known_hosts" 2>/dev/null; then
-      ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
-    fi
+  # Build the prescribed .ssh/ layout: owner symlinks, ids/ssh.developking/,
+  # ids/ssh.<installer-id>/, ids/ssh.outeruser/. With private.ossh.identity.stage
+  # having placed /tmp/oosh.{installer,outer}.* before init/oosh ran, the role
+  # methods auto-resolve the host runner's identity for installer + outer.
+  # Owner falls back to whoami@hostname for the running user (root here).
+  if ! osshLayout build; then
+    warn.log "osshLayout build did not complete; continuing install"
   fi
 
-  # Fix hardcoded root home paths in shared config so non-root users can source it
-  # Runs as root here, so no permission issues with the shared config
-  # Use $HOME to detect actual root home (/root on Linux, /var/root on macOS)
-  if [ -f "$CONFIG" ]; then
-    local rootHome="$HOME"
-    local sedFlag="-i"
-    # macOS BSD sed requires -i '' for in-place editing (GNU sed uses -i alone)
-    if [ "$(uname -s)" = "Darwin" ]; then sedFlag="-i ''"; fi
+  # github.com + WODA Host aliases are now owned upstream:
+  #   - github.com: state 31's `private.install.dev.configs` (oo) +
+  #                 ossh.config.shared.github.create (this file)
+  #   - WODA.{test,dev.root,dev}: user.init (user:243-273)
+  # user.init was rewritten in commit f515903 to be append-if-missing
+  # (was a destructive `} >$sshDir/config` heredoc), so state 31's
+  # github.com block now survives user.init instead of being wiped.
+  # The defensive re-adds that lived here (F1/F2 from the audit at
+  # docs/research/state-machine-fixup-audit.md) are no longer needed.
 
-    eval sed $sedFlag "'s|${rootHome}/config|\$HOME/config|g'" "'$CONFIG'"
-    eval sed $sedFlag "'s|${rootHome}/oosh|\$HOME/oosh|g'" "'$CONFIG'"
-    # Also fix worktree branch paths (e.g. /root/dev -> $HOME/oosh)
-    if [ -n "$OOSH_BRANCH" ] && [ "$OOSH_BRANCH" != "dev" ]; then
-      eval sed $sedFlag "'s|${rootHome}/${OOSH_BRANCH}|\$HOME/oosh|g'" "'$CONFIG'"
-    fi
-    # Also fix path references in sourced sub-configs
-    local configDir
-    configDir="$(dirname "$CONFIG")"
-    for f in "$configDir"/oosh.env "$configDir"/log.env; do
-      if [ -f "$f" ]; then
-        eval sed $sedFlag "'s|${rootHome}/config|\$HOME/config|g'" "'$f'"
-        eval sed $sedFlag "'s|${rootHome}/oosh|\$HOME/oosh|g'" "'$f'"
-        if [ -n "$OOSH_BRANCH" ] && [ "$OOSH_BRANCH" != "dev" ]; then
-          eval sed $sedFlag "'s|${rootHome}/${OOSH_BRANCH}|\$HOME/oosh|g'" "'$f'"
-        fi
-        # Fix OOSH_WORKTREE_BASE to use $HOME
-        eval sed $sedFlag "'s|OOSH_WORKTREE_BASE=\"${rootHome}\"|OOSH_WORKTREE_BASE=\"\$HOME\"|g'" "'$f'"
-      fi
-    done
-  fi
-
-  # Backup seed of /home/shared/.ssh/ in case state 31's call didn't run.
-  # Idempotent via ossh.config.shared.create's own file-exists guards.
-  local _basehome
-  _basehome="$(dirname "$HOME")"
-  [ "$_basehome" = / ] && _basehome=/home
-  if [ -f "$_basehome/developking/.ssh/id_rsa" ] && [ ! -f "$_basehome/shared/.ssh/2cuGitHub" ]; then
-    ossh.config.shared.create "" "$_basehome/developking/.ssh/id_rsa"
-  fi
+  # F3 + F4 (audit rows in docs/research/state-machine-fixup-audit.md) used
+  # to live here. F3 sed-rewrote /root paths in shared config; F4 was a
+  # defensive re-seed of /<basehome>/shared/.ssh/. Both are now owned by
+  # state 31 (oo:1229+) — F3's templating runs right after `config save`
+  # at oo:1494, F4's seed is the now-fail-loud `ossh config.shared.create`
+  # at the bottom of state 31's body. State machine owns it; if it fails,
+  # state 31 halts and the install does not progress here.
 
   # Clear install-only logging — LOG_INSTALL must not persist into user sessions
   # (it would be saved to log.env by config.save and cause Permission denied errors)
@@ -634,64 +749,14 @@ ossh.install.finish.local() # # finishes local oosh installation
     warn.log "Failed to push config to $sshConfigHost — continuing"
   }
 
-  # Set up shared SSH config for GitHub access (all via private.ossh.ssh)
-  # Uses dirname "$HOME" for platform-agnostic shared path (/home on Linux, /Users on macOS)
-  if [ -f "$HOME/.ssh/deploy_keys/2cuGitHub" ]; then
-    # Transfer deploy key to remote's shared location
-    private.ossh.ssh "$sshConfigHost" "
-      basehome=\$(dirname \"\$HOME\")
-      [ \"\$basehome\" = / ] && basehome=/home
-      sharedSsh=\"\$basehome/shared/.ssh\"
-      mkdir -p \"\$sharedSsh\" && chmod 750 \"\$sharedSsh\" && cat > \"\$sharedSsh/2cuGitHub\" && chmod 600 \"\$sharedSsh/2cuGitHub\"
-    " < "$HOME/.ssh/deploy_keys/2cuGitHub" || {
-      warn.log "Failed to transfer deploy key — continuing"
-    }
-    # Create shared SSH config and known_hosts (IdentityFile uses ~/.ssh/ so each user reads their own copy)
-    private.ossh.ssh "$sshConfigHost" "bash -c '
-      basehome=\$(dirname \"\$HOME\")
-      [ \"\$basehome\" = / ] && basehome=/home
-      sharedSsh=\"\$basehome/shared/.ssh\"
-      if ! grep -q \"^Host 2cuGitHub\" \"\$sharedSsh/config\" 2>/dev/null; then
-        printf \"\nHost 2cuGitHub\n User git\n Port 22\n HostName github.com\n IdentityFile ~/.ssh/2cuGitHub\n\n\" >> \"\$sharedSsh/config\"
-        chmod 644 \"\$sharedSsh/config\"
-      fi
-      if ! grep -q github.com \"\$sharedSsh/known_hosts\" 2>/dev/null; then
-        ssh-keyscan github.com >> \"\$sharedSsh/known_hosts\" 2>/dev/null
-        chmod 644 \"\$sharedSsh/known_hosts\"
-      fi
-    '" 2>/dev/null || {
-      warn.log "Could not create shared SSH config — continuing"
-    }
-    # Propagate the shared .ssh artefacts to every user's ~/.ssh (extracted
-    # helper — same logic used by the developking-fallback else branch).
-    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
-  else
-    # Fallback: seed /home/shared/.ssh/ from developking's in-place key,
-    # which state 31 populates from test.wo-da.de templates (see oo:1294).
-    # This closes the "every oosh user has GitHub access through developking
-    # automatically" expectation in the common case where the caller doesn't
-    # carry a local ~/.ssh/deploy_keys/2cuGitHub. user.oosh.install's
-    # existing copy-step (user:766-779) then propagates the seeded
-    # {2cuGitHub, config, known_hosts} into every new user's ~/.ssh/.
-    #
-    # If developking/.ssh/id_rsa is missing (test.wo-da.de unreachable AND
-    # no local templates) we emit a note and skip quietly — install still
-    # succeeds; only GitHub access ends up unconfigured.
-    # Caller has no local deploy_keys/2cuGitHub. Delegate to the oosh config
-    # primitive `ossh.config.shared.create`, sourced from developking's
-    # in-place id_rsa on the remote. State 31 also runs this method as part
-    # of its body, so in the normal caller-initiated flow the shared dir is
-    # ALREADY seeded when we get here — this else-branch then becomes a
-    # no-op thanks to ossh.config.shared.create's idempotency guards (file-
-    # exists check on the key, ossh.config.get on the Host alias, grep -q
-    # on known_hosts). Same single source of truth on both sides.
-    info.log "No local ~/.ssh/deploy_keys/2cuGitHub — delegating to ossh config.shared.create with developking's in-place key"
-    private.ossh.ssh "$sshConfigHost" "ossh config.shared.create \"\" \"~developking/.ssh/id_rsa\"" 2>/dev/null \
-      || warn.log "Could not seed shared .ssh from developking — GitHub access won't propagate to other users"
-
-    # Propagate to every existing user using the shared helper.
-    private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
-  fi
+  # Runner-side shared-SSH seeding + propagation. seed.github is idempotent
+  # (skip-when-seeded probe at start) and replaces the historical pre-Phase-3
+  # branching that read the runner's local ~/.ssh/deploy_keys/2cuGitHub.
+  # Github access now flows through ~/.ssh/ids/ssh.developking/id_rsa
+  # placed by osshLayout.role.developking on every user — no per-runner key
+  # transfer needed. The propagation helper is idempotent (append-if-missing).
+  ossh.config.shared.seed.github "$sshConfigHost"
+  private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
 
   local remoteKeyName
   # Strip ANSI escape sequences that leak into stdout when the remote's
@@ -765,11 +830,12 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
   # sshConfigHost resolves to) — matches the layout ossh.install.finish.local
   # already uses at line 636 (`basehome=$(dirname $HOME)`). No hardcoded
   # usernames — works before developking even exists.
+  # Resolve the remote's user-home base via $OSTYPE on the remote itself —
+  # mirrors private.ossh.users.basehome's logic, expressed inline so the
+  # remote doesn't need to source ossh just to compute /Users vs /home.
   local baseDir
-  baseDir=$(private.ossh.ssh "$sshConfigHost" 'dirname "$HOME"')
+  baseDir=$(private.ossh.ssh "$sshConfigHost" 'case "$OSTYPE" in darwin*) printf "%s\n" /Users ;; *) printf "%s\n" /home ;; esac')
   if [ -z "$baseDir" ] || [ "$baseDir" = "/" ]; then
-    # Edge case: SSH user's home is at filesystem root (e.g. root on some
-    # Linuxes lives at /root). Fall back to /home.
     baseDir="/home"
   fi
   local sharedOosh="$baseDir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/$ooshBranch"
@@ -882,24 +948,231 @@ ossh.update.authorized_keys() # <?sshDir:~/.ssh> # updates authorized_keys from 
 
 
 
-ossh.fix.rights() # <?sshDir:~/.ssh> # fixes file permissions in sshDir
+ossh.rights.fix() # <?sshDir:~/.ssh> # canonical perms on sshDir (alias for private.osshLayout.perms.tighten)
 {
   private.get.sshDir "$1"
-  if [ -n "$1" ]; then
+  if [ -n "$1" ]; then shift; fi
+  private.osshLayout.perms.tighten "$RESULT"
+}
+ossh.rights.fix.completion.sshDir() { echo "$HOME/.ssh"; }
+
+ossh.folder.fix() # <?installerEmail> <?sshDir:~/.ssh> <?mode:conservative> # converge ~/.ssh to canonical state; mode=conservative|strict
+{
+  # Arg parsing — classify by content (any order, any subset):
+  #   *@*                 → installerEmail
+  #   conservative|strict → mode
+  #   anything else       → sshDir
+  # Empty positional slots are ignored (so `ossh folder.fix "" path strict`
+  # also works).
+  local installerEmail="" sshDir="" mode=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      "")                  : ;;
+      conservative|strict) mode="$1" ;;
+      *@*)                 installerEmail="$1" ;;
+      *)                   sshDir="$1" ;;
+    esac
     shift
+  done
+  [ -z "$mode" ] && mode="conservative"
+  if [ -z "$sshDir" ]; then
+    private.get.sshDir ""
+    sshDir="$RESULT"
   fi
+
+  case "$mode" in
+    conservative|strict) ;;
+    *) error.log "ossh.folder.fix: unknown mode '$mode' (use conservative|strict)"; return 1 ;;
+  esac
+
+  important.log "ossh.folder.fix: converging $sshDir (mode=$mode)"
+
+  # Phase 1 — canonical tree. osshLayout.build is idempotent and (per
+  # commit 7660ac8) tolerates already-populated installer/outer dirs, so
+  # this is safe to call on any pre-existing tree. If installerEmail is
+  # empty, the role discovers from <sshDir>/ids/ssh.*/.
+  osshLayout.build "$installerEmail" "" "$sshDir" || { error.log "osshLayout.build failed"; return 1; }
+
+  # Phase 2 — WODA Host blocks. user.init appends-if-missing.
+  user.init "$sshDir" >/dev/null 2>&1 || warn.log "user.init returned non-zero; WODA blocks may not be present"
+
+  # Phase 2b — normalise ~/.ssh/config (WODA portability + Host github.com). Always runs.
+  private.ossh.folder.fix.config.normalize "$sshDir" || warn.log "config.normalize had errors"
+
+  # Phase 3 — strict-mode pruning (opt-in). Also removes the legacy Host 2cuGitHub block.
+  if [ "$mode" = "strict" ]; then
+    private.ossh.folder.fix.prune "$sshDir" || warn.log "strict pruning had errors"
+    private.ossh.folder.fix.config.strip.legacy "$sshDir" || warn.log "config.strip.legacy had errors"
+  fi
+
+  # Phase 4 — canonical perms (always last; sshd StrictModes requirement).
+  private.osshLayout.perms.tighten "$sshDir" || { error.log "private.osshLayout.perms.tighten failed"; return 1; }
+
+  success.log "ossh.folder.fix: $sshDir now canonical"
+}
+ossh.folder.fix.completion.installerEmail() { :; }
+ossh.folder.fix.completion.sshDir() { echo "$HOME/.ssh"; }
+ossh.folder.fix.completion.mode() { printf 'conservative\nstrict\n'; }
+
+private.ossh.folder.fix.prune() # <sshDir> # remove known-stale legacy artifacts (strict-mode only). NEVER touches authorized_keys, id_rsa, or anything the user might rely on.
+{
+  local sshDir="$1"
+  # Backup / rotation artifacts
+  rm -f "$sshDir"/*.bak.* "$sshDir"/*.old "$sshDir"/*.previous "$sshDir"/*.previous.pub 2>/dev/null
+  rm -f "$sshDir/id_ed25519.previous" "$sshDir/id_ed25519.pub.previous" 2>/dev/null
+  rm -f "$sshDir/known_hosts.old" 2>/dev/null
+  # Legacy pre-developking single-key files
+  rm -f "$sshDir/2cuGitHub" "$sshDir/2cuGitHub.pub" 2>/dev/null
+  # Stale tooling debris
+  rm -rf "$sshDir/no_deploy_keys" 2>/dev/null
+  rm -rf "$sshDir"/ssh-copy-id.* 2>/dev/null
+}
+
+private.ossh.folder.fix.config.normalize() # <sshDir> # ensure ~/.ssh/config has portable WODA paths + Host github.com block (conservative repairs to user-facing contract from test.ssh.config.invariant)
+{
+  local sshDir="$1"
+  local cfg="$sshDir/config"
+  [ -f "$cfg" ] || { touch "$cfg"; chmod 600 "$cfg"; }
+
+  # Repair existing WODA Host blocks whose IdentityFile is absolute. Per
+  # commit 9a5af58, the canonical form is the literal "~/.ssh/id_ed25519"
+  # so SSH expands ~ per-user at read-time. user.init appends-if-missing
+  # so it doesn't touch already-present blocks; this pass fixes them.
+  local tmp="$cfg.tmp.$$"
+  awk '
+    /^Host WODA\.(test|dev\.root|dev)$/ { in_woda = 1 }
+    /^Host / && !/^Host WODA\.(test|dev\.root|dev)$/ { in_woda = 0 }
+    {
+      if (in_woda && $1 == "IdentityFile" && $2 != "~/.ssh/id_ed25519") {
+        print " IdentityFile ~/.ssh/id_ed25519"
+      } else {
+        print
+      }
+    }
+  ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+
+  # Add Host github.com block if missing. Canonical form per
+  # test.ssh.config.invariant: IdentityFile points at
+  # ~/.ssh/ids/ssh.developking/id_rsa (single source of truth).
+  if ! grep -q "^Host github.com\$" "$cfg" 2>/dev/null; then
+    cat >>"$cfg" <<EOF
+
+Host github.com
+ User git
+ Port 22
+ HostName github.com
+ IdentityFile ~/.ssh/ids/ssh.developking/id_rsa
+EOF
+  fi
+  chmod 600 "$cfg"
+}
+
+private.ossh.folder.fix.config.strip.legacy() # <sshDir> # remove the legacy Host 2cuGitHub block from ~/.ssh/config (strict-mode only). Host github.com is the canonical replacement.
+{
+  local sshDir="$1"
+  local cfg="$sshDir/config"
+  [ -f "$cfg" ] || return 0
+  grep -q "^Host 2cuGitHub\$" "$cfg" 2>/dev/null || return 0
+
+  # Pre-flight: warn if any git repo under $HOME has a remote URL that
+  # depends on the 2cuGitHub Host alias. Doesn't block; just alerts.
+  # The user can fix with: git remote set-url origin git@github.com:owner/repo.git
+  private.ossh.folder.fix.scan.git.remotes 2cuGitHub
+
+  local tmp="$cfg.tmp.$$"
+  awk '
+    /^Host / { target = ($0 == "Host 2cuGitHub") }
+    !target { print }
+  ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+  chmod 600 "$cfg"
+}
+
+private.ossh.folder.fix.scan.git.remotes() # <hostAlias> # scan git repos under $HOME for remotes that reference <hostAlias>: and warn the user to update them
+{
+  local alias="$1"
+  command -v git >/dev/null 2>&1 || return 0
+  # Find .git dirs up to 4 levels deep under $HOME. Skip the .ssh tree and
+  # any hidden dotdirs other than .git itself. Cap depth to avoid huge home
+  # dirs; deeper consumers can run the scan manually.
+  local gitDir repo url found=0
+  while IFS= read -r gitDir; do
+    repo="${gitDir%/.git}"
+    url=$(git -C "$repo" remote get-url origin 2>/dev/null)
+    if [[ "$url" == "${alias}:"* ]] || [[ "$url" == *"@${alias}:"* ]]; then
+      if [ "$found" -eq 0 ]; then
+        warn.log "private.ossh.folder.fix.scan.git.remotes: removing Host $alias from ~/.ssh/config will break these git remotes:"
+        found=1
+      fi
+      warn.log "  $repo -> $url"
+      warn.log "    fix: git -C $repo remote set-url origin git@github.com:OWNER/REPO.git"
+    fi
+  done < <(find "$HOME" -maxdepth 5 -type d -name .git 2>/dev/null | grep -v '/\.ssh/')
+  return 0
+}
+
+ossh.folder.fix.check() # <?sshDir:~/.ssh> # report drift from canonical state (read-only, never mutates; returns 0 even when drift found)
+{
+  private.get.sshDir "$1"
+  if [ -n "$1" ]; then shift; fi
   local sshDir="$RESULT"
 
-  if ossh.isInstalled "" "$sshDir"; then
-    chmod 700 $sshDir
-    [ -f $sshDir/authorized_keys ] && chmod 600 $sshDir/authorized_keys
-    chmod +X,go+r $sshDir/*
-    if private.detect.ssh.key "$sshDir"; then
-      chmod 600 "$RESULT"
-    fi
-    tree -p $sshDir
+  important.log "ossh.folder.fix.check: inspecting $sshDir"
+
+  # Existence
+  if [ ! -d "$sshDir" ]; then
+    warn.log "missing: $sshDir"
+    console.log "ossh.folder.fix.check: done (run 'ossh folder.fix' to create canonical tree)"
+    return 0
   fi
+
+  local drift=0
+  local sym
+  # Forbidden symlinks (Phase 2 invariant) under private_key/ and public_keys/.
+  for sym in "$sshDir"/private_key/*.private_key "$sshDir"/public_keys/*.public_key \
+             "$sshDir"/ids/*/private_key/*.private_key "$sshDir"/ids/*/public_keys/*.public_key; do
+    if [ -L "$sym" ] 2>/dev/null; then
+      warn.log "forbidden symlink (Phase 2 violation): $sym"
+      drift=$((drift+1))
+    fi
+  done
+
+  # File perms
+  local f mode
+  while IFS= read -r f; do
+    [ -L "$f" ] && continue
+    mode=$(stat -c '%a' "$f" 2>/dev/null)
+    case "$f" in
+      *.private_key|*/id_ed25519|*/id_rsa)
+        [ "$mode" = "600" ] || { warn.log "wrong perms (want 600): $f (got $mode)"; drift=$((drift+1)); }
+        ;;
+      *.public_key|*/id_ed25519.pub|*/id_rsa.pub)
+        [ "$mode" = "644" ] || { warn.log "wrong perms (want 644): $f (got $mode)"; drift=$((drift+1)); }
+        ;;
+    esac
+  done < <(find "$sshDir" -type f 2>/dev/null)
+
+  # Dir perms
+  local d
+  while IFS= read -r d; do
+    mode=$(stat -c '%a' "$d" 2>/dev/null)
+    [ "$mode" = "700" ] || { warn.log "wrong dir perms (want 700): $d (got $mode)"; drift=$((drift+1)); }
+  done < <(find "$sshDir" -type d 2>/dev/null)
+
+  # WODA Host blocks
+  local host
+  for host in WODA.test WODA.dev.root WODA.dev; do
+    grep -qE "^Host ${host}\$" "$sshDir/config" 2>/dev/null \
+      || { warn.log "missing Host block: $host"; drift=$((drift+1)); }
+  done
+
+  if [ "$drift" -eq 0 ]; then
+    success.log "ossh.folder.fix.check: $sshDir is canonical (no drift detected)"
+  else
+    console.log "ossh.folder.fix.check: $drift drift(s) detected — run 'ossh folder.fix [strict]' to converge"
+  fi
+  return 0
 }
+ossh.folder.fix.check.completion.sshDir() { echo "$HOME/.ssh"; }
 
 private.ossh.get.current.key.file.name() # # gets the actual file name (instead of the best key name from get.key.name )
 {
@@ -975,7 +1248,12 @@ ossh.parameter.completion.sshDir() {
 
 ossh.config.create.completion.idOrProxyJump() {
   echo "proxyJump"
+  echo "identitiesOnly"
   ossh.parameter.completion.id "$@"
+}
+
+ossh.config.create.completion.identitiesOnly() {
+  echo "identitiesOnly"
 }
 
 ossh.config.create.completion.proxyJump() {
@@ -1153,6 +1431,7 @@ private.config.create() {
     echo " Port $port"
     echo " HostName $hostname"
     echo " IdentityFile $id"
+    [ -n "$identitiesOnly" ] && echo " IdentitiesOnly yes"
     [ -n "$proxyJump" ] && echo " ProxyJump $proxyJump"
     echo ""
   } >$CONFIG_PATH/result.txt
@@ -1347,48 +1626,33 @@ ossh.config.save.last() {  # <?file> # appends the config to file
   important.log "appended last config to $file"
 }
 
-ossh.config.shared.create() # <?sharedDir> <?deployKeySrc:$HOME/.ssh/deploy_keys/2cuGitHub> # create shared SSH config + 2cuGitHub alias seeded from <deployKeySrc> (target-side callers like state 31 pass ~developking/.ssh/id_rsa)
+ossh.config.shared.github.create() # <?sharedDir> # create shared SSH config + Host github.com alias whose IdentityFile is ~/.ssh/ids/ssh.developking/id_rsa (placed by osshLayout.role.developking on every user). Idempotent.
 {
   local basehome
-  basehome="$(dirname "$HOME")"
-  [ "$basehome" = / ] && basehome=/home
+  basehome="$(private.ossh.users.basehome)"
   local sharedDir="${1:-$basehome/shared/.ssh}"
-  # Source path defaults to caller-side deploy_keys location. Passing an
-  # alternative (e.g. ~developking/.ssh/id_rsa) lets this method also be
-  # invoked from the target-side during state 31, where the caller's
-  # ~/.ssh/deploy_keys/2cuGitHub doesn't exist but developking's in-place
-  # id_rsa does (populated from test.wo-da.de templates or local
-  # $OOSH_DIR/templates/user/developking.ssh/).
-  local deployKeySrc="${2:-$HOME/.ssh/deploy_keys/2cuGitHub}"
 
-  # Create shared SSH directory
   mkdir -p "$sharedDir"
   chmod 700 "$sharedDir"
 
-  # Copy deploy key if not already present
-  local deployKeyDst="$sharedDir/2cuGitHub"
-  if [ ! -f "$deployKeyDst" ]; then
-    if [ ! -f "$deployKeySrc" ]; then
-      error.log "Deploy key not found at $deployKeySrc"
-      create.result 1 "deploy key missing"
-      return $(result)
-    fi
-    cp "$deployKeySrc" "$deployKeyDst"
-    chmod 600 "$deployKeyDst"
-    success.log "Deploy key copied to $deployKeyDst (from $deployKeySrc)"
-  fi
-
-  # Create SSH config using existing oosh methods (idempotent)
-  if ! ossh.config.get 2cuGitHub "$sharedDir/config" >/dev/null 2>&1; then
-    ossh.config.create 2cuGitHub git@github.com:22 "~/.ssh/2cuGitHub"
+  # Emit the Host github.com block via the canonical primitive. IdentityFile
+  # uses literal `~` so SSH expands per-user at read time — every user
+  # (root, developking, bash-user, oosh-user, test, ...) reads the same
+  # shared config and finds their own ids/ssh.developking/id_rsa (placed by
+  # osshLayout.role.developking on every user during install). The
+  # `identitiesOnly` keyword (added Phase A.8) appends `IdentitiesOnly yes`
+  # so ssh-agent doesn't race ahead and present the wrong key first.
+  if ! ossh.config.get github.com "$sharedDir/config" >/dev/null 2>&1; then
+    ossh.config.create github.com git@github.com:22 "~/.ssh/ids/ssh.developking/id_rsa" identitiesOnly
     ossh.config.save.last "$sharedDir/config"
     chmod 600 "$sharedDir/config"
-    success.log "Created 2cuGitHub alias in $sharedDir/config"
+    success.log "Created Host github.com block in $sharedDir/config (IdentityFile ~/.ssh/ids/ssh.developking/id_rsa)"
   else
-    info.log "2cuGitHub alias already exists in $sharedDir/config"
+    info.log "Host github.com already exists in $sharedDir/config"
   fi
 
-  # Pre-populate known_hosts
+  # Pre-populate known_hosts. Runtime ssh-keyscan stays robust against
+  # GitHub host-key rotation; do not bake into a template.
   if [ ! -f "$sharedDir/known_hosts" ] || ! grep -q "github.com" "$sharedDir/known_hosts" 2>/dev/null; then
     ssh-keyscan github.com >> "$sharedDir/known_hosts" 2>/dev/null
     chmod 600 "$sharedDir/known_hosts"
@@ -1398,13 +1662,22 @@ ossh.config.shared.create() # <?sharedDir> <?deployKeySrc:$HOME/.ssh/deploy_keys
   create.result 0 "$sharedDir"
   return $(result)
 }
+ossh.config.shared.github.create.completion.sharedDir() {
+  compgen -d "$1"
+}
+
+# Deprecated shim — old name kept so any state still calling
+# `ossh config.shared.create` does not break. Emits a warn.log for
+# visibility. Drop after the next release once all callers are migrated.
+ossh.config.shared.create() # <?sharedDir> <?deployKeySrc:ignored> # DEPRECATED: use ossh.config.shared.github.create
+{
+  warn.log "ossh.config.shared.create is deprecated; use ossh.config.shared.github.create. The deployKeySrc arg is ignored — github access now flows through ~/.ssh/ids/ssh.developking/id_rsa (placed by osshLayout.role.developking)."
+  ossh.config.shared.github.create "$1"
+}
 ossh.config.shared.create.completion.sharedDir() {
   compgen -d "$1"
 }
 ossh.config.shared.create.completion.deployKeySrc() {
-  # Completes a path to an SSH private key. Tab-completes files; the
-  # common values are $HOME/.ssh/deploy_keys/2cuGitHub (caller-side) and
-  # ~developking/.ssh/id_rsa (target-side state-31 flow).
   compgen -f "$1"
 }
 
@@ -1412,8 +1685,7 @@ ossh.config.shared.link() # <?user> <?sharedDir> # link user SSH config to share
 {
   local targetUser="${1:-$(whoami)}"
   local basehome
-  basehome="$(dirname "$HOME")"
-  [ "$basehome" = / ] && basehome=/home
+  basehome="$(private.ossh.users.basehome)"
   local sharedDir="${2:-$basehome/shared/.ssh}"
   local userHome
   userHome=$(eval echo ~"$targetUser")
@@ -1421,25 +1693,31 @@ ossh.config.shared.link() # <?user> <?sharedDir> # link user SSH config to share
   local userSshDir="$userHome/.ssh"
   mkdir -p "$userSshDir"
 
-  # Copy or append config (SSH requires config owned by user, not symlinked)
-  if ! ossh.config.get 2cuGitHub "$userSshDir/config" >/dev/null 2>&1; then
+  # Copy or append config (SSH requires config owned by user, not symlinked).
+  # Detection key is now `Host github.com` (the post-Phase-3 alias) rather
+  # than the legacy `Host 2cuGitHub`. Phase A.8: use ossh.config.get (the
+  # canonical detection primitive) instead of inline grep.
+  if ! ossh.config.get github.com "$userSshDir/config" >/dev/null 2>&1; then
     if [ -L "$userSshDir/config" ]; then
-      # Remove stale symlink before copying
       rm -f "$userSshDir/config"
     fi
     if [ ! -f "$userSshDir/config" ]; then
       cp "$sharedDir/config" "$userSshDir/config"
       success.log "Copied shared config to $userSshDir/config"
     else
-      # Config exists — append 2cuGitHub block
-      ossh.config.create 2cuGitHub git@github.com:22 "$sharedDir/2cuGitHub"
-      ossh.config.save.last "$userSshDir/config"
-      success.log "Appended 2cuGitHub to $userSshDir/config"
+      # Config exists — append github.com block from shared. Use the shared
+      # config as source-of-truth: extract its github.com block verbatim.
+      awk '
+        /^Host github.com$/ {found=1; print; next}
+        found && /^Host / {found=0}
+        found {print}
+      ' "$sharedDir/config" >> "$userSshDir/config"
+      success.log "Appended Host github.com to $userSshDir/config"
     fi
     chown "$targetUser" "$userSshDir/config" 2>/dev/null
     chmod 600 "$userSshDir/config"
   else
-    info.log "2cuGitHub already exists in $userSshDir/config"
+    info.log "Host github.com already exists in $userSshDir/config"
   fi
 
   # Copy or append known_hosts
@@ -1466,7 +1744,62 @@ ossh.config.shared.link.completion.sharedDir() {
   compgen -d "$1"
 }
 
-private.ossh.shared.ssh.copy.to.all() # <sshConfigHost> # on <sshConfigHost>, copy /home/shared/.ssh/{config,known_hosts,2cuGitHub} to every existing user's ~/.ssh/ with owner=user (login group), perms 700/600/644. Single source of truth for the per-user propagation step shared by ossh.install.finish.local's caller-side path and its developking-fallback else branch.
+ossh.config.shared.seed.github() # <sshConfigHost> # seed {basehome}/shared/.ssh/{config,known_hosts} on <sshConfigHost> with the Host github.com block whose IdentityFile is ~/.ssh/ids/ssh.developking/id_rsa. Idempotent skip-when-seeded probe at start.
+{
+  local sshConfigHost="$1"
+  if [ -z "$sshConfigHost" ]; then
+    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
+    return 1
+  fi
+
+  # Skip-when-already-seeded probe. NOTE (Phase A.8): grep is intentional
+  # here — this expression runs in a remote bash via ossh.exec where OOSH
+  # functions like ossh.config.get aren't reliably importable across the
+  # shell layers (sudo + ssh + bash -c). Local sites in the same file use
+  # ossh.config.get; this remote-side site stays as grep.
+  if ossh.exec "$sshConfigHost" 'case "$OSTYPE" in darwin*) b=/Users ;; *) b=/home ;; esac; grep -q "^Host github.com$" "$b/shared/.ssh/config" 2>/dev/null' 2>/dev/null; then
+    info.log "Shared .ssh already has Host github.com on $sshConfigHost — skipping seed"
+    return 0
+  fi
+
+  # Delegate to remote `ossh config.shared.github.create`. Same plumbing as
+  # the legacy seed.fallback used (sudo + absolute path so we don't lose PATH
+  # on macOS sudoers env_reset, and so the install user — possibly not yet
+  # in the new NSS group cache — can still write to /<basehome>/shared/.ssh).
+  if ossh.exec "$sshConfigHost" 'sudo -E $(command -v ossh) config.shared.github.create'; then
+    return 0
+  fi
+
+  warn.log "Could not seed shared .ssh github block on $sshConfigHost — non-root users will lack GitHub Host alias"
+  return 1
+}
+ossh.config.shared.seed.github.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+# Deprecated shims — the deploy_keys/2cuGitHub seeding flow no longer exists.
+# GitHub access flows through ~/.ssh/ids/ssh.developking/id_rsa placed by
+# osshLayout.role.developking on every user. These shims keep call sites
+# from breaking; drop after the next release once all callers migrate to
+# ossh.config.shared.seed.github.
+ossh.config.shared.seed.from.local.deploy.key() # <sshConfigHost> # DEPRECATED: use ossh.config.shared.seed.github
+{
+  warn.log "ossh.config.shared.seed.from.local.deploy.key is deprecated; use ossh.config.shared.seed.github"
+  ossh.config.shared.seed.github "$1"
+}
+ossh.config.shared.seed.from.local.deploy.key.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+ossh.config.shared.seed.fallback() # <sshConfigHost> # DEPRECATED: use ossh.config.shared.seed.github
+{
+  warn.log "ossh.config.shared.seed.fallback is deprecated; use ossh.config.shared.seed.github"
+  ossh.config.shared.seed.github "$1"
+}
+ossh.config.shared.seed.fallback.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+private.ossh.shared.ssh.copy.to.all() # <sshConfigHost> # on <sshConfigHost>, append /home/shared/.ssh/{config,known_hosts} into every existing user's ~/.ssh/ with owner=user (login group), perms 700/600/644. Append-if-missing on Host github.com (idempotent). The standalone deploy key is no longer copied — github access uses ~/.ssh/ids/ssh.developking/id_rsa from osshLayout.role.developking.
 {
   local sshConfigHost="$1"
   if [ -z "$sshConfigHost" ]; then
@@ -1483,33 +1816,51 @@ private.ossh.shared.ssh.copy.to.all() # <sshConfigHost> # on <sshConfigHost>, co
   # login group whatever it's named. Robust against platform.test containers
   # where `test` has gid=0 and no `test` group exists; explicit `$u:$u`
   # would error with "invalid group".
+  # sudo'd context: $HOME on the remote becomes root's home (/var/root on
+  # macOS) — dirname /var/root = /var which is wrong. Use $OSTYPE (bash
+  # builtin, available everywhere) to pick /Users vs /home directly.
+  # Same logic as private.ossh.users.basehome; inlined here because the
+  # sudo'd remote bash doesn't source ossh.
+  # Append-if-missing semantics for ~/.ssh/config and ~/.ssh/known_hosts:
+  # cp would destructively overwrite, wiping any Host aliases the user
+  # already wrote (e.g. WODA Host blocks from user.init, custom entries,
+  # etc.). The shared config carries `Host github.com` whose IdentityFile
+  # is ~/.ssh/ids/ssh.developking/id_rsa — placed by
+  # osshLayout.role.developking on every user during install, so no
+  # standalone deploy-key file needs to be propagated.
   private.ossh.ssh "$sshConfigHost" "sudo bash -c '
-    basehome=\$(dirname \"\$HOME\")
-    [ \"\$basehome\" = / ] && basehome=/home
+    case \"\$OSTYPE\" in darwin*) basehome=/Users ;; *) basehome=/home ;; esac
     sharedSsh=\"\$basehome/shared/.ssh\"
-    [ -f \"\$sharedSsh/2cuGitHub\" ] || exit 0
+    [ -f \"\$sharedSsh/config\" ] || exit 0
+
+    propagate() {
+      local h=\"\$1\" owner=\"\$2\"
+      mkdir -p \"\$h/.ssh\"
+      # config: append Host github.com block only if not already present.
+      # Phase A.8: grep is intentional here — this runs in a sudo'd remote
+      # bash subshell (private.ossh.ssh + sudo bash -c) where ossh.config.get
+      # isn't reliably importable. Local sites use ossh.config.get.
+      if ! grep -q \"^Host github.com\$\" \"\$h/.ssh/config\" 2>/dev/null; then
+        cat \"\$sharedSsh/config\" >> \"\$h/.ssh/config\"
+      fi
+      # known_hosts: append github.com line if not present (idempotent)
+      if [ -f \"\$sharedSsh/known_hosts\" ] && ! grep -q github.com \"\$h/.ssh/known_hosts\" 2>/dev/null; then
+        cat \"\$sharedSsh/known_hosts\" >> \"\$h/.ssh/known_hosts\"
+      fi
+      chown \"\$owner:\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" 2>/dev/null
+      chmod 700 \"\$h/.ssh\"
+      [ -f \"\$h/.ssh/config\" ] && chmod 600 \"\$h/.ssh/config\"
+      [ -f \"\$h/.ssh/known_hosts\" ] && chmod 644 \"\$h/.ssh/known_hosts\"
+    }
+
     for u in \$(ls \"\$basehome\" 2>/dev/null | grep -v shared); do
       h=\"\$basehome/\$u\"
       [ -d \"\$h\" ] || continue
-      mkdir -p \"\$h/.ssh\"
-      cp \"\$sharedSsh/config\" \"\$h/.ssh/config\" 2>/dev/null
-      cp \"\$sharedSsh/known_hosts\" \"\$h/.ssh/known_hosts\" 2>/dev/null
-      cp \"\$sharedSsh/2cuGitHub\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-      chown \"\$u:\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" \"\$h/.ssh/2cuGitHub\" 2>/dev/null
-      chmod 700 \"\$h/.ssh\"
-      chmod 600 \"\$h/.ssh/config\" \"\$h/.ssh/2cuGitHub\"
-      chmod 644 \"\$h/.ssh/known_hosts\"
+      propagate \"\$h\" \"\$u\"
     done
     rootHome=\$(eval echo ~root)
     if [ -d \"\$rootHome\" ]; then
-      mkdir -p \"\$rootHome/.ssh\"
-      cp \"\$sharedSsh/config\" \"\$rootHome/.ssh/config\" 2>/dev/null
-      cp \"\$sharedSsh/known_hosts\" \"\$rootHome/.ssh/known_hosts\" 2>/dev/null
-      cp \"\$sharedSsh/2cuGitHub\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-      chown root: \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/known_hosts\" \"\$rootHome/.ssh/2cuGitHub\" 2>/dev/null
-      chmod 700 \"\$rootHome/.ssh\"
-      chmod 600 \"\$rootHome/.ssh/config\" \"\$rootHome/.ssh/2cuGitHub\"
-      chmod 644 \"\$rootHome/.ssh/known_hosts\"
+      propagate \"\$rootHome\" root
     fi
   '" 2>/dev/null
 }
@@ -1655,7 +2006,7 @@ ossh.config.push() # <toHost> <sshConfigName> # adds the config <configName> to 
   private.ossh.push.config "$@"
 }
 
-private.ossh.push.config() # <toHost> <sshConfigName> # adds the config <configName> to the configs on host <toHost>
+private.ossh.push.config() # <toHost> <?sshConfigName> # appends a Host block to <toHost>:~/.ssh/config. With <sshConfigName>: pushes that named local config. Without: NO-OP — the legacy "push runner's self-config to remote" behaviour was useless in every supported deployment (back-call from remote to runner doesn't work in platform.test containers — Docker NAT — and doesn't work in real ProxyJump — jump host's privkey isn't on the remote). Removed in Phase A.6.
 {
 
 
@@ -1670,13 +2021,40 @@ private.ossh.push.config() # <toHost> <sshConfigName> # adds the config <configN
   local configName="$1"
   if [ -n "$1" ]; then
     shift
-      private.ossh.get.config $configName >$CONFIG_PATH/tmp.ssh.config.$configName
+    private.ossh.get.config $configName >$CONFIG_PATH/tmp.ssh.config.$configName
   else
-    ossh.config.create >$CONFIG_PATH/tmp.ssh.config.$configName
+    # No configName given — historical "push runner's self-config" path.
+    # Always skip: nothing in OOSH's deployment topologies actually uses
+    # back-call from the remote to the runner, and the resulting Host
+    # block was either broken (hardcoded runner-side IdentityFile pre-A.5)
+    # or unreachable (Docker NAT in platform.test) or unauthenticated
+    # (no jump host privkey in real ProxyJump). See Phase A.6 commit msg.
+    info.log "private.ossh.push.config: no configName given — skipping runner self-config push (no supported deployment uses back-call from remote)"
+    return 0
   fi
 
 
   ossh.connection.open "$toHost"
+  # Ensure ~/config exists and is owned by the SSH-install user before rsync.
+  # On macOS the install path can leave admin's ~/config root:wheel-owned
+  # (root sudo'd into admin's home during install), causing rsync's atomic
+  # `mkstempat .tmp.ssh.config..XXX` to fail with Permission denied. The
+  # mkdir -p is a no-op when the dir exists; the sudo chown re-claims
+  # ownership for the SSH user. `|| true` keeps the function moving if sudo
+  # isn't installed (no-op on Linux containers where install user owns
+  # ~/config from creation).
+  #
+  # `chown -h` is critical — on Linux, ~/config is a SYMLINK to sharedConfig
+  # (mode developking:dev). Without -h, chown FOLLOWS the symlink and
+  # clobbers sharedConfig's ownership to the SSH-install user — and on
+  # `os platform.test ubuntu_24_04` where test's primary group is gid=0,
+  # `chown $(id -un):` (trailing colon = primary group) sets sharedConfig
+  # to test:root → other dev-group users (oosh-user, bash-user) lose
+  # write access through their own ~/config symlinks, c2 completion fails
+  # with "Permission denied". `chown -h` operates on the link itself when
+  # the path is a symlink, and is a harmless no-op on real dirs (POSIX +
+  # GNU + BSD compatible). Bisect confirmed root cause; see commit msg.
+  private.ossh.ssh "$toHost" "mkdir -p config; sudo chown -h \$(id -un): config 2>/dev/null || true" 2>/dev/null
   private.ossh.rsync "$CONFIG_PATH/tmp.ssh.config.$configName" "$toHost:config/tmp.ssh.config.$configName"
   private.ossh.ssh "$toHost" "cat config/tmp.ssh.config.$configName >>.ssh/config; rm ~/config/tmp.ssh.config.$configName"
   rm ~/config/tmp.ssh.config.$configName
@@ -1712,10 +2090,14 @@ private.ossh.push.key() #  <toHost> <?keyName> <?sshDir:~/.ssh> # adds your key 
   [ -n "$1" ] && shift
   local sshDir="$RESULT"
 
-  echo $sshDir/public_keys/$keyName $toHost:.ssh/public_keys/$keyName
+  # Quote keyName everywhere — defensive against legacy filenames
+  # that may have spaces (pre-sanitization at private.ossh.set.key.name).
+  echo "$sshDir/public_keys/$keyName" "$toHost:.ssh/public_keys/$keyName"
   ossh.connection.open "$toHost"
-  # Transfer key via ssh cat (no rsync needed on remote)
-  private.ossh.ssh "$toHost" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/$keyName" < "$sshDir/public_keys/$keyName"
+  # Transfer key via ssh cat (no rsync needed on remote). Single-quote
+  # the remote redirect target so a keyName with literal whitespace
+  # doesn't get token-split by the remote shell.
+  private.ossh.ssh "$toHost" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/'$keyName'" < "$sshDir/public_keys/$keyName"
   ossh.exec $toHost "user authorized.keys.update" || \
     ossh.exec $toHost "cat ~/.ssh/public_keys/* > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
 }
@@ -1738,7 +2120,16 @@ private.ossh.get.key.name() # # creates a good key name fot this user and host
     if [ -n "$OOSH_SSH_CONFIG_HOST" ]; then
       private.ossh.set.key.name "$USER.$OOSH_SSH_CONFIG_HOST"
     else
-      private.ossh.set.key.name "$USER.$(hostname -f)"
+      # Sanitize hostname output — on GHA macOS runners `hostname -f`
+      # returns multi-token output (e.g. "sat12-bq160-... ssh.runner...")
+      # that splits into multiple words. The resulting keyName ends up
+      # with literal spaces, propagates into filenames in private_key/
+      # and public_keys/, and breaks downstream `ls | sed`-based file
+      # detection (private.ossh.get.file.name at ossh:983) plus scp/ssh
+      # dispatches that don't quote $keyName. Strip everything except
+      # alphanumeric, dot, dash, underscore — same character class
+      # GHA / cloud provisioners actually emit for valid hostnames.
+      private.ossh.set.key.name "$USER.$(hostname -f | tr -dc 'A-Za-z0-9.-_')"
     fi
   fi
 
@@ -1756,7 +2147,8 @@ ossh.key.get.name() # # creates a good key name fot this user and host
 private.ossh.set.key.name() {  # <?sshKeyName> # sets the key name to sshKeyName and saves it in $CONFIG_PATH/ssh.info.env
   local sshKeyName="$1"
   if [ -z "$sshKeyName" ]; then
-    export SSH_KEY_NAME="$USER.$(hostname -f)"
+    # Sanitize — see comment in private.ossh.get.key.name above.
+    export SSH_KEY_NAME="$USER.$(hostname -f | tr -dc 'A-Za-z0-9.-_')"
   fi
   config save "ssh.info" "SSH_" >/dev/null
   stop.log "$SSH_KEY_NAME - $sshKeyName"
@@ -2181,104 +2573,98 @@ ossh.cmd.completion.pkg() {
   compgen -W "bash curl git wget tree expect python3 jq" -- "$1"
 }
 
-ossh.prereqs.install() # <sshConfigHost> # install the oosh install-time prereqs on the remote host (curl, git; macOS hosts without brew get Homebrew bootstrapped first; apk hosts also get bash + shadow + util-linux + busybox suid; brew hosts also get bash + /etc/paths.d/oosh-homebrew)
+private.ossh.prereqs.verify() # {pkgList} # for each pkg, check 'command -v <pkg>'; for each missing, error.log a diagnostic dump (PM/uname/brew presence). Used by ossh.prereqs.install local mode to make silent post-install failures fail-loud.
 {
-  local host="$1"
-  [ -z "$host" ] && { error.log "ossh.prereqs.install: no sshConfigHost specified"; return 1; }
-
-  # Base prereqs every supported package manager needs.
-  local pkgs="curl git"
-
-  # Per-PM additions:
-  #   apk: ships only busybox + ash; oosh needs bash for its shebangs, shadow
-  #        for useradd/chpasswd (busybox `adduser` differs in flags), and
-  #        util-linux for runuser (used by `os platform.test` for user-switching).
-  #   brew: macOS /bin/bash is 3.2 (Apple's last GPLv2 release); oosh requires
-  #        bash 4+. Brew bash lands at /opt/homebrew/bin/bash — paths.d wiring
-  #        below ensures non-interactive ssh sessions actually find it.
-  # Detect by querying the remote's package-manager command — same primitive
-  # ossh.cmd uses to dispatch installs.
-  local pmCmd
-  pmCmd=$(ossh.pm.discover "$host")
-
-  # macOS bootstrap: naked images (cirruslabs/macos-sequoia-base, fresh tart
-  # clones, etc.) ship with neither brew nor any other PM, so ossh.pm.discover
-  # echoes nothing and the install loop below would silently no-op — bash 4+
-  # would never land and the next `ossh install <host>` would still abort at
-  # the bash prereq check. Bootstrap Homebrew non-interactively first so we
-  # have a PM to install bash 4+ with. Apple Silicon → /opt/homebrew/bin/brew;
-  # Intel → /usr/local/bin/brew. Either way a fresh non-interactive ssh PATH
-  # won't see brew yet (paths.d wiring happens further down), so re-detect by
-  # probing the binaries directly rather than calling ossh.pm.discover again.
-  if [ -z "$pmCmd" ] && private.ossh.ssh "$host" '[ "$(uname -s)" = "Darwin" ]' 2>/dev/null; then
-    important.log "bootstrapping Homebrew on $host (no PM detected on macOS) — this may take several minutes"
-    private.ossh.ssh -tt "$host" \
-      'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
-      || { error.log "Homebrew bootstrap failed on $host"; return 1; }
-    if private.ossh.ssh "$host" '[ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]' 2>/dev/null; then
-      pmCmd="brew install"
-    else
-      error.log "Homebrew bootstrap reported success but brew binary not found at /opt/homebrew/bin or /usr/local/bin on $host"
-      return 1
+  local missing=""
+  local p
+  for p in "$@"; do
+    command -v "$p" >/dev/null 2>&1 || missing="$missing $p"
+  done
+  if [ -n "$missing" ]; then
+    error.log "ossh.prereqs.install verify: missing on PATH after install:$missing"
+    error.log "  diagnostic: OOSH_PM='${OOSH_PM:-<unset>}' uname=$(uname -s 2>/dev/null) brew=$(command -v brew 2>/dev/null || echo none)"
+    error.log "  diagnostic: PATH=$PATH"
+    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+      for _bp in /opt/homebrew/bin /usr/local/bin; do
+        for p in $missing; do
+          [ -x "$_bp/$p" ] && error.log "  diagnostic: $_bp/$p exists but not on PATH"
+        done
+      done
     fi
+    return 1
+  fi
+  return 0
+}
+
+ossh.prereqs.install() # <?sshConfigHost> # install post-clone prereqs via oo cmd (local mode); with sshConfigHost arg ships init/oosh to remote and runs it
+{
+  # Two modes:
+  #   - LOCAL (no $1): install missing post-clone prereqs on THIS machine
+  #     via the canonical `oo cmd <pkg>` primitive. Called by init/oosh
+  #     after clone+move+install-log setup, before state-machine handoff.
+  #     This is where rsync + tree (and any future install-time deps) get
+  #     installed — moved here from init/oosh's POSIX-sh Phase B so the
+  #     OOSH-canonical install path (`oo cmd`) is the single source of truth.
+  #   - REMOTE ($1=host): SCP init/oosh to the host and run it (existing
+  #     behaviour; back-compat for callers like `os platform.test` and
+  #     `ossh install`).
+  local host="$1"
+  if [ -z "$host" ]; then
+    # Local mode — install runtime prereqs via oo cmd.
+    important.log "ossh.prereqs.install (local): installing post-clone prereqs via oo cmd"
+    # rsync — needed by private.ossh.rsync (ossh:74) for runner→remote
+    # config push. Pre-installed on Debian/RHEL/Alma; missing on Alpine
+    # busybox + macOS (rsync ships but openrsync on newer macOS works too).
+    # oo cmd is idempotent: no-op if rsync is on PATH.
+    oo cmd rsync || warn.log "oo cmd rsync did not complete cleanly (install may still work if PATH already has rsync)"
+    # tree — used in many runtime paths (user.ssh.status user:226, debug
+    # helpers, ossh.status, state-31 progress dumps). oo cmd tree is
+    # already invoked at oo:1342 + ossh:1752 defensively; this guarantees
+    # post-install presence so other call sites don't need their own guard.
+    oo cmd tree || warn.log "oo cmd tree did not complete cleanly (install may still work if PATH already has tree)"
+
+    # Fail-loud post-condition: if any prereq is missing on PATH after
+    # 'oo cmd' returned, surface the diagnostic so silent failures
+    # (verified on macOS ProxyJump install, 2026-05-11) don't ship.
+    # Don't return 1 yet — log and keep going so install completes;
+    # the operator sees the error at end-of-install instead of
+    # discovering it later when a runtime path reaches for `tree`.
+    private.ossh.prereqs.verify rsync tree
+    return 0
+  fi
+  # Remote mode (existing behaviour) ──────────────────────────────────────
+  # Thin wrapper: SCP `init/oosh` to the remote and run it. The new init/oosh
+  # has a POSIX-sh prelude that installs git + bash 4+ via the platform PM
+  # (or bootstraps Homebrew on naked macOS), so this function no longer
+  # duplicates that logic — it just delivers the script.
+  #
+  # Back-compat: `ossh install <host>` still works (it always SCPs init/oosh
+  # via its own path); this entry point exists so users / docs / CI scripts
+  # that already call `ossh prereqs.install <host>` keep working.
+
+  if [ ! -f "$OOSH_DIR/init/oosh" ]; then
+    error.log "ossh.prereqs.install: cannot find $OOSH_DIR/init/oosh — is OOSH_DIR set correctly?"
+    return 1
   fi
 
-  case "$pmCmd" in
-    "apk add"*) pkgs="$pkgs bash shadow util-linux" ;;
-    # NB: brew's bash add is handled in the post-install hook below, not via
-    # the pkgs list. ossh.cmd's idempotency check (`command -v bash`) would
-    # short-circuit because macOS always ships /bin/bash 3.2 — the right
-    # check is "is /opt/homebrew/bin/bash 4+ present", not "is any bash present."
-  esac
+  important.log "shipping init/oosh to $host and running its self-install"
+  local remoteTmp="/tmp/oosh-init.$$"
+  scp -q "$OOSH_DIR/init/oosh" "$host:$remoteTmp" \
+    || { error.log "scp of init/oosh to $host failed"; return 1; }
 
-  local pkg rc=0
-  for pkg in $pkgs; do
-    ossh cmd "$host" "$pkg" || { error.log "failed to install $pkg on $host"; rc=1; }
-  done
+  # Stage installer + outer identity to /tmp/oosh.{installer,outer}.* on the
+  # remote BEFORE init/oosh runs. This is the actual install entry point in
+  # os.platform.test (ossh.install's path is skipped because prereqs.install
+  # already installed oosh). osshLayout build inside continue.local then
+  # picks up the staged identity instead of falling back to whoami@hostname.
+  private.ossh.identity.stage "$host" || {
+    warn.log "Failed to stage installer identity on $host — osshLayout will fall back to whoami@hostname"
+  }
 
-  # Per-PM post-install hooks:
-  case "$pmCmd" in
-    "apk add"*)
-      # Alpine: /bin/busybox is what /bin/su symlinks to. Naked alpine images
-      # ship busybox at mode 0755 (not suid); without the suid bit, non-root
-      # users can't run `su -`, which breaks `user login <other-user>` from a
-      # regular user's shell with "su: must be suid to work properly". Real
-      # alpine deployments typically ship busybox suid by default — restore
-      # that posture so user.login's `env -i su - "$1"` works after install.
-      private.ossh.ssh -tt "$host" "sudo chmod u+s /bin/busybox" \
-        || warn.log "could not set suid on /bin/busybox on $host — 'user login' from non-root will fail until set manually"
-    ;;
-    "brew install"*)
-      # 1) Install brew bash 4+ if absent. ossh.cmd's `command -v bash`
-      # idempotency check would always succeed (macOS ships /bin/bash 3.2),
-      # so we bypass it and check the brew-prefix path directly.
-      if ! private.ossh.ssh "$host" "[ -x /opt/homebrew/bin/bash ] || [ -x /usr/local/bin/bash ]" 2>/dev/null; then
-        # Source `brew shellenv` inline so `brew` is on PATH even when this
-        # ssh session isn't a login shell — macOS sshd builds PATH from
-        # launchd's hardcoded /usr/bin:/bin:/usr/sbin:/sbin and only
-        # consumes /etc/paths.d via path_helper from /etc/zprofile (login
-        # shells). Right after the Homebrew bootstrap above, the user's
-        # .zprofile entry doesn't help non-interactive sessions either.
-        # Try Apple Silicon prefix first, fall back to Intel.
-        private.ossh.ssh -tt "$host" \
-          'eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)" && brew install bash' \
-          || { error.log "failed to install brew bash on $host"; rc=1; }
-      else
-        info.log "brew bash 4+ already on $host"
-      fi
-      # 2) Wire /etc/paths.d/oosh-homebrew. macOS sshd builds non-interactive
-      # PATH via path_helper, which reads /etc/paths + /etc/paths.d/*.
-      # /opt/homebrew/bin is NOT in either by default, so even with brew
-      # bash on disk, ssh-exec'd shebangs (#!/usr/bin/env bash) resolve to
-      # /bin/bash 3.2 and fail oosh's bash-4+ prereq. Wiring it once via
-      # paths.d benefits every non-interactive ssh session on the host.
-      private.ossh.ssh -tt "$host" "echo /opt/homebrew/bin | sudo tee /etc/paths.d/oosh-homebrew >/dev/null && sudo chmod 644 /etc/paths.d/oosh-homebrew" \
-        || warn.log "could not wire /etc/paths.d/oosh-homebrew on $host — non-interactive ssh sessions may not find brew bash"
-    ;;
-  esac
-
-  [ "$rc" -eq 0 ] && success.log "prereqs installed on $host — now run: ossh install $host"
-  return $rc
+  # -tt forces a pty so sudo prompts are visible if the remote needs them.
+  # `bash` invocation guarantees POSIX-prelude path even if /tmp/oosh-init.$$
+  # isn't executable. Cleanup runs after install regardless of exit code.
+  private.ossh.ssh -tt "$host" "bash $remoteTmp; _rc=\$?; rm -f $remoteTmp; exit \$_rc"
 }
 ossh.prereqs.install.completion.sshConfigHost() {
   ossh.parameter.completion.sshConfigHost "$@"

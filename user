@@ -233,6 +233,9 @@ user.init() # <?sshDir:~/.ssh> # creates a new SSH key pair for this user
   [ -n "$1" ] && shift
   local sshDir="$RESULT"
 
+  # Keypair creation: only when ~/.ssh has no key yet. user.ssh.status's
+  # `log` arg makes the existing-state path log+ls; both branches fall
+  # through to the unconditional WODA-ensure block below.
   if user.ssh.status log "$sshDir"; then
     console.log ".ssh exists"
     if command -v tree >/dev/null 2>&1; then
@@ -250,30 +253,57 @@ user.init() # <?sshDir:~/.ssh> # creates a new SSH key pair for this user
     local sshKeyName="$RESULT"
     cp "$sshDir/id_ed25519" "$sshDir/private_key/$sshKeyName.private_key"
     cp "$sshDir/id_ed25519.pub" "$sshDir/public_keys/$sshKeyName.public_key"
-    {
-      echo "
+  fi
+
+  # Ensure the three WODA Host aliases are in $sshDir/config — runs whether
+  # or not ~/.ssh pre-existed. user.init was previously a one-shot keypair-
+  # creator that wrote WODA only when generating a fresh key; that meant
+  # users whose .ssh was created by ssh-keygen-on-first-login (e.g. test
+  # in nakedUbuntu's Dockerfile) silently never got WODA.
+  #
+  # **NOT using ossh.config.create**: it expects its third arg to be an
+  # alias name (e.g. "developking" → expanded to ~/.ssh/ids/developking/
+  # id_ed25519), not a literal IdentityFile path. Passing a literal path
+  # like "$sshDir/id_ed25519" triggers the path-construction fallback at
+  # ossh:315-323 — produces garbage like
+  # `IdentityFile /ids//root/.ssh/id_ed25519/id_ed25519`. Verified on Alma
+  # post-install (commit f515903 introduced this bug; SSH silently fails to
+  # resolve the WODA Host because the IdentityFile path is malformed).
+  #
+  # Direct heredoc per alias, append-if-missing on the `^Host <alias>$`
+  # header — same idempotency contract as the previous ossh.config.create
+  # path, but with a literal `IdentityFile ~/.ssh/id_ed25519` so SSH
+  # expands `~` per-user at read time (portable across all users).
+  touch "$sshDir/config"
+  if ! grep -q "^Host WODA.test$" "$sshDir/config" 2>/dev/null; then
+    cat >>"$sshDir/config" <<EOF
+
 Host WODA.test
  User root
  Port 22
  HostName 178.254.18.182
- IdentityFile $sshDir/id_ed25519
+ IdentityFile ~/.ssh/id_ed25519
+EOF
+  fi
+  if ! grep -q "^Host WODA.dev.root$" "$sshDir/config" 2>/dev/null; then
+    cat >>"$sshDir/config" <<EOF
 
 Host WODA.dev.root
  User root
  Port 22
  HostName cerulean.it
- IdentityFile $sshDir/id_ed25519
- 
+ IdentityFile ~/.ssh/id_ed25519
+EOF
+  fi
+  if ! grep -q "^Host WODA.dev$" "$sshDir/config" 2>/dev/null; then
+    cat >>"$sshDir/config" <<EOF
+
 Host WODA.dev
  User developking
  Port 22
  HostName cerulean.it
- IdentityFile $sshDir/id_ed25519
-      "
-
-    } >$sshDir/config
-  oo cmd tree >/dev/null
-  tree $sshDir
+ IdentityFile ~/.ssh/id_ed25519
+EOF
   fi
 }
 
@@ -821,13 +851,12 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
     sharedSsh='$baseDir/shared/.ssh'
     if [ -f \"\$sharedSsh/config\" ]; then
       mkdir -p '$targetHome/.ssh'
-      for f in config known_hosts 2cuGitHub; do
+      for f in config known_hosts; do
         [ -f \"\$sharedSsh/\$f\" ] && cp \"\$sharedSsh/\$f\" '$targetHome/.ssh/' 2>/dev/null
       done
       chown -R '$username:' '$targetHome/.ssh'
       chmod 700 '$targetHome/.ssh'
       [ -f '$targetHome/.ssh/config' ]      && chmod 600 '$targetHome/.ssh/config'
-      [ -f '$targetHome/.ssh/2cuGitHub' ]   && chmod 600 '$targetHome/.ssh/2cuGitHub'
       [ -f '$targetHome/.ssh/known_hosts' ] && chmod 644 '$targetHome/.ssh/known_hosts'
     fi
   " 2>/dev/null
@@ -866,6 +895,69 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
     user.group.add dev "$username"
   fi
 
+  # Write the WODA Host aliases into the target user's ~/.ssh/config.
+  # user.init is the canonical writer of WODA Host aliases for non-developking
+  # users (user:258-278 — append-if-missing per Host header). Without this
+  # invocation here, test/oosh-user/bash-user only ever get the 2cuGitHub
+  # alias propagated by private.ossh.shared.ssh.copy.to.all — never WODA.
+  # test/test.ssh.config.woda fails for those users without this block.
+  #
+  # Why a $sharedOosh-rooted source instead of `bash -lc 'user init'`:
+  # bashrcTemplate (templates/user/bashrcTemplate:27-30) early-returns for
+  # non-interactive shells before its PATH/OOSH setup, so `user` isn't on
+  # PATH inside `bash -lc`. Sourcing `\$sharedOosh/this` directly bypasses
+  # the early-return and gets oosh's dispatcher in scope.
+  #
+  # Why HOME/USER reset + CONFIG_* unset: private.as.user prefers
+  # `runuser -u <user> --` (user:711-712) which does NOT reset HOME — the
+  # caller's env leaks through. Without the explicit reset, \$HOME stays
+  # /root and \$CONFIG_PATH from a prior config.init resolves to /root/config
+  # — c2's staging file lands in /root/config/result.txt and reads-back
+  # fail with Permission denied for the target user.
+  #
+  # IMPORTANT — does NOT damage sharedConfig (post-c10def5): the chown -h
+  # in private.ossh.push.config preserves sharedConfig ownership; this
+  # `user init` only writes to \$sshDir/config (~/.ssh/config), not to
+  # ~/config. c2 dispatch may write through ~/config to sharedConfig but
+  # only as the target user via dev-group writes (mode g+w preserved).
+  private.as.user "$username" bash -c "
+    export HOME='$targetHome'
+    export USER='$username'
+    unset CONFIG CONFIG_PATH CONFIG_FILE
+    cd \"\$HOME\" 2>/dev/null
+    source '$sharedOosh/this' >/dev/null 2>&1 || exit 1
+    user init
+  " || warn.log "user.oosh.install: 'user init' for $username did not complete cleanly — WODA aliases may be missing from $targetHome/.ssh/config"
+
+  # Materialize the canonical ~/.ssh layout for this user — `ids/` subtree
+  # with ssh.developking + ssh.<installer-id> + ssh.outeruser, plus the
+  # private_key/<id>-> ../id_ed25519 and public_keys/<id>->../id_ed25519.pub
+  # symlinks. Without this, non-root users (test, oosh-user, bash-user in
+  # os.platform.test) only get a bare keypair + 2cuGitHub — root has the
+  # full layout (osshLayout build is invoked for root at ossh:691, but the
+  # per-user invocation was dropped by d9adb27 alongside band-aids).
+  # test/test.platform.ssh.layout.invariant pins the invariant.
+  #
+  # $SUDO bash -c so writes succeed even when the caller can't write into
+  # the target user's $HOME (e.g. test creating oosh-user via the platform
+  # test pipeline). osshLayout creates files as root because it runs under
+  # $SUDO, then we chown the entire .ssh tree to the target user. Safe
+  # because Phase 2 of the .ssh/ correctness plan replaced all symlinks
+  # under ids/ with real-file copies — chown -R follows symlinks but
+  # there are none anymore (verified by test.osshLayout's no-symlink
+  # assertions and test.platform.ssh.layout.invariant). Without this
+  # chown, ~/.ssh/ids/ is owned by root with mode 700 and the user can't
+  # even read their own developking key for github auth.
+  local _ownerEmail
+  _ownerEmail=$(private.as.user "$username" git config user.email 2>/dev/null) || true
+  [ -z "$_ownerEmail" ] && _ownerEmail="${username}@$(hostname)"
+  $SUDO bash -c "
+    export OOSH_DIR='$sharedOosh'
+    export PATH=\"\$OOSH_DIR:\$PATH\"
+    USER_EMAIL='$_ownerEmail' '$sharedOosh/osshLayout' build '' '' '$targetHome/.ssh'
+    chown -R '$username:' '$targetHome/.ssh'
+  " || warn.log "osshLayout build for '$username' did not complete cleanly — ~/.ssh/ids/ may be incomplete"
+
   # Platform-specific login-shell + SSH/docker group membership, dispatched via os.check
   if os.check private.user.oosh.install.shell; then
     $RESULT "$username" "$targetHome"
@@ -900,7 +992,7 @@ user.oosh.install.completion.branch() {
   [ -n "$OOSH_DIR" ] && ls "$(dirname "$OOSH_DIR")" 2>/dev/null
 }
 
-private.user.oosh.install.shell.darwin() # <username> <targetHome> # ensures bash is the login shell on macOS
+private.user.oosh.install.shell.darwin() # <username> <targetHome> # ensures bash is the login shell on macOS via dscl (chsh silently fails for sysadminctl/OD-managed users)
 {
   local username="$1"
   local targetHome="$2"
@@ -910,9 +1002,36 @@ private.user.oosh.install.shell.darwin() # <username> <targetHome> # ensures bas
   fi
   [ -z "$bashPath" ] && bashPath=$(command -v bash 2>/dev/null)
   currentShell=$(dscl . -read "/Users/$username" UserShell 2>/dev/null | awk '{print $2}')
-  if [ -n "$bashPath" ] && [ "$currentShell" != "$bashPath" ]; then
-    $SUDO chsh -s "$bashPath" "$username" 2>/dev/null
+
+  if [ -z "$bashPath" ] || [ "$currentShell" = "$bashPath" ]; then
+    return 0
   fi
+
+  # macOS-native: `dscl . -change /Users/<user> UserShell <old> <new>` writes
+  # the Open Directory record directly. `chsh -s` is the historical Unix way
+  # but on macOS it requires (a) the target shell listed in /etc/shells —
+  # /opt/homebrew/bin/bash typically isn't there — and (b) the user's own
+  # password OR full superuser context, which sudo+chsh doesn't always
+  # provide for sysadminctl-created users. dscl skips both gates.
+  if $SUDO dscl . -change "/Users/$username" UserShell "$currentShell" "$bashPath" 2>/dev/null; then
+    success.log "user shell for $username switched: $currentShell → $bashPath (dscl)"
+    return 0
+  fi
+
+  # Fallback for the rare environment where dscl isn't usable as root —
+  # e.g. some hardened MDM-managed Macs reject -change without GUI auth.
+  # Try chsh; if /etc/shells doesn't list bashPath yet, append first.
+  if [ -w /etc/shells ] || $SUDO test -w /etc/shells 2>/dev/null; then
+    grep -qxF "$bashPath" /etc/shells 2>/dev/null \
+      || $SUDO bash -c "echo '$bashPath' >> /etc/shells" 2>/dev/null
+  fi
+  if $SUDO chsh -s "$bashPath" "$username" 2>/dev/null; then
+    success.log "user shell for $username switched: $currentShell → $bashPath (chsh)"
+    return 0
+  fi
+
+  warn.log "Could not change $username's login shell to bash — neither dscl nor chsh succeeded; ssh-cat oosh commands may fail in zsh"
+  return 1
 }
 
 private.user.oosh.install.shell.linux() # <username> <targetHome> # ensures bash is the login shell on Linux (incl. BusyBox/Alpine)

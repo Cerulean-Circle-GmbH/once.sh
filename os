@@ -259,11 +259,37 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
   ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
-  console.log "Phase A.3: creating bash-user via raw useradd..."
+  console.log "Phase A.3: creating bash-user via raw useradd/adduser..."
   # Note: no `-G sudo` — that group only exists on Debian/Ubuntu (RHEL/Alma use
   # `wheel`, Alpine has neither by default). The NOPASSWD sudoers entry below
   # grants sudo access without group membership, so portability beats group hygiene.
-  ossh exec.tty "$platform" "sudo useradd -m -s /bin/bash bash-user && echo bash-user:bash-user | sudo chpasswd && sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'" || {
+  # Try useradd first (Debian/RHEL/Alma), fall back to adduser -D (Alpine/busybox);
+  # without this fallback, Alpine fails with `sudo: useradd: command not found`.
+  #
+  # Each step is independently idempotent — earlier versions chained
+  # everything with `&&`, which short-circuits if any step returns
+  # non-zero. Important quirk: `command -v useradd` runs in the SSH
+  # session's PATH, which on non-interactive ssh excludes /usr/sbin
+  # — so the existence check ALWAYS failed on Debian, even though
+  # /usr/sbin/useradd is there. We probe via `sudo command -v`
+  # instead so sudo's `secure_path` (which DOES include /usr/sbin)
+  # resolves the binary. No `||` between the user-create branches and
+  # the chpasswd/sudoers grant — those run unconditionally afterwards
+  # so a user-already-exists path doesn't skip them.
+  ossh exec.tty "$platform" "
+    if id bash-user >/dev/null 2>&1; then
+      echo 'bash-user already exists — skipping useradd'
+    elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then
+      sudo useradd -m -s /bin/bash bash-user
+    elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then
+      sudo adduser -D -s /bin/bash bash-user
+    else
+      echo 'no useradd/adduser available' >&2; exit 127
+    fi
+    echo bash-user:bash-user | sudo chpasswd
+    sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers \
+      || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'
+  " || {
     error.log "Failed to create bash-user on $platform"
   }
 
@@ -307,13 +333,30 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # home keeps find happy.
     console.log "Running core tests as oosh-user..."
     ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$ooshUserLog"
+    # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
+    # (busybox doesn't ship it). Use a runtime detector that prefers
+    # runuser (less PAM friction) and falls back to `sudo -H -u`. Both
+    # give us "switch to <user>, reset HOME" semantics under the
+    # NOPASSWD sudoers entry installed in Phase A.
+    ossh exec.tty "$platform" "
+      if command -v runuser >/dev/null 2>&1; then
+        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      else
+        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      fi
+    " 2>&1 | tee "$ooshUserLog"
     rcOoshUser=${PIPESTATUS[0]}
 
     # B.4 — bash-user (same pattern; same cwd fix)
     console.log "Running core tests as bash-user..."
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
-    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$bashUserLog"
+    ossh exec.tty "$platform" "
+      if command -v runuser >/dev/null 2>&1; then
+        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      else
+        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; export PATH=~/oosh:\$PATH; test.suite core 1'
+      fi
+    " 2>&1 | tee "$bashUserLog"
     rcBashUser=${PIPESTATUS[0]}
   else
     console.log "Skipping tests (notests)"
@@ -323,7 +366,14 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   if [ -n "$terminal" ]; then
     console.log "Opening interactive terminal as bash-user on $platform..."
     console.log "Type 'exit' to end the session and clean up."
-    ossh exec.tty "$platform" "sudo runuser -u bash-user -- bash -l"
+    # Same runuser-vs-sudo portability dance as the test invocations above.
+    ossh exec.tty "$platform" "
+      if command -v runuser >/dev/null 2>&1; then
+        sudo runuser -u bash-user -- bash -l
+      else
+        sudo -H -u bash-user bash -l
+      fi
+    "
   fi
 
   # Cleanup

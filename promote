@@ -53,7 +53,7 @@ promote.dev.to.testing() # <?reset|yes|skip> # promote dev to testing, gated by 
     local nextStateName="PROMOTE_STATES[${nextState}]"
     local nextStateLabel="${!nextStateName}"
     important.log "Skipping check for state [$nextState] = $nextStateLabel"
-    state.entry.set - $nextState
+    state.set - $nextState
     source $CONFIG_PATH/current.state.machine.env
     PROMOTE_SKIP=""
     private.promote.config.save
@@ -64,7 +64,7 @@ promote.dev.to.testing() # <?reset|yes|skip> # promote dev to testing, gated by 
   local i=0
   while [ $state -lt 99 ] && [ $i -lt 30 ]; do
     local prevState=$state
-    state transition.next
+    state next
     source $CONFIG_PATH/current.state.machine.env
     if [ $state -le $prevState ]; then
       error.log "State machine stuck at [$state]"
@@ -126,7 +126,7 @@ promote.testing.to.prod() # <?reset|yes|skip> # promote testing to prod, gated b
     local nextStateName="PROMOTE_STATES[${nextState}]"
     local nextStateLabel="${!nextStateName}"
     important.log "Skipping check for state [$nextState] = $nextStateLabel"
-    state.entry.set - $nextState
+    state.set - $nextState
     source $CONFIG_PATH/current.state.machine.env
     PROMOTE_SKIP=""
     private.promote.config.save
@@ -137,7 +137,7 @@ promote.testing.to.prod() # <?reset|yes|skip> # promote testing to prod, gated b
   local i=0
   while [ $state -lt 99 ] && [ $i -lt 30 ]; do
     local prevState=$state
-    state transition.next
+    state next
     source $CONFIG_PATH/current.state.machine.env
     if [ $state -le $prevState ]; then
       error.log "State machine stuck at [$state]"
@@ -267,25 +267,25 @@ private.promote.state.machine.init() {
   state.machine.create ${machine} promote
 
   # Testing path states [11]-[18]
-  state.entry.add initialization.checked       silent
-  state.entry.add target.checked               silent
-  state.entry.add uncommitted.checked          silent
-  state.entry.add test.suite.passed            silent
-  state.entry.add confirmation.received        silent
-  state.entry.add merged.to.testing            silent
-  state.entry.add testing.tagged               silent
-  state.entry.add testing.pushed               silent
+  state.add initialization.checked       silent
+  state.add target.checked               silent
+  state.add uncommitted.checked          silent
+  state.add test.suite.passed            silent
+  state.add confirmation.received        silent
+  state.add merged.to.testing            silent
+  state.add testing.tagged               silent
+  state.add testing.pushed               silent
 
-  # After 8 state.entry.add calls: [11]-[18] filled, [19]=next.custom.state
+  # After 8 state.add calls: [11]-[18] filled, [19]=next.custom.state
   # Re-source to get the full array into current scope
-  # (state.entry.add modifies a local copy due to declare -a scoping)
+  # (state.add modifies a local copy due to declare -a scoping)
   source $CONFIG_PATH/stateMachines/PROMOTE.states.env
 
   # Manual printf -v for [19]-[26]:
-  #   state.entry.add 99 can't work here because [99]="finished" is pre-set
-  #   by the template — state.entry.add would try to add at [99] which is
+  #   state.add 99 can't work here because [99]="finished" is pre-set
+  #   by the template — state.add would try to add at [99] which is
   #   already occupied. We also need non-sequential IDs ([19], [20]-[26])
-  #   that state.entry.add's auto-increment can't produce.
+  #   that state.add's auto-increment can't produce.
   #   After modifying, private.state.machine.update persists the array.
   printf -v "PROMOTE_STATES[19]" '%s' '99'
   printf -v "PROMOTE_STATES[20]" '%s' 'prod.path.started'
@@ -459,6 +459,59 @@ private.promote.rewrite.self.branch() # <ooshDir> # rewrite OOSH_SELF_BRANCH def
   fi
 }
 
+# private.promote.try.resolve.self.branch.conflict <ooshDir> <sourceBranch>
+# Called from private.check.merged.to.* after `git merge <source>` fails.
+# Every promote commits an OOSH_SELF_BRANCH rewrite onto the destination
+# branch (see private.promote.rewrite.self.branch), which becomes a permanent
+# 1-line divergence between source and destination init/oosh + Install
+# oosh.command. The next time the source-branch refactor touches lines near
+# that divergence, git can no longer 3-way-merge it and produces a conflict.
+# This helper auto-resolves that specific class of conflict: if EVERY
+# conflicted path is within the known-set {init/oosh, Install oosh.command},
+# take the source-branch version (theirs) for each, stage, and commit the
+# merge. The caller then runs private.promote.rewrite.self.branch which
+# immediately rewrites OOSH_SELF_BRANCH back to the destination branch.
+# Returns 0 on successful auto-resolve, 1 if conflicts touch any other file
+# (caller must abort the merge as before).
+private.promote.try.resolve.self.branch.conflict()
+{
+  local ooshDir="$1"
+  local sourceBranch="$2"
+  local destBranch
+  destBranch=$(git -C "$ooshDir" branch --show-current 2>/dev/null)
+
+  local conflicted
+  conflicted=$(git -C "$ooshDir" diff --name-only --diff-filter=U 2>/dev/null)
+  [ -z "$conflicted" ] && return 1
+
+  local f
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+      "init/oosh"|"Install oosh.command") ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$conflicted
+EOF
+
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    git -C "$ooshDir" checkout --theirs -- "$f" 2>/dev/null || return 1
+    git -C "$ooshDir" add -- "$f" 2>/dev/null || return 1
+  done <<EOF
+$conflicted
+EOF
+
+  git -C "$ooshDir" \
+      -c user.email="oosh-promote@local" \
+      -c user.name="oosh promote" \
+      -c commit.gpgsign=false \
+      commit -q -m "Merge branch '$sourceBranch' into $destBranch (auto-resolved OOSH_SELF_BRANCH drift)" 2>/dev/null || return 1
+
+  return 0
+}
+
 private.check.merged.to.testing() # <script> <stageTo> <stateFound> # merge dev into testing
 {
   local script=$1; shift
@@ -482,6 +535,10 @@ private.check.merged.to.testing() # <script> <stageTo> <stateFound> # merge dev 
       private.promote.rewrite.self.branch "$OOSH_DIR"
       # Stay on testing for tagging/pushing; stash popped in testing.pushed after returning to dev
       create.result 0 "Merged dev into testing"
+    elif private.promote.try.resolve.self.branch.conflict "$OOSH_DIR" "dev"; then
+      important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
+      private.promote.rewrite.self.branch "$OOSH_DIR"
+      create.result 0 "Merged dev into testing (auto-resolved OOSH_SELF_BRANCH drift)"
     else
       error.log "Merge conflict — aborting"
       git -C "$OOSH_DIR" merge --abort 2>/dev/null
@@ -603,6 +660,10 @@ private.check.merged.to.prod() # <script> <stageTo> <stateFound> # merge testing
       private.promote.rewrite.self.branch "$OOSH_DIR"
       # Stay on prod for tagging/pushing; stash popped in prod.pushed after returning to dev
       create.result 0 "Merged testing into prod"
+    elif private.promote.try.resolve.self.branch.conflict "$OOSH_DIR" "testing"; then
+      important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
+      private.promote.rewrite.self.branch "$OOSH_DIR"
+      create.result 0 "Merged testing into prod (auto-resolved OOSH_SELF_BRANCH drift)"
     else
       error.log "Merge conflict — aborting"
       git -C "$OOSH_DIR" merge --abort 2>/dev/null
