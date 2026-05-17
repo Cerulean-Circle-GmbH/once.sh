@@ -2298,14 +2298,44 @@ otmux.tree() # <?session> # show formatted tree — Tier 2, fast path via batche
 }
 otmux.tree.completion.session() { otmux.parameter.completion.session "$@"; }
 
-otmux.tree.detailed() # <?session> # show three-level tree with Claude session IDs per pane
+otmux.tree.detailed() # <?session> # show three-level tree with Claude session IDs per pane — Tier 3 (A+B+C+D)
 {
+  # Same A+B+C caches as tree() plus D: single global agents.discover call (was N×57s per session).
   if ! $TMUX_CMD list-sessions >/dev/null 2>&1; then
     echo -e "${BOLD_YELLOW}No tmux server running.${NORMAL} Use ${CYAN}'otmux new'${NORMAL} to start."
     return 1
   fi
 
+  # ── Fast-path caches (intra-call) ─────────────────────────────────────────
+  declare -A TREE_TTY=()
+  declare -A TREE_CLAUDE_PID=()
+  local TREE_VERSION="" TREE_DISCOVER="" _p _t _pid _args
+  while IFS='|' read -r _p _t; do
+    [ -z "$_p" ] && continue
+    TREE_TTY["$_p"]="${_t#/dev/}"
+  done < <($TMUX_CMD list-panes -aF '#{session_name}:#{window_index}.#{pane_index}|#{pane_tty}' 2>/dev/null)
+  while read -r _pid _t _args; do
+    [ -z "$_t" ] || [ "$_t" = "??" ] && continue
+    case "$_args" in *claude*) TREE_CLAUDE_PID["$_t"]="$_pid" ;; esac
+  done < <(ps -eo pid=,tty=,args= 2>/dev/null)
+  local _claude_bin
+  _claude_bin=$(command -v claude 2>/dev/null)
+  [ -z "$_claude_bin" ] && [ -x "$HOME/.local/bin/claude" ] && _claude_bin="$HOME/.local/bin/claude"
+  if [ -n "$_claude_bin" ]; then
+    TREE_VERSION=$("$_claude_bin" --version 2>/dev/null | head -1)
+    TREE_VERSION="${TREE_VERSION%% (*}"
+  fi
   local filter_session="$1"
+  # Fix D: hoist agents.discover OUT of the per-session loop. When the caller
+  # filters to a single session, call discover with that filter (1 call).
+  # When no filter (full server), call once globally (was N per-session calls).
+  if command -v hiveMind >/dev/null 2>&1; then
+    if [ -n "$filter_session" ]; then
+      TREE_DISCOVER=$(hiveMind protected.agents.discover "$filter_session" 2>/dev/null)
+    else
+      TREE_DISCOVER=$(hiveMind protected.agents.discover 2>/dev/null)
+    fi
+  fi
 
   local session_data
   if [ -n "$filter_session" ]; then
@@ -2366,12 +2396,10 @@ otmux.tree.detailed() # <?session> # show three-level tree with Claude session I
     pane_count=$(echo "$pane_data" | wc -l | tr -d ' ')
     local pane_i=0
 
-    # DRY: fetch shared discovery once per session (from hiveMind protected method).
-    # Returns: pane|role|state|uuid|title|is_claude. Falls back to per-pane lookup below.
+    # Fix D: per-session discover_data sliced from the GLOBAL TREE_DISCOVER cache
+    # (one hiveMind call covers all sessions, not N).
     local discover_data=""
-    if command -v hiveMind >/dev/null 2>&1; then
-      discover_data=$(hiveMind protected.agents.discover "$sess_name" 2>/dev/null)
-    fi
+    [ -n "$TREE_DISCOVER" ] && discover_data=$(awk -F'|' -v s="^${sess_name}:" '$1 ~ s' <<< "$TREE_DISCOVER")
 
     echo "$pane_data" | while IFS='|' read -r win_idx pane_idx pane_title pane_cmd; do
       pane_i=$((pane_i + 1))
@@ -2382,15 +2410,14 @@ otmux.tree.detailed() # <?session> # show three-level tree with Claude session I
       local pane_connector="├──"
       [ "$pane_i" -eq "$pane_count" ] && pane_connector="└──"
 
-      # When pane_cmd is bash/zsh, check for Claude child process and show version
+      # FAST PATH (A+B+C): pane→tty + tty→claude-pid + cached version. Same
+      # caches as tree(); each pane = 2× O(1) bash assoc lookups.
       local display_cmd="$pane_cmd"
       if [[ "$pane_cmd" == "bash" || "$pane_cmd" == "zsh" ]]; then
         local pane_target_ver="${sess_name}:${win_idx}.${pane_idx}"
-        if "$oosh_dir/claudeCode" process.running "$pane_target_ver" 2>/dev/null; then
-          local ver
-          ver=$("$oosh_dir/claudeCode" version "$pane_target_ver" 2>/dev/null)
-          ver="${ver%% (*}"  # trim " (Claude Code)" suffix
-          [ -n "$ver" ] && display_cmd="$ver"
+        local _tty_ver="${TREE_TTY[$pane_target_ver]}"
+        if [ -n "$_tty_ver" ] && [ -n "${TREE_CLAUDE_PID[$_tty_ver]:-}" ]; then
+          [ -n "$TREE_VERSION" ] && display_cmd="$TREE_VERSION"
         fi
       fi
       printf "${GRAY}%s%s${NORMAL} ${GRAY}%-5s${NORMAL} ${BOLD_WHITE}%-24s${NORMAL} ${GREEN}[%s]${NORMAL}\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$display_cmd"
