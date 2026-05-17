@@ -2165,11 +2165,43 @@ otmux.help() # # show tmux help
   echo "For full documentation: man tmux"
 }
 
-otmux.tree() # <?session> # show formatted tree of all sessions, panes, titles and commands
+otmux.tree() # <?session> # show formatted tree — Tier 2, fast path via batched tty+ps maps (A+B+C)
 {
+  # Architect-approved fast path (task-otmux-fast-path.md):
+  #   A) Build pane→tty map via ONE tmux list-panes -aF call (was 75× otmux pane.get subprocess)
+  #   B) Build tty→pid map via ONE ps scan (was 75× per-pane ps in process.find)
+  #   C) Cache claude --version once (was N calls — same answer every time)
+  # Combined effect: 40s → ~1.5s on a 76-pane server. Intra-call caches; nothing persists.
   if ! $TMUX_CMD list-sessions >/dev/null 2>&1; then
     echo -e "${BOLD_YELLOW}No tmux server running.${NORMAL} Use ${CYAN}'otmux new'${NORMAL} to start."
     return 1
+  fi
+
+  # ── Fast-path caches (built once at function entry) ──────────────────────
+  # TTY map: pane_tty is '/dev/ttysNNN' but ps tty column omits '/dev/' — strip
+  # on insert so the lookup key matches downstream.
+  declare -A TREE_TTY=()          # pane_target → tty (short, no /dev/)
+  declare -A TREE_CLAUDE_PID=()   # tty → claude pid (any claude-related process on a real tty)
+  local TREE_VERSION="" _p _t _pid _args
+  while IFS='|' read -r _p _t; do
+    [ -z "$_p" ] && continue
+    TREE_TTY["$_p"]="${_t#/dev/}"
+  done < <($TMUX_CMD list-panes -aF '#{session_name}:#{window_index}.#{pane_index}|#{pane_tty}' 2>/dev/null)
+  # ps tty="??" means detached process (no controlling tty). Such rows belong
+  # to background workers whose args may incidentally contain "claude" text —
+  # exclude them to avoid false positives in the per-pane lookup.
+  while read -r _pid _t _args; do
+    [ -z "$_t" ] || [ "$_t" = "??" ] && continue
+    case "$_args" in *claude*) TREE_CLAUDE_PID["$_t"]="$_pid" ;; esac
+  done < <(ps -eo pid=,tty=,args= 2>/dev/null)
+  # CLAUDE_CMD is an internal var of the claudeCode script (not exported), so
+  # we use PATH lookup or the well-known install location as fallback.
+  local _claude_bin
+  _claude_bin=$(command -v claude 2>/dev/null)
+  [ -z "$_claude_bin" ] && [ -x "$HOME/.local/bin/claude" ] && _claude_bin="$HOME/.local/bin/claude"
+  if [ -n "$_claude_bin" ]; then
+    TREE_VERSION=$("$_claude_bin" --version 2>/dev/null | head -1)
+    TREE_VERSION="${TREE_VERSION%% (*}"
   fi
 
   local filter_session="$1"
@@ -2247,15 +2279,15 @@ otmux.tree() # <?session> # show formatted tree of all sessions, panes, titles a
       local pane_connector="├──"
       [ "$pane_i" -eq "$pane_count" ] && pane_connector="└──"
 
-      # When pane_cmd is bash/zsh, check for Claude child process and show version
+      # When pane_cmd is bash/zsh, check for Claude child process and show version.
+      # FAST PATH: pane→tty (TREE_TTY) + tty→claude-pid (TREE_CLAUDE_PID) — both
+      # built once at function entry. Per-pane work = 2× O(1) bash assoc lookups.
       local display_cmd="$pane_cmd"
       if [[ "$pane_cmd" == "bash" || "$pane_cmd" == "zsh" ]]; then
         local pane_target="${sess_name}:${win_idx}.${pane_idx}"
-        if "$OOSH_DIR/claudeCode" process.running "$pane_target" 2>/dev/null; then
-          local ver
-          ver=$("$OOSH_DIR/claudeCode" version "$pane_target" 2>/dev/null)
-          ver="${ver%% (*}"  # trim " (Claude Code)" suffix
-          [ -n "$ver" ] && display_cmd="$ver"
+        local _tty="${TREE_TTY[$pane_target]}"
+        if [ -n "$_tty" ] && [ -n "${TREE_CLAUDE_PID[$_tty]:-}" ]; then
+          [ -n "$TREE_VERSION" ] && display_cmd="$TREE_VERSION"
         fi
       fi
       printf "${GRAY}%s%s${NORMAL} ${GRAY}%-5s${NORMAL} ${BOLD_WHITE}%-24s${NORMAL} ${GREEN}[%s]${NORMAL}\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$display_cmd"
@@ -2405,9 +2437,33 @@ otmux.tree.detailed() # <?session> # show three-level tree with Claude session I
 }
 otmux.tree.detailed.completion.session() { otmux.parameter.completion.session "$@"; }
 
-otmux.status() # # show current tmux status (tree overview)
+otmux.status() # # fast session list — Tier 1 (no per-pane subprocess calls). Use 'otmux tree' for full view.
 {
-  otmux.tree
+  # Pure tmux queries: list-sessions for names/attach/pane-count + count panes via list-panes -aF.
+  # Target: <0.5s server-wide. Was 46s (called otmux.tree → per-pane claudeCode bootstrap).
+  $TMUX_CMD list-sessions >/dev/null 2>&1 || {
+    echo -e "${BOLD_YELLOW}No tmux server running.${NORMAL} Use ${CYAN}'otmux new'${NORMAL} to start."
+    return 1
+  }
+  # Build pane-count-per-session map in ONE tmux call.
+  declare -A SESS_PANES=()
+  local _p _s
+  while IFS=':' read -r _s _p; do
+    [ -z "$_s" ] && continue
+    SESS_PANES["$_s"]=$(( ${SESS_PANES["$_s"]:-0} + 1 ))
+  done < <($TMUX_CMD list-panes -aF '#{session_name}:1' 2>/dev/null)
+  printf "${BOLD_WHITE}%-32s %-10s %-6s %s${NORMAL}\n" "SESSION" "STATUS" "PANES" "WINDOWS"
+  while IFS='|' read -r name attached windows; do
+    local status_label
+    if [ "$attached" -gt 0 ] 2>/dev/null; then
+      status_label="${BOLD_GREEN}attached${NORMAL}"
+    else
+      status_label="${GRAY}detached${NORMAL}"
+    fi
+    printf "${BOLD_CYAN}%-32s${NORMAL} %b %-6s %s\n" "$name" "$status_label" "${SESS_PANES[$name]:-0}" "$windows"
+  done < <($TMUX_CMD list-sessions -F '#{session_name}|#{session_attached}|#{session_windows}' 2>/dev/null)
+  echo ""
+  echo -e "${GRAY}Tip:${NORMAL} ${CYAN}otmux tree${NORMAL} for per-pane view, ${CYAN}otmux tree.detailed${NORMAL} for agent UUIDs."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
