@@ -604,6 +604,16 @@ private.promote.rewrite.self.branch() # <ooshDir> # rewrite OOSH_SELF_BRANCH def
   fi
 }
 
+private.promote.find.worktree() # <ooshDir> <branch> # echo the worktree path that currently has <branch> checked out (empty if none)
+{
+  local ooshDir=$1
+  local branch=$2
+  git -C "$ooshDir" worktree list --porcelain 2>/dev/null | awk -v ref="refs/heads/$branch" '
+    /^worktree / { wt=$2; next }
+    $1 == "branch" && $2 == ref { print wt; exit }
+  '
+}
+
 # private.promote.push.source.branch <ooshDir> <sourceBranch>
 # Push the source branch to origin BEFORE merging it into the destination.
 # Without this, a successful merge+push of the destination branch can leave
@@ -845,31 +855,54 @@ private.check.merged.to.prod() # <script> <stageTo> <stateFound> # merge testing
     return $(result)
   fi
 
-  if git -C "$OOSH_DIR" checkout prod 2>/dev/null; then
-    # See merge-creds note on the dev→testing site above — same rationale.
-    if git -C "$OOSH_DIR" \
-         -c user.email="oosh-promote@local" \
-         -c user.name="oosh promote" \
-         merge testing --no-edit 2>/dev/null; then
-      # Rewrite init/oosh's OOSH_SELF_BRANCH default — same helper as above.
-      private.promote.rewrite.self.branch "$OOSH_DIR"
-      # Stay on prod for tagging/pushing; stash popped in prod.pushed after returning to dev
-      create.result 0 "Merged testing into prod"
-    elif private.promote.try.resolve.self.branch.conflict "$OOSH_DIR" "testing"; then
-      important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
-      private.promote.rewrite.self.branch "$OOSH_DIR"
-      create.result 0 "Merged testing into prod (auto-resolved OOSH_SELF_BRANCH drift)"
-    else
-      error.log "Merge conflict — aborting"
-      git -C "$OOSH_DIR" merge --abort 2>/dev/null
-      git -C "$OOSH_DIR" checkout "$originalBranch" 2>/dev/null
-      [ "$stashed" = true ] && git -C "$OOSH_DIR" stash pop -q 2>/dev/null
-      create.result 1 "Merge failed — resolve conflicts manually"
-      return $(result)
+  # Worktree-aware: in a multi-worktree layout (dev, testing, prod as
+  # separate worktrees of the same repo), `git checkout prod` from the
+  # current worktree fails with "already used by worktree at <path>".
+  # Detect that case and merge inside prod's worktree directly — avoids
+  # touching the current worktree's checkout, and the merge commit lands
+  # on prod via the prod worktree's HEAD. Single-worktree setups fall
+  # through to the historical checkout-and-merge path.
+  local prodWorktree mergeDir prodStashed=false
+  prodWorktree=$(private.promote.find.worktree "$OOSH_DIR" "prod")
+  if [ -n "$prodWorktree" ] && [ "$prodWorktree" != "$OOSH_DIR" ]; then
+    # Stash prod-worktree's dirty changes too so merge isn't blocked.
+    if ! git -C "$prodWorktree" diff --quiet 2>/dev/null; then
+      git -C "$prodWorktree" stash push -q -m "promote: pre-merge stash"
+      prodStashed=true
     fi
+    mergeDir="$prodWorktree"
+  elif git -C "$OOSH_DIR" checkout prod 2>/dev/null; then
+    mergeDir="$OOSH_DIR"
   else
     [ "$stashed" = true ] && git -C "$OOSH_DIR" stash pop -q 2>/dev/null
-    create.result 1 "Could not checkout prod branch"
+    create.result 1 "Could not checkout prod branch (not in another worktree either)"
+    return $(result)
+  fi
+
+  # See merge-creds note on the dev→testing site above — same rationale.
+  if git -C "$mergeDir" \
+       -c user.email="oosh-promote@local" \
+       -c user.name="oosh promote" \
+       merge testing --no-edit 2>/dev/null; then
+    # Rewrite init/oosh's OOSH_SELF_BRANCH default — operates on mergeDir
+    # (the prod worktree if separate, else $OOSH_DIR currently on prod).
+    private.promote.rewrite.self.branch "$mergeDir"
+    [ "$prodStashed" = true ] && git -C "$prodWorktree" stash pop -q 2>/dev/null
+    create.result 0 "Merged testing into prod"
+  elif private.promote.try.resolve.self.branch.conflict "$mergeDir" "testing"; then
+    important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
+    private.promote.rewrite.self.branch "$mergeDir"
+    [ "$prodStashed" = true ] && git -C "$prodWorktree" stash pop -q 2>/dev/null
+    create.result 0 "Merged testing into prod (auto-resolved OOSH_SELF_BRANCH drift)"
+  else
+    error.log "Merge conflict — aborting"
+    git -C "$mergeDir" merge --abort 2>/dev/null
+    if [ "$mergeDir" = "$OOSH_DIR" ]; then
+      git -C "$OOSH_DIR" checkout "$originalBranch" 2>/dev/null
+    fi
+    [ "$prodStashed" = true ] && git -C "$prodWorktree" stash pop -q 2>/dev/null
+    [ "$stashed" = true ] && git -C "$OOSH_DIR" stash pop -q 2>/dev/null
+    create.result 1 "Merge failed — resolve conflicts manually"
     return $(result)
   fi
 
@@ -912,7 +945,12 @@ private.check.prod.tagged() # <script> <stageTo> <stateFound> # tag prod with se
     fi
   fi
 
-  if git -C "$OOSH_DIR" tag "$newTag" 2>/dev/null; then
+  # Tag the prod ref explicitly. The previous form (`git tag $newTag`)
+  # tagged HEAD of $OOSH_DIR's current checkout, which assumed
+  # merged.to.prod had just done `git checkout prod`. The worktree-aware
+  # merged.to.prod stays in $OOSH_DIR (often dev), so HEAD would be wrong.
+  # Tagging `prod` works regardless of which worktree we're in.
+  if git -C "$OOSH_DIR" tag "$newTag" prod 2>/dev/null; then
     create.result 0 "Tagged: $newTag"
     success.log "Tagged: $newTag"
   else
