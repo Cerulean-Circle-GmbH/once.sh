@@ -320,6 +320,11 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; source /root/config/user.env 2>/dev/null; export PATH=/root/oosh:\$PATH; test.suite core 1'" 2>&1 | tee "$rootLog"
     rcRoot=${PIPESTATUS[0]}
 
+    # Root's test.suite writes into sharedConfig (via /root/config symlink)
+    # with root:root ownership, blocking the unprivileged users that come
+    # next. Repair group+perms + setgid so B.3 and B.4 can write.
+    private.os.platform.shared.config.repair "$platform"
+
     # B.3 — oosh-user (via test+sudo+runuser; login-shell equivalent of `user login oosh-user`).
     # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
     # early-exit for non-interactive shells would otherwise skip the PATH / user.env
@@ -422,6 +427,31 @@ os.platform.test.completion.terminal() {
 
 os.platform.test.completion.notests() {
   echo "notests"
+}
+
+private.os.platform.shared.config.repair() # <platform> # reset sharedConfig group+perms in <platform>'s container so subsequent unprivileged users can write after root's test.suite left root-owned files there
+{
+  local platform=$1
+  if [ -z "$platform" ]; then
+    create.result 1 "private.os.platform.shared.config.repair requires <platform>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  # Resolve the sharedConfig path inside the container via root's
+  # ~/config symlink (set up by user.oosh.install per user:821).
+  # chgrp+chmod+setgid recover the dev-group-writable invariant; setgid
+  # on dirs causes new files to inherit the dev group ownership, so
+  # this doesn't have to run between every step — once after root is
+  # enough.
+  ossh exec.tty "$platform" "sudo bash -c '
+    shared=\$(readlink -f /root/config 2>/dev/null)
+    if [ -n \"\$shared\" ] && [ -d \"\$shared\" ]; then
+      chgrp -R dev \"\$shared\" 2>/dev/null
+      chmod -R g+rw \"\$shared\" 2>/dev/null
+      find \"\$shared\" -type d -exec chmod g+s {} + 2>/dev/null
+    fi
+  '"
 }
 
 os.platform.test.all() # # tests all must-pass platforms, reports summary
