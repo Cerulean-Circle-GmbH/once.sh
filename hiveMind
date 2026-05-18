@@ -3123,6 +3123,189 @@ hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> # cold-restart team
   return 0
 }
 
+hiveMind.team.migrate() # <session> <sshHost> <?snapshotFile> # migrate ONE team to remote — session-filtered, merge-on-remote (preserves remote's other teams)
+{
+  # Single-team migration. Mirrors teams.migrate but filtered to one session at
+  # every step. Architect/PO design (2026-05-18):
+  #   Q1 merge-on-remote — preserves remote's other teams (vs clobber)
+  #   Q2 auto-snapshot — generates if no snapshot found
+  #   Q3 success.log only for v1 (no event emission yet)
+  #   Q4 singular team.migrate (teams.migrate plural stays as full-machine)
+  # Gotcha (architect): use $1==s exact match, not $1~s — prevents ooshTeam from
+  # also matching ooshTeam2 as a prefix.
+  local session="$1" host="$2" snapfile="$3"
+  if [ -z "$session" ] || [ -z "$host" ]; then
+    error.log "Usage: hiveMind team.migrate <session> <sshHost> <?snapshotFile>"
+    return 1
+  fi
+  # Ingress P3 — SC-E.2 pattern
+  if ! this.isSessionName "$session"; then
+    error.log "team.migrate: invalid session name '$session'"
+    return 1
+  fi
+  if ! this.isPipeSafe "$session"; then
+    error.log "team.migrate: '|' or newline in session name — rejected"
+    return 1
+  fi
+  if ! otmux has "$session" 2>/dev/null; then
+    error.log "team.migrate: '$session' is not a live tmux session"
+    return 1
+  fi
+
+  : ${LOG_LIVE:=$HOME/config/log.live.out}
+  touch "$LOG_LIVE" 2>>"$LOG_LIVE"
+  important.log "team.migrate $session → $host (stderr in $LOG_LIVE — tail with: log live)"
+
+  # 1. Resolve / auto-create snapshot (PO Q2)
+  if [ -z "$snapfile" ]; then
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>>"$LOG_LIVE" | head -1)
+  fi
+  if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
+    info.log "No snapshot found — running teams.save first"
+    hiveMind.teams.save
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>>"$LOG_LIVE" | head -1)
+  fi
+  info.log "Using snapshot: $snapfile"
+
+  # 2. Build session-filtered slices in tmp dir
+  local tmpdir
+  tmpdir=$(mktemp -d -t hivemind.team.migrate.XXXXXX)
+  trap "rm -rf '$tmpdir'" RETURN
+  local sessSnap="$tmpdir/hivemind.snapshot.${session}.env"
+  # $1==s — EXACT match to prevent ooshTeam matching ooshTeam2 (architect note)
+  awk -F'|' -v s="$session" '/^#/{print;next} $1==s' "$snapfile" > "$sessSnap"
+  if [ ! -s "$sessSnap" ] || ! grep -qv '^#' "$sessSnap" 2>/dev/null; then
+    error.log "team.migrate: no entries for '$session' in snapshot — is the session running with agents?"
+    return 1
+  fi
+  local configPath="${CONFIG_PATH:-$HOME/config}"
+  # Slice registries by session prefix (pane keys are "session:win.pane")
+  [ -f "$configPath/hivemind.roles.env" ] && \
+    awk -F'|' -v p="^${session}:" '$1 ~ p' "$configPath/hivemind.roles.env" > "$tmpdir/roles.${session}.env"
+  [ -f "$configPath/hivemind.sessions.env" ] && \
+    awk -F'|' -v p="^${session}:" '$1 ~ p' "$configPath/hivemind.sessions.env" > "$tmpdir/sessions.${session}.env"
+  # teams.env keys are bare session names — exact match
+  [ -f "$configPath/hivemind.teams.env" ] && \
+    awk -F'|' -v s="$session" '$1==s' "$configPath/hivemind.teams.env" > "$tmpdir/teams.${session}.env"
+
+  # 3. Sync oosh code on remote (needed for protected.team.import to exist)
+  echo ""
+  important.log "Syncing oosh on $host..."
+  "$OOSH_DIR/ossh" connection.open "$host" 2>>"$LOG_LIVE"
+  if ! "$OOSH_DIR/ossh" exec "$host" "cd ~/oosh && git pull" 2>>"$LOG_LIVE"; then
+    warn.log "git pull failed on $host — falling back to dir.push"
+    "$OOSH_DIR/ossh" dir.push "$host" "$OOSH_DIR" 2>>"$LOG_LIVE"
+  fi
+
+  # 4. Push slices + snapshot
+  echo ""
+  important.log "Pushing session slices to $host..."
+  "$OOSH_DIR/ossh" exec "$host" "mkdir -p ~/config" 2>>"$LOG_LIVE"
+  local pushCount=0 f
+  for f in "$sessSnap" "$tmpdir/roles.${session}.env" "$tmpdir/sessions.${session}.env" "$tmpdir/teams.${session}.env"; do
+    [ -f "$f" ] || continue
+    if "$OOSH_DIR/ossh" scp "$f" "${host}:config/$(basename "$f")" 2>>"$LOG_LIVE"; then
+      info.log "  pushed: $(basename "$f")"
+      pushCount=$((pushCount + 1))
+    else
+      warn.log "  failed: $(basename "$f") — see $LOG_LIVE"
+    fi
+  done
+  info.log "Pushed $pushCount slice file(s)"
+
+  # 5. Push JSONLs for UUIDs in this session's snapshot only
+  echo ""
+  important.log "Pushing JSONL files for $session..."
+  local claudeProjectsDir="$HOME/.claude/projects"
+  local transferCount=0 seenUuids="" sess addr role uuid title
+  while IFS='|' read -r sess addr role uuid title <&3; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$uuid" ] && continue
+    echo "$seenUuids" | grep -q "$uuid" && continue
+    seenUuids="${seenUuids}${uuid} "
+    for dir in "$claudeProjectsDir"/*/; do
+      if [ -f "${dir}${uuid}.jsonl" ]; then
+        local remotePath="${dir}${uuid}.jsonl"
+        "$OOSH_DIR/ossh" exec "$host" "mkdir -p '$(dirname "$remotePath")'" 2>>"$LOG_LIVE"
+        if "$OOSH_DIR/ossh" scp "$remotePath" "${host}:${remotePath}" 2>>"$LOG_LIVE"; then
+          info.log "  transferred: ${uuid:0:8}... ($role)"
+          transferCount=$((transferCount + 1))
+        else
+          warn.log "  transfer failed: ${uuid:0:8}... ($role) — see $LOG_LIVE"
+        fi
+        break
+      fi
+    done
+  done 3< "$sessSnap"
+  info.log "Transferred $transferCount JSONL file(s)"
+
+  # 6. Merge slices into remote's registries (preserves remote's other teams)
+  echo ""
+  important.log "Merging $session into $host's registries..."
+  "$OOSH_DIR/ossh" exec "$host" "hiveMind protected.team.import $session" 2>>"$LOG_LIVE"
+
+  # 7. Restore on remote — feed it ONLY the session-filtered snapshot
+  echo ""
+  important.log "Restoring $session on $host..."
+  local snapname
+  snapname=$(basename "$sessSnap")
+  "$OOSH_DIR/ossh" exec "$host" "hiveMind teams.restore ~/config/${snapname}" 2>>"$LOG_LIVE"
+
+  echo ""
+  success.log "team.migrate: $session → $host complete"
+  echo "  Verify: ossh exec $host 'hiveMind team.status $session'"
+}
+hiveMind.team.migrate.completion.session() { private.hiveMind.teams.complete; }
+hiveMind.team.migrate.completion.sshHost() {
+  command -v ossh >/dev/null 2>&1 && private.ossh.config.complete.hosts 2>/dev/null
+}
+
+hiveMind.protected.team.import() # <session> # merge ~/config/{roles,sessions,teams}.<session>.env slice files into local registries (called by team.migrate on the remote side)
+{
+  # Idempotent: drop existing entries matching this session, append new.
+  # Pattern from D2.1 observer family — protected because cross-script callers
+  # (remote ssh exec invoking us during team.migrate) need it CLI-callable but
+  # it shouldn't appear in Tab completion as a user-facing verb.
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind protected.team.import <session>"
+    return 1
+  fi
+  # SC-E.2 P3 ingress — observer family is the highest-leverage attack surface
+  if ! this.isSessionName "$session"; then
+    error.log "protected.team.import: invalid session '$session'"
+    return 1
+  fi
+  if ! this.isPipeSafe "$session"; then
+    error.log "protected.team.import: '|' or newline in session — rejected"
+    return 1
+  fi
+  local cfg="${CONFIG_PATH:-$HOME/config}"
+  local imported=0
+  # Roles (S1): key format "session:win.pane|role|ts" — drop matching session prefix, append slice
+  if [ -f "$cfg/roles.${session}.env" ]; then
+    local reg="$cfg/hivemind.roles.env"
+    [ -f "$reg" ] && grep -v "^${session}:" "$reg" > "${reg}.tmp" 2>/dev/null && mv "${reg}.tmp" "$reg"
+    cat "$cfg/roles.${session}.env" >> "$reg"
+    imported=$((imported + 1))
+  fi
+  # Sessions (S2): same pattern (pane-keyed)
+  if [ -f "$cfg/sessions.${session}.env" ]; then
+    local ses="$cfg/hivemind.sessions.env"
+    [ -f "$ses" ] && grep -v "^${session}:" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
+    cat "$cfg/sessions.${session}.env" >> "$ses"
+    imported=$((imported + 1))
+  fi
+  # Teams (S3): bare session name as key — exact match
+  if [ -f "$cfg/teams.${session}.env" ]; then
+    local teams="$cfg/hivemind.teams.env"
+    [ -f "$teams" ] && grep -v "^${session}|" "$teams" > "${teams}.tmp" 2>/dev/null && mv "${teams}.tmp" "$teams"
+    cat "$cfg/teams.${session}.env" >> "$teams"
+    imported=$((imported + 1))
+  fi
+  success.log "protected.team.import: $session merged $imported slice file(s)"
+}
+
 hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote machine via ossh
 {
   local host="$1"
