@@ -5140,6 +5140,112 @@ echo "=== Epic I context-aware send tests complete ==="
 echo ""
 
 # ============================================================================
+# REGRESSION: McDonges remote disaster — teams.restore must NOT silently fallback
+# Bug: teams.restore falls back to 'ls -t hivemind.snapshot.*.env | head -1'
+# if no arg given. If team.migrate's session-slice transfer fails, the remote
+# teams.restore could restore the WRONG (full) snapshot, causing bulk pane explosion.
+# ============================================================================
+
+# --- T-RESTORE-FALLBACK-1: teams.restore with explicit nonexistent path must FAIL ---
+test.case $level "T-RESTORE-FALLBACK-1: teams.restore rejects nonexistent snapshot" \
+  hiveMind.teams.restore "/tmp/__nonexistent_snapshot_$$.env"
+if [ "$RETURN_VALUE" -ne 0 ]; then
+  expect.pass "teams.restore rejects nonexistent explicit path (rc=$RETURN_VALUE)"
+else
+  expect.fail "teams.restore should fail for nonexistent path, not fall back to latest"
+fi
+
+# --- T-RESTORE-FALLBACK-2: teams.restore with nonexistent path must NOT create panes ---
+test.case $level "T-RESTORE-FALLBACK-2: failed restore creates no sessions" \
+  echo "checking for leaked sessions"
+# If a previous snapshot exists on disk, the fallback could create panes from it
+RESTORE_BEFORE=$(otmux sessions -F "#{session_name}" 2>/dev/null | sort)
+hiveMind.teams.restore "/tmp/__nonexistent_restore_$$.env" 2>/dev/null
+RESTORE_AFTER=$(otmux sessions -F "#{session_name}" 2>/dev/null | sort)
+RESTORE_DIFF=$(diff <(echo "$RESTORE_BEFORE") <(echo "$RESTORE_AFTER"))
+if [ -z "$RESTORE_DIFF" ]; then
+  expect.pass "no sessions created by failed restore"
+else
+  expect.fail "failed restore created sessions: $RESTORE_DIFF"
+fi
+
+# --- T-RESTORE-FALLBACK-3: teams.restore with no args falls back (current behavior) ---
+# This documents the EXISTING behavior. Architect wants this changed to require explicit path.
+test.case $level "T-RESTORE-FALLBACK-3: teams.restore no-args uses latest snapshot" \
+  echo "documenting fallback behavior"
+RESTORE_NO_ARGS_OUTPUT=$(hiveMind.teams.restore 2>&1)
+RESTORE_NO_ARGS_RC=$?
+# If snapshots exist, it should restore from latest. If none, should error.
+SNAP_COUNT=$(ls "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | wc -l | tr -d ' ')
+if [ "$SNAP_COUNT" -eq 0 ]; then
+  if [ "$RESTORE_NO_ARGS_RC" -ne 0 ]; then
+    expect.pass "no snapshots exist, no-args correctly errors"
+  else
+    expect.fail "no snapshots exist but restore returned 0"
+  fi
+else
+  # Document: fallback happens. Future fix should require explicit path.
+  expect.pass "fallback to latest of $SNAP_COUNT snapshots (design: should require explicit arg)"
+fi
+# Kill any __restore_init session created by the restore attempt
+otmux kill __restore_init 2>/dev/null
+
+# --- T-MIGRATE-SCOPE-1: team.migrate snapshot is session-scoped ---
+# The bulk pane explosion happened because team.migrate restored ALL sessions
+# instead of just the one being migrated. Verify snapshot contains only 1 session.
+test.case $level "T-MIGRATE-SCOPE-1: team.migrate snapshot is session-scoped (code check)" \
+  echo "checking team.migrate code"
+HIVEMIND_SRC="$OOSH_DIR/hiveMind"
+MIGRATE_BODY=$(sed -n '/^hiveMind\.team\.migrate()/,/^}/p' "$HIVEMIND_SRC")
+# Must contain session-filtered snapshot creation (not full teams.save)
+if echo "$MIGRATE_BODY" | grep -qE 'session.*snap\|snap.*session\|grep.*session\|filter.*session'; then
+  expect.pass "team.migrate creates session-scoped snapshot"
+else
+  expect.fail "team.migrate must create session-scoped snapshot, not full teams.save"
+fi
+
+# --- T-MIGRATE-SCOPE-2: teams.restore passes session filter to remote ---
+# The remote-side call must include session scope
+test.case $level "T-MIGRATE-SCOPE-2: team.migrate passes explicit snapshot path to remote" \
+  echo "checking remote restore call"
+if echo "$MIGRATE_BODY" | grep -qE 'teams\.restore.*snap\|teams\.restore.*config/'; then
+  expect.pass "team.migrate passes explicit snapshot path to remote restore"
+else
+  expect.fail "team.migrate must pass explicit snapshot path — no args = fallback risk"
+fi
+
+# --- T-IMPORT-IDEMPOTENT-1: protected.team.import on existing team is safe ---
+test.case $level "T-IMPORT-IDEMPOTENT-1: team.import idempotent on existing data" \
+  echo "testing idempotency"
+if type -t hiveMind.protected.team.import &>/dev/null; then
+  # Create test slice files
+  IMP_SESSION="__test_import_$$"
+  echo "${IMP_SESSION}:0.0|imp-alpha" > "${CONFIG_PATH:-$HOME/config}/roles.${IMP_SESSION}.env"
+  echo "${IMP_SESSION}|Test import" > "${CONFIG_PATH:-$HOME/config}/teams.${IMP_SESSION}.env"
+  # Import once
+  hiveMind.protected.team.import "$IMP_SESSION" 2>/dev/null
+  REG_AFTER_1=$(grep "$IMP_SESSION" "${CONFIG_PATH:-$HOME/config}/hivemind.roles.env" 2>/dev/null | wc -l | tr -d ' ')
+  # Import again (idempotent)
+  hiveMind.protected.team.import "$IMP_SESSION" 2>/dev/null
+  REG_AFTER_2=$(grep "$IMP_SESSION" "${CONFIG_PATH:-$HOME/config}/hivemind.roles.env" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$REG_AFTER_1" -eq "$REG_AFTER_2" ]; then
+    expect.pass "import is idempotent: $REG_AFTER_1 entries both times"
+  else
+    expect.fail "import NOT idempotent: first=$REG_AFTER_1 second=$REG_AFTER_2 (duplicated)"
+  fi
+  # Cleanup
+  rm -f "${CONFIG_PATH:-$HOME/config}/roles.${IMP_SESSION}.env" "${CONFIG_PATH:-$HOME/config}/teams.${IMP_SESSION}.env"
+  grep -v "$IMP_SESSION" "${CONFIG_PATH:-$HOME/config}/hivemind.roles.env" > "${CONFIG_PATH:-$HOME/config}/hivemind.roles.env.tmp" 2>/dev/null && mv "${CONFIG_PATH:-$HOME/config}/hivemind.roles.env.tmp" "${CONFIG_PATH:-$HOME/config}/hivemind.roles.env"
+  grep -v "$IMP_SESSION" "${CONFIG_PATH:-$HOME/config}/hivemind.teams.env" > "${CONFIG_PATH:-$HOME/config}/hivemind.teams.env.tmp" 2>/dev/null && mv "${CONFIG_PATH:-$HOME/config}/hivemind.teams.env.tmp" "${CONFIG_PATH:-$HOME/config}/hivemind.teams.env"
+else
+  expect.pass "skipped — protected.team.import not defined"
+fi
+
+echo ""
+echo "=== McDonges disaster regression tests complete ==="
+echo ""
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 
