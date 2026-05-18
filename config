@@ -13,11 +13,6 @@
 [ "$(type -t debug.log)" = "function" ] || debug.log() { :; }
 [ "$(type -t error.log)" = "function" ] || error.log() { echo "ERROR: $*" >&2; }
 
-config.v() { # # prints out the tates version ${RED}Hard coded...make it support oo release${NORMAL}
-  echo "$0 version 2021-10-29 13:15"
-}
-
-
 config.completion.discover() {
   #set -x
   #info.log "completion.discover $*"
@@ -36,8 +31,6 @@ config.completion.discover() {
         shift
         ac=$(command -v $command)
         if [ -n "$ac" ]; then
-          complete -F private.oo.commands $ac
-          important.log "added completion to $ac"
           config.completion.discover $ac
           return 0
         else
@@ -85,11 +78,11 @@ config.completion.discover() {
   # fi
 
 
-  if (private.config.check.completion $command $previous); then
+  if (config.check.completion $command $previous); then
       $ac $previous.completion $last $command $previous
   fi
 
-  if (private.config.check.completion $command $last); then
+  if (config.check.completion $command $last); then
     if [ "$ac" = "$OOSH_DIR/config" ]; then
       if (this.functionExists $command.$last.completion); then
         $command.$last.completion '' $command $previous
@@ -123,7 +116,7 @@ config.completion.discover() {
   #echo "$@"
 }
 
-private.config.check.completion() {
+config.check.completion() {
   local command=$1
   local ac=$(command -v $command)
   local method="$2.completion"
@@ -179,10 +172,289 @@ config.init() # # inititalizes the $CONFIG environment if $CONFIG is empty
   #  source $CONFIG
   fi
   touch $CONFIG_PATH/error.txt
-  
+
   export CONFIG=$CONFIG_PATH/$CONFIG_FILE
   debug.log "$CONFIG"
 }
+
+# ---------------------------------------------------------------------------
+# Repair primitives — bring a tampered/corrupted OOSH layout back to the
+# canonical install state (matches what init/oosh produces). NOT called by
+# the bashrc-startup `config.init` above; that path stays cheap.
+# Reference state: ~/config and ~/oosh symlinks owned <user>:<user>;
+# sharedConfig dir mode 2775 group dev; no self-referential symlinks.
+# ---------------------------------------------------------------------------
+
+config.init.shared() # # ensure sharedConfig dir is mode 2775 group dev; remove self-loops; idempotent
+{
+  # `user` script provides user.get, private.as.user, user.group.add — not
+  # auto-loaded by `source this`. Source on demand so `./config init.*` works
+  # in standalone invocations (the c2 dispatch path in interactive shells
+  # already pulls it in).
+  [ "$(type -t user.get)" = "function" ] || source "$OOSH_DIR/user" >/dev/null 2>&1
+  local devHome
+  devHome=$(user.get home developking 2>/dev/null)
+  if [ -z "$devHome" ]; then
+    error.log "config.init.shared: cannot resolve developking's home — run ${YELLOW}ossh install${NORMAL} first"
+    return 1
+  fi
+  local baseDir
+  baseDir=$(dirname "$devHome")
+  local sharedConfig="$baseDir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
+  if [ ! -d "$sharedConfig" ]; then
+    error.log "config.init.shared: sharedConfig missing: ${RED}$sharedConfig${NORMAL} — install not completed"
+    return 1
+  fi
+  important.log "config.init.shared: normalising ${YELLOW}$sharedConfig${NORMAL} (mode 2775, group dev)"
+  private.ensure.sharedTree "$sharedConfig"
+}
+
+config.init.user() # <username:$USER> # ensure the user's ~/config + ~/oosh symlinks match canonical install
+{
+  [ "$(type -t user.get)" = "function" ] || source "$OOSH_DIR/user" >/dev/null 2>&1
+  local username="$1"
+  if [ -n "$1" ]; then shift; fi
+  if [ -z "$username" ]; then username="$USER"; fi
+
+  local targetHome
+  targetHome=$(user.get home "$username" 2>/dev/null)
+  if [ -z "$targetHome" ]; then
+    error.log "config.init.user: cannot resolve home for ${YELLOW}$username${NORMAL}"
+    return 1
+  fi
+  local devHome
+  devHome=$(user.get home developking 2>/dev/null)
+  if [ -z "$devHome" ]; then
+    error.log "config.init.user: developking missing — run ${YELLOW}ossh install${NORMAL} first"
+    return 1
+  fi
+  local baseDir
+  baseDir=$(dirname "$devHome")
+  local sharedConfig="$baseDir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
+  # Resolve the canonical shared oosh dir. Preference order, picking the
+  # first that resolves to an existing dir under the shared tree:
+  #   1. The current $OOSH_DIR (we're running from it — trustworthy).
+  #   2. The existing target of <user>'s ~/oosh symlink (if already aligned).
+  #   3. The branch named by $OOSH_MODE / git fallback / "dev".
+  # Avoids the case where $OOSH_MODE is set to a stale value like "released"
+  # that doesn't have a corresponding worktree on disk.
+  local sharedOoshBase="$baseDir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
+  local sharedOosh=""
+  if [ -d "$OOSH_DIR" ] && [ "${OOSH_DIR#$sharedOoshBase/}" != "$OOSH_DIR" ]; then
+    sharedOosh="$OOSH_DIR"
+  elif [ -L "$targetHome/oosh" ]; then
+    local _existing
+    _existing=$(readlink "$targetHome/oosh")
+    if [ -d "$_existing" ] && [ "${_existing#$sharedOoshBase/}" != "$_existing" ]; then
+      sharedOosh="$_existing"
+    fi
+  fi
+  if [ -z "$sharedOosh" ]; then
+    local branch="$OOSH_MODE"
+    [ -z "$branch" ] && branch=$(this.git.branch.short "$OOSH_DIR" 2>/dev/null)
+    [ -z "$branch" ] && branch="dev"
+    sharedOosh="$sharedOoshBase/$branch"
+  fi
+  if [ ! -d "$sharedOosh" ]; then
+    error.log "config.init.user: ${RED}$sharedOosh${NORMAL} missing — install not completed"
+    return 1
+  fi
+
+  important.log "config.init.user: aligning ${YELLOW}$username${NORMAL}'s ~/config and ~/oosh to canonical state"
+
+  # Symlink reconciliation in two phases.
+  #
+  # Phase 1 — recreate (only if needed): dispatch through private.as.user so
+  # newly-created symlinks inherit <user>:<user> ownership naturally. This is
+  # the same trick user.oosh.install uses at user:787-794 — and the reason
+  # fresh installs produce hannesn:hannesn while a tampered install path can
+  # leave hannesn:dev. Skip the dispatch entirely when both symlinks already
+  # point at the canonical targets — avoids the runuser PAM-session overhead
+  # and an observed silent-failure mode under sudo when env is sanitised.
+  #
+  # Phase 2 — force ownership: chown -h is run by THIS shell (not via
+  # private.as.user). When the caller is root (the typical sudo path) chown
+  # works for any target. When the caller is the target user, chown to their
+  # own primary group works without sudo. Other combinations are skipped
+  # quietly (e.g. sudoer alice repairing bob — the recreate path already
+  # gave bob:bob).
+  local _ts
+  _ts=$(date +%Y%m%d-%H%M%S)
+  local _needsRecreate=0
+  if [ ! -L "$targetHome/config" ] || [ "$(readlink "$targetHome/config")" != "$sharedConfig" ] \
+  || [ ! -L "$targetHome/oosh"   ] || [ "$(readlink "$targetHome/oosh")"   != "$sharedOosh"   ] \
+  || [ -d "$targetHome/config" -a ! -L "$targetHome/config" ] \
+  || [ -d "$targetHome/oosh"   -a ! -L "$targetHome/oosh"   ]; then
+    _needsRecreate=1
+  fi
+  if [ "$_needsRecreate" = "1" ]; then
+    private.as.user "$username" bash -c "
+      set -e
+      cd \"$targetHome\"
+      if [ -d config ] && [ ! -L config ]; then
+        mv config config.orig.$_ts
+      fi
+      if [ ! -L config ]; then
+        ln -s '$sharedConfig' config
+      elif [ \"\$(readlink config)\" != '$sharedConfig' ]; then
+        rm -f config
+        ln -s '$sharedConfig' config
+      fi
+      if [ -d oosh ] && [ ! -L oosh ]; then
+        mv oosh oosh.orig.$_ts
+      fi
+      if [ ! -L oosh ]; then
+        ln -s '$sharedOosh' oosh
+      elif [ \"\$(readlink oosh)\" != '$sharedOosh' ]; then
+        rm -f oosh
+        ln -s '$sharedOosh' oosh
+      fi
+    " || {
+      error.log "config.init.user: failed to create symlinks for ${RED}$username${NORMAL}"
+      return 1
+    }
+  fi
+  # Phase 2 — force canonical owner on the symlinks. Only when this shell has
+  # the privilege to do so (root, or self).
+  if [ "$(id -u)" = "0" ] || [ "$username" = "$USER" ]; then
+    chown -h "$username:$username" "$targetHome/config" "$targetHome/oosh" 2>/dev/null || true
+  fi
+
+  # bashrc — install template if the OOSH section is missing (idempotent).
+  # Same one-shot .bashrc.pre-oosh backup convention as user:850.
+  private.as.user "$username" bash -c "
+    [ -f \"$targetHome/.bashrc\" ] && [ ! -f \"$targetHome/.bashrc.pre-oosh\" ] && cp \"$targetHome/.bashrc\" \"$targetHome/.bashrc.pre-oosh\"
+    if ! grep -q 'config/user.env' \"$targetHome/.bashrc\" 2>/dev/null; then
+      if [ -f \"$sharedOosh/templates/user/bashrcTemplate\" ]; then
+        cp \"$sharedOosh/templates/user/bashrcTemplate\" \"$targetHome/.bashrc\"
+      else
+        printf '\n# oosh environment\n[ -f ~/config/user.env ] && source ~/config/user.env\n' >> \"$targetHome/.bashrc\"
+      fi
+    fi
+    [ ! -f \"$targetHome/.bash_profile\" ] && echo '[ -f ~/.bashrc ] && source ~/.bashrc' > \"$targetHome/.bash_profile\"
+  " 2>/dev/null
+
+  # Ensure dev group membership (idempotent; user.group.add no-ops if already a member).
+  if private.user.check.group dev >/dev/null 2>&1; then
+    user.group.add dev "$username" >/dev/null 2>&1
+  fi
+
+  success.log "config.init.user: ${GREEN}$username${NORMAL} aligned"
+}
+
+config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-group health (no fixes)
+{
+  [ "$(type -t user.get)" = "function" ] || source "$OOSH_DIR/user" >/dev/null 2>&1
+  local username="$1"
+  if [ -n "$1" ]; then shift; fi
+  if [ -z "$username" ]; then username="$USER"; fi
+
+  local targetHome
+  targetHome=$(user.get home "$username" 2>/dev/null)
+  if [ -z "$targetHome" ]; then
+    error.log "config.init.check: cannot resolve home for ${YELLOW}$username${NORMAL}"
+    return 0  # diagnostic — never block
+  fi
+
+  important.log "config.init.check: ${YELLOW}$username${NORMAL} (home: $targetHome)"
+
+  # ~/config — owner, target, target's mode/group
+  if [ -L "$targetHome/config" ]; then
+    local cOwner cTarget tMode tGroup
+    cOwner=$(stat -c "%U:%G" "$targetHome/config" 2>/dev/null || stat -f "%Su:%Sg" "$targetHome/config" 2>/dev/null)
+    cTarget=$(readlink "$targetHome/config")
+    info.log "  ~/config: owner=$cOwner target=$cTarget"
+    if [ -d "$cTarget" ]; then
+      tMode=$(stat -c "%a" "$cTarget" 2>/dev/null || stat -f "%Lp" "$cTarget" 2>/dev/null)
+      tGroup=$(stat -c "%G" "$cTarget" 2>/dev/null || stat -f "%Sg" "$cTarget" 2>/dev/null)
+      info.log "  sharedConfig: mode=$tMode group=$tGroup"
+      if [ "$tGroup" != "dev" ]; then
+        warn.log "  sharedConfig group ${RED}$tGroup${NORMAL} drifted from canonical ${GREEN}dev${NORMAL} — run ${YELLOW}config init.shared${NORMAL}"
+      fi
+      if [ -L "$cTarget/sharedConfig" ]; then
+        warn.log "  self-referential symlink present at $cTarget/sharedConfig — run ${YELLOW}config init.shared${NORMAL}"
+      fi
+    fi
+    # Symlink owner should be <user>:<user>, not <user>:dev
+    case "$cOwner" in
+      "$username:$username") : ;;
+      *) warn.log "  ~/config owner ${RED}$cOwner${NORMAL} drifted from canonical ${GREEN}$username:$username${NORMAL} — run ${YELLOW}config init.user${NORMAL}" ;;
+    esac
+  else
+    warn.log "  ~/config is not a symlink — run ${YELLOW}config init.user${NORMAL}"
+  fi
+
+  # Stale-dev-group warning: in /etc/group but not in active group set.
+  # We can only check the *running* shell's group set when the username is
+  # the caller; for other users we just check static membership.
+  if getent group dev 2>/dev/null | grep -qE "(:|,)$username(,|$)"; then
+    if [ "$username" = "$USER" ]; then
+      if ! id -nG | grep -qw dev; then
+        important.log "${YELLOW}$username${NORMAL} is in group ${GREEN}dev${NORMAL} per /etc/group, but the current shell's active groups don't include it. Log out of the desktop session ${RED}fully${NORMAL} (not just the terminal) and log back in — the active group set is captured at login time. Until then, writes to ~/config/* will hit Permission denied."
+      fi
+    fi
+  else
+    warn.log "  ${YELLOW}$username${NORMAL} not in group dev — run ${YELLOW}config init.user${NORMAL} to add"
+  fi
+  return 0
+}
+
+config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (mirrors install at oo:1456)
+{
+  if [ -z "$OOSH_DIR" ]; then
+    error.log "config.init.env: \$OOSH_DIR is empty — re-source ${YELLOW}this${NORMAL} or rerun under ${YELLOW}sudo -E${NORMAL}"
+    return 1
+  fi
+  # CONFIG_PATH must point at the shared sharedConfig dir we want to write
+  # into. Trust the calling context: bashrc/this set it to ~/config (the
+  # symlink), which `config init.user` ensures points at sharedConfig.
+  if [ -z "$CONFIG_PATH" ] || [ ! -d "$CONFIG_PATH" ]; then
+    error.log "config.init.env: \$CONFIG_PATH ${RED}$CONFIG_PATH${NORMAL} missing — run ${YELLOW}config init.user${NORMAL} first"
+    return 1
+  fi
+  # Backup user.env before regen — `config save` (no args) only re-emits
+  # CONFIG_*-prefixed exports plus the static blocks at config:540-541.
+  # Hand-customisations (custom non-CONFIG_* exports, manually-added source
+  # lines beyond what `config add` writes) would otherwise be lost silently.
+  if [ -f "$CONFIG_PATH/user.env" ]; then
+    local _ts
+    _ts=$(date +%Y%m%d-%H%M%S)
+    cp -p "$CONFIG_PATH/user.env" "$CONFIG_PATH/user.env.bak.$_ts" 2>/dev/null \
+      && important.log "config.init.env: backed up ${YELLOW}user.env${NORMAL} → ${GREEN}user.env.bak.$_ts${NORMAL}" \
+      || warn.log "config.init.env: failed to back up user.env (continuing)"
+  fi
+  important.log "config.init.env: regenerating ${YELLOW}user.env${NORMAL} + ${YELLOW}oosh.env${NORMAL} + ${YELLOW}log.env${NORMAL} via ${YELLOW}config save${NORMAL} (mirrors install)"
+  # `config save` (no args) cascades internally: writes user.env, then calls
+  # itself with (oosh OOSH) and (log LOG) to populate the other two with
+  # the canonical self-anchors and PATH/log-init blocks (config:543-599).
+  config.save || warn.log "config.init.env: config.save returned non-zero — env files may be partial"
+}
+
+config.init.full() # <username:$USER> # repair end-to-end: shared dir + user symlinks + env files + diagnostics
+{
+  local username="$1"
+  if [ -n "$1" ]; then shift; fi
+  if [ -z "$username" ]; then username="$USER"; fi
+
+  local rc=0
+  config.init.shared || rc=$?
+  config.init.user "$username" || rc=$?
+  # init.env runs AFTER init.user so the ~/config symlink is canonical
+  # before we write into the target. Only run for self-repair — regenerating
+  # other users' env files from the caller's shell would write THIS shell's
+  # OOSH_*/LOG_* state into THEIR config (likely wrong values).
+  if [ "$username" = "$USER" ] || [ "$(id -u)" = "0" -a "$username" = "root" ]; then
+    config.init.env || rc=$?
+  fi
+  config.init.check "$username" || rc=$?
+  return $rc
+}
+
+config.init.shared.completion() { :; }
+config.init.env.completion()    { :; }
+config.init.user.completion.username()  { user.list; }
+config.init.check.completion.username() { user.list; }
+config.init.full.completion.username()  { user.list; }
 
 config.usage()
 {
@@ -275,7 +547,7 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
       | grep -v 'CONFIG=' \
       | grep -v 'OOSH_DIR=' \
       | grep -v 'OOSH_COMPONENTS_DIR=' \
-      | sed 's/\([^-]*\)\(-x *\)\(.*'$name'\)\(.*\)=\(.*\)/export \1\3\4=\5/'
+      | sed 's/\([^-]*\)\(-x *\)\(.*'$name'\)\(.*\)=\(.*\)/export \3\4=\5/'
   } >$CONFIG
   private.ensure.groupWrite "$CONFIG"
 
@@ -292,7 +564,31 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # process. The `:` no-op default leaves an already-set CONFIG_PATH
     # untouched, so interactive sessions are unaffected.
     {
+      # 1st line: parameter-expansion default (BASH_SOURCE-based). Wins for
+      # the normal `source ~/config/user.env` case where BASH_SOURCE[0]
+      # is the absolute path and `%/*` strips the trailing /user.env.
+      # 2nd line: fallback for two failure modes where line 1 leaves a
+      # broken value and `source $CONFIG_PATH/log.env` would expand to
+      # `/log.env` (literal). Modes:
+      #   (a) BASH_SOURCE[0] empty — sourced via heredoc / eval / stdin,
+      #       so `${...%/*}` yields ""
+      #   (b) BASH_SOURCE[0] without a `/` — file in cwd ("user.env"),
+      #       so `%/*` returns "user.env" unchanged (not a valid dir)
+      # In either case fall back to $HOME/config (the canonical install
+      # location). `{ ...; }` groups the OR test so `&&` binds correctly.
       echo ': ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}'
+      echo '{ [ -z "$CONFIG_PATH" ] || [ "$CONFIG_PATH" = "${BASH_SOURCE[0]}" ]; } && CONFIG_PATH="$HOME/config"'
+      # Also self-anchor OOSH_DIR here in user.env. user.env is sourced by
+      # bashrc BEFORE oosh.env (config.add appends `source $CONFIG_PATH/oosh.env`
+      # below). With OOSH_DIR set at this point via the parameter-expansion
+      # default, oosh.env's own self-anchor is no longer the only line of
+      # defence — and crucially, when `config save oosh OOSH` (called by
+      # `oo mode <branch>`) overwrites oosh.env without re-adding its
+      # self-anchor, this user.env line still gives fresh shells (sudo su,
+      # `bash`, new tmux windows) a working OOSH_DIR. Resolves the $HOME/oosh
+      # symlink via cd -P; pwd to prevent self-loops (see comment at the
+      # bottom of this function for the oosh.env mirror).
+      echo ': ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}'
     } | cat - $CONFIG > $CONFIG.tmp && mv $CONFIG.tmp $CONFIG
     # PATH is NOT saved — it must be built dynamically at login by
     # bashrcTemplate (this.path.add + OOSH_DIR guard). Saving root's
@@ -373,13 +669,13 @@ config.bash.minimal.version() { # <bash.minimal.version:5> # sets the BASH_MINIM
 
 config.list() # <name:$CONFIG> # lists the content of the config with <name>
 {
-  private.config.check.file $1
+  config.file.check $1
   cat $CONFIG
 }
 
 config.delete() # <name:$CONFIG> # deletes the config with <name>
 {
-  private.config.check.file $1
+  config.file.check $1
   rm $CONFIG_PATH/$CONFIG_FILE
 }
 
@@ -400,7 +696,7 @@ config.edit() # <name:$CONFIG> # edits the config with <name> in vim
 {
   #check.debug.level 6
   oo cmd vim
-  if private.config.check.file $1; then
+  if config.file.check $1; then
     vim $CONFIG
   else
     vim $CONFIG
@@ -410,7 +706,7 @@ config.edit() # <name:$CONFIG> # edits the config with <name> in vim
 
 config.clean() #  # reinitalises a clean config and removes any custom addons
 {
-  private.config.check.file $1
+  config.file.check $1
   sort -u $CONFIG >$CONFIG_PATH/$CONFIG_FILE.clean
   rm $CONFIG_PATH/$CONFIG_FILE
   mv $CONFIG_PATH/$CONFIG_FILE.clean $CONFIG_PATH/$CONFIG_FILE
@@ -446,7 +742,7 @@ config.add() # <name:$CONFIG> # adds the config <name> into the user.env permane
   config.clean
 }
 
-private.config.check.file() # <name:$CONFIG> # sets the default config file to <name> if it exists
+config.file.check() # <name:$CONFIG> # sets the default config file to <name> if it exists
 {
   if [ -n "$1" ]; then
     config.file $1.env
@@ -454,16 +750,13 @@ private.config.check.file() # <name:$CONFIG> # sets the default config file to <
     RETURN=$1
     RETURN_VALUE=0
   else
-    RETURN_VALUE=0
+    RETURN_VALUE=1
   fi
   info.log "config file: $CONFIG"
   create.result $RETURN_VALUE $CONFIG
   return "$(result)"
 
 }
-
-config.file.check() # <name:$CONFIG> # sets the default config file to <name> if it exists
-{ private.config.check.file "$@"; }
 
 config.file() # <configfile> # sets the default config file to <configfile> if it exists
 # if <?option> is "reset", it sets the $CONFIG_FILE backi to user.env
@@ -572,7 +865,7 @@ function config.folder.create() # <folderName> # (internal deprecated) creates r
     fi
 }
 
-config.ssh.set.config.host() # <sshConfigName> # configures the PROMPT and the name of this host for ssh config
+config.ssh.host.set() # <sshConfigName> # configures the PROMPT and the name of this host for ssh config
 { 
   export OOSH_SSH_CONFIG_HOST=$1
   config.save
@@ -583,7 +876,7 @@ config.ssh.set.config.host() # <sshConfigName> # configures the PROMPT and the n
   #reconfigure
 }
 
-config.get() # <envVariable>  # gets an environment variable from the user.env 
+config.get() # <envVariable>  # gets an environment variable from the user.env
 {
   local envVariable="$1"
   if [ -n "$envVariable" ]; then
@@ -593,9 +886,15 @@ config.get() # <envVariable>  # gets an environment variable from the user.env
     return 1
   fi
 
-  local currentDefinition="$( grep "export $envVariable=" "$CONFIG" 2>/dev/null )"
+  # Matches both "export X=..." and the legacy malformed "export declare X=..." form.
+  local currentDefinition="$( grep -E "^export( declare)? ${envVariable}=" "$CONFIG" 2>/dev/null )"
   info.log "declaration: $currentDefinition"
-  echo "${!envVariable}"
+  if [ -n "$currentDefinition" ]; then
+    local val="${currentDefinition#*=}"
+    val="${val#\"}"
+    val="${val%\"}"
+    echo "$val"
+  fi
 }
 
 config.set() # <envVariable> <value> # adds or sets an environment variable to the user.env 
@@ -613,7 +912,8 @@ config.set() # <envVariable> <value> # adds or sets an environment variable to t
       shift
   fi
 
-  local currentDefinition="$( grep "export $envVariable=" "$CONFIG" 2>/dev/null )"
+  # Matches both "export X=..." and the legacy malformed "export declare X=..." form.
+  local currentDefinition="$( grep -E "^export( declare)? ${envVariable}=" "$CONFIG" 2>/dev/null )"
   if [ -n "$currentDefinition" ]; then
     if [ -z "$value" ]; then
       warn.log "set blank value on
@@ -622,10 +922,10 @@ config.set() # <envVariable> <value> # adds or sets an environment variable to t
       "
     fi
     local tmpFile="${CONFIG}.tmp.$$"
-    cat "$CONFIG" | line replace.sedquoted "export $envVariable=.*" "export $envVariable=\"$value\"" > "$tmpFile" && mv "$tmpFile" "$CONFIG"
+    # Replace the whole line (any form) with the clean "export X=value" form — normalizes on update.
+    sed -E "s|^export( declare)? ${envVariable}=.*|export ${envVariable}=\"${value}\"|" "$CONFIG" > "$tmpFile" && mv "$tmpFile" "$CONFIG"
   else
     echo "export $envVariable=\"$value\"" >>$CONFIG
-    cat $CONFIG
   fi
 }
 
@@ -664,15 +964,7 @@ function config.start() # <method> <parameter> # default start and parameter pro
   source this
   #check.debug.level 6
 
-  if ! [ -f "$CONFIG" ]; then
-      config.init
-      # local command=$1
-      # shift
-      #${1#"config."}"$@"
-      #this.start "$@"
-      return 0
-  fi
-  if [ -z "$CONFIG_PATH" ]; then
+  if [ -z "$CONFIG_PATH" ] || ! [ -f "$CONFIG" ]; then
       config.init
   fi
   if [ "$(type -t this.start)" = "function" ]; then

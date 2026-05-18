@@ -30,7 +30,7 @@ if [ -x ./init/oosh ]; then
   ./init/oosh
 else
   printf 'No sibling init/oosh — fetching from GitHub branch %s ...\n\n' "$OOSH_SELF_BRANCH"
-  bash -c "$(curl -fsSL "https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/${OOSH_SELF_BRANCH}/init/oosh")"
+  sh -c "$(curl -fsSL "https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/${OOSH_SELF_BRANCH}/init/oosh")"
 fi
 rc=$?
 
