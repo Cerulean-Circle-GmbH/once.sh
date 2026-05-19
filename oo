@@ -539,6 +539,23 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
     return 0
   fi
 
+  # Same-branch fast-path: if the requested branch matches the currently
+  # resolved symlink target, just show the current state and return. Saves
+  # the symlink-rm/shim-install/ln/config-save cascade (oo:566-600) and
+  # side-steps any downstream `oo update` / git-hook chain that might
+  # prompt for HTTPS credentials in unattended contexts (containers, CI
+  # runners). Observed live in platform-test ubuntu container where
+  # `oo mode dev` (already on dev) hung on `Username for 'https://github.com':`.
+  local currentName=""
+  if [ -n "$current_target" ]; then
+    currentName=$(basename "$current_target")
+  fi
+  if [ -n "$currentName" ] && [ "$branch" = "$currentName" ]; then
+    echo "Mode: $currentName (already current)"
+    echo "Path: $(private.this.path.canonical "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")"
+    return 0
+  fi
+
   # Require worktree structure for switching
   if [ $hasWorktrees -ne 0 ] || [ -z "$WORKTREE_BASE" ]; then
     error.log "No worktree structure detected. Run 'oo mode.setup' to convert your install."
@@ -549,14 +566,37 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
 
   if [ ! -d "$target_dir" ]; then
     console.log "Directory '$branch' not found. Checking remote branches..."
+    # Strict match: exact branch name (origin/<branch>), not regex/substring.
+    # The previous `grep -i "${branch//\./.*}"` matched partial names —
+    # `oo mode test` would silently select `origin/test/ish` (alphabetical
+    # first) and try to wedge a worktree at $WORKTREE_BASE/test for a
+    # branch actually named `test/ish`. Worse, when that worktree-add
+    # silently failed but the rest of oo.mode ran anyway, OOSH_DIR was
+    # exported to a non-existent path, breaking every subsequent c2
+    # completion lookup (c2:296 `script="$OOSH_DIR/ng/c2"` → EPERM).
+    # `grep -Fx` = fixed-string, full-line match; the user gets a clean
+    # error and can retype the full name (e.g. `oo mode test/ish`).
     local remote_branch
-    remote_branch=$(cd "$current_target" && git branch -r 2>/dev/null | sed 's/^ *//' | grep -v 'HEAD' | grep -i "${branch//\./.*}" | head -1)
-    if [ -n "$remote_branch" ]; then
-      console.log "Creating worktree for $remote_branch..."
-      (cd "$current_target" && git worktree add -B "${remote_branch#origin/}" "$WORKTREE_BASE/$branch" "$remote_branch")
-    else
-      error.log "No remote branch matching '$branch' found"
+    remote_branch=$(cd "$current_target" && git branch -r 2>/dev/null \
+      | sed 's/^ *//' \
+      | grep -v 'HEAD' \
+      | grep -Fx "origin/$branch" | head -1)
+    if [ -z "$remote_branch" ]; then
+      error.log "No remote branch named '$branch' found (use full name, e.g. \`oo mode test/macos\`)"
       create.result 1 "branch not found"
+      return $(result)
+    fi
+    console.log "Creating worktree for $remote_branch..."
+    if ! (cd "$current_target" && git worktree add -B "${remote_branch#origin/}" "$target_dir" "$remote_branch"); then
+      error.log "git worktree add failed for $remote_branch → $target_dir"
+      create.result 1 "worktree add failed"
+      return $(result)
+    fi
+    # Post-condition: target_dir MUST exist before we touch any symlink.
+    # Even when `git worktree add` reports success, defensive check.
+    if [ ! -d "$target_dir" ]; then
+      error.log "Worktree add reported success but $target_dir is missing"
+      create.result 1 "worktree add post-condition violated"
       return $(result)
     fi
   fi
