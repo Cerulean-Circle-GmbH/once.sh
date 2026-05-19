@@ -107,11 +107,39 @@ Sets `OOSH_MODE=dev` and saves to config.
 
 ### oo.update
 
-Pulls latest changes from GitHub.
+Pulls latest changes from GitHub, then self-heals user symlinks.
 
 ```bash
 oo update
 ```
+
+After a successful `git pull`, `oo update` delegates to
+`config init.user $USER` to re-apply the canonical `~/config` +
+`~/oosh` symlinks. This catches the case where `init/oosh` has been
+re-run out of band (e.g. a curl one-liner from the README) and
+clobbered the symlinks — `oo mode <TAB>` would otherwise show
+nothing. The heal is idempotent (no-op when symlinks are already
+canonical) and silenced during the pre-install bootstrap when
+`developking` doesn't yet exist. See
+[Repair toolkit](repair-toolkit.md) for the full primitive set.
+
+### oo.user.fix
+
+Repair the current user's `~/config` + `~/oosh` symlinks to the
+canonical shared tree. Thin alias for [`config init.user`](config.md).
+
+```bash
+oo user.fix              # repair this user (= $USER)
+oo user.fix developking  # repair another user (requires root)
+```
+
+Handles real-dir → symlink conversion (preserves originals as
+`oosh.orig.<ts>` / `config.orig.<ts>`), ownership, branch detection,
+and `dev`-group membership. Idempotent — calling it on an
+already-correct layout is a no-op. Naming follows the OOSH
+`noun.verb` convention and the existing `ossh.rights.fix` /
+`ossh.folder.fix` per-scope pattern. See
+[Repair toolkit](repair-toolkit.md) for related primitives.
 
 ### oo.commit
 
