@@ -191,31 +191,67 @@ oo.commit() # <?mode:force> # commits latest changes to the oosh environment and
 oo.update() # # updates oosh environment and pulls latest changes from github.
 {
   cd "$OOSH_DIR" || return 1
+  local pulled=0
   if git pull; then
-    return 0
+    pulled=1
+  else
+    # SSH-based pull failed. The shared clone at oo:1332 uses the 2cuGitHub
+    # SSH alias as its remote, which requires that alias to be present in the
+    # current user's ~/.ssh/config. On users where user.oosh.install couldn't
+    # seed the shared .ssh/ (e.g. fresh macOS install where developking's
+    # template wasn't fully laid out yet) the alias is missing and git pull
+    # can't resolve the host. Fall back to the same HTTPS URL init/oosh uses
+    # for the initial clone — read-only, no auth needed for a public repo.
+    # The configured remote is not changed, so future pushes keep using SSH.
+    local fallbackUrl="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
+    local branch
+    branch=$(this.git.branch.short "$OOSH_DIR" 2>/dev/null)
+    [ -z "$branch" ] && branch=$(git -C "$OOSH_DIR" symbolic-ref --short HEAD 2>/dev/null)
+    [ -z "$branch" ] && branch="dev"
+    warn.log "git pull (SSH remote) failed; trying HTTPS fallback: $fallbackUrl $branch"
+    if git pull "$fallbackUrl" "$branch"; then
+      important.log "oo update succeeded via HTTPS fallback (configured remote unchanged)"
+      pulled=1
+    fi
   fi
-
-  # SSH-based pull failed. The shared clone at oo:1332 uses the 2cuGitHub
-  # SSH alias as its remote, which requires that alias to be present in the
-  # current user's ~/.ssh/config. On users where user.oosh.install couldn't
-  # seed the shared .ssh/ (e.g. fresh macOS install where developking's
-  # template wasn't fully laid out yet) the alias is missing and git pull
-  # can't resolve the host. Fall back to the same HTTPS URL init/oosh uses
-  # for the initial clone — read-only, no auth needed for a public repo.
-  # The configured remote is not changed, so future pushes keep using SSH.
-  local fallbackUrl="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
-  local branch
-  branch=$(this.git.branch.short "$OOSH_DIR" 2>/dev/null)
-  [ -z "$branch" ] && branch=$(git -C "$OOSH_DIR" symbolic-ref --short HEAD 2>/dev/null)
-  [ -z "$branch" ] && branch="dev"
-  warn.log "git pull (SSH remote) failed; trying HTTPS fallback: $fallbackUrl $branch"
-  if git pull "$fallbackUrl" "$branch"; then
-    important.log "oo update succeeded via HTTPS fallback (configured remote unchanged)"
-    return 0
+  if [ "$pulled" -ne 1 ]; then
+    error.log "oo update failed via both SSH remote and HTTPS fallback"
+    return 1
   fi
-  error.log "oo update failed via both SSH remote and HTTPS fallback"
-  return 1
+  # Self-heal: rewire ~/config + ~/oosh symlinks via config.init.user.
+  # Catches the case where init/oosh was re-run out of band and clobbered
+  # them (the macstudio-root regression). Also runs during the normal
+  # install pipeline: ossh.install.continue.local calls `oo update` at
+  # ossh:666 before the state machine, so a re-install at SETUP_SERVER
+  # state 99 still heals here even though the state machine no-ops.
+  # Idempotent — config.init.user (config:212) no-ops when symlinks are
+  # already canonical. Explicit user action (NOT shell startup), so it
+  # stays on the safe side of the May-8 sudo-chain anti-pattern.
+  private.oo.update.heal.symlinks
+  return 0
 }
+
+private.oo.update.heal.symlinks() # # heal current user's ~/config + ~/oosh symlinks via config.init.user; idempotent
+{
+  [ "$(type -t config.init.user)" = "function" ] || source "$OOSH_DIR/config" >/dev/null 2>&1
+  if type config.init.user >/dev/null 2>&1; then
+    config.init.user "$USER" >/dev/null \
+      || warn.log "oo update: \`config init.user $USER\` reported an issue — run \`oo user.fix\` for details"
+  fi
+}
+
+oo.user.fix() # <username:$USER> # repair this user's ~/config + ~/oosh symlinks to the canonical shared tree; idempotent
+{
+  # Discoverable user-facing alias for config.init.user — the canonical
+  # OOSH explicit-repair primitive (config:212). Handles real-dir →
+  # symlink conversion (preserves originals as oosh.orig.<ts> /
+  # config.orig.<ts>), ownership, branch detection, dev-group membership.
+  # Naming follows the OOSH `noun.verb` convention and the per-scope
+  # `ossh.rights.fix` / `ossh.folder.fix` pattern.
+  [ "$(type -t config.init.user)" = "function" ] || source "$OOSH_DIR/config" >/dev/null 2>&1
+  config.init.user "$@"
+}
+oo.user.fix.completion.username() { user.list; }
 
 oo.remote.update() { # <sshConfigHost> # updates the oosh environment on <sshConfigHost>
   local sshConfigHost="$1"
@@ -1318,7 +1354,7 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> # produce canonic
 }
 
 
-private.oo.user.shared.symlinks.ensure() # <userHome> <sharedConfigPath> <onceShBase> <ooshBranch> # ensure $userHome/config and $userHome/oosh are symlinks to the shared tree; idempotent; preserves the originals as .initial
+private.oo.user.shared.symlinks.ensure() # <userHome> <sharedConfigPath> <onceShBase> <ooshBranch> # ensure $userHome/config and $userHome/oosh are symlinks to the shared tree; idempotent; preserves originals as .orig.<ts>
 {
   local userHome="$1"
   local sharedConfigPath="$2"
@@ -1331,13 +1367,40 @@ private.oo.user.shared.symlinks.ensure() # <userHome> <sharedConfigPath> <onceSh
     return $(result)
   fi
 
+  # Preserve originals as .orig.<timestamp> (matches config.init.user at
+  # config:295,304). The earlier `.initial` suffix collided on re-install:
+  # if a prior install attempt had already created `~/oosh.initial`, the
+  # `mv "$userHome/oosh" "$userHome/oosh.initial" 2>/dev/null` silently
+  # failed (target exists), the subsequent `ln -s` then failed because
+  # the directory was still in place, and the post-condition reported
+  # the bug — but only via error.log, after the install had already
+  # progressed. Using a timestamped suffix is collision-proof.
+  local _ts
+  _ts=$(date +%Y%m%d-%H%M%S)
+
   if [ ! -L "$userHome/config" ]; then
-    [ -e "$userHome/config" ] && mv "$userHome/config" "$userHome/config.initial" 2>/dev/null
-    ln -s "$sharedConfigPath" "$userHome/config"
+    if [ -e "$userHome/config" ] && ! mv "$userHome/config" "$userHome/config.orig.$_ts"; then
+      create.result 1 "could not preserve existing $userHome/config as config.orig.$_ts"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    if ! ln -s "$sharedConfigPath" "$userHome/config"; then
+      create.result 1 "could not symlink $userHome/config → $sharedConfigPath"
+      error.log "$RESULT"
+      return $(result)
+    fi
   fi
   if [ ! -L "$userHome/oosh" ]; then
-    [ -e "$userHome/oosh" ] && mv "$userHome/oosh" "$userHome/oosh.initial" 2>/dev/null
-    ln -s "$onceShBase/$ooshBranch" "$userHome/oosh"
+    if [ -e "$userHome/oosh" ] && ! mv "$userHome/oosh" "$userHome/oosh.orig.$_ts"; then
+      create.result 1 "could not preserve existing $userHome/oosh as oosh.orig.$_ts"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    if ! ln -s "$onceShBase/$ooshBranch" "$userHome/oosh"; then
+      create.result 1 "could not symlink $userHome/oosh → $onceShBase/$ooshBranch"
+      error.log "$RESULT"
+      return $(result)
+    fi
   fi
 
   # Verify post-condition for fail-loud testing.
