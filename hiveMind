@@ -3286,14 +3286,32 @@ hiveMind.team.migrate() # <session> <sshHost> <?snapshotFile> # migrate ONE team
     "$OOSH_DIR/ossh" dir.push "$host" "$OOSH_DIR" 2>>"$LOG_LIVE"
   fi
 
-  # 4. Push slices + snapshot
+  # 4. Push slices + snapshot + otmux layout file (PO directive 2026-05-19)
   echo ""
   important.log "Pushing session slices to $host..."
-  "$OOSH_DIR/ossh" exec "$host" "mkdir -p ~/config" 2>>"$LOG_LIVE"
+  "$OOSH_DIR/ossh" exec "$host" "mkdir -p ~/config ~/config/otmux" 2>>"$LOG_LIVE"
   local pushCount=0 f
-  for f in "$sessSnap" "$tmpdir/roles.${session}.env" "$tmpdir/sessions.${session}.env" "$tmpdir/teams.${session}.env"; do
+  # Copy the session's otmux layout file to tmpdir FIRST so scp src!=dest
+  # path. Without this, when remote host resolves to the same machine
+  # (e.g. McDonges.fritz.box pointing at localhost), scp src==dest and
+  # the source file gets truncated to 0 bytes.
+  local layoutSrc="${CONFIG_PATH:-$HOME/config}/otmux/${session}.layout.env"
+  local layoutStaged=""
+  if [ -f "$layoutSrc" ]; then
+    layoutStaged="$tmpdir/${session}.layout.env"
+    cp "$layoutSrc" "$layoutStaged" 2>>"$LOG_LIVE"
+  fi
+  for f in "$sessSnap" "$tmpdir/roles.${session}.env" "$tmpdir/sessions.${session}.env" "$tmpdir/teams.${session}.env" "$layoutStaged"; do
+    [ -n "$f" ] || continue
     [ -f "$f" ] || continue
-    if "$OOSH_DIR/ossh" scp "$f" "${host}:config/$(basename "$f")" 2>>"$LOG_LIVE"; then
+    # Layout file targets ~/config/otmux/, others target ~/config/
+    local remoteName remoteDir
+    if [[ "$f" == *.layout.env ]]; then
+      remoteDir="config/otmux"
+    else
+      remoteDir="config"
+    fi
+    if "$OOSH_DIR/ossh" scp "$f" "${host}:${remoteDir}/$(basename "$f")" 2>>"$LOG_LIVE"; then
       info.log "  pushed: $(basename "$f")"
       pushCount=$((pushCount + 1))
     else
@@ -3573,6 +3591,19 @@ hiveMind.team.pull() # <sshHost> # pull team config from remote machine
   "ossh" scp "$host:~/config/hivemind.sessions.env" "$pullDir/hivemind.sessions.env" 2>/dev/null
   "ossh" scp "$host:~/config/hivemind.teams.env" "$pullDir/hivemind.teams.env" 2>/dev/null
 
+  # 4b. Pull otmux layout files (PO directive 2026-05-19 — needed for teams.restore)
+  mkdir -p "$pullDir/otmux"
+  local remoteLayouts
+  remoteLayouts=$("ossh" exec "$host" "ls ~/config/otmux/*.layout.env 2>/dev/null" 2>/dev/null)
+  local layoutCount=0 layoutFile
+  for layoutFile in $remoteLayouts; do
+    [ -z "$layoutFile" ] && continue
+    if "ossh" scp "$host:$layoutFile" "$pullDir/otmux/$(basename "$layoutFile")" 2>/dev/null; then
+      layoutCount=$((layoutCount + 1))
+    fi
+  done
+  [ "$layoutCount" -gt 0 ] && info.log "Pulled $layoutCount otmux layout file(s)"
+
   # 5. Pull latest snapshot
   local remoteSnap
   remoteSnap=$("ossh" exec "$host" "ls -t ~/config/hivemind.snapshot.*.env 2>/dev/null | head -1" 2>/dev/null)
@@ -3758,8 +3789,17 @@ hiveMind.team.restart() # <configDir> # restart ALL agents from pulled config di
     # Create session if new
     if [ "$localSess" != "$prevSess" ]; then
       if ! otmux has "$localSess" 2>/dev/null; then
-        echo "  Creating session: $localSess"
-        otmux new "$localSess" 2>/dev/null
+        # PO directive 2026-05-19: use pulled layout file if available
+        # (only when no name collision — layout file is keyed by ORIGINAL session name)
+        local pulledLayout="$pullDir/otmux/${sess}.layout.env"
+        if [ "$localSess" = "$sess" ] && [ -f "$pulledLayout" ]; then
+          echo "  Creating session via pulled layout: $localSess"
+          OTMUX_LAYOUT_DIR="$pullDir/otmux" otmux layout.restore "$sess" 2>/dev/null \
+            || otmux new "$localSess" 2>/dev/null
+        else
+          echo "  Creating session: $localSess"
+          otmux new "$localSess" 2>/dev/null
+        fi
       fi
       prevSess="$localSess"
     fi
