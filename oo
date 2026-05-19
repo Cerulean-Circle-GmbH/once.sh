@@ -191,30 +191,83 @@ oo.commit() # <?mode:force> # commits latest changes to the oosh environment and
 oo.update() # # updates oosh environment and pulls latest changes from github.
 {
   cd "$OOSH_DIR" || return 1
+  local pulled=0
   if git pull; then
-    return 0
+    pulled=1
+  else
+    # SSH-based pull failed. The shared clone at oo:1332 uses the 2cuGitHub
+    # SSH alias as its remote, which requires that alias to be present in the
+    # current user's ~/.ssh/config. On users where user.oosh.install couldn't
+    # seed the shared .ssh/ (e.g. fresh macOS install where developking's
+    # template wasn't fully laid out yet) the alias is missing and git pull
+    # can't resolve the host. Fall back to the same HTTPS URL init/oosh uses
+    # for the initial clone — read-only, no auth needed for a public repo.
+    # The configured remote is not changed, so future pushes keep using SSH.
+    local fallbackUrl="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
+    local branch
+    branch=$(this.git.branch.short "$OOSH_DIR" 2>/dev/null)
+    [ -z "$branch" ] && branch=$(git -C "$OOSH_DIR" symbolic-ref --short HEAD 2>/dev/null)
+    [ -z "$branch" ] && branch="dev"
+    warn.log "git pull (SSH remote) failed; trying HTTPS fallback: $fallbackUrl $branch"
+    if git pull "$fallbackUrl" "$branch"; then
+      important.log "oo update succeeded via HTTPS fallback (configured remote unchanged)"
+      pulled=1
+    fi
   fi
+  if [ "$pulled" -ne 1 ]; then
+    error.log "oo update failed via both SSH remote and HTTPS fallback"
+    return 1
+  fi
+  # Self-heal: rewire ~/config + ~/oosh symlinks via config.init.user.
+  # Catches the case where init/oosh was re-run out of band and clobbered
+  # them (the macstudio-root regression). Also runs during the normal
+  # install pipeline: ossh.install.continue.local calls `oo update` at
+  # ossh:666 before the state machine, so a re-install at SETUP_SERVER
+  # state 99 still heals here even though the state machine no-ops.
+  # Idempotent — config.init.user (config:212) no-ops when symlinks are
+  # already canonical. Explicit user action (NOT shell startup), so it
+  # stays on the safe side of the May-8 sudo-chain anti-pattern.
+  private.oo.update.heal.symlinks
+  return 0
+}
 
-  # SSH-based pull failed. The shared clone at oo:1332 uses the 2cuGitHub
-  # SSH alias as its remote, which requires that alias to be present in the
-  # current user's ~/.ssh/config. On users where user.oosh.install couldn't
-  # seed the shared .ssh/ (e.g. fresh macOS install where developking's
-  # template wasn't fully laid out yet) the alias is missing and git pull
-  # can't resolve the host. Fall back to the same HTTPS URL init/oosh uses
-  # for the initial clone — read-only, no auth needed for a public repo.
-  # The configured remote is not changed, so future pushes keep using SSH.
-  local fallbackUrl="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
-  local branch
-  branch=$(this.git.branch.short "$OOSH_DIR" 2>/dev/null)
-  [ -z "$branch" ] && branch=$(git -C "$OOSH_DIR" symbolic-ref --short HEAD 2>/dev/null)
-  [ -z "$branch" ] && branch="dev"
-  warn.log "git pull (SSH remote) failed; trying HTTPS fallback: $fallbackUrl $branch"
-  if git pull "$fallbackUrl" "$branch"; then
-    important.log "oo update succeeded via HTTPS fallback (configured remote unchanged)"
-    return 0
+private.oo.update.heal.symlinks() # # heal current user's ~/config + ~/oosh symlinks via config.init.user; idempotent
+{
+  [ "$(type -t config.init.user)" = "function" ] || source "$OOSH_DIR/config" >/dev/null 2>&1
+  type config.init.user >/dev/null 2>&1 || return 0
+  # Skip silently when developking doesn't exist yet — this is the
+  # pre-install state (oo update fires very early in
+  # ossh.install.continue.local at ossh:666, BEFORE state 31 creates
+  # developking + the shared tree). The state machine will link
+  # everything correctly when it gets there; healing post-install
+  # drift is the heal's job, not pre-install bootstrap.
+  [ "$(type -t user.get)" = "function" ] || source "$OOSH_DIR/user" >/dev/null 2>&1
+  if type user.get >/dev/null 2>&1; then
+    local _devHome
+    _devHome=$(user.get home developking 2>/dev/null)
+    [ -z "$_devHome" ] && return 0
   fi
-  error.log "oo update failed via both SSH remote and HTTPS fallback"
-  return 1
+  config.init.user "$USER" >/dev/null \
+    || warn.log "oo update: \`config init.user $USER\` reported an issue — run \`oo user.fix\` for details"
+}
+
+oo.user.fix() # <username:$USER> # repair this user's ~/config + ~/oosh symlinks to the canonical shared tree; idempotent
+{
+  # Discoverable user-facing alias for config.init.user — the canonical
+  # OOSH explicit-repair primitive (config:212). Handles real-dir →
+  # symlink conversion (preserves originals as oosh.orig.<ts> /
+  # config.orig.<ts>), ownership, branch detection, dev-group membership.
+  # Naming follows the OOSH `noun.verb` convention and the per-scope
+  # `ossh.rights.fix` / `ossh.folder.fix` pattern.
+  [ "$(type -t config.init.user)" = "function" ] || source "$OOSH_DIR/config" >/dev/null 2>&1
+  config.init.user "$@"
+}
+oo.user.fix.completion.username() {
+  # Source `user` on demand so completion works in fresh-shell contexts
+  # where the dispatcher hasn't yet auto-loaded the script. Mirrors the
+  # guard pattern in private.oo.update.heal.symlinks and oo.user.fix.
+  [ "$(type -t user.list)" = "function" ] || source "$OOSH_DIR/user" >/dev/null 2>&1
+  user.list
 }
 
 oo.remote.update() { # <sshConfigHost> # updates the oosh environment on <sshConfigHost>
@@ -455,9 +508,13 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
 
   if [ -z "$branch" ]; then
     # No argument: show current worktree status
-    # Resolve from symlink to show the actual target, not a stale OOSH_DIR
+    # Resolve from symlink to show the actual target, not a stale OOSH_DIR.
+    # `private.this.path.canonical` (this:144) is the portable resolver —
+    # macOS BSD readlink predating 12.3 lacks `-f`, on those systems plain
+    # `readlink -f` silently returns nothing and we'd report the symlink
+    # path verbatim instead of its target.
     local actualPath
-    actualPath=$(readlink -f "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")
+    actualPath=$(private.this.path.canonical "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")
     local currentName
     currentName=$(basename "$actualPath")
     echo "Mode: $currentName"
@@ -482,6 +539,23 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
     return 0
   fi
 
+  # Same-branch fast-path: if the requested branch matches the currently
+  # resolved symlink target, just show the current state and return. Saves
+  # the symlink-rm/shim-install/ln/config-save cascade (oo:566-600) and
+  # side-steps any downstream `oo update` / git-hook chain that might
+  # prompt for HTTPS credentials in unattended contexts (containers, CI
+  # runners). Observed live in platform-test ubuntu container where
+  # `oo mode dev` (already on dev) hung on `Username for 'https://github.com':`.
+  local currentName=""
+  if [ -n "$current_target" ]; then
+    currentName=$(basename "$current_target")
+  fi
+  if [ -n "$currentName" ] && [ "$branch" = "$currentName" ]; then
+    echo "Mode: $currentName (already current)"
+    echo "Path: $(private.this.path.canonical "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")"
+    return 0
+  fi
+
   # Require worktree structure for switching
   if [ $hasWorktrees -ne 0 ] || [ -z "$WORKTREE_BASE" ]; then
     error.log "No worktree structure detected. Run 'oo mode.setup' to convert your install."
@@ -492,14 +566,37 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
 
   if [ ! -d "$target_dir" ]; then
     console.log "Directory '$branch' not found. Checking remote branches..."
+    # Strict match: exact branch name (origin/<branch>), not regex/substring.
+    # The previous `grep -i "${branch//\./.*}"` matched partial names —
+    # `oo mode test` would silently select `origin/test/ish` (alphabetical
+    # first) and try to wedge a worktree at $WORKTREE_BASE/test for a
+    # branch actually named `test/ish`. Worse, when that worktree-add
+    # silently failed but the rest of oo.mode ran anyway, OOSH_DIR was
+    # exported to a non-existent path, breaking every subsequent c2
+    # completion lookup (c2:296 `script="$OOSH_DIR/ng/c2"` → EPERM).
+    # `grep -Fx` = fixed-string, full-line match; the user gets a clean
+    # error and can retype the full name (e.g. `oo mode test/ish`).
     local remote_branch
-    remote_branch=$(cd "$current_target" && git branch -r 2>/dev/null | sed 's/^ *//' | grep -v 'HEAD' | grep -i "${branch//\./.*}" | head -1)
-    if [ -n "$remote_branch" ]; then
-      console.log "Creating worktree for $remote_branch..."
-      (cd "$current_target" && git worktree add -B "${remote_branch#origin/}" "$WORKTREE_BASE/$branch" "$remote_branch")
-    else
-      error.log "No remote branch matching '$branch' found"
+    remote_branch=$(cd "$current_target" && git branch -r 2>/dev/null \
+      | sed 's/^ *//' \
+      | grep -v 'HEAD' \
+      | grep -Fx "origin/$branch" | head -1)
+    if [ -z "$remote_branch" ]; then
+      error.log "No remote branch named '$branch' found (use full name, e.g. \`oo mode test/macos\`)"
       create.result 1 "branch not found"
+      return $(result)
+    fi
+    console.log "Creating worktree for $remote_branch..."
+    if ! (cd "$current_target" && git worktree add -B "${remote_branch#origin/}" "$target_dir" "$remote_branch"); then
+      error.log "git worktree add failed for $remote_branch → $target_dir"
+      create.result 1 "worktree add failed"
+      return $(result)
+    fi
+    # Post-condition: target_dir MUST exist before we touch any symlink.
+    # Even when `git worktree add` reports success, defensive check.
+    if [ ! -d "$target_dir" ]; then
+      error.log "Worktree add reported success but $target_dir is missing"
+      create.result 1 "worktree add post-condition violated"
       return $(result)
     fi
   fi
@@ -556,7 +653,9 @@ oo.mode.align() # # align git branch to match the current worktree directory nam
 {
   local OOSH_LINK="$HOME/oosh"
   local actualPath
-  actualPath=$(readlink -f "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")
+  # private.this.path.canonical (this:144) — portable resolver; see comment
+  # at oo.mode for the macOS BSD-readlink rationale.
+  actualPath=$(private.this.path.canonical "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")
   local currentName
   currentName=$(basename "$actualPath")
 
@@ -617,7 +716,8 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure
 {
   local OOSH_LINK="$HOME/oosh"
   local currentDir
-  currentDir=$(readlink -f "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
+  # private.this.path.canonical (this:144) — portable resolver.
+  currentDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
 
   # Check if already set up — base must exist AND contain at least one worktree subdir
   local existingBase
@@ -719,14 +819,42 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure
   echo "Use 'oo mode <branch>' to switch branches."
 }
 
+private.oo.completion.worktree.branches() # # echo branch names whose worktree dirs sit under oo.mode.base.get; safe inside c2 completion subprocesses (no create.result side-effects)
+{
+  # Single source of truth for the four `*.completion.branch` /
+  # `*.completion.baseBranch` functions below.
+  #
+  # Why a private helper instead of calling oo.branch.list directly: that
+  # function uses create.result (oo:420), which corrupts c2's completion
+  # subprocess output on macOS — root never sees branches; admin sees them
+  # only on the 3rd TAB via a c2 menu quirk. Same regression class as
+  # 7e54c91 fixed for oo.checkout.completion.version, and 70009fa /
+  # 8b14c78 fixed for the four call sites below. Memory:
+  # [project-create-result-breaks-c2-completion].
+  #
+  # Why filesystem iteration instead of `git worktree list --porcelain`:
+  # the T-MODE-5 fixture (and any future independent-`git init` sibling
+  # layout) doesn't share a .git, so `git worktree list` would return
+  # only the current dir — see T-MODE-5 commentary in test/test.oo.
+  local base
+  base=$(oo.mode.base.get 2>/dev/null)
+  [ $? -eq 0 ] && [ -d "$base" ] || return 0
+  local dir
+  for dir in "$base"/*/; do
+    [ -L "${dir%/}" ] && continue
+    [ -d "$dir/.git" ] || [ -f "$dir/.git" ] || continue
+    local dirName
+    dirName=$(basename "$dir")
+    [[ "$dirName" == .* ]] && continue
+    echo "$dirName"
+  done | sort -u
+}
+
 oo.mode.completion.branch() {
-  local branches
-  branches=$(oo.branch.list local 2>/dev/null)
-  if [ -n "$branches" ]; then
-    echo "$branches"
-  else
-    echo ";"
-  fi
+  # Delegates to private.oo.completion.worktree.branches (single source
+  # of truth for worktree-branch enumeration across the four completion
+  # functions; safe inside c2 completion subprocesses).
+  private.oo.completion.worktree.branches
 }
 
 oo.checkout() # <version> # clone or add worktree for a remote branch
@@ -774,17 +902,16 @@ oo.checkout() # <version> # clone or add worktree for a remote branch
         fi
       fi
 
-      # Already aligned — pull latest
-      info.log "Directory exists, pulling: $targetDir"
-      if git -C "$targetDir" pull 2>/dev/null; then
-        success.log "Pulled $version in $targetDir"
-        create.result 0 "$targetDir"
-        return $(result)
-      else
-        error.log "git pull failed in $targetDir"
-        create.result 1 "pull failed"
-        return $(result)
-      fi
+      # Already aligned and present — nothing to do. Pulling latest is NOT
+      # `oo.checkout`'s job; merging branches lives in `promote` /
+      # `oo stage` (the canonical promotion pipeline) and pulling lives
+      # in `oo update` (the explicit user-invoked refresh). Conflating
+      # them here meant `oo checkout dev` (with dev/ already present)
+      # silently fetched + merged origin/dev — surprising for a command
+      # whose name says "checkout", not "pull".
+      success.log "Worktree '$dirName' already present at $targetDir — run \`oo update\` to refresh"
+      create.result 0 "$targetDir"
+      return $(result)
     fi
 
     # New worktree
@@ -814,16 +941,11 @@ oo.checkout() # <version> # clone or add worktree for a remote branch
 
     if [ -d "$targetDir" ]; then
       if [ -d "$targetDir/.git" ] || [ -f "$targetDir/.git" ]; then
-        info.log "Directory exists, pulling: $targetDir"
-        if git -C "$targetDir" pull 2>/dev/null; then
-          success.log "Pulled $version in $targetDir"
-          create.result 0 "$targetDir"
-          return $(result)
-        else
-          error.log "git pull failed in $targetDir"
-          create.result 1 "pull failed"
-          return $(result)
-        fi
+        # Same rationale as the worktree-mode branch above: oo.checkout
+        # does NOT pull. Pulls live in `oo update`; merges in `promote`.
+        success.log "Clone '$dirName' already present at $targetDir — run \`oo update\` to refresh"
+        create.result 0 "$targetDir"
+        return $(result)
       else
         error.log "Directory exists but is not a git repo: $targetDir"
         create.result 1 "not a git repo"
@@ -914,13 +1036,9 @@ oo.use() # <branch> <command> # run a command from a specific branch without swi
   OOSH_DIR="$branchDir" "$branchDir/$command" "$@"
 }
 oo.use.completion.branch() {
-  local branches
-  branches=$(oo.branch.list local 2>/dev/null)
-  if [ -n "$branches" ]; then
-    echo "$branches"
-  else
-    echo ";"
-  fi
+  # Delegates to private.oo.completion.worktree.branches — see its
+  # docstring for the create.result / worktree-list rationale.
+  private.oo.completion.worktree.branches
 }
 oo.use.completion.command() {
   # In completion context, $1 is $cur (word being completed), not the branch.
@@ -1285,6 +1403,39 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> # produce canonic
 }
 
 
+private.oo.user.shared.symlinks.ensure() # <userHome> <sharedConfigPath> <onceShBase> <ooshBranch> # ensure $userHome/config and $userHome/oosh are symlinks to the shared tree; idempotent; preserves originals as .orig.<ts>
+{
+  local userHome="$1"
+  local sharedConfigPath="$2"
+  local onceShBase="$3"
+  local ooshBranch="$4"
+  if [ -z "$userHome" ] || [ -z "$sharedConfigPath" ] \
+     || [ -z "$onceShBase" ] || [ -z "$ooshBranch" ]; then
+    create.result 1 "private.oo.user.shared.symlinks.ensure requires <userHome> <sharedConfigPath> <onceShBase> <ooshBranch>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  # Delegate the actual symlink-with-backup work to the shared primitive
+  # private.this.symlink.with.backup (this:171). Same `.orig.<timestamp>`
+  # collision-proof convention as config.init.user (config:295,304),
+  # now driven by one canonical implementation. Each call fails loud on
+  # any mv/ln failure — see the primitive's docstring.
+  local _ts
+  _ts=$(date +%Y%m%d-%H%M%S)
+  private.this.symlink.with.backup "$userHome/config" "$sharedConfigPath"       "$_ts" || return $(result)
+  private.this.symlink.with.backup "$userHome/oosh"   "$onceShBase/$ooshBranch" "$_ts" || return $(result)
+
+  # Verify post-condition for fail-loud testing.
+  if [ -L "$userHome/config" ] && [ -L "$userHome/oosh" ]; then
+    create.result 0 "symlinks ensured for $userHome"
+  else
+    create.result 1 "failed to ensure symlinks at $userHome (config=$([ -L "$userHome/config" ] && echo L || echo D), oosh=$([ -L "$userHome/oosh" ] && echo L || echo D))"
+    error.log "$RESULT"
+  fi
+  return $(result)
+}
+
 private.check.root.shared.dev.folder.created() {
   #check.debug.level 6
   #source user
@@ -1366,8 +1517,10 @@ private.check.root.shared.dev.folder.created() {
   # developking — leaving the boss-as-developking experience broken.
   if [ -d "$onceShBase/${OOSH_BRANCH}" ] \
      && [ -L "$devHome/oosh" ] \
-     && [ -L "$devHome/config" ]; then
-    success.log "$onceShBase/${OOSH_BRANCH} exists and developking has OOSH symlinks"
+     && [ -L "$devHome/config" ] \
+     && [ -L "$HOME/config" ] \
+     && [ -L "$HOME/oosh" ]; then
+    success.log "$onceShBase/${OOSH_BRANCH} exists; developking AND root have config+oosh symlinks"
     create.result 0 "root.shared.dev.folder.created" $1
   else
     console.log "creating shared infrastructure"
@@ -1485,7 +1638,7 @@ EOF
         # `oo.mode.base.get` strategy 2/3/4 then all failed, breaking
         # `oo mode <branch>` and tab-completion for every user on the
         # install. The helper is idempotent (skips if main/ already exists).
-        private.oo.shared.tree.from.local "$(readlink -f $HOME/oosh)" "${OOSH_BRANCH}"
+        private.oo.shared.tree.from.local "$(private.this.path.canonical "$HOME/oosh")" "${OOSH_BRANCH}"
         RETURN_VALUE=$?
         if ! [ "$RETURN_VALUE" = "0" ]; then return $RETURN_VALUE; fi
       else
@@ -1564,6 +1717,32 @@ EOF
     chown -R $paramerUser:dev "$dir/shared"
     chmod -R g+w "$dir/shared"
 
+    # Always link ROOT's config AND oosh to the shared tree. State 31
+    # runs as root regardless of which paramerUser is being set up —
+    # without these symlinks, root's lazy
+    # `${OOSH_DIR:="$(cd $HOME/oosh && pwd -P)"}` in
+    # sharedConfig/user.env resolves to root's private clone, and root
+    # can't see the shared worktrees (the macstudio-root regression).
+    #
+    # Previous guard `[ "$paramerUser" != "root" ]` was wrong: when
+    # paramerUser is empty (SSH_CONFIG_NAME_USED_FOR_LOCAL isn't set
+    # until ossh:674, which runs AFTER `oo state` at ossh:668 has
+    # already advanced through state 31) OR explicitly "root", the
+    # guard skipped the helper and left root's ~/oosh as a real dir.
+    # Install log from the recurring macstudio bug confirmed the empty
+    # case: `paramerUser= currentHome=/var/root`.
+    #
+    # The helper is idempotent — config already linked above will be
+    # detected as a symlink and left alone. Delegates to the testable
+    # helper private.oo.user.shared.symlinks.ensure (covered by
+    # T-MODE-COMPLETION-LAZY-USERENV-ENSURE + T-SYMLINKS-ENSURE-COLLISION
+    # in test/test.oo).
+    private.oo.user.shared.symlinks.ensure \
+      "$HOME" \
+      "$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig" \
+      "$onceShBase" \
+      "${OOSH_BRANCH}"
+
     # Enable git's shared-repository mode on both worktrees so subsequent
     # git operations (root's `git pull` on re-install at init/oosh:271,
     # any dev-group user running `oo update`) create files with group rw
@@ -1584,6 +1763,18 @@ EOF
       resolvedOoshDir=$(osascript -e "POSIX path of (POSIX file \"$resolvedOoshDir\" as alias)" 2>/dev/null | sed 's:/$::') || resolvedOoshDir="$onceShBase/${OOSH_BRANCH}"
     fi
     git config --global --add safe.directory "$resolvedOoshDir"
+    # Also add safe.directory for the `main` worktree (created in
+    # step 2 above). Without this, root running `oo mode main` or any
+    # git op against /Users/Shared/.../Once.sh/main hits dubious-
+    # ownership rejection (shared tree is owned by developking:dev).
+    # Future worktrees added via `oo checkout <branch>` would need
+    # their own safe.directory entry — that's a separate concern at
+    # the checkout site.
+    local resolvedMainDir="$onceShBase/main"
+    if command -v osascript >/dev/null 2>&1; then
+      resolvedMainDir=$(osascript -e "POSIX path of (POSIX file \"$resolvedMainDir\" as alias)" 2>/dev/null | sed 's:/$::') || resolvedMainDir="$onceShBase/main"
+    fi
+    git config --global --add safe.directory "$resolvedMainDir"
 
     # TODO: This should be removed to only use $HOME/oosh in the PATH
     export PATH="$( echo $PATH | line replace.sedquoted "$HOME/oosh" "$onceShBase/${OOSH_BRANCH}" )"
@@ -1783,8 +1974,10 @@ private.check.user.shared.dev.folder.linked() {
     export CONFIG="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig/user.env"
     export CONFIG_FILE="user.env"
     export CONFIG_PATH="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-    # Resolve OOSH_DIR from root's symlink (set during root install to the correct branch folder)
-    export OOSH_DIR=$(readlink -f $HOME/oosh)
+    # Resolve OOSH_DIR from root's symlink (set during root install to the
+    # correct branch folder). private.this.path.canonical (this:144) is the
+    # portable resolver — see oo.mode for the macOS BSD-readlink rationale.
+    export OOSH_DIR=$(private.this.path.canonical "$HOME/oosh")
     export OOSH_MODE=$(basename "$OOSH_DIR")
 
     cd $HOME
@@ -2265,11 +2458,15 @@ oo.parameter.completion.stage() {
 oo.mode.base.set.completion.path() { compgen -d "$1"; }
 
 oo.parameter.completion.baseBranch() {
-  oo.branch.list local 2>/dev/null
+  # Delegates to private.oo.completion.worktree.branches — see its
+  # docstring for the create.result / worktree-list rationale.
+  private.oo.completion.worktree.branches
 }
 
 oo.parameter.completion.branch() {
-  oo.branch.list local 2>/dev/null
+  # Delegates to private.oo.completion.worktree.branches — see its
+  # docstring for the create.result / worktree-list rationale.
+  private.oo.completion.worktree.branches
 }
 
 oo.parameter.completion.cmd() {

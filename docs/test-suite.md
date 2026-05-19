@@ -37,6 +37,37 @@ expect 0 "result not loaded" "$RESULT after a direct call"
 - **Completion & Parameters:** Scripts like `test.c2` and `test.data/parameterTestScript` test completion logic and parameter parsing.
 - **Error Handling:** Use `expect.error` to check for expected failures and edge cases.
 
+### Diagnostic-rich assertions with `expect.pass` / `expect.fail`
+When a test must surface an actionable recovery hint on failure
+(more useful than "Expected return: 0, got: 1"), use
+`expect.pass "<context>"` and `expect.fail "<reason + recovery>"`
+instead of the value-comparing `expect 0 "*"` form. The framework
+prints the message verbatim to the test report:
+
+```bash
+test.case - "T-USER-FIX-EXISTS: oo.user.fix is defined" \
+  type oo.user.fix
+if type oo.user.fix >/dev/null 2>&1; then
+  expect.pass "oo.user.fix is defined"
+else
+  expect.fail "oo.user.fix should be defined — run \`oo update\` to re-source"
+fi
+```
+
+This is the right pattern for real-environment integration tests
+(e.g. `T-MODE-COMPLETION-REAL-ENV` in `test/test.oo`,
+`test/test.platform.shared.oosh.invariant`) where the fail message
+is the user's first signal that something needs fixing.
+
+### Platform-category tests
+Tests with `TEST_CATEGORY=platform` (e.g.
+`test.platform.shared.config.invariant`,
+`test.platform.shared.oosh.invariant`) verify post-install
+invariants on real machines. They run inside
+`os platform.test <platform> terminal` containers via
+`./test.suite run <name> 1`. See
+`templates/code/newPlatformInvariantTest` for the skeleton.
+
 ## Best Practices
 - Use `test.case` for each logical test scenario.
 - Use `expect` to assert both return values and output.

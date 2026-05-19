@@ -216,17 +216,12 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
   ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
-  # Install prereqs (git + curl) on the target. Naked platform images are
-  # deliberately minimal — they ship bash/sudo/wget/runuser but not
-  # git/curl. init/oosh's prereq check would error out with the framed
-  # "missing prerequisite(s)" message; call prereqs.install first to
-  # satisfy them via the detected PM.
-  console.log "Installing prereqs (git, curl) on $platform..."
-  ossh prereqs.install "$platform" || {
-    error.log "Failed to install prereqs on $platform — ossh install will likely fail"
-  }
-
-  # Install oosh
+  # Install oosh. init/oosh's POSIX prelude handles its own prereqs
+  # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
+  # no separate `ossh prereqs.install <host>` pre-step is needed. See
+  # `private.push.init.oosh` (ossh:433) which SCPs init/oosh and runs
+  # its self-install, and init/oosh:188 (git install) + 192-232
+  # (bash install).
   ossh install "$platform" test
 
   # Refresh ControlMaster so new sessions pick up dev group membership
