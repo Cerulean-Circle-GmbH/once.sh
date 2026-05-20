@@ -41,9 +41,12 @@ These scripts wrap external tools with oosh method syntax for easier use:
 
 | Wrapper | Wraps | Common Methods |
 |---------|-------|----------------|
+| `oo` | OOSH framework lifecycle | `oo mode <branch>`, `oo update` (pulls + self-heals symlinks), `oo user.fix` (repair `~/config` + `~/oosh`), `oo checkout`, `oo stage testing/prod` |
 | `claudeCode` | Claude Code CLI | `claudeCode session`, `claudeCode resume` |
 | `claudeFlow` | Claude Flow orchestration | `claudeFlow tmux.init`, `claudeFlow list`, `claudeFlow swarm.status` |
 | `otmux` | tmux terminal multiplexer | `otmux new`, `otmux list`, `otmux attach` |
+
+**Repair toolkit** — when something feels broken, see [docs/repair-toolkit.md](docs/repair-toolkit.md): `oo user.fix`, `config init.user`, `config init.shared`, `ossh rights.fix`, `ossh folder.fix`. The first two heal user-level `~/config` + `~/oosh` symlinks; the others handle shared-config perms and SSH layout drift.
 
 **Usage pattern:**
 ```bash
@@ -109,6 +112,10 @@ OOSH uses `test.suite` for all testing. Key points:
 # 3 = normal with test details
 # 5+ = debug mode (may trigger breakpoints)
 ```
+
+**Test categories:**
+- `TEST_CATEGORY=core` — fixture-based unit/integration tests; run by `./test.suite core 1`.
+- `TEST_CATEGORY=platform` — post-install invariant checks on real machines (e.g. `test.platform.shared.config.invariant`, `test.platform.shared.oosh.invariant`); run inside `os platform.test <p> terminal` via `./test.suite run <name> 1`. See `templates/code/newPlatformInvariantTest` for the skeleton.
 
 **Writing tests:**
 ```bash

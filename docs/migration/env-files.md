@@ -275,6 +275,8 @@ The older branches were never targets for these fixes — they pre-date the **sh
 
 **Why is the repair `config init.*` explicit rather than automatic?** The May 8 saga proved that auto-repair on every shell startup (the deleted block in `03fe62b`) is fragile and clobbers shared state under sudo chains. The repair primitives now run only when called.
 
+**What about the symlink-clobber case (post-May-2026)?** Subsequent to the May-8 decision, `oo update` (`oo:191`) calls `config init.user $USER` after every successful `git pull` — an **explicit user action**, NOT shell startup. This re-applies the canonical `~/config` + `~/oosh` symlinks when out-of-band tooling (an `init/oosh` re-run from the README's curl one-liner, a manual `git clone` into `$HOME/oosh`) has clobbered them. It stays on the safe side of the May-8 anti-pattern because the user explicitly invoked `oo update`. The same primitive is reachable directly via `oo user.fix` for symlink-only repair without a pull. See [Repair toolkit](../repair-toolkit.md).
+
 **How do I verify a given host's env files are 'current'?** Three indicators:
 
 - `head -1 ~/config/user.env` should show `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}`.
