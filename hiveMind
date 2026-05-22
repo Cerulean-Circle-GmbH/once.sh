@@ -39,6 +39,14 @@
 : ${HIVEMIND_QUEUE_MAX_DEPTH:=50}
 : ${HIVEMIND_QUEUE_MAX_AGE_SEC:=3600}
 
+# Naming convention (sprint-1-state-correctness/naming-migration-design.md):
+#   pane title  = role@HIVEMIND_HOST  (WHERE — humans reading otmux tree)
+#   /rename     = role@DEFAULT_MODEL  (WHAT — Claude session selector)
+#   registry    = bare role           (machine-readable)
+# role.fromTitle() strips @* — both surfaces parse cleanly through one point.
+: ${HIVEMIND_HOST:=$(hostname -s 2>/dev/null)}
+: ${HIVEMIND_DEFAULT_MODEL:=opus}
+
 # B5.1 — TTL window during which manual registry.set takes priority over live
 # discovery. After registry.set, the entry is "fresh"; live discovery will not
 # overwrite it for HIVEMIND_REGISTRY_TTL seconds. After the window expires, live
@@ -288,7 +296,7 @@ private.hiveMind.pane.identify() {
   local target="$1"
   local role="$2"
   private.hiveMind.registry.set "$target" "$role"
-  otmux pane.title "$target" "$role"
+  otmux pane.title "$target" "${role}@${HIVEMIND_HOST}"
   otmux send.enter "$target" "export FORCE_COLOR=2; unset COLORTERM; unset CLAUDECODE"
   otmux send.enter "$target" "export HIVEMIND_ROLE=$role"
 }
@@ -478,7 +486,7 @@ private.hiveMind.handler.agent.renamed.title() {
   # Defensive: skip if pane doesn't exist (test fixtures or stale agent.rename).
   # pane.lock spawns a background enforcer; without this guard it'd churn.
   tmux list-panes -t "$pane" -F '#{pane_id}' >/dev/null 2>&1 || return 0
-  otmux pane.lock "$pane" "$newName" 2>/dev/null
+  otmux pane.lock "$pane" "${newName}@${HIVEMIND_HOST}" 2>/dev/null
   return 0
 }
 
@@ -2789,12 +2797,13 @@ EOF
 
   # Step 9: rename inside Claude — sets customTitle so future session.id /
   # session.name lookups return the role. Slash command, not text.
-  "$OOSH_DIR/otmux" send.raw "$targetPane" "/rename $role" Enter
+  # Claude sees @model (helps fork selection); pane title sees @hostname (WHERE).
+  "$OOSH_DIR/otmux" send.raw "$targetPane" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}" Enter
   sleep 0.5
 
   # Step 10: pane title — visible label in tmux border. Lock it so Claude's
   # automatic title updates (firstPrompt etc) don't overwrite the role.
-  "$OOSH_DIR/otmux" pane.title "$targetPane" "$role"
+  "$OOSH_DIR/otmux" pane.title "$targetPane" "${role}@${HIVEMIND_HOST}"
 
   # Step 11: send boot file if it exists (Controller knows where boot files live)
   local workspace bootFile
@@ -3106,9 +3115,13 @@ hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> <?sessionFilter> # 
       private.hiveMind.ensure.pane "$pane_target"
     fi
 
-    # Set pane title (layout.restore may have done this; re-set for correctness)
+    # Set pane title (layout.restore may have done this; re-set for correctness).
+    # If snapshot title lacks @hostname (older snapshots), append HIVEMIND_HOST
+    # so restored teams adopt the role@hostname convention.
     if [ -n "$title" ]; then
-      otmux pane.title "$pane_target" "$title" 2>/dev/null
+      local restored_title="$title"
+      [[ "$restored_title" != *"@"* ]] && restored_title="${restored_title}@${HIVEMIND_HOST}"
+      otmux pane.title "$pane_target" "$restored_title" 2>/dev/null
     fi
 
     # C1 STEP 5: kind-aware dispatch
@@ -4061,12 +4074,12 @@ hiveMind.agent.rename() # <agentName> <newName> # rename agent: /rename + pane.l
     return 1
   fi
 
-  # 1. Send /rename to Claude Code TUI
-  otmux send.raw "$target" "/rename ${newName}" Enter
+  # 1. Send /rename to Claude Code TUI (Claude sees @model)
+  otmux send.raw "$target" "/rename ${newName}@${HIVEMIND_DEFAULT_MODEL}" Enter
   sleep 1
 
-  # 2. Lock pane title
-  otmux pane.lock "$target" "$newName"
+  # 2. Lock pane title (tmux shows @hostname)
+  otmux pane.lock "$target" "${newName}@${HIVEMIND_HOST}"
 
   # 3. Update registry
   private.hiveMind.registry.set "$target" "$newName"
@@ -4784,8 +4797,8 @@ hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (
 
     # --- 3c. Fix pane title ---
     if [ -n "$hasClaude" ] && ! echo "$title" | grep -qi "$role" 2>/dev/null; then
-      otmux pane.lock "$paneTarget" "$role"
-      lineParts+=("${BOLD_GREEN}title → $role ✓${NORMAL}")
+      otmux pane.lock "$paneTarget" "${role}@${HIVEMIND_HOST}"
+      lineParts+=("${BOLD_GREEN}title → ${role}@${HIVEMIND_HOST} ✓${NORMAL}")
       fixedTitle=$((fixedTitle + 1))
     fi
 
@@ -4939,8 +4952,9 @@ hiveMind.team.setup() # <roles> <?session> # create N-pane session with agents f
     local pane="${session}:0.${i}"
     local role="${role_array[$i]}"
 
-    # Send /rename so Claude Code session gets the role name
-    otmux send.enter "$pane" "/rename ${role}"
+    # Send /rename so Claude Code session gets the role name (with @model suffix
+    # — pane title is set elsewhere by pane.identify which appends @hostname)
+    otmux send.enter "$pane" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}"
     sleep 1
 
     # Capture session UUID
@@ -5387,9 +5401,11 @@ hiveMind.agent.bootstrap() # <agentName> <?session> <?pane> # full bootstrap: cr
   fi
 
   # Step 4c: Set session name via /rename so registry.refresh can identify this agent
-  info.log "Setting session name to ${role}@opus..."
-  otmux send.enter "$target_pane" "/rename ${role}@opus"
+  # Claude session sees @model (for fork selection); pane title gets @hostname (WHERE).
+  info.log "Setting session name to ${role}@${HIVEMIND_DEFAULT_MODEL}..."
+  otmux send.enter "$target_pane" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}"
   sleep 2
+  otmux pane.title "$target_pane" "${role}@${HIVEMIND_HOST}"
 
   # Step 5: Teach role
   local full_prompt
@@ -6254,9 +6270,10 @@ hiveMind.agent.respawn() # <agentName> # fork role snapshot into pane + /rename 
   newUuid=$(private.hiveMind.session.resolve.uuid "$target" 2>/dev/null)
   [ -n "$newUuid" ] && info.log "Child UUID: ${newUuid:0:8}..."
 
-  # /rename inside Claude TUI so customTitle matches role
-  otmux send.raw "$target" "/rename $role" Enter 2>/dev/null
+  # /rename inside Claude TUI so customTitle matches role (with @model suffix)
+  otmux send.raw "$target" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}" Enter 2>/dev/null
   sleep 1
+  otmux pane.title "$target" "${role}@${HIVEMIND_HOST}"
 
   # Reaffirm pane↔role registration
   private.hiveMind.registry.set "$target" "$role"
