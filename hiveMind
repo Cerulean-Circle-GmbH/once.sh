@@ -40,11 +40,15 @@
 : ${HIVEMIND_QUEUE_MAX_AGE_SEC:=3600}
 
 # Naming convention (sprint-1-state-correctness/naming-migration-design.md):
-#   pane title  = role@HIVEMIND_HOST  (WHERE — humans reading otmux tree)
-#   /rename     = role@DEFAULT_MODEL  (WHAT — Claude session selector)
-#   registry    = bare role           (machine-readable)
-# role.fromTitle() strips @* — both surfaces parse cleanly through one point.
+#   Option C (unified — TRON directive 2026-05-24): role@HIVEMIND_HOST EVERYWHERE.
+#   pane title    = role@HIVEMIND_HOST  (WHERE — humans reading otmux tree)
+#   /rename       = role@HIVEMIND_HOST  (Claude customTitle — same value)
+#   registry      = bare role           (machine-readable)
+# role.fromTitle() strips @* — single parse point. pane.lock prevents Claude
+# from overwriting the pane title (without lock, /rename propagates back).
 : ${HIVEMIND_HOST:=$(hostname -s 2>/dev/null)}
+# HIVEMIND_DEFAULT_MODEL kept for backwards compat; no longer used in /rename
+# (Option A retired). Reserved for future model-selection use.
 : ${HIVEMIND_DEFAULT_MODEL:=opus}
 
 # B5.1 — TTL window during which manual registry.set takes priority over live
@@ -297,7 +301,9 @@ private.hiveMind.pane.identify() {
   local target="$1"
   local role="$2"
   private.hiveMind.registry.set "$target" "$role"
-  otmux pane.title "$target" "${role}@${HIVEMIND_HOST}"
+  # pane.lock (not pane.title): prevents Claude's /rename from overwriting the
+  # title back to its customTitle (Option C — TRON 2026-05-24).
+  otmux pane.lock "$target" "${role}@${HIVEMIND_HOST}"
   otmux send.enter "$target" "export FORCE_COLOR=2; unset COLORTERM; unset CLAUDECODE"
   otmux send.enter "$target" "export HIVEMIND_ROLE=$role"
 }
@@ -2810,13 +2816,13 @@ EOF
 
   # Step 9: rename inside Claude — sets customTitle so future session.id /
   # session.name lookups return the role. Slash command, not text.
-  # Claude sees @model (helps fork selection); pane title sees @hostname (WHERE).
-  "$OOSH_DIR/otmux" send.raw "$targetPane" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}" Enter
+  # Option C: Claude sees @hostname (same as pane title — unified).
+  "$OOSH_DIR/otmux" send.raw "$targetPane" "/rename ${role}@${HIVEMIND_HOST}" Enter
   sleep 0.5
 
-  # Step 10: pane title — visible label in tmux border. Lock it so Claude's
-  # automatic title updates (firstPrompt etc) don't overwrite the role.
-  "$OOSH_DIR/otmux" pane.title "$targetPane" "${role}@${HIVEMIND_HOST}"
+  # Step 10: pane.lock pins the title so Claude can't override it via /rename
+  # propagation. (Was pane.title — replaced 2026-05-24 per TRON CMM4 directive.)
+  "$OOSH_DIR/otmux" pane.lock "$targetPane" "${role}@${HIVEMIND_HOST}"
 
   # Step 11: send boot file if it exists (Controller knows where boot files live)
   local workspace bootFile
@@ -3131,12 +3137,13 @@ hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> <?sessionFilter> # 
     fi
 
     # Set pane title (layout.restore may have done this; re-set for correctness).
-    # If snapshot title lacks @hostname (older snapshots), append HIVEMIND_HOST
-    # so restored teams adopt the role@hostname convention.
+    # If snapshot title lacks @hostname (older snapshots) OR has a non-hostname
+    # @suffix (e.g. legacy @opus from Option A), normalize to @HIVEMIND_HOST.
+    # Use pane.lock so Claude can't override after a /rename propagation.
     if [ -n "$title" ]; then
-      local restored_title="$title"
-      [[ "$restored_title" != *"@"* ]] && restored_title="${restored_title}@${HIVEMIND_HOST}"
-      otmux pane.title "$pane_target" "$restored_title" 2>/dev/null
+      local restored_title="${title%%@*}"
+      restored_title="${restored_title}@${HIVEMIND_HOST}"
+      otmux pane.lock "$pane_target" "$restored_title" 2>/dev/null
     fi
 
     # C1 STEP 5: kind-aware dispatch
@@ -4089,8 +4096,8 @@ hiveMind.agent.rename() # <agentName> <newName> # rename agent: /rename + pane.l
     return 1
   fi
 
-  # 1. Send /rename to Claude Code TUI (Claude sees @model)
-  otmux send.raw "$target" "/rename ${newName}@${HIVEMIND_DEFAULT_MODEL}" Enter
+  # 1. Send /rename to Claude Code TUI (Option C: same @hostname as pane title)
+  otmux send.raw "$target" "/rename ${newName}@${HIVEMIND_HOST}" Enter
   sleep 1
 
   # 2. Lock pane title (tmux shows @hostname)
@@ -4140,10 +4147,12 @@ private.hiveMind.reconcile.diff() # <?invariant:all> # emit mutations needed to 
   if [ "$only" = "all" ] || [ "$only" = "i4" ]; then private.hiveMind.reconcile.check.i4; fi
   if [ "$only" = "all" ] || [ "$only" = "i5" ]; then private.hiveMind.reconcile.check.i5; fi
   if [ "$only" = "all" ] || [ "$only" = "i6" ]; then private.hiveMind.reconcile.check.i6; fi
+  if [ "$only" = "all" ] || [ "$only" = "i8" ]; then private.hiveMind.reconcile.check.i8; fi
+  if [ "$only" = "all" ] || [ "$only" = "i9" ]; then private.hiveMind.reconcile.check.i9; fi
   return 0
 }
 private.hiveMind.reconcile.diff.completion.invariant() {
-  echo "all"; for i in 1 2 3 4 5 6 7; do echo "i$i"; done
+  echo "all"; for i in 1 2 3 4 5 6 7 8 9; do echo "i$i"; done
 }
 
 private.hiveMind.reconcile.check.i1() { # # I1 (HIGH): every pane in S1 exists in L1
@@ -4248,6 +4257,53 @@ hiveMind.protected.reconcile.diff.completion.invariant() {
   private.hiveMind.reconcile.diff.completion.invariant
 }
 
+private.hiveMind.reconcile.check.i8() { # # I8 (HIGH): every live pane should be in S1 (coverage)
+  # robbinTeam pane-shift incident (2026-05-22): new panes added via splits
+  # had no registry entry — resolve broken silently. This catches it.
+  # Output: HIGH per pane (so consistency.fix can register each individually).
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local pane title
+  while IFS='|' read -r pane title; do
+    [ -z "$pane" ] && continue
+    if [ ! -f "$reg" ] || ! grep -q "^${pane}|" "$reg" 2>/dev/null; then
+      # Derive proposed role from pane title (strip @* via role.fromTitle).
+      local proposed
+      proposed=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
+      [ -z "$proposed" ] && proposed="<unknown>"
+      echo "HIGH|I8|S1|ADD|${pane}|${proposed}|<not-in-S1>"
+    fi
+  done < <(tmux list-panes -aF '#{session_name}:#{window_index}.#{pane_index}|#{pane_title}' 2>/dev/null)
+}
+
+private.hiveMind.reconcile.check.i9() { # # I9 (MEDIUM): pane titles should be role@HIVEMIND_HOST (not @model)
+  # CMM4 directive (2026-05-24): titles must be role@hostname. Catches Claude's
+  # /rename @opus propagation when pane.lock wasn't applied (Option A leftovers).
+  # Only checks panes that ARE in the registry — coverage handled by I8.
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  [ -z "$HIVEMIND_HOST" ] && return 0
+  local pane title role expected
+  while IFS='|' read -r pane title; do
+    [ -z "$pane" ] && continue
+    # Only check panes with a registered role
+    role=$(grep "^${pane}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+    [ -z "$role" ] && continue
+    expected="${role}@${HIVEMIND_HOST}"
+    # If title has @ but suffix doesn't match HIVEMIND_HOST, flag it
+    case "$title" in
+      *@*)
+        if [ "$title" != "$expected" ]; then
+          echo "MEDIUM|I9|V1|UPDATE|${pane}|${expected}|${title}"
+        fi
+        ;;
+      *)
+        # No @ at all — also a mismatch
+        echo "MEDIUM|I9|V1|UPDATE|${pane}|${expected}|${title}"
+        ;;
+    esac
+  done < <(tmux list-panes -aF '#{session_name}:#{window_index}.#{pane_index}|#{pane_title}' 2>/dev/null)
+}
+
 private.hiveMind.reconcile.check.i7() { # # I7 (CRITICAL): tronMonitor display matches title
   # Active check — requires screen capture, slow (~0.5s). Skip if tronMonitor
   # not running. tronMonitor.verify is the single source of truth here.
@@ -4264,7 +4320,7 @@ private.hiveMind.reconcile.check.i7() { # # I7 (CRITICAL): tronMonitor display m
   fi
 }
 
-hiveMind.consistency.audit() # <?session> <?format:human|json> # graded audit (I1-I7) via reconcile.diff — pure read; exit code = violation count (U2)
+hiveMind.consistency.audit() # <?session> <?format:human|json> # graded audit (I1-I9) via reconcile.diff — pure read; exit code = violation count (U2)
 {
   # SC-A.2 — Sprint 1 state-correctness audit. Layers on top of SC-A.1
   # reconcile.diff primitive. Reports human OR json. Shows ALL violations
@@ -4315,7 +4371,7 @@ private.hiveMind.audit.render.human() # <diff_lines> <total> <c> <h> <m> <l> # c
   echo -e "${GRAY}$(printf '%.0s═' {1..78})${NORMAL}"
 
   if [ "$total" -eq 0 ]; then
-    echo -e "${BOLD_GREEN}✓ CLEAN${NORMAL} — all 7 invariants pass."
+    echo -e "${BOLD_GREEN}✓ CLEAN${NORMAL} — all 9 invariants pass."
     echo -e "${GRAY}$(printf '%.0s─' {1..78})${NORMAL}"
     return 0
   fi
@@ -4657,6 +4713,23 @@ private.hiveMind.reconcile.apply() # # consume diff lines on stdin, apply each m
           applied=$((applied + 1))
         fi
         ;;
+      S1:ADD)
+        # I8 — register pane that exists in tmux but missing from S1 registry.
+        # Skip if proposed role is <unknown> (no title to derive from).
+        if [ "$expected" = "<unknown>" ]; then
+          info.log "  SKIP I8 $key — no title to derive role from"
+          skipped=$((skipped + 1))
+        else
+          private.hiveMind.registry.set "$key" "$expected" >/dev/null 2>&1
+          applied=$((applied + 1))
+        fi
+        ;;
+      V1:UPDATE)
+        # I9 — pane title format mismatch (e.g. role@opus → role@HIVEMIND_HOST).
+        # Use pane.lock so Claude can't re-overwrite.
+        otmux pane.lock "$key" "$expected" 2>/dev/null
+        applied=$((applied + 1))
+        ;;
       *)
         info.log "  SKIP unhandled mutation: ${store} ${op} ${key}"
         skipped=$((skipped + 1))
@@ -4967,9 +5040,9 @@ hiveMind.team.setup() # <roles> <?session> # create N-pane session with agents f
     local pane="${session}:0.${i}"
     local role="${role_array[$i]}"
 
-    # Send /rename so Claude Code session gets the role name (with @model suffix
-    # — pane title is set elsewhere by pane.identify which appends @hostname)
-    otmux send.enter "$pane" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}"
+    # Send /rename — Option C: customTitle = @hostname (same as pane title).
+    # pane.identify already pane.lock'd the title; lock survives Claude's propagation.
+    otmux send.enter "$pane" "/rename ${role}@${HIVEMIND_HOST}"
     sleep 1
 
     # Capture session UUID
@@ -5415,12 +5488,12 @@ hiveMind.agent.bootstrap() # <agentName> <?session> <?pane> # full bootstrap: cr
     info.log "Captured session UUID for $role ($target_pane): ${new_sid}"
   fi
 
-  # Step 4c: Set session name via /rename so registry.refresh can identify this agent
-  # Claude session sees @model (for fork selection); pane title gets @hostname (WHERE).
-  info.log "Setting session name to ${role}@${HIVEMIND_DEFAULT_MODEL}..."
-  otmux send.enter "$target_pane" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}"
+  # Step 4c: Set session name via /rename — Option C: customTitle = @hostname.
+  info.log "Setting session name to ${role}@${HIVEMIND_HOST}..."
+  otmux send.enter "$target_pane" "/rename ${role}@${HIVEMIND_HOST}"
   sleep 2
-  otmux pane.title "$target_pane" "${role}@${HIVEMIND_HOST}"
+  # pane.lock (not pane.title): pins title against Claude's /rename propagation.
+  otmux pane.lock "$target_pane" "${role}@${HIVEMIND_HOST}"
 
   # Step 5: Teach role
   local full_prompt
@@ -6285,10 +6358,11 @@ hiveMind.agent.respawn() # <agentName> # fork role snapshot into pane + /rename 
   newUuid=$(private.hiveMind.session.resolve.uuid "$target" 2>/dev/null)
   [ -n "$newUuid" ] && info.log "Child UUID: ${newUuid:0:8}..."
 
-  # /rename inside Claude TUI so customTitle matches role (with @model suffix)
-  otmux send.raw "$target" "/rename ${role}@${HIVEMIND_DEFAULT_MODEL}" Enter 2>/dev/null
+  # /rename inside Claude TUI — Option C: customTitle = @hostname (same as pane).
+  otmux send.raw "$target" "/rename ${role}@${HIVEMIND_HOST}" Enter 2>/dev/null
   sleep 1
-  otmux pane.title "$target" "${role}@${HIVEMIND_HOST}"
+  # pane.lock (not pane.title): pins against Claude's /rename propagation.
+  otmux pane.lock "$target" "${role}@${HIVEMIND_HOST}"
 
   # Reaffirm pane↔role registration
   private.hiveMind.registry.set "$target" "$role"
