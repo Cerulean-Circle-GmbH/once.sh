@@ -203,18 +203,19 @@ private.hiveMind.pane.count() { # <target> # count panes in a window or session
 }
 
 private.hiveMind.claude.processes() { # # list Claude processes with pane targets: pid|tty|paneTarget|title|args
-  local -A ttyMap titleMap
-  while IFS='|' read -r paneTty paneRef paneTitle; do
-    ttyMap["$paneTty"]="$paneRef"
-    titleMap["$paneRef"]="$paneTitle"
-  done < <(private.hiveMind.list.panes tty+title)
+  # Bash 3.2 compat (task #29): assoc arrays unavailable. Store pane info as
+  # `paneTty|paneRef|paneTitle\n` lines, lookup via grep.
+  local paneInfo
+  paneInfo=$(private.hiveMind.list.panes tty+title)
   while read -r pid tty comm rest; do
     [ -z "$pid" ] && continue
     [[ "$comm" == "bash" || "$comm" == "zsh" || "$comm" == "node" ]] && continue
     local ttyDev="/dev/$tty"
-    local paneTarget="${ttyMap[$ttyDev]:-}"
-    [ -z "$paneTarget" ] && continue
-    local title="${titleMap[$paneTarget]:-}"
+    local hit paneTarget title
+    hit=$(echo "$paneInfo" | grep "^${ttyDev}|" | head -1)
+    [ -z "$hit" ] && continue
+    paneTarget=$(echo "$hit" | cut -d'|' -f2)
+    title=$(echo "$hit" | cut -d'|' -f3-)
     echo "${pid}|${tty}|${paneTarget}|${title}|${rest}"
   done < <(ps -eo pid,tty,comm,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1, $2, $3, substr($0, index($0,$4))}')
 }
@@ -316,8 +317,16 @@ private.hiveMind.pane.identify() {
 
 # Backing store — associative: event name → space-separated handler list.
 # Declared once at script-load; idempotent under repeated source.
-if ! declare -p HIVEMIND_EVENT_HANDLERS 2>/dev/null | grep -q '^declare -A'; then
-  declare -gA HIVEMIND_EVENT_HANDLERS=()
+# Bash 3.2 compat (task #29): declare -gA and assoc arrays are bash 4+.
+# On bash 3.2 (macOS default), the event system silently no-ops — handlers
+# never fire but the rest of hiveMind keeps working. Use bash 5 (homebrew /
+# `source ~/config/user.env`) for full SC-B event propagation.
+HIVEMIND_EVENTS_AVAILABLE=""
+if [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; then
+  if ! declare -p HIVEMIND_EVENT_HANDLERS 2>/dev/null | grep -q '^declare -A'; then
+    declare -gA HIVEMIND_EVENT_HANDLERS=()
+  fi
+  HIVEMIND_EVENTS_AVAILABLE=1
 fi
 
 private.hiveMind.events.register() # <eventName> <handlerFunction> # idempotent — re-registering the same handler is a no-op
@@ -327,6 +336,8 @@ private.hiveMind.events.register() # <eventName> <handlerFunction> # idempotent 
     error.log "events.register: usage <eventName> <handlerFunction>"
     return 1
   fi
+  # Bash 3.2 fallback: assoc arrays unavailable, silently no-op.
+  [ -z "$HIVEMIND_EVENTS_AVAILABLE" ] && return 0
   # Idempotent: only add if not already in the space-separated list
   local current="${HIVEMIND_EVENT_HANDLERS[$event]:-}"
   case " $current " in
@@ -343,8 +354,10 @@ private.hiveMind.events.emit() # <eventName> <arg...> # fan-out to all registere
     error.log "events.emit: usage <eventName> <arg...>"
     return 1
   fi
-  # Append to history log (SC-B.2 rotation)
+  # Append to history log (SC-B.2 rotation) — works on any bash version
   private.hiveMind.events.history.append "$event" "$@"
+  # Bash 3.2 fallback: assoc arrays unavailable, no handlers to fan out to.
+  [ -z "$HIVEMIND_EVENTS_AVAILABLE" ] && return 0
   local handlers="${HIVEMIND_EVENT_HANDLERS[$event]:-}"
   [ -z "$handlers" ] && return 0   # no handlers = silent no-op
   local h rc
@@ -1156,11 +1169,10 @@ hiveMind.protected.agents.discover() # <?session_filter> # shared discovery — 
   local filter="$1"
 
   # Build Claude process lookup (non-invasive)
-  local -A claudeProcs
-  while IFS='|' read -r pid tty paneTarget title rest; do
-    [ -z "$pid" ] && continue
-    claudeProcs["$paneTarget"]="${pid}|${rest}"
-  done < <(private.hiveMind.claude.processes)
+  # Bash 3.2 compat (task #29): delimited string instead of assoc array.
+  # Format per line: `paneTarget|pid|rest` (rest is the ps args field).
+  local claudeProcs procRow
+  claudeProcs=$(private.hiveMind.claude.processes | awk -F'|' '{print $3"|"$1"|"$5}')
 
   # Enumerate all panes
   while IFS='|' read -r pane_target pane_title; do
@@ -1173,9 +1185,10 @@ hiveMind.protected.agents.discover() # <?session_filter> # shared discovery — 
 
     local is_claude="no"
     local procRest=""
-    if [ -n "${claudeProcs[$pane_target]:-}" ]; then
+    procRow=$(echo "$claudeProcs" | grep "^${pane_target}|" | head -1)
+    if [ -n "$procRow" ]; then
       is_claude="yes"
-      procRest="${claudeProcs[$pane_target]#*|}"
+      procRest=$(echo "$procRow" | cut -d'|' -f3-)
     fi
 
     # Role: registry → pane title → "pane N"
@@ -3060,13 +3073,13 @@ hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> <?sessionFilter> # 
   # pane index forced new splits. The guard caps creation: if current >= target
   # for a session, the iteration loop SKIPS the per-row ensure.pane call.
   # Metadata (title, registry, claude join) still applies to the existing pane.
-  declare -A TARGET_PANE_COUNT=()
-  while IFS='|' read -r sess _rest; do
-    [ -z "$sess" ] && continue
-    [[ "$sess" == "#"* ]] && continue
-    [ -n "$sessionFilter" ] && [ "$sess" != "$sessionFilter" ] && continue
-    TARGET_PANE_COUNT["$sess"]=$(( ${TARGET_PANE_COUNT["$sess"]:-0} + 1 ))
-  done < <(grep -v '^#' "$snapfile" 2>/dev/null)
+  #
+  # Bash 3.2 compat (task #29): declare -A is bash 4+. Store as `sess|N\n` lines
+  # in a string instead; lookup via grep. Portable across bash 3.2 and 4+.
+  local TARGET_PANE_COUNT
+  TARGET_PANE_COUNT=$(grep -v '^#' "$snapfile" 2>/dev/null | cut -d'|' -f1 | \
+    if [ -n "$sessionFilter" ]; then grep -Fx "$sessionFilter"; else cat; fi | \
+    sort | uniq -c | awk '{printf "%s|%s\n", $2, $1}')
 
   for sess in "${uniqueSessions[@]}"; do
     [ -z "$sess" ] && continue
@@ -3107,7 +3120,9 @@ hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> <?sessionFilter> # 
     local _curPanes _tgtPanes
     # session-wide pane count (2nd arg "all" triggers -s in pane.count helper)
     _curPanes=$(private.hiveMind.pane.count "$sess" all 2>/dev/null)
-    _tgtPanes="${TARGET_PANE_COUNT[$sess]:-0}"
+    # Bash 3.2 compat: read TARGET_PANE_COUNT as `sess|N\n` lines, not assoc array.
+    _tgtPanes=$(echo "$TARGET_PANE_COUNT" | grep "^${sess}|" | head -1 | cut -d'|' -f2)
+    [ -z "$_tgtPanes" ] && _tgtPanes=0
     if [ "${_curPanes:-0}" -ge "${_tgtPanes:-0}" ] && [ "${_tgtPanes:-0}" -gt 0 ]; then
       : "skipping ensure.pane — session saturated (${_curPanes} >= ${_tgtPanes})"
     else
@@ -4389,14 +4404,10 @@ hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sp
   echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
 
   local consistent=0 inconsistent=0 noAgent=0
-  local -A seenUuids
-
-  # Build lookup of Claude processes by pane target
-  local -A claudeProcs
-  while IFS='|' read -r pid tty paneTarget title rest; do
-    [ -z "$pid" ] && continue
-    claudeProcs["$paneTarget"]="${pid}|${rest}"
-  done < <(private.hiveMind.claude.processes)
+  # Bash 3.2 compat (task #29): delimited strings instead of assoc arrays.
+  # seenUuids: `uuid|pane\n` per row. claudeProcs: `pane|pid|rest\n`.
+  local seenUuids="" claudeProcs procRow
+  claudeProcs=$(private.hiveMind.claude.processes | awk -F'|' '{print $3"|"$1"|"$5}')
 
   # Enumerate ALL panes (not just Claude-running ones)
   while IFS='|' read -r pane_target pane_title; do
@@ -4414,9 +4425,10 @@ hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sp
     # Check if this pane has a Claude process
     local hasClaude=""
     local procRest=""
-    if [ -n "${claudeProcs[$pane_target]:-}" ]; then
+    procRow=$(echo "$claudeProcs" | grep "^${pane_target}|" | head -1)
+    if [ -n "$procRow" ]; then
       hasClaude="yes"
-      procRest="${claudeProcs[$pane_target]#*|}"
+      procRest=$(echo "$procRow" | cut -d'|' -f3-)
     fi
 
     # Registry role
@@ -4454,10 +4466,12 @@ hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sp
       issues+=("UUID stale")
     fi
     if [ -n "$liveUuid" ]; then
-      if [ -n "${seenUuids[$liveUuid]:-}" ]; then
+      # Bash 3.2 compat: grep `uuid|` prefix in seenUuids string.
+      if echo "$seenUuids" | grep -q "^${liveUuid}|"; then
         issues+=("dup UUID")
       fi
-      seenUuids["$liveUuid"]="$pane_target"
+      seenUuids="${seenUuids}${liveUuid}|${pane_target}
+"
     fi
     if [ -n "$regRole" ]; then
       [[ ${#regRole} -gt 30 ]] && issues+=("role>30")
@@ -4694,13 +4708,9 @@ hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (
   fi
 
   local fixedReg=0 fixedSess=0 fixedTitle=0 skipped=0 dupResolved=0
-  local -A seenUuids roleForUuid claudeProcs
-
-  # Build lookup of Claude processes by pane target
-  while IFS='|' read -r pid tty paneTarget title rest; do
-    [ -z "$pid" ] && continue
-    claudeProcs["$paneTarget"]="${pid}|${rest}"
-  done < <(private.hiveMind.claude.processes)
+  # Bash 3.2 compat (task #29): delimited strings instead of assoc arrays.
+  local seenUuids="" roleForUuid="" claudeProcs procRow
+  claudeProcs=$(private.hiveMind.claude.processes | awk -F'|' '{print $3"|"$1"|"$5}')
 
   # Iterate ALL panes
   while IFS='|' read -r paneTarget title; do
@@ -4712,9 +4722,10 @@ hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (
 
     # Check Claude process
     local hasClaude="" procRest=""
-    if [ -n "${claudeProcs[$paneTarget]:-}" ]; then
+    procRow=$(echo "$claudeProcs" | grep "^${paneTarget}|" | head -1)
+    if [ -n "$procRow" ]; then
       hasClaude="yes"
-      procRest="${claudeProcs[$paneTarget]#*|}"
+      procRest=$(echo "$procRow" | cut -d'|' -f3-)
     fi
 
     # Non-Claude pane with no registry — skip
@@ -4763,8 +4774,10 @@ hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (
 
     # --- 3b. Fix sessions.env UUID ---
     if [ -n "$liveUuid" ]; then
-      if [ -n "${seenUuids[$liveUuid]:-}" ]; then
-        local dupRole="${roleForUuid[$liveUuid]:-}"
+      # Bash 3.2 compat: grep `uuid|` prefix in seenUuids/roleForUuid strings.
+      if echo "$seenUuids" | grep -q "^${liveUuid}|"; then
+        local dupRole
+        dupRole=$(echo "$roleForUuid" | grep "^${liveUuid}|" | head -1 | cut -d'|' -f2)
         echo -e "${BOLD_RED}⚠ DUP UUID: $dupRole and $role share ${liveUuid}${NORMAL}"
         dupResolved=$((dupResolved + 1))
       fi
@@ -4774,7 +4787,7 @@ hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (
       if [ -n "$dupPanes" ]; then
         while IFS= read -r stalePane; do
           [ -z "$stalePane" ] && continue
-          if [ -n "${claudeProcs[$stalePane]:-}" ]; then
+          if echo "$claudeProcs" | grep -q "^${stalePane}|"; then
             continue  # Live process — shared session, not stale
           fi
           private.hiveMind.env.del "$sess_file" "$stalePane" "$liveUuid"
@@ -4782,8 +4795,10 @@ hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (
           dupResolved=$((dupResolved + 1))
         done <<< "$dupPanes"
       fi
-      seenUuids["$liveUuid"]="$paneTarget"
-      roleForUuid["$liveUuid"]="$role"
+      seenUuids="${seenUuids}${liveUuid}|${paneTarget}
+"
+      roleForUuid="${roleForUuid}${liveUuid}|${role}
+"
 
       if private.hiveMind.env.set "$sess_file" "$paneTarget" "$liveUuid"; then
         lineParts+=("${BOLD_GREEN}sessions.env → ${liveUuid} ✓${NORMAL}")
