@@ -2996,11 +2996,14 @@ hiveMind.teams.save() # # snapshot all Claude processes + layout for cold-restar
     model=$(private.hiveMind.pane.model "$paneTarget" 2>/dev/null)
     kind=$(private.hiveMind.pane.kind "$paneTarget" 2>/dev/null)
 
-    echo "${sess}|${addr}|${role}|${sid:-}|${role:-}|${cwd:-}|${model:-}|${kind:-unknown}" >> "$tmpEntries"
-    count=$((count + 1))
-
-    # Track unique sessions for layout.save
-    echo "$seenSessions" | grep -q " ${sess} " || seenSessions="${seenSessions} ${sess} "
+    # SC-F.2: validate before writing — skip garbage rows (Bug #4 class)
+    local _liveRow="${sess}|${addr}|${role}|${sid:-}|${role:-}|${cwd:-}|${model:-}|${kind:-unknown}"
+    if private.hiveMind.snapshot.row.valid "$_liveRow"; then
+      echo "$_liveRow" >> "$tmpEntries"
+      count=$((count + 1))
+      # Track unique sessions for layout.save
+      echo "$seenSessions" | grep -q " ${sess} " || seenSessions="${seenSessions} ${sess} "
+    fi
   done < <(private.hiveMind.claude.processes)
 
   # Also include dead agents + shell panes from registry+sessions.env.
@@ -3030,9 +3033,13 @@ hiveMind.teams.save() # # snapshot all Claude processes + layout for cold-restar
       local dead_cwd dead_kind
       dead_cwd=$(otmux pane.get "$pane_target" '#{pane_current_path}' 2>/dev/null)
       dead_kind=$(private.hiveMind.pane.kind "$pane_target" 2>/dev/null)
-      echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${reg_role} (dead)|${dead_cwd:-}||${dead_kind:-shell}" >> "$tmpEntries"
-      dead_count=$((dead_count + 1))
-      echo "$seenSessions" | grep -q " ${dead_sess} " || seenSessions="${seenSessions} ${dead_sess} "
+      # SC-F.2: validate dead entries too (registry can hold garbage role names)
+      local _deadRow="${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${reg_role} (dead)|${dead_cwd:-}||${dead_kind:-shell}"
+      if private.hiveMind.snapshot.row.valid "$_deadRow"; then
+        echo "$_deadRow" >> "$tmpEntries"
+        dead_count=$((dead_count + 1))
+        echo "$seenSessions" | grep -q " ${dead_sess} " || seenSessions="${seenSessions} ${dead_sess} "
+      fi
     done < "$reg"
   fi
 
@@ -3076,6 +3083,55 @@ private.hiveMind.snapshot.version.check() # <snapfile> # SC-F.1 — 0 if support
   error.log "  file: $snapfile"
   error.log "  fix: use a v${HIVEMIND_SNAPSHOT_VERSION:-1} snapshot or upgrade/downgrade oosh to match"
   return 1
+}
+
+private.hiveMind.snapshot.row.valid() # <row> # SC-F.2/3 — true if row passes per-field validation (logs reason on reject)
+{
+  # SC-F.2/3: row gate for snapshot save (write) + restore (read).
+  # Uses kernel predicates (this.is*) from SC-E.2 P3 family. Skip-and-log
+  # semantics — caller continues processing other rows. Defends against:
+  #   • Bug #4 "Did/you/mean:" prompt garbage leaking into snapshot
+  #   • pipe/newline injection in any field
+  #   • non-tmux session names (e.g. error message captured as a row)
+  # Schema: sess|addr|role|uuid|title|cwd|model|kind
+  local row="$1"
+  [ -z "$row" ] && return 1
+  case "$row" in '#'*) return 1 ;; esac  # comments aren't data rows
+
+  local sess addr role uuid title cwd model kind
+  IFS='|' read -r sess addr role uuid title cwd model kind <<< "$row"
+
+  # Field 1 — session: required, tmux session name format
+  if ! this.isSessionName "$sess"; then
+    warn.log "snapshot row reject: invalid session '$sess'"
+    return 1
+  fi
+  # Field 2 — address: required, window.pane numeric
+  if [[ ! "$addr" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    warn.log "snapshot row reject: invalid address '$addr' (sess=$sess)"
+    return 1
+  fi
+  # Field 3 — role: empty allowed, otherwise isRoleName
+  if [ -n "$role" ] && ! this.isRoleName "$role"; then
+    warn.log "snapshot row reject: invalid role '$role' (sess=$sess)"
+    return 1
+  fi
+  # Field 4 — uuid: empty allowed, otherwise canonical UUID
+  if [ -n "$uuid" ] && ! this.isUuid "$uuid"; then
+    warn.log "snapshot row reject: invalid uuid '$uuid' (sess=$sess)"
+    return 1
+  fi
+  # Fields 5–8 — pipe-safe (titles can have spaces + parens; cwds are paths)
+  local f label
+  for f in "title:$title" "cwd:$cwd" "model:$model" "kind:$kind"; do
+    label="${f%%:*}"
+    local val="${f#*:}"
+    if [ -n "$val" ] && ! this.isPipeSafe "$val"; then
+      warn.log "snapshot row reject: pipe/newline in $label='$val' (sess=$sess)"
+      return 1
+    fi
+  done
+  return 0
 }
 
 private.hiveMind.wait.for.claude() # <paneTarget> <?timeout:30> # poll until Claude process alive
@@ -3208,6 +3264,14 @@ hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> <?sessionFilter> # 
     [ -n "$sessionFilter" ] && [ "$sess" != "$sessionFilter" ] && continue
     # Default kind for backward-compat with old 5-field snapshots
     [ -z "$kind" ] && kind=$([ -n "$uuid" ] && echo claude || echo shell)
+    # SC-F.3: per-row validation — skip + log garbage (Bug #4 class). Reconstruct
+    # the row for the shared validator. Pre-SC-F.1 snapshots may have title with
+    # trailing pipes; this catches them rather than mutating state from junk.
+    local _row="${sess}|${addr}|${role}|${uuid}|${title}|${cwd}|${model}|${kind}"
+    if ! private.hiveMind.snapshot.row.valid "$_row"; then
+      skip_count=$((skip_count + 1))
+      continue
+    fi
 
     local pane_target="${sess}:${addr}"
 
