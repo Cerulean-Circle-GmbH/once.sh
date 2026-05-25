@@ -455,8 +455,14 @@ private.hiveMind.handler.agent.spawned.registry() {
 
 private.hiveMind.handler.agent.spawned.sessions() {
   local pane="$1" role="$2" uuid="$3"
-  [ -z "$pane" ] || [ -z "$uuid" ] && return 0
-  private.hiveMind.session.store "$pane" "$uuid"
+  [ -z "$pane" ] && return 0
+  if [ -n "$uuid" ]; then
+    private.hiveMind.session.store "$pane" "$uuid"
+  elif [ -n "$role" ]; then
+    # SC-H.2 Gap A: probe race — UUID unknown at spawn time. Schedule
+    # background retries so S2 catches up without operator intervention.
+    private.hiveMind.session.store.deferred "$pane" "$role"
+  fi
 }
 
 # ── SC-C.2 agent.killed ─── args: <pane> ────────────────────────────────────
@@ -1042,6 +1048,72 @@ private.hiveMind.session.lookup() {
   private.hiveMind.sessions.migrate
   [ -f "$HIVEMIND_SESSIONS" ] || return 1
   grep "^${pane}|" "$HIVEMIND_SESSIONS" 2>/dev/null | tail -1 | cut -d'|' -f2
+}
+
+private.hiveMind.session.store.deferred() # <pane> <role> # bg retry probe @ 5/15/30s post-call
+{
+  # SC-H.2 Gap A: probe race fix. The synchronous probe in team.setup/
+  # agent.bootstrap/etc. waits only 8s after Claude launch. Slow startup,
+  # plan-mode prompts, or autocompact mid-launch can leave the TUI not yet
+  # serving /status — probe returns empty, session.store never runs, S2 misses
+  # the pane→UUID entry. Detector I10 (commit 53f2bd9) catches this post-fact;
+  # this is the prevention side.
+  #
+  # Forks a disowned subshell that retries probe at 5s/15s/30s. Idempotent:
+  # skips if S2 already populated; pidfile guards concurrent calls for the
+  # same pane (event handler + bash-3.2 fallback can both fire — pidfile wins).
+  local pane="$1" role="$2"
+  [ -z "$pane" ] && return 1
+
+  # Pidfile guard — sanitize pane target ( : . → _ ) for safe filename
+  local sanitized
+  sanitized=$(echo "$pane" | tr ':.' '__')
+  local pidFile="/tmp/hivemind.deferred.${sanitized}.pid"
+  if [ -f "$pidFile" ]; then
+    local oldPid
+    oldPid=$(cat "$pidFile" 2>/dev/null)
+    if [ -n "$oldPid" ] && kill -0 "$oldPid" 2>/dev/null; then
+      info.log "defer-probe: $pane already scheduled (pid $oldPid)"
+      return 0
+    fi
+    # Stale pidfile from previous crashed run
+    rm -f "$pidFile" 2>/dev/null
+  fi
+
+  # Spawn background retry loop. Each iteration checks S2 first (cheap), then
+  # invokes probe (invasive — sends /status to the pane). On success: store
+  # and exit. On final failure: warn and exit non-zero.
+  (
+    echo $$ > "$pidFile"
+    trap 'rm -f "$pidFile" 2>/dev/null' EXIT
+
+    local prev=0 delay wait sid existing
+    for delay in 5 15 30; do
+      wait=$((delay - prev))
+      sleep "$wait"
+      prev="$delay"
+
+      # Skip if another path populated S2 in the meantime
+      existing=$(private.hiveMind.session.lookup "$pane" 2>/dev/null)
+      if [ -n "$existing" ]; then
+        info.log "defer-probe: $pane already has UUID ${existing} — done"
+        exit 0
+      fi
+
+      # Invasive probe — sends /status to pane and parses
+      sid=$(hiveMind.agent.session.probe "$pane" 2>/dev/null)
+      if [ -n "$sid" ]; then
+        private.hiveMind.session.store "$pane" "$sid"
+        info.log "defer-probe: $pane captured UUID ${sid} after ${delay}s"
+        exit 0
+      fi
+    done
+
+    warn.log "defer-probe: $pane gave up after 30s (3 attempts) — S2 still missing for role '$role'"
+    exit 1
+  ) &
+  disown 2>/dev/null
+  return 0
 }
 
 # ── Active Team ───────────────────────────────────────────────────────────────
@@ -3767,6 +3839,10 @@ hiveMind.agent.restart() # <configDir> <role> # restart single agent from pulled
     # lifecycle. Emit agent.spawned with the snapshot UUID (best-known at this
     # point; fork-child UUID is filled in later by registry.refresh).
     private.hiveMind.events.emit "agent.spawned" "$paneTarget" "$role" "${uuid:-}"
+    # SC-H.2 Gap A: bash-3.2 fallback. Event handler schedules defer-probe on
+    # bash 5; events are no-op on bash 3.2 — schedule directly when UUID empty.
+    [ -z "$HIVEMIND_EVENTS_AVAILABLE" ] && [ -z "$uuid" ] && \
+      private.hiveMind.session.store.deferred "$paneTarget" "$role"
   fi
 
   # Fork session if UUID available
@@ -3855,6 +3931,9 @@ hiveMind.team.restart() # <configDir> # restart ALL agents from pulled config di
       # observer chain (registry refresh, tronMonitor sync, etc.) sees each
       # restarted agent uniformly with agent.bootstrap.
       private.hiveMind.events.emit "agent.spawned" "$paneTarget" "$role" "${uuid:-}"
+      # SC-H.2 Gap A: bash-3.2 fallback (events.emit no-op without bash 5).
+      [ -z "$HIVEMIND_EVENTS_AVAILABLE" ] && [ -z "$uuid" ] && \
+        private.hiveMind.session.store.deferred "$paneTarget" "$role"
     fi
 
     # Fork session if UUID available
@@ -5099,7 +5178,13 @@ hiveMind.team.setup() # <roles> <?session> # create N-pane session with agents f
     # Capture session UUID
     local sid
     sid=$(hiveMind.agent.session.probe "$pane" 2>/dev/null)
-    [ -n "$sid" ] && private.hiveMind.session.store "$pane" "$sid"
+    if [ -n "$sid" ]; then
+      private.hiveMind.session.store "$pane" "$sid"
+    else
+      # SC-H.2 Gap A: probe race — Claude TUI not ready in 8s window.
+      # Schedule background retries (5s/15s/30s). Idempotent.
+      private.hiveMind.session.store.deferred "$pane" "$role"
+    fi
   done
 
   # Register team
@@ -5537,6 +5622,12 @@ hiveMind.agent.bootstrap() # <agentName> <?session> <?pane> # full bootstrap: cr
   if [ -n "$new_sid" ]; then
     private.hiveMind.session.store "$target_pane" "$new_sid"
     info.log "Captured session UUID for $role ($target_pane): ${new_sid}"
+  else
+    # SC-H.2 Gap A: probe race fallback. Event handler also schedules on bash 5;
+    # this covers the bash 3.2 path where events.emit is no-op. Pidfile-guarded
+    # so double-schedule is harmless.
+    [ -z "$HIVEMIND_EVENTS_AVAILABLE" ] && \
+      private.hiveMind.session.store.deferred "$target_pane" "$role"
   fi
 
   # Step 4c: Set session name via /rename — Option C: customTitle = @hostname.
@@ -6036,11 +6127,15 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   info.log "Capturing session UUIDs..."
   local ses="$HIVEMIND_SESSIONS"
   local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2" "${session}:0.3")
+  local _roles=("orchestrator" "scrum-master" "oosh-expert" "oosh-tester")
   for i in 0 1 2 3; do
     local _sid
     _sid=$(hiveMind.agent.session.probe "${_panes[$i]}" 2>/dev/null)
     if [ -n "$_sid" ]; then
       private.hiveMind.session.store "${_panes[$i]}" "$_sid"
+    else
+      # SC-H.2 Gap A: probe race — schedule background retries
+      private.hiveMind.session.store.deferred "${_panes[$i]}" "${_roles[$i]}"
     fi
   done
 
