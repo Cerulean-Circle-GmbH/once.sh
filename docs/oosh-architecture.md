@@ -669,6 +669,58 @@ echo $LOG_LEVEL
 
 ---
 
+## State Correctness (Sprint 1)
+
+OOSH manages a substantial cache layer (S1–S10) that mirrors live tmux/process/display truth (L1–L3). State drift between caches and ground truth is the source of many recurring bugs (ghost agents, stale sessions, "Did/you/mean" garbage). Sprint 1 added architectural prevention: event-driven mutations, ingress hardening, and a reconcile cycle that catches anything events miss.
+
+### Canonical references
+
+- **[docs/state-stores.md](state-stores.md)** — S1–S10 definitions: owner script, writer method, format, mutation paths
+- **[docs/invariants.md](invariants.md)** — I1–I10 invariants: detector, severity, fix recipe, dispatch table
+
+### Quick map
+
+| Layer | Source of truth | Examples |
+|-------|-----------------|----------|
+| **L1** tmux | `tmux list-sessions/panes` | Sessions, windows, panes |
+| **L2** process | `ps -eo args` filtered for Claude | Live agent PIDs and UUIDs |
+| **L3** display | tmux pane titles, screen window labels | What the operator sees |
+| **S1–S10** caches | `~/config/hivemind.*.env`, `~/config/tronMonitor.env`, `~/config/otmux.*.env` | What we believe is true |
+
+Caches MUST converge to L1+L2+L3 via:
+1. **Event handlers** (SC-B/SC-C) — primary path; mutations fire events; observers update their stores
+2. **Ingress triple defense** (SC-E) — every public method validates caller-supplied identifiers at the boundary (regex + pipe-safe + existence check)
+3. **Snapshot integrity** (SC-F) — `# version: 1` header + per-row validation guards save/restore
+4. **Reconcile cycle** (SC-A/SC-D) — `scrumMaster.cycle` periodically runs `hiveMind consistency.reconcile apply`, fixing whatever events missed
+
+### Commands at a glance
+
+```bash
+# Read-only graded audit (I1–I10) — exit code = violation count
+hiveMind consistency.audit [<?session>] [<?format:human|json>]
+
+# Interactive y/N applier
+hiveMind consistency.fix [<?session>]
+
+# Silent batch reconcile — dry-run by default per U3 PO-lock
+hiveMind consistency.reconcile [<?session>] [<?mode:dry-run|apply>]
+
+# Event introspection
+hiveMind events.list             # registered events + handler counts
+hiveMind events.history [<?N:50>] # tail event log
+```
+
+### Adding a new state-mutating method
+
+Read both docs first. Then:
+
+1. Validate identifiers at the ingress boundary — use kernel predicates `this.isPaneTarget` / `this.isSessionName` / `this.isRoleName` / `this.isUuid` / `this.isSshHost` / `this.isPipeSafe`
+2. Go through the canonical writer (`private.hiveMind.registry.set`, `private.hiveMind.session.store`, etc.) — NEVER direct-edit env files
+3. Emit the appropriate event after mutation (`private.hiveMind.events.emit`)
+4. If introducing a new invariant: add `private.hiveMind.reconcile.check.iN` + table row in `docs/invariants.md` + dispatch arm in `private.hiveMind.reconcile.apply` if auto-fixable
+
+---
+
 ## See Also
 
 - [Wiki Index](wiki-index.md) - All documentation links
@@ -677,3 +729,5 @@ echo $LOG_LEVEL
 - [Config System](config.md) - Environment persistence
 - [OO Framework](oo.md) - Script creation
 - [State Machine](state.md) - Multi-step workflows
+- [State Stores](state-stores.md) - S1–S10 reference (Sprint 1)
+- [State Invariants](invariants.md) - I1–I10 reference (Sprint 1)
