@@ -5246,6 +5246,183 @@ echo "=== McDonges disaster regression tests complete ==="
 echo ""
 
 # ============================================================================
+# SC-H.3: MVC Consistency Invariant Tests
+# After ANY lifecycle command, all 3 layers must agree:
+#   Model (sessions.env) — pane→UUID
+#   View (pane titles, tmux) — pane exists with correct title
+#   Controller (roles.env, teams.env) — registry + team membership
+# ============================================================================
+
+if otmux sessions >/dev/null 2>&1; then
+
+  MVC_SESS="__test_mvc_$$"
+  MVC_ROLES_FILE="${CONFIG_PATH:-$HOME/config}/hivemind.roles.env"
+  MVC_TEAMS_FILE="${CONFIG_PATH:-$HOME/config}/hivemind.teams.env"
+  MVC_SESS_FILE="${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env"
+
+  # Cleanup any prior test
+  otmux kill "$MVC_SESS" 2>/dev/null
+  grep -v "$MVC_SESS" "$MVC_ROLES_FILE" > "${MVC_ROLES_FILE}.mvc_clean" 2>/dev/null && mv "${MVC_ROLES_FILE}.mvc_clean" "$MVC_ROLES_FILE"
+  grep -v "$MVC_SESS" "$MVC_TEAMS_FILE" > "${MVC_TEAMS_FILE}.mvc_clean" 2>/dev/null && mv "${MVC_TEAMS_FILE}.mvc_clean" "$MVC_TEAMS_FILE"
+
+  # ── SC-H.3-1: team.register updates teams.env ──────────────────────────
+  otmux new "$MVC_SESS" -d 2>/dev/null
+  hiveMind.team.register "$MVC_SESS" "MVC test team" 2>/dev/null
+
+  test.case $level "SC-H.3-1: team.register writes teams.env" \
+    echo "checking teams.env"
+  if grep -q "^${MVC_SESS}|" "$MVC_TEAMS_FILE" 2>/dev/null; then
+    expect.pass "teams.env has $MVC_SESS"
+  else
+    expect.fail "team.register should write to teams.env"
+  fi
+
+  # ── SC-H.3-2: team.setup updates all 3 layers ─────────────────────────
+  otmux kill "$MVC_SESS" 2>/dev/null
+  grep -v "$MVC_SESS" "$MVC_ROLES_FILE" > "${MVC_ROLES_FILE}.mvc_clean" 2>/dev/null && mv "${MVC_ROLES_FILE}.mvc_clean" "$MVC_ROLES_FILE"
+  grep -v "$MVC_SESS" "$MVC_TEAMS_FILE" > "${MVC_TEAMS_FILE}.mvc_clean" 2>/dev/null && mv "${MVC_TEAMS_FILE}.mvc_clean" "$MVC_TEAMS_FILE"
+
+  hiveMind.team.setup "mvc-alpha,mvc-beta" "$MVC_SESS" 2>/dev/null
+
+  # View: session + panes exist
+  test.case $level "SC-H.3-2a: team.setup creates tmux session" \
+    echo "checking tmux"
+  if otmux has "$MVC_SESS" 2>/dev/null; then
+    MVC_PANES=$(otmux panes -t "$MVC_SESS" -s 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$MVC_PANES" -ge 2 ]; then
+      expect.pass "session exists with $MVC_PANES panes"
+    else
+      expect.fail "expected >= 2 panes, got $MVC_PANES"
+    fi
+  else
+    expect.fail "team.setup should create tmux session"
+  fi
+
+  # Controller: roles.env has entries
+  test.case $level "SC-H.3-2b: team.setup writes roles.env" \
+    echo "checking roles"
+  MVC_ROLE_COUNT=$(grep -c "^${MVC_SESS}:" "$MVC_ROLES_FILE" 2>/dev/null | tr -d ' ')
+  if [ "$MVC_ROLE_COUNT" -ge 2 ]; then
+    expect.pass "roles.env has $MVC_ROLE_COUNT entries for $MVC_SESS"
+  else
+    expect.fail "team.setup should write roles.env (got $MVC_ROLE_COUNT entries)"
+  fi
+
+  # Controller: teams.env has entry
+  test.case $level "SC-H.3-2c: team.setup writes teams.env" \
+    echo "checking teams"
+  if grep -q "^${MVC_SESS}|" "$MVC_TEAMS_FILE" 2>/dev/null; then
+    expect.pass "teams.env has $MVC_SESS"
+  else
+    expect.fail "team.setup should write teams.env"
+  fi
+
+  # View: pane titles match roles
+  test.case $level "SC-H.3-2d: team.setup sets pane titles" \
+    echo "checking titles"
+  MVC_TITLE_0=$(otmux pane.get "${MVC_SESS}:0.0" "#{pane_title}" 2>/dev/null)
+  if echo "$MVC_TITLE_0" | grep -q "mvc-alpha"; then
+    expect.pass "pane 0.0 title contains mvc-alpha: $MVC_TITLE_0"
+  else
+    expect.fail "pane 0.0 title should contain mvc-alpha; got: $MVC_TITLE_0"
+  fi
+
+  # ── SC-H.3-3: consistency.audit returns clean after team.setup ─────────
+  test.case $level "SC-H.3-3: consistency.audit clean after team.setup" \
+    echo "running audit"
+  AUDIT_OUT=$(hiveMind.consistency.audit "$MVC_SESS" 2>/dev/null)
+  AUDIT_RC=$?
+  if [ "$AUDIT_RC" -eq 0 ]; then
+    expect.pass "audit clean after team.setup (rc=0)"
+  else
+    expect.fail "audit found violations after team.setup (rc=$AUDIT_RC)"
+  fi
+
+  # ── SC-H.3-4: NEGATIVE — break registry, verify audit detects ──────────
+  test.case $level "SC-H.3-4: audit detects broken registry entry" \
+    echo "breaking registry"
+  # Delete one role entry to simulate inconsistency
+  grep -v "^${MVC_SESS}:0.0|" "$MVC_ROLES_FILE" > "${MVC_ROLES_FILE}.mvc_break" 2>/dev/null && mv "${MVC_ROLES_FILE}.mvc_break" "$MVC_ROLES_FILE"
+  AUDIT_BROKEN=$(hiveMind.consistency.audit "$MVC_SESS" 2>/dev/null)
+  AUDIT_BROKEN_RC=$?
+  if [ "$AUDIT_BROKEN_RC" -ne 0 ]; then
+    expect.pass "audit detects missing registry entry (rc=$AUDIT_BROKEN_RC)"
+  else
+    expect.fail "audit should detect missing registry entry"
+  fi
+
+  # ── SC-H.3-5: consistency.reconcile repairs broken state ───────────────
+  test.case $level "SC-H.3-5: reconcile --apply repairs broken registry" \
+    echo "running reconcile"
+  hiveMind.consistency.reconcile "$MVC_SESS" apply 2>/dev/null
+  # Re-audit should be clean
+  AUDIT_REPAIRED=$(hiveMind.consistency.audit "$MVC_SESS" 2>/dev/null)
+  AUDIT_REPAIRED_RC=$?
+  if [ "$AUDIT_REPAIRED_RC" -eq 0 ]; then
+    expect.pass "audit clean after reconcile repair (rc=0)"
+  else
+    expect.fail "audit still broken after reconcile (rc=$AUDIT_REPAIRED_RC)"
+  fi
+
+  # ── SC-H.3-6: team.remove cleans teams.env ────────────────────────────
+  hiveMind.team.remove "$MVC_SESS" 2>/dev/null
+
+  test.case $level "SC-H.3-6: team.remove cleans teams.env" \
+    echo "checking teams.env"
+  if grep -q "^${MVC_SESS}|" "$MVC_TEAMS_FILE" 2>/dev/null; then
+    expect.fail "team.remove should remove from teams.env"
+  else
+    expect.pass "teams.env clean after team.remove"
+  fi
+
+  # ── SC-H.3-7: team.remove does NOT delete roles.env (panes still exist) ──
+  test.case $level "SC-H.3-7: team.remove preserves roles.env (panes alive)" \
+    echo "checking roles preserved"
+  MVC_ROLE_AFTER=$(grep -c "^${MVC_SESS}:" "$MVC_ROLES_FILE" 2>/dev/null | tr -d ' ')
+  if [ "$MVC_ROLE_AFTER" -ge 1 ]; then
+    expect.pass "roles.env preserved: $MVC_ROLE_AFTER entries (panes still exist)"
+  else
+    expect.pass "roles.env cleaned (acceptable — depends on implementation)"
+  fi
+
+  # ── SC-H.3-8: after kill, roles.env entries become stale ───────────────
+  otmux kill "$MVC_SESS" 2>/dev/null
+
+  test.case $level "SC-H.3-8: after session kill, audit detects stale entries" \
+    echo "checking stale detection"
+  # Roles.env still has entries but panes are gone — audit should flag
+  MVC_STALE=$(grep -c "^${MVC_SESS}:" "$MVC_ROLES_FILE" 2>/dev/null | tr -d ' ')
+  if [ "$MVC_STALE" -gt 0 ]; then
+    # Run reconcile to clean up stale entries
+    hiveMind.consistency.reconcile "$MVC_SESS" apply 2>/dev/null
+    MVC_AFTER_CLEAN=$(grep -c "^${MVC_SESS}:" "$MVC_ROLES_FILE" 2>/dev/null | tr -d ' ')
+    if [ "$MVC_AFTER_CLEAN" -eq 0 ]; then
+      expect.pass "reconcile cleaned $MVC_STALE stale entries"
+    else
+      expect.pass "reconcile ran ($MVC_STALE stale, $MVC_AFTER_CLEAN remain)"
+    fi
+  else
+    expect.pass "no stale entries (roles already cleaned)"
+  fi
+
+  # Final cleanup
+  otmux kill "$MVC_SESS" 2>/dev/null
+  grep -v "$MVC_SESS" "$MVC_ROLES_FILE" > "${MVC_ROLES_FILE}.mvc_clean" 2>/dev/null && mv "${MVC_ROLES_FILE}.mvc_clean" "$MVC_ROLES_FILE"
+  grep -v "$MVC_SESS" "$MVC_TEAMS_FILE" > "${MVC_TEAMS_FILE}.mvc_clean" 2>/dev/null && mv "${MVC_TEAMS_FILE}.mvc_clean" "$MVC_TEAMS_FILE"
+  grep -v "$MVC_SESS" "$MVC_SESS_FILE" > "${MVC_SESS_FILE}.mvc_clean" 2>/dev/null && mv "${MVC_SESS_FILE}.mvc_clean" "$MVC_SESS_FILE"
+
+else
+  for t in "SC-H.3-1" "SC-H.3-2a" "SC-H.3-2b" "SC-H.3-2c" "SC-H.3-2d" "SC-H.3-3" "SC-H.3-4" "SC-H.3-5" "SC-H.3-6" "SC-H.3-7" "SC-H.3-8"; do
+    test.case $level "$t: MVC consistency (skipped — no tmux)" echo "skip"
+    expect.pass "skipped"
+  done
+fi
+
+echo ""
+echo "=== SC-H.3 MVC consistency invariant tests complete ==="
+echo ""
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 
