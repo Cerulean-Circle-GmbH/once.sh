@@ -169,6 +169,10 @@ Listed smallest-first.
 
 None of these are urgent — the current code works. They're "before-the-next-feature" hygiene that pays off the moment any of those inline blocks needs to change.
 
+### Resolved — recommendations #1 + #2 (otest)
+
+Done in commits `2d4fe7f` (EAMD.ucp) + the immediately-following otest commit in once.sh. `otest:446` now routes through `private.python`. `private.testExists` and `private.testNames` are one-line shims that call `private.python "$OTEST_DIR/utils/test_discovery.py" {exists,names}` — the new helper holds the canonical `discover_tests()`, which `run_tests.py` also imports (the old bash heredocs were a near-duplicate of `run_tests.py:40–95`). Net: 40 lines of inline Python removed from `otest`; quoting hazard around `$target` eliminated; single source of truth for test discovery shared by both consumers. Audit items #7, #8, #9 are no longer ⚠️ — they're ✅ done.
+
 ### Pending hand-off — claudeCode python3 hard-dep
 
 Recommendation #3 above (extract `claudeCode`'s JSONL parsing) has been narrowed and handed off to the original author, Marcel Donges. The driver is a related rule we've separately settled on:
