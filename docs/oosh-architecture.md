@@ -687,11 +687,56 @@ OOSH manages a substantial cache layer (S1–S10) that mirrors live tmux/process
 | **L3** display | tmux pane titles, screen window labels | What the operator sees |
 | **S1–S10** caches | `~/config/hivemind.*.env`, `~/config/tronMonitor.env`, `~/config/otmux.*.env` | What we believe is true |
 
-Caches MUST converge to L1+L2+L3 via:
-1. **Event handlers** (SC-B/SC-C) — primary path; mutations fire events; observers update their stores
-2. **Ingress triple defense** (SC-E) — every public method validates caller-supplied identifiers at the boundary (regex + pipe-safe + existence check)
-3. **Snapshot integrity** (SC-F) — `# version: 1` header + per-row validation guards save/restore
-4. **Reconcile cycle** (SC-A/SC-D) — `scrumMaster.cycle` periodically runs `hiveMind consistency.reconcile apply`, fixing whatever events missed
+Caches MUST converge to L1+L2+L3 via two complementary mechanisms:
+
+### Event dispatch (primary — real-time)
+
+Every state mutation emits a named event. Handlers subscribed to that event
+update their respective stores. 10 events × ~25 handlers cover the full
+lifecycle:
+
+```
+agent.spawn ──emit "agent.spawned"──→ handler: registry.set (S1)
+                                    → handler: sessions.store (S2)
+team.remove ──emit "team.destroyed"─→ handler: teams.remove (S3)
+                                    → handler: tronMonitor.remove (S8)
+                                    → handler: registry.prune (S1)
+                                    → handler: sessions.prune (S2)
+                                    → handler: queue.prune (S6)
+```
+
+**API** (in hiveMind, not a separate script):
+- `private.hiveMind.events.register <event> <handler>` — idempotent
+- `private.hiveMind.events.emit <event> <args...>` — isolated (failing handler doesn't abort siblings)
+- Handler errors logged, never block the primary mutation (Pattern P1: log+continue)
+- Bash 3.2 compatibility: events gated by `BASH_VERSINFO >= 4`; direct fallback
+  code in each mutation performs the same store updates inline
+
+Cross-script events use the existing observer pattern: `command -v peer && peer protected.<event> ... || info.log` (soft-fail, loose coupling).
+
+Full event catalog: [state-stores.md § Event-driven mutation](state-stores.md).
+Per-invariant enforcement: [invariants.md § Event handler enforcement](invariants.md).
+
+### Reconcile cycle (safety net — periodic)
+
+`consistency.reconcile` diffs all stores against ground truth and applies
+corrections. Catches anything events missed (bash 3.2 no-op, race conditions,
+tmux kills bypassing hiveMind, operator manual edits).
+
+All three commands share the same primitive (`private.hiveMind.reconcile.diff`):
+- `consistency.audit` — read-only, graded report (CRITICAL/HIGH/MEDIUM/LOW)
+- `consistency.fix` — interactive y/N per violation
+- `consistency.reconcile` — batch (dry-run default; `apply` flag per U3 PO-lock)
+
+Called by `scrumMaster.cycle` after sweep stabilizes — never during active mutations.
+
+Full fix dispatch table: [invariants.md § Fix recipes](invariants.md).
+
+### Supporting defenses
+
+- **Ingress triple defense** (P3) — regex + delimiter-reject + existence-check on every public method accepting caller-supplied identifiers
+- **Snapshot integrity** (SC-F) — `# version: 1` header + per-row validation guards save/restore
+- **Kernel predicates** — `this.isPaneTarget`, `this.isSessionName`, `this.isRoleName`, `this.isUuid`, `this.isPipeSafe` (sibling to `this.isNumber`)
 
 ### Commands at a glance
 
@@ -724,6 +769,8 @@ Read both docs first. Then:
 ## See Also
 
 - [Wiki Index](wiki-index.md) - All documentation links
+- [State Stores](state-stores.md) - S1–S10 cache store definitions
+- [Invariants](invariants.md) - I1–I10 consistency invariants
 - [Log System](log.md) - Logging levels and functions
 - [Debug System](debug.md) - Step debugger and traps
 - [Config System](config.md) - Environment persistence
