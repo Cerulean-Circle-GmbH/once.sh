@@ -1508,6 +1508,19 @@ private.claudeCode.context.from.jsonl() {
   local jsonlFile="$1"
   [ -f "$jsonlFile" ] || return 1
 
+  # Staleness guard: if JSONL hasn't been written in >10 min, it's likely
+  # from a dead/compacted session — return "stale" so caller falls through
+  local mtime now age
+  mtime=$(stat -f %m "$jsonlFile" 2>/dev/null || stat -c %Y "$jsonlFile" 2>/dev/null)
+  now=$(date +%s)
+  if [ -n "$mtime" ]; then
+    age=$(( now - mtime ))
+    if [ "$age" -gt 600 ]; then
+      echo "stale"
+      return 1
+    fi
+  fi
+
   local maxTokens
   maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$jsonlFile")
 
@@ -1524,6 +1537,11 @@ for line in sys.stdin:
                 last_usage = usage
     except: pass
 if last_usage:
+    # Total context = input_tokens + cache_creation + cache_read
+    # input_tokens: non-cached prompt portion (often just 1 with full caching)
+    # cache_creation: new tokens being written to cache this turn
+    # cache_read: previously cached tokens read from cache
+    # Together = full prompt sent to model = context window usage
     input_t = last_usage['input_tokens']
     cache_create = last_usage.get('cache_creation_input_tokens', 0)
     cache_read = last_usage.get('cache_read_input_tokens', 0)
@@ -1571,14 +1589,11 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
     local sid
     sid=$(claudeCode.session.id "$pane" 2>/dev/null)
     if [ -n "$sid" ]; then
-      # Search project dirs for this session's JSONL
-      local projectDirs=(
-        "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
-        "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
-      )
-      for dir in "${projectDirs[@]}"; do
-        if [ -f "$dir/$sid.jsonl" ]; then
-          jsonlFile="$dir/$sid.jsonl"
+      # Search ALL project dirs for this session's JSONL (not hardcoded)
+      local dir
+      for dir in "$HOME/.claude/projects"/*/; do
+        if [ -f "${dir}${sid}.jsonl" ]; then
+          jsonlFile="${dir}${sid}.jsonl"
           break
         fi
       done
@@ -1592,10 +1607,29 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
   if [ -n "$jsonlFile" ] && [ -f "$jsonlFile" ]; then
     local pct
     pct=$(private.claudeCode.context.from.jsonl "$jsonlFile")
-    if [ -n "$pct" ] && [ "$pct" != "unknown" ]; then
+    if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ]; then
       RESULT="$pct"
       echo "$pct"
       return 0
+    fi
+    # JSONL stale or unreadable — try session.current for a fresher UUID
+    if [ "$pct" = "stale" ] && [ -n "$pane" ]; then
+      local freshSid
+      freshSid=$(claudeCode.session.current "$pane" 2>/dev/null)
+      if [ -n "$freshSid" ] && [ "$freshSid" != "$sid" ]; then
+        local freshJsonl=""
+        for dir in "$HOME/.claude/projects"/*/; do
+          [ -f "${dir}${freshSid}.jsonl" ] && freshJsonl="${dir}${freshSid}.jsonl" && break
+        done
+        if [ -n "$freshJsonl" ]; then
+          pct=$(private.claudeCode.context.from.jsonl "$freshJsonl")
+          if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ]; then
+            RESULT="$pct"
+            echo "$pct"
+            return 0
+          fi
+        fi
+      fi
     fi
   fi
 
@@ -1767,10 +1801,7 @@ with open('$jsonlFile') as f:
                 usage = msg.get('usage', {})
                 if usage and 'input_tokens' in usage:
                     ts = d.get('timestamp', '')
-                    input_t = usage['input_tokens']
-                    cache_create = usage.get('cache_creation_input_tokens', 0)
-                    output_t = usage.get('output_tokens', 0)
-                    total = input_t + cache_create + output_t
+                    total = usage['input_tokens'] + usage.get('cache_creation_input_tokens', 0) + usage.get('cache_read_input_tokens', 0)
                     messages.append({'ts': ts, 'tokens': total})
         except:
             pass
