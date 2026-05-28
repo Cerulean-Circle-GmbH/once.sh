@@ -12,9 +12,23 @@
 
 | Layer | Examples |
 |-------|----------|
-| **L1 — tmux truth** | `tmux list-sessions`, `tmux list-panes` — the live tmux server |
-| **L2 — process truth** | `ps -eo args` filtered for Claude processes |
-| **L3 — display truth** | tmux pane titles, GNU screen window labels, tronMonitor capture |
+| **L1 — tmux state** | `tmux list-sessions`, `tmux list-panes` — sessions, panes, titles, tty, pid |
+| **L2 — screen state** | `screen -ls`, `screen -X hardcopy` — GNU screen for tronMonitor viewer |
+| **L3 — Claude state** | `~/.claude/projects/*/*.jsonl` (conversation + usage), `ps -eo args` (running processes with `--resume <UUID>` flags) |
+
+**L3 token semantics (hard-won, P0 bug f89bbc8):**
+The JSONL `usage` object in each assistant message contains:
+- `input_tokens` — non-cached prompt portion (often just 1 with full caching!)
+- `cache_creation_input_tokens` — new tokens written to prompt cache this turn
+- `cache_read_input_tokens` — tokens read from existing prompt cache
+- **Total context = input + cache_creation + cache_read** (together = full prompt sent to model)
+
+These are NOT overlapping billing categories — they are additive components of the context window.
+`input_tokens` alone is meaningless with prompt caching enabled (shows 1 when context is 500k).
+
+For 1M-context sessions (`claude-opus-4-6[1m]`), max_tokens is 1,000,000 — detected by
+`private.claudeCode.max.tokens.for.jsonl` via 3-tier priority: ps args `[1m]` flag → observed
+max > 200k → model default. See `CLAUDE_MAX_TOKENS_*` env constants at top of `claudeCode`.
 
 Caches (S1–S10) MUST converge to L1+L2+L3 via the reconcile cycle (see `hiveMind.consistency.reconcile`).
 
@@ -25,7 +39,7 @@ Caches (S1–S10) MUST converge to L1+L2+L3 via the reconcile cycle (see `hiveMi
 | ID | Name | File | Format | Owner | Writer methods | Reads from |
 |----|------|------|--------|-------|----------------|------------|
 | **S1** | roles | `~/config/hivemind.roles.env` | `pane\|role\|epoch` (TTL field optional) | hiveMind | `private.hiveMind.registry.set` (one write path; called by `agent.bootstrap`, `agent.rename`, `agent.spawn`, `team.setup`, `consistency.fix`, event handlers) | many; canonical lookup via `private.hiveMind.registry.find` |
-| **S2** | sessions | `~/config/hivemind.sessions.env` | `pane\|uuid` | hiveMind | `private.hiveMind.session.store` (one write path; called after `agent.session.probe` succeeds, and by `private.hiveMind.session.store.deferred` async retry) | `private.hiveMind.session.lookup`, `private.hiveMind.session.resolve.uuid` |
+| **S2** | sessions | `~/config/hivemind.sessions.env` | `pane\|uuid` | hiveMind | `private.hiveMind.session.store` (one write path; called after `agent.session.probe` succeeds, and by `private.hiveMind.session.store.deferred` async retry) | `private.hiveMind.session.lookup`, `private.hiveMind.session.resolve.uuid`. **Staleness risk (P0 bug f89bbc8):** after fork, S2 retains PARENT UUID. `claudeCode.context.read` now rejects stale JSONL (mtime >10min) and re-resolves via `session.current`. |
 | **S3** | teams | `~/config/hivemind.teams.env` | `session\|description` | hiveMind | `hiveMind.team.register` (gold-standard triple defense, P3 reference), event handlers `team.created.teams` / `team.destroyed.teams` / `team.restored.teams` | `hiveMind.team.list`, `hiveMind.team.switch`, `private.hiveMind.active.team` |
 | **S4** | snapshots | `~/config/hivemind.snapshot.*.env` | header `# version: 1` + 8-field rows `session\|addr\|role\|uuid\|title\|cwd\|model\|kind` (post SC-F.1) | hiveMind | `hiveMind.teams.save` only; validated via `private.hiveMind.snapshot.row.valid` (SC-F.2) | `hiveMind.teams.restore`, `agent.restart`, `team.restart` — all gated by `private.hiveMind.snapshot.version.check` (SC-F.1) and per-row validator (SC-F.3) |
 | **S5** | forks audit | `~/config/hivemind.forks.env` | append-only: `ts\|pane\|role\|childUuid\|status\|parentUuid` | hiveMind | event handler `agent.forked.forks` only | diagnostic; consulted by `hiveMind.forks.list` |
@@ -33,7 +47,7 @@ Caches (S1–S10) MUST converge to L1+L2+L3 via the reconcile cycle (see `hiveMi
 | **S7** | active team | `~/config/hivemind.active.team` | single line: session name | hiveMind | `hiveMind.team.switch` / `team.activate` only | `private.hiveMind.active.team` (called by every method that defaults `$session`) |
 | **S8** | tronMonitor windows | `~/config/tronMonitor.env` | `screenWin\|session` | tronMonitor | `tronMonitor.add` / `tronMonitor.remove` / `tronMonitor.sync` / `tronMonitor.reset`; event handlers `team.created.tronMonitor` / `team.destroyed.tronMonitor` / `team.restored.tronMonitor` | `tronMonitor.list`, `tronMonitor.switch`, `private.tronMonitor.findWindow`, `private.tronMonitor.tracked.teams` |
 | **S9** | size locks | `~/config/otmux.size.locks.env` | `session\|minW×minH` | otmux | `otmux.size.lock` / `otmux.size.unlock` only | `otmux.size.floor.apply` (called by tronMonitor + scrumMaster.cycle to enforce minimums) |
-| **S10** | per-session layouts | `~/config/otmux.<session>.layout` | tmux layout string + per-pane titles + cwds | otmux | `otmux.layout.save` only (called by `hiveMind.teams.save` end of cycle, and `hiveMind.team.migrate` push) | `otmux.layout.restore` (called by `hiveMind.teams.restore`, `team.restart`) |
+| **S10** | per-session layouts | `~/config/otmux/<session>.layout.env` | sourced bash env: `OTMUX_LAYOUT_SESSION`, `OTMUX_WINDOW_<N>_LAYOUT` (tmux layout string), `OTMUX_WINDOW_<N>_PANE_<M>_TITLE/CWD/CMD` (per-pane metadata) | otmux | `otmux.layout.save` only (called by `hiveMind.teams.save` end of cycle, and `hiveMind.team.migrate` push) | `otmux.layout.restore` (called by `hiveMind.teams.restore`, `team.restart`), `otmux.layout.list`, `otmux.layout.show` |
 
 ---
 
