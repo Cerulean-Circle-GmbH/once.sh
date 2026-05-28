@@ -38,6 +38,35 @@
 
 ---
 
+## Event handlers that enforce each invariant
+
+Invariants are maintained by two mechanisms: **event handlers** (primary, real-time)
+and **reconcile** (safety net, periodic). This table shows which events keep each
+invariant true, and what reconcile catches if an event is missed (bash 3.2 no-op,
+race condition, tmux kill bypassing hiveMind, etc).
+
+| I# | Enforced by events | Reconcile catches |
+|----|-------------------|-------------------|
+| **I1** | `agent.spawned` → `registry.set` (adds S1 entry for new pane). `agent.killed` → `registry.remove` (removes S1 entry). `panes.shifted` → `registry.shift` (re-keys S1 when tmux renumbers). `team.destroyed` → `registry.prune` (bulk-removes all S1 entries for dead session). | Orphan S1 entries where pane no longer exists in L1 (`S1:REMOVE`). Missing S1 entries for live Claude panes (`S1:ADD` via I8). |
+| **I2** | `agent.spawned` → `sessions.store` (writes pane→UUID to S2). `agent.forked` → `sessions.store` (updates S2 with child UUID). `session.store.deferred` retries at 5s/15s/30s when UUID unknown at spawn (Gap A). | Orphan S2 entries for panes not in S1 (`S2:REMOVE`). Stale UUIDs where cached UUID doesn't match live ps args (`S2:UPDATE`). |
+| **I3** | `team.created` → `teams.add` (writes S3 after `otmux new`). `team.destroyed` → `teams.remove` (removes S3 entry). `team.register` applies P3 triple defense at ingress (rejects non-existent sessions). | Ghost S3 entries for tmux sessions that no longer exist (`S3:REMOVE`). |
+| **I4** | `team.created` → `tronMonitor.add` (observer pattern, soft-fail). `team.destroyed` → `tronMonitor.remove`. `team.restored` → `tronMonitor.add` (bulk). | S8 entries referencing sessions not in S3 (`S8:REMOVE` via `tronMonitor remove`). |
+| **I5** | `teams.save` validates each row via `snapshot.row.valid` before writing (SC-F.2). No event needed — validation is at write time. | Stale UUIDs in S4 pointing to deleted JSONLs (SKIP — needs human attention; JSONL was garbage-collected). |
+| **I6** | `agent.killed` → `queue.clean` (deletes queue file for dead pane). `team.destroyed` → `queue.prune` (bulk-deletes queue files for all panes in dead session). `panes.shifted` → `queue.rename` (renames queue files when pane addresses change). | Orphan queue files for panes not in S1 (`S6:REMOVE`). |
+| **I7** | `tronMonitor.switch` calls `tronMonitor.verify` after switching (Pattern P2 — verify-before-claim). | V-layer mismatch (SKIP — operator runs `tronMonitor sync/reset`). |
+| **I8** | Same as I1 — `agent.spawned` ensures new panes get S1 entries. Coverage is the complement of I1 (I1 = no orphans in S1; I8 = no gaps in S1). | Live Claude panes missing from S1 (`S1:ADD` with role from `role.fromTitle`). |
+| **I9** | `agent.renamed` → `pane.title.pushed` (sets title to `role@HIVEMIND_HOST`). `agent.spawned` → `pane.lock` (same title format). | Title drift where pane title doesn't match `role@HIVEMIND_HOST` (`V1:UPDATE` via `otmux pane.lock`). |
+| **I10** | Same as I2 — `agent.spawned`/`agent.forked` populate S2. `session.store.deferred` handles async UUID discovery. | Claude-running panes missing from S2 (`S2:ADD` or flag `<probe-required>` for fork children). |
+
+### Bash 3.2 fallback
+
+Events are gated by `BASH_VERSINFO >= 4` (task #29). On macOS default bash 3.2,
+`events.emit` is a no-op — handlers never fire. Each mutation method has a direct
+fallback gated by `[ -z "$HIVEMIND_EVENTS_AVAILABLE" ]` that performs the same
+store updates inline. The reconcile cycle catches anything both paths missed.
+
+---
+
 ## Detection patterns
 
 ### Pure detectors (no I/O on observed system)
@@ -93,6 +122,32 @@ The stability gate (`private.scrumMaster.sweep.isStable`) checks for recent life
 4. Add a test fixture under SC-D.3 (tester scope) — inject a violation, verify detector fires + apply mutates correctly.
 
 The reconcile cycle picks up new invariants automatically — no registration step. Just defining `private.hiveMind.reconcile.check.iN` and the audit/reconcile commands will iterate it.
+
+---
+
+## Real-world example: P0 context.read staleness (2026-05-28)
+
+**Invariant violated:** I2 (UUID in S2 matches live Claude) + I10 (every Claude pane has S2 entry).
+
+**What happened:** After forking oosh-expert, S2 retained the parent's UUID (`ea2c7021`).
+The parent's JSONL had stopped being written 39 minutes ago — its last 50 lines
+contained zero assistant messages with usage data (fully compacted). `claudeCode context.read`
+resolved pane → S2 → stale UUID → dead JSONL → total=0 → reported **100% remaining**.
+The SM used this to decide the agent was healthy. In reality the fork's real JSONL
+showed **48% remaining**.
+
+**Why events didn't catch it:** The fork happened via `claudeCode fork` from an
+external pane, not through `hiveMind.agent.fork.best` which would have emitted
+`agent.forked` and updated S2. Direct CLI fork bypasses the event system.
+
+**Fix (commit f89bbc8):**
+1. `context.from.jsonl` added staleness guard — rejects JSONL with mtime >10min
+2. `context.read` catches `"stale"` return, re-resolves UUID via `session.current` (ps-based)
+3. `context.read` searches ALL project dirs (was hardcoded to 2 paths)
+
+**Lesson:** Even with events + reconcile, consumers of cache data (like `context.read`)
+must defend against stale reads independently. The staleness guard is a Pattern P2
+application — verify the data you're about to use, don't trust the cache blindly.
 
 ---
 
