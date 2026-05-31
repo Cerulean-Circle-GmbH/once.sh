@@ -6270,6 +6270,154 @@ echo "=== SC-C handler integration tests complete ==="
 echo ""
 
 # ============================================================================
+# SC-D.3: Reconcile roundtrip — degrade → reconcile --apply → audit clean
+# Per invariant: inject violation, verify audit catches, reconcile fixes,
+# re-audit returns clean.
+# ============================================================================
+
+HIVEMIND_SRC="$OOSH_DIR/hiveMind"
+D3_ROLES="${CONFIG_PATH:-$HOME/config}/hivemind.roles.env"
+D3_TEAMS="${CONFIG_PATH:-$HOME/config}/hivemind.teams.env"
+D3_SESSIONS="${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env"
+
+if otmux sessions >/dev/null 2>&1; then
+
+  D3_SESS="__test_d3_$$"
+  otmux kill "$D3_SESS" 2>/dev/null
+
+  # Create test session with 2 panes
+  otmux new "$D3_SESS" -d 2>/dev/null
+  otmux split "$D3_SESS" -d 2>/dev/null
+  private.hiveMind.registry.set "${D3_SESS}:0.0" "d3-alpha"
+  private.hiveMind.registry.set "${D3_SESS}:0.1" "d3-beta"
+  otmux pane.lock "${D3_SESS}:0.0" "d3-alpha@MacStudio" 2>/dev/null
+  otmux pane.lock "${D3_SESS}:0.1" "d3-beta@MacStudio" 2>/dev/null
+
+  # --- D3-I1: S1 stale entry (pane in registry, not in tmux) ---
+  # Inject: add fake pane to registry that doesn't exist in tmux
+  private.hiveMind.registry.set "${D3_SESS}:0.9" "d3-ghost"
+
+  test.case $level "D3-I1: audit catches stale S1 entry" \
+    echo "degraded: ghost pane in S1"
+  D3_AUDIT=$(private.hiveMind.reconcile.diff "$D3_SESS" 2>/dev/null)
+  if echo "$D3_AUDIT" | grep -q "d3-ghost\|${D3_SESS}:0.9"; then
+    expect.pass "audit caught ghost entry"
+  else
+    expect.fail "audit should catch stale S1 entry for ${D3_SESS}:0.9"
+  fi
+
+  # Reconcile and verify clean
+  hiveMind.consistency.reconcile "$D3_SESS" apply 2>/dev/null
+  D3_POST=$(private.hiveMind.reconcile.diff "$D3_SESS" 2>/dev/null)
+  D3_POST_COUNT=$(echo "$D3_POST" | grep -c . | tr -d ' ')
+
+  test.case $level "D3-I1: reconcile repairs stale S1" \
+    echo "post-reconcile violations=$D3_POST_COUNT"
+  if [ "$D3_POST_COUNT" -eq 0 ]; then
+    expect.pass "audit clean after reconcile"
+  else
+    expect.fail "$D3_POST_COUNT violations remain after reconcile"
+  fi
+
+  # --- D3-I3: S3 stale team (team registered but session gone) ---
+  echo "__test_d3_dead_$$|Dead team" >> "$D3_TEAMS"
+
+  test.case $level "D3-I3: audit catches dead team in S3" \
+    echo "degraded: dead team in S3"
+  D3_AUDIT_I3=$(private.hiveMind.reconcile.diff 2>/dev/null)
+  if echo "$D3_AUDIT_I3" | grep -q "__test_d3_dead_$$"; then
+    expect.pass "audit caught dead team"
+  else
+    expect.fail "audit should catch dead team __test_d3_dead_$$"
+  fi
+
+  hiveMind.consistency.reconcile "" apply 2>/dev/null
+  D3_POST_I3=$(grep -c "__test_d3_dead_$$" "$D3_TEAMS" 2>/dev/null | tr -d ' ')
+
+  test.case $level "D3-I3: reconcile removes dead team from S3" \
+    echo "remaining=$D3_POST_I3"
+  if [ "$D3_POST_I3" -eq 0 ]; then
+    expect.pass "dead team removed from S3"
+  else
+    expect.fail "dead team still in S3 after reconcile"
+  fi
+
+  # --- D3-I8: live pane not in S1 (coverage gap) ---
+  # Remove d3-alpha from registry — pane still exists in tmux
+  grep -v "${D3_SESS}:0.0" "$D3_ROLES" > "${D3_ROLES}.d3tmp" 2>/dev/null && mv "${D3_ROLES}.d3tmp" "$D3_ROLES"
+
+  test.case $level "D3-I8: audit catches unregistered live pane" \
+    echo "degraded: pane exists but not in S1"
+  D3_AUDIT_I8=$(private.hiveMind.reconcile.diff "$D3_SESS" 2>/dev/null)
+  if echo "$D3_AUDIT_I8" | grep -q "I8\|ADD\|${D3_SESS}:0.0"; then
+    expect.pass "audit caught unregistered pane"
+  else
+    expect.fail "audit should catch I8 violation for ${D3_SESS}:0.0"
+  fi
+
+  hiveMind.consistency.reconcile "$D3_SESS" apply 2>/dev/null
+
+  test.case $level "D3-I8: reconcile registers live pane" \
+    echo "checking S1"
+  if grep -q "${D3_SESS}:0.0" "$D3_ROLES" 2>/dev/null; then
+    expect.pass "pane re-registered in S1"
+  else
+    expect.fail "pane ${D3_SESS}:0.0 should be re-registered after reconcile"
+  fi
+
+  # --- D3-I9: wrong pane title format ---
+  otmux pane.lock "${D3_SESS}:0.0" "d3-alpha@opus" 2>/dev/null
+
+  test.case $level "D3-I9: audit catches @model in pane title" \
+    echo "degraded: title has @opus"
+  D3_AUDIT_I9=$(private.hiveMind.reconcile.diff "$D3_SESS" 2>/dev/null)
+  if echo "$D3_AUDIT_I9" | grep -q "I9\|UPDATE\|@opus"; then
+    expect.pass "audit caught @model in title"
+  else
+    expect.fail "audit should catch I9 violation (@opus → @MacStudio)"
+  fi
+
+  hiveMind.consistency.reconcile "$D3_SESS" apply 2>/dev/null
+
+  test.case $level "D3-I9: reconcile fixes title to @HIVEMIND_HOST" \
+    echo "checking title"
+  D3_TITLE=$(otmux pane.get "${D3_SESS}:0.0" "#{pane_title}" 2>/dev/null)
+  if echo "$D3_TITLE" | grep -q "@${HIVEMIND_HOST:-MacStudio}"; then
+    expect.pass "title fixed to @${HIVEMIND_HOST:-MacStudio}: $D3_TITLE"
+  else
+    expect.fail "title should be @${HIVEMIND_HOST:-MacStudio}; got: $D3_TITLE"
+  fi
+
+  # --- D3-FULL: full roundtrip — audit returns clean ---
+  test.case $level "D3-FULL: final audit returns clean" \
+    echo "full roundtrip check"
+  hiveMind.consistency.reconcile "$D3_SESS" apply 2>/dev/null
+  D3_FINAL=$(private.hiveMind.reconcile.diff "$D3_SESS" 2>/dev/null)
+  D3_FINAL_COUNT=$(echo "$D3_FINAL" | grep -c . | tr -d ' ')
+  if [ "$D3_FINAL_COUNT" -eq 0 ]; then
+    expect.pass "audit clean after full reconcile roundtrip"
+  else
+    expect.fail "$D3_FINAL_COUNT violations remain: $D3_FINAL"
+  fi
+
+  # Cleanup
+  otmux kill "$D3_SESS" 2>/dev/null
+  grep -v "__test_d3_" "$D3_ROLES" > "${D3_ROLES}.d3clean" 2>/dev/null && mv "${D3_ROLES}.d3clean" "$D3_ROLES"
+  grep -v "__test_d3_" "$D3_TEAMS" > "${D3_TEAMS}.d3clean" 2>/dev/null && mv "${D3_TEAMS}.d3clean" "$D3_TEAMS"
+  grep -v "__test_d3_" "$D3_SESSIONS" > "${D3_SESSIONS}.d3clean" 2>/dev/null && mv "${D3_SESSIONS}.d3clean" "$D3_SESSIONS"
+
+else
+  for t in "D3-I1" "D3-I1-fix" "D3-I3" "D3-I3-fix" "D3-I8" "D3-I8-fix" "D3-I9" "D3-I9-fix" "D3-FULL"; do
+    test.case $level "$t: reconcile roundtrip (skipped — no tmux)" echo "skip"
+    expect.pass "skipped"
+  done
+fi
+
+echo ""
+echo "=== SC-D.3 reconcile roundtrip tests complete ==="
+echo ""
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 
