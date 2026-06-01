@@ -4,6 +4,7 @@
 
 #export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
 #set -x
+TEST_CATEGORY=core
 
 level=$1
 if [ -z "$level" ]; then
@@ -15,7 +16,7 @@ echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 source this
 source test.suite
-source log
+source $OOSH_DIR/log
 
 log.level $level
 
@@ -26,22 +27,27 @@ ORIGINAL_LOG_LEVEL=$LOG_LEVEL
 ORIGINAL_LOG_DEVICE=$LOG_DEVICE
 ORIGINAL_LOG_LIVE=$LOG_LIVE
 ORIGINAL_STEP_DEBUG=$STEP_DEBUG
+ORIGINAL_LOG_ENV=$(cat "$CONFIG_PATH/log.env" 2>/dev/null)
 
 # Disable STEP_DEBUG to prevent test blocking
 export STEP_DEBUG=OFF
 
 # Cleanup function
-cleanup_test_files() {
+cleanup.testFiles() {
   rm -f "$TEST_LOG_DEVICE" 2>/dev/null
   rm -f "$TEST_LOG_LIVE" 2>/dev/null
   export LOG_LEVEL=$ORIGINAL_LOG_LEVEL
   export LOG_DEVICE=$ORIGINAL_LOG_DEVICE
   export LOG_LIVE=$ORIGINAL_LOG_LIVE
   export STEP_DEBUG=$ORIGINAL_STEP_DEBUG
+  # Restore persisted config (tests call config save which pollutes log.env)
+  if [ -n "$ORIGINAL_LOG_ENV" ]; then
+    echo "$ORIGINAL_LOG_ENV" > "$CONFIG_PATH/log.env"
+  fi
 }
 
 # Cleanup before tests
-cleanup_test_files
+cleanup.testFiles
 touch "$TEST_LOG_DEVICE"
 touch "$TEST_LOG_LIVE"
 
@@ -287,10 +293,19 @@ expect 0 "File cleared with marker" "log.clear.liveLog clears file"
 export LOG_LEVEL=4
 > "$TEST_LOG_DEVICE"
 
-test.case - "T16: stop.log outputs at level 4" \
-  stop.log "test breakpoint"
+# Wrap stop.log to prevent debugger activation:
+# stop.log sets STEP_DEBUG=ON, which triggers the DEBUG trap on the next command.
+# By wrapping in a subshell-free helper that resets STEP_DEBUG immediately after,
+# we prevent the trap from firing before test.suite.save.results.
+test.stop.log.safe() {
+  stop.log "$@"
+  export STEP_DEBUG=OFF
+}
 
-# Reset STEP_DEBUG after stop.log sets it
+test.case - "T16: stop.log outputs at level 4" \
+  test.stop.log.safe "test breakpoint"
+
+# Ensure STEP_DEBUG stays off
 export STEP_DEBUG=OFF
 
 if grep -q "BREAKPOINT" "$TEST_LOG_DEVICE"; then
@@ -414,8 +429,426 @@ fi
 expect 0 "Result files cleared" "clear.resultFiles removes result/error files"
 
 # ============================================================================
+# T24: Test log.install.init creates log file and sets LOG_INSTALL
+# ============================================================================
+TEST_INSTALL_LOG="${TMPDIR:-/tmp}/test.install.log.$$"
+
+test.case - "T24: log.install.init creates log file" \
+  log.install.init "$TEST_INSTALL_LOG"
+
+if [ -n "$LOG_INSTALL" ] && [ -f "$LOG_INSTALL" ] && grep -q "OOSH Install Log" "$TEST_INSTALL_LOG"; then
+  create.result 0 "Install log created"
+else
+  create.result 1 "LOG_INSTALL=$LOG_INSTALL, file exists=$([ -f "$TEST_INSTALL_LOG" ] && echo yes || echo no)"
+fi
+expect 0 "Install log created" "log.install.init creates log file and sets LOG_INSTALL"
+
+# ============================================================================
+# T25: Test LOG_INSTALL captures all log functions unconditionally
+# ============================================================================
+export LOG_LEVEL=1
+> "$TEST_INSTALL_LOG"
+
+test.case - "T25: LOG_INSTALL captures all log levels" \
+  echo "testing install capture"
+
+console.log "install-capture-console"
+silent.log "install-capture-silent"
+debug.log "install-capture-debug"
+important.log "install-capture-important"
+warn.log "install-capture-warn"
+error.log "install-capture-error"
+
+capture_count=0
+grep -q "CONSOLE:.*install-capture-console" "$TEST_INSTALL_LOG" && ((capture_count++))
+grep -q "SILENT:.*install-capture-silent" "$TEST_INSTALL_LOG" && ((capture_count++))
+grep -q "DEBUG:.*install-capture-debug" "$TEST_INSTALL_LOG" && ((capture_count++))
+grep -q "IMPORTANT:.*install-capture-important" "$TEST_INSTALL_LOG" && ((capture_count++))
+grep -q "WARNING:.*install-capture-warn" "$TEST_INSTALL_LOG" && ((capture_count++))
+grep -q "ERROR:.*install-capture-error" "$TEST_INSTALL_LOG" && ((capture_count++))
+
+if [ $capture_count -eq 6 ]; then
+  create.result 0 "All 6 log types captured"
+else
+  create.result 1 "Only $capture_count/6 captured"
+fi
+expect 0 "All 6 log types captured" "LOG_INSTALL captures all log functions at any level"
+
+# ============================================================================
+# T26: Test log.install.finish writes summary and unsets LOG_INSTALL
+# ============================================================================
+test.case - "T26: log.install.finish finalizes log" \
+  log.install.finish
+
+if [ -z "$LOG_INSTALL" ] && grep -q "Install completed" "$TEST_INSTALL_LOG"; then
+  create.result 0 "Install log finalized"
+else
+  create.result 1 "LOG_INSTALL=$LOG_INSTALL, completed=$(grep -c 'Install completed' "$TEST_INSTALL_LOG" 2>/dev/null)"
+fi
+expect 0 "Install log finalized" "log.install.finish writes completion marker and unsets LOG_INSTALL"
+
+# ============================================================================
+# T27: Test LOG_INSTALL unset means no file writes
+# ============================================================================
+unset LOG_INSTALL
+TEST_NOLOG="${TMPDIR:-/tmp}/test.nolog.$$"
+touch "$TEST_NOLOG"
+
+test.case - "T27: no LOG_INSTALL means no file writes" \
+  console.log "should-not-be-logged"
+
+if grep -q "should-not-be-logged" "$TEST_NOLOG"; then
+  create.result 1 "File was written when it shouldn't have been"
+else
+  create.result 0 "No spurious writes"
+fi
+expect 0 "No spurious writes" "unset LOG_INSTALL produces no install log writes"
+
+rm -f "$TEST_INSTALL_LOG" "$TEST_NOLOG" 2>/dev/null
+
+# ============================================================================
+# T28: Test log.install outputs install log content
+# ============================================================================
+TEST_INSTALL_LOG2="${TMPDIR:-/tmp}/test.install.log2.$$"
+echo "# OOSH Install Log - test" > "$TEST_INSTALL_LOG2"
+echo "CONSOLE: test > hello world" >> "$TEST_INSTALL_LOG2"
+echo "ERROR: something failed" >> "$TEST_INSTALL_LOG2"
+export LOG_INSTALL="$TEST_INSTALL_LOG2"
+
+test.case - "T28: log.install outputs install log content" \
+  echo "testing log.install"
+
+OUTPUT=$(log.install 2>/dev/null)
+if echo "$OUTPUT" | grep -q "OOSH Install Log" && echo "$OUTPUT" | grep -q "hello world"; then
+  create.result 0 "Install log content shown"
+else
+  create.result 1 "Output: $OUTPUT"
+fi
+expect 0 "Install log content shown" "log.install outputs the install log content"
+
+# ============================================================================
+# T29: Test log.install.errors filters to ERROR lines only
+# ============================================================================
+test.case - "T29: log.install.errors shows only errors" \
+  echo "testing log.install.errors"
+
+OUTPUT=$(log.install.errors 2>/dev/null)
+if echo "$OUTPUT" | grep -q "ERROR:" && ! echo "$OUTPUT" | grep -q "CONSOLE:"; then
+  create.result 0 "Only errors shown"
+else
+  create.result 1 "Output: $OUTPUT"
+fi
+expect 0 "Only errors shown" "log.install.errors filters to ERROR lines only"
+
+# ============================================================================
+# T30: Test log.install.live is a function
+# ============================================================================
+test.case - "T30: log.install.live exists as function" \
+  echo "testing log.install.live"
+
+if [ "$(type -t log.install.live)" = "function" ]; then
+  create.result 0 "Function exists"
+else
+  create.result 1 "log.install.live is not a function"
+fi
+expect 0 "Function exists" "log.install.live is defined as a function"
+
+unset LOG_INSTALL
+rm -f "$TEST_INSTALL_LOG2" 2>/dev/null
+
+# ============================================================================
+# T31: Test log.start dispatches log. prefix methods (log.level)
+# ============================================================================
+# `log level 7` calls `config.save log LOG`, persisting LOG_LEVEL=7 to
+# ~/config/log.env. T32's subprocess (LOG_LEVEL=1 ... log error ...) then
+# sources user.env → log.env in err.log:259-262, clobbering LOG_LEVEL=1
+# with the persisted 7. seq.puml.log:130-138 sees LOG_LEVEL>6 and exports
+# STEP_DEBUG=ON; debug:step() reads stdin via `read -p` and hangs forever
+# when stdin is a tty (ssh -tt platform.test container). Snapshot/restore
+# log.env around T31 to prevent the leak.
+LOG_ENV_BACKUP="${TMPDIR:-/tmp}/test.log.env.backup.$$"
+cp "$HOME/config/log.env" "$LOG_ENV_BACKUP" 2>/dev/null
+
+test.case - "T31: log.start dispatches log. prefix methods" \
+  echo "testing dispatch via ./log"
+
+TEST_DISPATCH_LVL="${TMPDIR:-/tmp}/test.dispatch.lvl.$$"
+> "$TEST_DISPATCH_LVL"
+LOG_LEVEL=3 LOG_DEVICE="$TEST_DISPATCH_LVL" $OOSH_DIR/log level 7 2>/dev/null
+if grep -q "log level changed to 7" "$TEST_DISPATCH_LVL"; then
+  create.result 0 "log.level dispatched"
+else
+  create.result 1 "device content: $(cat "$TEST_DISPATCH_LVL")"
+fi
+rm -f "$TEST_DISPATCH_LVL" 2>/dev/null
+expect 0 "log.level dispatched" "log.start dispatches log.level correctly"
+
+# Restore log.env BEFORE T32 — T32's subprocess sources user.env which
+# sources log.env; if LOG_LEVEL=7 leaks through, T32 hangs on the step
+# debugger (see comment block above T31). `mv -f` because some shells
+# (e.g. Ubuntu's default `alias mv='mv -i'`) prompt to confirm overwriting
+# a read-only mode, which itself hangs the test on a tty.
+[ -f "$LOG_ENV_BACKUP" ] && \mv -f "$LOG_ENV_BACKUP" "$HOME/config/log.env"
+
+# ============================================================================
+# T32: Test log.start dispatches .log suffix methods (error.log)
+# ============================================================================
+TEST_DISPATCH_DEVICE="${TMPDIR:-/tmp}/test.dispatch.device.$$"
+> "$TEST_DISPATCH_DEVICE"
+
+test.case - "T32: log.start dispatches .log suffix methods" \
+  echo "testing suffix dispatch"
+
+LOG_LEVEL=1 LOG_DEVICE="$TEST_DISPATCH_DEVICE" $OOSH_DIR/log error "dispatch test error msg" 2>/dev/null
+if grep -q "ERROR" "$TEST_DISPATCH_DEVICE"; then
+  create.result 0 "error.log dispatched"
+else
+  create.result 1 "error.log not dispatched"
+fi
+expect 0 "error.log dispatched" "log.start dispatches error.log via suffix pattern"
+
+rm -f "$TEST_DISPATCH_DEVICE" 2>/dev/null
+
+# ============================================================================
+# T33: Test log.start dispatches sub-methods (log.install.init)
+# ============================================================================
+TEST_INSTALL_LOG3="${TMPDIR:-/tmp}/test.install.log3.$$"
+
+test.case - "T33: log.start dispatches sub-methods" \
+  echo "testing sub-method dispatch"
+
+LOG_LEVEL=3 $OOSH_DIR/log install init "$TEST_INSTALL_LOG3" 2>/dev/null
+if [ -f "$TEST_INSTALL_LOG3" ] && grep -q "OOSH Install Log" "$TEST_INSTALL_LOG3"; then
+  create.result 0 "log.install.init dispatched"
+else
+  create.result 1 "file exists=$([ -f "$TEST_INSTALL_LOG3" ] && echo yes || echo no)"
+fi
+expect 0 "log.install.init dispatched" "log.start dispatches log.install.init sub-method"
+
+rm -f "$TEST_INSTALL_LOG3" 2>/dev/null
+
+# ============================================================================
+# T34: Test log.live.file without args outputs current LOG_LIVE path
+# ============================================================================
+TEST_LIVE_PATH="${TMPDIR:-/tmp}/test.live.file.$$"
+export LOG_LIVE="$TEST_LIVE_PATH"
+
+test.case - "T34: log.live.file without args shows current file" \
+  echo "testing log.live.file no args"
+
+OUTPUT=$(log.live.file 2>/dev/null)
+if [ "$OUTPUT" = "$TEST_LIVE_PATH" ]; then
+  create.result 0 "Shows current file"
+else
+  create.result 1 "Output: '$OUTPUT', expected: '$TEST_LIVE_PATH'"
+fi
+expect 0 "Shows current file" "log.live.file without args outputs LOG_LIVE path"
+
+rm -f "$TEST_LIVE_PATH" 2>/dev/null
+
+# ============================================================================
+# T35: Test log.live.panes exists as function
+# ============================================================================
+test.case - "T35: log.live.panes exists as function" \
+  echo "testing log.live.panes"
+
+if [ "$(type -t log.live.panes)" = "function" ]; then
+  create.result 0 "Function exists"
+else
+  create.result 1 "log.live.panes is not a function"
+fi
+expect 0 "Function exists" "log.live.panes is defined as a function"
+
+# ============================================================================
+# T36: Test log.live.panes.stop exists as function
+# ============================================================================
+test.case - "T36: log.live.panes.stop exists as function" \
+  echo "testing log.live.panes.stop"
+
+if [ "$(type -t log.live.panes.stop)" = "function" ]; then
+  create.result 0 "Function exists"
+else
+  create.result 1 "log.live.panes.stop is not a function"
+fi
+expect 0 "Function exists" "log.live.panes.stop is defined as a function"
+
+# ============================================================================
+# T37: Test log.live.panes.stop handles missing session gracefully
+# ============================================================================
+test.case - "T37: log.live.panes.stop handles missing session" \
+  echo "testing stop with no session"
+
+# Kill ooshlog if it exists from a previous run
+tmux kill-session -t ooshlog 2>/dev/null
+log.live.panes.stop 2>/dev/null
+create.result $? "Ran without error"
+expect 0 "Ran without error" "log.live.panes.stop handles missing session gracefully"
+
+# ============================================================================
+# T38: Test log.live.result.txt function exists
+# ============================================================================
+test.log.liveResultTxtExists() {
+  if [ "$(type -t log.live.result.txt)" = "function" ]; then
+    create.result 0 "Function exists"
+  else
+    create.result 1 "log.live.result.txt is not a function"
+  fi
+}
+test.case - "T38: log.live.result.txt function exists" \
+  test.log.liveResultTxtExists
+expect 0 "Function exists" "log.live.result.txt is defined as a function"
+
+# ============================================================================
+# T39: Test log.live.result.env function exists
+# ============================================================================
+test.log.liveResultEnvExists() {
+  if [ "$(type -t log.live.result.env)" = "function" ]; then
+    create.result 0 "Function exists"
+  else
+    create.result 1 "log.live.result.env is not a function"
+  fi
+}
+test.case - "T39: log.live.result.env function exists" \
+  test.log.liveResultEnvExists
+expect 0 "Function exists" "log.live.result.env is defined as a function"
+
+# ============================================================================
+# T40: Test log.live.result.txt tails ~/config/result.txt
+# ============================================================================
+test.case - "T40: log.live.result.txt tails result.txt" \
+  echo "testing log.live.result.txt body"
+
+FUNC_BODY=$(declare -f log.live.result.txt)
+if echo "$FUNC_BODY" | grep -q 'tail -f.*result\.txt'; then
+  create.result 0 "Tails result.txt"
+else
+  create.result 1 "Body: $FUNC_BODY"
+fi
+expect 0 "Tails result.txt" "log.live.result.txt tails ~/config/result.txt"
+
+# ============================================================================
+# T41: Test log.live.result.env tails ~/config/result.env
+# ============================================================================
+test.case - "T41: log.live.result.env tails result.env" \
+  echo "testing log.live.result.env body"
+
+FUNC_BODY=$(declare -f log.live.result.env)
+if echo "$FUNC_BODY" | grep -q 'tail -f.*result\.env'; then
+  create.result 0 "Tails result.env"
+else
+  create.result 1 "Body: $FUNC_BODY"
+fi
+expect 0 "Tails result.env" "log.live.result.env tails ~/config/result.env"
+
+# ============================================================================
+# T42: Test log.live.panes creates ooshlog session
+# ============================================================================
+test.case - "T42: log.live.panes creates ooshlog session" \
+  echo "testing log.live.panes session creation"
+
+if ! command -v tmux &>/dev/null; then
+  create.result 0 "skipped (tmux not available)"
+  expect 0 "skipped (tmux not available)" "log.live.panes creates ooshlog session"
+else
+  # tmux refuses to start when TERM is unset or "unknown" (e.g. shells reached
+  # via `sudo su` that strip the env). Fall back to a known-good value.
+  if [ -z "$TERM" ] || [ "$TERM" = "unknown" ]; then
+    export TERM=xterm-256color
+  fi
+
+  # Ensure clean state
+  tmux kill-session -t ooshlog 2>/dev/null
+
+  # Run log.live.panes in background (it tries to attach, so we detach)
+  # We replicate the session-creation logic without attach to test safely
+  (
+    export TMUX=""  # Prevent "sessions should be nested" error
+    log.live.panes &>/dev/null &
+    PANES_PID=$!
+    sleep 3
+    kill $PANES_PID 2>/dev/null
+  )
+  sleep 1
+
+  if tmux has-session -t ooshlog 2>/dev/null; then
+    create.result 0 "ooshlog session created"
+    tmux kill-session -t ooshlog 2>/dev/null
+  else
+    create.result 1 "ooshlog session not found"
+  fi
+  expect 0 "ooshlog session created" "log.live.panes creates ooshlog session"
+fi
+
+# ============================================================================
+# T43: Test log.live.panes has 4-pane layout (3 split-window calls)
+# ============================================================================
+test.case - "T43: log.live.panes has 4-pane layout" \
+  echo "testing log.live.panes split-window count"
+
+FUNC_BODY=$(declare -f log.live.panes)
+SPLIT_COUNT=$(echo "$FUNC_BODY" | grep -c 'split-window')
+if [ "$SPLIT_COUNT" -eq 3 ]; then
+  create.result 0 "3 split-window calls found"
+else
+  create.result 1 "Expected 3 split-window calls, found $SPLIT_COUNT"
+fi
+expect 0 "3 split-window calls found" "log.live.panes creates 4 panes via 3 split-windows"
+
+# ============================================================================
+# T44: Test log.install.init creates log file at custom path
+# ============================================================================
+TEST_CUSTOM_INSTALL="${TMPDIR:-/tmp}/test.custom.install.$$"
+rm -f "$TEST_CUSTOM_INSTALL" 2>/dev/null
+
+test.case - "T44: log.install.init creates log file at custom path" \
+  log.install.init "$TEST_CUSTOM_INSTALL"
+
+if [ -f "$TEST_CUSTOM_INSTALL" ]; then
+  create.result 0 "File created at custom path"
+else
+  create.result 1 "File not found at $TEST_CUSTOM_INSTALL"
+fi
+expect 0 "File created at custom path" "log.install.init creates log file at custom path"
+
+# ============================================================================
+# T45: Test log.install captures all log levels
+# ============================================================================
+export LOG_LEVEL=1
+> "$TEST_CUSTOM_INSTALL"
+echo "# OOSH Install Log - test" > "$TEST_CUSTOM_INSTALL"
+export LOG_INSTALL="$TEST_CUSTOM_INSTALL"
+
+test.case - "T45: log.install captures all log levels" \
+  echo "testing install capture at custom path"
+
+console.log "t45-console-msg"
+silent.log "t45-silent-msg"
+debug.log "t45-debug-msg"
+important.log "t45-important-msg"
+warn.log "t45-warn-msg"
+error.log "t45-error-msg"
+
+T45_COUNT=0
+grep -q "CONSOLE:.*t45-console-msg" "$TEST_CUSTOM_INSTALL" && ((T45_COUNT++))
+grep -q "SILENT:.*t45-silent-msg" "$TEST_CUSTOM_INSTALL" && ((T45_COUNT++))
+grep -q "DEBUG:.*t45-debug-msg" "$TEST_CUSTOM_INSTALL" && ((T45_COUNT++))
+grep -q "IMPORTANT:.*t45-important-msg" "$TEST_CUSTOM_INSTALL" && ((T45_COUNT++))
+grep -q "WARNING:.*t45-warn-msg" "$TEST_CUSTOM_INSTALL" && ((T45_COUNT++))
+grep -q "ERROR:.*t45-error-msg" "$TEST_CUSTOM_INSTALL" && ((T45_COUNT++))
+
+if [ $T45_COUNT -eq 6 ]; then
+  create.result 0 "All 6 log types captured"
+else
+  create.result 1 "Only $T45_COUNT/6 captured in $TEST_CUSTOM_INSTALL"
+fi
+expect 0 "All 6 log types captured" "log.install captures all log levels at custom path"
+
+unset LOG_INSTALL
+rm -f "$TEST_CUSTOM_INSTALL" 2>/dev/null
+
+# ============================================================================
 # Cleanup
 # ============================================================================
-cleanup_test_files
+cleanup.testFiles
 
 test.suite.save.results
