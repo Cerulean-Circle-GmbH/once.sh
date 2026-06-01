@@ -43,10 +43,14 @@ private.os.platform.image.from.workspace() { # <workspace> # converts workspace 
   echo "$1" | sed 's/\([a-z]\)\([A-Z]\)/\1_\2/g' | tr '[:upper:]/' '[:lower:]_' | tr '.' '_'
 }
 
+private.os.platform.container.id() { # <port> # id of the running platform-test container publishing <port> (empty if none)
+  docker ps -q --filter "publish=$1" 2>/dev/null | head -1
+}
+
 private.os.platform.cleanup() { # <port> # stops and removes Docker container on given port
   local port="$1"
   local containerId
-  containerId=$(docker ps -q --filter "publish=$port" 2>/dev/null)
+  containerId=$(private.os.platform.container.id "$port")
   if [ -n "$containerId" ]; then
     docker stop "$containerId" 2>/dev/null
     docker rm "$containerId" 2>/dev/null
@@ -68,14 +72,14 @@ private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd afte
   # established connections survive — which is why the install itself finishes
   # but Phase B (fresh connections, after the ControlMaster is dropped) fails on
   # all users. We own the container and SSH itself is what's broken, so re-exec
-  # sshd via docker, not ssh. SIGHUP makes sshd re-exec the (new) binary while
-  # keeping the listener up. No-op when no container publishes the port
-  # (e.g. native runs).
-  local port="$1"
+  # sshd via odocker (docker), not ssh. SIGHUP makes sshd re-exec the (new)
+  # binary while keeping the listener up. No-op when no container publishes the
+  # port (e.g. native runs).
   local containerId
-  containerId=$(docker ps -q --filter "publish=$port" 2>/dev/null | head -1)
+  containerId=$(private.os.platform.container.id "$1")
   [ -z "$containerId" ] && return 0
-  docker exec "$containerId" sh -c '
+  console.log "Re-exec sshd on $containerId (pick up any in-place openssh upgrade)"
+  odocker exec.command "$containerId" '
     pid=$(cat /run/sshd.pid 2>/dev/null || cat /var/run/sshd.pid 2>/dev/null)
     [ -z "$pid" ] && pid=$(pidof sshd 2>/dev/null)
     [ -n "$pid" ] && kill -HUP $pid
