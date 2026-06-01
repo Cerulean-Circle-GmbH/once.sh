@@ -156,7 +156,8 @@ The Docker socket gives the container root-level access to the host's Docker dae
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `exec <container>` | container name, optional shell (default: bash) | Shell into running container |
+| `exec <container>` | container name, optional shell (default: bash) | Shell into running container (interactive `-it`) |
+| `exec.command <container> <command...>` | container name, command to run | Run a non-interactive command inside a running container (no TTY); for scripts/state machines |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
 | `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
