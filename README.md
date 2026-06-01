@@ -16,7 +16,7 @@ Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branchin
 - **bash 4+** — macOS: `brew install bash` · Debian/Ubuntu/RHEL: already present (Ubuntu 22/24 ships bash 5)
 - **git** — macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install git` · RHEL/Fedora: `sudo dnf install git` · Alpine: `apk add git`
 
-> **Why curl/wget/fetch is listed first:** the install one-liner below (`bash -c "$(curl …)"`) relies on bash's command-substitution to pull the installer from GitHub. If the fetcher is missing, bash silently runs `bash -c ""` and nothing happens — you'll see *`bash: curl: command not found`* with no framed error. Install a fetcher first (any one of curl / wget / fetch), then run the one-liner.
+> **Why curl/wget/fetch is listed first:** the install one-liner below (`sh -c "$(curl …)"`) relies on the shell's command-substitution to pull the installer from GitHub. If the fetcher is missing, the shell silently runs `sh -c ""` and nothing happens — you'll see *`sh: curl: command not found`* with no framed error. Install a fetcher first (any one of curl / wget / fetch), then run the one-liner.
 >
 > The installer itself checks **bash 4+** and **git** and prints a consolidated error with per-platform install hints if either is missing.
 
@@ -40,16 +40,13 @@ That's it — the `.command` file self-bootstraps: it fetches the bootstrap scri
 
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
-| **wget**  | `bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
-| **fetch** | `bash -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
+| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
 
-> **Note:** use `bash -c`, not `sh -c`. On Debian/Ubuntu `sh` is `dash`, and
-> the `sh -c "$(curl …)"` form hits a pre-existing bug in oosh's re-exec-via-bash
-> step: inside a piped script `$0` is literally `"sh"` (not a filesystem path),
-> so `exec bash "$0" "$@"` becomes `exec bash sh` which bash resolves via PATH
-> to `/usr/bin/sh` and fails with "cannot execute binary file". `bash -c` starts
-> under bash directly so the re-exec is never attempted.
+`init/oosh` is a POSIX `sh` script, so `sh -c` works on every supported
+platform (dash on Debian, ash on Alpine, bash on macOS). `bash -c` also
+works if you prefer it.
 
 Substitute the `prod` segment of the URL with `dev` (or any branch name) to
 install from a non-default branch, e.g. `…/dev/init/oosh`.
@@ -90,13 +87,13 @@ cat oosh | sh -x
 ```
 sudo apt update
 sudo apt install curl
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 
 or as root
 
 apt update
 apt install curl
-bash -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 ```
 
 
