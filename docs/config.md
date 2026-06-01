@@ -76,7 +76,7 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 | `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
 | `oosh.env` | first line: `: ${OOSH_DIR:="$(cd "$HOME/oosh" …)"}` | written by `config save oosh OOSH` |
-| `user.env` | first line: `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` | written by `config save` |
+| `user.env` | 3-line bootstrap header: `CONFIG_PATH` default, `{ … } && CONFIG_PATH="$HOME/config"` fallback, then `OOSH_DIR` anchor | written by `config save`. See [migration/env-files.md](migration/env-files.md) for the line-by-line rationale. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
 mirror the install steps at `oo:1456` (`config save`) and `oo:1462–1463`
@@ -272,7 +272,7 @@ Convenience function that saves and adds a config.
 ### Maintenance
 
 #### `config.clean`
-Removes duplicate lines and cleans up the config file.
+Removes duplicate lines while **preserving insertion order** (`awk '!seen[$0]++'`, not `sort -u`). Order matters: the `user.env` bootstrap header — and specifically the `CONFIG_PATH` fallback — must stay above the `source $CONFIG_PATH/*.env` lines, so the file must never be alphabetically re-sorted. Called automatically by `config.add`.
 
 ```bash
 ./config clean
