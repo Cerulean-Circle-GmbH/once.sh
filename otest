@@ -136,6 +136,40 @@ otest.deploy() # <?branch:test/WODA245> # Merge current branch to test, push, an
   success.log "Deployed to test server on branch $branch"
 }
 
+otest.browser.open() # <?url:https://test.wo-da.de/ide> <?profile:/tmp/browser-profile> # Open a Claude-controlled Chrome at <url>
+{
+  local url="${1:-https://test.wo-da.de/ide}"
+  local profile="${2:-/tmp/browser-profile}"
+
+  # Normalize bareword URLs (cnn.com -> https://cnn.com); Playwright requires a scheme.
+  case "$url" in
+    http://*|https://*|file://*|about:*|chrome://*) ;;
+    *) url="https://$url" ;;
+  esac
+
+  private.ensureDir || return 1
+  private.ensureVenv || return 1
+
+  local chrome
+  chrome=$(private.chromePath) || {
+    error.log "Real Chrome not found. Install google-chrome or set BROWSER_CHROME_PATH."
+    return 1
+  }
+
+  mkdir -p "$profile" || { error.log "Cannot create profile dir: $profile"; return 1; }
+
+  console.log "Launching $chrome (profile: $profile)"
+  private.python "$OTEST_DIR/browser.py" launch \
+    --chrome-path "$chrome" \
+    --user-data-dir "$profile" || { error.log "browser.py launch failed"; return 1; }
+
+  console.log "Navigating to: $url"
+  private.python "$OTEST_DIR/browser.py" navigate "$url" \
+    || warn.log "Navigate reported an error; page may still load (CDP is up)."
+
+  success.log "Browser open at: $url  —  CDP: http://localhost:9222"
+}
+
 otest.newTest() # <TestName> <?url> # Scaffold a new test in current component directory
 {
   local testName="$1"
@@ -373,6 +407,13 @@ otest.parameter.completion.branch() {
   git branch --format='%(refname:short)' 2>/dev/null
 }
 
+otest.browser.open.completion.profile() {
+  # Profile is a Chrome user-data dir path; echo the documented default plus
+  # the system Chrome profile so tab-completion lands on the common choices.
+  echo "/tmp/browser-profile"
+  echo "$HOME/.config/google-chrome"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PRIVATE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,7 +443,7 @@ private.runTest()
 
   local savedDir="$(pwd)"
   cd "$OTEST_DIR"
-  "$OTEST_DIR/venv/bin/python" run_tests.py "$testName" "${pythonArgs[@]}"
+  private.python run_tests.py "$testName" "${pythonArgs[@]}"
   local rc=$?
   cd "$savedDir"
   return $rc
@@ -533,6 +574,23 @@ private.python()
   "$OTEST_DIR/venv/bin/python" "$@"
 }
 
+private.chromePath()
+{
+  # Resolve real Chrome binary. Priority: $BROWSER_CHROME_PATH > common system paths.
+  if [ -n "$BROWSER_CHROME_PATH" ] && [ -x "$BROWSER_CHROME_PATH" ]; then
+    echo "$BROWSER_CHROME_PATH"
+    return 0
+  fi
+  local candidate
+  for candidate in /usr/bin/google-chrome /usr/bin/google-chrome-stable /opt/google/chrome/chrome; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 private.eamdRoot()
 {
   local dir="$OTEST_DIR"
@@ -629,65 +687,23 @@ private.mapName()
 
 private.testExists()
 {
-  # Check if a snake_case test name exists in discovered tests
+  # Check if a snake_case test name exists in discovered tests.
+  # Logic lives in TestSuite/2.0.0/utils/test_discovery.py (shared with
+  # run_tests.py's discover_tests); this bash function is a thin shim.
   local target="$1"
   private.ensureDir || return 1
   private.ensureVenv || return 1
-
-  local eamdRoot
-  eamdRoot=$(private.eamdRoot) || return 1
-
-  private.python -c "
-import yaml, os, re
-target = '$target'
-for root, dirs, files in os.walk('$eamdRoot/Components'):
-    if 'otest.yaml' in files:
-        with open(os.path.join(root, 'otest.yaml')) as f:
-            cfg = yaml.safe_load(f)
-        name = cfg.get('name')
-        if not name:
-            py_files = [fn for fn in files if fn.endswith('.py')]
-            if py_files:
-                stem = py_files[0].replace('.py', '')
-                name = re.sub(r'(?<!^)(?=[A-Z])', '_', stem).lower()
-        if name == target:
-            exit(0)
-        if 'environments' in cfg and name:
-            for env in cfg['environments']:
-                if env != 'local' and name + '_' + env == target:
-                    exit(0)
-exit(1)
-" 2>/dev/null
+  private.python "$OTEST_DIR/utils/test_discovery.py" exists "$target" 2>/dev/null
 }
 
 private.testNames()
 {
+  # Print one registered test name per line.
+  # Logic lives in TestSuite/2.0.0/utils/test_discovery.py (shared with
+  # run_tests.py's discover_tests); this bash function is a thin shim.
   private.ensureDir || return 1
   private.ensureVenv || return 1
-
-  local eamdRoot
-  eamdRoot=$(private.eamdRoot) || return 1
-
-  private.python -c "
-import yaml, os, re
-for root, dirs, files in os.walk('$eamdRoot/Components'):
-    if 'otest.yaml' in files:
-        with open(os.path.join(root, 'otest.yaml')) as f:
-            cfg = yaml.safe_load(f)
-        name = cfg.get('name')
-        if not name:
-            py_files = [fn for fn in files if fn.endswith('.py')]
-            if py_files:
-                stem = py_files[0].replace('.py', '')
-                name = re.sub(r'(?<!^)(?=[A-Z])', '_', stem).lower()
-        if not name:
-            continue
-        print(name)
-        if 'environments' in cfg:
-            for env in cfg['environments']:
-                if env != 'local':
-                    print(name + '_' + env)
-"
+  private.python "$OTEST_DIR/utils/test_discovery.py" names
 }
 
 private.testNames.camel()
@@ -725,6 +741,8 @@ otest.usage()
     $this updateGolden canvasGauges        Update golden screenshots
     $this setup                            Reinstall venv and dependencies
     $this deploy                           Deploy to test server
+    $this browser.open                     Open Claude-controlled Chrome at test.wo-da.de/ide
+    $this browser.open <url>               Open Chrome at a specific URL
     ----------
   "
 }

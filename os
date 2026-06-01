@@ -57,6 +57,32 @@ private.os.platform.cleanup() { # <port> # stops and removes Docker container on
   fi
 }
 
+private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd after an in-place openssh upgrade during install
+  # The in-container git install (init/oosh's prereq step, `dnf -y install git`)
+  # can upgrade openssh-server *in place*: AlmaLinux 9.8 shipped openssh
+  # 9.9p1-7.el9_8, while the test image still bakes in 8.7p1, so dnf swaps
+  # /usr/sbin/sshd out from under the running daemon. AlmaLinux sshd re-execs
+  # /usr/sbin/sshd for every new connection, so once the on-disk binary no
+  # longer matches the running master, every FRESH connection dies pre-banner
+  # ("kex_exchange_identification: Connection closed by remote host"). Already
+  # established connections survive — which is why the install itself finishes
+  # but Phase B (fresh connections, after the ControlMaster is dropped) fails on
+  # all users. We own the container and SSH itself is what's broken, so re-exec
+  # sshd via docker, not ssh. SIGHUP makes sshd re-exec the (new) binary while
+  # keeping the listener up. No-op when no container publishes the port
+  # (e.g. native runs).
+  local port="$1"
+  local containerId
+  containerId=$(docker ps -q --filter "publish=$port" 2>/dev/null | head -1)
+  [ -z "$containerId" ] && return 0
+  docker exec "$containerId" sh -c '
+    pid=$(cat /run/sshd.pid 2>/dev/null || cat /var/run/sshd.pid 2>/dev/null)
+    [ -z "$pid" ] && pid=$(pidof sshd 2>/dev/null)
+    [ -n "$pid" ] && kill -HUP $pid
+  ' 2>/dev/null
+  sleep 1
+}
+
 private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI workflow for native platform testing
 {
   local platform="$1"
@@ -223,6 +249,13 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # its self-install, and init/oosh:188 (git install) + 192-232
   # (bash install).
   ossh install "$platform" test
+
+  # The git install above may upgrade openssh-server in place (AlmaLinux 9.8
+  # shipped 9.9p1). sshd re-execs per connection, so the running pre-upgrade
+  # daemon refuses every FRESH connection until it re-execs the new binary.
+  # Re-exec it now so the ControlMaster refresh below — and all of Phase B —
+  # connect cleanly. See private.os.platform.sshd.reload.
+  private.os.platform.sshd.reload "$sshPort"
 
   # Refresh ControlMaster so new sessions pick up dev group membership
   # (usermod -aG dev runs during install, but ControlMaster keeps old groups)

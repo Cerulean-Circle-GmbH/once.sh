@@ -141,6 +141,33 @@ already-correct layout is a no-op. Naming follows the OOSH
 `ossh.folder.fix` per-scope pattern. See
 [Repair toolkit](repair-toolkit.md) for related primitives.
 
+### oo.safeDirectory.prune
+
+Remove entries from git's global `safe.directory` list whose paths
+no longer exist on disk.
+
+```bash
+oo safeDirectory.prune
+```
+
+Walks `git config --global --get-all safe.directory`, drops entries
+pointing at paths that no longer exist (typical sources: `/tmp/...`
+test fixtures, removed worktrees, stale install dirs), and leaves
+real paths untouched. Idempotent — a clean list logs *"No stale
+entries to prune"* at log level ≥ 4 and exits 0.
+
+Honours `$GIT_CONFIG_GLOBAL` so tests and ad-hoc scripts can
+sandbox without touching the user's real `~/.gitconfig` (the
+sandbox pattern is the reason this primitive exists — see
+[Repair toolkit](repair-toolkit.md) §Cursor / VS Code branches
+missing).
+
+The primitive is **explicit and read-then-rewrite**. There is
+deliberately no auto-invocation from shell startup or from
+read-only methods such as `oo.mode.list` — repair belongs to
+explicit primitives per the post-May-8 architectural rule (see
+[`migration/env-files.md`](migration/env-files.md)).
+
 ### oo.commit
 
 Commits and pushes changes (requires dev branch).

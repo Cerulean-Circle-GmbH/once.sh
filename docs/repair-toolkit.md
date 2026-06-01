@@ -18,6 +18,7 @@ listed here run only when invoked.
 | [`config init.shared`](config.md) | `sharedConfig` dir mode 2775 + group `dev` | After cross-user perm drift, "Permission denied" on shared config writes |
 | [`ossh rights.fix`](ossh.md) | `~/.ssh` file modes (600 private, 644 public, 700 dirs) | After SSH client complains about world-readable keys |
 | [`ossh folder.fix [strict]`](ossh.md) | `~/.ssh` tree layout (WODA Host blocks, IdentityFile paths, GitHub Host) | After `ssh: Bad configuration option`, missing `2cuGitHub` alias, drag-in legacy artifacts |
+| [`oo safeDirectory.prune`](oo.md#oosafedirectoryprune) | Stale entries in `git config --global safe.directory` | After many test runs or repeated installs bloated `~/.gitconfig`; symptom: Cursor / VS Code Source Control panel + branch picker empty |
 
 ## How they relate
 
@@ -78,6 +79,7 @@ explicitly when something drifts.
 | `ssh: Could not resolve hostname 2cuGitHub` | `ossh folder.fix` |
 | Legacy `~/.ssh/2cuGitHub` host block | `ossh folder.fix strict` |
 | `~/.ssh/id_ed25519.previous` / `.bak.*` cruft | `ossh folder.fix strict` |
+| Cursor / VS Code Source Control panel and branch picker stay empty although `git branch` works in the terminal; `git config --global --get-all safe.directory \| wc -l` is large (many stale `/tmp/...` entries) | `oo safeDirectory.prune` |
 
 ## Verification: am I healed?
 

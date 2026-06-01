@@ -5,8 +5,11 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
-# SSH ControlMaster socket path for connection reuse (single password entry)
-: ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
+# SSH ControlMaster socket path for connection reuse (single password entry).
+# Use %C (hash of %l%h%p%r, OpenSSH 6.7+) to keep path short — Unix domain
+# sockets have a ~104 char limit. Long hostnames (e.g. macstudio.fritz.box)
+# with the old %r@%h:%p template exceeded this on Termux/Android.
+: ${OSSH_CONTROL_PATH:="${TMPDIR:-/tmp}/ossh-%C"}
 
 ### new.method
 
@@ -25,20 +28,31 @@ ossh.connection.open() # <host> # open persistent SSH connection (enter password
     return 0
   fi
 
-  # Open master connection in background, persist for 10 min
-  ssh -o ControlMaster=yes \
+  # Open master connection in background, persist for 10 min.
+  # Try default (IPv4+IPv6) first; if it fails (Broken pipe on IPv6 is
+  # common on Termux/Android), retry with -4 to force IPv4.
+  if ssh -o ControlMaster=yes \
       -o ControlPath="$OSSH_CONTROL_PATH" \
       -o ControlPersist=600 \
       -o StrictHostKeyChecking=accept-new \
-      -N -f "$host"
-
-  if [ $? -eq 0 ]; then
+      -N -f "$host" 2>/dev/null; then
     success.log "Connection to $host established (reusable for 10 min)"
     return 0
-  else
-    error.log "Failed to connect to $host"
-    return 1
   fi
+
+  # Retry IPv4-only (avoids Broken pipe on IPv6-first platforms)
+  info.log "Retrying $host with IPv4 only (-4)..."
+  if ssh -4 -o ControlMaster=yes \
+      -o ControlPath="$OSSH_CONTROL_PATH" \
+      -o ControlPersist=600 \
+      -o StrictHostKeyChecking=accept-new \
+      -N -f "$host" 2>/dev/null; then
+    success.log "Connection to $host established via IPv4 (reusable for 10 min)"
+    return 0
+  fi
+
+  error.log "Failed to connect to $host (tried default + IPv4)"
+  return 1
 }
 ossh.connection.open.completion.host() {
   ossh.config.get.completion "$@"
@@ -88,16 +102,27 @@ private.ossh.rsync() # <src> <dest> # rsync with ControlMaster and auto-mkdir
     ssh -o ControlPath="$OSSH_CONTROL_PATH" -o StrictHostKeyChecking=accept-new "$host" "mkdir -p '$remoteDir'" 2>/dev/null
   fi
 
-  # Now rsync (compatible with openrsync on macOS)
-  rsync -avz -e "$sshOpts" "$src" "$dest"
+  # rsync with scp fallback (Termux/Android may not have rsync)
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -avz -e "$sshOpts" "$src" "$dest"
+  else
+    scp -o ControlPath="$OSSH_CONTROL_PATH" -o StrictHostKeyChecking=accept-new "$src" "$dest"
+  fi
 }
 
-private.ossh.rsync.pull() # <src> <dest> # rsync pull with ControlMaster
+private.ossh.rsync.pull() # <src> <dest> # rsync pull with ControlMaster; falls back to scp if rsync unavailable
 {
   local src="$1"
   local dest="$2"
-  local sshOpts="ssh -o ControlPath=$OSSH_CONTROL_PATH -o StrictHostKeyChecking=accept-new"
-  rsync -avz -e "$sshOpts" "$src" "$dest"
+  if command -v rsync >/dev/null 2>&1; then
+    local sshOpts="ssh -o ControlPath=$OSSH_CONTROL_PATH -o StrictHostKeyChecking=accept-new"
+    rsync -avz -e "$sshOpts" "$src" "$dest"
+  else
+    local destDir
+    destDir=$(dirname "$dest")
+    [ -d "$destDir" ] || mkdir -p "$destDir"
+    scp -o ControlPath="$OSSH_CONTROL_PATH" -o StrictHostKeyChecking=accept-new "$src" "$dest"
+  fi
 }
 
 private.ossh.ssh() # <?sshFlags> <host> <command...> # ssh with ControlMaster
@@ -314,13 +339,19 @@ ossh.config.create() # <?sshConfigName|user@host> <?url> <?idOrProxyJump> <?iden
     fi
   fi
 
+  if [ -d "$id" ]; then
+    # id_rsa etc. can be a DIRECTORY on some platforms (Termux) — detect key inside it
+    if private.detect.ssh.key "$id"; then
+      id="$RESULT"
+    else
+      warn.log "ossh: '$id' is a directory but contains no SSH key"
+    fi
   # Leading ~ means "each user's own home" — pass verbatim to the config
   # file (sshd expands it at read time). Without this guard, `[ ! -f "~/..." ]`
-  # treats tilde as literal, fails, and the fallback builds a bogus path
-  # like /ids/~/.ssh/2cuGitHub/id_ed25519 into the config.
-  if [[ "$id" != "~"* ]] && [ ! -f "$id" ]; then
+  # treats tilde as literal, fails, and the fallback builds a bogus path.
+  elif [[ "$id" != "~"* ]] && [ ! -f "$id" ]; then
     private.get.sshDir
-    local idName="$id"
+    local idName="${id##*/}"
     if private.detect.ssh.key "$RESULT/ids/$idName"; then
       id="$RESULT"
     else
@@ -671,7 +702,7 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
   config list
   #problem.log "returned from state transition: $?   -$sshConfigNameUsedForLocal"
 
-  config ssh.set.config.host "$sshConfigNameUsedForLocal"
+  config ssh.host.set "$sshConfigNameUsedForLocal"
 
   check dir $HOME/ssh.original not exists \
     call user ssh.backup original
@@ -2303,16 +2334,28 @@ private.ossh.pull.key() # <fromHost> <dir> # gets te directory <dir> <fromHost> 
   local keyName="$1"
   if [ -n "$1" ]; then
     shift
-  else
-    keyName=$( ossh exec $toHost "ossh get.file.name" )
-    error.log "no dir was specified: using $keyName"
-    #return 1
   fi
 
   ossh.connection.open "$toHost"
+
+  # Resolve keyName: explicit arg → remote ossh id.file.get → remote key auto-detect
+  if [ -z "$keyName" ]; then
+    keyName=$(ossh exec "$toHost" "ossh id.file.get" 2>/dev/null)
+  fi
+  if [ -z "$keyName" ]; then
+    # Fallback: detect key type directly on remote's ~/.ssh
+    keyName=$(ossh exec "$toHost" "for k in id_ed25519 id_ecdsa id_rsa id_dsa; do [ -f ~/.ssh/\$k.pub ] && echo \$k && break; done" 2>/dev/null)
+  fi
+  if [ -z "$keyName" ]; then
+    error.log "key.pull: cannot determine key name on $toHost (no key found in remote ~/.ssh)"
+    return 1
+  fi
+  info.log "key.pull: using keyName='$keyName' from $toHost"
+
   private.get.sshDir
-  private.ossh.rsync.pull "$toHost:.ssh/public_keys/$keyName.public_key" "$RESULT/public_keys/$keyName.public_key.pulled"
-  #ssh $toHost "user authorized.keys.update"
+  local localDir="$RESULT/public_keys"
+  [ -d "$localDir" ] || mkdir -p "$localDir"
+  private.ossh.rsync.pull "$toHost:.ssh/$keyName.pub" "$localDir/$keyName.public_key.pulled"
 }
 
 ossh.key.pull() # <fromHost> <dir> # gets te directory <dir> <fromHost> into the CURRENT LOCAL dirrectory
@@ -3018,6 +3061,497 @@ ossh.harden() # <sshConfigHost> # orchestrator — run all harden.* sub-methods 
 
 ossh.harden.completion.sshConfigHost() {
   ossh.parameter.completion.sshConfigHost "$@"
+}
+
+
+# ============================================================================
+# certificates.update — refresh TLS cert + restore workspace on remote hosts
+# ----------------------------------------------------------------------------
+# Boss brief (WODA-T3): one command that says "update certificates", backed
+# by a state machine. State machine name: CERT_UPDATE_<sanitized-host>. Each
+# state SSHes to the host via private.ossh.ssh (ControlMaster reuse). Per-host
+# config lives at $OOSH_DIR/etc/ossh/hosts/<host>/certificates.update.conf.
+# Failure stops AT the failing state; re-running ossh certificates.update
+# <host> resumes from there. The dated backup under $backupBase is the safety
+# net — no in-script EXIT-trap restore needed (state-machine *is* the recovery).
+# ============================================================================
+
+ossh.certificates.update() # <sshConfigHost> <?reset|yes|dryRun> # rotate TLS cert + restore workspace on <sshConfigHost>; state-machine backed, resume by re-running
+{
+  local host=""
+  local optReset=""
+  local optYes=""
+  local optDryRun=""
+
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --reset|reset)              optReset=yes ;;
+      --yes|-y|yes)               optYes=yes ;;
+      --dry-run|dry-run|dryRun)   optDryRun=yes ;;
+      -*)                    error.log "Unknown flag: $arg"; return 2 ;;
+      *)
+        if [ -z "$host" ]; then host="$arg"
+        else error.log "Unexpected positional arg: $arg"; return 2
+        fi ;;
+    esac
+  done
+
+  if [ -z "$host" ]; then
+    error.log "Usage: ossh certificates.update <sshConfigHost> [reset|yes|dryRun]"
+    return 2
+  fi
+
+  source state
+
+  private.certificates.update.config.load "$host" || return $?
+
+  CERT_UPDATE_FORCE="$optYes"
+  CERT_UPDATE_DRYRUN="$optDryRun"
+
+  local machine
+  private.certificates.update.machine.name "$host"
+  machine="$RESULT"
+
+  private.certificates.update.config.persist "$machine"
+
+  if [ "$optReset" = "yes" ] && state.machine.exists "$machine" 2>/dev/null; then
+    state.machine.delete "$machine" 2>/dev/null
+    # Stamp lives in the per-machine env file — wipe it on reset
+    CERT_UPDATE_STAMP=""
+    private.certificates.update.config.persist "$machine"
+  fi
+
+  if ! state.machine.exists "$machine" 2>/dev/null; then
+    private.certificates.update.state.machine.init "$machine"
+  fi
+
+  state of "$machine"
+  source "$CONFIG_PATH/stateMachines/$machine.states.env" 2>/dev/null
+  source "$CONFIG_PATH/current.state.machine.env"
+
+  # Previous run finished — start a fresh machine
+  if [ $state -ge 99 ]; then
+    state.machine.delete "$machine" 2>/dev/null
+    CERT_UPDATE_STAMP=""
+    private.certificates.update.config.persist "$machine"
+    private.certificates.update.state.machine.init "$machine"
+    state of "$machine"
+    source "$CONFIG_PATH/stateMachines/$machine.states.env" 2>/dev/null
+    source "$CONFIG_PATH/current.state.machine.env"
+  fi
+
+  # Confirmation prompt — only on a fresh-start (state < 11), and only when
+  # not --yes / not --dry-run. .status-style echo to stdout per
+  # [feedback_status_command_output_idiom] so the plan is always visible.
+  if [ "$optYes" != "yes" ] && [ "$optDryRun" != "yes" ] && [ $state -lt 11 ]; then
+    echo ""
+    echo "Plan for ${CERT_UPDATE_HOST}:"
+    echo "  domain         : ${CERT_UPDATE_DOMAIN}"
+    echo "  workspace      : ${CERT_UPDATE_WORKSPACE}"
+    echo "  certScenario   : ${CERT_UPDATE_CERT_SCENARIO}"
+    echo "  appScenario    : ${CERT_UPDATE_APP_SCENARIO}"
+    echo "  dataDir        : ${CERT_UPDATE_DATA_DIR}"
+    echo "  backupBase     : ${CERT_UPDATE_BACKUP_BASE}"
+    echo "  verifyMinDays  : ${CERT_UPDATE_VERIFY_MIN_DAYS}"
+    echo "  states         : stop.certbot -> stop.structr -> archive.workspace ->"
+    echo "                   create.certbot -> create.structr -> rotate.empty ->"
+    echo "                   restore.workspace -> start.structr -> verify.https"
+    echo ""
+    if [ -t 0 ]; then
+      local reply
+      read -r -p "Proceed? [y/N] " reply
+      case "$reply" in y|Y|yes|YES) ;; *) echo "Aborted."; return 1 ;; esac
+    else
+      error.log "Non-interactive run requires 'yes' — re-invoke: ossh certificates.update $host yes"
+      return 2
+    fi
+  fi
+
+  # Advancement loop (mirrors promote's structure)
+  local i=0
+  while [ $state -lt 99 ] && [ $i -lt 30 ]; do
+    local prevState=$state
+    state next
+    local checkResult="$RESULT"
+    source "$CONFIG_PATH/current.state.machine.env"
+    if [ $state -le $prevState ]; then
+      local stuckLabel="${machine}_STATES[${state}]"
+      echo ""
+      echo "Cannot update certificates on ${CERT_UPDATE_HOST}: ${checkResult:-state machine stuck at [$state]}"
+      echo "  Stuck at state: [$state] = ${!stuckLabel}"
+      echo "  Fix the blocking condition, then re-run \`ossh certificates.update $host\`."
+      return 1
+    fi
+    ((i++))
+  done
+
+  if [ $state -ge 99 ]; then
+    success.log "Certificate update complete on ${CERT_UPDATE_HOST}"
+    echo "Verify: open https://${CERT_UPDATE_DOMAIN} — no cert error, expiry > ${CERT_UPDATE_VERIFY_MIN_DAYS} days."
+  fi
+}
+ossh.certificates.update.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+ossh.certificates.update.completion.reset() {
+  echo "reset"
+  echo "yes"
+  echo "dryRun"
+}
+
+ossh.certificates.status() # <sshConfigHost> # show CERT_UPDATE machine state for <sshConfigHost>
+{
+  local host="$1"
+  if [ -z "$host" ]; then
+    error.log "Usage: ossh certificates.status <sshConfigHost>"
+    return 2
+  fi
+
+  source state
+
+  local machine
+  private.certificates.update.machine.name "$host"
+  machine="$RESULT"
+
+  if ! state.machine.exists "$machine" 2>/dev/null; then
+    echo "No CERT_UPDATE machine for $host — has never run, or was reset."
+    return 0
+  fi
+
+  state of "$machine"
+  source "$CONFIG_PATH/stateMachines/$machine.states.env" 2>/dev/null
+  source "$CONFIG_PATH/current.state.machine.env"
+
+  local stateLabel="${machine}_STATES[${state}]"
+  echo "host        : $host"
+  echo "machine     : $machine"
+  echo "current     : [$state] = ${!stateLabel:-(unknown)}"
+
+  local cfgFile="$CONFIG_PATH/stateMachines/${machine}.ossh.env"
+  if [ -f "$cfgFile" ]; then
+    echo ""
+    echo "Persisted config:"
+    sed 's/^/  /' "$cfgFile"
+  fi
+}
+ossh.certificates.status.completion.sshConfigHost() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+# ----------------------------------------------------------------------------
+# certificates.update — helpers
+# ----------------------------------------------------------------------------
+
+private.certificates.update.machine.name() # <host> # echo CERT_UPDATE_<sanitized host> via RESULT
+{
+  local host="$1"
+  local sanitized="${host//[.-]/_}"
+  RESULT="CERT_UPDATE_${sanitized}"
+}
+
+private.certificates.update.config.load() # <host> # load + validate per-host config; exports CERT_UPDATE_* vars
+{
+  local host="$1"
+  local cfg="$OOSH_DIR/etc/ossh/hosts/$host/certificates.update.conf"
+
+  if [ ! -f "$cfg" ]; then
+    error.log "No per-host config for $host: expected $cfg"
+    error.log "Create it with the keys: domain, workspace, certScenario, appScenario, dataDir"
+    return 1
+  fi
+
+  local domain="" workspace="" certScenario="" appScenario="" dataDir=""
+  local backupBase="" verifyMinDaysLeft=""
+
+  # shellcheck disable=SC1090
+  source "$cfg"
+
+  local missing=""
+  [ -z "$domain" ]       && missing="$missing domain"
+  [ -z "$workspace" ]    && missing="$missing workspace"
+  [ -z "$certScenario" ] && missing="$missing certScenario"
+  [ -z "$appScenario" ]  && missing="$missing appScenario"
+  [ -z "$dataDir" ]      && missing="$missing dataDir"
+
+  if [ -n "$missing" ]; then
+    error.log "Missing required key(s) in $cfg:$missing"
+    return 1
+  fi
+
+  : "${backupBase:=/var/backups}"
+  : "${verifyMinDaysLeft:=30}"
+
+  CERT_UPDATE_HOST="$host"
+  CERT_UPDATE_DOMAIN="$domain"
+  CERT_UPDATE_WORKSPACE="$workspace"
+  CERT_UPDATE_CERT_SCENARIO="$certScenario"
+  CERT_UPDATE_APP_SCENARIO="$appScenario"
+  CERT_UPDATE_DATA_DIR="$dataDir"
+  CERT_UPDATE_BACKUP_BASE="$backupBase"
+  CERT_UPDATE_VERIFY_MIN_DAYS="$verifyMinDaysLeft"
+}
+
+private.certificates.update.config.persist() # <machine> # save resolved config so re-runs from a fresh shell see it
+{
+  local machine="$1"
+  local file="$CONFIG_PATH/stateMachines/$machine.ossh.env"
+  mkdir -p "$CONFIG_PATH/stateMachines" 2>/dev/null
+  {
+    echo "CERT_UPDATE_HOST=$CERT_UPDATE_HOST"
+    echo "CERT_UPDATE_DOMAIN=$CERT_UPDATE_DOMAIN"
+    echo "CERT_UPDATE_WORKSPACE=$CERT_UPDATE_WORKSPACE"
+    echo "CERT_UPDATE_CERT_SCENARIO=$CERT_UPDATE_CERT_SCENARIO"
+    echo "CERT_UPDATE_APP_SCENARIO=$CERT_UPDATE_APP_SCENARIO"
+    echo "CERT_UPDATE_DATA_DIR=$CERT_UPDATE_DATA_DIR"
+    echo "CERT_UPDATE_BACKUP_BASE=$CERT_UPDATE_BACKUP_BASE"
+    echo "CERT_UPDATE_VERIFY_MIN_DAYS=$CERT_UPDATE_VERIFY_MIN_DAYS"
+    echo "CERT_UPDATE_FORCE=$CERT_UPDATE_FORCE"
+    echo "CERT_UPDATE_DRYRUN=$CERT_UPDATE_DRYRUN"
+    echo "CERT_UPDATE_STAMP=$CERT_UPDATE_STAMP"
+  } > "$file"
+}
+
+private.certificates.update.config.read() # # load CERT_UPDATE_* from the active machine's persisted ossh.env (state.check re-sources ossh, so check fns can't trust shell-local vars survive — load fresh on each entry, same idiom as promote.config.load)
+{
+  local machine=""
+  source "$CONFIG_PATH/current.state.machine.env" 2>/dev/null
+  if [ -z "$machine" ]; then
+    return 1
+  fi
+  local file="$CONFIG_PATH/stateMachines/$machine.ossh.env"
+  if [ -f "$file" ]; then
+    # shellcheck disable=SC1090
+    source "$file"
+  fi
+}
+
+private.certificates.update.state.machine.init() # <machine> # create + populate the machine (9 states, [11]-[19])
+{
+  local machine="$1"
+  console.log "initialising state machine: ${machine}"
+  source state
+  state.machine.create "${machine}" ossh
+
+  state.add certificates.update.stop.certbot       silent
+  state.add certificates.update.stop.structr       silent
+  state.add certificates.update.archive.workspace  silent
+  state.add certificates.update.create.certbot     silent
+  state.add certificates.update.create.structr     silent
+  state.add certificates.update.rotate.empty       silent
+  state.add certificates.update.restore.workspace  silent
+  state.add certificates.update.start.structr      silent
+  state.add certificates.update.verify.https       silent
+
+  source "$CONFIG_PATH/stateMachines/$machine.states.env"
+
+  # [20] = "99" terminator (slot after the 9 working states)
+  printf -v "${machine}_STATES[20]" '%s' '99'
+
+  private.state.machine.update
+  state.machine.start ossh
+}
+
+# State framework swallows stdout/stderr of private.check.*
+# (project_promote_silent_output_bug). Plain echo is invisible from check
+# fns; write to $LOG_DEVICE (usually /dev/tty) to bypass the swallow.
+# Live runs route through important.log for LOG_LEVEL=2+ visibility.
+private.certificates.update.ssh.run() # <host> <command...> # private.ossh.ssh wrapper with dry-run support
+{
+  local host="$1"; shift
+  if [ "$CERT_UPDATE_DRYRUN" = "yes" ]; then
+    echo "+ ssh $host \"$*\"   [dry-run, not executed]" >>"$LOG_DEVICE"
+    return 0
+  fi
+  important.log "+ ssh $host \"$*\""
+  private.ossh.ssh "$host" "$@"
+}
+
+# ----------------------------------------------------------------------------
+# certificates.update — per-state check functions ([11]..[19])
+# ----------------------------------------------------------------------------
+
+private.check.certificates.update.stop.certbot() # <script> <stageTo> <stateFound> # ssh: stop cert scenario
+{
+  private.certificates.update.config.read
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "once docker.scenario.stop $CERT_UPDATE_CERT_SCENARIO"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Stopped $CERT_UPDATE_CERT_SCENARIO on $CERT_UPDATE_HOST"
+  else
+    create.result 1 "Failed to stop $CERT_UPDATE_CERT_SCENARIO on $CERT_UPDATE_HOST"
+  fi
+  return $(result)
+}
+
+private.check.certificates.update.stop.structr() # <script> <stageTo> <stateFound> # ssh: stop app scenario
+{
+  private.certificates.update.config.read
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "once docker.scenario.stop $CERT_UPDATE_APP_SCENARIO"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Stopped $CERT_UPDATE_APP_SCENARIO on $CERT_UPDATE_HOST"
+  else
+    create.result 1 "Failed to stop $CERT_UPDATE_APP_SCENARIO on $CERT_UPDATE_HOST"
+  fi
+  return $(result)
+}
+
+private.check.certificates.update.archive.workspace() # <script> <stageTo> <stateFound> # ssh: mv data dir into backupBase, remember stamp
+{
+  private.certificates.update.config.read
+  # Stamp persisted in machine config so state [17] finds the same backup
+  # even when resumed from a fresh shell.
+  if [ -z "$CERT_UPDATE_STAMP" ]; then
+    CERT_UPDATE_STAMP="$(date +%F_%H%M%S)"
+    local machine
+    private.certificates.update.machine.name "$CERT_UPDATE_HOST"
+    machine="$RESULT"
+    private.certificates.update.config.persist "$machine"
+  fi
+
+  local src="$CERT_UPDATE_WORKSPACE/$CERT_UPDATE_DATA_DIR"
+  local dst="$CERT_UPDATE_BACKUP_BASE/$CERT_UPDATE_DATA_DIR.$CERT_UPDATE_STAMP.bak"
+
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "if [ -d '$src' ]; then mv '$src' '$dst'; else echo no-op: $src already absent; fi"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Archived $src -> $dst"
+  else
+    create.result 1 "Failed to archive $src on $CERT_UPDATE_HOST"
+  fi
+  return $(result)
+}
+
+private.check.certificates.update.create.certbot() # <script> <stageTo> <stateFound> # ssh: create cert scenario (TLS renewed here)
+{
+  private.certificates.update.config.read
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "once docker.scenario.create $CERT_UPDATE_CERT_SCENARIO $CERT_UPDATE_DOMAIN"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Created/renewed cert via $CERT_UPDATE_CERT_SCENARIO for $CERT_UPDATE_DOMAIN"
+  else
+    create.result 1 "docker.scenario.create $CERT_UPDATE_CERT_SCENARIO failed on $CERT_UPDATE_HOST"
+  fi
+  return $(result)
+}
+
+private.check.certificates.update.create.structr() # <script> <stageTo> <stateFound> # ssh: create app scenario (produces empty data dir)
+{
+  private.certificates.update.config.read
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "once docker.scenario.create $CERT_UPDATE_APP_SCENARIO $CERT_UPDATE_DOMAIN"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Created $CERT_UPDATE_APP_SCENARIO scenario on $CERT_UPDATE_HOST"
+  else
+    create.result 1 "docker.scenario.create $CERT_UPDATE_APP_SCENARIO failed on $CERT_UPDATE_HOST"
+  fi
+  return $(result)
+}
+
+private.check.certificates.update.rotate.empty() # <script> <stageTo> <stateFound> # ssh: drop stale WODA-empty, move new (empty) data dir aside as WODA-empty
+{
+  private.certificates.update.config.read
+  local ws="$CERT_UPDATE_WORKSPACE"
+  local dataDir="$CERT_UPDATE_DATA_DIR"
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "cd '$ws' && rm -rf WODA-empty && [ -d '$dataDir' ] && mv '$dataDir' WODA-empty"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Rotated $dataDir -> WODA-empty in $ws"
+  else
+    create.result 1 "Failed to rotate $dataDir in $ws on $CERT_UPDATE_HOST"
+  fi
+  return $(result)
+}
+
+private.check.certificates.update.restore.workspace() # <script> <stageTo> <stateFound> # ssh: mv dated backup back into data dir
+{
+  private.certificates.update.config.read
+  if [ -z "$CERT_UPDATE_STAMP" ]; then
+    create.result 1 "CERT_UPDATE_STAMP empty — cannot locate the archived workspace. Inspect $CERT_UPDATE_BACKUP_BASE on $CERT_UPDATE_HOST and restore manually."
+    return $(result)
+  fi
+
+  local src="$CERT_UPDATE_BACKUP_BASE/$CERT_UPDATE_DATA_DIR.$CERT_UPDATE_STAMP.bak"
+  local dst="$CERT_UPDATE_WORKSPACE/$CERT_UPDATE_DATA_DIR"
+
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "[ -d '$src' ] && mv '$src' '$dst'"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Restored $src -> $dst"
+  else
+    create.result 1 "Failed to restore $src on $CERT_UPDATE_HOST — check it still exists there"
+  fi
+  return $(result)
+}
+
+private.check.certificates.update.start.structr() # <script> <stageTo> <stateFound> # ssh: start app scenario
+{
+  private.certificates.update.config.read
+  private.certificates.update.ssh.run "$CERT_UPDATE_HOST" \
+    "once docker.scenario.start $CERT_UPDATE_APP_SCENARIO $CERT_UPDATE_DOMAIN"
+  if [ $? -eq 0 ]; then
+    create.result 0 "Started $CERT_UPDATE_APP_SCENARIO on $CERT_UPDATE_HOST"
+  else
+    create.result 1 "Failed to start $CERT_UPDATE_APP_SCENARIO on $CERT_UPDATE_HOST"
+  fi
+  return $(result)
+}
+
+# Framework terminators — the state script must define private.check.finished
+# and private.check.next.custom.state for state.machine.start to validate.
+# Copies of promote's terminators with the same no-op semantics.
+private.check.finished() # <script> <stageTo> <stateFound> # terminal state
+{
+  create.result 0 "finished"
+  return $(result)
+}
+
+private.check.next.custom.state() # <script> <stageTo> <stateFound> # placeholder pass-through
+{
+  create.result 0 "next.custom.state"
+  return $(result)
+}
+
+private.check.certificates.update.verify.https() # <script> <stageTo> <stateFound> # local: HTTPS reachable + cert expiry within minimum days
+{
+  private.certificates.update.config.read
+  if [ "$CERT_UPDATE_DRYRUN" = "yes" ]; then
+    echo "+ curl -sSf https://$CERT_UPDATE_DOMAIN   [dry-run, not executed]" >>"$LOG_DEVICE"
+    echo "+ openssl s_client -servername $CERT_UPDATE_DOMAIN  [dry-run, not executed]" >>"$LOG_DEVICE"
+    create.result 0 "Verified (dry-run)"
+    return $(result)
+  fi
+
+  if ! curl -sSf -o /dev/null --max-time 30 "https://$CERT_UPDATE_DOMAIN"; then
+    create.result 1 "https://$CERT_UPDATE_DOMAIN is not reachable"
+    return $(result)
+  fi
+
+  local notAfter notAfterEpoch nowEpoch daysLeft
+  notAfter=$(echo | openssl s_client -servername "$CERT_UPDATE_DOMAIN" -connect "$CERT_UPDATE_DOMAIN:443" 2>/dev/null \
+             | openssl x509 -noout -enddate 2>/dev/null \
+             | sed 's/notAfter=//')
+
+  if [ -z "$notAfter" ]; then
+    create.result 1 "Could not read cert expiry from https://$CERT_UPDATE_DOMAIN"
+    return $(result)
+  fi
+
+  notAfterEpoch=$(date -d "$notAfter" +%s 2>/dev/null || date -j -f "%b %e %T %Y %Z" "$notAfter" +%s 2>/dev/null)
+  nowEpoch=$(date +%s)
+  if [ -z "$notAfterEpoch" ]; then
+    create.result 1 "Could not parse cert expiry date: $notAfter"
+    return $(result)
+  fi
+  daysLeft=$(( (notAfterEpoch - nowEpoch) / 86400 ))
+
+  if [ "$daysLeft" -lt "$CERT_UPDATE_VERIFY_MIN_DAYS" ]; then
+    create.result 1 "Cert for $CERT_UPDATE_DOMAIN expires in $daysLeft days (< $CERT_UPDATE_VERIFY_MIN_DAYS)"
+  else
+    create.result 0 "https://$CERT_UPDATE_DOMAIN OK, cert expires in $daysLeft days"
+  fi
+  return $(result)
 }
 
 

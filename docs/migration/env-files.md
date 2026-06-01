@@ -2,30 +2,32 @@
 
 A reference for understanding how `~/config/user.env`, `~/config/oosh.env`, and `~/config/log.env` are generated, why the `dev` versions look the way they do, and how an older host running pre-April-2026 code differs.
 
-This document compares two ground-truth captures: the `main` branch (HEAD `c30787b`, March 2026; the same env-file generation logic lives on `test/macos.latest`) and `dev` (HEAD `beba799`, May 2026).
+This document compares two ground-truth captures: the `main` branch (HEAD `c30787b`, March 2026; the same env-file generation logic lives on `test/macos.latest`) and `dev` (current — the `user.env` capture reflects the three-line bootstrap header introduced by `9802158`/`43796be` and the `config.clean` ordering + fallback-predicate refinements that followed).
 
 ---
 
 ## What changed in one paragraph
 
-The `main` baseline persists **absolute paths captured at install time** — `CONFIG="/home/test/config/user.env"`, `OOSH_DIR="/home/test/oosh"`, `LOG_DEVICE="/dev/stdout"`, `LOGNAME="test"`, the full `PATH`. That works for a single-user Docker container but breaks the moment a real install symlinks `~/config` and `~/oosh` to a **shared directory** where multiple users source the same files: user-A's persisted `/home/A/...` becomes user-B's `EACCES`. `dev` inverts the model: per-user paths are **re-anchored at every shell init** via two self-anchor lines — `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` at the top of `user.env` and `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` at the top of `oosh.env` — and `config.save` actively **strips** the volatile absolutes (`CONFIG=`, `CONFIG_PATH=`, `OOSH_DIR=`, `LOG_LIVE=`, `LOG_DEVICE=`, `OOSH_COMPONENTS_DIR=`, `INSTALL`) so they can never leak between users. What survives the filter is portable per-install state: `OOSH_BRANCH`, `OOSH_MODE`, `OOSH_OS`, `OOSH_PM`, `OOSH_PROMPT`, `OOSH_SHLVL`, `OOSH_STATUS`, `OOSH_SSH_CONFIG_HOST`, `LOG_LEVEL`, `LOG_LEVEL_RESET`, `BASH_FILE`, `CONFIG_FILE`. Non-interactive shells (CI, `ssh exec`, completion) that don't run `this` get working defaults via the self-anchors. Brew bash on macOS gets PATH priority through a separate block at the bottom of `oosh.env`. Shared installs work without cross-user leaks, and a small `config.init.{shared,user,check,env,full}` family of repair primitives exists to recover hosts whose env files pre-date the fixes.
+The `main` baseline persists **absolute paths captured at install time** — `CONFIG="/home/test/config/user.env"`, `OOSH_DIR="/home/test/oosh"`, `LOG_DEVICE="/dev/stdout"`, `LOGNAME="test"`, the full `PATH`. That works for a single-user Docker container but breaks the moment a real install symlinks `~/config` and `~/oosh` to a **shared directory** where multiple users source the same files: user-A's persisted `/home/A/...` becomes user-B's `EACCES`. `dev` inverts the model: per-user paths are **re-anchored at every shell init** by a small self-anchoring **bootstrap header**. `user.env` now opens with three lines — `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` (derive `CONFIG_PATH` from the file's own location), `{ [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH/user.env" ]; } && CONFIG_PATH="$HOME/config"` (a fallback to the canonical `$HOME/config` whenever that derivation mis-fires), and `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` (a durable `OOSH_DIR` anchor) — while `oosh.env` mirrors the same `OOSH_DIR` anchor at its top. On top of that, `config.save` actively **strips** the volatile absolutes (`CONFIG=`, `CONFIG_PATH=`, `OOSH_DIR=`, `LOG_LIVE=`, `LOG_DEVICE=`, `OOSH_COMPONENTS_DIR=`, `INSTALL`) so they can never leak between users. What survives the filter is portable per-install state: `OOSH_BRANCH`, `OOSH_MODE`, `OOSH_OS`, `OOSH_PM`, `OOSH_PROMPT`, `OOSH_SHLVL`, `OOSH_STATUS`, `OOSH_SSH_CONFIG_HOST`, `LOG_LEVEL`, `LOG_LEVEL_RESET`, `BASH_FILE`, `CONFIG_FILE`. Non-interactive shells (CI, `ssh exec`, completion) that don't run `this` get working defaults via the self-anchors. Brew bash on macOS gets PATH priority through a separate block at the bottom of `oosh.env`. Shared installs work without cross-user leaks, and a small `config.init.{shared,user,check,env,full}` family of repair primitives exists to recover hosts whose env files pre-date the fixes.
 
-> If you only read one section of this document, read the next one. The two self-anchor lines are the centrepiece of the entire shift.
+> If you only read one section of this document, read the next one. The bootstrap-header self-anchor lines are the centrepiece of the entire shift.
 
 ---
 
-## The two self-anchor lines, line by line
+## The self-anchor lines, line by line
 
-These two lines are why everything else works. They make the env files **sourceable from anywhere** without any prior environment setup — solving the fundamental bootstrap problem of "how does a file tell you where it is without already being told where it is".
+These lines are why everything else works. They make the env files **sourceable from anywhere** without any prior environment setup — solving the fundamental bootstrap problem of "how does a file tell you where it is without already being told where it is". As of May 2026, `user.env`'s bootstrap header is **three** lines (a `CONFIG_PATH` default, a `CONFIG_PATH` fallback, and an `OOSH_DIR` anchor), and `oosh.env` carries its own mirror of the `OOSH_DIR` anchor.
 
 ### 1. `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` — top of `user.env`
 
 ```bash
 : ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}
-export BASH_FILE="/usr/bin/bash"
+{ [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH/user.env" ]; } && CONFIG_PATH="$HOME/config"
+: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}
 export CONFIG_FILE="user.env"
-source $CONFIG_PATH/log.env
+export BASH_FILE="/usr/bin/bash"
 source $CONFIG_PATH/oosh.env
+source $CONFIG_PATH/log.env
 ```
 
 Breaking the first line into pieces:
@@ -47,7 +49,32 @@ Breaking the first line into pieces:
 
 **Caveat.** `BASH_SOURCE` is a bash-specific array. A strict POSIX shell that sourced this file would see `BASH_SOURCE[0]` as unset and the self-anchor would fail. In practice this isn't an issue: the file uses `export` syntax throughout, and oosh's whole environment requires bash 4+. The first line is bash-only by design.
 
-### 2. `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` — top of `oosh.env`
+### 1b. `{ [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH/user.env" ]; } && CONFIG_PATH="$HOME/config"` — the fallback
+
+The line-1 self-anchor is *almost* enough, but `${BASH_SOURCE[0]%/*}` can still derive a wrong `CONFIG_PATH` in a few sourcing contexts. This second line is a safety net that repairs those cases before the `source $CONFIG_PATH/*.env` lines below run.
+
+Breaking it down:
+
+- **`{ … ; }`** — a brace group running in the *current* shell (no subshell). It groups the two-part OR test so the trailing `&&` binds to the **combined** condition, not just the last clause. The spaces inside the braces and the terminating `;` are required by bash syntax.
+- **`[ -z "$CONFIG_PATH" ]`** — true when the line-1 anchor produced an empty value.
+- **`[ ! -f "$CONFIG_PATH/user.env" ]`** — true when `CONFIG_PATH` is non-empty but is **not** the directory this `user.env` lives in. This is a *positive validity check*: the dir that holds the file currently being sourced must, by definition, contain a `user.env`. If it doesn't, `CONFIG_PATH` was mis-derived.
+- **`&& CONFIG_PATH="$HOME/config"`** — when either clause is true, fall back to the canonical install location.
+
+**The three failure modes it catches.** Line 1 can mis-derive `CONFIG_PATH` whenever `BASH_SOURCE[0]` isn't a clean absolute `…/config/user.env` path:
+
+| Sourcing context | `BASH_SOURCE[0]` | line-1 result | caught by |
+|---|---|---|---|
+| heredoc / `eval` | empty | `CONFIG_PATH=""` | `-z` clause |
+| bare-name (`source user.env` from cwd) | `user.env` | `CONFIG_PATH="user.env"` (`%/*` leaves it unchanged — no `/`) | `! -f` clause |
+| `source /dev/stdin <<EOF` | `/dev/stdin` | `CONFIG_PATH="/dev"` (a real dir, but holds no `user.env`) | `! -f` clause |
+
+In all three, without the fallback the next line `source $CONFIG_PATH/oosh.env` expands to `source /oosh.env`, `source user.env/oosh.env`, or `source /dev/oosh.env` — "No such file" / "Not a directory" — and the whole chain collapses.
+
+**Why a positive validity check rather than enumerating breakages.** The fallback was first added (`9802158`, 2026-05-08) with a narrower predicate that only handled the empty and bare-name cases (`[ -z … ] || [ "$CONFIG_PATH" = "${BASH_SOURCE[0]}" ]`). The `/dev/stdin` case slipped through, because `/dev` is non-empty and `≠ /dev/stdin`. The current `[ ! -f "$CONFIG_PATH/user.env" ]` form asks the one question that actually matters — *"is this the config dir?"* — so it covers every present and future mis-derivation shape while leaving a correctly-derived `CONFIG_PATH` untouched. (`73ed59b`; see the attribution table.)
+
+**Why it MUST sit above the `source` lines.** The fallback only helps if it runs *before* `source $CONFIG_PATH/oosh.env`. `config.add` runs the whole file through `config.clean` after appending each `source` line; `config.clean` historically used `sort -u`, which re-sorted the file alphabetically and pushed this line (leading `{`, a high byte) **below** the `source` lines — silently defeating it. `config.clean` now uses an order-preserving de-dup (`awk '!seen[$0]++'`) so the bootstrap header keeps the order `config.save` built. (`73ed59b`; see the attribution table.)
+
+### 2. `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` — top of `oosh.env` **and** `user.env`
 
 ```bash
 : ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}
@@ -67,9 +94,13 @@ Same `:` null command and same `${OOSH_DIR:=…}` assign-default operator as the
 
 **Why the fallback at all?** On a fresh, mid-install box `~/oosh` may not yet exist. Without the fallback, `OOSH_DIR` would be empty, and the trailing `[ -f "$OOSH_DIR/log" ] && source "$OOSH_DIR/log"` would evaluate `[ -f /log ]` and silently skip. That's fine *during* install, but the moment install completes and the user's first real shell starts, having a stale empty `OOSH_DIR` cached from the install-time source would cause confusion. The fallback ensures the value is *always* at least plausible, even on first boot.
 
+**Why this anchor now lives in `user.env` too.** Originally (`3596235`) this anchor existed only in `oosh.env`. But `oosh.env` is **volatile**: `config.save oosh OOSH` — which `oo mode <branch>` calls on every mode switch — rewrites the whole file from `declare -p` output and drops the anchor. A fresh shell started after `oo mode` (a `sudo su`, a plain `bash`, a new tmux pane) would then source an anchorless `oosh.env`, get `OOSH_DIR=""`, and its trailing `source $OOSH_DIR/log` would expand to `source /log` — cascading into "`/log`: No such file" and a dead oosh dispatch. So `43796be` (2026-05-12) added a **durable** copy of the same anchor to `user.env`'s bootstrap header. `user.env` is sourced by `bashrc` *before* `oosh.env`, and its header is only ever rewritten by a bare `config save` (never by the single-file `config save oosh OOSH`), so it survives `oo mode`. With `OOSH_DIR` already set by the time `oosh.env` is sourced, `oosh.env`'s own `${OOSH_DIR:=…}` is just a no-op second line of defence. The two copies are identical by design.
+
 ### Why the order matters
 
-Both self-anchors come **first** in their respective files, before any `export` line. That ordering is critical: the moment the parser starts evaluating the file, it needs `CONFIG_PATH` (in `user.env`) or `OOSH_DIR` (in `oosh.env`) to be set, because the next lines reference them. If the self-anchors came after the exports, those references would expand against the un-anchored values and the chain would break for non-interactive shells.
+The bootstrap header comes **first** in each file, before any `export` line, and within `user.env` the order of the three header lines is itself load-bearing: `CONFIG_PATH` default → `CONFIG_PATH` fallback → `OOSH_DIR` anchor → exports → `source` lines. The moment the parser starts evaluating the file it needs `CONFIG_PATH` (in `user.env`) or `OOSH_DIR` (in `oosh.env`) resolved, because the next lines reference them; and the fallback must repair a mis-derived `CONFIG_PATH` *before* the `source $CONFIG_PATH/*.env` lines consume it. If any header line came after the exports/sources, those references would expand against an un-anchored or broken value and the chain would break for non-interactive shells.
+
+This ordering is fragile in one specific way: `config.add` pipes the whole file through `config.clean` after appending each `source` line. `config.clean` therefore must **preserve insertion order**. It uses `awk '!seen[$0]++'` (order-preserving de-dup) rather than the historical `sort -u`, which would alphabetically reorder the header and sink the `{ … } && CONFIG_PATH=…` fallback below the `source` lines it is meant to protect.
 
 ### The whole sourcing flow
 
@@ -78,15 +109,17 @@ This is what the self-anchors are protecting. The user's `~/.bashrc` template do
 ```text
 ~/.bashrc
 └── source ~/config/user.env
-    ├── (self-anchor sets CONFIG_PATH from BASH_SOURCE[0])
-    ├── source $CONFIG_PATH/log.env       ← needs CONFIG_PATH resolved
-    └── source $CONFIG_PATH/oosh.env      ← needs CONFIG_PATH resolved
-        ├── (self-anchor sets OOSH_DIR from $HOME/oosh)
-        ├── (PATH builder block — see further down)
-        └── source $OOSH_DIR/log          ← needs OOSH_DIR resolved
+    ├── (line 1: self-anchor sets CONFIG_PATH from BASH_SOURCE[0])
+    ├── (line 2: fallback repairs CONFIG_PATH to $HOME/config if mis-derived)
+    ├── (line 3: self-anchor sets OOSH_DIR from $HOME/oosh — durable copy)
+    ├── source $CONFIG_PATH/oosh.env      ← needs CONFIG_PATH resolved
+    │   ├── (self-anchor sets OOSH_DIR — no-op, already set by user.env line 3)
+    │   ├── (PATH builder block — see further down)
+    │   └── source $OOSH_DIR/log          ← needs OOSH_DIR resolved
+    └── source $CONFIG_PATH/log.env       ← needs CONFIG_PATH resolved
 ```
 
-Each link in the chain depends on a path resolved by the previous one. The self-anchors guarantee that the FIRST file (`user.env`) can bootstrap the chain with no environment input — and the SECOND file (`oosh.env`) does the same independently, so even a script that sources `oosh.env` alone (bypassing `user.env`) still works.
+Each link in the chain depends on a path resolved by an earlier one. The bootstrap header guarantees that the FIRST file (`user.env`) can bootstrap the chain with no environment input — `CONFIG_PATH` is derived (line 1) and repaired if necessary (line 2), and `OOSH_DIR` is anchored durably (line 3) so it is already set before `oosh.env` is even sourced. The SECOND file (`oosh.env`) carries its own `OOSH_DIR` anchor too, so even a script that sources `oosh.env` alone (bypassing `user.env`) still works.
 
 ---
 
@@ -124,10 +157,12 @@ export declare OOSH_STATUS="0: started in shell level: 1"
 ```env
 # ~/config/user.env
 : ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}
-export BASH_FILE="/usr/bin/bash"
+{ [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH/user.env" ]; } && CONFIG_PATH="$HOME/config"
+: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}
 export CONFIG_FILE="user.env"
-source $CONFIG_PATH/log.env
+export BASH_FILE="/usr/bin/bash"
 source $CONFIG_PATH/oosh.env
+source $CONFIG_PATH/log.env
 
 # ~/config/log.env
 export declare LOG_LEVEL="3"
@@ -224,12 +259,16 @@ Net effect: `main`'s `log.env` had four entries, three of which leaked unrelated
 
 ## Per-difference attribution
 
-Every visible difference between the two captures, mapped to the commit that introduced it on `dev`. All 15 SHAs verified present on `origin/dev`.
+Every visible difference between the two captures, mapped to the commit that introduced it on `dev`. All SHAs are verified present on `origin/dev`; the header-order + fallback-predicate refinements landed in `73ed59b` after the last capture.
 
 | Difference | Commit | Date | Subject (verbatim) | Why |
 |---|---|---|---|---|
 | `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` self-anchor at top of `user.env` | `099bb7b` | 2026-04-27 | `fix(config.save): self-anchor user.env via ${BASH_SOURCE} so it's sourceable without CONFIG_PATH` | Non-interactive shells (CI, `ssh exec`) that don't run `this` can resolve `$CONFIG_PATH` from the file's own location. |
+| `{ … } && CONFIG_PATH="$HOME/config"` fallback line in `user.env` | `9802158` | 2026-05-08 | `fix(install): macOS post-install permission noise — sudo + dest-dir + CONFIG_PATH` | When line 1 mis-derives `CONFIG_PATH` (empty / bare-name), repair it to `$HOME/config` before the `source $CONFIG_PATH/*.env` lines run. |
+| Fallback predicate widened to positive check `[ ! -f "$CONFIG_PATH/user.env" ]` | `73ed59b` | 2026-06-01 | `fix(config): preserve user.env header order + widen CONFIG_PATH fallback` | Original predicate (`= "${BASH_SOURCE[0]}"`) missed the `source /dev/stdin` case (`CONFIG_PATH="/dev"`); the "is this the config dir?" check covers every mis-derivation. |
+| `config.clean` uses order-preserving `awk '!seen[$0]++'` instead of `sort -u` | `73ed59b` | 2026-06-01 | `fix(config): preserve user.env header order + widen CONFIG_PATH fallback` | `sort -u` re-sorted the header and sank the fallback below the `source` lines, defeating it. Order-preserving de-dup keeps the bootstrap header intact. |
 | `: ${OOSH_DIR:=…}` self-anchor at top of `oosh.env` | `3596235` | 2026-04-27 | `fix(config.save): self-anchor OOSH_DIR in oosh.env so completion works in non-this contexts` | `bashrcTemplate` sources `oosh.env` BEFORE `this` runs; completion and log loading would break without an `OOSH_DIR` fallback. |
+| Durable `: ${OOSH_DIR:=…}` self-anchor copied into `user.env` header | `43796be` | 2026-05-12 | `fix(config): OOSH_DIR self-anchor in user.env so fresh shells survive oo mode` | `config save oosh OOSH` (run by `oo mode`) rewrites `oosh.env` and drops its anchor; `user.env`'s header survives, so fresh shells after a mode switch still get `OOSH_DIR`. |
 | OOSH_DIR anchor uses `cd … && pwd -P` (resolve symlink) | `f4966bd` | 2026-04-27 | `fix(config.save): resolve $HOME/oosh symlink in OOSH_DIR self-anchor (no self-loop)` | Prevents self-referential symlinks when `bashrcTemplate` auto-syncs. |
 | `grep -v 'CONFIG='`, `'CONFIG_PATH='`, `'OOSH_DIR='`, `'OOSH_COMPONENTS_DIR='` in `config.save` | `b7f8b7c` | 2026-04-27 | `fix(config + ossh): drop persisted absolute paths; brew prereqs install bash + paths.d` | Stop leaking any one user's absolute home path into shared `user.env`. |
 | `grep -v 'LOG_DEVICE='` in `config.save` | `c0b0a35` | 2026-04-28 | `fix(config.save): filter LOG_DEVICE; oosh.env auto-sources $OOSH_DIR/log for non-bashrc contexts` | `LOG_DEVICE` is per-session; persisting one user's value pollutes others. |
@@ -258,6 +297,9 @@ Every visible difference between the two captures, mapped to the commit that int
 | Repair primitives | 2026-04-30 | `920ff00` + `0631f7e` | `config init.{shared,user,check,env,full}` — explicit one-shot repair, no implicit fixups on shell startup. |
 | Ownership debug saga (Bug 1→2→3) | 2026-05-07 → 2026-05-08 | `21e737c` → `468d5a2` → `03fe62b` | Tried to fix sudo-chain ownership inside `config.init`; broke shared dir; reverted. Recovery is now `config init.shared`. |
 | Install architecture refactor | 2026-05-08 | `014cf5d` | Minimal POSIX `init/oosh`; `ossh prereqs.install` local mode handles rsync/tree etc. |
+| `CONFIG_PATH` fallback line | 2026-05-08 | `9802158` | `user.env` repairs a mis-derived `CONFIG_PATH` to `$HOME/config` before the `source` lines run (macOS install permission-noise fix, part 3). |
+| Durable `OOSH_DIR` anchor in `user.env` | 2026-05-12 | `43796be` | Fresh shells survive `oo mode <branch>` (which rewrites `oosh.env` and drops its anchor). |
+| Fallback hardening + clean-ordering fix | 2026-06-01 | `73ed59b` | Fallback predicate widened to the positive `[ ! -f "$CONFIG_PATH/user.env" ]` check (covers `source /dev/stdin`); `config.clean` switched from `sort -u` to order-preserving de-dup so the header keeps its order. |
 
 ---
 
@@ -277,13 +319,14 @@ The older branches were never targets for these fixes — they pre-date the **sh
 
 **What about the symlink-clobber case (post-May-2026)?** Subsequent to the May-8 decision, `oo update` (`oo:191`) calls `config init.user $USER` after every successful `git pull` — an **explicit user action**, NOT shell startup. This re-applies the canonical `~/config` + `~/oosh` symlinks when out-of-band tooling (an `init/oosh` re-run from the README's curl one-liner, a manual `git clone` into `$HOME/oosh`) has clobbered them. It stays on the safe side of the May-8 anti-pattern because the user explicitly invoked `oo update`. The same primitive is reachable directly via `oo user.fix` for symlink-only repair without a pull. See [Repair toolkit](../repair-toolkit.md).
 
-**How do I verify a given host's env files are 'current'?** Three indicators:
+**How do I verify a given host's env files are 'current'?** Indicators:
 
-- `head -1 ~/config/user.env` should show `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}`.
+- `head -3 ~/config/user.env` should show the three-line bootstrap header: the `CONFIG_PATH` default, the `{ … } && CONFIG_PATH="$HOME/config"` fallback, then the `OOSH_DIR` anchor.
+- The fallback line (line 2) must appear **before** the `source $CONFIG_PATH/*.env` lines — `awk '/source \$CONFIG_PATH\//{exit} /CONFIG_PATH="\$HOME\/config"/{print "ok"}' ~/config/user.env` should print `ok`.
 - `head -1 ~/config/oosh.env` should show `: ${OOSH_DIR:="$(cd "$HOME/oosh"…`.
 - `grep CONFIG_PATH= ~/config/user.env` should return **empty** (it's filtered out).
 
-If any of those fail, the env files are from before April 27, 2026 and should be regenerated with `config init.env`.
+A host showing only a one-line header (`CONFIG_PATH` default, no fallback, no `user.env` `OOSH_DIR` anchor) pre-dates May 2026; a host whose fallback sits *below* the `source` lines pre-dates the `config.clean` ordering fix. Either way, regenerate with `config init.env`.
 
 **What about the legacy `export declare X=` malformation?** Fixed in `bf69c59` and `beba799` (May 11–12, 2026). Today's `config.save` emits clean `export X=` lines, and `config.set` normalises legacy lines on update. Existing installs heal lazily as users `config.set` things, or instantly via `config init.env`.
 
@@ -293,15 +336,17 @@ If any of those fail, the env files are from before April 27, 2026 and should be
 
 ## Files involved
 
-- `config` — `config.save` filter pipeline (L540–550), `config.get` (L868), `config.set` (L883), `config.init.{shared,user,check,env,full}` (L195–462).
+- `config` — `config.save` filter pipeline + the `user.env`/`oosh.env` bootstrap-header generation (the `echo`'d self-anchor + fallback lines), `config.clean` order-preserving de-dup (`awk '!seen[$0]++'`, NOT `sort -u`), `config.get`, `config.set`, `config.init.{shared,user,check,env,full}`.
 - `templates/user/bashrcTemplate` — the user bashrc that sources `oosh.env` first (before `this`), hence why `oosh.env` needs a self-anchor and the PATH-builder block.
 - `~/config/user.env`, `~/config/oosh.env`, `~/config/log.env` — the runtime artifacts on each install.
 
 ## Verification commands
 
 ```bash
-head -1 ~/config/user.env                                         # expect: : ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}
+head -3 ~/config/user.env                                         # expect: CONFIG_PATH default, then fallback, then OOSH_DIR anchor
 head -1 ~/config/oosh.env                                         # expect: : ${OOSH_DIR:="$(cd "$HOME/oosh"…
+grep -n 'CONFIG_PATH="$HOME/config"' ~/config/user.env            # expect: line 2 (fallback present, above the source lines)
+grep -n '^source \$CONFIG_PATH/' ~/config/user.env                # expect: line numbers GREATER than the fallback's
 grep -E '^export (declare )?CONFIG_PATH=' ~/config/user.env       # expect: empty (filtered)
 grep -E '^export (declare )?OOSH_DIR='    ~/config/oosh.env       # expect: empty (filtered)
 grep LOG_LEVEL_RESET ~/config/log.env                             # expect: present on dev, absent on main
