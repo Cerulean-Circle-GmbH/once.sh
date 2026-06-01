@@ -506,6 +506,8 @@ os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see outp
   
   if this.functionExists "$method"; then
     create.result 0 "$method" "$1"
+  elif this.functionExists "private.$method"; then
+    create.result 0 "private.$method" "$1"
   else
     create.result 1 "$method.unknown" "$1"
   fi
@@ -556,6 +558,99 @@ os.check.env() # #
 }
 
 
+# ── HOSTNAME MANAGEMENT ────────────────────────────────────────────────────────
+
+os.hostname.info() # # show hostname from all available sources
+{
+  if os.check os.hostname.info; then
+    $RESULT
+  else
+    error.log "Unsupported OS for hostname.info"
+    return 1
+  fi
+}
+
+private.os.hostname.info.darwin() # # show hostname sources on macOS
+{
+  echo -e "${BOLD_CYAN}Hostname Sources (macOS)${NORMAL}"
+  echo "  hostname cmd:    $(hostname)"
+  echo "  \$HOSTNAME env:   ${HOSTNAME:-<unset>}"
+  echo "  ComputerName:    $(scutil --get ComputerName 2>/dev/null || echo '<not set>')"
+  echo "  LocalHostName:   $(scutil --get LocalHostName 2>/dev/null || echo '<not set>')"
+  echo "  HostName:        $(scutil --get HostName 2>/dev/null || echo '<not set>')"
+}
+
+private.os.hostname.info.linux() # # show hostname sources on Linux
+{
+  echo -e "${BOLD_CYAN}Hostname Sources (Linux)${NORMAL}"
+  echo "  hostname cmd:    $(hostname)"
+  echo "  \$HOSTNAME env:   ${HOSTNAME:-<unset>}"
+  [ -f /etc/hostname ] && echo "  /etc/hostname:   $(cat /etc/hostname)"
+  command -v hostnamectl &>/dev/null && echo "  hostnamectl:     $(hostnamectl --static 2>/dev/null)"
+}
+
+os.hostname.get() # # return the effective hostname
+{
+  if os.check os.hostname.get; then
+    $RESULT
+  else
+    hostname
+  fi
+}
+
+private.os.hostname.get.darwin() # # get hostname on macOS — prefer scutil HostName, fall back to ComputerName
+{
+  local hn
+  hn=$(scutil --get HostName 2>/dev/null)
+  [ -n "$hn" ] && { echo "$hn"; return 0; }
+  hn=$(scutil --get ComputerName 2>/dev/null)
+  [ -n "$hn" ] && { echo "$hn"; return 0; }
+  hostname -s
+}
+
+private.os.hostname.get.linux() # # get hostname on Linux
+{
+  hostname -s 2>/dev/null || hostname
+}
+
+os.hostname.set() # <hostname> # set the system hostname (may require sudo)
+{
+  local newHostname="$1"
+  if [ -z "$newHostname" ]; then
+    error.log "Usage: os hostname.set <hostname>"
+    return 1
+  fi
+  if os.check os.hostname.set; then
+    $RESULT "$newHostname"
+  else
+    error.log "Unsupported OS for hostname.set"
+    return 1
+  fi
+}
+
+private.os.hostname.set.darwin() # <hostname> # set hostname on macOS via scutil
+{
+  local newHostname="$1"
+  console.log "Setting macOS hostname to: $newHostname"
+  sudo scutil --set HostName "$newHostname"
+  sudo scutil --set LocalHostName "$newHostname"
+  sudo scutil --set ComputerName "$newHostname"
+  success.log "Hostname set to: $newHostname (restart terminal to see effect)"
+}
+
+private.os.hostname.set.linux() # <hostname> # set hostname on Linux
+{
+  local newHostname="$1"
+  console.log "Setting Linux hostname to: $newHostname"
+  if command -v hostnamectl &>/dev/null; then
+    sudo hostnamectl set-hostname "$newHostname"
+  else
+    echo "$newHostname" | sudo tee /etc/hostname
+    sudo hostname "$newHostname"
+  fi
+  success.log "Hostname set to: $newHostname"
+}
+
 os.usage()
 {
   local this=${0##*/}
@@ -595,13 +690,12 @@ os.usage()
 
 os.start()
 {
-  #echo "sourcing init"
   source this
 
-  # if [ -z "$1" ]; then
-  #   status.discover "$@"
-  #   return 0
-  # fi
+  if [ -z "$1" ]; then
+    os.info
+    return 0
+  fi
 
   this.start "$@"
 }

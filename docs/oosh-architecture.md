@@ -17,8 +17,35 @@ OOSH achieves pseudo-object-oriented programming in Bash through **naming conven
 | **Instance** | The script itself when sourced or executed |
 | **Methods** | Functions named `scriptname.methodname()` |
 | **Constructor** | `scriptname.start()` entry point |
-| **Private methods** | Functions prefixed `private.` |
+| **Private methods** | `private.script.method()` — hidden from completion AND CLI |
+| **Protected methods** | `script.protected.method()` — hidden from completion, callable via CLI |
 | **Inheritance** | Sourcing other scripts to access their methods |
+
+### Method Visibility Levels
+
+| Prefix | Tab Completion | CLI Callable | Use Case |
+|--------|---------------|-------------|----------|
+| (none) | YES | YES | Public API (`hiveMind resolve`) |
+| `script.protected.method` | NO | YES | Inter-script events (`hiveMind protected.session.renamed`) |
+| `private.script.method` | NO | NO | Internal helpers (`private.hiveMind.agents.discover`) |
+
+### Completion System (Two Types)
+
+| Type | Trigger | How It Works |
+|------|---------|-------------|
+| **Method completion** | `script [Tab]` | c2 scans script for `scriptname.method()` signatures, filters out `private.`, `.protected.`, and `.completion` |
+| **Parameter completion** | `script method [Tab]` | c2 calls `scriptname.method.completion.paramName()` which returns one value per line |
+
+```bash
+# Method completion example: hiveMind [Tab]
+# c2 scans hiveMind for all public method signatures
+# Returns: resolve, send, panes, team.status, agent.monitor, ...
+
+# Parameter completion example: hiveMind resolve [Tab]
+# c2 finds hiveMind.resolve has param <agentName>
+# Calls hiveMind.resolve.completion.agentName()
+# Returns: oosh-expert, oosh-tester, scrum-master, ...
+```
 
 ### OOSH Naming Standard (MANDATORY)
 
@@ -55,7 +82,7 @@ Underscores technically work but are banned for consistency.
 # CORRECT
 odocker.file.find() # <containerOrImage> # find Dockerfile
 odocker.run() # <image> <?name> # run container
-scrumMaster.context.measure() # <agentName> <?session> # measure context
+scrumMaster.measure.context() # <agentName> <?session> # measure context
 
 # WRONG — all of these break OOSH or violate convention
 odocker.file.find() # <container-or-image> # CRASH: PARAM_container-or-image
@@ -499,7 +526,7 @@ See [docs/log.md](log.md) for complete documentation.
 
 ## Completion System
 
-Defined in `templates/user/c2.install`:
+Defined in `templates/user/2c.intsall`:
 
 ### Comment Syntax for Completion
 
@@ -593,7 +620,7 @@ $OOSH_DIR/
 └── templates/
     ├── code/         # Script templates
     └── user/
-        └── c2.install  # Completion system setup
+        └── 2c.intsall  # Completion system setup
 ```
 
 ---
@@ -642,50 +669,112 @@ echo $LOG_LEVEL
 
 ---
 
-## Cross-Platform Install Heals
+## State Correctness (Sprint 1)
 
-Two non-obvious dual-site defenses are applied during install. Both are intentional and **must not** be removed by future cleanups thinking they're redundant.
+OOSH manages a substantial cache layer (S1–S10) that mirrors live tmux/process/display truth (L1–L3). State drift between caches and ground truth is the source of many recurring bugs (ghost agents, stale sessions, "Did/you/mean" garbage). Sprint 1 added architectural prevention: event-driven mutations, ingress hardening, and a reconcile cycle that catches anything events miss.
 
-### Alpine / busybox-suid
+### Canonical references
 
-Naked alpine images ship `/bin/busybox` (which `/bin/su` symlinks to) at mode `0755`. busybox-su needs the binary suid for non-root identity switches; without it, `user login <user>` from a regular user's shell fails with `su: must be suid to work properly`. Real alpine deployments typically ship busybox suid by default — the naked image is the unusual case.
+- **[docs/state-stores.md](state-stores.md)** — S1–S10 definitions: owner script, writer method, format, mutation paths
+- **[docs/invariants.md](invariants.md)** — I1–I10 invariants: detector, severity, fix recipe, dispatch table
 
-The heal is applied at **both** install entry points:
+### Quick map
 
-| Site | Path covered | Why both |
-|---|---|---|
-| `init/oosh:171–178` | curl one-liner + drag-and-drop. Runs locally as root after `init/oosh`'s sudo re-exec. | Curl-bootstrap doesn't go through `ossh prereqs.install`. Without this site, `user login` would fail post-install on those entry paths. |
-| `ossh.prereqs.install` (ossh:2210–2217) | `ossh install <host>` (caller-driven). Runs over ssh+sudo on the remote. | The platform test exercises this path and depends on the heal happening before the `terminal` modifier drops into `bash-user`. |
+| Layer | Source of truth | Examples |
+|-------|-----------------|----------|
+| **L1** tmux | `tmux list-sessions/panes` | Sessions, windows, panes |
+| **L2** process | `ps -eo args` filtered for Claude | Live agent PIDs and UUIDs |
+| **L3** display | tmux pane titles, screen window labels | What the operator sees |
+| **S1–S10** caches | `~/config/hivemind.*.env`, `~/config/tronMonitor.env`, `~/config/otmux.*.env` | What we believe is true |
 
-Both fire under `ossh install <host>` (init/oosh runs on the remote regardless of caller). `chmod u+s` on an already-suid file is a no-op, so the idempotent overlap is intentional.
+Caches MUST converge to L1+L2+L3 via two complementary mechanisms:
 
-Verified by `T-OSSH-PREREQS-APK-BUSYBOX-SUID` (test/test.ossh) and `T-INIT-ALPINE-BUSYBOX-SUID` (test/test.install).
+### Event dispatch (primary — real-time)
 
-### `$SUDO` triple-defense
+Every state mutation emits a named event. Handlers subscribed to that event
+update their respective stores. 10 events × ~25 handlers cover the full
+lifecycle:
 
-`$SUDO` is set in **three** places, each covering a distinct code path:
+```
+agent.spawn ──emit "agent.spawned"──→ handler: registry.set (S1)
+                                    → handler: sessions.store (S2)
+team.remove ──emit "team.destroyed"─→ handler: teams.remove (S3)
+                                    → handler: tronMonitor.remove (S8)
+                                    → handler: registry.prune (S1)
+                                    → handler: sessions.prune (S2)
+                                    → handler: queue.prune (S6)
+```
 
-| Site | Path covered |
-|---|---|
-| `bashrcTemplate:21–25` | Interactive + non-interactive bash that sources bashrc (Debian's `SSH_SOURCE_BASHRC` patch covers ssh-with-command on Ubuntu/Debian/Alma). |
-| `this:51–66` | Every oosh script invocation that **didn't** go through bashrc — specifically ssh-with-command on Alpine/musl whose bash lacks the `SSH_SOURCE_BASHRC` patch. Self-heals via `id -u`. |
-| `bashrcTemplate:213–219` | PS1 conditional — *reads* `$SUDO` for prompt coloring; doesn't export. |
+**API** (in hiveMind, not a separate script):
+- `private.hiveMind.events.register <event> <handler>` — idempotent
+- `private.hiveMind.events.emit <event> <args...>` — isolated (failing handler doesn't abort siblings)
+- Handler errors logged, never block the primary mutation (Pattern P1: log+continue)
+- Bash 3.2 compatibility: events gated by `BASH_VERSINFO >= 4`; direct fallback
+  code in each mutation performs the same store updates inline
 
-Each defends a different code path; same-named variable, different sources of truth.
+Cross-script events use the existing observer pattern: `command -v peer && peer protected.<event> ... || info.log` (soft-fail, loose coupling).
 
-Verified by `T-THIS-SUDO-SELF-HEAL` (test/test.oo).
+Full event catalog: [state-stores.md § Event-driven mutation](state-stores.md).
+Per-invariant enforcement: [invariants.md § Event handler enforcement](invariants.md).
 
-### `LOG_LIVE` per-user anchor
+### Reconcile cycle (safety net — periodic)
 
-In multi-user installs (`~/config` is a shared symlink), `LOG_LIVE` must always resolve to the *current* user's `~/config/log.live.out`. See [Log System / LOG_LIVE per-user anchor](log.md) for the read+write defenses (`log:22`, `this:215–227`, `config:261`).
+`consistency.reconcile` diffs all stores against ground truth and applies
+corrections. Catches anything events missed (bash 3.2 no-op, race conditions,
+tmux kills bypassing hiveMind, operator manual edits).
+
+All three commands share the same primitive (`private.hiveMind.reconcile.diff`):
+- `consistency.audit` — read-only, graded report (CRITICAL/HIGH/MEDIUM/LOW)
+- `consistency.fix` — interactive y/N per violation
+- `consistency.reconcile` — batch (dry-run default; `apply` flag per U3 PO-lock)
+
+Called by `scrumMaster.cycle` after sweep stabilizes — never during active mutations.
+
+Full fix dispatch table: [invariants.md § Fix recipes](invariants.md).
+
+### Supporting defenses
+
+- **Ingress triple defense** (P3) — regex + delimiter-reject + existence-check on every public method accepting caller-supplied identifiers
+- **Snapshot integrity** (SC-F) — `# version: 1` header + per-row validation guards save/restore
+- **Kernel predicates** — `this.isPaneTarget`, `this.isSessionName`, `this.isRoleName`, `this.isUuid`, `this.isPipeSafe` (sibling to `this.isNumber`)
+
+### Commands at a glance
+
+```bash
+# Read-only graded audit (I1–I10) — exit code = violation count
+hiveMind consistency.audit [<?session>] [<?format:human|json>]
+
+# Interactive y/N applier
+hiveMind consistency.fix [<?session>]
+
+# Silent batch reconcile — dry-run by default per U3 PO-lock
+hiveMind consistency.reconcile [<?session>] [<?mode:dry-run|apply>]
+
+# Event introspection
+hiveMind events.list             # registered events + handler counts
+hiveMind events.history [<?N:50>] # tail event log
+```
+
+### Adding a new state-mutating method
+
+Read both docs first. Then:
+
+1. Validate identifiers at the ingress boundary — use kernel predicates `this.isPaneTarget` / `this.isSessionName` / `this.isRoleName` / `this.isUuid` / `this.isSshHost` / `this.isPipeSafe`
+2. Go through the canonical writer (`private.hiveMind.registry.set`, `private.hiveMind.session.store`, etc.) — NEVER direct-edit env files
+3. Emit the appropriate event after mutation (`private.hiveMind.events.emit`)
+4. If introducing a new invariant: add `private.hiveMind.reconcile.check.iN` + table row in `docs/invariants.md` + dispatch arm in `private.hiveMind.reconcile.apply` if auto-fixable
 
 ---
 
 ## See Also
 
 - [Wiki Index](wiki-index.md) - All documentation links
+- [State Stores](state-stores.md) - S1–S10 cache store definitions
+- [Invariants](invariants.md) - I1–I10 consistency invariants
 - [Log System](log.md) - Logging levels and functions
 - [Debug System](debug.md) - Step debugger and traps
 - [Config System](config.md) - Environment persistence
 - [OO Framework](oo.md) - Script creation
 - [State Machine](state.md) - Multi-step workflows
+- [State Stores](state-stores.md) - S1–S10 reference (Sprint 1)
+- [State Invariants](invariants.md) - I1–I10 reference (Sprint 1)

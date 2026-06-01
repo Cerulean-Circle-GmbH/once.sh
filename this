@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+
+# branch: feature/pathConfig
 # echo "entering: ${BASH_SOURCE[0]}"
 # echo "remove all echos to preseve output"
 # echo ""
@@ -7,24 +9,10 @@ export PS4='\e[90m  ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0
 if [ -n "$SH_OPT" ]; then set $SH_OPT; fi # force debug
 
 
-# Set group-writable umask for multi-user installs (detected by 'dev' group membership)
-if id -nG 2>/dev/null | grep -qw dev; then
-  umask 002
-fi
-
 if [ -z "$LOG_LEVEL" ]; then
   export LOG_LEVEL=3
-fi
-if [ -z "$LOG_DEVICE" ] || [ ! -w "$LOG_DEVICE" ] || { [ "$LOG_DEVICE" = "/dev/null" ] && [ -t 1 ]; }; then
-  if [ -t 1 ] && [ -w "$(tty 2>/dev/null)" ]; then
-    export LOG_DEVICE="$(tty)"
-  elif [ -w /proc/self/fd/1 ]; then
-    export LOG_DEVICE=/proc/self/fd/1
-  elif [ -w /dev/tty ]; then
-    export LOG_DEVICE=/dev/tty
-  else
-    export LOG_DEVICE=/dev/null
-  fi
+  export LOG_DEVICE=/dev/stdout
+  #export LOG_DEVICE=/dev/tty
 fi
 
 
@@ -38,7 +26,7 @@ fi
 
 
 if [ -z "$OOSH_DIR" ]; then
-  OOSH_DIR=$( cd "$(dirname ${BASH_SOURCE[0]})" ; pwd )
+  OOSH_DIR=$( cd "$(dirname ${BASH_SOURCE[0]})" ; pwd ) 
   if [ "$OOSH_DIR" = "." ]; then
     OOSH_DIR=$(pwd)
   fi
@@ -48,25 +36,11 @@ if [ -z "$OOSH_DIR" ]; then
   PATH="$OOSH_DIR:$PATH"
 fi
 
-# Ensure $SUDO is set for ALL oosh contexts. bashrcTemplate exports it
-# for interactive shells, but ssh-with-command (e.g. ossh exec.tty) on
-# distros without Debian's SSH_SOURCE_BASHRC bash patch (Alpine/musl)
-# won't source bashrc — leaving privileged ops like user.create's
-# `$SUDO useradd` to run unprivileged and fail with "Permission
-# denied". Self-heal here so every oosh script invocation has a
-# reliable $SUDO contract regardless of shell-startup quirks.
-# Use ${SUDO+x} to distinguish unset from explicitly-empty (root sets
-# SUDO="" intentionally; we must not clobber that).
-if [ -z "${SUDO+x}" ]; then
-  if [ "$(id -u 2>/dev/null)" = "0" ]; then
-    export SUDO=""
-  else
-    export SUDO="sudo "
-  fi
-fi
-
 info.log() {
-  [ -n "$LOG_INSTALL" ] && echo -e "INFO: ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[1]}:${LINENO} > $*" >>"$LOG_INSTALL" 2>/dev/null
+  if [ -n "$LOG_LIVE" ] \
+  && [ "$LOG_LEVEL" -gt "1" ]; then
+    echo -e "[90mINFO: ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} >$*${NORMAL}"  >>$LOG_LIVE     
+  fi
   if [ "$LOG_LEVEL" -gt "3" ]; then
     echo -e "\e[90mINFO> $*\e[0m" >>$LOG_DEVICE ## normal
   fi
@@ -76,63 +50,56 @@ this.isNumber() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
 
-private.ensure.groupWrite() { # <file...> # ensure files are group-writable (multi-user installs)
-  local f
-  for f in "$@"; do
-    chmod g+w "$f" 2>/dev/null
-    # Fix group ownership if dev group exists (multi-user installs)
-    if getent group dev >/dev/null 2>&1; then
-      chgrp dev "$f" 2>/dev/null
-    fi
-  done
+this.isEmpty() {
+  # True (rc 0) if $1 is empty or contains only whitespace (space/tab/newline).
+  # Single-source predicate for empty-payload guards (Tron P0 2026-05-12 LATE):
+  # used by otmux.send / send.smart / send.verified and hiveMind.send /
+  # send.message / agent.send to no-op rather than deliver bare prefix.
+  [[ "$1" =~ ^[[:space:]]*$ ]]
 }
 
-private.ensure.sharedTree() { # <dir> # ensure <dir> is group dev, recursively g+w; drop self-loops
-  # Used by `config init.shared` to bring a tampered sharedConfig tree back to
-  # the canonical install layout. Strict mirror of the install at oo:1462-1463
-  # (chown -R developking:dev + chmod -R g+w on $CONFIG_PATH) plus a
-  # corruption-fix that removes any self-referential symlink left over from
-  # `cp -r ~/config sharedConfig` at oo:1405 when ~/config was already a
-  # symlink at copy time.
-  #
-  # NOTE: install does NOT set SGID 2775 on these dirs — see commented-out
-  # oo:1273-1274. Group ownership is preserved at write-time by every writer
-  # calling `private.ensure.groupWrite` (this:79). Don't add SGID here.
-  #
-  # Elevation: only sudo when the caller doesn't own the target (i.e. the real
-  # `sharedConfig/` dir typically owned developking:dev). Test fixtures and
-  # caller-owned dirs use the unprivileged path — important so the test-suite
-  # can run without an interactive sudo prompt.
-  local dir="$1"
-  if [ -z "$dir" ] || [ ! -e "$dir" ]; then
-    error.log "private.ensure.sharedTree: directory missing: ${RED}$dir${NORMAL}"
-    return 1
-  fi
-  if ! getent group dev >/dev/null 2>&1; then
-    warn.log "private.ensure.sharedTree: dev group not present — skipping (single-user install)"
-    return 0
-  fi
-  local _sudo=""
-  [ ! -O "$dir" ] && _sudo="$SUDO"
+# ── SC-E.2 Ingress identifier predicates (DRY triple-defense Pattern P3) ────
+# Format validation (layer "a") for caller-supplied identifiers. Pair with
+# pipe-safe check (this.isPipeSafe) and existence check (otmux has / file
+# grep) at every public ingress per task-sc-e.1-findings.md.
 
-  # Detect & drop the known self-referential symlink (sharedConfig/sharedConfig
-  # -> .../sharedConfig). Compare readlink -f against the dir itself so we
-  # only remove true self-loops.
-  local resolvedDir
-  resolvedDir=$(readlink -f "$dir" 2>/dev/null || echo "$dir")
-  local entry
-  for entry in "$dir"/*; do
-    if [ -L "$entry" ]; then
-      local resolvedEntry
-      resolvedEntry=$(readlink -f "$entry" 2>/dev/null || echo "")
-      if [ "$resolvedEntry" = "$resolvedDir" ]; then
-        important.log "private.ensure.sharedTree: removing self-referential symlink ${YELLOW}$entry${NORMAL}"
-        $_sudo rm -f "$entry"
-      fi
-    fi
-  done
-  $_sudo chgrp -R dev "$dir" 2>/dev/null
-  $_sudo chmod -R g+w "$dir" 2>/dev/null
+this.isPaneTarget() {
+  # True if $1 is a tmux pane reference. Accepts canonical
+  # session:window.pane or raw pane id %N.
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]] || [[ "$1" =~ ^%[0-9]+$ ]]
+}
+
+this.isSessionName() {
+  # True if $1 is a valid tmux session name (alphanumeric / _ / . / -).
+  # Must start with alphanumeric or underscore (tmux convention).
+  [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]
+}
+
+this.isRoleName() {
+  # True if $1 is a plausible agent role name. Conservative bounds: starts with
+  # a letter, alphanumeric + dots/dashes/underscores, length 1..40. Rejects
+  # prompts ("Read", "You") indirectly via length, but a separate prompt-leak
+  # guard exists in private.hiveMind.live.discover for harder cases.
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9._-]{0,39}$ ]]
+}
+
+this.isUuid() {
+  # True if $1 is a canonical 36-char UUID (Claude session ids).
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+}
+
+this.isPipeSafe() {
+  # True if $1 contains no pipe, no newline. Use to reject delimiter-corrupting
+  # input before appending to env files (3-field pipe-separated rows).
+  [[ "$1" != *"|"* && "$1" != *$'\n'* ]]
+}
+
+this.isSshHost() {
+  # True if $1 is a plausible SSH config alias (alphanumeric + dots/dashes/underscores).
+  # SC-E.2 P3: prevents command injection when sshHost flows to `ssh "$host"` —
+  # rejects shell metacharacters, spaces, semicolons, backticks, $().
+  # Length capped at 64 (longest reasonable hostname or alias).
+  [[ "$1" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
 }
 
 this.functionExists() {
@@ -150,46 +117,6 @@ this.functionExists() {
   fi
 } 2>/dev/null
 
-this.methodNotFound() { # <method> <caller> # reports unknown method with suggestions
-  local method=$1
-  local caller=$2
-  local scriptPath="$This"
-
-  error.log "Method '$method' not found in $caller"
-
-  # Extract available methods using c2 pattern (inlined, no c2 dependency)
-  if [ -n "$scriptPath" ] && [ -f "$scriptPath" ]; then
-    local suggestions=""
-    local allMethods
-    allMethods=$(grep -E "^${caller}\.[^ ]*\(\) " "$scriptPath" \
-      | sed 's/().*$//' \
-      | sed "s/^${caller}\.//" \
-      | grep -v '\.completion' \
-      | grep -v '^private' \
-      | sort)
-
-    # Find prefix/substring matches
-    local match
-    while IFS= read -r match; do
-      if [ -n "$match" ] && [[ "$match" == *"$method"* || "$method" == *"$match"* ]]; then
-        if [ -n "$suggestions" ]; then
-          suggestions="$suggestions, $match"
-        else
-          suggestions="$match"
-        fi
-      fi
-    done <<< "$allMethods"
-
-    if [ -n "$suggestions" ]; then
-      error.log "  Did you mean: $suggestions"
-    else
-      error.log "  Run '$caller usage' to see available methods"
-    fi
-  fi
-
-  return 127
-}
-
 if (this.functionExists this.load); then
   info.log "this was already sourced"
   return 0
@@ -199,7 +126,7 @@ this.load() { # <aFunction> <aShellScript> # loads <aFunction> from a <aShellScr
   local aFunction=$1
   shift
   if [ -n "$1" ]; then
-    local fullQualifiedScript="$(command -v $1)"
+    local fullQualifiedScript="$(which $1)"
     local aShellScript=$(basename $1)
     shift
   else
@@ -226,7 +153,8 @@ this.load() { # <aFunction> <aShellScript> # loads <aFunction> from a <aShellScr
 
 check.debug.level() {
   if [ -n "$1" ]; then
-    log.level $1
+      echo "LOF_LEVEL is: $LOG_LEVEL ....checking for level $1"
+  #   log.level $1
   fi
 
   if [ "$LOG_LEVEL" -gt "6" ]; then
@@ -238,14 +166,16 @@ check.debug.level() {
 
   if [ "$LOG_LEVEL" -gt "5" ]; then
     export PS4='\e[90m  ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} \e[0m'
-    #set -x
+    set -x
   else
     {
+      # echo "should not debug $LOG_LEVEL ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/}"
+      #echo "check.debug.level $1=$LOG_LEVEL"
       set +x
     } 2>/dev/null
   fi
   #set -x
-} #2>/dev/null
+} # 2>/dev/null
 
 if ! [ "$(type -t debug.v)" = "function" ]; then
   #LOG_LEVEL=6
@@ -260,21 +190,7 @@ this.init() {
     info.log "inititlized"
     if [ -f "$CONFIG" ]; then
       if ! (this.isSourced); then
-        # Preserve current PATH and LOG_LIVE — config may contain stale
-        # values from a different user or install phase (e.g. root's PATH
-        # saved during install; bash-user's LOG_LIVE persisted in shared
-        # log.env after a 4-user platform-test). PATH is built dynamically
-        # by bashrcTemplate/this.path.add; LOG_LIVE is unconditionally
-        # re-anchored to the current user's home by log:22 at bashrc time
-        # — same anchor must hold across mid-session $CONFIG re-sources or
-        # console.log starts writing to another user's directory and hits
-        # "Permission denied".
-        # (Write-side complement: config:261 also filters LOG_LIVE= out of
-        # saved log.env so the value never gets persisted in the first place.)
-        local _savedPath="$PATH" _savedLogLive="$LOG_LIVE"
         source "$CONFIG"
-        export PATH="$_savedPath"
-        [ -n "$_savedLogLive" ] && export LOG_LIVE="$_savedLogLive"
       fi
     fi
     return 0
@@ -518,24 +434,6 @@ this.absolutePath()     # <?path:"."> <?option:"pipe"> echos the absolut path if
   fi
 }
 
-this.git.branch.short() # <?gitDir:$OOSH_DIR> # print the sanitised short branch name of <gitDir>'s current HEAD (strips refs/heads/, refs/remotes/origin/, heads/origin/, origin/ prefixes). Returns empty string if HEAD is detached or the dir is not a git repo.
-{
-  local dir="${1:-${OOSH_DIR:-.}}"
-  local b
-  b=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  # Degenerate branch names like `heads/origin/dev` — produced by
-  # `git worktree add <path> heads/origin/dev` or `git checkout -b origin/dev`
-  # followed by odd promotion sequences — would otherwise poison any caller
-  # that concatenates `origin/` onto the returned value (see oo:1342,
-  # init/oosh:247). Strip the known bad prefixes so downstream code can
-  # assume a bare branch name like `dev`, `testing`, `prod`.
-  b="${b#refs/heads/}"
-  b="${b#refs/remotes/origin/}"
-  b="${b#heads/origin/}"
-  b="${b#origin/}"
-  printf '%s' "$b"
-}
-
 this() {
   create.result "${0##*/}" "$1"
 }
@@ -574,16 +472,8 @@ this.call() # <aFunction> <?aShellScript> # loads <aFunction> from a <aShellScri
     #info.log "$aFunction does not exist!"
   fi
   if (this.functionExists $caller.$aFunction); then
-    # Prefer compound sub-method if it exists (e.g., oo.mode.stage over oo.mode)
-    if [ -n "$1" ] && (this.functionExists $caller.$aFunction.$1); then
-      local subMethod=$1
-      shift
-      debug.log "this.call: $caller.$aFunction.$subMethod $*"
-      $caller.$aFunction.$subMethod "$@"
-    else
-      debug.log "this.call: $caller.$aFunction $*"
-      $caller.$aFunction "$@"
-    fi
+    debug.log "this.call: $caller.$aFunction $*"
+    $caller.$aFunction "$@"
   else
     info.log "$caller.$aFunction does not exist!"
     local aShellScript=$aFunction
@@ -607,18 +497,12 @@ this.call() # <aFunction> <?aShellScript> # loads <aFunction> from a <aShellScri
       if [ -z "$aFunction" ]; then
         aFunction=usage
       fi
-      # Guard: check if aShellScript is an actual script before trying this.load
-      if [ -n "$(command -v $aShellScript 2>/dev/null)" ]; then
-        important.log "this.load: $aFunction $aShellScript"
-        if (this.load $aFunction $aShellScript "$@"); then
-          debug.log "done this.call: $aShellScript.$aFunction $*"
-        else
-          problem.log "this.load failed to load $aShellScript from \"$aFunction\": $?"
-          return 127
-        fi
+      important.log "this.load: $aFunction $aShellScript"
+      if (this.load $aFunction $aShellScript "$@"); then
+        debug.log "done this.call: $aShellScript.$aFunction $*"
+        #$aShellScript.$aFunction "$@"
       else
-        # aShellScript is not a real script — it was an unknown method name
-        this.methodNotFound "$aShellScript" "$caller"
+        problem.log "this.load faild to load $aShellScript from \"$aFunction\": $?"
         return 127
       fi
     fi
@@ -749,7 +633,7 @@ this.isSourced() {
     create.result 0 "sourced because called by $callerFunction in $caller"
     ;;
   "this.start") #started depending on command [3]
-    if [ "${1:-${FUNCNAME[3]}}" = "source" ]; then
+    if [ "${FUNCNAME[3]}" = "source" ]; then
       create.result 0 "sourced because called by $callerFunction in $caller" >/dev/null
     else
       create.result 1 "started by ${FUNCNAME[4]} in ${BASH_SOURCE[4]##*/}" >/dev/null
@@ -794,10 +678,10 @@ this.start() {
   local caller=${BASH_SOURCE[$len - 2]##*/}
   local callerFunction=${FUNCNAME[1]}
 
-  This=$(command -v $caller)
-  if (this.isSourced "${FUNCNAME[2]}"); then
+  This=$(which $caller)
+  if (this.isSourced); then
     info.log "is sourced"
-    export RESULT
+    export RESTULT
     return 0
   fi
 
@@ -846,7 +730,7 @@ this.start() {
       ;;
     restart)
       if [ -z "$BASH_FILE" ]; then
-        export BASH_FILE="$(command -v bash)"
+        export BASH_FILE="$(which bash)"
       fi
       echo "restarting $BASH_FILE: $RETURN_VALUE = $ERROR_CODE_RECONFIG"
 
@@ -972,7 +856,7 @@ else
     fi
     config ci
     if [ -z "$BASH_FILE" ]; then
-      export BASH_FILE="$(command -v bash)"
+      export BASH_FILE="$(which bash)"
       #   echo "BASH_FILE was not set"
       # else 
       #   echo "BASH_FILE is set to: $BASH_FILE"
@@ -1004,7 +888,7 @@ else
         oo state
         # HACK needed to get the package manager right for the first time
         user get home
-        # crashed the state transition.next otherwise
+        # crashed the state next otherwise 
 
 
 
@@ -1017,7 +901,7 @@ else
         continue with:
 
           state
-          state transition.next
+          state next
 
         "
     fi
