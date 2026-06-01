@@ -70,9 +70,9 @@ Breaking it down:
 
 In all three, without the fallback the next line `source $CONFIG_PATH/oosh.env` expands to `source /oosh.env`, `source user.env/oosh.env`, or `source /dev/oosh.env` — "No such file" / "Not a directory" — and the whole chain collapses.
 
-**Why a positive validity check rather than enumerating breakages.** The fallback was first added (`9802158`, 2026-05-08) with a narrower predicate that only handled the empty and bare-name cases (`[ -z … ] || [ "$CONFIG_PATH" = "${BASH_SOURCE[0]}" ]`). The `/dev/stdin` case slipped through, because `/dev` is non-empty and `≠ /dev/stdin`. The current `[ ! -f "$CONFIG_PATH/user.env" ]` form asks the one question that actually matters — *"is this the config dir?"* — so it covers every present and future mis-derivation shape while leaving a correctly-derived `CONFIG_PATH` untouched. (Working-tree refinement; see the attribution table.)
+**Why a positive validity check rather than enumerating breakages.** The fallback was first added (`9802158`, 2026-05-08) with a narrower predicate that only handled the empty and bare-name cases (`[ -z … ] || [ "$CONFIG_PATH" = "${BASH_SOURCE[0]}" ]`). The `/dev/stdin` case slipped through, because `/dev` is non-empty and `≠ /dev/stdin`. The current `[ ! -f "$CONFIG_PATH/user.env" ]` form asks the one question that actually matters — *"is this the config dir?"* — so it covers every present and future mis-derivation shape while leaving a correctly-derived `CONFIG_PATH` untouched. (`73ed59b`; see the attribution table.)
 
-**Why it MUST sit above the `source` lines.** The fallback only helps if it runs *before* `source $CONFIG_PATH/oosh.env`. `config.add` runs the whole file through `config.clean` after appending each `source` line; `config.clean` historically used `sort -u`, which re-sorted the file alphabetically and pushed this line (leading `{`, a high byte) **below** the `source` lines — silently defeating it. `config.clean` now uses an order-preserving de-dup (`awk '!seen[$0]++'`) so the bootstrap header keeps the order `config.save` built. (Working-tree refinement; see the attribution table.)
+**Why it MUST sit above the `source` lines.** The fallback only helps if it runs *before* `source $CONFIG_PATH/oosh.env`. `config.add` runs the whole file through `config.clean` after appending each `source` line; `config.clean` historically used `sort -u`, which re-sorted the file alphabetically and pushed this line (leading `{`, a high byte) **below** the `source` lines — silently defeating it. `config.clean` now uses an order-preserving de-dup (`awk '!seen[$0]++'`) so the bootstrap header keeps the order `config.save` built. (`73ed59b`; see the attribution table.)
 
 ### 2. `: ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}` — top of `oosh.env` **and** `user.env`
 
@@ -259,14 +259,14 @@ Net effect: `main`'s `log.env` had four entries, three of which leaked unrelated
 
 ## Per-difference attribution
 
-Every visible difference between the two captures, mapped to the commit that introduced it on `dev`. The committed SHAs are verified present on `origin/dev`; rows marked **working tree** are refinements applied after the last capture and not yet committed at the time of writing.
+Every visible difference between the two captures, mapped to the commit that introduced it on `dev`. All SHAs are verified present on `origin/dev`; the header-order + fallback-predicate refinements landed in `73ed59b` after the last capture.
 
 | Difference | Commit | Date | Subject (verbatim) | Why |
 |---|---|---|---|---|
 | `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}` self-anchor at top of `user.env` | `099bb7b` | 2026-04-27 | `fix(config.save): self-anchor user.env via ${BASH_SOURCE} so it's sourceable without CONFIG_PATH` | Non-interactive shells (CI, `ssh exec`) that don't run `this` can resolve `$CONFIG_PATH` from the file's own location. |
 | `{ … } && CONFIG_PATH="$HOME/config"` fallback line in `user.env` | `9802158` | 2026-05-08 | `fix(install): macOS post-install permission noise — sudo + dest-dir + CONFIG_PATH` | When line 1 mis-derives `CONFIG_PATH` (empty / bare-name), repair it to `$HOME/config` before the `source $CONFIG_PATH/*.env` lines run. |
-| Fallback predicate widened to positive check `[ ! -f "$CONFIG_PATH/user.env" ]` | **working tree** | 2026-06 | (pending) | Original predicate (`= "${BASH_SOURCE[0]}"`) missed the `source /dev/stdin` case (`CONFIG_PATH="/dev"`); the "is this the config dir?" check covers every mis-derivation. |
-| `config.clean` uses order-preserving `awk '!seen[$0]++'` instead of `sort -u` | **working tree** | 2026-06 | (pending) | `sort -u` re-sorted the header and sank the fallback below the `source` lines, defeating it. Order-preserving de-dup keeps the bootstrap header intact. |
+| Fallback predicate widened to positive check `[ ! -f "$CONFIG_PATH/user.env" ]` | `73ed59b` | 2026-06-01 | `fix(config): preserve user.env header order + widen CONFIG_PATH fallback` | Original predicate (`= "${BASH_SOURCE[0]}"`) missed the `source /dev/stdin` case (`CONFIG_PATH="/dev"`); the "is this the config dir?" check covers every mis-derivation. |
+| `config.clean` uses order-preserving `awk '!seen[$0]++'` instead of `sort -u` | `73ed59b` | 2026-06-01 | `fix(config): preserve user.env header order + widen CONFIG_PATH fallback` | `sort -u` re-sorted the header and sank the fallback below the `source` lines, defeating it. Order-preserving de-dup keeps the bootstrap header intact. |
 | `: ${OOSH_DIR:=…}` self-anchor at top of `oosh.env` | `3596235` | 2026-04-27 | `fix(config.save): self-anchor OOSH_DIR in oosh.env so completion works in non-this contexts` | `bashrcTemplate` sources `oosh.env` BEFORE `this` runs; completion and log loading would break without an `OOSH_DIR` fallback. |
 | Durable `: ${OOSH_DIR:=…}` self-anchor copied into `user.env` header | `43796be` | 2026-05-12 | `fix(config): OOSH_DIR self-anchor in user.env so fresh shells survive oo mode` | `config save oosh OOSH` (run by `oo mode`) rewrites `oosh.env` and drops its anchor; `user.env`'s header survives, so fresh shells after a mode switch still get `OOSH_DIR`. |
 | OOSH_DIR anchor uses `cd … && pwd -P` (resolve symlink) | `f4966bd` | 2026-04-27 | `fix(config.save): resolve $HOME/oosh symlink in OOSH_DIR self-anchor (no self-loop)` | Prevents self-referential symlinks when `bashrcTemplate` auto-syncs. |
@@ -299,7 +299,7 @@ Every visible difference between the two captures, mapped to the commit that int
 | Install architecture refactor | 2026-05-08 | `014cf5d` | Minimal POSIX `init/oosh`; `ossh prereqs.install` local mode handles rsync/tree etc. |
 | `CONFIG_PATH` fallback line | 2026-05-08 | `9802158` | `user.env` repairs a mis-derived `CONFIG_PATH` to `$HOME/config` before the `source` lines run (macOS install permission-noise fix, part 3). |
 | Durable `OOSH_DIR` anchor in `user.env` | 2026-05-12 | `43796be` | Fresh shells survive `oo mode <branch>` (which rewrites `oosh.env` and drops its anchor). |
-| Fallback hardening + clean-ordering fix | 2026-06 (working tree) | (pending) | Fallback predicate widened to the positive `[ ! -f "$CONFIG_PATH/user.env" ]` check (covers `source /dev/stdin`); `config.clean` switched from `sort -u` to order-preserving de-dup so the header keeps its order. |
+| Fallback hardening + clean-ordering fix | 2026-06-01 | `73ed59b` | Fallback predicate widened to the positive `[ ! -f "$CONFIG_PATH/user.env" ]` check (covers `source /dev/stdin`); `config.clean` switched from `sort -u` to order-preserving de-dup so the header keeps its order. |
 
 ---
 
