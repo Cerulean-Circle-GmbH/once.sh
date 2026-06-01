@@ -308,11 +308,11 @@ Sets config location to a different path.
 ./config location reset
 ```
 
-#### `config.ssh.set.config.host <hostname>`
+#### `config.ssh.host.set <hostname>`
 Sets the SSH config host name for prompts.
 
 ```bash
-./config ssh.set.config.host myserver
+./config ssh.host.set myserver
 ```
 
 #### `config.bash.minimal.version <version>`
