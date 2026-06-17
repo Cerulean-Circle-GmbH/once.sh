@@ -33,6 +33,9 @@ $0
       config.register  <path> registers an existing .backup.env in the tracking directory
       config.unregister <?path> removes a config from the tracking directory
       config.register.existing  scans and registers all existing .backup.env files
+      config.repair    <?configPath> scan registered configs for double-path bug and fix them
+      config.disable   <configPath> disable a registered config (renames to disabled.backup.env)
+      config.enable    <configPath> enable a disabled config (renames back to .backup.env)
 
       to               <directory> sets the backup target directory                 and saves the configuration
       from             <directory> sets the root source directroy to be backuped    and saves the configuration
@@ -42,6 +45,7 @@ $0
       full.diff        same but recursively  ${yellow}can tike some time${NORMAL}
 
       run              runs the rsync backup for the given <dir>
+      run.mv           moves files to backup target (copy + remove source + clean empty dirs)
       here             syncs current directory (auto-detects relative path from backup source)
       status           shows if a backup (rsync) is currently running
       stop             gracefully stops any running backup
@@ -122,9 +126,26 @@ backup.strategy()  # <strategy> # sets the backup strategy as one of: incrementa
   RETURN="$1"
 }
 
-backup.strategy.completion() 
+backup.strategy.help() # # shows available backup strategies and their behavior
 {
-  echo -e "full \\nincremental \\nsecureMove \\nreplaceByFolderLinks " | grep "^$1" 
+  console.log ""
+  console.log "${CYAN}  BACKUP STRATEGIES${NORMAL}"
+  console.log "${CYAN}═══════════════════════════════════════════════════════════════════${NORMAL}"
+  console.log ""
+  console.log "  ${WHITE}Strategy${NORMAL}                ${WHITE}Behavior${NORMAL}                     ${WHITE}--delete${NORMAL}"
+  console.log "  ${CYAN}───────────────────────────────────────────────────────────────${NORMAL}"
+  console.log "  ${GREEN}full${NORMAL}                    Exact mirror                     Yes — removes target files not in source"
+  console.log "  ${GREEN}incremental${NORMAL}             Additive only                    No — never deletes from target"
+  console.log "  ${GREEN}secureMove${NORMAL}              Move files                       Removes from source after copy"
+  console.log "  ${GREEN}replaceByFolderLinks${NORMAL}    Replace source with symlink      Source dir becomes link to target"
+  console.log ""
+  console.log "  Current: ${WHITE}${BACKUP_STRATEGY:-full}${NORMAL}"
+  console.log ""
+}
+
+backup.strategy.completion()
+{
+  echo -e "full \\nincremental \\nsecureMove \\nreplaceByFolderLinks " | grep "^$1"
 }
 
 backup.capture.log.mode() # <logMode> # set the log mode as one of: slient, full, screen, none
@@ -248,35 +269,45 @@ backup.config.save.completion.scope()
   echo -e "local\nglobal" | grep "^$1"
 }
 
-backup.config.create() # <?target_base:pi@pi400:/media/pi/myData/Devices/MacStudio.native> # creates config for current directory
+backup.config.create() # <?targetBase:pi@pi400:/media/pi/myData/Devices/MacStudio.native> # creates config for current directory
 {
   local current="$(pwd)"
-  local target_base="${1:-pi@pi400:/media/pi/myData/Devices/MacStudio.native}"
-  
-  # Generate target path based on current directory
-  local target_path="$target_base$current"
+  local targetBase="${1:-pi@pi400:/media/pi/myData/Devices/MacStudio.native}"
+
+  # Generate target path: remote = mirror local path on remote host, local = use as-is
+  local targetPath
+  if [[ "$targetBase" == *"@"* ]]; then
+    targetPath="$targetBase$current"
+  else
+    targetPath="$targetBase"
+  fi
   
   console.log "Creating backup config for: ${CYAN}$current${NORMAL}"
-  console.log "Target: ${CYAN}$target_path${NORMAL}"
-  
+  console.log "Target: ${CYAN}$targetPath${NORMAL}"
+
   export BACKUP_SOURCE="$current"
-  export BACKUP_TARGET="$target_path"
+  export BACKUP_TARGET="$targetPath"
   export BACKUP_STRATEGY="${BACKUP_STRATEGY:-full}"
   export BACKUP_CAPTURE_LOG_MODE="${BACKUP_CAPTURE_LOG_MODE:-full}"
-  
+
   backup.config.save local
-  
+
   # Create remote directory
-  if [[ "$target_path" == *"@"* ]]; then
-    local remote_host="${target_path%%:*}"
-    local remote_path="${target_path#*:}"
+  if [[ "$targetPath" == *"@"* ]]; then
+    local remoteHost="${targetPath%%:*}"
+    local remotePath="${targetPath#*:}"
     console.log "Creating remote directory..."
-    ssh "$remote_host" "mkdir -p '$remote_path'" 2>/dev/null && \
+    ssh "$remoteHost" "mkdir -p '$remotePath'" 2>/dev/null && \
       success.log "Remote directory created" || \
       warn.log "Could not create remote directory (may already exist)"
   fi
   
   backup.list
+}
+
+backup.config.create.completion.targetBase()
+{
+  compgen -o dirnames "$1" | grep "^$1"
 }
 
 # Naming Convention for Registered Configs:
@@ -345,6 +376,96 @@ backup.config.unregister() # <?config_path:./.backup.env> # removes a config fro
   warn.log "Config not registered: $config_path"
 }
 
+backup.config.disable() # <?configPath:here> # disable a registered config by renaming .backup.env to disabled.backup.env
+{
+  local configPath="$1"
+
+  if [ -z "$configPath" ] || [ "$configPath" = "here" ]; then
+    configPath=$(backup.config.discover)
+  fi
+
+  local dir=$(dirname "$configPath")
+  local disabledPath="$dir/disabled.backup.env"
+
+  if [ ! -f "$configPath" ]; then
+    if [ -f "$disabledPath" ]; then
+      info.log "Already disabled: $configPath"
+      return 0
+    fi
+    error.log "Config not found: $configPath"
+    return 1
+  fi
+
+  mv "$configPath" "$disabledPath"
+  success.log "Disabled: $configPath"
+}
+
+backup.config.disable.completion.configPath()
+{
+  echo "here"
+  if [ -d "$BACKUP_CONFIGS_DIR" ]; then
+    for link in "$BACKUP_CONFIGS_DIR"/*; do
+      if [ -L "$link" ]; then
+        local target=$(readlink "$link")
+        if [ -f "$target" ]; then
+          echo "$target"
+        fi
+      fi
+    done
+  fi
+}
+
+backup.config.enable() # <?configPath:here> # enable a disabled config by renaming disabled.backup.env back to .backup.env
+{
+  local configPath="$1"
+
+  if [ -z "$configPath" ] || [ "$configPath" = "here" ]; then
+    # Walk up looking for .backup.env (enabled) or disabled.backup.env
+    local dir="$(pwd)"
+    configPath=""
+    while [ "$dir" != "/" ]; do
+      if [ -f "$dir/.backup.env" ] || [ -f "$dir/disabled.backup.env" ]; then
+        configPath="$dir/.backup.env"
+        break
+      fi
+      dir="$(dirname "$dir")"
+    done
+    if [ -z "$configPath" ]; then
+      error.log "No config found walking up from $(pwd)"
+      return 1
+    fi
+  fi
+
+  # Already enabled — no-op
+  if [ -f "$configPath" ]; then
+    info.log "Already enabled: $configPath"
+    return 0
+  fi
+
+  local dir=$(dirname "$configPath")
+  local disabledPath="$dir/disabled.backup.env"
+
+  if [ ! -f "$disabledPath" ]; then
+    error.log "No disabled config found at: $disabledPath"
+    return 1
+  fi
+
+  mv "$disabledPath" "$configPath"
+  success.log "Enabled: $configPath"
+}
+
+backup.config.enable.completion.configPath()
+{
+  echo "here"
+  if [ -d "$BACKUP_CONFIGS_DIR" ]; then
+    for link in "$BACKUP_CONFIGS_DIR"/*; do
+      if [ -L "$link" ]; then
+        echo "$(readlink "$link")"
+      fi
+    done
+  fi
+}
+
 backup.config.list.all() # # lists all registered .backup.env files with their paths and targets
 {
   if [ ! -d "$BACKUP_CONFIGS_DIR" ]; then
@@ -354,6 +475,7 @@ backup.config.list.all() # # lists all registered .backup.env files with their p
   fi
   
   local count=0
+
   console.log "${CYAN}═══════════════════════════════════════════════════════════${NORMAL}"
   console.log "${CYAN}  REGISTERED BACKUP CONFIGURATIONS${NORMAL}"
   console.log "${CYAN}═══════════════════════════════════════════════════════════${NORMAL}"
@@ -364,17 +486,19 @@ backup.config.list.all() # # lists all registered .backup.env files with their p
       local target=$(readlink "$link")
       count=$((count + 1))
       
+      local dir=$(dirname "$target")
       if [ -f "$target" ]; then
-        local dir=$(dirname "$target")
         local backup_target=$(grep "BACKUP_TARGET=" "$target" | cut -d'"' -f2)
-        
-        console.log "${GREEN}[$count]${NORMAL} ${YELLOW}$dir${NORMAL}"
+        console.log "${GREEN}[$count] [enabled]${NORMAL} ${YELLOW}$dir${NORMAL}"
         console.log "    → ${CYAN}$backup_target${NORMAL}"
-        console.log ""
+      elif [ -f "$dir/disabled.backup.env" ]; then
+        local backup_target=$(grep "BACKUP_TARGET=" "$dir/disabled.backup.env" | cut -d'"' -f2)
+        console.log "${YELLOW}[$count] [disabled]${NORMAL} ${YELLOW}$dir${NORMAL}"
+        console.log "    → ${CYAN}$backup_target${NORMAL}"
       else
-        console.log "${RED}[$count]${NORMAL} ${YELLOW}$target${NORMAL} (missing!)"
-        console.log ""
+        console.log "${RED}[$count] [missing]${NORMAL} ${YELLOW}$target${NORMAL}"
       fi
+      console.log ""
     fi
   done
   
@@ -404,6 +528,127 @@ backup.config.register.existing() # # scans common locations and registers any e
   else
     success.log "Registered $found existing config(s)."
   fi
+}
+
+backup.config.repair() # <?configPath> # scan registered configs for double-path bug and fix them
+{
+  local configPath="$1"
+  local fixed=0
+  local skipped=0
+
+  if [ -n "$configPath" ]; then
+    # Fix a specific config
+    private.backup.repair.config "$configPath"
+    return $?
+  fi
+
+  # Scan all registered configs
+  if [ ! -d "$BACKUP_CONFIGS_DIR" ]; then
+    info.log "No backup configs registered."
+    return 0
+  fi
+
+  console.log "${CYAN}Scanning registered configs for double-path bug...${NORMAL}"
+  console.log ""
+
+  for link in "$BACKUP_CONFIGS_DIR"/*; do
+    if [ -L "$link" ]; then
+      local target=$(readlink "$link")
+      if [ -f "$target" ]; then
+        if private.backup.repair.config "$target"; then
+          fixed=$((fixed + 1))
+        else
+          skipped=$((skipped + 1))
+        fi
+      fi
+    fi
+  done
+
+  console.log ""
+  console.log "${CYAN}───────────────────────────────────────────────────────────${NORMAL}"
+  if [ $fixed -gt 0 ]; then
+    success.log "Repaired: $fixed config(s)"
+  fi
+  if [ $skipped -gt 0 ]; then
+    info.log "Already correct: $skipped config(s)"
+  fi
+}
+
+backup.config.repair.completion.configPath()
+{
+  # Complete with registered config paths
+  if [ -d "$BACKUP_CONFIGS_DIR" ]; then
+    for link in "$BACKUP_CONFIGS_DIR"/*; do
+      if [ -L "$link" ]; then
+        readlink "$link"
+      fi
+    done
+  fi
+}
+
+private.backup.repair.config() # <configPath> # detect and fix double-path in a single config
+{
+  local configPath="$1"
+
+  if [ ! -f "$configPath" ]; then
+    error.log "Config not found: $configPath"
+    return 1
+  fi
+
+  local backupSource=$(grep "BACKUP_SOURCE=" "$configPath" | cut -d'"' -f2)
+  local backupTarget=$(grep "BACKUP_TARGET=" "$configPath" | cut -d'"' -f2)
+
+  if [ -z "$backupSource" ] || [ -z "$backupTarget" ]; then
+    warn.log "Incomplete config (missing SOURCE or TARGET): $configPath"
+    return 1
+  fi
+
+  # Detect double-path: target contains source path appended after the base
+  local repairedTarget=""
+
+  if [[ "$backupTarget" == *"@"* ]]; then
+    # Remote target — extract host:path, check if path contains source duplicated
+    local remoteHost="${backupTarget%%:*}"
+    local remotePath="${backupTarget#*:}"
+
+    # Double-path pattern: remotePath ends with backupSource appended to a base that already contains it
+    # e.g., /Users/Shared/Workspaces/Users/Shared/Workspaces when source is /Users/Shared/Workspaces
+    if [[ "$remotePath" == *"$backupSource$backupSource"* ]]; then
+      repairedTarget="$remoteHost:${remotePath/$backupSource$backupSource/$backupSource}"
+    elif [[ "$remotePath" != *"$backupSource" ]] && [[ "$remotePath" == *"$backupSource"* ]]; then
+      # Check if source appears as a suffix after already being part of the base path
+      local withoutSuffix="${remotePath%$backupSource}"
+      if [[ "$withoutSuffix" == *"$backupSource" ]]; then
+        repairedTarget="$remoteHost:$withoutSuffix"
+      fi
+    fi
+  else
+    # Local target — check if target has source path appended
+    if [[ "$backupTarget" == *"$backupSource" ]] && [ "$backupTarget" != "$backupSource" ]; then
+      local base="${backupTarget%$backupSource}"
+      # Only repair if the base is a reasonable path (not empty)
+      if [ -n "$base" ]; then
+        repairedTarget="${base%/}"
+      fi
+    fi
+  fi
+
+  if [ -z "$repairedTarget" ]; then
+    debug.log "Config OK: $configPath"
+    return 1
+  fi
+
+  console.log "${YELLOW}Double-path detected:${NORMAL} $configPath"
+  console.log "  Before: ${RED}$backupTarget${NORMAL}"
+  console.log "  After:  ${GREEN}$repairedTarget${NORMAL}"
+
+  # Write the corrected target (delimiter is |, so escape & and | but not /)
+  local escapedOld=$(printf '%s\n' "$backupTarget" | sed 's/[&|]/\\&/g')
+  local escapedNew=$(printf '%s\n' "$repairedTarget" | sed 's/[&|]/\\&/g')
+  sed -i '' "s|BACKUP_TARGET=\"$escapedOld\"|BACKUP_TARGET=\"$escapedNew\"|" "$configPath"
+
+  success.log "Repaired: $configPath"
+  return 0
 }
 
 backup.status() # # shows if a backup (rsync) is currently running
@@ -704,53 +949,147 @@ backup.here() # # syncs current directory to backup target (auto-detects relativ
   fi
 }
 
-backup.run()  # <?dir> # backups the directroy (which you are in) to the backup location
+private.backup.rsync() # <sourcePath> <targetPath> <?extraFlags> # run rsync with logging and optional extra flags
 {
-  local source_path="$BACKUP_SOURCE"
-  local target_path="$BACKUP_TARGET"
-  
-  # If a subdirectory is specified, append it
-  if [ -n "$1" ] && [ "$1" != "." ]; then
-    source_path="$BACKUP_SOURCE/$1"
-    target_path="$BACKUP_TARGET/$1"
-  fi
-  
-  console.log "Source: $source_path"
-  console.log "Target: $target_path"
+  local sourcePath="$1"
+  local targetPath="$2"
+  local extraFlags="$3"
+
+  console.log "Source: $sourcePath"
+  console.log "Target: $targetPath"
 
   # Check if target is remote (contains @) - need to use ssh
-  local rsync_cmd="rsync -avh --progress"
+  local rsyncCmd="rsync -avh --progress --exclude .backup.env"
+  if [ -n "$extraFlags" ]; then
+    rsyncCmd="$rsyncCmd $extraFlags"
+  fi
   if [[ "$BACKUP_TARGET" == *"@"* ]]; then
-    rsync_cmd="$rsync_cmd -e ssh"
+    rsyncCmd="$rsyncCmd -e ssh"
     console.log "Using SSH for remote target"
   else
-    if ! [ -d "$target_path" ]; then
+    if ! [ -d "$targetPath" ]; then
       console.log "Creating local target directory"
-      mkdir -p "$target_path"
+      mkdir -p "$targetPath"
     fi
   fi
-  
-  console.log "Running: $rsync_cmd \"$source_path/\" \"$target_path/\""
+
+  console.log "Running: $rsyncCmd \"$sourcePath/\" \"$targetPath/\""
   console.log "Logging to: $CONFIG_PATH/result.txt and $CONFIG_PATH/error.txt"
-  
+
   # Clear previous logs
   > "$CONFIG_PATH/result.txt"
   > "$CONFIG_PATH/error.txt"
-  
+
   # Run rsync with output captured to log files
   # stdout+stderr to result.txt, stderr also to error.txt
-  $rsync_cmd "$source_path/" "$target_path/" > >(tee -a "$CONFIG_PATH/result.txt") 2> >(tee -a "$CONFIG_PATH/result.txt" "$CONFIG_PATH/error.txt" >&2)
-  
-  local exit_code=$?
-  
-  if [ $exit_code -eq 0 ]; then
-    success.log "Backup completed successfully"
+  $rsyncCmd "$sourcePath/" "$targetPath/" > >(tee -a "$CONFIG_PATH/result.txt") 2> >(tee -a "$CONFIG_PATH/result.txt" "$CONFIG_PATH/error.txt" >&2)
+
+  local exitCode=$?
+
+  if [ $exitCode -eq 0 ]; then
+    success.log "Rsync completed successfully"
   else
-    warn.log "Backup completed with errors (exit code: $exit_code)"
+    warn.log "Rsync completed with errors (exit code: $exitCode)"
     warn.log "Check errors with: backup list.errors"
   fi
-  
-  return $exit_code
+
+  return $exitCode
+}
+
+private.backup.resolve.paths() # <dir> # sets RESOLVED_SOURCE and RESOLVED_TARGET from BACKUP_SOURCE/TARGET + optional subdir
+{
+  RESOLVED_SOURCE="$BACKUP_SOURCE"
+  RESOLVED_TARGET="$BACKUP_TARGET"
+
+  if [ -n "$1" ] && [ "$1" != "." ]; then
+    RESOLVED_SOURCE="$BACKUP_SOURCE/$1"
+    RESOLVED_TARGET="$BACKUP_TARGET/$1"
+  fi
+}
+
+backup.run()  # <?dir> # backups the directroy (which you are in) to the backup location
+{
+  local strategy="${BACKUP_STRATEGY:-full}"
+
+  private.backup.resolve.paths "$1"
+  local sourcePath="$RESOLVED_SOURCE"
+  local targetPath="$RESOLVED_TARGET"
+
+  console.log "Strategy: ${WHITE}$strategy${NORMAL}"
+
+  case "$strategy" in
+    full)
+      private.backup.rsync "$sourcePath" "$targetPath" "--delete"
+      ;;
+    incremental)
+      private.backup.rsync "$sourcePath" "$targetPath"
+      ;;
+    secureMove)
+      private.backup.strategy.secureMove "$sourcePath" "$targetPath"
+      ;;
+    replaceByFolderLinks)
+      private.backup.strategy.replaceByFolderLinks "$sourcePath" "$targetPath"
+      ;;
+    *)
+      error.log "Unknown strategy: $strategy"
+      return 1
+      ;;
+  esac
+}
+
+private.backup.strategy.secureMove() # <sourcePath> <targetPath> # rsync + remove source files + clean empty dirs
+{
+  local sourcePath="$1"
+  local targetPath="$2"
+
+  private.backup.rsync "$sourcePath" "$targetPath" "--remove-source-files"
+  local exitCode=$?
+
+  if [ $exitCode -eq 0 ]; then
+    # Clean up empty directories left behind (rsync only removes files)
+    find "$sourcePath" -mindepth 1 -type d -empty -delete 2>/dev/null
+    success.log "secureMove completed — source files removed, empty dirs cleaned"
+  fi
+
+  return $exitCode
+}
+
+private.backup.strategy.replaceByFolderLinks() # <sourcePath> <targetPath> # secure move to target, then replace source with symlink
+{
+  local sourcePath="$1"
+  local targetPath="$2"
+
+  # Secure move: rsync with --remove-source-files (files only removed after successful copy)
+  private.backup.rsync "$sourcePath" "$targetPath" "--remove-source-files"
+  local exitCode=$?
+
+  if [ $exitCode -ne 0 ]; then
+    error.log "Rsync failed — will NOT replace source with symlink"
+    return $exitCode
+  fi
+
+  # Clean up empty directories left behind by rsync
+  find "$sourcePath" -mindepth 1 -type d -empty -delete 2>/dev/null
+
+  # Replace source directory with symlink to target
+  console.log "Replacing source with symlink to target..."
+  rm -rf "$sourcePath"
+  ln -s "$targetPath" "$sourcePath"
+
+  if [ -L "$sourcePath" ]; then
+    success.log "replaceByFolderLinks completed — source is now symlink to target"
+  else
+    error.log "Failed to create symlink: $sourcePath -> $targetPath"
+    return 1
+  fi
+
+  return 0
+}
+
+backup.run.mv() # <?dir> # moves files to backup target (shortcut for secureMove strategy)
+{
+  private.backup.resolve.paths "$1"
+  private.backup.strategy.secureMove "$RESOLVED_SOURCE" "$RESOLVED_TARGET"
 }
 
 backup.parameter.completion.dir() 
@@ -1060,9 +1399,12 @@ backup.list()
 }
 
 
-backup.list.config() 
+backup.list.config()
 {
-  console.log "${YELLOW}from Source: 
+  local activeConfig=$(backup.config.discover)
+  console.log "Active config: ${GREEN}$activeConfig${NORMAL}
+  "
+  console.log "${YELLOW}from Source:
   $BACKUP_SOURCE
   "
   console.log "${CYAN}to Target:

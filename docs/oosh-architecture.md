@@ -20,12 +20,209 @@ OOSH achieves pseudo-object-oriented programming in Bash through **naming conven
 | **Private methods** | Functions prefixed `private.` |
 | **Inheritance** | Sourcing other scripts to access their methods |
 
-### Method Naming Convention
+### OOSH Naming Standard (MANDATORY)
+
+**One rule: camelCase + dots. No dashes. No underscores. Everywhere.**
+
+This applies to method names, parameter names, variable names, completion
+functions, and private helpers. Dashes are a bash syntax error in identifiers.
+Underscores are banned for consistency — OOSH uses dots for hierarchy and
+camelCase for multi-word names.
+
+#### Method Names: `script.methodName`
+
+Dots separate hierarchy levels. Multi-word segments use camelCase.
 
 ```bash
-scriptname.method()           # Public API method
-scriptname.method.completion.param()  # Tab completion for param
-private.helper()              # Internal/private function
+# CORRECT
+odocker.file.find()                    # dot-separated hierarchy, camelCase
+hiveMind.team.context.status()         # deep hierarchy is fine
+scrumMaster.subscription()             # camelCase script name
+private.odocker.resolve.image()        # private prefix + dots
+
+# WRONG
+odocker.file-find()                    # dash in method name
+hive_mind.agent_status()               # underscores
+odocker.FILE.FIND()                    # uppercase segments
+```
+
+#### Parameter Names: `<camelCase>`
+
+OOSH converts `<paramName>` to bash variable `PARAM_paramName`. Dashes crash bash.
+Underscores technically work but are banned for consistency.
+
+```bash
+# CORRECT
+odocker.file.find() # <containerOrImage> # find Dockerfile
+odocker.run() # <image> <?name> # run container
+scrumMaster.measure.context() # <agentName> <?session> # measure context
+
+# WRONG — all of these break OOSH or violate convention
+odocker.file.find() # <container-or-image> # CRASH: PARAM_container-or-image
+ossh.key.create() # <ssh-dir> # CRASH: PARAM_ssh-dir
+myScript.run() # <agent_name> # BANNED: use agentName
+myScript.find() # <3letterCode> # CRASH: cannot start with number
+```
+
+#### Completion Functions: `script.method.completion.paramName`
+
+Must exactly match the parameter name from the method signature.
+
+```bash
+# CORRECT — paramName matches in signature and completion function
+odocker.file.find() # <containerOrImage> # find Dockerfile
+odocker.file.find.completion.containerOrImage() {
+  docker ps -a --format '{{.Names}}'
+  docker images --format '{{.Repository}}:{{.Tag}}'
+}
+
+# WRONG — dash in function name is invalid bash
+odocker.file.find.completion.container-or-image() { ... }
+```
+
+#### Local Variables: camelCase
+
+```bash
+# CORRECT
+local imageName wsPath totalCount
+local isActive=true
+
+# WRONG
+local image_name ws_path total_count    # underscores
+local image-name                        # bash syntax error
+```
+
+#### Summary Table
+
+| Element | Pattern | Example |
+|---------|---------|---------|
+| Script file | lowercase or camelCase | `odocker`, `scrumMaster`, `hiveMind` |
+| Public method | `script.methodName()` | `odocker.file.find()` |
+| Private method | `private.script.methodName()` | `private.odocker.resolve.image()` |
+| Parameter | `<camelCase>` | `<containerOrImage>` |
+| Completion | `script.method.completion.paramName()` | `odocker.file.find.completion.containerOrImage()` |
+| Local variable | `camelCase` | `local imageName` |
+| Environment var | `UPPER_SNAKE` (bash convention) | `ODOCKER_WORKSPACES` |
+
+**Environment variables are the one exception** — they follow standard bash
+convention (`UPPER_SNAKE_CASE`) because they interact with the shell environment.
+
+**Detection commands:**
+```bash
+# Find dashes in parameter names
+grep -E '# <[a-zA-Z0-9]*-' scriptname
+
+# Find dashes in function names
+grep -E '^[a-zA-Z].*-.*\(\)' scriptname
+
+# Find underscores in method names (excluding private. and UPPER_CASE)
+grep -E '^[a-z].*_.*\(\)' scriptname
+```
+
+### Method Structure Standard (MANDATORY)
+
+**Every public method must have: object.verb name, doc comment, typed parameters,
+and completion functions. No exceptions.**
+
+OOSH methods are self-documenting. The framework reads the method signature to
+generate help text, tab completion, and parameter validation. A method without
+its doc comment and completion function is broken — it won't appear in `this.help`
+and won't tab-complete.
+
+#### The Three Required Parts
+
+```bash
+#  1. METHOD SIGNATURE — object.verb pattern with typed params and doc comment
+#     ┌─ script name    ┌─ required param    ┌─ inline doc comment
+#     │                  │                    │
+odocker.file.find() # <containerOrImage> # find Dockerfile that built a container or image
+{                   #                    └─ description shown in this.help output
+  local input="$1"
+  # ... implementation ...
+}
+
+#  2. COMPLETION FUNCTION — one per parameter that needs tab completion
+#     Must match: script.method.completion.paramName
+#
+odocker.file.find.completion.containerOrImage() {
+  docker ps -a --format '{{.Names}}'
+  docker images --format '{{.Repository}}:{{.Tag}}'
+}
+
+#  3. (Optional params get <?name:default> syntax)
+odocker.run() # <image> <?name> # run container from image
+```
+
+#### Signature Format
+
+```
+script.method() # <required> <?optional> <?optionalWithDefault:value> # description
+```
+
+| Token | Meaning |
+|-------|---------|
+| `<param>` | Required parameter — method fails without it |
+| `<?param>` | Optional parameter — has a sensible default |
+| `<?param:default>` | Optional with explicit default shown in help |
+| `# description` | Final `#` starts the help text for `this.help` |
+
+#### Object.Verb Pattern
+
+Method names follow `object.verb` or `object.noun.verb` — the script is the
+subject, the method describes what it does to what.
+
+```bash
+# CORRECT — object.verb / object.noun.verb
+odocker.file.find()           # odocker finds a file
+hiveMind.agent.context.status()  # hiveMind reports one agent's context
+hiveMind.team.context.status()   # hiveMind reports all agents' context
+scrumMaster.velocity()        # scrumMaster reports velocity
+config.set()                  # config sets a value
+log.level()                   # log sets the level
+
+# WRONG — verb-first, unclear hierarchy, or missing verb
+find.dockerfile()             # verb-first, no script prefix
+odocker.dockerfile()          # noun without verb — what does it DO?
+odocker.do.thing()            # vague verb
+```
+
+#### Completion Function Rules
+
+1. **One completion function per completable parameter**
+2. **Name must exactly match**: `script.method.completion.paramName()`
+3. **Output**: one completion candidate per line to stdout
+4. **No-param methods**: use empty completion `script.method.completion() { :; }`
+5. **Private methods**: no completion needed (not user-facing)
+
+```bash
+# Method with two completable params — two completion functions
+odocker.run() # <image> <?name> # run container from image
+{ ... }
+odocker.run.completion.image() {
+  docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>'
+}
+# <?name> has no completion — user types it freely
+
+# No-parameter method — empty completion
+odocker.ps() # # list running containers
+{ ... }
+# No completion function needed for parameterless methods
+```
+
+#### Checklist for Every New Method
+
+- [ ] Name follows `script.verb` or `script.noun.verb` pattern
+- [ ] Signature has `# <params> # description` doc comment
+- [ ] All parameter names are camelCase (no dashes, no underscores)
+- [ ] Completion function exists for each completable parameter
+- [ ] Completion function name matches parameter name exactly
+- [ ] Method appears in `this.help` output (verify after adding)
+
+**Detection — find methods missing doc comments:**
+```bash
+# Methods without inline doc comment (missing # ... #)
+grep -E '^[a-z].*\(\)\s*$' scriptname    # no comment at all
+grep -E '^[a-z].*\(\)\s*#[^#]*$' scriptname  # only one # (missing description)
 ```
 
 ### Calling Convention
@@ -307,7 +504,7 @@ Defined in `templates/user/2c.intsall`:
 ### Comment Syntax for Completion
 
 ```bash
-# Format: # <required-param> <?optional-param> # description
+# Format: # <requiredParam> <?optionalParam> # description
 
 myScript.copy() # <source> <dest> <?flags> # copy files from source to dest
 {
