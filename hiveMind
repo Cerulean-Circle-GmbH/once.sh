@@ -7430,24 +7430,50 @@ private.hiveMind.sweep.detect() {
   trimmed=$(echo "$content" | tr -d '[:space:]')
   [ -z "$trimmed" ] && echo "unknown|none|info" && return 0
 
+  # ── LIVE TUI area FIRST — bottom 5 lines are the definitive state ─────
+  # Claude Code TUI layout (bottom of pane):
+  #   ─── role@host ──        (title bar)
+  #   ❯                       (prompt — may have typed text)
+  #   ────────────────────    (separator)
+  #   esc to interrupt        (ACTIVE — agent is working)
+  #   ⏵⏵ auto mode on · …   (IDLE — agent is waiting for input)
+  #
+  # Check the live area BEFORE scrollback. Stale scrollback (rate-limit text,
+  # "Compacted", api-error messages from prior states) caused false non-idle
+  # classifications when agents had already recovered to idle.
+  local bottom
+  bottom=$(echo "$content" | tail -n 5)
+
+  # Shell-escaped: bare $ prompt (agent left Claude Code)
+  if echo "$bottom" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
+    echo "shell-escaped|none|critical"
+    return 0
+  fi
+
+  # Active: "esc to int[errupt]" in the live area = Claude is generating/running
+  if echo "$bottom" | grep -q 'esc to int'; then
+    echo "active|none|info"
+    return 0
+  fi
+
+  # Idle: bare prompt (❯ or >) with NO "esc to interrupt" — definitive idle
+  if echo "$bottom" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
+    echo "idle|none|info"
+    return 0
+  fi
+
+  # Queued: text after prompt, not submitted (must come after idle check)
+  if echo "$bottom" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
+    echo "queued|enter|blocker"
+    return 0
+  fi
+
+  # ── Below here: bottom area was ambiguous (no clear prompt/active signal) ─
+  # Fall through to structural and scrollback checks for overlays, errors, etc.
+
   # Build a scrubbed view for substring-looking pattern checks (rate-limit,
-  # subscription-limit, crash) that tend to false-positive on source code
-  # showing the pattern string literally (comments, `grep -qE '…limit…'`
-  # regexes which match their own source). Structural checks below (menus,
-  # ❯ arrow, prompt state) keep using $content because their signals are UI
-  # shapes, not substrings, and don't collide with code.
-  # F2.1 — strip ALL common line-comment markers before substring matching.
-  # A source-code pane mentioning "rate limit" or "subscription limit" in a
-  # comment must not trigger the detector. Patterns stripped per first
-  # non-whitespace token:
-  #   #    — shell, Python, Ruby, Makefile, YAML, conf
-  #   //   — C, C++, JS, TS, Go, Rust, Java, Swift, CSS, Kotlin, Dart
-  #   --   — SQL, Haskell, Lua, Ada, Elm
-  #   /*   — C-family block comment open (single-line "/* … */" form)
-  #   *    — C-family block comment continuation line (e.g. "  * see also …")
-  #   <!-- — HTML/XML comment open
-  # Also drop shell control-flow, grep/sed/awk/echo calls (regex self-matches),
-  # and pipe continuations — unchanged from the original scrub.
+  # subscription-limit, crash) that tend to false-positive on source code.
+  # F2.1 — strip comment markers, code patterns, pipe continuations.
   local prose
   prose=$(echo "$content" \
     | grep -vE '^[[:space:]]*(#|//|--|/\*|\*[^/]|<!--)' \
@@ -7464,7 +7490,6 @@ private.hiveMind.sweep.detect() {
   fi
 
   # Git diff/status panel — needs Escape to close
-  # Note: 'files +N -N' also appears in the normal status bar — only match with Esc close
   if echo "$content" | grep -qE 'Esc close'; then
     echo "panel|escape|blocker"
     return 0
@@ -7474,17 +7499,33 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # ── Error states (most urgent first) ───────────────────────────────────
-  # These are substring matches that can collide with source-code displays,
-  # so they grep $prose (scrubbed of shell comments/code) not $content.
+  # ── Permission and confirmation prompts ────────────────────────────────
 
-  # Crash / exited: Claude Code process terminated unexpectedly
+  if echo "$content" | grep -q 'Do you want to' && \
+     echo "$content" | grep -qE '^\s*❯\s*[0-9]+\.\s*(Yes|No|Allow|Deny)'; then
+    echo "permission|enter|blocker"
+    return 0
+  fi
+
+  # ── Edit and acceptance prompts ────────────────────────────────────────
+
+  if echo "$bottom" | grep -q '⏵⏵ accept'; then
+    local edit_count
+    edit_count=$(echo "$bottom" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
+    [ -z "$edit_count" ] && edit_count=0
+    echo "accept-edits|enter|blocker|$edit_count"
+    return 0
+  fi
+
+  # ── Error states ──────────────────────────────────────────────────────
+  # Only reached when bottom area had no clear prompt. These are real
+  # blockers (agent is showing an error, not at a prompt).
+
   if echo "$prose" | grep -qiE 'claude.*exited|process.*terminated|segmentation fault|SIGKILL|SIGTERM|core dumped|fatal error'; then
     echo "crash|none|critical"
     return 0
   fi
 
-  # API error: network/server errors from Anthropic API
   if echo "$prose" | grep -qiE 'APIConnectionError|APIStatusError|ECONNREFUSED|ETIMEDOUT|502 Bad Gateway|503 Service|529 Overloaded|internal server error|network error|connection reset'; then
     local retry_detail
     retry_detail=$(echo "$prose" | grep -oiE 'retry.*(in |after )[0-9]+\s*s(ec)?' | tail -1)
@@ -7492,38 +7533,18 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # MCP connection error: MCP server connection/reconnect issues
   if echo "$prose" | grep -qiE 'MCP.*error|MCP.*disconnect|MCP.*reconnect|MCP.*timeout|MCP server.*not responding|failed to connect.*MCP'; then
     echo "mcp-error|wait|warning"
     return 0
   fi
 
-  # ── Permission and confirmation prompts ────────────────────────────────
-
-  # Permission / confirmation prompt — unified detector.
-  # All Claude Code approval dialogs share ONE invariant preamble: "Do you want to …?"
-  # (edit, proceed, continue, create, delete, run, apply, modify …). Combined with
-  # the interactive numbered menu (❯ arrow pointing at "N. Yes/No/Allow/Deny"),
-  # this reliably distinguishes a LIVE prompt from prose that mentions the words.
-  # Default action: Enter (CC pre-selects the safe affirmative option 1).
-  if echo "$content" | grep -q 'Do you want to' && \
-     echo "$content" | grep -qE '^\s*❯\s*[0-9]+\.\s*(Yes|No|Allow|Deny)'; then
-    echo "permission|enter|blocker"
-    return 0
-  fi
-
   # ── Rate and subscription limits ───────────────────────────────────────
-  # Substring matches — grep $prose (scrubbed) to avoid matching the pattern
-  # strings literally in source-code displays (hiveMind itself shows these
-  # patterns in comments and the grep regexes below self-match when visible).
 
-  # Subscription limit: quota/subscription exhausted (distinct from rate-limit)
   if echo "$prose" | grep -qiE 'subscription.*limit|daily.*limit.*reached|monthly.*limit|quota.*exhausted|billing.*limit|plan.*limit.*exceeded'; then
     echo "subscription-limit|none|critical"
     return 0
   fi
 
-  # Rate limit: temporary throttling
   if echo "$prose" | grep -qiE 'rate.limit|usage.limit|try again.*(in |later)|too many requests|throttl|request limit|capacity|overloaded.*try'; then
     local retry_time
     retry_time=$(echo "$prose" | grep -oiE '(in |after )[0-9]+ ?(sec|min|second|minute)s?' | tail -1)
@@ -7531,27 +7552,8 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # ── Edit and acceptance prompts ────────────────────────────────────────
-
-  # Accept edits prompt: ⏵⏵ accept edits on · N bash(es)
-  # F2.2 — match ONLY against the bottom 5 lines (the live status bar). Old
-  # `⏵⏵ accept` text in scrollback (e.g. agent's previous output, conversation
-  # history visible in pane) caused false positives that blocked Epic I
-  # context-aware sends to actually-idle agents. The live indicator only
-  # appears in the status bar above the prompt — never in conversation body.
-  local tail_content
-  tail_content=$(echo "$content" | tail -n 5)
-  if echo "$tail_content" | grep -q '⏵⏵ accept'; then
-    local edit_count
-    edit_count=$(echo "$tail_content" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
-    [ -z "$edit_count" ] && edit_count=0
-    echo "accept-edits|enter|blocker|$edit_count"
-    return 0
-  fi
-
   # ── Context and compact states ─────────────────────────────────────────
 
-  # Context warning: "Context left until auto-compact: N%"
   if echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
     local ctx_pct
     ctx_pct=$(echo "$content" | grep -oE 'auto-compact: [0-9]+%' | grep -oE '[0-9]+' | tail -1)
@@ -7559,7 +7561,6 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # Just compacted: "Compacted" in recent output
   if echo "$content" | grep -qiE 'Compacted|auto-compact.*completed'; then
     echo "just-compacted|none|warning"
     return 0
@@ -7567,49 +7568,12 @@ private.hiveMind.sweep.detect() {
 
   # ── UI states ──────────────────────────────────────────────────────────
 
-  # Autocomplete stuck: completion menu visible (e.g. /compact dropdown)
   if echo "$content" | grep -qE '^\s*/\w+.*─'; then
     echo "autocomplete|escape|blocker"
     return 0
   fi
 
-  # ── Live TUI area: bottom 5 lines contain title bar + prompt + status bar ──
-  # Claude Code TUI layout (bottom of pane):
-  #   ─── role@host ──        (title bar)
-  #   ❯                       (prompt — may have typed text)
-  #   ────────────────────    (separator)
-  #   esc to interrupt        (ACTIVE — agent is working)
-  #   ⏵⏵ auto mode on · …   (IDLE — agent is waiting for input)
-  # The old last_line approach got the status bar, not the prompt — broke idle detection.
-  local bottom
-  bottom=$(echo "$content" | tail -n 5)
-
-  # Shell-escaped: bare $ prompt (agent left Claude Code)
-  if echo "$bottom" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
-    echo "shell-escaped|none|critical"
-    return 0
-  fi
-
-  # Active: "esc to int[errupt]" in the live area = Claude is generating/running
-  # Status bar may truncate to "esc to int…" in narrow panes
-  if echo "$bottom" | grep -q 'esc to int'; then
-    echo "active|none|info"
-    return 0
-  fi
-
-  # Queued: text after prompt, not submitted
-  if echo "$bottom" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
-    echo "queued|enter|blocker"
-    return 0
-  fi
-
-  # Idle: prompt (❯ or >) in the bottom lines, no "esc to interrupt"
-  if echo "$bottom" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
-    echo "idle|none|info"
-    return 0
-  fi
-
-  # Unknown: can't classify from the live area
+  # Unknown: can't classify from live area or scrollback
   echo "unknown|none|info"
   return 0
 }
