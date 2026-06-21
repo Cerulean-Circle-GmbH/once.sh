@@ -36,6 +36,7 @@
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 : ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
 : ${HIVEMIND_SNAPSHOT_VERSION:=1}
+: ${HIVEMIND_STATE:=${CONFIG_PATH:-$HOME/config}/hivemind.state.env}
 : ${HIVEMIND_QUEUE_DIR:=${CONFIG_PATH:-$HOME/config}/hivemind.queue}
 : ${HIVEMIND_QUEUE_MAX_DEPTH:=50}
 : ${HIVEMIND_QUEUE_MAX_AGE_SEC:=3600}
@@ -2086,6 +2087,9 @@ private.hiveMind.agent.route() # <pane> # classify pane state → route name (in
   status="${detect%%|*}"
 
   case "$status" in
+    DURING_REWIND|MAINTENANCE|FROZEN)
+      echo "rewind-hold"
+      ;;
     idle|accept-edits)
       echo "inform"
       ;;
@@ -2096,8 +2100,6 @@ private.hiveMind.agent.route() # <pane> # classify pane state → route name (in
       echo "queue"
       ;;
     rate-limit|subscription-limit|crash|api-error|mcp-error)
-      # Critical: neither send nor remote-control fixes these. Queue for later;
-      # drain will retry once state recovers (or human intervenes).
       echo "queue"
       ;;
     ""|unknown|*)
@@ -2150,12 +2152,17 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
   route=$(private.hiveMind.agent.route "$target")
 
   case "$route" in
+    rewind-hold)
+      local overrideState
+      overrideState=$(private.hiveMind.state.get "$target")
+      warn.log "agent.send: $name is ${overrideState:-DURING_REWIND} — message held"
+      create.result 3 "rewind-hold: $name $overrideState"
+      return 3
+      ;;
     inform)
       private.hiveMind.agent.inform "$target" "$message"
       local rc=$?
       if [ $rc -eq 0 ]; then
-        # Operator-visible (console.log = level 3, default). Silent success
-        # at default level looked like "message lost" — bug report 2026-05-26.
         console.log "INFORM delivered to $name ($target)"
         create.result 0 "delivered $name $target"
         return 0
@@ -2192,6 +2199,154 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
 }
 hiveMind.agent.send.completion.agentName() {
   private.hiveMind.roles.complete
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPERATOR STATE OVERRIDE — Layer 3 on top of live detection (Layer 2)
+# Storage: hivemind.state.env — pane|STATE|timestamp|set-by
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.state.get() {
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+  [ -f "$HIVEMIND_STATE" ] || return 1
+  local val
+  val=$(grep "^${pane}|" "$HIVEMIND_STATE" 2>/dev/null | tail -1 | cut -d'|' -f2)
+  [ -n "$val" ] && echo "$val" && return 0
+  return 1
+}
+
+private.hiveMind.state.set() {
+  local pane="$1" state="$2" setBy="${3:-operator}"
+  [ -z "$pane" ] || [ -z "$state" ] && return 1
+  local ts
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  mkdir -p "$(dirname "$HIVEMIND_STATE")" 2>/dev/null
+  local tmpFile="${HIVEMIND_STATE}.tmp.$$"
+  grep -v "^${pane}|" "$HIVEMIND_STATE" 2>/dev/null > "$tmpFile" || true
+  echo "${pane}|${state}|${ts}|${setBy}" >> "$tmpFile"
+  mv "$tmpFile" "$HIVEMIND_STATE"
+}
+
+private.hiveMind.state.clear() {
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+  [ -f "$HIVEMIND_STATE" ] || return 0
+  local tmpFile="${HIVEMIND_STATE}.tmp.$$"
+  grep -v "^${pane}|" "$HIVEMIND_STATE" > "$tmpFile" 2>/dev/null || true
+  mv "$tmpFile" "$HIVEMIND_STATE"
+}
+
+hiveMind.agent.state.set() # <role> <STATE> # set operator override state for an agent
+{
+  local role="$1" state="$2"
+  if [ -z "$role" ] || [ -z "$state" ]; then
+    error.log "Usage: hiveMind agent.state.set <role> <STATE>"
+    return 1
+  fi
+  if ! this.isRoleName "$role"; then
+    error.log "agent.state.set: invalid role '$role'"
+    return 1
+  fi
+  local pane
+  pane=$(hiveMind.resolve "$role" 2>/dev/null)
+  if [ -z "$pane" ]; then
+    error.log "agent.state.set: cannot resolve role '$role'"
+    return 1
+  fi
+  local callerRole=""
+  [ -n "$TMUX_PANE" ] && callerRole=$(grep "^$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)|" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2)
+  private.hiveMind.state.set "$pane" "$state" "${callerRole:-operator}"
+  success.log "Set $role ($pane) → $state"
+}
+hiveMind.agent.state.set.completion.role() {
+  private.hiveMind.roles.complete
+}
+hiveMind.agent.state.set.completion.STATE() {
+  echo "DURING_REWIND"
+  echo "MAINTENANCE"
+  echo "FROZEN"
+}
+
+hiveMind.agent.state.clear() # <role> # clear operator override state for an agent
+{
+  local role="$1"
+  if [ -z "$role" ]; then
+    error.log "Usage: hiveMind agent.state.clear <role>"
+    return 1
+  fi
+  local pane
+  pane=$(hiveMind.resolve "$role" 2>/dev/null)
+  if [ -z "$pane" ]; then
+    error.log "agent.state.clear: cannot resolve role '$role'"
+    return 1
+  fi
+  private.hiveMind.state.clear "$pane"
+  success.log "Cleared override for $role ($pane)"
+}
+hiveMind.agent.state.clear.completion.role() {
+  private.hiveMind.roles.complete
+}
+
+hiveMind.agent.state.get() # <role> # get operator override state for an agent (empty if none)
+{
+  local role="$1"
+  [ -z "$role" ] && return 1
+  local pane
+  pane=$(hiveMind.resolve "$role" 2>/dev/null)
+  [ -z "$pane" ] && return 1
+  private.hiveMind.state.get "$pane"
+}
+hiveMind.agent.state.get.completion.role() {
+  private.hiveMind.roles.complete
+}
+
+hiveMind.team.state.set() # <session> <STATE> # set operator override for ALL agents in a session
+{
+  local session="$1" state="$2"
+  if [ -z "$session" ] || [ -z "$state" ]; then
+    error.log "Usage: hiveMind team.state.set <session> <STATE>"
+    return 1
+  fi
+  if ! this.isSessionName "$session"; then
+    error.log "team.state.set: invalid session '$session'"
+    return 1
+  fi
+  local callerRole=""
+  [ -n "$TMUX_PANE" ] && callerRole=$(grep "^$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)|" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2)
+  local count=0
+  local pane
+  while IFS= read -r pane; do
+    [ -z "$pane" ] && continue
+    private.hiveMind.state.set "$pane" "$state" "${callerRole:-operator}"
+    count=$((count + 1))
+  done < <(grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f1)
+  success.log "Set $count agents in $session → $state"
+}
+hiveMind.team.state.set.completion.session() {
+  private.hiveMind.teams.complete
+}
+hiveMind.team.state.set.completion.STATE() {
+  echo "DURING_REWIND"
+  echo "MAINTENANCE"
+  echo "FROZEN"
+}
+
+hiveMind.team.state.clear() # <session> # clear ALL operator overrides for a session
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind team.state.clear <session>"
+    return 1
+  fi
+  [ -f "$HIVEMIND_STATE" ] || return 0
+  local tmpFile="${HIVEMIND_STATE}.tmp.$$"
+  grep -v "^${session}:" "$HIVEMIND_STATE" > "$tmpFile" 2>/dev/null || true
+  mv "$tmpFile" "$HIVEMIND_STATE"
+  success.log "Cleared all overrides for $session"
+}
+hiveMind.team.state.clear.completion.session() {
+  private.hiveMind.teams.complete
 }
 
 hiveMind.agent.session.probe() # <agentName|pane> <?session> # ground-truth UUID via /status + JSONL correlation (slow ~3s)
@@ -7422,6 +7577,14 @@ private.hiveMind.sweep.detect() {
 
   local target="$1"
   [ -z "$target" ] && echo "unknown|none|info" && return 1
+
+  # Layer 3: operator override — takes precedence over live detection
+  local override
+  override=$(private.hiveMind.state.get "$target")
+  if [ -n "$override" ]; then
+    echo "${override}|none|warning|operator-set"
+    return 0
+  fi
 
   local content
   content=$(otmux pane.capture "$target" 20 2>/dev/null)
