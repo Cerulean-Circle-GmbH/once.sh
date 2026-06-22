@@ -213,7 +213,7 @@ Command line usage (space notation). Signatures from method comments:
 | Command | Signature | Description |
 |---------|-----------|-------------|
 | `state machine.list` | `<?nameFilter>` | Lists all available state machines |
-| `state of` | `<machine> <?method>` | Selects machine as current, optionally calls method |
+| `state of` | `<machine> <?method>` | Selects machine as current, optionally calls method. In the no-`<method>` form the current state id is returned via `$RESULT` / `$RETURN_VALUE` (not stdout). Sourced call (`state.of`) required to read `$RESULT` — see `create.result` in `this`. |
 | `state current` | `<?print>` | Load current state cache, print if no arg |
 | `state entry.list` | `<?machine> <listOption:all>` | Lists states |
 | `state machine.create` | `<machine> <?script>` | Creates a new state machine |

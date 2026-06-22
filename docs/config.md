@@ -56,6 +56,97 @@ Initializes the config environment. Creates `~/config/` directory if needed.
 ./config init
 ```
 
+### Repair (`config init.*`)
+
+A small family of repair primitives that brings a tampered or partially-set-up
+OOSH layout back to the canonical state produced by a fresh `init/oosh` install.
+**Fresh installs do not need these** — `init/oosh` (via `oo` state 31 and
+`user.oosh.install`) already produces the correct layout. Use these only when
+the box has been hand-edited after install (e.g. wrong symlink ownership,
+missing `dev`-group ACL on `sharedConfig/`, the self-referential
+`sharedConfig/sharedConfig` symlink, etc.) or when bringing a snapshot up to
+parity with another machine.
+
+Canonical state (what `init/oosh` produces and what these methods enforce):
+
+| Path | Owner | Mode |
+|---|---|---|
+| `~/config` symlink | `<user>:<user>` (NOT `<user>:dev`) | symlink |
+| `~/oosh` symlink   | `<user>:<user>` | symlink |
+| `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
+| files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
+| `oosh.env` | first line: `: ${OOSH_DIR:="$(cd "$HOME/oosh" …)"}` | written by `config save oosh OOSH` |
+| `user.env` | 3-line bootstrap header: `CONFIG_PATH` default, `{ … } && CONFIG_PATH="$HOME/config"` fallback, then `OOSH_DIR` anchor | written by `config save`. See [migration/env-files.md](migration/env-files.md) for the line-by-line rationale. |
+
+The four `config init.*` repair methods plus `init.full` (which composes them)
+mirror the install steps at `oo:1456` (`config save`) and `oo:1462–1463`
+(`chown -R developking:dev` + `chmod -R g+w`). They explicitly do **not** add
+SGID 2775 — the dev team rejected that approach (see `oo:1273-1274`); group
+ownership on writes is enforced by every writer calling
+`private.ensure.groupWrite` (`this:79`).
+
+#### `config.init.full [<username>]`
+Repair end-to-end: runs `config.init.shared`, then `config.init.user`, then
+`config.init.env` (only for self / root), then `config.init.check`. Defaults to
+the calling user. Idempotent.
+
+```bash
+./config init.full           # repair self
+sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_MODE for the env-regen step)
+./config init.full bob       # repair bob (sudoer caller); env-regen skipped for bob
+```
+
+#### `config.init.shared`
+Ensures the shared `sharedConfig/` directory has group `dev`, recursively
+`g+w`, and removes any self-referential symlink at
+`sharedConfig/sharedConfig`. Mirrors install at `oo:1462–1463`. Idempotent.
+
+```bash
+./config init.shared
+```
+
+#### `config.init.user [<username>]`
+Ensures `<user>`'s `~/config` and `~/oosh` symlinks point at the canonical
+shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
+`~/oosh` directories are renamed to `~/config.orig.<timestamp>` (data
+preserved, never deleted). Installs `templates/user/bashrcTemplate` if the
+OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
+backup). Adds `<user>` to group `dev` if not already a member.
+
+```bash
+./config init.user           # self
+./config init.user bob       # bob (caller must be root or sudoer)
+```
+
+#### `config.init.env`
+Regenerates `user.env`, `oosh.env`, and `log.env` by calling `config save`
+(no args) — the same flow the install uses at `oo:1456`. **Backs up
+`user.env` to `user.env.bak.<timestamp>` first** so any hand-edited
+customisations (custom non-`CONFIG_*` exports, hand-added source lines beyond
+what `config add` writes) are recoverable. Caller's shell must have `OOSH_DIR`
+and the relevant `OOSH_*`/`LOG_*` vars set — true for any normal `./config`
+invocation, but under `sudo` use `sudo -E` to preserve env.
+
+```bash
+./config init.env                 # repair self's env files
+sudo -E ./config init.env         # repair from root context (env preserved)
+```
+
+If you tampered with `oosh.env` or `user.env`, this is the canonical fix.
+After running, `./test.suite run config 1`'s T30/T31 (self-anchor checks)
+will pass.
+
+#### `config.init.check [<username>]`
+Diagnostic only — never modifies anything, always returns `0`. Reports the
+`~/config` symlink owner, the `sharedConfig/` group, presence of any
+self-referential symlink, and warns if the user is in `/etc/group`'s `dev`
+membership but the *running shell's* active group set doesn't include it (the
+classic post-install "log out fully and log back in" condition).
+
+```bash
+./config init.check
+```
+
 ### Saving Configuration
 
 #### `config.save [name] [PREFIX]`
@@ -73,10 +164,24 @@ Saves environment variables to a config file.
 ```
 
 Without parameters, saves:
-- All CONFIG_* variables
-- PATH
+- All CONFIG_* variables (except per-user dynamic paths — see *Excluded variables* below)
 - BASH_FILE
 - Then calls `config.save oosh` and `config.save log`
+
+**PATH is intentionally NOT saved** — it must be built dynamically at login by `bashrcTemplate` (`this.path.add` + `OOSH_DIR` guard). Saving root's PATH would overwrite the user's PATH in subprocesses.
+
+**Excluded variables.** `config.save` skips per-user dynamic paths so they don't leak from one user's saved config into another user's environment. The `~/config` symlink usually points at a shared location (`…sharedConfig/`), so a value written by root would otherwise be sourced verbatim by every other user — typically pointing at a path they can't access (EACCES). The exclusion list:
+
+| Variable | Why excluded | Re-derived at shell init by |
+|---|---|---|
+| `LOG_INSTALL`, `INSTALL_LOG`, etc. | Install-only state — must not persist into user sessions | (none — only set during install) |
+| `LOG_LIVE` | `~/config/log.live.out` is per-user; saving root's path EACCES-cascades | `log:21-23` (re-anchored at every bashrc) |
+| `CONFIG_PATH` | `$HOME/config` — per-user | `this:209` (`: ${CONFIG_PATH:=$HOME/config}`) |
+| `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config:183` (derived from CONFIG_PATH) |
+| `OOSH_DIR` | per-user oosh tree path | `this:40-49` (resolved from script location) |
+| `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
+
+If you add a new persisted env var that resolves to an absolute per-user path, extend the same exclusion filter at `config:265`.
 
 ### Listing Configuration
 
@@ -167,7 +272,7 @@ Convenience function that saves and adds a config.
 ### Maintenance
 
 #### `config.clean`
-Removes duplicate lines and cleans up the config file.
+Removes duplicate lines while **preserving insertion order** (`awk '!seen[$0]++'`, not `sort -u`). Order matters: the `user.env` bootstrap header — and specifically the `CONFIG_PATH` fallback — must stay above the `source $CONFIG_PATH/*.env` lines, so the file must never be alphabetically re-sorted. Called automatically by `config.add`.
 
 ```bash
 ./config clean
@@ -203,11 +308,11 @@ Sets config location to a different path.
 ./config location reset
 ```
 
-#### `config.ssh.set.config.host <hostname>`
+#### `config.ssh.host.set <hostname>`
 Sets the SSH config host name for prompts.
 
 ```bash
-./config ssh.set.config.host myserver
+./config ssh.host.set myserver
 ```
 
 #### `config.bash.minimal.version <version>`

@@ -38,12 +38,18 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [Supported Platforms](supported-platforms.md) - Platform matrix, tiers, and install requirements
 - [Branching Strategy](branching.md) - Branch naming, promotion flow, feature/hotfix conventions
 
+## Migration
+
+- [Env-file evolution](migration/env-files.md) - How `user.env` / `oosh.env` / `log.env` evolved from the `main` baseline to current `dev`, why the changes happened, and how to verify / regenerate a stale install.
+
 ## Agent Orchestration
 
 - [HiveMind](hivemind.md) - Multi-agent orchestrator for distributed task execution
+  - [UUID Tracking & Fork Lineage](hivemind.forks.md) — non-invasive session discovery, state classifier, forks.env audit log
 - `claudeFlow` - Claude Flow wrapper with hive-mind commands
 - `claudeCode` - Claude Code session management and agent support
 - `otmux` - Tmux wrapper for pane management
+  - [Clipboard — Copy/Paste in Local and Remote (SSH) Sessions](otmux.clipboard.md) — OSC 52 auto-detection
 
 ### Agent Roles (`.claude/agents/`)
 

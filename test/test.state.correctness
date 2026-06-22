@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# SC-A.3 — Invariant detection fixtures (Sprint 1 state-correctness)
+# Each fixture creates a deliberate violation, runs reconcile.diff for
+# that invariant, asserts the violation is detected at correct severity.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+source hiveMind
+
+log.level $level
+
+# ── Shared fixture setup ──────────────────────────────────────────────────
+
+CONFIG_DIR="${CONFIG_PATH:-$HOME/config}"
+FIXTURE_PREFIX="__test_sc_$$"
+TMUX_CMD="tmux -u"
+
+# Backup config files we'll pollute
+for f in hivemind.roles.env hivemind.sessions.env hivemind.teams.env; do
+  [ -f "$CONFIG_DIR/$f" ] && cp "$CONFIG_DIR/$f" "$CONFIG_DIR/${f}.sc_bak"
+done
+
+__sc_teardown() {
+  # Restore backups
+  for f in hivemind.roles.env hivemind.sessions.env hivemind.teams.env; do
+    if [ -f "$CONFIG_DIR/${f}.sc_bak" ]; then
+      mv "$CONFIG_DIR/${f}.sc_bak" "$CONFIG_DIR/$f"
+    fi
+  done
+  # Kill test sessions
+  $TMUX_CMD kill-session -t "${FIXTURE_PREFIX}_live" 2>/dev/null
+  # Clean queue files
+  rm -f "$CONFIG_DIR/hivemind.queue/${FIXTURE_PREFIX}"* 2>/dev/null
+}
+trap __sc_teardown EXIT
+
+# Create a live test session for some fixtures
+$TMUX_CMD new-session -d -s "${FIXTURE_PREFIX}_live" 2>/dev/null
+
+# ── T-SC-I1: roles.env entry for dead pane (HIGH) ────────────────────────
+
+# Inject a stale registry entry pointing to a pane that doesn't exist
+echo "${FIXTURE_PREFIX}_dead:0.99|ghost-agent" >> "$CONFIG_DIR/hivemind.roles.env"
+
+DIFF_I1=$(hiveMind.protected.reconcile.diff i1 2>/dev/null)
+
+test.case $level "T-SC-I1: detect stale role entry for dead pane (HIGH)" \
+  echo "$DIFF_I1"
+if echo "$DIFF_I1" | grep -q "HIGH|I1.*${FIXTURE_PREFIX}_dead"; then
+  expect.pass "I1 violation detected: stale role for dead pane"
+else
+  expect.fail "I1 should detect ${FIXTURE_PREFIX}_dead:0.99 as stale; got: $DIFF_I1"
+fi
+
+# ── T-SC-I2: sessions.env UUID orphan — pane not in roles.env (HIGH) ─────
+
+# Inject sessions.env entry for a pane NOT in roles.env
+echo "${FIXTURE_PREFIX}_orphan:0.88|aaaa1111-2222-3333-4444-555566667777" >> "$CONFIG_DIR/hivemind.sessions.env"
+
+DIFF_I2=$(hiveMind.protected.reconcile.diff i2 2>/dev/null)
+
+test.case $level "T-SC-I2: detect sessions.env orphan not in roles.env (HIGH)" \
+  echo "$DIFF_I2"
+if echo "$DIFF_I2" | grep -q "HIGH|I2.*${FIXTURE_PREFIX}_orphan"; then
+  expect.pass "I2 violation detected: sessions.env entry without roles.env match"
+else
+  expect.fail "I2 should detect orphan sessions.env entry; got: $DIFF_I2"
+fi
+
+# ── T-SC-I3: teams.env entry for non-existent tmux session (CRITICAL) ────
+
+# Inject a team pointing to a session that doesn't exist in tmux
+echo "${FIXTURE_PREFIX}_ghost_team|Ghost team description" >> "$CONFIG_DIR/hivemind.teams.env"
+
+DIFF_I3=$(hiveMind.protected.reconcile.diff i3 2>/dev/null)
+
+test.case $level "T-SC-I3: detect ghost team not in tmux (CRITICAL)" \
+  echo "$DIFF_I3"
+if echo "$DIFF_I3" | grep -q "CRITICAL|I3.*${FIXTURE_PREFIX}_ghost_team"; then
+  expect.pass "I3 violation detected: team has no tmux session"
+else
+  expect.fail "I3 should detect ghost team; got: $DIFF_I3"
+fi
+
+# ── T-SC-I4: tronMonitor.env entry not in teams.env (MEDIUM) ─────────────
+
+TRON_ENV="${CONFIG_DIR}/tronMonitor.env"
+# Only test if tronMonitor.env exists (may not on all machines)
+if [ -f "$TRON_ENV" ]; then
+  echo "99|${FIXTURE_PREFIX}_tron_orphan" >> "$TRON_ENV"
+
+  DIFF_I4=$(hiveMind.protected.reconcile.diff i4 2>/dev/null)
+
+  test.case $level "T-SC-I4: detect tronMonitor entry not in teams.env (MEDIUM)" \
+    echo "$DIFF_I4"
+  if echo "$DIFF_I4" | grep -q "MEDIUM|I4.*${FIXTURE_PREFIX}_tron_orphan"; then
+    expect.pass "I4 violation detected: tronMonitor entry without team"
+  else
+    expect.fail "I4 should detect orphan tronMonitor entry; got: $DIFF_I4"
+  fi
+
+  # Clean up tron entry
+  grep -v "${FIXTURE_PREFIX}_tron_orphan" "$TRON_ENV" > "${TRON_ENV}.tmp" 2>/dev/null && mv "${TRON_ENV}.tmp" "$TRON_ENV"
+else
+  test.case $level "T-SC-I4: tronMonitor orphan (skipped — no tronMonitor.env)" \
+    echo "skip"
+  expect.pass "skipped — tronMonitor.env not present"
+fi
+
+# ── T-SC-I6: queue file for dead pane (LOW) ───────────────────────────────
+
+QUEUE_DIR="$CONFIG_DIR/hivemind.queue"
+mkdir -p "$QUEUE_DIR"
+# Create a queue file for a pane that's NOT in the registry
+echo "$(date +%s)|inform|orphan message" > "$QUEUE_DIR/${FIXTURE_PREFIX}_dead_0_99.queue"
+
+DIFF_I6=$(hiveMind.protected.reconcile.diff i6 2>/dev/null)
+
+test.case $level "T-SC-I6: detect queue file for dead pane (LOW)" \
+  echo "$DIFF_I6"
+if echo "$DIFF_I6" | grep -q "LOW|I6.*${FIXTURE_PREFIX}_dead_0_99"; then
+  expect.pass "I6 violation detected: queue for dead pane"
+else
+  expect.fail "I6 should detect orphan queue; got: $DIFF_I6"
+fi
+
+# ── T-SC-AUDIT: consistency.audit returns violation count as exit code ────
+
+AUDIT_OUT=$(hiveMind.consistency.audit "" json 2>/dev/null)
+AUDIT_RC=$?
+
+test.case $level "T-SC-AUDIT: consistency.audit exit code = violation count" \
+  echo "rc=$AUDIT_RC"
+# We injected at least 3 violations (I1, I2, I3), so rc should be >= 3
+if [ "$AUDIT_RC" -ge 3 ]; then
+  expect.pass "audit exit code = $AUDIT_RC (>= 3 injected violations)"
+else
+  expect.fail "audit exit code should be >= 3 (injected I1+I2+I3); got $AUDIT_RC"
+fi
+
+# ── T-SC-SEVERITY: violations sorted CRITICAL → HIGH → MEDIUM → LOW ─────
+
+DIFF_ALL=$(hiveMind.protected.reconcile.diff all 2>/dev/null)
+
+test.case $level "T-SC-SEVERITY: violations sorted by severity" \
+  echo "checking order"
+# Extract severity column, check CRITICAL comes before HIGH comes before MEDIUM
+SEVERITIES=$(echo "$DIFF_ALL" | grep '|' | cut -d'|' -f1)
+PREV_SEV=""
+ORDER_OK="yes"
+while IFS= read -r sev; do
+  [ -z "$sev" ] && continue
+  case "$PREV_SEV" in
+    CRITICAL) [ "$sev" = "HIGH" ] || [ "$sev" = "MEDIUM" ] || [ "$sev" = "LOW" ] || [ "$sev" = "CRITICAL" ] || ORDER_OK="no" ;;
+    HIGH) [ "$sev" = "HIGH" ] || [ "$sev" = "MEDIUM" ] || [ "$sev" = "LOW" ] || ORDER_OK="no" ;;
+    MEDIUM) [ "$sev" = "MEDIUM" ] || [ "$sev" = "LOW" ] || ORDER_OK="no" ;;
+    LOW) [ "$sev" = "LOW" ] || ORDER_OK="no" ;;
+  esac
+  PREV_SEV="$sev"
+done <<< "$SEVERITIES"
+
+if [ "$ORDER_OK" = "yes" ]; then
+  expect.pass "severity order: CRITICAL → HIGH → MEDIUM → LOW"
+else
+  expect.fail "severity order violated: $SEVERITIES"
+fi
+
+# ── Cleanup ───────────────────────────────────────────────────────────────
+
+rm -f "$QUEUE_DIR/${FIXTURE_PREFIX}"*.queue 2>/dev/null
+
+test.suite.save.results

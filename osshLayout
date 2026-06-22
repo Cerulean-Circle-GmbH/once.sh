@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+osshLayout.id.from.email() # <email> # converts an email address to an oosh ssh id by lowercasing and replacing @ with .
+{
+  local email="$1"
+  if [ -z "$email" ]; then
+    error.log "usage: osshLayout id.from.email <email>"
+    return 1
+  fi
+  if ! [[ "$email" == *@* ]]; then
+    error.log "email must contain @: '$email'"
+    return 2
+  fi
+
+  local id
+  id=$(echo "$email" | tr '[:upper:]' '[:lower:]' | tr '@' '.')
+  create.result 0 "$id"
+  return 0
+}
+
+osshLayout.id.from.email.completion.email() { :; }
+
+private.osshLayout.ensure.keypair() # <sshDir> # generates id_ed25519 keypair in <sshDir> if absent
+{
+  local sshDir="$1"
+  if [ -z "$sshDir" ]; then
+    error.log "private.osshLayout.ensure.keypair: sshDir required"
+    return 1
+  fi
+  if [ ! -f "$sshDir/id_ed25519" ]; then
+    mkdir -p "$sshDir"
+    ssh-keygen -t ed25519 -f "$sshDir/id_ed25519" -N '' -q
+    create.result 0 "generated $sshDir/id_ed25519"
+  else
+    create.result 0 "$sshDir/id_ed25519 already exists"
+  fi
+}
+
+private.osshLayout.owner.email() # # resolves owner email: $USER_EMAIL > git config user.email > whoami@$OOSH_SSH_CONFIG_HOST > whoami@hostname
+{
+  local email="$USER_EMAIL"
+  if [ -z "$email" ] && command -v git >/dev/null 2>&1; then
+    email="$(git config --global user.email 2>/dev/null)"
+    [ -z "$email" ] && email="$(git config user.email 2>/dev/null)"
+  fi
+  if [ -z "$email" ]; then
+    # Prefer the OOSH alias (a meaningful name like "docker.once.ssh") over
+    # the raw OS hostname (often a random container ID). The alias is what
+    # bashrcTemplate uses for the prompt prefix, so the owner identity
+    # matches what the user sees in [oosh <alias>].
+    local host="${OOSH_SSH_CONFIG_HOST:-$(hostname)}"
+    email="$(whoami)@${host}"
+  fi
+  create.result 0 "$email"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Staged identity helpers — read /tmp/oosh.<role>.{email,id_ed25519,id_ed25519.pub}
+# placed by ossh.install (private.ossh.identity.stage) before the install
+# starts on the remote. Two role files: 'installer' (the user who triggered
+# the install) and 'outer' (the host of this environment). In os.platform.test
+# mode they hold the same bytes; in ProxyJump (future) they diverge.
+# ───────────────────────────────────────────────────────────────────────────
+
+private.osshLayout.staged.dir() # # echoes the staging directory ($OSSH_STAGE_DIR or /tmp)
+{
+  printf '%s\n' "${OSSH_STAGE_DIR:-/tmp}"
+}
+
+private.osshLayout.staged.email() # <role:installer|outer> # echoes the staged email for <role>, sets RESULT, returns 1 if not staged
+{
+  local role="$1"
+  local stageDir
+  stageDir="$(private.osshLayout.staged.dir)"
+  local emailFile="${stageDir}/oosh.${role}.email"
+  if [ ! -f "$emailFile" ]; then
+    create.result 1 ""
+    return 1
+  fi
+  local email
+  email="$(head -n1 "$emailFile" 2>/dev/null | tr -d '\r\n[:space:]')"
+  if [ -z "$email" ]; then
+    create.result 1 ""
+    return 1
+  fi
+  create.result 0 "$email"
+}
+
+private.osshLayout.staged.has.keypair() # <role:installer|outer> # returns 0 if <stageDir>/oosh.<role>.id_ed25519{,.pub} both exist (full keypair)
+{
+  local role="$1"
+  local stageDir
+  stageDir="$(private.osshLayout.staged.dir)"
+  [ -f "${stageDir}/oosh.${role}.id_ed25519" ] && [ -f "${stageDir}/oosh.${role}.id_ed25519.pub" ]
+}
+
+private.osshLayout.staged.has.pubkey() # <role:installer|outer> # returns 0 if <stageDir>/oosh.<role>.id_ed25519.pub exists
+{
+  local role="$1"
+  local stageDir
+  stageDir="$(private.osshLayout.staged.dir)"
+  [ -f "${stageDir}/oosh.${role}.id_ed25519.pub" ]
+}
+
+private.osshLayout.staged.has.privkey() # <role:installer|outer> # returns 0 if <stageDir>/oosh.<role>.id_ed25519 exists
+{
+  local role="$1"
+  local stageDir
+  stageDir="$(private.osshLayout.staged.dir)"
+  [ -f "${stageDir}/oosh.${role}.id_ed25519" ]
+}
+
+private.osshLayout.perms.tighten() # <sshDir> # apply canonical SSH perms (700 dirs, 600 privkeys, 644 pubkeys) across <sshDir>; safe to call repeatedly. Required because OpenSSH StrictModes rejects keys whose containing directory chain isn't 0700, and the role.* helpers cp keys into nested ids/ssh.*/private_key/ subdirs that default to 0755.
+{
+  local sshDir="$1"
+  [ -d "$sshDir" ] || return 0
+  chmod 700 "$sshDir" 2>/dev/null
+  [ -d "$sshDir/ids" ] && chmod 700 "$sshDir/ids" 2>/dev/null
+  local d f fmode
+  for d in "$sshDir/ids"/ssh.* "$sshDir/private_key" "$sshDir/public_keys"; do
+    [ -d "$d" ] || continue
+    chmod 700 "$d" 2>/dev/null
+    [ -d "$d/private_key" ] && chmod 700 "$d/private_key" 2>/dev/null
+    [ -d "$d/public_keys" ] && chmod 700 "$d/public_keys" 2>/dev/null
+  done
+  # Private keys → 600 (real files only; skip symlinks since chmod follows
+  # the link and would change perms of the canonical id_ed25519 — we already
+  # set those at the call site with chmod 600 on the source file).
+  for f in "$sshDir"/id_ed25519 "$sshDir"/id_rsa \
+           "$sshDir/ids"/ssh.*/id_ed25519 "$sshDir/ids"/ssh.*/id_rsa \
+           "$sshDir"/private_key/* "$sshDir/ids"/ssh.*/private_key/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] && chmod 600 "$f" 2>/dev/null
+  done
+  # Public keys → 644 (real files only; same symlink reasoning)
+  for f in "$sshDir"/*.pub "$sshDir/ids"/ssh.*/*.pub \
+           "$sshDir"/public_keys/* "$sshDir/ids"/ssh.*/public_keys/*; do
+    [ -f "$f" ] && [ ! -L "$f" ] && chmod 644 "$f" 2>/dev/null
+  done
+  return 0
+}
+
+osshLayout.role.owner() # <?sshDir:~/.ssh> # ensures owner keypair exists and creates ssh.<owner-id>.{private_key,public_key} files (real copies, mode 600/644)
+{
+  local sshDir="${1:-$HOME/.ssh}"
+
+  private.osshLayout.owner.email
+  local ownerEmail="$RESULT"
+
+  osshLayout.id.from.email "$ownerEmail"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.role.owner: could not derive id from '$ownerEmail'"
+    return 1
+  fi
+  local ownerId="$RESULT"
+
+  private.osshLayout.ensure.keypair "$sshDir"
+
+  mkdir -p "$sshDir/private_key" "$sshDir/public_keys"
+  # Real copies (not symlinks) — boss preference + eliminates fragile relative
+  # paths. Each file is self-contained: deleting the canonical id_ed25519
+  # doesn't break the aliases. Install rebuilds the layout from scratch so
+  # "edit once, propagate" doesn't matter here.
+  #
+  # rm -f before cp: if the destination is already a symlink back to the
+  # source (the pre-Phase-2 layout), cp would refuse with "are the same
+  # file". The rm forces cp to write a real file. Idempotent on the
+  # already-canonical case too (rm -f on a real file followed by cp).
+  rm -f "$sshDir/private_key/ssh.${ownerId}.private_key"
+  rm -f "$sshDir/public_keys/ssh.${ownerId}.public_key"
+  cp "$sshDir/id_ed25519"     "$sshDir/private_key/ssh.${ownerId}.private_key"
+  cp "$sshDir/id_ed25519.pub" "$sshDir/public_keys/ssh.${ownerId}.public_key"
+
+  # Prune legacy entries left by user.init (which copies id_ed25519 into
+  # private_key/<USER>.<hostname>.private_key with no ssh. prefix). The spec
+  # says private_key/ holds exactly the owner's symlink.
+  local privSym="ssh.${ownerId}.private_key"
+  local pubSym="ssh.${ownerId}.public_key"
+  local f
+  for f in "$sshDir/private_key"/*; do
+    [ -e "$f" ] || continue
+    [ "$(basename "$f")" = "$privSym" ] && continue
+    rm -f "$f"
+  done
+
+  # In public_keys/ only prune byte-for-byte duplicates of id_ed25519.pub
+  # (the misnamed owner pubkey). Peer pubkeys have different content and
+  # remain untouched.
+  for f in "$sshDir/public_keys"/*; do
+    [ -e "$f" ] || continue
+    [ -L "$f" ] && continue
+    [ "$(basename "$f")" = "$pubSym" ] && continue
+    if cmp -s "$f" "$sshDir/id_ed25519.pub" 2>/dev/null; then
+      rm -f "$f"
+    fi
+  done
+
+  console.log "owner: ssh.${ownerId} -> id_ed25519 in $sshDir"
+  create.result 0 "ssh.${ownerId}"
+}
+
+osshLayout.role.owner.completion.sshDir() { :; }
+
+osshLayout.role.developking() # <?sshDir:~/.ssh> # deploys the developking identity bundle from templates/user/developking.ssh/ into <sshDir>/ids/ssh.developking/
+{
+  local sshDir="${1:-$HOME/.ssh}"
+  local src="$OOSH_DIR/templates/user/developking.ssh"
+  local dst="$sshDir/ids/ssh.developking"
+
+  if [ ! -d "$src" ]; then
+    error.log "osshLayout.role.developking: template not found at $src"
+    return 1
+  fi
+
+  mkdir -p "$dst"
+  cp -R "$src/." "$dst/"
+
+  console.log "developking: deployed to $dst"
+  create.result 0 "ssh.developking"
+}
+
+osshLayout.role.developking.completion.sshDir() { :; }
+
+osshLayout.role.installer() # <?installerEmail> <?keypairSourceDir> <?sshDir:~/.ssh> # copies installer keypair into <sshDir>/ids/ssh.<installer-id>/; with no args reads from /tmp/oosh.installer.* (staged by ossh.install) or discovers an existing installer dir under <sshDir>/ids/
+{
+  local email="$1"
+  local sourceDir="$2"
+  local sshDir="${3:-$HOME/.ssh}"
+  local stagedKeyFile=""
+
+  # Repair-mode tolerance: if no email arg + nothing staged, discover an
+  # existing installer dir under <sshDir>/ids/. Exactly one non-role dir
+  # (i.e. not ssh.developking / ssh.outeruser) with a keypair == the
+  # installer. Re-normalise the dir's private_key/ + public_keys/ entries
+  # to real files (replacing any forbidden symlinks), then return.
+  if [ -z "$email" ] && ! private.osshLayout.staged.has.keypair installer; then
+    local _d _candidates=()
+    for _d in "$sshDir/ids/ssh."*/; do
+      [ -d "$_d" ] || continue
+      local _name="${_d%/}"; _name="${_name##*/}"
+      case "$_name" in ssh.developking|ssh.outeruser) continue ;; esac
+      [ -f "$_d/id_ed25519" ] || [ -f "$_d/id_rsa" ] || continue
+      _candidates+=("$_name")
+    done
+    if [ "${#_candidates[@]}" -eq 1 ]; then
+      local _existing="${_candidates[0]}"
+      local _existingId="${_existing#ssh.}"
+      local _existingDir="$sshDir/ids/$_existing"
+      # Determine which keypair type lives in the dir (ed25519 or rsa).
+      local _priv _pub
+      if [ -f "$_existingDir/id_ed25519" ]; then
+        _priv="$_existingDir/id_ed25519"; _pub="$_existingDir/id_ed25519.pub"
+      else
+        _priv="$_existingDir/id_rsa"; _pub="$_existingDir/id_rsa.pub"
+      fi
+      # Normalize: replace any pre-existing symlinks at the canonical names
+      # with real-file copies. rm -f before cp so cp can't refuse with
+      # "are the same file" when the dest is a symlink to the source.
+      mkdir -p "$_existingDir/private_key" "$_existingDir/public_keys"
+      rm -f "$_existingDir/private_key/ssh.${_existingId}.private_key"
+      rm -f "$_existingDir/public_keys/ssh.${_existingId}.public_key"
+      [ -f "$_priv" ] && cp "$_priv" "$_existingDir/private_key/ssh.${_existingId}.private_key"
+      [ -f "$_pub" ]  && cp "$_pub"  "$_existingDir/public_keys/ssh.${_existingId}.public_key"
+      important.log "osshLayout.role.installer: existing $_existing normalised at $_existingDir — repair-mode"
+      create.result 0 "$_existing"
+      return 0
+    fi
+  fi
+
+  # No-args path: resolve from staged /tmp/oosh.installer.*
+  if [ -z "$email" ]; then
+    private.osshLayout.staged.email installer
+    if [ "$RETURN_VALUE" -ne 0 ]; then
+      error.log "osshLayout.role.installer: no email arg and no /tmp/oosh.installer.email staged"
+      return 1
+    fi
+    email="$RESULT"
+  fi
+  if [ -z "$sourceDir" ]; then
+    if private.osshLayout.staged.has.keypair installer; then
+      stagedKeyFile="$(private.osshLayout.staged.dir)/oosh.installer.id_ed25519"
+    else
+      sourceDir="$HOME/.ssh"
+    fi
+  fi
+
+  osshLayout.id.from.email "$email"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    return 1
+  fi
+  local id="$RESULT"
+
+  local privSrc pubSrc privFile pubFile
+  if [ -n "$stagedKeyFile" ]; then
+    privSrc="$stagedKeyFile"
+    pubSrc="${stagedKeyFile}.pub"
+    privFile="id_ed25519"
+    pubFile="id_ed25519.pub"
+  elif [ -f "$sourceDir/id_ed25519" ] && [ -f "$sourceDir/id_ed25519.pub" ]; then
+    privSrc="$sourceDir/id_ed25519"
+    pubSrc="$sourceDir/id_ed25519.pub"
+    privFile="id_ed25519"
+    pubFile="id_ed25519.pub"
+  elif [ -f "$sourceDir/id_rsa" ] && [ -f "$sourceDir/id_rsa.pub" ]; then
+    privSrc="$sourceDir/id_rsa"
+    pubSrc="$sourceDir/id_rsa.pub"
+    privFile="id_rsa"
+    pubFile="id_rsa.pub"
+  else
+    error.log "osshLayout.role.installer: no id_ed25519 or id_rsa keypair in $sourceDir"
+    return 2
+  fi
+
+  local dst="$sshDir/ids/ssh.$id"
+  mkdir -p "$dst/private_key" "$dst/public_keys"
+
+  cp "$privSrc" "$dst/$privFile"
+  cp "$pubSrc" "$dst/$pubFile"
+  chmod 600 "$dst/$privFile"
+
+  # Real copies (not symlinks) — see role.owner for rationale.
+  cp "$dst/$privFile" "$dst/private_key/ssh.$id.private_key"
+  cp "$dst/$pubFile"  "$dst/public_keys/ssh.$id.public_key"
+
+  console.log "installer: ssh.$id deployed at $dst (from $privSrc)"
+  create.result 0 "ssh.$id"
+}
+
+osshLayout.role.installer.completion.installerEmail() { :; }
+osshLayout.role.installer.completion.keypairSourceDir() { :; }
+osshLayout.role.installer.completion.sshDir() { :; }
+
+osshLayout.role.outeruser() # <?sourceDir> <?sshDir:~/.ssh> # builds <sshDir>/ids/ssh.outeruser/; with no args reads /tmp/oosh.outer.* (staged) or tolerates an already-populated dir; with sourceDir does a passthrough mirror of an already-formatted outer .ssh folder
+{
+  local sourceDir="$1"
+  local sshDir="${2:-$HOME/.ssh}"
+  local dst="$sshDir/ids/ssh.outeruser"
+
+  # Repair-mode tolerance: if no sourceDir + nothing staged + dst already
+  # populated (id_ed25519.pub present), reuse it as-is. Normalise any
+  # forbidden symlinks inside private_key/ + public_keys/ to real files.
+  if [ -z "$sourceDir" ] && ! private.osshLayout.staged.has.pubkey outer && [ -f "$dst/id_ed25519.pub" ]; then
+    # Look up the outer id from the existing public_keys/ssh.<id>.public_key file.
+    local _outerKey _outerId=""
+    for _outerKey in "$dst/public_keys/ssh."*.public_key; do
+      [ -f "$_outerKey" ] || continue
+      local _n="${_outerKey##*/}"; _n="${_n%.public_key}"; _outerId="${_n#ssh.}"; break
+    done
+    # Pubkey side: always replace with real-file copy.
+    if [ -n "$_outerId" ]; then
+      mkdir -p "$dst/public_keys"
+      rm -f "$dst/public_keys/ssh.${_outerId}.public_key"
+      cp "$dst/id_ed25519.pub" "$dst/public_keys/ssh.${_outerId}.public_key"
+    fi
+    # Privkey side: only if a private key actually lives here (test-mode shape).
+    if [ -f "$dst/id_ed25519" ] && [ -n "$_outerId" ]; then
+      mkdir -p "$dst/private_key"
+      rm -f "$dst/private_key/ssh.${_outerId}.private_key"
+      cp "$dst/id_ed25519" "$dst/private_key/ssh.${_outerId}.private_key"
+    fi
+    important.log "osshLayout.role.outeruser: existing ssh.outeruser normalised at $dst — repair-mode"
+    create.result 0 "ssh.outeruser"
+    return 0
+  fi
+
+  # Staged mode: no sourceDir given, but /tmp/oosh.outer.id_ed25519.pub exists.
+  # Build the outer identity from staged files, naming the renamed symlinks
+  # after the outer's email — independent of installer's email so ProxyJump
+  # (where outer ≠ installer) keeps the right names without code changes.
+  #
+  # Two shapes:
+  #   full keypair (test-mode collapse — outer == installer): id_ed25519 +
+  #     id_ed25519.pub at top, plus private_key/ + public_keys/ symlinks.
+  #   pubkey-only (real ProxyJump — jump host's private key not exfiltrated):
+  #     id_ed25519.pub at top + public_keys/ssh.<outer-id>.public_key only,
+  #     no id_ed25519 private file, no private_key/ folder.
+  if [ -z "$sourceDir" ] && private.osshLayout.staged.has.pubkey outer; then
+    private.osshLayout.staged.email outer
+    if [ "$RETURN_VALUE" -ne 0 ]; then
+      error.log "osshLayout.role.outeruser: outer pubkey staged but no email"
+      return 3
+    fi
+    local outerEmail="$RESULT"
+    osshLayout.id.from.email "$outerEmail"
+    if [ "$RETURN_VALUE" -ne 0 ]; then
+      return 3
+    fi
+    local outerId="$RESULT"
+
+    local stageDir
+    stageDir="$(private.osshLayout.staged.dir)"
+    mkdir -p "$dst/public_keys"
+    cp "${stageDir}/oosh.outer.id_ed25519.pub" "$dst/id_ed25519.pub"
+    # Real copies (not symlinks) — see role.owner for rationale.
+    cp "$dst/id_ed25519.pub" "$dst/public_keys/ssh.${outerId}.public_key"
+
+    if private.osshLayout.staged.has.privkey outer; then
+      mkdir -p "$dst/private_key"
+      cp "${stageDir}/oosh.outer.id_ed25519" "$dst/id_ed25519"
+      chmod 600 "$dst/id_ed25519"
+      cp "$dst/id_ed25519" "$dst/private_key/ssh.${outerId}.private_key"
+      console.log "outeruser: ssh.outeruser populated from staged ${stageDir}/oosh.outer.* (outer-id=ssh.${outerId}, full keypair)"
+    else
+      console.log "outeruser: ssh.outeruser populated from staged ${stageDir}/oosh.outer.* (outer-id=ssh.${outerId}, pubkey-only — ProxyJump shape)"
+    fi
+
+    create.result 0 "ssh.outeruser"
+    return 0
+  fi
+
+  # Passthrough-mirror mode: sourceDir is an already-formatted outer .ssh folder.
+  if [ -z "$sourceDir" ]; then
+    error.log "usage: osshLayout role.outeruser <sourceDir> [sshDir] (or stage \$OSSH_STAGE_DIR/oosh.outer.*)"
+    return 1
+  fi
+  if [ ! -d "$sourceDir" ]; then
+    error.log "osshLayout.role.outeruser: source not found: $sourceDir"
+    return 2
+  fi
+
+  mkdir -p "$dst"
+  cp -a "$sourceDir/." "$dst/"
+
+  console.log "outeruser: mirrored from $sourceDir at $dst"
+  create.result 0 "ssh.outeruser"
+}
+
+osshLayout.role.outeruser.completion.sourceDir() { :; }
+osshLayout.role.outeruser.completion.sshDir() { :; }
+
+osshLayout.build() # <?installerEmail> <?installerKeypairSrc> <?sshDir:~/.ssh> # builds the prescribed layout: owner, developking, installer, outeruser. Args are optional fallbacks; role methods prefer staged /tmp/oosh.{installer,outer}.* placed by ossh.install.
+{
+  local installerEmail="$1"
+  local installerSrc="$2"
+  local sshDir="${3:-$HOME/.ssh}"
+
+  osshLayout.role.owner "$sshDir"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.owner failed"
+    return 2
+  fi
+
+  osshLayout.role.developking "$sshDir"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.developking failed"
+    return 3
+  fi
+
+  # role.installer auto-resolves: staged /tmp/oosh.installer.* > explicit args > fallback chain.
+  # Explicit args (if passed) override staging — useful for unit tests.
+  osshLayout.role.installer "$installerEmail" "$installerSrc" "$sshDir"
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.installer failed"
+    return 4
+  fi
+  local installerResult="$RESULT"
+
+  # role.outeruser: prefer staged /tmp/oosh.outer.* (no args), which handles
+  # both full-keypair (test mode) and pubkey-only (ProxyJump) shapes. If the
+  # outer dir is already populated (repair scenario), call with no sourceDir
+  # so the tolerance branch fires and normalises symlinks in place. Only if
+  # NEITHER staging NOR an existing populated dir is available do we fall
+  # back to mirroring the installer ids folder.
+  if private.osshLayout.staged.has.pubkey outer; then
+    osshLayout.role.outeruser "" "$sshDir"
+  elif [ -f "$sshDir/ids/ssh.outeruser/id_ed25519.pub" ]; then
+    osshLayout.role.outeruser "" "$sshDir"
+  else
+    osshLayout.role.outeruser "$sshDir/ids/$installerResult" "$sshDir"
+  fi
+  if [ "$RETURN_VALUE" -ne 0 ]; then
+    error.log "osshLayout.build: role.outeruser failed"
+    return 5
+  fi
+
+  # Canonical perms pass — sshd StrictModes rejects keys whose containing
+  # directory chain isn't 0700. Each role.* uses cp into nested ids/ssh.*/
+  # private_key/ subdirs that default to 0755; this single pass tightens
+  # everything before we hand the layout off.
+  private.osshLayout.perms.tighten "$sshDir"
+
+  important.log "✓ osshLayout build complete: $(whoami) at $sshDir (installer $installerResult)"
+  create.result 0 "$sshDir"
+}
+
+osshLayout.build.completion.installerEmail() { :; }
+osshLayout.build.completion.installerKeypairSrc() { :; }
+osshLayout.build.completion.sshDir() { :; }
+
+### new.method
+
+osshLayout.usage()
+{
+  local this=${0##*/}
+  echo "You started" 
+  echo "$0
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+  
+  Examples
+    $this v
+    $this init
+    ----------
+  "
+}
+
+osshLayout.start()
+{
+  #echo "sourcing init"
+  source this
+
+  # if [ -z "$1" ]; then
+  #   status.discover "$@"
+  #   return 0
+  # fi
+
+  this.start "$@"
+}
+
+osshLayout.start "$@"
+

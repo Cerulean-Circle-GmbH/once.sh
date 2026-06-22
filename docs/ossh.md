@@ -149,6 +149,35 @@ ossh key.push myhost
 ossh config.push myhost
 ```
 
+## Repairing a Broken `~/.ssh`
+
+A fresh OOSH install lays down a canonical `~/.ssh` tree via `osshLayout build` (idempotent roles for owner, developking, installer, outeruser, closed by `private.osshLayout.perms.tighten`). On older machines that were installed before the Phase 2 layout work, the tree may have drifted — forbidden symlinks where real files are required, wrong perms (775/777 on private keys), legacy artifacts from earlier OOSH versions.
+
+Three commands handle this:
+
+```bash
+# Diagnose drift (read-only, returns 0 even with findings)
+ossh folder.fix.check
+
+# Repair: converge ~/.ssh to canonical state (conservative — never deletes)
+ossh folder.fix
+
+# Repair + also prune known-stale legacy artifacts (.bak.*, .previous, 2cuGitHub, no_deploy_keys, ssh-copy-id.*)
+ossh folder.fix strict
+
+# Re-assert canonical perms only (700 dirs, 600 privkeys, 644 pubkeys)
+ossh rights.fix
+```
+
+`ossh folder.fix` is idempotent and uses three-tier identity resolution. If the installer email is already known from existing `~/.ssh/ids/ssh.*/` directories, no args are needed — discovery happens automatically. Otherwise, pass the email explicitly:
+
+```bash
+ossh folder.fix me@example.com
+ossh folder.fix me@example.com ~/.ssh strict
+```
+
+Strict mode **never** deletes `authorized_keys`, `id_rsa`, or `config`. It only removes documented legacy patterns. User-authored content is always preserved.
+
 ## Remote Installation
 
 ```bash
@@ -168,6 +197,28 @@ What happens during install:
 5. Copies deploy key for GitHub access (if available)
 6. Creates user account and symlinks
 7. Sets login shell to bash 4+
+
+### Prereqs (`ossh prereqs.install`)
+
+If the remote is missing oosh's install-time tools, run `ossh prereqs.install <host>` first. It installs the package list appropriate to the remote's package manager (detected via `ossh pm.discover`):
+
+| PM | Packages installed | Post-install |
+|---|---|---|
+| `apt-get`, `dnf`, `pacman`, `pkg` | `curl`, `git` | — |
+| `apk` (Alpine) | `curl`, `git`, **`bash`**, **`shadow`**, **`util-linux`** | `chmod u+s /bin/busybox` |
+| `brew` (macOS) | `curl`, `git`, **`bash`** | write `/etc/paths.d/oosh-homebrew` |
+
+The Alpine extras are required because alpine's base image ships only busybox + ash:
+- `bash` — oosh's `#!/usr/bin/env bash` shebangs
+- `shadow` — `useradd`/`chpasswd` (busybox `adduser` differs in flags)
+- `util-linux` — `runuser`, used by `os platform.test` for user-switching
+- `chmod u+s /bin/busybox` — naked alpine ships busybox at mode 0755; the suid bit is needed for non-root `su -` (so `user login <user>` works from a regular user's shell). Real alpine deployments typically ship busybox suid by default. The same chmod also fires from `init/oosh` after its sudo re-exec, so curl/drag-and-drop install paths get the heal too.
+
+The macOS extras are required because Apple's `/bin/bash` is 3.2 (their last GPLv2 release) but oosh requires bash 4+:
+- `bash` — installs `/opt/homebrew/bin/bash` (5.x).
+- `/etc/paths.d/oosh-homebrew` — macOS sshd builds non-interactive PATH via `path_helper`, which reads `/etc/paths` + `/etc/paths.d/*`. `/opt/homebrew/bin` is NOT in either by default, so even with brew bash on disk, ssh-exec'd shebangs (`#!/usr/bin/env bash`) resolve to `/bin/bash` 3.2. Wiring the entry once via paths.d benefits every non-interactive ssh session on the host.
+
+The remote install runs over ssh+sh (no bash on remote required), so this works on a fresh naked alpine box where bash doesn't yet exist, and on a stock macOS where only the system 3.2 bash is present.
 
 ### Deploy Key (GitHub access)
 
@@ -256,6 +307,82 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh harden.firewall` | Configure UFW (default deny in / allow out + OpenSSH + optional extra ports) |
 | `ossh harden.sshd` | Harden sshd_config (no AllowUsers) |
 | `ossh harden.sshd.allowusers` | **Opt-in** AllowUsers restriction |
+| `ossh certificates.update` | Rotate TLS cert + restore workspace on a remote host (state-machine backed) |
+| `ossh certificates.status` | Show current state of the CERT_UPDATE machine for a host |
+
+## certificates.update — TLS cert rotation
+
+`ossh certificates.update <host>` refreshes the TLS certificate for the
+application running on `<host>` and restores its data workspace afterwards.
+Backed by a 9-state machine (`CERT_UPDATE_<sanitized-host>`); a failure
+stops *at* the failing state, and re-running the same command resumes from
+there.
+
+### Usage
+
+```bash
+ossh certificates.update WODA.test            # interactive: prints plan, asks Proceed?
+ossh certificates.update WODA.test yes        # skip the confirmation prompt
+ossh certificates.update WODA.test dryRun     # print every SSH call, execute none
+ossh certificates.update WODA.test reset      # discard any in-flight state, start over
+
+ossh certificates.status WODA.test            # show current state + persisted config
+```
+
+`reset` / `yes` / `dryRun` can each be passed bare or `--`-prefixed.
+`dryRun` also accepts `dry-run` and `--dry-run` for ergonomics
+(`dryRun` is the canonical OOSH-camelCase name).
+
+### Per-host config
+
+Config for `<host>` lives at
+`$OOSH_DIR/etc/ossh/hosts/<host>/certificates.update.conf`, a `source`-able
+key=value file:
+
+```bash
+domain=test.wo-da.de
+workspace=/var/dev/.../Workspaces/structrAppWorkspace
+certScenario=certbot
+appScenario=structr
+dataDir=WODA-current
+
+# optional — defaults shown:
+backupBase=/var/backups
+verifyMinDaysLeft=30
+```
+
+Required keys: `domain`, `workspace`, `certScenario`, `appScenario`, `dataDir`.
+
+### State flow
+
+```
+[11] stop.certbot          ssh: once docker.scenario.stop $certScenario
+[12] stop.structr          ssh: once docker.scenario.stop $appScenario
+[13] archive.workspace     ssh: mv $workspace/$dataDir -> $backupBase/$dataDir.<stamp>.bak
+[14] create.certbot        ssh: once docker.scenario.create $certScenario $domain   (TLS renewed here)
+[15] create.structr        ssh: once docker.scenario.create $appScenario $domain
+[16] rotate.empty          ssh: rm -rf $workspace/WODA-empty ; mv $dataDir WODA-empty
+[17] restore.workspace     ssh: mv $backupBase/$dataDir.<stamp>.bak -> $workspace/$dataDir
+[18] start.structr         ssh: once docker.scenario.start $appScenario $domain
+[19] verify.https          local: curl + openssl s_client check expiry >= $verifyMinDaysLeft days
+```
+
+The dated backup in `$backupBase` is the safety net: if anything fails
+between [13] and [17], the data is recoverable and the state machine
+remembers where it stopped. No in-script `EXIT`-trap auto-restore — the
+state machine + dated backup *is* the recovery mechanism.
+
+### Caveats
+
+- **`WODA-empty` is treated as disposable** by state [16] (`rm -rf`). If
+  that directory ever holds data you care about, do not run this command
+  without first renaming it aside.
+- The remote host must have `once docker.scenario.{stop,create,start}`
+  available.
+- Catastrophic abort (laptop disconnects mid-state) may leave the host in
+  a partial state. `ossh certificates.status <host>` and the dated
+  backup name in `$backupBase` give you everything needed to resume or
+  recover manually.
 
 ## See Also
 

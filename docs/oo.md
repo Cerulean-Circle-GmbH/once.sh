@@ -107,11 +107,66 @@ Sets `OOSH_MODE=dev` and saves to config.
 
 ### oo.update
 
-Pulls latest changes from GitHub.
+Pulls latest changes from GitHub, then self-heals user symlinks.
 
 ```bash
 oo update
 ```
+
+After a successful `git pull`, `oo update` delegates to
+`config init.user $USER` to re-apply the canonical `~/config` +
+`~/oosh` symlinks. This catches the case where `init/oosh` has been
+re-run out of band (e.g. a curl one-liner from the README) and
+clobbered the symlinks — `oo mode <TAB>` would otherwise show
+nothing. The heal is idempotent (no-op when symlinks are already
+canonical) and silenced during the pre-install bootstrap when
+`developking` doesn't yet exist. See
+[Repair toolkit](repair-toolkit.md) for the full primitive set.
+
+### oo.user.fix
+
+Repair the current user's `~/config` + `~/oosh` symlinks to the
+canonical shared tree. Thin alias for [`config init.user`](config.md).
+
+```bash
+oo user.fix              # repair this user (= $USER)
+oo user.fix developking  # repair another user (requires root)
+```
+
+Handles real-dir → symlink conversion (preserves originals as
+`oosh.orig.<ts>` / `config.orig.<ts>`), ownership, branch detection,
+and `dev`-group membership. Idempotent — calling it on an
+already-correct layout is a no-op. Naming follows the OOSH
+`noun.verb` convention and the existing `ossh.rights.fix` /
+`ossh.folder.fix` per-scope pattern. See
+[Repair toolkit](repair-toolkit.md) for related primitives.
+
+### oo.safeDirectory.prune
+
+Remove entries from git's global `safe.directory` list whose paths
+no longer exist on disk.
+
+```bash
+oo safeDirectory.prune
+```
+
+Walks `git config --global --get-all safe.directory`, drops entries
+pointing at paths that no longer exist (typical sources: `/tmp/...`
+test fixtures, removed worktrees, stale install dirs), and leaves
+real paths untouched. Idempotent — a clean list logs *"No stale
+entries to prune"* at log level ≥ 4 and exits 0.
+
+Honours `$GIT_CONFIG_GLOBAL` so tests and ad-hoc scripts can
+sandbox without touching the user's real `~/.gitconfig` (the
+sandbox pattern is the reason this primitive exists — see
+[Repair toolkit](repair-toolkit.md) §Cursor / VS Code branches
+missing).
+
+The primitive is **explicit and read-then-rewrite**. There is
+deliberately no auto-invocation from shell startup or from
+read-only methods such as `oo.mode.list` — repair belongs to
+explicit primitives per the post-May-8 architectural rule (see
+[`migration/env-files.md`](migration/env-files.md)).
 
 ### oo.commit
 

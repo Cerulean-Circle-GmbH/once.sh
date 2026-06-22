@@ -30,26 +30,113 @@ jobs:
       - name: Bootstrap oosh on host
         run: |
           export OOSH_INSTALL_SOURCE="$GITHUB_WORKSPACE"
-          bash init/oosh
+
+          # Pre-oosh exception: install brew bash so the runner shell can
+          # run ossh (oosh requires bash 4+; macOS /bin/bash is 3.2). git
+          # and curl ship with macos-latest already. Same class as
+          # init/oosh's pure-bash prereq check (init/oosh:60-142): no
+          # oosh primitives available yet.
+          if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+            brew install bash
+          fi
+          export PATH="/opt/homebrew/bin:$PATH"
+
+          # Clean up leftover state from a previous attempt on the same VM.
+          # GHA's `macos-latest` label can re-use runner VMs; without this,
+          # stale ~/config/* (root-owned from a prior `sudo init/oosh` run)
+          # surfaces as `Permission denied on setup.color.env`, and stale
+          # ~/.ssh/public_keys/* + ~/.ssh/private_key/* with old (pre-tr-fix)
+          # multi-token hostnames surfaces as the dual-file `ls` newline
+          # collision in private.ossh.get.file.name. Match the freshness
+          # we get on a Tart VM macstudio install: nothing carries over.
+          sudo rm -rf /var/root/oosh /Users/runner/oosh \
+            /Users/runner/config \
+            /Users/runner/.ssh/public_keys /Users/runner/.ssh/private_key
+
+          # init/oosh's move-block tries to relocate $OOSH_DIR to $HOME/oosh.
+          # On GHA macos-latest, OOSH_DIR=$GITHUB_WORKSPACE — moving it would
+          # destroy the workspace and subsequent steps' working-directory.
+          # Pre-position a COPY of the repo at /var/root/oosh (root's
+          # canonical location); init/oosh's move-block then sees
+          # OOSH_DIR == $HOME/oosh (after the macos-symlink-aware
+          # canonicalization fix landed in init/oosh) and is a no-op.
+          # The original workspace stays intact for subsequent steps.
+          sudo cp -R "$GITHUB_WORKSPACE" /var/root/oosh
+          sudo chown -R root:wheel /var/root/oosh
+
+          # Run init/oosh AS ROOT from the canonical location.
+          sudo -H /opt/homebrew/bin/bash /var/root/oosh/init/oosh
+
+          # Post-install: shared config + oosh tree are owned by root
+          # (Bootstrap installer). Subsequent steps run as runner and need
+          # read+write access. Linux relies on `dev` group membership;
+          # macOS group propagation needs a fresh login which CI can't do.
+          # Chown the shared trees to runner so all subsequent ossh
+          # invocations work without permission errors.
+          sudo chown -R runner:staff /Users/shared 2>/dev/null || true
 
       - name: Generate SSH key
         run: |
+          # Force-fresh keypair every run. If a key already exists (some
+          # GHA macOS runner images pre-bake one OR a prior workflow on
+          # the same runner persisted one), `ssh-keygen` prompts
+          # "Overwrite (y/n)?" and the non-interactive shell with
+          # `set -e` exits 1 — first observed in run 25555509901.
+          # rm -f first so keygen doesn't prompt; localhost's sshd host
+          # key may have changed since the persisted client key was
+          # known, so we also clear known_hosts to avoid stale
+          # "Host key verification failed" (run 25555737289).
+          mkdir -p "$HOME/.ssh"
+          rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/known_hosts"
           ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -N "" -q
-          # Set up ossh directory structure (ossh expects these dirs)
-          keyName="runner.$(hostname -s)"
-          mkdir -p "$HOME/.ssh/private_key" "$HOME/.ssh/public_keys"
-          cp "$HOME/.ssh/id_ed25519" "$HOME/.ssh/private_key/${keyName}.private_key"
-          cp "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/public_keys/${keyName}.public_key"
-          # Skip host key check for localhost connections
-          echo "NoHostAuthenticationForLocalhost yes" >> "$HOME/.ssh/config"
 
-      - name: Enable SSH and create test user
+          # Don't pre-copy the keypair into ossh's `private_key/` +
+          # `public_keys/` subdirs — Phase A.1b's `ossh install macos test`
+          # runs `osshLayout build` which creates the canonical layout
+          # itself (osshLayout:327, 399 → `public_keys/ssh.<ownerId>.public_key`).
+          # When we ALSO pre-copied with a `runner.<hostname-s>` name,
+          # two valid keys ended up in `public_keys/`, and
+          # `private.ossh.get.file.name` (ossh:1194 — `ls | sed`)
+          # returned a multi-line value, leaking a newline into the
+          # path at ossh:2100. Mirrors the macstudio Tart VM install
+          # which has no pre-keygen step.
+
+          # SSH client config — disable host key check for localhost so
+          # `ssh test@localhost true` in Phase A.1a doesn't trip on a
+          # missing or stale known_hosts entry. Use a Host block (not
+          # `NoHostAuthenticationForLocalhost`, which controls hostbased-
+          # auth, NOT the host-key check). Idempotent — only append if
+          # the localhost block isn't already there. Built via printf
+          # rather than a heredoc because YAML block scalars (`run: |`)
+          # require every line to be indented at the block's level — a
+          # heredoc body at column 0 would break the YAML parse.
+          if ! grep -qxF "Host localhost" "$HOME/.ssh/config" 2>/dev/null; then
+            printf '\nHost localhost\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n' \
+              >> "$HOME/.ssh/config"
+          fi
+
+          # SSH client refuses to use ~/.ssh/config if mode > 600 — newly-
+          # created files default to 644 under runner's umask. Tighten +
+          # own explicitly. ~/.ssh dir gets the same treatment.
+          chmod 700 "$HOME/.ssh"
+          chmod 600 "$HOME/.ssh/config" "$HOME/.ssh/id_ed25519"
+          chmod 644 "$HOME/.ssh/id_ed25519.pub"
+
+      - name: Phase A.1a — Enable SSH + create test user
         run: |
           # Enable Remote Login (sshd) — insurance, may already be running
           sudo systemsetup -setremotelogin on
           sleep 2
 
-          # Create test user
+          # Create test user with default /bin/bash. Phase A.1b's
+          # `ossh install macos test` ships init/oosh to the remote,
+          # whose POSIX prelude installs brew bash (init/oosh:192-232)
+          # and writes /etc/paths.d/oosh-homebrew so /opt/homebrew/bin/bash
+          # is discoverable for non-interactive ssh sessions —
+          # init/oosh's `#!/usr/bin/env bash` then resolves to bash 5+
+          # regardless of login shell. Mirrors the macstudio Tart VM
+          # install: one `ossh install <host> <user>` call, no separate
+          # prereqs step.
           sudo sysadminctl -addUser test -password test -shell /bin/bash
           echo "test ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/test
 
@@ -71,15 +158,23 @@ jobs:
           ssh test@localhost true
           echo "SSH key-based auth verified"
 
-      - name: Install oosh via ossh
+      - name: Phase A.1b — Install oosh via ossh (root + test)
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
+          # Non-interactive ssh on macOS doesn't source bashrc, so OOSH_DIR
+          # PATH wiring from oosh.env may not be active.
+          export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           export OOSH_INSTALL_SOURCE="$GITHUB_WORKSPACE"
 
+          # Establish the ossh config alias + ControlMaster. Single
+          # `ossh install` then ships init/oosh and runs the full
+          # bootstrap (init/oosh handles brew bash + git + paths.d
+          # itself, init/oosh:188-232) — same flow as the macstudio
+          # Tart VM install (`ossh install tart_sequoia admin`), no
+          # separate `ossh prereqs.install` precursor.
           ossh config.create macos "test@localhost"
           ossh config.save.last
-
           ossh connection.open macos
 
           ossh key.push macos
@@ -95,64 +190,143 @@ jobs:
           rm -f "/tmp/ossh-test@localhost" 2>/dev/null
           ossh connection.open macos
 
-      - name: Run tests as user
+      - name: Phase A.2 — Create oosh-user (oosh-native, from test's session)
+        id: add-oosh-user
+        continue-on-error: true
+        run: |
+          source "$HOME/config/user.env" 2>/dev/null || true
+          export PATH="$HOME/oosh:$PATH"
+          export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
+          # user.create on macOS dispatches via os.check → sysadminctl path
+          # at user:524 (with brew-bash shell selection). Default password
+          # = username; "oosh-user" is 9 chars so the macOS 4-char-min
+          # padding doesn't fire.
+          ossh exec macos "user create oosh-user password oosh-user"
+          # NOPASSWD sudo for oosh-user (matches Linux's pattern in os:260)
+          echo "oosh-user ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/oosh-user >/dev/null
+          # SSH access on macOS gates via com.apple.access_ssh group + authorized_keys
+          sudo dseditgroup -o edit -a oosh-user -t user com.apple.access_ssh
+          sudo mkdir -p /Users/oosh-user/.ssh
+          sudo cp "$HOME/.ssh/id_ed25519.pub" /Users/oosh-user/.ssh/authorized_keys
+          sudo chown -R oosh-user:staff /Users/oosh-user/.ssh
+          sudo chmod 700 /Users/oosh-user/.ssh
+          sudo chmod 600 /Users/oosh-user/.ssh/authorized_keys
+
+      - name: Phase A.3 — Create bash-user (raw, mirrors Linux's useradd)
+        id: add-bash-user
+        continue-on-error: true
+        run: |
+          # macOS equivalent of Linux's `useradd`. sysadminctl is the only
+          # supported macOS user-add tool; see Phase A.1a's test-user
+          # creation for the same primitive. Default /bin/bash shell —
+          # /etc/paths.d/oosh-homebrew (wired by Phase A.1b's init/oosh)
+          # ensures init/oosh on bash-user's session finds brew bash 5+
+          # via PATH.
+          sudo sysadminctl -addUser bash-user -password bash-user -shell /bin/bash
+          echo "bash-user ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/bash-user >/dev/null
+          sudo dseditgroup -o edit -a bash-user -t user com.apple.access_ssh
+          sudo mkdir -p /Users/bash-user/.ssh
+          sudo cp "$HOME/.ssh/id_ed25519.pub" /Users/bash-user/.ssh/authorized_keys
+          sudo chown -R bash-user:staff /Users/bash-user/.ssh
+          sudo chmod 700 /Users/bash-user/.ssh
+          sudo chmod 600 /Users/bash-user/.ssh/authorized_keys
+          sudo chmod 755 /Users/bash-user
+
+      - name: Phase A.4 — Install oosh for bash-user (caller-driven)
+        id: install-bash-user
+        continue-on-error: true
+        run: |
+          source "$HOME/config/user.env" 2>/dev/null || true
+          export PATH="$HOME/oosh:$PATH"
+          export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
+          # || true — install may exit non-zero if ControlMaster drops late
+          # on macOS sshd + -tt; downstream test.suite (Phase B.4) is the
+          # real check. prereqs are already installed system-wide on the
+          # host from Phase A.1b's init/oosh run; same machine, same brew,
+          # no re-install.
+          ossh install macos bash-user || true
+
+          # Re-deploy runner's public key — `ossh install` rebuilds
+          # ~/.ssh/authorized_keys for the target user, dropping the
+          # key Phase A.3 deployed and replacing it with ossh-managed
+          # keys. Without this re-deploy, Phase B.4's
+          # `ossh exec macos_bash_user "test.suite core 1"` (which SSHes
+          # FROM the runner TO bash-user using id_ed25519) fails with
+          # `Permission denied`. Mirrors the same re-deploy Phase A.1b
+          # does for the test user.
+          sudo cp "$HOME/.ssh/id_ed25519.pub" /Users/bash-user/.ssh/authorized_keys
+          sudo chown bash-user:staff /Users/bash-user/.ssh/authorized_keys
+          sudo chmod 600 /Users/bash-user/.ssh/authorized_keys
+
+      - name: Phase B.1 — Run tests as test
         if: github.event.inputs.notests != 'notests'
         id: user-tests
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
+          export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
           ossh exec macos "test.suite core 1"
 
-      - name: Run tests as root
+      - name: Phase B.2 — Run tests as root
         if: github.event.inputs.notests != 'notests'
         id: root-tests
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
+          export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
-          # Use brew bash explicitly — sudo resets PATH so 'bash' would resolve to /bin/bash (bash 3)
-          # -H sets HOME to root's home so ~ and $CONFIG_PATH stay consistent
+          # sudo resets PATH so 'bash' would resolve to /bin/bash (3.2);
+          # use brew bash explicitly here. -H sets HOME to root's home so
+          # this:209 derives CONFIG_PATH=/var/root/config dynamically.
           ossh exec macos "sudo -H /opt/homebrew/bin/bash -c 'source /var/root/config/user.env 2>/dev/null; test.suite core 1'"
 
-      - name: Add dev user
-        id: add-dev
-        continue-on-error: true
-        run: |
-          source "$HOME/config/user.env" 2>/dev/null || true
-          export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
-          # install may exit non-zero if ControlMaster drops late (macOS sshd + -tt);
-          # dev tests validate the install succeeded — the key push is the real check
-          ossh install macos dev || true
-          # Set up passwordless sudo for dev (local sudo — avoids SSH reconnection issues)
-          echo "dev ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/dev >/dev/null
-
-      - name: Run tests as dev
+      - name: Phase B.3 — Run tests as oosh-user
         if: github.event.inputs.notests != 'notests'
-        id: dev-tests
+        id: oosh-user-tests
         continue-on-error: true
         run: |
           source "$HOME/config/user.env" 2>/dev/null || true
+          export PATH="$HOME/oosh:$PATH"
           export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
-          ossh config.create macos_dev "dev@localhost"
+          ossh config.create macos_oosh_user "oosh-user@localhost"
           ossh config.save.last
-          ossh connection.open macos_dev
-          ossh exec macos_dev "test.suite core 1"
+          ossh connection.open macos_oosh_user
+          ossh exec macos_oosh_user "test.suite core 1"
+
+      - name: Phase B.4 — Run tests as bash-user
+        if: github.event.inputs.notests != 'notests'
+        id: bash-user-tests
+        continue-on-error: true
+        run: |
+          source "$HOME/config/user.env" 2>/dev/null || true
+          export PATH="$HOME/oosh:$PATH"
+          export OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"
+          ossh config.create macos_bash_user "bash-user@localhost"
+          ossh config.save.last
+          ossh connection.open macos_bash_user
+          ossh exec macos_bash_user "test.suite core 1"
 
       - name: Test Summary
         if: always() && github.event.inputs.notests != 'notests'
         run: |
-          userResult="${{ steps.user-tests.outcome }}"
+          testResult="${{ steps.user-tests.outcome }}"
           rootResult="${{ steps.root-tests.outcome }}"
-          addDevResult="${{ steps.add-dev.outcome }}"
-          devResult="${{ steps.dev-tests.outcome }}"
+          addOoshResult="${{ steps.add-oosh-user.outcome }}"
+          ooshUserResult="${{ steps.oosh-user-tests.outcome }}"
+          addBashResult="${{ steps.add-bash-user.outcome }}"
+          installBashResult="${{ steps.install-bash-user.outcome }}"
+          bashUserResult="${{ steps.bash-user-tests.outcome }}"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "---" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$userResult" = "success" ] && [ "$rootResult" = "success" ] && [ "$addDevResult" = "success" ] && [ "$devResult" = "success" ]; then
-            echo "### ✅ PASS: macos (root=pass, user=pass, dev=pass)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$testResult" = "success" ] && [ "$rootResult" = "success" ] \
+             && [ "$addOoshResult" = "success" ] && [ "$ooshUserResult" = "success" ] \
+             && [ "$addBashResult" = "success" ] && [ "$installBashResult" = "success" ] \
+             && [ "$bashUserResult" = "success" ]; then
+            echo "### ✅ PASS: macos (test=pass root=pass oosh-user=pass bash-user=pass)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### ❌ FAIL: macos (user=${userResult}, root=${rootResult}, add-dev=${addDevResult}, dev=${devResult})" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ❌ FAIL: macos (test=${testResult} root=${rootResult} add-oosh=${addOoshResult} oosh-user=${ooshUserResult} add-bash=${addBashResult} install-bash=${installBashResult} bash-user=${bashUserResult})" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 

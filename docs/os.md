@@ -71,28 +71,57 @@ fi
 
 ### Platform Test Flow (Docker platforms)
 
-For each Docker-testable platform, `os platform.test` runs fully automated (no interactive prompts):
+For each Docker-testable platform, `os platform.test` runs fully automated (no interactive prompts). Every run exercises **4 users** covering every install path we support:
 
-1. `odocker reset <image>` — Fresh container with SSH access
-2. `ossh config.create` / `ossh config.save.last` — SSH config setup
+| User | Created via | Install path exercised |
+|---|---|---|
+| `test` | Image default / target of initial `ossh install <platform> test` | ssh-as-test → state machine + `user.oosh.install test` |
+| `root` | Already exists in image | sudo re-exec from test (init/oosh non-root → root branch) |
+| `oosh-user` | Inside test session: `user create oosh-user password oosh-user` | oosh-native user creation — `user.create` → `user.oosh.install` as side-effect |
+| `bash-user` | Raw `useradd` on remote + caller: `ossh install <platform> bash-user` | caller-initiated install for pre-existing account — `ossh.install.user.remote` |
+
+**Flow:**
+
+1. `odocker reset <image>` — fresh container with SSH access
+2. `ossh config.create` / `ossh config.save.last` — SSH config setup (`User=test` convention)
 3. Clean stale ControlMaster socket from any previous run
 4. `sshpass` opens a ControlMaster connection (password via `$SSHPASS` env var, runs `true` to avoid background fork race)
-5. `ossh push.key` — Pushes SSH key, reusing the ControlMaster socket (no password prompt)
-6. Configure `NOPASSWD` sudo on the ephemeral container (appended to `/etc/sudoers`)
-7. `ossh install <platform> test` — Install oosh remotely
-8. `ossh exec <platform> "test.suite core 1"` — Run tests as user
-9. `ossh exec.tty <platform> "sudo ... test.suite core 1"` — Run tests as root
-10. `ossh connection.close` + container cleanup
+5. `ossh push.key` — pushes SSH key, reusing the ControlMaster socket (no password prompt)
+6. Configure `NOPASSWD` sudo for `test` on the ephemeral container
+7. `ossh prereqs.install <platform>` — installs `curl + git` on the remote (and additionally `bash + shadow + util-linux` on apk hosts like alpine, where the base image ships only busybox + ash)
+8. **Phase A — installs:**
+   - `ossh install <platform> test` — root + test initial install
+   - `ossh exec <platform> "user create oosh-user password oosh-user"` — creates oosh-user
+   - Raw `useradd -m -G sudo bash-user` + NOPASSWD sudoers snippet — creates bash-user
+   - `ossh install <platform> bash-user` — caller-initiated install for bash-user
+9. **Phase B — tests** (skipped when `notests` modifier is passed):
+   - `ossh exec <platform> "test.suite core 1"` → `test` log
+   - `ossh exec.tty <platform> "sudo bash -lc '… test.suite core 1'"` → `root` log
+   - `ossh exec.tty <platform> "sudo runuser -u oosh-user -- bash -lc 'test.suite core 1'"` → `oosh-user` log
+   - `ossh exec.tty <platform> "sudo runuser -u bash-user -- bash -lc 'test.suite core 1'"` → `bash-user` log
+10. `terminal` modifier drops into an interactive `bash-user` shell before cleanup (same last-user-created convention as before)
+11. `ossh connection.close` + container cleanup
+
+> **Why `sudo runuser -u <user> -- bash -lc …` for the two new users?** `user.login` itself (`env -i su - "$1"`) is interactive and can't be fed a command. `sudo runuser -u <user> -- bash -lc …` is functionally identical — login-shell (`-lc`), fresh env, explicit user-switch — and scripts cleanly over one ssh-tt session. `runuser` ships from `util-linux` on every Linux target — present in the base image on Debian-derivatives and RHEL, installed by step 7 (`ossh prereqs.install`) on Alpine.
 
 Non-interactive `ssh-keygen` (`-N ''`) is handled in `user`/`ossh` so key generation never prompts.
 
 ### macOS Testing (CI)
 
-macOS is tested via GitHub Actions (`macos-test.yml`):
+macOS is tested via GitHub Actions (`macos-test.yml`) — same 4-user matrix as Linux (test → root → oosh-user → bash-user), same Phase A → Phase B contract (all 4 users installed before any test.suite runs).
 
 1. `os platform.test macos` triggers the workflow via `gh` CLI
 2. Watches the run and reports PASS/FAIL
 3. Requires `gh` CLI authenticated (`gh auth login`)
+
+The macOS workflow follows the same `ossh prereqs.install → ossh install` pattern as Linux. `ossh prereqs.install macos` (called as Phase A.1a-bis) installs `bash + curl + git` via brew and writes `/etc/paths.d/oosh-homebrew` so non-interactive ssh sessions find brew bash. From that point on, `ossh install macos <user>` works identically to its Linux equivalents.
+
+**macOS-specific primitives (same primitives, different name from Linux):**
+
+- **`sysadminctl` instead of `useradd`** — macOS's user-add primitive. `user.create` dispatches to it via the darwin branch at `user:524` (with brew-bash shell selection); raw `bash-user` creation in the workflow uses it directly with default `/bin/bash` (PATH-discoverable brew bash takes over once `/etc/paths.d/oosh-homebrew` is in place).
+- **`com.apple.access_ssh` group + `dseditgroup`** — macOS gates SSH access via this group; each new user (oosh-user, bash-user) is added to it after creation.
+- **Per-user `ossh config.create macos_<user>` instead of `runuser`** — macOS doesn't ship util-linux's `runuser`. Phase B.3 and B.4 use a separate ossh config alias (`macos_oosh_user`, `macos_bash_user`) so `ossh exec` connects directly as that user via key-based SSH (key already pushed to their `authorized_keys` during their setup phase).
+- **Brew bash for root tests** — Phase B.2 uses `sudo -H /opt/homebrew/bin/bash -c` because sudo resets PATH; `path_helper` is per-shell, so `sudo -H bash` would resolve to system `/bin/bash` 3.2 unless we name the brew binary explicitly.
 
 ### Interactive Terminal (tmate)
 

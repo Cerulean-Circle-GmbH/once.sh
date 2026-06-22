@@ -319,6 +319,20 @@ The logging functions use `tee` to write to both destinations when `LOG_LIVE` is
 1. Primary output → `LOG_DEVICE`
 2. Duplicate for monitoring → `LOG_LIVE`
 
+### LOG_LIVE per-user anchor (multi-user installs)
+
+In multi-user oosh installs (`~/config` is a shared symlink to a per-host shared dir), shared `log.env` is sourced by every user's bashrc. `LOG_LIVE` is **per-user** (`~/config/log.live.out` resolves to the current user's home), so we never persist it to shared `log.env` and we re-anchor it on every shell session.
+
+Two coordinated defenses keep `LOG_LIVE` correct across `user login` chains:
+
+* **Read-side: `log:22`** unconditionally re-exports `LOG_LIVE=~/config/log.live.out` at bashrc time. Defeats stale absolute paths inherited via shared `user.env` / `log.env`.
+* **Read-side: `this:215–227`** save+restore `LOG_LIVE` around `source "$CONFIG"` inside `this.init`. Mid-session re-sources of `$CONFIG` (every `oo` / `ossh` invocation goes through this path) would otherwise re-import a stale absolute path; preservation keeps the bashrc-anchored value.
+* **Write-side: `config:261`** filters `LOG_LIVE=` out of saved `log.env` (same hygiene as `INSTALL_LOG`/`LOG_INSTALL`). Stops the leak at the source — the saving user's absolute path never gets persisted to shared config.
+
+Result: `console.log` and `silent.log` always write to the current user's `~/config/log.live.out`, even after `user login <other>` chains across users with non-traversable home directories.
+
+The trio is verified by tests `T-THIS-INIT-LOG-LIVE-PRESERVED` and `T-CONFIG-SAVE-EXCLUDES-LOG-LIVE` in `test/test.oo`.
+
 ### Checking Log Configuration
 
 ```bash
@@ -343,6 +357,21 @@ log level 3
 # Start fresh shell
 exit && bash
 ```
+
+### User-invoked command output vs log events
+
+OOSH log functions (`console.log`, `important.log`, `silent.log`, `info.log`, `debug.log`) are gated by `LOG_LEVEL` — they're for **internal events at varying verbosity**, not for the answer that a user-invoked command returns.
+
+When you write a `<x>.status`, `<x>.report`, or other user-invoked **query** method, the structural lines that make up the user's answer **must use plain `echo` to stdout** — never `console.log` or `important.log`. The user typed the command expecting an answer; that answer must survive every `LOG_LEVEL` (in particular `LOG_LEVEL=1`, the recommended level for CI and a common interactive level, at which `console.log` is silent).
+
+Reserve OOSH log functions for:
+
+- Internal pipeline diagnostics (`Promoting to: testing` / `Current state: [22]` / `Next check: [23]` etc.) — `console.log`, opt-in via `LOG_LEVEL >= 3`.
+- Event notices (`No active promotion`, `Promotion complete`) — `important.log` / `success.log`.
+
+But the *primary answer* of a query method goes through `echo`. Example: `promote.status` (in `dev/promote`) — the `=============` / `Branch Status` / `=============` block and the per-branch alignment lines are all `echo`, while the per-state header above them is `console.log` (the user opts in to that detail by raising LOG_LEVEL).
+
+A common audit anti-pattern is "replace bare `echo` with `console.log` for uniform routing through `$LOG_DEVICE`". That refactor is **wrong** for status/report methods — it makes their output invisible at the user's working LOG_LEVEL. See the commits `02436eb` (`feat(promote): truthful status banner + branch.alignment helper`) and `dd41909` (`fix(promote): promote.status uses echo, not console.log`) for the regression-and-fix.
 
 ## Install Logging
 
