@@ -3968,13 +3968,302 @@ hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote ma
   return 0
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-hiveMind.team.push() # <sshHost> # push team to remote (alias for teams.migrate)
+# ─── TEAM PUSH — per-agent verify-or-fail migration to remote host ──────────
+
+private.hiveMind.push.preflight() { # <host> <teamSession>
+  local host="$1" teamSession="$2"
+
+  # SSH connectivity
+  if ! "$OOSH_DIR/ossh" exec "$host" "echo ok" >/dev/null 2>&1; then
+    error.log "push.preflight: SSH unreachable — $host"
+    return 1
+  fi
+  # OOSH installed
+  if ! "$OOSH_DIR/ossh" exec "$host" "which hiveMind" >/dev/null 2>&1; then
+    error.log "push.preflight: oosh not on PATH on $host"
+    return 1
+  fi
+  # Workspace dir — query remote for first existing project hash
+  local remoteProjectDir
+  remoteProjectDir=$("$OOSH_DIR/ossh" exec "$host" "ls -d ~/.claude/projects/*/ 2>/dev/null | head -1")
+  if [ -z "$remoteProjectDir" ]; then
+    warn.log "push.preflight: no ~/.claude/projects/ on $host — will be created on first transfer"
+  fi
+  # tmux session — create detached if missing
+  if ! "$OOSH_DIR/ossh" exec "$host" "tmux has-session -t '$teamSession'" 2>/dev/null; then
+    console.log "push.preflight: creating detached session $teamSession on $host"
+    "$OOSH_DIR/ossh" exec "$host" "tmux new-session -d -s '$teamSession' -x 200 -y 50"
+  fi
+  console.log "push.preflight: $host OK"
+  return 0
+}
+
+private.hiveMind.push.resolveCanonical() { # <role> <teamSession>
+  local role="$1" teamSession="$2"
+  local claudeProjectsDir="$HOME/.claude/projects"
+  local candidates="" candidateCount=0
+
+  for dir in "$claudeProjectsDir"/*/; do
+    [ -d "$dir" ] || continue
+    for f in "$dir"*.jsonl; do
+      [ -f "$f" ] || continue
+      local uuid
+      uuid=$(basename "$f" .jsonl)
+      local name
+      name=$("$OOSH_DIR/claudeCode" session.name "$uuid" 2>/dev/null)
+      [ -z "$name" ] && continue
+      local nameBase="${name%%@*}"
+      if [ "$nameBase" = "$role" ]; then
+        candidates="${candidates}${f}\n"
+        candidateCount=$((candidateCount + 1))
+      fi
+    done
+  done
+
+  if [ "$candidateCount" -eq 0 ]; then
+    error.log "resolveCanonical: role '$role' not found in any session"
+    return 1
+  fi
+
+  local canonical
+  if [ "$candidateCount" -eq 1 ]; then
+    canonical=$(echo -e "$candidates" | head -1)
+  else
+    # Dedup: newest mtime first, tiebreak by line count
+    canonical=$(echo -e "$candidates" | while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      local mtime lines
+      mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)
+      lines=$(wc -l < "$f" 2>/dev/null)
+      echo "${mtime:-0} ${lines:-0} $f"
+    done | sort -k1,1rn -k2,2rn | head -1 | awk '{print $3}')
+    info.log "resolveCanonical: DEDUP $role has $candidateCount sessions, canonical=$(basename "$canonical" .jsonl)"
+  fi
+
+  basename "$canonical" .jsonl
+}
+
+private.hiveMind.push.agent() { # <host> <role> <sourceUUID> <targetPane>
+  local host="$1" role="$2" sourceUUID="$3" targetPane="$4"
+
+  # 3.1: Compute target hash + project dir
+  local remoteProjectDir
+  remoteProjectDir=$("$OOSH_DIR/ossh" exec "$host" "ls -d ~/.claude/projects/*/ 2>/dev/null | head -1")
+  if [ -z "$remoteProjectDir" ]; then
+    local remoteWorkspace
+    remoteWorkspace=$("$OOSH_DIR/ossh" exec "$host" 'echo ${CLAUDE_PROJECT_DIR:-$(cd ~/oosh/.. 2>/dev/null && pwd)}')
+    local remoteHash
+    remoteHash=$(echo "$remoteWorkspace" | sed 's/\//-/g')
+    remoteProjectDir="$("$OOSH_DIR/ossh" exec "$host" 'echo $HOME')/.claude/projects/${remoteHash}/"
+  fi
+  "$OOSH_DIR/ossh" exec "$host" "mkdir -p '$remoteProjectDir'" 2>/dev/null
+
+  # 3.2: Place JSONL
+  local localJsonl=""
+  for dir in "$HOME/.claude/projects"/*/; do
+    [ -f "${dir}${sourceUUID}.jsonl" ] && localJsonl="${dir}${sourceUUID}.jsonl" && break
+  done
+  if [ -z "$localJsonl" ]; then
+    error.log "push.agent: JSONL not found for $sourceUUID ($role)"
+    return 1
+  fi
+  local targetJsonl="${remoteProjectDir}${sourceUUID}.jsonl"
+  if ! "$OOSH_DIR/ossh" scp "$localJsonl" "${host}:${targetJsonl}" 2>/dev/null; then
+    error.log "push.agent: scp failed for $role"
+    return 1
+  fi
+  # Verify JSONL landed
+  if ! "$OOSH_DIR/ossh" exec "$host" "[ -f '${targetJsonl}' ]" 2>/dev/null; then
+    error.log "push.agent: JSONL not found on target after scp ($role)"
+    return 1
+  fi
+  info.log "  JSONL placed: ${sourceUUID:0:8}..."
+
+  # Collision check: is Claude already running in target pane?
+  local alreadyRunning=""
+  alreadyRunning=$("$OOSH_DIR/ossh" exec "$host" "claudeCode process.running '$targetPane' 2>/dev/null && echo yes" 2>/dev/null)
+  if [ "$alreadyRunning" = "yes" ]; then
+    console.log "  $role: Claude already running in $targetPane — verify-only mode"
+  else
+    # 3.3: Fork — decode target hash to workspace path for cd
+    local remoteHash
+    remoteHash=$(basename "${remoteProjectDir%/}")
+    local projectDir
+    projectDir=$(echo "$remoteHash" | sed 's/^-/\//' | sed 's/-/\//g')
+
+    "$OOSH_DIR/ossh" exec "$host" "otmux send '$targetPane' \"cd '$projectDir' && claudeCode fork $sourceUUID\" Enter"
+
+    # Handle resume menu: wait up to 30s for prompt or menu
+    local waited=0
+    while [ "$waited" -lt 30 ]; do
+      sleep 5
+      waited=$((waited + 5))
+      local capture
+      capture=$("$OOSH_DIR/ossh" exec "$host" "otmux pane.capture '$targetPane' 10" 2>/dev/null)
+      # Auto-resumed: idle prompt
+      echo "$capture" | grep -q '❯' && break
+      # Resume menu: send 2 for full resume
+      if echo "$capture" | grep -q 'Continue\|1)'; then
+        "$OOSH_DIR/ossh" exec "$host" "otmux send '$targetPane' '2' Enter"
+        sleep 3
+      fi
+      # Compacting: just wait
+      echo "$capture" | grep -q 'Compacting\|compacting' && continue
+    done
+
+    # Verify fork started
+    local forkAlive=""
+    forkAlive=$("$OOSH_DIR/ossh" exec "$host" "claudeCode process.running '$targetPane' 2>/dev/null && echo yes" 2>/dev/null)
+    if [ "$forkAlive" != "yes" ]; then
+      error.log "push.agent: fork did not start for $role in $targetPane (waited ${waited}s)"
+      return 1
+    fi
+    info.log "  fork alive: $role"
+  fi
+
+  # 3.5: Rename
+  local targetHost
+  targetHost=$("$OOSH_DIR/ossh" exec "$host" "hostname -s" 2>/dev/null)
+  [ -z "$targetHost" ] && targetHost="$host"
+  "$OOSH_DIR/ossh" exec "$host" "otmux send.raw '$targetPane' '/rename ${role}@${targetHost}' Enter Enter"
+  sleep 3
+  # Verify rename
+  local renameCapture
+  renameCapture=$("$OOSH_DIR/ossh" exec "$host" "otmux pane.capture '$targetPane' 5" 2>/dev/null)
+  if ! echo "$renameCapture" | grep -q "renamed"; then
+    warn.log "  rename not confirmed for $role — retrying"
+    "$OOSH_DIR/ossh" exec "$host" "otmux send.raw '$targetPane' '/rename ${role}@${targetHost}' Enter Enter"
+    sleep 3
+  fi
+  info.log "  renamed: ${role}@${targetHost}"
+
+  # 3.6: /remote-control
+  "$OOSH_DIR/ossh" exec "$host" "otmux send.raw '$targetPane' '/remote-control' Enter Enter"
+  sleep 3
+
+  # 3.7: Registry + title + lock
+  "$OOSH_DIR/ossh" exec "$host" "hiveMind registry.set '$targetPane' '$role'" 2>/dev/null
+  "$OOSH_DIR/ossh" exec "$host" "otmux pane.lock '$targetPane' '${role}@${targetHost}'" 2>/dev/null
+
+  # 3.8: Per-agent MVC verify
+  local regRole
+  regRole=$("$OOSH_DIR/ossh" exec "$host" "grep '^${targetPane}|' ~/config/hivemind.roles.env 2>/dev/null | cut -d'|' -f2")
+  if [ "$regRole" != "$role" ]; then
+    error.log "push.agent: MVC mismatch — registry has '$regRole', expected '$role'"
+    return 1
+  fi
+
+  console.log "  PASS: $role → $host:$targetPane"
+  return 0
+}
+
+hiveMind.team.push() # <host> <?teamSession> # push entire team to target host with per-agent verify-or-fail
 {
-  hiveMind.teams.migrate "$@"
+  local host="$1"
+  local teamSession="${2:-$(private.hiveMind.active.team)}"
+
+  if [ -z "$host" ]; then
+    error.log "Usage: hiveMind team.push <host> <?teamSession>"
+    return 1
+  fi
+  if ! this.isSshHost "$host"; then
+    error.log "team.push: invalid host '$host'"
+    return 1
+  fi
+
+  console.log "team.push: $teamSession → $host"
+
+  # 1. Pre-flight
+  private.hiveMind.push.preflight "$host" "$teamSession" || return 1
+
+  # 2. Workspace sync
+  console.log "Syncing oosh on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "cd ~/oosh && git pull" 2>/dev/null || {
+    warn.log "git pull failed on $host — continuing"
+  }
+
+  # 3. Snapshot source team
+  hiveMind.teams.save "$teamSession" 2>/dev/null
+
+  # 4. Per-agent loop (sequential, verify-or-fail)
+  local snapfile
+  snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
+  if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
+    error.log "team.push: no snapshot found"
+    return 1
+  fi
+
+  # Ensure target has enough panes — count agents and split as needed
+  local agentCount=0 paneIdx=0
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ "$sess" != "$teamSession" ] && continue
+    [ -z "$uuid" ] && continue
+    agentCount=$((agentCount + 1))
+    local idx="${addr##*.}"
+    [ "$idx" -gt "$paneIdx" ] && paneIdx="$idx"
+  done < "$snapfile"
+
+  # Split target panes if needed
+  local curPanes
+  curPanes=$("$OOSH_DIR/ossh" exec "$host" "tmux list-panes -t '$teamSession' 2>/dev/null | wc -l" 2>/dev/null)
+  curPanes=$((curPanes + 0))
+  while [ "$curPanes" -le "$paneIdx" ]; do
+    "$OOSH_DIR/ossh" exec "$host" "tmux split-window -t '${teamSession}:0' -v" 2>/dev/null
+    curPanes=$((curPanes + 1))
+  done
+
+  local failed=0 passCount=0
+  while IFS='|' read -r sess addr role uuid title; do
+    [[ "$sess" == "#"* ]] && continue
+    [ "$sess" != "$teamSession" ] && continue
+    [ -z "$uuid" ] && continue
+    [ -z "$role" ] || [ "$role" = "unknown" ] && continue
+
+    local targetPane="${teamSession}:${addr}"
+
+    # Resolve canonical UUID for this role
+    local canonicalUUID
+    canonicalUUID=$(private.hiveMind.push.resolveCanonical "$role" "$teamSession")
+    if [ -z "$canonicalUUID" ]; then
+      error.log "team.push: could not resolve UUID for $role — stopping"
+      failed=1
+      break
+    fi
+
+    console.log "Pushing $role (${canonicalUUID:0:8}...) → $targetPane"
+    if ! private.hiveMind.push.agent "$host" "$role" "$canonicalUUID" "$targetPane"; then
+      error.log "FAILED at agent $role — stopping push"
+      failed=1
+      break
+    fi
+    passCount=$((passCount + 1))
+  done < "$snapfile"
+
+  # 5. Final parity gate
+  if [ "$failed" -eq 0 ] && [ "$passCount" -gt 0 ]; then
+    console.log "Running consistency.reconcile.apply on $host..."
+    "$OOSH_DIR/ossh" exec "$host" "hiveMind consistency.reconcile.apply '$teamSession'" 2>/dev/null
+    local auditRc
+    "$OOSH_DIR/ossh" exec "$host" "hiveMind consistency.audit '$teamSession'" 2>/dev/null
+    auditRc=$?
+    if [ "$auditRc" -ne 0 ]; then
+      warn.log "team.push: audit found $auditRc violations after reconcile"
+    fi
+  fi
+
+  if [ "$failed" -eq 0 ]; then
+    console.log "team.push COMPLETE: $teamSession → $host ($passCount agents)"
+  else
+    error.log "team.push INCOMPLETE: $passCount agents passed before failure"
+  fi
+  return "$failed"
 }
 hiveMind.team.push.completion.sshHost() {
   command -v ossh >/dev/null 2>&1 && private.ossh.config.complete.hosts 2>/dev/null
+}
+hiveMind.team.push.completion.teamSession() {
+  private.hiveMind.teams.complete
 }
 
 # REMOTE PULL — reverse of teams.migrate (pull FROM remote, restart locally)
@@ -5109,6 +5398,12 @@ hiveMind.consistency.reconcile() # <?session> <?mode:dry-run|apply> # silent bat
 }
 hiveMind.consistency.reconcile.completion.session() { private.hiveMind.teams.complete; }
 hiveMind.consistency.reconcile.completion.mode() { echo "dry-run"; echo "apply"; }
+
+hiveMind.consistency.reconcile.apply() # <?session> # non-interactive batch apply (flagless, for team.push automation)
+{
+  hiveMind.consistency.reconcile "$1" "apply"
+}
+hiveMind.consistency.reconcile.apply.completion.session() { private.hiveMind.teams.complete; }
 
 private.hiveMind.reconcile.apply() # # consume diff lines on stdin, apply each mutation; echo summary at end
 {
