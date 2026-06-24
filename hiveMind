@@ -36,6 +36,7 @@
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 : ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
 : ${HIVEMIND_SNAPSHOT_VERSION:=1}
+: ${HIVEMIND_STATE:=${CONFIG_PATH:-$HOME/config}/hivemind.state.env}
 : ${HIVEMIND_QUEUE_DIR:=${CONFIG_PATH:-$HOME/config}/hivemind.queue}
 : ${HIVEMIND_QUEUE_MAX_DEPTH:=50}
 : ${HIVEMIND_QUEUE_MAX_AGE_SEC:=3600}
@@ -2086,18 +2087,19 @@ private.hiveMind.agent.route() # <pane> # classify pane state → route name (in
   status="${detect%%|*}"
 
   case "$status" in
-    idle)
+    DURING_REWIND|MAINTENANCE|FROZEN)
+      echo "rewind-hold"
+      ;;
+    idle|accept-edits)
       echo "inform"
       ;;
-    permission|accept-edits|tool-confirm|overlay|panel|autocomplete|shell-escaped)
+    permission|tool-confirm|overlay|panel|autocomplete|shell-escaped)
       echo "overlay"
       ;;
     active|queued|context-warning|just-compacted|shell)
       echo "queue"
       ;;
     rate-limit|subscription-limit|crash|api-error|mcp-error)
-      # Critical: neither send nor remote-control fixes these. Queue for later;
-      # drain will retry once state recovers (or human intervenes).
       echo "queue"
       ;;
     ""|unknown|*)
@@ -2150,12 +2152,17 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
   route=$(private.hiveMind.agent.route "$target")
 
   case "$route" in
+    rewind-hold)
+      local overrideState
+      overrideState=$(private.hiveMind.state.get "$target")
+      warn.log "agent.send: $name is ${overrideState:-DURING_REWIND} — message held"
+      create.result 3 "rewind-hold: $name $overrideState"
+      return 3
+      ;;
     inform)
       private.hiveMind.agent.inform "$target" "$message"
       local rc=$?
       if [ $rc -eq 0 ]; then
-        # Operator-visible (console.log = level 3, default). Silent success
-        # at default level looked like "message lost" — bug report 2026-05-26.
         console.log "INFORM delivered to $name ($target)"
         create.result 0 "delivered $name $target"
         return 0
@@ -2192,6 +2199,154 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
 }
 hiveMind.agent.send.completion.agentName() {
   private.hiveMind.roles.complete
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPERATOR STATE OVERRIDE — Layer 3 on top of live detection (Layer 2)
+# Storage: hivemind.state.env — pane|STATE|timestamp|set-by
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.state.get() {
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+  [ -f "$HIVEMIND_STATE" ] || return 1
+  local val
+  val=$(grep "^${pane}|" "$HIVEMIND_STATE" 2>/dev/null | tail -1 | cut -d'|' -f2)
+  [ -n "$val" ] && echo "$val" && return 0
+  return 1
+}
+
+private.hiveMind.state.set() {
+  local pane="$1" state="$2" setBy="${3:-operator}"
+  [ -z "$pane" ] || [ -z "$state" ] && return 1
+  local ts
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  mkdir -p "$(dirname "$HIVEMIND_STATE")" 2>/dev/null
+  local tmpFile="${HIVEMIND_STATE}.tmp.$$"
+  grep -v "^${pane}|" "$HIVEMIND_STATE" 2>/dev/null > "$tmpFile" || true
+  echo "${pane}|${state}|${ts}|${setBy}" >> "$tmpFile"
+  mv "$tmpFile" "$HIVEMIND_STATE"
+}
+
+private.hiveMind.state.clear() {
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+  [ -f "$HIVEMIND_STATE" ] || return 0
+  local tmpFile="${HIVEMIND_STATE}.tmp.$$"
+  grep -v "^${pane}|" "$HIVEMIND_STATE" > "$tmpFile" 2>/dev/null || true
+  mv "$tmpFile" "$HIVEMIND_STATE"
+}
+
+hiveMind.agent.state.set() # <role> <STATE> # set operator override state for an agent
+{
+  local role="$1" state="$2"
+  if [ -z "$role" ] || [ -z "$state" ]; then
+    error.log "Usage: hiveMind agent.state.set <role> <STATE>"
+    return 1
+  fi
+  if ! this.isRoleName "$role"; then
+    error.log "agent.state.set: invalid role '$role'"
+    return 1
+  fi
+  local pane
+  pane=$(hiveMind.resolve "$role" 2>/dev/null)
+  if [ -z "$pane" ]; then
+    error.log "agent.state.set: cannot resolve role '$role'"
+    return 1
+  fi
+  local callerRole=""
+  [ -n "$TMUX_PANE" ] && callerRole=$(grep "^$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)|" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2)
+  private.hiveMind.state.set "$pane" "$state" "${callerRole:-operator}"
+  success.log "Set $role ($pane) → $state"
+}
+hiveMind.agent.state.set.completion.role() {
+  private.hiveMind.roles.complete
+}
+hiveMind.agent.state.set.completion.STATE() {
+  echo "DURING_REWIND"
+  echo "MAINTENANCE"
+  echo "FROZEN"
+}
+
+hiveMind.agent.state.clear() # <role> # clear operator override state for an agent
+{
+  local role="$1"
+  if [ -z "$role" ]; then
+    error.log "Usage: hiveMind agent.state.clear <role>"
+    return 1
+  fi
+  local pane
+  pane=$(hiveMind.resolve "$role" 2>/dev/null)
+  if [ -z "$pane" ]; then
+    error.log "agent.state.clear: cannot resolve role '$role'"
+    return 1
+  fi
+  private.hiveMind.state.clear "$pane"
+  success.log "Cleared override for $role ($pane)"
+}
+hiveMind.agent.state.clear.completion.role() {
+  private.hiveMind.roles.complete
+}
+
+hiveMind.agent.state.get() # <role> # get operator override state for an agent (empty if none)
+{
+  local role="$1"
+  [ -z "$role" ] && return 1
+  local pane
+  pane=$(hiveMind.resolve "$role" 2>/dev/null)
+  [ -z "$pane" ] && return 1
+  private.hiveMind.state.get "$pane"
+}
+hiveMind.agent.state.get.completion.role() {
+  private.hiveMind.roles.complete
+}
+
+hiveMind.team.state.set() # <session> <STATE> # set operator override for ALL agents in a session
+{
+  local session="$1" state="$2"
+  if [ -z "$session" ] || [ -z "$state" ]; then
+    error.log "Usage: hiveMind team.state.set <session> <STATE>"
+    return 1
+  fi
+  if ! this.isSessionName "$session"; then
+    error.log "team.state.set: invalid session '$session'"
+    return 1
+  fi
+  local callerRole=""
+  [ -n "$TMUX_PANE" ] && callerRole=$(grep "^$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)|" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f2)
+  local count=0
+  local pane
+  while IFS= read -r pane; do
+    [ -z "$pane" ] && continue
+    private.hiveMind.state.set "$pane" "$state" "${callerRole:-operator}"
+    count=$((count + 1))
+  done < <(grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f1)
+  success.log "Set $count agents in $session → $state"
+}
+hiveMind.team.state.set.completion.session() {
+  private.hiveMind.teams.complete
+}
+hiveMind.team.state.set.completion.STATE() {
+  echo "DURING_REWIND"
+  echo "MAINTENANCE"
+  echo "FROZEN"
+}
+
+hiveMind.team.state.clear() # <session> # clear ALL operator overrides for a session
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind team.state.clear <session>"
+    return 1
+  fi
+  [ -f "$HIVEMIND_STATE" ] || return 0
+  local tmpFile="${HIVEMIND_STATE}.tmp.$$"
+  grep -v "^${session}:" "$HIVEMIND_STATE" > "$tmpFile" 2>/dev/null || true
+  mv "$tmpFile" "$HIVEMIND_STATE"
+  success.log "Cleared all overrides for $session"
+}
+hiveMind.team.state.clear.completion.session() {
+  private.hiveMind.teams.complete
 }
 
 hiveMind.agent.session.probe() # <agentName|pane> <?session> # ground-truth UUID via /status + JSONL correlation (slow ~3s)
@@ -3790,6 +3945,14 @@ hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote ma
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+hiveMind.team.push() # <sshHost> # push team to remote (alias for teams.migrate)
+{
+  hiveMind.teams.migrate "$@"
+}
+hiveMind.team.push.completion.sshHost() {
+  command -v ossh >/dev/null 2>&1 && private.ossh.config.complete.hosts 2>/dev/null
+}
+
 # REMOTE PULL — reverse of teams.migrate (pull FROM remote, restart locally)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4611,7 +4774,8 @@ hiveMind.consistency.audit() # <?session> <?format:human|json> # graded audit (I
       ;;
   esac
 
-  # Exit code = total violation count (per U2 — non-zero indicates degraded state)
+  # Exit code = total violation count, capped at 125 (126/127 reserved by bash)
+  [ "$total" -gt 125 ] && return 125
   return "$total"
 }
 hiveMind.consistency.audit.completion.format() { echo "human"; echo "json"; }
@@ -4769,10 +4933,19 @@ hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sp
     local issues=()
     [ -z "$regRole" ] && issues+=("no registry")
     if [ -n "$regRole" ] && [ -n "$title" ]; then
-      echo "$title" | grep -qi "$regRole" 2>/dev/null || issues+=("title≠reg")
+      local titleRole
+      titleRole=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
+      if [ -z "$titleRole" ] || [ "$titleRole" != "$regRole" ]; then
+        issues+=("title≠reg")
+      elif [ "$title" != "${regRole}@${HIVEMIND_HOST:-$(hostname -s 2>/dev/null)}" ]; then
+        issues+=("title@warn")
+      fi
     fi
     if [ -n "$sessUuid" ] && [ -n "$liveUuid" ] && [ "$sessUuid" != "$liveUuid" ]; then
-      issues+=("UUID stale")
+      # Forked sessions: --resume UUID is the PARENT, not current — skip stale check
+      local isForked=""
+      [ -n "$procRest" ] && echo "$procRest" | grep -q '\-\-fork-session' && isForked="yes"
+      [ -z "$isForked" ] && issues+=("UUID stale")
     fi
     if [ -n "$liveUuid" ]; then
       # Bash 3.2 compat: grep `uuid|` prefix in seenUuids string.
@@ -4793,10 +4966,25 @@ hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sp
 
     local match="${BOLD_GREEN}✓${NORMAL}"
     local issueStr=""
-    if [ ${#issues[@]} -gt 0 ]; then
+    # Separate hard errors from warnings (title@warn is cosmetic, not consistency-breaking)
+    local hardIssues=()
+    local warnIssues=()
+    local i
+    for i in "${issues[@]}"; do
+      case "$i" in
+        title@warn) warnIssues+=("$i") ;;
+        *) hardIssues+=("$i") ;;
+      esac
+    done
+    if [ ${#hardIssues[@]} -gt 0 ]; then
       match="${BOLD_RED}✗${NORMAL}"
-      issueStr="${BOLD_RED}$(IFS=', '; echo "${issues[*]}")${NORMAL}"
+      issueStr="${BOLD_RED}$(IFS=', '; echo "${hardIssues[*]}")${NORMAL}"
+      [ ${#warnIssues[@]} -gt 0 ] && issueStr="${issueStr} ${BOLD_YELLOW}$(IFS=', '; echo "${warnIssues[*]}")${NORMAL}"
       inconsistent=$((inconsistent + 1))
+    elif [ ${#warnIssues[@]} -gt 0 ]; then
+      match="${BOLD_YELLOW}⚠${NORMAL}"
+      issueStr="${BOLD_YELLOW}$(IFS=', '; echo "${warnIssues[*]}")${NORMAL}"
+      consistent=$((consistent + 1))
     else
       consistent=$((consistent + 1))
     fi
@@ -7390,6 +7578,14 @@ private.hiveMind.sweep.detect() {
   local target="$1"
   [ -z "$target" ] && echo "unknown|none|info" && return 1
 
+  # Layer 3: operator override — takes precedence over live detection
+  local override
+  override=$(private.hiveMind.state.get "$target")
+  if [ -n "$override" ]; then
+    echo "${override}|none|warning|operator-set"
+    return 0
+  fi
+
   local content
   content=$(otmux pane.capture "$target" 20 2>/dev/null)
 
@@ -7397,24 +7593,50 @@ private.hiveMind.sweep.detect() {
   trimmed=$(echo "$content" | tr -d '[:space:]')
   [ -z "$trimmed" ] && echo "unknown|none|info" && return 0
 
+  # ── LIVE TUI area FIRST — bottom 5 lines are the definitive state ─────
+  # Claude Code TUI layout (bottom of pane):
+  #   ─── role@host ──        (title bar)
+  #   ❯                       (prompt — may have typed text)
+  #   ────────────────────    (separator)
+  #   esc to interrupt        (ACTIVE — agent is working)
+  #   ⏵⏵ auto mode on · …   (IDLE — agent is waiting for input)
+  #
+  # Check the live area BEFORE scrollback. Stale scrollback (rate-limit text,
+  # "Compacted", api-error messages from prior states) caused false non-idle
+  # classifications when agents had already recovered to idle.
+  local bottom
+  bottom=$(echo "$content" | tail -n 5)
+
+  # Shell-escaped: bare $ prompt (agent left Claude Code)
+  if echo "$bottom" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
+    echo "shell-escaped|none|critical"
+    return 0
+  fi
+
+  # Active: "esc to int[errupt]" in the live area = Claude is generating/running
+  if echo "$bottom" | grep -q 'esc to int'; then
+    echo "active|none|info"
+    return 0
+  fi
+
+  # Idle: bare prompt (❯ or >) with NO "esc to interrupt" — definitive idle
+  if echo "$bottom" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
+    echo "idle|none|info"
+    return 0
+  fi
+
+  # Queued: text after prompt, not submitted (must come after idle check)
+  if echo "$bottom" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
+    echo "queued|enter|blocker"
+    return 0
+  fi
+
+  # ── Below here: bottom area was ambiguous (no clear prompt/active signal) ─
+  # Fall through to structural and scrollback checks for overlays, errors, etc.
+
   # Build a scrubbed view for substring-looking pattern checks (rate-limit,
-  # subscription-limit, crash) that tend to false-positive on source code
-  # showing the pattern string literally (comments, `grep -qE '…limit…'`
-  # regexes which match their own source). Structural checks below (menus,
-  # ❯ arrow, prompt state) keep using $content because their signals are UI
-  # shapes, not substrings, and don't collide with code.
-  # F2.1 — strip ALL common line-comment markers before substring matching.
-  # A source-code pane mentioning "rate limit" or "subscription limit" in a
-  # comment must not trigger the detector. Patterns stripped per first
-  # non-whitespace token:
-  #   #    — shell, Python, Ruby, Makefile, YAML, conf
-  #   //   — C, C++, JS, TS, Go, Rust, Java, Swift, CSS, Kotlin, Dart
-  #   --   — SQL, Haskell, Lua, Ada, Elm
-  #   /*   — C-family block comment open (single-line "/* … */" form)
-  #   *    — C-family block comment continuation line (e.g. "  * see also …")
-  #   <!-- — HTML/XML comment open
-  # Also drop shell control-flow, grep/sed/awk/echo calls (regex self-matches),
-  # and pipe continuations — unchanged from the original scrub.
+  # subscription-limit, crash) that tend to false-positive on source code.
+  # F2.1 — strip comment markers, code patterns, pipe continuations.
   local prose
   prose=$(echo "$content" \
     | grep -vE '^[[:space:]]*(#|//|--|/\*|\*[^/]|<!--)' \
@@ -7431,7 +7653,6 @@ private.hiveMind.sweep.detect() {
   fi
 
   # Git diff/status panel — needs Escape to close
-  # Note: 'files +N -N' also appears in the normal status bar — only match with Esc close
   if echo "$content" | grep -qE 'Esc close'; then
     echo "panel|escape|blocker"
     return 0
@@ -7441,17 +7662,33 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # ── Error states (most urgent first) ───────────────────────────────────
-  # These are substring matches that can collide with source-code displays,
-  # so they grep $prose (scrubbed of shell comments/code) not $content.
+  # ── Permission and confirmation prompts ────────────────────────────────
 
-  # Crash / exited: Claude Code process terminated unexpectedly
+  if echo "$content" | grep -q 'Do you want to' && \
+     echo "$content" | grep -qE '^\s*❯\s*[0-9]+\.\s*(Yes|No|Allow|Deny)'; then
+    echo "permission|enter|blocker"
+    return 0
+  fi
+
+  # ── Edit and acceptance prompts ────────────────────────────────────────
+
+  if echo "$bottom" | grep -q '⏵⏵ accept'; then
+    local edit_count
+    edit_count=$(echo "$bottom" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
+    [ -z "$edit_count" ] && edit_count=0
+    echo "accept-edits|enter|blocker|$edit_count"
+    return 0
+  fi
+
+  # ── Error states ──────────────────────────────────────────────────────
+  # Only reached when bottom area had no clear prompt. These are real
+  # blockers (agent is showing an error, not at a prompt).
+
   if echo "$prose" | grep -qiE 'claude.*exited|process.*terminated|segmentation fault|SIGKILL|SIGTERM|core dumped|fatal error'; then
     echo "crash|none|critical"
     return 0
   fi
 
-  # API error: network/server errors from Anthropic API
   if echo "$prose" | grep -qiE 'APIConnectionError|APIStatusError|ECONNREFUSED|ETIMEDOUT|502 Bad Gateway|503 Service|529 Overloaded|internal server error|network error|connection reset'; then
     local retry_detail
     retry_detail=$(echo "$prose" | grep -oiE 'retry.*(in |after )[0-9]+\s*s(ec)?' | tail -1)
@@ -7459,38 +7696,18 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # MCP connection error: MCP server connection/reconnect issues
   if echo "$prose" | grep -qiE 'MCP.*error|MCP.*disconnect|MCP.*reconnect|MCP.*timeout|MCP server.*not responding|failed to connect.*MCP'; then
     echo "mcp-error|wait|warning"
     return 0
   fi
 
-  # ── Permission and confirmation prompts ────────────────────────────────
-
-  # Permission / confirmation prompt — unified detector.
-  # All Claude Code approval dialogs share ONE invariant preamble: "Do you want to …?"
-  # (edit, proceed, continue, create, delete, run, apply, modify …). Combined with
-  # the interactive numbered menu (❯ arrow pointing at "N. Yes/No/Allow/Deny"),
-  # this reliably distinguishes a LIVE prompt from prose that mentions the words.
-  # Default action: Enter (CC pre-selects the safe affirmative option 1).
-  if echo "$content" | grep -q 'Do you want to' && \
-     echo "$content" | grep -qE '^\s*❯\s*[0-9]+\.\s*(Yes|No|Allow|Deny)'; then
-    echo "permission|enter|blocker"
-    return 0
-  fi
-
   # ── Rate and subscription limits ───────────────────────────────────────
-  # Substring matches — grep $prose (scrubbed) to avoid matching the pattern
-  # strings literally in source-code displays (hiveMind itself shows these
-  # patterns in comments and the grep regexes below self-match when visible).
 
-  # Subscription limit: quota/subscription exhausted (distinct from rate-limit)
   if echo "$prose" | grep -qiE 'subscription.*limit|daily.*limit.*reached|monthly.*limit|quota.*exhausted|billing.*limit|plan.*limit.*exceeded'; then
     echo "subscription-limit|none|critical"
     return 0
   fi
 
-  # Rate limit: temporary throttling
   if echo "$prose" | grep -qiE 'rate.limit|usage.limit|try again.*(in |later)|too many requests|throttl|request limit|capacity|overloaded.*try'; then
     local retry_time
     retry_time=$(echo "$prose" | grep -oiE '(in |after )[0-9]+ ?(sec|min|second|minute)s?' | tail -1)
@@ -7498,27 +7715,8 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # ── Edit and acceptance prompts ────────────────────────────────────────
-
-  # Accept edits prompt: ⏵⏵ accept edits on · N bash(es)
-  # F2.2 — match ONLY against the bottom 5 lines (the live status bar). Old
-  # `⏵⏵ accept` text in scrollback (e.g. agent's previous output, conversation
-  # history visible in pane) caused false positives that blocked Epic I
-  # context-aware sends to actually-idle agents. The live indicator only
-  # appears in the status bar above the prompt — never in conversation body.
-  local tail_content
-  tail_content=$(echo "$content" | tail -n 5)
-  if echo "$tail_content" | grep -q '⏵⏵ accept'; then
-    local edit_count
-    edit_count=$(echo "$tail_content" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
-    [ -z "$edit_count" ] && edit_count=0
-    echo "accept-edits|enter|blocker|$edit_count"
-    return 0
-  fi
-
   # ── Context and compact states ─────────────────────────────────────────
 
-  # Context warning: "Context left until auto-compact: N%"
   if echo "$content" | grep -qE 'auto-compact: [0-9]+%'; then
     local ctx_pct
     ctx_pct=$(echo "$content" | grep -oE 'auto-compact: [0-9]+%' | grep -oE '[0-9]+' | tail -1)
@@ -7526,7 +7724,6 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # Just compacted: "Compacted" in recent output
   if echo "$content" | grep -qiE 'Compacted|auto-compact.*completed'; then
     echo "just-compacted|none|warning"
     return 0
@@ -7534,64 +7731,13 @@ private.hiveMind.sweep.detect() {
 
   # ── UI states ──────────────────────────────────────────────────────────
 
-  # Autocomplete stuck: completion menu visible (e.g. /compact dropdown)
   if echo "$content" | grep -qE '^\s*/\w+.*─'; then
     echo "autocomplete|escape|blocker"
     return 0
   fi
 
-  local last_line
-  last_line=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
-
-  # Shell-escaped: bare $ prompt (agent left Claude Code)
-  if echo "$last_line" | grep -qE '^[[:space:]]*\$[[:space:]]*$'; then
-    echo "shell-escaped|none|critical"
-    return 0
-  fi
-
-  # Idle: clean prompt (just ❯ or > with no text after)
-  if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
-    # ── State-transition catch: invisible-rate-limit bug (Tron 2026-05-26)
-    # An agent that hit a rate-limit / subscription-limit / api-error often
-    # shows the message briefly, then returns to IDLE. The 20-line content
-    # capture above has already scrolled past the message — sweep classifies
-    # IDLE when the agent is actually STUCK. Catch it by scanning the wider
-    # scrollback for recent block markers. Only runs on the idle path so
-    # active agents (working through a resolved limit) aren't misclassified.
-    local history historyProse
-    history=$(otmux pane.capture "$target" 200 2>/dev/null)
-    historyProse=$(echo "$history" \
-      | grep -vE '^[[:space:]]*(#|//|--|/\*|\*[^/]|<!--)' \
-      | grep -vE "(grep|sed|awk|echo)[[:space:]]+-?[a-zA-Z]*[[:space:]]*['\"]" \
-      | grep -vE "^[[:space:]]*(if|elif|fi|then|else|done|for|while|case|esac)[[:space:]]*[[(]" \
-      | grep -vE "^[[:space:]]*\|[[:space:]]*(grep|sed|awk)|^[[:space:]]+\\\\\$")
-    # Subscription limit — most severe, needs human
-    if echo "$historyProse" | grep -qiE 'subscription.*limit|daily.*limit.*reached|monthly.*limit|quota.*exhausted|billing.*limit|plan.*limit.*exceeded'; then
-      echo "subscription-limit|none|critical|scrolled-history"
-      return 0
-    fi
-    # Rate limit — conservative pattern (drop generic "try again" / "overloaded" that false-positive in tool output)
-    if echo "$historyProse" | grep -qiE 'rate.limit|usage.limit|too many requests|throttl|request limit exceeded'; then
-      echo "rate-limit|wait|blocker|scrolled-history"
-      return 0
-    fi
-    # API error — distinctive Anthropic error class names
-    if echo "$historyProse" | grep -qiE 'APIConnectionError|APIStatusError|502 Bad Gateway|503 Service|529 Overloaded'; then
-      echo "api-error|wait|blocker|scrolled-history"
-      return 0
-    fi
-    echo "idle|none|info"
-    return 0
-  fi
-
-  # Queued: text after prompt not submitted
-  if echo "$last_line" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]+.+'; then
-    echo "queued|enter|blocker"
-    return 0
-  fi
-
-  # Active (generating/running tools/indeterminate)
-  echo "active|none|info"
+  # Unknown: can't classify from live area or scrollback
+  echo "unknown|none|info"
   return 0
 }
 

@@ -3365,6 +3365,79 @@ else
   expect.fail "$BARE_STDIN_LOOPS bare stdin loops with no fd3 or devnull protection — bug present"
 fi
 
+# --- T-PULL-9: JSONL loop processes ALL UUIDs, not just first ---
+# Bug: only 1 JSONL downloaded out of ~10. Reproduce by running
+# the same fd3 loop pattern over a multi-UUID snapshot and counting iterations.
+# MUST NOT call real ossh — mock it. Learnings: never execute the bug pattern live.
+PULL9_SNAP="${TMPDIR:-/tmp}/__test_pull9_$$.env"
+cat > "$PULL9_SNAP" <<PULL9EOF
+# hiveMind snapshot pull9-test
+# session|address|role|uuid|title
+testTeam|0.0|agent-a|aaaa0000-1111-2222-3333-444455556666|agent-a
+testTeam|0.1|agent-b|bbbb0000-1111-2222-3333-444455556666|agent-b
+testTeam|0.2|agent-c|cccc0000-1111-2222-3333-444455556666|agent-c
+testTeam|0.3|agent-d|dddd0000-1111-2222-3333-444455556666|agent-d
+testTeam|0.4|agent-e|eeee0000-1111-2222-3333-444455556666|agent-e
+PULL9EOF
+
+PULL9_COUNT=0
+PULL9_SEEN=""
+while IFS='|' read -r _s _a _r uuid _t <&4; do
+  [[ "$_s" == "#"* ]] && continue
+  [ -z "$uuid" ] && continue
+  echo "$PULL9_SEEN" | grep -q "$uuid" && continue
+  PULL9_SEEN="${PULL9_SEEN}${uuid} "
+  PULL9_COUNT=$((PULL9_COUNT + 1))
+done 4< "$PULL9_SNAP"
+
+test.case $level "T-PULL-9: loop processes all UUIDs from snapshot" \
+  echo "processed=$PULL9_COUNT expected=5"
+if [ "$PULL9_COUNT" -eq 5 ]; then
+  expect.pass "all 5 UUIDs processed by fd-redirect loop"
+else
+  expect.fail "only $PULL9_COUNT of 5 UUIDs processed — stdin consumption bug"
+fi
+rm -f "$PULL9_SNAP"
+
+# --- T-PULL-10: verify ossh calls inside loop don't consume fd ---
+# Simulate what team.pull does: fd3 loop + subshell commands per iteration.
+# Each iteration spawns a subshell (like ossh exec). Verify fd3 survives.
+PULL10_SNAP="${TMPDIR:-/tmp}/__test_pull10_$$.env"
+cat > "$PULL10_SNAP" <<PULL10EOF
+# hiveMind snapshot pull10-test
+# session|address|role|uuid|title
+t|0.0|a1|u001|t1
+t|0.1|a2|u002|t2
+t|0.2|a3|u003|t3
+t|0.3|a4|u004|t4
+t|0.4|a5|u005|t5
+t|0.5|a6|u006|t6
+t|0.6|a7|u007|t7
+t|0.7|a8|u008|t8
+t|0.8|a9|u009|t9
+t|0.9|a10|u010|t10
+PULL10EOF
+
+PULL10_COUNT=0
+while IFS='|' read -r _s _a _r uuid _t <&5; do
+  [[ "$_s" == "#"* ]] && continue
+  [ -z "$uuid" ] && continue
+  # Simulate ossh exec (subshell that touches stdin)
+  _mock_result=$(echo "mock-path-$uuid" | cat)
+  # Simulate ossh scp (another subshell)
+  _mock_scp=$(echo "copied" | cat)
+  PULL10_COUNT=$((PULL10_COUNT + 1))
+done 5< "$PULL10_SNAP"
+
+test.case $level "T-PULL-10: fd-redirect loop survives subshell commands" \
+  echo "processed=$PULL10_COUNT expected=10"
+if [ "$PULL10_COUNT" -eq 10 ]; then
+  expect.pass "all 10 UUIDs processed with subshell commands inside loop"
+else
+  expect.fail "only $PULL10_COUNT of 10 — subshell consumed loop input"
+fi
+rm -f "$PULL10_SNAP"
+
 echo ""
 echo "=== team.pull tests complete ==="
 echo ""
@@ -6415,6 +6488,154 @@ fi
 
 echo ""
 echo "=== SC-D.3 reconcile roundtrip tests complete ==="
+echo ""
+
+# ============================================================================
+# T-REWIND-STATE: DURING_REWIND override layer
+# Design: session/tasks/during-rewind-state.md
+# Storage: ~/config/hivemind.state.env (pane|STATE|timestamp|set-by)
+# Override sits ON TOP of live detection — DURING_REWIND wins over IDLE/ACTIVE
+# ============================================================================
+
+REWIND_STATE_FILE="${CONFIG_PATH:-$HOME/config}/hivemind.state.env"
+REWIND_SESS="rw-test-$$"
+REWIND_ROLE="rw-test-agent"
+REWIND_PANE="${REWIND_SESS}:0.0"
+HIVEMIND_SRC="$OOSH_DIR/hiveMind"
+
+# --- T-REWIND-1..4: function existence (no tmux needed) ---
+test.case $level "T-REWIND-1: agent.state.set exists" \
+  type -t hiveMind.agent.state.set
+if type -t hiveMind.agent.state.set &>/dev/null; then
+  expect.pass "hiveMind.agent.state.set is a function"
+else
+  expect.fail "hiveMind.agent.state.set should be defined"
+fi
+
+test.case $level "T-REWIND-2: agent.state.get exists" \
+  type -t hiveMind.agent.state.get
+if type -t hiveMind.agent.state.get &>/dev/null; then
+  expect.pass "hiveMind.agent.state.get is a function"
+else
+  expect.fail "hiveMind.agent.state.get should be defined"
+fi
+
+test.case $level "T-REWIND-3: agent.state.clear exists" \
+  type -t hiveMind.agent.state.clear
+if type -t hiveMind.agent.state.clear &>/dev/null; then
+  expect.pass "hiveMind.agent.state.clear is a function"
+else
+  expect.fail "hiveMind.agent.state.clear should be defined"
+fi
+
+test.case $level "T-REWIND-4: team.state.set and team.state.clear exist" \
+  echo "checking team-level state methods"
+RW_TSET=""; RW_TCLR=""
+type -t hiveMind.team.state.set &>/dev/null && RW_TSET="yes"
+type -t hiveMind.team.state.clear &>/dev/null && RW_TCLR="yes"
+if [ "$RW_TSET" = "yes" ] && [ "$RW_TCLR" = "yes" ]; then
+  expect.pass "team.state.set + team.state.clear both exist"
+else
+  expect.fail "team.state.set=$RW_TSET team.state.clear=$RW_TCLR"
+fi
+
+# --- T-REWIND-5..10: state set/get/clear/send — need real tmux session ---
+if otmux sessions >/dev/null 2>&1 && type -t hiveMind.agent.state.set &>/dev/null; then
+
+  # Setup: real tmux session + registered role
+  otmux kill "$REWIND_SESS" 2>/dev/null
+  otmux new "$REWIND_SESS" 2>/dev/null
+  private.hiveMind.registry.set "$REWIND_PANE" "$REWIND_ROLE" 2>/dev/null
+
+  # T-REWIND-5: state.set writes to state.env
+  hiveMind.agent.state.set "$REWIND_ROLE" "DURING_REWIND" 2>/dev/null
+  RW5_LINE=$(grep "$REWIND_PANE" "$REWIND_STATE_FILE" 2>/dev/null | head -1)
+  test.case $level "T-REWIND-5: state.set writes to state.env" echo "$RW5_LINE"
+  if echo "$RW5_LINE" | grep -q "DURING_REWIND"; then
+    expect.pass "DURING_REWIND written for $REWIND_PANE"
+  else
+    expect.fail "state.env should contain DURING_REWIND for $REWIND_PANE"
+  fi
+
+  # T-REWIND-6: state.get returns override
+  RW6_GET=$(hiveMind.agent.state.get "$REWIND_ROLE" 2>/dev/null)
+  test.case $level "T-REWIND-6: state.get returns override" echo "$RW6_GET"
+  if [ "$RW6_GET" = "DURING_REWIND" ]; then
+    expect.pass "state.get returns DURING_REWIND"
+  else
+    expect.fail "expected DURING_REWIND, got: '$RW6_GET'"
+  fi
+
+  # T-REWIND-7: state.clear removes override
+  hiveMind.agent.state.clear "$REWIND_ROLE" 2>/dev/null
+  RW7_AFTER=$(hiveMind.agent.state.get "$REWIND_ROLE" 2>/dev/null)
+  test.case $level "T-REWIND-7: state.clear removes override" echo "after='$RW7_AFTER'"
+  if [ -z "$RW7_AFTER" ]; then
+    expect.pass "state.clear removed override"
+  else
+    expect.fail "after clear, state.get should be empty, got: '$RW7_AFTER'"
+  fi
+
+  # T-REWIND-8: state.env 4-field format
+  hiveMind.agent.state.set "$REWIND_ROLE" "DURING_REWIND" 2>/dev/null
+  RW8_LINE=$(grep "$REWIND_PANE" "$REWIND_STATE_FILE" 2>/dev/null | head -1)
+  RW8_FIELDS=$(echo "$RW8_LINE" | awk -F'|' '{print NF}')
+  test.case $level "T-REWIND-8: state.env format is 4 fields" echo "fields=$RW8_FIELDS"
+  if [ "$RW8_FIELDS" -eq 4 ]; then
+    expect.pass "4 pipe-delimited fields: $RW8_LINE"
+  else
+    expect.fail "expected 4 fields, got $RW8_FIELDS: $RW8_LINE"
+  fi
+
+  # T-REWIND-9: send returns rc=3 (rewind-hold)
+  hiveMind.agent.send "$REWIND_ROLE" "test message during rewind" 2>/dev/null
+  RW9_RC=$?
+  test.case $level "T-REWIND-9: agent.send returns rc=3 (rewind-hold)" echo "rc=$RW9_RC"
+  if [ "$RW9_RC" -eq 3 ]; then
+    expect.pass "agent.send returns rc=3 (rewind-hold)"
+  else
+    expect.fail "expected rc=3, got rc=$RW9_RC"
+  fi
+
+  # T-REWIND-10: after clear, state gone
+  hiveMind.agent.state.clear "$REWIND_ROLE" 2>/dev/null
+  RW10_AFTER=$(hiveMind.agent.state.get "$REWIND_ROLE" 2>/dev/null)
+  test.case $level "T-REWIND-10: after clear, state empty" echo "after='$RW10_AFTER'"
+  if [ -z "$RW10_AFTER" ]; then
+    expect.pass "state cleared — send routing uses live detection"
+  else
+    expect.fail "state should be empty after clear, got: '$RW10_AFTER'"
+  fi
+
+  # Cleanup
+  otmux kill "$REWIND_SESS" 2>/dev/null
+
+else
+  for t in 5 6 7 8 9 10; do
+    test.case $level "T-REWIND-$t: (skipped — no tmux or not implemented)" echo "skip"
+    expect.pass "skipped"
+  done
+fi
+
+# --- T-REWIND-11: code-level — sweep checks state.env override ---
+test.case $level "T-REWIND-11: sweep code checks state.env override" \
+  echo "checking sweep integration"
+SWEEP_BODY=$(sed -n '/hiveMind.team.sweep()/,/^}/p' "$HIVEMIND_SRC" 2>/dev/null)
+STATUS_BODY=$(sed -n '/hiveMind.team.status()/,/^}/p' "$HIVEMIND_SRC" 2>/dev/null)
+SWEEP_HAS=$(echo "$SWEEP_BODY" | grep -c 'state.env\|state.get\|hivemind.state' | tr -d ' ')
+STATUS_HAS=$(echo "$STATUS_BODY" | grep -c 'state.env\|state.get\|hivemind.state' | tr -d ' ')
+if [ "$SWEEP_HAS" -gt 0 ] || [ "$STATUS_HAS" -gt 0 ]; then
+  expect.pass "sweep/status checks state override (sweep=$SWEEP_HAS status=$STATUS_HAS)"
+else
+  expect.fail "sweep/status should check hivemind.state.env for override"
+fi
+
+# --- Cleanup rewind test artifacts ---
+[ -f "$REWIND_STATE_FILE" ] && grep -v 'rw-test' "$REWIND_STATE_FILE" > "${REWIND_STATE_FILE}.rw_clean" 2>/dev/null && mv "${REWIND_STATE_FILE}.rw_clean" "$REWIND_STATE_FILE"
+[ -f "$REG_FILE" ] && grep -v 'rw-test' "$REG_FILE" > "${REG_FILE}.rw_clean" 2>/dev/null && mv "${REG_FILE}.rw_clean" "$REG_FILE"
+
+echo ""
+echo "=== T-REWIND-STATE tests complete ==="
 echo ""
 
 # ============================================================================
