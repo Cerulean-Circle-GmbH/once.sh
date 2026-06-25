@@ -7,6 +7,19 @@
 - **Transparency:** Emphasis on logging, debugging, and state management for traceability and troubleshooting.
 - **Interactivity:** Advanced usage (ONCE server) is highly interactive, guiding the user through a state machine.
 
+- **Self-Care Across the Whole Lifecycle:** Every program is responsible for its own correctness from birth to death. It does not assume a correct environment — it establishes one, validates it, and repairs it when broken. Four obligations, no exceptions:
+  1. **Init correct state.** On startup, establish a known-good environment — resolve paths, write pure-state config, set required variables. Never assume the caller left things right.
+  2. **Detect when sideways.** Validate own state continuously (`config.validate`, `check … fix`). A broken env with RC=0 and no signal is a bug — silent wrongness is the worst failure mode.
+  3. **Reinit to self-repair.** When state is bad, heal it — regenerate clean config, re-resolve paths, reinit. Via ONE easy, discoverable, idempotent entrypoint (e.g. `config repair`, `oo reconfigure`). Self-repair is cheap and always available.
+  4. **Whole lifecycle.** install → boot → run → recover. Every phase can detect-and-heal; no phase silently ships or perpetuates a broken state.
+
+  Existing mechanisms that implement this principle:
+  - `check … fix <action>` — the OOSH check-and-auto-fix idiom (detect condition → apply fix action)
+  - `config.validate` — purity guard: rejects env files containing logic (no `source`, `$(...)`, `[ ]`, `: ${`)
+  - `config repair` / `oo reconfigure` — regenerate clean pure-state env from current live state
+  - `this` bootstrap — self-validates env on every boot; auto-heals or signals clearly when broken
+  - `context` lifecycle + state machines — lifecycle scaffolding for multi-step workflows with recovery
+
 ## Core Mechanisms
 - **State Machine:** ONCE uses a state-driven approach for installation and configuration, allowing stepwise progression and troubleshooting.
 - **Domain Management:** Supports domain configuration and discovery, including integration with external services (e.g., Keycloak).
