@@ -1,24 +1,17 @@
 # First Principles: oosh / once.sh
 
 ## Philosophy
+- **init() is the constructor — it ALWAYS yields a fully operational, consistent, and safe object.** OOSH is the Object-Oriented Shell: `scriptname.start()` / `this.init` / `config.init` are constructors. The constructor contract is absolute — after init runs, the object IS valid: fully operational, internally consistent, safe to use. There is no "loaded-but-broken" state.
+  - **Always valid, every call.** init is idempotent and self-healing BY DESIGN. Run it on a fresh object or a born-broken one — it always ends in a valid object. "Repair" is not a separate command; it is simply init invoked again.
+  - **Resolve fundamentals from the canonical source.** Identity/structure (e.g. OOSH_DIR, CONFIG_PATH, OOSH_MODE) is derived from where the script itself lives (`BASH_SOURCE`) — never guessed (`$HOME/oosh`), never trusted from a possibly-broken value, never conditionally skipped.
+  - **No state loss.** Reinit preserves all existing user configuration; it restores the broken/missing fundamentals only. Reinit ≠ wipe.
+  - **Pure-state persistence.** Config/env files hold STATE ONLY — `export`/`declare`, comments, blanks, and `source xyz.env` as the sole permitted construct. No logic. They are safe to source precisely because they are inert.
+  - **Never silently broken.** If init cannot reach a valid object, it fails LOUD — never half-constructed, never RC=0 on a broken env.
 - **Portability:** Designed to work across multiple Unix-like environments (Mac OS, Ubuntu, Android Termux, iOS iSH, Raspberry Pi OS).
 - **Object-Oriented Shell (OOSH):** Brings object-oriented paradigms to shell scripting for better modularity, reusability, and maintainability.
 - **Unified Management:** ONCE provides a single entry point to manage installation and configuration of the environment.
 - **Transparency:** Emphasis on logging, debugging, and state management for traceability and troubleshooting.
 - **Interactivity:** Advanced usage (ONCE server) is highly interactive, guiding the user through a state machine.
-
-- **Self-Care Across the Whole Lifecycle:** Every program is responsible for its own correctness from birth to death. It does not assume a correct environment — it establishes one, validates it, and repairs it when broken. Four obligations, no exceptions:
-  1. **Init correct state.** On startup, establish a known-good environment — resolve paths, write pure-state config, set required variables. Never assume the caller left things right.
-  2. **Detect when sideways.** Validate own state continuously (`config.validate`, `check … fix`). A broken env with RC=0 and no signal is a bug — silent wrongness is the worst failure mode.
-  3. **Reinit to self-repair.** When state is bad, heal it — regenerate clean config, re-resolve paths, reinit. Via ONE easy, discoverable, idempotent entrypoint (e.g. `config repair`, `oo reconfigure`). Self-repair is cheap and always available.
-  4. **Whole lifecycle.** install → boot → run → recover. Every phase can detect-and-heal; no phase silently ships or perpetuates a broken state.
-
-  Existing mechanisms that implement this principle:
-  - `check … fix <action>` — the OOSH check-and-auto-fix idiom (detect condition → apply fix action)
-  - `config.validate` — purity guard: rejects env files containing logic (no `source`, `$(...)`, `[ ]`, `: ${`)
-  - `config repair` / `oo reconfigure` — regenerate clean pure-state env from current live state
-  - `this` bootstrap — self-validates env on every boot; auto-heals or signals clearly when broken
-  - `context` lifecycle + state machines — lifecycle scaffolding for multi-step workflows with recovery
 
 ## Core Mechanisms
 - **State Machine:** ONCE uses a state-driven approach for installation and configuration, allowing stepwise progression and troubleshooting.
