@@ -284,58 +284,71 @@ config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" 
     #declare -px | grep "^\(declare .* \)*\(.*$name\)\(.*\)=" | sed 's/^\(declare .* \)*\(.*'$name'\)\(.*\)=\(\"\)*\([^\"]*\)\(\"\)*/export \2\3=\"\5\"/'
     #declare -p | grep "^\(declare -.* \)*\(.*$name\)\(.*\)=" | sed 's/^\(declare -.* \)*\(.*'$name'\)\(.*\)=\(.*\)/export \2\3=\4/'
   RESULT=""
-  # declare -p 
-  # important.log "now filter"
-  # declare -p | grep "^\(declare -[^aA]* \)*\([^ ]*$name\)\(.*\)=" 
-  # important.log "now replace"
-  # declare -p | grep "^\(declare -[^aA]* \)*\([^ ]*$name\)\(.*\)=" | sed 's/\([^-]*\)\(-x *\)\(.*'$name'\)\(.*\)=\(.*\)/export \1\3\4=\5/'
-  {    
-    #declare -p | grep "^\(declare -[^a]* \)*\([^ ]*$name\)\(.*\)=" | sed 's/^\(declare -.* \)*\((.*'$name'\)\(.*\)=\(.*\)/export \2\3=\4/'
-    #declare -p | grep "^\(declare -[^aA]* \)*\([^ ]*$name\)\(.*\)=" | sed 's/^\(declare -.* \)\(.*'$name'\)\(.*\)=\(.*\)/export \2\3=\4/'
-    
-    # Match exported vars where name is a PREFIX (e.g. OOSH matches OOSH_DIR).
-    # Filter: only vars whose NAME starts with the prefix (not vars whose VALUE contains it).
-    # Output format: export VARNAME="value"
-    declare -px 2>/dev/null | while IFS= read -r line; do
-      # Extract variable name: "declare -x VARNAME=..." or "export VARNAME=..."
-      local varname
-      varname=$(echo "$line" | sed -n 's/^.*[ ]\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')
-      [ -z "$varname" ] && continue
-      # Only include vars whose name starts with the prefix
-      case "$varname" in ${name}*) ;; *) continue ;; esac
-      # Skip arrays
-      echo "$line" | grep -q "^declare -[aA]" && continue
-      # Normalize to export format
-      echo "$line" | sed 's/^declare -[^ ]* /export /'
-    done
-  } >$CONFIG
 
-  if [ -z "$file" ]; then
-    #problem.log "regenerate config"
-
+  if [ -n "$file" ]; then
+    # Single-file save (e.g. oosh.env, log.env): dump from declare -px
+    {
+      declare -px 2>/dev/null | while IFS= read -r line; do
+        local varname
+        varname=$(echo "$line" | sed -n 's/^.*[ ]\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')
+        [ -z "$varname" ] && continue
+        case "$varname" in ${name}*) ;; *) continue ;; esac
+        echo "$line" | grep -q "^declare -[aA]" && continue
+        echo "$line" | sed 's/^declare -[^ ]* /export /'
+      done
+    } >$CONFIG
+  else
+    # No-args path: regenerate user.env via harvest-resolve-merge
     important.log "generating $CONFIG"
-    # Resolve fundamentals canonically before emit — never skip a fundamental var
-    private.this.resolve.fundamentals
-    echo "export PATH=\"$PATH\"" >>$CONFIG
-    echo "export BASH_FILE=\"$BASH_FILE\"" >>$CONFIG
-    echo "export OOSH_DIR=\"$OOSH_DIR\"" >>$CONFIG
-    echo "export CONFIG_PATH=\"$CONFIG_PATH\"" >>$CONFIG
-    echo "export OOSH_MODE=\"$OOSH_MODE\"" >>$CONFIG
 
+    # PHASE 1 — HARVEST: extract valid exports + source *.env from existing file
+    local harvested=""
+    if [ -f "$CONFIG" ]; then
+      harvested=$(while IFS= read -r line; do
+        [[ "$line" =~ ^export[[:space:]] ]] && echo "$line"
+        [[ "$line" =~ ^source[[:space:]].*\.env ]] && echo "$line"
+        [[ "$line" =~ ^\.[[:space:]].*\.env ]] && echo "$line"
+      done < "$CONFIG")
+    fi
+
+    # PHASE 2 — RESOLVE: canonical fundamentals from BASH_SOURCE
+    private.this.resolve.fundamentals
+
+    # PHASE 3 — MERGE + WRITE
+    {
+      # Fundamentals (canonical — always correct, override stale)
+      echo "export CONFIG_PATH=\"$CONFIG_PATH\""
+      echo "export CONFIG_FILE=\"$CONFIG_FILE\""
+      echo "export CONFIG=\"$CONFIG_PATH/$CONFIG_FILE\""
+      echo "export OOSH_DIR=\"$OOSH_DIR\""
+      echo "export OOSH_MODE=\"$OOSH_MODE\""
+      [ -n "$BASH_FILE" ] && echo "export BASH_FILE=\"$BASH_FILE\""
+      echo "export PATH=\"$PATH\""
+
+      # Harvested user vars (skip fundamentals — already written)
+      echo "$harvested" | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        # Extract var name from export line
+        [[ "$line" =~ ^export[[:space:]] ]] || continue
+        local vn="${line#export }"; vn="${vn%%=*}"
+        case "$vn" in
+          CONFIG_PATH|CONFIG_FILE|CONFIG|OOSH_DIR|OOSH_MODE|BASH_FILE|PATH) continue ;;
+        esac
+        echo "$line"
+      done
+
+      # Source chain (Rule A)
+      echo "source \$CONFIG_PATH/oosh.env"
+      echo "source \$CONFIG_PATH/log.env"
+    } > "$CONFIG"
 
     ### HACK should be in log.init only. but is needed for ssh remote logging
       log.device $LOG_DEVICE
     ###
 
-
     config.save oosh OOSH
     config.save log LOG
     config.file user.env
-    config.add oosh OOSH
-    config.add log LOG
-    # if [ -x "$(command -v once)" ]; then
-    #   once v
-    # fi
     config.validate
   fi
   config.info.log
@@ -419,45 +432,9 @@ config.validate() # <?file> # verify env file contains only pure state (export/d
   return 0
 }
 
-config.repair() # # regenerate a clean pure-state user.env from ground truth (never trusts broken env)
+config.repair() # # repair IS init — regenerate user.env via harvest-resolve-merge (alias for config.save)
 {
-  private.this.resolve.fundamentals
-  export CONFIG_FILE="user.env"
-  export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
-
-  if [ -z "$OOSH_DIR" ]; then
-    error.log "config.repair: cannot resolve OOSH_DIR"
-    return 1
-  fi
-
-  mkdir -p "$CONFIG_PATH" 2>/dev/null
-
-  local targetFile="$CONFIG_PATH/$CONFIG_FILE"
-  console.log "config.repair: OOSH_DIR=$OOSH_DIR MODE=$OOSH_MODE target=$targetFile"
-
-  # Write user.env directly to the resolved absolute path — bypass config.save entirely
-  {
-    echo "export CONFIG_PATH=\"$CONFIG_PATH\""
-    echo "export CONFIG_FILE=\"$CONFIG_FILE\""
-    echo "export CONFIG=\"$targetFile\""
-    echo "export OOSH_DIR=\"$OOSH_DIR\""
-    echo "export OOSH_MODE=\"$OOSH_MODE\""
-    echo "export PATH=\"$PATH\""
-    [ -n "$BASH_FILE" ] && echo "export BASH_FILE=\"$BASH_FILE\""
-    echo "export CONFIG_CHAIN_OOSH=1"
-    echo "export CONFIG_CHAIN_LOG=1"
-  } > "$targetFile"
-
-  # Re-export so subsequent config calls use the clean values
-  export CONFIG="$targetFile"
-
-  if config.validate; then
-    success.log "config.repair: $targetFile is clean"
-  else
-    error.log "config.repair: validation FAILED after regeneration"
-    return 1
-  fi
-  return 0
+  config.save
 }
 
 config.add() # <name:$CONFIG> # registers config <name> in user.env (pure export marker; sourcing chain lives in this bootstrap)
