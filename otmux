@@ -2994,6 +2994,19 @@ otmux.pane.send() # <target> <text> # send text + Enter to pane; target=session:
 }
 
 
+# Kill ONLY the background enforcer loops for <target> — matched by the distinct
+# `__paneLockEnforcer <target>` signature in their argv, NEVER the generic
+# `pane.lock` script name (which would SIGTERM the live foreground `otmux
+# pane.lock <target>` caller → rc=143, title never set: the BUG6 regression).
+private.otmux.pane.lock.killEnforcers() {
+  local target="$1"
+  [ -z "$target" ] && return 0
+  # escape regex-significant chars in the target so 0.4 doesn't match 0.41 etc.
+  local pat="__paneLockEnforcer $(echo "$target" | sed 's/[.[]/\\&/g') "
+  pkill -f "$pat" 2>/dev/null
+  return 0
+}
+
 otmux.pane.lock() # <target> <title> # lock pane title; idempotent — auto-unlocks first if already locked
 {
   local target=$(private.resolve.target "$1")
@@ -3020,18 +3033,20 @@ otmux.pane.lock() # <target> <title> # lock pane title; idempotent — auto-unlo
     # Claude Code plan mode uses select-pane -T directly, bypassing allow-rename.
     # Background loop re-enforces every 5s until pane.unlock kills it.
     local pidFile="/tmp/otmux.pane.lock.$(echo "$target" | tr ':.' '_').pid"
-    # Kill old enforcer if running
-    [ -f "$pidFile" ] && kill "$(cat "$pidFile")" 2>/dev/null
-    (
+    # Kill any prior enforcer(s) for this pane (orphan-safe) before starting one.
+    private.otmux.pane.lock.killEnforcers "$target"
+    # Tagged enforcer: argv carries `__paneLockEnforcer <target> …` so pane.unlock
+    # can pkill ONLY this loop, never the foreground pane.lock/pane.unlock caller.
+    setsid bash -c '
+      target="$1"; title="$2"; pidFile="$3"
       echo $$ > "$pidFile"
       while true; do
         sleep 5
-        local current
-        current=$($TMUX_CMD display-message -t "$target" -p '#{pane_title}' 2>/dev/null) || break
-        [ "$current" != "$title" ] && $TMUX_CMD select-pane -t "$target" -T "$title" 2>/dev/null
+        current=$(tmux -u display-message -t "$target" -p "#{pane_title}" 2>/dev/null) || break
+        [ "$current" != "$title" ] && tmux -u select-pane -t "$target" -T "$title" 2>/dev/null
       done
       rm -f "$pidFile"
-    ) &
+    ' __paneLockEnforcer "$target" "$title" "$pidFile" >/dev/null 2>&1 &
     disown
     info.log "Locked pane $target title to: $title (background enforcer)"
   fi
@@ -3047,8 +3062,10 @@ otmux.pane.unlock() # <target> # unlock pane title; allows normal title changes
   fi
   # Remove pane-level hook (tmux 3.2+ only, safe to fail on older)
   $TMUX_CMD set-hook -up -t "$target" pane-title-changed 2>/dev/null
-  # Kill ALL enforcers for this pane — catches orphans from accumulated pane.lock calls
-  pkill -f "pane\.lock.*$(echo "$target" | sed 's/[.]/\\./g')" 2>/dev/null
+  # Kill ALL enforcer loops for this pane (orphan-safe) — by the distinct
+  # `__paneLockEnforcer <target>` signature ONLY, so the live foreground
+  # `otmux pane.lock <target>` caller is never self-SIGTERM'd (BUG6 regression).
+  private.otmux.pane.lock.killEnforcers "$target"
   # Also clean up pid file
   local pidFile="/tmp/otmux.pane.lock.$(echo "$target" | tr ':.' '_').pid"
   [ -f "$pidFile" ] && kill "$(cat "$pidFile")" 2>/dev/null && rm -f "$pidFile"
