@@ -2167,6 +2167,140 @@ echo "=== T-ZOOM-HELPER tests complete ==="
 echo ""
 
 # ============================================================================
+# REGRESSION: T-UNLOCK-KILLS — pane.unlock must leave NO orphan enforcers
+# BUG 6: multiple pane.lock calls could leave orphan enforcers that keep
+#        flickering the title; pane.unlock only killed the ONE pid-file PID.
+# Fix: pane.lock auto-unlocks first (idempotent); pane.unlock removes the
+#      pane hook AND kills the enforcer (pid file) — zero orphans after unlock.
+#
+# MECHANISM-AWARE (PO ruling 2026-06-28): pane.lock chooses by tmux capability —
+#   tmux 3.2+ : pane-title-changed HOOK (no background process)
+#   tmux <3.2 : background ENFORCER process (pid-file tracked)
+#   neither   : allow-rename off only (escape-sequence block)
+# The orphan enforcer is tracked by its PID FILE, not by "pane.lock" in argv
+# (the subshell's argv never contains it) — so this test detects via pid file
+# + the live re-apply signature, and asserts the OBSERVABLE BUG6 contract on
+# every mechanism. Runs in an ISOLATED throwaway session (no live-pane impact).
+# ============================================================================
+
+if [ -n "$TMUX" ] && tmux new-session -d -s "__locktest_$$" -x 80 -y 24 2>/dev/null; then
+  UNLOCK_SESSION="__locktest_$$"
+  UNLOCK_PANE="${UNLOCK_SESSION}:0.0"
+  UNLOCK_TITLE="__test_unlock_$$"
+  UNLOCK_PIDFILE="/tmp/otmux.pane.lock.$(echo "$UNLOCK_PANE" | tr ':.' '_').pid"
+  # Disable automatic-rename in the throwaway session so the shell's command
+  # name can't churn the pane title back to the hostname (would mask the lock).
+  tmux set-option -t "$UNLOCK_SESSION" automatic-rename off 2>/dev/null
+  tmux set-window-option -t "$UNLOCK_SESSION" automatic-rename off 2>/dev/null
+
+  # Orphan-enforcer detector: pid-file PID alive, OR a live enforcer loop
+  # re-applying our test title (select-pane -T <title>). argv-pgrep on
+  # "pane.lock" cannot match the backgrounded subshell — pid file is canonical.
+  # Returns a clean integer (pgrep -c prints 0 but exits 1 on no-match, so we
+  # sanitize rather than chain `|| echo 0`, which would double-print).
+  count_orphan_enforcers() {
+    local n=0 extra
+    if [ -f "$UNLOCK_PIDFILE" ] && kill -0 "$(cat "$UNLOCK_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+      n=1
+    fi
+    extra=$(pgrep -fc "select-pane -t ${UNLOCK_PANE}.*${UNLOCK_TITLE}" 2>/dev/null)
+    case "$extra" in ''|*[!0-9]*) extra=0 ;; esac
+    echo $((n + extra))
+  }
+
+  # Pre-clean + capability probe: which locking mechanism does this tmux use?
+  otmux pane.unlock "$UNLOCK_PANE" >/dev/null 2>&1
+  rm -f "$UNLOCK_PIDFILE" 2>/dev/null
+  sleep 1
+  otmux pane.lock "$UNLOCK_PANE" "${UNLOCK_TITLE}_probe" >/dev/null 2>&1
+  sleep 1
+  if [ -f "$UNLOCK_PIDFILE" ] && kill -0 "$(cat "$UNLOCK_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    LOCK_MECH="enforcer"
+  elif tmux show-hooks -p -t "$UNLOCK_PANE" 2>/dev/null | grep -q pane-title-changed; then
+    LOCK_MECH="hook"
+  else
+    LOCK_MECH="escape-only"
+  fi
+  otmux pane.unlock "$UNLOCK_PANE" >/dev/null 2>&1
+  sleep 1
+
+  # T-UNLOCK-KILLS-1: pane.lock completes cleanly (rc=0) — the one universal,
+  # deterministic guarantee across all mechanisms. (Title-stickiness is
+  # mechanism-AND-tmux-version dependent — e.g. tmux <3.2 has no pane hooks and
+  # a shell pane's title can churn — and is covered by the dedicated
+  # "pane.lock sets pane title" regression above; this BUG6 suite asserts the
+  # lock/unlock LIFECYCLE, not title rendering.)
+  otmux pane.lock "$UNLOCK_PANE" "${UNLOCK_TITLE}_a" >/dev/null 2>&1
+  LOCK_RC=$?
+  sleep 1
+  test.case $level "T-UNLOCK-KILLS-1: pane.lock completes rc=0 (mech=$LOCK_MECH)" echo "rc=$LOCK_RC"
+  if [ "$LOCK_RC" -eq 0 ]; then
+    expect.pass "pane.lock rc=0 (mech=$LOCK_MECH)"
+  elif [ "$LOCK_RC" -eq 143 ]; then
+    # SIGTERM. pane.lock auto-unlocks first (idempotency); pane.unlock's
+    # `pkill -f "pane.lock.*$target"` matches the RUNNING `otmux pane.lock
+    # <target>` process's own argv and SIGTERMs it -> 143, title never set.
+    # Regression from the BUG6 pkill (the pattern must exclude the live caller,
+    # e.g. match only the enforcer loop signature, not any pane.lock invocation).
+    expect.fail "pane.lock SELF-TERMINATED (rc=143): pane.unlock pkill self-match — BUG6 regression, pane.lock cannot set a title"
+  else
+    expect.fail "pane.lock returned rc=$LOCK_RC"
+  fi
+
+  # T-UNLOCK-KILLS-2: BUG6 core — double-lock then unlock leaves ZERO orphan
+  # enforcers AND zero residual hook. Holds on all mechanisms (trivially 0 when
+  # none spawn; catches real accumulation when the enforcer path is active).
+  otmux pane.lock "$UNLOCK_PANE" "${UNLOCK_TITLE}_b" >/dev/null 2>&1
+  sleep 1
+  otmux pane.unlock "$UNLOCK_PANE" >/dev/null 2>&1
+  sleep 2
+  ORPHANS=$(count_orphan_enforcers)
+  HOOK_LEFT=$(tmux show-hooks -p -t "$UNLOCK_PANE" 2>/dev/null | grep -c pane-title-changed)
+  test.case $level "T-UNLOCK-KILLS-2: unlock leaves 0 orphan enforcers + 0 hooks" echo "orphans=$ORPHANS hooks=${HOOK_LEFT:-0}"
+  if [ "$ORPHANS" -eq 0 ] && [ "${HOOK_LEFT:-0}" -eq 0 ]; then
+    expect.pass "zero orphan enforcers, zero residual hook after unlock"
+  else
+    expect.fail "BUG6 regression: orphans=$ORPHANS residual-hooks=${HOOK_LEFT:-0} after unlock"
+  fi
+
+  # T-UNLOCK-KILLS-3: relock is idempotent (no accumulation) + unlock restores
+  # allow-rename. Relock WITHOUT an explicit unlock between — pane.lock must
+  # auto-unlock the prior lock so enforcers/hooks never stack.
+  otmux pane.lock "$UNLOCK_PANE" "${UNLOCK_TITLE}_c" >/dev/null 2>&1
+  sleep 1
+  otmux pane.lock "$UNLOCK_PANE" "${UNLOCK_TITLE}_d" >/dev/null 2>&1
+  sleep 1
+  RELOCK_ORPHANS=$(count_orphan_enforcers)
+  otmux pane.unlock "$UNLOCK_PANE" >/dev/null 2>&1
+  sleep 1
+  ALLOW_RENAME=$(tmux show-options -p -t "$UNLOCK_PANE" 2>/dev/null | grep allow-rename || echo "unset")
+  test.case $level "T-UNLOCK-KILLS-3: relock idempotent (<=1 enforcer) + allow-rename restored" \
+    echo "relock_orphans=$RELOCK_ORPHANS allow=$ALLOW_RENAME"
+  if [ "$RELOCK_ORPHANS" -le 1 ] && echo "$ALLOW_RENAME" | grep -qE "on|unset"; then
+    expect.pass "idempotent ($RELOCK_ORPHANS enforcer after relock), allow-rename restored ($ALLOW_RENAME)"
+  else
+    expect.fail "relock_orphans=$RELOCK_ORPHANS (want <=1), allow-rename=$ALLOW_RENAME (want on/unset)"
+  fi
+
+  # Cleanup — unlock, drop pid file, kill the throwaway session
+  otmux pane.unlock "$UNLOCK_PANE" >/dev/null 2>&1
+  rm -f "$UNLOCK_PIDFILE" 2>/dev/null
+  unset -f count_orphan_enforcers 2>/dev/null
+  tmux kill-session -t "$UNLOCK_SESSION" 2>/dev/null
+else
+  test.case $level "T-UNLOCK-KILLS-1: (skipped — no tmux)" echo "skip"
+  expect.pass "skipped"
+  test.case $level "T-UNLOCK-KILLS-2: (skipped — no tmux)" echo "skip"
+  expect.pass "skipped"
+  test.case $level "T-UNLOCK-KILLS-3: (skipped — no tmux)" echo "skip"
+  expect.pass "skipped"
+fi
+
+echo ""
+echo "=== T-UNLOCK-KILLS tests complete ==="
+echo ""
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 
