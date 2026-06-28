@@ -6,7 +6,14 @@
   - **Resolve fundamentals from the canonical source.** Identity/structure (e.g. OOSH_DIR, CONFIG_PATH, OOSH_MODE) is derived from where the script itself lives (`BASH_SOURCE`) — never guessed (`$HOME/oosh`), never trusted from a possibly-broken value, never conditionally skipped.
   - **No state loss.** Reinit preserves all existing user configuration; it restores the broken/missing fundamentals only. Reinit ≠ wipe.
   - **Pure-state persistence.** Config/env files hold STATE ONLY — `export`/`declare`, comments, blanks, and `source xyz.env` as the sole permitted construct. No logic. They are safe to source precisely because they are inert.
-  - **Never silently broken.** If init cannot reach a valid object, it fails LOUD — never half-constructed, never RC=0 on a broken env.
+  - **Never silently broken.** A broken/polluted env is never run on blindly: init detects it (validates its own state) and heals it. It is never half-constructed and never returns RC=0 on an env it has not made valid.
+- **Self-Care Across the Whole Lifecycle.** *Tron, verbatim:* "All programs self-care for their whole lifecycle. They init correct (env) states, and reinit to self-repair when something goes sideways." A program is responsible for its own correctness from birth to death:
+  - **Init correct state.** On startup it establishes a known-good environment (correct env vars, pure-state config, resolved paths) — it never assumes the environment is already correct.
+  - **Detect when it goes sideways.** It validates its own state (`config.validate`, `check`) and recognises a broken/polluted/stale env instead of running blindly on it.
+  - **Reinit to self-repair.** When state is bad it heals itself — regenerates clean config, re-resolves fundamentals, reinits — via ONE easy, discoverable, idempotent entrypoint that is always available (repair IS init invoked again).
+  - **Whole lifecycle.** install → boot → run → recover. Every phase can detect-and-heal; no phase silently ships or perpetuates a broken state.
+  - Implemented by: `check … fix` (check-and-auto-fix idiom), `config.validate` / `config.save` (purity guard + self-healing reinit), `reconfigure` / `oo reconfigure` (re-exec with fresh config), and `this` bootstrap self-validate.
+- **Only env files are sourced; scripts are invoked.** Sourcing pulls a file's contents into the current shell. Only pure-state env files (`export`/`declare` + `source xyz.env`, no logic) may be sourced — they are inert and safe. SCRIPTS are never sourced into a shell; they are invoked through their CLI / the `this` dispatch (`scriptname method args`), which runs them in their own process with proper method resolution. This keeps logic out of the env and keeps the shell uncontaminated by a script's internals.
 - **Portability:** Designed to work across multiple Unix-like environments (Mac OS, Ubuntu, Android Termux, iOS iSH, Raspberry Pi OS).
 - **Object-Oriented Shell (OOSH):** Brings object-oriented paradigms to shell scripting for better modularity, reusability, and maintainability.
 - **Unified Management:** ONCE provides a single entry point to manage installation and configuration of the environment.
