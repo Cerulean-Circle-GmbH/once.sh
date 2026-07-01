@@ -2179,7 +2179,45 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
       create.result 1 "rejected: in-overlay"
       return 1
       ;;
-    queue|unknown-state)
+    unknown-state)
+      # AUTO-HEAL (self-care) — `unknown-state` is almost always a TRANSIENT
+      # detection failure, NOT a genuinely unreachable agent: under fd/proc
+      # pressure sweep.detect's `otmux pane.capture` fork FAILS → empty capture →
+      # route classifies unknown-state. Queuing here is what makes robbin-po
+      # intermittently "unreachable". So RE-RESOLVE from ground truth (fresh
+      # channel → pane target) + RETRY detection ONCE before dropping to queue.
+      # init-correct → detect-sideways → reinit-to-repair.
+      local healChannel healTarget healRoute
+      healChannel=$(private.hiveMind.channel.resolve "$name" 2>/dev/null)
+      if [ -n "$healChannel" ] && [ "${healChannel%%|*}" != "api" ]; then
+        healTarget="${healChannel#*|}"
+      else
+        healTarget="$target"
+      fi
+      healRoute=$(private.hiveMind.agent.route "$healTarget")
+      if [ "$healRoute" != "unknown-state" ]; then
+        warn.log "agent.send: $name auto-healed unknown-state → $healRoute (target $healTarget)"
+        case "$healRoute" in
+          inform)
+            private.hiveMind.agent.inform "$healTarget" "$message"
+            if [ $? -eq 0 ]; then
+              console.log "INFORM delivered to $name ($healTarget) after auto-heal re-resolve"
+              create.result 0 "delivered $name $healTarget (auto-healed)"
+              return 0
+            fi
+            ;;
+          overlay)
+            error.log "rejected: $name is in overlay state — use hiveMind agent.approve/reject/dismiss/option"
+            create.result 1 "rejected: in-overlay (auto-healed)"
+            return 1
+            ;;
+        esac
+        # healRoute was queue/rewind-hold/inform-that-failed → queue with the
+        # re-resolved (ground-truth) target, not the stale one.
+        target="$healTarget"; route="$healRoute"
+      fi
+      ;&
+    queue)
       # I1.4 — persist to queue file; drain happens via agent.unblock idle hook.
       private.hiveMind.agent.queue.enqueue "$target" "inform" "$message"
       local pos
@@ -8092,6 +8130,15 @@ private.hiveMind.sweep.detect() {
 
   local trimmed
   trimmed=$(echo "$content" | tr -d '[:space:]')
+  # Self-heal: an EMPTY capture under fd/proc pressure is almost always a
+  # TRANSIENT fork failure (otmux pane.capture couldn't spawn), not a truly
+  # blank pane — and empty→"unknown" is the source of the spurious
+  # route=unknown-state that makes agents intermittently "unreachable". Retry
+  # once before declaring unknown; a real transient clears on the retry.
+  if [ -z "$trimmed" ]; then
+    content=$(otmux pane.capture "$target" 20 2>/dev/null)
+    trimmed=$(echo "$content" | tr -d '[:space:]')
+  fi
   [ -z "$trimmed" ] && echo "unknown|none|info" && return 0
 
   # ── LIVE TUI area FIRST — bottom 5 lines are the definitive state ─────
