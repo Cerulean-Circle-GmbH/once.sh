@@ -39,6 +39,18 @@ if [ "${BASH_SOURCE:-$0}" != "$0" ] || [ "${OOSH_NO_AUTORUN:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
+# ─── Ignore preset unclean config (clean environment first) ──────────────
+# init/oosh is the CONSTRUCTOR: it runs on a blank slate and must NOT trust
+# OOSH runtime/config vars inherited from another user's shell. `su <user>`
+# without `-` leaks the invoker's exports (e.g. root's CONFIG_PATH=/root/config,
+# OOSH_DIR=/root/oosh) which the target user often can't even read — poisoning
+# the handoff to `this call ossh install.continue.local`. Wipe them here so the
+# installer + state machine re-establish clean, user-correct values below.
+# (OOSH_DIR is additionally re-derived from this script's own path further down.)
+unset OOSH_DIR CONFIG CONFIG_PATH CONFIG_FILE OOSH_MODE OOSH_OS OOSH_PM \
+      OOSH_PM_UPDATED OOSH_PROMPT OOSH_SHLVL OOSH_SSH_CONFIG_HOST OOSH_STATUS \
+      BASH_FILE LOG_DEVICE LOG_LEVEL LOG_LEVEL_RESET
+
 # ─── Branch default ──────────────────────────────────────────────────────
 # Resolved early — the self-re-exec block below needs $OOSH_BRANCH for
 # the curl-pipe pre-clone fallback. `promote` rewrites this literal
@@ -78,6 +90,50 @@ if [ -z "${SUDO+x}" ]; then
   fi
 fi
 export SUDO
+
+# Can we run a privileged step WITHOUT an interactive prompt? True when already
+# root, or sudo present with a cached/NOPASSWD credential (`sudo -n`). Used to
+# DEFER system-package steps for an unprivileged direct-user install (`su <user>`
+# → run-as-user): rather than block on a sudo password or emit a raw "Could not
+# open lock file … Permission denied", we skip+warn and let the oo state machine
+# escalate later for the specific steps that truly need root (Tron 2026-07-01).
+oosh_can_escalate() {
+  [ "$(id -u 2>/dev/null)" = "0" ] && return 0
+  command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1
+}
+
+# Persist the OOSH login hook into the INVOKING user's ~/.bashrc so a fresh
+# interactive login (`su <user>`, ssh) comes up as `[oosh …]` (ACCEPTANCE-critical,
+# Tron 2026-07-01). Stock distros ship a plain ~/.bashrc; a direct-user install
+# (run-as-user path, no sudo re-exec) otherwise completes but the next login is
+# plain bash. Installs the canonical OOSH bashrc template (single source of truth
+# — same file the rest of the framework uses), idempotent + backs up a non-OOSH
+# original once. Self-healing warning on any failure; never fatal. Resolves the
+# user's real passwd home (a leaked HOME from `su` without `-` must not misdirect).
+oosh_install_user_bashrc() {
+  _tmpl="$OOSH_DIR/templates/user/bashrcTemplate"
+  _who="$(id -un 2>/dev/null)"
+  _home="$(eval echo "~$_who" 2>/dev/null)"
+  [ -d "$_home" ] || _home="$HOME"
+  _rc="$_home/.bashrc"
+  if [ ! -f "$_tmpl" ]; then
+    echo "oosh install: WARNING bashrc template missing ($_tmpl) — login hook not persisted" >&2
+    return 0
+  fi
+  # Already OOSH-enabled? (template sources config/user.env) → idempotent no-op.
+  if [ -f "$_rc" ] && grep -q 'config/user.env' "$_rc" 2>/dev/null; then
+    return 0
+  fi
+  # Back up a pre-existing non-OOSH ~/.bashrc once.
+  if [ -f "$_rc" ] && [ ! -f "$_home/.bashrc.pre-oosh" ]; then
+    cp "$_rc" "$_home/.bashrc.pre-oosh" 2>/dev/null
+  fi
+  if cp "$_tmpl" "$_rc" 2>/dev/null; then
+    echo "oosh install: installed OOSH login hook into $_rc — a fresh login yields [oosh]" >&2
+  else
+    echo "oosh install: WARNING could not write $_rc — login hook not persisted" >&2
+  fi
+}
 
 # PM detection — POSIX port of the historical PM-discovery helper, extended
 # with the same choice strings ossh.pm.discover uses (ossh:2128-2140). Sets
@@ -131,7 +187,15 @@ oosh_cmd_install() {
       $OOSH_PM "$_pkg"
     fi
   else
-    $SUDO $OOSH_PM "$_pkg"
+    # Non-brew PMs need root. If we can't escalate non-interactively, DEFER
+    # (self-healing warning) instead of prompting for a password or emitting a
+    # raw permission error — the oo state machine escalates when truly needed.
+    if oosh_can_escalate; then
+      $SUDO $OOSH_PM "$_pkg"
+    else
+      echo "oosh install: WARNING cannot install '$_pkg' without non-interactive root — deferring (oo state machine escalates when needed)" >&2
+      return 1
+    fi
   fi
 }
 
@@ -175,9 +239,15 @@ fi
 # line tells the user what's happening — without it, slow mirrors give
 # 30–60s of zero output that looks identical to a hang.
 if [ "$OOSH_PM_BIN" = "apt-get" ] && [ -z "$OOSH_APT_UPDATED" ]; then
-  echo "oosh install: refreshing package lists (apt-get update) — this may take 30-60 seconds…" >&2
-  $SUDO apt-get update >/dev/null 2>&1 || true
-  export OOSH_APT_UPDATED=1
+  if oosh_can_escalate; then
+    echo "oosh install: refreshing package lists (apt-get update) — this may take 30-60 seconds…" >&2
+    $SUDO apt-get update >/dev/null 2>&1 || true
+    export OOSH_APT_UPDATED=1
+  else
+    # Unprivileged direct-user install — defer system-pkg refresh (self-healing
+    # warning, not a fatal lock-file error). oo state machine escalates if needed.
+    echo "oosh install: WARNING skipping apt-get update (no non-interactive root) — deferring system-pkg steps to the oo state machine" >&2
+  fi
 fi
 
 # ─── 3. Install git BEFORE any bash re-exec ──────────────────────────────
@@ -343,7 +413,12 @@ fi
 #   3. ossh install <host> with Host's User=root      (MODE=root, id -u == 0) — skipped
 # i.e. we only need to re-exec when we're not already root. MODE=root is
 # the SCP-handoff signal, orthogonal to whether sudo is needed.
-if [ "$(id -u)" -ne 0 ]; then
+# Run AS THE USER — do NOT sudo re-exec on a direct user invocation (Tron 2026-07-01).
+# A user running `./init/oosh` (MODE empty) proceeds as themselves and sets up a
+# user-level OOSH; privilege is DEFERRED to the oo state machine, which escalates
+# only for the specific steps that truly need root. Only the ossh-driven remote
+# install (MODE=root, SCP-handoff) still re-execs as root.
+if [ "$(id -u)" -ne 0 ] && [ -n "$MODE" ]; then
   echo "oosh install: re-executing as root via sudo (enter password if prompted)…"
   # When curl-piped (`bash -c "$(curl …)"`), $0 is the literal string
   # "bash" (the shell's name), not a filesystem path — `sudo bash "$0"`
@@ -431,6 +506,17 @@ if [ "$OOSH_DIR" != "$_canon" ] && [ "$OOSH_DIR" != "$HOME/oosh" ]; then
 fi
 unset _canon
 
+# ─── Finalization tail is SELF-HEALING → disable errexit (Tron ERROR/WARNING) ──
+# Phase B ran under `set -e` so a genuinely-fatal prereq failure (no git/bash)
+# aborts with the framed hint. From here on every step is BEST-EFFORT and must
+# self-heal, not abort: the post-clone prereq install, the state-machine handoff,
+# per-user setup, and — critically — persisting the OOSH login hook. Leaving
+# `set -e` on made any non-zero in this tail (e.g. a warn/log helper, a deferred
+# system-pkg step) kill the script BEFORE the login hook was written, so a fresh
+# `su <user>` came up as plain bash. Errors here are WARNINGS; `rc` still carries
+# the state-machine result to the final exit.
+set +e
+
 # ─── Env + install log ──────────────────────────────────────────────────
 export OOSH_DIR
 export PATH="$OOSH_DIR:$PATH"
@@ -441,6 +527,13 @@ mkdir -p "$(dirname "$INSTALL_LOG")"
   echo "# init/oosh (thin bootstrap) handing off to ossh install.continue.local"
 } > "$INSTALL_LOG"
 [ -n "$LOG_LEVEL_ARG" ] && export LOG_LEVEL="$LOG_LEVEL_ARG"
+
+# ACCEPTANCE-critical: persist the OOSH login hook NOW — before the best-effort
+# state-machine handoff below — so a fresh `su <user>` yields [oosh] even if a
+# later tail step warns/fails. Idempotent; the copy only needs OOSH_DIR (set
+# above) + the template on disk. user.env is produced by the state machine that
+# follows and is sourced by the hook at login time.
+oosh_install_user_bashrc
 
 # ─── Install post-clone prereqs via canonical oosh primitive ────────────
 # rsync (used by ossh.config.shared.create at ossh:74) and tree (used by
@@ -459,6 +552,28 @@ local_name="${REMOTE_SSH_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null
 echo "Handing off to ossh install.continue.local (branch=$OOSH_BRANCH, host=$local_name)…"
 "$OOSH_DIR/this" call ossh install.continue.local "$local_name" "$CONFIG_REMOTE"
 rc=$?
+
+# ─── Classify the state-machine outcome (Tron ERROR/WARNING) ─────────────
+# The SETUP_SERVER state machine advances through the USER states and then a
+# ROOT/SERVER tail (root.installation.done → shared.dev.folder.linked → headless
+# → once) that an unprivileged DIRECT-USER install legitimately cannot complete.
+# Reaching `user.installation.done` IS success for this context — the [oosh] shell
+# is fully provisioned (verified: fresh `su - <user>` → [oosh], `config list` ok).
+# So a non-zero rc after reaching that state is a BENIGN DEFERRAL (warning), not a
+# failure — map it to 0 so a good user install doesn't report INIT_EXIT=1. A rc
+# from an EARLIER state is a real failure and stays non-zero (surfaced + logged).
+if [ "$rc" -ne 0 ]; then
+  _stateEnv="$HOME/config/current.state.machine.env"
+  _reached=""
+  [ -f "$_stateEnv" ] && _reached="$(. "$_stateEnv" 2>/dev/null; printf '%s' "${stateValue:-}")"
+  case "$_reached" in
+    user.installation.done|root.installation.done|*.folder.linked|headless|once)
+      echo "oosh install: user install complete (state '$_reached'); server/root steps deferred for this unprivileged context — re-login to use [oosh]. Treating as success." >&2
+      rc=0 ;;
+    *)
+      echo "oosh install: WARNING state machine returned $rc (reached '${_reached:-unknown}') — see $INSTALL_LOG" >&2 ;;
+  esac
+fi
 
 # ─── Install oosh for the invoking user when curl'd as non-root ─────────
 # When a non-root user runs the curl one-liner, the sudo re-exec earlier
@@ -499,5 +614,10 @@ if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ] && [ $rc -eq 0 ]; then
     echo "WARNING: user.oosh.install failed for '$SUDO_USER' — see errors above"
   fi
 fi
+
+# Re-affirm the login hook for the SUDO_USER re-exec path (idempotent no-op when
+# already present). The primary, acceptance-critical install ran before the
+# state-machine handoff above so it survives any best-effort tail failure.
+oosh_install_user_bashrc
 
 exit $rc
