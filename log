@@ -53,33 +53,22 @@ if ! [ "$(type -t info.log)" = "function" ]; then
   source $(dirname ${BASH_SOURCE[0]})/this
 fi
 
-private.log.device() { # # echo a WRITABLE log device — single source of truth (Tron ERROR/WARNING self-heal)
-  # init/oosh + `su <user>` (without -) leak the invoker's LOG_DEVICE=/dev/stdout;
-  # the target user usually cannot write root's fd1 → a raw `>>$LOG_DEVICE` write
-  # emits "Permission denied", and any fd1 device also contaminates $(...) captures
-  # (BUG 5). Map the known fd1 aliases to stderr, then verify writability with a
-  # tty→stderr fallback. Self-healing warning: never fails, never writes a raw error
-  # line. Every *.log writer routes its device through here so the coercion is global.
-  local dev="${LOG_DEVICE:-/dev/stderr}"
-  case "$dev" in
-    /dev/stdout|/proc/self/fd/1|/dev/fd/1) dev=/dev/stderr ;;
+private.log.emit() { # <preformatted-line> # write a log line WITHOUT the reopen-leak (Tron ERROR/WARNING self-heal)
+  # THE su- LEAK, precisely: after `su -` the controlling tty stays root-owned. A
+  # writer that REOPENS the /dev/stderr PATH (`>>/dev/stderr` = open /proc/self/fd/2
+  # → the root tty) gets EACCES at open() → "bash: /dev/stderr: Permission denied"
+  # at EVERY login. But writing the ALREADY-OPEN fd2 via a dup (`>&2`) does NOT
+  # reopen — the kernel checked permission only at the original open() (by root),
+  # so donges' write to the inherited fd2 SUCCEEDS. So: terminal logs go to fd2 by
+  # dup, never by reopening a path. A real LOG_DEVICE *file* is appended (silent fd2
+  # fallback). fd1/stdout stays excluded (BUG 5 — $() capture safety). `printf %b`
+  # matches `echo -e` escape handling.
+  case "${LOG_DEVICE:-}" in
+    ""|/dev/stdout|/dev/stderr|/proc/self/fd/1|/dev/fd/1|/proc/self/fd/2|/dev/fd/2|/dev/tty)
+      printf '%b\n' "$1" >&2 ;;
+    *)
+      { printf '%b\n' "$1" >>"$LOG_DEVICE"; } 2>/dev/null || printf '%b\n' "$1" >&2 ;;
   esac
-  # Writable as-is? use it. NOTE the redirection ORDER: `2>/dev/null` MUST come
-  # BEFORE `>>"$dev"`. Bash applies redirections left-to-right; if `>>/dev/stderr`
-  # is opened first and fails (root-owned tty under `su -`), bash prints
-  # "bash: /dev/stderr: Permission denied" to the REAL terminal before the
-  # `2>/dev/null` ever takes effect. Putting `2>/dev/null` first means the failed
-  # open's error is already routed to /dev/null. (This leak WAS residual #2.)
-  : 2>/dev/null >>"$dev" && { echo "$dev"; return 0; }
-  # Otherwise fall through writable candidates. The final /dev/null is guaranteed
-  # writable + silent, so a `su -` login whose controlling tty is still root-owned
-  # (both /dev/stderr AND /dev/tty unwritable for the target user) NEVER emits a
-  # raw "Permission denied" line at every login — logs drop silently instead.
-  local _cand
-  for _cand in /dev/tty /dev/stderr "${LOG_LIVE:-$HOME/config/log.live.out}" /dev/null; do
-    : 2>/dev/null >>"$_cand" && { echo "$_cand"; return 0; }
-  done
-  echo /dev/null
 }
 
 test.console.log() {
@@ -89,7 +78,7 @@ test.console.log() {
     echo -e "${NO_COLOR}log: ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} >$*${NORMAL}" | tee -a ~/config/result.txt  >>$LOG_LIVE  
   fi
   if [ "$LOG_LEVEL" -gt "0" ]; then
-    echo -e "${NO_COLOR}$*" >>"$(private.log.device)"
+    private.log.emit "${NO_COLOR}$*"
   fi
 }
 
@@ -100,7 +89,7 @@ console.log() {
     echo -e "${NO_COLOR}log: ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} >$*${NORMAL}" | tee -a ~/config/result.txt  >>$LOG_LIVE
   fi
   if [ "$LOG_LEVEL" -gt "2" ]; then
-    echo -e "${NO_COLOR}$*" >>"$(private.log.device)"
+    private.log.emit "${NO_COLOR}$*"
   fi
   [ -n "$LOG_INSTALL" ] && [ -f "$LOG_INSTALL" ] && echo "CONSOLE: $*" >> "$LOG_INSTALL"
 }
@@ -134,7 +123,7 @@ silent.log() {
     echo -e "${GRAY}-: ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} ${GRAY}> $*${NORMAL}" | tee -a ~/config/error.txt >>$LOG_LIVE ## cyan
   fi
   if [ "$LOG_LEVEL" -gt "2" ]; then
-    echo -e "${GRAY}  $*${NORMAL}" >>"$(private.log.device)"
+    private.log.emit "${GRAY}  $*${NORMAL}"
   fi
   [ -n "$LOG_INSTALL" ] && [ -f "$LOG_INSTALL" ] && echo "SILENT: $*" >> "$LOG_INSTALL"
 }
@@ -146,7 +135,7 @@ success.log() {
     echo -e "${BOLD_GREEN}SUCCESS: ${GRAY}${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} ${BOLD_GREEN}> $*${NORMAL}" | tee -a ~/config/result.txt >>$LOG_LIVE ## cyan
   fi
   if [ "$LOG_LEVEL" -gt "2" ]; then
-    echo -e "${BOLD_GREEN}SUCCESS> $*${NORMAL}" >>"$(private.log.device)"
+    private.log.emit "${BOLD_GREEN}SUCCESS> $*${NORMAL}"
   fi
 }
 
@@ -183,15 +172,12 @@ warn.log()
 
 important.log() {
   seq.puml.log 2>/dev/null
-  # BUG 5 — never write to stdout (would contaminate $(...) captures / RESULT).
-  # DRY: single-source writable-device coercion (also self-heals unwritable devices).
-  local impDev; impDev="$(private.log.device)"
   if [ -n "$LOG_LIVE" ] \
   && [ "$LOG_LEVEL" -gt "1" ]; then
     echo -e "${BOLD_CYAN}IMPORTANT: ${COLOR_GRAY}${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} ${BOLD_CYAN}> $*${NORMAL}" >>$LOG_LIVE ## cyan
   fi
   if [ "$LOG_LEVEL" -gt "1" ]; then
-    echo -e "${BOLD_CYAN}IMPORTANT> $*${NORMAL}" >>"$impDev"
+    private.log.emit "${BOLD_CYAN}IMPORTANT> $*${NORMAL}"
   fi
   [ -n "$LOG_INSTALL" ] && [ -f "$LOG_INSTALL" ] && echo "IMPORTANT: $*" >> "$LOG_INSTALL"
   {
@@ -215,7 +201,7 @@ debug.log() {
         echo -e "${BOLD_CYAN}-: ${COLOR_GRAY}${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} ${BOLD_CYAN}> $*${NORMAL}"  >>$LOG_LIVE     
     fi
     if [ "$LOG_LEVEL" -gt "4" ]; then
-        echo -e "${XXXX}${BOLD_CYAN}- $*${NORMAL}" >>"$(private.log.device)"
+        private.log.emit "${XXXX}${BOLD_CYAN}- $*${NORMAL}"
     fi
     [ -n "$LOG_INSTALL" ] && [ -f "$LOG_INSTALL" ] && echo "DEBUG: $*" >> "$LOG_INSTALL"
 }
@@ -227,7 +213,7 @@ stop.log() {
     echo -e "${BOLD_GREEN}BREAKPOINT: $(date) ${COLOR_GRAY}${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} ${BOLD_GREEN}> $*${NORMAL}" | tee -a ~/config/error.txt >>$LOG_LIVE ## cyan
   fi
   if [ "$LOG_LEVEL" -gt "3" ]; then
-    echo -e "${BOLD_GREEN}BREAKPOINT> $*${NORMAL}" >>"$(private.log.device)"
+    private.log.emit "${BOLD_GREEN}BREAKPOINT> $*${NORMAL}"
     export STEP_DEBUG=ON
   fi
 }
@@ -241,17 +227,13 @@ err.log() {
     source $CONFIG
   fi
 
-  # BUG 5 — errors must NEVER reach stdout: a $(...) command substitution captures
-  # fd1, so an error.log on stdout contaminates the caller's RESULT/path-build.
-  # DRY: single-source writable-device coercion (fd1→stderr + writability self-heal).
-  local errDev; errDev="$(private.log.device)"
 
   seq.puml.log
   if [ -n "$LOG_LIVE" ]; then
       echo -e "${BOLD_RED}ERROR: $(date) ${BOLD_WHITE}${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0]}:${LINENO}   - ${BASH_SOURCE[@]##*/} ${BOLD_RED}> $*${NORMAL}" | tee -a ~/config/error.txt ~/config/result.txt >>$LOG_LIVE
   fi
   if [ "$LOG_LEVEL" -gt 0 ]; then
-      echo -e "${BOLD_RED}ERROR> $*${NORMAL}" >>"$errDev"
+      private.log.emit "${BOLD_RED}ERROR> $*${NORMAL}"
   fi
 
   # seq.puml.log
