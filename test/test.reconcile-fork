@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# T-RECONCILE-FORK — OTR-3 reconcile-after-fork (SCENARIO-FIRST, RED before impl)
+# Spec: scrum.pmo/sprints/sprint-2/task-s2-c.2-reconcile-after-fork.md
+#
+# Contract (tester acceptance):
+#   • fork in-place → sessions.env carries the NEW (live) uuid, not the stale
+#     cached one, after reconcile heals it (I2b — currently SKIPPED).
+#   • empty-uuid + live agent → healed to the live uuid (tty-match adopt).
+#   • orphan (live agent pane with NO role) → team.audit flags unknown-route.
+#   • dead uuid (sessions.env uuid matching NO live process) → team.audit flags.
+#
+# Measure LIVE (role.uuid = proc-args truth, cache-immune). Fully ISOLATED:
+# every mutation is on a TEMP copy via HIVEMIND_SESSIONS/HIVEMIND_REGISTRY — the
+# live registry that routes real agents is NEVER touched.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+CFG="${CONFIG_PATH:-$HOME/config}"
+REAL_SESS="${HIVEMIND_SESSIONS:-$CFG/hivemind.sessions.env}"
+REAL_ROLES="${HIVEMIND_REGISTRY:-$CFG/hivemind.roles.env}"
+WORK="${TMPDIR:-/tmp}/test.reconcile-fork.$$"
+mkdir -p "$WORK"
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+# ── Discover a LIVE agent anchor: (pane, role, live-uuid) from proc-args ─────
+ANCHOR_PANE=""; ANCHOR_ROLE=""; ANCHOR_UUID=""
+if [ -f "$REAL_ROLES" ]; then
+  while IFS='|' read -r pane role ts; do
+    [ -z "$pane" ] || [ -z "$role" ] && continue
+    u=$(hiveMind role.uuid "$role" 2>/dev/null | grep -oE "$UUID_RE" | tail -1)
+    if [ -n "$u" ]; then ANCHOR_PANE="$pane"; ANCHOR_ROLE="$role"; ANCHOR_UUID="$u"; break; fi
+  done < "$REAL_ROLES"
+fi
+ANCHOR_SESSION="${ANCHOR_PANE%%:*}"
+BOGUS="deadbeef-0000-4000-8000-000000000000"
+
+# seed a temp registry pair from the live one, corrupt ONE anchor field
+seed() {  # <mutation-sed-on-sessions>
+  cp "$REAL_SESS"  "$WORK/sessions.env"
+  cp "$REAL_ROLES" "$WORK/roles.env"
+  [ -n "$1" ] && sed -i -E "$1" "$WORK/sessions.env"
+}
+anchor_uuid_in_temp() { awk -F'|' -v p="$ANCHOR_PANE" '$1==p{print $2; exit}' "$WORK/sessions.env"; }
+run_iso() { HIVEMIND_SESSIONS="$WORK/sessions.env" HIVEMIND_REGISTRY="$WORK/roles.env" "$@"; }
+
+if [ -z "$ANCHOR_PANE" ] || [ -z "$ANCHOR_UUID" ]; then
+  for t in FORKUUID EMPTY-UUID AUDIT-ORPHAN DEAD-UUID; do
+    test.case $level "T-RECONCILE-FORK-$t: (skipped — no live agent anchor)" echo "skip"
+    expect.pass "skipped: no live claude agent to reconcile against"
+  done
+  rm -rf "$WORK"
+  echo ""; echo "=== T-RECONCILE-FORK (skipped — no anchor) ==="; echo ""
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+fi
+
+echo "--- anchor: $ANCHOR_PANE role=$ANCHOR_ROLE live-uuid=$ANCHOR_UUID ---"
+
+# ============================================================================
+# T-RECONCILE-FORK-FORKUUID — stale cached uuid (post-fork) heals to live (I2b)
+# ============================================================================
+seed "s#^${ANCHOR_PANE}\|.*#${ANCHOR_PANE}|${BOGUS}#"
+run_iso hiveMind consistency.reconcile "$ANCHOR_SESSION" apply >/dev/null 2>&1
+HEALED=$(anchor_uuid_in_temp)
+test.case $level "T-RECONCILE-FORK-FORKUUID: stale post-fork uuid heals to live" \
+  echo "healed=$HEALED live=$ANCHOR_UUID"
+if [ "$HEALED" = "$ANCHOR_UUID" ] && [ "$HEALED" != "$BOGUS" ]; then
+  expect.pass "reconcile healed cache→live ($ANCHOR_UUID) [I2b]"
+else
+  expect.fail "cache NOT healed [I2b skipped]: healed=$HEALED (want $ANCHOR_UUID, was bogus $BOGUS)"
+fi
+
+# ============================================================================
+# T-RECONCILE-FORK-EMPTY-UUID — empty uuid + live agent → healed to live
+# ============================================================================
+seed "s#^${ANCHOR_PANE}\|.*#${ANCHOR_PANE}|#"
+run_iso hiveMind consistency.reconcile "$ANCHOR_SESSION" apply >/dev/null 2>&1
+HEALED_E=$(anchor_uuid_in_temp)
+test.case $level "T-RECONCILE-FORK-EMPTY-UUID: empty uuid on a live pane heals" \
+  echo "healed=$HEALED_E live=$ANCHOR_UUID"
+if [ "$HEALED_E" = "$ANCHOR_UUID" ]; then
+  expect.pass "empty uuid healed to live ($ANCHOR_UUID) via tty-match adopt"
+else
+  expect.fail "empty uuid NOT healed: healed='$HEALED_E' (want $ANCHOR_UUID)"
+fi
+
+# ============================================================================
+# T-RECONCILE-FORK-AUDIT-ORPHAN — live pane with NO role → team.audit flags
+# unknown-route (team.audit is the NEW OTR-3 method).
+# ============================================================================
+seed ""
+grep -v "^${ANCHOR_PANE}|" "$REAL_ROLES" > "$WORK/roles.env"   # remove role → orphan
+AUDIT_OUT=$(run_iso hiveMind team.audit "$ANCHOR_SESSION" 2>&1)
+test.case $level "T-RECONCILE-FORK-AUDIT-ORPHAN: team.audit flags orphan as unknown-route" \
+  echo "$AUDIT_OUT"
+if printf '%s' "$AUDIT_OUT" | grep -qiE 'unknown-route|orphan'; then
+  expect.pass "team.audit flagged the roleless live pane as unknown-route"
+else
+  expect.fail "team.audit did not flag orphan (method missing / not implemented): $(printf '%s' "$AUDIT_OUT" | head -1)"
+fi
+
+# ============================================================================
+# T-RECONCILE-FORK-DEAD-UUID — sessions.env uuid matching NO live process →
+# team.audit flags it (dead route).
+# ============================================================================
+seed ""
+echo "${ANCHOR_SESSION}:9.9|dead0000-0000-4000-8000-000000000000" >> "$WORK/sessions.env"
+AUDIT_DEAD=$(run_iso hiveMind team.audit "$ANCHOR_SESSION" 2>&1)
+test.case $level "T-RECONCILE-FORK-DEAD-UUID: team.audit flags a dead-route uuid" \
+  echo "$AUDIT_DEAD"
+if printf '%s' "$AUDIT_DEAD" | grep -qiE 'unknown-route|dead|no live'; then
+  expect.pass "team.audit flagged the dead uuid (no live process)"
+else
+  expect.fail "team.audit did not flag dead uuid (method missing / not implemented): $(printf '%s' "$AUDIT_DEAD" | head -1)"
+fi
+
+# ── Cleanup (temp only — live registry never touched) ───────────────────────
+rm -rf "$WORK"
+
+echo ""
+echo "=== T-RECONCILE-FORK tests complete ==="
+echo ""
+
+test.suite.save.results
