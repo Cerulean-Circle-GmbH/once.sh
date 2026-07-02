@@ -2375,23 +2375,10 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
         case "$healRoute" in
           inform)
             private.hiveMind.agent.inform "$healTarget" "$message"
-            local hrc=$?
-            if [ "$hrc" -eq 0 ]; then
+            if [ $? -eq 0 ]; then
               console.log "INFORM delivered to $name ($healTarget) after auto-heal re-resolve"
               create.result 0 "delivered $name $healTarget (auto-healed)"
               return 0
-            fi
-            # DUP-FIX (task-s2-g.1 double-invoke): OTR-1 made agent.inform return an
-            # HONEST rc 2 = staged-but-ON-THE-PANE (message DID land, just unverified).
-            # The old `if rc==0` let rc2 fall out of this case → `;&` fall-through to
-            # queue) → enqueue → idle-drain RE-DELIVERS = the live DOUBLE (2 prefixes,
-            # 1st carries the claude submit ^[). A staged message is already delivered
-            # → return here, NEVER re-queue. Only rc3 (blocked) / rc1 (error) = truly
-            # NOT on the pane → fall through to queue.
-            if [ "$hrc" -eq 2 ]; then
-              warn.log "agent.send: auto-heal INFORM staged-unverified (rc2) on $healTarget — already on pane, NOT re-queuing (dup guard)"
-              create.result 2 "staged-unverified (auto-healed): $name"
-              return 2
             fi
             ;;
           overlay)
@@ -2711,24 +2698,22 @@ hiveMind.delegate() # <agentName> <description> <?from:PO> # write task file and
     echo "- [ ] Task completed as described"
   } > "$task_file"
 
-  # OTR-1: send the ONE-LINE pointer THROUGH the submission-verified core.
-  # Pointer-only (ARON #3: task = comms base; detail lives in the committed file)
-  # is also WRAP-FREE → submits on the first Enter. `otmux send` returns the
-  # HONEST rc {0 submitted / 2 staged-unverified / 3 blocked / 1 error} — report
-  # it, never a "delivered / verify manually" lie (kills delegate's Hole 1+2).
+  # Send file-read nudge (not inline text — avoids tmux garbling)
   local relative_path="session/tasks/${timestamp}.task.md"
-  otmux send "$target" "Read ${relative_path}"
-  local rc=$?
-  case "$rc" in
-    0) console.log "Delegated to $name: $task_file (submitted)"
-       create.result 0 "$task_file"; return 0 ;;
-    2) warn.log "delegate: pointer STAGED but unverified on $target — task file written; re-drain/poke to submit"
-       create.result 2 "$task_file (staged-unverified)"; return 2 ;;
-    3) warn.log "delegate: $target BLOCKED (overlay/permission) — task file written; deliver after clearing"
-       create.result 3 "$task_file (blocked)"; return 3 ;;
-    *) error.log "delegate: send error to $target (rc $rc)"
-       create.result 1 "$task_file (send-error)"; return 1 ;;
-  esac
+  otmux send.enter "$target" "Read ${relative_path}" Enter
+
+  # Verify nudge landed
+  sleep 1
+  local verify
+  verify=$("otmux" pane.capture "$target" 5 2>/dev/null)
+  if echo "$verify" | grep -q "$relative_path"; then
+    console.log "Delegated to $name: $task_file"
+    create.result 0 "$task_file"
+  else
+    warn.log "Nudge may not have landed — verify manually"
+    create.result 0 "$task_file"
+  fi
+  return $(result)
 }
 hiveMind.task.delegate() # <sshHost> <pane> <taskFile> <?message> # delegate task file to remote agent via scp + send
 {
@@ -8276,41 +8261,21 @@ hiveMind.agent.queue.drain() # <agent|pane> # FIFO drain pending messages (re-ch
       break
     fi
 
-    # Dispatch per intent — capture the OTR-1 honest submission rc.
-    local dispatchRc=0
+    # Dispatch per intent
     case "$intent" in
       inform)
-        private.hiveMind.agent.inform "$target" "$text" 2>/dev/null; dispatchRc=$?
+        private.hiveMind.agent.inform "$target" "$text" 2>/dev/null
         ;;
       remote-control:*)
         local key="${intent#remote-control:}"
-        otmux send.raw "$target" "$key" 2>/dev/null; dispatchRc=$?
+        otmux send.raw "$target" "$key" 2>/dev/null
         ;;
       *)
         warn.log "queue $target: unknown intent '$intent', dropping"
-        dispatchRc=0   # unparseable intent → drop it (dequeue below)
         ;;
     esac
 
-    # DEQUEUE gate — DUP-FIX (task-s2-g.1, mirrors fccdad8's agent.send policy).
-    # OTR-1 rc semantics: 0 = verified-submitted; 2 = staged-but-ON-THE-PANE (the
-    # message DID land — send.smart already staged + poked×N onto the input line,
-    # only the submit couldn't be VERIFIED); 3 = BLOCKED (overlay owns input, Enter
-    # withheld → NOT on pane); 1 = error (NOT on pane).
-    #   • rc 0 OR rc 2 → message is ON THE PANE → DEQUEUE. Keeping an rc2 message
-    #     re-delivers it EVERY drain cycle (SM-cycle + unblock idle hook) → the LIVE
-    #     DOUBLE Tron sees (N copies). rc2 = already delivered — exactly as fccdad8
-    #     established for agent.send's auto-heal; the drain must match or it re-dups.
-    #   • rc 3 / rc 1 → truly NOT on the pane → KEEP queued, retry next drain, NEVER
-    #     silently dropped (Sprint22 Hole 2 preserved — rc2 is NOT a drop, the msg is
-    #     visibly on the input line).
-    if [ "$dispatchRc" -eq 3 ] || [ "$dispatchRc" -eq 1 ]; then
-      warn.log "queue $target: message NOT on pane (rc=$dispatchRc) — KEPT queued, stopping drain"
-      stopped_at="not-on-pane (rc=$dispatchRc) — message kept queued, will retry next drain"
-      break
-    fi
-
-    # Dequeue on verified submit (rc0) OR staged-on-pane (rc2 = delivered).
+    # Remove first line on success
     tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
     drained=$((drained + 1))
     sleep 0.2
