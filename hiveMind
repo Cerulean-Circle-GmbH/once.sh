@@ -1297,6 +1297,34 @@ hiveMind.protected.agents.discover() # <?session_filter> # shared discovery — 
   done < <(private.hiveMind.list.panes "#{session_name}:#{window_index}.#{pane_index}|#{pane_title}" -a)
 }
 
+# ── THE ONE shared live reader (parity DRY core — architect frame 145c7a9) ────
+# Model of record = the live process tree. Emits the canonical tuple-set
+#   session|address|role|uuid|title|cwd|model|kind
+# for EVERY live pane (agents AND shells), via ONE batch discover + ONE batch
+# list-panes — NO per-pane forks (those per-pane probes were teams.save's ~2min
+# slowness, PF1). BOTH teams.save (serialize) and status/team.list (enumerate)
+# consume THIS; neither re-enumerates → parity holds BY CONSTRUCTION (tree.detailed
+# reads the same discover). Completeness (PF2): discover walks list-panes -a, so
+# every live shell is included — no registry dependency to drop unregistered shells.
+private.hiveMind.live.tupleset() { # <?session> # canonical live tuple-set for every live pane
+  local filter="$1"
+  # ONE batch: pane → cwd (snapshot cwd field). `model` is left empty here — the
+  # per-pane JSONL read is slow and not needed for parity/enumeration; a consumer
+  # that needs it derives it live.
+  local cwdMap
+  cwdMap=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_current_path}' 2>/dev/null)
+  hiveMind.protected.agents.discover "$filter" 2>/dev/null \
+  | while IFS='|' read -r target role state uuid title is_claude; do
+    [ -z "$target" ] && continue
+    local sess="${target%%:*}" addr="${target#*:}"
+    local kind="shell"
+    [ "$is_claude" = "yes" ] && kind="agent"
+    local cwd
+    cwd=$(printf '%s\n' "$cwdMap" | grep -m1 "^${target}|" | cut -d'|' -f2)
+    printf '%s|%s|%s|%s|%s|%s||%s\n' "$sess" "$addr" "${role:-unknown}" "$uuid" "${title:--}" "$cwd" "$kind"
+  done
+}
+
 hiveMind.protected.agents.offline() # <session> # synthesize 6-field discovery rows from persisted state (roles.env + sessions.env) for offline teams
 {
   local session="$1"
@@ -3201,76 +3229,23 @@ hiveMind.teams.save() # # snapshot all Claude processes + layout for cold-restar
   local tmpEntries="${outfile}.unsorted.$$"
   local seenSessions=""
 
-  while IFS='|' read -r pid tty paneTarget title rest; do
-    [ -z "$pid" ] && continue
-
-    # Parse pane target → session + address
-    local sess="${paneTarget%%:*}"
-    local addr="${paneTarget#*:}"
-
-    # UUID via canonical resolver (handles forks + autocompact)
-    local sid
-    sid=$(private.hiveMind.session.resolve.uuid "$paneTarget" 2>/dev/null)
-
-    # Role priority: customTitle → registry → pane title → "unknown"
-    local role
-    role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
-    [ -z "$role" ] && role=$(private.hiveMind.registry.get "$paneTarget" 2>/dev/null)
-    [ -z "$role" ] && role=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
-    [ -z "$role" ] && role="unknown"
-
-    # NEW C1 fields: cwd, model, kind
-    local cwd model kind
-    cwd=$(otmux pane.get "$paneTarget" '#{pane_current_path}' 2>/dev/null)
-    model=$(private.hiveMind.pane.model "$paneTarget" 2>/dev/null)
-    kind=$(private.hiveMind.pane.kind "$paneTarget" 2>/dev/null)
-
+  # PARITY FIX (architect frame 145c7a9): serialize the COMPLETE shared live
+  # tuple-set — EVERY live pane (agents AND shells, every team), via the ONE
+  # shared reader that tree.detailed + status also use. This replaces the old
+  # lossy dual-enumeration (claude.processes for agents + registry for the rest),
+  # which DROPPED live shells not in the registry (PF2) and paid a per-pane probe
+  # cost of ~2min (PF1). Now: complete + deterministic + fast, parity by construction.
+  local dead_count=0 ghost_count=0
+  while IFS='|' read -r sess addr role uuid title cwd model kind; do
+    [ -z "$sess" ] && continue
     # SC-F.2: validate before writing — skip garbage rows (Bug #4 class)
-    local _liveRow="${sess}|${addr}|${role}|${sid:-}|${role:-}|${cwd:-}|${model:-}|${kind:-unknown}"
-    if private.hiveMind.snapshot.row.valid "$_liveRow"; then
-      echo "$_liveRow" >> "$tmpEntries"
+    local _row="${sess}|${addr}|${role}|${uuid:-}|${title:--}|${cwd:-}|${model:-}|${kind:-unknown}"
+    if private.hiveMind.snapshot.row.valid "$_row"; then
+      echo "$_row" >> "$tmpEntries"
       count=$((count + 1))
-      # Track unique sessions for layout.save
       echo "$seenSessions" | grep -q " ${sess} " || seenSessions="${seenSessions} ${sess} "
     fi
-  done < <(private.hiveMind.claude.processes)
-
-  # Also include dead agents + shell panes from registry+sessions.env.
-  # 3rd field _reg_ts absorbs the optional B5.1 TTL timestamp; absent for
-  # legacy 2-field entries (then _reg_ts is empty and is discarded).
-  local reg="$HIVEMIND_REGISTRY"
-  local ses="$HIVEMIND_SESSIONS"
-  local dead_count=0
-  local ghost_count=0
-  if [ -f "$reg" ]; then
-    while IFS='|' read -r pane_target reg_role _reg_ts; do
-      [ -z "$pane_target" ] || [ -z "$reg_role" ] && continue
-      [ -f "$tmpEntries" ] && grep -q "|${reg_role}|" "$tmpEntries" 2>/dev/null && continue
-      # MIG-1: skip ghost registry entries — pane no longer exists in tmux.
-      # Without this filter, stale registry pollutes snapshot and propagates
-      # to remote via team.migrate. Use tmux list-panes (otmux has only checks
-      # sessions; otmux pane.get falls back to focused pane on bad target).
-      if ! tmux list-panes -t "$pane_target" -F '#{pane_id}' 2>/dev/null | grep -q .; then
-        ghost_count=$((ghost_count + 1))
-        continue
-      fi
-      local dead_sess="${pane_target%%:*}"
-      local dead_addr="${pane_target#*:}"
-      local dead_uuid=""
-      [ -f "$ses" ] && dead_uuid=$(grep "^${pane_target}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
-      # Even dead/shell panes get cwd + kind captured
-      local dead_cwd dead_kind
-      dead_cwd=$(otmux pane.get "$pane_target" '#{pane_current_path}' 2>/dev/null)
-      dead_kind=$(private.hiveMind.pane.kind "$pane_target" 2>/dev/null)
-      # SC-F.2: validate dead entries too (registry can hold garbage role names)
-      local _deadRow="${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${reg_role} (dead)|${dead_cwd:-}||${dead_kind:-shell}"
-      if private.hiveMind.snapshot.row.valid "$_deadRow"; then
-        echo "$_deadRow" >> "$tmpEntries"
-        dead_count=$((dead_count + 1))
-        echo "$seenSessions" | grep -q " ${dead_sess} " || seenSessions="${seenSessions} ${dead_sess} "
-      fi
-    done < "$reg"
-  fi
+  done < <(private.hiveMind.live.tupleset)
 
   # Write sorted snapshot. SC-F.1: version header FIRST so readers can short-circuit
   # before parsing rows.
@@ -7172,38 +7147,45 @@ hiveMind.team.active() # # show the current active team
   echo "$active"
 }
 
-hiveMind.team.list() # # list all registered team sessions
+hiveMind.team.list() # # list every LIVE team session (View reads live, not the stale teams file)
 {
-  # Prefer team registry if it exists
-  if [ -f "$HIVEMIND_TEAMS" ] && [ -s "$HIVEMIND_TEAMS" ]; then
-    local active
-    active=$(private.hiveMind.active.team)
-    while IFS='|' read -r session description; do
-      [ -z "$session" ] && continue
-      local marker=" "
-      [ "$session" = "$active" ] && marker="*"
-      local running=""
-      otmux has "$session" 2>/dev/null && running="running" || running="stopped"
-      if [ -n "$description" ]; then
-        printf " %s %-24s %-10s %s\n" "$marker" "$session" "($running)" "$description"
-      else
-        printf " %s %-24s %s\n" "$marker" "$session" "($running)"
-      fi
-    done < "$HIVEMIND_TEAMS"
-    return 0
+  # PARITY FIX (architect frame 145c7a9): the View must enumerate EVERY LIVE team
+  # — the live tmux sessions ARE the authoritative team set (Model of record).
+  # The old path read the stale $HIVEMIND_TEAMS file, which OMITTED live teams it
+  # didn't know about (PF3: rawbin, u20 — live, present in tree.detailed +
+  # teams.save, but absent from the teams file). Enumerate LIVE, annotate with a
+  # description from the teams cache only when present.
+  local live_sessions
+  live_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | sort -u)
+  if [ -z "$live_sessions" ]; then
+    # No live server — fall back to the persisted teams file (cold-start view).
+    if [ -f "$HIVEMIND_TEAMS" ] && [ -s "$HIVEMIND_TEAMS" ]; then
+      while IFS='|' read -r session description; do
+        [ -z "$session" ] && continue
+        printf "   %-24s %-10s %s\n" "$session" "(stopped)" "${description}"
+      done < "$HIVEMIND_TEAMS"
+      return 0
+    fi
+    error.log "No live tmux sessions and no persisted teams"
+    return 1
   fi
 
-  # Fall back to deriving teams from role registry — verify sessions exist in tmux
-  if [ -f "$HIVEMIND_REGISTRY" ]; then
-    local _sess
-    for _sess in $(cut -d: -f1 "$HIVEMIND_REGISTRY" | sort -u); do
-      otmux has "$_sess" 2>/dev/null && echo "$_sess"
-    done
-    return 0
-  fi
-
-  error.log "No team or role registry found"
-  return 1
+  local active
+  active=$(private.hiveMind.active.team 2>/dev/null)
+  local _sess
+  while IFS= read -r _sess; do
+    [ -z "$_sess" ] && continue
+    local marker=" "
+    [ "$_sess" = "$active" ] && marker="*"
+    local description=""
+    [ -f "$HIVEMIND_TEAMS" ] && description=$(grep "^${_sess}|" "$HIVEMIND_TEAMS" 2>/dev/null | head -1 | cut -d'|' -f2-)
+    if [ -n "$description" ]; then
+      printf " %s %-24s %-10s %s\n" "$marker" "$_sess" "(running)" "$description"
+    else
+      printf " %s %-24s %s\n" "$marker" "$_sess" "(running)"
+    fi
+  done <<< "$live_sessions"
+  return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
