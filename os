@@ -669,6 +669,18 @@ os.check.env() # #
 
 }
 
+os.os() # # echo the OS discriminator (darwin / linux-gnu / cygwin / msys / win32 / freebsd)
+{
+  # S7: single-source accessor for the OS discriminator — side-effect-free for
+  # command-substitution capture (`OS="$(os os)"`). os.check.env owns the $OSTYPE→
+  # OOSH_OS mapping (DRY); this runs it (silently) and echoes the result so callers
+  # like config.init don't duplicate the case or need to source `os` (which
+  # auto-dispatches). info.log inside check.env is gated >3, so at default level the
+  # only output is the discriminator itself.
+  os.check.env >/dev/null 2>&1
+  echo "$OOSH_OS"
+}
+
 
 # ── HOSTNAME MANAGEMENT ────────────────────────────────────────────────────────
 
