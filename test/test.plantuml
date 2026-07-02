@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# T-PLANTUML — plantuml render + odocker one-shot primitives (dev 1cb40ee+0638344)
+# Contract (expert):
+#   GOOD  plantuml render <valid.puml> → real svg (> stub floor, no 'contains
+#         errors'), rc=0.
+#   BAD   plantuml render <bad.puml>   → detects error-stub, reports the file,
+#         rc=1 — NEVER ships a stub as success.
+#   odocker image.ensure <img>  → idempotent (2× = no-op, no re-pull).
+#   odocker run.ephemeral       → --rm, leaves no container behind.
+#   LAYERING: plantuml delegates ALL docker access to odocker (0 direct `docker`).
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+PLANTUML_SRC="$OOSH_DIR/plantuml"
+STUB_FLOOR="${PLANTUML_STUB_MIN_BYTES:-1200}"
+
+# ============================================================================
+# T-PLANTUML-LAYERING (static — always runs): plantuml must NOT call docker
+# directly; every docker access goes through odocker (single-responsibility).
+# grep-guard: zero standalone `docker ` command invocations in the script.
+# ============================================================================
+# A real invocation is `docker <subcommand>` at a command position (not `odocker`,
+# not a comment, not descriptive usage/status text like "docker reachable?").
+# Strip inline comments first, then require a known docker subcommand.
+DIRECT_DOCKER=$(sed 's/#.*//' "$PLANTUML_SRC" 2>/dev/null \
+  | grep -nE '(^|[[:space:]`(;&|=])docker[[:space:]]+(run|pull|push|image|images|ps|exec|build|inspect|create|start|stop|kill|rm|rmi|tag|login|cp|info|version|network|volume)([[:space:]]|$)')
+DIRECT_N=$(printf '%s' "$DIRECT_DOCKER" | grep -c . )
+
+test.case $level "T-PLANTUML-LAYERING: plantuml has 0 direct docker calls (uses odocker)" \
+  echo "direct=$DIRECT_N"
+if [ "$DIRECT_N" -eq 0 ]; then
+  expect.pass "all docker access delegated to odocker"
+else
+  expect.fail "$DIRECT_N direct docker call(s) in plantuml — must use odocker: $DIRECT_DOCKER"
+fi
+
+# ============================================================================
+# Docker-gated tests — skip VISIBLY when docker is unavailable (like the
+# current-target case-5 pattern: env-gated tests must announce the skip).
+# ============================================================================
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  # Authoritative image ref — the one plantuml itself uses (from `plantuml
+  # status`), not a duplicated default. Format: "image ref : <ref>".
+  REF=$(plantuml status 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | sed -n 's/^ *image ref *: *//p' | head -1)
+  WORK="${TMPDIR:-/tmp}/test.plantuml.$$"
+  mkdir -p "$WORK"
+
+  # ── T-PLANTUML-ENSURE-IDEMPOTENT: image.ensure 2× = no-op ────────────────
+  odocker image.ensure "$REF" >/dev/null 2>&1
+  ENSURE1_RC=$?
+  ENSURE2_OUT=$(odocker image.ensure "$REF" 2>&1)
+  ENSURE2_RC=$?
+  test.case $level "T-PLANTUML-ENSURE-IDEMPOTENT: image.ensure 2nd call is a no-op" \
+    echo "rc1=$ENSURE1_RC rc2=$ENSURE2_RC"
+  if [ "$ENSURE1_RC" -eq 0 ] && [ "$ENSURE2_RC" -eq 0 ] && ! printf '%s' "$ENSURE2_OUT" | grep -qi 'pulling'; then
+    expect.pass "both ensures rc=0, 2nd did not re-pull (idempotent)"
+  else
+    expect.fail "not idempotent: rc1=$ENSURE1_RC rc2=$ENSURE2_RC out2=$ENSURE2_OUT"
+  fi
+
+  # ── T-PLANTUML-EPHEMERAL-RM: run.ephemeral leaves no container ────────────
+  # Isolate to THIS image (ancestor=image-id) — a host-global `docker ps -aq`
+  # is noisy on a multi-agent box (u20/u24 + other agents' transient runs).
+  # --rm honored → zero containers of this image linger after the run returns.
+  IMG_ID=$(docker image inspect --format '{{.Id}}' "$REF" 2>/dev/null)
+  EPH_BEFORE=$(docker ps -a --filter ancestor="$IMG_ID" -q 2>/dev/null | wc -l | tr -d ' ')
+  odocker run.ephemeral "$REF" "$WORK" -version >/dev/null 2>&1
+  EPH_AFTER=$(docker ps -a --filter ancestor="$IMG_ID" -q 2>/dev/null | wc -l | tr -d ' ')
+  test.case $level "T-PLANTUML-EPHEMERAL-RM: run.ephemeral auto-removes container" \
+    echo "img_containers before=$EPH_BEFORE after=$EPH_AFTER"
+  if [ "$EPH_AFTER" -le "$EPH_BEFORE" ]; then
+    expect.pass "no new leftover container of this image (--rm honored): before=$EPH_BEFORE after=$EPH_AFTER"
+  else
+    expect.fail "run.ephemeral leaked a container: before=$EPH_BEFORE after=$EPH_AFTER (--rm not honored)"
+  fi
+
+  # ── T-PLANTUML-GOOD: valid puml → real svg, rc=0 ─────────────────────────
+  GOOD="$WORK/good.puml"
+  printf '@startuml\nAlice -> Bob: Authentication Request\nBob --> Alice: Authentication Response\nAlice -> Bob: Another Request\nBob --> Alice: Another Response\n@enduml\n' > "$GOOD"
+  plantuml render "$GOOD" >/dev/null 2>&1
+  GOOD_RC=$?
+  GOOD_SVG="$WORK/good.svg"
+  GOOD_SZ=$(wc -c < "$GOOD_SVG" 2>/dev/null | tr -d ' ')
+  GOOD_ERR=$(grep -c 'contains errors' "$GOOD_SVG" 2>/dev/null)
+  test.case $level "T-PLANTUML-GOOD: valid puml renders a real svg (rc=0)" \
+    echo "rc=$GOOD_RC size=${GOOD_SZ:-0} err=${GOOD_ERR:-?}"
+  if [ "$GOOD_RC" -eq 0 ] && [ -f "$GOOD_SVG" ] && [ "${GOOD_SZ:-0}" -ge "$STUB_FLOOR" ] && [ "${GOOD_ERR:-0}" -eq 0 ]; then
+    expect.pass "svg ${GOOD_SZ}B (>= ${STUB_FLOOR}B floor), no error marker, rc=0"
+  else
+    expect.fail "good render bad: rc=$GOOD_RC size=${GOOD_SZ:-0} floor=$STUB_FLOOR err=${GOOD_ERR:-?}"
+  fi
+
+  # ── T-PLANTUML-BAD: bad puml → rc=1, NEVER ships a stub as success ────────
+  BAD="$WORK/bad.puml"
+  printf '@startuml x\nusecase U\nclass C\nC <|-- U\nartifact A\n@enduml\n' > "$BAD"
+  BAD_OUT=$(plantuml render "$BAD" 2>&1)
+  BAD_RC=$?
+  test.case $level "T-PLANTUML-BAD: bad puml fails loud (rc=1, reports file)" \
+    echo "rc=$BAD_RC"
+  if [ "$BAD_RC" -eq 1 ]; then
+    expect.pass "bad render returned rc=1 — stub NOT shipped as success"
+  else
+    expect.fail "bad render did not fail (rc=$BAD_RC) — a stub svg would ship as success: $BAD_OUT"
+  fi
+
+  # Cleanup temp workdir
+  rm -rf "$WORK" 2>/dev/null
+else
+  for t in ENSURE-IDEMPOTENT EPHEMERAL-RM GOOD BAD; do
+    test.case $level "T-PLANTUML-$t: (skipped — docker unavailable)" echo "skip"
+    expect.pass "skipped: docker not reachable"
+  done
+fi
+
+echo ""
+echo "=== T-PLANTUML tests complete ==="
+echo ""
+
+test.suite.save.results
