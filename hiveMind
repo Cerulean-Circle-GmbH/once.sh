@@ -122,9 +122,12 @@ private.hiveMind.current.session() { # # return current tmux session name
   otmux pane.get '#{session_name}' 2>/dev/null || return 1
 }
 
-private.hiveMind.role.isGeneric() { # <agentName> # true if role is a generic placeholder
+private.hiveMind.role.isGeneric() { # <agentName> # true if role is a generic placeholder or a bare shell name
   local r="$1"
-  [ -z "$r" ] || [ "$r" = "unknown" ] || [ "$r" = "ClaudeCode" ] || [ "$r" = "claude" ]
+  # c.0: bare shell names (bash/zsh/sh) are NOT roles — reject centrally so
+  # role.fromTitle (the single title→role parse point) yields empty for shells.
+  [ -z "$r" ] || [ "$r" = "unknown" ] || [ "$r" = "ClaudeCode" ] || [ "$r" = "claude" ] \
+    || [ "$r" = "bash" ] || [ "$r" = "zsh" ] || [ "$r" = "sh" ]
 }
 
 private.hiveMind.role.fromTitle() { # <title> # extract role name from pane title, stripping prefixes
@@ -1271,13 +1274,15 @@ hiveMind.protected.agents.discover() # <?session_filter> # shared discovery — 
       procRest=$(echo "$procRow" | cut -d'|' -f3-)
     fi
 
-    # Role: registry → pane title → "pane N"
+    # Role: TITLE-first (live pane title = ground truth via pane.lock/rename) >
+    # registry (write-through cache; can go stale) [c.0 coherence fix — was
+    # registry-first]. role.fromTitle strips prefixes/@host and rejects generic +
+    # bare-shell titles (rc1 → empty). Registry is the fallback only when the live
+    # title yields no role. This makes identity.resolve (the C.3 projection) ground
+    # truth by construction — a stale/empty registry can no longer yield a stale role.
     local role
-    role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
-    if [ -z "$role" ]; then
-      role="$pane_title"
-      [ -z "$role" ] || [ "$role" = "bash" ] || [ "$role" = "zsh" ] && role=""
-    fi
+    role=$(private.hiveMind.role.fromTitle "$pane_title" 2>/dev/null) || role=""
+    [ -z "$role" ] && role=$(private.hiveMind.registry.get "$pane_target" 2>/dev/null)
 
     # State: sweep.detect for Claude panes, "shell" for others
     local state="shell"
@@ -1306,23 +1311,46 @@ hiveMind.protected.agents.discover() # <?session_filter> # shared discovery — 
 # consume THIS; neither re-enumerates → parity holds BY CONSTRUCTION (tree.detailed
 # reads the same discover). Completeness (PF2): discover walks list-panes -a, so
 # every live shell is included — no registry dependency to drop unregistered shells.
-private.hiveMind.live.tupleset() { # <?session> # canonical live tuple-set for every live pane
+private.hiveMind.live.tupleset() { # <?session> # canonical live reader — emits host|session|address|tty|role|uuid|kind|title|cwd per live pane
   local filter="$1"
-  # ONE batch: pane → cwd (snapshot cwd field). `model` is left empty here — the
-  # per-pane JSONL read is slow and not needed for parity/enumeration; a consumer
-  # that needs it derives it live.
-  local cwdMap
-  cwdMap=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_current_path}' 2>/dev/null)
+  # host tags every LOCAL row (remote rows carry the remote host — see the remote
+  # sourcing that projects off this same reader). Cached hostname, free.
+  local host="${HIVEMIND_HOST:-$(hostname -s 2>/dev/null)}"
+  # ONE batch: pane → tty + cwd. tty (stripped of /dev/) is the stable-across-fork
+  # join key C.2's tty-match adopt + C.3's identity anchor need; cwd is the snapshot
+  # field. `model` is DROPPED — derive-on-demand (slow per-pane JSONL), never part
+  # of the enumeration tuple.
+  local paneMap
+  paneMap=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_tty}|#{pane_current_path}' 2>/dev/null)
   hiveMind.protected.agents.discover "$filter" 2>/dev/null \
   | while IFS='|' read -r target role state uuid title is_claude; do
     [ -z "$target" ] && continue
     local sess="${target%%:*}" addr="${target#*:}"
     local kind="shell"
     [ "$is_claude" = "yes" ] && kind="agent"
-    local cwd
-    cwd=$(printf '%s\n' "$cwdMap" | grep -m1 "^${target}|" | cut -d'|' -f2)
-    printf '%s|%s|%s|%s|%s|%s||%s\n' "$sess" "$addr" "${role:-unknown}" "$uuid" "${title:--}" "$cwd" "$kind"
+    local row tty cwd
+    row=$(printf '%s\n' "$paneMap" | grep -m1 "^${target}|")
+    tty=$(printf '%s' "$row" | cut -d'|' -f2); tty="${tty#/dev/}"
+    cwd=$(printf '%s' "$row" | cut -d'|' -f3)
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$host" "$sess" "$addr" "$tty" "${role:-unknown}" "$uuid" "$kind" "${title:--}" "$cwd"
   done
+}
+
+hiveMind.protected.live.tupleset() # <?session> # CLI / test / remote-exec entry for the canonical live reader (ossh exec <host> hiveMind protected.live.tupleset <s>)
+{
+  private.hiveMind.live.tupleset "$1"
+}
+
+private.hiveMind.identity.resolve() { # <?pane> # role@host for ONE pane — a projection of live.tupleset filtered to the pane (defaults to caller's own pane via pane.self)
+  local pane="$1"
+  [ -z "$pane" ] && pane=$(otmux pane.self target 2>/dev/null)
+  [ -z "$pane" ] && { error.log "identity.resolve: no pane (pass a target or run inside tmux)"; return 1; }
+  local sess="${pane%%:*}"
+  # Project the canonical reader down to this pane's row → role@host. TITLE-first
+  # role resolution (via agents.discover) makes this ground truth, not cache.
+  private.hiveMind.live.tupleset "$sess" 2>/dev/null \
+  | awk -F'|' -v p="$pane" '$2":"$3==p {print $5"@"$1; exit}'
 }
 
 # PF4 (freshness): resolve role → uuid with LIVE proc-args PREFERRED over any
@@ -1342,7 +1370,7 @@ hiveMind.role.uuid() # <role> <?session> # role → uuid; live proc-args preferr
   #    live, THIS answers and the on-disk cache is never consulted.
   local live_uuid
   live_uuid=$(private.hiveMind.live.tupleset "$filter" 2>/dev/null \
-    | awk -F'|' -v r="$role" '$3==r && $4!="" {print $4; exit}')
+    | awk -F'|' -v r="$role" '$5==r && $6!="" {print $6; exit}')
   if [ -n "$live_uuid" ]; then
     echo "$live_uuid"
     return 0
@@ -3286,10 +3314,14 @@ hiveMind.teams.save() # # snapshot all Claude processes + layout for cold-restar
   # which DROPPED live shells not in the registry (PF2) and paid a per-pane probe
   # cost of ~2min (PF1). Now: complete + deterministic + fast, parity by construction.
   local dead_count=0 ghost_count=0
-  while IFS='|' read -r sess addr role uuid title cwd model kind; do
+  # c.0: consume the canonical 9-field reader (host|session|address|tty|role|uuid|
+  # kind|title|cwd) and remap to the UNCHANGED 8-field snapshot schema
+  # (sess|addr|role|uuid|title|cwd|model|kind). model is empty (derive-on-demand);
+  # host+tty are enumeration-only, not persisted in the snapshot.
+  while IFS='|' read -r host sess addr tty role uuid kind title cwd; do
     [ -z "$sess" ] && continue
     # SC-F.2: validate before writing — skip garbage rows (Bug #4 class)
-    local _row="${sess}|${addr}|${role}|${uuid:-}|${title:--}|${cwd:-}|${model:-}|${kind:-unknown}"
+    local _row="${sess}|${addr}|${role}|${uuid:-}|${title:--}|${cwd:-}||${kind:-unknown}"
     if private.hiveMind.snapshot.row.valid "$_row"; then
       echo "$_row" >> "$tmpEntries"
       count=$((count + 1))
