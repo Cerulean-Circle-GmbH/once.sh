@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# T-SOURCE-GUARD (#35) — the constructor must not destroy the SOURCE it was
+# invoked from. #34/a3b1eff made the TARGET side non-destructive (existing
+# $HOME/oosh → backup). This closes the SOURCE side: init/oosh's relocation
+# `mv "$OOSH_DIR" "$HOME/oosh"` EMPTIES OOSH_DIR's origin. When OOSH_DIR is a
+# LIVE / non-throwaway checkout (not the installer's own mktemp clone), it must
+# be COPIED or REFUSED (source preserved); a fresh-clone source still relocates.
+#
+# STRUCTURAL + ISOLATED SANDBOX only — NEVER run the real installer against a
+# live oosh dir (that IS the bug). Full destructive e2e → E1.2 throwaway container.
+# (ref: session/tasks/init-oosh-source-guard.md S35.2)
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+I="$OOSH_DIR/init/oosh"
+# relocation window: 8 lines up to the `mv "$OOSH_DIR" "$HOME/oosh"`.
+mvNo=$(grep -nE 'mv +"\$OOSH_DIR" +"\$HOME/oosh"' "$I" | head -1 | cut -d: -f1)
+relWin=$([ -n "$mvNo" ] && sed -n "$((mvNo-10)),$((mvNo+1))p" "$I" | grep -vE '^[[:space:]]*#')
+
+# ============================================================================
+# (A) STRUCTURAL FENCE — the relocation distinguishes a LIVE/non-throwaway
+# OOSH_DIR from the installer's own fresh clone: copy/refuse for live, mv for a
+# throwaway (mktemp/_oosh_tmp_clone/ /tmp). RED until S35.1 lands.
+# ============================================================================
+test.case $level "T-SOURCE-GUARD (fence): relocation guards a live SOURCE (copy/refuse), not blind mv" \
+  echo "${relWin:-<no mv found>}"
+if printf '%s' "$relWin" | grep -qiE 'cp +-a|cp +-R|_oosh_tmp_clone|mktemp|case +"\$OOSH_DIR"|/tmp/|throwaway|is-inside-work-tree|refuse|live checkout'; then
+  expect.pass "relocation detects live-vs-throwaway source (copy/refuse for a live checkout)"
+else
+  expect.fail "relocation blind-\`mv\`s ANY OOSH_DIR — a LIVE checkout source is emptied (#35 not yet guarded)"
+fi
+
+# ============================================================================
+# (B) SANDBOX — the ACCEPTANCE ORACLE for both cases, self-contained in /tmp.
+# Models the required behavior: LIVE source (persistent, has .git+MARKER) is
+# PRESERVED (copy/refuse — its MARKER survives at origin); THROWAWAY source
+# (under a temp/mktemp dir) still RELOCATES (moved; origin gone). Touches no
+# real oosh dir. This locks the contract S35.1 must satisfy.
+# ============================================================================
+# The live source must sit OUTSIDE any temp root (else the real temp-root
+# detection would misclassify it), so use a NON-temp sandbox under $HOME for the
+# live case + a REAL mktemp dir (an actual temp root) for the throwaway case.
+liveRoot="$HOME/.t35-src-guard.$$"; mkdir -p "$liveRoot/home"
+tmpRoot=$(mktemp -d 2>/dev/null || echo "/tmp/t35-$$")
+
+# place() mirrors the LANDED S35.1 algorithm VERBATIM (init/oosh 34c44cb+10ccc7e):
+# source under the temp root (TMPDIR-stripped / /tmp / /var/tmp / /var/folders) →
+# MOVE (throwaway); anything else → cp -Rp (live checkout, source preserved).
+place() { # <srcDir> <homeDir>
+  s="$1"; h="$2"
+  _tr="${TMPDIR:-/tmp}"; _tr="${_tr%/}"; fresh=""
+  case "$s" in
+    "$_tr"/*|/tmp/*|/var/tmp/*|/var/folders/*) fresh=1 ;;
+  esac
+  if [ "$fresh" = "1" ]; then
+    mv "$s" "$h/oosh"
+  else
+    cp -Rp "$s" "$h/oosh"
+  fi
+}
+
+# Case 1 — LIVE checkout source (under $HOME, NOT a temp root) must SURVIVE
+mkdir -p "$liveRoot/live/.git"; printf 'PRECIOUS\n' > "$liveRoot/live/MARKER"
+place "$liveRoot/live" "$liveRoot/home" 2>/dev/null
+liveSurvives=$(cat "$liveRoot/live/MARKER" 2>/dev/null)
+placedFromLive=$(cat "$liveRoot/home/oosh/MARKER" 2>/dev/null)
+test.case $level "T-SOURCE-GUARD (sandbox): LIVE checkout source SURVIVES (copied, not emptied)" \
+  echo "liveSurvives='$liveSurvives' placed='$placedFromLive' src=$liveRoot/live"
+if [ "$liveSurvives" = "PRECIOUS" ] && [ "$placedFromLive" = "PRECIOUS" ]; then
+  expect.pass "live source preserved at origin AND placed at \$HOME/oosh — non-destructive"
+else
+  expect.fail "sandbox: live source emptied (survives='$liveSurvives') — relocation destroyed it"
+fi
+
+# Case 2 — THROWAWAY source (under a REAL temp root) still relocates (moved)
+mkdir -p "$tmpRoot/clone" "$liveRoot/home2"; printf 'FRESH\n' > "$tmpRoot/clone/NEW"
+place "$tmpRoot/clone" "$liveRoot/home2" 2>/dev/null
+throwawayGone=$([ -e "$tmpRoot/clone" ] && echo EXISTS || echo GONE)
+placedFromTmp=$(cat "$liveRoot/home2/oosh/NEW" 2>/dev/null)
+test.case $level "T-SOURCE-GUARD (sandbox): THROWAWAY clone still RELOCATES (fresh path unchanged)" \
+  echo "throwaway=$throwawayGone placed='$placedFromTmp' src=$tmpRoot/clone"
+if [ "$throwawayGone" = "GONE" ] && [ "$placedFromTmp" = "FRESH" ]; then
+  expect.pass "throwaway clone relocated (moved) — fresh-install fast path preserved"
+else
+  expect.fail "sandbox: throwaway path wrong (gone=$throwawayGone placed='$placedFromTmp')"
+fi
+rm -rf "$liveRoot" "$tmpRoot" 2>/dev/null
+
+test.suite.save.results
