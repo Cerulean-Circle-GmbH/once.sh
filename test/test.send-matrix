@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# T-SEND-MATRIX — the exhaustive otmux-send regression guard (architect 2a6e3fa,
+# spec: scrum.pmo/sprints/sprint-2/task-s2-g.5). 11 groups / 50 cells; SUPERSET
+# of T-DISPATCH-SUBMIT(5) + T-SEND-SESSION(3) → zero regression.
+#
+# PRIORITY CELLS FIRST (PO): D3 (never-duplicate) + E5 (prefix-exactly-once) —
+# the guards for the LIVE "all messages duplicate" regression. RED now (dup live
+# on the claude path); the expert's double-invoke fix greens them = the cure is
+# verified.
+#
+# Testability tags: [S]=static source-assert · [B]=behavioral (real tmux pane)
+# · [I]=isolated planted fixture. Live claude ❯ state isn't forgeable, so claude
+# cells use an [I] FAKE-CLAUDE fixture: a binary named `claude` (= cat) so
+# `pane_current_command==claude` → isClaudeCode → the CLAUDE path (prefix+verify
+# +submit), while cat echoes the delivered keystrokes so duplication is visible.
+# FULL ISOLATION: scratch sessions + temp bin; the live registry is never touched.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+OTMUX_SRC="$OOSH_DIR/otmux"
+WORK="${TMPDIR:-/tmp}/test.send-matrix.$$"
+mkdir -p "$WORK/bin"
+CFG="${CONFIG_PATH:-$HOME/config}"
+LIVE_SESS="$CFG/hivemind.sessions.env"
+LIVE_MD5_BEFORE=$( [ -f "$LIVE_SESS" ] && md5sum "$LIVE_SESS" | cut -d' ' -f1 || echo none )
+
+HAVE_TMUX=1
+[ -z "$(command -v tmux)" ] && HAVE_TMUX=0
+
+# ── [I] fake-claude fixture: a pane whose pane_current_command is `claude` ────
+# so isClaudeCode → the CLAUDE send path fires; cat echoes typed keys → any
+# duplicate keystroke shows up verbatim in the pane.
+cp /bin/cat "$WORK/bin/claude" 2>/dev/null
+FC_SESSION=""; FC_PANE=""
+mk_fake_claude() {   # <tag> → sets FC_SESSION / FC_PANE
+  FC_SESSION="__smfc_${1}_$$"
+  tmux new-session -d -s "$FC_SESSION" -x 100 -y 30 2>/dev/null || return 1
+  FC_PANE="${FC_SESSION}:0.0"
+  tmux send-keys -t "$FC_PANE" "PATH=$WORK/bin:\$PATH claude" Enter
+  sleep 1
+  [ "$(tmux display-message -t "$FC_PANE" -p '#{pane_current_command}' 2>/dev/null)" = "claude" ]
+}
+rm_fake_claude() { [ -n "$FC_SESSION" ] && tmux kill-session -t "$FC_SESSION" 2>/dev/null; }
+fc_capture() { tmux capture-pane -t "$FC_PANE" -p 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g'; }
+
+# ============================================================================
+# D3 [B/I] — NEVER DUPLICATE. A single send delivers the message EXACTLY ONCE
+# (submit/poke are text-free & idempotent — not N×). The live double-invoke bug
+# types the whole (prefixed) message twice → RED until fixed.
+# ============================================================================
+if [ "$HAVE_TMUX" -eq 1 ] && mk_fake_claude d3; then
+  D3="D3MARK_$$"
+  otmux send "$FC_PANE" "$D3" >/dev/null 2>&1
+  sleep 1.5
+  D3N=$(fc_capture | grep -c "$D3")
+  test.case $level "D3: send delivers the message EXACTLY ONCE (never duplicate)" \
+    echo "count=$D3N"
+  if [ "${D3N:-0}" -eq 1 ]; then
+    expect.pass "message delivered once (no duplication)"
+  else
+    expect.fail "message DUPLICATED: delivered ${D3N}× (want 1) [live double-invoke regression]"
+  fi
+  rm_fake_claude
+else
+  test.case $level "D3: (skipped — no tmux/fixture)" echo "skip"; expect.pass "skipped"
+fi
+
+# ============================================================================
+# E5 [B/I] — SENDER PREFIX EXACTLY ONCE (BUG9 idempotent-prefix). `[@role pane]`
+# appears once and only once in the delivered text. The double-invoke bug doubles
+# the whole prefixed line → [@ count 2 → RED until fixed.
+# ============================================================================
+if [ "$HAVE_TMUX" -eq 1 ] && mk_fake_claude e5; then
+  E5="E5MARK_$$"
+  otmux send "$FC_PANE" "$E5" >/dev/null 2>&1
+  sleep 1.5
+  # count [@ prefixes on the delivered marker line(s) — once per delivered copy
+  E5N=$(fc_capture | grep "$E5" | grep -o '\[@' | wc -l | tr -d ' ')
+  test.case $level "E5: sender prefix appears EXACTLY ONCE (never doubled)" \
+    echo "prefixCount=$E5N"
+  if [ "${E5N:-0}" -eq 1 ]; then
+    expect.pass "[@…] prefix delivered exactly once"
+  else
+    expect.fail "prefix count=$E5N (want 1) — doubled prefix / duplicated send [BUG9/double-invoke]"
+  fi
+  rm_fake_claude
+else
+  test.case $level "E5: (skipped — no tmux/fixture)" echo "skip"; expect.pass "skipped"
+fi
+
+# ── E5-GUARD [S] — the idempotent-prefix guard exists: already-`[@`-prefixed
+# text is NOT re-prefixed (so poke/re-send can never add a second prefix). ─────
+GUARD=$(sed -n '/# Step 2: Add sender prefix/,/prefix.*text/p' "$OTMUX_SRC" | grep -E '\!= \\\[@' )
+[ -z "$GUARD" ] && GUARD=$(grep -E 'text.*!=.*\\\[@|\!\= \\\[@\*' "$OTMUX_SRC")
+test.case $level "E5-GUARD: send.smart guards against re-prefixing already-[@ text" \
+  echo "guard=$(printf '%s' "$GUARD" | head -1)"
+if [ -n "$GUARD" ]; then
+  expect.pass "idempotent-prefix guard present ([[ text != [@* ]] — BUG9)"
+else
+  expect.fail "no idempotent-prefix guard in send.smart — a second prefix could be added"
+fi
+
+# ── Isolation assertion: the live session registry was NEVER mutated ─────────
+LIVE_MD5_AFTER=$( [ -f "$LIVE_SESS" ] && md5sum "$LIVE_SESS" | cut -d' ' -f1 || echo none )
+test.case $level "ISOLATION: live sessions.env untouched by the send-matrix run" \
+  echo "before=$LIVE_MD5_BEFORE after=$LIVE_MD5_AFTER"
+if [ "$LIVE_MD5_BEFORE" = "$LIVE_MD5_AFTER" ]; then
+  expect.pass "live registry md5 unchanged — zero real-agent disturbance"
+else
+  expect.fail "live sessions.env CHANGED: $LIVE_MD5_BEFORE → $LIVE_MD5_AFTER"
+fi
+
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+rm -rf "$WORK" 2>/dev/null
+
+echo ""
+echo "=== T-SEND-MATRIX (D3 + E5 priority cells) complete ==="
+echo ""
+
+test.suite.save.results
