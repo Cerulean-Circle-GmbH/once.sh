@@ -1772,6 +1772,88 @@ otmux.send.raw() # <target> <keys> # raw send keys to pane; target=pane id, inde
     $TMUX_CMD send-keys -t "$target" "$@"
   fi
 }
+# ── OTR-1 submission-verified primitives (task-s2-b.1) ───────────────────────
+# object.verb / no-flag; built on the sanctioned send.raw. A send is DONE only
+# when SUBMISSION is VERIFIED by input-line REGION (staged text left the ❯ line),
+# NOT text-presence. submit/poke are TEXT-FREE (idempotent — N pokes can't dup).
+
+otmux.send.stage() # <target> <text> # stage literal text into the input line, NO submit
+{
+  local target=$(private.resolve.target "$1")
+  shift
+  local text="$*"
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.stage: invalid pane target '$target' — refusing to send"
+    return 1
+  fi
+  this.isEmpty "$text" && { debug.log "send.stage: empty text — no-op ($target)"; return 0; }
+  # -l = literal (no key-name interpretation); no Enter → text sits on the input line.
+  $TMUX_CMD send-keys -t "$target" -l "$text"
+}
+
+otmux.send.submit() # <target> # submit the staged input (Escape-if-Claude → Enter); SUBMIT ONLY, never re-stages → safe to repeat
+{
+  local target=$(private.resolve.target "$1")
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.submit: invalid pane target '$target' — refusing to send"
+    return 1
+  fi
+  # Delegate to the sanctioned raw Enter (dismisses Claude autocomplete first).
+  otmux.send.raw "$target" Enter
+}
+
+otmux.send.poke() # <target> # retry-submit a staged-unverified input; mechanically = submit, verb marks intent
+{
+  otmux.send.submit "$@"
+}
+
+# region-verify: SUBMITTED(0) iff the staged text is no longer on the input line;
+# STAGED(2) iff still on ❯/prompt; BLOCKED(3) iff an overlay/permission/dialog is up.
+otmux.send.verify() # <target> <?text> # verify SUBMISSION by input-line region — rc 0 submitted / 2 staged / 3 blocked / 1 error
+{
+  local target=$(private.resolve.target "$1")
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.verify: invalid pane target '$target'"
+    return 1
+  fi
+  local cap bottom
+  cap=$($TMUX_CMD capture-pane -t "$target" -p -S -8 2>/dev/null) || return 1
+  bottom=$(printf '%s\n' "$cap" | tail -8)
+
+  # BLOCKED — a modal/permission/overlay owns the input; Enter here is WRONG.
+  if printf '%s\n' "$bottom" | grep -qE 'Do you want to|❯[[:space:]]*[0-9]+\.[[:space:]]*(Yes|No|Allow|Deny)|Background tasks|Esc[[:space:]]+close|⏵⏵ accept'; then
+    return 3
+  fi
+
+  # SUBMITTED — the agent is processing (esc to interrupt) = input was consumed.
+  if printf '%s\n' "$bottom" | grep -q 'esc to int'; then
+    return 0
+  fi
+
+  # Locate the INPUT line and read what's AFTER the prompt marker:
+  #   Claude → the `❯` line (above the separator + status bar — NOT the last line).
+  #   bash   → the last line carrying a `>` prompt (the fresh prompt sits below the
+  #            echoed command). Content after the marker = still-staged text;
+  #            empty = submitted (fresh/consumed prompt).
+  local inputLine staged
+  inputLine=$(printf '%s\n' "$bottom" | grep '❯' | tail -1)
+  if [ -n "$inputLine" ]; then
+    staged="${inputLine##*❯}"
+  else
+    inputLine=$(printf '%s\n' "$bottom" | grep '>' | tail -1)
+    [ -z "$inputLine" ] && return 0   # no prompt visible (full-screen processing) → submitted
+    staged="${inputLine##*>}"
+  fi
+  staged=$(printf '%s' "$staged" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$staged" ] && return 2   # text still on the input line → STAGED
+  return 0                        # input line empty → SUBMITTED
+}
+
+otmux.send.stage.completion.target()  { private.complete.paneTargets; }
+otmux.send.submit.completion.target() { private.complete.paneTargets; }
+otmux.send.poke.completion.target()   { private.complete.paneTargets; }
+otmux.send.verify.completion.target() { private.complete.paneTargets; }
+
 otmux.send.key() # <target> <key> <?count:1> # send key N times to pane; key=Left/Right/Up/Down/Home/End/etc
 {
   local target=$(private.resolve.target "$1")
@@ -2066,28 +2148,33 @@ private.otmux.send.smart() # <target> <text> # internal: accept-edits, prefix, v
     [ -n "$prefix" ] && text="${prefix}${text}"
   fi
 
-  # Step 3: Send with verification
-  otmux.send.verified "$target" "$text" 3
-  local rc=$?
+  # Step 3: OTR-1 submission-verified core (task-s2-b.1) — stage → submit →
+  # verify → (poke → verify)×N → HONEST rc. Region-verify (staged text left the
+  # ❯ line), NOT text-presence. submit/poke are text-free → N pokes can't dup.
+  otmux.send.stage "$target" "$text" || return 1
+  otmux.send.submit "$target"
+  sleep 0.6
 
-  if [ $rc -eq 0 ]; then
-    return 0
-  fi
+  local verifyRc
+  otmux.send.verify "$target" "$text"; verifyRc=$?
 
-  # Step 4: Retry — send Enter and re-check
-  warn.log "send: initial send may have failed on $target — retrying Enter"
-  $TMUX_CMD send-keys -t "$target" Enter
-  sleep 2
+  # Bash panes submit reliably — a residual echoed command on the prompt is not a
+  # stuck input; light-verify: one poke max, then trust.
+  local pokes=0 maxPokes=3
+  while [ "$verifyRc" -eq 2 ] && [ "$pokes" -lt "$maxPokes" ]; do
+    pokes=$((pokes + 1))
+    warn.log "send: staged-not-submitted on $target — poke $pokes/$maxPokes"
+    otmux.send.poke "$target"
+    sleep 0.8
+    otmux.send.verify "$target" "$text"; verifyRc=$?
+  done
 
-  local after
-  after=$($TMUX_CMD capture-pane -t "$target" -p -S -10 2>/dev/null | tail -10)
-  if echo "$after" | grep -qF "$text"; then
-    info.log "send: message visible on $target after retry"
-    return 0
-  fi
-
-  warn.log "send: message may have been consumed by $target — verify manually"
-  return 0
+  case "$verifyRc" in
+    0) console.log "send.verified: SUBMITTED to $target"; return 0 ;;
+    3) warn.log "send: $target BLOCKED (overlay/permission) — not submitting (use approve/reject)"; return 3 ;;
+    2) warn.log "send: $target STAGED but UNVERIFIED after $maxPokes pokes — message staged, NOT confirmed (rc 2)"; return 2 ;;
+    *) error.log "send: verify error on $target (rc=$verifyRc)"; return 1 ;;
+  esac
 }
 
 
