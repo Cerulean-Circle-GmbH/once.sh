@@ -2599,22 +2599,24 @@ hiveMind.delegate() # <agentName> <description> <?from:PO> # write task file and
     echo "- [ ] Task completed as described"
   } > "$task_file"
 
-  # Send file-read nudge (not inline text — avoids tmux garbling)
+  # OTR-1: send the ONE-LINE pointer THROUGH the submission-verified core.
+  # Pointer-only (ARON #3: task = comms base; detail lives in the committed file)
+  # is also WRAP-FREE → submits on the first Enter. `otmux send` returns the
+  # HONEST rc {0 submitted / 2 staged-unverified / 3 blocked / 1 error} — report
+  # it, never a "delivered / verify manually" lie (kills delegate's Hole 1+2).
   local relative_path="session/tasks/${timestamp}.task.md"
-  otmux send.enter "$target" "Read ${relative_path}" Enter
-
-  # Verify nudge landed
-  sleep 1
-  local verify
-  verify=$("otmux" pane.capture "$target" 5 2>/dev/null)
-  if echo "$verify" | grep -q "$relative_path"; then
-    console.log "Delegated to $name: $task_file"
-    create.result 0 "$task_file"
-  else
-    warn.log "Nudge may not have landed — verify manually"
-    create.result 0 "$task_file"
-  fi
-  return $(result)
+  otmux send "$target" "Read ${relative_path}"
+  local rc=$?
+  case "$rc" in
+    0) console.log "Delegated to $name: $task_file (submitted)"
+       create.result 0 "$task_file"; return 0 ;;
+    2) warn.log "delegate: pointer STAGED but unverified on $target — task file written; re-drain/poke to submit"
+       create.result 2 "$task_file (staged-unverified)"; return 2 ;;
+    3) warn.log "delegate: $target BLOCKED (overlay/permission) — task file written; deliver after clearing"
+       create.result 3 "$task_file (blocked)"; return 3 ;;
+    *) error.log "delegate: send error to $target (rc $rc)"
+       create.result 1 "$task_file (send-error)"; return 1 ;;
+  esac
 }
 hiveMind.task.delegate() # <sshHost> <pane> <taskFile> <?message> # delegate task file to remote agent via scp + send
 {
@@ -8089,21 +8091,33 @@ hiveMind.agent.queue.drain() # <agent|pane> # FIFO drain pending messages (re-ch
       break
     fi
 
-    # Dispatch per intent
+    # Dispatch per intent — capture the OTR-1 honest submission rc.
+    local dispatchRc=0
     case "$intent" in
       inform)
-        private.hiveMind.agent.inform "$target" "$text" 2>/dev/null
+        private.hiveMind.agent.inform "$target" "$text" 2>/dev/null; dispatchRc=$?
         ;;
       remote-control:*)
         local key="${intent#remote-control:}"
-        otmux send.raw "$target" "$key" 2>/dev/null
+        otmux send.raw "$target" "$key" 2>/dev/null; dispatchRc=$?
         ;;
       *)
         warn.log "queue $target: unknown intent '$intent', dropping"
+        dispatchRc=0   # unparseable intent → drop it (dequeue below)
         ;;
     esac
 
-    # Remove first line on success
+    # OTR-1 CRITICAL: gate DEQUEUE on VERIFIED submission (rc 0). A message that
+    # did NOT submit (rc 2 staged-unverified / 3 blocked) STAYS queued — NEVER
+    # silently dropped. This is the robbin-po-unreachable / Sprint22 fix: Hole 2
+    # dropped drained-but-unsent messages. Stop the drain so we don't spin on it.
+    if [ "$dispatchRc" -ne 0 ]; then
+      warn.log "queue $target: message NOT submitted (rc=$dispatchRc) — KEPT queued, stopping drain"
+      stopped_at="submit unverified (rc=$dispatchRc) — message kept queued, will retry next drain"
+      break
+    fi
+
+    # Dequeue ONLY after verified submission.
     tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
     drained=$((drained + 1))
     sleep 0.2
