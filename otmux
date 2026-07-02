@@ -43,7 +43,18 @@ private.resolve.target() {
     L|l|left)  $TMUX_CMD display-message -p -t "{left-of}" "#{pane_id}" 2>/dev/null || echo "$target" ;;
     R|r|right) $TMUX_CMD display-message -p -t "{right-of}" "#{pane_id}" 2>/dev/null || echo "$target" ;;
     CURRENT|current|.|self) private.otmux.pane.self || echo "$target" ;;
-    *)         echo "$target" ;;
+    *)
+      # g.1 point 4: a BARE session name (no :win.pane, not a %id) → resolve to that
+      # session's ACTIVE pane, so a session-send branches on the active pane's KIND
+      # (shell vs claude). Only when it's a real session; else pass through unchanged
+      # for isPane to reject. Fully-qualified sess:win.pane and %id fall straight through.
+      if [[ "$target" != *:* ]] && [[ "$target" != %* ]] && \
+         $TMUX_CMD has-session -t "$target" 2>/dev/null; then
+        $TMUX_CMD display-message -p -t "$target" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "$target"
+      else
+        echo "$target"
+      fi
+      ;;
   esac
 }
 
@@ -1736,9 +1747,12 @@ private.otmux.pane.isClaudeCode() # <target> # returns 0 if pane runs Claude Cod
   local cmd
   cmd=$($TMUX_CMD display-message -t "$target" -p '#{pane_current_command}' 2>/dev/null)
   case "$cmd" in
-    node|claude) return 0 ;;
-    bash|zsh|sh)
-      # Claude Code may show as bash parent — check for claude child process
+    claude) return 0 ;;
+    node|bash|zsh|sh)
+      # g.1 (M2): node/bash/zsh/sh may be a Claude Code PARENT — confirm via the
+      # claude child process. `node` alone is NOT claude: ANY node tool (dev server,
+      # npm, a REPL) reports `node`. Treating node as unconditional-claude fired the
+      # Escape+poke TUI protocol into plain node shells → interrupt/hang.
       "$OOSH_DIR/claudeCode" process.running "$target" 2>/dev/null && return 0
       return 1 ;;
     *) return 1 ;;
@@ -2124,26 +2138,45 @@ private.otmux.send.smart() # <target> <text> # internal: accept-edits, prefix, v
     return 0
   fi
 
-  # Step 1: Detect accept-edits mode and clear it (Claude Code panes only)
-  if private.otmux.pane.isClaudeCode "$target"; then
-    local capture
-    capture=$($TMUX_CMD capture-pane -t "$target" -p -S -5 2>/dev/null)
-    if echo "$capture" | grep -q '⏵⏵ accept'; then
-      info.log "Accept-edits detected on $target — clearing"
-      $TMUX_CMD send-keys -t "$target" Enter
-      sleep 0.5
-      $TMUX_CMD send-keys -t "$target" BTab
-      sleep 0.3
-      $TMUX_CMD send-keys -t "$target" BTab
-      sleep 0.5
-    fi
-    # Clear input line
-    $TMUX_CMD send-keys -t "$target" C-u
+  # g.1 (architect e6eb721): branch on target KIND ONCE, up front. The OTR-1
+  # verify+poke+Escape sequence is a CLAUDE-TUI protocol (staged-in-the-❯-box vs
+  # submitted). Non-claude targets (shell / ssh / session-to-shell) have no such
+  # box → applying it misfires: fragile `>`-verify → false rc2 → poke loop, and
+  # Escape fired into a shell → interrupt/hang. Detect kind, pick the protocol.
+  local isClaude=false
+  private.otmux.pane.isClaudeCode "$target" && isClaude=true
+
+  if ! $isClaude; then
+    # NON-CLAUDE PATH — fire + light-confirm. stage + Enter, NO Escape, NO poke.
+    # A shell command isn't a TUI "staged" state; one Enter dispatches and there is
+    # nothing to poke. send.submit → send.raw Enter; isClaudeCode=false → NEVER
+    # Escapes. Mirrors macos.latest's old reliable sendEnter (stage+Enter).
+    otmux.send.stage "$target" "$text" || return 1
+    otmux.send.submit "$target"
+    console.log "send: dispatched to $target (shell)"
+    return 0
   fi
 
-  # Step 2: Add sender prefix (Claude Code targets only, skip /commands and
-  # already-prefixed text — idempotent: BUG 9, no [@x][@x] duplication)
-  if private.otmux.pane.isClaudeCode "$target" && [[ "$text" != /* ]] && [[ "$text" != \[@* ]]; then
+  # ── CLAUDE PATH — full OTR-1 contract, preserved (5/5 T-DISPATCH-SUBMIT) ──
+
+  # Step 1: Detect accept-edits mode and clear it
+  local capture
+  capture=$($TMUX_CMD capture-pane -t "$target" -p -S -5 2>/dev/null)
+  if echo "$capture" | grep -q '⏵⏵ accept'; then
+    info.log "Accept-edits detected on $target — clearing"
+    $TMUX_CMD send-keys -t "$target" Enter
+    sleep 0.5
+    $TMUX_CMD send-keys -t "$target" BTab
+    sleep 0.3
+    $TMUX_CMD send-keys -t "$target" BTab
+    sleep 0.5
+  fi
+  # Clear input line
+  $TMUX_CMD send-keys -t "$target" C-u
+
+  # Step 2: Add sender prefix (skip /commands and already-prefixed text —
+  # idempotent: BUG 9, no [@x][@x] duplication)
+  if [[ "$text" != /* ]] && [[ "$text" != \[@* ]]; then
     local prefix
     prefix=$(private.otmux.send.prefix)
     [ -n "$prefix" ] && text="${prefix}${text}"
@@ -2160,8 +2193,6 @@ private.otmux.send.smart() # <target> <text> # internal: accept-edits, prefix, v
   local verifyRc
   otmux.send.verify "$target" "$text"; verifyRc=$?
 
-  # Bash panes submit reliably — a residual echoed command on the prompt is not a
-  # stuck input; light-verify: one poke max, then trust.
   local pokes=0 maxPokes=3
   while [ "$verifyRc" -eq 2 ] && [ "$pokes" -lt "$maxPokes" ]; do
     pokes=$((pokes + 1))
