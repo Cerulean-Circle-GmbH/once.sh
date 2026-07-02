@@ -5141,6 +5141,14 @@ private.hiveMind.reconcile.check.i2() { # # I2 (HIGH): every pane in S2 is in S1
   local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
   local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
   [ -f "$ses" ] || return 0
+  # (b) I2b — batch live-uuid map (OTR-3, via the c.0 canonical reader): pane →
+  # live uuid, ONE scan (not per-pane — kills the ~1s/pane cost the TODO feared).
+  # A fork breaks EXACTLY this: the pane keeps role+tty, the live Claude gets a NEW
+  # uuid, S2 caches the OLD (or empty) one → stale route. tuple = host|session|
+  # address|tty|role|uuid|kind|title|cwd → pane=$2:$3, uuid=$6, kind=$7.
+  local liveMap
+  liveMap=$(private.hiveMind.live.tupleset 2>/dev/null \
+    | awk -F'|' '$7=="agent" && $6!="" {print $2":"$3"|"$6}')
   while IFS='|' read -r pane cachedUuid rest; do
     [ -z "$pane" ] || [[ "$pane" == "#"* ]] && continue
     # (a) Pane must be in S1 (else S2 entry is orphan)
@@ -5148,13 +5156,15 @@ private.hiveMind.reconcile.check.i2() { # # I2 (HIGH): every pane in S2 is in S1
       echo "HIGH|I2|S2|REMOVE|${pane}|<not-in-S1>|${cachedUuid}"
       continue
     fi
-    # (b) Cached UUID must match live Claude on that pane — SKIPPED for now.
-    # Per-pane `claudeCode session.current` call is ~1s each (sources `this`),
-    # times 40-50 sessions.env entries = 45s+ audit which times out under
-    # subshell capture. TODO Sprint 1 follow-up: batch live UUID discovery
-    # via ONE ps scan + JSONL correlation, replacing the per-pane call.
-    # The (a) orphan check above already catches the most-common drift
-    # (sessions.env entry for pane no longer in registry).
+    # (b) I2b: cached uuid must EQUAL the live uuid on that pane (cache→live heal).
+    # No live agent on the pane → not an I2b drift (dead/un-booted handled by
+    # team.audit / other invariants). Empty cache + live agent = adopt (fork case).
+    local liveUuid
+    liveUuid=$(printf '%s\n' "$liveMap" | awk -F'|' -v p="$pane" '$1==p{print $2; exit}')
+    [ -z "$liveUuid" ] && continue
+    if [ "$cachedUuid" != "$liveUuid" ]; then
+      echo "HIGH|I2|S2|UPDATE|${pane}|${liveUuid}|${cachedUuid}"
+    fi
   done < "$ses"
 }
 
@@ -5362,6 +5372,65 @@ hiveMind.consistency.audit() # <?session> <?format:human|json> # graded audit (I
 }
 hiveMind.consistency.audit.completion.format() { echo "human"; echo "json"; }
 hiveMind.consistency.audit.completion.session() { private.hiveMind.teams.complete; }
+
+hiveMind.team.audit() # <session> # team-scoped fork-corruption audit — flags orphan (unknown-route) / empty-uuid / dead-route; exit = violation count (U2)
+{
+  # OTR-3 (task-s2-c.2): the two post-fork corruption signatures, team-scoped,
+  # read against the c.0 canonical live reader (the ONE truth source):
+  #   • ORPHAN / UNKNOWN-ROUTE — a LIVE agent pane with NO role in S1 (roles.env).
+  #     Role is NEVER fabricated — flagged for reconcile tty-adopt / human resolve.
+  #   • EMPTY-UUID — a live agent pane in S1 with an empty uuid route (heal via I2b).
+  #   • DEAD-ROUTE — an S2 (sessions.env) uuid for this team matching NO live agent.
+  # Exit code = violation count (mirrors consistency.audit U2). Pure read.
+  local session="$1"
+  [ -z "$session" ] && { error.log "Usage: hiveMind team.audit <session>"; return 1; }
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+
+  # Live truth for this team (c.0 reader): host|session|address|tty|role|uuid|kind|title|cwd
+  local live liveUuids findings=""
+  live=$(private.hiveMind.live.tupleset "$session" 2>/dev/null)
+  liveUuids=$(printf '%s\n' "$live" | awk -F'|' '$7=="agent" && $6!="" {print $6}')
+
+  # (1) ORPHAN + EMPTY-UUID — per LIVE agent pane. Orphan = pane NOT in S1
+  # (roles.env) — checked against the registry, NOT the title (title-first would
+  # otherwise mask a missing registry entry). One finding per pane.
+  local pane role uuid
+  while IFS='|' read -r pane role uuid; do
+    [ -z "$pane" ] && continue
+    if ! grep -q "^${pane}|" "$reg" 2>/dev/null; then
+      findings+="UNKNOWN-ROUTE|${pane}|orphan: live agent pane has NO role in roles.env — adopt via reconcile tty-match or resolve manually"$'\n'
+    elif [ -z "$uuid" ]; then
+      findings+="EMPTY-UUID|${pane}|role=${role} live but no uuid route — heal via consistency.reconcile (I2b tty-adopt)"$'\n'
+    fi
+  done < <(printf '%s\n' "$live" | awk -F'|' '$7=="agent"{print $2":"$3"|"$5"|"$6}')
+
+  # (2) DEAD-ROUTE — S2 uuid for this team matching NO live agent process.
+  local sPane sUuid sRest
+  while IFS='|' read -r sPane sUuid sRest; do
+    [ -z "$sPane" ] || [[ "$sPane" == "#"* ]] && continue
+    [[ "$sPane" == "${session}:"* ]] || continue
+    [ -z "$sUuid" ] && continue
+    if ! printf '%s\n' "$liveUuids" | grep -qxF "$sUuid"; then
+      findings+="UNKNOWN-ROUTE|${sPane}|dead route: uuid ${sUuid} matches NO live process"$'\n'
+    fi
+  done < "$ses"
+
+  # Report (stdout — always visible) + exit = violation count.
+  local count=0
+  if [ -n "$findings" ]; then
+    printf '%s' "$findings"
+    count=$(printf '%s' "$findings" | grep -c '|')
+  fi
+  if [ "$count" -eq 0 ]; then
+    console.log "team.audit[$session]: clean (0 violations)"
+  else
+    warn.log "team.audit[$session]: $count violation(s) — see above"
+  fi
+  [ "$count" -gt 125 ] && return 125
+  return "$count"
+}
+hiveMind.team.audit.completion.session() { private.hiveMind.teams.complete; }
 
 private.hiveMind.audit.render.human() # <diff_lines> <total> <c> <h> <m> <l> # color-grouped report
 {
