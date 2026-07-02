@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# T-DASH-GUARD (#13, reframed) — the constructor self-heals the SHELL: when the
+# fresh-host entry `init/oosh` is launched under /bin/sh→dash it must NOT die
+# `Bad function name` (OOSH's object.verb dotted fns are bash-only) — it
+# re-execs under bash and reaches a valid [oosh]. This is the regression fence
+# for that bash-guarantee. (ref: session/tasks/claudecode-install-dash-safe.md D13.3)
+#
+# NON-DESTRUCTIVE: init/oosh is a REAL installer (moves the oosh tree, sudo
+# re-exec, state-machine handoff) — we NEVER run the full installer on the live
+# checkout (it wiped /home/donges/oosh during D13.3 baseline; had to re-clone).
+# We assert the guarantee structurally + prove the re-exec MECHANISM in isolation.
+# A full end-to-end "reaches [oosh]" belongs on a THROWAWAY container (S5), not here.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+I="$OOSH_DIR/init/oosh"
+
+# --- (1) init/oosh is a POSIX-sh bootstrap (shebang = sh, not bash) ----------
+test.case $level "T-DASH-GUARD: init/oosh shebang is POSIX sh" echo "$(head -1 "$I")"
+if head -1 "$I" | grep -qE '^#!.*/(env +)?(sh|dash)\b'; then
+  expect.pass "init/oosh is a POSIX sh bootstrap (runnable under /bin/sh)"
+else
+  expect.fail "init/oosh shebang must be POSIX sh so a naked /bin/sh host can launch it: $(head -1 "$I")"
+fi
+
+# --- (2) init/oosh PARSES clean under dash (no bashism blocks the pre-re-exec
+#         path; unlike claudeCode which dies at its first dotted fn) -----------
+if command -v dash >/dev/null 2>&1; then
+  dashOut=$(dash -n "$I" 2>&1); dashRc=$?
+  test.case $level "T-DASH-GUARD: init/oosh parses under 'dash -n' (no Bad function name)" \
+    echo "rc=$dashRc $dashOut"
+  if [ "$dashRc" -eq 0 ] && [ -z "$dashOut" ]; then
+    expect.pass "init/oosh is dash-parseable end-to-end"
+  else
+    expect.fail "dash rejects init/oosh (would die on a naked host): $dashOut"
+  fi
+else
+  test.case $level "T-DASH-GUARD: dash -n skipped (no dash)" echo "skip"
+  expect.pass "skipped dash -n (no dash on this box)"
+fi
+
+# --- (3) init/oosh contains a bash re-exec (self-guarantee of the interpreter) -
+reexecLine=$(grep -nE 'exec +("?\$[A-Za-z_]+"?|bash|"\$_newbash") .*"\$0"|exec +.*bash.*"\$0"' "$I" | head -1)
+test.case $level "T-DASH-GUARD: init/oosh re-execs into bash (exec … \"\$0\")" echo "$reexecLine"
+if [ -n "$reexecLine" ]; then
+  expect.pass "bash re-exec present: $reexecLine"
+else
+  expect.fail "init/oosh must re-exec into bash (exec \$bash \"\$0\" \"\$@\") to self-guarantee the interpreter"
+fi
+
+# --- (4) the re-exec precedes any sourcing of a DOTTED-fn script (this/ossh):
+#         if init sourced `. this` under dash BEFORE re-execing, dash would die
+#         Bad function name at runtime. First `exec …bash` line < first `. this` --
+reexecNo=$(grep -nE 'exec +.*bash.*"\$0"|exec +"\$_newbash"' "$I" | head -1 | cut -d: -f1)
+srcThisNo=$(grep -nE '(^|[[:space:]])(\.|source) +.*(/this|/ossh|"\$OOSH_DIR"/(this|ossh))' "$I" | head -1 | cut -d: -f1)
+test.case $level "T-DASH-GUARD: bash re-exec precedes any dotted-fn sourcing" \
+  echo "reexec@$reexecNo firstDottedSource@${srcThisNo:-none}"
+if [ -n "$reexecNo" ] && { [ -z "$srcThisNo" ] || [ "$reexecNo" -lt "$srcThisNo" ]; }; then
+  expect.pass "re-exec (line $reexecNo) is before any dotted-fn source (${srcThisNo:-none}) — dash-safe order"
+else
+  expect.fail "a dotted-fn source at line $srcThisNo precedes the bash re-exec ($reexecNo) — dash would die there"
+fi
+
+# --- (5) MECHANISM (live, isolated, non-destructive): a tiny script using
+#         init/oosh's EXACT re-exec pattern, launched under dash with
+#         BASH_VERSION cleared (env -u — else the parent bash leaks it and the
+#         guard never fires), re-execs into a real bash and reaches its tail.
+#         Line 3 is ONLY reachable after the sh→bash re-exec. --------------------
+if command -v dash >/dev/null 2>&1; then
+  gtmp=$(mktemp 2>/dev/null || echo "/tmp/t-guard-$$")
+  {
+    echo '#!/bin/sh'
+    echo '[ -z "$BASH_VERSION" ] && exec bash "$0" "$@"'
+    echo 'printf "REEXEC_OK=%s" "$BASH_VERSION"'
+  } > "$gtmp"
+  probe=$(env -u BASH_VERSION dash "$gtmp" 2>&1); pRc=$?
+  rm -f "$gtmp"
+  test.case $level "T-DASH-GUARD (live): sh→exec bash pattern reaches bash tail" echo "rc=$pRc $probe"
+  if printf '%s' "$probe" | grep -qE 'REEXEC_OK=[0-9]'; then
+    expect.pass "launched under dash, the re-exec guard yields a live bash ($probe)"
+  else
+    expect.fail "sh→exec bash did not re-exec into bash: rc=$pRc out='$probe'"
+  fi
+else
+  test.case $level "T-DASH-GUARD (live): mechanism skipped (no dash)" echo "skip"
+  expect.pass "skipped live mechanism probe (no dash)"
+fi
+
+test.suite.save.results
