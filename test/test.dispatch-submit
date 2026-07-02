@@ -23,23 +23,31 @@ source test.suite
 log.level $level
 
 # ============================================================================
-# T-DISPATCH-SUBMIT-GATE-SRC (static — always runs): lock the exact rc0-gate.
+# T-DISPATCH-SUBMIT-GATE-SRC (static — always runs): lock the drain DEQUEUE gate.
 # The behavioral NODROP test below exercises the route-defer path (a bash pane
-# is never route=inform, so drain bails before dispatch); the rc0-gate line
-# itself only fires on a live claude ❯ pane (not forgeable in a test). So assert
-# at the source that agent.queue.drain guards DEQUEUE behind the rc0 gate:
-# `dispatchRc -ne 0` → break (keep) BEFORE the `tail -n +2` dequeue.
+# is never route=inform, so drain bails before dispatch); the dispatch gate only
+# fires on a live claude ❯ pane (not forgeable in a test). So assert at source.
+#
+# NEW POLICY (d4e3ae0 — the real dup fix): DEQUEUE on rc0 OR rc2 (message is ON
+# THE PANE — submitted or staged/delivered), KEEP (break) ONLY on rc3 (blocked)
+# or rc1 (error) = NOT-ON-PANE. The old "-ne 0" kept rc2 queued → drain
+# re-delivered the staged message every cycle → the "all messages duplicate"
+# regression. So the guard now checks: keep-gate is `-eq 3 || -eq 1`, rc2 is NOT
+# in the keep set (rc2 dequeues), break before the `tail -n +2` dequeue.
 # ============================================================================
 DRAIN_BODY=$(sed -n '/^hiveMind.agent.queue.drain()/,/^}/p' "$OOSH_DIR/hiveMind")
-GATE_LINE=$(printf '%s\n' "$DRAIN_BODY" | grep -n 'dispatchRc" -ne 0' | head -1 | cut -d: -f1)
+GATE_LINE=$(printf '%s\n' "$DRAIN_BODY" | grep -n 'dispatchRc" -eq 3' | head -1 | cut -d: -f1)
 DEQ_LINE=$(printf '%s\n' "$DRAIN_BODY"  | grep -n 'tail -n +2 "$f"' | tail -1 | cut -d: -f1)
-BREAK_AFTER_GATE=$(printf '%s\n' "$DRAIN_BODY" | awk -v g="$GATE_LINE" 'NR>g && NR<=g+4 && /break/{print "yes"; exit}')
-test.case $level "T-DISPATCH-SUBMIT-GATE-SRC: drain dequeues ONLY after rc 0" \
-  echo "gate=$GATE_LINE break=$BREAK_AFTER_GATE lastDequeue=$DEQ_LINE"
-if [ -n "$GATE_LINE" ] && [ "$BREAK_AFTER_GATE" = "yes" ] && [ -n "$DEQ_LINE" ] && [ "$DEQ_LINE" -gt "$GATE_LINE" ]; then
-  expect.pass "dequeue is gated on rc 0 (non-0 → break before dequeue at line $DEQ_LINE)"
+BREAK_AFTER_GATE=$(printf '%s\n' "$DRAIN_BODY" | awk -v g="${GATE_LINE:-0}" 'NR>g && NR<=g+4 && /break/{print "yes"; exit}')
+# The keep-gate must NOT retain rc2 (rc2 is on-the-pane → dequeue, the dup fix).
+KEEP_HAS_RC2=$(printf '%s\n' "$DRAIN_BODY" | grep -cE 'dispatchRc" -(ne 0|eq 2)')
+test.case $level "T-DISPATCH-SUBMIT-GATE-SRC: drain dequeues on rc0|rc2, keeps only rc3|rc1" \
+  echo "gate=$GATE_LINE break=$BREAK_AFTER_GATE dequeue=$DEQ_LINE keepsRc2=$KEEP_HAS_RC2"
+if [ -n "$GATE_LINE" ] && [ "$BREAK_AFTER_GATE" = "yes" ] && [ -n "$DEQ_LINE" ] \
+   && [ "$DEQ_LINE" -gt "$GATE_LINE" ] && [ "${KEEP_HAS_RC2:-1}" -eq 0 ]; then
+  expect.pass "keep-gate = rc3|rc1 (not-on-pane) → break before dequeue (line $DEQ_LINE); rc2 dequeues (no re-deliver dup)"
 else
-  expect.fail "rc0-gate missing/misordered: gate=$GATE_LINE break=$BREAK_AFTER_GATE dequeue=$DEQ_LINE"
+  expect.fail "gate policy wrong: gate=$GATE_LINE break=$BREAK_AFTER_GATE dequeue=$DEQ_LINE keepsRc2=$KEEP_HAS_RC2 (want rc3|rc1 keep, rc2 dequeue)"
 fi
 
 # ── Isolated throwaway session (no live-pane impact) ────────────────────────
