@@ -1311,11 +1311,25 @@ hiveMind.protected.agents.discover() # <?session_filter> # shared discovery — 
 # consume THIS; neither re-enumerates → parity holds BY CONSTRUCTION (tree.detailed
 # reads the same discover). Completeness (PF2): discover walks list-panes -a, so
 # every live shell is included — no registry dependency to drop unregistered shells.
-private.hiveMind.live.tupleset() { # <?session> # canonical live reader — emits host|session|address|tty|role|uuid|kind|title|cwd per live pane
+private.hiveMind.live.tupleset() { # <?session> # canonical live reader — emits host|session|address|tty|role|uuid|kind|title|cwd per live pane (LOCAL + remote teams)
   local filter="$1"
   # host tags every LOCAL row (remote rows carry the remote host — see the remote
   # sourcing that projects off this same reader). Cached hostname, free.
   local host="${HIVEMIND_HOST:-$(hostname -s 2>/dev/null)}"
+
+  # c.0 REMOTE delegation: a filtered read of a REMOTE team runs the SAME reader
+  # ON that host via ossh exec (remote truth = the reader executed remotely). No
+  # infinite recursion: on the remote, that session is local → reads locally.
+  if [ -n "$filter" ]; then
+    local teamHost
+    teamHost=$(private.hiveMind.team.host "$filter")
+    if [ -n "$teamHost" ] && [ "$teamHost" != "$host" ]; then
+      private.hiveMind.live.tupleset.remote "$filter" "$teamHost"
+      return 0
+    fi
+  fi
+
+  # ── LOCAL rows ──
   # ONE batch: pane → tty + cwd. tty (stripped of /dev/) is the stable-across-fork
   # join key C.2's tty-match adopt + C.3's identity anchor need; cwd is the snapshot
   # field. `model` is DROPPED — derive-on-demand (slow per-pane JSONL), never part
@@ -1335,12 +1349,64 @@ private.hiveMind.live.tupleset() { # <?session> # canonical live reader — emit
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
       "$host" "$sess" "$addr" "$tty" "${role:-unknown}" "$uuid" "$kind" "${title:--}" "$cwd"
   done
+
+  # ── REMOTE teams (unfiltered enumeration only — union every remote team) ──
+  # Each remote team is sourced by running THIS reader on its host. Unreachable →
+  # an explicit remote-unreachable MARKER row (never a silent omission — kills PF3).
+  if [ -z "$filter" ]; then
+    local tf="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+    [ -f "$tf" ] && while IFS='|' read -r rsess rdesc rhost; do
+      [ -z "$rsess" ] && continue
+      [ -z "$rhost" ] && continue          # host-less row = local (already emitted)
+      [ "$rhost" = "$host" ] && continue    # explicitly local
+      private.hiveMind.live.tupleset.remote "$rsess" "$rhost"
+    done < "$tf"
+  fi
+}
+
+private.hiveMind.live.tupleset.remote() { # <session> <host> # source ONE remote team's canonical rows via ossh exec; fail-safe marker on unreachable
+  local session="$1" rhost="$2"
+  local out rows
+  out=$(ossh exec "$rhost" "hiveMind protected.live.tupleset $session" 2>/dev/null)
+  # Keep only well-formed 9-field rows (drops ssh/login noise + the leading blank).
+  rows=$(printf '%s\n' "$out" | awk -F'|' 'NF==9 && $1!=""')
+  if [ -z "$rows" ]; then
+    # FAIL-SAFE (kills PF3): NEVER silently omit an unreachable remote team — emit a
+    # host-tagged 9-field marker row so consumers SEE the team exists-but-unreachable.
+    printf '%s|%s|||||remote-unreachable|%s|\n' "$rhost" "$session" "unreachable@${rhost}"
+    return 0
+  fi
+  printf '%s\n' "$rows"
 }
 
 hiveMind.protected.live.tupleset() # <?session> # CLI / test / remote-exec entry for the canonical live reader (ossh exec <host> hiveMind protected.live.tupleset <s>)
 {
   private.hiveMind.live.tupleset "$1"
 }
+
+private.hiveMind.team.host() { # <session> # host owning a team (teams.env column 3); default = local HIVEMIND_HOST when absent
+  local session="$1"
+  local tf="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  local h=""
+  [ -f "$tf" ] && h=$(awk -F'|' -v s="$session" '$1==s {print $3; exit}' "$tf")
+  [ -z "$h" ] && h="${HIVEMIND_HOST:-$(hostname -s 2>/dev/null)}"
+  echo "$h"
+}
+
+hiveMind.team.host.set() # <session> <host> # set/update a team's host column (remote-team registration; called at team.push time)
+{
+  local session="$1" host="$2"
+  [ -z "$session" ] || [ -z "$host" ] && { error.log "Usage: hiveMind team.host.set <session> <host>"; return 1; }
+  if ! this.isSessionName "$session"; then error.log "team.host.set: invalid session '$session'"; return 1; fi
+  local tf="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  private.hiveMind.teams.ensure.dir
+  local desc=""
+  [ -f "$tf" ] && desc=$(awk -F'|' -v s="$session" '$1==s {print $2; exit}' "$tf")
+  [ -f "$tf" ] && grep -v "^${session}|" "$tf" > "${tf}.tmp" 2>/dev/null && mv "${tf}.tmp" "$tf"
+  echo "${session}|${desc}|${host}" >> "$tf"
+  success.log "team.host.set: $session → $host"
+}
+hiveMind.team.host.set.completion.session() { private.hiveMind.teams.complete 2>/dev/null; }
 
 private.hiveMind.identity.resolve() { # <?pane> # role@host for ONE pane — a projection of live.tupleset filtered to the pane (defaults to caller's own pane via pane.self)
   local pane="$1"
