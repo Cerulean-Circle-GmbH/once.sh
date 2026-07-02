@@ -549,6 +549,9 @@ oo.state() # # initializes the state machine or shows the current state if alrea
 
 
   if state machine.exists ${machine}; then
+    # S8: self-heal an existing box whose state order predates a schema change (F1).
+    # Two-tier detect (stamp + order invariant) → reconcile BY NAME. No drive here.
+    private.reconcile.check ${machine}
     state of ${machine} list all
     source $CONFIG_PATH/current.state.machine.env
     if [ $state -lt 4 ]; then
@@ -560,36 +563,51 @@ oo.state() # # initializes the state machine or shows the current state if alrea
   fi
 }
 
-private.init.state.machine() # <machine> # creates the state machine
-{
-  local machine=$1
-  console.log "initialising state machine: ${machine}"
-  
-  source $OOSH_DIR/state
+# S8: schema version of the SETUP_SERVER state ORDER. Bump whenever
+# private.setup.server.declare's add-sequence changes (D1 reorder = v2). A built
+# machine stamps OOSH_SETUP_SERVER_SCHEMA (oosh.env); a mismatch/absence triggers
+# the two-tier reconcile in oo.state (self-heal of already-installed boxes, F1).
+SETUP_SERVER_SCHEMA_EXPECTED=2
 
+private.setup.server.declare() # <machine> # SINGLE SOURCE OF TRUTH for the SETUP_SERVER state order
+{
+  # DRY (S8): the ONE ordered state.add sequence. Called by BOTH private.init.state.machine
+  # (fresh) AND private.reconcile.state.machine (existing-box rebuild) so the two paths
+  # can never diverge. Declaration ONLY — no drive (state.next), keeping it F2-safe and
+  # reusable for pure metadata rebuild. Order = D1-corrected: mode branch before done.
+  local machine=$1
+  source $OOSH_DIR/state
   state.machine.create ${machine} oo
-  state.add remote.install.started               silent 
-  state.add local.install.started                silent 
-  state.add priviledges.checked                  silent 
+  state.add remote.install.started               silent
+  state.add local.install.started                silent
+  state.add priviledges.checked                  silent
   state.add 20                                   silent
   state.add user.rights.only                     silent
   state.add user.mode.release                    silent
   state.add user.mode.dev                        silent
   state.add user.installation.done               silent
   state.add 30                                   silent
-  state.add root.rights                          silent 
-  state.add root.shared.dev.folder.created       silent 
-  state.add root.dev.keys.installed              silent 
-  state.add root.installation.done               silent 
-  state.add 40                                   silent 
-  state.add user.shared.dev.folder.linked        silent 
-  state.add user.state.machine.synced.with.root  silent 
-  state.add 50                                   silent 
-  state.add headless.setup.started               silent 
-  state.add headless.setup.finished              silent 
-  state.add 60                                   silent 
-  state.add once.setup.started                   silent 
-  state.add once.setup.finished                  silent 
+  state.add root.rights                          silent
+  state.add root.shared.dev.folder.created       silent
+  state.add root.dev.keys.installed              silent
+  state.add root.installation.done               silent
+  state.add 40                                   silent
+  state.add user.shared.dev.folder.linked        silent
+  state.add user.state.machine.synced.with.root  silent
+  state.add 50                                   silent
+  state.add headless.setup.started               silent
+  state.add headless.setup.finished              silent
+  state.add 60                                   silent
+  state.add once.setup.started                   silent
+  state.add once.setup.finished                  silent
+}
+
+private.init.state.machine() # <machine> # creates the state machine
+{
+  local machine=$1
+  console.log "initialising state machine: ${machine}"
+
+  private.setup.server.declare ${machine}
 
   state.next
   state.machine.start oo
@@ -616,6 +634,110 @@ private.init.state.machine() # <machine> # creates the state machine
   #state.next # root.shared.dev.folder.created
 
   #state.add - does.not.work
+
+  # S8: stamp the built machine's schema (pure-state OOSH_ export → oosh.env) so a
+  # future oo.state sees it as fresh (no needless reconcile).
+  export OOSH_SETUP_SERVER_SCHEMA="$SETUP_SERVER_SCHEMA_EXPECTED"
+  config save oosh OOSH >/dev/null
+}
+
+private.setup.server.invariant.holds() # <machine> # true if states.env order is D1-correct (release<dev<done)
+{
+  # Tier 2 oracle (S8 §B): read the persisted states.env READ-ONLY and assert the
+  # ordering invariant BY NAME. Definitive regardless of the schema stamp.
+  local machine=$1
+  local statesFile="$CONFIG_PATH/stateMachines/${machine}.states.env"
+  [ -f "$statesFile" ] || return 1
+  (
+    source "$statesFile" 2>/dev/null
+    local rel="" dev="" don="" i
+    for i in "${!SETUP_SERVER_STATES[@]}"; do
+      case "${SETUP_SERVER_STATES[$i]}" in
+        user.mode.release)       rel=$i ;;
+        user.mode.dev)           dev=$i ;;
+        user.installation.done)  don=$i ;;
+      esac
+    done
+    [ -n "$rel" ] && [ -n "$dev" ] && [ -n "$don" ] \
+      && [ "$rel" -lt "$dev" ] && [ "$dev" -lt "$don" ]
+  )
+}
+
+private.reconcile.check() # <machine> # two-tier stale-detect + dispatch (no-op / stamp-in-place / reconcile)
+{
+  # S8 §B: only runs on an EXISTING machine. Tier 1 = cheap schema stamp; Tier 2 =
+  # order-invariant oracle. Dual gate avoids BOTH missed migrations and needless
+  # rebuilds. No drive here — pure detection + metadata surgery.
+  local machine=$1
+  # Tier 1 — stamp matches expected → already fresh, no-op.
+  if [ "$OOSH_SETUP_SERVER_SCHEMA" = "$SETUP_SERVER_SCHEMA_EXPECTED" ]; then
+    return 0
+  fi
+  # Tier 2 — stamp mismatched/absent: consult the order invariant.
+  if private.setup.server.invariant.holds "$machine"; then
+    # legacy-but-correct → stamp-in-place (cheap upgrade, no rebuild).
+    export OOSH_SETUP_SERVER_SCHEMA="$SETUP_SERVER_SCHEMA_EXPECTED"
+    config save oosh OOSH >/dev/null
+    debug.log "reconcile.check: ${machine} order already correct — stamped schema in place"
+    return 0
+  fi
+  # stale order → reconcile.
+  private.reconcile.state.machine "$machine"
+}
+
+private.reconcile.state.machine() # <machine> # rebuild an existing machine to the current order, preserving cursor BY NAME
+{
+  # S8 §C: pure metadata surgery — capture progress BY NAME → delete → declare (shared
+  # order) → restore position BY NAME → stamp. NO drive (state.next) → cannot reintroduce
+  # the F2 sudo hang; actual advancement stays governed by F2's non-interactive fix.
+  local machine=$1
+  source $OOSH_DIR/state
+  local statesFile="$CONFIG_PATH/stateMachines/${machine}.states.env"
+
+  # 1. capture progress BY NAME (+ old cursor id for the marker fallback)
+  local savedName="" savedId=""
+  if [ -f "$statesFile" ]; then
+    savedName=$(source "$statesFile" 2>/dev/null; echo "${SETUP_SERVER_STATES[$SETUP_SERVER_STATE_ID]}")
+    savedId=$(source "$statesFile" 2>/dev/null; echo "${SETUP_SERVER_STATE_ID:-0}")
+  fi
+  console.log "reconcile: ${machine} state order stale → rebuilding to schema ${SETUP_SERVER_SCHEMA_EXPECTED} (was at '${savedName:-?}')"
+
+  # 2. rebuild in the NEW order from the single-source declaration.
+  # Clear the persisted machine DIRECTLY (F2-safe): the engine's `state
+  # machine.delete` runs `oo cmd vim` (a package install that can prompt/hang on a
+  # naked box — the exact class of bug F2 fixed), so we remove the states DATA file
+  # ourselves and let declare's `state.machine.create` re-init from scratch. Removing
+  # a data file is NOT a `state`-engine edit. Also drop a stale current-machine
+  # pointer so the rebuilt machine is read fresh.
+  rm -f "$CONFIG_PATH/stateMachines/${machine}.states.env"
+  if [ -f "$CONFIG_PATH/current.state.machine.env" ] \
+     && grep -q "^machine=${machine}\$" "$CONFIG_PATH/current.state.machine.env" 2>/dev/null; then
+    : > "$CONFIG_PATH/current.state.machine.env"
+  fi
+  private.setup.server.declare ${machine}
+
+  # 3. restore position BY NAME → re-resolves to the corrected index (the self-heal)
+  if [ -n "$savedName" ] && state.find ${machine} "$savedName" id >/dev/null 2>&1; then
+    state.set ${machine} "$savedName"
+    success.log "reconcile: restored ${machine} cursor to '${savedName}' in corrected order"
+  else
+    # 4. fallback — savedName gone: rewind to the last band marker (20/30/40/50/60)
+    # at-or-before the old position. Conservative: never advance past unverified states.
+    local marker="" m
+    for m in 20 30 40 50 60; do
+      [ "${savedId:-0}" -ge "$m" ] && marker="$m"
+    done
+    if [ -n "$marker" ]; then
+      state.set ${machine} "$marker"
+      warn.log "reconcile: '${savedName:-?}' gone — rewound ${machine} to band marker ${marker} (safe re-drive point)"
+    else
+      warn.log "reconcile: '${savedName:-?}' gone and no band marker at-or-before ${savedId:-0} — ${machine} left at rebuilt start"
+    fi
+  fi
+
+  # 5. stamp the reconciled schema
+  export OOSH_SETUP_SERVER_SCHEMA="$SETUP_SERVER_SCHEMA_EXPECTED"
+  config save oosh OOSH >/dev/null
 }
 
 private.check.remote.install.started() {
