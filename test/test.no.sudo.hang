@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# T-NO-SUDO-HANG — the SETUP_SERVER privilege probe must NEVER block on an
+# interactive sudo password. A naked P1 self-bootstrap runs `priviledges.checked`
+# → `private.test.sudo.priviledges`; on a box with no cached/NOPASSWD sudo the
+# old `$SUDO touch` PROMPTED and hung the unattended install (F2). Fix (8be593d):
+# non-interactive `sudo -n` — a failed escalation = "no sudo → defer to user band"
+# (warning, never a prompt). Mirrors init/oosh `oosh_can_escalate` (DRY).
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+OO="$OOSH_DIR/oo"
+probeBody=$(awk '/^private\.test\.sudo\.priviledges\(\)/{f=1} f{print} f&&/^}/{exit}' "$OO")
+codeOnly() { echo "$probeBody" | grep -vE '^[[:space:]]*#'; }   # strip comments
+
+# ============================================================================
+# SOURCE-LEVEL — the probe escalates NON-INTERACTIVELY
+# ============================================================================
+test.case $level "T-NO-SUDO-HANG: probe uses non-interactive 'sudo -n'" \
+  echo "grep probe for sudo -n"
+if codeOnly | grep -qE 'sudo[[:space:]]+-n\b'; then
+  expect.pass "privilege probe uses 'sudo -n' (non-interactive)"
+else
+  expect.fail "probe must escalate via 'sudo -n' — bare sudo prompts + hangs (F2)"
+fi
+
+test.case $level "T-NO-SUDO-HANG: probe has NO prompting sudo write (\$SUDO touch) in code" \
+  echo "check for uncommented \$SUDO touch"
+if codeOnly | grep -qE '\$SUDO[[:space:]]+touch|sudo[[:space:]]+touch'; then
+  expect.fail "probe still runs an interactive 'sudo touch' — reintroduces the F2 hang"
+else
+  expect.pass "no prompting 'sudo touch' in probe code (only in the explanatory comment)"
+fi
+
+test.case $level "T-NO-SUDO-HANG: no-sudo path DEFERS (create.result 1), not a fatal error" \
+  echo "$probeBody"
+if codeOnly | grep -qE 'create\.result[[:space:]]+1'; then
+  expect.pass "no-sudo path returns defer (result 1 → user band), self-heal"
+else
+  expect.fail "probe must DEFER on no-sudo (create.result 1), not hard-fail/hang"
+fi
+
+# ============================================================================
+# FUNCTIONAL — the probe COMPLETES under a timeout (no hang) and, when this box
+# has no passwordless sudo, DEFERS to the user band with a warning + no prompt.
+# ============================================================================
+rm -f "$HOME/.sudo_as_admin_successful" 2>/dev/null
+
+# Whether this box grants passwordless sudo decides which arm we can assert.
+if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  hasNoPwSudo=false
+else
+  hasNoPwSudo=true
+fi
+
+# The probe must ALWAYS return within a few seconds (never wait on a password).
+out=$(timeout 8 bash -c 'source this >/dev/null 2>&1; source oo >/dev/null 2>&1; private.test.sudo.priviledges; echo "PRC=$?|RES=$RESULT"' 2>&1)
+tExit=$?
+test.case $level "T-NO-SUDO-HANG: probe COMPLETES (no hang) within timeout" \
+  echo "timeout_exit=$tExit out=$out"
+if [ "$tExit" -ne 124 ] && [ "$tExit" -eq 0 ]; then
+  expect.pass "probe returned promptly (timeout_exit=$tExit) — no password wait"
+else
+  expect.fail "probe hung/timed out (exit=$tExit) — F2 regression (interactive sudo)"
+fi
+
+test.case $level "T-NO-SUDO-HANG: no interactive password PROMPT emitted" \
+  echo "$out"
+if echo "$out" | grep -qiE '\[sudo\] password for|password is required.*prompt'; then
+  expect.fail "an interactive sudo password prompt was emitted — F2 hang"
+else
+  expect.pass "no interactive sudo password prompt in probe output"
+fi
+
+if [ "$hasNoPwSudo" = "true" ]; then
+  # No passwordless sudo (the naked case): must DEFER (rc≠0) + warn.
+  test.case $level "T-NO-SUDO-HANG: no-sudo box DEFERS to user band (rc≠0 + warning)" \
+    echo "$out"
+  if echo "$out" | grep -qE 'PRC=[1-9]' && echo "$out" | grep -qiE 'defer|user.band|no.*sudo'; then
+    expect.pass "no passwordless sudo → deferred to user band with warning"
+  else
+    expect.fail "expected defer (rc≠0 + warning), got: $out"
+  fi
+
+  # priviledges.checked must redirect the non-sudo user to the USER band (index 20).
+  pRes=$(timeout 8 bash -c 'source this >/dev/null 2>&1; source oo >/dev/null 2>&1; private.check.priviledges.checked >/dev/null 2>&1; echo "$RESULT"' 2>&1)
+  test.case $level "T-NO-SUDO-HANG: priviledges.checked routes no-sudo user to user band (RESULT=20)" \
+    echo "priviledges.checked RESULT=$pRes"
+  if echo "$pRes" | grep -qE '(^|[^0-9])20([^0-9]|$)'; then
+    expect.pass "no-sudo user routed to user band (RESULT=$pRes)"
+  else
+    expect.fail "priviledges.checked should route no-sudo user to 20 (user band), got: $pRes"
+  fi
+else
+  test.case $level "T-NO-SUDO-HANG: defer-path skipped (box HAS passwordless sudo)" echo "skip"
+  expect.pass "skipped no-sudo defer assertions — this box grants passwordless sudo"
+fi
+
+test.suite.save.results
