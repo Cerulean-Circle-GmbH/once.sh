@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+### new.method
+
+# ============================================================================
+# plantuml - dockerized PlantUML render, managed via odocker (task-s2-f.1)
+# ----------------------------------------------------------------------------
+# Domain script: owns ALL plantuml-specifics (image name, -tsvg, render-dir
+# mounting, render-result validation). Delegates EVERY docker call to odocker
+# (run.ephemeral / image.ensure) — NEVER calls `docker` directly. Mirrors the
+# claudeCode→claude, claudeFlow→claude-flow wrapper pattern.
+# Layering invariant: plantuml → odocker → docker (plantuml has ZERO docker calls).
+# ============================================================================
+
+# Config (PO #2 — PIN for reproducibility, overridable for deliberate upgrades).
+# plantuml/plantuml publishes no clean semver tags, so the pin is a DIGEST (the
+# most reproducible ref, and explicitly not `:latest`). Override PLANTUML_TAG with
+# a tag or another sha256: digest to upgrade deliberately.
+: ${PLANTUML_IMAGE:=plantuml/plantuml}
+: ${PLANTUML_TAG:=sha256:47870c1f76cfb3747bc7090bfe83013a4e3105b5a0bb1515e2baf5d3e2b3ee9d}
+
+# Error-stub size floor: a real diagram is well past this; PlantUML's rendered
+# "contains errors" placeholder is tiny. Belt-and-suspenders with the text grep.
+: ${PLANTUML_STUB_MIN_BYTES:=1200}
+
+# Build the fully-pinned image reference. A digest pin uses @sha256:…, a tag :….
+private.plantuml.ref() {
+  case "$PLANTUML_TAG" in
+    sha256:*) echo "${PLANTUML_IMAGE}@${PLANTUML_TAG}" ;;
+    *)        echo "${PLANTUML_IMAGE}:${PLANTUML_TAG}" ;;
+  esac
+}
+
+plantuml.install() # # ensure the PlantUML image is present (idempotent, self-healing)
+{
+  # Delegate to odocker (ALL docker access goes through odocker). Idempotent:
+  # no-op if present, pull if missing. Run anytime → image available afterwards.
+  odocker image.ensure "$(private.plantuml.ref)"
+}
+
+plantuml.render() # <fileOrDir> # render a .puml file (or every .puml in a dir) to sibling .svg
+{
+  local target="$1"
+  if [ -z "$target" ]; then
+    error.log "usage: plantuml render <fileOrDir>"
+    return 1
+  fi
+  if [ ! -e "$target" ]; then
+    error.log "plantuml render: not found: $target"
+    return 1
+  fi
+
+  # Resolve the render dir (mounted into the container at its own path) and the
+  # render scope (the whole dir, or the single file).
+  local dir scope
+  if [ -d "$target" ]; then
+    dir=$(cd "$target" 2>/dev/null && pwd)
+    scope="$dir"
+  else
+    dir=$(cd "$(dirname "$target")" 2>/dev/null && pwd)
+    scope="$dir/$(basename "$target")"
+  fi
+
+  # Self-heal: ensure the image before rendering (constructor contract).
+  plantuml.install >/dev/null || { error.log "plantuml render: image unavailable"; return 1; }
+
+  local ref
+  ref=$(private.plantuml.ref)
+  important.log "plantuml render: $scope  (image $ref)"
+
+  # Render via the GENERIC odocker one-shot primitive. -tsvg is passthrough to
+  # the containerized plantuml binary (foreign-CLI), NOT an oosh flag. seccomp
+  # + --rm + the -v/-w mount are odocker's concern.
+  local out
+  out=$(odocker run.ephemeral "$ref" "$dir" -tsvg "$scope" 2>&1)
+  echo "$out"
+
+  # ── Post-render validation (self-care, PO #3): NEVER silently ship a failed
+  # render. PlantUML still writes an error-stub .svg for a bad diagram AND prints
+  # "Error line N in file: <path>". Detect both: name every errored source and
+  # every stub svg; fail loud if any.
+  local errored badSvg
+  errored=$(printf '%s\n' "$out" | grep -oE 'in file: .*\.puml' | sed 's/^in file: //' | sort -u)
+
+  # Scan produced svgs for the rendered error marker + the stub-size floor.
+  local svg
+  for svg in "$dir"/*.svg; do
+    [ -f "$svg" ] || continue
+    if grep -q 'contains errors' "$svg" 2>/dev/null; then
+      badSvg="${badSvg}${svg}"$'\n'
+      continue
+    fi
+    local sz
+    sz=$(wc -c < "$svg" 2>/dev/null | tr -d ' ')
+    if [ -n "$sz" ] && [ "$sz" -lt "$PLANTUML_STUB_MIN_BYTES" ] 2>/dev/null; then
+      badSvg="${badSvg}${svg} (${sz}B < ${PLANTUML_STUB_MIN_BYTES}B stub-floor)"$'\n'
+    fi
+  done
+
+  if [ -n "$errored" ] || [ -n "$badSvg" ]; then
+    error.log "plantuml render: FAILED — error-stubs detected, NOT shipping as success:"
+    [ -n "$errored" ] && printf '%s\n' "$errored" | while IFS= read -r f; do [ -n "$f" ] && error.log "  puml error: $f"; done
+    [ -n "$badSvg" ]  && printf '%s' "$badSvg"     | while IFS= read -r f; do [ -n "$f" ] && error.log "  stub svg : $f"; done
+    create.result 1 "render had errors"
+    return 1
+  fi
+
+  success.log "plantuml render: OK — svgs generated in $dir"
+  create.result 0 "rendered $scope"
+  return 0
+}
+plantuml.render.completion.fileOrDir() {
+  # .puml files + directories in the current context
+  ls -d */ 2>/dev/null
+  ls *.puml 2>/dev/null
+}
+
+plantuml.status() # # diagnostics: docker reachable? PlantUML image present?
+{
+  local ref
+  ref=$(private.plantuml.ref)
+  echo "image ref : $ref"
+  if odocker image.ensure "$ref" >/dev/null 2>&1 && odocker list 2>/dev/null | grep -q "${PLANTUML_IMAGE%%:*}"; then
+    echo "image     : present"
+  else
+    echo "image     : MISSING (run: plantuml install)"
+  fi
+  # PlantUML version via the one-shot (proves docker + seccomp + image all work)
+  local ver
+  ver=$(odocker run.ephemeral "$ref" /tmp -version 2>/dev/null | grep -m1 -i 'PlantUML version')
+  echo "plantuml  : ${ver:-unavailable (docker/image/seccomp issue)}"
+}
+
+plantuml.usage() # # show usage
+{
+  echo "plantuml — dockerized PlantUML render, via odocker
+
+  install            ensure the PlantUML image is present (idempotent)
+  render <fileOrDir> render a .puml (or every .puml in a dir) → sibling .svg
+                     (validates output — a failed render is reported, not shipped)
+  status             docker reachable? image present? plantuml version?
+  usage              this text
+
+  Config (override for deliberate upgrades):
+    PLANTUML_IMAGE   default: plantuml/plantuml
+    PLANTUML_TAG     default: a pinned digest (reproducible; not :latest)
+
+  Layering: plantuml → odocker → docker (no direct docker calls)."
+}
+
+plantuml.start()
+{
+  source this
+
+  if [ -z "$1" ]; then
+    plantuml.status
+    return 0
+  fi
+
+  this.start "$@"
+}
+
+plantuml.start "$@"
