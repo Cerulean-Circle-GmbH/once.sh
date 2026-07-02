@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# PF5 — teams.save / status MVC parity tests (SCENARIO-FIRST, RED before impl)
+# Sprint: session/tasks/sprint-teamsave-status-parity-FIX.md
+# Evidence: session/tasks/teamsave-vs-status-parity.md
+#
+# Invariant under test (oosh-po):  tree.detailed(T) == teams.save(T) == status(T)
+#   where T = the set of live tuples (team | address | role | uuid | class).
+#   live `otmux tree.detailed` (proc-args) = the Model of record.
+#   teams.save snapshot = the persisted Model (must be COMPLETE).
+#   status / team.list  = the View (must ENUMERATE every live team).
+#
+# These are RED FIRST — they encode the correct contract and FAIL against the
+# current code (PF2 drops shells, PF3 omits teams, PF4 serves stale uuids).
+# Expert makes PF1-4 turn them GREEN.  Measure LIVE, no output filtering.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+STRIP='s/\x1b\[[0-9;]*m//g'
+CONFIG_DIR="${CONFIG_PATH:-$HOME/config}"
+
+# ── Ground-truth helpers (live = authoritative) ─────────────────────────────
+
+# Every live pane as "session|address" — parsed from the OOSH authoritative
+# view `otmux tree.detailed` (the Model of record per the sprint).
+live_panes() {
+  otmux tree.detailed 2>&1 | sed -E "$STRIP" | gawk '
+    # session header:  "├── <Name> (Mon DD)"  — a name, no N.N pane address
+    match($0, /[├└]── ([A-Za-z_][A-Za-z0-9_.-]*) \(/, m) { sess=m[1]; next }
+    # pane line:  first "N.N" token is the pane address
+    match($0, /([0-9]+\.[0-9]+)/, a) { if (sess != "") print sess "|" a[1] }
+  ' | sort -u
+}
+
+# Every live team (session) name.
+live_teams() {
+  live_panes | cut -d'|' -f1 | sort -u
+}
+
+# Panes captured by a saved snapshot file → "session|address".
+snapshot_panes() {
+  local f="$1"
+  grep -v '^#' "$f" 2>/dev/null | awk -F'|' 'NF>=2 && $1!="" {print $1"|"$2}' | sort -u
+}
+
+# uuid a snapshot records for a given role (what a cold-start consumer reads).
+snapshot_uuid_for_role() {
+  local f="$1" role="$2"
+  awk -F'|' -v r="$role" 'NF>=4 && $3==r {print $4; exit}' "$f" 2>/dev/null
+}
+
+# live uuid for a role, from proc-args (tree.detailed detail line).
+# The detail line is "└ <mark> <role>@<host>   [uuid]" — the role and the
+# bracketed uuid are on the same line but separated by "@host" + padding, so
+# match any line that contains the role AND a uuid, then extract the uuid.
+live_uuid_for_role() {
+  local role="$1"
+  otmux tree.detailed 2>&1 | sed -E "$STRIP" | gawk -v r="$role" '
+    $0 ~ ("[ ]" r "[@ ]") && match($0, /\[([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\]/, m) { print m[1]; exit }
+  '
+}
+
+newest_snapshot() {
+  ls -t "$CONFIG_DIR"/hivemind.snapshot.*.env 2>/dev/null | grep -v '__test' | head -1
+}
+
+# ============================================================================
+# Fresh save ONCE (slow ~2min, invasive per-pane probe) — reused by parity.
+# ============================================================================
+echo "--- running hiveMind teams.save (fresh) — may take ~2min ---"
+hiveMind teams.save >/dev/null 2>&1
+FRESH_SNAP=$(newest_snapshot)
+echo "fresh snapshot: $FRESH_SNAP"
+
+# ============================================================================
+# T-TEAMSAVE-PARITY — teams.save must capture EVERY live pane (agents+shells)
+# BUG PF2: teams.save non-deterministically drops live shell panes.
+# ============================================================================
+LIVE_PANES=$(live_panes)
+SAVE_PANES=$(snapshot_panes "$FRESH_SNAP")
+
+# live panes absent from the fresh snapshot = dropped (the PF2 bug)
+DROPPED=$(comm -23 <(echo "$LIVE_PANES") <(echo "$SAVE_PANES"))
+DROPPED_N=$(printf '%s' "$DROPPED" | grep -c . )
+
+test.case $level "T-TEAMSAVE-PARITY: teams.save captures every live pane" \
+  echo "dropped=$DROPPED_N"
+if [ "$DROPPED_N" -eq 0 ]; then
+  expect.pass "fresh snapshot contains all $(echo "$LIVE_PANES" | grep -c .) live panes"
+else
+  expect.fail "teams.save DROPPED $DROPPED_N live pane(s) [PF2]: $(echo "$DROPPED" | tr '\n' ' ')"
+fi
+
+# ============================================================================
+# T-STATUS-ENUM — status/team.list must enumerate EVERY live team
+# BUG PF3: team.list omits whole live teams (measured: rawbin, u20 on WODA.prod;
+#          remoteOOSH on MacStudio) that tree.detailed + teams.save both see.
+# ============================================================================
+LIVE_TEAMS=$(live_teams)
+VIEW_TEAMS=$(hiveMind team.list 2>&1 | sed -E "$STRIP" \
+  | awk '{for(i=1;i<=NF;i++) if($i ~ /^[A-Za-z_][A-Za-z0-9_.-]*$/){print $i; break}}' \
+  | grep -vE '^\(running\)$' | sort -u)
+
+MISSING_TEAMS=$(comm -23 <(echo "$LIVE_TEAMS") <(echo "$VIEW_TEAMS"))
+MISSING_TEAMS_N=$(printf '%s' "$MISSING_TEAMS" | grep -c . )
+
+test.case $level "T-STATUS-ENUM: team.list enumerates every live team" \
+  echo "missing=$MISSING_TEAMS_N"
+if [ "$MISSING_TEAMS_N" -eq 0 ]; then
+  expect.pass "team.list shows all $(echo "$LIVE_TEAMS" | grep -c .) live teams"
+else
+  expect.fail "team.list OMITS $MISSING_TEAMS_N live team(s) [PF3]: $(echo "$MISSING_TEAMS" | tr '\n' ' ')"
+fi
+
+# ============================================================================
+# T-FRESHNESS — a stale snapshot must not yield a wrong uuid for a LIVE agent
+# BUG PF4: the newest on-disk snapshot can carry a stale uuid (measured:
+#          scrum-master 35916ccb stale vs dfcea556 live) until re-saved;
+#          cold-start consumers reading the newest file get the wrong identity.
+# Contract (PF4): the snapshot consumers load must be fresh — self-refreshing or
+#          timestamp-gated so a stale file cannot feed a wrong-uuid answer.
+# ============================================================================
+# Pick a live agent whose uuid we can confirm from BOTH the snapshot AND live
+# proc-args (skip dead/stale rows whose role has no live uuid).
+PROBE_ROLE=""
+LIVE_UUID=""
+while IFS='|' read -r sess addr role uuid rest; do
+  case "$uuid" in
+    [0-9a-f]*-*-*-*-*)
+      u=$(live_uuid_for_role "$role")
+      if [ -n "$u" ]; then PROBE_ROLE="$role"; LIVE_UUID="$u"; break; fi
+      ;;
+  esac
+done < <(grep -v '^#' "$FRESH_SNAP" 2>/dev/null)
+
+if [ -n "$PROBE_ROLE" ] && [ -n "$LIVE_UUID" ]; then
+  BOGUS="deadbeef-0000-4000-8000-000000000000"
+  # Plant a STALE snapshot that is the NEWEST on disk (future timestamp), with
+  # a bogus uuid for the live agent — exactly the PF4 failure mode.
+  STALE="$CONFIG_DIR/hivemind.snapshot.29991231T235959.env"
+  sed -E "s/^([^|#]*\|[^|]*\|${PROBE_ROLE}\|)[0-9a-f-]{36}/\1${BOGUS}/" "$FRESH_SNAP" > "$STALE"
+
+  # A cold-start consumer takes the agent's uuid from the newest snapshot.
+  SERVED=$(newest_snapshot)
+  SERVED_UUID=$(snapshot_uuid_for_role "$SERVED" "$PROBE_ROLE")
+
+  test.case $level "T-FRESHNESS: stale snapshot cannot yield a wrong uuid ($PROBE_ROLE)" \
+    echo "served=$SERVED_UUID live=$LIVE_UUID"
+  if [ "$SERVED_UUID" = "$LIVE_UUID" ]; then
+    expect.pass "newest-snapshot uuid matches live proc-args ($LIVE_UUID)"
+  else
+    expect.fail "stale newest snapshot serves WRONG uuid [PF4]: served=$SERVED_UUID live=$LIVE_UUID"
+  fi
+
+  # Cleanup the planted stale file — never leave test pollution behind.
+  rm -f "$STALE"
+else
+  test.case $level "T-FRESHNESS: (skipped — no probe role/uuid available)" echo "skip"
+  expect.pass "skipped: PROBE_ROLE='$PROBE_ROLE' LIVE_UUID='$LIVE_UUID'"
+fi
+
+echo ""
+echo "=== T-TEAMSAVE-PARITY / T-STATUS-ENUM / T-FRESHNESS complete ==="
+echo ""
+
+# ============================================================================
+# Save results
+# ============================================================================
+test.suite.save.results
