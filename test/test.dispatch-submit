@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# T-DISPATCH-SUBMIT — OTR-1 submission-verified dispatch + queue drain gating.
+# Contract (oosh-po gate):
+#   • send that submits            → rc 0
+#   • staged (not submitted)       → rc 2 detected; poke (=submit) → rc 0
+#   • blocked (modal/permission)   → rc 3
+#   • agent.queue.drain gates DEQUEUE on rc 0 — an unsubmittable message STAYS
+#     queued, never silently dropped (Sprint22 Hole-2 fix).
+# Primitives (otmux): send.stage / send.submit / send.poke / send.verify
+#   send.verify rc: 0 submitted · 2 staged · 3 blocked · 1 error.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# ============================================================================
+# T-DISPATCH-SUBMIT-GATE-SRC (static — always runs): lock the exact rc0-gate.
+# The behavioral NODROP test below exercises the route-defer path (a bash pane
+# is never route=inform, so drain bails before dispatch); the rc0-gate line
+# itself only fires on a live claude ❯ pane (not forgeable in a test). So assert
+# at the source that agent.queue.drain guards DEQUEUE behind the rc0 gate:
+# `dispatchRc -ne 0` → break (keep) BEFORE the `tail -n +2` dequeue.
+# ============================================================================
+DRAIN_BODY=$(sed -n '/^hiveMind.agent.queue.drain()/,/^}/p' "$OOSH_DIR/hiveMind")
+GATE_LINE=$(printf '%s\n' "$DRAIN_BODY" | grep -n 'dispatchRc" -ne 0' | head -1 | cut -d: -f1)
+DEQ_LINE=$(printf '%s\n' "$DRAIN_BODY"  | grep -n 'tail -n +2 "$f"' | tail -1 | cut -d: -f1)
+BREAK_AFTER_GATE=$(printf '%s\n' "$DRAIN_BODY" | awk -v g="$GATE_LINE" 'NR>g && NR<=g+4 && /break/{print "yes"; exit}')
+test.case $level "T-DISPATCH-SUBMIT-GATE-SRC: drain dequeues ONLY after rc 0" \
+  echo "gate=$GATE_LINE break=$BREAK_AFTER_GATE lastDequeue=$DEQ_LINE"
+if [ -n "$GATE_LINE" ] && [ "$BREAK_AFTER_GATE" = "yes" ] && [ -n "$DEQ_LINE" ] && [ "$DEQ_LINE" -gt "$GATE_LINE" ]; then
+  expect.pass "dequeue is gated on rc 0 (non-0 → break before dequeue at line $DEQ_LINE)"
+else
+  expect.fail "rc0-gate missing/misordered: gate=$GATE_LINE break=$BREAK_AFTER_GATE dequeue=$DEQ_LINE"
+fi
+
+# ── Isolated throwaway session (no live-pane impact) ────────────────────────
+if [ -z "$(command -v tmux)" ] || ! tmux new-session -d -s "__disp_$$" -x 100 -y 30 2>/dev/null; then
+  for t in RC0 RC2-POKE RC3 QUEUE-NODROP; do
+    test.case $level "T-DISPATCH-SUBMIT-$t: (skipped — no tmux)" echo "skip"
+    expect.pass "skipped"
+  done
+  echo ""
+  echo "=== T-DISPATCH-SUBMIT (skipped — no tmux) ==="
+  echo ""
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+fi
+
+DS_SESSION="__disp_$$"
+P="${DS_SESSION}:0.0"
+# Give the bash pane an OOSH-style prompt ending in "> " so send.verify's
+# bash branch can read the input line after the marker.
+tmux send-keys -t "$P" "PS1='oosh > '" Enter
+sleep 0.5
+tmux send-keys -t "$P" "clear" Enter
+sleep 0.5
+
+# ── T-DISPATCH-SUBMIT-RC0: stage + submit → verify rc 0 ─────────────────────
+otmux send.stage  "$P" "echo submitted_ok" >/dev/null 2>&1
+otmux send.submit "$P" >/dev/null 2>&1
+sleep 0.8
+otmux send.verify "$P" >/dev/null 2>&1; RC0=$?
+test.case $level "T-DISPATCH-SUBMIT-RC0: submitted send verifies rc 0" echo "rc=$RC0"
+if [ "$RC0" -eq 0 ]; then
+  expect.pass "submitted input verified rc 0"
+else
+  expect.fail "expected rc 0 (submitted), got rc $RC0"
+fi
+
+# ── T-DISPATCH-SUBMIT-RC2-POKE: stage (no submit) → rc 2; poke → rc 0 ────────
+tmux send-keys -t "$P" "clear" Enter; sleep 0.4
+otmux send.stage "$P" "this is a staged unsubmitted line" >/dev/null 2>&1
+sleep 0.5
+otmux send.verify "$P" >/dev/null 2>&1; RC_STAGED=$?
+otmux send.poke "$P" >/dev/null 2>&1    # poke == submit; text-free, idempotent
+sleep 0.8
+otmux send.verify "$P" >/dev/null 2>&1; RC_POKED=$?
+test.case $level "T-DISPATCH-SUBMIT-RC2-POKE: staged=rc2, poke submits → rc0" \
+  echo "staged=$RC_STAGED poked=$RC_POKED"
+if [ "$RC_STAGED" -eq 2 ] && [ "$RC_POKED" -eq 0 ]; then
+  expect.pass "staged detected (rc 2), poke submitted it (rc 0)"
+else
+  expect.fail "expected staged=2 poked=0, got staged=$RC_STAGED poked=$RC_POKED"
+fi
+
+# ── T-DISPATCH-SUBMIT-RC3: blocked (modal pattern) → verify rc 3 ────────────
+tmux send-keys -t "$P" "clear" Enter; sleep 0.4
+# Render a permission-modal-style line (what send.verify's BLOCKED guard detects).
+tmux send-keys -t "$P" "printf 'Do you want to proceed?\\n'" Enter
+sleep 0.6
+otmux send.verify "$P" >/dev/null 2>&1; RC3=$?
+test.case $level "T-DISPATCH-SUBMIT-RC3: blocked overlay verifies rc 3" echo "rc=$RC3"
+if [ "$RC3" -eq 3 ]; then
+  expect.pass "blocked overlay detected (rc 3) — Enter withheld"
+else
+  expect.fail "expected rc 3 (blocked), got rc $RC3"
+fi
+
+# ── T-DISPATCH-SUBMIT-QUEUE-NODROP: drain keeps an unsubmittable message ─────
+# Write a FRESH queued message directly (no script sourcing), then drain against
+# the pane while it is BLOCKED (route != inform) — the message must be KEPT.
+QDIR="${HIVEMIND_QUEUE_DIR:-${CONFIG_PATH:-$HOME/config}/hivemind.queue}"
+QSAFE="${P//:/_}"; QSAFE="${QSAFE//./_}"
+QFILE="${QDIR}/${QSAFE}.queue"
+mkdir -p "$QDIR" 2>/dev/null
+MARKER="dispatch-nodrop-$$"
+echo "$(date +%s)|inform|${MARKER}" > "$QFILE"
+
+# Keep the pane in a blocked/modal state so drain cannot verify a submission.
+tmux send-keys -t "$P" "clear" Enter; sleep 0.3
+tmux send-keys -t "$P" "printf 'Do you want to proceed?\\n'" Enter
+sleep 0.6
+
+hiveMind agent.queue.drain "$P" >/dev/null 2>&1
+
+KEPT=$(grep -c "$MARKER" "$QFILE" 2>/dev/null)
+test.case $level "T-DISPATCH-SUBMIT-QUEUE-NODROP: drain never silently drops an unsubmitted message" \
+  echo "kept=$KEPT"
+if [ "${KEPT:-0}" -ge 1 ]; then
+  expect.pass "unsubmittable message KEPT queued after drain (no silent drop)"
+else
+  expect.fail "drain DROPPED the message it could not submit [Sprint22 Hole-2 regression]"
+fi
+
+# ── Cleanup ─────────────────────────────────────────────────────────────────
+rm -f "$QFILE" 2>/dev/null
+tmux kill-session -t "$DS_SESSION" 2>/dev/null
+
+echo ""
+echo "=== T-DISPATCH-SUBMIT tests complete ==="
+echo ""
+
+test.suite.save.results
