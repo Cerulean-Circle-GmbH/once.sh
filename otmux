@@ -1849,39 +1849,44 @@ otmux.send.verified() # <target> <text> <?timeout:3> # send text to pane and ver
         return 1
     fi
 
-    # Capture state BEFORE send
-    local before
-    before=$($TMUX_CMD capture-pane -t "$target" -p -S -5 2>/dev/null | tail -5)
+    # SELF-HEAL SEND (Tron spec 2026-07-03): stage the text ONCE, then submit and
+    # VERIFY the Enter LANDED — i.e. the text COMMITTED (left the ❯ input line).
+    # If still staged → poke ENTER ONLY (NEVER re-type the text = the dup cause).
+    # The '[@…' prefix opens Claude's @-mention autocomplete which eats the Enter;
+    # Escape dismisses it — but ONLY on an idle prompt. NEVER Escape a GENERATING
+    # pane (that randomly interrupts the agent — Tron's hard rule).
+    local maxpokes="$timeout"; [ "$maxpokes" -ge 1 ] 2>/dev/null || maxpokes=3
 
-    # Send text + Enter (using sendEnter for literal text handling)
-    private.otmux.sendEnter "$target" "$text"
+    # Clear any stale input, then stage the text ONCE (literal, no Enter yet).
+    $TMUX_CMD send-keys -t "$target" C-u 2>/dev/null; sleep 0.05
+    $TMUX_CMD send-keys -t "$target" -l "$text"; sleep 0.2
 
-    # Wait for TUI to process
-    sleep "$timeout"
+    local isClaude=false
+    private.otmux.pane.isClaudeCode "$target" 2>/dev/null && isClaude=true
+    local probe="${text: -24}"   # distinctive tail chunk to test on the input line
 
-    # Capture state AFTER send
-    local after
-    after=$($TMUX_CMD capture-pane -t "$target" -p -S -10 2>/dev/null | tail -10)
-
-    # Verify: text should appear in pane OR pane state should have changed
-    if [ "$before" = "$after" ]; then
-        # Pane didn't change — likely blocked (permission dialog, overlay, etc.)
-        error.log "send.verified FAILED: pane $target unchanged after send"
-        RESULT="FAILED"
-        return 1
-    fi
-
-    # Check if our text appears in the after capture
-    if echo "$after" | grep -qF "$text"; then
-        console.log "send.verified OK: text delivered to $target"
-        RESULT="DELIVERED"
-        return 0
-    fi
-
-    # Pane changed but text not visible — likely processed (agent consumed it)
-    console.log "send.verified OK: pane $target changed (text likely processed)"
-    RESULT="CHANGED"
-    return 0
+    local i cap gen inputline
+    for (( i=1; i<=maxpokes; i++ )); do
+        cap=$($TMUX_CMD capture-pane -t "$target" -p 2>/dev/null)
+        gen=false; echo "$cap" | grep -q 'esc to interrupt' && gen=true
+        # Dismiss @-autocomplete before Enter — idle prompt ONLY (never interrupt).
+        if $isClaude && ! $gen; then
+            $TMUX_CMD send-keys -t "$target" Escape; sleep 0.08
+        fi
+        $TMUX_CMD send-keys -t "$target" Enter
+        sleep 0.9
+        # COMMITTED? the probe must have LEFT the current (last) ❯ input line.
+        inputline=$($TMUX_CMD capture-pane -t "$target" -p 2>/dev/null | grep -F '❯' | tail -1)
+        if ! echo "$inputline" | grep -qF "$probe"; then
+            console.log "send.verified OK: committed to $target (poke $i/$maxpokes)"
+            RESULT="COMMITTED"
+            return 0
+        fi
+        warn.log "send.verified: still staged on $target — poke $i/$maxpokes (ENTER only, text NOT resent)"
+    done
+    warn.log "send.verified: $target STAGED after $maxpokes pokes — honest rc 2 (text NOT resent → no dup)"
+    RESULT="STAGED"
+    return 2
 }
 
 private.otmux.send.prefix() # # return sender prefix [@role pane] or empty string
@@ -2076,28 +2081,12 @@ private.otmux.send.smart() # <target> <text> # internal: accept-edits, prefix, v
     [ -n "$prefix" ] && text="${prefix}${text}"
   fi
 
-  # Step 3: Send with verification
+  # Step 3: Self-heal verified send — send.verified stages the text ONCE, submits,
+  # verifies the text COMMITTED (left the ❯ line), and pokes ENTER-ONLY if still
+  # staged. It NEVER re-types the text (no dup) and never interrupts a generating
+  # pane. Its honest rc (0 committed / 2 staged) is the send's rc — no extra retry.
   otmux.send.verified "$target" "$text" 3
-  local rc=$?
-
-  if [ $rc -eq 0 ]; then
-    return 0
-  fi
-
-  # Step 4: Retry — send Enter and re-check
-  warn.log "send: initial send may have failed on $target — retrying Enter"
-  $TMUX_CMD send-keys -t "$target" Enter
-  sleep 2
-
-  local after
-  after=$($TMUX_CMD capture-pane -t "$target" -p -S -10 2>/dev/null | tail -10)
-  if echo "$after" | grep -qF "$text"; then
-    info.log "send: message visible on $target after retry"
-    return 0
-  fi
-
-  warn.log "send: message may have been consumed by $target — verify manually"
-  return 0
+  return $?
 }
 
 
