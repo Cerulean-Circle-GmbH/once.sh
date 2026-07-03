@@ -10,6 +10,14 @@ The oosh/once.sh project features a dynamic Bash completion system, primarily im
 - Supports custom completions for specific parameters and methods.
 - Designed for extensibility and DRY (Don't Repeat Yourself) principles.
 
+## Completion Precedence (3-tier)
+The order in which completions resolve is a MANDATORY first principle — see
+**[first-principles.md](first-principles.md) → Bash Completion (c2) → Completion Precedence**:
+1. Method-specific `<class>.<method>.completion.<param>` HARD-OVERWRITES the standard.
+2. Standard class-level `<class>.parameter.completion.<param>` is the default fallback.
+3. Parameter completion (either tier) is used OVER method/sub-command listing once a full method+params is on the line.
+Parameter names must be valid bash identifiers (no `...`/dashes/spaces) or `declare PARAM_<name>` breaks tracking.
+
 ## How It Works
 - The `c2` script scans scripts for function signatures and documentation.
 - Completion logic is modular and can be extended for new scripts and methods.
