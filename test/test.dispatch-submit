@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# T-DISPATCH-SUBMIT — OTR-1 submission-verified dispatch + queue drain gating.
-# Contract (oosh-po gate):
-#   • send that submits            → rc 0
-#   • staged (not submitted)       → rc 2 detected; poke (=submit) → rc 0
-#   • blocked (modal/permission)   → rc 3
-#   • agent.queue.drain gates DEQUEUE on rc 0 — an unsubmittable message STAYS
-#     queued, never silently dropped (Sprint22 Hole-2 fix).
-# Primitives (otmux): send.stage / send.submit / send.poke / send.verify
-#   send.verify rc: 0 submitted · 2 staged · 3 blocked · 1 error.
+# T-DISPATCH-SUBMIT → reshaped to the QUEUE-DRAIN no-drop guard (2026-07-03).
+#
+# HISTORY / why reshaped (PO directive): the original RC0 / RC2-POKE / RC3 cells
+# tested the OTR-1 stage→submit→verify→poke rc 0/2/3 verified-submission
+# contract via otmux.send.{stage,submit,verify,poke}. That contract was REVERTED
+# — those primitives are GONE, replaced by the self-heal `otmux.send.verified`
+# (stage once → Escape-idle-only+Enter → poke Enter-only). The send contract is
+# now covered by **test.send-selfheal (5/5)** + **test.send-matrix**. Those 3
+# cells were STALE (testing removed functions), NOT a real regression → RETIRED.
+#
+# What remains real and worth guarding: `hiveMind agent.queue.drain` must NOT
+# silently drop a message it can't deliver. The gate is now ROUTE-based (keep
+# when the agent isn't at an idle `inform` prompt), not the old dispatchRc gate.
 
 level=$1
 if [ -z "$level" ]; then
@@ -23,128 +27,66 @@ source test.suite
 log.level $level
 
 # ============================================================================
-# T-DISPATCH-SUBMIT-GATE-SRC (static — always runs): lock the drain DEQUEUE gate.
-# The behavioral NODROP test below exercises the route-defer path (a bash pane
-# is never route=inform, so drain bails before dispatch); the dispatch gate only
-# fires on a live claude ❯ pane (not forgeable in a test). So assert at source.
-#
-# NEW POLICY (d4e3ae0 — the real dup fix): DEQUEUE on rc0 OR rc2 (message is ON
-# THE PANE — submitted or staged/delivered), KEEP (break) ONLY on rc3 (blocked)
-# or rc1 (error) = NOT-ON-PANE. The old "-ne 0" kept rc2 queued → drain
-# re-delivered the staged message every cycle → the "all messages duplicate"
-# regression. So the guard now checks: keep-gate is `-eq 3 || -eq 1`, rc2 is NOT
-# in the keep set (rc2 dequeues), break before the `tail -n +2` dequeue.
+# T-DRAIN-ROUTE-GATE [S]: agent.queue.drain KEEPS (break) a message when the
+# recipient's route != inform (busy / overlay / unknown = not deliverable now),
+# BEFORE it dispatches or dequeues — the current no-silent-drop guard. (The old
+# dispatchRc rc0-gate was removed when the self-heal send made delivery reliable
+# + rc2=on-pane=dequeue.)
 # ============================================================================
 DRAIN_BODY=$(sed -n '/^hiveMind.agent.queue.drain()/,/^}/p' "$OOSH_DIR/hiveMind")
-GATE_LINE=$(printf '%s\n' "$DRAIN_BODY" | grep -n 'dispatchRc" -eq 3' | head -1 | cut -d: -f1)
-DEQ_LINE=$(printf '%s\n' "$DRAIN_BODY"  | grep -n 'tail -n +2 "$f"' | tail -1 | cut -d: -f1)
-BREAK_AFTER_GATE=$(printf '%s\n' "$DRAIN_BODY" | awk -v g="${GATE_LINE:-0}" 'NR>g && NR<=g+4 && /break/{print "yes"; exit}')
-# The keep-gate must NOT retain rc2 (rc2 is on-the-pane → dequeue, the dup fix).
-KEEP_HAS_RC2=$(printf '%s\n' "$DRAIN_BODY" | grep -cE 'dispatchRc" -(ne 0|eq 2)')
-test.case $level "T-DISPATCH-SUBMIT-GATE-SRC: drain dequeues on rc0|rc2, keeps only rc3|rc1" \
-  echo "gate=$GATE_LINE break=$BREAK_AFTER_GATE dequeue=$DEQ_LINE keepsRc2=$KEEP_HAS_RC2"
-if [ -n "$GATE_LINE" ] && [ "$BREAK_AFTER_GATE" = "yes" ] && [ -n "$DEQ_LINE" ] \
-   && [ "$DEQ_LINE" -gt "$GATE_LINE" ] && [ "${KEEP_HAS_RC2:-1}" -eq 0 ]; then
-  expect.pass "keep-gate = rc3|rc1 (not-on-pane) → break before dequeue (line $DEQ_LINE); rc2 dequeues (no re-deliver dup)"
+ROUTE_GATE=$(printf '%s\n' "$DRAIN_BODY" | grep -n 'route" != "inform"' | head -1 | cut -d: -f1)
+BREAK_AFTER=$(printf '%s\n' "$DRAIN_BODY" | awk -v g="${ROUTE_GATE:-0}" 'NR>g && NR<=g+3 && /break/{print "yes"; exit}')
+LAST_DEQ=$(printf '%s\n' "$DRAIN_BODY" | grep -n 'tail -n +2 "$f"' | tail -1 | cut -d: -f1)
+test.case $level "T-DRAIN-ROUTE-GATE: drain keeps (break) when route!=inform before dispatch/dequeue" \
+  echo "routeGate=$ROUTE_GATE break=$BREAK_AFTER lastDequeue=$LAST_DEQ"
+if [ -n "$ROUTE_GATE" ] && [ "$BREAK_AFTER" = "yes" ] && [ -n "$LAST_DEQ" ] && [ "$LAST_DEQ" -gt "$ROUTE_GATE" ]; then
+  expect.pass "route!=inform → break (keep) before the dispatch-success dequeue (line $LAST_DEQ)"
 else
-  expect.fail "gate policy wrong: gate=$GATE_LINE break=$BREAK_AFTER_GATE dequeue=$DEQ_LINE keepsRc2=$KEEP_HAS_RC2 (want rc3|rc1 keep, rc2 dequeue)"
+  expect.fail "route-gate missing/misordered: routeGate=$ROUTE_GATE break=$BREAK_AFTER dequeue=$LAST_DEQ"
 fi
 
-# ── Isolated throwaway session (no live-pane impact) ────────────────────────
-if [ -z "$(command -v tmux)" ] || ! tmux new-session -d -s "__disp_$$" -x 100 -y 30 2>/dev/null; then
-  for t in RC0 RC2-POKE RC3 QUEUE-NODROP; do
-    test.case $level "T-DISPATCH-SUBMIT-$t: (skipped — no tmux)" echo "skip"
-    expect.pass "skipped"
-  done
-  echo ""
-  echo "=== T-DISPATCH-SUBMIT (skipped — no tmux) ==="
-  echo ""
-  test.suite.save.results
-  return 0 2>/dev/null || exit 0
-fi
+# ============================================================================
+# T-DRAIN-NODROP [B]: draining against a recipient that is NOT at an idle inform
+# prompt must KEEP the message (never a silent drop). Uses an isolated throwaway
+# pane in a blocked/modal display state → route != inform → drain bails, message
+# stays queued. Direct queue-file write (no script sourcing — T-NO-SOURCE).
+# ============================================================================
+if [ -n "$(command -v tmux)" ] && tmux new-session -d -s "__drain_$$" -x 100 -y 30 2>/dev/null; then
+  DP="__drain_$$:0.0"
+  QDIR="${HIVEMIND_QUEUE_DIR:-${CONFIG_PATH:-$HOME/config}/hivemind.queue}"
+  QSAFE="${DP//:/_}"; QSAFE="${QSAFE//./_}"
+  QFILE="${QDIR}/${QSAFE}.queue"
+  mkdir -p "$QDIR" 2>/dev/null
+  MARKER="drain-nodrop-$$"
+  echo "$(date +%s)|inform|${MARKER}" > "$QFILE"
 
-DS_SESSION="__disp_$$"
-P="${DS_SESSION}:0.0"
-# Give the bash pane an OOSH-style prompt ending in "> " so send.verify's
-# bash branch can read the input line after the marker.
-tmux send-keys -t "$P" "PS1='oosh > '" Enter
-sleep 0.5
-tmux send-keys -t "$P" "clear" Enter
-sleep 0.5
+  # Put the pane in a blocked/modal display (route != inform → drain must keep).
+  tmux send-keys -t "$DP" "printf 'Do you want to proceed?\\n'" Enter
+  sleep 0.6
 
-# ── T-DISPATCH-SUBMIT-RC0: stage + submit → verify rc 0 ─────────────────────
-otmux send.stage  "$P" "echo submitted_ok" >/dev/null 2>&1
-otmux send.submit "$P" >/dev/null 2>&1
-sleep 0.8
-otmux send.verify "$P" >/dev/null 2>&1; RC0=$?
-test.case $level "T-DISPATCH-SUBMIT-RC0: submitted send verifies rc 0" echo "rc=$RC0"
-if [ "$RC0" -eq 0 ]; then
-  expect.pass "submitted input verified rc 0"
+  hiveMind agent.queue.drain "$DP" >/dev/null 2>&1
+
+  KEPT=$(grep -c "$MARKER" "$QFILE" 2>/dev/null)
+  test.case $level "T-DRAIN-NODROP: drain never silently drops an undeliverable message" \
+    echo "kept=$KEPT"
+  if [ "${KEPT:-0}" -ge 1 ]; then
+    expect.pass "undeliverable message KEPT queued after drain (no silent drop)"
+  else
+    expect.fail "drain DROPPED the message it could not deliver [Sprint22 Hole-2 regression]"
+  fi
+
+  rm -f "$QFILE" 2>/dev/null
+  tmux kill-session -t "__drain_$$" 2>/dev/null
 else
-  expect.fail "expected rc 0 (submitted), got rc $RC0"
+  test.case $level "T-DRAIN-NODROP: (skipped — no tmux)" echo "skip"; expect.pass "skipped"
 fi
 
-# ── T-DISPATCH-SUBMIT-RC2-POKE: stage (no submit) → rc 2; poke → rc 0 ────────
-tmux send-keys -t "$P" "clear" Enter; sleep 0.4
-otmux send.stage "$P" "this is a staged unsubmitted line" >/dev/null 2>&1
-sleep 0.5
-otmux send.verify "$P" >/dev/null 2>&1; RC_STAGED=$?
-otmux send.poke "$P" >/dev/null 2>&1    # poke == submit; text-free, idempotent
-sleep 0.8
-otmux send.verify "$P" >/dev/null 2>&1; RC_POKED=$?
-test.case $level "T-DISPATCH-SUBMIT-RC2-POKE: staged=rc2, poke submits → rc0" \
-  echo "staged=$RC_STAGED poked=$RC_POKED"
-if [ "$RC_STAGED" -eq 2 ] && [ "$RC_POKED" -eq 0 ]; then
-  expect.pass "staged detected (rc 2), poke submitted it (rc 0)"
-else
-  expect.fail "expected staged=2 poked=0, got staged=$RC_STAGED poked=$RC_POKED"
-fi
-
-# ── T-DISPATCH-SUBMIT-RC3: blocked (modal pattern) → verify rc 3 ────────────
-tmux send-keys -t "$P" "clear" Enter; sleep 0.4
-# Render a permission-modal-style line (what send.verify's BLOCKED guard detects).
-tmux send-keys -t "$P" "printf 'Do you want to proceed?\\n'" Enter
-sleep 0.6
-otmux send.verify "$P" >/dev/null 2>&1; RC3=$?
-test.case $level "T-DISPATCH-SUBMIT-RC3: blocked overlay verifies rc 3" echo "rc=$RC3"
-if [ "$RC3" -eq 3 ]; then
-  expect.pass "blocked overlay detected (rc 3) — Enter withheld"
-else
-  expect.fail "expected rc 3 (blocked), got rc $RC3"
-fi
-
-# ── T-DISPATCH-SUBMIT-QUEUE-NODROP: drain keeps an unsubmittable message ─────
-# Write a FRESH queued message directly (no script sourcing), then drain against
-# the pane while it is BLOCKED (route != inform) — the message must be KEPT.
-QDIR="${HIVEMIND_QUEUE_DIR:-${CONFIG_PATH:-$HOME/config}/hivemind.queue}"
-QSAFE="${P//:/_}"; QSAFE="${QSAFE//./_}"
-QFILE="${QDIR}/${QSAFE}.queue"
-mkdir -p "$QDIR" 2>/dev/null
-MARKER="dispatch-nodrop-$$"
-echo "$(date +%s)|inform|${MARKER}" > "$QFILE"
-
-# Keep the pane in a blocked/modal state so drain cannot verify a submission.
-tmux send-keys -t "$P" "clear" Enter; sleep 0.3
-tmux send-keys -t "$P" "printf 'Do you want to proceed?\\n'" Enter
-sleep 0.6
-
-hiveMind agent.queue.drain "$P" >/dev/null 2>&1
-
-KEPT=$(grep -c "$MARKER" "$QFILE" 2>/dev/null)
-test.case $level "T-DISPATCH-SUBMIT-QUEUE-NODROP: drain never silently drops an unsubmitted message" \
-  echo "kept=$KEPT"
-if [ "${KEPT:-0}" -ge 1 ]; then
-  expect.pass "unsubmittable message KEPT queued after drain (no silent drop)"
-else
-  expect.fail "drain DROPPED the message it could not submit [Sprint22 Hole-2 regression]"
-fi
-
-# ── Cleanup ─────────────────────────────────────────────────────────────────
-rm -f "$QFILE" 2>/dev/null
-tmux kill-session -t "$DS_SESSION" 2>/dev/null
+# NOTE: the send-side verified-submission contract (commit, exactly-1-delivery,
+# no-interrupt, prefix-once) is verified by test.send-selfheal (5/5) and
+# test.send-matrix — not here. This file is now the queue-drain no-drop guard.
 
 echo ""
-echo "=== T-DISPATCH-SUBMIT tests complete ==="
+echo "=== T-DISPATCH-SUBMIT (drain no-drop guard) complete ==="
 echo ""
 
 test.suite.save.results
