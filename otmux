@@ -1826,7 +1826,7 @@ otmux.parameter.completion.layout() {
 }
 otmux.parameter.completion.window() { private.complete.windows; }
 
-otmux.send.verified() # <target> <text> # send text with ONE Enter, verify commit ONCE (g.7 region-check); honest rc{0 committed / 2 staged}. g.8: NO poke/retry/2nd-Enter (Tron).
+otmux.send.verified() # <target> <text> # KIND-BRANCHED verify (Task 02): stage ONCE → (Escape claude+idle) → ONE shared Enter → verify BY KIND (claude=g.7 ❯-region / shell=prompt-advance). honest rc{0 committed / 2 staged}. NO poke/retry/2nd-Enter (g.8).
 {
     local target=$(private.resolve.target "$1")
     local text="$2"
@@ -1846,46 +1846,68 @@ otmux.send.verified() # <target> <text> # send text with ONE Enter, verify commi
         return 1
     fi
 
-    # g.8 (Tron 2026-07-03): EXACTLY ONE Enter per send. The old poke LOOP sprayed
-    # blank Enters (2× poke caught on a shell). KILLED ENTIRELY — no for-loop, no
-    # maxpokes, no retry, no 2nd Enter, no 'poke'. Stage once → (Escape if claude &
-    # idle) → ONE Enter → ONE-SHOT verify → honest rc. rc2 (staged) is the CALLER's
-    # decision — the legit retry lives in the DRAIN layer (a fresh single-shot next
-    # idle), NEVER a re-Enter here (re-Enter/re-type was the dup cause).
-
-    # Stage ONCE: clear stale input, type literal (no Enter yet).
+    # g.8: EXACTLY ONE Enter per send — no poke loop, no retry, no 2nd Enter.
+    # Stage the text ONCE (clear stale input, type literal, no Enter yet).
     $TMUX_CMD send-keys -t "$target" C-u 2>/dev/null; sleep 0.05
     $TMUX_CMD send-keys -t "$target" -l "$text"; sleep 0.2
 
+    # STAGED snapshot — captured AFTER `-l`, BEFORE Enter. Doubles as the generating
+    # check (Escape gate) + the shell prompt-advance baseline.
+    local probe="${text: -24}" staged isClaude=false gen=false
+    staged=$($TMUX_CMD capture-pane -t "$target" -p 2>/dev/null)
+    echo "$staged" | grep -q 'esc to interrupt' && gen=true
+
     # Escape dismisses Claude @-mention / slash autocomplete (which eats the Enter)
-    # — CLAUDE + IDLE only. NEVER Escape a shell (no autocomplete) nor a GENERATING
-    # pane (Escape interrupts the agent — Tron's hard rule).
-    local cap gen=false
-    cap=$($TMUX_CMD capture-pane -t "$target" -p 2>/dev/null)
-    echo "$cap" | grep -q 'esc to interrupt' && gen=true
+    # — CLAUDE + IDLE only. NEVER a shell (no autocomplete) nor a GENERATING pane
+    # (Escape interrupts the agent — Tron's hard rule). This gate ALSO resolves the
+    # `isClaude` kind for the verify branch below (one probe on the common paths).
     if ! $gen && private.otmux.pane.isClaudeCode "$target" 2>/dev/null; then
+        isClaude=true
         $TMUX_CMD send-keys -t "$target" Escape; sleep 0.08
+    else
+        # not idle-claude → generating-claude OR shell; re-probe ONLY if generating
+        # (the verify branch needs isClaude; the shell path skips a 2nd probe).
+        $gen && private.otmux.pane.isClaudeCode "$target" 2>/dev/null && isClaude=true
     fi
 
-    # SINGLE Enter. That's it — never a second one.
-    $TMUX_CMD send-keys -t "$target" Enter; sleep 0.9
+    # THE SINGLE Enter — one keystroke, both kinds. Never a second one.
+    $TMUX_CMD send-keys -t "$target" Enter
 
-    # ONE-SHOT g.7 region-verify: the probe (distinctive tail chunk) is STAGED iff
-    # it still sits in the INPUT REGION (last ❯ line → bottom of pane); a COMMITTED
-    # message moves ABOVE the ❯ (into the transcript) → out of the region. Region
-    # (not just the ❯ row) because a wrapped message spills BELOW ❯. Shell pane has
-    # no ❯ → empty region → committed.
-    local probe="${text: -24}" region
+    # ── VERIFY, kind-branched (Task 02) ──
+    local cap
+    if $isClaude; then
+        # CLAUDE: g.7 ❯-region verify UNCHANGED. probe is STAGED iff still in the
+        # input REGION (last ❯ line → bottom); COMMITTED once it moves above ❯.
+        sleep 0.9
+        cap=$($TMUX_CMD capture-pane -t "$target" -p 2>/dev/null)
+        local region
+        region=$(printf '%s\n' "$cap" | awk '/❯/{f=NR} {a[NR]=$0} END{ if(f) for(i=f;i<=NR;i++) print a[i] }')
+        if printf '%s\n' "$region" | grep -qF "$probe"; then
+            warn.log "send.verified: $target STAGED (not committed) — honest rc 2; NOT re-Entered (drain/caller retries fresh next idle)"
+            RESULT="STAGED"; return 2
+        fi
+        console.log "send.verified OK: committed to $target"
+        RESULT="COMMITTED"; return 0
+    fi
+
+    # SHELL: settle → prompt-advance verify. COMMITTED iff (a) the probe is NOT the
+    # tail of the bottom line (text left the prompt) OR (b) the pane advanced
+    # (after != staged). rc2 ONLY if BOTH fail (text still staged AND unchanged).
+    sleep 0.5
     cap=$($TMUX_CMD capture-pane -t "$target" -p 2>/dev/null)
-    region=$(printf '%s\n' "$cap" | awk '/❯/{f=NR} {a[NR]=$0} END{ if(f) for(i=f;i<=NR;i++) print a[i] }')
-    if printf '%s\n' "$region" | grep -qF "$probe"; then
-        warn.log "send.verified: $target STAGED (not committed) — honest rc 2; NOT re-Entered (drain/caller retries fresh next idle)"
-        RESULT="STAGED"
-        return 2
+    local bottomline committed=false
+    bottomline=$(printf '%s\n' "$cap" | grep -v '^[[:space:]]*$' | tail -1)
+    case "$bottomline" in
+        *"$probe") : ;;          # (a) FALSE — probe still on the prompt tail
+        *) committed=true ;;     # (a) TRUE  — probe left the bottom line
+    esac
+    [ "$cap" != "$staged" ] && committed=true   # (b) pane advanced
+    if $committed; then
+        info.log "send.verified: committed to $target (shell — prompt advanced)"
+        RESULT="COMMITTED"; return 0
     fi
-    console.log "send.verified OK: committed to $target"
-    RESULT="COMMITTED"
-    return 0
+    warn.log "send.verified: $target — Enter did not apply, text still staged, prompt unchanged (rc 2)"
+    RESULT="STAGED"; return 2
 }
 
 private.otmux.send.prefix() # # return sender prefix [@role pane] or empty string
