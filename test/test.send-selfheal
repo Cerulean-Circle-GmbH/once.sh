@@ -3,7 +3,7 @@
 # 2026-07-03, otmux.send.verified). Two invariants together + the no-interrupt
 # hard rule:
 #   (1) COMMITS reliably — Enter lands (idle + the [@-prefix autocomplete case).
-#   (2) EXACTLY 1 delivery — text staged ONCE, poke ENTER-ONLY (never re-typed),
+#   (2) EXACTLY 1 delivery — text staged ONCE, EXACTLY ONE Enter (g.8: no poke),
 #       so the recipient transcript shows the message once, never twice.
 #   BONUS: a GENERATING recipient is NOT interrupted — no Escape while
 #          'esc to interrupt' is on screen.
@@ -112,31 +112,62 @@ else
   test.case $level "V3: (skipped — no tmux/fixture)" echo "skip"; expect.pass "skipped"
 fi
 
-# ── [S] STRUCTURAL GUARDS — lock the self-heal contract in source ────────────
+# ── V4 [S] — g.8 EXACTLY-ONE-ENTER contract, locked in source: stage ONCE,
+# Escape claude+idle-only, ONE Enter, and NO poke/retry LOOP at all. ─────────
 VBODY=$(sed -n '/^otmux.send.verified()/,/^}/p' "$OTMUX_SRC")
-
-# stage EXACTLY ONCE: a single literal `send-keys … -l "$text"` (never in the poke loop).
 STAGE_CT=$(printf '%s\n' "$VBODY" | grep -cE 'send-keys .*-l "\$text"')
-# Escape is IDLE-ONLY: guarded by `! $gen` (never Escape a generating pane).
-ESC_GATED=$(printf '%s\n' "$VBODY" | grep -A1 -E 'isClaude && ! \$gen' | grep -c 'Escape')
-# gen detected from 'esc to interrupt'.
+ENTER_CT=$(printf '%s\n' "$VBODY" | grep -cE 'send-keys -t "\$target" Enter')
+ESC_GATED=$(printf '%s\n' "$VBODY" | grep -cE '! \$gen && private.otmux.pane.isClaudeCode')
 GEN_DET=$(printf '%s\n' "$VBODY" | grep -c "grep -q 'esc to interrupt'")
-test.case $level "V4 [S]: stage-once + Escape-idle-only + gen-detect (self-heal contract)" \
-  echo "stageOnce=$STAGE_CT escGated=$ESC_GATED genDetect=$GEN_DET"
-if [ "${STAGE_CT:-0}" -eq 1 ] && [ "${ESC_GATED:-0}" -ge 1 ] && [ "${GEN_DET:-0}" -ge 1 ]; then
-  expect.pass "text staged once, Escape gated by !gen, gen detected via 'esc to interrupt'"
+# Real loop constructs only (exclude comment lines — the g.8 comment DESCRIBES
+# the removed poke loop; there must be no actual for/while in the code).
+NO_LOOP=$(printf '%s\n' "$VBODY" | grep -vE '^[[:space:]]*#' | grep -cE 'for \(\(|while |send\.poke')
+test.case $level "V4 [S]: stage-once + ONE Enter + Escape-claude-idle-only + NO poke loop (g.8)" \
+  echo "stageOnce=$STAGE_CT enter=$ENTER_CT escGated=$ESC_GATED gen=$GEN_DET loop/poke=$NO_LOOP"
+if [ "${STAGE_CT:-0}" -eq 1 ] && [ "${ENTER_CT:-0}" -eq 1 ] && [ "${ESC_GATED:-0}" -ge 1 ] \
+   && [ "${GEN_DET:-0}" -ge 1 ] && [ "${NO_LOOP:-1}" -eq 0 ]; then
+  expect.pass "staged once, exactly ONE Enter, Escape gated claude+idle, ZERO poke/retry loop"
 else
-  expect.fail "contract not locked: stageOnce=$STAGE_CT escGated=$ESC_GATED genDetect=$GEN_DET (want 1,>=1,>=1)"
+  expect.fail "g.8 contract broken: stageOnce=$STAGE_CT enter=$ENTER_CT escGated=$ESC_GATED gen=$GEN_DET loop/poke=$NO_LOOP"
 fi
 
-# poke is ENTER-ONLY: the loop must NOT re-type the text (no second -l "$text").
-POKE_RETYPE=$(printf '%s\n' "$VBODY" | awk '/for \(\(/{f=1} f&&/send-keys .*-l "\$text"/{c++} END{print c+0}')
-test.case $level "V5 [S]: poke is ENTER-ONLY — text never re-typed in the loop (no dup)" \
-  echo "retypeInLoop=$POKE_RETYPE"
-if [ "${POKE_RETYPE:-1}" -eq 0 ]; then
-  expect.pass "poke loop re-types nothing — Enter-only (dup structurally impossible)"
+# ── V5 [B] — KEYSTREAM COUNT: a real send emits EXACTLY ONE Enter (no spray).
+# shell target = 1 Enter / 0 Escape; claude+idle = 1 Enter / 1 Escape. Measured
+# via a forwarding tmux stub that logs the actual key events. ─────────────────
+REALTMUX=$(command -v tmux)
+if [ -n "$REALTMUX" ] && [ "$HAVE" != 0 ]; then
+  KW="$WORK/estub"; mkdir -p "$KW/bin"
+  cat > "$KW/bin/tmux" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "-u" ] && [ "\$2" = "send-keys" ]; then
+  for a in "\$@"; do case "\$a" in Enter) echo Enter >> "$KW/keys.log";; Escape) echo Escape >> "$KW/keys.log";; esac; done
+fi
+exec "$REALTMUX" "\$@"
+STUB
+  chmod +x "$KW/bin/tmux"
+  # shell target
+  "$REALTMUX" new-session -d -s "__ks_sh_$$" 2>/dev/null; sleep 0.4
+  "$REALTMUX" send-keys -t "__ks_sh_$$:0.0" "PS1='oosh > '" Enter; sleep 0.5
+  : > "$KW/keys.log"
+  PATH="$KW/bin:$PATH" otmux send.verified "__ks_sh_$$:0.0" "KS_SH_$$" >/dev/null 2>&1
+  SH_E=$(grep -c Enter "$KW/keys.log" 2>/dev/null); SH_ESC=$(grep -c Escape "$KW/keys.log" 2>/dev/null)
+  "$REALTMUX" kill-session -t "__ks_sh_$$" 2>/dev/null
+  # claude target (fake-claude, idle)
+  "$REALTMUX" new-session -d -s "__ks_cl_$$" 2>/dev/null; sleep 0.4
+  "$REALTMUX" send-keys -t "__ks_cl_$$:0.0" "stty -echo; PATH=$WORK/bin:\$PATH claude" Enter; sleep 1
+  : > "$KW/keys.log"
+  PATH="$KW/bin:$PATH" otmux send.verified "__ks_cl_$$:0.0" "KS_CL_$$" >/dev/null 2>&1
+  CL_E=$(grep -c Enter "$KW/keys.log" 2>/dev/null); CL_ESC=$(grep -c Escape "$KW/keys.log" 2>/dev/null)
+  "$REALTMUX" kill-session -t "__ks_cl_$$" 2>/dev/null
+  test.case $level "V5 [B]: EXACTLY ONE Enter per send (shell 1E/0Esc, claude 1E/1Esc) — no poke spray" \
+    echo "shell=${SH_E}E/${SH_ESC}Esc claude=${CL_E}E/${CL_ESC}Esc"
+  if [ "${SH_E:-0}" -eq 1 ] && [ "${SH_ESC:-1}" -eq 0 ] && [ "${CL_E:-0}" -eq 1 ] && [ "${CL_ESC:-0}" -eq 1 ]; then
+    expect.pass "shell=1 Enter/0 Escape, claude=1 Enter/1 Escape — single-Enter, zero blank-Enter spray"
+  else
+    expect.fail "keystream wrong: shell=${SH_E}E/${SH_ESC}Esc (want 1/0) claude=${CL_E}E/${CL_ESC}Esc (want 1/1)"
+  fi
 else
-  expect.fail "poke loop re-types the text ($POKE_RETYPE) — dup risk"
+  test.case $level "V5 [B]: (skipped — no tmux)" echo "skip"; expect.pass "skipped"
 fi
 
 rm -rf "$WORK" 2>/dev/null
