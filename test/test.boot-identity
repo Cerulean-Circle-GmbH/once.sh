@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# T-BOOT-IDENTITY — C.3 / OTR-11 (1e9791a dev + 857b0a1 main): the boot hook
+# resolves role@host from GROUND TRUTH (otmux pane.self, not $TMUX_PANE) and
+# NEVER clobbers the shared session/agents/unknown/ sink — unresolvable identity
+# quarantines to a UNIQUE _unresolved/<pane>-<pid>.boot.md.
+# Spec: scrum.pmo/sprints/sprint-2/task-s2-c.3-boot-identity-per-host.md
+#
+# The hook git-commits + writes session files, so it is UNSAFE to run live here.
+# It is gated by [S] source-asserts on the hook + the SAFE behavioral resolver
+# (hiveMind protected.identity.resolve) + the unknown/-retired check. Same
+# "static-lock a runtime path that can't be safely forged" pattern as GATE-SRC.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# Locate the boot hook (project workspace, host-specific).
+HOOK=""
+for c in /var/dev/Workspaces/AI/Claude/.claude/hooks/pre-compress.sh \
+         "$HOME/Workspaces/AI/Claude/.claude/hooks/pre-compress.sh"; do
+  [ -f "$c" ] && { HOOK="$c"; break; }
+done
+PROJ_DIR=""
+[ -n "$HOOK" ] && PROJ_DIR=$(cd "$(dirname "$HOOK")/../.." && pwd)
+
+if [ -z "$HOOK" ]; then
+  for t in PANESELF RESOLVER HOSTDIR NO-UNKNOWN QUARANTINE-UNIQUE NO-UNKNOWN-COMMIT UNKNOWN-RETIRED; do
+    test.case $level "BI-$t: (skipped — pre-compress.sh hook not found)" echo "skip"
+    expect.pass "skipped"
+  done
+  echo ""; echo "=== T-BOOT-IDENTITY (skipped — no hook) ==="; echo ""
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+fi
+
+# ── BI-PANESELF [S]: PANE anchored on otmux pane.self (PRIMARY); $TMUX_PANE only
+# as a `-z $PANE_TARGET`-guarded last resort (the BUG7 holdout demoted). ──────
+PS_PRIMARY=$(grep -cE 'PANE_TARGET=\$\(otmux pane\.self' "$HOOK")
+TMUX_GATED=$(grep -B2 -E 'display-message -t "\$TMUX_PANE"' "$HOOK" | grep -c '\-z "\$PANE_TARGET"')
+test.case $level "BI-PANESELF: PANE anchored on otmux pane.self (\$TMUX_PANE demoted to fallback)" \
+  echo "paneSelfPrimary=$PS_PRIMARY tmuxGated=$TMUX_GATED"
+if [ "${PS_PRIMARY:-0}" -ge 1 ] && [ "${TMUX_GATED:-0}" -ge 1 ]; then
+  expect.pass "pane.self is PRIMARY; \$TMUX_PANE only when pane.self empty (BUG7 holdout retired)"
+else
+  expect.fail "pane.self not primary / \$TMUX_PANE not gated: primary=$PS_PRIMARY gated=$TMUX_GATED"
+fi
+
+# ── BI-RESOLVER [S+B]: hook resolves role@host via the shared resolver, and it
+# actually returns role@host for a live pane. ────────────────────────────────
+HOOK_USES_RESOLVER=$(grep -cE 'hiveMind (protected\.)?identity\.resolve' "$HOOK")
+LIVE_ID=$(hiveMind protected.live.tupleset 2>/dev/null | awk -F'|' '$7=="agent" && $5!=""{print $2":"$3; exit}')
+RESOLVED=""
+[ -n "$LIVE_ID" ] && RESOLVED=$(hiveMind protected.identity.resolve "$LIVE_ID" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+@[A-Za-z0-9._-]+' | head -1)
+test.case $level "BI-RESOLVER: hook uses shared identity.resolve; it returns role@host" \
+  echo "hookUses=$HOOK_USES_RESOLVER resolved=$RESOLVED"
+if [ "${HOOK_USES_RESOLVER:-0}" -ge 1 ] && [ -n "$RESOLVED" ]; then
+  expect.pass "hook calls the c.0 resolver; live resolve → $RESOLVED"
+else
+  expect.fail "hookUses=$HOOK_USES_RESOLVER resolved='$RESOLVED'"
+fi
+
+# ── BI-HOSTDIR [S]: ROLE_DIR is @host-aware — <role>@<host>/ if it exists, else
+# bare <role>/ (closes the per-host duplicated-fork directive). ──────────────
+HOSTDIR=$(grep -cE 'ROLE_DIR="\$\{CURRENT_ROLE\}@\$\{CURRENT_HOST\}"' "$HOOK")
+BAREDIR=$(grep -cE 'ROLE_DIR="\$CURRENT_ROLE"' "$HOOK")
+test.case $level "BI-HOSTDIR: ROLE_DIR is @host-aware (role@host if present, else bare role)" \
+  echo "hostDir=$HOSTDIR bareDir=$BAREDIR"
+if [ "${HOSTDIR:-0}" -ge 1 ] && [ "${BAREDIR:-0}" -ge 1 ]; then
+  expect.pass "@host-aware dir pick present (dup fork → role@host, single → bare role)"
+else
+  expect.fail "dir pick not @host-aware: hostDir=$HOSTDIR bareDir=$BAREDIR"
+fi
+
+# ── BI-NO-UNKNOWN [S]: the hook NEVER writes session/agents/unknown/. ROLE_DIR
+# is only {_unresolved, role@host, role} — never "unknown". ($ {CURRENT_ROLE:-
+# unknown} is a DISPLAY default in echoes, not a write target.) ──────────────
+UNKNOWN_WRITE=$(grep -nE 'agents/unknown|ROLE_DIR="unknown"|ROLE_DIR=unknown' "$HOOK" \
+  | grep -vE '#|echo|NEVER|Retire|clobber|sink')
+test.case $level "BI-NO-UNKNOWN: hook never writes session/agents/unknown/ (clobber sink retired)" \
+  echo "unknownWrites=$(printf '%s' "$UNKNOWN_WRITE" | grep -c .)"
+if [ -z "$UNKNOWN_WRITE" ]; then
+  expect.pass "no unknown/ write target — ROLE_DIR ∈ {_unresolved, role@host, role}"
+else
+  expect.fail "hook writes to unknown/: $(printf '%s' "$UNKNOWN_WRITE" | head -1)"
+fi
+
+# ── BI-QUARANTINE-UNIQUE [S]: unresolved → _unresolved/<pane>-<pid>.boot.md —
+# embeds BOTH pane and PID so two unknowns can NEVER collide. ────────────────
+QUAR_PANE=$(grep -cE 'BOOT_FILE=.*_unresolved.*\$\{?SAFE_PANE|SAFE_PANE=.*PANE_TARGET' "$HOOK")
+QUAR_PID=$(grep -cE 'BOOT_FILE=.*\$\$\.boot\.md|BOOT_FILE=.*-\$\$' "$HOOK")
+test.case $level "BI-QUARANTINE-UNIQUE: unresolved boot path embeds pane + pid (no collision)" \
+  echo "paneInPath=$QUAR_PANE pidInPath=$QUAR_PID"
+if [ "${QUAR_PANE:-0}" -ge 1 ] && [ "${QUAR_PID:-0}" -ge 1 ]; then
+  expect.pass "quarantine path = _unresolved/<pane>-<pid>.boot.md — unique per (pane,pid)"
+else
+  expect.fail "quarantine path not unique: paneInPath=$QUAR_PANE pidInPath=$QUAR_PID"
+fi
+
+# ── BI-NO-UNKNOWN-COMMIT [S]: an unresolved auto-commit is pane-scoped, NEVER
+# "Auto-save: unknown". ──────────────────────────────────────────────────────
+BAD_COMMIT=$(grep -cE 'COMMIT_MSG=.*(Auto-save: unknown|unknown pre-compact)' "$HOOK")
+UNRES_COMMIT=$(grep -cE 'COMMIT_MSG=.*(UNRESOLVED|\$\{?PANE_TARGET)' "$HOOK")
+test.case $level "BI-NO-UNKNOWN-COMMIT: unresolved commit is pane-scoped, never 'unknown'" \
+  echo "badUnknownCommit=$BAD_COMMIT paneScoped=$UNRES_COMMIT"
+if [ "${BAD_COMMIT:-1}" -eq 0 ] && [ "${UNRES_COMMIT:-0}" -ge 1 ]; then
+  expect.pass "no 'Auto-save: unknown' commit; unresolved msg is pane-scoped"
+else
+  expect.fail "bad unknown-labeled commit=$BAD_COMMIT / no pane-scoped unresolved msg=$UNRES_COMMIT"
+fi
+
+# ── BI-UNKNOWN-RETIRED [B]: session/agents/unknown/ is retired (absent). ─────
+test.case $level "BI-UNKNOWN-RETIRED: session/agents/unknown/ retired (dir absent)" \
+  echo "checking $PROJ_DIR/session/agents/unknown"
+if [ ! -d "$PROJ_DIR/session/agents/unknown" ]; then
+  expect.pass "session/agents/unknown/ absent — the shared identity sink is retired"
+else
+  expect.fail "session/agents/unknown/ still exists — clobber-by-construction risk remains"
+fi
+
+echo ""
+echo "=== T-BOOT-IDENTITY complete ==="
+echo ""
+
+test.suite.save.results
