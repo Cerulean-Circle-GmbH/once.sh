@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# T-SHELL-REAP — task-s2-i (64c0365): the SAFE background-shell reaper.
+# Spec: scrum.pmo/sprints/sprint-2/task-s2-i-shell-reaper.md
+# SAFETY-CRITICAL — a process reaper. Correct-by-construction ALLOW-LIST,
+# DEFAULT=KEEP: reap ONLY ppid==1 orphaned-reparented / orphaned-no-claude /
+# idle-stale>TTL; NEVER active-work (live child + parent alive) nor the pane's
+# foreground shell (the otmux:3119 SIGTERM-live-foreground hazard). Kill by PID
+# (SIGTERM→re-classify→SIGKILL), NEVER a pkill-pattern (the BUG6 lesson).
+#
+# Assertions (spec b/d/e/g the critical ones):
+#   • (e) post-rewind leak (bash ppid==1 WITH child, keeps pane tty) → REAPED.
+#   • (b) ACTIVE (bash + live sleep-300 child, parent alive) → SURVIVES.
+#   • (d) pane foreground shell (pane_pid) → NEVER reaped.
+#   • (g) shell.reap.dry kills NOTHING.
+# Fully isolated: a fake-claude scratch AGENT pane (the reaper only scopes agent
+# panes); all planted PIDs + the session are cleaned up; a control ppid==1 bash
+# on a DIFFERENT tty must survive a pane-scoped reap (h isolation).
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+OTMUX_SRC="$OOSH_DIR/otmux"; HM_SRC="$OOSH_DIR/hiveMind"
+WORK="${TMPDIR:-/tmp}/test.shell-reap.$$"
+mkdir -p "$WORK/bin"
+cp /bin/cat "$WORK/bin/claude" 2>/dev/null
+alive() { kill -0 "$1" 2>/dev/null && echo yes || echo no; }
+
+# ============================================================================
+# SR-CLASSIFIER-SRC [S] — the safety guards, locked in source (always runs).
+# ============================================================================
+IMPL=$(sed -n '/private.hiveMind.shell.reap.impl()/,/^}/p' "$HM_SRC")
+FG_GUARD=$(printf '%s\n' "$IMPL" | grep -cE 'pane_pid|== *pane_pid|pid.*pane_pid')
+NO_PKILL=$(printf '%s\n' "$IMPL" | grep -cE 'pkill')
+KILL_BY_PID=$(printf '%s\n' "$IMPL" | grep -cE 'kill -(KILL|TERM|9|15) "?\$?pid|kill.*\$pid')
+test.case $level "SR-CLASSIFIER-SRC: foreground-guard + kill-by-PID + no pkill-pattern (BUG6)" \
+  echo "fgGuard=$FG_GUARD noPkill=$NO_PKILL killByPid=$KILL_BY_PID"
+if [ "${FG_GUARD:-0}" -ge 1 ] && [ "${NO_PKILL:-1}" -eq 0 ] && [ "${KILL_BY_PID:-0}" -ge 1 ]; then
+  expect.pass "reaper guards pane_pid foreground, kills by PID, zero pkill-pattern"
+else
+  expect.fail "safety guards missing: fgGuard=$FG_GUARD noPkill=$NO_PKILL killByPid=$KILL_BY_PID"
+fi
+
+if [ -z "$(command -v tmux)" ] || ! tmux new-session -d -s "__reap_$$" 2>/dev/null; then
+  for t in DRY-CLASSIFY DRY-KILLS-NOTHING APPLY-REAP-LEAK-ACTIVE-SURVIVES ISOLATION; do
+    test.case $level "SR-$t: (skipped — no tmux)" echo "skip"; expect.pass "skipped"
+  done
+  rm -rf "$WORK"; echo ""; echo "=== T-SHELL-REAP (skipped — no tmux) ==="; echo ""
+  test.suite.save.results; return 0 2>/dev/null || exit 0
+fi
+
+RS="__reap_$$"; RP="${RS}:0.0"
+PP=$(tmux display-message -t "$RP" -p '#{pane_pid}')
+TTYS=$(tmux display-message -t "$RP" -p '#{pane_tty}'); TTYS="${TTYS#/dev/}"
+
+# Plant fixtures IN the pane (so they carry the pane's controlling tty):
+#  (b) ACTIVE: bash + sleep child, parent = pane_pid (alive, ppid!=1).
+tmux send-keys -t "$RP" "bash -c 'sleep 300; :' &" Enter; sleep 0.6
+#  (e) LEAK: subshell exits → bash reparents to init (ppid==1), keeps tty, has child.
+tmux send-keys -t "$RP" "( bash -c 'sleep 300; :' & )" Enter; sleep 0.8
+#  Become an AGENT (fake claude) so the reaper scopes this pane.
+tmux send-keys -t "$RP" "PATH=$WORK/bin:\$PATH claude" Enter; sleep 1
+
+# Control: a ppid==1 bash on a DIFFERENT tty (no pane) — must survive a scoped reap.
+( setsid bash -c 'sleep 300; :' >/dev/null 2>&1 & ) ; sleep 0.3
+CTRL=$(ps -eo pid,ppid,comm | awk '$2==1 && $3=="bash"{p=$1} END{print p}')
+
+# Identify the planted PIDs on the pane's tty.
+ACTIVE_PID=$(ps -eo pid,ppid,tty,comm | awk -v t="$TTYS" -v pp="$PP" '$3==t && $4=="bash" && $2==pp{print $1; exit}')
+LEAK_PID=$(ps -eo pid,ppid,tty,comm  | awk -v t="$TTYS" '$3==t && $4=="bash" && $2==1{print $1; exit}')
+
+echo "--- pane_pid=$PP tty=$TTYS active=$ACTIVE_PID leak=$LEAK_PID ctrl=$CTRL ---"
+
+# ============================================================================
+# SR-DRY-CLASSIFY [B/I] — .dry flags the LEAK (orphaned-reparented), NOT the
+# active shell, NOT the pane foreground.
+# ============================================================================
+DRY=$(SHELL_REAP_TTL=1 hiveMind shell.reap.dry "$RP" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g')
+LEAK_FLAGGED=$(printf '%s\n' "$DRY" | grep -cE "WOULD reap $LEAK_PID\b")
+ACTIVE_FLAGGED=$(printf '%s\n' "$DRY" | grep -cE "WOULD reap $ACTIVE_PID\b")
+FG_FLAGGED=$(printf '%s\n' "$DRY" | grep -cE "WOULD reap $PP\b")
+test.case $level "SR-DRY-CLASSIFY: .dry flags the ppid==1 leak, spares active + foreground" \
+  echo "leakFlagged=$LEAK_FLAGGED activeFlagged=$ACTIVE_FLAGGED fgFlagged=$FG_FLAGGED"
+if [ "${LEAK_FLAGGED:-0}" -ge 1 ] && [ "${ACTIVE_FLAGGED:-1}" -eq 0 ] && [ "${FG_FLAGGED:-1}" -eq 0 ]; then
+  expect.pass "leak=$LEAK_PID flagged orphaned-reparented; active=$ACTIVE_PID + foreground=$PP spared"
+else
+  expect.fail "classifier wrong: leakFlagged=$LEAK_FLAGGED activeFlagged=$ACTIVE_FLAGGED fgFlagged=$FG_FLAGGED"
+fi
+
+# ============================================================================
+# SR-DRY-KILLS-NOTHING [B/I] — the audit valve terminates nothing. [critical g]
+# ============================================================================
+test.case $level "SR-DRY-KILLS-NOTHING: shell.reap.dry terminates nothing" \
+  echo "leakAlive=$(alive $LEAK_PID) activeAlive=$(alive $ACTIVE_PID) fgAlive=$(alive $PP)"
+if [ "$(alive "$LEAK_PID")" = yes ] && [ "$(alive "$ACTIVE_PID")" = yes ] && [ "$(alive "$PP")" = yes ]; then
+  expect.pass "all processes still alive after .dry (audit valve kills nothing)"
+else
+  expect.fail ".dry killed something: leak=$(alive $LEAK_PID) active=$(alive $ACTIVE_PID) fg=$(alive $PP)"
+fi
+
+# ============================================================================
+# SR-APPLY [B/I] — shell.reap reaps the leak, ACTIVE survives, foreground
+# survives, and the out-of-scope control survives (isolation). [critical b/d/e/h]
+# ============================================================================
+SHELL_REAP_TTL=1 hiveMind shell.reap "$RP" >/dev/null 2>&1
+sleep 1
+test.case $level "SR-APPLY: leak REAPED, active + foreground + out-of-scope control SURVIVE" \
+  echo "leak=$(alive $LEAK_PID) active=$(alive $ACTIVE_PID) fg=$(alive $PP) ctrl=$(alive $CTRL)"
+if [ "$(alive "$LEAK_PID")" = no ] && [ "$(alive "$ACTIVE_PID")" = yes ] \
+   && [ "$(alive "$PP")" = yes ] && [ "$(alive "$CTRL")" = yes ]; then
+  expect.pass "leak killed; ACTIVE-work + pane-foreground + out-of-scope shell all survived"
+else
+  expect.fail "SAFETY VIOLATION: leak=$(alive $LEAK_PID)(want no) active=$(alive $ACTIVE_PID)(want yes) fg=$(alive $PP)(want yes) ctrl=$(alive $CTRL)(want yes)"
+fi
+
+# ── Cleanup — kill every planted PID + control + session + temp bin ─────────
+for pid in "$ACTIVE_PID" "$LEAK_PID" "$CTRL"; do [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null; done
+for pid in $(ps -eo pid,tty,comm 2>/dev/null | awk -v t="$TTYS" '$2==t && ($3=="bash"||$3=="sleep"||$3=="claude"){print $1}'); do
+  [ "$pid" != "$PP" ] && kill -9 "$pid" 2>/dev/null
+done
+tmux kill-session -t "$RS" 2>/dev/null
+rm -rf "$WORK" 2>/dev/null
+
+echo ""
+echo "=== T-SHELL-REAP complete ==="
+echo ""
+
+test.suite.save.results
