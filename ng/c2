@@ -352,14 +352,36 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
           console.log ""
           c2.get.formated.function.description $script ${filter}
     fi
-    # If method has its own completion function, skip sub-command listing
-    # and go directly to parameter completion (e.g. ossh.get has ossh.get.completion.object)
+    # Completion Precedence TIER 3 (docs/first-principles.md): PARAMETER completion
+    # (either tier) is USED over METHOD/sub-command listing. Once a full method that
+    # HAS a completable parameter is on the line, complete the parameter — do not list
+    # the method's sub-commands. Skip the sub-command listing when the method's first
+    # parameter can be completed by EITHER:
+    #   - method-specific  $class.$method.completion.$firstParam  (TIER 1, e.g. ossh.get.completion.object)
+    #   - whole-method     $class.$method.completion
+    #   - CLASS-level      $class.parameter.completion.$firstParam (TIER 2, e.g. otmux.parameter.completion.target)
+    # The class-level path was previously ignored → `otmux send`+Tab wrongly listed
+    # the send.* sub-methods instead of completing <target>.
+    #
+    # $firstParam is derived from the method's SIGNATURE (file grep, valid-identifier
+    # sed), NOT from completion.parameter.txt — that file is written LATER (~L420) so
+    # here it holds the PREVIOUS invocation's params (stale). That staleness is the
+    # trap cc11daf tried to escape with a compgen heuristic that got reverted (31099be);
+    # the signature is the reliable, sourcing-free source. A pure namespace prefix
+    # (no `$class.$method()` declaration) yields an EMPTY $firstParam → sub-commands
+    # are listed as before (no over-suppression regression).
     if [ $count -gt 0 ] && [ $word -gt 1 ]; then
+      # ensure the class is sourced so this.functionExists sees its completion fns
+      if ! this.functionExists $class.start 2>/dev/null; then
+        source $script completion.discover 2>/dev/null
+      fi
       local firstParam
-      firstParam=$(cat $CONFIG_PATH/completion.parameter.txt 2>/dev/null | line.select 1 2>/dev/null)
-      if this.functionExists "$class.$method.completion.$firstParam" 2>/dev/null || \
-         this.functionExists "$class.$method.completion" 2>/dev/null; then
-        info.log "method $method has own completion — skipping sub-commands"
+      firstParam=$(grep "${class}\.${method}()" "$script" 2>/dev/null | head -1 \
+        | sed -n 's/.*# *<?*\([a-zA-Z_][a-zA-Z0-9_]*\).*/\1/p')
+      if [ -n "$firstParam" ] && { this.functionExists "$class.$method.completion.$firstParam" 2>/dev/null || \
+                                   this.functionExists "$class.$method.completion" 2>/dev/null || \
+                                   this.functionExists "$class.parameter.completion.$firstParam" 2>/dev/null; }; then
+        info.log "method $method has parameter completion (<$firstParam>) — completing parameter, not sub-commands"
         count=0
         completionResult=""
       fi
@@ -470,12 +492,18 @@ private.call.custom.completion() # <cur> <class> <method> <?parameter> # calls c
       source $script completion.discover "$@"
     fi
 
+    # Completion Precedence TIER 1 (docs/first-principles.md): a method's OWN
+    # parameter completion HARD-OVERWRITES the standard class-level one. Checked
+    # FIRST so `$class.$method.completion.$param` wins over `$class.parameter.completion.$param`.
     if this.functionExists $class.$method.completion$parameter; then
       $class.$method.completion$parameter "$cur" "$class" "$method" | grep "^$cur" >$CONFIG_PATH/completion.result.txt
       debug.log "c2:$LINENO completion.result.txt: -> $(cat $CONFIG_PATH/completion.result.txt) <-"
       return 0
     fi
 
+    # TIER 2: standard class-level parameter completion — the default fallback when
+    # the method defines no specific completion for this parameter (e.g. otmux.send's
+    # <target> completes via otmux.parameter.completion.target).
     if this.functionExists $class.parameter.completion$parameter; then
       $class.parameter.completion$parameter "$cur" "$class" "$method" | grep "^$cur" >$CONFIG_PATH/completion.result.txt
       debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
@@ -486,10 +514,20 @@ private.call.custom.completion() # <cur> <class> <method> <?parameter> # calls c
 
       source $CONFIG_PATH/current.method.env
       if [ -n "$4" ] && [ "$4" != "none" ]; then
-        debug.log "$parameterENV=${!parameterENV}"
-        echo "${!parameterENV}" >$CONFIG_PATH/completion.result.txt
-        debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
-        return 0
+        # Self-heal (Tron ERROR/WARNING): a parameter name that is not a valid bash
+        # identifier (e.g. a legacy `<text...>` signature) would make the indirect
+        # expansion `${!parameterENV}` abort with "PARAM_text...: invalid variable
+        # name" and kill completion. Guard it — an invalid identifier has no stored
+        # PARAM_ value, so degrade to free-text (empty result) instead of crashing.
+        case "$parameterENV" in
+          [!A-Za-z_]*|*[!A-Za-z0-9_]*)
+            debug.log "$parameterENV is not a valid identifier — free-text param, skipping value lookup" ;;
+          *)
+            debug.log "$parameterENV=${!parameterENV}"
+            echo "${!parameterENV}" >$CONFIG_PATH/completion.result.txt
+            debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
+            return 0 ;;
+        esac
       fi
     fi
 

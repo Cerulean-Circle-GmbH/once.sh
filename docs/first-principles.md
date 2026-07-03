@@ -53,6 +53,11 @@
   - Integrates standard Bash completions (files, users, groups, etc.) with project-specific logic.
   - Supports custom completions for advanced use cases.
 - **Extensibility:** New scripts and methods are automatically included in the completion system, supporting rapid evolution and experimentation.
+- **Completion Precedence (MANDATORY — 3-tier resolution):**
+  1. **Method-specific parameter completion is a HARD OVERWRITE of the standard.** A method's own `<class>.<method>.completion.<paramName>` takes precedence over — and hard-overwrites — the standard class-level `<class>.parameter.completion.<paramName>`. *Method completion goes over (standard) parameter completion.*
+  2. **Standard (class-level) parameter completion is the default fallback.** When a method defines no specific completion for a parameter, the shared `<class>.parameter.completion.<paramName>` is used.
+  3. **Parameter completion (either tier) is USED over method / sub-command listing.** Once a complete method with parameters is on the line, complete the current PARAMETER — never fall back to listing sub-methods. *The usage of parameter completion goes over method-completion definition.*
+  - Corollary: a parameter name MUST be a valid bash identifier (camelCase, no `...` / dashes / spaces). An invalid name (e.g. `<text...>`) breaks `declare PARAM_<name>` and kills parameter tracking — see [oosh-architecture.md](oosh-architecture.md) naming standard.
 
 ## The "this" Script
 - **Bootstrapping:** Initializes the environment, sets up logging, and manages configuration.
