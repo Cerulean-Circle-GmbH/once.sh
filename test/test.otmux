@@ -2167,6 +2167,95 @@ echo "=== T-ZOOM-HELPER tests complete ==="
 echo ""
 
 # ============================================================================
+# T-CAPTURE-BRIDGE: pane.capture must read the VISIBLE screen (-p), never the
+# SCROLLBACK (-S). On a bridged/relayed/REDRAWING pane the -S buffer desyncs
+# from the live frame → stale/blank ("lying instrument", F-T20). Fix b2dd551
+# (cherry-pick of dev 7059a36) forward-ported to THIS branch (test/macos.latest).
+# Independent tester gate on THIS box/branch — mirrors dev gate 1c5a4e8, plus a
+# decisive REDRAWING-pane delta (the exact condition that blanks -S but not -p).
+# ============================================================================
+OTMUX_SRC=$(which otmux 2>/dev/null)
+
+# --- T-CAPTURE-BRIDGE-1: regression fence (static, always runs) -------------
+# Assert the pane.capture COMMAND (comments stripped, so the fix's own -S
+# comment can't false-positive) carries no -S scrollback anti-pattern.
+CAP_CMD=$(sed -n '/^otmux.pane.capture()/,/^}/p' "$OTMUX_SRC" 2>/dev/null \
+  | grep -v '^[[:space:]]*#' | grep 'capture-pane')
+test.case $level "T-CAPTURE-BRIDGE-1: pane.capture command has no -S scrollback (anti-pattern fence)" \
+  echo "$CAP_CMD"
+if [ -z "$CAP_CMD" ]; then
+  expect.fail "could not locate pane.capture capture-pane command in $OTMUX_SRC"
+elif echo "$CAP_CMD" | grep -qE '(^|[[:space:]])-S([[:space:]]|$)'; then
+  expect.fail "pane.capture uses -S scrollback (bridge-stale anti-pattern): $CAP_CMD"
+else
+  expect.pass "pane.capture reads visible screen (-p), no -S: $CAP_CMD"
+fi
+
+if tmux list-sessions &>/dev/null; then
+  # --- T-CAPTURE-BRIDGE-2: static A/B parity vs canonical raw tmux -p --------
+  CAP_SESSION="__test_cap_bridge_$$"
+  tmux new-session -d -s "$CAP_SESSION" -x 200 -y 50 2>/dev/null
+  CAP_PANE="${CAP_SESSION}:0.0"
+  tmux send-keys -t "$CAP_PANE" "clear; printf 'CAP-A\nCAP-B\n\nCAP-D-after-blank\n'" Enter 2>/dev/null
+  sleep 1
+  CAP_WRAPPED=$(otmux pane.capture "$CAP_PANE" 10 2>/dev/null)
+  CAP_RAW=$(tmux capture-pane -t "$CAP_PANE" -p 2>/dev/null \
+    | awk 'NF{last=NR}{l[NR]=$0}END{for(i=1;i<=last;i++)print l[i]}' | tail -10)
+  tmux kill-session -t "$CAP_SESSION" 2>/dev/null
+  test.case $level "T-CAPTURE-BRIDGE-2: pane.capture == raw tmux -p oracle (content parity, no blank/stale)" \
+    echo "wrapped=[$CAP_WRAPPED]"
+  if [ -z "$CAP_WRAPPED" ]; then
+    expect.fail "pane.capture returned BLANK on a live pane (bridge-stale symptom)"
+  elif [ "$CAP_WRAPPED" = "$CAP_RAW" ]; then
+    expect.pass "parity: wrapper matches raw -p oracle (interior blank preserved, no stale)"
+  else
+    expect.fail "MISMATCH — wrapped=[$CAP_WRAPPED] raw=[$CAP_RAW]"
+  fi
+
+  # --- T-CAPTURE-BRIDGE-3: interior blank line preserved --------------------
+  test.case $level "T-CAPTURE-BRIDGE-3: interior blank line preserved (not collapsed)" \
+    echo "$CAP_WRAPPED"
+  if printf '%s\n' "$CAP_WRAPPED" | grep -q 'CAP-D-after-blank' \
+     && printf '%s\n' "$CAP_WRAPPED" | awk '/CAP-B/{b=NR} /CAP-D-after-blank/{d=NR} END{exit !(d>b+1)}'; then
+    expect.pass "interior blank between CAP-B and CAP-D preserved"
+  else
+    expect.fail "interior blank collapsed or content missing: [$CAP_WRAPPED]"
+  fi
+
+  # --- T-CAPTURE-BRIDGE-4: REDRAWING-pane delta (decisive local repro) -------
+  # A pane that clears+repaints every second is the exact desync condition:
+  # NEW `-p` reads the CURRENT live MARK; the OLD `-S` scrollback form reads
+  # blank/stale. Asserts (a) fix reads live content, (b) fix is NOT a no-op
+  # (NEW differs from the OLD -S form → the bug was real and is resolved).
+  RD_SESSION="__test_cap_redraw_$$"
+  tmux new-session -d -s "$RD_SESSION" -x 120 -y 30 2>/dev/null
+  RD_PANE="${RD_SESSION}:0.0"
+  tmux send-keys -t "$RD_PANE" 'while true; do clear; echo "REDRAW-MARK-$RANDOM"; sleep 1; done' Enter 2>/dev/null
+  sleep 3
+  RD_NEW=$(otmux pane.capture "$RD_PANE" 5 2>/dev/null)                       # fix: -p visible
+  RD_OLD=$(tmux capture-pane -t "$RD_PANE" -p -S "-5" 2>/dev/null | tail -5)  # old: -S scrollback
+  tmux send-keys -t "$RD_PANE" C-c 2>/dev/null
+  sleep 0.3
+  tmux kill-session -t "$RD_SESSION" 2>/dev/null
+  test.case $level "T-CAPTURE-BRIDGE-4: redrawing pane — new -p reads live MARK, old -S stale (delta proven)" \
+    echo "new=[$RD_NEW] old=[$RD_OLD]"
+  RD_NEW_STRIP=$(printf '%s' "$RD_NEW" | tr -d '[:space:]')
+  if printf '%s\n' "$RD_NEW" | grep -q 'REDRAW-MARK-' && [ -n "$RD_NEW_STRIP" ] && [ "$RD_NEW" != "$RD_OLD" ]; then
+    expect.pass "new -p reads live MARK ([$RD_NEW]); differs from old -S form ([$RD_OLD]) — fix is not a no-op"
+  else
+    expect.fail "redraw delta unproven — new=[$RD_NEW] old=[$RD_OLD]"
+  fi
+else
+  test.case $level "T-CAPTURE-BRIDGE-2: (skipped — no tmux)" echo "skip"; expect.pass "skipped"
+  test.case $level "T-CAPTURE-BRIDGE-3: (skipped — no tmux)" echo "skip"; expect.pass "skipped"
+  test.case $level "T-CAPTURE-BRIDGE-4: (skipped — no tmux)" echo "skip"; expect.pass "skipped"
+fi
+
+echo ""
+echo "=== T-CAPTURE-BRIDGE tests complete ==="
+echo ""
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 
