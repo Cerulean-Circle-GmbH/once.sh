@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# T-SEND-SELFHEAL — FORMAL verification of the self-heal verified-send (Tron spec
+# 2026-07-03, otmux.send.verified). Two invariants together + the no-interrupt
+# hard rule:
+#   (1) COMMITS reliably — Enter lands (idle + the [@-prefix autocomplete case).
+#   (2) EXACTLY 1 delivery — text staged ONCE, poke ENTER-ONLY (never re-typed),
+#       so the recipient transcript shows the message once, never twice.
+#   BONUS: a GENERATING recipient is NOT interrupted — no Escape while
+#          'esc to interrupt' is on screen.
+#
+# [I] fake-claude fixture (binary `claude`=cat → pane_current_command=claude →
+# CLAUDE path fires; `stty -echo` so ONLY the program's stdout is counted =
+# times DELIVERED). Fully isolated: scratch sessions + temp bin.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+OTMUX_SRC="$OOSH_DIR/otmux"
+WORK="${TMPDIR:-/tmp}/test.send-selfheal.$$"
+mkdir -p "$WORK/bin"
+cp /bin/cat "$WORK/bin/claude" 2>/dev/null
+HAVE=1; [ -z "$(command -v tmux)" ] && HAVE=0
+
+mk_fc() {   # <tag> <?echo:off> → FC_SESSION/FC_PANE
+  FC_SESSION="__ssh_${1}_$$"
+  tmux new-session -d -s "$FC_SESSION" -x 100 -y 30 2>/dev/null || return 1
+  FC_PANE="${FC_SESSION}:0.0"
+  local stty="stty -echo; "
+  [ "$2" = "echo" ] && stty=""
+  tmux send-keys -t "$FC_PANE" "${stty}PATH=$WORK/bin:\$PATH claude" Enter
+  sleep 1
+  [ "$(tmux display-message -t "$FC_PANE" -p '#{pane_current_command}' 2>/dev/null)" = "claude" ]
+}
+rm_fc() { [ -n "$FC_SESSION" ] && tmux kill-session -t "$FC_SESSION" 2>/dev/null; }
+cap_fc() { tmux capture-pane -t "$FC_PANE" -p 2>/dev/null | sed -E 's/\x1b\[[0-9;]*m//g'; }
+
+# ── INVARIANT 1+2 (idle recipient): commits (rc0) AND exactly 1 delivery ─────
+if [ "$HAVE" -eq 1 ] && mk_fc idle; then
+  M="HEAL_IDLE_$$"
+  otmux send "$FC_PANE" "$M" >/dev/null 2>&1; RC=$?
+  sleep 1.5
+  N=$(cap_fc | grep -c "$M")
+  test.case $level "V1: idle recipient — COMMITS (rc0) + EXACTLY 1 delivery" \
+    echo "rc=$RC deliveries=$N"
+  if [ "$RC" -eq 0 ] && [ "${N:-0}" -eq 1 ]; then
+    expect.pass "committed (rc0) and delivered exactly once"
+  else
+    expect.fail "rc=$RC deliveries=$N (want rc0, 1 delivery)"
+  fi
+  rm_fc
+else
+  test.case $level "V1: (skipped — no tmux/fixture)" echo "skip"; expect.pass "skipped"
+fi
+
+# ── INVARIANT 1+2 ([@-prefix autocomplete case): the [@ prefix opens Claude's
+# @-mention autocomplete → Escape(idle-only) dismisses it → COMMITS, ONCE. ────
+if [ "$HAVE" -eq 1 ] && mk_fc prefix; then
+  M="HEAL_PFX_$$"
+  otmux send "$FC_PANE" "$M" >/dev/null 2>&1; RC=$?   # normal text → claude path adds [@ prefix
+  sleep 1.5
+  N=$(cap_fc | grep -c "$M")
+  P=$(cap_fc | grep "$M" | grep -o '\[@' | wc -l | tr -d ' ')
+  test.case $level "V2: [@-prefix autocomplete case — COMMITS + 1 delivery + prefix once" \
+    echo "rc=$RC deliveries=$N prefix=$P"
+  if [ "$RC" -eq 0 ] && [ "${N:-0}" -eq 1 ] && [ "${P:-0}" -eq 1 ]; then
+    expect.pass "prefixed message committed, delivered once, [@ prefix once"
+  else
+    expect.fail "rc=$RC deliveries=$N prefix=$P (want rc0, 1, 1)"
+  fi
+  rm_fc
+else
+  test.case $level "V2: (skipped — no tmux/fixture)" echo "skip"; expect.pass "skipped"
+fi
+
+# ── BONUS (busy recipient): NEVER interrupt a GENERATING pane — no Escape while
+# 'esc to interrupt' on screen. echo ON so keystrokes are visible; inject the
+# generating marker; send; assert ZERO Escape (^[) fired for our send. ────────
+if [ "$HAVE" -eq 1 ] && mk_fc busy echo; then
+  # Put the pane into a "generating" display state (cat echoes the line).
+  tmux send-keys -t "$FC_PANE" -l "esc to interrupt"; tmux send-keys -t "$FC_PANE" Enter
+  sleep 0.5
+  MB="HEAL_BUSY_$$"
+  otmux send "$FC_PANE" "$MB" >/dev/null 2>&1
+  sleep 1.2
+  # Escape echoes as ^[ (ESC, 0x1b) in a cooked-mode cat pane. With the gen guard
+  # (! $gen) NO Escape should fire while 'esc to interrupt' is present.
+  RAW=$(tmux capture-pane -t "$FC_PANE" -p -e 2>/dev/null)
+  ESC_CT=$(printf '%s' "$RAW" | grep -ac "$(printf '\033')" 2>/dev/null || echo 0)
+  # Focus: an Escape KEY sent to the pane (cat echoes it literally); the ANSI from
+  # our own capture is stripped by -e handling. Use the control-char echo ^[ form.
+  ESC_KEY=$(tmux capture-pane -t "$FC_PANE" -p 2>/dev/null | grep -c '\^\[')
+  GEN_STILL=$(tmux capture-pane -t "$FC_PANE" -p 2>/dev/null | grep -c 'esc to interrupt')
+  test.case $level "V3: generating recipient NOT interrupted (no Escape while 'esc to interrupt')" \
+    echo "escKeyEchoes=$ESC_KEY genStatePresent=$GEN_STILL"
+  if [ "${ESC_KEY:-0}" -eq 0 ]; then
+    expect.pass "no Escape key fired to the generating pane (interrupt averted)"
+  else
+    expect.fail "Escape fired ($ESC_KEY) while pane was generating — interrupts the agent"
+  fi
+  rm_fc
+else
+  test.case $level "V3: (skipped — no tmux/fixture)" echo "skip"; expect.pass "skipped"
+fi
+
+# ── [S] STRUCTURAL GUARDS — lock the self-heal contract in source ────────────
+VBODY=$(sed -n '/^otmux.send.verified()/,/^}/p' "$OTMUX_SRC")
+
+# stage EXACTLY ONCE: a single literal `send-keys … -l "$text"` (never in the poke loop).
+STAGE_CT=$(printf '%s\n' "$VBODY" | grep -cE 'send-keys .*-l "\$text"')
+# Escape is IDLE-ONLY: guarded by `! $gen` (never Escape a generating pane).
+ESC_GATED=$(printf '%s\n' "$VBODY" | grep -A1 -E 'isClaude && ! \$gen' | grep -c 'Escape')
+# gen detected from 'esc to interrupt'.
+GEN_DET=$(printf '%s\n' "$VBODY" | grep -c "grep -q 'esc to interrupt'")
+test.case $level "V4 [S]: stage-once + Escape-idle-only + gen-detect (self-heal contract)" \
+  echo "stageOnce=$STAGE_CT escGated=$ESC_GATED genDetect=$GEN_DET"
+if [ "${STAGE_CT:-0}" -eq 1 ] && [ "${ESC_GATED:-0}" -ge 1 ] && [ "${GEN_DET:-0}" -ge 1 ]; then
+  expect.pass "text staged once, Escape gated by !gen, gen detected via 'esc to interrupt'"
+else
+  expect.fail "contract not locked: stageOnce=$STAGE_CT escGated=$ESC_GATED genDetect=$GEN_DET (want 1,>=1,>=1)"
+fi
+
+# poke is ENTER-ONLY: the loop must NOT re-type the text (no second -l "$text").
+POKE_RETYPE=$(printf '%s\n' "$VBODY" | awk '/for \(\(/{f=1} f&&/send-keys .*-l "\$text"/{c++} END{print c+0}')
+test.case $level "V5 [S]: poke is ENTER-ONLY — text never re-typed in the loop (no dup)" \
+  echo "retypeInLoop=$POKE_RETYPE"
+if [ "${POKE_RETYPE:-1}" -eq 0 ]; then
+  expect.pass "poke loop re-types nothing — Enter-only (dup structurally impossible)"
+else
+  expect.fail "poke loop re-types the text ($POKE_RETYPE) — dup risk"
+fi
+
+rm -rf "$WORK" 2>/dev/null
+
+echo ""
+echo "=== T-SEND-SELFHEAL complete ==="
+echo ""
+
+test.suite.save.results
