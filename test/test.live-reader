@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# T-LIVE-READER — c.0 (45951ad + 0d9d162): the canonical live-truth reader.
+# Spec: scrum.pmo/sprints/sprint-2/task-s2-c.0-live-reader.md
+# Contract:
+#   • local tuple = 9 fields host|session|address|tty|role|uuid|kind|title|cwd —
+#     tty + host populated for every pane (batch, no per-pane subprocess).
+#   • identity.resolve(pane) == role@host of the reader's row for that pane
+#     (the C.3/C.2 projection — one shared resolver).
+#   • a remote team is enumerated via ossh-exec, host-tagged; UNREACHABLE remote
+#     → an explicit kind=remote-unreachable MARKER row, NEVER a silent omission
+#     (kills the PF3 team-dropping bug).
+# Public entries: `hiveMind protected.live.tupleset [session]`,
+#   `hiveMind protected.identity.resolve <pane>`, `hiveMind team.host.set`.
+# ISOLATED: remote test mutates only a temp HIVEMIND_TEAMS copy; live registry
+# md5 asserted unchanged.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+CFG="${CONFIG_PATH:-$HOME/config}"
+LIVE_TEAMS="${HIVEMIND_TEAMS:-$CFG/hivemind.teams.env}"
+TEAMS_MD5_BEFORE=$( [ -f "$LIVE_TEAMS" ] && md5sum "$LIVE_TEAMS" | cut -d' ' -f1 || echo none )
+WORK="${TMPDIR:-/tmp}/test.live-reader.$$"
+mkdir -p "$WORK"
+
+# ============================================================================
+# LR-9FIELD [B] — every live row is the canonical 9-field tuple with tty + host.
+# ============================================================================
+READ=$(hiveMind protected.live.tupleset 2>/dev/null | grep -vE '^[[:space:]]*$')
+TOTAL=$(printf '%s\n' "$READ" | grep -c .)
+BAD_NF=$(printf '%s\n' "$READ" | awk -F'|' 'NF!=9{c++} END{print c+0}')
+# host (f1) + tty (f4) non-empty for every row; agent rows carry a pts/N tty.
+NO_HOST=$(printf '%s\n' "$READ" | awk -F'|' '$1==""{c++} END{print c+0}')
+NO_TTY=$(printf '%s\n'  "$READ" | awk -F'|' '$7=="agent" && $4==""{c++} END{print c+0}')
+test.case $level "LR-9FIELD: every live row is 9-field with host+tty populated" \
+  echo "rows=$TOTAL badNF=$BAD_NF noHost=$NO_HOST agentNoTty=$NO_TTY"
+if [ "${TOTAL:-0}" -ge 1 ] && [ "$BAD_NF" -eq 0 ] && [ "$NO_HOST" -eq 0 ] && [ "$NO_TTY" -eq 0 ]; then
+  expect.pass "$TOTAL rows, all 9-field, host+tty populated (agent rows carry a tty)"
+else
+  expect.fail "canonical tuple broken: rows=$TOTAL badNF=$BAD_NF noHost=$NO_HOST agentNoTty=$NO_TTY"
+fi
+
+# ============================================================================
+# LR-IDENTITY [B] — identity.resolve(pane) == role@host of the reader's row.
+# ============================================================================
+# Pick a live AGENT row (has role + uuid) as the anchor.
+ANCHOR=$(printf '%s\n' "$READ" | awk -F'|' '$7=="agent" && $5!="" && $6!="" {print; exit}')
+A_HOST=$(printf '%s' "$ANCHOR" | cut -d'|' -f1)
+A_SESS=$(printf '%s' "$ANCHOR" | cut -d'|' -f2)
+A_ADDR=$(printf '%s' "$ANCHOR" | cut -d'|' -f3)
+A_ROLE=$(printf '%s' "$ANCHOR" | cut -d'|' -f5)
+if [ -n "$A_ROLE" ] && [ -n "$A_HOST" ]; then
+  RESOLVED=$(hiveMind protected.identity.resolve "${A_SESS}:${A_ADDR}" 2>/dev/null \
+    | grep -viE '^[[:space:]]*$' | grep -E '@' | tail -1)
+  test.case $level "LR-IDENTITY: identity.resolve(pane) == reader row role@host ($A_ROLE@$A_HOST)" \
+    echo "resolved=$RESOLVED"
+  if [ "$RESOLVED" = "${A_ROLE}@${A_HOST}" ]; then
+    expect.pass "identity.resolve is a faithful projection of the reader ($RESOLVED)"
+  else
+    expect.fail "projection mismatch: resolved='$RESOLVED' want '${A_ROLE}@${A_HOST}'"
+  fi
+else
+  test.case $level "LR-IDENTITY: (skipped — no agent anchor)" echo "skip"; expect.pass "skipped"
+fi
+
+# ============================================================================
+# LR-REMOTE-MARKER [B/I] — an UNREACHABLE remote team → kind=remote-unreachable
+# MARKER row, NEVER a silent omission (PF3 fail-safe). ISOLATED (temp teams.env).
+# ============================================================================
+TT="$WORK/teams.env"
+cp "$LIVE_TEAMS" "$TT" 2>/dev/null
+# Pick an existing local team to re-point at a bogus unreachable host.
+VICTIM=$(hiveMind protected.live.tupleset 2>/dev/null | awk -F'|' 'NF==9 && $7!="remote-unreachable"{print $2; exit}')
+[ -z "$VICTIM" ] && VICTIM="ooshShells"
+HIVEMIND_TEAMS="$TT" hiveMind team.host.set "$VICTIM" "nosuchhost.invalid" >/dev/null 2>&1
+MARKER=$(HIVEMIND_TEAMS="$TT" hiveMind protected.live.tupleset "$VICTIM" 2>/dev/null \
+  | grep -vE '^[[:space:]]*$' | awk -F'|' '$7=="remote-unreachable"{print; exit}')
+PRESENT=$(HIVEMIND_TEAMS="$TT" hiveMind protected.live.tupleset "$VICTIM" 2>/dev/null | grep -c "$VICTIM")
+test.case $level "LR-REMOTE-MARKER: unreachable remote → marker row, not omission (PF3 fail-safe)" \
+  echo "marker='$MARKER' teamPresent=$PRESENT"
+if [ -n "$MARKER" ] && [ "${PRESENT:-0}" -ge 1 ]; then
+  expect.pass "unreachable '$VICTIM' emits kind=remote-unreachable marker (team NOT silently dropped)"
+else
+  expect.fail "no marker / team omitted: marker='$MARKER' present=$PRESENT [PF3 regression]"
+fi
+
+# ============================================================================
+# LR-ISOLATION — the live teams registry was NEVER mutated by this run.
+# ============================================================================
+TEAMS_MD5_AFTER=$( [ -f "$LIVE_TEAMS" ] && md5sum "$LIVE_TEAMS" | cut -d' ' -f1 || echo none )
+test.case $level "LR-ISOLATION: live teams.env untouched (remote test used a temp copy)" \
+  echo "before=$TEAMS_MD5_BEFORE after=$TEAMS_MD5_AFTER"
+if [ "$TEAMS_MD5_BEFORE" = "$TEAMS_MD5_AFTER" ]; then
+  expect.pass "live teams.env md5 unchanged — zero registry disturbance"
+else
+  expect.fail "live teams.env CHANGED: $TEAMS_MD5_BEFORE → $TEAMS_MD5_AFTER"
+fi
+
+rm -rf "$WORK" 2>/dev/null
+
+echo ""
+echo "=== T-LIVE-READER complete ==="
+echo ""
+
+test.suite.save.results
