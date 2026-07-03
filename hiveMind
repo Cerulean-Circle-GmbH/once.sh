@@ -7647,22 +7647,8 @@ hiveMind.team.status() # <?session> # show team summary (no arg) or per-pane det
 # root pid (the shell-leak signal SM tracks). Excludes the pane's own shell (root,
 # not counted) and the foreground claude (comm never matches a shell). ONE ps
 # snapshot passed in — no per-pane subprocess.
-private.hiveMind.sweep.bgshells() { # <root_pid> <psSnap>
-  local root="$1" psSnap="$2"
-  [ -z "$root" ] && { echo 0; return; }
-  printf '%s\n' "$psSnap" | awk -v root="$root" '
-    { kids[$1]=kids[$1]" "$2; comm[$2]=$3 }
-    END {
-      n=split(kids[root], q0, " "); cnt=0; head=1; qn=0
-      for(i=1;i<=n;i++) if(q0[i]!=""){ qn++; s[qn]=q0[i] }
-      while(head<=qn){
-        pid=s[head++]; c=comm[pid]
-        if(c=="bash"||c=="sh"||c=="zsh"||c=="dash") cnt++
-        m=split(kids[pid], ch, " ")
-        for(j=1;j<=m;j++) if(ch[j]!=""){ qn++; s[qn]=ch[j] }
-      }
-      print cnt
-    }'
+private.hiveMind.sweep.bgshells() { # <root_pid> <psSnap> # bg-shell COUNT (DRY: counts the shell.descendants producer shared with shell.reap)
+  private.hiveMind.shell.descendants "$1" "$2" | grep -c . || echo 0
 }
 
 # Per-pane STATE (+details) via sweep.detect + captured content enrichment.
@@ -7720,6 +7706,135 @@ private.hiveMind.sweep.paneState() { # <target>
   esac
   echo "${state}|${details}"
 }
+
+: ${SHELL_REAP_TTL:=300}
+
+# bg-shell DESCENDANT PIDs of a pane's root shell (bash/sh/zsh/dash). The ONE
+# subtree producer shared with task-s2-h (h counts these; i classifies+reaps).
+private.hiveMind.shell.descendants() { # <root_pid> <psSnap:"ppid pid comm"> # print shell descendant PIDs (excl root)
+  local root="$1" psSnap="$2"
+  [ -z "$root" ] && return 0
+  printf '%s\n' "$psSnap" | awk -v root="$root" '
+    { kids[$1]=kids[$1]" "$2; comm[$2]=$3 }
+    END {
+      n=split(kids[root], q0, " "); head=1; qn=0
+      for(i=1;i<=n;i++) if(q0[i]!=""){ qn++; s[qn]=q0[i] }
+      while(head<=qn){
+        pid=s[head++]; c=comm[pid]
+        if(c=="bash"||c=="sh"||c=="zsh"||c=="dash") print pid
+        m=split(kids[pid], ch, " ")
+        for(j=1;j<=m;j++) if(ch[j]!=""){ qn++; s[qn]=ch[j] }
+      }
+    }'
+}
+
+# CLASSIFIER — correct-by-construction ALLOW-LIST; DEFAULT = KEEP. Echoes
+# "REAP:<reason>" or "KEEP:<reason>". The safety core: a shell with ANY live
+# (non-defunct) child is NEVER reaped — that's a running command (guards the
+# tester's "active bash with a live sleep 300 child SURVIVES").
+private.hiveMind.shell.classify() { # <pid> <pane_pid> <paneAlive:0|1> <psMeta> <ttl>
+  local pid="$1" panePid="$2" paneAlive="$3" psMeta="$4" ttl="$5"
+  # Never the pane's own foreground/interactive shell (the otmux:3119 hazard).
+  [ "$pid" = "$panePid" ] && { echo "KEEP:foreground"; return; }
+  printf '%s\n' "$psMeta" | awk -v pid="$pid" -v alive="$paneAlive" -v ttl="$ttl" '
+    { ppid[$2]=$1; stat[$2]=$4; et[$2]=$5; if($1==pid && $4 !~ /^Z/) livechild++ }
+    END {
+      # ppid==1 = PROVABLE orphan (parent died, kernel reparented to init). Reap
+      # even WITH children — this is the post-rewind leak (a sleep-loop background
+      # whose claude was killed keeps a sleep child; only ppid==1 distinguishes it
+      # from a live agent`s identical-looking active shell). Kernel-guaranteed, so
+      # safe to reap-with-child. Checked BEFORE the child guard for exactly this.
+      if (ppid[pid]==1) { print "REAP:orphaned-reparented"; exit }
+      # Safety core: a live (non-zombie) child under a STILL-PARENTED shell = a
+      # running command for a (probably live) agent → KEEP. Never kill active work.
+      if (livechild>0) { print "KEEP:active"; exit }
+      # No child + parent still alive from here:
+      if (alive=="0")        { print "REAP:orphaned-no-claude"; exit }   # owning pane has no live claude
+      if (et[pid]+0 > ttl+0) { print "REAP:idle-stale"; exit }           # idle beyond TTL
+      print "KEEP:young"                                                 # no child but young — give it time (default KEEP)
+    }'
+}
+
+private.hiveMind.shell.reap.impl() { # <?scope:pane|session> <mode:dry|apply>
+  local scope="$1" mode="$2"
+  local ttl="${SHELL_REAP_TTL:-300}"
+
+  # Determine in-scope AGENT panes by PROJECTING off c.0 (DRY with task-s2-h).
+  # scope empty = all teams; sess:win.pane = that pane; else = that session.
+  local sessFilter="" onePane=""
+  if [ -n "$scope" ]; then
+    if [[ "$scope" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then onePane="$scope"; sessFilter="${scope%%:*}"
+    else sessFilter="$scope"; fi
+  fi
+  local rows
+  rows=$(private.hiveMind.live.tupleset "$sessFilter" 2>/dev/null | awk -F'|' '$7=="agent"')
+  [ -n "$onePane" ] && rows=$(printf '%s\n' "$rows" | awk -F'|' -v p="$onePane" '$2":"$3==p')
+  [ -z "$rows" ] && { info.log "shell.reap: no agent panes in scope"; return 0; }
+
+  # Batches (fleet-wide, no per-pane subprocess explosion): pane→pane_pid + ps.
+  local panePidMap psSnap psMeta
+  panePidMap=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}' 2>/dev/null)
+  psSnap=$(ps -eo ppid=,pid=,comm= 2>/dev/null)
+  psMeta=$(ps -eo ppid=,pid=,comm=,stat=,etimes=,tty= 2>/dev/null)
+
+  local reapTotal=0 keepTotal=0
+  printf '%s\n' "$rows" | while IFS='|' read -r host rsess addr tty role uuid kind title cwd; do
+    local target="${rsess}:${addr}"
+    local panePid paneAlive=0
+    panePid=$(printf '%s\n' "$panePidMap" | awk -F'|' -v t="$target" '$1==t{print $2; exit}')
+    [ -z "$panePid" ] && continue
+    "$OOSH_DIR/claudeCode" process.running "$target" 2>/dev/null && paneAlive=1
+
+    # Candidates = shells STILL under the pane_pid subtree (idle-stale/active)
+    # UNION reparented orphans (ppid==1) that KEPT this pane's controlling tty.
+    # The latter LEFT the subtree when their claude died (reparented to init) — the
+    # dominant post-rewind leak the subtree walk alone can't see; attribute by tty.
+    local pid verdict candidates
+    candidates=$( { private.hiveMind.shell.descendants "$panePid" "$psSnap"
+                    printf '%s\n' "$psMeta" | awk -v t="$tty" '$1==1 && $6==t && ($3=="bash"||$3=="sh"||$3=="zsh"||$3=="dash"){print $2}'
+                  } | sort -un )
+    for pid in $candidates; do
+      verdict=$(private.hiveMind.shell.classify "$pid" "$panePid" "$paneAlive" "$psMeta" "$ttl")
+      case "$verdict" in
+        REAP:*)
+          local reason="${verdict#REAP:}"
+          if [ "$mode" = "apply" ]; then
+            kill -TERM "$pid" 2>/dev/null
+            sleep 0.3
+            # RE-CLASSIFY on fresh ps — spare a shell that started work in the grace window.
+            local psMeta2 recheck
+            psMeta2=$(ps -eo ppid=,pid=,comm=,stat=,etimes= 2>/dev/null)
+            recheck=$(private.hiveMind.shell.classify "$pid" "$panePid" "$paneAlive" "$psMeta2" "$ttl")
+            if kill -0 "$pid" 2>/dev/null; then
+              case "$recheck" in
+                REAP:*) kill -KILL "$pid" 2>/dev/null; console.log "shell.reap: KILLED $pid ($target, $reason)" ;;
+                *)      console.log "shell.reap: SPARED $pid ($target — became $recheck during grace)" ;;
+              esac
+            else
+              console.log "shell.reap: reaped $pid ($target, $reason)"
+            fi
+          else
+            console.log "shell.reap.dry: WOULD reap $pid ($target, role=$role) — $reason"
+          fi
+          ;;
+        *) : ;;  # KEEP — silent (dry can be verbose via debug)
+      esac
+      case "$verdict" in REAP:*) debug.log "reap $pid" ;; KEEP:*) debug.log "keep $pid $verdict" ;; esac
+    done
+  done
+  console.log "shell.reap${mode:+.$mode}: scan complete (scope='${scope:-all}', ttl=${ttl}s)"
+}
+
+hiveMind.shell.reap() # <?pane|session> # reap PROVABLY-SAFE leaked bg-shells (graceful SIGTERM→re-check→SIGKILL by PID; never active-work/foreground). No arg=all teams.
+{
+  private.hiveMind.shell.reap.impl "$1" "apply"
+}
+hiveMind.shell.reap.dry() # <?pane|session> # CLASSIFY + report what shell.reap WOULD reap — kills NOTHING (safety audit)
+{
+  private.hiveMind.shell.reap.impl "$1" "dry"
+}
+hiveMind.shell.reap.completion.pane() { private.hiveMind.teams.complete 2>/dev/null; }
+hiveMind.shell.reap.dry.completion.pane() { private.hiveMind.teams.complete 2>/dev/null; }
 
 hiveMind.team.sweep() # <?session> <?interval> # FLEET dashboard: no-arg = ALL active teams; per pane = state + bg-shells(sh:K) + context%(ctx). <session> scopes to one.
 {
