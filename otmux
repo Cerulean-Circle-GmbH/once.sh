@@ -46,6 +46,29 @@ private.resolve.target() {
   esac
 }
 
+private.otmux.target.isPane() { # <target> # rc=0 if target is a valid pane reference (session:win.pane or %paneId)
+  # Bug #4 defense: send.* methods must validate target format BEFORE delegating
+  # to tmux send-keys. Otherwise garbage from a failed upstream resolve (e.g.
+  # multi-line error.log captured into a target var) becomes raw input to the
+  # currently-focused pane via tmux's silent fallback.
+  #
+  # Valid pane references:
+  #   - "%N"               tmux pane id (e.g. %42)
+  #   - "sess:win.pane"    fully qualified (e.g. ooshTeam:0.2)
+  # Direction targets (U/D/L/R) are resolved by private.resolve.target before
+  # arriving here, so we only see post-resolve values.
+  local target="$1"
+  [ -z "$target" ] && return 1
+  # Reject anything with whitespace or newlines (typical of captured error.log)
+  case "$target" in
+    *[[:space:]]*) return 1 ;;
+  esac
+  # Match tmux pane id or session:win.pane
+  [[ "$target" =~ ^%[0-9]+$ ]] && return 0
+  [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]] && return 0
+  return 1
+}
+
 private.complete.sessions() {
   $TMUX_CMD list-sessions -F "#{session_name}" 2>/dev/null
 }
@@ -102,15 +125,29 @@ otmux.new() # <?name> <?command> # create a new session
   fi
 }
 
-otmux.attach() # <?target> # attach to session; target=session name or $id
+otmux.attach() # <?target> <?readonly> # attach to session; pass 'readonly' to attach with -r (no input, no resize)
 {
-  if [ -n "$1" ]; then
-    $TMUX_CMD attach-session -t "$1"
+  local target="" ro=""
+  for arg in "$@"; do
+    case "$arg" in
+      readonly|ro|-r) ro="-r" ;;
+      *) [ -z "$target" ] && target="$arg" ;;
+    esac
+  done
+  if [ -n "$target" ]; then
+    $TMUX_CMD attach-session $ro -t "$target"
   else
-    $TMUX_CMD attach-session
+    $TMUX_CMD attach-session $ro
   fi
 }
 otmux.attach.completion.target() { private.complete.sessions; }
+otmux.attach.completion.readonly() { echo "readonly"; }
+
+otmux.attach.readonly() # <?target> # convenience: attach in read-only mode (alias for attach <target> readonly)
+{
+  otmux.attach "$1" readonly
+}
+otmux.attach.readonly.completion.target() { private.complete.sessions; }
 
 otmux.detach() # # detach from current session
 {
@@ -148,6 +185,7 @@ otmux.rename() # <session> <?newName> # rename session (alias for session.rename
 {
   otmux.session.rename "$@"
 }
+otmux.rename.completion.session() { otmux.parameter.completion.session "$@"; }
 
 otmux.session.rename() # <session> <?newName> # rename session; 1 arg=current, 2 args=named
 {
@@ -168,6 +206,7 @@ otmux.session.rename() # <session> <?newName> # rename session; 1 arg=current, 2
   # Notify hiveMind to update env files (observer pattern)
   command -v hiveMind >/dev/null 2>&1 && hiveMind protected.session.renamed "$oldName" "$newName" 2>/dev/null
 }
+otmux.session.rename.completion.session() { otmux.parameter.completion.session "$@"; }
 
 otmux.switch() # <target> # switch to session; target=session name or $id
 {
@@ -314,34 +353,57 @@ private.otmux.respawnWindow() # <?command> # respawn window with command
 # PANE COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
+private.otmux.notifyHiveMind.shifted() { # <session> # observer callback after split/insert (per B5 PUML spec)
+  # B5.1 — View notifies Controller after pane indices may have shifted.
+  # Maps to architecture diagram: protected.panes.shifted <session>
+  local sess="${1:-}"
+  [ -z "$sess" ] && sess=$($TMUX_CMD display-message -p '#{session_name}' 2>/dev/null)
+  [ -z "$sess" ] && return 0
+  command -v hiveMind >/dev/null 2>&1 && hiveMind protected.panes.shifted "$sess" 2>/dev/null
+}
+
+private.otmux.sessionFromPane() { # <pane> # extract session name from session:window.pane target
+  local pane="$1"
+  echo "${pane%%:*}"
+}
+
 otmux.split() # <?target> <?command> # split current pane (or target pane)
 {
+  local sess
   if [[ "$1" == *[:.]*  ]] && [ -n "$1" ]; then
     local target="$1"; shift
+    sess=$(private.otmux.sessionFromPane "$target")
     $TMUX_CMD split-window -t "$target" "$@"
   else
     $TMUX_CMD split-window "$@"
   fi
+  private.otmux.notifyHiveMind.shifted "$sess"
 }
 
 otmux.split.h() # <?target> <?command> # split pane horizontally (side-by-side)
 {
+  local sess
   if [[ "$1" == *[:.]*  ]] && [ -n "$1" ]; then
     local target="$1"; shift
+    sess=$(private.otmux.sessionFromPane "$target")
     $TMUX_CMD split-window -h -t "$target" "$@"
   else
     $TMUX_CMD split-window -h "$@"
   fi
+  private.otmux.notifyHiveMind.shifted "$sess"
 }
 
 otmux.split.v() # <?target> <?command> # split pane vertically (top-bottom)
 {
+  local sess
   if [[ "$1" == *[:.]*  ]] && [ -n "$1" ]; then
     local target="$1"; shift
+    sess=$(private.otmux.sessionFromPane "$target")
     $TMUX_CMD split-window -v -t "$target" "$@"
   else
     $TMUX_CMD split-window -v "$@"
   fi
+  private.otmux.notifyHiveMind.shifted "$sess"
 }
 
 otmux.panes() # # list panes in current window
@@ -507,6 +569,332 @@ private.otmux.prevLayout() # # cycle to previous layout
 {
   $TMUX_CMD previous-layout
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYOUT PERSISTENCE (save / restore across server restart)
+# ─────────────────────────────────────────────────────────────────────────────
+# File format: ~/config/otmux/<session>.layout.env  (env-file, OOSH convention)
+#   OTMUX_LAYOUT_SESSION, OTMUX_LAYOUT_SAVED_AT
+#   OTMUX_LAYOUT_WINDOW_INDICES — space-separated list of window indices
+#   Per window W:
+#     OTMUX_WINDOW_<W>_NAME      — window name
+#     OTMUX_WINDOW_<W>_LAYOUT    — tmux native layout string (#{window_layout})
+#     OTMUX_WINDOW_<W>_PANE_INDICES — space-separated pane indices
+#   Per pane W.P:
+#     OTMUX_WINDOW_<W>_PANE_<P>_TITLE  — pane_title (set via select-pane -T)
+#     OTMUX_WINDOW_<W>_PANE_<P>_CWD    — pane_current_path
+#     OTMUX_WINDOW_<W>_PANE_<P>_CMD    — pane_current_command (info only)
+#
+# Agnostic to agents — purely geometry + labels. Controller (hiveMind) composes
+# layout.restore + content restoration (claude relaunch, role re-teaching, etc.)
+
+: ${OTMUX_LAYOUT_DIR:=${CONFIG_PATH:-$HOME/config}/otmux}
+
+otmux.layout.save() # <session> # serialize session layout (windows, panes, titles, cwds) to file
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.save <session>"
+    return 1
+  fi
+  if ! $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+    error.log "no tmux session: $session"
+    return 1
+  fi
+
+  mkdir -p "$OTMUX_LAYOUT_DIR"
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+
+  {
+    echo "# otmux layout for session: $session"
+    echo "# saved: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "OTMUX_LAYOUT_SESSION=\"$session\""
+    echo "OTMUX_LAYOUT_SAVED_AT=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+
+    local winIdxs
+    winIdxs=$($TMUX_CMD list-windows -t "$session" -F '#{window_index}' 2>/dev/null | tr '\n' ' ')
+    echo "OTMUX_LAYOUT_WINDOW_INDICES=\"${winIdxs% }\""
+
+    local w
+    for w in $winIdxs; do
+      local wname wlayout
+      wname=$($TMUX_CMD display-message -p -t "$session:$w" '#{window_name}' 2>/dev/null)
+      wlayout=$($TMUX_CMD display-message -p -t "$session:$w" '#{window_layout}' 2>/dev/null)
+      echo "OTMUX_WINDOW_${w}_NAME=\"${wname//\"/\\\"}\""
+      echo "OTMUX_WINDOW_${w}_LAYOUT=\"${wlayout//\"/\\\"}\""
+
+      local paneIdxs
+      paneIdxs=$($TMUX_CMD list-panes -t "$session:$w" -F '#{pane_index}' 2>/dev/null | tr '\n' ' ')
+      echo "OTMUX_WINDOW_${w}_PANE_INDICES=\"${paneIdxs% }\""
+
+      local p
+      for p in $paneIdxs; do
+        local ptitle pcwd pcmd
+        ptitle=$($TMUX_CMD display-message -p -t "$session:$w.$p" '#{pane_title}' 2>/dev/null)
+        pcwd=$($TMUX_CMD display-message -p -t "$session:$w.$p" '#{pane_current_path}' 2>/dev/null)
+        pcmd=$($TMUX_CMD display-message -p -t "$session:$w.$p" '#{pane_current_command}' 2>/dev/null)
+        echo "OTMUX_WINDOW_${w}_PANE_${p}_TITLE=\"${ptitle//\"/\\\"}\""
+        echo "OTMUX_WINDOW_${w}_PANE_${p}_CWD=\"${pcwd//\"/\\\"}\""
+        echo "OTMUX_WINDOW_${w}_PANE_${p}_CMD=\"${pcmd//\"/\\\"}\""
+      done
+    done
+  } > "$file"
+
+  success.log "Layout saved: $file"
+  RESULT="$file"
+  echo "$file"
+}
+otmux.layout.save.completion.session() { otmux.parameter.completion.session "$@"; }
+
+otmux.layout.restore() # <session> <?force> # recreate session layout from saved file (force value: --force to overwrite existing)
+{
+  local session="$1"
+  local force="${2:-}"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.restore <session> <?--force>"
+    return 1
+  fi
+
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+  if [ ! -f "$file" ]; then
+    error.log "no layout file: $file"
+    return 1
+  fi
+
+  # Guard: refuse to overwrite an existing session unless --force
+  if $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+    if [ "$force" != "--force" ]; then
+      error.log "session '$session' already exists — pass --force to apply layout anyway"
+      return 1
+    fi
+    warn.log "session '$session' exists — applying saved layout with --force"
+  fi
+
+  # Source env file in a subshell scope to read vars
+  source "$file"
+
+  # Create session with first window + pane if missing
+  if ! $TMUX_CMD has-session -t "$session" 2>/dev/null; then
+    $TMUX_CMD new-session -d -s "$session"
+    info.log "created session: $session"
+  fi
+
+  local w
+  for w in $OTMUX_LAYOUT_WINDOW_INDICES; do
+    local wname_var="OTMUX_WINDOW_${w}_NAME"
+    local wlayout_var="OTMUX_WINDOW_${w}_LAYOUT"
+    local pane_idx_var="OTMUX_WINDOW_${w}_PANE_INDICES"
+    local wname="${!wname_var}"
+    local wlayout="${!wlayout_var}"
+    local pane_indices="${!pane_idx_var}"
+
+    # Ensure window exists
+    if ! $TMUX_CMD list-windows -t "$session" -F '#{window_index}' 2>/dev/null | grep -q "^${w}$"; then
+      $TMUX_CMD new-window -t "$session:$w" -n "$wname" 2>/dev/null
+    else
+      $TMUX_CMD rename-window -t "$session:$w" "$wname" 2>/dev/null
+    fi
+
+    # Create panes to match saved count. Starting with 1 (from new-window/new-session),
+    # split-window N-1 times. Direction doesn't matter — select-layout reshapes.
+    local needed existing to_create
+    needed=$(echo "$pane_indices" | wc -w | tr -d ' ')
+    existing=$($TMUX_CMD list-panes -t "$session:$w" 2>/dev/null | wc -l | tr -d ' ')
+    to_create=$((needed - existing))
+    while [ "$to_create" -gt 0 ]; do
+      $TMUX_CMD split-window -t "$session:$w" 2>/dev/null
+      to_create=$((to_create - 1))
+    done
+
+    # Apply tmux-native layout string — reshapes to exact saved geometry
+    if [ -n "$wlayout" ]; then
+      $TMUX_CMD select-layout -t "$session:$w" "$wlayout" 2>/dev/null
+    fi
+
+    # Restore pane titles (one-shot; for persistent title use otmux pane.lock)
+    local p
+    for p in $pane_indices; do
+      local title_var="OTMUX_WINDOW_${w}_PANE_${p}_TITLE"
+      local title="${!title_var}"
+      if [ -n "$title" ]; then
+        $TMUX_CMD select-pane -t "$session:$w.$p" -T "$title" 2>/dev/null
+      fi
+    done
+  done
+
+  success.log "Layout restored for session '$session' from $file"
+}
+otmux.layout.restore.completion.session() {
+  [ -d "$OTMUX_LAYOUT_DIR" ] || return 0
+  local f
+  for f in "$OTMUX_LAYOUT_DIR"/*.layout.env; do
+    [ -f "$f" ] || continue
+    basename "$f" .layout.env
+  done
+}
+otmux.layout.restore.completion.force() { echo "--force"; }
+
+otmux.layout.list() # # list all saved layouts
+{
+  if [ ! -d "$OTMUX_LAYOUT_DIR" ]; then
+    info.log "no saved layouts (dir: $OTMUX_LAYOUT_DIR)"
+    return 0
+  fi
+  printf "%-30s %-22s %s\n" "SESSION" "SAVED" "FILE"
+  local f
+  for f in "$OTMUX_LAYOUT_DIR"/*.layout.env; do
+    [ -f "$f" ] || continue
+    local name saved
+    name=$(basename "$f" .layout.env)
+    saved=$(grep -oE 'OTMUX_LAYOUT_SAVED_AT="[^"]*"' "$f" | head -1 | sed 's/OTMUX_LAYOUT_SAVED_AT="//;s/"//')
+    printf "%-30s %-22s %s\n" "$name" "${saved:-unknown}" "$f"
+  done
+}
+otmux.layout.list.completion() { :; }
+
+otmux.layout.delete() # <session> # remove a saved layout file
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.delete <session>"
+    return 1
+  fi
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+  if [ ! -f "$file" ]; then
+    warn.log "no layout file for: $session"
+    return 1
+  fi
+  rm "$file"
+  success.log "deleted: $file"
+}
+otmux.layout.delete.completion.session() {
+  [ -d "$OTMUX_LAYOUT_DIR" ] || return 0
+  local f
+  for f in "$OTMUX_LAYOUT_DIR"/*.layout.env; do
+    [ -f "$f" ] || continue
+    basename "$f" .layout.env
+  done
+}
+
+otmux.layout.show() # <session> # display the saved layout file for a session
+{
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "usage: otmux layout.show <session>"
+    return 1
+  fi
+  local file="$OTMUX_LAYOUT_DIR/$session.layout.env"
+  if [ ! -f "$file" ]; then
+    error.log "no layout file: $file"
+    return 1
+  fi
+  cat "$file"
+}
+otmux.layout.show.completion.session() {
+  otmux.layout.delete.completion.session
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WINDOW LAYOUT — runtime getter/setter (B2 layout.save/restore is file-based;
+# these are for in-memory layout-spec manipulation: clone one session's geometry
+# onto another, snapshot for inspection, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+otmux.window.layout.get() # <?target> # return tmux layout-spec string for a window (default: current)
+{
+  # Returns the opaque layout-spec tmux uses internally — encodes pane geometry
+  # (positions + dimensions) plus pane IDs. Callers can pass the result to
+  # otmux.window.layout.set to clone the layout onto a different session.
+  local target="${1:-}"
+  if [ -n "$target" ]; then
+    $TMUX_CMD display-message -t "$target" -p '#{window_layout}' 2>/dev/null
+  else
+    $TMUX_CMD display-message -p '#{window_layout}' 2>/dev/null
+  fi
+}
+otmux.window.layout.get.completion.target() { private.complete.windows; }
+
+otmux.window.layout.set() # <target> <spec> # apply a literal tmux layout-spec to a window
+{
+  # Companion to layout.get. Use case: clone geometry between sessions:
+  #   spec=$(otmux window.layout.get sourceTeam:0)
+  #   otmux window.layout.set targetTeam:0 "$spec"
+  # Pane IDs in the spec must reference panes that EXIST in the target window —
+  # tmux fails silently otherwise. Same-shape windows (same pane count) work
+  # cleanly; cross-shape requires creating panes first.
+  local target="$1"
+  local spec="$2"
+  if [ -z "$target" ] || [ -z "$spec" ]; then
+    error.log "Usage: otmux window.layout.set <target> <spec>"
+    return 1
+  fi
+  $TMUX_CMD select-layout -t "$target" "$spec" 2>/dev/null
+}
+otmux.window.layout.set.completion.target() { private.complete.windows; }
+
+otmux.window.aggressive.resize() # <target> <?value:on> # toggle aggressive-resize on a window (auto-rebalance panes on attach)
+{
+  # `aggressive-resize on` makes a window's panes rebalance proportionally
+  # whenever the window dimensions change (e.g. when a different-sized client
+  # attaches). Without it, panes stay at their last computed sizes and may
+  # leave dead space or clip. Used in B8/restore flows to ensure restored
+  # sessions adapt to any viewer's terminal.
+  local target="$1"
+  local value="${2:-on}"
+  if [ -z "$target" ]; then
+    error.log "Usage: otmux window.aggressive.resize <target> <?value:on>"
+    return 1
+  fi
+  case "$value" in
+    on|off) ;;
+    *) error.log "value must be 'on' or 'off' (got: $value)"; return 1 ;;
+  esac
+  $TMUX_CMD set-window-option -t "$target" aggressive-resize "$value" 2>/dev/null
+}
+otmux.window.aggressive.resize.completion.target() { private.complete.windows; }
+otmux.window.aggressive.resize.completion.value() { echo "on"; echo "off"; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIST with custom format — programmatic queries
+# tmux list-panes/list-windows accept -F format strings; otmux.panes/.windows
+# use a fixed format. These let scripts query arbitrary fields.
+# ─────────────────────────────────────────────────────────────────────────────
+
+otmux.pane.list.format() # <format> <?target> # list panes with custom -F format string
+{
+  # Wrapper for `tmux list-panes -F <format>`. Default scope: -a (all sessions)
+  # if <?target> omitted; otherwise restricted to the target.
+  # Example: otmux pane.list.format '#{pane_index} #{pane_width}x#{pane_height}' ooshTeam
+  local format="$1"
+  local target="${2:-}"
+  if [ -z "$format" ]; then
+    error.log "Usage: otmux pane.list.format <format> <?target>"
+    return 1
+  fi
+  if [ -n "$target" ]; then
+    $TMUX_CMD list-panes -t "$target" -s -F "$format" 2>/dev/null
+  else
+    $TMUX_CMD list-panes -a -F "$format" 2>/dev/null
+  fi
+}
+
+otmux.window.list.format() # <format> <?session> # list windows with custom -F format
+{
+  # Wrapper for `tmux list-windows -F <format>`. Default scope: -a (all
+  # sessions); restrict by passing <?session>.
+  local format="$1"
+  local session="${2:-}"
+  if [ -z "$format" ]; then
+    error.log "Usage: otmux window.list.format <format> <?session>"
+    return 1
+  fi
+  if [ -n "$session" ]; then
+    $TMUX_CMD list-windows -t "$session" -F "$format" 2>/dev/null
+  else
+    $TMUX_CMD list-windows -a -F "$format" 2>/dev/null
+  fi
+}
+otmux.window.list.format.completion.session() { private.complete.sessions; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUFFER COMMANDS
@@ -754,7 +1142,7 @@ otmux.config.reset() # # reset tmux config to default (overwrites existing)
 # SETUP — apply defaults to running server
 # ─────────────────────────────────────────────────────────────────────────────
 
-otmux.setup.default() # # apply sensible defaults to running server (pane headers, clipboard, mouse)
+otmux.setup.default() # # apply sensible defaults to running server (pane headers, clipboard, mouse, window-size)
 {
   # Pane title headers — show agent name at top, bold if active
   $TMUX_CMD set -g pane-border-status top
@@ -768,14 +1156,326 @@ otmux.setup.default() # # apply sensible defaults to running server (pane header
   $TMUX_CMD set -g history-limit 50000
   $TMUX_CMD set -g renumber-windows on
 
+  # window-size=largest — keep the geometry of the largest attached client
+  # (smaller clients scroll). Without this, tron + agent attach causes the smaller
+  # of the two to dictate window dimensions, often shrinking team layouts to 0-width
+  # panes. MANDATORY for multi-client team sessions. Requires tmux 2.9+.
+  $TMUX_CMD set -g window-size largest 2>/dev/null
+
+  # aggressive-resize=on — window-level safety net for the same multi-client
+  # scenario. Helps in edge cases where two clients attach with different
+  # geometries (only the active window resizes to the focused client).
+  $TMUX_CMD setw -g aggressive-resize on 2>/dev/null
+
   # OS-independent clipboard
   private.otmux.setup.clipboard
 
-  success.log "defaults applied to running server"
+  success.log "defaults applied to running server (incl. window-size=largest)"
 }
 
-private.otmux.setup.clipboard() # # detect OS and configure clipboard bindings
+otmux.window.size() # <?value:largest> # set server-wide window-size (largest|smallest|latest|manual)
 {
+  # Convenience for adjusting after setup.default. Useful when:
+  #   • Forcing latest/manual for testing or single-client sessions
+  #   • Re-applying largest if tmux config drift occurred
+  # Required for tronMonitor safety (see B4.2). Idempotent — safe to call repeatedly.
+  local value="${1:-largest}"
+  case "$value" in
+    largest|smallest|latest|manual) ;;
+    *) error.log "Invalid window-size: $value (use largest|smallest|latest|manual)"; return 1 ;;
+  esac
+  $TMUX_CMD set -g window-size "$value"
+  success.log "window-size set to: $value"
+}
+otmux.window.size.completion.value() {
+  echo "largest"
+  echo "smallest"
+  echo "latest"
+  echo "manual"
+}
+
+# ── window.size floor: prevent 0×0 collapse in unattached sessions (B8) ────────
+#
+# When window-size=largest is set (server default since B4.2) and NO clients are
+# attached, tmux has no client geometry to size against — windows collapse to
+# 1×1. This makes background/restored agents unreadable until a client attaches.
+#
+# Lock mechanism: per-window switch to window-size=manual + resize-window to a
+# floor (default 80×40). Persistence in OTMUX_SIZE_LOCKS so we know which windows
+# are user-locked vs server-default. Unlock = revert to largest.
+#
+# Lock semantics (per PO decision, Option A): explicit unlock only. Real-client
+# attach does NOT auto-unlock. Predictable + follows OOSH explicit > implicit.
+
+: ${OTMUX_SIZE_LOCKS:=${CONFIG_PATH:-$HOME/config}/otmux.size.locks.env}
+: ${OTMUX_SIZE_FLOOR_W:=80}
+: ${OTMUX_SIZE_FLOOR_H:=40}
+
+private.otmux.size.lock.set() { # <session:win> <width> <height> # upsert lock entry
+  local key="$1" w="$2" h="$3"
+  [ -z "$key" ] || [ -z "$w" ] || [ -z "$h" ] && return 1
+  mkdir -p "$(dirname "$OTMUX_SIZE_LOCKS")" 2>/dev/null
+  touch "$OTMUX_SIZE_LOCKS"
+  # Atomic upsert via awk — fully literal match, immune to regex metachars in
+  # session names (orphan tmux sessions can have escape codes / brackets in
+  # their name; bug #1 fix).
+  awk -v k="${key}|" 'substr($0, 1, length(k)) != k' "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
+  mv "${OTMUX_SIZE_LOCKS}.tmp" "$OTMUX_SIZE_LOCKS"
+  echo "${key}|${w}|${h}|$(date +%s)" >> "$OTMUX_SIZE_LOCKS"
+}
+
+private.otmux.size.lock.remove() { # <session:win> # delete lock entry (literal-match, regex-safe)
+  local key="$1"
+  [ -z "$key" ] && return 1
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
+  awk -v k="${key}|" 'substr($0, 1, length(k)) != k' "$OTMUX_SIZE_LOCKS" > "${OTMUX_SIZE_LOCKS}.tmp" 2>/dev/null
+  mv "${OTMUX_SIZE_LOCKS}.tmp" "$OTMUX_SIZE_LOCKS"
+}
+
+private.otmux.size.lock.has() { # <session:win> # 0 if locked, 1 otherwise (literal-match)
+  local key="$1"
+  [ -z "$key" ] && return 1
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 1
+  awk -v k="${key}|" 'substr($0, 1, length(k)) == k {found=1; exit} END {exit !found}' "$OTMUX_SIZE_LOCKS"
+}
+
+private.otmux.size.lock.list() { # <?session> # list locked window keys (optionally filtered to session)
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
+  local sess="${1:-}"
+  if [ -n "$sess" ]; then
+    # Literal prefix match: session-name + ':'
+    awk -v p="${sess}:" 'substr($0, 1, length(p)) == p' "$OTMUX_SIZE_LOCKS" 2>/dev/null | cut -d'|' -f1
+  else
+    cut -d'|' -f1 "$OTMUX_SIZE_LOCKS" 2>/dev/null
+  fi
+}
+
+private.otmux.size.lock.cleanup() { # # drop entries whose session no longer exists
+  [ -f "$OTMUX_SIZE_LOCKS" ] || return 0
+  local kept="" key w h ts sess
+  while IFS='|' read -r key w h ts; do
+    [ -z "$key" ] && continue
+    sess="${key%%:*}"
+    if $TMUX_CMD has-session -t "$sess" 2>/dev/null; then
+      kept="${kept}${key}|${w}|${h}|${ts}"$'\n'
+    fi
+  done < "$OTMUX_SIZE_LOCKS"
+  printf '%s' "$kept" > "$OTMUX_SIZE_LOCKS"
+}
+
+# ── Shorter verb aliases for size ops — operate on current session by default ─
+# `otmux size.unlock` is faster to type than `otmux window.size.unlock`.
+# No args → resolve current tmux session from TMUX_PANE.
+
+private.otmux.size.currentSession() { # # echo current tmux session name or empty
+  [ -z "$TMUX_PANE" ] && return 1
+  $TMUX_CMD display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null
+}
+
+otmux.size.unlock() # <?session> # shorter alias — defaults to current session
+{
+  local s="${1:-$(private.otmux.size.currentSession)}"
+  [ -z "$s" ] && { error.log "size.unlock: no session given and not running in tmux"; return 1; }
+  otmux.window.size.unlock "$s"
+  $TMUX_CMD set-window-option -t "${s}:" aggressive-resize on 2>/dev/null
+  info.log "size.unlock: $s now dynamic (window-size=largest + aggressive-resize=on)"
+}
+otmux.size.unlock.completion.session() { private.complete.sessions; }
+
+otmux.size.lock() # <?session> <?width:80> <?height:40> # shorter alias for window.size.lock on current session
+{
+  local s="${1:-$(private.otmux.size.currentSession)}"
+  [ -z "$s" ] && { error.log "size.lock: no session given and not running in tmux"; return 1; }
+  shift 2>/dev/null
+  otmux.window.size.lock "$s" "$@"
+}
+otmux.size.lock.completion.session() { private.complete.sessions; }
+
+otmux.size.status() # # shorter alias for window.size.status
+{
+  otmux.window.size.status "$@"
+}
+
+otmux.fit() # <?session> # resize session window to caller's terminal cols×rows (snaps to current client)
+{
+  # Reads the calling client's terminal dimensions via display-message and
+  # applies them to the session's window. Pairs with size.unlock (=largest)
+  # for multi-client setups: fit gives a one-shot snap to *your* terminal,
+  # unlock returns to follow-largest behavior on next attach event.
+  # `resize-window -x -y` implicitly sets window-size=manual on the window;
+  # follow with `otmux size.unlock` to return to dynamic-largest.
+  [ -z "$TMUX_PANE" ] && { error.log "fit: not running in tmux (TMUX_PANE empty)"; return 1; }
+  local session="${1:-$(private.otmux.size.currentSession)}"
+  this.isSessionName "$session" || { error.log "fit: invalid session '$session'"; return 1; }
+  otmux has "$session" 2>/dev/null || { error.log "fit: '$session' is not a live tmux session"; return 1; }
+  # Caller's client dims — display-message defaults to the most-recently
+  # active client for the session containing TMUX_PANE. That IS the caller
+  # in interactive use (they just typed the command, so they're most recent).
+  local W H
+  W=$($TMUX_CMD display-message -p -t "$TMUX_PANE" '#{client_width}' 2>/dev/null)
+  H=$($TMUX_CMD display-message -p -t "$TMUX_PANE" '#{client_height}' 2>/dev/null)
+  if ! [[ "$W" =~ ^[0-9]+$ ]] || ! [[ "$H" =~ ^[0-9]+$ ]]; then
+    error.log "fit: cannot read caller client dimensions ($W x $H)"
+    return 1
+  fi
+  $TMUX_CMD resize-window -t "$session" -x "$W" -y "$H" 2>/dev/null
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "fit: $session → ${W}x${H} (caller terminal)"
+  else
+    error.log "fit: resize-window failed (rc=$rc) for $session at ${W}x${H}"
+  fi
+  return $rc
+}
+otmux.fit.completion.session() { private.complete.sessions; }
+
+otmux.window.size.lock() # <?session> <?width:80> <?height:40> # enforce floor + lock window-size=manual
+{
+  # Iterates windows in <?session> (or all sessions if omitted). Skips windows
+  # already wider AND taller than floor — never shrinks. Locks each modified
+  # window via window-size=manual + resize-window. Persists to OTMUX_SIZE_LOCKS.
+  # Idempotent: re-running on already-locked windows is a no-op.
+  local session="${1:-}"
+  local w="${2:-$OTMUX_SIZE_FLOOR_W}"
+  local h="${3:-$OTMUX_SIZE_FLOOR_H}"
+
+  local fmt='#{session_name}:#{window_index}|#{window_width}|#{window_height}'
+  local listArgs=()
+  if [ -n "$session" ]; then
+    $TMUX_CMD has-session -t "$session" 2>/dev/null || {
+      error.log "no such session: $session"
+      return 1
+    }
+    listArgs=(-t "$session")
+  else
+    listArgs=(-a)
+  fi
+
+  local locked=0 skipped=0
+  local line key cw ch
+  while IFS='|' read -r key cw ch; do
+    [ -z "$key" ] && continue
+    if [ "${cw:-0}" -ge "$w" ] && [ "${ch:-0}" -ge "$h" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    $TMUX_CMD set-window-option -t "$key" window-size manual 2>/dev/null
+    $TMUX_CMD resize-window -t "$key" -x "$w" -y "$h" 2>/dev/null
+    private.otmux.size.lock.set "$key" "$w" "$h"
+    locked=$((locked + 1))
+  done < <($TMUX_CMD list-windows "${listArgs[@]}" -F "$fmt" 2>/dev/null)
+
+  success.log "size.lock — $locked locked at ${w}×${h}, $skipped already ≥ floor"
+}
+otmux.window.size.lock.completion.session() { private.complete.sessions; }
+
+otmux.window.size.unlock() # <?session> # restore window-size=largest on locked windows
+{
+  # Reverts session windows (or all locked windows server-wide) to dynamic
+  # sizing. Removes persistence entries. Idempotent.
+  local session="${1:-}"
+  local unlocked=0
+  local key
+  while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    $TMUX_CMD set-window-option -t "$key" window-size largest 2>/dev/null
+    private.otmux.size.lock.remove "$key"
+    unlocked=$((unlocked + 1))
+  done < <(private.otmux.size.lock.list "$session")
+
+  success.log "size.unlock — $unlocked windows reverted to dynamic"
+}
+otmux.window.size.unlock.completion.session() { private.complete.sessions; }
+
+otmux.window.size.status() # # tabular: SESSION:WINDOW SIZE LOCKED CLIENTS — collapsed=red, locked=yellow, small=cyan, healthy=green
+{
+  # First age out stale lock entries (sessions that no longer exist)
+  private.otmux.size.lock.cleanup
+
+  printf "  %-40s %-12s %-8s %s\n" "SESSION:WINDOW" "SIZE" "LOCKED" "CLIENTS"
+  printf "  %-40s %-12s %-8s %s\n" "─────────────────────" "──────" "──────" "───────"
+
+  # Build client-by-session map first (one tmux call instead of per-row).
+  # Use #{session_attached} from list-sessions — more reliable than parsing
+  # list-clients (which may not see clients attached via switch-client).
+  local attachedBySess
+  attachedBySess=$($TMUX_CMD list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null)
+
+  local fmt='#{session_name}:#{window_index}|#{window_width}|#{window_height}'
+  local key cw ch sess clients locked color marker
+  while IFS='|' read -r key cw ch; do
+    [ -z "$key" ] && continue
+    sess="${key%%:*}"
+    # Lookup attached count for this session via literal awk match
+    clients=$(echo "$attachedBySess" | awk -F'|' -v s="$sess" '$1==s{print $2}')
+    [ -z "$clients" ] && clients=0
+
+    locked="no"
+    private.otmux.size.lock.has "$key" && locked="yes"
+
+    # Classification (bug #2 fix):
+    #   COLLAPSED (red) — below floor AND no clients attached. Truly broken.
+    #   SMALL     (cyan)— below floor but client attached. User has a small
+    #                     terminal — that's their choice, not a bug.
+    #   LOCKED    (yellow) — explicit window-size=manual via lock command
+    #   HEALTHY   (green) — at-or-above floor, no lock
+    color="${BOLD_GREEN}"
+    marker=""
+    local belowFloor=false
+    if [ "${cw:-0}" -lt "$OTMUX_SIZE_FLOOR_W" ] || [ "${ch:-0}" -lt "$OTMUX_SIZE_FLOOR_H" ]; then
+      belowFloor=true
+    fi
+    if [ "$belowFloor" = true ] && [ "${clients:-0}" -eq 0 ]; then
+      color="${BOLD_RED}"
+      marker=" [collapsed]"
+    elif [ "$belowFloor" = true ]; then
+      color="${BOLD_CYAN}"
+      marker=" [small client]"
+    elif [ "$locked" = "yes" ]; then
+      color="${BOLD_YELLOW}"
+    fi
+
+    printf "  %s%-40s${NORMAL} %-12s %-8s %s%s\n" \
+      "$color" "$key" "${cw}×${ch}" "$locked" "$clients" "$marker"
+  done < <($TMUX_CMD list-windows -a -F "$fmt" 2>/dev/null)
+}
+otmux.window.size.status.completion() { :; }
+
+otmux.window.size.floor.apply() # <?width:80> <?height:40> # sweep all UNATTACHED collapsed sessions; lock at floor — idempotent self-heal
+{
+  # Cron-friendly self-healing: find every UNATTACHED session whose windows are
+  # below the floor, lock at floor. Sessions with ≥1 client are skipped — their
+  # client is sizing them (even if smaller than floor, that's the user's choice).
+  # For explicit per-session locking regardless of client state, use window.size.lock.
+  local w="${1:-$OTMUX_SIZE_FLOOR_W}"
+  local h="${2:-$OTMUX_SIZE_FLOOR_H}"
+  local locked=0 skipped_attached=0 skipped_ok=0
+
+  local sess attached cw ch
+  while IFS='|' read -r sess attached; do
+    [ -z "$sess" ] && continue
+    if [ "${attached:-0}" -gt 0 ]; then
+      skipped_attached=$((skipped_attached + 1))
+      continue
+    fi
+    # Run lock for this session — it skips already-floored windows internally
+    local before
+    before=$(otmux.window.size.lock "$sess" "$w" "$h" 2>&1 | grep -oE '[0-9]+ locked' | grep -oE '[0-9]+')
+    locked=$((locked + ${before:-0}))
+  done < <($TMUX_CMD list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null)
+
+  success.log "floor.apply — $locked windows locked at ${w}×${h} (skipped attached sessions)"
+}
+otmux.window.size.floor.apply.completion() { :; }
+
+private.otmux.setup.clipboard() # # detect OS/SSH and configure clipboard bindings
+{
+  # Remote session: use OSC 52 so copy reaches the LOCAL machine's clipboard.
+  # pbcopy/xclip on the remote box would write to the remote clipboard (useless).
+  if [ -n "$SSH_CONNECTION" ] || [ -n "$SSH_TTY" ] || [ -n "$SSH_CLIENT" ]; then
+    private.otmux.setup.clipboard.osc52
+    return
+  fi
   source "$OOSH_DIR/os"
   if os.check private.otmux.setup.clipboard; then
     $RESULT
@@ -784,14 +1484,14 @@ private.otmux.setup.clipboard() # # detect OS and configure clipboard bindings
   fi
 }
 
-private.otmux.setup.clipboard.darwin() # # macOS clipboard via pbcopy/pbpaste
+private.otmux.setup.clipboard.darwin() # # macOS clipboard via pbcopy/pbpaste (local session)
 {
   local copyCmd="pbcopy"
   local pasteCmd="pbpaste"
   private.otmux.setup.clipboard.apply "$copyCmd" "$pasteCmd"
 }
 
-private.otmux.setup.clipboard.linux() # # Linux clipboard via xclip, xsel, or termux
+private.otmux.setup.clipboard.linux() # # Linux clipboard via xclip, xsel, or termux (local session)
 {
   local copyCmd="" pasteCmd=""
   if command -v xclip &>/dev/null; then
@@ -810,7 +1510,34 @@ private.otmux.setup.clipboard.linux() # # Linux clipboard via xclip, xsel, or te
   private.otmux.setup.clipboard.apply "$copyCmd" "$pasteCmd"
 }
 
-private.otmux.setup.clipboard.apply() # <copyCmd> <pasteCmd> # bind tmux copy/paste to OS clipboard
+private.otmux.setup.clipboard.osc52() # # OSC 52 mode — tmux → terminal → LOCAL clipboard (for SSH sessions)
+{
+  # tmux emits OSC 52 escape sequences; the user's LOCAL terminal (iTerm2,
+  # WezTerm, kitty, modern Terminal.app) intercepts and writes to the local
+  # clipboard. No remote helper needed. Works through ssh transparently.
+  #
+  # Requires on the local terminal:
+  #   iTerm2:       Preferences → General → Selection → "Applications in
+  #                 terminal may access clipboard" = ON
+  #   WezTerm:      on by default
+  #   kitty:        clipboard_control write-clipboard write-primary (default)
+  #   Terminal.app: OSC 52 support is limited; use iTerm2 if possible
+  #
+  $TMUX_CMD set -g set-clipboard on            # tmux emits OSC 52 on copy
+  $TMUX_CMD set -g allow-passthrough on 2>/dev/null  # tmux 3.3+ (nested sessions)
+  $TMUX_CMD bind -T copy-mode-vi v send-keys -X begin-selection
+  # No external copy command — tmux uses set-clipboard=on to emit OSC 52
+  $TMUX_CMD bind -T copy-mode-vi y send-keys -X copy-selection-and-cancel
+  $TMUX_CMD bind -T copy-mode-vi Enter send-keys -X copy-selection-and-cancel
+  $TMUX_CMD bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel
+  # Paste: local clipboard → terminal types it → tmux receives it naturally.
+  # No tmux binding needed for paste — user presses Cmd+V in local terminal.
+  # For paste from tmux's own buffer, keep the default prefix + ] binding.
+
+  info.log "clipboard: OSC 52 mode (remote-aware). Paste via local Cmd+V."
+}
+
+private.otmux.setup.clipboard.apply() # <copyCmd> <pasteCmd> # bind tmux copy/paste to OS clipboard (local session)
 {
   local copyCmd="$1"
   local pasteCmd="$2"
@@ -823,6 +1550,22 @@ private.otmux.setup.clipboard.apply() # <copyCmd> <pasteCmd> # bind tmux copy/pa
   $TMUX_CMD bind p run "$pasteCmd | tmux load-buffer - && tmux paste-buffer"
 
   info.log "clipboard: using $copyCmd / $pasteCmd"
+}
+
+otmux.setup.clipboard.remote() # # force OSC 52 (remote-aware) clipboard mode — for SSH sessions
+{
+  private.otmux.setup.clipboard.osc52
+}
+
+otmux.setup.clipboard.local() # # force local pbcopy/xclip clipboard mode
+{
+  source "$OOSH_DIR/os"
+  if os.check private.otmux.setup.clipboard; then
+    $RESULT
+  else
+    important.log "clipboard: unsupported OS ($OSTYPE)"
+    return 1
+  fi
 }
 
 otmux.install() # # install tmux via oo cmd and initialize config
@@ -921,6 +1664,11 @@ otmux.send.raw() # <target> <keys> # raw send keys to pane; target=pane id, inde
 {
   local target=$(private.resolve.target "$1")
   shift
+  # Bug #4 defense: validate target format BEFORE send-keys
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.raw: invalid pane target '$target' — refusing to send"
+    return 1
+  fi
   # Detect trailing Enter — add delay for TUI apps like Claude Code.
   # Without delay, the TUI receives Enter before processing the text.
   local last=""
@@ -942,6 +1690,11 @@ otmux.send.key() # <target> <key> <?count:1> # send key N times to pane; key=Lef
 
   if [ -z "$target" ] || [ -z "$key" ]; then
     error.log "usage: otmux send.key <target> <key> <?count>"
+    return 1
+  fi
+  # Bug #4 defense: validate target format
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.key: invalid pane target '$target' — refusing to send"
     return 1
   fi
 
@@ -992,8 +1745,20 @@ otmux.send.verified() # <target> <text> <?timeout:3> # send text to pane and ver
     local text="$2"
     local timeout="${3:-3}"
 
-    if [ -z "$target" ] || [ -z "$text" ]; then
+    if [ -z "$target" ]; then
         error.log "usage: otmux send.verified <target> <text> <?timeout>"
+        return 1
+    fi
+    # Tron P0: empty/whitespace text is a silent no-op (prefix-only message
+    # leaks into Claude TUIs as a prompt — agents hallucinate tasks). Shared
+    # this.isEmpty predicate.
+    if this.isEmpty "$text"; then
+        debug.log "send.verified: empty/whitespace-only text — silent no-op (target=$target)"
+        return 0
+    fi
+    # Bug #4 defense: validate target format
+    if ! private.otmux.target.isPane "$target"; then
+        error.log "otmux.send.verified: invalid pane target '$target' — refusing to send"
         return 1
     fi
 
@@ -1033,16 +1798,73 @@ otmux.send.verified() # <target> <text> <?timeout:3> # send text to pane and ver
 }
 
 private.otmux.send.prefix() # # return sender prefix [@role pane] or empty string
+# Reads role from the hivemind registry (single source of truth) — never from
+# HIVEMIND_ROLE env var, which is set once at shell start and goes stale after
+# pane swaps/moves/renames. Per PO directive (Tron P0, 2026-05-12): the registry
+# is the ground truth; env reads here cause stale role leakage.
+#
+# Self-pane resolution MUST use $TMUX_PANE (Tron P0 #3, 2026-05-12 LATE):
+# `otmux send` runs as a subprocess. A bare `tmux display-message -p` (no -t)
+# returns the FOCUSED pane — i.e. wherever the user last clicked — NOT the
+# caller's pane. tmux exports TMUX_PANE=%N to every pane's child processes,
+# so the subprocess inherits its caller's pane id reliably. Pass it as -t
+# to display-message to get the canonical session:win.pane format used in the
+# registry. Without this, prefix has been wrong in production for everything
+# routed through subprocess `otmux send` calls.
 {
   local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -z "$TMUX_PANE" ] && return   # not running under tmux (CI/script) → no prefix
   local myPane
-  myPane=$($TMUX_CMD display-message -p "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+  myPane=$($TMUX_CMD display-message -p -t "$TMUX_PANE" "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
   [ -z "$myPane" ] && return
-  local myRole="${HIVEMIND_ROLE:-}"
-  if [ -z "$myRole" ] && [ -f "$reg" ]; then
-    myRole=$(grep "^${myPane}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
-  fi
+  [ -f "$reg" ] || return
+  local myRole
+  myRole=$(grep "^${myPane}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
   [ -n "$myRole" ] && echo "[@${myRole} ${myPane}] "
+}
+
+private.otmux.is.key() # <token> # 0 if token is a tmux key name (no prefix), 1 if prose
+{
+  # SINGLE SOURCE OF TRUTH for key-vs-prose detection. Called by otmux.send to
+  # decide whether to apply the sender prefix. Per PO directive (2026-05-12,
+  # Tron P0): prefix is for INFORM-path prose ONLY; every key send must be
+  # prefix-free. Detection covers:
+  #   1. Any single non-whitespace char (digits, letters, punctuation)
+  #   2. Named tmux keys (case-insensitive — covers user typos like 'enter')
+  #   3. Modifier-prefix combinations: C-x, M-x, S-x, C-M-Up, etc.
+  #   4. Plus-syntax shortcuts: Shift+Tab, Ctrl+C, Alt+M
+  local t="$1"
+  [ -z "$t" ] && return 1
+
+  # 1. Single non-whitespace char
+  [[ "$t" =~ ^[^[:space:]]$ ]] && return 0
+
+  # 2. Named tmux keys + common aliases (case-insensitive)
+  local tl="${t,,}"
+  case "$tl" in
+    up|down|left|right|home|end|space|tab|enter|escape|esc) return 0 ;;
+    bspace|backspace|bs|btab|backtab) return 0 ;;
+    dc|delete|del|ic|insert|ins) return 0 ;;
+    ppage|pageup|pgup|npage|pagedown|pgdn|pgdown) return 0 ;;
+    f1|f2|f3|f4|f5|f6|f7|f8|f9|f10|f11|f12) return 0 ;;
+    any) return 0 ;;   # tmux 'Any' keyword
+  esac
+
+  # 3. Modifier-prefix combinations (C/M/S, possibly stacked: C-M-x, C-M-S-x)
+  #    Tail must contain no spaces and no `-` (else collision with modifier).
+  #    For multi-modifier `C-M-Up`, tail is `Up` (no `-`). For combo like
+  #    `C-M-S-BTab`, tail is `BTab`.
+  if [[ "$t" =~ ^([CMS]-){1,3}[^[:space:]-]+$ ]]; then
+    return 0
+  fi
+
+  # 4. Plus-syntax (user-typed style): Shift+Tab, Ctrl+C, Alt+Enter,
+  #    Ctrl+Shift+X (allow up to 3 chained modifiers via plus).
+  if [[ "$t" =~ ^(Shift|Ctrl|Alt|Meta|Cmd|Super)(\+(Shift|Ctrl|Alt|Meta|Cmd|Super)){0,2}\+[^[:space:]]+$ ]]; then
+    return 0
+  fi
+
+  return 1
 }
 
 otmux.send() # <target> <text...> # smart send: auto-detects keys, /commands, text+key combos
@@ -1050,15 +1872,37 @@ otmux.send() # <target> <text...> # smart send: auto-detects keys, /commands, te
   local target=$(private.resolve.target "$1")
   shift
 
-  if [ -z "$target" ] || [ -z "$*" ]; then
+  if [ -z "$target" ]; then
     error.log "usage: otmux send <target> <text...>"
     return 1
   fi
+  # Tron P0 (2026-05-12): empty / whitespace-only payload must be a silent no-op.
+  # Sending bare `[@role pane] ` prefix into a Claude TUI is read as a prompt —
+  # the receiving agent hallucinates a task to satisfy the apparent ask. The
+  # guard must run BEFORE prefix logic, BEFORE key detection, BEFORE any tmux
+  # send call. DRY predicate: this.isEmpty (defined in `this`, available
+  # everywhere via kernel sourcing — same helper used by send.smart,
+  # send.verified, and hiveMind.send family).
+  if this.isEmpty "$*"; then
+    debug.log "otmux.send: empty/whitespace-only payload — silent no-op (target=$target)"
+    return 0
+  fi
+  # Bug #4 defense: validate target format BEFORE any send.
+  # Catches garbage from a failed upstream resolve (e.g. error.log captured into
+  # a target var) before tmux silently sends it to the focused pane.
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send: invalid pane target '$target' — refusing to send"
+    return 1
+  fi
 
-  # Detect trailing tmux key names (Enter, C-u, Tab, etc.)
+  # Detect tmux key tokens (Enter, BTab, C-u, Shift+Tab, single chars, etc.).
+  # Tron P0 (2026-05-12): prefix leaked on '[@role pane] Shift+Tab'. PO rule:
+  # prefix is ONLY for prose to idle agents (INFORM path); ALL key sends — by
+  # any name or modifier syntax — must be prefix-free. DRY: single is_key
+  # helper called from every dispatch case below.
   local last="${@: -1}"
   local is_key=false
-  [[ "$last" =~ ^(Enter|Escape|Tab|Space|BSpace|DC|IC|C-[a-z]|M-[a-z]|Up|Down|Left|Right|Home|End|PPage|NPage|F[0-9]+)$ ]] && is_key=true
+  private.otmux.is.key "$last" && is_key=true
 
   # Case 1: Single key only — raw keypress, no prefix
   if $is_key && [ $# -eq 1 ]; then
@@ -1067,7 +1911,23 @@ otmux.send() # <target> <text...> # smart send: auto-detects keys, /commands, te
   fi
 
   # Case 2: Text + trailing key — smart send text, then raw key
+  # BUT: if ALL args are keys (e.g. `send pane Down Enter`, `send pane y Enter`,
+  # `send pane Shift+Tab Tab Enter`), no prose to prefix — send all raw.
   if $is_key && [ $# -gt 1 ]; then
+    local all_keys=true
+    local a
+    for a in "$@"; do
+      private.otmux.is.key "$a" || { all_keys=false; break; }
+    done
+    if $all_keys; then
+      # All-raw key chain (menu navigation) — no prefix
+      for a in "$@"; do
+        otmux.send.raw "$target" "$a"
+        sleep 0.05
+      done
+      return 0
+    fi
+    # Mixed text + trailing key — prefix the text, raw the key
     local text_args=("${@:1:$#-1}")
     private.otmux.send.smart "$target" "${text_args[*]}"
     sleep 0.05
@@ -1083,6 +1943,14 @@ private.otmux.send.smart() # <target> <text> # internal: accept-edits, prefix, v
 {
   local target="$1"
   local text="$2"
+
+  # Tron P0 defense-in-depth: never send a prefix-only message (caller-side
+  # empty payload should be rejected at otmux.send, but smart can be entered
+  # directly from internal paths — guard here too via shared this.isEmpty).
+  if this.isEmpty "$text"; then
+    debug.log "send.smart: empty/whitespace-only text — silent no-op (target=$target)"
+    return 0
+  fi
 
   # Step 1: Detect accept-edits mode and clear it (Claude Code panes only)
   if private.otmux.pane.isClaudeCode "$target"; then
@@ -1137,6 +2005,11 @@ private.otmux.sendEnter() # <target> <text> # send text followed by Enter; targe
 {
   local target=$(private.resolve.target "$1")
   shift
+  # Bug #4 defense: validate target format
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.enter: invalid pane target '$target' — refusing to send"
+    return 1
+  fi
   # Send text literally (-l) to avoid interpreting tmux key names in the message,
   # then send Enter separately with a brief delay. This prevents words like
   # "Escape" or "Up" from being treated as key sequences, and improves reliability
@@ -1155,6 +2028,11 @@ private.otmux.sendKeys() # <target> <key1> [<key2>...] # send keys with inter-ke
   # (e.g. Claude Code permission prompts: sendKeys <pane> Down Enter).
   local target=$(private.resolve.target "$1")
   shift
+  # Bug #4 defense: validate target format
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.tui: invalid pane target '$target' — refusing to send"
+    return 1
+  fi
   for key in "$@"; do
     $TMUX_CMD send-keys -t "$target" "$key"
     sleep 0.05
@@ -1232,12 +2110,12 @@ otmux.commands() # # list all tmux commands
 
 otmux.256color() # <command> # force 256 color mode (stacks with UTF-8)
 {
-  tmux -u -2 "$@"
+  $TMUX_CMD -2 "$@"
 }
 
 otmux.control() # <?command> # start in control mode (stacks with UTF-8)
 {
-  tmux -u -C "$@"
+  $TMUX_CMD -C "$@"
 }
 
 otmux.utf8() # <command> # force UTF-8 mode (already default, provided for compatibility)
@@ -1247,28 +2125,28 @@ otmux.utf8() # <command> # force UTF-8 mode (already default, provided for compa
 
 otmux.verbose() # <command> # enable verbose logging (stacks with UTF-8)
 {
-  tmux -u -v "$@"
+  $TMUX_CMD -v "$@"
 }
 
 otmux.socket() # <name> <command> # use specific socket name (stacks with UTF-8)
 {
   local name="$1"
   shift
-  tmux -u -L "$name" "$@"
+  $TMUX_CMD -L "$name" "$@"
 }
 
 private.otmux.socketPath() # <path> <command> # use specific socket path (stacks with UTF-8)
 {
   local path="$1"
   shift
-  tmux -u -S "$path" "$@"
+  $TMUX_CMD -S "$path" "$@"
 }
 
 otmux.config() # <file> <command> # use specific config file (stacks with UTF-8)
 {
   local file="$1"
   shift
-  tmux -u -f "$file" "$@"
+  $TMUX_CMD -f "$file" "$@"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1287,11 +2165,43 @@ otmux.help() # # show tmux help
   echo "For full documentation: man tmux"
 }
 
-otmux.tree() # <?session> # show formatted tree of all sessions, panes, titles and commands
+otmux.tree() # <?session> # show formatted tree — Tier 2, fast path via batched tty+ps maps (A+B+C)
 {
+  # Architect-approved fast path (task-otmux-fast-path.md):
+  #   A) Build pane→tty map via ONE tmux list-panes -aF call (was 75× otmux pane.get subprocess)
+  #   B) Build tty→pid map via ONE ps scan (was 75× per-pane ps in process.find)
+  #   C) Cache claude --version once (was N calls — same answer every time)
+  # Combined effect: 40s → ~1.5s on a 76-pane server. Intra-call caches; nothing persists.
   if ! $TMUX_CMD list-sessions >/dev/null 2>&1; then
     echo -e "${BOLD_YELLOW}No tmux server running.${NORMAL} Use ${CYAN}'otmux new'${NORMAL} to start."
     return 1
+  fi
+
+  # ── Fast-path caches (built once at function entry) ──────────────────────
+  # TTY map: pane_tty is '/dev/ttysNNN' but ps tty column omits '/dev/' — strip
+  # on insert so the lookup key matches downstream.
+  declare -A TREE_TTY=()          # pane_target → tty (short, no /dev/)
+  declare -A TREE_CLAUDE_PID=()   # tty → claude pid (any claude-related process on a real tty)
+  local TREE_VERSION="" _p _t _pid _args
+  while IFS='|' read -r _p _t; do
+    [ -z "$_p" ] && continue
+    TREE_TTY["$_p"]="${_t#/dev/}"
+  done < <($TMUX_CMD list-panes -aF '#{session_name}:#{window_index}.#{pane_index}|#{pane_tty}' 2>/dev/null)
+  # ps tty="??" means detached process (no controlling tty). Such rows belong
+  # to background workers whose args may incidentally contain "claude" text —
+  # exclude them to avoid false positives in the per-pane lookup.
+  while read -r _pid _t _args; do
+    [ -z "$_t" ] || [ "$_t" = "??" ] && continue
+    case "$_args" in *claude*) TREE_CLAUDE_PID["$_t"]="$_pid" ;; esac
+  done < <(ps -eo pid=,tty=,args= 2>/dev/null)
+  # CLAUDE_CMD is an internal var of the claudeCode script (not exported), so
+  # we use PATH lookup or the well-known install location as fallback.
+  local _claude_bin
+  _claude_bin=$(command -v claude 2>/dev/null)
+  [ -z "$_claude_bin" ] && [ -x "$HOME/.local/bin/claude" ] && _claude_bin="$HOME/.local/bin/claude"
+  if [ -n "$_claude_bin" ]; then
+    TREE_VERSION=$("$_claude_bin" --version 2>/dev/null | head -1)
+    TREE_VERSION="${TREE_VERSION%% (*}"
   fi
 
   local filter_session="$1"
@@ -1369,15 +2279,15 @@ otmux.tree() # <?session> # show formatted tree of all sessions, panes, titles a
       local pane_connector="├──"
       [ "$pane_i" -eq "$pane_count" ] && pane_connector="└──"
 
-      # When pane_cmd is bash/zsh, check for Claude child process and show version
+      # When pane_cmd is bash/zsh, check for Claude child process and show version.
+      # FAST PATH: pane→tty (TREE_TTY) + tty→claude-pid (TREE_CLAUDE_PID) — both
+      # built once at function entry. Per-pane work = 2× O(1) bash assoc lookups.
       local display_cmd="$pane_cmd"
       if [[ "$pane_cmd" == "bash" || "$pane_cmd" == "zsh" ]]; then
         local pane_target="${sess_name}:${win_idx}.${pane_idx}"
-        if "$OOSH_DIR/claudeCode" process.running "$pane_target" 2>/dev/null; then
-          local ver
-          ver=$("$OOSH_DIR/claudeCode" version "$pane_target" 2>/dev/null)
-          ver="${ver%% (*}"  # trim " (Claude Code)" suffix
-          [ -n "$ver" ] && display_cmd="$ver"
+        local _tty="${TREE_TTY[$pane_target]}"
+        if [ -n "$_tty" ] && [ -n "${TREE_CLAUDE_PID[$_tty]:-}" ]; then
+          [ -n "$TREE_VERSION" ] && display_cmd="$TREE_VERSION"
         fi
       fi
       printf "${GRAY}%s%s${NORMAL} ${GRAY}%-5s${NORMAL} ${BOLD_WHITE}%-24s${NORMAL} ${GREEN}[%s]${NORMAL}\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$display_cmd"
@@ -1386,15 +2296,46 @@ otmux.tree() # <?session> # show formatted tree of all sessions, panes, titles a
     echo -e "${GRAY}${pane_prefix}${NORMAL}"
   done
 }
+otmux.tree.completion.session() { otmux.parameter.completion.session "$@"; }
 
-otmux.tree.detailed() # <?session> # show three-level tree with Claude session IDs per pane
+otmux.tree.detailed() # <?session> # show three-level tree with Claude session IDs per pane — Tier 3 (A+B+C+D)
 {
+  # Same A+B+C caches as tree() plus D: single global agents.discover call (was N×57s per session).
   if ! $TMUX_CMD list-sessions >/dev/null 2>&1; then
     echo -e "${BOLD_YELLOW}No tmux server running.${NORMAL} Use ${CYAN}'otmux new'${NORMAL} to start."
     return 1
   fi
 
+  # ── Fast-path caches (intra-call) ─────────────────────────────────────────
+  declare -A TREE_TTY=()
+  declare -A TREE_CLAUDE_PID=()
+  local TREE_VERSION="" TREE_DISCOVER="" _p _t _pid _args
+  while IFS='|' read -r _p _t; do
+    [ -z "$_p" ] && continue
+    TREE_TTY["$_p"]="${_t#/dev/}"
+  done < <($TMUX_CMD list-panes -aF '#{session_name}:#{window_index}.#{pane_index}|#{pane_tty}' 2>/dev/null)
+  while read -r _pid _t _args; do
+    [ -z "$_t" ] || [ "$_t" = "??" ] && continue
+    case "$_args" in *claude*) TREE_CLAUDE_PID["$_t"]="$_pid" ;; esac
+  done < <(ps -eo pid=,tty=,args= 2>/dev/null)
+  local _claude_bin
+  _claude_bin=$(command -v claude 2>/dev/null)
+  [ -z "$_claude_bin" ] && [ -x "$HOME/.local/bin/claude" ] && _claude_bin="$HOME/.local/bin/claude"
+  if [ -n "$_claude_bin" ]; then
+    TREE_VERSION=$("$_claude_bin" --version 2>/dev/null | head -1)
+    TREE_VERSION="${TREE_VERSION%% (*}"
+  fi
   local filter_session="$1"
+  # Fix D: hoist agents.discover OUT of the per-session loop. When the caller
+  # filters to a single session, call discover with that filter (1 call).
+  # When no filter (full server), call once globally (was N per-session calls).
+  if command -v hiveMind >/dev/null 2>&1; then
+    if [ -n "$filter_session" ]; then
+      TREE_DISCOVER=$(hiveMind protected.agents.discover "$filter_session" 2>/dev/null)
+    else
+      TREE_DISCOVER=$(hiveMind protected.agents.discover 2>/dev/null)
+    fi
+  fi
 
   local session_data
   if [ -n "$filter_session" ]; then
@@ -1455,12 +2396,10 @@ otmux.tree.detailed() # <?session> # show three-level tree with Claude session I
     pane_count=$(echo "$pane_data" | wc -l | tr -d ' ')
     local pane_i=0
 
-    # DRY: fetch shared discovery once per session (from hiveMind protected method).
-    # Returns: pane|role|state|uuid|title|is_claude. Falls back to per-pane lookup below.
+    # Fix D: per-session discover_data sliced from the GLOBAL TREE_DISCOVER cache
+    # (one hiveMind call covers all sessions, not N).
     local discover_data=""
-    if command -v hiveMind >/dev/null 2>&1; then
-      discover_data=$(hiveMind protected.agents.discover "$sess_name" 2>/dev/null)
-    fi
+    [ -n "$TREE_DISCOVER" ] && discover_data=$(awk -F'|' -v s="^${sess_name}:" '$1 ~ s' <<< "$TREE_DISCOVER")
 
     echo "$pane_data" | while IFS='|' read -r win_idx pane_idx pane_title pane_cmd; do
       pane_i=$((pane_i + 1))
@@ -1471,15 +2410,14 @@ otmux.tree.detailed() # <?session> # show three-level tree with Claude session I
       local pane_connector="├──"
       [ "$pane_i" -eq "$pane_count" ] && pane_connector="└──"
 
-      # When pane_cmd is bash/zsh, check for Claude child process and show version
+      # FAST PATH (A+B+C): pane→tty + tty→claude-pid + cached version. Same
+      # caches as tree(); each pane = 2× O(1) bash assoc lookups.
       local display_cmd="$pane_cmd"
       if [[ "$pane_cmd" == "bash" || "$pane_cmd" == "zsh" ]]; then
         local pane_target_ver="${sess_name}:${win_idx}.${pane_idx}"
-        if "$oosh_dir/claudeCode" process.running "$pane_target_ver" 2>/dev/null; then
-          local ver
-          ver=$("$oosh_dir/claudeCode" version "$pane_target_ver" 2>/dev/null)
-          ver="${ver%% (*}"  # trim " (Claude Code)" suffix
-          [ -n "$ver" ] && display_cmd="$ver"
+        local _tty_ver="${TREE_TTY[$pane_target_ver]}"
+        if [ -n "$_tty_ver" ] && [ -n "${TREE_CLAUDE_PID[$_tty_ver]:-}" ]; then
+          [ -n "$TREE_VERSION" ] && display_cmd="$TREE_VERSION"
         fi
       fi
       printf "${GRAY}%s%s${NORMAL} ${GRAY}%-5s${NORMAL} ${BOLD_WHITE}%-24s${NORMAL} ${GREEN}[%s]${NORMAL}\n" "$pane_prefix" "$pane_connector" "$address" "$title" "$display_cmd"
@@ -1524,9 +2462,35 @@ otmux.tree.detailed() # <?session> # show three-level tree with Claude session I
     echo -e "${GRAY}${pane_prefix}${NORMAL}"
   done
 }
-otmux.status() # # show current tmux status (tree overview)
+otmux.tree.detailed.completion.session() { otmux.parameter.completion.session "$@"; }
+
+otmux.status() # # fast session list — Tier 1 (no per-pane subprocess calls). Use 'otmux tree' for full view.
 {
-  otmux.tree
+  # Pure tmux queries: list-sessions for names/attach/pane-count + count panes via list-panes -aF.
+  # Target: <0.5s server-wide. Was 46s (called otmux.tree → per-pane claudeCode bootstrap).
+  $TMUX_CMD list-sessions >/dev/null 2>&1 || {
+    echo -e "${BOLD_YELLOW}No tmux server running.${NORMAL} Use ${CYAN}'otmux new'${NORMAL} to start."
+    return 1
+  }
+  # Build pane-count-per-session map in ONE tmux call.
+  declare -A SESS_PANES=()
+  local _p _s
+  while IFS=':' read -r _s _p; do
+    [ -z "$_s" ] && continue
+    SESS_PANES["$_s"]=$(( ${SESS_PANES["$_s"]:-0} + 1 ))
+  done < <($TMUX_CMD list-panes -aF '#{session_name}:1' 2>/dev/null)
+  printf "${BOLD_WHITE}%-32s %-10s %-6s %s${NORMAL}\n" "SESSION" "STATUS" "PANES" "WINDOWS"
+  while IFS='|' read -r name attached windows; do
+    local status_label
+    if [ "$attached" -gt 0 ] 2>/dev/null; then
+      status_label="${BOLD_GREEN}attached${NORMAL}"
+    else
+      status_label="${GRAY}detached${NORMAL}"
+    fi
+    printf "${BOLD_CYAN}%-32s${NORMAL} %b %-6s %s\n" "$name" "$status_label" "${SESS_PANES[$name]:-0}" "$windows"
+  done < <($TMUX_CMD list-sessions -F '#{session_name}|#{session_attached}|#{session_windows}' 2>/dev/null)
+  echo ""
+  echo -e "${GRAY}Tip:${NORMAL} ${CYAN}otmux tree${NORMAL} for per-pane view, ${CYAN}otmux tree.detailed${NORMAL} for agent UUIDs."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1537,6 +2501,10 @@ otmux.status() # # show current tmux status (tree overview)
 
 # --- SESSION ALIASES ---
 
+otmux.session.kill() # <target> # kill session (alias for otmux.kill); target=session name
+{
+  otmux.kill "$@"
+}
 otmux.session.kill.completion.target() { private.complete.sessions; }
 
 otmux.session.kill.all() # # kill all sessions except current
@@ -1584,6 +2552,7 @@ otmux.session.details() # <session> # show all windows and panes with titles, co
 
   echo ""
 }
+otmux.session.details.completion.session() { otmux.parameter.completion.session "$@"; }
 
 # --- WINDOW ALIASES ---
 
@@ -1691,6 +2660,7 @@ otmux.pane.list() # <?session> # list panes with addresses and titles; session=f
     otmux.panes "$@"
   fi
 }
+otmux.pane.list.completion.session() { otmux.parameter.completion.session "$@"; }
 
 
 otmux.pane.get() # <?target> <?format:%> # get pane info; 2 args = target + format, 1 arg = format, 0 = pane_id
@@ -1743,6 +2713,14 @@ otmux.pane.break() # # break pane into new window
 otmux.pane.join() # <window> # join pane to window; window=destination [session:]window
 {
   private.otmux.joinPane "$@"
+  # B5.1 — pane changed window: notify Controller for both source and destination sessions
+  # The destination is in $1; current pane's session is the source. Refresh both.
+  local destSess
+  destSess=$(private.otmux.sessionFromPane "${1:-}")
+  local curSess
+  curSess=$($TMUX_CMD display-message -p '#{session_name}' 2>/dev/null)
+  [ -n "$destSess" ] && private.otmux.notifyHiveMind.shifted "$destSess"
+  [ -n "$curSess" ] && [ "$curSess" != "$destSess" ] && private.otmux.notifyHiveMind.shifted "$curSess"
 }
 
 otmux.pane.swap() # <sourcePane> <targetPane> # swap two panes; sourcePane/targetPane=session:window.pane
@@ -1754,11 +2732,25 @@ otmux.pane.swap() # <sourcePane> <targetPane> # swap two panes; sourcePane/targe
     return 1
   fi
   $TMUX_CMD swap-pane -s "$sourcePane" -t "$targetPane"
+  # B5.1 — pane content swapped → roles must swap too (agent moves with pane).
+  # Per architecture diagram: protected.panes.swapped <session> <paneA> <paneB>.
+  # More precise than panes.shifted — tells Controller to swap two specific keys
+  # without re-running full discovery.
+  local sess
+  sess=$(private.otmux.sessionFromPane "$sourcePane")
+  command -v hiveMind >/dev/null 2>&1 && hiveMind protected.panes.swapped "$sess" "$sourcePane" "$targetPane" 2>/dev/null
 }
 
 otmux.pane.move() # <window> # move pane; window=destination window
 {
   private.otmux.movePane "$@"
+  # B5.1 — pane moved between windows: notify both old and new sessions
+  local destSess
+  destSess=$(private.otmux.sessionFromPane "${1:-}")
+  local curSess
+  curSess=$($TMUX_CMD display-message -p '#{session_name}' 2>/dev/null)
+  [ -n "$destSess" ] && private.otmux.notifyHiveMind.shifted "$destSess"
+  [ -n "$curSess" ] && [ "$curSess" != "$destSess" ] && private.otmux.notifyHiveMind.shifted "$curSess"
 }
 
 otmux.pane.resize() # <direction> <?amount> # resize pane; direction=U/D/L/R, amount=cells (default 5)
@@ -1766,6 +2758,38 @@ otmux.pane.resize() # <direction> <?amount> # resize pane; direction=U/D/L/R, am
   private.otmux.resizePane "$@"
 }
 
+otmux.pane.size.set() # <pane> <?width> <?height> # set absolute pane size (one or both dims; omit to leave unchanged)
+{
+  # Absolute pane sizing — wrapper for `tmux resize-pane -x W -y H`. Useful for
+  # locking shell panes to a minimum height in vertically-stacked layouts where
+  # tmux's auto-resize collapses small panes to 1 row when the window shrinks.
+  # Caller use case (ud-po): `otmux pane.size.set upDownTeam:0.3 - 10` to give
+  # an expert-shell at least 10 rows.
+  local pane="$1"
+  local w="${2:-}"
+  local h="${3:-}"
+  if [ -z "$pane" ]; then
+    error.log "Usage: otmux pane.size.set <pane> <?width> <?height> (use '-' to skip a dim)"
+    return 1
+  fi
+  local args=()
+  [ -n "$w" ] && [ "$w" != "-" ] && args+=(-x "$w")
+  [ -n "$h" ] && [ "$h" != "-" ] && args+=(-y "$h")
+  if [ ${#args[@]} -eq 0 ]; then
+    error.log "pane.size.set: provide at least one of <width>, <height>"
+    return 1
+  fi
+  $TMUX_CMD resize-pane -t "$pane" "${args[@]}" 2>/dev/null
+}
+otmux.pane.size.set.completion.pane() { private.complete.panes; }
+
+otmux.pane.size() # <pane> # display pane size as 'WxH'
+{
+  local pane="$1"
+  [ -z "$pane" ] && { error.log "Usage: otmux pane.size <pane>"; return 1; }
+  $TMUX_CMD display-message -t "$pane" -p '#{pane_width}x#{pane_height}' 2>/dev/null
+}
+otmux.pane.size.completion.pane() { private.complete.panes; }
 
 
 otmux.pane.respawn() # <?command> # respawn pane; command=shell command to run
@@ -1841,7 +2865,7 @@ otmux.pane.send() # <target> <text> # send text + Enter to pane; target=session:
 }
 
 
-otmux.pane.lock() # <target> <title> # lock pane title; prevents Claude Code from overwriting
+otmux.pane.lock() # <target> <title> # lock pane title; idempotent — auto-unlocks first if already locked
 {
   local target=$(private.resolve.target "$1")
   local title="$2"
@@ -1849,6 +2873,12 @@ otmux.pane.lock() # <target> <title> # lock pane title; prevents Claude Code fro
     error.log "usage: otmux pane.lock <target> <title>"
     return 1
   fi
+
+  # B3.1 — auto-unlock first so pane.lock is idempotent and safe to retitle.
+  # Clears any prior hook + background enforcer + allow-rename state before
+  # we install the new lock. Silent: no info.log from the unlock step.
+  otmux.pane.unlock "$target" >/dev/null 2>&1
+
   # Set the title
   $TMUX_CMD select-pane -t "$target" -T "$title"
   # Block escape-sequence-based renaming
@@ -1988,16 +3018,90 @@ otmux.buffer.choose() # # interactively choose buffer
 
 # --- CLIENT ALIASES ---
 
-otmux.client.list() # # list connected clients
+otmux.client.list() # # list connected clients with size, flags, session, idle (B6)
 {
-  otmux.clients "$@"
+  # B6: structured format with size + flags helps diagnose layout-crush from
+  # stale read-only/small clients (e.g. tronMonitor's 54x26 screen attaches).
+  if ! $TMUX_CMD list-clients >/dev/null 2>&1; then
+    echo "no tmux server"
+    return 1
+  fi
+  printf "%-18s %-22s %-9s %-44s %s\n" "TTY" "SESSION" "SIZE" "FLAGS" "IDLE"
+  $TMUX_CMD list-clients -F '#{client_tty}|#{client_session}|#{client_width}x#{client_height}|#{client_flags}|#{client_activity}' 2>/dev/null \
+    | while IFS='|' read -r tty sess size flags activity; do
+        local idle="-"
+        if [ -n "$activity" ] && [ "$activity" -gt 0 ] 2>/dev/null; then
+          local now
+          now=$(date +%s)
+          local secs=$((now - activity))
+          if [ "$secs" -ge 3600 ]; then
+            idle="$((secs / 3600))h $((secs % 3600 / 60))m"
+          elif [ "$secs" -ge 60 ]; then
+            idle="$((secs / 60))m"
+          else
+            idle="${secs}s"
+          fi
+        fi
+        printf "%-18s %-22s %-9s %-44s %s\n" "$tty" "$sess" "$size" "$flags" "$idle"
+      done
 }
 
-otmux.client.detach() # <?client> # detach client; client=client tty (e.g., /dev/pts/0)
+otmux.client.detach() # <?client> # detach client by tty; refreshes remaining clients to restore layout (B6)
 {
-  private.otmux.detachClient "$@"
+  # B6: after detach, refresh-client -S forces all remaining clients to
+  # re-sync sizes — crucial after killing a small read-only client that
+  # was forcing window-size=smallest behavior.
+  local target="$1"
+  if [ -n "$target" ]; then
+    if ! $TMUX_CMD detach-client -t "$target" 2>&1; then
+      error.log "client.detach: failed to detach '$target'"
+      return 1
+    fi
+    info.log "Detached client: $target"
+  else
+    $TMUX_CMD detach-client 2>&1
+  fi
+  # Trigger size re-sync on remaining clients (only if server still up)
+  if $TMUX_CMD list-clients >/dev/null 2>&1; then
+    $TMUX_CMD refresh-client -S 2>/dev/null
+  fi
+  return 0
 }
 otmux.client.detach.completion.client() { private.complete.clients; }
+
+otmux.client.cleanup() # <?filter:read-only> # detach stale clients matching <filter>; refresh layout
+{
+  # B6: bulk-detach clients whose flags include <filter>. Default 'read-only'
+  # targets monitoring clients (e.g. tronMonitor's screen→tmux attach -r) that
+  # crush layout when their terminal is small.
+  # Other useful filters: 'ignore-size' (won't grow but counted), or any flag.
+  local filter="${1:-read-only}"
+  if ! $TMUX_CMD list-clients >/dev/null 2>&1; then
+    echo "no tmux server"
+    return 1
+  fi
+  local detached=0 skipped=0
+  while IFS='|' read -r tty flags; do
+    [ -z "$tty" ] && continue
+    if echo "$flags" | grep -q "$filter"; then
+      info.log "client.cleanup: detaching $tty (matches '$filter') — flags=$flags"
+      $TMUX_CMD detach-client -t "$tty" 2>/dev/null && detached=$((detached + 1))
+    else
+      skipped=$((skipped + 1))
+    fi
+  done < <($TMUX_CMD list-clients -F '#{client_tty}|#{client_flags}' 2>/dev/null)
+  # Force layout re-sync on whatever survived (crucial — this restores widths)
+  if $TMUX_CMD list-clients >/dev/null 2>&1; then
+    $TMUX_CMD refresh-client -S 2>/dev/null
+  fi
+  success.log "client.cleanup: detached $detached, kept $skipped (filter='$filter')"
+}
+otmux.client.cleanup.completion.filter() {
+  echo "read-only"
+  echo "ignore-size"
+  echo "attached"
+  echo "focused"
+}
 
 otmux.client.suspend() # # suspend current client (Ctrl+Z)
 {
@@ -2155,18 +3259,16 @@ otmux.tronMonitor.setup() # <?session:TRONinterface> <?pane:0.3> # create TRON-M
     otmux.new "$session"
   fi
 
-  # Ensure pane exists
-  private.hiveMind.ensure.pane "$target" 2>/dev/null || {
-    # Fallback: split until we have enough panes
-    local current needed
-    needed=$((${paneIdx##*.} + 1))
+  # Ensure pane exists by splitting until we reach the requested index.
+  # B1.3 BOUNDARY-2: pure View — no cross-layer call to Controller helpers.
+  local current needed
+  needed=$((${paneIdx##*.} + 1))
+  current=$($TMUX_CMD list-panes -t "${session}:${paneIdx%%.*}" 2>/dev/null | wc -l | tr -d ' ')
+  while [ "${current:-0}" -lt "$needed" ]; do
+    $TMUX_CMD split-window -d -t "${session}:${paneIdx%%.*}" 2>/dev/null
+    $TMUX_CMD select-layout -t "${session}:${paneIdx%%.*}" tiled 2>/dev/null
     current=$($TMUX_CMD list-panes -t "${session}:${paneIdx%%.*}" 2>/dev/null | wc -l | tr -d ' ')
-    while [ "${current:-0}" -lt "$needed" ]; do
-      $TMUX_CMD split-window -d -t "${session}:${paneIdx%%.*}" 2>/dev/null
-      $TMUX_CMD select-layout -t "${session}:${paneIdx%%.*}" tiled 2>/dev/null
-      current=$($TMUX_CMD list-panes -t "${session}:${paneIdx%%.*}" 2>/dev/null | wc -l | tr -d ' ')
-    done
-  }
+  done
 
   # Run tronMonitor setup on the target pane
   "$OOSH_DIR/tronMonitor" setup "$target"

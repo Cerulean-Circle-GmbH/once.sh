@@ -35,6 +35,16 @@
 : ${HIVEMIND_FORKS:=${CONFIG_PATH:-$HOME/config}/hivemind.forks.env}
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 : ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
+: ${HIVEMIND_QUEUE_DIR:=${CONFIG_PATH:-$HOME/config}/hivemind.queue}
+: ${HIVEMIND_QUEUE_MAX_DEPTH:=50}
+: ${HIVEMIND_QUEUE_MAX_AGE_SEC:=3600}
+
+# B5.1 — TTL window during which manual registry.set takes priority over live
+# discovery. After registry.set, the entry is "fresh"; live discovery will not
+# overwrite it for HIVEMIND_REGISTRY_TTL seconds. After the window expires, live
+# discovery resumes priority (handles cases where the agent /rename'd to a
+# different role or moved panes externally).
+: ${HIVEMIND_REGISTRY_TTL:=30}
 
 # Default agent roles
 HIVEMIND_DEFAULT_AGENTS=(
@@ -145,7 +155,7 @@ private.hiveMind.liveUuid() { # <paneTarget> <?procArgs:ignored> <?probe> # get 
   [ -n "$sid" ] && echo "$sid" && return 0
   # Invasive fallback only when explicitly requested (e.g. consistency.fix).
   if [ "$probe" = "probe" ]; then
-    sid=$("$OOSH_DIR/claudeCode" session.probe "$target" 2>/dev/null)
+    sid=$(hiveMind.agent.session.probe "$target" 2>/dev/null)
     [ -n "$sid" ] && echo "$sid" && return 0
   fi
   return 1
@@ -283,6 +293,461 @@ private.hiveMind.pane.identify() {
   otmux send.enter "$target" "export HIVEMIND_ROLE=$role"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SC-B.1 — Event dispatch primitives (Sprint 1 state-correctness)
+# Function-table dispatch for cross-store state mutations. Per design §4 +
+# expert review Q5 answer, the table lives in hiveMind (not a new script) and
+# is in-process for hiveMind→hiveMind handlers. Cross-script observers still
+# use the B5.1 subprocess pattern: `hiveMind protected.<event>`.
+# PO-locked constraints:
+#   U1 — handler failure: log+continue, never abort the mutation (reconcile catches drift)
+# ─────────────────────────────────────────────────────────────────────────────
+
+: ${HIVEMIND_EVENTS_LOG:=${CONFIG_PATH:-$HOME/config}/hivemind.events.log}
+: ${HIVEMIND_EVENTS_LOG_MAX_BYTES:=1048576}   # 1 MiB before rotation (SC-B.2)
+
+# Backing store — associative: event name → space-separated handler list.
+# Declared once at script-load; idempotent under repeated source.
+if ! declare -p HIVEMIND_EVENT_HANDLERS 2>/dev/null | grep -q '^declare -A'; then
+  declare -gA HIVEMIND_EVENT_HANDLERS=()
+fi
+
+private.hiveMind.events.register() # <eventName> <handlerFunction> # idempotent — re-registering the same handler is a no-op
+{
+  local event="$1" handler="$2"
+  if [ -z "$event" ] || [ -z "$handler" ]; then
+    error.log "events.register: usage <eventName> <handlerFunction>"
+    return 1
+  fi
+  # Idempotent: only add if not already in the space-separated list
+  local current="${HIVEMIND_EVENT_HANDLERS[$event]:-}"
+  case " $current " in
+    *" $handler "*) return 0 ;;  # already registered
+  esac
+  HIVEMIND_EVENT_HANDLERS["$event"]="${current:+${current} }${handler}"
+  return 0
+}
+
+private.hiveMind.events.emit() # <eventName> <arg...> # fan-out to all registered handlers, log+continue on failure (U1)
+{
+  local event="$1"; shift
+  if [ -z "$event" ]; then
+    error.log "events.emit: usage <eventName> <arg...>"
+    return 1
+  fi
+  # Append to history log (SC-B.2 rotation)
+  private.hiveMind.events.history.append "$event" "$@"
+  local handlers="${HIVEMIND_EVENT_HANDLERS[$event]:-}"
+  [ -z "$handlers" ] && return 0   # no handlers = silent no-op
+  local h rc
+  for h in $handlers; do
+    # Each handler runs isolated — failure logs but doesn't abort siblings (U1)
+    "$h" "$@"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      error.log "events.emit: handler '$h' for event '$event' returned rc=$rc (continuing)"
+    fi
+  done
+  return 0
+}
+
+private.hiveMind.events.history.append() # <event> <arg...> # internal: append to log, rotate at 1 MiB
+{
+  local event="$1"; shift
+  local ts size
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  # Rotation: portable size check via wc -c (BSD + GNU compatible)
+  if [ -f "$HIVEMIND_EVENTS_LOG" ]; then
+    size=$(wc -c < "$HIVEMIND_EVENTS_LOG" 2>/dev/null | tr -d ' ')
+    if [ -n "$size" ] && [ "$size" -ge "${HIVEMIND_EVENTS_LOG_MAX_BYTES}" ] 2>/dev/null; then
+      mv "$HIVEMIND_EVENTS_LOG" "${HIVEMIND_EVENTS_LOG}.1" 2>/dev/null
+    fi
+  fi
+  printf '%s|%s|%s\n' "$ts" "$event" "$*" >> "$HIVEMIND_EVENTS_LOG" 2>/dev/null
+}
+
+hiveMind.protected.events.register() # <eventName> <handlerFunction> # CLI wrapper for tests
+{
+  private.hiveMind.events.register "$@"
+}
+
+hiveMind.protected.events.emit() # <eventName> <arg...> # CLI wrapper for tests + cross-script events
+{
+  private.hiveMind.events.emit "$@"
+}
+
+hiveMind.events.list() # # show registered events and handler counts
+{
+  if [ "${#HIVEMIND_EVENT_HANDLERS[@]}" -eq 0 ]; then
+    info.log "No events registered"
+    return 0
+  fi
+  printf '%-32s %4s  %s\n' "EVENT" "N" "HANDLERS"
+  printf '%-32s %4s  %s\n' "─────" "─" "────────"
+  local event handlers count
+  for event in "${!HIVEMIND_EVENT_HANDLERS[@]}"; do
+    handlers="${HIVEMIND_EVENT_HANDLERS[$event]}"
+    count=$(echo "$handlers" | wc -w | tr -d ' ')
+    printf '%-32s %4s  %s\n' "$event" "$count" "$handlers"
+  done | sort
+}
+
+hiveMind.events.history() # <?lines:50> # tail the events log
+{
+  local lines="${1:-50}"
+  if [ ! -f "$HIVEMIND_EVENTS_LOG" ]; then
+    info.log "No events log yet ($HIVEMIND_EVENTS_LOG)"
+    return 0
+  fi
+  tail -n "$lines" "$HIVEMIND_EVENTS_LOG"
+}
+hiveMind.events.history.completion.lines() {
+  for n in 10 25 50 100 200; do echo "$n"; done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SC-C — Event handlers (Sprint 1 design §4 catalog)
+# ─────────────────────────────────────────────────────────────────────────────
+# One handler per (event, target store). Registered at script-load below.
+# Failure of any handler logs+continues per U1 — the event.emit primitive
+# already wraps each call with rc capture, so handlers can return non-zero
+# safely.
+# Migration note: existing direct calls in mutation sites (e.g. agent.bootstrap
+# calling private.hiveMind.registry.set directly) are RETAINED during Sprint 1.
+# They become idempotent siblings of the event-driven path. Once SC-C tests
+# confirm handlers cover all paths reliably, a future refactor will remove the
+# direct calls and rely solely on event dispatch.
+
+# ── SC-C.1 agent.spawned ─── args: <pane> <role> <?uuid> ────────────────────
+
+private.hiveMind.handler.agent.spawned.registry() {
+  local pane="$1" role="$2"
+  [ -z "$pane" ] || [ -z "$role" ] && return 0
+  private.hiveMind.registry.set "$pane" "$role"
+}
+
+private.hiveMind.handler.agent.spawned.sessions() {
+  local pane="$1" role="$2" uuid="$3"
+  [ -z "$pane" ] || [ -z "$uuid" ] && return 0
+  private.hiveMind.session.store "$pane" "$uuid"
+}
+
+# ── SC-C.2 agent.killed ─── args: <pane> ────────────────────────────────────
+
+private.hiveMind.handler.agent.killed.registry() {
+  local pane="$1"
+  [ -z "$pane" ] && return 0
+  [ -f "$HIVEMIND_REGISTRY" ] || return 0
+  grep -v "^${pane}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
+  mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
+}
+
+private.hiveMind.handler.agent.killed.sessions() {
+  local pane="$1"
+  [ -z "$pane" ] && return 0
+  [ -f "$HIVEMIND_SESSIONS" ] || return 0
+  grep -v "^${pane}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+  mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+}
+
+private.hiveMind.handler.agent.killed.queue() {
+  local pane="$1"
+  [ -z "$pane" ] && return 0
+  # queue.path may not exist yet if queue helpers aren't sourced — soft-fail.
+  local qfile
+  qfile=$(private.hiveMind.agent.queue.path "$pane" 2>/dev/null) || return 0
+  [ -n "$qfile" ] && [ -f "$qfile" ] && rm -f "$qfile"
+  return 0
+}
+
+# ── SC-C.3 agent.renamed ─── args: <pane> <oldName> <newName> ──────────────
+# Fires after /rename inside a Claude TUI. Handlers update:
+#   - S1 (roles.env): pane → newName (overwrite oldName)
+#   - title:           otmux pane.lock pins the new title
+#   - role.env:        push HIVEMIND_ROLE=newName to pane shell (Bug #3)
+
+private.hiveMind.handler.agent.renamed.registry() {
+  local pane="$1" newName="$3"
+  [ -z "$pane" ] || [ -z "$newName" ] && return 0
+  private.hiveMind.registry.set "$pane" "$newName"
+}
+
+private.hiveMind.handler.agent.renamed.title() {
+  local pane="$1" newName="$3"
+  [ -z "$pane" ] || [ -z "$newName" ] && return 0
+  # Defensive: skip if pane doesn't exist (test fixtures or stale agent.rename).
+  # pane.lock spawns a background enforcer; without this guard it'd churn.
+  tmux list-panes -t "$pane" -F '#{pane_id}' >/dev/null 2>&1 || return 0
+  otmux pane.lock "$pane" "$newName" 2>/dev/null
+  return 0
+}
+
+private.hiveMind.handler.agent.renamed.role_env() {
+  local pane="$1" newName="$3"
+  [ -z "$pane" ] || [ -z "$newName" ] && return 0
+  private.hiveMind.pane.pushRoleEnv "$pane" "$newName"
+}
+
+# ── SC-C.4 agent.forked ─── args: <pane> <role> <parentUuid> <childUuid> ───
+# Fires after a successful claudeCode fork. Handlers update:
+#   - S1 (roles.env): pane → role (reaffirm post-fork)
+#   - S2 (sessions.env): pane → childUuid
+#   - S5 (forks.env): append lineage row `ts|pane|role|childUuid|live|parentUuid`
+
+private.hiveMind.handler.agent.forked.registry() {
+  local pane="$1" role="$2"
+  [ -z "$pane" ] || [ -z "$role" ] && return 0
+  private.hiveMind.registry.set "$pane" "$role"
+}
+
+private.hiveMind.handler.agent.forked.sessions() {
+  local pane="$1" childUuid="$4"
+  [ -z "$pane" ] || [ -z "$childUuid" ] && return 0
+  private.hiveMind.session.store "$pane" "$childUuid"
+}
+
+private.hiveMind.handler.agent.forked.forks() {
+  local pane="$1" role="$2" parentUuid="$3" childUuid="$4"
+  [ -z "$pane" ] || [ -z "$childUuid" ] && return 0
+  local forksFile="${HIVEMIND_FORKS:-${CONFIG_PATH:-$HOME/config}/hivemind.forks.env}"
+  local dir
+  dir=$(dirname "$forksFile")
+  mkdir -p "$dir" 2>/dev/null
+  local ts
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  echo "${ts}|${pane}|${role}|${childUuid}|live|${parentUuid}" >> "$forksFile"
+}
+
+# ── SC-C.5 panes.shifted ─── args: <session> ───────────────────────────────
+# Fired after split/insert in a session — pane indices may have changed; live
+# discovery reconciles. queue.rename handler stub (future work — needs old→new
+# index map; current B5.1 caller passes only session, not the shift delta).
+
+private.hiveMind.handler.panes.shifted.registry() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  otmux has "$session" 2>/dev/null || return 0
+  if type -t hiveMind.registry.refresh >/dev/null 2>&1; then
+    hiveMind.registry.refresh "$session" 2>/dev/null
+  fi
+}
+
+# ── SC-C.6 panes.swapped ─── args: <session> <paneA> <paneB> ───────────────
+# Two handlers: swap registry entries + push HIVEMIND_ROLE env to each shell
+# (the agents moved with the panes, so each pane shell needs new role env).
+# Pane address normalization (B5.2 SWAP-1): callers may pass addr-only ('0.0')
+# or full target ('teamX:0.0') — handlers prepend session when prefix missing.
+
+private.hiveMind.handler.panes.swapped.registry() {
+  local session="$1" a="$2" b="$3"
+  [ -z "$a" ] || [ -z "$b" ] && return 0
+  [[ "$a" != *:* ]] && [ -n "$session" ] && a="${session}:${a}"
+  [[ "$b" != *:* ]] && [ -n "$session" ] && b="${session}:${b}"
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+
+  local roleA roleB
+  roleA=$(grep "^${a}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  roleB=$(grep "^${b}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  grep -vE "^(${a}|${b})\|" "$reg" > "${reg}.tmp" 2>/dev/null
+  mv "${reg}.tmp" "$reg"
+  [ -n "$roleA" ] && private.hiveMind.registry.set "$b" "$roleA"
+  [ -n "$roleB" ] && private.hiveMind.registry.set "$a" "$roleB"
+  info.log "Panes swapped: $a ⇄ $b (roles: ${roleA:-∅}|${roleB:-∅} → ${roleB:-∅}|${roleA:-∅})"
+}
+
+private.hiveMind.handler.panes.swapped.role_env() {
+  local session="$1" a="$2" b="$3"
+  [ -z "$a" ] || [ -z "$b" ] && return 0
+  [[ "$a" != *:* ]] && [ -n "$session" ] && a="${session}:${a}"
+  [[ "$b" != *:* ]] && [ -n "$session" ] && b="${session}:${b}"
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  # Read POST-swap roles (registry handler ran first per registration order)
+  local newA newB
+  newA=$(grep "^${a}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  newB=$(grep "^${b}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  [ -n "$newA" ] && private.hiveMind.pane.pushRoleEnv "$a" "$newA"
+  [ -n "$newB" ] && private.hiveMind.pane.pushRoleEnv "$b" "$newB"
+}
+
+# ── SC-C.7 pane.moved ─── args: <fromPane> <toPane> ────────────────────────
+# Two handlers: rename registry key + push HIVEMIND_ROLE to destination shell.
+
+private.hiveMind.handler.pane.moved.registry() {
+  local from="$1" to="$2"
+  [ -z "$from" ] || [ -z "$to" ] && return 0
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  local role
+  role=$(grep "^${from}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  [ -z "$role" ] && return 0
+  grep -v "^${from}|" "$reg" > "${reg}.tmp" 2>/dev/null
+  mv "${reg}.tmp" "$reg"
+  private.hiveMind.registry.set "$to" "$role"
+  info.log "Pane moved: $from → $to (role $role preserved)"
+}
+
+private.hiveMind.handler.pane.moved.role_env() {
+  local from="$1" to="$2"
+  [ -z "$to" ] && return 0
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  # Read role from post-move location (registry handler ran first)
+  local role
+  role=$(grep "^${to}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  [ -n "$role" ] && private.hiveMind.pane.pushRoleEnv "$to" "$role"
+}
+
+# ── SC-C.8 team.created ─── args: <session> <?description> ─────────────────
+# Fired after team.register confirms a session is a valid live tmux team.
+# Handlers:
+#   - teams:       append session|description to teams.env (Idempotent — caller
+#                  already wrote the row; this handler is a write-through audit
+#                  hook in case future emitters bypass team.register)
+#   - tronMonitor: open a monitor window for the team (closes V→C event-gap —
+#                  was a direct call in team.register, now an event handler)
+
+private.hiveMind.handler.team.created.teams() {
+  local session="$1" description="$2"
+  [ -z "$session" ] && return 0
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  # Idempotent: only append if not already present (team.register's own write
+  # is the primary path; this catches emitters that bypass it).
+  [ -f "$teamsFile" ] && grep -q "^${session}|" "$teamsFile" 2>/dev/null && return 0
+  private.hiveMind.teams.ensure.dir 2>/dev/null
+  echo "${session}|${description}" >> "$teamsFile"
+}
+
+private.hiveMind.handler.team.created.tronMonitor() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  # Soft-fail per U1 — tronMonitor add may fail (screen not running, name
+  # collision); registration succeeded regardless.
+  tronMonitor add "$session" 2>/dev/null || \
+    info.log "tronMonitor add failed/skipped for $session (non-fatal)"
+}
+
+# ── SC-C.9 team.destroyed ─── args: <session> ──────────────────────────────
+# Fired after team.remove confirms the team is gone. Cascade-cleans:
+#   - teams:        remove row from teams.env (idempotent — caller may have
+#                   already done this; safe to re-run)
+#   - tronMonitor:  close monitor window
+#   - registry:     prune all pane entries belonging to this session (S1)
+#   - sessions:     prune all pane entries belonging to this session (S2)
+#   - queue:        remove queue files for panes in this session (S6)
+
+private.hiveMind.handler.team.destroyed.teams() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$teamsFile" ] || return 0
+  grep -v "^${session}|" "$teamsFile" > "${teamsFile}.tmp" 2>/dev/null
+  mv "${teamsFile}.tmp" "$teamsFile"
+}
+
+private.hiveMind.handler.team.destroyed.tronMonitor() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  tronMonitor remove "$session" 2>/dev/null || \
+    info.log "tronMonitor remove failed/skipped for $session (non-fatal)"
+}
+
+private.hiveMind.handler.team.destroyed.registry() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  grep -v "^${session}:" "$reg" > "${reg}.tmp" 2>/dev/null
+  mv "${reg}.tmp" "$reg"
+}
+
+private.hiveMind.handler.team.destroyed.sessions() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  local sess="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  [ -f "$sess" ] || return 0
+  grep -v "^${session}:" "$sess" > "${sess}.tmp" 2>/dev/null
+  mv "${sess}.tmp" "$sess"
+}
+
+private.hiveMind.handler.team.destroyed.queue() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  # queue files are at $CONFIG_PATH/hivemind.queue/<session>:<addr>.queue
+  local queueDir="${CONFIG_PATH:-$HOME/config}/hivemind.queue"
+  [ -d "$queueDir" ] || return 0
+  # Match files starting with "<session>:" prefix (literal colon). Use a
+  # glob expansion guard so unmatched-pattern returns no files cleanly.
+  local f
+  shopt -s nullglob
+  for f in "$queueDir/${session}:"*.queue; do
+    [ -f "$f" ] && rm -f "$f"
+  done
+  shopt -u nullglob
+  return 0
+}
+
+# ── SC-C.10 team.restored ─── args: <session> ──────────────────────────────
+# Fired after teams.restore re-creates a team from snapshot (B2 layout +
+# claudeCode join.byID per pane). Handlers:
+#   - teams:       ensure teams.env has the row (idempotent — teams.restore
+#                  calls team.register which writes; this handler is a
+#                  fallback if direct restore-paths bypass team.register)
+#   - tronMonitor: re-add monitor window for the restored team
+# NOTE: per-agent registry/sessions are repopulated by agent.spawned/agent.forked
+# events fired during the restore pass, not by team.restored.
+
+private.hiveMind.handler.team.restored.teams() {
+  local session="$1" description="$2"
+  [ -z "$session" ] && return 0
+  local teamsFile="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$teamsFile" ] && grep -q "^${session}|" "$teamsFile" 2>/dev/null && return 0
+  private.hiveMind.teams.ensure.dir 2>/dev/null
+  echo "${session}|${description}" >> "$teamsFile"
+}
+
+private.hiveMind.handler.team.restored.tronMonitor() {
+  local session="$1"
+  [ -z "$session" ] && return 0
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  tronMonitor add "$session" 2>/dev/null || \
+    info.log "tronMonitor add failed/skipped for $session (non-fatal)"
+}
+
+# ── Registration (script-load) ───────────────────────────────────────────────
+
+private.hiveMind.events.register "agent.spawned" "private.hiveMind.handler.agent.spawned.registry"
+private.hiveMind.events.register "agent.spawned" "private.hiveMind.handler.agent.spawned.sessions"
+private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.registry"
+private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.sessions"
+private.hiveMind.events.register "agent.killed"  "private.hiveMind.handler.agent.killed.queue"
+# Order matters: registry mutates first, role_env reads post-mutation
+private.hiveMind.events.register "agent.renamed" "private.hiveMind.handler.agent.renamed.registry"
+private.hiveMind.events.register "agent.renamed" "private.hiveMind.handler.agent.renamed.title"
+private.hiveMind.events.register "agent.renamed" "private.hiveMind.handler.agent.renamed.role_env"
+private.hiveMind.events.register "agent.forked"  "private.hiveMind.handler.agent.forked.registry"
+private.hiveMind.events.register "agent.forked"  "private.hiveMind.handler.agent.forked.sessions"
+private.hiveMind.events.register "agent.forked"  "private.hiveMind.handler.agent.forked.forks"
+private.hiveMind.events.register "panes.shifted" "private.hiveMind.handler.panes.shifted.registry"
+# Order matters: registry mutates first, role_env reads post-mutation state
+private.hiveMind.events.register "panes.swapped" "private.hiveMind.handler.panes.swapped.registry"
+private.hiveMind.events.register "panes.swapped" "private.hiveMind.handler.panes.swapped.role_env"
+# SC-C.8/9/10 team lifecycle — closes V→C event-gap for team.register/remove/restore
+private.hiveMind.events.register "team.created"   "private.hiveMind.handler.team.created.teams"
+private.hiveMind.events.register "team.created"   "private.hiveMind.handler.team.created.tronMonitor"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.teams"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.tronMonitor"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.registry"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.sessions"
+private.hiveMind.events.register "team.destroyed" "private.hiveMind.handler.team.destroyed.queue"
+private.hiveMind.events.register "team.restored"  "private.hiveMind.handler.team.restored.teams"
+private.hiveMind.events.register "team.restored"  "private.hiveMind.handler.team.restored.tronMonitor"
+private.hiveMind.events.register "pane.moved"    "private.hiveMind.handler.pane.moved.registry"
+private.hiveMind.events.register "pane.moved"    "private.hiveMind.handler.pane.moved.role_env"
+
 # ── Role Registry ─────────────────────────────────────────────────────────────
 # Write-through cache: pane target → role name.
 # PRIMARY source of truth is live discovery (process → session UUID → customTitle).
@@ -319,7 +784,9 @@ private.hiveMind.sessions.migrate() {
 }
 
 private.hiveMind.registry.set() {
-  # Add or update a target→role mapping
+  # Add or update a target→role mapping with timestamp (B5.1 TTL).
+  # Format: pane|role|epoch-timestamp (3 fields). Old 2-field entries are
+  # backward-compatible — readers default missing timestamp to 0 (= stale).
   local target="$1"
   local role="$2"
   [ -z "$target" ] || [ -z "$role" ] && return 1
@@ -338,41 +805,96 @@ private.hiveMind.registry.set() {
   local config_dir
   config_dir=$(dirname "$HIVEMIND_REGISTRY")
   mkdir -p "$config_dir" 2>/dev/null
-  # Remove old entry for this target, then append new one
+  # Remove old entry for this target, then append new one with timestamp
   if [ -f "$HIVEMIND_REGISTRY" ]; then
     grep -v "^${target}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
     mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
   fi
-  echo "${target}|${role}" >> "$HIVEMIND_REGISTRY"
+  local ts
+  ts=$(date +%s 2>/dev/null)
+  echo "${target}|${role}|${ts}" >> "$HIVEMIND_REGISTRY"
+}
+
+private.hiveMind.registry.isRecent() { # <pane> # 0 if file entry was set within TTL window
+  # B5.1 — true when manual registry.set should win over live discovery.
+  # Checks 3rd field (timestamp) against now − HIVEMIND_REGISTRY_TTL.
+  local target="$1"
+  [ -z "$target" ] && return 1
+  [ -f "$HIVEMIND_REGISTRY" ] || return 1
+  local ts
+  ts=$(grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f3)
+  [ -z "$ts" ] && return 1               # 2-field entry (legacy) — not recent
+  ! [[ "$ts" =~ ^[0-9]+$ ]] && return 1  # malformed timestamp
+  local now
+  now=$(date +%s 2>/dev/null)
+  [ -z "$now" ] && return 1
+  local age=$(( now - ts ))
+  [ "$age" -lt 0 ] && return 1           # clock skew safety
+  local ttl="${HIVEMIND_REGISTRY_TTL:-30}"
+  [ "$ttl" -eq 0 ] && return 1           # TTL=0 means "always expired" (live-only mode)
+  [ "$age" -le "$ttl" ]
 }
 
 private.hiveMind.registry.get() {
-  # Look up role for a given pane target
-  # PRIMARY: live discovery from running Claude process
-  # FALLBACK: static file (for panes where Claude isn't running yet)
+  # Look up role for a given pane target.
+  # B5.1 priority order:
+  #   1. File entry IF set within HIVEMIND_REGISTRY_TTL (manual-set wins fresh)
+  #   2. Live discovery from running Claude process
+  #   3. File entry (any age) — fallback when live can't find role
   local target="$1"
+  [ -z "$target" ] && return 1
+  private.hiveMind.registry.migrate
+
+  # Priority 1 — recently-set file entry overrides live discovery
+  if private.hiveMind.registry.isRecent "$target"; then
+    grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
+    return 0
+  fi
+
+  # Priority 2 — live discovery (handles /rename'd agents not yet in registry)
   local role
   role=$(private.hiveMind.live.discover "$target" 2>/dev/null)
   [ -n "$role" ] && echo "$role" && return 0
-  # Fallback to static registry file
-  private.hiveMind.registry.migrate
+
+  # Priority 3 — any file entry (stale ok)
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   grep "^${target}|" "$HIVEMIND_REGISTRY" 2>/dev/null | head -1 | cut -d'|' -f2
 }
 
 private.hiveMind.registry.find() {
-  # Find pane target by role name (case-insensitive partial match)
-  # PRIMARY: live discovery — scan panes for matching role
-  # FALLBACK: static file
+  # Find pane target by role name (case-insensitive partial match).
+  # B5.1 priority order:
+  #   1. Recently-set file entries (manual registry.set wins fresh)
+  #   2. Live discovery from running Claude processes
+  #   3. Any file entry (stale ok) — verified to exist in tmux
   local name="$1"
   local session="$2"
+  private.hiveMind.registry.migrate
+
+  # Priority 1 — scan file for recent entries matching role
+  if [ -f "$HIVEMIND_REGISTRY" ]; then
+    local recentCandidates
+    if [ -n "$session" ]; then
+      recentCandidates=$(grep "^${session}:" "$HIVEMIND_REGISTRY" 2>/dev/null | grep -i "$name" | cut -d'|' -f1)
+    else
+      recentCandidates=$(grep -i "$name" "$HIVEMIND_REGISTRY" 2>/dev/null | cut -d'|' -f1)
+    fi
+    local cand
+    for cand in $recentCandidates; do
+      if private.hiveMind.registry.isRecent "$cand"; then
+        otmux has "${cand%%:*}" 2>/dev/null && echo "$cand" && return 0
+      fi
+    done
+  fi
+
+  # Priority 2 — live discovery
   if [ -n "$session" ]; then
     local match
     match=$(private.hiveMind.live.discover.session "$session" 2>/dev/null | grep -i "$name" | head -1 | cut -d'|' -f1)
     [ -n "$match" ] && echo "$match" && return 0
   fi
-  # Fallback to static registry file — verify pane exists in tmux
-  private.hiveMind.registry.migrate
+
+  # Priority 3 — any file entry (stale ok), verified to exist in tmux
   [ -f "$HIVEMIND_REGISTRY" ] || return 1
   local candidates
   if [ -n "$session" ]; then
@@ -382,7 +904,6 @@ private.hiveMind.registry.find() {
   fi
   local pane
   for pane in $candidates; do
-    # Verify pane exists in tmux (skip dead/stale entries)
     otmux has "${pane%%:*}" 2>/dev/null && echo "$pane" && return 0
   done
 }
@@ -572,7 +1093,16 @@ private.hiveMind.monitor.switch() { # <paneTarget> # auto-switch tronMonitor to 
   local pane="$1"
   [ -z "$pane" ] && return
   local session="${pane%%:*}"
-  "tronMonitor" switch "$session" >/dev/null 2>&1 || true
+  # SM-reported bug: tronMonitor switch could hang/crash during screen auto-recovery
+  # after D1.6 — an agent.monitor call would stall, blocking PERMISSION inspection.
+  # Bound the call at 2s and swallow ALL failures (including signals). A failed
+  # visual switch is a UX nicety; it must never block callers like agent.monitor.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 2 "tronMonitor" switch "$session" >/dev/null 2>&1
+  else
+    "tronMonitor" switch "$session" >/dev/null 2>&1
+  fi
+  return 0
 }
 
 private.hiveMind.pane.activity() {
@@ -674,7 +1204,7 @@ hiveMind.protected.agents.offline() # <session> # synthesize 6-field discovery r
   local sesFile="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
   [ -f "$roleFile" ] || return 1
 
-  while IFS='|' read -r pane role; do
+  while IFS='|' read -r pane role _ts; do
     [ -z "$pane" ] && continue
     case "$pane" in "${session}:"*) ;; *) continue ;; esac
     local uuid=""
@@ -789,6 +1319,20 @@ hiveMind.process.lookup.completion.pid() {
   ps -eo pid,args 2>/dev/null | grep -i 'claude' | grep -v grep | awk '{print $1}'
 }
 
+hiveMind.agent.restart.completion.configDir() {
+  # Pulled team config directories that contain a snapshot
+  local d
+  for d in /tmp/hivemind.*/ "${CONFIG_PATH:-$HOME/config}"/hivemind.*/; do
+    [ -f "${d}hivemind.snapshot.env" ] || continue
+    [[ "$d" == *__test_* ]] && continue
+    echo "${d%/}"
+  done
+}
+
+hiveMind.team.restart.completion.configDir() {
+  hiveMind.agent.restart.completion.configDir
+}
+
 hiveMind.agent.restart.completion.role() {
   # c2 passes: $1=cur $2=class $3=method — NOT the configDir
   # Scan all known pull directories for roles in snapshot files
@@ -823,12 +1367,6 @@ hiveMind.team.loop.completion.interval() {
   echo "15"
   echo "30"
   echo "60"
-}
-
-hiveMind.agent.approve.completion.option() {
-  echo "2"
-  echo "1"
-  echo "3"
 }
 
 hiveMind.pane.sweep.completion.interval() {
@@ -1094,6 +1632,17 @@ hiveMind.agent.spawn() # <agentName> <?workdir:.> # spawn a new agent with pane
     error.log "Usage: hiveMind agent.spawn <agentId> <?workdir>"
     return 1
   fi
+  # SC-E.2 P3 — (a) role regex, (b) pipe-safe. Existence (c) is N/A here:
+  # spawn CREATES the agent, so absence is the precondition. Pane creation
+  # happens downstream in pane.create which inherits the validated id.
+  if ! this.isRoleName "$agent_id"; then
+    error.log "agent.spawn: invalid agent name '$agent_id' (must be [A-Za-z][A-Za-z0-9._-]{0,39})"
+    return 1
+  fi
+  if ! this.isPipeSafe "$agent_id"; then
+    error.log "agent.spawn: agent name '$agent_id' contains '|' or newline — rejected"
+    return 1
+  fi
 
   # Find next free port
   local used_ports=$(agentRoom list.ports 2>/dev/null | sort -n | tail -1)
@@ -1184,7 +1733,7 @@ hiveMind.status() # <?session> # show team status for one or all sessions (falls
     printf "  ${BOLD_WHITE}%-30s${NORMAL} ${GRAY}%s${NORMAL}\n" "$sess" "${desc:-(no description)}"
   done < "$teamsFile"
   echo ""
-  echo -e "${GRAY}Start with:${NORMAL}  hiveMind teams.restore --fork"
+  echo -e "${GRAY}Start with:${NORMAL}  hiveMind teams.restore fork"
   echo -e "${GRAY}Restart one:${NORMAL}  hiveMind team.restart <configDir>"
   echo -e "${GRAY}Pull remote:${NORMAL}  hiveMind team.pull <host>"
   return 0
@@ -1325,62 +1874,42 @@ hiveMind.resolve.completion.session() {
   private.hiveMind.teams.complete
 }
 
-hiveMind.send() # <agentName> <text...> # send text/keys to agent by name (delegates to otmux send)
+hiveMind.send() # <agentName> <text...> # DEPRECATED — context-aware wrapper around agent.send (Epic I Phase 2)
 {
+  # Epic I Phase 2 (PO decision 2): legacy hiveMind.send is now a thin wrapper
+  # around hiveMind.agent.send. Existing callers automatically gain state-aware
+  # routing — no longer interrupts active agents or sends into overlays. The
+  # original Bug #4 target-format validation lives inside agent.send / route.
   local name="$1"
   shift
-
-  if [ -z "$name" ] || [ -z "$*" ]; then
+  if [ -z "$name" ]; then
     error.log "Usage: hiveMind send <name> <text...>"
     return 1
   fi
-
-  local target
-  target=$(hiveMind.resolve "$name")
-  if [ $? -ne 0 ]; then
-    return 1
+  # Tron P0 (2026-05-12): empty/whitespace text → silent no-op. Shared
+  # this.isEmpty predicate so guard is identical to otmux's. Stops bare
+  # `[@role pane]` prefix from being delivered as a phantom prompt.
+  if this.isEmpty "$*"; then
+    debug.log "hiveMind.send: empty/whitespace-only text — silent no-op (name=$name)"
+    return 0
   fi
-  private.hiveMind.monitor.switch "$target"
-
-  # Delegate all detection (keys, /commands, text+key combos) to otmux send
-  otmux send "$target" "$@"
-  info.log "Sent to $name ($target): $*"
-  return 0
+  hiveMind.agent.send "$name" "$@"
 }
 
-hiveMind.send.message() # <agentName> <message> # safe send: resolve name across ALL teams, delegate to otmux send
+hiveMind.send.message() # <agentName> <message> # DEPRECATED — context-aware wrapper around agent.send (Epic I Phase 2)
 {
+  # See hiveMind.send above. This entry point is preserved for back-compat.
   local name="$1"
   shift
-  local message="$*"
-
-  if [ -z "$name" ] || [ -z "$message" ]; then
+  if [ -z "$name" ]; then
     error.log "Usage: hiveMind send.message <name> <message>"
     return 1
   fi
-
-  # Cross-team resolve. For disambiguation between same-named agents in
-  # multiple teams, caller must use hiveMind.resolve directly with a session.
-  local target
-  target=$(hiveMind.resolve "$name" 2>/dev/null)
-  if [ -z "$target" ]; then
-    error.log "Cannot resolve '$name' in any team"
-    return 1
+  if this.isEmpty "$*"; then
+    debug.log "hiveMind.send.message: empty/whitespace-only text — silent no-op (name=$name)"
+    return 0
   fi
-  private.hiveMind.monitor.switch "$target"
-
-  # Delegate all tmux logic to otmux (DRY — accept-edits, C-u, verify all in one place)
-  "otmux" send "$target" "$message"
-  local rc=$?
-
-  if [ $rc -eq 0 ]; then
-    info.log "Message delivered to $name ($target)"
-    create.result 0 "DELIVERED"
-  else
-    warn.log "Message delivery uncertain for $name ($target)"
-    create.result 0 "UNCERTAIN"
-  fi
-  return $rc
+  hiveMind.agent.send "$name" "$@"
 }
 hiveMind.send.enter() { # <agentName> <message> # send message to agent (alias for send.message)
   hiveMind.send.message "$@"
@@ -1389,15 +1918,23 @@ hiveMind.send.enter() { # <agentName> <message> # send message to agent (alias f
 # TRANSPORT-INDEPENDENT MESSAGING
 # ─────────────────────────────────────────────────────────────────────────────
 
-private.hiveMind.channel.resolve() # <agentName> # resolve agent name to best available communication channel
+private.hiveMind.channel.resolve() # <agentName|pane> # resolve agent name to best available communication channel
 {
   local name="$1"
   [ -z "$name" ] && return 1
 
-  # Channel 1: tmux pane via registry
-  local pane_target
+  # Direct pane target — bypass registry resolve entirely
+  if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    echo "pane|${name}"
+    return 0
+  fi
+
+  # Channel 1: tmux pane via registry. Bug #4 gotcha: hiveMind.resolve writes
+  # error.log to stdout — `[ -n "$pane_target" ]` alone is fooled. Use rc + format.
+  local pane_target rc
   pane_target=$(hiveMind.resolve "$name" 2>/dev/null)
-  if [ -n "$pane_target" ]; then
+  rc=$?
+  if [ $rc -eq 0 ] && [[ "$pane_target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
     echo "pane|${pane_target}"
     return 0
   fi
@@ -1416,42 +1953,185 @@ private.hiveMind.channel.resolve() # <agentName> # resolve agent name to best av
   return 1
 }
 
-hiveMind.agent.send() # <agentName> <message> # send message to agent via best available channel
+private.hiveMind.agent.inform() # <pane> <text...> # INFORM path: deliver text as user-turn input to agent at idle ❯
 {
+  # Epic I I1.2 — INFORM path. Pre-condition: caller (router) verified the
+  # pane is at idle. Delegates to otmux.send (smart prefix from B5, target
+  # validation from Bug #4). Notify monitor for observer pattern (B1.4).
+  local pane="$1"
+  shift
+  [ -z "$pane" ] && { error.log "private.hiveMind.agent.inform: missing pane"; return 1; }
+  # Tron P0: silent no-op on empty/whitespace text (DRY via this.isEmpty).
+  # The downstream otmux.send also enforces this guard — duplicated here so we
+  # don't pay the monitor.switch cost for a payload that won't be delivered.
+  this.isEmpty "$*" && { debug.log "agent.inform: empty payload — silent no-op (pane=$pane)"; return 0; }
+
+  private.hiveMind.monitor.switch "$pane" 2>/dev/null
+  otmux send "$pane" "$@"
+  return $?
+}
+
+private.hiveMind.agent.route() # <pane> # classify pane state → route name (inform|overlay|queue|unknown-state)
+{
+  # Epic I I1.1: maps sweep.detect's 18 states to one of 4 routes:
+  #   inform              — INFORM path (only when at idle ❯ prompt)
+  #   overlay             — REMOTE CONTROL allowed (modal needs approve/reject/dismiss/option)
+  #   queue               — agent busy or transient state, defer message
+  #   unknown-state       — sweep.detect couldn't classify (conservative queue)
+  local pane="$1"
+  [ -z "$pane" ] && { echo "unknown-state"; return 1; }
+
+  local detect status
+  detect=$(private.hiveMind.sweep.detect "$pane" 2>/dev/null)
+  status="${detect%%|*}"
+
+  case "$status" in
+    idle)
+      echo "inform"
+      ;;
+    permission|accept-edits|tool-confirm|overlay|panel|autocomplete|shell-escaped)
+      echo "overlay"
+      ;;
+    active|queued|context-warning|just-compacted|shell)
+      echo "queue"
+      ;;
+    rate-limit|subscription-limit|crash|api-error|mcp-error)
+      # Critical: neither send nor remote-control fixes these. Queue for later;
+      # drain will retry once state recovers (or human intervenes).
+      echo "queue"
+      ;;
+    ""|unknown|*)
+      echo "unknown-state"
+      ;;
+  esac
+}
+
+hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFORM, busy→QUEUE, overlay→reject (use approve/reject) [Epic I]
+{
+  # Epic I I1.1 router. Transport-aware (pane vs api) AND state-aware (only sends
+  # to idle agents; queues otherwise; rejects overlay states with guidance).
   local name="$1"
   shift
   local message="$*"
 
-  if [ -z "$name" ] || [ -z "$message" ]; then
+  if [ -z "$name" ]; then
     error.log "Usage: hiveMind agent.send <name> <message>"
     return 1
+  fi
+  # Tron P0: empty/whitespace message → silent no-op (DRY via this.isEmpty).
+  # Same guard as otmux.send — Controller never produces a prefix-only payload
+  # for the View even if a caller passes an empty $message by accident.
+  if this.isEmpty "$message"; then
+    debug.log "hiveMind.agent.send: empty/whitespace-only message — silent no-op (name=$name)"
+    return 0
   fi
 
   local channel
   channel=$(private.hiveMind.channel.resolve "$name")
   if [ $? -ne 0 ]; then
     error.log "No communication channel available for agent '$name'"
+    create.result 1 "no-channel: $name"
     return 1
   fi
 
   local transport="${channel%%|*}"
   local target="${channel#*|}"
 
-  case "$transport" in
-    pane)
-      otmux send.enter "$target" "$message"
+  # API transport — no pane state to detect. Send directly.
+  if [ "$transport" = "api" ]; then
+    agentRoom chat "$target" "$message"
+    info.log "Sent to $name via api ($target)"
+    create.result 0 "delivered $name $target via api"
+    return 0
+  fi
+
+  # Pane transport — route via state detection.
+  local route
+  route=$(private.hiveMind.agent.route "$target")
+
+  case "$route" in
+    inform)
+      private.hiveMind.agent.inform "$target" "$message"
+      local rc=$?
+      if [ $rc -eq 0 ]; then
+        info.log "INFORM delivered to $name ($target)"
+        create.result 0 "delivered $name $target"
+        return 0
+      fi
+      warn.log "INFORM uncertain for $name ($target)"
+      create.result 1 "uncertain: inform-failed $name"
+      return $rc
       ;;
-    api)
-      agentRoom chat "$target" "$message"
+    overlay)
+      error.log "rejected: $name is in overlay state — use hiveMind agent.approve/reject/dismiss/option"
+      create.result 1 "rejected: in-overlay"
+      return 1
+      ;;
+    queue|unknown-state)
+      # I1.4 — persist to queue file; drain happens via agent.unblock idle hook.
+      private.hiveMind.agent.queue.enqueue "$target" "inform" "$message"
+      local pos
+      pos=$(private.hiveMind.agent.queue.depth "$target")
+      info.log "QUEUE: $name ($target) busy (route=$route) — queued at position $pos"
+      create.result 0 "queued $name $pos (route=$route)"
+      return 0
       ;;
     *)
-      error.log "Unknown transport: $transport"
+      error.log "Internal: unknown route '$route' for $name"
+      create.result 1 "internal: unknown-route"
       return 1
       ;;
   esac
+}
+hiveMind.agent.send.completion.agentName() {
+  private.hiveMind.roles.complete
+}
 
-  info.log "Sent to $name via $transport ($target): $message"
-  return 0
+hiveMind.agent.session.probe() # <agentName|pane> <?session> # ground-truth UUID via /status + JSONL correlation (slow ~3s)
+{
+  # A1.2 Fix #2b: Controller side of session.probe. View I/O lives here;
+  # parsing delegates to claudeCode.session.probe.fromCapture (Model parser).
+  # Replaces the pre-migration claudeCode.session.probe composite method.
+  local input="$1"
+  if [ -z "$input" ]; then
+    error.log "Usage: hiveMind agent.session.probe <agentName|pane> <?session>"
+    return 1
+  fi
+
+  # Accept pane target directly OR resolve agent name to pane
+  local target
+  if [[ "$input" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]] || [[ "$input" =~ ^%[0-9]+$ ]]; then
+    target="$input"
+  else
+    local rc
+    target=$(hiveMind.resolve "$input" "${2:-}" 2>/dev/null)
+    rc=$?
+    if [ $rc -ne 0 ] || [ -z "$target" ]; then
+      error.log "agent.session.probe: cannot resolve '$input' (rc=$rc)"
+      return 1
+    fi
+  fi
+
+  # Skip if pane is not running Claude Code (prevents /status pollution in plain bash)
+  if ! claudeCode process.running "$target" 2>/dev/null; then
+    return 1
+  fi
+
+  # View I/O: send /status, wait for TUI to render, capture, dismiss modal
+  otmux send.raw "$target" "/status" Enter
+  sleep 3
+  local capture
+  capture=$(otmux pane.capture "$target" 40 2>/dev/null)
+  otmux send.raw "$target" Escape
+
+  # Model parse: delegate to pure parser (no I/O, no tmux dep)
+  claudeCode session.probe.fromCapture "$capture"
+}
+hiveMind.agent.session.probe.completion.agentName() {
+  private.hiveMind.roles.complete
+}
+hiveMind.agent.session.probe.completion.session() {
+  private.hiveMind.teams.complete
 }
 # ─────────────────────────────────────────────────────────────────────────────
 # TASK MANAGEMENT
@@ -1625,6 +2305,12 @@ hiveMind.broadcast() # <message> # send message to all agents
     error.log "Usage: hiveMind broadcast <message>"
     return 1
   fi
+  # Tron P0: whitespace-only message refused at controller level (avoid
+  # fanning out N silent no-ops in the per-agent loop).
+  if this.isEmpty "$message"; then
+    debug.log "hiveMind.broadcast: whitespace-only message — refusing fan-out"
+    return 0
+  fi
 
   info.log "Broadcasting: $message"
 
@@ -1777,7 +2463,7 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
       sid=$("claudeCode" session.id "$paneTarget" 2>/dev/null)
     fi
     if [ -z "$sid" ]; then
-      sid=$("claudeCode" session.probe "$paneTarget" 2>/dev/null)
+      sid=$(hiveMind.agent.session.probe "$paneTarget" 2>/dev/null)
     fi
     
 
@@ -1793,13 +2479,397 @@ hiveMind.process.list() # <?session> # list all Claude processes with pane targe
   return 0
 }
 
-hiveMind.teams.save() # # snapshot all Claude processes for restore after restart
+hiveMind.roles.list.uuids() # <role> # list all session UUIDs that ever ran as <role>, sorted by recency (Epic J1)
+{
+  # Output: tab-separated rows + header. Status ∈ {live, dead, orphan}.
+  # Sources (DRY):
+  #   • JSONL scan for sessionId + tail customTitle + mtime (mirrors claudeCode list)
+  #   • ps for live UUID→pane (mirrors hiveMind process.list internals via private.claude.processes)
+  # Match: customTitle equal-or-prefix-of role|fallback-role (case-insensitive).
+  # Strips '@model' suffix on the title before comparison.
+  local role="$1"
+  if [ -z "$role" ]; then
+    error.log "Usage: hiveMind roles.list.uuids <role>"
+    return 1
+  fi
+
+  ROLE="$role" python3 << 'EOF'
+import os, glob, sys, re, time, subprocess
+
+role = os.environ.get('ROLE', '').lower()
+
+# 1. Live UUID → pane map via ps (same source private.hiveMind.claude.processes uses)
+live = {}  # uuid → pane
+try:
+    out = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, check=False).stdout
+    uuid_re = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    for line in out.splitlines():
+        if 'claude' not in line.lower():
+            continue
+        m = uuid_re.search(line)
+        if m:
+            live[m.group(0)] = '?'  # pane unknown without tmux cross-ref
+except Exception:
+    pass
+
+# Cross-ref pane via tmux (one tmux call, parse pane→tty + ps tty→uuid)
+try:
+    panes = subprocess.run(['tmux', 'list-panes', '-a', '-F', '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}'],
+                            capture_output=True, text=True, check=False).stdout
+    tty_to_pane = {}
+    for line in panes.splitlines():
+        parts = line.split(' ', 1)
+        if len(parts) == 2:
+            tty_to_pane[parts[0].replace('/dev/', '')] = parts[1]
+    # Re-scan ps with tty for live UUIDs
+    psout = subprocess.run(['ps', '-eo', 'tty,args'], capture_output=True, text=True, check=False).stdout
+    for line in psout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        tty, args = parts
+        if 'claude' not in args.lower():
+            continue
+        m = uuid_re.search(args)
+        if not m:
+            continue
+        uuid = m.group(0)
+        pane = tty_to_pane.get(tty, '?')
+        if pane != '?':
+            live[uuid] = pane
+        elif uuid not in live:
+            live[uuid] = '?'
+except Exception:
+    pass
+
+# 2. Scan JSONL files for sessionId + customTitle + mtime
+projects_dir = os.path.expanduser('~/.claude/projects')
+ct_re = re.compile(r'"customTitle":"([^"]*)"')
+results = []
+
+for project_dir in glob.glob(os.path.join(projects_dir, '*')):
+    if not os.path.isdir(project_dir):
+        continue
+    if os.path.basename(project_dir) == '-':
+        continue
+    for f in glob.glob(os.path.join(project_dir, '*.jsonl')):
+        sid = os.path.basename(f)[:-len('.jsonl')]
+        try:
+            mtime = int(os.path.getmtime(f))
+        except OSError:
+            continue
+        # Read tail (last 64KB) for customTitle
+        title = ''
+        try:
+            with open(f, 'rb') as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 65536))
+                tail = fh.read().decode('utf-8', errors='ignore')
+            for ln in reversed(tail.split('\n')):
+                m = ct_re.search(ln)
+                if m:
+                    title = m.group(1)
+                    break
+        except OSError:
+            continue
+
+        # Strip '@model' for comparison
+        bare = title.split('@', 1)[0].lower()
+        if not (bare == role or bare == 'fallback-' + role):
+            continue
+
+        if sid in live:
+            status = 'live'
+            pane = live[sid]
+        else:
+            age = time.time() - mtime
+            status = 'dead' if age < 86400 else 'orphan'
+            pane = '—'
+
+        last_active = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(mtime))
+        results.append((sid, title, pane, last_active, status, mtime))
+
+# 3. Sort by mtime desc and print (colorized like claudeCode list)
+results.sort(key=lambda x: x[5], reverse=True)
+
+# ANSI color codes — matches claudeCode list scheme:
+#   UUID = gray, TITLE = bold white, status: live=green, dead=red, orphan=yellow
+GRAY        = '\033[90m'
+BOLD_WHITE  = '\033[1;37m'
+BOLD_CYAN   = '\033[1;36m'
+BOLD_GREEN  = '\033[1;32m'
+BOLD_RED    = '\033[1;31m'
+BOLD_YELLOW = '\033[1;33m'
+NORMAL      = '\033[0m'
+
+status_color = {'live': BOLD_GREEN, 'dead': BOLD_RED, 'orphan': BOLD_YELLOW}
+
+# Header (gray underline-style row, no color on labels)
+print(f'{GRAY}{"UUID":<36}  {"TITLE":<28}  {"PANE":<24}  {"LAST_ACTIVE":<19}  STATUS{NORMAL}')
+
+for sid, title, pane, last_active, status, _ in results:
+    sc = status_color.get(status, GRAY)
+    pc = BOLD_CYAN if pane != '—' else GRAY
+    # widths must use uncolored text; color wraps the text only
+    print(
+        f'{GRAY}{sid:<36}{NORMAL}  '
+        f'{BOLD_WHITE}{title[:28]:<28}{NORMAL}  '
+        f'{pc}{pane[:24]:<24}{NORMAL}  '
+        f'{last_active:<19}  '
+        f'{sc}{status}{NORMAL}'
+    )
+
+if not results:
+    sys.exit(1)
+EOF
+}
+
+hiveMind.roles.list.uuids.completion.role() {
+  # Live roles + offer fallback-<role> variants
+  local roles
+  roles=$("$OOSH_DIR/hiveMind" role.list 2>/dev/null)
+  echo "$roles"
+  echo "$roles" | sed 's/^/fallback-/'
+}
+
+hiveMind.agent.fork.best() # <role> <targetPane> # find best-trained session for <role> and fork it into <targetPane> (Epic J2)
+{
+  # Selection per session/tasks/j2-fork-best-design.md:
+  #   • PRIMARY signal: JSONL file size (large = trained, small = boot/recovery attempt)
+  #   • Filter: skip <50KB (broken attempts)
+  #   • Tiebreaker: bare role name > fallback-* prefix; more recent > older
+  # Reuses the same JSONL+ps scan as roles.list.uuids (DRY logic, single python pass).
+  # After fork: wait for startup, send boot.md if exists, register in roles.env.
+  local role="$1"
+  local targetPane="$2"
+  if [ -z "$role" ] || [ -z "$targetPane" ]; then
+    error.log "Usage: hiveMind agent.fork.best <role> <targetPane>"
+    return 1
+  fi
+
+  # Pane target validity check (defence-in-depth — same as send methods)
+  if ! [[ "$targetPane" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    error.log "agent.fork.best: malformed targetPane '$targetPane'"
+    return 1
+  fi
+
+  local picked
+  picked=$(ROLE="$role" python3 << 'EOF'
+import os, glob, sys, re, time, subprocess
+
+role = os.environ.get('ROLE', '').lower()
+
+# Build live UUID set via ps (skip dead-process classification — fork.best
+# doesn't care about live status, only quality)
+live = set()
+try:
+    out = subprocess.run(['ps', '-eo', 'args='], capture_output=True, text=True, check=False).stdout
+    uuid_re = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    for line in out.splitlines():
+        if 'claude' not in line.lower():
+            continue
+        for m in uuid_re.findall(line):
+            live.add(m)
+except Exception:
+    pass
+
+projects_dir = os.path.expanduser('~/.claude/projects')
+ct_re = re.compile(r'"customTitle":"([^"]*)"')
+candidates = []  # (size, tools, mtime, uuid, title, prefer_bare)
+
+for project_dir in glob.glob(os.path.join(projects_dir, '*')):
+    if not os.path.isdir(project_dir) or os.path.basename(project_dir) == '-':
+        continue
+    for f in glob.glob(os.path.join(project_dir, '*.jsonl')):
+        sid = os.path.basename(f)[:-len('.jsonl')]
+        try:
+            size = os.path.getsize(f)
+            mtime = int(os.path.getmtime(f))
+        except OSError:
+            continue
+        # Read tail for customTitle
+        title = ''
+        try:
+            with open(f, 'rb') as fh:
+                fh.seek(0, 2)
+                total = fh.tell()
+                fh.seek(max(0, total - 65536))
+                tail = fh.read().decode('utf-8', errors='ignore')
+            for ln in reversed(tail.split('\n')):
+                m = ct_re.search(ln)
+                if m:
+                    title = m.group(1)
+                    break
+        except OSError:
+            continue
+        bare = title.split('@', 1)[0].lower()
+        is_bare = bare == role
+        is_fallback = bare == 'fallback-' + role
+        if not (is_bare or is_fallback):
+            continue
+        # Tool count via grep — cheap on text mode but we need a count
+        # Use subprocess for speed on large files (10MB+)
+        try:
+            tools = int(subprocess.run(['grep', '-c', '"tool_use"', f],
+                                        capture_output=True, text=True, check=False).stdout.strip() or 0)
+        except Exception:
+            tools = 0
+        prefer_bare = 1 if is_bare else 0
+        candidates.append((size, tools, mtime, sid, title, prefer_bare))
+
+if not candidates:
+    print('NO_CANDIDATES')
+    sys.exit(1)
+
+# Sort all by size desc for display
+candidates.sort(key=lambda x: x[0], reverse=True)
+
+THRESHOLD = 50000  # 50KB — design spec
+qualified = [c for c in candidates if c[0] >= THRESHOLD]
+
+# Display block to stderr (visible to caller)
+def fmt_size(s):
+    if s >= 1048576: return f'{s/1048576:.1f}MB'
+    if s >= 1024:    return f'{s//1024}KB'
+    return f'{s}B'
+
+print(f'\nCandidates for {role} ({len(candidates)} found):', file=sys.stderr)
+shown_best = False
+for c in candidates:
+    size, tools, mtime, sid, title, prefer_bare = c
+    when = time.strftime('%b %d %H:%M', time.localtime(mtime))
+    sized = fmt_size(size)
+    flag = ''
+    if size < THRESHOLD:
+        flag = 'SKIP'
+    elif not shown_best:
+        flag = 'BEST'
+        shown_best = True
+    live_mark = ' (LIVE)' if sid in live else ''
+    print(f'  {flag:>4} → {sid[:8]}  {sized:>7}  {tools:>5} tools  {title:<28}  {when}{live_mark}', file=sys.stderr)
+
+if not qualified:
+    # Fallback per design: warn + use most recent anyway
+    print('NO_QUALIFIED', file=sys.stderr)
+    candidates.sort(key=lambda x: x[2], reverse=True)  # most recent
+    pick = candidates[0]
+    print(f'  WARN: no candidate above 50KB — falling back to most recent ({pick[3][:8]})', file=sys.stderr)
+    print(pick[3])  # uuid to stdout
+    sys.exit(0)
+
+# Tiebreaker on top candidates within ±10% of best size
+best_size = qualified[0][0]
+top = [c for c in qualified if c[0] >= best_size * 0.9]
+# Within tied group: prefer bare > fallback, then more recent
+top.sort(key=lambda c: (-c[5], -c[2]))
+pick = top[0]
+print(pick[3])  # uuid to stdout
+EOF
+)
+  local rc=$?
+
+  if [ "$picked" = "NO_CANDIDATES" ] || [ -z "$picked" ]; then
+    error.log "No JSONL sessions found for role '$role'. Suggest: hiveMind agent.bootstrap $role"
+    return 1
+  fi
+
+  # Live process safety: refuse to fork a UUID that's currently alive
+  if ps -eo args= 2>/dev/null | grep -F "$picked" | grep -q claude; then
+    warn.log "Selected UUID $picked is currently LIVE — forking the live UUID will create a sibling, not recover. Confirm intent or pick a different one."
+  fi
+
+  info.log "Forking $picked into $targetPane..."
+
+  # Step 7: fork via Model. Cd handled by claudeCode internal resolve.
+  "$OOSH_DIR/otmux" send.enter "$targetPane" "claudeCode fork $picked"
+
+  # Step 8: wait for startup
+  sleep 8
+
+  # Step 9: rename inside Claude — sets customTitle so future session.id /
+  # session.name lookups return the role. Slash command, not text.
+  "$OOSH_DIR/otmux" send.raw "$targetPane" "/rename $role" Enter
+  sleep 0.5
+
+  # Step 10: pane title — visible label in tmux border. Lock it so Claude's
+  # automatic title updates (firstPrompt etc) don't overwrite the role.
+  "$OOSH_DIR/otmux" pane.title "$targetPane" "$role"
+
+  # Step 11: send boot file if it exists (Controller knows where boot files live)
+  local workspace bootFile
+  workspace=$(git rev-parse --show-toplevel 2>/dev/null)
+  bootFile="${workspace}/session/agents/${role}/boot.md"
+  if [ -f "$bootFile" ]; then
+    "$OOSH_DIR/otmux" send "$targetPane" "Read session/agents/${role}/boot.md" Enter
+    info.log "Boot file sent: session/agents/${role}/boot.md"
+  else
+    info.log "No boot file at session/agents/${role}/boot.md — skipping"
+  fi
+
+  # Step 12: registry update — pane → role mapping. Sender prefix + agent.send
+  # rely on this. HIVEMIND_ROLE env not pushed here because target pane runs
+  # Claude TUI (text injection would land in the agent's input prompt).
+  # Registry IS the source of truth for Claude panes.
+  hiveMind.registry.set "$targetPane" "$role"
+  success.log "Forked $role into $targetPane (UUID ${picked:0:8}, renamed, registered)"
+}
+hiveMind.agent.fork.best.completion.role() {
+  hiveMind.roles.list.uuids.completion.role
+}
+hiveMind.agent.fork.best.completion.targetPane() {
+  otmux panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+private.hiveMind.pane.kind() # <paneTarget> # classify pane: claude | shell | monitor | unknown
+{
+  local target="$1"
+  [ -z "$target" ] && { echo unknown; return 0; }
+  local cmd
+  cmd=$(otmux pane.get "$target" '#{pane_current_command}' 2>/dev/null)
+  case "$cmd" in
+    node|claude) echo claude ;;
+    bash|zsh|sh|fish)
+      # bash/zsh parent could be hiding Claude; check via Model
+      if "$OOSH_DIR/claudeCode" process.running "$target" 2>/dev/null; then
+        echo claude
+      else
+        echo shell
+      fi
+      ;;
+    screen|screen-256color) echo monitor ;;
+    *) echo unknown ;;
+  esac
+}
+
+private.hiveMind.pane.model() # <paneTarget> # extract model flag from running claude's ps args
+{
+  local target="$1"
+  [ -z "$target" ] && return 0
+  local wrapperPid
+  wrapperPid=$("$OOSH_DIR/claudeCode" process.find "$target" 2>/dev/null)
+  [ -z "$wrapperPid" ] && return 0
+
+  # process.find returns the bash wrapper PID (claudeCode ...). The actual
+  # `claude --model X --resume UUID` is a child process. Walk children.
+  local childPid
+  childPid=$(pgrep -P "$wrapperPid" 2>/dev/null | head -1)
+  # Try the child first, fall back to wrapper (in case direct claude invocation)
+  local args
+  args=$(ps -p "${childPid:-$wrapperPid}" -o args= 2>/dev/null)
+  [ -z "$args" ] && [ -n "$wrapperPid" ] && args=$(ps -p "$wrapperPid" -o args= 2>/dev/null)
+  # Match claude-<model>-<version>[1m]? from --model flag
+  echo "$args" | grep -oE 'claude-(opus|sonnet|haiku)-[0-9a-z-]+(\[[0-9]+m\])?' | head -1
+}
+
+hiveMind.teams.save() # # snapshot all Claude processes + layout for cold-restart (schema: sess|addr|role|uuid|title|cwd|model|kind)
 {
   local configPath="${CONFIG_PATH:-$HOME/config}"
   local outfile="${configPath}/hivemind.snapshot.$(date +%Y%m%dT%H%M%S).env"
 
   local count=0
   local tmpEntries="${outfile}.unsorted.$$"
+  local seenSessions=""
 
   while IFS='|' read -r pid tty paneTarget title rest; do
     [ -z "$pid" ] && continue
@@ -1812,64 +2882,136 @@ hiveMind.teams.save() # # snapshot all Claude processes for restore after restar
     local sid
     sid=$(private.hiveMind.session.resolve.uuid "$paneTarget" 2>/dev/null)
 
-    # Role priority (correct order): customTitle (live.discover) → registry → pane title → "unknown"
-    # DRY: role.fromTitle already strips prefixes / @model / whitespace / generic markers.
+    # Role priority: customTitle → registry → pane title → "unknown"
     local role
     role=$(private.hiveMind.live.discover "$paneTarget" 2>/dev/null)
     [ -z "$role" ] && role=$(private.hiveMind.registry.get "$paneTarget" 2>/dev/null)
     [ -z "$role" ] && role=$(private.hiveMind.role.fromTitle "$title" 2>/dev/null)
     [ -z "$role" ] && role="unknown"
 
-    echo "${sess}|${addr}|${role}|${sid:-}|${role:-}" >> "$tmpEntries"
+    # NEW C1 fields: cwd, model, kind
+    local cwd model kind
+    cwd=$(otmux pane.get "$paneTarget" '#{pane_current_path}' 2>/dev/null)
+    model=$(private.hiveMind.pane.model "$paneTarget" 2>/dev/null)
+    kind=$(private.hiveMind.pane.kind "$paneTarget" 2>/dev/null)
+
+    echo "${sess}|${addr}|${role}|${sid:-}|${role:-}|${cwd:-}|${model:-}|${kind:-unknown}" >> "$tmpEntries"
     count=$((count + 1))
+
+    # Track unique sessions for layout.save
+    echo "$seenSessions" | grep -q " ${sess} " || seenSessions="${seenSessions} ${sess} "
   done < <(private.hiveMind.claude.processes)
 
-  # Also include dead agents from registry+sessions.env
+  # Also include dead agents + shell panes from registry+sessions.env.
+  # 3rd field _reg_ts absorbs the optional B5.1 TTL timestamp; absent for
+  # legacy 2-field entries (then _reg_ts is empty and is discarded).
   local reg="$HIVEMIND_REGISTRY"
   local ses="$HIVEMIND_SESSIONS"
   local dead_count=0
+  local ghost_count=0
   if [ -f "$reg" ]; then
-    while IFS='|' read -r pane_target reg_role; do
+    while IFS='|' read -r pane_target reg_role _reg_ts; do
       [ -z "$pane_target" ] || [ -z "$reg_role" ] && continue
-      # Skip if already captured from live processes
       [ -f "$tmpEntries" ] && grep -q "|${reg_role}|" "$tmpEntries" 2>/dev/null && continue
+      # MIG-1: skip ghost registry entries — pane no longer exists in tmux.
+      # Without this filter, stale registry pollutes snapshot and propagates
+      # to remote via team.migrate. Use tmux list-panes (otmux has only checks
+      # sessions; otmux pane.get falls back to focused pane on bad target).
+      if ! tmux list-panes -t "$pane_target" -F '#{pane_id}' 2>/dev/null | grep -q .; then
+        ghost_count=$((ghost_count + 1))
+        continue
+      fi
       local dead_sess="${pane_target%%:*}"
       local dead_addr="${pane_target#*:}"
       local dead_uuid=""
       [ -f "$ses" ] && dead_uuid=$(grep "^${pane_target}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
-      local dead_title="${reg_role}"
-      echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${dead_title} (dead)" >> "$tmpEntries"
+      # Even dead/shell panes get cwd + kind captured
+      local dead_cwd dead_kind
+      dead_cwd=$(otmux pane.get "$pane_target" '#{pane_current_path}' 2>/dev/null)
+      dead_kind=$(private.hiveMind.pane.kind "$pane_target" 2>/dev/null)
+      echo "${dead_sess}|${dead_addr}|${reg_role}|${dead_uuid:-}|${reg_role} (dead)|${dead_cwd:-}||${dead_kind:-shell}" >> "$tmpEntries"
       dead_count=$((dead_count + 1))
+      echo "$seenSessions" | grep -q " ${dead_sess} " || seenSessions="${seenSessions} ${dead_sess} "
     done < "$reg"
   fi
 
-  # Write sorted snapshot: header + entries sorted by session then address
+  # Write sorted snapshot
   {
     echo "# hiveMind snapshot $(date +%Y-%m-%dT%H:%M:%S)"
-    echo "# session|address|role|uuid|title"
+    echo "# session|address|role|uuid|title|cwd|model|kind"
     [ -f "$tmpEntries" ] && sort -t'|' -k1,1 -k2,2 "$tmpEntries"
   } > "$outfile"
   rm -f "$tmpEntries"
 
-  echo "Saved $count live + $dead_count dead agents to $outfile"
+  # C1: save layout for each session touched (View-layer persistence via B2)
+  local layout_count=0
+  for sess in $seenSessions; do
+    [ -z "$sess" ] && continue
+    if otmux has "$sess" 2>/dev/null; then
+      otmux layout.save "$sess" >/dev/null 2>&1 && layout_count=$((layout_count + 1))
+    fi
+  done
+
+  echo "Saved $count live + $dead_count dead agents to $outfile (skipped $ghost_count ghost registry entries)"
+  echo "Saved $layout_count session layouts via otmux layout.save"
   cat "$outfile"
   return 0
 }
 
-hiveMind.teams.restore() # <?snapshotFile> <?--fork> # restore teams from snapshot; --fork uses fork instead of join (cross-machine)
+private.hiveMind.wait.for.claude() # <paneTarget> <?timeout:30> # poll until Claude process alive
 {
-  local snapfile="" forkMode=""
+  local target="$1" timeout="${2:-30}" waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    if "$OOSH_DIR/claudeCode" process.running "$target" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+hiveMind.teams.restore() # <?snapshotFile> <?mode:join|fork> <?sessionFilter> # cold-restart teams from snapshot + layout (compose B2 + claudeCode)
+{
+  # Arg classification (positional, OOSH-style — no flags):
+  #   fork | join                              → forkMode
+  #   existing file on disk                    → snapshot path
+  #   matches this.isSessionName (alpha-num + .-_) → sessionFilter (only that session is restored)
+  # SC-F#7 (post-McDonges-disaster): sessionFilter scopes the restore to ONE
+  # session instead of every row in the snapshot. Prevents bulk-explosion when
+  # team.migrate calls back into restore on the remote.
+  # SC-F#8 (post-McDonges): track whether the caller PROVIDED a snapshot path
+  # vs left it implicit. An explicit-but-missing path must fail loud — the
+  # silent `ls -t | head -1` fallback caused team.migrate's session-slice
+  # transfer failures to fall back to the remote's latest full snapshot,
+  # restoring EVERY session in it (McDonges 18-session bulk-clone disaster).
+  local snapfile="" forkMode="" sessionFilter="" snapfileExplicit=""
   for arg in "$@"; do
     case "$arg" in
-      --fork) forkMode="yes" ;;
-      *) [ -z "$snapfile" ] && snapfile="$arg" ;;
+      fork) forkMode="yes" ;;
+      join) forkMode="" ;;
+      *)
+        if [ -f "$arg" ]; then
+          [ -z "$snapfile" ] && { snapfile="$arg"; snapfileExplicit="yes"; }
+        elif this.isSessionName "$arg" 2>/dev/null; then
+          [ -z "$sessionFilter" ] && sessionFilter="$arg"
+        else
+          # Looks like a path the caller meant — but file doesn't exist. Record
+          # the intent so we can fail loud (not silently fall back to latest).
+          [ -z "$snapfile" ] && { snapfile="$arg"; snapfileExplicit="yes"; }
+        fi
+        ;;
     esac
   done
+  if [ "$snapfileExplicit" = "yes" ] && [ ! -f "$snapfile" ]; then
+    error.log "teams.restore: snapshot file not found: '$snapfile' — refusing to fall back to latest (SC-F#8 fail-loud)"
+    return 1
+  fi
   if [ -z "$snapfile" ]; then
     snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>/dev/null | head -1)
   fi
   if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
-    error.log "No snapshot found. Usage: hiveMind teams.restore <?file> <?--fork>"
+    error.log "No snapshot found. Usage: hiveMind teams.restore <?file> <?mode:join|fork> <?sessionFilter>"
     return 1
   fi
 
@@ -1883,54 +3025,150 @@ hiveMind.teams.restore() # <?snapshotFile> <?--fork> # restore teams from snapsh
     RESTORE_CLEANUP_SESSION="__restore_init"
   fi
 
-  local prev_sess=""
-  while IFS='|' read -r sess addr role uuid title <&3; do
-    [[ "$sess" == "#"* ]] && continue
+  # C1 STEP 1: collect unique sessions, restore layout FIRST via B2 (geometry + titles + cwds)
+  # Bug #4-class hardening: use array, not unquoted $var. A snapshot corrupted
+  # with whitespace-containing session names (e.g. an error message that leaked
+  # in via teams.save) would word-split on the for-loop, registering each token
+  # as a separate team. Already in teams.env: "Did" / "you" / "mean:" entries
+  # from a "Did you mean: <suggestion>" error captured into a 20260427 snapshot.
+  local uniqueSessions=()
+  while IFS= read -r sess; do
     [ -z "$sess" ] && continue
+    # SC-F#7 — sessionFilter scopes restore to ONE session
+    [ -n "$sessionFilter" ] && [ "$sess" != "$sessionFilter" ] && continue
+    uniqueSessions+=("$sess")
+  done < <(grep -v '^#' "$snapfile" 2>/dev/null | cut -d'|' -f1 | sort -u)
+  if [ -n "$sessionFilter" ] && [ ${#uniqueSessions[@]} -eq 0 ]; then
+    error.log "teams.restore: sessionFilter '$sessionFilter' matched no rows in $snapfile"
+    return 1
+  fi
+  [ -n "$sessionFilter" ] && echo "Filter: only session '$sessionFilter' will be restored"
 
-    # Create session if new
-    if [ "$sess" != "$prev_sess" ]; then
-      if ! otmux has "$sess" 2>/dev/null; then
-        echo "Creating session: $sess"
+  # SC-F#10 (post-McDonges): precompute target pane count per session from the
+  # snapshot. The McDonges disaster's ooshTeam 55-pane explosion came from
+  # successive bulk-restore runs each calling ensure.pane for snapshot rows
+  # against an already-populated session — every row beyond the existing max
+  # pane index forced new splits. The guard caps creation: if current >= target
+  # for a session, the iteration loop SKIPS the per-row ensure.pane call.
+  # Metadata (title, registry, claude join) still applies to the existing pane.
+  declare -A TARGET_PANE_COUNT=()
+  while IFS='|' read -r sess _rest; do
+    [ -z "$sess" ] && continue
+    [[ "$sess" == "#"* ]] && continue
+    [ -n "$sessionFilter" ] && [ "$sess" != "$sessionFilter" ] && continue
+    TARGET_PANE_COUNT["$sess"]=$(( ${TARGET_PANE_COUNT["$sess"]:-0} + 1 ))
+  done < <(grep -v '^#' "$snapfile" 2>/dev/null)
+
+  for sess in "${uniqueSessions[@]}"; do
+    [ -z "$sess" ] && continue
+    if otmux has "$sess" 2>/dev/null; then
+      # Idempotency: session exists → apply saved layout with --force (doesn't destroy panes)
+      otmux layout.restore "$sess" --force >/dev/null 2>&1 \
+        && echo "  layout.restore: $sess (session existed — applied saved layout)"
+    else
+      if otmux layout.restore "$sess" >/dev/null 2>&1; then
+        echo "  layout.restore: $sess (created from saved layout)"
+      else
+        # Fallback: no saved layout → create bare session
+        echo "  layout.restore: $sess (no layout file — creating bare session)"
         otmux new "$sess" -d -x 200 -y 50 2>/dev/null
       fi
-      prev_sess="$sess"
     fi
+  done
+
+  # C1 STEP 2: iterate snapshot entries — schema: sess|addr|role|uuid|title|cwd|model|kind
+  local claude_count=0 shell_count=0 skip_count=0
+  while IFS='|' read -r sess addr role uuid title cwd model kind <&3; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$sess" ] && continue
+    # SC-F#7 — skip rows outside the session filter (no-op when filter empty)
+    [ -n "$sessionFilter" ] && [ "$sess" != "$sessionFilter" ] && continue
+    # Default kind for backward-compat with old 5-field snapshots
+    [ -z "$kind" ] && kind=$([ -n "$uuid" ] && echo claude || echo shell)
 
     local pane_target="${sess}:${addr}"
 
-    # Ensure pane exists (create window + split until target pane index exists)
-    private.hiveMind.ensure.pane "$pane_target"
-
-    # Set pane title
-    if [ -n "$title" ]; then
-      "otmux" pane.title "$pane_target" "$title" 2>/dev/null
-    fi
-
-    # Resume Claude if UUID available
-    if [ -n "$uuid" ]; then
-      local joinCmd="join"
-      [ "$forkMode" = "yes" ] && joinCmd="fork"
-      echo "  ${pane_target}: ${joinCmd}ing ${role:-unknown} (${uuid})"
-      "otmux" send.enter "$pane_target" "cd '${CLAUDE_PROJECT_DIR:-/Users/Shared/Workspaces/AI/Claude}'" Enter
-      sleep 0.5
-      "otmux" send.enter "$pane_target" "claudeCode $joinCmd $uuid" Enter
-      # Send boot prompt after resume
-      if [ -n "$role" ] && [ "$role" != "unknown" ]; then
-        sleep 5
-        local boot_file="session/agents/${role}/boot.md"
-        if [ -f "$HIVEMIND_AGENTS_DIR/../../$boot_file" ] 2>/dev/null; then
-          "otmux" send.enter "$pane_target" "Read $boot_file" Enter
-        fi
-      fi
-      # Auto-register child UUID after fork (join keeps same UUID)
-      if [ "$joinCmd" = "fork" ]; then
-        sleep 5
-        private.hiveMind.session.resolve.uuid "$pane_target" 2>/dev/null
-      fi
+    # SC-F#10 — pane-count guard. Skip ensure.pane when the session already has
+    # at least as many panes as the snapshot expects. Prevents cumulative pane
+    # explosion when restore runs against an already-populated session (the
+    # McDonges 55-pane ooshTeam pattern). If the target pane index falls within
+    # the existing pane range, ensure.pane is a no-op anyway; if it falls
+    # beyond, skipping is the conservative choice (operator can layout.restore
+    # explicitly if they want growth).
+    local _curPanes _tgtPanes
+    # session-wide pane count (2nd arg "all" triggers -s in pane.count helper)
+    _curPanes=$(private.hiveMind.pane.count "$sess" all 2>/dev/null)
+    _tgtPanes="${TARGET_PANE_COUNT[$sess]:-0}"
+    if [ "${_curPanes:-0}" -ge "${_tgtPanes:-0}" ] && [ "${_tgtPanes:-0}" -gt 0 ]; then
+      : "skipping ensure.pane — session saturated (${_curPanes} >= ${_tgtPanes})"
     else
-      echo "  ${pane_target}: ${role:-unknown} (no UUID — start manually)"
+      # Pane should already exist from layout.restore; ensure anyway
+      private.hiveMind.ensure.pane "$pane_target"
     fi
+
+    # Set pane title (layout.restore may have done this; re-set for correctness)
+    if [ -n "$title" ]; then
+      otmux pane.title "$pane_target" "$title" 2>/dev/null
+    fi
+
+    # C1 STEP 5: kind-aware dispatch
+    case "$kind" in
+      shell)
+        # Shell panes stay bash — just cd if we have a saved cwd
+        if [ -n "$cwd" ]; then
+          otmux send.enter "$pane_target" "cd '${cwd}'" Enter 2>/dev/null
+        fi
+        echo "  ${pane_target}: ${role} [shell] — left as bash${cwd:+ (cwd: $cwd)}"
+        shell_count=$((shell_count + 1))
+        ;;
+      monitor)
+        # tronMonitor setup handled separately (see tronMonitor.setup)
+        echo "  ${pane_target}: ${role} [monitor] — skipped (tronMonitor.setup handles)"
+        skip_count=$((skip_count + 1))
+        ;;
+      claude|*)
+        if [ -n "$uuid" ]; then
+          # C1 STEP 4: idempotency — skip if Claude already running
+          if "$OOSH_DIR/claudeCode" process.running "$pane_target" 2>/dev/null; then
+            echo "  ${pane_target}: ${role} already running (idempotent skip)"
+            private.hiveMind.registry.set "$pane_target" "$role" 2>/dev/null
+            skip_count=$((skip_count + 1))
+            continue
+          fi
+          local joinCmd="join"
+          [ "$forkMode" = "yes" ] && joinCmd="fork"
+          echo "  ${pane_target}: ${joinCmd}ing ${role} (${uuid:0:8}...)${model:+ model=$model}"
+          # Per-pane cwd (from snapshot, not hardcoded)
+          local restoreCwd="${cwd:-${CLAUDE_PROJECT_DIR:-/Users/Shared/Workspaces/AI/Claude}}"
+          otmux send.enter "$pane_target" "cd '${restoreCwd}'" Enter
+          sleep 0.3
+          # Model flag: use saved model or default to opus[1m]
+          local modelFlag="${model:-claude-opus-4-6[1m]}"
+          otmux send.enter "$pane_target" "claudeCode ${joinCmd}.byID ${uuid}" Enter
+          # C1 STEP 3: poll for Claude alive instead of fixed sleep
+          if private.hiveMind.wait.for.claude "$pane_target" 30; then
+            # Boot prompt for known role
+            if [ -n "$role" ] && [ "$role" != "unknown" ]; then
+              local boot_file="session/agents/${role}/boot.md"
+              if [ -f "$HIVEMIND_AGENTS_DIR/../../$boot_file" ] 2>/dev/null; then
+                otmux send.enter "$pane_target" "Read $boot_file" Enter
+              fi
+            fi
+            # Re-register child UUID for fork (join keeps same UUID)
+            if [ "$joinCmd" = "fork" ]; then
+              sleep 2
+              private.hiveMind.session.resolve.uuid "$pane_target" 2>/dev/null
+            fi
+            claude_count=$((claude_count + 1))
+          else
+            warn.log "${pane_target}: Claude did not start within 30s (timeout)"
+          fi
+        else
+          echo "  ${pane_target}: ${role} (no UUID — start manually)"
+          skip_count=$((skip_count + 1))
+        fi
+        ;;
+    esac
 
     # Update registry
     if [ -n "$role" ] && [ "$role" != "unknown" ]; then
@@ -1939,14 +3177,245 @@ hiveMind.teams.restore() # <?snapshotFile> <?--fork> # restore teams from snapsh
 
   done 3< "$snapfile"
 
+  # C1: re-register teams that were active
+  # SC-C.10: team.register emits team.created (first creation semantics).
+  # We also emit team.restored per-team so handlers can apply restore-specific
+  # behavior (e.g. annotate as restored, run consistency reconcile). Both
+  # handler chains are idempotent; firing both is intentional.
+  for sess in "${uniqueSessions[@]}"; do
+    [ -z "$sess" ] && continue
+    if otmux has "$sess" 2>/dev/null; then
+      hiveMind.team.register "$sess" "Restored from $(basename "$snapfile")" 2>/dev/null
+      private.hiveMind.events.emit "team.restored" "$sess" "$(basename "$snapfile")"
+    fi
+  done
+
+  # B8: enforce 80×40 size floor on restored sessions — guarantees panes are
+  # readable even with no client attached (otherwise tmux + window-size=largest
+  # collapses unattached sessions to 1×1). User can `otmux window.size.unlock`
+  # to revert any session to dynamic.
+  for sess in "${uniqueSessions[@]}"; do
+    [ -z "$sess" ] && continue
+    if otmux has "$sess" 2>/dev/null; then
+      otmux window.size.lock "$sess" 2>/dev/null
+    fi
+  done
+
   # Clean up init session if we created it
   if [ -n "$RESTORE_CLEANUP_SESSION" ]; then
     otmux kill "$RESTORE_CLEANUP_SESSION" 2>/dev/null
   fi
 
   echo ""
-  echo "Restore complete. Check with: hiveMind team.status"
+  echo "Restore complete: ${claude_count} Claude resumed, ${shell_count} shells restored, ${skip_count} skipped."
+  echo "Check with: hiveMind team.status"
   return 0
+}
+
+hiveMind.team.migrate() # <session> <sshHost> <?snapshotFile> # migrate ONE team to remote — session-filtered, merge-on-remote (preserves remote's other teams)
+{
+  # Single-team migration. Mirrors teams.migrate but filtered to one session at
+  # every step. Architect/PO design (2026-05-18):
+  #   Q1 merge-on-remote — preserves remote's other teams (vs clobber)
+  #   Q2 auto-snapshot — generates if no snapshot found
+  #   Q3 success.log only for v1 (no event emission yet)
+  #   Q4 singular team.migrate (teams.migrate plural stays as full-machine)
+  # Gotcha (architect): use $1==s exact match, not $1~s — prevents ooshTeam from
+  # also matching ooshTeam2 as a prefix.
+  local session="$1" host="$2" snapfile="$3"
+  if [ -z "$session" ] || [ -z "$host" ]; then
+    error.log "Usage: hiveMind team.migrate <session> <sshHost> <?snapshotFile>"
+    return 1
+  fi
+  # Ingress P3 — SC-E.2 pattern
+  if ! this.isSessionName "$session"; then
+    error.log "team.migrate: invalid session name '$session'"
+    return 1
+  fi
+  if ! this.isPipeSafe "$session"; then
+    error.log "team.migrate: '|' or newline in session name — rejected"
+    return 1
+  fi
+  if ! otmux has "$session" 2>/dev/null; then
+    error.log "team.migrate: '$session' is not a live tmux session"
+    return 1
+  fi
+
+  : ${LOG_LIVE:=$HOME/config/log.live.out}
+  touch "$LOG_LIVE" 2>>"$LOG_LIVE"
+  important.log "team.migrate $session → $host (stderr in $LOG_LIVE — tail with: log live)"
+
+  # 1. Resolve / auto-create snapshot (PO Q2)
+  if [ -z "$snapfile" ]; then
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>>"$LOG_LIVE" | head -1)
+  fi
+  if [ -z "$snapfile" ] || [ ! -f "$snapfile" ]; then
+    info.log "No snapshot found — running teams.save first"
+    hiveMind.teams.save
+    snapfile=$(ls -t "${CONFIG_PATH:-$HOME/config}"/hivemind.snapshot.*.env 2>>"$LOG_LIVE" | head -1)
+  fi
+  info.log "Using snapshot: $snapfile"
+
+  # 2. Build session-filtered slices in tmp dir
+  local tmpdir
+  tmpdir=$(mktemp -d -t hivemind.team.migrate.XXXXXX)
+  trap "rm -rf '$tmpdir'" RETURN
+  local sessSnap="$tmpdir/hivemind.snapshot.${session}.env"
+  # $1==s — EXACT match to prevent ooshTeam matching ooshTeam2 (architect note)
+  awk -F'|' -v s="$session" '/^#/{print;next} $1==s' "$snapfile" > "$sessSnap"
+  if [ ! -s "$sessSnap" ] || ! grep -qv '^#' "$sessSnap" 2>/dev/null; then
+    error.log "team.migrate: no entries for '$session' in snapshot — is the session running with agents?"
+    return 1
+  fi
+  local configPath="${CONFIG_PATH:-$HOME/config}"
+  # Slice registries by session prefix (pane keys are "session:win.pane")
+  [ -f "$configPath/hivemind.roles.env" ] && \
+    awk -F'|' -v p="^${session}:" '$1 ~ p' "$configPath/hivemind.roles.env" > "$tmpdir/roles.${session}.env"
+  [ -f "$configPath/hivemind.sessions.env" ] && \
+    awk -F'|' -v p="^${session}:" '$1 ~ p' "$configPath/hivemind.sessions.env" > "$tmpdir/sessions.${session}.env"
+  # teams.env keys are bare session names — exact match
+  [ -f "$configPath/hivemind.teams.env" ] && \
+    awk -F'|' -v s="$session" '$1==s' "$configPath/hivemind.teams.env" > "$tmpdir/teams.${session}.env"
+
+  # 3. Sync oosh code on remote (needed for protected.team.import to exist)
+  echo ""
+  important.log "Syncing oosh on $host..."
+  "$OOSH_DIR/ossh" connection.open "$host" 2>>"$LOG_LIVE"
+  if ! "$OOSH_DIR/ossh" exec "$host" "cd ~/oosh && git pull" 2>>"$LOG_LIVE"; then
+    warn.log "git pull failed on $host — falling back to dir.push"
+    "$OOSH_DIR/ossh" dir.push "$host" "$OOSH_DIR" 2>>"$LOG_LIVE"
+  fi
+
+  # 4. Push slices + snapshot + otmux layout file (PO directive 2026-05-19)
+  echo ""
+  important.log "Pushing session slices to $host..."
+  "$OOSH_DIR/ossh" exec "$host" "mkdir -p ~/config ~/config/otmux" 2>>"$LOG_LIVE"
+  local pushCount=0 f
+  # Copy the session's otmux layout file to tmpdir FIRST so scp src!=dest
+  # path. Without this, when remote host resolves to the same machine
+  # (e.g. McDonges.fritz.box pointing at localhost), scp src==dest and
+  # the source file gets truncated to 0 bytes.
+  local layoutSrc="${CONFIG_PATH:-$HOME/config}/otmux/${session}.layout.env"
+  local layoutStaged=""
+  if [ -f "$layoutSrc" ]; then
+    layoutStaged="$tmpdir/${session}.layout.env"
+    cp "$layoutSrc" "$layoutStaged" 2>>"$LOG_LIVE"
+  fi
+  for f in "$sessSnap" "$tmpdir/roles.${session}.env" "$tmpdir/sessions.${session}.env" "$tmpdir/teams.${session}.env" "$layoutStaged"; do
+    [ -n "$f" ] || continue
+    [ -f "$f" ] || continue
+    # Layout file targets ~/config/otmux/, others target ~/config/
+    local remoteName remoteDir
+    if [[ "$f" == *.layout.env ]]; then
+      remoteDir="config/otmux"
+    else
+      remoteDir="config"
+    fi
+    if "$OOSH_DIR/ossh" scp "$f" "${host}:${remoteDir}/$(basename "$f")" 2>>"$LOG_LIVE"; then
+      info.log "  pushed: $(basename "$f")"
+      pushCount=$((pushCount + 1))
+    else
+      warn.log "  failed: $(basename "$f") — see $LOG_LIVE"
+    fi
+  done
+  info.log "Pushed $pushCount slice file(s)"
+
+  # 5. Push JSONLs for UUIDs in this session's snapshot only
+  echo ""
+  important.log "Pushing JSONL files for $session..."
+  local claudeProjectsDir="$HOME/.claude/projects"
+  local transferCount=0 seenUuids="" sess addr role uuid title
+  while IFS='|' read -r sess addr role uuid title <&3; do
+    [[ "$sess" == "#"* ]] && continue
+    [ -z "$uuid" ] && continue
+    echo "$seenUuids" | grep -q "$uuid" && continue
+    seenUuids="${seenUuids}${uuid} "
+    for dir in "$claudeProjectsDir"/*/; do
+      if [ -f "${dir}${uuid}.jsonl" ]; then
+        local remotePath="${dir}${uuid}.jsonl"
+        "$OOSH_DIR/ossh" exec "$host" "mkdir -p '$(dirname "$remotePath")'" 2>>"$LOG_LIVE"
+        if "$OOSH_DIR/ossh" scp "$remotePath" "${host}:${remotePath}" 2>>"$LOG_LIVE"; then
+          info.log "  transferred: ${uuid:0:8}... ($role)"
+          transferCount=$((transferCount + 1))
+        else
+          warn.log "  transfer failed: ${uuid:0:8}... ($role) — see $LOG_LIVE"
+        fi
+        break
+      fi
+    done
+  done 3< "$sessSnap"
+  info.log "Transferred $transferCount JSONL file(s)"
+
+  # 6. Merge slices into remote's registries (preserves remote's other teams)
+  echo ""
+  important.log "Merging $session into $host's registries..."
+  "$OOSH_DIR/ossh" exec "$host" "hiveMind protected.team.import $session" 2>>"$LOG_LIVE"
+
+  # 7. Restore on remote — feed it the session-filtered snapshot AND the
+  #    sessionFilter param (SC-F#9). Belt-and-braces: even if the slice
+  #    snapshot somehow contains other sessions (corruption / future schema
+  #    change), the filter scopes restore to one session. Pre-SC-F#9, the
+  #    remote `teams.restore` would process every row in the slice file —
+  #    if the file itself was wrong, McDonges-style explosion would recur.
+  echo ""
+  important.log "Restoring $session on $host..."
+  local snapname
+  snapname=$(basename "$sessSnap")
+  "$OOSH_DIR/ossh" exec "$host" "hiveMind teams.restore ~/config/${snapname} ${session}" 2>>"$LOG_LIVE"
+
+  echo ""
+  success.log "team.migrate: $session → $host complete"
+  echo "  Verify: ossh exec $host 'hiveMind team.status $session'"
+}
+hiveMind.team.migrate.completion.session() { private.hiveMind.teams.complete; }
+hiveMind.team.migrate.completion.sshHost() {
+  command -v ossh >/dev/null 2>&1 && private.ossh.config.complete.hosts 2>/dev/null
+}
+
+hiveMind.protected.team.import() # <session> # merge ~/config/{roles,sessions,teams}.<session>.env slice files into local registries (called by team.migrate on the remote side)
+{
+  # Idempotent: drop existing entries matching this session, append new.
+  # Pattern from D2.1 observer family — protected because cross-script callers
+  # (remote ssh exec invoking us during team.migrate) need it CLI-callable but
+  # it shouldn't appear in Tab completion as a user-facing verb.
+  local session="$1"
+  if [ -z "$session" ]; then
+    error.log "Usage: hiveMind protected.team.import <session>"
+    return 1
+  fi
+  # SC-E.2 P3 ingress — observer family is the highest-leverage attack surface
+  if ! this.isSessionName "$session"; then
+    error.log "protected.team.import: invalid session '$session'"
+    return 1
+  fi
+  if ! this.isPipeSafe "$session"; then
+    error.log "protected.team.import: '|' or newline in session — rejected"
+    return 1
+  fi
+  local cfg="${CONFIG_PATH:-$HOME/config}"
+  local imported=0
+  # Roles (S1): key format "session:win.pane|role|ts" — drop matching session prefix, append slice
+  if [ -f "$cfg/roles.${session}.env" ]; then
+    local reg="$cfg/hivemind.roles.env"
+    [ -f "$reg" ] && grep -v "^${session}:" "$reg" > "${reg}.tmp" 2>/dev/null && mv "${reg}.tmp" "$reg"
+    cat "$cfg/roles.${session}.env" >> "$reg"
+    imported=$((imported + 1))
+  fi
+  # Sessions (S2): same pattern (pane-keyed)
+  if [ -f "$cfg/sessions.${session}.env" ]; then
+    local ses="$cfg/hivemind.sessions.env"
+    [ -f "$ses" ] && grep -v "^${session}:" "$ses" > "${ses}.tmp" 2>/dev/null && mv "${ses}.tmp" "$ses"
+    cat "$cfg/sessions.${session}.env" >> "$ses"
+    imported=$((imported + 1))
+  fi
+  # Teams (S3): bare session name as key — exact match
+  if [ -f "$cfg/teams.${session}.env" ]; then
+    local teams="$cfg/hivemind.teams.env"
+    [ -f "$teams" ] && grep -v "^${session}|" "$teams" > "${teams}.tmp" 2>/dev/null && mv "${teams}.tmp" "$teams"
+    cat "$cfg/teams.${session}.env" >> "$teams"
+    imported=$((imported + 1))
+  fi
+  success.log "protected.team.import: $session merged $imported slice file(s)"
 }
 
 hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote machine via ossh
@@ -2072,10 +3541,10 @@ hiveMind.teams.migrate() # <sshHost> <?snapshotFile> # migrate team to remote ma
     "$OOSH_DIR/ossh" exec "$host" "sed -i.bak 's/opus\[1m\]/opus/g' ~/.claude/settings.json" 2>>"$LOG_LIVE"
   fi
 
-  # 6. Ensure tmux server running + restore on remote (--fork for cross-machine)
+  # 6. Ensure tmux server running + restore on remote (fork mode for cross-machine)
   echo ""
-  important.log "Running teams.restore --fork on $host..."
-  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore --fork" 2>>"$LOG_LIVE"
+  important.log "Running teams.restore fork on $host..."
+  "$OOSH_DIR/ossh" exec "$host" "export PATH=/opt/homebrew/bin:\$PATH; hiveMind teams.restore fork" 2>>"$LOG_LIVE"
 
   # 7. Verify
   echo ""
@@ -2121,6 +3590,19 @@ hiveMind.team.pull() # <sshHost> # pull team config from remote machine
   "ossh" scp "$host:~/config/hivemind.roles.env" "$pullDir/hivemind.roles.env" 2>/dev/null
   "ossh" scp "$host:~/config/hivemind.sessions.env" "$pullDir/hivemind.sessions.env" 2>/dev/null
   "ossh" scp "$host:~/config/hivemind.teams.env" "$pullDir/hivemind.teams.env" 2>/dev/null
+
+  # 4b. Pull otmux layout files (PO directive 2026-05-19 — needed for teams.restore)
+  mkdir -p "$pullDir/otmux"
+  local remoteLayouts
+  remoteLayouts=$("ossh" exec "$host" "ls ~/config/otmux/*.layout.env 2>/dev/null" 2>/dev/null)
+  local layoutCount=0 layoutFile
+  for layoutFile in $remoteLayouts; do
+    [ -z "$layoutFile" ] && continue
+    if "ossh" scp "$host:$layoutFile" "$pullDir/otmux/$(basename "$layoutFile")" 2>/dev/null; then
+      layoutCount=$((layoutCount + 1))
+    fi
+  done
+  [ "$layoutCount" -gt 0 ] && info.log "Pulled $layoutCount otmux layout file(s)"
 
   # 5. Pull latest snapshot
   local remoteSnap
@@ -2307,8 +3789,17 @@ hiveMind.team.restart() # <configDir> # restart ALL agents from pulled config di
     # Create session if new
     if [ "$localSess" != "$prevSess" ]; then
       if ! otmux has "$localSess" 2>/dev/null; then
-        echo "  Creating session: $localSess"
-        otmux new "$localSess" 2>/dev/null
+        # PO directive 2026-05-19: use pulled layout file if available
+        # (only when no name collision — layout file is keyed by ORIGINAL session name)
+        local pulledLayout="$pullDir/otmux/${sess}.layout.env"
+        if [ "$localSess" = "$sess" ] && [ -f "$pulledLayout" ]; then
+          echo "  Creating session via pulled layout: $localSess"
+          OTMUX_LAYOUT_DIR="$pullDir/otmux" otmux layout.restore "$sess" 2>/dev/null \
+            || otmux new "$localSess" 2>/dev/null
+        else
+          echo "  Creating session: $localSess"
+          otmux new "$localSess" 2>/dev/null
+        fi
       fi
       prevSess="$localSess"
     fi
@@ -2364,6 +3855,19 @@ hiveMind.protected.session.renamed() # <oldName> <newName> # update all env file
   local old="$1" new="$2"
   [ -z "$old" ] || [ -z "$new" ] && return 1
   [ "$old" = "$new" ] && return 0
+  # SC-E.2 P3 — both names must be valid session identifiers and pipe-safe.
+  # This handler rewrites multiple env files via sed; an unvalidated identifier
+  # containing '|', spaces, or shell-meta chars would corrupt the env or
+  # behave as a sed metachar. Highest-leverage observer: every otmux rename
+  # flows through here.
+  if ! this.isSessionName "$old" || ! this.isSessionName "$new"; then
+    error.log "protected.session.renamed: invalid name(s) '$old' → '$new' — rejected"
+    return 1
+  fi
+  if ! this.isPipeSafe "$old" || ! this.isPipeSafe "$new"; then
+    error.log "protected.session.renamed: '|' or newline in name(s) — rejected"
+    return 1
+  fi
 
   local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
   local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
@@ -2376,6 +3880,107 @@ hiveMind.protected.session.renamed() # <oldName> <newName> # update all env file
   [ -f "$active" ] && grep -q "^${old}$" "$active" 2>/dev/null && echo "$new" > "$active"
 
   info.log "Session renamed: $old → $new (env files updated)"
+}
+
+hiveMind.protected.panes.shifted() # <session> # B5.1 observer — emits panes.shifted event (SC-C.5)
+{
+  # View → Controller bridge: View notifies Controller after split/insert.
+  # SC-C.5 migration: now a thin emitter; mutation logic lives in
+  # `private.hiveMind.handler.panes.shifted.*` handlers (registered at load).
+  local session="$1"
+  [ -z "$session" ] && return 1
+  private.hiveMind.events.emit "panes.shifted" "$session"
+  info.log "Panes shifted in $session — registry refreshed"
+}
+
+private.hiveMind.pane.pushRoleEnv() { # <pane> <newRole> # Bug #3 — push HIVEMIND_ROLE update to pane shell
+  # After swap/move, the pane index has changed but the shell process retained
+  # its old HIVEMIND_ROLE export. The env value itself is NOT a source of truth
+  # for the sender prefix anymore (Tron P0 2026-05-12 LATE: prefix now reads
+  # registry only, never env — env was prone to staleness). We still push the
+  # updated env here so any FUTURE Claude process started in this pane inherits
+  # the correct role (bootstrap/respawn read it at launch time), and so user
+  # commands in the shell see consistent `$HIVEMIND_ROLE`.
+  #
+  # Strategy: only push the export when pane is running a plain shell. Sending
+  # to a Claude Code TUI would inject text into the agent's input prompt —
+  # harmful.
+  local pane="$1" newRole="$2"
+  [ -z "$pane" ] || [ -z "$newRole" ] && return 0
+  # Use raw tmux to avoid re-entering the OOSH dispatch chain (info.log noise
+  # would pollute $cmd at higher LOG_LEVEL). hiveMind already invokes tmux
+  # directly elsewhere via otmux which uses tmux -u; here we need a single
+  # display-message read, no flag stacking — plain `tmux` is fine.
+  local cmd
+  cmd=$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)
+  cmd="${cmd##*$'\n'}"   # last line only — defensive
+  case "$cmd" in
+    bash|zsh|sh|fish)
+      # Verify it's not a Claude Code child process running under bash
+      if "$OOSH_DIR/claudeCode" process.running "$pane" 2>/dev/null; then
+        debug.log "Skipping HIVEMIND_ROLE update on $pane — Claude running under shell"
+        return 0
+      fi
+      otmux send.enter "$pane" "export HIVEMIND_ROLE=$newRole" 2>/dev/null
+      debug.log "Pushed HIVEMIND_ROLE=$newRole to shell at $pane"
+      ;;
+    *)
+      # Claude/node/other TUI — env update would inject into prompt; skip.
+      # Registry alone is authoritative for send.prefix (Tron P0); no env-fallback
+      # needed here. Bootstrap/respawn will pick up the correct role from the
+      # shell env at next launch if/when a new Claude starts in this pane.
+      debug.log "Skipping HIVEMIND_ROLE update on $pane (cmd=$cmd) — TUI"
+      ;;
+  esac
+}
+
+hiveMind.protected.panes.swapped() # <session> <paneA> <paneB> # B5.1 observer — emits panes.swapped event (SC-C.6)
+{
+  # View → Controller bridge for tmux swap-pane. SC-C.6 migration: thin emitter;
+  # logic lives in `private.hiveMind.handler.panes.swapped.{registry,role_env}`.
+  # Order-dependent registration: registry handler runs first, role_env reads
+  # post-mutation state to push HIVEMIND_ROLE correctly (Bug #3).
+  local session="$1" a="$2" b="$3"
+  [ -z "$a" ] || [ -z "$b" ] && return 1
+  # SC-E.2 P3 — both panes regex-validated (accept addr-only "0.0" by
+  # prefixing with session, or full "sess:0.0"), pipe-safe. Session optional
+  # here (may be implicit from caller context).
+  local checkA="$a" checkB="$b"
+  [[ "$a" != *:* ]] && [ -n "$session" ] && checkA="${session}:${a}"
+  [[ "$b" != *:* ]] && [ -n "$session" ] && checkB="${session}:${b}"
+  if ! this.isPaneTarget "$checkA" || ! this.isPaneTarget "$checkB"; then
+    error.log "protected.panes.swapped: invalid pane target(s) '$a' / '$b' — rejected"
+    return 1
+  fi
+  if ! this.isPipeSafe "$a" || ! this.isPipeSafe "$b"; then
+    error.log "protected.panes.swapped: '|' or newline in pane args — rejected"
+    return 1
+  fi
+  if [ -n "$session" ] && ! this.isSessionName "$session"; then
+    error.log "protected.panes.swapped: invalid session '$session' — rejected"
+    return 1
+  fi
+  private.hiveMind.events.emit "panes.swapped" "$session" "$a" "$b"
+}
+
+hiveMind.protected.pane.moved() # <fromPane> <toPane> # B5.1 observer — emits pane.moved event (SC-C.7)
+{
+  # View → Controller bridge for tmux move-pane / join-pane. SC-C.7 migration:
+  # thin emitter; logic lives in `private.hiveMind.handler.pane.moved.{registry,role_env}`.
+  local from="$1" to="$2"
+  [ -z "$from" ] || [ -z "$to" ] && return 1
+  # SC-E.2 P3 — both pane targets must be canonical session:win.pane or %N,
+  # pipe-safe. Pane registry rename via this observer is unrecoverable if
+  # corrupted (entries lost).
+  if ! this.isPaneTarget "$from" || ! this.isPaneTarget "$to"; then
+    error.log "protected.pane.moved: invalid pane target(s) '$from' → '$to' — rejected"
+    return 1
+  fi
+  if ! this.isPipeSafe "$from" || ! this.isPipeSafe "$to"; then
+    error.log "protected.pane.moved: '|' or newline in pane args — rejected"
+    return 1
+  fi
+  private.hiveMind.events.emit "pane.moved" "$from" "$to"
 }
 
 hiveMind.registry.set() # <pane> <role> # set registry entry for a pane
@@ -2396,10 +4001,23 @@ hiveMind.registry.remove() # <pane> # remove registry entry for a pane
     error.log "Usage: hiveMind registry.remove <pane>"
     return 1
   fi
+  # SC-E.2 P3 — (a) regex, (b) pipe-safe. Existence (c) is the registry-grep
+  # below (we WANT the entry to exist to remove it; tmux liveness irrelevant).
+  if ! this.isPaneTarget "$target"; then
+    error.log "registry.remove: invalid pane target '$target' (expected session:win.pane or %N)"
+    return 1
+  fi
+  if ! this.isPipeSafe "$target"; then
+    error.log "registry.remove: pane target '$target' contains '|' or newline — rejected"
+    return 1
+  fi
   local reg="$HIVEMIND_REGISTRY"
   if [ -f "$reg" ] && grep -q "^${target}|" "$reg" 2>/dev/null; then
     grep -v "^${target}|" "$reg" > "${reg}.tmp" && mv "${reg}.tmp" "$reg"
     echo "Removed $target from registry"
+    # SC-C.2 — emit agent.killed. Handlers ensure sessions.env and queue file
+    # are also cleaned (the direct mutation above only touched roles.env).
+    private.hiveMind.events.emit "agent.killed" "$target"
   else
     error.log "No registry entry for $target"
     return 1
@@ -2418,6 +4036,19 @@ hiveMind.agent.rename() # <agentName> <newName> # rename agent: /rename + pane.l
 
   if [ -z "$name" ] || [ -z "$newName" ]; then
     error.log "Usage: hiveMind agent.rename <agentName> <newName>"
+    return 1
+  fi
+  # SC-E.2 P3 — newName flows into /rename inside the agent's TUI AND into
+  # the registry AND into pane.lock title. All three need clean role-name
+  # format. Existing name is the lookup key (resolved below via hiveMind.resolve
+  # — that's the (c) existence layer for source side). Validate target name
+  # format + pipe-safety for the destination side.
+  if ! this.isRoleName "$newName"; then
+    error.log "agent.rename: invalid new role name '$newName' (must be [A-Za-z][A-Za-z0-9._-]{0,39})"
+    return 1
+  fi
+  if ! this.isPipeSafe "$newName"; then
+    error.log "agent.rename: new name '$newName' contains '|' or newline — rejected"
     return 1
   fi
 
@@ -2444,6 +4075,11 @@ hiveMind.agent.rename() # <agentName> <newName> # rename agent: /rename + pane.l
   # a new custom-title entry in the JSONL; discover picks it up). Non-invasive.
   hiveMind.registry.refresh "$session" >/dev/null
 
+  # SC-C.3 — emit agent.renamed. Handlers (registry, title, role_env) replicate
+  # steps 2+3 idempotently AND push HIVEMIND_ROLE to the pane shell (which
+  # rename did NOT do before). Direct calls retained during Sprint 1 transition.
+  private.hiveMind.events.emit "agent.renamed" "$target" "$name" "$newName"
+
   success.log "Renamed $name → $newName ($target)"
 }
 hiveMind.team.activate() # <session> # set active team (alias for team.switch)
@@ -2451,7 +4087,281 @@ hiveMind.team.activate() # <session> # set active team (alias for team.switch)
   hiveMind.team.switch "$@"
 }
 
-hiveMind.consistency.audit() # <?session> # cross-compare all identity sources and show mismatches
+# ─────────────────────────────────────────────────────────────────────────────
+# SC-A.1 — reconcile.diff primitive (Sprint 1 state-correctness foundation)
+# Single source-of-truth diff between cached state (S1-S10) and ground truth
+# (L1-L3) per sprint-1-design.md §3. Pure: no writes, no side effects.
+# Used by: consistency.audit (read-only), consistency.fix (apply w/ confirm),
+#          consistency.reconcile (apply silently via --apply, SM-cycle caller).
+# Output format (one line per mutation):
+#   <severity>|<invariant>|<store>|<op>|<key>|<expected>|<actual>
+# Severities: CRITICAL / HIGH / MEDIUM / LOW (per U2 graded audit lock)
+# Ops: ADD / REMOVE / UPDATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.reconcile.diff() # <?invariant:all> # emit mutations needed to reconcile caches to live truth
+{
+  # Optional <?invariant> filter to check only one of i1..i7 (unit-test hook).
+  # Default 'all' runs every check in CRITICAL → HIGH → MEDIUM → LOW order
+  # (stable output: severity descending, then invariant id ascending within tier).
+  local only="${1:-all}"
+  if [ "$only" = "all" ] || [ "$only" = "i3" ]; then private.hiveMind.reconcile.check.i3; fi
+  if [ "$only" = "all" ] || [ "$only" = "i7" ]; then private.hiveMind.reconcile.check.i7; fi
+  if [ "$only" = "all" ] || [ "$only" = "i1" ]; then private.hiveMind.reconcile.check.i1; fi
+  if [ "$only" = "all" ] || [ "$only" = "i2" ]; then private.hiveMind.reconcile.check.i2; fi
+  if [ "$only" = "all" ] || [ "$only" = "i4" ]; then private.hiveMind.reconcile.check.i4; fi
+  if [ "$only" = "all" ] || [ "$only" = "i5" ]; then private.hiveMind.reconcile.check.i5; fi
+  if [ "$only" = "all" ] || [ "$only" = "i6" ]; then private.hiveMind.reconcile.check.i6; fi
+  return 0
+}
+private.hiveMind.reconcile.diff.completion.invariant() {
+  echo "all"; for i in 1 2 3 4 5 6 7; do echo "i$i"; done
+}
+
+private.hiveMind.reconcile.check.i1() { # # I1 (HIGH): every pane in S1 exists in L1
+  # Stale role entry for a pane that's no longer in tmux.
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] || return 0
+  while IFS='|' read -r pane role rest; do
+    [ -z "$pane" ] || [[ "$pane" == "#"* ]] && continue
+    # L1 check — does the pane still exist?
+    if ! tmux list-panes -t "$pane" -F '#{pane_id}' >/dev/null 2>&1; then
+      echo "HIGH|I1|S1|REMOVE|${pane}|<not-in-tmux>|${role:-}"
+    fi
+  done < "$reg"
+}
+
+private.hiveMind.reconcile.check.i2() { # # I2 (HIGH): every pane in S2 is in S1, UUID matches live ps
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  [ -f "$ses" ] || return 0
+  while IFS='|' read -r pane cachedUuid rest; do
+    [ -z "$pane" ] || [[ "$pane" == "#"* ]] && continue
+    # (a) Pane must be in S1 (else S2 entry is orphan)
+    if [ -f "$reg" ] && ! grep -q "^${pane}|" "$reg" 2>/dev/null; then
+      echo "HIGH|I2|S2|REMOVE|${pane}|<not-in-S1>|${cachedUuid}"
+      continue
+    fi
+    # (b) Cached UUID must match live Claude on that pane — SKIPPED for now.
+    # Per-pane `claudeCode session.current` call is ~1s each (sources `this`),
+    # times 40-50 sessions.env entries = 45s+ audit which times out under
+    # subshell capture. TODO Sprint 1 follow-up: batch live UUID discovery
+    # via ONE ps scan + JSONL correlation, replacing the per-pane call.
+    # The (a) orphan check above already catches the most-common drift
+    # (sessions.env entry for pane no longer in registry).
+  done < "$ses"
+}
+
+private.hiveMind.reconcile.check.i3() { # # I3 (CRITICAL): every team in S3 is a live tmux session
+  # The Did/you/mean garbage class. Fixed at ingress (ebc8b5e) but reconcile
+  # catches anything that slipped past (e.g. legacy entries from before ebc8b5e).
+  local teams="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$teams" ] || return 0
+  while IFS='|' read -r session desc; do
+    [ -z "$session" ] || [[ "$session" == "#"* ]] && continue
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+      echo "CRITICAL|I3|S3|REMOVE|${session}|<not-in-tmux>|${desc:-}"
+    fi
+  done < "$teams"
+}
+
+private.hiveMind.reconcile.check.i4() { # # I4 (MEDIUM): tronMonitor.env (S8) ⊂ teams.env (S3)
+  local monEnv="${TRON_MONITOR_ENV:-${CONFIG_PATH:-$HOME/config}/tronMonitor.env}"
+  local teams="${HIVEMIND_TEAMS:-${CONFIG_PATH:-$HOME/config}/hivemind.teams.env}"
+  [ -f "$monEnv" ] || return 0
+  [ -f "$teams" ] || return 0
+  while IFS='|' read -r winNum session; do
+    [ -z "$winNum" ] || [ -z "$session" ] && continue
+    if ! grep -q "^${session}|" "$teams" 2>/dev/null; then
+      echo "MEDIUM|I4|S8|REMOVE|${session}|<not-in-S3>|window-${winNum}"
+    fi
+  done < "$monEnv"
+}
+
+private.hiveMind.reconcile.check.i5() { # # I5 (MEDIUM): snapshot UUID JSONL exists on disk
+  local snap="${HIVEMIND_SNAPSHOTS:-${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}"
+  [ -f "$snap" ] || return 0
+  while IFS='|' read -r role uuid ts ctxPct; do
+    [ -z "$role" ] || [[ "$role" == "#"* ]] && continue
+    [ -z "$uuid" ] && continue
+    # JSONL must exist somewhere under ~/.claude/projects/*/
+    local found=""
+    for dir in "$HOME/.claude/projects"/*/; do
+      [ -f "${dir}${uuid}.jsonl" ] && found="yes" && break
+    done
+    if [ -z "$found" ]; then
+      echo "MEDIUM|I5|S4|UPDATE|${role}|<jsonl-missing>|${uuid}"
+    fi
+  done < "$snap"
+}
+
+private.hiveMind.reconcile.check.i6() { # # I6 (LOW): queue files reference valid panes
+  local queueDir="${CONFIG_PATH:-$HOME/config}/hivemind.queue"
+  [ -d "$queueDir" ] || return 0
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local f base pane
+  for f in "$queueDir"/*.queue; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .queue)
+    # Queue filenames encode pane as 'session__win__pane' or 'session:win.pane'
+    # — accept either convention. Normalize __ → : / . for comparison.
+    pane=$(echo "$base" | sed 's/__/:/' | sed 's/__/./')
+    if [ -f "$reg" ] && ! grep -q "^${pane}|" "$reg" 2>/dev/null; then
+      echo "LOW|I6|S6|REMOVE|${base}|<pane-not-in-S1>|${f}"
+    fi
+  done
+}
+
+hiveMind.protected.reconcile.diff() # <?invariant:all> # CLI-callable wrapper for tests/diagnostics; SC-A.2 will layer consistency.audit on top
+{
+  private.hiveMind.reconcile.diff "$@"
+}
+hiveMind.protected.reconcile.diff.completion.invariant() {
+  private.hiveMind.reconcile.diff.completion.invariant
+}
+
+private.hiveMind.reconcile.check.i7() { # # I7 (CRITICAL): tronMonitor display matches title
+  # Active check — requires screen capture, slow (~0.5s). Skip if tronMonitor
+  # not running. tronMonitor.verify is the single source of truth here.
+  command -v tronMonitor >/dev/null 2>&1 || return 0
+  # tronMonitor.verify returns rc=1 on mismatch (added in aa7d6ac)
+  local verifyOut
+  verifyOut=$(tronMonitor verify 2>&1)
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Parse "Title claims: X (MISMATCH ...)" line for context
+    local claim
+    claim=$(echo "$verifyOut" | grep -oE "Title claims: [^ ]+" | head -1 | sed 's/Title claims: //')
+    echo "CRITICAL|I7|S8|UPDATE|tronMonitor|<screen-content>|${claim:-<unknown>}"
+  fi
+}
+
+hiveMind.consistency.audit() # <?session> <?format:human|json> # graded audit (I1-I7) via reconcile.diff — pure read; exit code = violation count (U2)
+{
+  # SC-A.2 — Sprint 1 state-correctness audit. Layers on top of SC-A.1
+  # reconcile.diff primitive. Reports human OR json. Shows ALL violations
+  # (does not exit early per U2 graded). Exit code is total violation count
+  # (0 = clean). PO-locked dry-run (U3) — never mutates.
+  local filter_session="$1"
+  local format="${2:-human}"
+
+  # Collect diff lines, optionally filter to a session
+  local diff_lines
+  diff_lines=$(private.hiveMind.reconcile.diff 2>/dev/null)
+  if [ -n "$filter_session" ] && [ -n "$diff_lines" ]; then
+    # Filter: key field (field 5) must start with session: or equal session
+    diff_lines=$(echo "$diff_lines" | awk -F'|' -v s="$filter_session" '
+      $5 == s || index($5, s":") == 1 || $5 == "tronMonitor" { print }
+    ')
+  fi
+
+  # Count violations by severity (used by both renderers and exit code)
+  local critical=0 high=0 medium=0 low=0 total=0
+  if [ -n "$diff_lines" ]; then
+    critical=$(echo "$diff_lines" | grep -c '^CRITICAL|' || true)
+    high=$(echo "$diff_lines" | grep -c '^HIGH|' || true)
+    medium=$(echo "$diff_lines" | grep -c '^MEDIUM|' || true)
+    low=$(echo "$diff_lines" | grep -c '^LOW|' || true)
+    total=$((critical + high + medium + low))
+  fi
+
+  case "$format" in
+    json)
+      private.hiveMind.audit.render.json "$diff_lines" "$total" "$critical" "$high" "$medium" "$low"
+      ;;
+    human|*)
+      private.hiveMind.audit.render.human "$diff_lines" "$total" "$critical" "$high" "$medium" "$low"
+      ;;
+  esac
+
+  # Exit code = total violation count (per U2 — non-zero indicates degraded state)
+  return "$total"
+}
+hiveMind.consistency.audit.completion.format() { echo "human"; echo "json"; }
+hiveMind.consistency.audit.completion.session() { private.hiveMind.teams.complete; }
+
+private.hiveMind.audit.render.human() # <diff_lines> <total> <c> <h> <m> <l> # color-grouped report
+{
+  local diff_lines="$1" total="$2" c="$3" h="$4" m="$5" l="$6"
+  echo -e "${BOLD_CYAN}State Correctness Audit${NORMAL} ${GRAY}(SC-A.2 · sprint-1-design.md §3)${NORMAL}"
+  echo -e "${GRAY}$(printf '%.0s═' {1..78})${NORMAL}"
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${BOLD_GREEN}✓ CLEAN${NORMAL} — all 7 invariants pass."
+    echo -e "${GRAY}$(printf '%.0s─' {1..78})${NORMAL}"
+    return 0
+  fi
+
+  # One section per severity tier, in CRITICAL → LOW order
+  local tier color label
+  for tier in CRITICAL:BOLD_RED HIGH:BOLD_YELLOW MEDIUM:BOLD_CYAN LOW:GRAY; do
+    label="${tier%:*}"
+    color="${tier#*:}"
+    local lines
+    lines=$(echo "$diff_lines" | grep "^${label}|" || true)
+    [ -z "$lines" ] && continue
+    local count
+    count=$(echo "$lines" | wc -l | tr -d ' ')
+    echo
+    echo -e "${!color}${label}${NORMAL} ${GRAY}($count)${NORMAL}"
+    echo "$lines" | while IFS='|' read -r sev inv store op key expected actual; do
+      printf "  ${!color}%-3s${NORMAL}  ${BOLD_WHITE}%-4s${NORMAL}  ${BOLD_WHITE}%-6s${NORMAL}  %-32s  ${GRAY}%s${NORMAL} → ${GRAY}%s${NORMAL}\n" \
+        "$op" "$inv" "$store" "$key" "$actual" "$expected"
+    done
+  done
+
+  echo
+  echo -e "${GRAY}$(printf '%.0s─' {1..78})${NORMAL}"
+  echo -e "Summary: ${BOLD_RED}${c} crit${NORMAL}, ${BOLD_YELLOW}${h} high${NORMAL}, ${BOLD_CYAN}${m} med${NORMAL}, ${GRAY}${l} low${NORMAL} = ${BOLD_WHITE}${total} violations${NORMAL}"
+  echo -e "${GRAY}Recover (dry-run by default per U3):${NORMAL}"
+  echo -e "${GRAY}  hiveMind consistency.fix          — interactive (y/N prompt before each fix)${NORMAL}"
+  echo -e "${GRAY}  hiveMind consistency.reconcile --apply  — silent batch (SM-cycle-style)${NORMAL}"
+}
+
+private.hiveMind.audit.render.json() # <diff_lines> <total> <c> <h> <m> <l> # JSON output for CI/dashboards
+{
+  local diff_lines="$1" total="$2" c="$3" h="$4" m="$5" l="$6"
+  echo "{"
+  echo "  \"version\": 1,"
+  echo "  \"task\": \"SC-A.2\","
+  echo "  \"summary\": {"
+  echo "    \"total\": $total,"
+  echo "    \"critical\": $c,"
+  echo "    \"high\": $h,"
+  echo "    \"medium\": $m,"
+  echo "    \"low\": $l"
+  echo "  },"
+  echo -n "  \"violations\": ["
+  if [ -z "$diff_lines" ] || [ "$total" -eq 0 ]; then
+    echo "]"
+    echo "}"
+    return 0
+  fi
+  echo
+  local first=1
+  echo "$diff_lines" | while IFS='|' read -r sev inv store op key expected actual; do
+    [ -z "$sev" ] && continue
+    if [ "$first" -eq 1 ]; then first=0; else echo ","; fi
+    # JSON string escape: backslash + double-quote
+    printf '    {"severity":"%s","invariant":"%s","store":"%s","op":"%s","key":"%s","expected":"%s","actual":"%s"}' \
+      "$(private.hiveMind.audit.json.escape "$sev")" \
+      "$(private.hiveMind.audit.json.escape "$inv")" \
+      "$(private.hiveMind.audit.json.escape "$store")" \
+      "$(private.hiveMind.audit.json.escape "$op")" \
+      "$(private.hiveMind.audit.json.escape "$key")" \
+      "$(private.hiveMind.audit.json.escape "$expected")" \
+      "$(private.hiveMind.audit.json.escape "$actual")"
+  done
+  echo
+  echo "  ]"
+  echo "}"
+}
+
+private.hiveMind.audit.json.escape() { # <str> # minimal JSON string escape (\ and ")
+  echo -n "${1//\\/\\\\}" | sed 's/"/\\"/g'
+}
+
+hiveMind.consistency.audit.table() # <?session> # LEGACY per-pane table view (Sprint 0 — kept for diagnostics)
 {
   local filter_session="$1"
 
@@ -2460,7 +4370,7 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
   # Load sessions.env (role|uuid)
   local sess_file="$HIVEMIND_SESSIONS"
 
-  echo -e "${BOLD_CYAN}Identity Consistency Audit${NORMAL}"
+  echo -e "${BOLD_CYAN}Identity Consistency Audit (legacy table)${NORMAL}"
   echo -e "${GRAY}$(printf '%.0s═' {1..85})${NORMAL}"
   printf "${BOLD_WHITE}%-28s %-16s %-16s %-13s %-16s %s${NORMAL}\n" "PANE" "TITLE" "REGISTRY" "SESS.ENV" "LIVE UUID" "MATCH"
   echo -e "${GRAY}$(printf '%.0s─' {1..85})${NORMAL}"
@@ -2565,7 +4475,177 @@ hiveMind.consistency.audit() # <?session> # cross-compare all identity sources a
   return 0
 }
 
-hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from live truth
+hiveMind.consistency.fix() # <?session> # interactive y/N apply of consistency.audit findings (SC-D.1)
+{
+  # SC-D.1 — top-of-diff applier with interactive confirmation. Same primitive
+  # as consistency.audit (read-only) and consistency.reconcile (silent batch);
+  # this one shows the diff + prompts before mutating.
+  local filter_session="$1"
+  local diff_lines total
+  diff_lines=$(private.hiveMind.reconcile.diff 2>/dev/null)
+  if [ -n "$filter_session" ] && [ -n "$diff_lines" ]; then
+    diff_lines=$(echo "$diff_lines" | awk -F'|' -v s="$filter_session" '
+      $5 == s || index($5, s":") == 1 || $5 == "tronMonitor" { print }
+    ')
+  fi
+  total=0
+  [ -n "$diff_lines" ] && total=$(echo "$diff_lines" | grep -c '^[A-Z]' || true)
+
+  if [ "$total" -eq 0 ]; then
+    echo -e "${BOLD_GREEN}✓ CLEAN${NORMAL} — nothing to fix."
+    return 0
+  fi
+
+  # Show audit-style report so user knows what's being asked
+  hiveMind.consistency.audit "$filter_session" human 2>/dev/null
+  echo
+  echo -en "${BOLD_YELLOW}Apply $total fix(es)?${NORMAL} [y/N] "
+  local reply
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      echo -e "${GRAY}Aborted — no mutations performed.${NORMAL}"
+      return 1
+      ;;
+  esac
+
+  echo "$diff_lines" | private.hiveMind.reconcile.apply
+  return $?
+}
+hiveMind.consistency.fix.completion.session() { private.hiveMind.teams.complete; }
+
+hiveMind.consistency.reconcile() # <?session> <?mode:dry-run|apply> # silent batch reconciliation; dry-run by default (U3 lock)
+{
+  # SC-D.1 — cron/SM-cycle-friendly. Per U3 (PO-locked): dry-run unless 'apply'
+  # is explicitly passed. Output is minimal — total violation count + brief
+  # severity breakdown. Exit code = total PRE-apply violations (so SM-cycle
+  # can detect change-over-time).
+  local filter_session="$1"
+  local mode="${2:-dry-run}"
+
+  local diff_lines total c h m l
+  diff_lines=$(private.hiveMind.reconcile.diff 2>/dev/null)
+  if [ -n "$filter_session" ] && [ -n "$diff_lines" ]; then
+    diff_lines=$(echo "$diff_lines" | awk -F'|' -v s="$filter_session" '
+      $5 == s || index($5, s":") == 1 || $5 == "tronMonitor" { print }
+    ')
+  fi
+  total=0; c=0; h=0; m=0; l=0
+  if [ -n "$diff_lines" ]; then
+    c=$(echo "$diff_lines" | grep -c '^CRITICAL|' || true)
+    h=$(echo "$diff_lines" | grep -c '^HIGH|'     || true)
+    m=$(echo "$diff_lines" | grep -c '^MEDIUM|'   || true)
+    l=$(echo "$diff_lines" | grep -c '^LOW|'      || true)
+    total=$((c + h + m + l))
+  fi
+
+  if [ "$total" -eq 0 ]; then
+    echo "reconcile: clean (0 violations)"
+    return 0
+  fi
+
+  case "$mode" in
+    apply)
+      echo "reconcile: $total violations (C=$c H=$h M=$m L=$l) — applying..."
+      local applied
+      applied=$(echo "$diff_lines" | private.hiveMind.reconcile.apply | tail -1)
+      echo "reconcile: $applied"
+      ;;
+    dry-run|*)
+      echo "reconcile: $total violations (C=$c H=$h M=$m L=$l) — DRY RUN (use 'reconcile <?session> apply' to mutate)"
+      ;;
+  esac
+  return "$total"
+}
+hiveMind.consistency.reconcile.completion.session() { private.hiveMind.teams.complete; }
+hiveMind.consistency.reconcile.completion.mode() { echo "dry-run"; echo "apply"; }
+
+private.hiveMind.reconcile.apply() # # consume diff lines on stdin, apply each mutation; echo summary at end
+{
+  # Apply primitive — reads diff format from stdin:
+  #   <severity>|<invariant>|<store>|<op>|<key>|<expected>|<actual>
+  # Skip I5 (snapshot stale — needs re-snapshot, not safe auto-mutation)
+  # Skip I7 (tronMonitor display — Tron's call, not auto-apply)
+  local sev inv store op key expected actual
+  local applied=0 skipped=0
+  while IFS='|' read -r sev inv store op key expected actual; do
+    [ -z "$sev" ] && continue
+    case "$inv" in
+      I5|I7)
+        info.log "  SKIP $inv ($store $op $key) — not safe to auto-apply"
+        skipped=$((skipped + 1))
+        continue
+        ;;
+    esac
+    case "${store}:${op}" in
+      S1:REMOVE)
+        # Remove stale role entry — grep -v pattern
+        if [ -f "$HIVEMIND_REGISTRY" ]; then
+          grep -v "^${key}|" "$HIVEMIND_REGISTRY" > "${HIVEMIND_REGISTRY}.tmp" 2>/dev/null
+          mv "${HIVEMIND_REGISTRY}.tmp" "$HIVEMIND_REGISTRY"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S2:REMOVE)
+        if [ -f "$HIVEMIND_SESSIONS" ]; then
+          grep -v "^${key}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+          mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S2:UPDATE)
+        # Replace cached UUID with live (key = pane, expected = liveUuid)
+        if [ -f "$HIVEMIND_SESSIONS" ]; then
+          grep -v "^${key}|" "$HIVEMIND_SESSIONS" > "${HIVEMIND_SESSIONS}.tmp" 2>/dev/null
+          echo "${key}|${expected}" >> "${HIVEMIND_SESSIONS}.tmp"
+          mv "${HIVEMIND_SESSIONS}.tmp" "$HIVEMIND_SESSIONS"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S3:REMOVE)
+        if [ -f "$HIVEMIND_TEAMS" ]; then
+          grep -v "^${key}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null
+          mv "${HIVEMIND_TEAMS}.tmp" "$HIVEMIND_TEAMS"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S8:REMOVE)
+        # tronMonitor.env — prefer tronMonitor.remove (handles screen window
+        # cleanup too) over raw file edit. Soft-fail if tronMonitor isn't on PATH.
+        if command -v tronMonitor >/dev/null 2>&1; then
+          tronMonitor remove "$key" >/dev/null 2>&1
+          applied=$((applied + 1))
+        elif [ -f "$TRON_MONITOR_ENV" ]; then
+          grep -v "|${key}$" "$TRON_MONITOR_ENV" > "${TRON_MONITOR_ENV}.tmp" 2>/dev/null
+          mv "${TRON_MONITOR_ENV}.tmp" "$TRON_MONITOR_ENV"
+          applied=$((applied + 1))
+        fi
+        ;;
+      S6:REMOVE)
+        # Queue file — actual field is the full file path
+        if [ -f "$actual" ]; then
+          rm -f "$actual"
+          applied=$((applied + 1))
+        fi
+        ;;
+      *)
+        info.log "  SKIP unhandled mutation: ${store} ${op} ${key}"
+        skipped=$((skipped + 1))
+        ;;
+    esac
+  done
+  echo "applied=$applied skipped=$skipped"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# LEGACY consistency.fix.table — Sprint 0 per-pane hand-rolled reconciler.
+# Kept available for diagnostic use; SC-D.1 above (consistency.fix) is the
+# canonical Sprint 1 implementation on top of reconcile.diff primitive.
+# ────────────────────────────────────────────────────────────────────────────
+
+hiveMind.consistency.fix.table() # <?session> # LEGACY Sprint-0 per-pane fixer (kept for diagnostics)
 {
   local filter_session="$1"
 
@@ -2576,7 +4656,7 @@ hiveMind.consistency.fix() # <?session> # auto-repair identity mismatches from l
   [ -f "$reg" ] || touch "$reg"
   [ -f "$sess_file" ] || touch "$sess_file"
 
-  echo -e "${BOLD_CYAN}Fixing identity consistency...${NORMAL}"
+  echo -e "${BOLD_CYAN}Fixing identity consistency (legacy)...${NORMAL}"
   echo
 
   # --- 0. Clean up garbage entries in sessions.env ---
@@ -2865,7 +4945,7 @@ hiveMind.team.setup() # <roles> <?session> # create N-pane session with agents f
 
     # Capture session UUID
     local sid
-    sid=$(claudeCode session.probe "$pane" 2>/dev/null)
+    sid=$(hiveMind.agent.session.probe "$pane" 2>/dev/null)
     [ -n "$sid" ] && private.hiveMind.session.store "$pane" "$sid"
   done
 
@@ -2941,7 +5021,7 @@ hiveMind.team.setup.oosh() # <?session> # create 3-pane tmux session with oosh-o
   local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2")
   for i in 0 1 2; do
     local _sid
-    _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
+    _sid=$(hiveMind.agent.session.probe "${_panes[$i]}" 2>/dev/null)
     if [ -n "$_sid" ]; then
       private.hiveMind.session.store "${_panes[$i]}" "$_sid"
     fi
@@ -3099,7 +5179,7 @@ hiveMind.registry.fix() # # clean up invalid entries in roles registry (raw %NNN
   local fixed=0 dropped=0
   > "$tmpfile"
 
-  while IFS='|' read -r pane role; do
+  while IFS='|' read -r pane role _ts; do
     [ -z "$pane" ] || [ -z "$role" ] && continue
     # Skip entries with raw pane IDs (%NNN format)
     if echo "$pane" | grep -qE '^%[0-9]+$'; then
@@ -3300,7 +5380,7 @@ hiveMind.agent.bootstrap() # <agentName> <?session> <?pane> # full bootstrap: cr
 
   # Step 4b: Capture UUID and write to sessions file
   local new_sid
-  new_sid=$(claudeCode session.probe "$target_pane" 2>/dev/null)
+  new_sid=$(hiveMind.agent.session.probe "$target_pane" 2>/dev/null)
   if [ -n "$new_sid" ]; then
     private.hiveMind.session.store "$target_pane" "$new_sid"
     info.log "Captured session UUID for $role ($target_pane): ${new_sid}"
@@ -3322,6 +5402,10 @@ hiveMind.agent.bootstrap() # <agentName> <?session> <?pane> # full bootstrap: cr
   # Step 7: Lifecycle trigger — refresh the team's UUIDs so caches + forks.env
   # reflect this new agent immediately. Non-invasive.
   hiveMind.registry.refresh "$session" >/dev/null
+
+  # SC-C.1 — emit agent.spawned. Handlers (registry, sessions) replicate the
+  # direct calls above; harmless idempotent doubling during Sprint 1 transition.
+  private.hiveMind.events.emit "agent.spawned" "$target_pane" "$role" "${new_sid:-}"
 
   success.log "Agent $role bootstrapped in pane $target_pane"
   echo "Verify with: hiveMind agent.verify $target_pane"
@@ -3383,7 +5467,7 @@ hiveMind.agent.context.status() # <agentName> <?session> # show context % for on
 
   # Find the agent in the registry
   local target=""
-  while IFS='|' read -r t r; do
+  while IFS='|' read -r t r _ts; do
     [ -z "$t" ] || [ -z "$r" ] && continue
     case "$t" in "${session}:"*) ;; *) continue ;; esac
     if [ "$r" = "$agent" ]; then
@@ -3799,7 +5883,7 @@ hiveMind.team.setup.full() # <?session> # bootstrap full team: Agent Teacher + E
   local _panes=("${session}:0.0" "${session}:0.1" "${session}:0.2" "${session}:0.3")
   for i in 0 1 2 3; do
     local _sid
-    _sid=$(claudeCode session.probe "${_panes[$i]}" 2>/dev/null)
+    _sid=$(hiveMind.agent.session.probe "${_panes[$i]}" 2>/dev/null)
     if [ -n "$_sid" ]; then
       private.hiveMind.session.store "${_panes[$i]}" "$_sid"
     fi
@@ -3843,6 +5927,37 @@ hiveMind.team.register() # <session> <?description> # register a team session in
     return 1
   fi
 
+  # Bug #4-class hardening — reject invalid session names. Without this, callers
+  # that forward unvalidated output (error text, word-split arrays, snapshot
+  # corruption) write garbage entries like 'Did', 'you', 'mean:' from an upstream
+  # "Did you mean: <suggestion>" error message. Same defense as registry.set
+  # for role names. Allowed chars match tmux session-name conventions
+  # ([A-Za-z0-9_][A-Za-z0-9_.-]*) — alphanumeric, underscore, dot, dash,
+  # must start with alphanumeric or underscore.
+  if ! [[ "$session" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
+    error.log "team.register: invalid session name '$session' (must match [A-Za-z0-9_][A-Za-z0-9_.-]*)"
+    return 1
+  fi
+
+  # Belt-and-braces: also reject names containing the pipe delimiter (would
+  # break env-file parsing) and names matching the test-prefix pattern.
+  if [[ "$session" == *"|"* ]]; then
+    error.log "team.register: session name '$session' contains '|' delimiter — rejected"
+    return 1
+  fi
+
+  # Existence check — the strongest defense. A "team" by definition is a live
+  # tmux session. Names that pass regex but aren't real sessions (e.g. 'Did',
+  # 'you' from a "Did you mean: ..." error tokenized by word-split) are
+  # rejected here. Caller can override for known-pending sessions by setting
+  # HIVEMIND_TEAM_REGISTER_SKIP_TMUX_CHECK=1 (used by tests).
+  if [ "${HIVEMIND_TEAM_REGISTER_SKIP_TMUX_CHECK:-0}" != "1" ]; then
+    if ! otmux has "$session" 2>/dev/null; then
+      error.log "team.register: '$session' is not a live tmux session — rejected (export HIVEMIND_TEAM_REGISTER_SKIP_TMUX_CHECK=1 to bypass)"
+      return 1
+    fi
+  fi
+
   private.hiveMind.teams.ensure.dir
 
   # Check if already registered
@@ -3867,6 +5982,11 @@ hiveMind.team.register() # <session> <?description> # register a team session in
     echo "$session" > "$HIVEMIND_ACTIVE_TEAM_FILE"
     info.log "Auto-switched active team to: $session"
   fi
+
+  # SC-C.8 — emit team.created. Handlers fan out to teams.env (idempotent
+  # write-through audit) and tronMonitor.add. Replaces the prior direct
+  # `tronMonitor add` call (D2.1) which is now a handler.
+  private.hiveMind.events.emit "team.created" "$session" "$description"
 }
 hiveMind.team.remove() # <session> # unregister a team session
 {
@@ -3874,6 +5994,17 @@ hiveMind.team.remove() # <session> # unregister a team session
 
   if [ -z "$session" ]; then
     error.log "Usage: hiveMind team.remove <session>"
+    return 1
+  fi
+  # SC-E.2 P3 triple defense — (a) regex, (b) pipe-safe. Existence (c) is
+  # the registry-grep check below — for removal we want session-in-registry,
+  # not session-in-tmux (a team can be removed AFTER its tmux session died).
+  if ! this.isSessionName "$session"; then
+    error.log "team.remove: invalid session name '$session' (must match [A-Za-z0-9_][A-Za-z0-9_.-]*)"
+    return 1
+  fi
+  if ! this.isPipeSafe "$session"; then
+    error.log "team.remove: session name '$session' contains '|' or newline — rejected"
     return 1
   fi
 
@@ -3886,6 +6017,13 @@ hiveMind.team.remove() # <session> # unregister a team session
     error.log "Team $session not registered"
     return 1
   fi
+
+  # SC-C.9 — emit team.destroyed. Handlers fan out: teams.env row removal,
+  # tronMonitor.remove, plus full S1/S2/S6 cleanup (pane entries in roles.env,
+  # sessions.env, and queue files belonging to this session). The team.remove
+  # caller also writes to teams.env below for the legacy synchronous path,
+  # which the teams handler treats as idempotent.
+  private.hiveMind.events.emit "team.destroyed" "$session"
 
   grep -v "^${session}|" "$HIVEMIND_TEAMS" > "${HIVEMIND_TEAMS}.tmp" 2>/dev/null
   mv "${HIVEMIND_TEAMS}.tmp" "$HIVEMIND_TEAMS"
@@ -4128,6 +6266,12 @@ hiveMind.agent.respawn() # <agentName> # fork role snapshot into pane + /rename 
   local sessionOfPane="${target%%:*}"
   hiveMind.registry.refresh "$sessionOfPane" >/dev/null
 
+  # SC-C.4 — emit agent.forked. Handlers update registry, sessions, forks.env.
+  # The registry.refresh above already wrote forks.env once for live discovery;
+  # the .forks handler appends a second row with explicit parent linkage (the
+  # `uuid` here is the parent — refresh only sees the child via JSONL parentUuid).
+  private.hiveMind.events.emit "agent.forked" "$target" "$role" "$uuid" "${newUuid:-}"
+
   success.log "Respawned ${role} in ${target} (fork of ${uuid:0:8}... → ${newUuid:0:8}...)"
 }
 hiveMind.agent.respawn.completion.agentName() {
@@ -4259,7 +6403,7 @@ hiveMind.team.sweep() # <session> <?interval> # structured one-line-per-pane sta
   local own_pane=""
   [ -n "$TMUX_PANE" ] && own_pane="$TMUX_PANE"
 
-  while IFS='|' read -r target role; do
+  while IFS='|' read -r target role _ts; do
     [ -z "$target" ] || [ -z "$role" ] && continue
     case "$target" in "${session}:"*) ;; *) continue ;; esac
 
@@ -4492,20 +6636,292 @@ hiveMind.team.monitor.completion.session() {
 hiveMind.team.monitor.completion.agentName() {
   private.hiveMind.roles.complete 2>/dev/null
 }
-hiveMind.agent.approve() # <pane> <?option:2> # approve a permission prompt in a pane
+private.hiveMind.agent.overlay.key() # <overlayState> <verb> <?option> # map (state, verb) → tmux key sequence
 {
-  local pane="$1"
-  local option="${2:-2}"
+  # Epic I I1.3 per-overlay key map (PO decision 5):
+  #   permission   / tool-confirm:  approve=1   reject=2   option=N    dismiss=Escape
+  #   accept-edits:                 approve=Tab reject=Esc option=N    dismiss=Escape
+  #   overlay      / panel:         dismiss=Esc only (others meaningless)
+  local state="$1"
+  local verb="$2"
+  local option="${3:-}"
+  case "$verb" in
+    dismiss)
+      echo "Escape"
+      return 0
+      ;;
+    option)
+      [ -z "$option" ] && return 1
+      echo "$option"
+      return 0
+      ;;
+    approve)
+      case "$state" in
+        permission|tool-confirm) echo "1"; return 0 ;;
+        accept-edits)             echo "Tab"; return 0 ;;
+      esac
+      ;;
+    reject)
+      case "$state" in
+        permission|tool-confirm) echo "2"; return 0 ;;
+        accept-edits)             echo "Escape"; return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
 
-  if [ -z "$pane" ]; then
-    error.log "Usage: hiveMind agent.approve <pane> <?option:2>"
+private.hiveMind.agent.overlay.dispatch() # <agent|pane> <verb> <?option> # detect overlay state, send key, return outcome
+{
+  # Common entry for the 4 REMOTE CONTROL verbs. Validates that the agent is
+  # actually in an overlay state, looks up the key per state, sends via raw.
+  local name="$1"
+  local verb="$2"
+  local option="${3:-}"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: hiveMind agent.${verb} <agent|pane> ${option:+<option>}"
     return 1
   fi
 
-  info.log "Sending approval option $option to pane $pane..."
-  otmux send.enter "$pane" "$option"
-  success.log "Sent option $option to pane $pane"
+  # Resolve to pane (accepts both agent names and direct pane targets)
+  local target resolveRc
+  if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    target="$name"
+  else
+    target=$(hiveMind.resolve "$name" 2>/dev/null)
+    resolveRc=$?
+    if [ $resolveRc -ne 0 ] || [ -z "$target" ]; then
+      error.log "agent.${verb}: cannot resolve '$name'"
+      create.result 1 "no-pane: $name"
+      return 1
+      fi
+    if ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+      error.log "agent.${verb}: malformed target '$target'"
+      create.result 1 "no-pane: $name"
+      return 1
+    fi
+  fi
+
+  # Detect overlay state — only act if agent is in one
+  local detect status
+  detect=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
+  status="${detect%%|*}"
+
+  case "$status" in
+    permission|tool-confirm|accept-edits|overlay|panel)
+      ;;  # ok — proceed
+    *)
+      error.log "agent.${verb}: $name is not in an overlay state (current=$status) — refusing to send key"
+      create.result 1 "rejected: not-in-overlay (state=$status)"
+      return 1
+      ;;
+  esac
+
+  # Look up key per (state, verb)
+  local key
+  key=$(private.hiveMind.agent.overlay.key "$status" "$verb" "$option")
+  if [ -z "$key" ]; then
+    error.log "agent.${verb}: no key mapping for state=$status verb=$verb option=$option"
+    create.result 1 "no-mapping: state=$status verb=$verb"
+    return 1
+  fi
+
+  # Send raw key (no prefix, no Enter — TUI key handling is exact)
+  otmux send.raw "$target" "$key"
+  info.log "REMOTE CONTROL: $name ($target) state=$status verb=$verb key=$key"
+  create.result 0 "controlled $name $target $key"
+  return 0
 }
+
+hiveMind.agent.approve() # <agent|pane> # affirmative response in current overlay (Epic I I1.3)
+{
+  private.hiveMind.agent.overlay.dispatch "$1" approve
+}
+hiveMind.agent.approve.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.reject() # <agent|pane> # negative response in current overlay (Epic I I1.3)
+{
+  private.hiveMind.agent.overlay.dispatch "$1" reject
+}
+hiveMind.agent.reject.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.dismiss() # <agent|pane> # dismiss any overlay with Escape (Epic I I1.3)
+{
+  private.hiveMind.agent.overlay.dispatch "$1" dismiss
+}
+hiveMind.agent.dismiss.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.option() # <agent|pane> <N> # send arbitrary option N in current overlay (Epic I I1.3)
+{
+  private.hiveMind.agent.overlay.dispatch "$1" option "$2"
+}
+hiveMind.agent.option.completion.agentName() { private.hiveMind.roles.complete; }
+hiveMind.agent.option.completion.N() { echo "1"; echo "2"; echo "3"; }
+
+# ── Epic I I1.4: QUEUE path — defer messages when agent busy, drain on idle ──
+
+private.hiveMind.agent.queue.path() { # <pane> # path to queue file for a pane (sanitize : and . to _)
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+  local safe="${pane//:/_}"
+  safe="${safe//./_}"
+  echo "${HIVEMIND_QUEUE_DIR}/${safe}.queue"
+}
+
+private.hiveMind.agent.queue.enqueue() { # <pane> <intent> <text> # append message; enforce depth bound
+  # Format: <epoch>|<intent>|<text>
+  # Atomic: append (>> is atomic for short writes per POSIX). Depth bound
+  # rotates by dropping oldest after append (warn on drop).
+  local pane="$1" intent="$2"
+  shift 2
+  local text="$*"
+  [ -z "$pane" ] || [ -z "$intent" ] && return 1
+  local f
+  f=$(private.hiveMind.agent.queue.path "$pane")
+  mkdir -p "$(dirname "$f")" 2>/dev/null
+  echo "$(date +%s)|${intent}|${text}" >> "$f"
+
+  # Depth bound — drop oldest if over limit
+  local depth
+  depth=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
+  if [ "${depth:-0}" -gt "$HIVEMIND_QUEUE_MAX_DEPTH" ]; then
+    local over=$((depth - HIVEMIND_QUEUE_MAX_DEPTH))
+    warn.log "queue ${pane}: depth ${depth} > max ${HIVEMIND_QUEUE_MAX_DEPTH}; dropping ${over} oldest"
+    tail -n "$HIVEMIND_QUEUE_MAX_DEPTH" "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+  fi
+}
+
+private.hiveMind.agent.queue.depth() { # <pane> # number of pending messages
+  local pane="$1"
+  local f
+  f=$(private.hiveMind.agent.queue.path "$pane")
+  [ -f "$f" ] || { echo 0; return 0; }
+  wc -l < "$f" 2>/dev/null | tr -d ' '
+}
+
+private.hiveMind.agent.queue.resolve() { # <agent|pane> # resolve to pane (used by public queue verbs)
+  local name="$1"
+  if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    echo "$name"
+    return 0
+  fi
+  local target rc
+  target=$(hiveMind.resolve "$name" 2>/dev/null)
+  rc=$?
+  if [ $rc -ne 0 ] || ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_.-]*:[0-9]+\.[0-9]+$ ]]; then
+    return 1
+  fi
+  echo "$target"
+}
+
+hiveMind.agent.queue.list() # <agent|pane> # show pending messages with age (Epic I I1.4)
+{
+  local target
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.list: cannot resolve '$1'"; return 1; }
+  local f
+  f=$(private.hiveMind.agent.queue.path "$target")
+  if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+    info.log "queue $target: empty"
+    return 0
+  fi
+  local now
+  now=$(date +%s)
+  local epoch intent text age idx=0
+  printf "  %-4s %-8s %-12s %s\n" "#" "AGE" "INTENT" "MESSAGE"
+  while IFS='|' read -r epoch intent text; do
+    idx=$((idx + 1))
+    age=$((now - epoch))
+    printf "  %-4s %-8s %-12s %s\n" "$idx" "${age}s" "$intent" "$text"
+  done < "$f"
+}
+hiveMind.agent.queue.list.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.queue.clear() # <agent|pane> # cancel all pending queued messages (Epic I I1.4)
+{
+  local target
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.clear: cannot resolve '$1'"; return 1; }
+  local f
+  f=$(private.hiveMind.agent.queue.path "$target")
+  [ -f "$f" ] && rm -f "$f"
+  info.log "queue $target: cleared"
+}
+hiveMind.agent.queue.clear.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.queue.drain() # <agent|pane> # FIFO drain pending messages (re-checks state per message) (Epic I I1.4)
+{
+  # Drain semantics:
+  #   • FIFO order (oldest first)
+  #   • Re-check state per-message — if agent re-enters busy mid-drain, stop
+  #   • Drop messages older than HIVEMIND_QUEUE_MAX_AGE_SEC (warn each)
+  #   • Atomic per-message: read line, dispatch, rewrite file without that line
+  local target
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.drain: cannot resolve '$1'"; return 1; }
+  local f
+  f=$(private.hiveMind.agent.queue.path "$target")
+  [ -f "$f" ] && [ -s "$f" ] || { info.log "queue $target: nothing to drain"; return 0; }
+
+  local now drained=0 dropped_age=0 stopped_at=""
+  now=$(date +%s)
+
+  while [ -s "$f" ]; do
+    # Read first line
+    local first
+    first=$(head -1 "$f")
+    [ -z "$first" ] && { tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"; continue; }
+
+    local epoch intent text
+    IFS='|' read -r epoch intent text <<< "$first"
+
+    # Age check
+    if [ $((now - epoch)) -gt "$HIVEMIND_QUEUE_MAX_AGE_SEC" ]; then
+      warn.log "queue $target: dropping stale message (age=$((now - epoch))s, intent=$intent)"
+      tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+      dropped_age=$((dropped_age + 1))
+      continue
+    fi
+
+    # Re-check state — bail if agent re-entered busy
+    local route
+    route=$(private.hiveMind.agent.route "$target")
+    if [ "$route" != "inform" ]; then
+      stopped_at="state went $route mid-drain"
+      break
+    fi
+
+    # Dispatch per intent
+    case "$intent" in
+      inform)
+        private.hiveMind.agent.inform "$target" "$text" 2>/dev/null
+        ;;
+      remote-control:*)
+        local key="${intent#remote-control:}"
+        otmux send.raw "$target" "$key" 2>/dev/null
+        ;;
+      *)
+        warn.log "queue $target: unknown intent '$intent', dropping"
+        ;;
+    esac
+
+    # Remove first line on success
+    tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+    drained=$((drained + 1))
+    sleep 0.2
+  done
+
+  # Clean empty file
+  [ -f "$f" ] && [ ! -s "$f" ] && rm -f "$f"
+
+  if [ -n "$stopped_at" ]; then
+    info.log "queue $target: drained $drained, dropped $dropped_age stale; stopped — $stopped_at"
+  else
+    info.log "queue $target: drained $drained, dropped $dropped_age stale"
+  fi
+}
+hiveMind.agent.queue.drain.completion.agentName() { private.hiveMind.roles.complete; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SWEEP & UNBLOCK
@@ -4547,9 +6963,21 @@ private.hiveMind.sweep.detect() {
   # regexes which match their own source). Structural checks below (menus,
   # ❯ arrow, prompt state) keep using $content because their signals are UI
   # shapes, not substrings, and don't collide with code.
+  # F2.1 — strip ALL common line-comment markers before substring matching.
+  # A source-code pane mentioning "rate limit" or "subscription limit" in a
+  # comment must not trigger the detector. Patterns stripped per first
+  # non-whitespace token:
+  #   #    — shell, Python, Ruby, Makefile, YAML, conf
+  #   //   — C, C++, JS, TS, Go, Rust, Java, Swift, CSS, Kotlin, Dart
+  #   --   — SQL, Haskell, Lua, Ada, Elm
+  #   /*   — C-family block comment open (single-line "/* … */" form)
+  #   *    — C-family block comment continuation line (e.g. "  * see also …")
+  #   <!-- — HTML/XML comment open
+  # Also drop shell control-flow, grep/sed/awk/echo calls (regex self-matches),
+  # and pipe continuations — unchanged from the original scrub.
   local prose
   prose=$(echo "$content" \
-    | grep -v '^[[:space:]]*#' \
+    | grep -vE '^[[:space:]]*(#|//|--|/\*|\*[^/]|<!--)' \
     | grep -vE "(grep|sed|awk|echo)[[:space:]]+-?[a-zA-Z]*[[:space:]]*['\"]" \
     | grep -vE "^[[:space:]]*(if|elif|fi|then|else|done|for|while|case|esac)[[:space:]]*[[(]" \
     | grep -vE "^[[:space:]]*\|[[:space:]]*(grep|sed|awk)|^[[:space:]]+\\\\$")
@@ -4633,9 +7061,16 @@ private.hiveMind.sweep.detect() {
   # ── Edit and acceptance prompts ────────────────────────────────────────
 
   # Accept edits prompt: ⏵⏵ accept edits on · N bash(es)
-  if echo "$content" | grep -q '⏵⏵ accept'; then
+  # F2.2 — match ONLY against the bottom 5 lines (the live status bar). Old
+  # `⏵⏵ accept` text in scrollback (e.g. agent's previous output, conversation
+  # history visible in pane) caused false positives that blocked Epic I
+  # context-aware sends to actually-idle agents. The live indicator only
+  # appears in the status bar above the prompt — never in conversation body.
+  local tail_content
+  tail_content=$(echo "$content" | tail -n 5)
+  if echo "$tail_content" | grep -q '⏵⏵ accept'; then
     local edit_count
-    edit_count=$(echo "$content" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
+    edit_count=$(echo "$tail_content" | grep -oE '[0-9]+ bash' | head -1 | grep -oE '[0-9]+')
     [ -z "$edit_count" ] && edit_count=0
     echo "accept-edits|enter|blocker|$edit_count"
     return 0
@@ -4692,8 +7127,13 @@ private.hiveMind.sweep.detect() {
 }
 
 private.hiveMind.agent.unblock.pane() {
-  # Detect and resolve blocker on a single pane
-  # Handles new sweep.detect format: status|action|severity[|detail]
+  # Detect and resolve blocker on a single pane.
+  # Bug #2 fix: STRICT ALLOWLIST — keys are sent ONLY to panes confirmed in a
+  # blocking state. Active/idle/completed/unknown/anything-else are no-ops.
+  # SM previously interrupted web4-po twice because the old fallback `*)` case
+  # forwarded $action (enter/down-enter) for non-blocked statuses.
+  #
+  # Handles sweep.detect format: status|action|severity[|detail]
   local target="$1"
   local label="$2"
   local attempt="${3:-1}"
@@ -4705,11 +7145,39 @@ private.hiveMind.agent.unblock.pane() {
   local status action severity detail
   IFS='|' read -r status action severity detail <<< "$result"
 
-  # Skip if already healthy
+  # Bug #2 ALLOWLIST — explicit list of statuses that trigger key sends.
+  # Per PO: permission, tool-confirm, accept-edits, queued.
+  # Wait-only statuses (rate-limit, mcp-error, …) are handled separately below.
+  # Anything not in either list is silently skipped — never send keys to an
+  # ACTIVE agent.
   case "$status" in
-    active|idle|unknown) return 0 ;;
+    permission|tool-confirm|accept-edits|queued)
+      ;;  # falls through to action handlers below
+    rate-limit|api-error|mcp-error)
+      console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
+      return 0
+      ;;
+    subscription-limit|crash|shell-escaped)
+      warn.log "CRITICAL $label ($status) — needs human intervention"
+      return 0
+      ;;
+    idle)
+      # Epic I I1.4 — agent at idle ❯ : drain any queued messages FIFO.
+      # Drain re-checks state per-message (will stop if agent re-enters busy
+      # mid-drain). Safe no-op if queue is empty.
+      private.hiveMind.agent.queue.drain "$target" 2>/dev/null
+      return 0
+      ;;
+    *)
+      # active|completed|unknown|overlay|panel|autocomplete|<anything-new>
+      # → SKIP. No keys sent. Old fallback that read $action is REMOVED — that
+      # was the regression vector that interrupted web4-po.
+      debug.log "Skipping $label ($status) — not in unblock allowlist"
+      return 0
+      ;;
   esac
 
+  # Below here only runs for: permission, tool-confirm, accept-edits, queued.
   case "$status" in
     permission)
       # Select option 2 ("Yes, and don't ask again") — Down then Enter
@@ -4741,77 +7209,27 @@ private.hiveMind.agent.unblock.pane() {
       sleep 0.3
       console.log "Unblocked $label ($status) → $((count+1))x Enter + 2x BTab (back to normal)"
       ;;
-    overlay|panel)
-      # Dismiss overlay or git panel
-      otmux send.raw "$target" Escape
-      console.log "Unblocked $label ($status) → Escape"
-      ;;
-    autocomplete)
-      # Dismiss stuck autocomplete menu
-      otmux send.raw "$target" Escape
-      console.log "Unblocked $label ($status) → Escape"
-      ;;
     queued)
       # Submit queued text
       otmux send.raw "$target" Enter
       console.log "Unblocked $label ($status) → Enter"
       ;;
-    rate-limit|api-error)
-      # Transient — just wait, auto-recovers
-      console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
-      ;;
-    subscription-limit|crash|shell-escaped)
-      # Critical — cannot auto-resolve, log warning
-      warn.log "CRITICAL $label ($status) — needs human intervention"
-      ;;
-    mcp-error)
-      # MCP errors often self-recover
-      console.log "Waiting $label ($status) — MCP reconnecting"
-      ;;
-    *)
-      # Fallback: use action field
-      case "$action" in
-        enter)
-          otmux send.raw "$target" Enter
-          console.log "Unblocked $label ($status) → Enter"
-          ;;
-        down-enter)
-          otmux send.raw "$target" Down
-          sleep 0.3
-          otmux send.raw "$target" Enter
-          console.log "Unblocked $label ($status) → Down+Enter"
-          ;;
-        escape)
-          otmux send.raw "$target" Escape
-          sleep 0.1
-          otmux send.raw "$target" Enter
-          console.log "Unblocked $label ($status) → Escape+Enter"
-          ;;
-        wait)
-          console.log "Waiting $label ($status) — ${detail:-will auto-recover}"
-          ;;
-        none) ;;
-      esac
-      ;;
   esac
 
-  # Verify: re-detect after action (skip for wait-only states)
-  case "$status" in
-    rate-limit|api-error|subscription-limit|crash|shell-escaped|mcp-error) return 0 ;;
-  esac
-
+  # Verify: re-detect after action. If still blocked with same/another
+  # actionable state, retry once. If now active/idle/completed/etc., we're done.
   if [ "$attempt" -le 1 ]; then
     sleep 1
     local recheck
     recheck=$(private.hiveMind.sweep.detect "$target" 2>/dev/null)
     local new_status="${recheck%%|*}"
     case "$new_status" in
-      active|idle|unknown)
-        debug.log "Verified: $label cleared ($status → $new_status)"
-        ;;
-      *)
+      permission|tool-confirm|accept-edits|queued)
         warn.log "$label still blocked ($new_status) — retrying once"
         private.hiveMind.agent.unblock.pane "$target" "$label" 2
+        ;;
+      *)
+        debug.log "Verified: $label cleared ($status → $new_status)"
         ;;
     esac
   fi
@@ -4843,7 +7261,7 @@ hiveMind.pane.sweep() # <?session> <?interval> # show last lines of each agent p
     return 1
   fi
 
-  while IFS='|' read -r target role; do
+  while IFS='|' read -r target role _ts; do
     [ -z "$target" ] || [ -z "$role" ] && continue
     case "$target" in "${session}:"*) ;; *) continue ;; esac
 
@@ -4981,7 +7399,7 @@ hiveMind.dashboard() # <?session> # write consolidated team state to session/das
 
   # Iterate all agents
   if [ -f "$registry" ]; then
-    while IFS='|' read -r target role; do
+    while IFS='|' read -r target role _ts; do
       [ -z "$role" ] && continue
       [[ "$target" != "$session:"* ]] && continue
 
@@ -5044,7 +7462,7 @@ hiveMind.agent.unblock() # <agentName> <?session> # detect and resolve stuck pro
   local session="${2:-$(private.hiveMind.active.team)}"
 
   if [ "$name" = "all" ]; then
-    while IFS='|' read -r target role; do
+    while IFS='|' read -r target role _ts; do
       [ -z "$target" ] || [ -z "$role" ] && continue
       case "$target" in "${session}:"*) ;; *) continue ;; esac
       private.hiveMind.agent.unblock.pane "$target" "$role"
@@ -6196,6 +8614,11 @@ hiveMind.start()
   fi
 
   if [ -z "$1" ]; then
+    # When sourced (no args), do NOT scan sessions — caller wants functions only.
+    # BUG-T5: source hiveMind was calling hiveMind.status → 30s scan of all sessions.
+    if (this.isSourced); then
+      return 0
+    fi
     hiveMind.status
     return 0
   fi

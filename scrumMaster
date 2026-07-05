@@ -589,7 +589,53 @@ scrumMaster.team.capture.completion.session() # # tmux session names
   tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
-scrumMaster.cycle() # <?session> <?interval:0> # one measure+sweep+unblock cycle with optional sleep
+private.scrumMaster.sweep.isStable() # <?session> # 0 if safe to reconcile (no in-flight mutation), 1 otherwise
+{
+  # SC-D.2 stability gate. Conservative: any RECENT lifecycle/mutation process
+  # → skip reconcile this cycle. Reconcile is a safety net, not a hot path —
+  # one missed cycle is harmless; fighting a mid-flight mutation is destructive.
+  #
+  # CRITICAL: filter by RECENCY (etime < 60s). Long-running parent shells like
+  # `bash claudeCode fork ...` persist as agent wrappers — every running Claude
+  # agent looks like a "fork in progress" forever. Recency filter restricts to
+  # actual in-flight ops which finish within seconds.
+  #
+  # Three gate patterns (combined into one awk pass for performance):
+  #   1. claudeCode short-lived mutations: teams.save | teams.restore | session.probe
+  #      (NOT fork/join/new — those are agent wrappers that persist)
+  #   2. hiveMind agent lifecycle: bootstrap | respawn | restart | spawn | rename
+  #   3. tronMonitor lifecycle: setup | reset | add | sync | remove | prune
+  #   4. hiveMind consistency.* — anti-recursion (don't reconcile during reconcile)
+  local session="$1"  # reserved for future per-team gating; gates currently global
+  : "${session:=}"
+
+  local matched
+  matched=$(ps -eo etime,args 2>/dev/null | awk '
+    function et2s(e,   a) {
+      if (split(e, a, "-") == 2) return 86400 * a[1] + 3600*substr(a[2],1,2) + 60*substr(a[2],4,2) + substr(a[2],7,2)
+      if (split(e, a, ":") == 3) return 3600*a[1] + 60*a[2] + a[3]
+      if (split(e, a, ":") == 2) return 60*a[1] + a[2]
+      return e+0
+    }
+    NR == 1 { next }                                            # skip header
+    {
+      sec = et2s($1)
+      if (sec >= 60) next                                       # too old — likely a wrapper, not in-flight
+      line = $0
+      if (line ~ /claudeCode (teams\.(save|restore)|session\.probe)/) { print "claudeCode"; exit }
+      if (line ~ /hiveMind agent\.(bootstrap|respawn|restart|spawn|rename)/) { print "agent-lifecycle"; exit }
+      if (line ~ /tronMonitor (setup|reset|add|sync|remove|prune)/) { print "tronMonitor"; exit }
+      if (line ~ /hiveMind consistency\.(fix|reconcile|audit)/) { print "consistency"; exit }
+    }
+  ')
+  if [ -n "$matched" ]; then
+    debug.log "reconcile gate: recent $matched mutation in flight — skip"
+    return 1
+  fi
+  return 0
+}
+
+scrumMaster.cycle() # <?session> <?interval:0> # one measure+sweep+unblock+reconcile cycle with optional sleep
 {
   local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
   local interval="${2:-0}"
@@ -601,6 +647,16 @@ scrumMaster.cycle() # <?session> <?interval:0> # one measure+sweep+unblock cycle
   scrumMaster.dashboard "$session"
   "$OOSH_DIR/hiveMind" pane.sweep "$session"
   "$OOSH_DIR/hiveMind" agent.unblock all "$session"
+
+  # SC-D.2 — close the safety-net loop: SM sweeps → detects drift → reconcile fixes.
+  # Reconcile in apply mode after sweep+unblock have settled, gated by stability
+  # check so we never mutate against in-flight lifecycle ops. Output is a single
+  # line per the consistency.reconcile contract.
+  if private.scrumMaster.sweep.isStable "$session"; then
+    "$OOSH_DIR/hiveMind" consistency.reconcile "$session" apply
+  else
+    info.log "scrumMaster.cycle: reconcile skipped (mutation in flight)"
+  fi
 }
 scrumMaster.cycle.completion() { :; }
 
@@ -1753,33 +1809,79 @@ scrumMaster.metrics.collect.completion() { :; }
 # Answers management questions about subscription usage
 # ─────────────────────────────────────────────────────────────────────────────
 
-private.scrumMaster.subscription.api.call() # # fetch subscription data from OAuth API and cache
+private.scrumMaster.subscription.cacheFile() { # # canonical path for subscription cache env
+  echo "${CONFIG_PATH:-$HOME/config}/scrumMaster.subscription.env"
+}
+
+private.scrumMaster.subscription.api.call() # # fetch subscription data from OAuth API; on rate_limit/failure keeps existing cache marked stale
 {
+  local cacheFile
+  cacheFile=$(private.scrumMaster.subscription.cacheFile)
+
   # Auth
   local token
   token=$(private.scrumMaster.subscription.auth)
-  if [ $? -ne 0 ]; then return 1; fi
+  if [ $? -ne 0 ]; then
+    # No token — if we have any cache, load and mark stale; otherwise fail.
+    if [ -f "$cacheFile" ]; then
+      source "$cacheFile" 2>/dev/null
+      export SUBSCRIPTION_STALE=1
+      return 0
+    fi
+    return 1
+  fi
 
-  # API call
-  local response
-  response=$(curl -s -f \
+  # API call — split status from body so we can detect 429 / 5xx
+  local tmpBody
+  tmpBody=$(mktemp 2>/dev/null || echo "/tmp/scrumMaster.sub.$$.body")
+  local httpCode
+  httpCode=$(curl -s -o "$tmpBody" -w "%{http_code}" \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
     -H "Accept: application/json" \
     "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-  if [ $? -ne 0 ] || [ -z "$response" ]; then
-    error.log "OAuth usage API call failed"
+  local curlRc=$?
+  local response
+  response=$(cat "$tmpBody" 2>/dev/null)
+  rm -f "$tmpBody" 2>/dev/null
+
+  # Transient failure path — serve cache if available, mark stale
+  if [ "$curlRc" -ne 0 ] || [ -z "$response" ] || [ "$httpCode" != "200" ]; then
+    local reason="network"
+    [ "$httpCode" = "429" ] && reason="rate_limit"
+    [ "$httpCode" -ge 500 ] 2>/dev/null && reason="server_${httpCode}"
+    [ "$httpCode" -ge 400 ] 2>/dev/null && [ "$httpCode" -lt 500 ] && reason="client_${httpCode}"
+
+    if [ -f "$cacheFile" ]; then
+      source "$cacheFile" 2>/dev/null
+      export SUBSCRIPTION_STALE=1
+      export SUBSCRIPTION_STALE_REASON="$reason"
+      warn.log "OAuth usage API failed ($reason) — using cached data (age: $(scrumMaster.subscription.cache.age)s)"
+      return 0
+    fi
+    error.log "OAuth usage API failed ($reason) — no cache available"
     return 1
   fi
 
   # Parse into SUBSCRIPTION_* variables
   private.scrumMaster.subscription.parse "$response"
-  if [ $? -ne 0 ]; then return 1; fi
+  if [ $? -ne 0 ]; then
+    # Parse failure — same fallback as API failure
+    if [ -f "$cacheFile" ]; then
+      source "$cacheFile" 2>/dev/null
+      export SUBSCRIPTION_STALE=1
+      export SUBSCRIPTION_STALE_REASON="parse_error"
+      warn.log "OAuth response parse failed — using cached data"
+      return 0
+    fi
+    return 1
+  fi
 
-  # Cache for offline access
-  local cacheFile="${CONFIG_PATH:-$HOME/config}/scrumMaster.subscription.env"
+  # Fresh data — clear stale flags, write cache
+  unset SUBSCRIPTION_STALE SUBSCRIPTION_STALE_REASON
   {
     echo "SUBSCRIPTION_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "SUBSCRIPTION_TIMESTAMP_EPOCH=\"$(date +%s)\""
     echo "SUBSCRIPTION_FIVE_HOUR_UTIL=\"${SUBSCRIPTION_FIVE_HOUR_UTIL:-}\""
     echo "SUBSCRIPTION_FIVE_HOUR_RESETS=\"${SUBSCRIPTION_FIVE_HOUR_RESETS:-}\""
     echo "SUBSCRIPTION_SEVEN_DAY_UTIL=\"${SUBSCRIPTION_SEVEN_DAY_UTIL:-}\""
@@ -1790,6 +1892,32 @@ private.scrumMaster.subscription.api.call() # # fetch subscription data from OAu
   } > "$cacheFile"
   return 0
 }
+
+scrumMaster.subscription.cache.age() # # seconds since last fresh API read (or "no-cache" / "unknown")
+{
+  local cacheFile
+  cacheFile=$(private.scrumMaster.subscription.cacheFile)
+  [ ! -f "$cacheFile" ] && { echo "no-cache"; return 1; }
+
+  # Prefer epoch field (added 2026-04-24); fall back to parsing ISO timestamp
+  local ts_epoch
+  ts_epoch=$(grep -E '^SUBSCRIPTION_TIMESTAMP_EPOCH=' "$cacheFile" 2>/dev/null | cut -d'"' -f2)
+  if [ -z "$ts_epoch" ]; then
+    local ts_iso
+    ts_iso=$(grep -E '^SUBSCRIPTION_TIMESTAMP=' "$cacheFile" 2>/dev/null | cut -d'"' -f2)
+    [ -z "$ts_iso" ] && { echo "unknown"; return 1; }
+    # Convert ISO → epoch (BSD + GNU date compatible)
+    ts_epoch=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts_iso" '+%s' 2>/dev/null \
+            || date -d "$ts_iso" '+%s' 2>/dev/null)
+    [ -z "$ts_epoch" ] && { echo "unknown"; return 1; }
+  fi
+
+  local now
+  now=$(date +%s)
+  echo $((now - ts_epoch))
+  return 0
+}
+scrumMaster.subscription.cache.age.completion() { :; }
 
 private.scrumMaster.subscription.resets.in() # # calculate human-readable time until reset
 {
@@ -1840,7 +1968,14 @@ scrumMaster.subscription() # # one-liner subscription status — "are we OK?"
   local verdict
   verdict=$(private.scrumMaster.subscription.verdict "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}")
 
-  echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-?}% 5h | ${SUBSCRIPTION_SEVEN_DAY_UTIL:-?}% 7d | resets in ${resets_in} | ${verdict}"
+  local staleTag=""
+  if [ "${SUBSCRIPTION_STALE:-0}" = "1" ]; then
+    local age
+    age=$(scrumMaster.subscription.cache.age 2>/dev/null)
+    staleTag=" (cached ${age}s, ${SUBSCRIPTION_STALE_REASON:-stale})"
+  fi
+
+  echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-?}% 5h | ${SUBSCRIPTION_SEVEN_DAY_UTIL:-?}% 7d | resets in ${resets_in} | ${verdict}${staleTag}"
 }
 scrumMaster.subscription.completion() { :; }
 
@@ -1931,6 +2066,178 @@ scrumMaster.velocity.target() # # calculate burn rate target
   private.scrumMaster.velocity.target "$@"
 }
 scrumMaster.velocity.target.completion() { :; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F1 — Velocity time-series logging + burn-rate alerts (CMM4)
+# ─────────────────────────────────────────────────────────────────────────────
+# Log format: append-only env-file, one sample per line:
+#   <epoch>|<utcTimestamp>|<fiveHourPct>|<sevenDayPct>|<remainingMin>
+# Stored at:  ~/config/metrics/velocity.log.env
+#
+# scrumMaster.velocity.log        — capture current sample + compute 10-min burn
+# scrumMaster.velocity.alert      — log then warn if 10-min burn > 15%
+# scrumMaster.velocity.history    — show recent samples (diagnostic)
+# scrumMaster.velocity.rate       — compute burn rate over arbitrary window
+
+: ${SCRUMMASTER_VELOCITY_LOG:=${CONFIG_PATH:-$HOME/config}/metrics/velocity.log.env}
+: ${SCRUMMASTER_VELOCITY_ALERT_THRESHOLD:=15}  # % per 10-min that triggers alert
+: ${SCRUMMASTER_VELOCITY_WINDOW_MIN:=10}       # minutes per burn-rate window
+
+private.scrumMaster.velocity.ensure.log() {
+  local logdir="$(dirname "$SCRUMMASTER_VELOCITY_LOG")"
+  [ -d "$logdir" ] || mkdir -p "$logdir"
+  [ -f "$SCRUMMASTER_VELOCITY_LOG" ] || touch "$SCRUMMASTER_VELOCITY_LOG"
+}
+
+private.scrumMaster.velocity.capture.sample() # # refresh SUBSCRIPTION_* via live API (or cache)
+{
+  # Prefer live API call; fall back to cache if API fails (consistent with the
+  # other scrumMaster.subscription.* wrappers).
+  if ! private.scrumMaster.subscription.api.call >/dev/null 2>&1; then
+    local cacheFile="${CONFIG_PATH:-$HOME/config}/scrumMaster.subscription.env"
+    if [ -f "$cacheFile" ]; then
+      source "$cacheFile"
+    else
+      return 1
+    fi
+  fi
+  return 0
+}
+
+scrumMaster.velocity.log() # # capture current 5h% + compute 10-min burn rate, persist sample
+{
+  private.scrumMaster.velocity.ensure.log
+
+  # Step 1 — capture live sample
+  if ! private.scrumMaster.velocity.capture.sample; then
+    error.log "velocity.log: could not fetch subscription data (API + cache both empty)"
+    create.result 1 "no data"
+    return 1
+  fi
+
+  local fiveHour sevenDay resetsAt now_epoch now_iso remain_min
+  fiveHour=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+  sevenDay=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+  resetsAt="${SUBSCRIPTION_FIVE_HOUR_RESETS:-}"
+  now_epoch=$(date +%s)
+  now_iso=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+  # Compute remaining minutes until 5h window reset (best-effort)
+  remain_min=0
+  if [ -n "$resetsAt" ]; then
+    remain_min=$(python3 -c "
+from datetime import datetime, timezone
+try:
+    r = datetime.fromisoformat('$resetsAt')
+    if r.tzinfo is None: r = r.replace(tzinfo=timezone.utc)
+    d = r - datetime.now(timezone.utc)
+    print(max(0, int(d.total_seconds() // 60)))
+except: print(0)
+" 2>/dev/null)
+  fi
+
+  # Step 2 — append sample (one line per capture)
+  echo "${now_epoch}|${now_iso}|${fiveHour}|${sevenDay}|${remain_min}" >> "$SCRUMMASTER_VELOCITY_LOG"
+
+  # Step 3 — compute burn rate over the 10-min window
+  local burn
+  burn=$(scrumMaster.velocity.rate "$SCRUMMASTER_VELOCITY_WINDOW_MIN")
+
+  # Output summary
+  echo "sample: ${fiveHour}% 5h / ${sevenDay}% 7d / ${remain_min}min left"
+  if [ -n "$burn" ] && [ "$burn" != "-" ]; then
+    echo "burn  : ${burn}% per ${SCRUMMASTER_VELOCITY_WINDOW_MIN}-min window"
+  else
+    echo "burn  : insufficient history (need ≥ 2 samples in window)"
+  fi
+
+  create.result 0 "$fiveHour"
+}
+scrumMaster.velocity.log.completion() { :; }
+
+scrumMaster.velocity.rate() # <?windowMin:10> # compute 5h% burn rate over a time window (empty if < 2 samples)
+{
+  local windowMin="${1:-$SCRUMMASTER_VELOCITY_WINDOW_MIN}"
+  private.scrumMaster.velocity.ensure.log
+
+  local now_epoch
+  now_epoch=$(date +%s)
+  local window_start=$(( now_epoch - windowMin * 60 ))
+
+  # Find samples whose epoch ≥ window_start — earliest and latest
+  local earliest_pct="" earliest_epoch="" latest_pct="" latest_epoch=""
+  while IFS='|' read -r e iso five seven rem; do
+    [ -z "$e" ] && continue
+    [[ "$e" != [0-9]* ]] && continue
+    [ "$e" -lt "$window_start" ] && continue
+    if [ -z "$earliest_pct" ]; then
+      earliest_pct="$five"
+      earliest_epoch="$e"
+    fi
+    latest_pct="$five"
+    latest_epoch="$e"
+  done < "$SCRUMMASTER_VELOCITY_LOG"
+
+  if [ -z "$earliest_pct" ] || [ -z "$latest_pct" ] || [ "$earliest_epoch" = "$latest_epoch" ]; then
+    echo "-"
+    return 1
+  fi
+
+  # Burn = (latest_pct - earliest_pct) normalized to per-windowMin rate.
+  # Since the window is already windowMin long (roughly), the delta is the rate.
+  local delta=$(( latest_pct - earliest_pct ))
+  echo "$delta"
+  return 0
+}
+scrumMaster.velocity.rate.completion.windowMin() { echo "5"; echo "10"; echo "30"; echo "60"; }
+
+scrumMaster.velocity.alert() # <?threshold:15> <?windowMin:10> # warn if burn rate exceeds threshold
+{
+  local threshold="${1:-$SCRUMMASTER_VELOCITY_ALERT_THRESHOLD}"
+  local windowMin="${2:-$SCRUMMASTER_VELOCITY_WINDOW_MIN}"
+
+  # Log a fresh sample first (alert without log is just a one-shot check)
+  scrumMaster.velocity.log >/dev/null 2>&1
+
+  local burn
+  burn=$(scrumMaster.velocity.rate "$windowMin")
+
+  if [ "$burn" = "-" ] || [ -z "$burn" ]; then
+    info.log "velocity.alert: insufficient history (need ≥ 2 samples in ${windowMin}-min window)"
+    create.result 0 "no-data"
+    return 0
+  fi
+
+  if [ "$burn" -ge "$threshold" ] 2>/dev/null; then
+    local now_five
+    now_five=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+    warn.log "velocity BURN RATE HIGH: ${burn}% per ${windowMin}min (threshold ${threshold}%, current ${now_five}% 5h)"
+    create.result 1 "$burn"
+    return 1
+  fi
+
+  info.log "velocity ok: ${burn}%/${windowMin}min (threshold ${threshold}%)"
+  create.result 0 "$burn"
+  return 0
+}
+scrumMaster.velocity.alert.completion.threshold() { echo "10"; echo "15"; echo "20"; echo "25"; }
+scrumMaster.velocity.alert.completion.windowMin() { scrumMaster.velocity.rate.completion.windowMin; }
+
+scrumMaster.velocity.history() # <?lines:20> # show recent velocity samples for diagnostics
+{
+  local lines="${1:-20}"
+  private.scrumMaster.velocity.ensure.log
+  if [ ! -s "$SCRUMMASTER_VELOCITY_LOG" ]; then
+    info.log "velocity log empty: $SCRUMMASTER_VELOCITY_LOG"
+    return 0
+  fi
+  printf "%-22s %-6s %-6s %-6s\n" "TIMESTAMP" "5h%" "7d%" "MIN"
+  tail -n "$lines" "$SCRUMMASTER_VELOCITY_LOG" | while IFS='|' read -r e iso five seven rem; do
+    [ -z "$e" ] && continue
+    printf "%-22s %-6s %-6s %-6s\n" "$iso" "$five" "$seven" "$rem"
+  done
+}
+scrumMaster.velocity.history.completion.lines() { echo "10"; echo "20"; echo "50"; echo "200"; }
 
 scrumMaster.usage()
 {
