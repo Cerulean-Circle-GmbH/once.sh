@@ -66,18 +66,6 @@ sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh
 ```
 
 
-## Starting an OOSH shell
-
-After install, just type **`bash`** — that's it. Your prompt becomes:
-
-```
-[oosh <hostname>] user@host:~ >
-```
-
-Tab completion works on all OOSH scripts (`otmux <TAB>`, `hiveMind <TAB>`, etc).
-
-Details and troubleshooting: [docs/oosh.md — Starting an OOSH Shell](docs/oosh.md#starting-an-oosh-shell).
-
 ## Advanced usage: ONCE Server
 
 setup a once server management environment
