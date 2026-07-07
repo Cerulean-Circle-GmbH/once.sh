@@ -288,6 +288,40 @@ private.config.var.allowed() { # <varName> # rc 0 if the var may be harvested fr
   return 1
 }
 
+private.config.declare.varname() # <declare-or-export-line> # THE canonical varname extractor (config-save-greedy-varname-drop contract A). Anchored, NEVER greedy: strip the exact prefix, then take the identifier up to the FIRST '='. The value (after '=') is structurally UNREACHABLE — a value containing ' x=' CANNOT corrupt the name. Prints varname+rc0, else empty+rc1.
+{
+  local line="$1" vn=""
+  case "$line" in *=*) ;; *) return 1 ;; esac      # must be an assignment
+  case "$line" in
+    "declare -"*) vn="${line#declare }"; vn="${vn#-* }"; vn="${vn%%=*}" ;;  # `declare -flags IDENT=…` → IDENT
+    "export "*)   vn="${line#export }";  vn="${vn%%=*}" ;;                   # `export IDENT=…`         → IDENT
+    *) return 1 ;;
+  esac
+  # Pinned identifier only — reject anything with a non-identifier char (proves the
+  # capture didn't run into a value).
+  case "$vn" in
+    ""|[!A-Za-z_]*|*[!A-Za-z0-9_]*) return 1 ;;
+  esac
+  echo "$vn"
+}
+
+private.config.commit.checked() # <tmpfile> <realfile> <intended-newline-list> # contract B: FAIL-LOUD round-trip. Re-parse tmp → persisted; if any intended var is missing → error+rc1 and KEEP the original (atomic mv only on match) = no silent loss for ANY drop cause.
+{
+  local tmp="$1" real="$2" intended="$3"
+  local persisted dropped="" vn
+  persisted=$(while IFS= read -r line; do private.config.declare.varname "$line"; done < "$tmp" 2>/dev/null)
+  while IFS= read -r vn; do
+    [ -z "$vn" ] && continue
+    printf '%s\n' "$persisted" | grep -qxF "$vn" || dropped="$dropped $vn"
+  done <<< "$intended"
+  if [ -n "$dropped" ]; then
+    error.log "config.save: round-trip DROPPED:${dropped} — refusing silent data loss (kept original $real)"
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  mv "$tmp" "$real"
+}
+
 config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" config file in $CONFIG_PATH containing all env variables that match <ENV_PREFIX>
 # without parameters it inititlises the $CONFIG_PATH/user.env
 {
@@ -320,22 +354,32 @@ config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" 
   
   stop.log "
   config.save [file:$file] [name:$name] to $CONFIG"
-    #declare -px | grep "^\(declare .* \)*\(.*$name\)\(.*\)=" | sed 's/^\(declare .* \)*\(.*'$name'\)\(.*\)=\(\"\)*\([^\"]*\)\(\"\)*/export \2\3=\"\5\"/'
-    #declare -p | grep "^\(declare -.* \)*\(.*$name\)\(.*\)=" | sed 's/^\(declare -.* \)*\(.*'$name'\)\(.*\)=\(.*\)/export \2\3=\4/'
   RESULT=""
 
   if [ -n "$file" ]; then
-    # Single-file save (e.g. oosh.env, log.env): dump from declare -px
+    # Single-file save (e.g. oosh.env, log.env): dump from declare -px → TMP, then
+    # fail-loud round-trip commit (contract B) so no matching var is silently lost.
+    local tmp="${CONFIG}.tmp.$$"
     {
       declare -px 2>/dev/null | while IFS= read -r line; do
         local varname
-        varname=$(echo "$line" | sed -n 's/^declare -[^ ]* \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')
-        [ -z "$varname" ] && continue
+        varname=$(private.config.declare.varname "$line") || continue
         case "$varname" in ${name}*) ;; *) continue ;; esac
-        echo "$line" | grep -q "^declare -[aA]" && continue
+        case "$line" in "declare -a"*|"declare -A"*) continue ;; esac
         echo "$line" | sed 's/^declare -[^ ]* /export /'
       done
-    } >$CONFIG
+    } >"$tmp"
+    # intended = EXPORTED varnames matching the prefix, from compgen -e (NAME-direct,
+    # does NOT go through the extractor, so a broken/greedy extractor drop is DETECTED
+    # not hidden). compgen -e (EXPORTED only) mirrors the `declare -px` source above —
+    # `compgen -v` would over-include non-exported shell vars → false "dropped".
+    local intended
+    intended=$(compgen -e 2>/dev/null | while IFS= read -r vn; do
+        case "$vn" in ${name}*) ;; *) continue ;; esac
+        case "$(declare -p "$vn" 2>/dev/null)" in "declare -a"*|"declare -A"*) continue ;; esac
+        echo "$vn"
+      done)
+    private.config.commit.checked "$tmp" "$CONFIG" "$intended" || { RESULT="config.save round-trip failed"; return 1; }
   else
     # No-args path: regenerate user.env via harvest-resolve-merge
     info.log "generating $CONFIG"
@@ -349,7 +393,7 @@ config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" 
     if [ -f "$CONFIG" ]; then
       while IFS= read -r line; do
         [[ "$line" =~ ^export[[:space:]] ]] || continue
-        local vn="${line#export }"; vn="${vn%%=*}"
+        local vn; vn=$(private.config.declare.varname "$line") || continue
         private.config.var.denied "$vn" && continue
         echo "$line" >> "$harvestFile"
       done < "$CONFIG"
@@ -357,10 +401,8 @@ config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" 
     # From live env: STRICT allow-list. The shell env is full of terminal/VSCode/
     # git/test leakage; only OOSH-owned vars may be newly captured from it.
     declare -px 2>/dev/null | while IFS= read -r line; do
-      local vn
-      vn=$(echo "$line" | sed -n 's/^declare -[^ ]* \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p')
-      [ -z "$vn" ] && continue
-      echo "$line" | grep -q "^declare -[aA]" && continue
+      local vn; vn=$(private.config.declare.varname "$line") || continue
+      case "$line" in "declare -a"*|"declare -A"*) continue ;; esac
       grep -q "^export ${vn}=" "$harvestFile" 2>/dev/null && continue
       private.config.var.allowed "$vn" || continue
       echo "$line" | sed 's/^declare -[^ ]* /export /' >> "$harvestFile"
@@ -369,7 +411,9 @@ config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" 
     # PHASE 2 — RESOLVE: canonical fundamentals from BASH_SOURCE
     private.this.resolve.fundamentals
 
-    # PHASE 3 — MERGE + WRITE
+    # PHASE 3 — MERGE + WRITE (to TMP, then fail-loud round-trip commit — contract B)
+    [ -z "$BASH_FILE" ] && BASH_FILE=$(which bash 2>/dev/null)
+    local tmp="${CONFIG}.tmp.$$"
     {
       # Fundamentals (canonical — always correct, override stale)
       echo "export CONFIG_PATH=\"$CONFIG_PATH\""
@@ -377,7 +421,6 @@ config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" 
       echo "export CONFIG=\"$CONFIG_PATH/$CONFIG_FILE\""
       echo "export OOSH_DIR=\"$OOSH_DIR\""
       echo "export OOSH_MODE=\"$OOSH_MODE\""
-      [ -z "$BASH_FILE" ] && BASH_FILE=$(which bash 2>/dev/null)
       echo "export BASH_FILE=\"$BASH_FILE\""
       echo "export PATH=\"$PATH\""
 
@@ -385,16 +428,25 @@ config.save() # <?name> <?ENV_PREFIX> <?silent:silent># creates an "<name>.env" 
       while IFS= read -r line; do
         [ -z "$line" ] && continue
         [[ "$line" =~ ^export[[:space:]] ]] || continue
-        local vn="${line#export }"; vn="${vn%%=*}"
+        local vn; vn=$(private.config.declare.varname "$line") || continue
         case "$vn" in
           CONFIG_PATH|CONFIG_FILE|CONFIG|OOSH_DIR|OOSH_MODE|BASH_FILE|PATH) continue ;;
         esac
         echo "$line"
       done < "$harvestFile"
 
-    } > "$CONFIG"
+    } > "$tmp"
 
+    # intended = fundamentals + every harvested varname (extracted robustly from the
+    # harvestFile, which is the already-curated set to persist). A drop between the
+    # harvest and the written tmp → detected, original user.env preserved.
+    local intended
+    intended=$(printf 'CONFIG_PATH\nCONFIG_FILE\nCONFIG\nOOSH_DIR\nOOSH_MODE\nBASH_FILE\nPATH\n'
+      while IFS= read -r line; do
+        private.config.declare.varname "$line"
+      done < "$harvestFile" 2>/dev/null)
     rm -f "$harvestFile" 2>/dev/null
+    private.config.commit.checked "$tmp" "$CONFIG" "$intended" || { RESULT="config.save round-trip failed"; return 1; }
 
     if [ -n "$OOSH_DIR" ]; then
       config.save oosh OOSH
