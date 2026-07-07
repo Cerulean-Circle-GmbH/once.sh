@@ -7,6 +7,12 @@
 - **Transparency:** Emphasis on logging, debugging, and state management for traceability and troubleshooting.
 - **Interactivity:** Advanced usage (ONCE server) is highly interactive, guiding the user through a state machine.
 
+## Self-Healing Objects (CMM4 — MANDATORY)
+- **Every OOSH object MUST self-heal to a valid state from nothing.** A broken or missing config is not an error to report — it is a state to recover from. `config init` regenerates `user.env` from scratch; the bootstrap (`source this`) re-derives `OOSH_DIR`, `CONFIG_PATH`, `PATH`, and the source chain (`log.env`, `oosh.env`) from whatever the environment provides. The result is a working object, not an error message.
+- **Why:** A machine restart, a corrupted env file, or a fresh install all produce the same condition: missing or broken state. If the framework requires manual repair, it is not CMM3. If it self-heals, it is.
+- **Proven pattern (WODA.prod, 2026-07-07):** config was broken after a restart (corrupted `current.method.env`, completion dead). Running `config init` triggered `config.save` which regenerated the full env chain — `user.env` → `oosh.env` → `log.env` — from live environment variables. Completion recovered. No manual file editing. The object healed itself.
+- **The rule:** `init` always yields a valid object. A constructor that can fail is not a constructor — it is a function. Every OOSH entry point (`this.start`, `config.init`, `oo.start`) must leave the system in a usable state or explain exactly why it cannot (never silently broken).
+
 ## Core Mechanisms
 - **State Machine:** ONCE uses a state-driven approach for installation and configuration, allowing stepwise progression and troubleshooting.
 - **Domain Management:** Supports domain configuration and discovery, including integration with external services (e.g., Keycloak).
