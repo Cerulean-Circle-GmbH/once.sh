@@ -47,6 +47,44 @@ private.osemvec.osemvecBin() # # absolute path to this script (for hook commands
   command -v osemvec 2>/dev/null || echo "$OOSH_DIR/osemvec"
 }
 
+private.osemvec.agentsDir() # # canonical agents dir — cwd/shell-independent (env → config FILE → FS walk)
+{
+  # Resolve-from-canonical-source (same doctrine class as the oo-new bug): the
+  # roles/agents dir must NOT depend on the caller's cwd. The agents dir is not
+  # under OOSH_DIR in this deployment, so we resolve, in order:
+  #   1. HIVEMIND_AGENTS_DIR env (explicit override)
+  #   2. the persisted pointer read DIRECTLY from the OOSH config FILE (env may be
+  #      unset in non-login shells; the file is the source of truth)
+  #   3. an upward walk from realpath(OOSH_DIR), then PWD (last resort)
+  if [ -n "$HIVEMIND_AGENTS_DIR" ] && [ -d "$HIVEMIND_AGENTS_DIR" ]; then
+    echo "$HIVEMIND_AGENTS_DIR"; return 0
+  fi
+  local cfg="${CONFIG:-$HOME/config/user.env}"
+  if [ -f "$cfg" ]; then
+    local fromFile
+    fromFile=$(grep -E '^[[:space:]]*export[[:space:]]+HIVEMIND_AGENTS_DIR=' "$cfg" 2>/dev/null \
+      | tail -1 | sed -E 's/^[^=]*=//; s/^"//; s/"$//')
+    [ -n "$fromFile" ] && [ -d "$fromFile" ] && { echo "$fromFile"; return 0; }
+  fi
+  local start d
+  for start in "$(realpath "${OOSH_DIR:-.}" 2>/dev/null)" "$PWD"; do
+    d="$start"
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+      [ -d "$d/.claude/agents" ] && { echo "$d/.claude/agents"; return 0; }
+      d=$(dirname "$d")
+    done
+  done
+  return 0
+}
+
+private.osemvec.knownRoles() # # clean role-name list, resolved canonically (FILTERED — error text never leaks)
+{
+  local ad; ad=$(private.osemvec.agentsDir)
+  # grep filter = the error-leak guard: only plausible role names survive, so an
+  # "ERROR> Agents directory not found" line can never be treated as a role.
+  HIVEMIND_AGENTS_DIR="$ad" hiveMind role.list 2>/dev/null | grep -E '^[A-Za-z][A-Za-z0-9._-]{0,39}$'
+}
+
 # ── Integration templates (private; emit JSON with the venv interpreter baked in)
 # Reuses the proven shapes from web4x/osemvec, adding the PreToolUse guard.
 
@@ -169,24 +207,112 @@ osemvec.install() # # opy-ensure python + build osemvec venv + pip semvec (all e
 
 # ── Indexing ─────────────────────────────────────────────────────────────────
 
-osemvec.index() # <projectDir> # build/refresh the semvec index for a project
+osemvec.index() # <projectDir> # prepare/refresh the semvec state dir for a project (semvec indexes incrementally)
 {
   local dir="$1"
   [ -z "$dir" ] && { error.log "usage: osemvec index <projectDir>"; return 1; }
   [ -d "$dir" ] || { error.log "osemvec.index: no such directory: $dir"; return 1; }
   local py; py="$(private.osemvec.venvPython)"
   if [ ! -x "$py" ]; then
-    error.log "osemvec.index: osemvec venv not built — run 'osemvec install' first"
-    return 1
+    error.log "osemvec.index: osemvec venv not built — run 'osemvec install' first"; return 1
   fi
-  console.log "osemvec.index: indexing $dir"
-  # semvec builds its index into SEMVEC_STATE_DIR (.semvec) rooted at the project.
-  ( cd "$dir" && SEMVEC_STATE_DIR=".semvec" SEMVEC_WORKSPACE="." \
-      "$py" -m semvec.coding.index . ) \
-    || { error.log "osemvec.index: semvec index failed for $dir"; return 1; }
+  if ! "$py" -c 'import semvec' >/dev/null 2>&1; then
+    error.log "osemvec.index: semvec not importable in venv — run 'osemvec install'"; return 1
+  fi
+  # MEASURED: semvec exposes NO batch/CLI project indexer. CodePointerIndex.register
+  # is per-pointer, driven by the MCP pss_register_code tool as the guarded instance
+  # works; state persists to SEMVEC_STATE_DIR (.semvec). So 'index' PREPARES that
+  # state dir and the index populates incrementally. When semvec ships a batch
+  # indexer, wire it here (see task-2 done-report seam note for python-expert).
+  local stateDir="$dir/.semvec"
+  mkdir -p "$stateDir" || { error.log "osemvec.index: cannot create $stateDir"; return 1; }
+  console.log "osemvec.index: prepared $stateDir — semvec populates it incrementally via pss_register_code"
   return 0
 }
 osemvec.index.completion.projectDir() { compgen -d -- "$1"; }
+
+# ── semvec operations (reflect semvec's real surface as OOSH object.verb) ─────
+# semvec's CLI is `semvec serve` (REST API); its operational surface is 6 PSS
+# handlers in semvec.coding.mcp_server (the MCP pss_* tools). Each is exposed here
+# as a thin OOSH method through a single engine-invoking chokepoint. NOTE: building
+# the engine loads the embedder model (~seconds) — these are explicit CLI ops, not
+# per-tool hooks. Skip-guarded in tests.
+
+private.osemvec.pss() # <projectDir> <handler> <args...> # invoke a semvec MCP handler via the venv engine; echo its result
+{
+  local dir="$1" handler="$2"; shift 2
+  [ -d "$dir" ] || { error.log "osemvec: no such projectDir: $dir"; return 1; }
+  local py; py="$(private.osemvec.venvPython)"
+  [ -x "$py" ] || { error.log "osemvec: venv not built — run 'osemvec install'"; return 1; }
+  ( cd "$dir" && SEMVEC_STATE_DIR=".semvec" SEMVEC_WORKSPACE="." OSEMVEC_HANDLER="$handler" \
+      "$py" - "$@" <<'PYEOF'
+import os, sys
+import semvec.coding.mcp_server as m
+h = getattr(m, os.environ["OSEMVEC_HANDLER"], None)
+if h is None:
+    sys.stderr.write("unknown semvec handler: %s\n" % os.environ["OSEMVEC_HANDLER"]); sys.exit(2)
+eng = m.create_engine(state_dir=os.environ.get("SEMVEC_STATE_DIR", ".semvec"),
+                      workspace_dir=os.environ.get("SEMVEC_WORKSPACE", "."))
+try:
+    out = h(eng, *sys.argv[1:])
+    sys.stdout.write(out if isinstance(out, str) else str(out))
+except TypeError as e:
+    sys.stderr.write("semvec %s arg error: %s\n" % (os.environ["OSEMVEC_HANDLER"], e)); sys.exit(2)
+except Exception as e:
+    sys.stderr.write("semvec %s error: %s\n" % (os.environ["OSEMVEC_HANDLER"], e)); sys.exit(3)
+PYEOF
+  )
+}
+
+osemvec.serve() # <?port:8000> <?host:127.0.0.1> # run the semvec REST API server (semvec serve)
+{
+  local port="${1:-8000}" host="${2:-127.0.0.1}"
+  local py; py="$(private.osemvec.venvPython)"
+  [ -x "$py" ] || { error.log "osemvec.serve: venv not built — run 'osemvec install'"; return 1; }
+  console.log "osemvec.serve: semvec REST API on ${host}:${port} (Ctrl-C to stop)"
+  "$py" -m semvec.api.cli serve --host "$host" --port "$port"
+}
+
+osemvec.context() # <projectDir> <task> # semvec PSS: get semantic context for a task (pss_get_context)
+{
+  local dir="$1" task="$2"
+  [ -z "$dir" ] || [ -z "$task" ] && { error.log "usage: osemvec context <projectDir> <task>"; return 1; }
+  private.osemvec.pss "$dir" handle_get_context "$task"
+}
+osemvec.context.completion.projectDir() { compgen -d -- "$1"; }
+
+osemvec.register() # <projectDir> <file> <intent> <signature> # semvec PSS: register a code pointer into the index (pss_register_code)
+{
+  local dir="$1" file="$2" intent="$3" sig="$4"
+  [ -z "$dir" ] || [ -z "$file" ] || [ -z "$intent" ] || [ -z "$sig" ] && { error.log "usage: osemvec register <projectDir> <file> <intent> <signature>"; return 1; }
+  private.osemvec.pss "$dir" handle_register_code "$file" "$intent" "$sig"
+}
+osemvec.register.completion.projectDir() { compgen -d -- "$1"; }
+osemvec.register.completion.file() { compgen -f -- "$1"; }
+
+osemvec.update() # <projectDir> <text> <type> # semvec PSS: update persistent semantic state (pss_update)
+{
+  local dir="$1" text="$2" type="$3"
+  [ -z "$dir" ] || [ -z "$text" ] || [ -z "$type" ] && { error.log "usage: osemvec update <projectDir> <text> <type>"; return 1; }
+  private.osemvec.pss "$dir" handle_update "$text" "$type"
+}
+osemvec.update.completion.projectDir() { compgen -d -- "$1"; }
+
+osemvec.error() # <projectDir> <errorText> <source> # semvec PSS: record an error (pss_record_error)
+{
+  local dir="$1" text="$2" src="$3"
+  [ -z "$dir" ] || [ -z "$text" ] || [ -z "$src" ] && { error.log "usage: osemvec error <projectDir> <errorText> <source>"; return 1; }
+  private.osemvec.pss "$dir" handle_record_error "$text" "$src"
+}
+osemvec.error.completion.projectDir() { compgen -d -- "$1"; }
+
+osemvec.save() # <projectDir> # semvec PSS: persist state to .semvec (pss_save)
+{
+  local dir="$1"
+  [ -z "$dir" ] && { error.log "usage: osemvec save <projectDir>"; return 1; }
+  private.osemvec.pss "$dir" handle_save
+}
+osemvec.save.completion.projectDir() { compgen -d -- "$1"; }
 
 # ── Spawn (SAFETY: default dry-run, live spawn is auth-gated) ─────────────────
 
@@ -197,8 +323,12 @@ osemvec.new() # <role> <projectDir> <?policy> # provision + (auth-gated) spawn a
   if ! this.isRoleName "$role"; then
     error.log "osemvec.new: malformed role '$role' (see 'hiveMind roles')"; return 1
   fi
-  # Existence check (best-effort): reject unknown roles when the registry lists any.
-  local knownRoles; knownRoles=$(hiveMind role.list 2>/dev/null)
+  # Resolve the agents dir CANONICALLY (not from cwd) and export it, so BOTH the
+  # role lookup below AND the downstream hiveMind bootstrap resolve roles from any
+  # cwd/shell. This is the resolve-from-canonical-source fix for the clean-cwd bug.
+  export HIVEMIND_AGENTS_DIR="$(private.osemvec.agentsDir)"
+  # Existence check: reject unknown roles when the (filtered) registry lists any.
+  local knownRoles; knownRoles=$(private.osemvec.knownRoles)
   if [ -n "$knownRoles" ] && ! printf '%s\n' "$knownRoles" | grep -qx "$role"; then
     error.log "osemvec.new: unknown role '$role' — see 'hiveMind roles'"; return 1
   fi
@@ -238,7 +368,7 @@ osemvec.new() # <role> <projectDir> <?policy> # provision + (auth-gated) spawn a
   create.result 0 "spawned: $role @ $pane"
   return 0
 }
-osemvec.new.completion.role() { hiveMind role.list 2>/dev/null; }
+osemvec.new.completion.role() { private.osemvec.knownRoles; }
 osemvec.new.completion.projectDir() { compgen -d -- "$1"; }
 
 # ── Guard verdict (used by the PreToolUse hook) ──────────────────────────────
