@@ -10,8 +10,11 @@
 # No flags, positional params only. Following: tmux→otmux, ssh→ossh, docker→odocker
 # ============================================================================
 
-# Docker workspaces base directory
-: ${ODOCKER_WORKSPACES:="/Users/Shared/Workspaces/AI/Claude.All/DockerWorkspaces"}
+# Docker workspaces base directory — platform-derived (D3). config.init sets
+# ODOCKER_WORKSPACES + the OOSH_SHARED_BASE seam (persisted in oosh.env); this
+# fallback derives from that seam so odocker is cross-platform even before init,
+# with no macOS literal. Operator/CI override via a preset ODOCKER_WORKSPACES.
+: ${ODOCKER_WORKSPACES:="${OOSH_SHARED_BASE:-/home/shared}/Workspaces/AI/Claude.All/DockerWorkspaces"}
 
 ### new.method
 
@@ -302,33 +305,87 @@ odocker.run.completion.image() {
   private.odocker.images
 }
 
-odocker.run.sshd() # <image> <?name> # run container with SSH port mappings (for sshd images)
+odocker.run.ephemeral() # <image> <workdir> <args...> # one-shot run in a mounted workdir; container auto-removed
+{
+  # GENERIC (domain-agnostic) one-shot primitive — the verb `ephemeral` encodes
+  # --rm. The docker-runtime concerns live HERE, never as oosh flags: --rm,
+  # --security-opt seccomp=unconfined (Docker 20.10.7 blocks the JVM/thread
+  # clone3 → "cannot create worker GC thread" without it), and -v/-w mount the
+  # workdir at its own path. <args...> are OPAQUE passthrough to the image's
+  # entrypoint (foreign-CLI exception; oosh method signature stays flag-free).
+  local image="$1"
+  local workdir="$2"
+  if [ -z "$image" ] || [ -z "$workdir" ]; then
+    error.log "Usage: odocker run.ephemeral <image> <workdir> <args...>"
+    return 1
+  fi
+  shift 2
+  docker run --rm --security-opt seccomp=unconfined -v "$workdir":"$workdir" -w "$workdir" "$image" "$@"
+}
+odocker.run.ephemeral.completion.image() {
+  private.odocker.images
+}
+
+odocker.image.ensure() # <image> # idempotent: pull the image if missing, no-op if present (self-care)
+{
+  # Constructor contract: run anytime → image available afterwards. No-op when the
+  # image is already local; pulls otherwise. Returns 0 when the image is present.
+  local image="$1"
+  if [ -z "$image" ]; then
+    error.log "Usage: odocker image.ensure <image>"
+    return 1
+  fi
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    console.log "image present: $image"
+    return 0
+  fi
+  console.log "image missing — pulling: $image"
+  docker pull "$image"
+}
+odocker.image.ensure.completion.image() {
+  private.odocker.images
+}
+
+odocker.run.sshd() # <image> <?name> <?sshHostPort> # run container with SSH port mappings (for sshd images); 3rd arg maps ONLY ssh on that host port (multi-box safe)
 {
   local image="$1"
   if [ -z "$image" ]; then
-    error.log "Usage: odocker run.sshd <image> <?name>"
+    error.log "Usage: odocker run.sshd <image> <?name> <?sshHostPort>"
     return 1
   fi
   shift
   local name="${1:-$(echo "$image" | tr '/:' '_')_sshd}"
+  shift 2>/dev/null
+  local sshHostPort="$1"
 
-  console.log "Running image: $image with SSH mappings as $name"
-  docker run -d \
-    --name "$name" \
-    -p 8022:22 \
-    -p 8080:8080 \
-    -p 8443:8443 \
-    -p 5001:5001 \
-    -p 5002:5002 \
-    -p 5005:5005 \
-    "$image"
-  local rc=$?
-
-  if [ $rc -eq 0 ]; then
-    success.log "Container $name started (SSH: ssh -p 8022 test@localhost)"
+  local rc
+  if [ -n "$sshHostPort" ]; then
+    # Explicit ssh host port → map SSH ONLY, bound to 127.0.0.1 (localhost-only).
+    # HARDENED (2026-07-02, post /tmp/linux u20 malware): the container was owned
+    # via a network-exposed 0.0.0.0:9022 sshd brute-force. These boxes are only
+    # accessed FROM this host (ossh install / ssh <alias>), so binding loopback
+    # removes the remote attack surface entirely. Combined with the key-only
+    # image (no password auth), this is the anti-recompromise baseline.
+    console.log "Running image: $image as $name (SSH on 127.0.0.1:$sshHostPort, key-only)"
+    docker run -d --name "$name" -p "127.0.0.1:${sshHostPort}:22" "$image"
+    rc=$?
+    [ $rc -eq 0 ] && success.log "Container $name started (SSH: ssh -p $sshHostPort root@localhost — key-only, loopback-bound)"
   else
-    error.log "Run failed with exit code $rc"
+    console.log "Running image: $image with SSH mappings as $name"
+    docker run -d \
+      --name "$name" \
+      -p 8022:22 \
+      -p 8080:8080 \
+      -p 8443:8443 \
+      -p 5001:5001 \
+      -p 5002:5002 \
+      -p 5005:5005 \
+      "$image"
+    rc=$?
+    [ $rc -eq 0 ] && success.log "Container $name started (SSH: ssh -p 8022 test@localhost)"
   fi
+
+  [ $rc -ne 0 ] && error.log "Run failed with exit code $rc"
   return $rc
 }
 odocker.run.sshd.completion.image() {
@@ -353,6 +410,26 @@ odocker.exec() # <container> <?shell:bash> # exec into running container
 }
 odocker.exec.completion.container() {
   private.odocker.running.containers
+}
+
+odocker.exec.command() # <container> <command...> # run a non-interactive command inside a running container (no TTY)
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    error.log "Usage: odocker exec.command <container> <command...>"
+    return 1
+  fi
+  shift
+  if [ -z "$1" ]; then
+    error.log "Usage: odocker exec.command <container> <command...>"
+    return 1
+  fi
+  # No -it: callers are scripts/state machines, not humans. "$*" lets callers
+  # pass a full shell snippet as one argument; sh -c runs it inside the container.
+  docker exec "$container" sh -c "$*"
+}
+odocker.exec.command.completion.container() {
+  private.odocker.container.list.all
 }
 
 odocker.stop() # <container> # stop a running container
@@ -603,9 +680,80 @@ odocker.install.completion.container() {
   private.odocker.running.containers
 }
 
-odocker.start()
+# ── Hypervisor self-care (constructor must yield a reachable docker engine) ───
+# `odocker.start` is the constructor: a fully-operational odocker means the docker
+# daemon answers. Detect a dead daemon and bring the hypervisor up — idempotent
+# (already-up → no-op), context/endpoint read from `docker context` (never a
+# guessed path), fail-loud (never rc0 on a dead daemon).
+
+private.odocker.activeContext() # # echo the active docker context name
+{
+  docker context show 2>/dev/null
+}
+
+private.odocker.engineReachable() # # 0 if the docker daemon answers on the active context
+{
+  docker info >/dev/null 2>&1
+}
+
+private.odocker.waitReachable() # <?timeout:90> # poll docker info until reachable or timeout; 0 on success
+{
+  local timeout="${1:-90}" waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    private.odocker.engineReachable && return 0
+    sleep 2; waited=$((waited + 2))
+  done
+  private.odocker.engineReachable
+}
+
+private.odocker.ensureEngine() # # self-heal: ensure the docker engine is reachable, bringing the hypervisor up; fail loud
+{
+  # Idempotent — already reachable → no-op.
+  if private.odocker.engineReachable; then
+    debug.log "odocker: docker engine reachable — no-op"
+    return 0
+  fi
+  local ctx; ctx="$(private.odocker.activeContext)"
+  important.log "odocker.start: docker engine not reachable (context '${ctx:-?}') — bringing the hypervisor up"
+  case "$ctx" in
+    desktop-linux)
+      command -v systemctl >/dev/null 2>&1 || { error.log "odocker.start: systemctl unavailable — cannot start the docker-desktop hypervisor"; return 1; }
+      systemctl --user start docker-desktop 2>/dev/null \
+        || { error.log "odocker.start: 'systemctl --user start docker-desktop' failed — check 'systemctl --user status docker-desktop'"; return 1; }
+      if private.odocker.waitReachable 90; then
+        console.log "odocker.start: hypervisor up — docker engine reachable"; return 0
+      fi
+      error.log "odocker.start: started docker-desktop but the engine is still unreachable after 90s — check 'systemctl --user status docker-desktop'"
+      return 1
+      ;;
+    default)
+      # System dockerd path — root/sudo-gated; degrade gracefully if not permitted.
+      local sudo=""; [ "$(id -u)" -ne 0 ] && sudo="sudo"
+      if $sudo systemctl start docker 2>/dev/null && private.odocker.waitReachable 60; then
+        console.log "odocker.start: system dockerd up — docker engine reachable"; return 0
+      fi
+      error.log "odocker.start: engine unreachable on context 'default' and could not start docker.service (needs privileges?) — start it manually"
+      return 1
+      ;;
+    *)
+      error.log "odocker.start: engine unreachable on context '${ctx:-?}' — no known hypervisor start path; start the daemon manually"
+      return 1
+      ;;
+  esac
+}
+
+odocker.start() # # constructor: bootstrap kernel + ensure the docker hypervisor is reachable (self-heal), then dispatch
 {
   source this
+  # Constructor must yield a fully-operational object → the docker engine must be
+  # reachable. Self-heal on real construction only; skip when sourced (completion)
+  # and for introspection verbs so the tool stays usable when docker is down.
+  if ! this.isSourced; then
+    case "$1" in
+      ''|help|help*|usage|completion*) : ;;
+      *) private.odocker.ensureEngine || return $? ;;
+    esac
+  fi
   this.start "$@"
 }
 
