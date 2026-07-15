@@ -1373,7 +1373,22 @@ ossh.key.pull() { # <fromHost> <dir> # gets te directory <dir> <fromHost> into t
   #ssh $toHost "user update.authorized_keys"
 }
 
-ossh.config.pull() { # <fromHost> <sshConfigName> <?file> # pulls a config from remote and seves it
+private.ossh.hostKnown() { # <host> # 0 if <host> is a Host entry in the local ssh config
+  local host="$1"
+  [ -z "$host" ] && return 1
+  private.get.sshDir
+  grep -qiE "^[[:space:]]*Host[[:space:]]+${host}([[:space:]]|$)" "$RESULT/config" 2>/dev/null
+}
+
+private.ossh.validConfigBlock() { # <file> # 0 if <file> is a non-empty ssh Host block with no error/log markers
+  local f="$1"
+  [ -s "$f" ] || return 1                                    # non-empty
+  grep -qiE '^[[:space:]]*Host[[:space:]]+' "$f" || return 1 # looks like a Host block
+  grep -qiE 'ERROR>|WARNING>|not found|no such|cannot|refused|denied' "$f" && return 1  # no leaked error/log text
+  return 0
+}
+
+ossh.config.pull() { # <fromHost> <sshConfigName> <?file> # pull a VALIDATED ssh config block from a remote host and append it safely (fail-loud, never corrupts the config)
   local fromHost="$1"
   if [ -n "$1" ]; then
     shift
@@ -1386,7 +1401,6 @@ ossh.config.pull() { # <fromHost> <sshConfigName> <?file> # pulls a config from 
   if [ -n "$1" ]; then
     shift
   else
-
     error.log "no sshConfigName was specified."
     important.log "available remote ssh configs:"
     ossh exec $fromHost "ossh config.list"
@@ -1402,7 +1416,40 @@ ossh.config.pull() { # <fromHost> <sshConfigName> <?file> # pulls a config from 
     file="$RESULT/config"
   fi
 
-  ossh exec $fromHost "ossh config.get $sshConfigName" >>$file
+  # (1) Resolve fromHost — must be a known local ssh Host, else fail loud (no silent exec failure).
+  if ! private.ossh.hostKnown "$fromHost"; then
+    error.log "config.pull: '$fromHost' is not a known ssh Host locally — cannot pull. Available hosts:"
+    private.ossh.config.complete.hosts 2>/dev/null | sed 's/^/  /'
+    return 1
+  fi
+
+  # (5) Idempotent-friendly: refuse to duplicate an already-present Host block.
+  if grep -qiE "^[[:space:]]*Host[[:space:]]+${sshConfigName}([[:space:]]|$)" "$file" 2>/dev/null; then
+    important.log "config.pull: Host '$sshConfigName' already present in $file — skipping (no duplicate)"
+    return 0
+  fi
+
+  # (2) Capture the remote payload to a TEMP (never straight into the config);
+  #     check the exec rc — a failed exec must never touch $file.
+  local tmp; tmp=$(mktemp 2>/dev/null) || { error.log "config.pull: cannot create temp file"; return 1; }
+  if ! ossh exec "$fromHost" "ossh config.get $sshConfigName" > "$tmp" 2>/dev/null; then
+    error.log "config.pull: remote 'ossh config.get $sshConfigName' on '$fromHost' FAILED (exec rc≠0) — $file untouched"
+    rm -f "$tmp"; return 1
+  fi
+
+  # (3)+(4) Validate the payload is a real Host block BEFORE any write; reject
+  #         empty / error-text (the corruption hazard) with a loud, actionable error.
+  if ! private.ossh.validConfigBlock "$tmp"; then
+    error.log "config.pull: remote payload for '$sshConfigName' on '$fromHost' is empty or not a valid Host block — refusing to append ($file protected)"
+    debug.log "config.pull: rejected payload head: $(head -3 "$tmp" 2>/dev/null)"
+    rm -f "$tmp"; return 1
+  fi
+
+  # (3) Append ONLY the validated payload (blank-line separated).
+  { echo ""; cat "$tmp"; } >> "$file" || { error.log "config.pull: append to $file failed"; rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  console.log "config.pull: appended validated Host '$sshConfigName' (from '$fromHost') to $file"
+  return 0
 }
 
 ossh.id.pull() # <fromHost> <?file> <?sshDir> # pulls the .ssh dir <formHost> to <sshDir>/ids and renames it
