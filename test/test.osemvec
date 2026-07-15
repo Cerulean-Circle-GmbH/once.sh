@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Tests for the osemvec script — semvec-guarded claudeCode provisioner.
+#
+# SAFETY: the suite NEVER runs `osemvec install` (heavy pip) and NEVER spawns a
+# live claudeCode. The critical assertion is that `osemvec new` DEFAULTS to
+# dry-run: it provisions files but leaves the pane count UNCHANGED. semvec/venv-
+# dependent cases are skip-guarded. Project state is isolated under /tmp.
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+source osemvec
+
+log.level $level
+
+# ── Isolation ────────────────────────────────────────────────────────────────
+TEST_ROOT="/tmp/test.osemvec.$$"
+PROJ="$TEST_ROOT/proj"
+mkdir -p "$PROJ"
+cleanup_test_osemvec() { rm -rf "$TEST_ROOT" 2>/dev/null; }
+
+# A real, resolvable role for the valid-path tests.
+VALID_ROLE=$(hiveMind role.list 2>/dev/null | grep -x 'oosh-expert' || hiveMind role.list 2>/dev/null | head -1)
+
+# ============================================================================
+# T1: .mcp.json template is valid JSON and points at the venv python
+# ============================================================================
+test.case - "T1: mcp.json template valid + venv python" \
+  echo "checking"
+MCP=$(private.osemvec.mcpJson /venv/py)
+if echo "$MCP" | python3 -m json.tool >/dev/null 2>&1 && echo "$MCP" | grep -q '/venv/py'; then
+  create.result 0 "valid mcp"
+else
+  create.result 1 "invalid mcp json"
+fi
+expect 0 "valid mcp" "mcp.json is valid JSON with the venv interpreter baked in"
+
+# ============================================================================
+# T2: settings.json valid + has SessionStart/PreCompact + PreToolUse guard
+# ============================================================================
+test.case - "T2: settings.json valid + guard wired" \
+  echo "checking"
+SET=$(private.osemvec.settingsJson /venv/py)
+if echo "$SET" | python3 -m json.tool >/dev/null 2>&1 \
+   && echo "$SET" | grep -q 'SessionStart' \
+   && echo "$SET" | grep -q 'PreCompact' \
+   && echo "$SET" | grep -q 'PreToolUse'; then
+  create.result 0 "valid settings"
+else
+  create.result 1 "settings missing hooks or invalid"
+fi
+expect 0 "valid settings" "settings.json valid with SessionStart/PreCompact + PreToolUse guard"
+
+# ============================================================================
+# T3: venvPython path composition honors OPY_VENVS + venv name
+# ============================================================================
+test.case - "T3: venvPython honors OPY_VENVS" \
+  echo "checking"
+EXPECT_PY="${OPY_VENVS:-$HOME/.opy/venvs}/$(private.osemvec.venvName)/bin/python"
+if [ "$(private.osemvec.venvPython)" = "$EXPECT_PY" ]; then
+  create.result 0 "path ok"
+else
+  create.result 1 "got: $(private.osemvec.venvPython)"
+fi
+expect 0 "path ok" "venvPython is deterministic from OPY_VENVS"
+
+# ============================================================================
+# T4: check → allow (exit 0) even when semvec absent (fail-open, never bricks)
+# ============================================================================
+test.case - "T4: check fails open to allow" \
+  osemvec.check "$PROJ"
+create.result "$RETURN_VALUE" "allow"
+expect 0 "allow" "check returns allow (0) when guard infra absent"
+
+# ============================================================================
+# T5: SAFETY — new DEFAULTS to dry-run: provisions but does NOT spawn a pane
+# ============================================================================
+PANES_BEFORE=$(tmux list-panes -a 2>/dev/null | wc -l | tr -d ' ')
+test.case - "T5: new (no policy) is dry-run" \
+  osemvec.new "$VALID_ROLE" "$PROJ"
+NEW_RC="$RETURN_VALUE"
+PANES_AFTER=$(tmux list-panes -a 2>/dev/null | wc -l | tr -d ' ')
+if [ "$NEW_RC" -eq 0 ] && [ "$PANES_BEFORE" = "$PANES_AFTER" ] \
+   && [ -f "$PROJ/.mcp.json" ] && [ -f "$PROJ/.claude/settings.json" ]; then
+  create.result 0 "dry-run provisioned"
+else
+  create.result 1 "rc=$NEW_RC panes $PANES_BEFORE->$PANES_AFTER"
+fi
+expect 0 "dry-run provisioned" "new defaults to dry-run: files staged, NO live spawn"
+
+# ============================================================================
+# T6: provisioned settings.json is valid + carries the PreToolUse guard
+# ============================================================================
+test.case - "T6: provisioned settings valid + guarded" \
+  echo "checking"
+if python3 -m json.tool "$PROJ/.claude/settings.json" >/dev/null 2>&1 \
+   && grep -q 'PreToolUse' "$PROJ/.claude/settings.json"; then
+  create.result 0 "guarded"
+else
+  create.result 1 "bad provisioned settings"
+fi
+expect 0 "guarded" "provisioned project carries a valid guarded settings.json"
+
+# ============================================================================
+# T7: new rejects an unknown role (when the registry lists roles)
+# ============================================================================
+if [ -n "$(hiveMind role.list 2>/dev/null | head -1)" ]; then
+  test.case - "T7: new rejects unknown role" \
+    osemvec.new not_a_real_role_xyz "$PROJ"
+  [ "$RETURN_VALUE" -ne 0 ] && create.result 0 "rejected" || create.result 1 "should reject"
+  expect 0 "rejected" "new rejects an unknown role"
+else
+  important.log "SKIP T7 — hiveMind role.list empty on this host"
+fi
+
+# ============================================================================
+# T8: new rejects a malformed role name
+# ============================================================================
+test.case - "T8: new rejects malformed role" \
+  osemvec.new "9 bad name" "$PROJ"
+[ "$RETURN_VALUE" -ne 0 ] && create.result 0 "rejected" || create.result 1 "should reject"
+expect 0 "rejected" "new rejects a malformed role"
+
+# ============================================================================
+# T9: new rejects a missing projectDir
+# ============================================================================
+test.case - "T9: new rejects missing projectDir" \
+  osemvec.new "$VALID_ROLE" "$TEST_ROOT/does-not-exist"
+[ "$RETURN_VALUE" -ne 0 ] && create.result 0 "rejected" || create.result 1 "should reject"
+expect 0 "rejected" "new rejects a missing projectDir"
+
+# ============================================================================
+# T10: guard rejects a non-pane target (human error, non-zero)
+# ============================================================================
+test.case - "T10: guard rejects non-pane target" \
+  osemvec.guard "not-a-pane"
+[ "$RETURN_VALUE" -ne 0 ] && create.result 0 "rejected" || create.result 1 "should reject"
+expect 0 "rejected" "guard rejects a non-pane target"
+
+# ============================================================================
+# T11: index rejects a missing directory
+# ============================================================================
+test.case - "T11: index rejects missing dir" \
+  osemvec.index "$TEST_ROOT/nope"
+[ "$RETURN_VALUE" -ne 0 ] && create.result 0 "rejected" || create.result 1 "should reject"
+expect 0 "rejected" "index rejects a missing directory"
+
+# ============================================================================
+# T12: status runs and reports health (venv NOT BUILT in test env)
+# ============================================================================
+test.case - "T12: status runs" \
+  osemvec.status
+create.result "$RETURN_VALUE" "ran"
+expect 0 "ran" "status succeeds and reports semvec health"
+
+# ── semvec/venv-dependent (skip-guarded) ─────────────────────────────────────
+if private.osemvec.venvReady; then
+  test.case - "T13: index builds when venv present" \
+    osemvec.index "$PROJ"
+  create.result "$RETURN_VALUE" "indexed"
+  expect 0 "indexed" "index succeeds with a built venv"
+else
+  important.log "SKIP T13 — osemvec venv not built (run 'osemvec install')"
+fi
+
+# ── Teardown ─────────────────────────────────────────────────────────────────
+cleanup_test_osemvec
+
+test.suite.save.results

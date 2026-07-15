@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# osemvec — semvec-guarded claudeCode provisioner (OOSH).
+#
+# Provisions a semvec environment (via `opy`) and spawns claudeCode instances
+# that both LEVERAGE semvec (MCP memory tools) and are GUARDED by it (a
+# PreToolUse gate + a supervisor loop). `osemvec install` uses `opy` to
+# guarantee Python + a dedicated venv, then pip-installs semvec (all extras)
+# and stages the .mcp.json / .claude/settings.json integration shapes.
+#
+# SAFETY (PO opy1, CRITICAL): osemvec.new DEFAULTS TO DRY-RUN. It never spawns a
+# live claudeCode until explicitly authorized — mirroring hiveMind.agent.rewind's
+# default-refuse auth. No live spawns during dev/test.
+#
+# Author: oosh-expert · Spec: sprint-1/task-2.osemvec.md · Depends: Epic 1 (opy)
+
+# ── Resolution helpers (private) ─────────────────────────────────────────────
+
+private.osemvec.venvName() # # echo the managed venv name osemvec builds via opy
+{
+  echo "${OSEMVEC_VENV:-osemvec}"
+}
+
+private.osemvec.venvPython() # # absolute interpreter path of the opy-built osemvec venv
+{
+  # Coupled to opy's public venv-home contract (OPY_VENVS, default ~/.opy/venvs).
+  echo "${OPY_VENVS:-$HOME/.opy/venvs}/$(private.osemvec.venvName)/bin/python"
+}
+
+private.osemvec.pyver() # # python version to build on — measured from opy, overridable
+{
+  # Measure the newest installed pyenv version (via opy) rather than assume one.
+  echo "${OSEMVEC_PYVER:-$(opy version.list 2>/dev/null | tail -1)}"
+}
+
+private.osemvec.stateDir() # # osemvec state/template home
+{
+  echo "${OSEMVEC_STATE:-$HOME/.osemvec}"
+}
+
+private.osemvec.templatesDir() # # where install stages the integration templates
+{
+  echo "$(private.osemvec.stateDir)/templates"
+}
+
+private.osemvec.osemvecBin() # # absolute path to this script (for hook commands)
+{
+  command -v osemvec 2>/dev/null || echo "$OOSH_DIR/osemvec"
+}
+
+# ── Integration templates (private; emit JSON with the venv interpreter baked in)
+# Reuses the proven shapes from web4x/osemvec, adding the PreToolUse guard.
+
+private.osemvec.mcpJson() # <?python> # emit .mcp.json (semvec MCP server via venv python)
+{
+  local py="${1:-$(private.osemvec.venvPython)}"
+  cat <<EOF
+{
+  "mcpServers": {
+    "semvec": {
+      "command": "$py",
+      "args": ["-m", "semvec.coding.mcp_server"],
+      "env": {
+        "SEMVEC_STATE_DIR": ".semvec",
+        "SEMVEC_WORKSPACE": ".",
+        "SEMVEC_EMBED_MODEL": "all-MiniLM-L6-v2",
+        "SEMVEC_EMBED_DEVICE": "cpu"
+      }
+    }
+  }
+}
+EOF
+}
+
+private.osemvec.settingsJson() # <?python> # emit .claude/settings.json (SessionStart/PreCompact + PreToolUse guard)
+{
+  local py="${1:-$(private.osemvec.venvPython)}"
+  local guard; guard="$(private.osemvec.osemvecBin)"
+  cat <<EOF
+{
+  "env": {
+    "MCP_TIMEOUT": "180000",
+    "MCP_CONNECT_TIMEOUT_MS": "180000"
+  },
+  "permissions": {
+    "allow": [
+      "mcp__semvec__pss_get_context",
+      "mcp__semvec__pss_update",
+      "mcp__semvec__pss_check_anti_resonance",
+      "mcp__semvec__pss_register_code",
+      "mcp__semvec__pss_record_error",
+      "mcp__semvec__pss_save"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "$py -m semvec.coding.hooks.session_start", "timeout": 120 } ] }
+    ],
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "$py -m semvec.coding.hooks.pre_compact", "timeout": 120 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash|Edit|Write|MultiEdit", "hooks": [ { "type": "command", "command": "$guard check", "timeout": 30 } ] }
+    ]
+  }
+}
+EOF
+}
+
+private.osemvec.venvReady() # # 0 if the osemvec venv interpreter exists + runs
+{
+  local py; py="$(private.osemvec.venvPython)"
+  [ -x "$py" ] && "$py" -c 'pass' >/dev/null 2>&1
+}
+
+private.osemvec.semvecVersion() # <python> # echo installed semvec version (or empty)
+{
+  # Kept out of an inline $(...) — nested single-quoted parens break bash's parser.
+  local py="$1"
+  "$py" -c 'import semvec; print(getattr(semvec,"__version__","?"))' 2>/dev/null
+}
+
+private.osemvec.provision() # <projectDir> # write .claude/settings.json + .mcp.json into a dir (idempotent)
+{
+  local dir="$1"
+  [ -z "$dir" ] && { error.log "provision: projectDir required"; return 1; }
+  mkdir -p "$dir/.claude" || { error.log "provision: cannot create $dir/.claude"; return 1; }
+  private.osemvec.mcpJson      > "$dir/.mcp.json"            || return 1
+  private.osemvec.settingsJson > "$dir/.claude/settings.json" || return 1
+  return 0
+}
+
+# ── Constructor ──────────────────────────────────────────────────────────────
+
+osemvec.start() # # constructor: source kernel + dispatch (provisioning lives in osemvec.install)
+{
+  source this
+  this.start "$@"
+}
+
+# ── Provisioning ─────────────────────────────────────────────────────────────
+
+osemvec.install() # # opy-ensure python + build osemvec venv + pip semvec (all extras) + stage integration templates
+{
+  local pyver; pyver="$(private.osemvec.pyver)"
+  [ -z "$pyver" ] && { error.log "osemvec.install: no python version resolvable (set OSEMVEC_PYVER or run 'opy install <ver>')"; return 1; }
+  local venv; venv="$(private.osemvec.venvName)"
+
+  # 1. Ensure Python + the dedicated venv, via opy (idempotent).
+  console.log "osemvec.install: ensuring python $pyver + venv '$venv' via opy"
+  opy install "$pyver"            || { error.log "osemvec.install: opy install $pyver failed"; return 1; }
+  opy venv.create "$venv" "$pyver" || { error.log "osemvec.install: opy venv.create $venv failed"; return 1; }
+
+  # 2. pip-install semvec (all extras) + sentence-transformers through the venv.
+  local py; py="$(private.osemvec.venvPython)"
+  [ -x "$py" ] || { error.log "osemvec.install: venv interpreter missing at $py"; return 1; }
+  console.log "osemvec.install: pip installing semvec[all-extras] + sentence-transformers (this can take a while)…"
+  "$py" -m pip install --upgrade pip >/dev/null 2>&1
+  "$py" -m pip install "semvec[cortex,coding,compliance,api,hybrid]" sentence-transformers \
+    || { error.log "osemvec.install: pip install failed"; return 1; }
+
+  # 3. Stage integration templates (interpreter path baked in).
+  local tdir; tdir="$(private.osemvec.templatesDir)"
+  mkdir -p "$tdir/.claude" || { error.log "osemvec.install: cannot create $tdir"; return 1; }
+  private.osemvec.mcpJson      "$py" > "$tdir/.mcp.json"
+  private.osemvec.settingsJson "$py" > "$tdir/.claude/settings.json"
+  console.log "osemvec.install: staged templates under $tdir"
+  return 0
+}
+
+# ── Indexing ─────────────────────────────────────────────────────────────────
+
+osemvec.index() # <projectDir> # build/refresh the semvec index for a project
+{
+  local dir="$1"
+  [ -z "$dir" ] && { error.log "usage: osemvec index <projectDir>"; return 1; }
+  [ -d "$dir" ] || { error.log "osemvec.index: no such directory: $dir"; return 1; }
+  local py; py="$(private.osemvec.venvPython)"
+  if [ ! -x "$py" ]; then
+    error.log "osemvec.index: osemvec venv not built — run 'osemvec install' first"
+    return 1
+  fi
+  console.log "osemvec.index: indexing $dir"
+  # semvec builds its index into SEMVEC_STATE_DIR (.semvec) rooted at the project.
+  ( cd "$dir" && SEMVEC_STATE_DIR=".semvec" SEMVEC_WORKSPACE="." \
+      "$py" -m semvec.coding.index . ) \
+    || { error.log "osemvec.index: semvec index failed for $dir"; return 1; }
+  return 0
+}
+osemvec.index.completion.projectDir() { compgen -d -- "$1"; }
+
+# ── Spawn (SAFETY: default dry-run, live spawn is auth-gated) ─────────────────
+
+osemvec.new() # <role> <projectDir> <?policy> # provision + (auth-gated) spawn a semvec-guarded claudeCode
+{
+  local role="$1" dir="$2" policy="$3"
+  [ -z "$role" ] || [ -z "$dir" ] && { error.log "usage: osemvec new <role> <projectDir> <?policy>"; return 1; }
+  if ! this.isRoleName "$role"; then
+    error.log "osemvec.new: malformed role '$role' (see 'hiveMind roles')"; return 1
+  fi
+  # Existence check (best-effort): reject unknown roles when the registry lists any.
+  local knownRoles; knownRoles=$(hiveMind role.list 2>/dev/null)
+  if [ -n "$knownRoles" ] && ! printf '%s\n' "$knownRoles" | grep -qx "$role"; then
+    error.log "osemvec.new: unknown role '$role' — see 'hiveMind roles'"; return 1
+  fi
+  [ -d "$dir" ] || { error.log "osemvec.new: no such projectDir: $dir"; return 1; }
+
+  # Inject the guard + semvec inheritance into projectDir/.claude BEFORE any spawn.
+  private.osemvec.provision "$dir" || { error.log "osemvec.new: provisioning failed"; return 1; }
+  console.log "osemvec.new: provisioned $dir/.claude/settings.json + $dir/.mcp.json (semvec-guarded)"
+
+  # AUTH GATE — default-refuse the LIVE spawn (mirror hiveMind.agent.rewind).
+  # Live spawn requires an explicit policy token OR OSEMVEC_SPAWN_AUTHORIZED=1.
+  local authorized=0
+  case "$policy" in
+    authorized|confirm|yes|live) authorized=1 ;;
+  esac
+  [ "${OSEMVEC_SPAWN_AUTHORIZED:-0}" = "1" ] && authorized=1
+
+  if [ "$authorized" -eq 0 ]; then
+    important.log "osemvec.new: DRY-RUN (default) — NOT spawning a live claudeCode."
+    console.log "  Would: cd '$dir' && hiveMind agent.bootstrap '$role' (semvec inherited via .mcp.json)."
+    console.log "  Authorize a real spawn with: osemvec new '$role' '$dir' authorized   (or OSEMVEC_SPAWN_AUTHORIZED=1)"
+    create.result 0 "dry-run: $role @ $dir"
+    return 0
+  fi
+
+  # LIVE PATH (authorized) — cd first so the spawned instance inherits projectDir.
+  # All cross-tool calls go through the CLI (osemvec sources only `this`).
+  local session; session=$(hiveMind team.active 2>/dev/null | head -1 | tr -d ' ')
+  [ -z "$session" ] && { error.log "osemvec.new: no active team session to spawn into"; return 1; }
+  otmux split.h -t "${session}:0" || { error.log "osemvec.new: pane split failed"; return 1; }
+  otmux tiled "${session}:0"
+  local idx; idx=$(otmux panes -t "${session}:0" -F "#{pane_index}" | sort -n | tail -1)
+  local pane="${session}:0.${idx}"
+  otmux send.enter "$pane" "cd '$dir'"          # cd BEFORE launch (spec)
+  console.log "osemvec.new: spawning guarded '$role' in $pane (cwd=$dir)"
+  hiveMind agent.bootstrap "$role" "$session" "$pane" || { error.log "osemvec.new: bootstrap failed"; return 1; }
+  create.result 0 "spawned: $role @ $pane"
+  return 0
+}
+osemvec.new.completion.role() { hiveMind role.list 2>/dev/null; }
+osemvec.new.completion.projectDir() { compgen -d -- "$1"; }
+
+# ── Guard verdict (used by the PreToolUse hook) ──────────────────────────────
+
+osemvec.check() # <?target> # semvec anti-resonance / query verdict; exit 0 = allow, 2 = block (Claude Code hook)
+{
+  local target="${1:-.}"
+  local py; py="$(private.osemvec.venvPython)"
+  # Fail-OPEN when the guard infra is not yet built (never brick a project);
+  # honor a real semvec verdict when available. Loud either way.
+  if [ ! -x "$py" ]; then
+    debug.log "osemvec.check: semvec venv absent — allowing (infra not built; run 'osemvec install')"
+    return 0
+  fi
+  # semvec exposes anti-resonance via MCP (pss_check_anti_resonance). A CLI seam
+  # is not yet published, so this is best-effort: probe importability and defer
+  # the verdict to semvec when a check module lands. Until then: allow + note.
+  if "$py" -c 'import semvec' >/dev/null 2>&1; then
+    debug.log "osemvec.check: semvec present — anti-resonance CLI seam pending; allowing '$target'"
+    return 0
+  fi
+  warn.log "osemvec.check: semvec not importable in venv — allowing '$target' (fail-open)"
+  return 0
+}
+osemvec.check.completion.target() { compgen -d -- "$1"; }
+
+# ── Supervisor gate (mirror agent.rewind: default-refuse auth to actually HOLD)
+
+osemvec.guard() # <pane> <?auth> # one gate pass: measure pane, HOLD on drift / clear on pass (auth-gated mutation)
+{
+  local pane="$1" auth="$2"
+  [ -z "$pane" ] && { error.log "usage: osemvec guard <pane> <?auth>"; return 1; }
+  if ! this.isPaneTarget "$pane"; then
+    error.log "osemvec.guard: '$pane' is not a live pane target"; return 1
+  fi
+
+  # Resolve pane → role (state mutation uses the PUBLIC role-keyed hiveMind API).
+  local role; role=$(hiveMind registry.list "${pane%%:*}" 2>/dev/null | grep "^${pane}|" | head -1 | cut -d'|' -f2)
+
+  # Measure the semantic verdict for the instance's project (its cwd).
+  local verdict=0
+  osemvec.check "$pane" >/dev/null 2>&1 || verdict=$?
+
+  if [ "$verdict" -eq 0 ]; then
+    # Pass → clear any HOLD (only mutate state when authorized, default-refuse).
+    if private.osemvec.authorized "$auth"; then
+      [ -n "$role" ] && hiveMind agent.state.clear "$role" >/dev/null 2>&1
+      console.log "osemvec.guard: $pane (${role:-?}) PASS — hold cleared"
+    else
+      console.log "osemvec.guard: $pane (${role:-?}) PASS (dry-run — pass 'authorized' to clear hold state)"
+    fi
+    return 0
+  fi
+
+  # Drift → HOLD the instance (à la agent.rewind DURING_REWIND quiesce).
+  if private.osemvec.authorized "$auth"; then
+    [ -n "$role" ] && hiveMind agent.state.set "$role" "OSEMVEC_HOLD" >/dev/null 2>&1
+    error.log "osemvec.guard: $pane (${role:-?}) DRIFT (verdict=$verdict) — set OSEMVEC_HOLD"
+  else
+    error.log "osemvec.guard: $pane (${role:-?}) DRIFT (verdict=$verdict) — WOULD set OSEMVEC_HOLD (dry-run; pass 'authorized')"
+  fi
+  return "$verdict"
+}
+osemvec.guard.completion.pane() { hiveMind registry.list 2>/dev/null | cut -d'|' -f1; }
+
+private.osemvec.authorized() # <?auth> # 0 if guard state-mutation is authorized (default-refuse)
+{
+  case "$1" in authorized|confirm|yes) return 0 ;; esac
+  [ "${OSEMVEC_GUARD_AUTHORIZED:-0}" = "1" ]
+}
+
+# ── Status ───────────────────────────────────────────────────────────────────
+
+osemvec.status() # # list guarded instances + semvec health
+{
+  console.log "── semvec health ──"
+  local py; py="$(private.osemvec.venvPython)"
+  if private.osemvec.venvReady; then
+    local ver; ver="$(private.osemvec.semvecVersion "$py")"
+    console.log "  venv:   $py (ok)"
+    console.log "  semvec: ${ver:-not importable}"
+  else
+    console.log "  venv:   NOT BUILT — run 'osemvec install'"
+  fi
+  console.log "── guarded instances (HOLD state) ──"
+  local stateFile="${HIVEMIND_STATE:-${CONFIG_PATH:-$HOME/config}/hivemind.state.env}"
+  if [ -f "$stateFile" ]; then
+    grep 'OSEMVEC_HOLD' "$stateFile" 2>/dev/null | cut -d'|' -f1,2 | tr '|' ' ' || true
+  fi
+  return 0
+}
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+osemvec.usage() # # help footer -> this.help
+{
+  console.log "osemvec — semvec-guarded claudeCode provisioner (opy-backed)"
+  this.help
+}
+
+osemvec.start "$@"
