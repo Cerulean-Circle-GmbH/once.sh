@@ -53,6 +53,35 @@ private.opy.isInstalled() # <version> # 0 if version is a bare pyenv install
   private.opy.pyenv versions --bare 2>/dev/null | grep -qx "$version"
 }
 
+private.opy.latest() # # echo the latest STABLE CPython (X.Y.Z) resolvable via pyenv, or empty
+{
+  # Pure release versions only: 3.<minor>.<patch>. Excludes rc/dev/a/b/pre suffixes
+  # and non-CPython flavours (pypy/miniconda/anaconda/stackless/…). Newest by -V sort.
+  private.opy.pyenv install --list 2>/dev/null \
+    | sed 's/^[[:space:]]*//' \
+    | grep -E '^3\.[0-9]+\.[0-9]+$' \
+    | sort -V | tail -1
+}
+
+private.opy.activateLatest() # <version> # make a freshly-installed latest the global — but NEVER clobber a deliberate pin (announce either way)
+{
+  local version="$1"
+  [ -z "$version" ] && return 1
+  local current; current=$(private.opy.pyenv global 2>/dev/null | head -1)
+  if [ "$current" = "$version" ]; then
+    console.log "opy.install: $version already the active global"
+    return 0
+  fi
+  if [ -z "$current" ] || [ "$current" = "system" ]; then
+    # No deliberate pin — activate the latest so 'opy install' yields a usable latest
+    private.opy.pyenv global "$version" || { error.log "opy.install: could not set global to $version"; return 1; }
+    console.log "opy.install: activated $version as global (was ${current:-unset})"
+  else
+    # A real version is deliberately pinned — do NOT repoint; announce + how to activate
+    console.log "opy.install: latest $version installed; global left at $current (deliberate pin). Activate latest: opy version.set $version"
+  fi
+}
+
 private.opy.ensurePyenv() # # self-heal: pyenv present + actually runnable, else fail loud
 {
   local bin; bin=$(private.opy.pyenvBin)
@@ -207,17 +236,26 @@ opy.deps() # <?version> # check/install build headers needed to compile CPython
 
 # ── Version management ───────────────────────────────────────────────────────
 
-opy.install() # <version> # pyenv install <version> (idempotent; runs deps first)
+opy.install() # <?version> # install <version>; with NO arg, resolve + install the LATEST stable CPython (idempotent on the target). No-arg activates the latest as global unless a version is already pinned (never clobbered).
 {
-  local version="$1"
-  [ -z "$version" ] && { error.log "usage: opy install <version>"; return 1; }
+  local version="$1" latest=""
+  if [ -z "$version" ]; then
+    version=$(private.opy.latest)
+    [ -z "$version" ] && { error.log "opy.install: could not resolve latest stable CPython (pyenv install --list)"; return 1; }
+    latest=yes
+    console.log "opy.install: latest stable CPython = $version"
+  fi
+  # Idempotency targets THIS version only — an existing OLDER version never skips the latest.
   if private.opy.isInstalled "$version"; then
     console.log "opy.install: $version already installed"
-    return 0
+  else
+    opy.deps "$version" || { error.log "opy.install: build deps failed for $version"; return 1; }
+    console.log "opy.install: building $version (this can take several minutes)…"
+    private.opy.pyenv install -s "$version" || { error.log "opy.install: pyenv install failed for $version"; return 1; }
   fi
-  opy.deps "$version" || { error.log "opy.install: build deps failed for $version"; return 1; }
-  console.log "opy.install: building $version (this can take several minutes)…"
-  private.opy.pyenv install -s "$version"
+  # Activate only on the no-arg (latest) path; private.opy.activateLatest never clobbers a deliberate pin.
+  [ "$latest" = yes ] && private.opy.activateLatest "$version"
+  return 0
 }
 opy.install.completion.version() { private.opy.pyenv install --list 2>/dev/null | sed 's/^[[:space:]]*//' | grep -viE 'available versions|^$'; }
 
