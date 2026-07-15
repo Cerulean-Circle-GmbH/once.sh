@@ -19,6 +19,8 @@ export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=100
 unset  COLORTERM
 unset  CLAUDECODE
 
+CLAUDECODE_DEFAULT_MODEL="claude-opus-4-8[1m]"
+
 # ── Context window limits — single source of truth ────────────────────────────
 # Used by context.*, velocity.*, dashboard. Detection logic (which value applies
 # to which session) lives in private.claudeCode.max.tokens.for.jsonl.
@@ -52,7 +54,7 @@ private.claudeCode.complete.sessionIds() {
     if [ -f "$indexFile" ] && command -v jq &>/dev/null; then
       while read -r sid; do
         [ -z "$sid" ] && continue
-        if echo "$liveUuids" | grep -q "$sid" || echo "$regUuids" | grep -q "$sid"; then
+        if echo "$liveUuids" | grep -q "$sid" || echo "$sid" | grep -qFf <(echo "$regUuids"); then
           echo "$sid"
         fi
       done < <(jq -r '.entries[].sessionId' "$indexFile" 2>/dev/null)
@@ -61,7 +63,7 @@ private.claudeCode.complete.sessionIds() {
       for f in "$projectDir"/*.jsonl; do
         [ -f "$f" ] || continue
         sid=$(basename "$f" .jsonl)
-        if echo "$liveUuids" | grep -q "$sid" || echo "$regUuids" | grep -q "$sid"; then
+        if echo "$liveUuids" | grep -q "$sid" || echo "$sid" | grep -qFf <(echo "$regUuids"); then
           echo "$sid"
         fi
       done
@@ -71,6 +73,10 @@ private.claudeCode.complete.sessionIds() {
 private.claudeCode.complete.roleNames() {
   local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
   [ -f "$reg" ] && cut -d'|' -f2 "$reg" 2>/dev/null | sort -u
+}
+
+private.claudeCode.projectHash() { # <path> # encode workspace path to project dir hash: /Users/Shared → -Users-Shared (replaces / . _ with -)
+  echo "$1" | sed 's/[\/._]/-/g'
 }
 
 private.claudeCode.decode.projectHash() { # <hash> # decode project dir hash to path: -Users-Shared → /Users/Shared
@@ -106,24 +112,14 @@ claudeCode.sessions() # # list all available sessions (interactive picker)
   "$CLAUDE_CMD" --resume
 }
 
-claudeCode.list() # <?format:tree|json> # list all Claude Code sessions on this host (tree default; json delegates to list.json)
+claudeCode.list() # <?nameFilter> # list sessions; nameFilter substring-matches agent name
 {
   local CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
-  local format="${1:-tree}"
-
-  # Backward-compat: accept legacy --json form.
-  # OOSH first principle (T-ARCH-5): no --flag args. New form is positional 'json'.
-  [ "$format" = "--json" ] && format="json"
-  [ "$format" != "json" ] && format="tree"
+  local nameFilter="$1"
 
   if [ ! -d "$CLAUDE_PROJECTS_DIR" ]; then
     echo "No Claude projects directory found: $CLAUDE_PROJECTS_DIR"
     return 1
-  fi
-
-  if [ "$format" = "json" ]; then
-    claudeCode.list.json
-    return $?
   fi
 
   echo ""
@@ -161,12 +157,15 @@ claudeCode.list() # <?format:tree|json> # list all Claude Code sessions on this 
     echo "📁 $decodedPath"
 
       # Parse JSONL filenames + registry cross-reference (works with or without jq)
-      local jsonlFiles=("$projectDir"/*.jsonl)
-      local jsonlCount=${#jsonlFiles[@]}
-      [ ! -f "${jsonlFiles[0]}" ] && jsonlCount=0
+      # Sort by mtime newest-first so output is age-sorted
+      local jsonlFiles
+      jsonlFiles=$(ls -t "$projectDir"/*.jsonl 2>/dev/null)
+      local jsonlCount
+      jsonlCount=$(echo "$jsonlFiles" | grep -c . 2>/dev/null || echo 0)
+      [ -z "$jsonlFiles" ] && jsonlCount=0
       if [ "$jsonlCount" -gt 0 ]; then
         local idx=0
-        for f in "${jsonlFiles[@]}"; do
+        while IFS= read -r f; do
           [ -f "$f" ] || continue
           # Option A: skip queue-operation logs (not agent sessions)
           head -1 "$f" 2>/dev/null | grep -q '"type":"queue-operation"' && continue
@@ -194,11 +193,16 @@ claudeCode.list() # <?format:tree|json> # list all Claude Code sessions on this 
           # Strip @model suffix (e.g. oosh-expert@opus → oosh-expert)
           local label="${sessionName:-${regRole:-}}"
           label="${label%%@*}"
+          # nameFilter: skip entries whose label doesn't match (case-insensitive)
+          if [ -n "$nameFilter" ] && ! echo "$label" | grep -qi "$nameFilter"; then
+            continue
+          fi
           local paneLabel=""
           [ -n "$regPane" ] && paneLabel="($regPane)"
           # Last active from file mtime
           local lastActive
-          lastActive=$(stat -f '%Sm' -t '%b %d %H:%M' "$f" 2>/dev/null || stat -c '%y' "$f" 2>/dev/null | cut -c1-16)
+          lastActive=$(stat -c '%y' "$f" 2>/dev/null | cut -c1-16)
+          [ -z "$lastActive" ] && lastActive=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f" 2>/dev/null)
           # Color + status marker:
           #   RED [DEAD]        — no pane AND no live process
           #   CYAN [FORK-READY] — has pane + role + 60..80% ctx used (remaining 20..40)
@@ -224,7 +228,8 @@ claudeCode.list() # <?format:tree|json> # list all Claude Code sessions on this 
             fi
           else
             local mtime_epoch
-            mtime_epoch=$(stat -f '%m' "$f" 2>/dev/null || stat -c '%Y' "$f" 2>/dev/null)
+            mtime_epoch=$(stat -c '%Y' "$f" 2>/dev/null)
+            [ -z "$mtime_epoch" ] && mtime_epoch=$(stat -f '%m' "$f" 2>/dev/null)
             local now_epoch
             now_epoch=$(date +%s)
             if [ -n "$mtime_epoch" ] && [ $(( now_epoch - mtime_epoch )) -lt 86400 ]; then
@@ -233,7 +238,7 @@ claudeCode.list() # <?format:tree|json> # list all Claude Code sessions on this 
           fi
           local RST=$'\e[0m'
           printf "%s ${color}%-36s${RST}  ${BOLD_WHITE}%-16s${RST} ${BOLD_CYAN}%-18s${RST} ${color}%s${RST}${color}%s${RST}\n" "$prefix" "$sid" "${label}" "${paneLabel}" "${lastActive}" "${marker}"
-        done
+        done <<< "$jsonlFiles"
       else
         echo "└── (no sessions)"
       fi
@@ -306,10 +311,12 @@ claudeCode.join() # <session> # resume a specific session by name or UUID
       local foundUuid=""
       # Try as pane target first (new schema: pane|UUID)
       [ -f "$ses" ] && foundUuid=$(grep "^${session}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
-      # Try as role name: resolve role→pane→UUID
+      # Try as role name: resolve role→pane→UUID. Registry is 3-field
+      # (pane|role|epoch) since the TTL addition — match field 2 by exact
+      # equality via awk instead of $-anchored grep (which the epoch breaks).
       if [ -z "$foundUuid" ] && [ -f "$reg" ]; then
         local pane
-        pane=$(grep "|${session}$" "$reg" 2>/dev/null | head -1 | cut -d'|' -f1)
+        pane=$(awk -F'|' -v n="$session" '$2==n {print $1; exit}' "$reg" 2>/dev/null)
         [ -n "$pane" ] && [ -f "$ses" ] && foundUuid=$(grep "^${pane}|" "$ses" 2>/dev/null | head -1 | cut -d'|' -f2)
       fi
       [ -n "$foundUuid" ] && session="$foundUuid"
@@ -327,7 +334,7 @@ claudeCode.join() # <session> # resume a specific session by name or UUID
     fi
     # cd to the project directory where the JSONL lives (required for Claude to find it)
     private.claudeCode.resolve.projectDir "$session" 2>/dev/null
-    "$CLAUDE_CMD" --resume "$session" --model "claude-opus-4-6[1m]" "$@"
+    "$CLAUDE_CMD" --resume "$session" --model "$CLAUDECODE_DEFAULT_MODEL" "$@"
   else
     # No session specified, show picker
     "$CLAUDE_CMD" --resume
@@ -341,6 +348,12 @@ claudeCode.join.byID() # <sessionId> # resume session directly by UUID
 {
   local sessionId="$1"
   [ -z "$sessionId" ] && { error.log "usage: claudeCode join.byID <sessionId>"; return 1; }
+  # SC-E.2 P3: sessionId flows to claude --resume; reject garbage at boundary
+  # instead of relying on Claude failing downstream.
+  if ! this.isUuid "$sessionId"; then
+    error.log "claudeCode.join.byID: invalid UUID '$sessionId' (expected 8-4-4-4-12 hex)"
+    return 1
+  fi
   shift
   "$CLAUDE_CMD" --resume "$sessionId" "$@"
 }
@@ -354,8 +367,11 @@ private.claudeCode.resolve.byName() { # <name> # role name → UUID (via registr
   local name="$1"
   local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
   local ses="${HIVEMIND_SESSIONS:-${CONFIG_PATH:-$HOME/config}/hivemind.sessions.env}"
+  # Registry is 3-field (pane|role|epoch) since the TTL addition — match
+  # field 2 by exact equality via awk instead of $-anchored grep (which
+  # the trailing epoch broke). Robust against future field additions.
   local pane
-  pane=$(grep "|${name}$" "$reg" 2>/dev/null | head -1 | cut -d'|' -f1)
+  pane=$(awk -F'|' -v n="$name" '$2==n {print $1; exit}' "$reg" 2>/dev/null)
   if [ -z "$pane" ]; then
     error.log "no pane found for role '$name' in registry"
     return 1
@@ -406,6 +422,11 @@ claudeCode.join.byPane() # <pane> # resume session by resolving pane → UUID
 {
   local pane="$1"
   [ -z "$pane" ] && { error.log "usage: claudeCode join.byPane <pane>"; return 1; }
+  # SC-E.2 P3: pane format check before resolver lookup.
+  if ! this.isPaneTarget "$pane"; then
+    error.log "claudeCode.join.byPane: invalid pane '$pane' (expected session:window.pane or %N)"
+    return 1
+  fi
   shift
   local uuid
   uuid=$(private.claudeCode.resolve.byPane "$pane") || return 1
@@ -421,9 +442,14 @@ claudeCode.fork() # <sessionId> # fork session by UUID with new ID, preserving c
 {
   local sessionId="$1"
   [ -z "$sessionId" ] && { error.log "usage: claudeCode fork <sessionId>"; return 1; }
+  # SC-E.2 P3: sessionId flows to claude --resume; reject garbage at boundary.
+  if ! this.isUuid "$sessionId"; then
+    error.log "claudeCode.fork: invalid UUID '$sessionId' (expected 8-4-4-4-12 hex)"
+    return 1
+  fi
   shift
   private.claudeCode.resolve.projectDir "$sessionId" 2>/dev/null
-  "$CLAUDE_CMD" --resume "$sessionId" --fork-session --model "claude-opus-4-6[1m]" "$@"
+  "$CLAUDE_CMD" --resume "$sessionId" --fork-session --model "$CLAUDECODE_DEFAULT_MODEL" "$@"
 }
 claudeCode.fork.completion.sessionId() {
   private.claudeCode.complete.sessionIds
@@ -445,7 +471,7 @@ claudeCode.fork.byName() # <name> # fork session by role name (role→pane→UUI
   local uuid
   uuid=$(private.claudeCode.resolve.byName "$name") || return 1
   private.claudeCode.resolve.projectDir "$uuid" 2>/dev/null
-  "$CLAUDE_CMD" --resume "$uuid" --fork-session --model "claude-opus-4-6[1m]" "$@"
+  "$CLAUDE_CMD" --resume "$uuid" --fork-session --model "$CLAUDECODE_DEFAULT_MODEL" "$@"
 }
 claudeCode.fork.byName.completion.name() {
   private.claudeCode.complete.roleNames
@@ -455,11 +481,16 @@ claudeCode.fork.byPane() # <pane> # fork session by resolving pane → UUID → 
 {
   local pane="$1"
   [ -z "$pane" ] && { error.log "usage: claudeCode fork.byPane <pane>"; return 1; }
+  # SC-E.2 P3: pane format check before resolver lookup.
+  if ! this.isPaneTarget "$pane"; then
+    error.log "claudeCode.fork.byPane: invalid pane '$pane' (expected session:window.pane or %N)"
+    return 1
+  fi
   shift
   local uuid
   uuid=$(private.claudeCode.resolve.byPane "$pane") || return 1
   private.claudeCode.resolve.projectDir "$uuid" 2>/dev/null
-  "$CLAUDE_CMD" --resume "$uuid" --fork-session --model "claude-opus-4-6[1m]" "$@"
+  "$CLAUDE_CMD" --resume "$uuid" --fork-session --model "$CLAUDECODE_DEFAULT_MODEL" "$@"
 }
 claudeCode.fork.byPane.completion.pane() {
   private.claudeCode.complete.panes
@@ -479,6 +510,17 @@ claudeCode.fork.to() # <pane> <?role> # one-shot recovery: pick best JSONL for r
   local role="$2"
   if [ -z "$pane" ]; then
     error.log "Usage: claudeCode fork.to <pane> <?role>"
+    return 1
+  fi
+
+  # SC-E.2 P3: pane writes to registry via downstream hiveMind.agent.fork.best;
+  # role flows into hivemind.roles.env. Guard at the boundary.
+  if ! this.isPaneTarget "$pane"; then
+    error.log "claudeCode.fork.to: invalid pane '$pane' (expected session:window.pane or %N)"
+    return 1
+  fi
+  if [ -n "$role" ] && ! this.isRoleName "$role"; then
+    error.log "claudeCode.fork.to: invalid role '$role' (alphanumeric + dot/dash/underscore, max 40)"
     return 1
   fi
 
@@ -511,9 +553,9 @@ claudeCode.continue() # # continue the most recent session without picker
 claudeCode.new() # <?prompt> # start a fresh conversation with optional initial prompt
 {
   if [ -n "$1" ]; then
-    "$CLAUDE_CMD" --print "$@"
+    "$CLAUDE_CMD" --model "$CLAUDECODE_DEFAULT_MODEL" --print "$@"
   else
-    "$CLAUDE_CMD"
+    "$CLAUDE_CMD" --model "$CLAUDECODE_DEFAULT_MODEL"
   fi
 }
 
@@ -611,7 +653,7 @@ claudeCode.model.get.completion.pane() {
 
 claudeCode.opus() # <?prompt> # use opus 1M context model
 {
-  "$CLAUDE_CMD" --model "claude-opus-4-6[1m]" "$@"
+  "$CLAUDE_CMD" --model "$CLAUDECODE_DEFAULT_MODEL" "$@"
 }
 
 claudeCode.sonnet() # <?prompt> # use sonnet model
@@ -771,16 +813,18 @@ claudeCode.install() # # install claude code from web for linux
   local CONFIG_FILE="${CONFIG:-$HOME/config/user.env}"
 
   # Check if already installed
-  if command -v claude &> /dev/null; then
+  if command -v claude >/dev/null 2>&1; then
     info.log "Claude Code is already installed: $(which claude)"
     "$CLAUDE_CMD" --version
     echo ""
-    read -p "Reinstall/update anyway? [y/N] " -n 1 -r
+    # POSIX-safe prompt (#13): dash `read` has no -p/-n; use printf + line read + case.
+    printf '%s' "Reinstall/update anyway? [y/N] "
+    read -r REPLY
     echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      info.log "Installation cancelled"
-      return 0
-    fi
+    case "$REPLY" in
+      [Yy]*) ;;
+      *) info.log "Installation cancelled"; return 0 ;;
+    esac
   fi
 
   info.log "Installing Claude Code for Linux..."
@@ -823,11 +867,12 @@ claudeCode.install() # # install claude code from web for linux
     warn.log "Add ~/.local/bin to your PATH manually if needed"
   fi
 
-  # Add to current session PATH if not present
-  if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    export PATH="$PATH:$INSTALL_DIR"
-    info.log "Added $INSTALL_DIR to current session PATH"
-  fi
+  # Add to current session PATH if not present (POSIX case-glob, not [[ ]] — #13)
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ;;
+    *) export PATH="$PATH:$INSTALL_DIR"
+       info.log "Added $INSTALL_DIR to current session PATH" ;;
+  esac
 
   # Create claude.env with defaults if missing
   local claudeEnv="${CONFIG_PATH:-$HOME/config}/claude.env"
@@ -837,14 +882,16 @@ claudeCode.install() # # install claude code from web for linux
   fi
   # Ensure user.env sources claude.env
   if [ -f "$CONFIG_FILE" ] && ! grep -q 'claude.env' "$CONFIG_FILE"; then
-    echo 'source $CONFIG_PATH/claude.env' >> "$CONFIG_FILE"
+    # Write the POSIX '.' form (not 'source') so user.env stays portable if ever
+    # sourced under dash; config.validate allows both (Rule A). (#13)
+    echo '. $CONFIG_PATH/claude.env' >> "$CONFIG_FILE"
     info.log "Added claude.env source to $CONFIG_FILE"
   fi
-  # Source in current session
-  source "$claudeEnv" 2>/dev/null
+  # Source in current session (POSIX '.', not bash 'source' — #13)
+  . "$claudeEnv" 2>/dev/null
 
   # Verify installation
-  if command -v claude &> /dev/null; then
+  if command -v claude >/dev/null 2>&1; then
     success.log "Claude Code installed successfully!"
     "$CLAUDE_CMD" --version
     echo ""
@@ -871,13 +918,15 @@ claudeCode.uninstall() # # uninstall claude code
   [ -f "$CLAUDE_BIN" ] && echo "  - $CLAUDE_BIN"
   [ -d "$CLAUDE_DIR" ] && echo "  - $CLAUDE_DIR"
   echo ""
-  read -p "Are you sure you want to uninstall Claude Code? [y/N] " -n 1 -r
+  # POSIX-safe prompt (#13): printf + line read + case (dash read has no -p/-n).
+  printf '%s' "Are you sure you want to uninstall Claude Code? [y/N] "
+  read -r REPLY
   echo
 
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    info.log "Uninstall cancelled"
-    return 0
-  fi
+  case "$REPLY" in
+    [Yy]*) ;;
+    *) info.log "Uninstall cancelled"; return 0 ;;
+  esac
 
   info.log "Removing Claude Code..."
 
@@ -908,6 +957,12 @@ claudeCode.process.find() # <pane> # find Claude Code PID running in a tmux pane
 
   local tty
   tty=$(otmux pane.get "$target" "#{pane_tty}" 2>/dev/null)
+  # Trim whitespace/newlines — the `this` CLI dispatch can prepend a stray newline
+  # to `otmux pane.get` output. An untrimmed tty (e.g. "\n/dev/pts/3") fails the
+  # `$2 == tty` ps match below → a bash-PARENT Claude is missed → isClaudeCode /
+  # pane.kind / process.running all misclassify a LIVE agent as a shell (g.4: real
+  # agents then take the non-claude send path, skipping prefix + submit-verify).
+  tty=$(printf '%s' "$tty" | tr -d '[:space:]')
   [ -z "$tty" ] && return 1
   local ttyShort="${tty#/dev/}"
 
@@ -923,6 +978,39 @@ claudeCode.process.find() # <pane> # find Claude Code PID running in a tmux pane
 claudeCode.process.running() # <pane> # check if Claude Code is running in a tmux pane
 {
   claudeCode.process.find "$1" > /dev/null 2>&1
+}
+
+claudeCode.stop() # <pane> # stop Claude Code in a pane and restore clean shell
+{
+  local target="$1"
+  if [ -z "$target" ]; then
+    error.log "Usage: claudeCode stop <pane>"
+    return 1
+  fi
+  if ! this.isPaneTarget "$target"; then
+    error.log "claudeCode.stop: invalid pane '$target'"
+    return 1
+  fi
+
+  local pid
+  pid=$(claudeCode.process.find "$target" 2>/dev/null)
+  if [ -z "$pid" ]; then
+    info.log "No Claude process in $target"
+    return 0
+  fi
+
+  kill "$pid" 2>/dev/null
+  sleep 0.3
+
+  # Respawn pane to restore cooked terminal mode.
+  # After killing Claude, the shell inherits raw-mode PTY settings
+  # (^M echoed literally, no line editing). respawn-pane -k replaces
+  # the dead shell with a fresh one in cooked mode.
+  otmux pane.respawn -k -t "$target"
+  success.log "Stopped Claude (PID $pid) in $target — shell restored"
+}
+claudeCode.stop.completion.pane() {
+  otmux panes -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -950,6 +1038,11 @@ private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customT
   # Strip spinner/accept-edits markers from pane title
   local title
   title=$(otmux pane.get "$pane" '#{pane_title}' 2>/dev/null)
+  # Trim whitespace/newlines FIRST — otmux pane.get can prepend a stray newline
+  # (a this-dispatch artifact); an untrimmed title makes the customTitle role match
+  # below fail → forces the S2 cache fallback (defeats cache-immunity → breaks
+  # reconcile/I2b for forked agents).
+  title=$(printf '%s' "$title" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
   local cleanTitle="${title#✳ }"; cleanTitle="${cleanTitle# }"
   cleanTitle="${cleanTitle#⏵⏵ }"; cleanTitle="${cleanTitle# }"
 
@@ -973,14 +1066,21 @@ private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customT
       # Extract the last customTitle in this JSONL
       lastTitle=$(grep -o '"customTitle":"[^"]*"' "$f" 2>/dev/null | tail -1 | sed 's/.*":"//;s/"$//')
       [ -z "$lastTitle" ] && continue
-      [ "$lastTitle" = "$cleanTitle" ] || continue
+      # Correlate on ROLE (identity), not the full @host-qualified title. /rename
+      # may have stamped @<sshConfigHost> (e.g. ARON@WODA.prod) while the live pane
+      # title carries @<hostname-s> (ARON@v60211). @host is a LOCATION qualifier,
+      # not identity — an exact-title compare fails on that skew and forces the S2
+      # cache fallback below (defeats cache-immunity → breaks reconcile/I2b). Match
+      # the role portion; cwd + mtime rank the survivors. Role-strip is a SUPERSET
+      # of exact match (identical titles still match after stripping @host).
+      [ "${lastTitle%%@*}" = "${cleanTitle%%@*}" ] || continue
       uuid=$(basename "$f" .jsonl)
       # cwd disambiguator — first line usually has "cwd":"/path"
       cwdMatch=0
       if [ -n "$paneCwd" ] && head -1 "$f" 2>/dev/null | grep -q "\"cwd\":\"${paneCwd}\""; then
         cwdMatch=1
       fi
-      m=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)
+      m=$(stat -c %Y "$f" 2>/dev/null); [ -z "$m" ] && m=$(stat -f %m "$f" 2>/dev/null)
       [ -z "$m" ] && continue
       # Rank: cwd-match first, then mtime
       if [ "$cwdMatch" -gt "$bestCwdMatch" ] || { [ "$cwdMatch" -eq "$bestCwdMatch" ] && [ "$m" -gt "$bestMtime" ]; }; then
@@ -1471,6 +1571,19 @@ private.claudeCode.context.from.jsonl() {
   local jsonlFile="$1"
   [ -f "$jsonlFile" ] || return 1
 
+  # Staleness guard: if JSONL hasn't been written in >10 min, it's likely
+  # from a dead/compacted session — return "stale" so caller falls through
+  local mtime now age
+  mtime=$(stat -c %Y "$jsonlFile" 2>/dev/null); [ -z "$mtime" ] && mtime=$(stat -f %m "$jsonlFile" 2>/dev/null)
+  now=$(date +%s)
+  if [ -n "$mtime" ]; then
+    age=$(( now - mtime ))
+    if [ "$age" -gt 600 ]; then
+      echo "stale"
+      return 1
+    fi
+  fi
+
   local maxTokens
   maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$jsonlFile")
 
@@ -1487,6 +1600,11 @@ for line in sys.stdin:
                 last_usage = usage
     except: pass
 if last_usage:
+    # Total context = input_tokens + cache_creation + cache_read
+    # input_tokens: non-cached prompt portion (often just 1 with full caching)
+    # cache_creation: new tokens being written to cache this turn
+    # cache_read: previously cached tokens read from cache
+    # Together = full prompt sent to model = context window usage
     input_t = last_usage['input_tokens']
     cache_create = last_usage.get('cache_creation_input_tokens', 0)
     cache_read = last_usage.get('cache_read_input_tokens', 0)
@@ -1499,14 +1617,10 @@ else:
 " 2>/dev/null
 }
 
-claudeCode.context.self() # # read own context % using TMUX_PANE — rc=1 if not in tmux
+claudeCode.context.self() # # read own context % via otmux pane.self — rc=1 if not in tmux
 {
-  if [ -z "$TMUX" ] && [ -z "$TMUX_PANE" ]; then
-    error.log "Not in a tmux pane (TMUX and TMUX_PANE both unset)"
-    return 1
-  fi
   local myPane
-  myPane=$(otmux pane.get.target 2>/dev/null)
+  myPane=$(otmux pane.self target 2>/dev/null)
   if [ -z "$myPane" ]; then
     error.log "Not in a tmux pane"
     return 1
@@ -1534,14 +1648,11 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
     local sid
     sid=$(claudeCode.session.id "$pane" 2>/dev/null)
     if [ -n "$sid" ]; then
-      # Search project dirs for this session's JSONL
-      local projectDirs=(
-        "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
-        "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
-      )
-      for dir in "${projectDirs[@]}"; do
-        if [ -f "$dir/$sid.jsonl" ]; then
-          jsonlFile="$dir/$sid.jsonl"
+      # Search ALL project dirs for this session's JSONL (not hardcoded)
+      local dir
+      for dir in "$HOME/.claude/projects"/*/; do
+        if [ -f "${dir}${sid}.jsonl" ]; then
+          jsonlFile="${dir}${sid}.jsonl"
           break
         fi
       done
@@ -1555,10 +1666,29 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
   if [ -n "$jsonlFile" ] && [ -f "$jsonlFile" ]; then
     local pct
     pct=$(private.claudeCode.context.from.jsonl "$jsonlFile")
-    if [ -n "$pct" ] && [ "$pct" != "unknown" ]; then
+    if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ]; then
       RESULT="$pct"
       echo "$pct"
       return 0
+    fi
+    # JSONL stale or unreadable — try session.current for a fresher UUID
+    if [ "$pct" = "stale" ] && [ -n "$pane" ]; then
+      local freshSid
+      freshSid=$(claudeCode.session.current "$pane" 2>/dev/null)
+      if [ -n "$freshSid" ] && [ "$freshSid" != "$sid" ]; then
+        local freshJsonl=""
+        for dir in "$HOME/.claude/projects"/*/; do
+          [ -f "${dir}${freshSid}.jsonl" ] && freshJsonl="${dir}${freshSid}.jsonl" && break
+        done
+        if [ -n "$freshJsonl" ]; then
+          pct=$(private.claudeCode.context.from.jsonl "$freshJsonl")
+          if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ]; then
+            RESULT="$pct"
+            echo "$pct"
+            return 0
+          fi
+        fi
+      fi
     fi
   fi
 
@@ -1730,10 +1860,7 @@ with open('$jsonlFile') as f:
                 usage = msg.get('usage', {})
                 if usage and 'input_tokens' in usage:
                     ts = d.get('timestamp', '')
-                    input_t = usage['input_tokens']
-                    cache_create = usage.get('cache_creation_input_tokens', 0)
-                    output_t = usage.get('output_tokens', 0)
-                    total = input_t + cache_create + output_t
+                    total = usage['input_tokens'] + usage.get('cache_creation_input_tokens', 0) + usage.get('cache_read_input_tokens', 0)
                     messages.append({'ts': ts, 'tokens': total})
         except:
             pass
