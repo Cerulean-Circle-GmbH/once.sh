@@ -66,6 +66,20 @@ private.osemvec.agentsDir() # # canonical agents dir — cwd/shell-independent (
       | tail -1 | sed -E 's/^[^=]*=//; s/^"//; s/"$//')
     [ -n "$fromFile" ] && [ -d "$fromFile" ] && { echo "$fromFile"; return 0; }
   fi
+  #   4. GROUND TRUTH (robust to config churn): a LIVE team agent runs IN the
+  #      workspace, so its process cwd contains .claude/agents. Resolve from
+  #      process state — cwd/shell-independent AND config-independent.
+  local p pid c
+  for p in $(hiveMind registry.list 2>/dev/null | cut -d'|' -f1); do
+    pid=$(claudeCode process.find "$p" 2>/dev/null) || continue
+    [ -z "$pid" ] && continue
+    c=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+    while [ -n "$c" ] && [ "$c" != "/" ]; do
+      [ -d "$c/.claude/agents" ] && { echo "$c/.claude/agents"; return 0; }
+      c=$(dirname "$c")
+    done
+  done
+  #   5. last resort — upward walk from realpath(OOSH_DIR), then PWD
   local start d
   for start in "$(realpath "${OOSH_DIR:-.}" 2>/dev/null)" "$PWD"; do
     d="$start"
@@ -460,6 +474,106 @@ osemvec.status() # # list guarded instances + semvec health
   fi
   return 0
 }
+
+# ── Running-instance inventory (read-only) ───────────────────────────────────
+# Ground truth, measured not stored: serve servers from the process table, guarded
+# claude instances from the hiveMind registry + the on-disk guard file.
+
+private.osemvec.listServe() # # emit 'serve|<pid>|<port>' per running semvec serve server
+{
+  # Match the ACTUAL server (python -m semvec.api.cli serve), NOT the osemvec
+  # wrapper substring; pull the --port value (default 8000). pgrep excludes self.
+  pgrep -af 'semvec\.api\.cli serve' 2>/dev/null | while read -r pid rest; do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    port=$(printf '%s' "$rest" | sed -n 's/.*--port[= ]\([0-9][0-9]*\).*/\1/p')
+    echo "serve|${pid}|${port:-8000}"
+  done
+}
+
+private.osemvec.listGuarded() # # emit 'guarded|<pane>|<role>|<cwd>' for registry panes whose cwd carries the osemvec guard
+{
+  hiveMind registry.list 2>/dev/null | while IFS='|' read -r pane role rest; do
+    [ -z "$pane" ] && continue
+    pid=$(claudeCode process.find "$pane" 2>/dev/null) || continue
+    [ -z "$pid" ] && continue
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+    [ -z "$cwd" ] && continue
+    if [ -f "$cwd/.claude/settings.json" ] && grep -q 'osemvec' "$cwd/.claude/settings.json" 2>/dev/null; then
+      echo "guarded|${pane}|${role}|${cwd}"
+    fi
+  done
+}
+
+osemvec.list() # # read-only inventory of running osemvec-managed instances (serve servers + guarded claudes)
+{
+  private.osemvec.listServe
+  private.osemvec.listGuarded
+  return 0
+}
+
+# ── Lifecycle stop (ownership-verified; guarded-instance kill is auth-gated) ──
+
+private.osemvec.ownsProcess() # <pid> # 0 ONLY if pid is a live process owned by the current user (never touch others')
+{
+  local pid="$1"
+  [ -z "$pid" ] && return 1
+  case "$pid" in *[!0-9]*) return 1 ;; esac
+  [ -d "/proc/$pid" ] || return 1
+  local owner; owner=$(stat -c '%U' "/proc/$pid" 2>/dev/null)
+  [ -n "$owner" ] && [ "$owner" = "$(id -un)" ]
+}
+
+private.osemvec.stopAuthorized() # <?auth> # 0 if stopping a LIVE guarded instance is authorized (default-refuse)
+{
+  case "$1" in authorized|confirm|yes) return 0 ;; esac
+  [ "${OSEMVEC_STOP_AUTHORIZED:-0}" = "1" ]
+}
+
+osemvec.stop() # <target> <?auth> # stop a serve server (port/pid) or guarded instance (pane/role, auth-gated dry-run)
+{
+  local target="$1" auth="$2"
+  [ -z "$target" ] && { error.log "usage: osemvec stop <target> <?auth>   (target = serve port/pid, or guarded pane/role — see 'osemvec list')"; return 1; }
+
+  # Serve server match (port or pid). Only ever a pid that (a) 'list' verified is a
+  # real semvec.api.cli serve process AND (b) is owned by THIS user — never an
+  # arbitrary/system/other-user process. No auth (it is your own server).
+  local serveLine; serveLine=$(private.osemvec.listServe | awk -F'|' -v t="$target" '$2==t||$3==t{print;exit}')
+  if [ -n "$serveLine" ]; then
+    local pid port; pid=$(printf '%s' "$serveLine" | cut -d'|' -f2); port=$(printf '%s' "$serveLine" | cut -d'|' -f3)
+    if ! private.osemvec.ownsProcess "$pid"; then
+      error.log "osemvec.stop: refusing — serve pid $pid is not owned by $(id -un)"; return 1
+    fi
+    console.log "osemvec.stop: stopping serve server pid=$pid port=$port"
+    kill "$pid" 2>/dev/null || { error.log "osemvec.stop: failed to signal pid $pid"; return 1; }
+    create.result 0 "stopped serve: $pid"
+    return 0
+  fi
+
+  # Guarded instance match (pane or role) — AUTH-GATED, DEFAULT DRY-RUN
+  # (mirrors osemvec.new + hiveMind.agent.rewind default-refuse).
+  local guardLine; guardLine=$(private.osemvec.listGuarded | awk -F'|' -v t="$target" '$2==t||$3==t{print;exit}')
+  if [ -n "$guardLine" ]; then
+    local pane role; pane=$(printf '%s' "$guardLine" | cut -d'|' -f2); role=$(printf '%s' "$guardLine" | cut -d'|' -f3)
+    if ! private.osemvec.stopAuthorized "$auth"; then
+      important.log "osemvec.stop: DRY-RUN — would kill guarded instance in pane $pane (role ${role:-?})."
+      console.log "  Authorize: osemvec stop '$target' authorized   (or OSEMVEC_STOP_AUTHORIZED=1)"
+      create.result 0 "dry-run: $pane"
+      return 0
+    fi
+    local pid; pid=$(claudeCode process.find "$pane" 2>/dev/null)
+    if [ -z "$pid" ] || ! private.osemvec.ownsProcess "$pid"; then
+      error.log "osemvec.stop: refusing — pane $pane process ${pid:-?} not owned by $(id -un)"; return 1
+    fi
+    console.log "osemvec.stop: stopping guarded instance pane=$pane role=${role:-?} pid=$pid"
+    kill "$pid" 2>/dev/null
+    create.result 0 "stopped: $pane"
+    return 0
+  fi
+
+  error.log "osemvec.stop: no serve server or guarded instance matches '$target' — see 'osemvec list'"
+  return 1
+}
+osemvec.stop.completion.target() { osemvec.list 2>/dev/null | awk -F'|' '$1=="serve"{print $3} $1=="guarded"{print $2}'; }
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 
