@@ -286,7 +286,7 @@ test.case - "T16: this.help lists all public methods" \
   echo "checking"
 HELP=$(LOG_DEVICE=/dev/null opy usage 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
 MISS=""
-for m in start deps install version version.set version.list venv.create venv.list venv.remove remove update usage; do
+for m in start deps install version version.set version.list venv.create venv.list venv.remove remove update usage shell.install venv.activate venv.deactivate; do
   echo "$HELP" | grep -qE "^[[:space:]]*${m//./\\.}[[:space:]]*\|" || MISS="$MISS $m"
 done
 [ -z "$MISS" ] && create.result 0 "all listed" || create.result 1 "missing:$MISS"
