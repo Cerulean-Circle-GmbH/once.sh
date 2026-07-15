@@ -292,6 +292,69 @@ done
 [ -z "$MISS" ] && create.result 0 "all listed" || create.result 1 "missing:$MISS"
 expect 0 "all listed" "this.help documents every public opy method"
 
+# ============================================================================
+# ── Tasks 21-22: shell-function UX (venv.activate/deactivate + shell.install) ─
+# Hermetic: fake venv under the isolated OPY_VENVS, a TEMP rcfile — never
+# ~/.bashrc, never a real interactive activation (assert the EMITTED line only).
+# ============================================================================
+OPY_FAKE_VENV="$OPY_VENVS/fakeact"
+mkdir -p "$OPY_FAKE_VENV/bin"; printf '#dummy\n' > "$OPY_FAKE_VENV/bin/activate"
+OPY_RC="/tmp/test.opy.$$/fake.bashrc"
+
+# T17: venv.activate emits the exact source line (no real activation)
+test.case - "T17: venv.activate emits source line" \
+  echo "checking"
+ACT_OUT=$(opy.venv.activate fakeact 2>/dev/null)
+if [ "$ACT_OUT" = "source '$OPY_FAKE_VENV/bin/activate'" ]; then
+  create.result 0 "emitted"
+else
+  create.result 1 "got: $ACT_OUT"
+fi
+expect 0 "emitted" "venv.activate emits the exact source line for the shell fn to eval"
+
+# T18: venv.activate on a missing venv → non-zero
+test.case - "T18: venv.activate missing venv errors" \
+  opy.venv.activate nope-venv
+[ "$RETURN_VALUE" -ne 0 ] && create.result 0 "err" || create.result 1 "should fail"
+expect 0 "err" "venv.activate rejects a missing venv"
+
+# T19: venv.deactivate emits a guarded deactivate line
+test.case - "T19: venv.deactivate emits" \
+  echo "checking"
+DEACT_OUT=$(opy.venv.deactivate 2>/dev/null)
+echo "$DEACT_OUT" | grep -q "deactivate" && create.result 0 "emitted" || create.result 1 "got: $DEACT_OUT"
+expect 0 "emitted" "venv.deactivate emits a deactivate line"
+
+# T20: shell.install writes a VALID opy shell fn to a TEMP rc (never ~/.bashrc)
+rm -f "$OPY_RC"
+test.case - "T20: shell.install writes valid function block" \
+  opy.shell.install "$OPY_RC"
+if [ "$RETURN_VALUE" -eq 0 ] && grep -q '>>> opy shell function >>>' "$OPY_RC" && bash -n "$OPY_RC" 2>/dev/null; then
+  create.result 0 "installed"
+else
+  create.result 1 "install failed / invalid"
+fi
+expect 0 "installed" "shell.install writes a syntactically valid opy shell function"
+
+# T21: idempotent — second run leaves exactly ONE block
+test.case - "T21: shell.install idempotent" \
+  opy.shell.install "$OPY_RC"
+CNT=$(grep -c '>>> opy shell function >>>' "$OPY_RC")
+[ "$RETURN_VALUE" -eq 0 ] && [ "$CNT" -eq 1 ] && create.result 0 "one block" || create.result 1 "blocks=$CNT"
+expect 0 "one block" "shell.install is idempotent (exactly one function block)"
+
+# T22: self-heals a drifted block back to canonical
+printf '\n# >>> opy shell function >>>\nopy_CORRUPT_marker\n# <<< opy shell function <<<\n' > "$OPY_RC"
+test.case - "T22: shell.install self-heals drift" \
+  opy.shell.install "$OPY_RC"
+if grep -q 'command opy' "$OPY_RC" && ! grep -q 'CORRUPT' "$OPY_RC" \
+   && [ "$(grep -c '>>> opy shell function >>>' "$OPY_RC")" -eq 1 ]; then
+  create.result 0 "healed"
+else
+  create.result 1 "not healed"
+fi
+expect 0 "healed" "shell.install replaces a drifted block with the canonical one"
+
 # ── Teardown ─────────────────────────────────────────────────────────────────
 cleanup_test_opy
 

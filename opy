@@ -88,12 +88,63 @@ private.opy.pkgInstall() # <pkg...> # non-interactive build-header install via a
 
 # ── Constructor ──────────────────────────────────────────────────────────────
 
+# ── Shell-function UX (activate/deactivate need the CURRENT shell) ────────────
+# A subprocess can't mutate its parent shell, so venv activate/deactivate are
+# driven by a thin opy shell function like pyenv/nvm: the function evals what
+# the script EMITS for those two verbs and passes every other verb through. The
+# function is installed by an EXPLICIT, user-invoked `opy shell.install` — consent
+# required to touch a shell profile — never silently on every call.
+
+private.opy.bashrcBlock() # # emit the canonical opy() shell-function block (marker-delimited)
+{
+  cat <<'EOF'
+# >>> opy shell function >>>
+function opy {
+  case "$1" in
+    venv.activate|venv.deactivate) eval "$(command opy "$@")" ;;
+    *) command opy "$@" ;;
+  esac
+}
+# <<< opy shell function <<<
+EOF
+}
+
+private.opy.installBashrc() # <rcfile> # idempotently install/self-heal the opy() function into <rcfile>
+{
+  local rc="$1"
+  [ -z "$rc" ] && { error.log "installBashrc: rcfile required"; return 1; }
+  local begin="# >>> opy shell function >>>"
+  local end="# <<< opy shell function <<<"
+  local canonical; canonical="$(private.opy.bashrcBlock)"
+  [ -f "$rc" ] || touch "$rc" 2>/dev/null || { error.log "opy: cannot create $rc"; return 1; }
+  local existing
+  existing=$(awk -v b="$begin" -v e="$end" 'index($0,b){f=1} f{print} index($0,e){f=0}' "$rc" 2>/dev/null)
+  [ "$existing" = "$canonical" ] && { console.log "opy.shell.install: already current in $rc"; return 0; }
+  local tmp; tmp="${rc}.opy.$$"
+  awk -v b="$begin" -v e="$end" 'index($0,b){f=1} !f{print} index($0,e){f=0}' "$rc" 2>/dev/null > "$tmp" \
+    || { error.log "opy: bashrc rewrite failed"; rm -f "$tmp"; return 1; }
+  printf '%s\n' "$canonical" >> "$tmp"
+  mv "$tmp" "$rc" || { error.log "opy: cannot update $rc"; rm -f "$tmp"; return 1; }
+  console.log "opy.shell.install: installed opy shell function in $rc — run 'source $rc' or open a new shell"
+  return 0
+}
+
+opy.shell.install() # <?rcfile:~/.bashrc> # EXPLICIT opt-in: install the opy() shell function enabling venv.activate/deactivate
+{
+  local rc="${1:-$HOME/.bashrc}"
+  private.opy.installBashrc "$rc"
+}
+opy.shell.install.completion.rcfile() { compgen -f -- "$1"; }
+
 opy.start() # # constructor: source kernel + self-heal pyenv (never on source), then dispatch
 {
   source this
   # Self-heal on real construction only (init yields a valid object or fails loud).
   # Skipped when sourced (completion) and for introspection verbs so the tool
-  # stays usable even when pyenv is broken.
+  # stays usable even when pyenv is broken. NOTE: the opy shell function is NOT
+  # auto-installed here — a shell profile is only modified via explicit
+  # `opy shell.install` (consent). If venv.activate is used without it, activate
+  # emits a hint.
   if ! this.isSourced; then
     case "$1" in
       ''|help|help*|usage) : ;;
@@ -259,6 +310,26 @@ opy.venv.remove() # <name> # remove a venv
   return 0
 }
 opy.venv.remove.completion.name() { opy.venv.list; }
+
+opy.venv.activate() # <name> # emit the activation line for the opy() shell function to eval in the CURRENT shell
+{
+  local name="$1"
+  [ -z "$name" ] && { error.log "usage: opy venv.activate <name>"; return 1; }
+  local home; home="$(private.opy.venvHome)"
+  local act="$home/$name/bin/activate"
+  [ -f "$act" ] || { error.log "opy.venv.activate: no such venv '$name' (looked for $act) — 'opy venv.create $name' first"; return 1; }
+  # RAW stdout bypasses logging: the opy shell function evals this in-place.
+  # Run directly (no function) and you just SEE the line — install once with
+  # 'opy shell.install' to make 'opy venv.activate' activate in your shell.
+  echo "source '$act'"
+}
+opy.venv.activate.completion.name() { opy.venv.list; }
+
+opy.venv.deactivate() # # emit the deactivation command for the opy() shell function to eval
+{
+  # Guarded so eval is a no-op when no venv is active.
+  echo "deactivate 2>/dev/null || true"
+}
 
 # ── Lifecycle ────────────────────────────────────────────────────────────────
 
