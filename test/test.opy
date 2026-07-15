@@ -194,11 +194,12 @@ if [ "$PYENV_OK" -eq 0 ]; then
   fi
 
   if [ "$ALLIMP" -eq 1 ]; then
-    # Capture console.log output via a LOG_DEVICE file (console.log writes to
-    # LOG_DEVICE, not stdout — /dev/null would swallow the 'nothing to install' line).
-    DEPS_LOG="/tmp/test.opy.$$.deps"
-    LOG_DEVICE="$DEPS_LOG" opy deps >/dev/null 2>&1; DEPS_RC=$?
-    DEPS_OUT=$(cat "$DEPS_LOG" 2>/dev/null); rm -f "$DEPS_LOG"
+    # 'nothing to install' is a console.log (min level 3). The suite runs at
+    # level 1 where console.log is suppressed REGARDLESS of LOG_DEVICE (measured
+    # with oosh-expert: L1→empty, L3→line present; LOG_LEVEL is exported=1).
+    # Force level 3 on the probe subprocess so the branch line is deterministic,
+    # independent of ambient LOG_LEVEL state.
+    DEPS_OUT=$(LOG_LEVEL=3 LOG_DEVICE=/dev/stdout opy deps 2>&1); DEPS_RC=$?
     test.case - "T12: deps all-importable dry path (no install)" \
       echo "checking"
     if [ "$DEPS_RC" -eq 0 ] && echo "$DEPS_OUT" | grep -q "nothing to install"; then
