@@ -82,18 +82,42 @@ private.opy.activateLatest() # <version> # make a freshly-installed latest the g
   fi
 }
 
-private.opy.ensurePyenv() # # self-heal: pyenv present + actually runnable, else fail loud
+private.opy.ensurePyenv() # # self-CARE: pyenv present + runnable; AUTO-INSTALL (git clone) when missing, then proceed
 {
   local bin; bin=$(private.opy.pyenvBin)
   if [ -z "$bin" ]; then
-    error.log "pyenv is not installed/resolvable under $(private.opy.pyenvRoot). Install pyenv (https://github.com/pyenv/pyenv), then re-run."
-    return 1
+    # Self-care (OOSH rule): NEVER tell the user to install pyenv — DO it, then continue.
+    private.opy.installPyenv || return 1
+    bin=$(private.opy.pyenvBin)
+    [ -z "$bin" ] && { error.log "opy.ensurePyenv: pyenv still not resolvable after auto-install"; return 1; }
   fi
   if ! PYENV_ROOT="$(private.opy.pyenvRoot)" "$bin" --version >/dev/null 2>&1; then
     error.log "pyenv found at $bin but not runnable — broken install."
     return 1
   fi
   debug.log "pyenv OK: $bin (root=$(private.opy.pyenvRoot))"
+  return 0
+}
+
+private.opy.installPyenv() # # self-care: clone pyenv into PYENV_ROOT + build shims (idempotent; never overwrites a non-pyenv dir)
+{
+  local root; root=$(private.opy.pyenvRoot)
+  [ -x "$root/bin/pyenv" ] && return 0   # already present — idempotent
+  if [ -e "$root" ] && [ -n "$(ls -A "$root" 2>/dev/null)" ]; then
+    error.log "opy.installPyenv: $root exists and is non-empty but has no bin/pyenv — refusing to overwrite. Move it aside and re-run."
+    return 1
+  fi
+  command -v git >/dev/null 2>&1 || { error.log "opy.installPyenv: git is required to auto-install pyenv but was not found"; return 1; }
+  console.log "opy: pyenv not found — auto-installing (git clone → $root)…"
+  if ! git clone --depth 1 https://github.com/pyenv/pyenv "$root"; then
+    error.log "opy.installPyenv: git clone of pyenv into $root failed (network / permissions?)"
+    return 1
+  fi
+  # Build the shims dir so interpreters are reachable — pyenv is usable by opy immediately
+  # (opy funnels through PYENV_ROOT + the resolved binary; interactive shell PATH/init is
+  # the consented 'opy shell.install' path, not auto-edited here).
+  PYENV_ROOT="$root" "$root/bin/pyenv" rehash 2>/dev/null || true
+  console.log "opy: pyenv installed at $root (interactive shell PATH/init: run 'opy shell.install')"
   return 0
 }
 
@@ -283,6 +307,7 @@ opy.version.set.completion.version() { private.opy.pyenv versions --bare 2>/dev/
 opy.version.list() # # list installed pyenv versions
 {
   private.opy.pyenv versions --bare 2>/dev/null
+  return 0   # informational list — never propagate non-zero (would surface as EPERM via the OOSH debug trap)
 }
 
 # ── Virtual environments ─────────────────────────────────────────────────────
