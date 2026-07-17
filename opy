@@ -128,7 +128,7 @@ private.opy.pkgInstall() # <pkg...> # non-interactive build-header install via a
   [ "$(id -u)" -ne 0 ] && sudo="sudo"
   if command -v apt-get >/dev/null 2>&1; then
     $sudo apt-get update -y >/dev/null 2>&1
-    $sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+    $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
   elif command -v dnf >/dev/null 2>&1; then
     $sudo dnf install -y "$@"
   elif command -v yum >/dev/null 2>&1; then
