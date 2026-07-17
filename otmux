@@ -1265,11 +1265,10 @@ private.otmux.size.lock.cleanup() { # # drop entries whose session no longer exi
 
 # ── Shorter verb aliases for size ops — operate on current session by default ─
 # `otmux size.unlock` is faster to type than `otmux window.size.unlock`.
-# No args → resolve current tmux session from TMUX_PANE.
+# No args → resolve caller's own tmux session via the PID-walk resolver (G1), not $TMUX_PANE.
 
-private.otmux.size.currentSession() { # # echo current tmux session name or empty
-  [ -z "$TMUX_PANE" ] && return 1
-  $TMUX_CMD display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null
+private.otmux.size.currentSession() { # # echo current tmux session name or empty (G1: via private.otmux.self.session)
+  private.otmux.self.session
 }
 
 otmux.size.unlock() # <?session> # shorter alias — defaults to current session
@@ -1304,16 +1303,16 @@ otmux.fit() # <?session> # resize session window to caller's terminal cols×rows
   # unlock returns to follow-largest behavior on next attach event.
   # `resize-window -x -y` implicitly sets window-size=manual on the window;
   # follow with `otmux size.unlock` to return to dynamic-largest.
-  [ -z "$TMUX_PANE" ] && { error.log "fit: not running in tmux (TMUX_PANE empty)"; return 1; }
-  local session="${1:-$(private.otmux.size.currentSession)}"
+  local selfPane; selfPane=$(private.otmux.pane.resolve) || { error.log "fit: not running in tmux"; return 1; }
+  local session="${1:-$(private.otmux.self.session)}"
   this.isSessionName "$session" || { error.log "fit: invalid session '$session'"; return 1; }
   otmux has "$session" 2>/dev/null || { error.log "fit: '$session' is not a live tmux session"; return 1; }
-  # Caller's client dims — display-message defaults to the most-recently
-  # active client for the session containing TMUX_PANE. That IS the caller
-  # in interactive use (they just typed the command, so they're most recent).
+  # Caller's client dims — display-message defaults to the most-recently active
+  # client for the session containing the caller's pane (resolved via the process
+  # tree, G1 — not $TMUX_PANE). That IS the caller in interactive use.
   local W H
-  W=$($TMUX_CMD display-message -p -t "$TMUX_PANE" '#{client_width}' 2>/dev/null)
-  H=$($TMUX_CMD display-message -p -t "$TMUX_PANE" '#{client_height}' 2>/dev/null)
+  W=$($TMUX_CMD display-message -p -t "$selfPane" '#{client_width}' 2>/dev/null)
+  H=$($TMUX_CMD display-message -p -t "$selfPane" '#{client_height}' 2>/dev/null)
   if ! [[ "$W" =~ ^[0-9]+$ ]] || ! [[ "$H" =~ ^[0-9]+$ ]]; then
     error.log "fit: cannot read caller client dimensions ($W x $H)"
     return 1
@@ -1803,20 +1802,17 @@ private.otmux.send.prefix() # # return sender prefix [@role pane] or empty strin
 # pane swaps/moves/renames. Per PO directive (Tron P0, 2026-05-12): the registry
 # is the ground truth; env reads here cause stale role leakage.
 #
-# Self-pane resolution MUST use $TMUX_PANE (Tron P0 #3, 2026-05-12 LATE):
-# `otmux send` runs as a subprocess. A bare `tmux display-message -p` (no -t)
-# returns the FOCUSED pane — i.e. wherever the user last clicked — NOT the
-# caller's pane. tmux exports TMUX_PANE=%N to every pane's child processes,
-# so the subprocess inherits its caller's pane id reliably. Pass it as -t
-# to display-message to get the canonical session:win.pane format used in the
-# registry. Without this, prefix has been wrong in production for everything
-# routed through subprocess `otmux send` calls.
+# Self-pane resolution uses the ONE PID-walk resolver (private.otmux.pane.resolve via
+# otmux.pane.self), NEVER $TMUX_PANE. This SUPERSEDES the old Tron P0 #3 "MUST use
+# TMUX_PANE" directive: that env var is a spawn-time snapshot that goes STALE after
+# fork / move / rewind, so the prefix mis-tagged relocated agents (the wrong `otmux send`
+# still reached the right pane, but the [@role pane] tag lied). The process tree is
+# ground truth and survives fork/move/rewind (G1).
 {
   local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-  [ -z "$TMUX_PANE" ] && return   # not running under tmux (CI/script) → no prefix
   local myPane
-  myPane=$($TMUX_CMD display-message -p -t "$TMUX_PANE" "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
-  [ -z "$myPane" ] && return
+  myPane=$(otmux.pane.self target 2>/dev/null)   # PID-walk → session:win.pane, never stale
+  [ -z "$myPane" ] && return   # not under tmux (CI/script) or unresolved → no prefix
   [ -f "$reg" ] || return
   local myRole
   myRole=$(grep "^${myPane}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
@@ -2665,11 +2661,13 @@ otmux.pane.list.completion.session() { otmux.parameter.completion.session "$@"; 
 
 otmux.pane.get() # <?target> <?format:%> # get pane info; 2 args = target + format, 1 arg = format, 0 = pane_id
 {
-  local target_args=(-t "${TMUX_PANE:-}") format="%"
+  local target_args format="%"
   if [ $# -ge 2 ]; then
     target_args=(-t "$1"); format="$2"
-  elif [ $# -eq 1 ]; then
-    format="$1"
+  else
+    [ $# -eq 1 ] && format="$1"
+    local selfPane; selfPane=$(private.otmux.pane.resolve) || return 1   # G1: self via PID-walk, not $TMUX_PANE
+    target_args=(-t "$selfPane")
   fi
   case "$format" in
     %)  $TMUX_CMD display-message "${target_args[@]}" -p "#{pane_id}" ;;
@@ -2678,9 +2676,49 @@ otmux.pane.get() # <?target> <?format:%> # get pane info; 2 args = target + form
   esac
 }
 
-otmux.pane.get.target() # # get executing pane in target format (session:window.pane)
+# ── G1: the ONE canonical self-ID resolver ──────────────────────────────────
+# Resolve the EXECUTING pane by walking the process tree to its controlling tmux
+# pane. NEVER $TMUX_PANE — that env var is a spawn-time snapshot injected by tmux
+# and goes STALE after fork / move / rewind (the Claude process keeps the OLD
+# pane's value → mis-tag/self-ID lie). The process tree is ground truth and
+# survives all three. current / pane.self / pane.get.target all delegate here.
+private.otmux.pane.resolve() { # # echo the executing pane's #{pane_id} (%N); rc1 if not under tmux
+  local pid=$$ paneMap
+  paneMap=$($TMUX_CMD list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null) || return 1
+  while [ "$pid" -gt 1 ] 2>/dev/null; do
+    local match
+    match=$(echo "$paneMap" | awk -v p="$pid" '$1==p {print $2}')
+    [ -n "$match" ] && { echo "$match"; return 0; }
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -z "$pid" ] && break
+  done
+  return 1
+}
+
+otmux.pane.self() # <?format:%> # the ONE self-ID primitive — which pane am I (PID-walk, never stale); %=pane_id (default), target=session:window.pane
 {
-  $TMUX_CMD display-message -t "${TMUX_PANE:-}" -p "#{session_name}:#{window_index}.#{pane_index}"
+  local selfPane
+  selfPane=$(private.otmux.pane.resolve) || return 1
+  case "${1:-%}" in
+    %)      echo "$selfPane" ;;
+    target) $TMUX_CMD display-message -t "$selfPane" -p "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null ;;
+    *)      $TMUX_CMD display-message -t "$selfPane" -p "$1" 2>/dev/null ;;
+  esac
+}
+otmux.pane.self.completion.format() { echo "%"; echo "target"; }
+
+# Caller's OWN session via the resolver — never bare `display-message -p` (focused pane) or stale $TMUX_PANE.
+private.otmux.self.session() { # # echo caller's own session name, or empty
+  local selfPane
+  selfPane=$(private.otmux.pane.resolve) || return 1
+  $TMUX_CMD display-message -t "$selfPane" -p '#{session_name}' 2>/dev/null
+}
+
+otmux.pane.get.target() # # get executing pane in target format (session:window.pane) — delegates to the ONE resolver (G1)
+{
+  local selfPane
+  selfPane=$(private.otmux.pane.resolve) || return 1
+  $TMUX_CMD display-message -t "$selfPane" -p "#{session_name}:#{window_index}.#{pane_index}"
 }
 
 otmux.current() # # alias to otmux.pane.get.target showing the current pane name
