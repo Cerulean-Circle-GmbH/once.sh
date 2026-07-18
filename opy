@@ -223,24 +223,24 @@ opy.deps() # <?version> # check/install build headers needed to compile CPython
     toolchain="build-essential"
   fi
 
-  # Choose an interpreter to probe: the target version if present, else active.
-  local py=""
-  if [ -n "$version" ] && [ -x "$(private.opy.python "$version")" ]; then
-    py="$(private.opy.python "$version")"
-  else
-    py="$(private.opy.pyenv which python 2>/dev/null)"
-  fi
-
-  local missing=""
-  if [ -n "$py" ] && [ -x "$py" ]; then
+  # Module-probe is valid ONLY against the TARGET version's own python (a re-check of
+  # an already-built version). For a FRESH install (target not built), a DIFFERENT
+  # python — system/active — having a module does NOT mean the -dev HEADER is installed
+  # for compiling a NEW python. GAP 2 proof: system /usr/bin/python3 HAS zlib → the old
+  # `pyenv which python` fallback saw zlib "present" → zlib1g-dev was SKIPPED → 3.14.6
+  # compiled WITHOUT zlib → pip bootstrap "zlib not available" → make install Error 1.
+  # So: probe the target python if it exists; otherwise install the FULL header set.
+  local missing="" targetPy=""
+  [ -n "$version" ] && targetPy="$(private.opy.python "$version")"
+  if [ -n "$targetPy" ] && [ -x "$targetPy" ]; then
     local m
     for m in $modules; do
-      "$py" -c "import $m" >/dev/null 2>&1 || missing="$missing $m"
+      "$targetPy" -c "import $m" >/dev/null 2>&1 || missing="$missing $m"
     done
   else
-    # No interpreter to probe yet (fresh host) — install the full set so the
-    # first compile has every header. Measure-don't-assume: say why.
-    important.log "opy.deps: no interpreter to probe — installing full CPython build-dep set"
+    # Fresh install (target not built) — never trust another python's modules for a
+    # build-header decision; install the full set so the compile has every header.
+    important.log "opy.deps: target $version not built — installing full CPython build-header set"
     missing="$modules"
   fi
 
