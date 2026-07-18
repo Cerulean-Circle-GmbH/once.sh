@@ -214,6 +214,15 @@ opy.deps() # <?version> # check/install build headers needed to compile CPython
   local version="$1"
   local modules="_sqlite3 bz2 readline ctypes lzma _ssl zlib"
 
+  # ALWAYS ensure the base C toolchain FIRST — CPython cannot compile without a
+  # compiler + make, and the module-probe below PRESUMES one exists (the GAP:
+  # "configure: error: no acceptable C compiler found in \$PATH"). Independent of
+  # the module-probe: if cc OR make is absent, install build-essential (gcc/g++/make/libc).
+  local toolchain=""
+  if ! command -v cc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
+    toolchain="build-essential"
+  fi
+
   # Choose an interpreter to probe: the target version if present, else active.
   local py=""
   if [ -n "$version" ] && [ -x "$(private.opy.python "$version")" ]; then
@@ -235,13 +244,14 @@ opy.deps() # <?version> # check/install build headers needed to compile CPython
     missing="$modules"
   fi
 
-  if [ -z "$missing" ]; then
-    console.log "opy.deps: all build modules importable — nothing to install"
+  if [ -z "$missing" ] && [ -z "$toolchain" ]; then
+    console.log "opy.deps: compiler + all build modules present — nothing to install"
     return 0
   fi
 
-  # Map probed modules → Debian/Ubuntu -dev packages.
-  local pkgs="" mod
+  # Map probed modules → Debian/Ubuntu -dev packages; prepend the toolchain (build-essential)
+  # so a bare box gets the compiler BEFORE the first CPython compile.
+  local pkgs="$toolchain" mod
   for mod in $missing; do
     case "$mod" in
       _sqlite3) pkgs="$pkgs libsqlite3-dev" ;;
@@ -254,7 +264,7 @@ opy.deps() # <?version> # check/install build headers needed to compile CPython
     esac
   done
   pkgs=$(echo $pkgs | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
-  console.log "opy.deps: installing build headers:$pkgs"
+  console.log "opy.deps: installing build deps:$pkgs"
   private.opy.pkgInstall $pkgs
 }
 
