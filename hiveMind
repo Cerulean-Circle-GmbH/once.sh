@@ -7480,16 +7480,64 @@ private.hiveMind.context.age() { # <tsIso> # echo "<compactAge>|<ageSeconds>" (e
   echo "${str}|${age}"
 }
 
-# Derive the REAL window (denom in thousands) for an agent when the caller omits it:
-# 1000 (1M) if the agent's live session runs [1m], else 200 (base). Honest fallback:
-# undeterminable → 200 (base), logged. NEVER an invented denominator.
+# Derive the REAL window (denom in thousands): 1000 (1M) vs 200 (base). Three signals,
+# most-reliable first (a session's live sid can DRIFT from its launch --resume UUID after
+# fork/compact, so a bare sid==ps-args match is NOT enough — measured on robbin-skill-expert
+# whose sid no longer matched any [1m] launch line, yielding a wrong 200 denom):
+#   1. The claude process running IN THIS PANE's tree has a "[1m]" model arg.
+#   2. Legacy: the live sid appears in a ps line carrying "[1m]".
+#   3. Observed-max: JSONL usage > 200k means it CANNOT be a 200k window (a 200k session
+#      auto-compacts before exceeding 200k) → must be 1M. This is denom-from-evidence.
+# Undeterminable → 200 (honest base default). NEVER an invented denominator.
 private.hiveMind.context.denom.for.target() { # <pane> # echo 1000 or 200
-  local target="$1"
+  local target="${1:-}"
+  [ -z "$target" ] && { echo "200"; return 0; }
+
+  # 1. Pane-tree claude process with a [1m] model arg (survives sid drift).
+  local panePid
+  panePid=$(otmux display "$target" '#{pane_pid}' 2>/dev/null)
+  if [ -n "$panePid" ]; then
+    if ps -eo ppid=,args= 2>/dev/null | awk -v r="$panePid" '$1==r' | grep -q '\[1m\]'; then
+      echo "1000"; return 0
+    fi
+  fi
+
   local sid
   sid=$("$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null)
+
+  # 2. Legacy sid==ps-args match.
   if [ -n "$sid" ] && ps -eo args= 2>/dev/null | grep -F "$sid" | grep -q '\[1m\]'; then
     echo "1000"; return 0
   fi
+
+  # 3. Observed-max from JSONL: any usage > 200k ⇒ must be 1M.
+  if [ -n "$sid" ]; then
+    local dir jsonl=""
+    for dir in "$HOME/.claude/projects"/*/; do
+      [ -f "${dir}${sid}.jsonl" ] && jsonl="${dir}${sid}.jsonl" && break
+    done
+    if [ -n "$jsonl" ]; then
+      local obs
+      obs=$(tail -200 "$jsonl" 2>/dev/null | python3 -c "
+import sys, json
+m=0
+for line in sys.stdin:
+    try:
+        d=json.loads(line)
+        if d.get('type')=='assistant':
+            u=d.get('message',{}).get('usage',{})
+            if u and 'input_tokens' in u:
+                t=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
+                if t>m: m=t
+    except: pass
+print(m)
+" 2>/dev/null)
+      if [ -n "$obs" ] && [ "$obs" -gt 200000 ] 2>/dev/null; then
+        echo "1000"; return 0
+      fi
+    fi
+  fi
+
   echo "200"
 }
 
@@ -7520,6 +7568,55 @@ private.hiveMind.context.parse() { # <captured-content> # echo used_k|pct|denom_
   fi
   [ -z "$usedK" ] || [ -z "$pct" ] || [ -z "$denomK" ] && return 1
   echo "${usedK}|${pct}|${denomK}"
+}
+
+# JSONL reading (PRIMARY gather source). WHY: the /context TOTAL header
+# ("N/1M tokens (P%)") renders at the TOP of a redraw panel TALLER than a typical
+# agent pane (~19 rows). After the panel settles, capture-pane sees only the BOTTOM
+# (subsection lines like "File reads 51.1k (5%)" — a MISREAD TRAP) and the top total
+# is neither on-screen nor in scrollback → parse-fails on genuinely-live idle agents
+# (measured on robbin-skill-expert %7 / robbin-architect %8, 2026-07-19). The JSONL
+# has the EXACT total tokens with no scroll-out; combined with the HONEST denom
+# (the [1m] window), it yields the same number /context would show at the top
+# (architect: JSONL total 476753 → 47.7% of 1M = 52.3% remaining, matching context.read).
+# Echoes: used_k|pct|denom_k (rounded), or empty+rc1 when JSONL unreadable/stale.
+private.hiveMind.context.from.jsonl.reading() { # <pane> # echo used_k|pct|denom_k from JSONL total + honest denom
+  local target="${1:-}"
+  [ -z "$target" ] && return 1
+  local sid dir jsonl=""
+  sid=$("$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null)
+  [ -z "$sid" ] && return 1
+  for dir in "$HOME/.claude/projects"/*/; do
+    [ -f "${dir}${sid}.jsonl" ] && jsonl="${dir}${sid}.jsonl" && break
+  done
+  [ -z "$jsonl" ] && return 1
+  local denomK
+  denomK=$(private.hiveMind.context.denom.for.target "$target")   # 1000 or 200 (honest)
+  # exact total tokens from the last assistant usage (input + cache_create + cache_read)
+  local out
+  out=$(tail -60 "$jsonl" 2>/dev/null | DENOM_K="$denomK" python3 -c "
+import sys, json, os
+denomK=int(os.environ.get('DENOM_K','200'))
+last=None
+for line in sys.stdin:
+    try:
+        d=json.loads(line)
+        if d.get('type')=='assistant':
+            u=d.get('message',{}).get('usage',{})
+            if u and 'input_tokens' in u: last=u
+    except: pass
+if not last:
+    sys.exit(1)
+tot=last['input_tokens']+last.get('cache_creation_input_tokens',0)+last.get('cache_read_input_tokens',0)
+denom=denomK*1000
+usedK=round(tot/1000)
+pct=round(tot/denom*100)
+if pct<0: pct=0
+if pct>100: pct=100          # clamp display (over-window = compacting imminent)
+print('%d|%d|%d' % (usedK,pct,denomK))
+" 2>/dev/null)
+  [ -z "$out" ] && return 1
+  echo "$out"
 }
 
 # ── Unit A — RECORD ──────────────────────────────────────────────────────────
@@ -7631,35 +7728,55 @@ hiveMind.context.gather() # <agent> # send /context to an IDLE agent, parse the 
     *) echo "${agent}: skipped: ${state:-unknown}"; return 0 ;;
   esac
 
-  # Send /context (double-submit: accept autocomplete, then submit)
+  # Nudge /context so the TUI writes a fresh usage frame to the JSONL (double-submit:
+  # accept autocomplete, then submit). We do NOT rely on capturing the /context TOTAL
+  # header from the pane — on a pane shorter than the /context panel that header
+  # scrolls off the top and is unreachable (measured). The send guarantees the JSONL
+  # usage line is current; the JSONL is then the reliable, honest reading source.
   "otmux" send.enter "$target" "/context"
   sleep 0.3
   "otmux" send.raw "$target" Enter
   sleep 5
 
-  local content parsed
-  content=$(otmux pane.capture "$target" 32767 2>/dev/null)
-  parsed=$(private.hiveMind.context.parse "$content")
+  local usedK="" pct="" denomK="" src=""
 
-  # Retry once on scroll-out (re-capture after a longer settle)
-  if [ -z "$parsed" ]; then
-    sleep 2
-    content=$(otmux pane.capture "$target" 32767 2>/dev/null)
-    parsed=$(private.hiveMind.context.parse "$content")
+  # PRIMARY — JSONL total + honest denom (no scroll-out; exact tokens).
+  local jreading
+  jreading=$(private.hiveMind.context.from.jsonl.reading "$target")
+  if [ -n "$jreading" ]; then
+    IFS='|' read -r usedK pct denomK <<< "$jreading"
+    src="jsonl"
   fi
 
-  # Parse failure → record NOTHING, fail loud
-  if [ -z "$parsed" ]; then
-    error.log "context.gather: parse failed for '$agent' — recorded nothing (no false reading)"
+  # CROSS-CHECK / FALLBACK — the /context TOTAL header, IF it happens to be on-screen
+  # (tall pane / short dump). Only accept a captured line that matches the TOTAL header
+  # form "<used>k/<denom>k tokens (P%)" — context.parse REJECTS bare subsection lines
+  # like "File reads 51.1k (5%)" (no "/denom" → no match), so the misread trap is closed.
+  if [ -z "$usedK" ]; then
+    local content parsed
+    content=$(otmux pane.capture "$target" 32767 2>/dev/null)
+    parsed=$(private.hiveMind.context.parse "$content")
+    if [ -z "$parsed" ]; then
+      sleep 2
+      content=$(otmux pane.capture "$target" 32767 2>/dev/null)
+      parsed=$(private.hiveMind.context.parse "$content")
+    fi
+    if [ -n "$parsed" ]; then
+      IFS='|' read -r usedK pct denomK <<< "$parsed"
+      src="context"
+    fi
+  fi
+
+  # No reliable source → record NOTHING, fail loud (never a false reading).
+  if [ -z "$usedK" ] || [ -z "$pct" ] || [ -z "$denomK" ]; then
+    error.log "context.gather: no reliable reading for '$agent' (JSONL unreadable + /context total not captured) — recorded nothing"
     echo "${agent}: parse-fail"
     return 1
   fi
 
-  local usedK pct denomK
-  IFS='|' read -r usedK pct denomK <<< "$parsed"
   hiveMind.context.record "$agent" "$usedK" "$pct" "$denomK" >/dev/null || return 1
   local win; win=$([ "$denomK" -ge 1000 ] 2>/dev/null && echo "1M" || echo "${denomK}k")
-  echo "${agent}: ${pct}% (${usedK}k/${win})"
+  echo "${agent}: ${pct}% (${usedK}k/${win}) [${src}]"
 }
 hiveMind.context.gather.completion.agent() { private.hiveMind.roles.complete 2>/dev/null; }
 
