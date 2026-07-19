@@ -7480,6 +7480,75 @@ private.hiveMind.context.age() { # <tsIso> # echo "<compactAge>|<ageSeconds>" (e
   echo "${str}|${age}"
 }
 
+# Resolve the pane's LIVE usage-bearing JSONL — drift-proof. WHY: fork/bridge sessions
+# launch with `--resume <A> --fork-session`; the live session writes a NEW uuid <B>≠<A>,
+# and worse, in the bridge-session format the LAUNCH file keeps being written with
+# system/user/bridge-session/custom-title records while the assistant USAGE turns sit
+# hundreds of lines back OR in the bridged file. A bare `session.id → ${sid}.jsonl`
+# lookup + `tail -60` therefore MISSES the usage entirely (measured: robbin-skill-expert
+# last usage at line 4337 of 4548; architect/planner likewise). Resolution order:
+#   1. session.current (customTitle/agent-name match — drift-proof) → its jsonl IF it has usage.
+#   2. session.id (launch uuid) jsonl IF it has usage.
+#   3. Among ALL jsonl carrying this pane's agentName, the one with the NEWEST assistant
+#      usage record (mtime-independent — a metadata-only newer file can't win).
+# Echoes the jsonl PATH (guaranteed to contain ≥1 assistant usage), or empty+rc1.
+private.hiveMind.context.live.jsonl() { # <pane> # echo path to the live usage-bearing jsonl, or empty
+  local target="${1:-}"
+  [ -z "$target" ] && return 1
+  local projd="$HOME/.claude/projects" dir f
+
+  # helper: does file f contain at least one assistant usage record? (whole-file scan)
+  local hasUsage='
+import sys
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        if "\"type\":\"assistant\"" in line and "\"input_tokens\"" in line:
+            print("1"); break
+'
+  local cand
+  # 1. session.current (drift-proof), 2. session.id (launch) — try each; accept if it has usage.
+  for cand in \
+    "$("$OOSH_DIR/claudeCode" session.current "$target" 2>/dev/null)" \
+    "$("$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null)"; do
+    [ -z "$cand" ] && continue
+    for dir in "$projd"/*/; do
+      f="${dir}${cand}.jsonl"
+      if [ -f "$f" ] && [ -n "$(python3 -c "$hasUsage" "$f" 2>/dev/null)" ]; then
+        echo "$f"; return 0
+      fi
+    done
+  done
+
+  # 3. Fallback — among jsonl carrying this pane's agentName AND containing usage, pick
+  #    the NEWEST-mtime one (a metadata-only newer file is skipped: usage is required).
+  local role
+  role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+  if [ -n "$role" ]; then
+    local best
+    best=$(grep -lF "\"agentName\":\"${role}@" "$projd"/*/*.jsonl 2>/dev/null \
+      | python3 -c "
+import sys, os
+best=None; best_ts=-1.0
+for path in sys.stdin:
+    path=path.strip()
+    if not path: continue
+    has=False
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if '\"type\":\"assistant\"' in line and '\"input_tokens\"' in line:
+                    has=True; break
+        if has:
+            m=os.path.getmtime(path)
+            if m>best_ts: best_ts=m; best=path
+    except: pass
+if best: print(best)
+" 2>/dev/null)
+    [ -n "$best" ] && { echo "$best"; return 0; }
+  fi
+  return 1
+}
+
 # Derive the REAL window (denom in thousands): 1000 (1M) vs 200 (base). Three signals,
 # most-reliable first (a session's live sid can DRIFT from its launch --resume UUID after
 # fork/compact, so a bare sid==ps-args match is NOT enough — measured on robbin-skill-expert
@@ -7493,11 +7562,18 @@ private.hiveMind.context.denom.for.target() { # <pane> # echo 1000 or 200
   local target="${1:-}"
   [ -z "$target" ] && { echo "200"; return 0; }
 
-  # 1. Pane-tree claude process with a [1m] model arg (survives sid drift).
+  # 1. Pane-tree claude process with a [1m] model arg (survives sid drift). The claude
+  #    process is a DESCENDANT of pane_pid (not always a direct child), so walk the tree.
   local panePid
-  panePid=$(otmux display "$target" '#{pane_pid}' 2>/dev/null)
+  panePid=$(otmux pane.get "$target" '#{pane_pid}' 2>/dev/null)
   if [ -n "$panePid" ]; then
-    if ps -eo ppid=,args= 2>/dev/null | awk -v r="$panePid" '$1==r' | grep -q '\[1m\]'; then
+    if ps -eo pid=,ppid=,args= 2>/dev/null | awk -v root="$panePid" '
+      { line[$1]=$0; par[$1]=$2 }
+      END {
+        q[0]=root; n=1
+        for (i=0;i<n;i++) for (p in par) if (par[p]==q[i]) q[n++]=p
+        for (i=0;i<n;i++) if (line[q[i]] ~ /claude/ && line[q[i]] ~ /\[1m\]/) { print "1m"; exit }
+      }' | grep -q '1m'; then
       echo "1000"; return 0
     fi
   fi
@@ -7510,31 +7586,29 @@ private.hiveMind.context.denom.for.target() { # <pane> # echo 1000 or 200
     echo "1000"; return 0
   fi
 
-  # 3. Observed-max from JSONL: any usage > 200k ⇒ must be 1M.
-  if [ -n "$sid" ]; then
-    local dir jsonl=""
-    for dir in "$HOME/.claude/projects"/*/; do
-      [ -f "${dir}${sid}.jsonl" ] && jsonl="${dir}${sid}.jsonl" && break
-    done
-    if [ -n "$jsonl" ]; then
-      local obs
-      obs=$(tail -200 "$jsonl" 2>/dev/null | python3 -c "
+  # 3. Observed-max from the LIVE usage-bearing JSONL (drift-proof resolver, WHOLE-file
+  #    scan): any usage > 200k ⇒ must be 1M. This also covers sid-drift/bridge cases.
+  local jsonl
+  jsonl=$(private.hiveMind.context.live.jsonl "$target" 2>/dev/null)
+  if [ -n "$jsonl" ]; then
+    local obs
+    obs=$(python3 -c "
 import sys, json
 m=0
-for line in sys.stdin:
-    try:
-        d=json.loads(line)
-        if d.get('type')=='assistant':
-            u=d.get('message',{}).get('usage',{})
-            if u and 'input_tokens' in u:
-                t=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
-                if t>m: m=t
-    except: pass
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        try:
+            d=json.loads(line)
+            if d.get('type')=='assistant':
+                u=d.get('message',{}).get('usage',{})
+                if u and 'input_tokens' in u:
+                    t=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
+                    if t>m: m=t
+        except: pass
 print(m)
-" 2>/dev/null)
-      if [ -n "$obs" ] && [ "$obs" -gt 200000 ] 2>/dev/null; then
-        echo "1000"; return 0
-      fi
+" "$jsonl" 2>/dev/null)
+    if [ -n "$obs" ] && [ "$obs" -gt 200000 ] 2>/dev/null; then
+      echo "1000"; return 0
     fi
   fi
 
@@ -7583,28 +7657,28 @@ private.hiveMind.context.parse() { # <captured-content> # echo used_k|pct|denom_
 private.hiveMind.context.from.jsonl.reading() { # <pane> # echo used_k|pct|denom_k from JSONL total + honest denom
   local target="${1:-}"
   [ -z "$target" ] && return 1
-  local sid dir jsonl=""
-  sid=$("$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null)
-  [ -z "$sid" ] && return 1
-  for dir in "$HOME/.claude/projects"/*/; do
-    [ -f "${dir}${sid}.jsonl" ] && jsonl="${dir}${sid}.jsonl" && break
-  done
+  # Drift-proof: resolve the LIVE usage-bearing jsonl (handles fork/bridge uuid drift AND
+  # the metadata-flooded tail where the last usage is far from EOF — session.id+tail miss it).
+  local jsonl
+  jsonl=$(private.hiveMind.context.live.jsonl "$target" 2>/dev/null)
   [ -z "$jsonl" ] && return 1
   local denomK
   denomK=$(private.hiveMind.context.denom.for.target "$target")   # 1000 or 200 (honest)
-  # exact total tokens from the last assistant usage (input + cache_create + cache_read)
+  # WHOLE-file scan for the LAST assistant usage (bridge/system/user records flood the tail;
+  # the usage can sit hundreds of lines back — a tail window drops it → false parse-fail).
   local out
-  out=$(tail -60 "$jsonl" 2>/dev/null | DENOM_K="$denomK" python3 -c "
+  out=$(DENOM_K="$denomK" python3 -c "
 import sys, json, os
 denomK=int(os.environ.get('DENOM_K','200'))
 last=None
-for line in sys.stdin:
-    try:
-        d=json.loads(line)
-        if d.get('type')=='assistant':
-            u=d.get('message',{}).get('usage',{})
-            if u and 'input_tokens' in u: last=u
-    except: pass
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        try:
+            d=json.loads(line)
+            if d.get('type')=='assistant':
+                u=d.get('message',{}).get('usage',{})
+                if u and 'input_tokens' in u: last=u
+        except: pass
 if not last:
     sys.exit(1)
 tot=last['input_tokens']+last.get('cache_creation_input_tokens',0)+last.get('cache_read_input_tokens',0)
@@ -7614,7 +7688,7 @@ pct=round(tot/denom*100)
 if pct<0: pct=0
 if pct>100: pct=100          # clamp display (over-window = compacting imminent)
 print('%d|%d|%d' % (usedK,pct,denomK))
-" 2>/dev/null)
+" "$jsonl" 2>/dev/null)
   [ -z "$out" ] && return 1
   echo "$out"
 }
