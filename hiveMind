@@ -36,6 +36,12 @@
 : ${HIVEMIND_ACTIVE_TEAM_FILE:=${CONFIG_PATH:-$HOME/config}/hivemind.active.team}
 : ${HIVEMIND_SNAPSHOTS:=${CONFIG_PATH:-$HOME/config}/hivemind.snapshots.env}
 : ${HIVEMIND_SNAPSHOT_VERSION:=1}
+# context store : ~/config/hivemind.context.env  per-agent MEASURED /context readings
+#                 format: role@host|used_k|pct|denom_k|ts_iso  (keyed role@host — fleet-safe)
+#                 pct is the REAL /context used-% with its REAL denom (1M vs 200k) — never a
+#                 live re-derived guess. Display = this recorded reading + its age (§ context.*).
+: ${HIVEMIND_CONTEXT:=${CONFIG_PATH:-$HOME/config}/hivemind.context.env}
+: ${HIVEMIND_CONTEXT_STALE_SEC:=1800}   # >30m recorded reading = stale (⚠ flag)
 : ${HIVEMIND_STATE:=${CONFIG_PATH:-$HOME/config}/hivemind.state.env}
 : ${HIVEMIND_QUEUE_DIR:=${CONFIG_PATH:-$HOME/config}/hivemind.queue}
 : ${HIVEMIND_QUEUE_MAX_DEPTH:=50}
@@ -6798,44 +6804,27 @@ hiveMind.agent.context.status() # <agentName> <?session> # show context % for on
   # Full scrollback — use large line count for complete /context output
   ctx_output=$(otmux pane.capture "$target" 32767 2>/dev/null)
 
-  # Parse token line
-  local token_line pct tokens
-  token_line=$(echo "$ctx_output" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr '\n' ' ' | grep -oE '[0-9]+k/[0-9]+k tokens \([0-9]+%\)' | tail -1)
-
-  if [ -n "$token_line" ]; then
-    pct=$(echo "$token_line" | grep -oE '\([0-9]+%\)' | grep -oE '[0-9]+')
-    tokens=$(echo "$token_line" | grep -oE '[0-9]+k/[0-9]+k')
-  else
-    local clean fallback_line
-    clean=$(echo "$ctx_output" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
-    fallback_line=$(echo "$clean" | grep -iE 'token|context' | grep -E '[0-9]+%' | head -1)
-    pct=$(echo "$fallback_line" | grep -oE '[0-9]+%' | grep -oE '[0-9]+' | head -1)
-    if echo "$fallback_line" | grep -qi 'remaining'; then
-      local pct_is_remaining="yes"
-    fi
-    tokens="—"
-  fi
-
-  if [ -z "$pct" ]; then
+  # THE ONE parse point (DRY) — extracts used_k|pct|denom_k with the REAL denom.
+  local parsed usedK pct denomK
+  parsed=$(private.hiveMind.context.parse "$ctx_output")
+  if [ -z "$parsed" ]; then
+    # parse fail → record NOTHING (no false reading), fail loud
     printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "?" "parse-fail" "UNKNOWN"
     return 1
   fi
+  IFS='|' read -r usedK pct denomK <<< "$parsed"
 
-  local remaining
-  if [ "${pct_is_remaining:-}" = "yes" ]; then
-    remaining=$pct
-  else
-    remaining=$((100 - pct))
-  fi
+  # RECORD the measured reading (honest denom straight from the readout)
+  hiveMind.context.record "$agent" "$usedK" "$pct" "$denomK" >/dev/null 2>&1
 
-  local threshold="OK"
-  if [ "$remaining" -lt 25 ]; then
-    threshold="DANGER"
-  elif [ "$remaining" -lt 35 ]; then
-    threshold="CRITICAL"
-  elif [ "$remaining" -lt 50 ]; then
-    threshold="WARN"
-  fi
+  local win tokens remaining threshold
+  win=$([ "$denomK" -ge 1000 ] 2>/dev/null && echo "1M" || echo "${denomK}k")
+  tokens="${usedK}k/${win}"
+  remaining=$(( 100 - pct ))     # pct is USED-% (from /context) → remaining
+  threshold="OK"
+  if   [ "$remaining" -lt 25 ]; then threshold="DANGER"
+  elif [ "$remaining" -lt 35 ]; then threshold="CRITICAL"
+  elif [ "$remaining" -lt 50 ]; then threshold="WARN"; fi
 
   printf "%-20s %-8s %-6s %-12s %s\n" "$agent" "$pane_short" "${remaining}%" "$tokens" "$threshold"
 }
@@ -7031,43 +7020,24 @@ hiveMind.team.context.status() # <?session> # show context % for all registered 
     # ~400+ lines above bottom. Use large line count for full capture.
     ctx_output=$(otmux pane.capture "$target" 32767 2>/dev/null)
 
-    # Parse token line: "claude-opus-4-6 · 79k/200k tokens (40%)"
-    # Use tail -1 to get the MOST RECENT /context result in scrollback
-    local token_line pct tokens
-    # Join lines to handle narrow pane wrapping, strip ANSI, then match
-    token_line=$(echo "$ctx_output" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | tr '\n' ' ' | grep -oE '[0-9]+k/[0-9]+k tokens \([0-9]+%\)' | tail -1)
-
-    if [ -n "$token_line" ]; then
-      pct=$(echo "$token_line" | grep -oE '\([0-9]+%\)' | grep -oE '[0-9]+')
-      tokens=$(echo "$token_line" | grep -oE '[0-9]+k/[0-9]+k')
-    else
-      # Fallback: look for any percentage near "tokens" or "context"
-      local clean fallback_line
-      clean=$(echo "$ctx_output" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
-      fallback_line=$(echo "$clean" | grep -iE 'token|context' | grep -E '[0-9]+%' | head -1)
-      pct=$(echo "$fallback_line" | grep -oE '[0-9]+%' | grep -oE '[0-9]+' | head -1)
-      # If "remaining" keyword found, pct IS the remaining — flag to skip inversion later
-      if echo "$fallback_line" | grep -qi 'remaining'; then
-        local pct_is_remaining="yes"
-      fi
-      tokens="—"
-    fi
-
-    if [ -z "$pct" ]; then
+    # THE ONE parse point (DRY) — used_k|pct|denom_k with the REAL denom from readout.
+    local parsed pct usedK denomK tokens
+    parsed=$(private.hiveMind.context.parse "$ctx_output")
+    if [ -z "$parsed" ]; then
+      # parse fail → record NOTHING (no false reading), fail loud
       printf "%-20s %-8s %-6s %-12s %s\n" "$role" "$pane_short" "?" "parse-fail" "UNKNOWN"
       alerts="${alerts}  ${role}: context parse failed\n"
       continue
     fi
+    IFS='|' read -r usedK pct denomK <<< "$parsed"
 
-    # Calculate remaining % (TUI shows usage%, we want remaining)
-    # /context shows usage: "79k/200k tokens (40%)" means 40% used, 60% remaining
-    # If fallback detected "remaining" keyword, pct is already the remaining value
-    local remaining
-    if [ "${pct_is_remaining:-}" = "yes" ]; then
-      remaining=$pct
-    else
-      remaining=$((100 - pct))
-    fi
+    # RECORD the measured reading (honest denom straight from the readout)
+    hiveMind.context.record "$role" "$usedK" "$pct" "$denomK" >/dev/null 2>&1
+
+    local win; win=$([ "$denomK" -ge 1000 ] 2>/dev/null && echo "1M" || echo "${denomK}k")
+    tokens="${usedK}k/${win}"
+    # pct is USED-% (from /context) → remaining = 100 − used
+    local remaining=$(( 100 - pct ))
 
     # Threshold assessment
     local threshold="OK"
@@ -7429,6 +7399,279 @@ hiveMind.team.list() # # list every LIVE team session (View reads live, not the 
   done <<< "$live_sessions"
   return 0
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTEXT TRACKING — reliable per-agent /context readings (RECORD / GET / GATHER)
+# Storage: $HIVEMIND_CONTEXT (role@host|used_k|pct|denom_k|ts_iso)
+#
+# WHY: the OLD team.sweep ctx% was a LIVE re-derived guess (claudeCode context.read
+# → context.from.jsonl ÷ a GUESSED 1M-vs-200k denominator). Wrong denominator =
+# the 858%/5%/73% garbage. This module instead STORES the REAL measured /context
+# reading (used_k, used-%, real denom parsed from the readout, UTC ts) and DISPLAYS
+# that recorded reading + its age. MEASURE-SOURCE-NOT-COPY: display never recomputes.
+#
+# KEY = role@host (fleet-safe: many teams share roles like product-owner; matches the
+# Option-C role@host identity convention). Lookup falls back to bare-role (like resolve).
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.context.ensure.dir() {
+  mkdir -p "$(dirname "$HIVEMIND_CONTEXT")" 2>/dev/null
+}
+
+# role → role@host key. If the caller already passed role@host, keep it. Bare role
+# gets tagged with HIVEMIND_HOST (the local convention). This is the WRITE key.
+private.hiveMind.context.key() { # <role> # echo canonical role@host storage key
+  local role="$1"
+  [ -z "$role" ] && return 1
+  case "$role" in
+    *@*) echo "$role" ;;
+    *)   echo "${role}@${HIVEMIND_HOST:-$(hostname -s 2>/dev/null)}" ;;
+  esac
+}
+
+private.hiveMind.context.set() { # <roleKey> <usedK> <pct> <denomK> <tsIso> # upsert one reading
+  local key="$1" usedK="$2" pct="$3" denomK="$4" ts="$5"
+  [ -z "$key" ] && { error.log "context.set: missing role key"; return 1; }
+  private.hiveMind.context.ensure.dir
+  if [ -f "$HIVEMIND_CONTEXT" ]; then
+    grep -v "^${key}|" "$HIVEMIND_CONTEXT" > "${HIVEMIND_CONTEXT}.tmp" 2>/dev/null
+    mv "${HIVEMIND_CONTEXT}.tmp" "$HIVEMIND_CONTEXT"
+  fi
+  echo "${key}|${usedK}|${pct}|${denomK}|${ts}" >> "$HIVEMIND_CONTEXT"
+}
+
+# Lookup a stored reading. Tries the exact role@host key first, then bare-role
+# fallback (matches ANY host row for that role) — like hiveMind.resolve's fallback.
+# Echoes: used_k|pct|denom_k|ts_iso   (empty + rc1 when nothing recorded)
+private.hiveMind.context.get() { # <role> # echo used_k|pct|denom_k|ts_iso or empty
+  local role="$1"
+  [ -z "$role" ] && return 1
+  [ -f "$HIVEMIND_CONTEXT" ] || return 1
+  local key line
+  key=$(private.hiveMind.context.key "$role")
+  # 1. exact role@host
+  line=$(grep "^${key}|" "$HIVEMIND_CONTEXT" 2>/dev/null | tail -1)
+  # 2. bare-role fallback — first row whose key starts "role@" (or exactly role)
+  if [ -z "$line" ]; then
+    local bare="${role%@*}"
+    line=$(grep -E "^${bare}(@[^|]*)?\|" "$HIVEMIND_CONTEXT" 2>/dev/null | tail -1)
+  fi
+  [ -z "$line" ] && return 1
+  echo "$line" | cut -d'|' -f2-
+}
+
+# now − tsIso → "compactAge|ageSeconds" on ONE line (subshell-safe — a $()-captured
+# caller splits the two; a global RESULT would be lost across the subshell boundary).
+# Compact age = Nm / Nh / Nd. Cross-platform ISO→epoch (the date -d || date -j pair used
+# elsewhere for snapshot parsing). Unparseable ts → "?|" and rc1.
+private.hiveMind.context.age() { # <tsIso> # echo "<compactAge>|<ageSeconds>" (e.g. "3m|182"); rc1 on bad ts
+  local ts="${1:-}"
+  [ -z "$ts" ] && { echo "?|"; return 1; }
+  local epoch now age
+  epoch=$(date -u -d "$ts" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null)
+  [ -z "$epoch" ] && { echo "?|"; return 1; }
+  now=$(date -u +%s 2>/dev/null)
+  age=$(( now - epoch ))
+  [ "$age" -lt 0 ] && age=0
+  local str
+  if   [ "$age" -lt 3600 ];  then str="$(( age / 60 ))m"
+  elif [ "$age" -lt 86400 ]; then str="$(( age / 3600 ))h"
+  else                            str="$(( age / 86400 ))d"; fi
+  echo "${str}|${age}"
+}
+
+# Derive the REAL window (denom in thousands) for an agent when the caller omits it:
+# 1000 (1M) if the agent's live session runs [1m], else 200 (base). Honest fallback:
+# undeterminable → 200 (base), logged. NEVER an invented denominator.
+private.hiveMind.context.denom.for.target() { # <pane> # echo 1000 or 200
+  local target="$1"
+  local sid
+  sid=$("$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null)
+  if [ -n "$sid" ] && ps -eo args= 2>/dev/null | grep -F "$sid" | grep -q '\[1m\]'; then
+    echo "1000"; return 0
+  fi
+  echo "200"
+}
+
+# THE ONE /context parse point (DRY — collapses the two old duplicate parse blocks in
+# agent.context.status and team.context.status). Reads a captured pane buffer, extracts
+# the REAL token line "<used>k/<denom>k tokens (NN%)". The denom comes FROM THE READOUT
+# (1000k=1M vs 200k) — no ps-args guess. Echoes: used_k|pct|denom_k  (empty + rc1 = parse fail).
+private.hiveMind.context.parse() { # <captured-content> # echo used_k|pct|denom_k or empty
+  local content="${1:-}"
+  local clean line usedK="" denomK="" pct=""
+  # strip ANSI, flatten to one line, grab the MOST RECENT token line (tail -1)
+  clean=$(printf '%s' "$content" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+  line=$(printf '%s' "$clean" | tr '\n' ' ' | grep -oE '[0-9]+k/[0-9]+k tokens \([0-9]+%\)' | tail -1)
+  if [ -n "$line" ]; then
+    usedK=$(echo "$line"  | grep -oE '^[0-9]+k'        | grep -oE '[0-9]+')
+    denomK=$(echo "$line" | grep -oE '/[0-9]+k tokens' | grep -oE '[0-9]+')
+    pct=$(echo "$line"    | grep -oE '\([0-9]+%\)'     | grep -oE '[0-9]+')
+  fi
+  # secondary: bare "N/1M tokens" or "N/200k" header form (scroll-out fallback)
+  if [ -z "$pct" ]; then
+    local hdr
+    hdr=$(printf '%s' "$clean" | tr '\n' ' ' | grep -oE '[0-9]+k?/(1M|1000k|200k) tokens \([0-9]+%\)' | tail -1)
+    if [ -n "$hdr" ]; then
+      usedK=$(echo "$hdr" | grep -oE '^[0-9]+' )
+      pct=$(echo "$hdr"   | grep -oE '\([0-9]+%\)' | grep -oE '[0-9]+')
+      case "$hdr" in *1M*|*1000k*) denomK=1000 ;; *200k*) denomK=200 ;; esac
+    fi
+  fi
+  [ -z "$usedK" ] || [ -z "$pct" ] || [ -z "$denomK" ] && return 1
+  echo "${usedK}|${pct}|${denomK}"
+}
+
+# ── Unit A — RECORD ──────────────────────────────────────────────────────────
+hiveMind.context.record() # <agent> <usedK> <pct> [<denomK>] # store a MEASURED context reading (unknown agent → fail loud; non-numeric → reject)
+{
+  local agent="${1:-}" usedK="${2:-}" pct="${3:-}" denomK="${4:-}"
+  [ -z "$agent" ] && { error.log "Usage: hiveMind context.record <agent> <usedK> <pct> [<denomK>]"; return 1; }
+
+  # Resolve agent → pane target (unknown agent → fail loud)
+  local target
+  target=$(hiveMind.resolve "$agent" 2>/dev/null)
+  if [ -z "$target" ]; then
+    error.log "context.record: unknown agent '$agent' (not resolvable to a pane)"
+    return 1
+  fi
+
+  # Reject non-numeric used_k / pct (fail loud)
+  if ! [[ "$usedK" =~ ^[0-9]+$ ]]; then
+    error.log "context.record: usedK '$usedK' is not a non-negative integer — rejected"
+    return 1
+  fi
+  if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -gt 100 ] 2>/dev/null; then
+    error.log "context.record: pct '$pct' is not an integer 0-100 — rejected"
+    return 1
+  fi
+
+  # denomK optional → derive real window honestly (never invent)
+  if [ -z "$denomK" ]; then
+    denomK=$(private.hiveMind.context.denom.for.target "$target")
+    info.log "context.record: denom not given; derived real window ${denomK}k for '$agent'"
+  elif ! [[ "$denomK" =~ ^[0-9]+$ ]] || [ "$denomK" -le 0 ] 2>/dev/null; then
+    error.log "context.record: denomK '$denomK' is not a positive integer — rejected"
+    return 1
+  fi
+
+  # role@host key (prefer the live resolved role; fall back to the passed name)
+  local role
+  role=$(private.hiveMind.registry.get "$target" 2>/dev/null); [ -z "$role" ] && role="$agent"
+  local key ts
+  key=$(private.hiveMind.context.key "$role")
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  private.hiveMind.context.set "$key" "$usedK" "$pct" "$denomK" "$ts" || return 1
+  success.log "context: ${key} → ${pct}% (${usedK}k/${denomK}k) @ ${ts}"
+}
+hiveMind.context.record.completion.agent() { private.hiveMind.roles.complete 2>/dev/null; }
+
+# ── Unit A — GET ─────────────────────────────────────────────────────────────
+hiveMind.context.get() # <agent> # return last-recorded context reading (unknown agent / no record → fail loud rc1)
+{
+  local agent="${1:-}"
+  [ -z "$agent" ] && { error.log "Usage: hiveMind context.get <agent>"; return 1; }
+
+  # Resolve → role for the key (unknown agent → fail loud). Fall back to bare name so
+  # a recorded-but-now-offline agent is still readable.
+  local target role=""
+  target=$(hiveMind.resolve "$agent" 2>/dev/null)
+  if [ -n "$target" ]; then
+    role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+  fi
+  [ -z "$role" ] && role="$agent"
+
+  local rec
+  rec=$(private.hiveMind.context.get "$role")
+  if [ -z "$rec" ]; then
+    error.log "context.get: no recorded reading for '$agent' (never gathered — not fabricating)"
+    return 1
+  fi
+  echo "$rec"
+}
+hiveMind.context.get.completion.agent() { private.hiveMind.roles.complete 2>/dev/null; }
+
+# ── Unit C — GATHER (one agent) ──────────────────────────────────────────────
+# THE ONLY method that touches a pane / sends keystrokes. Idle-gated. On parse
+# failure it records NOTHING (fail loud) — never a false reading.
+hiveMind.context.gather() # <agent> # send /context to an IDLE agent, parse the real reading, record it (skips active)
+{
+  local agent="${1:-}"
+  [ -z "$agent" ] && { error.log "Usage: hiveMind context.gather <agent>"; return 1; }
+
+  local target
+  target=$(hiveMind.resolve "$agent" 2>/dev/null)
+  if [ -z "$target" ]; then
+    error.log "context.gather: unknown agent '$agent'"
+    return 1
+  fi
+
+  # Never poke SELF or the Tron pane
+  local self_pane
+  self_pane=$("otmux" pane.get.target 2>/dev/null)
+  if [ "$target" = "$self_pane" ]; then
+    echo "${agent}: skipped: self"; return 0
+  fi
+  case "$target" in *.4) echo "${agent}: skipped: tron"; return 0 ;; esac
+
+  # IDLE GATE — only idle panes get /context (shared detector, DRY)
+  local activity
+  activity=$(private.hiveMind.pane.activity "$target" 2>/dev/null)
+  if [ "$activity" != "idle" ]; then
+    echo "${agent}: skipped: active"
+    return 0
+  fi
+
+  # Send /context (double-submit: accept autocomplete, then submit)
+  "otmux" send.enter "$target" "/context"
+  sleep 0.3
+  "otmux" send.raw "$target" Enter
+  sleep 5
+
+  local content parsed
+  content=$(otmux pane.capture "$target" 32767 2>/dev/null)
+  parsed=$(private.hiveMind.context.parse "$content")
+
+  # Retry once on scroll-out (re-capture after a longer settle)
+  if [ -z "$parsed" ]; then
+    sleep 2
+    content=$(otmux pane.capture "$target" 32767 2>/dev/null)
+    parsed=$(private.hiveMind.context.parse "$content")
+  fi
+
+  # Parse failure → record NOTHING, fail loud
+  if [ -z "$parsed" ]; then
+    error.log "context.gather: parse failed for '$agent' — recorded nothing (no false reading)"
+    echo "${agent}: parse-fail"
+    return 1
+  fi
+
+  local usedK pct denomK
+  IFS='|' read -r usedK pct denomK <<< "$parsed"
+  hiveMind.context.record "$agent" "$usedK" "$pct" "$denomK" >/dev/null || return 1
+  local win; win=$([ "$denomK" -ge 1000 ] 2>/dev/null && echo "1M" || echo "${denomK}k")
+  echo "${agent}: ${pct}% (${usedK}k/${win})"
+}
+hiveMind.context.gather.completion.agent() { private.hiveMind.roles.complete 2>/dev/null; }
+
+# ── Unit C — GATHER (all idle agents in a team, SERIAL) ──────────────────────
+hiveMind.context.gather.all() # <?session> # gather /context from every IDLE agent in a team (serial; skips active)
+{
+  local session="${1:-$(private.hiveMind.active.team)}"
+  local rows
+  rows=$(private.hiveMind.live.tupleset "$session" 2>/dev/null)
+  if [ -z "$rows" ]; then
+    error.log "context.gather.all: no live agents$([ -n "$session" ] && echo " for '$session'")"
+    return 1
+  fi
+  # SERIAL — one agent at a time (parallel /context races corrupt captures)
+  printf '%s\n' "$rows" | awk -F'|' '$7=="agent" && $5!="" && $5!="unknown"{print $5}' | while IFS= read -r role; do
+    [ -z "$role" ] && continue
+    hiveMind.context.gather "$role"
+  done
+}
+hiveMind.context.gather.all.completion.session() { private.hiveMind.teams.complete 2>/dev/null; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT SNAPSHOTS — golden fork-source per role for re-forking trained agents
@@ -7942,14 +8185,25 @@ hiveMind.team.sweep() # <?session> <?interval> # FLEET dashboard: no-arg = ALL a
       local paneRoot bg
       paneRoot=$(printf '%s\n' "$panePidMap" | awk -F'|' -v t="$target" '$1==t{print $2; exit}')
       bg=$(private.hiveMind.sweep.bgshells "$paneRoot" "$psSnap")
-      local ctx ctxStr="" cliff
-      cliff=$'\xe2\x9a\xa0'   # ⚠ real UTF-8 bytes (ANSI-C quote — a %s-printed var won't interpret \x)
-      ctx=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
-      ctx="${ctx%.*}"   # context.read returns a DECIMAL (e.g. 53.1); int-ise for the -le/-ge cliff compares (non-numeric like no-claude/unknown → guard below rejects)
-      if [ -n "$ctx" ] && [ "$ctx" -ge 0 ] 2>/dev/null; then
-        if   [ "$ctx" -le 20 ] 2>/dev/null; then ctxStr="${RED}ctx ${ctx}% ${cliff}${NORMAL}"
-        elif [ "$ctx" -le 40 ] 2>/dev/null; then ctxStr="${BOLD_YELLOW}ctx ${ctx}%${NORMAL}"
-        else                                       ctxStr="${GRAY}ctx ${ctx}%${NORMAL}"; fi
+      # CONTEXT: show the LAST-RECORDED /context reading + its age (NOT a live
+      # re-derived guess — that was the 858%/5% garbage). Semantics = USED-% (matches
+      # /context). No recording → "— never" (never a fabricated %). >30m → ⚠ stale.
+      local ctxStr="" cliff rec
+      cliff=$'\xe2\x9a\xa0'   # ⚠ real UTF-8 bytes (ANSI-C quote)
+      rec=$(private.hiveMind.context.get "$role" 2>/dev/null)
+      if [ -z "$rec" ]; then
+        ctxStr="${GRAY}— never${NORMAL}"
+      else
+        local uK pct dK ts agePair age ageSec win col stale
+        IFS='|' read -r uK pct dK ts <<< "$rec"
+        agePair=$(private.hiveMind.context.age "$ts"); age="${agePair%%|*}"; ageSec="${agePair#*|}"
+        win=$([ "${dK:-0}" -ge 1000 ] 2>/dev/null && echo "1M" || echo "${dK}k")
+        stale=""
+        if   [ -n "$ageSec" ] && [ "$ageSec" -gt "${HIVEMIND_CONTEXT_STALE_SEC:-1800}" ] 2>/dev/null; then col="${BOLD_YELLOW}"; stale="$cliff"
+        elif [ "${pct:-0}" -ge 80 ] 2>/dev/null; then col="${RED}"
+        elif [ "${pct:-0}" -ge 60 ] 2>/dev/null; then col="${BOLD_YELLOW}"
+        else                                           col="${GRAY}"; fi
+        ctxStr="${col}${stale}${pct}% (${uK}k/${win}) ${age}${NORMAL}"
       fi
       local state details
       if [ "$target" = "$own_target" ]; then
