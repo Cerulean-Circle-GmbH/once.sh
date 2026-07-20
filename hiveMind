@@ -46,6 +46,10 @@
 : ${HIVEMIND_QUEUE_DIR:=${CONFIG_PATH:-$HOME/config}/hivemind.queue}
 : ${HIVEMIND_QUEUE_MAX_DEPTH:=50}
 : ${HIVEMIND_QUEUE_MAX_AGE_SEC:=3600}
+: ${HIVEMIND_CTXREFRESH_DIR:=${CONFIG_PATH:-$HOME/config}/hivemind.ctxrefresh}  # per-agent last-refresh state
+: ${HIVEMIND_CTX_REFRESH_SEC:=300}       # recorded reading older than this → auto-refresh eligible
+: ${HIVEMIND_CTX_REFRESH_PCT:=60}        # recorded pct at/above this (near-cliff) → auto-refresh eligible
+: ${HIVEMIND_CTX_REFRESH_MIN_SEC:=300}   # min seconds between auto-refreshes of the SAME agent (no per-tick churn)
 
 # Naming convention (sprint-1-state-correctness/naming-migration-design.md):
 #   Option C (unified — TRON directive 2026-05-24): role@HIVEMIND_HOST EVERYWHERE.
@@ -10439,7 +10443,146 @@ hiveMind.path.fix() # # verify OOSH PATH works, scan SKILL.md files for stale ex
   return "$issues"
 }
 
-hiveMind.pane.sweep.loop() # <?seconds:30> # continuous sweep + unblock all sessions at interval
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTEXT AUTO-REFRESH (unit D) — keep sweep's ctx% FRESH so the 80%-rewind trigger
+# is never blinded by a stale recorded reading. Wires context.gather (idle-gated,
+# fail-loud) into pane.sweep.loop for IDLE agents whose recorded reading is STALE
+# (age > HIVEMIND_CTX_REFRESH_SEC) OR near-cliff (pct >= HIVEMIND_CTX_REFRESH_PCT).
+# BOUNDED per-agent (own ctxrefresh.state — parallel to, not dependent on, renudge)
+# so a ~30s sweep tick never re-gathers the same agent — NO per-tick /context churn.
+# SERIAL like gather.all. FAIL-SAFE: gather records NOTHING on parse/ghost fail and
+# context.record refuses 0/impossible → a bad refresh KEEPS the prior reading, never
+# zeroes it. Highest-pct-then-stalest first.
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.hiveMind.ctxrefresh.statefile() { # <agent> # per-agent last-refresh state path (sanitize non-word → _)
+  local agent="$1"; [ -z "$agent" ] && return 1
+  local safe="${agent//[^A-Za-z0-9_.-]/_}"
+  echo "${HIVEMIND_CTXREFRESH_DIR}/${safe}.last"
+}
+
+private.hiveMind.ctxrefresh.due() { # <agent> # rc0 if backoff window elapsed (or never refreshed), rc1 if too soon
+  local agent="$1" f now last
+  f=$(private.hiveMind.ctxrefresh.statefile "$agent")
+  [ -f "$f" ] || return 0                       # never refreshed → due
+  now=$(date +%s); last=$(cat "$f" 2>/dev/null); last="${last:-0}"
+  [ $(( now - last )) -ge "$HIVEMIND_CTX_REFRESH_MIN_SEC" ]
+}
+
+private.hiveMind.ctxrefresh.mark() { # <agent> # stamp now as last-refresh (bounds the next tick)
+  local f; f=$(private.hiveMind.ctxrefresh.statefile "$1")
+  mkdir -p "$(dirname "$f")" 2>/dev/null
+  date +%s > "$f"
+}
+
+# Decide + (in apply mode) refresh ONE agent. Echoes "prio|verdict|agent|why" so the
+# caller can sort by prio (higher = more urgent) and log. Does NOT itself idle-gate the
+# SEND — context.gather does (and skips active); we only PRE-FILTER on the recorded
+# reading to avoid gathering agents that don't need it.
+private.hiveMind.ctxrefresh.eval() { # <agent> <mode:dry|apply>
+  local agent="$1" mode="$2"
+
+  # Recorded reading (fail-loud rc1 if never gathered). used_k|pct|denom_k|ts_iso.
+  local rec
+  rec=$(hiveMind.context.get "$agent" 2>/dev/null) || { echo "0|skip|$agent|no-recorded-reading"; return 0; }
+  local uK pct dK ts
+  IFS='|' read -r uK pct dK ts <<< "$rec"
+  [[ "$pct" =~ ^[0-9]+$ ]] || { echo "0|skip|$agent|bad-record"; return 0; }
+
+  # Age of the recorded reading.
+  local agePair ageSec
+  agePair=$(private.hiveMind.context.age "$ts" 2>/dev/null); ageSec="${agePair#*|}"
+  [[ "$ageSec" =~ ^[0-9]+$ ]] || ageSec=999999   # unparseable ts = treat as very stale
+
+  # Eligibility: STALE or near-cliff.
+  local eligible="" why=""
+  if [ "$ageSec" -gt "$HIVEMIND_CTX_REFRESH_SEC" ]; then eligible=1; why="stale(${ageSec}s)"; fi
+  if [ "$pct" -ge "$HIVEMIND_CTX_REFRESH_PCT" ];      then eligible=1; why="${why:+$why,}pct(${pct}%)"; fi
+  [ -z "$eligible" ] && { echo "0|skip|$agent|fresh(${pct}%,${ageSec}s)"; return 0; }
+
+  # Priority = pct*10000 + min(ageSec,99999): highest-pct first, then stalest.
+  local capAge=$ageSec; [ "$capAge" -gt 99999 ] && capAge=99999
+  local prio=$(( pct * 100000 + capAge ))
+
+  # BACKOFF — bound per-agent so a 30s tick can't re-gather each pass.
+  if ! private.hiveMind.ctxrefresh.due "$agent"; then
+    echo "${prio}|backoff|$agent|$why"
+    return 0
+  fi
+
+  if [ "$mode" = "dry" ]; then
+    echo "${prio}|would-refresh|$agent|$why"
+    return 0
+  fi
+
+  # APPLY. Mark BEFORE gathering (bounds the next tick even if gather idle-skips or
+  # fails). gather idle-gates internally + is FAIL-LOUD: parse/ghost fail records
+  # nothing and record() refuses 0/impossible → the PRIOR reading is preserved.
+  private.hiveMind.ctxrefresh.mark "$agent"
+  local out rc
+  out=$(hiveMind.context.gather "$agent" 2>/dev/null); rc=$?
+  # gather returns 0 BOTH when it records a fresh reading AND when it idle-SKIPS
+  # (output "…: skipped: active", rc0). So rc alone is ambiguous — inspect the
+  # output: a genuine refresh is neither a skip nor a parse-fail.
+  if [ $rc -eq 0 ] && ! echo "$out" | grep -qiE 'skipped:|parse-fail'; then
+    info.log "ctx.refresh: $agent refreshed ($why) → $out"
+    echo "${prio}|refreshed|$agent|$why"
+  else
+    # idle-skip(active/…)/parse-fail/ghost — prior reading intact (never corrupted).
+    info.log "ctx.refresh: $agent not refreshed ($why) — ${out:-gather-declined} (prior reading kept)"
+    echo "${prio}|declined|$agent|$why"
+  fi
+  return 0
+}
+
+private.hiveMind.ctx.refresh.impl() { # <?session> <mode:dry|apply>
+  local session="$1" mode="$2"
+  local rows
+  rows=$(private.hiveMind.live.tupleset "$session" 2>/dev/null)
+  [ -z "$rows" ] && { info.log "ctx.refresh: no live agents in scope${session:+ ($session)}"; return 0; }
+
+  # AGENT roles only (skip shells/unreachable/blank). Serial evaluation, collect
+  # decisions, then process apply/would in PRIORITY order (highest pct, then stalest).
+  local roles
+  roles=$(printf '%s\n' "$rows" | awk -F'|' '$7=="agent" && $5!="" && $5!="unknown"{print $5}')
+  [ -z "$roles" ] && { info.log "ctx.refresh: no agent roles in scope"; return 0; }
+
+  # PASS 1 (dry probe of every agent) → sort by prio desc → PASS 2 refresh the
+  # eligible-and-due in order. gather is serial (parallel /context races corrupt).
+  local decisions role
+  decisions=$(while IFS= read -r role; do
+                [ -z "$role" ] && continue
+                private.hiveMind.ctxrefresh.eval "$role" dry
+              done <<< "$roles" | sort -t'|' -k1,1 -rn)
+
+  # In dry mode: report the WOULD-refresh set and STOP (no sends at all).
+  if [ "$mode" = "dry" ]; then
+    printf '%s\n' "$decisions" | awk -F'|' '$2=="would-refresh"{printf "ctx.refresh.dry: WOULD refresh %s (%s, prio=%s)\n",$3,$4,$1}'
+    local n; n=$(printf '%s\n' "$decisions" | awk -F'|' '$2=="would-refresh"' | grep -c .)
+    console.log "ctx.refresh.dry: ${n:-0} agent(s) would refresh (scope='${session:-all}')"
+    return 0
+  fi
+
+  # APPLY mode: refresh the would-refresh set in prio order, serially.
+  printf '%s\n' "$decisions" | awk -F'|' '$2=="would-refresh"{print $3}' | while IFS= read -r role; do
+    [ -z "$role" ] && continue
+    private.hiveMind.ctxrefresh.eval "$role" apply >/dev/null
+  done
+}
+
+hiveMind.ctx.refresh() # <?session> # auto-refresh ctx% for IDLE agents whose recorded reading is stale/near-cliff (bounded, serial, fail-safe). No arg=all teams.
+{
+  private.hiveMind.ctx.refresh.impl "$1" "apply"
+}
+hiveMind.ctx.refresh.completion.session() { private.hiveMind.teams.complete 2>/dev/null; }
+
+hiveMind.ctx.refresh.dry() # <?session> # report which agents ctx.refresh WOULD refresh — sends NOTHING (safety audit)
+{
+  private.hiveMind.ctx.refresh.impl "$1" "dry"
+}
+hiveMind.ctx.refresh.dry.completion.session() { private.hiveMind.teams.complete 2>/dev/null; }
+
+hiveMind.pane.sweep.loop() # <?seconds:30> # continuous sweep + unblock + ctx-refresh all sessions at interval
 {
   local interval="${1:-30}"
 
@@ -10454,6 +10597,7 @@ hiveMind.pane.sweep.loop() # <?seconds:30> # continuous sweep + unblock all sess
       while read -r session; do
         hiveMind.pane.sweep "$session"
         hiveMind.agent.unblock all "$session"
+        hiveMind.ctx.refresh "$session"
       done <<< "$teams"
     fi
     sleep "$interval"
