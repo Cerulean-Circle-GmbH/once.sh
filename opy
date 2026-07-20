@@ -107,7 +107,9 @@ private.opy.installPyenv() # # self-care: clone pyenv into PYENV_ROOT + build sh
     error.log "opy.installPyenv: $root exists and is non-empty but has no bin/pyenv — refusing to overwrite. Move it aside and re-run."
     return 1
   fi
-  command -v git >/dev/null 2>&1 || { error.log "opy.installPyenv: git is required to auto-install pyenv but was not found"; return 1; }
+  # Self-care: git is needed to clone pyenv — INSTALL it if missing (don't error out),
+  # exactly like opy.deps ensures build-essential (opy:89 self-care principle).
+  command -v git >/dev/null 2>&1 || private.opy.pkgInstall git || { error.log "opy.installPyenv: git missing and could not be installed (needed to clone pyenv)"; return 1; }
   console.log "opy: pyenv not found — auto-installing (git clone → $root)…"
   if ! git clone --depth 1 https://github.com/pyenv/pyenv "$root"; then
     error.log "opy.installPyenv: git clone of pyenv into $root failed (network / permissions?)"
@@ -223,6 +225,13 @@ opy.deps() # <?version> # check/install build headers needed to compile CPython
     toolchain="build-essential"
   fi
 
+  # pyenv's python-build DOWNLOADS the CPython source via curl / wget / aria2c — ensure one
+  # exists (self-care), else the build dies with "please install aria2c, curl or wget".
+  local downloader=""
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && ! command -v aria2c >/dev/null 2>&1; then
+    downloader="curl"
+  fi
+
   # Module-probe is valid ONLY against the TARGET version's own python (a re-check of
   # an already-built version). For a FRESH install (target not built), a DIFFERENT
   # python — system/active — having a module does NOT mean the -dev HEADER is installed
@@ -244,14 +253,14 @@ opy.deps() # <?version> # check/install build headers needed to compile CPython
     missing="$modules"
   fi
 
-  if [ -z "$missing" ] && [ -z "$toolchain" ]; then
-    console.log "opy.deps: compiler + all build modules present — nothing to install"
+  if [ -z "$missing" ] && [ -z "$toolchain" ] && [ -z "$downloader" ]; then
+    console.log "opy.deps: compiler + downloader + all build modules present — nothing to install"
     return 0
   fi
 
   # Map probed modules → Debian/Ubuntu -dev packages; prepend the toolchain (build-essential)
-  # so a bare box gets the compiler BEFORE the first CPython compile.
-  local pkgs="$toolchain" mod
+  # + downloader (curl) so a bare box gets the compiler AND a fetcher BEFORE the first compile.
+  local pkgs="$toolchain $downloader" mod
   for mod in $missing; do
     case "$mod" in
       _sqlite3) pkgs="$pkgs libsqlite3-dev" ;;
