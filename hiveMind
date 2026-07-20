@@ -8449,7 +8449,16 @@ hiveMind.team.sweep() # <?session> <?interval> # FLEET dashboard: no-arg = ALL a
         stateOut=$(private.hiveMind.sweep.paneState "$target")
         state="${stateOut%%|*}"; details="${stateOut#*|}"
       fi
-      printf '  %-5s %-22s %-13s %ssh:%s%s %s %s\n' "$addr" "$role" "$state" "${GRAY}" "$bg" "${NORMAL}" "$ctxStr" "$details"
+      # RATE_LIMIT rendered BOLD_YELLOW (distinct from plain IDLE and red SUB_LIMIT !!).
+      # Pad the PLAIN token to width FIRST, then wrap in color — otherwise the ANSI
+      # escape bytes are counted by %-13s and the column misaligns.
+      local stateCol
+      if [ "$state" = "RATE_LIMIT" ]; then
+        stateCol=$(printf '%-13s' "$state"); stateCol="${BOLD_YELLOW}${stateCol}${NORMAL}"
+      else
+        stateCol=$(printf '%-13s' "$state")
+      fi
+      printf '  %-5s %-22s %s %ssh:%s%s %s %s\n' "$addr" "$role" "$stateCol" "${GRAY}" "$bg" "${NORMAL}" "$ctxStr" "$details"
     done
   done <<< "$sessions"
 }
@@ -8914,6 +8923,72 @@ hiveMind.agent.queue.drain.completion.agentName() { private.hiveMind.roles.compl
 # SWEEP & UNBLOCK
 # ─────────────────────────────────────────────────────────────────────────────
 
+private.hiveMind.sweep.ratelimit.probe() { # <content> # echo retry-detail + return 0 if content is an UNRESOLVED, last-substantive rate-limit; else return 1
+  # THROTTLE-INTERRUPTED-AT-IDLE probe. Caller has already confirmed the bottom
+  # is a bare empty ❯ prompt. We decide: is this idle=done (return 1) or
+  # idle=throttle-needs-nudge (return 0 + echo retry-detail)?
+  #
+  # No-false-positive contract (all must hold to flag rate-limit):
+  #   1. A rate-limit SIGNATURE is present in the recent-scrollback window.
+  #   2. LAST-SUBSTANTIVE: that signature is on the LAST substantive (non-chrome,
+  #      non-blank) line before the prompt. If ANY real activity followed the
+  #      throttle, the last substantive line is that newer thing → NOT flagged
+  #      (defeats the RESOLVED-then-idle false-positive).
+  #   3. UNRESOLVED: no resolution/new-activity marker after the signature line
+  #      (completed-response past-tense verb, a ❯ with text = nudge already sent,
+  #      or "esc to interrupt" = resumed). Mostly implied by (2); explicit guard.
+  #   4. WINDOW: only the caller's 20-line capture is inspected — a throttle in
+  #      DEEP scrollback is physically unreachable here (never widen this).
+  local content="$1"
+  [ -z "$content" ] && return 1
+
+  # Strip TUI chrome + code/prose noise, then blanks. Reuse the SAME scrub the
+  # ambiguous-bottom rate-limit branch uses (comments/code false-positive guard),
+  # plus TUI separators/title-bar/status-bar/empty-prompt so the "last line" is a
+  # genuine substantive event, not decoration.
+  local substantive
+  substantive=$(printf '%s\n' "$content" \
+    | grep -vE '^[[:space:]]*(#|//|--|/\*|\*[^/]|<!--)' \
+    | grep -vE "(grep|sed|awk|echo)[[:space:]]+-?[a-zA-Z]*[[:space:]]*['\"]" \
+    | grep -vE '^[[:space:]]*[─━—-]{3,}[[:space:]]*$' \
+    | grep -vE 'auto mode on|esc to interrupt|⏵⏵' \
+    | grep -vE '^[[:space:]]*(>|❯)[[:space:]]*$' \
+    | grep -vE '^[[:space:]]*$')
+
+  [ -z "$substantive" ] && return 1
+
+  # LAST substantive line = the event immediately preceding the idle prompt.
+  local lastLine
+  lastLine=$(printf '%s\n' "$substantive" | tail -n 1)
+
+  # (1)+(2) signature MUST be on that last line (not merely somewhere above).
+  echo "$lastLine" | grep -qiE 'Server is temporarily limiting requests|temporarily limiting requests|Rate limited|rate.limit|too many requests|throttl|usage.limit' || return 1
+
+  # (3) UNRESOLVED guard: reject if a resolution/activity marker sits AFTER the
+  # last signature occurrence anywhere in the substantive slice (belt+suspenders
+  # for the "resumed then idle again within 20 lines" edge).
+  local sigLast afterSig
+  sigLast=$(printf '%s\n' "$substantive" | grep -niE 'Server is temporarily limiting requests|temporarily limiting requests|Rate limited|rate.limit|too many requests|throttl|usage.limit' | tail -n 1 | cut -d: -f1)
+  if [ -n "$sigLast" ]; then
+    afterSig=$(printf '%s\n' "$substantive" | tail -n +"$((sigLast + 1))")
+    if echo "$afterSig" | grep -qiE 'Baked|Brewed|Cooked|Simmered|Distilled|Woven|Crafted|Composed|Frosted|Incubated|Cascaded|esc to interrupt|^[[:space:]]*(>|❯)[[:space:]]+.+'; then
+      return 1
+    fi
+  fi
+
+  # Flagged: extract retry-time detail. Covers the verbose form ("in 30 seconds")
+  # AND the real Claude compact form ("retry in 30s" / "in 5m") the ambiguous-bottom
+  # regex misses — anchored to a retry/try-again context so plain numbers don't match.
+  local retry
+  retry=$(echo "$content" | grep -oiE '(retry|try again).{0,12}(in |after )?[0-9]+ ?(s|m|sec|min|second|minute)s?\b' | tail -1)
+  [ -z "$retry" ] && retry=$(echo "$content" | grep -oiE '(in |after )[0-9]+ ?(sec|min|second|minute)s?' | tail -1)
+  # Normalize to just the "<n><unit>" token if present.
+  local rtok
+  rtok=$(echo "$retry" | grep -oiE '[0-9]+ ?(s|m|sec|min|second|minute)s?\b' | tail -1)
+  echo "${rtok:-${retry:-unknown}}"
+  return 0
+}
+
 private.hiveMind.sweep.detect() {
   # Enhanced blocker detection — returns status|action|severity[|detail]
   #
@@ -8993,8 +9068,20 @@ private.hiveMind.sweep.detect() {
     return 0
   fi
 
-  # Idle: bare prompt (❯ or >) with NO "esc to interrupt" — definitive idle
+  # Idle: bare prompt (❯ or >) with NO "esc to interrupt".
+  # BEFORE declaring plain idle, probe the RECENT (20-line) scrollback: if the
+  # LAST substantive event before this empty prompt is an UNRESOLVED rate-limit
+  # signature, the agent is throttle-interrupted (idle=needs-nudge), NOT idle=done.
+  # The probe requires last-substantive + unresolved + within-window so a RESOLVED
+  # throttle (activity/completion/new-turn after it) or a DEEP-scrollback throttle
+  # falls through to plain idle (no false-positive). Emits the SAME rate-limit
+  # contract as the ambiguous-bottom branch below → DISPLAY/route/unblock unchanged.
   if echo "$bottom" | grep -qE '^[[:space:]]*(>|❯)[[:space:]]*$'; then
+    local rlRetry
+    if rlRetry=$(private.hiveMind.sweep.ratelimit.probe "$content"); then
+      echo "rate-limit|wait|blocker|${rlRetry:-unknown}"
+      return 0
+    fi
     echo "idle|none|info"
     return 0
   fi
