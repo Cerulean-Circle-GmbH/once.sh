@@ -7480,6 +7480,87 @@ private.hiveMind.context.age() { # <tsIso> # echo "<compactAge>|<ageSeconds>" (e
   echo "${str}|${age}"
 }
 
+# Resolve the pane's LIVE usage-bearing JSONL — drift-proof. WHY: fork/bridge sessions
+# launch `--resume <A> --fork-session`; the live session can write a NEW uuid <B>≠<A>, and
+# the launch file's tail is flooded with system/user/bridge metadata while the assistant
+# USAGE turns sit far back. A bare `session.id → ${sid}.jsonl` + `tail` misses it. Resolution:
+#   1. session.current (customTitle-match — drift-proof) jsonl IF it holds NON-ZERO usage.
+#   2. session.id (launch uuid) jsonl IF it holds NON-ZERO usage.
+#   3. Fallback: among jsonl carrying this pane's agentName, the NEWEST-mtime one that holds
+#      NON-ZERO usage.
+# NON-ZERO is REQUIRED (not just the "input_tokens" key): a JSONL can be full of ZERO-total
+# streaming/stub assistant records (stop_sequence frames, mid-stream chunks) — accepting a
+# key-only file leads to the 0k FALSE-LOW that masked the cliff (the 10fde7f regression).
+# Echoes the jsonl PATH (guaranteed ≥1 NON-ZERO usage), or empty+rc1 (fail-loud).
+private.hiveMind.context.live.jsonl() { # <pane> # echo path to the live NON-ZERO-usage jsonl, or empty
+  local target="${1:-}"
+  [ -z "$target" ] && return 1
+  local projd="$HOME/.claude/projects" dir f
+
+  # true iff file has ≥1 assistant record whose TOTAL (input+cache_create+cache_read) > 0.
+  local hasNonZero='
+import sys, json
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        if "\"input_tokens\"" not in line: continue
+        try:
+            d=json.loads(line)
+            if d.get("type")=="assistant":
+                u=d.get("message",{}).get("usage",{})
+                if u and "input_tokens" in u:
+                    if u["input_tokens"]+u.get("cache_creation_input_tokens",0)+u.get("cache_read_input_tokens",0) > 0:
+                        print("1"); break
+        except: pass
+'
+  local cand
+  for cand in \
+    "$("$OOSH_DIR/claudeCode" session.current "$target" 2>/dev/null)" \
+    "$("$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null)"; do
+    [ -z "$cand" ] && continue
+    for dir in "$projd"/*/; do
+      f="${dir}${cand}.jsonl"
+      if [ -f "$f" ] && [ -n "$(python3 -c "$hasNonZero" "$f" 2>/dev/null)" ]; then
+        echo "$f"; return 0
+      fi
+    done
+  done
+
+  # 3. Fallback — agentName match, newest-mtime file that has NON-ZERO usage.
+  local role
+  role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
+  if [ -n "$role" ]; then
+    local best
+    best=$(grep -lF "\"agentName\":\"${role}@" "$projd"/*/*.jsonl 2>/dev/null \
+      | python3 -c "
+import sys, json, os
+best=None; best_ts=-1.0
+for path in sys.stdin:
+    path=path.strip()
+    if not path: continue
+    nz=False
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if '\"input_tokens\"' not in line: continue
+                try:
+                    d=json.loads(line)
+                    if d.get('type')=='assistant':
+                        u=d.get('message',{}).get('usage',{})
+                        if u and 'input_tokens' in u:
+                            if u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0) > 0:
+                                nz=True; break
+                except: pass
+        if nz:
+            m=os.path.getmtime(path)
+            if m>best_ts: best_ts=m; best=path
+    except: pass
+if best: print(best)
+" 2>/dev/null)
+    [ -n "$best" ] && { echo "$best"; return 0; }
+  fi
+  return 1
+}
+
 # Derive the REAL window (denom in thousands): 1000 (1M) vs 200 (base). Three signals,
 # most-reliable first (a session's live sid can DRIFT from its launch --resume UUID after
 # fork/compact, so a bare sid==ps-args match is NOT enough — measured on robbin-skill-expert
@@ -7493,11 +7574,18 @@ private.hiveMind.context.denom.for.target() { # <pane> # echo 1000 or 200
   local target="${1:-}"
   [ -z "$target" ] && { echo "200"; return 0; }
 
-  # 1. Pane-tree claude process with a [1m] model arg (survives sid drift).
+  # 1. Pane-tree claude process with a [1m] model arg (survives sid drift). The claude
+  #    process is a DESCENDANT of pane_pid (not always a direct child), so walk the tree.
   local panePid
-  panePid=$(otmux display "$target" '#{pane_pid}' 2>/dev/null)
+  panePid=$(otmux pane.get "$target" '#{pane_pid}' 2>/dev/null)
   if [ -n "$panePid" ]; then
-    if ps -eo ppid=,args= 2>/dev/null | awk -v r="$panePid" '$1==r' | grep -q '\[1m\]'; then
+    if ps -eo pid=,ppid=,args= 2>/dev/null | awk -v root="$panePid" '
+      { line[$1]=$0; par[$1]=$2 }
+      END {
+        q[0]=root; n=1
+        for (i=0;i<n;i++) for (p in par) if (par[p]==q[i]) q[n++]=p
+        for (i=0;i<n;i++) if (line[q[i]] ~ /claude/ && line[q[i]] ~ /\[1m\]/) { print "1m"; exit }
+      }' | grep -q '1m'; then
       echo "1000"; return 0
     fi
   fi
@@ -7510,31 +7598,29 @@ private.hiveMind.context.denom.for.target() { # <pane> # echo 1000 or 200
     echo "1000"; return 0
   fi
 
-  # 3. Observed-max from JSONL: any usage > 200k ⇒ must be 1M.
-  if [ -n "$sid" ]; then
-    local dir jsonl=""
-    for dir in "$HOME/.claude/projects"/*/; do
-      [ -f "${dir}${sid}.jsonl" ] && jsonl="${dir}${sid}.jsonl" && break
-    done
-    if [ -n "$jsonl" ]; then
-      local obs
-      obs=$(tail -200 "$jsonl" 2>/dev/null | python3 -c "
+  # 3. Observed-max from the LIVE non-zero-usage JSONL (drift-proof resolver, WHOLE-file
+  #    scan): any usage > 200k ⇒ must be 1M. Also covers sid-drift/bridge cases.
+  local jsonl
+  jsonl=$(private.hiveMind.context.live.jsonl "$target" 2>/dev/null)
+  if [ -n "$jsonl" ]; then
+    local obs
+    obs=$(python3 -c "
 import sys, json
 m=0
-for line in sys.stdin:
-    try:
-        d=json.loads(line)
-        if d.get('type')=='assistant':
-            u=d.get('message',{}).get('usage',{})
-            if u and 'input_tokens' in u:
-                t=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
-                if t>m: m=t
-    except: pass
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        try:
+            d=json.loads(line)
+            if d.get('type')=='assistant':
+                u=d.get('message',{}).get('usage',{})
+                if u and 'input_tokens' in u:
+                    t=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
+                    if t>m: m=t
+        except: pass
 print(m)
-" 2>/dev/null)
-      if [ -n "$obs" ] && [ "$obs" -gt 200000 ] 2>/dev/null; then
-        echo "1000"; return 0
-      fi
+" "$jsonl" 2>/dev/null)
+    if [ -n "$obs" ] && [ "$obs" -gt 200000 ] 2>/dev/null; then
+      echo "1000"; return 0
     fi
   fi
 
@@ -7583,39 +7669,50 @@ private.hiveMind.context.parse() { # <captured-content> # echo used_k|pct|denom_
 private.hiveMind.context.from.jsonl.reading() { # <pane> # echo used_k|pct|denom_k from JSONL total + honest denom
   local target="${1:-}"
   [ -z "$target" ] && return 1
-  local sid dir jsonl=""
-  sid=$("$OOSH_DIR/claudeCode" session.id "$target" 2>/dev/null)
-  [ -z "$sid" ] && return 1
-  for dir in "$HOME/.claude/projects"/*/; do
-    [ -f "${dir}${sid}.jsonl" ] && jsonl="${dir}${sid}.jsonl" && break
-  done
+  # Drift-proof: resolve the LIVE non-zero-usage jsonl (handles fork/bridge uuid drift AND
+  # the metadata-flooded tail where the last usage is far from EOF).
+  local jsonl
+  jsonl=$(private.hiveMind.context.live.jsonl "$target" 2>/dev/null)
   [ -z "$jsonl" ] && return 1
   local denomK
   denomK=$(private.hiveMind.context.denom.for.target "$target")   # 1000 or 200 (honest)
-  # exact total tokens from the last assistant usage (input + cache_create + cache_read)
+  # WHOLE-file scan for the LAST assistant usage whose TOTAL > 0. WHY skip zero-total:
+  # a JSONL contains ZERO-token assistant records (stop_sequence frames / mid-stream stubs
+  # with usage.input_tokens=0); picking the LAST record regardless of value yields a
+  # transient 0k FALSE-LOW that masks the cliff — worse than '— never'. Only a NON-ZERO
+  # record reflects real context occupancy.
   local out
-  out=$(tail -60 "$jsonl" 2>/dev/null | DENOM_K="$denomK" python3 -c "
+  out=$(DENOM_K="$denomK" python3 -c "
 import sys, json, os
 denomK=int(os.environ.get('DENOM_K','200'))
-last=None
-for line in sys.stdin:
-    try:
-        d=json.loads(line)
-        if d.get('type')=='assistant':
-            u=d.get('message',{}).get('usage',{})
-            if u and 'input_tokens' in u: last=u
-    except: pass
-if not last:
-    sys.exit(1)
-tot=last['input_tokens']+last.get('cache_creation_input_tokens',0)+last.get('cache_read_input_tokens',0)
+last_nonzero=None
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        if '\"input_tokens\"' not in line: continue
+        try:
+            d=json.loads(line)
+            if d.get('type')=='assistant':
+                u=d.get('message',{}).get('usage',{})
+                if u and 'input_tokens' in u:
+                    tot=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
+                    if tot>0: last_nonzero=tot     # skip zero-total streaming/stub records
+        except: pass
+if not last_nonzero or last_nonzero<=0:
+    sys.exit(1)                                    # 0-GUARD: no real reading → fail-loud
 denom=denomK*1000
-usedK=round(tot/1000)
-pct=round(tot/denom*100)
-if pct<0: pct=0
-if pct>100: pct=100          # clamp display (over-window = compacting imminent)
+usedK=round(last_nonzero/1000)
+pct=round(last_nonzero/denom*100)
+if usedK<=0 or pct<=0:
+    sys.exit(1)                                    # VALUE-SANITY: a live agent is never 0k/0%
+if pct>100: pct=100                                # clamp (over-window = compacting imminent)
 print('%d|%d|%d' % (usedK,pct,denomK))
-" 2>/dev/null)
+" "$jsonl" 2>/dev/null)
+  # 0-GUARD (belt + suspenders, in bash): reject empty OR a 0k/0% reading — never store it.
   [ -z "$out" ] && return 1
+  local uK pP dD
+  IFS='|' read -r uK pP dD <<< "$out"
+  if ! [[ "$uK" =~ ^[0-9]+$ ]] || [ "$uK" -le 0 ] 2>/dev/null; then return 1; fi
+  if ! [[ "$pP" =~ ^[0-9]+$ ]] || [ "$pP" -le 0 ] 2>/dev/null; then return 1; fi
   echo "$out"
 }
 
@@ -7640,6 +7737,15 @@ hiveMind.context.record() # <agent> <usedK> <pct> [<denomK>] # store a MEASURED 
   fi
   if ! [[ "$pct" =~ ^[0-9]+$ ]] || [ "$pct" -gt 100 ] 2>/dev/null; then
     error.log "context.record: pct '$pct' is not an integer 0-100 — rejected"
+    return 1
+  fi
+
+  # MANDATORY 0-GUARD (non-negotiable). A live agent CANNOT have 0k / 0% context — a 0
+  # reading is a transient JSONL artifact (zero-token stub record) or a resolver miss, and
+  # storing it FALSE-LOWs the dashboard, masking the cliff (worse than '— never'). Record
+  # NOTHING and fail loud; the store keeps the prior honest reading (which ages → ⚠ stale).
+  if [ "$usedK" -le 0 ] 2>/dev/null || [ "$pct" -le 0 ] 2>/dev/null; then
+    error.log "context.record: refusing 0k/0% reading for '$agent' (impossible for a live agent — not storing a false-low)"
     return 1
   fi
 
@@ -7774,7 +7880,12 @@ hiveMind.context.gather() # <agent> # send /context to an IDLE agent, parse the 
     return 1
   fi
 
-  hiveMind.context.record "$agent" "$usedK" "$pct" "$denomK" >/dev/null || return 1
+  # record() enforces the MANDATORY 0-guard + numeric/range checks. If it rejects (e.g. a
+  # 0k/0% slipped through a source), gather reports parse-fail — NOT a false success.
+  if ! hiveMind.context.record "$agent" "$usedK" "$pct" "$denomK" >/dev/null; then
+    echo "${agent}: parse-fail"
+    return 1
+  fi
   local win; win=$([ "$denomK" -ge 1000 ] 2>/dev/null && echo "1M" || echo "${denomK}k")
   echo "${agent}: ${pct}% (${usedK}k/${win}) [${src}]"
 }
