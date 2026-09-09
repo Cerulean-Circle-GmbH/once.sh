@@ -115,13 +115,20 @@ to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
 delegates to `log.session.save`).
 
 The shared `log.env` is linked to the per-user file by a source chain — its last
-line is `source $OOSH_USER_CONFIG_PATH/log.session.env` (the var written
-**unexpanded**, so each user loads their OWN file). This means a value you set
-with `log name <value>` is **loaded back on every login**, not just recorded:
-`log`'s top-level keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so
-the saved name wins and the `user@host` default only fills in when none is saved.
-`LOG_DEVICE` is re-derived per session (the saved tty is stale), and `LOG_LIVE`
-re-anchors to the per-user default.
+line is `. $OOSH_USER_CONFIG_PATH/log.session.env` (POSIX `.`, not the bash
+`source`, so `boot` parses under dash/ash; the var is written **unexpanded**, so
+each user loads their OWN file). This means a value you set with `log name
+<value>` is **loaded back on every login**, not just recorded: `log`'s top-level
+keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so the saved name
+wins and the `user@host` default only fills in when none is saved.
+
+`LOG_DEVICE` is a per-session value and the saved one is the PREVIOUS session's
+tty, so `log` must not let it win: when the shell has a live tty, `log`'s
+top-level **always re-derives `LOG_DEVICE` to the current tty** (a pts owned by
+the same user is writable, so a plain `-w` check would wrongly keep the stale
+one and send this shell's output to the old terminal); it falls back to the
+`fd/1` → `/dev/null` cascade only for non-tty contexts (`ssh exec`, cron, CI).
+`LOG_LIVE` re-anchors to the per-user default.
 
 ```bash
 log name                 # show LOG_NAME (defaults to user@host)
