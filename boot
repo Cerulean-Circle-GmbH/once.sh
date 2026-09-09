@@ -70,3 +70,9 @@ fi
 # oosh requires bash 4+ to run anyway. This keeps `boot` sourceable under
 # dash/ash without a "Bad function name" error.
 [ -n "$BASH_VERSION" ] && [ -f "$OOSH_DIR/log" ] && . "$OOSH_DIR/log"
+
+# ── 5. Materialise the per-user/session log config ───────────────────────────
+# Delegate to log's own method (bash only). This writes LOG_NAME / LOG_DEVICE /
+# LOG_LIVE to the user's private ~/.config/oosh/log.session.env — per-user, no
+# leak into the shared log.env. Once per shell (boot runs once).
+[ -n "$BASH_VERSION" ] && type log.session.save >/dev/null 2>&1 && log.session.save >/dev/null 2>&1

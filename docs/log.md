@@ -90,13 +90,43 @@ log.device
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LOG_LEVEL` | 3 | Current log verbosity |
-| `LOG_DEVICE` | /dev/tty | Output destination |
-| `LOG_LIVE` | (unset) | Live log file path |
-| `LOG_LEVEL_RESET` | - | Previous level for toggle |
-| `STEP_DEBUG` | OFF | Interactive debug mode |
+| Variable | Default | Description | Scope |
+|----------|---------|-------------|-------|
+| `LOG_LEVEL` | 3 | Current log verbosity | shared (`log.env`) |
+| `LOG_LEVEL_RESET` | - | Previous level for toggle | shared (`log.env`) |
+| `LOG_NAME` | `user@host` | OOSH log identity (see below) | per-user (`log.session.env`) |
+| `LOG_DEVICE` | /dev/tty | Output destination | per-session (`log.session.env`) |
+| `LOG_LIVE` | `~/.config/oosh/log.live.out` | Live log file path | per-user (`log.session.env`) |
+| `STEP_DEBUG` | OFF | Interactive debug mode | volatile |
+
+### Two-tier storage: shared vs per-user
+
+OOSH config is **shared**: every user's `~/config` symlinks to one `sharedConfig`
+directory, so everything written to `~/config/log.env` is seen by *all* users.
+Only the site-wide verbosity (`LOG_LEVEL`, `LOG_LEVEL_RESET`) belongs there.
+
+Anything per-user or per-session must NOT go into the shared `log.env` — it would
+leak one user's absolute paths, tty, or identity onto everyone else (and cause
+cross-user permission errors). `config.save` therefore filters `LOG_NAME`,
+`LOG_DEVICE` and `LOG_LIVE` out of the shared `log.env`. They are instead written
+to the user's **private** `~/.config/oosh/log.session.env` — the same per-user
+directory OOSH already uses for `mode-env.bash`. The `boot` loader materialises
+that file once per shell (it delegates to `log.session.save`).
+
+```bash
+log name                 # show LOG_NAME (defaults to user@host)
+log name ci-run@box      # set LOG_NAME and re-persist the session file
+log session              # show ~/.config/oosh/log.session.env
+log session.save         # (re)write that per-user/session file
+```
+
+### `LOG_NAME` vs `LOGNAME` (the naming convention)
+
+All of OOSH's log variables use the underscore `LOG_` family: `LOG_LEVEL`,
+`LOG_LEVEL_RESET`, `LOG_DEVICE`, `LOG_LIVE`, and now **`LOG_NAME`** (the log
+identity, defaulting to `user@host`). `LOGNAME` (no underscore) is the **system
+login** variable — it is deliberately *not* part of OOSH config: OOSH neither
+sets nor persists it. If you want to name a log context, set `LOG_NAME`.
 
 ## Live Logging
 
