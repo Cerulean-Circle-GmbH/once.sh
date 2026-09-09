@@ -32,6 +32,13 @@ export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
 # the user's own. log/config/oo reference $OOSH_USER_CONFIG_PATH, not the literal.
 export OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"
 
+# Ensure the per-user log session file exists BEFORE user.env's chain sources it
+# (log.env ends with `source $OOSH_USER_CONFIG_PATH/log.session.env`). It is
+# populated properly by log.session.save further down; this just prevents a
+# "No such file" error on the very first shell, before it has ever been written.
+mkdir -p "$OOSH_USER_CONFIG_PATH" 2>/dev/null
+[ -f "$OOSH_USER_CONFIG_PATH/log.session.env" ] || : > "$OOSH_USER_CONFIG_PATH/log.session.env"
+
 # ── 2. Source the config ─────────────────────────────────────────────────────
 # Source ONLY user.env — it chains `source $CONFIG_PATH/oosh.env` /
 # `log.env` itself (config.add appends those), so this one line stands up the

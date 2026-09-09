@@ -45,10 +45,19 @@ directory, so everything in it is **shared across all users** — only site-wide
 data belongs there. Anything per-user or per-session lives instead in the
 user's private `$OOSH_USER_CONFIG_PATH` (default `~/.config/oosh`, the same dir
 `oo` uses for `mode-env.bash`). `config list` reads both tiers by name, so
-`config list log` shows the shared `log.env` and `config list log.session`
-shows the per-user `log.session.env`. The per-user lookup is **read-only** —
-`config save`/`add`/`delete`/`edit` operate only on the shared `$CONFIG_PATH`
-tier. See [Log System Documentation](log.md) for the per-user log vars.
+`config list log.session` shows the per-user `log.session.env`. The per-user
+lookup is **read-only** — `config save`/`add`/`delete`/`edit` operate only on
+the shared `$CONFIG_PATH` tier.
+
+The two tiers are linked by a source chain, exactly like `user.env` chains
+`oosh.env`/`log.env`: the generated shared `log.env` ends with
+`source $OOSH_USER_CONFIG_PATH/log.session.env` (the var written **unexpanded**,
+so each user loads their OWN file — no leak). So `config list log` shows the
+session file nested under it, and — because the chain is sourced at shell init —
+the saved per-user `LOG_NAME` (and the rest) are actually **loaded** each login,
+not just recorded. `boot` touch-creates the session file before the chain runs,
+so a first-ever shell has no missing-source error. See
+[Log System Documentation](log.md) for the per-user log vars.
 
 ## Environment Variables
 

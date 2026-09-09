@@ -109,9 +109,19 @@ Anything per-user or per-session must NOT go into the shared `log.env` — it wo
 leak one user's absolute paths, tty, or identity onto everyone else (and cause
 cross-user permission errors). `config.save` therefore filters `LOG_NAME`,
 `LOG_DEVICE` and `LOG_LIVE` out of the shared `log.env`. They are instead written
-to the user's **private** `~/.config/oosh/log.session.env` — the same per-user
-directory OOSH already uses for `mode-env.bash`. The `boot` loader materialises
-that file once per shell (it delegates to `log.session.save`).
+to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
+`~/.config/oosh`) — the same per-user directory OOSH already uses for
+`mode-env.bash`. The `boot` loader materialises that file once per shell (it
+delegates to `log.session.save`).
+
+The shared `log.env` is linked to the per-user file by a source chain — its last
+line is `source $OOSH_USER_CONFIG_PATH/log.session.env` (the var written
+**unexpanded**, so each user loads their OWN file). This means a value you set
+with `log name <value>` is **loaded back on every login**, not just recorded:
+`log`'s top-level keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so
+the saved name wins and the `user@host` default only fills in when none is saved.
+`LOG_DEVICE` is re-derived per session (the saved tty is stale), and `LOG_LIVE`
+re-anchors to the per-user default.
 
 ```bash
 log name                 # show LOG_NAME (defaults to user@host)
