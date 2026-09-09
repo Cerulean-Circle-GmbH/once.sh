@@ -26,6 +26,11 @@ export OOSH_DIR="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"
 export CONFIG_PATH="$(cd "$HOME/config" 2>/dev/null && pwd -P || echo "$HOME/config")"
 export CONFIG_FILE="user.env"
 export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
+# Per-user (NON-shared) oosh config dir — single source of truth for per-user /
+# per-session state (log.session.env, log.live.out, oo's mode-env.bash). Unlike
+# CONFIG_PATH (which usually symlinks to a shared sharedConfig), this is always
+# the user's own. log/config/oo reference $OOSH_USER_CONFIG_PATH, not the literal.
+export OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"
 
 # ── 2. Source the config ─────────────────────────────────────────────────────
 # Source ONLY user.env — it chains `source $CONFIG_PATH/oosh.env` /

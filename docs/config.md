@@ -34,16 +34,30 @@ The config system supports:
 |------|---------|
 | `~/config/user.env` | Main user configuration (default) |
 | `~/config/oosh.env` | OOSH-specific variables |
-| `~/config/log.env` | Logging configuration |
+| `~/config/log.env` | Logging configuration (shared: `LOG_LEVEL`, `LOG_LEVEL_RESET`) |
 | `~/config/<name>.env` | Custom named configs |
+| `$OOSH_USER_CONFIG_PATH/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
+
+### Two config tiers: shared vs per-user
+
+`~/config` (`$CONFIG_PATH`) usually symlinks to one shared `sharedConfig`
+directory, so everything in it is **shared across all users** — only site-wide
+data belongs there. Anything per-user or per-session lives instead in the
+user's private `$OOSH_USER_CONFIG_PATH` (default `~/.config/oosh`, the same dir
+`oo` uses for `mode-env.bash`). `config list` reads both tiers by name, so
+`config list log` shows the shared `log.env` and `config list log.session`
+shows the per-user `log.session.env`. The per-user lookup is **read-only** —
+`config save`/`add`/`delete`/`edit` operate only on the shared `$CONFIG_PATH`
+tier. See [Log System Documentation](log.md) for the per-user log vars.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
-| `$CONFIG_PATH` | `~/config` | Config directory path |
+| `$CONFIG_PATH` | `~/config` | Shared config directory path (often a `sharedConfig` symlink) |
 | `$CONFIG_FILE` | `user.env` | Current config filename |
+| `$OOSH_USER_CONFIG_PATH` | `~/.config/oosh` | **Per-user** (non-shared) oosh config dir — single source of truth, anchored by `this.init`/`boot` |
 
 ## Commands
 
@@ -175,13 +189,20 @@ Without parameters, saves:
 | Variable | Why excluded | Re-derived at shell init by |
 |---|---|---|
 | `LOG_INSTALL`, `INSTALL_LOG`, etc. | Install-only state — must not persist into user sessions | (none — only set during install) |
-| `LOG_LIVE` | `~/config/log.live.out` is per-user; saving root's path EACCES-cascades | `log:21-23` (re-anchored at every bashrc) |
-| `CONFIG_PATH` | `$HOME/config` — per-user | `this:209` (`: ${CONFIG_PATH:=$HOME/config}`) |
-| `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config:183` (derived from CONFIG_PATH) |
-| `OOSH_DIR` | per-user oosh tree path | `this:40-49` (resolved from script location) |
+| `LOG_NAME` | OOSH log identity (`user@host`) — per-user | `log` top-level (`${LOG_NAME:-user@host}`); persisted per-user in `log.session.env` |
+| `LOG_DEVICE` | per-session tty | `this`/`log` (per shell); persisted per-user in `log.session.env` |
+| `LOG_LIVE` | `$OOSH_USER_CONFIG_PATH/log.live.out` is per-user; saving root's path EACCES-cascades | `log` (re-anchored at every bashrc); persisted per-user in `log.session.env` |
+| `CONFIG_PATH` | `$HOME/config` — per-user | `this` (`: ${CONFIG_PATH:=$HOME/config}`) |
+| `OOSH_USER_CONFIG_PATH` | `$HOME/.config/oosh` — per-user | `this`/`boot` (`: ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}`) |
+| `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config` (derived from CONFIG_PATH) |
+| `OOSH_DIR` | per-user oosh tree path | `boot`/`this` (resolved from `~/oosh`) |
 | `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
 
-If you add a new persisted env var that resolves to an absolute per-user path, extend the same exclusion filter at `config:265`.
+The per-user `LOG_*` vars are deliberately NOT persisted into the shared
+`log.env`; they are written to the per-user `$OOSH_USER_CONFIG_PATH/log.session.env`
+by `log.session.save` (see [log.md](log.md)). If you add a new persisted env var
+that resolves to an absolute per-user path, extend the same exclusion `case` in
+`config.save`.
 
 ### Listing Configuration
 
@@ -192,9 +213,12 @@ Lists the content of a config file.
 # List user.env (default)
 ./config list
 
-# List specific config
+# List specific config (shared tier)
 ./config list oosh
 ./config list log
+
+# List the per-user tier by name (reads $OOSH_USER_CONFIG_PATH/log.session.env)
+./config list log.session
 ```
 
 ### Getting/Setting Variables
