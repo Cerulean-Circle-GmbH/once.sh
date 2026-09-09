@@ -120,6 +120,11 @@ log session              # show ~/.config/oosh/log.session.env
 log session.save         # (re)write that per-user/session file
 ```
 
+`config list` is tier-aware and can show either file by name: `config list log`
+reads the shared `~/config/log.env`, while `config list log.session` reads the
+per-user `~/.config/oosh/log.session.env`. That fallback is read-only —
+`config delete`/`edit`/`save` still operate on the shared `~/config` tier.
+
 ### `LOG_NAME` vs `LOGNAME` (the naming convention)
 
 All of OOSH's log variables use the underscore `LOG_` family: `LOG_LEVEL`,
