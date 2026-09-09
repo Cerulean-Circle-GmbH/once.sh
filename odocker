@@ -10,11 +10,9 @@
 # No flags, positional params only. Following: tmux→otmux, ssh→ossh, docker→odocker
 # ============================================================================
 
-# Docker workspaces base directory — platform-derived (D3). config.init sets
-# ODOCKER_WORKSPACES + the OOSH_SHARED_BASE seam (persisted in oosh.env); this
-# fallback derives from that seam so odocker is cross-platform even before init,
-# with no macOS literal. Operator/CI override via a preset ODOCKER_WORKSPACES.
-: ${ODOCKER_WORKSPACES:="${OOSH_SHARED_BASE:-/home/shared}/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces"}
+# Docker workspaces base directory (persist via: odocker workspace.set <path>)
+: ${ODOCKER_WORKSPACES:=$(config get ODOCKER_WORKSPACES 2>/dev/null)}
+: ${ODOCKER_WORKSPACES:="/var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces"}
 
 ### new.method
 
@@ -22,19 +20,60 @@
 # COMPLETION HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-private.odocker.running.containers() {
+private.odocker.container.list.running() {
   docker ps --format '{{.Names}}' 2>/dev/null
 }
 
-private.odocker.all.containers() {
+private.odocker.container.list.all() {
   docker ps -a --format '{{.Names}}' 2>/dev/null
 }
 
-private.odocker.images() {
+private.odocker.container.ports() {
+  docker inspect --format '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{.HostPort}}->{{$p}} {{end}}{{end}}' "$1" 2>/dev/null
+}
+
+private.odocker.container.name() {
+  docker inspect --format '{{.Name}}' "$1" 2>/dev/null | sed 's|^/||'
+}
+
+private.odocker.ensure.socket.access() {
+  local socket="/var/run/docker.sock"
+  [ -e "$socket" ] || return 0
+  # Fix socket group if not owned by docker group
+  local socketGroup
+  socketGroup=$(stat -c "%G" "$socket" 2>/dev/null || stat -f "%Sg" "$socket" 2>/dev/null)
+  if [ "$socketGroup" != "docker" ]; then
+    echo "Docker socket has wrong group ($socketGroup instead of docker) — fixing with sudo..."
+    sudo chgrp docker "$socket"
+  fi
+}
+
+private.odocker.docker.socket.opt() {
+  private.odocker.ensure.socket.access
+  echo "-v /var/run/docker.sock:/var/run/docker.sock"
+}
+
+private.odocker.port.offset() {
+  local value="${1:-0}"
+  # Non-numeric values default to 0
+  case "$value" in
+    -[0-9]*) ;;
+    *[!0-9]*) echo "0"; return ;;
+  esac
+  if [ "$value" -ge 1024 ]; then
+    # Looks like an SSH port — derive offset (can be negative)
+    echo $((value - 8022))
+  else
+    # Treat as offset directly
+    echo "$value"
+  fi
+}
+
+private.odocker.image.list() {
   docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>'
 }
 
-private.odocker.workspaces() {
+private.odocker.workspace.list() {
   # List workspace/variant paths that contain a Dockerfile (glob, not find)
   local base="$ODOCKER_WORKSPACES"
   local dir
@@ -47,7 +86,7 @@ private.odocker.workspaces() {
   return 0
 }
 
-private.odocker.image.from.workspace() {
+private.odocker.image.resolve.from.workspace() {
   # Convert workspace path to image tag: nakedUbuntu/20.04.sshd → naked_ubuntu_20_04_sshd
   # Insert underscore before uppercase letters (camelCase → snake_case), then lowercase all
   echo "$1" | sed 's/\([a-z]\)\([A-Z]\)/\1_\2/g' | tr '[:upper:]/' '[:lower:]_' | tr '.' '_'
@@ -56,6 +95,28 @@ private.odocker.image.from.workspace() {
 # ─────────────────────────────────────────────────────────────────────────────
 # WORKSPACE MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
+
+odocker.workspace.get() # # show current Docker workspaces directory
+{
+  console.log "${ODOCKER_WORKSPACES:-not set}"
+}
+
+odocker.workspace.set() # <path> # set Docker workspaces directory
+{
+  local path="$1"
+  if [ -z "$path" ]; then
+    echo "Usage: odocker workspace.set <path>"
+    return 1
+  fi
+  if [ ! -d "$path" ]; then
+    error.log "Directory not found: $path"
+    return 1
+  fi
+  ODOCKER_WORKSPACES="$path"
+  config set ODOCKER_WORKSPACES "$path"
+  success.log "Workspace directory set to: $path"
+}
+odocker.workspace.set.completion.path() { compgen -d "$1"; }
 
 odocker.workspace.list() # # list all Dockerfile workspaces and their build status
 {
@@ -68,18 +129,18 @@ odocker.workspace.list() # # list all Dockerfile workspaces and their build stat
   printf "%-35s %-25s %s\n" "WORKSPACE" "IMAGE TAG" "BUILT"
   printf "%-35s %-25s %s\n" "---------" "---------" "-----"
 
-  local dir ws_path ws_tag built
+  local dir wsPath wsTag built
   for dir in "$base"/*/Dockerfile "$base"/*/*/Dockerfile; do
     [ -f "$dir" ] || continue
-    ws_path=$(dirname "$dir")
-    ws_path="${ws_path#$base/}"
-    ws_tag=$(private.odocker.image.from.workspace "$ws_path")
-    if docker image inspect "$ws_tag" >/dev/null 2>&1; then
+    wsPath=$(dirname "$dir")
+    wsPath="${wsPath#$base/}"
+    wsTag=$(private.odocker.image.resolve.from.workspace "$wsPath")
+    if docker image inspect "$wsTag" >/dev/null 2>&1; then
       built="yes"
     else
       built="no"
     fi
-    printf "%-35s %-25s %s\n" "$ws_path" "$ws_tag" "$built"
+    printf "%-35s %-25s %s\n" "$wsPath" "$wsTag" "$built"
   done
 }
 
@@ -89,10 +150,39 @@ odocker.workspace.list() # # list all Dockerfile workspaces and their build stat
 
 odocker.ps() # # list running containers
 {
-  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+  {
+    printf "CONTAINER ID\tNAMES\tIMAGE\tSTATUS\tPORTS\n"
+    local id name image status ports
+    while IFS=$'\t' read -r id name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$name" "$image" "$status" "$ports"
+    done < <(docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
+}
+
+odocker.list.running() # # list running containers
+{
+  odocker.ps "$@"
 }
 
 odocker.list() # # list images
+{
+  docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}'
+}
+
+odocker.container.list() # # list all containers
+{
+  {
+    printf "CONTAINER ID\tNAMES\tIMAGE\tSTATUS\tPORTS\n"
+    local id name image status ports
+    while IFS=$'\t' read -r id name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$name" "$image" "$status" "$ports"
+    done < <(docker ps -a --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
+}
+
+odocker.image.list() # # list all images
 {
   docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}'
 }
@@ -126,8 +216,12 @@ odocker.file.find() # <containerOrImage> # find Dockerfile that built a containe
 {
   local input="$1"
   if [ -z "$input" ]; then
-    error.log "Usage: odocker file.find <containerOrImage>"
-    return 1
+    echo "Usage: odocker file.find <containerOrImage>"
+    echo ""
+    odocker.container.list
+    echo ""
+    odocker.image.list
+    return 0
   fi
 
   # Resolve to image name
@@ -139,40 +233,40 @@ odocker.file.find() # <containerOrImage> # find Dockerfile that built a containe
   fi
 
   # --- Tier 1: Label check ---
-  local label_path
-  label_path=$(docker inspect --format '{{index .Config.Labels "dockerfile.path"}}' "$image" 2>/dev/null)
-  if [ -n "$label_path" ] && [ "$label_path" != "<no value>" ]; then
-    if [ -f "$label_path" ]; then
-      console.log "Image: $image"
-      console.log "Dockerfile: $label_path"
-      console.log "Directory: $(dirname "$label_path")"
-      RESULT="$label_path"
+  local labelPath
+  labelPath=$(docker inspect --format '{{index .Config.Labels "dockerfile.path"}}' "$image" 2>/dev/null)
+  if [ -n "$labelPath" ] && [ "$labelPath" != "<no value>" ]; then
+    if [ -f "$labelPath" ]; then
+      echo "Image: $image"
+      echo "Dockerfile: $labelPath"
+      echo "Directory: $(dirname "$labelPath")"
+      RESULT="$labelPath"
       return 0
     fi
   fi
 
-  local label_dir
-  label_dir=$(docker inspect --format '{{index .Config.Labels "dockerfile.dir"}}' "$image" 2>/dev/null)
-  if [ -n "$label_dir" ] && [ "$label_dir" != "<no value>" ]; then
-    if [ -f "$label_dir/Dockerfile" ]; then
-      console.log "Image: $image"
-      console.log "Dockerfile: $label_dir/Dockerfile"
-      console.log "Directory: $label_dir"
-      RESULT="$label_dir/Dockerfile"
+  local labelDir
+  labelDir=$(docker inspect --format '{{index .Config.Labels "dockerfile.dir"}}' "$image" 2>/dev/null)
+  if [ -n "$labelDir" ] && [ "$labelDir" != "<no value>" ]; then
+    if [ -f "$labelDir/Dockerfile" ]; then
+      echo "Image: $image"
+      echo "Dockerfile: $labelDir/Dockerfile"
+      echo "Directory: $labelDir"
+      RESULT="$labelDir/Dockerfile"
       return 0
     fi
   fi
 
   # --- Tier 2: Compose label ---
-  local compose_dir
-  compose_dir=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$image" 2>/dev/null)
-  if [ -n "$compose_dir" ] && [ "$compose_dir" != "<no value>" ]; then
-    if [ -f "$compose_dir/Dockerfile" ]; then
-      console.log "Image: $image"
-      console.log "Dockerfile: $compose_dir/Dockerfile"
-      console.log "Directory: $compose_dir"
-      console.log "Source: docker-compose label"
-      RESULT="$compose_dir/Dockerfile"
+  local composeDir
+  composeDir=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$image" 2>/dev/null)
+  if [ -n "$composeDir" ] && [ "$composeDir" != "<no value>" ]; then
+    if [ -f "$composeDir/Dockerfile" ]; then
+      echo "Image: $image"
+      echo "Dockerfile: $composeDir/Dockerfile"
+      echo "Directory: $composeDir"
+      echo "Source: docker-compose label"
+      RESULT="$composeDir/Dockerfile"
       return 0
     fi
   fi
@@ -183,14 +277,14 @@ odocker.file.find() # <containerOrImage> # find Dockerfile that built a containe
     local dir
     for dir in "$base"/*/Dockerfile "$base"/*/*/Dockerfile; do
       [ -f "$dir" ] || continue
-      local ws_dir=$(dirname "$dir")
-      local ws_tag
-      ws_tag=$(private.odocker.image.from.workspace "${ws_dir#$base/}")
-      if [ "$ws_tag" = "$image" ] || [ "$ws_tag" = "${image%%:*}" ]; then
-        console.log "Image: $image"
-        console.log "Dockerfile: $dir"
-        console.log "Directory: $ws_dir"
-        console.log "Source: workspace name match"
+      local wsDir=$(dirname "$dir")
+      local wsTag
+      wsTag=$(private.odocker.image.resolve.from.workspace "${wsDir#$base/}")
+      if [ "$wsTag" = "$image" ] || [ "$wsTag" = "${image%%:*}" ]; then
+        echo "Image: $image"
+        echo "Dockerfile: $dir"
+        echo "Directory: $wsDir"
+        echo "Source: workspace name match"
         RESULT="$dir"
         return 0
       fi
@@ -198,9 +292,9 @@ odocker.file.find() # <containerOrImage> # find Dockerfile that built a containe
   fi
 
   # --- Tier 4: History reconstruct ---
-  console.log "Image: $image"
-  console.log "Dockerfile: NOT FOUND"
-  console.log "Build history (reconstruct manually):"
+  echo "Image: $image"
+  echo "Dockerfile: NOT FOUND"
+  echo "Build history (reconstruct manually):"
   docker image history --no-trunc --format '  {{.CreatedBy}}' "$image" 2>/dev/null \
     | sed 's|/bin/sh -c #(nop)  ||g; s|/bin/sh -c ||g' \
     | tac
@@ -208,8 +302,8 @@ odocker.file.find() # <containerOrImage> # find Dockerfile that built a containe
   return 1
 }
 odocker.file.find.completion.containerOrImage() {
-  private.odocker.all.containers
-  private.odocker.images
+  private.odocker.container.list.all
+  private.odocker.image.list
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,14 +318,14 @@ odocker.build.all() # # build all workspaces that have a Dockerfile
     return 1
   fi
 
-  local dir ws_path total=0 ok=0 fail=0
+  local dir wsPath total=0 ok=0 fail=0
   for dir in "$base"/*/Dockerfile "$base"/*/*/Dockerfile; do
     [ -f "$dir" ] || continue
-    ws_path=$(dirname "$dir")
-    ws_path="${ws_path#$base/}"
+    wsPath=$(dirname "$dir")
+    wsPath="${wsPath#$base/}"
     total=$((total + 1))
-    console.log "--- Building $ws_path ($total) ---"
-    if odocker.build "$ws_path"; then
+    console.log "--- Building $wsPath ($total) ---"
+    if odocker.build "$wsPath"; then
       ok=$((ok + 1))
     else
       fail=$((fail + 1))
@@ -243,200 +337,226 @@ odocker.build.all() # # build all workspaces that have a Dockerfile
   [ $fail -eq 0 ]
 }
 
+odocker.build.completion.workspace() {
+  private.odocker.workspace.list
+}
+
 odocker.build() # <workspace> # build image from DockerWorkspaces directory
 {
+  private.odocker.ensure.socket.access
   local workspace="$1"
   if [ -z "$workspace" ]; then
-    error.log "Usage: odocker build <workspace>"
-    console.log "Available workspaces:"
-    private.odocker.workspaces
+    echo "Usage: odocker build <workspace>"
+    echo ""
+    odocker.workspace.list
     return 1
   fi
 
-  local workspace_dir="$ODOCKER_WORKSPACES/$workspace"
-  if [ ! -f "$workspace_dir/Dockerfile" ]; then
-    error.log "No Dockerfile found in $workspace_dir"
+  local workspaceDir="$ODOCKER_WORKSPACES/$workspace"
+  if [ ! -f "$workspaceDir/Dockerfile" ]; then
+    error.log "No Dockerfile found in $workspaceDir"
     return 1
   fi
 
-  local image_tag
-  image_tag=$(private.odocker.image.from.workspace "$workspace")
+  local imageTag
+  imageTag=$(private.odocker.image.resolve.from.workspace "$workspace")
 
-  local dockerfile_path
-  dockerfile_path=$(cd "$workspace_dir" && pwd -P)/Dockerfile
+  local dockerfilePath
+  dockerfilePath=$(cd "$workspaceDir" && pwd -P)/Dockerfile
 
-  console.log "Building image: $image_tag from $workspace_dir"
+  console.log "Building image: $imageTag from $workspaceDir"
   docker build \
-    --label "dockerfile.path=$dockerfile_path" \
-    --label "dockerfile.dir=$(dirname "$dockerfile_path")" \
-    -t "$image_tag" "$workspace_dir"
+    --label "dockerfile.path=$dockerfilePath" \
+    --label "dockerfile.dir=$(dirname "$dockerfilePath")" \
+    -t "$imageTag" "$workspaceDir"
   local rc=$?
 
   if [ $rc -eq 0 ]; then
-    success.log "Image $image_tag built successfully"
+    success.log "Image $imageTag built successfully"
   else
     error.log "Build failed with exit code $rc"
   fi
   return $rc
 }
-odocker.build.completion.workspace() {
-  private.odocker.workspaces
-}
 
-odocker.run() # <image> <?name> # run container from image
+odocker.run() # <image> <?name> <?docker> # run container from image
 {
   local image="$1"
   if [ -z "$image" ]; then
-    error.log "Usage: odocker run <image> <?name>"
+    echo "Usage: odocker run <image> <?name> <?docker>"
     return 1
   fi
   shift
   local name="$1"
+  shift 2>/dev/null
+  local dockerOpt=$(private.odocker.docker.socket.opt)
 
-  local name_opt=""
+  local nameOpt=""
   if [ -n "$name" ]; then
-    name_opt="--name $name"
+    nameOpt="--name $name"
   fi
 
   console.log "Running image: $image"
-  docker run -it $name_opt "$image" bash
-}
-odocker.run.completion.image() {
-  private.odocker.images
+  docker run -it $nameOpt $dockerOpt "$image" bash
 }
 
-odocker.run.ephemeral() # <image> <workdir> <args...> # one-shot run in a mounted workdir; container auto-removed
-{
-  # GENERIC (domain-agnostic) one-shot primitive — the verb `ephemeral` encodes
-  # --rm. The docker-runtime concerns live HERE, never as oosh flags: --rm,
-  # --security-opt seccomp=unconfined (Docker 20.10.7 blocks the JVM/thread
-  # clone3 → "cannot create worker GC thread" without it), and -v/-w mount the
-  # workdir at its own path. <args...> are OPAQUE passthrough to the image's
-  # entrypoint (foreign-CLI exception; oosh method signature stays flag-free).
-  local image="$1"
-  local workdir="$2"
-  if [ -z "$image" ] || [ -z "$workdir" ]; then
-    error.log "Usage: odocker run.ephemeral <image> <workdir> <args...>"
-    return 1
-  fi
-  shift 2
-  docker run --rm --security-opt seccomp=unconfined -v "$workdir":"$workdir" -w "$workdir" "$image" "$@"
-}
-odocker.run.ephemeral.completion.image() {
-  private.odocker.images
-}
-
-odocker.image.ensure() # <image> # idempotent: pull the image if missing, no-op if present (self-care)
-{
-  # Constructor contract: run anytime → image available afterwards. No-op when the
-  # image is already local; pulls otherwise. Returns 0 when the image is present.
-  local image="$1"
-  if [ -z "$image" ]; then
-    error.log "Usage: odocker image.ensure <image>"
-    return 1
-  fi
-  if docker image inspect "$image" >/dev/null 2>&1; then
-    console.log "image present: $image"
-    return 0
-  fi
-  console.log "image missing — pulling: $image"
-  docker pull "$image"
-}
-odocker.image.ensure.completion.image() {
-  private.odocker.images
-}
-
-odocker.run.sshd() # <image> <?name> <?sshHostPort> # run container with SSH port mappings (for sshd images); 3rd arg maps ONLY ssh on that host port (multi-box safe)
+odocker.run.sshd() # <image> <?name> <?portOrOffset:0> <?docker> # run container with port mappings (offset or SSH port, e.g. 1000 or 9022)
 {
   local image="$1"
   if [ -z "$image" ]; then
-    error.log "Usage: odocker run.sshd <image> <?name> <?sshHostPort>"
+    echo "Usage: odocker run.sshd <image> <?name> <?portOrOffset:0> <?docker>"
     return 1
   fi
   shift
-  local name="${1:-$(echo "$image" | tr '/:' '_')_sshd}"
+  local name="$1"
   shift 2>/dev/null
-  local sshHostPort="$1"
+  local portOffset=$(private.odocker.port.offset "$1")
+  local sshPort=$((8022 + portOffset))
+  shift 2>/dev/null
+  local dockerArg="$1"
+  local dockerOpt=$(private.odocker.docker.socket.opt)
 
-  local rc
-  if [ -n "$sshHostPort" ]; then
-    # Explicit ssh host port → map SSH ONLY, bound to 127.0.0.1 (localhost-only).
-    # HARDENED (2026-07-02, post /tmp/linux u20 malware): the container was owned
-    # via a network-exposed 0.0.0.0:9022 sshd brute-force. These boxes are only
-    # accessed FROM this host (ossh install / ssh <alias>), so binding loopback
-    # removes the remote attack surface entirely. Combined with the key-only
-    # image (no password auth), this is the anti-recompromise baseline.
-    console.log "Running image: $image as $name (SSH on 127.0.0.1:$sshHostPort, key-only)"
-    docker run -d --name "$name" -p "127.0.0.1:${sshHostPort}:22" "$image"
-    rc=$?
-    [ $rc -eq 0 ] && success.log "Container $name started (SSH: ssh -p $sshHostPort root@localhost — key-only, loopback-bound)"
-  else
-    console.log "Running image: $image with SSH mappings as $name"
-    docker run -d \
-      --name "$name" \
-      -p 8022:22 \
-      -p 8080:8080 \
-      -p 8443:8443 \
-      -p 5001:5001 \
-      -p 5002:5002 \
-      -p 5005:5005 \
-      "$image"
-    rc=$?
-    [ $rc -eq 0 ] && success.log "Container $name started (SSH: ssh -p 8022 test@localhost)"
+  # Lowest default port is 5001; offset must not push any port below 1
+  if [ $((5001 + portOffset)) -lt 1 ]; then
+    error.log "Port offset $portOffset too low: would produce invalid port $((5001 + portOffset))"
+    return 1
   fi
 
-  [ $rc -ne 0 ] && error.log "Run failed with exit code $rc"
+  local nameOpt=""
+  if [ -n "$name" ]; then
+    nameOpt="--name $name"
+  fi
+
+  console.log "Running image: $image with port mappings (offset: $portOffset)"
+  local cid
+  cid=$(docker run -d \
+    $nameOpt \
+    $dockerOpt \
+    -p $sshPort:22 \
+    -p $((8080 + portOffset)):8080 \
+    -p $((8443 + portOffset)):8443 \
+    -p $((5001 + portOffset)):5001 \
+    -p $((5002 + portOffset)):5002 \
+    -p $((5005 + portOffset)):5005 \
+    "$image")
+  local rc=$?
+
+  if [ $rc -eq 0 ]; then
+    local cname
+    cname=$(private.odocker.container.name "$cid")
+    success.log "Container $cname (${cid:0:12}) started (SSH: ssh -p $sshPort root@localhost)"
+    if [ "$dockerArg" = "docker" ]; then
+      odocker.install "$cname"
+    fi
+  else
+    error.log "Run failed with exit code $rc"
+  fi
   return $rc
 }
-odocker.run.sshd.completion.image() {
-  private.odocker.images
+
+odocker.rebuild.completion.workspace() {
+  private.odocker.workspace.list
+}
+
+odocker.rebuild() # <workspace> # remove old image and rebuild from Dockerfile
+{
+  private.odocker.ensure.socket.access
+  local workspace="$1"
+  if [ -z "$workspace" ]; then
+    echo "Usage: odocker rebuild <workspace>"
+    echo ""
+    odocker.workspace.list
+    return 1
+  fi
+
+  local imageTag
+  imageTag=$(private.odocker.image.resolve.from.workspace "$workspace")
+
+  if docker image inspect "$imageTag" >/dev/null 2>&1; then
+    console.log "Removing old image: $imageTag"
+    docker rmi -f "$imageTag" 2>/dev/null
+  fi
+
+  odocker.build "$workspace"
+}
+
+odocker.reset() # <image> <?portOrOffset:0> <?docker> # stop container, remove it, clear host key, start fresh (offset or SSH port)
+{
+  private.odocker.ensure.socket.access
+  local image="$1"
+  if [ -z "$image" ]; then
+    echo "Usage: odocker reset <image> <?portOrOffset:0> <?docker>"
+    return 1
+  fi
+  shift
+  local rawPortArg="${1:-0}"
+  shift 2>/dev/null
+  local dockerArg="$1"
+  local portOffset=$(private.odocker.port.offset "$rawPortArg")
+  local sshPort=$((8022 + portOffset))
+
+  # Step 1: Stop and remove any container on the SSH port
+  local containerId
+  containerId=$(docker ps -q --filter "publish=$sshPort" 2>/dev/null)
+  if [ -n "$containerId" ]; then
+    console.log "Stopping container on port $sshPort..."
+    docker stop "$containerId" 2>/dev/null
+    docker rm "$containerId" 2>/dev/null
+  fi
+
+  # Also clean up stopped containers on that port
+  containerId=$(docker ps -aq --filter "publish=$sshPort" 2>/dev/null)
+  if [ -n "$containerId" ]; then
+    docker rm "$containerId" 2>/dev/null
+  fi
+
+  # Also clean up by container name (stopped containers lose port bindings)
+  local containerName
+  containerName="$(echo "$image" | tr '/:' '_')_sshd"
+  docker rm -f "$containerName" 2>/dev/null
+
+  # Step 2: Clear stale SSH host key
+  ossh known.hosts.remove localhost "$sshPort"
+
+  # Step 3: Start fresh container
+  console.log "Starting fresh container from $image on port $sshPort..."
+  odocker.run.sshd "$image" "" "$rawPortArg" "$dockerArg"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONTAINER OPERATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
-odocker.exec() # <container> <?shell:bash> # exec into running container
+odocker.exec() # <container> <?shell> # exec into running container
 {
   local container="$1"
   if [ -z "$container" ]; then
-    error.log "Usage: odocker exec <container> <?shell:bash>"
+    echo "Usage: odocker exec <container> <?shell>"
     return 1
   fi
   shift
-  local shell="${1:-bash}"
+  local shell="$1"
+  if [ -z "$shell" ]; then
+    if docker exec "$container" sh -c 'command -v bash' >/dev/null 2>&1; then
+      shell="bash"
+    else
+      shell="sh"
+    fi
+  fi
 
   docker exec -it "$container" "$shell"
 }
-odocker.exec.completion.container() {
-  private.odocker.running.containers
-}
 
-odocker.exec.command() # <container> <command...> # run a non-interactive command inside a running container (no TTY)
+odocker.enter() # <container> <?shell:bash> # enter a running container
 {
-  local container="$1"
-  if [ -z "$container" ]; then
-    error.log "Usage: odocker exec.command <container> <command...>"
-    return 1
-  fi
-  shift
-  if [ -z "$1" ]; then
-    error.log "Usage: odocker exec.command <container> <command...>"
-    return 1
-  fi
-  # No -it: callers are scripts/state machines, not humans. "$*" lets callers
-  # pass a full shell snippet as one argument; sh -c runs it inside the container.
-  docker exec "$container" sh -c "$*"
-}
-odocker.exec.command.completion.container() {
-  private.odocker.container.list.all
+  odocker.exec "$@"
 }
 
 odocker.stop() # <container> # stop a running container
 {
   local container="$1"
   if [ -z "$container" ]; then
-    error.log "Usage: odocker stop <container>"
+    echo "Usage: odocker stop <container>"
     return 1
   fi
 
@@ -449,15 +569,12 @@ odocker.stop() # <container> # stop a running container
   fi
   return $rc
 }
-odocker.stop.completion.container() {
-  private.odocker.running.containers
-}
 
 odocker.log() # <container> <?lines:50> # show container logs
 {
   local container="$1"
   if [ -z "$container" ]; then
-    error.log "Usage: odocker log <container> <?lines:50>"
+    echo "Usage: odocker log <container> <?lines:50>"
     return 1
   fi
   shift
@@ -466,14 +583,14 @@ odocker.log() # <container> <?lines:50> # show container logs
   docker logs --tail "$lines" "$container"
 }
 odocker.log.completion.container() {
-  private.odocker.all.containers
+  private.odocker.container.list.all
 }
 
 odocker.rm() # <container> # remove a stopped container
 {
   local container="$1"
   if [ -z "$container" ]; then
-    error.log "Usage: odocker rm <container>"
+    echo "Usage: odocker rm <container>"
     return 1
   fi
 
@@ -486,15 +603,44 @@ odocker.rm() # <container> # remove a stopped container
   fi
   return $rc
 }
+
 odocker.rm.completion.container() {
-  private.odocker.all.containers
+  private.odocker.container.list.all
+}
+
+odocker.create() # <image> <?name> # create container without starting
+{
+  local image="$1"
+  if [ -z "$image" ]; then
+    echo "Usage: odocker create <image> <?name>"
+    return 1
+  fi
+  shift
+  local name="$1"
+
+  local nameOpt=""
+  if [ -n "$name" ]; then
+    nameOpt="--name $name"
+  fi
+
+  local cid
+  cid=$(docker create $nameOpt "$image")
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    local cname
+    cname=$(private.odocker.container.name "$cid")
+    success.log "Container $cname (${cid:0:12}) created from $image"
+  else
+    error.log "Create failed with exit code $rc"
+  fi
+  return $rc
 }
 
 odocker.rmi() # <image> # remove an image
 {
   local image="$1"
   if [ -z "$image" ]; then
-    error.log "Usage: odocker rmi <image>"
+    echo "Usage: odocker rmi <image>"
     return 1
   fi
 
@@ -507,8 +653,385 @@ odocker.rmi() # <image> # remove an image
   fi
   return $rc
 }
-odocker.rmi.completion.image() {
-  private.odocker.images
+
+odocker.clone() # <container> <?portOrOffset:0> <?docker> # clone a container with its filesystem state onto different ports
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    echo "Usage: odocker clone <container> <?portOrOffset:0> <?docker>"
+    echo ""
+    odocker.container.list
+    return 1
+  fi
+  shift
+  local rawPortArg="${1:-0}"
+  shift 2>/dev/null
+  local dockerArg="$1"
+  local portOffset=$(private.odocker.port.offset "$rawPortArg")
+
+  # Verify source container exists
+  if ! docker container inspect "$container" >/dev/null 2>&1; then
+    error.log "Container not found: $container"
+    return 1
+  fi
+
+  # Step 1: Commit container filesystem to a snapshot image
+  local cloneImage="clone_${container}"
+  console.log "Committing $container to image $cloneImage..."
+  docker commit "$container" "$cloneImage" >/dev/null 2>&1
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    error.log "Failed to commit container $container"
+    return $rc
+  fi
+
+  # Step 2: Run new container from snapshot
+  local exposedPorts
+  exposedPorts=$(docker inspect --format '{{json .Config.ExposedPorts}}' "$cloneImage" 2>/dev/null)
+  if echo "$exposedPorts" | grep -q '"22/tcp"'; then
+    odocker.run.sshd "$cloneImage" "" "$rawPortArg" "$dockerArg"
+    rc=$?
+  else
+    local dockerOpt=$(private.odocker.docker.socket.opt)
+    local cid
+    cid=$(docker run -d $dockerOpt "$cloneImage")
+    rc=$?
+    if [ $rc -eq 0 ]; then
+      local cname
+      cname=$(private.odocker.container.name "$cid")
+      success.log "Container $cname (${cid:0:12}) cloned from $container"
+    fi
+  fi
+
+  # Step 3: Clone volume data from source container
+  if [ $rc -eq 0 ]; then
+    local cloneCid
+    cloneCid=$(docker ps -lq --filter "ancestor=$cloneImage" 2>/dev/null)
+    if [ -n "$cloneCid" ]; then
+      local mounts
+      mounts=$(docker inspect --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$container" 2>/dev/null)
+      if [ -n "$mounts" ]; then
+        console.log "Cloning volume data..."
+        local mountPath
+        while IFS= read -r mountPath; do
+          [ -z "$mountPath" ] && continue
+          docker cp "$container":"$mountPath" - 2>/dev/null | docker cp - "$cloneCid":/ 2>/dev/null
+          if [ $? -eq 0 ]; then
+            console.log "  Cloned volume: $mountPath"
+          else
+            error.log "  Failed to clone volume: $mountPath"
+          fi
+        done <<< "$mounts"
+      fi
+    fi
+  fi
+
+  if [ $rc -eq 0 ]; then
+    success.log "Cloned $container (offset: $portOffset)"
+  else
+    # Clean up snapshot image on failure
+    docker rmi "$cloneImage" >/dev/null 2>&1
+    error.log "Clone failed with exit code $rc"
+  fi
+  return $rc
+}
+odocker.clone.completion.container() {
+  private.odocker.container.list.all
+}
+
+odocker.install() # <container> # install Docker CLI inside a running container
+{
+  local container="$1"
+  if [ -n "$1" ]; then
+    shift
+  else
+    error.log "no container was specified"
+    echo "Usage: odocker install <container>"
+    return 1
+  fi
+
+  # Verify container exists and is running
+  local state
+  state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null)
+  if [ -z "$state" ]; then
+    error.log "Container not found: $container"
+    return 1
+  fi
+  if [ "$state" != "running" ]; then
+    error.log "Container $container is not running (state: $state)"
+    return 1
+  fi
+
+  # Verify Docker socket is mounted
+  local socketMounted
+  socketMounted=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}yes{{end}}{{end}}' "$container" 2>/dev/null)
+  if [ "$socketMounted" != "yes" ]; then
+    error.log "Docker socket not mounted in $container. Recreate with 'docker' parameter."
+    return 1
+  fi
+
+  # Detect OS via package manager and install Docker CLI
+  console.log "Installing Docker CLI in $container..."
+  local rc
+  if docker exec "$container" sh -c 'command -v apk' >/dev/null 2>&1; then
+    info.log "Detected Alpine (apk)"
+    docker exec "$container" apk add --no-cache docker-cli util-linux-misc
+    rc=$?
+  elif docker exec "$container" sh -c 'command -v apt-get' >/dev/null 2>&1; then
+    info.log "Detected Debian/Ubuntu (apt-get)"
+    docker exec "$container" sh -c 'apt-get update && apt-get install -y docker.io bsdextrautils'
+    rc=$?
+  elif docker exec "$container" sh -c 'command -v dnf' >/dev/null 2>&1; then
+    info.log "Detected RHEL/Alma/Fedora (dnf)"
+    docker exec "$container" sh -c 'dnf install -y yum-utils && dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && dnf install -y docker-ce-cli'
+    rc=$?
+  elif docker exec "$container" sh -c 'command -v yum' >/dev/null 2>&1; then
+    info.log "Detected CentOS/older RHEL (yum)"
+    docker exec "$container" sh -c 'yum install -y yum-utils && yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && yum install -y docker-ce-cli'
+    rc=$?
+  else
+    error.log "Unsupported OS in $container: no known package manager found"
+    return 1
+  fi
+
+  if [ $rc -eq 0 ]; then
+    success.log "Docker CLI installed in $container"
+    # Grant non-root users access to the bind-mounted Docker socket.
+    # Strategy: find or create a group matching the socket's GID, then add users to it.
+    # Never chgrp the socket — it's bind-mounted from the host and changing it breaks host perms.
+    local socketGid
+    socketGid=$(docker exec "$container" stat -c "%g" /var/run/docker.sock 2>/dev/null)
+    if [ -z "$socketGid" ]; then
+      info.log "Docker socket not found in $container — skipping group setup"
+    else
+      # Find or create a group matching the socket's GID
+      local socketGroup
+      socketGroup=$(docker exec "$container" sh -c "getent group $socketGid 2>/dev/null | cut -d: -f1")
+      if [ -z "$socketGroup" ]; then
+        # No group with this GID — align existing docker group or create one
+        local existingGid
+        existingGid=$(docker exec "$container" sh -c "getent group docker 2>/dev/null | cut -d: -f3")
+        if [ -n "$existingGid" ] && [ "$existingGid" != "$socketGid" ]; then
+          # docker group exists with wrong GID — fix it
+          docker exec "$container" sh -c "groupmod -g $socketGid docker 2>/dev/null || { delgroup docker 2>/dev/null; addgroup -g $socketGid docker 2>/dev/null; }"
+        else
+          docker exec "$container" sh -c "groupadd -g $socketGid docker 2>/dev/null || addgroup -g $socketGid docker 2>/dev/null"
+        fi
+        socketGroup="docker"
+      fi
+      # Add all non-system users to the socket's group
+      local ooshDir
+      ooshDir=$(docker exec "$container" bash -c 'source ~/config/user.env 2>/dev/null; echo "$OOSH_DIR"' 2>/dev/null)
+      local u
+      for u in $(docker exec "$container" awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
+        if [ -n "$ooshDir" ] && docker exec "$container" test -f "$ooshDir/user" 2>/dev/null; then
+          docker exec "$container" bash -c "source ~/config/user.env 2>/dev/null; LOG_LEVEL=0 \$OOSH_DIR/user group.add $socketGroup $u"
+        else
+          docker exec "$container" sh -c "usermod -aG $socketGroup $u 2>/dev/null || addgroup $u $socketGroup 2>/dev/null"
+        fi
+      done
+    fi
+  else
+    error.log "Docker CLI installation failed in $container (exit code: $rc)"
+  fi
+  return $rc
+}
+odocker.install.completion.container() {
+  private.odocker.container.list.running
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCKER COMPOSE
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.odocker.compose.file.in() {
+  local dir="$1"
+  local f
+  for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
+    if [ -f "$dir/$f" ]; then
+      echo "$dir/$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+private.odocker.compose.file.find() {
+  local dir="${1:-}"
+  # If explicit dir given, check only there
+  if [ -n "$dir" ]; then
+    private.odocker.compose.file.in "$dir" && return 0
+    return 1
+  fi
+  # 1. Current directory
+  private.odocker.compose.file.in "." && return 0
+  # 2. Workspace directory
+  if [ -d "$ODOCKER_WORKSPACES" ]; then
+    private.odocker.compose.file.in "$ODOCKER_WORKSPACES" && return 0
+  fi
+  # 3. From running compose containers (docker inspect label)
+  local firstContainer
+  firstContainer=$(docker ps -q 2>/dev/null | head -1)
+  if [ -n "$firstContainer" ]; then
+    local composeDir
+    composeDir=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$firstContainer" 2>/dev/null)
+    if [ -n "$composeDir" ] && [ "$composeDir" != "<no value>" ]; then
+      private.odocker.compose.file.in "$composeDir" && return 0
+    fi
+  fi
+  return 1
+}
+
+private.odocker.compose.services() {
+  local composeFile
+  composeFile=$(private.odocker.compose.file.find 2>/dev/null)
+  if [ -n "$composeFile" ]; then
+    docker compose -f "$composeFile" config --services 2>/dev/null
+  fi
+}
+
+odocker.compose() # <?service> # show compose status or service details
+{
+  local service="$1"
+  local composeFile
+  composeFile=$(private.odocker.compose.file.find)
+  if [ $? -ne 0 ]; then
+    error.log "No compose file found"
+    return 1
+  fi
+
+  if [ -n "$service" ]; then
+    docker compose -f "$composeFile" ps "$service"
+  else
+    console.log "Compose file: $composeFile"
+    docker compose -f "$composeFile" ps
+  fi
+}
+odocker.compose.completion.service() {
+  private.odocker.compose.services
+  private.odocker.container.list.running
+}
+
+odocker.up() # <container> <?portOrOffset:0> <?docker> # start a container, run an image, or start a compose service (offset or SSH port)
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    echo "Usage: odocker up <container|image|service> <?portOrOffset:0> <?docker>"
+    echo ""
+    odocker.container.list
+    echo ""
+    odocker.image.list
+    return 0
+  fi
+  shift
+  local rawPortArg="${1:-0}"
+  shift 2>/dev/null
+  local dockerArg="$1"
+  local portOffset=$(private.odocker.port.offset "$rawPortArg")
+
+  # Try as docker container first (container inspect, not generic inspect)
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    # If portOffset requested but container has no port bindings, offer to recreate
+    local existingPorts
+    existingPorts=$(private.odocker.container.ports "$container")
+    if [ "$portOffset" -ne 0 ] && [ -z "$existingPorts" ]; then
+      local image
+      image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+      echo "Container $container has no port bindings."
+      read -p "Reset from $image with offset $portOffset? (y/N) " confirm
+      if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        docker rm -f "$container" 2>/dev/null
+        odocker.run.sshd "$image" "$container" "$rawPortArg" "$dockerArg"
+        return $?
+      else
+        console.log "Aborted"
+        return 0
+      fi
+    fi
+    console.log "Starting container: $container"
+    docker start "$container"
+  elif docker image inspect "$container" >/dev/null 2>&1; then
+    # Try as image — use run.sshd if image exposes port 22, else run detached
+    local exposedPorts
+    exposedPorts=$(docker inspect --format '{{json .Config.ExposedPorts}}' "$container" 2>/dev/null)
+    if echo "$exposedPorts" | grep -q '"22/tcp"'; then
+      odocker.run.sshd "$container" "" "$rawPortArg" "$dockerArg"
+    else
+      console.log "Running new container from image: $container (detached)"
+      local dockerOpt=$(private.odocker.docker.socket.opt)
+      local cid
+      cid=$(docker run -d $dockerOpt "$container")
+      local rc=$?
+      if [ $rc -eq 0 ]; then
+        local cname
+        cname=$(private.odocker.container.name "$cid")
+        success.log "Container $cname (${cid:0:12}) started"
+      fi
+    fi
+    return $?
+  else
+    # Try as compose service
+    local composeFile
+    composeFile=$(private.odocker.compose.file.find)
+    if [ $? -eq 0 ]; then
+      console.log "Starting compose service: $container"
+      docker compose -f "$composeFile" up -d "$container"
+    else
+      error.log "Not found as container, image, or compose service: $container"
+      return 1
+    fi
+  fi
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "Started: $container"
+  else
+    error.log "Start failed with exit code $rc"
+  fi
+  return $rc
+}
+odocker.up.completion.container() {
+  private.odocker.container.list.all
+  private.odocker.image.list
+  private.odocker.compose.services 2>/dev/null
+}
+
+odocker.down() # <container> # stop a container or compose service
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    echo "Usage: odocker down <container|service>"
+    echo ""
+    odocker.container.list
+    return 0
+  fi
+
+  # Try as running docker container first (container inspect, not generic inspect)
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    console.log "Stopping container: $container"
+    docker stop "$container"
+  else
+    # Try as compose service
+    local composeFile
+    composeFile=$(private.odocker.compose.file.find)
+    if [ $? -eq 0 ]; then
+      console.log "Stopping compose service: $container"
+      docker compose -f "$composeFile" stop "$container"
+    else
+      error.log "Container or service not found: $container"
+      return 1
+    fi
+  fi
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "Stopped: $container"
+  else
+    error.log "Stop failed with exit code $rc"
+  fi
+  return $rc
+}
+odocker.down.completion.container() {
+  private.odocker.container.list.running
+  private.odocker.compose.services 2>/dev/null
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -518,15 +1041,94 @@ odocker.rmi.completion.image() {
 odocker.status() # # show Docker overview: images, containers, disk usage
 {
   console.log "=== Running Containers ==="
-  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null
+  {
+    printf "CONTAINER ID\tNAMES\tIMAGE\tSTATUS\tPORTS\n"
+    local id name image status ports
+    while IFS=$'\t' read -r id name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$name" "$image" "$status" "$ports"
+    done < <(docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
   echo ""
 
   console.log "=== Stopped Containers ==="
-  docker ps -a --filter "status=exited" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null
+  {
+    printf "CONTAINER ID\tNAMES\tIMAGE\tSTATUS\tPORTS\n"
+    while IFS=$'\t' read -r id name image status; do
+      ports=$(private.odocker.container.ports "$name")
+      printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$name" "$image" "$status" "$ports"
+    done < <(docker ps -a --filter "status=exited" --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  } | column -t -s $'\t'
   echo ""
 
   console.log "=== Images ==="
   docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' 2>/dev/null
+  echo ""
+
+  console.log "=== Disk Usage ==="
+  docker system df 2>/dev/null
+}
+
+odocker.lifecycle() # # check health of containers, images, and compose services
+{
+  console.log "=== Container Health ==="
+  {
+    printf "CONTAINER ID\tCONTAINER\tIMAGE\tHEALTH\tPORTS\n"
+    local id container image health ports
+    while IFS=$'\t' read -r id container; do
+      [ -z "$container" ] && continue
+      image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+      health=$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null)
+      if [ -z "$health" ] || [ "$health" = "<no value>" ]; then
+        health="no healthcheck"
+      fi
+      ports=$(private.odocker.container.ports "$container")
+      printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$container" "$image" "$health" "$ports"
+    done < <(docker ps --format '{{.ID}}\t{{.Names}}' 2>/dev/null)
+  } | column -t -s $'\t'
+  echo ""
+
+  console.log "=== Stopped Containers ==="
+  local name status
+  local stopped
+  stopped=$(docker ps -a --filter "status=exited" --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+  if [ -n "$stopped" ]; then
+    {
+      printf "CONTAINER ID\tCONTAINER\tIMAGE\tSTATUS\tPORTS\n"
+      echo "$stopped" | while IFS=$'\t' read -r id name image status; do
+        ports=$(private.odocker.container.ports "$name")
+        printf "%s\t%s\t%s\t%s\t%s\n" "$id" "$name" "$image" "$status" "$ports"
+      done
+    } | column -t -s $'\t'
+  else
+    echo "  (none)"
+  fi
+  echo ""
+
+  console.log "=== Images ==="
+  docker images --format '  {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}' 2>/dev/null | grep -v '<none>' | column -t -s $'\t'
+  echo ""
+
+  console.log "=== Dangling Images ==="
+  local dangling
+  dangling=$(docker images --filter "dangling=true" --format '{{.ID}} {{.CreatedSince}}' 2>/dev/null)
+  if [ -n "$dangling" ]; then
+    echo "$dangling" | while read -r id age; do
+      printf "  %-20s %s\n" "$id" "$age"
+    done
+  else
+    echo "  (none)"
+  fi
+  echo ""
+
+  console.log "=== Compose Services ==="
+  local composeFile
+  composeFile=$(private.odocker.compose.file.find 2>/dev/null)
+  if [ -n "$composeFile" ]; then
+    docker compose -f "$composeFile" ps 2>/dev/null
+  else
+    echo "  (no compose file found)"
+  fi
   echo ""
 
   console.log "=== Disk Usage ==="
@@ -538,20 +1140,50 @@ odocker.disk() # # show Docker disk usage details
   docker system df -v 2>/dev/null
 }
 
-odocker.prune() # # remove dangling images and stopped containers
+odocker.prune() # <container> # remove a stopped container and its image
 {
-  console.log "Will remove:"
-  console.log "  - Stopped containers"
-  console.log "  - Dangling images"
-  console.log "  - Unused networks"
-  echo ""
+  local container="$1"
 
-  docker container prune -f 2>/dev/null
-  docker image prune -f 2>/dev/null
-  docker network prune -f 2>/dev/null
+  if [ -z "$container" ]; then
+    echo "Usage: odocker prune <container>"
+    echo ""
+    odocker.container.list
+    return 1
+  fi
 
-  success.log "Prune complete"
-  docker system df 2>/dev/null
+  # Selective prune: remove container and its image
+  local image
+  image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+
+  # Remove the container
+  docker rm -f "$container" 2>/dev/null
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "Container $container removed"
+  else
+    error.log "Failed to remove container: $container"
+    return $rc
+  fi
+
+  # Remove the image if no other containers use it
+  if [ -n "$image" ]; then
+    local others
+    others=$(docker ps -a --filter "ancestor=$image" --format '{{.Names}}' 2>/dev/null)
+    if [ -z "$others" ]; then
+      docker rmi "$image" 2>/dev/null
+      if [ $? -eq 0 ]; then
+        success.log "Image $image removed"
+      else
+        error.log "Failed to remove image: $image"
+      fi
+    else
+      console.log "Image $image still in use by: $others"
+    fi
+  fi
+}
+odocker.prune.completion.container() {
+  private.odocker.container.list.all
+  private.odocker.image.list
 }
 
 odocker.prune.all() # # full system prune including unused images and volumes
@@ -601,186 +1233,63 @@ odocker.usage()
   echo "
 
   Examples
+    $this workspace.get
+    $this workspace.set /path/to/workspaces
+    $this workspace.list
+    $this container.list
+    $this image.list
     $this ps
     $this build nakedUbuntu/20.04.sshd
     $this run.sshd naked_ubuntu_20_04_sshd
     $this exec fervent_ritchie
+    $this enter fervent_ritchie
+    $this create naked_ubuntu_24_04 mycontainer
+    $this up mycontainer
+    $this down mycontainer
     $this file.find fervent_ritchie
     $this stop fervent_ritchie
     $this log fervent_ritchie
-    $this workspace.list
+    $this compose
     $this status
+    $this lifecycle
     $this disk
     $this prune
     ----------
   "
 }
 
-private.odocker.isInsideDocker() # # return 0 if running inside a Docker container
-{
-  [ -f /.dockerenv ] && return 0
-  grep -q 'docker\|containerd' /proc/1/cgroup 2>/dev/null && return 0
-  return 1
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER COMPLETIONS (shared across all methods)
+# ─────────────────────────────────────────────────────────────────────────────
+
+odocker.parameter.completion.shell() {
+  echo "bash"
+  echo "sh"
 }
 
-odocker.install() # <?container> # install Docker CLI (inside container) or engine (on host). Auto-detects.
-{
-  local container="$1"
-
-  if [ -n "$container" ]; then
-    # Install CLI into a named container via docker exec
-    console.log "Installing Docker CLI into container: $container"
-    docker exec "$container" bash -c '
-      apt-get update -qq && apt-get install -y -qq docker.io 2>/dev/null || \
-      apt-get install -y -qq docker-ce-cli 2>/dev/null || \
-      { echo "ERROR: could not install Docker CLI"; exit 1; }
-    '
-    return $?
-  fi
-
-  if private.odocker.isInsideDocker; then
-    # Inside a container: install CLI only (engine runs on host)
-    console.log "Detected: running inside Docker container"
-    console.log "Installing Docker CLI only (engine runs on host)..."
-    oo cmd docker.io 2>/dev/null || oo cmd docker-ce-cli 2>/dev/null || {
-      # Manual install if oo cmd fails
-      if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq docker.io
-      elif command -v apk >/dev/null 2>&1; then
-        apk add docker-cli
-      else
-        error.log "Cannot install Docker CLI — unknown package manager"
-        return 1
-      fi
-    }
-    if command -v docker >/dev/null 2>&1; then
-      success.log "Docker CLI installed: $(docker --version 2>/dev/null)"
-    else
-      error.log "Docker CLI installation failed"
-      return 1
-    fi
-  else
-    # On host: install full Docker engine
-    console.log "Detected: running on host (not inside Docker)"
-    console.log "Installing Docker engine..."
-    if command -v docker >/dev/null 2>&1; then
-      console.log "Docker already installed: $(docker --version)"
-      return 0
-    fi
-    curl -fsSL https://get.docker.com | bash
-    if command -v docker >/dev/null 2>&1; then
-      success.log "Docker engine installed: $(docker --version)"
-    else
-      error.log "Docker engine installation failed"
-      return 1
-    fi
-  fi
-}
-odocker.install.completion.container() {
-  private.odocker.running.containers
+odocker.parameter.completion.workspace() {
+  private.odocker.workspace.list
 }
 
-# ── Hypervisor self-care (constructor must yield a reachable docker engine) ───
-# `odocker.start` is the constructor: a fully-operational odocker means the docker
-# daemon answers. Detect a dead daemon and bring the hypervisor up — idempotent
-# (already-up → no-op), context/endpoint read from `docker context` (never a
-# guessed path), fail-loud (never rc0 on a dead daemon).
-
-private.odocker.activeContext() # # echo the active docker context name
-{
-  docker context show 2>/dev/null
+odocker.parameter.completion.container() {
+  private.odocker.container.list.running
 }
 
-private.odocker.engineReachable() # # 0 if the docker daemon answers on the active context
-{
-  docker info >/dev/null 2>&1
+odocker.parameter.completion.image() {
+  private.odocker.image.list
 }
 
-private.odocker.waitReachable() # <?timeout:90> # poll docker info until reachable or timeout; 0 on success
-{
-  local timeout="${1:-90}" waited=0
-  while [ "$waited" -lt "$timeout" ]; do
-    private.odocker.engineReachable && return 0
-    sleep 2; waited=$((waited + 2))
-  done
-  private.odocker.engineReachable
+odocker.parameter.completion.service() {
+  private.odocker.compose.services
 }
 
-private.odocker.ensureEngine() # # self-heal: ensure the docker engine is reachable, bringing the hypervisor up; fail loud
-{
-  # Idempotent — already reachable → no-op.
-  if private.odocker.engineReachable; then
-    debug.log "odocker: docker engine reachable — no-op"
-    return 0
-  fi
-  local ctx; ctx="$(private.odocker.activeContext)"
-  important.log "odocker.start: docker engine not reachable (context '${ctx:-?}') — bringing the hypervisor up"
-  case "$ctx" in
-    desktop-linux)
-      command -v systemctl >/dev/null 2>&1 || { error.log "odocker.start: systemctl unavailable — cannot start the docker-desktop hypervisor"; return 1; }
-      systemctl --user start docker-desktop 2>/dev/null \
-        || { error.log "odocker.start: 'systemctl --user start docker-desktop' failed — check 'systemctl --user status docker-desktop'"; return 1; }
-      if private.odocker.waitReachable 90; then
-        console.log "odocker.start: hypervisor up — docker engine reachable"; return 0
-      fi
-      error.log "odocker.start: started docker-desktop but the engine is still unreachable after 90s — check 'systemctl --user status docker-desktop'"
-      return 1
-      ;;
-    default)
-      # System dockerd path — root/sudo-gated; degrade gracefully if not permitted.
-      local sudo=""; [ "$(id -u)" -ne 0 ] && sudo="sudo"
-      if $sudo systemctl start docker 2>/dev/null && private.odocker.waitReachable 60; then
-        console.log "odocker.start: system dockerd up — docker engine reachable"; return 0
-      fi
-      error.log "odocker.start: engine unreachable on context 'default' and could not start docker.service (needs privileges?) — start it manually"
-      return 1
-      ;;
-    *)
-      error.log "odocker.start: engine unreachable on context '${ctx:-?}' — no known hypervisor start path; start the daemon manually"
-      return 1
-      ;;
-  esac
+odocker.parameter.completion.docker() {
+  echo "docker"
 }
 
-private.odocker.ensureWorkspaceConfig() # # self-heal: persist ODOCKER_WORKSPACES + register odocker config if none exists (idempotent)
-{
-  local default="${OOSH_SHARED_BASE:-/home/shared}/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces"
-  # Idempotent — an odocker config already registered in user.env → no-op (just
-  # ensure the workspace dir exists so the object stays fully operational).
-  if grep -q 'odocker\.env' "$CONFIG" 2>/dev/null; then
-    debug.log "odocker: workspace config already registered — no-op"
-    [ -d "$ODOCKER_WORKSPACES" ] || mkdir -p "$ODOCKER_WORKSPACES" 2>/dev/null \
-      || warn.log "odocker: ODOCKER_WORKSPACES=$ODOCKER_WORKSPACES not creatable — create it manually"
-    return 0
-  fi
-  important.log "odocker.start: no docker workspace configured — provisioning ODOCKER_WORKSPACES=$default"
-  export ODOCKER_WORKSPACES="$default"
-  # 1. pure-state env file (odocker.env = exports only, no source lines).
-  config save odocker ODOCKER_ || { error.log "odocker.start: failed to persist odocker.env — NOT claiming configured"; return 1; }
-  # 2. wire it into user.env permanently (TRON: 'config add odocker').
-  config add odocker || { error.log "odocker.start: 'config add odocker' failed — NOT claiming configured"; return 1; }
-  # 3. fully-operational constructor: create the workspace dir (warn-not-fail —
-  #    the persisted var is the primary requirement; the dir is secondary).
-  [ -d "$default" ] || mkdir -p "$default" 2>/dev/null \
-    || warn.log "odocker.start: ODOCKER_WORKSPACES set but could not create $default — create it manually"
-  console.log "odocker.start: workspace config provisioned (ODOCKER_WORKSPACES=$default; wired via 'config add odocker')"
-  return 0
-}
-
-odocker.start() # # constructor: bootstrap kernel + ensure the docker hypervisor + workspace config (self-heal), then dispatch
+odocker.start()
 {
   source this
-  # Constructor must yield a fully-operational object → the docker engine must be
-  # reachable AND a docker workspace must be configured. Self-heal on real
-  # construction only; skip when sourced (completion) and for introspection verbs
-  # so the tool stays usable when docker is down.
-  if ! this.isSourced; then
-    case "$1" in
-      ''|help|help*|usage|completion*) : ;;
-      *) private.odocker.ensureEngine || return $?
-         private.odocker.ensureWorkspaceConfig || return $? ;;
-    esac
-  fi
   this.start "$@"
 }
 
