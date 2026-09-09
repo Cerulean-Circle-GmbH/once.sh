@@ -1,0 +1,763 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+### new.method
+
+otest.run() # <testName> <?headless> <?updateGolden> <?keepScreenshots> <?webkit> # Run a specific test (or 'all')
+{
+  local testName="$1"
+  [ -z "$testName" ] && { error.log "Usage: otest run <testName> <?headless> <?updateGolden> <?keepScreenshots>"; return 1; }
+  shift
+
+  # Map camelCase to snake_case for run_tests.py
+  testName=$(private.mapName "$testName")
+  private.runTest "$testName" "$@"
+}
+
+otest.run.completion.testName()
+{
+  private.testNames.camel
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY METHODS
+# ─────────────────────────────────────────────────────────────────────────────
+
+otest.here() # <?headless> <?updateGolden> <?keepScreenshots> <?webkit> # Auto-detect and run test for the current directory
+{
+  local yamlFile=""
+
+  # Check for otest.yaml in current directory
+  if [ -f "$(pwd)/otest.yaml" ]; then
+    yamlFile="$(pwd)/otest.yaml"
+  else
+    # Search in test/ subdirectories (supports version root invocation)
+    yamlFile=$(find "$(pwd)/test" -name "otest.yaml" -type f 2>/dev/null | head -n 1)
+  fi
+
+  if [ -n "$yamlFile" ]; then
+    local testName
+    # Try name: from yaml first
+    testName=$(grep '^name:' "$yamlFile" | sed 's/name: *//' | tr -d '"' | tr -d "'")
+    # If no name field, derive from .py filename (PascalCase -> snake_case)
+    if [ -z "$testName" ]; then
+      local testDir
+      testDir=$(dirname "$yamlFile")
+      local pyFile
+      pyFile=$(ls "$testDir"/*.py 2>/dev/null | head -n 1)
+      if [ -n "$pyFile" ]; then
+        pyFile=$(basename "$pyFile" .py)
+        testName=$(echo "$pyFile" | sed 's/\([A-Z]\)/_\L\1/g' | sed 's/^_//')
+      fi
+    fi
+    if [ -n "$testName" ]; then
+      console.log "Detected test: $testName (from $yamlFile)"
+      private.runTest "$testName" "$@"
+      return $?
+    fi
+  fi
+
+  error.log "No otest.yaml found in current directory or test/ subdirectories: $(pwd)"
+  return 1
+}
+
+otest.list() # # List all available tests
+{
+  echo "Available tests:"
+  private.discoverTests | while IFS=$'\t' read -r name desc; do
+    printf "  %-30s %s\n" "$name" "$desc"
+  done
+}
+
+otest.updateGolden() # <testName> <?headless> <?webkit> # Run a test and update golden screenshots
+{
+  local testName="$1"
+  [ -z "$testName" ] && { error.log "Usage: otest updateGolden <testName>"; return 1; }
+  shift
+
+  # Map camelCase to snake_case if needed
+  testName=$(private.mapName "$testName")
+  private.runTest "$testName" updateGolden "$@"
+}
+
+otest.updateGolden.completion.testName()
+{
+  private.testNames.camel
+}
+
+otest.setup() # # Force reinstall venv and all dependencies
+{
+  private.ensureDir
+
+  local venvDir="$OTEST_DIR/venv"
+  if [ -d "$venvDir" ]; then
+    console.log "Removing existing venv..."
+    rm -rf "$venvDir"
+  fi
+
+  private.ensureVenv
+  success.log "Setup complete. venv recreated with all dependencies."
+}
+
+otest.deploy() # <?branch:test/WODA245> # Merge current branch to test, push, and deploy to test server
+{
+  local branch="${1:-test/WODA245}"
+  private.ensureDir
+
+  local eamdRoot
+  eamdRoot=$(private.eamdRoot)
+
+  if [ -z "$eamdRoot" ]; then
+    error.log "Cannot find EAMD.ucp git root"
+    return 1
+  fi
+
+  local currentBranch
+  currentBranch=$(git -C "$eamdRoot" branch --show-current)
+
+  console.log "Merging $currentBranch into $branch..."
+  git -C "$eamdRoot" checkout "$branch" || return 1
+  git -C "$eamdRoot" merge "$currentBranch" || return 1
+  git -C "$eamdRoot" push || return 1
+
+  console.log "Deploying to test server..."
+  ssh -o ConnectTimeout=10 \
+      -i ~/.ssh/id_rsa \
+      root@178.254.18.182 \
+      "docker exec 69ede060b6e3 bash -c 'cd /var/dev/EAMD.ucp && git fetch origin && git checkout $branch && git pull'" 2>&1
+
+  console.log "Switching back to $currentBranch..."
+  git -C "$eamdRoot" checkout "$currentBranch"
+
+  success.log "Deployed to test server on branch $branch"
+}
+
+otest.browser.open() # <?url:https://test.wo-da.de/ide> <?profile:/tmp/browser-profile> # Open a Claude-controlled Chrome at <url>
+{
+  local url="${1:-https://test.wo-da.de/ide}"
+  local profile="${2:-/tmp/browser-profile}"
+
+  # Normalize bareword URLs (cnn.com -> https://cnn.com); Playwright requires a scheme.
+  case "$url" in
+    http://*|https://*|file://*|about:*|chrome://*) ;;
+    *) url="https://$url" ;;
+  esac
+
+  private.ensureDir || return 1
+  private.ensureVenv || return 1
+
+  local chrome
+  chrome=$(private.chromePath) || {
+    error.log "Real Chrome not found. Install google-chrome or set BROWSER_CHROME_PATH."
+    return 1
+  }
+
+  mkdir -p "$profile" || { error.log "Cannot create profile dir: $profile"; return 1; }
+
+  console.log "Launching $chrome (profile: $profile)"
+  private.python "$OTEST_DIR/browser.py" launch \
+    --chrome-path "$chrome" \
+    --user-data-dir "$profile" || { error.log "browser.py launch failed"; return 1; }
+
+  console.log "Navigating to: $url"
+  private.python "$OTEST_DIR/browser.py" navigate "$url" \
+    || warn.log "Navigate reported an error; page may still load (CDP is up)."
+
+  success.log "Browser open at: $url  —  CDP: http://localhost:9222"
+}
+
+otest.newTest() # <TestName> <?url> # Scaffold a new test in current component directory
+{
+  local testName="$1"
+  local url="$2"
+
+  if [ -z "$testName" ]; then
+    error.log "Usage: otest newTest <TestName> <?url>"
+    error.log "  TestName: PascalCase name (e.g., MyFeatureTest)"
+    error.log "  url:      Optional test URL (derived from cwd if omitted)"
+    return 1
+  fi
+
+  # Validate PascalCase (starts with uppercase)
+  if ! echo "$testName" | grep -qE '^[A-Z]'; then
+    error.log "TestName must be PascalCase (start with uppercase): $testName"
+    return 1
+  fi
+
+  private.ensureDir || return 1
+
+  local eamdRoot
+  eamdRoot=$(private.eamdRoot) || { error.log "Cannot find EAMD.ucp root"; return 1; }
+
+  # Determine target directory
+  local targetDir=""
+  local cwd="$(pwd)"
+
+  if [ -f "$cwd/otest.yaml" ]; then
+    # Already in a test dir
+    targetDir="$cwd"
+  elif echo "$cwd" | grep -qE '/test(/[0-9]+\.[0-9]+\.[0-9]+)?$'; then
+    # In test/ or test/2.0.0/ dir
+    if echo "$cwd" | grep -qE '/[0-9]+\.[0-9]+\.[0-9]+$'; then
+      targetDir="$cwd"
+    else
+      targetDir="$cwd/2.0.0"
+    fi
+  elif [ -d "$cwd/test" ] || echo "$cwd" | grep -qE '/[0-9]+\.[0-9]+\.[0-9]+$'; then
+    # In a component version dir
+    targetDir="$cwd/test/2.0.0"
+  else
+    error.log "Cannot determine test location from: $cwd"
+    error.log "Run from a component version directory (e.g., MyComponent/1.0.0/)"
+    error.log "  or its test/2.0.0/ subdirectory."
+    return 1
+  fi
+
+  # Check if test already exists
+  if [ -f "$targetDir/$testName.py" ]; then
+    error.log "Test already exists: $targetDir/$testName.py"
+    return 1
+  fi
+
+  # Derive URL from cwd if not given
+  if [ -z "$url" ]; then
+    # Compute relative path from EAMD.ucp root
+    local relPath="${cwd#$eamdRoot/}"
+    url="https://localhost:8443/EAMD.ucp/${relPath}"
+    console.log "Derived URL: $url"
+  fi
+
+  # Convert PascalCase to snake_case for function name
+  local snakeName
+  snakeName=$(echo "$testName" | sed 's/\([A-Z]\)/_\L\1/g' | sed 's/^_//')
+
+  # Create directory
+  mkdir -p "$targetDir/golden"
+
+  # Create .gitkeep in golden/
+  touch "$targetDir/golden/.gitkeep"
+
+  # Generate otest.yaml
+  cat > "$targetDir/otest.yaml" << YAML_EOF
+description: "$testName test"
+
+url: "$url"
+
+xpaths: {}
+
+settings:
+  wait_time: 10
+YAML_EOF
+
+  # Generate Python test file
+  cat > "$targetDir/$testName.py" << 'PYTHON_HEADER'
+import os
+import sys
+import time
+import logging
+import argparse
+import yaml
+from datetime import datetime
+from playwright.sync_api import sync_playwright
+
+# Script directory — all config and screenshots are colocated here
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Find TestSuite for shared utils
+def _find_test_suite():
+    from_env = os.environ.get('OTEST_DIR')
+    if from_env and os.path.isdir(from_env):
+        return os.path.abspath(from_env)
+    current = SCRIPT_DIR
+    while current != os.path.dirname(current):
+        candidate = os.path.join(current, 'Components', 'me', 'hannesnortje', 'TestSuite', '2.0.0')
+        if os.path.isdir(candidate):
+            return candidate
+        current = os.path.dirname(current)
+    raise RuntimeError("Cannot find TestSuite/2.0.0. Set OTEST_DIR or run via otest.")
+
+sys.path.insert(0, _find_test_suite())
+from utils.playwright_setup import create_playwright_context
+
+# Load local config
+with open(os.path.join(SCRIPT_DIR, 'otest.yaml')) as f:
+    config = yaml.safe_load(f)
+
+CONFIG_URL = config['url']
+
+# Screenshots colocated with test (SCREENSHOT_DIR set in __main__ to support _ipad suffix)
+SCREENSHOT_DIR = os.path.join(SCRIPT_DIR, 'latest')
+
+def take_screenshot(page, name):
+    """Take a screenshot and save it with timestamp"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(SCREENSHOT_DIR, f"{name}_{timestamp}.png")
+    page.screenshot(path=filename)
+    logging.info(f"Screenshot saved: {filename}")
+
+PYTHON_HEADER
+
+  # Generate the test function and main block (needs variable substitution)
+  cat >> "$targetDir/$testName.py" << PYTHON_BODY
+def perform_${snakeName}_test(headless=False, browser_type='chromium'):
+    """Perform the $testName test"""
+    browser = None
+    playwright = None
+
+    try:
+        playwright = sync_playwright().start()
+
+        # Setup browser
+        browser, context = create_playwright_context(playwright, "${testName}", (0, 0), headless, browser_type=browser_type)
+        page = context.new_page()
+
+        # Load URL
+        logging.info(f"Loading URL: {CONFIG_URL}")
+        page.goto(CONFIG_URL)
+
+        # Wait for page to initialize
+        logging.info("Waiting for page to initialize...")
+        time.sleep(10)
+
+        # Take initial screenshot
+        take_screenshot(page, "1_initial_load")
+
+        # ========================================================================
+        # TODO: Add your test steps here
+        # ========================================================================
+
+        logging.info("\\n" + "="*80)
+        logging.info("TEST COMPLETED SUCCESSFULLY!")
+        logging.info("="*80)
+
+    except Exception as e:
+        logging.error(f"Test failed: {e}")
+        if 'page' in locals():
+            take_screenshot(page, "error_state")
+        raise
+
+    finally:
+        if browser:
+            browser.close()
+        if playwright:
+            playwright.stop()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Run $testName test')
+    parser.add_argument('--headless', action='store_true', help='Run in headless mode')
+    parser.add_argument('--browser', choices=['chromium', 'webkit'], default='chromium',
+                        help='Browser engine (default: chromium, webkit for iPad emulation)')
+    args, _extra = parser.parse_known_args()
+
+    suffix = '_ipad' if args.browser == 'webkit' else ''
+    SCREENSHOT_DIR = os.path.join(SCRIPT_DIR, f'latest{suffix}')
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    perform_${snakeName}_test(args.headless, args.browser)
+PYTHON_BODY
+
+  success.log "Test scaffolded in: $targetDir"
+  console.log "  $testName.py  — test script (add your steps in the TODO section)"
+  console.log "  otest.yaml    — test configuration"
+  console.log "  golden/       — golden screenshots (run with updateGolden to populate)"
+
+  local camelName
+  camelName=$(echo "$snakeName" | sed 's/_\([a-z]\)/\U\1/g')
+  success.log "Test ready: otest run $camelName"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER COMPLETIONS (shared by run, here, updateGolden)
+# ─────────────────────────────────────────────────────────────────────────────
+
+otest.parameter.completion.headless() {
+  echo "headless"
+  echo "updateGolden"
+  echo "keepScreenshots"
+  echo "webkit"
+}
+
+otest.parameter.completion.updateGolden() {
+  echo "headless"
+  echo "updateGolden"
+  echo "keepScreenshots"
+  echo "webkit"
+}
+
+otest.parameter.completion.keepScreenshots() {
+  echo "headless"
+  echo "updateGolden"
+  echo "keepScreenshots"
+  echo "webkit"
+}
+
+otest.parameter.completion.webkit() {
+  echo "headless"
+  echo "updateGolden"
+  echo "keepScreenshots"
+  echo "webkit"
+}
+
+otest.parameter.completion.branch() {
+  git branch --format='%(refname:short)' 2>/dev/null
+}
+
+otest.browser.open.completion.profile() {
+  # Profile is a Chrome user-data dir path; echo the documented default plus
+  # the system Chrome profile so tab-completion lands on the common choices.
+  echo "/tmp/browser-profile"
+  echo "$HOME/.config/google-chrome"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.runTest()
+{
+  local testName="$1"
+  shift
+
+  private.ensureDir
+  private.ensureVenv
+
+  # Translate oosh positional words to Python flags
+  local pythonArgs=()
+  for arg in "$@"; do
+    case "$arg" in
+      headless)        pythonArgs+=("--headless") ;;
+      updateGolden)    pythonArgs+=("--update-golden") ;;
+      keepScreenshots) pythonArgs+=("--keep-screenshots") ;;
+      webkit)          pythonArgs+=("--browser" "webkit") ;;
+      *)               pythonArgs+=("$arg") ;;
+    esac
+  done
+
+  # Export OTEST_DIR so Python tests can use it
+  export OTEST_DIR
+
+  local savedDir="$(pwd)"
+  cd "$OTEST_DIR"
+  private.python run_tests.py "$testName" "${pythonArgs[@]}"
+  local rc=$?
+  cd "$savedDir"
+  return $rc
+}
+
+private.ensureDir()
+{
+  if [ -n "$OTEST_DIR" ] && [ -d "$OTEST_DIR" ]; then
+    return 0
+  fi
+
+  # Auto-discover TestSuite directory
+  local candidates=(
+    "$HOME/WODA.2023/_var_dev/EAMD.ucp/Components/me/hannesnortje/TestSuite/2.0.0"
+    "/var/dev/EAMD.ucp/Components/me/hannesnortje/TestSuite/2.0.0"
+  )
+
+  # Also try walking up from current directory
+  local current="$(pwd)"
+  while [ "$current" != "/" ]; do
+    local candidate="$current/Components/me/hannesnortje/TestSuite/2.0.0"
+    if [ -d "$candidate" ]; then
+      export OTEST_DIR="$candidate"
+      info.log "Found TestSuite at: $OTEST_DIR"
+      return 0
+    fi
+    current="$(dirname "$current")"
+  done
+
+  for dir in "${candidates[@]}"; do
+    if [ -d "$dir" ]; then
+      export OTEST_DIR="$dir"
+      info.log "Found TestSuite at: $OTEST_DIR"
+      return 0
+    fi
+  done
+
+  error.log "Cannot find TestSuite directory. Set OTEST_DIR environment variable."
+  return 1
+}
+
+private.ensureVenv()
+{
+  local venvDir="$OTEST_DIR/venv"
+  local venvPython="$venvDir/bin/python"
+
+  # Check if venv exists and has a working pip
+  if [ -f "$venvPython" ]; then
+    if "$venvPython" -m pip --version >/dev/null 2>&1; then
+      # Venv is healthy
+      return 0
+    fi
+    # Broken venv — remove and recreate
+    warn.log "Existing venv is broken (no pip). Removing..."
+    rm -rf "$venvDir"
+  fi
+
+  # Check if python3 is available
+  if ! command -v python3 >/dev/null 2>&1; then
+    error.log "python3 is not installed"
+    return 1
+  fi
+
+  # Check if ensurepip is available (needed by venv)
+  if ! python3 -c "import ensurepip" 2>/dev/null; then
+    warn.log "ensurepip not available. Installing python3-venv..."
+    local pyver
+    pyver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get install -y "python${pyver}-venv" || sudo apt-get install -y python3-venv || {
+        error.log "Failed to install python3-venv. Install it manually: sudo apt install python${pyver}-venv"
+        return 1
+      }
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y python3-pip || {
+        error.log "Failed to install python3-pip. Install it manually: sudo dnf install python3-pip"
+        return 1
+      }
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y python3-pip || {
+        error.log "Failed to install python3-pip. Install it manually: sudo yum install python3-pip"
+        return 1
+      }
+    else
+      error.log "No supported package manager found. Install python3-venv (Debian) or python3-pip (RHEL) manually."
+      return 1
+    fi
+  fi
+
+  console.log "Creating virtual environment in $venvDir..."
+  python3 -m venv "$venvDir"
+  if [ $? -ne 0 ]; then
+    error.log "Failed to create virtual environment"
+    [ -d "$venvDir" ] && rm -rf "$venvDir"
+    return 1
+  fi
+
+  # Ensure pip is up to date
+  "$venvPython" -m ensurepip --upgrade >/dev/null 2>&1
+
+  console.log "Installing Python dependencies..."
+  "$venvPython" -m pip install -r "$OTEST_DIR/requirements.txt" || {
+    error.log "Failed to install requirements"
+    return 1
+  }
+
+  console.log "Installing Playwright Chromium browser..."
+  "$venvPython" -m playwright install chromium || {
+    error.log "Failed to install Playwright browsers"
+    return 1
+  }
+
+  console.log "Installing Playwright WebKit browser..."
+  "$venvPython" -m playwright install webkit || {
+    warn.log "Failed to install WebKit browser (iPad tests unavailable)"
+  }
+
+  # Install setuptools for pkg_resources compatibility
+  "$venvPython" -m pip install setuptools >/dev/null 2>&1
+
+  success.log "Virtual environment ready"
+  return 0
+}
+
+private.python()
+{
+  "$OTEST_DIR/venv/bin/python" "$@"
+}
+
+private.chromePath()
+{
+  # Resolve real Chrome binary. Priority: $BROWSER_CHROME_PATH > common system paths.
+  if [ -n "$BROWSER_CHROME_PATH" ] && [ -x "$BROWSER_CHROME_PATH" ]; then
+    echo "$BROWSER_CHROME_PATH"
+    return 0
+  fi
+  local candidate
+  for candidate in /usr/bin/google-chrome /usr/bin/google-chrome-stable /opt/google/chrome/chrome; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+private.eamdRoot()
+{
+  local dir="$OTEST_DIR"
+  while [ "$dir" != "/" ]; do
+    if [ "$(basename "$dir")" = "EAMD.ucp" ] && [ -d "$dir/Components" ]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+private.findEamdRoot()
+{
+  # Lightweight EAMD.ucp root discovery — no Python/venv needed
+  # Used by completion and list (must be fast)
+
+  # Try OTEST_DIR
+  if [ -n "$OTEST_DIR" ]; then
+    local dir="$OTEST_DIR"
+    while [ "$dir" != "/" ]; do
+      if [ "$(basename "$dir")" = "EAMD.ucp" ] && [ -d "$dir/Components" ]; then
+        echo "$dir"
+        return 0
+      fi
+      dir="$(dirname "$dir")"
+    done
+  fi
+
+  # Walk up from cwd
+  local dir="$(pwd)"
+  while [ "$dir" != "/" ]; do
+    if [ "$(basename "$dir")" = "EAMD.ucp" ] && [ -d "$dir/Components" ]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+
+  # Well-known paths
+  local candidate
+  for candidate in "$HOME/WODA.2023/_var_dev/EAMD.ucp" "/var/dev/EAMD.ucp"; do
+    if [ -d "$candidate/Components" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+private.discoverTests()
+{
+  # Core discovery: outputs "snake_name\tdescription" per test line
+  # Pure bash — no Python/venv needed (used by list + completion)
+  local eamdRoot
+  eamdRoot=$(private.findEamdRoot) || return 1
+
+  local yamlFile name desc testDir pyFile
+  while IFS= read -r yamlFile; do
+    name=""
+    name=$(grep '^name:' "$yamlFile" 2>/dev/null | head -1 | sed "s/^name: *//; s/[\"']//g")
+
+    if [ -z "$name" ]; then
+      testDir=$(dirname "$yamlFile")
+      pyFile=$(ls "$testDir"/*.py 2>/dev/null | head -1)
+      if [ -n "$pyFile" ]; then
+        pyFile=$(basename "$pyFile" .py)
+        name=$(echo "$pyFile" | sed 's/\([A-Z]\)/_\L\1/g; s/^_//')
+      fi
+    fi
+
+    [ -z "$name" ] && continue
+
+    desc=$(grep '^description:' "$yamlFile" 2>/dev/null | head -1 | sed "s/^description: *//; s/[\"']//g")
+    printf "%s\t%s\n" "$name" "$desc"
+
+    # Non-local environments
+    if grep -q '^environments:' "$yamlFile" 2>/dev/null; then
+      local env
+      for env in $(awk '/^environments:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^  [a-z]/{sub(/:.*$/,""); gsub(/^ +/,""); if($0!="local") print}' "$yamlFile" 2>/dev/null); do
+        printf "%s\t%s (%s)\n" "${name}_${env}" "$desc" "$env"
+      done
+    fi
+  done < <(find "$eamdRoot/Components" -name "otest.yaml" -type f 2>/dev/null)
+}
+
+private.mapName()
+{
+  # Convert camelCase to snake_case: canvasGauges -> canvas_gauges
+  echo "$1" | sed 's/\([A-Z]\)/_\L\1/g' | sed 's/^_//'
+}
+
+private.testExists()
+{
+  # Check if a snake_case test name exists in discovered tests.
+  # Logic lives in TestSuite/2.0.0/utils/test_discovery.py (shared with
+  # run_tests.py's discover_tests); this bash function is a thin shim.
+  local target="$1"
+  private.ensureDir || return 1
+  private.ensureVenv || return 1
+  private.python "$OTEST_DIR/utils/test_discovery.py" exists "$target" 2>/dev/null
+}
+
+private.testNames()
+{
+  # Print one registered test name per line.
+  # Logic lives in TestSuite/2.0.0/utils/test_discovery.py (shared with
+  # run_tests.py's discover_tests); this bash function is a thin shim.
+  private.ensureDir || return 1
+  private.ensureVenv || return 1
+  private.python "$OTEST_DIR/utils/test_discovery.py" names
+}
+
+private.testNames.camel()
+{
+  # Convert discovered snake_case names to camelCase for tab-completion
+  private.discoverTests | cut -f1 | sed 's/_\([a-z]\)/\U\1/g'
+  echo "all"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDARD OOSH FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+otest.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+
+  Examples
+    $this run all                          Run all tests
+    $this run all headless                 Run all tests headless
+    $this run canvasGauges headless        Run a specific test headless
+    $this run canvasGauges headless webkit Run test on WebKit/iPad
+    $this run canvasGauges updateGolden    Run and update golden screenshots
+    $this here                             Run test for current directory
+    $this list                             List available tests
+    $this newTest MyTest                   Scaffold a new test (URL from cwd)
+    $this newTest MyTest https://...       Scaffold with explicit URL
+    $this updateGolden canvasGauges        Update golden screenshots
+    $this setup                            Reinstall venv and dependencies
+    $this deploy                           Deploy to test server
+    $this browser.open                     Open Claude-controlled Chrome at test.wo-da.de/ide
+    $this browser.open <url>               Open Chrome at a specific URL
+    ----------
+  "
+}
+
+otest.start()
+{
+  #echo "sourcing init"
+  source this
+
+  # if [ -z "$1" ]; then
+  #   status.discover "$@"
+  #   return 0
+  # fi
+
+  this.start "$@"
+}
+
+otest.start "$@"
