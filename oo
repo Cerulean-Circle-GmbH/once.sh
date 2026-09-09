@@ -306,8 +306,104 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
   console.log "Switched to: $branch"
   console.log "$OOSH_LINK -> $target_dir"
   export OOSH_MODE="$branch"
-  export OOSH_DIR="$target_dir"
+  # OOSH_DIR invariant: stay on the stable symlink, NEVER the resolved target_dir
+  # (base.get + mode folder). The symlink now points at the new target; file
+  # resolution follows it, and OOSH_DIR is mode-independent.
+  export OOSH_DIR="$OOSH_LINK"
   create.result 0 "$branch"
+  return $(result)
+}
+
+private.oo.mode.resolve.branch() # <dirName> # echo the origin branch (without origin/) that fits <dirName>; empty + rc1 if none. Run with cwd inside the clone.
+{
+  local name="$1"
+  # Per-dir overrides for names that do not map cleanly to a branch.
+  case "$name" in
+    macos) echo "test/macos.latest"; return 0 ;;
+  esac
+  # Prefer a bare origin/<name>, then origin/test/<name>.
+  if git show-ref --verify --quiet "refs/remotes/origin/$name"; then
+    echo "$name"; return 0
+  fi
+  if git show-ref --verify --quiet "refs/remotes/origin/test/$name"; then
+    echo "test/$name"; return 0
+  fi
+  return 1
+}
+
+oo.mode.sync() # <?dirName> # align each component CLONE to its name-matching origin branch (clones-only; NEVER worktrees). Backs up ahead-commits + stashes local changes first. Idempotent. Optional <dirName> syncs just one.
+{
+  local base
+  base=$(oo.mode.base.get)
+  local only="$1"
+  local stamp
+  stamp=$(date +%Y-%m-%d)
+  local rc=0 dir name
+
+  for dir in "$base"/*/; do
+    [ -d "$dir" ] || continue
+    name=$(basename "$dir")
+    [[ "$name" == .* ]] && continue
+    [ -n "$only" ] && [ "$name" != "$only" ] && continue
+
+    if [ ! -d "$dir/.git" ]; then
+      if [ -f "$dir/.git" ]; then
+        warn.log "$name: is a git WORKTREE, not a clone — skipped (clones-only policy)"
+      else
+        warn.log "$name: not a git clone — skipped"
+      fi
+      continue
+    fi
+
+    (
+      cd "$dir" || exit 1
+      git worktree prune 2>/dev/null
+      git fetch origin --quiet 2>/dev/null
+
+      local target
+      target=$(private.oo.mode.resolve.branch "$name") || {
+        warn.log "$name: no matching origin branch (tried origin/$name, origin/test/$name) — left as-is"
+        exit 3
+      }
+
+      # Local branch is named after the FOLDER (folder name -> branch name, no
+      # "test/" prefix), tracking the origin branch resolved above.
+      # No-op ONLY when on the right branch, clean, and HEAD == origin/<target>
+      # (neither ahead NOR behind). A behind branch must still fast-forward.
+      local cur; cur=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+      if [ "$cur" = "$name" ] && git diff --quiet && git diff --cached --quiet \
+         && [ -z "$(git rev-list "origin/$target..HEAD" 2>/dev/null)" ] \
+         && [ -z "$(git rev-list "HEAD..origin/$target" 2>/dev/null)" ]; then
+        console.log "$name: already on $name -> origin/$target (clean, up to date)"
+        exit 0
+      fi
+
+      # Preserve ahead-commits on a local backup branch (never lost).
+      if [ -n "$(git rev-list "origin/$target..HEAD" 2>/dev/null)" ]; then
+        local bkp="backup/${name}-$(git rev-parse --short HEAD)-${stamp}"
+        git branch -f "$bkp" HEAD 2>/dev/null
+        important.log "$name: ahead-commits preserved on local branch $bkp"
+      fi
+
+      # Preserve uncommitted changes in a labeled stash (recoverable).
+      if ! git diff --quiet || ! git diff --cached --quiet; then
+        git stash push -u -m "oo mode.sync ${name} ${stamp}" >/dev/null 2>&1 \
+          && important.log "$name: local changes stashed ('git stash list')"
+      fi
+
+      # Align via CLONE checkout — never a worktree. Local branch = folder name.
+      if git checkout -B "$name" "origin/$target" >/dev/null 2>&1; then
+        git branch --set-upstream-to="origin/$target" "$name" >/dev/null 2>&1
+        success.log "$name -> origin/$target"
+      else
+        error.log "$name: 'git checkout -B $name origin/$target' FAILED"
+        exit 1
+      fi
+    )
+    [ $? -eq 1 ] && rc=1
+  done
+
+  create.result "$rc" "mode.sync done"
   return $(result)
 }
 oo.mode.completion.branch() {
@@ -1385,7 +1481,10 @@ oo.usage()
 oo.start() # <method> <parameter> # default start and parameter processing
 {
   #echo "sourcing init"
-  source this
+  # env -i clean-boot: PATH may be empty, so `source this` (PATH lookup) fails.
+  # Source the sibling `this` self-relatively from our own location first; fall
+  # back to PATH lookup for relative/PATH invocations. `this` then sets PATH.
+  source "$(dirname "${BASH_SOURCE[0]}")/this" 2>/dev/null || source this
 
   # if [ -z "$1" ]; then
   #   status.discover "$@"
