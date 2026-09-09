@@ -22,23 +22,31 @@ log.level $level
 TEST_MACHINE="TEST_STATE_$$"
 PDCA_MACHINE="PDCA_TEST_$$"
 
-# Save the original current machine before any test operations
-ORIG_STATE_MACHINE=""
-if [ -f "$CONFIG_PATH/current.state.machine.env" ]; then
-  source $CONFIG_PATH/current.state.machine.env
-  ORIG_STATE_MACHINE="$machine"
-fi
+# Back up the shared current-machine cache VERBATIM and restore it on EXIT. This
+# test creates, selects and deletes machines; state.machine.delete of the CURRENT
+# machine drops the cache, which would otherwise destroy the real selection (e.g.
+# SETUP_SERVER) for EVERY user — ~/config is one shared sharedConfig. A verbatim
+# cp backup + trap restore is robust where the old value-based `state of $ORIG`
+# restore was not (it no-ops once the cache is already empty).
+CURRENT_CACHE="$CONFIG_PATH/current.state.machine.env"
+CACHE_BACKUP="$(mktemp 2>/dev/null || echo "/tmp/test.state.cache.$$")"
+CACHE_EXISTED=0
+if [ -f "$CURRENT_CACHE" ]; then CACHE_EXISTED=1; cp -p "$CURRENT_CACHE" "$CACHE_BACKUP"; fi
 
-# Cleanup function - use state.machine.delete to properly clear ghost refs
+restore_current_cache() {
+  if [ "$CACHE_EXISTED" = "1" ]; then
+    cp -p "$CACHE_BACKUP" "$CURRENT_CACHE" 2>/dev/null
+  else
+    rm -f "$CURRENT_CACHE" 2>/dev/null
+  fi
+  rm -f "$CACHE_BACKUP" 2>/dev/null
+}
+trap restore_current_cache EXIT
+
+# Cleanup function - remove any leftover test machines (ghost-ref hygiene)
 cleanup_test_machines() {
   state.machine.exists "$TEST_MACHINE" 2>/dev/null && state.machine.delete "$TEST_MACHINE" 2>/dev/null
   state.machine.exists "$PDCA_MACHINE" 2>/dev/null && state.machine.delete "$PDCA_MACHINE" 2>/dev/null
-
-  # Restore original machine if it still exists
-  if [ -n "$ORIG_STATE_MACHINE" ] && \
-     state.machine.exists "$ORIG_STATE_MACHINE" 2>/dev/null; then
-    state of "$ORIG_STATE_MACHINE" >/dev/null 2>&1
-  fi
 }
 
 # Cleanup before tests
@@ -600,5 +608,42 @@ log.level $_OLD_LOG_LEVEL >/dev/null 2>&1
 
 state.machine.exists "$QUIET_MACHINE" 2>/dev/null && state.machine.delete "$QUIET_MACHINE" 2>/dev/null
 unset _OLD_LOG_LEVEL _STATE_OF_STDOUT _STATE_FIND_STDOUT QUIET_MACHINE
+
+# ============================================================================
+# T-STATE-DELETE-SAFE-CACHE: deleting the CURRENT machine drops the cache file
+# (does NOT write the all-empty cache that crashed `state list` with
+# "invalid variable name"). Regression for the Marcel 6ca9c164 clear-to-empty.
+# ============================================================================
+DEL_MACHINE="DEL_TEST_$$"
+state.machine.exists "$DEL_MACHINE" 2>/dev/null && state.machine.delete "$DEL_MACHINE" 2>/dev/null
+state machine.create $DEL_MACHINE state >/dev/null 2>&1
+state of $DEL_MACHINE add only.state silent >/dev/null 2>&1
+state of $DEL_MACHINE >/dev/null 2>&1          # make it current
+state machine.delete $DEL_MACHINE >/dev/null 2>&1
+test.case - "T-STATE-DELETE-SAFE-CACHE: delete of current machine drops (not empties) the cache" \
+  echo "(verify no all-empty current.state.machine.env after deleting current machine)"
+# PASS if the cache is gone OR at least not the crash-inducing all-empty shape
+if [ ! -f "$CONFIG_PATH/current.state.machine.env" ] \
+   || ! grep -qxE 'machine=' "$CONFIG_PATH/current.state.machine.env" 2>/dev/null; then
+  expect.pass "current cache dropped (no all-empty crash file)"
+else
+  expect.fail "current.state.machine.env was left all-empty (would crash state list): $(cat "$CONFIG_PATH/current.state.machine.env" | tr '\n' '|')"
+fi
+
+# ============================================================================
+# T-STATE-LIST-NO-MACHINE: `state list` with no machine selected prints a clear
+# line and exits 0 — NOT the raw bash "invalid variable name" crash.
+# ============================================================================
+rm -f "$CONFIG_PATH/current.state.machine.env" 2>/dev/null   # simulate "none selected"
+test.case - "T-STATE-LIST-NO-MACHINE: state list is graceful with no machine selected" \
+  echo "(capturing state list output with empty/absent cache)"
+_LIST_OUT=$(state list all 2>&1); _LIST_RC=$?
+if [ "$_LIST_RC" -eq 0 ] && echo "$_LIST_OUT" | grep -q "no state machine selected" \
+   && ! echo "$_LIST_OUT" | grep -q "invalid variable name"; then
+  expect.pass "state list handles no-machine without crashing"
+else
+  expect.fail "state list crashed or misbehaved (rc=$_LIST_RC): $_LIST_OUT"
+fi
+unset DEL_MACHINE _LIST_OUT _LIST_RC
 
 test.suite.save.results
