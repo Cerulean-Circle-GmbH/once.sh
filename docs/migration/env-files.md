@@ -1,5 +1,17 @@
 # Env-file evolution: from `main` baseline to `dev`
 
+> **⚠️ SUPERSEDED (2026-09-09).** The "self-anchor bootstrap header" this document
+> calls the *centrepiece* was **removed**. Env files are now **pure data** (only
+> `export …` and POSIX `.` chain lines); all bootstrap logic moved into the single
+> entry point **`$OOSH_DIR/boot`** (commit `ca4abe1` and the boot-loader series).
+> The boss's ruling was "config must not contain code". So wherever this doc
+> describes `: ${CONFIG_PATH:=…}` / `: ${OOSH_DIR:=…}` header lines *inside*
+> `user.env`/`oosh.env`, read it as **history** — the current design does that in
+> `boot`. Per-user log vars (`LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE`) now live in the
+> per-user `$OOSH_USER_CONFIG_PATH/log.session.env`, chained from `log.env`.
+> See **[../boot.md](../boot.md)** and **[../config.md](../config.md)** for the
+> current model. This document is retained for the `main → dev` history only.
+
 A reference for understanding how `~/config/user.env`, `~/config/oosh.env`, and `~/config/log.env` are generated, why the `dev` versions look the way they do, and how an older host running pre-April-2026 code differs.
 
 This document compares two ground-truth captures: the `main` branch (HEAD `c30787b`, March 2026; the same env-file generation logic lives on `test/macos.latest`) and `dev` (current — the `user.env` capture reflects the three-line bootstrap header introduced by `9802158`/`43796be` and the `config.clean` ordering + fallback-predicate refinements that followed).

@@ -75,6 +75,14 @@ The heart of the oosh/once.sh system is an advanced Bash completion engine, impl
 - Supports custom completions for specific parameters and methods, and can fall back to standard Bash completions.
 - Is designed to be modular and extensible, allowing new scripts and methods to be added without duplicating completion logic.
 
+### The `boot` Loader
+The `boot` script (`$OOSH_DIR/boot`) is the single entry point that turns a bare
+shell into an oosh shell — every context (login shell, `ossh exec`, platform
+tests, CI) sources it. It owns the bootstrap logic that used to live inside the
+config env files (so those stay pure data), is POSIX-`sh` clean (dash/ash), and
+sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`), the source
+chain, PATH, and the logging primitives. See **[boot.md](boot.md)**.
+
 ### The "this" Boot Script
 The `this` script is the bootstrapper and foundation of the environment:
 - Sets up environment variables, logging, and debugging.

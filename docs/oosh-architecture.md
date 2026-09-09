@@ -266,17 +266,23 @@ scriptname.start "$@"  # Entry point
 
 When a script like `myScript` boots, dependencies load in this order:
 
+An interactive login shell boots via `$OOSH_DIR/boot` (from `bashrcTemplate`),
+which sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`),
+sources the pure-data env chain, builds PATH, and loads `log` — see
+[boot.md](boot.md). A script invoked directly boots via `source this`:
+
 ```
 1. myScript.start "$@"
    │
 2. source this                    # OOSH kernel
    │
    ├─ this.init                   # Initialize environment
-   │   ├─ Sets OOSH_DIR, OOSH_PROMPT
-   │   └─ source $CONFIG          # Load user.env
-   │       ├─ export PATH=...
-   │       ├─ source log.env      # Log configuration
-   │       └─ source oosh.env     # OOSH configuration
+   │   ├─ Sets OOSH_DIR, CONFIG_PATH, OOSH_USER_CONFIG_PATH
+   │   └─ . $CONFIG               # Load user.env (pure data)
+   │       ├─ . oosh.env          # OOSH configuration
+   │       └─ . log.env           # Log configuration
+   │           └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
+   │   (PATH is built by boot/this, NOT persisted in the env files)
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
    │
@@ -423,17 +429,30 @@ this.call() {
 
 ### user.env Structure
 
-```bash
-# ~/config/user.env
-export BASH_FILE="/usr/local/bin/bash"
-export CONFIG="/root/config/user.env"
-export CONFIG_FILE="user.env"
-export CONFIG_PATH="/root/config"
-export PATH="/root/.local/bin:/root/oosh:..."
+Env files are **pure data** now — only `export KEY="VALUE"` and `.`-chain lines,
+no logic. The per-user/volatile anchors (`OOSH_DIR`, `CONFIG`, `CONFIG_PATH`,
+`PATH`) are **not** persisted here; `$OOSH_DIR/boot` computes them fresh each
+shell (see [boot.md](boot.md)). `config.validate` enforces the no-logic rule.
 
-source $CONFIG_PATH/log.env
-source $CONFIG_PATH/oosh.env
+```bash
+# ~/config/user.env  — portable data + POSIX `.` source chain
+export BASH_FILE="/usr/local/bin/bash"
+export CONFIG_FILE="user.env"
+
+. $CONFIG_PATH/oosh.env
+. $CONFIG_PATH/log.env
 ```
+
+`log.env` in turn chains the per-user session file:
+
+```bash
+# ~/config/log.env  (shared)
+export LOG_LEVEL="1"
+export LOG_LEVEL_RESET="1"
+. $OOSH_USER_CONFIG_PATH/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
+```
+
+Note POSIX `.` (not the bash `source` builtin) so `boot` parses under dash/ash.
 
 ---
 
@@ -677,7 +696,12 @@ Verified by `T-THIS-SUDO-SELF-HEAL` (test/test.oo).
 
 ### `LOG_LIVE` per-user anchor
 
-In multi-user installs (`~/config` is a shared symlink), `LOG_LIVE` must always resolve to the *current* user's `~/config/log.live.out`. See [Log System / LOG_LIVE per-user anchor](log.md) for the read+write defenses (`log:22`, `this:215–227`, `config:261`).
+In multi-user installs (`~/config` is a shared symlink), the per-user log vars
+must never leak into the shared config. `LOG_LIVE` (and `LOG_NAME`/`LOG_DEVICE`)
+live in the **per-user** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
+`~/.config/oosh/log.session.env`), not in the shared `~/config/log.env`;
+`config.save` filters them out of the shared tier. See [Log System](log.md) and
+[config.md § two config tiers](config.md) for the read+write defenses.
 
 ---
 
