@@ -27,14 +27,13 @@ export CONFIG_PATH="$(cd "$HOME/config" 2>/dev/null && pwd -P || echo "$HOME/con
 export CONFIG_FILE="user.env"
 export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
 
-# ── 2. Source the pure-data env files, in order ──────────────────────────────
-# user (base identity: CONFIG_FILE, BASH_FILE, portable state) → oosh (OOSH_*)
-# → log (LOG_*). Each is guarded so a missing file on a fresh/partial install
-# is a silent no-op, not an error.
-for _oosh_env in user oosh log; do
-  [ -f "$CONFIG_PATH/$_oosh_env.env" ] && . "$CONFIG_PATH/$_oosh_env.env"
-done
-unset _oosh_env
+# ── 2. Source the config ─────────────────────────────────────────────────────
+# Source ONLY user.env — it chains `source $CONFIG_PATH/oosh.env` /
+# `log.env` itself (config.add appends those), so this one line stands up the
+# whole config (single source of truth, no double-sourcing). CONFIG_PATH is
+# already set above, so the chain resolves. Guarded: a missing file on a
+# fresh/partial install is a silent no-op, not an error.
+[ -f "$CONFIG_PATH/user.env" ] && . "$CONFIG_PATH/user.env"
 
 # ── 3. PATH ──────────────────────────────────────────────────────────────────
 # Ensure OOSH_DIR and OOSH_DIR/ng are on PATH so oo/os/ossh/config/this/c2/…
