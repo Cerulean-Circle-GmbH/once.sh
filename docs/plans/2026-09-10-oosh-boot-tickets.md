@@ -68,41 +68,62 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 > **Card (Ideas #4):** `OOSH_DIR is always /userhome/oosh  ~/oosh` — `NEVER oo mode.base.get`
 > **Card (Ideas #5):** `review all OOSH_DIR=` — `understand the boot mechanism`
 
-**Meaning.** One rule for where OOSH lives: `OOSH_DIR` is always the user's `~/oosh`
-(physically resolved), never derived from `oo mode.base.get`. T5 is the audit that makes T4
-enforceable — hence taken together.
+**Meaning.** One rule for where OOSH lives: `OOSH_DIR` is always the user's `~/oosh` —
+**the symlink path itself**, never the worktree it points at, and never derived from
+`oo mode.base.get`. T5 is the audit that makes T4 enforceable — hence taken together.
 
-**Evidence (audit 2026-09-10, read-only).** 14 assignment sites in tracked non-doc/test files:
+**The rule, and why it collapses the work.** Written in code as `OOSH_DIR="$HOME/oosh"`
+(a tilde inside quotes does not expand). Because the value is the symlink, it is a
+**constant**: `oo mode` moves only what `~/oosh` *points at*, so the variable never
+changes and needs setting in exactly **one** place. Code that genuinely needs the
+**physical** directory resolves it *at that spot* with the existing portable helper
+`private.this.path.canonical` (`this:144`).
 
-| Conforming (derive from `~/oosh`) | Non-conforming |
+**Delivered (2026-09-10).**
+
+| | |
 |---|---|
-| `boot:25` — canonical `cd "$HOME/oosh" && pwd -P` | `oo:702`, `oo:710`, `oo:875`, `oo:1867`, `oo:1108` — worktree / branch dir |
-| `init/oosh:385`, `init/oosh:429` | `this:41`, `this:43`, `this:477` — from `BASH_SOURCE`/`pwd` |
-| `init/once:7441` | `ossh:3569` — from `$0` (flagged in the 2026-09-09 review) |
-| `oo:2087`, `this:46` | `ossh:883`, `user:982` — `$sharedOosh` (remote/WODA) |
+| **Single setter** | `boot` — `export OOSH_DIR="$HOME/oosh"`. Plus one same-literal fallback in `this`'s top-level block for contexts that never source `boot`. |
+| **Setters removed** | `oo.mode`, `oo.mode.setup`, install state 31 (root), `this.init`, and the `OOSH_DIR` line of the generated `mode-env.bash` — a constant needs no updating, and each assigned a *physical* path. |
+| **Real bugs fixed** | `ossh.start` derived from `$0`, i.e. the **host** process whenever `ossh` is *sourced* (`myId`, `config`, `user`, `test.ossh`). Install state 31 (user) did `ln -s "$OOSH_DIR" oosh` inside `cd $HOME` — a self-referential symlink ("Too many levels of symbolic links") — and took `OOSH_MODE=$(basename "$OOSH_DIR")`, which yields `oosh` instead of the branch. |
+| **Physical-path consumers fixed** | `config.init.user`'s shared-tree prefix test, `promote`'s worktree/mergeDir comparisons (double-stash of the same dir), `oo.mode.base.get` strategies 3/4 (`dirname ~/oosh` is just `$HOME`), `test.oo`'s mode fixture. |
+| **Sanctioned exceptions** | 4, each marked in-code: `oo.use` (scoped child override), `ossh` remote invoke, `user.oosh.install` sub-shell, and `init/oosh` (file-wide — the installer runs before `~/oosh` exists). Marker: `# oosh-dir-exception: <reason>` / `# oosh-dir-exception-file: <reason>`. |
+| **Guard** | New `this.oosh.dir.validate` (`this`) — one `git grep` over the tracked tree, classifying every assignment conforming / exception / violation, verdict echoed to stdout, rc 1 on any violation. Shaped like `config.validate`. |
 
-`oo.mode.base.get` itself is still used legitimately to **locate worktrees**
+`oo.mode.base.get` itself remains legitimate for **locating worktrees**
 (`oo:470,518,573,796,912,951,1082,1120`); the ticket forbids only deriving `OOSH_DIR` from it.
 
-**Design tension to resolve first.** `oo mode <branch>` **repoints the `~/oosh` symlink**, so the
-`OOSH_DIR="$target_dir"` assignments may now be redundant — or actively contradict the rule.
-Decide: does `oo mode`/`oo use` still set `OOSH_DIR` directly, or only repoint the symlink and
-let a fresh `boot` resolve it?
-
 **Definition of done.**
-- [ ] Decision recorded on `oo mode`/`oo use` vs the always-`~/oosh` rule
-- [ ] Every remaining non-conforming site either fixed, or justified in-code with a comment
-- [ ] A test pins the rule (extend `test.config` T31, which already asserts `boot`'s resolution)
-- [ ] `docs/boot.md` states the rule and the sanctioned exceptions
+- [x] Decision recorded on `oo mode`/`oo use` vs the always-`~/oosh` rule — `oo mode` no longer exports `OOSH_DIR` (the symlink move *is* the switch); `oo use` is a marked exception
+- [x] Every remaining non-conforming site either fixed, or justified in-code with a marker
+- [x] A test pins the rule — `test.this` T-OOSH-DIR-* (4 cases, including a *planted* violation so the guard is proven to fail); `test.config` T31 asserts `boot`'s literal and delegates the tree sweep
+- [x] `docs/boot.md` states the rule and the sanctioned exceptions
 - [ ] Standing verification bar passes
 
 **Verification.**
 ```bash
-# the audit must show only sanctioned exceptions
-git ls-files | grep -vE '^(docs|test)/' | xargs grep -nE '(export +)?OOSH_DIR=|: *\$\{OOSH_DIR:='
-./test.suite run config 1 && ./test.suite core 1
+source ~/oosh/boot && echo "$OOSH_DIR"      # → /home/<user>/oosh  (the symlink itself)
+readlink ~/oosh                             # → the branch worktree, NOT ~/oosh
+this.oosh.dir.validate                      # → OK: … 0 violations   (rc 0)
+                                            #   (`this` is a function in an oosh shell,
+                                            #    so call the method directly)
+./test.suite run this 1 && ./test.suite run config 1 && ./test.suite core 1
 os platform.test ubuntu_24_04
 ```
+
+#### Follow-ups found while doing T4+T5 (not fixed here)
+
+- **PATH physical-path rewrite pair** — `mode-env.bash`'s branch-name `sed` and install
+  state 31's `export PATH="$( … replace.sedquoted "$HOME/oosh" "$onceShBase/$OOSH_BRANCH" )"`
+  (which carries its own `# TODO: This should be removed to only use $HOME/oosh in the PATH`).
+  Left in place deliberately: they still work, and removing them is a separate cleanup.
+- `oo`'s `private.check.user.shared.dev.folder.linked`: non-idempotent `ln -s` (fails with
+  "File exists" when `~/oosh` already exists, which it must for the resolve above it to work)
+  and an unrestored `cd $HOME`. The rest of the tree uses the idempotent
+  `private.oo.user.shared.symlinks.ensure` for exactly this.
+- `docs/oo.md` has **no `oo use` section** — the "run from another branch without switching"
+  contract exists only as the method's docstring, yet the `oo.use` exception depends on it.
+- `this` lacks the `### new.method` insertion marker (only `ossh`/`state` carry it).
 
 ---
 
@@ -229,3 +250,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 | Date | Change |
 |---|---|
 | 2026-09-10 | Document created; board oriented; T4+T5 moved to In Progress |
+| 2026-09-10 | First T4+T5 attempt (`6ada741`) built on the WRONG rule (resolved target); reverted in full (`ba355b7`) and rebuilt on `OOSH_DIR` = the `~/oosh` symlink itself |

@@ -98,8 +98,8 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
 | `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
-| `oosh.env` | first line: `: ${OOSH_DIR:="$(cd "$HOME/oosh" …)"}` | written by `config save oosh OOSH` |
-| `user.env` | 3-line bootstrap header: `CONFIG_PATH` default, `{ … } && CONFIG_PATH="$HOME/config"` fallback, then `OOSH_DIR` anchor | written by `config save`. See [migration/env-files.md](migration/env-files.md) for the line-by-line rationale. |
+| `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`. `OOSH_DIR`/`CONFIG_PATH`/`CONFIG` are filtered out on purpose — they are per-user anchors, set by [`boot`](boot.md). |
+| `user.env` | **pure data** — a `. $CONFIG_PATH/<name>.env` chain, no bootstrap header | written by `config save`. The old self-anchoring header moved into [`boot`](boot.md); see [migration/env-files.md](migration/env-files.md) for what it used to look like and why. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
 mirror the install steps at `oo:1456` (`config save`) and `oo:1462–1463`

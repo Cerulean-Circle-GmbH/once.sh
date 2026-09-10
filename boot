@@ -15,14 +15,13 @@
 # or double-applies anything.
 
 # ── 1. Anchors ──────────────────────────────────────────────────────────────
-# OOSH_DIR is ALWAYS ~/oosh (the boss ruling), resolved to its PHYSICAL target
-# via `cd … && pwd -P`. Resolving matters two ways: (a) never anchor to the
-# literal "$HOME/oosh" symlink string — that made bashrc's old auto-sync do
-# `ln -s $HOME/oosh $HOME/oosh`, a self-referential loop ("Too many levels of
-# symbolic links"); (b) it is derived from a FIXED, well-known location, never
-# from `oo.mode.base.get` or a BASH_SOURCE walk. On a fresh box where the
-# symlink/dir doesn't exist yet, fall back to the unresolved path.
-export OOSH_DIR="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"
+# OOSH_DIR is ALWAYS ~/oosh (the boss ruling) — the symlink path ITSELF, never
+# its resolved target. That makes it a CONSTANT: switching branches only moves
+# what ~/oosh points at, so the value never changes and this is the ONE place
+# that sets it (see docs/boot.md "The OOSH_DIR rule"). Written "$HOME/oosh"
+# because a tilde inside quotes does not expand. Code that genuinely needs the
+# PHYSICAL directory resolves it at that spot (private.this.path.canonical).
+export OOSH_DIR="$HOME/oosh"
 export CONFIG_PATH="$(cd "$HOME/config" 2>/dev/null && pwd -P || echo "$HOME/config")"
 export CONFIG_FILE="user.env"
 export CONFIG="$CONFIG_PATH/$CONFIG_FILE"

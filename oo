@@ -404,10 +404,16 @@ oo.mode.base.get() # # returns the OOSH components base directory
     return 0
   fi
 
+  # OOSH_DIR is the ~/oosh symlink (docs/boot.md). Strategies 3 and 4 do path
+  # arithmetic (dirname/basename) on it, which needs the PHYSICAL worktree —
+  # `dirname ~/oosh` is just $HOME. Resolve once, here.
+  local ooshDir
+  ooshDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
+
   # Strategy 2: Use git worktree list to find main worktree, derive base as its parent
-  if [ -d "$OOSH_DIR/.git" ] || [ -f "$OOSH_DIR/.git" ]; then
+  if [ -d "$ooshDir/.git" ] || [ -f "$ooshDir/.git" ]; then
     local mainWt
-    mainWt=$(git -C "$OOSH_DIR" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
+    mainWt=$(git -C "$ooshDir" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
     if [ -n "$mainWt" ]; then
       local mainBase
       mainBase=$(basename "$mainWt")
@@ -418,10 +424,10 @@ oo.mode.base.get() # # returns the OOSH components base directory
     fi
   fi
 
-  # Strategy 3: Check if OOSH_DIR is inside a worktree (.git file with gitdir: pointer)
-  if [ -f "$OOSH_DIR/.git" ]; then
+  # Strategy 3: Check if the worktree is inside a worktree (.git file with gitdir: pointer)
+  if [ -f "$ooshDir/.git" ]; then
     local parent
-    parent=$(dirname "$OOSH_DIR")
+    parent=$(dirname "$ooshDir")
     if [ -d "$parent/main" ]; then
       echo "$parent"
       return 0
@@ -429,16 +435,16 @@ oo.mode.base.get() # # returns the OOSH components base directory
   fi
 
   # Strategy 4: Fall back to dirname if sibling "main" directory exists
-  if [ -n "$OOSH_DIR" ]; then
+  if [ -n "$ooshDir" ]; then
     local parent
-    parent=$(dirname "$OOSH_DIR")
+    parent=$(dirname "$ooshDir")
     local selfName
-    selfName=$(basename "$OOSH_DIR")
-    if [ "$selfName" = "main" ] && [ -d "$OOSH_DIR/.git" ]; then
+    selfName=$(basename "$ooshDir")
+    if [ "$selfName" = "main" ] && [ -d "$ooshDir/.git" ]; then
       echo "$parent"
       return 0
     fi
-    if [ -d "$parent/main" ] && [ "$parent/main" != "$OOSH_DIR" ]; then
+    if [ -d "$parent/main" ] && [ "$parent/main" != "$ooshDir" ]; then
       echo "$parent"
       return 0
     fi
@@ -690,26 +696,37 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
   ln -s "$target_dir" "$OOSH_LINK"
 
   # Replace old branch name in ALL PATH entries (handles /root/<branch>, /home/shared/.../<branch>, etc.)
-  local oldOoshDir="$OOSH_DIR"
-  local oldBranchName
-  oldBranchName=$(basename "$oldOoshDir")
+  # The old branch name comes from what ~/oosh POINTED AT before the ln -s above
+  # ($current_target, captured at the top of this method) — NOT from $OOSH_DIR,
+  # which is the constant ~/oosh and would yield the literal name "oosh". That
+  # would rewrite every "/oosh:" segment of PATH into "/<branch>:" and break it.
+  # A PATH that already holds ~/oosh has no branch name in it, so this is then
+  # correctly a no-op; it still repairs a PATH holding a physical worktree path
+  # (a legacy shell, or install state 31 which puts one there on purpose).
+  local oldBranchName=""
+  [ -n "$current_target" ] && oldBranchName=$(basename "$current_target")
   if [ -n "$oldBranchName" ] && [ "$oldBranchName" != "$branch" ]; then
     PATH=$(echo "$PATH" | sed "s|/${oldBranchName}:|/${branch}:|g;s|/${oldBranchName}$|/${branch}|")
   fi
   hash -r  # Clear command hash table so bash finds commands in new path
 
+  # OOSH_DIR is NOT reassigned: it is the constant ~/oosh, and the `ln -s`
+  # above already repointed it at $target_dir. Only OOSH_MODE changes.
   export OOSH_MODE="$branch"
-  export OOSH_DIR="$target_dir"
   config save oosh OOSH 2>/dev/null
 
   # Write env pickup file so the shim can update the parent shell next time
   mkdir -p "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}"
-  cat > "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/mode-env.bash" <<MODEENV
-PATH=\$(echo "\$PATH" | sed "s|/${oldBranchName}:|/${branch}:|g;s|/${oldBranchName}\$|/${branch}|")
-hash -r
-export OOSH_DIR="$target_dir"
-export OOSH_MODE="$branch"
-MODEENV
+  {
+    # Same PATH repair as above, and emitted only under the same condition —
+    # an empty or unchanged old branch name would turn the sed into "s|/:|…"
+    # and mangle every PATH entry.
+    if [ -n "$oldBranchName" ] && [ "$oldBranchName" != "$branch" ]; then
+      echo "PATH=\$(echo \"\$PATH\" | sed \"s|/${oldBranchName}:|/${branch}:|g;s|/${oldBranchName}\\\$|/${branch}|\")"
+    fi
+    echo "hash -r"
+    echo "export OOSH_MODE=\"$branch\""
+  } > "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/mode-env.bash"
 
   echo "Switched to: $branch ($target_dir)"
 
@@ -871,8 +888,8 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure
   ln -s "$targetDir" "$OOSH_LINK"
 
   # Update environment
+  # OOSH_DIR stays the constant ~/oosh — the `ln -s` above made it valid again.
   export OOSH_COMPONENTS_DIR="$base"
-  export OOSH_DIR="$targetDir"
   export OOSH_MODE="$currentBranch"
   config save oosh OOSH 2>/dev/null
 
@@ -1105,6 +1122,9 @@ oo.use() # <branch> <command> # run a command from a specific branch without swi
              debug.log success.log silent.log stop.log seq.puml.log; } 2>/dev/null
 
   # Execute from target branch with overridden OOSH_DIR
+  # oosh-dir-exception: oo.use runs ONE command from another branch WITHOUT
+  # switching — a scoped child-process override; there is no symlink alternative
+  # by design (the symlink is what `oo mode` moves, and `use` must not move it).
   OOSH_DIR="$branchDir" "$branchDir/$command" "$@"
 }
 oo.use.completion.branch() {
@@ -1791,10 +1811,9 @@ EOF
 
     # Always link ROOT's config AND oosh to the shared tree. State 31
     # runs as root regardless of which paramerUser is being set up —
-    # without these symlinks, root's lazy
-    # `${OOSH_DIR:="$(cd $HOME/oosh && pwd -P)"}` in
-    # sharedConfig/user.env resolves to root's private clone, and root
-    # can't see the shared worktrees (the macstudio-root regression).
+    # without these symlinks, root's OOSH_DIR (always ~/oosh, see
+    # docs/boot.md) resolves at point of use to root's private clone, and
+    # root can't see the shared worktrees (the macstudio-root regression).
     #
     # Previous guard `[ "$paramerUser" != "root" ]` was wrong: when
     # paramerUser is empty (SSH_CONFIG_NAME_USED_FOR_LOCAL isn't set
@@ -1864,7 +1883,8 @@ EOF
     export CONFIG="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig/user.env"
     export CONFIG_FILE="user.env"
     export CONFIG_PATH="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-    export OOSH_DIR="$onceShBase/${OOSH_BRANCH}"
+    # OOSH_DIR is the constant ~/oosh — private.oo.user.shared.symlinks.ensure
+    # above just pointed it at $onceShBase/${OOSH_BRANCH}. Nothing to export.
     export OOSH_MODE="${OOSH_BRANCH}"
 
     console.log "PATH=$PATH"
@@ -2081,11 +2101,16 @@ private.check.user.shared.dev.folder.linked() {
     export CONFIG="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig/user.env"
     export CONFIG_FILE="user.env"
     export CONFIG_PATH="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-    # Resolve OOSH_DIR from root's symlink (set during root install to the
-    # correct branch folder). private.this.path.canonical (this:144) is the
-    # portable resolver — see oo.mode for the macOS BSD-readlink rationale.
-    export OOSH_DIR=$(private.this.path.canonical "$HOME/oosh")
-    export OOSH_MODE=$(basename "$OOSH_DIR")
+    # OOSH_DIR is the constant ~/oosh and needs no export here. What IS needed
+    # is the PHYSICAL target of root's ~/oosh symlink (set during root install
+    # to the correct branch folder): OOSH_MODE is that folder's BRANCH name, and
+    # the `ln -s` below must point at a real directory — linking $OOSH_DIR itself
+    # would create $HOME/oosh -> $HOME/oosh ("Too many levels of symbolic
+    # links"). private.this.path.canonical (this:144) is the portable resolver —
+    # see oo.mode for the macOS BSD-readlink rationale.
+    local ooshTarget
+    ooshTarget=$(private.this.path.canonical "$HOME/oosh")
+    export OOSH_MODE=$(basename "$ooshTarget")
 
     cd $HOME
     if [ -L config ]; then
@@ -2095,7 +2120,7 @@ private.check.user.shared.dev.folder.linked() {
     else
       mv config "config.orig"
       ln -s "$CONFIG_PATH" config
-      ln -s "$OOSH_DIR" oosh
+      ln -s "$ooshTarget" oosh
     fi
 
   return 0

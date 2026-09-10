@@ -506,7 +506,7 @@ See [docs/log.md](log.md) for complete documentation.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `OOSH_DIR` | Root oosh directory | `/root/oosh` |
+| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [boot.md](boot.md)) | `~/oosh` |
 | `CONFIG` | Path to user.env | `~/config/user.env` |
 | `CONFIG_PATH` | Config directory | `~/config` |
 | `LOG_LEVEL` | Logging verbosity (0-6) | `3` |

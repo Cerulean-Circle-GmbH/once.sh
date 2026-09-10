@@ -37,14 +37,12 @@ if [ "$EXPECTED_RETURN_VALUE" -lt 1 ]; then
 fi
 
 
+# OOSH_DIR is ALWAYS ~/oosh — a constant, set by $OOSH_DIR/boot (the single
+# setter, see docs/boot.md). This is only a fallback for contexts that never
+# sourced boot (a bare `source this`, a mid-install sub-shell): same literal
+# value, never a BASH_SOURCE/$0 walk, never a resolved physical path.
 if [ -z "$OOSH_DIR" ]; then
-  OOSH_DIR=$( cd "$(dirname ${BASH_SOURCE[0]})" ; pwd )
-  if [ "$OOSH_DIR" = "." ]; then
-    OOSH_DIR=$(pwd)
-  fi
-  if [ "$OOSH_DIR" = "$USERHOME/init" ]; then
-    OOSH_DIR="$USERHOME/oosh"
-  fi
+  OOSH_DIR="$HOME/oosh"
   PATH="$OOSH_DIR:$PATH"
 fi
 
@@ -167,6 +165,97 @@ private.this.path.canonical() { # <path> # echo canonical absolute path; portabl
   fi
   printf '%s\n' "$p"
 }
+
+this.oosh.dir.validate() # <?treeRoot:$OOSH_DIR> # verify every OOSH_DIR assignment in the tree is the constant ~/oosh; rc 1 + report on any violation
+{
+  # THE RULE (docs/boot.md): OOSH_DIR is ALWAYS ~/oosh — the symlink path
+  # itself, written "$HOME/oosh" because a quoted tilde does not expand. It is
+  # therefore a CONSTANT: switching branches only moves what ~/oosh points at.
+  # Code that needs the PHYSICAL directory resolves it at point of use with
+  # private.this.path.canonical; it must never bake that into OOSH_DIR.
+  #
+  # Shaped like config.validate / context.validate: one tree scan, a verdict
+  # echoed to stdout (so it survives any LOG_LEVEL — the status-output idiom),
+  # create.result / return $(result).
+  local treeRoot="${1:-$OOSH_DIR}"
+  if [ ! -d "$treeRoot" ]; then
+    error.log "this.oosh.dir.validate: no such directory: $treeRoot"
+    echo "INVALID: no such directory: $treeRoot"
+    create.result 2 "no such directory: $treeRoot"
+    return $(result)
+  fi
+
+  # ONE scan of the tracked tree (git grep = a single process, and it honours
+  # .gitignore). Excluded on purpose: docs/ (prose about the rule), test/
+  # (fixtures legitimately point OOSH_DIR at a fixture worktree), .claude/ and
+  # *.md/*.json (tool config and documentation, not runnable oosh code).
+  local matches
+  matches=$(git -C "$treeRoot" grep -nE '(export[[:space:]]+OOSH_DIR=|^[[:space:]]*OOSH_DIR=|\$\{OOSH_DIR:=)' -- \
+              ':!docs' ':!test' ':!.claude' ':!*.md' ':!*.json' 2>/dev/null)
+
+  local conforming=0 exceptions=0 violations=0
+  local match file lineNo content trimmed prevLine
+  while IFS= read -r match; do
+    [ -z "$match" ] && continue
+    file="${match%%:*}"
+    content="${match#*:}"
+    lineNo="${content%%:*}"
+    content="${content#*:}"
+
+    # A line that only TALKS about OOSH_DIR is not an assignment.
+    trimmed="${content#"${content%%[![:space:]]*}"}"
+    case "$trimmed" in '#'*) continue ;; esac
+
+    # Sanctioned exception: marked on the line itself, on the line above, or —
+    # for a whole installer that runs before ~/oosh exists — file-wide.
+    # Anchored to a COMMENT so the marker only counts where a human wrote it —
+    # otherwise this very function (which names both markers) would exempt itself.
+    if printf '%s' "$content" | grep -qE '#[[:space:]]*oosh-dir-exception:'; then
+      exceptions=$((exceptions + 1)); continue
+    fi
+    if grep -qE '^[[:space:]]*#[[:space:]]*oosh-dir-exception-file:' "$treeRoot/$file" 2>/dev/null; then
+      exceptions=$((exceptions + 1)); continue
+    fi
+    # A marker directly on the line is rare: the assignment is often buried in a
+    # heredoc or a `bash -c` string, so accept it anywhere in the few lines just
+    # above (one sed per match — a handful of forks, not one per tree line).
+    prevLine=""
+    if [ "$lineNo" -gt 1 ]; then
+      local windowFrom=$((lineNo - 5))
+      [ "$windowFrom" -lt 1 ] && windowFrom=1
+      prevLine=$(sed -n "${windowFrom},$((lineNo - 1))p" "$treeRoot/$file" 2>/dev/null)
+    fi
+    if printf '%s' "$prevLine" | grep -qE '#[[:space:]]*oosh-dir-exception:'; then
+      exceptions=$((exceptions + 1)); continue
+    fi
+
+    # Conforming: the constant, and nothing else. `"$HOME/oosh"` / `$HOME/oosh`
+    # / `~/oosh` (bare tilde expands). A `pwd -P`, a `readlink -f`, a
+    # BASH_SOURCE/$0 walk or any branch worktree path is a violation.
+    if printf '%s' "$trimmed" \
+       | grep -qE '^(export[[:space:]]+)?OOSH_DIR=("\$HOME/oosh"|\$HOME/oosh|~/oosh)[[:space:]]*$'; then
+      conforming=$((conforming + 1)); continue
+    fi
+    if printf '%s' "$trimmed" \
+       | grep -qE '^:[[:space:]]+\$\{OOSH_DIR:=("\$HOME/oosh"|\$HOME/oosh|~/oosh)\}[[:space:]]*$'; then
+      conforming=$((conforming + 1)); continue
+    fi
+
+    error.log "this.oosh.dir.validate: $file:$lineNo does not set OOSH_DIR to ~/oosh: $trimmed"
+    violations=$((violations + 1))
+  done <<< "$matches"
+
+  if [ "$violations" -gt 0 ]; then
+    error.log "this.oosh.dir.validate: $violations violation(s) — OOSH_DIR is always \$HOME/oosh (see ${YELLOW}docs/boot.md${NORMAL}); resolve physical paths at point of use with private.this.path.canonical, or mark a genuine exception with '# oosh-dir-exception: <reason>'"
+    echo "INVALID: $treeRoot — $violations violation(s), $conforming conforming, $exceptions exception(s)"
+    create.result 1 "$violations violation(s), $conforming conforming, $exceptions exception(s)"
+    return $(result)
+  fi
+  echo "OK: $treeRoot — $conforming conforming, $exceptions exception(s), 0 violations"
+  create.result 0 "$conforming conforming, $exceptions exception(s), 0 violations"
+  return $(result)
+}
+this.oosh.dir.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
 
 private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPath> is a symlink to <target>; preserve any pre-existing real entry as <linkPath>.orig.<ts>; idempotent; fail-loud on every step
   # Shared by state 31's private.oo.user.shared.symlinks.ensure (oo) and
@@ -432,17 +521,8 @@ this.init() {
     return 0
   fi
   #set -x
-  #does not work on mac osx. readlink does not have option -f on mac
-  #local initStartPath=$(dirname $(readlink -f "${BASH_SOURCE[0]}"))
-  local initStartPath=$(dirname "${BASH_SOURCE[0]}")
   let shellLevel=$SHLVL-1
   let ooShellLevel=$SHLVL+2
-  #echo initStartPath $initStartPath
-
-  # if (loop list PATH find $initStartPath); then
-  #   loop list PATH rm $initStartPath
-  # fi
-  #export PATH=$initStartPath:$PATH
 
   #export PS1="[oosh $ONCE_SSH_CONFIG_HOST] $PS1"
   if ! [ "${0##*/}" = "config" ]; then
@@ -474,7 +554,9 @@ this.init() {
   fi
   if [ -z "$OOSH_PROMPT" ]; then
     export OOSH_STATUS="0: started in shell level: $shellLevel"
-    export OOSH_DIR="$initStartPath"
+    # No OOSH_DIR here: it is the constant ~/oosh, already set by boot or by
+    # this scripts top-level fallback. Assigning $initStartPath (a dirname of
+    # BASH_SOURCE, often relative) violated the rule and overrode a good value.
     export OOSH_SHLVL=$ooShellLevel
     export OOSH_PROMPT="oosh "
     export ERROR_CODE_RECONFIG=117
