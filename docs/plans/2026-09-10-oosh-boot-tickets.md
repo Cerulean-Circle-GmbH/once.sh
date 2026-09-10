@@ -53,7 +53,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 
 | # | Ticket | Status | Why this position |
 |---|---|---|---|
-| 1 | **T4+T5** — `OOSH_DIR` audit + enforce | 🔵 **In Progress** | Core boot mechanism. 14 assignment sites, ~10 non-conforming. Everything below documents or depends on what this settles. |
+| 1 | **T4+T5** — `OOSH_DIR` audit + enforce | 🟣 **In Review** | Core boot mechanism. Landed `2045811` + `518e179` (the `CONFIG_PATH` follow-up). Everything below documents or depends on what this settles. |
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 💡 Ideas | Has a live reproducible bug, but its fix needs T4/T5's `OOSH_DIR`+branch semantics. |
 | 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
 | 4 | **T3** — `env -i sh` SAFETY | 💡 Ideas | Verify/close once `boot` is final. |
@@ -63,7 +63,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 
 ## 4. Tickets
 
-### T4 + T5 — `OOSH_DIR` is always `~/oosh` · review all `OOSH_DIR=` 🔵 In Progress
+### T4 + T5 — `OOSH_DIR` is always `~/oosh` · review all `OOSH_DIR=` 🟣 In Review
 
 > **Card (Ideas #4):** `OOSH_DIR is always /userhome/oosh  ~/oosh` — `NEVER oo mode.base.get`
 > **Card (Ideas #5):** `review all OOSH_DIR=` — `understand the boot mechanism`
@@ -99,7 +99,13 @@ changes and needs setting in exactly **one** place. Code that genuinely needs th
 - [x] Every remaining non-conforming site either fixed, or justified in-code with a marker
 - [x] A test pins the rule — `test.this` T-OOSH-DIR-* (4 cases, including a *planted* violation so the guard is proven to fail); `test.config` T31 asserts `boot`'s literal and delegates the tree sweep
 - [x] `docs/boot.md` states the rule and the sanctioned exceptions
-- [ ] Standing verification bar passes
+- [x] Standing verification bar passes — host `test.suite core 1` 623 assertions /
+      622 passed / 1 intentional; `os platform.test ubuntu_24_04` **rc=0**, in-container
+      core 628/627/1, the only `✗ FAIL` lines being that same intentional meta-test once
+      per container user (root/test/oosh-user/bash-user). After a *real fresh install* all
+      four users' shells passed T-OOSH-DIR-IS-HOME-OOSH, T-CONFIG-PATH-IS-HOME-CONFIG,
+      T-ANCHOR-VALIDATE-TREE and T31 — and the log holds zero occurrences of "Too many
+      levels of symbolic links" (the state-31 self-loop this ticket fixed).
 
 **Verification.**
 ```bash
@@ -286,3 +292,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 | 2026-09-10 | Document created; board oriented; T4+T5 moved to In Progress |
 | 2026-09-10 | First T4+T5 attempt (`6ada741`) built on the WRONG rule (resolved target); reverted in full (`ba355b7`) and rebuilt on `OOSH_DIR` = the `~/oosh` symlink itself |
 | 2026-09-10 | T4+T5 landed (`2045811`). Follow-up in the same pass: `CONFIG_PATH` put under the same rule; guard generalised to `this.anchor.validate` |
+| 2026-09-10 | `os platform.test ubuntu_24_04` green against both commits (rc=0, zero real failures across all 4 container users) → **T4+T5 moved to In Review** |
