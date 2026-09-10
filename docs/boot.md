@@ -55,6 +55,34 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
 6. **Logging primitives** (bash only): source `log`, then `log.session.save`
    writes the per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` to `log.session.env`.
 
+### The `OOSH_DIR` rule (and its only exceptions)
+
+`OOSH_DIR` is **always the user's `~/oosh`, physically resolved** — never a
+`BASH_SOURCE`/`$0` walk, never `oo.mode.base.get`. There is **one** implementation:
+
+- **bash** → dispatch to `private.this.oosh.dir` (`this`), which wraps the portable
+  `private.this.path.canonical "$HOME/oosh"`.
+- **pre-`source this` bootstrap** → the identical inline expression
+  `"$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"`, used by `boot`
+  itself, by `ossh.start`, and emitted into the generated `~/.config/oosh/mode-env.bash`.
+
+Code that repoints `~/oosh` (`oo mode`, `oo mode.setup`, install state 31) **derives
+`OOSH_DIR` from the symlink afterwards** rather than assigning the target directly — the
+export is still needed because a symlink change cannot update an already-running shell.
+`oo.mode.base.get` remains legitimate for *locating worktrees*; it must never feed `OOSH_DIR`.
+
+**Sanctioned exceptions** — each marked in-code with `# oosh-dir-exception: <reason>`:
+
+| Site | Why |
+|---|---|
+| `oo.use` | runs one command **from another branch without switching** — a scoped child-process override; no symlink alternative by design |
+| `ossh` remote invoke | string executed on a **remote** host whose `~/oosh` does not exist yet |
+| `user.oosh.install` sub-shell | installs **another user** before their `~/oosh` exists |
+| `init/oosh` | the installer runs **before** `~/oosh` exists (may start from a clone/ZIP); it self-corrects by moving the repo to `$HOME/oosh`, and `unset`s `OOSH_DIR` before handing off to the login shell |
+
+Enforced by **`this oosh.dir.validate`** (rc 1 + report on any violation), which is
+covered by `test.this` T-OOSH-DIR-VALIDATE and delegated to from `test.config` T31.
+
 ## Idempotent
 
 Safe to source repeatedly (mode switches, `exec bash`, nested shells): PATH
