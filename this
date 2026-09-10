@@ -38,16 +38,13 @@ fi
 
 
 if [ -z "$OOSH_DIR" ]; then
-  # OOSH_DIR is ALWAYS ~/oosh (board rule), resolved to its physical target.
-  # This block runs at the TOP of `this`, before private.this.oosh.dir is defined
-  # further down, so it inlines the same canonical expression $OOSH_DIR/boot uses.
-  #
-  # Replaces the old `dirname "${BASH_SOURCE[0]}"` walk — which boot explicitly
-  # rules out, and which used LOGICAL `pwd` so it yielded the unresolved symlink
-  # string (or even "." when `this` was sourced by a relative path) — plus its two
-  # dead follow-ups: `$OOSH_DIR = "."` cannot happen (`pwd` is always absolute),
-  # and `$USERHOME` is only ever set by status.discover.
-  OOSH_DIR="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"
+  OOSH_DIR=$( cd "$(dirname ${BASH_SOURCE[0]})" ; pwd )
+  if [ "$OOSH_DIR" = "." ]; then
+    OOSH_DIR=$(pwd)
+  fi
+  if [ "$OOSH_DIR" = "$USERHOME/init" ]; then
+    OOSH_DIR="$USERHOME/oosh"
+  fi
   PATH="$OOSH_DIR:$PATH"
 fi
 
@@ -170,108 +167,6 @@ private.this.path.canonical() { # <path> # echo canonical absolute path; portabl
   fi
   printf '%s\n' "$p"
 }
-
-private.this.oosh.dir() # # echo the canonical OOSH_DIR — ALWAYS the user's ~/oosh, physically resolved
-{
-  # THE rule (board ticket "OOSH_DIR is always ~/oosh"): OOSH_DIR is always the
-  # user's ~/oosh, resolved to its physical target — never a BASH_SOURCE/$0 walk,
-  # never oo.mode.base.get. This is the SINGLE implementation; every bash caller
-  # dispatches here instead of re-spelling the expression.
-  #
-  # Echoes (rather than create.result) to match its sibling helper
-  # private.this.path.canonical, because callers consume it as $(...).
-  #
-  # Two categories of caller cannot reach this method and legitimately inline the
-  # same expression instead — they run BEFORE this script's functions exist:
-  #   * $OOSH_DIR/boot (POSIX sh, the reference implementation), and
-  #   * ossh.start / the generated mode-env.bash (pre-`source this`).
-  # this.oosh.dir.validate knows about both. See docs/boot.md.
-  private.this.path.canonical "$HOME/oosh"
-}
-
-this.oosh.dir.validate() # <?path:$OOSH_DIR> # verify every OOSH_DIR assignment in the oosh tree derives from ~/oosh; rc 1 + report on any violation
-{
-  # Fail-loud guard for the board rule "OOSH_DIR is always ~/oosh, NEVER
-  # oo mode.base.get". Same shape as config.validate / context.validate: it is
-  # user-invocable, so the verdict goes to STDOUT via echo (status-output idiom)
-  # and survives any LOG_LEVEL; details also go through error.log.
-  #
-  # An assignment CONFORMS when it dispatches to private.this.oosh.dir, uses the
-  # portable private.this.path.canonical "$HOME/oosh", or inlines the canonical
-  # ~/oosh expression (the pre-`source this` bootstrap form used by boot,
-  # ossh.start and the generated mode-env.bash).
-  #
-  # Anything else must be a SANCTIONED EXCEPTION, marked in-code with
-  # `# oosh-dir-exception: <reason>` on the same line or the line above. Marking
-  # in-code (rather than a file:line allowlist here) keeps the justification next
-  # to the code and cannot drift as line numbers move.
-  local root="${1:-$OOSH_DIR}"
-  if [ ! -d "$root" ]; then
-    error.log "this.oosh.dir.validate: no such directory: $root"
-    echo "INVALID: no such directory: $root"
-    create.result 2 "no such directory: $root"
-    return $(result)
-  fi
-
-  # ONE scan for candidate ASSIGNMENTS across the tracked scripts — never a fork
-  # per line. Matches a statement-initial `OOSH_DIR=` (optionally export/local),
-  # the `: ${OOSH_DIR:=...}` default form, and `export OOSH_DIR=` anywhere; the
-  # last catches the remote/sub-shell command STRINGS in ossh/user, which are
-  # real assignments executed elsewhere. Reads such as `echo OOSH_DIR=$OOSH_DIR`
-  # do not match. docs/ and test/ and non-script file types are excluded.
-  # -H: always print the filename. grep OMITS it when given a single file, which
-  # would shift the file:line:content parsing below by one field.
-  local candidates
-  candidates=$(cd "$root" 2>/dev/null && git ls-files 2>/dev/null \
-    | grep -vE '^(docs|test)/' | grep -vE '\.(md|json|ya?ml|svg|puml)$' \
-    | tr '\n' '\0' \
-    | xargs -0 grep -HnE '^[[:space:]]*(export[[:space:]]+|local[[:space:]]+)?OOSH_DIR=|:[[:space:]]*\$\{OOSH_DIR:=|export[[:space:]]+OOSH_DIR=' 2>/dev/null)
-
-  local violations=0 entry f rest lineNum line trimmed prev
-  while IFS= read -r entry; do
-    [ -n "$entry" ] || continue
-    f=${entry%%:*};      rest=${entry#*:}
-    lineNum=${rest%%:*}; line=${rest#*:}
-    this.isNumber "$lineNum" || continue
-    # skip pure comment lines
-    trimmed=${line#"${line%%[![:space:]]*}"}
-    case "$trimmed" in '#'*) continue ;; esac
-    # Conforming derivations. NOTE the PRIMARY derivation must be ~/oosh — a mere
-    # mention of $HOME/oosh is not enough, or a line like
-    #   : ${OOSH_DIR:="$(cd "$(dirname "$0")" ... || echo "$HOME/oosh")"}
-    # would pass on its FALLBACK while actually deriving from $0 (the real
-    # ossh.start bug this ticket fixed).
-    case "$line" in
-      *private.this.oosh.dir*) continue ;;
-      *'private.this.path.canonical "$HOME/oosh"'*) continue ;;
-      *'cd "$HOME/oosh"'*) continue ;;
-      # heredoc-escaped variant: a GENERATED file (oo writes mode-env.bash) that
-      # emits this same canonical expression for the shell which later sources it
-      *'cd "\$HOME/oosh"'*) continue ;;
-      *'="$HOME/oosh"'*|*'=$HOME/oosh'*|*'=~/oosh'*|*'="~/oosh"'*) continue ;;
-    esac
-    # sanctioned exception marked on this line or the line above
-    prev=$(sed -n "$((lineNum - 1))p" "$root/$f" 2>/dev/null)
-    case "$line$prev" in
-      *oosh-dir-exception*) continue ;;
-    esac
-    error.log "this.oosh.dir.validate: $f:$lineNum does not derive OOSH_DIR from ~/oosh: $line"
-    echo "  VIOLATION $f:$lineNum: $line"
-    violations=$((violations + 1))
-  done <<< "$candidates"
-
-  if [ "$violations" -gt 0 ]; then
-    error.log "this.oosh.dir.validate: $violations violation(s) — OOSH_DIR must always derive from ~/oosh (dispatch to private.this.oosh.dir) or be marked '# oosh-dir-exception: <reason>'"
-    echo "INVALID: $violations OOSH_DIR violation(s)"
-    create.result 1 "$violations violation(s)"
-    return $(result)
-  fi
-  echo "OK: every OOSH_DIR assignment derives from ~/oosh"
-  create.result 0 "no violations"
-  return $(result)
-}
-
-this.oosh.dir.validate.completion.path() { :; }
 
 private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPath> is a symlink to <target>; preserve any pre-existing real entry as <linkPath>.orig.<ts>; idempotent; fail-loud on every step
   # Shared by state 31's private.oo.user.shared.symlinks.ensure (oo) and
@@ -579,11 +474,7 @@ this.init() {
   fi
   if [ -z "$OOSH_PROMPT" ]; then
     export OOSH_STATUS="0: started in shell level: $shellLevel"
-    # OOSH_DIR is always ~/oosh (board rule) — dispatch to the single
-    # implementation instead of the old `dirname "${BASH_SOURCE[0]}"`, which was
-    # unresolved and could even be RELATIVE (e.g. "." when `this` was sourced by
-    # a relative path), and which exported over any value already set.
-    export OOSH_DIR="$(private.this.oosh.dir)"
+    export OOSH_DIR="$initStartPath"
     export OOSH_SHLVL=$ooShellLevel
     export OOSH_PROMPT="oosh "
     export ERROR_CODE_RECONFIG=117
