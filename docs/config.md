@@ -64,7 +64,7 @@ so a first-ever shell has no missing-source error. See
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
-| `$CONFIG_PATH` | `~/config` | Shared config directory path (often a `sharedConfig` symlink) |
+| `$CONFIG_PATH` | `~/config` | Shared config directory — **always** the `~/config` symlink itself, never the `sharedConfig` it points at (see [boot.md](boot.md)) |
 | `$CONFIG_FILE` | `user.env` | Current config filename |
 | `$OOSH_USER_CONFIG_PATH` | `~/.config/oosh` | **Per-user** (non-shared) oosh config dir — single source of truth, anchored by `this.init`/`boot` |
 

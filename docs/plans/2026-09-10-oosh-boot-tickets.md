@@ -88,7 +88,8 @@ changes and needs setting in exactly **one** place. Code that genuinely needs th
 | **Real bugs fixed** | `ossh.start` derived from `$0`, i.e. the **host** process whenever `ossh` is *sourced* (`myId`, `config`, `user`, `test.ossh`). Install state 31 (user) did `ln -s "$OOSH_DIR" oosh` inside `cd $HOME` — a self-referential symlink ("Too many levels of symbolic links") — and took `OOSH_MODE=$(basename "$OOSH_DIR")`, which yields `oosh` instead of the branch. |
 | **Physical-path consumers fixed** | `config.init.user`'s shared-tree prefix test, `promote`'s worktree/mergeDir comparisons (double-stash of the same dir), `oo.mode.base.get` strategies 3/4 (`dirname ~/oosh` is just `$HOME`), `test.oo`'s mode fixture. |
 | **Sanctioned exceptions** | 4, each marked in-code: `oo.use` (scoped child override), `ossh` remote invoke, `user.oosh.install` sub-shell, and `init/oosh` (file-wide — the installer runs before `~/oosh` exists). Marker: `# oosh-dir-exception: <reason>` / `# oosh-dir-exception-file: <reason>`. |
-| **Guard** | New `this.oosh.dir.validate` (`this`) — one `git grep` over the tracked tree, classifying every assignment conforming / exception / violation, verdict echoed to stdout, rc 1 on any violation. Shaped like `config.validate`. |
+| **Guard** | New `this.anchor.validate <all\|OOSH_DIR\|CONFIG_PATH>` (`this`), with `this.oosh.dir.validate` / `this.config.path.validate` as the per-anchor forms — one `git grep` per anchor over the tracked tree, classifying every assignment conforming / exception / violation, verdict echoed to stdout, rc 1 on any violation. Shaped like `config.validate`. Tree today: `OOSH_DIR` 4 conforming / 7 exceptions / 0 violations; `CONFIG_PATH` 6 / 3 / 0. |
+| **Follow-up: `CONFIG_PATH`** | Put under the same rule in the same pass — see below. |
 
 `oo.mode.base.get` itself remains legitimate for **locating worktrees**
 (`oo:470,518,573,796,912,951,1082,1120`); the ticket forbids only deriving `OOSH_DIR` from it.
@@ -104,12 +105,45 @@ changes and needs setting in exactly **one** place. Code that genuinely needs th
 ```bash
 source ~/oosh/boot && echo "$OOSH_DIR"      # → /home/<user>/oosh  (the symlink itself)
 readlink ~/oosh                             # → the branch worktree, NOT ~/oosh
-this.oosh.dir.validate                      # → OK: … 0 violations   (rc 0)
+echo "$CONFIG_PATH"                          # → /home/<user>/config  (the symlink itself)
+this.anchor.validate                        # → OK for BOTH anchors, 0 violations (rc 0)
                                             #   (`this` is a function in an oosh shell,
                                             #    so call the method directly)
 ./test.suite run this 1 && ./test.suite run config 1 && ./test.suite core 1
 os platform.test ubuntu_24_04
 ```
+
+#### Follow-up done in the same pass — `CONFIG_PATH` is always `~/config`
+
+The card names only `OOSH_DIR`, but the audit showed `CONFIG_PATH` had the *same*
+defect in a sharper form: **`boot` was the only place in the tree that resolved it.**
+`config:170` (`export CONFIG_PATH=~/config`), `log:103`, `log:300`, `ossh:3579` and
+`this:492` (`: ${CONFIG_PATH:=$HOME/config}`) all already used the literal — so the
+variable held *two different values depending on which entry point ran*: the shared
+`sharedConfig` path after `boot`, `~/config` after a bare `source this`, `ossh exec`
+or a mid-install sub-shell.
+
+- **Fixed:** `boot` now sets `export CONFIG_PATH="$HOME/config"`, agreeing with
+  everyone else. One line.
+- **No point-of-use fixes were needed.** Unlike `OOSH_DIR`, nothing in the tree does
+  `dirname` / `basename` / prefix arithmetic on `CONFIG_PATH` — only `-d` / `-f` /
+  `-z` tests, which follow a symlink. The one `ln -s "$CONFIG_PATH" config`
+  (`oo:2122`, the self-loop shape that bit `OOSH_DIR`) is safe because `CONFIG_PATH`
+  is set to the explicit shared path 19 lines above it.
+- **3 exceptions marked** `# config-path-exception:` — `config file <path>` (the one
+  method whose job is to leave `~/config`) and install state 31 (×2, which builds the
+  shared tree *before* `~/config` is a symlink to it).
+- **Guard generalised** rather than cloned: the marker slug is derived from the
+  variable name (`OOSH_DIR` → `oosh-dir-exception`, `CONFIG_PATH` →
+  `config-path-exception`), and a self-assignment (`CONFIG_PATH=$CONFIG_PATH`, as in
+  `config`'s and `test.suite`'s usage banners) is skipped — it is a no-op, and a
+  marker comment there would be *printed to the user*.
+- **Tests:** `test.this` T-CONFIG-PATH-IS-HOME-CONFIG and T-CONFIG-PATH-VALIDATE-REJECTS
+  (the latter proves the rule is per-anchor: an `oosh-dir` marker does **not** exempt
+  a `CONFIG_PATH` line); `test.config` T31 now asserts both of `boot`'s literals.
+
+Not touched: `CONFIG` (`$CONFIG_PATH/$CONFIG_FILE`) simply follows, and
+`OOSH_USER_CONFIG_PATH` was already the literal `$HOME/.config/oosh`.
 
 #### Follow-ups found while doing T4+T5 (not fixed here)
 
@@ -251,3 +285,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 |---|---|
 | 2026-09-10 | Document created; board oriented; T4+T5 moved to In Progress |
 | 2026-09-10 | First T4+T5 attempt (`6ada741`) built on the WRONG rule (resolved target); reverted in full (`ba355b7`) and rebuilt on `OOSH_DIR` = the `~/oosh` symlink itself |
+| 2026-09-10 | T4+T5 landed (`2045811`). Follow-up in the same pass: `CONFIG_PATH` put under the same rule; guard generalised to `this.anchor.validate` |

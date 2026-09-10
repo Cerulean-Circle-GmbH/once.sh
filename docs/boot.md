@@ -37,10 +37,10 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
 
 ## What it does, in order
 
-1. **Anchors.** `OOSH_DIR` is always `~/oosh` — the symlink path *itself*, never
-   its resolved target, never from `oo.mode.base.get` (see the rule below).
-   `CONFIG_PATH` = `~/config` (still resolved — the rule governs `OOSH_DIR` only),
-   `CONFIG_FILE` = `user.env`, `CONFIG` = the two joined.
+1. **Anchors.** `OOSH_DIR` is always `~/oosh` and `CONFIG_PATH` is always
+   `~/config` — the symlink paths *themselves*, never their resolved targets,
+   never from `oo.mode.base.get` (see the rule below). `CONFIG_FILE` =
+   `user.env`, `CONFIG` = `CONFIG_PATH` + `CONFIG_FILE`.
 2. **`OOSH_USER_CONFIG_PATH`** = `~/.config/oosh` — the per-user (non-shared)
    config dir (see [config.md § two tiers](config.md)). Single source of truth;
    `log`/`config`/`oo` reference the var, not the literal path.
@@ -55,20 +55,31 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
 6. **Logging primitives** (bash only): source `log`, then `log.session.save`
    writes the per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` to `log.session.env`.
 
-### The `OOSH_DIR` rule (and its only exceptions)
+### The path-anchor rule (and its only exceptions)
 
 **`OOSH_DIR` is always `~/oosh`** — the user's `oosh` symlink, never the branch
 worktree it happens to point at, never a `BASH_SOURCE`/`$0` walk, never
 `oo.mode.base.get`.
 
-In code that is written `"$HOME/oosh"`, because a tilde inside quotes does **not**
-expand (`OOSH_DIR="~/oosh"` would be seven literal characters and break every path
-built from it). `$HOME/oosh` and `~/oosh` are the same path; `$HOME/oosh` is the
-form that is safe in POSIX `sh` and in every quoting context.
+**`CONFIG_PATH` is always `~/config`** — the user's `config` symlink, never the
+shared `sharedConfig` directory it points at.
+
+In code those are written `"$HOME/oosh"` / `"$HOME/config"`, because a tilde inside
+quotes does **not** expand (`OOSH_DIR="~/oosh"` would be seven literal characters and
+break every path built from it). `$HOME/oosh` and `~/oosh` are the same path;
+`$HOME/oosh` is the form that is safe in POSIX `sh` and in every quoting context.
 
 ```sh
-export OOSH_DIR="$HOME/oosh"      # this IS ~/oosh
+export OOSH_DIR="$HOME/oosh"        # this IS ~/oosh
+export CONFIG_PATH="$HOME/config"   # this IS ~/config
 ```
+
+`CONFIG_PATH` came to the rule second, and for a blunt reason: `boot` was the **only**
+place that resolved it. `config`, `log`, `ossh` and `this` all already default to the
+literal `$HOME/config`, so the variable had *two different values depending on which
+entry point ran* — the shared physical path after `boot`, `~/config` after a bare
+`source this` or a mid-install sub-shell. Making `boot` agree with everyone else
+removed that split.
 
 #### Why that makes it simple
 
@@ -76,9 +87,11 @@ Because the value is the symlink, `OOSH_DIR` is a **constant**. Switching branch
 (`oo mode`) moves only what `~/oosh` *points at*; the variable itself never changes.
 A constant needs setting in exactly **one** place, so:
 
-- **`boot` is the single setter.** Everything else just reads it.
-- The one other assignment is a same-literal *fallback* in `this`'s top-level block,
-  for contexts that never source `boot` (a bare `source this`, a mid-install sub-shell).
+- **`boot` is the single setter** for both. Everything else just reads them.
+- For `OOSH_DIR` the one other assignment is a same-literal *fallback* in `this`'s
+  top-level block, for contexts that never source `boot` (a bare `source this`, a
+  mid-install sub-shell). `CONFIG_PATH` has the same shape of fallback in `this`,
+  `log` and `ossh` (`: ${CONFIG_PATH:=$HOME/config}`).
 - `oo.mode`, `oo.mode.setup` and install state 31 **no longer export it** — repointing
   the symlink *is* the switch. `mode-env.bash` (written by `oo.mode` for the `ooShim`
   to source into the parent shell) now carries only `OOSH_MODE`, `hash -r` and the
@@ -101,13 +114,19 @@ Resolve it **at that spot** with the portable helper `private.this.path.canonica
 | `oo.mode.base.get` | strategies 3/4 do `dirname`/`basename` — `dirname ~/oosh` is just `$HOME` |
 
 Everything else works fine through the symlink and is deliberately left alone: every
-`git -C "$OOSH_DIR" …`, every `$OOSH_DIR/<file>` path join, and
-`ln -s "$path/$class" "$OOSH_DIR/external/$class"`.
+`git -C "$OOSH_DIR" …`, every `$OOSH_DIR/<file>` and `$CONFIG_PATH/<file>` path join,
+`private.ensure.groupWrite "$CONFIG_PATH/…"`, and
+`ln -s "$path/$class" "$OOSH_DIR/external/$class"`. `CONFIG_PATH` needed **no**
+point-of-use fixes at all — nothing in the tree does `dirname`/`basename`/prefix
+arithmetic on it, only `-d` / `-f` / `-z` tests, which all follow a symlink.
 
 #### Sanctioned exceptions
 
-Each is marked in-code with `# oosh-dir-exception: <reason>` — or, for a whole file,
-`# oosh-dir-exception-file: <reason>`:
+Each is marked in-code with `# <anchor>-exception: <reason>` — or, for a whole file,
+`# <anchor>-exception-file: <reason>` — where `<anchor>` is the variable name
+lower-cased with `_` → `-`: `oosh-dir-exception`, `config-path-exception`.
+
+**`OOSH_DIR`:**
 
 | Site | Why |
 |---|---|
@@ -116,18 +135,31 @@ Each is marked in-code with `# oosh-dir-exception: <reason>` — or, for a whole
 | `user.oosh.install` sub-shell | installs **another user** before their `~/oosh` exists |
 | `init/oosh` (file-wide) | the installer runs **before** `~/oosh` exists (it may start from a clone or a ZIP); it self-corrects by moving the repo to `$HOME/oosh`, and `unset`s `OOSH_DIR` before handing off to the login shell |
 
-Enforced by **`this.oosh.dir.validate`** (in an oosh shell `this` is itself a
-function, so call the method directly; as a script it is `./this oosh.dir.validate`)
-— one `git grep` over the tracked tree
-(`docs/`, `test/`, `.claude/` and `*.md`/`*.json` excluded), classifying every
+**`CONFIG_PATH`:**
+
+| Site | Why |
+|---|---|
+| `config file <path>` | the one method whose *job* is to leave `~/config` — it points the session at an arbitrary config file, so `CONFIG_PATH` must come from that path |
+| install state 31 (×2) | builds the shared tree **before** `~/config` is a symlink to it, so it must name the target directly |
+
+A self-assignment (`CONFIG_PATH=$CONFIG_PATH`, as in `config`'s and `test.suite`'s
+usage banners) is not an assignment site — it is a no-op, and a marker comment there
+would be *printed to the user*.
+
+Enforced by **`this.anchor.validate <all|OOSH_DIR|CONFIG_PATH>`**, with
+`this.oosh.dir.validate` and `this.config.path.validate` as the per-anchor forms.
+(In an oosh shell `this` is itself a function, so call the method directly; as a
+script it is `./this anchor.validate`.) One `git grep` per anchor over the tracked
+tree (`docs/`, `test/`, `.claude/` and `*.md`/`*.json` excluded), classifying every
 assignment as conforming / exception / violation, echoing its verdict to stdout (so
 it survives any `LOG_LEVEL`) and returning rc 1 on any violation. Covered by
-`test.this` T-OOSH-DIR-* — including a *planted* violation, so the guard is proven to
-fail — and `test.config` T31 asserts `boot`'s literal then delegates the tree sweep
-to it.
+`test.this` T-OOSH-DIR-* / T-CONFIG-PATH-* — including *planted* violations, so the
+guard is proven to fail, and proven to be per-anchor (an `oosh-dir` marker does not
+exempt a `CONFIG_PATH` line) — and `test.config` T31 asserts both of `boot`'s
+literals then delegates the tree sweep to it.
 
-> A shell opened **before** this change still holds its old resolved `OOSH_DIR`.
-> `source ~/oosh/boot`, or simply a new shell, fixes it.
+> A shell opened **before** this change still holds the old resolved `OOSH_DIR` /
+> `CONFIG_PATH`. `source ~/oosh/boot`, or simply a new shell, fixes it.
 
 ## Idempotent
 
@@ -146,7 +178,7 @@ absent. (Promotion is owned by the release process, not by this work.)
 
 `boot` has no `boot.start`, no `noun.verb` methods, and is POSIX `sh` — that is
 deliberate (the dash/ash requirement). Its tests live in `test/test.config`
-(T24 PATH idempotency, T31 the OOSH_DIR constant, T40 POSIX-sh lint, T44
+(T24 PATH idempotency, T31 the OOSH_DIR/CONFIG_PATH constants, T40 POSIX-sh lint, T44
 `OOSH_USER_CONFIG_PATH`, T45 session touch-guard, T47 dash sources a generated
 chain).
 

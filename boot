@@ -22,7 +22,12 @@
 # because a tilde inside quotes does not expand. Code that genuinely needs the
 # PHYSICAL directory resolves it at that spot (private.this.path.canonical).
 export OOSH_DIR="$HOME/oosh"
-export CONFIG_PATH="$(cd "$HOME/config" 2>/dev/null && pwd -P || echo "$HOME/config")"
+# CONFIG_PATH follows the same rule for the same reason: it is ALWAYS ~/config,
+# the per-user symlink itself, not the shared sharedConfig dir it points at.
+# boot used to be the ONLY place that resolved it — config, log, ossh and this
+# all already default to the literal — so the variable had two different values
+# depending on which entry point ran. It is a constant now, set only here.
+export CONFIG_PATH="$HOME/config"
 export CONFIG_FILE="user.env"
 export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
 # Per-user (NON-shared) oosh config dir — single source of truth for per-user /

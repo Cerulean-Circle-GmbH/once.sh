@@ -166,35 +166,23 @@ private.this.path.canonical() { # <path> # echo canonical absolute path; portabl
   printf '%s\n' "$p"
 }
 
-this.oosh.dir.validate() # <?treeRoot:$OOSH_DIR> # verify every OOSH_DIR assignment in the tree is the constant ~/oosh; rc 1 + report on any violation
+private.this.anchor.validate.one() # <anchor> <leaf> <treeRoot> # scan <treeRoot> for assignments of <anchor>; echo the verdict; rc 0 clean / 1 violations
 {
-  # THE RULE (docs/boot.md): OOSH_DIR is ALWAYS ~/oosh — the symlink path
-  # itself, written "$HOME/oosh" because a quoted tilde does not expand. It is
-  # therefore a CONSTANT: switching branches only moves what ~/oosh points at.
-  # Code that needs the PHYSICAL directory resolves it at point of use with
-  # private.this.path.canonical; it must never bake that into OOSH_DIR.
-  #
-  # Shaped like config.validate / context.validate: one tree scan, a verdict
-  # echoed to stdout (so it survives any LOG_LEVEL — the status-output idiom),
-  # create.result / return $(result).
-  local treeRoot="${1:-$OOSH_DIR}"
-  if [ ! -d "$treeRoot" ]; then
-    error.log "this.oosh.dir.validate: no such directory: $treeRoot"
-    echo "INVALID: no such directory: $treeRoot"
-    create.result 2 "no such directory: $treeRoot"
-    return $(result)
-  fi
-
   # ONE scan of the tracked tree (git grep = a single process, and it honours
   # .gitignore). Excluded on purpose: docs/ (prose about the rule), test/
-  # (fixtures legitimately point OOSH_DIR at a fixture worktree), .claude/ and
+  # (fixtures legitimately point an anchor at a fixture dir), .claude/ and
   # *.md/*.json (tool config and documentation, not runnable oosh code).
+  local anchor="$1" leaf="$2" treeRoot="$3"
+  # Marker slug is derived from the variable name, so each anchor gets its own:
+  # OOSH_DIR -> "# oosh-dir-exception:", CONFIG_PATH -> "# config-path-exception:".
+  local slug="${anchor,,}"; slug="${slug//_/-}"
+
   local matches
-  matches=$(git -C "$treeRoot" grep -nE '(export[[:space:]]+OOSH_DIR=|^[[:space:]]*OOSH_DIR=|\$\{OOSH_DIR:=)' -- \
+  matches=$(git -C "$treeRoot" grep -nE "(export[[:space:]]+${anchor}=|^[[:space:]]*${anchor}=|\\\$\\{${anchor}:=)" -- \
               ':!docs' ':!test' ':!.claude' ':!*.md' ':!*.json' 2>/dev/null)
 
   local conforming=0 exceptions=0 violations=0
-  local match file lineNo content trimmed prevLine
+  local match file lineNo content trimmed prevLine windowFrom
   while IFS= read -r match; do
     [ -z "$match" ] && continue
     file="${match%%:*}"
@@ -202,60 +190,124 @@ this.oosh.dir.validate() # <?treeRoot:$OOSH_DIR> # verify every OOSH_DIR assignm
     lineNo="${content%%:*}"
     content="${content#*:}"
 
-    # A line that only TALKS about OOSH_DIR is not an assignment.
+    # A line that only TALKS about the anchor is not an assignment.
     trimmed="${content#"${content%%[![:space:]]*}"}"
     case "$trimmed" in '#'*) continue ;; esac
 
-    # Sanctioned exception: marked on the line itself, on the line above, or —
-    # for a whole installer that runs before ~/oosh exists — file-wide.
+    # Self-assignment (`X=$X`) is a no-op — it appears inside `config`'s and
+    # `test.suite`'s usage banners, where a marker comment would be PRINTED to
+    # the user. It cannot violate the rule, so it is not an assignment site.
+    case "$trimmed" in
+      "${anchor}=\$${anchor}" | "${anchor}=\"\$${anchor}\"") continue ;;
+    esac
+
+    # Sanctioned exception: marked on the line itself, in the few lines just
+    # above (these assignments often sit inside a heredoc or a `bash -c`
+    # string, so the marker cannot go on the line), or file-wide.
     # Anchored to a COMMENT so the marker only counts where a human wrote it —
     # otherwise this very function (which names both markers) would exempt itself.
-    if printf '%s' "$content" | grep -qE '#[[:space:]]*oosh-dir-exception:'; then
+    if printf '%s' "$content" | grep -qE "#[[:space:]]*${slug}-exception:"; then
       exceptions=$((exceptions + 1)); continue
     fi
-    if grep -qE '^[[:space:]]*#[[:space:]]*oosh-dir-exception-file:' "$treeRoot/$file" 2>/dev/null; then
+    if grep -qE "^[[:space:]]*#[[:space:]]*${slug}-exception-file:" "$treeRoot/$file" 2>/dev/null; then
       exceptions=$((exceptions + 1)); continue
     fi
-    # A marker directly on the line is rare: the assignment is often buried in a
-    # heredoc or a `bash -c` string, so accept it anywhere in the few lines just
-    # above (one sed per match — a handful of forks, not one per tree line).
     prevLine=""
     if [ "$lineNo" -gt 1 ]; then
-      local windowFrom=$((lineNo - 5))
+      windowFrom=$((lineNo - 5))
       [ "$windowFrom" -lt 1 ] && windowFrom=1
       prevLine=$(sed -n "${windowFrom},$((lineNo - 1))p" "$treeRoot/$file" 2>/dev/null)
     fi
-    if printf '%s' "$prevLine" | grep -qE '#[[:space:]]*oosh-dir-exception:'; then
+    if printf '%s' "$prevLine" | grep -qE "#[[:space:]]*${slug}-exception:"; then
       exceptions=$((exceptions + 1)); continue
     fi
 
-    # Conforming: the constant, and nothing else. `"$HOME/oosh"` / `$HOME/oosh`
-    # / `~/oosh` (bare tilde expands). A `pwd -P`, a `readlink -f`, a
-    # BASH_SOURCE/$0 walk or any branch worktree path is a violation.
+    # Conforming: the constant, and nothing else. `"$HOME/<leaf>"` /
+    # `$HOME/<leaf>` / `~/<leaf>` (a BARE tilde expands; a quoted one does not).
+    # A `pwd -P`, a `readlink -f`, a BASH_SOURCE/$0 walk or any physical path
+    # is a violation.
     if printf '%s' "$trimmed" \
-       | grep -qE '^(export[[:space:]]+)?OOSH_DIR=("\$HOME/oosh"|\$HOME/oosh|~/oosh)[[:space:]]*$'; then
+       | grep -qE "^(export[[:space:]]+)?${anchor}=(\"\\\$HOME/${leaf}\"|\\\$HOME/${leaf}|~/${leaf})[[:space:]]*\$"; then
       conforming=$((conforming + 1)); continue
     fi
     if printf '%s' "$trimmed" \
-       | grep -qE '^:[[:space:]]+\$\{OOSH_DIR:=("\$HOME/oosh"|\$HOME/oosh|~/oosh)\}[[:space:]]*$'; then
+       | grep -qE "^:[[:space:]]+\\\$\\{${anchor}:=(\"\\\$HOME/${leaf}\"|\\\$HOME/${leaf}|~/${leaf})\\}[[:space:]]*\$"; then
       conforming=$((conforming + 1)); continue
     fi
 
-    error.log "this.oosh.dir.validate: $file:$lineNo does not set OOSH_DIR to ~/oosh: $trimmed"
+    error.log "this.anchor.validate: $file:$lineNo does not set $anchor to ~/$leaf: $trimmed"
     violations=$((violations + 1))
   done <<< "$matches"
 
   if [ "$violations" -gt 0 ]; then
-    error.log "this.oosh.dir.validate: $violations violation(s) — OOSH_DIR is always \$HOME/oosh (see ${YELLOW}docs/boot.md${NORMAL}); resolve physical paths at point of use with private.this.path.canonical, or mark a genuine exception with '# oosh-dir-exception: <reason>'"
-    echo "INVALID: $treeRoot — $violations violation(s), $conforming conforming, $exceptions exception(s)"
-    create.result 1 "$violations violation(s), $conforming conforming, $exceptions exception(s)"
+    error.log "this.anchor.validate: $anchor — $violations violation(s); it is always \$HOME/$leaf (see ${YELLOW}docs/boot.md${NORMAL}). Resolve physical paths at point of use with private.this.path.canonical, or mark a genuine exception with '# ${slug}-exception: <reason>'"
+    echo "INVALID: $anchor in $treeRoot — $violations violation(s), $conforming conforming, $exceptions exception(s)"
+    return 1
+  fi
+  echo "OK: $anchor in $treeRoot — $conforming conforming, $exceptions exception(s), 0 violations"
+  return 0
+}
+
+this.anchor.validate() # <?anchor:all> <?treeRoot:$OOSH_DIR> # verify every assignment of a path anchor (all|OOSH_DIR|CONFIG_PATH) in the tree is its ~/… constant; rc 1 + report on any violation
+{
+  # THE RULE (docs/boot.md): the per-user path anchors are ALWAYS the symlink
+  # in the user's home — OOSH_DIR is ~/oosh, CONFIG_PATH is ~/config — written
+  # "$HOME/…" because a quoted tilde does not expand. They are therefore
+  # CONSTANTS: switching branches or re-pointing the shared tree moves only what
+  # the symlink points AT. Code that needs the PHYSICAL directory resolves it at
+  # point of use with private.this.path.canonical; it must never be baked in.
+  #
+  # Shaped like config.validate / context.validate: one tree scan per anchor, a
+  # verdict echoed to stdout (so it survives any LOG_LEVEL — the status-output
+  # idiom), create.result / return $(result).
+  local anchor="${1:-all}" treeRoot="${2:-$OOSH_DIR}"
+  if [ ! -d "$treeRoot" ]; then
+    error.log "this.anchor.validate: no such directory: $treeRoot"
+    echo "INVALID: no such directory: $treeRoot"
+    create.result 2 "no such directory: $treeRoot"
     return $(result)
   fi
-  echo "OK: $treeRoot — $conforming conforming, $exceptions exception(s), 0 violations"
-  create.result 0 "$conforming conforming, $exceptions exception(s), 0 violations"
+
+  local rc=0 verdicts=""
+  local pair name leaf
+  for pair in "OOSH_DIR:oosh" "CONFIG_PATH:config"; do
+    name="${pair%%:*}"
+    leaf="${pair##*:}"
+    [ "$anchor" = "all" ] || [ "$anchor" = "$name" ] || continue
+    verdicts="${verdicts}$(private.this.anchor.validate.one "$name" "$leaf" "$treeRoot")"$'\n'
+    [ $? -eq 0 ] || rc=1
+  done
+
+  if [ -z "$verdicts" ]; then
+    error.log "this.anchor.validate: unknown anchor '$anchor' — use all, OOSH_DIR or CONFIG_PATH"
+    echo "INVALID: unknown anchor: $anchor"
+    create.result 2 "unknown anchor: $anchor"
+    return $(result)
+  fi
+  printf '%s' "$verdicts"
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "$anchor: violations found"
+    return $(result)
+  fi
+  create.result 0 "$anchor: 0 violations"
+  return $(result)
+}
+this.anchor.validate.completion.anchor() { echo "all"; echo "OOSH_DIR"; echo "CONFIG_PATH"; }
+this.anchor.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
+
+this.oosh.dir.validate() # <?treeRoot:$OOSH_DIR> # verify every OOSH_DIR assignment in the tree is the constant ~/oosh; rc 1 + report on any violation
+{
+  this.anchor.validate OOSH_DIR "$1"
   return $(result)
 }
 this.oosh.dir.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
+
+this.config.path.validate() # <?treeRoot:$OOSH_DIR> # verify every CONFIG_PATH assignment in the tree is the constant ~/config; rc 1 + report on any violation
+{
+  this.anchor.validate CONFIG_PATH "$1"
+  return $(result)
+}
+this.config.path.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
 
 private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPath> is a symlink to <target>; preserve any pre-existing real entry as <linkPath>.orig.<ts>; idempotent; fail-loud on every step
   # Shared by state 31's private.oo.user.shared.symlinks.ensure (oo) and
