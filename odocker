@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+# ============================================================================
+# odocker - Docker wrapper for oosh
+# No flags, positional params only. Following: tmux→otmux, ssh→ossh, docker→odocker
+# ============================================================================
+
+# Docker workspaces base directory
+: ${ODOCKER_WORKSPACES:="/Users/Shared/Workspaces/AI/Claude.All/DockerWorkspaces"}
+
+### new.method
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPLETION HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.odocker.running.containers() {
+  docker ps --format '{{.Names}}' 2>/dev/null
+}
+
+private.odocker.all.containers() {
+  docker ps -a --format '{{.Names}}' 2>/dev/null
+}
+
+private.odocker.images() {
+  docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>'
+}
+
+private.odocker.workspaces() {
+  # List workspace/variant paths that contain a Dockerfile (glob, not find)
+  local base="$ODOCKER_WORKSPACES"
+  local dir
+  for dir in "$base"/*/; do
+    [ -f "$dir/Dockerfile" ] && echo "${dir#$base/}" | sed 's|/$||'
+  done
+  for dir in "$base"/*/*/; do
+    [ -f "$dir/Dockerfile" ] && echo "${dir#$base/}" | sed 's|/$||'
+  done
+  return 0
+}
+
+private.odocker.image.from.workspace() {
+  # Convert workspace path to image tag: nakedUbuntu/20.04.sshd → naked_ubuntu_20_04_sshd
+  # Insert underscore before uppercase letters (camelCase → snake_case), then lowercase all
+  echo "$1" | sed 's/\([a-z]\)\([A-Z]\)/\1_\2/g' | tr '[:upper:]/' '[:lower:]_' | tr '.' '_'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKSPACE MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+odocker.workspace.list() # # list all Dockerfile workspaces and their build status
+{
+  local base="$ODOCKER_WORKSPACES"
+  if [ ! -d "$base" ]; then
+    error.log "DockerWorkspaces not found: $base"
+    return 1
+  fi
+
+  printf "%-35s %-25s %s\n" "WORKSPACE" "IMAGE TAG" "BUILT"
+  printf "%-35s %-25s %s\n" "---------" "---------" "-----"
+
+  local dir ws_path ws_tag built
+  for dir in "$base"/*/Dockerfile "$base"/*/*/Dockerfile; do
+    [ -f "$dir" ] || continue
+    ws_path=$(dirname "$dir")
+    ws_path="${ws_path#$base/}"
+    ws_tag=$(private.odocker.image.from.workspace "$ws_path")
+    if docker image inspect "$ws_tag" >/dev/null 2>&1; then
+      built="yes"
+    else
+      built="no"
+    fi
+    printf "%-35s %-25s %s\n" "$ws_path" "$ws_tag" "$built"
+  done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTAINER INSPECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+odocker.ps() # # list running containers
+{
+  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+}
+
+odocker.list() # # list images
+{
+  docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE DISCOVERY
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.odocker.resolve.image() {
+  # Given a container name or image name, return the image name
+  local input="$1"
+  local image
+
+  # Try as container first — get image from running/stopped container
+  image=$(docker inspect --format '{{.Config.Image}}' "$input" 2>/dev/null)
+  if [ -n "$image" ]; then
+    echo "$image"
+    return 0
+  fi
+
+  # Try as image directly
+  if docker image inspect "$input" >/dev/null 2>&1; then
+    echo "$input"
+    return 0
+  fi
+
+  return 1
+}
+
+odocker.file.find() # <containerOrImage> # find Dockerfile that built a container or image
+{
+  local input="$1"
+  if [ -z "$input" ]; then
+    error.log "Usage: odocker file.find <containerOrImage>"
+    return 1
+  fi
+
+  # Resolve to image name
+  local image
+  image=$(private.odocker.resolve.image "$input")
+  if [ $? -ne 0 ]; then
+    error.log "Not found as container or image: $input"
+    return 1
+  fi
+
+  # --- Tier 1: Label check ---
+  local label_path
+  label_path=$(docker inspect --format '{{index .Config.Labels "dockerfile.path"}}' "$image" 2>/dev/null)
+  if [ -n "$label_path" ] && [ "$label_path" != "<no value>" ]; then
+    if [ -f "$label_path" ]; then
+      console.log "Image: $image"
+      console.log "Dockerfile: $label_path"
+      console.log "Directory: $(dirname "$label_path")"
+      RESULT="$label_path"
+      return 0
+    fi
+  fi
+
+  local label_dir
+  label_dir=$(docker inspect --format '{{index .Config.Labels "dockerfile.dir"}}' "$image" 2>/dev/null)
+  if [ -n "$label_dir" ] && [ "$label_dir" != "<no value>" ]; then
+    if [ -f "$label_dir/Dockerfile" ]; then
+      console.log "Image: $image"
+      console.log "Dockerfile: $label_dir/Dockerfile"
+      console.log "Directory: $label_dir"
+      RESULT="$label_dir/Dockerfile"
+      return 0
+    fi
+  fi
+
+  # --- Tier 2: Compose label ---
+  local compose_dir
+  compose_dir=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$image" 2>/dev/null)
+  if [ -n "$compose_dir" ] && [ "$compose_dir" != "<no value>" ]; then
+    if [ -f "$compose_dir/Dockerfile" ]; then
+      console.log "Image: $image"
+      console.log "Dockerfile: $compose_dir/Dockerfile"
+      console.log "Directory: $compose_dir"
+      console.log "Source: docker-compose label"
+      RESULT="$compose_dir/Dockerfile"
+      return 0
+    fi
+  fi
+
+  # --- Tier 3: Filesystem search in DockerWorkspaces ---
+  local base="$ODOCKER_WORKSPACES"
+  if [ -d "$base" ]; then
+    local dir
+    for dir in "$base"/*/Dockerfile "$base"/*/*/Dockerfile; do
+      [ -f "$dir" ] || continue
+      local ws_dir=$(dirname "$dir")
+      local ws_tag
+      ws_tag=$(private.odocker.image.from.workspace "${ws_dir#$base/}")
+      if [ "$ws_tag" = "$image" ] || [ "$ws_tag" = "${image%%:*}" ]; then
+        console.log "Image: $image"
+        console.log "Dockerfile: $dir"
+        console.log "Directory: $ws_dir"
+        console.log "Source: workspace name match"
+        RESULT="$dir"
+        return 0
+      fi
+    done
+  fi
+
+  # --- Tier 4: History reconstruct ---
+  console.log "Image: $image"
+  console.log "Dockerfile: NOT FOUND"
+  console.log "Build history (reconstruct manually):"
+  docker image history --no-trunc --format '  {{.CreatedBy}}' "$image" 2>/dev/null \
+    | sed 's|/bin/sh -c #(nop)  ||g; s|/bin/sh -c ||g' \
+    | tac
+  RESULT=""
+  return 1
+}
+odocker.file.find.completion.containerOrImage() {
+  private.odocker.all.containers
+  private.odocker.images
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD & RUN
+# ─────────────────────────────────────────────────────────────────────────────
+
+odocker.build.all() # # build all workspaces that have a Dockerfile
+{
+  local base="$ODOCKER_WORKSPACES"
+  if [ ! -d "$base" ]; then
+    error.log "DockerWorkspaces not found: $base"
+    return 1
+  fi
+
+  local dir ws_path total=0 ok=0 fail=0
+  for dir in "$base"/*/Dockerfile "$base"/*/*/Dockerfile; do
+    [ -f "$dir" ] || continue
+    ws_path=$(dirname "$dir")
+    ws_path="${ws_path#$base/}"
+    total=$((total + 1))
+    console.log "--- Building $ws_path ($total) ---"
+    if odocker.build "$ws_path"; then
+      ok=$((ok + 1))
+    else
+      fail=$((fail + 1))
+    fi
+    echo ""
+  done
+
+  console.log "Build complete: $ok succeeded, $fail failed out of $total workspaces"
+  [ $fail -eq 0 ]
+}
+
+odocker.build() # <workspace> # build image from DockerWorkspaces directory
+{
+  local workspace="$1"
+  if [ -z "$workspace" ]; then
+    error.log "Usage: odocker build <workspace>"
+    console.log "Available workspaces:"
+    private.odocker.workspaces
+    return 1
+  fi
+
+  local workspace_dir="$ODOCKER_WORKSPACES/$workspace"
+  if [ ! -f "$workspace_dir/Dockerfile" ]; then
+    error.log "No Dockerfile found in $workspace_dir"
+    return 1
+  fi
+
+  local image_tag
+  image_tag=$(private.odocker.image.from.workspace "$workspace")
+
+  local dockerfile_path
+  dockerfile_path=$(cd "$workspace_dir" && pwd -P)/Dockerfile
+
+  console.log "Building image: $image_tag from $workspace_dir"
+  docker build \
+    --label "dockerfile.path=$dockerfile_path" \
+    --label "dockerfile.dir=$(dirname "$dockerfile_path")" \
+    -t "$image_tag" "$workspace_dir"
+  local rc=$?
+
+  if [ $rc -eq 0 ]; then
+    success.log "Image $image_tag built successfully"
+  else
+    error.log "Build failed with exit code $rc"
+  fi
+  return $rc
+}
+odocker.build.completion.workspace() {
+  private.odocker.workspaces
+}
+
+odocker.run() # <image> <?name> # run container from image
+{
+  local image="$1"
+  if [ -z "$image" ]; then
+    error.log "Usage: odocker run <image> <?name>"
+    return 1
+  fi
+  shift
+  local name="$1"
+
+  local name_opt=""
+  if [ -n "$name" ]; then
+    name_opt="--name $name"
+  fi
+
+  console.log "Running image: $image"
+  docker run -it $name_opt "$image" bash
+}
+odocker.run.completion.image() {
+  private.odocker.images
+}
+
+odocker.run.sshd() # <image> <?name> # run container with SSH port mappings (for sshd images)
+{
+  local image="$1"
+  if [ -z "$image" ]; then
+    error.log "Usage: odocker run.sshd <image> <?name>"
+    return 1
+  fi
+  shift
+  local name="${1:-$(echo "$image" | tr '/:' '_')_sshd}"
+
+  console.log "Running image: $image with SSH mappings as $name"
+  docker run -d \
+    --name "$name" \
+    -p 8022:22 \
+    -p 8080:8080 \
+    -p 8443:8443 \
+    -p 5001:5001 \
+    -p 5002:5002 \
+    -p 5005:5005 \
+    "$image"
+  local rc=$?
+
+  if [ $rc -eq 0 ]; then
+    success.log "Container $name started (SSH: ssh -p 8022 test@localhost)"
+  else
+    error.log "Run failed with exit code $rc"
+  fi
+  return $rc
+}
+odocker.run.sshd.completion.image() {
+  private.odocker.images
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTAINER OPERATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+odocker.exec() # <container> <?shell:bash> # exec into running container
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    error.log "Usage: odocker exec <container> <?shell:bash>"
+    return 1
+  fi
+  shift
+  local shell="${1:-bash}"
+
+  docker exec -it "$container" "$shell"
+}
+odocker.exec.completion.container() {
+  private.odocker.running.containers
+}
+
+odocker.stop() # <container> # stop a running container
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    error.log "Usage: odocker stop <container>"
+    return 1
+  fi
+
+  docker stop "$container"
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "Container $container stopped"
+  else
+    error.log "Failed to stop $container"
+  fi
+  return $rc
+}
+odocker.stop.completion.container() {
+  private.odocker.running.containers
+}
+
+odocker.log() # <container> <?lines:50> # show container logs
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    error.log "Usage: odocker log <container> <?lines:50>"
+    return 1
+  fi
+  shift
+  local lines="${1:-50}"
+
+  docker logs --tail "$lines" "$container"
+}
+odocker.log.completion.container() {
+  private.odocker.all.containers
+}
+
+odocker.rm() # <container> # remove a stopped container
+{
+  local container="$1"
+  if [ -z "$container" ]; then
+    error.log "Usage: odocker rm <container>"
+    return 1
+  fi
+
+  docker rm "$container"
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "Container $container removed"
+  else
+    error.log "Failed to remove $container (running? use odocker stop first)"
+  fi
+  return $rc
+}
+odocker.rm.completion.container() {
+  private.odocker.all.containers
+}
+
+odocker.rmi() # <image> # remove an image
+{
+  local image="$1"
+  if [ -z "$image" ]; then
+    error.log "Usage: odocker rmi <image>"
+    return 1
+  fi
+
+  docker rmi "$image"
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    success.log "Image $image removed"
+  else
+    error.log "Failed to remove image $image (in use?)"
+  fi
+  return $rc
+}
+odocker.rmi.completion.image() {
+  private.odocker.images
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATUS & MAINTENANCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+odocker.status() # # show Docker overview: images, containers, disk usage
+{
+  console.log "=== Running Containers ==="
+  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null
+  echo ""
+
+  console.log "=== Stopped Containers ==="
+  docker ps -a --filter "status=exited" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null
+  echo ""
+
+  console.log "=== Images ==="
+  docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' 2>/dev/null
+  echo ""
+
+  console.log "=== Disk Usage ==="
+  docker system df 2>/dev/null
+}
+
+odocker.disk() # # show Docker disk usage details
+{
+  docker system df -v 2>/dev/null
+}
+
+odocker.prune() # # remove dangling images and stopped containers
+{
+  console.log "Will remove:"
+  console.log "  - Stopped containers"
+  console.log "  - Dangling images"
+  console.log "  - Unused networks"
+  echo ""
+
+  docker container prune -f 2>/dev/null
+  docker image prune -f 2>/dev/null
+  docker network prune -f 2>/dev/null
+
+  success.log "Prune complete"
+  docker system df 2>/dev/null
+}
+
+odocker.prune.all() # # full system prune including unused images and volumes
+{
+  console.log "WARNING: This will remove ALL unused data:"
+  console.log "  - All stopped containers"
+  console.log "  - All unused images (not just dangling)"
+  console.log "  - All unused volumes"
+  console.log "  - All unused networks"
+  console.log "  - Build cache"
+  echo ""
+  console.log "Current usage before prune:"
+  docker system df 2>/dev/null
+  echo ""
+
+  read -p "Continue? (y/N) " confirm
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    console.log "Aborted"
+    return 0
+  fi
+
+  docker system prune -a --volumes -f 2>/dev/null
+  local rc=$?
+
+  if [ $rc -eq 0 ]; then
+    success.log "Full prune complete"
+    docker system df 2>/dev/null
+  else
+    error.log "Prune failed with exit code $rc"
+  fi
+  return $rc
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USAGE & START
+# ─────────────────────────────────────────────────────────────────────────────
+
+odocker.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+
+  Examples
+    $this ps
+    $this build nakedUbuntu/20.04.sshd
+    $this run.sshd naked_ubuntu_20_04_sshd
+    $this exec fervent_ritchie
+    $this file.find fervent_ritchie
+    $this stop fervent_ritchie
+    $this log fervent_ritchie
+    $this workspace.list
+    $this status
+    $this disk
+    $this prune
+    ----------
+  "
+}
+
+odocker.start()
+{
+  source this
+  this.start "$@"
+}
+
+odocker.start "$@"
