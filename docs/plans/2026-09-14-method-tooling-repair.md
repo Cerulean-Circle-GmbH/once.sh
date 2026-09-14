@@ -45,26 +45,46 @@ Anyone following the documentation types a command that has not dispatched for s
 **absent** from `config`, `this`, `log`, `debug` and `oo` itself — precisely the scripts under
 active work.
 
-### 3. The `.new` usage-file step has no files left
+### 3. It runs — but mangles what it writes
 
-It also runs `replace within "$OOSH_DIR/$newScript.new"`. Only **`myScript.new`** still exists, so
-even `otmux` / `path` / `backup` — which *do* carry the marker — fail at that step.
+Corrected from an earlier revision of this ticket: `<script>.new` is **not** a usage-file
+convention. It is the *working copy* of the `replace` transaction — `replace within …` writes
+`$FILE.new`, `replace commit` swaps it in (`mv $FILE $FILE.bak; mv $FILE.new $FILE`), `replace
+cleanup` removes both. `myScript.new` (0 bytes, dated 2026-04-30) is a **leftover from an
+interrupted run**, not a convention. There is no step to drop.
 
-## Decision needed
+Driven end-to-end against a throwaway script (`oo new probeScript` → `oo method.new
+probeScript.probeMethod`, four prompts answered), the tool **does** insert — and produces this:
 
-**What happens to the `<script>.new` usage file?** Recommendation: **drop the step.** Usage already
-lives in each method's `# <params> # description #` docstring, and that is what the completion
-engine reads — `docs/first-principles.md`: *"information about available commands, parameters, and
-defaults is defined only once — in the code itself. The completion engine reads this directly,
-eliminating duplication between documentation, code, and completion logic."* A parallel `.new` file
-is exactly the duplication that principle forbids. The alternative is to regenerate ~40 `.new`
-files and keep them in step forever.
+**The test file is generated correctly.** All three test prompts land:
+
+```bash
+test.case - "a probe test" \
+   probeScript.probeMethod probeArg
+expect 0 "probe_ok"
+```
+
+**The script is not.** Two defects:
+
+| Defect | Evidence |
+|---|---|
+| the typed description never reaches the method docstring | inserted as `probeScript.probeMethod()     # parameters # method description # an example` — the template placeholder, unchanged. That docstring is what the **completion engine reads** (`docs/first-principles.md`), so a method created by the tool is born with no usable parameter or description metadata |
+| the usage/Examples table is mangled and the description is lost | `private.oo.sed.first "----" …` then `"--------------------------" …` against the `.new` working copy leaves `probeMethod------`, and the typed text appears nowhere in the file |
+
+Plus a spurious warning on Linux: `WARNING> The filesystem is case insensitive and the case
+sensitive file … DOES NOT exist!` — on a case-sensitive filesystem, where the file does exist.
+
+So the tool is not missing and not unusable — it is **half-working**, and the half that fails is the
+half that carries the DRY metadata. That is very likely why it fell out of use.
 
 ## Definition of done
 
-- [ ] Decision recorded on the `<script>.new` usage-file step
 - [ ] All 17 stale references corrected to `oo method.new` / `oo test.new`
 - [ ] `### new.method` marker present in `config`, `this`, `log`, `debug`, `oo`
+- [ ] The typed description reaches the **method docstring** — the metadata the completion engine reads
+- [ ] The usage/Examples table is written correctly, not mangled (`probeMethod------`)
+- [ ] The spurious case-sensitivity warning is gone on a case-sensitive filesystem
+- [ ] The stale `myScript.new` leftover is removed
 - [ ] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
       from `templates/code/newMethod` **and** its test case from `templates/code/newMethodTest`
 - [ ] A test pins **documented command names against what the scripts actually define**, so this
