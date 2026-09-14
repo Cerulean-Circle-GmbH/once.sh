@@ -110,6 +110,14 @@ if [ -z "$OOSH_BOOT_NO_RECONSTRUCT" ]; then
   fi
   if [ -n "$_oosh_self" ]; then
     _oosh_selfdir=$(cd "$(dirname "$_oosh_self")" 2>/dev/null && pwd -P)
+    # If we were reached THROUGH ~/oosh, that anchor works by definition — this
+    # is an ordinary boot, not a rescue. Skipping here also keeps restore out of
+    # the installer's way: during install ~/oosh is legitimately mid-flight, and
+    # a login shell sourcing ~/oosh/boot must not start repairing underneath it.
+    _oosh_home_real=$(cd "$HOME/oosh" 2>/dev/null && pwd -P)
+    if [ -n "$_oosh_home_real" ] && [ "$_oosh_selfdir" = "$_oosh_home_real" ]; then
+      _oosh_selfdir=""
+    fi
     # Trigger on ~/oosh ONLY — the anchor whose breakage makes oosh unreachable
     # and so makes this entry point necessary at all. A missing ~/config with a
     # working ~/oosh is NOT boot's business: oosh commands still run there, so
@@ -120,10 +128,15 @@ if [ -z "$OOSH_BOOT_NO_RECONSTRUCT" ]; then
       # ...and are we standing in a real oosh tree to anchor TO?
       if [ -n "$_oosh_selfdir" ] && [ -f "$_oosh_selfdir/this" ] \
          && [ -f "$_oosh_selfdir/config" ] && [ -f "$_oosh_selfdir/oo" ]; then
-        "$_oosh_selfdir/config" env.init "$_oosh_selfdir"
+        # PATH first: config.start does `source this`, which resolves via PATH.
+        # Without this it fails with "this: No such file or directory" — and a
+        # host test can MASK that, because bash's `source` also searches the
+        # current directory, so running from inside the tree makes it pass.
+        PATH="$_oosh_selfdir:$_oosh_selfdir/ng:$PATH" \
+          "$_oosh_selfdir/config" env.init "$_oosh_selfdir"
       fi
     fi
-    unset _oosh_selfdir
+    unset _oosh_selfdir _oosh_home_real
   fi
   unset _oosh_self
 fi
