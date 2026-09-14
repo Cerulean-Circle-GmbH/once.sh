@@ -475,7 +475,7 @@ In `docs/plans/2026-09-10-oosh-boot-tickets.md`, under T3, mark the clean-enviro
 **Delivered (2026-09-14, second attempt).** `boot` and `init/oosh` both recover `$HOME`;
 `init/oosh` re-execs clean without `env -S`. The guarantee `075b4a3` removed for Alpine is
 restored portably — see
-[the design spec](../superpowers/specs/2026-09-14-clean-environment-guarantee-design.md).
+[the design spec](../specs/2026-09-14-clean-environment-guarantee-design.md).
 ```
 
 - [ ] **Step 3: Run the full core suite**

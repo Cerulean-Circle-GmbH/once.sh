@@ -85,6 +85,8 @@ explicitly when something drifts.
 | `Permissions … are too open` from ssh client | `ossh rights.fix` |
 | `ssh: Could not resolve hostname 2cuGitHub` | `ossh folder.fix` |
 | Legacy `~/.ssh/2cuGitHub` host block | `ossh folder.fix strict` |
+| `~/.ssh/id_ed25519.previous` / `.bak.*` cruft | `ossh folder.fix strict` |
+| Cursor / VS Code Source Control panel and branch picker stay empty although `git branch` works in the terminal; `git config --global --get-all safe.directory \| wc -l` is large (many stale `/tmp/...` entries) | `oo safeDirectory.prune` |
 
 ## `oo boot.fix` — why it exists and what it does not promise
 
@@ -96,7 +98,7 @@ is why nobody noticed). `/etc/oosh/boot` is the fixed path that collapses that
 to one command for any user, in any shell, with no environment at all. See
 [`boot.md` § The tilde caveat](boot.md).
 
-It is a separate primitive because the existing five cannot absorb it:
+It is a separate primitive because the existing ones cannot absorb it:
 `oo user.fix` / `config init.user` are per-user scope and run as the user,
 `config init.shared` is host scope but owns `sharedConfig` perms only, and
 `ossh rights.fix` / `folder.fix` are `~/.ssh`-only.
@@ -140,8 +142,6 @@ login by somebody who has never heard of oosh is a silent no-op.
 > is already a symlink into that same tree; what changed is only that the path
 > now *looks* root-owned. Do not treat `/etc/oosh/boot` as
 > trusted-because-`/etc`: it is exactly as trusted as the `dev` group.
-| `~/.ssh/id_ed25519.previous` / `.bak.*` cruft | `ossh folder.fix strict` |
-| Cursor / VS Code Source Control panel and branch picker stay empty although `git branch` works in the terminal; `git config --global --get-all safe.directory \| wc -l` is large (many stale `/tmp/...` entries) | `oo safeDirectory.prune` |
 
 ## Verification: am I healed?
 
