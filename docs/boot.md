@@ -337,7 +337,7 @@ Two caveats, both measured, both easy to get wrong when quoting this:
   name in `log` and the shell *died*; that is the bug T70 fixes.
 
 Guarded by `test.config` **T68** (the `$ENV` route and both of those negatives) and
-`test.oo` **T9B-PROFILED-\*** (the drop-in's content and guards, against a fixture);
+`test.oo` **T-BOOTPATH-PROFILED-\*** (the drop-in's content and guards, against a fixture);
 the deployed files are proved by `test.platform.boot.system.path.invariant`.
 
 #### macOS — what actually applies there

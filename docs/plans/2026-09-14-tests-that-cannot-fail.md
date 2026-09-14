@@ -140,4 +140,4 @@ Also found 2026-09-14, by a negative control that was supposed to fail and didn'
 bashism could land in `boot` and T40 would stay green. The T9 drop-in lint now pairs `sh -n` with an
 explicit bashism grep; T40 should do the same.
 
-- [ ] T40 pairs its `sh -n` lint with an explicit bashism grep
+- [x] T40 pairs its `sh -n` lint with an explicit bashism grep (2026-09-14)

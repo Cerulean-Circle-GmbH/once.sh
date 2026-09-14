@@ -22,7 +22,7 @@ non-intentional failures, and state 34 really fired in-container:
 privilege message used `error.log`, which routes to `$LOG_DEVICE` — visible on a developer's
 tty, invisible to all four container users, who got a bare non-zero exit. That violated
 doctrine already guarded in `test.promote:1164-1170`; it is now bare `echo` to stderr, with
-`T9-BOOT-FIX-FATAL-USES-BARE-ECHO` pinning it. (2) T67 originally pointed at the host's real
+`T-BOOTPATH-BOOT-FIX-FATAL-USES-BARE-ECHO` pinning it. (2) T67 originally pointed at the host's real
 `/etc/oosh/boot`, which would have left `core` permanently red on every dev box until someone
 ran `oo boot.fix` with sudo — and its skip branch returned rc 0 with a different string, so
 `expect 0 "<literal>"` failed on it anyway. Core now proves the *mechanism* against a fixture;
@@ -297,7 +297,7 @@ behaviour, not a regression.
 ### Tests
 
 Same split as T9. **Core** proves the mechanism against fixtures:
-`test.oo` **T9B-PROFILED-\*** (creation, `.sh` glob, mode 644, macOS skip,
+`test.oo` **T-BOOTPATH-PROFILED-\*** (creation, `.sh` glob, mode 644, macOS skip,
 POSIX + bashism lint, the two guards behaviourally, idempotence, status
 reporting) and `test.config` **T68** (the `$ENV` route in `sh`/`dash`/`busybox
 ash`/bash-as-`sh`, plus both negatives). **Platform** proves the deployment:

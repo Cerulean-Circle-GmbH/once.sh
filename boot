@@ -34,6 +34,7 @@
 # DELIBERATELY DUPLICATED in init/oosh: that script runs before oosh exists and
 # this one runs in a shell where `this` cannot even be parsed, so neither may
 # source a shared helper. See the design spec, "Duplication is inherent".
+# BEGIN homeRecovery
 if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
   _oosh_user=$(id -un 2>/dev/null)
   _oosh_home=""
@@ -67,6 +68,7 @@ if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
     return 1 2>/dev/null || exit 1
   fi
 fi
+# END homeRecovery
 
 # ── 1. Anchors ──────────────────────────────────────────────────────────────
 # OOSH_DIR is ALWAYS ~/oosh (the boss ruling) — the symlink path ITSELF, never

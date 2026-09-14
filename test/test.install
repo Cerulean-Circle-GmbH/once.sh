@@ -375,6 +375,8 @@ expect 0 "HOME recovery precedes the first \$HOME use" \
 test.install.cleanEnvReexec() {
   local ok=1
   grep -q 'OOSH_CLEAN_ENV' "$INIT_SCRIPT" || ok=0
+  # BEGIN/END cleanEnv markers delimit the block the probe below extracts.
+  grep -q '^# BEGIN cleanEnv$' "$INIT_SCRIPT" && grep -q '^# END cleanEnv$' "$INIT_SCRIPT" || ok=0
   grep -qE '^ *exec env -i( \\)?$' "$INIT_SCRIPT" || ok=0
   # The re-exec must name an INTERPRETER, never hand a bare "$0" to the
   # kernel — see T-INIT-CLEAN-ENV-EXEC for the three call sites that breaks.
@@ -438,7 +440,7 @@ test.install.cleanEnvProbe() # <interpreter> <flags|-> <var=value…> # runs the
     echo '#!/usr/bin/env sh'
     echo 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"'
     echo ': ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}'
-    sed -n '/^# ─── Clean environment ───/,/^fi$/p' "$INIT_SCRIPT"
+    sed -n '/^# BEGIN cleanEnv$/,/^# END cleanEnv$/p' "$INIT_SCRIPT"
     echo 'hasHomebrew=no; case ":$PATH:" in *:/opt/homebrew/bin:*) hasHomebrew=yes ;; esac'
     echo 'xtraceOn=off; case "$-" in *x*) xtraceOn=on ;; esac'
     echo 'isBash=no; if [ -n "$BASH_VERSION" ]; then isBash=yes; fi'
@@ -649,26 +651,36 @@ expect 0 "/opt/homebrew/bin is on the child's PATH" \
 # ============================================================================
 # `getent passwd <name>` prints one line per source that knows the user. On a
 # host where the user is in BOTH files and LDAP/SSSD it prints two. Without a
-# `head -1`, `cut -d: -f6` then yields two lines, `_oosh_home` is non-empty so
-# both fallbacks are skipped, and `[ -d "$_oosh_home" ]` is false for the
-# two-line string — so the recovery REFUSES while holding a perfectly good
-# home directory on line 1. Both copies of the block must guard against it.
+# `head -1`, `cut -d: -f6` yields two lines, the result is non-empty so both
+# fallbacks are skipped, and `[ -d ]` on the two-line string is false — the
+# recovery REFUSES while holding a perfectly good home on line 1.
+# Asserted by EFFECT, not by grepping for `head -1`: both recovery blocks
+# (init/oosh and boot, between their BEGIN/END homeRecovery markers) run with
+# a stub getent that answers two lines, and must come out with line 1's home.
 test.install.homeRecoveryNssMultiline() {
-  local missing=""
-  grep -q 'getent passwd "\$_oosh_user" 2>/dev/null | head -1 | cut -d: -f6' "$INIT_SCRIPT" \
-    || missing="init/oosh"
-  grep -q 'getent passwd "\$_oosh_user" 2>/dev/null | head -1 | cut -d: -f6' "$OOSH_DIR/boot" \
-    || missing="$missing boot"
-  if [ -z "$missing" ]; then
-    create.result 0 "getent output is reduced to one line before cut"
+  local stub goodHome bad="" file out
+  stub=$(mktemp -d "${TMPDIR:-/tmp}/test.install.nss.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  goodHome="$stub/home"; mkdir -p "$goodHome"
+  printf '%s\n' '#!/bin/sh' "echo \"u:x:1:1::$goodHome:/bin/sh\"" 'echo "u:x:1:1::/nonexistent/second-source:/bin/sh"' > "$stub/getent"
+  chmod +x "$stub/getent"
+  for file in "$INIT_SCRIPT" "$OOSH_DIR/boot"; do
+    sed -n '/^# BEGIN homeRecovery$/,/^# END homeRecovery$/p' "$file" > "$stub/block"
+    if [ ! -s "$stub/block" ]; then bad="$bad no-homeRecovery-markers:${file##*/}"; continue; fi
+    out=$(cd /tmp && env -i PATH="$stub:/usr/bin:/bin" sh -c ". $stub/block; echo \"HOME=[\$HOME]\"" 2>/dev/null | tail -1)
+    [ "$out" = "HOME=[$goodHome]" ] || bad="$bad ${file##*/}=>$out"
+  done
+  rm -rf "$stub"
+  if [ -z "$bad" ]; then
+    create.result 0 "two-line getent output recovers line 1's home in both blocks"
   else
-    create.result 1 "missing head -1 in:$missing"
+    create.result 1 "multi-source getent breaks recovery:$bad"
   fi
+  return $(result)
 }
-test.case $level "T-HOME-RECOVERY-NSS: getent multi-source output is truncated to one line" \
+test.case $level "T-HOME-RECOVERY-NSS: a two-line getent answer still recovers \$HOME (init/oosh and boot)" \
   test.install.homeRecoveryNssMultiline
-expect 0 "getent output is reduced to one line before cut" \
-  "files+LDAP hosts return two passwd lines; without head -1 recovery refuses with a valid home in hand"
+expect 0 "two-line getent output recovers line 1's home in both blocks" \
+  "files+LDAP hosts return two passwd lines; the recovery must take the first, not refuse"
 
 # ============================================================================
 # T-INIT-CLEAN-ENV-PASSTHROUGH: the re-exec passes the caller's env to CHILDREN
