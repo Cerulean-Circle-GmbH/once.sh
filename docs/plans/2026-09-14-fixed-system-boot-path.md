@@ -1,10 +1,10 @@
-# T9 — a fixed system path to `boot` 💡 Ideas (researched, not started)
+# T9 — a fixed system path to `boot` 🚧 In Progress
 
 > **Card:** `. /etc/oosh/boot` — one command that recovers any user, in any shell,
 > with no environment at all.
 
-**Status:** design complete, **five decisions open** (bottom). Not started. Research only —
-no code written, per the research-first rule for install-state-machine work.
+**Status:** design complete, **all five decisions taken** (bottom). Implementation started
+2026-09-14.
 
 ## Why
 
@@ -179,19 +179,24 @@ correct, and `boot` is already the most heavily pinned file in the tree.
 units (which frequently run with no `HOME`) get a stable ABI; and `ossh exec`'s five
 `|| <degrade>` call sites gain a second recovery rung.
 
-## Open decisions — needed before any code
+## Decisions taken (2026-09-14)
 
-1. **Trust.** Is a `/etc` path pointing at dev-group-writable content acceptable?
-   (a) accept and document — identical to root's existing `~/oosh`; (b) a root-owned **copy**
-   refreshed by `oo boot.fix`, trading single-source-of-truth for trust; (c) tighten the shared
-   tree's mode for `boot` specifically. *Research recommends (a) with an explicit note.*
-2. **Which branch does the canonical path pin to?** The install branch is the obvious answer and
-   is what state 31 already builds — but confirm a host installed from `dev` should keep serving
-   `dev`'s `boot` to a user who has switched to `testing`, rather than `oo mode` re-pointing it.
-3. **New state 34, or fold into 33?** Research argues 34; 33 is roughly half the work. The
-   tie-breaker is whether a dedicated halt point (*"halted at [34] root.boot.path.installed"*) is
-   worth one new entry in the state list.
-4. **`sudo oo boot.fix`, or `$SUDO` internally?** The repo does both — `init/oosh` uses `$SUDO`,
-   state 31 assumes root. Pick one and pin it so the diagnostic names the right command.
-5. **Is this a card of its own?** Research says yes — T3 is already In Review, and the working
-   agreement is one In Progress at a time.
+1. **Trust — (a) accept and document.** `/etc/oosh/boot` points at dev-group-writable content.
+   This is the *same* trust model as root's existing `~/oosh`, which is already a symlink into the
+   same `chmod -R g+w` tree — the change is not that `dev` members can influence root's bootstrap
+   (they already can), but that the path now *looks* root-owned. So it must be said out loud, in
+   two places: a note in `docs/boot.md` next to the fixed-path instruction, and a comment at the
+   creation site in `oo`. Anyone who later treats `/etc/oosh/boot` as trusted-because-`/etc`
+   should find the correction where they are looking.
+2. **Pins to the install branch.** `$OOSH_BRANCH` as state 31 already builds it; `oo mode` does
+   **not** re-point it. Low-stakes by construction: `boot` names no branch, so all a user on
+   another branch inherits is the ~160-line anchor prologue, and their own config and `log` still
+   load from their own tree (`boot:106`, `boot:149`).
+3. **New state `34 root.boot.path.installed`.** Dedicated halt point, so a failure reads
+   *"halted at [34] root.boot.path.installed"* rather than being folded into state 33's
+   best-effort `chsh`/`.bashrc` work. Renumbers nothing.
+4. **`$SUDO` internally, not `sudo oo boot.fix`.** One command in the docs that works whether the
+   caller is already root or a `dev` member with sudo, matching `init/oosh`'s idiom
+   (`init/oosh:351-354`). If neither applies it fails loudly naming what it needed — it must never
+   half-succeed.
+5. **A card of its own** — this one. T3 stays In Review.
