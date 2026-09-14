@@ -1,6 +1,6 @@
 # Ticket: repair the `oo method.new` tooling
 
-**Created:** 2026-09-14 · **Branch:** `dev` · **Status:** 💡 proposed — not yet on the board
+**Created:** 2026-09-14 · **Branch:** `dev` · **Status:** 🟣 In Review — implemented and pushed; awaiting acceptance
 **Found while:** planning T3 (`env -i sh. SAVETY...shall boot correctly`)
 
 ## Why this is a ticket
@@ -79,17 +79,17 @@ half that carries the DRY metadata. That is very likely why it fell out of use.
 
 ## Definition of done
 
-- [ ] All 17 stale references corrected to `oo method.new` / `oo test.new`
-- [ ] `### new.method` marker present in `config`, `this`, `log`, `debug`, `oo`
-- [ ] The typed description reaches the **method docstring** — the metadata the completion engine reads
-- [ ] The usage/Examples table is written correctly, not mangled (`probeMethod------`)
-- [ ] The spurious case-sensitivity warning is gone on a case-sensitive filesystem
-- [ ] The stale `myScript.new` leftover is removed
-- [ ] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
+- [x] All 17 stale references corrected to `oo method.new` / `oo test.new`
+- [x] `### new.method` marker present in `config`, `this`, `log`, `debug`, `oo`
+- [x] The typed description reaches the **method docstring** — the metadata the completion engine reads
+- [x] The usage/Examples table is written correctly, not mangled (`probeMethod------`)
+- [x] The spurious case-sensitivity warning is gone on a case-sensitive filesystem
+- [x] The stale `myScript.new` leftover is removed
+- [x] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
       from `templates/code/newMethod` **and** its test case from `templates/code/newMethodTest`
-- [ ] A test pins **documented command names against what the scripts actually define**, so this
+- [x] A test pins **documented command names against what the scripts actually define**, so this
       cannot drift silently again
-- [ ] Standing verification bar passes
+- [x] Standing verification bar passes
 
 ## Scope note — this is probably not only `oo`
 
@@ -111,6 +111,22 @@ oo method.new config.someProbe && grep -n 'config.someProbe' config test/test.co
 # and the guard catches a reintroduced drift
 ./test.suite run oo 1 && ./test.suite core 1
 ```
+
+## Delivered
+
+| Commit | What |
+|---|---|
+| `0428dca` | **`this.help` restored.** `line.quote` now escapes apostrophes (one apostrophe in one docstring had been killing `help` for an entire script — `config`, `this`, `oo`, `ossh`, `user` all affected), and the format init is guarded on **content** not existence (`lineFormat.env` existed at 0 bytes, so the init was skipped forever and `FORMAT_HELP` stayed unset). `line.unquote` mirrors the escaping — caught by `c2` going 23/23 → 22/23, not by reasoning. |
+| `f2ae994` | **The docstring became the single source.** `templates/code/newScript` drops the per-method table; `oo method.new` writes the typed parameters + description into the method docstring instead of patching that table. Plus `check`'s `find` now follows a symlinked start dir — it had been warning "file DOES NOT exist" for every `check file $OOSH_DIR/<x>` since `OOSH_DIR` became the `~/oosh` symlink in T4+T5. |
+| this commit | Markers, stale docs, and the drift guard. |
+
+**Extra defect found and fixed along the way** (not in the original evidence): `docs/oo.md`
+documented an entire `### oo.mode.dev` section for a method that does not exist — the command is
+`oo mode <branch>`, the branch being an argument. The new drift guard found it.
+
+**Still open:** `config save lineFormat "FORMAT_"` writes a 0-byte file, so the format init now
+re-runs every shell rather than once. Harmless, and it is why `lineFormat.env` was empty in the
+first place — but it is a separate defect in `config.save`'s prefix matching, not in `line`.
 
 ## Relationship to T3
 

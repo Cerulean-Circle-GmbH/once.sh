@@ -19,7 +19,7 @@ The oo framework supports:
 oo new myscript
 
 # Add a method to existing script
-oo new.method myscript.mymethod
+oo method.new myscript.mymethod
 
 # Update oosh from GitHub
 oo update
@@ -33,13 +33,13 @@ oo mode
 The recommended development workflow:
 
 ```
-1. oo mode.dev        → Switch to dev branch for development
+1. oo mode dev        → Switch to dev branch for development
 2. oo update          → Pull latest changes from GitHub
 3. [develop]          → Make your changes
 4. oo commit          → Commit and push to dev branch
 5. oo dev.to.testing  → Promote dev to testing (gated by core tests)
 6. oo testing.to.prod → Promote testing to prod (gated by platform tests)
-7. oo mode.dev        → Return to dev for next cycle
+7. oo mode dev        → Return to dev for next cycle
 ```
 
 ## Script Creation
@@ -58,26 +58,39 @@ This:
 3. Automatically creates `test/test.myscript`
 4. Prompts to run `reconfigure` for completion
 
-### oo.new.method
+### oo.method.new
 
 Adds a new method to an existing script (interactive).
 
 ```bash
-oo new.method myscript.mymethod
+oo method.new myscript.mymethod
 ```
 
 Prompts for:
-- Method description and parameters
+- **Method parameters** — e.g. `<branch> <?force:no>`, blank for none
+- **Method description**
 - Test description
 - Test parameters
 - Expected test result
 
-### oo.new.test
+The first two become the method's **docstring**:
+
+```bash
+myscript.mymethod()  # <branch> <?force:no> # switches to a branch, safely #
+```
+
+That docstring is the single source. [`this.help`](#) renders the
+`METHOD | PARAMETER | DESCRIPTION` table from it, and the completion engine reads the
+same line for parameters and defaults — so a script's `usage()` must **not** carry a
+hand-maintained per-method table (see
+[first-principles.md](first-principles.md), DRY). `templates/code/newScript` no longer has one.
+
+### oo.test.new
 
 Creates a test file for a script.
 
 ```bash
-oo new.test myscript
+oo test.new myscript
 ```
 
 Creates `test/test.myscript` from `templates/code/newScriptTest`.
@@ -86,24 +99,23 @@ Creates `test/test.myscript` from `templates/code/newScriptTest`.
 
 ### oo.mode
 
-Shows current branch status and git remote configuration.
+With no argument, shows current branch status and git remote configuration.
+With a branch, switches to that branch's worktree.
 
 ```bash
 oo mode
 # Output:
 # git branch is: * dev
 # OOSH_MODE=dev
+
+oo mode dev        # switch to the dev worktree
+oo mode testing
 ```
 
-### oo.mode.dev
-
-Switches to the dev branch for development.
-
-```bash
-oo mode.dev
-```
-
-Sets `OOSH_MODE=dev` and saves to config.
+The branch is an **argument**, not part of the method name — `oo.mode()` takes
+`<?branch>`. Tab completion offers the available worktree branches. Switching
+repoints the `~/oosh` symlink and sets `OOSH_MODE`; `OOSH_DIR` does not change,
+because it is always `~/oosh` (see [boot.md](boot.md)).
 
 ### oo.update
 
@@ -409,8 +421,8 @@ Templates are located in `$OOSH_DIR/templates/code/`:
 oo new mycmd
 
 # Add methods
-oo new.method mycmd.hello
-oo new.method mycmd.goodbye
+oo method.new mycmd.hello
+oo method.new mycmd.goodbye
 
 # Run tests
 test.suite run mycmd
@@ -423,7 +435,7 @@ reconfigure
 
 ```bash
 # Switch to dev mode
-oo mode.dev
+oo mode dev
 
 # Pull latest
 oo update

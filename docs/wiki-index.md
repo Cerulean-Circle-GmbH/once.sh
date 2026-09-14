@@ -99,7 +99,7 @@ For more details, see:
 
 Commands in oosh/once.sh are created using the `oo` script, which provides utilities for generating new scripts and methods:
 - `oo.new <name>`: Creates a new script (command) from a template, with completion support.
-- `oo.new.method <script.method>`: Adds a new method to an existing script, interactively updating the script with a method template.
+- `oo.method.new <script.method>`: Adds a new method to an existing script, interactively updating the script with a method template.
 - Templates for new scripts and methods are found in `templates/code/` (e.g., `newScript`, `newMethod`).
 - Each new command is structured to support modular loading, completion, and usage documentation.
 
@@ -114,8 +114,8 @@ Testing is managed by the `test.suite` system:
 
 ### Example: Creating and Testing a Command
 1. `oo new mycmd` — creates `mycmd` script from template.
-2. `oo new.method mycmd.hello` — adds a `hello` method to `mycmd`.
-3. `oo.new.test mycmd` — creates `test/test.mycmd` from template.
+2. `oo method.new mycmd.hello` — adds a `hello` method to `mycmd`.
+3. `oo.test.new mycmd` — creates `test/test.mycmd` from template.
 4. Edit `test/test.mycmd` to add test cases for `mycmd` methods.
 5. Run `test.suite run mycmd` or `test.suite all` to execute tests and see results.
 

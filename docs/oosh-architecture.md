@@ -546,8 +546,8 @@ myScript.copy.completion.flags() {
 
 ```bash
 ./oo new myscript                    # Create new oosh script from template
-./oo new.method myscript.mymethod    # Add method to script
-./oo new.test myscript               # Create test file
+./oo method.new myscript.mymethod    # Add method to script
+./oo test.new myscript               # Create test file
 ```
 
 See [docs/oo.md](oo.md) for complete documentation.
