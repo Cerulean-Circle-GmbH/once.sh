@@ -1,6 +1,6 @@
 # Ticket: repair the `oo method.new` tooling
 
-**Created:** 2026-09-14 · **Branch:** `dev` · **Status:** 🟣 In Review — implemented and pushed; awaiting acceptance
+**Created:** 2026-09-14 · **Branch:** `dev` · **Status:** 💡 Ideas — investigated in depth; **implementation reverted 2026-09-14**
 **Found while:** planning T3 (`env -i sh. SAVETY...shall boot correctly`)
 
 ## Why this is a ticket
@@ -79,17 +79,17 @@ half that carries the DRY metadata. That is very likely why it fell out of use.
 
 ## Definition of done
 
-- [x] All 17 stale references corrected to `oo method.new` / `oo test.new`
-- [x] `### new.method` marker present in `config`, `this`, `log`, `debug`, `oo`
-- [x] The typed description reaches the **method docstring** — the metadata the completion engine reads
-- [x] The usage/Examples table is written correctly, not mangled (`probeMethod------`)
-- [x] The spurious case-sensitivity warning is gone on a case-sensitive filesystem
-- [x] The stale `myScript.new` leftover is removed
-- [x] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
+- [ ] All 17 stale references corrected to `oo method.new` / `oo test.new`
+- [ ] `### new.method` marker present in `config`, `this`, `log`, `debug`, `oo`
+- [ ] The typed description reaches the **method docstring** — the metadata the completion engine reads
+- [ ] The usage/Examples table is written correctly, not mangled (`probeMethod------`)
+- [ ] The spurious case-sensitivity warning is gone on a case-sensitive filesystem
+- [ ] The stale `myScript.new` leftover is removed
+- [ ] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
       from `templates/code/newMethod` **and** its test case from `templates/code/newMethodTest`
-- [x] A test pins **documented command names against what the scripts actually define**, so this
+- [ ] A test pins **documented command names against what the scripts actually define**, so this
       cannot drift silently again
-- [x] Standing verification bar passes
+- [ ] Standing verification bar passes
 
 ## Scope note — this is probably not only `oo`
 
@@ -112,7 +112,24 @@ oo method.new config.someProbe && grep -n 'config.someProbe' config test/test.co
 ./test.suite run oo 1 && ./test.suite core 1
 ```
 
-## Delivered
+## Implementation reverted (2026-09-14)
+
+This was built (`0428dca`, `f2ae994`, `cc6078a`) and then **reverted** along with the rest of the
+day's code, because an unrelated regression appeared in the same window and could not be isolated —
+see the boot-tickets tracker. **The findings below stand**; only the code is gone. Redoing it is a
+matter of re-applying known changes, not re-investigating.
+
+One further defect, found by *using* the tool and worth having on record:
+
+- **It cannot create multi-segment method names.** `oo method.new config.env.init` produced
+  `config.env()` and silently dropped `.init`, because the name is split with `cut -d. -f2`. Yet
+  noun.verb naming inherently produces multi-segment methods (`oo.mode.base.get`,
+  `config.init.user`) — so the tool cannot create the very naming style the project mandates.
+  One-line fix: split on the FIRST dot (`${name%%.*}` / `${name#*.}`).
+- The **test** half needs `### test.method` markers, absent from every core test file; without them
+  it reports success and inserts nothing.
+
+## Was delivered, now reverted
 
 | Commit | What |
 |---|---|

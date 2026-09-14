@@ -2,6 +2,20 @@
 
 **Date:** 2026-09-14 · **Branch:** `dev` · **Ticket:** T3 — `env -i sh. SAVETY...shall boot correctly`
 
+> **Status (2026-09-14): designed, implemented, reverted.** The implementation
+> (`5f5a8bc`, `f7607fe`) was rolled back with the rest of the day's code after an unrelated
+> regression appeared in the same commit window and could not be isolated — see
+> [the boot-tickets tracker](../../plans/2026-09-10-oosh-boot-tickets.md). **The design and the
+> ruling below stand**; nothing here was found to be wrong. What was lost is the code, not the
+> reasoning.
+>
+> Two implementation lessons worth carrying forward:
+> - `boot` must put the tree on **PATH** before dispatching `config`, or `config.start`'s
+>   `source this` fails. A host test masked this for a whole cycle because it ran with the tree as
+>   the current directory, and bash's `source` falls back to the cwd. Tests must `cd` elsewhere.
+> - Restore must **not** fire when `boot` was reached *through* `~/oosh` — that is an ordinary
+>   boot, and firing there puts it in the installer's way.
+
 ## Context
 
 T3's card was misread for most of a day. `env -i` is not the shell's `env -i`, and not "install" —

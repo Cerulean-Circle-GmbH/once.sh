@@ -56,7 +56,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 | 1 | **T4+T5** — `OOSH_DIR` audit + enforce | 🟣 **In Review** | Core boot mechanism. Landed `2045811` + `518e179` (the `CONFIG_PATH` follow-up). Everything below documents or depends on what this settles. |
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 💡 Ideas | Has a live reproducible bug, but its fix needs T4/T5's `OOSH_DIR`+branch semantics. |
 | 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
-| 4 | **T3** — `env -i sh` SAFETY | 🟣 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. |
+| 4 | **T3** — `env -i sh` SAFETY | 💡 **Ideas** (partly delivered) | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. |
 | 5 | **T6** — `bootsratp.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the four above settle. |
 
 ---
@@ -299,7 +299,7 @@ first). But a separate `path` script (`path.list`, `path.env`, `path.save`, `pat
 
 ---
 
-### T3 — `env -i sh` SAFETY, shall boot correctly 🟣 In Review
+### T3 — `env -i sh` SAFETY, shall boot correctly 💡 Ideas (partly delivered, rest reverted)
 
 > **Card (Ideas #3):** `env -i sh. SAVETY...shall boot correctly`
 
@@ -372,7 +372,17 @@ was missed.
 calls INVALID) and `setup.color.env` uses the bashism `ESC=$'\e['`. Neither is in `boot`'s chain;
 the user chose not to fix them this round.
 
-**Delivered.**
+
+**Status after 2026-09-14.** `a824d8e` is **kept** — it fixes `boot` returning rc 1 on success under
+sh/dash/ash, which made five production sites (`ossh exec`, `ossh exec.tty`, three `user` rootkey
+pushes) take their "boot failed" branch on *every successful boot*. That commit is the only point of
+the day **proven green by a container platform run**.
+
+Everything after it was **reverted** (see §4d). Still missing, and recorded rather than lost:
+`$HOME` derivation so `env -i sh` boots; `config.reconstruct`; `config.env.init` and `boot` restore
+mode. The design for those is written up in full and was not found to be wrong.
+
+**Was delivered, now reverted.**
 - `boot`'s bash-only tail moved into **one `if`**, and the file now ends with a bare `:` — success
   can never again be reported as failure.
 - New **section 0**: when `$HOME` is unset *or not a directory* (a stale `HOME` produces the same
@@ -389,15 +399,15 @@ the user chose not to fix them this round.
   `$HOME` required, proven shells.
 
 **Definition of done.**
-- [x] Scope of "SAVETY" agreed and written down (above)
-- [x] Each agreed case has a test — `test.config` **T50** (exits 0 in sh/dash/ash/bash),
+- [x] Scope of "SAVETY" agreed and written down (above) — **and corrected twice by the user's own testing**: `env -i` means env INITIATE, i.e. RECOVERY of a broken box; see [the design spec](../superpowers/specs/2026-09-14-oosh-recovery-from-bare-shell-design.md)
+- [ ] Each agreed case has a test — `test.config` **T50** (exits 0 in sh/dash/ash/bash),
       **T51** (`env -i <sh>` really boots, deriving `$HOME`), **T52** (ash really boots),
       **T53** (refuses when no home can be derived), **T45**/**T46** (shared files carry no
       per-user reference; `boot` loads the per-user values itself), **T54** (cross-user dispatch
       unsets the per-user anchor); **T40** extended to lint under `ash` as well as `sh`.
       Every new guard was proven able to FAIL first, against deliberately broken copies.
-- [x] `docs/boot.md` documents the guarantees
-- [x] Standing verification bar passes — host `test.suite core 1` 626/625/1 intentional;
+- [ ] `docs/boot.md` documents the guarantees
+- [ ] Standing verification bar passes — host `test.suite core 1` 626/625/1 intentional;
       `os platform.test ubuntu_24_04` **rc=0**, in-container core 631/630/1, every `✗ FAIL`
       being that same intentional meta-test once per container user. After a real fresh install
       all four users passed T40, T50, T51 and T52.
@@ -445,6 +455,40 @@ The user moves cards; these are written up so they can be added to **Ideas** whe
 
 ---
 
+## 4d. The 2026-09-14 revert, and the regression that caused it
+
+**What happened.** A container platform run showed `test.ssh.config.woda.portable` failing 4× — the
+WODA `~/.ssh/config` Host aliases missing for every user except `root`. The day's code was reverted
+to `a824d8e` rather than shipped with an unexplained regression.
+
+**Established, so it need not be rediscovered:**
+
+| | |
+|---|---|
+| **Window** | `5e44f2b..f7607fe` (9 commits). `a824d8e` is **proven green**: 12 `✓ PASS: … IdentityFile is portable`, zero real failures |
+| **Ruled out** | `boot` restore mode — the failures were identical after `f7607fe` fixed its real bug |
+| **NOT evidence** | `ERROR> osshLayout.build failed` (3×) and `user init … did not complete` (10×) appear in the **green** run too — pre-existing noise, not the cause |
+| **Works standalone** | running `user init` by hand for a fresh user writes all three WODA blocks |
+| **Trap** | manual `user.oosh.install` does **not** reproduce install-time behaviour. Two A/B tests built on it (reverting `line`, then `user`) produced false exonerations. A real bisect needs one platform run per commit |
+
+**Fixes given up with the revert** — each still described in its ticket, so redoing them is
+re-applying, not re-investigating:
+
+- shared/per-user env-file separation — the `/root/.config/oosh/log.session.env: Permission denied`
+  errors across users **return**;
+- honest ERR-trap diagnostics — `env`/`grep` are again reported as "Command not found" /
+  "Misuse of shell builtins" when they ran fine;
+- `this.help` — stays broken for `config`, `this`, `oo`, `ossh`, `user` (one apostrophe in one
+  docstring breaks it for a whole script), and `lineFormat.env` stays 0 bytes;
+- the `oo method.new` repair (see [its ticket](2026-09-14-method-tooling-repair.md)).
+
+**Kept:** the two tickets, the design spec, and every documentation correction that is true
+independent of the code — 17 stale `oo new.method`/`oo new.test` references (renamed in `2fe5133`,
+March 2026) across 7 files, and `oo mode.dev` → `oo mode dev` in `docs/oo.md` for a method that has
+never existed.
+
+---
+
 ## 5. Standing verification bar (every ticket)
 
 - `./test.suite core 1` → **zero real failures** (1 intentional meta-test expected; 613 pass at time of writing)
@@ -471,6 +515,7 @@ The user moves cards; these are written up so they can be added to **Ideas** whe
 | 2026-09-14 | **T3** taken next at the user's request (out of the original order). Tracker's "already passes today" claim corrected: 2 real defects found and fixed (`boot` rc 1 on success; no-`HOME` killed the sourcing shell). → In Review |
 | 2026-09-14 | T3 landed (`a824d8e`); platform test green (rc=0, zero real failures across all 4 container users) |
 | 2026-09-14 | The card finally read correctly — `env -i` is **env initiate**, and it means RECOVERY. `config.env.init` + `boot` restore mode landed; `env -i sh <tree>/boot` brings a wrecked box back |
+| 2026-09-14 | **Reverted to `a824d8e`** after an unexplained WODA regression in the container. Knowledge kept, code rolled back — see §4d |
 | 2026-09-14 | User tested `env -i sh` in a container: a refusal is not a boot. T3 scope corrected — `boot` now DERIVES `$HOME` from the passwd database instead of failing fast; `env -i sh` boots correctly in all four shells |
 | 2026-09-14 | User pointed at the install log's env-file errors. Root cause: the SHARED `log.env` referenced the PER-USER `$OOSH_USER_CONFIG_PATH`, and `user:951` leaked it across users. Shared files now hold only shared data; `boot` sources the per-user file itself |
 | 2026-09-14 | User queried the last two error lines in tmux. Neither was a real failure: the ERR trap's `errno()` glossed propagated exit statuses as "Command not found" / "Misuse of shell builtins". Now verifies before diagnosing; hoisted to `private.debug.errno` and tested |

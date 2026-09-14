@@ -67,23 +67,10 @@ oo method.new myscript.mymethod
 ```
 
 Prompts for:
-- **Method parameters** — e.g. `<branch> <?force:no>`, blank for none
-- **Method description**
+- Method description and parameters
 - Test description
 - Test parameters
 - Expected test result
-
-The first two become the method's **docstring**:
-
-```bash
-myscript.mymethod()  # <branch> <?force:no> # switches to a branch, safely #
-```
-
-That docstring is the single source. [`this.help`](#) renders the
-`METHOD | PARAMETER | DESCRIPTION` table from it, and the completion engine reads the
-same line for parameters and defaults — so a script's `usage()` must **not** carry a
-hand-maintained per-method table (see
-[first-principles.md](first-principles.md), DRY). `templates/code/newScript` no longer has one.
 
 ### oo.test.new
 
@@ -113,9 +100,7 @@ oo mode testing
 ```
 
 The branch is an **argument**, not part of the method name — `oo.mode()` takes
-`<?branch>`. Tab completion offers the available worktree branches. Switching
-repoints the `~/oosh` symlink and sets `OOSH_MODE`; `OOSH_DIR` does not change,
-because it is always `~/oosh` (see [boot.md](boot.md)).
+`<?branch>`. Tab completion offers the available worktree branches.
 
 ### oo.update
 

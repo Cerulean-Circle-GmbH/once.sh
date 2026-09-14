@@ -64,30 +64,6 @@ so a first-ever shell has no missing-source error. See
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
-**Recovery.** `config env.init` is the T3 card's *env initiate*: it anchors `~/oosh` to a given
-oosh tree, repairs `~/config`, regenerates the env files and verifies them — the path for a box so
-broken that no oosh command is reachable. [`boot`](boot.md) dispatches it, and can be **executed**
-(not just sourced) so `env -i sh <tree>/boot` works. It refuses rather than guesses if the tree is
-not an oosh tree, and never deletes: a real entry becomes `<name>.orig.<ts>`. Pinned by
-`test.config` **T60-T63**.
-
-**Repair.** `config reconstruct` rebuilds the shared env files when they are *all* missing and
-reports them when they are merely damaged — it never rewrites a populated `sharedConfig`, because
-`config.save` regenerates it from the calling shell's live environment. [`boot`](boot.md) calls it
-automatically (see its Guarantees); `config init.env` is the deliberate full regenerate, and
-`config init.full` composes both. Pinned by `test.config` **T55-T59**.
-
-**The rule that keeps the two tiers apart: a SHARED file never references a
-PER-USER variable.** `config.save` used to append
-`. $OOSH_USER_CONFIG_PATH/log.session.env` to the shared `log.env`, so the shared file
-carried a per-user reference. Any cross-user sub-shell that inherited someone else's
-`OOSH_USER_CONFIG_PATH` then resolved it to *their* directory — `/root/.config/oosh/
-log.session.env: Permission denied`, seen for `test`, `developking` and `bash-user`
-throughout a platform-test install. [`boot`](boot.md) sources the per-user file itself
-now (its section 2b), right after the shared chain so per-user values still win.
-Pinned by `test.config` **T45**/**T46**, and **T54** (a cross-user dispatch must `unset`
-the per-user anchor along with the others).
-
 | `$CONFIG_PATH` | `~/config` | Shared config directory — **always** the `~/config` symlink itself, never the `sharedConfig` it points at (see [boot.md](boot.md)) |
 | `$CONFIG_FILE` | `user.env` | Current config filename |
 | `$OOSH_USER_CONFIG_PATH` | `~/.config/oosh` | **Per-user** (non-shared) oosh config dir — single source of truth, anchored by `this.init`/`boot` |
