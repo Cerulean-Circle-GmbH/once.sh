@@ -129,7 +129,7 @@ count moves when the suite grows, because the file it shadows grows.
    file's numbers. That is the general fix and it protects every future file.
 
 - [ ] `test.suite` fails loudly (or reports 0/0) when a file produces no results of its own
-- [ ] `test.tilde` asserts through the framework instead of via `echo`
+- [x] `test.tilde` asserts through the framework instead of via `echo` (2026-09-14: T-TILDE-CLEAN-ENV, -HOME, -STRING, -FILE-TEST; the clean re-exec now carries OOSH_DIR/CONFIG_PATH/LOG_* so the framework can score it)
 - [ ] Re-baseline the `core 1` totals in the T3 and T9 tickets once the phantom 31 is gone
 
 ## Related blind spot: `sh -n` does not catch `[[`
