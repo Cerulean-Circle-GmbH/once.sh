@@ -73,12 +73,23 @@ the ambiguity and keeps the recovery in a single place per run.)
 ### 2 · Recovering `HOME`
 
 `getent passwd "$(id -un)"` → `dscl . -read /Users/<u> NFSHomeDirectory` (macOS; take the **first**
-of the two paths it returns for `root`) → `/etc/passwd` via `awk`. The same three-way split the
-tree already uses (`this:126-134`).
+of the two paths it returns for `root`) → `/etc/passwd` via `awk`.
+
+The home-directory analogue already in the tree is `private.get.home.darwin` (`user:495`), which
+this mirrors for the `dscl` branch. (An earlier revision of this spec cited `this:126-134` — that
+is `private.this.group.exists`, a **group** lookup with the opposite probe order. Corrected here
+because the wrong citation propagated into code comments and commit messages before anyone
+checked it.)
+
+**A recovered home must also exist.** The candidate is accepted only when it is a *directory*, not
+merely a non-empty string. A user present in `passwd` whose home has not been created yet is
+therefore refused rather than recovered — deliberately: anchoring on a non-existent directory is
+exactly what produced the original fatal `: > /.config/oosh/log.session.env`, where a redirection
+failure on a special builtin killed the sourcing shell.
 
 An explicitly set, usable `HOME` always wins — recovery fires only when `HOME` is empty **or not a
 directory** (a removed user, or a container that inherited the builder's). If all three lookups come
-up empty there is nothing safe to anchor to, so it refuses with one diagnostic — by `return` in
+up empty there is nothing safe to anchor to, so it refuses — by `return` in
 `boot` (sourced: `exit` would close the user's shell) and `exit` in `init/oosh`.
 
 ### 3 · Duplication is inherent, not a smell
@@ -173,7 +184,7 @@ Each entry path across `sh`, `dash`, `bash` and `busybox ash`:
 | `env -i` with no `HOME`, piped | `HOME` recovered from the password database; `OOSH_DIR` is `~/oosh`, not `/oosh` |
 | explicit `HOME` | never overridden |
 | stale `HOME` (set, not a directory) | recovered, not trusted |
-| no home derivable at all | one diagnostic, non-zero; `boot` *returns*, `init/oosh` *exits* |
+| no home derivable at all | a diagnostic naming the user and the three sources tried, non-zero; `boot` *returns*, `init/oosh` *exits* |
 | sourced `boot` | never re-execs — the calling shell survives |
 | `-S` free | no `env -S` anywhere in `init/oosh` or `boot`, so Alpine cannot regress |
 
