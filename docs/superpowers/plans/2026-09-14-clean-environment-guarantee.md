@@ -347,7 +347,19 @@ cd ~/oosh && ./test.suite run install 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep 
 ```
 Expected: **FAIL**.
 
-- [ ] **Step 3: Add the re-exec, immediately after the `$HOME` block**
+- [ ] **Step 3: Add the re-exec, AFTER the branch default block**
+
+**Placement matters and is not negotiable.** `init/oosh` sets the branch at:
+
+```sh
+OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"
+: ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}
+```
+
+The re-exec must go **after those two lines**, not immediately after the `$HOME` block. Placed
+earlier, `OOSH_BRANCH` would still be empty, the re-exec would carry nothing, and the child would
+fall back to `dev` — silently discarding a caller's `OOSH_BRANCH=hannes-v2`. That is exactly the
+bug `57f0984` (2026-02-16) fixed. Insert immediately after `: ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}`:
 
 ```sh
 # ─── Clean environment ───────────────────────────────────────────────────
@@ -511,6 +523,6 @@ os platform.test ubuntu_24_04
 
 ## Risks
 
-- **`init/oosh` already re-execs twice** — for bash 4+ (`exec "$_newbash" "$0" "$@"`) and via a pre-clone for the curl-pipe path. The clean re-exec must come **first** so those inherit the clean environment; `OOSH_CLEAN_ENV` survives `exec` and stops any loop. Task 3 places it immediately after the `$HOME` block, before Phase A.
+- **`init/oosh` already re-execs twice** — for bash 4+ (`exec "$_newbash" "$0" "$@"`) and via a pre-clone for the curl-pipe path. The clean re-exec must come **first** so those inherit the clean environment; `OOSH_CLEAN_ENV` survives `exec` and stops any loop. Task 3 places it after the branch default and before Phase A — early enough to precede both existing re-execs, late enough that `OOSH_BRANCH` is set and can be carried across.
 - **`env -i` wipes `SUDO`, `OOSH_APT_UPDATED` and similar mid-install state.** The re-exec happens before any of it is set, so nothing is lost — but if a future variable must survive, it has to be added to the carry list explicitly, the way `OOSH_BRANCH` is.
 - **The previous attempt died on an unexplained WODA regression** (tracker §4d). These changes touch `boot` and `init/oosh` only — not `user`, `ossh` or `line` — but the platform test in Task 4 Step 5 is what decides that, not this reasoning.
