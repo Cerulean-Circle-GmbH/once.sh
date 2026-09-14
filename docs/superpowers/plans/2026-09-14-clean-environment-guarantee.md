@@ -1,5 +1,9 @@
 # Clean-Environment Guarantee Implementation Plan
 
+> **DELIVERED 2026-09-14** — every task below landed on `dev` (`80b6257` … `7e88ec4`, then the
+> review fixes `c140c21`/`18d4dfa` for USER and the set-only carry). Kept as the record of the
+> plan; do not re-execute it. The shipped form is `init/oosh`'s `cleanEnv` block.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Starting oosh from a clean environment works however you got there — `HOME` is recovered rather than demanded, and `init/oosh` re-establishes a clean environment for itself.
@@ -31,7 +35,7 @@ The `HOME` recovery is **duplicated on purpose** — `init/oosh` runs before oos
 - Modify: `boot` (the `── 0. Refuse to half-boot without a usable $HOME ──` block)
 - Test: `test/test.config`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test/test.config`, immediately before the final `### test.method` marker:
 
@@ -41,7 +45,7 @@ Append to `test/test.config`, immediately before the final `### test.method` mar
 # ============================================================================
 # `env -i` drops HOME, and every anchor hangs off it. boot used to refuse.
 # The card (T3) is "env -i sh … shall boot correctly", so it must recover:
-# getent -> dscl -> /etc/passwd, the same split as this:126-134.
+# getent -> dscl -> /etc/passwd, mirroring private.get.home.darwin (user).
 test.config.bootRecoversHome() {
   local bad="" shell out expect
   expect="[$HOME|$HOME/oosh|$HOME/config]"
@@ -77,14 +81,14 @@ expect 0 "HOME recovered in every shell" \
 
 Note the `cd /tmp` — running from inside the oosh tree lets bash's `source` fall back to the cwd and can mask a PATH bug. This exact mistake cost a full cycle earlier.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cd ~/oosh && ./test.suite run config 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "T65|✗ FAIL|Failed:"
 ```
 Expected: **FAIL** — current `boot` refuses, so `$HOME` comes back empty.
 
-- [ ] **Step 3: Replace boot's §0 block**
+- [x] **Step 3: Replace boot's §0 block**
 
 Replace the whole block from `# ── 0. Refuse to half-boot without a usable $HOME ───` through its closing `fi` with:
 
@@ -98,7 +102,7 @@ Replace the whole block from `# ── 0. Refuse to half-boot without a usable $
 # A HOME that is SET but not a directory (a removed user, a container that
 # inherited the builder's) is the same broken input and gets the same treatment.
 #
-# Three-way lookup, the same split the rest of the tree uses (this:126-134):
+# Three-way lookup, mirroring private.get.home.darwin (user):
 # getent (Linux/NSS) -> dscl (macOS) -> /etc/passwd (minimal images with
 # neither). Only if all three come up empty do we refuse — and then by `return`,
 # never `exit`, because boot is SOURCED and exit would close the terminal.
@@ -136,21 +140,21 @@ if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
 fi
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 ```bash
 cd ~/oosh && ./test.suite run config 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "T65|✗ FAIL|Failed:"
 ```
 Expected: **PASS**, `Failed: 0`.
 
-- [ ] **Step 5: Verify POSIX cleanliness in all four shells**
+- [x] **Step 5: Verify POSIX cleanliness in all four shells**
 
 ```bash
 cd ~/oosh && for s in sh dash bash "busybox ash"; do printf '%-14s ' "$s"; $s -n boot && echo OK; done
 ```
 Expected: `OK` four times. (`busybox ash -n` must pass — this is the Alpine guarantee.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 cd ~/oosh && git add boot test/test.config
@@ -158,7 +162,7 @@ git commit -m "fix(boot): recover \$HOME from the passwd database instead of ref
 
 env -i drops HOME and every anchor hangs off it, so boot refused — which made
 the T3 card's own command impossible. It now derives HOME the way bash derives
-~: getent -> dscl -> /etc/passwd, the same split as this:126-134. Refuses only
+~: getent -> dscl -> /etc/passwd, mirroring private.get.home.darwin (user). Refuses only
 when all three come up empty, and by return rather than exit because boot is
 sourced.
 
@@ -173,7 +177,7 @@ Test T65 pins it across sh, dash, bash and busybox ash."
 - Modify: `init/oosh` (after the sourcing guard, before `OOSH_SELF_BRANCH`)
 - Test: `test/test.install`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test/test.install`, before `test.suite.save.results`:
 
@@ -205,14 +209,14 @@ expect 0 "HOME recovery precedes the first \$HOME use" \
   "env -i drops HOME; without recovery the installer targets /oosh"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cd ~/oosh && ./test.suite run install 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "HOME-RECOVERY|✗ FAIL|Failed:"
 ```
 Expected: **FAIL** — no recovery block exists yet.
 
-- [ ] **Step 3: Add the recovery to `init/oosh`**
+- [x] **Step 3: Add the recovery to `init/oosh`**
 
 Insert immediately **after** the sourcing guard (the block ending `return 0 2>/dev/null || exit 0` and its `fi`) and **before** the `# ─── Branch default ───` comment:
 
@@ -257,14 +261,14 @@ fi
 
 Unlike `boot`, this one **announces** the recovery — the documented invocation is an `-x` trace being captured to a log, so an install into an unexpected home must be visible in that log. And it `exit`s rather than `return`s: `init/oosh` is executed, never sourced (the guard above already handled sourcing).
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 ```bash
 cd ~/oosh && ./test.suite run install 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "HOME-RECOVERY|✗ FAIL|Failed:"
 ```
 Expected: **PASS**, `Failed: 0`.
 
-- [ ] **Step 5: Verify the recovery works, without running an install**
+- [x] **Step 5: Verify the recovery works, without running an install**
 
 ```bash
 cd /tmp && env -i sh -c '
@@ -275,14 +279,14 @@ cd /tmp && env -i sh -c '
 ```
 Expected: `HOME=[/home/<you>]` and `OOSH_DIR would be=[/home/<you>/oosh]` — **not** `/oosh`.
 
-- [ ] **Step 6: POSIX cleanliness**
+- [x] **Step 6: POSIX cleanliness**
 
 ```bash
 cd ~/oosh && for s in sh dash bash "busybox ash"; do printf '%-14s ' "$s"; $s -n init/oosh && echo OK; done
 ```
 Expected: `OK` four times.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/oosh && git add init/oosh test/test.install
@@ -307,7 +311,7 @@ the documented invocation is an -x trace captured to a log."
 
 This restores what `#!/usr/bin/env -iS HOME=${HOME} sh` gave from 2024-04-07 to 2026-03-09, without the `-S` flag BusyBox lacks. Verified: `busybox env` rejects `-S` but accepts `env -i VAR=val cmd`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test/test.install`, before `test.suite.save.results`:
 
@@ -340,14 +344,14 @@ expect 0 "clean re-exec present, guarded, no -S" \
   "restores the 2024-2026 clean-environment guarantee; -S is what BusyBox lacks"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cd ~/oosh && ./test.suite run install 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "CLEAN-ENV|✗ FAIL|Failed:"
 ```
 Expected: **FAIL**.
 
-- [ ] **Step 3: Add the re-exec, AFTER the branch default block**
+- [x] **Step 3: Add the re-exec, AFTER the branch default block**
 
 **Placement matters and is not negotiable.** `init/oosh` sets the branch at:
 
@@ -390,14 +394,14 @@ fi
 
 `OOSH_BRANCH` is carried explicitly because `57f0984` (2026-02-16) fixed precisely this: `env -i` wiped it when passed as an env-var prefix. Carrying it here keeps both the positional-argument path and the env-var path working.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 ```bash
 cd ~/oosh && ./test.suite run install 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "CLEAN-ENV|✗ FAIL|Failed:"
 ```
 Expected: **PASS**, `Failed: 0`.
 
-- [ ] **Step 5: Prove the re-exec actually cleans, without running an install**
+- [x] **Step 5: Prove the re-exec actually cleans, without running an install**
 
 ```bash
 cd /tmp && cat > /tmp/reexec.sh <<'EOF'
@@ -412,14 +416,14 @@ rm -f /tmp/reexec.sh
 ```
 Expected, every shell: `POLLUTE=[<gone>]`, `HOME` intact, `args=[a b]`.
 
-- [ ] **Step 6: POSIX cleanliness**
+- [x] **Step 6: POSIX cleanliness**
 
 ```bash
 cd ~/oosh && for s in sh dash bash "busybox ash"; do printf '%-14s ' "$s"; $s -n init/oosh && echo OK; done
 ```
 Expected: `OK` four times.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd ~/oosh && git add init/oosh test/test.install
@@ -446,7 +450,7 @@ OOSH_BRANCH is carried across explicitly — 57f0984 fixed exactly that loss."
 **Files:**
 - Modify: `docs/boot.md`, `docs/plans/2026-09-10-oosh-boot-tickets.md`
 
-- [ ] **Step 1: Update `docs/boot.md`'s Guarantees table**
+- [x] **Step 1: Update `docs/boot.md`'s Guarantees table**
 
 The table currently contains this row verbatim:
 
@@ -467,7 +471,7 @@ through"* — the `HOME` caveat no longer applies:
 | **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i`, with or without `HOME`. |
 ```
 
-- [ ] **Step 2: Tick T3's DoD in the tracker**
+- [x] **Step 2: Tick T3's DoD in the tracker**
 
 In `docs/plans/2026-09-10-oosh-boot-tickets.md`, under T3, mark the clean-environment items done and add:
 
@@ -478,14 +482,14 @@ restored portably — see
 [the design spec](../specs/2026-09-14-clean-environment-guarantee-design.md).
 ```
 
-- [ ] **Step 3: Run the full core suite**
+- [x] **Step 3: Run the full core suite**
 
 ```bash
 cd ~/oosh && ./test.suite core 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tail -8
 ```
 Expected: one intentional failure only.
 
-- [ ] **Step 4: Commit and push**
+- [x] **Step 4: Commit and push**
 
 ```bash
 cd ~/oosh && git add docs/boot.md docs/plans/2026-09-10-oosh-boot-tickets.md
@@ -493,7 +497,7 @@ git commit -m "docs: the clean-environment guarantee is restored"
 git push origin dev
 ```
 
-- [ ] **Step 5: Platform test — the real gate**
+- [x] **Step 5: Platform test — the real gate**
 
 ```bash
 cd ~/oosh && os platform.test ubuntu_24_04

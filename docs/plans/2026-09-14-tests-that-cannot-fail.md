@@ -91,7 +91,7 @@ That change needs its own analysis; it is not a one-line fix.
 
 ---
 
-## Third defect (2026-09-14): a file that asserts nothing inherits the previous file's score
+## Second defect (2026-09-14): a file that asserts nothing inherits the previous file's score
 
 Found while restoring `test/test.tilde`'s clean-environment guarantee (T3/T9 follow-on).
 
@@ -130,7 +130,7 @@ count moves when the suite grows, because the file it shadows grows.
 
 - [ ] `test.suite` fails loudly (or reports 0/0) when a file produces no results of its own
 - [x] `test.tilde` asserts through the framework instead of via `echo` (2026-09-14: T-TILDE-CLEAN-ENV, -HOME, -STRING, -FILE-TEST; the clean re-exec now carries OOSH_DIR/CONFIG_PATH/LOG_* so the framework can score it)
-- [ ] Re-baseline the `core 1` totals in the T3 and T9 tickets once the phantom 31 is gone
+- [x] Re-baseline the `core 1` totals in the T3 and T9 tickets once the phantom 31 is gone — done 2026-09-14 after the review pass: `test.suite core 1` = 26 files, 642 assertions, 641 passed, 1 intentional (the phantom 31 is gone; `test.tilde` now scores its own 4). The 643/642/1 quoted in the tracker for T3 was the phantom-inflated figure.
 
 ## Related blind spot: `sh -n` does not catch `[[`
 

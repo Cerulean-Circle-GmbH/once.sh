@@ -64,6 +64,13 @@ if [ -z "$OOSH_CLEAN_ENV" ] && [ -f "$0" ]; then
 fi
 ```
 
+> **Superseded by the shipped form.** This sketch hands a bare `"$0"` to the kernel, which
+> needs the execute bit and re-reads the shebang (dropping `-x`, downgrading a deliberate bash),
+> leaves PATH to the compiled-in default, and carries every variable even when the caller lacks
+> it (`env -i VAR= cmd` SETS it empty — git runs an empty `GIT_SSH_COMMAND` as `''`). The
+> implementation in `init/oosh` (the `cleanEnv` block) names the interpreter, seeds PATH and
+> carries only set variables; `docs/boot.md` records the audit.
+
 **Order matters, so it is fixed here:** `HOME` is recovered **before** the re-exec, and the
 recovered value is what `env -i HOME="$HOME"` carries across. The child then finds a usable `HOME`
 and its own recovery is a no-op. (Re-execing first and recovering in the child also works —

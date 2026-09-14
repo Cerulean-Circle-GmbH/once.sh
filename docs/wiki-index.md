@@ -28,6 +28,8 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [Debug System Documentation](debug.md) - Interactive step debugger, stack traces, and trap handlers
 - [OO Framework Documentation](oo.md) - Script creation, version control, package management
 - [State Machine Documentation](state.md) - Creating and managing state machines for multi-step workflows
+- [Repair Toolkit](repair-toolkit.md) - The explicit repair primitives (`oo user.fix`, `oo boot.fix`, `config init.*`, `ossh rights.fix` / `folder.fix`) and which symptom needs which
+- [Install bootstrap (init/oosh)](install-bootstrap.md) - The installer's clean-environment re-exec: what is carried, what is seeded, why
 
 ## Infrastructure Tools
 
@@ -37,6 +39,12 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [OS & Platform Testing (os)](os.md) - OS detection, platform install tests
 - [Supported Platforms](supported-platforms.md) - Platform matrix, tiers, and install requirements
 - [Branching Strategy](branching.md) - Branch naming, promotion flow, feature/hotfix conventions
+
+## Design docs & tickets
+
+- `docs/plans/` - Ticket trackers and cards: [OOSH boot tickets](plans/2026-09-10-oosh-boot-tickets.md) (the board, working agreement, change log), [fixed system boot path (T9)](plans/2026-09-14-fixed-system-boot-path.md), [method-tooling repair](plans/2026-09-14-method-tooling-repair.md), [tests that cannot fail](plans/2026-09-14-tests-that-cannot-fail.md)
+- `docs/superpowers/specs/` and `docs/superpowers/plans/` - Design specs and implementation plans from the superpowers workflow, e.g. the [clean-environment guarantee](superpowers/specs/2026-09-14-clean-environment-guarantee-design.md) and [recovery from a bare shell](superpowers/specs/2026-09-14-oosh-recovery-from-bare-shell-design.md)
+- `docs/research/` - Reviews and forensics, e.g. the [boot-loader review](research/review-2026-09-09-boot-loader-pure-env-files.md)
 
 ## Migration
 
@@ -81,7 +89,10 @@ shell into an oosh shell — every context (login shell, `ossh exec`, platform
 tests, CI) sources it. It owns the bootstrap logic that used to live inside the
 config env files (so those stay pure data), is POSIX-`sh` clean (dash/ash), and
 sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`), the source
-chain, PATH, and the logging primitives. See **[boot.md](boot.md)**.
+chain, PATH, and the logging primitives. It recovers `$HOME` from the password
+database, so `env -i sh` can boot; the fixed host-wide path `/etc/oosh/boot`
+(install state 34, `oo boot.fix`) makes that one command for any user and any
+shell — see **[boot.md](boot.md)** § The three recovery routes.
 
 ### The "this" Boot Script
 The `this` script is the bootstrapper and foundation of the environment:

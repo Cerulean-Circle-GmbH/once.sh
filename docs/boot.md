@@ -42,14 +42,10 @@ real bug (fixed 2026-09-14, `test.config` **T70**). **On macOS `/bin/sh` IS bash
 `$BASH_VERSION` is set, so the old guard sourced `log` — but that shell runs with
 `posix` on, where a **dotted function name is not a valid identifier**, and `log` is
 built from dotted names (`log.device`, `log.level`, …). Worse, **a parse error in a
-sourced file under POSIX mode kills the shell**, not just the `source`. Measured on a
-macOS 15.7.3 arm64 VM:
-
-| Command | Result |
-|---|---|
-| `env -i /bin/sh -c '. /etc/oosh/boot; echo REACHED'` | ``/Users/admin/oosh/log: line 73: `log.device': not a valid identifier`` — rc 2, `REACHED` **never printed, the shell was dead** |
-| `env -i /bin/bash -c '. /etc/oosh/boot; …'` | rc 0, all anchors set |
-| `env -i /opt/homebrew/bin/bash -c '…'` | rc 0 |
+sourced file under POSIX mode kills the shell**, not just the `source`. Measured (the run
+is recorded on the T9 card): under `/bin/sh` the sourced `log` failed to parse and the
+shell died with rc 2 before the next command ran; `/bin/bash` and Homebrew bash booted
+the same file cleanly.
 
 Same binary, same file — only POSIX mode differs. It is the same failure class as
 **T3** (a sourced `boot` killing its caller) reached by another route.
@@ -212,7 +208,7 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 
 | | |
 |---|---|
-| **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
+| **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. Every call site sources it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
 | **Recovers `$HOME`** | `env -i` drops it, so `boot` looks it up in the password database (`getent` → `dscl` → `/etc/passwd`) and exports it — which is what lets `env -i sh` boot correctly *once `boot` is reached*. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
 | **Proven shells** | `sh`, `dash`, `busybox ash`, `bash`, and **POSIX-mode bash** (`bash --posix`, `set -o posix`, macOS `/bin/sh`) — and under `env -i`, with or without `HOME`, **when sourced by absolute path**: use `. /etc/oosh/boot`. Two caveats below: with `HOME` unset, `~` is not a path a POSIX shell can resolve, so `. ~/oosh/boot` is the everyday form, not the recovery form; and a POSIX-mode shell comes up **anchored but without the log functions**. |
@@ -231,7 +227,7 @@ before `boot` gets to run. Measured in a container:
 
 With `HOME` unset, `~` is undefined behaviour in POSIX and dash/ash leave it **literal**; bash
 falls back to the password database and expands it anyway. So the `. ~/oosh/boot` form given in
-the table above — correct for everyday use, and what all 20 call sites use — is exactly the form
+the table above — correct for everyday use, and what every call site uses — is exactly the form
 that cannot work in the empty-environment case `boot` exists to survive. Chicken-and-egg: the
 thing that would recover `HOME` sits behind a path that needs `HOME`.
 
@@ -310,7 +306,7 @@ fi
    `HOME` from the password database itself. Without this guard every non-oosh user on
    the host would get a nonexistent `$HOME/oosh` prepended to `PATH` **and** an empty
    `~/.config/oosh` created in their home, just for logging in. The guard lives here
-   rather than in `boot` on purpose: `boot`'s own behaviour is unchanged for all 20
+   rather than in `boot` on purpose: `boot`'s own behaviour is unchanged for every
    existing call sites and for anyone who types `. /etc/oosh/boot` deliberately; what
    must not regress is the *passive* login of somebody who never asked for oosh.
 
@@ -342,14 +338,13 @@ the deployed files are proved by `test.platform.boot.system.path.invariant`.
 
 #### macOS — what actually applies there
 
-Measured on a macOS 15.7.3 arm64 VM with oosh installed from `dev`. Three facts, and they
+Three facts about macOS (measured; the T9 card records the run), and they
 change which route you should reach for:
 
 1. **`/bin/sh` on macOS is bash 3.2 in POSIX mode.** Not dash. `$BASH_VERSION` is set and
    `SHELLOPTS` contains `posix`. `. /etc/oosh/boot` under it recovers every anchor and
    returns 0, but that shell gets **no log functions** — see the guard section above. Before
-   the T70 fix it did not merely lose them: the shell died with
-   ``log: line 73: `log.device': not a valid identifier``.
+   the T70 fix the shell died instead.
 2. **There is no `/etc/profile.d` on macOS at all**, so the login-shell route
    (`/etc/profile.d/oosh.sh`, `env -i sh -l`) is **Linux-only**. State 34 still creates
    `/etc/oosh/boot` — confirmed on the VM, pointing into `/Users/shared/…` — and then
@@ -423,136 +418,10 @@ correspondingly different re-run hint). The lookup itself — `id -un`, then
 
 ### The other half of T3: `init/oosh` re-execs clean
 
-`boot` recovering `$HOME` makes `env -i sh` *survivable*. The guarantee that the installer runs in
-a clean environment is a separate thing, and it used to come from a shebang:
-
-```sh
-#!/usr/bin/env -iS HOME=${HOME} sh     # 2024-04-07 (8c277f4) … 2026-03-09 (075b4a3)
-```
-
-`075b4a3` removed it for Alpine — BusyBox `env` has no `-S` — and nothing replaced it. `init/oosh`
-now re-establishes it itself, immediately after the branch default:
-
-```sh
-if [ -z "$OOSH_CLEAN_ENV" ] && [ -f "$0" ] && [ -r "$0" ]; then
-  _oosh_sh=sh
-  if [ -n "$BASH_VERSION" ]; then _oosh_sh="${BASH:-bash}"; fi
-  _oosh_x=""
-  case "$-" in *x*) _oosh_x="-x" ;; esac
-  exec env -i PATH=… HOME="$HOME" OOSH_CLEAN_ENV=1 … "$_oosh_sh" $_oosh_x "$0" "$@"
-fi
-```
-
-**It names an interpreter, never a bare `"$0"`** — as do all three other `exec`s in the file. A
-bare `"$0"` goes to the *kernel*, which requires the execute bit and re-reads the shebang. That
-breaks three real call sites: `ossh.prereqs.install` (`scp -q` with no `-p`, then `bash
-/tmp/oosh-init.$$`, whose comment promises it works "even if … isn't executable" — a kernel exec
-dies there at exit 126 with a bare `env:` message); README's `env -i sh -x init/oosh` debugging
-recipe (the shebang re-read **drops `-x`**, producing a debug log with no trace in it — hence
-`$_oosh_x`); and `macos-test.yml`'s deliberate `/opt/homebrew/bin/bash` (silently downgraded —
-hence the `$BASH_VERSION` check). `-r` rather than only `-f` because an interpreter must *read*
-`$0`; the execute bit is deliberately not required.
-
-`-S` existed only because a *shebang* can pass a single argument; doing it inside the script lifts
-that constraint. BusyBox rejects `env -S` but accepts `env -i VAR=val cmd`, so this is portable.
-`$0` is a readable file only when the script is executed — in the curl-pipe path `$0` is `sh` and
-there is nothing to re-exec, so that path skips. `OOSH_CLEAN_ENV` makes it fire exactly once.
-
-**Placement is load-bearing.** It must come *after* `: ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}`: `env -i`
-wipes `OOSH_SELF_BRANCH`, which is not carried, so re-execing any earlier silently resolves the
-branch to `dev` and discards a caller's override.
-
-**Anything the installer reads but never sets must be named in the carry list.** `init/oosh` was
-rewritten three times (`b8b90b8`, `b427809`, `0594657`) during the two years the guarantee was
-absent, so no part of the current file had ever run under `env -i`; two variables had grown a
-dependency on inheritance:
-
-The guarantee is therefore **not "empty"**. It is *deterministic for oosh, pass-through for the
-tools oosh calls*. `env -i` strips not only what `init/oosh` itself reads, but the environment
-handed to **every child it spawns** — `this call ossh prereqs.install`, `install.continue.local`,
-`user oosh.install`, every `git clone`, the Homebrew `curl`, `sudo`, and the final
-`exec "${BASH_FILE:-bash}" -l`. A strictly clean environment sabotages all of those.
-
-Two groups, with **two different justifications**. They look alike in the `exec` line and must not
-be collapsed: someone auditing "does `init/oosh` read this?" would correctly conclude Group 1 is
-load-bearing and *wrongly* conclude Group 2 is removable.
-
-**Group 1 — oosh's own state.** Carried because *this script* reads it.
-
-| Carried | Why |
-|---|---|
-| `HOME` | every anchor hangs off it |
-| `OOSH_CLEAN_ENV` | the once-only sentinel; without it the re-exec loops |
-| `OOSH_BRANCH` | the caller's branch choice — `57f0984` fixed exactly this loss |
-| `OOSH_NO_AUTORUN` | sourcing/test guard |
-| `SUDO_USER` | assigned nowhere in the file. `sudo ./init/oosh` would otherwise lose the invoker, and the post-install `user oosh.install "$SUDO_USER"` silently never runs |
-| `OOSH_REPO` | assigned nowhere in the file. A fork or private-repo override would otherwise fall back to public GitHub with no error |
-
-**Group 2 — pass-through.** `init/oosh` reads **none** of these. They are carried for the children.
-
-| Carried | Why |
-|---|---|
-| `LOG_LEVEL` | `this` does `[ -z "$LOG_LEVEL" ] && export LOG_LEVEL=3`, so it is an inherited knob. Only `mode root` has a positional argument for it, so on the drag-and-drop and direct paths env is the **only** lever — without it `LOG_LEVEL=6 ./init/oosh` installs at 3 in silence |
-| `TERM` | the success path ends in `exec "${BASH_FILE:-bash}" -l`; without it the user lands in a shell with no line editing and no colour |
-| `LANG`, `LC_ALL` | the installer prints `═ ─ ✓` box-drawing throughout; the C locale mangles it |
-| `http_proxy`, `https_proxy`, `no_proxy` | nothing in the tree sets these, so env is the only channel. Behind a corporate proxy the install otherwise dies at the first `git clone` |
-| `SSH_AUTH_SOCK` | we carry `OOSH_REPO` precisely so a private-repo override works, then would wipe the agent socket that authenticates the clone. Carrying one without the other is incoherent |
-| `GIT_SSH_COMMAND` | the same argument one step further: a private fork cloned with an explicit key (`GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key"`) is the same use case as one cloned via the agent |
-
-**`${VAR:-}` — and the one exception.** Every pass-through uses `${VAR:-}` so an *absent* variable
-stays absent-in-effect rather than becoming a spurious empty value that shadows a downstream
-default. That property was checked per variable, not assumed: `LOG_LEVEL` is tested with
-`[ -z ... ]`; POSIX `setlocale` ignores an empty `LANG`/`LC_ALL`; OpenSSH tests `SSH_AUTH_SOCK` for
-empty explicitly; an empty proxy variable reads as "no proxy".
-
-`TERM` is the **sole exception** and gets `${TERM:-dumb}`. Measured: bash turns an *unset* `TERM`
-into `dumb` but leaves an *empty* one empty, and `tput` errors on empty while accepting `dumb`. So
-`${TERM:-}` would be strictly **worse** than dropping `TERM` altogether. `${TERM:-dumb}` reproduces
-the unset behaviour exactly and carries a real terminal when there is one.
-
-### `PATH` is seeded, not carried — and not "re-derived"
-
-An earlier revision of this document claimed `PATH` loss "self-heals, at the cost of a redundant
-Homebrew probe". **That was wrong**, and the error mattered. `env -i` leaves `PATH` unset, so the
-child falls back to its compiled-in default — measured as
-`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`. That contains `/usr/local/bin` but
-**not** `/opt/homebrew/bin`.
-
-On an Apple-Silicon Mac that *already* has Homebrew this is fatal and does not recover:
-`oosh_pm_detect` finds no package manager → the Darwin branch runs the full Homebrew installer over
-`curl` → as root that aborts with *"Don't run this as root!"* → `die "Homebrew bootstrap failed"`.
-The `eval "$(/opt/homebrew/bin/brew shellenv)"` that would have rescued `PATH` sits **inside that
-same failure branch**, after the installer has already run, so it is never reached. The two
-`case ":$PATH:" in` blocks only *prepend* to whatever the shell defaulted to; neither discovers
-brew. Intel Macs escape only because their brew lives in `/usr/local/bin`.
-
-So `PATH` is now **seeded to a fixed, known-good list** rather than carried:
-
-```sh
-PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
-```
-
-Seeding is not the same as carrying. The caller's `PATH` is still discarded; what changes is that
-the child gets a value that is *constant regardless of who invoked us*. That determinism is the
-point of the guarantee — carrying the caller's `PATH` would surrender it.
-
-Still deliberately *not* carried: `BASH_FILE` and `SUDO` (recomputed, more correctly, from scratch
-— Phase A may have just installed a newer bash that a stale `BASH_FILE` would shadow),
-`INSTALL_LOG`/`OOSH_APT_UPDATED` (set downstream of the re-exec, so nothing is lost), and
-`GIT_ASKPASS` (it names a helper *binary*, which the seeded `PATH` may no longer resolve — it would
-fail confusingly rather than cleanly — and it drives an interactive credential prompt that an
-unattended installer cannot answer anyway).
-
-> Guarded by `test.install` **T-INIT-HOME-RECOVERY**, **T-HOME-RECOVERY-NSS** (the `head -1` that
-> stops multi-source `getent` output from defeating recovery, in *both* copies),
-> **T-INIT-CLEAN-ENV** (re-exec present, guarded, names an interpreter, no `env -S`),
-> **T-INIT-CLEAN-ENV-CARRY** (`SUDO_USER` and `OOSH_REPO` actually cross),
-> **T-INIT-CLEAN-ENV-EXEC** (survives a mode-644 `$0`, keeps a deliberate bash, forwards `-x`),
-> **T-INIT-CLEAN-ENV-PATH** (`/opt/homebrew/bin` is on the child's `PATH`) and
-> **T-INIT-CLEAN-ENV-PASSTHROUGH** (`LOG_LEVEL` crosses; `TERM` defaults to `dumb`, not empty).
-> The probe deliberately runs at `mktemp`'s mode 600 — an earlier revision `chmod +x`'d it and so
-> granted the one permission the real `ossh.prereqs.install` call site does not, which is why the
-> bare-`"$0"` bug survived its first review.
+`boot` recovering `$HOME` makes `env -i sh` *survivable*. The guarantee that the installer
+itself runs in a clean environment is a separate thing — the `env -i` self-re-exec in
+`init/oosh`, what it carries, what it seeds, and the per-variable audit — and it has its
+own page: [install-bootstrap.md](install-bootstrap.md).
 
 ## Idempotent
 
@@ -580,6 +449,7 @@ the macOS `/bin/sh` case).
 ## See also
 - [config.md](config.md) — the two config tiers and `config.save` generation
 - [log.md](log.md) — `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` and the session chain
+- [install-bootstrap.md](install-bootstrap.md) — `init/oosh`'s clean-environment re-exec
 - [migration/env-files.md](migration/env-files.md) — the pure-data migration
 - [research/review-2026-09-09-boot-loader-pure-env-files.md](research/review-2026-09-09-boot-loader-pure-env-files.md)
 - [puml/bootstrap.sequence/bootstrap.sequence.svg](puml/bootstrap.sequence/bootstrap.sequence.svg) — the bootstrap sequence diagram (source `puml/bootstrap.sequence.puml`, editable copy `puml/bootstrap.sequence.drawio`; ticket T6 tracks bringing it up to date with `boot`)

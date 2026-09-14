@@ -140,48 +140,37 @@ already-correct layout is a no-op. Naming follows the OOSH
 
 ### oo.boot.fix
 
-Install or repair `/etc/oosh/boot` — the **fixed host-wide path** to `boot`.
+Install or repair the two host-wide resources that let a shell with **no
+environment at all** become an oosh shell: the fixed path `/etc/oosh/boot`
+(a symlink into the shared tree) and the login-shell drop-in
+`/etc/profile.d/oosh.sh` (from `templates/user/profile.d.oosh.sh`).
 
 ```bash
-oo boot.status           # read-only report first
-oo boot.fix              # install or repair the link
+oo boot.status                       # read-only report first
+oo boot.fix                          # install or repair both
+oo boot.fix <systemPath> <profileDir> # fixture paths, for tests — pass BOTH
 ```
 
-`boot` recovers `$HOME` from the password database, so it survives
-`env -i` — but only once it is *reached*. With `HOME` unset, dash and
-ash leave `~` **literal**, so `. ~/oosh/boot` cannot work in exactly
-the empty-environment case `boot` exists to survive. `/etc/oosh/boot`
-is a symlink into the shared tree that collapses that to one command
-for any user, in any shell, with no environment at all. See
-[`boot.md` § The tilde caveat](boot.md).
-
-Created during install by state **`34 root.boot.path.installed`**.
-`oo boot.fix` is what reaches hosts that already exist: the
-state-machine declaration is **frozen per host at first install**, so
-an already-installed host will never run state 34.
-
-`$SUDO` is used internally — run `oo boot.fix`, **not**
-`sudo oo boot.fix`. It works whether you are already root or a `dev`
-member with sudo installed; if sudo is absent it fails loudly before
-creating anything. Idempotent, and never auto-triggered (`oo update`
-runs as an ordinary user with no sudo). On a branch that has no `boot`
-(`testing` / `prod`) it warns and skips rather than leaving a dangling
-link. See [Repair toolkit](repair-toolkit.md).
-
-> **Trust.** `/etc/oosh/boot` points at **dev-group-writable** content:
-> install state 31 runs `chmod -R g+w` on the shared tree, so any member
-> of `dev` can edit the file it resolves to, and anyone who sources it —
-> root included — executes it. Same trust model as root's existing
-> `~/oosh`, already a symlink into that same tree; what changed is only
-> that the path now *looks* root-owned. It is exactly as trusted as the
-> `dev` group.
+`<?systemPath:/etc/oosh>` and `<?profileDir:/etc/profile.d>` are optional.
+Created during install by state **`34 root.boot.path.installed`**; because
+the state-machine declaration is frozen per host at first install,
+`oo boot.fix` is the only way onto hosts that already exist. `$SUDO` is
+used internally — run `oo boot.fix`, not `sudo oo boot.fix`; it fails loudly
+before creating anything when sudo is absent. Idempotent, never
+auto-triggered. On a branch without `boot` it warns and skips rather than
+leaving a dangling link; on a host without `/etc/profile.d` (macOS) it
+skips the drop-in and says so. Why the fixed path exists, what the drop-in
+can and cannot recover, and the trust note on dev-group-writable content
+behind a root-looking path: [`boot.md` § The tilde caveat](boot.md#the-tilde-caveat--reaching-boot-is-not-the-same-as-running-it),
+[§ The three recovery routes](boot.md#the-three-recovery-routes) and
+[§ Guarantees](boot.md#guarantees). See also [Repair toolkit](repair-toolkit.md).
 
 ### oo.boot.status
 
-Read-only report on `/etc/oosh/boot`: whether it is present, a symlink,
-where it resolves, whether you can read through it, and the recovery
-command if not. Emits on plain stdout, so it answers at any log level.
-Returns 0 only when the path is healthy.
+Read-only report on both resources — present, a symlink, where it resolves,
+readable by you, and whether the drop-in sources it — with the recovery
+command when not. Same two optional parameters as `oo boot.fix`. Emits on
+plain stdout, so it answers at any log level; rc 0 only when both are healthy.
 
 ### oo.safeDirectory.prune
 

@@ -7,6 +7,10 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 
 ---
 
+> **Where things live.** This file and the cards next to it (`docs/plans/`) are the tickets; design
+> specs and implementation plans from the superpowers workflow live under `docs/superpowers/{specs,plans}/`;
+> reviews and forensics under `docs/research/`. `docs/wiki-index.md` § Design docs & tickets lists them.
+
 ## 1. Board mapping
 
 | Column | Cards | Ours? |
@@ -57,7 +61,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 💡 Ideas | Has a live reproducible bug, but its fix needs T4/T5's `OOSH_DIR`+branch semantics. |
 | 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
 | 4 | **T3** — `env -i sh` SAFETY | 🔍 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. Second attempt delivered `boot` + `init/oosh` recovery and the clean re-exec. |
-| 5 | **T9** — fixed system path to `boot` | 🔍 **In Review** | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. Design complete, **5 decisions open**: [the card](2026-09-14-fixed-system-boot-path.md). |
+| 5 | **T9** — fixed system path to `boot` | 🔍 **In Review** | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. **Delivered 2026-09-14**: install state `34 root.boot.path.installed`, `oo boot.fix` / `oo boot.status`, the `/etc/profile.d/oosh.sh` login-shell drop-in (from `templates/user/profile.d.oosh.sh`), `test.platform.boot.system.path.invariant`. The five design decisions are recorded on [the card](2026-09-14-fixed-system-boot-path.md). Review checklist: the trust note (dev-group-writable content behind a root-looking path), the warn-and-skip on branches without `boot`, and a platform run on a host installed BEFORE state 34 followed by `oo boot.fix`. |
 | 6 | **T6** — `bootstrap.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the five above settle. |
 
 ---
@@ -446,7 +450,7 @@ mode. The design for those is written up in full and was not found to be wrong.
 - New **section 0**: when `$HOME` is unset *or not a directory* (a stale `HOME` produces the same
   garbage anchors), derive it — `getent` (Linux/NSS) → `dscl` (macOS, taking the first of the two
   paths it returns for `root`) → `/etc/passwd` — and export it. Same three-way split the rest of
-  the tree uses (`this:126-134`). Only if all three come up empty does `boot` refuse, with one
+  the tree uses (`private.get.home.darwin` in `user`). Only if all three come up empty does `boot` refuse, with one
   diagnostic on stderr and `return` — never `exit`, because `boot` is sourced and `exit` would
   close the user's terminal.
 - **Result: `env -i sh -c '. <path>/boot'` now comes out with `HOME`, `OOSH_DIR` and
@@ -478,8 +482,8 @@ had grown a dependency on inheritance and would have broken silently:
 | `SUDO_USER` | `sudo ./init/oosh` loses the invoker; the post-install `user oosh.install "$SUDO_USER"` never runs, so the invoker simply does not get oosh |
 | `OOSH_REPO` | a fork or private-repo override falls back to public GitHub, with no error |
 
-Both are now carried. `PATH` is deliberately not: it is re-derived, and the macOS cost (a redundant
-Homebrew probe) self-heals via `brew shellenv`. **Anything added later that reads an inherited
+Both are now carried. `PATH` is deliberately not carried: it is **seeded** to a fixed list by
+the re-exec (`env -i` leaves it unset, and the compiled-in default lacks `/opt/homebrew/bin`, which on an arm64 Mac ran the Homebrew installer as root and aborted — see `docs/install-bootstrap.md`). **Anything added later that reads an inherited
 variable must be added to the carry list** — the list and its rationale sit at the call site.
 
 Two fossils confirmed by the audit: `ossh:518` already passes the branch as an argument *"not env
@@ -629,3 +633,4 @@ never existed.
 | 2026-09-14 | T3 **second attempt**: `boot` + `init/oosh` recover `$HOME`; `init/oosh` re-execs clean without `env -S`, restoring the guarantee `075b4a3` traded away for Alpine. Audit found 531/537 lines of `init/oosh` (at baseline `a6f0ce3`) postdate the shebang removal, and two read-but-never-set variables (`SUDO_USER`, `OOSH_REPO`) that `env -i` would have destroyed silently — both now carried. → In Review, pending the platform test |
 | 2026-09-14 | User pointed at the install log's env-file errors. Root cause: the SHARED `log.env` referenced the PER-USER `$OOSH_USER_CONFIG_PATH`, and `user:951` leaked it across users. Shared files now hold only shared data; `boot` sources the per-user file itself |
 | 2026-09-14 | User queried the last two error lines in tmux. Neither was a real failure: the ERR trap's `errno()` glossed propagated exit statuses as "Command not found" / "Misuse of shell builtins". Now verifies before diagnosing; hoisted to `private.debug.errno` and tested |
+| 2026-09-14 | **Review pass** on the day (all of T3 + T9, net of the revert). Two defects found and fixed: the clean re-exec erased `USER` (root installs with no later sudo hop were routed to the user lane — `this` now heals it like `$SUDO`) and set every pass-through variable EMPTY (`GIT_SSH_COMMAND=""` made git run `''`; state 31's ssh clone always fell back — only set variables cross now). Then: one boot-from-nothing test harness, one base+branch derivation, one privilege rule, the drop-in as a template, `test.tilde` a real test, symbol citations, `T-BOOTPATH-*` ids, diagram family renamed, docs de-duplicated (`install-bootstrap.md` split out of `boot.md`). Host `test.suite core 1` after the pass: 642 assertions / 641 passed / 1 intentional — the earlier 643/642/1 included the 31 phantom assertions `test.tilde` inherited. T3/T9 stay **In Review**; the platform test must be re-run, once with a ROOT ssh target. |

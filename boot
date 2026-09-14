@@ -15,25 +15,12 @@
 # or double-applies anything.
 
 # ── 0. $HOME ────────────────────────────────────────────────────────────────
-# EVERY anchor below hangs off $HOME — and `env -i` drops it, which is exactly
-# the "env -i sh … shall boot correctly" case (T3). So DERIVE it rather than
-# give up: that is what bash itself does for `~` when HOME is unset, and it is
-# what makes the documented clean-environment install work.
-#
-# A HOME that is SET but not a directory (a removed user, a container that
-# inherited the builder's) is the same broken input and gets the same treatment.
-#
-# Three-way lookup. The home-directory analogue in the tree is
-# private.get.home.darwin (user), which this mirrors for the dscl branch;
-# the getent/passwd fallbacks are this file's own, since it must work before
-# anything in the tree is loadable.
-# getent (Linux/NSS) -> dscl (macOS) -> /etc/passwd (minimal images with
-# neither). Only if all three come up empty do we refuse — and then by `return`,
-# never `exit`, because boot is SOURCED and exit would close the terminal.
-#
-# DELIBERATELY DUPLICATED in init/oosh: that script runs before oosh exists and
-# this one runs in a shell where `this` cannot even be parsed, so neither may
-# source a shared helper. See the design spec, "Duplication is inherent".
+# EVERY anchor below hangs off $HOME, and `env -i` drops it (T3). DERIVE it —
+# getent (Linux/NSS) -> dscl (macOS) -> /etc/passwd — rather than refuse; a HOME
+# that is SET but not a directory gets the same treatment. Refuse only when all
+# three come up empty, and by `return`, never `exit`: boot is SOURCED.
+# DELIBERATELY DUPLICATED in init/oosh, which runs before oosh exists; neither
+# file may source a shared helper. docs/boot.md § Why no-HOME needed fixing.
 # BEGIN homeRecovery
 if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
   _oosh_user=$(id -un 2>/dev/null)

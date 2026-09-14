@@ -90,13 +90,9 @@ explicitly when something drifts.
 
 ## `oo boot.fix` — why it exists and what it does not promise
 
-`boot` recovers `$HOME` from the password database, so it survives `env -i` —
-but only once it is *reached*. With `HOME` unset, dash and ash leave `~`
-**literal**, so `. ~/oosh/boot` cannot work in exactly the empty-environment
-case `boot` exists to survive (bash falls back to the password database, which
-is why nobody noticed). `/etc/oosh/boot` is the fixed path that collapses that
-to one command for any user, in any shell, with no environment at all. See
-[`boot.md` § The tilde caveat](boot.md).
+`boot` recovers `$HOME` from the password database, but `. ~/oosh/boot` cannot be *reached*
+under dash/ash with `HOME` unset (`~` stays literal) — `/etc/oosh/boot` is the fixed path
+that collapses recovery to one command. See [`boot.md` § The tilde caveat](boot.md#the-tilde-caveat--reaching-boot-is-not-the-same-as-running-it).
 
 It is a separate primitive because the existing ones cannot absorb it:
 `oo user.fix` / `config init.user` are per-user scope and run as the user,
@@ -135,13 +131,8 @@ the other routes still work. The drop-in is guarded twice (the boot path must be
 readable, and the caller must actually have `~/oosh` unless `HOME` is unset), so a
 login by somebody who has never heard of oosh is a silent no-op.
 
-> **Trust.** `/etc/oosh/boot` points at **dev-group-writable** content: install
-> state 31 runs `chmod -R g+w` on the shared tree, so any member of `dev` can
-> edit the file it resolves to, and anyone who sources it — root included —
-> executes it. This is the *same* trust model as root's existing `~/oosh`, which
-> is already a symlink into that same tree; what changed is only that the path
-> now *looks* root-owned. Do not treat `/etc/oosh/boot` as
-> trusted-because-`/etc`: it is exactly as trusted as the `dev` group.
+> **Trust.** `/etc/oosh/boot` resolves to **dev-group-writable** content — exactly as trusted as
+> the `dev` group, no more, the same as root's own `~/oosh`. Details: [`boot.md` § Guarantees](boot.md#guarantees).
 
 ## Verification: am I healed?
 
