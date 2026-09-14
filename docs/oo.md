@@ -138,6 +138,51 @@ already-correct layout is a no-op. Naming follows the OOSH
 `ossh.folder.fix` per-scope pattern. See
 [Repair toolkit](repair-toolkit.md) for related primitives.
 
+### oo.boot.fix
+
+Install or repair `/etc/oosh/boot` — the **fixed host-wide path** to `boot`.
+
+```bash
+oo boot.status           # read-only report first
+oo boot.fix              # install or repair the link
+```
+
+`boot` recovers `$HOME` from the password database, so it survives
+`env -i` — but only once it is *reached*. With `HOME` unset, dash and
+ash leave `~` **literal**, so `. ~/oosh/boot` cannot work in exactly
+the empty-environment case `boot` exists to survive. `/etc/oosh/boot`
+is a symlink into the shared tree that collapses that to one command
+for any user, in any shell, with no environment at all. See
+[`boot.md` § The tilde caveat](boot.md).
+
+Created during install by state **`34 root.boot.path.installed`**.
+`oo boot.fix` is what reaches hosts that already exist: the
+state-machine declaration is **frozen per host at first install**, so
+an already-installed host will never run state 34.
+
+`$SUDO` is used internally — run `oo boot.fix`, **not**
+`sudo oo boot.fix`. It works whether you are already root or a `dev`
+member with sudo; if neither applies it fails loudly naming both and
+creates nothing. Idempotent, and never auto-triggered (`oo update`
+runs as an ordinary user with no sudo). On a branch that has no `boot`
+(`testing` / `prod`) it warns and skips rather than leaving a dangling
+link. See [Repair toolkit](repair-toolkit.md).
+
+> **Trust.** `/etc/oosh/boot` points at **dev-group-writable** content:
+> install state 31 runs `chmod -R g+w` on the shared tree, so any member
+> of `dev` can edit the file it resolves to, and anyone who sources it —
+> root included — executes it. Same trust model as root's existing
+> `~/oosh`, already a symlink into that same tree; what changed is only
+> that the path now *looks* root-owned. It is exactly as trusted as the
+> `dev` group.
+
+### oo.boot.status
+
+Read-only report on `/etc/oosh/boot`: whether it is present, a symlink,
+where it resolves, whether you can read through it, and the recovery
+command if not. Emits on plain stdout, so it answers at any log level.
+Returns 0 only when the path is healthy.
+
 ### oo.safeDirectory.prune
 
 Remove entries from git's global `safe.directory` list whose paths
@@ -307,7 +352,10 @@ States include:
 | 20 | user.rights.only | User-only installation |
 | 21-24 | user.* | User installation steps |
 | 30 | root.rights | Root installation |
-| 31-34 | root.* | Root installation steps |
+| 31 | root.shared.dev.folder.created | Shared tree, developking, dev repo |
+| 32 | root.dev.keys.installed | Deploy keys |
+| 33 | root.installation.done | root bashrc + login shell |
+| 34 | root.boot.path.installed | `/etc/oosh/boot` fixed path (see [`oo.boot.fix`](#oobootfix)) |
 | 40+ | shared/headless/once | Advanced setup stages |
 
 ## Promotion Pipeline

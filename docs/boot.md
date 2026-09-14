@@ -178,7 +178,7 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 | **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
 | **Recovers `$HOME`** | `env -i` drops it, so `boot` looks it up in the password database (`getent` → `dscl` → `/etc/passwd`) and exports it — which is what lets `env -i sh` boot correctly *once `boot` is reached*. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
-| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i`, with or without `HOME`, **when sourced by absolute path**. See the caveat below: with `HOME` unset, `~` is not a path a POSIX shell can resolve. |
+| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i`, with or without `HOME`, **when sourced by absolute path**: use `. /etc/oosh/boot`. See the caveat below: with `HOME` unset, `~` is not a path a POSIX shell can resolve, so `. ~/oosh/boot` is the everyday form, not the recovery form. |
 
 ### The tilde caveat — reaching `boot` is not the same as running it
 
@@ -197,7 +197,28 @@ the table above — correct for everyday use, and what all 20 call sites use —
 that cannot work in the empty-environment case `boot` exists to survive. Chicken-and-egg: the
 thing that would recover `HOME` sits behind a path that needs `HOME`.
 
-Until a fixed absolute path exists (see below), the recovery forms that work in every shell are:
+So there is a fixed, host-wide path. **One command, any user, any shell, no environment at all:**
+
+```sh
+. /etc/oosh/boot
+```
+
+`/etc/oosh/boot` is a **symlink** into the shared tree, created by install state
+**`34 root.boot.path.installed`** and healed by **`oo boot.fix`** (`oo boot.status` reports on it).
+It needs no `HOME`, no `PATH` and no knowledge of which branch you are on: `boot` derives `$HOME`
+per caller, so the one canonical copy serves every user on the box — you source the host's
+anchoring prologue and then your *own* config and your *own* `log`, from your *own* tree.
+
+> **Trust — read this before treating `/etc/oosh/boot` as root-owned.** It points at
+> **dev-group-writable** content: install state 31 runs `chmod -R g+w` on the shared tree, so any
+> member of `dev` can edit the file this link resolves to, and anyone who sources it — root
+> included — executes it. That trust model is **unchanged** from root's existing `~/oosh`, which is
+> already a symlink into the same tree. What changed is only that the path now *looks* root-owned.
+> `/etc/oosh/boot` is exactly as trusted as the `dev` group, no more.
+
+**Portable fallbacks**, for a host that has no `/etc/oosh/boot` — a user-rights-only (20-lane)
+install never reaches state 34, and a host installed before this landed has not run `oo boot.fix`
+yet:
 
 ```sh
 . /home/you/oosh/boot                                        # if you know your home
@@ -207,10 +228,9 @@ Until a fixed absolute path exists (see below), the recovery forms that work in 
 `getent` is Linux/NSS; on macOS use `dscl . -read /Users/$(id -un) NFSHomeDirectory`, or just use
 `bash`, which is the system shell there anyway.
 
-> **Open:** a fixed, well-known absolute path (`. /etc/oosh/boot` or similar) would collapse all of
-> this to one memorable command that works for any user in any shell with no environment at all.
-> `boot` already derives `HOME` per-caller, so one system path can serve every user on the box.
-> Under design — it touches the install state machine, so it is not a drive-by change.
+On SELinux hosts (Alma/RHEL) the symlink is read through to its target under `/home/shared/...`,
+labelled `home_root_t`/`default_t`. Unconfined user shells — the only consumers today — are
+unaffected; a *confined* domain sourcing it would be denied.
 
 ### Why the exit status needed fixing
 
