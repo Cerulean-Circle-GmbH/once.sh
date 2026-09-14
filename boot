@@ -14,23 +14,53 @@
 # re-sourcing on `exec bash`, mode switches, or nested shells never grows PATH
 # or double-applies anything.
 
-# ── 0. Refuse to half-boot without a usable $HOME ───────────────────────────
-# EVERY anchor below hangs off $HOME. With HOME unset — which is exactly what
-# `env -i` does unless you pass it through — they silently degrade to /oosh and
-# /config, and section 3's touch-guard then runs
-# `: > /.config/oosh/log.session.env`. That is NOT a warning: a redirection
-# failure on a SPECIAL BUILTIN (`:`) is fatal under POSIX, so it killed the very
-# shell that sourced boot. A stale HOME (a removed user, a container that
-# inherited the builder's) is the same class of failure, hence `-d` and not just
-# `-z`. Refuse loudly instead of booting into garbage — or into nothing.
+# ── 0. $HOME ────────────────────────────────────────────────────────────────
+# EVERY anchor below hangs off $HOME — and `env -i` drops it, which is exactly
+# the "env -i sh … shall boot correctly" case (T3). So DERIVE it rather than
+# give up: that is what bash itself does for `~` when HOME is unset, and it is
+# what makes the documented clean-environment install work.
 #
-# `return` (not `exit`): boot is SOURCED into the caller's shell, so `exit`
-# would close the user's terminal. The `|| exit 1` only matters if someone runs
-# boot as a script, which nothing does — see docs/boot.md "Guarantees".
+# A HOME that is SET but not a directory (a removed user, a container that
+# inherited the builder's) is the same broken input and gets the same treatment.
+#
+# Three-way lookup. The home-directory analogue in the tree is
+# private.get.home.darwin (user:495), which this mirrors for the dscl branch;
+# the getent/passwd fallbacks are this file's own, since it must work before
+# anything in the tree is loadable.
+# getent (Linux/NSS) -> dscl (macOS) -> /etc/passwd (minimal images with
+# neither). Only if all three come up empty do we refuse — and then by `return`,
+# never `exit`, because boot is SOURCED and exit would close the terminal.
+#
+# DELIBERATELY DUPLICATED in init/oosh: that script runs before oosh exists and
+# this one runs in a shell where `this` cannot even be parsed, so neither may
+# source a shared helper. See the design spec, "Duplication is inherent".
 if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
-  echo "oosh boot: \$HOME is unset or not a directory — cannot anchor ~/oosh and ~/config" >&2
-  echo "oosh boot: set HOME first, e.g. env -i HOME=\"\$HOME\" sh -c '. ~/oosh/boot'" >&2
-  return 1 2>/dev/null || exit 1
+  _oosh_user=$(id -un 2>/dev/null)
+  _oosh_home=""
+  if [ -n "$_oosh_user" ]; then
+    if command -v getent >/dev/null 2>&1; then
+      _oosh_home=$(getent passwd "$_oosh_user" 2>/dev/null | cut -d: -f6)
+    fi
+    if [ -z "$_oosh_home" ] && command -v dscl >/dev/null 2>&1; then
+      # macOS returns TWO paths in one field for root ("/var/root
+      # /private/var/root"); take the first — same as private.get.home.darwin.
+      _oosh_home=$(dscl . -read "/Users/$_oosh_user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    fi
+    if [ -z "$_oosh_home" ] && [ -r /etc/passwd ]; then
+      _oosh_home=$(awk -F: -v u="$_oosh_user" '$1 == u { print $6; exit }' /etc/passwd)
+    fi
+  fi
+  if [ -n "$_oosh_home" ] && [ -d "$_oosh_home" ]; then
+    HOME="$_oosh_home"
+    export HOME
+    unset _oosh_user _oosh_home
+  else
+    echo "oosh boot: \$HOME is unset or not a directory, and no home could be" >&2
+    echo "oosh boot: derived for '${_oosh_user:-?}' from getent, dscl or /etc/passwd." >&2
+    echo "oosh boot: re-run with HOME set, e.g. HOME=/home/you sh -c '. ~/oosh/boot'" >&2
+    unset _oosh_user _oosh_home
+    return 1 2>/dev/null || exit 1
+  fi
 fi
 
 # ── 1. Anchors ──────────────────────────────────────────────────────────────
