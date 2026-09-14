@@ -83,9 +83,11 @@ up empty there is nothing safe to anchor to, so it refuses with one diagnostic �
 
 ### 3 · Duplication is inherent, not a smell
 
-`init/oosh` runs **before oosh exists**; `boot` runs **before `this` is loaded**. Neither may source
-a shared helper. Both carry their own copy of the lookup, each commented as deliberate. Extracting
-it would create exactly the dependency these two files exist to avoid.
+`init/oosh` runs **before oosh exists**; `boot` runs **before `this` is loaded** — and, as
+[Why `boot` and `this` are two files](#why-boot-and-this-are-two-files) shows, in a shell where
+`this` cannot even be parsed. Neither may source a shared helper. Both carry their own copy of the
+lookup, each commented as deliberate. Extracting it would create exactly the dependency these two
+files exist to avoid.
 
 ### 4 · What must never happen
 
@@ -100,6 +102,66 @@ it would create exactly the dependency these two files exist to avoid.
 The shebang itself. `#!/usr/bin/env -i sh` would drop `HOME` (worse than today), and a shebang
 cannot portably pass two words. The re-exec supersedes it and covers strictly more cases — the
 shebang never protected the piped one-liner, because a shebang is not read when content is piped.
+
+## Why `boot` and `this` are two files
+
+The obvious question, since `boot` was introduced to take code *out* of the env files: why not fold
+it into `this`, the kernel that already bootstraps everything?
+
+**Because `this` cannot parse under a POSIX shell.** Measured:
+
+```
+dash        -n this  ->  Syntax error: Bad function name   (line 66)
+busybox ash -n this  ->  syntax error: bad function name
+sh          -n this  ->  Syntax error: Bad function name
+boot                 ->  parses under sh, dash and busybox ash
+```
+
+Dotted function names — `this.start()`, `create.result()`, the whole `noun.verb` model — are not
+POSIX *names*. This is not a lint warning; the file will not load.
+
+**And it cannot be hidden behind a guard.** A natural instinct is to wrap the bash-only parts in
+`if [ -n "$BASH_VERSION" ]`. That does not work — a POSIX shell parses each command as it reaches
+it, and dies on the *definition* even when the branch is never taken:
+
+```
+$ dash lazy.sh
+start
+lazy.sh: 3: Syntax error: Bad function name
+```
+
+It printed `start`, then died. So a single file **cannot** be both POSIX-parseable and contain
+`this`'s methods. That is the real reason there are two files.
+
+### How narrow is the POSIX requirement, really?
+
+Narrower than `docs/boot.md` implies, and worth stating honestly:
+
+- every `os` / `ossh` caller either wraps the source in an explicit `bash -c`, or targets a user
+  whose login shell oosh deliberately forces to bash — including on Alpine
+  (`private.user.oosh.install.shell.linux`, *"incl. BusyBox/Alpine"*);
+- `bashrcTemplate` is bash by definition.
+
+So for an **installed** oosh user almost every path is already bash. What still genuinely needs
+POSIX:
+
+1. a user oosh has not set up yet, or a host mid-install, where the login shell is still dash/ash;
+2. `ossh exec` to a target that is not an oosh user;
+3. **`env -i sh` — this very ticket.**
+
+Folding `boot` into `this` would therefore mean giving up T3. That, not tradition, is the decisive
+argument.
+
+### The division of labour
+
+| | |
+|---|---|
+| **`boot`** | the POSIX-sh **prologue** — settle `HOME`, set the anchors, source the pure-data config, build PATH. Everything that must work *before* bash can be assumed. |
+| **`this`** | the bash **kernel** — dispatch, `create.result`, method loading. Everything that *is* oosh. |
+
+`boot` did not merely take code out of the env files. It took the part that has to run in a shell
+`this` cannot run in. The env-file cleanup and the POSIX prologue happened to be the same code,
+which is why they look like one job.
 
 ## Testing
 
