@@ -57,7 +57,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 💡 Ideas | Has a live reproducible bug, but its fix needs T4/T5's `OOSH_DIR`+branch semantics. |
 | 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
 | 4 | **T3** — `env -i sh` SAFETY | 🔍 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. Second attempt delivered `boot` + `init/oosh` recovery and the clean re-exec. |
-| 5 | **T9** — fixed system path to `boot` | 💡 **Ideas** (researched) | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. Design complete, **5 decisions open**: [the card](2026-09-14-fixed-system-boot-path.md). |
+| 5 | **T9** — fixed system path to `boot` | 🔍 **In Review** | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. Design complete, **5 decisions open**: [the card](2026-09-14-fixed-system-boot-path.md). |
 | 6 | **T6** — `bootsratp.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the five above settle. |
 
 ---

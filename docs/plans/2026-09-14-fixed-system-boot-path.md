@@ -1,10 +1,31 @@
-# T9 — a fixed system path to `boot` 🚧 In Progress
+# T9 — a fixed system path to `boot` 🔍 In Review
 
 > **Card:** `. /etc/oosh/boot` — one command that recovers any user, in any shell,
 > with no environment at all.
 
-**Status:** design complete, **all five decisions taken** (bottom). Implementation started
-2026-09-14.
+**Status:** delivered 2026-09-14, in review. Commits `22e67f3` (helper + state-34 guard),
+`7500828` (state 34), `c2905cc` + `9e1c382` (`oo boot.fix` / `boot.status` + completion),
+`de88694` (tests), `f5fb1e8` (docs), `62ed433` (T67 driven from a fixture), `6a69e03` (the
+fatal message must survive any `LOG_DEVICE`).
+
+**Verified:** host `test.suite core 1` 663/662/1 intentional, `run oo 1` 102/102,
+`run config 1` 63/63, `this anchor.validate` 0 violations on both anchors.
+`os platform.test ubuntu_24_04` **rc=0**, `test.ssh.config.woda.portable` 12x, zero
+non-intentional failures, and state 34 really fired in-container:
+`SUCCESS> boot system path ensured at /etc/oosh/boot -> <shared>/dev/boot`.
+
+**Two bugs the platform gate caught that the host could not.** (1) `oo boot.fix`'s fatal
+privilege message used `error.log`, which routes to `$LOG_DEVICE` — visible on a developer's
+tty, invisible to all four container users, who got a bare non-zero exit. That violated
+doctrine already guarded in `test.promote:1164-1170`; it is now bare `echo` to stderr, with
+`T9-BOOT-FIX-FATAL-USES-BARE-ECHO` pinning it. (2) T67 originally pointed at the host's real
+`/etc/oosh/boot`, which would have left `core` permanently red on every dev box until someone
+ran `oo boot.fix` with sudo — and its skip branch returned rc 0 with a different string, so
+`expect 0 "<literal>"` failed on it anyway. Core now proves the *mechanism* against a fixture;
+the platform suite proves the *deployment*.
+
+Note `test.platform.boot.system.path.invariant` is `TEST_CATEGORY=platform`, so like its
+siblings it runs under `os platform.test <p> terminal`, not in the default pass.
 
 ## Why
 
