@@ -179,7 +179,7 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 
 | | |
 |---|---|
-| **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
+| **Sourced normally; executed to RESTORE** | `. ~/oosh/boot` is the normal path — it sets variables in *your* shell. Running it as a program (`<tree>/boot`) is the **recovery** entry point: it repairs a broken box on disk, then tells you to start a new shell. See below. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
 | **Derives `$HOME` when it has to** | `env -i` drops `HOME`, so `boot` looks it up in the password database and exports it — which is what makes `env -i sh` boot correctly. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
 | **Reconstructs a missing config** | A missing config used to be silently *skipped* — a shell that looked fine with no environment. `boot` now rebuilds it when it is entirely gone, and reports it when it is merely damaged. See the table below. |
@@ -208,6 +208,36 @@ pipeline and for fixtures that must not heal the tree they are asserting on.
 > One deliberate gap: `boot`'s own check is existence only. A *present but corrupt* file is caught
 > by `config reconstruct` / `config init.check` when run explicitly, not on every shell —
 > validating three files at every shell start is not worth the cost.
+
+### Restoring a broken box — the T3 card
+
+*"`env -i sh`. SAVETY…shall boot correctly"* is **env initiate**: on a machine whose `~/oosh` is
+missing, dangling, or a real directory instead of a symlink, no oosh command is reachable — so the
+repair has to come from `boot` itself.
+
+| How you run it | Shell | Knows its path via | Result |
+|---|---|---|---|
+| `. <tree>/boot` | bash | `BASH_SOURCE` | repairs the box **and** this shell comes up working |
+| `<tree>/boot` | **any**, incl. `env -i sh` | `$0` | repairs the box; start a new shell |
+
+A *sourced* script cannot know its own path under POSIX `sh` — `$0` is the shell name. An
+*executed* one's `$0` **is** its path, in every shell, including under `env -i`. That second route
+is what makes the card satisfiable at all, and it gives an executed `boot` a purpose it never had.
+
+`boot` only **detects and dispatches**; [`config env.init`](config.md) owns the repair — anchoring
+`~/oosh` to the tree `boot` was run from, then `~/config`, then the env files, verifying each. It
+**refuses rather than guesses** if that directory is not a real oosh tree, and it **never deletes**:
+a pre-existing real entry is preserved as `<name>.orig.<ts>`.
+
+Anchoring to the tree it was *run from* is a deliberate, marked exception to
+[the path-anchor rule](#the-path-anchor-rule-and-its-only-exceptions) — on a broken box `~/oosh` is
+precisely what cannot be trusted. Discovery heuristics were rejected: where almost nothing survives,
+every heuristic is a guess, while the directory you invoked is known.
+
+**Trigger:** `~/oosh` alone. A missing `~/config` with a working `~/oosh` is *not* boot's business —
+oosh commands still run there, so `config init.user` can be invoked normally. Keeping it to one
+anchor also stops `boot` becoming a second install path: a box simply not set up for this user
+passes through silently (`test.config` T58). `OOSH_BOOT_NO_RECONSTRUCT=1` disables it.
 
 ### Why the exit status needed fixing
 
@@ -248,6 +278,7 @@ Only when all three come up empty does `boot` refuse — and by `return`, never 
 > Guarded by `test.config` **T40** (parses under `sh` *and* `ash`), **T50** (exits 0 in every
 > shell), **T51** (`env -i <sh>` really boots, deriving `$HOME`), **T52** (`ash` really boots),
 > **T53** (refuses when no home can be derived), **T55-T59** (the reconstruct table above),
+> **T60-T63** (restore mode, both routes),
 > alongside **T49** (the boot-absent fallbacks still exist).
 
 ## Idempotent

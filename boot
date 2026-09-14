@@ -80,6 +80,54 @@ export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
 # the user's own. log/config/oo reference $OOSH_USER_CONFIG_PATH, not the literal.
 export OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"
 
+# ── 1b. RESTORE MODE ─────────────────────────────────────────────────────────
+# T3's card: "env -i sh. SAVETY...shall boot correctly" — env INITIATE. On a box
+# whose ANCHORS are wrong (~/oosh missing, dangling, or a real directory; ~/config
+# gone) no oosh command is reachable, so the repair has to come from here.
+#
+# Two routes, because a SOURCED script cannot know its own path under POSIX sh
+# ($0 is the shell name) — only bash has BASH_SOURCE. An EXECUTED script's $0 IS
+# its path, in every shell, including under `env -i`:
+#
+#   . <tree>/boot     bash, sourced   -> repairs, and THIS shell comes up working
+#   <tree>/boot       any shell, run  -> repairs the box; start a new shell
+#
+# Cheap: two file tests on a healthy box, then nothing. Only when an anchor is
+# actually broken do we hand off to `config env.init`, which owns the repair.
+# Invoked as a COMMAND (config is bash, this may be dash) and by absolute path,
+# since PATH is not built yet.
+#
+# oosh-dir-exception: recovery anchors to the tree boot was RUN FROM, not to
+# ~/oosh — on a broken box ~/oosh is precisely what cannot be trusted.
+if [ -z "$OOSH_BOOT_NO_RECONSTRUCT" ]; then
+  _oosh_self=""
+  case "$0" in
+    */boot|boot) [ -f "$0" ] && _oosh_self="$0" ;;
+  esac
+  # Guarded so dash never EVALUATES the bashism (it parses fine either way).
+  if [ -z "$_oosh_self" ] && [ -n "$BASH_VERSION" ]; then
+    _oosh_self="${BASH_SOURCE[0]}"
+  fi
+  if [ -n "$_oosh_self" ]; then
+    _oosh_selfdir=$(cd "$(dirname "$_oosh_self")" 2>/dev/null && pwd -P)
+    # Trigger on ~/oosh ONLY — the anchor whose breakage makes oosh unreachable
+    # and so makes this entry point necessary at all. A missing ~/config with a
+    # working ~/oosh is NOT boot's business: oosh commands still run there, so
+    # `config init.user` (its owner) can be invoked normally. Keeping the trigger
+    # to one anchor also keeps boot from becoming a second install path — a box
+    # that simply has not been set up for this user must pass through silently.
+    if [ ! -f "$HOME/oosh/this" ]; then
+      # ...and are we standing in a real oosh tree to anchor TO?
+      if [ -n "$_oosh_selfdir" ] && [ -f "$_oosh_selfdir/this" ] \
+         && [ -f "$_oosh_selfdir/config" ] && [ -f "$_oosh_selfdir/oo" ]; then
+        "$_oosh_selfdir/config" env.init "$_oosh_selfdir"
+      fi
+    fi
+    unset _oosh_selfdir
+  fi
+  unset _oosh_self
+fi
+
 # ── 2. Source the config ─────────────────────────────────────────────────────
 # Source ONLY user.env — it chains `source $CONFIG_PATH/oosh.env` /
 # `log.env` itself (config.add appends those), so this one line stands up the

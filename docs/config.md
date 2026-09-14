@@ -64,6 +64,13 @@ so a first-ever shell has no missing-source error. See
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
+**Recovery.** `config env.init` is the T3 card's *env initiate*: it anchors `~/oosh` to a given
+oosh tree, repairs `~/config`, regenerates the env files and verifies them — the path for a box so
+broken that no oosh command is reachable. [`boot`](boot.md) dispatches it, and can be **executed**
+(not just sourced) so `env -i sh <tree>/boot` works. It refuses rather than guesses if the tree is
+not an oosh tree, and never deletes: a real entry becomes `<name>.orig.<ts>`. Pinned by
+`test.config` **T60-T63**.
+
 **Repair.** `config reconstruct` rebuilds the shared env files when they are *all* missing and
 reports them when they are merely damaged — it never rewrites a populated `sharedConfig`, because
 `config.save` regenerates it from the calling shell's live environment. [`boot`](boot.md) calls it
