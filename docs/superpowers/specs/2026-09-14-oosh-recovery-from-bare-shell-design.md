@@ -57,38 +57,14 @@ keeping the logic in a method where it is completable, testable and documented, 
 `docs/first-principles.md` ("DRY: information about commands, parameters and defaults is defined
 only once — in the code itself. The completion engine reads this directly").
 
-## Prerequisite: repair the method-creation tooling
+## Dependency: the method-creation tooling
 
-`docs/command-creation.md` and `docs/first-principles.md` mandate the template-driven route for
-adding methods. That command **exists and is correctly named** — `oo.method.new` (`oo:75`), with
-`oo.test.new` (`oo:54`) alongside. It was renamed from `oo.new.method` in **`2fe5133`**
-(2026-03-16, *"refactor: enforce object.verb method naming across all scripts"* — 57 methods across
-7 scripts), which kept the old names as `private.*` so they disappear from completion.
+`config.env.init` must be generated through `oo method.new` from `templates/code/newMethod`, not
+hand-written. That tooling currently cannot run against any core script — stale docs, a missing
+`### new.method` marker, and a `.new` usage-file step with no files left.
 
-Nothing was lost. What rotted is everything around it:
-
-| Problem | Detail |
-|---|---|
-| **Stale docs** | Six files still say `oo new.method` / `oo new.test` — the pre-`2fe5133` names, dead since March: `command-creation.md`, `first-principles.md`, `oo.md` (its own section + examples), `oosh.md`, `oosh-architecture.md`, `python.md` |
-| **Missing insertion marker** | `private.oo.new.method` inserts via `replace within <script> "### new.method"`. That marker is absent from `config`, `this`, `log`, `debug`, `oo` — the scripts this work touches |
-| **Missing usage file** | It also does `replace within "$OOSH_DIR/$newScript.new"`. Only **`myScript.new`** still exists, so even `otmux`/`path`/`backup` — which *do* carry the marker — fail that step |
-
-So `oo method.new` cannot currently be run against any script that matters. That is the real reason
-methods in this tree get hand-written, including everything added today.
-
-Repair, in order, before the design work:
-
-1. **Docs** — update the six files to `oo method.new` / `oo test.new`, and add a test pinning
-   documented command names against what `oo` actually defines, so this cannot drift silently again.
-2. **`### new.method` markers** — add to `config`, `this`, `log`, `debug`, `oo`.
-3. **The `.new` usage-file step** — decide whether that convention is still wanted. Only
-   `myScript.new` follows it, so either regenerate the files or drop the step from
-   `private.oo.new.method`. Dropping looks right: the usage information already lives in each
-   method's `# <params> # description #` docstring, which is what the completion engine reads
-   (`docs/first-principles.md`, DRY). A parallel `.new` file duplicates it — exactly what that
-   principle forbids.
-
-Only once `oo method.new` runs cleanly is it used to generate `config.env.init` and its test.
+That is **its own ticket**: `docs/plans/2026-09-14-method-tooling-repair.md`. This design is
+blocked on it for the *generation* step only; the design work below stands independently.
 
 ## Design
 

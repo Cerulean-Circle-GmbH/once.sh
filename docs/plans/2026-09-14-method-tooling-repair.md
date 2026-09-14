@@ -1,0 +1,99 @@
+# Ticket: repair the `oo method.new` tooling
+
+**Created:** 2026-09-14 · **Branch:** `dev` · **Status:** 💡 proposed — not yet on the board
+**Found while:** planning T3 (`env -i sh. SAVETY...shall boot correctly`)
+
+## Why this is a ticket
+
+The project mandates a template-driven route for adding methods —
+`docs/command-creation.md`: *"Use `oo …` to interactively add new methods to scripts"*;
+`docs/first-principles.md`: *"All new scripts and methods are based on templates in
+`templates/code/`, enforcing best practices and DRY principles."*
+
+That command exists and is correctly named: **`oo.method.new`** (`oo:75`), with **`oo.test.new`**
+(`oo:54`). It was renamed from the verb-first `oo.new.method` in **`2fe5133`** (2026-03-16,
+*"refactor: enforce object.verb method naming across all scripts"*), which kept the old names as
+`private.*` so they drop out of completion.
+
+**But it cannot currently be run against any script that matters.** Three things rotted around it,
+so every method in this tree gets hand-written instead — which is a standing violation of the
+project's own methodology, not a style preference.
+
+## Evidence
+
+### 1. The docs never followed the rename
+
+`2fe5133` updated **one** documentation file (`docs/oosh-architecture.md`, 2 lines) — and even that
+file still carries stale references. **17 references across 7 files** still name the pre-rename
+commands, dead since March 2026:
+
+| File | Lines |
+|---|---|
+| `oo.md` | 22, 61, 66, 75, 80, 412, 413 — including its own `### oo.new.method` section heading |
+| `wiki-index.md` | 102, 117, 118 |
+| `oosh-architecture.md` | 549, 550 |
+| `oosh.md` | 139, 140 |
+| `command-creation.md` | 12 |
+| `first-principles.md` | 48 |
+| `python.md` | 125 |
+
+Anyone following the documentation types a command that has not dispatched for six months.
+
+### 2. The insertion marker is missing from the core scripts
+
+`private.oo.new.method` inserts via `replace within <script> "### new.method"`. That marker is
+**absent** from `config`, `this`, `log`, `debug` and `oo` itself — precisely the scripts under
+active work.
+
+### 3. The `.new` usage-file step has no files left
+
+It also runs `replace within "$OOSH_DIR/$newScript.new"`. Only **`myScript.new`** still exists, so
+even `otmux` / `path` / `backup` — which *do* carry the marker — fail at that step.
+
+## Decision needed
+
+**What happens to the `<script>.new` usage file?** Recommendation: **drop the step.** Usage already
+lives in each method's `# <params> # description #` docstring, and that is what the completion
+engine reads — `docs/first-principles.md`: *"information about available commands, parameters, and
+defaults is defined only once — in the code itself. The completion engine reads this directly,
+eliminating duplication between documentation, code, and completion logic."* A parallel `.new` file
+is exactly the duplication that principle forbids. The alternative is to regenerate ~40 `.new`
+files and keep them in step forever.
+
+## Definition of done
+
+- [ ] Decision recorded on the `<script>.new` usage-file step
+- [ ] All 17 stale references corrected to `oo method.new` / `oo test.new`
+- [ ] `### new.method` marker present in `config`, `this`, `log`, `debug`, `oo`
+- [ ] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
+      from `templates/code/newMethod` **and** its test case from `templates/code/newMethodTest`
+- [ ] A test pins **documented command names against what the scripts actually define**, so this
+      cannot drift silently again
+- [ ] Standing verification bar passes
+
+## Scope note — this is probably not only `oo`
+
+`2fe5133` renamed 57 methods across 7 scripts (its message: `ossh` 17, `backup` 13, `scrumMaster`
+10, `oo` 7, `c2` 6, `user` 3, `config` 1) and updated 2 lines of documentation. The other six
+scripts' docs are likely stale the same way. The name-pinning test in the DoD is what turns that
+from an open-ended audit into a finite, enforced list — write the test first and let it enumerate
+the drift.
+
+## Verification
+
+```bash
+# no stale names remain
+grep -rn 'oo\.new\.method\|oo new\.method\|oo\.new\.test\|oo new\.test' docs/
+
+# the tool runs end-to-end
+oo method.new config.someProbe && grep -n 'config.someProbe' config test/test.config
+
+# and the guard catches a reintroduced drift
+./test.suite run oo 1 && ./test.suite core 1
+```
+
+## Relationship to T3
+
+T3's design (`docs/superpowers/specs/2026-09-14-oosh-recovery-from-bare-shell-design.md`) needs
+`config.env.init` generated through this tooling. T3 is **blocked on this ticket** for the
+*generation* step, though its design work can proceed in parallel.

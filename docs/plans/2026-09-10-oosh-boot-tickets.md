@@ -435,6 +435,16 @@ already flags a regression against its `this localInstall → "starts new bash"`
 
 ---
 
+## 4c. Proposed new cards (found by us, not yet on the board)
+
+The user moves cards; these are written up so they can be added to **Ideas** when he chooses.
+
+| Ticket | Why | Doc |
+|---|---|---|
+| **Repair the `oo method.new` tooling** | The project mandates template-driven method creation, but the tool cannot run against any core script: 17 stale doc references to names dead since `2fe5133` (2026-03-16), the `### new.method` marker missing from `config`/`this`/`log`/`debug`/`oo`, and a `<script>.new` usage-file step with only `myScript.new` left. Every method in this tree is therefore hand-written — a standing methodology violation. | [2026-09-14-method-tooling-repair.md](2026-09-14-method-tooling-repair.md) |
+
+---
+
 ## 5. Standing verification bar (every ticket)
 
 - `./test.suite core 1` → **zero real failures** (1 intentional meta-test expected; 613 pass at time of writing)
