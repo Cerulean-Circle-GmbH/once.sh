@@ -109,7 +109,7 @@ first install, so an already-installed host will *never* run state 34.
 
 `$SUDO` is used internally, so `oo boot.fix` — not `sudo oo boot.fix` — is the
 one command that works whether you are already root or a `dev` member with
-sudo. If neither applies it fails loudly naming both, and creates nothing.
+sudo installed. If sudo is absent it fails loudly before creating anything (a user without sudo rights meets sudo's own denial).
 Like every primitive here it is **not** auto-triggered: `oo update` runs as an
 ordinary user with no sudo.
 

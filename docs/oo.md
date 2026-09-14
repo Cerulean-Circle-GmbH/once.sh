@@ -162,8 +162,8 @@ an already-installed host will never run state 34.
 
 `$SUDO` is used internally — run `oo boot.fix`, **not**
 `sudo oo boot.fix`. It works whether you are already root or a `dev`
-member with sudo; if neither applies it fails loudly naming both and
-creates nothing. Idempotent, and never auto-triggered (`oo update`
+member with sudo installed; if sudo is absent it fails loudly before
+creating anything. Idempotent, and never auto-triggered (`oo update`
 runs as an ordinary user with no sudo). On a branch that has no `boot`
 (`testing` / `prod`) it warns and skips rather than leaving a dangling
 link. See [Repair toolkit](repair-toolkit.md).
