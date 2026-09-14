@@ -2,6 +2,10 @@
 
 > **Card:** `. /etc/oosh/boot` — one command that recovers any user, in any shell,
 > with no environment at all.
+>
+> **"in any shell" needed a correction** — it was false on macOS `/bin/sh` until
+> 2026-09-14. See *Follow-up: the card's "any shell" was false on macOS* at the end
+> of this document for what was measured, what was fixed, and what is now claimed.
 
 **Status:** delivered 2026-09-14, in review. Commits `22e67f3` (helper + state-34 guard),
 `7500828` (state 34), `c2905cc` + `9e1c382` (`oo boot.fix` / `boot.status` + completion),
@@ -304,6 +308,43 @@ bare `env -i sh` does not).
 
 Two caveats measured rather than assumed, and documented: `$ENV` is honoured by
 **interactive** shells only (`sh -c` ignores it), and bash honours `$ENV` only
-when invoked as `sh` — never under its own name, and an explicit `bash --posix`
-is the one combination that breaks, because POSIX mode is already active when
-`$ENV` is read and bash then rejects every dotted function name in `log`.
+when invoked as `sh` — never under its own name. An explicit `bash --posix` reads
+`$ENV` with POSIX mode already active; it now recovers the anchors and stays alive,
+but without the log functions (see the follow-up below).
+
+### Follow-up: the card's "any shell" was false on macOS — fixed 2026-09-14
+
+The card says "one command that recovers any user, **in any shell**, with no
+environment at all", and so did `docs/boot.md`. Running this work against a live
+macOS 15.7.3 arm64 VM showed that was **not true there**:
+
+```
+env -i /bin/sh   -c '. /etc/oosh/boot; echo REACHED'
+  -> /Users/admin/oosh/log: line 73: `log.device': not a valid identifier
+  -> rc 2, REACHED never printed — the shell was DEAD
+env -i /bin/bash -c '. /etc/oosh/boot; …'          -> rc 0, all anchors
+env -i /opt/homebrew/bin/bash -c '…'               -> rc 0
+```
+
+**macOS `/bin/sh` IS bash 3.2 in POSIX mode.** `boot`'s section-4 guard asked only
+`[ -n "$BASH_VERSION" ]`, which is true there, so it sourced `log` — full of dotted
+function names, which POSIX mode rejects — and a parse error in a sourced file under
+POSIX mode **kills the shell**. Same failure class as T3, different route.
+
+The guard is now "bash **and not** POSIX mode" (`$SHELLOPTS` + a `case`, so T40's
+four-shell lint still holds). In POSIX mode `boot` skips `log` and continues: anchors
+set, rc 0, shell alive, **no log functions**. Guarded by `test.config` **T70**, driven
+with `bash --posix`, which reproduces the whole thing on Linux.
+
+Two further macOS facts the VM settled, now in `docs/boot.md`:
+
+- **`/etc/profile.d` does not exist on macOS**, so the login-shell route is **Linux-only**.
+  State 34 *did* create `/etc/oosh/boot` on the VM (pointing into `/Users/shared/…`) and
+  gracefully skipped the drop-in, exactly as designed — but nothing there self-recovers a
+  login shell.
+- **For macOS the reliable recovery is bash**, not `sh`: `bash -c '. /etc/oosh/boot'` or
+  `/opt/homebrew/bin/bash -c …`. From `/bin/sh` the command is safe and gives a working
+  `PATH`; it is just degraded.
+
+So the claim is now: **any shell, and it never kills your shell** — with the POSIX-mode
+degradation stated rather than papered over.

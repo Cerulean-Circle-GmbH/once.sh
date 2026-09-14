@@ -31,9 +31,44 @@ Every context that needs an oosh environment sources `boot`:
 no arrays, and the **env files it sources must use POSIX `.`, not the bash
 `source` builtin** (`config.add` / `config.save` emit `.` — see D1 in
 [the 2026-09-09 review](research/review-2026-09-09-boot-loader-pure-env-files.md)).
-The one bash-only thing — the `log` framework script — is sourced under a
-`[ -n "$BASH_VERSION" ]` guard and simply skipped under a bare `sh` (oosh needs
-bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediately).
+The one bash-only thing — the `log` framework script — is sourced under a guard
+and simply skipped otherwise (oosh needs bash 4+ to actually run; the `env -i sh`
+bootstrap re-execs into bash immediately).
+
+### The guard is "bash **and not** POSIX mode"
+
+`[ -n "$BASH_VERSION" ]` alone is the wrong question, and asking it that way was a
+real bug (fixed 2026-09-14, `test.config` **T70**). **On macOS `/bin/sh` IS bash 3.2**:
+`$BASH_VERSION` is set, so the old guard sourced `log` — but that shell runs with
+`posix` on, where a **dotted function name is not a valid identifier**, and `log` is
+built from dotted names (`log.device`, `log.level`, …). Worse, **a parse error in a
+sourced file under POSIX mode kills the shell**, not just the `source`. Measured on a
+macOS 15.7.3 arm64 VM:
+
+| Command | Result |
+|---|---|
+| `env -i /bin/sh -c '. /etc/oosh/boot; echo REACHED'` | ``/Users/admin/oosh/log: line 73: `log.device': not a valid identifier`` — rc 2, `REACHED` **never printed, the shell was dead** |
+| `env -i /bin/bash -c '. /etc/oosh/boot; …'` | rc 0, all anchors set |
+| `env -i /opt/homebrew/bin/bash -c '…'` | rc 0 |
+
+Same binary, same file — only POSIX mode differs. It is the same failure class as
+**T3** (a sourced `boot` killing its caller) reached by another route.
+
+So the guard tests both halves, through `$SHELLOPTS` (which bash keeps current, so a
+runtime `set -o posix` is caught too) with a `case`, keeping the file parseable by
+dash/ash for T40's four-shell lint:
+
+```sh
+_oosh_posix=no
+case ":$SHELLOPTS:" in *:posix:*) _oosh_posix=yes ;; esac
+if [ -n "$BASH_VERSION" ] && [ "$_oosh_posix" = no ]; then …
+```
+
+**Under POSIX mode `boot` skips `log` and carries on.** Every anchor and the PATH block
+are set *before* that point, so a POSIX-mode shell still comes up fully anchored and
+`boot` still returns 0 — it just has **no log functions** (`console.log`, `error.log`,
+…). That is the correct trade; killing the shell is not. `bash --posix` reproduces the
+whole thing on Linux, which is what T70 drives.
 
 ## What it does, in order
 
@@ -56,9 +91,11 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
 5. **PATH.** Put `$OOSH_DIR` and `$OOSH_DIR/ng` on PATH (and `$BASH_FILE`'s dir
    first, so brew bash wins over path_helper's `/bin/bash` on macOS). Colon-
    anchored, so re-sourcing never grows PATH.
-6. **Logging primitives** (bash only): source `log`, then `log.session.save`
-   writes the per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` to `log.session.env`.
-   Both live in **one `if`**, not two `&&` lists — see [Guarantees](#guarantees).
+6. **Logging primitives** (**bash, and not in POSIX mode** — see
+   [the guard](#the-guard-is-bash-and-not-posix-mode)): source `log`, then
+   `log.session.save` writes the per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` to
+   `log.session.env`. Both live in **one `if`**, not two `&&` lists — see
+   [Guarantees](#guarantees). Skipped, not fatal, in every other shell.
 7. **Exit 0.** A bare `:` terminates `boot`, so success is never reported as
    failure to the callers that branch on its status.
 
@@ -178,7 +215,8 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 | **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
 | **Recovers `$HOME`** | `env -i` drops it, so `boot` looks it up in the password database (`getent` → `dscl` → `/etc/passwd`) and exports it — which is what lets `env -i sh` boot correctly *once `boot` is reached*. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
-| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i`, with or without `HOME`, **when sourced by absolute path**: use `. /etc/oosh/boot`. See the caveat below: with `HOME` unset, `~` is not a path a POSIX shell can resolve, so `. ~/oosh/boot` is the everyday form, not the recovery form. |
+| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash`, and **POSIX-mode bash** (`bash --posix`, `set -o posix`, macOS `/bin/sh`) — and under `env -i`, with or without `HOME`, **when sourced by absolute path**: use `. /etc/oosh/boot`. Two caveats below: with `HOME` unset, `~` is not a path a POSIX shell can resolve, so `. ~/oosh/boot` is the everyday form, not the recovery form; and a POSIX-mode shell comes up **anchored but without the log functions**. |
+| **Never kills the caller** | `boot` is sourced, so it must not be able to end the shell that sourced it. It `return`s rather than `exit`s (T51), and it refuses to source `log` into a shell that cannot parse it — in POSIX mode a parse error in a sourced file is fatal to the shell (T70). |
 
 ### The tilde caveat — reaching `boot` is not the same as running it
 
@@ -197,7 +235,9 @@ the table above — correct for everyday use, and what all 20 call sites use —
 that cannot work in the empty-environment case `boot` exists to survive. Chicken-and-egg: the
 thing that would recover `HOME` sits behind a path that needs `HOME`.
 
-So there is a fixed, host-wide path. **One command, any user, any shell, no environment at all:**
+So there is a fixed, host-wide path. **One command, any user, any shell, no environment at all**
+(in POSIX-mode shells — macOS `/bin/sh` — anchored but without the log functions; see
+[the guard section](#the-guard-is-bash-and-not-posix-mode) and [macOS](#macos--what-actually-applies-there)):
 
 ```sh
 . /etc/oosh/boot
@@ -227,7 +267,7 @@ table — nothing here is aspirational:
 | `env -i sh` | **no** | `ENV=[]` — `$ENV` is a non-login POSIX `sh`'s **only** rc hook, and `env -i` is precisely what erased it. There is nothing left to hook. |
 | `env -i ENV=/etc/oosh/boot sh` | **yes** | that same hook, handed back. `$ENV` is `sh`'s `~/.bashrc`. |
 | `env -i sh -l` | **yes** | a login shell reads `/etc/profile`, which loops `/etc/profile.d/*.sh` — and `/etc/profile.d/oosh.sh` is installed alongside the symlink. |
-| `. /etc/oosh/boot` | **yes** | the explicit form. Works in every shell, login or not, with or without the two above. |
+| `. /etc/oosh/boot` | **yes** | the explicit form. Works in every shell, login or not, with or without the two above — **degraded, not broken, in POSIX mode**: anchors yes, log functions no (see the guard section). |
 
 **Bare `env -i sh` can never self-recover, and no future change will make it.** A
 non-login POSIX `sh` reads exactly one startup file, the one named by `$ENV`;
@@ -290,15 +330,40 @@ Two caveats, both measured, both easy to get wrong when quoting this:
   **not** source it. Do not add a `-c`.
 - **bash under its own name ignores `$ENV` entirely** — it is a POSIX-mode feature
   there. Invoked as `sh` (the RHEL/Alma `/bin/sh`) bash *does* read `$ENV`, and works,
-  because it enters POSIX mode only **after** the startup file is read, so `boot`'s
-  dotted function names still parse. The one combination that does **not** work is an
-  explicit `bash --posix`: POSIX mode is already active when `$ENV` is read, and bash
-  then rejects every dotted function name in `log`. That combination is not claimed
-  anywhere, and should not be.
+  because it enters POSIX mode only **after** the startup file is read, so it gets the
+  log functions too. An explicit `bash --posix` reads `$ENV` with POSIX mode **already
+  active**: it recovers the anchors and stays alive, but `boot` skips `log`, so that
+  shell has no log functions. It used to be worse — bash rejected every dotted function
+  name in `log` and the shell *died*; that is the bug T70 fixes.
 
 Guarded by `test.config` **T68** (the `$ENV` route and both of those negatives) and
 `test.oo` **T9B-PROFILED-\*** (the drop-in's content and guards, against a fixture);
 the deployed files are proved by `test.platform.boot.system.path.invariant`.
+
+#### macOS — what actually applies there
+
+Measured on a macOS 15.7.3 arm64 VM with oosh installed from `dev`. Three facts, and they
+change which route you should reach for:
+
+1. **`/bin/sh` on macOS is bash 3.2 in POSIX mode.** Not dash. `$BASH_VERSION` is set and
+   `SHELLOPTS` contains `posix`. `. /etc/oosh/boot` under it recovers every anchor and
+   returns 0, but that shell gets **no log functions** — see the guard section above. Before
+   the T70 fix it did not merely lose them: the shell died with
+   ``log: line 73: `log.device': not a valid identifier``.
+2. **There is no `/etc/profile.d` on macOS at all**, so the login-shell route
+   (`/etc/profile.d/oosh.sh`, `env -i sh -l`) is **Linux-only**. State 34 still creates
+   `/etc/oosh/boot` — confirmed on the VM, pointing into `/Users/shared/…` — and then
+   *gracefully skips* the drop-in. Do not expect a macOS login shell to self-recover through it.
+3. **For macOS, the reliable recovery is bash**, not `sh`:
+
+   ```sh
+   bash -c '. /etc/oosh/boot; …'          # /bin/bash 3.2 — anchors + log functions
+   /opt/homebrew/bin/bash -c '. /etc/oosh/boot; …'   # brew bash 5.x, what oosh actually wants
+   ```
+
+   Both measured rc 0 with `HOME`, `OOSH_DIR` and `CONFIG_PATH` all recovered. `. /etc/oosh/boot`
+   from `/bin/sh` is safe and gives you a working `PATH` — use it to *reach* oosh, then run
+   oosh commands, which re-exec under bash themselves.
 
 **Portable fallbacks**, for a host that has no `/etc/oosh/boot` — a user-rights-only (20-lane)
 install never reaches state 34, and a host installed before this landed has not run `oo boot.fix`
@@ -509,7 +574,8 @@ deliberate (the dash/ash requirement). Its tests live in `test/test.config`
 (T24 PATH idempotency, T31 the OOSH_DIR/CONFIG_PATH constants, T40 POSIX-sh/ash lint,
 T49-T52 the guarantees above, T44
 `OOSH_USER_CONFIG_PATH`, T45 session touch-guard, T47 dash sources a generated
-chain).
+chain, T65-T68 `$HOME` recovery and the fixed-path routes, T70 POSIX-mode bash —
+the macOS `/bin/sh` case).
 
 ## See also
 - [config.md](config.md) — the two config tiers and `config.save` generation
