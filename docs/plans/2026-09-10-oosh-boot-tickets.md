@@ -56,7 +56,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 | 1 | **T4+T5** — `OOSH_DIR` audit + enforce | 🟣 **In Review** | Core boot mechanism. Landed `2045811` + `518e179` (the `CONFIG_PATH` follow-up). Everything below documents or depends on what this settles. |
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 💡 Ideas | Has a live reproducible bug, but its fix needs T4/T5's `OOSH_DIR`+branch semantics. |
 | 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
-| 4 | **T3** — `env -i sh` SAFETY | 💡 Ideas | Verify/close once `boot` is final. |
+| 4 | **T3** — `env -i sh` SAFETY | 🟣 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. |
 | 5 | **T6** — `bootsratp.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the four above settle. |
 
 ---
@@ -226,29 +226,68 @@ first). But a separate `path` script (`path.list`, `path.env`, `path.save`, `pat
 
 ---
 
-### T3 — `env -i sh` SAFETY, shall boot correctly 💡 Ideas
+### T3 — `env -i sh` SAFETY, shall boot correctly 🟣 In Review
 
 > **Card (Ideas #3):** `env -i sh. SAVETY...shall boot correctly`
 
 **Meaning.** Booting from a completely empty environment must work, safely.
 
-**Evidence.** Already passes today:
-```
-env -i HOME=$HOME sh -c '. ~/oosh/boot'
-→ OOSH_DIR, CONFIG_PATH, LOG_LEVEL set; ~/oosh on PATH
-```
-Guarded by `test.config` **T40** (POSIX-sh lint of `boot`) and **T47** (dash sources a *generated*
-`user.env`).
+**Correction to this document (2026-09-14).** An earlier revision of this section claimed T3
+"already passes today". **It did not.** Only the *happy path with `HOME` set* passed. Probing
+`boot` under a bare POSIX shell found two real defects, one of them live in production paths:
 
-**Open question to settle with the user.** What "SAVETY" must additionally cover: no `HOME`?
-corrupt/missing config? ash/busybox? a `boot` that returns non-zero (its last statement is an
-`&&` list — noted in the 2026-09-09 review)?
+**Defect 1 — `boot` returned rc 1 after a completely successful POSIX-sh boot.**
+Its last statement was `[ -n "$BASH_VERSION" ] && type log.session.save … && log.session.save …`.
+Under `sh`/`dash`/`ash` there is no `$BASH_VERSION`, so the `&&` list was false and `boot` exited 1
+with every anchor correctly set. Measured: `dash` 1, `busybox ash` 1, `bash` 0. Five production
+sites branch on that status — `ossh:2530` (`ossh exec`), `ossh:2549` (`ossh exec.tty`) and
+`user:135,156,180` (rootkey pushes) all do
+`[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:$PATH`. On every dash/ash host
+the "boot failed, degrade" branch fired **on success**, making a real failure indistinguishable
+from a healthy boot and duplicating `~/oosh` on PATH.
+
+**Defect 2 — no `HOME` did not merely half-boot, it KILLED the sourcing shell.**
+`$HOME` empty → `OOSH_DIR=/oosh`, `CONFIG_PATH=/config`, then the touch-guard ran
+`: > /.config/oosh/log.session.env`. A redirection failure on a **special builtin** (`:`) is fatal
+under POSIX, so the shell that sourced `boot` died on the spot. `env -i` drops `HOME` unless it is
+passed through, and `env -i` is how the install bootstrap starts.
+
+**Scope agreed with the user (2026-09-14).** In: rc 0 on success; fail fast on no `HOME`;
+busybox **ash** coverage. Out: corrupt/missing config (probe shows it already works — not pinned
+this round); the 8 `|| true` in `macos-test.yml` (review finding **M1**, still deferred); PATH
+*design* (that is T8 — T3 only asserts `~/oosh` ends up on PATH).
+
+**Delivered.**
+- `boot`'s bash-only tail moved into **one `if`**, and the file now ends with a bare `:` — success
+  can never again be reported as failure.
+- New **section 0**: refuse when `$HOME` is unset *or not a directory* (a stale `HOME` produces the
+  same garbage anchors), with one diagnostic on stderr and `return` — never `exit`, because `boot`
+  is sourced and `exit` would close the user's terminal.
+- The five `||` callers needed **no change**: the fix is upstream, and their degrade action is
+  still right for a genuinely absent `boot` (non-dev branches — that is what T49 pins).
+- `docs/boot.md` gains a **Guarantees** section: sourced-only, exit status is a contract,
+  `$HOME` required, proven shells.
 
 **Definition of done.**
-- [ ] Scope of "SAVETY" agreed and written down
-- [ ] Each agreed case has a test
-- [ ] `docs/boot.md` documents the guarantees
-- [ ] Standing verification bar passes
+- [x] Scope of "SAVETY" agreed and written down (above)
+- [x] Each agreed case has a test — `test.config` **T50** (exits 0 in sh/dash/ash/bash),
+      **T51** (refuses without `$HOME`), **T52** (ash really boots); **T40** extended to lint
+      under `ash` as well as `sh`
+- [x] `docs/boot.md` documents the guarantees
+- [x] Standing verification bar passes
+
+**Verification.**
+```bash
+for s in sh dash bash "busybox ash"; do env -i HOME=$HOME $s -c '. ~/oosh/boot'; echo "$s rc=$?"; done
+env -i sh -c '. ~/oosh/boot && echo BOOTED'     # one diagnostic, NO "BOOTED"
+env -i HOME=$HOME busybox ash -c '. ~/oosh/boot; echo "$OOSH_DIR $CONFIG_PATH"'
+./test.suite run config 1 && ./test.suite core 1
+os platform.test ubuntu_24_04                    # exercises ossh exec + the per-user runners
+```
+
+**Follow-ups (not this ticket).** The five `|| export PATH=~/oosh:~/oosh/ng:$PATH` fallbacks are
+not colon-guarded, so a *genuine* failure still duplicates PATH entries. The 8
+`source "$HOME/oosh/boot" … || true` in `macos-test.yml` are now redundant (review **M1**).
 
 ---
 
@@ -293,3 +332,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 | 2026-09-10 | First T4+T5 attempt (`6ada741`) built on the WRONG rule (resolved target); reverted in full (`ba355b7`) and rebuilt on `OOSH_DIR` = the `~/oosh` symlink itself |
 | 2026-09-10 | T4+T5 landed (`2045811`). Follow-up in the same pass: `CONFIG_PATH` put under the same rule; guard generalised to `this.anchor.validate` |
 | 2026-09-10 | `os platform.test ubuntu_24_04` green against both commits (rc=0, zero real failures across all 4 container users) → **T4+T5 moved to In Review** |
+| 2026-09-14 | **T3** taken next at the user's request (out of the original order). Tracker's "already passes today" claim corrected: 2 real defects found and fixed (`boot` rc 1 on success; no-`HOME` killed the sourcing shell). → In Review |

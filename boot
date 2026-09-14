@@ -14,6 +14,25 @@
 # re-sourcing on `exec bash`, mode switches, or nested shells never grows PATH
 # or double-applies anything.
 
+# ── 0. Refuse to half-boot without a usable $HOME ───────────────────────────
+# EVERY anchor below hangs off $HOME. With HOME unset — which is exactly what
+# `env -i` does unless you pass it through — they silently degrade to /oosh and
+# /config, and section 3's touch-guard then runs
+# `: > /.config/oosh/log.session.env`. That is NOT a warning: a redirection
+# failure on a SPECIAL BUILTIN (`:`) is fatal under POSIX, so it killed the very
+# shell that sourced boot. A stale HOME (a removed user, a container that
+# inherited the builder's) is the same class of failure, hence `-d` and not just
+# `-z`. Refuse loudly instead of booting into garbage — or into nothing.
+#
+# `return` (not `exit`): boot is SOURCED into the caller's shell, so `exit`
+# would close the user's terminal. The `|| exit 1` only matters if someone runs
+# boot as a script, which nothing does — see docs/boot.md "Guarantees".
+if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
+  echo "oosh boot: \$HOME is unset or not a directory — cannot anchor ~/oosh and ~/config" >&2
+  echo "oosh boot: set HOME first, e.g. env -i HOME=\"\$HOME\" sh -c '. ~/oosh/boot'" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 # ── 1. Anchors ──────────────────────────────────────────────────────────────
 # OOSH_DIR is ALWAYS ~/oosh (the boss ruling) — the symlink path ITSELF, never
 # its resolved target. That makes it a CONSTANT: switching branches only moves
@@ -73,11 +92,13 @@ if [ -n "$BASH_FILE" ]; then
   unset _oosh_bashdir
 fi
 
-# ── 4. Logging primitives ────────────────────────────────────────────────────
+# ── 4. Logging primitives + per-user session config (bash only) ──────────────
 # Give console.log / info.log / error.log (and the per-user LOG_DEVICE/LOG_LIVE
 # re-anchor) to contexts that never run `this` (CI steps, `ssh exec`). This is
 # the line that used to be generated at the bottom of oosh.env. Idempotent —
-# `this` sources log again later, a no-op the second time.
+# `this` sources log again later, a no-op the second time. Then log.session.save
+# writes LOG_NAME / LOG_DEVICE / LOG_LIVE to the user's private
+# ~/.config/oosh/log.session.env — per-user, no leak into the shared log.env.
 #
 # `log` (like every oosh framework script) uses dotted function names and other
 # bash features, so it can only be sourced INTO a bash shell. Guard on
@@ -85,10 +106,18 @@ fi
 # bootstrap, which re-execs into bash almost immediately) we simply skip it —
 # oosh requires bash 4+ to run anyway. This keeps `boot` sourceable under
 # dash/ash without a "Bad function name" error.
-[ -n "$BASH_VERSION" ] && [ -f "$OOSH_DIR/log" ] && . "$OOSH_DIR/log"
+#
+# ONE `if`, not two `&&` lists: an `&&` list whose first test is false yields
+# status 1, and under sh/dash/ash $BASH_VERSION is ALWAYS empty — which made a
+# perfectly successful POSIX-sh boot exit 1 (see section 5).
+if [ -n "$BASH_VERSION" ]; then
+  [ -f "$OOSH_DIR/log" ] && . "$OOSH_DIR/log"
+  type log.session.save >/dev/null 2>&1 && log.session.save >/dev/null 2>&1
+fi
 
-# ── 5. Materialise the per-user/session log config ───────────────────────────
-# Delegate to log's own method (bash only). This writes LOG_NAME / LOG_DEVICE /
-# LOG_LIVE to the user's private ~/.config/oosh/log.session.env — per-user, no
-# leak into the shared log.env. Once per shell (boot runs once).
-[ -n "$BASH_VERSION" ] && type log.session.save >/dev/null 2>&1 && log.session.save >/dev/null 2>&1
+# ── 5. Exit status ───────────────────────────────────────────────────────────
+# boot succeeded — say so explicitly. Callers BRANCH on this status
+# (`[ -f ~/oosh/boot ] && . ~/oosh/boot || <degrade>` in ossh exec / exec.tty
+# and the user rootkey pushes), so the last statement here must never be a
+# conditional list. `:` is rc 0 in every shell, sourced or executed.
+:

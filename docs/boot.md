@@ -37,6 +37,9 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
 
 ## What it does, in order
 
+0. **Refuse without a usable `$HOME`.** Every anchor below hangs off it, so an
+   unset or stale `HOME` is refused up front rather than half-booted (see
+   [Guarantees](#guarantees)).
 1. **Anchors.** `OOSH_DIR` is always `~/oosh` and `CONFIG_PATH` is always
    `~/config` — the symlink paths *themselves*, never their resolved targets,
    never from `oo.mode.base.get` (see the rule below). `CONFIG_FILE` =
@@ -46,6 +49,7 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
    `log`/`config`/`oo` reference the var, not the literal path.
 3. **Touch-guard** the per-user `log.session.env` so the next step's chain can
    source it even on a first-ever shell (it is written properly in step 6).
+   Its failure used to be *fatal* to the sourcing shell — see [Guarantees](#guarantees).
 4. **Source the config.** Only `user.env` — it chains `. $CONFIG_PATH/oosh.env`
    / `log.env` itself, and `log.env` chains `. $OOSH_USER_CONFIG_PATH/log.session.env`.
    One line stands up the whole environment.
@@ -54,6 +58,9 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
    anchored, so re-sourcing never grows PATH.
 6. **Logging primitives** (bash only): source `log`, then `log.session.save`
    writes the per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` to `log.session.env`.
+   Both live in **one `if`**, not two `&&` lists — see [Guarantees](#guarantees).
+7. **Exit 0.** A bare `:` terminates `boot`, so success is never reported as
+   failure to the callers that branch on its status.
 
 ### The path-anchor rule (and its only exceptions)
 
@@ -161,6 +168,46 @@ literals then delegates the tree sweep to it.
 > A shell opened **before** this change still holds the old resolved `OOSH_DIR` /
 > `CONFIG_PATH`. `source ~/oosh/boot`, or simply a new shell, fixes it.
 
+## Guarantees
+
+The contract `boot` keeps, and that callers may rely on (settled by ticket **T3**,
+"`env -i sh` SAFETY, shall boot correctly"):
+
+| | |
+|---|---|
+| **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
+| **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
+| **Requires `$HOME`** | set, and an existing directory. Otherwise `boot` prints one diagnostic to stderr and `return`s non-zero without touching anything. |
+| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i` with `HOME` passed through. |
+
+### Why the exit status needed fixing
+
+`boot` used to end with
+
+```sh
+[ -n "$BASH_VERSION" ] && type log.session.save … && log.session.save …
+```
+
+Under `sh`/`dash`/`ash` there is no `$BASH_VERSION`, so the `&&` list is false and **`boot`
+returned 1 after a completely successful boot**. Every one of the five `|| <degrade>` callers
+above therefore took its "boot failed" branch *on success*, on every dash/ash host — which both
+made a real failure indistinguishable from a healthy boot and prepended `~/oosh` to PATH a second
+time. The bash-only tail now sits in one `if`, and `boot` ends with a bare `:`.
+
+### Why no-`HOME` needed fixing
+
+Every anchor hangs off `$HOME`, and `env -i` drops it. Unguarded, `OOSH_DIR` became `/oosh` and
+`CONFIG_PATH` `/config` — and then the `log.session.env` touch-guard tried
+`: > /.config/oosh/log.session.env`. **A redirection failure on a special builtin (`:`) is fatal
+under POSIX**, so that did not merely warn: it *killed the shell that sourced `boot`*. Refusing up
+front is both safer and far easier to diagnose.
+
+`return` — not `exit` — precisely because `boot` is sourced: `exit` would close the user's terminal.
+
+> Guarded by `test.config` **T40** (parses under `sh` *and* `ash`), **T50** (exits 0 in every
+> shell), **T51** (refuses without `$HOME`), **T52** (`ash` really boots), alongside **T49**
+> (the boot-absent fallbacks still exist).
+
 ## Idempotent
 
 Safe to source repeatedly (mode switches, `exec bash`, nested shells): PATH
@@ -178,7 +225,8 @@ absent. (Promotion is owned by the release process, not by this work.)
 
 `boot` has no `boot.start`, no `noun.verb` methods, and is POSIX `sh` — that is
 deliberate (the dash/ash requirement). Its tests live in `test/test.config`
-(T24 PATH idempotency, T31 the OOSH_DIR/CONFIG_PATH constants, T40 POSIX-sh lint, T44
+(T24 PATH idempotency, T31 the OOSH_DIR/CONFIG_PATH constants, T40 POSIX-sh/ash lint,
+T49-T52 the guarantees above, T44
 `OOSH_USER_CONFIG_PATH`, T45 session touch-guard, T47 dash sources a generated
 chain).
 
