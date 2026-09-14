@@ -303,7 +303,64 @@ first). But a separate `path` script (`path.list`, `path.env`, `path.save`, `pat
 
 > **Card (Ideas #3):** `env -i sh. SAVETY...shall boot correctly`
 
-**Meaning.** Booting from a completely empty environment must work, safely.
+## Forensics (2026-09-14) — `env -i` is a SHEBANG, not a command
+
+The card was misread all day, in several different ways, before the history settled it. **`env -i`
+was never something you type at a prompt.** It is the shebang `init/oosh` used to carry:
+
+```sh
+#!/usr/bin/env -iS HOME=${HOME} sh
+         ^^         ^^^^^^^^^^^
+         |          passes HOME through
+         start from a CLEAN environment
+```
+
+Wipe the environment, **but keep `HOME`** — because `HOME` is the one thing that cannot be derived
+from nothing. That is the "SAVETY" in the card.
+
+### Where it came from and where it went
+
+| When | Commit | What |
+|---|---|---|
+| **2024-04-07** | `8c277f4`, `815d14d` — *Chris Daßler* | Introduced `#!/usr/bin/env -iS HOME=${HOME} sh` on `init/oosh`, and the `bash` variant on `test/test.tilde`. Message: *"Shebang for clean environment"* |
+| **2026-02-16** | `57f0984` | `env -i` wiped `OOSH_BRANCH` when it was passed as an env-var prefix; fixed by passing the branch as a **positional argument**, which survives the wipe |
+| **2026-03-09** | `075b4a3` | **Removed.** *"Change shebang from `#!/usr/bin/env -iS` to `#!/bin/sh` (BusyBox env doesn't support `-S` flag)"* — Alpine compatibility |
+
+So the guarantee held from **April 2024 to March 2026** and was traded away for Alpine support. A
+real portability constraint, not a mistake — but nothing replaced the guarantee.
+
+| branch | `init/oosh` shebang |
+|---|---|
+| **`main`** (last touched 2026-03-12) | `#!/usr/bin/env -iS HOME=${HOME} sh` — **still has it** |
+| `prod` / `testing` / `dev` | `#!/usr/bin/env sh` |
+
+### The separate question: could a bare shell ever stand up the environment?
+
+Each era's `user.env` was reconstructed from its own `config.save` and **executed**, not read:
+
+| Era | `env -i sh` | `env -i bash` |
+|---|---|---|
+| **main** (≤ Apr 2026) | ✅ works | ✅ works |
+| **prod / testing** (Apr–Sep 2026) | ❌ `Bad substitution` | ✅ works |
+| **dev**, env files alone (since `8b498f4`, 2026-09-08) | ❌ nothing set | ❌ nothing set |
+| **dev**, via `$OOSH_DIR/boot` | ✅ works | ✅ works |
+
+Two findings that matter:
+
+- **prod/testing only ever worked under bash.** Their self-anchor is
+  `: ${CONFIG_PATH:="${BASH_SOURCE[0]%/*}"}`, and `BASH_SOURCE` is a **bashism** — under `sh`/dash
+  it dies with `Bad substitution` before anything is set. "It works in older branches" is true for
+  `bash`; it has never been true for literal `sh`.
+- **main worked under `sh` only because of the defect that was deliberately fixed** — it baked
+  absolute paths (`export PATH=…`, `export OOSH_DIR=/home/x/oosh`) into the *shared* config, which
+  is precisely the cross-user leak the pure-data migration removed.
+
+**So `dev` + `boot` is the first design where a bare POSIX shell comes up correctly without baked-in
+absolute paths.** For this card it is strictly better than prod/testing, not worse. The one
+remaining gap is `HOME`: `env -i` drops it, and `boot` currently refuses rather than deriving it.
+
+**Meaning (restated).** The installer, and any oosh entry point, must survive being started from a
+clean environment — with `HOME` preserved, or derived when it is not.
 
 **Correction to this document (2026-09-14).** An earlier revision of this section claimed T3
 "already passes today". **It did not.** Only the *happy path with `HOME` set* passed. Probing
