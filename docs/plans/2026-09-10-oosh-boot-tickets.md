@@ -151,6 +151,39 @@ or a mid-install sub-shell.
 Not touched: `CONFIG` (`$CONFIG_PATH/$CONFIG_FILE`) simply follows, and
 `OOSH_USER_CONFIG_PATH` was already the literal `$HOME/.config/oosh`.
 
+#### Found while verifying T3 — the error trap was inventing diagnoses (fixed)
+
+Chasing the last two noisy lines in an otherwise clean install log showed that **neither was a
+real failure**. `private.debug.errno` (was a nested `errno()` inside `onError`, `debug:259`)
+mapped any command's exit status through **bash's own shell conventions**:
+
+```
+2)   EXIT 2 Misuse of shell builtins
+126) EACCES 126 Command not executable
+127) ENOENT 127 Command not found
+```
+
+Those meanings hold only when the **shell** could not run the command. A program is free to
+return the same numbers as its own status, and two in this tree do:
+
+| Seen in the log | What really happened |
+|---|---|
+| `"env" … ENOENT 127 Command not found` | the user ran `odocker` inside `env -i sh`, it was not on PATH, `exit` propagated 127 — **`env` itself ran fine** |
+| `"grep" … EXIT 2 Misuse of shell builtins` | `grep` returns 2 for "an error occurred" (e.g. an unreadable file) — nothing to do with builtins |
+
+A third layer: when `python3` was present the fallback translated the exit status through
+**errno** — a third, unrelated numbering system (errno 2 is ENOENT; exit 2 is just 2).
+
+**Fixed.** Every interpretation is now checked before it is offered: 126/127 only when
+`command -v` confirms the command really is missing or non-executable; the `2` gloss and the
+errno lookup are gone; everything else reports an honest `EXIT <n>`. The genuine diagnoses —
+a truly missing command, and signal deaths (128+N, which the *shell* does set) — are unchanged.
+Dropping the errno lookup also takes `python3` out of an ERR-trap path.
+
+`errno()` was defined *inside* `onError`, so it was unreachable until the trap had fired once —
+which is why it had never been tested. It is now `private.debug.errno`, covered by
+`test.debug` **T-ERRNO-NO-FABRICATED-DIAGNOSIS**.
+
 #### Follow-ups found while doing T4+T5 (not fixed here)
 
 - **PATH physical-path rewrite pair** — `mode-env.bash`'s branch-name `sed` and install
@@ -389,3 +422,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 | 2026-09-14 | T3 landed (`a824d8e`); platform test green (rc=0, zero real failures across all 4 container users) |
 | 2026-09-14 | User tested `env -i sh` in a container: a refusal is not a boot. T3 scope corrected — `boot` now DERIVES `$HOME` from the passwd database instead of failing fast; `env -i sh` boots correctly in all four shells |
 | 2026-09-14 | User pointed at the install log's env-file errors. Root cause: the SHARED `log.env` referenced the PER-USER `$OOSH_USER_CONFIG_PATH`, and `user:951` leaked it across users. Shared files now hold only shared data; `boot` sources the per-user file itself |
+| 2026-09-14 | User queried the last two error lines in tmux. Neither was a real failure: the ERR trap's `errno()` glossed propagated exit statuses as "Command not found" / "Misuse of shell builtins". Now verifies before diagnosing; hoisted to `private.debug.errno` and tested |
