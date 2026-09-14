@@ -216,6 +216,90 @@ anchoring prologue and then your *own* config and your *own* `log`, from your *o
 > already a symlink into the same tree. What changed is only that the path now *looks* root-owned.
 > `/etc/oosh/boot` is exactly as trusted as the `dev` group, no more.
 
+### The three recovery routes
+
+`. /etc/oosh/boot` always works, but somebody has to *type* it. Two of the three
+routes below need no typing at all. Measured in a container, and this is the whole
+table — nothing here is aspirational:
+
+| Command | Recovers? | Why |
+|---|---|---|
+| `env -i sh` | **no** | `ENV=[]` — `$ENV` is a non-login POSIX `sh`'s **only** rc hook, and `env -i` is precisely what erased it. There is nothing left to hook. |
+| `env -i ENV=/etc/oosh/boot sh` | **yes** | that same hook, handed back. `$ENV` is `sh`'s `~/.bashrc`. |
+| `env -i sh -l` | **yes** | a login shell reads `/etc/profile`, which loops `/etc/profile.d/*.sh` — and `/etc/profile.d/oosh.sh` is installed alongside the symlink. |
+| `. /etc/oosh/boot` | **yes** | the explicit form. Works in every shell, login or not, with or without the two above. |
+
+**Bare `env -i sh` can never self-recover, and no future change will make it.** A
+non-login POSIX `sh` reads exactly one startup file, the one named by `$ENV`;
+`/etc/profile` is login-only; `~/.bashrc` is bash-only. `env -i` clears the
+environment, so the one hook is gone before the shell starts. Proven with dash's own
+tracing: `env -i sh -lxc ':'` traces through `/etc/profile` (`id -u`,
+`[ 1003 -eq 0 ]`, `PS1=$`, `[ -d /etc/profile.d ]`), while `env -i sh -xc ':'` shows
+only `+ :`. If you have no environment *and* have not typed anything, nothing can run.
+
+#### `/etc/profile.d/oosh.sh` — the login route
+
+Created by the **same** install state `34 root.boot.path.installed` and healed by the
+**same** `oo boot.fix` as `/etc/oosh/boot`; `oo boot.status` reports on both. The `.sh`
+suffix is load-bearing — `/etc/profile`'s glob is `/etc/profile.d/*.sh`, and any other
+name is simply never read.
+
+It is **Linux-only, by fact rather than by choice**: macOS has no `/etc/profile.d` at
+all (its `/etc/profile` runs `path_helper` and sources `/etc/bashrc`, and globs
+nothing), so a file there would never be read. On such a host the drop-in is a
+**graceful skip** — state 34 still succeeds, the symlink is still created, and the
+other two routes are unaffected.
+
+It runs for **every** login shell on the box, including users who have never heard of
+oosh, so it is guarded twice and both guards matter:
+
+```sh
+if [ -r "/etc/oosh/boot" ]; then                      # 1
+  if [ -z "${HOME-}" ] || [ -d "$HOME/oosh" ]; then   # 2
+    . "/etc/oosh/boot"
+  fi
+fi
+:
+```
+
+1. **The target must exist and be readable.** `-r` follows the symlink, so a missing
+   *or dangling* `/etc/oosh/boot` is a silent no-op — never an error at somebody's
+   login prompt.
+2. **The caller must actually have an oosh install** — *unless* `HOME` is unset, which
+   is the `env -i sh -l` recovery case this route exists for, and where `boot` derives
+   `HOME` from the password database itself. Without this guard every non-oosh user on
+   the host would get a nonexistent `$HOME/oosh` prepended to `PATH` **and** an empty
+   `~/.config/oosh` created in their home, just for logging in. The guard lives here
+   rather than in `boot` on purpose: `boot`'s own behaviour is unchanged for all 20
+   existing call sites and for anyone who types `. /etc/oosh/boot` deliberately; what
+   must not regress is the *passive* login of somebody who never asked for oosh.
+
+No `exit` (it would close the login shell), no `return` (not every `/etc/profile`
+sources it from a function), and a trailing `:` so a `boot` that legitimately refuses
+cannot hand a non-zero status to the login shell.
+
+#### `$ENV` — the hand-it-back route
+
+```sh
+env -i ENV=/etc/oosh/boot sh
+```
+
+Two caveats, both measured, both easy to get wrong when quoting this:
+
+- **`$ENV` is honoured by *interactive* shells only.** `env -i ENV=… sh -c '…'` does
+  **not** source it. Do not add a `-c`.
+- **bash under its own name ignores `$ENV` entirely** — it is a POSIX-mode feature
+  there. Invoked as `sh` (the RHEL/Alma `/bin/sh`) bash *does* read `$ENV`, and works,
+  because it enters POSIX mode only **after** the startup file is read, so `boot`'s
+  dotted function names still parse. The one combination that does **not** work is an
+  explicit `bash --posix`: POSIX mode is already active when `$ENV` is read, and bash
+  then rejects every dotted function name in `log`. That combination is not claimed
+  anywhere, and should not be.
+
+Guarded by `test.config` **T68** (the `$ENV` route and both of those negatives) and
+`test.oo` **T9B-PROFILED-\*** (the drop-in's content and guards, against a fixture);
+the deployed files are proved by `test.platform.boot.system.path.invariant`.
+
 **Portable fallbacks**, for a host that has no `/etc/oosh/boot` — a user-rights-only (20-lane)
 install never reaches state 34, and a host installed before this landed has not run `oo boot.fix`
 yet:

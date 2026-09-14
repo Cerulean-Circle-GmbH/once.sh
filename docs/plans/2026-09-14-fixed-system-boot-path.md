@@ -221,3 +221,89 @@ units (which frequently run with no `HOME`) get a stable ABI; and `ossh exec`'s 
    (`init/oosh:351-354`). If neither applies it fails loudly naming what it needed — it must never
    half-succeed.
 5. **A card of its own** — this one. T3 stays In Review.
+
+---
+
+## Follow-on (2026-09-14) — making recovery *automatic*
+
+T9 made `. /etc/oosh/boot` work. You still had to type it. Measured again, in a
+container, and this is the complete set:
+
+| Command | Recovers? | Why |
+|---|---|---|
+| `env -i sh` | **no** | `ENV=[]` — `$ENV` is a non-login POSIX `sh`'s *only* rc hook, and `env -i` is what erased it |
+| `env -i ENV=/etc/oosh/boot sh` | **yes** | that hook, handed back |
+| `env -i sh -l` | **yes**, now | `/etc/profile` loops `/etc/profile.d/*.sh`, and `oosh.sh` now lives there |
+
+Proven with dash's own tracing: `env -i sh -lxc ':'` runs `/etc/profile`
+(`id -u`, `[ 1003 -eq 0 ]`, `PS1=$`, `[ -d /etc/profile.d ]`), while
+`env -i sh -xc ':'` shows only `+ :`.
+
+**Bare `env -i sh` can never self-recover.** There is no hook left. Nothing in
+this ticket, or any future one, changes that — the docs say so explicitly and
+`test.platform.boot.system.path.invariant` asserts the negative so the claim
+cannot quietly rot.
+
+### What landed
+
+`/etc/profile.d/oosh.sh`, written by the **same** `private.oo.boot.path.ensure`
+— hence the same state 34 and the same `oo boot.fix` — as a 4th parameter
+`<profileDir:/etc/profile.d>`. `oo boot.fix` and `oo boot.status` gained the
+matching second parameter (and `oo.parameter.completion.profileDir`).
+`oo boot.status` now reports both host resources.
+
+**macOS is a graceful skip, not a failure.** It has no `/etc/profile.d` at all
+(its `/etc/profile` runs `path_helper` and sources `/etc/bashrc`, globbing
+nothing), so the directory is *not created* and state 34 still passes. This is
+the same shape as the existing warn-and-skip for a branch without `boot`.
+
+### The PATH judgement call — decided: guard in the drop-in
+
+The risk table above already recorded that `boot` on a host where the user never
+installed oosh "sets a nonexistent `OOSH_DIR`… prepends a nonexistent dir to
+PATH… harmless and already true". A host-wide *login* hook makes that reachable
+by everyone on the box, so it had to be decided rather than inherited.
+
+**Chosen: the drop-in guards; `boot` is not changed.** The drop-in sources
+`boot` only when `$HOME/oosh` exists — unless `HOME` is unset, which is the
+`env -i sh -l` case the route exists for and where `boot` derives `HOME`
+itself.
+
+Three reasons:
+
+1. **PATH is not the worst of it.** `boot:97-98` does `mkdir -p
+   "$OOSH_USER_CONFIG_PATH"` and touches `log.session.env`. Sourcing it for
+   every login would create `~/.config/oosh/` in the home directory of every
+   user on the host who has never heard of oosh. A junk PATH entry is
+   invisible; a directory appearing in someone's home is not.
+2. **The blast radius is right.** Guarding in the drop-in changes behaviour for
+   exactly the new thing. Changing `boot`'s PATH block would change all 20
+   existing call sites and every `. /etc/oosh/boot` typed by hand — for the
+   most heavily pinned file in the tree, to fix a problem none of those callers
+   have (they *are* oosh users).
+3. **`boot` cannot make the distinction cheaply anyway.** The predicate is "does
+   this caller have an install", and a `[ -d "$OOSH_DIR" ]` guard inside `boot`
+   would also skip the PATH setup during install, before `~/oosh` exists —
+   a call-path audit for no gain.
+
+What is *not* claimed: a deliberate `. /etc/oosh/boot` by a non-oosh user still
+behaves exactly as it did before. That is an explicit act, and unchanged
+behaviour, not a regression.
+
+### Tests
+
+Same split as T9. **Core** proves the mechanism against fixtures:
+`test.oo` **T9B-PROFILED-\*** (creation, `.sh` glob, mode 644, macOS skip,
+POSIX + bashism lint, the two guards behaviourally, idempotence, status
+reporting) and `test.config` **T68** (the `$ENV` route in `sh`/`dash`/`busybox
+ash`/bash-as-`sh`, plus both negatives). **Platform** proves the deployment:
+`test.platform.boot.system.path.invariant` gains INVARIANT-5 (the deployed
+drop-in, its glob, its content, its lint, and `env -i sh -l` recovering for
+*this* user) and INVARIANT-6 (the `$ENV` route, and the pinned negative that
+bare `env -i sh` does not).
+
+Two caveats measured rather than assumed, and documented: `$ENV` is honoured by
+**interactive** shells only (`sh -c` ignores it), and bash honours `$ENV` only
+when invoked as `sh` — never under its own name, and an explicit `bash --posix`
+is the one combination that breaks, because POSIX mode is already active when
+`$ENV` is read and bash then rejects every dotted function name in `log`.
