@@ -274,7 +274,10 @@ this round); the 8 `|| true` in `macos-test.yml` (review finding **M1**, still d
       **T51** (refuses without `$HOME`), **T52** (ash really boots); **T40** extended to lint
       under `ash` as well as `sh`
 - [x] `docs/boot.md` documents the guarantees
-- [x] Standing verification bar passes
+- [x] Standing verification bar passes — host `test.suite core 1` 626/625/1 intentional;
+      `os platform.test ubuntu_24_04` **rc=0**, in-container core 631/630/1, every `✗ FAIL`
+      being that same intentional meta-test once per container user. After a real fresh install
+      all four users passed T40, T50, T51 and T52.
 
 **Verification.**
 ```bash
@@ -333,3 +336,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 | 2026-09-10 | T4+T5 landed (`2045811`). Follow-up in the same pass: `CONFIG_PATH` put under the same rule; guard generalised to `this.anchor.validate` |
 | 2026-09-10 | `os platform.test ubuntu_24_04` green against both commits (rc=0, zero real failures across all 4 container users) → **T4+T5 moved to In Review** |
 | 2026-09-14 | **T3** taken next at the user's request (out of the original order). Tracker's "already passes today" claim corrected: 2 real defects found and fixed (`boot` rc 1 on success; no-`HOME` killed the sourcing shell). → In Review |
+| 2026-09-14 | T3 landed (`a824d8e`); platform test green (rc=0, zero real failures across all 4 container users) |
