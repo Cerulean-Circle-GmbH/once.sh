@@ -177,8 +177,8 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 |---|---|
 | **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
-| **Requires `$HOME`** | set, and an existing directory. Otherwise `boot` prints one diagnostic to stderr and `return`s non-zero without touching anything. |
-| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i` with `HOME` passed through. |
+| **Recovers `$HOME`** | `env -i` drops it, so `boot` looks it up in the password database (`getent` → `dscl` → `/etc/passwd`) and exports it — which is what makes `env -i sh` boot correctly. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
+| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i`, with or without `HOME`. |
 
 ### Why the exit status needed fixing
 
@@ -199,14 +199,69 @@ time. The bash-only tail now sits in one `if`, and `boot` ends with a bare `:`.
 Every anchor hangs off `$HOME`, and `env -i` drops it. Unguarded, `OOSH_DIR` became `/oosh` and
 `CONFIG_PATH` `/config` — and then the `log.session.env` touch-guard tried
 `: > /.config/oosh/log.session.env`. **A redirection failure on a special builtin (`:`) is fatal
-under POSIX**, so that did not merely warn: it *killed the shell that sourced `boot`*. Refusing up
-front is both safer and far easier to diagnose.
+under POSIX**, so that did not merely warn: it *killed the shell that sourced `boot`*.
+
+An earlier fix refused up front when `$HOME` was missing. That was safe but not sufficient: the
+card asks that `env -i sh` **boot correctly**, not that it fail cleanly. So `boot` now recovers
+first — `id -un`, then `getent passwd` → `dscl` (macOS) → `/etc/passwd` — and only refuses when no
+home can be derived at all. Refusal is still a real outcome, just a much rarer one.
 
 `return` — not `exit` — precisely because `boot` is sourced: `exit` would close the user's terminal.
+`init/oosh` is *executed*, so its copy of the same block ends in `exit 1` instead. That is the only
+behavioural difference between the two.
 
 > Guarded by `test.config` **T40** (parses under `sh` *and* `ash`), **T50** (exits 0 in every
-> shell), **T51** (refuses without `$HOME`), **T52** (`ash` really boots), alongside **T49**
-> (the boot-absent fallbacks still exist).
+> shell), **T51** (refuses when no home is derivable), **T52** (`ash` really boots), **T65**
+> (recovery across `sh`/`dash`/`bash`/`busybox ash`, stale `HOME`, and a good `HOME` left alone),
+> alongside **T49** (the boot-absent fallbacks still exist).
+
+### The other half of T3: `init/oosh` re-execs clean
+
+`boot` recovering `$HOME` makes `env -i sh` *survivable*. The guarantee that the installer runs in
+a clean environment is a separate thing, and it used to come from a shebang:
+
+```sh
+#!/usr/bin/env -iS HOME=${HOME} sh     # 2024-04-07 (8c277f4) … 2026-03-09 (075b4a3)
+```
+
+`075b4a3` removed it for Alpine — BusyBox `env` has no `-S` — and nothing replaced it. `init/oosh`
+now re-establishes it itself, immediately after the branch default:
+
+```sh
+if [ -z "$OOSH_CLEAN_ENV" ] && [ -f "$0" ]; then
+  exec env -i HOME="$HOME" OOSH_CLEAN_ENV=1 … "$0" "$@"
+fi
+```
+
+`-S` existed only because a *shebang* can pass a single argument; doing it inside the script lifts
+that constraint. BusyBox rejects `env -S` but accepts `env -i VAR=val cmd`, so this is portable.
+`$0` is a readable file only when the script is executed — in the curl-pipe path `$0` is `sh` and
+there is nothing to re-exec, so that path skips. `OOSH_CLEAN_ENV` makes it fire exactly once.
+
+**Placement is load-bearing.** It must come *after* `: ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}`: `env -i`
+wipes `OOSH_SELF_BRANCH`, which is not carried, so re-execing any earlier silently resolves the
+branch to `dev` and discards a caller's override.
+
+**Anything the installer reads but never sets must be named in the carry list.** `init/oosh` was
+rewritten three times (`b8b90b8`, `b427809`, `0594657`) during the two years the guarantee was
+absent, so no part of the current file had ever run under `env -i`; two variables had grown a
+dependency on inheritance:
+
+| Carried | Why |
+|---|---|
+| `HOME` | every anchor hangs off it |
+| `OOSH_BRANCH` | the caller's branch choice |
+| `OOSH_NO_AUTORUN` | sourcing/test guard |
+| `SUDO_USER` | `sudo ./init/oosh` would otherwise lose the invoker, and the post-install `user oosh.install "$SUDO_USER"` silently never runs |
+| `OOSH_REPO` | a fork or private-repo override would otherwise fall back to public GitHub with no error |
+
+Deliberately *not* carried: `PATH` (re-derived; on macOS this costs a redundant Homebrew probe that
+self-heals), `BASH_FILE` and `SUDO` (recomputed, more correctly, from scratch), and
+`INSTALL_LOG`/`OOSH_APT_UPDATED` (set downstream of the re-exec, so nothing is lost).
+
+> Guarded by `test.install` **T-INIT-HOME-RECOVERY**, **T-INIT-CLEAN-ENV** (re-exec present,
+> guarded, and no `env -S`) and **T-INIT-CLEAN-ENV-CARRY** (`SUDO_USER` and `OOSH_REPO` actually
+> cross the re-exec).
 
 ## Idempotent
 

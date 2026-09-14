@@ -56,7 +56,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 | 1 | **T4+T5** — `OOSH_DIR` audit + enforce | 🟣 **In Review** | Core boot mechanism. Landed `2045811` + `518e179` (the `CONFIG_PATH` follow-up). Everything below documents or depends on what this settles. |
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 💡 Ideas | Has a live reproducible bug, but its fix needs T4/T5's `OOSH_DIR`+branch semantics. |
 | 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
-| 4 | **T3** — `env -i sh` SAFETY | 💡 **Ideas** (partly delivered) | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. |
+| 4 | **T3** — `env -i sh` SAFETY | 🔍 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. Second attempt delivered `boot` + `init/oosh` recovery and the clean re-exec. |
 | 5 | **T6** — `bootsratp.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the four above settle. |
 
 ---
@@ -299,7 +299,7 @@ first). But a separate `path` script (`path.list`, `path.env`, `path.save`, `pat
 
 ---
 
-### T3 — `env -i sh` SAFETY, shall boot correctly 💡 Ideas (partly delivered, rest reverted)
+### T3 — `env -i sh` SAFETY, shall boot correctly 🔍 In Review (second attempt, 2026-09-14)
 
 > **Card (Ideas #3):** `env -i sh. SAVETY...shall boot correctly`
 
@@ -455,15 +455,52 @@ mode. The design for those is written up in full and was not found to be wrong.
 - `docs/boot.md` gains a **Guarantees** section: sourced-only, exit status is a contract,
   `$HOME` required, proven shells.
 
+**Delivered (2026-09-14, second attempt).** `boot` and `init/oosh` both recover `$HOME`;
+`init/oosh` re-execs clean without `env -S`. The guarantee `075b4a3` removed for Alpine is
+restored portably — see
+[the design spec](../superpowers/specs/2026-09-14-clean-environment-guarantee-design.md) and
+[the plan](../superpowers/plans/2026-09-14-clean-environment-guarantee.md).
+
+Commits: `80b6257` (`boot` recovers `$HOME`), `78957c7` (`init/oosh` recovers `$HOME`),
+`dc3bbcb` (clean re-exec), `47f0a8b` (carry `SUDO_USER` + `OOSH_REPO`), `a886203` (comment).
+
+**The finding that made this more than a restore.** `init/oosh` was rewritten three times
+(`b8b90b8`, `b427809`, `0594657`) during the two years the shebang was absent: **594 of its 601
+lines postdate `075b4a3`**, the other 7 being blank lines and bare `fi`s. So "we are only putting
+back what used to be there" was false — effectively the whole current file was meeting `env -i`
+for the first time. An audit of every variable the installer *reads but never sets* found two that
+had grown a dependency on inheritance and would have broken silently:
+
+| Variable | Silent failure if not carried |
+|---|---|
+| `SUDO_USER` | `sudo ./init/oosh` loses the invoker; the post-install `user oosh.install "$SUDO_USER"` never runs, so the invoker simply does not get oosh |
+| `OOSH_REPO` | a fork or private-repo override falls back to public GitHub, with no error |
+
+Both are now carried. `PATH` is deliberately not: it is re-derived, and the macOS cost (a redundant
+Homebrew probe) self-heals via `brew shellenv`. **Anything added later that reads an inherited
+variable must be added to the carry list** — the list and its rationale sit at the call site.
+
+Two fossils confirmed by the audit: `ossh:518` already passes the branch as an argument *"not env
+var — init/oosh shebang uses env -i which wipes environment"*, dead since March and true again now;
+and `Install oosh.command:20` sets `OOSH_SELF_BRANCH` **unexported**, so it never crossed anyway.
+
 **Definition of done.**
 - [x] Scope of "SAVETY" agreed and written down (above) — **and corrected twice by the user's own testing**: `env -i` means env INITIATE, i.e. RECOVERY of a broken box; see [the design spec](../superpowers/specs/2026-09-14-oosh-recovery-from-bare-shell-design.md)
-- [ ] Each agreed case has a test — `test.config` **T50** (exits 0 in sh/dash/ash/bash),
-      **T51** (`env -i <sh>` really boots, deriving `$HOME`), **T52** (ash really boots),
-      **T53** (refuses when no home can be derived), **T45**/**T46** (shared files carry no
-      per-user reference; `boot` loads the per-user values itself), **T54** (cross-user dispatch
-      unsets the per-user anchor); **T40** extended to lint under `ash` as well as `sh`.
-      Every new guard was proven able to FAIL first, against deliberately broken copies.
-- [ ] `docs/boot.md` documents the guarantees
+- [x] Each agreed case has a test. In `test.config`: **T40** (lints under `sh` *and* `ash`),
+      **T50** (exits 0 in sh/dash/ash/bash), **T51** (refuses when no home is derivable),
+      **T52** (ash really boots), **T65** (recovery across all four shells, a *stale* `HOME`,
+      a good `HOME` left untouched, and the sourcing shell surviving). In `test.install`:
+      **T-INIT-HOME-RECOVERY** (recovery precedes the first `$HOME` use),
+      **T-INIT-CLEAN-ENV** (re-exec present, guarded, and no `env -S`) and
+      **T-INIT-CLEAN-ENV-CARRY** (`SUDO_USER` and `OOSH_REPO` really cross the re-exec).
+      Every new guard was proven able to FAIL first, against deliberately broken copies —
+      and that discipline paid: it caught a plan-specified assertion that could never fail,
+      because an unanchored `grep` for `[ -f "$0" ]` matched a pre-existing line elsewhere
+      in `init/oosh`. See [tests that cannot fail](2026-09-14-tests-that-cannot-fail.md).
+      *(T53/T54 from the first, reverted attempt do not exist; this list replaces them.)*
+- [x] `docs/boot.md` documents the guarantees — the **Guarantees** table (`$HOME` is now
+      *recovered*, not merely required) plus a section covering the `init/oosh` half: the
+      re-exec, why placement after the branch default is load-bearing, and the carry list
 - [ ] Standing verification bar passes — host `test.suite core 1` 626/625/1 intentional;
       `os platform.test ubuntu_24_04` **rc=0**, in-container core 631/630/1, every `✗ FAIL`
       being that same intentional meta-test once per container user. After a real fresh install
@@ -575,5 +612,6 @@ never existed.
 | 2026-09-14 | The card finally read correctly — `env -i` is **env initiate**, and it means RECOVERY. `config.env.init` + `boot` restore mode landed; `env -i sh <tree>/boot` brings a wrecked box back |
 | 2026-09-14 | **Reverted to `a824d8e`** after an unexplained WODA regression in the container. Knowledge kept, code rolled back — see §4d |
 | 2026-09-14 | User tested `env -i sh` in a container: a refusal is not a boot. T3 scope corrected — `boot` now DERIVES `$HOME` from the passwd database instead of failing fast; `env -i sh` boots correctly in all four shells |
+| 2026-09-14 | T3 **second attempt**: `boot` + `init/oosh` recover `$HOME`; `init/oosh` re-execs clean without `env -S`, restoring the guarantee `075b4a3` traded away for Alpine. Audit found 594/601 lines of `init/oosh` postdate the shebang removal, and two read-but-never-set variables (`SUDO_USER`, `OOSH_REPO`) that `env -i` would have destroyed silently — both now carried. → In Review, pending the platform test |
 | 2026-09-14 | User pointed at the install log's env-file errors. Root cause: the SHARED `log.env` referenced the PER-USER `$OOSH_USER_CONFIG_PATH`, and `user:951` leaked it across users. Shared files now hold only shared data; `boot` sources the per-user file itself |
 | 2026-09-14 | User queried the last two error lines in tmux. Neither was a real failure: the ERR trap's `errno()` glossed propagated exit statuses as "Command not found" / "Misuse of shell builtins". Now verifies before diagnosing; hoisted to `private.debug.errno` and tested |
