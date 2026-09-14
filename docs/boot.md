@@ -47,12 +47,16 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
 2. **`OOSH_USER_CONFIG_PATH`** = `~/.config/oosh` — the per-user (non-shared)
    config dir (see [config.md § two tiers](config.md)). Single source of truth;
    `log`/`config`/`oo` reference the var, not the literal path.
-3. **Touch-guard** the per-user `log.session.env` so the next step's chain can
-   source it even on a first-ever shell (it is written properly in step 6).
-   Its failure used to be *fatal* to the sourcing shell — see [Guarantees](#guarantees).
-4. **Source the config.** Only `user.env` — it chains `. $CONFIG_PATH/oosh.env`
-   / `log.env` itself, and `log.env` chains `. $OOSH_USER_CONFIG_PATH/log.session.env`.
-   One line stands up the whole environment.
+3. **Source the shared config.** Only `user.env` — it chains
+   `. $CONFIG_PATH/oosh.env` / `log.env` itself. One line stands up the whole
+   shared environment.
+4. **Source the per-user session file** (`$OOSH_USER_CONFIG_PATH/log.session.env`)
+   directly, *after* the shared chain so per-user `LOG_*` win. The **shared**
+   `log.env` deliberately does *not* chain it — a shared file referencing a
+   per-user variable is what produced the cross-user
+   `…/root/.config/oosh/log.session.env: Permission denied` failures. The old
+   touch-guard that made that chain safe is gone with it — and with it the `:`
+   redirection that could kill the sourcing shell.
 5. **PATH.** Put `$OOSH_DIR` and `$OOSH_DIR/ng` on PATH (and `$BASH_FILE`'s dir
    first, so brew bash wins over path_helper's `/bin/bash` on macOS). Colon-
    anchored, so re-sourcing never grows PATH.

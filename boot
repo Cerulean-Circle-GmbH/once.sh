@@ -80,13 +80,6 @@ export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
 # the user's own. log/config/oo reference $OOSH_USER_CONFIG_PATH, not the literal.
 export OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"
 
-# Ensure the per-user log session file exists BEFORE user.env's chain sources it
-# (log.env ends with `source $OOSH_USER_CONFIG_PATH/log.session.env`). It is
-# populated properly by log.session.save further down; this just prevents a
-# "No such file" error on the very first shell, before it has ever been written.
-mkdir -p "$OOSH_USER_CONFIG_PATH" 2>/dev/null
-[ -f "$OOSH_USER_CONFIG_PATH/log.session.env" ] || : > "$OOSH_USER_CONFIG_PATH/log.session.env"
-
 # ── 2. Source the config ─────────────────────────────────────────────────────
 # Source ONLY user.env — it chains `source $CONFIG_PATH/oosh.env` /
 # `log.env` itself (config.add appends those), so this one line stands up the
@@ -94,6 +87,21 @@ mkdir -p "$OOSH_USER_CONFIG_PATH" 2>/dev/null
 # already set above, so the chain resolves. Guarded: a missing file on a
 # fresh/partial install is a silent no-op, not an error.
 [ -f "$CONFIG_PATH/user.env" ] && . "$CONFIG_PATH/user.env"
+
+# ── 2b. Source the PER-USER session file ─────────────────────────────────────
+# LOG_NAME / LOG_DEVICE / LOG_LIVE are per-user, so they live in the user's OWN
+# $OOSH_USER_CONFIG_PATH, never in the shared config. boot sources that file
+# HERE, directly — the SHARED log.env does NOT chain it.
+#
+# It used to: config.save appended `. $OOSH_USER_CONFIG_PATH/log.session.env` to
+# the shared log.env. That put a PER-USER reference inside a SHARED file, and a
+# cross-user sub-shell that inherited someone else's OOSH_USER_CONFIG_PATH then
+# resolved it to THEIR directory — "/root/.config/oosh/log.session.env:
+# Permission denied" all over the install log. Shared files now hold only shared
+# data, so that whole class of breakage is gone. (Old installs may still carry
+# the stale line; it is harmless — pure data, sourced twice at worst — and the
+# next `config save` regenerates log.env without it.)
+[ -f "$OOSH_USER_CONFIG_PATH/log.session.env" ] && . "$OOSH_USER_CONFIG_PATH/log.session.env"
 
 # ── 3. PATH ──────────────────────────────────────────────────────────────────
 # Ensure OOSH_DIR and OOSH_DIR/ng are on PATH so oo/os/ossh/config/this/c2/…

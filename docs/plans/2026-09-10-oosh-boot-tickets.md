@@ -266,6 +266,39 @@ Refusal is kept only for when no home can be found at all. Out: corrupt/missing 
 this round); the 8 `|| true` in `macos-test.yml` (review finding **M1**, still deferred); PATH
 *design* (that is T8 — T3 only asserts `~/oosh` ends up on PATH).
 
+**Second scope correction (2026-09-14), again from the user's own testing.** Running the
+platform test again, the user pointed at the install log — *"still the same … what this needs to
+do is fix all the env files as simple as this"*. The remaining noise was:
+
+```
+/home/test/config/log.env:       line 3: /root/.config/oosh/log.session.env: Permission denied
+/home/developking/config/log.env: line 2: /root/.config/oosh/log.session.env: Permission denied
+/home/bash-user/config/log.env:  line 3: /root/.config/oosh/log.session.env: Permission denied
+```
+
+**Root cause — a SHARED file referencing a PER-USER variable.** `config.save` appended
+`. $OOSH_USER_CONFIG_PATH/log.session.env` to the shared `log.env`. That variable is *exported*
+and per-user, so any cross-user sub-shell that inherited the caller's value resolved the line to
+**their** directory. `user:951` reset `CONFIG CONFIG_PATH CONFIG_FILE` before running as another
+user but had **not** been updated to reset `OOSH_USER_CONFIG_PATH` — it was added to
+`config.save`'s persistence deny-list when the per-user tier was introduced, and this `unset` list
+was missed.
+
+**Fixed structurally, not patched.** Shared files now hold only shared data:
+- `config.save` no longer appends that line — a freshly generated `log.env` is two `export LOG_*`
+  lines and nothing else.
+- `boot` sources `$OOSH_USER_CONFIG_PATH/log.session.env` itself (new **section 2b**), *after* the
+  shared chain so per-user values still win.
+- `boot`'s old touch-guard is gone with it — and with it the `:` redirection that could kill the
+  sourcing shell (the same POSIX special-builtin hazard as Defect 2).
+- `user:951` now unsets `OOSH_USER_CONFIG_PATH` too, so the leak cannot recur by another route.
+- Stale `log.env` files on existing installs keep the old line harmlessly (pure data, sourced
+  twice at worst) and lose it at the next `config save`.
+
+*Out of scope, recorded:* `result.env` uses bare `declare -x` (which `config.validate` already
+calls INVALID) and `setup.color.env` uses the bashism `ESC=$'\e['`. Neither is in `boot`'s chain;
+the user chose not to fix them this round.
+
 **Delivered.**
 - `boot`'s bash-only tail moved into **one `if`**, and the file now ends with a bare `:` — success
   can never again be reported as failure.
@@ -286,9 +319,10 @@ this round); the 8 `|| true` in `macos-test.yml` (review finding **M1**, still d
 - [x] Scope of "SAVETY" agreed and written down (above)
 - [x] Each agreed case has a test — `test.config` **T50** (exits 0 in sh/dash/ash/bash),
       **T51** (`env -i <sh>` really boots, deriving `$HOME`), **T52** (ash really boots),
-      **T53** (refuses when no home can be derived); **T40** extended to lint under `ash`
-      as well as `sh`. T51 and T53 were both proven able to FAIL first, against deliberately
-      broken copies of `boot`.
+      **T53** (refuses when no home can be derived), **T45**/**T46** (shared files carry no
+      per-user reference; `boot` loads the per-user values itself), **T54** (cross-user dispatch
+      unsets the per-user anchor); **T40** extended to lint under `ash` as well as `sh`.
+      Every new guard was proven able to FAIL first, against deliberately broken copies.
 - [x] `docs/boot.md` documents the guarantees
 - [x] Standing verification bar passes — host `test.suite core 1` 626/625/1 intentional;
       `os platform.test ubuntu_24_04` **rc=0**, in-container core 631/630/1, every `✗ FAIL`
@@ -354,3 +388,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 | 2026-09-14 | **T3** taken next at the user's request (out of the original order). Tracker's "already passes today" claim corrected: 2 real defects found and fixed (`boot` rc 1 on success; no-`HOME` killed the sourcing shell). → In Review |
 | 2026-09-14 | T3 landed (`a824d8e`); platform test green (rc=0, zero real failures across all 4 container users) |
 | 2026-09-14 | User tested `env -i sh` in a container: a refusal is not a boot. T3 scope corrected — `boot` now DERIVES `$HOME` from the passwd database instead of failing fast; `env -i sh` boots correctly in all four shells |
+| 2026-09-14 | User pointed at the install log's env-file errors. Root cause: the SHARED `log.env` referenced the PER-USER `$OOSH_USER_CONFIG_PATH`, and `user:951` leaked it across users. Shared files now hold only shared data; `boot` sources the per-user file itself |
