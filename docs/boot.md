@@ -177,8 +177,40 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 |---|---|
 | **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
-| **Recovers `$HOME`** | `env -i` drops it, so `boot` looks it up in the password database (`getent` → `dscl` → `/etc/passwd`) and exports it — which is what makes `env -i sh` boot correctly. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
-| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i`, with or without `HOME`. |
+| **Recovers `$HOME`** | `env -i` drops it, so `boot` looks it up in the password database (`getent` → `dscl` → `/etc/passwd`) and exports it — which is what lets `env -i sh` boot correctly *once `boot` is reached*. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
+| **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i`, with or without `HOME`, **when sourced by absolute path**. See the caveat below: with `HOME` unset, `~` is not a path a POSIX shell can resolve. |
+
+### The tilde caveat — reaching `boot` is not the same as running it
+
+`boot` recovers `$HOME`. It cannot help you *find* it, because the shell must resolve the path
+before `boot` gets to run. Measured in a container:
+
+| Under `env -i` | Result |
+|---|---|
+| `sh` → `. ~/oosh/boot` | **fails** — `sh: .: cannot open ~/oosh/boot: No such file` |
+| `sh` → `. /home/you/oosh/boot` | `rc=0`, all three anchors recovered |
+| `bash` → `. ~/oosh/boot` | `rc=0` |
+
+With `HOME` unset, `~` is undefined behaviour in POSIX and dash/ash leave it **literal**; bash
+falls back to the password database and expands it anyway. So the `. ~/oosh/boot` form given in
+the table above — correct for everyday use, and what all 20 call sites use — is exactly the form
+that cannot work in the empty-environment case `boot` exists to survive. Chicken-and-egg: the
+thing that would recover `HOME` sits behind a path that needs `HOME`.
+
+Until a fixed absolute path exists (see below), the recovery forms that work in every shell are:
+
+```sh
+. /home/you/oosh/boot                                        # if you know your home
+. "$(getent passwd "$(id -un)" | head -1 | cut -d: -f6)/oosh/boot"   # if you don't
+```
+
+`getent` is Linux/NSS; on macOS use `dscl . -read /Users/$(id -un) NFSHomeDirectory`, or just use
+`bash`, which is the system shell there anyway.
+
+> **Open:** a fixed, well-known absolute path (`. /etc/oosh/boot` or similar) would collapse all of
+> this to one memorable command that works for any user in any shell with no environment at all.
+> `boot` already derives `HOME` per-caller, so one system path can serve every user on the box.
+> Under design — it touches the install state machine, so it is not a drive-by change.
 
 ### Why the exit status needed fixing
 
