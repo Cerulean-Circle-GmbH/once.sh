@@ -37,9 +37,9 @@ bash 4+ to actually run; the `env -i sh` bootstrap re-execs into bash immediatel
 
 ## What it does, in order
 
-0. **Refuse without a usable `$HOME`.** Every anchor below hangs off it, so an
-   unset or stale `HOME` is refused up front rather than half-booted (see
-   [Guarantees](#guarantees)).
+0. **Settle `$HOME`.** Every anchor below hangs off it, and `env -i` drops it —
+   so an unset or stale `HOME` is *derived* from the password database rather
+   than half-booted (see [Guarantees](#guarantees)).
 1. **Anchors.** `OOSH_DIR` is always `~/oosh` and `CONFIG_PATH` is always
    `~/config` — the symlink paths *themselves*, never their resolved targets,
    never from `oo.mode.base.get` (see the rule below). `CONFIG_FILE` =
@@ -177,7 +177,7 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 |---|---|
 | **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
-| **Requires `$HOME`** | set, and an existing directory. Otherwise `boot` prints one diagnostic to stderr and `return`s non-zero without touching anything. |
+| **Derives `$HOME` when it has to** | `env -i` drops `HOME`, so `boot` looks it up in the password database and exports it — which is what makes `env -i sh` boot correctly. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
 | **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i` with `HOME` passed through. |
 
 ### Why the exit status needed fixing
@@ -194,19 +194,32 @@ above therefore took its "boot failed" branch *on success*, on every dash/ash ho
 made a real failure indistinguishable from a healthy boot and prepended `~/oosh` to PATH a second
 time. The bash-only tail now sits in one `if`, and `boot` ends with a bare `:`.
 
-### Why no-`HOME` needed fixing
+### Why `$HOME` is derived, not demanded
 
-Every anchor hangs off `$HOME`, and `env -i` drops it. Unguarded, `OOSH_DIR` became `/oosh` and
-`CONFIG_PATH` `/config` — and then the `log.session.env` touch-guard tried
-`: > /.config/oosh/log.session.env`. **A redirection failure on a special builtin (`:`) is fatal
-under POSIX**, so that did not merely warn: it *killed the shell that sourced `boot`*. Refusing up
-front is both safer and far easier to diagnose.
+The card is *"`env i sh`. SAVETY…**shall boot correctly**"*, and `env -i` drops `HOME`. Every
+anchor hangs off it, so unguarded, `OOSH_DIR` became `/oosh` and `CONFIG_PATH` `/config` — and
+then step 3's touch-guard ran `: > /.config/oosh/log.session.env`. That is **not** a warning: a
+redirection failure on a **special builtin** (`:`) is fatal under POSIX, so it killed the very
+shell that sourced `boot`. On an interactive login that is a closed terminal.
 
-`return` — not `exit` — precisely because `boot` is sourced: `exit` would close the user's terminal.
+Refusing would have been safe but would not satisfy the card. So `boot` derives instead —
+precisely what bash itself already does for `~` when `HOME` is unset (which is why
+`env -i bash -c '. ~/oosh/boot'` could find the file at all while `env -i sh` could not). The
+lookup is the same three-way split the rest of the tree uses (`this:126-134`):
+
+| Order | Source | Where |
+|---|---|---|
+| 1 | `getent passwd "$(id -un)"` | Linux / NSS |
+| 2 | `dscl . -read /Users/<user> NFSHomeDirectory` | macOS — takes the **first** of the two paths it returns for `root` |
+| 3 | `/etc/passwd` via `awk` | minimal images with neither |
+
+Only when all three come up empty does `boot` refuse — and by `return`, never `exit`, because
+`boot` is sourced and `exit` would close the user's terminal.
 
 > Guarded by `test.config` **T40** (parses under `sh` *and* `ash`), **T50** (exits 0 in every
-> shell), **T51** (refuses without `$HOME`), **T52** (`ash` really boots), alongside **T49**
-> (the boot-absent fallbacks still exist).
+> shell), **T51** (`env -i <sh>` really boots, deriving `$HOME`), **T52** (`ash` really boots),
+> **T53** (refuses when no home can be derived), alongside **T49** (the boot-absent fallbacks
+> still exist).
 
 ## Idempotent
 
@@ -226,7 +239,7 @@ absent. (Promotion is owned by the release process, not by this work.)
 `boot` has no `boot.start`, no `noun.verb` methods, and is POSIX `sh` — that is
 deliberate (the dash/ash requirement). Its tests live in `test/test.config`
 (T24 PATH idempotency, T31 the OOSH_DIR/CONFIG_PATH constants, T40 POSIX-sh/ash lint,
-T49-T52 the guarantees above, T44
+T49-T53 the guarantees above, T44
 `OOSH_USER_CONFIG_PATH`, T45 session touch-guard, T47 dash sources a generated
 chain).
 

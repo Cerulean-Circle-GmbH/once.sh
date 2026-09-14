@@ -252,17 +252,31 @@ from a healthy boot and duplicating `~/oosh` on PATH.
 under POSIX, so the shell that sourced `boot` died on the spot. `env -i` drops `HOME` unless it is
 passed through, and `env -i` is how the install bootstrap starts.
 
-**Scope agreed with the user (2026-09-14).** In: rc 0 on success; fail fast on no `HOME`;
-busybox **ash** coverage. Out: corrupt/missing config (probe shows it already works — not pinned
+**Scope agreed with the user (2026-09-14).** In: rc 0 on success; no-`HOME` handling;
+busybox **ash** coverage.
+
+**Scope corrected mid-ticket (2026-09-14), after the user tested it.** The first cut made `boot`
+*fail fast* on a missing `HOME`. The user then ran `env -i sh` in a platform-test container and
+reported "it is not working" — correctly. Failing fast is safe, but the card says
+**"shall boot correctly"**, and a refusal is not a boot. (My scope question had framed this as a
+safety choice; that framing was wrong.) `boot` now **derives** `$HOME` from the password database
+instead — exactly what bash itself does for `~` when `HOME` is unset, which is why
+`env -i bash` could reach `boot` at all while `env -i sh` could not even resolve `~/oosh/boot`.
+Refusal is kept only for when no home can be found at all. Out: corrupt/missing config (probe shows it already works — not pinned
 this round); the 8 `|| true` in `macos-test.yml` (review finding **M1**, still deferred); PATH
 *design* (that is T8 — T3 only asserts `~/oosh` ends up on PATH).
 
 **Delivered.**
 - `boot`'s bash-only tail moved into **one `if`**, and the file now ends with a bare `:` — success
   can never again be reported as failure.
-- New **section 0**: refuse when `$HOME` is unset *or not a directory* (a stale `HOME` produces the
-  same garbage anchors), with one diagnostic on stderr and `return` — never `exit`, because `boot`
-  is sourced and `exit` would close the user's terminal.
+- New **section 0**: when `$HOME` is unset *or not a directory* (a stale `HOME` produces the same
+  garbage anchors), derive it — `getent` (Linux/NSS) → `dscl` (macOS, taking the first of the two
+  paths it returns for `root`) → `/etc/passwd` — and export it. Same three-way split the rest of
+  the tree uses (`this:126-134`). Only if all three come up empty does `boot` refuse, with one
+  diagnostic on stderr and `return` — never `exit`, because `boot` is sourced and `exit` would
+  close the user's terminal.
+- **Result: `env -i sh -c '. <path>/boot'` now comes out with `HOME`, `OOSH_DIR` and
+  `CONFIG_PATH` all correct, in `sh`, `dash`, `bash` and `busybox ash`.** That is the card.
 - The five `||` callers needed **no change**: the fix is upstream, and their degrade action is
   still right for a genuinely absent `boot` (non-dev branches — that is what T49 pins).
 - `docs/boot.md` gains a **Guarantees** section: sourced-only, exit status is a contract,
@@ -271,8 +285,10 @@ this round); the 8 `|| true` in `macos-test.yml` (review finding **M1**, still d
 **Definition of done.**
 - [x] Scope of "SAVETY" agreed and written down (above)
 - [x] Each agreed case has a test — `test.config` **T50** (exits 0 in sh/dash/ash/bash),
-      **T51** (refuses without `$HOME`), **T52** (ash really boots); **T40** extended to lint
-      under `ash` as well as `sh`
+      **T51** (`env -i <sh>` really boots, deriving `$HOME`), **T52** (ash really boots),
+      **T53** (refuses when no home can be derived); **T40** extended to lint under `ash`
+      as well as `sh`. T51 and T53 were both proven able to FAIL first, against deliberately
+      broken copies of `boot`.
 - [x] `docs/boot.md` documents the guarantees
 - [x] Standing verification bar passes — host `test.suite core 1` 626/625/1 intentional;
       `os platform.test ubuntu_24_04` **rc=0**, in-container core 631/630/1, every `✗ FAIL`
@@ -282,7 +298,7 @@ this round); the 8 `|| true` in `macos-test.yml` (review finding **M1**, still d
 **Verification.**
 ```bash
 for s in sh dash bash "busybox ash"; do env -i HOME=$HOME $s -c '. ~/oosh/boot'; echo "$s rc=$?"; done
-env -i sh -c '. ~/oosh/boot && echo BOOTED'     # one diagnostic, NO "BOOTED"
+env -i sh -c ". $OOSH_DIR/boot; echo \"\$HOME \$OOSH_DIR \$CONFIG_PATH\""  # all three correct
 env -i HOME=$HOME busybox ash -c '. ~/oosh/boot; echo "$OOSH_DIR $CONFIG_PATH"'
 ./test.suite run config 1 && ./test.suite core 1
 os platform.test ubuntu_24_04                    # exercises ossh exec + the per-user runners
@@ -337,3 +353,4 @@ already flags a regression against its `this localInstall → "starts new bash"`
 | 2026-09-10 | `os platform.test ubuntu_24_04` green against both commits (rc=0, zero real failures across all 4 container users) → **T4+T5 moved to In Review** |
 | 2026-09-14 | **T3** taken next at the user's request (out of the original order). Tracker's "already passes today" claim corrected: 2 real defects found and fixed (`boot` rc 1 on success; no-`HOME` killed the sourcing shell). → In Review |
 | 2026-09-14 | T3 landed (`a824d8e`); platform test green (rc=0, zero real failures across all 4 container users) |
+| 2026-09-14 | User tested `env -i sh` in a container: a refusal is not a boot. T3 scope corrected — `boot` now DERIVES `$HOME` from the passwd database instead of failing fast; `env -i sh` boots correctly in all four shells |
