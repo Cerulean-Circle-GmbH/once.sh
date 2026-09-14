@@ -127,7 +127,7 @@ if [ -n "$BASH_FILE" ]; then
   unset _oosh_bashdir
 fi
 
-# ── 4. Logging primitives + per-user session config (bash only) ──────────────
+# ── 4. Logging primitives + per-user session config (bash, non-POSIX only) ──────────────
 # Give console.log / info.log / error.log (and the per-user LOG_DEVICE/LOG_LIVE
 # re-anchor) to contexts that never run `this` (CI steps, `ssh exec`). This is
 # the line that used to be generated at the bottom of oosh.env. Idempotent —
@@ -136,19 +136,45 @@ fi
 # ~/.config/oosh/log.session.env — per-user, no leak into the shared log.env.
 #
 # `log` (like every oosh framework script) uses dotted function names and other
-# bash features, so it can only be sourced INTO a bash shell. Guard on
-# $BASH_VERSION: under a bare POSIX `sh` (the `env -i sh -c "$(curl init/oosh)"`
-# bootstrap, which re-execs into bash almost immediately) we simply skip it —
-# oosh requires bash 4+ to run anyway. This keeps `boot` sourceable under
-# dash/ash without a "Bad function name" error.
+# bash features, so it can only be sourced INTO a bash shell that is NOT in
+# POSIX mode. Both halves of that sentence are load-bearing:
+#
+#   * not bash at all — a bare POSIX `sh` (the `env -i sh -c "$(curl init/oosh)"`
+#     bootstrap, which re-execs into bash almost immediately), dash, ash. Skip.
+#   * bash IN POSIX MODE — and this is the one that bit. On macOS `/bin/sh` IS
+#     bash 3.2, so $BASH_VERSION is SET, but it runs with `posix` on, where a
+#     dotted function name is not a valid identifier. Asking only "is this bash?"
+#     therefore sourced `log` into a shell that cannot parse it, and A PARSE
+#     ERROR IN A SOURCED FILE UNDER POSIX MODE KILLS THE SHELL — not just the
+#     source. Measured on macOS 15.7.3: `env -i /bin/sh -c '. /etc/oosh/boot;
+#     echo REACHED'` printed "`log.device': not a valid identifier", exited 2,
+#     and never reached the echo. Same failure class as T3 (a sourced `boot`
+#     killing its caller) by a different route; `bash --posix` reproduces it on
+#     Linux, which is what test.config T70 uses.
+#
+# So the guard is "bash AND NOT posix". SKIPPING log is the correct trade: every
+# anchor (HOME, OOSH_DIR, CONFIG_PATH, OOSH_USER_CONFIG_PATH) and PATH is already
+# set above, so recovery still succeeds and boot still returns 0 — a POSIX-mode
+# shell comes up anchored but without the log functions, which is strictly better
+# than a dead shell. Nothing below this block uses them.
+#
+# $SHELLOPTS is the detector (bash keeps it current, so a runtime `set -o posix`
+# shows up too); `case` keeps the whole thing parseable by dash/ash, which T40's
+# four-shell lint requires. Under sh/dash/ash $SHELLOPTS is simply empty and the
+# $BASH_VERSION test already short-circuits.
 #
 # ONE `if`, not two `&&` lists: an `&&` list whose first test is false yields
 # status 1, and under sh/dash/ash $BASH_VERSION is ALWAYS empty — which made a
 # perfectly successful POSIX-sh boot exit 1 (see section 5).
-if [ -n "$BASH_VERSION" ]; then
+_oosh_posix=no
+case ":$SHELLOPTS:" in
+  *:posix:*) _oosh_posix=yes ;;
+esac
+if [ -n "$BASH_VERSION" ] && [ "$_oosh_posix" = no ]; then
   [ -f "$OOSH_DIR/log" ] && . "$OOSH_DIR/log"
   type log.session.save >/dev/null 2>&1 && log.session.save >/dev/null 2>&1
 fi
+unset _oosh_posix
 
 # ── 5. Exit status ───────────────────────────────────────────────────────────
 # boot succeeded — say so explicitly. Callers BRANCH on this status
