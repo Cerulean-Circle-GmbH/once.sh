@@ -1528,6 +1528,88 @@ private.oo.user.shared.symlinks.ensure() # <userHome> <sharedConfigPath> <onceSh
   return $(result)
 }
 
+private.oo.boot.path.ensure() # <sharedOoshBase> <branch> <systemPath:/etc/oosh> # ensure <systemPath>/boot is a symlink to <sharedOoshBase>/<branch>/boot; idempotent; warns and skips (rc=0) when the target does not exist
+{
+  # T9 — the FIXED system path to `boot`
+  # (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md).
+  #
+  # `boot` recovers $HOME from the password database, so it survives `env -i`
+  # — but only once it is REACHED. With HOME unset, dash and ash leave `~`
+  # LITERAL (POSIX leaves it undefined; bash falls back to getpwuid, which is
+  # why nobody noticed), so `. ~/oosh/boot` — the form docs and all 20 call
+  # sites use — cannot work in exactly the empty-environment case `boot`
+  # exists to survive. A host-wide `/etc/oosh/boot` collapses that to one
+  # command that works for any user, in any shell, with no environment.
+  #
+  # A SYMLINK, never a stub or a copy: `boot` is the single entry point that
+  # owns ALL bootstrap logic (boot:2-7), a stub would need its own copy of the
+  # getent→dscl→/etc/passwd lookup that boot:34-36 already forbids a third
+  # copy of, and a stale copy would boot you into last month's bootstrap in
+  # silence where a dangling symlink fails loudly.
+  #
+  # ── TRUST NOTE (T9 decision 1a) ───────────────────────────────────────────
+  # /etc/oosh/boot points at DEV-GROUP-WRITABLE content: state 31 runs
+  # `chmod -R g+w` on the shared tree (oo:1809), so any member of `dev` can
+  # edit the file this link resolves to — and anyone who sources it, root
+  # included, executes it. That trust model is UNCHANGED from root's existing
+  # ~/oosh, which is already a symlink into the same tree. What changes is
+  # that the path now *looks* root-owned. Do NOT treat /etc/oosh/boot as
+  # trusted-because-/etc: it is exactly as trusted as the `dev` group.
+  # ──────────────────────────────────────────────────────────────────────────
+  #
+  # Paths are PARAMETERS (same shape as private.oo.user.shared.symlinks.ensure
+  # above) so tests can drive this against a fixture without root.
+  local sharedOoshBase="$1"
+  local branch="$2"
+  local systemPath="${3:-/etc/oosh}"
+
+  if [ -z "$sharedOoshBase" ] || [ -z "$branch" ]; then
+    create.result 1 "private.oo.boot.path.ensure requires <sharedOoshBase> <branch> [<systemPath:/etc/oosh>]"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  local target="$sharedOoshBase/$branch/boot"
+
+  # Warn-and-SKIP, never dangle. `boot` lives on `dev` only; an install from
+  # `testing`/`prod` legitimately has no target yet, and a dangling
+  # /etc/oosh/boot would break `. /etc/oosh/boot` for every user on the box.
+  # Absence is CORRECT there, so state 34 must pass, not halt.
+  if [ ! -f "$target" ]; then
+    warn.log "private.oo.boot.path.ensure: no \`boot\` at $target — skipping $systemPath/boot (expected on a branch without boot)"
+    create.result 0 "boot system path skipped (no $target)"
+    return $(result)
+  fi
+
+  # Privilege: /etc needs root, a test fixture under $HOME does not. Prefix
+  # only the commands that need it, and only when we cannot already write —
+  # same idiom as init/oosh:351-354 (`$SUDO tee` + `$SUDO chmod` on
+  # /etc/paths.d/oosh-homebrew), which is also the in-repo proof that root can
+  # write /etc on macOS.
+  local _sudo=""
+  if [ -d "$systemPath" ]; then
+    [ -w "$systemPath" ] || _sudo="$SUDO"
+  else
+    [ -w "$(dirname "$systemPath")" ] || _sudo="$SUDO"
+  fi
+
+  $_sudo mkdir -p "$systemPath"
+  $_sudo chmod 755 "$systemPath"
+  # -n is load-bearing: without it `ln -sf` DEREFERENCES an existing
+  # symlink-to-directory and creates the link INSIDE it, so a re-run over a
+  # stale dir symlink silently produces <systemPath>/boot/boot.
+  $_sudo ln -sfn "$target" "$systemPath/boot"
+
+  # Post-condition — fail loud rather than half-succeed (decision 4).
+  if [ -L "$systemPath/boot" ] && [ -r "$systemPath/boot" ]; then
+    create.result 0 "boot system path ensured at $systemPath/boot -> $target"
+  else
+    create.result 1 "failed to ensure $systemPath/boot -> $target (isLink=$([ -L "$systemPath/boot" ] && echo y || echo n) readable=$([ -r "$systemPath/boot" ] && echo y || echo n) points.at=$(readlink "$systemPath/boot" 2>/dev/null))"
+    error.log "$RESULT"
+  fi
+  return $(result)
+}
+
 private.check.root.shared.dev.folder.created() {
   #check.debug.level 6
   #source user
@@ -2088,6 +2170,37 @@ private.check.root.installation.done() {
   config save log LOG
 
   return 0
+}
+
+private.check.root.boot.path.installed() { # # state 34 — install the fixed host-wide boot path /etc/oosh/boot
+  # T9. Runs in the 30-lane, so $USER is root (private.check.priviledges.checked
+  # routes here only for root / working sudo, and ossh:523 re-enters as root).
+  # Derives the same shared base state 31 built, then delegates to the testable
+  # helper. Dedicated state (not folded into 31's idempotent fast-path, nor into
+  # 33's best-effort chsh/.bashrc work) so a failure reads
+  # "halted at [34] root.boot.path.installed".
+  local dir
+  dir="$( user get basehome developking )"
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    dir="$( user get basehome )"
+  fi
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    error.log "state 34 [root.boot.path.installed]: could not determine the shared basehome — state 31 must run first"
+    create.result 1 "state 34 failed: no basehome"
+    return $(result)
+  fi
+  local onceShBase="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
+
+  local branch="${OOSH_BRANCH}"
+  if [ -z "$branch" ]; then
+    branch=$(this.git.branch.short "$HOME/oosh")
+  fi
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    branch=main
+  fi
+
+  private.oo.boot.path.ensure "$onceShBase" "$branch"
+  return $(result)
 }
 
 private.check.user.shared.dev.folder.linked() {

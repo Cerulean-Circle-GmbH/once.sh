@@ -2095,4 +2095,199 @@ test.case - "T-SHARED-TREE-FROM-LOCAL-BRANCH-MAIN: branch=main creates only main
   test.oo.sharedTreeFromLocalBranchMain
 expect 0 "only main/ created" "private.oo.shared.tree.from.local skips worktree-add when branch == main"
 
+# ============================================================================
+# T9-BOOT-PATH: private.oo.boot.path.ensure — the fixed system boot path
+# ============================================================================
+# Ticket T9 (docs/plans/2026-09-14-fixed-system-boot-path.md). `. ~/oosh/boot`
+# cannot be REACHED under `env -i sh`: with HOME unset dash/ash leave `~`
+# literal. The fix is a host-wide symlink /etc/oosh/boot into the shared tree.
+# The helper takes its paths as parameters precisely so these tests can drive
+# it against a fixture without root.
+
+# Build a fixture: <root>/shared/<branch>/boot + an empty system path.
+test.oo.bootPath.fixture() { # <fixtureRoot> <branch> <?withBoot:yes>
+  local fixture="$1" branch="$2" withBoot="${3:-yes}"
+  rm -rf "$fixture"
+  mkdir -p "$fixture/shared/$branch" "$fixture/system"
+  if [ "$withBoot" = "yes" ]; then
+    printf '%s\n' '#!/usr/bin/env sh' '# fixture boot' > "$fixture/shared/$branch/boot"
+  fi
+}
+
+# --- T9-BOOT-PATH-CREATES-SYMLINK -------------------------------------------
+test.oo.bootPathEnsureCreatesSymlink() {
+  local fixture="/tmp/test.oo.bootpath.create.$(id -u).$$"
+  test.oo.bootPath.fixture "$fixture" dev yes
+  local sys="$fixture/system/oosh"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" >/dev/null 2>&1
+  local rc=$?
+  local link="$sys/boot"
+  local target="$fixture/shared/dev/boot"
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned rc=$rc"
+  elif [ ! -L "$link" ]; then
+    create.result 1 "$link is not a symlink (ls: $(ls -ld "$link" 2>&1))"
+  elif [ "$(readlink "$link")" != "$target" ]; then
+    create.result 1 "link points at '$(readlink "$link")', expected '$target'"
+  elif [ ! -r "$link" ]; then
+    create.result 1 "$link is not readable"
+  else
+    create.result 0 "boot system path is a symlink to the shared tree"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T9-BOOT-PATH-CREATES-SYMLINK: helper links <systemPath>/boot at <base>/<branch>/boot" \
+  test.oo.bootPathEnsureCreatesSymlink
+expect 0 "boot system path is a symlink to the shared tree" \
+  "a SYMLINK, never a copy or a generated stub (spec: 'Why a symlink')"
+
+# --- T9-BOOT-PATH-SKIPS-WHEN-TARGET-MISSING ---------------------------------
+# The testing/prod promotion case: `boot` exists on dev only. State 34 must
+# PASS there (absence is correct), and must NEVER leave a dangling link —
+# a dangling link would make `. /etc/oosh/boot` fail for every user on the box.
+test.oo.bootPathEnsureSkipsWhenTargetMissing() {
+  local fixture="/tmp/test.oo.bootpath.skip.$(id -u).$$"
+  test.oo.bootPath.fixture "$fixture" testing no
+  local sys="$fixture/system/oosh"
+  private.oo.boot.path.ensure "$fixture/shared" testing "$sys" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "absent target must warn-and-SKIP (rc=0), got rc=$rc — state 34 would halt on testing/prod"
+  elif [ -L "$sys/boot" ] || [ -e "$sys/boot" ]; then
+    create.result 1 "created a DANGLING link: $(ls -ld "$sys/boot" 2>&1)"
+  else
+    create.result 0 "absent target skipped without a dangling link"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T9-BOOT-PATH-SKIPS-WHEN-TARGET-MISSING: warn-and-skip, never dangle" \
+  test.oo.bootPathEnsureSkipsWhenTargetMissing
+expect 0 "absent target skipped without a dangling link" \
+  "promotion to testing/prod must not halt state 34 nor dangle /etc/oosh/boot"
+
+# --- T9-BOOT-PATH-NO-NESTING ------------------------------------------------
+# `ln -sf` (without -n) DEREFERENCES an existing symlink-to-directory and
+# creates the new link INSIDE it. A re-run over a stale dir-symlink would then
+# produce <systemPath>/boot/boot and leave <systemPath>/boot pointing at the
+# wrong thing. -n is what prevents that; this pins it.
+test.oo.bootPathEnsureDoesNotNest() {
+  local fixture="/tmp/test.oo.bootpath.nest.$(id -u).$$"
+  test.oo.bootPath.fixture "$fixture" dev yes
+  local sys="$fixture/system/oosh"
+  mkdir -p "$sys" "$fixture/stale"
+  ln -s "$fixture/stale" "$sys/boot"        # stale symlink → DIRECTORY
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" >/dev/null 2>&1
+  local rc=$?
+  local target="$fixture/shared/dev/boot"
+  if [ -e "$fixture/stale/boot" ]; then
+    create.result 1 "nested INSIDE the stale dir symlink: $fixture/stale/boot exists (missing 'ln -sfn')"
+  elif [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned rc=$rc"
+  elif [ "$(readlink "$sys/boot")" != "$target" ]; then
+    create.result 1 "link points at '$(readlink "$sys/boot")', expected '$target'"
+  else
+    create.result 0 "stale dir symlink replaced, not nested into"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T9-BOOT-PATH-NO-NESTING: re-run over a stale dir symlink replaces it (ln -sfn)" \
+  test.oo.bootPathEnsureDoesNotNest
+expect 0 "stale dir symlink replaced, not nested into" \
+  "without -n a second install nests the link inside the old directory symlink"
+
+# --- T9-BOOT-PATH-IDEMPOTENT ------------------------------------------------
+test.oo.bootPathEnsureIdempotent() {
+  local fixture="/tmp/test.oo.bootpath.idem.$(id -u).$$"
+  test.oo.bootPath.fixture "$fixture" dev yes
+  local sys="$fixture/system/oosh"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" >/dev/null 2>&1
+  local first
+  first=$(find "$sys" | sort; readlink "$sys/boot")
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" >/dev/null 2>&1
+  local rc=$?
+  local second
+  second=$(find "$sys" | sort; readlink "$sys/boot")
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "second call returned rc=$rc"
+  elif [ "$first" != "$second" ]; then
+    create.result 1 "second call changed the tree: '$first' vs '$second'"
+  else
+    create.result 0 "second call is a no-op"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T9-BOOT-PATH-IDEMPOTENT: second invocation changes nothing" \
+  test.oo.bootPathEnsureIdempotent
+expect 0 "second call is a no-op" \
+  "state 34 re-runs on every re-install; it must stay a no-op"
+
+# --- T9-BOOT-PATH-REQUIRES-ARGS ---------------------------------------------
+test.oo.bootPathEnsureRequiresArgs() {
+  private.oo.boot.path.ensure >/dev/null 2>&1
+  local rc1=$?
+  private.oo.boot.path.ensure /tmp/nowhere >/dev/null 2>&1
+  local rc2=$?
+  if [ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ]; then
+    create.result 0 "missing arguments rejected"
+  else
+    create.result 1 "rc(no args)=$rc1 rc(base only)=$rc2 — both must be non-zero"
+  fi
+  return $(result)
+}
+test.case - "T9-BOOT-PATH-REQUIRES-ARGS: <sharedOoshBase> and <branch> are mandatory" \
+  test.oo.bootPathEnsureRequiresArgs
+expect 0 "missing arguments rejected" \
+  "a silently defaulted base would link /etc/oosh/boot at the wrong tree"
+
+# --- T9-BOOT-PATH-FAILS-LOUD ------------------------------------------------
+# "It must never half-succeed" (decision 4). When the privileged commands
+# cannot run, the post-condition must catch it and return non-zero rather than
+# reporting success on a system path that was never written.
+test.oo.bootPathEnsureFailsLoud() {
+  if [ "$(id -u)" = "0" ]; then
+    create.result 0 "privileged commands verified"   # root can always write
+    return $(result)
+  fi
+  local fixture="/tmp/test.oo.bootpath.loud.$(id -u).$$"
+  test.oo.bootPath.fixture "$fixture" dev yes
+  mkdir -p "$fixture/ro"
+  chmod 500 "$fixture/ro"
+  local sys="$fixture/ro/oosh"
+  # SUDO="false " makes every privileged command a guaranteed no-op failure.
+  local rc
+  ( SUDO="false " ; private.oo.boot.path.ensure "$fixture/shared" dev "$sys" ) >/dev/null 2>&1
+  rc=$?
+  chmod 700 "$fixture/ro" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    create.result 0 "privileged commands verified"
+  else
+    create.result 1 "returned 0 although $sys/boot was never created — half-success"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T9-BOOT-PATH-FAILS-LOUD: unwritable system path returns non-zero" \
+  test.oo.bootPathEnsureFailsLoud
+expect 0 "privileged commands verified" \
+  "post-condition must catch a failed privileged write, never report half-success"
+
+# --- T9-BOOT-CHECK-DEFINED --------------------------------------------------
+test.oo.bootPathCheckDefined() {
+  if [ "$(type -t private.check.root.boot.path.installed)" = "function" ]; then
+    create.result 0 "state 34 guard is defined"
+  else
+    create.result 1 "private.check.root.boot.path.installed is not a function"
+  fi
+  return $(result)
+}
+test.case - "T9-BOOT-CHECK-DEFINED: private.check.root.boot.path.installed exists" \
+  test.oo.bootPathCheckDefined
+expect 0 "state 34 guard is defined" \
+  "state.next [34] dispatches to private.check.<stateName> — no guard, no transition"
+
+
 test.suite.save.results
