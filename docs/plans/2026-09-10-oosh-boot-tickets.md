@@ -502,10 +502,14 @@ and `Install oosh.command:20` sets `OOSH_SELF_BRANCH` **unexported**, so it neve
 - [x] `docs/boot.md` documents the guarantees — the **Guarantees** table (`$HOME` is now
       *recovered*, not merely required) plus a section covering the `init/oosh` half: the
       re-exec, why placement after the branch default is load-bearing, and the carry list
-- [ ] Standing verification bar passes — host `test.suite core 1` 626/625/1 intentional;
-      `os platform.test ubuntu_24_04` **rc=0**, in-container core 631/630/1, every `✗ FAIL`
-      being that same intentional meta-test once per container user. After a real fresh install
-      all four users passed T40, T50, T51 and T52.
+- [x] Standing verification bar passes (2026-09-14, second attempt, at `7e88ec4`) —
+      host `test.suite core 1` **643 assertions / 642 passed / 1 intentional**;
+      `test.install` 33/33; `test.config` 61/61; four-shell lint clean on both `boot` and
+      `init/oosh`; `grep 'env -S'` finds nothing.
+      `os platform.test ubuntu_24_04` **rc=0**, in-container core **643/642/1**, and every
+      `✗ FAIL` in the log is that same intentional meta-test, once per container user.
+      **`test.ssh.config.woda.portable` passes 12×** — the regression that ended the first
+      attempt (§4d) is absent. Re-run after the review fixes, not only before them.
 
 **Verification.**
 ```bash
@@ -613,6 +617,8 @@ never existed.
 | 2026-09-14 | The card finally read correctly — `env -i` is **env initiate**, and it means RECOVERY. `config.env.init` + `boot` restore mode landed; `env -i sh <tree>/boot` brings a wrecked box back |
 | 2026-09-14 | **Reverted to `a824d8e`** after an unexplained WODA regression in the container. Knowledge kept, code rolled back — see §4d |
 | 2026-09-14 | User tested `env -i sh` in a container: a refusal is not a boot. T3 scope corrected — `boot` now DERIVES `$HOME` from the passwd database instead of failing fast; `env -i sh` boots correctly in all four shells |
+| 2026-09-14 | T3 review round: quality review found the re-exec required the exec bit (breaking `ossh prereqs.install`, whose `scp` has no `-p`), dropped `sh -x` from the documented debug command, and left `PATH` unseeded so an arm64 macOS root install would re-bootstrap Homebrew and die. Fixed in `7e88ec4` by naming an interpreter, forwarding `$-`, and seeding a fixed PATH. Also `getent passwd` multi-line (LDAP+files) poisoned `$HOME` recovery in BOTH files — `head -1` added. Platform test re-run green. |
+| 2026-09-14 | **Guarantee scoped by the user: clean-plus-pass-through, not strictly clean.** `env -i` strips the environment of every child the installer spawns, so `LOG_LEVEL`, `TERM` (as `${TERM:-dumb}` — empty behaves worse than unset), `LANG`/`LC_ALL`, the three proxy vars, `SSH_AUTH_SOCK` and `GIT_SSH_COMMAND` now cross. `GIT_ASKPASS` deliberately does not: it names a binary, and PATH is reset in the same breath. |
 | 2026-09-14 | T3 **second attempt**: `boot` + `init/oosh` recover `$HOME`; `init/oosh` re-execs clean without `env -S`, restoring the guarantee `075b4a3` traded away for Alpine. Audit found 531/537 lines of `init/oosh` (at baseline `a6f0ce3`) postdate the shebang removal, and two read-but-never-set variables (`SUDO_USER`, `OOSH_REPO`) that `env -i` would have destroyed silently — both now carried. → In Review, pending the platform test |
 | 2026-09-14 | User pointed at the install log's env-file errors. Root cause: the SHARED `log.env` referenced the PER-USER `$OOSH_USER_CONFIG_PATH`, and `user:951` leaked it across users. Shared files now hold only shared data; `boot` sources the per-user file itself |
 | 2026-09-14 | User queried the last two error lines in tmux. Neither was a real failure: the ERR trap's `errno()` glossed propagated exit statuses as "Command not found" / "Misuse of shell builtins". Now verifies before diagnosing; hoisted to `private.debug.errno` and tested |
