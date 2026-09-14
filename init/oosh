@@ -53,7 +53,12 @@ if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
   _oosh_home=""
   if [ -n "$_oosh_user" ]; then
     if command -v getent >/dev/null 2>&1; then
-      _oosh_home=$(getent passwd "$_oosh_user" 2>/dev/null | cut -d: -f6)
+      # `head -1` is load-bearing: getent prints one line PER NSS SOURCE, so a
+      # user present in both `files` and LDAP/SSSD yields two. Without it the
+      # cut returns two lines, _oosh_home is non-empty so both fallbacks are
+      # skipped, and `[ -d ]` on the two-line string fails — refusing while
+      # holding a perfectly good home on line 1.
+      _oosh_home=$(getent passwd "$_oosh_user" 2>/dev/null | head -1 | cut -d: -f6)
     fi
     if [ -z "$_oosh_home" ] && command -v dscl >/dev/null 2>&1; then
       # macOS returns TWO paths in one field for root ("/var/root
@@ -69,11 +74,11 @@ if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
   if [ -n "$_oosh_home" ] && [ -d "$_oosh_home" ]; then
     HOME="$_oosh_home"
     export HOME
-    echo "oosh install: \$HOME was unset; recovered as $HOME" >&2
+    echo "oosh install: \$HOME was unset or not a directory; recovered as $HOME" >&2
   else
-    echo "oosh install: \$HOME is unset and no home could be derived for" >&2
-    echo "oosh install: '${_oosh_user:-?}'. Re-run with HOME set:" >&2
-    echo "oosh install:   env -i HOME=\"\$HOME\" sh -c \"\$(wget -O- …/init/oosh)\"" >&2
+    echo "oosh install: \$HOME is unset or not a directory, and no home could be" >&2
+    echo "oosh install: derived for '${_oosh_user:-?}' from getent, dscl or /etc/passwd." >&2
+    echo "oosh install: re-run with HOME set, e.g. HOME=/home/you sh init/oosh" >&2
     unset _oosh_user _oosh_home
     exit 1
   fi
@@ -91,71 +96,98 @@ OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"
 
 # ─── Clean environment ───────────────────────────────────────────────────
 # From 2024-04-07 (8c277f4) to 2026-03-09 (075b4a3) this file carried
-#   #!/usr/bin/env -iS HOME=${HOME} sh
-# — wipe the environment, pass HOME through. 075b4a3 removed it because
-# BusyBox env has no -S flag, and nothing replaced the guarantee.
+# `#!/usr/bin/env -iS HOME=${HOME} sh` — clean environment, HOME passed
+# through. 075b4a3 dropped it because BusyBox env has no -S, and nothing
+# replaced the guarantee. Re-established here instead of in the shebang: -S
+# was only ever needed because a SHEBANG passes one argument. Measured:
+# busybox env rejects -S but accepts `env -i VAR=val cmd`.
 #
-# Re-establish it here instead of in the shebang. `-S` was only ever needed
-# because a SHEBANG can pass one argument; doing it inside the script removes
-# that constraint. Verified: busybox env rejects -S but accepts
-# `env -i VAR=val cmd`, so this works on Alpine.
+# PLACEMENT IS LOAD-BEARING — this must stay AFTER the branch default above.
+# env -i wipes OOSH_SELF_BRANCH, which is not carried, so re-execing any
+# earlier resolves the branch to `dev` and discards a caller's override.
 #
-# HOME is already recovered above, so the good value is what we carry across.
-# Guarded on $0 being a readable file: in the curl-pipe path ($0 is "sh")
-# there is nothing to re-exec, so we skip — that path is already clean-ish and
-# the pre-clone fallback below handles the interpreter upgrade.
-# OOSH_CLEAN_ENV makes it fire exactly once; looping is impossible.
+# WE NAME AN INTERPRETER, never a bare "$0" — as do all three other execs in
+# this file. A bare "$0" goes to the KERNEL, which needs the execute bit and
+# re-reads the shebang. That breaks: ossh.prereqs.install (scp's with no -p,
+# then runs `bash /tmp/oosh-init.$$`, promising it works "even if ... isn't
+# executable" — a kernel exec dies there at 126 with a bare `env:` message);
+# README's `env -i sh -x init/oosh` (shebang re-read DROPS -x, so the debug
+# recipe logs no trace — hence $_oosh_x); and macos-test.yml's deliberate
+# `/opt/homebrew/bin/bash` (silently downgraded — hence the $BASH_VERSION
+# check). `-r` rather than only `-f`: an interpreter must READ $0; the execute
+# bit is deliberately NOT required.
 #
-# THE CARRIED LIST IS LOAD-BEARING — read this before shortening it.
-# `env -i` destroys every variable this script READS BUT NEVER SETS. It is
-# tempting to assume that is safe because the 2024-2026 shebang did the same,
-# but it is not: 594 of this file's 601 lines postdate 075b4a3 (the commit
-# that dropped the shebang), and the 7 that don't are blank lines and bare
-# `fi`s. None of the current env-reading code has ever run under `env -i`.
-# Anything added below that reads an inherited variable must be added here
-# too, or it will fail silently. What is carried, and why:
-#   HOME          recovered above; every path anchor hangs off it.
-#   OOSH_CLEAN_ENV the once-only sentinel. Without it this loops forever.
-#   OOSH_BRANCH   57f0984 (2026-02-16) fixed exactly this loss. Set just
-#                 above from OOSH_SELF_BRANCH, which is why the re-exec sits
-#                 here and not next to the $HOME block.
-#   OOSH_NO_AUTORUN carried for symmetry with the guard at the top; if it
-#                 were "1" we would already have exited there.
-#   SUDO_USER     set by sudo, assigned NOWHERE in this file. Three readers:
-#                 the `[ "$(id -u)" = "0" ] && [ -n "$SUDO_USER" ]` guard in
-#                 Phase A (never `sudo brew` as root), the post-install
-#                 `if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]`
-#                 block, and the login-shell exec's `[ -z "$SUDO_USER" ]`
-#                 branch. A user running `sudo ./init/oosh` directly reaches
-#                 here with it already set; wiping it silently skips
-#                 user.oosh.install and the invoker never gets oosh. The
-#                 re-exec keeps the same uid, so the invoker's identity must
-#                 cross it intact. Introduced 7ac375a (2026-04-24), six weeks
-#                 AFTER the shebang was removed — hence never tested clean.
-#   OOSH_REPO     three `${OOSH_REPO:-<github url>}` readers, assigned
-#                 nowhere. It exists only to be inherited, so wiping it makes
-#                 the override dead code and silently falls back to public
-#                 GitHub — the OOSH_BRANCH bug again, different var.
-# Deliberately NOT carried:
-#   PATH          wiping it is the point; Phase A re-derives it (the brew
-#                 probe's `eval "$(... brew shellenv)"` and the
-#                 `case ":$PATH:" in` prepend guards) and self-heals.
-#   BASH_FILE     `export BASH_FILE="${BASH_FILE:-$(command -v bash)}"` —
-#                 recomputing is CORRECT here, since Phase A may have just
-#                 installed a newer bash that a stale inherit would shadow.
-#   SUDO          re-derived by `if [ -z "${SUDO+x}" ]` from `id -u`, to the
-#                 same answer.
-# Cited by code, not by line number, deliberately: an earlier revision cited
-# lines and they went stale twice in a day as edits shifted them. grep for
-# the quoted fragment instead. See the T3 audit in docs/boot.md.
-if [ -z "$OOSH_CLEAN_ENV" ] && [ -f "$0" ]; then
-  exec env -i HOME="$HOME" \
+# PATH IS SEEDED, NOT CARRIED. env -i leaves PATH unset, so the child falls
+# back to a compiled-in default that has /usr/local/bin but NOT
+# /opt/homebrew/bin. On an arm64 Mac that already has Homebrew that is fatal
+# and does NOT self-heal: oosh_pm_detect finds no PM, the Darwin branch runs
+# the Homebrew installer, and as root it aborts "Don't run this as root!".
+# The `eval "$(... brew shellenv)"` that would rescue PATH sits INSIDE that
+# same failure branch, after the installer has already run. A fixed list keeps
+# the value constant regardless of caller — that determinism is the point,
+# whereas carrying the caller's PATH would surrender it.
+#
+# THE GUARANTEE IS "DETERMINISTIC FOR OOSH, PASS-THROUGH FOR THE TOOLS WE
+# CALL" — not "empty". Two groups, two different justifications; do not
+# collapse them. Full audit and per-variable evidence: docs/boot.md.
+#
+#   Group 1 — oosh's own state, carried because THIS SCRIPT reads it:
+#     HOME, OOSH_CLEAN_ENV (once-only sentinel), OOSH_BRANCH (57f0984 fixed
+#     exactly this loss), OOSH_NO_AUTORUN, SUDO_USER, OOSH_REPO.
+#     SUDO_USER and OOSH_REPO are assigned NOWHERE in this file — pure
+#     inherits. Losing SUDO_USER silently skips `user oosh.install` so the
+#     invoker of `sudo ./init/oosh` never gets oosh; losing OOSH_REPO makes
+#     the fork/private-repo override dead code. Anything added below that
+#     reads an inherited variable must be added here too.
+#
+#   Group 2 — pass-through, carried for the CHILDREN, not for us:
+#     LOG_LEVEL, TERM, LANG, LC_ALL, http_proxy, https_proxy, no_proxy,
+#     SSH_AUTH_SOCK, GIT_SSH_COMMAND.
+#     init/oosh reads NONE of these. An audit asking only "does init/oosh
+#     read this?" would wrongly call them removable. They are here because
+#     env -i also strips the environment handed to every child we spawn —
+#     `this call ossh ...`, `git clone`, the Homebrew curl, sudo, and the
+#     final `exec "${BASH_FILE:-bash}" -l`.
+#
+#   Deliberately NOT carried: PATH (seeded — above), BASH_FILE (recomputing
+#   is correct; Phase A may have just installed a newer bash a stale value
+#   would shadow), SUDO (re-derived from id -u to the same answer), and
+#   GIT_ASKPASS (names a helper BINARY, which the seeded PATH may no longer
+#   resolve — it would fail confusingly rather than cleanly, and it drives an
+#   interactive prompt an unattended installer cannot answer anyway).
+#
+# `${VAR:-}` everywhere so an ABSENT variable stays absent-in-effect instead
+# of becoming a spurious empty value that shadows a downstream default. That
+# was checked per variable, not assumed. TERM is the SOLE EXCEPTION and gets
+# `${TERM:-dumb}`: measured, bash turns an UNSET TERM into `dumb` but leaves
+# an EMPTY one empty, and tput errors on empty while accepting dumb — so
+# `${TERM:-}` would be strictly worse than dropping TERM altogether.
+if [ -z "$OOSH_CLEAN_ENV" ] && [ -f "$0" ] && [ -r "$0" ]; then
+  # Keep a deliberate bash; otherwise plain sh. $BASH is bash's own absolute
+  # path, so it survives the PATH reset below.
+  _oosh_sh=sh
+  if [ -n "$BASH_VERSION" ]; then _oosh_sh="${BASH:-bash}"; fi
+  # Forward xtrace. Unquoted on purpose: empty must expand to NO argument.
+  _oosh_x=""
+  case "$-" in *x*) _oosh_x="-x" ;; esac
+  exec env -i \
+    PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME" \
     OOSH_CLEAN_ENV=1 \
     OOSH_BRANCH="${OOSH_BRANCH:-}" \
     OOSH_NO_AUTORUN="${OOSH_NO_AUTORUN:-}" \
     SUDO_USER="${SUDO_USER:-}" \
     OOSH_REPO="${OOSH_REPO:-}" \
-    "$0" "$@"
+    LOG_LEVEL="${LOG_LEVEL:-}" \
+    TERM="${TERM:-dumb}" \
+    LANG="${LANG:-}" \
+    LC_ALL="${LC_ALL:-}" \
+    http_proxy="${http_proxy:-}" \
+    https_proxy="${https_proxy:-}" \
+    no_proxy="${no_proxy:-}" \
+    SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" \
+    GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-}" \
+    "$_oosh_sh" $_oosh_x "$0" "$@"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -465,8 +465,9 @@ Commits: `80b6257` (`boot` recovers `$HOME`), `78957c7` (`init/oosh` recovers `$
 `dc3bbcb` (clean re-exec), `47f0a8b` (carry `SUDO_USER` + `OOSH_REPO`), `a886203` (comment).
 
 **The finding that made this more than a restore.** `init/oosh` was rewritten three times
-(`b8b90b8`, `b427809`, `0594657`) during the two years the shebang was absent: **594 of its 601
-lines postdate `075b4a3`**, the other 7 being blank lines and bare `fi`s. So "we are only putting
+(`b8b90b8`, `b427809`, `0594657`) during the two years the shebang was absent: at the pre-change
+baseline `a6f0ce3`, **531 of its 537 lines postdate `075b4a3`**, the other 6 being two bare `fi`s
+and four blank lines. So "we are only putting
 back what used to be there" was false — effectively the whole current file was meeting `env -i`
 for the first time. An audit of every variable the installer *reads but never sets* found two that
 had grown a dependency on inheritance and would have broken silently:
@@ -612,6 +613,6 @@ never existed.
 | 2026-09-14 | The card finally read correctly — `env -i` is **env initiate**, and it means RECOVERY. `config.env.init` + `boot` restore mode landed; `env -i sh <tree>/boot` brings a wrecked box back |
 | 2026-09-14 | **Reverted to `a824d8e`** after an unexplained WODA regression in the container. Knowledge kept, code rolled back — see §4d |
 | 2026-09-14 | User tested `env -i sh` in a container: a refusal is not a boot. T3 scope corrected — `boot` now DERIVES `$HOME` from the passwd database instead of failing fast; `env -i sh` boots correctly in all four shells |
-| 2026-09-14 | T3 **second attempt**: `boot` + `init/oosh` recover `$HOME`; `init/oosh` re-execs clean without `env -S`, restoring the guarantee `075b4a3` traded away for Alpine. Audit found 594/601 lines of `init/oosh` postdate the shebang removal, and two read-but-never-set variables (`SUDO_USER`, `OOSH_REPO`) that `env -i` would have destroyed silently — both now carried. → In Review, pending the platform test |
+| 2026-09-14 | T3 **second attempt**: `boot` + `init/oosh` recover `$HOME`; `init/oosh` re-execs clean without `env -S`, restoring the guarantee `075b4a3` traded away for Alpine. Audit found 531/537 lines of `init/oosh` (at baseline `a6f0ce3`) postdate the shebang removal, and two read-but-never-set variables (`SUDO_USER`, `OOSH_REPO`) that `env -i` would have destroyed silently — both now carried. → In Review, pending the platform test |
 | 2026-09-14 | User pointed at the install log's env-file errors. Root cause: the SHARED `log.env` referenced the PER-USER `$OOSH_USER_CONFIG_PATH`, and `user:951` leaked it across users. Shared files now hold only shared data; `boot` sources the per-user file itself |
 | 2026-09-14 | User queried the last two error lines in tmux. Neither was a real failure: the ERR trap's `errno()` glossed propagated exit statuses as "Command not found" / "Misuse of shell builtins". Now verifies before diagnosing; hoisted to `private.debug.errno` and tested |

@@ -39,7 +39,12 @@ if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
   _oosh_home=""
   if [ -n "$_oosh_user" ]; then
     if command -v getent >/dev/null 2>&1; then
-      _oosh_home=$(getent passwd "$_oosh_user" 2>/dev/null | cut -d: -f6)
+      # `head -1` is load-bearing: getent prints one line PER NSS SOURCE, so a
+      # user present in both `files` and LDAP/SSSD yields two. Without it the
+      # cut returns two lines, _oosh_home is non-empty so both fallbacks are
+      # skipped, and `[ -d ]` on the two-line string fails — refusing while
+      # holding a perfectly good home on line 1.
+      _oosh_home=$(getent passwd "$_oosh_user" 2>/dev/null | head -1 | cut -d: -f6)
     fi
     if [ -z "$_oosh_home" ] && command -v dscl >/dev/null 2>&1; then
       # macOS returns TWO paths in one field for root ("/var/root
