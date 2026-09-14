@@ -182,7 +182,32 @@ The contract `boot` keeps, and that callers may rely on (settled by ticket **T3*
 | **Sourced, never executed** | `. ~/oosh/boot` / `source ~/oosh/boot`. All 20 call sites source it. It sets variables in *your* shell — running it as a program would set them in a process that immediately exits. |
 | **Exit status is meaningful** | **0** on success, **non-zero** on refusal. Callers branch on it — `ossh exec` / `ossh exec.tty` and the three `user` rootkey pushes all do `[ -f ~/oosh/boot ] && . ~/oosh/boot \|\| export PATH=…`. So the last statement in `boot` must never be a conditional list (see below). |
 | **Derives `$HOME` when it has to** | `env -i` drops `HOME`, so `boot` looks it up in the password database and exports it — which is what makes `env -i sh` boot correctly. A `HOME` that is *set but not a directory* (a removed user, an inherited container env) is treated the same way. Only if no home can be found at all does `boot` print a diagnostic and `return` non-zero. |
+| **Reconstructs a missing config** | A missing config used to be silently *skipped* — a shell that looked fine with no environment. `boot` now rebuilds it when it is entirely gone, and reports it when it is merely damaged. See the table below. |
 | **Proven shells** | `sh`, `dash`, `busybox ash`, `bash` — and under `env -i` with `HOME` passed through. |
+
+### What "reconstruct" does, and what it refuses to do
+
+Every source in `boot` is `[ -f … ] &&`-guarded, so a missing config was simply skipped. The
+safety net is scoped by **blast radius**, because the two config tiers are not alike — every user
+symlinks `~/config` to *one* `sharedConfig`, and `config.save` regenerates it from the **calling
+shell's live environment**. An automatic rewrite would stamp one user's `LOG_LEVEL` onto everybody.
+
+| Situation | What `boot` does |
+|---|---|
+| config intact | **nothing** — three `[ -f ]` tests, no subprocess, no output |
+| all of `user.env`/`oosh.env`/`log.env` missing | **rebuild** — there is nothing to destroy |
+| *some* missing or invalid | **report only**, naming `config init.env` — never rewrite a populated shared config |
+| `$CONFIG_PATH` absent entirely | **silence** — oosh is not installed for this user, and install belongs to the state machine, not to `boot` |
+| per-user `log.session.env` | needs no repair — `log.session.save` rewrites it every shell |
+
+`config reconstruct` owns that decision; `boot` only notices that a file is gone and hands off. It
+is invoked as a **command, not sourced** — sourcing `config` runs its top level, which has side
+effects (it creates `$CONFIG_PATH`). `OOSH_BOOT_NO_RECONSTRUCT=1` disables it, for the install
+pipeline and for fixtures that must not heal the tree they are asserting on.
+
+> One deliberate gap: `boot`'s own check is existence only. A *present but corrupt* file is caught
+> by `config reconstruct` / `config init.check` when run explicitly, not on every shell —
+> validating three files at every shell start is not worth the cost.
 
 ### Why the exit status needed fixing
 
@@ -222,8 +247,8 @@ Only when all three come up empty does `boot` refuse — and by `return`, never 
 
 > Guarded by `test.config` **T40** (parses under `sh` *and* `ash`), **T50** (exits 0 in every
 > shell), **T51** (`env -i <sh>` really boots, deriving `$HOME`), **T52** (`ash` really boots),
-> **T53** (refuses when no home can be derived), alongside **T49** (the boot-absent fallbacks
-> still exist).
+> **T53** (refuses when no home can be derived), **T55-T59** (the reconstruct table above),
+> alongside **T49** (the boot-absent fallbacks still exist).
 
 ## Idempotent
 

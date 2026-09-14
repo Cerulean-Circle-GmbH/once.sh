@@ -146,6 +146,34 @@ fi
 if [ -n "$BASH_VERSION" ]; then
   [ -f "$OOSH_DIR/log" ] && . "$OOSH_DIR/log"
   type log.session.save >/dev/null 2>&1 && log.session.save >/dev/null 2>&1
+
+  # ── 4b. SAFETY NET: reconstruct a missing shared config ────────────────────
+  # Every source above is `[ -f … ] &&`-guarded, so a missing config is silently
+  # SKIPPED — you get a shell that looks fine and has no environment.
+  #
+  # The check here is three `[ -f ]` tests: free, and on a healthy shell that is
+  # ALL that runs — no subprocess, no cost. Only when something is actually
+  # missing do we hand off to `config reconstruct`, which owns the decision:
+  # rebuild when all three are gone (nothing to destroy), otherwise REPORT and
+  # name `config init.env`, because regenerating a populated sharedConfig would
+  # stamp THIS shell's values onto every user who symlinks to it.
+  #
+  # Invoked as a COMMAND, not sourced: sourcing `config` runs its top level,
+  # which has side effects (it will create $CONFIG_PATH). A subprocess keeps
+  # boot's shell clean.
+  #
+  # An absent $CONFIG_PATH is left alone — not installed is not broken, and
+  # install belongs to the state machine, not to boot. The per-user session file
+  # needs no repair either: log.session.save above rewrites it every shell.
+  #
+  # OOSH_BOOT_NO_RECONSTRUCT=1 opts out — for the install pipeline (which owns
+  # its own repair) and for fixtures that must not heal the tree under test.
+  if [ -z "$OOSH_BOOT_NO_RECONSTRUCT" ] && [ -d "$CONFIG_PATH" ]; then
+    if [ ! -f "$CONFIG_PATH/user.env" ] || [ ! -f "$CONFIG_PATH/oosh.env" ] \
+       || [ ! -f "$CONFIG_PATH/log.env" ]; then
+      [ -x "$OOSH_DIR/config" ] && "$OOSH_DIR/config" reconstruct
+    fi
+  fi
 fi
 
 # ── 5. Exit status ───────────────────────────────────────────────────────────

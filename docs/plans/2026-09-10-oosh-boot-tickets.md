@@ -151,6 +151,46 @@ or a mid-install sub-shell.
 Not touched: `CONFIG` (`$CONFIG_PATH/$CONFIG_FILE`) simply follows, and
 `OOSH_USER_CONFIG_PATH` was already the literal `$HOME/.config/oosh`.
 
+#### Third scope correction — `boot` must RECONSTRUCT, not just read (2026-09-14)
+
+The user's final steer: *"It should just reconstruct all the env files."* Measured before:
+
+```
+boot with no env files   ->  rc 0, nothing rebuilt        (silent no-op)
+config init.env          ->  all files back, correct      (machinery already worked)
+```
+
+`boot` guards every source with `[ -f … ] &&`, so a missing config was simply skipped — a shell
+that looked fine and had no environment. The repair family already existed; `boot` never called it.
+
+**The hazard that shaped the design.** `config.init.env` → `config.save` writes the **shared**
+sharedConfig from the **calling shell's live environment**. Auto-running it per shell would let one
+user's shell rewrite everyone's config — not theoretical: earlier in this session a `config save`
+from a `LOG_LEVEL=1` shell persisted `LOG_LEVEL="1"` into the shared `log.env` for all users. So
+the reconstruct is scoped by blast radius:
+
+| Situation | Behaviour |
+|---|---|
+| config intact | nothing — three `[ -f ]` tests, no subprocess, no output |
+| all three shared files missing | rebuild (nothing to destroy) |
+| some missing/invalid | **report only**, naming `config init.env` |
+| `$CONFIG_PATH` absent | silence — install owns install |
+
+New **`config.reconstruct`** owns the decision; `boot` only notices a file is gone and hands off,
+invoking it as a **command, not sourced** (sourcing `config` runs its top level, which creates
+`$CONFIG_PATH` — caught during implementation when the "not installed" case wrongly conjured a
+config dir). `OOSH_BOOT_NO_RECONSTRUCT=1` opts out for the install pipeline and fixtures.
+
+Two things the implementation corrected against the approved plan, both from measurement:
+- the planned **per-user tier was dead weight** — `boot` already calls `log.session.save` on every
+  shell, so that file cannot be missing afterwards;
+- `config.init.full` did **not** need the reconstruct (its `config.init.env` is strictly more), but
+  *did* lack any per-user repair, so it now calls `log.session.save` directly.
+
+Covered by `test.config` **T55-T59**; T56/T57 proven to fail against the previous commit's `boot`.
+
+This also delivers the first half of **T7** (`config init repairs a nonexisting or broken config`).
+
 #### Found while verifying T3 — the error trap was inventing diagnoses (fixed)
 
 Chasing the last two noisy lines in an otherwise clean install log showed that **neither was a

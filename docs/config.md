@@ -64,6 +64,12 @@ so a first-ever shell has no missing-source error. See
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
+**Repair.** `config reconstruct` rebuilds the shared env files when they are *all* missing and
+reports them when they are merely damaged — it never rewrites a populated `sharedConfig`, because
+`config.save` regenerates it from the calling shell's live environment. [`boot`](boot.md) calls it
+automatically (see its Guarantees); `config init.env` is the deliberate full regenerate, and
+`config init.full` composes both. Pinned by `test.config` **T55-T59**.
+
 **The rule that keeps the two tiers apart: a SHARED file never references a
 PER-USER variable.** `config.save` used to append
 `. $OOSH_USER_CONFIG_PATH/log.session.env` to the shared `log.env`, so the shared file
