@@ -58,7 +58,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 | 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
 | 4 | **T3** — `env -i sh` SAFETY | 🔍 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. Second attempt delivered `boot` + `init/oosh` recovery and the clean re-exec. |
 | 5 | **T9** — fixed system path to `boot` | 🔍 **In Review** | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. Design complete, **5 decisions open**: [the card](2026-09-14-fixed-system-boot-path.md). |
-| 6 | **T6** — `bootsratp.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the five above settle. |
+| 6 | **T6** — `bootstrap.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the five above settle. |
 
 ---
 
@@ -527,13 +527,13 @@ not colon-guarded, so a *genuine* failure still duplicates PATH entries. The 8
 
 ---
 
-### T6 — `bootsratp.sequence` diagram 💡 Ideas
+### T6 — `bootstrap.sequence` diagram 💡 Ideas
 
-> **Card (Ideas #6):** `prod/docs/puml/bootsratp.sequence` `/bootsratp.sequence.svg`
+> **Card (Ideas #6):** `prod/docs/puml/bootsratp.sequence` `/bootsratp.sequence.svg` (sic — the family was renamed `bootstrap.sequence` on 2026-09-14)
 
 **Meaning.** The bootstrap sequence diagram must match the real (post-`boot`) mechanism.
 
-**Evidence.** `docs/puml/bootsratp.sequence.puml` last changed **2026-03-18** (`9d9b9bb`) — before
+**Evidence.** `docs/puml/bootstrap.sequence.puml` last changed **2026-03-18** (`9d9b9bb`) — before
 the boot loader — and mentions "boot" once. `~/oosh-notes/2026-09-08-oosh-install-break-and-revert-eval.md`
 already flags a regression against its `this localInstall → "starts new bash"` step. Docs-only, no code.
 
@@ -544,6 +544,12 @@ already flags a regression against its `this localInstall → "starts new bash"`
 - [ ] User confirms the diagram is now correct (this was the original question)
 
 ---
+
+**2026-09-14 note.** The misspelled family (`bootsratp.*`, since 2022) was renamed
+`bootstrap.sequence`; a `.drawio` editable copy was added next to the `.puml`
+(`docs/puml/bootstrap.sequence.drawio`) and `docs/boot.md` § See also links the
+diagram. The `.svg` is still the 2026-04-30 render — no PlantUML on the dev host —
+and the `.puml` is unchanged, so every DoD item above is still open.
 
 ## 4c. Proposed new cards (found by us, not yet on the board)
 

@@ -582,3 +582,4 @@ the macOS `/bin/sh` case).
 - [log.md](log.md) — `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` and the session chain
 - [migration/env-files.md](migration/env-files.md) — the pure-data migration
 - [research/review-2026-09-09-boot-loader-pure-env-files.md](research/review-2026-09-09-boot-loader-pure-env-files.md)
+- [puml/bootstrap.sequence/bootstrap.sequence.svg](puml/bootstrap.sequence/bootstrap.sequence.svg) — the bootstrap sequence diagram (source `puml/bootstrap.sequence.puml`, editable copy `puml/bootstrap.sequence.drawio`; ticket T6 tracks bringing it up to date with `boot`)
