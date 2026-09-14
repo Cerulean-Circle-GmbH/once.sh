@@ -508,6 +508,7 @@ The user moves cards; these are written up so they can be added to **Ideas** whe
 
 | Ticket | Why | Doc |
 |---|---|---|
+| **Tests that cannot fail** | A test function calling `create.result 1` reports **PASS** unless it ends with `return $(result)` — `create.result` only assigns `RETURN_VALUE`, and `test.case` then overwrites it with the function's exit status, always 0. Combined with `expect 0 "*"` (which sets the expectation to the actual result) both discriminators vanish. 57 wildcard assertions across 26 files; 8/8 sampled in `test.oo` are vacuous. | [2026-09-14-tests-that-cannot-fail.md](2026-09-14-tests-that-cannot-fail.md) |
 | **Repair the `oo method.new` tooling** | The project mandates template-driven method creation, but the tool cannot run against any core script: 17 stale doc references to names dead since `2fe5133` (2026-03-16), the `### new.method` marker missing from `config`/`this`/`log`/`debug`/`oo`, and a `<script>.new` usage-file step with only `myScript.new` left. Every method in this tree is therefore hand-written — a standing methodology violation. | [2026-09-14-method-tooling-repair.md](2026-09-14-method-tooling-repair.md) |
 
 ---
