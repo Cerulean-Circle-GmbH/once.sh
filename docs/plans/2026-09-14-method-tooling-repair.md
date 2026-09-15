@@ -79,17 +79,43 @@ half that carries the DRY metadata. That is very likely why it fell out of use.
 
 ## Definition of done
 
-- [ ] All 17 stale references corrected to `oo method.new` / `oo test.new`
-- [ ] `### new.method` marker present in `config`, `this`, `log`, `debug`, `oo`
-- [ ] The typed description reaches the **method docstring** — the metadata the completion engine reads
-- [ ] The usage/Examples table is written correctly, not mangled (`probeMethod------`)
-- [ ] The spurious case-sensitivity warning is gone on a case-sensitive filesystem
-- [ ] The stale `myScript.new` leftover is removed
-- [ ] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
+- [x] All 17 stale references corrected to `oo method.new` / `oo test.new` — **was already done.**
+      `cc6078a` fixed them and `a8b6928` kept the docs when it reverted the code ("DOCS KEPT,
+      because they are true regardless of which commit is checked out"). One genuine stale
+      reference survived, in code rather than docs: `test/test.c2` probed `oo new.method`.
+- [x] `### new.method` marker present in `config`, `this`, `log`, ~~`debug`~~, `oo` — **`debug`
+      corrected out of scope.** It has no `debug.start` dispatcher, so it is not a method-script at
+      all; a method spliced into it could never be called. Same category as `boot`.
+- [x] The typed description reaches the **method docstring** — the metadata the completion engine reads
+- [x] ~~The usage/Examples table is written correctly, not mangled (`probeMethod------`)~~ —
+      **decided the other way (2026-09-16).** The tool no longer touches the usage table at all.
+      The docstring already feeds `this.help` and `c2`, and the template's `usage()` already calls
+      it; writing the description into a table as well puts it in two places that drift. The two
+      substitutions that produced `probeMethod------` are deleted rather than made precise.
+- [x] The spurious case-sensitivity warning is gone on a case-sensitive filesystem — **two causes,
+      both fixed.** `find` does not descend into a start directory that is a SYMLINK, and
+      `$OOSH_DIR` is always the `~/oosh` symlink, so it fired for files that plainly existed
+      (`find -L`). And it fired for any absent file, asserting a filesystem property it had never
+      tested — it now warns only when the two tests disagree.
+- [x] The stale `myScript.new` leftover is removed
+- [x] `oo method.new <script>.<method>` runs end-to-end against a core script, generating the method
       from `templates/code/newMethod` **and** its test case from `templates/code/newMethodTest`
-- [ ] A test pins **documented command names against what the scripts actually define**, so this
-      cannot drift silently again
+- [x] A test pins **documented command names against what the scripts actually define**, so this
+      cannot drift silently again — `T-DOCS-NAME-DRIFT`, recovered from `cc6078a`.
 - [ ] Standing verification bar passes
+
+**Added, not in the original DoD:**
+
+- [x] **Multi-segment names.** `cut -d. -f2` took only the second segment, so `config.env.init`
+      generated `config.env()`. Now `${name%%.*}` / `${name#*.}`. `T-METHOD-NEW-MULTISEGMENT`.
+- [x] **A completion stub per parameter.** `docs/oosh-architecture.md` makes it mandatory and the
+      template emits none, so every generated method was broken by the project's own standard.
+- [x] **`replace` cannot destroy a script.** `replace commit` ran `mv "$FILE" "$FILE.bak"`
+      unconditionally — with no working copy the second `mv` failed and the script was left with no
+      file under its own name, one failed insertion away from source loss. And `replace within`
+      matches a SUBSTRING on every line, so running the tool against `oo` rewrote the marker text
+      inside the tool's own source; new `replace line` requires a whole-line match and exactly one
+      of them. `test/test.replace`.
 
 ## Scope note — this is probably not only `oo`
 

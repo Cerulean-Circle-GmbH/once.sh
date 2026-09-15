@@ -60,17 +60,47 @@ This:
 
 ### oo.method.new
 
-Adds a new method to an existing script (interactive).
+Adds a new method to an existing script, and its test case to that script's test file, from
+`templates/code/newMethod` and `templates/code/newMethodTest`. Interactive.
 
 ```bash
 oo method.new myscript.mymethod
+oo method.new myscript.certificates.update.run    # every dot segment is part of the method name
 ```
 
-Prompts for:
-- Method description and parameters
-- Test description
-- Test parameters
-- Expected test result
+Five prompts, in order, all asked **before** any file is touched:
+
+| Prompt | Lands in |
+|---|---|
+| Parameters, e.g. `<branch> <?force:no>` | the method **docstring**, and one completion stub per parameter |
+| One-line description | the method **docstring** |
+| Test description | the `test.case` label |
+| Test arguments | the call under test |
+| Expected `$RESULT` | the `expect` |
+
+**The docstring is the single source.** `this.help` renders it and `c2` completes from it, so a
+method without one does not appear in help and does not tab-complete — the Method Structure
+Standard in [oosh-architecture.md](oosh-architecture.md) calls that broken. The tool therefore also
+emits a `myscript.mymethod.completion.<param>()` per parameter, or the documented empty form
+`myscript.mymethod.completion() { :; }` for a method that takes none. Fill in the candidates; the
+stub is a placeholder, not an answer.
+
+**It does not touch the usage table.** Scripts like `oo`, `user` and `line` carry a hand-written
+`METHOD / DESCRIPTION` table in their `usage()`, above the `this.help` call that renders the same
+information from docstrings. Generating a row there would put the description in two places and let
+them drift. Until 2026-09-16 the tool tried, looking for a dash pattern the script template does not
+contain, and mangled the Examples block into `mymethod------` while dropping the description
+entirely.
+
+**Insertion is a whole-line, exactly-one-match transaction** (`replace line`, not `replace within`).
+The `### new.method` and `### test.method` markers must each appear exactly once as a line of their
+own; the tool refuses and changes nothing otherwise. A substring search would rewrite the marker
+text wherever else it appears — including inside this tool's own source.
+
+Requires the markers to be present. `templates/code/newScript` and `templates/code/newScriptTest`
+carry them, and each template re-emits the marker after what it inserts, so the next call has
+somewhere to go. Scripts without a `<script>.start` dispatcher — `boot`, `debug` — are not
+method-scripts and deliberately have no marker.
 
 ### oo.test.new
 
