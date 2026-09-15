@@ -6,7 +6,7 @@
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
 
-replace.by()
+replace.by() # <newText> # completes `replace within` or `replace line`; writes the transformed copy to <file>.new
 {
   REPLACE_EXPRESSION="$1"
   shift
@@ -16,13 +16,49 @@ replace.by()
   export SEARCH_EXPRESSION
   export REPLACE_EXPRESSION
 
-  if [[ $FILE == *.new ]]; then
-    perl -pe 's/\Q$ENV{SEARCH_EXPRESSION}\E/$ENV{REPLACE_EXPRESSION}/' "$FILE" > "$FILE.new"
-    replace commit "$FILE"
-    replace cleanup "$FILE"
-  else
-    perl -pe 's/\Q$ENV{SEARCH_EXPRESSION}\E/$ENV{REPLACE_EXPRESSION}/' "$FILE" > "$FILE.new"
+  local pattern='s/\Q$ENV{SEARCH_EXPRESSION}\E/$ENV{REPLACE_EXPRESSION}/'
+  if [ "$REPLACE_ANCHOR" = "line" ]; then
+    # Whole line, and exactly one of them. `replace within` matches a
+    # SUBSTRING, and `perl -pe` loops over every line, so it rewrites the
+    # first match on EVERY line that contains one. Running `oo method.new
+    # oo.something` used to corrupt oo's own source that way: the marker text
+    # "### new.method" appears both as the real marker and inside the tool's
+    # own string literal one line above it.
+    local matches; matches=$(grep -c -x -F -- "$SEARCH_EXPRESSION" "$FILE" 2>/dev/null)
+    unset REPLACE_ANCHOR
+    if [ "${matches:-0}" != "1" ]; then
+      create.result 1 "replace line: '$SEARCH_EXPRESSION' matches ${matches:-0} whole line(s) in $FILE — expected exactly 1, refusing"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    pattern='s/^\Q$ENV{SEARCH_EXPRESSION}\E$/$ENV{REPLACE_EXPRESSION}/'
   fi
+
+  if ! perl -pe "$pattern" "$FILE" > "$FILE.new"; then
+    create.result 1 "replace by: could not write $FILE.new"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  if [[ $FILE == *.new ]]; then
+    replace commit "$FILE" || return 1
+    replace cleanup "$FILE"
+  fi
+  # create.result's THIRD argument is the chaining marker. This used to be a
+  # bare `RETURN=$1` as the last statement, which pinned the exit status at 0 —
+  # the same defect oo.cmd carried until 8928c3e, and the reason a failed
+  # substitution could be followed by an unconditional `replace commit`.
+  create.result 0 "$FILE.new written" "$1"
+  return $(result)
+}
+
+replace.line() # <file> <exactLine> # like `replace within`, but the search must match a WHOLE line and exactly one of them; continue with `by <newText>`
+{
+  FILE="$1"
+  shift
+  SEARCH_EXPRESSION=$1
+  shift
+  REPLACE_ANCHOR="line"
+  export REPLACE_ANCHOR
   RETURN=$1
 }
 
@@ -55,15 +91,28 @@ replace.diff()
  diff "$FILE" "$FILE.new"
 }
 
-replace.commit()
+replace.commit() # <file> # swap the transformed copy in: <file> becomes <file>.bak and <file>.new becomes <file>
 {
   FILE="$1"
+  # REFUSE without the working copy. This used to run unconditionally: the
+  # first `mv` displaced the original to .bak, the second failed because
+  # .new was never written, and the script was left with NO file under its
+  # own name. private.oo.new.method calls this whether or not any
+  # substitution matched, so it was one failed `replace within` away from
+  # deleting the script it was editing.
+  if [ ! -f "$FILE.new" ]; then
+    create.result 1 "replace commit: $FILE.new does not exist — nothing to commit, refusing (committing anyway would leave $FILE with no file under its own name)"
+    error.log "$RESULT"
+    return $(result)
+  fi
   # Use standard bash test - works on case-insensitive APFS
   [ -f "$FILE.bak" ] && rm "$FILE.bak"
   chmod -x "$FILE"
   mv "$FILE" "$FILE.bak"
   mv "$FILE.new" "$FILE"
   chmod +x "$FILE"
+  create.result 0 "$FILE committed, previous kept as $FILE.bak"
+  return $(result)
 }
 
 replace.rollback()
@@ -109,17 +158,19 @@ $0
       rollback          filename
       diff              filename
 
-      by        <replace expression> 
+      by        <replace expression>
       by.file
-      within        <filename> <search expression>
+      within        <filename> <search expression>   substring, every line
+      line          <filename> <exact line>          whole line, exactly one match
 
       cleanup
 
-  
+
   Examples
     $this init
 
     replace within some.File.txt \"hello\" by \"servus\"
+    replace line   some.File.txt \"### new.method\" by \"inserted\"
     replace diff some.File.txt
     replace commit some.File.txt
 
