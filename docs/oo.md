@@ -281,10 +281,31 @@ oo cmd tree           # Install tree if missing
 oo cmd errno python3    # Install python3 for errno
 ```
 
+The two-argument form installs a package whose name differs from the command:
+
+```bash
+oo cmd sshd openssh-server   # command is sshd, package is openssh-server
+```
+
 Special cases:
-- `update` - Runs `apt-get update`
+- `update` - Refreshes the package-manager cache (`apt-get update` / `dnf makecache` / `yum makecache`)
 - `errno` - Installs python3
-- `eamd`, `oosh`, `once` - Loads from ONCE repository
+- `eamd`, `oosh`, `once` - Loads from the ONCE repository; fails naming `once` when it is not installed
+- `mkcert` - Delegates to `once.su.mkcert.install`; fails naming it when undefined
+- `brew` - Bootstraps Homebrew on macOS only
+
+**Result contract.** `oo cmd` returns **0 only when `<cmd>` is on PATH afterwards** — it captures the
+package manager's exit status *and* re-verifies with `private.oo.cmd.verify`, because a package
+manager reporting success is not the same as the command being usable (the macOS
+installed-but-not-on-PATH case). `$RESULT` carries the reason on failure. Callers may branch on it:
+
+```bash
+oo cmd rsync || warn.log "rsync is not available"
+```
+
+Until 2026-09-15 it always returned 0 — its last statement was a bare `RETURN=$1` assignment, so its
+exit status was that of a variable assignment whatever the package manager did, and every caller
+that checked it was dead code.
 
 ### oo.find.cmd
 

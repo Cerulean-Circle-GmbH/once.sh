@@ -2919,4 +2919,171 @@ expect 0 "status covers the login-shell drop-in too" \
   "two host resources, one report — otherwise a broken login route is invisible"
 
 
+# ============================================================================
+# T-CMD-* — oo.cmd's result contract
+# ============================================================================
+# oo.cmd reported success unconditionally: its last statement was a bare
+# `RETURN=$1` assignment, so its exit status was that of a variable assignment
+# — always 0, whatever the package manager did. `oo cmd mc` shelled out and
+# reported success when the package did not exist, the network was down, sudo
+# was denied, or OOSH_PM was empty. Three callers check the status and could
+# never fire.
+#
+# Driven through a PATH shim that LOGS ITS ARGV, so "the PM was never invoked"
+# is an assertion with a diagnostic rather than a bare sentinel. OOSH_PM is
+# pinned in every case: left empty, oo.cmd calls oo.pm.discover, which does a
+# real `config save` and on apt hosts a real `apt-get update`.
+# CONFIG_PATH is passed through from this file's fixture (test.suite.config.isolate
+# at the top), never env -i'd away, so the child cannot reach the shared tier.
+
+test.oo.cmd.fixture() { # <stubDir> # a fake package manager that records every call and exits $PM_RC
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$PM_LOG"' 'exit ${PM_RC:-0}' > "$1/fakepm"
+  chmod +x "$1/fakepm"
+}
+
+test.oo.cmd.run() { # <stubDir> <pmRc> <noPm> <args...> # run oo.cmd in a pinned child; echo "rc|RESULT"
+  local stub="$1" pmRc="$2" noPm="$3"; shift 3
+  local pmPin='OOSH_PM="fakepm install"'
+  [ "$noPm" = "noPm" ] && pmPin='OOSH_PM=""; oo.pm.discover() { :; }'
+  env PATH="$stub:$PATH" HOME="$HOME" LOG_LEVEL=0 SUDO="" \
+      PM_LOG="$stub/pm.calls" PM_RC="$pmRc" \
+      CONFIG_PATH="$CONFIG_PATH" CONFIG="$CONFIG" CONFIG_FILE="$CONFIG_FILE" \
+      bash -c '
+        source "$HOME/oosh/this" >/dev/null 2>&1
+        source "$HOME/oosh/oo"   >/dev/null 2>&1
+        '"$pmPin"'
+        oo.cmd "$@" >/dev/null 2>&1
+        printf "%s|%s" "$?" "$RESULT"' _ "$@"
+}
+
+# --- T-CMD-PM-FAILS ---------------------------------------------------------
+test.oo.cmdPmFails() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.fail.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  local got; got=$(test.oo.cmd.run "$stub" 1 withPm ooshNoSuchTool)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "reported success though the package manager exited 1 (RESULT=[$res])"
+  elif [ "${res#*ooshNoSuchTool}" = "$res" ]; then
+    create.result 1 "failed but \$RESULT does not name the tool: [$res]"
+  else
+    create.result 0 "a failing package manager is reported"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-PM-FAILS: a failing package manager is reported, and names the tool" \
+  test.oo.cmdPmFails
+expect 0 "a failing package manager is reported" \
+  "oo cmd reported success unconditionally — three callers check its status and could never fire"
+
+# --- T-CMD-VERIFY-AFTER-INSTALL --------------------------------------------
+test.oo.cmdVerifyAfterInstall() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.verify.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  # PM exits 0 but installs nothing — the command is still absent afterwards
+  local got; got=$(test.oo.cmd.run "$stub" 0 withPm ooshNoSuchTool)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "package manager said OK and the command is still absent, but oo.cmd reported success (RESULT=[$res])"
+  else
+    create.result 0 "installing without landing the command is a failure"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-VERIFY-AFTER-INSTALL: PM says OK but the command is still missing" \
+  test.oo.cmdVerifyAfterInstall
+expect 0 "installing without landing the command is a failure" \
+  "the post-condition oo.cmd's own comment deferred to ossh.prereqs.install for"
+
+# --- T-CMD-ALREADY-PRESENT --------------------------------------------------
+test.oo.cmdAlreadyPresent() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.present.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  local got; got=$(test.oo.cmd.run "$stub" 0 withPm sh)
+  local rc="${got%%|*}"
+  local calls=""; [ -s "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
+  rm -rf "$stub" 2>/dev/null
+  if [ -n "$calls" ]; then
+    create.result 1 "invoked the package manager for an already-present command: [$calls]"
+  elif [ "$rc" != "0" ]; then
+    create.result 1 "an already-present command reported rc=$rc"
+  else
+    create.result 0 "already present is success, PM never invoked"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-ALREADY-PRESENT: no work, no package manager, rc 0" \
+  test.oo.cmdAlreadyPresent
+expect 0 "already present is success, PM never invoked" \
+  "idempotency is the documented contract — every caller relies on it"
+
+# --- T-CMD-NO-PM ------------------------------------------------------------
+test.oo.cmdNoPm() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.nopm.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  local got; got=$(test.oo.cmd.run "$stub" 0 noPm ooshNoSuchTool)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "no package manager at all, yet reported success (RESULT=[$res])"
+  else
+    create.result 0 "no package manager is a failure"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-NO-PM: nothing can be installed, so nothing succeeded" \
+  test.oo.cmdNoPm
+expect 0 "no package manager is a failure" \
+  "it used to console.log 'no package manger' and exit 0"
+
+# --- T-CMD-TWO-ARG ----------------------------------------------------------
+test.oo.cmdTwoArg() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.twoarg.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  # <cmd> <packageName> — the documented two-argument form
+  test.oo.cmd.run "$stub" 0 withPm ooshNoSuchTool ooshNoSuchPackage >/dev/null
+  local calls=""; [ -f "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
+  rm -rf "$stub" 2>/dev/null
+  if [ "${calls#*ooshNoSuchPackage}" = "$calls" ]; then
+    create.result 1 "the package name never reached the package manager: [$calls]"
+  else
+    create.result 0 "the package name reaches the package manager"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-TWO-ARG: oo.cmd <cmd> <packageName> installs the PACKAGE" \
+  test.oo.cmdTwoArg
+expect 0 "the package name reaches the package manager" \
+  "the second argument was shifted away and lost — ossh:1933 installs nothing today"
+
+# --- T-CMD-DEAD-BRANCH ------------------------------------------------------
+test.oo.cmdDeadBranch() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.dead.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  # mkcert delegates to once.su.mkcert.install, which is defined nowhere
+  local got; got=$(test.oo.cmd.run "$stub" 0 withPm mkcert)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "a branch whose installer does not exist reported success (RESULT=[$res])"
+  else
+    create.result 0 "a branch that cannot work says so"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-DEAD-BRANCH: mkcert delegates to a command that does not exist" \
+  test.oo.cmdDeadBranch
+expect 0 "a branch that cannot work says so" \
+  "once, private.stage and once.su.mkcert.install are defined nowhere in this tree"
+
+### test.method
+
 test.suite.save.results

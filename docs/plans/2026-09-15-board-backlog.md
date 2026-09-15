@@ -135,14 +135,42 @@ tail. Decide fatal-vs-warn per call site and record the decision in the commit m
 `oo.prereqs.install` fatal (it already reads that way), the two `ossh` sites warn (they already say
 "install may still work").
 
-**Land this one alone.** It makes three dormant install branches live simultaneously, so a red
-platform run afterwards must have exactly one candidate cause.
+**Land this one alone.** It makes dormant branches live, so a red platform run afterwards must have
+exactly one candidate cause.
+
+**RISK RATING CORRECTED (2026-09-15).** This card said HIGH — install, "three dormant install
+branches live simultaneously". Two of the three claims were wrong. `oo.prereqs.install` — the one
+with `if ! oo cmd "$pkg"` — has **zero callers in the tree**; it is reachable only by hand. The two
+sites that do run during install are both followed by an unconditional `return 0` that already
+discards even the existing verify's status. Real blast radius on a live install: **two new
+`warn.log` lines**, on Alpine and naked macOS.
 
 **Done when.** A stubbed `$OOSH_PM` that exits 1 → rc ≠ 0 and `$RESULT` names the tool; a command
 already present → rc 0 and the PM is never invoked; `RETURN` unchanged across the call. Controls:
 restore the `RETURN=$1` tail and watch case 1 flip; then make the stub exit **0** while leaving the
 command absent, and watch the verify-after-install assertion flip. Platform run on ubuntu **plus
 alpine and almalinux**. `docs/oo.md` gains the contract line.
+
+**DONE 2026-09-15.** `oo.cmd` has the contract on every branch; the post-condition is the new
+`private.oo.cmd.verify`, moved out of `ossh` so `oo.cmd` can enforce what its own comment used to
+defer to `ossh.prereqs.install` for. Six `T-CMD-*` tests, each with its own negative control.
+
+Two defects this card did not mention, both fixed here:
+
+- **The two-argument form dropped the package.** `oo.cmd sshd openssh-server` shifted twice and
+  installed nothing — the package manager was called with no operand at all, which `apt-get -y
+  install` exits 0 for. Reproduced in the failing test as `[install ]`, the PM's whole argv. Live at
+  `ossh`'s `oo.cmd sshd openssh-server`.
+- **Four branches called commands that exist nowhere** (`once`, `private.stage`,
+  `once.su.mkcert.install`). They now fail naming what is missing instead of emitting "command not
+  found" and reporting success.
+
+Also recorded: `RETURN=$1` was not nonsense — it was the chaining protocol hand-rolled. `RETURN` is
+the sentinel `this.start` reads to find where the next command on a chained line begins, and the
+documented way to set it is `create.result`'s **third argument**. Doing it by hand as the last
+statement is what pinned the exit status at 0, and it was broken for its own purpose too: it set
+`RETURN=""`, which never matches, so `this.start` shifted through every remaining argument, hit
+"force stop" and exited — silently swallowing the rest of the line.
 
 ---
 
