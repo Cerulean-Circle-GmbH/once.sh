@@ -272,6 +272,8 @@ rc 1, and after repair the persisted value agrees with the checkout. With `oosh.
 entirely: the check **names** every missing variable, instead of succeeding emptily. Controls:
 revert the reconcile; and separately prove the repair cannot fire during an install.
 
+**DONE 2026-09-16** (`fee9513`…`5fbb513`). Both decisions in the research doc were taken, plus one it missed: `OOSH_MODE` also carried the word `released`, written by `promote` one line after it checked the tree back out to `dev`, and asserted by a state check whose sibling asserts `dev` — so a host could satisfy only one. The release lane now asks for the `prod` branch and promote's write is gone. `config validate required` reports this host's actual drift: `OOSH_MODE=released but ~/oosh is on dev`. **Both waivers are deleted and a core run reports no `Shared tier:` line at all.** Not in scope, recorded: `config.init.env` still builds on the no-arg `config.save` this ticket forbids as a repair primitive.
+
 **Two test waivers are T7's to remove.** `test/test.completion.audit` and `test/test.config` both
 declare `TEST_SHARED_TIER_WRITER="blocked on T7: …"`, because they `source` the `config` script and
 `config.start` re-runs `config.init`, whose unconditional `export CONFIG_PATH=~/config` undoes any

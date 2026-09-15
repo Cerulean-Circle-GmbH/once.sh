@@ -223,7 +223,40 @@ environment, defaulting to the constant when none is given. The anchor rule is a
 
 ---
 
-## 9. Open questions for the boss
+## 9. Decided, and what shipped (2026-09-16)
+
+All three questions below were answered, and one collision the research above **missed** turned
+up during implementation.
+
+| Question | Decided |
+|---|---|
+| Does `OOSH_BRANCH` stop being persisted? | **Yes.** Blast radius measured first: on an installed host no runtime reader's answer changes. |
+| `OOSH_MODE` reconciled on load, or on request? | **On request.** `config validate required` returns rc 1; `config.init.check` reports and swallows it, because it is documented as never failing its caller. |
+| Rewrite `config.init.env`? | **No** — recorded as a follow-up; it is the only code that creates the three-file structure. |
+
+**The collision this document missed.** `OOSH_MODE` did not only hold branch names. `promote`
+wrote the literal `released` into it, one line *after* `git checkout dev` — recording a
+developer-box event in the variable that describes an installed host — and
+`private.check.user.mode.release` asserted that word. Its sibling lane asserts `dev`, so a host
+could satisfy only one, and on a genuinely released box (where `oo mode prod` had set the branch
+name) the release lane failed anyway. **It was asking the wrong question.** A released install is
+one sitting on the `prod` branch. The lane was repointed and promote's write deleted.
+
+**A second finding, filed separately.** Those two lanes are registered *consecutively*
+(`oo:1473-1474`), so the 20-lane has been unfinishable since it was written — it stalls either
+way. T7 changed what the first one asks, not the contradiction. See the tracker § 4c.
+
+**What shipped:** `fee9513` (exclusion) · `db4952f` (mode means branch) · `325c4e5` (config.init
+honours its anchor) · `69cd0a8` (both waivers deleted) · `5fbb513` (required set + drift report).
+
+Proof, in the ticket's own terms: a `core` run reports **no `Shared tier:` line at all**, where
+for two days it named two files — a pre-existing guard falling silent rather than a new assertion.
+And on this host the new check says exactly what the ticket was filed for:
+`OOSH_MODE=released but ~/oosh is on dev`.
+
+---
+
+## 10. Open questions, as originally posed
 
 1. **Does `OOSH_BRANCH` stop being persisted?** This is the whole decision. It makes the drift
    impossible rather than repairable, and it is a deletion — but it changes what a cold shell

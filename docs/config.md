@@ -222,6 +222,43 @@ that resolves to an absolute per-user path, extend the same exclusion `case` in
 `config.save` — and the `for leaker in …` list in `test/test.config` T29, which is the
 value-level mirror of that `case` and the only thing that pins it.
 
+### Required variables
+
+The exclusion list above says what must **never** persist. This says what a config must
+**carry**. It is declared as data in `config` by `private.config.required.variables.get`
+— change both together.
+
+| Variable | Lives in | Re-derived by |
+|---|---|---|
+| `BASH_FILE` | `user.env` | `command -v bash` |
+| `CONFIG_FILE` | `user.env` | `config.init` |
+| `OOSH_MODE` | `oosh.env` | `basename` of the canonical `~/oosh` |
+| `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` |
+| `OOSH_PM` | `oosh.env` | `oo pm.discover` |
+| `LOG_LEVEL` | `log.env` | defaults to `1` |
+
+```bash
+config validate required
+```
+
+Reports **every** missing variable, not just the first, and compares the persisted
+`OOSH_MODE` against the branch `~/oosh` actually points at. rc 1 on either, verdict on
+stdout:
+
+```
+INCOMPLETE: /home/you/config — OOSH_MODE=released but ~/oosh is on dev
+  repair with: config init.env
+```
+
+`config.init.check` runs the same report but **swallows the rc** — it is documented as
+never failing its caller. Branch on `config validate required` instead.
+
+**Why this was needed.** `config.init` created a directory and three variables, so on a
+missing config it succeeded emptily, leaving `$CONFIG` pointing at a file that did not
+exist. `config.validate` checks line *shape* and knows no variable name. Nothing compared
+the persisted branch to the checkout, which is how this host ran for weeks with
+`OOSH_MODE=released` on a `dev` tree.
+
 **`OOSH_BRANCH` vs `OOSH_MODE`.** They are not two names for one thing.
 `OOSH_BRANCH` is the branch the operator **asked for**, meaningful for the length of one
 install (`init/oosh`, install state 31) and never persisted. `OOSH_MODE` is the branch the

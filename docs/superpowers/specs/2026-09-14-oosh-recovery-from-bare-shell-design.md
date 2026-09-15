@@ -1,5 +1,10 @@
 # Design: recovering a broken oosh from a bare shell
 
+> **Stale as of 2026-09-16.** This document describes `config reconstruct` as shipped. It was not:
+> `8b668c6` was rolled back by `a8b6928` with the rest of that day, and `grep` finds the function nowhere in the
+> tree. Read it as a design record. What T7 actually delivered is in
+> [the T7 research doc](../../research/2026-09-16-t7-config-branch-variables.md).
+
 **Date:** 2026-09-14 · **Branch:** `dev` · **Ticket:** T3 — `env -i sh. SAVETY...shall boot correctly`
 
 > **Status (2026-09-14): designed, implemented, reverted.** The implementation
