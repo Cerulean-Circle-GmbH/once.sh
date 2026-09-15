@@ -5,18 +5,6 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
-# Cross-platform sed helper for first-match replacement
-# BSD sed (macOS) doesn't support GNU's 0,/pattern/ syntax
-# Uses perl which is available on both platforms
-private.oo.sed.first() {
-  local pattern="$1"
-  local replacement="$2"
-  local file="$3"
-  # Escape special chars in replacement for perl
-  local escapedReplacement=$(printf '%s' "$replacement" | sed 's/[&/\]/\\&/g')
-  perl -i -pe "s/\Q${pattern}\E/${escapedReplacement}/ && (\$done = 1) unless \$done" "$file"
-}
-
 oo.deinstall() { # # deinstall oosh and clean leftover configurations
   problem.log "DEINSTALL OOSH: are you sure?  continue with by typing 'c'"
   cp $OOSH_DIR/init/oosh $HOME/install.oosh
@@ -83,12 +71,16 @@ private.oo.new.method()   # <newScript.newMethod> # creates a new method in the 
     error.log "No parameter provided."
     return 1
   fi
-  local newScript=$(echo $name | cut -d. -f1)
-  local newMethod=$(echo $name | cut -d. -f2)
-  
-  if [ -z "$newMethod" ]; then
-    warn.log "check if the parameter contains a ."
-    error.lgo "no method name in: $name:"
+  # EVERY segment after the first is the method name. `cut -d. -f2` took only
+  # the second, so `config.env.init` generated `config.env()` and dropped
+  # `.init` silently, and `private.oo.cmd.verify` aimed at a file called
+  # `private`. Deep hierarchy is explicitly blessed — see
+  # docs/oosh-architecture.md, `hiveMind.team.context.status()`.
+  local newScript="${name%%.*}"
+  local newMethod="${name#*.}"
+
+  if [ -z "$newMethod" ] || [ "$newMethod" = "$name" ]; then
+    error.log "no method name in '$name' — expected <script>.<method>, e.g. config.env.init"
     return 2
   fi
   console.log "
@@ -98,71 +90,112 @@ private.oo.new.method()   # <newScript.newMethod> # creates a new method in the 
 
   if check file $OOSH_DIR/$newScript exists fix error.log "$OOSH_DIR/$newScript does not exist"
   then
+    # Ask BEFORE touching the file, and put the answers in the DOCSTRING.
+    # The docstring is the single source: this.help renders it and c2
+    # completes from it (docs/first-principles.md — "defined only once, in the
+    # code itself"). The tool used to ship the template's placeholder
+    # unchanged and write the typed text into the usage TABLE instead, so
+    # every generated method was born with no metadata at all.
+    local methodParameter methodDescription
+    echo "Parameters for $newScript.$newMethod — e.g. <branch> <?force:no> — empty for none:"
+    read methodParameter
+    echo "One-line description of $newScript.$newMethod:"
+    read methodDescription
+
     local tweakedMethod=$(cat $OOSH_DIR/templates/code/newMethod | sed 's/newScript/'"$newScript"'/' | sed 's/newMethod/'"$newMethod"'/')
-    local replaceText="### new.method"
 
-    replace within "$OOSH_DIR/$newScript" "$replaceText" by "$tweakedMethod"
+    # The pattern MUST be quoted inside ${var/pattern/replacement}: unquoted,
+    # a leading '#' is not matched literally and the substitution silently
+    # does nothing.
+    local placeholder="# parameters # method description # an example"
+    local docstring="# ${methodParameter} # ${methodDescription} #"
+    tweakedMethod="${tweakedMethod/"$placeholder"/"$docstring"}"
 
+    # A method without its completion function is broken by the project's own
+    # definition (docs/oosh-architecture.md, Method Structure Standard): it
+    # will not tab-complete. The template emits none, so the tool must.
+    # Inserted BEFORE the trailing marker, which the template carries so the
+    # next insertion has somewhere to go.
+    local stubs; stubs=$(private.oo.method.stubs.get "$newScript.$newMethod" "$methodParameter")
+    tweakedMethod="${tweakedMethod/"### new.method"/"$stubs
+### new.method"}"
 
-    local replaceNameDesc="      ----      --------------------------"
-    local newNameDesc="      ----      --------------------------
-      ----      --------------------------"
-
-    replace within "$OOSH_DIR/$newScript.new" "$replaceNameDesc" by "$newNameDesc"
-
-    private.oo.sed.first "----" "$newMethod" "$OOSH_DIR/$newScript.new"
-
-    local descriptParameter
-    echo "A short description and Parameter(s) for method" $newMethod "of" $newScript": "
-    read descriptParameter
-    echo "$descriptParameter"
-
-    private.oo.sed.first "--------------------------" "$descriptParameter" "$OOSH_DIR/$newScript.new"
-
-    replace commit "$OOSH_DIR/$newScript"
-
-    replace cleanup "$OOSH_DIR/$newScript"
-
-    success.log "created oo new method in script $1"
-    
+    # `replace line`, not `replace within`: the marker must match a WHOLE line
+    # and exactly one of them. `replace within` matches a substring on every
+    # line, and the marker text also appears in this very function's source a
+    # few lines above — running the tool against `oo` itself corrupted it.
+    if replace line "$OOSH_DIR/$newScript" "### new.method" by "$tweakedMethod" \
+       && replace commit "$OOSH_DIR/$newScript"; then
+      replace cleanup "$OOSH_DIR/$newScript"
+      success.log "created method $newScript.$newMethod in $OOSH_DIR/$newScript"
+    else
+      # Deliberately no `replace commit` on this path. It used to run
+      # unconditionally, and committing with no working copy left the script
+      # with no file under its own name.
+      error.log "could not insert $newScript.$newMethod — $OOSH_DIR/$newScript is unchanged"
+      replace cleanup "$OOSH_DIR/$newScript"
+      return 3
+    fi
   fi
 
   if check file $OOSH_DIR/test/test.$newScript exists fix error.log "$OOSH_DIR/test/test.$newScript does not exist"
   then
-    local tweakedTestMethod=$(cat $OOSH_DIR/templates/code/newMethodTest | sed 's/newScript/'"$newScript"'/' | sed 's/newMethod/'"$newMethod"'/')
-    local replaceTestText="### test.method"
-
-    replace within "$OOSH_DIR/test/test.$newScript" "$replaceTestText" by "$tweakedTestMethod"
-
-    local testDescription
-    echo "Give a short description of the test" $newMethod "of script" $newScript": "
+    # Same shape as the method half: ask first, substitute in the VARIABLE,
+    # insert once. The three answers used to be sed'd into the file after
+    # insertion, first-match-in-the-whole-file — so a second run against the
+    # same test file rewrote the FIRST test case's text instead of the new one.
+    local testDescription testParameter testExpect
+    echo "One-line description of the test for $newScript.$newMethod:"
     read testDescription
-    echo "$testDescription"
-
-    private.oo.sed.first "testDescription" "$testDescription" "$OOSH_DIR/test/test.$newScript.new"
-
-    local testParameter
-    echo "Give the parameters for test" $newMethod "of script" $newScript": "
+    echo "Arguments to call $newScript.$newMethod with in the test:"
     read testParameter
-    echo "$testParameter"
-
-    private.oo.sed.first "newArguments" "$testParameter" "$OOSH_DIR/test/test.$newScript.new"
-
-    local testExpect
-    echo "What to expect of test" $newMethod "of script" $newScript": "
+    echo "Expected \$RESULT for that call:"
     read testExpect
-    echo "$testExpect"
 
-    private.oo.sed.first "new_expect" "$testExpect" "$OOSH_DIR/test/test.$newScript.new"
-    
-    replace commit "$OOSH_DIR/test/test.$newScript"
+    local tweakedTestMethod=$(cat $OOSH_DIR/templates/code/newMethodTest | sed 's/newScript/'"$newScript"'/' | sed 's/newMethod/'"$newMethod"'/')
+    tweakedTestMethod="${tweakedTestMethod/"testDescription"/"$testDescription"}"
+    tweakedTestMethod="${tweakedTestMethod/"newArguments"/"$testParameter"}"
+    tweakedTestMethod="${tweakedTestMethod/"new_expect"/"$testExpect"}"
 
-    replace cleanup "$OOSH_DIR/test/test.$newScript"
-
-    success.log "created new test for method $1"
-    
+    if replace line "$OOSH_DIR/test/test.$newScript" "### test.method" by "$tweakedTestMethod" \
+       && replace commit "$OOSH_DIR/test/test.$newScript"; then
+      replace cleanup "$OOSH_DIR/test/test.$newScript"
+      success.log "created the test case for $newScript.$newMethod in $OOSH_DIR/test/test.$newScript"
+    else
+      error.log "could not insert the test case — $OOSH_DIR/test/test.$newScript is unchanged"
+      replace cleanup "$OOSH_DIR/test/test.$newScript"
+      return 4
+    fi
   fi
 
+  create.result 0 "$newScript.$newMethod created in $newScript and test/test.$newScript"
+  return $(result)
+}
+
+private.oo.method.stubs.get() # <script.method> <parameters> # the completion functions a generated method must carry, one per parameter; answers on stdout
+{
+  # NO create.result — a getter consumed as $(...), which runs in a subshell,
+  # so RESULT would never reach the caller. Same reasoning as
+  # private.oo.path.sudo.get.
+  #
+  # The name deliberately avoids the segment `.completion.`: c2 scans for
+  # `*.completion.*` to build its candidate lists, and a helper matching that
+  # shape would be offered as if it completed a parameter called `stub`.
+  local fullName="$1" params="$2" token pname
+  if [ -z "$params" ]; then
+    # The documented empty form for a method that takes no parameters.
+    printf '\n%s\n' "$fullName.completion() { :; }"
+    return 0
+  fi
+  printf '\n'
+  for token in $params; do
+    pname="${token#<}"; pname="${pname%>}"; pname="${pname#\?}"; pname="${pname%%:*}"
+    case "$pname" in ''|*[!A-Za-z0-9]*) continue ;; esac
+    printf '%s\n' "$fullName.completion.$pname() {"
+    printf '%s\n' "  # one candidate per line on stdout; \$1 is the word being completed"
+    printf '%s\n' "  echo \"\""
+    printf '%s\n' "}"
+  done
 }
 
 
