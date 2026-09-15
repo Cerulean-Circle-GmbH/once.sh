@@ -307,6 +307,13 @@ Until 2026-09-15 it always returned 0 — its last statement was a bare `RETURN=
 exit status was that of a variable assignment whatever the package manager did, and every caller
 that checked it was dead code.
 
+**From inside a script, source `oo` and call `oo.cmd`**, not `oo cmd`: the exit status crosses a
+subprocess boundary but `$RESULT` (the reason) does not. `ossh.prereqs.install` and `ossh.status`
+do it this way.
+
+**Chaining limit.** `<packageName>` is optional and positional, so `oo cmd X cmd Y` cannot chain —
+the second `cmd` is read as X's package name. Use one `oo cmd` per line.
+
 ### oo.find.cmd
 
 Searches apt repositories for a command.
@@ -526,6 +533,7 @@ Internal functions (not for direct use):
 | `private.check.pm` | Tests single package manager |
 | `private.check.all.pm` | Tests all package managers |
 | `private.install.dev.configs` | Installs dev SSH configs |
+| `private.oo.cmd.verify` | Predicate: is `<cmd>` on PATH after an install attempt; reason (incl. the macOS installed-but-not-on-PATH diagnostic) in `$RESULT`, never logged by itself — the caller logs it once at its own severity |
 
 ## See Also
 

@@ -56,14 +56,22 @@ target. That is the only reason the order below departs from the tracker's, whic
 | 1 | *(no card — found while grounding)* | Tests write the real shared config | none to prod |
 | 2 | `oo cmd mc && create.result check` | `oo.cmd` always exits 0 | **HIGH** — install |
 | 3 | *(no card — open box on an existing ticket)* | `test.suite` inherits another file's score | none to prod |
-| 4 | `review hot PATH is bootstrapped` | **T8** | LOW |
-| 5 | `config has to bootstrap always all variables…` | **T7** | **HIGH** — install |
+| 4 | `config has to bootstrap always all variables…` | **T7** | **HIGH** — install |
+| 5 | `review hot PATH is bootstrapped` | **T8** | LOW |
 | 6 | `/root/ssh..2378eed3bee5.for.2378eed3bee5` | Two naming bugs + a cwd-relative backup | **HIGH** — install |
 | 7 | `oo.mode.setup # <?worktree_base> #…` | Exists, incomplete | MEDIUM — dev tree |
 | 8 | `odocker workspace.get …` + `odocker workspace.init` | `get` ignores its arg; `init` missing | LOW |
 | 9 | `oo.checkout # <version> #…` | Works correctly. Docs-only | none |
 | 10 | `…/hosts/WODA.test/certificates.update.conf` | Nothing broken. Note only | none |
 | 11 | `prod/docs/puml/bootsratp.sequence` | **T6** diagram | none |
+
+**Also not scheduled — three cards proposed by the afternoon review (2026-09-15), see the
+tracker § 4c.** *Runner-level test isolation* (ticket 1 is opt-in per file and ticket 3's handoff
+still lands in the shared tier and never fails the run — the runner should isolate every
+`core`/`extended` child by default and keep its handoff in a per-run directory; scheduled right
+after this pass, before T7). *Callers of `oo cmd` act on its status* (8 of 12 live call sites
+still ignore it). *`check.file` warns "filesystem is case insensitive" on any absent file, and
+`log` writes `~/config/result.txt`/`error.txt` by a hardcoded path.*
 
 **Not scheduled — needs its own card.** 44 production functions call `create.result` without
 `return $(result)`, across `oo`, `ossh`, `this`, `os`, `state`, `path`, `osshLayout`, `hiveMind`,
@@ -153,7 +161,22 @@ alpine and almalinux**. `docs/oo.md` gains the contract line.
 
 **DONE 2026-09-15.** `oo.cmd` has the contract on every branch; the post-condition is the new
 `private.oo.cmd.verify`, moved out of `ossh` so `oo.cmd` can enforce what its own comment used to
-defer to `ossh.prereqs.install` for. Six `T-CMD-*` tests, each with its own negative control.
+defer to `ossh.prereqs.install` for. Six `T-CMD-*` tests.
+
+**Corrected in the afternoon conformance review (2026-09-15).** The morning's DONE text claimed
+"each with its own negative control" — the controls existed only in `8928c3e`'s commit body, four
+of six. They are now in the file as `T-CMD-CONTROL-*` (`8e3c9cc`): each plants the original
+defect as an `oo.cmd` override in the same shim and requires the test above to go red with its
+specific diagnosis. Three further defects in the morning's own code were fixed (`e12cc32`):
+`private.oo.cmd.verify` logged *and* was called under `>/dev/null 2>&1` (swallowing its own
+diagnostic when `LOG_DEVICE` is not a tty), `8d1617c` re-verified out of process behind a
+`this.functionExists` fallback, and the comment in `oo` asserted the wrong dependency direction.
+`ossh.prereqs.install` now sources `oo` and calls `oo.cmd` in-process (`T-OSSH-PREREQS-LOCAL-*`,
+with control). The DoD's "ubuntu plus alpine and almalinux" had **not** been met — only alpine and
+almalinux ran, and those showed 3 and 2 reds that were skip-guard defects in T47/T50, not the
+claimed "1 intentional" (`791458e`). The ubuntu gate on `8d1617c` passed for all four users
+(658/657/1) before the afternoon changes; the three-platform gate on the corrected tree is
+recorded in the tracker change log.
 
 Two defects this card did not mention, both fixed here:
 
@@ -194,58 +217,7 @@ assertions. No `extended` baseline had ever been recorded; it is now.
 
 ---
 
-## 4. T8 — PATH bootstrap and the `path` script
-
-**Card:** `review hot PATH is bootstrapped` · `PATH=` · `and the path script`
-
-**What it is.** `boot` is already the correct colon-guarded, idempotent PATH builder. The problem
-is that it is one of **five** mechanisms:
-
-1. `boot` — correct
-2. a duplicate of the same block in `ossh`
-3. unguarded prepends in `this` (two of them)
-4. `this.path.add`, a prepend chain invoked five times — including `this.path.add "."`, which puts
-   **the current directory first on PATH**
-5. the `path` script — effectively dead: `path append`/`prepend`/`remove` mutate a child process
-   and exit, then claim to persist to config, but `config.save` never persists PATH.
-   `path.file.global`/`save`/`load` target `/etc/paths` and `~/paths`, neither of which exists on
-   Linux. `path.status`/`path.sync` grep for an `^export PATH=` line that pure-data `user.env` has
-   not contained since the env-file migration.
-
-Two stale docs: `docs/config.md` names `bashrcTemplate` as the PATH builder (it has only been a
-degrade branch since the boot-loader migration), and `docs/oosh-architecture.md` advertises
-`path add`, a verb that does not exist. There is no PATH-ownership rule in `docs/boot.md`, unlike
-`OOSH_DIR` and `CONFIG_PATH`, which have one *and* a validator.
-
-**Research doc first.**
-
-**What to do.** Establish the rule: **`boot` is the single builder and stays byte-identical**;
-everything else delegates or is a documented degrade branch. Guard it the way T4+T5 guarded the
-anchors — a `this.anchor.validate` sibling with a planted violation in its test. Colon-guard the
-two `this` prepends. Remove `this.path.add "."`. Reduce `path` to a read-only reporting tool plus
-session-local helpers: delete `private.update.config` (this is what ends the shared-config
-corruption), the macOS relics, and `path.status`/`path.sync`. Remove **7 of the 8** `export PATH`
-lines in `.github/workflows/macos-test.yml` — **keep the Homebrew one**. Fix both stale docs. Add
-the PATH section to `docs/boot.md`.
-
-**Keep and document as sanctioned:** the five `. ~/oosh/boot || export PATH=…` degrade branches and
-`bashrcTemplate`'s fallback. Those are the boot-absent path, not violations.
-
-**Do not re-litigate.** T9 already decided `boot` may not skip PATH when `~/oosh` is absent — it
-would skip during install, before `~/oosh` exists. Cite that decision rather than reopening it. Do
-not touch `templates/user/profile.d.oosh.sh`; install state 34 owns that file.
-
-**Done when.** `test.config` T24 — which today greps `boot` for literal strings and therefore
-cannot fail — is replaced with a behavioural test: source `boot` twice from a fixture `HOME` and
-assert `$OOSH_DIR` appears exactly once on PATH; then pre-seed PATH with it mid-string and assert
-`boot` neither moves nor duplicates it. Controls: strip the colon guard; and add a bare
-`export PATH=/tmp:$PATH` to a tracked file and require the sweep to report a violation.
-
-*Housekeeping while in there: `test.config` has two different tests both numbered T24.*
-
----
-
-## 5. T7 — config bootstraps all branch-version variables
+## 4. T7 — config bootstraps all branch-version variables
 
 **Card:** `config has to bootstrap always all variables required for a branch version` ·
 `conifg init repairs a nonexisting or broken config`
@@ -297,6 +269,63 @@ calling shell's variables into the shared tier — that is the mechanism that pr
 rc 1, and after repair the persisted value agrees with the checkout. With `oosh.env` absent
 entirely: the check **names** every missing variable, instead of succeeding emptily. Controls:
 revert the reconcile; and separately prove the repair cannot fire during an install.
+
+**Follow-up owned by this ticket.** `test.suite.config.isolate` (ticket 1) re-implements
+`config.init` by hand — it touches `$CONFIG`, `result.env`, `error.txt` and `stateMachines/` in
+the fixture — because `config.init` does an unconditional `export CONFIG_PATH=~/config` and cannot
+be pointed at a fixture. Once `config init` honours the `CONFIG_PATH` it is given, `isolate`
+delegates to it and that hand-rolled block goes.
+
+---
+
+## 5. T8 — PATH bootstrap and the `path` script
+
+**Card:** `review hot PATH is bootstrapped` · `PATH=` · `and the path script`
+
+**What it is.** `boot` is already the correct colon-guarded, idempotent PATH builder. The problem
+is that it is one of **five** mechanisms:
+
+1. `boot` — correct
+2. a duplicate of the same block in `ossh`
+3. unguarded prepends in `this` (two of them)
+4. `this.path.add`, a prepend chain invoked five times — including `this.path.add "."`, which puts
+   **the current directory first on PATH**
+5. the `path` script — effectively dead: `path append`/`prepend`/`remove` mutate a child process
+   and exit, then claim to persist to config, but `config.save` never persists PATH.
+   `path.file.global`/`save`/`load` target `/etc/paths` and `~/paths`, neither of which exists on
+   Linux. `path.status`/`path.sync` grep for an `^export PATH=` line that pure-data `user.env` has
+   not contained since the env-file migration.
+
+Two stale docs: `docs/config.md` names `bashrcTemplate` as the PATH builder (it has only been a
+degrade branch since the boot-loader migration), and `docs/oosh-architecture.md` advertises
+`path add`, a verb that does not exist. There is no PATH-ownership rule in `docs/boot.md`, unlike
+`OOSH_DIR` and `CONFIG_PATH`, which have one *and* a validator.
+
+**Research doc first.**
+
+**What to do.** Establish the rule: **`boot` is the single builder and stays byte-identical**;
+everything else delegates or is a documented degrade branch. Guard it the way T4+T5 guarded the
+anchors — a `this.anchor.validate` sibling with a planted violation in its test. Colon-guard the
+two `this` prepends. Remove `this.path.add "."`. Reduce `path` to a read-only reporting tool plus
+session-local helpers: delete `private.update.config` (this is what ends the shared-config
+corruption), the macOS relics, and `path.status`/`path.sync`. Remove **7 of the 8** `export PATH`
+lines in `.github/workflows/macos-test.yml` — **keep the Homebrew one**. Fix both stale docs. Add
+the PATH section to `docs/boot.md`.
+
+**Keep and document as sanctioned:** the five `. ~/oosh/boot || export PATH=…` degrade branches and
+`bashrcTemplate`'s fallback. Those are the boot-absent path, not violations.
+
+**Do not re-litigate.** T9 already decided `boot` may not skip PATH when `~/oosh` is absent — it
+would skip during install, before `~/oosh` exists. Cite that decision rather than reopening it. Do
+not touch `templates/user/profile.d.oosh.sh`; install state 34 owns that file.
+
+**Done when.** `test.config` T24 — which today greps `boot` for literal strings and therefore
+cannot fail — is replaced with a behavioural test: source `boot` twice from a fixture `HOME` and
+assert `$OOSH_DIR` appears exactly once on PATH; then pre-seed PATH with it mid-string and assert
+`boot` neither moves nor duplicates it. Controls: strip the colon guard; and add a bare
+`export PATH=/tmp:$PATH` to a tracked file and require the sweep to report a violation.
+
+*Housekeeping while in there: `test.config` has two different tests both numbered T24.*
 
 ---
 
