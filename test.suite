@@ -60,8 +60,15 @@ private.test.suite.category() # <file> # reads TEST_CATEGORY from a test file, d
   create.result 0 "$category"
 }
 
-private.test.suite.results.file() # # absolute path of the per-file handoff the child writes and the runner reads back as that file's score
+private.test.suite.results.file.get() # # absolute path of the per-file handoff the child writes and the runner reads back as that file's score
 {
+  # NO create.result here, deliberately. This is a getter consumed as $(...),
+  # and a command substitution runs in a SUBSHELL — RESULT and RETURN_VALUE
+  # set inside it never reach the caller, so the contract would silently break
+  # the value channel. Same reasoning as private.oo.path.sudo.get,
+  # test.suite.home.passwd and test.suite.boot.anchors.check, which all answer
+  # on stdout for exactly this reason.
+  #
   # A default SUBSTITUTION, not an assignment — this.anchor.validate matches
   # `${CONFIG_PATH:=` and plain assignments, and this is neither, so no
   # exception marker is warranted here.
@@ -70,21 +77,24 @@ private.test.suite.results.file() # # absolute path of the per-file handoff the 
 
 private.test.suite.results.clear() # # remove the handoff file, so the next file cannot be scored with the previous file's numbers
 {
-  # Removes the FILE only. It deliberately does NOT zero the counters: this is
-  # callable from inside a test file, and zeroing there would wipe that file's
-  # own running score. Zeroing is the runner's business and happens in
-  # private.test.suite.run.filtered, between files.
-  local resultsFile; resultsFile=$(private.test.suite.results.file)
+  # Runner-only, called between files. It removes the FILE and deliberately
+  # does NOT zero the counters — the two were one primitive at first, and
+  # calling it wiped the calling file's own running score. Zeroing lives in
+  # private.test.suite.counters.reset.
+  local resultsFile; resultsFile=$(private.test.suite.results.file.get)
   rm -f "$resultsFile" 2>/dev/null
   if [ -e "$resultsFile" ]; then
     # $CONFIG_PATH is a SHARED sharedConfig (2775, group dev). Another user's
     # file is unlinkable unless the DIRECTORY lost its group-write bit — the
     # state private.os.platform.shared.config.repair exists to fix. Silent
-    # failure here silently restores the inheritance bug, so: loud.
-    echo -e "\e[1;31m  ✗ test.suite: cannot remove $resultsFile — every score from here on would be inherited\e[0m"
-    return 1
+    # failure here silently restores the inheritance bug, so: loud, and via
+    # bare echo so the instruction survives any LOG_DEVICE.
+    create.result 1 "cannot remove $resultsFile — every score from here on would be inherited"
+    echo -e "\e[1;31m  ✗ test.suite: $RESULT\e[0m"
+    return $(result)
   fi
-  return 0
+  create.result 0 "handoff cleared"
+  return $(result)
 }
 
 private.test.suite.counters.reset() # # zero the exported per-file counters between files; runner-only, never call this from inside a test file
@@ -96,7 +106,8 @@ private.test.suite.counters.reset() # # zero the exported per-file counters betw
   TEST_SUITE_EXPECT_COUNTER=0
   TEST_SUITE_SUCCESS_COUNTER=0
   export TEST_SUITE_TEST_COUNTER TEST_SUITE_EXPECT_COUNTER TEST_SUITE_SUCCESS_COUNTER
-  return 0
+  create.result 0 "per-file counters reset"
+  return $(result)
 }
 
 test.suite.save.results() # # writes this file's counters to the handoff the runner reads, then prints the summary
@@ -107,7 +118,18 @@ test.suite.save.results() # # writes this file's counters to the handoff the run
   # fixture and the runner would have re-read the PREVIOUS file's numbers.
   # Three literal lines, one destination, and no config.start — which used to
   # run at the tail of every test file and could re-fire config.init.
-  local resultsFile; resultsFile=$(private.test.suite.results.file)
+  # Isolation self-check, BEFORE the counters are written so it is scored.
+  # Only files that called test.suite.config.isolate carry a stamp.
+  if [ -n "$TEST_SUITE_CONFIG_STAMP" ]; then
+    local nowStamp; nowStamp=$(private.test.suite.config.stamp.get "$TEST_SUITE_RESULT_PATH")
+    if [ "$nowStamp" = "$TEST_SUITE_CONFIG_STAMP" ]; then
+      expect.pass "shared config tier untouched ($TEST_SUITE_RESULT_PATH)"
+    else
+      expect.fail "this file WROTE the shared config tier — before[$TEST_SUITE_CONFIG_STAMP] after[$nowStamp]"
+    fi
+  fi
+
+  local resultsFile; resultsFile=$(private.test.suite.results.file.get)
   {
     echo "export TEST_SUITE_TEST_COUNTER=\"${TEST_SUITE_TEST_COUNTER:-0}\""
     echo "export TEST_SUITE_EXPECT_COUNTER=\"${TEST_SUITE_EXPECT_COUNTER:-0}\""
@@ -230,7 +252,7 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
     $OOSH_DIR/test/test.$command $level $clear >/dev/null
   fi
 
-  local resultsFile; resultsFile=$(private.test.suite.results.file)
+  local resultsFile; resultsFile=$(private.test.suite.results.file.get)
   if [ -f "$resultsFile" ]; then
     source "$resultsFile"
   else
@@ -342,7 +364,7 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
 
     # Load per-file results saved by test.suite.save.results in the subprocess
     local FILE_TESTS=0 FILE_EXPECTS=0 FILE_SUCCESS=0
-    local resultsFile; resultsFile=$(private.test.suite.results.file)
+    local resultsFile; resultsFile=$(private.test.suite.results.file.get)
     if [ -f "$resultsFile" ]; then
       source "$resultsFile"
       FILE_TESTS=${TEST_SUITE_TEST_COUNTER:-0}
@@ -721,7 +743,11 @@ test.suite.config.isolate() # <?label:caller> # point the config anchors at a fr
   # silently snaps back to the shared dir while this file believes it is safe.
   local label="${1:-${0##*/}}"
   local fixture
-  fixture=$(mktemp -d "${TMPDIR:-/tmp}/${label}.config.XXXXXX") || return 1
+  if ! fixture=$(mktemp -d "${TMPDIR:-/tmp}/${label}.config.XXXXXX"); then
+    create.result 1 "mktemp -d failed under ${TMPDIR:-/tmp} — cannot isolate, refusing to run against the shared tier"
+    error.log "$RESULT"
+    return $(result)
+  fi
 
   # The score belongs to the CONFIG_PATH this file INHERITED. Pinned before the
   # move and never re-derived, so an early exit or a missing teardown cannot
@@ -730,6 +756,17 @@ test.suite.config.isolate() # <?label:caller> # point the config anchors at a fr
   export TEST_SUITE_RESULT_PATH
   TEST_SUITE_CONFIG_FIXTURE="$fixture"
   export TEST_SUITE_CONFIG_FIXTURE
+  # Fingerprint the inherited tier now, so test.suite.save.results can prove
+  # this file did not write it.
+  #
+  # What this catches: a write that ESCAPES the fixture — a hardcoded
+  # ~/config path, or $HOME/config, which moving CONFIG_PATH does not
+  # redirect. That is exactly the shape test.log's T23 and T31 had.
+  # What it does NOT catch: removal of the isolate call itself, since the
+  # stamp is set by the same call. The canary in test.test.suite covers that
+  # case and is the authoritative proof.
+  TEST_SUITE_CONFIG_STAMP=$(private.test.suite.config.stamp.get "$TEST_SUITE_RESULT_PATH")
+  export TEST_SUITE_CONFIG_STAMP
 
   export CONFIG_PATH="$fixture"   # config-path-exception: a test fixture, not a shell anchor — the point is that this file's production calls land here instead of the site-wide ~/config. Restored by test.suite.config.restore.
   export CONFIG_FILE="user.env"
@@ -750,11 +787,36 @@ test.suite.config.isolate() # <?label:caller> # point the config anchors at a fr
   # Loud postcondition. A half-isolated file is worse than an un-isolated one:
   # it writes the shared tier and nobody is watching any more.
   if [ "$CONFIG_PATH" = "$TEST_SUITE_RESULT_PATH" ] || [ ! -f "$CONFIG" ]; then
-    echo -e "\e[1;31m  ✗ test.suite.config.isolate: isolation FAILED (CONFIG_PATH=$CONFIG_PATH CONFIG=$CONFIG)\e[0m"
-    return 1
+    create.result 1 "isolation FAILED (CONFIG_PATH=$CONFIG_PATH CONFIG=$CONFIG)"
+    # Bare echo, not error.log: this tells the caller its file is about to
+    # write the site-wide tier, and error.log routes to $LOG_DEVICE, which in
+    # a capture or a non-tty CI run swallows it. Bare-echo doctrine.
+    echo -e "\e[1;31m  ✗ test.suite.config.isolate: $RESULT\e[0m" >&2
+    return $(result)
   fi
+  # Both channels, as private.ossh.get.key.name does: $RESULT for a sourced
+  # caller, stdout for $(...) — the docstring promises the path either way.
+  create.result 0 "$fixture" "$1"
   echo "$fixture"
-  return 0
+  return $(result)
+}
+
+private.test.suite.config.stamp.get() # <configPath> # fingerprint of exactly the three files a no-arg `config save` rewrites, for the isolation self-check
+{
+  # NO create.result — a getter consumed as $(...), same subshell reasoning as
+  # private.test.suite.results.file.get.
+  #
+  # Scoped to user.env/oosh.env/log.env: those are what the no-arg config.save
+  # cascade rewrites. result.env, testresult.env and result.txt are written by
+  # the framework itself and would make this fire on every run.
+  local dir="$1" f
+  for f in user.env oosh.env log.env; do
+    if [ ! -f "$dir/$f" ]; then
+      echo "$f ABSENT"
+      continue
+    fi
+    echo "$f $(stat -c '%s %y' "$dir/$f" 2>/dev/null || stat -f '%z %m' "$dir/$f" 2>/dev/null)"
+  done
 }
 
 test.suite.config.isolate.completion.label() {
@@ -765,13 +827,20 @@ test.suite.config.isolate.completion.label() {
 
 test.suite.config.restore() # # restore the config anchors saved by test.suite.config.isolate and remove the fixture; installed as its EXIT trap, safe to call twice
 {
-  [ -z "$TEST_SUITE_CONFIG_FIXTURE" ] && return 0
+  if [ -z "$TEST_SUITE_CONFIG_FIXTURE" ]; then
+    # Nothing to undo is a legitimate outcome, not a failure — the trap fires
+    # on every exit, including files that never isolated. Same distinction
+    # private.oo.boot.path.ensure draws for a branch with no `boot` to link.
+    create.result 0 "nothing to restore"
+    return $(result)
+  fi
   rm -rf "$TEST_SUITE_CONFIG_FIXTURE" 2>/dev/null
   unset TEST_SUITE_CONFIG_FIXTURE
   export CONFIG_PATH="$TEST_SUITE_RESULT_PATH"   # config-path-exception: restoring the value this file inherited, captured by test.suite.config.isolate before it moved it.
   export CONFIG_FILE="user.env"
   export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
-  return 0
+  create.result 0 "config anchors restored to $CONFIG_PATH"
+  return $(result)
 }
 
 test.suite.usage() # # displays usage information for test.suite
