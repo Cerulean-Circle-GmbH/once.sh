@@ -242,7 +242,9 @@ claims T7's first half was delivered via `config.reconstruct`. It was not — th
 prior art worth reading: it contains the blast-radius table and the `OOSH_BOOT_NO_RECONSTRUCT=1`
 escape hatch.
 
-**Research doc first.** Its central decision is that **`OOSH_BRANCH` has two meanings**:
+**Research doc first — written 2026-09-16:**
+[what a config must carry, and who owns `OOSH_BRANCH`](../research/2026-09-16-t7-config-branch-variables.md).
+Its central decision is that **`OOSH_BRANCH` has two meanings**:
 
 | Meaning | Where |
 |---|---|

@@ -254,6 +254,11 @@ which is why it had never been tested. It is now `private.debug.errno`, covered 
 
 ### T7 — config bootstraps all branch-version variables · `config init` repairs 💡 Ideas
 
+> **Research doc (2026-09-16), read before any code:**
+> [what a config must carry, and who owns `OOSH_BRANCH`](../research/2026-09-16-t7-config-branch-variables.md).
+> It ends with three questions for the boss; the central one is whether `OOSH_BRANCH` stops being
+> persisted, which makes the drift impossible rather than repairable.
+
 > **Card (Ideas #7):** `config has to bootstrap always all variables required for a branch version`
 > — `conifg init repairs a nonexisting or broken config`
 
