@@ -89,6 +89,33 @@ is the point; the restore is damage control.
 `TEST_CATEGORY=platform` files are exempt. They assert on the real installed machine, which is the
 entire reason that category exists.
 
+### When a file cannot be isolated yet
+
+Two `core` files reach a production `config save` and **cannot be fixed today**:
+`test.completion.audit` and `test.config`. Both `source` the `config` script, whose `config.start`
+re-runs `config.init`, and `config.init` does an unconditional `export CONFIG_PATH=~/config`. The
+fixture is undone from inside the file under test. That is T7's blocker, not a test defect.
+
+Such a file declares it, in the file, next to `TEST_CATEGORY`:
+
+```bash
+TEST_SHARED_TIER_WRITER="blocked on T7: …the reason, and the ticket that removes it"
+```
+
+The guard still reports the file, still names which shared file changed, and still restores the
+tier. It only stops the run going red, and the line turns yellow and says `(known)` with the
+declared reason. The summary counts waived files on their own line.
+
+**A waiver is a confession, not an exemption.** It names the ticket that will delete it, it lives
+in the file rather than in a list inside the runner so it cannot outlive the fix by accident, and
+the count is meant to reach zero. Do not add one to make a red run green; add one only when the
+write is genuinely unreachable from the test file, and say why.
+
+Why this is not visible on a dev host: `log.env` is only rewritten when its content actually
+differs, and the persisted `LOG_LEVEL` here happens to equal the level the suite runs at. In a
+container that persists `3` while the suite runs at `1`, the same write changes the file. The guard
+is right either way; the host just has nothing to report.
+
 This catches strictly more than isolation prevents. `test.suite.config.isolate` redirects writes
 addressed through `$CONFIG_PATH`; it can do nothing about a hardcoded `~/config` path. That is not
 hypothetical — `test.log`'s T31 wrote the real shared `log.env` through `$HOME/config/log.env`

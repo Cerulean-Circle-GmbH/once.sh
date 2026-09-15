@@ -270,6 +270,14 @@ rc 1, and after repair the persisted value agrees with the checkout. With `oosh.
 entirely: the check **names** every missing variable, instead of succeeding emptily. Controls:
 revert the reconcile; and separately prove the repair cannot fire during an install.
 
+**Two test waivers are T7's to remove.** `test/test.completion.audit` and `test/test.config` both
+declare `TEST_SHARED_TIER_WRITER="blocked on T7: …"`, because they `source` the `config` script and
+`config.start` re-runs `config.init`, whose unconditional `export CONFIG_PATH=~/config` undoes any
+fixture from inside the file under test. The runner's shared-tier guard reports and restores them
+but does not fail the run. **T7 is not done until both markers are deleted and a `core` run is
+green without them** — that is the cheapest possible proof that `config init` now honours the path
+it is given.
+
 **Follow-up owned by this ticket.** `test.suite.config.isolate` (ticket 1) re-implements
 `config.init` by hand — it touches `$CONFIG`, `result.env`, `error.txt` and `stateMachines/` in
 the fixture — because `config.init` does an unconditional `export CONFIG_PATH=~/config` and cannot

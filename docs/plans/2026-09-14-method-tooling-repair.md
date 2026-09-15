@@ -1,6 +1,6 @@
 # Ticket: repair the `oo method.new` tooling
 
-**Created:** 2026-09-14 · **Branch:** `dev` · **Status:** 💡 Ideas — investigated in depth; **implementation reverted 2026-09-14**
+**Created:** 2026-09-14 · **Branch:** `dev` · **Status:** 🔍 **In Review (2026-09-16)** — delivered in `7f93f4b`…`f386f87`; the 2026-09-14 attempt was reverted with the rest of that day (`a8b6928`) and rebuilt here
 **Found while:** planning T3 (`env -i sh. SAVETY...shall boot correctly`)
 
 ## Why this is a ticket
