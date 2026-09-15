@@ -11,6 +11,13 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 > specs and implementation plans from the superpowers workflow live under `docs/superpowers/{specs,plans}/`;
 > reviews and forensics under `docs/research/`. `docs/wiki-index.md` § Design docs & tickets lists them.
 
+> **Start here for the current backlog (2026-09-15):**
+> [what each board card actually is, and what to do about it](2026-09-15-board-backlog.md) —
+> all eleven open items grounded against the code, in recommended order, with the card text
+> verbatim for matching against the board. It supersedes this file's execution order in §3:
+> the test-isolation repair is scheduled **before** T7, because `./test.suite core 1` currently
+> rewrites `oosh.env` — the very file T7's drift bug lives in.
+
 ## 1. Board mapping
 
 | Column | Cards | Ours? |

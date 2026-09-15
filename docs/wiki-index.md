@@ -42,7 +42,7 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 
 ## Design docs & tickets
 
-- `docs/plans/` - Ticket trackers and cards: [OOSH boot tickets](plans/2026-09-10-oosh-boot-tickets.md) (the board, working agreement, change log), [fixed system boot path (T9)](plans/2026-09-14-fixed-system-boot-path.md), [method-tooling repair](plans/2026-09-14-method-tooling-repair.md), [tests that cannot fail](plans/2026-09-14-tests-that-cannot-fail.md)
+- `docs/plans/` - Ticket trackers and cards: **[board backlog 2026-09-15](plans/2026-09-15-board-backlog.md)** (start here — every open card, what it actually is, and what to do), [OOSH boot tickets](plans/2026-09-10-oosh-boot-tickets.md) (the board, working agreement, change log), [fixed system boot path (T9)](plans/2026-09-14-fixed-system-boot-path.md), [method-tooling repair](plans/2026-09-14-method-tooling-repair.md), [tests that cannot fail](plans/2026-09-14-tests-that-cannot-fail.md)
 - `docs/superpowers/specs/` and `docs/superpowers/plans/` - Design specs and implementation plans from the superpowers workflow, e.g. the [clean-environment guarantee](superpowers/specs/2026-09-14-clean-environment-guarantee-design.md) and [recovery from a bare shell](superpowers/specs/2026-09-14-oosh-recovery-from-bare-shell-design.md)
 - `docs/research/` - Reviews and forensics, e.g. the [boot-loader review](research/review-2026-09-09-boot-loader-pure-env-files.md)
 
