@@ -223,7 +223,7 @@ test.test.suite.fixtureSharedConfig() {
   if [ -n "$missing" ]; then
     create.result 1 "test.path rewrote the shared tier; canary destroyed in:$missing"
   elif [ "${landed:-0}" -le 0 ]; then
-    create.result 1 "test.path's score never reached the inherited CONFIG_PATH — the fixture swallowed it"
+    create.result 1 "test.path's score never reached the TEST_SUITE_RESULT_PATH it was given — the config fixture swallowed it"
   else
     # Fixed literal — the expect below matches it exactly. Never `expect 0 "*"`,
     # which would set the expectation to whatever actually happened.
@@ -235,6 +235,205 @@ test.case $level "T-FIXTURE-SHARED-CONFIG: test.path leaves the inherited config
   test.test.suite.fixtureSharedConfig
 expect 0 "shared tier intact, score landed" \
   "a core test must never rewrite the site-wide config every user sources at login"
+
+# ============================================================================
+# T-SHARED-CANARY-* — the RUNNER guards the shared tier, for every file
+# ============================================================================
+# test.suite.config.isolate is opt-in: the next file that forgets the line
+# rewrites the site-wide tier again, and only the isolating file itself carries
+# a canary. Worse, isolation only redirects writes addressed through
+# $CONFIG_PATH — test.log's T31 wrote the real shared log.env through a
+# hardcoded $HOME/config path while believing itself isolated (fixed f9c3802).
+# So the runner fingerprints the tier around EVERY core and extended child,
+# names the offender, puts the tier back, and fails the run.
+
+test.test.suite.shared.fixture() { # <dir> # a simulated shared tier with the three files a no-arg config.save rewrites
+  local f
+  for f in user.env oosh.env log.env; do
+    printf 'export OOSH_CANARY_%s="original"\n' "${f%%.*}" > "$1/$f"
+  done
+}
+
+# --- T-SHARED-CANARY-DETECTS ------------------------------------------------
+test.test.suite.sharedCanaryDetects() {
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.canary.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  # A subshell: the pins below must not leak into THIS file's own scoring.
+  local out rc
+  out=$(
+    export TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run"
+    private.test.suite.shared.snapshot >/dev/null 2>&1 || { echo "SNAPSHOT-FAILED"; exit 1; }
+    if private.test.suite.shared.verify probeFile >/dev/null 2>&1; then
+      : # clean tier verifies clean, as it must
+    else
+      echo "CLEAN-TIER-REPORTED-DIRTY: $RESULT"; exit 1
+    fi
+    printf 'export OOSH_CANARY_oosh="rewritten"\n' > "$fix/oosh.env"
+    if private.test.suite.shared.verify probeFile >/dev/null 2>&1; then
+      echo "WRITE-NOT-DETECTED"; exit 1
+    fi
+    echo "$RESULT"
+  ); rc=$?
+  rm -rf "$fix" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "${out:-verify did not report the write}"
+  elif [ "${out#*oosh.env}" = "$out" ]; then
+    create.result 1 "did not name the file that changed: [$out]"
+  elif [ "${out#*user.env}" != "$out" ]; then
+    create.result 1 "named a file that did NOT change: [$out]"
+  elif [ "${out#*probeFile}" = "$out" ]; then
+    create.result 1 "did not name the test file responsible: [$out]"
+  else
+    create.result 0 "the write is detected and both the file and the offender are named"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-DETECTS: a rewritten shared file is caught and named, an untouched one is not" \
+  test.test.suite.sharedCanaryDetects
+expect 0 "the write is detected and both the file and the offender are named" \
+  "opt-in isolation cannot see a file that never opted in"
+
+# --- T-SHARED-CANARY-RESTORES -----------------------------------------------
+test.test.suite.sharedCanaryRestores() {
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.restore.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  local out rc
+  out=$(
+    export TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run"
+    private.test.suite.shared.snapshot >/dev/null 2>&1 || { echo "SNAPSHOT-FAILED"; exit 1; }
+    printf 'export OOSH_CANARY_user="rewritten"\n' > "$fix/user.env"
+    rm -f "$fix/log.env"                       # a file DELETED by the offender
+    printf 'export X="1"\n' > "$fix/extra.env" # a file the snapshot never saw
+    private.test.suite.shared.restore >/dev/null 2>&1 || { echo "RESTORE-FAILED: $RESULT"; exit 1; }
+    # the tier must now verify clean against the stamp pinned before the damage
+    private.test.suite.shared.verify probeFile >/dev/null 2>&1 || { echo "STILL-DIRTY: $RESULT"; exit 1; }
+    cat "$fix/user.env"
+    [ -f "$fix/extra.env" ] || echo "COLLATERAL-REMOVAL"
+  ); rc=$?
+  rm -rf "$fix" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "${out:-restore did not put the tier back}"
+  elif [ "${out#*COLLATERAL}" != "$out" ]; then
+    create.result 1 "restore removed a file it never snapshotted"
+  elif [ "${out#*rewritten}" != "$out" ]; then
+    create.result 1 "the rewritten content survived the restore: [$out]"
+  elif [ "${out#*original}" = "$out" ]; then
+    create.result 1 "the original content did not come back: [$out]"
+  else
+    create.result 0 "the tier is put back, byte for byte, and nothing else is touched"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-RESTORES: the snapshot undoes the damage, including a deletion" \
+  test.test.suite.sharedCanaryRestores
+expect 0 "the tier is put back, byte for byte, and nothing else is touched" \
+  "the tier is site-wide — one bad test file must not leave it broken for every user on the box"
+
+# --- T-SHARED-CANARY-RUNNER -------------------------------------------------
+# End to end, through the real runner. The unit checks above prove the
+# primitives; only this proves the RUNNER calls them. A throwaway probe file is
+# created in $OOSH_DIR/test (the precedent is T-METHOD-NEW-DOCSTRING, which
+# created probeMethodNewScript in $OOSH_DIR) under a trap, so an interrupted
+# run cannot leave it in the suite's glob.
+test.test.suite.sharedCanaryRunner() {
+  local probe="$OOSH_DIR/test/test.sharedTierProbe"
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.runner.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  trap 'rm -f "'"$probe"'"; rm -rf "'"$fix"'"' RETURN
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'TEST_CATEGORY=core'
+    echo 'source this'
+    echo 'source test.suite'
+    # exactly the defect under test: a production write to the inherited tier
+    echo 'printf %s\\n "export OOSH_CANARY_oosh=\"probe\"" > "$CONFIG_PATH/oosh.env"'
+    echo 'expect.pass "the probe asserted something"'
+    echo 'test.suite.save.results'
+  } > "$probe"
+  chmod +x "$probe"
+
+  local out rc
+  # Capture first, strip colours second. A pipeline would hand back sed's exit
+  # status, not the runner's, and the runner's status is the whole assertion.
+  # TEST_SUITE_CONFIG_ORIGIN must be pinned alongside CONFIG_PATH. It is
+  # exported, so this nested runner would otherwise inherit THIS run's origin —
+  # the real ~/config — snapshot that instead of the fixture, find it untouched
+  # and report green while the probe merrily rewrote the fixture.
+  out=$(env CONFIG_PATH="$fix" CONFIG_FILE=user.env CONFIG="$fix/user.env" \
+            TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run" \
+            "$OOSH_DIR/test.suite" run sharedTierProbe 1 2>&1); rc=$?
+  out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
+  local after; after=$(cat "$fix/oosh.env" 2>/dev/null)
+
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "the runner stayed green while the probe rewrote the shared tier"
+  elif ! echo "$out" | grep -q 'SHARED CONFIG WRITTEN'; then
+    create.result 1 "the runner did not report the write: $(echo "$out" | tail -3 | tr '\n' '|')"
+  elif ! echo "$out" | grep -q 'test.sharedTierProbe'; then
+    create.result 1 "the report does not name the offending file"
+  elif ! echo "$out" | grep -q 'test.suite.config.isolate'; then
+    create.result 1 "the report does not say how to fix it"
+  elif [ "${after#*probe}" != "$after" ]; then
+    create.result 1 "the runner did not restore the tier: [$after]"
+  else
+    create.result 0 "the runner catches it, names it, says how to fix it, and restores the tier"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-RUNNER: end to end, the runner itself catches a file that writes the tier" \
+  test.test.suite.sharedCanaryRunner
+expect 0 "the runner catches it, names it, says how to fix it, and restores the tier" \
+  "the primitives being right proves nothing unless the runner actually calls them"
+
+# ============================================================================
+# T-VERDICT — the suite's pass/fail rule, as one testable decision
+# ============================================================================
+# The rule used to be a 20-line if/elif chain in the tail of
+# private.test.suite.run.filtered that nothing could reach. Extracted so the
+# two new failure causes — a written shared tier, and a core file that scored
+# nothing — can be proven to reach the return code, which is what the macOS
+# workflow and os platform.test gate on.
+#
+# The table is its own control: it contains both rc 0 and rc 1 rows, so a rule
+# that always passed or always failed cannot satisfy it.
+test.test.suite.verdictRule() {
+  local row want got fails=""
+  # sharedWrites noResults category expects passed metaFailures | wantRc
+  while read -r row; do
+    [ -z "$row" ] && continue
+    want="${row##*|}"; want="${want// /}"
+    set -- ${row%%|*}
+    private.test.suite.verdict "$1" "$2" "$3" "$4" "$5" "$6" >/dev/null 2>&1
+    got=$?
+    [ "$got" != "$want" ] && fails="$fails [${row%%|*}-> $got want $want]"
+  done <<'ROWS'
+0 0 core 10 10 -    | 0
+0 0 core 10 9 1     | 0
+0 0 core 10 9 -     | 1
+0 0 core 10 8 1     | 1
+0 0 core 0 0 -      | 1
+0 1 core 10 10 -    | 1
+0 1 extended 10 10 -| 0
+1 0 core 10 10 -    | 1
+1 0 extended 10 10 -| 1
+ROWS
+  if [ -n "$fails" ]; then
+    create.result 1 "verdict rule wrong for:$fails"
+  else
+    create.result 0 "the verdict rule holds on every row"
+  fi
+  return $(result)
+}
+test.case $level "T-VERDICT: a written tier fails any run; a score-less file fails core only" \
+  test.test.suite.verdictRule
+expect 0 "the verdict rule holds on every row" \
+  "these two causes never reached the return code, so CI stayed green through both"
 
 # ============================================================================
 # Final verification

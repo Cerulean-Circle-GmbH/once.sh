@@ -41,7 +41,9 @@ The config system supports:
 > **Tests must never write the shared tier.** It is site-wide: a test that reaches `config save`
 > rewrites `user.env` / `oosh.env` / `log.env` for every user on the box. Use
 > `test.suite.config.isolate` — see [test-suite.md](test-suite.md) § *Isolating a test from the
-> shared config*.
+> shared config*. You will not get away with forgetting: the runner fingerprints those three files
+> around every test file, names the offender, restores the tier and fails the run — see
+> [test-suite.md](test-suite.md) § *The runner guards the shared config tier*.
 
 ### Two config tiers: shared vs per-user
 

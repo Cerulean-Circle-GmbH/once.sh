@@ -68,6 +68,39 @@ invariants on real machines. They run inside
 `./test.suite run <name> 1`. See
 `templates/code/newPlatformInvariantTest` for the skeleton.
 
+## The runner guards the shared config tier
+
+You do not have to remember to isolate for the guard to catch you. Before the first test file, the
+runner copies `user.env`, `oosh.env` and `log.env` out of the inherited `$CONFIG_PATH` and
+fingerprints them (content checksum, size and mtime — the checksum is load-bearing, because BSD
+`stat` reports whole seconds and a test rewrite lands inside one). After **every** `core` and
+`extended` file it compares. A file that changed any of the three is reported like this:
+
+```
+  ✗ SHARED CONFIG WRITTEN: test.myscript wrote the shared config tier: oosh.env
+    fix: add  test.suite.config.isolate test.myscript  before the 'source' of the script under test
+    the tier has been restored from this run's snapshot
+```
+
+and **the whole run fails**, in every category. The tier is then put back from the snapshot, so one
+bad test file does not leave the site-wide config broken for everyone else on the box. The failure
+is the point; the restore is damage control.
+
+`TEST_CATEGORY=platform` files are exempt. They assert on the real installed machine, which is the
+entire reason that category exists.
+
+This catches strictly more than isolation prevents. `test.suite.config.isolate` redirects writes
+addressed through `$CONFIG_PATH`; it can do nothing about a hardcoded `~/config` path. That is not
+hypothetical — `test.log`'s T31 wrote the real shared `log.env` through `$HOME/config/log.env`
+while the file believed itself isolated, until 2026-09-15. The fingerprint sees the write whatever
+route it took.
+
+**The handoff is no longer in the shared tier either.** `testresult.env` used to land in
+`$CONFIG_PATH`, so two users running tests at the same time overwrote each other's scores. The
+runner now gives each run a private `mktemp -d` and exports it as `TEST_SUITE_RESULT_PATH`. A
+caller that pins that variable itself is never overridden — that is how the meta-test drives a
+nested runner.
+
 ## Isolating a test from the shared config
 
 `~/config` (`$CONFIG_PATH`) is normally a **site-wide `sharedConfig`** that every user sources at
@@ -89,10 +122,16 @@ next `source $OOSH_DIR/config` silently snaps back to the shared dir while the t
 safe. `isolate` refuses loudly rather than half-isolating, and `test.suite.config.restore` is
 installed as an `EXIT` trap (chained onto any trap the file already had).
 
-**Your score is unaffected.** `test.suite.init` pins the inherited `CONFIG_PATH` into
-`TEST_SUITE_RESULT_PATH` *before* anything can move it, and `test.suite.save.results` always writes
-there. Without that pin a file that isolated its config would write its score into its own fixture,
-and the runner would report `0 / 0` for a file that really ran.
+**Your score is unaffected.** `test.suite.save.results` writes to `TEST_SUITE_RESULT_PATH`, which
+the runner owns and exports; isolating your config does not move it. Without that separation a file
+that isolated would write its score into its own fixture, and the runner would report `0 / 0` for a
+file that really ran.
+
+**Two variables, two jobs.** `TEST_SUITE_RESULT_PATH` is where the score goes.
+`TEST_SUITE_CONFIG_ORIGIN` is the config tier this process inherited — it is what
+`test.suite.config.restore` puts back into `CONFIG_PATH`, and what the runner snapshots. They were
+one variable until 2026-09-16, which was only correct while the score happened to live in the
+config tier.
 
 **What `CONFIG_PATH` does not cover:** `~/.gitconfig` (use `GIT_CONFIG_GLOBAL`), and `log`'s
 `~/config/result.txt` / `error.txt`, which are hardcoded to `$HOME`.
@@ -112,6 +151,16 @@ file — so it exists if and only if that file wrote it — and a file that prod
 
 If you see `⚠ NO RESULTS: test.<name> produced no score of its own`, that file is not being
 measured. Add `test.suite.save.results` as its last line.
+
+Since 2026-09-16 that warning **fails a `core` run**. All twenty-six `core` files score today, so
+the rule costs nothing now and exists to catch the regression. `extended` keeps the warning without
+failing, because twelve of its files have never scored and giving them one is content work, not
+runner work.
+
+The whole pass/fail rule lives in one place, `private.test.suite.verdict`, so it can be tested. It
+used to be an if/elif chain in the tail of the runner that nothing could reach — which is how both
+of these causes came to be printed on screen and then dropped before the return code that the macOS
+workflow and `os platform.test` actually gate on.
 
 ## Best Practices
 - Use `test.case` for each logical test scenario.

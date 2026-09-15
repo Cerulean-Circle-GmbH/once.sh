@@ -121,9 +121,9 @@ test.suite.save.results() # # writes this file's counters to the handoff the run
   # Isolation self-check, BEFORE the counters are written so it is scored.
   # Only files that called test.suite.config.isolate carry a stamp.
   if [ -n "$TEST_SUITE_CONFIG_STAMP" ]; then
-    local nowStamp; nowStamp=$(private.test.suite.config.stamp.get "$TEST_SUITE_RESULT_PATH")
+    local nowStamp; nowStamp=$(private.test.suite.config.stamp.get "$TEST_SUITE_CONFIG_ORIGIN")
     if [ "$nowStamp" = "$TEST_SUITE_CONFIG_STAMP" ]; then
-      expect.pass "shared config tier untouched ($TEST_SUITE_RESULT_PATH)"
+      expect.pass "shared config tier untouched ($TEST_SUITE_CONFIG_ORIGIN)"
     else
       expect.fail "this file WROTE the shared config tier — before[$TEST_SUITE_CONFIG_STAMP] after[$nowStamp]"
     fi
@@ -193,12 +193,26 @@ test.suite.init() # # initializes test suite counters and environment
     export SUITE_RESULT="Suite Result: "
   fi
 
-  # Pin where this file's score goes, BEFORE anything can move the anchors.
-  # `:=` on an exported variable means the runner's value wins in every child
-  # (test files are exec'd, not sourced), so parent and child resolve the same
-  # handoff path by construction rather than by convention — even when a file
-  # isolates its config with test.suite.config.isolate.
-  : ${TEST_SUITE_RESULT_PATH:=${CONFIG_PATH:-$HOME/config}}
+  # Pin the CONFIG_PATH this process INHERITED, before anything can move it.
+  # Two distinct jobs used to share one variable: test.suite.config.restore put
+  # TEST_SUITE_RESULT_PATH back into CONFIG_PATH, which was only correct while
+  # the score happened to live in the config tier. They are separate now —
+  # ORIGIN is "the tier I inherited", RESULT_PATH is "where my score goes".
+  : ${TEST_SUITE_CONFIG_ORIGIN:=${CONFIG_PATH:-$HOME/config}}
+  export TEST_SUITE_CONFIG_ORIGIN
+
+  # Where this file's score goes. `:=` on an exported variable means the
+  # runner's value wins in every child (test files are exec'd, not sourced), so
+  # parent and child resolve the same handoff path by construction rather than
+  # by convention — even when a file isolates its config.
+  # The flag records that nobody chose this value, so the runner may replace it
+  # with a private per-run directory (private.test.suite.results.dir.open). A
+  # caller that pins TEST_SUITE_RESULT_PATH itself is never overridden.
+  if [ -z "$TEST_SUITE_RESULT_PATH" ]; then
+    TEST_SUITE_RESULT_PATH="${CONFIG_PATH:-$HOME/config}"
+    TEST_SUITE_RESULT_PATH_DEFAULTED=1
+    export TEST_SUITE_RESULT_PATH_DEFAULTED
+  fi
   export TEST_SUITE_RESULT_PATH
 
   # Initialize expected error tracking
@@ -240,6 +254,9 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
   echo -e "\e[1;36m╚════════════════════════════════════════════════════════════════════╝\e[0m"
   echo ""
 
+  private.test.suite.results.dir.open >/dev/null
+  private.test.suite.shared.snapshot >/dev/null
+
   # Same pre-clear as the filtered runner: after this line the handoff exists
   # if and only if THIS file wrote it.
   private.test.suite.results.clear
@@ -250,6 +267,12 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
     $OOSH_DIR/test/test.$command $level $clear
   else
     $OOSH_DIR/test/test.$command $level $clear >/dev/null
+  fi
+
+  local sharedWrites=0
+  if ! private.test.suite.shared.verify "test.$command"; then
+    sharedWrites=1
+    private.test.suite.shared.report "$RESULT" "test.$command"
   fi
 
   local resultsFile; resultsFile=$(private.test.suite.results.file.get)
@@ -270,13 +293,33 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
   echo -e "  Results:   \e[1;32m$TEST_SUITE_SUCCESS_COUNTER\e[0m / $TEST_SUITE_EXPECT_COUNTER assertions passed"
   echo -e "\e[1;37m────────────────────────────────────────────────────────────────────\e[0m"
 
-  if [ "$TEST_SUITE_SUCCESS_COUNTER" -eq "$TEST_SUITE_EXPECT_COUNTER" ]; then
+  local rc=0
+  if [ "$sharedWrites" -gt 0 ]; then
+    echo -e "\e[1;31m  ✗ the shared config tier was written\e[0m"
+    rc=1
+  elif [ "$TEST_SUITE_SUCCESS_COUNTER" -eq "$TEST_SUITE_EXPECT_COUNTER" ]; then
     echo -e "\e[1;32m  ✓ All tests successful\e[0m"
-    return 0
   else
     echo -e "\e[1;31m  ✗ Some tests failed\e[0m"
-    return 1
+    rc=1
   fi
+  private.test.suite.results.dir.close >/dev/null
+  return $rc
+}
+
+private.test.suite.shared.report() # <reason> <testFile> # print the shared-tier verdict and put the tier back; runner-only
+{
+  # Bare echo, not error.log: this says the site-wide config every user sources
+  # at login was just rewritten, and it has to survive a non-tty CI run.
+  echo -e "\e[1;31m  ✗ SHARED CONFIG WRITTEN: $1\e[0m" >&2
+  echo -e "\e[1;31m    fix: add  test.suite.config.isolate ${2}  before the 'source' of the script under test\e[0m" >&2
+  if private.test.suite.shared.restore; then
+    echo -e "\e[1;33m    the tier has been restored from this run's snapshot\e[0m" >&2
+  else
+    echo -e "\e[1;31m    COULD NOT RESTORE: $RESULT\e[0m" >&2
+  fi
+  create.result 0 "reported"
+  return $(result)
 }
 
 private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests matching category filter
@@ -296,6 +339,14 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   # failed". A file with 0 expects has 0 failures.
   local -i NO_RESULT_COUNT=0
   local NO_RESULT_FILES=""
+  # Files caught rewriting the site-wide config tier. Unlike NO_RESULT_COUNT
+  # this fails every category, because the damage is to other users, not to
+  # this run's arithmetic.
+  local -i SHARED_WRITE_COUNT=0
+  local SHARED_WRITE_FILES=""
+
+  private.test.suite.results.dir.open >/dev/null
+  private.test.suite.shared.snapshot >/dev/null
 
   # Count total files matching filter
   local -i TOTAL_FILES=0
@@ -331,10 +382,13 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
       continue
     fi
 
-    # Apply category filter
-    if [ -n "$categoryFilter" ]; then
-      private.test.suite.category "$file"
-      [ "$RESULT" != "$categoryFilter" ] && continue
+    # Ask for the category ALWAYS, not only when filtering: the shared-tier
+    # guard below has to know whether this is a platform test, and `test.suite
+    # all 1` passes no filter yet still runs them.
+    private.test.suite.category "$file"
+    local fileCategory="$RESULT"
+    if [ -n "$categoryFilter" ] && [ "$fileCategory" != "$categoryFilter" ]; then
+      continue
     fi
 
     ((FILE_COUNT++))
@@ -360,6 +414,17 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
       $file $level $clear
     else
       $file $level $clear >/dev/null
+    fi
+
+    # Did this file rewrite the site-wide tier? A platform test is exempt by
+    # design — it asserts on the REAL installed machine, which is the whole
+    # reason TEST_CATEGORY=platform exists.
+    if [ "$fileCategory" != "platform" ]; then
+      if ! private.test.suite.shared.verify "$filename"; then
+        ((SHARED_WRITE_COUNT++))
+        SHARED_WRITE_FILES="$SHARED_WRITE_FILES $filename"
+        private.test.suite.shared.report "$RESULT" "$filename"
+      fi
     fi
 
     # Load per-file results saved by test.suite.save.results in the subprocess
@@ -440,6 +505,9 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   if [ "$NO_RESULT_COUNT" -gt 0 ]; then
     echo -e "  \e[1;33mNo results:  $NO_RESULT_COUNT file(s) never called test.suite.save.results:\e[0m$NO_RESULT_FILES"
   fi
+  if [ "$SHARED_WRITE_COUNT" -gt 0 ]; then
+    echo -e "  \e[1;31mShared tier: $SHARED_WRITE_COUNT file(s) rewrote $TEST_SUITE_CONFIG_ORIGIN:\e[0m$SHARED_WRITE_FILES"
+  fi
   echo ""
 
   # GitHub Actions Job Summary (only when running in GHA)
@@ -478,22 +546,28 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
     fi
   fi
 
-  if [ "$CUMULATIVE_SUCCESS_COUNTER" -eq "$CUMULATIVE_EXPECT_COUNTER" ] && [ "$CUMULATIVE_EXPECT_COUNTER" -gt 0 ]; then
-    echo -e "  \e[1;32m✓ ALL TESTS PASSED\e[0m"
-    return 0
-  elif [ "$CUMULATIVE_EXPECT_COUNTER" -eq 0 ]; then
-    echo -e "  \e[1;33m⚠ NO TESTS RUN\e[0m"
-    return 1
-  elif [ "$ONLY_INTENTIONAL_FAILURE" -eq 1 ]; then
-    echo -e "  \e[1;32m╔══════════════════════════════════════════════════════════════════╗\e[0m"
-    echo -e "  \e[1;32m║  ✓ ALL TESTS PASSED                                              ║\e[0m"
-    echo -e "  \e[1;32m║    (1 intentional failure in test.test.suite verifies counters)  ║\e[0m"
-    echo -e "  \e[1;32m╚══════════════════════════════════════════════════════════════════╝\e[0m"
-    return 0
+  # One rule, one place, testable — see private.test.suite.verdict. The chain
+  # that used to live here was unreachable by any test, which is how a written
+  # shared tier and a score-less core file came to be printed and then dropped
+  # before the return code the CI gate reads.
+  local rc=0
+  if private.test.suite.verdict \
+       "$SHARED_WRITE_COUNT" "$NO_RESULT_COUNT" "$categoryFilter" \
+       "$CUMULATIVE_EXPECT_COUNTER" "$CUMULATIVE_SUCCESS_COUNTER" "$META_TEST_FAILURES"; then
+    if [ "$ONLY_INTENTIONAL_FAILURE" -eq 1 ]; then
+      echo -e "  \e[1;32m╔══════════════════════════════════════════════════════════════════╗\e[0m"
+      echo -e "  \e[1;32m║  ✓ ALL TESTS PASSED                                              ║\e[0m"
+      echo -e "  \e[1;32m║    (1 intentional failure in test.test.suite verifies counters)  ║\e[0m"
+      echo -e "  \e[1;32m╚══════════════════════════════════════════════════════════════════╝\e[0m"
+    else
+      echo -e "  \e[1;32m✓ ALL TESTS PASSED\e[0m"
+    fi
   else
-    echo -e "  \e[1;31m✗ SOME TESTS FAILED\e[0m"
-    return 1
+    echo -e "  \e[1;31m✗ $RESULT\e[0m"
+    rc=1
   fi
+  private.test.suite.results.dir.close >/dev/null
+  return $rc
 }
 
 test.suite.all() # <?logLevel:1> # runs all tests from the test folder
@@ -753,11 +827,12 @@ test.suite.config.isolate() # <?label:caller> # point the config anchors at a fr
     return $(result)
   fi
 
-  # The score belongs to the CONFIG_PATH this file INHERITED. Pinned before the
-  # move and never re-derived, so an early exit or a missing teardown cannot
-  # send it into the fixture where the runner would never find it.
+  # Both pinned before the move and never re-derived, so an early exit or a
+  # missing teardown cannot send the score into the fixture where the runner
+  # would never find it, nor leave CONFIG_PATH pointing at the fixture.
   : ${TEST_SUITE_RESULT_PATH:=${CONFIG_PATH:-$HOME/config}}
-  export TEST_SUITE_RESULT_PATH
+  : ${TEST_SUITE_CONFIG_ORIGIN:=${CONFIG_PATH:-$HOME/config}}
+  export TEST_SUITE_RESULT_PATH TEST_SUITE_CONFIG_ORIGIN
   TEST_SUITE_CONFIG_FIXTURE="$fixture"
   export TEST_SUITE_CONFIG_FIXTURE
   # Fingerprint the inherited tier now, so test.suite.save.results can prove
@@ -769,7 +844,7 @@ test.suite.config.isolate() # <?label:caller> # point the config anchors at a fr
   # What it does NOT catch: removal of the isolate call itself, since the
   # stamp is set by the same call. The canary in test.test.suite covers that
   # case and is the authoritative proof.
-  TEST_SUITE_CONFIG_STAMP=$(private.test.suite.config.stamp.get "$TEST_SUITE_RESULT_PATH")
+  TEST_SUITE_CONFIG_STAMP=$(private.test.suite.config.stamp.get "$TEST_SUITE_CONFIG_ORIGIN")
   export TEST_SUITE_CONFIG_STAMP
 
   export CONFIG_PATH="$fixture"   # config-path-exception: a test fixture, not a shell anchor — the point is that this file's production calls land here instead of the site-wide ~/config. Restored by test.suite.config.restore.
@@ -790,7 +865,7 @@ test.suite.config.isolate() # <?label:caller> # point the config anchors at a fr
 
   # Loud postcondition. A half-isolated file is worse than an un-isolated one:
   # it writes the shared tier and nobody is watching any more.
-  if [ "$CONFIG_PATH" = "$TEST_SUITE_RESULT_PATH" ] || [ ! -f "$CONFIG" ]; then
+  if [ "$CONFIG_PATH" = "$TEST_SUITE_CONFIG_ORIGIN" ] || [ ! -f "$CONFIG" ]; then
     create.result 1 "isolation FAILED (CONFIG_PATH=$CONFIG_PATH CONFIG=$CONFIG)"
     # Bare echo, not error.log: this tells the caller its file is about to
     # write the site-wide tier, and error.log routes to $LOG_DEVICE, which in
@@ -819,8 +894,177 @@ private.test.suite.config.stamp.get() # <configPath> # fingerprint of exactly th
       echo "$f ABSENT"
       continue
     fi
-    echo "$f $(stat -c '%s %y' "$dir/$f" 2>/dev/null || stat -f '%z %m' "$dir/$f" 2>/dev/null)"
+    # cksum FIRST, and it is the load-bearing part. BSD `stat -f %m` has
+    # whole-second resolution, so mtime alone misses a rewrite that lands in
+    # the same second — which is exactly what a test file does. cksum reads
+    # from stdin so the output carries no filename to differ between platforms.
+    echo "$f $(cksum < "$dir/$f" 2>/dev/null) $(stat -c '%s %y' "$dir/$f" 2>/dev/null || stat -f '%z %m' "$dir/$f" 2>/dev/null)"
   done
+}
+
+private.test.suite.results.dir.open() # # give this run a private directory for the handoff and the shared-tier snapshot, so two users running tests at once cannot clobber each other; runner-only
+{
+  # The handoff used to land in $CONFIG_PATH — a SHARED sharedConfig. Two runs
+  # by different users overwrote each other's scores, and
+  # private.test.suite.results.clear still carries the branch for "another
+  # user's file is unlinkable" that this makes unreachable.
+  if [ -z "$TEST_SUITE_RESULT_PATH_DEFAULTED" ]; then
+    # Somebody chose the value on purpose (the meta-test pins its own fixture).
+    create.result 0 "using the caller's $TEST_SUITE_RESULT_PATH"
+    return $(result)
+  fi
+  local dir
+  if ! dir=$(mktemp -d "${TMPDIR:-/tmp}/oosh.test.suite.XXXXXX"); then
+    create.result 1 "mktemp -d failed under ${TMPDIR:-/tmp} — refusing to put the score back in the shared tier"
+    # Bare echo: this decides where every score for the rest of the run goes,
+    # and error.log routes to $LOG_DEVICE, which a capture or a non-tty CI run
+    # swallows. Same doctrine as private.test.suite.results.clear.
+    echo -e "\e[1;31m  ✗ test.suite: $RESULT\e[0m" >&2
+    return $(result)
+  fi
+  TEST_SUITE_RESULT_PATH="$dir"
+  unset TEST_SUITE_RESULT_PATH_DEFAULTED
+  export TEST_SUITE_RESULT_PATH
+  # NOT exported, deliberately. This says "THIS process created the directory",
+  # so it must not reach a child. A nested runner — test.test.suite drives
+  # `test.suite run` as a subprocess — would otherwise inherit the flag and
+  # delete its parent's directory on close, taking the parent's whole score
+  # with it. Caught by T-SHARED-CANARY-RUNNER reporting 0 / 0 for this file.
+  TEST_SUITE_RESULT_PATH_OWNED="$dir"
+  create.result 0 "$dir"
+  return $(result)
+}
+
+private.test.suite.results.dir.close() # # remove the per-run directory, but only if this process created it; runner-only
+{
+  if [ -z "$TEST_SUITE_RESULT_PATH_OWNED" ]; then
+    # Nothing to undo is a legitimate outcome, not a failure — the caller may
+    # have pinned its own directory, which is theirs to remove.
+    create.result 0 "nothing to remove"
+    return $(result)
+  fi
+  rm -rf "$TEST_SUITE_RESULT_PATH_OWNED" 2>/dev/null
+  create.result 0 "removed $TEST_SUITE_RESULT_PATH_OWNED"
+  unset TEST_SUITE_RESULT_PATH_OWNED
+  return $(result)
+}
+
+private.test.suite.shared.snapshot() # # copy the inherited config tier aside and pin its fingerprint, so a test file that rewrites it can be named and the damage undone; runner-only
+{
+  # This is the guard test.suite.config.isolate cannot be: isolation is opt-in,
+  # so it never sees a file that forgot the line, and it only redirects writes
+  # addressed through $CONFIG_PATH. test/test.log's T31 wrote the real shared
+  # log.env through a hardcoded $HOME/config path while the file believed
+  # itself isolated (f9c3802). A fingerprint catches the write whatever route
+  # it took.
+  local snap="$TEST_SUITE_RESULT_PATH/sharedTier"
+  if ! mkdir -p "$snap" 2>/dev/null; then
+    create.result 1 "cannot create $snap — the shared tier would be unguarded for this whole run"
+    echo -e "\e[1;31m  ✗ test.suite: $RESULT\e[0m" >&2
+    return $(result)
+  fi
+  local f
+  for f in user.env oosh.env log.env; do
+    # -p keeps the mtime, so a restored tier fingerprints identically.
+    [ -f "$TEST_SUITE_CONFIG_ORIGIN/$f" ] && cp -p "$TEST_SUITE_CONFIG_ORIGIN/$f" "$snap/$f" 2>/dev/null
+  done
+  TEST_SUITE_SHARED_SNAPSHOT="$snap"
+  TEST_SUITE_SHARED_STAMP=$(private.test.suite.config.stamp.get "$TEST_SUITE_CONFIG_ORIGIN")
+  export TEST_SUITE_SHARED_SNAPSHOT TEST_SUITE_SHARED_STAMP
+  create.result 0 "snapshotted $TEST_SUITE_CONFIG_ORIGIN to $snap"
+  return $(result)
+}
+
+private.test.suite.shared.verify() # <testFile> # rc 1 and $RESULT naming which shared file <testFile> rewrote; runner-only, call it after every child
+{
+  local testFile="${1:-an unnamed test file}"
+  if [ -z "$TEST_SUITE_SHARED_STAMP" ]; then
+    # No snapshot pinned means no claim to make. Not a failure — test.suite.run
+    # is also reachable before the runner has opened its directory.
+    create.result 0 "no snapshot pinned"
+    return $(result)
+  fi
+  local nowStamp; nowStamp=$(private.test.suite.config.stamp.get "$TEST_SUITE_CONFIG_ORIGIN")
+  if [ "$nowStamp" = "$TEST_SUITE_SHARED_STAMP" ]; then
+    create.result 0 "shared tier untouched"
+    return $(result)
+  fi
+  # Name the files, not just the fact. awk with an exact first-field match —
+  # `grep "^user.env "` would treat the dot as a wildcard.
+  local changed="" f before after
+  for f in user.env oosh.env log.env; do
+    before=$(printf '%s\n' "$TEST_SUITE_SHARED_STAMP" | awk -v k="$f" '$1==k')
+    after=$(printf '%s\n' "$nowStamp" | awk -v k="$f" '$1==k')
+    [ "$before" != "$after" ] && changed="$changed $f"
+  done
+  create.result 1 "$testFile wrote the shared config tier:$changed"
+  return $(result)
+}
+
+private.test.suite.shared.restore() # # put the snapshotted config tier back, byte for byte; runner-only, call it after private.test.suite.shared.verify reports a write
+{
+  # Not suppression: the run has already been failed by the caller. The tier is
+  # site-wide, so leaving one test file's damage in place would break every
+  # other user on the box until someone noticed.
+  local snap="$TEST_SUITE_SHARED_SNAPSHOT"
+  if [ -z "$snap" ] || [ ! -d "$snap" ]; then
+    create.result 1 "no snapshot to restore from"
+    return $(result)
+  fi
+  local f rc=0
+  for f in user.env oosh.env log.env; do
+    if [ -f "$snap/$f" ]; then
+      cp -p "$snap/$f" "$TEST_SUITE_CONFIG_ORIGIN/$f" 2>/dev/null || rc=1
+    elif [ -f "$TEST_SUITE_CONFIG_ORIGIN/$f" ]; then
+      # It was absent when we snapshotted, so the test file created it.
+      rm -f "$TEST_SUITE_CONFIG_ORIGIN/$f" 2>/dev/null || rc=1
+    fi
+  done
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "could not put $TEST_SUITE_CONFIG_ORIGIN back — it is left as the test file wrote it"
+    return $(result)
+  fi
+  create.result 0 "$TEST_SUITE_CONFIG_ORIGIN restored"
+  return $(result)
+}
+
+private.test.suite.verdict() # <sharedWrites> <noResults> <category> <expects> <passed> <?metaFailures:-> # the suite's pass/fail rule as one decision; rc 0 pass, rc 1 fail, $RESULT is the reason
+{
+  # Extracted from the tail of private.test.suite.run.filtered, where it was a
+  # twenty-line if/elif chain no test could reach — which is how two failure
+  # causes came to be displayed and then dropped on the floor before the
+  # return code. The macOS workflow and `os platform.test` gate on that return
+  # code (macos-test.yml Test Summary; os.platform.test's four rcs), so a
+  # cause that does not reach it does not exist.
+  local sharedWrites="${1:-0}" noResults="${2:-0}" category="$3"
+  local expects="${4:-0}" passed="${5:-0}" metaFailures="$6"
+  local failed=$((expects - passed))
+
+  if [ "$sharedWrites" -gt 0 ]; then
+    create.result 1 "the shared config tier was written during this run"
+    return $(result)
+  fi
+  # core only: the twelve known score-less files are all extended, and giving
+  # them a score is content work, not runner work. See tests-that-cannot-fail.
+  if [ "$noResults" -gt 0 ] && [ "$category" = "core" ]; then
+    create.result 1 "a core test file produced no score of its own"
+    return $(result)
+  fi
+  if [ "$expects" -eq 0 ]; then
+    create.result 1 "no tests run"
+    return $(result)
+  fi
+  if [ "$failed" -eq 0 ]; then
+    create.result 0 "all tests passed"
+    return $(result)
+  fi
+  # The meta-test asserts one failure on purpose, to prove the counters count.
+  if [ "$failed" -eq 1 ] && [ "$metaFailures" = "1" ]; then
+    create.result 0 "all tests passed (1 intentional meta-test failure)"
+    return $(result)
+  fi
+  create.result 1 "$failed assertion(s) failed"
+  return $(result)
 }
 
 test.suite.config.isolate.completion.label() {
@@ -840,7 +1084,11 @@ test.suite.config.restore() # # restore the config anchors saved by test.suite.c
   fi
   rm -rf "$TEST_SUITE_CONFIG_FIXTURE" 2>/dev/null
   unset TEST_SUITE_CONFIG_FIXTURE
-  export CONFIG_PATH="$TEST_SUITE_RESULT_PATH"   # config-path-exception: restoring the value this file inherited, captured by test.suite.config.isolate before it moved it.
+  # ORIGIN, not RESULT_PATH. They were one variable until 2026-09-16, which was
+  # only correct while the score happened to live in the config tier; the
+  # moment the handoff moved to its own directory, this line would have left
+  # CONFIG_PATH pointing at the handoff.
+  export CONFIG_PATH="$TEST_SUITE_CONFIG_ORIGIN"   # config-path-exception: restoring the value this file inherited, captured by test.suite.config.isolate before it moved it.
   export CONFIG_FILE="user.env"
   export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
   create.result 0 "config anchors restored to $CONFIG_PATH"
