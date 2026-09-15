@@ -128,7 +128,28 @@ count moves when the suite grows, because the file it shadows grows.
    `test.suite.save.results` should be an error, or at minimum report `0 / 0`, never the previous
    file's numbers. That is the general fix and it protects every future file.
 
-- [ ] `test.suite` fails loudly (or reports 0/0) when a file produces no results of its own
+- [x] `test.suite` fails loudly (or reports 0/0) when a file produces no results of its own —
+      **done 2026-09-15.** The runner now clears the handoff *before* each file, so it exists iff
+      that file wrote it; a file that produced none is reported `0 / 0`, named on its own line, and
+      counted in a separate `No results:` summary. Deliberately **not** folded into `TOTAL_FAILED`,
+      which is assertion arithmetic feeding `GITHUB_OUTPUT failed=`.
+
+      **Measured, and it corrects an assumption:** all 12 score-less files are `extended`; every one
+      of the 26 `core` files saves. So `core` was never inflated by this — the phantom-31
+      re-baseline below was already right — and `core` is unchanged by the fix. The inflation was
+      all in `extended`, which had no recorded baseline until now:
+
+      | `extended` | before | after |
+      |---|---|---|
+      | Assertions | 427 | **343** |
+      | Passed | 340 | 284 |
+      | Failed | 87 | 59 |
+
+      The 12: `test.academyScript`, `test.certificates`, `test.colors`, `test.headless`,
+      `test.mycmd`, `test.myId`, `test.myScript`, `test.odocker`, `test.osshLayout`, `test.share`,
+      `test.tt`, `test.webitem`. Two of them assert substantively and throw the score away
+      (`test.odocker` ~136, `test.osshLayout` ~94) — **follow-up card**, since giving them a score
+      is content work, not runner work.
 - [x] `test.tilde` asserts through the framework instead of via `echo` (2026-09-14: T-TILDE-CLEAN-ENV, -HOME, -STRING, -FILE-TEST; the clean re-exec now carries OOSH_DIR/CONFIG_PATH/LOG_* so the framework can score it)
 - [x] Re-baseline the `core 1` totals in the T3 and T9 tickets once the phantom 31 is gone — done 2026-09-14 after the review pass: `test.suite core 1` = 26 files, 642 assertions, 641 passed, 1 intentional (the phantom 31 is gone; `test.tilde` now scores its own 4). The 643/642/1 quoted in the tracker for T3 was the phantom-inflated figure.
 

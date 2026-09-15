@@ -60,10 +60,59 @@ private.test.suite.category() # <file> # reads TEST_CATEGORY from a test file, d
   create.result 0 "$category"
 }
 
-test.suite.save.results() # # saves test results to config file and prints summary
+private.test.suite.results.file() # # absolute path of the per-file handoff the child writes and the runner reads back as that file's score
 {
-  source $OOSH_DIR/config
-  config.save testresult TEST_SUITE
+  # A default SUBSTITUTION, not an assignment — this.anchor.validate matches
+  # `${CONFIG_PATH:=` and plain assignments, and this is neither, so no
+  # exception marker is warranted here.
+  echo "${TEST_SUITE_RESULT_PATH:-${CONFIG_PATH:-$HOME/config}}/testresult.env"
+}
+
+private.test.suite.results.clear() # # remove the handoff file, so the next file cannot be scored with the previous file's numbers
+{
+  # Removes the FILE only. It deliberately does NOT zero the counters: this is
+  # callable from inside a test file, and zeroing there would wipe that file's
+  # own running score. Zeroing is the runner's business and happens in
+  # private.test.suite.run.filtered, between files.
+  local resultsFile; resultsFile=$(private.test.suite.results.file)
+  rm -f "$resultsFile" 2>/dev/null
+  if [ -e "$resultsFile" ]; then
+    # $CONFIG_PATH is a SHARED sharedConfig (2775, group dev). Another user's
+    # file is unlinkable unless the DIRECTORY lost its group-write bit — the
+    # state private.os.platform.shared.config.repair exists to fix. Silent
+    # failure here silently restores the inheritance bug, so: loud.
+    echo -e "\e[1;31m  ✗ test.suite: cannot remove $resultsFile — every score from here on would be inherited\e[0m"
+    return 1
+  fi
+  return 0
+}
+
+private.test.suite.counters.reset() # # zero the exported per-file counters between files; runner-only, never call this from inside a test file
+{
+  # Exported, so each child inherits them. The `declare -i` in test.suite.init
+  # is function-local and evaporates on return, which is why the file-scope
+  # counters in every test file come from the environment rather than from there.
+  TEST_SUITE_TEST_COUNTER=0
+  TEST_SUITE_EXPECT_COUNTER=0
+  TEST_SUITE_SUCCESS_COUNTER=0
+  export TEST_SUITE_TEST_COUNTER TEST_SUITE_EXPECT_COUNTER TEST_SUITE_SUCCESS_COUNTER
+  return 0
+}
+
+test.suite.save.results() # # writes this file's counters to the handoff the runner reads, then prints the summary
+{
+  # NOT `source $OOSH_DIR/config; config.save testresult TEST_SUITE`.
+  # config.file re-points $CONFIG under whatever CONFIG_PATH is current, so a
+  # file that isolated its config would have written its score into its own
+  # fixture and the runner would have re-read the PREVIOUS file's numbers.
+  # Three literal lines, one destination, and no config.start — which used to
+  # run at the tail of every test file and could re-fire config.init.
+  local resultsFile; resultsFile=$(private.test.suite.results.file)
+  {
+    echo "export TEST_SUITE_TEST_COUNTER=\"${TEST_SUITE_TEST_COUNTER:-0}\""
+    echo "export TEST_SUITE_EXPECT_COUNTER=\"${TEST_SUITE_EXPECT_COUNTER:-0}\""
+    echo "export TEST_SUITE_SUCCESS_COUNTER=\"${TEST_SUITE_SUCCESS_COUNTER:-0}\""
+  } > "$resultsFile"
 
   # Print final summary
   test.suite.summary
@@ -161,6 +210,11 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
   echo -e "\e[1;36m╚════════════════════════════════════════════════════════════════════╝\e[0m"
   echo ""
 
+  # Same pre-clear as the filtered runner: after this line the handoff exists
+  # if and only if THIS file wrote it.
+  private.test.suite.results.clear
+  private.test.suite.counters.reset
+
   if [ "$level" -gt 0 ]; then
     important.log "starting test: $OOSH_DIR/test/test.$command -level:$level- -clear:$clear-"
     $OOSH_DIR/test/test.$command $level $clear
@@ -168,8 +222,15 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
     $OOSH_DIR/test/test.$command $level $clear >/dev/null
   fi
 
-  if check file $CONFIG_PATH/testresult.env exists; then
-    source $CONFIG_PATH/testresult.env
+  local resultsFile; resultsFile=$(private.test.suite.results.file)
+  if [ -f "$resultsFile" ]; then
+    source "$resultsFile"
+  else
+    # Previously this left the counters EMPTY (the reset sat inside the `if`),
+    # so the comparison below became `[ "" -eq "" ]` → "integer expression
+    # expected" on a clean box, or the previous file's numbers otherwise.
+    private.test.suite.counters.reset
+    echo -e "\e[1;33m  ⚠ NO RESULTS: test.$command produced no score of its own — 0 / 0\e[0m"
   fi
 
   # Print results
@@ -199,6 +260,12 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   local -i CUMULATIVE_EXPECT_COUNTER=0
   local -i CUMULATIVE_SUCCESS_COUNTER=0
   local -i FILE_COUNT=0
+  # Files that produced no score of their own. Tracked separately from
+  # TOTAL_FAILED on purpose: that number is assertion arithmetic and feeds
+  # GITHUB_OUTPUT failed=, where a workflow reads it as "assertions that
+  # failed". A file with 0 expects has 0 failures.
+  local -i NO_RESULT_COUNT=0
+  local NO_RESULT_FILES=""
 
   # Count total files matching filter
   local -i TOTAL_FILES=0
@@ -249,6 +316,15 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
     echo -e "\e[1;36m║  [$FILE_COUNT/$TOTAL_FILES] $filename\e[0m"
     echo -e "\e[1;36m╚════════════════════════════════════════════════════════════════════╝\e[0m"
 
+    # Clear the handoff BEFORE the run: after this line the file exists if and
+    # only if THIS file wrote it. The old code cleared only the shell VARIABLES
+    # and left the file behind, so a file that never called
+    # test.suite.save.results was silently scored with the previous file's
+    # numbers — test.tilde reporting test.this's 31 assertions was the instance
+    # that exposed it.
+    private.test.suite.results.clear
+    private.test.suite.counters.reset
+
     # Run the test file (subprocess — counters don't propagate back)
     if [ "$level" -gt 0 ]; then
       $file $level $clear
@@ -258,16 +334,21 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
 
     # Load per-file results saved by test.suite.save.results in the subprocess
     local FILE_TESTS=0 FILE_EXPECTS=0 FILE_SUCCESS=0
-    if check file $CONFIG_PATH/testresult.env exists; then
-      source $CONFIG_PATH/testresult.env
+    local resultsFile; resultsFile=$(private.test.suite.results.file)
+    if [ -f "$resultsFile" ]; then
+      source "$resultsFile"
       FILE_TESTS=${TEST_SUITE_TEST_COUNTER:-0}
       FILE_EXPECTS=${TEST_SUITE_EXPECT_COUNTER:-0}
       FILE_SUCCESS=${TEST_SUITE_SUCCESS_COUNTER:-0}
-      # Reset counters so next subprocess starts fresh
-      TEST_SUITE_TEST_COUNTER=0
-      TEST_SUITE_EXPECT_COUNTER=0
-      TEST_SUITE_SUCCESS_COUNTER=0
+    else
+      ((NO_RESULT_COUNT++))
+      NO_RESULT_FILES="$NO_RESULT_FILES $filename"
+      echo -e "\e[1;33m  ⚠ NO RESULTS: $filename produced no score of its own — reported 0 / 0, NOT the previous file's numbers\e[0m"
     fi
+    # Clear again so the suite never leaves a stale score in the shared dir
+    # between invocations.
+    private.test.suite.results.clear
+    private.test.suite.counters.reset
     local FILE_FAILED=$((FILE_EXPECTS - FILE_SUCCESS))
 
     # Track meta-test (test.test.suite) failures separately
@@ -325,6 +406,9 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
     echo -e "  Failed:      \e[1;31m$TOTAL_FAILED\e[0m"
   else
     echo -e "  Failed:      \e[1;32m0\e[0m"
+  fi
+  if [ "$NO_RESULT_COUNT" -gt 0 ]; then
+    echo -e "  \e[1;33mNo results:  $NO_RESULT_COUNT file(s) never called test.suite.save.results:\e[0m$NO_RESULT_FILES"
   fi
   echo ""
 

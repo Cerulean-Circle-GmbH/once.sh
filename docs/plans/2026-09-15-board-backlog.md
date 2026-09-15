@@ -135,8 +135,12 @@ alpine and almalinux**. `docs/oo.md` gains the contract line.
 produced no results of its own reports `0 / 0`, or fails loudly naming the file.
 
 **Done when.** A fixture file that asserts nothing reports `0 / 0` rather than inheriting.
-Control: revert and watch it inherit again. Re-baseline the tracker totals in the same commit —
-expect the reported numbers to move once, downward.
+Control: revert and watch it inherit again. Re-baseline the totals in the same commit.
+
+**DONE 2026-09-15** — and one thing above was wrong. "Expect the reported numbers to move once,
+downward" is true of `extended` only. All 12 score-less files are `extended`; every one of the 26
+`core` files saves, so `core` was never inflated and does not move. `extended` went 427 → **343**
+assertions. No `extended` baseline had ever been recorded; it is now.
 
 ---
 

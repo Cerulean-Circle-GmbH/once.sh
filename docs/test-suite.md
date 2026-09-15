@@ -68,6 +68,22 @@ invariants on real machines. They run inside
 `./test.suite run <name> 1`. See
 `templates/code/newPlatformInvariantTest` for the skeleton.
 
+## Every file scores itself
+
+`test.suite.save.results` at the end of a test file is **mandatory**, not decorative. Test files run
+as child processes (the runner invokes `$file` directly), so the only channel back to the runner is
+the handoff file `testresult.env`. A file that never calls `test.suite.save.results` produces no
+score of its own.
+
+Until 2026-09-15 such a file was silently given the **previous** file's numbers, because the runner
+cleared only its shell variables and left the handoff behind. `test.tilde` reporting `test.this`'s
+31 assertions was the instance that exposed it. The runner now clears the handoff *before* each
+file — so it exists if and only if that file wrote it — and a file that produced none is reported
+`0 / 0`, named on its own line, and counted in a `No results:` summary at the end.
+
+If you see `⚠ NO RESULTS: test.<name> produced no score of its own`, that file is not being
+measured. Add `test.suite.save.results` as its last line.
+
 ## Best Practices
 - Use `test.case` for each logical test scenario.
 - Use `expect` to assert both return values and output.
