@@ -93,9 +93,13 @@ mtime-identical, where before it rewrote all three 45 ms apart.
 
 Three things worth carrying forward:
 
-- **`log.env` still moves**, via `test/test.log` — the third unguarded `core` offender from the
-  audit, deliberately outside this ticket's two-file scope. One more `isolate` line closes it;
-  **follow-up card**.
+- **`test/test.log` closed too** (scope extended on request). It needed more than the isolate line:
+  its T23 wrote and asserted a hardcoded `~/config/result.txt`, while `clear.resultFiles` — the
+  function under test — operates on `$CONFIG_PATH`. The two only coincided because `CONFIG_PATH`
+  *was* `~/config`, so the test was both writing the shared tier and asserting against the wrong
+  file the moment anything moved the anchor. Its T31 backup/restore used `$HOME/config/log.env`,
+  which a `CONFIG_PATH` fixture does not move, so the restore was the actual remaining writer.
+  **A full `core 1` run now leaves all three shared files untouched.**
 - **Two `config set oosh OOSH_COMPONENTS_DIR` lines in `test.oo` were deleted, not fixed.** They
   were *inert*: `config.set` takes `<envVariable> <value>`, so they wrote
   `export oosh="OOSH_COMPONENTS_DIR"` and never touched the variable they named. The `export` on the
