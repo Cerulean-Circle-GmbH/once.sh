@@ -87,6 +87,24 @@ in T-SETUP-3) write the real site-wide config. See the finding above.
 **Done when.** Record `oosh.env`'s mtime, run `./test.suite core 1`, assert it is unchanged.
 Negative control: revert the fixture and watch the assertion go red.
 
+**DONE 2026-09-15.** `test.suite.config.isolate` / `.restore` added; `test/test.path` and
+`test/test.oo` adopt it. A full `core 1` run now leaves `user.env` and `oosh.env` byte- and
+mtime-identical, where before it rewrote all three 45 ms apart.
+
+Three things worth carrying forward:
+
+- **`log.env` still moves**, via `test/test.log` — the third unguarded `core` offender from the
+  audit, deliberately outside this ticket's two-file scope. One more `isolate` line closes it;
+  **follow-up card**.
+- **Two `config set oosh OOSH_COMPONENTS_DIR` lines in `test.oo` were deleted, not fixed.** They
+  were *inert*: `config.set` takes `<envVariable> <value>`, so they wrote
+  `export oosh="OOSH_COMPONENTS_DIR"` and never touched the variable they named. The `export` on the
+  line above already did the work. Correcting the arity would have been worse — it would persist a
+  variable `config.save`'s exclusion list exists to keep out.
+- **`~/.gitconfig` needed a different tool.** `CONFIG_PATH` cannot redirect it;
+  `oo.safeDirectory.prune` writes it through `git config --global`, so it is sandboxed with
+  `GIT_CONFIG_GLOBAL` — the pattern `test.oo` already used twelve lines later.
+
 ---
 
 ## 2. `oo cmd` result contract

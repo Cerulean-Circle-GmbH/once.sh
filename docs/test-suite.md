@@ -68,6 +68,35 @@ invariants on real machines. They run inside
 `./test.suite run <name> 1`. See
 `templates/code/newPlatformInvariantTest` for the skeleton.
 
+## Isolating a test from the shared config
+
+`~/config` (`$CONFIG_PATH`) is normally a **site-wide `sharedConfig`** that every user sources at
+login. A test that reaches a production `config save` rewrites it for everybody. If the script under
+test can persist anything, isolate first:
+
+```bash
+source this
+source test.suite
+test.suite.config.isolate test.myscript >/dev/null || exit 1
+source myscript          # <- after the isolate line
+```
+
+`test.suite.config.isolate` points `CONFIG_PATH`, `CONFIG_FILE` and `CONFIG` at a fresh `mktemp`
+directory, **and touches `$CONFIG`**. All four moves are required. The touch is not tidiness:
+`config.start` re-runs `config.init` whenever `$CONFIG` is not a file, and `config.init` then does an
+unconditional `export CONFIG_PATH=~/config`. Setting the path alone is therefore not isolation — the
+next `source $OOSH_DIR/config` silently snaps back to the shared dir while the test believes it is
+safe. `isolate` refuses loudly rather than half-isolating, and `test.suite.config.restore` is
+installed as an `EXIT` trap (chained onto any trap the file already had).
+
+**Your score is unaffected.** `test.suite.init` pins the inherited `CONFIG_PATH` into
+`TEST_SUITE_RESULT_PATH` *before* anything can move it, and `test.suite.save.results` always writes
+there. Without that pin a file that isolated its config would write its score into its own fixture,
+and the runner would report `0 / 0` for a file that really ran.
+
+**What `CONFIG_PATH` does not cover:** `~/.gitconfig` (use `GIT_CONFIG_GLOBAL`), and `log`'s
+`~/config/result.txt` / `error.txt`, which are hardcoded to `$HOME`.
+
 ## Every file scores itself
 
 `test.suite.save.results` at the end of a test file is **mandatory**, not decorative. Test files run

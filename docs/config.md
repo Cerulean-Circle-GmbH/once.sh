@@ -38,6 +38,11 @@ The config system supports:
 | `~/config/<name>.env` | Custom named configs |
 | `$OOSH_USER_CONFIG_PATH/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
 
+> **Tests must never write the shared tier.** It is site-wide: a test that reaches `config save`
+> rewrites `user.env` / `oosh.env` / `log.env` for every user on the box. Use
+> `test.suite.config.isolate` — see [test-suite.md](test-suite.md) § *Isolating a test from the
+> shared config*.
+
 ### Two config tiers: shared vs per-user
 
 `~/config` (`$CONFIG_PATH`) usually symlinks to one shared `sharedConfig`
