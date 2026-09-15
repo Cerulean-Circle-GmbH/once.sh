@@ -105,7 +105,7 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
 | `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
-| `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`. `OOSH_DIR`/`CONFIG_PATH`/`CONFIG` are filtered out on purpose — they are per-user anchors, set by [`boot`](boot.md). |
+| `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`. `OOSH_DIR`/`CONFIG_PATH`/`CONFIG` are filtered out on purpose — they are per-user anchors, set by [`boot`](boot.md) — and so is `OOSH_BRANCH`, which is install input rather than state. |
 | `user.env` | **pure data** — a `. $CONFIG_PATH/<name>.env` chain, no bootstrap header | written by `config save`. The old self-anchoring header moved into [`boot`](boot.md); see [migration/env-files.md](migration/env-files.md) for what it used to look like and why. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
@@ -213,12 +213,21 @@ Without parameters, saves:
 | `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config` (derived from CONFIG_PATH) |
 | `OOSH_DIR` | per-user oosh tree path | `boot`/`this` (resolved from `~/oosh`) |
 | `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
+| `OOSH_BRANCH` | Install **input** — the branch the operator asked for. Not a path; excluded for the other reason this list exists: state that must be **derived, never remembered**. Persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** | not re-derived at shell init at all — the branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh` |
 
 The per-user `LOG_*` vars are deliberately NOT persisted into the shared
 `log.env`; they are written to the per-user `$OOSH_USER_CONFIG_PATH/log.session.env`
 by `log.session.save` (see [log.md](log.md)). If you add a new persisted env var
 that resolves to an absolute per-user path, extend the same exclusion `case` in
-`config.save`.
+`config.save` — and the `for leaker in …` list in `test/test.config` T29, which is the
+value-level mirror of that `case` and the only thing that pins it.
+
+**`OOSH_BRANCH` vs `OOSH_MODE`.** They are not two names for one thing.
+`OOSH_BRANCH` is the branch the operator **asked for**, meaningful for the length of one
+install (`init/oosh`, install state 31) and never persisted. `OOSH_MODE` is the branch the
+host **is on**, derived from the canonical `~/oosh` and persisted. When `OOSH_BRANCH` is
+empty — which is every shell outside an install — `private.oo.install.branch.get` falls
+through to the checkout, which is the answer every caller wants.
 
 ### Listing Configuration
 
