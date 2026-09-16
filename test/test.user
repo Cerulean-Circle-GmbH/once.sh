@@ -428,4 +428,152 @@ else
   expect.fail "private.as.user missing one of runuser/sudo/su dispatches — sudo-less containers will break"
 fi
 
+# ============================================================================
+# T-SSH-BACKUP-* : the archive is $HOME-anchored, and cannot nest
+# ============================================================================
+# The old body was `cp -R $sshDir ssh.$name` — a CWD-RELATIVE destination —
+# while its callers guarded on the ABSOLUTE $HOME/ssh.<name>. Nothing tested
+# either method, which is how three root-owned copies of root's ~/.ssh ended
+# up in a normal user's home on the dev box.
+#
+# Every case below runs in a `bash -c` with its OWN $HOME and its cwd
+# deliberately somewhere else, because cwd is the whole point.
+TUSR_SSH_TMP=$(mktemp -d "${TMPDIR:-/tmp}/test.user.ssh.XXXXXX")
+trap 'rm -rf "$TUSR_SSH_TMP" 2>/dev/null' EXIT
+
+private.test.user.ssh.run() { # <command...> # run <command> with a fresh $HOME and cwd elsewhere; echo its stdout
+  cd "$TUSR_SSH_TMP/elsewhere" 2>/dev/null || return 1
+  HOME="$TUSR_SSH_TMP/home" CURRENT_SSH_DIR="" bash -c '
+    source "'"$OOSH_DIR"'/this" >/dev/null 2>&1
+    source "'"$OOSH_DIR"'/user" >/dev/null 2>&1
+    unset CURRENT_SSH_DIR
+    '"$*"'
+  ' 2>/dev/null
+  local rc=$?
+  cd "$OOSH_DIR" || true
+  return $rc
+}
+
+private.test.user.ssh.fixture() { # # rebuild a fresh fixture home + an empty cwd
+  rm -rf "$TUSR_SSH_TMP/home" "$TUSR_SSH_TMP/elsewhere"
+  mkdir -p "$TUSR_SSH_TMP/home/.ssh" "$TUSR_SSH_TMP/elsewhere"
+  echo "original-key" > "$TUSR_SSH_TMP/home/.ssh/id_probe"
+}
+
+# --- the card's own "Done when" -------------------------------------------
+test.user.sshBackupIsHomeAnchored() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null' >/dev/null
+  local inCwd inHome
+  inCwd=$(ls -A "$TUSR_SSH_TMP/elsewhere" 2>/dev/null | grep -c .)
+  inHome=$(ls -1d "$TUSR_SSH_TMP/home/.ssh.backups"/*-probe 2>/dev/null | grep -c .)
+  if [ "$inCwd" != "0" ]; then
+    create.result 1 "it wrote $inCwd entr(ies) into the current directory"
+  elif [ "$inHome" != "1" ]; then
+    create.result 1 "expected exactly 1 archive under \$HOME/.ssh.backups, found $inHome"
+  else
+    create.result 0 "archived under \$HOME"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-ANCHORED: the archive lands under \$HOME, never in the current directory" \
+  test.user.sshBackupIsHomeAnchored
+expect 0 "archived under \$HOME" "cwd-relative is how root's keys ended up in a user's home"
+
+# --- repeat runs must not nest ---------------------------------------------
+test.user.sshBackupDoesNotNest() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null; user.ssh.backup probe >/dev/null' >/dev/null
+  local archives nested
+  archives=$(ls -1d "$TUSR_SSH_TMP/home/.ssh.backups"/*-probe* 2>/dev/null | grep -c .)
+  nested=$(find "$TUSR_SSH_TMP/home/.ssh.backups" -name .ssh -type d 2>/dev/null | grep -c .)
+  if [ "$nested" != "0" ]; then
+    create.result 1 "the second run nested inside the first ($nested nested .ssh)"
+  elif [ "$archives" != "2" ]; then
+    create.result 1 "expected 2 distinct archives, found $archives"
+  else
+    create.result 0 "two archives, neither nested"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-NO-NEST: a second backup makes a second archive, not a nested copy" \
+  test.user.sshBackupDoesNotNest
+expect 0 "two archives, neither nested" "cp -R into an existing directory copies INTO it — each install nested one level deeper"
+
+# --- nothing to archive is a refusal, not a silent success ------------------
+test.user.sshBackupRefusesMissingDir() {
+  private.test.user.ssh.fixture
+  rm -rf "$TUSR_SSH_TMP/home/.ssh"
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null' >/dev/null
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success with no ~/.ssh to archive"
+  elif [ -d "$TUSR_SSH_TMP/home/.ssh.backups" ]; then
+    create.result 1 "it created an archive root for an archive it could not make"
+  else
+    create.result 0 "refused"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-NO-SOURCE: no ~/.ssh is a refusal, not an empty archive" \
+  test.user.sshBackupRefusesMissingDir
+expect 0 "refused" "a backup that silently archives nothing is worse than no backup"
+
+# --- restore must never destroy first ---------------------------------------
+test.user.sshRestoreKeepsSshOnMissingArchive() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.restore doesNotExist >/dev/null' >/dev/null
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success for an archive that does not exist"
+  elif [ ! -f "$TUSR_SSH_TMP/home/.ssh/id_probe" ]; then
+    create.result 1 "it destroyed ~/.ssh before discovering it had nothing to restore"
+  else
+    create.result 0 "~/.ssh untouched"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-RESTORE-SAFE: a missing archive leaves ~/.ssh intact" \
+  test.user.sshRestoreKeepsSshOnMissingArchive
+expect 0 "~/.ssh untouched" "the old body ran rm -Rf \$sshDir BEFORE a cwd-relative cp — from the wrong directory it destroyed ~/.ssh"
+
+# --- and it must actually restore ------------------------------------------
+test.user.sshRestoreRoundTrip() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null' >/dev/null
+  echo "corrupted" > "$TUSR_SSH_TMP/home/.ssh/id_probe"
+  private.test.user.ssh.run 'user.ssh.restore latest >/dev/null' >/dev/null
+  local content
+  content=$(cat "$TUSR_SSH_TMP/home/.ssh/id_probe" 2>/dev/null)
+  if [ "$content" = "original-key" ]; then
+    create.result 0 "restored"
+  else
+    create.result 1 "got '$content', expected 'original-key'"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-RESTORE-ROUNDTRIP: backup then restore latest brings the content back" \
+  test.user.sshRestoreRoundTrip
+expect 0 "restored" "an archive nobody can restore is not a backup"
+
+# --- the archives are discoverable -----------------------------------------
+test.user.sshBackupList() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup one >/dev/null; user.ssh.backup two >/dev/null' >/dev/null
+  local out
+  out=$(private.test.user.ssh.run 'user.ssh.backup.list')
+  local lines
+  lines=$(printf '%s\n' "$out" | grep -c -- '-one$\|-two$')
+  if [ "$lines" = "2" ]; then
+    create.result 0 "both listed"
+  else
+    create.result 1 "expected 2 archives listed, got: $out"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-LIST: the archives can be found again" \
+  test.user.sshBackupList
+expect 0 "both listed" "ssh.backup.list is how a human reaches an archive without knowing the timestamp"
+### test.method
+
 test.suite.save.results

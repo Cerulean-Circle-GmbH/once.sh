@@ -5,6 +5,8 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+### new.method
+
 # SSH ControlMaster socket path (must match ossh)
 : ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
 
@@ -1266,41 +1268,174 @@ private.user.check.group() # <groupName> # checks if a group exists
   fi
 }
 
-user.ssh.backup() {
-  local name="$1"
-  if [ -z "$name" ]; then
-    name="bak"
-  fi
-  if [ -n "$1" ]; then
-    shift
-  fi
-
+user.ssh.backup() # <?label:manual> <?sshDir:~/.ssh> # archives <sshDir> into $HOME/.ssh.backups/ under a UTC-timestamped name; never writes to the current directory
+{
+  # $HOME-ANCHORED, and that anchor IS the fix. The old body was
+  # `cp -R $sshDir ssh.$name` — a CWD-RELATIVE destination — while both of its
+  # callers guarded on the ABSOLUTE `$HOME/ssh.<name>`. Three consequences,
+  # all of them observed:
+  #   - the guard could never become true, so the backup ran on EVERY install;
+  #   - `cp -R src dst` copies INTO an existing dst, so every re-run nested one
+  #     level deeper — ssh.X/.ssh/.ssh/…, each layer a full copy of the keys;
+  #   - it landed wherever the operator happened to be. Three root-owned 0700
+  #     copies of ROOT's ~/.ssh are sitting in a normal user's home on the dev
+  #     box for exactly that reason.
+  # During a root install $HOME is /root, so the keys now land in root's own
+  # home whatever directory the installer was started from.
+  #
+  # Timestamped, so the name cannot collide and therefore cannot nest, and no
+  # caller needs a guard any more. A DIRECTORY, not a tarball: there is no
+  # `tar` anywhere in the tracked tree, and the install path is the wrong
+  # place to introduce a new cross-platform dependency for this.
+  local label="${1:-manual}"
+  [ -n "$1" ] && shift
   private.user.get.sshDir "$1"
-  if [ -n "$1" ]; then
-    shift
-  fi
+  [ -n "$1" ] && shift
   local sshDir="$RESULT"
 
-  cp -R $sshDir ssh.$name 
+  # A label reaches this from a call site, so it must not be able to escape
+  # the archive root.
+  label="$( printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '-' )"
+
+  if [ ! -d "$sshDir" ]; then
+    error.log "user.ssh.backup: nothing to archive — $sshDir does not exist"
+    create.result 1 "no such directory: $sshDir" "$1"
+    return $(result)
+  fi
+
+  local root="$HOME/.ssh.backups"
+  if ! mkdir -p "$root"; then
+    error.log "user.ssh.backup: cannot create $root"
+    create.result 2 "cannot create $root" "$1"
+    return $(result)
+  fi
+  chmod 700 "$root" 2>/dev/null
+
+  local stamp archive
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  archive="$root/$stamp-$label"
+  # Two archives inside the same second are possible during install, where two
+  # labels fire close together. Never overwrite one.
+  local n=1
+  while [ -e "$archive" ]; do
+    archive="$root/$stamp-$label.$n"
+    n=$((n + 1))
+  done
+
+  # `cp -R "$src/." "$dst/"` — the idiom osshLayout:220 already uses. Copying
+  # the CONTENTS into a directory we created ourselves is what makes nesting
+  # impossible even if the name ever did repeat.
+  if ! mkdir -p "$archive" || ! cp -R "$sshDir/." "$archive/"; then
+    error.log "user.ssh.backup: could not archive $sshDir to $archive"
+    create.result 3 "could not archive $sshDir" "$1"
+    return $(result)
+  fi
+  chmod 700 "$archive" 2>/dev/null
+
+  # echo, not console.log: a path the caller may need survives any LOG_LEVEL.
+  echo "$archive"
+  create.result 0 "$archive" "$1"
+  return $(result)
+}
+user.ssh.backup.completion.label() {
+  # The labels the install path uses, plus the interactive default.
+  echo "manual"
+  echo "pre-install"
+  echo "pre-user-init"
+  echo "pre-restore"
 }
 
-user.ssh.restore() {
-  local name="$1"
-  if [ -z "$name" ]; then
-    name="bak"
-  fi
-  if [ -n "$1" ]; then
-    shift
-  fi
-
+user.ssh.restore() # <?archive:latest> <?sshDir:~/.ssh> # restores an archive from $HOME/.ssh.backups over <sshDir>; archives the current <sshDir> first and swaps only after the copy succeeded
+{
+  # THE OLD BODY WAS `rm -Rf $sshDir` FOLLOWED BY a cwd-relative
+  # `cp -R ssh.$name $sshDir`. Run from the wrong directory it destroyed
+  # ~/.ssh and then failed to replace it. It has never had a caller anywhere
+  # in the tree, which is the only reason that never happened to anyone.
+  #
+  # Now: resolve first, stage second, and only then swap. Every failure path
+  # returns with <sshDir> untouched.
+  local wanted="${1:-latest}"
+  [ -n "$1" ] && shift
   private.user.get.sshDir "$1"
-  if [ -n "$1" ]; then
-    shift
-  fi
+  [ -n "$1" ] && shift
   local sshDir="$RESULT"
 
-  rm -Rf $sshDir 
-  cp -R ssh.$name $sshDir 
+  local root="$HOME/.ssh.backups"
+  local archive=""
+  if [ "$wanted" = "latest" ]; then
+    # Names start with a UTC timestamp, so lexical order IS chronological.
+    archive="$( ls -1d "$root"/*/ 2>/dev/null | sed 's:/$::' | tail -1 )"
+  else
+    case "$wanted" in
+      /*) archive="$wanted" ;;
+      *)  archive="$root/$wanted" ;;
+    esac
+  fi
+
+  if [ -z "$archive" ] || [ ! -d "$archive" ]; then
+    error.log "user.ssh.restore: no such archive: ${archive:-<none under $root>} — $sshDir is untouched"
+    create.result 1 "no such archive: ${archive:-none}" "$1"
+    return $(result)
+  fi
+
+  # Stage NEXT TO the target, so the swap is a rename on the same filesystem
+  # rather than a second copy.
+  local staging="$sshDir.restoring.$$"
+  rm -rf "$staging" 2>/dev/null
+  if ! mkdir -p "$staging" || ! cp -R "$archive/." "$staging/"; then
+    rm -rf "$staging" 2>/dev/null
+    error.log "user.ssh.restore: could not stage $archive — $sshDir is untouched"
+    create.result 2 "could not stage $archive" "$1"
+    return $(result)
+  fi
+
+  # Only now is anything at risk, and the thing being replaced is archived
+  # before it goes.
+  if [ -d "$sshDir" ]; then
+    user.ssh.backup pre-restore "$sshDir" >/dev/null || {
+      rm -rf "$staging" 2>/dev/null
+      error.log "user.ssh.restore: refusing to swap — could not archive the current $sshDir first"
+      create.result 3 "could not archive current $sshDir" "$1"
+      return $(result)
+    }
+    rm -rf "$sshDir"
+  fi
+  if ! mv "$staging" "$sshDir"; then
+    error.log "user.ssh.restore: the swap failed; the staged copy is at $staging"
+    create.result 4 "swap failed, staged copy at $staging" "$1"
+    return $(result)
+  fi
+  chmod 700 "$sshDir" 2>/dev/null
+
+  echo "$sshDir restored from $archive"
+  create.result 0 "restored from $archive" "$1"
+  return $(result)
+}
+user.ssh.restore.completion.archive() {
+  # NO create.result in a completion function — it corrupts c2.
+  echo "latest"
+  ls -1d "$HOME/.ssh.backups"/*/ 2>/dev/null | sed 's:/$::' | xargs -r -n1 basename
+}
+
+user.ssh.backup.list() # # lists the ssh archives under $HOME/.ssh.backups, oldest first
+{
+  local root="$HOME/.ssh.backups"
+  if [ ! -d "$root" ]; then
+    echo "no archives: $root does not exist"
+    create.result 0 "no archives" "$1"
+    return $(result)
+  fi
+  local found
+  found="$( ls -1d "$root"/*/ 2>/dev/null | sed 's:/$::' )"
+  if [ -z "$found" ]; then
+    echo "no archives under $root"
+    create.result 0 "no archives" "$1"
+    return $(result)
+  fi
+  # echo, not console.log: this method exists to be READ.
+  printf '%s\n' "$found"
+  create.result 0 "$( printf '%s\n' "$found" | grep -c . ) archive(s)" "$1"
+  return $(result)
 }
 
 user.usage()
@@ -1330,8 +1465,9 @@ $0
       ssh.get.key.name      
       ssh.get.file.name       <?sshDir:\"~/.ssh\">
 
-      ssh.backup              <newName> <?sshDir:\"~/.ssh\"> will result in a ssh.newName folder
-      ssh.restore             <newName> <?sshDir:\"~/.ssh\"> CAREFULL!!! ssh.newName in sshDir and if not present overwites the current .ssh folder
+      ssh.backup              <?label:manual> <?sshDir:\"~/.ssh\"> archives sshDir to ~/.ssh.backups/<timestamp>-<label>/
+      ssh.backup.list         lists the archives under ~/.ssh.backups
+      ssh.restore             <?archive:latest> <?sshDir:\"~/.ssh\"> restores an archive; archives the current sshDir first
 
       ssh.rootkey.file.revoke <sshConfigName> <publicKeyFile>      revokes access for the public key file
       ssh.rootkey.file.push   <sshConfigName> <publicKeyFile>      pushes the public key file        to the root of the specified ssh server and makes it authorized
