@@ -519,4 +519,10 @@ the macOS `/bin/sh` case).
 - [install-bootstrap.md](install-bootstrap.md) — `init/oosh`'s clean-environment re-exec
 - [migration/env-files.md](migration/env-files.md) — the pure-data migration
 - [research/review-2026-09-09-boot-loader-pure-env-files.md](research/review-2026-09-09-boot-loader-pure-env-files.md)
-- [puml/bootstrap.sequence/bootstrap.sequence.svg](puml/bootstrap.sequence/bootstrap.sequence.svg) — the bootstrap sequence diagram (source `puml/bootstrap.sequence.puml`, editable copy `puml/bootstrap.sequence.drawio`; ticket T6 tracks bringing it up to date with `boot`)
+- [puml/bootstrap.sequence.drawio](puml/bootstrap.sequence.drawio) — **the** bootstrap sequence
+  diagram, and the single source of truth for it. Six lanes: install from GitHub, local
+  `init/oosh`, the login-shell `.bashrc → boot` path this page describes, reconfigure-and-exit,
+  remote install, de-install. Open it in [diagrams.net](https://app.diagrams.net).
+  `puml/bootstrap.sequence.puml` and the `.svg`/`.eps` beside it are the **superseded** pre-`boot`
+  version, kept for history and marked as such in their own header — do not read them for the
+  current mechanism.

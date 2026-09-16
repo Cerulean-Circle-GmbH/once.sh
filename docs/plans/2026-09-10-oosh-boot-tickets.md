@@ -69,7 +69,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 | 3 | **T8** — PATH bootstrap + the `path` script | 🔍 **In Review** | Same "what does `boot` own" theme as T4/T5. Delivered `2471b43`…`db0177d` + markers: `path validate`, the writer rule in [boot.md](../boot.md), `path` shrunk 26 methods to 11, `.` off the PATH. |
 | 4 | **T3** — `env -i sh` SAFETY | 🔍 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. Second attempt delivered `boot` + `init/oosh` recovery and the clean re-exec. |
 | 5 | **T9** — fixed system path to `boot` | 🔍 **In Review** | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. **Delivered 2026-09-14**: install state `34 root.boot.path.installed`, `oo boot.fix` / `oo boot.status`, the `/etc/profile.d/oosh.sh` login-shell drop-in (from `templates/user/profile.d.oosh.sh`), `test.platform.boot.system.path.invariant`. The five design decisions are recorded on [the card](2026-09-14-fixed-system-boot-path.md). Review checklist: the trust note (dev-group-writable content behind a root-looking path), the warn-and-skip on branches without `boot`, and a platform run on a host installed BEFORE state 34 followed by `oo boot.fix`. |
-| 6 | **T6** — `bootstrap.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the five above settle. |
+| 6 | **T6** — `bootstrap.sequence` diagram | 🔍 **In Review** | Last, and it documents the mechanism the five above settle. Diagram redrawn by the user (`bootstrap.sequence.drawio`); this pass declared it the source of truth, marked the pre-`boot` `.puml` superseded, cross-linked it, and corrected three labels that T8 and item 6 invalidated after it was drawn. |
 
 ---
 
@@ -580,7 +580,7 @@ not colon-guarded, so a *genuine* failure still duplicates PATH entries. The 8
 
 ---
 
-### T6 — `bootstrap.sequence` diagram 💡 Ideas
+### T6 — `bootstrap.sequence` diagram 🔍 In Review (2026-09-16)
 
 > **Card (Ideas #6):** `prod/docs/puml/bootsratp.sequence` `/bootsratp.sequence.svg` (sic — the family was renamed `bootstrap.sequence` on 2026-09-14)
 
@@ -591,10 +591,31 @@ the boot loader — and mentions "boot" once. `~/oosh-notes/2026-09-08-oosh-inst
 already flags a regression against its `this localInstall → "starts new bash"` step. Docs-only, no code.
 
 **Definition of done.**
-- [ ] `.puml` redrawn against `boot` (see `docs/boot.md` §"What it does, in order")
-- [ ] `.svg` regenerated
-- [ ] Cross-linked from `docs/boot.md` / `docs/wiki-index.md`
-- [ ] User confirms the diagram is now correct (this was the original question)
+- [x] Redrawn against `boot` — **by the user, in `docs/puml/bootstrap.sequence.drawio`**. Six lanes
+      (GitHub install, local `init/oosh`, login-shell `.bashrc → boot`, reconfigure-and-exit,
+      remote install, de-install), and it carries the post-`boot` mechanism in detail: the T4+T5
+      anchor rule and why the anchors are constants, the pure-data `user.env → oosh.env → log.env`
+      chain, the colon-guarded PATH with `dirname $BASH_FILE` first, the bare-`sh` skip of steps
+      6-7, and the `this call … then exit` step that replaced the old *"this localInstall → starts
+      new bash"* the 2026-09-08 notes flagged.
+- [x] Source of truth declared. Two editable sources was the same two-owners problem T8 exists to
+      end. **`.drawio` wins**; `bootstrap.sequence.puml` and its April `.svg`/`.eps` renders are
+      kept for history and now carry a `SUPERSEDED` header naming the replacement.
+- [x] Cross-linked from [boot.md](../boot.md) § See also — which had the ownership **backwards**,
+      calling the `.puml` the source and the `.drawio` an "editable copy" — and newly from
+      [wiki-index](../wiki-index.md), which did not link the diagram at all.
+- [x] **Three labels corrected**, because this week's tickets moved the mechanism under the
+      diagram after it was drawn on 2026-09-14:
+      `user ssh.backup $USER.$local.for.$remote (if not yet backed up)` → `user ssh.backup
+      pre-user-init` (item 6 deleted that name *and* that guard);
+      `this.path.add external · init · **.** · $OOSH_DIR · ng` → the `.` removed (T8, CWE-426);
+      and state 31 gained its new **first** step, the `pre-install` ssh snapshot (item 6).
+- [ ] **User confirms the diagram is correct** — the original question the card asked, and the one
+      box that is not ours to tick.
+
+**Not done, deliberately.** The `.svg` was not regenerated: the `.drawio` is the source now, and a
+render pipeline for it (a `drawio-export` container) is a tooling decision of its own. The stale
+renders say so in the `.puml` header rather than pretending otherwise.
 
 ---
 
@@ -729,3 +750,4 @@ never existed.
 | 2026-09-16 | **Backlog item 7 delivered** (`ff465db`…`eabf472`). `oo.mode.setup` delegates its layout half to `private.oo.shared.tree.from.local`, so there is **one** definition of canonical and it is the one install state 31 produces. All four `mv`s of the live tree are gone. What the research did not foresee: delegation does not fit in one call — when the clone already sits at `<base>/<branch>`, `git worktree add ../<branch>` collides with it (measured: rc 1). The source has to go BETWEEN the copy and the worktree-add, which is also the ordering the boss asked for, so the helper gained `<?consumeSource:no>` — verify `main/` is a real repository, then remove, then build. Default `no`, so state 31 is unchanged. **The acceptance criterion is enforced twice**: `mode.setup` verifies `oo.mode.base.get` resolves with `OOSH_COMPONENTS_DIR` unset before touching `~/oosh`, and T-SETUP-4 asserts it end to end — its old post-condition would have been satisfied by a bare `mkdir`. Six other checks added (argument validation, a canonical already-set-up guard that runs before branch detection, a non-repository `main/` refused, rc-checked symlink swap, and the result contract it never had). `oo.mode.base.set`'s "and persist" docstring corrected. test.oo 132 → 140, including four `T-BASE-GET` cases because **nothing** exercised strategies 2/3/4. core 727 → 735 assertions. One card filed, not fixed: is `OOSH_COMPONENTS_DIR` production config or test noise (§ 4c). |
 | 2026-09-16 | **Backlog item 8 delivered** (`54bc6ba`…`39f4ad4`). The card asked for `workspace.init` and for `workspace.get` to stop ignoring its argument; both done, and both `get` defects proven **red against the old code** before the fix. `init` delegates to `workspace.set` wholesale, so canonicalisation and the persistence trio keep one definition each; `get` also reports whether the root is **usable**, because it used to print a directory that was not there while `workspace.list` and `build` failed against the same value. **The bigger find was the template**: `templates/code/newScriptTest` carried no `test.suite.save.results` and no `TEST_CATEGORY`, so every generated test file was born score-less — which is why **twelve** files in `test/` report 0 / 0. Template fixed. Giving `test/test.odocker` a score exposed **nine** assertions failing invisibly, all defects in the test file: two dead function names (`private.odocker.workspaces`, `private.odocker.image.from.workspace`), three demanding method-specific completions where c2 and the audit both accept the shared form, and two demanding rc 1 from `up`/`down` where they deliberately show a picker and return 0. Two corrections to the card: the shipped default **does** exist here, and `this.absolutePath` answers `$PWD` for a nonexistent path — filed in § 4c with the two-enumerators finding. core 828 → 836 assertions, 28 → 29 files. |
 | 2026-09-16 | **Backlog items 9 and 10 delivered** (`3a4a1b4`…). Item 9 was documentation only and `oo.checkout` turned out to be one of the good citizens — `create.result` on every branch, `return $(result)` at the end, and a deliberate refusal to pull, because pulling belongs to `oo update` and merging to `promote`. `docs/oo.md` gained `### oo.checkout` and `### oo.use`, plus three things beyond the card: `### oo.method.delete` (created Tuesday, documented only in a commit message), a table for the rest of the mode family, and a warning section for `tmp.cleanup.testing` / `install.dev` / `install.dev.keys` — verbs tab completion offers with nothing behind them, one of which removes oosh and the SSH keys. One naming drift fixed: the section titled `oo.find.cmd` documented a verb that has never dispatched; the method is `oo.cmd.find`. Item 10 was a note: the decision to keep per-host `ossh` configs in the repo, and its two consequences, are now in § 4b. No code change in either. |
+| 2026-09-16 | **T6 — the last card.** The diagram itself was **redrawn by the user** (`docs/puml/bootstrap.sequence.drawio`, six lanes, current with `boot` — it carries the anchor rule, the pure-data env chain, the colon-guarded PATH, the bare-`sh` skip, and the `this call … then exit` step that replaced the *"starts new bash"* the 2026-09-08 notes flagged). This pass did the rest: **`.drawio` declared the single source of truth** — `boot.md` § See also had the ownership backwards, calling the pre-`boot` `.puml` the source and the `.drawio` an "editable copy" — the `.puml` and its April renders marked `SUPERSEDED` in their own header rather than deleted, a `wiki-index` link where there was none, and **three labels corrected that this week's own tickets invalidated after the diagram was drawn**: the `.for.` backup name and its unsatisfiable guard (item 6), the `.` on PATH (T8, CWE-426), and state 31's new first step (item 6). The `.svg` was deliberately not regenerated — a render pipeline for `.drawio` is its own tooling decision, and the stale renders now say so. One box left open on purpose: **the user confirming the diagram is correct**, which was the card's original question. |

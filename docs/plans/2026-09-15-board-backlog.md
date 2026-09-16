@@ -540,7 +540,16 @@ change.
 
 ---
 
-## 11. T6 — bootstrap.sequence diagram
+## 11. T6 — bootstrap.sequence diagram 🔍 IN REVIEW 2026-09-16
+
+> **The diagram itself was redrawn by the user**, in `docs/puml/bootstrap.sequence.drawio` — six
+> lanes, and current with `boot`. What this pass added: the `.drawio` declared the single source of
+> truth (`boot.md` § See also had the ownership backwards), the superseded `.puml` marked so in its
+> own header, a `wiki-index` link where there was none, and **three labels corrected** that this
+> week's own tickets invalidated after the diagram was drawn — the `.for.` backup name and its
+> guard (item 6), the `.` on PATH (T8), and state 31's new first step (item 6). The `.svg` was
+> deliberately not regenerated. One box is left open on purpose: the user confirming the diagram is
+> correct, which was the card's original question.
 
 **Card:** `prod/docs/puml/bootsratp.sequence` `/bootsratp.sequence.svg`
 
