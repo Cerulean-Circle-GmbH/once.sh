@@ -447,3 +447,28 @@ remote-install behaviour, so it is not bundled into a backup fix.
 
 **Still open, on purpose** (§ 14): the three directories in `/home/hannesn` are untouched — the
 tool that moves them now exists, and running it is the user's call.
+
+### The ubuntu gate, on `1122808`
+
+A real install from `origin/dev` into `os platform.test ubuntu_24_04`:
+
+```
+--- stray ssh.* in any home:
+NONE (correct)
+--- archives in /root/.ssh.backups:
+20260916T080540Z-pre-install        ← state 31, before its first ~/.ssh write
+20260916T080650Z-pre-user-init
+20260916T080656Z-pre-user-init
+--- user ssh.backup.status (as bash-user):
+OK: no legacy ssh.* backup directories in /home/bash-user      rc=0
+```
+
+Three things it proves that no unit test can: the archives land in **root's own home** rather than
+wherever the installer was started, **nothing** named `ssh.*` is created in any home any more, and
+the two labels appear in the right order with the state-31 snapshot first. The two `pre-user-init`
+entries are `ossh.install.continue.local` running more than once — which it always did; the
+difference is that they no longer nest inside each other.
+
+In-container `test.suite core 1`: 28 files, 731 assertions, 730 passed, 1 intentional, no
+`Shared tier:` line. The +4 over the host are `test.user`'s password tests, which run where sudo
+is passwordless.
