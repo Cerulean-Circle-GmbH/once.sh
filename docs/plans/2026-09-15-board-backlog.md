@@ -408,7 +408,17 @@ argument order so the local case cannot produce `X.for.X`.
 
 ---
 
-## 7. `oo.mode.setup`
+## 7. `oo.mode.setup` ✅ DELIVERED 2026-09-16
+
+> **Done** (`ff465db` … `eabf472`). Three of this section's claims were corrected by the research
+> doc — four base.get strategies not three, the first keying on `$OOSH_COMPONENTS_DIR` rather than
+> on `main`, and four T-SETUP tests of which only one is literally vacuous. `mode.setup` now
+> delegates its layout half to `private.oo.shared.tree.from.local`, so there is one definition of
+> canonical; all four `mv`s of the live tree are gone; and it **verifies `oo.mode.base.get` can
+> find the base with `OOSH_COMPONENTS_DIR` unset before it touches `~/oosh`** — this section's own
+> "Done when", which nothing checked. `oo.mode.base.set`'s "and persist" docstring corrected.
+> test.oo 132 → 140. § 13 of the research doc has the detail. Everything below is the ticket as
+> written.
 
 **Card:** `oo.mode.setup # <?worktree_base> # convert a plain clone to worktree structure for
 branch switching`

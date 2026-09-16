@@ -1,6 +1,6 @@
 # Item 7 — research: `oo.mode.setup`
 
-**Written 2026-09-16 · Branch `dev` (`b6a0ecc`) · Status: research complete; three questions open, see § 10.**
+**Written 2026-09-16 · Branch `dev` (`b6a0ecc`) · Status: DELIVERED — questions answered in § 10, what actually shipped in § 13.**
 **Card:** `oo.mode.setup # <?worktree_base> # convert a plain clone to worktree structure for branch switching`
 
 Ticket: [board backlog](../plans/2026-09-15-board-backlog.md) § 7 — the last **MEDIUM** on the list.
@@ -288,3 +288,54 @@ Measured on `b6a0ecc`, before any change:
   be `mv` of the shared `dev` worktree these files live in.
 - The 57 wildcard assertions beyond the ones item 7 touches — § 5.
 - `oo.use.completion.command`'s missing rc check — § 9, recorded not fixed.
+
+---
+
+## 13. Decided, and what shipped (2026-09-16, `ff465db` … `eabf472`)
+
+**The three answers.**
+
+1. **Delegate.** `oo.mode.setup` keeps its unique half — symlink, shim, summary — and hands the
+   layout half to `private.oo.shared.tree.from.local`. There is one definition of "canonical" in
+   the tree now, and it is the one install state 31 produces.
+2. **Copy, verify, then remove the original.** No `mv` of a live tree survives.
+3. **Stop the false claims here, file the rest.** `mode.setup`'s `config save` is gone and
+   `oo.mode.base.set`'s docstring is corrected; the variable question is filed.
+
+**What the research did not foresee: delegation does not fit in one call.** The helper goes
+`cp -a "$src" main` → normalise → `git worktree add "../$branch"`. When the plain clone already
+sits at `<base>/<branch>`, `../<branch>` **is** the source, and git refuses an existing non-empty
+path. Measured: rc 1, with `dev/.git` left as a plain clone's directory rather than a worktree
+pointer.
+
+The source therefore has to go **between** the copy and the worktree-add — which is also exactly
+the ordering decision 2 asks for. So the helper gained
+`private.oo.shared.tree.from.local <sourceDir> <branchName> <?consumeSource:no>`: it verifies
+`main/` is a real repository, then removes the source, then adds the worktree. Default `no`, so
+state 31's call is unchanged. Putting it there rather than in `mode.setup` is what keeps a single
+layout builder, with the destructive step beside the rc checks that already guard the copy.
+
+**One ordering changed during implementation.** The already-set-up guard now runs **before** branch
+detection. Caught by a test: with detection first, an already-canonical tree whose branch
+directory was not itself a repository turned a no-op into a refusal.
+
+**The acceptance criterion is enforced twice.** `mode.setup` verifies `oo.mode.base.get` resolves
+the base with `OOSH_COMPONENTS_DIR` unset **before** it touches `~/oosh` — so a failure leaves a
+canonical tree and a working symlink rather than a broken pair — and T-SETUP-4 asserts the same
+property end to end. § 5 showed its old post-condition would have been satisfied by a bare `mkdir`.
+
+**Tests: 132 → 140 in `test.oo`.** Four on `consumeSource` (default keeps the source, which pins
+state 31; `yes` removes it; a `main/` that is not a repository is refused rather than treated as a
+licence to delete; and the in-the-way case the parameter exists for, with a negative control
+confirming rc 1 without it). Four rewritten `T-SETUP`. Four new `T-BASE-GET`, because § 5 found
+that **nothing** exercised strategies 2/3/4 — including the negative that is this ticket's whole
+reason, `<base>/dev` with no `main/` being undetectable.
+
+**Not fixed, filed instead:** whether `OOSH_COMPONENTS_DIR` is production configuration or test
+noise. `config` documents it as the latter and excludes it; `oo.mode.base.set` treats it as the
+former. With a canonical layout it is no longer needed on this path, which is why item 7 could stop
+at correcting the claims.
+
+**Live box:** `oo mode.setup` reports "already exists" and touches nothing; `oo mode.base.get`
+still resolves with `OOSH_COMPONENTS_DIR` unset. Host `core` 727 → 735 assertions, 734 passed,
+1 intentional, no `Shared tier:` line.

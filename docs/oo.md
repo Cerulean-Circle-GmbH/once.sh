@@ -132,6 +132,59 @@ oo mode testing
 The branch is an **argument**, not part of the method name — `oo.mode()` takes
 `<?branch>`. Tab completion offers the available worktree branches.
 
+### The worktree layout
+
+Every `oo mode*` verb assumes one on-disk shape, and it is a **contract**, not a
+convention:
+
+```
+<base>/
+├── main/          ← the repository. .git is a real DIRECTORY
+├── dev/           ← a linked worktree. .git is a FILE: "gitdir: …/main/.git/worktrees/dev"
+└── prod/          ← likewise
+```
+
+`main` is load-bearing. `oo.mode.base.get` has four strategies and the three that
+work without an environment variable all key on a directory **named** `main`:
+the first worktree in `git worktree list` being called `main`, a sibling `main/`
+next to a linked worktree, or being `main/` itself. A layout with no `main/` is
+undetectable — which is exactly the bug
+[item 7](research/2026-09-16-item7-oo-mode-setup.md) fixed.
+
+`$OOSH_COMPONENTS_DIR` is the fourth route, and it is **process-scoped only**:
+`config` excludes it from every save on purpose. Do not rely on it surviving a
+shell. Build the layout instead.
+
+### oo.mode.setup
+
+Converts a plain clone into that layout and points `~/oosh` at it.
+
+```bash
+oo mode.setup                 # base defaults to the clone's parent directory
+oo mode.setup /var/dev/trees  # or name the base explicitly
+```
+
+It copies the clone to `<base>/main`, verifies that copy is a real repository,
+removes the original, adds `<base>/<branch>` as a worktree, and **checks that
+`oo.mode.base.get` can find the base with `OOSH_COMPONENTS_DIR` unset** before
+it touches `~/oosh`. If that check fails it stops with the layout built and the
+old symlink intact.
+
+It is a no-op when `<base>/main` already exists as a repository, and it refuses
+rather than guessing when `<base>/main` exists but is not one, when the source
+has no detectable branch, or when `~/oosh` is a real directory rather than a
+symlink.
+
+The layout itself is built by `private.oo.shared.tree.from.local` — the same
+helper install state 31 uses, so there is one definition of "canonical".
+
+### oo.mode.base.get / oo.mode.base.set
+
+`oo mode.base.get` prints the components base, or returns 1 when no layout is
+detectable. `oo mode.base.set <path>` sets it **for the current process only** —
+it is not persisted, whatever its output suggests. For a base that survives the
+shell, run `oo mode.setup`.
+
 ### oo.update
 
 Pulls latest changes from GitHub, then self-heals user symlinks.

@@ -58,7 +58,7 @@ The asymmetry that starts it: **`OOSH_MODE` has three runtime writers and `OOSH_
 | Writer | Site | Writes |
 |---|---|---|
 | `oo.mode` | `oo:899` + `config save oosh OOSH` | `OOSH_MODE` only |
-| `oo.mode.setup` | `oo:1077` | `OOSH_MODE` only |
+| `oo.mode.setup` | `oo:1084` at the time; the method was rewritten by [item 7](2026-09-16-item7-oo-mode-setup.md) | `OOSH_MODE` only — and its `config save` is gone, see that doc § 13 |
 | `promote` | `promote:1029` | `OOSH_MODE="released"` — the source of the value on this box |
 
 Each persists through a cascade that re-persists whatever `OOSH_BRANCH` the calling shell happens
