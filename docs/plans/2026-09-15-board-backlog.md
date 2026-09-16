@@ -373,6 +373,13 @@ The name is built as `ssh.` + `$USER` + `.` + *local* + `.for.` + *remote*.
    because cwd happened to be `/root`. `user.ssh.restore` reads the same relative name, and the
    `ssh.original` guard has the identical flaw.
 
+> **Research doc (2026-09-16), read before any code:**
+> [the `ssh.<user>.<host>.for.<host>` directory](../research/2026-09-16-item6-ssh-backup-naming.md).
+> It finds **six** defects, not three; disproves defect 1 with a measurement; shows the guard can
+> never be satisfied, so the backup fires on **every** install and **nests** one level deeper each
+> time; and records that the audit already classifies backup-before-overwrite as LEGIT where it
+> sits, which reframes the placement question. Ends with three questions for you.
+
 **Research doc first** — the placement question. These backup calls already live inside
 `ossh.install.continue.local`, which the working agreement forbids for *new* fixups. The doc must
 decide whether they move into a state rather than adding a fourth fixup beside them.
