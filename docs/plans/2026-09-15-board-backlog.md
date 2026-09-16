@@ -420,6 +420,15 @@ after running it on a plain clone, the base may still not be detectable. `privat
 is the function that already produces the canonical layout, and `mode.setup` does not call it. Its
 three tests use wildcard assertions from the cannot-fail family. No `docs/oo.md` section.
 
+> **Research doc (2026-09-16), read before any code:**
+> [`oo.mode.setup`](../research/2026-09-16-item7-oo-mode-setup.md). It corrects three of this
+> section's claims — there are **four** base.get strategies and the first does **not** key on
+> `main`, and there are **four** T-SETUP tests of which only one is literally vacuous — and it
+> finds a sharper defect than the one below: `mode.setup`'s only bridge to detectability is
+> `OOSH_COMPONENTS_DIR`, which `config` **filters out of every save on purpose**, so the layout it
+> builds works in that one process and is undetectable in the next shell. Measured both ways.
+> Ends with three questions for you.
+
 **Research doc first** — it `mv`s the live tree.
 
 **What to do.** Delegate to `private.oo.shared.tree.from.local` rather than growing a second layout
