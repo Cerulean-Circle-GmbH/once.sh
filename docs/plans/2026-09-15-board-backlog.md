@@ -290,7 +290,16 @@ delegates to it and that hand-rolled block goes.
 
 ---
 
-## 5. T8 — PATH bootstrap and the `path` script
+## 5. T8 — PATH bootstrap and the `path` script ✅ DELIVERED 2026-09-16
+
+> **Done** (`2471b43` … `0821802`). The rule is [boot.md § The PATH-writer rule](../boot.md),
+> enforced by **`path validate`** — a *writer sweep*, not a value check, because PATH is an
+> accumulation. `path` went from 26 definitions to 11 and stopped claiming a persistence it never
+> had; `.` came off the PATH; `claudeCode` stopped writing `export PATH=` into an env file; the
+> seven CI exports were **converted** to the sanctioned degrade idiom rather than deleted, because
+> the `|| true` above them made a failed `boot` silent. What actually shipped, and the four things
+> the research did not foresee, are in § 12 of the research doc. Everything below is the ticket as
+> it was written, kept for the record.
 
 **Card:** `review hot PATH is bootstrapped` · `PATH=` · `and the path script`
 

@@ -10,9 +10,12 @@
 # under dash (`ossh exec` on Debian), ash (Alpine/busybox), `env -i sh`, AND
 # bash. This is also what makes `env -i sh` boot correctly.
 #
-# Idempotent: safe to source repeatedly (PATH additions are colon-guarded), so
-# re-sourcing on `exec bash`, mode switches, or nested shells never grows PATH
-# or double-applies anything.
+# Idempotent, with one stated qualification. The $OOSH_DIR block below is
+# colon-anchored, so it is a true SEGMENT test and re-sourcing never moves or
+# duplicates it. The $BASH_FILE block is anchored to the FRONT of PATH only,
+# on purpose — brew bash must beat the /bin/bash that macOS path_helper
+# appends — so with BASH_FILE set, re-sourcing CAN grow PATH by one entry.
+# Nothing else double-applies. See docs/boot.md, "Idempotent".
 
 # ── 0. $HOME ────────────────────────────────────────────────────────────────
 # EVERY anchor below hangs off $HOME, and `env -i` drops it (T3). DERIVE it —

@@ -198,7 +198,7 @@ Without parameters, saves:
 - BASH_FILE
 - Then calls `config.save oosh` and `config.save log`
 
-**PATH is intentionally NOT saved** — it must be built dynamically at login by `bashrcTemplate` (`this.path.add` + `OOSH_DIR` guard). Saving root's PATH would overwrite the user's PATH in subprocesses.
+**PATH is intentionally NOT saved** — it is built at login by **`boot`**, which is its single owner (see [boot.md § The PATH-writer rule](boot.md)). Saving root's PATH would overwrite the user's PATH in subprocesses. Note the mechanism: PATH never reaches the *Excluded variables* table below, because `config.save`'s **inclusion gate** only ever considers `CONFIG_*` and `BASH_FILE`. (`bashrcTemplate` has carried no `this.path.add` since the boot-loader migration; its only PATH action is the degrade `elif` for branches that have no `boot` yet.)
 
 **Excluded variables.** `config.save` skips per-user dynamic paths so they don't leak from one user's saved config into another user's environment. The `~/config` symlink usually points at a shared location (`…sharedConfig/`), so a value written by root would otherwise be sourced verbatim by every other user — typically pointing at a path they can't access (EACCES). The exclusion list:
 

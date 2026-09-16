@@ -1,6 +1,6 @@
 # T8 — research: who owns `PATH`
 
-**Written 2026-09-16 · Branch `dev` (`97ad59c`) · Status: research complete; questions 1 and 2 decided, see § 11.**
+**Written 2026-09-16 · Branch `dev` (`97ad59c`) · Status: DELIVERED — decisions in § 11, what actually shipped in § 12.**
 **Card (Ideas):** `review hot PATH is bootstrapped` · `PATH=` · `and the path script`
 
 Ticket: [boot tickets tracker](../plans/2026-09-10-oosh-boot-tickets.md) § T8 ·
@@ -32,8 +32,13 @@ survive.** That is the main reason this document exists before any code.
 ## 2. Every PATH writer
 
 Five named mechanisms, eleven actual writers. One methodological note first: the default `grep`
-in this environment honours `.gitignore`, which **silently hides `init/once`** — it has 21 `PATH=`
-hits and is invisible to a plain `grep -rn`. Use `command grep` for this audit.
+in this environment honours `.gitignore`, which **silently hides `init/once`** from a plain
+`grep -rn` — it has 21 `PATH=` hits. Use `command grep` for an ad-hoc audit.
+
+> **Correction, made while implementing (2026-09-16):** `init/once` is nevertheless **tracked** —
+> it was committed before `once` was added to `.gitignore`, and `.gitignore` does not apply to
+> files already in the index. So `git grep` **does** see it, and `path validate` sweeps all
+> thirteen of its assignments. It is exempted by a file-wide marker, not by being invisible.
 
 **Builders and extenders, production:**
 
@@ -325,3 +330,32 @@ and is the lesser of the two evils on a Mac.
 
 **Not a question, an answer**, recorded so it is not asked again: **the rule is about writers, not
 values**, because `PATH` is an accumulation. See § 7.
+
+---
+
+## 12. What was delivered (2026-09-16, `2471b43` … `0821802`)
+
+Every decision in § 11 was implemented as written. Four things the research did not foresee, and
+one number that moved:
+
+1. **Three tools had to be built first**, because the ticket could not be done inside the
+   methodology without them — `line.remove.exact` (§ 5 and § 6 blamed the unanchored `grep -v` for
+   three separate bugs; one whole-line method fixes all three, in `path` *and* in
+   `this.path.add`), `replace block` (a method is a block, not a line), and **`oo method.delete`**,
+   the missing member of the `oo new` / `oo test.new` / `oo method.new` family. Without the last
+   one, sixteen deletions would have been sixteen hand edits — which is exactly how `path` came to
+   carry completion functions for verbs it no longer had.
+2. **`private.pathrm` was deleted after all**, as § 11 said. An intermediate plan kept it, on the
+   grounds that its anchored `sed` was the only correct de-dupe in the file; `line.remove.exact`
+   makes the `line` pipeline correct instead, which is the more conformant fix.
+3. **The sweep pattern had to be broadened.** `^[[:space:]]*PATH=` misses `boot`'s own
+   assignments, which sit inside a `case` and read `*) PATH="..." ;;` — the first run reported
+   **zero** conforming sites. It is `(^|[^A-Za-z0-9_])(export[[:space:]]+)?PATH=` now, and the
+   leading class is what keeps `CONFIG_PATH=` and `OSSH_CONTROL_PATH=` out. Its own test.
+4. **The seven CI exports were converted, not deleted.** § 9 and the ticket both read as "remove
+   them". They sit under `source "$HOME/oosh/boot" 2>/dev/null || true`, and that `|| true` makes a
+   failed boot silent — so the seven lines were the only thing between that and a broken job. They
+   are a genuine degrade branch, and the tree already had one blessed spelling for that.
+5. **§ 10's baselines moved**: `test.path` 13 → 21, `test.config` 70 → 70 (a test was replaced, not
+   added), `test.this` 32 → 32, host core 681 → 695 assertions. `./c2 function.completion ./path`
+   went from 21 verbs to 9, not the ~8 estimated, because `validate` is new.

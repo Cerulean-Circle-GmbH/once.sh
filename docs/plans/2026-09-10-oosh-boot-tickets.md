@@ -66,7 +66,7 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 |---|---|---|---|
 | 1 | **T4+T5** — `OOSH_DIR` audit + enforce | 🟣 **In Review** | Core boot mechanism. Landed `2045811` + `518e179` (the `CONFIG_PATH` follow-up). Everything below documents or depends on what this settles. |
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 💡 Ideas | Has a live reproducible bug, but its fix needs T4/T5's `OOSH_DIR`+branch semantics. |
-| 3 | **T8** — PATH bootstrap + the `path` script | 💡 Ideas | Same "what does `boot` own" theme as T4/T5; natural follow-on. |
+| 3 | **T8** — PATH bootstrap + the `path` script | 🔍 **In Review** | Same "what does `boot` own" theme as T4/T5. Delivered `2471b43`…`db0177d` + markers: `path validate`, the writer rule in [boot.md](../boot.md), `path` shrunk 26 methods to 11, `.` off the PATH. |
 | 4 | **T3** — `env -i sh` SAFETY | 🔍 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. Second attempt delivered `boot` + `init/oosh` recovery and the clean re-exec. |
 | 5 | **T9** — fixed system path to `boot` | 🔍 **In Review** | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. **Delivered 2026-09-14**: install state `34 root.boot.path.installed`, `oo boot.fix` / `oo boot.status`, the `/etc/profile.d/oosh.sh` login-shell drop-in (from `templates/user/profile.d.oosh.sh`), `test.platform.boot.system.path.invariant`. The five design decisions are recorded on [the card](2026-09-14-fixed-system-boot-path.md). Review checklist: the trust note (dev-group-writable content behind a root-looking path), the warn-and-skip on branches without `boot`, and a platform run on a host installed BEFORE state 34 followed by `oo boot.fix`. |
 | 6 | **T6** — `bootstrap.sequence` diagram | 💡 Ideas | Last: it documents the mechanism the five above settle. |
@@ -295,7 +295,7 @@ config init.check && ./test.suite run config 1
 
 ---
 
-### T8 — review how PATH is bootstrapped · the `path` script 💡 Ideas
+### T8 — review how PATH is bootstrapped · the `path` script 🔍 In Review (2026-09-16)
 
 > **Research doc (2026-09-16), read before any code:**
 > [who owns `PATH`](../research/2026-09-16-t8-path-ownership.md). It corrects six of this
@@ -313,11 +313,38 @@ first). But a separate `path` script (`path.list`, `path.env`, `path.save`, `pat
 *after* sourcing `boot` (review finding **M1**, deferred).
 
 **Definition of done.**
-- [ ] Decision: `boot` owns runtime PATH; what (if anything) `path` may persist
-- [ ] `path` script reconciled with that decision (or documented as a user-facing tool only)
-- [ ] The 7 redundant `macos-test.yml` exports removed or justified
-- [ ] Test pins PATH idempotency (extend `test.config` T24)
-- [ ] Standing verification bar passes
+- [x] Decision: `boot` owns runtime PATH; `path` persists **nothing** — it reports, and edits the
+      session. The rule and its exception table are in [boot.md § The PATH-writer rule](../boot.md).
+- [x] `path` script reconciled: 26 definitions to 11, 305 lines to ~260 (the new validator is most
+      of what is left), `./c2 function.completion ./path` from 21 verbs to 9. The three mutators
+      stopped claiming "and saves config", and stopped matching by substring.
+- [x] The 7 redundant `macos-test.yml` exports — **converted, not deleted**. Each sat under
+      `source "$HOME/oosh/boot" 2>/dev/null || true`, whose `|| true` makes a failed boot silent,
+      so they were a real degrade branch. Both lines became the one blessed spelling the tree
+      already uses.
+- [x] Test pins PATH idempotency — `test.config` **T74**, behavioural (source `boot` twice in a
+      clean sub-shell, inspect the PATH). It replaces a *second* test that also called itself T24
+      and could not fail: it grepped `boot` for two literals that appear in `boot`'s own comment.
+- [x] Standing verification bar passes — host `test.suite core 1` 27 files / 695 assertions / 694
+      passed / 1 intentional, no `Shared tier:` line; `path validate` 0 violations;
+      `this anchor.validate` 0 violations on both anchors.
+
+**Beyond the card.** Two live defects the ticket did not mention, both found by the research doc:
+
+- **`this.path.add "."`** — CWE-426. Each call prepends, so `.` landed *fourth*, ahead of
+  `/usr/local/bin`, `/usr/bin` and `/bin`, whenever `this`, `log`, `init` or `oosh` was
+  **executed** — the whole install run included, since `init/oosh` has `$0` of `oosh`. Silent,
+  because oosh's own tools still resolved from `$OOSH_DIR` while every `git`, `curl`, `tar` and
+  `sudo` they shelled out to came from the current directory. Root too, via `$OOSH_DIR/su`.
+- **`claudeCode`** wrote `export PATH=` **into a config env file** — the last writer that believed
+  env files carry PATH. It was also dead on its feet: `$CONFIG_FILE` is a file *name*, so its
+  `[ -f ]` guard was false anywhere but inside `~/config`.
+
+**Three tools were built first**, because the ticket could not be done conformantly without them
+(`2471b43`): `line.remove.exact` (whole-line, replacing the `grep -v` substring match behind three
+separate bugs), `replace block` (a method is a block, not a line), and **`oo method.delete`** — the
+missing member of the `oo new` / `oo test.new` / `oo method.new` family, without which sixteen
+deletions would have been sixteen hand edits.
 
 ---
 
@@ -659,3 +686,4 @@ never existed.
 | 2026-09-15 | **Three-platform gate on `9c05878`: PASS** — ubuntu_24_04, alpine_3_19, almalinux_9, all four users each, only the intentional meta-test failure (661/660/1 for the `test` user, 666/665/1 for root/oosh-user/bash-user — the +5 is `test.c2` in containers). The former alpine/almalinux reds now read `T47 skipped` ×8 and `T50 skipped` ×4. Also fixed: CLAUDE.md's `./otmux sendEnter` (dead name) → `./otmux send.enter`. |
 | 2026-09-16 | **Runner-level shared-tier guard** (`cff3bb5`…`b1003c7`) and **`oo method.new` repaired** (`7f93f4b`…`f386f87`). The isolation card was delivered as a canary rather than as default isolation — see § 4c for why the proposed design was wrong. First catch: `test.odocker` had been rewriting the site-wide `user.env`. The platform gate then caught a defect in the guard itself (mtime in the fingerprint, cascading on alpine), which is what the gate is for. Method tooling: multi-segment names, the docstring as the single source, a mandatory completion stub per parameter, the usage-table edit deleted rather than repaired, and two ways `replace` could destroy the script it was editing. Host core 665/664/1 → 672/671/1 intentional across 27 files. |
 | 2026-09-16 | **T7 delivered** (`fee9513`…`5fbb513`). `OOSH_BRANCH` is install INPUT and no longer persists; `OOSH_MODE` means the branch a host is on and the release lane asks for `prod` instead of a word promote stamped in after checking the tree back out to dev; `config.init` honours an anchor it is given, which is what finally made `config` fixture-able; `config validate required` declares the positive variable set and reports branch drift. **Both shared-tier waivers deleted and a core run now reports no `Shared tier:` line at all** — a pre-existing guard falling silent, which was the ticket's cheapest proof. Two things found on the way: an empty fixture is not isolation (test.config lost its PM cache and sat on a `sudo apt-get update` prompt — fixtures are seeded now), and the 20-lane is unfinishable by construction, filed in § 4c. core 674/673/1 → 680/679/1 intentional. |
+| 2026-09-16 | **T8 delivered** (`2471b43`…`0821802`). `boot` is now the STATED single owner of PATH, with `path validate` enforcing it the way `this anchor.validate` enforces the anchors — but as a **writer sweep**, not a value check, because PATH is an accumulation and there is no value to compare. 55 violations to 0: two conforming sites in `boot`, 57 declared exceptions, two whole-file exemptions (`init/oosh`, and `init/once`, which is in `.gitignore` but still tracked — a correction to the research doc). `path` shrunk from 26 definitions to 11 and stopped claiming a persistence it never had. Two defects beyond the card: `.` came off the PATH (CWE-426, and it fired during every install), and `claudeCode` stopped writing `export PATH=` into an env file. Three tools were built first because the ticket could not be done conformantly without them — `line.remove.exact`, `replace block`, and `oo method.delete`, the missing member of the `oo new` family. core 680/679/1 → 694/693/1 intentional. |

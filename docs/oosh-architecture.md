@@ -362,7 +362,7 @@ The file `this` is the OOSH kernel. It provides:
 | `this.functionExists` | Checks if a function is defined |
 | `this.isSourced` | Detects if script was sourced vs executed |
 | `this.init` | Initializes oosh environment |
-| `this.path.add` | Adds directories to PATH |
+| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that never source `boot` — `boot` owns the PATH ([boot.md](boot.md)) |
 
 ### Method Dispatch Chain
 
@@ -401,7 +401,7 @@ this.call() {
 | `this` | Core runtime, `this.start()` dispatches commands to methods |
 | `oo` | Framework lifecycle, `oo new`, `oo update`, `oo release` |
 | `config` | Configuration persistence to `~/config/user.env` |
-| `path` | PATH manipulation (`path add`, `path list`, `path remove`) |
+| `path` | PATH reporting and session-local edits (`path list`, `path env`, `path prepend`, `path remove`) plus `path validate`, the PATH-writer sweep. There is no `path add` |
 | `log` | Logging with levels 1-7 (`console.log`, `info.log`, `error.log`) |
 | `debug` | Step debugger, stack traces, trap handlers |
 | `line` | Pipe-friendly text processing (`line.split`, `line.join`, `line.filter`) |

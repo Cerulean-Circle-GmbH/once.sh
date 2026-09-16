@@ -201,6 +201,55 @@ literals then delegates the tree sweep to it.
 > A shell opened **before** this change still holds the old resolved `OOSH_DIR` /
 > `CONFIG_PATH`. `source ~/oosh/boot`, or simply a new shell, fixes it.
 
+### The PATH-writer rule (and its only exceptions)
+
+**`boot` is the single builder of `PATH`.** Everything else either delegates to
+it, or is a documented degrade branch that says so in the code.
+
+The anchor rule above and this one are enforced the same way, but they are not
+the same kind of rule, and the difference is the whole design:
+
+| | `OOSH_DIR` / `CONFIG_PATH` | `PATH` |
+|---|---|---|
+| what it is | a **constant** — `$HOME/oosh`, `$HOME/config` | an **accumulation** |
+| so "conforming" means | the value equals the constant | **the writer is `boot`** |
+| the validator is | a value check | a **writer sweep** |
+
+There is no value to test a `PATH` against, so the rule can only be about *who
+may write it*. Every `PATH=` or `export PATH=` assignment in the tracked tree
+outside `boot` is a violation unless it carries a marker:
+
+```sh
+# path-exception: <reason>            # this line, or one of the five above it
+# path-exception-file: <reason>       # anywhere in the file — the whole file
+```
+
+The five-line window exists because these assignments often sit inside a
+heredoc, an `ssh` command string or a `bash -c` string, where the marker cannot
+go on the line itself. The slug is derived from the variable name exactly as
+the anchor markers are (`PATH` → `path-exception`), so this is no new syntax.
+
+#### Who is exempt, and why
+
+| Kind | Sites | Why |
+|---|---|---|
+| **whole file** | `init/oosh` | the installer runs **before `~/oosh` exists**, so `boot` — which lives inside it — cannot be sourced yet. It builds brew-bash-first and hands a clean environment to the login shell |
+| **whole file** | `init/once` | the superseded ONCE installer, kept for history. Still *tracked* (committed before `once` entered `.gitignore`), so the sweep sees it |
+| degrade branch | `ossh` ×2, `user` ×3, `templates/user/bashrcTemplate`, and seven CI steps | `. ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:$PATH` — boot first, bare prepend only if it is missing. See *Cross-branch note* below |
+| remote / sudo string | `ossh`, `user` ×2, `hiveMind` ×3 | executed on **another host** or **as another user**, where `boot` has not run |
+| sourced-without-boot | `ossh.start`, `this` (file scope and `this.path.add`) | `ossh` and `this` are *sourced* by scripts that never reach `boot`; both prepends are colon-anchored |
+| repair, not build | `oo.mode` ×2, `this.init` | rewriting a branch name already in PATH, or saving and restoring PATH across a mid-session `source "$CONFIG"` |
+| session scope | `oo` (brew, `ONCE_LOAD_DIR`), `claudeCode`, `path.append`/`prepend`/`remove` | deliberately affects only the running shell, and says so in its docstring |
+| diagnostics | `debug`'s `p`, two banners, `path.env` | they **print** `PATH=`; they do not set it |
+
+Enforced by **`path validate [<treeRoot>]`** — one `git grep` over the tracked
+tree (`docs/`, `test/`, `.claude/`, `*.md`, `*.json` excluded as for the
+anchors, plus `old/` and `restore/`, the legacy graveyards), classifying every
+assignment as conforming / exception / violation, echoing its verdict to stdout
+so it survives any `LOG_LEVEL`, and returning rc 1 on any violation. Covered by
+`test.path` `T-PATH-VALIDATE-*`, including *planted* violations, so the guard
+is proven to fail — and proven not to mistake `CONFIG_PATH=` or
+`OSSH_CONTROL_PATH=` for `PATH=`.
 ## Guarantees
 
 The contract `boot` keeps, and that callers may rely on (settled by ticket **T3**,
@@ -425,8 +474,25 @@ own page: [install-bootstrap.md](install-bootstrap.md).
 
 ## Idempotent
 
-Safe to source repeatedly (mode switches, `exec bash`, nested shells): PATH
-additions are colon-guarded and nothing double-applies.
+Safe to source repeatedly (mode switches, `exec bash`, nested shells): nothing
+double-applies. The PATH statement needs one qualification, because the two
+blocks are not guarded the same way and only one of them is idempotent.
+
+**Block 1, `$OOSH_DIR` (`boot:103-109`) — segment-idempotent.** Its guard is
+`case ":$PATH:" in *":$OOSH_DIR:"*`, a true exact-segment test, so a PATH that
+already carries `~/oosh` anywhere is neither moved nor grown. `test.config`
+T74 pins this behaviourally: source `boot` twice in a clean sub-shell, and
+`$OOSH_DIR` appears exactly once and the second source changes nothing.
+
+**Block 2, `$BASH_FILE` (`boot:110-117`) — deliberately not.** Its guard is
+`case "$PATH" in "$_oosh_bashdir:"*`, anchored to the **front of PATH only**,
+so if that directory is present but not first it is prepended again. That is
+the point of the block: on macOS, brew bash has to beat the `/bin/bash` that
+`path_helper` appends, and re-asserting first position is how. The case is
+reachable — block 1 prepending `$OOSH_DIR` pushes the bash directory back one
+place — so re-sourcing `boot` with `BASH_FILE` set **can** grow PATH by one
+entry. That is the lesser of the two evils on a Mac: the behaviour stays, and
+this paragraph is the correction to the claim that used to stand here.
 
 ## Cross-branch note
 
@@ -440,7 +506,8 @@ absent. (Promotion is owned by the release process, not by this work.)
 
 `boot` has no `boot.start`, no `noun.verb` methods, and is POSIX `sh` — that is
 deliberate (the dash/ash requirement). Its tests live in `test/test.config`
-(T24 PATH idempotency, T31 the OOSH_DIR/CONFIG_PATH constants, T40 POSIX-sh/ash lint,
+(T74 PATH idempotency — behavioural, replacing a second test that also called
+itself T24 and could not fail; T31 the OOSH_DIR/CONFIG_PATH constants, T40 POSIX-sh/ash lint,
 T49-T52 the guarantees above, T44
 `OOSH_USER_CONFIG_PATH`, T45 session touch-guard, T47 dash sources a generated
 chain, T65-T68 `$HOME` recovery and the fixed-path routes, T70 POSIX-mode bash —
