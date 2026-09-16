@@ -490,7 +490,16 @@ today's code to watch it start red.
 
 ---
 
-## 9. `oo.checkout` — documentation only
+## 9. `oo.checkout` — documentation only ✅ DELIVERED 2026-09-16
+
+> **Done** (`3a4a1b4`…). `docs/oo.md` gained `### oo.checkout` and `### oo.use` as the card asks —
+> `### oo.mode.setup` and `### The worktree layout` landed with item 7. Folded in beyond the card,
+> because the gap it points at is wider than the verbs it names: `### oo.method.delete` (created
+> this week, documented only in a commit message), a table for the rest of the mode family
+> (`mode.list`, `branch.list`, `mode.align`, `mode.stage`, `prereqs.install`), and a warning
+> section for the three verbs tab completion offers that you must not run by accident. One naming
+> drift fixed: the section called `oo.find.cmd` documented a verb that has never dispatched — the
+> method is `oo.cmd.find`.
 
 **Card:** `oo.checkout # <version> # clone or add worktree for a remote branch`
 
@@ -508,7 +517,12 @@ The only gap: `docs/oo.md` jumps from `oo.mode` straight to `oo.update`.
 
 ---
 
-## 10. WODA.test certificates config — note only
+## 10. WODA.test certificates config — note only ✅ DELIVERED 2026-09-16
+
+> **Done** (`3a4a1b4`…). The decision and its two consequences are recorded in the tracker's new
+> § 4b, "Recorded decisions": `$OOSH_DIR` is the `~/oosh` symlink, so `oo mode <branch>` changes
+> which branch's host configs are visible; and the resolved machine values live in
+> `$CONFIG_PATH/stateMachines/`, not beside the `.conf`. No code change, as the card says.
 
 **Card:** `/root/oosh/etc/ossh/hosts/WODA.test/certificates.update.conf`
 

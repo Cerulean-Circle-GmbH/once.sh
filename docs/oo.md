@@ -185,6 +185,104 @@ detectable. `oo mode.base.set <path>` sets it **for the current process only** �
 it is not persisted, whatever its output suggests. For a base that survives the
 shell, run `oo mode.setup`.
 
+### oo.checkout
+
+Bring a remote branch onto this machine — as a worktree when the canonical
+layout is there, as a plain clone when it is not.
+
+```bash
+oo checkout testing              # → <base>/testing
+oo checkout feature/my-thing     # → <base>/my.thing   (prefix stripped, / → .)
+```
+
+The directory name is derived, not copied: a leading `test/`, `feature/` or
+`bugfix/` is stripped and the remaining slashes become dots, so
+`feature/my-thing` lands at `my.thing` and `oo mode my.thing` works.
+
+Which mode it takes depends on `oo.mode.base.get` — see
+[§ The worktree layout](#the-worktree-layout). With a base it runs
+`git worktree add` under it; without one it clones as a sibling of `~/oosh`,
+taking the remote URL from the existing checkout.
+
+**It does not pull.** A branch that is already present is reported and left
+alone, with a pointer to `oo update`. That is deliberate: pulling belongs to
+`oo update` and merging belongs to `promote` / `oo stage`, and conflating them
+here meant `oo checkout dev` silently fetched and merged `origin/dev` — a
+surprise from a command whose name says checkout. The one thing it *will*
+change is a worktree whose git branch has drifted from its directory name: it
+checks the branch out again to realign them, which is what `oo mode` assumes.
+
+`create.result` on every branch and `return $(result)` at the end, so it can be
+chained and its status trusted. On a failed clone it removes the half-made
+directory rather than leaving one behind.
+
+### oo.use
+
+Run one command from another branch **without switching**.
+
+```bash
+oo use main ossh status          # run main's ossh, stay on dev
+oo use testing test.suite core 1
+```
+
+The branch directory is found under the worktree base, falling back to a
+sibling of `~/oosh`. The command is then executed with `OOSH_DIR` pointed at
+that branch — a scoped child-process override, which is the one sanctioned
+exception to the `OOSH_DIR` anchor rule (`oosh-dir-exception` in the code;
+[boot.md § Sanctioned exceptions](boot.md)). There is no symlink alternative
+by design: the symlink is what `oo mode` moves, and `use` must not move it.
+
+Its exit status is **the command's own**, deliberately — it is a runner, so a
+failure in the target branch has to reach you unchanged. A missing branch or a
+missing command is a refusal with `create.result` before anything runs.
+
+It exports the logging stubs before handing over, because older branches call
+`console.log` / `important.log` during their own bootstrap. `info.log` is
+pointedly **not** exported — `log` uses its existence as a bootstrap guard, so
+exporting it would stop the target branch loading its own logging.
+
+### oo.method.delete
+
+Remove a method from a script, with its completion functions.
+
+```bash
+oo method.delete path.status         # the method and every path.status.completion.*
+```
+
+The counterpart of [`oo method.new`](#oomethodnew), and it exists for the same
+reason: a method is a **block**, not a line — its docstring, its body and one
+completion function per parameter. Deleting one by hand takes the body and
+leaves the rest orphaned, which is how `path` came to carry completion
+functions for verbs it no longer had.
+
+Built on `replace block`, so the `.bak`/`.new` transaction and the
+exactly-one-match refusal come for free. It handles the one-liner completion
+form (`x.completion.y() { echo a; }` has no closing brace *line*, so the block
+form alone would run past it).
+
+**It does not delete the test case.** A test case has no delimiters — a
+`test.case` line, a call and one or more `expect`s, freely interleaved with
+fixtures — so guessing its extent would silently eat assertions. Test
+references and private helpers named after the method are **reported** instead,
+for you to remove deliberately.
+
+A legacy `private.` helper whose name carries no script segment
+(`private.update.config` lived in `path`, but nothing in the name said so) is
+out of its reach; remove one of those with the command this is built on:
+`replace block <file> "<its first line>" "}" by ""`.
+
+### The rest of the mode family
+
+Short, because each one does what its name says — but they were undocumented,
+so `oo <TAB>` offered verbs with nothing behind them.
+
+| Verb | What it does |
+|---|---|
+| `oo mode.list` | the branches available as worktrees, with each one's git status |
+| `oo branch.list <?source:all>` | branches from `worktrees`, local `git`, and/or `remote` — `all` merges them |
+| `oo mode.align` | checks the git branch out again to match the worktree's directory name, for a tree that has drifted. `oo checkout` does the same repair for a branch it is asked to bring in |
+| `oo mode.stage <stage>` | promote a stage forward (`dev` → `testing` → `prod`). An alias of `oo stage`; the pipeline itself is [§ Promotion Commands](#promotion-commands-via-oo-wrappers) and lives in `promote` |
+| `oo prereqs.install` | install the install-time prereqs locally — `git`, `curl`, and `bash` 4+ when the running shell is older. Called by `init/oosh` through `ossh prereqs.install`; you rarely type it |
 ### oo.update
 
 Pulls latest changes from GitHub, then self-heals user symlinks.
@@ -397,14 +495,26 @@ do it this way.
 **Chaining limit.** `<packageName>` is optional and positional, so `oo cmd X cmd Y` cannot chain —
 the second `cmd` is read as X's package name. Use one `oo cmd` per line.
 
-### oo.find.cmd
+### oo.cmd.find
 
-Searches apt repositories for a command.
+Searches apt repositories for a command. The method is `oo.cmd.find` — this
+section said `oo.find.cmd` for as long as it has existed, which is a verb that
+has never dispatched.
 
 ```bash
-oo find.cmd htpasswd
+oo cmd.find htpasswd
 ```
 
+### Deprecated and dangerous verbs
+
+Tab completion offers these. They are listed here so nobody discovers what they
+do by running one.
+
+| Verb | Status |
+|---|---|
+| `oo tmp.cleanup.testing` | **DESTRUCTIVE.** Removes oosh *and SSH keys* from the machine completely. It exists for tearing down a throwaway test host. Never run it on a machine you care about |
+| `oo install.dev` | **Deprecated.** The old GitHub-keys install path. Use `init/oosh` (the curl one-liner) or `ossh install <host>` |
+| `oo install.dev.keys` | **Deprecated**, same family |
 ## Installation
 
 ### oo.install

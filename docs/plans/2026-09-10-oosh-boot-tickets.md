@@ -604,6 +604,33 @@ already flags a regression against its `this localInstall → "starts new bash"`
 diagram. The `.svg` is still the 2026-04-30 render — no PlantUML on the dev host —
 and the `.puml` is unchanged, so every DoD item above is still open.
 
+## 4b. Recorded decisions (so they are not rediscovered)
+
+### Per-host `ossh` configs live in the repo — backlog item 10, 2026-09-16
+
+The card `/root/oosh/etc/ossh/hosts/WODA.test/certificates.update.conf` looked
+like a stray file. It is not: nothing is broken, `WODA.test` is a genuinely known
+host, the file is committed on purpose, a real-env test asserts its contents, and
+`/root/oosh/etc/…` is the correct path when `OOSH_DIR=/root/oosh`.
+
+**Decision: it stays in the repo.** It is team configuration, version-controlled
+deliberately, and it arrives with a fresh install.
+
+Two consequences of that, which are the reason this note exists:
+
+1. **`$OOSH_DIR` is the `~/oosh` symlink**, so `oo mode <branch>` changes which
+   branch's host configs are visible. A host config added on `dev` is not there
+   after `oo mode prod` until it is promoted — that is the versioning working,
+   not a fault.
+2. **The resolved machine values go somewhere else entirely** — to
+   `$CONFIG_PATH/stateMachines/`, not next to the `.conf`. The `.conf` is input;
+   the state machine's record of a run is output, and it lives in the config tier
+   with everything else per-host.
+
+No code change. See [board backlog § 10](2026-09-15-board-backlog.md).
+
+---
+
 ## 4c. Proposed new cards (found by us, not yet on the board)
 
 The user moves cards; these are written up so they can be added to **Ideas** when he chooses.
@@ -701,3 +728,4 @@ never existed.
 | 2026-09-16 | **Backlog item 7 — research doc** ([`oo.mode.setup`](../research/2026-09-16-item7-oo-mode-setup.md)). Three of the card's claims corrected: there are **four** `oo.mode.base.get` strategies, not three, and the first keys on `$OOSH_COMPONENTS_DIR` rather than on a directory named `main`; there are **four** T-SETUP tests, of which only one is literally wildcard-vacuous. The sharper defect the card does not name: `mode.setup` builds `<base>/dev` with no `main`, so strategies 2/3/4 cannot match, and its only bridge is `OOSH_COMPONENTS_DIR` — which `config` **excludes from every save by design** (`config:571,595`, documented at `docs/config.md:215` as test noise). Measured: `base/dev` alone gives base.get **rc 1**; with the variable exported, rc 0. So the command whose own failure message tells you to run it produces a layout that re-creates that failure one shell later. Also recorded: four unguarded `mv`s where a pre-existing destination nests the live tree and a failed move still deletes and re-points `~/oosh`; T-SETUP-2 tests a git check that does not exist; T-SETUP-4's post-condition would be satisfied by a bare `mkdir` and never checks base.get; and **no test anywhere exercises strategies 2/3/4**. Three questions open. No code. |
 | 2026-09-16 | **Backlog item 7 delivered** (`ff465db`…`eabf472`). `oo.mode.setup` delegates its layout half to `private.oo.shared.tree.from.local`, so there is **one** definition of canonical and it is the one install state 31 produces. All four `mv`s of the live tree are gone. What the research did not foresee: delegation does not fit in one call — when the clone already sits at `<base>/<branch>`, `git worktree add ../<branch>` collides with it (measured: rc 1). The source has to go BETWEEN the copy and the worktree-add, which is also the ordering the boss asked for, so the helper gained `<?consumeSource:no>` — verify `main/` is a real repository, then remove, then build. Default `no`, so state 31 is unchanged. **The acceptance criterion is enforced twice**: `mode.setup` verifies `oo.mode.base.get` resolves with `OOSH_COMPONENTS_DIR` unset before touching `~/oosh`, and T-SETUP-4 asserts it end to end — its old post-condition would have been satisfied by a bare `mkdir`. Six other checks added (argument validation, a canonical already-set-up guard that runs before branch detection, a non-repository `main/` refused, rc-checked symlink swap, and the result contract it never had). `oo.mode.base.set`'s "and persist" docstring corrected. test.oo 132 → 140, including four `T-BASE-GET` cases because **nothing** exercised strategies 2/3/4. core 727 → 735 assertions. One card filed, not fixed: is `OOSH_COMPONENTS_DIR` production config or test noise (§ 4c). |
 | 2026-09-16 | **Backlog item 8 delivered** (`54bc6ba`…`39f4ad4`). The card asked for `workspace.init` and for `workspace.get` to stop ignoring its argument; both done, and both `get` defects proven **red against the old code** before the fix. `init` delegates to `workspace.set` wholesale, so canonicalisation and the persistence trio keep one definition each; `get` also reports whether the root is **usable**, because it used to print a directory that was not there while `workspace.list` and `build` failed against the same value. **The bigger find was the template**: `templates/code/newScriptTest` carried no `test.suite.save.results` and no `TEST_CATEGORY`, so every generated test file was born score-less — which is why **twelve** files in `test/` report 0 / 0. Template fixed. Giving `test/test.odocker` a score exposed **nine** assertions failing invisibly, all defects in the test file: two dead function names (`private.odocker.workspaces`, `private.odocker.image.from.workspace`), three demanding method-specific completions where c2 and the audit both accept the shared form, and two demanding rc 1 from `up`/`down` where they deliberately show a picker and return 0. Two corrections to the card: the shipped default **does** exist here, and `this.absolutePath` answers `$PWD` for a nonexistent path — filed in § 4c with the two-enumerators finding. core 828 → 836 assertions, 28 → 29 files. |
+| 2026-09-16 | **Backlog items 9 and 10 delivered** (`3a4a1b4`…). Item 9 was documentation only and `oo.checkout` turned out to be one of the good citizens — `create.result` on every branch, `return $(result)` at the end, and a deliberate refusal to pull, because pulling belongs to `oo update` and merging to `promote`. `docs/oo.md` gained `### oo.checkout` and `### oo.use`, plus three things beyond the card: `### oo.method.delete` (created Tuesday, documented only in a commit message), a table for the rest of the mode family, and a warning section for `tmp.cleanup.testing` / `install.dev` / `install.dev.keys` — verbs tab completion offers with nothing behind them, one of which removes oosh and the SSH keys. One naming drift fixed: the section titled `oo.find.cmd` documented a verb that has never dispatched; the method is `oo.cmd.find`. Item 10 was a note: the decision to keep per-host `ossh` configs in the repo, and its two consequences, are now in § 4b. No code change in either. |
