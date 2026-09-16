@@ -1,6 +1,6 @@
 # Item 6 — research: the `ssh.<user>.<host>.for.<host>` directory
 
-**Written 2026-09-16 · Branch `dev` (`8875332`) · Status: research complete; three questions open, see § 11.**
+**Written 2026-09-16 · Branch `dev` (`8875332`) · Status: DELIVERED — questions answered in § 11, what actually shipped in § 15.**
 **Card:** `/root/ssh..2378eed3bee5.for.2378eed3bee5`
 
 Ticket: [board backlog](../plans/2026-09-15-board-backlog.md) § 6 — the last **HIGH · install**
@@ -381,3 +381,69 @@ Checked before proposing, not after.
   **undetermined**, not absent.
 - `restore/` and `old/` — see § 10.
 - `ossh:2437`'s leaked `cd` and `oo:2260` — recorded, not fixed here.
+
+---
+
+## 15. Decided, and what shipped (2026-09-16, `6ad508e` … `65ccd9d`)
+
+**The four answers.**
+
+1. **Archive** — a timestamped **directory** under `$HOME/.ssh.backups/`, not a tarball. There is
+   no `tar` anywhere in the tracked tree, and the install path is the wrong place to introduce a
+   cross-platform dependency for this. `cp -R "$src/." "$dst/"`, the idiom `osshLayout:220` already
+   uses.
+2. **Placement: it moved.** § 7 left this open; the measurement closed it. `oo state` at
+   `ossh:699` drives the machine to 99 before returning, and state 31 writes `~/.ssh` at `oo:2066`
+   and after — so the backup labelled `original` never was. The snapshot is now the first thing
+   state 31 does, immediately above its own `mkdir -p "$HOME/.ssh"`, and it **fails loud**: the
+   state halts rather than continue without one. The *second* snapshot stayed exactly where it
+   was, immediately before `user init` — backup-before-overwrite, which § 7 showed the audit
+   already blesses there.
+3. **The argument order is kept**, and § 5's analysis is why: both callers pass the same shape, so
+   the order was never the defect. `.for.` is retired because the install runs **on the target**,
+   which made `.for.<target>` name the host the directory was already sitting on — redundant on
+   *both* paths, not only the degenerate local one. No caller changed.
+4. **Cleanup shipped** — `user ssh.backup.status` / `user ssh.backup.migrate`, § 9's constraints
+   honoured: unprivileged reporting, move rather than delete, `$SUDO` named when it is needed, and
+   the two same-prefix decoys (`$HOME/.ssh.backups`, `$HOME/.ssh/ids/ssh.*`) asserted to survive.
+
+**Why a new state was not added.** § 7 assumed the choice was "stay, or add a state". It is
+narrower than that: `private.check.priviledges.checked` (`oo:1537-1552`) **branches**, returning
+`20` or `30` as the follow-up, so a state appended to the 10-lane is unreachable — and inserting
+one before it renumbers `priviledges.checked`, which twelve files name by number, including
+generated `docs/puml/*.svg` and `.html`. The T9 comment at `oo:1486-1491` warns about exactly
+this. Putting the snapshot inside the state that does the writing satisfies the rule without any
+of that.
+
+**One claim in this document was wrong.** § 12 says the property "`$USER` is non-empty by the time
+`ossh` builds a path from it" is *"currently pinned by nothing"*. It is pinned:
+`test/test.this:543-561`, **T-THIS-USER-SELF-HEAL**, sources `this` under `env -i` and reads
+`USER` back. Since `this` guarantees it for every oosh context, a second test in `test.user` would
+have been a duplicate, and none was added.
+
+**Two prerequisites the ticket had to clear first.**
+
+- `test/test.user` carried **no `TEST_CATEGORY`**, so none of this would have run in the standing
+  bar — and it could not join `core`, because it blocked on a sudo password prompt. The cause was
+  one line in a fixture: `T-USER-INIT-SELF-HEAL` deliberately plants an incomplete
+  `os.commands.env`, whose self-heal ends in `oo pm.discover` → `$SUDO apt-get update`
+  (`oo:2961-2970`), and `sudo` reads the tty, so the redirects could not suppress it. Fixed with
+  `OOSH_PM_UPDATED`, the mechanism `oo` already has for "the index has been refreshed".
+- `user` and `test/test.user` had **neither insertion marker**, so `oo method.new` could not have
+  written into either. Both added — the same template gap T8 found in `path`, `line` and
+  `replace`.
+
+**What is deliberately NOT fixed, and now has its own card.** `ossh:705` does
+`config ssh.host.set "$sshConfigNameUsedForLocal"`, and by § 5's table that is the **runner's**
+alias on the remote path, while `config.ssh.host.set` (`config:1025`) is documented as *"the name
+of this host for ssh config"*. It lands right only because the runner's `OOSH_SSH_CONFIG_HOST` is
+usually unset and `init/oosh:426` turns the `_` placeholder into empty.
+`ssh.root.vm-dev.for.hannesn-VirtualBox` on the dev box is a case where it was not. That changes
+remote-install behaviour, so it is not bundled into a backup fix.
+
+**Baselines moved**: `test.user` 19 → 29 and it now runs in `core` for the first time;
+`test.ossh` 99 → 101; `test.oo` 131 → 132; host `core` 27 files / 695 assertions → **28 files /
+727 assertions**, 726 passed, 1 intentional, no `Shared tier:` line.
+
+**Still open, on purpose** (§ 14): the three directories in `/home/hannesn` are untouched — the
+tool that moves them now exists, and running it is the user's call.

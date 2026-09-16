@@ -355,7 +355,16 @@ assert `$OOSH_DIR` appears exactly once on PATH; then pre-seed PATH with it mid-
 
 ---
 
-## 6. The `ssh..<id>.for.<id>` directory
+## 6. The `ssh..<id>.for.<id>` directory ✅ DELIVERED 2026-09-16
+
+> **Done** (`6ad508e` … `65ccd9d`). Six defects, not three. Defect 1 (`$USER` → `ssh..`) was
+> already dead and is measured so. The backup is now a `$HOME`-anchored timestamped archive under
+> `~/.ssh.backups/`, which fixes the root-keys-in-a-user's-home defect by construction; the
+> pre-install snapshot moved **into state 31**, because `ssh.original` was taken after `oo state`
+> and was therefore never original; `.for.` is retired without moving an argument; `user
+> ssh.backup.status` / `.migrate` clean up what is already on disk. Ten tests where there were
+> none, and `test.user` joined `core` — it could not before, because it blocked on a sudo prompt.
+> § 15 of the research doc has the detail. Everything below is the ticket as written.
 
 **Card:** `/root/ssh..2378eed3bee5.for.2378eed3bee5`
 
