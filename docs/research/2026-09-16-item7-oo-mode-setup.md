@@ -339,3 +339,22 @@ at correcting the claims.
 **Live box:** `oo mode.setup` reports "already exists" and touches nothing; `oo mode.base.get`
 still resolves with `OOSH_COMPONENTS_DIR` unset. Host `core` 727 → 735 assertions, 734 passed,
 1 intentional, no `Shared tier:` line.
+
+### The ubuntu gate, on `7ade687`
+
+Item 7 is off the install path, but commit 1 touched
+`private.oo.shared.tree.from.local`, which install state 31 calls on its clone-failure fallback —
+so the default had to be proven inert. `os platform.test ubuntu_24_04`:
+
+```
+--- layout produced by the install:
+dev
+main
+--- oo.mode.base.get with OOSH_COMPONENTS_DIR unset:
+…/Once.sh        rc=0
+```
+
+The canonical layout still comes out of state 31, and it is detectable without the variable — which
+is the property `oo.mode.setup` now produces too. In-container `test.suite core 1`: 28 files, 739
+assertions, 738 passed, 1 intentional, no `Shared tier:` line. The +4 over the host are
+`test.user`'s password tests, which run where sudo is passwordless.
