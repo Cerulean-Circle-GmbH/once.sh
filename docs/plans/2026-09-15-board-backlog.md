@@ -455,7 +455,17 @@ breaking CI.
 
 ---
 
-## 8. odocker workspaces
+## 8. odocker workspaces ✅ DELIVERED 2026-09-16
+
+> **Done** (`54bc6ba` … `39f4ad4`). `workspace.init` created via `oo method.new`, delegating to
+> `workspace.set` wholesale; `workspace.get` now honours its argument **and** reports whether the
+> root is usable, with both defects proven red against the old code first. Two corrections to this
+> section: the shipped default **does** exist on this host, so the symptom quoted below is not the
+> one to reproduce; and the real blocker was that `test/test.odocker` scored **0 / 0**, because
+> `templates/code/newScriptTest` carried no `test.suite.save.results` — the template made every
+> generated test file score-less, which is why twelve files in `test/` were in that state. Giving
+> this one a score exposed **nine** assertions that had been failing invisibly, all of them defects
+> in the test file. Everything below is the ticket as written.
 
 **Cards:** `odocker workspace.get /var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces`
 and `odocker workspace.init`

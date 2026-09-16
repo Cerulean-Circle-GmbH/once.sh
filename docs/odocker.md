@@ -127,10 +127,15 @@ The Docker socket gives the container root-level access to the host's Docker dae
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `workspace.get` | | Show current Docker workspaces directory and where it's persisted |
+| `workspace.get <?path>` | directory path (optional) | With no argument: show the current Docker workspaces directory, where it is persisted, **and whether it is usable** — rc 1 when it is not. With a path: report whether **that** path would be a usable root. A reporter only; it never sets, persists or creates |
+| `workspace.init <?path>` | directory path (optional — defaults to the platform default) | **Create** the directory if it is absent, then hand over to `workspace.set`. Idempotent. The verb to use on a fresh host, where `workspace.set` would refuse because the directory is not there yet |
 | `workspace.set <?path>` | directory path (optional — defaults to the platform default) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to `$ODOCKER_WORKSPACES_DEFAULT` |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
 
+> **Which verb:** `init` creates and sets, `set` sets an existing directory and
+> refuses a missing one, `get` only reports. `set`'s refusal is deliberate — a
+> typo must not persist a path that is not there — which is why `init` exists.
+>
 > **Persistence:** `workspace.set` stores the setting in `$CONFIG_PATH/odocker.env`
 > and registers it with `config add` so every new shell inherits the value.
 > Legacy installs that had `ODOCKER_WORKSPACES=` in `user.env` are migrated on
