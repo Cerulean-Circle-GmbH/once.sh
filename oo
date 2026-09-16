@@ -638,7 +638,7 @@ oo.mode.base.get() # # returns the OOSH components base directory
   return 1
 }
 
-oo.mode.base.set() # <path> # set and persist the OOSH components base directory
+oo.mode.base.set() # <path> # set the OOSH components base directory FOR THIS PROCESS ONLY — it is not persisted; see `oo mode.setup` for a durable layout
 {
   local path="$1"
   if [ -z "$path" ]; then
@@ -650,8 +650,18 @@ oo.mode.base.set() # <path> # set and persist the OOSH components base directory
     return 1
   fi
   export OOSH_COMPONENTS_DIR="$path"
+  # NOT persisted, and the docstring used to say it was. `config` excludes
+  # OOSH_COMPONENTS_DIR from every save on purpose (config:595, reason at
+  # config:571), so this `config save` only ever wrote the OTHER OOSH_* values
+  # and silently dropped the one variable this method exists to set. It is kept
+  # because the method's callers may rely on the rest of that save; what
+  # changed is that the docstring and this comment now say what happens.
+  #
+  # For a base that survives the shell, build the canonical layout —
+  # `oo mode.setup` — so oo.mode.base.get resolves through strategies 2/3/4
+  # and needs no variable at all.
   config save oosh OOSH
-  console.log "Base set to: $path"
+  console.log "Base set to: $path (this process only — see oo mode.setup)"
 }
 
 oo.mode.list() # # list available branches with git status
@@ -992,97 +1002,138 @@ private.oo.install.shim() {
   echo "  Shim:    $shimDst (oo function loaded — mode/use update current shell)"
 }
 
-oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure for branch switching
+oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main/ + <branch>/ worktree layout and point ~/oosh at it
 {
+  # It builds ONE layout, and it is not this function's own. The layout half is
+  # private.oo.shared.tree.from.local — validated, idempotent, git-fallback'd,
+  # and the same builder install state 31 uses, so there is exactly one
+  # definition of "canonical" in the tree.
+  #
+  # What this used to do instead: build <base>/dev with NO main/, which defeats
+  # oo.mode.base.get strategies 2, 3 and 4 (they all key on a directory named
+  # `main`), and bridge the gap by exporting OOSH_COMPONENTS_DIR for strategy 1
+  # — a variable `config` excludes from every save on purpose (config:571,595).
+  # So the layout worked in this process and was undetectable in the next
+  # shell: the command whose own failure message tells you to run it produced a
+  # layout that re-created that failure. Measured in
+  # docs/research/2026-09-16-item7-oo-mode-setup.md § 3.
+  #
+  # And it moved the live tree with four unguarded `mv`s. Those are gone: the
+  # helper copies, verifies, and only then consumes the source.
   local OOSH_LINK="$HOME/oosh"
   local currentDir
   # private.this.path.canonical (this:144) — portable resolver.
   currentDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
 
-  # Check if already set up — base must exist AND contain at least one worktree subdir
-  local existingBase
-  existingBase=$(oo.mode.base.get 2>/dev/null)
-  if [ -n "$existingBase" ] && [ -d "$existingBase" ]; then
-    local hasWorktrees=false
-    for d in "$existingBase"/*/; do
-      if [ -d "$d/.git" ] || [ -f "$d/.git" ]; then
-        hasWorktrees=true
-        break
-      fi
-    done
-    if [ "$hasWorktrees" = "true" ]; then
-      echo "Worktree structure already exists at: $existingBase"
-      return 0
+  # 1. Validate the argument. Nothing did, so a typo'd base silently became the
+  #    place the live tree was moved to.
+  local base
+  if [ -n "$1" ]; then
+    base="$1"
+    shift
+    if [ ! -d "$base" ]; then
+      error.log "oo.mode.setup: <worktree_base> is not a directory: $base"
+      create.result 2 "no such directory: $base" "$1"
+      return $(result)
     fi
+    if [ ! -w "$base" ]; then
+      error.log "oo.mode.setup: <worktree_base> is not writable: $base"
+      create.result 2 "not writable: $base" "$1"
+      return $(result)
+    fi
+  else
+    base="$(dirname "$currentDir")"
+  fi
+  local targetDir
+
+  # 2. Already set up. This comes BEFORE branch detection on purpose: if the
+  #    layout is canonical there is nothing to do, and demanding a detectable
+  #    branch first would turn a no-op into a refusal.
+  #    The old guard accepted ANY subdirectory holding a .git, so a
+  #    half-converted tree read as done. The canonical shape is main/ with a
+  #    real .git DIRECTORY — main/ is the repository, the branch directories
+  #    are linked worktrees whose .git is a pointer file.
+  if [ -d "$base/main/.git" ]; then
+    echo "Worktree structure already exists at: $base"
+    create.result 0 "already set up at $base" "$1"
+    return $(result)
   fi
 
-  # Determine worktree base directory
-  local base="${1:-$(dirname "$currentDir")}"
-  local devDir="$base/dev"
+  # 3. A main/ that is not a repository is a refusal, not something to copy over.
+  if [ -e "$base/main" ]; then
+    error.log "oo.mode.setup: $base/main exists but is not a git repository — move it aside first"
+    create.result 3 "$base/main is not a repository" "$1"
+    return $(result)
+  fi
 
-  # Detect current branch
+  # 4. The branch this clone is on names the worktree directory.
   local currentBranch
   currentBranch=$(this.git.branch.short "$currentDir")
   if [ -z "$currentBranch" ]; then
-    error.log "Cannot detect current branch in $currentDir"
-    return 1
+    error.log "oo.mode.setup: cannot detect a branch in $currentDir — is it a git clone?"
+    create.result 1 "no branch detected in $currentDir" "$1"
+    return $(result)
   fi
+  targetDir="$base/$currentBranch"
+
+
 
   echo "Setting up worktree structure..."
   echo "  Source: $currentDir (branch: $currentBranch)"
   echo "  Base:   $base"
 
-  if [ "$currentBranch" = "dev" ]; then
-    # On dev: just move the directory
-    if [ "$currentDir" = "$devDir" ]; then
-      echo "Already at $devDir — nothing to move"
-    else
-      echo "Moving $currentDir → $devDir"
-      mv "$currentDir" "$devDir"
-    fi
-  else
-    # On a feature branch: move to dev dir, checkout dev, then worktree add for the branch
-    echo "Moving $currentDir → $devDir"
-    mv "$currentDir" "$devDir"
-
-    echo "Switching $devDir to dev branch..."
-    (cd "$devDir" && git checkout dev 2>/dev/null) || {
-      # If dev doesn't exist locally, create it from origin/dev
-      (cd "$devDir" && git checkout -b dev origin/dev 2>/dev/null) || {
-        error.log "Failed to checkout dev branch. Restoring original location."
-        mv "$devDir" "$currentDir"
-        return 1
-      }
-    }
-
-    echo "Creating worktree for $currentBranch..."
-    (cd "$devDir" && git worktree add -B "$currentBranch" "../$currentBranch" "$currentBranch") || {
-      error.log "Failed to create worktree for '$currentBranch'. Restoring original location."
-      (cd "$devDir" && git checkout "$currentBranch" 2>/dev/null)
-      mv "$devDir" "$currentDir"
-      return 1
-    }
+  # 5. Build it. `yes` consumes the source AFTER main/ is verified — the only
+  #    ordering that works when the clone already sits where the branch
+  #    worktree has to go, and the only one in which nothing can be lost.
+  if ! ( cd "$base" && private.oo.shared.tree.from.local "$currentDir" "$currentBranch" yes ); then
+    error.log "oo.mode.setup: could not build the canonical layout in $base — $currentDir is untouched unless the log above says otherwise"
+    create.result 4 "layout build failed in $base" "$1"
+    return $(result)
   fi
 
-  # Create symlink
-  local targetDir
-  if [ "$currentBranch" = "dev" ]; then
-    targetDir="$devDir"
-  else
-    targetDir="$base/$currentBranch"
+  # 6. THE acceptance criterion, and nothing checked it before: can
+  #    oo.mode.base.get find this base in a shell that has no
+  #    OOSH_COMPONENTS_DIR? That is every shell but this one. Checked BEFORE
+  #    the symlink moves, so a failure leaves a canonical tree and a working
+  #    ~/oosh rather than a broken pair.
+  local verifiedBase
+  verifiedBase=$( unset OOSH_COMPONENTS_DIR; OOSH_DIR="$targetDir"; oo.mode.base.get 2>/dev/null )
+  if [ "$verifiedBase" != "$base" ]; then
+    error.log "oo.mode.setup: the layout in $base is not detectable without OOSH_COMPONENTS_DIR (got '${verifiedBase:-nothing}') — ~/oosh left where it was"
+    create.result 5 "layout not detectable: ${verifiedBase:-nothing}" "$1"
+    return $(result)
   fi
 
+  # 7. Repoint ~/oosh. The source is gone by now, so the path is free when it
+  #    WAS the source. A real directory that was not the source is a refusal —
+  #    the old code skipped its own `rm` in that case and let `ln -s` create
+  #    the link INSIDE the directory.
   if [ -L "$OOSH_LINK" ]; then
-    rm "$OOSH_LINK"
+    rm "$OOSH_LINK" || {
+      error.log "oo.mode.setup: could not remove the old $OOSH_LINK symlink"
+      create.result 6 "could not remove $OOSH_LINK" "$1"
+      return $(result)
+    }
+  elif [ -e "$OOSH_LINK" ]; then
+    error.log "oo.mode.setup: $OOSH_LINK exists and is not a symlink — move it aside, then re-run. The canonical layout is already in $base"
+    create.result 6 "$OOSH_LINK is not a symlink" "$1"
+    return $(result)
   fi
-  # At this point the original directory was moved, so OOSH_LINK path is free
-  ln -s "$targetDir" "$OOSH_LINK"
+  if ! ln -s "$targetDir" "$OOSH_LINK"; then
+    error.log "oo.mode.setup: could not link $OOSH_LINK -> $targetDir. The canonical layout is in $base"
+    create.result 6 "could not create $OOSH_LINK" "$1"
+    return $(result)
+  fi
 
-  # Update environment
   # OOSH_DIR stays the constant ~/oosh — the `ln -s` above made it valid again.
-  export OOSH_COMPONENTS_DIR="$base"
+  # OOSH_MODE means the branch this host is on (T7).
   export OOSH_MODE="$currentBranch"
-  config save oosh OOSH 2>/dev/null
+  # PROCESS-SCOPED, deliberately not saved. `config` excludes
+  # OOSH_COMPONENTS_DIR from every save (config:595), and with a canonical
+  # layout it is not needed: oo.mode.base.get resolves through strategies
+  # 2/3/4, which is what step 6 just proved. The old `config save oosh OOSH`
+  # here only ever looked like it persisted this.
+  export OOSH_COMPONENTS_DIR="$base"
 
   # Install ooShim so 'oo mode' always works regardless of active branch
   private.oo.install.shim "$targetDir"
@@ -1090,13 +1141,13 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure
   echo ""
   echo "Worktree structure created:"
   echo "  Base:    $base"
-  echo "  Dev:     $devDir"
-  if [ "$currentBranch" != "dev" ]; then
-    echo "  Branch:  $targetDir"
-  fi
+  echo "  Repo:    $base/main"
+  echo "  Branch:  $targetDir"
   echo "  Symlink: $OOSH_LINK → $targetDir"
   echo ""
   echo "Use 'oo mode <branch>' to switch branches."
+  create.result 0 "worktree structure at $base" "$1"
+  return $(result)
 }
 
 private.oo.completion.worktree.branches() # # echo branch names whose worktree dirs sit under oo.mode.base.get; safe inside c2 completion subprocesses (no create.result side-effects)
