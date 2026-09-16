@@ -1,6 +1,6 @@
 # T8 — research: who owns `PATH`
 
-**Written 2026-09-16 · Branch `dev` (`97ad59c`) · Status: research only, no code.**
+**Written 2026-09-16 · Branch `dev` (`97ad59c`) · Status: research complete; questions 1 and 2 decided, see § 11.**
 **Card (Ideas):** `review hot PATH is bootstrapped` · `PATH=` · `and the path script`
 
 Ticket: [boot tickets tracker](../plans/2026-09-10-oosh-boot-tickets.md) § T8 ·
@@ -88,7 +88,8 @@ appends. But it means the claim *"re-sourcing `boot` never grows PATH"* — stat
 and in [boot.md § Idempotent](../boot.md) — is **false** in precisely that case, and the case is
 reachable: block 1 prepending `$OOSH_DIR` pushes the bash dir back one position.
 
-Either the behaviour or the claim has to give way. That is open question 3.
+Either the behaviour or the claim has to give way. Recommendation in § 11: the claim gives way —
+brew bash winning is the point of the block, and the documentation is what is inaccurate.
 
 **Not open:** `boot` touches PATH even when `~/oosh` is absent. Its only guard is
 `[ -n "$OOSH_DIR" ]`, and `OOSH_DIR` was set unconditionally 36 lines earlier at `boot:67`. This
@@ -283,19 +284,44 @@ Measured on `97ad59c`, host, before any T8 change:
 
 ---
 
-## 11. Open questions
+## 11. Decisions
 
-The first two are **coupled** and should be answered together.
+**1 and 2 — decided 2026-09-16: `path` is KEPT and shrunk hard, and the validator lives in it.**
 
-1. **Does `path` survive?** A read-only reporting tool, or deleted outright. There are no
-   production callers either way. Deleting it costs `test/test.c2:162-177`, which uses
-   `path prepend`'s signature as a completion fixture and would need repointing at another script.
-2. **Where does the validator live?** If `path` survives, `path.validate` is the noun.verb home and
-   the script finally earns its keep. If `path` goes, it belongs in `this` beside
-   `this.anchor.validate` as `this.path.validate`, completing the family that already has
-   `this.oosh.dir.validate` and `this.config.path.validate`.
-3. **Which gives way on the `BASH_FILE` block** — the idempotency claim in the documentation, or
-   the must-be-first behaviour in the code?
+The deciding fact is one the code cannot answer: whether a human types `path list`. It does, so the
+script stays — but as an honest reporting tool rather than one whose own help text advertises verbs
+it has never had.
 
-Not a question, an answer, recorded here so it is not asked again: **the rule is about writers, not
+| Keep | Delete |
+|---|---|
+| `path.list`, `path.env` — they work and they are the reason to have the script | the macOS relics: `path.file.global`, `.global.use`, `.user`, `.user.save`, `.user.edit`, `.user.set`, `path.save`, `path.load`, `path.edit` |
+| `path.file.custom` — a plain `cat`, harmless and working | the ONCE integration: `path.sync`, `path.show.once.path` — it calls a **gitignored** script that exists on no other machine |
+| `path.append`, `path.prepend`, `path.remove` — but honestly: session-local, with the false persistence claim removed | `path.status`, `path.show.oosh.path` — they grep for a line no generated env file has contained since the env-file migration, and compare stale data against stale data |
+| the two `path.parameter.completion.*` | `private.update.config` — the external `config save` that rewrites the tier from a child's environment |
+| | `private.pathadd`, `private.pathrm` — correct code, zero callers |
+
+Three things the shrink must carry, or it trades one wrong claim for another:
+
+- **`path.usage` is rewritten.** It currently advertises `add`, `push`, `put` and `rm`, none of
+  which exist. `docs/oosh-architecture.md:404` advertises `path add` too.
+- **The docstrings stop claiming persistence.** `path.append`'s "and saves config" is false in both
+  modes — as a command it mutates a child that then exits, and nothing writes PATH to the config
+  under any invocation.
+- **The unanchored `grep -v` is fixed or documented.** `line.filter` / `line.remove` match a
+  substring, so `path remove /usr` deletes `/usr/bin`, `/usr/local/bin` and `/usr/sbin`. A method
+  kept as user-facing cannot keep that behaviour silently.
+
+Because `path` survives, the validator is **`path.validate`** — the noun.verb home, and the thing
+that finally makes the script earn its keep. `this` keeps the two anchor validators it already has.
+`test/test.c2:162-177` needs no repointing, since `path.prepend` stays.
+
+**3 — recommendation, open to being overruled: the claim gives way, not the behaviour.**
+
+Brew bash must win over the `/bin/bash` that macOS `path_helper` appends; that is the whole point
+of `boot:110-117` and it should not change. What is wrong is the documentation saying re-sourcing
+*never* grows PATH. The accurate statement is that the `OOSH_DIR` block is segment-idempotent and
+the `BASH_FILE` block deliberately re-asserts first position — which can grow PATH by one entry,
+and is the lesser of the two evils on a Mac.
+
+**Not a question, an answer**, recorded so it is not asked again: **the rule is about writers, not
 values**, because `PATH` is an accumulation. See § 7.
