@@ -313,7 +313,12 @@ degrade branch since the boot-loader migration), and `docs/oosh-architecture.md`
 `path add`, a verb that does not exist. There is no PATH-ownership rule in `docs/boot.md`, unlike
 `OOSH_DIR` and `CONFIG_PATH`, which have one *and* a validator.
 
-**Research doc first.**
+**Research doc first — written 2026-09-16:**
+[who owns `PATH`](../research/2026-09-16-t8-path-ownership.md). **Six of the claims below did not
+survive re-checking** — there are eleven PATH writers rather than five, `this.path.add` is called
+six times, `.` lands fourth rather than first, `ossh`'s block is not a byte-identical duplicate,
+`config.save` stops PATH at the inclusion gate rather than the exclusion list, and the
+shared-config finding is already closed. Read the doc, not this paragraph.
 
 **What to do.** Establish the rule: **`boot` is the single builder and stays byte-identical**;
 everything else delegates or is a documented degrade branch. Guard it the way T4+T5 guarded the

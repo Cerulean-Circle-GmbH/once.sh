@@ -297,6 +297,11 @@ config init.check && ./test.suite run config 1
 
 ### T8 — review how PATH is bootstrapped · the `path` script 💡 Ideas
 
+> **Research doc (2026-09-16), read before any code:**
+> [who owns `PATH`](../research/2026-09-16-t8-path-ownership.md). It corrects six of this
+> ticket's factual claims, finds two defects the ticket does not mention, and ends with three
+> questions — the first two coupled: does `path` survive, and where does the validator live.
+
 > **Card (Ideas #8):** `review hot PATH is bootstrapped` — `PATH=` — `and the path script`
 
 **Meaning.** Establish a single owner for PATH.
