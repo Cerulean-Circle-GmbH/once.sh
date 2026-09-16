@@ -13,15 +13,18 @@ echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 source this
 source test.suite
 
-# `path` has no fixture of its own: path.append / prepend / remove all end in
-# private.update.config, whose body is a NO-ARG `config save`. That truncates
-# $CONFIG_PATH/user.env and then cascades `config save oosh OOSH` and
-# `config save log LOG`, regenerating oosh.env and log.env from the CURRENT
-# process env. ~/config is a site-wide sharedConfig sourced by every user at
-# login, so this file rewrote three shared files eight times per
+# NO config isolation any more, deliberately. path.append / prepend / remove
+# used to end in private.update.config, whose body was a NO-ARG `config save`:
+# that truncated $CONFIG_PATH/user.env and then cascaded `config save oosh
+# OOSH` and `config save log LOG`, regenerating oosh.env and log.env from the
+# current process env. ~/config is a site-wide sharedConfig sourced by every
+# user at login, so this one file rewrote three shared files eight times per
 # `test.suite core 1` run, for everyone on the box.
-# The score still goes to the inherited CONFIG_PATH — see test.suite.save.results.
-test.suite.config.isolate test.path >/dev/null || exit 1
+#
+# T8 deleted private.update.config. These methods are session-local now and
+# write no file at all, so the fixture has nothing left to protect. The
+# runner's shared-tier canary is the proof: if this file ever writes ~/config
+# again, the run names it.
 
 source path
 
@@ -72,7 +75,7 @@ else
 fi
 
 # ============================================================================
-# Test path.append (also tests path.add and path.push which are aliases)
+# Test path.append  (there are no `add` / `push` aliases — there never were)
 # ============================================================================
 
 reset_path
@@ -139,6 +142,71 @@ else
   expect.fail "path.remove should remove directory from PATH"
 fi
 
+# ============================================================================
+# T-PATH-REMOVE-EXACT: `path remove /usr` must not take /usr/bin with it
+# ============================================================================
+# The old body used line.remove — `grep -v "$1"`, a SUBSTRING match — so
+# removing a prefix removed every path under it. This is the assertion the
+# shrink exists for.
+test.path.removeIsWholeSegment() {
+  # The REAL PATH is kept and /usr appended to it — a synthetic PATH would
+  # leave grep, sed and xargs unresolvable, and path.remove runs a line.*
+  # pipeline. The real PATH already carries /usr/bin, /usr/local/bin and
+  # /usr/sbin, which is exactly what the old substring match destroyed.
+  local saved="$PATH" after bare kept
+  export PATH="$PATH:/usr"
+  path.remove "/usr" >/dev/null 2>&1
+  after="$PATH"
+  export PATH="$saved"
+  bare=$(printf "%s" ":$after:" | grep -c ":/usr:")
+  kept=$(printf "%s" ":$after:" | grep -c ":/usr/bin:")
+  if [ "$bare" = "0" ] && [ "$kept" != "0" ]; then
+    create.result 0 "whole segment only"
+  else
+    create.result 1 "bare=$bare kept=$kept in: $after"
+  fi
+  return $(result)
+}
+test.case $level "path.remove - removes the whole segment only, not everything under it" \
+  test.path.removeIsWholeSegment
+expect 0 "whole segment only" "line.remove is a substring match: it deleted /usr/bin, /usr/local/bin and /usr/sbin too"
+
+# The same substring bug on the de-dupe side: appending /opt/x dropped /opt/xy.
+test.path.appendDeDupeIsWholeSegment() {
+  local saved="$PATH" after
+  export PATH="$PATH:/opt/xy"
+  path.append "/opt/x" >/dev/null 2>&1
+  after="$PATH"
+  export PATH="$saved"
+  case ":$after:" in
+    *":/opt/xy:"*) create.result 0 "neighbour kept" ;;
+    *)             create.result 1 "the de-dupe pass ate /opt/xy: $after" ;;
+  esac
+  return $(result)
+}
+test.case $level "path.append - de-dupes by whole segment, so /opt/xy survives adding /opt/x" \
+  test.path.appendDeDupeIsWholeSegment
+expect 0 "neighbour kept" "line.filter matched a substring, so the de-dupe pass ate the neighbour"
+
+# Nothing here may persist: PATH is built by boot at login, and these methods
+# are session-local. The docstrings used to claim "and saves config".
+test.path.mutatorsPersistNothing() {
+  local saved="$PATH" before after
+  before=$(cat "$CONFIG" 2>/dev/null | wc -l)
+  path.prepend "/tmp/oosh-test-path-persistence" >/dev/null 2>&1
+  after=$(cat "$CONFIG" 2>/dev/null | wc -l)
+  export PATH="$saved"
+  if [ "$before" != "$after" ] || grep -q "oosh-test-path-persistence" "$CONFIG" 2>/dev/null; then
+    create.result 1 "path.prepend wrote to $CONFIG"
+  else
+    create.result 0 "nothing written"
+  fi
+  return $(result)
+}
+test.case $level "path.prepend - writes nothing to the config tier" \
+  test.path.mutatorsPersistNothing
+expect 0 "nothing written" "private.update.config ran a no-arg config save from a child process — boot owns PATH"
+
 
 # ============================================================================
 # Test path.parameter.completion.dir - completion function
@@ -190,14 +258,27 @@ fi
 # Test path.usage
 # ============================================================================
 
-test.case $level "path.usage - displays usage information" \
-  path.usage
-
-if [[ "$RESULT" == *"Usage"* ]] || [ $RETURN_VALUE -eq 0 ]; then
-  expect.pass "path.usage displays help"
-else
-  expect.fail "path.usage should display help information"
-fi
+# The old assertion was `[[ "$RESULT" == *"Usage"* ]] || [ $RETURN_VALUE -eq 0 ]`
+# — the second disjunct is satisfied by almost any outcome, so it could not
+# fail. What matters is that the text no longer advertises verbs that do not
+# exist: `add`, `push`, `put` and `rm` all reach this.methodNotFound, and the
+# table is rendered by this.help from the docstrings now.
+test.path.usageAdvertisesOnlyRealVerbs() {
+  local out
+  out=$(path.usage 2>/dev/null)
+  local ghost
+  for ghost in "  add" "  push" "  put" "  rm" " status " " file.global" " file.user"; do
+    case "$out" in *"$ghost"*) create.result 1 "usage still advertises '$ghost'"; return $(result) ;; esac
+  done
+  case "$out" in
+    *"Usage"*) create.result 0 "usage is honest" ;;
+    *)         create.result 1 "usage printed no command table" ;;
+  esac
+  return $(result)
+}
+test.case $level "path.usage - advertises only verbs that exist" \
+  test.path.usageAdvertisesOnlyRealVerbs
+expect 0 "usage is honest" "the hand-maintained table advertised four verbs that have never existed"
 
 # ============================================================================
 # Cleanup
