@@ -325,7 +325,12 @@ first). But a separate `path` script (`path.list`, `path.env`, `path.save`, `pat
 - [x] Test pins PATH idempotency — `test.config` **T74**, behavioural (source `boot` twice in a
       clean sub-shell, inspect the PATH). It replaces a *second* test that also called itself T24
       and could not fail: it grepped `boot` for two literals that appear in `boot`'s own comment.
-- [x] Standing verification bar passes — host `test.suite core 1` 27 files / 695 assertions / 694
+- [x] Standing verification bar passes — **ubuntu gate on `cd11aec`: PASS.** A real install from
+      `origin/dev` completes, and inside the container `echo $PATH` shows **no `.`** — the CWE-426
+      fix holds through the install path, which is where it used to fire. `test.suite core 1` there:
+      27 files / 695 assertions / 694 passed / 1 intentional, same as the host, no `Shared tier:`
+      line; `path validate` and `this anchor.validate` both 0 violations in the container.
+      Host `test.suite core 1` 27 files / 695 assertions / 694
       passed / 1 intentional, no `Shared tier:` line; `path validate` 0 violations;
       `this anchor.validate` 0 violations on both anchors.
 
