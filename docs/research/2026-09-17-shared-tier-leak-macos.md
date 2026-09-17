@@ -268,3 +268,52 @@ One is the intentional meta-test. Eight are one cause — macOS `/tmp` and `/var
 symlinks, so a canonicalised path gains a `/private` prefix and a string comparison fails. One is
 `$TMPDIR` carrying a trailing slash, producing `//` in a built path. One is the `ooshTestC` case
 above. **None is in this ticket.**
+
+---
+
+## 11. The macOS portability pass (2026-09-17) — 12 failures to 2
+
+`493c25c` (canonicalised fixtures) and `48f8b05` (portable grep), on top of `823d50a`.
+
+| | at the start | now |
+|---|---|---|
+| macOS `core` failures | 12 | **2** |
+| of which intentional | 1 | 1 |
+| **real** failures | **11** | **1** |
+| shared tier written | 2 files | **none** |
+| ubuntu gate | `test=0 root=0 oosh-user=0 bash-user=0` | **unchanged** |
+| host `core` | 838/839 | **unchanged** |
+
+Two causes, eleven assertions:
+
+- **Eight** — macOS `/tmp` is a symlink to `/private/tmp`, and `$TMPDIR` lives under
+  `/var/folders`, reached the same way. A fixture path handed to code that RESOLVES it comes back
+  with the `/private` prefix, so a comparison against the raw `mktemp` path can never match.
+  `test.suite.fixture.make` canonicalises at creation. **`$TMPDIR` also ends in a slash on macOS**,
+  so `"${TMPDIR}/x"` yields `…//x`; canonicalising collapses that too — one fix, two symptoms.
+- **One** — `grep -c -- '-one$\|-two$'`. **`\|` alternation is a GNU extension**; BSD grep does not
+  support it, so the count was 0 and the test reported `user.ssh.backup.list` broken **while the
+  tool was working perfectly**. The worst kind of failure: it sends you to debug working code.
+
+**Regression safety, which is the reason for the shape of this fix.** Canonicalisation is a
+**no-op on Linux** (`/tmp` is a real directory) — measured before converting anything — so a
+converted fixture cannot behave differently here, and host `core` is byte-for-byte the same score.
+Only the **seven sites that actually failed** were converted, not all 85 `mktemp -d` sites in
+`test/`: a sweep of that size is churn with its own regression risk and no measured benefit.
+
+### The one real failure left
+
+`user.create ooshTestC password '' leaves account locked`. Not a path or a regex — genuine macOS
+account semantics: `sysadminctl -addUser` does not produce the shadow-less account `useradd`
+does, and the test's cleanup calls `user.delete.linux` unconditionally (a name that is not a
+defined public method — `private.user.delete.linux` is). Sibling of the
+`private.this.group.create has no macOS route` card. **Its own ticket.**
+
+### Cards filed by this pass
+
+| Card | Why |
+|---|---|
+| **macOS account creation** | `user.create <u> password ""` does not leave a locked account on darwin; the test also calls `user.delete.linux`, which no public method defines. Same family as `private.this.group.create`. |
+| **`test/test.hiveMind` uses GNU-only `\|` BREs** | `:1211, :1222, :2163, :2171, :2185`. `TEST_CATEGORY=extended`, already has known failures, so not bundled — but it will never pass on macOS as written. |
+| **78 un-canonicalised fixture sites** | `test/` has 85 `mktemp -d` calls; seven now use `test.suite.fixture.make`. The rest are latent macOS failures, each waiting for someone to compare a resolved path. |
+| **`test.suite` cannot be extended by the tool** | It carries no `### new.method` marker, and `oo method.new` cannot parse a dotted script name — `${name%%.*}` on `test.suite.fixture.make` yields `test`. So `test.suite.fixture.make` had to be hand-written. |
