@@ -471,6 +471,18 @@ These functions are used internally and generally not called directly:
 | `config.string.quote` | Quotes strings for command line |
 | `config.info.log` | Logs config at info level |
 | `config.completion.*` | Tab completion helpers |
+| `private.config.variables.list` | `<envPrefix>` → one persistable variable NAME per line (`compgen -v`, shape gates, exclusion list) |
+| `private.config.variable.export.line` | `<variableName>` → one `export NAME="value"` line; rc 1 for unset, array, or an ANSI-C-quoted value |
+| `private.config.variables.export` | `<envPrefix>` → the whole body of a generated env file |
+| `private.config.string.upper` | `<string>` → upper-cased, without the bash-4 `${var^^}` operator |
+| `private.config.required.variables.get` | the required-variable table, as data |
+| `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
+
+All six are getters consumed as `$(…)`, so none calls `create.result` — it runs
+in a subshell and the result could never reach the caller. The first three are
+additionally **silent by contract**: their only caller runs inside
+`{ … } >$CONFIG`, and `log:35` sets `LOG_DEVICE=/proc/self/fd/1`, so inside that
+redirect a single `debug.log` would be written into the generated env file.
 
 ## File Format
 
@@ -481,6 +493,31 @@ export VARIABLE_NAME="value"
 export ANOTHER_VAR="another value"
 source $CONFIG_PATH/other.env
 ```
+
+**`export` is mandatory, not decoration.** `boot` sources these files with POSIX
+`.`, and a bare `NAME=value` assigns in the sourcing shell but exports nothing to
+its children — so `OOSH_MODE` would be set at login and empty in every command
+the user then runs.
+
+Note that **`config validate` does not enforce it**: its regex makes the keyword
+optional (`^(export[[:space:]]+…)?[A-Za-z_][A-Za-z0-9_]*=`), so a file of bare
+assignments validates `OK`. On macOS that is exactly what `config.save` produced
+for years — bash 3.2's `declare -p` prints no `declare -x` prefix for the `sed`
+to rewrite. The check that does enforce it is the platform test
+`test/test.platform.shared.config.env.invariant`.
+
+**How the body is generated.** `config.save` does not parse `declare -p`. It asks
+`private.config.variables.list <prefix>` for variable NAMES (`compgen -v`, two
+shape gates, then the exclusion list), and renders each one with
+`private.config.variable.export.line`, which uses `declare -p <name>` — the
+*named* form, the only one that behaves the same on bash 3.2 and bash 5. Bash
+does the quoting; nothing in oosh hand-rolls an escaper.
+
+A value that bash renders with ANSI-C quoting (`$'a\nb'` — a newline or a control
+character) is **refused, not written**: `$'…'` is a bashism and dash reads it
+literally at every `/bin/sh` login. Nothing in the `OOSH_*` / `LOG_*` / `CONFIG_*`
+families is meant to hold a newline, so such a value is an upstream bug;
+`config validate required` is what reports the variable as missing.
 
 ## Completion Support
 

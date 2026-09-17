@@ -1,6 +1,6 @@
 # `config.save` under bash 3.2 — research: how the required-variables table got written into `oosh.env`
 
-**Written 2026-09-17 · Branch `dev` (`93a9a12`) · Status: RESEARCH — no code changed. Questions in § 8.**
+**Written 2026-09-17 · Branch `dev` (`93a9a12`) · Status: F1 + F2 + F3 DELIVERED 2026-09-17 — see § 12. F4 + F5 + F6 remain (card 2).**
 **Found by:** the macOS gate after T6, on a virgin `sequoia-base` Tart VM (`192.168.64.5`, user `admin`).
 
 A fresh macOS install produces a `~/config/oosh.env` that every shell fails to source:
@@ -271,3 +271,67 @@ Re-running the install from scratch reproduces § 1 from a clean VM in about six
 Board: this wants **one card for F1+F2+F3** (HIGH · install — `config.save` is not bash-3.2-safe)
 and **one for F4+F5+F6** (MEDIUM — the guard that was discarded and the repair that does not
 repair). They are separable and the first is the one that ships broken installs.
+
+---
+
+## 12. What shipped (2026-09-17)
+
+**F1 + F2 + F3 — delivered.** Commits `287073f` … `2b70425` on `dev`.
+
+| # | Fault | Fix |
+|---|---|---|
+| **F1** | `declare -p` assumed to be `declare -flags NAME=value` | `declare -p <name>` — the *named* form, measured correct on 3.2 and 5 — and `export` is **prepended**, never sed-patched onto a prefix bash 3.2 does not print |
+| **F2** | no shape gate on the derived name | `compgen -v` supplies NAMES; two input gates and one output gate; both loops read **line by line**, so the line is the unit validated |
+| **F3** | macOS env files never carried `export` | same change; `docs/config.md § File Format` now says `export` is mandatory and why |
+
+The twelve-line inline loop is four private methods —
+`private.config.variables.list`, `private.config.variable.export.line`,
+`private.config.variables.export`, `private.config.string.upper` — which is the
+extraction `review-2026-09-09 § M3` named eight days before it existed.
+
+### Two prerequisites the ticket did not expect
+
+- **`oo method.new` could not create a private method.** It split
+  `private.config.variables.list` on the first segment, aimed at a file called
+  `private`, and refused with rc 3. Private methods are a large share of every
+  script, so the tool the project *mandates* could not make one and each was
+  hand-written. Fixed first (`287073f`), with `T-METHOD-NEW-PRIVATE`.
+- **Anything logged inside `config.save`'s redirect lands in the env file.**
+  `log:35` sets `LOG_DEVICE=/proc/self/fd/1`; inside `{ … } >$CONFIG` fd 1 *is*
+  `$CONFIG`. A second, latent route for junk into env files, now a stated
+  contract on the three harvest methods.
+
+### Three faults found while fixing these, and fixed here
+
+- **`${file^^}` is fatal on bash 3.2**, not a warning: "bad substitution" and
+  the shell **exits**. Reached by the DOCUMENTED single-argument form
+  (`config add oosh`, `docs/config.md:343`), so on macOS a documented command
+  killed the user's shell.
+- **`config save backup BACKUP_`** (`backup:262`) harvested nothing: the gate
+  read `BACKUP_|BACKUP__*`. `backup.env` has always been empty.
+- **`result.save`** (`this:697`) wrote every line matching `RESULT` —
+  name *and value* — into a file `result.load` then **sources**. With two
+  planted decoys the red run also caught three unplanted ones, including
+  `testName`, whose *value* merely mentioned RESULT.
+
+### One correction to § 6
+
+The table listed `result.save` as carrying the same bash-3.2 fault. It does
+not: `declare -px` (**with** `-x`) is well behaved on 3.2 — probed on the VM.
+Its defect is the sibling one, matching the whole line instead of the name.
+
+### Still open — card 2
+
+**F4** (`config.save` discards its own `config.validate` verdict), **F5**
+(`config init.env` empties the file), **F6** (the re-derivation column has no
+consumer). Plus the cards in § 13.
+
+## 13. Cards filed while doing this
+
+| Card | Why |
+|---|---|
+| `config.string.quote` is lossy | `config:163-166` ends `echo $RESULT` **unquoted**: `"a␣␣␣␣b"` → `'a b'`. It is the nearest-miss helper for this ticket and could not be reused. Fixing it moves T25/T26 semantics. |
+| `BASH_MINIMUM_MAJOR_VERSION` is dead | `config.bash.minimal.version` (`config:780`) writes it; nothing in the tree reads it. It also appends straight to `$CONFIG` instead of via `config.set`, so it duplicates on every call. |
+| `templates/code` has no `newGetterTest` | `newMethodTest` assumes a `create.result` method: its `expect 0 "<result>"` compares `$RESULT`, which a getter never sets, so the generated case compares whatever the previous test left — a test that cannot fail. Four such cases were generated and removed by hand here. |
+| `replace` cannot target one of two identical adjacent lines | `replace block` requires anchors matching exactly one line each, so collapsing a duplicated line needed raw `python3` — the one edit in this ticket that did not go through an oosh command. |
+| Which install step runs `config.save` under `/bin/bash`? | § 8 Q2, still unpinned. This ticket makes it harmless rather than answering it. If the answer is "none should", that is an install-path ticket and this becomes defence in depth. |
