@@ -442,22 +442,78 @@ config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (
     error.log "config.init.env: \$CONFIG_PATH ${RED}$CONFIG_PATH${NORMAL} missing — run ${YELLOW}config init.user${NORMAL} first"
     return 1
   fi
-  # Backup user.env before regen — `config save` (no args) only re-emits
-  # CONFIG_*-prefixed exports plus the static blocks at config:540-541.
-  # Hand-customisations (custom non-CONFIG_* exports, manually-added source
-  # lines beyond what `config add` writes) would otherwise be lost silently.
-  if [ -f "$CONFIG_PATH/user.env" ]; then
-    local _ts
-    _ts=$(date +%Y%m%d-%H%M%S)
-    cp -p "$CONFIG_PATH/user.env" "$CONFIG_PATH/user.env.bak.$_ts" 2>/dev/null \
-      && important.log "config.init.env: backed up ${YELLOW}user.env${NORMAL} → ${GREEN}user.env.bak.$_ts${NORMAL}" \
-      || warn.log "config.init.env: failed to back up user.env (continuing)"
-  fi
+  # Back up ALL THREE, not just user.env. Only user.env was copied before, and
+  # that is exactly how OOSH_PM was lost on the macOS VM: `config save oosh
+  # OOSH` truncates oosh.env with `{ … } >$CONFIG` before anything can read the
+  # surviving value out of it, so by the time the save fails there is nothing
+  # left to restore from. The refuse-to-worsen guard below restores from these.
+  local _ts _envName
+  _ts=$(date +%Y%m%d-%H%M%S)
+  for _envName in user oosh log; do
+    [ -f "$CONFIG_PATH/$_envName.env" ] || continue
+    cp -p "$CONFIG_PATH/$_envName.env" "$CONFIG_PATH/$_envName.env.bak.$_ts" 2>/dev/null \
+      || warn.log "config.init.env: failed to back up $_envName.env (continuing)"
+  done
+  important.log "config.init.env: backed up user/oosh/log .env → ${GREEN}*.env.bak.$_ts${NORMAL}"
+
+  # WHAT WAS MISSING BEFORE THIS TICKET. config.save persists the ENVIRONMENT,
+  # and the environment is populated FROM the config — a closed loop with no
+  # source of truth. So regenerating a config that had lost a variable simply
+  # wrote the gap back, and on the macOS VM the report went from two missing
+  # variables to three with oosh.env emptied.
+  #
+  # Derive here, in the REPAIR, and never in config.save: `oo pm.discover`
+  # reaches `config save` internally (oo:3045 → config's log.device HACK → a
+  # recursive `config save log LOG`), and that cascade is what wrote a shared
+  # config tier on macOS. The writer stays a pure persister.
+  #
+  # Per-variable emptiness guard, exactly as private.user.init's OS_CMD heal
+  # does it (user:1655-1699): a value that survived is NEVER overwritten by a
+  # derived one. The verdicts go to stdout — nothing captures config.init.env,
+  # unlike config.save — so an operator running the advertised repair can see
+  # what was reconstructed and what could not be.
+  local _variable _file _deriver _derived _repaired="" _unrecoverable=""
+  while read -r _variable _file _deriver; do
+    [ -z "$_variable" ] && continue
+    [ -n "${!_variable}" ] && continue          # it survived; leave it alone
+    [ "$(type -t "$_deriver")" = "function" ] || { _unrecoverable="$_unrecoverable $_variable"; continue; }
+    _derived=$("$_deriver" 2>/dev/null)
+    if [ -n "$_derived" ]; then
+      export "$_variable=$_derived"
+      _repaired="$_repaired $_variable"
+    else
+      _unrecoverable="$_unrecoverable $_variable"
+    fi
+  done <<REQUIRED
+$(private.config.required.variables.get)
+REQUIRED
+  [ -n "$_repaired" ]      && echo "config.init.env: re-derived:$_repaired"
+  [ -n "$_unrecoverable" ] && echo "config.init.env: could NOT derive:$_unrecoverable — the regenerated config will still be missing these"
+
   important.log "config.init.env: regenerating ${YELLOW}user.env${NORMAL} + ${YELLOW}oosh.env${NORMAL} + ${YELLOW}log.env${NORMAL} via ${YELLOW}config save${NORMAL} (mirrors install)"
   # `config save` (no args) cascades internally: writes user.env, then calls
-  # itself with (oosh OOSH) and (log LOG) to populate the other two with
-  # the canonical self-anchors and PATH/log-init blocks (config:543-599).
+  # itself with (oosh OOSH) and (log LOG).
   config.save || warn.log "config.init.env: config.save returned non-zero — env files may be partial"
+
+  # REFUSE TO WORSEN. The command `config validate required` advertises as the
+  # repair must never again be able to make its own report worse — which is
+  # precisely what it did on the VM. Count what is missing afterwards; if the
+  # tier came out with FEWER export lines than it went in with, put the backups
+  # back and say so.
+  local _envRc=0
+  for _envName in user oosh log; do
+    local _bak="$CONFIG_PATH/$_envName.env.bak.$_ts"
+    [ -f "$_bak" ] || continue
+    local _wasCount _nowCount
+    _wasCount=$(grep -c '^[[:space:]]*export ' "$_bak" 2>/dev/null)
+    _nowCount=$(grep -c '^[[:space:]]*export ' "$CONFIG_PATH/$_envName.env" 2>/dev/null)
+    if [ "${_nowCount:-0}" -lt "${_wasCount:-0}" ]; then
+      echo "config.init.env: REFUSING — $_envName.env went from ${_wasCount:-0} to ${_nowCount:-0} export lines; restoring $_bak"
+      cp -p "$_bak" "$CONFIG_PATH/$_envName.env" 2>/dev/null
+      _envRc=1
+    fi
+  done
+  return $_envRc
 }
 
 config.init.full() # <username:$USER> # repair end-to-end: shared dir + user symlinks + env files + diagnostics
@@ -629,6 +685,121 @@ private.config.string.upper()     # <string> # echo string upper-cased, without 
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
+# ── The required-variable derivers ───────────────────────────────────────────
+# One per row of private.config.required.variables.get, whose third column now
+# names the function instead of describing it in prose. Before this, that column
+# was documentation of a repair that did not exist (F6), which is why
+# config.init.env could only re-persist the gap it was asked to fix (F5).
+#
+# All six are GETTERS consumed as $(...), which runs in a subshell — so none
+# calls create.result, the same exemption every other private.config.* getter
+# carries. They DERIVE ONLY: none assigns, none persists, none writes a file.
+# That separation is deliberate. `oo pm.discover` reaches `config save`
+# internally (oo:3045-3053 → config:740's log.device HACK → a recursive
+# `config save log LOG`), so derivation belongs in the REPAIR and never in the
+# WRITER. See docs/research/2026-09-17-config-save-bash32.md § 2.
+
+private.config.derive.oosh.mode()     # # the branch $HOME/oosh actually points at, its canonical basename #
+{
+  # The same two steps config.validate.required's drift check used inline
+  # (and oo:2631-2633 a third time). Now one accessor, so the check and the
+  # repair cannot disagree about what "the branch this host is on" means.
+  # private.this.path.canonical, not `readlink -f` — the latter is GNU-only.
+  local ooshTarget
+  ooshTarget=$(private.this.path.canonical "$HOME/oosh" 2>/dev/null) || return 1
+  [ -n "$ooshTarget" ] || return 1
+  # A ~/oosh that is not there canonicalises to itself; that is not a branch.
+  [ -d "$ooshTarget" ] || return 1
+  echo "${ooshTarget##*/}"
+}
+
+private.config.derive.oosh.os()     # # the OS family for this host, via os.check.env #
+{
+  # os.check.env owns the $OSTYPE mapping and already sets OOSH_OS only when it
+  # is empty, so calling it is safe whether or not the value is known. `config`
+  # does not source `os`; the on-demand guard is the established route here
+  # (config:215, config:235, oo:472).
+  [ "$(type -t os.check.env)" = "function" ] || source "$OOSH_DIR/os" >/dev/null 2>&1
+  [ "$(type -t os.check.env)" = "function" ] || return 1
+  os.check.env >/dev/null 2>&1
+  [ -n "$OOSH_OS" ] || return 1
+  echo "$OOSH_OS"
+}
+
+private.config.derive.oosh.pm()     # # the package-manager install command for this host #
+{
+  # Already known? That IS the answer.
+  [ -n "$OOSH_PM" ] && { echo "$OOSH_PM"; return 0; }
+  # Second best: the binary survived even though the command did not.
+  [ -n "$OOSH_PM_BIN" ] && { private.config.pm.command.get "$OOSH_PM_BIN"; return $?; }
+
+  # NOT `oo pm.discover`. That verb is not a detector — it runs the platform's
+  # package manager for real (`$SUDO apt-get update`, oo:3093-3104) and then
+  # `config save`, so calling it from here hung a test run on a sudo password
+  # prompt and would have re-entered the writer this card deliberately keeps
+  # pure. test.suite:895-905 records the same trap being sprung once before.
+  #
+  # A DERIVER MUST HAVE NO SIDE EFFECTS. This is detection only: which package
+  # manager exists, and what its install command is.
+  local pmBin
+  for pmBin in brew apt-get dnf yum apk pacman pkg; do
+    command -v "$pmBin" >/dev/null 2>&1 || continue
+    private.config.pm.command.get "$pmBin"
+    return $?
+  done
+  return 1
+}
+
+private.config.pm.command.get()     # <packageManagerBinary> # the install command for a package-manager binary #
+{
+  # THE THIRD COPY of this table — init/oosh:214-222 has it in POSIX sh for the
+  # bootstrap, and oo:3093-3101 has it as arguments to private.check.pm. A
+  # fourth would be indefensible; even this one is only justified because the
+  # other two are unreachable from here (init/oosh self-installs when sourced,
+  # and oo's copy is fused to the installer that runs sudo). Carded: one
+  # side-effect-free `oo pm.detect` that all three call.
+  case "$1" in
+    brew)    echo "brew install" ;;
+    apt-get) echo "apt-get -y install" ;;
+    dnf)     echo "dnf -y install" ;;
+    yum)     echo "yum -y install" ;;
+    apk)     echo "apk add" ;;
+    pacman)  echo "pacman -S --noconfirm" ;;
+    pkg)     echo "pkg install -y" ;;
+    *)       return 1 ;;
+  esac
+}
+
+private.config.derive.bash.file()     # # the bash interpreter this host should use #
+{
+  # What config.save has always done inline (and this:1190, this:1322). On
+  # macOS `command -v bash` can answer /bin/bash 3.2 while brew bash 5 is the
+  # one the install chose, so an already-set value wins — user:696-700 picks
+  # the interpreter and it is not this function's business to second-guess it.
+  [ -n "$BASH_FILE" ] && { echo "$BASH_FILE"; return 0; }
+  local found
+  found=$(command -v bash 2>/dev/null) || return 1
+  [ -n "$found" ] || return 1
+  echo "$found"
+}
+
+private.config.derive.config.file()     # # the name of the config file a shell starts from #
+{
+  # A constant, and deliberately so: config.init (config:188) and boot:77 both
+  # hard-set it, and `config file reset` means "go back to user.env". It is a
+  # row in the required table because a config without it is broken, not
+  # because it is ever in doubt.
+  echo "user.env"
+}
+
+private.config.derive.log.level()     # # the default log level #
+{
+  # An already-set level wins — a host that has chosen one keeps it. The
+  # fallback is 3, which is what this:16 and log:125 both actually use. The
+  # table used to say "defaults to 1" and no code anywhere agreed with it.
+  [ -n "$LOG_LEVEL" ] && { echo "$LOG_LEVEL"; return 0; }
+  echo "3"
+}
 ### new.method
 
 config.usage()
@@ -669,6 +840,12 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
 {
   #set -x
   console.log "config.save (CONFIG=$CONFIG)"
+
+  # config.save had no deliberate exit status at all — it fell off the end
+  # through config.info.log, whose rc is a `[ … -gt … ]` test. It now reports
+  # whether the files it wrote passed their own validation (see the guard at
+  # the end of the no-arg branch).
+  local configSaveRc=0
 
   local file=$1
   shift
@@ -760,16 +937,42 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # Guard: user.env may hold export/comment/blank + `source *.env` chaining
     # (composition, NOT logic); oosh.env / log.env must be pure. config.validate
     # allows the source lines but rejects real logic (self-anchors, if-blocks).
-    local _envName
+    #
+    # THE VERDICT IS NO LONGER THROWN AWAY. This used to be
+    # `config.validate … >/dev/null 2>&1 || warn.log …`, and that is why card
+    # 1's corruption reached a user: config.validate caught it correctly on the
+    # FIRST macOS install and the verdict went to /dev/null, with the only
+    # signal a warn.log inside a 1 MB install log at a level that was not
+    # printing. A guard whose verdict is discarded is not a guard.
+    #
+    # STDERR, not stdout, and the reason is load-bearing: user:1702-1708 records
+    # that `$(user get basehome)` CAPTURES this function's stdout, and a stray
+    # line there once propagated a garbage IdentityFile into a generated
+    # 2cuGitHub config block and failed the downstream git clone. stderr
+    # survives every LOG_LEVEL and LOG_DEVICE exactly as stdout would — which is
+    # the whole point of the status-output idiom — and `$( )` does not capture
+    # it. This is the one place in the tree where the idiom must use stderr, and
+    # test/test.config T83 pins BOTH halves: the verdict on stderr, and stdout
+    # staying clean.
+    #
+    # It REPORTS, it does not halt: config.save runs as root during install and
+    # a non-zero rc here is already more than any caller acts on today (audited
+    # 2026-09-17 — nothing branches on it; private.check.pm is the only place it
+    # could propagate and oo.pm.discover masks it with `RETURN=$1`).
+    local _envName _invalid=""
     for _envName in user oosh log; do
-      config.validate "$_envName" >/dev/null 2>&1 \
-        || warn.log "config.save: $_envName.env has logic — run 'config validate $_envName' to see why"
+      config.validate "$_envName" >/dev/null 2>&1 || _invalid="$_invalid $_envName"
     done
+    if [ -n "$_invalid" ]; then
+      echo "INVALID: config.save wrote$_invalid with logic in it — run 'config validate <name>' to see why" >&2
+      configSaveRc=1
+    fi
     # if [ -x "$(command -v once)" ]; then
     #   once v
     # fi
   fi
   config.info.log
+  return $configSaveRc
 }
 
 config.validate() # <?name:user> # verify an env file is PURE DATA (only export/comment/blank lines); rc 1 + report on any logic line. <name> is a bare name (user/oosh/log), a filename (x.env), or a path.
@@ -825,7 +1028,7 @@ config.validate() # <?name:user> # verify an env file is PURE DATA (only export/
 
 config.validate.completion.name() { echo "user oosh log"; }
 
-private.config.required.variables.get() # # the variables a config must carry for a branch version: "<variable> <file> <how it is re-derived>", one per line
+private.config.required.variables.get() # # the variables a config must carry for a branch version: "<variable> <file> <deriverFunction>", one per line
 {
   # NO create.result — a getter consumed as $(...), which runs in a subshell.
   # Same reasoning as private.config.file.resolve.
@@ -839,12 +1042,12 @@ private.config.required.variables.get() # # the variables a config must carry fo
   # OOSH_BRANCH is deliberately absent: it is install INPUT, excluded from
   # persistence since T7, and a config that carried it would be the bug.
   cat <<'REQUIRED'
-BASH_FILE user.env command -v bash
-CONFIG_FILE user.env config.init
-OOSH_MODE oosh.env basename of the canonical ~/oosh
-OOSH_OS oosh.env $OSTYPE, via os
-OOSH_PM oosh.env oo pm.discover
-LOG_LEVEL log.env defaults to 1
+BASH_FILE user.env private.config.derive.bash.file
+CONFIG_FILE user.env private.config.derive.config.file
+OOSH_MODE oosh.env private.config.derive.oosh.mode
+OOSH_OS oosh.env private.config.derive.oosh.os
+OOSH_PM oosh.env private.config.derive.oosh.pm
+LOG_LEVEL log.env private.config.derive.log.level
 REQUIRED
 }
 
@@ -868,11 +1071,14 @@ REQUIRED
   # Branch drift: the persisted OOSH_MODE against the branch ~/oosh actually
   # points at. This is the T7 bug — persisted prod/released on a dev box, with
   # nothing in the tree ever comparing the two.
-  local drift="" persistedMode actualMode ooshTarget
+  local drift="" persistedMode actualMode
   persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$CONFIG_PATH/oosh.env" 2>/dev/null \
                   | cut -d= -f2- | tr -d '"')
-  ooshTarget=$(private.this.path.canonical "$HOME/oosh" 2>/dev/null)
-  [ -n "$ooshTarget" ] && actualMode="${ooshTarget##*/}"
+  # The SAME accessor the repair uses. This was two inline steps here and two
+  # more at oo:2631-2633; three answers to "which branch is this host on" could
+  # drift apart, and the drift check disagreeing with the repair is the one
+  # disagreement that would be hardest to see.
+  actualMode=$(private.config.derive.oosh.mode 2>/dev/null)
   if [ -n "$persistedMode" ] && [ -n "$actualMode" ] && [ "$persistedMode" != "$actualMode" ]; then
     drift="OOSH_MODE=$persistedMode but ~/oosh is on $actualMode"
   fi
