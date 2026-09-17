@@ -539,3 +539,65 @@ land in the right place.
 
 Nothing asserted that before. "Isolation held the last five times I looked" is not a guarantee;
 this makes it one.
+
+---
+
+## 18. § 11 delivered — and the measured surface was wrong in both directions
+
+§ 11 counted the portability faults in test-harness code and proposed a sweep. Both halves of that
+are now in the tree: `test.suite portability.validate [<treeRoot>]`, gated by `T-PORTABILITY-TREE`
+in `test/test.test.suite`, with the 22 genuine violations fixed.
+
+The count in § 11 was wrong in **both** directions, and the two errors are different in kind.
+
+**Over-reported — 14 correct sites flagged.** § 11 counted *constructs*, and a construct is not a
+fault. Five shapes are portable and were being called violations:
+
+| Flagged | Why it is correct |
+|---|---|
+| `grep -E '…\|…'` ×3 | under `-E` a backslash-pipe is an escaped **literal** pipe — `test.config:1155/1287/1288` are matching `\|\|` in shell source, which is the whole point |
+| `stat -c … \| … stat -f …` ×6 | the BSD fallback is on the **continued** line. So the "7 unpaired `stat -c`" of § 11 was **1**, and even that one paired. |
+| `date -r … \|\| date -d …` | the BSD form is already **first**; `-d` is the GNU fallback |
+| `pgrep -P` | caught by a `grep -P` rule with no word anchor |
+| `sed -i` ×2 | inside an `expect.pass` **message string**, not a command |
+
+Each of those became a rule the sweep understands — `-E` detection, a continued-line join, a
+`date -r` pairing case, word-anchoring, command-position anchoring — rather than a
+`# portability-exception:` marker somebody has to write and the next reader has to trust. **A sweep
+is only as useful as its false-positive rate**: markers accumulated to silence a noisy rule are
+indistinguishable from markers that mean something.
+
+**Under-reported — `\|` was 3 *files*, not 3 sites.** There were **14**, across `test.c2`,
+`test.config`, `test.hiveMind`, `test.oo` and `test.otmux`. And `mktemp` was **118**, not 74.
+
+### The severity column, which § 11 did not foresee
+
+§ 11's scope note said "most of the 74 are latent … so mark rather than churn" — correct, but it
+did not say what *marking* means for a gate. Converting 118 fixtures in the same commit that
+introduces the guard is churn with no test behind it; leaving the rule in at `violation` makes the
+gate permanently red, and **a rule that is always red is a rule nobody reads**. So the rule table
+carries a severity and `mktemp` is an `advisory`: counted, reported as a per-file tally through
+`warn.log`, rc unchanged. `T-PORTABILITY-ADVISORY` pins that behaviour, so the two severities
+cannot quietly collapse back into one.
+
+`test.hiveMind` turned out to be **in** scope, against § 11's exclusion: its six `\|` sites are
+mechanical BRE→ERE rewrites, and it scores 115/138 before and after, so its known failures are
+untouched. Excluding a file because its suite is red would have left a third of the fault class in
+the tree.
+
+### Two prerequisites
+
+Neither was foreseen, and neither was optional if the work was to be done in the tree's own idiom:
+
+1. **`oo method.new` could not name this method.** `private.oo.new.method` split the script from the
+   method at the **first** dot (`${nameBody%%.*}`), so `test.suite.portability.validate` resolved
+   its script to `test` — a **directory**. It now walks back from the longest prefix that is an
+   existing file. Red-first with `T-METHOD-NEW-DOTTED-SCRIPT` in `test/test.oo`.
+2. **`test.suite` had no `### new.method` marker**, so `oo method.new` returned rc 3 and could not
+   write into it at all. Added, along with `### test.method` in `test/test.test.suite`.
+
+### What it does not cover
+
+Production portability — that is what the macOS and container gates are for, and cards 1-3 are the
+work that came out of them. The sweep is static: it finds constructs, not behaviours. `mktemp`'s
+118 advisories are the honest measure of how much of this class is still latent.

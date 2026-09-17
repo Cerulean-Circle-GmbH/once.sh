@@ -1224,4 +1224,169 @@ $0
   #loop.list PATH print '---------------------: '
 }
 
+test.suite.portability.validate()     # <?treeRoot:$OOSH_DIR/test> # verify test-harness code makes no GNU-only or Linux-only assumption; rc 1 and a report on any violation #
+{
+  # THE RULE: a test may not assume GNU coreutils or a Linux filesystem. When it
+  # does, it does not fail honestly — it reports the CODE UNDER TEST as broken
+  # while that code is fine, with a confident and specific message that sends
+  # you to debug the wrong thing. Three of those on 2026-09-17 alone:
+  #
+  #   grep '…$\|…$'   `\|` is a GNU BRE extension. BSD grep counted 0 and the
+  #                   test blamed user.ssh.backup.list.
+  #   raw mktemp path macOS /tmp is a symlink to /private/tmp, so a path the
+  #                   code RESOLVES never equals the fixture literal. Eight
+  #                   assertions blamed oo.mode, base.get and workspace.init.
+  #   script -qec     does not guarantee which shell runs the command. Under
+  #                   dash the probe died on `source: not found`, never sourced
+  #                   `log`, and blamed log's D4 guard in every container.
+  #
+  # Sibling of path.validate and this.anchor.validate, and the same shape: ONE
+  # scan of the tree, a verdict echoed to stdout so it survives any LOG_LEVEL
+  # (the status-output idiom), create.result / return $(result), and a
+  # `# portability-exception: <reason>` marker on the line or in the few lines
+  # above it for a construct that is deliberate.
+  #
+  # It differs from its siblings in ONE way, on purpose: it scans TEST code, not
+  # production code. Production portability is enforced by running the thing on
+  # the platforms (the macOS and container gates). Nothing ran the test harness
+  # anywhere new often enough to catch these.
+  local treeRoot="${1:-$OOSH_DIR/test}"
+  if [ ! -d "$treeRoot" ]; then
+    error.log "test.suite.portability.validate: no such directory: $treeRoot"
+    echo "INVALID: no such directory: $treeRoot"
+    create.result 2 "no such directory: $treeRoot"
+    return $(result)
+  fi
+
+  # Each rule is <ERE>@@<severity>@@<why>, severity `violation` or `advisory`.
+  #
+  # The separator is @@ and not | because several of the patterns contain a
+  # pipe, which makes | unusable as a field separator — the first version of
+  # this table used | and matched nothing at all, silently.
+  #
+  # TWO SEVERITIES, because the surface is two different sizes. A `violation` is
+  # a construct that is wrong wherever it stands and whose total count in the
+  # tree is small enough to fix in one sitting — this sweep ships with all of
+  # them at zero, and rc 1 keeps them there. An `advisory` is a construct that
+  # is only LATENT: correct today, and wrong the day someone compares its result
+  # against a canonicalised path. `mktemp` is the whole of that class, at 118
+  # sites. Converting 118 fixtures in the same commit that introduces the guard
+  # would be churn with no test behind it, so the sweep MARKS them and the gate
+  # stays actionable. Convert one whenever you are in the file anyway:
+  # `test.suite.fixture.make <label>` is mktemp + private.this.path.canonical.
+  #
+  # portability-exception: this is the RULE TABLE, not a use of the constructs
+  # it names. A sweep necessarily contains the text it looks for.
+  local rules='grep[^@]*\\\|@@violation@@GNU-only backslash-pipe alternation in a BRE; BSD grep has no such thing — use grep -E
+readlink -f@@violation@@readlink -f is GNU-only; use private.this.path.canonical
+script -qec @@violation@@script does not guarantee which shell runs the command; run it as: bash <file>
+(^|[^A-Za-z])grep -P@@violation@@grep -P is GNU-only; use grep -E
+stat -c@@violation@@stat -c is GNU-only; pair it with a stat -f fallback
+date -d @@violation@@date -d is GNU-only; BSD date uses -v/-j
+(^|[|;&(]|\$\()[[:space:]]*sed -i [[:alnum:]]@@violation@@sed -i needs an explicit suffix on BSD; write a temp file and mv, or use replace
+mktemp@@advisory@@raw mktemp; on macOS /tmp is a symlink to /private/tmp, so the literal never equals a path the code under test resolves — use test.suite.fixture.make'
+
+  local violations=0 advisories=0 checked=0 exceptions=0 advisoryFiles=""
+  local rule pattern severity why rest matches match file lineNo content joined trimmed prevLine windowFrom
+  while IFS= read -r rule; do
+    [ -z "$rule" ] && continue
+    pattern="${rule%%@@*}"; rest="${rule#*@@}"; severity="${rest%%@@*}"
+    why="${rest#*@@}"
+    matches=$(git -C "$treeRoot" grep -nE "$pattern" 2>/dev/null) || matches=""
+    while IFS= read -r match; do
+      [ -z "$match" ] && continue
+      file="${match%%:*}"
+      content="${match#*:}"
+      lineNo="${content%%:*}"
+      content="${content#*:}"
+      checked=$((checked + 1))
+
+      # A line that only TALKS about a construct is not a use of it.
+      trimmed="${content#"${content%%[![:space:]]*}"}"
+      case "$trimmed" in '#'*) exceptions=$((exceptions + 1)); continue ;; esac
+
+      # A GNU/BSD pair is normally written across a continued line:
+      #   x=$(stat -c %U f 2>/dev/null \
+      #       || stat -f %Su f 2>/dev/null)
+      # That is ONE command, so judge it as one — a trailing backslash pulls the
+      # next line in. Six correct sites in test.oo, test.osshLayout and
+      # test.platform.shared.config.invariant were flagged before this existed.
+      joined="$content"
+      case "$content" in
+        *'\') joined="$content $(sed -n "$((lineNo + 1))p" "$treeRoot/$file" 2>/dev/null)" ;;
+      esac
+
+      # Four constructs are correct in a shape the ERE alone cannot express, so
+      # they are excused here rather than by a marker in every file:
+      #
+      #   `grep -E ... \| ...`  under -E a backslash-pipe is an ESCAPED LITERAL
+      #                         pipe, which is portable and usually the point.
+      #                         Only a BRE grep — no -E — is the fault.
+      #   `script -qec "bash …"`  naming the shell IS the fix; only a bare
+      #                         command left for `script` to dispatch is the fault.
+      #   `stat -c … || stat -f …`   the GNU form with its BSD fallback already
+      #   `date -r … || date -d …`   present is the fix, not the fault. Note
+      #                         date puts the BSD form FIRST: -r is the portable
+      #                         spelling and -d only the GNU fallback.
+      case "$pattern" in
+        'grep'*) if printf '%s' "$content" | grep -qE 'grep [^|]*-[A-Za-z]*E'; then
+                   exceptions=$((exceptions + 1)); continue
+                 fi ;;
+        'script -qec '*) case "$content" in *'bash '*|*'sh '*) exceptions=$((exceptions + 1)); continue ;; esac ;;
+        'stat -c') case "$joined" in *'stat -f'*) exceptions=$((exceptions + 1)); continue ;; esac ;;
+        'date -d '*) case "$joined" in *'date -r'*|*'date -v'*|*'date -j'*) exceptions=$((exceptions + 1)); continue ;; esac ;;
+      esac
+
+      # Sanctioned: on the line, or in the few lines just above it (these often
+      # sit inside a heredoc or a quoted probe where the marker cannot go on the
+      # line itself). Anchored to a COMMENT so only a human-written marker
+      # counts — otherwise the rule table above would exempt this very function.
+      if printf '%s' "$content" | grep -qE '#[[:space:]]*portability-exception:'; then
+        exceptions=$((exceptions + 1)); continue
+      fi
+      prevLine=""
+      if [ "$lineNo" -gt 1 ]; then
+        windowFrom=$((lineNo - 5))
+        [ "$windowFrom" -lt 1 ] && windowFrom=1
+        prevLine=$(sed -n "${windowFrom},$((lineNo - 1))p" "$treeRoot/$file" 2>/dev/null)
+      fi
+      if printf '%s' "$prevLine" | grep -qE '#[[:space:]]*portability-exception:'; then
+        exceptions=$((exceptions + 1)); continue
+      fi
+
+      if [ "$severity" = "advisory" ]; then
+        advisories=$((advisories + 1))
+        advisoryFiles="$advisoryFiles$file
+"
+        continue
+      fi
+      error.log "test.suite.portability.validate: $file:$lineNo — $why"
+      violations=$((violations + 1))
+    done <<< "$matches"
+  done <<< "$rules"
+
+  # Advisories are reported ONCE, as a per-file tally. One line per site would
+  # be 118 lines of noise every run, and noise is how the three faults in the
+  # header comment survived in the first place.
+  if [ "$advisories" -gt 0 ]; then
+    warn.log "test.suite.portability.validate: $advisories latent construct(s) — correct today, wrong the day the value is compared against a resolved path. Convert with test.suite.fixture.make when you are in the file anyway:
+$(printf '%s' "$advisoryFiles" | sort | uniq -c | sort -rn)"
+  fi
+
+  if [ "$violations" -gt 0 ]; then
+    error.log "test.suite.portability.validate: $violations violation(s). A test that assumes GNU or Linux reports the CODE UNDER TEST as broken when it is fine. Fix it, or mark a deliberate one with '# portability-exception: <reason>'"
+    echo "INVALID: test portability in $treeRoot — $violations violation(s), $advisories advisory(s), $exceptions exception(s)"
+    create.result 1 "test portability: violations found"
+    return $(result)
+  fi
+  echo "OK: test portability in $treeRoot — $checked construct(s) checked, $advisories advisory(s), $exceptions exception(s), 0 violations"
+  create.result 0 "test portability: 0 violations"
+  return $(result)
+}
+
+test.suite.portability.validate.completion.treeRoot() { echo "$OOSH_DIR/test"; }
+
+
+### new.method
+
 test.suite.init "$@"

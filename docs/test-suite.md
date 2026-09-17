@@ -205,6 +205,60 @@ used to be an if/elif chain in the tail of the runner that nothing could reach �
 of these causes came to be printed on screen and then dropped before the return code that the macOS
 workflow and `os platform.test` actually gate on.
 
+## The test tree is itself checked for portability
+
+```bash
+test.suite portability.validate [<treeRoot>]     # default: $OOSH_DIR/test
+```
+
+A test that assumes GNU coreutils or a Linux filesystem does not fail honestly. It reports **the
+code under test** as broken while that code is fine, with a confident and specific message that
+sends you to debug the wrong thing. Three of those on 2026-09-17 alone:
+
+| Construct | What it did |
+|---|---|
+| `grep '…$\|…$'` | `\|` is a GNU BRE extension. BSD `grep` counted 0 and the test blamed `user.ssh.backup.list`. |
+| a raw `mktemp` path | macOS `/tmp` is a symlink to `/private/tmp`, so a path the code **resolves** never equals the fixture literal. Eight assertions blamed `oo.mode`, `base.get` and `workspace.init`. |
+| `script -qec '<cmd>'` | does not guarantee which shell runs the command. Under dash the probe died on `source: not found`, never sourced `log`, and blamed log's D4 guard in every container. |
+
+`test.suite.portability.validate` is the sibling of `path.validate` and `this.anchor.validate` and
+has the same shape: one `git grep` sweep of the tree, a verdict **echoed to stdout** so it survives
+any `LOG_LEVEL`, and `create.result` / `return $(result)`. It differs in one way on purpose — it
+scans **test** code, not production code. Production portability is enforced by running the thing
+on the platforms (the macOS and container gates); nothing ran the test harness anywhere new often
+enough to catch these.
+
+`T-PORTABILITY-TREE` in `test/test.test.suite` is the gate, so a new offender fails `core` on the
+machine that introduces it rather than on someone's Mac a week later.
+
+### Two severities
+
+A **violation** is wrong wherever it stands and fails the gate (rc 1): the BRE `\|`, `readlink -f`,
+`grep -P`, `date -d`, a bare `sed -i`, an unpaired `stat -c`, and `script -qec` handed a command
+without naming the shell. The tree ships at **zero** of these.
+
+An **advisory** is *latent* — correct today, wrong the day someone compares its result against a
+canonicalised path. `mktemp` is the whole of that class, at ~118 sites. Converting all of them in
+one commit would be churn with no test behind it, so the sweep **marks** them, reports a per-file
+tally through `warn.log`, and leaves the gate actionable. Convert one whenever you are in the file
+anyway:
+
+```bash
+fixture=$(test.suite.fixture.make my.label)   # mktemp -d + private.this.path.canonical
+```
+
+### Declaring a deliberate one
+
+Put `# portability-exception: <reason>` on the line, or in the five lines just above it — the same
+affordance `path.validate` gives, and the escape hatch for a construct that is the point of the
+test. The marker must be in a **comment**, so a string that merely names a construct cannot exempt
+itself.
+
+Some correct shapes need no marker at all, because the sweep understands them: `grep -E` (where
+`\|` is an escaped *literal* pipe), a GNU form with its BSD fallback (`stat -c … || stat -f …`,
+`date -r … || date -d …`) including when the pair is written across a continued line, and
+`script -qec "bash <file>"`, where naming the shell **is** the fix.
+
 ## Best Practices
 - Use `test.case` for each logical test scenario.
 - Use `expect` to assert both return values and output.
