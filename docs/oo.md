@@ -66,7 +66,15 @@ Adds a new method to an existing script, and its test case to that script's test
 ```bash
 oo method.new myscript.mymethod
 oo method.new myscript.certificates.update.run    # every dot segment is part of the method name
+oo method.new private.myscript.mymethod           # a private method goes into myscript
 ```
+
+**A private method's script is the SECOND segment.** `private.config.variables.list` is a method of
+`config`, not of a file called `private`. Until 2026-09-17 the tool split on the first segment,
+aimed at `$OOSH_DIR/private` and refused with rc 3 — so it could not create a private method at
+all, and every one in the tree was hand-written. Private methods also get **no completion stub**:
+they are never dispatched from the command line, and `test/test.completion.audit` skips `private*`
+for the same reason.
 
 Five prompts, in order, all asked **before** any file is touched:
 
