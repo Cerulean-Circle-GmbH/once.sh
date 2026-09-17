@@ -394,12 +394,25 @@ already re-pathed to brew bash: a validator silently declining to validate. Same
 `config.save`'s `${file^^}`, found the same way, fixed with `printf | tr`. Measured on the VM:
 `bash=3.2.57 slug=[oosh-dir]`, shell survives.
 
-### Not proven here
+### The Linux container gate — 7 failures, then 1
 
-The Linux container gate (`os platform.test ubuntu_24_04`) reports **7 failures: 6 in
-`test.odocker` plus the 1 intentional meta-test**. The six are pre-existing and unrelated —
-they assert the HOST's `/var/dev/…/DockerWorkspaces` tree exists, ungated, unlike the
-docker-touching assertions beside them which are all behind `DOCKER_AVAILABLE`. They date from
+The first `os platform.test ubuntu_24_04` after this ticket reported **7 failures: 6 in
+`test.odocker` plus the 1 intentional meta-test**. The six were pre-existing and unrelated to
+`config.save` — they assert the HOST's `/var/dev/…/DockerWorkspaces` tree exists, ungated, unlike
+the docker-touching assertions beside them which are all behind `DOCKER_AVAILABLE`. They date from
 `3cfd931`; backlog item 8 gave `test.odocker` its `core` category and score, and its plan said
-*"No platform run: odocker is off the install path"* — so this was the first container `core`
-since, and it surfaced item 8's blind spot. **Its own card.** No new failures from this ticket.
+*"No platform run: odocker is off the install path"* — so this was the first container `core` since,
+and it surfaced item 8's blind spot.
+
+**Fixed the same day** (`d60cf69`), in its own ticket: `T-WS-LIST` tests the enumerator against a
+fixture built with `odocker workspace.init` and passes anywhere;
+`test/test.platform.odocker.workspaces.invariant` keeps the host-readiness question where a
+host-dependent assertion belongs. The gate now reads:
+
+```
+PASS: ubuntu_24_04 (test=0 root=0 oosh-user=0 bash-user=0)
+748 test cases, 847 assertions, 846 passed, 1 intentional
+```
+
+So the ubuntu gate for this research doc's work is **green**, with the only remaining failure being
+the meta-test that verifies the counters.
