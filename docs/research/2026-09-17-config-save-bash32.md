@@ -486,3 +486,59 @@ now asserts content.
   `private.config.pm.command.get`. One side-effect-free `oo pm.detect` should serve all three.
 - **Four answers to "which branch is ~/oosh on"** — this card unified two (`config:874`,
   the repair); `private.oo.shared.base.get` and `config.init.user:277-282` remain.
+
+---
+
+## 16. Card 3 (2026-09-17) — the config stops degrading
+
+`5731a9e`. Card 2 made the config **repairable**; this stops it **degrading**.
+
+`config.save` persists the ENVIRONMENT and truncates with `{ … } >$CONFIG`, so a shell missing a
+required variable rewrites the file without it. `oo mode <branch>` is the live example
+(`oo:938-940`): it sets `OOSH_MODE` and immediately saves `oosh.env` from that shell — which has
+`OOSH_MODE` and, because nothing re-derives `OOSH_OS` at shell init, no `OOSH_OS`.
+
+**That is the oscillation measured on the VM across the day**: `OOSH_OS` present and `OOSH_MODE`
+missing at one point, the exact reverse an hour later. Not two bugs — one writer, two shells.
+
+### Not the design proposed
+
+I said this would need one of the two options not taken for card 2 — derive at shell init, or make
+every save complete. Investigating found a third, smaller and safer than both: **the writer does
+not need to derive anything, only to stop throwing away what it was already holding.** Before
+truncating, any required row for the file being written that is empty in this shell but present in
+the file is carried forward.
+
+No derivation in the writer, no sourcing `os`, no re-entrancy, nothing new during an install.
+Derivation stays in `config.init.env` where card 2 put it, for values that were never there at all.
+Read **before** the redirect — by the time `>$CONFIG` has run the old values are gone, which is
+exactly how `config.init.env` lost `OOSH_PM` before card 2.
+
+### Measured, in the real `oo mode` shape
+
+```
+shell: OOSH_MODE=testing, OOSH_OS unset, OOSH_PM unset
+
+before  OOSH_MODE=dev      OOSH_OS=linux-gnu  OOSH_PM=apt-get -y install
+after   OOSH_MODE=testing  OOSH_OS=linux-gnu  OOSH_PM=apt-get -y install
+```
+
+The intended change lands; the values that shell knew nothing about survive.
+
+On the macOS VM, a save with `OOSH_OS` and `OOSH_PM` unset now leaves
+`OK: /Users/admin/config carries every required variable and agrees with the checkout`.
+
+`T84` pins it, watched failing with *"OOSH_OS was in the file and the rewrite dropped it — this is
+how the VM degraded"*.
+
+**Gates:** host `core` 844 assertions / 843 passed / 1 intentional, canary silent.
+`os platform.test ubuntu_24_04` → `PASS (test=0 root=0 oosh-user=0 bash-user=0)`, 853 assertions.
+
+### The config lifecycle, now complete
+
+| | |
+|---|---|
+| **written** correctly | card 1 — `config.save` is bash-3.2-safe |
+| **reported** when wrong | card 2 F4 — the verdict is no longer discarded |
+| **repaired** when incomplete | card 2 F5/F6 — `config.init.env` derives |
+| **kept** once correct | card 3 — a rewrite cannot drop what it held |
