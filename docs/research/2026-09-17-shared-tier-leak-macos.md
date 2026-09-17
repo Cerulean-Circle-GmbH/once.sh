@@ -180,9 +180,13 @@ ticket: any isolated test that reaches `oo` can write a real machine's config th
 
 - **Not a test-only bug.** The same cascade runs during a real install and on every login shell
   that sources `user` on macOS, writing `~/config/log.env` each time.
-- **Linux is unaffected** in practice: the heal succeeds there, so the cache goes healthy and
-  `oo pm.discover` stops being called. Verified — this host's `core` has been canary-silent all day
-  and `os platform.test ubuntu_24_04` reports `test=0 root=0 oosh-user=0 bash-user=0`.
+- **~~Linux is unaffected~~ — WRONG, corrected 2026-09-17 evening. See § 13.** What this bullet
+  said was: *"the heal succeeds there, so the cache goes healthy and `oo pm.discover` stops being
+  called. Verified — this host's `core` has been canary-silent all day and
+  `os platform.test ubuntu_24_04` reports `test=0 root=0 oosh-user=0 bash-user=0`."* Both
+  observations were true and the conclusion drawn from them was not: every Linux run quoted there
+  was either a long-established config or a context with no controlling terminal. A **fresh Linux
+  install, first `core`, under a pty** has **seven** files rewriting the shared tier.
 - The canary **did its job**: it caught the write, named the file, and restored the tier from its
   snapshot. Without it this would still be invisible.
 
@@ -351,3 +355,67 @@ password, where Linux produces one that cannot authenticate at all.
 
 Each was measured on the VM before being fixed, and each fix is confined to a branch Linux never
 reaches or to a path nothing in production takes — which is why the Linux numbers never moved.
+
+---
+
+## 13. The leak is on Linux too — the "unaffected" claim in § 6 was wrong
+
+**Found 2026-09-17 evening**, while chasing an unrelated question: the user installed oosh into a
+naked Ubuntu 24.04 container using the README's `wget` one-liner, as root, and ran `core`. It
+scored 840/843 with **3** failures where every Linux run that day had scored 2.
+
+Chasing the third failure produced a **controlled pair**. Two fresh containers from the same image,
+both installed the same way from `dev`, both running their **first** `core` — differing in one
+thing only, whether a pty was allocated:
+
+| | `docker exec` (no pty) | `docker exec -t` (pty) |
+|---|---|---|
+| test cases / assertions | 744 / 843 | 744 / 843 |
+| failed | **2** | **5** |
+| shared tier | *(no such line)* | **7 file(s) rewrote /root/config** |
+
+```
+Shared tier: 7 file(s) rewrote /root/config:
+  test.check test.debug test.log test.oo test.promote test.state test.user
+```
+
+Same image, same install, same first run, one variable. **The pty is what makes the difference**,
+and it makes it on Linux.
+
+### Why every earlier Linux observation missed it
+
+Both of the runs quoted in § 6 were structurally incapable of showing it:
+
+- **This host's `core`** runs in a tmux pane — which *does* have a tty — but against a
+  **long-established** `~/config`. The canary compares CONTENT. On a config whose `log.env` already
+  holds what the cascade would write, the write happens and changes nothing, so the canary is
+  silent. Silence there means "no CHANGE", not "no write".
+- **`os platform.test`** runs `core` through `ossh exec`, and the four passes after the first are
+  no longer first runs.
+
+So "canary-silent" was never evidence of "does not write". That is the error in § 6, and it is an
+error of inference, not of measurement.
+
+### What is NOT yet established
+
+The macOS root cause — `private.check.pm` persisting empty `OS_CMD_*`, § 3 — **cannot** be the
+Linux trigger: every Linux package manager passes those arguments, the cache is complete there, and
+the container installed from `dev` **with** `823d50a` already in it and leaked anyway.
+
+Five of the seven named files (`test.check`, `test.debug`, `test.promote`, `test.state`,
+`test.user`) do not call `test.suite.config.isolate` at all, so any config write they make lands on
+the shared tier by construction. Two of them (`test.log`, `test.oo`) **do** isolate and wrote
+anyway — which is the same "isolation did not hold" question as § 5, and still unanswered.
+
+**The hypothesis to test, not a conclusion:** `config.save`'s `log.device "$LOG_DEVICE"` HACK
+(`config:740`) writes only when `$LOG_DEVICE` is non-empty, and a pty is what makes it non-empty.
+That fits every observation above and the macOS chain in § 2, but it has not been probed on Linux
+the way § 2 was probed on macOS. **Do that before changing anything.**
+
+### One more failure the pty run surfaced
+
+`T74: re-sourcing boot never grows PATH` → `$OOSH_DIR appears 2 time(s) in PATH, expected exactly 1`.
+Only under a pty, only on a first run; the login PATH inspected afterwards holds `/root/oosh`
+exactly once. Unexplained, and a candidate for the third failure the user saw — **candidate, not
+conclusion**: their run had 3 failures where the closest reproduction has 5, so the environments
+still differ and the specific assertion they hit was never identified.
