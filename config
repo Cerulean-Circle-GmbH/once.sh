@@ -486,6 +486,149 @@ config.init.user.completion.username()  { user.list; }
 config.init.check.completion.username() { user.list; }
 config.init.full.completion.username()  { user.list; }
 
+private.config.variables.list()     # <envPrefix> # echo one variable NAME per line for every set, scalar, persistable variable matching envPrefix #
+{
+  # NO create.result — a getter consumed as $(...), which runs in a subshell,
+  # so RESULT could never reach the caller. Same reasoning as
+  # private.config.required.variables.get and private.config.file.resolve.
+  #
+  # SILENT BY CONTRACT. The only caller runs inside `{ … } >$CONFIG`, and
+  # log:35 sets LOG_DEVICE=/proc/self/fd/1 — inside that block fd 1 IS the
+  # generated env file. One debug.log here would be written into it.
+  #
+  # compgen -v, NOT `declare -p` with no names. On bash 3.2 the no-argument
+  # form behaves like bare `declare`: `set`-style output AND every function
+  # body, verbatim and multi-line, in the same stream. That is how rows of
+  # private.config.required.variables.get's heredoc became lines in
+  # ~/config/oosh.env — docs/research/2026-09-17-config-save-bash32.md § 2.
+  # `compgen -v` emits variable NAMES ONLY, on 3.2 and 5 alike (measured).
+  #
+  # ${1%_}: `backup config.save global` passes BACKUP_ (backup:262). With the
+  # underscore already there the prefix gate read `BACKUP_|BACKUP__*`, which
+  # BACKUP_TARGET matches neither, so backup.env was always written empty.
+  local envPrefix="${1%_}"
+  local variableName
+  # These two locals are themselves listed by `compgen -v`, exactly as they
+  # were by `declare -p`. camelCase cannot match an OOSH_/LOG_/CONFIG/OS_CMD_
+  # prefix, so the harvest set is unchanged.
+  # Read LINE BY LINE, never `for … in $(compgen -v)`. Unquoted command
+  # substitution word-splits, which would SHRED a malformed row into its words
+  # and let the first one through as if it were a name — the shape gate would
+  # then be passing by accident. A line is the unit being validated.
+  compgen -v 2>/dev/null | while IFS= read -r variableName; do
+    # SHAPE GATE. The old filter derived a name with three string-strips
+    # (`${_line#declare }`, `${_vn#-* }`, `${_vn%%=*}`) and never checked the
+    # result was a name at all: a line with no `=` survived the last strip
+    # whole, and a `case` glob spans spaces, so the row
+    # `OOSH_MODE oosh.env basename of the canonical ~/oosh` matched `OOSH_*`
+    # and was written out as if it were a variable.
+    case "$variableName" in
+      [A-Za-z_]*) ;;
+      *) continue ;;
+    esac
+    case "$variableName" in *[!A-Za-z0-9_]*) continue ;; esac
+    # Prefix as a whole name or a `name_…` family — never `${envPrefix}*`,
+    # which for LOG would also grab LOGNAME.
+    case "$variableName" in ${envPrefix}|${envPrefix}_*) ;; *) continue ;; esac
+    case "$variableName" in
+      # per-user / volatile / install-only / sudo-injected — never persist.
+      #
+      # Derived per-user paths are dynamically rebuilt from $HOME at every
+      # shell init ($OOSH_DIR/boot and this.init set CONFIG_PATH / OOSH_DIR /
+      # OOSH_USER_CONFIG_PATH), so persisting their ABSOLUTE expanded value
+      # into shared config (the saving user's $HOME) only causes EACCES leaks
+      # when a different user later sources it. Same reasoning as
+      # LOG_LIVE/LOG_NAME/LOG_DEVICE (per-user, kept in
+      # $OOSH_USER_CONFIG_PATH/log.session.env, not the shared log.env).
+      # Install-only vars (LOG_INSTALL, INSTALL_LOG) must not persist into user
+      # sessions. OOSH_COMPONENTS_DIR is a transient /tmp/test.oo.* path from
+      # test runs — never share.
+      #
+      # OOSH_BRANCH is the install INPUT: the branch the OPERATOR ASKED FOR,
+      # meaningful for the length of one install and meaningless afterwards. It
+      # is not an absolute path, so it is here for the other reason this list
+      # exists — state that must be DERIVED, never remembered. Persisting it
+      # closed a loop (oosh.env seeds a shell, the shell reaches a config save,
+      # the save writes it back) in which nothing ever consults the checkout,
+      # and it left private.oo.install.branch.get answering "prod" on a dev box
+      # for weeks. The branch a host is ON is derived from the canonical
+      # ~/oosh; see private.oo.shared.base.get. That is T7.
+      #
+      # Documented at docs/config.md § Excluded variables and pinned by
+      # test/test.config T29 — change all three together.
+      *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|SUDO_*|_) continue ;;
+    esac
+    echo "$variableName"
+  done
+}
+
+private.config.variable.export.line()     # <variableName> # echo ONE export line for a set scalar variable; rc 1 for unset, array, or a value bash renders with ANSI-C quoting #
+{
+  # NO create.result — a getter consumed as $(...); it also runs in a loop and
+  # would clobber the caller's RESULT on every iteration (config.save sets
+  # RESULT="" before the block on purpose). SILENT BY CONTRACT, same fd-1
+  # reason as private.config.variables.list.
+  local variableName="$1"
+  local declaration assignment
+  # `declare -p` WITH AN EXPLICIT NAME — measured correct on bash 3.2.57
+  # (`declare -- FOO="bar"`, `declare -a A='([0]="x")'`), unlike the
+  # no-argument form. Bash does the quoting, so we hand-roll no escaper: the
+  # same precedent, and the same reason, as result.into (this:719-728), whose
+  # comment records what a bare `echo "$1=$value"` did to values with spaces.
+  declaration=$(declare -p "$variableName" 2>/dev/null) || return 1
+  case "$declaration" in
+    'declare -a'*|'declare -A'*|'typeset -a'*|'typeset -A'*) return 1 ;;
+  esac
+  assignment="${declaration#declare -* }"
+  # Output-side shape gate: refuse anything that is not `NAME=…` rather than
+  # guess. `declare -- X` — declared, never assigned — lands here.
+  case "$assignment" in "${variableName}="*) ;; *) return 1 ;; esac
+  # ANSI-C quoting is what bash emits for a value carrying a newline or a
+  # control character, on 3.2 as well as 5. It is a BASHISM, and $OOSH_DIR/boot
+  # sources these files under dash/ash, which reads $'…' literally
+  # (review-2026-09-09 § D1). Refuse to persist such a value rather than write
+  # a line half the loaders mis-read. Nothing in the OOSH_/LOG_/CONFIG_ families
+  # is designed to hold a newline, so a value that does is an upstream bug —
+  # and `config validate required` is the detector that names it as missing.
+  case "$assignment" in "${variableName}=\$'"*) return 1 ;; esac
+  # PREPEND `export`. The old code sed-patched a `declare -` prefix into it,
+  # which bash 3.2's no-argument form never prints — so on macOS the
+  # substitution silently did nothing and no generated env file has ever
+  # carried `export`.
+  echo "export $assignment"
+}
+
+private.config.variables.export()     # <envPrefix> # echo the complete body of an env file: one export line per persistable variable matching envPrefix #
+{
+  # NO create.result — its stdout IS the file. SILENT BY CONTRACT.
+  #
+  # review-2026-09-09 § M3 named this before it existed: "config.save's
+  # `declare -p | while read` harvesting loop is a 12-line inline block that
+  # reads as private.config.vars.export <prefix>". Spelled with the full word
+  # `variables` to match private.config.required.variables.get in this file.
+  local envPrefix="$1"
+  local variableName
+  # Line by line, for the same reason as private.config.variables.list.
+  private.config.variables.list "$envPrefix" | while IFS= read -r variableName; do
+    private.config.variable.export.line "$variableName"
+  done
+}
+
+private.config.string.upper()     # <string> # echo string upper-cased, without the bash-4 parameter expansion operator #
+{
+  # NO create.result — a getter consumed as $(...).
+  #
+  # `${string^^}` is bash 4+. On macOS /bin/bash 3.2 it is not a warning but a
+  # FATAL "bad substitution" — the shell EXITS, measured on a sequoia VM. Both
+  # config.save and config.add reached it from their DOCUMENTED single-argument
+  # form (`config add oosh`, docs/config.md), so on macOS a documented command
+  # killed the user's shell.
+  #
+  # printf | tr, not `tr <<< "$1"`: a here-string creates a temp file in
+  # $TMPDIR, and this runs as root during install.
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
+
 ### new.method
 
 config.usage()
@@ -547,55 +690,24 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   
   stop.log "
   config.save [file:$file] [name:$name] to $CONFIG"
-    #declare -px | grep "^\(declare .* \)*\(.*$name\)\(.*\)=" | sed 's/^\(declare .* \)*\(.*'$name'\)\(.*\)=\(\"\)*\([^\"]*\)\(\"\)*/export \2\3=\"\5\"/'
-    #declare -p | grep "^\(declare -.* \)*\(.*$name\)\(.*\)=" | sed 's/^\(declare -.* \)*\(.*'$name'\)\(.*\)=\(.*\)/export \2\3=\4/'
   RESULT=""
-  # declare -p 
-  # important.log "now filter"
-  # declare -p | grep "^\(declare -[^aA]* \)*\([^ ]*$name\)\(.*\)=" 
-  # important.log "now replace"
-  # declare -p | grep "^\(declare -[^aA]* \)*\([^ ]*$name\)\(.*\)=" | sed 's/\([^-]*\)\(-x *\)\(.*'$name'\)\(.*\)=\(.*\)/export \1\3\4=\5/'
-  {    
-    #declare -p | grep "^\(declare -[^a]* \)*\([^ ]*$name\)\(.*\)=" | sed 's/^\(declare -.* \)*\((.*'$name'\)\(.*\)=\(.*\)/export \2\3=\4/'
-    #declare -p | grep "^\(declare -[^aA]* \)*\([^ ]*$name\)\(.*\)=" | sed 's/^\(declare -.* \)\(.*'$name'\)\(.*\)=\(.*\)/export \2\3=\4/'
-    
-    # on mac without -x
-    # Match vars where name is a PREFIX (e.g. OOSH matches OOSH_DIR but not SOME_OOSH_VAR)
-    # Exclude install-only vars (LOG_INSTALL, INSTALL_LOG) — they must not persist into user sessions.
-    # Exclude derived per-user paths — these are dynamically rebuilt from $HOME at every
-    # shell init ($OOSH_DIR/boot and this.init set CONFIG_PATH / OOSH_DIR /
-    # OOSH_USER_CONFIG_PATH), so persisting their ABSOLUTE expanded value into shared
-    # config (the saving user's $HOME) only causes EACCES leaks when a different user
-    # later sources it. Same reasoning as LOG_LIVE/LOG_NAME/LOG_DEVICE (per-user, kept
-    # in $OOSH_USER_CONFIG_PATH/log.session.env, not the shared log.env).
-    # OOSH_COMPONENTS_DIR is a transient /tmp/test.oo.* path from test runs — never share.
-    # Exclude the install INPUT. OOSH_BRANCH is the branch the OPERATOR ASKED FOR,
-    # meaningful for the length of one install and meaningless afterwards. It is not
-    # an absolute path, so it is here for the other reason this list exists: state
-    # that must be DERIVED, never remembered. Persisting it closed a loop —
-    # oosh.env seeds a shell, the shell reaches a config save, the save writes it
-    # back — in which nothing ever consults the checkout, and it left
-    # private.oo.install.branch.get (oo:1721, "the one rule behind state 31, state 34
-    # and oo boot.fix") answering "prod" on a dev box for weeks. The branch a host is
-    # ON is derived from the canonical ~/oosh; see private.oo.shared.base.get.
-    # Match on the VARIABLE NAME only, never the value. The old `grep " ${name}[_=]"`
-    # matched the prefix ANYWHERE in the declare line — so a var whose VALUE
-    # contained e.g. " OOSH_DIR" (SUDO_COMMAND holding a bash -c script that
-    # mentions OOSH_DIR) was wrongly harvested into oosh.env. Extract the varname
-    # (anchored: `declare -flags NAME=…` → NAME; the value after `=` is
-    # structurally unreachable) and test the prefix against that.
-    declare -p 2>/dev/null | while IFS= read -r _line; do
-      _vn=${_line#declare }; _vn=${_vn#-* }; _vn=${_vn%%=*}
-      # match the varname as `name` exactly or `name_…` — the old ` ${name}[_=]`
-      # boundary. Bare `${name}*` would be too broad (name=LOG would grab LOGNAME).
-      case "$_vn" in ${name}|${name}_*) ;; *) continue ;; esac
-      case "$_line" in "declare -a"*|"declare -A"*) continue ;; esac  # skip arrays
-      case "$_vn" in
-        # per-user / volatile / install-only / sudo-injected — never persist
-        *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|SUDO_*|_) continue ;;
-      esac
-      echo "$_line" | sed 's/^declare -[^ ]* /export /'
-    done
+  {
+    # The harvesting loop that used to live here is now
+    # private.config.variables.export, and the exclusion list moved with it, to
+    # sit beside the comment that explains it. review-2026-09-09 § M3 named the
+    # extraction before it existed.
+    #
+    # It enumerates NAMES with `compgen -v` and renders each one with
+    # `declare -p <name>`. It never parses the NO-ARGUMENT `declare -p` stream,
+    # which on bash 3.2 is `set`-style AND contains every function body — the
+    # two facts that between them wrote rows of the required-variables table
+    # into ~/config/oosh.env on every macOS install.
+    # See docs/research/2026-09-17-config-save-bash32.md.
+    #
+    # NOTHING inside this block may log. log:35 sets
+    # LOG_DEVICE=/proc/self/fd/1, and inside this redirect fd 1 IS $CONFIG, so
+    # a single debug.log would be written into the generated env file.
+    private.config.variables.export "$name"
   } >$CONFIG
   private.ensure.groupWrite "$CONFIG"
 
