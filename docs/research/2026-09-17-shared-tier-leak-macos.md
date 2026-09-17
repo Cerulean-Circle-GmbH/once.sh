@@ -86,6 +86,54 @@ export OS_CMD_USER_DEL="sysadminctl -deleteUser"
 export OS_CMD_USER_MOD="dseditgroup -o edit -a"
 ```
 
+### CORRECTION (2026-09-17, later the same day)
+
+**The paragraph that stood here was wrong, and is kept below the fix so the mistake is legible.**
+
+I wrote that `private.user.init`'s heal "looks for the wrong tools — macOS has neither `addgroup`
+nor `groupadd`". That code (`user:1666-1675`) is in the **`else` branch**. It never runs on darwin.
+`private.user.init` has a correct darwin branch (`user:1632-1637`) that sets all four, including
+`OS_CMD_GROUP_ADD="dseditgroup -o create -q"`.
+
+**The real writer of the empty strings is `private.check.pm`** (`oo:3055`):
+
+```bash
+export OS_CMD_GROUP_ADD=$3     # unconditional
+export OS_CMD_USER_ADD=$4      # unconditional
+…
+config save os.commands "OS_CMD"
+```
+
+and the call table (`oo:3093-3101`) gives the whole game away in one column:
+
+```
+private.check.pm brew    "brew install"                                    ← no $3, no $4
+private.check.pm apt-get "apt-get -y install" "groupadd -f" "useradd -g dev"
+private.check.pm dnf     "dnf -y install"     "groupadd -f" "useradd -g dev"
+private.check.pm yum     "yum -y install"     "groupadd -f" "useradd -g dev"
+private.check.pm apk     "apk add"            "addgroup"    "adduser -g dev"
+private.check.pm dpkg    "dpkg install"                                    ← no $3, no $4
+private.check.pm pkg     "pkg install"                                     ← no $3, no $4
+private.check.pm pacman  "pacman -S"                                       ← no $3, no $4
+```
+
+**Every Linux package manager passes the pair. `brew` — the macOS one — passes neither**, so both
+are exported as the empty string and then persisted. That is where
+`export OS_CMD_GROUP_ADD=""` in a clean Sequoia install comes from.
+
+**Fixed** (`oo`, 2026-09-17): `check.pm` now writes only what it was given. Not by adding darwin's
+commands at the call site — `private.user.init` already knows them, and a second copy would be the
+same knowledge in two places — but by leaving them **unset**, which is what lets the existing heal
+run. `T-CHECK-PM-NO-CLOBBER` in `test/test.oo` pins it, watched failing with
+`check.pm overwrote the pair with [|]`.
+
+**Still not pinned:** the heal *should* have repaired the file on a later run and did not. There is
+an ordering question between `private.check.pm`'s save and `private.user.init`'s persist that this
+research did not answer. The fix removes the bad write at its source, so the question is no longer
+load-bearing — but it is not answered.
+
+<details><summary>The original, incorrect paragraph</summary>
+
 and the heal cannot fill them, because it looks for the wrong tools (`user:1666-1675`):
 
 ```bash
@@ -100,6 +148,8 @@ fi
 already knows about for `OS_CMD_USER_MOD`. So the variable stays empty, the cache is never healthy,
 and the persist branch — `config save os.commands OS_CMD` followed by `oo pm.discover` — runs on
 **every** invocation, on every macOS host, forever.
+
+</details>
 
 ## 4. Three symptoms, one cause
 
