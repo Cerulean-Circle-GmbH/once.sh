@@ -416,3 +416,73 @@ PASS: ubuntu_24_04 (test=0 root=0 oosh-user=0 bash-user=0)
 
 So the ubuntu gate for this research doc's work is **green**, with the only remaining failure being
 the meta-test that verifies the counters.
+
+---
+
+## 15. Card 2 delivered (2026-09-17) — F4 + F5 + F6
+
+`5f258ba`. The repair that made things worse now repairs, **measured on the machine that was
+actually broken**:
+
+```
+=== BEFORE   INCOMPLETE: /Users/admin/config — missing: OOSH_OS
+=== REPAIR   config.init.env: re-derived: OOSH_OS
+=== AFTER    OK: /Users/admin/config carries every required variable and agrees with the checkout
+=== SECOND RUN
+             (nothing to derive)  OK: … carries every required variable
+```
+
+`test/test.platform.shared.config.env.invariant` on the VM: **11/13 → 13/13**. Its two failures
+were exactly this card's symptom.
+
+### F6 — the third column is a function name now
+
+Every derivation already existed; each got a name and one home:
+
+| row | deriver | was |
+|---|---|---|
+| `OOSH_MODE` | `private.config.derive.oosh.mode` | inline **twice** — `config.validate.required`'s drift check and `oo:2631-2633` |
+| `OOSH_OS` | `private.config.derive.oosh.os` | `os.check.env`, reached by nothing on the config path |
+| `OOSH_PM` | `private.config.derive.oosh.pm` | only `oo pm.discover`, which is not a detector |
+| `BASH_FILE` / `CONFIG_FILE` / `LOG_LEVEL` | ditto | inline in `config.save` / `config.init` / `this` |
+
+The drift check now calls the same accessor the repair does, so they cannot disagree about what
+"the branch this host is on" means.
+
+### F5 — the repair derives before it saves
+
+Per-variable emptiness guard (`private.user.init`'s OS_CMD shape), so a surviving value is never
+overwritten. **All three env files are backed up**, not just `user.env` — that omission is exactly
+how `OOSH_PM` was lost, because `config save oosh OOSH` truncates `oosh.env` before anything can
+read the survivor out of it. And a **refuse-to-worsen** guard: fewer export lines out than in
+restores the backup and says so.
+
+### F4 — the verdict is heard, on stderr
+
+`config.save` had no deliberate exit status at all; it has one now, and the verdict goes to
+**stderr**. Not stylistic: `user:1702-1708` records that `$(user get basehome)` **captures** this
+function's stdout, and a stray line there once propagated a garbage IdentityFile into a generated
+ssh config and failed a git clone. Smoke-tested — a capture around `config save` comes back empty.
+
+### Two corrections made during the work
+
+- The first `OOSH_PM` deriver called **`oo pm.discover`**, which is not a detector: it runs the real
+  package manager (`$SUDO apt-get update`) and then `config save`. It hung a test run on a sudo
+  password prompt — the same trap `test.suite:895-905` records being sprung once before. **A
+  deriver must have no side effects.** It now detects with `command -v` and maps; that map is a
+  **third copy** (`init/oosh:214`, `oo:3093`) and is carded, not hidden.
+- The first `T80` asserted `LOG_LEVEL` derives 3 while the suite runs at 1. The deriver was right —
+  an already-chosen level wins — and the test was wrong.
+
+The table claimed `LOG_LEVEL` *"defaults to 1"*; `this:16` and `log:125` both use **3**. Corrected.
+**T37** — which passed on a **zero-byte** file, the one outcome that actually happened on the VM —
+now asserts content.
+
+### Open after this card
+
+- **§ 5 / § 7.3** — on macOS `CONFIG_PATH` was exported by a parent and empty two processes down.
+  Untouched, and it makes `test.suite.config.isolate` weaker than it looks.
+- **Three copies of the package-manager table** — `init/oosh:214`, `oo:3093`, and now
+  `private.config.pm.command.get`. One side-effect-free `oo pm.detect` should serve all three.
+- **Four answers to "which branch is ~/oosh on"** — this card unified two (`config:874`,
+  the repair); `private.oo.shared.base.get` and `config.init.user:277-282` remain.
