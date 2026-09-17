@@ -259,6 +259,19 @@ Some correct shapes need no marker at all, because the sweep understands them: `
 `date -r … || date -d …`) including when the pair is written across a continued line, and
 `script -qec "bash <file>"`, where naming the shell **is** the fix.
 
+### The rules are measured, not reasoned
+
+Each one was checked against a real BSD userland on the macOS VM, because a portability rule
+justified by reasoning is exactly what this sweep exists to stop. `stat -c`, `date -d`, `grep -P`,
+`sed -i <script>` and `script -qec` are all *illegal option* there. `readlink -f` in fact **works**
+on macOS 12.3+, so that rule is about older BSD — it stays a violation only because
+`private.this.path.canonical` already exists and carries the fallback for free.
+
+The `\|` case is the one that justifies the whole card: on BSD grep it does not error and does not
+return zero — it returns **1 where the answer is 2**. A wrong count, silently, in a test that then
+reports the code under test as broken. The full probe table is in
+[the research doc](research/2026-09-17-shared-tier-leak-macos.md).
+
 ## Best Practices
 - Use `test.case` for each logical test scenario.
 - Use `expect` to assert both return values and output.

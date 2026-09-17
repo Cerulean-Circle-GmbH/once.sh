@@ -601,3 +601,43 @@ Neither was foreseen, and neither was optional if the work was to be done in the
 Production portability — that is what the macOS and container gates are for, and cards 1-3 are the
 work that came out of them. The sweep is static: it finds constructs, not behaviours. `mktemp`'s
 118 advisories are the honest measure of how much of this class is still latent.
+
+### The rules, measured rather than reasoned
+
+Every rule in the table was checked against a real BSD userland on the Sequoia VM
+(`grep (BSD grep, GNU compatible) 2.6.0-FreeBSD`, bash 5.3 from homebrew) after the sweep went
+green, because a portability rule justified by reasoning is exactly the kind of thing this card
+exists to stop:
+
+| Probe | Result on macOS |
+|---|---|
+| `grep -c -- '-one$\|-two$'` on a 3-line file | **1** — where the answer is 2 |
+| `grep -cE -- '-(one\|two)$'` on the same file | **2** — correct |
+| `readlink -f /tmp` | `/private/tmp` — **works** on this macOS (12.3+) |
+| `stat -c %U /tmp` | `stat: illegal option -- c` |
+| `date -d @0` | `date: illegal option -- d` |
+| `grep -P a file` | `grep: invalid option -- P` |
+| `sed -i s/a/b/ file` | `sed: 1: "…": extra characters at the end of p command` |
+| `sed -i '' s/a/b/ file` | rc 0 — the portable spelling |
+| `script -qec true /dev/null` | `script: illegal option -- c` |
+
+Two of these change what the rules should say.
+
+**The `\|` case is worse than "it fails".** It does not error and it does not return 0 — it returns
+**1 where the answer is 2**. A wrong count, silently, in a test that then reports the code under
+test as broken. That is the exact shape of the `T-SSH-BACKUP-LIST` failure and the reason this rule
+is a `violation` rather than an advisory: an error would have been survivable.
+
+**`readlink -f` works on this macOS**, so the rule is about *older* BSD, not about this box. It
+stays a violation because `private.this.path.canonical` already exists, costs nothing, and carries
+the fallback — but the honest statement is "GNU-only on BSD before macOS 12.3", not "broken here".
+Note also what it returned: `/private/tmp`. That is the `mktemp` advisory's whole premise,
+demonstrated by the one probe that passed.
+
+**`script -qec` is an illegal option on BSD**, which confirms that the `# portability-exception:`
+on `test/test.log`'s capability probe is the right call rather than a dodge: the probe fails there,
+so T50 skips, which is the portable outcome. The marker documents a skip, not a hidden fault.
+
+The sweep itself returns identical numbers on both platforms — 166 constructs, 119 advisories, 47
+exceptions, 0 violations — which is the minimum one should expect of a static scan and was worth
+confirming anyway, since it is written in the shell whose portability it polices.
