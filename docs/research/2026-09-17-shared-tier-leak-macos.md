@@ -213,3 +213,58 @@ one is `$TMPDIR` carrying a trailing slash, producing `//` in a built path. Thei
 `dev` at `df6d57b`, clean, in sync with `origin/dev`. No code changed by this research.
 The Tart VM (`192.168.64.5`, user `admin`) is installed and restored to a clean state; the probes
 used in § 2 were removed.
+
+---
+
+## 10. Verified on the VM (2026-09-17)
+
+`823d50a` — `private.check.pm` writes only the OS_CMD values it was given.
+
+**The cache heals, on macOS, measured:**
+
+```
+BEFORE                        AFTER
+OS_CMD_GROUP_ADD=""           OS_CMD_GROUP_ADD="dseditgroup -o create -q"
+OS_CMD_USER_ADD=""            OS_CMD_USER_ADD="sysadminctl -addUser"
+OS_CMD_USER_DEL="sysadminctl -deleteUser"     (unchanged)
+OS_CMD_USER_MOD="dseditgroup -o edit -a"      (unchanged)
+```
+
+**The leak is gone.** `test.suite run completion.audit 1` on the VM:
+
+```
+✓ PASS: shared config tier untouched (/Users/admin/config)
+2 / 2 assertions passed
+```
+
+**Full `core` on the clean macOS install:**
+
+| | before | after |
+|---|---|---|
+| assertions | 842 | 848 |
+| failed | 12 | **11** |
+| shared tier | **2 files rewrote /Users/admin/config** | *(no such line — canary silent)* |
+
+So the cause identified in § 3 is removed and the leak it produced is closed.
+
+### What this did NOT fix, stated plainly
+
+`user.create ooshTestC password '' leaves account locked` still fails
+(`ooshTestC should exist with no password hash`), while the test above it —
+`user.create ooshTestB defaults password to username` — passes. Having the right *command* is not
+the same as asserting the right *evidence*: macOS keeps credentials in OpenDirectory, not in a
+shadow file, so "no password hash" is not a question `/etc/shadow` can answer there. That is a
+narrower, separate defect in the assertion or in `user.password`'s darwin route.
+
+### Open question § 7.3 is still open
+
+`CONFIG_PATH` was exported by the audit and **empty** in the `config` process two levels down. The
+fix removes the *reason* that path was taken, not the *possibility*: any isolated test that reaches
+a subprocess losing the anchor can still write a real machine's config. Its own card.
+
+### The remaining 11 macOS failures
+
+One is the intentional meta-test. Eight are one cause — macOS `/tmp` and `/var/folders` are
+symlinks, so a canonicalised path gains a `/private` prefix and a string comparison fails. One is
+`$TMPDIR` carrying a trailing slash, producing `//` in a built path. One is the `ooshTestC` case
+above. **None is in this ticket.**
