@@ -68,6 +68,22 @@ invariants on real machines. They run inside
 `./test.suite run <name> 1`. See
 `templates/code/newPlatformInvariantTest` for the skeleton.
 
+**A host-resource check belongs here, not in `core`.** If an assertion needs
+something the oosh install does not itself create — a checkout of another
+repository, a daemon, a tree under `/var` — it cannot pass on a fresh machine or
+inside a container, and `os platform.test` runs `test.suite core 1` four times
+per gate. Do not reach for a `[ -d … ] → expect.pass "skipped"` guard either:
+`expect.pass` bumps both counters and `expect.fail` only one, so **a skip is
+indistinguishable from a pass** and the assertion silently stops asserting
+everywhere it matters.
+
+The worked example is `test/test.odocker`, 2026-09-17. Six assertions checked
+that this machine had the EAMD.ucp `DockerWorkspaces` tree; they failed 6 × 4 on
+every container gate. They split into `T-WS-LIST` in `core` — which tests the
+enumerator against a fixture built with `odocker workspace.init` and passes
+anywhere — and `test/test.platform.odocker.workspaces.invariant`, which keeps
+the host-readiness question where it belongs.
+
 ## The runner guards the shared config tier
 
 You do not have to remember to isolate for the guard to catch you. Before the first test file, the
