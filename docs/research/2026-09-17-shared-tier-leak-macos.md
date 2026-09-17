@@ -317,3 +317,37 @@ defined public method — `private.user.delete.linux` is). Sibling of the
 | **`test/test.hiveMind` uses GNU-only `\|` BREs** | `:1211, :1222, :2163, :2171, :2185`. `TEST_CATEGORY=extended`, already has known failures, so not bundled — but it will never pass on macOS as written. |
 | **78 un-canonicalised fixture sites** | `test/` has 85 `mktemp -d` calls; seven now use `test.suite.fixture.make`. The rest are latent macOS failures, each waiting for someone to compare a resolved path. |
 | **`test.suite` cannot be extended by the tool** | It carries no `### new.method` marker, and `oo method.new` cannot parse a dotted script name — `${name%%.*}` on `test.suite.fixture.make` yields `test`. So `test.suite.fixture.make` had to be hand-written. |
+
+---
+
+## 12. macOS `core` is green (2026-09-17)
+
+`f53efa1` — `password ""` leaves a locked account on darwin.
+
+```
+  Test Files:  29
+  Test Cases:  748
+  Assertions:  848
+  Passed:      847
+  Failed:      1 (intentional meta-test)
+
+  ✓ ALL TESTS PASSED
+```
+
+**Zero real failures on a clean macOS install**, from twelve this morning, and the shared-tier
+canary silent throughout. Linux is unchanged at every step: host `core` 838/839 before and after,
+ubuntu gate `test=0 root=0 oosh-user=0 bash-user=0`.
+
+The last one was the only defect of the four that was a **security** difference rather than a
+portability one: `password ""` on macOS produced an account that authenticates with an empty
+password, where Linux produces one that cannot authenticate at all.
+
+| # | Defect | Class | Fix |
+|---|---|---|---|
+| 1 | `check.pm` persisted two empty `OS_CMD_*` values | install | write only what was given |
+| 2 | fixture paths resolved through `/private`; `$TMPDIR` has a trailing slash | test | `test.suite.fixture.make` canonicalises |
+| 3 | `\|` alternation in a BRE is GNU-only | test | POSIX ERE |
+| 4 | `password ""` gave an empty-password account, not a locked one | **security** | delete `AuthenticationAuthority` |
+
+Each was measured on the VM before being fixed, and each fix is confined to a branch Linux never
+reaches or to a path nothing in production takes — which is why the Linux numbers never moved.
