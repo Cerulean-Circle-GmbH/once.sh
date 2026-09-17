@@ -335,3 +335,71 @@ consumer). Plus the cards in § 13.
 | `templates/code` has no `newGetterTest` | `newMethodTest` assumes a `create.result` method: its `expect 0 "<result>"` compares `$RESULT`, which a getter never sets, so the generated case compares whatever the previous test left — a test that cannot fail. Four such cases were generated and removed by hand here. |
 | `replace` cannot target one of two identical adjacent lines | `replace block` requires anchors matching exactly one line each, so collapsing a duplicated line needed raw `python3` — the one edit in this ticket that did not go through an oosh command. |
 | Which install step runs `config.save` under `/bin/bash`? | § 8 Q2, still unpinned. This ticket makes it harmless rather than answering it. If the answer is "none should", that is an install-path ticket and this becomes defence in depth. |
+
+---
+
+## 14. The macOS gate (2026-09-17) — before and after, same image
+
+Tart VM rebuilt from `ghcr.io/cirruslabs/macos-sequoia-base:latest`, Sequoia 15.7.3,
+`/bin/bash` 3.2.57, `ossh install tart_sequoia admin` from `origin/dev`.
+
+**`~/config/oosh.env` before (§ 1) and after:**
+
+```
+before                                                after
+──────────────────────────────────────────────────    ─────────────────────────────────────
+OOSH_CONFIG_NEEDS_SAVE=/var/root/config/user.env      export OOSH_CLEAN_ENV="1"
+OOSH_PM='brew install'                                export OOSH_CONFIG_NEEDS_SAVE="/var/root/config/user.env"
+OOSH_PROMPT='oosh '                                   export OOSH_OS="darwin"
+OOSH_SHLVL=4                                          export OOSH_PM="brew install"
+OOSH_STATUS='0: started in shell level: 1'            export OOSH_PM_BIN="brew"
+OOSH_MODE oosh.env basename of the canonical ~/oosh   export OOSH_PM_UPDATE=""
+OOSH_OS oosh.env $OSTYPE, via os                      export OOSH_PROMPT="oosh "
+OOSH_PM oosh.env oo pm.discover                       export OOSH_SHLVL="4"
+                                                      export OOSH_STATUS="0: started in shell level: 1"
+```
+
+No prose rows; **every line carries `export` for the first time on macOS**; `OOSH_OS` is
+persisted where before it was one of the "missing" variables. `log.env` likewise
+(`export LOG_LEVEL="3"` plus the chain line, no `LOG_LEVEL log.env defaults to 1` row).
+
+| Check | Before | After |
+|---|---|---|
+| `config validate oosh` | `INVALID — 3 violation(s)` | **OK** |
+| `config validate log` | `INVALID — 1 violation(s)` | **OK** |
+| `config validate user` | OK | OK |
+| `path validate` | OK | OK |
+| every shell | 4 × `…: command not found` | **silent** |
+| `config validate required` | `missing: OOSH_MODE OOSH_OS` | `missing: OOSH_MODE` |
+| `test.platform.shared.config.env.invariant` | — (did not exist) | **11 / 13** |
+| `/bin/bash -n` on config/this/oo/boot | — | all parse under 3.2.57 |
+
+### The two remaining failures are ONE defect, and it is not this card's
+
+`OOSH_MODE` is never set in the shell that saves, so it is absent from `oosh.env` and empty
+after sourcing `boot`. The value is plainly derivable — `~/oosh` is a symlink to `dev` on that
+VM — and the required-variables table already states how (*"basename of the canonical
+~/oosh"*). **Nothing reads that column.** That is **F6**, and the repair that should close it
+is **F5**. Card 2.
+
+It is worth saying what changed here: before, that validator's verdict was drowned in
+corruption and a wall of `command not found`. Now it is the only thing left on the screen,
+saying one true sentence.
+
+### One more fault, found by the gate, fixed here
+
+`this:191` used `${anchor,,}` — bash 4+. Under macOS `/bin/bash` 3.2 that is a "bad
+substitution", so **`this anchor.validate` produced no verdict at all** on any macOS shell not
+already re-pathed to brew bash: a validator silently declining to validate. Same class as
+`config.save`'s `${file^^}`, found the same way, fixed with `printf | tr`. Measured on the VM:
+`bash=3.2.57 slug=[oosh-dir]`, shell survives.
+
+### Not proven here
+
+The Linux container gate (`os platform.test ubuntu_24_04`) reports **7 failures: 6 in
+`test.odocker` plus the 1 intentional meta-test**. The six are pre-existing and unrelated —
+they assert the HOST's `/var/dev/…/DockerWorkspaces` tree exists, ungated, unlike the
+docker-touching assertions beside them which are all behind `DOCKER_AVAILABLE`. They date from
+`3cfd931`; backlog item 8 gave `test.odocker` its `core` category and score, and its plan said
+*"No platform run: odocker is off the install path"* — so this was the first container `core`
+since, and it surfaced item 8's blind spot. **Its own card.** No new failures from this ticket.
