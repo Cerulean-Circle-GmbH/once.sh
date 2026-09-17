@@ -419,3 +419,68 @@ Only under a pty, only on a first run; the login PATH inspected afterwards holds
 exactly once. Unexplained, and a candidate for the third failure the user saw — **candidate, not
 conclusion**: their run had 3 failures where the closest reproduction has 5, so the environments
 still differ and the specific assertion they hit was never identified.
+
+---
+
+## 14. § 13 was wrong too — the "controlled pair" was not controlled
+
+**Same evening, one hour later.** § 13 claimed a Linux tty-dependent leak on the strength of two
+container runs differing "in one thing only, whether a pty was allocated". They differed in a
+second thing I did not notice: **how each waited for the install to finish.**
+
+| run | how it waited | verdict |
+|---|---|---|
+| no-pty | install and `core` **chained in one `docker exec`** — cannot race | clean |
+| pty | `until docker exec … 'test -x /root/oosh/test.suite'` | **raced the install** |
+
+`test -x ~/oosh/test.suite` becomes true **partway through** the install, while the tree is still
+being assembled. That run's `core` therefore executed against a half-installed oosh. So did the
+probe run after it, which is how I ended up looking at a `~/oosh` symlink pointing at a `dev`
+worktree that had not been created yet and briefly believing a test had deleted it.
+
+**Redone properly** — install writes a completion marker, the wait polls for the marker, *then*
+`core` runs under a pty on a fresh install:
+
+```
+  Assertions:  843
+  Failed:      2          ← T50 + the intentional meta-test
+  (no "Shared tier:" line)
+  diff /tmp/log.env.before /root/config/log.env → IDENTICAL
+```
+
+and every one of the eight probe hits at `log`'s three `config save log LOG` sites carried a
+**fixture** `CONFIG_PATH`, never `/root/config`:
+
+```
+PROBE site=399 cfg=[/tmp/test.log.config.428px9]     parent=test/test.log
+PROBE site=473 cfg=[/tmp/test.log.config.428px9]     parent=test.suite core
+PROBE site=586 cfg=[/tmp/oosh.t71.c0DqKT]            parent=test/test.config
+PROBE site=586 cfg=[/tmp/test.config.bak.0.29629]    parent=test.suite core
+…
+```
+
+The cascade **runs** — eight times — and isolation **holds** every time. That is the opposite of
+what § 13 concluded.
+
+### What stands, and what is withdrawn
+
+- **WITHDRAWN:** "the leak is on Linux too", "the pty is what makes the difference", and the
+  seven-writer table. All of it rested on the contaminated run.
+- **STANDS:** everything in §§ 1-5 and § 10-12 — the macOS chain, which was probed directly, and
+  the `check.pm` fix, which was measured before and after on the VM.
+- **STANDS, and is the better-evidenced version of § 6:** a fresh Linux install's first `core`,
+  under a pty, writes nothing to the shared tier. That is now a measurement rather than an
+  inference from silence.
+
+### The lesson worth keeping
+
+**`test -x <file>` is not an install-completion check.** It was wrong twice in one hour, and both
+times it produced a confident, wrong finding rather than an obvious error. A background install
+must publish a completion marker and the waiter must poll for *that*.
+
+### Still unexplained
+
+The user's own run — install by hand, `core` by hand, no race — scored **843 assertions, 3
+failures** where every clean reproduction scores 843/2. One assertion failed for them that has
+never failed since, and it was not identified. That remains open, and § 13's `T74` guess is
+withdrawn along with the rest of it.
