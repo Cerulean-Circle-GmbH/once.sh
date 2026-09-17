@@ -238,7 +238,7 @@ A **violation** is wrong wherever it stands and fails the gate (rc 1): the BRE `
 without naming the shell. The tree ships at **zero** of these.
 
 An **advisory** is *latent* — correct today, wrong the day someone compares its result against a
-canonicalised path. `mktemp` is the whole of that class, at ~118 sites. Converting all of them in
+canonicalised path. `mktemp` is the whole of that class, at 82 sites. Converting all of them in
 one commit would be churn with no test behind it, so the sweep **marks** them, reports a per-file
 tally through `warn.log`, and leaves the gate actionable. Convert one whenever you are in the file
 anyway:
@@ -246,6 +246,13 @@ anyway:
 ```bash
 fixture=$(test.suite.fixture.make my.label)   # mktemp -d + private.this.path.canonical
 ```
+
+Both `sed -i` and `mktemp` carry a **command-position anchor** — `(^|[|;&(`]|\$\()[[:space:]]*` —
+so a construct merely *named* in a message string is not counted as a use of it. Without it the
+mktemp rule matched `|| { create.result 1 "mktemp failed"; … }`, the commonest line in the tree
+containing the word, and over-counted its own tally by 43% (119 reported against 82 real). A
+validator that reports faults which are not there is doing a mild version of exactly what this
+sweep exists to stop, so `T-PORTABILITY-ADVISORY-STRING` pins it.
 
 ### Declaring a deliberate one
 
