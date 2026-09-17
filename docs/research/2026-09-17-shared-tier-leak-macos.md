@@ -484,3 +484,58 @@ The user's own run — install by hand, `core` by hand, no race — scored **843
 failures** where every clean reproduction scores 843/2. One assertion failed for them that has
 never failed since, and it was not identified. That remains open, and § 13's `T74` guess is
 withdrawn along with the rest of it.
+
+---
+
+## 17. § 5 / § 7.3 — the anchor that vanished: not reproduced, trigger removed
+
+**The claim, from § 2:** on macOS the audit had `CONFIG_PATH=<fixture>` and `export -p` agreed
+(`exported=2`), and the `config` process **two levels down** had it EMPTY, so `config.init`
+defaulted it to `~/config` and the write landed on the shared tier.
+
+```
+AUDIT-PARENT cfg=/var/folders/…/T//test.completion.audit.config.u6FQ5P  exported=2
+PROBE site=586 cfg=[/Users/admin/config]  parent=oo pm.discover  gparent=test.completion.audit
+```
+
+**It does not reproduce.** Measured on the same VM after cards 1-3:
+
+| probe | result |
+|---|---|
+| `CONFIG_PATH=/tmp/probeCFG config discover` (one level) | **survives** — answers `/tmp/probeCFG` |
+| `CONFIG_PATH=/tmp/probeCFG oo pm.discover` (two levels, the same shape) | **survives** — every `.env` written landed in the fixture, the shared `oosh.env` mtime unchanged |
+| `test.suite run completion.audit 1` on the VM — the real path | **2/2, canary silent** |
+
+### Ruled out
+
+- **A general inheritance failure on macOS.** No: one level survives, measured.
+- **An `oo` shim re-execing with a clean environment.** No shim — `command -v oo` is
+  `/Users/admin/oosh/oo`, the real script.
+- **`oo`'s two unconditional `export CONFIG_PATH=`** (`oo:2383`, `oo:2623`). Real, and they *would*
+  override an inherited anchor — but both carry `# config-path-exception:` markers with a sound
+  reason (install state 31 builds the shared tree before `~/config` is a symlink to it) and neither
+  is on the audit's path.
+- **`config.init` clobbering it.** T7 made that conditional (`: ${CONFIG_PATH:=~/config}`), and T72
+  pins it.
+
+### The honest conclusion
+
+**The trigger is gone, and the mechanism was never determined.** Card 2's `check.pm` fix means the
+macOS `OS_CMD` cache is now complete, so `private.user.init`'s heal-and-persist branch — the thing
+that invoked `oo pm.discover` from inside the audit — no longer fires. The chain that lost the
+anchor is simply not walked any more.
+
+That is the removal of a trigger, not an explanation. **I could not reproduce it and I am not going
+to invent a cause for it.** What was observed was observed; it is recorded above with its probe
+output, and if it returns the next person starts from the ruled-out list rather than from nothing.
+
+### What was done instead
+
+`T85` in `test/test.config` asserts the property that was silently assumed: an exported
+`CONFIG_PATH` **survives into a grandchild process**, and a `config save` two levels down writes
+the fixture and leaves the real tier byte-identical. Deliberately a WRITE test, not a
+variable-echo test — what matters is not that the child can read the anchor but that its writes
+land in the right place.
+
+Nothing asserted that before. "Isolation held the last five times I looked" is not a guarantee;
+this makes it one.
