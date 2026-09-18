@@ -16,6 +16,13 @@ echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 source this
 source test.suite
+
+# T31 drives `log level 7`, which calls `config.save log LOG` and rewrites
+# $CONFIG_PATH/log.env — the site-wide sharedConfig every user sources at
+# login. Isolate before sourcing log, so the snapshot/restore dance below
+# operates on a fixture instead of mitigating damage to the real tier.
+test.suite.config.isolate test.log >/dev/null || exit 1
+
 source $OOSH_DIR/log
 
 log.level $level
@@ -28,6 +35,10 @@ ORIGINAL_LOG_DEVICE=$LOG_DEVICE
 ORIGINAL_LOG_LIVE=$LOG_LIVE
 ORIGINAL_STEP_DEBUG=$STEP_DEBUG
 ORIGINAL_LOG_ENV=$(cat "$CONFIG_PATH/log.env" 2>/dev/null)
+ORIGINAL_LOG_NAME=$LOG_NAME
+# Per-user/session file the log.session.* tests write to (real file — snapshot it)
+SESSION_ENV="$HOME/.config/oosh/log.session.env"
+ORIGINAL_SESSION_ENV=$(cat "$SESSION_ENV" 2>/dev/null)
 
 # Disable STEP_DEBUG to prevent test blocking
 export STEP_DEBUG=OFF
@@ -40,9 +51,14 @@ cleanup.testFiles() {
   export LOG_DEVICE=$ORIGINAL_LOG_DEVICE
   export LOG_LIVE=$ORIGINAL_LOG_LIVE
   export STEP_DEBUG=$ORIGINAL_STEP_DEBUG
+  export LOG_NAME=$ORIGINAL_LOG_NAME
   # Restore persisted config (tests call config save which pollutes log.env)
   if [ -n "$ORIGINAL_LOG_ENV" ]; then
     echo "$ORIGINAL_LOG_ENV" > "$CONFIG_PATH/log.env"
+  fi
+  # Restore the per-user/session file (log.session.* tests rewrite it)
+  if [ -n "$ORIGINAL_SESSION_ENV" ]; then
+    echo "$ORIGINAL_SESSION_ENV" > "$SESSION_ENV"
   fi
 }
 
@@ -415,13 +431,17 @@ expect 0 "Colors initialized" "log.init.colors loads without error"
 # ============================================================================
 # T23: Test clear.resultFiles clears result files
 # ============================================================================
-echo "test content" > ~/config/result.txt 2>/dev/null
-echo "test error" > ~/config/error.txt 2>/dev/null
+# $CONFIG_PATH, not a hardcoded ~/config: clear.resultFiles itself operates on
+# $CONFIG_PATH. The two only coincided because CONFIG_PATH *was* ~/config, so
+# the old form both wrote the shared tier and asserted against the wrong file
+# the moment anything moved the anchor.
+echo "test content" > "$CONFIG_PATH/result.txt" 2>/dev/null
+echo "test error" > "$CONFIG_PATH/error.txt" 2>/dev/null
 
 test.case - "T23: clear.resultFiles clears result files" \
   clear.resultFiles
 
-if [ ! -f ~/config/result.txt ] || [ ! -s ~/config/result.txt ]; then
+if [ ! -f "$CONFIG_PATH/result.txt" ] || [ ! -s "$CONFIG_PATH/result.txt" ]; then
   create.result 0 "Result files cleared"
 else
   create.result 1 "Result files not cleared"
@@ -567,7 +587,7 @@ rm -f "$TEST_INSTALL_LOG2" 2>/dev/null
 # when stdin is a tty (ssh -tt platform.test container). Snapshot/restore
 # log.env around T31 to prevent the leak.
 LOG_ENV_BACKUP="/tmp/test.log.env.backup.$$"
-cp "$HOME/config/log.env" "$LOG_ENV_BACKUP" 2>/dev/null
+cp "$CONFIG_PATH/log.env" "$LOG_ENV_BACKUP" 2>/dev/null
 
 test.case - "T31: log.start dispatches log. prefix methods" \
   echo "testing dispatch via ./log"
@@ -588,7 +608,7 @@ expect 0 "log.level dispatched" "log.start dispatches log.level correctly"
 # debugger (see comment block above T31). `mv -f` because some shells
 # (e.g. Ubuntu's default `alias mv='mv -i'`) prompt to confirm overwriting
 # a read-only mode, which itself hangs the test on a tty.
-[ -f "$LOG_ENV_BACKUP" ] && \mv -f "$LOG_ENV_BACKUP" "$HOME/config/log.env"
+[ -f "$LOG_ENV_BACKUP" ] && \mv -f "$LOG_ENV_BACKUP" "$CONFIG_PATH/log.env"
 
 # ============================================================================
 # T32: Test log.start dispatches .log suffix methods (error.log)
@@ -847,8 +867,136 @@ unset LOG_INSTALL
 rm -f "$TEST_CUSTOM_INSTALL" 2>/dev/null
 
 # ============================================================================
+# T46: Test LOG_NAME defaults to user@host (underscore family, NOT system LOGNAME)
+# ============================================================================
+test.case - "T46: LOG_NAME looks like user@host" \
+  echo "testing LOG_NAME shape"
+
+if [[ "$LOG_NAME" == *@* ]]; then
+  create.result 0 "LOG_NAME=$LOG_NAME"
+else
+  create.result 1 "LOG_NAME=$LOG_NAME (expected user@host)"
+fi
+expect 0 "LOG_NAME=$LOG_NAME" "LOG_NAME defaults to user@host"
+
+# ============================================================================
+# T47: Test log.name without args shows LOG_NAME, with arg sets it
+# ============================================================================
+test.case - "T47: log.name gets and sets LOG_NAME" \
+  echo "testing log.name getter/setter"
+
+SAVED_LOG_NAME=$LOG_NAME
+GET_OUT=$(log.name 2>/dev/null)
+log.name "ci-run@testhost" >/dev/null 2>&1
+if [ "$GET_OUT" = "$SAVED_LOG_NAME" ] && [ "$LOG_NAME" = "ci-run@testhost" ]; then
+  create.result 0 "get and set work"
+else
+  create.result 1 "get='$GET_OUT' (expected '$SAVED_LOG_NAME'), set LOG_NAME='$LOG_NAME'"
+fi
+export LOG_NAME=$SAVED_LOG_NAME
+expect 0 "get and set work" "log.name shows and sets LOG_NAME"
+
+# ============================================================================
+# T48: Test log.session.save writes the 3 vars and NOT system LOGNAME
+# ============================================================================
+test.case - "T48: log.session.save writes LOG_NAME/LOG_DEVICE/LOG_LIVE, no LOGNAME" \
+  log.session.save
+
+SESSION_BODY=$(cat "$SESSION_ENV" 2>/dev/null)
+if echo "$SESSION_BODY" | grep -q "^export LOG_NAME=" \
+   && echo "$SESSION_BODY" | grep -q "^export LOG_DEVICE=" \
+   && echo "$SESSION_BODY" | grep -q "^export LOG_LIVE=" \
+   && ! echo "$SESSION_BODY" | grep -qE "^export LOGNAME="; then
+  create.result 0 "3 vars present, no LOGNAME"
+else
+  create.result 1 "Body: $SESSION_BODY"
+fi
+expect 0 "3 vars present, no LOGNAME" "log.session.save persists the 3 LOG_ vars and never the system LOGNAME"
+
+# ============================================================================
+# T49: Test LOG_LIVE resolves under the per-user ~/.config/oosh (not shared ~/config)
+# ============================================================================
+test.case - "T49: LOG_LIVE is per-user under ~/.config/oosh" \
+  echo "testing LOG_LIVE relocation"
+
+# log.live() default must anchor under the per-user dir — now expressed via the
+# single-source-of-truth $OOSH_USER_CONFIG_PATH (fallback ~/.config/oosh), NOT a
+# re-spelled literal. Assert both the var reference and the log.live.out file.
+DEFAULT_BODY=$(declare -f log.live)
+if echo "$DEFAULT_BODY" | grep -q 'OOSH_USER_CONFIG_PATH' \
+   && echo "$DEFAULT_BODY" | grep -q 'log\.live\.out'; then
+  create.result 0 "LOG_LIVE default under \$OOSH_USER_CONFIG_PATH"
+else
+  create.result 1 "log.live default not relocated: $DEFAULT_BODY"
+fi
+expect 0 "LOG_LIVE default under \$OOSH_USER_CONFIG_PATH" "LOG_LIVE default lives under the per-user \$OOSH_USER_CONFIG_PATH"
+
+# ============================================================================
+# T50: the LIVE terminal wins over a stale chained LOG_DEVICE (needs a pty)
+# ============================================================================
+# LOG_DEVICE is loaded from the chained log.session.env (a PREVIOUS session's
+# tty, still writable because same-user). With a controlling terminal attached,
+# log's top-level must re-derive LOG_DEVICE to the CURRENT tty, or every new
+# shell would log onto the first terminal. Verified under a real pty via script.
+test.log.liveTtyWinsOverStale() {
+  # (1) a STALE terminal path (a previous session's pts) must be refreshed to the
+  #     live tty; (2) an EXPLICIT non-terminal device (capture file) must be kept
+  #     (this is what T31/T32's `LOG_DEVICE=/tmp/… log …` rely on under a tty).
+  local capfile="/tmp/test.log.cap.$$"; : > "$capfile"
+  local probe="/tmp/test.log.probe.$$"
+  # The probe goes in a FILE, and `script` is told to run it with BASH.
+  #
+  # `script -qec <command>` does not guarantee which shell runs <command>, and
+  # the command below MUST be bash: `log` uses dotted function names, so it can
+  # only be sourced by bash, and `source` itself is a bashism. On a host where
+  # `script` picked /bin/sh (dash) this failed with `sh: 1: source: not found`
+  # — the probe never sourced `log` at all, LOG_DEVICE was never refreshed, and
+  # the test reported the D4 guard broken WHILE THE GUARD WAS FINE. Measured in
+  # an Ubuntu 24.04 container 2026-09-17; the same script version on the host
+  # picked bash and passed, which is why it looked like a container bug.
+  #
+  # A file rather than a nested quoted string: this is three levels of quoting
+  # (test → script → shell) and the previous one-liner was already at the limit.
+  cat > "$probe" <<PROBE
+export LOG_DEVICE=/dev/pts/999
+source '$OOSH_DIR/log' >/dev/null 2>&1
+[ "\$LOG_DEVICE" = "\$(tty)" ] && echo STALE_REFRESHED
+export LOG_DEVICE='$capfile'
+source '$OOSH_DIR/log' >/dev/null 2>&1
+[ "\$LOG_DEVICE" = '$capfile' ] && echo FILE_KEPT
+PROBE
+  local out
+  out=$(script -qec "bash $probe" /dev/null 2>/dev/null | tr -d '\r')
+  rm -f "$probe"
+  rm -f "$capfile"
+  if echo "$out" | grep -q STALE_REFRESHED && echo "$out" | grep -q FILE_KEPT; then
+    create.result 0 "stale terminal refreshed, explicit file kept"
+  else
+    create.result 1 "D4 guard wrong: $out"
+  fi
+}
+# Skip-guard OUTSIDE the case (docs/python.md § Tests that exercise the Python
+# paths): needs util-linux `script -qec` for a pty. Inside the function the
+# skip returned a string the expect does not match, so it was scored as a
+# FAIL on the alpine platform run (2026-09-15).
+# portability-exception: this is the CAPABILITY PROBE for util-linux `script`,
+# not a use of it to run test code — the command is the shell builtin `true`,
+# so which shell runs it cannot matter. BSD/macOS `script` has no -e/-c, so the
+# probe fails there and T50 skips, which is the portable outcome.
+if command -v script >/dev/null 2>&1 && script -qec 'true' /dev/null >/dev/null 2>&1; then
+test.case - "T50: live terminal wins over stale LOG_DEVICE, explicit file respected" \
+  test.log.liveTtyWinsOverStale
+expect 0 "stale terminal refreshed, explicit file kept" \
+  "log refreshes a stale terminal device but respects an explicit non-terminal one"
+else
+  expect.pass "T50 skipped: no util-linux script / pty on this host"
+fi
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 cleanup.testFiles
+
+### test.method
 
 test.suite.save.results

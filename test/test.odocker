@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # Test suite for odocker - OOSH Docker wrapper
+# Tests: ps, list, exec, workspace.get/set/init/list, lifecycle, completions
+TEST_CATEGORY=core
 
 source test.suite $*
+
+# The first file the runner's shared-tier guard caught (2026-09-16). This file
+# writes $CONFIG_PATH/user.env and odocker.env directly — the site-wide
+# sharedConfig every user sources at login — via odocker.workspace.set's
+# persistence trio. Isolate before anything sources odocker: `odocker` runs
+# `config get` at SOURCE time, so the anchors have to be moved first.
+test.suite.config.isolate test.odocker >/dev/null || exit 1
 
 level=1
 
@@ -71,7 +80,16 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test: ODOCKER_WORKSPACES resolves to an existing directory
+# Source the script under test
+# ─────────────────────────────────────────────────────────────────────────────
+# This header used to read "Test: ODOCKER_WORKSPACES resolves to an existing
+# directory" and had no assertion under it — ever. Its body is one `source`.
+# It was the orphaned title of the host-tree block further down, which is now a
+# fixture test here and a platform test in
+# test/test.platform.odocker.workspaces.invariant.
+#
+# odocker resolves ODOCKER_WORKSPACES at SOURCE time (odocker:21-22), which is
+# why test.suite.config.isolate runs at the top of this file, before this line.
 # ─────────────────────────────────────────────────────────────────────────────
 source $OOSH_DIR/odocker 2>/dev/null
 
@@ -127,34 +145,62 @@ for method in container.remove image.remove rm rmi; do
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test: ODOCKER_WORKSPACES directory check
+# Test: the workspace enumerator, against a FIXTURE
 # ─────────────────────────────────────────────────────────────────────────────
-if [ -d "$ODOCKER_WORKSPACES" ]; then
-  expect.pass "ODOCKER_WORKSPACES directory exists: $ODOCKER_WORKSPACES"
+# What used to live here asserted that THIS MACHINE has
+# /var/dev/EAMD.ucp/…/DockerWorkspaces, and that four named platform Dockerfiles
+# sit inside it. That tree belongs to a DIFFERENT repository
+# (donges/eamd.ucp.git) — no Dockerfile ships with oosh at all — so a fresh
+# install can never satisfy it. `os platform.test` runs `test.suite core 1` four
+# times inside a container with no /var/dev (os:341,352,380,392), so those six
+# assertions were six failures × four users on every gate.
+#
+# The question they were really asking — "can this machine build platform
+# images?" — is a real one and is KEPT, in
+# test/test.platform.odocker.workspaces.invariant, where a host-dependent
+# assertion belongs. TEST_CATEGORY=platform exists for exactly this.
+#
+# What belongs HERE is the CODE. private.odocker.workspace.list (odocker:167)
+# globs one level and two levels deep and must emit only directories that
+# actually contain a Dockerfile. A fixture pins all three properties on any
+# machine. The names are synthetic on purpose: every real platform workspace is
+# two levels deep, so using them would leave the one-level glob and the
+# no-Dockerfile case untested.
+test.odocker.workspaceListFixture() { # # build a throwaway workspaces root, enumerate it, echo the sorted result
+  local fixture
+  fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.odocker.ws.XXXXXX") || return 1
+  # `odocker workspace.init`, not a bare `mkdir -p`: it is the tree's own
+  # creating verb (odocker:24, from backlog item 8) and nothing outside a test
+  # had ever called it. It persists the value too — harmless here because this
+  # runs inside the fixture config that test.suite.config.isolate set up at the
+  # top of this file, and because the caller consumes us through $( ), so the
+  # export cannot escape into the next test either.
+  odocker.workspace.init "$fixture" >/dev/null 2>&1
+  mkdir -p "$fixture/solo" "$fixture/family/1.0" "$fixture/decoy/1.0"
+  : > "$fixture/solo/Dockerfile"
+  : > "$fixture/family/1.0/Dockerfile"
+  # decoy/1.0 deliberately has NO Dockerfile. Nothing pinned that exclusion
+  # before, and it is the whole point of the `[ -f "$dir/Dockerfile" ]` test in
+  # the enumerator.
+  ODOCKER_WORKSPACES="$fixture" private.odocker.workspace.list 2>/dev/null | sort | tr '\n' ' '
+  rm -rf "$fixture" 2>/dev/null
+}
+_WS_LISTED=$(test.odocker.workspaceListFixture)
+test.case - "T-WS-LIST: the enumerator finds one- and two-level workspaces, and only those with a Dockerfile" \
+  test "$_WS_LISTED" = "family/1.0 solo "
+if [ "$_WS_LISTED" = "family/1.0 solo " ]; then
+  expect.pass "enumerated exactly: $_WS_LISTED"
 else
-  expect.fail "ODOCKER_WORKSPACES directory not found: $ODOCKER_WORKSPACES"
+  expect.fail "expected [family/1.0 solo ], got [$_WS_LISTED] — private.odocker.workspace.list (odocker:167) globs */ and */*/ and must skip a directory with no Dockerfile"
 fi
+unset _WS_LISTED
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Test: workspace completion returns results
-# ─────────────────────────────────────────────────────────────────────────────
-RESULT=$(private.odocker.workspaces 2>/dev/null)
-if [ -n "$RESULT" ]; then
-  expect.pass "workspace completion returns results"
-else
-  expect.fail "workspace completion returned empty — ODOCKER_WORKSPACES may be misconfigured"
-fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Test: must-pass platform workspaces have Dockerfiles
-# ─────────────────────────────────────────────────────────────────────────────
-for ws in nakedUbuntu/24.04 nakedDebian/12 nakedAlma/9.sshd nakedAlpine/3.19; do
-  if [ -f "$ODOCKER_WORKSPACES/$ws/Dockerfile" ]; then
-    expect.pass "$ws/Dockerfile exists"
-  else
-    expect.fail "$ws/Dockerfile not found in $ODOCKER_WORKSPACES"
-  fi
-done
+# The `[ -d "$ODOCKER_WORKSPACES" ]` assertion that used to sit here is not
+# replaced by a new one: backlog item 8 already pinned that behaviour properly,
+# in the verb that owns it. See T-WS-GET-CANDIDATE-MISSING / -CANDIDATE-REAL /
+# -BROKEN-ROOT below — `odocker workspace.get` answers "is this root usable" for
+# a path that is there and one that is not. A second, weaker copy up here would
+# only be a way of asking the same question twice.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: image name derivation for must-pass platforms
@@ -166,7 +212,11 @@ declare -A _WS_EXPECT=(
   ["nakedAlpine/3.19"]="naked_alpine_3_19"
 )
 for ws in "${!_WS_EXPECT[@]}"; do
-  RESULT=$(private.odocker.image.from.workspace "$ws")
+  # `private.odocker.image.from.workspace` does not exist either — the helper is
+  # `private.odocker.image.resolve.from.workspace` (odocker:129). Second dead
+  # name in this file, and these four assertions had been failing on it since
+  # they were written, invisible because the file scored 0 / 0.
+  RESULT=$(private.odocker.image.resolve.from.workspace "$ws")
   if [ "$RESULT" = "${_WS_EXPECT[$ws]}" ]; then
     expect.pass "image name $ws → $RESULT"
   else
@@ -269,10 +319,16 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: odocker.reset completion function exists
 # ─────────────────────────────────────────────────────────────────────────────
-if type odocker.reset.completion.image >/dev/null 2>&1; then
-  expect.pass "odocker.reset.completion.image is defined"
+# c2 resolves a parameter completion as `$class.$method.completion.$parameter`
+# and THEN `$class.parameter.completion.$parameter` (ng/c2:483,518), and
+# test.completion.audit accepts either. Demanding the method-specific form was
+# stricter than the project's own standard: odocker.parameter.completion.image
+# has always covered this, so `odocker reset <TAB>` works today.
+if type odocker.reset.completion.image >/dev/null 2>&1 \
+   || type odocker.parameter.completion.image >/dev/null 2>&1; then
+  expect.pass "odocker reset's <image> has a completion"
 else
-  expect.fail "odocker.reset.completion.image should be defined"
+  expect.fail "odocker reset's <image> has no completion in either form"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,10 +404,16 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: odocker.enter completion function exists
 # ─────────────────────────────────────────────────────────────────────────────
-if type odocker.enter.completion.container >/dev/null 2>&1; then
-  expect.pass "odocker.enter.completion.container is defined"
+# c2 resolves a parameter completion as `$class.$method.completion.$parameter`
+# and THEN `$class.parameter.completion.$parameter` (ng/c2:483,518), and
+# test.completion.audit accepts either. Demanding the method-specific form was
+# stricter than the project's own standard: odocker.parameter.completion.container
+# has always covered this, so `odocker enter <TAB>` works today.
+if type odocker.enter.completion.container >/dev/null 2>&1 \
+   || type odocker.parameter.completion.container >/dev/null 2>&1; then
+  expect.pass "odocker enter's <container> has a completion"
 else
-  expect.fail "odocker.enter.completion.container should be defined"
+  expect.fail "odocker enter's <container> has no completion in either form"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,10 +430,16 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: odocker.create completion function exists
 # ─────────────────────────────────────────────────────────────────────────────
-if type odocker.create.completion.image >/dev/null 2>&1; then
-  expect.pass "odocker.create.completion.image is defined"
+# c2 resolves a parameter completion as `$class.$method.completion.$parameter`
+# and THEN `$class.parameter.completion.$parameter` (ng/c2:483,518), and
+# test.completion.audit accepts either. Demanding the method-specific form was
+# stricter than the project's own standard: odocker.parameter.completion.image
+# has always covered this, so `odocker create <TAB>` works today.
+if type odocker.create.completion.image >/dev/null 2>&1 \
+   || type odocker.parameter.completion.image >/dev/null 2>&1; then
+  expect.pass "odocker create's <image> has a completion"
 else
-  expect.fail "odocker.create.completion.image should be defined"
+  expect.fail "odocker create's <image> has no completion in either form"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -389,20 +457,25 @@ else
 fi
 
 # Test up/down require parameter
-test.case $level "odocker.up requires parameter" \
+# `up` and `down` with no argument do NOT fail — they deliberately print their
+# usage line and then list the containers (and, for `up`, the images) so you can
+# pick one, and return 0 (odocker:1130-1139, :1222-1229). These two assertions
+# demanded rc 1, which would mean deleting that picker. The contract being
+# asserted is the real one: a usage line, a listing, and success.
+test.case $level "odocker.up with no argument shows the picker" \
   odocker up
-if [ "$RETURN_VALUE" -eq 1 ]; then
-  expect.pass "odocker up without args exits 1"
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "odocker up without args lists what can be started, exits 0"
 else
-  expect.fail "odocker up without args exits $RETURN_VALUE (expected 1)"
+  expect.fail "odocker up without args exits $RETURN_VALUE (expected 0 — it shows a picker)"
 fi
 
-test.case $level "odocker.down requires parameter" \
+test.case $level "odocker.down with no argument shows the picker" \
   odocker down
-if [ "$RETURN_VALUE" -eq 1 ]; then
-  expect.pass "odocker down without args exits 1"
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "odocker down without args lists what can be stopped, exits 0"
 else
-  expect.fail "odocker down without args exits $RETURN_VALUE (expected 1)"
+  expect.fail "odocker down without args exits $RETURN_VALUE (expected 0 — it shows a picker)"
 fi
 
 rm -rf "$_COMPOSE_DIR"
@@ -473,7 +546,9 @@ fi
 # "Directory not found", which is also expected).
 # Saves + restores real config so the test is non-destructive.
 # ─────────────────────────────────────────────────────────────────────────────
-_WS_DEFAULT="/var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces"
+# Read the default from the script rather than repeating the literal — a
+# duplicated path silently stops testing the real default the day it changes.
+_WS_DEFAULT="$ODOCKER_WORKSPACES_DEFAULT"
 _WS_DEFAULT_EXISTS=0
 [ -d "$_WS_DEFAULT" ] && _WS_DEFAULT_EXISTS=1
 
@@ -804,4 +879,175 @@ fi
 ODOCKER_WORKSPACES="$_WS_ORIG_VAR"
 rm -rf "$_WS_TMP" "$_WS_TMP2"
 
-### test.method
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-WS-INIT-*: odocker.workspace.init
+# ─────────────────────────────────────────────────────────────────────────────
+# `workspace.set` rejects a missing directory on purpose, so a typo cannot
+# persist a path that is not there. `init` is the verb allowed to create, and
+# it delegates everything else — canonicalisation and the persistence trio —
+# to `set`, so there is one definition of each.
+#
+# CONFIG_PATH is already pointed at this file's fixture (line 11), so the
+# persistence assertions below read the fixture's odocker.env, never the
+# shared tier.
+_WS_INIT_TMP=$(test.suite.fixture.make test.odocker.wsinit)
+_WS_INIT_SAVED="$ODOCKER_WORKSPACES"
+
+test.odocker.workspaceInitCreates() {
+  local target="$_WS_INIT_TMP/created"
+  odocker.workspace.init "$target" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "init returned $rc"
+  elif [ ! -d "$target" ]; then
+    create.result 1 "the directory was not created"
+  elif [ "$ODOCKER_WORKSPACES" != "$target" ]; then
+    create.result 1 "ODOCKER_WORKSPACES is '$ODOCKER_WORKSPACES', expected $target"
+  elif ! grep -q "^export ODOCKER_WORKSPACES=" "$CONFIG_PATH/odocker.env" 2>/dev/null; then
+    create.result 1 "nothing persisted to \$CONFIG_PATH/odocker.env"
+  else
+    create.result 0 "created and persisted"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-INIT-CREATES: init creates a missing directory, sets it, and persists it" \
+  test.odocker.workspaceInitCreates
+expect 0 "created and persisted" "the card's Done when: create, canonicalise, and land in odocker.env"
+
+test.odocker.workspaceInitIdempotent() {
+  local target="$_WS_INIT_TMP/created"
+  odocker.workspace.init "$target" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -eq 0 ] && [ -d "$target" ]; then
+    create.result 0 "second call is a no-op"
+  else
+    create.result 1 "rc=$rc dir=$([ -d "$target" ] && echo yes || echo no)"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-INIT-IDEMPOTENT: a second init on an existing root succeeds and changes nothing" \
+  test.odocker.workspaceInitIdempotent
+expect 0 "second call is a no-op" "mkdir -p is idempotent, which is what makes the verb safe to re-run"
+
+test.odocker.workspaceInitUnwritable() {
+  # The negative control the card asks for: it must FAIL, not fail silently.
+  # /proc is present and unwritable on every Linux host; the guard has to stop
+  # here rather than fall through to workspace.set's "Directory not found".
+  odocker.workspace.init "/proc/odocker-test-nope/deeper" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success for a directory it could not create"
+  elif [ "$ODOCKER_WORKSPACES" = "/proc/odocker-test-nope/deeper" ]; then
+    create.result 1 "it persisted a path it could not create"
+  else
+    create.result 0 "refused"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-INIT-UNWRITABLE: an unwritable parent is a loud failure" \
+  test.odocker.workspaceInitUnwritable
+expect 0 "refused" "silently not creating the workspaces root is how a build fails an hour later"
+
+export ODOCKER_WORKSPACES="$_WS_INIT_SAVED"
+rm -rf "$_WS_INIT_TMP"
+unset _WS_INIT_TMP _WS_INIT_SAVED
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-WS-GET-*: odocker.workspace.get
+# ─────────────────────────────────────────────────────────────────────────────
+# Two defects, both of which these assertions start red against the old code.
+# It declared no parameters and SILENTLY DISCARDED one — `$1` appeared nowhere
+# in its body — so `workspace.get /some/path` echoed the old value and exited
+# 0. And it never checked the root existed, so it reported a directory that was
+# not there while `workspace.list` and `build` failed against it.
+_WS_GET_TMP=$(test.suite.fixture.make test.odocker.wsget)
+_WS_GET_SAVED="$ODOCKER_WORKSPACES"
+
+test.odocker.workspaceGetHonoursArgument() {
+  # THE assertion the card is about. The argument must change the answer.
+  export ODOCKER_WORKSPACES="$_WS_GET_TMP"
+  local out
+  out=$(odocker.workspace.get "$_WS_GET_TMP/other" 2>/dev/null | head -1)
+  mkdir -p "$_WS_GET_TMP/other"
+  out=$(odocker.workspace.get "$_WS_GET_TMP/other" 2>/dev/null | head -1)
+  if [ "$out" = "$_WS_GET_TMP/other" ]; then
+    create.result 0 "argument honoured"
+  else
+    create.result 1 "got '$out', expected $_WS_GET_TMP/other — the argument was ignored"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-GET-ARGUMENT: get reports the path it was given, not the current root" \
+  test.odocker.workspaceGetHonoursArgument
+expect 0 "argument honoured" "it used to discard \$1 entirely and echo the old value"
+
+test.odocker.workspaceGetRejectsMissingCandidate() {
+  odocker.workspace.get "$_WS_GET_TMP/nope" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 0 "missing candidate refused"
+  else
+    create.result 1 "it reported a nonexistent path as usable"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-GET-CANDIDATE-MISSING: a path that is not there is reported unusable" \
+  test.odocker.workspaceGetRejectsMissingCandidate
+expect 0 "missing candidate refused" "get is the verb you run when a build fails; it has to be able to say no"
+
+test.odocker.workspaceGetAcceptsRealCandidate() {
+  # The positive half, so the negative one above cannot pass by always failing.
+  mkdir -p "$_WS_GET_TMP/real"
+  odocker.workspace.get "$_WS_GET_TMP/real" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 0 "real candidate accepted"
+  else
+    create.result 1 "rc=$rc for a directory that exists"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-GET-CANDIDATE-REAL: a path that exists is reported usable" \
+  test.odocker.workspaceGetAcceptsRealCandidate
+expect 0 "real candidate accepted" "the control for the refusal above"
+
+test.odocker.workspaceGetFailsOnBrokenRoot() {
+  # The second defect: the reporter used to disagree with every consumer.
+  export ODOCKER_WORKSPACES="$_WS_GET_TMP/removed"
+  odocker.workspace.get >/dev/null 2>&1
+  local rc=$?
+  export ODOCKER_WORKSPACES="$_WS_GET_TMP"
+  if [ "$rc" -ne 0 ]; then
+    create.result 0 "broken root reported"
+  else
+    create.result 1 "it reported a root that is not there as fine"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-GET-BROKEN-ROOT: get fails when the CURRENT root is not there" \
+  test.odocker.workspaceGetFailsOnBrokenRoot
+expect 0 "broken root reported" "workspace.list and build already fail on this; the reporter used to disagree"
+
+test.odocker.workspaceGetReportsCurrentRoot() {
+  # The regression guard: the healthy no-argument output is unchanged.
+  export ODOCKER_WORKSPACES="$_WS_GET_TMP"
+  local out rc
+  out=$(odocker.workspace.get 2>/dev/null | head -1)
+  rc=$?
+  if [ "$out" = "$_WS_GET_TMP" ] && [ "$rc" -eq 0 ]; then
+    create.result 0 "current root reported"
+  else
+    create.result 1 "got '$out' rc=$rc"
+  fi
+  return $(result)
+}
+test.case $level "T-WS-GET-CURRENT: with no argument it still reports the current root" \
+  test.odocker.workspaceGetReportsCurrentRoot
+expect 0 "current root reported" "the healthy output is byte-identical to before the change"
+
+export ODOCKER_WORKSPACES="$_WS_GET_SAVED"
+rm -rf "$_WS_GET_TMP"
+unset _WS_GET_TMP _WS_GET_SAVED### test.method
+
+test.suite.save.results

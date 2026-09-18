@@ -19,7 +19,7 @@ Distilled from `oosh-architecture.md`, `log.md`, `state.md`, `config.md`, `oo.md
 6. **Config** — use `config.init`, `config save`, `config get`. Never hardcode paths; rely on `$CONFIG`, `$CONFIG_PATH`. Exclude per-user dynamic vars from shared configs.
 7. **State machine** — owns all multi-step install logic. Each state has `private.check.<stateName>()`. Return 0 success, non-zero fail (halts machine).
 8. **Idempotency** — detect-don't-suppress. Probe before write. `if ! ossh.config.get <alias>; then create…`.
-9. **Helper extraction** — use `oo.new.method` or mirror its pattern (signature + docstring + completion). Not inline heredocs.
+9. **Helper extraction** — use `oo.method.new` or mirror its pattern (signature + docstring + completion). Not inline heredocs.
 10. **Env reset for user switching** — explicit `export HOME=<target>; export USER=<target>; unset CONFIG CONFIG_PATH` + dispatch. Not `bash -lc` (bashrcTemplate early-returns for non-interactive).
 11. **Guards are not substitutes for root-cause fixes** — symptom-fixes like `[ -w ]` gates are temporary; root-cause solutions follow.
 

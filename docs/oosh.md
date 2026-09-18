@@ -136,8 +136,8 @@ debug.log "message"    # Level 5
 
 ```bash
 ./oo new myscript              # Create script from template
-./oo new.method myscript.foo   # Add method
-./oo new.test myscript         # Create test file
+./oo method.new myscript.foo   # Add method
+./oo test.new myscript         # Create test file
 ```
 
 ---

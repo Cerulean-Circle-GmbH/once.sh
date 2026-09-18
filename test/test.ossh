@@ -922,6 +922,71 @@ else
   expect.pass "ossh.prereqs.install no longer contains platform install logic (lives in init/oosh)"
 fi
 
+# T-OSSH-PREREQS-LOCAL-NAMES-TOOL : local mode runs oo.cmd IN-PROCESS (oo is
+# sourced), so a prereq that did not land is reported by NAME, once, and the
+# install continues (rc 0). 8d1617c shipped `verify: /root/config/user.env` on
+# every platform — someone else's $RESULT — because its verify ran as a
+# subprocess and the reason never crossed back.
+test.ossh.prereqs.local.stub() { # <stubDir> # a PATH with the coreutils the scripts need, a fake PM that logs its argv, and NO rsync / tree
+  local b p
+  for b in bash sh sed grep awk date tee mkdir cat find dirname basename id tty stat hostname uname readlink tr cut ls wc ln rm mv cp touch sort head tail printf env getent whoami realpath ps; do
+    p=$(type -P "$b" 2>/dev/null) && ln -s "$p" "$1/$b"
+  done
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$PM_LOG"' 'exit 0' > "$1/fakepm"
+  chmod +x "$1/fakepm"
+}
+
+test.ossh.prereqs.local.run() { # <stubDir> # ossh.prereqs.install (local) in a pinned child; echoes its output plus a final rc= line
+  # TEST_OSSH_PREREQS_OVERRIDE, when set, is spliced in after ossh is sourced
+  # (the negative control below plants the pre-fix symptom with it).
+  env -i PATH="$1" HOME="$HOME" OOSH_DIR="$OOSH_DIR" TERM=dumb LOG_LEVEL=2 LOG_DEVICE=/proc/self/fd/1 SUDO="" \
+      OOSH_PM="fakepm install" PM_LOG="$1/pm.calls" \
+      CONFIG_PATH="$CONFIG_PATH" CONFIG="$CONFIG" CONFIG_FILE="$CONFIG_FILE" \
+      bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1
+               '"${TEST_OSSH_PREREQS_OVERRIDE:-:}"'
+               ossh.prereqs.install 2>&1; echo "rc=$?"' | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+test.ossh.prereqsLocalNamesTool() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.ossh.prereqs.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.ossh.prereqs.local.stub "$stub"
+  local out; out=$(test.ossh.prereqs.local.run "$stub")
+  local calls=""; [ -f "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
+  rm -rf "$stub"
+  local tool missing=""
+  for tool in rsync tree; do
+    [ "$(echo "$out" | grep -c "WARNING> ossh.prereqs.install: continuing without $tool")" = "1" ] || missing="$missing $tool"
+  done
+  if ! echo "$out" | grep -q '^rc=0$'; then
+    create.result 1 "local mode must continue (rc 0) — got: $(echo "$out" | grep '^rc=')"
+  elif [ -n "$missing" ]; then
+    create.result 1 "warning does not name the tool (exactly once) for:$missing — warnings: $(echo "$out" | grep WARNING | tr '\n' '|')"
+  elif [ "${calls#*install rsync}" = "$calls" ] || [ "${calls#*install tree}" = "$calls" ]; then
+    create.result 1 "the package manager was not asked for both tools: [$calls]"
+  else
+    create.result 0 "each missing prereq is named once, install continues"
+  fi
+  return $(result)
+}
+test.case $level "T-OSSH-PREREQS-LOCAL-NAMES-TOOL: a prereq that did not land is named, once, and the install continues" \
+  test.ossh.prereqsLocalNamesTool
+expect 0 "each missing prereq is named once, install continues" \
+  "8d1617c reported someone else's \$RESULT (verify: /root/config/user.env) because the verify ran out of process"
+
+# Negative control: plant the pre-fix symptom — a warning that carries a stale
+# $RESULT instead of the tool — and require the test above to go red on it.
+test.case $level "T-OSSH-PREREQS-LOCAL-CONTROL: a warning carrying someone else's \$RESULT is caught" \
+  echo "(negative control: plant the 8d1617c symptom, expect the test above to catch it)"
+TEST_OSSH_PREREQS_OVERRIDE='warn.log() { echo "WARNING> ossh.prereqs.install verify: /root/config/user.env"; }'
+test.ossh.prereqsLocalNamesTool; _ctlRc=$?; _ctlRes="$RESULT"
+unset TEST_OSSH_PREREQS_OVERRIDE
+if [ "$_ctlRc" -ne 0 ] && [ "${_ctlRes#warning does not name the tool}" != "$_ctlRes" ]; then
+  expect.pass "control caught: warning does not name the tool"
+else
+  expect.fail "planted stale-\$RESULT warning NOT caught (rc=$_ctlRc RESULT=[$_ctlRes])"
+fi
+
 # T-OSSH-CMD-PREFLIGHT-NOT-SILENCED : ossh.cmd's apt-get update preflight must
 # NOT redirect stdout/stderr — that hides sudo password prompts on remotes
 # without NOPASSWD configured, leaving the install to hang silently.
@@ -1172,4 +1237,58 @@ else
   expect.fail "private.ossh.folder.fix.scan.git.remotes not defined"
 fi
 
+# ============================================================================
+# T-INSTALL-SSH-BACKUP-*: the backup call sites, after item 6
+# ============================================================================
+# Both guards used to test the ABSOLUTE $HOME/ssh.<name> while user.ssh.backup
+# wrote the CWD-RELATIVE ./ssh.<name>, so neither could ever be satisfied and
+# both fired on every install. And `.for.` named the host the directory was
+# already sitting on, because the install runs ON the target.
+test.ossh.installContinueLocalBackupCallSites() {
+  local body
+  body=$(declare -f ossh.install.continue.local 2>/dev/null)
+  if [ -z "$body" ]; then
+    create.result 1 "ossh.install.continue.local is not defined"
+    return $(result)
+  fi
+  local code
+  code=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*#')
+  if printf '%s\n' "$code" | grep -q '\.for\.'; then
+    create.result 1 "the .for. name is still constructed"
+  elif printf '%s\n' "$code" | grep -q 'ssh\.original'; then
+    create.result 1 "the ssh.original backup is still here — state 31 owns it now"
+  elif printf '%s\n' "$code" | grep -q 'check dir \$HOME/ssh\.'; then
+    create.result 1 "a guard on \$HOME/ssh.<name> survives, and it can never be satisfied"
+  elif ! printf '%s\n' "$code" | grep -q 'ssh\.backup pre-user-init'; then
+    create.result 1 "the pre-user-init snapshot is gone entirely"
+  else
+    create.result 0 "one labelled snapshot"
+  fi
+  return $(result)
+}
+test.case $level "T-INSTALL-SSH-BACKUP-CALLSITES: one labelled snapshot, no .for. name, no unsatisfiable guard" \
+  test.ossh.installContinueLocalBackupCallSites
+expect 0 "one labelled snapshot" "the guard tested an absolute path while the writer wrote a relative one"
+
+# The snapshot only means anything if it happens BEFORE user init, which is
+# what writes the WODA Host aliases into ~/.ssh/config.
+test.ossh.backupPrecedesUserInit() {
+  local body backupLine initLine
+  body=$(declare -f ossh.install.continue.local 2>/dev/null | grep -v '^[[:space:]]*#')
+  backupLine=$(printf '%s\n' "$body" | grep -n 'ssh\.backup pre-user-init' | head -1 | cut -d: -f1)
+  # `declare -f` normalises the body and appends a `;` to each statement, so
+  # the pattern must tolerate one.
+  initLine=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*user init[[:space:]]*;?[[:space:]]*$' | head -1 | cut -d: -f1)
+  if [ -z "$backupLine" ] || [ -z "$initLine" ]; then
+    create.result 1 "backupLine=[$backupLine] initLine=[$initLine] — one of them is missing"
+  elif [ "$backupLine" -ge "$initLine" ]; then
+    create.result 1 "the snapshot is at $backupLine, user init at $initLine — too late"
+  else
+    create.result 0 "snapshot first"
+  fi
+  return $(result)
+}
+test.case $level "T-INSTALL-SSH-BACKUP-ORDER: the snapshot precedes user init" \
+  test.ossh.backupPrecedesUserInit
+expect 0 "snapshot first" "user init writes the three WODA Host aliases into ~/.ssh/config"
 test.suite.save.results

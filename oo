@@ -5,18 +5,6 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
-# Cross-platform sed helper for first-match replacement
-# BSD sed (macOS) doesn't support GNU's 0,/pattern/ syntax
-# Uses perl which is available on both platforms
-private.oo.sed.first() {
-  local pattern="$1"
-  local replacement="$2"
-  local file="$3"
-  # Escape special chars in replacement for perl
-  local escapedReplacement=$(printf '%s' "$replacement" | sed 's/[&/\]/\\&/g')
-  perl -i -pe "s/\Q${pattern}\E/${escapedReplacement}/ && (\$done = 1) unless \$done" "$file"
-}
-
 oo.deinstall() { # # deinstall oosh and clean leftover configurations
   problem.log "DEINSTALL OOSH: are you sure?  continue with by typing 'c'"
   cp $OOSH_DIR/init/oosh $HOME/install.oosh
@@ -72,10 +60,10 @@ private.oo.new.test() # <newClassName> # creates a new test script for the class
   fi
 }
 
-oo.method.new() # <newScript.newMethod> # creates a new method in the script newScript
+oo.method.new() # <newScript.newMethod> # creates a new method in a script; a private.someScript.someVerb name goes into someScript
 { private.oo.new.method "$@"; }
 
-private.oo.new.method()   # <newScript.newMethod> # creates a new method in the script newScript
+private.oo.new.method()   # <newScript.newMethod> # creates a new method in a script; a private.someScript.someVerb name goes into someScript
 # this is an higly interactive command
 {
   local name="$1"
@@ -83,86 +71,177 @@ private.oo.new.method()   # <newScript.newMethod> # creates a new method in the 
     error.log "No parameter provided."
     return 1
   fi
-  local newScript=$(echo $name | cut -d. -f1)
-  local newMethod=$(echo $name | cut -d. -f2)
-  
-  if [ -z "$newMethod" ]; then
-    warn.log "check if the parameter contains a ."
-    error.lgo "no method name in: $name:"
+  # EVERY segment after the first is the method name. `cut -d. -f2` took only
+  # the second, so `config.env.init` generated `config.env()` and dropped
+  # `.init` silently. Deep hierarchy is explicitly blessed — see
+  # docs/oosh-architecture.md, `hiveMind.team.context.status()`.
+  #
+  # A PRIVATE method is named `private.<script>.<verb>`, so the SCRIPT it
+  # belongs to is the SECOND segment. Splitting on the first sent
+  # `oo method.new private.config.variables.list` at a file called `private`
+  # and refused with rc 3 — measured. The comment this replaces already knew
+  # ("`private.oo.cmd.verify` aimed at a file called `private`") and fixed
+  # only the deep-hierarchy half. Private methods are a large share of every
+  # script in the tree, so until now the tool the project MANDATES could not
+  # create a single one of them and every private method was hand-written.
+  #
+  # Two names, because they are two things and conflating them is the bug:
+  #   functionName — the DOTTED NAME the function gets: private.config.x.y
+  #   newScript    — the FILE it is written into: config
+  # They differ only for private methods.
+  local functionName="$name" nameBody="$name"
+  case "$name" in
+    private.*) nameBody="${name#private.}" ;;
+  esac
+  # The boundary between SCRIPT and METHOD is not "the first dot". `test.suite`
+  # is a script whose own NAME contains one, so `${nameBody%%.*}` resolved
+  # `test.suite.portability.validate` to `test` — a DIRECTORY — and the
+  # insertion had nowhere to go. Take the LONGEST leading prefix that names a
+  # file which EXISTS: the only rule that separates `test.suite.x` from
+  # `config.x` without keeping a list of special cases.
+  local newScript="" newMethod="" candidate="$nameBody"
+  while [ "$candidate" != "${candidate%.*}" ]; do
+    candidate="${candidate%.*}"
+    if [ -f "$OOSH_DIR/$candidate" ]; then
+      newScript="$candidate"
+      newMethod="${nameBody#$candidate.}"
+      break
+    fi
+  done
+  # Nothing on disk matched — a brand-new script, or a typo. Fall back to the
+  # historical first-segment split so the error below names what the caller
+  # typed rather than something derived from it.
+  if [ -z "$newScript" ]; then
+    newScript="${nameBody%%.*}"
+    newMethod="${nameBody#*.}"
+  fi
+
+  if [ -z "$newMethod" ] || [ "$newMethod" = "$nameBody" ]; then
+    error.log "no method name in '$name' — expected <script>.<method>, e.g. config.env.init"
     return 2
   fi
   console.log "
   command: $newScript
-  method : $newMethod
+  method : $functionName
   "
 
   if check file $OOSH_DIR/$newScript exists fix error.log "$OOSH_DIR/$newScript does not exist"
   then
-    local tweakedMethod=$(cat $OOSH_DIR/templates/code/newMethod | sed 's/newScript/'"$newScript"'/' | sed 's/newMethod/'"$newMethod"'/')
-    local replaceText="### new.method"
+    # Ask BEFORE touching the file, and put the answers in the DOCSTRING.
+    # The docstring is the single source: this.help renders it and c2
+    # completes from it (docs/first-principles.md — "defined only once, in the
+    # code itself"). The tool used to ship the template's placeholder
+    # unchanged and write the typed text into the usage TABLE instead, so
+    # every generated method was born with no metadata at all.
+    local methodParameter methodDescription
+    echo "Parameters for $functionName — e.g. <branch> <?force:no> — empty for none:"
+    read methodParameter
+    echo "One-line description of $functionName:"
+    read methodDescription
 
-    replace within "$OOSH_DIR/$newScript" "$replaceText" by "$tweakedMethod"
+    local tweakedMethod=$(cat $OOSH_DIR/templates/code/newMethod | sed 's/newScript\.newMethod/'"$functionName"'/')
 
+    # The pattern MUST be quoted inside ${var/pattern/replacement}: unquoted,
+    # a leading '#' is not matched literally and the substitution silently
+    # does nothing.
+    local placeholder="# parameters # method description # an example"
+    local docstring="# ${methodParameter} # ${methodDescription} #"
+    tweakedMethod="${tweakedMethod/"$placeholder"/"$docstring"}"
 
-    local replaceNameDesc="      ----      --------------------------"
-    local newNameDesc="      ----      --------------------------
-      ----      --------------------------"
+    # A method without its completion function is broken by the project's own
+    # definition (docs/oosh-architecture.md, Method Structure Standard): it
+    # will not tab-complete. The template emits none, so the tool must.
+    # Inserted BEFORE the trailing marker, which the template carries so the
+    # next insertion has somewhere to go.
+    #
+    # EXCEPT for a private method. It is never dispatched from the command
+    # line, so a completion function for it is dead code that nothing will
+    # ever call — and test/test.completion.audit skips `private*` for exactly
+    # that reason. Generating one would only invite it to be hand-deleted.
+    local stubs=""
+    case "$functionName" in
+      private.*) ;;
+      *) stubs=$(private.oo.method.stubs.get "$functionName" "$methodParameter") ;;
+    esac
+    tweakedMethod="${tweakedMethod/"### new.method"/"$stubs
+### new.method"}"
 
-    replace within "$OOSH_DIR/$newScript.new" "$replaceNameDesc" by "$newNameDesc"
-
-    private.oo.sed.first "----" "$newMethod" "$OOSH_DIR/$newScript.new"
-
-    local descriptParameter
-    echo "A short description and Parameter(s) for method" $newMethod "of" $newScript": "
-    read descriptParameter
-    echo "$descriptParameter"
-
-    private.oo.sed.first "--------------------------" "$descriptParameter" "$OOSH_DIR/$newScript.new"
-
-    replace commit "$OOSH_DIR/$newScript"
-
-    replace cleanup "$OOSH_DIR/$newScript"
-
-    success.log "created oo new method in script $1"
-    
+    # `replace line`, not `replace within`: the marker must match a WHOLE line
+    # and exactly one of them. `replace within` matches a substring on every
+    # line, and the marker text also appears in this very function's source a
+    # few lines above — running the tool against `oo` itself corrupted it.
+    if replace line "$OOSH_DIR/$newScript" "### new.method" by "$tweakedMethod" \
+       && replace commit "$OOSH_DIR/$newScript"; then
+      replace cleanup "$OOSH_DIR/$newScript"
+      success.log "created method $functionName in $OOSH_DIR/$newScript"
+    else
+      # Deliberately no `replace commit` on this path. It used to run
+      # unconditionally, and committing with no working copy left the script
+      # with no file under its own name.
+      error.log "could not insert $functionName — $OOSH_DIR/$newScript is unchanged"
+      replace cleanup "$OOSH_DIR/$newScript"
+      return 3
+    fi
   fi
 
   if check file $OOSH_DIR/test/test.$newScript exists fix error.log "$OOSH_DIR/test/test.$newScript does not exist"
   then
-    local tweakedTestMethod=$(cat $OOSH_DIR/templates/code/newMethodTest | sed 's/newScript/'"$newScript"'/' | sed 's/newMethod/'"$newMethod"'/')
-    local replaceTestText="### test.method"
-
-    replace within "$OOSH_DIR/test/test.$newScript" "$replaceTestText" by "$tweakedTestMethod"
-
-    local testDescription
-    echo "Give a short description of the test" $newMethod "of script" $newScript": "
+    # Same shape as the method half: ask first, substitute in the VARIABLE,
+    # insert once. The three answers used to be sed'd into the file after
+    # insertion, first-match-in-the-whole-file — so a second run against the
+    # same test file rewrote the FIRST test case's text instead of the new one.
+    local testDescription testParameter testExpect
+    echo "One-line description of the test for $functionName:"
     read testDescription
-    echo "$testDescription"
-
-    private.oo.sed.first "testDescription" "$testDescription" "$OOSH_DIR/test/test.$newScript.new"
-
-    local testParameter
-    echo "Give the parameters for test" $newMethod "of script" $newScript": "
+    echo "Arguments to call $functionName with in the test:"
     read testParameter
-    echo "$testParameter"
-
-    private.oo.sed.first "newArguments" "$testParameter" "$OOSH_DIR/test/test.$newScript.new"
-
-    local testExpect
-    echo "What to expect of test" $newMethod "of script" $newScript": "
+    echo "Expected \$RESULT for that call:"
     read testExpect
-    echo "$testExpect"
 
-    private.oo.sed.first "new_expect" "$testExpect" "$OOSH_DIR/test/test.$newScript.new"
-    
-    replace commit "$OOSH_DIR/test/test.$newScript"
+    local tweakedTestMethod=$(cat $OOSH_DIR/templates/code/newMethodTest | sed 's/newScript\.newMethod/'"$functionName"'/')
+    tweakedTestMethod="${tweakedTestMethod/"testDescription"/"$testDescription"}"
+    tweakedTestMethod="${tweakedTestMethod/"newArguments"/"$testParameter"}"
+    tweakedTestMethod="${tweakedTestMethod/"new_expect"/"$testExpect"}"
 
-    replace cleanup "$OOSH_DIR/test/test.$newScript"
-
-    success.log "created new test for method $1"
-    
+    if replace line "$OOSH_DIR/test/test.$newScript" "### test.method" by "$tweakedTestMethod" \
+       && replace commit "$OOSH_DIR/test/test.$newScript"; then
+      replace cleanup "$OOSH_DIR/test/test.$newScript"
+      success.log "created the test case for $functionName in $OOSH_DIR/test/test.$newScript"
+    else
+      error.log "could not insert the test case — $OOSH_DIR/test/test.$newScript is unchanged"
+      replace cleanup "$OOSH_DIR/test/test.$newScript"
+      return 4
+    fi
   fi
 
+  create.result 0 "$functionName created in $newScript and test/test.$newScript"
+  return $(result)
+}
+
+private.oo.method.stubs.get() # <script.method> <parameters> # the completion functions a generated method must carry, one per parameter; answers on stdout
+{
+  # NO create.result — a getter consumed as $(...), which runs in a subshell,
+  # so RESULT would never reach the caller. Same reasoning as
+  # private.oo.path.sudo.get.
+  #
+  # The name deliberately avoids the segment `.completion.`: c2 scans for
+  # `*.completion.*` to build its candidate lists, and a helper matching that
+  # shape would be offered as if it completed a parameter called `stub`.
+  local fullName="$1" params="$2" token pname
+  if [ -z "$params" ]; then
+    # The documented empty form for a method that takes no parameters.
+    printf '\n%s\n' "$fullName.completion() { :; }"
+    return 0
+  fi
+  printf '\n'
+  for token in $params; do
+    pname="${token#<}"; pname="${pname%>}"; pname="${pname#\?}"; pname="${pname%%:*}"
+    case "$pname" in ''|*[!A-Za-z0-9]*) continue ;; esac
+    printf '%s\n' "$fullName.completion.$pname() {"
+    printf '%s\n' "  # one candidate per line on stdout; \$1 is the word being completed"
+    printf '%s\n' "  echo \"\""
+    printf '%s\n' "}"
+  done
 }
 
 
@@ -251,7 +330,158 @@ private.oo.update.heal.symlinks() # # heal current user's ~/config + ~/oosh syml
     || warn.log "oo update: \`config init.user $USER\` reported an issue — run \`oo user.fix\` for details"
 }
 
-oo.user.fix() # <username:$USER> # repair this user's ~/config + ~/oosh symlinks to the canonical shared tree; idempotent
+oo.boot.fix() # <?systemPath:/etc/oosh> <?profileDir:/etc/profile.d> # install or repair the fixed host-wide boot path <systemPath>/boot -> the canonical shared boot, and the <profileDir>/oosh.sh login-shell drop-in; idempotent
+{
+  # T9 (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md).
+  #
+  # NOT a convenience. The state-machine declaration is FROZEN per host at
+  # first install — state.machine.init writes the state array
+  # once and oo.state() re-creates the machine only when it does not
+  # exist — so no ALREADY-INSTALLED host will ever see state 34. This is the
+  # only path onto those machines.
+  #
+  # Deliberately NOT auto-triggered: `oo update` runs as an ordinary user with
+  # no sudo, and implicit auto-repair on startup was removed after the May-8
+  # sudo-chain incident (docs/repair-toolkit.md). Naming follows `oo user.fix`.
+  #
+  # TWO host resources, one command: the fixed path <systemPath>/boot, and the
+  # <profileDir>/oosh.sh drop-in that makes `env -i sh -l` recover by itself.
+  # Both are parameters so tests can drive this against fixtures without root —
+  # pass BOTH when you do, or the drop-in half still aims at the real
+  # /etc/profile.d and asks for a sudo password.
+  local systemPath="${1:-/etc/oosh}"
+  local profileDir="${2:-/etc/profile.d}"
+
+  # ── Privilege pre-flight (decision 4) ──────────────────────────────────────
+  # $SUDO INTERNALLY, not `sudo oo boot.fix`: one documented command that works
+  # whether the caller is already root or a `dev` member with sudo — the
+  # `$SUDO tee` idiom init/oosh uses for /etc/paths.d. If NEITHER applies, fail loudly naming what it
+  # needed; it must never half-succeed.
+  #
+  # One privilege rule (private.oo.path.sudo.get, built on $SUDO — "" for
+  # root): a prefix is needed for <systemPath>, or for <profileDir> where it
+  # EXISTS (a host without it, macOS, skips that half and must not be told it
+  # needs root). If a prefix is needed and there is no sudo to provide it,
+  # fail loudly before creating anything.
+  local needsSudo
+  needsSudo=$(private.oo.path.sudo.get "$systemPath")
+  if [ -d "$profileDir" ] && [ -z "$needsSudo" ]; then
+    needsSudo=$(private.oo.path.sudo.get "$profileDir")
+  fi
+  if [ -n "$needsSudo" ] && ! command -v sudo >/dev/null 2>&1; then
+    # Bare `echo` to stderr, NOT error.log — doctrine, and guarded in
+    # test.promote / test.ossh.certificates.update (bare-echo doctrine): error.log
+    # routes to $LOG_DEVICE, so when that is a file or /dev/null (a capture,
+    # `log device <file>`, a non-tty CI run) this instruction vanishes and the
+    # user is left with a bare non-zero exit. A fatal message that tells the
+    # caller what to do must survive every LOG_LEVEL and LOG_DEVICE.
+    echo "oo boot.fix: $systemPath needs root — you are '${USER:-?}' and no usable sudo was found. Re-run as root (e.g. \`su - -c 'oo boot.fix'\`) or install sudo." >&2
+    create.result 1 "oo boot.fix: neither root nor sudo"
+    return $(result)
+  fi
+
+  # ── Derive the canonical shared base + branch ─────────────────────────────
+  # One rule for state 31, state 34 and this method: private.oo.shared.base.get.
+  # Pins to the INSTALL branch by construction — `oo mode` does not re-point
+  # it, and that is fine: `boot` names no branch, so all a user on another
+  # branch inherits is the anchoring prologue; their own config and `log`
+  # still load from their own tree.
+  local base branch
+  { read -r base; read -r branch; } <<< "$(private.oo.shared.base.get)"
+  if [ -z "$base" ] || [ ! -d "$base" ] || [ -z "$branch" ]; then
+    error.log "oo boot.fix: could not derive the shared base/branch from OOSH_DIR=$OOSH_DIR (got '$base' '$branch') — run \`oo user.fix\` first"
+    create.result 1 "oo boot.fix: no shared base/branch"
+    return $(result)
+  fi
+
+  private.oo.boot.path.ensure "$base" "$branch" "$systemPath" "$profileDir"
+  return $(result)
+}
+
+oo.boot.status() # <?systemPath:/etc/oosh> <?profileDir:/etc/profile.d> # read-only report on the fixed host-wide boot path and its login-shell drop-in; rc 0 when healthy
+{
+  # Status-command idiom: a user-invoked report emits its ANSWER on plain
+  # stdout, never gated behind console.log / important.log — otherwise it is
+  # silent at the log level CI and installs run with. Read-only: it diagnoses,
+  # `oo boot.fix` repairs.
+  local systemPath="${1:-/etc/oosh}"
+  local profileDir="${2:-/etc/profile.d}"
+  local link="$systemPath/boot"
+
+  echo "oosh boot system path: $link"
+
+  if [ ! -L "$link" ]; then
+    if [ -e "$link" ]; then
+      echo "  state:   PRESENT but NOT a symlink ($(ls -ld "$link" 2>/dev/null))"
+    else
+      echo "  state:   MISSING"
+    fi
+    echo "  cause:   this host was installed before state 34 (root.boot.path.installed),"
+    echo "           or the link was removed."
+    echo "  fix:     oo boot.fix"
+    create.result 1 "$link missing or not a symlink — run oo boot.fix"
+    return $(result)
+  fi
+
+  local target
+  target=$(readlink "$link" 2>/dev/null)
+  echo "  target:  $target"
+
+  local rc=0
+  if [ ! -f "$target" ]; then
+    echo "  state:   DANGLING — the target does not exist"
+    echo "  fix:     oo boot.fix"
+    rc=1
+  elif [ ! -r "$link" ]; then
+    echo "  state:   NOT READABLE by ${USER:-$(id -un 2>/dev/null)}"
+    echo "  fix:     oo boot.fix   (and check group/mode on the shared tree)"
+    rc=1
+  else
+    echo "  state:   OK"
+    echo "  use:     . $link          # any user, any shell, no environment at all"
+  fi
+
+  # ── The login-shell route ────────────────────────────────────────────────
+  # Reported here or a broken `env -i sh -l` stays invisible until someone
+  # needs it in anger. A host with no <profileDir> (macOS) is NOT a fault:
+  # /etc/profile there globs nothing, so the route simply does not exist.
+  local dropIn="$profileDir/oosh.sh"
+  echo "oosh login-shell drop-in: $dropIn"
+  if [ ! -d "$profileDir" ]; then
+    echo "  state:   N/A — this host has no $profileDir (macOS); the login route does not exist here"
+    echo "  use:     . $link          # or: env -i ENV=$link sh"
+  elif [ ! -r "$dropIn" ]; then
+    echo "  state:   MISSING — /etc/profile globs $profileDir/*.sh and finds no oosh line"
+    echo "  effect:  \`env -i sh -l\` does NOT come up as an oosh shell on this host"
+    echo "  fix:     oo boot.fix"
+    rc=1
+  elif ! grep -Fq "$link" "$dropIn" 2>/dev/null; then
+    echo "  state:   STALE — present, but it does not source $link"
+    echo "  fix:     oo boot.fix"
+    rc=1
+  else
+    echo "  state:   OK"
+    echo "  use:     env -i sh -l     # login shells recover by themselves"
+  fi
+  echo "  note:    bare \`env -i sh\` can NEVER self-recover — \$ENV is a non-login"
+  echo "           POSIX sh's only rc hook and \`env -i\` is what erased it."
+  echo "           Hand it back: env -i ENV=$link sh"
+
+  # Trust note (T9 decision 1a) — see docs/boot.md and the creation site in
+  # private.oo.boot.path.ensure. Reported here too so nobody reading the
+  # status output concludes /etc means root-owned.
+  echo "  trust:   the target is DEV-GROUP-WRITABLE (state 31 runs chmod -R g+w on"
+  echo "           the shared tree). Same trust model as root's own ~/oosh, which is"
+  echo "           already a symlink into that tree — the path merely LOOKS root-owned."
+  if [ "$rc" = 0 ]; then
+    create.result 0 "boot system path healthy"
+  else
+    create.result 1 "boot system path or login drop-in needs oo boot.fix"
+  fi
+  return $(result)
+}
+
+oo.user.fix() # <?username:$USER> # repair this user's ~/config + ~/oosh symlinks to the canonical shared tree; idempotent
 {
   # Discoverable user-facing alias for config.init.user — the canonical
   # OOSH explicit-repair primitive (config:212). Handles real-dir →
@@ -404,10 +634,16 @@ oo.mode.base.get() # # returns the OOSH components base directory
     return 0
   fi
 
+  # OOSH_DIR is the ~/oosh symlink (docs/boot.md). Strategies 3 and 4 do path
+  # arithmetic (dirname/basename) on it, which needs the PHYSICAL worktree —
+  # `dirname ~/oosh` is just $HOME. Resolve once, here.
+  local ooshDir
+  ooshDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
+
   # Strategy 2: Use git worktree list to find main worktree, derive base as its parent
-  if [ -d "$OOSH_DIR/.git" ] || [ -f "$OOSH_DIR/.git" ]; then
+  if [ -d "$ooshDir/.git" ] || [ -f "$ooshDir/.git" ]; then
     local mainWt
-    mainWt=$(git -C "$OOSH_DIR" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
+    mainWt=$(git -C "$ooshDir" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
     if [ -n "$mainWt" ]; then
       local mainBase
       mainBase=$(basename "$mainWt")
@@ -418,10 +654,10 @@ oo.mode.base.get() # # returns the OOSH components base directory
     fi
   fi
 
-  # Strategy 3: Check if OOSH_DIR is inside a worktree (.git file with gitdir: pointer)
-  if [ -f "$OOSH_DIR/.git" ]; then
+  # Strategy 3: Check if the worktree is inside a worktree (.git file with gitdir: pointer)
+  if [ -f "$ooshDir/.git" ]; then
     local parent
-    parent=$(dirname "$OOSH_DIR")
+    parent=$(dirname "$ooshDir")
     if [ -d "$parent/main" ]; then
       echo "$parent"
       return 0
@@ -429,16 +665,16 @@ oo.mode.base.get() # # returns the OOSH components base directory
   fi
 
   # Strategy 4: Fall back to dirname if sibling "main" directory exists
-  if [ -n "$OOSH_DIR" ]; then
+  if [ -n "$ooshDir" ]; then
     local parent
-    parent=$(dirname "$OOSH_DIR")
+    parent=$(dirname "$ooshDir")
     local selfName
-    selfName=$(basename "$OOSH_DIR")
-    if [ "$selfName" = "main" ] && [ -d "$OOSH_DIR/.git" ]; then
+    selfName=$(basename "$ooshDir")
+    if [ "$selfName" = "main" ] && [ -d "$ooshDir/.git" ]; then
       echo "$parent"
       return 0
     fi
-    if [ -d "$parent/main" ] && [ "$parent/main" != "$OOSH_DIR" ]; then
+    if [ -d "$parent/main" ] && [ "$parent/main" != "$ooshDir" ]; then
       echo "$parent"
       return 0
     fi
@@ -448,7 +684,7 @@ oo.mode.base.get() # # returns the OOSH components base directory
   return 1
 }
 
-oo.mode.base.set() # <path> # set and persist the OOSH components base directory
+oo.mode.base.set() # <path> # set the OOSH components base directory FOR THIS PROCESS ONLY — it is not persisted; see `oo mode.setup` for a durable layout
 {
   local path="$1"
   if [ -z "$path" ]; then
@@ -460,8 +696,18 @@ oo.mode.base.set() # <path> # set and persist the OOSH components base directory
     return 1
   fi
   export OOSH_COMPONENTS_DIR="$path"
+  # NOT persisted, and the docstring used to say it was. `config` excludes
+  # OOSH_COMPONENTS_DIR from every save on purpose (config:595, reason at
+  # config:571), so this `config save` only ever wrote the OTHER OOSH_* values
+  # and silently dropped the one variable this method exists to set. It is kept
+  # because the method's callers may rely on the rest of that save; what
+  # changed is that the docstring and this comment now say what happens.
+  #
+  # For a base that survives the shell, build the canonical layout —
+  # `oo mode.setup` — so oo.mode.base.get resolves through strategies 2/3/4
+  # and needs no variable at all.
   config save oosh OOSH
-  console.log "Base set to: $path"
+  console.log "Base set to: $path (this process only — see oo mode.setup)"
 }
 
 oo.mode.list() # # list available branches with git status
@@ -690,26 +936,44 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
   ln -s "$target_dir" "$OOSH_LINK"
 
   # Replace old branch name in ALL PATH entries (handles /root/<branch>, /home/shared/.../<branch>, etc.)
-  local oldOoshDir="$OOSH_DIR"
-  local oldBranchName
-  oldBranchName=$(basename "$oldOoshDir")
+  # The old branch name comes from what ~/oosh POINTED AT before the ln -s above
+  # ($current_target, captured at the top of this method) — NOT from $OOSH_DIR,
+  # which is the constant ~/oosh and would yield the literal name "oosh". That
+  # would rewrite every "/oosh:" segment of PATH into "/<branch>:" and break it.
+  # A PATH that already holds ~/oosh has no branch name in it, so this is then
+  # correctly a no-op; it still repairs a PATH holding a physical worktree path
+  # (a legacy shell, or install state 31 which puts one there on purpose).
+  # path-exception: a REPAIR of a PATH that already holds a branch worktree
+  # path, not a build — `oo mode` moves the ~/oosh symlink, and a legacy shell
+  # (or install state 31) can be holding the physical path of the old branch.
+  local oldBranchName=""
+  [ -n "$current_target" ] && oldBranchName=$(basename "$current_target")
   if [ -n "$oldBranchName" ] && [ "$oldBranchName" != "$branch" ]; then
+    # path-exception: a REPAIR, see the note above this if.
     PATH=$(echo "$PATH" | sed "s|/${oldBranchName}:|/${branch}:|g;s|/${oldBranchName}$|/${branch}|")
   fi
   hash -r  # Clear command hash table so bash finds commands in new path
 
+  # OOSH_DIR is NOT reassigned: it is the constant ~/oosh, and the `ln -s`
+  # above already repointed it at $target_dir. Only OOSH_MODE changes.
   export OOSH_MODE="$branch"
-  export OOSH_DIR="$target_dir"
   config save oosh OOSH 2>/dev/null
 
   # Write env pickup file so the shim can update the parent shell next time
-  mkdir -p "$HOME/.config/oosh"
-  cat > "$HOME/.config/oosh/mode-env.bash" <<MODEENV
-PATH=\$(echo "\$PATH" | sed "s|/${oldBranchName}:|/${branch}:|g;s|/${oldBranchName}\$|/${branch}|")
-hash -r
-export OOSH_DIR="$target_dir"
-export OOSH_MODE="$branch"
-MODEENV
+  mkdir -p "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}"
+  {
+    # path-exception: the same repair, EMITTED into mode-env.bash for the shim
+    # to source into the parent shell. Same reasoning as the line above.
+    # Same PATH repair as above, and emitted only under the same condition —
+    # an empty or unchanged old branch name would turn the sed into "s|/:|…"
+    # and mangle every PATH entry.
+    if [ -n "$oldBranchName" ] && [ "$oldBranchName" != "$branch" ]; then
+      # path-exception: the same repair, emitted for the shim.
+      echo "PATH=\$(echo \"\$PATH\" | sed \"s|/${oldBranchName}:|/${branch}:|g;s|/${oldBranchName}\\\$|/${branch}|\")"
+    fi
+    echo "hash -r"
+    echo "export OOSH_MODE=\"$branch\""
+  } > "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/mode-env.bash"
 
   echo "Switched to: $branch ($target_dir)"
 
@@ -764,13 +1028,13 @@ oo.mode.align() # # align git branch to match the current worktree directory nam
 private.oo.install.shim() {
   local sourceDir="${1:-$OOSH_DIR}"
   local shimSrc="$sourceDir/templates/user/ooShim"
-  local shimDst="$HOME/.config/oosh/oo-func.bash"
+  local shimDst="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/oo-func.bash"
 
   if [ ! -f "$shimSrc" ]; then
     return 0  # shim template not available, skip silently
   fi
 
-  mkdir -p "$HOME/.config/oosh"
+  mkdir -p "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}"
   cp "$shimSrc" "$shimDst"
 
   # Source it now so oo() function is available immediately
@@ -784,97 +1048,138 @@ private.oo.install.shim() {
   echo "  Shim:    $shimDst (oo function loaded — mode/use update current shell)"
 }
 
-oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure for branch switching
+oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main/ + <branch>/ worktree layout and point ~/oosh at it
 {
+  # It builds ONE layout, and it is not this function's own. The layout half is
+  # private.oo.shared.tree.from.local — validated, idempotent, git-fallback'd,
+  # and the same builder install state 31 uses, so there is exactly one
+  # definition of "canonical" in the tree.
+  #
+  # What this used to do instead: build <base>/dev with NO main/, which defeats
+  # oo.mode.base.get strategies 2, 3 and 4 (they all key on a directory named
+  # `main`), and bridge the gap by exporting OOSH_COMPONENTS_DIR for strategy 1
+  # — a variable `config` excludes from every save on purpose (config:571,595).
+  # So the layout worked in this process and was undetectable in the next
+  # shell: the command whose own failure message tells you to run it produced a
+  # layout that re-created that failure. Measured in
+  # docs/research/2026-09-16-item7-oo-mode-setup.md § 3.
+  #
+  # And it moved the live tree with four unguarded `mv`s. Those are gone: the
+  # helper copies, verifies, and only then consumes the source.
   local OOSH_LINK="$HOME/oosh"
   local currentDir
   # private.this.path.canonical (this:144) — portable resolver.
   currentDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
 
-  # Check if already set up — base must exist AND contain at least one worktree subdir
-  local existingBase
-  existingBase=$(oo.mode.base.get 2>/dev/null)
-  if [ -n "$existingBase" ] && [ -d "$existingBase" ]; then
-    local hasWorktrees=false
-    for d in "$existingBase"/*/; do
-      if [ -d "$d/.git" ] || [ -f "$d/.git" ]; then
-        hasWorktrees=true
-        break
-      fi
-    done
-    if [ "$hasWorktrees" = "true" ]; then
-      echo "Worktree structure already exists at: $existingBase"
-      return 0
+  # 1. Validate the argument. Nothing did, so a typo'd base silently became the
+  #    place the live tree was moved to.
+  local base
+  if [ -n "$1" ]; then
+    base="$1"
+    shift
+    if [ ! -d "$base" ]; then
+      error.log "oo.mode.setup: <worktree_base> is not a directory: $base"
+      create.result 2 "no such directory: $base" "$1"
+      return $(result)
     fi
+    if [ ! -w "$base" ]; then
+      error.log "oo.mode.setup: <worktree_base> is not writable: $base"
+      create.result 2 "not writable: $base" "$1"
+      return $(result)
+    fi
+  else
+    base="$(dirname "$currentDir")"
+  fi
+  local targetDir
+
+  # 2. Already set up. This comes BEFORE branch detection on purpose: if the
+  #    layout is canonical there is nothing to do, and demanding a detectable
+  #    branch first would turn a no-op into a refusal.
+  #    The old guard accepted ANY subdirectory holding a .git, so a
+  #    half-converted tree read as done. The canonical shape is main/ with a
+  #    real .git DIRECTORY — main/ is the repository, the branch directories
+  #    are linked worktrees whose .git is a pointer file.
+  if [ -d "$base/main/.git" ]; then
+    echo "Worktree structure already exists at: $base"
+    create.result 0 "already set up at $base" "$1"
+    return $(result)
   fi
 
-  # Determine worktree base directory
-  local base="${1:-$(dirname "$currentDir")}"
-  local devDir="$base/dev"
+  # 3. A main/ that is not a repository is a refusal, not something to copy over.
+  if [ -e "$base/main" ]; then
+    error.log "oo.mode.setup: $base/main exists but is not a git repository — move it aside first"
+    create.result 3 "$base/main is not a repository" "$1"
+    return $(result)
+  fi
 
-  # Detect current branch
+  # 4. The branch this clone is on names the worktree directory.
   local currentBranch
   currentBranch=$(this.git.branch.short "$currentDir")
   if [ -z "$currentBranch" ]; then
-    error.log "Cannot detect current branch in $currentDir"
-    return 1
+    error.log "oo.mode.setup: cannot detect a branch in $currentDir — is it a git clone?"
+    create.result 1 "no branch detected in $currentDir" "$1"
+    return $(result)
   fi
+  targetDir="$base/$currentBranch"
+
+
 
   echo "Setting up worktree structure..."
   echo "  Source: $currentDir (branch: $currentBranch)"
   echo "  Base:   $base"
 
-  if [ "$currentBranch" = "dev" ]; then
-    # On dev: just move the directory
-    if [ "$currentDir" = "$devDir" ]; then
-      echo "Already at $devDir — nothing to move"
-    else
-      echo "Moving $currentDir → $devDir"
-      mv "$currentDir" "$devDir"
-    fi
-  else
-    # On a feature branch: move to dev dir, checkout dev, then worktree add for the branch
-    echo "Moving $currentDir → $devDir"
-    mv "$currentDir" "$devDir"
-
-    echo "Switching $devDir to dev branch..."
-    (cd "$devDir" && git checkout dev 2>/dev/null) || {
-      # If dev doesn't exist locally, create it from origin/dev
-      (cd "$devDir" && git checkout -b dev origin/dev 2>/dev/null) || {
-        error.log "Failed to checkout dev branch. Restoring original location."
-        mv "$devDir" "$currentDir"
-        return 1
-      }
-    }
-
-    echo "Creating worktree for $currentBranch..."
-    (cd "$devDir" && git worktree add -B "$currentBranch" "../$currentBranch" "$currentBranch") || {
-      error.log "Failed to create worktree for '$currentBranch'. Restoring original location."
-      (cd "$devDir" && git checkout "$currentBranch" 2>/dev/null)
-      mv "$devDir" "$currentDir"
-      return 1
-    }
+  # 5. Build it. `yes` consumes the source AFTER main/ is verified — the only
+  #    ordering that works when the clone already sits where the branch
+  #    worktree has to go, and the only one in which nothing can be lost.
+  if ! ( cd "$base" && private.oo.shared.tree.from.local "$currentDir" "$currentBranch" yes ); then
+    error.log "oo.mode.setup: could not build the canonical layout in $base — $currentDir is untouched unless the log above says otherwise"
+    create.result 4 "layout build failed in $base" "$1"
+    return $(result)
   fi
 
-  # Create symlink
-  local targetDir
-  if [ "$currentBranch" = "dev" ]; then
-    targetDir="$devDir"
-  else
-    targetDir="$base/$currentBranch"
+  # 6. THE acceptance criterion, and nothing checked it before: can
+  #    oo.mode.base.get find this base in a shell that has no
+  #    OOSH_COMPONENTS_DIR? That is every shell but this one. Checked BEFORE
+  #    the symlink moves, so a failure leaves a canonical tree and a working
+  #    ~/oosh rather than a broken pair.
+  local verifiedBase
+  verifiedBase=$( unset OOSH_COMPONENTS_DIR; OOSH_DIR="$targetDir"; oo.mode.base.get 2>/dev/null )
+  if [ "$verifiedBase" != "$base" ]; then
+    error.log "oo.mode.setup: the layout in $base is not detectable without OOSH_COMPONENTS_DIR (got '${verifiedBase:-nothing}') — ~/oosh left where it was"
+    create.result 5 "layout not detectable: ${verifiedBase:-nothing}" "$1"
+    return $(result)
   fi
 
+  # 7. Repoint ~/oosh. The source is gone by now, so the path is free when it
+  #    WAS the source. A real directory that was not the source is a refusal —
+  #    the old code skipped its own `rm` in that case and let `ln -s` create
+  #    the link INSIDE the directory.
   if [ -L "$OOSH_LINK" ]; then
-    rm "$OOSH_LINK"
+    rm "$OOSH_LINK" || {
+      error.log "oo.mode.setup: could not remove the old $OOSH_LINK symlink"
+      create.result 6 "could not remove $OOSH_LINK" "$1"
+      return $(result)
+    }
+  elif [ -e "$OOSH_LINK" ]; then
+    error.log "oo.mode.setup: $OOSH_LINK exists and is not a symlink — move it aside, then re-run. The canonical layout is already in $base"
+    create.result 6 "$OOSH_LINK is not a symlink" "$1"
+    return $(result)
   fi
-  # At this point the original directory was moved, so OOSH_LINK path is free
-  ln -s "$targetDir" "$OOSH_LINK"
+  if ! ln -s "$targetDir" "$OOSH_LINK"; then
+    error.log "oo.mode.setup: could not link $OOSH_LINK -> $targetDir. The canonical layout is in $base"
+    create.result 6 "could not create $OOSH_LINK" "$1"
+    return $(result)
+  fi
 
-  # Update environment
-  export OOSH_COMPONENTS_DIR="$base"
-  export OOSH_DIR="$targetDir"
+  # OOSH_DIR stays the constant ~/oosh — the `ln -s` above made it valid again.
+  # OOSH_MODE means the branch this host is on (T7).
   export OOSH_MODE="$currentBranch"
-  config save oosh OOSH 2>/dev/null
+  # PROCESS-SCOPED, deliberately not saved. `config` excludes
+  # OOSH_COMPONENTS_DIR from every save (config:595), and with a canonical
+  # layout it is not needed: oo.mode.base.get resolves through strategies
+  # 2/3/4, which is what step 6 just proved. The old `config save oosh OOSH`
+  # here only ever looked like it persisted this.
+  export OOSH_COMPONENTS_DIR="$base"
 
   # Install ooShim so 'oo mode' always works regardless of active branch
   private.oo.install.shim "$targetDir"
@@ -882,13 +1187,13 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to worktree structure
   echo ""
   echo "Worktree structure created:"
   echo "  Base:    $base"
-  echo "  Dev:     $devDir"
-  if [ "$currentBranch" != "dev" ]; then
-    echo "  Branch:  $targetDir"
-  fi
+  echo "  Repo:    $base/main"
+  echo "  Branch:  $targetDir"
   echo "  Symlink: $OOSH_LINK → $targetDir"
   echo ""
   echo "Use 'oo mode <branch>' to switch branches."
+  create.result 0 "worktree structure at $base" "$1"
+  return $(result)
 }
 
 private.oo.completion.worktree.branches() # # echo branch names whose worktree dirs sit under oo.mode.base.get; safe inside c2 completion subprocesses (no create.result side-effects)
@@ -1105,6 +1410,9 @@ oo.use() # <branch> <command> # run a command from a specific branch without swi
              debug.log success.log silent.log stop.log seq.puml.log; } 2>/dev/null
 
   # Execute from target branch with overridden OOSH_DIR
+  # oosh-dir-exception: oo.use runs ONE command from another branch WITHOUT
+  # switching — a scoped child-process override; there is no symlink alternative
+  # by design (the symlink is what `oo mode` moves, and `use` must not move it).
   OOSH_DIR="$branchDir" "$branchDir/$command" "$@"
 }
 oo.use.completion.branch() {
@@ -1272,8 +1580,14 @@ private.init.state.machine() # <machine> # creates the state machine
   state.add root.rights                          silent 
   state.add root.shared.dev.folder.created       silent 
   state.add root.dev.keys.installed              silent 
-  state.add root.installation.done               silent 
-  state.add 40                                   silent 
+  state.add root.installation.done               silent
+  # T9 — the fixed host-wide boot path /etc/oosh/boot. Inserted HERE, after
+  # the last named 30-lane state and before the `40` transition marker, so it
+  # lands at 34 and pushes only the marker to 35: state.add treats a numeric
+  # argument as a jump, so no existing state NUMBER moves (many are hard-coded
+  # in comments across oo and ossh). Pinned by T-BOOTPATH-STATE-34 in test/test.oo.
+  state.add root.boot.path.installed             silent
+  state.add 40                                   silent
   state.add user.shared.dev.folder.linked        silent 
   state.add user.state.machine.synced.with.root  silent 
   state.add 50                                   silent 
@@ -1382,10 +1696,16 @@ private.check.user.installation.done() {
 }
 
 private.check.user.mode.release() {
-  if [ "$OOSH_MODE" = "released" ]; then
+  # A released install is one sitting on the PROD branch. This used to compare
+  # against the literal "released", a mode word that only ever appeared because
+  # promote stamped it in — one line after checking the tree back out to dev.
+  # So it described a developer-box event, not this host, and on a genuinely
+  # released box (where `oo mode prod` had set the branch name) the check failed
+  # anyway. OOSH_MODE is the branch a host is ON; see docs/config.md § T7.
+  if [ "$OOSH_MODE" = "prod" ]; then
     create.result 0 "OOSH_MODE=$OOSH_MODE"
   else
-    create.result 1 "not in mode released!   OOSH_MODE=$OOSH_MODE"
+    create.result 1 "not on the prod branch — a released install runs prod. OOSH_MODE=$OOSH_MODE"
   fi
   return $(result)
 }
@@ -1421,11 +1741,11 @@ private.check.root.rights() {
 }
 
 
-private.oo.shared.tree.from.local() # <sourceDir> <branchName> # produce canonical `main/ + <branchName>/` worktree layout in $(pwd) from a local clone. Idempotent — skips if main/ already exists. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 2/4 then succeeds and `oo mode <branch>` works).
+private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:no> # produce canonical `main/ + <branchName>/` worktree layout in $(pwd) from a local clone. Idempotent — skips if main/ already exists. With <consumeSource> = yes the source is removed once main/ is verified, which is what `oo mode.setup` needs when the clone already sits where the branch worktree has to go. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 2/4 then succeeds and `oo mode <branch>` works).
 {
   local src="$1"
   local branch="$2"
-
+  local consume="${3:-no}"
   if [ -z "$src" ] || [ -z "$branch" ]; then
     error.log "private.oo.shared.tree.from.local: usage <sourceDir> <branchName>"
     return 1
@@ -1460,6 +1780,23 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> # produce canonic
   else
     git -C main checkout main >/dev/null 2>&1 \
       || warn.log "private.oo.shared.tree.from.local: could not checkout main in main/"
+  fi
+
+  # 2b. Optionally consume the source. `oo mode.setup` needs this: when the
+  #     plain clone already sits at <base>/<branch>, the `git worktree add
+  #     ../<branch>` below collides with it — git refuses an existing,
+  #     non-empty path. Removing it HERE is the only ordering in which nothing
+  #     can be lost: main/ is verified to be a real repository first, and it
+  #     already holds every commit the source had. Default no, so state 31's
+  #     call is unchanged.
+  if [ "$consume" = "yes" ]; then
+    if [ ! -d "main/.git" ] || ! git -C main rev-parse --git-dir >/dev/null 2>&1; then
+      error.log "private.oo.shared.tree.from.local: refusing to remove $src — main/ is not a usable repository"
+      return 1
+    fi
+    rm -rf "$src" \
+      || { error.log "private.oo.shared.tree.from.local: could not remove the consumed source $src"; return 1; }
+    important.log "private.oo.shared.tree.from.local: source consumed: $src"
   fi
 
   # 3. Add the active branch as a worktree of main/. Skip when the active
@@ -1506,6 +1843,191 @@ private.oo.user.shared.symlinks.ensure() # <userHome> <sharedConfigPath> <onceSh
     error.log "$RESULT"
   fi
   return $(result)
+}
+
+private.oo.install.branch.get() # # print the install branch: $OOSH_BRANCH, else the branch $HOME/oosh is on, else main — the one rule behind state 31, state 34 and oo boot.fix
+{
+  local branch="${OOSH_BRANCH}"
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    # Detect from the initial $HOME/oosh clone before it gets symlinked.
+    branch=$(this.git.branch.short "$HOME/oosh" 2>/dev/null)
+  fi
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    branch=main
+  fi
+  echo "$branch"
+}
+
+private.oo.shared.base.get() # # print two lines — the canonical shared Once.sh base and the branch under it — derived ONCE for install state 31/34 and oo boot.fix
+{
+  # Three sources, most concrete first:
+  #   1. what ~/oosh RESOLVES to — on any installed host (root included, once
+  #      state 31 has symlinked root's ~/oosh) this IS the truth;
+  #   2. the worktree base oo.mode.base.get already knows;
+  #   3. the basehome state 31 builds under (developking, else this user's),
+  #      which is the only answer available BEFORE the shared tree exists.
+  local ooshDir base="" branch=""
+  ooshDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null)
+  case "$ooshDir" in
+    */Once.sh/*)
+      base="${ooshDir%/*}"
+      branch="${ooshDir##*/}"
+      ;;
+  esac
+  if [ -z "$base" ] || [ ! -d "$base" ]; then
+    base=$(oo.mode.base.get 2>/dev/null)
+  fi
+  if [ -z "$base" ] || [ ! -d "$base" ]; then
+    local dir
+    dir="$( user get basehome developking )"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+      dir="$( user get basehome )"
+    fi
+    [ -n "$dir" ] && base="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
+  fi
+  [ -z "$branch" ] && branch=$(private.oo.install.branch.get)
+  echo "$base"
+  echo "$branch"
+}
+
+private.oo.path.sudo.get() # <path> # print the $SUDO prefix needed to write <path> (its parent while it does not exist yet), or nothing when the caller can already write there — the one privilege rule behind oo boot.fix and private.oo.boot.path.ensure
+{
+  # Builds on the framework contract: `this` sets $SUDO to "" for root and
+  # "sudo " otherwise, so root never gets a prefix and a fixture under $HOME
+  # never needs one. Builtins only (no `id`, no `dirname`), so it still
+  # answers correctly when PATH is unusable.
+  local path="$1" probe
+  if [ -e "$path" ]; then
+    probe="$path"
+  else
+    probe="${path%/*}"
+    [ "$probe" = "$path" ] && probe="."
+    [ -z "$probe" ] && probe="/"
+  fi
+  [ -w "$probe" ] || printf '%s' "$SUDO"
+}
+
+private.oo.boot.path.ensure() # <sharedOoshBase> <branch> <?systemPath:/etc/oosh> <?profileDir:/etc/profile.d> # ensure <systemPath>/boot is a symlink to <sharedOoshBase>/<branch>/boot AND <profileDir>/oosh.sh sources it for login shells; idempotent; warns and skips (rc=0) when the target does not exist, skips the drop-in when <profileDir> does not (macOS)
+{
+  # T9 — the FIXED system path to `boot`
+  # (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md).
+  #
+  # `boot` recovers $HOME, but `. ~/oosh/boot` cannot be REACHED under dash/ash
+  # with HOME unset (`~` stays literal): a host-wide <systemPath>/boot collapses
+  # recovery to one command. docs/boot.md § The tilde caveat.
+  #
+  # A SYMLINK, never a stub or a copy: `boot` is the single entry point that
+  # owns ALL bootstrap logic (its header says so), a stub would need its own copy of the
+  # getent→dscl→/etc/passwd lookup that boot's HOME block already forbids a third
+  # copy of, and a stale copy would boot you into last month's bootstrap in
+  # silence where a dangling symlink fails loudly.
+  #
+  # TRUST: <systemPath>/boot resolves to DEV-GROUP-WRITABLE content (state 31
+  # runs chmod -R g+w on the shared tree) — exactly as trusted as the dev group,
+  # the same as root's own ~/oosh; the path merely LOOKS root-owned.
+  # docs/boot.md § Guarantees.
+  #
+  # Paths are PARAMETERS (same shape as private.oo.user.shared.symlinks.ensure
+  # above) so tests can drive this against a fixture without root.
+  local sharedOoshBase="$1"
+  local branch="$2"
+  local systemPath="${3:-/etc/oosh}"
+
+  if [ -z "$sharedOoshBase" ] || [ -z "$branch" ]; then
+    create.result 1 "private.oo.boot.path.ensure requires <sharedOoshBase> <branch> [<systemPath:/etc/oosh>] [<profileDir:/etc/profile.d>]"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  local target="$sharedOoshBase/$branch/boot"
+
+  # Warn-and-SKIP, never dangle. `boot` lives on `dev` only; an install from
+  # `testing`/`prod` legitimately has no target yet, and a dangling
+  # /etc/oosh/boot would break `. /etc/oosh/boot` for every user on the box.
+  # Absence is CORRECT there, so state 34 must pass, not halt.
+  if [ ! -f "$target" ]; then
+    warn.log "private.oo.boot.path.ensure: no \`boot\` at $target — skipping $systemPath/boot (expected on a branch without boot)"
+    create.result 0 "boot system path skipped (no $target)"
+    return $(result)
+  fi
+
+  # Privilege: /etc needs root, a test fixture under $HOME does not — one
+  # rule, private.oo.path.sudo.get, prefixing only the commands that need it.
+  local sudoCmd
+  sudoCmd=$(private.oo.path.sudo.get "$systemPath")
+
+  $sudoCmd mkdir -p "$systemPath"
+  $sudoCmd chmod 755 "$systemPath"
+  # -n is load-bearing: without it `ln -sf` DEREFERENCES an existing
+  # symlink-to-directory and creates the link INSIDE it, so a re-run over a
+  # stale dir symlink silently produces <systemPath>/boot/boot.
+  $sudoCmd ln -sfn "$target" "$systemPath/boot"
+
+  # Post-condition — fail loud rather than half-succeed (decision 4).
+  if [ ! -L "$systemPath/boot" ] || [ ! -r "$systemPath/boot" ]; then
+    create.result 1 "failed to ensure $systemPath/boot -> $target (isLink=$([ -L "$systemPath/boot" ] && echo y || echo n) readable=$([ -r "$systemPath/boot" ] && echo y || echo n) points.at=$(readlink "$systemPath/boot" 2>/dev/null))"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  # ── The LOGIN-SHELL route: <profileDir>/oosh.sh ───────────────────────────
+  # T9 follow-on. The symlink above makes `. /etc/oosh/boot` POSSIBLE; this
+  # makes `env -i sh -l` AUTOMATIC. Measured:
+  #
+  #   env -i sh                     no   — $ENV is a non-login POSIX sh's ONLY
+  #                                        rc hook, and `env -i` erased it.
+  #                                        Nothing can recover this.
+  #   env -i ENV=/etc/oosh/boot sh  yes  — that hook, handed back by hand.
+  #   env -i sh -l                  yes, ONCE /etc/profile has an oosh line.
+  #
+  # dash's own `-lxc` trace runs /etc/profile (`[ -d /etc/profile.d ]`, then
+  # `for i in /etc/profile.d/*.sh`) while `-xc` shows only `+ :`. So this
+  # drop-in — SAME state 34, SAME `oo boot.fix`, one mechanism — is what makes
+  # the login route work. The `.sh` suffix is load-bearing: that glob is the
+  # only reason the file is ever read.
+  local profileDir="${4:-/etc/profile.d}"
+  local dropIn="$profileDir/oosh.sh"
+
+  # macOS has NO /etc/profile.d: its /etc/profile runs path_helper and sources
+  # /etc/bashrc, and globs nothing — a directory created there would never be
+  # read. So absence is a graceful SKIP, never a failure, and we do NOT create
+  # the directory. The Linux-only-ness of this route is a fact about
+  # /etc/profile, not a defect. The other two routes are unaffected.
+  if [ ! -d "$profileDir" ]; then
+    info.log "private.oo.boot.path.ensure: no $profileDir on this host — skipping the login-shell drop-in (macOS has none; \`. $systemPath/boot\` and the ENV= route are unaffected)"
+    create.result 0 "boot system path ensured at $systemPath/boot -> $target (no $profileDir; login-shell drop-in skipped)"
+    return $(result)
+  fi
+
+  local sudoProfile
+  sudoProfile=$(private.oo.path.sudo.get "$profileDir")
+  private.oo.boot.profile.content.get "$systemPath" | $sudoProfile tee "$dropIn" >/dev/null
+  $sudoProfile chmod 644 "$dropIn"
+
+  if [ -r "$dropIn" ] && grep -Fq "$systemPath/boot" "$dropIn" 2>/dev/null; then
+    create.result 0 "boot system path ensured at $systemPath/boot -> $target (login-shell drop-in at $dropIn)"
+  else
+    create.result 1 "failed to write the login-shell drop-in $dropIn (readable=$([ -r "$dropIn" ] && echo y || echo n)) — \`env -i sh -l\` will not recover on this host"
+    error.log "$RESULT"
+  fi
+  return $(result)
+}
+
+private.oo.boot.profile.content.get() # <?systemPath:/etc/oosh> # emit the POSIX-sh /etc/profile.d drop-in that sources <systemPath>/boot for login shells, from templates/user/profile.d.oosh.sh
+{
+  # Managed-file content lives in templates/user/ like every other file oosh
+  # writes for a host or user (bashrcTemplate, ooShim, sudo); this method only
+  # substitutes the path. Separated from the writer so tests can lint and
+  # EXECUTE the content against fixture paths without root — guarded by
+  # test.oo T-BOOTPATH-PROFILED-CONTENT-IS-POSIX / T-BOOTPATH-PROFILED-CONTENT-IS-GUARDED.
+  local systemPath="${1:-/etc/oosh}"
+  local template="$OOSH_DIR/templates/user/profile.d.oosh.sh"
+  if [ ! -r "$template" ]; then
+    create.result 1 "private.oo.boot.profile.content.get: template missing: $template"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  sed "s|@SYSTEM_PATH@|$systemPath|g" "$template"
 }
 
 private.check.root.shared.dev.folder.created() {
@@ -1571,13 +2093,7 @@ private.check.root.shared.dev.folder.created() {
   
   #return 2
   
-  if [ -z "${OOSH_BRANCH}" ]; then
-    # Detect branch from initial $HOME/oosh clone before it gets symlinked
-    OOSH_BRANCH=$(this.git.branch.short "$HOME/oosh")
-    if [ -z "$OOSH_BRANCH" ] || [ "$OOSH_BRANCH" = "HEAD" ]; then
-      OOSH_BRANCH=main
-    fi
-  fi
+  OOSH_BRANCH=$(private.oo.install.branch.get)
 
   local onceShBase="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
 
@@ -1653,6 +2169,25 @@ private.check.root.shared.dev.folder.created() {
     fi
 
     # ─── state 31 [4/5: shared.config.seeded] ─────────────────────────────
+    # SNAPSHOT FIRST. Everything below this line writes to the installing
+    # user's ~/.ssh — the mkdir, the Host github.com block, the ssh-keyscan
+    # into known_hosts, and the developking copy into ids/. That is why the
+    # backup ossh.install.continue.local used to take AFTER `oo state` and
+    # call "ssh.original" was nothing of the kind: by then this state had
+    # already run. The state that does the work owns the snapshot.
+    #
+    # Guarded on the directory existing: a fresh machine has nothing to
+    # protect, and `user ssh.backup` correctly refuses an absent ~/.ssh.
+    # Where it DOES exist, a failure halts state 31 — a backup that silently
+    # did not happen is worse than a stopped install.
+    if [ -d "$HOME/.ssh" ]; then
+      if ! user ssh.backup pre-install >/dev/null; then
+        error.log "state 31 [4/5]: could not archive $HOME/.ssh before writing to it"
+        create.result 1 "state 31 step 4/5 failed: pre-install ssh snapshot"
+        return $(result)
+      fi
+    fi
+
     # Ensure root's ~/.ssh exists before any write. On Alpine 3.19's
     # naked_alpine_3_19 image the sshd config permits root login without
     # an authorized_keys file, so /root/.ssh is never auto-created on
@@ -1791,10 +2326,9 @@ EOF
 
     # Always link ROOT's config AND oosh to the shared tree. State 31
     # runs as root regardless of which paramerUser is being set up —
-    # without these symlinks, root's lazy
-    # `${OOSH_DIR:="$(cd $HOME/oosh && pwd -P)"}` in
-    # sharedConfig/user.env resolves to root's private clone, and root
-    # can't see the shared worktrees (the macstudio-root regression).
+    # without these symlinks, root's OOSH_DIR (always ~/oosh, see
+    # docs/boot.md) resolves at point of use to root's private clone, and
+    # root can't see the shared worktrees (the macstudio-root regression).
     #
     # Previous guard `[ "$paramerUser" != "root" ]` was wrong: when
     # paramerUser is empty (SSH_CONFIG_NAME_USED_FOR_LOCAL isn't set
@@ -1850,6 +2384,7 @@ EOF
     fi
     private.oo.safeDirectory.add "$resolvedMainDir" >/dev/null
 
+    # path-exception: install-time, and already marked for removal below.
     # TODO: This should be removed to only use $HOME/oosh in the PATH
     export PATH="$( echo $PATH | line replace.sedquoted "$HOME/oosh" "$onceShBase/${OOSH_BRANCH}" )"
 
@@ -1863,11 +2398,14 @@ EOF
 
     export CONFIG="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig/user.env"
     export CONFIG_FILE="user.env"
+    # config-path-exception: install state 31 builds the shared tree BEFORE
+    # ~/config is a symlink to it, so it must name the target directly.
     export CONFIG_PATH="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-    export OOSH_DIR="$onceShBase/${OOSH_BRANCH}"
+    # OOSH_DIR is the constant ~/oosh — private.oo.user.shared.symlinks.ensure
+    # above just pointed it at $onceShBase/${OOSH_BRANCH}. Nothing to export.
     export OOSH_MODE="${OOSH_BRANCH}"
 
-    console.log "PATH=$PATH"
+    console.log "PATH=$PATH"   # path-exception: a diagnostic, not an assignment
     console.log "CONFIG=$CONFIG"
     config save
 
@@ -2068,6 +2606,26 @@ private.check.root.installation.done() {
   return 0
 }
 
+private.check.root.boot.path.installed() # # state 34 — install the fixed host-wide boot path /etc/oosh/boot
+{
+  # T9. Runs in the 30-lane, so $USER is root (private.check.priviledges.checked
+  # routes here only for root / working sudo, and ossh.install re-enters as root).
+  # Derives the same shared base state 31 built, then delegates to the testable
+  # helper. Dedicated state (not folded into 31's idempotent fast-path, nor into
+  # 33's best-effort chsh/.bashrc work) so a failure reads
+  # "halted at [34] root.boot.path.installed".
+  local base branch
+  { read -r base; read -r branch; } <<< "$(private.oo.shared.base.get)"
+  if [ -z "$base" ] || [ ! -d "$base" ]; then
+    error.log "state 34 [root.boot.path.installed]: could not determine the shared base (got '$base') — state 31 must run first"
+    create.result 1 "state 34 failed: no shared base"
+    return $(result)
+  fi
+
+  private.oo.boot.path.ensure "$base" "$branch"
+  return $(result)
+}
+
 private.check.user.shared.dev.folder.linked() {
   local devHome="$( user get home developking )"
   if [ -z "$devHome" ]; then
@@ -2080,12 +2638,19 @@ private.check.user.shared.dev.folder.linked() {
 
     export CONFIG="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig/user.env"
     export CONFIG_FILE="user.env"
+    # config-path-exception: install state 31 builds the shared tree BEFORE
+    # ~/config is a symlink to it, so it must name the target directly.
     export CONFIG_PATH="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
-    # Resolve OOSH_DIR from root's symlink (set during root install to the
-    # correct branch folder). private.this.path.canonical (this:144) is the
-    # portable resolver — see oo.mode for the macOS BSD-readlink rationale.
-    export OOSH_DIR=$(private.this.path.canonical "$HOME/oosh")
-    export OOSH_MODE=$(basename "$OOSH_DIR")
+    # OOSH_DIR is the constant ~/oosh and needs no export here. What IS needed
+    # is the PHYSICAL target of root's ~/oosh symlink (set during root install
+    # to the correct branch folder): OOSH_MODE is that folder's BRANCH name, and
+    # the `ln -s` below must point at a real directory — linking $OOSH_DIR itself
+    # would create $HOME/oosh -> $HOME/oosh ("Too many levels of symbolic
+    # links"). private.this.path.canonical (this:144) is the portable resolver —
+    # see oo.mode for the macOS BSD-readlink rationale.
+    local ooshTarget
+    ooshTarget=$(private.this.path.canonical "$HOME/oosh")
+    export OOSH_MODE=$(basename "$ooshTarget")
 
     cd $HOME
     if [ -L config ]; then
@@ -2095,7 +2660,7 @@ private.check.user.shared.dev.folder.linked() {
     else
       mv config "config.orig"
       ln -s "$CONFIG_PATH" config
-      ln -s "$OOSH_DIR" oosh
+      ln -s "$ooshTarget" oosh
     fi
 
   return 0
@@ -2163,7 +2728,7 @@ oo.tmp.cleanup.testing() { # # clean test BE CAREFULL removes oosh and SSH KEYS 
     #sudo rm -rf /home/shared
     rm config
     mv config.initial config
-    source ~/config/user.env
+    source ~/oosh/boot
     #oo update
     rm -rf oosh.http
     sudo rm -rf .ssh
@@ -2211,128 +2776,230 @@ oo.install.dev() # # DEPRECATED install the official dev oosh. GitHub keys requi
 
 ## oo.mode.fullDebug — removed: use `oo mode fullDebug` (worktree-based switching)
 
-oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installes it with: $SUDO $PM <?packageName>
+private.oo.cmd.verify() # <cmd> # predicate: is <cmd> on PATH after an install attempt; the reason, including the macOS installed-but-not-on-PATH diagnostic, is in $RESULT for the caller to log
 {
-    current=$1
-    shift
-    package=$1
+  # The post-condition oo.cmd's own comment used to defer to
+  # ossh.prereqs.install for. Moved here from private.ossh.prereqs.verify so
+  # oo.cmd can enforce it itself.
+  #
+  # A predicate, so NO logging in here: each caller decides the severity
+  # (oo.cmd: error, ossh.prereqs.install: warn) and logs $RESULT once. That is
+  # what lets the callers drop their >/dev/null 2>&1 — which was swallowing
+  # the very diagnostic this function exists to deliver whenever LOG_DEVICE
+  # is not a tty — and stops the reason being logged twice when it is.
+  local cmd="$1"
+  if [ -z "$cmd" ]; then
+    create.result 1 "private.oo.cmd.verify requires <cmd>"
+    return $(result)
+  fi
 
-    if [ -z "$1" ]; then
-        package=$current
-    else
+  if command -v "$cmd" >/dev/null 2>&1; then
+    create.result 0 "$cmd is on PATH"
+    return $(result)
+  fi
+
+  local reason="$cmd is still not on PATH after install (OOSH_PM='${OOSH_PM:-<unset>}' OSTYPE='$OSTYPE' brew=$(command -v brew 2>/dev/null || echo none))"
+  case "$OSTYPE" in
+    darwin*)
+      # The failure mode this diagnostic exists for: brew installed it into a
+      # prefix that is not on this shell's PATH.
+      local brewPath
+      for brewPath in /opt/homebrew/bin /usr/local/bin; do
+        [ -x "$brewPath/$cmd" ] && reason="$reason; $brewPath/$cmd exists but is not on PATH"
+      done
+      ;;
+  esac
+  create.result 1 "$reason"
+  return $(result)
+}
+
+oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it with: $SUDO $OOSH_PM <?packageName>, then verifies it landed
+{
+    # Argument order is the chaining protocol: consume our own arguments, then
+    # hand the token the NEXT command starts at to create.result's third
+    # parameter. This used to be a bare `RETURN=$1` as the function's LAST
+    # statement, which pinned the exit status at 0 (a variable assignment
+    # always succeeds) and set RETURN="" — which never matches, so this.start
+    # shifted through every remaining argument, hit "force stop" and exited,
+    # silently swallowing the rest of a chained line.
+    local current="$1"
+    shift
+    local package="$1"
+    if [ -n "$package" ]; then
       shift
-      package=$1
-    fi   
-    
+    else
+      # One-argument form: the command IS the package name.
+      package="$current"
+    fi
+
+    if [ -z "$current" ]; then
+      create.result 1 "oo.cmd requires <cmd>" "$1"
+      error.log "$RESULT"
+      return $(result)
+    fi
+
     if [ -z "$OOSH_PM" ]; then
-      console.log "no PM found...checking" 
+      console.log "no PM found...checking"
       oo.pm.discover
     fi
-    if ! [ -x "$(command -v $current)" ]; then
-        console.log "no $current"
-        if [ -n "$OOSH_PM" ]; then
-          case $current in
-            eamd)
-              once load $current tla/EAMD/UcpComponentSupport/1.0.0/src/sh/eamd
-              export PATH="$PATH:$ONCE_LOAD_DIR"
-              hash -d eamd    #clears the command cache for eamd
-              #hash -r   #clears the command cache completley
-              ;;
-            oosh)
-              once load $current com/ceruleanCircle/EAM/1_infrastructure/OOSH/1.0.0/src/sh/oosh
-              ;;
-            once)
-              once load once.sh tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/once.sh
-              cd $ONCE_LOAD_DIR
-              mv once.sh once
-              private.stage status
-              ;;
-            # npm)
-            #   # if ! which $current > /dev/null; then
-            #     once.su.npm.install
-              # else
-              #   console.log "$current allready installed!";
-              # fi
-              # exit;
-            # ;;
-            brew)
-              if [ "$(uname -s)" = "Darwin" ]; then
-                console.log "Installing Homebrew..."
-                NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-                for _brew_path in /opt/homebrew/bin /usr/local/bin; do
-                  if [ -x "$_brew_path/brew" ]; then
-                    export PATH="$_brew_path:$PATH"
-                    break
-                  fi
-                done
-                oo.pm.discover
-              else
-                warn.log "brew is only available on macOS"
-              fi
-              ;;
-            mkcert)
-              once.su.mkcert.install
-              ;;
-            update)
-              if [ -z "$OOSH_PM_UPDATED" ]; then
-                if command -v apt-get >/dev/null 2>&1; then
-                  OOSH_PM_UPDATED="$SUDO apt-get update"
-                elif command -v dnf >/dev/null 2>&1; then
-                  OOSH_PM_UPDATED="$SUDO dnf makecache"
-                elif command -v yum >/dev/null 2>&1; then
-                  OOSH_PM_UPDATED="$SUDO yum makecache"
-                else
-                  warn.log "No known package manager found for update"
-                fi
-                if [ -n "$OOSH_PM_UPDATED" ]; then
-                  $OOSH_PM_UPDATED
-                fi
-              else
-                warn.log "Package manager already updated with: $OOSH_PM_UPDATED"
-              fi
-              ;;
-            errno)
-              oo cmd python3 python3
-              ;;
-            *)
-              if [ "$OOSH_PM" = "brew install" ]; then
-                # Homebrew refuses to run as root since v2.0
-                # ("Running Homebrew as root is extremely dangerous and no
-                # longer supported"). When init/oosh has sudo-re-exec'd to
-                # root before reaching `oo cmd <pkg>` (the standard install
-                # path), drop privileges back to $SUDO_USER — sudo preserves
-                # this var to the original invoking user. -H sets HOME to
-                # that user's home so brew finds its config + cache there.
-                # If we're truly root (no $SUDO_USER), fall through and let
-                # brew error out loudly — the verify post-condition in
-                # ossh.prereqs.install will surface the diagnostic.
-                if [ "$(id -u)" = "0" ] && [ -n "$SUDO_USER" ]; then
-                  sudo -u "$SUDO_USER" -H brew install $package
-                else
-                  brew install $package
-                fi
-              else
-                $SUDO $OOSH_PM $package
-              fi
-            esac
-        else
-            console.log "no package manger"
-        fi
-        if [ -n "$1" ]; then
-          shift
-        fi
-    else
-      # Command exists but may be a BusyBox stub with limited functionality
+
+    if command -v "$current" >/dev/null 2>&1; then
+      # Already present — the idempotency every caller relies on. The package
+      # manager must NOT be invoked here.
       case $current in
         wget)
+          # BusyBox ships a wget stub with too few options for our use.
           if wget --help 2>&1 | grep -q "BusyBox"; then
             console.log "BusyBox wget detected — installing full wget"
             $SUDO $OOSH_PM wget
+            # The stub is still there, so this is advisory, not a failure.
+            private.oo.cmd.verify wget || warn.log "$RESULT"
           fi
           ;;
       esac
+      create.result 0 "$current already present" "$1"
+      return $(result)
     fi
-    RETURN=$1
+
+    console.log "no $current"
+
+    if [ -z "$OOSH_PM" ]; then
+      create.result 1 "no package manager found — cannot install $current" "$1"
+      error.log "$RESULT"
+      return $(result)
+    fi
+
+    local rc=0
+    case $current in
+      eamd|oosh|once)
+        # These delegate to `once`, which is not part of this tree. Fail
+        # loudly naming what is missing rather than emitting "command not
+        # found" and reporting success.
+        if ! command -v once >/dev/null 2>&1; then
+          create.result 1 "$current needs \`once\`, which is not installed in this tree" "$1"
+          error.log "$RESULT"
+          return $(result)
+        fi
+        case $current in
+          eamd)
+            once load $current tla/EAMD/UcpComponentSupport/1.0.0/src/sh/eamd || rc=$?
+            # path-exception: session scope — `once load` puts the loaded class
+            # in $ONCE_LOAD_DIR and it has to be callable in this shell.
+            export PATH="$PATH:$ONCE_LOAD_DIR"
+            hash -d eamd    #clears the command cache for eamd
+            ;;
+          oosh)
+            once load $current com/ceruleanCircle/EAM/1_infrastructure/OOSH/1.0.0/src/sh/oosh || rc=$?
+            ;;
+          once)
+            once load once.sh tla/EAM/layer1/Thinglish/Once/latestServer/src/sh/once.sh || rc=$?
+            ;;
+        esac
+        ;;
+      brew)
+        case "$OSTYPE" in
+          darwin*)
+            console.log "Installing Homebrew..."
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || rc=$?
+            local brewPath
+            for brewPath in /opt/homebrew/bin /usr/local/bin; do
+              if [ -x "$brewPath/brew" ]; then
+                # path-exception: Homebrew has just been installed in this
+                # process; brew must be callable before the shell restarts.
+                export PATH="$brewPath:$PATH"
+                break
+              fi
+            done
+            oo.pm.discover
+            ;;
+          *)
+            create.result 1 "brew is only available on macOS (OSTYPE='$OSTYPE')" "$1"
+            warn.log "$RESULT"
+            return $(result)
+            ;;
+        esac
+        ;;
+      mkcert)
+        # Delegates to once.su.mkcert.install, a function defined nowhere in
+        # this tree.
+        if ! this.functionExists once.su.mkcert.install; then
+          create.result 1 "$current needs the function once.su.mkcert.install, which is not defined in this tree" "$1"
+          error.log "$RESULT"
+          return $(result)
+        fi
+        once.su.mkcert.install || rc=$?
+        ;;
+      update)
+        # Refreshes the PM cache; there is no command to verify afterwards.
+        if [ -n "$OOSH_PM_UPDATED" ]; then
+          create.result 0 "package manager already updated with: $OOSH_PM_UPDATED" "$1"
+          return $(result)
+        fi
+        if command -v apt-get >/dev/null 2>&1; then
+          OOSH_PM_UPDATED="$SUDO apt-get update"
+        elif command -v dnf >/dev/null 2>&1; then
+          OOSH_PM_UPDATED="$SUDO dnf makecache"
+        elif command -v yum >/dev/null 2>&1; then
+          OOSH_PM_UPDATED="$SUDO yum makecache"
+        else
+          create.result 1 "no known package manager found for update" "$1"
+          warn.log "$RESULT"
+          return $(result)
+        fi
+        if $OOSH_PM_UPDATED; then
+          create.result 0 "package manager cache refreshed with: $OOSH_PM_UPDATED" "$1"
+        else
+          create.result 1 "package manager cache refresh failed: $OOSH_PM_UPDATED" "$1"
+          error.log "$RESULT"
+        fi
+        return $(result)
+        ;;
+      errno)
+        oo cmd python3 python3 || rc=$?
+        ;;
+      *)
+        if [ "$OOSH_PM" = "brew install" ]; then
+          # Homebrew refuses to run as root since v2.0 ("Running Homebrew as
+          # root is extremely dangerous and no longer supported"). When
+          # init/oosh has sudo-re-exec'd to root before reaching `oo cmd
+          # <pkg>` (the standard install path), drop privileges back to
+          # $SUDO_USER — sudo preserves this var to the original invoking
+          # user. -H sets HOME to that user's home so brew finds its config
+          # and cache there.
+          if [ "$(id -u)" = "0" ] && [ -n "$SUDO_USER" ]; then
+            sudo -u "$SUDO_USER" -H brew install $package || rc=$?
+          else
+            brew install $package || rc=$?
+          fi
+        else
+          $SUDO $OOSH_PM $package || rc=$?
+        fi
+        ;;
+    esac
+
+    if [ "$rc" -ne 0 ]; then
+      create.result 1 "installing $package for $current failed (package manager exit $rc)" "$1"
+      error.log "$RESULT"
+      return $(result)
+    fi
+
+    # Post-condition: the package manager reporting success is not the same as
+    # the command being usable. Verify, and fail loudly if it did not land.
+    if private.oo.cmd.verify "$current"; then
+      create.result 0 "$current installed from $package" "$1"
+    else
+      # $RESULT is the predicate's reason; it names the tool and the PM.
+      create.result 1 "$package installed without error but $RESULT" "$1"
+      error.log "$RESULT"
+    fi
+    return $(result)
+}
+
+oo.cmd.completion.packageName() {
+  # NEVER create.result here — it corrupts c2's completion protocol.
+  # <cmd> already completes via the script-wide oo.parameter.completion.cmd;
+  # the package name is usually the same word, so offer the same candidates.
+  compgen -c "$1" 2>/dev/null | head -20
 }
 
 oo.prereqs.install() # # install the oosh install-time prereqs locally — git and curl — plus bash 4+ if the running shell is older
@@ -2420,8 +3087,28 @@ private.check.pm()             # checks for a package manager
     else
         if [ -z "$OOSH_PM" ]; then
             export OOSH_PM=$packageManagerCommand
-            export OS_CMD_GROUP_ADD=$3
-            export OS_CMD_USER_ADD=$4
+            # Only write what we were GIVEN. These two exports were
+            # unconditional, so a call site that passes no group/user command —
+            # `brew`, the macOS one (oo:3093), and dpkg/pkg/pacman — set both to
+            # the EMPTY STRING and then persisted them with the
+            # `config save os.commands` below. A clean Sequoia install therefore
+            # carried OS_CMD_GROUP_ADD="" and OS_CMD_USER_ADD="" for good, while
+            # every Linux install carried real values.
+            #
+            # NOT fixed by adding darwin's commands here: private.user.init
+            # already knows them (user:1633-1636 — `dseditgroup -o create -q`,
+            # `sysadminctl -addUser`) and heals whichever are empty. Writing
+            # them here too would put the same knowledge in two places. Leaving
+            # them UNSET is what lets that heal run — and the heal is what makes
+            # the cache go healthy, which is what stops private.user.init
+            # invoking `oo pm.discover` on every single call.
+            # See docs/research/2026-09-17-shared-tier-leak-macos.md.
+            if [ -n "$3" ]; then
+                export OS_CMD_GROUP_ADD="$3"
+            fi
+            if [ -n "$4" ]; then
+                export OS_CMD_USER_ADD="$4"
+            fi
             echo "Package Manager found: using $OOSH_PM somePackage"
             if [ "$packageManager" = "apt-get" ]; then
                 if [ -z "$OOSH_PM_UPDATED" ]; then
@@ -2450,8 +3137,13 @@ private.check.all.pm()         # adds tools and configurations to package manage
     private.check.pm yum "yum -y install" "groupadd -f" "useradd -g dev"
     private.check.pm apk "apk add" "addgroup" "adduser -g dev"
     private.check.pm dpkg "dpkg install"
-    private.check.pm pkg "pkg install"
-    private.check.pm pacman "pacman -S"
+    private.check.pm pkg "pkg install -y"
+    # -y / --noconfirm are NOT optional. `oo cmd <tool>` runs these during an
+    # install; without them pacman and pkg stop on a confirmation prompt and the
+    # install hangs with no output explaining why. init/oosh:214-222 and
+    # ossh:2604-2616 have always carried the flags — oo was the odd one out, and
+    # nothing compared the four copies until T-PM-TABLES-AGREE.
+    private.check.pm pacman "pacman -S --noconfirm"
 
  
 }
@@ -2523,6 +3215,139 @@ oo.su() {
   fi
 }
 
+oo.method.delete()     # <script.method> # removes a method and its completion functions from the script; reports the test cases that still reference it #
+{
+  # The counterpart of oo.method.new, and the reason it exists: a method is a
+  # BLOCK — its docstring, its body and one completion function per parameter.
+  # Deleting it by hand removes the body and leaves the rest orphaned, which
+  # is how `path` came to carry completion functions for verbs it no longer
+  # had. Built on `replace block`, so the .bak/.new transaction and the
+  # exactly-one-match refusal come for free.
+  #
+  # It deliberately does NOT delete the test case. A test case has no
+  # delimiters — it is a `test.case` line, a call and one or more `expect`s,
+  # freely interleaved with fixtures — so guessing its extent would silently
+  # eat assertions. The references are REPORTED instead, for a human to remove.
+  #
+  # It addresses a method as <script>.<method>, so it cannot reach a LEGACY
+  # private helper whose name carries no script segment — `private.update.config`
+  # lived in `path`, but nothing in the name said so. Remove one of those with
+  # the command this is built on: `replace block <file> "<its first line>" "}"
+  # by ""`. Modern privates (private.oo.cmd.verify) are named after their
+  # script and need no special case.
+  local name="$1"
+  if [ -z "$name" ]; then
+    error.log "oo.method.delete: no method given — expected <script>.<method>, e.g. path.status"
+    create.result 1 "no method given"
+    return $(result)
+  fi
+  local script="${name%%.*}"
+  local method="${name#*.}"
+  if [ -z "$method" ] || [ "$method" = "$name" ]; then
+    error.log "oo.method.delete: no method name in '$name' — expected <script>.<method>, e.g. path.status"
+    create.result 2 "no method name in '$name'"
+    return $(result)
+  fi
+
+  local file="$OOSH_DIR/$script"
+  if ! check file "$file" exists fix error.log "$file does not exist"; then
+    create.result 3 "$file does not exist"
+    return $(result)
+  fi
+
+  # The method itself, then every completion function that belongs to it:
+  # <script>.<method>.completion and <script>.<method>.completion.<param>.
+  # A `private.` sibling is NOT swept — nothing can prove it had only this
+  # one caller — so it is reported like the tests are.
+  local escaped="$(private.oo.regex.escape.get "$script.$method")"
+  local targets removed=0 target startLine
+  # `[[:space:]]*` before the parens: a handful of legacy methods are written
+  # `name ()` with a space (path.file.global.use was one), and the tool has to
+  # find those too or it reports a method that plainly exists as missing.
+  targets=$(grep -E "^${escaped}(\.completion(\.[A-Za-z0-9_]+)?)?[[:space:]]*\(\)" "$file" 2>/dev/null)
+
+  if [ -z "$targets" ]; then
+    error.log "oo.method.delete: $script.$method is not defined in $file"
+    create.result 4 "$script.$method not found in $file"
+    return $(result)
+  fi
+
+  while IFS= read -r startLine; do
+    [ -z "$startLine" ] && continue
+    case "$startLine" in
+      # A one-liner — `x.completion.y() { echo a; echo b; }` — has no closing
+      # `}` LINE, so the block form would run on to the next function's brace.
+      *"}")
+        if replace line "$file" "$startLine" by "" && replace commit "$file"; then
+          removed=$((removed + 1))
+        else
+          error.log "oo.method.delete: could not remove the one-line definition: $startLine"
+        fi
+        ;;
+      *)
+        if replace block "$file" "$startLine" "}" by "" && replace commit "$file"; then
+          removed=$((removed + 1))
+        else
+          error.log "oo.method.delete: could not remove the block starting: $startLine"
+        fi
+        ;;
+    esac
+    replace cleanup "$file"
+  done <<< "$targets"
+
+  # What is left behind for a human: test cases, and any private helper named
+  # after the method.
+  local refs refCount
+  refs=$(grep -rn -F -- "$script.$method" "$OOSH_DIR/test" 2>/dev/null)
+  refCount=$(printf '%s' "$refs" | grep -c . )
+  if [ "${refCount:-0}" -gt 0 ]; then
+    important.log "oo.method.delete: $refCount test reference(s) to $script.$method remain — remove them deliberately:"
+    important.log "$refs"
+  fi
+  local helpers
+  helpers=$(grep -E "^private\.${escaped}" "$file" 2>/dev/null)
+  if [ -n "$helpers" ]; then
+    important.log "oo.method.delete: private helper(s) named after $script.$method are still in $file — check their callers before removing:"
+    important.log "$helpers"
+  fi
+
+  success.log "removed $removed definition(s) of $script.$method from $file"
+  create.result 0 "$script.$method removed from $script — $removed definition(s), $refCount test reference(s) remain"
+  return $(result)
+}
+
+private.oo.regex.escape.get() # <text> # <text> with every ERE metacharacter backslash-escaped; answers on stdout
+{
+  # NO create.result — a getter consumed as $(...) runs in a subshell, so
+  # RESULT would never reach the caller. Same reasoning as
+  # private.oo.method.stubs.get.
+  printf '%s' "$1" | sed 's/[][\.*^$(){}?+|/]/\\&/g'
+}
+
+oo.method.delete.completion.script() {
+  # Hand-written rather than generated, and the reason belongs here:
+  # private.oo.method.stubs.get skips any parameter whose name is not purely
+  # alphanumeric, and this one is `<script.method>`.
+  #
+  # NO create.result, and nothing that calls it — a completion function that
+  # does corrupts c2 (docs/completion-system.md).
+  local word="$1"
+  case "$word" in
+    *.*)
+      local script="${word%%.*}"
+      [ -f "$OOSH_DIR/$script" ] || return 0
+      grep -oE "^${script}\.[A-Za-z0-9_.]+\(\)" "$OOSH_DIR/$script" 2>/dev/null | sed 's/()$//'
+      ;;
+    *)
+      # Extensionless files in $OOSH_DIR are the method-scripts.
+      ls -1 "$OOSH_DIR" 2>/dev/null | grep -vE '[.]'
+      ;;
+  esac
+}
+
+
+### new.method
+
 oo.usage()
 {
   local this=${0##*/}
@@ -2563,6 +3388,24 @@ oo.parameter.completion.stage() {
 }
 
 oo.mode.base.set.completion.path() { compgen -d "$1"; }
+
+oo.parameter.completion.systemPath() {
+  # <systemPath> of oo boot.fix / oo boot.status. Offer the canonical default
+  # first, then whatever directories the user is typing towards (tests and
+  # dry-runs drive these methods against a fixture path). Direct compgen, no
+  # create.result — see [[project-create-result-breaks-c2-completion]].
+  echo "/etc/oosh"
+  compgen -d "$1"
+}
+
+oo.parameter.completion.profileDir() {
+  # <profileDir> of oo boot.fix / oo boot.status. Canonical default first, then
+  # whatever the user is typing towards (tests drive these against fixtures).
+  # Direct compgen, no create.result — see
+  # [[project-create-result-breaks-c2-completion]].
+  echo "/etc/profile.d"
+  compgen -d "$1"
+}
 
 oo.parameter.completion.baseBranch() {
   # Delegates to private.oo.completion.worktree.branches — see its

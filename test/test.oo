@@ -12,6 +12,14 @@ echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 source this
 source test.suite
+
+# `config set` / `config save` below are teardown bookkeeping, but `config` is
+# an external process that writes whatever CONFIG_PATH it inherits — the
+# site-wide sharedConfig every user sources at login. Fixture it. Must come
+# before the SAVE_* snapshots below, which capture OOSH_*/PATH, not the config
+# anchors, and are unaffected.
+test.suite.config.isolate test.oo >/dev/null || exit 1
+
 source $OOSH_DIR/oo
 
 log.level $level
@@ -131,15 +139,28 @@ SAVE_PATH="$PATH"
 
 # Build fixture: worktree base with two git dirs, one plain dir, one symlink
 MODE_FIXTURE="/tmp/test.oo.mode.$$"
+# CANONICALISE the fixture root before anything derives from it. On macOS /tmp
+# is a symlink to /private/tmp (and $TMPDIR lives under /var/folders, itself
+# reached through /private), so a path the code under test RESOLVES can never
+# equal this literal and every comparison against it fails — eight assertions'
+# worth on a clean Sequoia install. private.this.path.canonical is the tree's
+# portable resolver (the platform-test template names it for this exact reason:
+# GNU `readlink -f` is missing on BSD). On Linux it is a no-op, so this cannot
+# change anything here.
+mkdir -p "$MODE_FIXTURE"
+MODE_FIXTURE=$(private.this.path.canonical "$MODE_FIXTURE")
 MODE_LINK="$MODE_FIXTURE/ooshTestLink"
 mkdir -p "$MODE_FIXTURE/main" "$MODE_FIXTURE/dev" "$MODE_FIXTURE/notGit"
 git init "$MODE_FIXTURE/main" >/dev/null 2>&1
 git init "$MODE_FIXTURE/dev"  >/dev/null 2>&1
 ln -s "$MODE_FIXTURE/dev" "$MODE_LINK"
+ln -sfn "$MODE_FIXTURE/dev" "$MODE_FIXTURE/oosh"
 
-# Point the mode system at the fixture
+# Point the mode system at the fixture. OOSH_DIR is ALWAYS ~/oosh (docs/boot.md)
+# and HOME is overridden to $MODE_FIXTURE inside the mode tests, so the fixture
+# value is the fixture's own oosh SYMLINK — not the worktree it points at.
 export OOSH_COMPONENTS_DIR="$MODE_FIXTURE"
-export OOSH_DIR="$MODE_FIXTURE/dev"
+export OOSH_DIR="$MODE_FIXTURE/oosh"
 export PATH="$MODE_FIXTURE/dev:$PATH"
 
 # ============================================================================
@@ -173,18 +194,23 @@ test.case - "T-MODE-1: oo.mode switches symlink to target branch" \
 expect 0 "$MODE_FIXTURE/main" "symlink points to main after oo.mode main"
 
 # ============================================================================
-# T-MODE-2: oo.mode updates OOSH_DIR
+# T-MODE-2: oo.mode leaves OOSH_DIR alone — it is the CONSTANT ~/oosh, and the
+# switch happens by repointing that symlink (docs/boot.md "The OOSH_DIR rule").
+# So after T-MODE-1 switched to main: OOSH_DIR is still the fixture's ~/oosh,
+# and resolving it AT POINT OF USE yields the main worktree.
 # ============================================================================
 test.oo.mode.dir() {
-  if [[ "$OOSH_DIR" == */main ]]; then
-    create.result 0 "$OOSH_DIR"
+  local resolved
+  resolved=$(private.this.path.canonical "$OOSH_DIR")
+  if [ "$OOSH_DIR" = "$MODE_FIXTURE/oosh" ] && [ "$resolved" = "$MODE_FIXTURE/main" ]; then
+    create.result 0 "$OOSH_DIR -> $resolved"
   else
-    create.result 1 "OOSH_DIR=$OOSH_DIR (expected */main)"
+    create.result 1 "OOSH_DIR=$OOSH_DIR resolved=$resolved (expected $MODE_FIXTURE/oosh -> $MODE_FIXTURE/main)"
   fi
 }
-test.case - "T-MODE-2: oo.mode updates OOSH_DIR after switch" \
+test.case - "T-MODE-2: oo.mode keeps OOSH_DIR at ~/oosh; the symlink follows" \
   test.oo.mode.dir
-expect 0 "*" "OOSH_DIR ends with /main"
+expect 0 "$MODE_FIXTURE/oosh -> $MODE_FIXTURE/main" "OOSH_DIR unchanged, resolves to main"
 
 # ============================================================================
 # T-MODE-3: oo.mode switches back to dev
@@ -200,7 +226,8 @@ test.oo.mode.switchBack() {
   target=$(readlink "$MODE_FIXTURE/oosh")
   HOME="$HOME_ORIG"
 
-  if [ $rc -eq 0 ] && [ "$target" = "$MODE_FIXTURE/dev" ] && [[ "$OOSH_DIR" == */dev ]]; then
+  # OOSH_DIR must NOT have moved — it is the constant ~/oosh; only the symlink did.
+  if [ $rc -eq 0 ] && [ "$target" = "$MODE_FIXTURE/dev" ] && [ "$OOSH_DIR" = "$MODE_FIXTURE/oosh" ]; then
     create.result 0 "$target"
   else
     create.result 1 "rc=$rc target=$target OOSH_DIR=$OOSH_DIR"
@@ -458,10 +485,9 @@ fi
 # T-MODE-COMPLETION-LAZY-USERENV: macstudio-root contract — what state 31
 # must satisfy for completion to work end-to-end.
 # ----------------------------------------------------------------------------
-# sharedConfig/user.env uses a LAZY assignment:
-#   : ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}
-# So OOSH_DIR resolves relative to $HOME/oosh after `pwd -P` strips
-# symlinks. The contract that makes `oo mode <TAB>` work for any user
+# $OOSH_DIR/boot sets the constant `OOSH_DIR="$HOME/oosh"`, and consumers that
+# need the physical worktree resolve it at point of use (oo.mode.base.get does).
+# The contract that makes `oo mode <TAB>` work for any user
 # (including root) is:
 #   - $HOME/oosh must be a SYMLINK to a worktree under sharedOoshBase.
 # If $HOME/oosh is a REAL directory (e.g. root's initial init/oosh clone
@@ -480,14 +506,13 @@ git -C "$LE_FIXTURE/sharedBase/main" -c user.email=test@example -c user.name=tes
 git -C "$LE_FIXTURE/sharedBase/main" worktree add "../dev"     -b dev     >/dev/null 2>&1
 git -C "$LE_FIXTURE/sharedBase/main" worktree add "../testing" -b testing >/dev/null 2>&1
 
-# Helper that mimics the lazy assignment in sharedConfig/user.env.
-# Run in a fresh bash with OOSH_DIR explicitly unset so the lazy
-# `${OOSH_DIR:=…}` actually fires (otherwise it inherits the parent
-# test's value and the test becomes a no-op).
+# Helper that mimics what boot does for a given $HOME. Run in a fresh bash with
+# OOSH_DIR explicitly unset so the assignment actually fires (otherwise it
+# inherits the parent test's value and the test becomes a no-op).
 private.test.lazy.oosh.dir() {
   local fakeHome="$1"
   HOME="$fakeHome" env -u OOSH_DIR bash -c '
-    : ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}
+    : ${OOSH_DIR:="$HOME/oosh"}
     echo "$OOSH_DIR"
   '
 }
@@ -518,7 +543,7 @@ test.oo.mode.completionLazyRealDir() {
 }
 test.case - "T-MODE-COMPLETION-LAZY-USERENV-A: real-dir ~/oosh → completion empty" \
   test.oo.mode.completionLazyRealDir
-expect 0 "empty (real dir → no base)" "private-clone ~/oosh yields empty completion via lazy user.env"
+expect 0 "empty (real dir → no base)" "private-clone ~/oosh yields empty completion (OOSH_DIR resolves into the clone)"
 
 # Scenario B: $HOME/oosh is a SYMLINK to a worktree (correct post-state-31).
 test.oo.mode.completionLazySymlink() {
@@ -551,7 +576,7 @@ test.oo.mode.completionLazySymlink() {
 }
 test.case - "T-MODE-COMPLETION-LAZY-USERENV-B: symlinked ~/oosh → completion shows all worktree branches" \
   test.oo.mode.completionLazySymlink
-expect 0 "main+dev+testing" "symlinked ~/oosh yields full worktree-branch list via lazy user.env"
+expect 0 "main+dev+testing" "symlinked ~/oosh yields full worktree-branch list (OOSH_DIR resolves into the shared tree)"
 
 # ============================================================================
 # T-MODE-COMPLETION-LAZY-USERENV-ENSURE: state-31 helper produces the
@@ -564,7 +589,7 @@ expect 0 "main+dev+testing" "symlinked ~/oosh yields full worktree-branch list v
 # This test calls private.oo.user.shared.symlinks.ensure (the helper
 # that state 31's root-symlink block delegates to) against THIS exact
 # pre-state and asserts the post-state matches the contract: both
-# ~/config and ~/oosh are symlinks; lazy user.env-resolved OOSH_DIR
+# ~/config and ~/oosh are symlinks; OOSH_DIR (=~/oosh) resolves at point of use
 # now points at the shared worktree; oo.mode.completion.branch shows
 # the worktree branches.
 #
@@ -618,12 +643,10 @@ test.oo.user.symlinks.ensure() {
   [ -L "$fakeHome/oosh" ]   && ooshIsLink=true
   ls -d "$fakeHome"/oosh.orig.* >/dev/null 2>&1 && oldOoshPreserved=true
 
-  # And the lazy ${OOSH_DIR:=…} now resolves to the shared dev worktree.
+  # And ~/oosh — which IS $OOSH_DIR — now resolves to the shared dev worktree
+  # when a consumer canonicalizes it at point of use.
   local resolved
-  resolved=$(HOME="$fakeHome" env -u OOSH_DIR bash -c '
-    : ${OOSH_DIR:="$(cd "$HOME/oosh" 2>/dev/null && pwd -P || echo "$HOME/oosh")"}
-    echo "$OOSH_DIR"
-  ')
+  resolved=$(private.this.path.canonical "$(private.test.lazy.oosh.dir "$fakeHome")")
   local resolvedExpected
   resolvedExpected=$(cd "$EN_FIXTURE/sharedBase/dev" && pwd -P)
 
@@ -887,7 +910,13 @@ rm -rf "$MODE_FIXTURE"
 # fixture path might have introduced. The prune only touches paths
 # that no longer exist on disk, so legitimate worktree entries are
 # preserved. Silent (errors swallowed) — this is housekeeping.
-oo.safeDirectory.prune >/dev/null 2>&1
+# GIT_CONFIG_GLOBAL, like T-MODE-NOLEAK at :283 and T-SAFEDIR-PRUNE below:
+# CONFIG_PATH cannot redirect ~/.gitconfig, and oo.safeDirectory.prune writes it
+# through `git config --global`. Its own mktemp, because $MODE_FIXTURE has
+# already been removed two lines above.
+_PRUNE_SANDBOX=$(mktemp "${TMPDIR:-/tmp}/test.oo.prune.gitconfig.XXXXXX")
+GIT_CONFIG_GLOBAL="$_PRUNE_SANDBOX" oo.safeDirectory.prune >/dev/null 2>&1
+rm -f "$_PRUNE_SANDBOX" 2>/dev/null
 
 # ============================================================================
 # T-SAFEDIR-PRUNE: oo.safeDirectory.prune keeps real paths, drops stale
@@ -925,9 +954,10 @@ expect 0 "kept only real path" "prune keeps real paths, drops stale"
 # ============================================================================
 # T-SAFEDIR-ADD-IDEMPOTENT: private.oo.safeDirectory.add deduplicates
 # ----------------------------------------------------------------------------
-# Regression for the duplicate-prod bug. The install path at
-# private.oo.shared.tree.from.local calls private.oo.safeDirectory.add
-# for the resolved worktree and main paths on every (re)install.
+# Regression for the duplicate-prod bug. The install path calls
+# private.oo.safeDirectory.add for the resolved worktree and main paths on
+# every (re)install. (It is install state 31 that calls it, not
+# private.oo.shared.tree.from.local — this comment named the wrong function.)
 # Calling the helper N times with the same path must yield exactly
 # one entry in the global config — earlier versions used raw
 # `git config --global --add` and accumulated duplicates each
@@ -1334,6 +1364,10 @@ rm -rf "$SHIM_FIXTURE"
 # ============================================================================
 
 SETUP_FIXTURE="/tmp/test.oo.setup.$$"
+# Canonicalised for the same reason as MODE_FIXTURE above: on macOS /tmp is a
+# symlink, so a resolved path never equals this literal. No-op on Linux.
+mkdir -p "$SETUP_FIXTURE"
+SETUP_FIXTURE=$(private.this.path.canonical "$SETUP_FIXTURE")
 SAVE_SETUP_OOSH_DIR="$OOSH_DIR"
 SAVE_SETUP_OOSH_MODE="$OOSH_MODE"
 SAVE_SETUP_OOSH_COMPONENTS_DIR="$OOSH_COMPONENTS_DIR"
@@ -1349,24 +1383,31 @@ test.oo.setup.functionExists() {
   else
     create.result 1 "oo.mode.setup not found"
   fi
+  return $(result)
 }
 test.case - "T-SETUP-1: oo.mode.setup function exists" \
   test.oo.setup.functionExists
 expect 0 "oo.mode.setup is defined" "oo.mode.setup function exists"
 
 # ============================================================================
-# T-SETUP-2: mode.setup rejects non-git directory
+# T-SETUP-2: mode.setup refuses a directory with no branch
 # ============================================================================
+# This used to be called "rejects non-git directory" and mode.setup had no git
+# check — the rc 1 it saw came from the empty-branch path, so any unrelated
+# future rc-1 kept it green. It also used `expect 1 "*"`, which is vacuous, and
+# an `expect.error 1` that is inert here (that sets EXPECTED_RETURN_VALUE for
+# the onError trap, while test.case keys on TEST_EXPECTING_ERROR). The rewrite
+# gives the refusal a real RESULT, so both halves of the assertion now bite.
 test.oo.setup.nonGit() {
   mkdir -p "$SETUP_FIXTURE/nogit"
   export OOSH_DIR="$SETUP_FIXTURE/nogit"
   export OOSH_COMPONENTS_DIR="$SETUP_FIXTURE"
-  oo.mode.setup "$SETUP_FIXTURE" 2>/dev/null
+  oo.mode.setup "$SETUP_FIXTURE" >/dev/null 2>&1
+  return $(result)
 }
-expect.error 1
-test.case - "T-SETUP-2: mode.setup rejects non-git directory" \
+test.case - "T-SETUP-2: mode.setup refuses a directory with no detectable branch" \
   test.oo.setup.nonGit
-expect 1 "*" "mode.setup returns error for directory without git"
+expect 1 "no branch detected in $SETUP_FIXTURE/nogit" "a plain directory is not a clone, and the refusal says so"
 rm -rf "$SETUP_FIXTURE"
 export OOSH_DIR="$SAVE_SETUP_OOSH_DIR"
 export OOSH_MODE="$SAVE_SETUP_OOSH_MODE"
@@ -1374,14 +1415,16 @@ export OOSH_COMPONENTS_DIR="$SAVE_SETUP_OOSH_COMPONENTS_DIR"
 export PATH="$SAVE_SETUP_PATH"
 
 # ============================================================================
-# T-SETUP-3: mode.setup detects already-set-up worktrees
+# T-SETUP-3: mode.setup detects an already-canonical layout
 # ============================================================================
+# The fixture is the CANONICAL shape now: main/ with a real .git directory.
+# The old one was `mkdir -p base/dev/.git base/main/.git` and the old guard
+# accepted any subdirectory holding a .git, so a half-converted tree read as
+# done.
 test.oo.setup.alreadyExists() {
-  mkdir -p "$SETUP_FIXTURE/base/dev/.git" "$SETUP_FIXTURE/base/main/.git"
+  mkdir -p "$SETUP_FIXTURE/base/main/.git" "$SETUP_FIXTURE/base/dev"
   export OOSH_DIR="$SETUP_FIXTURE/base/dev"
   export OOSH_COMPONENTS_DIR="$SETUP_FIXTURE/base"
-  # Pre-set mode base so oo.mode.base.get returns our fixture
-  config set oosh OOSH_COMPONENTS_DIR "$SETUP_FIXTURE/base" 2>/dev/null
   local output
   output=$(oo.mode.setup "$SETUP_FIXTURE/base" 2>&1)
   local rc=$?
@@ -1390,10 +1433,11 @@ test.oo.setup.alreadyExists() {
   else
     create.result 1 "rc=$rc output=$output"
   fi
+  return $(result)
 }
-test.case - "T-SETUP-3: mode.setup detects already-set-up worktrees" \
+test.case - "T-SETUP-3: mode.setup detects an already-canonical layout" \
   test.oo.setup.alreadyExists
-expect 0 "already exists detected" "mode.setup recognizes existing worktree structure"
+expect 0 "already exists detected" "the guard is main/ with a real .git, not any subdir holding one"
 rm -rf "$SETUP_FIXTURE"
 export OOSH_DIR="$SAVE_SETUP_OOSH_DIR"
 export OOSH_MODE="$SAVE_SETUP_OOSH_MODE"
@@ -1402,45 +1446,159 @@ export PATH="$SAVE_SETUP_PATH"
 config save oosh OOSH 2>/dev/null
 
 # ============================================================================
-# T-SETUP-4: mode.setup creates dev dir from plain clone
+# T-SETUP-4: the acceptance criterion — a converted clone is DETECTABLE
 # ============================================================================
-test.oo.setup.createDev() {
-  local CLONE_DIR="$SETUP_FIXTURE/repo"
+# The old post-condition was `[ -d "$BASE_DIR/dev" ]`, which a bare `mkdir`
+# would satisfy. It never checked the one thing the ticket is about: that
+# oo.mode.base.get can find the base afterwards in a shell with no
+# OOSH_COMPONENTS_DIR — which is every shell but the one that ran setup.
+# It also ran the SUT inside $( ), hiding its exports.
+test.oo.setup.producesDetectableLayout() {
   local BASE_DIR="$SETUP_FIXTURE/base"
+  local CLONE_DIR="$BASE_DIR/oosh-clone"
   mkdir -p "$BASE_DIR"
-  # Create a real git repo on the dev branch
-  git init "$CLONE_DIR" >/dev/null 2>&1
-  (cd "$CLONE_DIR" && \
-   git config user.email "test@test" && git config user.name "test" && \
-   git checkout -b dev 2>/dev/null && \
-   git commit --allow-empty -m "init" >/dev/null 2>&1)
+  git init --initial-branch=main -q "$CLONE_DIR" >/dev/null 2>&1
+  (
+    cd "$CLONE_DIR"
+    git config user.email "test@test.local"
+    git config user.name "test"
+    git commit --allow-empty -q -m init
+    git checkout -q -b dev
+  ) >/dev/null 2>&1
 
-  # Move clone into the base directory to simulate the plain clone layout
-  mv "$CLONE_DIR" "$BASE_DIR/oosh-clone"
-
-  export OOSH_DIR="$BASE_DIR/oosh-clone"
-  # Force OOSH_COMPONENTS_DIR to empty so mode.base.get won't find stale worktrees
+  export OOSH_DIR="$CLONE_DIR"
   export OOSH_COMPONENTS_DIR=""
-  config set oosh OOSH_COMPONENTS_DIR "" 2>/dev/null
-
   HOME="$BASE_DIR"
-  # Create the symlink that mode.setup expects
-  ln -sf "$BASE_DIR/oosh-clone" "$BASE_DIR/oosh"
+  ln -sfn "$CLONE_DIR" "$BASE_DIR/oosh"
 
-  local output
-  output=$(oo.mode.setup "$BASE_DIR" 2>&1)
+  oo.mode.setup "$BASE_DIR" >/dev/null 2>&1
   local rc=$?
   HOME="$SAVE_SETUP_HOME"
 
-  if [ $rc -eq 0 ] && [ -d "$BASE_DIR/dev" ]; then
-    create.result 0 "dev dir created"
+  # The base as a shell WITHOUT OOSH_COMPONENTS_DIR would resolve it.
+  local detected
+  detected=$( unset OOSH_COMPONENTS_DIR; OOSH_DIR="$BASE_DIR/dev"; oo.mode.base.get 2>/dev/null )
+
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "mode.setup returned $rc"
+  elif [ ! -d "$BASE_DIR/main/.git" ]; then
+    create.result 1 "main/ is not a repository"
+  elif [ ! -f "$BASE_DIR/dev/.git" ] || ! grep -q '^gitdir: ' "$BASE_DIR/dev/.git"; then
+    create.result 1 "dev/ is not a linked worktree"
+  elif [ -e "$CLONE_DIR" ]; then
+    create.result 1 "the original clone is still there"
+  elif [ "$(readlink "$BASE_DIR/oosh")" != "$BASE_DIR/dev" ]; then
+    create.result 1 "the symlink points at $(readlink "$BASE_DIR/oosh")"
+  elif [ "$detected" != "$BASE_DIR" ]; then
+    create.result 1 "base.get without OOSH_COMPONENTS_DIR returned '${detected:-nothing}'"
   else
-    create.result 1 "rc=$rc dev_exists=$([ -d "$BASE_DIR/dev" ] && echo yes || echo no) output=$output"
+    create.result 0 "detectable layout"
   fi
+  return $(result)
 }
-test.case - "T-SETUP-4: mode.setup creates dev dir from plain clone" \
-  test.oo.setup.createDev
-expect 0 "dev dir created" "mode.setup moves clone to dev/ directory"
+test.case - "T-SETUP-4: a converted clone is canonical, consumed, linked and DETECTABLE" \
+  test.oo.setup.producesDetectableLayout
+expect 0 "detectable layout" "the point of the ticket: oo.mode.base.get must find the base in a shell that has no OOSH_COMPONENTS_DIR"
+
+# ============================================================================
+# T-BASE-GET-*: oo.mode.base.get without OOSH_COMPONENTS_DIR
+# ============================================================================
+# Nothing exercised these. Every existing fixture exports OOSH_COMPONENTS_DIR
+# and short-circuits on strategy 1, and T1 above is unfalsifiable on both
+# halves — so the four checks that actually run on every real host (strategies
+# 2, 3, 4a, 4b, all of which key on a directory literally named `main`) had no
+# coverage at all. Asserted by BEHAVIOUR rather than by strategy number: what
+# matters is whether a layout is detectable, not which branch of the function
+# noticed.
+private.test.oo.base.get.canonical() { # <baseDir> # build main/ + dev/ in <baseDir>
+  mkdir -p "$1"
+  ( cd "$1" \
+    && git init --initial-branch=main -q main \
+    && cd main \
+    && git config user.email "test@test.local" \
+    && git config user.name "test" \
+    && git commit --allow-empty -q -m seed \
+    && git worktree add -B dev ../dev main ) >/dev/null 2>&1
+}
+private.test.oo.base.get.probe() { # <ooshDir> # base.get with OOSH_COMPONENTS_DIR unset; echoes the base
+  ( unset OOSH_COMPONENTS_DIR; OOSH_DIR="$1"; oo.mode.base.get 2>/dev/null )
+}
+
+test.oo.baseGetFromWorktree() {
+  local fixture; fixture=$(test.suite.fixture.make test.oo.baseget.wt) \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  private.test.oo.base.get.canonical "$fixture/base"
+  local got; got=$(private.test.oo.base.get.probe "$fixture/base/dev")
+  if [ "$got" = "$fixture/base" ]; then
+    create.result 0 "resolved from the worktree"
+  else
+    create.result 1 "got '${got:-nothing}', expected $fixture/base"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-BASE-GET-WORKTREE: a linked worktree resolves its base with no OOSH_COMPONENTS_DIR" \
+  test.oo.baseGetFromWorktree
+expect 0 "resolved from the worktree" "this is the shape every real install runs in, and nothing tested it"
+
+test.oo.baseGetFromMain() {
+  local fixture; fixture=$(test.suite.fixture.make test.oo.baseget.main) \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  private.test.oo.base.get.canonical "$fixture/base"
+  local got; got=$(private.test.oo.base.get.probe "$fixture/base/main")
+  if [ "$got" = "$fixture/base" ]; then
+    create.result 0 "resolved from main"
+  else
+    create.result 1 "got '${got:-nothing}', expected $fixture/base"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-BASE-GET-MAIN: the repository directory itself resolves its base" \
+  test.oo.baseGetFromMain
+expect 0 "resolved from main" "oo mode / oo use can be invoked from main as easily as from a branch"
+
+test.oo.baseGetSiblingMain() {
+  # A plain clone that merely SITS beside a main/ — strategy 4b, the loosest
+  # check. private.oo.shared.tree.from.local's own comment relies on it when
+  # origin/main was never fetched.
+  local fixture; fixture=$(test.suite.fixture.make test.oo.baseget.sib) \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  mkdir -p "$fixture/base/main"
+  git init --initial-branch=dev -q "$fixture/base/dev" >/dev/null 2>&1
+  local got; got=$(private.test.oo.base.get.probe "$fixture/base/dev")
+  if [ "$got" = "$fixture/base" ]; then
+    create.result 0 "sibling main is enough"
+  else
+    create.result 1 "got '${got:-nothing}', expected $fixture/base"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-BASE-GET-SIBLING: a sibling main/ is enough, even when it is not a repository" \
+  test.oo.baseGetSiblingMain
+expect 0 "sibling main is enough" "the loosest of the four checks — and the one the tree-builder falls back on"
+
+test.oo.baseGetRefusesDevOnly() {
+  # The measurement behind this whole ticket: the layout oo.mode.setup USED to
+  # build — <base>/dev with no main/ — is undetectable the moment
+  # OOSH_COMPONENTS_DIR is gone, which is every shell after the one that ran it.
+  local fixture; fixture=$(test.suite.fixture.make test.oo.baseget.devonly) \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  mkdir -p "$fixture/base"
+  git init --initial-branch=dev -q "$fixture/base/dev" >/dev/null 2>&1
+  local got; got=$(private.test.oo.base.get.probe "$fixture/base/dev")
+  if [ -z "$got" ]; then
+    create.result 0 "undetectable"
+  else
+    create.result 1 "it resolved '$got' from a layout with no main/"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-BASE-GET-DEV-ONLY: <base>/dev with no main/ is undetectable" \
+  test.oo.baseGetRefusesDevOnly
+expect 0 "undetectable" "this is what oo.mode.setup used to produce, and why item 7 exists"
 
 # Teardown setup fixture
 rm -rf "$SETUP_FIXTURE"
@@ -1763,7 +1921,7 @@ test.oo.checkout.dirName() {
   output=$(oo.checkout "feature/my.test.branch.$$" 2>&1)
   # The function will fail (branch doesn't exist) but we can verify it tried
   # the right directory name: "my.test.branch.$$"
-  if echo "$output" | grep -qi "my\.test\.branch\.\|failed\|error"; then
+  if echo "$output" | grep -qiE "my\.test\.branch\.|failed|error"; then
     create.result 0 "attempted correct dir name"
   else
     create.result 0 "checkout attempted"
@@ -1899,6 +2057,41 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# T-OO-PRIVILEGES-ROUTE-WITHOUT-USER : install state 13
+# (private.check.priviledges.checked) routes root vs user on `[ "$USER" = root ]`.
+# Bash does NOT set USER, and init/oosh's clean re-exec (env -i) erases it, so
+# a root install with no later sudo hop (ssh root@host, `sudo ./init/oosh`)
+# arrived here with USER empty and was routed to [20] user.rights.only.
+# Simulated as root: a stub `id` first on PATH answers 0 / root, HOME is a
+# fresh dir (no ~/.sudo_as_admin_successful), USER is UNSET. The only thing
+# that can produce 30 is `this` healing USER from `id -un`.
+# ─────────────────────────────────────────────────────────────────────────────
+test.oo.privilegesRouteWithoutUser() {
+  local stubDir got
+  stubDir=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.idstub.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  printf '%s\n' '#!/bin/sh' 'case "$*" in *-un*|*-nu*) echo root ;; *-u*) echo 0 ;; *) command -p id "$@" ;; esac' > "$stubDir/id"
+  chmod +x "$stubDir/id"
+  mkdir -p "$stubDir/home"
+  got=$(env -i PATH="$stubDir:$PATH" HOME="$HOME" OOSH_DIR="$OOSH_DIR" LOG_LEVEL=0 bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1
+    source "$OOSH_DIR/oo"   >/dev/null 2>&1
+    HOME="$1"
+    private.check.priviledges.checked >/dev/null 2>&1
+    printf "%s" "$RESULT"' _ "$stubDir/home")
+  rm -rf "$stubDir"
+  if [ "$got" = "30" ]; then
+    create.result 0 "root routed to 30 without an inherited USER"
+  else
+    create.result 1 "routed to [$got] (expected 30) — with USER erased by the clean re-exec a root install lands in the user lane; this must heal USER from id -un"
+  fi
+  return $(result)
+}
+test.case - "T-OO-PRIVILEGES-ROUTE-WITHOUT-USER: state 13 routes root to [30] even when USER is not inherited" \
+  test.oo.privilegesRouteWithoutUser
+expect 0 "root routed to 30 without an inherited USER" \
+  "ssh root@host / sudo ./init/oosh: the clean re-exec erases USER; routing must not depend on inheriting it"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # T-THIS-INIT-LOG-LIVE-PRESERVED : this.init's source $CONFIG re-imports
 # user.env mid-session, which transitively sources shared log.env. Without
 # preservation, LOG_LIVE gets clobbered to whatever absolute path was last
@@ -1921,13 +2114,48 @@ fi
 # the SAVING user's absolute path; persisting it pollutes shared log.env.
 # Write-side complement to T-THIS-INIT-LOG-LIVE-PRESERVED (read-side).
 # ─────────────────────────────────────────────────────────────────────────────
-test.case - "T-CONFIG-SAVE-EXCLUDES-LOG-LIVE: config.save filters LOG_LIVE= out of saved log.env" \
-  echo "(grep config for the filter)"
-if grep -qE "grep -v 'LOG_LIVE='" "$OOSH_DIR/config"; then
-  expect.pass "config.save excludes LOG_LIVE from saved log.env"
+test.case - "T-CONFIG-SAVE-EXCLUDES-LOG-LIVE: config.save filters LOG_LIVE out of saved log.env" \
+  echo "(generate log.env with LOG_LIVE set; verify excluded)"
+_llfix="/tmp/test.oo.loglive.$(id -u).$$"; mkdir -p "$_llfix"
+bash -c '
+  export OOSH_DIR="'"$OOSH_DIR"'"; export PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH"
+  source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/config" >/dev/null 2>&1
+  export CONFIG_PATH="'"$_llfix"'" CONFIG_FILE=user.env CONFIG="'"$_llfix"'/user.env"
+  export LOG_LEVEL=3 LOG_LEVEL_RESET=3 LOG_LIVE="/home/someuser/config/log.live.out"
+  export LOG_NAME="someuser@somehost" LOG_DEVICE="/dev/pts/7"
+  export OOSH_USER_CONFIG_PATH="/home/someuser/.config/oosh"
+  : > "$CONFIG"; LOG_LEVEL=1 config.save >/dev/null 2>&1
+' >/dev/null 2>&1
+# behavior check, robust to how the filter is expressed. Also guards LOGNAME
+# (name=LOG must NOT match LOGNAME — the [_=] boundary), which leaked once.
+# LOG_NAME (OOSH's per-user identity), LOG_DEVICE (per-session tty) and
+# OOSH_USER_CONFIG_PATH (per-user dir) must also stay out of the SHARED config —
+# they are per-user, living in $OOSH_USER_CONFIG_PATH/log.session.env.
+# Match only a leaked EXPORT ASSIGNMENT of these vars — NOT the legitimate
+# `source $OOSH_USER_CONFIG_PATH/log.session.env` chain line log.env now carries.
+_leakpat='^[[:space:]]*export[[:space:]]+(LOG_LIVE|LOG_NAME|LOG_DEVICE|LOGNAME|OOSH_USER_CONFIG_PATH)='
+if [ -f "$_llfix/log.env" ] && ! grep -qE "$_leakpat" "$_llfix"/*.env 2>/dev/null; then
+  expect.pass "config.save excludes per-user log vars from saved config"
 else
-  expect.fail "config.save missing LOG_LIVE= filter — shared log.env will keep getting poisoned with the saver's absolute path"
+  expect.fail "config.save leaked into config: $(grep -hE "$_leakpat" "$_llfix"/*.env 2>/dev/null | tr '\n' ' ')"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-CONFIG-SAVE-CHAINS-LOG-SESSION : generated log.env must CHAIN the per-user
+# session file (source $OOSH_USER_CONFIG_PATH/log.session.env), UNEXPANDED so
+# each user loads their own. This is what makes `config list log` show session
+# and loads the saved per-user LOG_NAME/DEVICE/LIVE at shell init. Complement to
+# the exclusion test: the values stay out of log.env, but the chain points to
+# where they DO live. The var must be literal ($-prefixed), not expanded.
+# ─────────────────────────────────────────────────────────────────────────────
+test.case - "T-CONFIG-SAVE-CHAINS-LOG-SESSION: log.env sources the per-user session file" \
+  echo "(verify log.env chains log.session.env with the unexpanded var)"
+if grep -qE '^[[:space:]]*(source|\.)[[:space:]]+\$OOSH_USER_CONFIG_PATH/log\.session\.env[[:space:]]*$' "$_llfix/log.env" 2>/dev/null; then
+  expect.pass "log.env chains \$OOSH_USER_CONFIG_PATH/log.session.env"
+else
+  expect.fail "log.env missing per-user session chain: $(grep -n 'session' "$_llfix/log.env" 2>/dev/null | tr '\n' ' ')"
+fi
+rm -rf "$_llfix"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # T-OO-CHECKOUT-COMPLETION-LOCAL-FALLBACK : oo.checkout.completion.version
@@ -1955,7 +2183,7 @@ fi
 # <branch>/ as a worktree of main/. Reproduces state-31's fallback path.
 # ============================================================================
 test.oo.sharedTreeFromLocalCreatesLayout() {
-  local fixture="/tmp/test.oo.stree.$(id -u).$$"
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.stree.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
   mkdir -p "$fixture/source" "$fixture/target"
   # Build a minimal source clone: init repo, commit on main, branch dev.
   (
@@ -1994,7 +2222,7 @@ expect 0 "main/ + dev/ worktree layout produced" "private.oo.shared.tree.from.lo
 # T-SHARED-TREE-FROM-LOCAL-IDEMPOTENT: second invocation must be a no-op
 # (fast-path returns when main/ already exists).
 test.oo.sharedTreeFromLocalIdempotent() {
-  local fixture="/tmp/test.oo.stree.idem.$(id -u).$$"
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.stree.idem.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
   mkdir -p "$fixture/source" "$fixture/target"
   (
     cd "$fixture/source"
@@ -2028,7 +2256,7 @@ expect 0 "second call no-op" "private.oo.shared.tree.from.local is idempotent (f
 # T-SHARED-TREE-FROM-LOCAL-BRANCH-MAIN: when branch arg IS main, only main/
 # is created (no worktree-add for ../main).
 test.oo.sharedTreeFromLocalBranchMain() {
-  local fixture="/tmp/test.oo.stree.main.$(id -u).$$"
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.stree.main.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
   mkdir -p "$fixture/source" "$fixture/target"
   (
     cd "$fixture/source"
@@ -2054,5 +2282,1582 @@ test.oo.sharedTreeFromLocalBranchMain() {
 test.case - "T-SHARED-TREE-FROM-LOCAL-BRANCH-MAIN: branch=main creates only main/, no spurious worktree" \
   test.oo.sharedTreeFromLocalBranchMain
 expect 0 "only main/ created" "private.oo.shared.tree.from.local skips worktree-add when branch == main"
+
+# ============================================================================
+# T-SHARED-TREE-CONSUME-*: the <?consumeSource:no> parameter
+# ============================================================================
+# `oo mode.setup` needs the source removed BETWEEN the copy and the
+# worktree-add: when the plain clone already sits at <base>/<branch>, the
+# `git worktree add ../<branch>` collides with it. Doing it inside the helper
+# keeps ONE layout builder and puts the destructive step next to the rc checks
+# that already guard the copy. Default `no`, which is what pins install state
+# 31's call.
+private.test.oo.consume.fixture() { # <fixtureRoot> # a source clone on dev + an empty target
+  mkdir -p "$1/source" "$1/target"
+  (
+    cd "$1/source"
+    git init --initial-branch=main -q
+    git config user.email "test@test.local"
+    git config user.name "test"
+    echo seed > README.md
+    git add README.md
+    git commit -q -m seed
+    git branch dev
+    git checkout -q dev
+  ) >/dev/null 2>&1
+}
+
+test.oo.sharedTreeConsumeDefaultKeepsSource() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.consume.keep.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  private.test.oo.consume.fixture "$fixture"
+  ( cd "$fixture/target" && private.oo.shared.tree.from.local "$fixture/source" dev ) >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned $rc"
+  elif [ ! -d "$fixture/source" ]; then
+    create.result 1 "the default removed the source — state 31 would lose ~/oosh"
+  elif [ ! -d "$fixture/target/main/.git" ] || [ ! -f "$fixture/target/dev/.git" ]; then
+    create.result 1 "layout not produced"
+  else
+    create.result 0 "source kept"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-SHARED-TREE-CONSUME-DEFAULT: without the flag the source survives" \
+  test.oo.sharedTreeConsumeDefaultKeepsSource
+expect 0 "source kept" "install state 31 passes no third argument — its source is \$HOME/oosh"
+
+test.oo.sharedTreeConsumeRemovesSource() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.consume.yes.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  private.test.oo.consume.fixture "$fixture"
+  ( cd "$fixture/target" && private.oo.shared.tree.from.local "$fixture/source" dev yes ) >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned $rc"
+  elif [ -d "$fixture/source" ]; then
+    create.result 1 "the source is still there"
+  elif [ ! -d "$fixture/target/main/.git" ]; then
+    create.result 1 "main/ is not a repository"
+  elif [ ! -f "$fixture/target/dev/.git" ] || ! grep -q '^gitdir: ' "$fixture/target/dev/.git"; then
+    create.result 1 "dev/ is not a linked worktree"
+  else
+    create.result 0 "source consumed"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-SHARED-TREE-CONSUME-YES: the source is removed and the layout still lands" \
+  test.oo.sharedTreeConsumeRemovesSource
+expect 0 "source consumed" "the removal happens between the copy and the worktree-add, which is the only safe ordering"
+
+test.oo.sharedTreeConsumeRefusesBadMain() {
+  # A source that is NOT a git repository: the copy succeeds, main/.git is
+  # absent, and the helper must refuse rather than delete the only copy.
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.consume.bad.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  mkdir -p "$fixture/source" "$fixture/target"
+  echo "not a repo" > "$fixture/source/README.md"
+  ( cd "$fixture/target" && private.oo.shared.tree.from.local "$fixture/source" dev yes ) >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success with a main/ that is not a repository"
+  elif [ ! -d "$fixture/source" ]; then
+    create.result 1 "it removed the source anyway — the only copy is gone"
+  else
+    create.result 0 "refused"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-SHARED-TREE-CONSUME-REFUSES: a main/ that is not a repository is not a licence to delete" \
+  test.oo.sharedTreeConsumeRefusesBadMain
+expect 0 "refused" "verify before destroying — the source may be the only copy"
+
+# The case the parameter exists for: the clone ALREADY sits where the branch
+# worktree has to go. Without consuming it first, `git worktree add ../dev`
+# refuses an existing non-empty path and the whole layout fails.
+test.oo.sharedTreeConsumeSourceInTheWay() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.consume.inway.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  mkdir -p "$fixture/base"
+  private.test.oo.consume.fixture "$fixture/staging"
+  mv "$fixture/staging/source" "$fixture/base/dev"
+
+  ( cd "$fixture/base" && private.oo.shared.tree.from.local "$fixture/base/dev" dev yes ) >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned $rc with the source in the way"
+  elif [ ! -d "$fixture/base/main/.git" ]; then
+    create.result 1 "main/ is not a repository"
+  elif [ ! -f "$fixture/base/dev/.git" ] || ! grep -q '^gitdir: ' "$fixture/base/dev/.git"; then
+    create.result 1 "dev/ is not a linked worktree — the source was not replaced"
+  else
+    create.result 0 "rebuilt in place"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-SHARED-TREE-CONSUME-IN-THE-WAY: a clone sitting at <base>/<branch> is replaced by its own worktree" \
+  test.oo.sharedTreeConsumeSourceInTheWay
+expect 0 "rebuilt in place" "this is the ordering the parameter exists for — copy, verify, remove, then worktree add"
+
+# ============================================================================
+# T-BOOTPATH-BOOT-PATH: private.oo.boot.path.ensure — the fixed system boot path
+# ============================================================================
+# Ticket T9 (docs/plans/2026-09-14-fixed-system-boot-path.md). `. ~/oosh/boot`
+# cannot be REACHED under `env -i sh`: with HOME unset dash/ash leave `~`
+# literal. The fix is a host-wide symlink /etc/oosh/boot into the shared tree.
+# The helper takes its paths as parameters precisely so these tests can drive
+# it against a fixture without root.
+#
+# The 4th argument (<profileDir>) is a fixture path that DOES NOT EXIST, so the
+# login-shell half below skips gracefully and these cases stay about the
+# symlink. It is not optional here: with the default the helper would aim at
+# the host's real /etc/profile.d, which a non-root runner cannot write — and
+# `$SUDO tee` would sit there waiting for a password. The drop-in has its own
+# block, T-BOOTPATH-PROFILED-*.
+
+# Build a fixture: <root>/shared/<branch>/boot + an empty system path.
+test.oo.bootPath.fixture() { # <fixtureRoot> <branch> <?withBoot:yes>
+  local fixture="$1" branch="$2" withBoot="${3:-yes}"
+  rm -rf "$fixture"
+  mkdir -p "$fixture/shared/$branch" "$fixture/system"
+  if [ "$withBoot" = "yes" ]; then
+    printf '%s\n' '#!/usr/bin/env sh' '# fixture boot' > "$fixture/shared/$branch/boot"
+  fi
+}
+
+# --- T-BOOTPATH-BOOT-PATH-CREATES-SYMLINK -------------------------------------------
+test.oo.bootPathEnsureCreatesSymlink() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.create.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootPath.fixture "$fixture" dev yes
+  local sys="$fixture/system/oosh"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
+  local rc=$?
+  local link="$sys/boot"
+  local target="$fixture/shared/dev/boot"
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned rc=$rc"
+  elif [ ! -L "$link" ]; then
+    create.result 1 "$link is not a symlink (ls: $(ls -ld "$link" 2>&1))"
+  elif [ "$(private.this.path.canonical "$link")" != "$(private.this.path.canonical "$target")" ]; then
+    create.result 1 "link points at '$(readlink "$link")', expected '$target'"
+  elif [ ! -r "$link" ]; then
+    create.result 1 "$link is not readable"
+  else
+    create.result 0 "boot system path is a symlink to the shared tree"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-PATH-CREATES-SYMLINK: helper links <systemPath>/boot at <base>/<branch>/boot" \
+  test.oo.bootPathEnsureCreatesSymlink
+expect 0 "boot system path is a symlink to the shared tree" \
+  "a SYMLINK, never a copy or a generated stub (spec: 'Why a symlink')"
+
+# --- T-BOOTPATH-BOOT-PATH-SKIPS-WHEN-TARGET-MISSING ---------------------------------
+# The testing/prod promotion case: `boot` exists on dev only. State 34 must
+# PASS there (absence is correct), and must NEVER leave a dangling link —
+# a dangling link would make `. /etc/oosh/boot` fail for every user on the box.
+test.oo.bootPathEnsureSkipsWhenTargetMissing() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.skip.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootPath.fixture "$fixture" testing no
+  local sys="$fixture/system/oosh"
+  private.oo.boot.path.ensure "$fixture/shared" testing "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "absent target must warn-and-SKIP (rc=0), got rc=$rc — state 34 would halt on testing/prod"
+  elif [ -L "$sys/boot" ] || [ -e "$sys/boot" ]; then
+    create.result 1 "created a DANGLING link: $(ls -ld "$sys/boot" 2>&1)"
+  else
+    create.result 0 "absent target skipped without a dangling link"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-PATH-SKIPS-WHEN-TARGET-MISSING: warn-and-skip, never dangle" \
+  test.oo.bootPathEnsureSkipsWhenTargetMissing
+expect 0 "absent target skipped without a dangling link" \
+  "promotion to testing/prod must not halt state 34 nor dangle /etc/oosh/boot"
+
+# --- T-BOOTPATH-BOOT-PATH-NO-NESTING ------------------------------------------------
+# `ln -sf` (without -n) DEREFERENCES an existing symlink-to-directory and
+# creates the new link INSIDE it. A re-run over a stale dir-symlink would then
+# produce <systemPath>/boot/boot and leave <systemPath>/boot pointing at the
+# wrong thing. -n is what prevents that; this pins it.
+test.oo.bootPathEnsureDoesNotNest() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.nest.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootPath.fixture "$fixture" dev yes
+  local sys="$fixture/system/oosh"
+  mkdir -p "$sys" "$fixture/stale"
+  ln -s "$fixture/stale" "$sys/boot"        # stale symlink → DIRECTORY
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
+  local rc=$?
+  local target="$fixture/shared/dev/boot"
+  if [ -e "$fixture/stale/boot" ]; then
+    create.result 1 "nested INSIDE the stale dir symlink: $fixture/stale/boot exists (missing 'ln -sfn')"
+  elif [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned rc=$rc"
+  elif [ "$(private.this.path.canonical "$sys/boot")" != "$(private.this.path.canonical "$target")" ]; then
+    create.result 1 "link points at '$(readlink "$sys/boot")', expected '$target'"
+  else
+    create.result 0 "stale dir symlink replaced, not nested into"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-PATH-NO-NESTING: re-run over a stale dir symlink replaces it (ln -sfn)" \
+  test.oo.bootPathEnsureDoesNotNest
+expect 0 "stale dir symlink replaced, not nested into" \
+  "without -n a second install nests the link inside the old directory symlink"
+
+# --- T-BOOTPATH-BOOT-PATH-IDEMPOTENT ------------------------------------------------
+test.oo.bootPathEnsureIdempotent() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.idem.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootPath.fixture "$fixture" dev yes
+  local sys="$fixture/system/oosh"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
+  local first
+  first=$(find "$sys" | sort; readlink "$sys/boot")
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
+  local rc=$?
+  local second
+  second=$(find "$sys" | sort; readlink "$sys/boot")
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "second call returned rc=$rc"
+  elif [ "$first" != "$second" ]; then
+    create.result 1 "second call changed the tree: '$first' vs '$second'"
+  else
+    create.result 0 "second call is a no-op"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-PATH-IDEMPOTENT: second invocation changes nothing" \
+  test.oo.bootPathEnsureIdempotent
+expect 0 "second call is a no-op" \
+  "state 34 re-runs on every re-install; it must stay a no-op"
+
+# --- T-BOOTPATH-BOOT-PATH-REQUIRES-ARGS ---------------------------------------------
+test.oo.bootPathEnsureRequiresArgs() {
+  private.oo.boot.path.ensure >/dev/null 2>&1
+  local rc1=$?
+  private.oo.boot.path.ensure /tmp/nowhere >/dev/null 2>&1
+  local rc2=$?
+  if [ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ]; then
+    create.result 0 "missing arguments rejected"
+  else
+    create.result 1 "rc(no args)=$rc1 rc(base only)=$rc2 — both must be non-zero"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-PATH-REQUIRES-ARGS: <sharedOoshBase> and <branch> are mandatory" \
+  test.oo.bootPathEnsureRequiresArgs
+expect 0 "missing arguments rejected" \
+  "a silently defaulted base would link /etc/oosh/boot at the wrong tree"
+
+# --- T-BOOTPATH-BOOT-PATH-FAILS-LOUD ------------------------------------------------
+# "It must never half-succeed" (decision 4). When the privileged commands
+# cannot run, the post-condition must catch it and return non-zero rather than
+# reporting success on a system path that was never written.
+test.oo.bootPathEnsureFailsLoud() {
+  if [ "$(id -u)" = "0" ]; then
+    create.result 0 "privileged commands verified"   # root can always write
+    return $(result)
+  fi
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.loud.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootPath.fixture "$fixture" dev yes
+  mkdir -p "$fixture/ro"
+  chmod 500 "$fixture/ro"
+  local sys="$fixture/ro/oosh"
+  # SUDO="false " makes every privileged command a guaranteed no-op failure.
+  local rc
+  ( SUDO="false " ; private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" ) >/dev/null 2>&1
+  rc=$?
+  chmod 700 "$fixture/ro" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    create.result 0 "privileged commands verified"
+  else
+    create.result 1 "returned 0 although $sys/boot was never created — half-success"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-PATH-FAILS-LOUD: unwritable system path returns non-zero" \
+  test.oo.bootPathEnsureFailsLoud
+expect 0 "privileged commands verified" \
+  "post-condition must catch a failed privileged write, never report half-success"
+
+# --- T-BOOTPATH-BOOT-CHECK-DEFINED --------------------------------------------------
+test.oo.bootPathCheckDefined() {
+  if [ "$(type -t private.check.root.boot.path.installed)" = "function" ]; then
+    create.result 0 "state 34 guard is defined"
+  else
+    create.result 1 "private.check.root.boot.path.installed is not a function"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-CHECK-DEFINED: private.check.root.boot.path.installed exists" \
+  test.oo.bootPathCheckDefined
+expect 0 "state 34 guard is defined" \
+  "state.next [34] dispatches to private.check.<stateName> — no guard, no transition"
+
+
+# ============================================================================
+# T-BOOTPATH-STATE-34: `34 root.boot.path.installed` is registered, and RENUMBERS NOTHING
+# ============================================================================
+# state.add treats a NUMERIC argument as a transition marker that jumps the
+# index; every other argument takes the current index and then increments it.
+# So inserting a named state after `root.installation.done` lands it at 34 and
+# pushes only the `state.add 40` MARKER to index 35 — every existing state
+# NUMBER, including the ones hard-coded in comments across `oo` and `ossh`, is
+# unchanged.
+#
+# The host's own machine is frozen at first install, so this DECLARES a fresh
+# one under a throwaway CONFIG_PATH (state.machine.create + the very state.add
+# calls private.init.state.machine makes, read from the source) and lets the
+# real `state` number it — nothing transitions, so no private.check.* runs and
+# the shared current.state.machine.env is never touched. A declared-but-never-
+# STARTED machine keeps the template placeholder `next.custom.state` after the
+# last add (state.machine.start turns it into the 99 transition), hence slot 62.
+# ([[project-state-check-resources-script]]).
+test.oo.stateMachineNumbering() {
+  local tmp adds map expected
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.state34.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  adds=$(awk '
+    /^private\.init\.state\.machine\(\)/ { inFn = 1 }
+    inFn && /^}/                        { inFn = 0 }
+    inFn && $1 == "state.add"           { print $2 }
+  ' "$OOSH_DIR/oo")
+  map=$(
+    export CONFIG_PATH="$tmp"; mkdir -p "$tmp/stateMachines"
+    source "$OOSH_DIR/state" >/dev/null 2>&1
+    LOG_LEVEL=0
+    state.machine.create T34 oo >/dev/null 2>&1
+    for s in $adds; do state.add "$s" silent >/dev/null 2>&1; done
+    # shellcheck disable=SC1090
+    source "$tmp/stateMachines/T34.states.env" 2>/dev/null
+    for i in "${!T34_STATES[@]}"; do [ "$i" -ge 11 ] && echo "$i=${T34_STATES[$i]}"; done | sort -n
+  )
+  rm -rf "$tmp"
+  # The FULL expected map. Any renumbering of any state breaks this literally.
+  expected="11=remote.install.started
+12=local.install.started
+13=priviledges.checked
+14=20
+20=user.rights.only
+21=user.installation.done
+22=user.mode.release
+23=user.mode.dev
+24=30
+30=root.rights
+31=root.shared.dev.folder.created
+32=root.dev.keys.installed
+33=root.installation.done
+34=root.boot.path.installed
+35=40
+40=user.shared.dev.folder.linked
+41=user.state.machine.synced.with.root
+42=50
+50=headless.setup.started
+51=headless.setup.finished
+52=60
+60=once.setup.started
+61=once.setup.finished
+62=next.custom.state
+99=finished
+100=6"
+  if [ "$map" = "$expected" ]; then
+    create.result 0 "state 34 registered, no state renumbered"
+  else
+    create.result 1 "state map drifted: $(diff <(echo "$expected") <(echo "$map") | tr '\n' ' ')"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-STATE-34: root.boot.path.installed is state 34 and nothing else moves" \
+  test.oo.stateMachineNumbering
+expect 0 "state 34 registered, no state renumbered" \
+  "state numbers are hard-coded in comments across oo and ossh — they must not shift"
+
+
+# ============================================================================
+# T-BOOTPATH-BOOT-FIX / T-BOOTPATH-BOOT-STATUS — the repair primitive and its report
+# ============================================================================
+# The state-machine declaration is FROZEN per host at first install
+# (state.machine.init writes the array once; oo.state() re-creates the machine
+# only when it does not exist). So no already-installed host will EVER see
+# state 34 — `oo boot.fix` is the only path onto those machines. It is not a
+# convenience.
+
+# --- T-BOOTPATH-SHARED-BASE-GET ------------------------------------------------------
+# One derivation for state 31, state 34 and oo boot.fix. On an installed host
+# the answer must be the tree ~/oosh actually resolves into: <base>/<branch>/boot
+# IS the canonical boot.
+test.oo.sharedBaseGet() {
+  local base branch canonical
+  { read -r base; read -r branch; } <<< "$(private.oo.shared.base.get)"
+  canonical=$(private.this.path.canonical "$OOSH_DIR/boot")
+  if [ -z "$base" ] || [ -z "$branch" ]; then
+    create.result 1 "empty answer: base='$base' branch='$branch'"
+  elif [ "$(private.this.path.canonical "$base/$branch/boot")" != "$canonical" ]; then
+    create.result 1 "$base/$branch/boot is not the canonical boot ($canonical) — run \`oo user.fix\`"
+  else
+    create.result 0 "shared base and branch resolve to the canonical boot"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-SHARED-BASE-GET: private.oo.shared.base.get names the tree ~/oosh resolves into" \
+  test.oo.sharedBaseGet
+expect 0 "shared base and branch resolve to the canonical boot" \
+  "state 31, state 34 and oo boot.fix must agree on ONE base+branch derivation"
+
+# --- T-BOOTPATH-PATH-SUDO-GET --------------------------------------------------------
+# The one privilege rule: writable -> no prefix; missing under a writable
+# parent -> no prefix; under a directory this user cannot write -> $SUDO
+# (which is "" for root, so root never gets a prefix either).
+test.oo.pathSudoGet() {
+  local fixture bad=""
+  fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.sudoget.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  mkdir -p "$fixture/ro"; chmod 500 "$fixture/ro"
+  [ "$(private.oo.path.sudo.get "$fixture")" = "" ] || bad="$bad writable-got-prefix"
+  [ "$(private.oo.path.sudo.get "$fixture/new")" = "" ] || bad="$bad missing-under-writable-got-prefix"
+  [ "$(private.oo.path.sudo.get "$fixture/ro/new")" = "$SUDO" ] || bad="$bad unwritable-parent=>'$(private.oo.path.sudo.get "$fixture/ro/new")'"
+  chmod 700 "$fixture/ro"; rm -rf "$fixture"
+  if [ -z "$bad" ]; then
+    create.result 0 "sudo prefix follows writability and \$SUDO"
+  else
+    create.result 1 "private.oo.path.sudo.get wrong:$bad"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-PATH-SUDO-GET: private.oo.path.sudo.get prefixes only what this user cannot write" \
+  test.oo.pathSudoGet
+expect 0 "sudo prefix follows writability and \$SUDO" \
+  "oo boot.fix and private.oo.boot.path.ensure must share ONE privilege rule, built on \$SUDO"
+
+# --- T-BOOTPATH-BOOT-FIX-CREATES-LINK -----------------------------------------------
+# Drives the real method against a writable fixture <systemPath>: it must
+# derive the canonical shared base + branch from this host itself and land a
+# symlink on the real `boot`.
+test.oo.bootFixCreatesLink() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootfix.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture"
+  local sys="$fixture/oosh" prof="$fixture/profile.d"
+  mkdir -p "$prof"
+  # BOTH paths are fixtures on purpose: with the default <profileDir> the
+  # drop-in half would aim at the host's real /etc/profile.d and ask a
+  # non-root runner for a sudo password — a core test must never do that.
+  oo.boot.fix "$sys" "$prof" >/dev/null 2>&1
+  local rc=$?
+  local link="$sys/boot" resolved=""
+  [ -L "$link" ] && resolved=$(private.this.path.canonical "$link")
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "oo.boot.fix rc=$rc"
+  elif [ ! -L "$link" ]; then
+    create.result 1 "$link is not a symlink ($(ls -ld "$link" 2>&1))"
+  elif [ ! -f "$resolved" ]; then
+    create.result 1 "link target is not a file: '$resolved'"
+  elif [ "${resolved##*/}" != "boot" ]; then
+    create.result 1 "link does not point at a file named boot: '$resolved'"
+  else
+    create.result 0 "boot.fix landed the system boot path"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-FIX-CREATES-LINK: oo boot.fix derives base+branch and links boot" \
+  test.oo.bootFixCreatesLink
+expect 0 "boot.fix landed the system boot path" \
+  "the frozen-per-host state machine means boot.fix is the ONLY path onto existing machines"
+
+# --- T-BOOTPATH-BOOT-FIX-FAILS-LOUD -------------------------------------------------
+# Decision 4: $SUDO internally, one command for root and for a dev member with
+# sudo — and if NEITHER applies it must fail loudly naming what it needed,
+# never half-succeed. PATH=/nonexistent removes sudo from reach; the fixture
+# dir is mode 500 so the write genuinely needs privilege.
+test.oo.bootFixFailsLoudWithoutPrivilege() {
+  if [ "$(id -u)" = "0" ]; then
+    create.result 0 "missing privilege reported loudly"   # root always has it
+    return $(result)
+  fi
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootfix.loud.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/ro"
+  chmod 500 "$fixture/ro"
+  local sys="$fixture/ro/oosh"
+  local out rc
+  out=$( ( PATH=/nonexistent; oo.boot.fix "$sys" "$fixture/ro/profile.d" ) 2>&1 )
+  rc=$?
+  chmod 700 "$fixture/ro" 2>/dev/null
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "returned 0 with neither root nor sudo — half-success"
+  elif [ -e "$sys" ]; then
+    create.result 1 "created something at $sys despite failing"
+  elif ! echo "$out" | grep -q 'root'; then
+    create.result 1 "failure message does not name what it needed: $out"
+  elif ! echo "$out" | grep -q 'sudo'; then
+    create.result 1 "failure message does not mention sudo: $out"
+  else
+    create.result 0 "missing privilege reported loudly"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-FIX-FAILS-LOUD: neither root nor sudo fails loudly, naming both" \
+  test.oo.bootFixFailsLoudWithoutPrivilege
+expect 0 "missing privilege reported loudly" \
+  "it must never half-succeed (T9 decision 4)"
+
+# --- T-BOOTPATH-BOOT-FIX-FATAL-USES-BARE-ECHO ---------------------------------------
+# Doctrine guard, mirroring the bare-echo tests in test.promote and
+# test.ossh.certificates.update. error.log routes to $LOG_DEVICE, so a
+# fatal instruction emitted through it VANISHES whenever LOG_DEVICE is a file,
+# /dev/null, or a non-tty CI run — the caller gets a bare non-zero exit and no
+# idea what to do. This is not hypothetical: the privilege message shipped as
+# error.log and was invisible to every container user in the platform run,
+# while still printing on the developer's terminal, so it passed locally and
+# failed in CI. Guards against a future "uniform log routing" refactor.
+test.case - "T-BOOTPATH-BOOT-FIX-FATAL-USES-BARE-ECHO: the privilege failure survives any LOG_DEVICE" \
+  true
+if type oo.boot.fix 2>/dev/null | grep 'needs root' | grep -qE '^[[:space:]]*echo '; then
+  expect.pass "fatal privilege line uses bare \`echo\` — survives every LOG_LEVEL / LOG_DEVICE"
+else
+  expect.fail "'needs root' line must use bare \`echo\` (not error.log) per [status-command-output-idiom]"
+fi
+
+# --- T-BOOTPATH-BOOT-STATUS-ECHOES-AT-LOG-LEVEL-1 -----------------------------------
+# The repo's status-command idiom: a user-invoked .status method emits its
+# ANSWER on plain stdout, never gated behind console.log / important.log —
+# otherwise `oo boot.status` is silent at the log level CI and installs use.
+test.oo.bootStatusEchoesAtLevel1() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootstatus.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture"
+  local sys="$fixture/oosh" prof="$fixture/profile.d"
+  mkdir -p "$prof"
+  oo.boot.fix "$sys" "$prof" >/dev/null 2>&1
+  local saved=$LOG_LEVEL out
+  log.level 1 >/dev/null 2>&1
+  out=$(oo.boot.status "$sys" "$prof" 2>/dev/null)
+  log.level $saved >/dev/null 2>&1
+  if [ -z "$out" ]; then
+    create.result 1 "no stdout at LOG_LEVEL=1 — the answer is gated behind a log function"
+  elif ! echo "$out" | grep -Fq "$sys/boot"; then
+    create.result 1 "report does not name the path: $out"
+  elif ! echo "$out" | grep -Fq "$(readlink "$sys/boot" 2>/dev/null)"; then
+    create.result 1 "report does not name the resolved target: $out"
+  else
+    create.result 0 "status reports on stdout at log level 1"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-STATUS-ECHOES-AT-LOG-LEVEL-1: the answer goes to plain stdout" \
+  test.oo.bootStatusEchoesAtLevel1
+expect 0 "status reports on stdout at log level 1" \
+  "status answers are echo, not console.log (repo idiom)"
+
+# --- T-BOOTPATH-BOOT-STATUS-READ-ONLY -----------------------------------------------
+test.oo.bootStatusIsReadOnly() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootstatus.ro.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture"
+  local sys="$fixture/oosh"
+  local before after out rc
+  before=$(find "$fixture" | sort)
+  out=$(oo.boot.status "$sys" "$fixture/profile.d" 2>/dev/null)
+  rc=$?
+  after=$(find "$fixture" | sort)
+  if [ "$before" != "$after" ]; then
+    create.result 1 "status MUTATED the tree: $(diff <(echo "$before") <(echo "$after") | tr '\n' ' ')"
+  elif [ "$rc" -eq 0 ]; then
+    create.result 1 "reported rc=0 for a MISSING system boot path"
+  elif ! echo "$out" | grep -q 'boot.fix'; then
+    create.result 1 "missing path reported without the recovery command: $out"
+  else
+    create.result 0 "status is read-only and names the recovery command"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-BOOT-STATUS-READ-ONLY: reports a missing path without creating it" \
+  test.oo.bootStatusIsReadOnly
+expect 0 "status is read-only and names the recovery command" \
+  "a report must diagnose, never repair — repair is the explicit oo boot.fix"
+
+
+# ============================================================================
+# T-BOOTPATH-PROFILED: /etc/profile.d/oosh.sh — the LOGIN-SHELL recovery route
+# ============================================================================
+# Follow-on to T9 (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md
+# "The three recovery routes"). `/etc/oosh/boot` works, but a human has to TYPE
+# `. /etc/oosh/boot`. Measured in a container:
+#
+#   env -i sh                     -> NO   $ENV is a non-login POSIX sh's ONLY rc
+#                                         hook, and `env -i` is what erased it.
+#                                         Nothing can recover this; do not claim
+#                                         otherwise anywhere.
+#   env -i ENV=/etc/oosh/boot sh  -> YES  that same hook, handed back by hand.
+#   env -i sh -l                  -> only once /etc/profile has an oosh line.
+#
+# dash's own trace settles the third: `env -i sh -lxc ':'` runs /etc/profile
+# (`id -u`, `[ 1003 -eq 0 ]`, `PS1=$`, `[ -d /etc/profile.d ]`) while
+# `env -i sh -xc ':'` shows only `+ :` — and /etc/profile already loops
+# `for i in /etc/profile.d/*.sh`. So a drop-in makes the login route work.
+#
+# It is created by the SAME state 34 and healed by the SAME `oo boot.fix` —
+# i.e. by private.oo.boot.path.ensure. One mechanism, not two.
+#
+# EVERYTHING here is driven against FIXTURE paths. A core test must never
+# write to the host's real /etc/profile.d, and must never need root.
+
+# Build a fixture whose <branch>/boot is the REAL boot, so the behavioural
+# assertions below actually exercise the anchoring prologue. `[ -f ]` follows
+# symlinks, so the helper's warn-and-skip guard is satisfied.
+test.oo.bootProfile.fixture() { # <fixtureRoot> <?withProfileDir:yes>
+  local fixture="$1" withProfileDir="${2:-yes}"
+  rm -rf "$fixture"
+  mkdir -p "$fixture/shared/dev" "$fixture/system/oosh"
+  ln -sfn "$OOSH_DIR/boot" "$fixture/shared/dev/boot"
+  [ "$withProfileDir" = "yes" ] && mkdir -p "$fixture/system/profile.d"
+  return 0
+}
+
+# --- T-BOOTPATH-PROFILED-DROPIN-CREATED --------------------------------------------
+# The file must END IN .sh — /etc/profile has `for i in /etc/profile.d/*.sh`,
+# so any other name is never read and the whole route silently does nothing.
+test.oo.bootProfileDropInCreated() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.create.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootProfile.fixture "$fixture" yes
+  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+  local rc=$? dropIn="$prof/oosh.sh" mode=""
+  [ -f "$dropIn" ] && mode=$(ls -l "$dropIn" 2>/dev/null | cut -c1-10)
+  local matched=no
+  # exactly the glob /etc/profile reads — not a name that merely looks right
+  local g; for g in "$prof"/*.sh; do [ "$g" = "$dropIn" ] && matched=yes; done
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned rc=$rc"
+  elif [ ! -f "$dropIn" ]; then
+    create.result 1 "no drop-in at $dropIn (dir: $(ls -la "$prof" 2>&1 | tr '\n' ' '))"
+  elif [ "$matched" != "yes" ]; then
+    create.result 1 "$dropIn is not matched by /etc/profile's own \`*.sh\` glob — it would never be read"
+  elif ! grep -Fq "$sys/boot" "$dropIn"; then
+    create.result 1 "drop-in does not source $sys/boot: $(cat "$dropIn")"
+  elif [ "$mode" != "-rw-r--r--" ]; then
+    create.result 1 "drop-in mode is '$mode', expected -rw-r--r-- (644) — every login shell must be able to read it"
+  else
+    create.result 0 "login-shell drop-in created"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-PROFILED-DROPIN-CREATED: state 34 / oo boot.fix also lands <profileDir>/oosh.sh" \
+  test.oo.bootProfileDropInCreated
+expect 0 "login-shell drop-in created" \
+  "without it \`env -i sh -l\` still cannot bootstrap oosh (/etc/profile has no oosh line)"
+
+# --- T-BOOTPATH-PROFILED-SKIPS-WITHOUT-PROFILE-DIR ---------------------------------
+# macOS has NO /etc/profile.d: its /etc/profile runs path_helper and sources
+# /etc/bashrc, and globs nothing. Creating the directory there would be inert,
+# so absence is a GRACEFUL SKIP — rc 0, symlink still ensured, nothing created.
+# This is the same shape as the helper's existing warn-and-skip for a branch
+# without `boot`.
+test.oo.bootProfileSkipsWithoutProfileDir() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.nodir.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootProfile.fixture "$fixture" no
+  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "absent $prof must SKIP (rc=0), got rc=$rc — state 34 would halt on every macOS host"
+  elif [ -e "$prof" ]; then
+    create.result 1 "created $prof although the host has none — a drop-in there is inert on macOS"
+  elif [ ! -L "$sys/boot" ]; then
+    create.result 1 "the primary contract was dropped: no symlink at $sys/boot"
+  else
+    create.result 0 "no profile.d means a graceful skip"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-PROFILED-SKIPS-WITHOUT-PROFILE-DIR: macOS has no /etc/profile.d — skip, do not fail" \
+  test.oo.bootProfileSkipsWithoutProfileDir
+expect 0 "no profile.d means a graceful skip" \
+  "the login route is Linux-only; its absence must never halt state 34"
+
+# --- T-BOOTPATH-PROFILED-CONTENT-FROM-TEMPLATE -------------------------------------
+# The drop-in is a managed file, so its content is a TEMPLATE
+# (templates/user/profile.d.oosh.sh) like bashrcTemplate and ooShim — never a
+# heredoc in code. The method only substitutes @SYSTEM_PATH@.
+test.oo.bootProfileContentFromTemplate() {
+  local template="$OOSH_DIR/templates/user/profile.d.oosh.sh" got want
+  if [ ! -r "$template" ]; then
+    create.result 1 "template missing: $template"; return $(result)
+  fi
+  got=$(private.oo.boot.profile.content.get /fix/oosh)
+  want=$(sed 's|@SYSTEM_PATH@|/fix/oosh|g' "$template")
+  if [ -z "$got" ]; then
+    create.result 1 "method emitted nothing"
+  elif [ "$got" != "$want" ]; then
+    create.result 1 "emitted content is not the substituted template"
+  elif printf '%s' "$got" | grep -q '@SYSTEM_PATH@'; then
+    create.result 1 "placeholder left unsubstituted"
+  else
+    create.result 0 "drop-in content comes from the template"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-PROFILED-CONTENT-FROM-TEMPLATE: the drop-in is templates/user/profile.d.oosh.sh with the path substituted" \
+  test.oo.bootProfileContentFromTemplate
+expect 0 "drop-in content comes from the template" \
+  "managed files oosh writes come from templates/user/, never from heredocs in code"
+
+# --- T-BOOTPATH-PROFILED-CONTENT-IS-POSIX ------------------------------------------
+# It is read by /bin/sh on every login. Same bar as `boot` itself (T40).
+test.oo.bootProfileContentIsPosix() {
+  local tmp bad=""; tmp=$(mktemp "${TMPDIR:-/tmp}/test.oo.bootprofile.lint.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  private.oo.boot.profile.content.get /etc/oosh > "$tmp" 2>/dev/null
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; create.result 1 "private.oo.boot.profile.content.get emitted nothing"
+    return $(result)
+  fi
+  sh    -n "$tmp" 2>/dev/null || bad="$bad sh:$(sh -n "$tmp" 2>&1 | head -1)"
+  if command -v dash >/dev/null 2>&1; then
+    dash -n "$tmp" 2>/dev/null || bad="$bad dash:$(dash -n "$tmp" 2>&1 | head -1)"
+  fi
+  if command -v busybox >/dev/null 2>&1; then
+    busybox ash -n "$tmp" 2>/dev/null || bad="$bad ash:$(busybox ash -n "$tmp" 2>&1 | head -1)"
+  fi
+  bash  -n "$tmp" 2>/dev/null || bad="$bad bash:$(bash -n "$tmp" 2>&1 | head -1)"
+  # `-n` ALONE IS NOT ENOUGH, and that is measured, not assumed: a planted
+  # `[[ -r … ]]` sails through `dash -n`, because `[[` is a perfectly valid
+  # COMMAND NAME to dash — it only blows up at run time with "[[: not found".
+  # So the common bashisms are grepped for explicitly. (T40 lints `boot` the
+  # same way and inherits the same blind spot.)
+  grep -Eq '(^|[[:space:];&|(])(\[\[|\(\(|local|source|declare|typeset)([[:space:]]|$)' "$tmp" \
+    && bad="$bad bashism:$(grep -nE '(^|[[:space:];&|(])(\[\[|\(\(|local|source|declare|typeset)([[:space:]]|$)' "$tmp" | head -1)"
+  # `exit` in a file sourced by /etc/profile KILLS the login shell.
+  grep -Eq '(^|[[:space:];&|(])exit([[:space:]]|$)' "$tmp" && bad="$bad contains-exit"
+  rm -f "$tmp"
+  if [ -z "$bad" ]; then
+    create.result 0 "drop-in is POSIX and cannot exit a login shell"
+  else
+    create.result 1 "drop-in lint failed —$bad"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-PROFILED-CONTENT-IS-POSIX: parses under sh/dash/ash/bash and never \`exit\`s" \
+  test.oo.bootProfileContentIsPosix
+expect 0 "drop-in is POSIX and cannot exit a login shell" \
+  "this file runs for EVERY login on the box — a parse error or an exit breaks logins"
+
+# --- T-BOOTPATH-PROFILED-CONTENT-IS-GUARDED ----------------------------------------
+# The behavioural contract, four ways. This runs for every login shell on the
+# host, including users who have never heard of oosh.
+#   1. HOME unset (`env -i sh -l`, the case this route EXISTS for) -> boot is
+#      sourced and derives HOME itself.
+#   2. HOME set and the user HAS ~/oosh -> sourced, anchors recovered.
+#   3. HOME set and the user has NO ~/oosh -> NOT sourced. This is the PATH
+#      judgement call: without this guard every non-oosh user on the box grows
+#      a nonexistent ~/oosh on PATH *and* an empty ~/.config/oosh in their home
+#      just for logging in.
+#   4. the boot target missing/dangling -> silent no-op, rc 0, shell alive.
+test.oo.bootProfileContentIsGuarded() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.guard.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootProfile.fixture "$fixture" yes
+  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+  local dropIn="$prof/oosh.sh" bad="" out
+  local probe='echo "<[$HOME|$OOSH_DIR]>"'
+
+  # 1. HOME unset — boot must run and recover it from the password database.
+  #    Compared against the PASSWD home, which is what boot derives — not the
+  #    runner's $HOME (they differ under sudo without -H).
+  local pwHome
+  pwHome=$(test.suite.home.passwd)
+  out=$(cd /tmp && env -i sh -c ". $dropIn; $probe" 2>&1 | grep -o '<\[[^]]*\]>' | tail -1)
+  [ "$out" = "<[$pwHome|$pwHome/oosh]>" ] || bad="$bad home-unset=>$out"
+
+  # 2. HOME set, user HAS ~/oosh (this test's own user, by definition of $HOME).
+  if [ -d "$HOME/oosh" ]; then
+    out=$(cd /tmp && env -i HOME="$HOME" sh -c ". $dropIn; $probe" 2>&1 | grep -o '<\[[^]]*\]>' | tail -1)
+    [ "$out" = "<[$HOME|$HOME/oosh]>" ] || bad="$bad oosh-user=>$out"
+  fi
+
+  # 3. HOME set, NO ~/oosh — must not source boot, and must not litter.
+  local stranger="$fixture/stranger"
+  mkdir -p "$stranger"
+  out=$(cd /tmp && env -i HOME="$stranger" sh -c ". $dropIn; $probe" 2>&1 | grep -o '<\[[^]]*\]>' | tail -1)
+  [ "$out" = "<[$stranger|]>" ] || bad="$bad non-oosh-user=>$out"
+  [ -e "$stranger/.config/oosh" ] && bad="$bad littered:$stranger/.config/oosh"
+
+  # 4. the target is gone — a login must see NOTHING, not an error.
+  rm -f "$sys/boot"
+  out=$(cd /tmp && env -i HOME="$HOME" sh -c ". $dropIn; echo ALIVE" 2>&1)
+  [ "$out" = "ALIVE" ] || bad="$bad dangling-not-silent=>$out"
+  ( cd /tmp && env -i HOME="$HOME" sh -c ". $dropIn" ) >/dev/null 2>&1 || bad="$bad dangling-rc=$?"
+
+  rm -rf "$fixture" 2>/dev/null
+  if [ -z "$bad" ]; then
+    create.result 0 "drop-in is guarded on both the target and the caller"
+  else
+    create.result 1 "guard broken —$bad"
+  fi
+  return $(result)
+}
+test.case - "T-BOOTPATH-PROFILED-CONTENT-IS-GUARDED: never breaks a login, never touches a non-oosh user" \
+  test.oo.bootProfileContentIsGuarded
+expect 0 "drop-in is guarded on both the target and the caller" \
+  "a host-wide login hook that assumes oosh would junk every other user's PATH and home"
+
+# --- T-BOOTPATH-PROFILED-IDEMPOTENT ------------------------------------------------
+test.oo.bootProfileIdempotent() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.idem.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootProfile.fixture "$fixture" yes
+  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+  local first; first=$(cat "$prof/oosh.sh" 2>/dev/null; ls -l "$prof" 2>/dev/null)
+  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+  local rc=$? second; second=$(cat "$prof/oosh.sh" 2>/dev/null; ls -l "$prof" 2>/dev/null)
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "second call returned rc=$rc"
+  elif [ ! -s "$prof/oosh.sh" ]; then
+    # Without this, "nothing == nothing" would make the comparison below pass
+    # while no drop-in was ever written — the `create.result 1` defect in
+    # another dress. Two absences are not idempotence.
+    create.result 1 "no drop-in to be idempotent about at $prof/oosh.sh"
+  elif [ "$first" != "$second" ]; then
+    create.result 1 "second call changed the drop-in"
+  else
+    create.result 0 "drop-in write is a no-op on re-run"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-PROFILED-IDEMPOTENT: re-running state 34 rewrites the same file" \
+  test.oo.bootProfileIdempotent
+expect 0 "drop-in write is a no-op on re-run" \
+  "state 34 re-runs on every re-install, and oo boot.fix is run by hand"
+
+# --- T-BOOTPATH-PROFILED-STATUS-REPORTS --------------------------------------------
+# `oo boot.status` is the read-only report; it must cover BOTH host resources
+# the fix creates, or a missing drop-in is invisible until someone tries
+# `env -i sh -l` in anger.
+test.oo.bootProfileStatusReports() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.status.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  test.oo.bootProfile.fixture "$fixture" yes
+  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
+  oo.boot.fix "$sys" "$prof" >/dev/null 2>&1
+  local saved=$LOG_LEVEL out rc
+  log.level 1 >/dev/null 2>&1
+  out=$(oo.boot.status "$sys" "$prof" 2>/dev/null); rc=$?
+  # now break it and re-report
+  rm -f "$prof/oosh.sh"
+  local out2 rc2
+  out2=$(oo.boot.status "$sys" "$prof" 2>/dev/null); rc2=$?
+  log.level $saved >/dev/null 2>&1
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "healthy host reported rc=$rc: $out"
+  elif ! echo "$out" | grep -Fq "$prof/oosh.sh"; then
+    create.result 1 "report does not name the drop-in: $out"
+  elif [ "$rc2" -eq 0 ]; then
+    create.result 1 "a MISSING drop-in reported healthy (rc=0): $out2"
+  elif ! echo "$out2" | grep -q 'boot.fix'; then
+    create.result 1 "missing drop-in reported without the recovery command: $out2"
+  else
+    create.result 0 "status covers the login-shell drop-in too"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case - "T-BOOTPATH-PROFILED-STATUS-REPORTS: oo boot.status reports the drop-in, and misses nothing" \
+  test.oo.bootProfileStatusReports
+expect 0 "status covers the login-shell drop-in too" \
+  "two host resources, one report — otherwise a broken login route is invisible"
+
+
+# ============================================================================
+# T-CMD-* — oo.cmd's result contract
+# ============================================================================
+# oo.cmd reported success unconditionally: its last statement was a bare
+# `RETURN=$1` assignment, so its exit status was that of a variable assignment
+# — always 0, whatever the package manager did. `oo cmd mc` shelled out and
+# reported success when the package did not exist, the network was down, sudo
+# was denied, or OOSH_PM was empty. Three callers check the status and could
+# never fire.
+#
+# Driven through a PATH shim that LOGS ITS ARGV, so "the PM was never invoked"
+# is an assertion with a diagnostic rather than a bare sentinel. OOSH_PM is
+# pinned in every case: left empty, oo.cmd calls oo.pm.discover, which does a
+# real `config save` and on apt hosts a real `apt-get update`.
+# CONFIG_PATH is passed through from this file's fixture (test.suite.config.isolate
+# at the top), never env -i'd away, so the child cannot reach the shared tier.
+
+test.oo.cmd.fixture() { # <stubDir> # a fake package manager that records every call and exits $PM_RC
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$PM_LOG"' 'exit ${PM_RC:-0}' > "$1/fakepm"
+  chmod +x "$1/fakepm"
+}
+
+test.oo.cmd.run() { # <stubDir> <pmRc> <noPm> <args...> # run oo.cmd in a pinned child; echo "rc|RESULT"
+  local stub="$1" pmRc="$2" noPm="$3"; shift 3
+  local pmPin='OOSH_PM="fakepm install"'
+  [ "$noPm" = "noPm" ] && pmPin='OOSH_PM=""; oo.pm.discover() { :; }'
+  # TEST_OO_CMD_OVERRIDE, when set, is spliced in AFTER the real oo is sourced.
+  # The negative controls below use it to plant the ORIGINAL defect as an
+  # oo.cmd override and prove the test function above catches it.
+  env PATH="$stub:$PATH" HOME="$HOME" LOG_LEVEL=0 SUDO="" \
+      PM_LOG="$stub/pm.calls" PM_RC="$pmRc" \
+      CONFIG_PATH="$CONFIG_PATH" CONFIG="$CONFIG" CONFIG_FILE="$CONFIG_FILE" \
+      bash -c '
+        source "$OOSH_DIR/this" >/dev/null 2>&1
+        source "$OOSH_DIR/oo"   >/dev/null 2>&1
+        '"$pmPin"'
+        '"${TEST_OO_CMD_OVERRIDE:-:}"'
+        oo.cmd "$@" >/dev/null 2>&1
+        printf "%s|%s" "$?" "$RESULT"' _ "$@"
+}
+
+test.oo.cmd.control() { # <caseName> <plantedOverride> <testFunction> <expectedFailurePrefix> # negative control: with the defect planted as an oo.cmd override, the test function must FAIL with the named diagnosis
+  # Runs its own test.case + expect (the T-OSSH-PREREQS-* idiom) because
+  # test.case word-splits $testArguments — a quoted override with spaces cannot
+  # travel through it as one argument.
+  local name="$1" fn="$3" want="$4" rc res
+  test.case $level "$name" echo "(negative control: plant the original defect, expect the test above to catch it)"
+  TEST_OO_CMD_OVERRIDE="$2"
+  $fn; rc=$?; res="$RESULT"
+  unset TEST_OO_CMD_OVERRIDE
+  if [ "$rc" -ne 0 ] && [ "${res#"$want"}" != "$res" ]; then
+    expect.pass "control caught: $want"
+  else
+    expect.fail "planted defect NOT caught by $fn (rc=$rc RESULT=[$res])"
+  fi
+}
+
+# --- T-CMD-PM-FAILS ---------------------------------------------------------
+test.oo.cmdPmFails() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.fail.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  local got; got=$(test.oo.cmd.run "$stub" 1 withPm ooshNoSuchTool)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "reported success though the package manager exited 1 (RESULT=[$res])"
+  elif [ "${res#*ooshNoSuchTool}" = "$res" ]; then
+    create.result 1 "failed but \$RESULT does not name the tool: [$res]"
+  else
+    create.result 0 "a failing package manager is reported"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-PM-FAILS: a failing package manager is reported, and names the tool" \
+  test.oo.cmdPmFails
+expect 0 "a failing package manager is reported" \
+  "oo cmd reported success unconditionally — three callers check its status and could never fire"
+
+# --- T-CMD-VERIFY-AFTER-INSTALL --------------------------------------------
+test.oo.cmdVerifyAfterInstall() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.verify.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  # PM exits 0 but installs nothing — the command is still absent afterwards
+  local got; got=$(test.oo.cmd.run "$stub" 0 withPm ooshNoSuchTool)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "package manager said OK and the command is still absent, but oo.cmd reported success (RESULT=[$res])"
+  else
+    create.result 0 "installing without landing the command is a failure"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-VERIFY-AFTER-INSTALL: PM says OK but the command is still missing" \
+  test.oo.cmdVerifyAfterInstall
+expect 0 "installing without landing the command is a failure" \
+  "the post-condition oo.cmd's own comment deferred to ossh.prereqs.install for"
+
+# --- T-CMD-ALREADY-PRESENT --------------------------------------------------
+test.oo.cmdAlreadyPresent() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.present.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  local got; got=$(test.oo.cmd.run "$stub" 0 withPm sh)
+  local rc="${got%%|*}"
+  local calls=""; [ -s "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
+  rm -rf "$stub" 2>/dev/null
+  if [ -n "$calls" ]; then
+    create.result 1 "invoked the package manager for an already-present command: [$calls]"
+  elif [ "$rc" != "0" ]; then
+    create.result 1 "an already-present command reported rc=$rc"
+  else
+    create.result 0 "already present is success, PM never invoked"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-ALREADY-PRESENT: no work, no package manager, rc 0" \
+  test.oo.cmdAlreadyPresent
+expect 0 "already present is success, PM never invoked" \
+  "idempotency is the documented contract — every caller relies on it"
+
+# --- T-CMD-NO-PM ------------------------------------------------------------
+test.oo.cmdNoPm() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.nopm.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  local got; got=$(test.oo.cmd.run "$stub" 0 noPm ooshNoSuchTool)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "no package manager at all, yet reported success (RESULT=[$res])"
+  else
+    create.result 0 "no package manager is a failure"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-NO-PM: nothing can be installed, so nothing succeeded" \
+  test.oo.cmdNoPm
+expect 0 "no package manager is a failure" \
+  "it used to console.log 'no package manger' and exit 0"
+
+# --- T-CMD-TWO-ARG ----------------------------------------------------------
+test.oo.cmdTwoArg() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.twoarg.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  # <cmd> <packageName> — the documented two-argument form
+  test.oo.cmd.run "$stub" 0 withPm ooshNoSuchTool ooshNoSuchPackage >/dev/null
+  local calls=""; [ -f "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
+  rm -rf "$stub" 2>/dev/null
+  if [ "${calls#*ooshNoSuchPackage}" = "$calls" ]; then
+    create.result 1 "the package name never reached the package manager: [$calls]"
+  else
+    create.result 0 "the package name reaches the package manager"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-TWO-ARG: oo.cmd <cmd> <packageName> installs the PACKAGE" \
+  test.oo.cmdTwoArg
+expect 0 "the package name reaches the package manager" \
+  "the second argument was shifted away and lost — ossh:1933 installs nothing today"
+
+# --- T-CMD-DEAD-BRANCH ------------------------------------------------------
+test.oo.cmdDeadBranch() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.dead.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture "$stub"
+  # mkcert delegates to once.su.mkcert.install, which is defined nowhere
+  local got; got=$(test.oo.cmd.run "$stub" 0 withPm mkcert)
+  local rc="${got%%|*}" res="${got#*|}"
+  rm -rf "$stub" 2>/dev/null
+  if [ "$rc" = "0" ]; then
+    create.result 1 "a branch whose installer does not exist reported success (RESULT=[$res])"
+  else
+    create.result 0 "a branch that cannot work says so"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-DEAD-BRANCH: mkcert delegates to a command that does not exist" \
+  test.oo.cmdDeadBranch
+expect 0 "a branch that cannot work says so" \
+  "once, private.stage and once.su.mkcert.install are defined nowhere in this tree"
+
+# --- T-CMD-CONTROL-* — one negative control per T-CMD assertion ------------
+# Each plants the ORIGINAL defect as an oo.cmd override in the same shim and
+# asserts the test function above goes red with its specific diagnosis. A test
+# nobody has watched fail is not a test (standing verification bar).
+test.oo.cmd.control "T-CMD-CONTROL-PM-FAILS: a bare RETURN=\$1 tail (always rc 0) is caught" \
+  'oo.cmd() { $OOSH_PM "$1"; RETURN=$1; }' \
+  test.oo.cmdPmFails "reported success though the package manager exited 1"
+
+test.oo.cmd.control "T-CMD-CONTROL-VERIFY: trusting the PM without re-verifying is caught" \
+  'oo.cmd() { $OOSH_PM "$1" && create.result 0 "installed"; return $(result); }' \
+  test.oo.cmdVerifyAfterInstall "package manager said OK and the command is still absent"
+
+test.oo.cmd.control "T-CMD-CONTROL-PRESENT: dropping the already-present short-circuit is caught" \
+  'oo.cmd() { $OOSH_PM "$1"; create.result 0 "ok"; return $(result); }' \
+  test.oo.cmdAlreadyPresent "invoked the package manager for an already-present command"
+
+test.oo.cmd.control "T-CMD-CONTROL-NO-PM: the old console.log-and-exit-0 on a missing PM is caught" \
+  'oo.cmd() { create.result 0 "no package manger"; return $(result); }' \
+  test.oo.cmdNoPm "no package manager at all, yet reported success"
+
+test.oo.cmd.control "T-CMD-CONTROL-TWO-ARG: the double shift that lost the package name is caught" \
+  'oo.cmd() { shift; shift; $OOSH_PM "$1"; create.result 1 "x"; return $(result); }' \
+  test.oo.cmdTwoArg "the package name never reached the package manager"
+
+test.oo.cmd.control "T-CMD-CONTROL-DEAD-BRANCH: calling an undefined installer and reporting success is caught" \
+  'oo.cmd() { once.su.mkcert.install; create.result 0 "ok"; return $(result); }' \
+  test.oo.cmdDeadBranch "a branch whose installer does not exist reported success"
+
+# ============================================================================
+# T-METHOD-* — `oo method.new` actually produces a usable method
+# ============================================================================
+# The project mandates template-driven method creation
+# (docs/first-principles.md, docs/command-creation.md), but every method in
+# this tree is hand-written because the tool was half-broken: it shipped the
+# template's placeholder docstring, mangled the usage table to
+# `<method>------`, dropped every name segment after the second, and emitted
+# no completion function. The docstring is the metadata this.help renders and
+# c2 completes from, so a method born without it is broken by the project's
+# own Method Structure Standard.
+
+test.oo.method.probe.clean() { # <probe> # remove a throwaway script, its test, and any transaction leftovers
+  rm -f "$OOSH_DIR/$1" "$OOSH_DIR/$1.new" "$OOSH_DIR/$1.bak" \
+        "$OOSH_DIR/test/test.$1" "$OOSH_DIR/test/test.$1.new" "$OOSH_DIR/test/test.$1.bak" 2>/dev/null
+}
+
+test.oo.method.probe.make() { # <probe> # a throwaway script + test from the templates, via the real oo.new
+  test.oo.method.probe.clean "$1"
+  ( LOG_LEVEL=1 oo.new "$1" ) >/dev/null 2>&1
+  [ -f "$OOSH_DIR/$1" ] && [ -f "$OOSH_DIR/test/test.$1" ]
+}
+
+# --- T-METHOD-NEW-DOCSTRING -------------------------------------------------
+test.oo.methodNewWritesDocstring() {
+  local probe="probeMethodNewScript" pwdBefore="$PWD"
+  # oo.new and private.oo.new.test both `cd`, so the caller's directory has to
+  # be put back by hand.
+  if ! test.oo.method.probe.make "$probe"; then
+    cd "$pwdBefore"; test.oo.method.probe.clean "$probe"
+    create.result 1 "oo.new did not create $probe and its test"
+    return $(result)
+  fi
+  printf '%s\n' '<branch> <?force:no>' 'switches to a branch, safely' \
+                 'a probe test' 'probeArg' 'probe_ok' \
+    | ( LOG_LEVEL=1 oo.method.new "$probe.probeThing" ) >/dev/null 2>&1
+  cd "$pwdBefore"
+
+  local docline mangled untouchedExamples stub testcase
+  docline=$(grep -F "$probe.probeThing()" "$OOSH_DIR/$probe" 2>/dev/null | head -1)
+  # The mangling signature is a NAME run straight into dashes — `probeThing------`
+  # — produced by the first-match-anywhere sed that used to chew the Examples
+  # block. The template's own plain dashed rule is not residue: the tool does
+  # not touch the usage table at all any more, so that line must survive intact.
+  mangled=$(grep -c -E '^[[:space:]]*[A-Za-z][A-Za-z0-9.]*-{3,}' "$OOSH_DIR/$probe" 2>/dev/null)
+  untouchedExamples=$(grep -c -E '^[[:space:]]*-{4,}[[:space:]]*$' "$OOSH_DIR/$probe" 2>/dev/null)
+  stub=$(grep -c "^$probe.probeThing.completion.branch()" "$OOSH_DIR/$probe" 2>/dev/null)
+  testcase=$(grep -c 'a probe test' "$OOSH_DIR/test/test.$probe" 2>/dev/null)
+  test.oo.method.probe.clean "$probe"
+
+  if ! echo "$docline" | grep -Fq '# <branch> <?force:no> # switches to a branch, safely #'; then
+    create.result 1 "the typed metadata never reached the docstring: [$docline]"
+  elif [ "$mangled" != "0" ]; then
+    create.result 1 "the usage/Examples block was mangled ($mangled line(s) of the probeThing------ shape)"
+  elif [ "$untouchedExamples" = "0" ]; then
+    create.result 1 "the template's Examples rule is gone — the tool is still editing the usage table"
+  elif [ "$stub" = "0" ]; then
+    create.result 1 "no completion function for <branch> — the method cannot tab-complete"
+  elif [ "$testcase" = "0" ]; then
+    create.result 1 "the test case was not written into test.$probe"
+  else
+    create.result 0 "docstring, completion and test case all carry the typed metadata"
+  fi
+  return $(result)
+}
+test.case $level "T-METHOD-NEW-DOCSTRING: the typed parameters and description land in the docstring, with a completion stub" \
+  test.oo.methodNewWritesDocstring
+expect 0 "docstring, completion and test case all carry the typed metadata" \
+  "the docstring is what this.help renders and c2 completes from — it must never ship a placeholder"
+
+# --- T-METHOD-NEW-MULTISEGMENT ----------------------------------------------
+test.oo.methodNewMultiSegment() {
+  local probe="probeMultiSegScript" pwdBefore="$PWD"
+  if ! test.oo.method.probe.make "$probe"; then
+    cd "$pwdBefore"; test.oo.method.probe.clean "$probe"
+    create.result 1 "oo.new did not create $probe and its test"
+    return $(result)
+  fi
+  printf '%s\n' '<host>' 'updates the certificates for a host' \
+                 'a probe test' 'probeHost' 'probe_ok' \
+    | ( LOG_LEVEL=1 oo.method.new "$probe.certificates.update.run" ) >/dev/null 2>&1
+  cd "$pwdBefore"
+
+  local full truncated
+  full=$(grep -c "^$probe.certificates.update.run()" "$OOSH_DIR/$probe" 2>/dev/null)
+  truncated=$(grep -c "^$probe.certificates()" "$OOSH_DIR/$probe" 2>/dev/null)
+  test.oo.method.probe.clean "$probe"
+
+  if [ "$truncated" != "0" ]; then
+    create.result 1 "the name was truncated to $probe.certificates() — every segment after the second was dropped"
+  elif [ "$full" != "1" ]; then
+    create.result 1 "$probe.certificates.update.run() was not created (found $full)"
+  else
+    create.result 0 "every dot segment survives into the method name"
+  fi
+  return $(result)
+}
+test.case $level "T-METHOD-NEW-MULTISEGMENT: oo method.new <script>.a.b.c creates a.b.c, not a" \
+  test.oo.methodNewMultiSegment
+expect 0 "every dot segment survives into the method name" \
+  "deep hierarchy is explicitly blessed by the naming standard — hiveMind.team.context.status()"
+
+# --- T-DOCS-NAME-DRIFT ------------------------------------------------------
+# 2fe5133 renamed oo.new.method to oo.method.new in March 2026 and updated two
+# documentation lines. Seventeen references stayed wrong for six months, so the
+# documented route into this tooling did not dispatch for anyone who followed it.
+test.oo.docsNameNoDrift() {
+  local missing="" doc cmd method
+  for doc in "$OOSH_DIR"/docs/*.md; do
+    [ -f "$doc" ] || continue
+    for cmd in $(grep -ohE '(^[[:space:]]*([0-9]+\.[[:space:]]*)?\.?/?oo |`\.?/?oo )[a-z][a-zA-Z0-9]*(\.[a-zA-Z0-9]+)*' "$doc" 2>/dev/null \
+                 | sed -E 's/.*oo //' | sort -u); do
+      method="oo.$cmd"
+      grep -qE "^(private\.)?${method//./\.}\(\)" "$OOSH_DIR/oo" || missing="$missing
+    $(basename "$doc"): oo $cmd"
+    done
+  done
+  if [ -z "$(echo "$missing" | tr -d '[:space:]')" ]; then
+    create.result 0 "every documented oo command exists"
+  else
+    create.result 1 "docs name commands that oo does not define:$missing"
+  fi
+  return $(result)
+}
+test.case $level "T-DOCS-NAME-DRIFT: every oo command named in docs/ is actually defined" \
+  test.oo.docsNameNoDrift
+expect 0 "every documented oo command exists" \
+  "a rename must update the docs — 2fe5133 did not, and it went unnoticed for six months"
+
+# ============================================================================
+# T-MODE-RELEASE-* — the release lane asks about the branch, not a mode word
+# ============================================================================
+# OOSH_MODE carried two kinds of value: a branch name, written by `oo mode`,
+# and the literal word "released", written by promote AFTER it had already
+# checked the tree back out to dev. Its sibling lane asserts "dev", so a box
+# could satisfy only one of the two — and on a genuinely released box, where
+# `oo mode prod` had set the branch name, the release lane failed anyway.
+#
+# A released install is one sitting on the prod branch. The lane keeps its
+# purpose and asks the right question; promote's write is gone, because it was
+# recording a developer-box event into a variable that describes an installed
+# machine.
+test.oo.modeRelease() { # <modeValue> # rc of private.check.user.mode.release with OOSH_MODE=<modeValue>
+  local saved="$OOSH_MODE"
+  export OOSH_MODE="$1"
+  private.check.user.mode.release >/dev/null 2>&1
+  local rc=$?
+  export OOSH_MODE="$saved"
+  return $rc
+}
+
+test.oo.modeReleaseChecksProd() {
+  if ! test.oo.modeRelease prod; then
+    create.result 1 "a prod box is not accepted as released"
+  elif test.oo.modeRelease dev; then
+    create.result 1 "a dev box was accepted as released"
+  elif test.oo.modeRelease released; then
+    create.result 1 "the old mode word 'released' still satisfies the check — OOSH_MODE is meant to be a branch now"
+  else
+    create.result 0 "released means: on the prod branch"
+  fi
+  return $(result)
+}
+test.case $level "T-MODE-RELEASE-CHECKS-PROD: the release lane accepts prod, rejects dev and the old mode word" \
+  test.oo.modeReleaseChecksProd
+expect 0 "released means: on the prod branch" \
+  "OOSH_MODE is the branch the host is on; 'released' was an event recorded in the wrong variable"
+
+
+# ============================================================================
+# T-METHOD-DELETE — the counterpart of oo method.new
+# ============================================================================
+# oo had `oo new`, `oo test.new` and `oo method.new`, and nothing that removed
+# a method. Deleting one by hand takes the body and leaves the docstring's
+# completion functions behind — which is how `path` came to carry completion
+# functions for verbs it no longer had. The fixture is a throwaway script in
+# $OOSH_DIR, because the tool addresses scripts as $OOSH_DIR/<script>.
+MD_SCRIPT="testMethodDeleteFixture$$"   # dot-free: <script.method> splits on the FIRST dot
+MD_FILE="$OOSH_DIR/$MD_SCRIPT"
+
+private.test.oo.method.delete.fixture() { # # write the throwaway script under test
+  cat > "$MD_FILE" <<FIXTURE
+#!/usr/bin/env bash
+
+$MD_SCRIPT.keep() # <dir> # a method that must survive
+{
+  echo keep
+}
+$MD_SCRIPT.keep.completion.dir() { echo "/tmp"; }
+
+$MD_SCRIPT.victim() # <dir> <?force:no> # the method under test
+{
+  local brace="}"      # NOT the end of the block
+  echo victim
+}
+$MD_SCRIPT.victim.completion.dir() {
+  echo "/tmp"
+}
+$MD_SCRIPT.victim.completion.force() { echo "yes"; echo "no"; }
+FIXTURE
+}
+
+test.oo.methodDeleteRemovesMethodAndCompletions() {
+  private.test.oo.method.delete.fixture
+  "$OOSH_DIR/oo" method.delete "$MD_SCRIPT.victim" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "oo method.delete returned $rc"
+  elif grep -q "victim" "$MD_FILE"; then
+    create.result 1 "something named victim survived: $(grep -n victim "$MD_FILE" | tr '\n' ' ')"
+  elif ! grep -q "^$MD_SCRIPT.keep() " "$MD_FILE" || ! grep -q "^$MD_SCRIPT.keep.completion.dir" "$MD_FILE"; then
+    create.result 1 "the neighbouring method or its completion was taken too: $(cat "$MD_FILE")"
+  else
+    create.result 0 "removed"
+  fi
+  return $(result)
+}
+test.case $level "T-METHOD-DELETE: the method, its docstring and both completion functions go together" \
+  test.oo.methodDeleteRemovesMethodAndCompletions
+expect 0 "removed" "a one-line completion function has no closing brace LINE — the block form alone would run past it"
+
+# A method that is not there must be refused, not silently reported as done.
+test.oo.methodDeleteRefusesUnknown() {
+  private.test.oo.method.delete.fixture
+  "$OOSH_DIR/oo" method.delete "$MD_SCRIPT.neverExisted" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success for a method that does not exist"
+  elif ! grep -q "^$MD_SCRIPT.victim() " "$MD_FILE"; then
+    create.result 1 "it edited the file anyway"
+  else
+    create.result 0 "refused"
+  fi
+  return $(result)
+}
+test.case $level "T-METHOD-DELETE-UNKNOWN: an absent method is refused and the file is untouched" \
+  test.oo.methodDeleteRefusesUnknown
+expect 0 "refused" "silently succeeding would hide a typo in the method name"
+
+rm -f "$MD_FILE" "$MD_FILE.bak" "$MD_FILE.new"
+unset MD_SCRIPT MD_FILE
+
+# ============================================================================
+# T-STATE31-SSH-SNAPSHOT-FIRST: the snapshot precedes the first ~/.ssh write
+# ============================================================================
+# State 31 is the first thing in the whole install that writes the installing
+# user's ~/.ssh — `mkdir -p "$HOME/.ssh"`, the Host github.com block, the
+# ssh-keyscan into known_hosts, the developking copy into ids/. That is why
+# ossh.install.continue.local's old "ssh.original" backup was nothing of the
+# kind: it ran after `oo state`, by which point this state had already run.
+#
+# Structural, not behavioural: state.check re-sources $stateScript on every
+# advancement, which kills in-shell function mocks, so an end-to-end mock of
+# `user ssh.backup` cannot survive. The ORDER is the invariant that matters,
+# and the platform gate proves the behaviour.
+test.oo.state31SnapshotsBeforeWriting() {
+  local body snapshotLine mkdirLine
+  body=$(declare -f private.check.root.shared.dev.folder.created 2>/dev/null)
+  if [ -z "$body" ]; then
+    create.result 1 "private.check.root.shared.dev.folder.created is not defined"
+    return $(result)
+  fi
+  snapshotLine=$(printf '%s\n' "$body" | grep -n 'ssh\.backup pre-install' | head -1 | cut -d: -f1)
+  mkdirLine=$(printf '%s\n' "$body" | grep -n 'mkdir -p "\$HOME/\.ssh"' | head -1 | cut -d: -f1)
+  if [ -z "$snapshotLine" ]; then
+    create.result 1 "state 31 takes no pre-install ssh snapshot"
+  elif [ -z "$mkdirLine" ]; then
+    create.result 1 "could not find the mkdir -p \$HOME/.ssh this test anchors on"
+  elif [ "$snapshotLine" -ge "$mkdirLine" ]; then
+    create.result 1 "the snapshot is at line $snapshotLine, the first write at $mkdirLine — too late"
+  else
+    create.result 0 "snapshot first"
+  fi
+  return $(result)
+}
+test.case $level "T-STATE31-SSH-SNAPSHOT-FIRST: state 31 archives ~/.ssh before it writes to it" \
+  test.oo.state31SnapshotsBeforeWriting
+expect 0 "snapshot first" "the state that does the work owns the snapshot — a backup taken afterwards is not a backup"
+# --- T-METHOD-NEW-PRIVATE ---------------------------------------------------
+# A private method is named private.<script>.<verb>, so the SCRIPT it belongs
+# to is the SECOND segment. Splitting on the first sent the tool at a file
+# called `private` and it refused with rc 3 — so the tool this project MANDATES
+# for method creation could not create a single private method, and every one
+# in the tree was hand-written. That is the standing methodology violation.
+test.oo.methodNewPrivate() {
+  local probe="probePrivateScript" pwdBefore="$PWD"
+  if ! test.oo.method.probe.make "$probe"; then
+    cd "$pwdBefore"; test.oo.method.probe.clean "$probe"
+    create.result 1 "oo.new did not create $probe and its test"
+    return $(result)
+  fi
+  printf '%s\n' '<envPrefix>' 'lists the persistable variable names' \
+                 'a probe test' 'OOSH' 'probe_ok' \
+    | ( LOG_LEVEL=1 oo.method.new "private.$probe.variables.list" ) >/dev/null 2>&1
+  cd "$pwdBefore"
+
+  local created stray stubs testcase
+  created=$(grep -c "^private\.$probe\.variables\.list()" "$OOSH_DIR/$probe" 2>/dev/null)
+  # The old split aimed at $OOSH_DIR/private. Nothing should ever create it.
+  stray=0; [ -e "$OOSH_DIR/private" ] && stray=1
+  # A private method is never dispatched from the command line, so a completion
+  # function for it is dead code — test/test.completion.audit skips `private*`
+  # for exactly that reason, and the tool must not generate one.
+  stubs=$(grep -c "^private\.$probe\.variables\.list\.completion\." "$OOSH_DIR/$probe" 2>/dev/null)
+  testcase=$(grep -c "private\.$probe\.variables\.list" "$OOSH_DIR/test/test.$probe" 2>/dev/null)
+  test.oo.method.probe.clean "$probe"
+
+  if [ "$stray" != "0" ]; then
+    create.result 1 "the tool created \$OOSH_DIR/private — the script is the SECOND segment of a private name"
+  elif [ "$created" != "1" ]; then
+    create.result 1 "private.$probe.variables.list() was not created in $probe (found $created)"
+  elif [ "$stubs" != "0" ]; then
+    create.result 1 "a private method got $stubs completion stub(s) — dead code the audit skips"
+  elif [ "$testcase" = "0" ]; then
+    create.result 1 "no test case was written for the private method"
+  else
+    create.result 0 "a private method lands in its own script, with no dead completion stub"
+  fi
+  return $(result)
+}
+test.case $level "T-METHOD-NEW-PRIVATE: oo method.new private.<script>.<verb> writes to <script>" \
+  test.oo.methodNewPrivate
+expect 0 "a private method lands in its own script, with no dead completion stub" \
+  "private methods are a large share of every script; the mandated tool could not create one"
+
+# --- T-CHECK-PM-NO-CLOBBER --------------------------------------------------
+# private.check.pm (oo:3055) does `export OS_CMD_GROUP_ADD=$3` and
+# `export OS_CMD_USER_ADD=$4` unconditionally, then persists the set with
+# `config save os.commands "OS_CMD"`. Four of the eight call sites pass those
+# arguments; `brew` — the macOS one — passes NEITHER (oo:3093), as do dpkg,
+# pkg and pacman. So on macOS the pair is written as the EMPTY STRING and
+# saved, which is why a clean Sequoia install carries
+#
+#   export OS_CMD_GROUP_ADD=""
+#   export OS_CMD_USER_ADD=""
+#
+# while Linux carries real values. private.user.init already knows the darwin
+# answers (`dseditgroup -o create -q`, `sysadminctl -addUser`, user:1633-1636),
+# so the fix is NOT to duplicate them here — it is for check.pm to stop writing
+# a variable it was never given, and let the heal fill them.
+#
+# The consequences were three, all measured on a clean VM 2026-09-17:
+#   - user.create fails ("ooshTestC should exist with no password hash");
+#   - private.this.group.create has no working route on darwin;
+#   - the cache can never go healthy, so private.user.init's persist branch —
+#     `config save os.commands` + `oo pm.discover` — runs on EVERY invocation,
+#     and that cascade is what wrote the shared config tier from an isolated
+#     test. See docs/research/2026-09-17-shared-tier-leak-macos.md.
+test.oo.checkPmDoesNotClobber() {
+  # A subshell: check.pm exports into its caller, and OOSH_PM must be empty for
+  # it to do anything at all. `true` stands in for a package manager because
+  # `command -v true` succeeds everywhere and installing nothing is safe — the
+  # apt-get branch, which shells out to `apt-get update`, is not reached.
+  local observed
+  observed=$(
+    export OOSH_PM=""
+    export OS_CMD_GROUP_ADD="SENTINEL_GROUP"
+    export OS_CMD_USER_ADD="SENTINEL_USER"
+    private.check.pm ls "ls install" >/dev/null 2>&1
+    echo "$OS_CMD_GROUP_ADD|$OS_CMD_USER_ADD"
+  )
+  if [ "$observed" = "SENTINEL_GROUP|SENTINEL_USER" ]; then
+    create.result 0 "a two-argument check.pm leaves the OS_CMD pair alone"
+  else
+    create.result 1 "check.pm overwrote the pair with [$observed] — a call that passes no group/user command must not write one"
+  fi
+  return $(result)
+}
+test.case $level "T-CHECK-PM-NO-CLOBBER: a PM with no group/user command does not blank the cached pair" \
+  test.oo.checkPmDoesNotClobber
+expect 0 "a two-argument check.pm leaves the OS_CMD pair alone" \
+  "brew passes neither, so macOS persisted two empty strings and user.create has never worked there"
+
+# --- T-PM-TABLES-AGREE -------------------------------------------------------
+# The package-manager map exists FOUR times in this tree, and they had drifted.
+#
+#   init/oosh:209-228   oosh_pm_detect        POSIX sh, standalone by necessity —
+#                                             it runs from a curl one-liner before
+#                                             any oosh exists to source.
+#   oo:3113-3121        private.check.all.pm  the local installer's call table
+#   ossh:2604-2616      ossh.pm.discover      a string executed on a REMOTE host
+#                                             that may have no oosh at all
+#   config              private.config.pm.command.get   added 2026-09-17 by card 2,
+#                                             because oo pm.discover is not a
+#                                             detector (it runs sudo apt-get update)
+#
+# Three of the four CANNOT be merged: init/oosh must be self-contained POSIX,
+# and ossh's runs on a machine that has nothing of ours on it. What can be done
+# is pin that they AGREE — which is what this test is, and what nothing did
+# before. The drift it was written to catch:
+#
+#   pacman   init/oosh, ossh, config: "pacman -S --noconfirm"    oo: "pacman -S"
+#   pkg      init/oosh, ossh, config: "pkg install -y"           oo: "pkg install"
+#
+# Both of oo's are INTERACTIVE. `oo cmd <tool>` runs them during an install, so
+# on Arch or FreeBSD the install would sit on a confirmation prompt — the same
+# failure mode as the sudo prompt oo pm.discover caused on 2026-09-17.
+test.oo.pmTablesAgree() {
+  local pm mismatches="" fromOo fromInit fromConfig
+  for pm in brew apt-get dnf yum apk pacman pkg; do
+    fromOo=$(grep -oE "private\.check\.pm $pm \"[^\"]+\"" "$OOSH_DIR/oo" 2>/dev/null \
+             | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fromInit=$(grep -E "^[[:space:]]+$pm\)" "$OOSH_DIR/init/oosh" 2>/dev/null \
+               | head -1 | sed 's/.*OOSH_PM="\([^"]*\)".*/\1/')
+    fromConfig=$(grep -E "^[[:space:]]+$pm\)" "$OOSH_DIR/config" 2>/dev/null \
+                 | head -1 | sed 's/.*echo "\([^"]*\)".*/\1/')
+    [ -n "$fromOo" ] && [ -n "$fromInit" ] && [ "$fromOo" != "$fromInit" ] \
+      && mismatches="$mismatches
+    $pm: oo=[$fromOo] init/oosh=[$fromInit]"
+    [ -n "$fromConfig" ] && [ -n "$fromInit" ] && [ "$fromConfig" != "$fromInit" ] \
+      && mismatches="$mismatches
+    $pm: config=[$fromConfig] init/oosh=[$fromInit]"
+  done
+  if [ -z "$(printf '%s' "$mismatches" | tr -d '[:space:]')" ]; then
+    create.result 0 "every copy of the package-manager map agrees"
+  else
+    create.result 1 "the package-manager maps disagree:$mismatches"
+  fi
+  return $(result)
+}
+test.case $level "T-PM-TABLES-AGREE: the four copies of the package-manager map say the same thing" \
+  test.oo.pmTablesAgree
+expect 0 "every copy of the package-manager map agrees" \
+  "oo's pacman and pkg entries lack their non-interactive flags, so an install on Arch or FreeBSD would sit on a prompt"
+
+# --- T-METHOD-NEW-DOTTED-SCRIPT ---------------------------------------------
+# A script whose own NAME contains a dot — `test.suite` is the one that matters
+# — cannot be extended by the tool this project mandates. `${name%%.*}` takes
+# everything before the FIRST dot, so `oo method.new test.suite.portability.validate`
+# resolves the script to `test`, which is a DIRECTORY, and the insertion has
+# nowhere to go.
+#
+# The boundary between script and method is not "the first dot". It is "the
+# longest leading prefix that names a file that exists", which is the only
+# definition that can tell `test.suite.x` from `config.x` without a list.
+test.oo.methodNewDottedScript() {
+  local probe="probeDotted.name" pwdBefore="$PWD"
+  printf '#!/usr/bin/env bash\n\n### new.method\n' > "$OOSH_DIR/$probe"
+  printf '#!/usr/bin/env bash\nTEST_CATEGORY=core\n\n### test.method\n' > "$OOSH_DIR/test/test.$probe"
+  printf '%s\n' '<thing>' 'does a thing' 'a probe test' 'x' 'probe_ok' \
+    | ( LOG_LEVEL=1 oo.method.new "$probe.deep.verb" ) >/dev/null 2>&1
+  cd "$pwdBefore"
+
+  local created stray testcase
+  created=$(grep -c "^$probe\.deep\.verb()" "$OOSH_DIR/$probe" 2>/dev/null)
+  # The old split aimed at `probeDotted`; nothing should ever create it.
+  stray=0; [ -e "$OOSH_DIR/probeDotted" ] && stray=1
+  testcase=$(grep -c "$probe\.deep\.verb" "$OOSH_DIR/test/test.$probe" 2>/dev/null)
+  rm -f "$OOSH_DIR/$probe" "$OOSH_DIR/$probe".bak "$OOSH_DIR/$probe".new \
+        "$OOSH_DIR/test/test.$probe" "$OOSH_DIR/test/test.$probe".bak \
+        "$OOSH_DIR/test/test.$probe".new "$OOSH_DIR/probeDotted" 2>/dev/null
+
+  if [ "$stray" != "0" ]; then
+    create.result 1 "the tool created \$OOSH_DIR/probeDotted — the script is the LONGEST existing prefix, not the first segment"
+  elif [ "$created" != "1" ]; then
+    create.result 1 "$probe.deep.verb() was not created in $probe (found $created)"
+  elif [ "$testcase" = "0" ]; then
+    create.result 1 "no test case was written for a dotted-script method"
+  else
+    create.result 0 "a script whose name contains a dot can be extended"
+  fi
+  return $(result)
+}
+test.case $level "T-METHOD-NEW-DOTTED-SCRIPT: oo method.new resolves a script name containing a dot" \
+  test.oo.methodNewDottedScript
+expect 0 "a script whose name contains a dot can be extended" \
+  "test.suite is such a script, and the mandated tool could not add a method to it"
+
+### test.method
 
 test.suite.save.results

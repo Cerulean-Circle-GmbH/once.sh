@@ -122,7 +122,7 @@ This is the right pattern — tests survive on a venv-less host (e.g. fresh cont
 
 ## Methodology audit
 
-Doctrine: `feedback_oosh_methodology` — *"prefer OOSH commands/templates over raw bash; create new methods via oo.new.method before writing inline bash; consult docs/"*. Applied to Python: prefer OOSH/bash primitives; reach for Python when it's the right tool; keep Python at arm's length (separate file or thin wrapper), not embedded as multi-line heredocs that hide from linters, tests, and code review.
+Doctrine: `feedback_oosh_methodology` — *"prefer OOSH commands/templates over raw bash; create new methods via oo.method.new before writing inline bash; consult docs/"*. Applied to Python: prefer OOSH/bash primitives; reach for Python when it's the right tool; keep Python at arm's length (separate file or thin wrapper), not embedded as multi-line heredocs that hide from linters, tests, and code review.
 
 Classification key:
 

@@ -476,7 +476,7 @@ private.push.init.oosh() {
 
   # Skip bootstrap if oosh is already installed (state machine at [99])
   # Use bash explicitly (Alpine default shell is ash which doesn't support source/declare)
-  if private.ossh.ssh "$sshConfigHost" "bash -c 'source ~/config/user.env 2>/dev/null && source ~/config/current.state.machine.env 2>/dev/null && [ \"\$state\" = \"99\" ]'" 2>/dev/null; then
+  if private.ossh.ssh "$sshConfigHost" "bash -c 'source ~/oosh/boot 2>/dev/null; source ~/config/current.state.machine.env 2>/dev/null && [ \"\$state\" = \"99\" ]'" 2>/dev/null; then
     important.log "oosh already installed on $sshConfigHost (state [99]) — skipping bootstrap"
     ossh.install.finish.local "$sshConfigHost" "$OSSH_INSTALL_TARGET_USER"
     return $?
@@ -651,7 +651,19 @@ private.ossh.identity.stage.outer.proxyJump() # <toHost> <jumpHost> # stage oute
   return 0
 }
 
-ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal> #
+ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal> # continues a local install after init/oosh has cloned and handed off
+# The two parameter names read backwards against what the callers pass, and
+# both callers pass the SAME shape — this runs ON the machine being installed:
+#   arg 1 is THIS host's own ssh alias  ($sshConfigHost from ossh:523, or the
+#          local `hostname -s` from init/oosh:590)
+#   arg 2 is the alias of whoever STARTED the install (the runner's
+#          $OOSH_SSH_CONFIG_HOST, or empty on a local install)
+# The order is deliberate and is a two-caller contract; do not swap it. The
+# names are kept because renaming them would move the two
+# ossh.parameter.completion.* functions for no behavioural gain.
+# NOTE (own card): `config ssh.host.set "$sshConfigNameUsedForLocal"` below
+# therefore sets THIS host's name from arg 2 — the runner's. It lands right
+# only because that is usually unset and falls back to $HOSTNAME.
 {
   success.log "remote inititialized over ssh....
   
@@ -704,13 +716,30 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
 
   config ssh.host.set "$sshConfigNameUsedForLocal"
 
-  check dir $HOME/ssh.original not exists \
-    call user ssh.backup original
-  
+  # ONE snapshot here, immediately before `user init` — which is what writes
+  # next (a keypair when ~/.ssh has none, and the three WODA Host aliases into
+  # ~/.ssh/config, always). Backup-before-overwrite is the pattern
+  # docs/research/state-machine-fixup-audit.md classifies as LEGIT in this
+  # function, and the label now says exactly what it is.
+  #
+  # Two things that used to be here are gone:
+  #   - the "ssh.original" snapshot. It ran AFTER `oo state` above, and state
+  #     31 writes ~/.ssh — so it was never original. That snapshot now lives
+  #     in state 31 itself, before its first write.
+  #   - the ssh.$USER.<local>.for.<remote> name. The install runs ON the
+  #     target, so `.for.<target>` named the host the directory was already
+  #     sitting on — redundant on BOTH paths, not just the local one where it
+  #     degenerated into X.for.X. Archives are timestamped now.
+  #
+  # No `check dir … not exists` guard either. It tested $HOME/ssh.<name> while
+  # user.ssh.backup wrote ./ssh.<name>, so it could never be satisfied and the
+  # backup fired on every install, nesting one level deeper each time. A
+  # timestamped archive needs no guard.
+  user ssh.backup pre-user-init >/dev/null \
+    || warn.log "ossh.install.continue.local: could not archive $HOME/.ssh before user init"
+
   user init
 
-  check dir $HOME/ssh.$USER.$sshConfigNameUsedForLocal.for.$remoteSshConfigName not exists \
-    call user ssh.backup $USER.$sshConfigNameUsedForLocal.for.$remoteSshConfigName
   
   # Move any public keys transferred during install
   local _pubkeys=( $HOME/*.public_key )
@@ -753,7 +782,9 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
   unset INSTALL_LOG
 
   #state set 12
-  #scp -r $HOME/ssh.original
+  # (a commented-out `scp -r $HOME/ssh.original` lived here; ssh.original no
+  #  longer exists — the pre-install snapshot is state 31's, under
+  #  $HOME/.ssh.backups/)
   create.result 0 "ossh.install.continue.local done successful" "$1"
   return $(result)
 
@@ -880,6 +911,9 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
   # user script by absolute path (because the target's ~/oosh symlink
   # doesn't exist yet), we export PATH and OOSH_DIR explicitly so the
   # normal bootstrap succeeds.
+  # oosh-dir-exception: string executed on a REMOTE host whose ~/oosh does not exist yet
+  # path-exception: a string executed on a REMOTE host, whose ~/oosh/boot may
+  # not exist yet — this is the bootstrap that makes it reachable.
   local remoteInvoke="export OOSH_DIR='$sharedOosh'; export PATH='$sharedOosh':\$PATH"
 
   # 1. Create user on remote if missing. Invoke via the shared script path
@@ -2524,7 +2558,12 @@ ossh.exec() # <toHost> <command> # executes the command on host <toHost>
   fi
 
 
-  private.ossh.ssh "$toHost" "[ -f config/user.env ] && source config/user.env; [ -d ~/oosh ] && export PATH=~/oosh:\$PATH; $@"
+  # Source boot if present; otherwise (testing/prod/main, or any host without the
+  # boot loader) fall back to putting ~/oosh on PATH so the command still resolves.
+  # path-exception: the sanctioned DEGRADE branch — boot first, and only if it
+  # is not there does the remote shell fall back to a bare prepend.
+  # docs/boot.md, Cross-branch note.
+  private.ossh.ssh "$toHost" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; $@"
 }
 
 
@@ -2542,7 +2581,9 @@ ossh.exec.tty() # <toHost> <command> # executes command on host with TTY allocat
     return 1
   fi
 
-  private.ossh.ssh -tt "$toHost" "[ -f config/user.env ] && source config/user.env; [ -d ~/oosh ] && export PATH=~/oosh:\$PATH; $@"
+  # Same boot-or-PATH-fallback as ossh.exec (works when boot is absent).
+  # path-exception: the sanctioned degrade branch, tty form. docs/boot.md.
+  private.ossh.ssh -tt "$toHost" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; $@"
 }
 ossh.exec.tty.completion() {
   ossh.config.get.completion "$@"
@@ -2616,28 +2657,6 @@ ossh.cmd.completion.pkg() {
   compgen -W "bash curl git wget tree expect python3 jq" -- "$1"
 }
 
-private.ossh.prereqs.verify() # {pkgList} # for each pkg, check 'command -v <pkg>'; for each missing, error.log a diagnostic dump (PM/uname/brew presence). Used by ossh.prereqs.install local mode to make silent post-install failures fail-loud.
-{
-  local missing=""
-  local p
-  for p in "$@"; do
-    command -v "$p" >/dev/null 2>&1 || missing="$missing $p"
-  done
-  if [ -n "$missing" ]; then
-    error.log "ossh.prereqs.install verify: missing on PATH after install:$missing"
-    error.log "  diagnostic: OOSH_PM='${OOSH_PM:-<unset>}' uname=$(uname -s 2>/dev/null) brew=$(command -v brew 2>/dev/null || echo none)"
-    error.log "  diagnostic: PATH=$PATH"
-    if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-      for _bp in /opt/homebrew/bin /usr/local/bin; do
-        for p in $missing; do
-          [ -x "$_bp/$p" ] && error.log "  diagnostic: $_bp/$p exists but not on PATH"
-        done
-      done
-    fi
-    return 1
-  fi
-  return 0
-}
 
 ossh.prereqs.install() # <?sshConfigHost> # install post-clone prereqs via oo cmd (local mode); with sshConfigHost arg ships init/oosh to remote and runs it
 {
@@ -2655,24 +2674,27 @@ ossh.prereqs.install() # <?sshConfigHost> # install post-clone prereqs via oo cm
   if [ -z "$host" ]; then
     # Local mode — install runtime prereqs via oo cmd.
     important.log "ossh.prereqs.install (local): installing post-clone prereqs via oo cmd"
-    # rsync — needed by private.ossh.rsync (ossh:74) for runner→remote
-    # config push. Pre-installed on Debian/RHEL/Alma; missing on Alpine
-    # busybox + macOS (rsync ships but openrsync on newer macOS works too).
-    # oo cmd is idempotent: no-op if rsync is on PATH.
-    oo cmd rsync || warn.log "oo cmd rsync did not complete cleanly (install may still work if PATH already has rsync)"
-    # tree — used in many runtime paths (user.ssh.status user:226, debug
-    # helpers, ossh.status, state-31 progress dumps). oo cmd tree is
-    # already invoked at oo:1342 + ossh:1752 defensively; this guarantees
-    # post-install presence so other call sites don't need their own guard.
-    oo cmd tree || warn.log "oo cmd tree did not complete cleanly (install may still work if PATH already has tree)"
-
-    # Fail-loud post-condition: if any prereq is missing on PATH after
-    # 'oo cmd' returned, surface the diagnostic so silent failures
-    # (verified on macOS ProxyJump install, 2026-05-11) don't ship.
-    # Don't return 1 yet — log and keep going so install completes;
-    # the operator sees the error at end-of-install instead of
-    # discovering it later when a runtime path reaches for `tree`.
-    private.ossh.prereqs.verify rsync tree
+    # rsync — needed by private.ossh.rsync for the runner→remote config push.
+    #         Pre-installed on Debian/RHEL/Alma; missing on Alpine busybox.
+    # tree  — used by user.ssh.status, ossh.status and the state-31 dumps.
+    #
+    # `oo` is SOURCED and oo.cmd called as a function, not `oo cmd` as a
+    # subprocess: oo.cmd verifies its own post-condition (the tool is on PATH
+    # afterwards) and puts the reason in $RESULT, and $RESULT only crosses
+    # into this shell when the method runs in it — see create.result's header
+    # in `this`, and ossh.status for the same pattern. As a subprocess the
+    # status crossed but the reason did not, which is why an earlier version
+    # re-verified here and reported someone else's $RESULT.
+    #
+    # Warn, don't fail (decided on the `oo cmd` card, 2026-09-15): the install
+    # may still complete. oo.cmd has already error-logged the reason ($RESULT);
+    # this line states the decision, once, naming the tool — not the reason
+    # again.
+    source $OOSH_DIR/oo
+    local prereq
+    for prereq in rsync tree; do
+      oo.cmd "$prereq" || warn.log "ossh.prereqs.install: continuing without $prereq"
+    done
     return 0
   fi
   # Remote mode (existing behaviour) ──────────────────────────────────────
@@ -3558,9 +3580,28 @@ private.check.certificates.update.verify.https() # <script> <stageTo> <stateFoun
 ossh.start()
 {
   #echo "sourcing init"
+  # Ensure OOSH_DIR is set and on PATH BEFORE the bare `source this/line/os`
+  # below. Those resolve via PATH; a context that invoked ossh without setting
+  # up the environment (e.g. a mid-install sub-shell) would otherwise fail with
+  # "this: No such file or directory". OOSH_DIR is the constant ~/oosh (see
+  # docs/boot.md) — NOT derived from $0, which is the HOST process whenever
+  # ossh is *sourced* (myId, config, user, test.ossh) and then yielded the
+  # caller's directory. `:=` only fires when unset, so an explicit override
+  # (the remote-invoke exception below) still wins.
+  : ${OOSH_DIR:="$HOME/oosh"}
+  # path-exception: ossh is SOURCED by myId, config, user and test.ossh, in
+  # contexts that never reach boot. Colon-anchored, so it is the same
+  # segment test boot does and re-sourcing never grows PATH.
+  case ":$PATH:" in *":$OOSH_DIR:"*) ;; *) export PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH" ;; esac
   if [ -z "$CONFIG" ]; then
+    # Path anchors before the direct env-chain source — log.env chains
+    # $OOSH_USER_CONFIG_PATH/log.session.env, so the var must be set or it
+    # expands to `/log.session.env`. Same defaults boot/this set.
+    : ${CONFIG_PATH:=$HOME/config}
+    : ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}
+    export CONFIG_PATH OOSH_USER_CONFIG_PATH
     CONFIG=$HOME/config/user.env
-    source $CONFIG
+    [ -f "$CONFIG" ] && source $CONFIG
   fi
   source this
   source line
