@@ -120,6 +120,47 @@ user.ssh.backup.migrate()     # <?home:$HOME> # moves the legacy ssh.* backup di
 
 
 user.ssh.backup.migrate.completion.home() { echo "$HOME"; }
+private.user.delete.command.get()     # <?sbinDir:/usr/sbin> # echo this system's user-delete command WITH its remove-home flag, or nothing if it has none #
+{
+  # NO create.result — a getter consumed as $(...), which runs in a subshell, so
+  # RESULT could never reach the caller. Same exemption as the other getters.
+  #
+  # ONE definition, called from both places that need it: private.user.init's
+  # OS_CMD heal and private.user.delete.linux. They used to probe separately and
+  # BOTH probed only `userdel`, which alpine does not have — it ships busybox
+  # `deluser`. So on alpine the cache stayed empty (two red assertions in every
+  # alpine run since the heal was written on 2026-04-24) and every delete ran
+  # `/usr/sbin/userdel -rf` and died with ENOENT 127.
+  #
+  # The flag is PART OF THE VALUE, as it is for darwin's
+  # `sysadminctl -deleteUser`, because the two spellings differ and a caller
+  # appending its own would have to know which command it got:
+  #
+  #   shadow    userdel -rf USER            (shadow-utils)
+  #   busybox   deluser --remove-home USER  (measured: BusyBox v1.36.1, alpine 3.19)
+  #
+  # <sbinDir> is a real parameter, not a test hook: these binaries live in
+  # /usr/sbin, which is NOT on a non-root PATH on Debian, so the directory to
+  # fall back to has to be nameable. It is also the only way to exercise the
+  # busybox branch on a shadow host — without it the absolute path wins and the
+  # test passes for the wrong reason, which is how this stayed hidden.
+  local sbinDir="${1:-/usr/sbin}"
+  local name candidate
+  for name in userdel deluser; do
+    candidate=$(command -v "$name" 2>/dev/null || echo "$sbinDir/$name")
+    if [ -x "$candidate" ]; then
+      case "$name" in
+        userdel) echo "$candidate -rf" ;;
+        deluser) echo "$candidate --remove-home" ;;
+      esac
+      return 0
+    fi
+  done
+  return 1
+}
+private.user.delete.command.get.completion.sbinDir() { echo "/usr/sbin"; }
+
+
 ### new.method
 
 # SSH ControlMaster socket path (must match ossh)
@@ -1263,10 +1304,19 @@ private.user.delete.linux() { # <username> # removes the user and all its files
   if [ "$OOSH_OS" = "darwin" ]; then
     $SUDO sysadminctl -deleteUser "$username"
   else
-    # userdel may be in /usr/sbin which is not in PATH on Debian
-    local _userdel
-    _userdel=$(command -v userdel 2>/dev/null || echo /usr/sbin/userdel)
-    $SUDO "$_userdel" -rf $username
+    # THE SHARED ACCESSOR, not a second probe. This function hardcoded
+    # `userdel -rf` and alpine has no userdel, so every call died ENOENT 127 —
+    # and OS_CMD_USER_DEL, which private.user.init caches for exactly this, was
+    # never read by anybody. It is read now.
+    local userDel="${OS_CMD_USER_DEL:-$(private.user.delete.command.get)}"
+    if [ -z "$userDel" ]; then
+      create.result 1 "no user-delete command on this system — tried userdel and deluser"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    # Unquoted on purpose: the value carries its flag, exactly as
+    # OS_CMD_USER_MOD does where it is consumed the same way (user:1355).
+    $SUDO $userDel "$username"
   fi
 }
 
@@ -1671,11 +1721,11 @@ private.user.init() {
         fi
       fi
       if [ -z "$OS_CMD_USER_DEL" ]; then
-        local _userdel
-        _userdel=$(command -v userdel 2>/dev/null || echo /usr/sbin/userdel)
-        if [ -x "$_userdel" ]; then
-          export OS_CMD_USER_DEL="$_userdel"
-        fi
+        # private.user.delete.command.get knows about busybox; this used to
+        # probe `userdel` alone, so on alpine the cache could never go complete
+        # and this whole heal re-ran on every invocation.
+        export OS_CMD_USER_DEL="$(private.user.delete.command.get)"
+        [ -z "$OS_CMD_USER_DEL" ] && unset OS_CMD_USER_DEL
       fi
       if [ -z "$OS_CMD_USER_MOD" ]; then
         local _usermod
