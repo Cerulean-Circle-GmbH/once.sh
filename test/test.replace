@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# Tests for the `replace` transaction: whole-line substitution and the commit guard.
+#
+# `replace` edits scripts in place by writing <file>.new and swapping it in.
+# It is what `oo method.new` uses to splice a method into a live script, so a
+# defect here destroys source files. Two did.
+
+TEST_CATEGORY=core
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+REPLACE_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/test.replace.XXXXXX")
+trap 'rm -rf "$REPLACE_FIXTURE" 2>/dev/null' EXIT
+
+# ============================================================================
+# T-REPLACE-LINE-EXACT — a whole-line match does not touch the same text
+#                        appearing as a SUBSTRING on another line
+# ============================================================================
+# `replace within` searches for a substring and `perl -pe` loops over every
+# line, so it rewrites the first match on EVERY line containing one. In `oo`
+# the marker text "### new.method" appears both as the real marker and inside
+# the tool's own string literal — running the tool against `oo` corrupted it.
+test.replace.lineExact() {
+  local f="$REPLACE_FIXTURE/exact.txt"
+  {
+    echo 'local marker="### new.method"   # the tool talking about the marker'
+    echo 'untouched middle line'
+    echo '### new.method'
+  } > "$f"
+
+  "$OOSH_DIR/replace" line "$f" "### new.method" by "INSERTED
+### new.method" >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 0 ] && { create.result 1 "replace line returned $rc"; return $(result); }
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1 || { create.result 1 "commit failed"; return $(result); }
+
+  local literal inserted
+  literal=$(grep -c 'local marker="### new.method"' "$f")
+  inserted=$(grep -c '^INSERTED$' "$f")
+  if [ "$literal" != "1" ]; then
+    create.result 1 "the substring occurrence was rewritten — the tool's own source line is gone"
+  elif [ "$inserted" != "1" ]; then
+    create.result 1 "the whole-line marker was not replaced (found $inserted insertions)"
+  else
+    create.result 0 "only the whole-line match is replaced"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-LINE-EXACT: a whole-line match leaves the same text elsewhere alone" \
+  test.replace.lineExact
+expect 0 "only the whole-line match is replaced" \
+  "replace within matches a substring on every line — that is how the tool corrupted oo's own source"
+
+# ============================================================================
+# T-REPLACE-LINE-REFUSES — ambiguity is an error, not a coin toss
+# ============================================================================
+test.replace.lineRefuses() {
+  local f="$REPLACE_FIXTURE/ambiguous.txt"
+  printf '%s\n' 'MARKER' 'middle' 'MARKER' > "$f"
+  local before; before=$(cat "$f")
+
+  "$OOSH_DIR/replace" line "$f" "MARKER" by "REPLACED" >/dev/null 2>&1
+  local rc=$?
+  local after; after=$(cat "$f")
+
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "two whole-line matches were accepted — one of them would be picked silently"
+  elif [ "$after" != "$before" ]; then
+    create.result 1 "the file was modified despite the refusal"
+  else
+    create.result 0 "an ambiguous marker is refused and nothing is written"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-LINE-REFUSES: two matching lines is an error, not a guess" \
+  test.replace.lineRefuses
+expect 0 "an ambiguous marker is refused and nothing is written" \
+  "a marker that is not unique means the caller's assumption about the file is already wrong"
+
+# ============================================================================
+# T-REPLACE-LINE-NO-PERL — the whole-line form must work where there is no perl
+# ============================================================================
+# Alpine ships no perl at all. `replace` has always used it, so `oo method.new`
+# simply could not run there — surfaced by the alpine platform gate on f386f87,
+# three tests red with "replace line returned 1". The whole-line form is the
+# one the method tool uses, so it is implemented in awk; the substring form
+# still needs perl and keeps its own card.
+test.replace.lineNoPerl() {
+  local shim="$REPLACE_FIXTURE/noperl" f="$REPLACE_FIXTURE/noperl.txt"
+  mkdir -p "$shim"
+  local b p
+  for b in bash sh awk grep sed cat rm mv cp chmod dirname basename printf ls; do
+    p=$(type -P "$b" 2>/dev/null) && ln -sf "$p" "$shim/$b"
+  done
+  printf '%s\n' 'keep' '### new.method' 'keep2' > "$f"
+
+  # A replacement carrying a backslash and a newline: awk -v would eat the
+  # backslash as an escape, which is why the implementation reads ENVIRON.
+  #
+  # $OOSH_DIR belongs on this PATH — `replace.start` does `source this`, which
+  # is resolved through PATH. Without it the whole point is lost: the script
+  # dies at 127 before it ever reaches awk. On a dev host the omission was
+  # invisible, because bash's `source` falls back to the working directory and
+  # the suite runs from $OOSH_DIR; on alpine, where the shell starts in $HOME,
+  # it failed — which is the second thing that platform run caught.
+  env -i PATH="$shim:$OOSH_DIR" HOME="$HOME" OOSH_DIR="$OOSH_DIR" LOG_LEVEL=1 \
+      CONFIG_PATH="$CONFIG_PATH" CONFIG="$CONFIG" CONFIG_FILE="$CONFIG_FILE" \
+      "$OOSH_DIR/replace" line "$f" "### new.method" by 'a\b
+### new.method' >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "replace line returned $rc without perl on PATH"
+    return $(result)
+  fi
+  local got; got=$(cat "$f.new" 2>/dev/null)
+  rm -f "$f.new"
+  if [ "${got#*'a\b'}" = "$got" ]; then
+    create.result 1 "the backslash in the replacement was eaten: [$got]"
+  elif [ "$(printf '%s\n' "$got" | grep -c '^### new.method$')" != "1" ]; then
+    create.result 1 "the marker was not re-emitted exactly once: [$got]"
+  else
+    create.result 0 "the whole-line form needs no perl"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-LINE-NO-PERL: whole-line insertion works on a host with no perl" \
+  test.replace.lineNoPerl
+expect 0 "the whole-line form needs no perl" \
+  "alpine ships no perl, so oo method.new could not run there at all"
+
+# ============================================================================
+# T-REPLACE-COMMIT-GUARD — committing with no working copy must not eat the file
+# ============================================================================
+# `replace commit` ran `mv "$FILE" "$FILE.bak"` unconditionally. With no
+# <file>.new the second mv failed and the script was left with NO file under
+# its own name. private.oo.new.method called commit whether or not any
+# substitution had matched, so it was one failed insertion away from deleting
+# the script it was editing.
+test.replace.commitGuard() {
+  local f="$REPLACE_FIXTURE/nowork.txt"
+  printf '%s\n' 'the original content' > "$f"
+  rm -f "$f.new" "$f.bak"
+
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1
+  local rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "commit reported success with no working copy to commit"
+  elif [ ! -f "$f" ]; then
+    create.result 1 "the file was DESTROYED — moved to .bak with nothing to put in its place"
+  elif [ "$(cat "$f")" != "the original content" ]; then
+    create.result 1 "the file survived but its content changed"
+  else
+    create.result 0 "commit refuses and the file is untouched"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-GUARD: committing with no working copy leaves the file intact" \
+  test.replace.commitGuard
+expect 0 "commit refuses and the file is untouched" \
+  "the unguarded version moved the original to .bak and left nothing behind — silent source loss"
+
+
+# ============================================================================
+# T-REPLACE-BLOCK — a whole function block, and exactly one of them
+# ============================================================================
+# A method is a BLOCK, not a line. `oo method.delete` removes one with this,
+# because deleting a function by hand is how its docstring, its completion
+# functions and its test case get orphaned.
+test.replace.blockDeletes() {
+  local f="$REPLACE_FIXTURE/block.sh"
+  {
+    echo 'before() {'
+    echo '  echo before'
+    echo '}'
+    echo ''
+    echo 'victim() {'
+    echo '  local brace="}"      # NOT the end of the block — whole-line match'
+    echo '  echo victim'
+    echo '}'
+    echo ''
+    echo 'after() {'
+    echo '  echo after'
+    echo '}'
+  } > "$f"
+
+  "$OOSH_DIR/replace" block "$f" "victim() {" "}" by "" >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 0 ] && { create.result 1 "replace block returned $rc"; return $(result); }
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1 || { create.result 1 "commit failed"; return $(result); }
+
+  if grep -q 'echo victim' "$f"; then
+    create.result 1 "the block survived — the inner \"}\" line ended it early"
+  elif ! grep -q '^before() {' "$f" || ! grep -q '^after() {' "$f"; then
+    create.result 1 "a neighbouring function was taken too: $(cat "$f")"
+  else
+    create.result 0 "block removed"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-BLOCK: a whole function is removed and its neighbours are left alone" \
+  test.replace.blockDeletes
+expect 0 "block removed" "the end pattern is a whole line, so a brace inside a string does not close the block"
+
+# The same contract replace line carries: refuse rather than guess.
+test.replace.blockRefusesAmbiguous() {
+  local f="$REPLACE_FIXTURE/block.ambiguous.sh"
+  printf '%s\n' 'victim() {' '  a' '}' '' 'victim() {' '  b' '}' > "$f"
+  "$OOSH_DIR/replace" block "$f" "victim() {" "}" by "" >/dev/null 2>&1
+  local rc=$?
+  "$OOSH_DIR/replace" cleanup "$f" >/dev/null 2>&1
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it picked one of two identical start lines instead of refusing"
+  else
+    create.result 0 "refused"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-BLOCK-AMBIGUOUS: two identical start lines are refused, not guessed" \
+  test.replace.blockRefusesAmbiguous
+expect 0 "refused" "exactly one match, or nothing — the same contract as replace line"
+
+### test.method
+
+test.suite.save.results

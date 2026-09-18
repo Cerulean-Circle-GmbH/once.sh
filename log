@@ -7,21 +7,52 @@
 # export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
 # set -x
 
-# Ensure LOG_DEVICE has a default — prevents "ambiguous redirect" errors
-if [ -z "$LOG_DEVICE" ] || [ ! -w "$LOG_DEVICE" ]; then
-  if [ -t 1 ] && [ -w "$(tty 2>/dev/null)" ]; then
-    export LOG_DEVICE="$(tty)"
-  elif [ -w /proc/self/fd/1 ]; then
+# Ensure LOG_DEVICE points at the LIVE terminal — prevents "ambiguous redirect"
+# errors AND the stale-device trap: LOG_DEVICE is now loaded from the chained
+# log.session.env (boot sources it before this runs), where it holds the PREVIOUS
+# session's tty (e.g. /dev/pts/1). A pts owned by the same user is still writable,
+# so a plain `-w` guard would keep it and this shell's console.log/important.log
+# would land on the WRONG terminal. So: when stdout is a live tty, ALWAYS
+# re-derive it (the live terminal wins); only fall back to the fd/null cascade for
+# non-tty contexts (ssh exec, cron, CI) with no usable device set.
+_oosh_livetty="$(tty 2>/dev/null)"
+if [ -n "$_oosh_livetty" ] && [ "$_oosh_livetty" != "not a tty" ] && [ -w "$_oosh_livetty" ]; then
+  # A controlling terminal is attached. The LIVE terminal wins over a STALE
+  # terminal device loaded from the chained log.session.env (a PREVIOUS session's
+  # /dev/pts/N, still writable because same-user — it would send this shell's
+  # output to the old terminal). But do NOT override an EXPLICIT non-terminal
+  # device: a capture file (tests set `LOG_DEVICE=/tmp/…`), `log device <file>`,
+  # or /dev/null must be respected. So refresh only when LOG_DEVICE is empty or
+  # is itself a terminal path; leave any other value alone.
+  case "$LOG_DEVICE" in
+    "" | "$_oosh_livetty") export LOG_DEVICE="$_oosh_livetty" ;;
+    /dev/pts/* | /dev/tty*)  export LOG_DEVICE="$_oosh_livetty" ;;  # stale terminal → refresh
+    *) : ;;                                                          # explicit non-terminal → respect
+  esac
+elif [ -z "$LOG_DEVICE" ] || [ ! -w "$LOG_DEVICE" ]; then
+  # No terminal (ssh exec, cron, CI) and no usable device set — fall back.
+  if [ -w /proc/self/fd/1 ]; then
     export LOG_DEVICE=/proc/self/fd/1
   else
     export LOG_DEVICE=/dev/null
   fi
 fi
+unset _oosh_livetty
 
-# Always resolve LOG_LIVE relative to current user (shared config may have another user's path)
-export LOG_LIVE=~/config/log.live.out
+# LOG_LIVE is genuinely per-USER: it lives in the user's OWN $OOSH_USER_CONFIG_PATH
+# (NOT the shared ~/config — every user symlinks that to one sharedConfig, where
+# all users would clobber a single log.live.out). Private file → no dev-group
+# write. Re-anchored unconditionally to the current user each shell. The `:-`
+# fallback covers contexts that sourced log before this/boot set the var.
+mkdir -p "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}" 2>/dev/null
+export LOG_LIVE="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/log.live.out"
 touch "$LOG_LIVE" 2>/dev/null
-type private.ensure.groupWrite >/dev/null 2>&1 && private.ensure.groupWrite "$LOG_LIVE"
+
+# LOG_NAME — OOSH's OWN log identity, in the LOG_ underscore family. This is NOT
+# the system `LOGNAME` (no underscore), which OOSH neither owns nor persists.
+# Defaults to user@host; overridable via `log name <value>`. Keep an existing
+# value (a custom name set this session survives re-sourcing).
+export LOG_NAME="${LOG_NAME:-${USER:-$(id -un 2>/dev/null)}@${OOSH_SSH_CONFIG_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo localhost)}}"
 
 log.device()
 {
@@ -65,6 +96,13 @@ log.init() {
     level=3
   fi
   if [ -z "$CONFIG" ]; then
+    # Ensure the path anchors exist before sourcing the env chain directly (this
+    # path bypasses boot/this). user.env chains oosh.env/log.env, and log.env
+    # chains $OOSH_USER_CONFIG_PATH/log.session.env — without these defaults that
+    # expands to `/log.session.env`. Same anchors boot/this set.
+    : ${CONFIG_PATH:=$HOME/config}
+    : ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}
+    export CONFIG_PATH OOSH_USER_CONFIG_PATH
     CONFIG=~/config/user.env
     source $CONFIG
     source $OOSH_DIR/config
@@ -87,11 +125,11 @@ log.init() {
     export LOG_LEVEL=3
   fi
 
-  # Initialize LOG_LIVE with default path if not already set
+  # Initialize LOG_LIVE with per-user default path if not already set
   if [ -z "$LOG_LIVE" ]; then
-    export LOG_LIVE=~/config/log.live.out
+    mkdir -p "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}" 2>/dev/null
+    export LOG_LIVE="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/log.live.out"
     touch "$LOG_LIVE" 2>/dev/null
-    private.ensure.groupWrite "$LOG_LIVE"
   fi
 
   important.log "log initialized on level $LOG_LEVEL"
@@ -257,6 +295,11 @@ error.log() {
 }
 err.log() {
   if [ -z "$CONFIG" ]; then
+    # anchors before the direct env-chain source (see log.init) — log.env chains
+    # $OOSH_USER_CONFIG_PATH/log.session.env.
+    : ${CONFIG_PATH:=$HOME/config}
+    : ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}
+    export CONFIG_PATH OOSH_USER_CONFIG_PATH
     CONFIG=~/config/user.env
     source $CONFIG
   fi
@@ -383,9 +426,9 @@ log.level() { # <levelno> # switch to a specific log level
 
 log.live() { # <device:/root/log.out.txt> # tail the live log file
     if [ -z "$LOG_LIVE" ]; then
-      export LOG_LIVE=~/config/log.live.out
+      mkdir -p "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}" 2>/dev/null
+      export LOG_LIVE="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/log.live.out"
       touch "$LOG_LIVE" 2>/dev/null
-      private.ensure.groupWrite "$LOG_LIVE"
     fi
     tail -f "$LOG_LIVE"
 }
@@ -431,6 +474,38 @@ log.live.file() { # <?device> # set or show the log live file
   else
     echo "$LOG_LIVE"
   fi
+}
+
+log.name() { # <?name> # set or show the OOSH log name (default user@host). NOT the system LOGNAME.
+  if [ -n "$1" ]; then
+    export LOG_NAME="$1"
+    important.log "new LOG_NAME=$LOG_NAME"
+    log.session.save >/dev/null
+  else
+    echo "$LOG_NAME"
+  fi
+}
+
+log.name.completion() { :; }
+
+log.session.save() { # # persist per-user/session log vars (LOG_NAME, LOG_DEVICE, LOG_LIVE) to $OOSH_USER_CONFIG_PATH/log.session.env
+  # Per-user / per-session: these must NOT go into the shared log.env (every
+  # user symlinks ~/config to one sharedConfig — they would leak). Written to
+  # the user's OWN $OOSH_USER_CONFIG_PATH, the same private dir oo uses for
+  # mode-env.bash (oo:706). Deliberately no system LOGNAME (see log.name).
+  local d="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}"
+  mkdir -p "$d" 2>/dev/null
+  {
+    echo "export LOG_NAME=\"$LOG_NAME\""
+    echo "export LOG_DEVICE=\"$LOG_DEVICE\""
+    echo "export LOG_LIVE=\"$LOG_LIVE\""
+  } > "$d/log.session.env" 2>/dev/null
+  create.result 0 "$d/log.session.env"
+  return $(result)
+}
+
+log.session() { # # show the per-user/session log config (LOG_NAME, LOG_DEVICE, LOG_LIVE)
+  cat "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/log.session.env" 2>/dev/null
 }
 
 log.live.result.txt() { # <device:/root/log.out.txt> # shows live intermediate results
@@ -572,6 +647,8 @@ log.install.live() { # # tail the install log in real-time (during install)
   fi
 }
 
+### new.method
+
 log.usage() {
   local this=${0##*/}
   echo "You started: $this
@@ -617,7 +694,14 @@ log.usage() {
     clear the live log with
       $this clear.liveLog
 
+    per-user/session log identity (stored in ~/.config/oosh/log.session.env)
+      $this name            # show LOG_NAME (defaults to user@host)
+      $this name <value>    # set LOG_NAME and re-persist
+      $this session         # show the per-user/session log config
+      $this session.save    # (re)write the per-user/session log config
+
     live log file currently is: $LOG_LIVE
+    log name currently is: $LOG_NAME
   "
 }
 

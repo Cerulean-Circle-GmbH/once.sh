@@ -338,4 +338,413 @@ else
 fi
 unset OO_SCRIPT
 
+# ============================================================================
+# T-INIT-HOME-RECOVERY: init/oosh recovers $HOME under env -i
+# ============================================================================
+# README documents `unbuffer env -i sh -xc "$(wget -O- .../init/oosh)"`. env -i
+# drops HOME, so init/oosh computed OOSH_DIR=/oosh and
+# INSTALL_LOG=/config/install.log — it would install into the filesystem root.
+# Structural check: the recovery block exists and precedes the first $HOME use.
+test.install.homeRecovery() {
+  local ok=1 recoverLn firstUseLn
+  grep -q 'getent passwd' "$INIT_SCRIPT" || ok=0
+  grep -q 'NFSHomeDirectory' "$INIT_SCRIPT" || ok=0
+  grep -q '/etc/passwd' "$INIT_SCRIPT" || ok=0
+  recoverLn=$(grep -n 'getent passwd' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  firstUseLn=$(grep -n ': ${OOSH_DIR:=$HOME/oosh}' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  [ -n "$recoverLn" ] && [ -n "$firstUseLn" ] && [ "$recoverLn" -lt "$firstUseLn" ] || ok=0
+  if [ "$ok" = "1" ]; then
+    create.result 0 "HOME recovery precedes the first \$HOME use"
+  else
+    create.result 1 "recover=$recoverLn firstUse=$firstUseLn"
+  fi
+}
+test.case $level "T-INIT-HOME-RECOVERY: init/oosh recovers \$HOME before using it" \
+  test.install.homeRecovery
+expect 0 "HOME recovery precedes the first \$HOME use" \
+  "env -i drops HOME; without recovery the installer targets /oosh"
+
+# ============================================================================
+# T-INIT-CLEAN-ENV: init/oosh re-establishes a clean environment
+# ============================================================================
+# From 2024-04-07 (8c277f4, Chris Daßler) to 2026-03-09 (075b4a3) init/oosh
+# carried `#!/usr/bin/env -iS HOME=${HOME} sh` — clean environment, HOME passed
+# through. 075b4a3 removed it because BusyBox env has no -S. A self-re-exec
+# gets the same guarantee portably: busybox env rejects -S but accepts
+# `env -i VAR=val cmd`.
+test.install.cleanEnvReexec() {
+  local ok=1
+  grep -q 'OOSH_CLEAN_ENV' "$INIT_SCRIPT" || ok=0
+  # BEGIN/END cleanEnv markers delimit the block the probe below extracts.
+  grep -q '^# BEGIN cleanEnv$' "$INIT_SCRIPT" && grep -q '^# END cleanEnv$' "$INIT_SCRIPT" || ok=0
+  grep -qE '^ *exec env -i( \\)?$' "$INIT_SCRIPT" || ok=0
+  # The re-exec must name an INTERPRETER, never hand a bare "$0" to the
+  # kernel — see T-INIT-CLEAN-ENV-EXEC for the three call sites that breaks.
+  grep -qE '"\$_oosh_sh" \$_oosh_x "\$0"' "$INIT_SCRIPT" || ok=0
+  # Guarded on $0 being a readable regular file — the curl-pipe case has no
+  # file to re-exec. Anchored to the OOSH_CLEAN_ENV condition itself: a bare
+  # `[ -f "$0" ]` also occurs in the bash re-exec block (`if [ -f "$0" ]`
+  # inside the bash-4+ upgrade), so an unanchored grep still matched — and
+  # therefore still PASSED — with this guard deleted. `-r` is what an
+  # interpreter actually needs; the execute bit is deliberately not required.
+  grep -qE '^if \[ -z "\$OOSH_CLEAN_ENV" \] && \[ -f "\$0" \] && \[ -r "\$0" \]' "$INIT_SCRIPT" || ok=0
+  # and must NOT reintroduce the flag BusyBox cannot parse
+  grep -q 'env -S' "$INIT_SCRIPT" && ok=0
+  if [ "$ok" = "1" ]; then
+    create.result 0 "clean re-exec present, guarded, no -S"
+  else
+    create.result 1 "clean-env re-exec missing, unguarded, or uses env -S"
+  fi
+}
+test.case $level "T-INIT-CLEAN-ENV: init/oosh re-execs clean without env -S" \
+  test.install.cleanEnvReexec
+expect 0 "clean re-exec present, guarded, no -S" \
+  "restores the 2024-2026 clean-environment guarantee; -S is what BusyBox lacks"
+
+# ============================================================================
+# T-INIT-CLEAN-ENV-CARRY: the clean re-exec carries the invoker's identity
+# ============================================================================
+# BEHAVIOURAL, not structural. The re-exec added for T3 wipes the environment,
+# so every variable init/oosh READS BUT NEVER SETS is destroyed unless it is
+# named in the carried list. An audit of the 2026-09-14 file found that ALL of
+# its env-reading code postdates 075b4a3 (2026-03-09, the commit that dropped
+# `#!/usr/bin/env -iS HOME=${HOME} sh`) — at the pre-change baseline a6f0ce3,
+# 531 of 537 lines do, and the 6 that don't are two bare `fi`s and four blank
+# lines. So none of it has ever run under
+# `env -i`, and "this only restores old behaviour" does not hold.
+#
+# Two vars are read-only inherits with no internal assignment at all:
+#   SUDO_USER  — set by sudo itself, assigned nowhere in init/oosh. Losing it
+#                silently skips "Installing oosh for invoking user" and flips
+#                the login-shell exec's `[ -z "$SUDO_USER" ]` branch.
+#                Introduced 7ac375a (2026-04-24), i.e. six weeks AFTER the
+#                guarantee was removed.
+#   OOSH_REPO  — three `${OOSH_REPO:-<github url>}` readers, assigned
+#                nowhere. Its only purpose is external override; wiping it
+#                makes the override dead and silently falls back to public
+#                GitHub. Same failure class as 57f0984 (OOSH_BRANCH).
+#
+# The probe extracts the block and runs it standalone — it NEVER runs the
+# installer. It asserts three things at once: the re-exec actually fired
+# (CLEAN=[1]), the environment really was wiped (POLLUTE gone), and the
+# variable under test crossed intact.
+test.install.cleanEnvProbe() # <interpreter> <flags|-> <var=value…> # runs the extracted block, echoes the child's view
+{
+  local interp="$1"; shift
+  local flags="$1"; shift
+  local probe err out rc
+  [ "$flags" = "-" ] && flags=""
+  probe="$(mktemp "${TMPDIR:-/tmp}/test.install.cleanenv.XXXXXX")" || return 1
+  err="$(mktemp "${TMPDIR:-/tmp}/test.install.cleanenv.err.XXXXXX")" || return 1
+  {
+    echo '#!/usr/bin/env sh'
+    echo 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"'
+    echo ': ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}'
+    sed -n '/^# BEGIN cleanEnv$/,/^# END cleanEnv$/p' "$INIT_SCRIPT"
+    echo 'hasHomebrew=no; case ":$PATH:" in *:/opt/homebrew/bin:*) hasHomebrew=yes ;; esac'
+    echo 'xtraceOn=off; case "$-" in *x*) xtraceOn=on ;; esac'
+    echo 'isBash=no; if [ -n "$BASH_VERSION" ]; then isBash=yes; fi'
+    echo 'echo "CLEAN=[${OOSH_CLEAN_ENV-<gone>}] POLLUTE=[${POLLUTE-<gone>}] SUDO_USER=[${SUDO_USER-<gone>}] OOSH_REPO=[${OOSH_REPO-<gone>}] USER=[${USER-<gone>}] LOGNAME=[${LOGNAME-<gone>}] GIT_SSH_COMMAND=[${GIT_SSH_COMMAND-<gone>}] LOG_LEVEL=[${LOG_LEVEL-<gone>}] TERM=[${TERM-<gone>}] HOMEBREW_ON_PATH=[$hasHomebrew] XTRACE=[$xtraceOn] BASH=[$isBash]"'
+  } > "$probe"
+  # DELIBERATELY NOT chmod +x. mktemp leaves mode 600 — readable, NOT
+  # executable — which is exactly the shape ossh.prereqs.install produces:
+  # it `scp -q`s init/oosh with no `-p` and then runs `bash /tmp/oosh-init.$$`,
+  # whose comment promises the "POSIX-prelude path even if /tmp/oosh-init.$$
+  # isn't executable". An earlier revision of this probe chmod'd +x and so
+  # granted the one permission the real call site does not — which is why it
+  # passed against a re-exec that handed bare "$0" to the kernel.
+  out="$(env -u OOSH_CLEAN_ENV POLLUTE=yes "$@" $interp $flags "$probe" 2>"$err")"
+  rc=$?
+  # Surface the child's stderr only when it produced no parseable line, so a
+  # hard failure (e.g. "env: './x': Permission denied", exit 126) is legible
+  # instead of showing up as an empty string.
+  if [ -z "$out" ]; then
+    out="rc=$rc stderr=[$(tr '\n' ' ' < "$err" | cut -c1-200)]"
+  fi
+  rm -f "$probe" "$err"
+  echo "$out"
+}
+
+test.install.cleanEnvCarriesSudoUser() {
+  local out
+  out="$(test.install.cleanEnvProbe sh - SUDO_USER=testinvoker)"
+  case "$out" in
+    *'CLEAN=[1]'*) : ;;
+    *) create.result 1 "re-exec never fired: $out"; return 1 ;;
+  esac
+  case "$out" in
+    *'POLLUTE=[<gone>]'*) : ;;
+    *) create.result 1 "environment was NOT wiped: $out"; return 1 ;;
+  esac
+  case "$out" in
+    *'SUDO_USER=[testinvoker]'*)
+      create.result 0 "SUDO_USER survives the clean re-exec" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-CARRY: SUDO_USER crosses the clean re-exec" \
+  test.install.cleanEnvCarriesSudoUser
+expect 0 "SUDO_USER survives the clean re-exec" \
+  "sudo ./init/oosh: losing SUDO_USER silently skips user.oosh.install for the invoker"
+
+test.install.cleanEnvCarriesUser() {
+  local out
+  out="$(test.install.cleanEnvProbe sh - USER=testinvoker LOGNAME=testinvoker)"
+  case "$out" in
+    *'USER=[testinvoker]'*'LOGNAME=[testinvoker]'*)
+      create.result 0 "USER and LOGNAME survive the clean re-exec" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-CARRY: USER and LOGNAME cross the clean re-exec" \
+  test.install.cleanEnvCarriesUser
+expect 0 "USER and LOGNAME survive the clean re-exec" \
+  "bash does not set USER; state 13 routes root vs user on it — losing it sends a root install down the user lane"
+
+test.install.cleanEnvAbsentStaysAbsent() {
+  # `env -i VAR= cmd` SETS VAR to the empty string. git runs a set-but-empty
+  # GIT_SSH_COMMAND as the command '' ("error: cannot run : No such file or
+  # directory"), so state 31's ssh clone silently fell back to the local copy
+  # on every install through the re-exec. A variable the caller does not have
+  # must reach the child UNSET — and one it does have must arrive verbatim.
+  local absent present
+  absent="$(unset GIT_SSH_COMMAND; test.install.cleanEnvProbe sh -)"
+  case "$absent" in
+    *'CLEAN=[1]'*'GIT_SSH_COMMAND=[<gone>]'*) : ;;
+    *) create.result 1 "unset GIT_SSH_COMMAND reached the child SET: $absent"; return 1 ;;
+  esac
+  present="$(test.install.cleanEnvProbe sh - GIT_SSH_COMMAND='ssh -i /k')"
+  case "$present" in
+    *'GIT_SSH_COMMAND=[ssh -i /k]'*)
+      create.result 0 "absent stays absent, set is carried verbatim" ;;
+    *)
+      create.result 1 "set GIT_SSH_COMMAND did not cross intact: $present" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-ABSENT: a variable the caller lacks reaches the child UNSET, not empty" \
+  test.install.cleanEnvAbsentStaysAbsent
+expect 0 "absent stays absent, set is carried verbatim" \
+  "env -i VAR= sets VAR to ''; git then runs '' as the ssh command and state 31's clone fails"
+
+test.install.cleanEnvCarriesRepo() {
+  local out
+  out="$(test.install.cleanEnvProbe sh - OOSH_REPO=https://example.invalid/fork.git)"
+  case "$out" in
+    *'OOSH_REPO=[https://example.invalid/fork.git]'*)
+      create.result 0 "OOSH_REPO survives the clean re-exec" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-CARRY: OOSH_REPO crosses the clean re-exec" \
+  test.install.cleanEnvCarriesRepo
+expect 0 "OOSH_REPO survives the clean re-exec" \
+  "OOSH_REPO is assigned nowhere in init/oosh — wiping it makes the override dead code"
+
+# ============================================================================
+# T-INIT-CLEAN-ENV-EXEC: the re-exec names an interpreter, so $0 needs no +x
+# ============================================================================
+# `exec env -i … "$0" "$@"` hands $0 to the KERNEL, which requires the execute
+# bit and re-reads the shebang. Every other exec in init/oosh names an
+# interpreter deliberately — `exec "$_newbash" "$0" "$@"`,
+# `exec sudo -H -E sh "$0" "$@"`, `exec sh "$OOSH_DIR/init/oosh" "$@"`.
+# Three real breakages when this one does not:
+#
+#  (a) ossh.prereqs.install `scp -q`s init/oosh with NO `-p`, then runs
+#      `bash /tmp/oosh-init.$$`. Its own comment promises the "POSIX-prelude
+#      path even if /tmp/oosh-init.$$ isn't executable". A kernel exec of a
+#      mode-644 $0 dies at exit 126 with a bare `env:` message and no
+#      `oosh install:` prefix.
+#  (b) README's "More detailed logging for debugging" documents
+#      `unbuffer env -i sh -x init/oosh | tee install.log.txt`. $0 IS a file
+#      there, so the re-exec fires and the shebang re-read drops `-x` —
+#      the debug command produces a log with no trace in it.
+#  (c) .github/workflows/macos-test.yml runs
+#      `sudo -H /opt/homebrew/bin/bash /var/root/oosh/init/oosh` precisely to
+#      get bash 5; a shebang re-read silently downgrades it to /usr/bin/env sh.
+#
+# The probe runs at mktemp's mode 600 — readable, NOT executable — which is
+# the ossh.prereqs.install shape exactly.
+test.install.cleanEnvNoExecBit() {
+  local out
+  out="$(test.install.cleanEnvProbe sh -)"
+  case "$out" in
+    *'CLEAN=[1]'*'POLLUTE=[<gone>]'*)
+      create.result 0 "re-exec survives a non-executable \$0" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-EXEC: re-exec works when \$0 is mode 644 (no execute bit)" \
+  test.install.cleanEnvNoExecBit
+expect 0 "re-exec survives a non-executable \$0" \
+  "ossh.prereqs.install scp's without -p and runs 'bash \$remoteTmp' — \$0 has no +x there"
+
+test.install.cleanEnvKeepsBash() {
+  local out
+  out="$(test.install.cleanEnvProbe bash -)"
+  case "$out" in
+    *'BASH=[yes]'*)
+      create.result 0 "a deliberate bash invocation is not downgraded" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-EXEC: re-exec does not downgrade a deliberate bash to sh" \
+  test.install.cleanEnvKeepsBash
+expect 0 "a deliberate bash invocation is not downgraded" \
+  "macos-test.yml invokes /opt/homebrew/bin/bash on purpose to get bash 5"
+
+test.install.cleanEnvKeepsXtrace() {
+  local out
+  out="$(test.install.cleanEnvProbe sh -x)"
+  case "$out" in
+    *'XTRACE=[on]'*)
+      create.result 0 "xtrace survives the re-exec" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-EXEC: re-exec forwards xtrace (-x)" \
+  test.install.cleanEnvKeepsXtrace
+expect 0 "xtrace survives the re-exec" \
+  "README documents 'env -i sh -x init/oosh | tee install.log.txt' for debugging"
+
+# ============================================================================
+# T-INIT-CLEAN-ENV-PATH: the re-exec seeds a deterministic PATH
+# ============================================================================
+# `env -i` leaves PATH unset, so the child shell falls back to its compiled-in
+# default — measured here as /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+# /sbin:/bin (and something smaller under busybox). That default contains
+# /usr/local/bin but NOT /opt/homebrew/bin.
+#
+# On an Apple-Silicon Mac that ALREADY has Homebrew, that is fatal, and it does
+# not self-heal: `oosh_pm_detect` finds no PM, the Darwin branch runs the full
+# Homebrew installer over curl, and as root that aborts with "Don't run this as
+# root!" → `die "Homebrew bootstrap failed"`. The `eval "$(… brew shellenv)"`
+# that would have rescued PATH sits INSIDE that failure branch, AFTER the
+# installer has already run, so it is never reached. Intel Macs escape only
+# because their brew lives in /usr/local/bin, which the default PATH has.
+#
+# Seeding a fixed, known-good PATH is NOT the same as carrying the caller's:
+# the value is constant regardless of who invoked us, which is the determinism
+# the clean-environment guarantee is actually for.
+test.install.cleanEnvSeedsPath() {
+  local out
+  out="$(test.install.cleanEnvProbe sh -)"
+  case "$out" in
+    *'HOMEBREW_ON_PATH=[yes]'*)
+      create.result 0 "/opt/homebrew/bin is on the child's PATH" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-PATH: re-exec seeds a PATH containing /opt/homebrew/bin" \
+  test.install.cleanEnvSeedsPath
+expect 0 "/opt/homebrew/bin is on the child's PATH" \
+  "arm64 macOS root install hard-fails without it — brew is invisible and the bootstrap dies"
+
+# ============================================================================
+# T-HOME-RECOVERY-NSS: getent may return one line PER NSS SOURCE
+# ============================================================================
+# `getent passwd <name>` prints one line per source that knows the user. On a
+# host where the user is in BOTH files and LDAP/SSSD it prints two. Without a
+# `head -1`, `cut -d: -f6` yields two lines, the result is non-empty so both
+# fallbacks are skipped, and `[ -d ]` on the two-line string is false — the
+# recovery REFUSES while holding a perfectly good home on line 1.
+# Asserted by EFFECT, not by grepping for `head -1`: both recovery blocks
+# (init/oosh and boot, between their BEGIN/END homeRecovery markers) run with
+# a stub getent that answers two lines, and must come out with line 1's home.
+test.install.homeRecoveryNssMultiline() {
+  local stub goodHome bad="" file out
+  stub=$(mktemp -d "${TMPDIR:-/tmp}/test.install.nss.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  goodHome="$stub/home"; mkdir -p "$goodHome"
+  printf '%s\n' '#!/bin/sh' "echo \"u:x:1:1::$goodHome:/bin/sh\"" 'echo "u:x:1:1::/nonexistent/second-source:/bin/sh"' > "$stub/getent"
+  chmod +x "$stub/getent"
+  for file in "$INIT_SCRIPT" "$OOSH_DIR/boot"; do
+    sed -n '/^# BEGIN homeRecovery$/,/^# END homeRecovery$/p' "$file" > "$stub/block"
+    if [ ! -s "$stub/block" ]; then bad="$bad no-homeRecovery-markers:${file##*/}"; continue; fi
+    out=$(cd /tmp && env -i PATH="$stub:/usr/bin:/bin" sh -c ". $stub/block; echo \"HOME=[\$HOME]\"" 2>/dev/null | tail -1)
+    [ "$out" = "HOME=[$goodHome]" ] || bad="$bad ${file##*/}=>$out"
+  done
+  rm -rf "$stub"
+  if [ -z "$bad" ]; then
+    create.result 0 "two-line getent output recovers line 1's home in both blocks"
+  else
+    create.result 1 "multi-source getent breaks recovery:$bad"
+  fi
+  return $(result)
+}
+test.case $level "T-HOME-RECOVERY-NSS: a two-line getent answer still recovers \$HOME (init/oosh and boot)" \
+  test.install.homeRecoveryNssMultiline
+expect 0 "two-line getent output recovers line 1's home in both blocks" \
+  "files+LDAP hosts return two passwd lines; the recovery must take the first, not refuse"
+
+# ============================================================================
+# T-INIT-CLEAN-ENV-PASSTHROUGH: the re-exec passes the caller's env to CHILDREN
+# ============================================================================
+# The guarantee is deterministic-for-oosh, PASS-THROUGH-for-the-tools-it-calls,
+# not "empty". `env -i` strips the environment handed to every child init/oosh
+# spawns — `this call ossh prereqs.install`, `install.continue.local`,
+# `user oosh.install`, every `git clone`, the Homebrew `curl`, `sudo`, and the
+# final `exec "${BASH_FILE:-bash}" -l`. A strictly-clean environment sabotages
+# all of them.
+#
+# LOG_LEVEL is the case tested here because its loss is SILENT rather than
+# loud. `this` does `[ -z "$LOG_LEVEL" ] && export LOG_LEVEL=3`, so it is an
+# inherited knob; and only the `mode root` invocation has a positional argument
+# for it, so on the drag-and-drop and direct paths env is the ONLY lever.
+# Dropping it means `LOG_LEVEL=6 ./init/oosh` installs at 3 and says nothing.
+#
+# One representative case is enough — the rest of the pass-through group
+# (LANG/LC_ALL, the proxies, SSH_AUTH_SOCK, GIT_SSH_COMMAND) crosses by the
+# same mechanism. TERM is asserted separately because it is the one variable
+# that needs a non-empty default rather than `${VAR:-}`.
+test.install.cleanEnvPassesLogLevel() {
+  local out
+  out="$(test.install.cleanEnvProbe sh - LOG_LEVEL=6)"
+  case "$out" in
+    *'LOG_LEVEL=[6]'*)
+      create.result 0 "LOG_LEVEL crosses the re-exec to the children" ;;
+    *)
+      create.result 1 "$out" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-PASSTHROUGH: LOG_LEVEL reaches the spawned tools" \
+  test.install.cleanEnvPassesLogLevel
+expect 0 "LOG_LEVEL crosses the re-exec to the children" \
+  "env is the only lever on the drag-and-drop path; losing it installs at 3 in silence"
+
+# TERM is the one pass-through that must NOT use the bare `${VAR:-}` form.
+# Measured: bash turns an UNSET TERM into `dumb` but leaves an EMPTY one empty,
+# and `tput` errors on empty while accepting `dumb`. So `${TERM:-}` would be
+# strictly worse than dropping TERM altogether. `${TERM:-dumb}` reproduces the
+# unset behaviour exactly, and carries a real terminal when there is one.
+# The success path ends in `exec "${BASH_FILE:-bash}" -l`, so this is what
+# decides whether the user lands in a usable shell.
+test.install.cleanEnvTermDefault() {
+  local kept dflt
+  kept="$(test.install.cleanEnvProbe sh - TERM=xterm-256color)"
+  # Passing TERM= (empty) is the strictly harder case: `${TERM:-dumb}` must
+  # turn BOTH empty and unset into dumb, and empty is the one that a bare
+  # `${TERM:-}` would have let through.
+  dflt="$(test.install.cleanEnvProbe sh - TERM=)"
+  case "$kept" in
+    *'TERM=[xterm-256color]'*) : ;;
+    *) create.result 1 "real TERM not carried: $kept"; return 1 ;;
+  esac
+  case "$dflt" in
+    *'TERM=[dumb]'*)
+      create.result 0 "TERM carried when set, defaulted to dumb when not" ;;
+    *)
+      create.result 1 "empty TERM did not default to dumb: $dflt" ;;
+  esac
+}
+test.case $level "T-INIT-CLEAN-ENV-PASSTHROUGH: TERM is carried, and defaults to dumb not empty" \
+  test.install.cleanEnvTermDefault
+expect 0 "TERM carried when set, defaulted to dumb when not" \
+  "an empty TERM is worse than an absent one — bash defaults unset to dumb, tput rejects empty"
+
 test.suite.save.results

@@ -9,7 +9,7 @@ The oosh/once.sh project uses a modular, template-driven approach for creating n
 - Completion and usage documentation are set up automatically.
 
 ## Adding Methods
-- Use `oo.new.method <script.method>` to interactively add new methods to scripts.
+- Use `oo.method.new <script.method>` to interactively add new methods to scripts.
 - Methods are inserted using templates, ensuring consistent documentation and structure.
 
 ## Templates

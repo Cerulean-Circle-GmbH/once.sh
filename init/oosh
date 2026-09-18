@@ -39,6 +39,54 @@ if [ "${BASH_SOURCE:-$0}" != "$0" ] || [ "${OOSH_NO_AUTORUN:-0}" = "1" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
+# ─── $HOME ───────────────────────────────────────────────────────────────
+# Everything below anchors off $HOME — OOSH_DIR, INSTALL_LOG, the final
+# `mv` to ~/oosh. `env -i` drops it, and the README documents exactly that:
+#   unbuffer env -i sh -xc "$(wget -O- .../init/oosh)" | tee install.log.txt
+# Without recovery that installs into /oosh with a log at /config/install.log.
+#
+# getent (Linux/NSS) -> dscl (macOS) -> /etc/passwd. DELIBERATELY DUPLICATED
+# from boot: this script runs before oosh exists, so it cannot source a shared
+# helper. See the design spec, "Duplication is inherent".
+# BEGIN homeRecovery
+if [ -z "$HOME" ] || [ ! -d "$HOME" ]; then
+  _oosh_user=$(id -un 2>/dev/null)
+  _oosh_home=""
+  if [ -n "$_oosh_user" ]; then
+    if command -v getent >/dev/null 2>&1; then
+      # `head -1` is load-bearing: getent prints one line PER NSS SOURCE, so a
+      # user present in both `files` and LDAP/SSSD yields two. Without it the
+      # cut returns two lines, _oosh_home is non-empty so both fallbacks are
+      # skipped, and `[ -d ]` on the two-line string fails — refusing while
+      # holding a perfectly good home on line 1.
+      _oosh_home=$(getent passwd "$_oosh_user" 2>/dev/null | head -1 | cut -d: -f6)
+    fi
+    if [ -z "$_oosh_home" ] && command -v dscl >/dev/null 2>&1; then
+      # macOS returns TWO paths in one field for root ("/var/root
+      # /private/var/root"); take the first — same as private.get.home.darwin.
+      # Hence `awk '{print $2}'` (field 2 = first path, after the key) and
+      # not the rest of the line.
+      _oosh_home=$(dscl . -read "/Users/$_oosh_user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    fi
+    if [ -z "$_oosh_home" ] && [ -r /etc/passwd ]; then
+      _oosh_home=$(awk -F: -v u="$_oosh_user" '$1 == u { print $6; exit }' /etc/passwd)
+    fi
+  fi
+  if [ -n "$_oosh_home" ] && [ -d "$_oosh_home" ]; then
+    HOME="$_oosh_home"
+    export HOME
+    echo "oosh install: \$HOME was unset or not a directory; recovered as $HOME" >&2
+  else
+    echo "oosh install: \$HOME is unset or not a directory, and no home could be" >&2
+    echo "oosh install: derived for '${_oosh_user:-?}' from getent, dscl or /etc/passwd." >&2
+    echo "oosh install: re-run with HOME set, e.g. HOME=/home/you sh init/oosh" >&2
+    unset _oosh_user _oosh_home
+    exit 1
+  fi
+  unset _oosh_user _oosh_home
+fi
+# END homeRecovery
+
 # ─── Branch default ──────────────────────────────────────────────────────
 # Resolved early — the self-re-exec block below needs $OOSH_BRANCH for
 # the curl-pipe pre-clone fallback. `promote` rewrites this literal
@@ -47,6 +95,81 @@ fi
 # bash-re-exec pre-clone) can read it.
 OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"
 : ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}
+
+# ─── Clean environment ───────────────────────────────────────────────────
+# From 2024-04-07 (8c277f4) to 2026-03-09 (075b4a3) this file carried
+# `#!/usr/bin/env -iS HOME=${HOME} sh`. 075b4a3 dropped it (BusyBox env has
+# no -S) and nothing replaced the guarantee. Re-established here as a
+# self-re-exec: busybox env rejects -S but accepts `env -i VAR=val cmd`.
+# Full audit, per-variable evidence and measurements: docs/install-bootstrap.md.
+# What is LOCAL and load-bearing:
+#
+# PLACEMENT — must stay AFTER the branch default above: env -i wipes
+# OOSH_SELF_BRANCH, so re-execing earlier discards a caller's override.
+#
+# WE NAME AN INTERPRETER, never a bare "$0": a bare "$0" goes to the kernel,
+# which needs the execute bit (ossh.prereqs.install scp's without -p and runs
+# `bash /tmp/oosh-init.$$`) and re-reads the shebang (dropping `-x`, hence
+# $_oosh_x; downgrading macos-test.yml's deliberate /opt/homebrew/bin/bash,
+# hence the $BASH_VERSION check). `-r`, not only `-f`: an interpreter READS $0.
+#
+# PATH IS SEEDED, NOT CARRIED: env -i leaves PATH unset and the compiled-in
+# default lacks /opt/homebrew/bin, which on an arm64 Mac runs the Homebrew
+# installer as root and aborts. A fixed list is deterministic by construction.
+#
+# TWO GROUPS OF CARRIED VARIABLES — do not collapse them:
+#   1. oosh's own state, read by THIS script: HOME, OOSH_CLEAN_ENV (sentinel),
+#      OOSH_BRANCH, OOSH_NO_AUTORUN, SUDO_USER, OOSH_REPO, USER, LOGNAME.
+#      SUDO_USER/OOSH_REPO are pure inherits (losing them skips
+#      `user oosh.install` / kills the fork override); USER/LOGNAME because
+#      bash does not set them and state 13 routes root vs user on $USER.
+#      Anything added below that reads an inherited variable goes here too.
+#   2. pass-through for the CHILDREN we spawn (git, curl, sudo, the final
+#      login shell): LOG_LEVEL, TERM, LANG, LC_ALL, http_proxy, https_proxy,
+#      no_proxy, SSH_AUTH_SOCK, GIT_SSH_COMMAND. init/oosh reads none of them.
+#   Deliberately NOT carried: PATH (seeded), BASH_FILE (recomputed — Phase A
+#   may have installed a newer bash), SUDO (re-derived), GIT_ASKPASS (names a
+#   binary the seeded PATH may not resolve; drives an interactive prompt).
+#
+# ONLY SET VARIABLES ARE CARRIED: `env -i VAR= cmd` SETS VAR to the empty
+# string, and git runs a set-but-empty GIT_SSH_COMMAND as the command ''
+# (state 31's ssh clone then fails silently). Each variable is tested with
+# `${VAR+set}`. TERM is the sole always-set exception (`${TERM:-dumb}`):
+# bash turns an UNSET TERM into dumb but leaves an EMPTY one empty, and tput
+# rejects empty. POSIX sh has no arrays, so the env argv is assembled in "$@":
+# carried pairs and the interpreter appended, the caller's own $_oosh_argc
+# arguments rotated from the front to the back.
+# BEGIN cleanEnv
+if [ -z "$OOSH_CLEAN_ENV" ] && [ -f "$0" ] && [ -r "$0" ]; then
+  # Keep a deliberate bash; otherwise plain sh. $BASH is bash's own absolute
+  # path, so it survives the PATH reset below.
+  _oosh_sh=sh
+  if [ -n "$BASH_VERSION" ]; then _oosh_sh="${BASH:-bash}"; fi
+  # Forward xtrace. Unquoted on purpose: empty must expand to NO argument.
+  _oosh_x=""
+  case "$-" in *x*) _oosh_x="-x" ;; esac
+  _oosh_argc=$#
+  for _oosh_v in OOSH_BRANCH OOSH_NO_AUTORUN SUDO_USER OOSH_REPO USER LOGNAME \
+                 LOG_LEVEL LANG LC_ALL http_proxy https_proxy no_proxy \
+                 SSH_AUTH_SOCK GIT_SSH_COMMAND; do
+    if eval "[ -n \"\${$_oosh_v+set}\" ]"; then
+      eval "set -- \"\$@\" \"$_oosh_v=\${$_oosh_v}\""
+    fi
+  done
+  set -- "$@" "$_oosh_sh" $_oosh_x "$0"
+  while [ "$_oosh_argc" -gt 0 ]; do
+    set -- "$@" "$1"
+    shift
+    _oosh_argc=$((_oosh_argc - 1))
+  done
+  exec env -i \
+    PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME" \
+    OOSH_CLEAN_ENV=1 \
+    TERM="${TERM:-dumb}" \
+    "$@"
+fi
+# END cleanEnv
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase A — self-install platform deps (POSIX `sh`)
@@ -372,7 +495,16 @@ if command -v apk >/dev/null 2>&1 && [ -e /bin/busybox ]; then
   chmod u+s /bin/busybox 2>/dev/null || true
 fi
 
+# path-exception-file: the installer runs BEFORE ~/oosh exists, so `boot` — which
+# lives inside it — cannot be sourced yet. It builds its own PATH (brew bash
+# first on macOS, then $OOSH_DIR) and hands a clean environment to the login
+# shell, which sources boot normally. See docs/boot.md.
+
 # ─── Resolve OOSH_DIR (where the repo lives or will live) ───────────────
+# oosh-dir-exception-file: the installer runs BEFORE ~/oosh exists (it may start
+# from a clone or an unzipped download), so it is the ONE place that derives
+# OOSH_DIR rather than asserting it. It self-corrects below by moving the repo to
+# $HOME/oosh, so by the time it hands off to the login shell OOSH_DIR IS ~/oosh.
 OOSH_DIR=""
 SCRIPT_PATH="$0"
 if [ -f "$SCRIPT_PATH" ]; then
@@ -498,6 +630,36 @@ if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ] && [ $rc -eq 0 ]; then
   else
     echo "WARNING: user.oosh.install failed for '$SUDO_USER' — see errors above"
   fi
+fi
+
+# Ensure a login shell reaches ~/.bashrc (where the oosh hook lives) even on
+# distros whose ~/.profile doesn't source it. Mirrors config:331 / user:895.
+[ ! -f ~/.bash_profile ] && echo '[ -f ~/.bashrc ] && source ~/.bashrc' > ~/.bash_profile
+
+# Auto-activate the oosh shell after a successful LOCAL interactive install run
+# as the target identity (root-direct curl / drag-and-drop). Restores the old
+# `this localInstall` behaviour of starting a fresh oosh shell so the installer
+# leaves you AT an [oosh ...] prompt rather than a bare shell. Skip when:
+#   rc != 0                     install failed — surface the exit code, don't mask it
+#   MODE = root                 remote ossh-install handoff (runs over ssh -tt);
+#                               an interactive exec would hang the ssh caller
+#   not a tty ([ -t 1 ] false)  CI / pipes — nothing to attach to
+#   SUDO_USER set & != root     a freshly-created non-root invoker needs a real
+#                               re-login to pick up the `dev` group; handled by
+#                               the message branch above, so don't exec here
+if [ "$rc" -eq 0 ] && [ -z "$MODE" ] && [ -t 1 ] \
+   && { [ -z "$SUDO_USER" ] || [ "$SUDO_USER" = "root" ]; }; then
+  echo "Starting oosh shell…"
+  # Start a CLEAN login shell: drop the install process's OOSH_DIR/OOSH_MODE so
+  # the new shell re-derives them from ~/config exactly like a real fresh login.
+  # init/oosh exports OOSH_DIR as the literal "$HOME/oosh" SYMLINK path (not
+  # resolved); if that leaks into the login shell, bashrcTemplate's symlink
+  # auto-sync runs `ln -s $HOME/oosh $HOME/oosh` → a self-referential loop
+  # ("Too many levels of symbolic links" when sourcing c2.install). A genuine
+  # login has OOSH_DIR unset and re-resolves it via `pwd -P`, so clearing it
+  # here reproduces that safe path.
+  unset OOSH_DIR OOSH_MODE
+  exec "${BASH_FILE:-bash}" -l
 fi
 
 exit $rc

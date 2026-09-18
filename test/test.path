@@ -12,6 +12,20 @@ echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 source this
 source test.suite
+
+# NO config isolation any more, deliberately. path.append / prepend / remove
+# used to end in private.update.config, whose body was a NO-ARG `config save`:
+# that truncated $CONFIG_PATH/user.env and then cascaded `config save oosh
+# OOSH` and `config save log LOG`, regenerating oosh.env and log.env from the
+# current process env. ~/config is a site-wide sharedConfig sourced by every
+# user at login, so this one file rewrote three shared files eight times per
+# `test.suite core 1` run, for everyone on the box.
+#
+# T8 deleted private.update.config. These methods are session-local now and
+# write no file at all, so the fixture has nothing left to protect. The
+# runner's shared-tier canary is the proof: if this file ever writes ~/config
+# again, the run names it.
+
 source path
 
 log.level $level
@@ -61,7 +75,7 @@ else
 fi
 
 # ============================================================================
-# Test path.append (also tests path.add and path.push which are aliases)
+# Test path.append  (there are no `add` / `push` aliases — there never were)
 # ============================================================================
 
 reset_path
@@ -128,6 +142,71 @@ else
   expect.fail "path.remove should remove directory from PATH"
 fi
 
+# ============================================================================
+# T-PATH-REMOVE-EXACT: `path remove /usr` must not take /usr/bin with it
+# ============================================================================
+# The old body used line.remove — `grep -v "$1"`, a SUBSTRING match — so
+# removing a prefix removed every path under it. This is the assertion the
+# shrink exists for.
+test.path.removeIsWholeSegment() {
+  # The REAL PATH is kept and /usr appended to it — a synthetic PATH would
+  # leave grep, sed and xargs unresolvable, and path.remove runs a line.*
+  # pipeline. The real PATH already carries /usr/bin, /usr/local/bin and
+  # /usr/sbin, which is exactly what the old substring match destroyed.
+  local saved="$PATH" after bare kept
+  export PATH="$PATH:/usr"
+  path.remove "/usr" >/dev/null 2>&1
+  after="$PATH"
+  export PATH="$saved"
+  bare=$(printf "%s" ":$after:" | grep -c ":/usr:")
+  kept=$(printf "%s" ":$after:" | grep -c ":/usr/bin:")
+  if [ "$bare" = "0" ] && [ "$kept" != "0" ]; then
+    create.result 0 "whole segment only"
+  else
+    create.result 1 "bare=$bare kept=$kept in: $after"
+  fi
+  return $(result)
+}
+test.case $level "path.remove - removes the whole segment only, not everything under it" \
+  test.path.removeIsWholeSegment
+expect 0 "whole segment only" "line.remove is a substring match: it deleted /usr/bin, /usr/local/bin and /usr/sbin too"
+
+# The same substring bug on the de-dupe side: appending /opt/x dropped /opt/xy.
+test.path.appendDeDupeIsWholeSegment() {
+  local saved="$PATH" after
+  export PATH="$PATH:/opt/xy"
+  path.append "/opt/x" >/dev/null 2>&1
+  after="$PATH"
+  export PATH="$saved"
+  case ":$after:" in
+    *":/opt/xy:"*) create.result 0 "neighbour kept" ;;
+    *)             create.result 1 "the de-dupe pass ate /opt/xy: $after" ;;
+  esac
+  return $(result)
+}
+test.case $level "path.append - de-dupes by whole segment, so /opt/xy survives adding /opt/x" \
+  test.path.appendDeDupeIsWholeSegment
+expect 0 "neighbour kept" "line.filter matched a substring, so the de-dupe pass ate the neighbour"
+
+# Nothing here may persist: PATH is built by boot at login, and these methods
+# are session-local. The docstrings used to claim "and saves config".
+test.path.mutatorsPersistNothing() {
+  local saved="$PATH" before after
+  before=$(cat "$CONFIG" 2>/dev/null | wc -l)
+  path.prepend "/tmp/oosh-test-path-persistence" >/dev/null 2>&1
+  after=$(cat "$CONFIG" 2>/dev/null | wc -l)
+  export PATH="$saved"
+  if [ "$before" != "$after" ] || grep -q "oosh-test-path-persistence" "$CONFIG" 2>/dev/null; then
+    create.result 1 "path.prepend wrote to $CONFIG"
+  else
+    create.result 0 "nothing written"
+  fi
+  return $(result)
+}
+test.case $level "path.prepend - writes nothing to the config tier" \
+  test.path.mutatorsPersistNothing
+expect 0 "nothing written" "private.update.config ran a no-arg config save from a child process — boot owns PATH"
+
 
 # ============================================================================
 # Test path.parameter.completion.dir - completion function
@@ -179,14 +258,27 @@ fi
 # Test path.usage
 # ============================================================================
 
-test.case $level "path.usage - displays usage information" \
-  path.usage
-
-if [[ "$RESULT" == *"Usage"* ]] || [ $RETURN_VALUE -eq 0 ]; then
-  expect.pass "path.usage displays help"
-else
-  expect.fail "path.usage should display help information"
-fi
+# The old assertion was `[[ "$RESULT" == *"Usage"* ]] || [ $RETURN_VALUE -eq 0 ]`
+# — the second disjunct is satisfied by almost any outcome, so it could not
+# fail. What matters is that the text no longer advertises verbs that do not
+# exist: `add`, `push`, `put` and `rm` all reach this.methodNotFound, and the
+# table is rendered by this.help from the docstrings now.
+test.path.usageAdvertisesOnlyRealVerbs() {
+  local out
+  out=$(path.usage 2>/dev/null)
+  local ghost
+  for ghost in "  add" "  push" "  put" "  rm" " status " " file.global" " file.user"; do
+    case "$out" in *"$ghost"*) create.result 1 "usage still advertises '$ghost'"; return $(result) ;; esac
+  done
+  case "$out" in
+    *"Usage"*) create.result 0 "usage is honest" ;;
+    *)         create.result 1 "usage printed no command table" ;;
+  esac
+  return $(result)
+}
+test.case $level "path.usage - advertises only verbs that exist" \
+  test.path.usageAdvertisesOnlyRealVerbs
+expect 0 "usage is honest" "the hand-maintained table advertised four verbs that have never existed"
 
 # ============================================================================
 # Cleanup
@@ -201,5 +293,134 @@ export PATH="$ORIGINAL_PATH"
 # ============================================================================
 # Test Summary
 # ============================================================================
+
+
+console.log "
+Test 1 
+===================================================================="
+
+# ============================================================================
+# T-PATH-VALIDATE-TREE: the shipped tree obeys the rule
+# ============================================================================
+test.path.validateTree() {
+  local out
+  out=$(path.validate "$OOSH_DIR" 2>/dev/null)
+  local rc=$?
+  case "$out" in
+    *"OK:"*"0 violations"*) [ "$rc" -eq 0 ] && create.result 0 "tree conforms" || create.result 1 "verdict OK but rc=$rc" ;;
+    *)                      create.result 1 "rc=$rc $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PATH-VALIDATE-TREE: every PATH= in the tree is boot's or carries a marker" \
+  test.path.validateTree
+expect 0 "tree conforms" "no unmarked PATH writer escapes the rule"
+
+# ============================================================================
+# T-PATH-VALIDATE-* : the guard can actually FAIL
+# ============================================================================
+# A guard that never fails guards nothing. Plant each shape in a throwaway git
+# repo — `git grep` only sees TRACKED files, so `git add` is required — using
+# the same mechanism as test.this's anchor-validator tests (:463-534).
+PV_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/test.path.validate.XXXXXX")
+git -c init.defaultBranch=main init "$PV_FIXTURE" >/dev/null 2>&1
+
+private.test.path.validate.plant() { # <file> <content...> # write + track <file>, echo the verdict
+  local name="$1"; shift
+  printf '%s\n' "$@" > "$PV_FIXTURE/$name"
+  git -C "$PV_FIXTURE" add "$name" >/dev/null 2>&1
+  # LOG_DEVICE is not always a tty (test.suite core redirects), so error.log
+  # lines can share this capture with the verdict — match on SUBSTRINGS.
+  path.validate "$PV_FIXTURE" 2>/dev/null
+}
+private.test.path.validate.clear() { # # drop every planted file
+  git -C "$PV_FIXTURE" rm -q -f --ignore-unmatch '*' >/dev/null 2>&1
+  rm -f "$PV_FIXTURE"/* 2>/dev/null
+}
+
+test.path.validateRejects() {
+  private.test.path.validate.clear
+  local out
+  out=$(private.test.path.validate.plant offender '#!/usr/bin/env bash' \
+        'export PATH="/somewhere:$PATH"')
+  case "$out" in
+    *"INVALID:"*"1 violation"*) create.result 0 "unmarked writer rejected" ;;
+    *)                          create.result 1 "expected 1 violation, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PATH-VALIDATE-REJECTS: an unmarked PATH= outside boot is a violation" \
+  test.path.validateRejects
+expect 0 "unmarked writer rejected" "boot is the single builder; everything else declares itself"
+
+test.path.validateAcceptsBoot() {
+  private.test.path.validate.clear
+  local out
+  out=$(private.test.path.validate.plant boot '#!/usr/bin/env sh' \
+        '  *) PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH" ;;')
+  case "$out" in
+    *"OK:"*"1 conforming"*) create.result 0 "boot conforms" ;;
+    *)                      create.result 1 "expected 1 conforming, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PATH-VALIDATE-BOOT: boot is the one conforming site, even inside a case" \
+  test.path.validateAcceptsBoot
+expect 0 "boot conforms" "boot's own assignments read '*) PATH=...' — an anchored pattern missed all of them"
+
+test.path.validateHonoursMarker() {
+  private.test.path.validate.clear
+  local out
+  out=$(private.test.path.validate.plant degrade '#!/usr/bin/env bash' \
+        '# path-exception: fixture — boot has not run on the far side of this ssh' \
+        'export PATH="/somewhere:$PATH"')
+  case "$out" in
+    *"OK:"*"1 exception"*) create.result 0 "marker honoured" ;;
+    *)                     create.result 1 "expected 1 exception, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PATH-VALIDATE-MARKER: an in-code # path-exception: is honoured" \
+  test.path.validateHonoursMarker
+expect 0 "marker honoured" "the marker may sit on the line or in the few lines above it"
+
+test.path.validateHonoursFileMarker() {
+  private.test.path.validate.clear
+  local out
+  out=$(private.test.path.validate.plant installer '#!/usr/bin/env sh' \
+        '# path-exception-file: fixture — runs before ~/oosh exists' \
+        'export PATH="/a:$PATH"' \
+        'PATH="/b:$PATH"')
+  case "$out" in
+    *"OK:"*"2 exception"*) create.result 0 "file marker honoured" ;;
+    *)                     create.result 1 "expected 2 exceptions, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PATH-VALIDATE-FILE-MARKER: # path-exception-file: exempts the whole file" \
+  test.path.validateHonoursFileMarker
+expect 0 "file marker honoured" "an installer that runs before ~/oosh exists cannot delegate to boot"
+
+test.path.validateIgnoresOtherPathVars() {
+  private.test.path.validate.clear
+  local out
+  out=$(private.test.path.validate.plant neighbours '#!/usr/bin/env bash' \
+        'export CONFIG_PATH="$HOME/config"' \
+        'OSSH_CONTROL_PATH="/tmp/ossh-%r@%h:%p"' \
+        'echo "$PATH"')
+  case "$out" in
+    *"OK:"*"0 violations"*) create.result 0 "only PATH itself" ;;
+    *)                      create.result 1 "a <SOMETHING>_PATH= was read as PATH=, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PATH-VALIDATE-SCOPE: CONFIG_PATH= and OSSH_CONTROL_PATH= are not PATH=" \
+  test.path.validateIgnoresOtherPathVars
+expect 0 "only PATH itself" "the leading character class excludes '_', so no <X>_PATH= is swept in"
+
+rm -rf "$PV_FIXTURE"
+unset PV_FIXTURE
+
+### test.method
 
 test.suite.save.results

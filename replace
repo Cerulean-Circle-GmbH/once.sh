@@ -5,8 +5,43 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+replace.block()     # <file> <startLine> <endLine> # selects the whole block from <startLine> to <endLine> inclusive, exactly one of them; continue with `by <newText>` — `by ""` deletes it #
+{
+  # A SELECTOR, like replace.line and replace.within: it only records what to
+  # act on and hands the chain forward via RETURN. replace.by does the write
+  # and owns the result — which is why there is no create.result here.
+  #
+  # Both patterns are WHOLE LINES, matched literally (grep -x -F / awk ==),
+  # never regexes: the block this exists to remove is a shell function, whose
+  # first line contains (), $, quotes and often a docstring.
+  FILE="$1"
+  shift
+  SEARCH_EXPRESSION="$1"
+  shift
+  BLOCK_END_EXPRESSION="$1"
+  shift
+  REPLACE_ANCHOR="block"
+  export REPLACE_ANCHOR BLOCK_END_EXPRESSION
+  RETURN=$1
+}
 
-replace.by()
+
+replace.block.completion.file() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+replace.block.completion.startLine() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+replace.block.completion.endLine() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+### new.method
+
+
+replace.by() # <newText> # completes `replace within` or `replace line`; writes the transformed copy to <file>.new
 {
   REPLACE_EXPRESSION="$1"
   shift
@@ -16,13 +51,96 @@ replace.by()
   export SEARCH_EXPRESSION
   export REPLACE_EXPRESSION
 
-  if [[ $FILE == *.new ]]; then
-    perl -pe 's/\Q$ENV{SEARCH_EXPRESSION}\E/$ENV{REPLACE_EXPRESSION}/' "$FILE" > "$FILE.new"
-    replace commit "$FILE"
-    replace cleanup "$FILE"
-  else
-    perl -pe 's/\Q$ENV{SEARCH_EXPRESSION}\E/$ENV{REPLACE_EXPRESSION}/' "$FILE" > "$FILE.new"
+  if [ "$REPLACE_ANCHOR" = "block" ]; then
+    # Whole BLOCK, from <startLine> to <endLine> inclusive, and exactly one of
+    # them. `by ""` deletes it; `by "<text>"` swaps the whole block for <text>.
+    # This is what `oo method.delete` removes a function with — a method is a
+    # block, not a line, and deleting it by hand is how docstrings and
+    # completion functions get orphaned.
+    local starts; starts=$(grep -c -x -F -- "$SEARCH_EXPRESSION" "$FILE" 2>/dev/null)
+    unset REPLACE_ANCHOR
+    if [ "${starts:-0}" != "1" ]; then
+      create.result 1 "replace block: start '$SEARCH_EXPRESSION' matches ${starts:-0} whole line(s) in $FILE — expected exactly 1, refusing"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    # Same reasoning as the line form: awk, not perl (Alpine ships no perl),
+    # and ENVIRON, not -v (awk processes escapes in a -v assignment).
+    export BLOCK_END_EXPRESSION
+    if ! awk 'BEGIN{s=ENVIRON["SEARCH_EXPRESSION"];e=ENVIRON["BLOCK_END_EXPRESSION"];r=ENVIRON["REPLACE_EXPRESSION"]}
+              !inBlock && !closed && $0==s {inBlock=1; next}
+              inBlock && $0==e {inBlock=0; closed=1; if (r != "") print r; next}
+              inBlock {next}
+              {print}
+              END{ if (inBlock) exit 3 }' "$FILE" > "$FILE.new"; then
+      create.result 1 "replace block: no '$BLOCK_END_EXPRESSION' line after '$SEARCH_EXPRESSION' in $FILE"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    create.result 0 "$FILE.new written" "$1"
+    return $(result)
   fi
+
+  if [ "$REPLACE_ANCHOR" = "line" ]; then
+    # Whole line, and exactly one of them. `replace within` matches a
+    # SUBSTRING, and `perl -pe` loops over every line, so it rewrites the
+    # first match on EVERY line that contains one. Running `oo method.new
+    # oo.something` used to corrupt oo's own source that way: the marker text
+    # "### new.method" appears both as the real marker and inside the tool's
+    # own string literal one line above it.
+    local matches; matches=$(grep -c -x -F -- "$SEARCH_EXPRESSION" "$FILE" 2>/dev/null)
+    unset REPLACE_ANCHOR
+    if [ "${matches:-0}" != "1" ]; then
+      create.result 1 "replace line: '$SEARCH_EXPRESSION' matches ${matches:-0} whole line(s) in $FILE — expected exactly 1, refusing"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    # awk, NOT perl. Alpine ships no perl at all, so `replace` — and therefore
+    # `oo method.new`, which is the whole point of the whole-line form — could
+    # not run there. Caught by the alpine platform gate on f386f87: three tests
+    # red with "replace line returned 1". busybox awk is enough for an
+    # equality test, and this is the path the method tool uses.
+    #
+    # ENVIRON, not `-v`: awk processes escape sequences in a -v assignment, so
+    # a backslash anywhere in the generated method body would be mangled.
+    if ! awk 'BEGIN{s=ENVIRON["SEARCH_EXPRESSION"];r=ENVIRON["REPLACE_EXPRESSION"]}
+              $0==s{print r; next}{print}' "$FILE" > "$FILE.new"; then
+      create.result 1 "replace line: could not write $FILE.new"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    create.result 0 "$FILE.new written" "$1"
+    return $(result)
+  fi
+
+  # The substring form still needs perl for its literal \Q…\E match. That is a
+  # pre-existing dependency, unchanged here, and it is why `replace within`
+  # does not work on a host without perl — its own card.
+  if ! perl -pe 's/\Q$ENV{SEARCH_EXPRESSION}\E/$ENV{REPLACE_EXPRESSION}/' "$FILE" > "$FILE.new"; then
+    create.result 1 "replace by: could not write $FILE.new (perl absent? `replace within` requires it)"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  if [[ $FILE == *.new ]]; then
+    replace commit "$FILE" || return 1
+    replace cleanup "$FILE"
+  fi
+  # create.result's THIRD argument is the chaining marker. This used to be a
+  # bare `RETURN=$1` as the last statement, which pinned the exit status at 0 —
+  # the same defect oo.cmd carried until 8928c3e, and the reason a failed
+  # substitution could be followed by an unconditional `replace commit`.
+  create.result 0 "$FILE.new written" "$1"
+  return $(result)
+}
+
+replace.line() # <file> <exactLine> # like `replace within`, but the search must match a WHOLE line and exactly one of them; continue with `by <newText>`
+{
+  FILE="$1"
+  shift
+  SEARCH_EXPRESSION=$1
+  shift
+  REPLACE_ANCHOR="line"
+  export REPLACE_ANCHOR
   RETURN=$1
 }
 
@@ -55,15 +173,28 @@ replace.diff()
  diff "$FILE" "$FILE.new"
 }
 
-replace.commit()
+replace.commit() # <file> # swap the transformed copy in: <file> becomes <file>.bak and <file>.new becomes <file>
 {
   FILE="$1"
+  # REFUSE without the working copy. This used to run unconditionally: the
+  # first `mv` displaced the original to .bak, the second failed because
+  # .new was never written, and the script was left with NO file under its
+  # own name. private.oo.new.method calls this whether or not any
+  # substitution matched, so it was one failed `replace within` away from
+  # deleting the script it was editing.
+  if [ ! -f "$FILE.new" ]; then
+    create.result 1 "replace commit: $FILE.new does not exist — nothing to commit, refusing (committing anyway would leave $FILE with no file under its own name)"
+    error.log "$RESULT"
+    return $(result)
+  fi
   # Use standard bash test - works on case-insensitive APFS
   [ -f "$FILE.bak" ] && rm "$FILE.bak"
   chmod -x "$FILE"
   mv "$FILE" "$FILE.bak"
   mv "$FILE.new" "$FILE"
   chmod +x "$FILE"
+  create.result 0 "$FILE committed, previous kept as $FILE.bak"
+  return $(result)
 }
 
 replace.rollback()
@@ -109,17 +240,21 @@ $0
       rollback          filename
       diff              filename
 
-      by        <replace expression> 
+      by        <replace expression>
       by.file
-      within        <filename> <search expression>
+      within        <filename> <search expression>   substring, every line
+      line          <filename> <exact line>          whole line, exactly one match
+      block         <filename> <start line> <end line>   whole block, exactly one match; `by \"\"` deletes it
 
       cleanup
 
-  
+
   Examples
     $this init
 
     replace within some.File.txt \"hello\" by \"servus\"
+    replace line   some.File.txt \"### new.method\" by \"inserted\"
+    replace block  some.File.txt \"victim() {\" \"}\" by \"\"        # delete a whole function
     replace diff some.File.txt
     replace commit some.File.txt
 

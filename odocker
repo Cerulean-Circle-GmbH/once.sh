@@ -15,9 +15,60 @@
 #   2. legacy ODOCKER_WORKSPACES= in user.env (pre-migration installs)
 #   3. $ODOCKER_WORKSPACES_DEFAULT below
 # Update via: odocker workspace.set <?path>   (no path → falls back to the default)
+#          or odocker workspace.init <?path>  (creates it first — `set` refuses a
+#                                              directory that is not there)
 ODOCKER_WORKSPACES_DEFAULT="/var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces"
 : ${ODOCKER_WORKSPACES:=$(config get ODOCKER_WORKSPACES 2>/dev/null)}
 : ${ODOCKER_WORKSPACES:=$ODOCKER_WORKSPACES_DEFAULT}
+
+odocker.workspace.init()     # <?path:$ODOCKER_WORKSPACES_DEFAULT> # create the Docker workspaces directory if it is absent, then set it; idempotent #
+{
+  # The verb that is allowed to CREATE. `workspace.set` deliberately rejects a
+  # missing directory (below) so a typo cannot silently persist a path that is
+  # not there; this one makes the directory first and then hands over to it —
+  # wholesale, so the canonicalisation and the persistence trio have exactly
+  # one definition.
+  #
+  # Shape follows the .init family: config.init.user, claudeCode.init,
+  # claudeFlow.init — an optional path, create, delegate, idempotent.
+  local path="$1"
+  if [ -z "$path" ]; then
+    path="$ODOCKER_WORKSPACES_DEFAULT"
+    info.log "No path given — using default: $path"
+  fi
+  [ -n "$1" ] && shift
+
+  if [ -e "$path" ] && [ ! -d "$path" ]; then
+    error.log "odocker.workspace.init: $path exists and is not a directory"
+    create.result 2 "not a directory: $path" "$1"
+    return $(result)
+  fi
+
+  # mkdir -p is idempotent, so a second call on an existing root is a no-op —
+  # which is what makes this method safe to re-run. Its status IS checked: an
+  # unwritable parent has to fail here, loudly, rather than fall through to
+  # workspace.set and be reported as "Directory not found".
+  if ! mkdir -p "$path" 2>/dev/null; then
+    error.log "odocker.workspace.init: cannot create $path — is its parent writable?"
+    create.result 1 "cannot create $path" "$1"
+    return $(result)
+  fi
+
+  # Everything else — this.absolutePath, config save odocker ODOCKER,
+  # config add odocker, config unset ODOCKER_WORKSPACES — belongs to
+  # workspace.set and stays there.
+  odocker.workspace.set "$path"
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result "$rc" "created $path but could not set it" "$1"
+    return $(result)
+  fi
+  create.result 0 "workspace directory set to: $ODOCKER_WORKSPACES" "$1"
+  return $(result)
+}
+
+odocker.workspace.init.completion.path() { compgen -d "$1"; }
+
 
 ### new.method
 
@@ -136,21 +187,64 @@ private.odocker.image.resolve.from.workspace() {
 # WORKSPACE MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-odocker.workspace.get() # # show current Docker workspaces directory and where it's persisted
+odocker.workspace.get() # <?path:$ODOCKER_WORKSPACES> # report the Docker workspaces root and whether it is usable; with a path, report whether that one would be
 {
-  # Use plain echo: the value IS this method's output, so it must be visible
-  # at any LOG_LEVEL (console.log only prints at LOG_LEVEL>=3, which made
-  # `odocker workspace.get` silent on the common LOG_LEVEL=1 setup).
-  echo "${ODOCKER_WORKSPACES:-not set}"
-  if [ -f "$CONFIG_PATH/odocker.env" ]; then
+  # A REPORTER. It never sets, never persists, never creates — workspace.set
+  # and workspace.init do that.
+  #
+  # It used to declare no parameters and SILENTLY DISCARD one: $1, $@, $* and
+  # shift appeared nowhere in the body, so `odocker workspace.get /some/path`
+  # echoed the OLD value and exited 0. And it never checked the root existed,
+  # so it happily reported a directory that was not there while
+  # workspace.list and build failed with "DockerWorkspaces not found"
+  # (odocker.workspace.list below) — the reporter and the consumers disagreed.
+  local path="$1"
+  local subject="current"
+  if [ -n "$1" ]; then
+    subject="candidate"
+    shift
+    # Canonicalise ONLY when it exists. this.absolutePath cd's to the dirname
+    # and silently falls back to $PWD when that fails (this:805), so
+    # canonicalising a path that is not there would answer with a DIFFERENT
+    # path. workspace.set gets away with calling it unconditionally because it
+    # checks -d first.
+    if [ -d "$path" ]; then
+      this.absolutePath "$path"
+      path="$RESULT"
+    fi
+  else
+    path="$ODOCKER_WORKSPACES"
+  fi
+
+  # Plain echo, never console.log: the value IS this method's output, so it has
+  # to survive any LOG_LEVEL. console.log prints only at LOG_LEVEL>=3, which
+  # made `odocker workspace.get` silent on the common LOG_LEVEL=1 setup.
+  echo "${path:-not set}"
+  if [ "$subject" = "current" ] && [ -f "$CONFIG_PATH/odocker.env" ]; then
     info.log "(persisted in: \$CONFIG_PATH/odocker.env)"
   fi
+
+  if [ -z "$path" ]; then
+    error.log "odocker.workspace.get: no workspaces root is set — create one with 'odocker workspace.init'"
+    echo "INVALID: no workspaces root set"
+    create.result 1 "no workspaces root set" "$1"
+    return $(result)
+  fi
+  if [ ! -d "$path" ]; then
+    error.log "odocker.workspace.get: $path is not a directory — 'odocker build' and 'odocker workspace.list' will fail against it. Create it with 'odocker workspace.init $path'"
+    echo "INVALID: not a directory: $path"
+    create.result 1 "not a directory: $path" "$1"
+    return $(result)
+  fi
+  create.result 0 "$path" "$1"
+  return $(result)
 }
+odocker.workspace.get.completion.path() { compgen -d "$1"; }
 
 odocker.workspace.set() # <?path:$ODOCKER_WORKSPACES_DEFAULT> # set Docker workspaces directory (persists to $CONFIG_PATH/odocker.env)
 {
   local path="$1"
-  # No arg → fall back to the platform default (declared at odocker:13).
+  # No arg → fall back to the platform default (declared at odocker:18).
   # Users who just want "reset to default" can now call `odocker workspace.set`
   # with no args instead of having to retype the long path.
   if [ -z "$path" ]; then
@@ -1006,11 +1100,11 @@ odocker.install() # <container> # install Docker CLI inside a running container
       fi
       # Add all non-system users to the socket's group
       local ooshDir
-      ooshDir=$(docker exec "$container" bash -c 'source ~/config/user.env 2>/dev/null; echo "$OOSH_DIR"' 2>/dev/null)
+      ooshDir=$(docker exec "$container" bash -c 'source ~/oosh/boot 2>/dev/null; echo "$OOSH_DIR"' 2>/dev/null)
       local u
       for u in $(docker exec "$container" awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
         if [ -n "$ooshDir" ] && docker exec "$container" test -f "$ooshDir/user" 2>/dev/null; then
-          docker exec "$container" bash -c "source ~/config/user.env 2>/dev/null; LOG_LEVEL=0 \$OOSH_DIR/user group.add $socketGroup $u"
+          docker exec "$container" bash -c "source ~/oosh/boot 2>/dev/null; LOG_LEVEL=0 \$OOSH_DIR/user group.add $socketGroup $u"
         else
           docker exec "$container" sh -c "usermod -aG $socketGroup $u 2>/dev/null || addgroup $u $socketGroup 2>/dev/null"
         fi
@@ -1419,6 +1513,8 @@ odocker.usage()
 
   Examples
     $this workspace.get
+    $this workspace.get /path/to/check         # report whether that path would do
+    $this workspace.init                       # create the default root, then set it
     $this workspace.set /path/to/workspaces
     $this workspace.list
     $this container.list

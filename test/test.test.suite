@@ -132,6 +132,401 @@ test.case $level "private.test.suite.category defaults to extended" \
 expect 0 "extended" "test.claudeCode defaults to extended"
 
 # ============================================================================
+# T-RESULTS-NO-INHERIT — a file that saves no result inherits nothing
+# ============================================================================
+# test.suite.save.results writes $CONFIG_PATH/testresult.env and the runner
+# reads it back as that file's score. The runner used to zero only the shell
+# VARIABLES and leave the FILE, so a file that never called save.results was
+# scored with the previous file's numbers. test.tilde reporting test.this's 31
+# assertions was the instance that exposed it.
+#
+# Driven against the primitive with a fixture TEST_SUITE_RESULT_PATH (dynamic
+# scoping — private.test.suite.results.file reads it), so the real shared
+# ~/config is never touched and no state is borrowed from the surrounding run.
+# Driven END-TO-END through the real runner against test.colors, which asserts
+# nothing and never calls test.suite.save.results. A unit check of the clear
+# primitive alone would be tautological: once the handoff is removed, the
+# "inherited" branch can never fire. Only the runner path proves the score a
+# score-less file actually receives.
+test.test.suite.resultsNoInherit() {
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.results.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+
+  # a previous file's score, exactly as test.suite.save.results writes it,
+  # planted where the runner will look
+  printf 'export TEST_SUITE_TEST_COUNTER="9"\nexport TEST_SUITE_EXPECT_COUNTER="31"\nexport TEST_SUITE_SUCCESS_COUNTER="31"\n' \
+    > "$fix/testresult.env"
+
+  local out
+  out=$(TEST_SUITE_RESULT_PATH="$fix" "$OOSH_DIR/test.suite" run colors 1 2>&1 \
+        | sed 's/\x1b\[[0-9;]*m//g')
+  rm -rf "$fix" 2>/dev/null
+
+  if echo "$out" | grep -q '31 assertions'; then
+    create.result 1 "test.colors was scored with the previous file's 31 assertions"
+  elif ! echo "$out" | grep -q 'NO RESULTS'; then
+    create.result 1 "no warning that the file produced no score of its own"
+  elif ! echo "$out" | grep -q '0 / 0 assertions'; then
+    create.result 1 "did not report 0 / 0: $(echo "$out" | grep -m1 'Results:')"
+  else
+    create.result 0 "0 assertions inherited"
+  fi
+  return $(result)
+}
+test.case $level "T-RESULTS-NO-INHERIT: a file that saves nothing inherits nothing" \
+  test.test.suite.resultsNoInherit
+expect 0 "0 assertions inherited" \
+  "the previous file's score must never become this file's score"
+
+# ============================================================================
+# T-FIXTURE-* — a test file must not rewrite the shared config tier
+# ============================================================================
+# ~/config is a SITE-WIDE sharedConfig sourced by every user at login.
+# test/test.path sources `path`, and path.append/prepend/remove each end in
+# private.update.config, whose body is a NO-ARG `config save` — which truncates
+# user.env and regenerates oosh.env and log.env from the current process env.
+#
+# The proof is a planted CANARY, not a checksum. config.save rewrites those
+# files byte-identically from the same environment, and test.oo (which sorts
+# earlier) has its own pollution erased by test.path's later truncate — so a
+# content diff or a hash is a guaranteed false negative. Only a marker that a
+# rewrite destroys can see it. mtime would work by hand on Linux but not in a
+# test: BSD stat on the macOS runners has whole-second resolution.
+test.test.suite.fixtureSharedConfig() {
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.fixture.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  local canary="# OOSH-SHARED-CANARY-$$"
+  local f
+  for f in user.env oosh.env log.env; do
+    printf 'export BASH_FILE="/usr/bin/bash"\nexport CONFIG_FILE="user.env"\n%s\n' "$canary" > "$fix/$f"
+  done
+  : > "$fix/result.env"
+
+  # Run the real file the way the runner does (kernel exec), with both anchors
+  # AND the results path pointed at the simulated shared dir. Without
+  # TEST_SUITE_RESULT_PATH the child would inherit ours and clobber this file's
+  # own score.
+  env CONFIG_PATH="$fix" CONFIG_FILE=user.env CONFIG="$fix/user.env" \
+      TEST_SUITE_RESULT_PATH="$fix" \
+      "$OOSH_DIR/test/test.path" 1 >/dev/null 2>&1
+
+  local missing=""
+  for f in user.env oosh.env log.env; do
+    grep -qF "$canary" "$fix/$f" 2>/dev/null || missing="$missing $f"
+  done
+  # grep, not source — sourcing would clobber THIS file's live counters
+  local landed=0
+  [ -f "$fix/testresult.env" ] \
+    && landed=$(grep -m1 TEST_SUITE_EXPECT_COUNTER "$fix/testresult.env" | cut -d'"' -f2)
+  rm -rf "$fix" 2>/dev/null
+
+  if [ -n "$missing" ]; then
+    create.result 1 "test.path rewrote the shared tier; canary destroyed in:$missing"
+  elif [ "${landed:-0}" -le 0 ]; then
+    create.result 1 "test.path's score never reached the TEST_SUITE_RESULT_PATH it was given — the config fixture swallowed it"
+  else
+    # Fixed literal — the expect below matches it exactly. Never `expect 0 "*"`,
+    # which would set the expectation to whatever actually happened.
+    create.result 0 "shared tier intact, score landed"
+  fi
+  return $(result)
+}
+test.case $level "T-FIXTURE-SHARED-CONFIG: test.path leaves the inherited config tier alone" \
+  test.test.suite.fixtureSharedConfig
+expect 0 "shared tier intact, score landed" \
+  "a core test must never rewrite the site-wide config every user sources at login"
+
+# ============================================================================
+# T-SHARED-CANARY-* — the RUNNER guards the shared tier, for every file
+# ============================================================================
+# test.suite.config.isolate is opt-in: the next file that forgets the line
+# rewrites the site-wide tier again, and only the isolating file itself carries
+# a canary. Worse, isolation only redirects writes addressed through
+# $CONFIG_PATH — test.log's T31 wrote the real shared log.env through a
+# hardcoded $HOME/config path while believing itself isolated (fixed f9c3802).
+# So the runner fingerprints the tier around EVERY core and extended child,
+# names the offender, puts the tier back, and fails the run.
+
+test.test.suite.shared.fixture() { # <dir> # a simulated shared tier with the three files a no-arg config.save rewrites
+  local f
+  for f in user.env oosh.env log.env; do
+    printf 'export OOSH_CANARY_%s="original"\n' "${f%%.*}" > "$1/$f"
+  done
+}
+
+# --- T-SHARED-CANARY-DETECTS ------------------------------------------------
+test.test.suite.sharedCanaryDetects() {
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.canary.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  # A subshell: the pins below must not leak into THIS file's own scoring.
+  local out rc
+  out=$(
+    export TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run"
+    private.test.suite.shared.snapshot >/dev/null 2>&1 || { echo "SNAPSHOT-FAILED"; exit 1; }
+    if private.test.suite.shared.verify probeFile >/dev/null 2>&1; then
+      : # clean tier verifies clean, as it must
+    else
+      echo "CLEAN-TIER-REPORTED-DIRTY: $RESULT"; exit 1
+    fi
+    printf 'export OOSH_CANARY_oosh="rewritten"\n' > "$fix/oosh.env"
+    if private.test.suite.shared.verify probeFile >/dev/null 2>&1; then
+      echo "WRITE-NOT-DETECTED"; exit 1
+    fi
+    echo "$RESULT"
+  ); rc=$?
+  rm -rf "$fix" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "${out:-verify did not report the write}"
+  elif [ "${out#*oosh.env}" = "$out" ]; then
+    create.result 1 "did not name the file that changed: [$out]"
+  elif [ "${out#*user.env}" != "$out" ]; then
+    create.result 1 "named a file that did NOT change: [$out]"
+  elif [ "${out#*probeFile}" = "$out" ]; then
+    create.result 1 "did not name the test file responsible: [$out]"
+  else
+    create.result 0 "the write is detected and both the file and the offender are named"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-DETECTS: a rewritten shared file is caught and named, an untouched one is not" \
+  test.test.suite.sharedCanaryDetects
+expect 0 "the write is detected and both the file and the offender are named" \
+  "opt-in isolation cannot see a file that never opted in"
+
+# --- T-SHARED-CANARY-MTIME --------------------------------------------------
+# The fingerprint must be CONTENT ONLY. The tier is owned by developking and
+# merely group-writable, so a test user can put a file's content back but
+# cannot put its mtime back — `cp -p` needs ownership for utimensat. An
+# mtime-sensitive stamp therefore turned one genuine write into a permanent
+# mismatch, and the alpine platform run of 2026-09-16 duly reported fourteen
+# consecutive "offenders" that had touched nothing at all.
+test.test.suite.sharedCanaryIgnoresMtime() {
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.mtime.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  local out rc
+  out=$(
+    export TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run"
+    private.test.suite.shared.snapshot >/dev/null 2>&1 || { echo "SNAPSHOT-FAILED"; exit 1; }
+    # Same bytes, new timestamp — exactly what a non-owner restore leaves behind.
+    touch "$fix/user.env" "$fix/oosh.env" "$fix/log.env"
+    private.test.suite.shared.verify probeFile >/dev/null 2>&1 || { echo "MTIME-REPORTED-AS-A-WRITE: $RESULT"; exit 1; }
+    # and a real content change is still caught
+    printf 'export OOSH_CANARY_user="rewritten"\n' > "$fix/user.env"
+    private.test.suite.shared.verify probeFile >/dev/null 2>&1 && { echo "CONTENT-CHANGE-MISSED"; exit 1; }
+    echo "$RESULT"
+  ); rc=$?
+  rm -rf "$fix" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "${out:-the stamp is sensitive to something other than content}"
+  elif [ "${out#*user.env}" = "$out" ]; then
+    create.result 1 "the content change was reported without naming the file: [$out]"
+  else
+    create.result 0 "a new timestamp is not a write, a new byte is"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-MTIME: the fingerprint is content, not timestamps" \
+  test.test.suite.sharedCanaryIgnoresMtime
+expect 0 "a new timestamp is not a write, a new byte is" \
+  "a test user can restore a shared file's content but not its mtime — stamping mtime cascades"
+
+# --- T-SHARED-CANARY-RESTORES -----------------------------------------------
+test.test.suite.sharedCanaryRestores() {
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.restore.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  local out rc
+  out=$(
+    export TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run"
+    private.test.suite.shared.snapshot >/dev/null 2>&1 || { echo "SNAPSHOT-FAILED"; exit 1; }
+    printf 'export OOSH_CANARY_user="rewritten"\n' > "$fix/user.env"
+    rm -f "$fix/log.env"                       # a file DELETED by the offender
+    printf 'export X="1"\n' > "$fix/extra.env" # a file the snapshot never saw
+    private.test.suite.shared.restore >/dev/null 2>&1 || { echo "RESTORE-FAILED: $RESULT"; exit 1; }
+    # the tier must now verify clean against the stamp pinned before the damage
+    private.test.suite.shared.verify probeFile >/dev/null 2>&1 || { echo "STILL-DIRTY: $RESULT"; exit 1; }
+    cat "$fix/user.env"
+    [ -f "$fix/extra.env" ] || echo "COLLATERAL-REMOVAL"
+  ); rc=$?
+  rm -rf "$fix" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "${out:-restore did not put the tier back}"
+  elif [ "${out#*COLLATERAL}" != "$out" ]; then
+    create.result 1 "restore removed a file it never snapshotted"
+  elif [ "${out#*rewritten}" != "$out" ]; then
+    create.result 1 "the rewritten content survived the restore: [$out]"
+  elif [ "${out#*original}" = "$out" ]; then
+    create.result 1 "the original content did not come back: [$out]"
+  else
+    create.result 0 "the tier is put back, byte for byte, and nothing else is touched"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-RESTORES: the snapshot undoes the damage, including a deletion" \
+  test.test.suite.sharedCanaryRestores
+expect 0 "the tier is put back, byte for byte, and nothing else is touched" \
+  "the tier is site-wide — one bad test file must not leave it broken for every user on the box"
+
+# --- T-SHARED-CANARY-RUNNER -------------------------------------------------
+# End to end, through the real runner. The unit checks above prove the
+# primitives; only this proves the RUNNER calls them. A throwaway probe file is
+# created in $OOSH_DIR/test (the precedent is T-METHOD-NEW-DOCSTRING, which
+# created probeMethodNewScript in $OOSH_DIR) under a trap, so an interrupted
+# run cannot leave it in the suite's glob.
+test.test.suite.sharedCanaryRunner() {
+  local probe="$OOSH_DIR/test/test.sharedTierProbe"
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.runner.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  trap 'rm -f "'"$probe"'"; rm -rf "'"$fix"'"' RETURN
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'TEST_CATEGORY=core'
+    echo 'source this'
+    echo 'source test.suite'
+    # exactly the defect under test: a production write to the inherited tier
+    echo 'printf %s\\n "export OOSH_CANARY_oosh=\"probe\"" > "$CONFIG_PATH/oosh.env"'
+    echo 'expect.pass "the probe asserted something"'
+    echo 'test.suite.save.results'
+  } > "$probe"
+  chmod +x "$probe"
+
+  local out rc
+  # Capture first, strip colours second. A pipeline would hand back sed's exit
+  # status, not the runner's, and the runner's status is the whole assertion.
+  # TEST_SUITE_CONFIG_ORIGIN must be pinned alongside CONFIG_PATH. It is
+  # exported, so this nested runner would otherwise inherit THIS run's origin —
+  # the real ~/config — snapshot that instead of the fixture, find it untouched
+  # and report green while the probe merrily rewrote the fixture.
+  out=$(env CONFIG_PATH="$fix" CONFIG_FILE=user.env CONFIG="$fix/user.env" \
+            TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run" \
+            "$OOSH_DIR/test.suite" run sharedTierProbe 1 2>&1); rc=$?
+  out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
+  local after; after=$(cat "$fix/oosh.env" 2>/dev/null)
+
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "the runner stayed green while the probe rewrote the shared tier"
+  elif ! echo "$out" | grep -q 'SHARED CONFIG WRITTEN'; then
+    create.result 1 "the runner did not report the write: $(echo "$out" | tail -3 | tr '\n' '|')"
+  elif ! echo "$out" | grep -q 'test.sharedTierProbe'; then
+    create.result 1 "the report does not name the offending file"
+  elif ! echo "$out" | grep -q 'test.suite.config.isolate'; then
+    create.result 1 "the report does not say how to fix it"
+  elif [ "${after#*probe}" != "$after" ]; then
+    create.result 1 "the runner did not restore the tier: [$after]"
+  else
+    create.result 0 "the runner catches it, names it, says how to fix it, and restores the tier"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-RUNNER: end to end, the runner itself catches a file that writes the tier" \
+  test.test.suite.sharedCanaryRunner
+expect 0 "the runner catches it, names it, says how to fix it, and restores the tier" \
+  "the primitives being right proves nothing unless the runner actually calls them"
+
+# --- T-SHARED-CANARY-WAIVER -------------------------------------------------
+# Two core files cannot be isolated yet: test.completion.audit and test.config
+# both SOURCE `config`, whose config.start re-runs config.init, which does an
+# unconditional `export CONFIG_PATH=~/config` — the fixture is undone from
+# inside the file under test. That is T7's blocker, not a test defect. Such a
+# file declares TEST_SHARED_TIER_WRITER with the reason; the guard still
+# reports it and still restores the tier, but does not fail the run. A waiver
+# is a confession, not an exemption, and the count has to reach zero.
+test.test.suite.sharedCanaryWaiver() {
+  local probe="$OOSH_DIR/test/test.sharedTierWaived"
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.waived.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  trap 'rm -f "'"$probe"'"; rm -rf "'"$fix"'"' RETURN
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'TEST_CATEGORY=core'
+    echo 'TEST_SHARED_TIER_WRITER="blocked on T7: probe"'
+    echo 'source this'
+    echo 'source test.suite'
+    echo 'printf %s\\n "export OOSH_CANARY_oosh=\"probe\"" > "$CONFIG_PATH/oosh.env"'
+    echo 'expect.pass "the probe asserted something"'
+    echo 'test.suite.save.results'
+  } > "$probe"
+  chmod +x "$probe"
+
+  local out rc
+  out=$(env CONFIG_PATH="$fix" CONFIG_FILE=user.env CONFIG="$fix/user.env" \
+            TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run" \
+            "$OOSH_DIR/test.suite" run sharedTierWaived 1 2>&1); rc=$?
+  out=$(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g')
+  local after; after=$(cat "$fix/oosh.env" 2>/dev/null)
+
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "a declared writer still failed the run (rc=$rc)"
+  elif ! echo "$out" | grep -q 'SHARED CONFIG WRITTEN (known)'; then
+    create.result 1 "the write was not reported at all — a waiver must still confess"
+  elif ! echo "$out" | grep -q 'blocked on T7: probe'; then
+    create.result 1 "the report does not carry the declared reason"
+  elif [ "${after#*probe}" != "$after" ]; then
+    create.result 1 "a waived writer was not restored: [$after]"
+  else
+    create.result 0 "a declared writer is reported and restored, but does not fail the run"
+  fi
+  return $(result)
+}
+test.case $level "T-SHARED-CANARY-WAIVER: a declared known writer is reported and restored, not failed" \
+  test.test.suite.sharedCanaryWaiver
+expect 0 "a declared writer is reported and restored, but does not fail the run" \
+  "two core files cannot be isolated until T7 — the gate must stay meaningful without lying about them"
+
+# ============================================================================
+# T-VERDICT — the suite's pass/fail rule, as one testable decision
+# ============================================================================
+# The rule used to be a 20-line if/elif chain in the tail of
+# private.test.suite.run.filtered that nothing could reach. Extracted so the
+# two new failure causes — a written shared tier, and a core file that scored
+# nothing — can be proven to reach the return code, which is what the macOS
+# workflow and os platform.test gate on.
+#
+# The table is its own control: it contains both rc 0 and rc 1 rows, so a rule
+# that always passed or always failed cannot satisfy it.
+test.test.suite.verdictRule() {
+  local row want got fails=""
+  # sharedWrites noResults category expects passed metaFailures | wantRc
+  while read -r row; do
+    [ -z "$row" ] && continue
+    want="${row##*|}"; want="${want// /}"
+    set -- ${row%%|*}
+    private.test.suite.verdict "$1" "$2" "$3" "$4" "$5" "$6" >/dev/null 2>&1
+    got=$?
+    [ "$got" != "$want" ] && fails="$fails [${row%%|*}-> $got want $want]"
+  done <<'ROWS'
+0 0 core 10 10 -    | 0
+0 0 core 10 9 1     | 0
+0 0 core 10 9 -     | 1
+0 0 core 10 8 1     | 1
+0 0 core 0 0 -      | 1
+0 1 core 10 10 -    | 1
+0 1 extended 10 10 -| 0
+1 0 core 10 10 -    | 1
+1 0 extended 10 10 -| 1
+ROWS
+  if [ -n "$fails" ]; then
+    create.result 1 "verdict rule wrong for:$fails"
+  else
+    create.result 0 "the verdict rule holds on every row"
+  fi
+  return $(result)
+}
+test.case $level "T-VERDICT: a written tier fails any run; a score-less file fails core only" \
+  test.test.suite.verdictRule
+expect 0 "the verdict rule holds on every row" \
+  "these two causes never reached the return code, so CI stayed green through both"
+
+# ============================================================================
 # Final verification
 # ============================================================================
 
@@ -164,5 +559,213 @@ echo ""
 # ============================================================================
 # Test Summary
 # ============================================================================
+
+# ============================================================================
+# T-PORTABILITY-* : test.suite.portability.validate
+#
+# Sibling of test.path's T-PATH-VALIDATE-* and test.this's anchor tests, and
+# deliberately the same shape — plant a file in a throwaway git repo (`git
+# grep` only sees TRACKED files, so `git add` is required), read the verdict.
+#
+# The sweep exists because three separate faults on 2026-09-17 were GNU-only
+# constructs in TEST code that reported the code under test as broken while it
+# was fine. See the header comment on the function itself.
+# ============================================================================
+PORT_FIXTURE=$(test.suite.fixture.make test.test.suite.portability)
+git -c init.defaultBranch=main init "$PORT_FIXTURE" >/dev/null 2>&1
+
+private.test.suite.portability.plant() { # <file> <content...> # write + track <file>, echo the verdict
+  local name="$1"; shift
+  printf '%s\n' "$@" > "$PORT_FIXTURE/$name"
+  git -C "$PORT_FIXTURE" add "$name" >/dev/null 2>&1
+  # LOG_DEVICE is not always a tty (test.suite core redirects), so error.log
+  # lines can share this capture with the verdict — match on SUBSTRINGS.
+  test.suite.portability.validate "$PORT_FIXTURE" 2>/dev/null
+}
+private.test.suite.portability.clear() { # # drop every planted file
+  git -C "$PORT_FIXTURE" rm -q -f --ignore-unmatch '*' >/dev/null 2>&1
+  rm -f "$PORT_FIXTURE"/* 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-TREE: the shipped test tree conforms. THIS is the gate — the
+# one assertion that keeps the next `grep -q 'a\|b'` out of test/.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityTree() {
+  local out
+  out=$(test.suite.portability.validate "$OOSH_DIR/test" 2>/dev/null)
+  local rc=$?
+  case "$out" in
+    *"OK:"*"0 violations"*) [ "$rc" -eq 0 ] && create.result 0 "tree conforms" || create.result 1 "verdict OK but rc=$rc" ;;
+    *)                      create.result 1 "rc=$rc $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PORTABILITY-TREE: no test assumes GNU coreutils or a Linux filesystem" \
+  test.test.suite.portabilityTree
+expect 0 "tree conforms" "a GNU-only construct in a test blames the code under test, not itself"
+
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-REJECTS: the guard can actually fail. A guard that never fails
+# guards nothing.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityRejects() {
+  private.test.suite.portability.clear
+  local out
+  # portability-exception: the offending construct below is the FIXTURE — it is
+  # planted in a throwaway repo to prove the sweep can fail. A sweep that cannot
+  # contain its own counter-example cannot be tested at all.
+  out=$(private.test.suite.portability.plant offender '#!/usr/bin/env bash' \
+        "grep -q 'alpha\\|beta' \"\$file\"")
+  case "$out" in
+    *"INVALID:"*"1 violation"*) create.result 0 "BRE alternation rejected" ;;
+    *)                          create.result 1 "expected 1 violation, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PORTABILITY-REJECTS: a BRE \\| alternation is a violation" \
+  test.test.suite.portabilityRejects
+expect 0 "BRE alternation rejected" "BSD grep counts 0 for it and the test blames the wrong thing"
+
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-GREP-E: and it does NOT fire on the correct form. Under -E a
+# backslash-pipe is an escaped LITERAL pipe — three sites in test.config and
+# test.install use it deliberately, and the first draft of this sweep flagged
+# all of them.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityAcceptsGrepE() {
+  private.test.suite.portability.clear
+  local out
+  out=$(private.test.suite.portability.plant conforming '#!/usr/bin/env bash' \
+        "grep -qE 'alpha\\|beta' \"\$file\"")
+  case "$out" in
+    *"OK:"*"0 violations"*) create.result 0 "grep -E accepted" ;;
+    *)                      create.result 1 "expected 0 violations, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PORTABILITY-GREP-E: grep -E with an escaped literal pipe is not a violation" \
+  test.test.suite.portabilityAcceptsGrepE
+expect 0 "grep -E accepted" "the rule is about the BRE, not about the characters"
+
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-MARKER: a deliberate one can be declared, on the line or in the
+# few lines above it — the same affordance path.validate gives.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityHonoursMarker() {
+  private.test.suite.portability.clear
+  local out
+  out=$(private.test.suite.portability.plant declared '#!/usr/bin/env bash' \
+        '# portability-exception: fixture — this line is the point of the test' \
+        "grep -q 'alpha\\|beta' \"\$file\"")
+  case "$out" in
+    *"OK:"*"1 exception"*) create.result 0 "marker honoured" ;;
+    *)                     create.result 1 "expected 1 exception, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PORTABILITY-MARKER: an in-code # portability-exception: is honoured" \
+  test.test.suite.portabilityHonoursMarker
+expect 0 "marker honoured" "the marker may sit on the line or in the few lines above it"
+
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-PAIRED: a GNU form with its BSD fallback is the FIX, not the
+# fault — including when the pair is written across a continued line, which is
+# how all six real sites in the tree are written.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityAcceptsPair() {
+  private.test.suite.portability.clear
+  local out
+  out=$(private.test.suite.portability.plant paired '#!/usr/bin/env bash' \
+        'owner=$(stat -c %U "$f" 2>/dev/null \' \
+        '        || stat -f %Su "$f" 2>/dev/null)')
+  case "$out" in
+    *"OK:"*"0 violations"*) create.result 0 "paired fallback accepted" ;;
+    *)                      create.result 1 "expected 0 violations, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PORTABILITY-PAIRED: stat -c with a stat -f fallback on the next line is accepted" \
+  test.test.suite.portabilityAcceptsPair
+expect 0 "paired fallback accepted" "a continued line is one command and is judged as one"
+
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-ADVISORY: `mktemp` is LATENT, not wrong — 116 sites in the tree
+# today. It is counted and reported, and it does NOT fail the gate. If this
+# ever goes red the two severities have collapsed into one and the sweep
+# becomes unusable as a gate.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityAdvisoryIsNotFatal() {
+  private.test.suite.portability.clear
+  local out
+  out=$(private.test.suite.portability.plant latent '#!/usr/bin/env bash' \
+        'tmp=$(mktemp -d)')
+  local rc=$?
+  case "$out" in
+    *"OK:"*"1 advisory"*"0 violations"*) [ "$rc" -eq 0 ] && create.result 0 "advisory reported, gate open" || create.result 1 "verdict OK but rc=$rc" ;;
+    *)                                   create.result 1 "expected 1 advisory and 0 violations, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PORTABILITY-ADVISORY: a raw mktemp is reported but does not fail the gate" \
+  test.test.suite.portabilityAdvisoryIsNotFatal
+expect 0 "advisory reported, gate open" "the latent mktemp sites must not make the gate permanently red"
+
+private.test.suite.portability.clear
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-BLIND: a sweep that can read NOTHING must not report OK.
+# `git grep` sees tracked files only, and returns empty both for a clean tree
+# and for a tree it cannot read at all — an unpacked tarball, or the "dubious
+# ownership" refusal that fires when root sweeps an oosh-user checkout, which
+# is the shape `os platform.test` runs in. Silence is not a pass.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityRefusesBlind() {
+  local blind out rc
+  blind=$(test.suite.fixture.make test.test.suite.portability.blind)
+  : > "$blind/untracked"          # a file, but no repository
+  out=$(test.suite.portability.validate "$blind" 2>/dev/null); rc=$?
+  rm -rf "$blind"
+  case "$out" in
+    *"INVALID:"*"no tracked files visible"*) [ "$rc" -ne 0 ] && create.result 0 "blind sweep refused" || create.result 1 "verdict INVALID but rc=$rc" ;;
+    *)                                       create.result 1 "expected a refusal, got rc=$rc $out" ;;
+  esac
+  return $(result)
+}
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-ADVISORY-STRING: a construct NAMED in a message is not a USE of
+# it. `|| { create.result 1 "mktemp failed"; ... }` is the commonest line in the
+# tree containing the word, at 57 occurrences, and it runs nothing.
+#
+# This is the same false-positive class that `sed -i` was given a
+# command-position anchor for when the sweep was written — and the mktemp rule
+# was left as a bare pattern, so it over-counted its own advisory tally by 43%
+# (119 reported, 83 real). A validator that reports faults which are not there
+# is doing a mild version of the exact thing this whole sweep exists to stop.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityIgnoresNamedConstruct() {
+  private.test.suite.portability.clear
+  local out
+  out=$(private.test.suite.portability.plant named '#!/usr/bin/env bash' \
+        'fixture=$(private.make.dir) \' \
+        '  || { create.result 1 "mktemp failed"; return $(result); }')
+  case "$out" in
+    *"OK:"*"0 advisory"*) create.result 0 "named construct ignored" ;;
+    *)                    create.result 1 "expected 0 advisories, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-PORTABILITY-ADVISORY-STRING: mktemp named in a message is not a use of mktemp" \
+  test.test.suite.portabilityIgnoresNamedConstruct
+expect 0 "named construct ignored" "a sweep that reports faults which are not there is the fault it exists to stop"
+
+private.test.suite.portability.clear
+test.case $level "T-PORTABILITY-BLIND: a tree git cannot read is a failure, not a clean result" \
+  test.test.suite.portabilityRefusesBlind
+expect 0 "blind sweep refused" "an empty git grep looks exactly like a conforming tree"
+
+private.test.suite.portability.clear
+rm -rf "$PORT_FIXTURE"
+
+### test.method
 
 test.suite.save.results

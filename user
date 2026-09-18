@@ -5,6 +5,123 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+user.ssh.backup.status()     # <?home:$HOME> # reports legacy ssh.* backup directories left in <home> by the old cwd-relative backup; rc 1 if any are found #
+{
+  # REPORT BEFORE DESTROY, the shape `path validate` and `this anchor.validate`
+  # use: echo the verdict so it survives any LOG_LEVEL, rc 1 on findings, and
+  # leave the acting to a separate verb.
+  #
+  # The artefacts this finds are what `cp -R $sshDir ssh.$name` left behind
+  # when it ran with the operator's cwd rather than $HOME: `ssh.original` and
+  # `ssh.<user>.<host>.for.<host>`. On the dev box they are root-owned and
+  # mode 0700, so this must work WITHOUT being able to read them — `[ -d ]`
+  # on the path succeeds because the parent directory belongs to the user.
+  #
+  # $HOME/.ssh.backups (the new archive root) and $HOME/.ssh/ids/ssh.* (which
+  # osshLayout owns, same prefix, different meaning) are never touched: the
+  # glob is $home/ssh.* — no leading dot, and one level deep.
+  local home="${1:-$HOME}"
+  [ -n "$1" ] && shift
+
+  if [ ! -d "$home" ]; then
+    error.log "user.ssh.backup.status: no such directory: $home"
+    echo "INVALID: no such directory: $home"
+    create.result 2 "no such directory: $home" "$1"
+    return $(result)
+  fi
+
+  local found="" entry count=0
+  for entry in "$home"/ssh.*; do
+    [ -e "$entry" ] || continue
+    [ -d "$entry" ] || continue
+    found="${found}${entry}	owner=$(private.user.path.owner.get "$entry")
+"
+    count=$((count + 1))
+  done
+
+  if [ "$count" -eq 0 ]; then
+    echo "OK: no legacy ssh.* backup directories in $home"
+    create.result 0 "0 legacy artefact(s)" "$1"
+    return $(result)
+  fi
+
+  error.log "user.ssh.backup.status: $count legacy ssh.* director(ies) in $home — these are pre-item-6 backups written relative to the operator's cwd. Move them with 'user ssh.backup.migrate'"
+  printf '%s' "$found"
+  echo "INVALID: $count legacy ssh.* backup director(ies) in $home"
+  create.result 1 "$count legacy artefact(s)" "$1"
+  return $(result)
+}
+
+private.user.path.owner.get() # <path> # the owning user of <path>, or "?" when it cannot be read; answers on stdout
+{
+  # NO create.result — a getter consumed as $(...) runs in a subshell, so
+  # RESULT would never reach the caller. `stat` differs between GNU and BSD,
+  # so try both rather than dispatching on $OOSH_OS for one field.
+  stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null || echo "?"
+}
+
+
+user.ssh.backup.status.completion.home() { echo "$HOME"; }
+user.ssh.backup.migrate()     # <?home:$HOME> # moves the legacy ssh.* backup directories in <home> under <home>/.ssh.backups/legacy/ #
+{
+  # The acting half of user.ssh.backup.status. It MOVES rather than deletes:
+  # these directories hold private keys, and nothing in this ticket has the
+  # standing to destroy them. Once they are under .ssh.backups/legacy/ the
+  # user can look at them and decide.
+  #
+  # It refuses rather than half-moving. On the dev box the artefacts are
+  # root-owned, and a `mv` of a root-owned directory succeeds only because the
+  # PARENT belongs to the user — which is true in a home directory and false
+  # in general, so the failure path has to be real and has to name $SUDO.
+  local home="${1:-$HOME}"
+  [ -n "$1" ] && shift
+
+  if [ ! -d "$home" ]; then
+    error.log "user.ssh.backup.migrate: no such directory: $home"
+    create.result 2 "no such directory: $home" "$1"
+    return $(result)
+  fi
+
+  local legacy="$home/.ssh.backups/legacy"
+  local entry moved=0 failed=0
+  for entry in "$home"/ssh.*; do
+    [ -e "$entry" ] || continue
+    [ -d "$entry" ] || continue
+    if ! mkdir -p "$legacy"; then
+      error.log "user.ssh.backup.migrate: cannot create $legacy"
+      create.result 3 "cannot create $legacy" "$1"
+      return $(result)
+    fi
+    chmod 700 "$home/.ssh.backups" "$legacy" 2>/dev/null
+    local target="$legacy/$(basename "$entry")"
+    if [ -e "$target" ]; then
+      error.log "user.ssh.backup.migrate: $target already exists — not overwriting"
+      failed=$((failed + 1))
+      continue
+    fi
+    if mv "$entry" "$target"; then
+      console.log "moved $entry -> $target"
+      moved=$((moved + 1))
+    else
+      error.log "user.ssh.backup.migrate: could not move $entry — it is probably owned by another user; re-run as: \$SUDO user ssh.backup.migrate $home"
+      failed=$((failed + 1))
+    fi
+  done
+
+  if [ "$failed" -gt 0 ]; then
+    echo "INCOMPLETE: moved $moved, failed $failed"
+    create.result 1 "moved $moved, failed $failed" "$1"
+    return $(result)
+  fi
+  echo "OK: moved $moved legacy ssh.* director(ies) to $legacy"
+  create.result 0 "migrated" "$1"
+  return $(result)
+}
+
+
+user.ssh.backup.migrate.completion.home() { echo "$HOME"; }
+### new.method
+
 # SSH ControlMaster socket path (must match ossh)
 : ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
 
@@ -129,7 +246,13 @@ user.ssh.rootkey.push() {
 
   "$OOSH_DIR/ossh" connection.open "$sshConfigName"
   rsync -avz --mkpath -e "ssh -o ControlPath=$OSSH_CONTROL_PATH" "$sshDir/public_keys/$sshKeyName.public_key" "$sshConfigName:/root/.ssh/public_keys/"
-  ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" ". /root/config/user.env; user authorized.keys.update"
+  # path-exception: the sanctioned degrade branch. docs/boot.md, Cross-branch note.
+  # Source boot if present, else fall back to ~/oosh on PATH (boot is absent on
+  # non-dev branches). Check the ssh rc — a silent failure here means the key is
+  # pushed but never authorised.
+  ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; user authorized.keys.update"
+  local _rc=$?
+  [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.push: authorize failed on $sshConfigName (ssh rc=$_rc) — key may be pushed but NOT authorised"
 }
 
 user.ssh.rootkey.file.push() {
@@ -147,7 +270,11 @@ user.ssh.rootkey.file.push() {
     shift
     "$OOSH_DIR/ossh" connection.open "$sshConfigName"
     rsync -avz --mkpath -e "ssh -o ControlPath=$OSSH_CONTROL_PATH" "$sshPublicKeyFile" "$sshConfigName:/root/.ssh/public_keys/"
-    ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" ". /root/config/user.env; user authorized.keys.update"
+    # path-exception: the sanctioned degrade branch. docs/boot.md.
+    # boot-or-PATH fallback + rc check (see user.ssh.rootkey.push)
+    ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; user authorized.keys.update"
+    local _rc=$?
+    [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.file.push: authorize failed on $sshConfigName (ssh rc=$_rc) — key may be pushed but NOT authorised"
   else
     error.log "no public key file provided as second parameter"
   fi
@@ -168,7 +295,11 @@ user.ssh.rootkey.file.revoke() {
   local sshPublicKeyFile="$1"
   if [ -n "$sshPublicKeyFile" ]; then
     shift
-    ssh -o ControlPath="$OSSH_CONTROL_PATH" $sshConfigName ". /root/config/user.env; mv  /root/.ssh/public_keys/$(basename $sshPublicKeyFile)  /root/.ssh/deactive.public_keys/$(basename $sshPublicKeyFile);    user authorized.keys.update"
+    # boot-or-PATH fallback + rc check (see user.ssh.rootkey.push)
+    # path-exception: the sanctioned degrade branch. docs/boot.md.
+    ssh -o ControlPath="$OSSH_CONTROL_PATH" $sshConfigName "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; mv  /root/.ssh/public_keys/$(basename $sshPublicKeyFile)  /root/.ssh/deactive.public_keys/$(basename $sshPublicKeyFile);    user authorized.keys.update"
+    local _rc=$?
+    [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.file.revoke: revoke/authorize failed on $sshConfigName (ssh rc=$_rc)"
   else
     error.log "no public key file provided as second parameter"
   fi
@@ -191,7 +322,7 @@ user.ssh.rootkey.pull() {
 
   "$OOSH_DIR/ossh" connection.open "$sshConfigName"
   rsync -avz -e "ssh -o ControlPath=$OSSH_CONTROL_PATH" "$sshConfigName:/root/.ssh/id_rsa.pub" "./root.$sshConfigName.public_key"
-  #ssh $sshConfigName ". /root/config/user.env; user authorized.keys.update"
+  #ssh $sshConfigName ". /root/oosh/boot; user authorized.keys.update"
 }
 
 user.ssh.rootkey.push.completion() {
@@ -569,7 +700,30 @@ user.create()  # <username> <?password> <?uid> <?gid> # creates a new user with 
     local _shell=/bin/bash
     [ -x /opt/homebrew/bin/bash ] && _shell=/opt/homebrew/bin/bash   # Apple Silicon
     [ -x /usr/local/bin/bash ] && _shell=/usr/local/bin/bash         # Intel Mac
-    if ! $SUDO sysadminctl -addUser "$name" -password "$password" -shell "$_shell"; then
+    if $SUDO sysadminctl -addUser "$name" -password "$password" -shell "$_shell"; then
+      # An EMPTY password means "no usable credential" — `password ""` is the
+      # documented way to opt out (see the default-password comment above). The
+      # Linux branch gets that for free: useradd leaves /etc/shadow locked and
+      # the `user.password.set` below is skipped, so the account exists and
+      # cannot authenticate.
+      #
+      # macOS does NOT. Measured on a Sequoia VM, 2026-09-17:
+      # `sysadminctl -addUser X -password ""` SUCCEEDS and attaches
+      #     AuthenticationAuthority: ;ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2,…>
+      # and so does omitting -password altogether. The result is an account that
+      # authenticates with an EMPTY PASSWORD — weaker than the Linux outcome,
+      # not equivalent to it, and the opposite of what the caller asked for.
+      #
+      # Deleting AuthenticationAuthority is the macOS analogue of the `!` that
+      # useradd leaves in /etc/shadow: the account and its home stay, the
+      # credential does not. Guarded on an empty password, so every caller that
+      # asks for a real one — `user create developking` (oo:2059, which defaults
+      # to the username) and `user create oosh-user password oosh-user`
+      # (os:285) — reaches none of this.
+      if [ -z "$password" ]; then
+        $SUDO dscl . -delete "/Users/$name" AuthenticationAuthority >/dev/null 2>&1
+      fi
+    else
       error.log "user.create: sysadminctl failed to create '$name' — user likely rejected by password policy or already exists. Aborting."
       return 1
     fi
@@ -889,8 +1043,8 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
     [ -f ~/.bashrc ] && [ ! -f ~/.bashrc.pre-oosh ] && cp ~/.bashrc ~/.bashrc.pre-oosh
     if [ -f ~/oosh/templates/user/bashrcTemplate ]; then
       cp ~/oosh/templates/user/bashrcTemplate ~/.bashrc
-    elif ! grep -q 'config/user.env' ~/.bashrc 2>/dev/null; then
-      printf '\n# oosh environment\n[ -f ~/config/user.env ] && source ~/config/user.env\n' >> ~/.bashrc
+    elif ! grep -q 'oosh/boot' ~/.bashrc 2>/dev/null; then
+      printf '\n# oosh environment\n[ -f ~/oosh/boot ] && source ~/oosh/boot\n' >> ~/.bashrc
     fi
     [ ! -f ~/.bash_profile ] && echo '[ -f ~/.bashrc ] && source ~/.bashrc' > ~/.bash_profile
   "
@@ -936,6 +1090,14 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
     unset CONFIG CONFIG_PATH CONFIG_FILE
     cd \"\$HOME\" 2>/dev/null
     source '$sharedOosh/this' >/dev/null 2>&1 || exit 1
+    # Guarantee OOSH_DIR is on PATH: sourcing 'this' only prepends it when
+    # OOSH_DIR was UNSET, but private.as.user (runuser) leaks the caller's
+    # already-set OOSH_DIR through, so the guard is skipped and 'user'/'ossh'
+    # (and ossh's own 'source this') would be command-not-found. Prepend
+    # explicitly — idempotent, mirrors what \$OOSH_DIR/boot does at shell init.
+    # path-exception: inside a `$SUDO bash -c` string run AS ANOTHER USER
+    # before their login shell exists; boot has not run there.
+    export PATH=\"$sharedOosh:$sharedOosh/ng:\$PATH\"
     user init
   " || warn.log "user.oosh.install: 'user init' for $username did not complete cleanly — WODA aliases may be missing from $targetHome/.ssh/config"
 
@@ -961,6 +1123,8 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   local _ownerEmail
   _ownerEmail=$(private.as.user "$username" git config user.email 2>/dev/null) || true
   [ -z "$_ownerEmail" ] && _ownerEmail="${username}@$(hostname)"
+  # oosh-dir-exception: installs ANOTHER user before their ~/oosh symlink exists
+  # path-exception: same string, same reason — boot is unreachable there.
   $SUDO bash -c "
     export OOSH_DIR='$sharedOosh'
     export PATH=\"\$OOSH_DIR:\$PATH\"
@@ -999,7 +1163,13 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
 
 user.oosh.install.completion.username() { user.list; }
 user.oosh.install.completion.branch() {
-  [ -n "$OOSH_DIR" ] && ls "$(dirname "$OOSH_DIR")" 2>/dev/null
+  # OOSH_DIR is the ~/oosh symlink (docs/boot.md), so `dirname` on it yields
+  # $HOME. Resolve to the physical worktree first, then list its siblings.
+  # private.this.path.canonical is a pure echo — safe inside a completion
+  # function, unlike anything that calls create.result.
+  local wtBase
+  wtBase=$(dirname "$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")")
+  [ -d "$wtBase" ] && ls "$wtBase" 2>/dev/null
 }
 
 private.user.oosh.install.shell.darwin() # <username> <targetHome> # ensures bash is the login shell on macOS via dscl (chsh silently fails for sysadminctl/OD-managed users)
@@ -1236,41 +1406,174 @@ private.user.check.group() # <groupName> # checks if a group exists
   fi
 }
 
-user.ssh.backup() {
-  local name="$1"
-  if [ -z "$name" ]; then
-    name="bak"
-  fi
-  if [ -n "$1" ]; then
-    shift
-  fi
-
+user.ssh.backup() # <?label:manual> <?sshDir:~/.ssh> # archives <sshDir> into $HOME/.ssh.backups/ under a UTC-timestamped name; never writes to the current directory
+{
+  # $HOME-ANCHORED, and that anchor IS the fix. The old body was
+  # `cp -R $sshDir ssh.$name` — a CWD-RELATIVE destination — while both of its
+  # callers guarded on the ABSOLUTE `$HOME/ssh.<name>`. Three consequences,
+  # all of them observed:
+  #   - the guard could never become true, so the backup ran on EVERY install;
+  #   - `cp -R src dst` copies INTO an existing dst, so every re-run nested one
+  #     level deeper — ssh.X/.ssh/.ssh/…, each layer a full copy of the keys;
+  #   - it landed wherever the operator happened to be. Three root-owned 0700
+  #     copies of ROOT's ~/.ssh are sitting in a normal user's home on the dev
+  #     box for exactly that reason.
+  # During a root install $HOME is /root, so the keys now land in root's own
+  # home whatever directory the installer was started from.
+  #
+  # Timestamped, so the name cannot collide and therefore cannot nest, and no
+  # caller needs a guard any more. A DIRECTORY, not a tarball: there is no
+  # `tar` anywhere in the tracked tree, and the install path is the wrong
+  # place to introduce a new cross-platform dependency for this.
+  local label="${1:-manual}"
+  [ -n "$1" ] && shift
   private.user.get.sshDir "$1"
-  if [ -n "$1" ]; then
-    shift
-  fi
+  [ -n "$1" ] && shift
   local sshDir="$RESULT"
 
-  cp -R $sshDir ssh.$name 
+  # A label reaches this from a call site, so it must not be able to escape
+  # the archive root.
+  label="$( printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '-' )"
+
+  if [ ! -d "$sshDir" ]; then
+    error.log "user.ssh.backup: nothing to archive — $sshDir does not exist"
+    create.result 1 "no such directory: $sshDir" "$1"
+    return $(result)
+  fi
+
+  local root="$HOME/.ssh.backups"
+  if ! mkdir -p "$root"; then
+    error.log "user.ssh.backup: cannot create $root"
+    create.result 2 "cannot create $root" "$1"
+    return $(result)
+  fi
+  chmod 700 "$root" 2>/dev/null
+
+  local stamp archive
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  archive="$root/$stamp-$label"
+  # Two archives inside the same second are possible during install, where two
+  # labels fire close together. Never overwrite one.
+  local n=1
+  while [ -e "$archive" ]; do
+    archive="$root/$stamp-$label.$n"
+    n=$((n + 1))
+  done
+
+  # `cp -R "$src/." "$dst/"` — the idiom osshLayout:220 already uses. Copying
+  # the CONTENTS into a directory we created ourselves is what makes nesting
+  # impossible even if the name ever did repeat.
+  if ! mkdir -p "$archive" || ! cp -R "$sshDir/." "$archive/"; then
+    error.log "user.ssh.backup: could not archive $sshDir to $archive"
+    create.result 3 "could not archive $sshDir" "$1"
+    return $(result)
+  fi
+  chmod 700 "$archive" 2>/dev/null
+
+  # echo, not console.log: a path the caller may need survives any LOG_LEVEL.
+  echo "$archive"
+  create.result 0 "$archive" "$1"
+  return $(result)
+}
+user.ssh.backup.completion.label() {
+  # The labels the install path uses, plus the interactive default.
+  echo "manual"
+  echo "pre-install"
+  echo "pre-user-init"
+  echo "pre-restore"
 }
 
-user.ssh.restore() {
-  local name="$1"
-  if [ -z "$name" ]; then
-    name="bak"
-  fi
-  if [ -n "$1" ]; then
-    shift
-  fi
-
+user.ssh.restore() # <?archive:latest> <?sshDir:~/.ssh> # restores an archive from $HOME/.ssh.backups over <sshDir>; archives the current <sshDir> first and swaps only after the copy succeeded
+{
+  # THE OLD BODY WAS `rm -Rf $sshDir` FOLLOWED BY a cwd-relative
+  # `cp -R ssh.$name $sshDir`. Run from the wrong directory it destroyed
+  # ~/.ssh and then failed to replace it. It has never had a caller anywhere
+  # in the tree, which is the only reason that never happened to anyone.
+  #
+  # Now: resolve first, stage second, and only then swap. Every failure path
+  # returns with <sshDir> untouched.
+  local wanted="${1:-latest}"
+  [ -n "$1" ] && shift
   private.user.get.sshDir "$1"
-  if [ -n "$1" ]; then
-    shift
-  fi
+  [ -n "$1" ] && shift
   local sshDir="$RESULT"
 
-  rm -Rf $sshDir 
-  cp -R ssh.$name $sshDir 
+  local root="$HOME/.ssh.backups"
+  local archive=""
+  if [ "$wanted" = "latest" ]; then
+    # Names start with a UTC timestamp, so lexical order IS chronological.
+    archive="$( ls -1d "$root"/*/ 2>/dev/null | sed 's:/$::' | tail -1 )"
+  else
+    case "$wanted" in
+      /*) archive="$wanted" ;;
+      *)  archive="$root/$wanted" ;;
+    esac
+  fi
+
+  if [ -z "$archive" ] || [ ! -d "$archive" ]; then
+    error.log "user.ssh.restore: no such archive: ${archive:-<none under $root>} — $sshDir is untouched"
+    create.result 1 "no such archive: ${archive:-none}" "$1"
+    return $(result)
+  fi
+
+  # Stage NEXT TO the target, so the swap is a rename on the same filesystem
+  # rather than a second copy.
+  local staging="$sshDir.restoring.$$"
+  rm -rf "$staging" 2>/dev/null
+  if ! mkdir -p "$staging" || ! cp -R "$archive/." "$staging/"; then
+    rm -rf "$staging" 2>/dev/null
+    error.log "user.ssh.restore: could not stage $archive — $sshDir is untouched"
+    create.result 2 "could not stage $archive" "$1"
+    return $(result)
+  fi
+
+  # Only now is anything at risk, and the thing being replaced is archived
+  # before it goes.
+  if [ -d "$sshDir" ]; then
+    user.ssh.backup pre-restore "$sshDir" >/dev/null || {
+      rm -rf "$staging" 2>/dev/null
+      error.log "user.ssh.restore: refusing to swap — could not archive the current $sshDir first"
+      create.result 3 "could not archive current $sshDir" "$1"
+      return $(result)
+    }
+    rm -rf "$sshDir"
+  fi
+  if ! mv "$staging" "$sshDir"; then
+    error.log "user.ssh.restore: the swap failed; the staged copy is at $staging"
+    create.result 4 "swap failed, staged copy at $staging" "$1"
+    return $(result)
+  fi
+  chmod 700 "$sshDir" 2>/dev/null
+
+  echo "$sshDir restored from $archive"
+  create.result 0 "restored from $archive" "$1"
+  return $(result)
+}
+user.ssh.restore.completion.archive() {
+  # NO create.result in a completion function — it corrupts c2.
+  echo "latest"
+  ls -1d "$HOME/.ssh.backups"/*/ 2>/dev/null | sed 's:/$::' | xargs -r -n1 basename
+}
+
+user.ssh.backup.list() # # lists the ssh archives under $HOME/.ssh.backups, oldest first
+{
+  local root="$HOME/.ssh.backups"
+  if [ ! -d "$root" ]; then
+    echo "no archives: $root does not exist"
+    create.result 0 "no archives" "$1"
+    return $(result)
+  fi
+  local found
+  found="$( ls -1d "$root"/*/ 2>/dev/null | sed 's:/$::' )"
+  if [ -z "$found" ]; then
+    echo "no archives under $root"
+    create.result 0 "no archives" "$1"
+    return $(result)
+  fi
+  # echo, not console.log: this method exists to be READ.
+  printf '%s\n' "$found"
+  create.result 0 "$( printf '%s\n' "$found" | grep -c . ) archive(s)" "$1"
+  return $(result)
 }
 
 user.usage()
@@ -1300,8 +1603,11 @@ $0
       ssh.get.key.name      
       ssh.get.file.name       <?sshDir:\"~/.ssh\">
 
-      ssh.backup              <newName> <?sshDir:\"~/.ssh\"> will result in a ssh.newName folder
-      ssh.restore             <newName> <?sshDir:\"~/.ssh\"> CAREFULL!!! ssh.newName in sshDir and if not present overwites the current .ssh folder
+      ssh.backup              <?label:manual> <?sshDir:\"~/.ssh\"> archives sshDir to ~/.ssh.backups/<timestamp>-<label>/
+      ssh.backup.list         lists the archives under ~/.ssh.backups
+      ssh.backup.status       <?home:\"$HOME\"> reports legacy ssh.* backup dirs left by the pre-item-6 code; rc 1 if any
+      ssh.backup.migrate      <?home:\"$HOME\"> moves those under ~/.ssh.backups/legacy/ (moves, never deletes)
+      ssh.restore             <?archive:latest> <?sshDir:\"~/.ssh\"> restores an archive; archives the current sshDir first
 
       ssh.rootkey.file.revoke <sshConfigName> <publicKeyFile>      revokes access for the public key file
       ssh.rootkey.file.push   <sshConfigName> <publicKeyFile>      pushes the public key file        to the root of the specified ssh server and makes it authorized
