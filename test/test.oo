@@ -3199,10 +3199,23 @@ test.oo.cmd.fixture() { # <stubDir> # a fake package manager that records every 
   chmod +x "$1/fakepm"
 }
 
+test.oo.cmd.fixture.apt() { # <stubDir> # a fake apt-get that records its ARGV *and* the debconf-relevant env
+  # Named apt-get on purpose, so `case "$OOSH_PM" in apt-get*)` inside oo.cmd
+  # actually fires — the fakepm stub the other T-CMD cases pin deliberately
+  # does not match it, which is why this needs its own stub rather than a
+  # tweak to test.oo.cmd.fixture (six cases depend on that one unchanged).
+  printf '%s\n' '#!/bin/sh' \
+    'echo "argv=$*" >> "$PM_LOG"' \
+    'echo "DEBIAN_FRONTEND=[${DEBIAN_FRONTEND-unset}]" >> "$PM_LOG"' \
+    'exit ${PM_RC:-0}' > "$1/apt-get"
+  chmod +x "$1/apt-get"
+}
+
 test.oo.cmd.run() { # <stubDir> <pmRc> <noPm> <args...> # run oo.cmd in a pinned child; echo "rc|RESULT"
   local stub="$1" pmRc="$2" noPm="$3"; shift 3
   local pmPin='OOSH_PM="fakepm install"'
   [ "$noPm" = "noPm" ] && pmPin='OOSH_PM=""; oo.pm.discover() { :; }'
+  [ "$noPm" = "aptPm" ] && pmPin='OOSH_PM="apt-get -y install"'
   # TEST_OO_CMD_OVERRIDE, when set, is spliced in AFTER the real oo is sourced.
   # The negative controls below use it to plant the ORIGINAL defect as an
   # oo.cmd override and prove the test function above catches it.
@@ -3341,6 +3354,41 @@ test.case $level "T-CMD-TWO-ARG: oo.cmd <cmd> <packageName> installs the PACKAGE
 expect 0 "the package name reaches the package manager" \
   "the second argument was shifted away and lost — ossh:1933 installs nothing today"
 
+# --- T-CMD-APT-NONINTERACTIVE -----------------------------------------------
+# `oo cmd vim` on a naked ubuntu:24.04 hung forever: apt pulled tzdata, and
+# tzdata's debconf postinst blocked in anon_pipe_read waiting for an answer to
+# "Geographic area:" that no unattended installer can give. The install wedged
+# with no output after "no vim", and a 5-minute watcher timed out rather than
+# ever seeing the end banner.
+#
+# `-y` does not cover this — -y answers apt's own prompt, debconf is a separate
+# questioner inside the maintainer script. And the variable has to cross the
+# sudo boundary via `env`: $SUDO is "sudo ", and sudo's env_reset drops a plain
+# shell-assignment prefix, so `DEBIAN_FRONTEND=x $SUDO apt-get …` would never
+# reach apt at all.
+test.oo.cmdAptNonInteractive() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.apt.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.oo.cmd.fixture.apt "$stub"
+  test.oo.cmd.run "$stub" 0 aptPm ooshNoSuchTool ooshNoSuchPackage >/dev/null
+  local calls=""; [ -f "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
+  rm -rf "$stub" 2>/dev/null
+  if [ -z "$calls" ]; then
+    create.result 1 "the apt-get stub was never invoked — the guard or the stub PATH is wrong"
+  elif [ "${calls#*DEBIAN_FRONTEND=\[noninteractive\]}" = "$calls" ]; then
+    create.result 1 "DEBIAN_FRONTEND did not reach apt — tzdata will hang the install: [$calls]"
+  elif [ "${calls#*ooshNoSuchPackage}" = "$calls" ]; then
+    create.result 1 "the env prefix swallowed the package name: [$calls]"
+  else
+    create.result 0 "an apt-like PM is invoked non-interactively, with the package intact"
+  fi
+  return $(result)
+}
+test.case $level "T-CMD-APT-NONINTERACTIVE: apt-like package managers are invoked with DEBIAN_FRONTEND set" \
+  test.oo.cmdAptNonInteractive
+expect 0 "an apt-like PM is invoked non-interactively, with the package intact" \
+  "oo cmd vim wedged forever on tzdata's 'Geographic area' prompt in a naked ubuntu:24.04"
+
 # --- T-CMD-DEAD-BRANCH ------------------------------------------------------
 test.oo.cmdDeadBranch() {
   local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.cmd.dead.XXXXXX") \
@@ -3389,6 +3437,10 @@ test.oo.cmd.control "T-CMD-CONTROL-TWO-ARG: the double shift that lost the packa
 test.oo.cmd.control "T-CMD-CONTROL-DEAD-BRANCH: calling an undefined installer and reporting success is caught" \
   'oo.cmd() { once.su.mkcert.install; create.result 0 "ok"; return $(result); }' \
   test.oo.cmdDeadBranch "a branch whose installer does not exist reported success"
+
+test.oo.cmd.control "T-CMD-CONTROL-APT-INTERACTIVE: the bare \$SUDO \$OOSH_PM call that hung on tzdata is caught" \
+  'oo.cmd() { $SUDO $OOSH_PM "$2"; create.result 0 "ok"; return $(result); }' \
+  test.oo.cmdAptNonInteractive "DEBIAN_FRONTEND did not reach apt"
 
 # ============================================================================
 # T-METHOD-* — `oo method.new` actually produces a usable method
