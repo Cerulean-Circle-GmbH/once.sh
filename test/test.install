@@ -78,19 +78,21 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
-# T-INIT-SIZE-CAP: init/oosh stays bounded — ≤ 700 lines.
-# History: was ~650 (fat), shrunk to ~350 (thin), now ~600 (self-installing
+# T-INIT-SIZE-CAP: init/oosh stays bounded — ≤ 720 lines.
+# History: was ~650 (fat), shrunk to ~350 (thin), then ~600 (self-installing
 # again — POSIX prelude in Phase A handles platform deps so ossh.prereqs.install
-# becomes a thin SCP-and-run wrapper). The 700-line cap is a soft anti-bloat
-# guard, not a thin-bootstrap target.
+# becomes a thin SCP-and-run wrapper), now ~700: the userEnvSeed block below
+# adds the ~/config/user.env head the first login shell boots from, which `boot`
+# used to supply. Raised 700 → 720 for it, deliberately leaving little headroom.
+# It is a soft anti-bloat guard, not a thin-bootstrap target.
 # ─────────────────────────────────────────────────────────────────────────
-test.case $level "T-INIT-SIZE-CAP: init/oosh is bounded (≤ 700 lines)" \
+test.case $level "T-INIT-SIZE-CAP: init/oosh is bounded (≤ 720 lines)" \
   echo "(wc -l)"
 lines=$(wc -l < "$INIT_SCRIPT")
-if [ "$lines" -le 700 ]; then
-  expect.pass "init/oosh is $lines lines (cap 700; POSIX prelude + bash phase)"
+if [ "$lines" -le 720 ]; then
+  expect.pass "init/oosh is $lines lines (cap 720; POSIX prelude + bash phase + userEnvSeed)"
 else
-  expect.fail "init/oosh is $lines lines — over the 700-line anti-bloat cap"
+  expect.fail "init/oosh is $lines lines — over the 720-line anti-bloat cap"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -802,5 +804,76 @@ test.case $level "T-INIT-CLEAN-ENV-PASSTHROUGH: TERM is carried, and defaults to
   test.install.cleanEnvTermDefault
 expect 0 "TERM carried when set, defaulted to dumb when not" \
   "an empty TERM is worse than an absent one — bash defaults unset to dumb, tput rejects empty"
+
+
+# ============================================================================
+# T-INIT-SEEDS-USER-ENV: init/oosh seeds ~/config/user.env after the clone
+# ============================================================================
+# ~/config/user.env IS the boot — every later shell sources it for its anchors
+# and PATH. Install state 31's `config save` writes it, but the FIRST login
+# shell after a fresh install happens before that. So init/oosh writes the same
+# head itself, once, between BEGIN/END userEnvSeed markers. POSIX sh cannot
+# call private.config.anchor.lines.get, so the block is a deliberate duplicate
+# — the same pattern as the $HOME recovery block (T-HOME-RECOVERY-NSS). This
+# case runs the duplicate and diffs it against the emitter so they cannot drift.
+# `config` runs `config.start "$@"` at source time, and config.start re-exports
+# CONFIG_PATH to the shared ~/config whenever $CONFIG is not a file. So the
+# emitter is reached in a SUBSHELL with no positional arguments rather than
+# sourced into this file, which dispatches `config` as a command elsewhere.
+test.install.anchorLinesGet() {
+  OOSH_SEED_BASH_FILE="$1" bash -c \
+    'source "$OOSH_DIR/config" >/dev/null 2>&1; private.config.anchor.lines.get "$OOSH_SEED_BASH_FILE"'
+}
+
+test.install.initSeedsUserEnv() {
+  # The seed block in init/oosh is a POSIX duplicate of private.config.anchor.lines.get;
+  # extract it by its markers, run it under sh into a fixture HOME, diff against the emitter.
+  local fx; fx=$(test.suite.fixture.make seed) || { create.result 1 "mktemp failed"; return $(result); }
+  local block; block=$(sed -n '/^# BEGIN userEnvSeed/,/^# END userEnvSeed/p' "$INIT_SCRIPT")
+  if [ -z "$block" ]; then rm -rf "$fx"; create.result 1 "no BEGIN/END userEnvSeed block in init/oosh"; return $(result); fi
+  printf '%s\n' "$block" | env -i HOME="$fx" BASH_FILE=/opt/homebrew/bin/bash PATH=/usr/bin:/bin sh
+  if ! diff <(test.install.anchorLinesGet /opt/homebrew/bin/bash) "$fx/config/user.env" >/dev/null 2>&1; then
+    rm -rf "$fx"; create.result 1 "seeded user.env differs from private.config.anchor.lines.get"; return $(result)
+  fi
+  echo 'export PLANTED=1' >> "$fx/config/user.env"
+  printf '%s\n' "$block" | env -i HOME="$fx" BASH_FILE=/opt/homebrew/bin/bash PATH=/usr/bin:/bin sh
+  local kept; kept=$(grep -c PLANTED "$fx/config/user.env"); rm -rf "$fx"
+  if [ "$kept" = 1 ]; then create.result 0 "seed matches emitter and is write-once"; else create.result 1 "second run rewrote an existing user.env"; fi
+  return $(result)
+}
+test.case - "T-INIT-SEEDS-USER-ENV: init/oosh seeds ~/config/user.env once, identical to config's emitter" \
+  test.install.initSeedsUserEnv
+expect 0 "seed matches emitter and is write-once" "the first login after a fresh install boots from this file before state 31 ever runs config save"
+
+# ============================================================================
+# T-INIT-SEED-GATES: the seed drops a non-absolute BASH_FILE
+# ============================================================================
+# The emitter gates the brew-bash PATH line on the INPUT being an absolute
+# path, not on dirname's ANSWER — dirname says "." for a slash-less or empty
+# argument, which would write `export PATH=".:$PATH"` and put the working
+# directory on every login shell's PATH (CWE-426, the hole ticket T8 closed).
+test.install.initSeedNeverPutsCwdOnPath() {
+  # The seed reproduces the emitter's INPUT gate: a slash-less or empty BASH_FILE
+  # must not become `export PATH=".:$PATH"` (CWE-426, ticket T8), and an empty one
+  # must emit no BASH_FILE line at all.
+  local fx block bad=""
+  block=$(sed -n '/^# BEGIN userEnvSeed/,/^# END userEnvSeed/p' "$INIT_SCRIPT")
+  local bf
+  for bf in bash ""; do
+    fx=$(test.suite.fixture.make seedgate) || { create.result 1 "mktemp failed"; return $(result); }
+    printf '%s\n' "$block" | env -i HOME="$fx" BASH_FILE="$bf" PATH=/usr/bin:/bin sh
+    grep -q '^export PATH="\.' "$fx/config/user.env" 2>/dev/null && bad="$bad cwd-on-path[$bf]"
+    [ "$(grep -c '^export PATH=' "$fx/config/user.env" 2>/dev/null)" = 1 ] || bad="$bad extra-path-line[$bf]"
+    if [ -z "$bf" ] && grep -q '^export BASH_FILE=' "$fx/config/user.env" 2>/dev/null; then
+      bad="$bad empty-bash-file-persisted"
+    fi
+    rm -rf "$fx"
+  done
+  if [ -z "$bad" ]; then create.result 0 "seed gates match the emitter"; else create.result 1 "seed gate failures:$bad"; fi
+  return $(result)
+}
+test.case - "T-INIT-SEED-GATES: the seed drops a non-absolute BASH_FILE like the emitter does" \
+  test.install.initSeedNeverPutsCwdOnPath
+expect 0 "seed gates match the emitter" "a bad BASH_FILE must never put the working directory on every login shell's PATH"
 
 test.suite.save.results
