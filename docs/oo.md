@@ -327,39 +327,36 @@ already-correct layout is a no-op. Naming follows the OOSH
 `ossh.folder.fix` per-scope pattern. See
 [Repair toolkit](repair-toolkit.md) for related primitives.
 
-### oo.boot.fix
+### oo.profile.fix
 
-Install or repair the two host-wide resources that let a shell with **no
-environment at all** become an oosh shell: the fixed path `/etc/oosh/boot`
-(a symlink into the shared tree) and the login-shell drop-in
-`/etc/profile.d/oosh.sh` (from `templates/user/profile.d.oosh.sh`).
+Install or repair the login-shell drop-in `/etc/profile.d/oosh.sh` (from
+`templates/user/profile.d.oosh.sh`) — the one thing that makes `env -i sh -l`
+come up as an oosh shell. `/etc/profile` loops `for i in /etc/profile.d/*.sh`,
+so the drop-in is read on every login; it recovers `$HOME` from the password
+database and then sources `~/config/user.env`, which carries the anchors, the
+env chain and the PATH prepend as data.
 
 ```bash
-oo boot.status                       # read-only report first
-oo boot.fix                          # install or repair both
-oo boot.fix <systemPath> <profileDir> # fixture paths, for tests — pass BOTH
+oo profile.status              # read-only report first
+oo profile.fix                 # install or repair the drop-in
+oo profile.fix <profileDir>    # a fixture path, for tests
 ```
 
-`<?systemPath:/etc/oosh>` and `<?profileDir:/etc/profile.d>` are optional.
-Created during install by state **`34 root.boot.path.installed`**; because
-the state-machine declaration is frozen per host at first install,
-`oo boot.fix` is the only way onto hosts that already exist. `$SUDO` is
-used internally — run `oo boot.fix`, not `sudo oo boot.fix`; it fails loudly
-before creating anything when sudo is absent. Idempotent, never
-auto-triggered. On a branch without `boot` it warns and skips rather than
-leaving a dangling link; on a host without `/etc/profile.d` (macOS) it
-skips the drop-in and says so. Why the fixed path exists, what the drop-in
-can and cannot recover, and the trust note on dev-group-writable content
-behind a root-looking path: [`boot.md` § The tilde caveat](boot.md#the-tilde-caveat--reaching-boot-is-not-the-same-as-running-it),
-[§ The three recovery routes](boot.md#the-three-recovery-routes) and
-[§ Guarantees](boot.md#guarantees). See also [Repair toolkit](repair-toolkit.md).
+`<?profileDir:/etc/profile.d>` is optional. Written during install by state
+**`34 root.profile.dropin.installed`**; because the state-machine declaration
+is frozen per host at first install, `oo profile.fix` is the only way onto
+hosts that already exist. `$SUDO` is used internally — run `oo profile.fix`,
+not `sudo oo profile.fix`; it fails loudly before creating anything when sudo
+is absent. Idempotent, never auto-triggered. On a host without
+`/etc/profile.d` (macOS) it skips and says so. See also
+[Repair toolkit](repair-toolkit.md).
 
-### oo.boot.status
+### oo.profile.status
 
-Read-only report on both resources — present, a symlink, where it resolves,
-readable by you, and whether the drop-in sources it — with the recovery
-command when not. Same two optional parameters as `oo boot.fix`. Emits on
-plain stdout, so it answers at any log level; rc 0 only when both are healthy.
+Read-only report on the drop-in — present, readable, and whether it sources
+`~/config/user.env` — with the recovery command when not. Same optional
+parameter as `oo profile.fix`. Emits on plain stdout, so it answers at any log
+level; rc 0 only when the drop-in is healthy.
 
 ### oo.safeDirectory.prune
 
@@ -573,7 +570,7 @@ States include:
 | 31 | root.shared.dev.folder.created | Shared tree, developking, dev repo |
 | 32 | root.dev.keys.installed | Deploy keys |
 | 33 | root.installation.done | root bashrc + login shell |
-| 34 | root.boot.path.installed | `/etc/oosh/boot` fixed path (see [`oo.boot.fix`](#oobootfix)) |
+| 34 | root.profile.dropin.installed | `/etc/profile.d/oosh.sh` login-shell drop-in (see [`oo.profile.fix`](#ooprofilefix)) |
 | 40+ | shared/headless/once | Advanced setup stages |
 
 ## Promotion Pipeline

@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+TEST_CATEGORY=platform
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# platform.profile.dropin.invariant — the login-shell drop-in
+# /etc/profile.d/oosh.sh on the REAL host, after a real install.
+#
+#   ./test.suite run platform.profile.dropin.invariant 1
+#
+# /etc/profile loops `for i in /etc/profile.d/*.sh`, so this drop-in is the one
+# thing that makes `env -i sh -l` come up as an oosh shell: it recovers $HOME
+# from the password database and then sources ~/config/user.env. It is written
+# by install state 34 (root.profile.dropin.installed) and healed by
+# `oo profile.fix`.
+#
+# Why this cannot be a `core` fixture test: core drives the helper against a
+# fixture <profileDir> and can never say whether the HOST's /etc/profile.d got
+# the file — and pointing a core test at /etc/profile.d would leave every dev
+# box permanently red until somebody ran `oo profile.fix` with sudo.
+#
+# Diagnostic-rich assertions (expect.pass / expect.fail, never `expect 0 "*"`)
+# so a failure surfaces its own copy-paste recovery command.
+
+dropIn="/etc/profile.d/oosh.sh"
+template="$OOSH_DIR/templates/user/profile.d.oosh.sh"
+pwHome=$(test.suite.home.passwd)
+
+# ----------------------------------------------------------------------------
+# INVARIANT-0 (precondition): the host must HAVE /etc/profile.d at all.
+# macOS does not: its /etc/profile runs path_helper and globs nothing, so the
+# login route does not exist there. That is a SKIP, never a failure.
+# ----------------------------------------------------------------------------
+if [ ! -d /etc/profile.d ]; then
+  test.case $level "platform.profile.dropin: precondition — /etc/profile.d exists" true
+  expect.pass "INVARIANT-0 skipped — no /etc/profile.d on this host (macOS); the login route does not exist here. Use: . ~/config/user.env"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-1 (precondition): the drop-in exists and this user can read it.
+# /etc/profile reads it as the logging-in user, so root-only is not enough.
+# ----------------------------------------------------------------------------
+test.case $level "platform.profile.dropin: INVARIANT-1 — $dropIn exists and is readable" \
+  test -r "$dropIn"
+if [ ! -r "$dropIn" ]; then
+  expect.fail "$dropIn missing or unreadable by ${USER:-$(id -un)} — \`env -i sh -l\` does NOT come up as an oosh shell here. Repair: sudo oo profile.fix"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "$dropIn is present and readable"
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-2: it is the MANAGED file, byte for byte. Nothing is substituted
+# into it any more, so any difference means a hand-edit or a host healed by the
+# retired /etc/oosh/boot machinery.
+# ----------------------------------------------------------------------------
+test.platform.profileDropInMatchesTemplate() {
+  if diff -q "$dropIn" "$template" >/dev/null 2>&1; then
+    create.result 0 "drop-in is byte-equal to the template"
+  else
+    create.result 1 "$dropIn differs from $template: $(diff "$template" "$dropIn" 2>&1 | head -3 | tr '\n' ' ')"
+  fi
+  return $(result)
+}
+test.case $level "platform.profile.dropin: INVARIANT-2 — byte-equal to templates/user/profile.d.oosh.sh" \
+  test.platform.profileDropInMatchesTemplate
+if [ "$RESULT" = "drop-in is byte-equal to the template" ]; then
+  expect.pass "the drop-in is the managed file, unmodified"
+else
+  expect.fail "$RESULT — repair: sudo oo profile.fix"
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-3: /bin/sh parses it. A parse error here breaks EVERY login on the
+# host, oosh user or not.
+# ----------------------------------------------------------------------------
+test.platform.profileDropInParses() {
+  local out
+  if out=$(sh -n "$dropIn" 2>&1); then
+    create.result 0 "drop-in parses under /bin/sh"
+  else
+    create.result 1 "sh -n $dropIn failed: $out"
+  fi
+  return $(result)
+}
+test.case $level "platform.profile.dropin: INVARIANT-3 — parses under /bin/sh" \
+  test.platform.profileDropInParses
+if [ "$RESULT" = "drop-in parses under /bin/sh" ]; then
+  expect.pass "every login on this host reads this file — it parses"
+else
+  expect.fail "$RESULT — repair: sudo oo profile.fix"
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-4: the whole point — `env -i sh -l` comes up anchored, with no
+# environment whatsoever. HOME is DERIVED here (the drop-in's job), so the
+# expectation is the PASSWORD-DATABASE home, not the runner's $HOME.
+# ----------------------------------------------------------------------------
+test.platform.profileDropInLoginRecovers() {
+  local out expected="<[$pwHome|$pwHome/oosh|$pwHome/config]>"
+  out=$(cd /tmp && env -i sh -lc 'echo "<[$HOME|$OOSH_DIR|$CONFIG_PATH]>"' 2>/dev/null | grep -o '<\[[^]]*\]>' | tail -1)
+  if [ "$out" = "$expected" ]; then
+    create.result 0 "env -i sh -l comes up anchored"
+  else
+    create.result 1 "env -i sh -l gave '$out', expected '$expected'"
+  fi
+  return $(result)
+}
+test.case $level "platform.profile.dropin: INVARIANT-4 — env -i sh -l recovers \$HOME and the anchors" \
+  test.platform.profileDropInLoginRecovers
+if [ "$RESULT" = "env -i sh -l comes up anchored" ]; then
+  expect.pass "HOME derived from the password database, then ~/config/user.env sourced"
+else
+  expect.fail "$RESULT — /etc/profile must glob the drop-in and ~/config/user.env must carry the anchors. Repair: sudo oo profile.fix, then \`config save\` as this user"
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-5: the DATA route, independent of the login route — sourcing
+# ~/config/user.env by hand stands the environment up in sh, dash, ash, bash
+# and busybox ash. HOME is passed: deriving it is the drop-in's job (INVARIANT-4),
+# not user.env's.
+# ----------------------------------------------------------------------------
+test.platform.profileDropInDataRoute() {
+  local bad
+  bad=$(test.suite.anchors.check '. "$HOME/config/user.env"')
+  if [ -z "$bad" ]; then
+    create.result 0 "every shell anchors from user.env"
+  else
+    create.result 1 "shells that did not anchor:$bad"
+  fi
+  return $(result)
+}
+test.case $level "platform.profile.dropin: INVARIANT-5 — . \$HOME/config/user.env anchors every shell" \
+  test.platform.profileDropInDataRoute
+if [ "$RESULT" = "every shell anchors from user.env" ]; then
+  expect.pass "the data route needs only HOME — sh, dash, ash, bash and busybox ash all anchor"
+else
+  expect.fail "$RESULT — repair: run \`config save\` as this user, then re-check ~/config/user.env"
+fi
+
+test.suite.save.results

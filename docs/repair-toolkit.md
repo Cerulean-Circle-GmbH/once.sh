@@ -16,7 +16,7 @@ listed here run only when invoked.
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
 | [`config init.shared`](config.md) | `sharedConfig` dir mode 2775 + group `dev` | After cross-user perm drift, "Permission denied" on shared config writes |
-| [`oo boot.fix`](oo.md#oobootfix) | `/etc/oosh/boot` **and** `/etc/profile.d/oosh.sh` — the fixed host-wide path to `boot`, and the login-shell drop-in that sources it | `. /etc/oosh/boot` says "cannot open"; `env -i sh -l` does not come up as an oosh shell; host installed before install state 34 (`root.boot.path.installed`). `oo boot.status` reports first. Needs root, or `dev` + sudo |
+| [`oo profile.fix`](oo.md#ooprofilefix) | `/etc/profile.d/oosh.sh` — the login-shell drop-in that recovers `$HOME` and sources `~/config/user.env` | `env -i sh -l` does not come up as an oosh shell; host installed before install state 34 (`root.profile.dropin.installed`). `oo profile.status` reports first. Needs root, or `dev` + sudo |
 | [`ossh rights.fix`](ossh.md) | `~/.ssh` file modes (600 private, 644 public, 700 dirs) | After SSH client complains about world-readable keys |
 | [`ossh folder.fix [strict]`](ossh.md) | `~/.ssh` tree layout (WODA Host blocks, IdentityFile paths, GitHub Host) | After `ssh: Bad configuration option`, missing `2cuGitHub` alias, drag-in legacy artifacts |
 | [`oo safeDirectory.prune`](oo.md#oosafedirectoryprune) | Stale entries in `git config --global safe.directory` | After many test runs or repeated installs bloated `~/.gitconfig`; symptom: Cursor / VS Code Source Control panel + branch picker empty |
@@ -79,23 +79,22 @@ explicitly when something drifts.
 | `~/config` not a symlink | `oo user.fix` |
 | `Permission denied` writing to `~/config/*.env` | `config init.shared` |
 | `sharedConfig` owned by `root:root` or mode `0775` | `config init.shared` |
-| `. /etc/oosh/boot` → `cannot open` / `No such file` | `oo boot.fix` |
-| Host was installed before state 34 (`root.boot.path.installed`) | `oo boot.fix` |
-| `/etc/oosh/boot` exists but dangles, or is a copy instead of a symlink | `oo boot.fix` |
-| `env -i sh -l` does not come up as an oosh shell | `oo boot.fix` (the `/etc/profile.d/oosh.sh` drop-in is missing) |
-| `/etc/profile.d/oosh.sh` missing, or it names the wrong path | `oo boot.fix` |
-| `env -i sh` cannot bootstrap oosh at all | nothing can — see below. Use `. /etc/oosh/boot`, `env -i ENV=/etc/oosh/boot sh`, or `env -i sh -l` |
+| Host was installed before state 34 (`root.profile.dropin.installed`) | `oo profile.fix` |
+| `env -i sh -l` does not come up as an oosh shell | `oo profile.fix` (the `/etc/profile.d/oosh.sh` drop-in is missing) |
+| `/etc/profile.d/oosh.sh` missing, or it no longer sources `~/config/user.env` | `oo profile.fix` |
+| `env -i sh` cannot bootstrap oosh at all | nothing can — see below. Use `env -i sh -l`, or `. ~/config/user.env` with `HOME` set |
 | `Permissions … are too open` from ssh client | `ossh rights.fix` |
 | `ssh: Could not resolve hostname 2cuGitHub` | `ossh folder.fix` |
 | Legacy `~/.ssh/2cuGitHub` host block | `ossh folder.fix strict` |
 | `~/.ssh/id_ed25519.previous` / `.bak.*` cruft | `ossh folder.fix strict` |
 | Cursor / VS Code Source Control panel and branch picker stay empty although `git branch` works in the terminal; `git config --global --get-all safe.directory \| wc -l` is large (many stale `/tmp/...` entries) | `oo safeDirectory.prune` |
 
-## `oo boot.fix` — why it exists and what it does not promise
+## `oo profile.fix` — why it exists and what it does not promise
 
-`boot` recovers `$HOME` from the password database, but `. ~/oosh/boot` cannot be *reached*
-under dash/ash with `HOME` unset (`~` stays literal) — `/etc/oosh/boot` is the fixed path
-that collapses recovery to one command. See [`boot.md` § The tilde caveat](boot.md#the-tilde-caveat--reaching-boot-is-not-the-same-as-running-it).
+The bootstrap is DATA in `~/config/user.env`, at a `$HOME`-relative path. A shell that
+has `HOME` can always type `. ~/config/user.env`; a shell started by `env -i` has no
+`HOME` at all. `/etc/profile.d/oosh.sh` is what closes that gap for LOGIN shells: it
+derives `$HOME` (getent → dscl → `/etc/passwd`) and then sources the file.
 
 It is a separate primitive because the existing ones cannot absorb it:
 `oo user.fix` / `config init.user` are per-user scope and run as the user,
@@ -104,9 +103,9 @@ It is a separate primitive because the existing ones cannot absorb it:
 
 **It is not a convenience.** The state-machine declaration is frozen per host at
 first install, so an already-installed host will *never* run state 34.
-`oo boot.fix` is the only way the fixed path reaches hosts that already exist.
+`oo profile.fix` is the only way the drop-in reaches hosts that already exist.
 
-`$SUDO` is used internally, so `oo boot.fix` — not `sudo oo boot.fix` — is the
+`$SUDO` is used internally, so `oo profile.fix` — not `sudo oo profile.fix` — is the
 one command that works whether you are already root or a `dev` member with
 sudo installed. If sudo is absent it fails loudly before creating anything (a user without sudo rights meets sudo's own denial).
 Like every primitive here it is **not** auto-triggered: `oo update` runs as an
@@ -116,23 +115,18 @@ ordinary user with no sudo.
 
 | Command | Recovers? | Why |
 |---|---|---|
-| `. /etc/oosh/boot` | **yes** | the explicit form; works in every shell, login or not |
-| `env -i ENV=/etc/oosh/boot sh` | **yes** | `$ENV` is a POSIX `sh`'s `~/.bashrc`; this hands the hook back |
-| `env -i sh -l` | **yes** | `/etc/profile` loops `/etc/profile.d/*.sh`, and `oo boot.fix` puts `oosh.sh` there |
+| `. ~/config/user.env` | **yes**, with `HOME` set | the explicit form; works in every shell, login or not |
+| `env -i sh -l` | **yes** | `/etc/profile` loops `/etc/profile.d/*.sh`, and `oo profile.fix` puts `oosh.sh` there; it derives `$HOME` itself |
 | `env -i sh` | **no** | `$ENV` is a non-login `sh`'s *only* rc hook, and `env -i` is what erased it |
 
-**Bare `env -i sh` cannot be repaired into self-recovering**, by `oo boot.fix` or by
-anything else: there is no hook left to point at `boot`. If that is the shell you are
-in, type one of the first three. Two caveats on the `$ENV` form: it is honoured by
-**interactive** shells only (do not add `-c`), and bash honours it only when invoked as
-`sh` — never under its own name, and never with an explicit `--posix`. Full detail and
-the measurements in [`boot.md` § The three recovery routes](boot.md).
+**Bare `env -i sh` cannot be repaired into self-recovering**, by `oo profile.fix` or by
+anything else: there is no hook left to point at. If that is the shell you are in, add
+`-l`, or set `HOME` and source `~/config/user.env` by hand.
 
-The `/etc/profile.d/oosh.sh` half is **Linux-only by fact**: macOS has no
-`/etc/profile.d`, so `oo boot.fix` skips it there and says so. That is not a failure —
-the other routes still work. The drop-in is guarded twice (the boot path must be
-readable, and the caller must actually have `~/oosh` unless `HOME` is unset), so a
-login by somebody who has never heard of oosh is a silent no-op.
+The drop-in is **Linux-only by fact**: macOS has no `/etc/profile.d`, so
+`oo profile.fix` skips it there and says so. That is not a failure — the data route
+still works. The drop-in is guarded (`~/config/user.env` must exist), so a login by
+somebody who has never heard of oosh is a silent no-op.
 
 > **Trust.** `/etc/oosh/boot` resolves to **dev-group-writable** content — exactly as trusted as
 > the `dev` group, no more, the same as root's own `~/oosh`. Details: [`boot.md` § Guarantees](boot.md#guarantees).

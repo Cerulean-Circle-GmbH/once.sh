@@ -28,7 +28,7 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [Debug System Documentation](debug.md) - Interactive step debugger, stack traces, and trap handlers
 - [OO Framework Documentation](oo.md) - Script creation, version control, package management
 - [State Machine Documentation](state.md) - Creating and managing state machines for multi-step workflows
-- [Repair Toolkit](repair-toolkit.md) - The explicit repair primitives (`oo user.fix`, `oo boot.fix`, `config init.*`, `ossh rights.fix` / `folder.fix`) and which symptom needs which
+- [Repair Toolkit](repair-toolkit.md) - The explicit repair primitives (`oo user.fix`, `oo profile.fix`, `config init.*`, `ossh rights.fix` / `folder.fix`) and which symptom needs which
 - [Install bootstrap (init/oosh)](install-bootstrap.md) - The installer's clean-environment re-exec: what is carried, what is seeded, why
 
 ## Infrastructure Tools
@@ -92,7 +92,7 @@ config env files (so those stay pure data), is POSIX-`sh` clean (dash/ash), and
 sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`), the source
 chain, PATH, and the logging primitives. It recovers `$HOME` from the password
 database, so `env -i sh` can boot; the fixed host-wide path `/etc/oosh/boot`
-(install state 34, `oo boot.fix`) makes that one command for any user and any
+(install state 34, `oo profile.fix`) makes that one command for any user and any
 shell — see **[boot.md](boot.md)** § The three recovery routes.
 
 ### The "this" Boot Script

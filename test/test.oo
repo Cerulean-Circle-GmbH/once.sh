@@ -2151,19 +2151,20 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# T-CONFIG-SAVE-CHAINS-LOG-SESSION : generated log.env must CHAIN the per-user
-# session file (source $OOSH_USER_CONFIG_PATH/log.session.env), UNEXPANDED so
-# each user loads their own. This is what makes `config list log` show session
-# and loads the saved per-user LOG_NAME/DEVICE/LIVE at shell init. Complement to
-# the exclusion test: the values stay out of log.env, but the chain points to
-# where they DO live. The var must be literal ($-prefixed), not expanded.
+# T-CONFIG-SAVE-NO-LOG-SESSION-CHAIN : the generated log.env must carry NO
+# per-user chain line. It used to source $OOSH_USER_CONFIG_PATH/log.session.env,
+# but log.env is SHARED and the per-user file is not guaranteed to exist — dash
+# ABORTS on `.` of a missing file, so a single user who never saved a session
+# broke every dash shell on the host. `log` now creates and sources that file
+# itself (test.config T45/T46). Complement to the exclusion test above: the
+# per-user values stay out of log.env, and so does the pointer to them.
 # ─────────────────────────────────────────────────────────────────────────────
-test.case - "T-CONFIG-SAVE-CHAINS-LOG-SESSION: log.env sources the per-user session file" \
-  echo "(verify log.env chains log.session.env with the unexpanded var)"
-if grep -qE '^[[:space:]]*(source|\.)[[:space:]]+\$OOSH_USER_CONFIG_PATH/log\.session\.env[[:space:]]*$' "$_llfix/log.env" 2>/dev/null; then
-  expect.pass "log.env chains \$OOSH_USER_CONFIG_PATH/log.session.env"
+test.case - "T-CONFIG-SAVE-NO-LOG-SESSION-CHAIN: log.env carries no per-user chain line" \
+  echo "(verify log.env does not source log.session.env)"
+if grep -q 'log\.session\.env' "$_llfix/log.env" 2>/dev/null; then
+  expect.fail "log.env chains the per-user session file — dash aborts when it is missing: $(grep -n 'session' "$_llfix/log.env" 2>/dev/null | tr '\n' ' ')"
 else
-  expect.fail "log.env missing per-user session chain: $(grep -n 'session' "$_llfix/log.env" 2>/dev/null | tr '\n' ' ')"
+  expect.pass "log.env carries no \$OOSH_USER_CONFIG_PATH/log.session.env chain"
 fi
 rm -rf "$_llfix"
 
@@ -2415,216 +2416,59 @@ test.case $level "T-SHARED-TREE-CONSUME-IN-THE-WAY: a clone sitting at <base>/<b
 expect 0 "rebuilt in place" "this is the ordering the parameter exists for — copy, verify, remove, then worktree add"
 
 # ============================================================================
-# T-BOOTPATH-BOOT-PATH: private.oo.boot.path.ensure — the fixed system boot path
+# T-PROFILE-*: /etc/profile.d/oosh.sh — the login-shell bootstrap
 # ============================================================================
-# Ticket T9 (docs/plans/2026-09-14-fixed-system-boot-path.md). `. ~/oosh/boot`
-# cannot be REACHED under `env -i sh`: with HOME unset dash/ash leave `~`
-# literal. The fix is a host-wide symlink /etc/oosh/boot into the shared tree.
-# The helper takes its paths as parameters precisely so these tests can drive
-# it against a fixture without root.
+# Successor of ticket T9's `/etc/oosh/boot`. That fixed host-wide SYMLINK
+# existed for one reason: with HOME unset, dash/ash leave `~` literal, so
+# `. ~/oosh/boot` could not be REACHED in exactly the empty-environment case
+# it was meant to survive — an absolute path was the only way in.
 #
-# The 4th argument (<profileDir>) is a fixture path that DOES NOT EXIST, so the
-# login-shell half below skips gracefully and these cases stay about the
-# symlink. It is not optional here: with the default the helper would aim at
-# the host's real /etc/profile.d, which a non-root runner cannot write — and
-# `$SUDO tee` would sit there waiting for a password. The drop-in has its own
-# block, T-BOOTPATH-PROFILED-*.
+# There is nothing left to link. `boot` is gone; the bootstrap is DATA in
+# ~/config/user.env, and that path is $HOME-relative by construction. What
+# survives is the LOGIN route: /etc/profile loops `for i in /etc/profile.d/*.sh`,
+# so a drop-in there recovers $HOME itself (getent -> dscl -> /etc/passwd) and
+# then sources ~/config/user.env. Measured in a container:
+#
+#   env -i sh      -> NO.  $ENV is a non-login POSIX sh's ONLY rc hook, and
+#                          `env -i` is what erased it. Nothing recovers this;
+#                          do not claim otherwise anywhere.
+#   env -i sh -l   -> YES, once /etc/profile.d has the oosh drop-in.
+#
+# dash's own trace settles it: `env -i sh -lxc ':'` runs /etc/profile
+# (`[ -d /etc/profile.d ]`, then the `*.sh` glob) while `env -i sh -xc ':'`
+# shows only `+ :`.
+#
+# It is created by install state 34 (root.profile.dropin.installed) and healed
+# by `oo profile.fix`; `oo profile.status` reports on it.
+#
+# EVERYTHING here is driven against FIXTURE paths. A core test must never write
+# to the host's real /etc/profile.d, and must never need root.
 
-# Build a fixture: <root>/shared/<branch>/boot + an empty system path.
-test.oo.bootPath.fixture() { # <fixtureRoot> <branch> <?withBoot:yes>
-  local fixture="$1" branch="$2" withBoot="${3:-yes}"
-  rm -rf "$fixture"
-  mkdir -p "$fixture/shared/$branch" "$fixture/system"
-  if [ "$withBoot" = "yes" ]; then
-    printf '%s\n' '#!/usr/bin/env sh' '# fixture boot' > "$fixture/shared/$branch/boot"
-  fi
-}
-
-# --- T-BOOTPATH-BOOT-PATH-CREATES-SYMLINK -------------------------------------------
-test.oo.bootPathEnsureCreatesSymlink() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.create.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootPath.fixture "$fixture" dev yes
-  local sys="$fixture/system/oosh"
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
-  local rc=$?
-  local link="$sys/boot"
-  local target="$fixture/shared/dev/boot"
-  if [ "$rc" -ne 0 ]; then
-    create.result 1 "helper returned rc=$rc"
-  elif [ ! -L "$link" ]; then
-    create.result 1 "$link is not a symlink (ls: $(ls -ld "$link" 2>&1))"
-  elif [ "$(private.this.path.canonical "$link")" != "$(private.this.path.canonical "$target")" ]; then
-    create.result 1 "link points at '$(readlink "$link")', expected '$target'"
-  elif [ ! -r "$link" ]; then
-    create.result 1 "$link is not readable"
-  else
-    create.result 0 "boot system path is a symlink to the shared tree"
-  fi
-  rm -rf "$fixture" 2>/dev/null
-  return $(result)
-}
-test.case - "T-BOOTPATH-BOOT-PATH-CREATES-SYMLINK: helper links <systemPath>/boot at <base>/<branch>/boot" \
-  test.oo.bootPathEnsureCreatesSymlink
-expect 0 "boot system path is a symlink to the shared tree" \
-  "a SYMLINK, never a copy or a generated stub (spec: 'Why a symlink')"
-
-# --- T-BOOTPATH-BOOT-PATH-SKIPS-WHEN-TARGET-MISSING ---------------------------------
-# The testing/prod promotion case: `boot` exists on dev only. State 34 must
-# PASS there (absence is correct), and must NEVER leave a dangling link —
-# a dangling link would make `. /etc/oosh/boot` fail for every user on the box.
-test.oo.bootPathEnsureSkipsWhenTargetMissing() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.skip.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootPath.fixture "$fixture" testing no
-  local sys="$fixture/system/oosh"
-  private.oo.boot.path.ensure "$fixture/shared" testing "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
-  local rc=$?
-  if [ "$rc" -ne 0 ]; then
-    create.result 1 "absent target must warn-and-SKIP (rc=0), got rc=$rc — state 34 would halt on testing/prod"
-  elif [ -L "$sys/boot" ] || [ -e "$sys/boot" ]; then
-    create.result 1 "created a DANGLING link: $(ls -ld "$sys/boot" 2>&1)"
-  else
-    create.result 0 "absent target skipped without a dangling link"
-  fi
-  rm -rf "$fixture" 2>/dev/null
-  return $(result)
-}
-test.case - "T-BOOTPATH-BOOT-PATH-SKIPS-WHEN-TARGET-MISSING: warn-and-skip, never dangle" \
-  test.oo.bootPathEnsureSkipsWhenTargetMissing
-expect 0 "absent target skipped without a dangling link" \
-  "promotion to testing/prod must not halt state 34 nor dangle /etc/oosh/boot"
-
-# --- T-BOOTPATH-BOOT-PATH-NO-NESTING ------------------------------------------------
-# `ln -sf` (without -n) DEREFERENCES an existing symlink-to-directory and
-# creates the new link INSIDE it. A re-run over a stale dir-symlink would then
-# produce <systemPath>/boot/boot and leave <systemPath>/boot pointing at the
-# wrong thing. -n is what prevents that; this pins it.
-test.oo.bootPathEnsureDoesNotNest() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.nest.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootPath.fixture "$fixture" dev yes
-  local sys="$fixture/system/oosh"
-  mkdir -p "$sys" "$fixture/stale"
-  ln -s "$fixture/stale" "$sys/boot"        # stale symlink → DIRECTORY
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
-  local rc=$?
-  local target="$fixture/shared/dev/boot"
-  if [ -e "$fixture/stale/boot" ]; then
-    create.result 1 "nested INSIDE the stale dir symlink: $fixture/stale/boot exists (missing 'ln -sfn')"
-  elif [ "$rc" -ne 0 ]; then
-    create.result 1 "helper returned rc=$rc"
-  elif [ "$(private.this.path.canonical "$sys/boot")" != "$(private.this.path.canonical "$target")" ]; then
-    create.result 1 "link points at '$(readlink "$sys/boot")', expected '$target'"
-  else
-    create.result 0 "stale dir symlink replaced, not nested into"
-  fi
-  rm -rf "$fixture" 2>/dev/null
-  return $(result)
-}
-test.case - "T-BOOTPATH-BOOT-PATH-NO-NESTING: re-run over a stale dir symlink replaces it (ln -sfn)" \
-  test.oo.bootPathEnsureDoesNotNest
-expect 0 "stale dir symlink replaced, not nested into" \
-  "without -n a second install nests the link inside the old directory symlink"
-
-# --- T-BOOTPATH-BOOT-PATH-IDEMPOTENT ------------------------------------------------
-test.oo.bootPathEnsureIdempotent() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.idem.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootPath.fixture "$fixture" dev yes
-  local sys="$fixture/system/oosh"
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
-  local first
-  first=$(find "$sys" | sort; readlink "$sys/boot")
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" >/dev/null 2>&1
-  local rc=$?
-  local second
-  second=$(find "$sys" | sort; readlink "$sys/boot")
-  if [ "$rc" -ne 0 ]; then
-    create.result 1 "second call returned rc=$rc"
-  elif [ "$first" != "$second" ]; then
-    create.result 1 "second call changed the tree: '$first' vs '$second'"
-  else
-    create.result 0 "second call is a no-op"
-  fi
-  rm -rf "$fixture" 2>/dev/null
-  return $(result)
-}
-test.case - "T-BOOTPATH-BOOT-PATH-IDEMPOTENT: second invocation changes nothing" \
-  test.oo.bootPathEnsureIdempotent
-expect 0 "second call is a no-op" \
-  "state 34 re-runs on every re-install; it must stay a no-op"
-
-# --- T-BOOTPATH-BOOT-PATH-REQUIRES-ARGS ---------------------------------------------
-test.oo.bootPathEnsureRequiresArgs() {
-  private.oo.boot.path.ensure >/dev/null 2>&1
-  local rc1=$?
-  private.oo.boot.path.ensure /tmp/nowhere >/dev/null 2>&1
-  local rc2=$?
-  if [ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ]; then
-    create.result 0 "missing arguments rejected"
-  else
-    create.result 1 "rc(no args)=$rc1 rc(base only)=$rc2 — both must be non-zero"
-  fi
-  return $(result)
-}
-test.case - "T-BOOTPATH-BOOT-PATH-REQUIRES-ARGS: <sharedOoshBase> and <branch> are mandatory" \
-  test.oo.bootPathEnsureRequiresArgs
-expect 0 "missing arguments rejected" \
-  "a silently defaulted base would link /etc/oosh/boot at the wrong tree"
-
-# --- T-BOOTPATH-BOOT-PATH-FAILS-LOUD ------------------------------------------------
-# "It must never half-succeed" (decision 4). When the privileged commands
-# cannot run, the post-condition must catch it and return non-zero rather than
-# reporting success on a system path that was never written.
-test.oo.bootPathEnsureFailsLoud() {
-  if [ "$(id -u)" = "0" ]; then
-    create.result 0 "privileged commands verified"   # root can always write
-    return $(result)
-  fi
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootpath.loud.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootPath.fixture "$fixture" dev yes
-  mkdir -p "$fixture/ro"
-  chmod 500 "$fixture/ro"
-  local sys="$fixture/ro/oosh"
-  # SUDO="false " makes every privileged command a guaranteed no-op failure.
-  local rc
-  ( SUDO="false " ; private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$fixture/system/profile.d" ) >/dev/null 2>&1
-  rc=$?
-  chmod 700 "$fixture/ro" 2>/dev/null
-  if [ "$rc" -ne 0 ]; then
-    create.result 0 "privileged commands verified"
-  else
-    create.result 1 "returned 0 although $sys/boot was never created — half-success"
-  fi
-  rm -rf "$fixture" 2>/dev/null
-  return $(result)
-}
-test.case - "T-BOOTPATH-BOOT-PATH-FAILS-LOUD: unwritable system path returns non-zero" \
-  test.oo.bootPathEnsureFailsLoud
-expect 0 "privileged commands verified" \
-  "post-condition must catch a failed privileged write, never report half-success"
-
-# --- T-BOOTPATH-BOOT-CHECK-DEFINED --------------------------------------------------
-test.oo.bootPathCheckDefined() {
-  if [ "$(type -t private.check.root.boot.path.installed)" = "function" ]; then
+# --- T-PROFILE-CHECK-DEFINED --------------------------------------------------------
+test.oo.profileDropInCheckDefined() {
+  if [ "$(type -t private.check.root.profile.dropin.installed)" = "function" ]; then
     create.result 0 "state 34 guard is defined"
   else
-    create.result 1 "private.check.root.boot.path.installed is not a function"
+    create.result 1 "private.check.root.profile.dropin.installed is not a function"
   fi
   return $(result)
 }
-test.case - "T-BOOTPATH-BOOT-CHECK-DEFINED: private.check.root.boot.path.installed exists" \
-  test.oo.bootPathCheckDefined
+test.case - "T-PROFILE-CHECK-DEFINED: private.check.root.profile.dropin.installed exists" \
+  test.oo.profileDropInCheckDefined
 expect 0 "state 34 guard is defined" \
   "state.next [34] dispatches to private.check.<stateName> — no guard, no transition"
 
 
 # ============================================================================
-# T-BOOTPATH-STATE-34: `34 root.boot.path.installed` is registered, and RENUMBERS NOTHING
+# T-PROFILE-STATE-34: `34 root.profile.dropin.installed` is registered, and RENUMBERS NOTHING
 # ============================================================================
 # state.add treats a NUMERIC argument as a transition marker that jumps the
 # index; every other argument takes the current index and then increments it.
 # So inserting a named state after `root.installation.done` lands it at 34 and
 # pushes only the `state.add 40` MARKER to index 35 — every existing state
 # NUMBER, including the ones hard-coded in comments across `oo` and `ossh`, is
-# unchanged.
+# unchanged. The RENAME from root.boot.path.installed changes the name in slot
+# 34 and nothing else.
 #
 # The host's own machine is frozen at first install, so this DECLARES a fresh
 # one under a throwaway CONFIG_PATH (state.machine.create + the very state.add
@@ -2667,7 +2511,7 @@ test.oo.stateMachineNumbering() {
 31=root.shared.dev.folder.created
 32=root.dev.keys.installed
 33=root.installation.done
-34=root.boot.path.installed
+34=root.profile.dropin.installed
 35=40
 40=user.shared.dev.folder.linked
 41=user.state.machine.synced.with.root
@@ -2687,44 +2531,45 @@ test.oo.stateMachineNumbering() {
   fi
   return $(result)
 }
-test.case - "T-BOOTPATH-STATE-34: root.boot.path.installed is state 34 and nothing else moves" \
+test.case - "T-PROFILE-STATE-34: root.profile.dropin.installed is state 34 and nothing else moves" \
   test.oo.stateMachineNumbering
 expect 0 "state 34 registered, no state renumbered" \
   "state numbers are hard-coded in comments across oo and ossh — they must not shift"
 
 
 # ============================================================================
-# T-BOOTPATH-BOOT-FIX / T-BOOTPATH-BOOT-STATUS — the repair primitive and its report
+# T-PROFILE-FIX / T-PROFILE-STATUS — the repair primitive and its report
 # ============================================================================
 # The state-machine declaration is FROZEN per host at first install
 # (state.machine.init writes the array once; oo.state() re-creates the machine
 # only when it does not exist). So no already-installed host will EVER see
-# state 34 — `oo boot.fix` is the only path onto those machines. It is not a
+# state 34 — `oo profile.fix` is the only path onto those machines. It is not a
 # convenience.
 
-# --- T-BOOTPATH-SHARED-BASE-GET ------------------------------------------------------
-# One derivation for state 31, state 34 and oo boot.fix. On an installed host
-# the answer must be the tree ~/oosh actually resolves into: <base>/<branch>/boot
-# IS the canonical boot.
+# --- T-PROFILE-SHARED-BASE-GET ------------------------------------------------------
+# One derivation for state 31 and its callers. On an installed host the answer
+# must be the tree ~/oosh actually resolves into. Probed through `oo` itself:
+# every branch has one, so the assertion does not depend on any single
+# bootstrap file continuing to exist.
 test.oo.sharedBaseGet() {
   local base branch canonical
   { read -r base; read -r branch; } <<< "$(private.oo.shared.base.get)"
-  canonical=$(private.this.path.canonical "$OOSH_DIR/boot")
+  canonical=$(private.this.path.canonical "$OOSH_DIR/oo")
   if [ -z "$base" ] || [ -z "$branch" ]; then
     create.result 1 "empty answer: base='$base' branch='$branch'"
-  elif [ "$(private.this.path.canonical "$base/$branch/boot")" != "$canonical" ]; then
-    create.result 1 "$base/$branch/boot is not the canonical boot ($canonical) — run \`oo user.fix\`"
+  elif [ "$(private.this.path.canonical "$base/$branch/oo")" != "$canonical" ]; then
+    create.result 1 "$base/$branch is not the tree ~/oosh resolves into ($canonical) — run \`oo user.fix\`"
   else
-    create.result 0 "shared base and branch resolve to the canonical boot"
+    create.result 0 "shared base and branch resolve to the canonical tree"
   fi
   return $(result)
 }
-test.case - "T-BOOTPATH-SHARED-BASE-GET: private.oo.shared.base.get names the tree ~/oosh resolves into" \
+test.case - "T-PROFILE-SHARED-BASE-GET: private.oo.shared.base.get names the tree ~/oosh resolves into" \
   test.oo.sharedBaseGet
-expect 0 "shared base and branch resolve to the canonical boot" \
-  "state 31, state 34 and oo boot.fix must agree on ONE base+branch derivation"
+expect 0 "shared base and branch resolve to the canonical tree" \
+  "state 31 and everything built on it must agree on ONE base+branch derivation"
 
-# --- T-BOOTPATH-PATH-SUDO-GET --------------------------------------------------------
+# --- T-PROFILE-PATH-SUDO-GET --------------------------------------------------------
 # The one privilege rule: writable -> no prefix; missing under a writable
 # parent -> no prefix; under a directory this user cannot write -> $SUDO
 # (which is "" for root, so root never gets a prefix either).
@@ -2743,68 +2588,64 @@ test.oo.pathSudoGet() {
   fi
   return $(result)
 }
-test.case - "T-BOOTPATH-PATH-SUDO-GET: private.oo.path.sudo.get prefixes only what this user cannot write" \
+test.case - "T-PROFILE-PATH-SUDO-GET: private.oo.path.sudo.get prefixes only what this user cannot write" \
   test.oo.pathSudoGet
 expect 0 "sudo prefix follows writability and \$SUDO" \
-  "oo boot.fix and private.oo.boot.path.ensure must share ONE privilege rule, built on \$SUDO"
+  "oo profile.fix and private.oo.profile.dropin.ensure must share ONE privilege rule, built on \$SUDO"
 
-# --- T-BOOTPATH-BOOT-FIX-CREATES-LINK -----------------------------------------------
-# Drives the real method against a writable fixture <systemPath>: it must
-# derive the canonical shared base + branch from this host itself and land a
-# symlink on the real `boot`.
-test.oo.bootFixCreatesLink() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootfix.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  rm -rf "$fixture"; mkdir -p "$fixture"
-  local sys="$fixture/oosh" prof="$fixture/profile.d"
-  mkdir -p "$prof"
-  # BOTH paths are fixtures on purpose: with the default <profileDir> the
-  # drop-in half would aim at the host's real /etc/profile.d and ask a
-  # non-root runner for a sudo password — a core test must never do that.
-  oo.boot.fix "$sys" "$prof" >/dev/null 2>&1
-  local rc=$?
-  local link="$sys/boot" resolved=""
-  [ -L "$link" ] && resolved=$(private.this.path.canonical "$link")
+# --- T-PROFILE-FIX-CREATES-DROPIN ---------------------------------------------------
+# Drives the real method against a writable fixture <profileDir>: it must land
+# the drop-in, and the drop-in must be the template.
+test.oo.profileFixCreatesDropIn() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profilefix.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
+  # A FIXTURE <profileDir> on purpose: with the default the method would aim at
+  # the host's real /etc/profile.d and ask a non-root runner for a sudo
+  # password — a core test must never do that.
+  oo.profile.fix "$fixture/profile.d" >/dev/null 2>&1
+  local rc=$? dropIn="$fixture/profile.d/oosh.sh"
   if [ "$rc" -ne 0 ]; then
-    create.result 1 "oo.boot.fix rc=$rc"
-  elif [ ! -L "$link" ]; then
-    create.result 1 "$link is not a symlink ($(ls -ld "$link" 2>&1))"
-  elif [ ! -f "$resolved" ]; then
-    create.result 1 "link target is not a file: '$resolved'"
-  elif [ "${resolved##*/}" != "boot" ]; then
-    create.result 1 "link does not point at a file named boot: '$resolved'"
+    create.result 1 "oo.profile.fix rc=$rc"
+  elif [ ! -f "$dropIn" ]; then
+    create.result 1 "$dropIn was not created ($(ls -la "$fixture/profile.d" 2>&1 | tr '\n' ' '))"
+  elif ! diff -q "$dropIn" "$OOSH_DIR/templates/user/profile.d.oosh.sh" >/dev/null 2>&1; then
+    create.result 1 "drop-in is not the template: $(diff "$OOSH_DIR/templates/user/profile.d.oosh.sh" "$dropIn" | head -3 | tr '\n' ' ')"
   else
-    create.result 0 "boot.fix landed the system boot path"
+    create.result 0 "profile.fix landed the login-shell drop-in"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-BOOT-FIX-CREATES-LINK: oo boot.fix derives base+branch and links boot" \
-  test.oo.bootFixCreatesLink
-expect 0 "boot.fix landed the system boot path" \
-  "the frozen-per-host state machine means boot.fix is the ONLY path onto existing machines"
+test.case - "T-PROFILE-FIX-CREATES-DROPIN: oo profile.fix writes <profileDir>/oosh.sh from the template" \
+  test.oo.profileFixCreatesDropIn
+expect 0 "profile.fix landed the login-shell drop-in" \
+  "the frozen-per-host state machine means profile.fix is the ONLY path onto existing machines"
 
-# --- T-BOOTPATH-BOOT-FIX-FAILS-LOUD -------------------------------------------------
-# Decision 4: $SUDO internally, one command for root and for a dev member with
-# sudo — and if NEITHER applies it must fail loudly naming what it needed,
-# never half-succeed. PATH=/nonexistent removes sudo from reach; the fixture
-# dir is mode 500 so the write genuinely needs privilege.
-test.oo.bootFixFailsLoudWithoutPrivilege() {
+# --- T-PROFILE-FIX-FAILS-LOUD -------------------------------------------------------
+# $SUDO internally, one command for root and for a dev member with sudo — and
+# if NEITHER applies it must fail loudly naming what it needed, never
+# half-succeed. PATH=/nonexistent removes sudo from reach; the fixture dir is
+# mode 500 so the write genuinely needs privilege.
+test.oo.profileFixFailsLoudWithoutPrivilege() {
   if [ "$(id -u)" = "0" ]; then
     create.result 0 "missing privilege reported loudly"   # root always has it
     return $(result)
   fi
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootfix.loud.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  rm -rf "$fixture"; mkdir -p "$fixture/ro"
-  chmod 500 "$fixture/ro"
-  local sys="$fixture/ro/oosh"
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profilefix.loud.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
+  # The DROP-IN DIRECTORY is what must be unwritable: private.oo.path.sudo.get
+  # probes <profileDir> itself (it exists), not its parent. A mode-500 parent
+  # around a writable profile.d would need no privilege at all and the case
+  # would prove nothing.
+  chmod 500 "$fixture/profile.d"
   local out rc
-  out=$( ( PATH=/nonexistent; oo.boot.fix "$sys" "$fixture/ro/profile.d" ) 2>&1 )
+  out=$( ( PATH=/nonexistent; oo.profile.fix "$fixture/profile.d" ) 2>&1 )
   rc=$?
-  chmod 700 "$fixture/ro" 2>/dev/null
+  chmod 700 "$fixture/profile.d" 2>/dev/null
   if [ "$rc" -eq 0 ]; then
     create.result 1 "returned 0 with neither root nor sudo — half-success"
-  elif [ -e "$sys" ]; then
-    create.result 1 "created something at $sys despite failing"
+  elif [ -e "$fixture/profile.d/oosh.sh" ]; then
+    create.result 1 "created a drop-in despite failing"
   elif ! echo "$out" | grep -q 'root'; then
     create.result 1 "failure message does not name what it needed: $out"
   elif ! echo "$out" | grep -q 'sudo'; then
@@ -2815,12 +2656,12 @@ test.oo.bootFixFailsLoudWithoutPrivilege() {
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-BOOT-FIX-FAILS-LOUD: neither root nor sudo fails loudly, naming both" \
-  test.oo.bootFixFailsLoudWithoutPrivilege
+test.case - "T-PROFILE-FIX-FAILS-LOUD: neither root nor sudo fails loudly, naming both" \
+  test.oo.profileFixFailsLoudWithoutPrivilege
 expect 0 "missing privilege reported loudly" \
   "it must never half-succeed (T9 decision 4)"
 
-# --- T-BOOTPATH-BOOT-FIX-FATAL-USES-BARE-ECHO ---------------------------------------
+# --- T-PROFILE-FIX-FATAL-USES-BARE-ECHO ---------------------------------------------
 # Doctrine guard, mirroring the bare-echo tests in test.promote and
 # test.ossh.certificates.update. error.log routes to $LOG_DEVICE, so a
 # fatal instruction emitted through it VANISHES whenever LOG_DEVICE is a file,
@@ -2829,118 +2670,85 @@ expect 0 "missing privilege reported loudly" \
 # error.log and was invisible to every container user in the platform run,
 # while still printing on the developer's terminal, so it passed locally and
 # failed in CI. Guards against a future "uniform log routing" refactor.
-test.case - "T-BOOTPATH-BOOT-FIX-FATAL-USES-BARE-ECHO: the privilege failure survives any LOG_DEVICE" \
+test.case - "T-PROFILE-FIX-FATAL-USES-BARE-ECHO: the privilege failure survives any LOG_DEVICE" \
   true
-if type oo.boot.fix 2>/dev/null | grep 'needs root' | grep -qE '^[[:space:]]*echo '; then
+if type oo.profile.fix 2>/dev/null | grep 'needs root' | grep -qE '^[[:space:]]*echo '; then
   expect.pass "fatal privilege line uses bare \`echo\` — survives every LOG_LEVEL / LOG_DEVICE"
 else
   expect.fail "'needs root' line must use bare \`echo\` (not error.log) per [status-command-output-idiom]"
 fi
 
-# --- T-BOOTPATH-BOOT-STATUS-ECHOES-AT-LOG-LEVEL-1 -----------------------------------
+# --- T-PROFILE-STATUS-ECHOES-AT-LOG-LEVEL-1 -----------------------------------------
 # The repo's status-command idiom: a user-invoked .status method emits its
 # ANSWER on plain stdout, never gated behind console.log / important.log —
-# otherwise `oo boot.status` is silent at the log level CI and installs use.
-test.oo.bootStatusEchoesAtLevel1() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootstatus.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  rm -rf "$fixture"; mkdir -p "$fixture"
-  local sys="$fixture/oosh" prof="$fixture/profile.d"
-  mkdir -p "$prof"
-  oo.boot.fix "$sys" "$prof" >/dev/null 2>&1
-  local saved=$LOG_LEVEL out
+# otherwise `oo profile.status` is silent at the log level CI and installs use.
+test.oo.profileStatusEchoesAtLevel1() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profilestatus.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
+  local prof="$fixture/profile.d"
+  oo.profile.fix "$prof" >/dev/null 2>&1
+  local saved=$LOG_LEVEL out rc
   log.level 1 >/dev/null 2>&1
-  out=$(oo.boot.status "$sys" "$prof" 2>/dev/null)
+  out=$(oo.profile.status "$prof" 2>/dev/null); rc=$?
   log.level $saved >/dev/null 2>&1
   if [ -z "$out" ]; then
     create.result 1 "no stdout at LOG_LEVEL=1 — the answer is gated behind a log function"
-  elif ! echo "$out" | grep -Fq "$sys/boot"; then
-    create.result 1 "report does not name the path: $out"
-  elif ! echo "$out" | grep -Fq "$(readlink "$sys/boot" 2>/dev/null)"; then
-    create.result 1 "report does not name the resolved target: $out"
+  elif [ "$rc" -ne 0 ]; then
+    create.result 1 "healthy drop-in reported rc=$rc: $out"
+  elif ! echo "$out" | grep -Fq "$prof/oosh.sh"; then
+    create.result 1 "report does not name the drop-in: $out"
+  elif ! echo "$out" | grep -q 'OK'; then
+    create.result 1 "report does not state the drop-in is OK: $out"
   else
     create.result 0 "status reports on stdout at log level 1"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-BOOT-STATUS-ECHOES-AT-LOG-LEVEL-1: the answer goes to plain stdout" \
-  test.oo.bootStatusEchoesAtLevel1
+test.case - "T-PROFILE-STATUS-ECHOES-AT-LOG-LEVEL-1: the answer goes to plain stdout" \
+  test.oo.profileStatusEchoesAtLevel1
 expect 0 "status reports on stdout at log level 1" \
   "status answers are echo, not console.log (repo idiom)"
 
-# --- T-BOOTPATH-BOOT-STATUS-READ-ONLY -----------------------------------------------
-test.oo.bootStatusIsReadOnly() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootstatus.ro.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  rm -rf "$fixture"; mkdir -p "$fixture"
-  local sys="$fixture/oosh"
+# --- T-PROFILE-STATUS-READ-ONLY -----------------------------------------------------
+test.oo.profileStatusIsReadOnly() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profilestatus.ro.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
   local before after out rc
   before=$(find "$fixture" | sort)
-  out=$(oo.boot.status "$sys" "$fixture/profile.d" 2>/dev/null)
+  out=$(oo.profile.status "$fixture/profile.d" 2>/dev/null)
   rc=$?
   after=$(find "$fixture" | sort)
   if [ "$before" != "$after" ]; then
     create.result 1 "status MUTATED the tree: $(diff <(echo "$before") <(echo "$after") | tr '\n' ' ')"
   elif [ "$rc" -eq 0 ]; then
-    create.result 1 "reported rc=0 for a MISSING system boot path"
-  elif ! echo "$out" | grep -q 'boot.fix'; then
-    create.result 1 "missing path reported without the recovery command: $out"
+    create.result 1 "reported rc=0 for a MISSING drop-in"
+  elif ! echo "$out" | grep -q 'profile.fix'; then
+    create.result 1 "missing drop-in reported without the recovery command: $out"
   else
     create.result 0 "status is read-only and names the recovery command"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-BOOT-STATUS-READ-ONLY: reports a missing path without creating it" \
-  test.oo.bootStatusIsReadOnly
+test.case - "T-PROFILE-STATUS-READ-ONLY: reports a missing drop-in without creating it" \
+  test.oo.profileStatusIsReadOnly
 expect 0 "status is read-only and names the recovery command" \
-  "a report must diagnose, never repair — repair is the explicit oo boot.fix"
+  "a report must diagnose, never repair — repair is the explicit oo profile.fix"
 
 
 # ============================================================================
-# T-BOOTPATH-PROFILED: /etc/profile.d/oosh.sh — the LOGIN-SHELL recovery route
+# T-PROFILE-DROPIN / T-PROFILE-CONTENT — the file itself
 # ============================================================================
-# Follow-on to T9 (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md
-# "The three recovery routes"). `/etc/oosh/boot` works, but a human has to TYPE
-# `. /etc/oosh/boot`. Measured in a container:
-#
-#   env -i sh                     -> NO   $ENV is a non-login POSIX sh's ONLY rc
-#                                         hook, and `env -i` is what erased it.
-#                                         Nothing can recover this; do not claim
-#                                         otherwise anywhere.
-#   env -i ENV=/etc/oosh/boot sh  -> YES  that same hook, handed back by hand.
-#   env -i sh -l                  -> only once /etc/profile has an oosh line.
-#
-# dash's own trace settles the third: `env -i sh -lxc ':'` runs /etc/profile
-# (`id -u`, `[ 1003 -eq 0 ]`, `PS1=$`, `[ -d /etc/profile.d ]`) while
-# `env -i sh -xc ':'` shows only `+ :` — and /etc/profile already loops
-# `for i in /etc/profile.d/*.sh`. So a drop-in makes the login route work.
-#
-# It is created by the SAME state 34 and healed by the SAME `oo boot.fix` —
-# i.e. by private.oo.boot.path.ensure. One mechanism, not two.
-#
-# EVERYTHING here is driven against FIXTURE paths. A core test must never
-# write to the host's real /etc/profile.d, and must never need root.
 
-# Build a fixture whose <branch>/boot is the REAL boot, so the behavioural
-# assertions below actually exercise the anchoring prologue. `[ -f ]` follows
-# symlinks, so the helper's warn-and-skip guard is satisfied.
-test.oo.bootProfile.fixture() { # <fixtureRoot> <?withProfileDir:yes>
-  local fixture="$1" withProfileDir="${2:-yes}"
-  rm -rf "$fixture"
-  mkdir -p "$fixture/shared/dev" "$fixture/system/oosh"
-  ln -sfn "$OOSH_DIR/boot" "$fixture/shared/dev/boot"
-  [ "$withProfileDir" = "yes" ] && mkdir -p "$fixture/system/profile.d"
-  return 0
-}
-
-# --- T-BOOTPATH-PROFILED-DROPIN-CREATED --------------------------------------------
+# --- T-PROFILE-DROPIN-CREATED -------------------------------------------------------
 # The file must END IN .sh — /etc/profile has `for i in /etc/profile.d/*.sh`,
 # so any other name is never read and the whole route silently does nothing.
-test.oo.bootProfileDropInCreated() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.create.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootProfile.fixture "$fixture" yes
-  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+test.oo.profileDropInCreated() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profiledropin.create.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
+  local prof="$fixture/profile.d"
+  private.oo.profile.dropin.ensure "$prof" >/dev/null 2>&1
   local rc=$? dropIn="$prof/oosh.sh" mode=""
   [ -f "$dropIn" ] && mode=$(ls -l "$dropIn" 2>/dev/null | cut -c1-10)
   local matched=no
@@ -2952,8 +2760,8 @@ test.oo.bootProfileDropInCreated() {
     create.result 1 "no drop-in at $dropIn (dir: $(ls -la "$prof" 2>&1 | tr '\n' ' '))"
   elif [ "$matched" != "yes" ]; then
     create.result 1 "$dropIn is not matched by /etc/profile's own \`*.sh\` glob — it would never be read"
-  elif ! grep -Fq "$sys/boot" "$dropIn"; then
-    create.result 1 "drop-in does not source $sys/boot: $(cat "$dropIn")"
+  elif ! grep -Fq 'config/user.env' "$dropIn"; then
+    create.result 1 "drop-in does not source ~/config/user.env: $(cat "$dropIn")"
   elif [ "$mode" != "-rw-r--r--" ]; then
     create.result 1 "drop-in mode is '$mode', expected -rw-r--r-- (644) — every login shell must be able to read it"
   else
@@ -2962,74 +2770,73 @@ test.oo.bootProfileDropInCreated() {
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-PROFILED-DROPIN-CREATED: state 34 / oo boot.fix also lands <profileDir>/oosh.sh" \
-  test.oo.bootProfileDropInCreated
+test.case - "T-PROFILE-DROPIN-CREATED: state 34 / oo profile.fix lands <profileDir>/oosh.sh" \
+  test.oo.profileDropInCreated
 expect 0 "login-shell drop-in created" \
   "without it \`env -i sh -l\` still cannot bootstrap oosh (/etc/profile has no oosh line)"
 
-# --- T-BOOTPATH-PROFILED-SKIPS-WITHOUT-PROFILE-DIR ---------------------------------
+# --- T-PROFILE-SKIPS-WITHOUT-PROFILE-DIR --------------------------------------------
 # macOS has NO /etc/profile.d: its /etc/profile runs path_helper and sources
 # /etc/bashrc, and globs nothing. Creating the directory there would be inert,
-# so absence is a GRACEFUL SKIP — rc 0, symlink still ensured, nothing created.
-# This is the same shape as the helper's existing warn-and-skip for a branch
-# without `boot`.
-test.oo.bootProfileSkipsWithoutProfileDir() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.nodir.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootProfile.fixture "$fixture" no
-  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+# so absence is a GRACEFUL SKIP — rc 0, nothing created.
+test.oo.profileSkipsWithoutProfileDir() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profiledropin.nodir.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture"
+  local prof="$fixture/profile.d"
+  private.oo.profile.dropin.ensure "$prof" >/dev/null 2>&1
   local rc=$?
   if [ "$rc" -ne 0 ]; then
     create.result 1 "absent $prof must SKIP (rc=0), got rc=$rc — state 34 would halt on every macOS host"
   elif [ -e "$prof" ]; then
     create.result 1 "created $prof although the host has none — a drop-in there is inert on macOS"
-  elif [ ! -L "$sys/boot" ]; then
-    create.result 1 "the primary contract was dropped: no symlink at $sys/boot"
   else
     create.result 0 "no profile.d means a graceful skip"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-PROFILED-SKIPS-WITHOUT-PROFILE-DIR: macOS has no /etc/profile.d — skip, do not fail" \
-  test.oo.bootProfileSkipsWithoutProfileDir
+test.case - "T-PROFILE-SKIPS-WITHOUT-PROFILE-DIR: macOS has no /etc/profile.d — skip, do not fail" \
+  test.oo.profileSkipsWithoutProfileDir
 expect 0 "no profile.d means a graceful skip" \
   "the login route is Linux-only; its absence must never halt state 34"
 
-# --- T-BOOTPATH-PROFILED-CONTENT-FROM-TEMPLATE -------------------------------------
+# --- T-PROFILE-CONTENT-FROM-TEMPLATE ------------------------------------------------
 # The drop-in is a managed file, so its content is a TEMPLATE
 # (templates/user/profile.d.oosh.sh) like bashrcTemplate and ooShim — never a
-# heredoc in code. The method only substitutes @SYSTEM_PATH@.
-test.oo.bootProfileContentFromTemplate() {
-  local template="$OOSH_DIR/templates/user/profile.d.oosh.sh" got want
+# heredoc in code. Nothing is substituted any more: the boot data is at a
+# $HOME-relative path, so the emitted bytes ARE the template's bytes.
+test.oo.profileContentFromTemplate() {
+  local template="$OOSH_DIR/templates/user/profile.d.oosh.sh" tmp
   if [ ! -r "$template" ]; then
     create.result 1 "template missing: $template"; return $(result)
   fi
-  got=$(private.oo.boot.profile.content.get /fix/oosh)
-  want=$(sed 's|@SYSTEM_PATH@|/fix/oosh|g' "$template")
-  if [ -z "$got" ]; then
-    create.result 1 "method emitted nothing"
-  elif [ "$got" != "$want" ]; then
-    create.result 1 "emitted content is not the substituted template"
-  elif printf '%s' "$got" | grep -q '@SYSTEM_PATH@'; then
-    create.result 1 "placeholder left unsubstituted"
-  else
-    create.result 0 "drop-in content comes from the template"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/test.oo.profilecontent.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  private.oo.profile.content.get > "$tmp" 2>/dev/null
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; create.result 1 "private.oo.profile.content.get emitted nothing"; return $(result)
   fi
+  if ! diff -q "$tmp" "$template" >/dev/null 2>&1; then
+    create.result 1 "emitted content is not byte-equal to the template: $(diff "$template" "$tmp" | head -3 | tr '\n' ' ')"
+  elif grep -q '@SYSTEM_PATH@' "$tmp"; then
+    create.result 1 "a @SYSTEM_PATH@ placeholder survives — there is no path to substitute any more"
+  else
+    create.result 0 "drop-in content is the template, byte for byte"
+  fi
+  rm -f "$tmp"
   return $(result)
 }
-test.case - "T-BOOTPATH-PROFILED-CONTENT-FROM-TEMPLATE: the drop-in is templates/user/profile.d.oosh.sh with the path substituted" \
-  test.oo.bootProfileContentFromTemplate
-expect 0 "drop-in content comes from the template" \
+test.case - "T-PROFILE-CONTENT-FROM-TEMPLATE: the drop-in IS templates/user/profile.d.oosh.sh, unsubstituted" \
+  test.oo.profileContentFromTemplate
+expect 0 "drop-in content is the template, byte for byte" \
   "managed files oosh writes come from templates/user/, never from heredocs in code"
 
-# --- T-BOOTPATH-PROFILED-CONTENT-IS-POSIX ------------------------------------------
-# It is read by /bin/sh on every login. Same bar as `boot` itself (T40).
-test.oo.bootProfileContentIsPosix() {
-  local tmp bad=""; tmp=$(mktemp "${TMPDIR:-/tmp}/test.oo.bootprofile.lint.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  private.oo.boot.profile.content.get /etc/oosh > "$tmp" 2>/dev/null
+# --- T-PROFILE-CONTENT-IS-POSIX -----------------------------------------------------
+# It is read by /bin/sh on every login.
+test.oo.profileContentIsPosix() {
+  local tmp bad=""; tmp=$(mktemp "${TMPDIR:-/tmp}/test.oo.profilelint.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  private.oo.profile.content.get > "$tmp" 2>/dev/null
   if [ ! -s "$tmp" ]; then
-    rm -f "$tmp"; create.result 1 "private.oo.boot.profile.content.get emitted nothing"
+    rm -f "$tmp"; create.result 1 "private.oo.profile.content.get emitted nothing"
     return $(result)
   fi
   sh    -n "$tmp" 2>/dev/null || bad="$bad sh:$(sh -n "$tmp" 2>&1 | head -1)"
@@ -3043,99 +2850,133 @@ test.oo.bootProfileContentIsPosix() {
   # `-n` ALONE IS NOT ENOUGH, and that is measured, not assumed: a planted
   # `[[ -r … ]]` sails through `dash -n`, because `[[` is a perfectly valid
   # COMMAND NAME to dash — it only blows up at run time with "[[: not found".
-  # So the common bashisms are grepped for explicitly. (T40 lints `boot` the
-  # same way and inherits the same blind spot.)
-  grep -Eq '(^|[[:space:];&|(])(\[\[|\(\(|local|source|declare|typeset)([[:space:]]|$)' "$tmp" \
-    && bad="$bad bashism:$(grep -nE '(^|[[:space:];&|(])(\[\[|\(\(|local|source|declare|typeset)([[:space:]]|$)' "$tmp" | head -1)"
-  # `exit` in a file sourced by /etc/profile KILLS the login shell.
-  grep -Eq '(^|[[:space:];&|(])exit([[:space:]]|$)' "$tmp" && bad="$bad contains-exit"
+  # So the common bashisms are grepped for explicitly — in the CODE only. The
+  # header of this file is prose about the code ("neither file may source a
+  # shared helper"), and a comment cannot be a bashism.
+  local bashisms='(^|[[:space:];&|(])(\[\[|\(\(|local|source|declare|typeset)([[:space:]]|$)'
+  if grep -vE '^[[:space:]]*#' "$tmp" | grep -Eq "$bashisms"; then
+    bad="$bad bashism:$(grep -vE '^[[:space:]]*#' "$tmp" | grep -nE "$bashisms" | head -1)"
+  fi
   rm -f "$tmp"
   if [ -z "$bad" ]; then
-    create.result 0 "drop-in is POSIX and cannot exit a login shell"
+    create.result 0 "drop-in parses as POSIX sh in every shell"
   else
     create.result 1 "drop-in lint failed —$bad"
   fi
   return $(result)
 }
-test.case - "T-BOOTPATH-PROFILED-CONTENT-IS-POSIX: parses under sh/dash/ash/bash and never \`exit\`s" \
-  test.oo.bootProfileContentIsPosix
-expect 0 "drop-in is POSIX and cannot exit a login shell" \
-  "this file runs for EVERY login on the box — a parse error or an exit breaks logins"
+test.case - "T-PROFILE-CONTENT-IS-POSIX: parses under sh/dash/ash/bash with no bashisms" \
+  test.oo.profileContentIsPosix
+expect 0 "drop-in parses as POSIX sh in every shell" \
+  "this file runs for EVERY login on the box — a parse error breaks logins"
 
-# --- T-BOOTPATH-PROFILED-CONTENT-IS-GUARDED ----------------------------------------
-# The behavioural contract, four ways. This runs for every login shell on the
-# host, including users who have never heard of oosh.
-#   1. HOME unset (`env -i sh -l`, the case this route EXISTS for) -> boot is
-#      sourced and derives HOME itself.
-#   2. HOME set and the user HAS ~/oosh -> sourced, anchors recovered.
-#   3. HOME set and the user has NO ~/oosh -> NOT sourced. This is the PATH
-#      judgement call: without this guard every non-oosh user on the box grows
-#      a nonexistent ~/oosh on PATH *and* an empty ~/.config/oosh in their home
-#      just for logging in.
-#   4. the boot target missing/dangling -> silent no-op, rc 0, shell alive.
-test.oo.bootProfileContentIsGuarded() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.guard.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootProfile.fixture "$fixture" yes
-  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+# --- T-PROFILE-CONTENT-IS-GUARDED ---------------------------------------------------
+# The behavioural contract plus the two structural rules that keep a login
+# alive. This runs for every login shell on the host, including users who have
+# never heard of oosh.
+#   1. HOME unset (`env -i sh -l`, the case this route EXISTS for) -> HOME is
+#      derived from the password database, then ~/config/user.env is sourced.
+#   2. HOME set and the user HAS ~/config/user.env -> anchors recovered.
+#   3. HOME set and the user has NO ~/config/user.env -> left exactly as found.
+#      Without this guard every non-oosh user on the box would grow a
+#      nonexistent ~/oosh on PATH just for logging in.
+#   4. Structurally: the source line is behind a `[ -f … ]` test, and there is
+#      no `exit` (it would CLOSE the login shell) and no `return` (not every
+#      /etc/profile sources this from a function) anywhere outside a comment.
+test.oo.profileContentIsGuarded() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profileguard.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
+  local prof="$fixture/profile.d"
+  private.oo.profile.dropin.ensure "$prof" >/dev/null 2>&1
   local dropIn="$prof/oosh.sh" bad="" out
   local probe='echo "<[$HOME|$OOSH_DIR]>"'
 
-  # 1. HOME unset — boot must run and recover it from the password database.
-  #    Compared against the PASSWD home, which is what boot derives — not the
-  #    runner's $HOME (they differ under sudo without -H).
+  # 4a. the source line is GUARDED by a `[ -f ]` test on the same file.
+  grep -Eq '\[ -f "\$HOME/config/user\.env" \]' "$dropIn" \
+    || bad="$bad source-not-behind-[-f]"
+  # 4b. no `exit`, no `return` outside comments. Single-quoted spans are
+  #     stripped first: `awk '… ; exit }'` is an AWK keyword inside an awk
+  #     program, not a shell command, and a shell `exit`/`return` can never
+  #     live inside single quotes.
+  if grep -vE '^[[:space:]]*#' "$dropIn" | sed "s/'[^']*'//g" | grep -Ewq 'return|exit'; then
+    bad="$bad contains-exit-or-return:$(grep -vE '^[[:space:]]*#' "$dropIn" | sed "s/'[^']*'//g" | grep -Ewn 'return|exit' | head -1)"
+  fi
+
+  # 1. HOME unset — the drop-in must recover it from the password database.
+  #    Compared against the PASSWD home, not the runner's $HOME (they differ
+  #    under sudo without -H).
   local pwHome
   pwHome=$(test.suite.home.passwd)
   out=$(cd /tmp && env -i sh -c ". $dropIn; $probe" 2>&1 | grep -o '<\[[^]]*\]>' | tail -1)
   [ "$out" = "<[$pwHome|$pwHome/oosh]>" ] || bad="$bad home-unset=>$out"
 
-  # 2. HOME set, user HAS ~/oosh (this test's own user, by definition of $HOME).
-  if [ -d "$HOME/oosh" ]; then
+  # 2. HOME set, user HAS ~/config/user.env (this test's own user).
+  if [ -f "$HOME/config/user.env" ]; then
     out=$(cd /tmp && env -i HOME="$HOME" sh -c ". $dropIn; $probe" 2>&1 | grep -o '<\[[^]]*\]>' | tail -1)
     [ "$out" = "<[$HOME|$HOME/oosh]>" ] || bad="$bad oosh-user=>$out"
   fi
 
-  # 3. HOME set, NO ~/oosh — must not source boot, and must not litter.
+  # 3. HOME set, NO ~/config/user.env — must be left exactly as found.
   local stranger="$fixture/stranger"
   mkdir -p "$stranger"
   out=$(cd /tmp && env -i HOME="$stranger" sh -c ". $dropIn; $probe" 2>&1 | grep -o '<\[[^]]*\]>' | tail -1)
   [ "$out" = "<[$stranger|]>" ] || bad="$bad non-oosh-user=>$out"
   [ -e "$stranger/.config/oosh" ] && bad="$bad littered:$stranger/.config/oosh"
 
-  # 4. the target is gone — a login must see NOTHING, not an error.
-  rm -f "$sys/boot"
-  out=$(cd /tmp && env -i HOME="$HOME" sh -c ". $dropIn; echo ALIVE" 2>&1)
-  [ "$out" = "ALIVE" ] || bad="$bad dangling-not-silent=>$out"
-  ( cd /tmp && env -i HOME="$HOME" sh -c ". $dropIn" ) >/dev/null 2>&1 || bad="$bad dangling-rc=$?"
-
   rm -rf "$fixture" 2>/dev/null
   if [ -z "$bad" ]; then
-    create.result 0 "drop-in is guarded on both the target and the caller"
+    create.result 0 "drop-in is guarded on the file and on the caller"
   else
     create.result 1 "guard broken —$bad"
   fi
   return $(result)
 }
-test.case - "T-BOOTPATH-PROFILED-CONTENT-IS-GUARDED: never breaks a login, never touches a non-oosh user" \
-  test.oo.bootProfileContentIsGuarded
-expect 0 "drop-in is guarded on both the target and the caller" \
+test.case - "T-PROFILE-CONTENT-IS-GUARDED: never breaks a login, never touches a non-oosh user" \
+  test.oo.profileContentIsGuarded
+expect 0 "drop-in is guarded on the file and on the caller" \
   "a host-wide login hook that assumes oosh would junk every other user's PATH and home"
 
-# --- T-BOOTPATH-PROFILED-IDEMPOTENT ------------------------------------------------
-test.oo.bootProfileIdempotent() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.idem.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootProfile.fixture "$fixture" yes
-  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+# --- T-PROFILE-CONTENT-RECOVERS-HOME ------------------------------------------------
+# The one thing this file exists for, asserted against the TEMPLATE itself
+# rather than a written fixture: `env -i` drops HOME, and the drop-in derives
+# it (getent -> dscl -> /etc/passwd) before anything else. Second half: with an
+# unusable PATH every lookup fails, and the fall-through must be SILENT and
+# NON-FATAL — a shell that exits or returns here closes somebody's login.
+test.oo.profileContentRecoversHome() {
+  local template="$OOSH_DIR/templates/user/profile.d.oosh.sh" bad="" out pwHome
+  pwHome=$(test.suite.home.passwd)
+  out=$(cd /tmp && env -i PATH=/usr/bin:/bin /bin/sh -c ". $template; echo \"[\$HOME]\"" 2>&1 | tail -1)
+  [ "$out" = "[$pwHome]" ] || bad="$bad recovery=>$out"
+  # /bin/sh by ABSOLUTE path: with PATH=/nonexistent, `env` itself could not
+  # find a bare `sh` and the case would prove nothing.
+  out=$(cd /tmp && env -i PATH=/nonexistent /bin/sh -c ". $template; echo ALIVE" 2>&1 | tail -1)
+  [ "$out" = "ALIVE" ] || bad="$bad unusable-PATH=>$out"
+  if [ -z "$bad" ]; then
+    create.result 0 "drop-in recovers HOME and never aborts the shell"
+  else
+    create.result 1 "HOME recovery broken —$bad"
+  fi
+  return $(result)
+}
+test.case - "T-PROFILE-CONTENT-RECOVERS-HOME: derives \$HOME under env -i, and survives an unusable PATH" \
+  test.oo.profileContentRecoversHome
+expect 0 "drop-in recovers HOME and never aborts the shell" \
+  "every anchor hangs off \$HOME, and a login shell must survive a failed lookup"
+
+# --- T-PROFILE-IDEMPOTENT -----------------------------------------------------------
+test.oo.profileIdempotent() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profileidem.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
+  local prof="$fixture/profile.d"
+  private.oo.profile.dropin.ensure "$prof" >/dev/null 2>&1
   local first; first=$(cat "$prof/oosh.sh" 2>/dev/null; ls -l "$prof" 2>/dev/null)
-  private.oo.boot.path.ensure "$fixture/shared" dev "$sys" "$prof" >/dev/null 2>&1
+  private.oo.profile.dropin.ensure "$prof" >/dev/null 2>&1
   local rc=$? second; second=$(cat "$prof/oosh.sh" 2>/dev/null; ls -l "$prof" 2>/dev/null)
   if [ "$rc" -ne 0 ]; then
     create.result 1 "second call returned rc=$rc"
   elif [ ! -s "$prof/oosh.sh" ]; then
     # Without this, "nothing == nothing" would make the comparison below pass
-    # while no drop-in was ever written — the `create.result 1` defect in
-    # another dress. Two absences are not idempotence.
+    # while no drop-in was ever written. Two absences are not idempotence.
     create.result 1 "no drop-in to be idempotent about at $prof/oosh.sh"
   elif [ "$first" != "$second" ]; then
     create.result 1 "second call changed the drop-in"
@@ -3145,47 +2986,52 @@ test.oo.bootProfileIdempotent() {
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-PROFILED-IDEMPOTENT: re-running state 34 rewrites the same file" \
-  test.oo.bootProfileIdempotent
+test.case - "T-PROFILE-IDEMPOTENT: re-running state 34 rewrites the same file" \
+  test.oo.profileIdempotent
 expect 0 "drop-in write is a no-op on re-run" \
-  "state 34 re-runs on every re-install, and oo boot.fix is run by hand"
+  "state 34 re-runs on every re-install, and oo profile.fix is run by hand"
 
-# --- T-BOOTPATH-PROFILED-STATUS-REPORTS --------------------------------------------
-# `oo boot.status` is the read-only report; it must cover BOTH host resources
-# the fix creates, or a missing drop-in is invisible until someone tries
+# --- T-PROFILE-STATUS-REPORTS -------------------------------------------------------
+# `oo profile.status` is the read-only report; a missing OR stale drop-in must
+# be visible, or a broken login route stays invisible until someone needs
 # `env -i sh -l` in anger.
-test.oo.bootProfileStatusReports() {
-  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.bootprofile.status.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  test.oo.bootProfile.fixture "$fixture" yes
-  local sys="$fixture/system/oosh" prof="$fixture/system/profile.d"
-  oo.boot.fix "$sys" "$prof" >/dev/null 2>&1
-  local saved=$LOG_LEVEL out rc
+test.oo.profileStatusReports() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.profilestatus.rep.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  rm -rf "$fixture"; mkdir -p "$fixture/profile.d"
+  local prof="$fixture/profile.d"
+  oo.profile.fix "$prof" >/dev/null 2>&1
+  local saved=$LOG_LEVEL out rc out2 rc2 out3 rc3
   log.level 1 >/dev/null 2>&1
-  out=$(oo.boot.status "$sys" "$prof" 2>/dev/null); rc=$?
-  # now break it and re-report
+  out=$(oo.profile.status "$prof" 2>/dev/null); rc=$?
+  # STALE: present, but not the oosh drop-in (a host healed by the old T9).
+  echo '# something else entirely' > "$prof/oosh.sh"
+  out2=$(oo.profile.status "$prof" 2>/dev/null); rc2=$?
+  # MISSING
   rm -f "$prof/oosh.sh"
-  local out2 rc2
-  out2=$(oo.boot.status "$sys" "$prof" 2>/dev/null); rc2=$?
+  out3=$(oo.profile.status "$prof" 2>/dev/null); rc3=$?
   log.level $saved >/dev/null 2>&1
   if [ "$rc" -ne 0 ]; then
     create.result 1 "healthy host reported rc=$rc: $out"
   elif ! echo "$out" | grep -Fq "$prof/oosh.sh"; then
     create.result 1 "report does not name the drop-in: $out"
   elif [ "$rc2" -eq 0 ]; then
-    create.result 1 "a MISSING drop-in reported healthy (rc=0): $out2"
-  elif ! echo "$out2" | grep -q 'boot.fix'; then
-    create.result 1 "missing drop-in reported without the recovery command: $out2"
+    create.result 1 "a STALE drop-in reported healthy (rc=0): $out2"
+  elif ! echo "$out2" | grep -q 'STALE'; then
+    create.result 1 "a stale drop-in was not reported as STALE: $out2"
+  elif [ "$rc3" -eq 0 ]; then
+    create.result 1 "a MISSING drop-in reported healthy (rc=0): $out3"
+  elif ! echo "$out3" | grep -q 'profile.fix'; then
+    create.result 1 "missing drop-in reported without the recovery command: $out3"
   else
-    create.result 0 "status covers the login-shell drop-in too"
+    create.result 0 "status separates OK, STALE and MISSING"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case - "T-BOOTPATH-PROFILED-STATUS-REPORTS: oo boot.status reports the drop-in, and misses nothing" \
-  test.oo.bootProfileStatusReports
-expect 0 "status covers the login-shell drop-in too" \
-  "two host resources, one report — otherwise a broken login route is invisible"
-
+test.case - "T-PROFILE-STATUS-REPORTS: oo profile.status tells OK, STALE and MISSING apart" \
+  test.oo.profileStatusReports
+expect 0 "status separates OK, STALE and MISSING" \
+  "a host healed by the old T9 has a drop-in that sources /etc/oosh/boot — that must read STALE, not OK"
 
 # ============================================================================
 # T-CMD-* — oo.cmd's result contract

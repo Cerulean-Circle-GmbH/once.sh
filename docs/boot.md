@@ -289,7 +289,7 @@ So there is a fixed, host-wide path. **One command, any user, any shell, no envi
 ```
 
 `/etc/oosh/boot` is a **symlink** into the shared tree, created by install state
-**`34 root.boot.path.installed`** and healed by **`oo boot.fix`** (`oo boot.status` reports on it).
+**`34 root.profile.dropin.installed`** and healed by **`oo profile.fix`** (`oo profile.status` reports on it).
 It needs no `HOME`, no `PATH` and no knowledge of which branch you are on: `boot` derives `$HOME`
 per caller, so the one canonical copy serves every user on the box — you source the host's
 anchoring prologue and then your *own* config and your *own* `log`, from your *own* tree.
@@ -324,8 +324,8 @@ only `+ :`. If you have no environment *and* have not typed anything, nothing ca
 
 #### `/etc/profile.d/oosh.sh` — the login route
 
-Created by the **same** install state `34 root.boot.path.installed` and healed by the
-**same** `oo boot.fix` as `/etc/oosh/boot`; `oo boot.status` reports on both. The `.sh`
+Created by install state `34 root.profile.dropin.installed` and healed by
+`oo profile.fix`; `oo profile.status` reports on it. The `.sh`
 suffix is load-bearing — `/etc/profile`'s glob is `/etc/profile.d/*.sh`, and any other
 name is simply never read.
 
@@ -410,7 +410,7 @@ change which route you should reach for:
    oosh commands, which re-exec under bash themselves.
 
 **Portable fallbacks**, for a host that has no `/etc/oosh/boot` — a user-rights-only (20-lane)
-install never reaches state 34, and a host installed before this landed has not run `oo boot.fix`
+install never reaches state 34, and a host installed before this landed has not run `oo profile.fix`
 yet:
 
 ```sh
