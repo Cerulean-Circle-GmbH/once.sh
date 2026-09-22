@@ -107,7 +107,7 @@ text wherever else it appears — including inside this tool's own source.
 
 Requires the markers to be present. `templates/code/newScript` and `templates/code/newScriptTest`
 carry them, and each template re-emits the marker after what it inserts, so the next call has
-somewhere to go. Scripts without a `<script>.start` dispatcher — `boot`, `debug` — are not
+somewhere to go. Scripts without a `<script>.start` dispatcher — `debug` — are not
 method-scripts and deliberately have no marker.
 
 ### oo.test.new
@@ -237,7 +237,7 @@ The branch directory is found under the worktree base, falling back to a
 sibling of `~/oosh`. The command is then executed with `OOSH_DIR` pointed at
 that branch — a scoped child-process override, which is the one sanctioned
 exception to the `OOSH_DIR` anchor rule (`oosh-dir-exception` in the code;
-[boot.md § Sanctioned exceptions](boot.md)). There is no symlink alternative
+[oosh-architecture.md § Sanctioned exceptions](oosh-architecture.md#sanctioned-exceptions)). There is no symlink alternative
 by design: the symlink is what `oo mode` moves, and `use` must not move it.
 
 Its exit status is **the command's own**, deliberately — it is a runner, so a

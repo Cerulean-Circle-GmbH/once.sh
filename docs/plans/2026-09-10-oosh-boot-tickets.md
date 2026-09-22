@@ -66,9 +66,9 @@ the source of truth; this file mirrors it and is updated in the same commit as t
 |---|---|---|---|
 | 1 | **T4+T5** — `OOSH_DIR` audit + enforce | 🟣 **In Review** | Core boot mechanism. Landed `2045811` + `518e179` (the `CONFIG_PATH` follow-up). Everything below documents or depends on what this settles. |
 | 2 | **T7** — config bootstraps branch-version vars / `config init` repairs | 🔍 **In Review** | Delivered `fee9513`…`1d1cc41`: `OOSH_BRANCH` un-persisted, `OOSH_MODE` means the branch, `config.init` honours its anchor, `config validate required`, both shared-tier waivers deleted. |
-| 3 | **T8** — PATH bootstrap + the `path` script | 🔍 **In Review** | Same "what does `boot` own" theme as T4/T5. Delivered `2471b43`…`db0177d` + markers: `path validate`, the writer rule in [boot.md](../boot.md), `path` shrunk 26 methods to 11, `.` off the PATH. |
+| 3 | **T8** — PATH bootstrap + the `path` script | 🔍 **In Review** | Same "what does `boot` own" theme as T4/T5. Delivered `2471b43`…`db0177d` + markers: `path validate`, the writer rule now in [config.md § The PATH-writer rule](../config.md#the-path-writer-rule), `path` shrunk 26 methods to 11, `.` off the PATH. |
 | 4 | **T3** — `env -i sh` SAFETY | 🔍 **In Review** | Taken out of order at the user's request (2026-09-14). `boot` was final on both anchors after T4+T5, so nothing blocked it — and it turned out to hold two live defects, not to be a verify-and-close. Second attempt delivered `boot` + `init/oosh` recovery and the clean re-exec. |
-| 5 | **T9** — fixed system path to `boot` | 🔍 **In Review** | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. **Delivered 2026-09-14**: install state `34 root.boot.path.installed`, `oo boot.fix` / `oo boot.status`, the `/etc/profile.d/oosh.sh` login-shell drop-in (from `templates/user/profile.d.oosh.sh`), `test.platform.boot.system.path.invariant`. The five design decisions are recorded on [the card](2026-09-14-fixed-system-boot-path.md). Review checklist: the trust note (dev-group-writable content behind a root-looking path), the warn-and-skip on branches without `boot`, and a platform run on a host installed BEFORE state 34 followed by `oo boot.fix`. |
+| 5 | **T9** — fixed system path to `boot` | ⚪ **Superseded 2026-09-22** (see docs/superpowers/plans/2026-09-22-remove-boot-user-env-is-the-boot.md — `boot` is gone, so `/etc/oosh/boot` is too; the drop-in survives and sources `~/config/user.env`) | Fell out of T3: `boot` recovers `$HOME`, but `. ~/oosh/boot` cannot be *reached* under `env -i sh` — dash leaves `~` literal with `HOME` unset. **Delivered 2026-09-14**: install state `34 root.boot.path.installed`, `oo boot.fix` / `oo boot.status`, the `/etc/profile.d/oosh.sh` login-shell drop-in (from `templates/user/profile.d.oosh.sh`), `test.platform.boot.system.path.invariant`. The five design decisions are recorded on [the card](2026-09-14-fixed-system-boot-path.md). Review checklist: the trust note (dev-group-writable content behind a root-looking path), the warn-and-skip on branches without `boot`, and a platform run on a host installed BEFORE state 34 followed by `oo boot.fix`. |
 | 6 | **T6** — `bootstrap.sequence` diagram | 🔍 **In Review** | Last, and it documents the mechanism the five above settle. Diagram redrawn by the user (`bootstrap.sequence.drawio`); this pass declared it the source of truth, marked the pre-`boot` `.puml` superseded, cross-linked it, and corrected three labels that T8 and item 6 invalidated after it was drawn. |
 
 ---
@@ -110,7 +110,7 @@ changes and needs setting in exactly **one** place. Code that genuinely needs th
 - [x] Decision recorded on `oo mode`/`oo use` vs the always-`~/oosh` rule — `oo mode` no longer exports `OOSH_DIR` (the symlink move *is* the switch); `oo use` is a marked exception
 - [x] Every remaining non-conforming site either fixed, or justified in-code with a marker
 - [x] A test pins the rule — `test.this` T-OOSH-DIR-* (4 cases, including a *planted* violation so the guard is proven to fail); `test.config` T31 asserts `boot`'s literal and delegates the tree sweep
-- [x] `docs/boot.md` states the rule and the sanctioned exceptions
+- [x] the rule and the sanctioned exceptions are stated — now in [oosh-architecture.md § The anchors are data](../oosh-architecture.md#the-anchors-are-data) (was `docs/boot.md`)
 - [x] Standing verification bar passes — host `test.suite core 1` 623 assertions /
       622 passed / 1 intentional; `os platform.test ubuntu_24_04` **rc=0**, in-container
       core 628/627/1, the only `✗ FAIL` lines being that same intentional meta-test once
@@ -297,6 +297,8 @@ config init.check && ./test.suite run config 1
 
 ### T8 — review how PATH is bootstrapped · the `path` script 🔍 In Review (2026-09-16)
 
+> **Superseded 2026-09-22** — see docs/superpowers/plans/2026-09-22-remove-boot-user-env-is-the-boot.md
+
 > **Research doc (2026-09-16), read before any code:**
 > [who owns `PATH`](../research/2026-09-16-t8-path-ownership.md). It corrects six of this
 > ticket's factual claims, finds two defects the ticket does not mention, and ends with three
@@ -314,7 +316,7 @@ first). But a separate `path` script (`path.list`, `path.env`, `path.save`, `pat
 
 **Definition of done.**
 - [x] Decision: `boot` owns runtime PATH; `path` persists **nothing** — it reports, and edits the
-      session. The rule and its exception table are in [boot.md § The PATH-writer rule](../boot.md).
+      session. The rule and its exception table are in [config.md § The PATH-writer rule](../config.md#the-path-writer-rule).
 - [x] `path` script reconciled: 26 definitions to 11, 305 lines to ~260 (the new validator is most
       of what is left), `./c2 function.completion ./path` from 21 verbs to 9. The three mutators
       stopped claiming "and saves config", and stopped matching by substring.
@@ -354,6 +356,8 @@ deletions would have been sixteen hand edits.
 ---
 
 ### T3 — `env -i sh` SAFETY, shall boot correctly 🔍 In Review (second attempt, 2026-09-14)
+
+> **Superseded 2026-09-22** — see docs/superpowers/plans/2026-09-22-remove-boot-user-env-is-the-boot.md
 
 > **Card (Ideas #3):** `env -i sh. SAVETY...shall boot correctly`
 
@@ -506,7 +510,7 @@ mode. The design for those is written up in full and was not found to be wrong.
   `CONFIG_PATH` all correct, in `sh`, `dash`, `bash` and `busybox ash`.** That is the card.
 - The five `||` callers needed **no change**: the fix is upstream, and their degrade action is
   still right for a genuinely absent `boot` (non-dev branches — that is what T49 pins).
-- `docs/boot.md` gains a **Guarantees** section: sourced-only, exit status is a contract,
+- `docs/boot.md` gains a **Guarantees** section (that page is gone as of 2026-09-22): sourced-only, exit status is a contract,
   `$HOME` required, proven shells.
 
 **Delivered (2026-09-14, second attempt).** `boot` and `init/oosh` both recover `$HOME`;
@@ -553,7 +557,7 @@ and `Install oosh.command:20` sets `OOSH_SELF_BRANCH` **unexported**, so it neve
       because an unanchored `grep` for `[ -f "$0" ]` matched a pre-existing line elsewhere
       in `init/oosh`. See [tests that cannot fail](2026-09-14-tests-that-cannot-fail.md).
       *(T53/T54 from the first, reverted attempt do not exist; this list replaces them.)*
-- [x] `docs/boot.md` documents the guarantees — the **Guarantees** table (`$HOME` is now
+- [x] `docs/boot.md` documented the guarantees — the **Guarantees** table (`$HOME` is now
       *recovered*, not merely required) plus a section covering the `init/oosh` half: the
       re-exec, why placement after the branch default is load-bearing, and the carry list
 - [x] Standing verification bar passes (2026-09-14, second attempt, at `7e88ec4`) —
@@ -601,7 +605,7 @@ already flags a regression against its `this localInstall → "starts new bash"`
 - [x] Source of truth declared. Two editable sources was the same two-owners problem T8 exists to
       end. **`.drawio` wins**; `bootstrap.sequence.puml` and its April `.svg`/`.eps` renders are
       kept for history and now carry a `SUPERSEDED` header naming the replacement.
-- [x] Cross-linked from [boot.md](../boot.md) § See also — which had the ownership **backwards**,
+- [x] Cross-linked from `docs/boot.md` § See also — which had the ownership **backwards**,
       calling the `.puml` the source and the `.drawio` an "editable copy" — and newly from
       [wiki-index](../wiki-index.md), which did not link the diagram at all.
 - [x] **Three labels corrected**, because this week's tickets moved the mechanism under the
@@ -621,7 +625,7 @@ renders say so in the `.puml` header rather than pretending otherwise.
 
 **2026-09-14 note.** The misspelled family (`bootsratp.*`, since 2022) was renamed
 `bootstrap.sequence`; a `.drawio` editable copy was added next to the `.puml`
-(`docs/puml/bootstrap.sequence.drawio`) and `docs/boot.md` § See also links the
+(`docs/puml/bootstrap.sequence/bootstrap.sequence.drawio`) and `docs/boot.md` § See also links the
 diagram. The `.svg` is still the 2026-04-30 render — no PlantUML on the dev host —
 and the `.puml` is unchanged, so every DoD item above is still open.
 
@@ -779,3 +783,4 @@ never existed.
 | 2026-09-18 | **The card-1 newline guard tested bash's RENDERING, not the value** (`c983cd8`). `oo stage testing` went red on **almalinux 9**, stuck at state 22: one real failure in 864 assertions, T77. `private.config.variable.export.line` refused a newline-bearing value by matching `$'…'`, the ANSI-C quoting bash uses for it — and that is a bash **>= 5.2** behaviour. Measured: 5.2.21 (host, ubuntu 24.04) emits `declare -x T=$'a\nb'`, while **5.1.8 (almalinux 9), 5.1.16 (ubuntu 22.04) and 5.1.4 (debian 11) all emit a double-quoted string with a LITERAL newline in it**. So the guard matched nothing on any bash 5.1 and a two-line assignment went into a line-oriented env file. The comment above it claimed ANSI-C quoting happened "on 3.2 as well as 5" — never measured, and false for every 5.1. Fixed by testing the VALUE (`\n` or `\r` refused outright), which no bash version can disagree about; the `$'…'` check stays as a second gate because bash reaching for it at all is a bashism and `boot` sources these files under dash. **Proven as a matrix, not asserted**: old code green on 5.2 and RED on 5.1; new code green on 5.2, 5.1.8, 5.1.16, 5.1.4. Two lessons. (1) This is the SAME error as the mktemp rule the day before, one layer down — checking a rendering instead of the property; twice in two days is a pattern, not an accident. (2) **ubuntu_24_04 and macOS could not have caught it**, both being bash 5.2 — the must-pass set had no bash 5.1 box in it until almalinux ran, which is the argument for the platform gate being wide rather than fast. T77 was right all along and now records why its two shapes must not be merged. almalinux_9 PASS (test=0 root=0 oosh-user=0 bash-user=0), core 864/863/1 intentional. |
 | 2026-09-18 | **All five must-pass platforms run.** almalinux_9 **PASS** after the bash-5.1 newline fix; ubuntu_24_04 **PASS**; debian_12 **PASS**; macOS **PASS** (core 864/863/1 on the VM); alpine_3_19 **FAIL**, 3 real failures, **all three bisected in-container to `93a9a12` and therefore pre-existing** — alpine went 845/835/**10** before the 2026-09-17 work to 859/855/**4** after it, so that work removed six alpine failures and introduced none. The remaining three are carded in § 4c: busybox has no `userdel`, and a canary hit on `test.completion.audit` that only appears inside a `core` sequence. **One measurement worth keeping**: of the five must-pass platforms, **almalinux_9 is the ONLY bash 5.1 box** — ubuntu 24.04 is 5.2.21, debian 12 is 5.2.15, alpine 3.19 is 5.2.21, macOS is 5.3.20. The gate that caught the morning's defect was one platform wide, not five, and bash 5.1 is ubuntu 22.04, debian 11, RHEL 9 and everything downstream. Worth deciding whether the must-pass set should pin a 5.1 box deliberately rather than by accident. |
 | 2026-09-18 | **ALL FIVE must-pass platforms green** (`a0d3a5b`). alpine_3_19 PASS closes the set: ubuntu_24_04, debian_12, almalinux_9, alpine_3_19 and macOS all `test=0 root=0 oosh-user=0 bash-user=0`. The alpine card scoped two defects and the fix took **three** — the `test.completion.audit` canary was the same root cause, not a separate one. While the OS_CMD cache is incomplete, `private.user.init` re-runs its persist branch (`config save os.commands` + `oo pm.discover`) on every invocation, and that cascade writes the shared tier; `test.completion.audit` sources every script in the tree, so it fired the persist dozens of times, while standalone it wrote nothing because the cache was warm. The "only inside a core sequence" observation was the clue and was read as a curiosity for an hour. The defect was also larger than carded: `OS_CMD_USER_DEL` was **write-only** — cached, asserted on by two tests, and never read, because `private.user.delete.linux` ran its own probe with a hardcoded `userdel -rf`. One accessor now serves both. **And a near-miss worth keeping**: the first version of the new test stubbed `PATH` only, the absolute `/usr/sbin/userdel` answered anyway, and the busybox case passed while exercising the shadow branch — a test green-lighting the branch it is not running, which is precisely how this survived from 2026-04-24. `<sbinDir>` exists to make that branch reachable on a shadow host. |
+| 2026-09-22 | **`boot` removed — `user.env` is the boot.** The 155-line POSIX-sh loader is deleted; its job is done by pure `export` data at the head of `~/config/user.env` (the five `$HOME`-relative anchors, the PATH prepend, `BASH_FILE`, then the `.`-chain), written by `config`'s `private.config.anchor.lines.get` via `config save` and seeded by `init/oosh`. `$HOME` recovery moved to `/etc/profile.d/oosh.sh` and `init/oosh`'s own copy; the per-user `log.session.env` is created and sourced by `log` itself, so the shared `log.env` no longer chains it; `this` de-duplicates PATH by segment on load. `/etc/oosh/boot` and `oo boot.fix`/`boot.status` are gone — state 34 is `root.profile.dropin.installed`, repaired by `oo profile.fix`, reported by `oo profile.status`. Deliberately given up: a bare `env -i sh` with no `HOME` no longer self-heals (no fixed absolute path left to source), and macOS has no `/etc/profile.d` so the login route is Linux-only. **Docs:** `docs/boot.md` deleted; the path-anchor rule is now [oosh-architecture.md § The anchors are data](../oosh-architecture.md#the-anchors-are-data), the PATH-writer rule and the `user.env` contract [config.md § user.env is the boot](../config.md#userenv-is-the-boot); all nine code doc-pointers retargeted. T3/T8/T9 marked superseded. |

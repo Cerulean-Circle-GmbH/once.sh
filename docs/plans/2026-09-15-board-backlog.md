@@ -292,7 +292,7 @@ delegates to it and that hand-rolled block goes.
 
 ## 5. T8 — PATH bootstrap and the `path` script ✅ DELIVERED 2026-09-16
 
-> **Done** (`2471b43` … `0821802`). The rule is [boot.md § The PATH-writer rule](../boot.md),
+> **Done** (`2471b43` … `0821802`). The rule is [config.md § The PATH-writer rule](../config.md#the-path-writer-rule) (it lived in `docs/boot.md` until that page was folded away on 2026-09-22),
 > enforced by **`path validate`** — a *writer sweep*, not a value check, because PATH is an
 > accumulation. `path` went from 26 definitions to 11 and stopped claiming a persistence it never
 > had; `.` came off the PATH; `claudeCode` stopped writing `export PATH=` into an env file; the

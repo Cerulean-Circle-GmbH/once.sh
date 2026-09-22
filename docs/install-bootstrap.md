@@ -1,17 +1,25 @@
 # The install bootstrap: `init/oosh` re-execs clean
 
-`init/oosh` is the installer — it runs before oosh exists, so it is POSIX `sh` and
-shares nothing with `boot` except one deliberately duplicated block (the `$HOME`
-recovery). This page documents its **clean-environment guarantee**: the `env -i`
-self-re-exec (the `cleanEnv` block), what is carried, what is seeded, and why.
-For `boot` itself see [boot.md](boot.md); for the design record see
+`init/oosh` is the installer — it runs before oosh exists, so it is POSIX `sh`. Two of its
+blocks are **deliberately duplicated**, each with a different twin, because neither twin
+may source a shared helper:
+
+| Block | Twin | Why it cannot be shared |
+|---|---|---|
+| `BEGIN`/`END homeRecovery` | `templates/user/profile.d.oosh.sh`, the login-shell drop-in | one runs before oosh exists, the other runs for **every** login on the host — including users who have never heard of oosh |
+| `BEGIN`/`END userEnvSeed` | `config`'s `private.config.anchor.lines.get` | POSIX `sh` cannot call a bash function, and this runs before there is an oosh to call |
+
+`test.install` **T-HOME-RECOVERY-NSS** runs *both* recovery blocks against a stub, and
+**T-INIT-SEEDS-USER-ENV** pins the seed to the emitter. This page documents the installer's
+**clean-environment guarantee**: the `env -i` self-re-exec (the `cleanEnv` block), what is
+carried, what is seeded, and why. For the data those seeds write see
+[config.md § user.env is the boot](config.md#userenv-is-the-boot); for the design record see
 [the clean-environment spec](superpowers/specs/2026-09-14-clean-environment-guarantee-design.md).
 
 
 ## The clean re-exec
 
-`boot` recovering `$HOME` makes `env -i sh` *survivable*. The guarantee that the installer runs in
-a clean environment is a separate thing, and it used to come from a shebang:
+The guarantee that the installer runs in a clean environment used to come from a shebang:
 
 ```sh
 #!/usr/bin/env -iS HOME=${HOME} sh     # 2024-04-07 (8c277f4) … 2026-03-09 (075b4a3)
@@ -105,7 +113,7 @@ into `dumb` but leaves an *empty* one empty, and `tput` errors on empty while ac
 `${TERM:-}` would be strictly **worse** than dropping `TERM` altogether. `${TERM:-dumb}` reproduces
 the unset behaviour exactly and carries a real terminal when there is one.
 
-## `PATH` is seeded, not carried — and not "re-derived"
+## `PATH` and `user.env` are seeded, not carried — and not "re-derived"
 
 `env -i` leaves `PATH` unset, so the
 child falls back to its compiled-in default — measured as
@@ -129,6 +137,41 @@ PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/b
 Seeding is not the same as carrying. The caller's `PATH` is still discarded; what changes is that
 the child gets a value that is *constant regardless of who invoked us*. That determinism is the
 point of the guarantee — carrying the caller's `PATH` would surrender it.
+
+### The `user.env` seed
+
+The same word, one level up. `env -i` leaves the re-exec'd installer with no oosh anchors
+at all, and the login shell it eventually `exec`s needs them — so `init/oosh` **writes**
+them, rather than carrying them:
+
+```sh
+# BEGIN userEnvSeed
+if [ ! -f "$HOME/config/user.env" ]; then
+  mkdir -p "$HOME/config"
+  …
+  {
+    echo 'export OOSH_DIR="$HOME/oosh"'
+    echo 'export CONFIG_PATH="$HOME/config"'
+    …
+  } > "$HOME/config/user.env"
+fi
+# END userEnvSeed
+```
+
+Three properties are load-bearing:
+
+- **Only when absent.** The `[ ! -f ]` guard means a re-install never clobbers a host's
+  existing `user.env`; the install's own `config save` rewrites it properly later.
+- **Byte-identical to `config`'s emitter.** POSIX `sh` cannot call
+  `private.config.anchor.lines.get`, so the lines are duplicated. `test.install`
+  **T-INIT-SEEDS-USER-ENV** pins the two copies together — a change to one that is not
+  made to the other fails the suite.
+- **`$HOME`-relative, written unexpanded.** The installer runs as root, or as the
+  installing user, into a config directory that is usually shared. An expanded
+  `/root/oosh` here would be the leak the whole design exists to prevent.
+
+After that the final `exec "${BASH_FILE:-bash}" -l` needs to carry nothing: the new login
+shell sources `~/config/user.env` and picks up its own anchors and its own PATH.
 
 Still deliberately *not* carried: `BASH_FILE` and `SUDO` (recomputed, more correctly, from scratch
 — Phase A may have just installed a newer bash that a stale `BASH_FILE` would shadow),

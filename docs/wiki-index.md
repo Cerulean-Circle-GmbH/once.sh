@@ -43,9 +43,9 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 ## Design docs & tickets
 
 - `docs/plans/` - Ticket trackers and cards: **[board backlog 2026-09-15](plans/2026-09-15-board-backlog.md)** (start here — every open card, what it actually is, and what to do), [OOSH boot tickets](plans/2026-09-10-oosh-boot-tickets.md) (the board, working agreement, change log), [fixed system boot path (T9)](plans/2026-09-14-fixed-system-boot-path.md), [method-tooling repair](plans/2026-09-14-method-tooling-repair.md), [tests that cannot fail](plans/2026-09-14-tests-that-cannot-fail.md)
-- `docs/puml/` - Diagrams. **[bootstrap.sequence.drawio](puml/bootstrap.sequence.drawio)** is the single source of truth for how oosh comes up — six lanes, from the GitHub one-liner to de-install — and the one to open in [diagrams.net](https://app.diagrams.net). The `.puml` and the `.svg`/`.eps` beside it are the superseded pre-`boot` version, kept for history and marked so in their header.
+- `docs/puml/` - Diagrams. **[bootstrap.sequence.drawio](puml/bootstrap.sequence/bootstrap.sequence.drawio)** is the single source of truth for how oosh comes up — six lanes, from the GitHub one-liner to de-install — and the one to open in [diagrams.net](https://app.diagrams.net). Both it and `Bootstrap Sequence v2.drawio` still show the `boot` loader lane, which no longer exists: read them for the install and de-install lanes, and [config.md § user.env is the boot](config.md#userenv-is-the-boot) for how a shell comes up. `puml/bootstrap.sequence.puml` and the `.svg`/`.eps` are the older superseded renders, marked so in their own header.
 - `docs/superpowers/specs/` and `docs/superpowers/plans/` - Design specs and implementation plans from the superpowers workflow, e.g. the [clean-environment guarantee](superpowers/specs/2026-09-14-clean-environment-guarantee-design.md) and [recovery from a bare shell](superpowers/specs/2026-09-14-oosh-recovery-from-bare-shell-design.md)
-- `docs/research/` - Reviews and forensics, e.g. the [T7 config/branch-variable research](research/2026-09-16-t7-config-branch-variables.md), [T8 PATH-ownership research](research/2026-09-16-t8-path-ownership.md) (delivered — the rule it argues for is now [boot.md § The PATH-writer rule](boot.md), enforced by `path validate`), [the `ssh.<user>.<host>.for.<host>` directory](research/2026-09-16-item6-ssh-backup-naming.md) (backlog item 6 — six defects behind one stray directory name), [`oo.mode.setup`](research/2026-09-16-item7-oo-mode-setup.md) (backlog item 7 — delivered; the worktree layout is documented at [oo.md § The worktree layout](oo.md)) and the [boot-loader review](research/review-2026-09-09-boot-loader-pure-env-files.md)
+- `docs/research/` - Reviews and forensics, e.g. the [T7 config/branch-variable research](research/2026-09-16-t7-config-branch-variables.md), [T8 PATH-ownership research](research/2026-09-16-t8-path-ownership.md) (delivered — the rule it argues for is now [config.md § The PATH-writer rule](config.md#the-path-writer-rule), enforced by `path validate`), [the `ssh.<user>.<host>.for.<host>` directory](research/2026-09-16-item6-ssh-backup-naming.md) (backlog item 6 — six defects behind one stray directory name), [`oo.mode.setup`](research/2026-09-16-item7-oo-mode-setup.md) (backlog item 7 — delivered; the worktree layout is documented at [oo.md § The worktree layout](oo.md)) and the [boot-loader review](research/review-2026-09-09-boot-loader-pure-env-files.md) (superseded — the loader it reviews has been removed)
 
 ## Migration
 
@@ -84,16 +84,18 @@ The heart of the oosh/once.sh system is an advanced Bash completion engine, impl
 - Supports custom completions for specific parameters and methods, and can fall back to standard Bash completions.
 - Is designed to be modular and extensible, allowing new scripts and methods to be added without duplicating completion logic.
 
-### The `boot` Loader
-The `boot` script (`$OOSH_DIR/boot`) is the single entry point that turns a bare
-shell into an oosh shell — every context (login shell, `ossh exec`, platform
-tests, CI) sources it. It owns the bootstrap logic that used to live inside the
-config env files (so those stay pure data), is POSIX-`sh` clean (dash/ash), and
-sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`), the source
-chain, PATH, and the logging primitives. It recovers `$HOME` from the password
-database, so `env -i sh` can boot; the fixed host-wide path `/etc/oosh/boot`
-(install state 34, `oo profile.fix`) makes that one command for any user and any
-shell — see **[boot.md](boot.md)** § The three recovery routes.
+### `user.env` is the boot
+There is no loader script. A shell becomes an oosh shell by sourcing
+**`~/config/user.env`** — the anchors (`OOSH_DIR`, `CONFIG_PATH`, `CONFIG_FILE`,
+`CONFIG`, `OOSH_USER_CONFIG_PATH`), the PATH prepend, `BASH_FILE` and the
+`. $CONFIG_PATH/*.env` chain, all as `$HOME`-relative `export` data. `config save`
+writes it, `init/oosh` seeds it, and every context reads it: the login shell
+(`bashrcTemplate`), `this` on a cold start, `ossh exec`, the `os platform.test`
+runners, `odocker` and CI. On Linux, `/etc/profile.d/oosh.sh` (install state 34,
+repaired by `oo profile.fix`) recovers `$HOME` from the password database and
+sources it, so `env -i sh -l` comes up as an oosh shell — see
+**[config.md](config.md)** § *user.env is the boot* and
+**[repair-toolkit.md](repair-toolkit.md)**.
 
 ### The "this" Boot Script
 The `this` script is the bootstrapper and foundation of the environment:

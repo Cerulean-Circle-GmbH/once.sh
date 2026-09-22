@@ -2,7 +2,7 @@
 
 OOSH ships explicit, idempotent repair primitives for the
 post-install drift modes most likely to bite: user symlinks, shared
-config perms, SSH rights, SSH layout, and the fixed system boot path. Each primitive has a
+config perms, SSH rights, SSH layout, and the login-shell drop-in. Each primitive has a
 single, scoped responsibility (per the `noun.verb` convention).
 Implicit auto-repair on every shell startup was deliberately removed
 after the May-8 sudo-chain incident — see
@@ -83,6 +83,10 @@ explicitly when something drifts.
 | `env -i sh -l` does not come up as an oosh shell | `oo profile.fix` (the `/etc/profile.d/oosh.sh` drop-in is missing) |
 | `/etc/profile.d/oosh.sh` missing, or it no longer sources `~/config/user.env` | `oo profile.fix` |
 | `env -i sh` cannot bootstrap oosh at all | nothing can — see below. Use `env -i sh -l`, or `. ~/config/user.env` with `HOME` set |
+| `config validate required` says `INCOMPLETE … anchor:OOSH_DIR=…` | `config save` — the host's `user.env` predates the anchor lines |
+| `test.platform.shared.config.invariant` red after a pull | `config save` |
+| a `/bin/sh` login dies at `log.session.env: No such file` | `config save` — the legacy chain line is still in `log.env` |
+| `.bashrc` still sources a `boot` that no longer exists | `config init.user <user>` re-templates it |
 | `Permissions … are too open` from ssh client | `ossh rights.fix` |
 | `ssh: Could not resolve hostname 2cuGitHub` | `ossh folder.fix` |
 | Legacy `~/.ssh/2cuGitHub` host block | `ossh folder.fix strict` |
@@ -113,23 +117,59 @@ ordinary user with no sudo.
 
 ### Recovery commands — what to type when you have nothing
 
-| Command | Recovers? | Why |
-|---|---|---|
-| `. ~/config/user.env` | **yes**, with `HOME` set | the explicit form; works in every shell, login or not |
-| `env -i sh -l` | **yes** | `/etc/profile` loops `/etc/profile.d/*.sh`, and `oo profile.fix` puts `oosh.sh` there; it derives `$HOME` itself |
-| `env -i sh` | **no** | `$ENV` is a non-login `sh`'s *only* rc hook, and `env -i` is what erased it |
+| Situation | Command |
+|---|---|
+| `env -i sh -l` does not come up as oosh (Linux) | `oo profile.fix` — needs root, or `dev` + sudo; `$SUDO` is used internally, so do **not** type `sudo oo profile.fix` |
+| any shell, `HOME` set | `. ~/config/user.env` — the explicit form, login shell or not |
+| a host whose `user.env` predates this change | `config save` — adds the anchor lines, and drops the legacy per-user chain line from `log.env` |
+| a user whose `.bashrc` still has the old hook | `config init.user <user>` — re-templates it from `templates/user/bashrcTemplate` |
 
 **Bare `env -i sh` cannot be repaired into self-recovering**, by `oo profile.fix` or by
-anything else: there is no hook left to point at. If that is the shell you are in, add
-`-l`, or set `HOME` and source `~/config/user.env` by hand.
+anything else: `$ENV` is a non-login `sh`'s *only* rc hook and `env -i` is what erased it,
+and there is no fixed absolute path left to source by hand — `~/config/user.env` needs a
+`$HOME`, and with `HOME` unset a POSIX shell leaves `~` literal. If that is the shell you
+are in, add `-l`, or set `HOME` and source the file.
+
+### Migrating a host that predates this
+
+This is the note to read before concluding a host is broken.
+
+A host that pulled this change but has **not re-run `config save`** has a `user.env` with
+no anchor lines in it. Two things follow:
+
+- **It still works.** `this` degrades gracefully: at file scope it defaults `CONFIG_PATH`
+  and `OOSH_USER_CONFIG_PATH` *before* sourcing the file, so the `. $CONFIG_PATH/oosh.env`
+  chain inside it still resolves. `bashrcTemplate`'s `elif [ -d "$HOME/oosh" ]` branch
+  covers the case where the file is missing altogether.
+- **But it reports red.** `config validate required` returns INCOMPLETE naming each missing
+  `anchor:…` line, and the shared-config platform invariant
+  (`test.platform.shared.config.invariant`) stays red until the save runs.
+
+The fix is one command: **`config save`**.
+
+One narrow case is worth knowing about, because it is the only one that is not merely
+cosmetic. A host whose `log.env` still carries the legacy last line
+
+```sh
+. $OOSH_USER_CONFIG_PATH/log.session.env
+```
+
+**and** which has never had that per-user file created would abort under dash — a failed
+`.` ends a POSIX shell. `config save` fixes that too: it regenerates `log.env` as pure
+`export LOG_*` data with no chain line, and `log` creates and sources the per-user file
+itself. In practice the window is tiny: any host that has ever been logged into already
+has `~/.config/oosh/log.session.env`, and both `this` and `log` touch-guard it anyway.
 
 The drop-in is **Linux-only by fact**: macOS has no `/etc/profile.d`, so
 `oo profile.fix` skips it there and says so. That is not a failure — the data route
 still works. The drop-in is guarded (`~/config/user.env` must exist), so a login by
 somebody who has never heard of oosh is a silent no-op.
 
-> **Trust.** `/etc/oosh/boot` resolves to **dev-group-writable** content — exactly as trusted as
-> the `dev` group, no more, the same as root's own `~/oosh`. Details: [`boot.md` § Guarantees](boot.md#guarantees).
+> **Trust.** The drop-in sources `~/config/user.env`, which lives in the **dev-group-writable**
+> shared config tree: install state 31 runs `chmod -R g+w` on it, so any member of `dev` can edit
+> the file every login shell then sources. That trust model is **unchanged** — root's own `~/oosh`
+> and `~/config` are already symlinks into the same tree. The drop-in is exactly as trusted as the
+> `dev` group, no more.
 
 ## Verification: am I healed?
 

@@ -111,14 +111,19 @@ cross-user permission errors). `config.save` therefore filters `LOG_NAME`,
 `LOG_DEVICE` and `LOG_LIVE` out of the shared `log.env`. They are instead written
 to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
 `~/.config/oosh`) — the same per-user directory OOSH already uses for
-`mode-env.bash`. The `boot` loader materialises that file once per shell (it
-delegates to `log.session.save`).
+`mode-env.bash`.
 
-The shared `log.env` is linked to the per-user file by a source chain — its last
-line is `. $OOSH_USER_CONFIG_PATH/log.session.env` (POSIX `.`, not the bash
-`source`, so `boot` parses under dash/ash; the var is written **unexpanded**, so
-each user loads their OWN file). This means a value you set with `log name
-<value>` is **loaded back on every login**, not just recorded: `log`'s top-level
+**`log` owns that file.** Its top level creates `$OOSH_USER_CONFIG_PATH`,
+touch-guards `log.session.env` and sources it (`log:15-23`); `log.session.save`
+writes it. The shared `log.env` used to chain it with a last line
+`. $OOSH_USER_CONFIG_PATH/log.session.env`, and that was removed: a failed `.`
+ends a POSIX shell, so a per-user file that did not exist yet aborted a
+`/bin/sh` login outright. A host whose `log.env` still carries that line gets it
+dropped by its next `config save` — see
+[repair-toolkit.md](repair-toolkit.md) § *Migrating a host that predates this*.
+
+Because `log` sources the file itself, a value you set with `log name
+<value>` is still **loaded back on every login**, not just recorded: `log`'s top-level
 keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so the saved name
 wins and the `user@host` default only fills in when none is saved.
 

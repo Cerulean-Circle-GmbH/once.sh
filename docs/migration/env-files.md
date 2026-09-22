@@ -1,16 +1,32 @@
 # Env-file evolution: from `main` baseline to `dev`
 
-> **⚠️ SUPERSEDED (2026-09-09).** The "self-anchor bootstrap header" this document
-> calls the *centrepiece* was **removed**. Env files are now **pure data** (only
-> `export …` and POSIX `.` chain lines); all bootstrap logic moved into the single
-> entry point **`$OOSH_DIR/boot`** (commit `ca4abe1` and the boot-loader series).
-> The boss's ruling was "config must not contain code". So wherever this doc
-> describes `: ${CONFIG_PATH:=…}` / `: ${OOSH_DIR:=…}` header lines *inside*
-> `user.env`/`oosh.env`, read it as **history** — the current design does that in
-> `boot`. Per-user log vars (`LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE`) now live in the
-> per-user `$OOSH_USER_CONFIG_PATH/log.session.env`, chained from `log.env`.
-> See **[../boot.md](../boot.md)** and **[../config.md](../config.md)** for the
-> current model. This document is retained for the `main → dev` history only.
+> **⚠️ SUPERSEDED TWICE.**
+>
+> **(1) 2026-09-09.** The "self-anchor bootstrap header" this document calls the
+> *centrepiece* was **removed**. Env files became **pure data** (only `export …`
+> and POSIX `.` chain lines); all bootstrap logic moved into a single POSIX-`sh`
+> entry point, `$OOSH_DIR/boot` (commit `ca4abe1` and the boot-loader series).
+> The boss's ruling was "config must not contain code".
+>
+> **(2) 2026-09-22.** `boot` itself was **deleted**. `~/config/user.env` *is* the
+> boot again — but as **data**, not logic. Its first lines are
+> `export OOSH_DIR="$HOME/oosh"`, `export CONFIG_PATH="$HOME/config"`, the rest of
+> the anchors, the PATH prepend and `BASH_FILE`, each an unexpanded
+> `$HOME`-relative constant that the sourcing shell expands. That form **avoids
+> the absolute-path leak this page describes**: the `main` baseline persisted
+> `/home/test/oosh` and every other user sourcing the shared file got EACCES,
+> whereas `$HOME/oosh` is correct for whoever sources it, with no derivation, no
+> `BASH_SOURCE` walk and no conditional. Per-user log vars
+> (`LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE`) live in the per-user
+> `$OOSH_USER_CONFIG_PATH/log.session.env`, which `log` creates and sources
+> itself — the shared `log.env` no longer chains it.
+>
+> So wherever this doc describes `: ${CONFIG_PATH:=…}` / `: ${OOSH_DIR:=…}` header
+> lines *inside* `user.env`/`oosh.env`, read it as **history**. See
+> **[../config.md](../config.md)** § *user.env is the boot* and
+> **[../oosh-architecture.md](../oosh-architecture.md)** § *The anchors are data*
+> for the current model. This document is retained for the `main → dev` history
+> only.
 
 A reference for understanding how `~/config/user.env`, `~/config/oosh.env`, and `~/config/log.env` are generated, why the `dev` versions look the way they do, and how an older host running pre-April-2026 code differs.
 
