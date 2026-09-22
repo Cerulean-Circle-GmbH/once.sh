@@ -349,7 +349,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # root reads anything; the failure mode is subprocesses (e.g. man-db's
     # postinst, which drops to user `man`) inheriting /home/test as cwd.
     rootLog="/tmp/oosh-platform-test-root-$platform.log"
-    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; source /root/oosh/boot 2>/dev/null; test.suite core 1'" 2>&1 | tee "$rootLog"
+    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; source /root/config/user.env 2>/dev/null; test.suite core 1'" 2>&1 | tee "$rootLog"
     rcRoot=${PIPESTATUS[0]}
 
     # Root's test.suite writes into sharedConfig (via /root/config symlink)
@@ -358,9 +358,10 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     private.os.platform.shared.config.repair "$platform"
 
     # B.3 — oosh-user (via test+sudo+runuser; login-shell equivalent of `user login oosh-user`).
-    # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
-    # early-exit for non-interactive shells would otherwise skip the PATH / user.env
-    # setup and `test.suite: command not found` fires.
+    # Explicitly sourcing ~/config/user.env mirrors the root case above:
+    # bashrcTemplate's early-exit for non-interactive shells would otherwise skip
+    # it, leaving no anchors and no PATH, and `test.suite: command not found`
+    # fires.
     # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
     # home, mode 700 owned by test). After `runuser -u oosh-user`, the new
     # user can't read /home/test, so any `find` invocation in test.suite
@@ -377,9 +378,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # NOPASSWD sudoers entry installed in Phase A.
     ossh exec.tty "$platform" "
       if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; test.suite core 1'
       else
-        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; test.suite core 1'
       fi
     " 2>&1 | tee "$ooshUserLog"
     rcOoshUser=${PIPESTATUS[0]}
@@ -389,9 +390,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
     ossh exec.tty "$platform" "
       if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; test.suite core 1'
       else
-        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/config/user.env 2>/dev/null; test.suite core 1'
       fi
     " 2>&1 | tee "$bashUserLog"
     rcBashUser=${PIPESTATUS[0]}
