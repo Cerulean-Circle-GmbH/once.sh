@@ -36,17 +36,87 @@ if [ "$EXPECTED_RETURN_VALUE" -lt 1 ]; then
   export EXPECTED_RETURN_VALUE=1
 fi
 
-
-# OOSH_DIR is ALWAYS ~/oosh — a constant, set by $OOSH_DIR/boot (the single
-# setter, see docs/boot.md). This is only a fallback for contexts that never
-# sourced boot (a bare `source this`, a mid-install sub-shell): same literal
-# value, never a BASH_SOURCE/$0 walk, never a resolved physical path.
-# path-exception: the same fallback, one line down — without $OOSH_DIR on PATH
-# nothing in oosh resolves, and boot has not run in these contexts.
-if [ -z "$OOSH_DIR" ]; then
-  OOSH_DIR="$HOME/oosh"
-  PATH="$OOSH_DIR:$PATH"
+# The reconfigure exit code, a constant like the ones above. It used to be set
+# only by this.init's first-init arm, which the cold start below now skips in
+# almost every context — and it was already empty in a live login shell, because
+# bashrcTemplate:9 sets CONFIG above the non-interactive early return. That left
+# bashrcTemplate's own reconfigure() doing `exit $ERROR_CODE_RECONFIG` with an
+# empty value, i.e. exiting 0: a silent no-op on the interactive reconfigure
+# path. `fix` already self-heals the same 117 when it finds it unset.
+if [ -z "$ERROR_CODE_RECONFIG" ]; then
+  export ERROR_CODE_RECONFIG=117
 fi
+
+
+# The anchors, the env chain and the PATH prepend are DATA in ~/config/user.env
+# (config.save writes them, init/oosh seeds them). A context that never sourced
+# it — a bare `source this`, an ssh command without bashrc, a mid-install
+# sub-shell — loads it here, once, before anything else. Same gate as this.init
+# and ossh.start: CONFIG set means someone already stood the environment up
+# (or a test isolated it — never override that). The gate stays `-z`, and a
+# STALE $CONFIG (set, but the file is gone) is deliberately NOT recovered here:
+# widening the gate to `[ ! -f "$CONFIG" ]` would re-source the real user.env
+# underneath a test that isolated CONFIG at a fixture it had already deleted,
+# weakening exactly the isolation T74c exists to protect.
+if [ -z "$CONFIG" ] && [ -f "$HOME/config/user.env" ]; then
+  # config-path-exception: defaults BEFORE the source — a pre-migration user.env
+  # has no anchors of its own and its `. $CONFIG_PATH/oosh.env` chain needs them.
+  : ${CONFIG_PATH:=$HOME/config}
+  : ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}
+  export CONFIG_PATH OOSH_USER_CONFIG_PATH
+  # Migration-window guard, ported from boot:86-88. log.env's last line is
+  # `. $OOSH_USER_CONFIG_PATH/log.session.env`, and a missing file there aborts
+  # dash outright — so the very first cold shell of a fresh user (the
+  # `os platform.test` per-user runners, mid-install sub-shells) needs the file
+  # to exist before the chain runs. Task 3 removes that line from log.env and
+  # gives `log` ownership of the file, but hosts already installed keep the line
+  # until their next `config save`, so this guard stays until then.
+  [ -f "$OOSH_USER_CONFIG_PATH/log.session.env" ] || {
+    mkdir -p "$OOSH_USER_CONFIG_PATH" 2>/dev/null
+    : > "$OOSH_USER_CONFIG_PATH/log.session.env" 2>/dev/null
+  }
+  . "$HOME/config/user.env"
+  : ${CONFIG:=$CONFIG_PATH/${CONFIG_FILE:-user.env}}
+  export CONFIG
+fi
+# oosh-dir-exception: the last-resort fallback when no user.env exists yet
+# (mid-install, before init/oosh seeded it): the same literal constant, never a
+# BASH_SOURCE/$0 walk, never a resolved physical path.
+# path-exception: the same fallback — without $OOSH_DIR on PATH nothing resolves.
+if [ -z "$OOSH_DIR" ]; then
+  export OOSH_DIR="$HOME/oosh"
+  PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH"
+fi
+
+# PATH de-duplication. user.env's `export PATH="$HOME/oosh:…:$PATH"` is data and
+# cannot guard itself, so a shell that sources it twice (bashrc + a nested
+# `source this`, a re-login inside tmux) carries the prepend twice. Whole
+# segments, first occurrence wins, order preserved. Runs once per `source this`.
+#
+# Pure parameter expansion, no `read`/here-string: bash before 5.1 backs a
+# here-string with a TMPDIR temp file, so that form did filesystem I/O on every
+# single `source this` on macOS bash 3.2 (in this plan's platform gate) and
+# broke outright on a read-only or noexec /tmp during install.
+_oosh_new=""; _oosh_seen=":"; _oosh_rest="$PATH:"
+while [ -n "$_oosh_rest" ]; do
+  _oosh_seg=${_oosh_rest%%:*}; _oosh_rest=${_oosh_rest#*:}
+  # An EMPTY segment ("::", a leading or trailing colon) means the current
+  # directory — CWE-426, the same hole ticket T8 closed for a literal `.` in
+  # config.save's brew-bash line. Dropped here, never preserved. This does NOT
+  # shut the hole: a LITERAL `.` segment is a non-empty segment and survives
+  # de-duplication untouched, exactly as it did before.
+  if [ -n "$_oosh_seg" ]; then
+    case "$_oosh_seen" in *":$_oosh_seg:"*) ;; *)
+      _oosh_seen="$_oosh_seen$_oosh_seg:"
+      _oosh_new="${_oosh_new:+$_oosh_new:}$_oosh_seg" ;;
+    esac
+  fi
+done
+# path-exception: a REWRITE of the value already there, not a build — the
+# segments put back are exactly the ones that came in, minus the repeats. A
+# no-op when nothing changed, which is the common case.
+[ "$_oosh_new" = "$PATH" ] || export PATH="$_oosh_new"
+unset _oosh_new _oosh_seen _oosh_seg _oosh_rest
 
 # Ensure $SUDO is set for ALL oosh contexts. bashrcTemplate exports it
 # for interactive shells, but ssh-with-command (e.g. ossh exec.tty) on
@@ -576,8 +646,9 @@ this.init() {
       if ! (this.isSourced); then
         # Preserve current PATH and LOG_LIVE — config may contain stale
         # values from a different user or install phase (e.g. root's PATH
-        # saved during install; a stale LOG_LIVE). PATH is built dynamically
-        # by $OOSH_DIR/boot and this.path.add; LOG_LIVE is re-anchored to the
+        # saved during install; a stale LOG_LIVE). PATH comes from user.env's
+        # data line and is de-duplicated at the top of this file (and grown by
+        # this.path.add); LOG_LIVE is re-anchored to the
         # current user's $OOSH_USER_CONFIG_PATH by log's top-level each shell
         # — same anchor must hold across mid-session $CONFIG re-sources or
         # console.log starts writing to another user's directory and hits
@@ -585,11 +656,21 @@ this.init() {
         # (Write-side complement: config.save filters LOG_LIVE out of the
         # shared log.env so the value never gets persisted in the first place.)
         # path-exception: SAVE AND RESTORE across a mid-session `source "$CONFIG"`,
-        # not a write — the value put back is the one that was there.
+        # not a write — the value put back is the one that was there. The four
+        # anchors are restored too: user.env now carries them as $HOME-relative
+        # data, and a test that isolated CONFIG_PATH must not be repointed at
+        # the real shared tier by this re-source.
         local _savedPath="$PATH" _savedLogLive="$LOG_LIVE"
+        local _savedConfigPath="$CONFIG_PATH" _savedConfig="$CONFIG" _savedConfigFile="$CONFIG_FILE" _savedUserCfg="$OOSH_USER_CONFIG_PATH"
         source "$CONFIG"
+        # path-exception: the RESTORE half of the save above, not a write.
         export PATH="$_savedPath"
         [ -n "$_savedLogLive" ] && export LOG_LIVE="$_savedLogLive"
+        # config-path-exception: the RESTORE half of the save two lines up — the
+        # value put back is the one that was already there, never a new path.
+        # No `[ -n … ] &&` guard on OOSH_USER_CONFIG_PATH: this.init defaults it
+        # a few lines above, so it can never be empty by the time we get here.
+        export CONFIG_PATH="$_savedConfigPath" CONFIG="$_savedConfig" CONFIG_FILE="$_savedConfigFile" OOSH_USER_CONFIG_PATH="$_savedUserCfg"
       fi
     fi
     return 0
@@ -628,8 +709,8 @@ this.init() {
   fi
   if [ -z "$OOSH_PROMPT" ]; then
     export OOSH_STATUS="0: started in shell level: $shellLevel"
-    # No OOSH_DIR here: it is the constant ~/oosh, already set by boot or by
-    # this scripts top-level fallback. Assigning $initStartPath (a dirname of
+    # No OOSH_DIR here: it is the constant ~/oosh, already set by user.env or
+    # by this file's top-level fallback. Assigning $initStartPath (a dirname of
     # BASH_SOURCE, often relative) violated the rule and overrode a good value.
     export OOSH_SHLVL=$ooShellLevel
     export OOSH_PROMPT="oosh "
