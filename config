@@ -850,6 +850,51 @@ config.usage()
   #loop.list PATH print '---------------------: '
 }
 
+private.config.anchor.lines.get() # <?bashFile:$BASH_FILE> # emit the head of user.env: the $HOME-relative anchors, the PATH prepend and BASH_FILE — pure data, one line each
+{
+  # THE boot. Every shell sources these lines (bashrcTemplate, ossh exec, the
+  # platform runners, `this` on a cold start). They are DATA: $HOME expands when
+  # sourced, so one shared user.env is right for every user on the host.
+  # Task 4 of docs/superpowers/plans/2026-09-22-remove-boot-user-env-is-the-boot.md
+  # will duplicate this verbatim in init/oosh (BEGIN/END userEnvSeed) — POSIX sh
+  # cannot call this — pinned by test.install T-INIT-SEEDS-USER-ENV. Until then
+  # boot still supplies these at login.
+  local bashFile="${1:-$BASH_FILE}" bashDir=""
+  # oosh-dir-exception: the persisted DATA form of the constant — the value IS
+  # "$HOME/oosh", written unexpanded for the sourcing shell to expand.
+  echo 'export OOSH_DIR="$HOME/oosh"'
+  # config-path-exception: same, for CONFIG_PATH.
+  echo 'export CONFIG_PATH="$HOME/config"'
+  echo 'export CONFIG_FILE="user.env"'
+  echo 'export CONFIG="$CONFIG_PATH/$CONFIG_FILE"'
+  echo 'export OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"'
+  # path-writer: the ONE sanctioned PATH builder in the tree (path.validate).
+  # Grows by one segment per re-source; from Task 2 of the plan above `this`
+  # de-duplicates it on load (today this.init save/restores PATH around the
+  # $CONFIG re-source, which discards the prepend instead).
+  echo 'export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"'
+  # Brew bash must beat the /bin/bash that macOS path_helper appends. Host-wide,
+  # so safe in shared config; skipped where bash lives in a default directory.
+  #
+  # Gated on the INPUT, not on dirname's output: dirname NEVER returns empty —
+  # it answers "." for a slash-less or empty argument — so a bad $BASH_FILE
+  # ("bash", "") would emit `export PATH=".:$PATH"` and put the working
+  # directory on the PATH of every login shell on the host (CWE-426, the hole
+  # ticket T8 removed). config.save runs as root during install, so this is the
+  # one arm that must not be permissive. Only an ABSOLUTE path yields a dir.
+  case "$bashFile" in /*) bashDir=$(dirname "$bashFile") ;; esac
+  case "$bashDir" in
+    /bin|/usr/bin|"") ;;
+    # path-writer: the same builder, brew-bash half.
+    *) echo "export PATH=\"$bashDir:\$PATH\"" ;;
+  esac
+  # No BASH_FILE line at all when there is no value: `export BASH_FILE=""`
+  # would satisfy config.validate.required's presence grep and report OK,
+  # hiding the problem. Omitting the line makes it report BASH_FILE missing.
+  [ -n "$bashFile" ] && echo "export BASH_FILE=\"$bashFile\""
+  return 0
+}
+
 config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $CONFIG_PATH containing all env variables that match <ENV_PREFIX>
 # without parameters it inititlises the $CONFIG_PATH/user.env
 {
@@ -943,20 +988,18 @@ REQUIRED
     #problem.log "regenerate config"
 
     important.log "generating $CONFIG"
-    # user.env holds only PORTABLE config values (BASH_FILE = per-host bash;
-    # CONFIG_FILE) followed by the source chain, so `config list` (cat user.env)
-    # shows a meaningful config and sourcing user.env stands up the whole
-    # environment. The per-user / volatile anchors (OOSH_DIR, CONFIG_PATH,
-    # CONFIG, PATH) are deliberately NOT persisted — $OOSH_DIR/boot computes them
-    # fresh at every shell init (correct per-user, robust to a moved config, no
-    # cross-user leak). boot sets CONFIG_PATH BEFORE sourcing user.env, so the
-    # appended `source $CONFIG_PATH/*.env` chain resolves. oosh.env / log.env
-    # stay single-purpose (OOSH_* / LOG_*), no chaining of their own.
+    # user.env IS the boot: private.config.anchor.lines.get writes the anchors,
+    # the PATH prepend and BASH_FILE as data, then config.add appends the source
+    # chain. No loader stands between a shell and this file.
+    #
+    # $CONFIG_PATH/user.env, NOT $CONFIG. With a non-default CONFIG_FILE (say
+    # `config file myapp.env` then `config save`) $CONFIG points elsewhere,
+    # while `config.file user.env` below resets it before config.add appends
+    # the chain — so the anchors landed in myapp.env and user.env was left
+    # holding two source lines and nothing to anchor them. Once boot is gone
+    # that file is unbootable. The anchors belong to user.env by definition.
     [ -z "$BASH_FILE" ] && BASH_FILE=$(command -v bash)
-    {
-      echo "export BASH_FILE=\"$BASH_FILE\""
-      echo "export CONFIG_FILE=\"$CONFIG_FILE\""
-    } >$CONFIG
+    private.config.anchor.lines.get "$BASH_FILE" > "$CONFIG_PATH/user.env"
 
 
     ### HACK should be in log.init only. but is needed for ssh remote logging
@@ -1112,6 +1155,15 @@ config.validate.required() # # verify the persisted config carries every variabl
   done <<REQUIRED
 $(private.config.required.variables.get)
 REQUIRED
+
+  # The boot data: every anchor line the emitter writes must be present verbatim.
+  local anchorLine
+  while IFS= read -r anchorLine; do
+    # path-exception: a READ pattern that matches the emitter's line, not a PATH
+    # assignment — the two host-specific lines are skipped by this check.
+    case "$anchorLine" in 'export BASH_FILE='*|'export PATH="'/*) continue ;; esac
+    grep -Fxq "$anchorLine" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing anchor:${anchorLine#export }"
+  done <<< "$(private.config.anchor.lines.get "${BASH_FILE:-/bin/bash}")"
 
   # Branch drift: the persisted OOSH_MODE against the branch ~/oosh actually
   # points at. This is the T7 bug — persisted prod/released on a dev box, with
