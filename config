@@ -313,44 +313,51 @@ config.init.user() # <username:$USER> # ensure the user's ~/config + ~/oosh syml
   || [ -d "$targetHome/oosh"   -a ! -L "$targetHome/oosh"   ]; then
     _needsRecreate=1
   fi
-  if [ "$_needsRecreate" = "1" ]; then
-    # Delegate symlink convergence to the shared primitive
-    # private.this.symlink.with.backup (this:171). private.as.user runs
-    # the operations AS the target user, so the symlinks naturally inherit
-    # <user>:<user> ownership — the canonical install layout.
-    #
-    # The bash -c subshell sources $OOSH_DIR/this to bring the primitive
-    # (and its create.result / error.log / result dependencies) into
-    # scope. We deliberately DON'T `set -e` here: `this` returns non-zero
-    # at load-time as part of its dispatch protocol (it's a callable
-    # script as well as a sourceable library), so `set -e` + source would
-    # exit the subshell before the primitive ever ran. Explicit
-    # `|| exit 1` after each primitive call gives the same fail-fast
-    # behaviour without the false-positive on the source.
-    private.as.user "$username" bash -c "
-      cd \"$targetHome\" || exit 1
-      source \"$OOSH_DIR/this\" >/dev/null 2>&1
+  # ONE hop as the target user: symlink convergence (only when needed) via the
+  # shared primitive private.this.symlink.with.backup — run AS the target so
+  # new symlinks inherit <user>:<user> — then the .bashrc heal, which always
+  # runs (idempotent, T86). The preamble comes from
+  # private.this.as.user.preamble.get: it exports the TARGET's HOME/USER,
+  # drops the caller's leaked anchors and sources `this` from the SHARED tree.
+  # The string used to source "$OOSH_DIR/this", expanded by the CALLER — root
+  # healing another user made them source /root/oosh/this, unreadable under a
+  # 0700 /root, so every step failed silently (T87).
+  #
+  # Deliberately no `set -e`: `this` returns non-zero at load-time as part of
+  # its dispatch protocol, so `set -e` + source would exit before anything
+  # ran. Explicit `|| exit 1` on the symlink steps gives the same fail-fast.
+  # The heal's RESULT is echoed on the last line so this shell can report a
+  # re-template (a create.result inside the hop never reaches us).
+  local bashrcOutcome
+  bashrcOutcome=$(private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")
+    if [ '$_needsRecreate' = 1 ]; then
       private.this.symlink.with.backup config '$sharedConfig' '$_ts' || exit 1
       private.this.symlink.with.backup oosh   '$sharedOosh'   '$_ts' || exit 1
-    " || {
+    fi
+    # config AFTER the symlinks: config.start runs config.init when CONFIG is
+    # unset, and that mkdirs a REAL ~/config the symlink step would then have
+    # to move aside as config.orig.<ts>.
+    source '$sharedOosh/config' >/dev/null 2>&1
+    private.config.bashrc.ensure '$targetHome' '$sharedOosh' '$_ts' >/dev/null
+    echo \"\$RESULT\"
+  ")
+  local hopRc=$?
+  if [ "$hopRc" -ne 0 ]; then
+    if [ "$(readlink "$targetHome/config" 2>/dev/null)" != "$sharedConfig" ] \
+    || [ "$(readlink "$targetHome/oosh"   2>/dev/null)" != "$sharedOosh"   ]; then
       error.log "config.init.user: failed to create symlinks for ${RED}$username${NORMAL}"
       return 1
-    }
+    fi
+    warn.log "config.init.user: could not ensure ${YELLOW}$targetHome/.bashrc${NORMAL}"
   fi
+  case "$bashrcOutcome" in
+    re-templated*) important.log "config.init.user: $bashrcOutcome (previous file kept as .bashrc.pre-oosh / .bashrc.orig.$_ts)" ;;
+  esac
   # Phase 2 — force canonical owner on the symlinks. Only when this shell has
   # the privilege to do so (root, or self).
   if [ "$(id -u)" = "0" ] || [ "$username" = "$USER" ]; then
     chown -h "$username:$username" "$targetHome/config" "$targetHome/oosh" 2>/dev/null || true
   fi
-
-  # bashrc — install the template unless a live line already sources
-  # ~/config/user.env (idempotent; heals a boot-era .bashrc). As the target
-  # user, like the symlink phase above.
-  private.as.user "$username" bash -c "
-    source \"$OOSH_DIR/this\" >/dev/null 2>&1
-    source \"$OOSH_DIR/config\" >/dev/null 2>&1
-    private.config.bashrc.ensure '$targetHome' '$sharedOosh' '$_ts'
-  " || warn.log "config.init.user: could not ensure ${YELLOW}$targetHome/.bashrc${NORMAL}"
 
   # Ensure dev group membership (idempotent; user.group.add no-ops if already a member).
   if private.user.check.group dev >/dev/null 2>&1; then
@@ -821,7 +828,9 @@ private.config.bashrc.ensure()     # <targetHome> <sharedOosh> <?stamp:now> # in
  # NOT the bare string config/user.env: every template era carries
  # `CONFIG=~/config/user.env` on line 9, so that guard matched a boot-era
  # .bashrc and the heal never replaced its dead `. "$HOME/oosh/boot"` (T86).
- local targetHome="$1" sharedOosh="$2" stamp="${3:-$(date +%Y%m%dT%H%M%S)}"
+ # Same stamp format as config.init.user's `_ts`, so a run that converged the
+ # symlinks and re-templated .bashrc leaves ONE timestamp behind, not two.
+ local targetHome="$1" sharedOosh="$2" stamp="${3:-$(date +%Y%m%d-%H%M%S)}"
  local bashrc="$targetHome/.bashrc"
  local hook='(^|&&|;)[[:space:]]*(\.|source)[[:space:]]+"?(\$HOME|~)/config/user\.env'
  if ! grep -Eq "$hook" "$bashrc" 2>/dev/null; then
