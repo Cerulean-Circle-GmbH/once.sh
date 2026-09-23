@@ -21,6 +21,13 @@
 > `$OOSH_USER_CONFIG_PATH/log.session.env`, which `log` creates and sources
 > itself — the shared `log.env` no longer chains it.
 >
+> **(3) 2026-09-23 — the leftover chain line.** A host installed before (2)
+> still carried `. $OOSH_USER_CONFIG_PATH/log.session.env` at the end of its
+> shared `log.env`, and nothing routine rewrote that file. `config init.user`
+> (run by `oo update`) now strips it via `private.config.log.env.migrate`,
+> once per host. The touch-guard in `this` that covered the window is slated
+> for removal (ticket T10 in the boot tickets doc) once hosts have updated.
+>
 > So wherever this doc describes `: ${CONFIG_PATH:=…}` / `: ${OOSH_DIR:=…}` header
 > lines *inside* `user.env`/`oosh.env`, read it as **history**. See
 > **[../config.md](../config.md)** § *user.env is the boot* and
