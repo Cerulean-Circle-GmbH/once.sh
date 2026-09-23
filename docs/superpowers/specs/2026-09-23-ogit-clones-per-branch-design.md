@@ -154,15 +154,17 @@ today (inventory A). Every signature ends with `<?dir:$OOSH_DIR>` unless noted.
 | `ogit.branch.reset` | `<branch> <startPoint> <?dir>` (`checkout -B`) | oo:1670 |
 | `ogit.branch.compare` | `<from> <to> <?dir>` → the alignment verdict (moves from `promote.branch.alignment`, promote:277) | promote alias |
 | `ogit.branch.merge` | `<ref> <?asEmail> <?asName> <?dir>` (`--no-edit`; identity flags only when given) | promote:770, 939; otest:124 |
+| `ogit.branch.fastForward` | `<ref> <?dir>` rc 1 when diverged | promote (Phase 2 merge-in-folder) |
 
 **merge / conflict**
 | `ogit.merge.abort` | `<?dir>` | promote:785, 955 |
 | `ogit.merge.base.get` | `<a> <b> <?dir>` | oo:1403 |
 | `ogit.conflict.list` | `<?dir>` (`--diff-filter=U`) | promote:709 |
-| `ogit.conflict.resolve.theirs` | `<file> <?dir>` | promote:725 |
+| `ogit.conflict.resolve` | `<file> <?side:theirs> <?dir>` | promote:725 |
 
 **remote**
 | `ogit.remote.url.get` | `<?remote:origin> <?dir>` | oo:1203, ossh:1187, promote:682 |
+| `ogit.remote.url.set` | `<url> <?remote:origin> <?dir>` | `private.oo.shared.tree.from.local` (Phase 2) |
 | `ogit.remote.branch.list` | `<?remote:origin> <?dir>` (`ls-remote --heads`, network) | oo:1256 |
 | `ogit.remote.fetch` | `<?dir> <?prune:no>` | ×5 |
 | `ogit.remote.pull` | `<?dir> <?url> <?branch>` (url+branch = `oo.update`'s HTTPS fallback) | ×5 |
@@ -205,7 +207,9 @@ today (inventory A). Every signature ends with `<?dir:$OOSH_DIR>` unless noted.
 **worktree / layout**
 | `ogit.worktree.add` | `<branch> <targetDir> <startPoint> <?dir>` | oo:802, 1191, 1700-1701, 2065 |
 | `ogit.worktree.list` | `<?dir>` porcelain | oo:540 |
-| `ogit.worktree.find` | `<branch> <?base>` → folder holding `<branch>` (worktree today, `<base>/<branch>` clone after Phase 2) | promote:660 |
+| `ogit.worktree.find` | `<branch> <?dir>` → folder holding `<branch>`: a linked worktree of `<dir>`'s repo, else the sibling clone `<base>/<branch>` (base = parent of `<dir>` when `main/` is there) | promote:660 |
+| `ogit.worktree.delete` | `<path> <?dir>` (`worktree remove`) | `worktree.remove` (Phase 2) |
+| `ogit.worktree.prune` | `<?dir>` | `worktree.remove` (Phase 2) |
 | `ogit.worktree.remove` / `ogit.worktree.restore` / `ogit.layout.status` | § 2.1 (Phase 2) | new |
 
 **binary / escape hatch**

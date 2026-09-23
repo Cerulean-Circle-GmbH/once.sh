@@ -105,10 +105,11 @@ private.ogit.require() # # rc 0 when the git binary is present; error.log + crea
  return 127
 }
 
-private.ogit.identity() # <?asEmail> <?asName> # echo the -c identity flags for a bot commit/merge, or nothing #
+private.ogit.identity() # <?asEmail> <?asName> # fill the array OGIT_IDENTITY with the -c flags for a bot commit/merge (empty when no email) — arrays, because a name like "oosh promote" has a space #
 {
- [ -n "$1" ] || return 0
- printf '%s' "-c user.email=$1 -c user.name=${2:-$1} -c commit.gpgsign=false"
+ OGIT_IDENTITY=()
+ [ -n "$1" ] && OGIT_IDENTITY=(-c "user.email=$1" -c "user.name=${2:-$1}" -c commit.gpgsign=false)
+ return 0
 }
 
 ### new.method
@@ -192,10 +193,12 @@ test.ogit.fixture() { # <label> # echo <fx>; <fx>/work is the clone, <fx>/origin
   echo "$fx"
 }
 
-test.ogit.commit() { # <work> <message> # one more commit on the fixture (raw git, fixture side)
+test.ogit.commit() { # <work> <message> # one more commit on the fixture (raw git, fixture side); each commit is one minute later than the previous, so date-sorted answers are deterministic
+  TEST_OGIT_TICK=$(( ${TEST_OGIT_TICK:-0} + 1 ))
   printf '%s\n' "$2" >> "$1/file"
   git -C "$1" add file
-  git -C "$1" -c user.email=t@t -c user.name=t commit -q -m "$2"
+  GIT_COMMITTER_DATE="@$((1700000000 + TEST_OGIT_TICK * 60)) +0000" GIT_AUTHOR_DATE="@$((1700000000 + TEST_OGIT_TICK * 60)) +0000" \
+    git -C "$1" -c user.email=t@t -c user.name=t commit -q -m "$2"
 }
 
 test.ogit.fixtureWorks() {
@@ -217,6 +220,8 @@ expect 0 "fixture: one commit, tracking origin/dev" "every ogit case builds on t
 ---
 
 ### Task 3: `repo` noun
+
+(`private.ogit.gitdir` — shown in Task 19 — is needed by `repo.share`; create it here, in the PRIVATE HELPERS section, with `oo method.new private.ogit.gitdir`.)
 
 **Files:** `ogit`, `test/test.ogit`
 
@@ -286,7 +291,7 @@ ogit.repo.share()     # <?dir:$OOSH_DIR> # make <dir>'s repository group-writabl
 {
  private.ogit.require || return $(result)
  local dir; dir=$(private.ogit.dir "$1")
- local gitDir; gitDir=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)
+ local gitDir; gitDir=$(private.ogit.gitdir "$dir")
  if [ -z "$gitDir" ]; then create.result 1 "ogit.repo.share: $dir is not a repository"; error.log "$RESULT"; return $(result); fi
  git -C "$dir" config core.sharedRepository group \
    && find "$gitDir" -type d -exec chmod g+s {} + \
@@ -299,7 +304,8 @@ ogit.repo.share.completion.dir() { compgen -d "$1"; }
 
 ogit.repo.grep()     # <pattern> <?dir:$OOSH_DIR> <?pathspecs...> # git grep -nE <pattern> over the tracked files of <dir> (the tree sweeps) #
 {
- local pattern="$1" dir; dir=$(private.ogit.dir "$2"); shift 2 2>/dev/null
+ local pattern="$1" dir; dir=$(private.ogit.dir "$2")
+ if [ $# -ge 2 ]; then shift 2; else shift; fi
  git -C "$dir" grep -nE "$pattern" -- "$@" 2>/dev/null
 }
 
@@ -358,8 +364,13 @@ test.ogit.branch() {
   test.ogit.commit "$w" two
   [ "$(ogit.branch.compare origin/dev dev "$w" >/dev/null; echo "$RESULT")" != "" ] || bad="$bad compare-empty"
   git -C "$w" checkout -q feature/x
-  ogit.branch.merge dev t@t t "$w" >/dev/null 2>&1 || bad="$bad merge-rc=$?"
+  ogit.branch.merge dev "t@t" "t t" "$w" >/dev/null 2>&1 || bad="$bad merge-rc=$?"
   [ "$(git -C "$w" rev-parse feature/x)" = "$(git -C "$w" rev-parse dev)" ] || bad="$bad merge-ff"
+  git -C "$w" checkout -q dev; test.ogit.commit "$w" three; git -C "$w" checkout -q feature/x
+  ogit.branch.fastForward dev "$w" >/dev/null 2>&1 || bad="$bad ff-rc=$?"
+  [ "$(git -C "$w" rev-parse feature/x)" = "$(git -C "$w" rev-parse dev)" ] || bad="$bad ff-sha"
+  test.ogit.commit "$w" diverge; git -C "$w" checkout -q dev; test.ogit.commit "$w" other
+  ogit.branch.fastForward feature/x "$w" >/dev/null 2>&1 && bad="$bad ff-diverged-passed"
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "branch: get/list/check/find/checkout/reset/compare/merge behave" || create.result 1 "branch:$bad"
   return $(result)
@@ -438,12 +449,20 @@ ogit.branch.compare()     # <from> <to> <?dir:$OOSH_DIR> # RESULT = the alignmen
 ogit.branch.compare.completion.from() { ogit.parameter.completion.branch "$@"; }
 ogit.branch.compare.completion.to()   { ogit.parameter.completion.branch "$@"; }
 
+ogit.branch.fastForward()     # <ref> <?dir:$OOSH_DIR> # fast-forward the current branch of <dir> to <ref>; rc 1 (nothing changed) when it has diverged #
+{
+ private.ogit.require || return $(result)
+ if git -C "$(private.ogit.dir "$2")" merge --ff-only "$1" >/dev/null 2>&1; then create.result 0 "fast-forwarded to $1"; else create.result 1 "$(private.ogit.dir "$2") has diverged from $1 — no fast-forward"; fi
+ return $(result)
+}
+ogit.branch.fastForward.completion.ref() { ogit.parameter.completion.ref "$@"; }
+
 ogit.branch.merge()     # <ref> <?asEmail> <?asName> <?dir:$OOSH_DIR> # merge <ref> into the current branch of <dir> (--no-edit); with <asEmail>/<asName> the merge commit carries that identity and no gpg signing #
 {
  private.ogit.require || return $(result)
  local ref="$1" dir; dir=$(private.ogit.dir "$4")
- # $(private.ogit.identity) is unquoted on purpose: it is zero or six words.
- if git -C "$dir" $(private.ogit.identity "$2" "$3") merge "$ref" --no-edit 2>/dev/null; then
+ private.ogit.identity "$2" "$3"
+ if git -C "$dir" "${OGIT_IDENTITY[@]}" merge "$ref" --no-edit 2>/dev/null; then
    create.result 0 "merged $ref"
  else
    create.result 1 "merge of $ref failed in $dir — conflicts? see ogit conflict.list"
@@ -470,17 +489,17 @@ test.ogit.mergeConflict() {
   [ "$base" = "$(git -C "$w" rev-parse dev~1)" ] || bad="$bad base=$base"
   ogit.branch.merge other t@t t "$w" >/dev/null 2>&1 && bad="$bad conflicting-merge-passed"
   [ "$(ogit.conflict.list "$w")" = file ] || bad="$bad list=$(ogit.conflict.list "$w")"
-  ogit.conflict.resolve.theirs file "$w" >/dev/null 2>&1 || bad="$bad resolve-rc=$?"
+  ogit.conflict.resolve file theirs "$w" >/dev/null 2>&1 || bad="$bad resolve-rc=$?"
   [ "$(cat "$w/file")" = theirs ] || bad="$bad resolved-content"
   [ -z "$(ogit.conflict.list "$w")" ] || bad="$bad still-conflicted"
   ogit.merge.abort "$w" >/dev/null 2>&1 || bad="$bad abort-rc=$?"
   [ "$(cat "$w/file")" = ours ] || bad="$bad abort-content"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "merge.base.get, conflict.list, conflict.resolve.theirs, merge.abort behave" || create.result 1 "merge/conflict:$bad"
+  [ -z "$bad" ] && create.result 0 "merge.base.get, conflict.list, conflict.resolve, merge.abort behave" || create.result 1 "merge/conflict:$bad"
   return $(result)
 }
 test.case $level "T-OGIT-MERGE-CONFLICT: merge and conflict nouns" test.ogit.mergeConflict
-expect 0 "merge.base.get, conflict.list, conflict.resolve.theirs, merge.abort behave" "promote's conflict path"
+expect 0 "merge.base.get, conflict.list, conflict.resolve, merge.abort behave" "promote's conflict path"
 ```
 
 - [ ] **Step 2: Implement**
@@ -507,15 +526,17 @@ ogit.conflict.list()     # <?dir:$OOSH_DIR> # echo the conflicted paths of the m
 }
 ogit.conflict.list.completion.dir() { compgen -d "$1"; }
 
-ogit.conflict.resolve.theirs()     # <file> <?dir:$OOSH_DIR> # resolve <file>'s conflict by taking the merged-in side and stage it #
+ogit.conflict.resolve()     # <file> <?side:theirs> <?dir:$OOSH_DIR> # resolve <file>'s conflict by taking <side> (theirs = the merged-in branch, ours = the current one) and stage it #
 {
  private.ogit.require || return $(result)
- local dir; dir=$(private.ogit.dir "$2")
- if git -C "$dir" checkout --theirs -- "$1" 2>/dev/null && git -C "$dir" add -- "$1" 2>/dev/null; then create.result 0 "took theirs for $1"
+ local side="${2:-theirs}" dir; dir=$(private.ogit.dir "$3")
+ case "$side" in theirs|ours) ;; *) create.result 1 "ogit.conflict.resolve: side must be theirs or ours"; error.log "$RESULT"; return $(result) ;; esac
+ if git -C "$dir" checkout "--$side" -- "$1" 2>/dev/null && git -C "$dir" add -- "$1" 2>/dev/null; then create.result 0 "took $side for $1"
  else create.result 1 "could not resolve $1"; fi
  return $(result)
 }
-ogit.conflict.resolve.theirs.completion.file() { ogit.conflict.list; }
+ogit.conflict.resolve.completion.file() { ogit.conflict.list; }
+ogit.conflict.resolve.completion.side() { echo theirs; echo ours; }
 ```
 
 - [ ] **Step 3: Run → PASS. Commit** `feat(ogit): merge and conflict nouns`.
@@ -542,6 +563,8 @@ test.ogit.remote() {
   [ "$(git -C "$w" rev-parse origin/dev)" = "$(git -C "$c/w" rev-parse dev)" ] || bad="$bad fetch-ref"
   ogit.remote.pull "$w" >/dev/null 2>&1 || bad="$bad pull-rc=$?"
   [ "$(git -C "$w" rev-parse dev)" = "$(git -C "$c/w" rev-parse dev)" ] || bad="$bad pull-sha"
+  ogit.remote.url.set "$fx/elsewhere.git" origin "$w" >/dev/null 2>&1 || bad="$bad url-set-rc"
+  [ "$(ogit.remote.url.get origin "$w")" = "$fx/elsewhere.git" ] || bad="$bad url-set"
   rm -rf "$fx" "$c"
   [ -z "$bad" ] && create.result 0 "remote: url.get/branch.list/fetch/pull/push behave" || create.result 1 "remote:$bad"
   return $(result)
@@ -564,6 +587,14 @@ ogit.remote.branch.list()     # <?remote:origin> <?dir:$OOSH_DIR> # echo the bra
  git -C "$(private.ogit.dir "$2")" ls-remote --heads "${1:-origin}" 2>/dev/null | sed 's|.*refs/heads/||'
 }
 ogit.remote.branch.list.completion.remote() { ogit.parameter.completion.remote "$@"; }
+
+ogit.remote.url.set()     # <url> <?remote:origin> <?dir:$OOSH_DIR> # point <remote> of <dir> at <url> #
+{
+ private.ogit.require || return $(result)
+ if git -C "$(private.ogit.dir "$3")" remote set-url "${2:-origin}" "$1" 2>/dev/null; then create.result 0 "${2:-origin} → $1"; else create.result 1 "could not set ${2:-origin} to $1"; fi
+ return $(result)
+}
+ogit.remote.url.set.completion.remote() { ogit.parameter.completion.remote "$@"; }
 
 ogit.remote.fetch()     # <?dir:$OOSH_DIR> <?prune:no> # fetch origin into <dir>; prune=yes drops deleted remote branches #
 {
@@ -650,8 +681,9 @@ ogit.commit.create()     # <?message> <?asEmail> <?asName> <?dir:$OOSH_DIR> # co
 {
  private.ogit.require || return $(result)
  local msg="$1" dir; dir=$(private.ogit.dir "$4")
- if [ -n "$msg" ]; then git -C "$dir" $(private.ogit.identity "$2" "$3") commit -q -m "$msg"
- else git -C "$dir" $(private.ogit.identity "$2" "$3") commit; fi \
+ private.ogit.identity "$2" "$3"
+ if [ -n "$msg" ]; then git -C "$dir" "${OGIT_IDENTITY[@]}" commit -q -m "$msg"
+ else git -C "$dir" "${OGIT_IDENTITY[@]}" commit; fi \
    && create.result 0 "committed: ${msg:-(editor)}" || create.result 1 "commit failed in $dir (nothing staged?)"
  return $(result)
 }
@@ -669,8 +701,9 @@ ogit.commit.count()     # <from> <to> <?dir:$OOSH_DIR> # RESULT = number of comm
  # exist on test rigs without remotes — empty counts as 0.
  if [ -z "$1" ] || [ -z "$2" ]; then create.result 1 "ogit.commit.count requires <from> <to>"; error.log "$RESULT"; return $(result); fi
  local dir; dir=$(private.ogit.dir "$3") from="$1" to="$2" n
- case "$from" in */*) ;; *) from="refs/heads/$from" ;; esac
- case "$to"   in */*) ;; *) to="refs/heads/$to" ;; esac
+ # Only a BARE branch name gets refs/heads/; @{u}, HEAD, origin/x, x~1 pass verbatim.
+ case "$from" in */*|*@*|HEAD*|*~*|*^*) ;; *) from="refs/heads/$from" ;; esac
+ case "$to"   in */*|*@*|HEAD*|*~*|*^*) ;; *) to="refs/heads/$to" ;; esac
  n=$(git -C "$dir" rev-list --count "$from..$to" 2>/dev/null)
  create.result 0 "${n:-0}"
  return $(result)
@@ -967,15 +1000,18 @@ ogit.safeDirectory.ensure.completion.base() { compgen -d "$1"; }
 
 ```bash
 oo.safeDirectory.prune() # # remove git safe.directory entries whose paths no longer exist on disk (delegates to ogit safeDirectory.prune)
-{ private.oo.ogit.load; ogit.safeDirectory.prune "$@"; }
+{ private.this.ogit.load; ogit.safeDirectory.prune "$@"; }
 
 private.oo.safeDirectory.add() # <path> # idempotently add path to git's global safe.directory list (delegates to ogit safeDirectory.add)
-{ private.oo.ogit.load; ogit.safeDirectory.add "$@"; }
-
-private.oo.ogit.load() # # source ogit once into this shell (oo is sourced by tests and by the ooShim, so this cannot be at file scope) #
-{ [ "$(type -t ogit.safeDirectory.add)" = function ] || source "$OOSH_DIR/ogit" >/dev/null 2>&1; }
+{ private.this.ogit.load; ogit.safeDirectory.add "$@"; }
 ```
-Place `private.oo.ogit.load` via `oo method.new private.oo.ogit.load`. Move the safeDirectory tests from `test/test.oo` to `test/test.ogit` (rename the method calls); keep in `test.oo` one case `T-SAFEDIR-DELEGATES` that asserts `declare -f oo.safeDirectory.prune | grep -q ogit.safeDirectory.prune`.
+`private.this.ogit.load` is the ONE loader, defined in the kernel (Task 12, create it here first with `oo method.new private.this.ogit.load`):
+
+```bash
+private.this.ogit.load() # # source ogit into this shell once; lazy, because ogit sources this and every consumer (oo, promote, …) may be merely sourced by the ooShim or a test #
+{ [ "$(type -t ogit.branch.get)" = function ] || source "$OOSH_DIR/ogit" >/dev/null 2>&1; }
+```
+Rule for every consumer script: **the first line of each method that calls `ogit.*` is `private.this.ogit.load`** (a `type -t` check — cheap). No per-script loader copies, no file-scope `source ogit` (file scope runs before `source this` has put the tree on PATH). Move the safeDirectory tests from `test/test.oo` to `test/test.ogit` (rename the method calls); keep in `test.oo` one case `T-SAFEDIR-DELEGATES` that asserts `declare -f oo.safeDirectory.prune | grep -q ogit.safeDirectory.prune`.
 
 - [ ] **Step 4: Run** `./test.suite run ogit 1` and `./test.suite run oo 1` → PASS. **Commit** `feat(ogit): config and safeDirectory nouns — moved from oo, oo delegates`.
 
@@ -994,14 +1030,20 @@ test.ogit.worktree() {
   ogit.worktree.list "$w" | grep -q "^worktree $(cd "$fx/prod" && pwd -P)$" || bad="$bad list"
   [ "$(ogit.worktree.find prod "$w")" = "$(cd "$fx/prod" && pwd -P)" ] || bad="$bad find=[$(ogit.worktree.find prod "$w")]"
   [ -z "$(ogit.worktree.find nosuch "$w")" ] || bad="$bad find-nosuch"
+  printf 'dirty\n' >> "$fx/prod/file"
+  ogit.worktree.delete "$fx/prod" "$w" >/dev/null 2>&1 && bad="$bad delete-dirty-passed"
+  git -C "$fx/prod" checkout -q -- file
+  ogit.worktree.delete "$fx/prod" "$w" >/dev/null 2>&1 || bad="$bad delete-rc=$?"
+  [ -e "$fx/prod" ] && bad="$bad delete-left-folder"
+  ogit.worktree.prune "$w" >/dev/null 2>&1; [ "$(ogit.worktree.list "$w" | grep -c '^worktree ')" = 1 ] || bad="$bad prune"
   ogit.binary.check || bad="$bad binary"
   [ "$(ogit.raw "$w" rev-parse --abbrev-ref HEAD)" = dev ] || bad="$bad raw"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "worktree.add/list/find, binary.check, raw behave" || create.result 1 "worktree:$bad"
+  [ -z "$bad" ] && create.result 0 "worktree.add/list/find/delete/prune, binary.check, raw behave" || create.result 1 "worktree:$bad"
   return $(result)
 }
 test.case $level "T-OGIT-WORKTREE: worktree noun, binary.check, raw" test.ogit.worktree
-expect 0 "worktree.add/list/find, binary.check, raw behave" "worktree noun"
+expect 0 "worktree.add/list/find/delete/prune, binary.check, raw behave" "worktree noun"
 ```
 
 - [ ] **Step 2: Implement**
@@ -1030,6 +1072,21 @@ ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has 
 }
 ogit.worktree.find.completion.branch() { ogit.parameter.completion.branch "$@"; }
 
+ogit.worktree.delete()     # <path> <?dir:$OOSH_DIR> # unregister and delete the linked worktree at <path> from <dir>'s repository (refuses a dirty one — gate first) #
+{
+ private.ogit.require || return $(result)
+ if git -C "$(private.ogit.dir "$2")" worktree remove "$1" 2>/dev/null; then create.result 0 "worktree $1 removed"; else create.result 1 "git worktree remove $1 failed (dirty, or not a linked worktree)"; fi
+ return $(result)
+}
+ogit.worktree.delete.completion.path() { compgen -d "$1"; }
+
+ogit.worktree.prune()     # <?dir:$OOSH_DIR> # drop worktree registrations whose folders are gone #
+{
+ private.ogit.require || return $(result)
+ git -C "$(private.ogit.dir "$1")" worktree prune 2>/dev/null; create.result 0 "worktrees pruned"; return $(result)
+}
+ogit.worktree.prune.completion.dir() { compgen -d "$1"; }
+
 ogit.binary.check()     # # rc 0 when the git binary is on PATH #
 {
  command -v git >/dev/null 2>&1
@@ -1045,7 +1102,7 @@ ogit.raw()     # <dir> <args...> # run git -C <dir> <args...> verbatim — the d
 ogit.raw.completion.dir() { compgen -d "$1"; }
 ```
 
-- [ ] **Step 3: Run → PASS. Commit** `feat(ogit): worktree noun, binary.check, raw`.
+- [ ] **Step 3: Run → PASS. Commit** `feat(ogit): worktree noun (add/list/find/delete/prune), binary.check, raw`.
 
 ---
 
@@ -1071,12 +1128,9 @@ test.case $level "T-THIS-GIT-ALIASES: this.git.branch.short / commits.count dele
 expect 0 "this.git.* delegate to ogit and still answer" "callers outside this tree keep working"
 ```
 
-- [ ] **Step 2: Implement in `this`** (replace `this.git.branch.short` and `this.git.commits.count` bodies; keep their docstrings and completions):
+- [ ] **Step 2: Implement in `this`** (replace `this.git.branch.short` and `this.git.commits.count` bodies; keep their docstrings and completions; `private.this.ogit.load` exists since Task 10):
 
 ```bash
-private.this.ogit.load() # # source ogit once into this shell; this cannot source it at file scope (ogit sources this) #
-{ [ "$(type -t ogit.branch.get)" = function ] || source "$OOSH_DIR/ogit" >/dev/null 2>&1; }
-
 this.git.branch.short() # <?gitDir:$OOSH_DIR> # print the sanitised short branch name of <gitDir> (delegates to ogit branch.get)
 { private.this.ogit.load; ogit.branch.get "$@"; }
 
@@ -1085,7 +1139,7 @@ this.git.commits.count() # <gitDir> <fromRef> <toRef> # count commits in <toRef>
 ```
 Note the argument order flip: `this.git.commits.count <gitDir> <from> <to>` → `ogit.commit.count <from> <to> <dir>`.
 
-- [ ] **Step 3: `promote.branch.alignment`** becomes `{ private.promote.ogit.load; ogit.branch.compare "$1" "$2" "$OOSH_DIR"; }` with `private.promote.ogit.load` defined like `private.oo.ogit.load` (via `oo method.new`). Paste the original body into `ogit.branch.compare` (Task 4 placeholder) now.
+- [ ] **Step 3: `promote.branch.alignment`** becomes `{ private.this.ogit.load; ogit.branch.compare "$1" "$2" "$OOSH_DIR"; }`. Paste the original body into `ogit.branch.compare` (Task 4 placeholder) now.
 
 - [ ] **Step 4: Re-aim pins**
   - `test/test.ossh:720-735` (T-BRANCH-SHORT-STRIP-*): `BRANCH_BODY=$(declare -f ogit.branch.get 2>/dev/null)` after `private.this.ogit.load` — the four `${b#…}` strips are asserted there.
@@ -1112,8 +1166,8 @@ Note the argument order flip: `this.git.commits.count <gitDir> <from> <to>` → 
 # of scope; ogit itself is the caller.
 test.ogit.rawGitCalls() { # <?treeRoot:$OOSH_DIR> # echo file:line:text of every raw git call that is neither ogit nor excepted
   local root="${1:-$OOSH_DIR}" hit file line prev
-  git -C "$root" grep -nE '(^|[^A-Za-z0-9_./-])git[[:space:]]+[a-z-]+' -- \
-      ':!ogit' ':!init/oosh' ':!init/once' ':!test' ':!old' ':!restore' ':!docs' ':!.github' ':!.claude' ':!*.md' 2>/dev/null \
+  ogit.repo.grep '(^|[^A-Za-z0-9_./-])git[[:space:]]+[a-z-]+' "$root" \
+      ':!ogit' ':!init/oosh' ':!init/once' ':!test' ':!old' ':!restore' ':!docs' ':!.github' ':!.claude' ':!*.md' \
     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
     | grep -vE '(echo |printf |\.log |die |User git|for pkg in|compgen -W|ogit-exception)' \
     | while IFS= read -r hit; do
@@ -1157,12 +1211,12 @@ expect 0 "the sweep finds a planted call and honours the marker" "a sweep that c
 
 ### Task 14: Migrate `this`, `path`, `test.suite`, `config`, `os`, `claudeCode`, `osshLayout`
 
-Each site: replace the call, keep behaviour, run that file's tests. The command form is needed only where a function is not in scope; in these files `ogit` functions are loaded with a `private.<script>.ogit.load` helper (create one per script with `oo method.new`, same one-liner as `private.oo.ogit.load`; in `this` use `private.this.ogit.load` from Task 12).
+Each site: replace the call, keep behaviour, run that file's tests. The command form is needed only where a function is not in scope; everywhere else the method that calls `ogit.*` starts with `private.this.ogit.load` (the kernel loader from Task 10).
 
 | Site | Before | After |
 |---|---|---|
 | this:246 `private.this.anchor.validate.one` | `git -C "$treeRoot" grep -nE "$pattern" -- <pathspecs>` | `private.this.ogit.load; ogit.repo.grep "$pattern" "$treeRoot" <pathspecs>` |
-| path:54 `path.validate` | `git -C "$treeRoot" grep -nE 'PATH=' -- …` | `private.path.ogit.load; ogit.repo.grep '(^\|[^A-Za-z0-9_])PATH=' "$treeRoot" …` (keep the exact pattern that is there) |
+| path:54 `path.validate` | `git -C "$treeRoot" grep -nE 'PATH=' -- …` | `private.this.ogit.load; ogit.repo.grep '(^\|[^A-Za-z0-9_])PATH=' "$treeRoot" …` (keep the exact pattern that is there) |
 | test.suite:1269 | `git -C "$root" ls-files \| head -1` | `ogit.repo.files.list "$root" \| head -1` |
 | test.suite:1310 | `git -C … grep -nE "$pattern" …` | `ogit.repo.grep "$pattern" "$root" …` |
 | config:280, user:973 | already `this.git.branch.short` | unchanged (alias) |
@@ -1179,7 +1233,7 @@ Each site: replace the call, keep behaviour, run that file's tests. The command 
 
 **Files:** `oo`; tests `test/test.oo`
 
-Add `private.oo.ogit.load` calls at the top of each affected public method (or once in `oo.start` after `source this`: `source ogit` — preferred, since `oo` always sources `this` first; the ooShim sources `oo` and then needs `ogit` too: add `source "$dir/ogit"` next to its `source "$dir/oo"` line in `templates/user/ooShim`).
+Every method below that calls `ogit.*` gets `private.this.ogit.load` as its first line. The ooShim (which sources `this` and `oo`, then calls `oo.mode`) needs no change: the loader inside `oo.mode` does the work.
 
 | Line(s) | Before | After |
 |---|---|---|
@@ -1213,7 +1267,7 @@ Add `private.oo.ogit.load` calls at the top of each affected public method (or o
 
 **Files:** `promote`; tests `test/test.promote`
 
-Add `source ogit` in `promote.start` after `source this` (promote is also sourced by test.promote: keep `private.promote.ogit.load` from Task 12 for the sourced path).
+Every `private.check.*` and `promote.*` method below that calls `ogit.*` gets `private.this.ogit.load` as its first line (promote is also merely sourced by test.promote).
 
 | Line(s) | Before | After |
 |---|---|---|
@@ -1224,7 +1278,7 @@ Add `source ogit` in `promote.start` after `source this` (promote is also source
 | 628, 643-652 `rewrite.self.branch` | `branch --show-current`, `diff --quiet -- files`, `add files`, `-c … commit -m … -q` | `ogit.branch.get "$dir"`, `ogit.diff.check "$dir" init/oosh "Install oosh.command"`, `ogit.index.add all "$dir" init/oosh "Install oosh.command"`, `ogit.commit.create "chore(promote): …" oosh-promote@local "oosh promote" "$dir"` |
 | 660 `find.worktree` | body | `ogit.worktree.find "$branch" "$ooshDir"` |
 | 682, 684 `push.source.branch` | `remote get-url origin`, `push origin $b` | `[ -n "$(ogit.remote.url.get origin "$ooshDir")" ] \|\| return 0`; `ogit.remote.push "$sourceBranch" no "$ooshDir"` |
-| 706-735 conflict helper | `branch --show-current`, `diff --name-only --diff-filter=U`, `checkout --theirs`, `add`, `-c … commit` | `ogit.branch.get`, `ogit.conflict.list`, `ogit.conflict.resolve.theirs "$f"`, `ogit.commit.create "Merge …" oosh-promote@local "oosh promote" "$dir"` |
+| 706-735 conflict helper | `branch --show-current`, `diff --name-only --diff-filter=U`, `checkout --theirs`, `add`, `-c … commit` | `ogit.branch.get`, `ogit.conflict.list`, `ogit.conflict.resolve "$f" theirs`, `ogit.commit.create "Merge …" oosh-promote@local "oosh promote" "$dir"` |
 | 751-792, 893-960 both merges | `diff --quiet`, `stash push -q -m`, `stash pop -q`, `checkout X`, `-c … merge X --no-edit`, `merge --abort` | `ogit.diff.check "$OOSH_DIR"`, `ogit.stash.push "promote: pre-merge stash" "$OOSH_DIR"`, `ogit.stash.pop "$OOSH_DIR"`, `ogit.branch.checkout testing "$OOSH_DIR"`, `ogit.branch.merge dev oosh-promote@local "oosh promote" "$mergeDir"`, `ogit.merge.abort "$mergeDir"` |
 | 809, 814 | `tag -l "$tag" \| grep -q`, `tag "$tag"` | `ogit.tag.check "$tag" "$OOSH_DIR"`, `ogit.tag.create "$tag" HEAD "$OOSH_DIR"` |
 | 829, 1024 | `push origin testing --tags` | `ogit.remote.push testing yes "$OOSH_DIR"` |
@@ -1245,10 +1299,10 @@ Add `source ogit` in `promote.start` after `source this` (promote is also source
     '$sharedOosh/ogit' safeDirectory.add '$sharedOosh'"` (and the osascript canonical-case variant the same way) |
 | user:1154 | `_ownerEmail=$(private.as.user "$username" bash -c "$(private.this.as.user.preamble.get …)
     '$sharedOosh/ogit' config.email.get" 2>/dev/null) \|\| true` |
-| ossh:580-581 | `ogit.config.email.get "$PWD"` (ossh.start already sources this; add `source ogit` there) |
+| ossh:580-581 | `private.this.ogit.load; ogit.config.email.get "$PWD"` |
 | ossh:640 (remote jump host) | `ossh.exec "$jumpHost" "command -v ogit >/dev/null 2>&1 && ogit config.email.get \|\| git config --global user.email \|\| git config user.email"` with `# ogit-exception: jump host may have no oosh` on the line above |
 | ossh:1180, 1187 | `ogit.binary.check`, `ogit.remote.url.get origin "$repo"` |
-| hiveMind ×11 `rev-parse --show-toplevel` | `ogit.repo.root.get` (hiveMind sources this; add `source ogit` in `hiveMind.start`) |
+| hiveMind ×11 `rev-parse --show-toplevel` | `private.this.ogit.load; ogit.repo.root.get` |
 | hiveMind:1753 (remote) | `ossh exec "$host" "~/oosh/ogit remote.pull"` |
 | hiveMind:4060-4069 auto.commit | `ogit.status.check && return 0`; `ogit.index.add updated`; `ogit.commit.create "$msg"`; `ogit.remote.push "" no "$dir" &` |
 | hiveMind:4126-4208, scrumMaster:643-741, 1444 | `ogit.branch.get`, `ogit.commit.log.show "" 1 oneline`, `ogit.status.check`, `ogit.commit.log.show "" 5 oneline`, `ogit.commit.log.show --since=midnight "" oneline \| wc -l` (pass `--since=midnight` as `<range>`) |
@@ -1287,7 +1341,7 @@ Add `source ogit` in `promote.start` after `source this` (promote is also source
 test.ogit.base() { # <label> <?shape:worktree> # echo <base> holding main + dev + prod as linked worktrees (shape worktree) or as clones (shape clone), all tracking <base>/origin.git
   local fx; fx=$(test.suite.fixture.make "$1"); local base="$fx/Once.sh"; mkdir -p "$base"
   git init -q --bare -b main "$fx/origin.git"
-  git clone -q "$fx/origin.git" "$base/main" 2>/dev/null; git -C "$base/main" checkout -q -b main 2>/dev/null
+  git init -q -b main "$base/main"; git -C "$base/main" remote add origin "$fx/origin.git"
   printf 'seed\n' > "$base/main/file"; git -C "$base/main" add file; git -C "$base/main" -c user.email=t@t -c user.name=t commit -q -m seed
   git -C "$base/main" push -q -u origin main
   local b; for b in dev prod; do
@@ -1311,6 +1365,9 @@ test.ogit.layoutStatus() {
   out=$(ogit.layout.status "$base")
   printf '%s\n' "$out" | grep -qE '^prod[[:space:]]+worktree[[:space:]]+dirty 1' || bad="$bad prod-dirty"
   printf '%s\n' "$out" | grep -qE '^dev[[:space:]]+worktree[[:space:]]+dirty 0[[:space:]]+ahead 1' || bad="$bad dev-ahead"
+  ogit.layout.status "$base" >/dev/null || bad="$bad consistent-worktree-layout-rc=$?"
+  # a mixed layout: prod becomes a clone while dev is still a worktree
+  git -C "$base/prod" checkout -q -- file; git -C "$base/main" worktree remove "$base/prod"; git clone -q -b prod "$(dirname "$base")/origin.git" "$base/prod"
   ogit.layout.status "$base" >/dev/null && bad="$bad mixed-layout-rc0"
   rm -rf "$(dirname "$base")"
   base=$(test.ogit.base layoutcl clone)
@@ -1326,6 +1383,11 @@ expect 0 "layout.status reports shape, dirty, ahead, behind per folder; rc 1 on 
 - [ ] **Step 3: Implement**
 
 ```bash
+private.ogit.gitdir() # <?dir:$OOSH_DIR> # echo the absolute .git directory of <dir>'s repository #
+{
+ git -C "$(private.ogit.dir "$1")" rev-parse --absolute-git-dir 2>/dev/null
+}
+
 private.ogit.folder.shape() # <folder> # echo worktree | clone | missing for <folder> #
 {
  if   [ -f "$1/.git" ]; then echo worktree
@@ -1345,10 +1407,12 @@ ogit.layout.status()     # <?base:$(oo mode.base.get)> # one line per folder und
    [ "$shape" = missing ] && continue
    shapes="$shapes $shape"
    dirty=$(ogit.status.show porcelain "$d" | grep -c .)
-   ahead=$(git -C "$d" rev-list --count @{u}..HEAD 2>/dev/null || echo '?')
-   behind=$(git -C "$d" rev-list --count HEAD..@{u} 2>/dev/null || echo '?')
+   if ogit.branch.check '@{u}' "$d"; then
+     ogit.commit.count '@{u}' HEAD "$d" >/dev/null; ahead="$RESULT"
+     ogit.commit.count HEAD '@{u}' "$d" >/dev/null; behind="$RESULT"
+   else ahead='?'; behind='?'; fi
    [ "$(git -C "$d" config --get core.sharedRepository 2>/dev/null)" = group ] && shared=group || shared=no
-   [ -g "$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" ] && setgid=yes || setgid=no
+   [ -g "$(private.ogit.gitdir "$d")" ] && setgid=yes || setgid=no
    ogit.safeDirectory.list | grep -qFx "$d" && trusted=yes || trusted=no
    printf '%-14s %-9s dirty %-3s ahead %-3s behind %-3s shared=%s setgid=%s trusted=%s\n' "$name" "$shape" "$dirty" "$ahead" "$behind" "$shared" "$setgid" "$trusted"
  done
@@ -1410,8 +1474,8 @@ private.ogit.folder.gate() # <folder> # rc 0 when <folder> is clean, has an upst
  local d="$1" name="${1##*/}" n
  n=$(ogit.status.show porcelain "$d" | grep -c .)
  if [ "$n" != 0 ]; then create.result 1 "$name has $n uncommitted change(s) — commit or stash them in $d first"; return 1; fi
- if ! git -C "$d" rev-parse --abbrev-ref @{u} >/dev/null 2>&1; then create.result 1 "$name tracks no upstream — push it (git -C $d push -u origin <branch>) first"; return 1; fi
- n=$(git -C "$d" rev-list --count @{u}..HEAD 2>/dev/null)
+ if ! ogit.branch.check '@{u}' "$d"; then create.result 1 "$name tracks no upstream — push it (ogit remote.push <branch> no $d after git branch -u) first"; return 1; fi
+ ogit.commit.count '@{u}' HEAD "$d" >/dev/null; n="$RESULT"
  if [ "${n:-0}" != 0 ]; then create.result 1 "$name is $n commit(s) ahead of its upstream — push it first"; return 1; fi
  return 0
 }
@@ -1421,6 +1485,10 @@ private.ogit.folder.finish() # <folder> # after a clone/worktree lands under the
  ogit.repo.share "$1" >/dev/null || return $(result)
  if [ "$(id -u)" = 0 ] && id developking >/dev/null 2>&1; then chown -R developking:dev "$1" 2>/dev/null; fi
  ogit.safeDirectory.add "$1" >/dev/null
+ # Under sudo the entry above is ROOT's; the person who typed the command needs one too.
+ if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ]; then
+   private.as.user "$SUDO_USER" "$OOSH_DIR/ogit" safeDirectory.add "$1" >/dev/null 2>&1
+ fi
  return 0
 }
 
@@ -1449,18 +1517,21 @@ ogit.worktree.remove()     # <?base:$(oo mode.base.get)> # turn every linked wor
  local i
  for i in "${!folders[@]}"; do
    wt="${folders[$i]}"; branch="${branches[$i]}"
-   git -C "$base/main" worktree remove "$wt" >/dev/null 2>&1 \
-     || { create.result 1 "git worktree remove $wt failed — stop; nothing after this folder was touched"; error.log "$RESULT"; return $(result); }
+   ogit.worktree.delete "$wt" "$base/main" >/dev/null \
+     || { create.result 1 "worktree delete of $wt failed — stop; nothing after this folder was touched"; error.log "$RESULT"; return $(result); }
    ogit.repo.clone "$url" "$branch" "$wt" >/dev/null 2>&1 \
      || { create.result 1 "${wt##*/}: worktree removed but clone of $branch failed — recover with: ogit repo.clone $url $branch $wt"; error.log "$RESULT"; return $(result); }
    private.ogit.folder.finish "$wt" || return $(result)
    echo "${wt##*/}: worktree → clone ($branch)"
  done
- git -C "$base/main" worktree prune >/dev/null 2>&1
+ ogit.worktree.prune "$base/main" >/dev/null
  create.result 0 "${#folders[@]} folder(s) converted to clones under $base"
  return $(result)
 }
 ogit.worktree.remove.completion.base() { compgen -d "$1"; }
+```
+(`awk '{print $2}'` on the porcelain list assumes no spaces in the base path — true for the shared tree; `layout.status` and the fixtures share the assumption.)
+```bash
 ```
 
 - [ ] **Step 3: Run → PASS. Commit** `feat(ogit): worktree.remove — linked worktrees become independent clones, gated`.
@@ -1541,8 +1612,11 @@ ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has 
 {
  local hit; hit=$(ogit.worktree.list "$2" | awk -v ref="refs/heads/$1" '/^worktree / { wt=$2; next } $1 == "branch" && $2 == ref { print wt; exit }')
  if [ -n "$hit" ]; then printf '%s\n' "$hit"; return 0; fi
- local base; base=$(oo mode.base.get 2>/dev/null)
- [ -n "$base" ] && [ -d "$base/$1/.git" ] && [ "$(ogit.branch.get "$base/$1")" = "$1" ] && printf '%s\n' "$(cd "$base/$1" && pwd -P)"
+ # The base is the parent of THIS repository when a sibling main/ exists — derived
+ # from <dir>, not from oo mode.base.get, so a fixture never resolves to the real tree.
+ local self base; self=$(cd "$(private.ogit.dir "$2")" 2>/dev/null && pwd -P) || return 0
+ base=$(dirname "$self")
+ [ -d "$base/main/.git" ] && [ -d "$base/$1/.git" ] && [ "$(ogit.branch.get "$base/$1")" = "$1" ] && printf '%s\n' "$base/$1"
 }
 ```
 
@@ -1566,11 +1640,10 @@ ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has 
     local originUrl; originUrl=$(ogit.remote.url.get origin main)
     ogit.repo.clone "$(pwd)/main" "$branch" "$branch" >/dev/null \
       || { error.log "private.oo.shared.tree.from.local: clone of $branch from main/ failed"; return 1; }
-    [ -n "$originUrl" ] && git -C "$branch" remote set-url origin "$originUrl"   # ogit-exception: no method for set-url yet; add ogit.remote.url.set if a second caller appears
+    [ -n "$originUrl" ] && { ogit.remote.url.set "$originUrl" origin "$branch" >/dev/null || return 1; }
     ogit.repo.share "$branch" >/dev/null
   fi
 ```
-(Better: add `ogit.remote.url.set <url> <?remote:origin> <?dir>` via `oo method.new` with a one-line test, and use it — do that instead of the exception.)
 
 - [ ] **Step 3: State 31** — replace the "Creating worktree" branch (oo:2049-2071 at 8c46828, migrated in Task 15) with:
 
@@ -1633,7 +1706,7 @@ and the permission block (oo:2144-2171) with:
     (Do the rename: message `clone failed for`, pin updated in test.oo:470.)
   - `oo.checkout`: delete the "Worktree mode" branch; the single path is: `base=$(oo.mode.base.get)` (fail loud if none: `create.result 1 "no components base — run oo mode.setup"`); `targetDir="$base/$dirName"`; the existing-folder branch unchanged (align via `ogit.branch.checkout`); else `ogit.remote.fetch "$oosh"`, `ogit.repo.clone "$(ogit.remote.url.get origin "$oosh")" "$version" "$targetDir"`, `ogit.repo.share "$targetDir"`, `ogit.safeDirectory.add "$targetDir"`. Docstring: `# <version> # clone a remote branch as <base>/<dirName>`.
   - `oo.update`: after the pull and before `private.oo.update.heal.symlinks`: `ogit.safeDirectory.ensure >/dev/null || warn.log "oo update: could not ensure safe.directory — $RESULT"`.
-  - `config.init.user`: after the log.env migration block: `ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null || warn.log "config.init.user: $RESULT"` (for the *caller*); and inside the as-user hop, after `private.config.bashrc.ensure`: `'$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")' >/dev/null` (for the *target*). `config` loads ogit via `private.config.ogit.load` (`oo method.new`).
+  - `config.init.user`: after the log.env migration block: `private.this.ogit.load; ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null || warn.log "config.init.user: $RESULT"` (for the *caller*); and inside the as-user hop, after `private.config.bashrc.ensure`: `'$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")' >/dev/null` (for the *target*).
   - `user.oosh.install` (Task 17 sites): replace the two `safeDirectory.add` hops with one `'$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")'` hop.
 
 - [ ] **Step 3: Run** oo, config, user suites → PASS. Commit `feat(oo,config,user): oo mode/checkout clone under the base; trust ensured by oo update, config init.user, user.oosh.install`.
@@ -1683,7 +1756,7 @@ private.promote.merge.into.folder() # <source> <target> # push <source>; in <tar
  local stashed=no
  if ! ogit.diff.check "$dir"; then ogit.stash.push "promote: pre-merge stash" "$dir" >/dev/null && stashed=yes; fi
  ogit.remote.fetch "$dir" >/dev/null || { create.result 1 "fetch failed in $dir"; return $(result); }
- if ! git -C "$dir" merge --ff-only "origin/$target" >/dev/null 2>&1; then   # ogit-exception: add ogit.branch.fastForward <ref> if a second caller appears
+ if ! ogit.branch.fastForward "origin/$target" "$dir" >/dev/null; then
    [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
    create.result 1 "$target in $dir has diverged from origin/$target — reconcile it by hand"; return $(result)
  fi
@@ -1705,8 +1778,6 @@ private.promote.merge.into.folder() # <source> <target> # push <source>; in <tar
  return $(result)
 }
 ```
-(Implement `ogit.branch.fastForward <ref> <?dir>` properly via `oo method.new` — `git merge --ff-only` — with a test in test.ogit, rather than the exception; the plan shows the exception only so the shape is clear.)
-
 Then:
 - `private.check.merged.to.testing` body → `private.promote.merge.into.folder dev testing; return $(result)` (keep the `<script> <stageTo> <stateFound>` shifts).
 - `private.check.merged.to.prod` body → `private.promote.merge.into.folder testing prod; return $(result)`.
@@ -1731,6 +1802,6 @@ Then:
 
 ## Self-review checklist (done by the plan author; re-run by the implementer at the end)
 
-- **Spec coverage:** § 2 layout → Tasks 19-23, 25; § 2.1 conversions → Tasks 20-21; § 3.1-3.2 shape/conventions → Task 1; § 3.3 catalogue → Tasks 3-11 (plus `ogit.remote.url.set` and `ogit.branch.fastForward` added in Tasks 22/24 — add them to spec § 3.3 and the drawio JSON when you land them); § 3.4 aliases → Tasks 10, 12; § 3.5 → Tasks 15-16 keep porcelain verbs; § 3.6 exceptions → Tasks 13, 17; § 4 permissions/trust → Tasks 20-23; § 5 caller changes → Tasks 22-24; § 6 tests/docs/rollout → Tasks 13, 18, 25.
+- **Spec coverage:** § 2 layout → Tasks 19-23, 25; § 2.1 conversions → Tasks 20-21; § 3.1-3.2 shape/conventions → Task 1; § 3.3 catalogue → Tasks 3-11 (`ogit.remote.url.set`, `ogit.branch.fastForward`, `ogit.worktree.delete`, `ogit.worktree.prune`, `ogit.conflict.resolve <file> <?side>` are already in spec § 3.3 and the tree); § 3.4 aliases → Tasks 10, 12; § 3.5 → Tasks 15-16 keep porcelain verbs; § 3.6 exceptions → Tasks 13, 17; § 4 permissions/trust → Tasks 20-23; § 5 caller changes → Tasks 22-24; § 6 tests/docs/rollout → Tasks 13, 18, 25.
 - **Invariants (spec § 7):** `path validate` / `anchor.validate` after every task; `main/` always present; sweep green from Task 17 on; install fixes only in state 31's body; no automatic conversion.
 - **Known judgement calls for the implementer:** `oo.commit`'s `add *` → `index.add all` (dotfiles); `hiveMind:4888 add -f`; the `promote.report` tag format (keep output identical); `scrumMaster:14` lazy default; whether `ossh:640` keeps the raw fallback. Decide, note the decision in the commit message, move on.
