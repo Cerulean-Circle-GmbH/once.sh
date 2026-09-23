@@ -114,7 +114,7 @@ to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
 `mode-env.bash`.
 
 **`log` owns that file.** Its top level creates `$OOSH_USER_CONFIG_PATH`,
-touch-guards `log.session.env` and sources it (`log:15-23`); `log.session.save`
+touch-guards `log.session.env` and sources it (the file-scope block at the top of `log`); `log.session.save`
 writes it. The shared `log.env` used to chain it with a last line
 `. $OOSH_USER_CONFIG_PATH/log.session.env`, and that was removed: a failed `.`
 ends a POSIX shell, so a per-user file that did not exist yet aborted a

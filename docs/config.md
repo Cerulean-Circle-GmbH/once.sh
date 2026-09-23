@@ -59,7 +59,7 @@ the shared `$CONFIG_PATH` tier.
 The two tiers are **not** linked by a chain line in the shared `log.env`. They
 used to be — `log.env` ended with `. $OOSH_USER_CONFIG_PATH/log.session.env` —
 and that made a missing per-user file abort a `/bin/sh` login outright, because
-a failed `.` in dash ends the shell. **`log` owns that file now**: `log:15-23`
+a failed `.` in dash ends the shell. **`log` owns that file now**: the file-scope block at the top of `log`
 creates `$OOSH_USER_CONFIG_PATH`, touch-guards `log.session.env` and sources it
 itself, so the per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` are still **loaded**
 each login rather than merely recorded, and a first-ever shell has nothing to

@@ -16,6 +16,7 @@ listed here run only when invoked.
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
 | [`config init.shared`](config.md) | `sharedConfig` dir mode 2775 + group `dev` | After cross-user perm drift, "Permission denied" on shared config writes |
+| [`oo profile.status`](oo.md#ooprofilestatus) | Read-only report on `/etc/profile.d/oosh.sh`: missing, stale (still sources the retired `/etc/oosh/boot`) or OK; N/A on macOS | Before `oo profile.fix`; rc 1 when the drop-in needs repair, no privilege needed |
 | [`oo profile.fix`](oo.md#ooprofilefix) | `/etc/profile.d/oosh.sh` — the login-shell drop-in that recovers `$HOME` and sources `~/config/user.env` | `env -i sh -l` does not come up as an oosh shell; host installed before install state 34 (`root.profile.dropin.installed`). `oo profile.status` reports first. Needs root, or `dev` + sudo |
 | [`ossh rights.fix`](ossh.md) | `~/.ssh` file modes (600 private, 644 public, 700 dirs) | After SSH client complains about world-readable keys |
 | [`ossh folder.fix [strict]`](ossh.md) | `~/.ssh` tree layout (WODA Host blocks, IdentityFile paths, GitHub Host) | After `ssh: Bad configuration option`, missing `2cuGitHub` alias, drag-in legacy artifacts |

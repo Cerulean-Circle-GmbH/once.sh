@@ -280,13 +280,15 @@ boots via `source this`:
    │
 2. source this                    # OOSH kernel
    │
-   ├─ this.init                   # Initialize environment
-   │   ├─ Sets OOSH_DIR, CONFIG_PATH, OOSH_USER_CONFIG_PATH
-   │   └─ . $CONFIG               # Load user.env (pure data)
-   │       ├─ . oosh.env          # OOSH configuration
-   │       └─ . log.env           # Log configuration
-   │           └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
-   │   (PATH is a data line IN user.env; `this` de-duplicates it on load)
+   ├─ cold start (file scope)     # only when CONFIG is empty
+   │   └─ . ~/config/user.env     # the boot, as data: anchors, PATH, then
+   │       ├─ . oosh.env          #   OOSH configuration
+   │       └─ . log.env           #   Log configuration (no per-user chain)
+   │   (`log` creates and sources $OOSH_USER_CONFIG_PATH/log.session.env itself)
+   │
+   ├─ private.this.path.dedup     # the PATH line is data and cannot guard itself
+   ├─ this.init                   # re-sources $CONFIG for executed scripts,
+   │                              #   saving/restoring PATH and the anchors
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
    │
@@ -373,7 +375,7 @@ never changes. A constant needs setting in exactly **one** place, so:
 #### When you need the physical directory
 
 Resolve it **at that spot** with the portable helper
-`private.this.path.canonical` (`this:226`) — never bake the resolution into
+`private.this.path.canonical` (in `this`) — never bake the resolution into
 `OOSH_DIR`. The consumers that do:
 
 | Site | Why it needs the physical path |
@@ -588,7 +590,7 @@ export LOG_LEVEL_RESET="1"
 
 The per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` live in
 `$OOSH_USER_CONFIG_PATH/log.session.env`, which **`log` creates and sources
-itself** (`log:15-23`) — the shared `log.env` does not chain it, because a
+itself** (the file-scope block at the top of `log`) — the shared `log.env` does not chain it, because a
 missing per-user file in a shared chain line aborts dash outright.
 
 Note POSIX `.` (not the bash `source` builtin): every shell sources these files
@@ -828,8 +830,8 @@ Verified by `T-OSSH-PREREQS-APK-BUSYBOX-SUID` (test/test.ossh) and `T-INIT-ALPIN
 | Site | Path covered |
 |---|---|
 | `bashrcTemplate:21–25` | Interactive + non-interactive bash that sources bashrc (Debian's `SSH_SOURCE_BASHRC` patch covers ssh-with-command on Ubuntu/Debian/Alma). |
-| `this:51–66` | Every oosh script invocation that **didn't** go through bashrc — specifically ssh-with-command on Alpine/musl whose bash lacks the `SSH_SOURCE_BASHRC` patch. Self-heals via `id -u`. |
-| `bashrcTemplate:213–219` | PS1 conditional — *reads* `$SUDO` for prompt coloring; doesn't export. |
+| `this`, the file-scope `# Ensure $SUDO is set` block | Every oosh script invocation that **didn't** go through bashrc — specifically ssh-with-command on Alpine/musl whose bash lacks the `SSH_SOURCE_BASHRC` patch. Self-heals via `id -u`. |
+| `bashrcTemplate`, the PS1 conditional (`if [ "$USER" = "root" ]` near the prompt) | Colours the root prompt. It tests `$USER`, not `$SUDO`, and exports nothing — listed because it is the third place a reader will find the root/non-root split. |
 
 Each defends a different code path; same-named variable, different sources of truth.
 
