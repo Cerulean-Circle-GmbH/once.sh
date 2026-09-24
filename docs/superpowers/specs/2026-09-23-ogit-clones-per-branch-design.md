@@ -79,6 +79,10 @@ folder; `git -C main fetch origin`; `git -C main worktree add -B <branch> ../<br
 origin/<branch>`; permissions as state 31 does today (setgid/`g+w` on `main/.git`, per-folder
 `safe.directory`).
 
+Both conversions carry gitignored files: before a folder is touched, its ignored paths are
+copied into a timestamped backup (`$HOME/.oosh.backups/<UTC-stamp>-ogit-<folder>`) and restored
+into the new folder once it is finished; tracked dirty work is still refused by the gate (D4).
+
 **`ogit layout.status <?base>`** — read-only, plain `echo`: one line per folder —
 `worktree | clone | missing`, `dirty N`, `ahead N`, `behind N`, `shared=group|no`,
 `setgid=yes|no`, `trusted=yes|no` (calling user's `safe.directory`). rc 1 when any folder is
