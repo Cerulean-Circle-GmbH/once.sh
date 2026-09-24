@@ -918,6 +918,141 @@ ogit.layout.status()     # <?base:$(oo mode.base.get)> # one line per folder und
 }
 
 
+private.ogit.folder.ignored.save()     # <folder> <stashDir> # copy every gitignored path of <folder> into <stashDir>, keeping relative paths; RESULT = the number carried; rc 1 when a copy fails (RESULT names <stashDir>) #
+{
+ local folder="$1" stash="$2"
+ local p n=0
+ local -a paths=()
+ # Rule 3: a failing status must not read as "nothing ignored" and let the
+ # conversion delete the folder with its ignored files. Checked once through
+ # the runner (the -z stream itself needs a process substitution).
+ if ! private.ogit.git.run "$folder" status --porcelain --ignored -z >/dev/null; then
+   create.result 1 "ogit: cannot list the ignored files of $folder — nothing in $folder was touched$(private.ogit.git.reason.get)"; return $(result)
+ fi
+ # `!! <path>` entries are the ignored ones; -z keeps odd names whole. A fully
+ # ignored directory is one entry ending in /.
+ while IFS= read -r -d '' p; do
+   case "$p" in '!! '*) paths+=("${p#!! }") ;; esac
+ done < <(private.ogit.git.run "$folder" status --porcelain --ignored -z)
+ if [ ${#paths[@]} = 0 ]; then create.result 0 "0"; return $(result); fi
+ if ! mkdir -p "$stash" || ! chmod 700 "$stash"; then
+   create.result 1 "ogit: cannot create the backup $stash — nothing in $folder was touched"; return $(result)
+ fi
+ for p in "${paths[@]}"; do
+   p="${p%/}"
+   if mkdir -p "$stash/$(dirname "$p")" && cp -Rp "$folder/$p" "$stash/$(dirname "$p")/"; then
+     success.log "carrying ignored ${folder##*/}/$p"
+     n=$((n + 1))
+   else
+     create.result 1 "ogit: could not back up $folder/$p — nothing in $folder was touched; the partial backup is in $stash"; return $(result)
+   fi
+ done
+ create.result 0 "$n"
+ return $(result)
+}
+
+
+private.ogit.folder.ignored.restore()     # <stashDir> <folder> # copy everything saved in <stashDir> back into <folder>, keeping relative paths; the backup itself is kept #
+{
+ local stash="$1" folder="$2"
+ if [ ! -d "$stash" ]; then create.result 0 "no ignored files to carry"; return $(result); fi
+ # `<stash>/.` copies the CONTENTS, dotfiles included, into the existing folder.
+ if cp -Rp "$stash/." "$folder/"; then
+   success.log "ignored files carried into $folder (backup kept: $stash)"
+   create.result 0 "restored from $stash"
+ else
+   create.result 1 "ogit: could not copy the ignored files back into $folder — they are safe in $stash; copy them by hand: cp -Rp '$stash/.' '$folder/'"
+ fi
+ return $(result)
+}
+
+
+private.ogit.folder.gate()     # <folder> # rc 0 when <folder> is clean, has an upstream and is not ahead of it; RESULT names the folder and the fix otherwise #
+{
+ local d="$1" name="${1##*/}" n
+ n=$(ogit.status.show porcelain "$d" | grep -c .)
+ if [ "$n" != 0 ]; then create.result 1 "$name has $n uncommitted change(s) — commit or stash them in $d first"; return $(result); fi
+ if ! ogit.branch.check '@{u}' "$d"; then create.result 1 "$name tracks no upstream — set it with: ogit branch.upstream.set origin/<branch> $d, then ogit remote.push <branch> no $d"; return $(result); fi
+ ogit.commit.count '@{u}' HEAD "$d" >/dev/null; n="$RESULT"
+ if [ "${n:-0}" != 0 ]; then create.result 1 "$name is $n commit(s) ahead of its upstream — push it first"; return $(result); fi
+ create.result 0 "$name is clean and pushed"
+ return $(result)
+}
+
+
+private.ogit.folder.finish()     # <folder> # after a clone/worktree lands under the base: shared group mode (ogit repo.share, when a dev group exists), trust for the caller and — under sudo — for the person who typed the command; no ownership change #
+{
+ # No chown: the policy is chgrp dev + g+w + setgid, never a recursive chown
+ # (T-STATE-31-CHOWN-NOT-RECURSIVE, test/test.install:406-412). A single-user
+ # host without a dev group has nothing to share with; trust is still added.
+ if private.this.group.exists dev; then
+   ogit.repo.share "$1" >/dev/null || return $(result)
+ fi
+ ogit.safeDirectory.add "$1" >/dev/null || return $(result)
+ # Under sudo the entry above is ROOT's; the person who typed the command needs
+ # one too. Through the as-user preamble (this:1098), and with the PHYSICAL
+ # shared tree: root's $OOSH_DIR is /root/oosh, unreadable to that user.
+ if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ]; then
+   local sharedOosh
+   sharedOosh=$(private.this.path.canonical "$OOSH_DIR")
+   if private.this.script.load user private.as.user; then
+     private.as.user "$SUDO_USER" bash -c "$(private.this.as.user.preamble.get "$SUDO_USER" "$(user.get home "$SUDO_USER")" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.add '$1'" >/dev/null 2>&1 \
+       || warn.log "ogit: could not add $1 to $SUDO_USER's safe.directory — they run: ogit safeDirectory.ensure"
+   else
+     warn.log "ogit: user script not loadable — $SUDO_USER runs: ogit safeDirectory.ensure"
+   fi
+ fi
+ create.result 0 "finished: $1"
+ return $(result)
+}
+
+
+ogit.worktree.remove()     # <?base:$(oo mode.base.get)> # turn every linked worktree of <base>/main into an independent clone of the same branch, carrying its gitignored files across; refuses on a dirty or unpushed folder; idempotent; run with sudo on a shared tree #
+{
+ private.ogit.require || return $(result)
+ local base
+ base=$(private.ogit.base.get "$1")
+ if [ ! -d "$base/main/.git" ]; then create.result 1 "ogit.worktree.remove: no repository at $base/main"; error.log "$RESULT"; return $(result); fi
+ local url
+ url=$(ogit.remote.url.get origin "$base/main")
+ if [ -z "$url" ]; then create.result 1 "ogit.worktree.remove: $base/main has no origin"; error.log "$RESULT"; return $(result); fi
+ # Gate EVERY folder before touching ANY: main, then each linked worktree.
+ local -a folders=() branches=()
+ local wt branch mainPhys
+ mainPhys=$(private.this.path.canonical "$base/main")
+ while IFS= read -r wt; do
+   [ "$wt" = "$mainPhys" ] && continue
+   folders+=("$wt")
+ done < <(private.ogit.worktree.paths.get "$base/main")
+ private.ogit.folder.gate "$base/main" || { error.log "$RESULT"; return $(result); }
+ for wt in "${folders[@]}"; do
+   private.ogit.folder.gate "$wt" || { error.log "$RESULT"; return $(result); }
+   branch=$(ogit.branch.get "$wt")
+   [ -n "$branch" ] || { create.result 1 "${wt##*/} is detached — check a branch out first"; error.log "$RESULT"; return $(result); }
+   branches+=("$branch")
+ done
+ if [ ${#folders[@]} = 0 ]; then create.result 0 "no linked worktrees under $base — nothing to remove"; success.log "$RESULT"; return $(result); fi
+ local i stash keep
+ for i in "${!folders[@]}"; do
+   wt="${folders[$i]}"; branch="${branches[$i]}"
+   stash="$HOME/.oosh.backups/$(date -u +%Y%m%dT%H%M%SZ)-ogit-${wt##*/}"
+   [ -e "$stash" ] && stash="$stash.$$"
+   private.ogit.folder.ignored.save "$wt" "$stash" || { error.log "$RESULT"; return $(result); }
+   keep=""; [ -d "$stash" ] && keep=" — its ignored files are kept in $stash"
+   ogit.worktree.delete "$wt" "$base/main" >/dev/null \
+     || { create.result 1 "worktree delete of $wt failed — stop; nothing after this folder was touched$keep$(private.ogit.git.reason.get)"; error.log "$RESULT"; return $(result); }
+   ogit.repo.clone "$url" "$branch" "$wt" >/dev/null 2>&1 \
+     || { create.result 1 "${wt##*/}: worktree removed but clone of $branch failed — recover with: ogit repo.clone $url $branch $wt$keep$(private.ogit.git.reason.get)"; error.log "$RESULT"; return $(result); }
+   private.ogit.folder.finish "$wt" || { error.log "$RESULT$keep"; return $(result); }
+   private.ogit.folder.ignored.restore "$stash" "$wt" || { error.log "$RESULT"; return $(result); }
+   success.log "${wt##*/}: worktree → clone ($branch)"
+ done
+ ogit.worktree.prune "$base/main" >/dev/null
+ create.result 0 "${#folders[@]} folder(s) converted to clones under $base"
+ return $(result)
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────

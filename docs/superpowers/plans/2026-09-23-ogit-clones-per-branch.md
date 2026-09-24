@@ -1973,7 +1973,7 @@ ogit.layout.status()     # <?base:$(oo mode.base.get)> # one line per folder und
 
 `git worktree remove` deletes the folder **with its gitignored files** (`dev/sessions/agent.context.md` on this host is one), and the folder gate does not see them. The conversion therefore carries them across (spec § 2.1): before a folder is touched its `!!` paths are copied into a timestamped backup directory `$HOME/.oosh.backups/<UTC-stamp>-ogit-<folder>` (the `user ssh.backup` shape — a directory, no tar), and copied back once the new folder is finished. The backup is kept; on any failure its path is in the recovery message. Tracked dirty work is still refused by the gate (D4).
 
-- [ ] **Step 1: Test (RED)**
+- [x] **Step 1: Test (RED)**
 
 ```bash
 test.ogit.worktreeRemove() {
@@ -2016,7 +2016,7 @@ test.case $level "T-OGIT-WORKTREE-REMOVE: worktrees become independent clones, s
 expect 0 "refuses dirty and unpushed by name; converts clean worktrees to trusted, shared clones; carries ignored files; idempotent" "D1 + D4 of the design, § 2.1 ignored-file carry"
 ```
 
-- [ ] **Step 2: Implement** (the two carry helpers of § 0.3 first, via `oo method.new`):
+- [x] **Step 2: Implement** (the two carry helpers of § 0.3 first, via `oo method.new`; as built, rule 3 of § 0.5: `ignored.save` runs its `status --ignored` through `private.ogit.git.run` and fails loud when git cannot list — an empty answer must not read as "nothing to carry" — and the delete/clone failure RESULTs in `worktree.remove` carry `$(private.ogit.git.reason.get)`):
 
 ```bash
 private.ogit.folder.ignored.save() # <folder> <stashDir> # copy every gitignored path of <folder> into <stashDir>, keeping relative paths; RESULT = the number carried; rc 1 when a copy fails (RESULT names <stashDir>) #
@@ -2145,7 +2145,7 @@ ogit.worktree.remove()     # <?base:$(oo mode.base.get)> # turn every linked wor
 ```
 (`base` comes from the shared completer. The porcelain parse is `private.ogit.worktree.paths.get` — paths with spaces stay whole.)
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): worktree.remove — linked worktrees become independent clones, gated, ignored files carried`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): worktree.remove — linked worktrees become independent clones, gated, ignored files carried`.
 
 ---
 
