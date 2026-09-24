@@ -369,7 +369,8 @@ and in every quoting context.
 ### The path-anchor rule
 
 **`OOSH_DIR` is always `~/oosh`** — the user's `oosh` symlink, never the branch
-worktree it happens to point at, never a `BASH_SOURCE`/`$0` walk, never
+folder it happens to point at (a clone under the components base —
+[oo.md § The clone layout](oo.md#the-clone-layout)), never a `BASH_SOURCE`/`$0` walk, never
 `oo.mode.base.get`.
 
 **`CONFIG_PATH` is always `~/config`** — the user's `config` symlink, never the
@@ -407,9 +408,9 @@ Resolve it **at that spot** with the portable helper
 | Site | Why it needs the physical path |
 |---|---|
 | install state 31 `ln -s … oosh` | linking `$OOSH_DIR` itself would create `~/oosh -> ~/oosh` ("Too many levels of symbolic links") |
-| install state 31 `OOSH_MODE` | the branch name is `basename` of the *worktree*, not of the symlink |
+| install state 31 `OOSH_MODE` | the branch name is `basename` of the *branch folder*, not of the symlink |
 | `config.init.user` | decides "are we under the shared tree?" with a string-prefix test |
-| `promote` | `git worktree list` reports physical paths; a mismatch would stash the same directory twice |
+| `promote` | `ogit worktree.find` reports physical folder paths (a sibling clone, or a linked worktree on an unconverted host); a mismatch would stash the same directory twice |
 | `oo.mode.base.get` | strategies 3/4 do `dirname`/`basename` — `dirname ~/oosh` is just `$HOME` |
 
 Everything else works fine through the symlink and is deliberately left alone:

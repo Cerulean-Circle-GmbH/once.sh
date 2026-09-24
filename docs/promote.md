@@ -11,7 +11,7 @@ The `promote` script implements a gated promotion pipeline (dev → testing → 
 
 ## Where the merge happens — each stage in its own folder
 
-Since the clone layout (ogit plan, Task 24) every stage is its own folder under the components base: `<base>/dev`, `<base>/testing`, `<base>/prod`. `promote` merges, tags and pushes **inside the target stage's folder** (found with `ogit worktree.find <target>`, which also finds a linked worktree on hosts not yet migrated). The folder you work in (`$OOSH_DIR`, e.g. `dev`) is never checked out to another branch.
+Since the clone layout ([oo.md § The clone layout](oo.md#the-clone-layout); ogit plan, Task 24) every stage is its own folder under the components base: `<base>/dev`, `<base>/testing`, `<base>/prod`. `promote` merges, tags and pushes **inside the target stage's folder** (found with `ogit worktree.find <target>`, which also finds a linked worktree on hosts not yet migrated). The folder you work in (`$OOSH_DIR`, e.g. `dev`) is never checked out to another branch.
 
 For each merge (`private.promote.merge.into.folder <source> <target>`):
 

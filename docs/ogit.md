@@ -222,9 +222,17 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 |--------|-----------|-------------|
 | `worktree.add` | `<branch> <targetDir> <startPoint> <?dir:$OOSH_DIR>` | add `<targetDir>` as a linked worktree of `<dir>` with `<branch>` (re)created at `<startPoint>` |
 | `worktree.list` | `<?dir:$OOSH_DIR>` | `git worktree list --porcelain` of the repository of `<dir>` |
-| `worktree.find` | `<branch> <?dir:$OOSH_DIR>` | echo the folder that has `<branch>` checked out: a linked worktree of the repository of `<dir>` (Phase 2 adds the sibling clone `<base>/<branch>`); empty when none |
+| `worktree.find` | `<branch> <?dir:$OOSH_DIR>` | echo the folder that has `<branch>` checked out: a linked worktree of the repository of `<dir>`, else the sibling clone `<base>/<branch>` when it is on `<branch>`; empty when none |
 | `worktree.delete` | `<path> <?dir:$OOSH_DIR>` | unregister and delete the linked worktree at `<path>` from the repository of `<dir>` (refuses a dirty one — gate first) |
 | `worktree.prune` | `<?dir:$OOSH_DIR>` | drop worktree registrations whose folders are gone |
+| `worktree.remove` | `<?base:$(oo mode.base.get)>` | turn every linked worktree of `<base>/main` into an independent clone of the same branch, carrying its gitignored files across; refuses on a dirty or unpushed folder; idempotent; run with sudo on a shared tree — see [§ Layout](#layout) |
+| `worktree.restore` | `<?base:$(oo mode.base.get)>` | the reverse: every sibling clone of `<base>/main` (same origin) back into a linked worktree of `main`; same gates, same carry |
+
+### layout
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `layout.status` | `<?base:$(oo mode.base.get)>` | one line per folder under `<base>`: shape (`worktree`/`clone`), dirty/ahead/behind counts, `shared=` `setgid=` `trusted=`; rc 1 when the folders other than `main/` are not all the same shape |
 
 ### binary / raw
 
@@ -241,9 +249,131 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 
 ## Layout
 
-Today: `main/` is a clone and the other branch folders are linked worktrees of it (`ogit worktree.list`, `ogit worktree.find <branch>`). Phase 2 of the plan converts them to independent clones per folder (`ogit worktree.remove` / `worktree.restore`, `ogit layout.status`) — see the [spec](superpowers/specs/2026-09-23-ogit-clones-per-branch-design.md) § 2. Those three methods do not exist yet.
+**The clone layout** (decision D1, built in Phase 2 of the plan): one independent clone per branch folder under the components base — `main/`, `dev/`, `testing/`, `prod/` and feature folders, each with its own `.git` **directory**, `origin` on GitHub, checked out on the branch its name says, group-shared (`core.sharedRepository=group`, group `dev`, g+w, setgid — `ogit repo.share`) and trusted per folder (`ogit safeDirectory.ensure`). The base itself is group `dev` with setgid. `main/` is always present — it is how `oo mode.base.get` finds the base. The contract, and how `oo checkout` / `oo mode` / install state 31 build it, is [oo.md § The clone layout](oo.md#the-clone-layout).
 
-The target (decision D1) is one independent clone per branch folder under the base — `main/`, `dev/`, `testing/`, `prod/` and feature folders, each with its own `.git` directory, `origin` on GitHub, checked out on the branch its name says. Phase 1 (decision D3) moved every git call behind `ogit` with behaviour unchanged; Phase 2 switches the layout, and refuses to convert a dirty or unpushed folder (decision D4).
+```bash
+ogit layout.status            # one line per folder: shape, dirty/ahead/behind, shared= setgid= trusted=
+```
+
+```
+dev            clone     dirty 0   ahead 0   behind 0   shared=group setgid=yes trusted=yes
+main           clone     dirty 0   ahead 0   behind 8   shared=group setgid=yes trusted=yes
+prod           clone     dirty 0   ahead 0   behind 0   shared=group setgid=yes trusted=yes
+```
+
+`layout.status` returns 1 on a **mixed** layout (the folders other than `main/` not all the same shape) — the sign of a conversion that stopped half-way. A host installed before the clone layout shows `main` as `clone` and every other folder as `worktree`; that is consistent (rc 0) but old, and `test.platform.shared.layout.invariant` fails it.
+
+**The converters.** Nothing converts a host automatically — not install, not `oo update`. Two explicit, idempotent methods do, in both directions:
+
+| Command | Does |
+|---|---|
+| `sudo ogit worktree.remove <?base>` | every linked worktree of `<base>/main` → an independent clone of the same branch |
+| `sudo ogit worktree.restore <?base>` | every sibling clone of `<base>/main` with the same origin → a linked worktree of `main` again |
+
+Their gates, checked for **every** folder (and `main/`) **before any folder is touched** — each refusal names the folder and the fix:
+
+- **dirty** — `<folder> has N uncommitted change(s) — commit or stash them in <dir> first`;
+- **no upstream** — `<folder> tracks no upstream — set it with: ogit branch.upstream.set origin/<branch> <dir>, …`;
+- **unpushed** — `<folder> is N commit(s) ahead of its upstream — push it first`;
+- **detached** — `<folder> is detached — check a branch out first`;
+- `worktree.restore` only: **unpushed commits on a `main/` local branch** it would reset — `main/ has N unpushed commit(s) on its local <branch> branch, which restore would reset — push it or delete it in <base>/main first`.
+
+**Ignored files are carried.** A folder's gitignored files (on a dev host e.g. `sessions/`) are copied before the folder is removed and copied into the new folder once it is finished. The copy is a **backup that is kept**: `$HOME/.oosh.backups/<UTC-stamp>-ogit-<folder>` — under `sudo` that is root's `$HOME`. Nothing deletes it; remove it yourself once you are satisfied.
+
+**Run them with sudo on a shared tree.** The folders belong to different users of the `dev` group; the converters delete and recreate them. Under sudo each new folder is trusted for root **and** for the user who typed the command (`SUDO_USER`); other users get their entries from `oo update` / `oo user.fix`.
+
+## Migrating a host from worktrees to clones
+
+A **user-run** runbook — never automatic. It is written for a dev host installed before the clone layout (`main/` a clone, `dev/` and `prod/` linked worktrees, no `testing/`); on any host the steps are the same.
+
+**Before you start:** stop other shells, agents and editors that work inside `dev/` or `prod/` (their working directory is deleted and recreated), and push everything — the conversion refuses a dirty or unpushed folder.
+
+`sudo` resets `PATH`, so it cannot find `ogit` by name. Run the script by path from `~/oosh`, and pass the base explicitly so root's own `oo mode.base.get` does not matter:
+
+```bash
+cd ~/oosh
+base=$(oo mode.base.get)      # e.g. /home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh
+```
+
+**1. Look first.**
+
+```bash
+ogit layout.status "$base"
+```
+
+Expect `main clone`, `dev worktree`, `prod worktree`, every line `dirty 0` and `ahead 0` (`behind` does not matter). Anything else: commit and push in that folder first (`oo commit`, `ogit remote.push <branch> no <dir>`). The conversion would refuse anyway, naming the folder.
+
+**2. Ignored files are backed up automatically.** `dev/sessions/` (with `sessions/agent.context.md`) is gitignored: `worktree.remove` copies it into `/root/.oosh.backups/<UTC-stamp>-ogit-dev`, recreates `dev/` as a clone and copies it back. Nothing to do — just note the backup path it reports.
+
+**3. Convert.**
+
+```bash
+sudo ./ogit worktree.remove "$base"
+```
+
+Expect, per folder, `carrying ignored dev/sessions` then `dev: worktree → clone (dev)` and `prod: worktree → clone (prod)`, and finally `2 folder(s) converted to clones under <base>`. A refusal stops before anything is touched — fix what it names and re-run. Your shell's working directory was the old `dev/`: re-enter it with `cd ~/oosh`.
+
+**4. Check.**
+
+```bash
+cd ~/oosh
+ogit layout.status "$base"
+cat sessions/agent.context.md        # intact
+```
+
+Expect every line `clone … shared=group setgid=yes trusted=yes`. `trusted=no` for you: `oo update` (or `ogit safeDirectory.ensure "$base"`). `shared=no` / `setgid=no`: `sudo ./ogit repo.share "$base/<folder>"`.
+
+**5. The base setgid.**
+
+```bash
+stat -c '%A %G' "$base"              # macOS: stat -f '%Sp %Sg' "$base"
+```
+
+Expect group `dev` and an `s` in the group bits (`drwxrwsr-x dev`). A base from an older install is `root:dev` without setgid; fix it once:
+
+```bash
+sudo chgrp dev "$base" && sudo chmod g+ws "$base"
+```
+
+**6. Login shells and mode switching.**
+
+```bash
+env -i HOME=$HOME bash -l -c 'oo mode.list'     # dev, main, prod listed, no "unsafe ownership"
+oo mode prod && oo mode dev
+```
+
+**7. Before the first promote: the `testing/` folder.** `promote` merges in `<base>/testing` and refuses without it (`no folder holds branch testing — run: oo checkout testing`).
+
+```bash
+oo checkout testing                  # → <base>/testing, cloned, shared, trusted
+promote status
+```
+
+**8. Optional — prove it is reversible.**
+
+```bash
+sudo ./ogit worktree.restore "$base" # dev, prod, testing → worktrees of main again
+ogit layout.status "$base"           # main clone, the rest worktree
+sudo ./ogit worktree.remove "$base"  # and back to clones
+cd ~/oosh && cat sessions/agent.context.md   # still intact after the round trip
+```
+
+`worktree.restore` also refuses when `main/` holds unpushed commits on a local branch it would reset.
+
+**9. The platform invariant.**
+
+```bash
+./test.suite run platform.shared.layout.invariant 1     # → PASS
+```
+
+Before the migration it fails INVARIANT-1 (`linked worktree(s) … dev prod`) and, on an older base, INVARIANT-4 (base setgid) — each FAIL line carries its recovery command.
+
+### If something goes wrong
+
+- **Every refusal names the folder and the command that fixes it** — a dirty, unpushed, upstream-less or detached folder stops the conversion before anything is touched. Fix, then re-run: both converters are idempotent and skip folders that are already done.
+- **A failure mid-way** (a clone that could not be made after its worktree was removed) says so and prints the exact recovery command, e.g. `ogit repo.clone <url> <branch> <dir>` or `ogit worktree.add <branch> <dir> origin/<branch> <base>/main`. `ogit layout.status` then reports a mixed layout (rc 1) until you finish it — run the recovery command, then the converter again.
+- **The backup under `~/.oosh.backups/` is never deleted** (under sudo: `/root/.oosh.backups/`). If ignored files did not come back, copy them yourself: `sudo cp -Rp /root/.oosh.backups/<stamp>-ogit-<folder>/. <base>/<folder>/`.
+- **Committed work is never at risk**: the gate refuses anything that is not on origin, so every branch can always be re-cloned from GitHub.
 
 ## Troubleshooting
 
@@ -256,6 +386,8 @@ ogit safeDirectory.ensure
 ogit safeDirectory.list      # check the entries
 ogit safeDirectory.prune     # drop entries whose folders are gone
 ```
+
+`oo update` and `oo user.fix` run `ogit safeDirectory.ensure` for you; `ogit layout.status` shows `trusted=` per folder.
 
 ### git is not installed
 
