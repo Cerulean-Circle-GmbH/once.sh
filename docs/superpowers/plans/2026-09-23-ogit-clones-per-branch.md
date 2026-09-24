@@ -1168,7 +1168,7 @@ ogit.diff.show.completion.format() { echo stat; echo full; }
 
 ### Task 9: `tag` and `stash` nouns
 
-- [ ] **Step 1: Test (RED)**
+- [x] **Step 1: Test (RED)**
 
 ```bash
 test.ogit.tagStash() {
@@ -1195,7 +1195,7 @@ test.case $level "T-OGIT-TAG-STASH: tag and stash nouns" test.ogit.tagStash
 expect 0 "tag.create/check/latest.get/list and stash.push/pop/top.get behave" "tag and stash nouns"
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 ```bash
 ogit.tag.list()     # <?pattern> <?dir:$OOSH_DIR> # echo tags matching <pattern> (default all), newest creation date first #
@@ -1250,7 +1250,7 @@ ogit.stash.top.get()     # <?dir:$OOSH_DIR> # echo the message of stash@{0}, emp
 ```
 (`tag.list` sorts by creator date; for lightweight tags that is the commit date — which is why both fixtures date the seed at tick 0.)
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): tag and stash nouns`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): tag and stash nouns`.
 
 ---
 
