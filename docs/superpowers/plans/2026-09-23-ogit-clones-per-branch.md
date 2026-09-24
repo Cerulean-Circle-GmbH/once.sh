@@ -1869,7 +1869,7 @@ Every `private.check.*` and `promote.*` method below that calls `ogit.*` gets `p
 
 **Files:** `ogit`, `test/test.ogit`
 
-- [ ] **Step 1: Fixture for a base** (add to test.ogit):
+- [x] **Step 1: Fixture for a base** (add to test.ogit):
 
 ```bash
 test.ogit.base() { # <label> <?shape:worktree> # echo <base> holding main + dev + prod as linked worktrees (shape worktree) or as clones (shape clone), all tracking <base>/origin.git; each folder ignores ignored.txt
@@ -1891,7 +1891,7 @@ test.ogit.base() { # <label> <?shape:worktree> # echo <base> holding main + dev 
 }
 ```
 
-- [ ] **Step 2: Test (RED)**
+- [x] **Step 2: Test (RED)**
 
 ```bash
 test.ogit.layoutStatus() {
@@ -1918,7 +1918,7 @@ test.case $level "T-OGIT-LAYOUT-STATUS: per-folder shape and freshness, rc 1 whe
 expect 0 "layout.status reports shape, dirty, ahead, behind per folder; rc 1 on a mixed layout" "the read-only view of the base"
 ```
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement** (`private.ogit.gitdir` already existed — created with `ogit.repo.share`; not re-created)
 
 ```bash
 private.ogit.gitdir()     # <?dir:$OOSH_DIR> # echo the absolute .git directory of the repository of <dir> #
@@ -1965,7 +1965,7 @@ ogit.layout.status()     # <?base:$(oo mode.base.get)> # one line per folder und
 ```
 (The "mixed" rule: `main` is a clone by definition, so a consistent worktree layout is `clone` + N×`worktree`, a consistent clone layout is all `clone`. Exactly one `clone` among worktrees → consistent; otherwise mixed. The folder loop is `private.ogit.base.folders.list` (Task 10): symlinks, dot-dirs and non-repositories never appear. `base` comes from the shared completer.) Every git call here is an ogit method or inside `ogit`, so `caller.validate` is satisfied.
 
-- [ ] **Step 4: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): layout.status`.
+- [x] **Step 4: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): layout.status`.
 
 ---
 
