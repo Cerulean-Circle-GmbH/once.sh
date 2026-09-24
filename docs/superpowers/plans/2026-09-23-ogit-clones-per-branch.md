@@ -1103,7 +1103,7 @@ ogit.commit.log.show.completion.format() { echo oneline; echo '%h %ci'; }
 
 ### Task 8: `status` and `diff` nouns
 
-- [ ] **Step 1: Test (RED)**
+- [x] **Step 1: Test (RED)**
 
 ```bash
 test.ogit.status() {
@@ -1125,7 +1125,7 @@ test.ogit.status() {
 test.case $level "T-OGIT-STATUS: status and diff nouns" test.ogit.status
 expect 0 "status.show/check and diff.check/show behave" "status and diff nouns"
 ```
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 ```bash
 ogit.status.show()     # <?format:short> <?dir:$OOSH_DIR> # working-tree status: short (--short --branch) or porcelain #
@@ -1162,7 +1162,7 @@ ogit.diff.show()     # <a> <b> <?format:stat> <?dir:$OOSH_DIR> # diff between <a
 ogit.diff.show.completion.format() { echo stat; echo full; }
 ```
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): status and diff nouns`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): status and diff nouns`.
 
 ---
 
