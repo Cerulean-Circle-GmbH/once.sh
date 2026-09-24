@@ -309,6 +309,10 @@ oo.update() # # updates oosh environment and pulls latest changes from github.
     error.log "oo update failed via both SSH remote and HTTPS fallback"
     return 1
   fi
+  # Trust: in the clone layout every folder under the base is its own
+  # repository and needs its own safe.directory entry for the caller (spec
+  # § 4). Idempotent; a folder added since the last run is trusted here.
+  ogit.safeDirectory.ensure >/dev/null || warn.log "oo update: could not ensure safe.directory — $RESULT"
   # Self-heal: rewire ~/config + ~/oosh symlinks via config.init.user.
   # Catches the case where init/oosh was re-run out of band and clobbered
   # them (the macstudio-root regression). Also runs during the normal
@@ -664,7 +668,7 @@ oo.branch.list.completion.source() {
   echo "remote"
 }
 
-oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
+oo.mode() # <?branch> # switch oosh to a branch folder under the base (cloned when missing), or show current mode
 {
   private.this.script.load ogit ogit.branch.get
   local WORKTREE_BASE
@@ -757,20 +761,34 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
       create.result 1 "branch not found"
       return $(result)
     fi
-    console.log "Creating worktree for $remote_branch..."
-    if ! ogit.worktree.add "${remote_branch#origin/}" "$target_dir" "$remote_branch" "$current_target"; then
-      # ogit-exception: printed text, not an invocation
-      error.log "git worktree add failed for $remote_branch → $target_dir"
-      create.result 1 "worktree add failed"
+    # The clone layout (2026-09-23 design): every folder under the base is
+    # its own repository. private.oo.branch.clone.ensure owns the decision
+    # (the helper install state 31 uses; never clones over a folder it did
+    # not make). Cloned from origin's URL, then group-shared and trusted.
+    console.log "Cloning $remote_branch into $target_dir..."
+    local originUrl
+    originUrl=$(ogit.remote.url.get origin "$current_target")
+    if [ -z "$originUrl" ]; then
+      error.log "clone failed for $remote_branch → $target_dir — no origin URL in ${current_target:-$OOSH_DIR}"
+      create.result 1 "clone failed"
+      return $(result)
+    fi
+    if ! private.oo.branch.clone.ensure "$originUrl" "${remote_branch#origin/}" "$target_dir" >/dev/null; then
+      error.log "clone failed for $remote_branch → $target_dir — $RESULT"
+      create.result 1 "clone failed"
       return $(result)
     fi
     # Post-condition: target_dir MUST exist before we touch any symlink.
-    # Even when `git worktree add` reports success, defensive check.
+    # Even when the clone reports success, defensive check.
     if [ ! -d "$target_dir" ]; then
-      error.log "Worktree add reported success but $target_dir is missing"
-      create.result 1 "worktree add post-condition violated"
+      error.log "Clone reported success but $target_dir is missing"
+      create.result 1 "clone post-condition violated"
       return $(result)
     fi
+    ogit.repo.share "$target_dir" >/dev/null || warn.log "oo mode: $RESULT"
+    # macOS: safe.directory is a string match — the file system's letter case.
+    ogit.safeDirectory.add "$(private.this.path.case.get "$target_dir")" >/dev/null \
+      || warn.log "oo mode: $RESULT"
   fi
 
   # Switch symlink
@@ -1095,7 +1113,7 @@ oo.mode.completion.branch() {
   private.oo.completion.worktree.branches
 }
 
-oo.checkout() # <version> # clone or add worktree for a remote branch
+oo.checkout() # <version> # clone a remote branch as its own folder under the components base (prefix stripped, slashes as dots); an existing folder is aligned, never pulled
 {
   private.this.script.load ogit ogit.branch.get
   local version="$1"
@@ -1113,105 +1131,81 @@ oo.checkout() # <version> # clone or add worktree for a remote branch
   dirName="${dirName#bugfix/}"
   dirName=$(echo "$dirName" | tr '/' '.')
 
-  # Detect environment
+  # ONE layout (2026-09-23 design): every branch is its own clone under the
+  # components base. No base means no layout to add to — fail loud with the
+  # fix instead of dropping a clone beside whatever $OOSH_DIR happens to be
+  # (the old plain-clone mode).
   local base
   base=$(oo.mode.base.get 2>/dev/null)
-  local hasWorktrees=$?
+  if [ -z "$base" ] || [ ! -d "$base" ]; then
+    create.result 1 "no components base — run oo mode.setup"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  local oosh="${OOSH_DIR:-$HOME/oosh}"
+  local targetDir="$base/$dirName"
 
-  if [ $hasWorktrees -eq 0 ] && [ -d "$base" ]; then
-    # --- Worktree mode ---
-    local targetDir="$base/$dirName"
+  if [ -d "$targetDir" ]; then
+    # Already exists — check if git branch matches directory name
+    local currentGitBranch
+    currentGitBranch=$(ogit.branch.get "$targetDir")
 
-    if [ -d "$targetDir" ]; then
-      # Already exists — check if git branch matches directory name
-      local currentGitBranch
-      currentGitBranch=$(ogit.branch.get "$targetDir")
-
-      if [ -n "$currentGitBranch" ] && [ "$currentGitBranch" != "$dirName" ]; then
-        # Misaligned: git branch doesn't match directory name — fix it
-        # ogit-exception: printed text, not an invocation
-        info.log "Aligning git branch to directory name: $dirName"
-        if ogit.branch.checkout "$dirName" "$targetDir"; then
-          success.log "Aligned branch to '$dirName' in $targetDir"
-          create.result 0 "$targetDir"
-          return $(result)
-        else
-          error.log "Failed to checkout branch '$dirName' in $targetDir"
-          create.result 1 "checkout failed"
-          return $(result)
-        fi
-      fi
-
-      # Already aligned and present — nothing to do. Pulling latest is NOT
-      # `oo.checkout`'s job; merging branches lives in `promote` /
-      # `oo stage` (the canonical promotion pipeline) and pulling lives
-      # in `oo update` (the explicit user-invoked refresh). Conflating
-      # them here meant `oo checkout dev` (with dev/ already present)
-      # silently fetched + merged origin/dev — surprising for a command
-      # whose name says "checkout", not "pull".
-      success.log "Worktree '$dirName' already present at $targetDir — run \`oo update\` to refresh"
-      create.result 0 "$targetDir"
-      return $(result)
-    fi
-
-    # New worktree
-    ogit.remote.fetch no "${OOSH_DIR:-$HOME/oosh}"
-    info.log "Creating worktree for $version at $targetDir"
-    if ogit.worktree.add "$dirName" "$targetDir" "origin/$version" "${OOSH_DIR:-$HOME/oosh}"; then
-      success.log "Created worktree for $version at $targetDir"
-      console.log "  Use 'oo mode $dirName' to switch to it"
-      create.result 0 "$targetDir"
-    else
+    if [ -n "$currentGitBranch" ] && [ "$currentGitBranch" != "$dirName" ]; then
+      # Misaligned: git branch doesn't match directory name — fix it
       # ogit-exception: printed text, not an invocation
-      error.log "git worktree add failed for '$version'"
-      create.result 1 "worktree add failed"
-    fi
-
-  else
-    # --- Plain clone mode ---
-    local repoUrl
-    repoUrl=$(ogit.remote.url.get origin "${OOSH_DIR:-$HOME/oosh}")
-    if [ -z "$repoUrl" ]; then
-      # ogit-exception: printed text, not an invocation
-      error.log "Cannot determine git remote URL from ${OOSH_DIR:-$HOME/oosh}"
-      create.result 1 "no remote URL"
-      return $(result)
-    fi
-
-    local targetDir
-    targetDir="$(dirname "${OOSH_DIR:-$HOME/oosh}")/$dirName"
-
-    if [ -d "$targetDir" ]; then
-      if [ -d "$targetDir/.git" ] || [ -f "$targetDir/.git" ]; then
-        # Same rationale as the worktree-mode branch above: oo.checkout
-        # does NOT pull. Pulls live in `oo update`; merges in `promote`.
-        success.log "Clone '$dirName' already present at $targetDir — run \`oo update\` to refresh"
+      info.log "Aligning git branch to directory name: $dirName"
+      if ogit.branch.checkout "$dirName" "$targetDir"; then
+        success.log "Aligned branch to '$dirName' in $targetDir"
         create.result 0 "$targetDir"
         return $(result)
       else
-        # ogit-exception: printed text, not an invocation
-        error.log "Directory exists but is not a git repo: $targetDir"
-        create.result 1 "not a git repo"
+        error.log "Failed to checkout branch '$dirName' in $targetDir"
+        create.result 1 "checkout failed"
         return $(result)
       fi
     fi
 
-    # Fetch before clone to ensure branch is available
-    ogit.remote.fetch no "${OOSH_DIR:-$HOME/oosh}"
-    info.log "Cloning $version into $targetDir"
-    # ogit.repo.clone removes a half-made dir it created itself (and refuses
-    # a non-empty target), so no rm -rf here.
-    if ogit.repo.clone "$repoUrl" "$version" "$targetDir"; then
-      success.log "Cloned $version to $targetDir"
-      console.log "  Use 'oo mode $dirName' to switch to it"
-      create.result 0 "$targetDir"
-    else
-      # ogit-exception: printed text, not an invocation
-      error.log "git clone failed for branch '$version'"
-      create.result 1 "clone failed"
-    fi
+    # Already aligned and present — nothing to do. Pulling latest is NOT
+    # `oo.checkout`'s job; merging branches lives in `promote` /
+    # `oo stage` (the canonical promotion pipeline) and pulling lives
+    # in `oo update` (the explicit user-invoked refresh). Conflating
+    # them here meant `oo checkout dev` (with dev/ already present)
+    # silently fetched + merged origin/dev — surprising for a command
+    # whose name says "checkout", not "pull".
+    success.log "Folder '$dirName' already present at $targetDir — run \`oo update\` to refresh"
+    create.result 0 "$targetDir"
+    return $(result)
   fi
 
+  local repoUrl
+  repoUrl=$(ogit.remote.url.get origin "$oosh")
+  if [ -z "$repoUrl" ]; then
+    # ogit-exception: printed text, not an invocation
+    error.log "Cannot determine git remote URL from $oosh"
+    create.result 1 "no remote URL"
+    return $(result)
+  fi
+
+  # Fetch first: a branch pushed since the last fetch becomes known here, and
+  # the local fallback of oo.checkout.completion.version sees it next time.
+  ogit.remote.fetch no "$oosh" >/dev/null || warn.log "oo checkout: $RESULT"
+  info.log "Cloning $version into $targetDir"
+  # private.oo.branch.clone.ensure: the clone decision install state 31 and
+  # oo mode use — ogit repo.clone removes only a half-made dir it created
+  # itself, so no rm -rf here.
+  if ! private.oo.branch.clone.ensure "$repoUrl" "$version" "$targetDir" >/dev/null; then
+    error.log "clone failed for '$version' — $RESULT"
+    create.result 1 "clone failed"
+    return $(result)
+  fi
+  # Each folder is its own repository: group-shared, and trusted by the
+  # caller (macOS: safe.directory is a string match — the file system's case).
+  ogit.repo.share "$targetDir" >/dev/null || warn.log "oo checkout: $RESULT"
+  ogit.safeDirectory.add "$(private.this.path.case.get "$targetDir")" >/dev/null \
+    || warn.log "oo checkout: $RESULT"
+  success.log "Cloned $version to $targetDir"
+  console.log "  Use 'oo mode $dirName' to switch to it"
+  create.result 0 "$targetDir"
   return $(result)
 }
 oo.checkout.completion.version() {

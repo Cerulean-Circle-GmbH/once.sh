@@ -2343,13 +2343,13 @@ and the permission block (oo:2144-2171) with:
 
 **Files:** `oo` (`oo.mode` missing-folder block, `oo.checkout`, `oo.update`), `config` (`config.init.user`), `user` (`user.oosh.install`), tests in `test/test.oo`, `test/test.config`
 
-- [ ] **Step 1: Tests (RED)**
+- [x] **Step 1: Tests (RED)**
   - test.oo T-MODE-COMPLETION-WORKTREE (316-358), T-MODE-COMPLETION-LAZY-USERENV-* (485-663), T-SETUP-4 (1449-1501), T-BASE-GET-WORKTREE (1508-1540): build their fixtures with `test.ogit.base <label> clone` semantics (copy the helper into test.oo as `test.oo.base`) and assert `-d "$fx/dev/.git"`; T-SETUP-4's "dev/.git is a file containing gitdir:" becomes "dev/.git is a directory".
   - New `T-CHECKOUT-CLONES-UNDER-BASE`: with a clone-layout fixture and `OOSH_COMPONENTS_DIR="$base"`, `OOSH_DIR="$base/dev"`, `oo.checkout prod` (branch exists on the fixture origin) creates `$base/prod` with a `.git` directory, `core.sharedRepository=group`, and `safe.directory` (sandboxed `GIT_CONFIG_GLOBAL`).
   - New `T-UPDATE-ENSURES-TRUST` (test.oo): after `oo.update` on the fixture, every folder under the base is in `ogit safeDirectory.list` (mock the pull with `ogit.remote.pull() { create.result 0 mocked; }` inside a subshell).
   - test.config: extend T87/T-INIT-USER (or add `T89`): `declare -f config.init.user | grep -q 'ogit.safeDirectory.ensure'`.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
   - `oo.mode` missing folder (oo:792-815): replace the `worktree add` with
     ```bash
     console.log "Cloning $remote_branch into $target_dir..."
@@ -2367,7 +2367,9 @@ and the permission block (oo:2144-2171) with:
   - `config.init.user`: after the log.env migration block: `private.this.script.load ogit ogit.branch.get && ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null || warn.log "config.init.user: $RESULT"` (for the *caller*); and inside the as-user hop (it already uses `private.this.as.user.preamble.get`), after `private.config.bashrc.ensure`: `'$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")' >/dev/null` (for the *target*).
   - `user.oosh.install` (Task 17 sites): replace the two `safeDirectory.add` hops (as-computed + canonical case) with one hop through the preamble: `private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.ensure '$(private.this.path.case.get "$(dirname "$sharedOosh")")'"` — the case-canonical base keeps the macOS string-match fix the old second hop existed for.
 
-- [ ] **Step 3: Run** oo, config, user suites → PASS. Commit `feat(oo,config,user): oo mode/checkout clone under the base; trust ensured by oo update, config init.user, user.oosh.install`.
+- [x] **Step 3: Run** oo, config, user suites → PASS. Commit `feat(oo,config,user): oo mode/checkout clone under the base; trust ensured by oo update, config init.user, user.oosh.install`.
+
+  *Done 2026-09-24.* `oo.mode` and `oo.checkout` clone through `private.oo.branch.clone.ensure` (Task 22's helper) rather than `ogit.repo.clone` directly, then `ogit repo.share` + `ogit safeDirectory.add` of the case-canonical folder (warn on failure, not fatal). `oo.checkout` has one path: no base → `create.result 1 "no components base — run oo mode.setup"`; its docstring avoids `<base>/<dirName>` (completion.audit reads angle brackets as parameters). `config.init.user` loads ogit on its first line (rule 12), and its hop saves the bashrc RESULT before the ensure so the re-template report still reaches the caller. The docstring of `config.init.user` is unchanged (it was already one of c2's pre-existing INVALIDs). Tests: T-MODE-COMPLETION-WORKTREE / LAZY-USERENV-B / -ENSURE and T-BASE-GET-WORKTREE on clone fixtures (`test.oo.base`, copied from test.ogit); T-CHECKOUT-2 moved off the real host onto a fixture; new T-MODE-CLONES-MISSING, T-CHECKOUT-CLONES-UNDER-BASE, T-CHECKOUT-NO-BASE, T-UPDATE-ENSURES-TRUST (end to end: pull and symlink heal mocked in a subshell), test.config T89, test.user T-USER-OOSH-INSTALL-TRUST. RED test.oo 149/155, test.config 88/89, test.user 33/34; GREEN 155/155, 89/89, 34/34; test.ogit 23/23, test.install 40/40.
 
 ---
 

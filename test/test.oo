@@ -24,6 +24,25 @@ source $OOSH_DIR/oo
 
 log.level $level
 
+# Test-local copy of test/test.ogit's test.ogit.base (Task 23 of the ogit
+# plan): the clone layout every oo.mode / oo.checkout / base.get fixture uses.
+test.oo.base() { # <label> <?shape:worktree> # echo <base> holding main + dev + prod as linked worktrees (shape worktree) or as clones (shape clone), all tracking <base>/../origin.git; each folder ignores ignored.txt
+  local fx; fx=$(test.suite.fixture.make "$1"); local base="$fx/Once.sh"; mkdir -p "$base"
+  git init -q --bare -b main "$fx/origin.git"
+  git init -q -b main "$base/main"; git -C "$base/main" remote add origin "$fx/origin.git"
+  printf 'seed\n' > "$base/main/file"; printf 'ignored.txt\n' > "$base/main/.gitignore"
+  git -C "$base/main" add file .gitignore
+  GIT_COMMITTER_DATE="@1700000000 +0000" GIT_AUTHOR_DATE="@1700000000 +0000" \
+    git -C "$base/main" -c user.email=t@t -c user.name=t commit -q -m seed
+  git -C "$base/main" push -q -u origin main
+  local b; for b in dev prod; do
+    git -C "$base/main" branch -q "$b" main; git -C "$base/main" push -q origin "$b"
+    if [ "${2:-worktree}" = clone ]; then git clone -q -b "$b" "$fx/origin.git" "$base/$b"
+    else git -C "$base/main" worktree add -q "$base/$b" "$b" >/dev/null 2>&1; git -C "$base/$b" branch -q -u "origin/$b"; fi
+  done
+  echo "$base"
+}
+
 # ============================================================================
 # T1: oo.mode.base.get returns a valid directory (3-level dotted method)
 # ============================================================================
@@ -313,26 +332,21 @@ test.case - "T-MODE-NOLEAK: oo.mode.list does not mutate global safe.directory" 
 expect 0 "no entries added" "oo.mode.list must not write to git config"
 
 # ============================================================================
-# T-MODE-COMPLETION-WORKTREE: completion against REAL git worktrees
+# T-MODE-COMPLETION-WORKTREE: completion against the real CLONE layout
 # ----------------------------------------------------------------------------
 # T-MODE-5 uses independent `git init` siblings. This test builds the
-# canonical OOSH-install structure using `git worktree add` so we also
-# cover the case where the sibling dirs share a single .git via worktree
-# pointers (`.git` is a FILE, not a dir, in worktrees).
+# canonical OOSH-install structure — since the 2026-09-23 design every
+# sibling is an independent clone of one origin (`.git` a DIRECTORY in each),
+# not a linked worktree of main/ — so the fixture is the install's own shape.
 # ============================================================================
-WT_FIXTURE="/tmp/test.oo.mode.worktree.$$"
-mkdir -p "$WT_FIXTURE"
-git -c init.defaultBranch=main init "$WT_FIXTURE/main" >/dev/null 2>&1
-git -C "$WT_FIXTURE/main" -c user.email=test@example -c user.name=test \
-  -c commit.gpgsign=false commit --allow-empty -m init >/dev/null 2>&1
-git -C "$WT_FIXTURE/main" worktree add "../testing" -b testing >/dev/null 2>&1
-git -C "$WT_FIXTURE/main" worktree add "../prod"    -b prod    >/dev/null 2>&1
+WT_BASE=$(test.oo.base test.oo.mode.clones clone)
+WT_FIXTURE=$(dirname "$WT_BASE")
 
 test.oo.mode.completionWorktree() {
   local SAVE_OOSH_DIR_2="$OOSH_DIR"
   local SAVE_OOSH_CD="$OOSH_COMPONENTS_DIR"
-  export OOSH_COMPONENTS_DIR="$WT_FIXTURE"
-  export OOSH_DIR="$WT_FIXTURE/main"
+  export OOSH_COMPONENTS_DIR="$WT_BASE"
+  export OOSH_DIR="$WT_BASE/main"
 
   local output
   output=$(oo.mode.completion.branch 2>/dev/null)
@@ -340,20 +354,22 @@ test.oo.mode.completionWorktree() {
   export OOSH_DIR="$SAVE_OOSH_DIR_2"
   export OOSH_COMPONENTS_DIR="$SAVE_OOSH_CD"
 
-  local hasMain=false hasTesting=false hasProd=false
-  echo "$output" | grep -qw "main"    && hasMain=true
-  echo "$output" | grep -qw "testing" && hasTesting=true
-  echo "$output" | grep -qw "prod"    && hasProd=true
+  local hasMain=false hasDev=false hasProd=false
+  echo "$output" | grep -qw "main" && hasMain=true
+  echo "$output" | grep -qw "dev"  && hasDev=true
+  echo "$output" | grep -qw "prod" && hasProd=true
 
-  if [ "$hasMain" = "true" ] && [ "$hasTesting" = "true" ] && [ "$hasProd" = "true" ]; then
-    create.result 0 "main+testing+prod"
+  if [ ! -d "$WT_BASE/dev/.git" ] || [ ! -d "$WT_BASE/prod/.git" ]; then
+    create.result 1 "fixture: dev/ and prod/ are not clones (.git is not a directory)"
+  elif [ "$hasMain" = "true" ] && [ "$hasDev" = "true" ] && [ "$hasProd" = "true" ]; then
+    create.result 0 "main+dev+prod"
   else
-    create.result 1 "main=$hasMain testing=$hasTesting prod=$hasProd (output=$output)"
+    create.result 1 "main=$hasMain dev=$hasDev prod=$hasProd (output=$output)"
   fi
 }
-test.case - "T-MODE-COMPLETION-WORKTREE: enumerates real git-worktree-add siblings" \
+test.case - "T-MODE-COMPLETION-WORKTREE: enumerates the sibling clones of a clone-layout base" \
   test.oo.mode.completionWorktree
-expect 0 "main+testing+prod" "completion lists all 3 worktrees of a real worktree base"
+expect 0 "main+dev+prod" "completion lists all 3 clones of a real clone-layout base"
 rm -rf "$WT_FIXTURE"
 
 # ============================================================================
@@ -457,29 +473,69 @@ else
 fi
 
 # ============================================================================
-# T-MODE-REMOTE-BRANCH-CHECKED-ADD (structural): worktree-add failure halts
+# T-MODE-REMOTE-BRANCH-CHECKED-ADD (structural): clone failure halts
 # ----------------------------------------------------------------------------
-# Lock in the `if ! (cd … git worktree add)` failure path + post-condition
-# check at oo:566-580. Without these, a failed worktree-add fell through to
-# the symlink-recreate block (oo:566-578) and OOSH_DIR export (oo:590),
-# leaving OOSH_DIR pointing at a non-existent path. c2:296's default-script
-# resolution then exploded on every Tab completion. Asserting both the
-# explicit return-on-failure and the post-condition guards keeps the cure.
+# Lock in the failure path + post-condition check of the missing-folder
+# block. Without these, a failed add (a worktree add then, a clone since the
+# 2026-09-23 clone layout) fell through to the symlink-recreate block and
+# OOSH_DIR export, leaving OOSH_DIR pointing at a non-existent path. c2's
+# default-script resolution then exploded on every Tab completion. Asserting
+# both the explicit return-on-failure and the post-condition guards keeps the
+# cure. Behaviour: T-MODE-CLONES-MISSING below.
 # ============================================================================
-test.case $level "oo.mode propagates git worktree add failure (no silent fall-through)" \
-  bash -c "type oo.mode | grep -qE 'git worktree add failed for'"
-if type oo.mode 2>/dev/null | grep -qE 'git worktree add failed for'; then
-  expect.pass "oo.mode body emits an error and returns 1 when worktree-add fails"
+test.case $level "oo.mode propagates a clone failure (no silent fall-through)" \
+  bash -c "type oo.mode | grep -qE 'clone failed for'"
+if type oo.mode 2>/dev/null | grep -qE 'clone failed for'; then
+  expect.pass "oo.mode body emits an error and returns 1 when the clone fails"
 else
-  expect.fail "oo.mode must return 1 with error.log if \`git worktree add\` fails — silent fall-through caused the macstudio /test/ng/c2 corruption"
+  expect.fail "oo.mode must return 1 with error.log 'clone failed for …' if the clone fails — silent fall-through caused the macstudio /test/ng/c2 corruption"
 fi
-test.case $level "oo.mode verifies worktree-add post-condition before mutating symlink" \
+test.case $level "oo.mode verifies the clone post-condition before mutating symlink" \
   bash -c "type oo.mode | grep -qE 'post-condition violated|reported success but'"
 if type oo.mode 2>/dev/null | grep -qE 'post-condition violated|reported success but'; then
-  expect.pass "oo.mode body re-checks \$target_dir exists after worktree-add before touching the symlink"
+  expect.pass "oo.mode body re-checks \$target_dir exists after the clone before touching the symlink"
 else
-  expect.fail "oo.mode must verify \$target_dir exists after \`git worktree add\` reported success — otherwise OOSH_DIR can be exported to a non-existent path"
+  expect.fail "oo.mode must verify \$target_dir exists after the clone reported success — otherwise OOSH_DIR can be exported to a non-existent path"
 fi
+
+# ============================================================================
+# T-MODE-CLONES-MISSING: oo.mode <branch> with no <base>/<branch> folder
+# clones origin/<branch> there — a .git DIRECTORY, group-shared, trusted —
+# and points ~/oosh at it. Fixture base of clones; HOME, the per-user config
+# dir and the global git config are all sandboxed in a subshell.
+# ============================================================================
+test.oo.mode.clonesMissing() {
+  private.this.script.load ogit ogit.branch.get
+  local base fx bad="" rc
+  base=$(test.oo.base test.oo.mode.clonemissing clone) || { create.result 1 "fixture failed"; return $(result); }
+  fx=$(dirname "$base")
+  rm -rf "$base/prod"
+  # dev/ was cloned before prod was pushed; oo mode reads remote-tracking
+  # refs without fetching, so let dev/ learn origin/prod first.
+  git -C "$base/dev" fetch -q origin >/dev/null 2>&1
+  mkdir -p "$fx/home"; ln -s "$base/dev" "$fx/home/oosh"
+  (
+    HOME="$fx/home"
+    export OOSH_USER_CONFIG_PATH="$fx/home/.config/oosh"
+    export GIT_CONFIG_GLOBAL="$fx/gitconfig"
+    export OOSH_COMPONENTS_DIR="$base"
+    export OOSH_DIR="$fx/home/oosh"
+    oo.mode prod >/dev/null 2>&1
+  ); rc=$?
+  [ "$rc" -eq 0 ] || bad="$bad rc=$rc"
+  [ -d "$base/prod/.git" ] || bad="$bad prod/.git-not-a-directory"
+  [ "$(git -C "$base/prod" rev-parse --abbrev-ref HEAD 2>/dev/null)" = prod ] || bad="$bad not-on-prod"
+  [ "$(git -C "$base/prod" config --local --get core.sharedRepository 2>/dev/null)" = group ] || bad="$bad not-shared"
+  GIT_CONFIG_GLOBAL="$fx/gitconfig" ogit.safeDirectory.list | grep -qFx "$base/prod" || bad="$bad not-trusted"
+  [ "$(readlink "$fx/home/oosh")" = "$base/prod" ] || bad="$bad link=[$(readlink "$fx/home/oosh")]"
+  rm -rf "$fx"
+  if [ -n "$bad" ]; then create.result 1 "oo.mode prod:$bad"
+  else create.result 0 "cloned, shared, trusted and linked"; fi
+  return $(result)
+}
+test.case $level "T-MODE-CLONES-MISSING: oo.mode clones a missing branch folder under the base" \
+  test.oo.mode.clonesMissing
+expect 0 "cloned, shared, trusted and linked" "clone layout: oo mode never adds a linked worktree"
 
 # ============================================================================
 # T-MODE-COMPLETION-LAZY-USERENV: macstudio-root contract — what state 31
@@ -498,13 +554,10 @@ fi
 # This test simulates BOTH states (real-dir → empty, symlink → branches)
 # so the contract is testable without standing up a full install.
 # ============================================================================
-LE_FIXTURE="/tmp/test.oo.mode.lazyenv.$$"
-mkdir -p "$LE_FIXTURE/sharedBase"
-git -c init.defaultBranch=main init "$LE_FIXTURE/sharedBase/main" >/dev/null 2>&1
-git -C "$LE_FIXTURE/sharedBase/main" -c user.email=test@example -c user.name=test \
-  -c commit.gpgsign=false commit --allow-empty -m init >/dev/null 2>&1
-git -C "$LE_FIXTURE/sharedBase/main" worktree add "../dev"     -b dev     >/dev/null 2>&1
-git -C "$LE_FIXTURE/sharedBase/main" worktree add "../testing" -b testing >/dev/null 2>&1
+# The shared base in the clone layout (2026-09-23 design): main/, dev/ and
+# prod/ are independent clones of one origin.
+LE_BASE=$(test.oo.base test.oo.mode.lazyenv clone)
+LE_FIXTURE=$(dirname "$LE_BASE")
 
 # Helper that mimics what user.env's anchor lines do for a given $HOME. Run in a fresh bash with
 # OOSH_DIR explicitly unset so the assignment actually fires (otherwise it
@@ -549,7 +602,7 @@ expect 0 "empty (real dir → no base)" "private-clone ~/oosh yields empty compl
 test.oo.mode.completionLazySymlink() {
   local fakeHome="$LE_FIXTURE/homeSymlink"
   mkdir -p "$fakeHome"
-  ln -sf "$LE_FIXTURE/sharedBase/dev" "$fakeHome/oosh"
+  ln -sf "$LE_BASE/dev" "$fakeHome/oosh"
 
   local resolvedOOSH_DIR
   resolvedOOSH_DIR=$(private.test.lazy.oosh.dir "$fakeHome")
@@ -563,20 +616,22 @@ test.oo.mode.completionLazySymlink() {
   export OOSH_DIR="$SAVE_OOSH_DIR_3"
   [ -n "$SAVE_OOSH_CD" ] && export OOSH_COMPONENTS_DIR="$SAVE_OOSH_CD"
 
-  local hasMain=false hasDev=false hasTesting=false
-  echo "$output" | grep -qw "main"    && hasMain=true
-  echo "$output" | grep -qw "dev"     && hasDev=true
-  echo "$output" | grep -qw "testing" && hasTesting=true
+  local hasMain=false hasDev=false hasProd=false
+  echo "$output" | grep -qw "main" && hasMain=true
+  echo "$output" | grep -qw "dev"  && hasDev=true
+  echo "$output" | grep -qw "prod" && hasProd=true
 
-  if [ "$hasMain" = "true" ] && [ "$hasDev" = "true" ] && [ "$hasTesting" = "true" ]; then
-    create.result 0 "main+dev+testing"
+  if [ ! -d "$LE_BASE/dev/.git" ]; then
+    create.result 1 "fixture: dev/ is not a clone (.git is not a directory)"
+  elif [ "$hasMain" = "true" ] && [ "$hasDev" = "true" ] && [ "$hasProd" = "true" ]; then
+    create.result 0 "main+dev+prod"
   else
-    create.result 1 "got: main=$hasMain dev=$hasDev testing=$hasTesting (output=$output)"
+    create.result 1 "got: main=$hasMain dev=$hasDev prod=$hasProd (output=$output)"
   fi
 }
-test.case - "T-MODE-COMPLETION-LAZY-USERENV-B: symlinked ~/oosh → completion shows all worktree branches" \
+test.case - "T-MODE-COMPLETION-LAZY-USERENV-B: symlinked ~/oosh → completion shows all branch folders" \
   test.oo.mode.completionLazySymlink
-expect 0 "main+dev+testing" "symlinked ~/oosh yields full worktree-branch list (OOSH_DIR resolves into the shared tree)"
+expect 0 "main+dev+prod" "symlinked ~/oosh yields the full branch-folder list (OOSH_DIR resolves into the shared tree)"
 
 # ============================================================================
 # T-MODE-COMPLETION-LAZY-USERENV-ENSURE: state-31 helper produces the
@@ -599,14 +654,10 @@ expect 0 "main+dev+testing" "symlinked ~/oosh yields full worktree-branch list (
 # (test.platform.shared.oosh.invariant) catches it; that test runs
 # inside `os platform.test <p>` post-install.
 # ============================================================================
-EN_FIXTURE="/tmp/test.oo.mode.ensure.$$"
-mkdir -p "$EN_FIXTURE/sharedBase" \
-         "$EN_FIXTURE/sharedConfig/stateMachines"
-git -c init.defaultBranch=main init "$EN_FIXTURE/sharedBase/main" >/dev/null 2>&1
-git -C "$EN_FIXTURE/sharedBase/main" -c user.email=test@example -c user.name=test \
-  -c commit.gpgsign=false commit --allow-empty -m init >/dev/null 2>&1
-git -C "$EN_FIXTURE/sharedBase/main" worktree add "../dev"     -b dev     >/dev/null 2>&1
-git -C "$EN_FIXTURE/sharedBase/main" worktree add "../testing" -b testing >/dev/null 2>&1
+# The shared base in the clone layout (2026-09-23 design), as in LE_BASE.
+EN_BASE=$(test.oo.base test.oo.mode.ensure clone)
+EN_FIXTURE=$(dirname "$EN_BASE")
+mkdir -p "$EN_FIXTURE/sharedConfig/stateMachines"
 
 test.oo.user.symlinks.ensure() {
   # Build the pre-state: ~/oosh as a REAL dir, ~/config as a symlink
@@ -630,7 +681,7 @@ test.oo.user.symlinks.ensure() {
   private.oo.user.shared.symlinks.ensure \
     "$fakeHome" \
     "$EN_FIXTURE/sharedConfig" \
-    "$EN_FIXTURE/sharedBase" \
+    "$EN_BASE" \
     "dev" >/dev/null 2>&1
   local rc=$?
 
@@ -643,14 +694,14 @@ test.oo.user.symlinks.ensure() {
   [ -L "$fakeHome/oosh" ]   && ooshIsLink=true
   ls -d "$fakeHome"/oosh.orig.* >/dev/null 2>&1 && oldOoshPreserved=true
 
-  # And ~/oosh — which IS $OOSH_DIR — now resolves to the shared dev worktree
+  # And ~/oosh — which IS $OOSH_DIR — now resolves to the shared dev clone
   # when a consumer canonicalizes it at point of use.
   local resolved
   resolved=$(private.this.path.canonical "$(private.test.lazy.oosh.dir "$fakeHome")")
-  local resolvedExpected
-  resolvedExpected=$(cd "$EN_FIXTURE/sharedBase/dev" && pwd -P)
+  local resolvedExpected="$EN_BASE/dev"
 
   if [ "$rc" -eq 0 ] \
+     && [ -d "$EN_BASE/dev/.git" ] \
      && [ "$configIsLink" = "true" ] \
      && [ "$ooshIsLink" = "true" ] \
      && [ "$oldOoshPreserved" = "true" ] \
@@ -682,7 +733,7 @@ test.oo.user.symlinks.ensure.collision() {
   private.oo.user.shared.symlinks.ensure \
     "$fakeHome" \
     "$EN_FIXTURE/sharedConfig" \
-    "$EN_FIXTURE/sharedBase" \
+    "$EN_BASE" \
     "dev" >/dev/null 2>&1
   local rc=$?
 
@@ -1459,7 +1510,7 @@ expect 0 "detectable layout" "the point of the ticket: oo.mode.base.get must fin
 # coverage at all. Asserted by BEHAVIOUR rather than by strategy number: what
 # matters is whether a layout is detectable, not which branch of the function
 # noticed.
-private.test.oo.base.get.canonical() { # <baseDir> # build main/ + dev/ in <baseDir>
+private.test.oo.base.get.canonical() { # <baseDir> # build main/ + dev/ in <baseDir> in the clone layout: dev/ an independent clone of main/
   mkdir -p "$1"
   ( cd "$1" \
     && git init --initial-branch=main -q main \
@@ -1467,7 +1518,9 @@ private.test.oo.base.get.canonical() { # <baseDir> # build main/ + dev/ in <base
     && git config user.email "test@test.local" \
     && git config user.name "test" \
     && git commit --allow-empty -q -m seed \
-    && git worktree add -B dev ../dev main ) >/dev/null 2>&1
+    && git branch dev \
+    && cd .. \
+    && git clone -q -b dev main dev ) >/dev/null 2>&1
 }
 private.test.oo.base.get.probe() { # <ooshDir> # base.get with OOSH_COMPONENTS_DIR unset; echoes the base
   ( unset OOSH_COMPONENTS_DIR; OOSH_DIR="$1"; oo.mode.base.get 2>/dev/null )
@@ -1478,17 +1531,19 @@ test.oo.baseGetFromWorktree() {
     || { create.result 1 "mktemp failed"; return $(result); }
   private.test.oo.base.get.canonical "$fixture/base"
   local got; got=$(private.test.oo.base.get.probe "$fixture/base/dev")
-  if [ "$got" = "$fixture/base" ]; then
-    create.result 0 "resolved from the worktree"
+  if [ ! -d "$fixture/base/dev/.git" ]; then
+    create.result 1 "fixture: dev/ is not a clone (.git is not a directory)"
+  elif [ "$got" = "$fixture/base" ]; then
+    create.result 0 "resolved from the branch clone"
   else
     create.result 1 "got '${got:-nothing}', expected $fixture/base"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case $level "T-BASE-GET-WORKTREE: a linked worktree resolves its base with no OOSH_COMPONENTS_DIR" \
+test.case $level "T-BASE-GET-WORKTREE: a branch clone beside main/ resolves its base with no OOSH_COMPONENTS_DIR" \
   test.oo.baseGetFromWorktree
-expect 0 "resolved from the worktree" "this is the shape every real install runs in, and nothing tested it"
+expect 0 "resolved from the branch clone" "this is the shape every real install runs in (the clone layout since 2026-09-23)"
 
 test.oo.baseGetFromMain() {
   local fixture; fixture=$(test.suite.fixture.make test.oo.baseget.main) \
@@ -1863,22 +1918,32 @@ expect 1 "*" "oo.checkout requires version argument"
 # T-CHECKOUT-2: oo.checkout derives correct directory name from version
 # ============================================================================
 test.oo.checkout.dirName() {
-  # Test prefix stripping and slash-to-dot conversion
-  # We test the naming logic by calling checkout with a non-existent branch
-  # and checking the error message for the derived directory name
-  local output
-  output=$(oo.checkout "feature/my.test.branch.$$" 2>&1)
-  # The function will fail (branch doesn't exist) but we can verify it tried
-  # the right directory name: "my.test.branch.$$"
-  if echo "$output" | grep -qiE "my\.test\.branch\.|failed|error"; then
-    create.result 0 "attempted correct dir name"
+  # Prefix stripping and slash-to-dot conversion, on a fixture base (it used
+  # to run against the real host's base and could only ever pass): a branch
+  # feature/my/test exists on the fixture origin and must land in
+  # <base>/my.test. Global git config sandboxed — the clone is trusted.
+  private.this.script.load ogit ogit.branch.get
+  local base fx rc
+  base=$(test.oo.base test.oo.checkout.dirname clone) || { create.result 1 "fixture failed"; return $(result); }
+  fx=$(dirname "$base")
+  git -C "$base/main" branch -q feature/my/test main && git -C "$base/main" push -q origin feature/my/test
+  local GIT_CONFIG_GLOBAL="$fx/gitconfig"; export GIT_CONFIG_GLOBAL
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  oo.checkout feature/my/test >/dev/null 2>&1; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "oo.checkout feature/my/test returned $rc: $RESULT"
+  elif [ "$(git -C "$base/my.test" rev-parse --abbrev-ref HEAD 2>/dev/null)" != feature/my/test ]; then
+    create.result 1 "no clone of feature/my/test at $base/my.test"
   else
-    create.result 0 "checkout attempted"
+    create.result 0 "feature/my/test cloned as <base>/my.test"
   fi
+  rm -rf "$fx"
+  return $(result)
 }
 test.case - "T-CHECKOUT-2: oo.checkout strips prefix from version" \
   test.oo.checkout.dirName
-expect 0 "*" "oo.checkout derives directory name correctly"
+expect 0 "feature/my/test cloned as <base>/my.test" "oo.checkout derives directory name correctly"
 
 # ============================================================================
 # T-CHECKOUT-NO-PULL: oo.checkout MUST NOT pull/merge
@@ -1907,6 +1972,95 @@ if type oo.checkout 2>/dev/null | grep -qE 'git[[:space:]]+merge[[:space:]]'; th
 else
   expect.pass "oo.checkout body has no \`git merge\` — merges only in \`promote\` / \`oo stage\`"
 fi
+
+# ============================================================================
+# T-CHECKOUT-CLONES-UNDER-BASE: oo.checkout <branch> clones it as
+# <base>/<branch> — a .git DIRECTORY, core.sharedRepository=group, and a
+# safe.directory entry (clone layout, 2026-09-23 design; spec § 4)
+# ============================================================================
+test.oo.checkout.clonesUnderBase() {
+  # load ogit BEFORE re-pointing OOSH_DIR: the loader sources "$OOSH_DIR/ogit"
+  private.this.script.load ogit ogit.branch.get
+  local base fx bad="" rc
+  base=$(test.oo.base test.oo.checkout.clone clone) || { create.result 1 "fixture failed"; return $(result); }
+  fx=$(dirname "$base")
+  rm -rf "$base/prod"
+  # local + export: this function's values, the caller's come back on return
+  local GIT_CONFIG_GLOBAL="$fx/gitconfig"; export GIT_CONFIG_GLOBAL
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  oo.checkout prod >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ] || bad="$bad rc=$rc result=[$RESULT]"
+  [ -d "$base/prod/.git" ] || bad="$bad prod/.git-not-a-directory"
+  [ "$(git -C "$base/prod" rev-parse --abbrev-ref HEAD 2>/dev/null)" = prod ] || bad="$bad not-on-prod"
+  [ "$(git -C "$base/prod" config --local --get core.sharedRepository 2>/dev/null)" = group ] || bad="$bad not-shared"
+  ogit.safeDirectory.list | grep -qFx "$base/prod" || bad="$bad not-trusted"
+  rm -rf "$fx"
+  if [ -n "$bad" ]; then create.result 1 "oo.checkout prod:$bad"
+  else create.result 0 "prod cloned under the base, shared and trusted"; fi
+  return $(result)
+}
+test.case $level "T-CHECKOUT-CLONES-UNDER-BASE: oo.checkout clones a branch as <base>/<branch>, shared and trusted" \
+  test.oo.checkout.clonesUnderBase
+expect 0 "prod cloned under the base, shared and trusted" "clone layout: oo checkout never adds a linked worktree"
+
+# ============================================================================
+# T-CHECKOUT-NO-BASE: with no components base oo.checkout fails loud and
+# names the fix — it no longer drops a clone beside whatever $OOSH_DIR is
+# ============================================================================
+test.oo.checkout.noBase() {
+  private.this.script.load ogit ogit.branch.get
+  local fx rc bad=""
+  fx=$(test.suite.fixture.make test.oo.checkout.nobase) || { create.result 1 "fixture failed"; return $(result); }
+  git init -q -b dev "$fx/oosh" >/dev/null 2>&1
+  local OOSH_COMPONENTS_DIR=""; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$fx/oosh"; export OOSH_DIR
+  oo.checkout prod >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad rc=0"
+  case "$RESULT" in *"oo mode.setup"*) ;; *) bad="$bad result=[$RESULT]" ;; esac
+  [ -e "$fx/prod" ] && bad="$bad made-$fx/prod"
+  rm -rf "$fx"
+  if [ -n "$bad" ]; then create.result 1 "oo.checkout without a base:$bad"
+  else create.result 0 "refused, naming oo mode.setup"; fi
+  return $(result)
+}
+test.case $level "T-CHECKOUT-NO-BASE: without a components base oo.checkout refuses and names oo mode.setup" \
+  test.oo.checkout.noBase
+expect 0 "refused, naming oo mode.setup" "one layout: no plain-clone fallback beside \$OOSH_DIR"
+
+# ============================================================================
+# T-UPDATE-ENSURES-TRUST: after oo.update every repository folder under the
+# base is in the caller's safe.directory list (spec § 4 — oo update repairs
+# trust). The pull and the symlink heal (config.init.user against the real
+# HOME) are mocked in a subshell; the global git config is sandboxed.
+# ============================================================================
+test.oo.update.ensuresTrust() {
+  private.this.script.load ogit ogit.branch.get
+  local base fx bad="" rc missing="" d
+  base=$(test.oo.base test.oo.update.trust clone) || { create.result 1 "fixture failed"; return $(result); }
+  fx=$(dirname "$base")
+  local GIT_CONFIG_GLOBAL="$fx/gitconfig"; export GIT_CONFIG_GLOBAL
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  (
+    ogit.remote.pull() { create.result 0 mocked; }
+    private.oo.update.heal.symlinks() { :; }
+    oo.update >/dev/null 2>&1
+  ); rc=$?
+  [ "$rc" -eq 0 ] || bad="$bad rc=$rc"
+  for d in "$base"/*/; do
+    d="${d%/}"
+    ogit.safeDirectory.list | grep -qFx "$d" || missing="$missing ${d##*/}"
+  done
+  [ -z "$missing" ] || bad="$bad untrusted:$missing"
+  rm -rf "$fx"
+  if [ -n "$bad" ]; then create.result 1 "oo.update:$bad"
+  else create.result 0 "every folder under the base is trusted after oo update"; fi
+  return $(result)
+}
+test.case $level "T-UPDATE-ENSURES-TRUST: oo.update ensures safe.directory for every folder under the base" \
+  test.oo.update.ensuresTrust
+expect 0 "every folder under the base is trusted after oo update" "oo update is the repair for a folder that lost its trust"
 
 # ============================================================================
 # T-USE-1: oo.use rejects missing arguments
