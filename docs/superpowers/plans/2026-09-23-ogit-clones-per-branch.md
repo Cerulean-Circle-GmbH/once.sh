@@ -1578,7 +1578,7 @@ Note the argument order flip: `this.git.commits.count <gitDir> <from> <to>` → 
 
 The sweep is **not** a test-only helper: it is a validator in the family of `path.validate` (path:8-129), `private.this.anchor.validate.one` (this:227-314) and `test.suite.portability.validate` (test.suite:1227-1400) — read those three first and mirror their shape. The tests only call it.
 
-- [ ] **Step 1: Scaffold**
+- [x] **Step 1: Scaffold**
 
 ```bash
 printf '%s\n' '<?treeRoot:$OOSH_DIR>' \
@@ -1588,7 +1588,7 @@ printf '%s\n' '<?treeRoot:$OOSH_DIR>' \
 ```
 Replace the generated `ogit.caller.validate.completion.treeRoot` stub with `{ echo "$OOSH_DIR"; }` — `treeRoot` is this method's own parameter, so it is METHOD completion (the shared `treeRoot` completer was removed 2026-09-24, § 0.4-2).
 
-- [ ] **Step 2: Tests (RED)** — replace the stub case in `test/test.ogit`:
+- [x] **Step 2: Tests (RED)** — replace the stub case in `test/test.ogit`:
 
 ```bash
 # ============================================================================
@@ -1642,7 +1642,7 @@ test.case $level "T-OGIT-ONLY-CALLER-REJECTS: caller.validate catches planted ra
 expect 0 "caller.validate rejects planted calls, honours comment-anchored markers, refuses an unreadable tree" "a validator that cannot fail proves nothing"
 ```
 
-- [ ] **Step 3: Implement** in `ogit`:
+- [x] **Step 3: Implement** in `ogit`:
 
 ```bash
 ogit.caller.validate()     # <?treeRoot:$OOSH_DIR> # verify ogit is the only caller of the git binary in the tracked tree: every other raw git call carries a comment-anchored ogit-exception marker; echo an OK:/INVALID: verdict; rc 1 on any violation #
@@ -1738,7 +1738,7 @@ ogit.caller.validate()     # <?treeRoot:$OOSH_DIR> # verify ogit is the only cal
 ```
 (Not filtered, on purpose: `echo |printf |\.log` on the line. The first draft dropped those lines unanchored, which let `x=$(git …); echo` through. A printed hint that names a git command gets a marker, like `myId:84` in Task 17.)
 
-- [ ] **Step 4: Run** `./test.suite run ogit 1` → `T-OGIT-ONLY-CALLER` FAILS with `INVALID: … ≈260 violation(s)` (≈220 outside `init/oosh`/`init/once`, which get their file markers in Task 17; counted at 9b69114 with the pattern above, printed hints included — this is the RED that Tasks 14-17 turn green; `LOG_LEVEL=1 ./ogit caller.validate` lists them); `-REJECTS` PASSES. `./test.suite run completion.audit 1` → PASS. **Commit** `feat(ogit): caller.validate — the only-caller rule as a production validator, red against the current tree`.
+- [x] **Step 4: Run** `./test.suite run ogit 1` → `T-OGIT-ONLY-CALLER` FAILS with `INVALID: … ≈260 violation(s)` (≈220 outside `init/oosh`/`init/once`, which get their file markers in Task 17; counted at 9b69114 with the pattern above, printed hints included — this is the RED that Tasks 14-17 turn green; `LOG_LEVEL=1 ./ogit caller.validate` lists them); `-REJECTS` PASSES. `./test.suite run completion.audit 1` → PASS. **Commit** `feat(ogit): caller.validate — the only-caller rule as a production validator, red against the current tree`.
 
 ---
 
