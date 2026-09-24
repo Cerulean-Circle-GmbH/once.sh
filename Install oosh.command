@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# ogit-exception-file: macOS double-click installer wrapper, runs before oosh exists
 # macOS drag-and-drop wrapper for oosh install. Two usage modes:
 #
 #   1. Downloaded standalone (single file in ~/Downloads or wherever).

@@ -1849,7 +1849,7 @@ Every `private.check.*` and `promote.*` method below that calls `ogit.*` gets `p
 | `Install oosh.command` | read it: a macOS double-click wrapper that runs `./init/oosh` or downloads it with curl/wget/fetch — it runs **before bash-mode oosh exists**, so it can never call ogit. Today it has **no** git invocation (only `github.com` URLs, which the pattern does not match); mark it anyway so a future call is judged by its stated reason: `# ogit-exception-file: macOS double-click installer wrapper, runs before oosh exists` as the second line (after the shebang) |
 | init/oosh, init/once | `# ogit-exception-file: POSIX sh, runs before bash and oosh exist` / `# ogit-exception-file: legacy once framework, out of scope` as the second line of each file |
 
-- [ ] Run the suites of every touched script (`user`, `ossh`, `hiveMind`, `scrumMaster`, `context`, `agentRoom`, `snet`, `otest`, `myId`, `install`) → PASS. `LOG_LEVEL=1 ./ogit caller.validate` → `OK: git callers in … — only ogit, N exception(s), 0 violations`; `./test.suite run ogit 1` → `T-OGIT-ONLY-CALLER` PASSES. From here on `./ogit caller.validate` is one of the validators of rule 5. Commit `refactor: remaining scripts call ogit; caller.validate green`.
+- [x] Run the suites of every touched script (`user`, `ossh`, `hiveMind`, `scrumMaster`, `context`, `agentRoom`, `snet`, `otest`, `myId`, `install`) → PASS. `LOG_LEVEL=1 ./ogit caller.validate` → `OK: git callers in … — only ogit, N exception(s), 0 violations`; `./test.suite run ogit 1` → `T-OGIT-ONLY-CALLER` PASSES. From here on `./ogit caller.validate` is one of the validators of rule 5. Commit `refactor: remaining scripts call ogit; caller.validate green`.
 
 ---
 
