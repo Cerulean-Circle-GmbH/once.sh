@@ -649,7 +649,7 @@ ogit.parameter.completion.asEmail()    { ogit.config.email.get; }
 
 **Files:** `ogit`, `test/test.ogit`
 
-- [ ] **Step 1: Tests (RED)**
+- [x] **Step 1: Tests (RED)**
 
 ```bash
 test.ogit.branch() {
@@ -695,9 +695,9 @@ test.case $level "T-OGIT-BRANCH: the branch noun" test.ogit.branch
 expect 0 "branch: get/list/check/find/checkout/upstream.set/reset/compare/merge behave" "the branch noun"
 ```
 
-- [ ] **Step 2: Run** → FAIL (functions missing).
+- [x] **Step 2: Run** → FAIL (functions missing).
 
-- [ ] **Step 3: Implement.** `ogit.branch.compare` counts with `ogit.commit.count`, so create `ogit.commit.count` **here** (`oo method.new ogit.commit.count`, body from Task 7); Task 7 then only adds its assertions.
+- [x] **Step 3: Implement.** `ogit.branch.compare` counts with `ogit.commit.count`, so create `ogit.commit.count` **here** (`oo method.new ogit.commit.count`, body from Task 7); Task 7 then only adds its assertions.
 
 ```bash
 ogit.branch.get()     # <?dir:$OOSH_DIR> # echo the current branch of <dir>, sanitised (refs/heads/, refs/remotes/origin/, heads/origin/, origin/ stripped); empty when detached or not a repo #
@@ -834,7 +834,7 @@ ogit.branch.merge()     # <ref> <?asEmail> <?asName> <?dir:$OOSH_DIR> # merge <r
 ```
 (No per-method completers: `dir`, `ref`, `branch`, `startPoint`, `commit`, `to`, `asEmail` come from the shared block; `from` is exempt; `asName` exempt since Task M.)
 
-- [ ] **Step 4: Run** `./test.suite run ogit 1` and `./test.suite run completion.audit 1` → PASS. Commit: `feat(ogit): branch noun — compare moved in with its body; upstream.set`.
+- [x] **Step 4: Run** `./test.suite run ogit 1` and `./test.suite run completion.audit 1` → PASS. Commit: `feat(ogit): branch noun — compare moved in with its body; upstream.set`.
 
 ---
 
@@ -1080,23 +1080,9 @@ ogit.commit.show()     # <ref> <?dir:$OOSH_DIR> # show commit <ref> #
  git -C "$dir" show "$1" 2>/dev/null
 }
 
-ogit.commit.count()     # <from> <to> <?dir:$OOSH_DIR> # RESULT = number of commits in <to> that are not in <from> (refs/heads/ when bare names); "0" when a ref is missing #
-{
- # Moved from this.git.commits.count (this:921). The refs may legitimately not
- # exist on test rigs without remotes — empty counts as 0.
- # (Created in Task 4, because ogit.branch.compare counts with it.)
- if [ -z "$1" ] || [ -z "$2" ]; then create.result 1 "ogit.commit.count requires <from> <to>"; error.log "$RESULT"; return $(result); fi
- local from="$1"
- local to="$2"
- local dir="${3:-${OOSH_DIR:-.}}"
- local n
- # Only a BARE branch name gets refs/heads/; @{u}, HEAD, origin/x, x~1 pass verbatim.
- case "$from" in */*|*@*|HEAD*|*~*|*^*) ;; *) from="refs/heads/$from" ;; esac
- case "$to"   in */*|*@*|HEAD*|*~*|*^*) ;; *) to="refs/heads/$to" ;; esac
- n=$(git -C "$dir" rev-list --count "$from..$to" 2>/dev/null)
- create.result 0 "${n:-0}"
- return $(result)
-}
+# ogit.commit.count already exists — created in Task 4 because
+# ogit.branch.compare counts with it (body as it stood here). Do not add it
+# again; this Task only adds its assertion (the `count=` line above).
 
 ogit.commit.log.show()     # <?range> <?limit> <?format> <?dir:$OOSH_DIR> # git log of <range> (default HEAD), at most <limit> commits; <format> is oneline or a --pretty=format: string #
 {
