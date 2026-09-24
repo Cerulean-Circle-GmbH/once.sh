@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+TEST_CATEGORY=platform
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# platform.shared.layout.invariant — the clone layout of the ogit plan
+# (docs/ogit.md § Layout, spec docs/superpowers/specs/2026-09-23-ogit-clones-per-branch-design.md § 2).
+#
+# Every folder under the components base (main/ + one per branch) is an
+# independent clone — never a linked worktree — whose .git is group-shared
+# (core.sharedRepository=group, setgid), trusted by the caller
+# (safe.directory), under a base that is group dev with setgid so new
+# folders inherit the group.
+#
+# Run on a real host, or inside `os platform.test <platform> terminal` after
+# install completes:
+#
+#   ./test.suite run platform.shared.layout.invariant 1
+#
+# Asserts:
+#   0. oo mode.base.get answers a base (precondition — bail out otherwise).
+#   1. every folder is a clone: ogit layout.status rc 0, no `worktree` line.
+#   2. every folder is shared=group setgid=yes.
+#   3. every folder is trusted=yes for the caller.
+#   4. the base itself is group dev with the setgid bit.
+
+private.this.script.load oo oo.mode.base.get
+private.this.script.load ogit ogit.layout.status
+
+# ----------------------------------------------------------------------------
+# INVARIANT-0 (precondition): a components base exists.
+# ----------------------------------------------------------------------------
+base=$(oo.mode.base.get 2>/dev/null)
+rc=$?
+test.case $level "platform.shared.layout: precondition — oo mode.base.get answers a base" true
+if [ "$rc" -ne 0 ] || [ -z "$base" ] || [ ! -d "$base" ]; then
+  expect.fail "oo mode.base.get rc=$rc base='$base' — no clone layout to check; run \`oo mode.setup\` (or install with \`ossh install <host>\`) first"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "base=$base"
+fi
+
+# One ogit layout.status call feeds invariants 1-3.
+layout=$(ogit.layout.status "$base")
+layoutRc=$?
+
+# ----------------------------------------------------------------------------
+# INVARIANT-1: every folder under the base is a clone, not a linked worktree.
+# ----------------------------------------------------------------------------
+worktrees=""
+name="" shape="" rest=""
+while read -r name shape rest; do
+  [ "$shape" = worktree ] && worktrees="$worktrees $name"
+done <<< "$layout"
+test.case $level "platform.shared.layout: every folder under the base is a clone" true
+if [ "$layoutRc" -eq 0 ] && [ -z "$worktrees" ]; then
+  expect.pass "all folders are clones under $base"
+elif [ -n "$worktrees" ]; then
+  expect.fail "linked worktree(s) under $base:$worktrees — convert them: \`sudo ogit worktree.remove $base\`"
+else
+  expect.fail "ogit layout.status rc=$layoutRc (mixed layout under $base) — finish the conversion: \`sudo ogit worktree.remove $base\`"
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-2: each folder's repository is group-shared with setgid.
+# INVARIANT-3: each folder is trusted (safe.directory) for the caller.
+# ----------------------------------------------------------------------------
+unshared="" untrusted="" folders=0
+while read -r name shape rest; do
+  [ -n "$name" ] || continue
+  case "$shape" in clone|worktree) ;; *) continue ;; esac
+  folders=$((folders + 1))
+  case "$rest" in
+    *"shared=group setgid=yes"*) ;;
+    *) unshared="$unshared $name" ;;
+  esac
+  case "$rest" in
+    *"trusted=yes"*) ;;
+    *) untrusted="$untrusted $name" ;;
+  esac
+done <<< "$layout"
+
+test.case $level "platform.shared.layout: every folder is shared=group setgid=yes" true
+if [ "$folders" -eq 0 ]; then
+  expect.fail "no repository folders under $base — run \`oo mode.setup\`"
+elif [ -z "$unshared" ]; then
+  expect.pass "$folders folder(s) shared=group setgid=yes"
+else
+  for name in $unshared; do
+    expect.fail "$base/$name is not group-shared with setgid — run: \`ogit repo.share $base/$name\` (with sudo when you do not own it)"
+  done
+fi
+
+test.case $level "platform.shared.layout: every folder is trusted for $(whoami)" true
+if [ "$folders" -eq 0 ]; then
+  expect.fail "no repository folders under $base — run \`oo mode.setup\`"
+elif [ -z "$untrusted" ]; then
+  expect.pass "$folders folder(s) trusted=yes for $(whoami)"
+else
+  expect.fail "not in $(whoami)'s safe.directory:$untrusted — run: \`oo update\` (or \`ogit safeDirectory.ensure $base\`)"
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-4: the base itself is group dev with the setgid bit, so a new
+# branch folder (oo checkout <version>) inherits the group.
+# ----------------------------------------------------------------------------
+baseGroup=$(stat -c '%G' "$base" 2>/dev/null || stat -f '%Sg' "$base" 2>/dev/null)
+test.case $level "platform.shared.layout: base is group dev with setgid" true
+if [ "$baseGroup" = dev ] && [ -g "$base" ]; then
+  expect.pass "$base is group dev with setgid"
+else
+  setgidState=no; [ -g "$base" ] && setgidState=yes
+  expect.fail "$base is group '$baseGroup' setgid=$setgidState — run: \`sudo chgrp dev $base && sudo chmod g+ws $base\`"
+fi
+
+test.suite.save.results
