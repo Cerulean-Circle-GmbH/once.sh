@@ -1821,7 +1821,7 @@ Every `private.check.*` and `promote.*` method below that calls `ogit.*` gets `p
 | 976, 1009 | `tag -l 'v*' --sort=-version:refname \| head -1`, `tag "$newTag" prod` | `ogit.tag.latest.get 'v*' "$OOSH_DIR"`, `ogit.tag.create "$newTag" prod "$OOSH_DIR"` |
 | `GIT_PAGER` save/restore (218-331) | keep | keep (not an invocation) |
 
-- [ ] Run `./test.suite run promote 1` → PASS. Commit `refactor(promote): every git call goes through ogit`.
+- [x] Run `./test.suite run promote 1` → PASS. Commit `refactor(promote): every git call goes through ogit`.
 
 ---
 
