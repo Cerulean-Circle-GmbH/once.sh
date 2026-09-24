@@ -1009,7 +1009,7 @@ ogit.remote.push.completion.tags()   { echo no; echo yes; }
 
 ### Task 7: `index` and `commit` nouns
 
-- [ ] **Step 1: Test (RED)**
+- [x] **Step 1: Test (RED)**
 
 (The case is `test.ogit.commitNoun`, NOT `test.ogit.commit`: that name is the Task 2 fixture helper, and redefining it would break every later case that adds a commit.)
 
@@ -1040,7 +1040,7 @@ test.case $level "T-OGIT-COMMIT: index and commit nouns" test.ogit.commitNoun
 expect 0 "index.add, commit.create/count/show/log.show behave" "index and commit nouns"
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 ```bash
 ogit.index.add()     # <?scope:all> <?dir:$OOSH_DIR> <?paths...> # stage: all (-A), updated (-u, tracked files only), or the given <paths>; variadic, so <?dir> precedes <paths> #
@@ -1097,7 +1097,7 @@ ogit.commit.log.show.completion.format() { echo oneline; echo '%h %ci'; }
 ```
 (No `completion.message() { :; }` — `message` is exempt. `ref`, `to`, `range`, `paths`, `asEmail` come from the shared block; `from`, `limit`, `asName` are exempt.)
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): index and commit nouns`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): index and commit nouns`.
 
 ---
 
