@@ -188,11 +188,32 @@ odocker.do.thing()            # vague verb
 
 #### Completion Function Rules
 
-1. **One completion function per completable parameter**
-2. **Name must exactly match**: `script.method.completion.paramName()`
-3. **Output**: one completion candidate per line to stdout
-4. **No-param methods**: use empty completion `script.method.completion() { :; }`
+There are **two forms**, and `c2` tries them in this order for the parameter under the cursor
+(`ng/c2` `c2.completion.discover` → `private.call.custom.completion`):
+
+| Step | Function | Form | Use it for |
+|------|----------|------|------------|
+| 1 | `script.method.completion()` | method catch-all | runs first for EVERY position of that method; only the empty `{ :; }` form is safe on a method with parameters (empty output falls through) |
+| 2 | `script.method.completion.paramName()` | **method completion** | a parameter that belongs to this method (`from`, `range`, `a`), or a *specialisation* of a shared type |
+| 3 | `script.parameter.completion.paramName()` | **parameter completion** | a **domain type** shared by every method with a parameter of that name (`container`, `image`, `branch`, `dir`) |
+| 4 | the signature's `<?param:default>` | default | nothing written |
+
+The model is `odocker`: `odocker.parameter.completion.container` (running containers) is the
+default for every `<container>`; `odocker.log.completion.container` specialises it to ALL
+containers. Both call a **private list getter** (`private.odocker.container.list.all`), never
+each other. A shared completer named after one method's parameter (`a`, `to`) is wrong: it
+silently applies to every future method that happens to use the name. An empty method completer
+cannot *suppress* a shared one — empty output falls through to step 3.
+
+1. **One completion function per completable parameter** — method form or parameter form, as above
+2. **Name must exactly match** the parameter: `script.method.completion.paramName()` / `script.parameter.completion.paramName()`
+3. **Output**: one completion candidate per line to stdout; never `create.result` (it runs in completion subshells)
+4. **No-param methods**: `oo method.new` generates the empty `script.method.completion() { :; }`; keep it (harmless — it falls through)
 5. **Private methods**: no completion needed (not user-facing)
+6. **No unpaired `'` in a docstring.** `c2` parses the signature line through `line.unquote`; an
+   apostrophe (`<dir>'s repository`) swallows the rest of the line and the parameters are misread,
+   so none of them completes. Paired quotes (`'all'`) are fine. Check a script with
+   `./c2 signature.validate <script>` (T11 tracks the 37 existing offenders outside `ogit`).
 
 ```bash
 # Method with two completable params — two completion functions
@@ -203,10 +224,15 @@ odocker.run.completion.image() {
 }
 # <?name> has no completion — user types it freely
 
-# No-parameter method — empty completion
+# A domain type shared by every method with a <container> parameter …
+odocker.parameter.completion.container() { private.odocker.container.list.running; }
+# … and one method that needs a different set specialises it
+odocker.log.completion.container() { private.odocker.container.list.all; }
+
+# No-parameter method — the empty completion oo method.new generates
 odocker.ps() # # list running containers
 { ... }
-# No completion function needed for parameterless methods
+odocker.ps.completion() { :; }
 ```
 
 #### Checklist for Every New Method
