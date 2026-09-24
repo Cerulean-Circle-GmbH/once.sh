@@ -1423,7 +1423,7 @@ private.oo.safeDirectory.add() # <path> # idempotently add path to git's global 
 
 ### Task 11: `worktree`, `binary`, `raw`
 
-- [ ] **Step 1: Test (RED)**
+- [x] **Step 1: Test (RED)**
 
 ```bash
 test.ogit.worktree() {
@@ -1456,7 +1456,7 @@ test.case $level "T-OGIT-WORKTREE: worktree noun, binary.check, raw" test.ogit.w
 expect 0 "worktree.add/list/find/delete/prune, binary.check, raw behave" "worktree noun"
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 ```bash
 private.ogit.worktree.paths.get() # <?dir:$OOSH_DIR> # echo the folder of every worktree of <dir>'s repository (the main one first), one per line; a path with spaces stays whole #
@@ -1522,7 +1522,7 @@ ogit.raw()     # <dir> <args...> # run git -C <dir> <args...> verbatim — the d
 ```
 (`branch`, `targetDir`, `startPoint`, `path`, `dir` come from the shared block; `args` is exempt.)
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): worktree noun (add/list/find/delete/prune), binary.check, raw`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): worktree noun (add/list/find/delete/prune), binary.check, raw`.
 
 ---
 
