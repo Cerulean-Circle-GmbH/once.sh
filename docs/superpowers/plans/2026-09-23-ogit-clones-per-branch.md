@@ -2377,7 +2377,7 @@ and the permission block (oo:2144-2171) with:
 
 **Files:** `promote` (`private.check.merged.to.testing`, `private.check.merged.to.prod`, `testing.pushed`, `prod.pushed`, `prod.tagged`), `test/test.promote`
 
-- [ ] **Step 1: Test (RED)** — new fixture: a base with `dev` and `testing` clones of one bare origin (`test.ogit.base` shape clone, plus a `testing` branch), `OOSH_COMPONENTS_DIR="$base"`, `OOSH_DIR="$base/dev"`, one extra commit on dev:
+- [x] **Step 1: Test (RED)** — new fixture: a base with `dev` and `testing` clones of one bare origin (`test.ogit.base` shape clone, plus a `testing` branch), `OOSH_COMPONENTS_DIR="$base"`, `OOSH_DIR="$base/dev"`, one extra commit on dev:
 
 ```bash
 test.promote.mergeInTargetFolder() {
@@ -2404,7 +2404,7 @@ test.case $level "T-PROMOTE-MERGE-IN-TARGET-FOLDER: dev→testing merges inside 
 expect 0 "the merge lands in testing's own folder; dev's folder is untouched; a missing target folder is refused with the fix" "clone layout: each stage folder is its own repository"
 ```
 
-- [ ] **Step 2: Implement** — one helper replaces both merge bodies:
+- [x] **Step 2: Implement** — one helper replaces both merge bodies:
 
 ```bash
 private.promote.merge.into.folder() # <source> <target> # push <source>; in <target>'s own folder: fetch, fast-forward <target> to origin/<target>, merge origin/<source> as the promote bot; rewrite OOSH_SELF_BRANCH there; RESULT tells #
@@ -2450,7 +2450,8 @@ Then:
 - `testing.pushed` / `prod.pushed`: `ogit.remote.push testing yes "$dir"`; no `checkout dev` any more (the dev folder never left dev) — update `test.promote.noModeWrite` (test.promote:494-499), which pinned `checkout dev`, to pin "no `branch.checkout`" instead; drop the stash-pop tail (stashes are popped in the helper).
 - `promote.status` / `branch.alignment`: read refs from the target folders (`ogit.commit.log.show refs/heads/testing 1 '%h %ci' "$(ogit.worktree.find testing …)"`), falling back to `$OOSH_DIR` when no folder exists.
 
-- [ ] **Step 3: Run** `./test.suite run promote 1` → PASS. Commit `feat(promote): merge in the target stage's own folder; refuse when the folder is missing`.
+- [x] **Step 3: Run** `./test.suite run promote 1` → PASS. Commit `feat(promote): merge in the target stage's own folder; refuse when the folder is missing`.
+  - *Done 2026-09-24:* promote 58→62/62 (RED 57/62 on the 5 new/re-aimed cases). Deviations: `<source>` is pushed from ITS folder (`ogit.worktree.find <source>`, fallback `$OOSH_DIR`) — a dev clone has no local `testing` branch, so the plan's `push.source.branch "$OOSH_DIR" "$source"` would fail testing→prod in the clone layout; `promote.branch.alignment` compares in `<to>`'s folder and reads `<from>` as `origin/<from>` there when no local branch exists (verdict relabelled to `<from>`); `private.promote.find.worktree` removed via `replace block … by ""` (`oo method.delete` cannot address `private.<script>.*` names). Follow-up: the confirmation previews (`testing..dev`, `prod..testing` in `$OOSH_DIR`) still read `$OOSH_DIR`'s refs.
 
 ---
 

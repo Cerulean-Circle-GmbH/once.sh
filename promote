@@ -260,10 +260,15 @@ promote.status() # # show PROMOTE pipeline state and branch diffs
   # Use full refs/heads/<name> so git doesn't get confused when a sibling
   # worktree or a stray symlink with the same name lives inside $OOSH_DIR
   # (in which case bare 'dev' is ambiguous: "revision vs filename").
-  local devHead testingHead prodHead
-  devHead=$(ogit.commit.log.show refs/heads/dev 1 '%h  %ci' "$OOSH_DIR" || echo "not found")
-  testingHead=$(ogit.commit.log.show refs/heads/testing 1 '%h  %ci' "$OOSH_DIR" || echo "not found")
-  prodHead=$(ogit.commit.log.show refs/heads/prod 1 '%h  %ci' "$OOSH_DIR" || echo "not found")
+  # Each branch is read from its own folder when one exists (clone layout:
+  # <base>/<branch>), else from $OOSH_DIR's repository.
+  local devDir testingDir prodDir devHead testingHead prodHead
+  devDir=$(ogit.worktree.find dev "$OOSH_DIR")
+  testingDir=$(ogit.worktree.find testing "$OOSH_DIR")
+  prodDir=$(ogit.worktree.find prod "$OOSH_DIR")
+  devHead=$(ogit.commit.log.show refs/heads/dev 1 '%h  %ci' "${devDir:-$OOSH_DIR}" || echo "not found")
+  testingHead=$(ogit.commit.log.show refs/heads/testing 1 '%h  %ci' "${testingDir:-$OOSH_DIR}" || echo "not found")
+  prodHead=$(ogit.commit.log.show refs/heads/prod 1 '%h  %ci' "${prodDir:-$OOSH_DIR}" || echo "not found")
 
   echo "dev    $devHead"
   promote.branch.alignment dev testing
@@ -276,7 +281,24 @@ promote.status() # # show PROMOTE pipeline state and branch diffs
 }
 
 promote.branch.alignment() # <from> <to> # symmetric branch comparison; sets RESULT to one of: up to date with <from>, <from> merged in, N commits behind <from>, diverged: N behind <from>
-{ private.this.script.load ogit ogit.branch.get; ogit.branch.compare "$1" "$2" "$OOSH_DIR"; }
+{
+  private.this.script.load ogit ogit.branch.get
+  # Compared in <to>'s own folder when one exists (clone layout: <base>/<to>),
+  # else in $OOSH_DIR. A clone of <to> has no local <from> branch — it knows
+  # <from> as origin/<from>, as of its last fetch (merge.into.folder fetches).
+  local from="$1" to="$2" dir fromRef
+  [ -n "$to" ] && dir=$(ogit.worktree.find "$to" "$OOSH_DIR")
+  dir="${dir:-$OOSH_DIR}"
+  fromRef="$from"
+  if [ -n "$from" ] && ! ogit.branch.check "refs/heads/$from" "$dir" && ogit.branch.check "refs/remotes/origin/$from" "$dir"; then
+    fromRef="origin/$from"
+  fi
+  ogit.branch.compare "$fromRef" "$to" "$dir"
+  local rc=$?
+  # the verdict names the stage, not the remote-tracking ref it was read from
+  [ "$fromRef" != "$from" ] && RESULT="${RESULT//$fromRef/$from}"
+  return $rc
+}
 
 # ogit-exception: docstring text, not an invocation
 promote.report() # # show promotion history from git tags
@@ -313,6 +335,72 @@ promote.report() # # show promotion history from git tags
 
   if [ "$_git_pager_orig" = "__unset__" ]; then unset GIT_PAGER; else export GIT_PAGER="$_git_pager_orig"; fi
 }
+
+private.promote.merge.into.folder()     # <source> <target> # push <source>; in <target>'s own folder: fetch, fast-forward <target> to origin/<target>, merge origin/<source> as the promote bot, rewrite OOSH_SELF_BRANCH there; RESULT tells #
+{
+ private.this.script.load ogit ogit.branch.get
+ local source="$1" target="$2"
+ # Clone layout: every stage is its own folder under the components base, so
+ # the merge happens INSIDE <target>'s folder and the folder of <source>
+ # ($OOSH_DIR, e.g. dev) is never checked out to another branch.
+ # <source> is pushed from ITS folder: a dev clone has no local testing branch.
+ # Where no folder holds <source> (worktree layout, detached main) the shared
+ # repository of $OOSH_DIR has the branch — push from there, as before.
+ local sourceDir
+ sourceDir=$(ogit.worktree.find "$source" "$OOSH_DIR")
+ # Push <source> first so origin/<source> holds every commit the later
+ # origin/<target> push references — and fail before any merge work when
+ # origin/<source> has diverged.
+ if ! private.promote.push.source.branch "${sourceDir:-$OOSH_DIR}" "$source"; then
+   create.result 1 "Failed to push $source to origin — pull/resolve manually before promoting: $RESULT"
+   return $(result)
+ fi
+ local dir
+ dir=$(ogit.worktree.find "$target" "$OOSH_DIR")
+ if [ -z "$dir" ]; then
+   create.result 1 "no folder holds branch $target — run: oo checkout $target"
+   return $(result)
+ fi
+ # Stash local changes of the target folder (e.g. .claude/settings.local.json)
+ # so the merge is not blocked; popped on every way out below.
+ local stashed=no
+ if ! ogit.diff.check "$dir"; then
+   ogit.stash.push "promote: pre-merge stash" "$dir" >/dev/null && stashed=yes
+ fi
+ if ! ogit.remote.fetch no "$dir" >/dev/null; then
+   local reason="$RESULT"
+   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
+   create.result 1 "$reason"
+   return $(result)
+ fi
+ if ! ogit.branch.fastForward "origin/$target" "$dir" >/dev/null; then
+   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
+   create.result 1 "$target in $dir has diverged from origin/$target — reconcile it by hand, then promote again"
+   return $(result)
+ fi
+ # asEmail/asName: the merge commit needs an identity — without it `git merge`
+ # aborts before producing conflict markers on hosts lacking a global git user
+ # (alma containers, fresh CI runners).
+ if ogit.branch.merge "origin/$source" oosh-promote@local "oosh promote" "$dir" >/dev/null; then
+   # Rewrite init/oosh's OOSH_SELF_BRANCH default so /<branch>/init/oosh curl
+   # installs auto-select the matching folder (see init/oosh).
+   private.promote.rewrite.self.branch "$dir"
+   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
+   create.result 0 "Merged $source into $target (in $dir)"
+ elif private.promote.try.resolve.self.branch.conflict "$dir" "$source"; then
+   important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
+   private.promote.rewrite.self.branch "$dir"
+   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
+   create.result 0 "Merged $source into $target (auto-resolved OOSH_SELF_BRANCH drift, in $dir)"
+ else
+   error.log "Merge conflict — aborting"
+   ogit.merge.abort "$dir" >/dev/null
+   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
+   create.result 1 "Merge failed — resolve conflicts manually in $dir"
+ fi
+ return $(result)
+}
+
 
 ### new.method
 
@@ -637,13 +725,6 @@ private.promote.rewrite.self.branch() # <ooshDir> # rewrite OOSH_SELF_BRANCH def
   fi
 }
 
-private.promote.find.worktree() # <ooshDir> <branch> # echo the worktree path that currently has <branch> checked out (empty if none)
-{
-  private.this.script.load ogit ogit.branch.get
-  local ooshDir=$1
-  local branch=$2
-  ogit.worktree.find "$branch" "$ooshDir"
-}
 
 # private.promote.push.source.branch <ooshDir> <sourceBranch>
 # Push the source branch to origin BEFORE merging it into the destination.
@@ -668,7 +749,8 @@ private.promote.push.source.branch()
 }
 
 # private.promote.try.resolve.self.branch.conflict <ooshDir> <sourceBranch>
-# Called from private.check.merged.to.* after `git merge <source>` fails.
+# Called from private.promote.merge.into.folder (in the target stage's folder)
+# after the merge of origin/<source> fails.
 # Every promote commits an OOSH_SELF_BRANCH rewrite onto the destination
 # branch (see private.promote.rewrite.self.branch), which becomes a permanent
 # 1-line divergence between source and destination init/oosh + Install
@@ -719,62 +801,13 @@ EOF
 
 private.check.merged.to.testing() # <script> <stageTo> <stateFound> # merge dev into testing
 {
-  private.this.script.load ogit ogit.branch.get
   local script=$1; shift
   local stageTo=$1; shift
   local stateFound=$1; shift
 
-  # Empty on a detached HEAD (ogit.branch.get since c6445ca; it used to be the
-  # literal "HEAD", whose checkout was a no-op) — the restore below is skipped then.
-  local originalBranch
-  originalBranch=$(ogit.branch.get "$OOSH_DIR")
-
-  # Stash any local changes (e.g. .claude/settings.local.json)
-  local stashed=false
-  if ! ogit.diff.check "$OOSH_DIR"; then
-    ogit.stash.push "promote: pre-merge stash" "$OOSH_DIR"
-    stashed=true
-  fi
-
-  # Push source (dev) first so origin/dev contains every commit that the
-  # subsequent origin/testing push will reference. Fail fast — before any
-  # destructive merge work — if the push is rejected.
-  if ! private.promote.push.source.branch "$OOSH_DIR" "dev"; then
-    [ "$stashed" = true ] && ogit.stash.pop "$OOSH_DIR"
-    create.result 1 "Failed to push dev to origin — pull/resolve manually before promoting"
-    return $(result)
-  fi
-
-  if ogit.branch.checkout testing "$OOSH_DIR"; then
-    # asEmail/asName: the merge commit needs identity, same as
-    # the explicit commits below — without inline creds, `git merge` aborts
-    # before producing conflict markers on environments lacking global git
-    # user config (alma containers, fresh CI runners, etc).
-    if ogit.branch.merge dev oosh-promote@local "oosh promote" "$OOSH_DIR"; then
-      # Rewrite init/oosh's OOSH_SELF_BRANCH default so /<branch>/init/oosh
-      # curl installs auto-select the matching worktree (see init/oosh:228).
-      private.promote.rewrite.self.branch "$OOSH_DIR"
-      # Stay on testing for tagging/pushing; stash popped in testing.pushed after returning to dev
-      create.result 0 "Merged dev into testing"
-    elif private.promote.try.resolve.self.branch.conflict "$OOSH_DIR" "dev"; then
-      important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
-      private.promote.rewrite.self.branch "$OOSH_DIR"
-      create.result 0 "Merged dev into testing (auto-resolved OOSH_SELF_BRANCH drift)"
-    else
-      error.log "Merge conflict — aborting"
-      ogit.merge.abort "$OOSH_DIR"
-      # No restore from a detached HEAD: the old `checkout HEAD` was a no-op.
-      [ -n "$originalBranch" ] && ogit.branch.checkout "$originalBranch" "$OOSH_DIR"
-      [ "$stashed" = true ] && ogit.stash.pop "$OOSH_DIR"
-      create.result 1 "Merge failed — resolve conflicts manually"
-      return $(result)
-    fi
-  else
-    [ "$stashed" = true ] && ogit.stash.pop "$OOSH_DIR"
-    create.result 1 "Could not checkout testing branch"
-    return $(result)
-  fi
-
+  # In testing's own folder (<base>/testing); refused naming `oo checkout
+  # testing` when no folder holds it. The dev folder never leaves dev.
+  private.promote.merge.into.folder dev testing
   return $(result)
 }
 
@@ -785,40 +818,53 @@ private.check.testing.tagged() # <script> <stageTo> <stateFound> # tag testing w
   local stageTo=$1; shift
   local stateFound=$1; shift
 
+  # Tag in testing's own folder — the merge landed there (merged.to.testing).
+  local dir
+  dir=$(ogit.worktree.find testing "$OOSH_DIR")
+  if [ -z "$dir" ]; then
+    create.result 1 "no folder holds branch testing — run: oo checkout testing"
+    return $(result)
+  fi
+
   local tagBase="testing-$(date +%Y-%m-%d)"
   local tag="$tagBase"
   local counter=1
-  while ogit.tag.check "$tag" "$OOSH_DIR"; do
+  while ogit.tag.check "$tag" "$dir"; do
     tag="${tagBase}.${counter}"
     ((counter++))
   done
 
-  if ogit.tag.create "$tag" HEAD "$OOSH_DIR"; then
+  if ogit.tag.create "$tag" testing "$dir"; then
     create.result 0 "Tagged: $tag"
     success.log "Tagged: $tag"
   else
-    create.result 1 "Failed to create tag: $tag"
+    create.result 1 "Failed to create tag: $tag — $RESULT"
   fi
   return $(result)
 }
 
-private.check.testing.pushed() # <script> <stageTo> <stateFound> # push testing and tags, return to dev
+private.check.testing.pushed() # <script> <stageTo> <stateFound> # push testing and tags from testing's own folder
 {
   private.this.script.load ogit ogit.branch.get
   local script=$1; shift
   local stageTo=$1; shift
   local stateFound=$1; shift
 
-  if ogit.remote.push testing yes "$OOSH_DIR"; then
-    ogit.branch.checkout dev "$OOSH_DIR"
-    # Pop any stash from merged.to.testing (now safe — back on dev)
-    case "$(ogit.stash.top.get "$OOSH_DIR")" in
-      *"promote: pre-merge stash"*) ogit.stash.pop "$OOSH_DIR" ;;
-    esac
-    create.result 0 "Pushed testing with tags, back on dev"
+  # Pushed FROM testing's folder, which holds the merge and the tag. No
+  # checkout back to dev: the dev folder never left dev, and the pre-merge
+  # stash (if any) was popped by private.promote.merge.into.folder.
+  local dir
+  dir=$(ogit.worktree.find testing "$OOSH_DIR")
+  if [ -z "$dir" ]; then
+    create.result 1 "no folder holds branch testing — run: oo checkout testing"
+    return $(result)
+  fi
+
+  if ogit.remote.push testing yes "$dir"; then
+    create.result 0 "Pushed testing with tags (from $dir)"
     success.log "Testing promotion complete"
   else
-    create.result 1 "Failed to push testing — check remote access"
+    create.result 1 "Failed to push testing — check remote access: $RESULT"
   fi
   return $(result)
 }
@@ -865,88 +911,13 @@ private.check.confirmation.received.prod() # <script> <stageTo> <stateFound> # c
 
 private.check.merged.to.prod() # <script> <stageTo> <stateFound> # merge testing into prod
 {
-  private.this.script.load ogit ogit.branch.get
   local script=$1; shift
   local stageTo=$1; shift
   local stateFound=$1; shift
 
-  # Empty on a detached HEAD (see private.check.merged.to.testing) — the
-  # restore below is skipped then, as the old `checkout HEAD` was a no-op.
-  local originalBranch
-  originalBranch=$(ogit.branch.get "$OOSH_DIR")
-
-  # Stash any local changes (e.g. .claude/settings.local.json)
-  local stashed=false
-  if ! ogit.diff.check "$OOSH_DIR"; then
-    ogit.stash.push "promote: pre-merge stash" "$OOSH_DIR"
-    stashed=true
-  fi
-
-  # Push source (testing) first so origin/testing contains every commit
-  # that the subsequent origin/prod push will reference. Same rationale as
-  # in private.check.merged.to.testing.
-  if ! private.promote.push.source.branch "$OOSH_DIR" "testing"; then
-    [ "$stashed" = true ] && ogit.stash.pop "$OOSH_DIR"
-    create.result 1 "Failed to push testing to origin — pull/resolve manually before promoting"
-    return $(result)
-  fi
-
-  # Worktree-aware: in a multi-worktree layout (dev, testing, prod as
-  # separate worktrees of the same repo), `git checkout prod` from the
-  # current worktree fails with "already used by worktree at <path>".
-  # Detect that case and merge inside prod's worktree directly — avoids
-  # touching the current worktree's checkout, and the merge commit lands
-  # on prod via the prod worktree's HEAD. Single-worktree setups fall
-  # through to the historical checkout-and-merge path.
-  local prodWorktree mergeDir prodStashed=false
-  # `git worktree list` reports PHYSICAL paths while OOSH_DIR is the ~/oosh
-  # symlink, so compare against its resolved target — otherwise the prod
-  # worktree looks "different" even when it IS the current one, and we would
-  # stash the same directory twice. See docs/oosh-architecture.md § The anchors
-  # are data.
-  local ooshPhysical
-  ooshPhysical=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
-  prodWorktree=$(private.promote.find.worktree "$OOSH_DIR" "prod")
-  if [ -n "$prodWorktree" ] && [ "$prodWorktree" != "$ooshPhysical" ]; then
-    # Stash prod-worktree's dirty changes too so merge isn't blocked.
-    if ! ogit.diff.check "$prodWorktree"; then
-      ogit.stash.push "promote: pre-merge stash" "$prodWorktree"
-      prodStashed=true
-    fi
-    mergeDir="$prodWorktree"
-  elif ogit.branch.checkout prod "$OOSH_DIR"; then
-    mergeDir="$OOSH_DIR"
-  else
-    [ "$stashed" = true ] && ogit.stash.pop "$OOSH_DIR"
-    create.result 1 "Could not checkout prod branch (not in another worktree either)"
-    return $(result)
-  fi
-
-  # See merge-creds note on the dev→testing site above — same rationale.
-  if ogit.branch.merge testing oosh-promote@local "oosh promote" "$mergeDir"; then
-    # Rewrite init/oosh's OOSH_SELF_BRANCH default — operates on mergeDir
-    # (the prod worktree if separate, else $OOSH_DIR currently on prod).
-    private.promote.rewrite.self.branch "$mergeDir"
-    [ "$prodStashed" = true ] && ogit.stash.pop "$prodWorktree"
-    create.result 0 "Merged testing into prod"
-  elif private.promote.try.resolve.self.branch.conflict "$mergeDir" "testing"; then
-    important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
-    private.promote.rewrite.self.branch "$mergeDir"
-    [ "$prodStashed" = true ] && ogit.stash.pop "$prodWorktree"
-    create.result 0 "Merged testing into prod (auto-resolved OOSH_SELF_BRANCH drift)"
-  else
-    error.log "Merge conflict — aborting"
-    ogit.merge.abort "$mergeDir"
-    # No restore from a detached HEAD: the old `checkout HEAD` was a no-op.
-    if [ -n "$originalBranch" ] && { [ "$mergeDir" = "$OOSH_DIR" ] || [ "$mergeDir" = "$ooshPhysical" ]; }; then
-      ogit.branch.checkout "$originalBranch" "$OOSH_DIR"
-    fi
-    [ "$prodStashed" = true ] && ogit.stash.pop "$prodWorktree"
-    [ "$stashed" = true ] && ogit.stash.pop "$OOSH_DIR"
-    create.result 1 "Merge failed — resolve conflicts manually"
-    return $(result)
-  fi
-
+  # In prod's own folder (<base>/prod); refused naming `oo checkout prod`
+  # when no folder holds it. The dev folder never leaves dev.
+  private.promote.merge.into.folder testing prod
   return $(result)
 }
 
@@ -957,9 +928,18 @@ private.check.prod.tagged() # <script> <stageTo> <stateFound> # tag prod with se
   local stageTo=$1; shift
   local stateFound=$1; shift
 
+  # Tag in prod's own folder — the merge landed there (merged.to.prod), and
+  # its fetch brought the earlier v* tags along.
+  local dir
+  dir=$(ogit.worktree.find prod "$OOSH_DIR")
+  if [ -z "$dir" ]; then
+    create.result 1 "no folder holds branch prod — run: oo checkout prod"
+    return $(result)
+  fi
+
   # Find latest v* tag and auto-increment patch
   local latestTag
-  latestTag=$(ogit.tag.latest.get 'v*' "$OOSH_DIR")
+  latestTag=$(ogit.tag.latest.get 'v*' "$dir")
 
   local newTag
   if [ -n "$latestTag" ]; then
@@ -987,43 +967,43 @@ private.check.prod.tagged() # <script> <stageTo> <stateFound> # tag prod with se
     fi
   fi
 
-  # Tag the prod ref explicitly. The previous form (`git tag $newTag`)
-  # tagged HEAD of $OOSH_DIR's current checkout, which assumed
-  # merged.to.prod had just done `git checkout prod`. The worktree-aware
-  # merged.to.prod stays in $OOSH_DIR (often dev), so HEAD would be wrong.
-  # Tagging `prod` works regardless of which worktree we're in.
-  if ogit.tag.create "$newTag" prod "$OOSH_DIR"; then
+  # Tag the prod ref explicitly, in prod's folder.
+  if ogit.tag.create "$newTag" prod "$dir"; then
     create.result 0 "Tagged: $newTag"
     success.log "Tagged: $newTag"
   else
-    create.result 1 "Failed to create tag: $newTag"
+    create.result 1 "Failed to create tag: $newTag — $RESULT"
   fi
   return $(result)
 }
 
-private.check.prod.pushed() # <script> <stageTo> <stateFound> # push prod and tags, return to dev
+private.check.prod.pushed() # <script> <stageTo> <stateFound> # push prod and tags from prod's own folder
 {
   private.this.script.load ogit ogit.branch.get
   local script=$1; shift
   local stageTo=$1; shift
   local stateFound=$1; shift
 
-  if ogit.remote.push prod yes "$OOSH_DIR"; then
-    ogit.branch.checkout dev "$OOSH_DIR"
-    # Pop any stash from merged.to.prod (now safe — back on dev)
-    case "$(ogit.stash.top.get "$OOSH_DIR")" in
-      *"promote: pre-merge stash"*) ogit.stash.pop "$OOSH_DIR" ;;
-    esac
-    # NO `export OOSH_MODE="released"` here. The tree is back on dev one line
-    # above, so stamping a mode word recorded a developer-box EVENT into the
-    # variable that says which branch this host is ON — and then persisted it,
-    # for every later shell. That was the value half of the T7 drift. The
-    # release state is now read from the branch itself
-    # (private.check.user.mode.release in oo).
-    create.result 0 "Pushed prod with tags, back on dev"
+  # Pushed FROM prod's folder, which holds the merge and the tag. No checkout
+  # back to dev: the dev folder never left dev, and the pre-merge stash (if
+  # any) was popped by private.promote.merge.into.folder.
+  local dir
+  dir=$(ogit.worktree.find prod "$OOSH_DIR")
+  if [ -z "$dir" ]; then
+    create.result 1 "no folder holds branch prod — run: oo checkout prod"
+    return $(result)
+  fi
+
+  if ogit.remote.push prod yes "$dir"; then
+    # NO `export OOSH_MODE="released"` here. Stamping a mode word recorded a
+    # developer-box EVENT into the variable that says which branch this host
+    # is ON — and then persisted it, for every later shell. That was the value
+    # half of the T7 drift. The release state is now read from the branch
+    # itself (private.check.user.mode.release in oo).
+    create.result 0 "Pushed prod with tags (from $dir)"
     success.log "Prod promotion complete"
   else
-    create.result 1 "Failed to push prod — check remote access"
+    create.result 1 "Failed to push prod — check remote access: $RESULT"
   fi
   return $(result)
 }

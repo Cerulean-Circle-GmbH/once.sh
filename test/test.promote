@@ -490,14 +490,23 @@ fi
 #
 # A source check rather than a behavioural one: running it means pushing prod.
 # Same idiom as T-OSSH-PREREQS-THIN-WRAPPER.
+#
+# Since Task 24 (clone layout) the pushed handlers push FROM the target stage's
+# own folder; $OOSH_DIR never left dev, so there is no `checkout dev` to return
+# to any more — the case now also pins that neither pushed handler checks a
+# branch out (the behaviour is covered by T-PROMOTE-FULL-CYCLE-IN-TARGET-FOLDERS).
 test.promote.noModeWrite() {
   local body; body=$(declare -f private.check.prod.pushed 2>/dev/null)
   if [ -z "$body" ]; then
     create.result 1 "private.check.prod.pushed is not defined — cannot check it"
   elif printf '%s' "$body" | grep -qE 'OOSH_MODE='; then
     create.result 1 "promote still writes OOSH_MODE: $(printf '%s' "$body" | grep -oE 'OOSH_MODE=[^ ;]*' | head -1)"
-  elif ! printf '%s' "$body" | grep -q 'checkout dev'; then
-    create.result 1 "the function no longer returns the tree to dev — this test is aimed at the wrong place"
+  elif printf '%s' "$body" | grep -q 'branch.checkout'; then
+    create.result 1 "promote checks a branch out in a pushed handler — the dev folder must never leave dev: $(printf '%s' "$body" | grep -o 'ogit.branch.checkout[^;]*' | head -1)"
+  elif ! printf '%s' "$body" | grep -q 'ogit.remote.push prod yes'; then
+    create.result 1 "the function no longer pushes prod with tags — this test is aimed at the wrong place"
+  elif declare -f private.check.testing.pushed | grep -q 'branch.checkout'; then
+    create.result 1 "private.check.testing.pushed still checks a branch out — the dev folder must never leave dev"
   else
     create.result 0 "promote records no mode word"
   fi
@@ -507,6 +516,139 @@ test.case $level "T-PROMOTE-NO-MODE-WRITE: promoting prod does not stamp a mode 
   test.promote.noModeWrite
 expect 0 "promote records no mode word" \
   "it wrote 'released' one line after checking the tree back out to dev — the wrong variable for an event"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-PROMOTE-MERGE-IN-TARGET-FOLDER* : the clone layout — every stage is its own
+# folder under the components base. promote merges, tags and pushes INSIDE the
+# target stage's folder; the folder of the source ($OOSH_DIR, dev) is never
+# checked out to another branch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# test.ogit.base's shape (test/test.ogit), plus the testing branch. Every branch
+# exists on the bare origin; only <folders> get a folder beside main/.
+test.promote.base() { # <label> <?shape:clone> <?folders:dev testing prod> # echo <base> holding main + <folders> as clones (shape clone) or linked worktrees (shape worktree) of <base>/../origin.git
+  local fx; fx=$(test.suite.fixture.make "$1"); local base="$fx/Once.sh"; mkdir -p "$base"
+  git init -q --bare -b main "$fx/origin.git"
+  git init -q -b main "$base/main"; git -C "$base/main" remote add origin "$fx/origin.git"
+  printf 'seed\n' > "$base/main/file"; printf 'ignored.txt\n' > "$base/main/.gitignore"
+  git -C "$base/main" add file .gitignore
+  GIT_COMMITTER_DATE="@1700000000 +0000" GIT_AUTHOR_DATE="@1700000000 +0000" \
+    git -C "$base/main" -c user.email=t@t -c user.name=t commit -q -m seed
+  git -C "$base/main" push -q -u origin main
+  local b; for b in dev testing prod; do
+    git -C "$base/main" branch -q "$b" main; git -C "$base/main" push -q origin "$b"
+  done
+  for b in ${3:-dev testing prod}; do
+    if [ "${2:-clone}" = clone ]; then git clone -q -b "$b" "$fx/origin.git" "$base/$b"
+    else git -C "$base/main" worktree add -q "$base/$b" "$b" >/dev/null 2>&1; git -C "$base/$b" branch -q -u "origin/$b"; fi
+  done
+  echo "$base"
+}
+
+test.promote.mergeInTargetFolder() {
+  local base fx bad=""; base=$(test.promote.base mit); fx=$(dirname "$base")
+  # never push anywhere but the fixture's own bare origin
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  # load ogit BEFORE re-pointing OOSH_DIR: the loader sources "$OOSH_DIR/ogit" (rule 12)
+  private.this.script.load ogit ogit.branch.get
+  # local + export: both anchors are this function's; the caller's values come back on return
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  printf 'new\n' >> "$base/dev/file"; git -C "$base/dev" -c user.email=t@t -c user.name=t commit -qam new
+  private.check.merged.to.testing promote testing 14 >/dev/null 2>&1 || bad="$bad rc=$? result=[$RESULT]"
+  [ "$(git -C "$base/testing" branch --show-current)" = testing ] || bad="$bad testing-folder-branch"
+  git -C "$base/testing" log --oneline | grep -q new || bad="$bad merge-not-in-testing-folder"
+  [ "$(git -C "$base/dev" branch --show-current)" = dev ] || bad="$bad dev-folder-moved"
+  [ "$(git -C "$fx/origin.git" rev-parse dev)" = "$(git -C "$base/dev" rev-parse dev)" ] || bad="$bad source-not-pushed"
+  rm -rf "$base/testing"
+  private.check.merged.to.testing promote testing 14 >/dev/null 2>&1 && bad="$bad missing-target-not-refused"
+  case "$RESULT" in *"oo checkout testing"*) ;; *) bad="$bad refusal-names-no-fix=[$RESULT]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the merge lands in testing's own folder; dev's folder is untouched; a missing target folder is refused with the fix" || create.result 1 "promote:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-MERGE-IN-TARGET-FOLDER: dev→testing merges inside <base>/testing" test.promote.mergeInTargetFolder
+expect 0 "the merge lands in testing's own folder; dev's folder is untouched; a missing target folder is refused with the fix" "clone layout: each stage folder is its own repository"
+
+# The whole merge → tag → push path of both stages, in the clone layout.
+# prod.tagged prompts unless PROMOTE_FORCE=yes — stdin is /dev/null, so the
+# prompt reads nothing and takes the proposed tag.
+test.promote.fullCycleInTargetFolders() {
+  local base fx bad="" day; base=$(test.promote.base cyc); fx=$(dirname "$base"); day=$(date +%Y-%m-%d)
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  private.this.script.load ogit ogit.branch.get
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  printf 'feature\n' >> "$base/dev/file"; git -C "$base/dev" -c user.email=t@t -c user.name=t commit -qam feature
+  private.check.merged.to.testing promote testing 16 >/dev/null 2>&1 || bad="$bad merge-testing=[$RESULT]"
+  private.check.testing.tagged promote testing 17 >/dev/null 2>&1 || bad="$bad tag-testing=[$RESULT]"
+  git -C "$base/testing" rev-parse -q --verify "refs/tags/testing-$day" >/dev/null || bad="$bad testing-tag-not-in-testing-folder"
+  private.check.testing.pushed promote testing 18 >/dev/null 2>&1 || bad="$bad push-testing=[$RESULT]"
+  [ "$(git -C "$fx/origin.git" rev-parse testing)" = "$(git -C "$base/testing" rev-parse testing)" ] || bad="$bad testing-not-pushed"
+  git -C "$fx/origin.git" rev-parse -q --verify "refs/tags/testing-$day" >/dev/null || bad="$bad testing-tag-not-pushed"
+  private.check.merged.to.prod promote prod 30 >/dev/null 2>&1 || bad="$bad merge-prod=[$RESULT]"
+  git -C "$base/prod" log --oneline | grep -q feature || bad="$bad merge-not-in-prod-folder"
+  private.check.prod.tagged promote prod 31 </dev/null >/dev/null 2>&1 || bad="$bad tag-prod=[$RESULT]"
+  [ "$(git -C "$base/prod" rev-parse -q --verify refs/tags/v1.0.0)" = "$(git -C "$base/prod" rev-parse prod)" ] || bad="$bad prod-tag-not-on-prod"
+  private.check.prod.pushed promote prod 32 >/dev/null 2>&1 || bad="$bad push-prod=[$RESULT]"
+  [ "$(git -C "$fx/origin.git" rev-parse prod)" = "$(git -C "$base/prod" rev-parse prod)" ] || bad="$bad prod-not-pushed"
+  git -C "$fx/origin.git" rev-parse -q --verify refs/tags/v1.0.0 >/dev/null || bad="$bad prod-tag-not-pushed"
+  [ "$(git -C "$base/dev" branch --show-current)" = dev ] || bad="$bad dev-folder-moved"
+  [ "$(git -C "$base/testing" branch --show-current)" = testing ] || bad="$bad testing-folder-moved"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "merge, tag and push happen in each target's folder; dev never moves" || create.result 1 "promote:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-FULL-CYCLE-IN-TARGET-FOLDERS: dev→testing→prod merge, tag, push per folder" test.promote.fullCycleInTargetFolders
+expect 0 "merge, tag and push happen in each target's folder; dev never moves" "each stage is tagged and pushed from its own folder"
+
+# A target that diverged from origin is refused, untouched — no merge on top.
+test.promote.divergedTargetRefused() {
+  local base fx bad="" before; base=$(test.promote.base div); fx=$(dirname "$base")
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  private.this.script.load ogit ogit.branch.get
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  # origin/testing moves on (from main/), the testing folder commits on its own
+  git -C "$base/main" checkout -q testing; printf 'theirs\n' > "$base/main/other"; git -C "$base/main" add other
+  git -C "$base/main" -c user.email=t@t -c user.name=t commit -qm theirs; git -C "$base/main" push -q origin testing
+  printf 'mine\n' > "$base/testing/mine"; git -C "$base/testing" add mine
+  git -C "$base/testing" -c user.email=t@t -c user.name=t commit -qm mine
+  before=$(git -C "$base/testing" rev-parse HEAD)
+  private.check.merged.to.testing promote testing 16 >/dev/null 2>&1 && bad="$bad diverged-not-refused"
+  case "$RESULT" in *diverged*) ;; *) bad="$bad refusal-says=[$RESULT]" ;; esac
+  [ "$(git -C "$base/testing" rev-parse HEAD)" = "$before" ] || bad="$bad testing-folder-changed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a diverged target folder is refused and left as it was" || create.result 1 "promote:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-DIVERGED-TARGET-REFUSED: no merge on top of a target that diverged from origin" test.promote.divergedTargetRefused
+expect 0 "a diverged target folder is refused and left as it was" "fast-forward first, or refuse"
+
+# The worktree layout with no testing/ folder (a host that was never given one):
+# dev→testing is refused naming the fix, and $OOSH_DIR is NOT checked out to
+# testing as the old code did; testing→prod still merges in prod's worktree.
+test.promote.worktreeLayout() {
+  local base fx bad=""; base=$(test.promote.base wtl worktree "dev prod"); fx=$(dirname "$base")
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  private.this.script.load ogit ogit.branch.get
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  private.check.merged.to.testing promote testing 16 >/dev/null 2>&1 && bad="$bad missing-testing-not-refused"
+  case "$RESULT" in *"oo checkout testing"*) ;; *) bad="$bad refusal-names-no-fix=[$RESULT]" ;; esac
+  [ "$(git -C "$base/dev" branch --show-current)" = dev ] || bad="$bad dev-folder-moved"
+  printf 'tested\n' >> "$base/dev/file"; git -C "$base/dev" -c user.email=t@t -c user.name=t commit -qam tested
+  git -C "$base/main" branch -q -f testing dev
+  private.check.merged.to.prod promote prod 30 >/dev/null 2>&1 || bad="$bad merge-prod=[$RESULT]"
+  git -C "$base/prod" log --oneline | grep -q tested || bad="$bad merge-not-in-prod-worktree"
+  [ "$(git -C "$base/dev" branch --show-current)" = dev ] || bad="$bad dev-folder-moved-on-prod"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "worktree layout: missing testing refused with the fix; prod merges in its worktree" || create.result 1 "promote:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-WORKTREE-LAYOUT: no testing folder is refused; prod merges in its own worktree" test.promote.worktreeLayout
+expect 0 "worktree layout: missing testing refused with the fix; prod merges in its worktree" "the pre-migration shape of a developer host"
 
 ### test.method
 
