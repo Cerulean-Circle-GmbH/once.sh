@@ -1858,8 +1858,8 @@ Every `private.check.*` and `promote.*` method below that calls `ogit.*` gets `p
 - [x] **`docs/ogit.md`** shaped like `docs/odocker.md`: `# ogit — Git Wrapper for oosh`, `## Overview` (naming line `git→ogit`, the only-caller rule and its validator `ogit caller.validate`, `<?dir>` last — with the variadic exceptions `repo.grep`, `index.add`, `diff.check`, `raw`, where `<?dir>` precedes the list —, positional skipping with `""`, getters vs mutators, `ogit-exception` / `ogit-exception-file` markers and the 5-line window), `## Quick Start`, `## Methods` with one `| Method | Parameters | Description |` table per noun (copy the signatures from this plan), `## Layout` (Phase 2 fills it; for now: "worktrees today, see spec"), `## Troubleshooting` (dubious ownership → `ogit safeDirectory.ensure`; git missing → `oo cmd git`), `## See Also`. Embed the tree: `![ogit method tree](puml/ogit.tree/ogit.tree.drawio)` link.
 - [x] `docs/wiki-index.md`: `- [Git Wrapper (ogit)](ogit.md) - every git call in oosh; branch/remote/commit/tag/stash/trust nouns; worktree↔clone layout` under Infrastructure Tools. `CLAUDE.md` wrapper table: `| ogit | git | ogit branch.get, ogit remote.pull, ogit safeDirectory.ensure, ogit layout.status |`. `docs/oosh-architecture.md` § Key Scripts: `| ogit | The only git caller; docs/ogit.md |`.
 - [x] `./test.suite core 1` → all green (1 intentional meta-failure). Validators OK, including `./ogit caller.validate` and `./test.suite run completion.audit 1`.
-- [ ] Commit `docs(ogit): docs/ogit.md, wiki, CLAUDE.md`. **Stop (Batch 5) and ask before pushing.** On the user's go: push `dev`; `os platform.test ubuntu_24_04` → PASS ×4 users.
-- [ ] Record in `sessions/agent.context.md`: Phase 1 done, commit range, gate results.
+- [x] Commit `docs(ogit): docs/ogit.md, wiki, CLAUDE.md`. **Stop (Batch 5) and ask before pushing.** On the user's go: push `dev`; `os platform.test ubuntu_24_04` → PASS ×4 users.
+- [x] Record in `sessions/agent.context.md`: Phase 1 done, commit range, gate results.
 
 ---
 
