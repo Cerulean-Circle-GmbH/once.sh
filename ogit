@@ -708,13 +708,20 @@ ogit.worktree.list()     # <?dir:$OOSH_DIR> # git worktree list --porcelain of t
 }
 
 
-ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has <branch> checked out: a linked worktree of the repository of <dir> (Phase 2 adds the sibling clone <base>/<branch>); empty when none #
+ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has <branch> checked out: a linked worktree of the repository of <dir>, else the sibling clone <base>/<branch> when it is on <branch>; empty when none #
 {
+ local dir="${2:-${OOSH_DIR:-.}}"
  local wt
  while IFS= read -r wt; do
    # symbolic-ref --short answers X exactly when the porcelain says "branch refs/heads/X".
    if [ "$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)" = "$1" ]; then printf '%s\n' "$wt"; return 0; fi
- done < <(private.ogit.worktree.paths.get "$2")
+ done < <(private.ogit.worktree.paths.get "$dir")
+ # The base is the parent of THIS repository when a sibling main/ exists — derived
+ # from <dir>, not from oo mode.base.get, so a fixture never resolves to the real tree.
+ local self base
+ self=$(private.this.path.canonical "$dir") || return 0
+ base=$(dirname "$self")
+ if [ -d "$base/main/.git" ] && [ -d "$base/$1/.git" ] && [ "$(ogit.branch.get "$base/$1")" = "$1" ]; then printf '%s\n' "$base/$1"; fi
  return 0
 }
 
@@ -1049,6 +1056,49 @@ ogit.worktree.remove()     # <?base:$(oo mode.base.get)> # turn every linked wor
  done
  ogit.worktree.prune "$base/main" >/dev/null
  create.result 0 "${#folders[@]} folder(s) converted to clones under $base"
+ return $(result)
+}
+
+
+ogit.worktree.restore()     # <?base:$(oo mode.base.get)> # turn every sibling clone of <base>/main (same origin) back into a linked worktree of main, carrying its gitignored files across; refuses on a dirty or unpushed folder; idempotent; run with sudo on a shared tree #
+{
+ private.ogit.require || return $(result)
+ local base
+ base=$(private.ogit.base.get "$1")
+ if [ ! -d "$base/main/.git" ]; then create.result 1 "ogit.worktree.restore: no repository at $base/main"; error.log "$RESULT"; return $(result); fi
+ local url
+ url=$(ogit.remote.url.get origin "$base/main")
+ local d branch
+ local -a folders=() branches=()
+ while IFS= read -r d; do
+   [ "${d##*/}" = main ] && continue
+   [ -d "$d/.git" ] || continue                                   # worktrees (.git file) are already done
+   [ "$(ogit.remote.url.get origin "$d")" = "$url" ] || continue   # a foreign clone is not ours
+   private.ogit.folder.gate "$d" || { error.log "$RESULT"; return $(result); }
+   branch=$(ogit.branch.get "$d")
+   [ -n "$branch" ] || { create.result 1 "${d##*/} is detached — check a branch out first"; error.log "$RESULT"; return $(result); }
+   folders+=("$d"); branches+=("$branch")
+ done < <(private.ogit.base.folders.list "$base")
+ private.ogit.folder.gate "$base/main" || { error.log "$RESULT"; return $(result); }
+ if [ ${#folders[@]} = 0 ]; then create.result 0 "no sibling clones under $base — nothing to restore"; success.log "$RESULT"; return $(result); fi
+ ogit.remote.fetch no "$base/main" >/dev/null || { error.log "$RESULT"; return $(result); }
+ local i stash keep
+ for i in "${!folders[@]}"; do
+   d="${folders[$i]}"; branch="${branches[$i]}"
+   stash="$HOME/.oosh.backups/$(date -u +%Y%m%dT%H%M%SZ)-ogit-${d##*/}"
+   [ -e "$stash" ] && stash="$stash.$$"
+   private.ogit.folder.ignored.save "$d" "$stash" || { error.log "$RESULT"; return $(result); }
+   keep=""; [ -d "$stash" ] && keep=" — its ignored files are kept in $stash"
+   rm -rf "$d" || { create.result 1 "could not remove $d$keep"; error.log "$RESULT"; return $(result); }
+   ogit.worktree.add "$branch" "$d" "origin/$branch" "$base/main" >/dev/null \
+     || { create.result 1 "${d##*/}: clone removed but worktree add failed — recover with: ogit worktree.add $branch $d origin/$branch $base/main$keep$(private.ogit.git.reason.get)"; error.log "$RESULT"; return $(result); }
+   ogit.branch.upstream.set "origin/$branch" "$d" >/dev/null
+   private.ogit.folder.finish "$d" || { error.log "$RESULT$keep"; return $(result); }
+   private.ogit.folder.ignored.restore "$stash" "$d" || { error.log "$RESULT"; return $(result); }
+   success.log "${d##*/}: clone → worktree ($branch)"
+ done
+ ogit.repo.share "$base/main" >/dev/null
+ create.result 0 "${#folders[@]} folder(s) restored as worktrees of $base/main"
  return $(result)
 }
 

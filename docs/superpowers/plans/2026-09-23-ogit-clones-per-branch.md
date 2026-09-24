@@ -2151,7 +2151,7 @@ ogit.worktree.remove()     # <?base:$(oo mode.base.get)> # turn every linked wor
 
 ### Task 21: `ogit worktree.restore` (clones → worktrees)
 
-- [ ] **Step 1: Test (RED)**
+- [x] **Step 1: Test (RED)** (`test.ogit.base` moved up beside the other fixture helpers — the extended `T-OGIT-WORKTREE` runs before Test 15 and needs it)
 
 ```bash
 test.ogit.worktreeRestore() {
@@ -2181,7 +2181,7 @@ test.case $level "T-OGIT-WORKTREE-RESTORE: the reverse conversion, and the round
 expect 0 "clones become linked worktrees again, gated, idempotent, round-trippable, ignored files carried" "reversibility is the promise"
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement** (as built, rule 3: the worktree-add failure RESULT carries `$(private.ogit.git.reason.get)`; `worktree.find` replaced with `replace block`)
 
 ```bash
 ogit.worktree.restore()     # <?base:$(oo mode.base.get)> # turn every sibling clone of <base>/main (same origin) back into a linked worktree of main, carrying its gitignored files across; refuses on a dirty or unpushed folder; idempotent; run with sudo on a shared tree #
@@ -2246,7 +2246,7 @@ ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has 
 }
 ```
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): worktree.restore (ignored files carried); worktree.find knows sibling clones`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): worktree.restore (ignored files carried); worktree.find knows sibling clones`.
 
 ---
 

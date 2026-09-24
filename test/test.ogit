@@ -81,6 +81,29 @@ test.ogit.commit() { # <work> <message> # one more commit on the fixture (raw gi
     git -C "$1" -c user.email=t@t -c user.name=t commit -q -m "$2"
 }
 
+# ============================================================================
+# PHASE 2 fixture: a base holding main + dev + prod (the host layout), either
+# as linked worktrees of main (shape worktree) or as independent clones
+# (shape clone). Raw git on the fixture side, as test.ogit.fixture.
+# ============================================================================
+test.ogit.base() { # <label> <?shape:worktree> # echo <base> holding main + dev + prod as linked worktrees (shape worktree) or as clones (shape clone), all tracking <base>/origin.git; each folder ignores ignored.txt
+  local fx; fx=$(test.suite.fixture.make "$1"); local base="$fx/Once.sh"; mkdir -p "$base"
+  git init -q --bare -b main "$fx/origin.git"
+  git init -q -b main "$base/main"; git -C "$base/main" remote add origin "$fx/origin.git"
+  printf 'seed\n' > "$base/main/file"; printf 'ignored.txt\n' > "$base/main/.gitignore"
+  git -C "$base/main" add file .gitignore
+  # tick 0 of test.ogit.commit's clock, as in test.ogit.fixture
+  GIT_COMMITTER_DATE="@1700000000 +0000" GIT_AUTHOR_DATE="@1700000000 +0000" \
+    git -C "$base/main" -c user.email=t@t -c user.name=t commit -q -m seed
+  git -C "$base/main" push -q -u origin main
+  local b; for b in dev prod; do
+    git -C "$base/main" branch -q "$b" main; git -C "$base/main" push -q origin "$b"
+    if [ "${2:-worktree}" = clone ]; then git clone -q -b "$b" "$fx/origin.git" "$base/$b"
+    else git -C "$base/main" worktree add -q "$base/$b" "$b" >/dev/null 2>&1; git -C "$base/$b" branch -q -u "origin/$b"; fi
+  done
+  echo "$base"
+}
+
 test.ogit.fixtureWorks() {
   local fx; fx=$(test.ogit.fixture smoke)
   local n; n=$(git -C "$fx/work" rev-list --count HEAD)
@@ -470,6 +493,14 @@ test.ogit.worktree() {
   ogit.binary.check || bad="$bad binary"
   [ "$(ogit.raw "$w" rev-parse --abbrev-ref HEAD)" = dev ] || bad="$bad raw"
   rm -rf "$fx"
+  # worktree.find knows sibling clones: <base>/<branch> next to <base>/main, when it is on <branch>
+  local cb; cb=$(test.ogit.base wtfind clone)
+  [ "$(ogit.worktree.find prod "$cb/main")" = "$cb/prod" ] || bad="$bad find-clone=[$(ogit.worktree.find prod "$cb/main")]"
+  [ "$(ogit.worktree.find prod "$cb/dev")" = "$cb/prod" ] || bad="$bad find-clone-from-sibling"
+  [ -z "$(ogit.worktree.find nosuch "$cb/main")" ] || bad="$bad find-clone-nosuch"
+  git -C "$cb/prod" checkout -q -b other
+  [ -z "$(ogit.worktree.find prod "$cb/main")" ] || bad="$bad find-clone-wrong-branch"
+  rm -rf "$(dirname "$cb")"
   [ -z "$bad" ] && create.result 0 "worktree.add/list/find/delete/prune, binary.check, raw behave" || create.result 1 "worktree:$bad"
   return $(result)
 }
@@ -676,29 +707,6 @@ console.log "
 Test 15
 ===================================================================="
 
-# ============================================================================
-# PHASE 2 fixture: a base holding main + dev + prod (the host layout), either
-# as linked worktrees of main (shape worktree) or as independent clones
-# (shape clone). Raw git on the fixture side, as test.ogit.fixture.
-# ============================================================================
-test.ogit.base() { # <label> <?shape:worktree> # echo <base> holding main + dev + prod as linked worktrees (shape worktree) or as clones (shape clone), all tracking <base>/origin.git; each folder ignores ignored.txt
-  local fx; fx=$(test.suite.fixture.make "$1"); local base="$fx/Once.sh"; mkdir -p "$base"
-  git init -q --bare -b main "$fx/origin.git"
-  git init -q -b main "$base/main"; git -C "$base/main" remote add origin "$fx/origin.git"
-  printf 'seed\n' > "$base/main/file"; printf 'ignored.txt\n' > "$base/main/.gitignore"
-  git -C "$base/main" add file .gitignore
-  # tick 0 of test.ogit.commit's clock, as in test.ogit.fixture
-  GIT_COMMITTER_DATE="@1700000000 +0000" GIT_AUTHOR_DATE="@1700000000 +0000" \
-    git -C "$base/main" -c user.email=t@t -c user.name=t commit -q -m seed
-  git -C "$base/main" push -q -u origin main
-  local b; for b in dev prod; do
-    git -C "$base/main" branch -q "$b" main; git -C "$base/main" push -q origin "$b"
-    if [ "${2:-worktree}" = clone ]; then git clone -q -b "$b" "$fx/origin.git" "$base/$b"
-    else git -C "$base/main" worktree add -q "$base/$b" "$b" >/dev/null 2>&1; git -C "$base/$b" branch -q -u "origin/$b"; fi
-  done
-  echo "$base"
-}
-
 test.ogit.layoutStatus() {
   local base bad="" out; base=$(test.ogit.base layoutwt)
   out=$(ogit.layout.status "$base")
@@ -765,6 +773,37 @@ test.ogit.worktreeRemove() {
 }
 test.case $level "T-OGIT-WORKTREE-REMOVE: worktrees become independent clones, safely" test.ogit.worktreeRemove
 expect 0 "refuses dirty and unpushed by name; converts clean worktrees to trusted, shared clones; carries ignored files; idempotent" "D1 + D4 of the design, § 2.1 ignored-file carry"
+
+
+console.log "
+Test 17
+===================================================================="
+
+test.ogit.worktreeRestore() {
+  local base bad="" fx; base=$(test.ogit.base clrs clone); fx=$(dirname "$base")
+  local GIT_CONFIG_GLOBAL="$fx/gitconfig"; export GIT_CONFIG_GLOBAL; : > "$GIT_CONFIG_GLOBAL"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  printf 'mine\n' > "$base/dev/ignored.txt"
+  test.ogit.commit "$base/dev" local
+  ogit.worktree.restore "$base" >/dev/null 2>&1 && bad="$bad ahead-not-refused"
+  case "$RESULT" in *dev*) ;; *) bad="$bad ahead-not-named" ;; esac
+  git -C "$base/dev" push -q origin dev
+  ogit.worktree.restore "$base" >/dev/null 2>&1 || bad="$bad restore-rc=$?"
+  [ -f "$base/dev/.git" ] && [ -f "$base/prod/.git" ] || bad="$bad not-worktrees"
+  [ "$(git -C "$base/dev" rev-parse HEAD)" = "$(git -C "$fx/origin.git" rev-parse dev)" ] || bad="$bad dev-content"
+  [ "$(git -C "$base/main" worktree list --porcelain | grep -c '^worktree ')" = 3 ] || bad="$bad main-lists"
+  [ "$(cat "$base/dev/ignored.txt" 2>/dev/null)" = mine ] || bad="$bad ignored-file-lost"
+  ogit.worktree.restore "$base" >/dev/null 2>&1 || bad="$bad second-run-rc"
+  # round trip — the ignored file survives both directions
+  ogit.worktree.remove "$base" >/dev/null 2>&1 || bad="$bad roundtrip-remove"
+  [ -d "$base/dev/.git" ] || bad="$bad roundtrip-shape"
+  [ "$(cat "$base/dev/ignored.txt" 2>/dev/null)" = mine ] || bad="$bad roundtrip-ignored-file-lost"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "clones become linked worktrees again, gated, idempotent, round-trippable, ignored files carried" || create.result 1 "worktree.restore:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-WORKTREE-RESTORE: the reverse conversion, and the round trip" test.ogit.worktreeRestore
+expect 0 "clones become linked worktrees again, gated, idempotent, round-trippable, ignored files carried" "reversibility is the promise"
 
 ### test.method
 
