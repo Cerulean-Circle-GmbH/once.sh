@@ -508,7 +508,7 @@ expect 0 "fixture: one commit, tracking origin/dev" "every ogit case builds on t
 
 For each method: scaffold with `oo method.new` (params / description exactly as the signature below), replace the stub body, replace the stub test with the case shown, run RED, implement, run GREEN, commit. Bodies:
 
-- [ ] **Step 1: Tests (RED)** — add to `test/test.ogit`:
+- [x] **Step 1: Tests (RED)** — add to `test/test.ogit`:
 
 ```bash
 test.ogit.repo() {
@@ -537,9 +537,9 @@ test.case $level "T-OGIT-REPO: repo.clone/check/root.get/files.list/grep/share" 
 expect 0 "repo: clone, check, root.get, files.list, grep, share behave" "the repo noun"
 ```
 
-- [ ] **Step 2: Run** → FAIL (`ogit.repo.check: command not found` or the stub's RESULT).
+- [x] **Step 2: Run** → FAIL (`ogit.repo.check: command not found` or the stub's RESULT).
 
-- [ ] **Step 3: Implement** (scaffold each with `oo method.new`, then paste; delete every completion stub the generator made for a parameter the shared block below covers):
+- [x] **Step 3: Implement** (scaffold each with `oo method.new`, then paste; delete every completion stub the generator made for a parameter the shared block below covers):
 
 ```bash
 ogit.repo.clone()     # <url> <branch> <targetDir> # clone <url> at <branch> into <targetDir>; refuses a non-empty <targetDir>; on failure removes only a dir this call created #
@@ -640,8 +640,8 @@ ogit.parameter.completion.asEmail()    { ogit.config.email.get; }
 ```
 (`ogit.branch.list` / `ogit.tag.list` / `ogit.config.email.get` arrive in Tasks 4, 9 and 10; until then the completer prints nothing — fine. `from`, `url`, `pattern`, `message`, `format`, `key`, `value`, `args` are already in `EXEMPT_PARAMS`; `limit`, `asName` since Task M.)
 
-- [ ] **Step 4: Run** → PASS; `./test.suite run completion.audit 1` → PASS. `./ng/c2 function.completion ./ogit repo` lists the six methods.
-- [ ] **Step 5: Commit** `git add ogit test/test.ogit && git commit -m "feat(ogit): repo noun — clone, check, root.get, share, grep, files.list"`
+- [x] **Step 4: Run** → PASS; `./test.suite run completion.audit 1` → PASS. `./ng/c2 function.completion ./ogit repo` lists the six methods.
+- [x] **Step 5: Commit** `git add ogit test/test.ogit && git commit -m "feat(ogit): repo noun — clone, check, root.get, share, grep, files.list"`
 
 ---
 
