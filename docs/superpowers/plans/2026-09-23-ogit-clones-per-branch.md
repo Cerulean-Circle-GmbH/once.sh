@@ -167,7 +167,7 @@ Correctness defects of the first draft, fixed in the snippets: `local` lines who
 
 Every later Task calls these (§ 0.3), so they exist before `ogit` does. Each method is created with the pipe-driven `oo method.new` (rule 2 of § 0.5), then its stub body and stub test are replaced with the code below. Red first, as everywhere.
 
-- [ ] **Step 1: `private.this.script.load` — scaffold**
+- [x] **Step 1: `private.this.script.load` — scaffold**
 
 ```bash
 cd ~/oosh && printf '%s\n' '<script> <probeFn>' \
@@ -177,7 +177,7 @@ cd ~/oosh && printf '%s\n' '<script> <probeFn>' \
 ```
 (Private: no completion stubs are generated, by design.)
 
-- [ ] **Step 2: Test (RED)** — replace the stub case in `test/test.this`:
+- [x] **Step 2: Test (RED)** — replace the stub case in `test/test.this`:
 
 ```bash
 test.this.scriptLoad() {
@@ -201,7 +201,7 @@ expect 0 "script.load sources once, keeps This, rc 1 when the probe stays undefi
 ```
 Run `./test.suite run this 1` → FAIL (stub).
 
-- [ ] **Step 3: Implement** in `this` (a predicate: rc only, no `create.result` — it runs inside completion paths too):
+- [x] **Step 3: Implement** in `this` (a predicate: rc only, no `create.result` — it runs inside completion paths too):
 
 ```bash
 private.this.script.load() # <script> <probeFn> # source $OOSH_DIR/<script> into this shell once, unless <probeFn> is already a function; This is saved and restored around the source; rc 0 when <probeFn> is a function afterwards #
@@ -220,7 +220,7 @@ private.this.script.load() # <script> <probeFn> # source $OOSH_DIR/<script> into
 ```
 Run → PASS. **Commit** `feat(this): private.this.script.load — one lazy source-once loader that keeps This`.
 
-- [ ] **Step 4: `private.this.path.case.get` — scaffold, test (RED), implement**
+- [x] **Step 4: `private.this.path.case.get` — scaffold, test (RED), implement**
 
 ```bash
 printf '%s\n' '<path>' \
@@ -265,7 +265,7 @@ private.this.path.case.get() # <path> # echo <path> in the file system canonical
 ```
 Run `./test.suite run this 1` → PASS. **Commit** `feat(this): private.this.path.case.get — the macOS canonical-case idiom, once`.
 
-- [ ] **Step 5: `oo test.platform.new` — scaffold, test (RED), implement**
+- [x] **Step 5: `oo test.platform.new` — scaffold, test (RED), implement**
 
 ```bash
 printf '%s\n' '<scope> <aspect>' \
@@ -329,11 +329,11 @@ oo.test.platform.new.completion.aspect() { echo config; echo oosh; echo layout; 
 ```
 (`rm -f "$target"` only on the failure branch, and only after the existence refusal above — so it can only remove what this call wrote.) Run `./test.suite run oo 1` → PASS. **Commit** `feat(oo): oo test.platform.new — generate platform invariant tests from the template`.
 
-- [ ] **Step 6: completion audit covers ogit** — in `test/test.completion.audit`, add `ogit` to `IN_SCOPE_SCRIPTS` (lines 39-41; the loop skips a script that does not exist yet, so this is safe before Task 1) and append ` limit asName ` to the single-line `EXEMPT_PARAMS`, with a comment above it: `# limit: a number of commits (ogit commit.log.show); asName: free-text bot display name (ogit identity)`. The remaining free ogit params get shared completers in Task 3 (`asEmail` → the configured email, `range` → refs, `paths`/`pathspecs` → files, `treeRoot` → `$OOSH_DIR`).
+- [x] **Step 6: completion audit covers ogit** — in `test/test.completion.audit`, add `ogit` to `IN_SCOPE_SCRIPTS` (lines 39-41; the loop skips a script that does not exist yet, so this is safe before Task 1) and append ` limit asName ` to the single-line `EXEMPT_PARAMS`, with a comment above it: `# limit: a number of commits (ogit commit.log.show); asName: free-text bot display name (ogit identity)`. The remaining free ogit params get shared completers in Task 3 (`asEmail` → the configured email, `range` → refs, `paths`/`pathspecs` → files, `treeRoot` → `$OOSH_DIR`).
 
 Run `./test.suite run completion.audit 1` → PASS (unchanged count until ogit exists). **Commit** `test(completion.audit): ogit in scope; limit and asName exempt with reason`.
 
-- [ ] **Step 7: Gate** — `./test.suite run this 1`, `./test.suite run oo 1`, validators (rule 5) → green. Allow-list any new command in `.claude/settings.json`. **Stop (Batch M).**
+- [x] **Step 7: Gate** — `./test.suite run this 1`, `./test.suite run oo 1`, validators (rule 5) → green. Allow-list any new command in `.claude/settings.json`. **Stop (Batch M).**
 
 ---
 
