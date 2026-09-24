@@ -840,7 +840,7 @@ ogit.branch.merge()     # <ref> <?asEmail> <?asName> <?dir:$OOSH_DIR> # merge <r
 
 ### Task 5: `merge` and `conflict` nouns
 
-- [ ] **Step 1: Test (RED)** — a fixture with a real conflict:
+- [x] **Step 1: Test (RED)** — a fixture with a real conflict:
 
 ```bash
 test.ogit.mergeConflict() {
@@ -864,7 +864,7 @@ test.case $level "T-OGIT-MERGE-CONFLICT: merge and conflict nouns" test.ogit.mer
 expect 0 "merge.base.get, conflict.list, conflict.resolve, merge.abort behave" "promote's conflict path"
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 ```bash
 ogit.merge.abort()     # <?dir:$OOSH_DIR> # abort the merge in progress in <dir> #
@@ -901,7 +901,7 @@ ogit.conflict.resolve.completion.file() { ogit.conflict.list; }
 ogit.conflict.resolve.completion.side() { echo theirs; echo ours; }
 ```
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): merge and conflict nouns`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): merge and conflict nouns`.
 
 ---
 
