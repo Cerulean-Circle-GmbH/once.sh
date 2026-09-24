@@ -450,7 +450,7 @@ git add ogit test/test.ogit && git commit -m "feat(ogit): scaffold the git wrapp
 **Files:**
 - Modify: `test/test.ogit` (above `### test.method`)
 
-- [ ] **Step 1: Add the fixture helper and a smoke case**
+- [x] **Step 1: Add the fixture helper and a smoke case**
 
 Insert after `source ogit` (the template sources the script under test; keep `TEST_CATEGORY=core`):
 
@@ -495,8 +495,8 @@ test.case $level "T-OGIT-FIXTURE: the fixture clone tracks its bare origin" test
 expect 0 "fixture: one commit, tracking origin/dev" "every ogit case builds on this shape"
 ```
 
-- [ ] **Step 2: Run** `./test.suite run ogit 1` → PASS (fixture only; the template's own "test start" case may print usage — that is expected).
-- [ ] **Step 3: Commit** `git add test/test.ogit && git commit -m "test(ogit): fixture helper — work clone tracking a bare origin"`
+- [x] **Step 2: Run** `./test.suite run ogit 1` → PASS (fixture only; the template's own "test start" case may print usage — that is expected).
+- [x] **Step 3: Commit** `git add test/test.ogit && git commit -m "test(ogit): fixture helper — work clone tracking a bare origin"`
 
 ---
 
