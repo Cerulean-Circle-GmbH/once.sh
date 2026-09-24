@@ -77,7 +77,7 @@ ogit-internal helpers (created in the Task that first needs them, via `oo method
 ### 0.4 Conformance fixes applied to the snippets below
 
 1. **Sweep → `ogit.caller.validate`** (Task 13) in the validator shape: comment-anchored `# ogit-exception:` on the line or the 5 lines above; `^[[:space:]]*#[[:space:]]*ogit-exception-file:`; exclusions `':!ogit' ':!docs' ':!test' ':!.claude' ':!old' ':!restore' ':!*.md' ':!*.json'`; no unanchored `echo |printf |\.log` filter (it let `x=$(git …); echo` through); the empty-`files.list` guard (test.suite:1261-1274) so dubious ownership cannot make it pass silently. The tests call it on `$OOSH_DIR` and on a planted fixture.
-2. **Completion**: no per-method wrapper that only forwards; the shared block `ogit.parameter.completion.{dir,targetDir,path,base,startPoint,commit,branch,ref,tag,remote}` (+ `to,a,b,range,paths,pathspecs,asEmail,treeRoot`) serves every method; only method-specific enumerations stay per method (`source`, `format`, `scope`, `side`, `tags`, `prune`, `pattern`, `key`, `file`); no `completion.message() { :; }` (message is exempt). Free params that cannot be completed (`limit`, `asName`) go into `EXEMPT_PARAMS` with a reason (Task M). `./test.suite run completion.audit 1` is in every ogit Task's Run step.
+2. **Completion** (revised 2026-09-24 after review — [oosh-architecture.md § Completion Function Rules](../../oosh-architecture.md#completion-function-rules), the odocker pattern): **parameter completion** `ogit.parameter.completion.*` holds only **domain types** shared by every method with that parameter name — exactly `dir targetDir path base branch ref tag remote paths pathspecs asEmail`; **method completion** `ogit.<method>.completion.<param>` holds a method's own parameters (`from`, `to`, `a`, `b`, `range`, `startPoint`, `commit`, `treeRoot`) and specialisations (`worktree.delete path` = linked worktrees); both call **private list getters** (`private.ogit.ref.list`, `private.ogit.worktree.paths.get`), never each other; method-specific enumerations stay per method (`source`, `format`, `scope`, `side`, `tags`, `prune`, `pattern`, `key`, `file`); docstrings carry no unpaired `'` (`c2 signature.validate ogit`, T-OGIT-SIGNATURES-PARSE); no `completion.message() { :; }` (message is exempt). Free params that cannot be completed (`limit`, `asName`) go into `EXEMPT_PARAMS` with a reason (Task M). `./test.suite run completion.audit 1` is in every ogit Task's Run step.
 3. `private.ogit.dir` subshell → inline `local dir="${n:-${OOSH_DIR:-.}}"` (this:905 idiom) in every body.
 4. `ogit.repo.share` → `private.ensure.sharedTree "$gitDir"` (chgrp dev + g+w) + the setgid `find` (the one piece with no helper — `sharedTree` deliberately sets no SGID) + `core.sharedRepository` via git.
 5. `private.ogit.folder.finish` → gate on `private.this.group.exists dev`, `ogit.repo.share`, no recursive chown; SUDO_USER trust via the preamble hop (0.1).
@@ -576,7 +576,7 @@ ogit.repo.root.get()     # <?dir:$PWD> # echo the toplevel of the repository con
  git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null
 }
 
-ogit.repo.share()     # <?dir:$OOSH_DIR> # make <dir>'s repository group-writable: dev group + g+w (private.ensure.sharedTree), setgid on every .git dir, core.sharedRepository group #
+ogit.repo.share()     # <?dir:$OOSH_DIR> # make the repository of <dir> group-writable: dev group + g+w (private.ensure.sharedTree), setgid on every .git dir, core.sharedRepository group #
 {
  private.ogit.require || return $(result)
  local dir="${1:-${OOSH_DIR:-.}}"
@@ -610,6 +610,8 @@ ogit.repo.files.list()     # <?dir:$OOSH_DIR> # echo the tracked files of <dir>,
  git -C "$dir" ls-files 2>/dev/null
 }
 ```
+
+> **Superseded 2026-09-24** (§ 0.4-2, commit `9404d94`): the block below was built as written, then split — the shared block now holds only the domain types `dir targetDir path base branch ref tag remote paths pathspecs asEmail` (`ref` calls `private.ogit.ref.list`); `a b to range commit startPoint treeRoot` became method completers next to their methods. Kept here as the Task 3 record.
 
 Also add the shared completers near the bottom (before `ogit.start`). c2 falls back to `ogit.parameter.completion.<param>` when no method-specific completer exists (ng/c2:483,518), and the completion audit accepts it — so **no method carries a wrapper that only forwards here**:
 
@@ -888,7 +890,7 @@ ogit.conflict.list()     # <?dir:$OOSH_DIR> # echo the conflicted paths of the m
  git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null
 }
 
-ogit.conflict.resolve()     # <file> <?side:theirs> <?dir:$OOSH_DIR> # resolve <file>'s conflict by taking <side> (theirs = the merged-in branch, ours = the current one) and stage it #
+ogit.conflict.resolve()     # <file> <?side:theirs> <?dir:$OOSH_DIR> # resolve the conflict of <file> by taking <side> (theirs = the merged-in branch, ours = the current one) and stage it #
 {
  private.ogit.require || return $(result)
  local side="${2:-theirs}"
@@ -971,7 +973,7 @@ ogit.remote.fetch()     # <?prune:no> <?dir:$OOSH_DIR> # fetch origin into <dir>
 }
 ogit.remote.fetch.completion.prune() { echo no; echo yes; }
 
-ogit.remote.pull()     # <?url> <?branch> <?dir:$OOSH_DIR> # pull into <dir>; with <url> <branch> pull that branch from that URL instead of the tracking remote (oo.update's https fallback) #
+ogit.remote.pull()     # <?url> <?branch> <?dir:$OOSH_DIR> # pull into <dir>; with <url> <branch> pull that branch from that URL instead of the tracking remote (the https fallback of oo.update) #
 {
  private.ogit.require || return $(result)
  local url="$1"
@@ -1320,7 +1322,7 @@ private.ogit.base.folders.list() # <base> # echo every repository folder directl
  done
 }
 
-ogit.config.get()     # <key> <?scope:any> <?dir:$OOSH_DIR> # echo <key>: scope any = the global git config, else <dir>'s repository config; scope local = <dir>'s repository config only #
+ogit.config.get()     # <key> <?scope:any> <?dir:$OOSH_DIR> # echo <key>: scope any = the global git config, else the repository config of <dir>; scope local = the repository config of <dir> only #
 {
  local key="$1"
  local scope="${2:-any}"
@@ -1333,7 +1335,7 @@ ogit.config.get()     # <key> <?scope:any> <?dir:$OOSH_DIR> # echo <key>: scope 
 ogit.config.get.completion.key()   { echo user.email; echo user.name; echo core.sharedRepository; }
 ogit.config.get.completion.scope() { echo any; echo local; }
 
-ogit.config.set()     # <key> <value> <?dir:$OOSH_DIR> # set <key> in <dir>'s repository config #
+ogit.config.set()     # <key> <value> <?dir:$OOSH_DIR> # set <key> in the repository config of <dir> #
 {
  private.ogit.require || return $(result)
  local dir="${3:-${OOSH_DIR:-.}}"
@@ -1342,7 +1344,7 @@ ogit.config.set()     # <key> <value> <?dir:$OOSH_DIR> # set <key> in <dir>'s re
 }
 ogit.config.set.completion.key() { echo user.email; echo user.name; echo core.sharedRepository; }
 
-ogit.config.email.get()     # <?dir:$OOSH_DIR> # echo the committer email: global user.email, else <dir>'s #
+ogit.config.email.get()     # <?dir:$OOSH_DIR> # echo the committer email: global user.email, else the one of the repository of <dir> #
 {
  ogit.config.get user.email any "$1"
 }
@@ -1459,7 +1461,7 @@ expect 0 "worktree.add/list/find/delete/prune, binary.check, raw behave" "worktr
 - [x] **Step 2: Implement**
 
 ```bash
-private.ogit.worktree.paths.get() # <?dir:$OOSH_DIR> # echo the folder of every worktree of <dir>'s repository (the main one first), one per line; a path with spaces stays whole #
+private.ogit.worktree.paths.get()     # <?dir:$OOSH_DIR> # echo the folder of every worktree of the repository of <dir> (the main one first), one per line; a path with spaces stays whole #
 {
  # The one porcelain parse. `awk '{print $2}'` cut a path at its first space.
  local dir="${1:-${OOSH_DIR:-.}}"
@@ -1478,13 +1480,13 @@ ogit.worktree.add()     # <branch> <targetDir> <startPoint> <?dir:$OOSH_DIR> # a
  return $(result)
 }
 
-ogit.worktree.list()     # <?dir:$OOSH_DIR> # git worktree list --porcelain of <dir>'s repository #
+ogit.worktree.list()     # <?dir:$OOSH_DIR> # git worktree list --porcelain of the repository of <dir> #
 {
  local dir="${1:-${OOSH_DIR:-.}}"
  git -C "$dir" worktree list --porcelain 2>/dev/null
 }
 
-ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has <branch> checked out: a linked worktree of <dir>'s repository (Phase 2 adds the sibling clone <base>/<branch>); empty when none #
+ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has <branch> checked out: a linked worktree of the repository of <dir> (Phase 2 adds the sibling clone <base>/<branch>); empty when none #
 {
  local wt
  while IFS= read -r wt; do
@@ -1494,7 +1496,7 @@ ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has 
  return 0
 }
 
-ogit.worktree.delete()     # <path> <?dir:$OOSH_DIR> # unregister and delete the linked worktree at <path> from <dir>'s repository (refuses a dirty one — gate first) #
+ogit.worktree.delete()     # <path> <?dir:$OOSH_DIR> # unregister and delete the linked worktree at <path> from the repository of <dir> (refuses a dirty one — gate first) #
 {
  private.ogit.require || return $(result)
  local dir="${2:-${OOSH_DIR:-.}}"
@@ -1584,7 +1586,7 @@ printf '%s\n' '<?treeRoot:$OOSH_DIR>' \
   'T-OGIT-ONLY-CALLER: no raw git invocation outside ogit' '' '' \
   | LOG_LEVEL=1 ./oo method.new ogit.caller.validate
 ```
-Delete the generated `ogit.caller.validate.completion.treeRoot` stub — `ogit.parameter.completion.treeRoot` (Task 3) serves it.
+Replace the generated `ogit.caller.validate.completion.treeRoot` stub with `{ echo "$OOSH_DIR"; }` — `treeRoot` is this method's own parameter, so it is METHOD completion (the shared `treeRoot` completer was removed 2026-09-24, § 0.4-2).
 
 - [ ] **Step 2: Tests (RED)** — replace the stub case in `test/test.ogit`:
 
@@ -1919,7 +1921,7 @@ expect 0 "layout.status reports shape, dirty, ahead, behind per folder; rc 1 on 
 - [ ] **Step 3: Implement**
 
 ```bash
-private.ogit.gitdir() # <?dir:$OOSH_DIR> # echo the absolute .git directory of <dir>'s repository #
+private.ogit.gitdir()     # <?dir:$OOSH_DIR> # echo the absolute .git directory of the repository of <dir> #
 {
  local dir="${1:-${OOSH_DIR:-.}}"
  git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null
@@ -2227,7 +2229,7 @@ ogit.worktree.restore()     # <?base:$(oo mode.base.get)> # turn every sibling c
 Also extend `ogit.worktree.find` (Task 11) with the clone case, and test it in `T-OGIT-WORKTREE` with a `test.ogit.base … clone` fixture:
 
 ```bash
-ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has <branch> checked out: a linked worktree of <dir>'s repository, else the sibling clone <base>/<branch> when it is on <branch>; empty when none #
+ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has <branch> checked out: a linked worktree of the repository of <dir>, else the sibling clone <base>/<branch> when it is on <branch>; empty when none #
 {
  local dir="${2:-${OOSH_DIR:-.}}"
  local wt
