@@ -2254,9 +2254,9 @@ ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has 
 
 **Files:** `oo` (state 31 body at the sites migrated in Task 15; `private.oo.shared.tree.from.local`), `test/test.oo` (T-SHARED-TREE-*)
 
-- [ ] **Step 1: Tests (RED)** — rewrite the four `T-SHARED-TREE-*` cases (test.oo:2192-2416) to assert the clone shape: replace every `[ -f "$fixture/dev/.git" ] && grep -q gitdir: …` with `[ -d "$fixture/dev/.git" ]` and add `[ "$(git -C "$fixture/dev" remote get-url origin)" = "$(git -C "$fixture/main" remote get-url origin)" ]`. Run `./test.suite run oo 1` → those four FAIL.
+- [x] **Step 1: Tests (RED)** — rewrite the four `T-SHARED-TREE-*` cases (test.oo:2192-2416) to assert the clone shape: replace every `[ -f "$fixture/dev/.git" ] && grep -q gitdir: …` with `[ -d "$fixture/dev/.git" ]` and add `[ "$(git -C "$fixture/dev" remote get-url origin)" = "$(git -C "$fixture/main" remote get-url origin)" ]`. Run `./test.suite run oo 1` → those four FAIL.
 
-- [ ] **Step 2: `private.oo.shared.tree.from.local`** — replace step 3 (the `worktree add` pair) with:
+- [x] **Step 2: `private.oo.shared.tree.from.local`** — replace step 3 (the `worktree add` pair) with:
 
 ```bash
   # 3. The active branch as an INDEPENDENT CLONE beside main/ (clone layout,
@@ -2285,7 +2285,7 @@ ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has 
 ```
 (The function keeps its `return 1` / `error.log` contract — its callers, state 31 and `oo mode.setup`, test `$?`.)
 
-- [ ] **Step 3: State 31** — the install lives in `private.check.root.shared.dev.folder.created` (state 31) and nowhere else (rule 7). Replace the "Creating worktree" branch (oo:2049-2071 at 8c46828, migrated in Task 15) — the old `cd main` … `cd ..` go with it — with:
+- [x] **Step 3: State 31** — the install lives in `private.check.root.shared.dev.folder.created` (state 31) and nowhere else (rule 7). Replace the "Creating worktree" branch (oo:2049-2071 at 8c46828, migrated in Task 15) — the old `cd main` … `cd ..` go with it — with:
 
 ```bash
       else
@@ -2333,7 +2333,9 @@ and the permission block (oo:2144-2171) with:
 ```
 (`private.ogit.base.folders.list` is the Task 10 loop — symlinks, dot-dirs and non-repositories are skipped. The pinned checks further down at oo:2300-2340, labelled `[5/5: dev.repo.cloned]`, stay as they are; only their `check git clone/worktree-add logs` hint becomes `check the ogit repo.clone log above`.)
 
-- [ ] **Step 4: Run** `./test.suite run oo 1` and `./test.suite run install 1` (T-STATE-31-CHOWN-NOT-RECURSIVE must still pass) → PASS. Commit `feat(oo): install state 31 and shared.tree.from.local produce the clone layout with per-folder permissions and a setgid base`.
+- [x] **Step 4: Run** `./test.suite run oo 1` and `./test.suite run install 1` (T-STATE-31-CHOWN-NOT-RECURSIVE must still pass) → PASS. Commit `feat(oo): install state 31 and shared.tree.from.local produce the clone layout with per-folder permissions and a setgid base`.
+
+  *Done 2026-09-24.* The branch-clone decision (absent → clone; clone on the branch → kept; old-install worktree → left alone, rc 0, pointing at `sudo ogit worktree.remove`; anything else → refused) lives in the new `private.oo.branch.clone.ensure <url> <branch> <targetDir>`, used by state 31 AND by `shared.tree.from.local`, so it is fixture-tested (T-BRANCH-CLONE-ENSURE-*) — state 31 itself is pinned structurally (T-STATE31-CLONE-LAYOUT). T-SETUP-4's worktree assertion moved to the clone shape here (not in Task 23): `oo mode.setup` builds through `shared.tree.from.local`. test.oo 146 → 151/151 (RED 141/151), test.install 40/40, test.ogit 23/23.
 
 ---
 

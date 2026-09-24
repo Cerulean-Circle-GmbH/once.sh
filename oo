@@ -907,7 +907,7 @@ private.oo.install.shim() {
   echo "  Shim:    $shimDst (oo function loaded — mode/use update current shell)"
 }
 
-oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main/ + <branch>/ worktree layout and point ~/oosh at it
+oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main/ + <branch>/ clone layout and point ~/oosh at it
 {
   # It builds ONE layout, and it is not this function's own. The layout half is
   # private.oo.shared.tree.from.local — validated, idempotent, git-fallback'd,
@@ -956,8 +956,8 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main
   #    branch first would turn a no-op into a refusal.
   #    The old guard accepted ANY subdirectory holding a .git, so a
   #    half-converted tree read as done. The canonical shape is main/ with a
-  #    real .git DIRECTORY — main/ is the repository, the branch directories
-  #    are linked worktrees whose .git is a pointer file.
+  #    real .git DIRECTORY — main/ is a repository, and so is every branch
+  #    directory beside it (the clone layout; older installs: linked worktrees).
   if [ -d "$base/main/.git" ]; then
     echo "Worktree structure already exists at: $base"
     create.result 0 "already set up at $base" "$1"
@@ -1615,7 +1615,7 @@ private.check.root.rights() {
 }
 
 
-private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:no> # produce canonical `main/ + <branchName>/` worktree layout in $(pwd) from a local clone. Idempotent — skips if main/ already exists. With <consumeSource> = yes the source is removed once main/ is verified, which is what `oo mode.setup` needs when the clone already sits where the branch worktree has to go. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 2/4 then succeeds and `oo mode <branch>` works).
+private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:no> # produce the canonical `main/ + <branchName>/` clone layout in $(pwd) from a local clone: <branchName>/ is an independent clone of main/ (origin re-pointed at main/'s origin, group-shared). Idempotent — skips if main/ already exists. With <consumeSource> = yes the source is removed once main/ is verified, which is what `oo mode.setup` needs when the clone already sits where the branch clone has to go. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 4 then succeeds and `oo mode <branch>` works).
 {
   private.this.script.load ogit ogit.branch.get
   local src="$1"
@@ -1674,21 +1674,38 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:n
     important.log "private.oo.shared.tree.from.local: source consumed: $src"
   fi
 
-  # 3. Add the active branch as a worktree of main/. Skip when the active
-  #    branch IS main — main/ already serves that role.
+  # 3. The active branch as an INDEPENDENT CLONE beside main/ (clone layout,
+  #    2026-09-23 design). Skip when the active branch IS main — main/ already
+  #    serves that role. Cloned from main/ (offline-safe), so main/ must hold
+  #    a LOCAL <branch>: a clone from a local path sees only its local heads.
+  #    When only origin/<branch> exists (the source was a clone of another
+  #    branch), create it from there first — the fallback the old
+  #    `worktree add … "$branch" || … "origin/$branch"` pair had — and put
+  #    main/ back on main. Then origin is re-pointed at main/'s origin so the
+  #    clone pulls from GitHub like every folder, and the clone is shared.
   if [ "$branch" != "main" ]; then
-    # "<here>/$branch" is what `git -C main … ../$branch` resolved to (git
-    # works from main/'s physical path); spelled absolute because
-    # ogit.worktree.add re-checks the folder from HERE, not from main/.
-    local here
+    local here originUrl
     here=$(private.this.path.canonical "$PWD")
-    # ogit-exception: printed text (the error.log below), not an invocation
-    ogit.worktree.add "$branch" "$here/$branch" "$branch" main >/dev/null \
-      || ogit.worktree.add "$branch" "$here/$branch" "origin/$branch" main >/dev/null \
-      || { error.log "private.oo.shared.tree.from.local: git worktree add ../$branch failed in main/"; return 1; }
+    if ! ogit.branch.check "refs/heads/$branch" main; then
+      ogit.branch.reset "$branch" "origin/$branch" main >/dev/null \
+        || { error.log "private.oo.shared.tree.from.local: neither $branch nor origin/$branch exists in main/ — $RESULT"; return 1; }
+      ogit.branch.checkout main main >/dev/null \
+        || warn.log "private.oo.shared.tree.from.local: could not put main/ back on main (no local main — see step 2)"
+    fi
+    originUrl=$(ogit.remote.url.get origin main)
+    private.oo.branch.clone.ensure "$here/main" "$branch" "$here/$branch" >/dev/null \
+      || { error.log "private.oo.shared.tree.from.local: clone of $branch from main/ failed — $RESULT"; return 1; }
+    if [ -n "$originUrl" ]; then
+      ogit.remote.url.set "$originUrl" origin "$here/$branch" >/dev/null \
+        || { error.log "private.oo.shared.tree.from.local: $RESULT"; return 1; }
+    fi
+    # Not fatal: state 31 re-shares every folder right after (fail-loud there),
+    # and oo mode.setup's user owns the clone it just made.
+    ogit.repo.share "$here/$branch" >/dev/null \
+      || warn.log "private.oo.shared.tree.from.local: $RESULT"
   fi
 
-  important.log "private.oo.shared.tree.from.local: canonical layout produced in $(pwd) (main/ + ${branch}/)"
+  important.log "private.oo.shared.tree.from.local: canonical clone layout produced in $(pwd) (main/ + ${branch}/)"
   return 0
 }
 
@@ -2011,7 +2028,7 @@ EOF
     if ! [ "$RETURN_VALUE" = "0" ]; then
       warn.log "SSH clone failed — falling back to local copy from \$HOME/oosh"
       if [ -d "$HOME/oosh" ]; then
-        # Produce the canonical layout (main/ + ${OOSH_BRANCH}/ worktree) from
+        # Produce the canonical layout (main/ + ${OOSH_BRANCH}/ clone) from
         # the local clone at \$HOME/oosh, mirroring what a successful network
         # clone above would have produced. Without this, the layout used to
         # be just `${OOSH_BRANCH}/` with no `main/` sibling — and
@@ -2033,31 +2050,24 @@ EOF
       elif [ "$OOSH_BRANCH" = "main" ]; then
         important.log "<oo> Branch is main — already cloned"
       else
-        important.log "<oo> Creating worktree for branch ${OOSH_BRANCH}"
-        cd main
-        ogit.remote.fetch no "$PWD"
-        RETURN_VALUE=$?
-        if ! [ "$RETURN_VALUE" = "0" ]; then
-          # ogit-exception: printed text, not an invocation
-          error.log "state 31: 'git fetch origin' failed (rc=$RETURN_VALUE) in $(pwd)"
-          return $RETURN_VALUE
-        fi
-        # Defence in depth: if an older (unpatched) caller sent a polluted
-        # $OOSH_BRANCH like "heads/origin/dev", strip it here before we
-        # concatenate "origin/" below — otherwise git sees
-        # "origin/heads/origin/dev" and fails with "invalid reference".
+        # ─── state 31 [5/5: dev.repo.cloned] — the branch as its OWN clone
+        # beside main/ (clone layout, 2026-09-23 design). Absolute target, no
+        # cd. Defence in depth: an older (unpatched) caller may send a
+        # polluted $OOSH_BRANCH like "heads/origin/dev" — strip it before it
+        # names a branch and a folder.
         OOSH_BRANCH="${OOSH_BRANCH#refs/heads/}"
         OOSH_BRANCH="${OOSH_BRANCH#refs/remotes/origin/}"
         OOSH_BRANCH="${OOSH_BRANCH#heads/origin/}"
         OOSH_BRANCH="${OOSH_BRANCH#origin/}"
-        ogit.worktree.add "${OOSH_BRANCH}" "../${OOSH_BRANCH}" "origin/${OOSH_BRANCH}" "$PWD"
-        RETURN_VALUE=$?
-        if ! [ "$RETURN_VALUE" = "0" ]; then
-          # ogit-exception: printed text, not an invocation
-          error.log "state 31: 'git worktree add -B ${OOSH_BRANCH} ../${OOSH_BRANCH} origin/${OOSH_BRANCH}' failed (rc=$RETURN_VALUE) in $(pwd)"
-          return $RETURN_VALUE
+        important.log "state 31 [5/5: dev.repo.cloned]: cloning ${OOSH_BRANCH} beside main/ in $onceShBase"
+        # Re-runs: an existing clone of the branch is kept, an old-install
+        # linked worktree is left alone (sudo ogit worktree.remove converts
+        # it), anything else refuses — see private.oo.branch.clone.ensure.
+        if ! private.oo.branch.clone.ensure git@github.com:Cerulean-Circle-GmbH/once.sh.git "${OOSH_BRANCH}" "$onceShBase/${OOSH_BRANCH}"; then
+          error.log "state 31 [5/5: dev.repo.cloned]: clone of ${OOSH_BRANCH} into $onceShBase failed — $RESULT"
+          create.result 1 "state 31 step 5/5 failed: clone of ${OOSH_BRANCH} failed"
+          return $(result)
         fi
-        cd ..
       fi
     fi
 
@@ -2124,36 +2134,37 @@ EOF
       "$onceShBase" \
       "${OOSH_BRANCH}"
 
-    # Enable git's shared-repository mode on both worktrees so subsequent
-    # git operations (root's `git pull` on re-install at init/oosh:271,
-    # any dev-group user running `oo update`) create files with group rw
-    # and honour the setgid bit on .git directories. Without this, root's
-    # git ops write FETCH_HEAD/ORIG_HEAD/objects as root:root 644 and
-    # lock out dev-group users from further updates.
-    for _wt in "$onceShBase/main" "$onceShBase/${OOSH_BRANCH}"; do
-      if [ -e "$_wt/.git" ]; then
-        ogit.config.set core.sharedRepository group "$_wt" >/dev/null || true
+    # Each folder is its own repository now (clone layout, 2026-09-23 design):
+    # shared mode, setgid, g+w and the caller's trust PER FOLDER (ogit
+    # repo.share / safeDirectory.add), not on main/.git only. Shared mode is
+    # what keeps root's git ops (`git pull` on re-install, init/oosh) from
+    # writing FETCH_HEAD/ORIG_HEAD/objects as root:root 644 and locking the
+    # dev group out. safe.directory: the tree is developking:dev, so without
+    # an entry per folder root hits dubious-ownership on `oo mode <folder>`.
+    # The BASE gets group dev + setgid (a live host had root:dev WITHOUT
+    # setgid), so a folder added later by oo checkout / oo mode inherits the
+    # group. No recursive chown (T-STATE-31-CHOWN-NOT-RECURSIVE). A folder
+    # left as an old-install worktree shares main/.git, which main/'s own
+    # pass covers. Re-runs are idempotent.
+    if private.this.group.exists dev; then
+      if ! { chgrp dev "$onceShBase" && chmod g+ws "$onceShBase"; }; then
+        error.log "state 31 [5/5: dev.repo.cloned]: cannot set group dev + setgid on $onceShBase"
+        create.result 1 "state 31 step 5/5 failed: base $onceShBase is not group dev + setgid"
+        return $(result)
       fi
-    done
-    # Propagate setgid to all .git dirs so new files inherit group=dev
-    find "$onceShBase/main/.git" -type d -exec chmod g+s {} + 2>/dev/null
-    chmod -R g+w "$onceShBase/main/.git" 2>/dev/null
-    # Resolve canonical path — macOS case-insensitive FS needs exact case for safe.directory
-    local resolvedOoshDir
-    resolvedOoshDir=$(private.this.path.case.get "$onceShBase/${OOSH_BRANCH}")
-    private.oo.safeDirectory.add "$resolvedOoshDir" >/dev/null
-    # Also add safe.directory for the `main` worktree (created in
-    # step 2 above). Without this, root running `oo mode main` or any
-    # git op against /Users/Shared/.../Once.sh/main hits dubious-
-    # ownership rejection (shared tree is owned by developking:dev).
-    # Future worktrees added via `oo checkout <branch>` would need
-    # their own safe.directory entry — that's a separate concern at
-    # the checkout site. Uses private.oo.safeDirectory.add for
-    # idempotent dedup — earlier versions called `git config --add`
-    # directly and accumulated duplicate entries on re-install.
-    local resolvedMainDir
-    resolvedMainDir=$(private.this.path.case.get "$onceShBase/main")
-    private.oo.safeDirectory.add "$resolvedMainDir" >/dev/null
+    fi
+    local _wt
+    while IFS= read -r _wt; do
+      if ! ogit.repo.share "$_wt" >/dev/null; then
+        error.log "state 31 [5/5: dev.repo.cloned]: ogit repo.share $_wt failed — $RESULT"
+        create.result 1 "state 31 step 5/5 failed: $_wt is not group-shared"
+        return $(result)
+      fi
+      # macOS: safe.directory is a string match on a case-insensitive FS —
+      # the entry must carry the file system's own letter case.
+      ogit.safeDirectory.add "$(private.this.path.case.get "$_wt")" >/dev/null \
+        || warn.log "state 31 [5/5: dev.repo.cloned]: could not trust $_wt — $RESULT"
+    done < <(private.ogit.base.folders.list "$onceShBase")
 
     # path-exception: install-time, and already marked for removal below.
     # TODO: This should be removed to only use $HOME/oosh in the PATH
@@ -2283,13 +2294,12 @@ EOF
     # macOS landed in the wrong directory (no /root on macOS — root's
     # home is /var/root). Removed.
     # ─── state 31 [5/5: dev.repo.cloned] ─────────────────────────────────
-    # Post-body verification: without this, a silent failure in git clone /
-    # worktree add leaves the state machine thinking state 31 succeeded while
+    # Post-body verification: without this, a silent failure in a clone
+    # leaves the state machine thinking state 31 succeeded while
     # $sharedOosh never materialized, causing downstream user.oosh.install to
     # time out polling for a dir that's never going to appear.
     if [ ! -d "$onceShBase/${OOSH_BRANCH}" ]; then
-      # ogit-exception: printed text, not an invocation
-      error.log "state 31 [5/5: dev.repo.cloned]: $onceShBase/${OOSH_BRANCH} missing — check git clone/worktree-add logs above"
+      error.log "state 31 [5/5: dev.repo.cloned]: $onceShBase/${OOSH_BRANCH} missing — check the ogit repo.clone log above"
       create.result 1 "state 31 step 5/5 failed: dev folder not created at $onceShBase/${OOSH_BRANCH}"
       return $(result)
     fi
@@ -3199,6 +3209,45 @@ oo.test.platform.new.completion.aspect() {
   echo oosh
   echo layout
 }
+private.oo.branch.clone.ensure()     # <url> <branch> <targetDir> # ensure <targetDir> is an independent clone of <branch>: clone <url> when it is absent or empty; an existing clone on <branch> is kept; a linked worktree from an older install is left alone (convert with sudo ogit worktree.remove); anything else refuses #
+{
+ private.this.script.load ogit ogit.branch.get
+ local url="$1" branch="$2" target="$3"
+ if [ -z "$url" ] || [ -z "$branch" ] || [ -z "$target" ]; then
+   create.result 1 "private.oo.branch.clone.ensure requires <url> <branch> <targetDir>"; error.log "$RESULT"; return $(result)
+ fi
+ # Re-runs of install state 31 arrive here with the folder already present.
+ # ogit repo.clone refuses a non-empty target — right for it, wrong as the
+ # answer to "is the layout there?". Decide here, and never delete: a folder
+ # this call did not make is somebody's work.
+ if [ -e "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+   local have
+   have=$(ogit.branch.get "$target")
+   case "$(private.ogit.folder.shape "$target")" in
+     clone)
+       if [ "$have" = "$branch" ]; then
+         create.result 0 "kept: $target is already a clone of $branch"
+       else
+         create.result 1 "$target is a clone of '${have:-detached}', not $branch — refusing to touch it"; error.log "$RESULT"
+       fi
+       ;;
+     worktree)
+       # An install from before the clone layout. Converting it is gated work
+       # (clean + pushed, ignored files carried) that ogit owns — not the install.
+       create.result 0 "left alone: $target is a linked worktree from an older install — convert it with: sudo ogit worktree.remove"
+       warn.log "$RESULT"
+       ;;
+     *)
+       create.result 1 "$target exists, is not empty and is not a repository — refusing to clone over it"; error.log "$RESULT"
+       ;;
+   esac
+   return $(result)
+ fi
+ ogit.repo.clone "$url" "$branch" "$target"
+ return $(result)
+}
+
+
 ### new.method
 
 oo.usage()

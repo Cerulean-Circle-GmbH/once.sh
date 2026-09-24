@@ -1432,8 +1432,8 @@ test.oo.setup.producesDetectableLayout() {
     create.result 1 "mode.setup returned $rc"
   elif [ ! -d "$BASE_DIR/main/.git" ]; then
     create.result 1 "main/ is not a repository"
-  elif [ ! -f "$BASE_DIR/dev/.git" ] || ! grep -q '^gitdir: ' "$BASE_DIR/dev/.git"; then
-    create.result 1 "dev/ is not a linked worktree"
+  elif [ ! -d "$BASE_DIR/dev/.git" ]; then
+    create.result 1 "dev/ is not an independent clone (.git is not a directory)"
   elif [ -e "$CLONE_DIR" ]; then
     create.result 1 "the original clone is still there"
   elif [ "$(readlink "$BASE_DIR/oosh")" != "$BASE_DIR/dev" ]; then
@@ -2139,10 +2139,37 @@ else
 fi
 
 # ============================================================================
-# T-SHARED-TREE-FROM-LOCAL-CREATES-MAIN-AND-WORKTREE: helper produces
-# canonical Once.sh/{main, <branch>} layout from a local git clone, with
-# <branch>/ as a worktree of main/. Reproduces state-31's fallback path.
+# T-SHARED-TREE-FROM-LOCAL-CREATES-MAIN-AND-CLONE: helper produces the
+# canonical Once.sh/{main, <branch>} CLONE layout (2026-09-23 design) from a
+# local git clone: <branch>/ is an independent clone (.git a directory) whose
+# origin is main/'s origin, in group-shared mode. Reproduces state-31's
+# fallback path.
 # ============================================================================
+# The fixture origin URL is never contacted: every clone here is from a local
+# path, and the helper only COPIES main/'s origin URL onto the new clone.
+TEST_OO_STREE_ORIGIN="git@github.com:example/once.sh.git"
+
+private.test.oo.stree.cloneShape() { # <fixtureTarget> <branch> # RESULT = "clone" when <target>/<branch> has the clone shape, else what is wrong
+  local t="$1" b="$2" mainUrl devUrl shared
+  mainUrl=$(git -C "$t/main" remote get-url origin 2>/dev/null)
+  devUrl=$(git -C "$t/$b" remote get-url origin 2>/dev/null)
+  shared=$(git -C "$t/$b" config --get core.sharedRepository 2>/dev/null)
+  if [ ! -d "$t/main/.git" ]; then
+    create.result 1 "main/ is not a repository"
+  elif [ ! -d "$t/$b/.git" ]; then
+    create.result 1 "$b/.git is not a directory — not an independent clone ($( [ -f "$t/$b/.git" ] && echo 'a worktree file' || echo missing))"
+  elif [ -z "$mainUrl" ] || [ "$devUrl" != "$mainUrl" ]; then
+    create.result 1 "origin of $b/ is '$devUrl', main/'s is '$mainUrl'"
+  elif [ "$(git -C "$t/$b" rev-parse --abbrev-ref HEAD 2>/dev/null)" != "$b" ]; then
+    create.result 1 "$b/ is not on branch $b"
+  elif [ "$shared" != "group" ]; then
+    create.result 1 "core.sharedRepository of $b/ is '$shared', not group"
+  else
+    create.result 0 "clone"
+  fi
+  return $(result)
+}
+
 test.oo.sharedTreeFromLocalCreatesLayout() {
   local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.stree.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
   mkdir -p "$fixture/source" "$fixture/target"
@@ -2152,6 +2179,7 @@ test.oo.sharedTreeFromLocalCreatesLayout() {
     git init --initial-branch=main -q
     git config user.email "test@test.local"
     git config user.name "test"
+    git remote add origin "$TEST_OO_STREE_ORIGIN"
     echo "seed" > README.md
     git add README.md
     git commit -q -m "seed"
@@ -2163,25 +2191,63 @@ test.oo.sharedTreeFromLocalCreatesLayout() {
   ( cd "$fixture/target" && private.oo.shared.tree.from.local "$fixture/source" dev ) >/dev/null 2>&1
   local rc=$?
 
-  # Assert main/ exists with real .git dir; dev/ exists; dev/'s .git is a
-  # gitdir-pointer file (worktree marker), not a real .git dir.
-  if [ "$rc" -eq 0 ] \
-     && [ -d "$fixture/target/main/.git" ] \
-     && [ -d "$fixture/target/dev" ] \
-     && [ -f "$fixture/target/dev/.git" ] \
-     && grep -q "^gitdir: " "$fixture/target/dev/.git"; then
-    create.result 0 "main/ + dev/ worktree layout produced"
-  else
-    create.result 1 "rc=$rc; main=$([ -d $fixture/target/main/.git ] && echo y || echo n) dev=$([ -d $fixture/target/dev ] && echo y || echo n) dev.git=$(file $fixture/target/dev/.git 2>/dev/null)"
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned $rc"
+  elif private.test.oo.stree.cloneShape "$fixture/target" dev; then
+    create.result 0 "main/ + dev/ clone layout produced"
   fi
   rm -rf "$fixture" 2>/dev/null
+  return $(result)
 }
-test.case - "T-SHARED-TREE-FROM-LOCAL-CREATES-MAIN-AND-WORKTREE: helper produces main/ + dev/ worktree layout" \
+test.case - "T-SHARED-TREE-FROM-LOCAL-CREATES-MAIN-AND-CLONE: helper produces main/ + dev/ clone layout" \
   test.oo.sharedTreeFromLocalCreatesLayout
-expect 0 "main/ + dev/ worktree layout produced" "private.oo.shared.tree.from.local creates canonical worktree layout"
+expect 0 "main/ + dev/ clone layout produced" "private.oo.shared.tree.from.local creates the canonical clone layout: dev/.git a directory, origin = main/'s origin, core.sharedRepository=group"
+
+# T-SHARED-TREE-FROM-LOCAL-ORIGIN-FALLBACK: the source is a clone of ANOTHER
+# branch, so main/ holds only origin/<branch>, no local <branch>. A clone from
+# a local path sees only main/'s local heads — the helper must create the local
+# <branch> from origin/<branch> first (the fallback the old worktree-add pair
+# had), and leave main/ on main.
+test.oo.sharedTreeFromLocalOriginFallback() {
+  local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.stree.fb.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  mkdir -p "$fixture/source" "$fixture/target"
+  (
+    cd "$fixture/source"
+    git init --initial-branch=main -q
+    git config user.email "test@test.local"
+    git config user.name "test"
+    git remote add origin "$TEST_OO_STREE_ORIGIN"
+    echo "seed" > README.md && git add . && git commit -q -m "seed"
+    git checkout -q -b dev
+    echo "on dev" > dev.txt && git add . && git commit -q -m "dev work"
+    git update-ref refs/remotes/origin/dev dev
+    git checkout -q main
+    git branch -q -D dev
+  ) >/dev/null 2>&1
+
+  ( cd "$fixture/target" && private.oo.shared.tree.from.local "$fixture/source" dev ) >/dev/null 2>&1
+  local rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "helper returned $rc"
+  elif ! private.test.oo.stree.cloneShape "$fixture/target" dev; then
+    :
+  elif [ ! -f "$fixture/target/dev/dev.txt" ]; then
+    create.result 1 "dev/ does not hold origin/dev's commit"
+  elif [ "$(git -C "$fixture/target/main" rev-parse --abbrev-ref HEAD 2>/dev/null)" != "main" ]; then
+    create.result 1 "main/ was left on $(git -C "$fixture/target/main" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  else
+    create.result 0 "cloned from origin/dev"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+  return $(result)
+}
+test.case $level "T-SHARED-TREE-FROM-LOCAL-ORIGIN-FALLBACK: main/ without a local dev still yields the dev clone" \
+  test.oo.sharedTreeFromLocalOriginFallback
+expect 0 "cloned from origin/dev" "the origin/<branch> fallback survives the move from worktree add to clone"
 
 # T-SHARED-TREE-FROM-LOCAL-IDEMPOTENT: second invocation must be a no-op
-# (fast-path returns when main/ already exists).
+# (fast-path returns when main/ already exists) and leaves the clone as it was.
 test.oo.sharedTreeFromLocalIdempotent() {
   local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.stree.idem.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
   mkdir -p "$fixture/source" "$fixture/target"
@@ -2190,6 +2256,7 @@ test.oo.sharedTreeFromLocalIdempotent() {
     git init --initial-branch=main -q
     git config user.email "test@test.local"
     git config user.name "test"
+    git remote add origin "$TEST_OO_STREE_ORIGIN"
     echo "seed" > README.md && git add . && git commit -q -m "seed"
     git branch dev && git checkout -q dev
   ) >/dev/null 2>&1
@@ -2203,16 +2270,19 @@ test.oo.sharedTreeFromLocalIdempotent() {
   local hash2
   hash2=$(find "$fixture/target" -printf '%p %m\n' 2>/dev/null | sort | sha256sum)
 
-  if [ "$rc2" -eq 0 ] && [ "$hash1" = "$hash2" ]; then
+  if [ "$rc2" -ne 0 ]; then
+    create.result 1 "second call returned $rc2"
+  elif [ "$hash1" != "$hash2" ]; then
+    create.result 1 "hash mismatch: '$hash1' vs '$hash2'"
+  elif private.test.oo.stree.cloneShape "$fixture/target" dev; then
     create.result 0 "second call no-op"
-  else
-    create.result 1 "rc2=$rc2; hash mismatch: '$hash1' vs '$hash2'"
   fi
   rm -rf "$fixture" 2>/dev/null
+  return $(result)
 }
-test.case - "T-SHARED-TREE-FROM-LOCAL-IDEMPOTENT: second invocation is a no-op" \
+test.case - "T-SHARED-TREE-FROM-LOCAL-IDEMPOTENT: second invocation is a no-op and keeps the clone" \
   test.oo.sharedTreeFromLocalIdempotent
-expect 0 "second call no-op" "private.oo.shared.tree.from.local is idempotent (fast-path on main/ presence)"
+expect 0 "second call no-op" "private.oo.shared.tree.from.local is idempotent (fast-path on main/ presence), rc 0, the clone untouched"
 
 # T-SHARED-TREE-FROM-LOCAL-BRANCH-MAIN: when branch arg IS main, only main/
 # is created (no worktree-add for ../main).
@@ -2248,8 +2318,9 @@ expect 0 "only main/ created" "private.oo.shared.tree.from.local skips worktree-
 # T-SHARED-TREE-CONSUME-*: the <?consumeSource:no> parameter
 # ============================================================================
 # `oo mode.setup` needs the source removed BETWEEN the copy and the
-# worktree-add: when the plain clone already sits at <base>/<branch>, the
-# `git worktree add ../<branch>` collides with it. Doing it inside the helper
+# branch clone: when the plain clone already sits at <base>/<branch>, the
+# clone into <base>/<branch> collides with it (ogit repo.clone refuses a
+# non-empty target). Doing it inside the helper
 # keeps ONE layout builder and puts the destructive step next to the rc checks
 # that already guard the copy. Default `no`, which is what pins install state
 # 31's call.
@@ -2260,6 +2331,7 @@ private.test.oo.consume.fixture() { # <fixtureRoot> # a source clone on dev + an
     git init --initial-branch=main -q
     git config user.email "test@test.local"
     git config user.name "test"
+    git remote add origin "$TEST_OO_STREE_ORIGIN"
     echo seed > README.md
     git add README.md
     git commit -q -m seed
@@ -2278,9 +2350,7 @@ test.oo.sharedTreeConsumeDefaultKeepsSource() {
     create.result 1 "helper returned $rc"
   elif [ ! -d "$fixture/source" ]; then
     create.result 1 "the default removed the source — state 31 would lose ~/oosh"
-  elif [ ! -d "$fixture/target/main/.git" ] || [ ! -f "$fixture/target/dev/.git" ]; then
-    create.result 1 "layout not produced"
-  else
+  elif private.test.oo.stree.cloneShape "$fixture/target" dev; then
     create.result 0 "source kept"
   fi
   rm -rf "$fixture" 2>/dev/null
@@ -2300,19 +2370,15 @@ test.oo.sharedTreeConsumeRemovesSource() {
     create.result 1 "helper returned $rc"
   elif [ -d "$fixture/source" ]; then
     create.result 1 "the source is still there"
-  elif [ ! -d "$fixture/target/main/.git" ]; then
-    create.result 1 "main/ is not a repository"
-  elif [ ! -f "$fixture/target/dev/.git" ] || ! grep -q '^gitdir: ' "$fixture/target/dev/.git"; then
-    create.result 1 "dev/ is not a linked worktree"
-  else
+  elif private.test.oo.stree.cloneShape "$fixture/target" dev; then
     create.result 0 "source consumed"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case $level "T-SHARED-TREE-CONSUME-YES: the source is removed and the layout still lands" \
+test.case $level "T-SHARED-TREE-CONSUME-YES: the source is removed and the clone layout still lands" \
   test.oo.sharedTreeConsumeRemovesSource
-expect 0 "source consumed" "the removal happens between the copy and the worktree-add, which is the only safe ordering"
+expect 0 "source consumed" "the removal happens between the copy and the branch clone, which is the only safe ordering"
 
 test.oo.sharedTreeConsumeRefusesBadMain() {
   # A source that is NOT a git repository: the copy succeeds, main/.git is
@@ -2338,8 +2404,9 @@ test.case $level "T-SHARED-TREE-CONSUME-REFUSES: a main/ that is not a repositor
 expect 0 "refused" "verify before destroying — the source may be the only copy"
 
 # The case the parameter exists for: the clone ALREADY sits where the branch
-# worktree has to go. Without consuming it first, `git worktree add ../dev`
-# refuses an existing non-empty path and the whole layout fails.
+# clone has to go. Without consuming it first, ogit repo.clone refuses an
+# existing non-empty path and the whole layout fails. The rebuilt dev/ is the
+# helper's own clone: group-shared, which the staged source never was.
 test.oo.sharedTreeConsumeSourceInTheWay() {
   local fixture; fixture=$(mktemp -d "${TMPDIR:-/tmp}/test.oo.consume.inway.XXXXXX") \
     || { create.result 1 "mktemp failed"; return $(result); }
@@ -2351,19 +2418,15 @@ test.oo.sharedTreeConsumeSourceInTheWay() {
   local rc=$?
   if [ "$rc" -ne 0 ]; then
     create.result 1 "helper returned $rc with the source in the way"
-  elif [ ! -d "$fixture/base/main/.git" ]; then
-    create.result 1 "main/ is not a repository"
-  elif [ ! -f "$fixture/base/dev/.git" ] || ! grep -q '^gitdir: ' "$fixture/base/dev/.git"; then
-    create.result 1 "dev/ is not a linked worktree — the source was not replaced"
-  else
+  elif private.test.oo.stree.cloneShape "$fixture/base" dev; then
     create.result 0 "rebuilt in place"
   fi
   rm -rf "$fixture" 2>/dev/null
   return $(result)
 }
-test.case $level "T-SHARED-TREE-CONSUME-IN-THE-WAY: a clone sitting at <base>/<branch> is replaced by its own worktree" \
+test.case $level "T-SHARED-TREE-CONSUME-IN-THE-WAY: a clone sitting at <base>/<branch> is replaced by the layout's own clone" \
   test.oo.sharedTreeConsumeSourceInTheWay
-expect 0 "rebuilt in place" "this is the ordering the parameter exists for — copy, verify, remove, then worktree add"
+expect 0 "rebuilt in place" "this is the ordering the parameter exists for — copy, verify, remove, then clone"
 
 # ============================================================================
 # T-PROFILE-*: /etc/profile.d/oosh.sh — the login-shell bootstrap
@@ -3873,6 +3936,139 @@ test.case $level "T-METHOD-NEW-SYMLINKED-SCRIPT: oo method.new / method.delete e
   test.oo.methodNewSymlinkedScript
 expect 0 "method.new and method.delete edit the link target; the link stays a link" \
   "c2 -> ng/c2: the mandated tool must be able to extend c2"
+
+
+# ============================================================================
+# T-BRANCH-CLONE-ENSURE-*: private.oo.branch.clone.ensure — the clone step of
+# install state 31 and of private.oo.shared.tree.from.local, idempotent
+# ============================================================================
+# State 31 itself cannot be driven end to end (state.check re-sources the
+# script and kills mocks), so the branch-clone decision lives in this helper
+# and is tested here against fixtures: absent → clone; a clone on the branch →
+# kept (a re-run is not a failure although ogit repo.clone refuses a non-empty
+# target); an old-install WORKTREE → left alone, rc 0, pointing at
+# `sudo ogit worktree.remove`; anything else → refused, never deleted.
+private.test.oo.branchClone.origin() { # <fixture> # $fixture/origin: a repository with main + dev
+  (
+    mkdir -p "$1/origin" && cd "$1/origin" || exit 1
+    git init --initial-branch=main -q
+    git config user.email "test@test.local"
+    git config user.name "test"
+    echo seed > README.md && git add . && git commit -q -m seed
+    git branch dev
+  ) >/dev/null 2>&1
+}
+
+test.oo.branchCloneEnsureClonesAndKeeps() {
+  local fx; fx=$(test.suite.fixture.make oo.branchclone) || { create.result 1 "fixture failed"; return $(result); }
+  private.test.oo.branchClone.origin "$fx"
+  mkdir -p "$fx/base"
+  local rc1 rc2
+  private.oo.branch.clone.ensure "$fx/origin" dev "$fx/base/dev" >/dev/null 2>&1; rc1=$?
+  echo "local work" > "$fx/base/dev/untracked.txt"
+  private.oo.branch.clone.ensure "$fx/origin" dev "$fx/base/dev" >/dev/null 2>&1; rc2=$?
+  if [ "$rc1" -ne 0 ]; then
+    create.result 1 "first call returned $rc1"
+  elif [ ! -d "$fx/base/dev/.git" ]; then
+    create.result 1 "dev/.git is not a directory"
+  elif [ "$(git -C "$fx/base/dev" rev-parse --abbrev-ref HEAD 2>/dev/null)" != dev ]; then
+    create.result 1 "dev/ is not on dev"
+  elif [ "$rc2" -ne 0 ]; then
+    create.result 1 "the re-run returned $rc2 — a re-run of state 31 would halt"
+  elif [ ! -f "$fx/base/dev/untracked.txt" ]; then
+    create.result 1 "the re-run replaced the existing clone"
+  else
+    create.result 0 "cloned, then kept"
+  fi
+  rm -rf "$fx"
+  return $(result)
+}
+test.case $level "T-BRANCH-CLONE-ENSURE-IDEMPOTENT: clones an absent branch folder, keeps it on a re-run" \
+  test.oo.branchCloneEnsureClonesAndKeeps
+expect 0 "cloned, then kept" "state 31 re-runs over an existing clone of the right branch with rc 0"
+
+test.oo.branchCloneEnsureLeavesWorktree() {
+  local fx; fx=$(test.suite.fixture.make oo.branchclone.wt) || { create.result 1 "fixture failed"; return $(result); }
+  private.test.oo.branchClone.origin "$fx"
+  mkdir -p "$fx/base"
+  git clone -q -b main "$fx/origin" "$fx/base/main" >/dev/null 2>&1
+  git -C "$fx/base/main" worktree add -q "$fx/base/dev" dev >/dev/null 2>&1
+  local rc
+  private.oo.branch.clone.ensure "$fx/origin" dev "$fx/base/dev" >/dev/null 2>&1; rc=$?
+  if [ ! -f "$fx/base/main/.git/worktrees/dev/HEAD" ] && [ ! -f "$fx/base/dev/.git" ]; then
+    create.result 1 "fixture: no linked worktree was made"
+  elif [ "$rc" -ne 0 ]; then
+    create.result 1 "returned $rc on an old-install worktree"
+  elif [ ! -f "$fx/base/dev/.git" ]; then
+    create.result 1 "the worktree was replaced — it must be left alone"
+  elif ! printf '%s' "$RESULT" | grep -q 'ogit worktree.remove'; then
+    create.result 1 "RESULT does not point at ogit worktree.remove: $RESULT"
+  else
+    create.result 0 "worktree left alone"
+  fi
+  rm -rf "$fx"
+  return $(result)
+}
+test.case $level "T-BRANCH-CLONE-ENSURE-WORKTREE: an old-install worktree is left alone with a pointer to ogit worktree.remove" \
+  test.oo.branchCloneEnsureLeavesWorktree
+expect 0 "worktree left alone" "the conversion is ogit worktree.remove's job (gated, carries ignored files) — never the install's"
+
+test.oo.branchCloneEnsureRefusesOther() {
+  local fx; fx=$(test.suite.fixture.make oo.branchclone.other) || { create.result 1 "fixture failed"; return $(result); }
+  private.test.oo.branchClone.origin "$fx"
+  mkdir -p "$fx/base"
+  git clone -q -b main "$fx/origin" "$fx/base/dev" >/dev/null 2>&1
+  local rc
+  private.oo.branch.clone.ensure "$fx/origin" dev "$fx/base/dev" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "accepted a clone of main sitting at dev/"
+  elif [ "$(git -C "$fx/base/dev" rev-parse --abbrev-ref HEAD 2>/dev/null)" != main ]; then
+    create.result 1 "the folder was changed"
+  else
+    create.result 0 "refused"
+  fi
+  rm -rf "$fx"
+  return $(result)
+}
+test.case $level "T-BRANCH-CLONE-ENSURE-REFUSES: a folder on another branch is refused, not replaced" \
+  test.oo.branchCloneEnsureRefusesOther
+expect 0 "refused" "the install never deletes a folder it did not make"
+
+# ============================================================================
+# T-STATE31-CLONE-LAYOUT: state 31 produces clones with per-folder permissions
+# ============================================================================
+# Structural (state.check re-sources $stateScript — end-to-end mocks die):
+# the branch folder comes from the clone helper, never from worktree add; the
+# permission block runs PER repository folder under the base (repo.share +
+# safe.directory of the case-canonical path); the BASE gets group dev + setgid
+# so folders added later inherit the group; no recursive chown of the base.
+test.oo.state31CloneLayout() {
+  local body bad=""
+  body=$(declare -f private.check.root.shared.dev.folder.created 2>/dev/null)
+  if [ -z "$body" ]; then
+    create.result 1 "private.check.root.shared.dev.folder.created is not defined"
+    return $(result)
+  fi
+  printf '%s\n' "$body" | grep -q 'ogit.repo.clone' || bad="$bad no-ogit.repo.clone"
+  printf '%s\n' "$body" | grep -q 'private.oo.branch.clone.ensure' || bad="$bad no-branch.clone.ensure"
+  printf '%s\n' "$body" | grep -q 'worktree.add' && bad="$bad still-worktree.add"
+  printf '%s\n' "$body" | grep -q 'private.ogit.base.folders.list "$onceShBase"' || bad="$bad no-per-folder-loop"
+  printf '%s\n' "$body" | grep -q 'ogit.repo.share "$_wt"' || bad="$bad no-per-folder-share"
+  printf '%s\n' "$body" | grep -q 'ogit.safeDirectory.add "$(private.this.path.case.get "$_wt")"' || bad="$bad no-per-folder-trust"
+  printf '%s\n' "$body" | grep -q 'chmod g+ws "$onceShBase"' || bad="$bad base-not-setgid"
+  printf '%s\n' "$body" | grep -q 'chgrp dev "$onceShBase"' || bad="$bad base-not-group-dev"
+  printf '%s\n' "$body" | grep -qE 'chown -R[^;]*onceShBase' && bad="$bad recursive-chown-of-base"
+  printf '%s\n' "$body" | grep -q 'onceShBase/main/.git' && bad="$bad main-only-permissions"
+  if [ -z "$bad" ]; then
+    create.result 0 "clone layout, per-folder permissions, setgid base"
+  else
+    create.result 1 "state 31:$bad"
+  fi
+  return $(result)
+}
+test.case $level "T-STATE31-CLONE-LAYOUT: state 31 clones the branch and shares + trusts every folder, base setgid, no recursive chown" \
+  test.oo.state31CloneLayout
+expect 0 "clone layout, per-folder permissions, setgid base" "spec § 2 + § 4: each folder is its own repository"
 
 ### test.method
 
