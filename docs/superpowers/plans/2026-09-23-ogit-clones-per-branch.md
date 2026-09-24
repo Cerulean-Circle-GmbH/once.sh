@@ -1757,8 +1757,8 @@ Each site: replace the call, keep behaviour, run that file's tests. The command 
 | claudeCode:1439, 1503 | `git rev-parse --show-toplevel` | `ogit.repo.root.get` |
 | osshLayout:47-49 | `command -v git`, `git config --global user.email \|\| git config user.email` | `ogit.binary.check`, `ogit.config.email.get "$PWD"` |
 
-- [ ] Run: `./test.suite run this 1; run path 1; run test.suite 1; run config 1; run os 1; run claudeCode 1; run osshLayout 1` → PASS; `./path validate`, `./this anchor.validate all`, `./test.suite portability.validate` → OK; `LOG_LEVEL=1 ./ogit caller.validate` → the violation count drops by these sites.
-- [ ] Commit `refactor: this/path/test.suite/os/claudeCode/osshLayout call ogit`.
+- [x] Run: `./test.suite run this 1; run path 1; run test.suite 1; run config 1; run os 1; run claudeCode 1; run osshLayout 1` → PASS; `./path validate`, `./this anchor.validate all`, `./test.suite portability.validate` → OK; `LOG_LEVEL=1 ./ogit caller.validate` → the violation count drops by these sites.
+- [x] Commit `refactor: this/path/test.suite/os/claudeCode/osshLayout call ogit`.
 
 ---
 

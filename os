@@ -89,6 +89,7 @@ private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd afte
 
 private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI workflow for native platform testing
 {
+  private.this.script.load ogit ogit.branch.get
   local platform="$1"
   local terminal="$2"
   local notests="$3"
@@ -104,8 +105,9 @@ private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI 
   fi
 
   local branch
-  branch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  branch=$(ogit.branch.get "$OOSH_DIR")
   if [ -z "$branch" ]; then
+    # ogit-exception: printed text, not an invocation
     error.log "Could not determine current git branch"
     create.result 1 "FAIL"
     return 1
