@@ -907,7 +907,7 @@ ogit.conflict.resolve.completion.side() { echo theirs; echo ours; }
 
 ### Task 6: `remote` noun
 
-- [ ] **Step 1: Test (RED)**
+- [x] **Step 1: Test (RED)**
 
 ```bash
 test.ogit.remote() {
@@ -935,7 +935,7 @@ test.case $level "T-OGIT-REMOTE: the remote noun" test.ogit.remote
 expect 0 "remote: url.get/branch.list/fetch/pull/push behave" "the remote noun"
 ```
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 ```bash
 ogit.remote.url.get()     # <?remote:origin> <?dir:$OOSH_DIR> # echo the URL of <remote>, empty when there is none #
@@ -1003,7 +1003,7 @@ ogit.remote.push.completion.tags()   { echo no; echo yes; }
 ```
 (`remote`, `branch`, `dir` come from the shared block; `url` is exempt.)
 
-- [ ] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): remote noun`.
+- [x] **Step 3: Run** `ogit` and `completion.audit` suites → PASS. **Commit** `feat(ogit): remote noun`.
 
 ---
 
