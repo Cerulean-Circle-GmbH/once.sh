@@ -1259,7 +1259,7 @@ ogit.stash.top.get()     # <?dir:$OOSH_DIR> # echo the message of stash@{0}, emp
 
 **Files:** `ogit`, `test/test.ogit`, `oo:397-461`, `test/test.oo` (the safeDirectory cases: search `safeDirectory` in test.oo and move them to test.ogit with the method names renamed)
 
-- [ ] **Step 1: Test (RED)** — sandboxed via `GIT_CONFIG_GLOBAL`:
+- [x] **Step 1: Test (RED)** — sandboxed via `GIT_CONFIG_GLOBAL`:
 
 ```bash
 test.ogit.trust() {
@@ -1296,7 +1296,7 @@ test.case $level "T-OGIT-TRUST: config and safeDirectory nouns (sandboxed GIT_CO
 expect 0 "config.get/set/email.get and safeDirectory.add/list/ensure/prune/clear behave" "config and safeDirectory nouns"
 ```
 
-- [ ] **Step 2: Implement** (with the two private helpers § 0.3 assigns to this Task: `private.ogit.base.folders.list` — the one base-folder loop, reused by Tasks 19, 21, 22 — and `private.ogit.base.get`, the one default-base resolver, reused by Tasks 19-21):
+- [x] **Step 2: Implement** (with the two private helpers § 0.3 assigns to this Task: `private.ogit.base.folders.list` — the one base-folder loop, reused by Tasks 19, 21, 22 — and `private.ogit.base.get`, the one default-base resolver, reused by Tasks 19-21):
 
 ```bash
 private.ogit.base.get() # <?base> # echo <base>, else the components base: oo.mode.base.get when it is loaded in this shell, else the oo command #
@@ -1406,7 +1406,7 @@ ogit.safeDirectory.ensure()     # <?base:$(oo.mode.base.get)> # one global safe.
 ```
 (`path` and `base` come from the shared block.)
 
-- [ ] **Step 3: Aliases in `oo`** — replace the two bodies at `oo:397-461` with `replace block oo "<signature line>" "}" by "<new body>"` → `replace commit oo` → `replace cleanup oo` (§ 0.1), so they read:
+- [x] **Step 3: Aliases in `oo`** — replace the two bodies at `oo:397-461` with `replace block oo "<signature line>" "}" by "<new body>"` → `replace commit oo` → `replace cleanup oo` (§ 0.1), so they read:
 
 ```bash
 oo.safeDirectory.prune() # # remove git safe.directory entries whose paths no longer exist on disk (delegates to ogit safeDirectory.prune)
@@ -1417,7 +1417,7 @@ private.oo.safeDirectory.add() # <path> # idempotently add path to git's global 
 ```
 `private.this.script.load` is the ONE loader, in the kernel since **Task M** — no ogit-specific loader is created. Rule 12 of § 0.5 applies to every consumer script from here on. Move the safeDirectory tests from `test/test.oo` to `test/test.ogit` (rename the method calls); keep in `test.oo` one case `T-SAFEDIR-DELEGATES` that asserts `declare -f oo.safeDirectory.prune | grep -q ogit.safeDirectory.prune`.
 
-- [ ] **Step 4: Run** `./test.suite run ogit 1`, `./test.suite run oo 1` and `./test.suite run completion.audit 1` → PASS. **Commit** `feat(ogit): config and safeDirectory nouns — moved from oo, oo delegates`.
+- [x] **Step 4: Run** `./test.suite run ogit 1`, `./test.suite run oo 1` and `./test.suite run completion.audit 1` → PASS. **Commit** `feat(ogit): config and safeDirectory nouns — moved from oo, oo delegates`.
 
 ---
 
