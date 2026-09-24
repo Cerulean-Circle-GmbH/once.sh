@@ -1522,11 +1522,8 @@ ogit.worktree.prune()     # <?dir:$OOSH_DIR> # drop worktree registrations whose
  git -C "$dir" worktree prune 2>/dev/null; create.result 0 "worktrees pruned"; return $(result)
 }
 
-ogit.binary.check()     # # rc 0 when the git binary is on PATH #
-{
- command -v git >/dev/null 2>&1
-}
-ogit.binary.check.completion() { :; }
+# ogit.binary.check already exists — created in Task 1 (35d44b7) so that
+# private.ogit.require could delegate to it from the start. Do not add it again.
 
 ogit.raw()     # <dir> <args...> # run git -C <dir> <args...> verbatim — the documented last resort; every use needs a comment saying why no method fits; variadic, so <dir> comes first #
 {
