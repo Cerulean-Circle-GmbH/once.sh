@@ -342,14 +342,14 @@ Run `./test.suite run completion.audit 1` → PASS (unchanged count until ogit e
 **Files:**
 - Create: `ogit` and `test/test.ogit` (both via `oo new ogit` — it runs the `newScript` and `newScriptTest` templates)
 
-- [ ] **Step 1: Scaffold with the OOSH tool**
+- [x] **Step 1: Scaffold with the OOSH tool**
 
 ```bash
 cd ~/oosh && LOG_LEVEL=1 ./oo new ogit && ls -l ogit test/test.ogit
 ```
 Expected: both files exist, `ogit` executable, each carries its marker (`### new.method` / `### test.method`).
 
-- [ ] **Step 2: Header, banners, usage**
+- [x] **Step 2: Header, banners, usage**
 
 Replace the top of `ogit` (keep the template's commented `#clear`/`PS4` lines) so it reads:
 
@@ -423,21 +423,21 @@ ogit.usage()
 }
 ```
 
-- [ ] **Step 3: Verify the sourced guard**
+- [x] **Step 3: Verify the sourced guard**
 
 ```bash
 bash -c 'source ~/oosh/ogit; type -t ogit.usage; echo "rc=$?"'
 ```
 Expected: `function` and `rc=0`, no usage text printed (because `this.start` returns on `this.isSourced`). If usage prints, add to `ogit.start` before `this.start`: `this.isSourced "${FUNCNAME[1]}" && return 0` — and record why in a comment.
 
-- [ ] **Step 4: Completion is automatic — prove it**
+- [x] **Step 4: Completion is automatic — prove it**
 
 ```bash
 ./ng/c2 function.completion ./ogit
 ```
 Expected: `usage` (only). Later tasks add methods.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ogit test/test.ogit && git commit -m "feat(ogit): scaffold the git wrapper (oo new ogit) — header, helpers, usage"
