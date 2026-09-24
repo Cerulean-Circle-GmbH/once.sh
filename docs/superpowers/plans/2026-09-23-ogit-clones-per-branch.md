@@ -1532,7 +1532,7 @@ ogit.raw()     # <dir> <args...> # run git -C <dir> <args...> verbatim — the d
 
 **Files:** `this:903-943`, `promote:277-316`, `test/test.ossh:715-750`, `test/test.this:194-254`, `test/test.promote` (alignment cases)
 
-- [ ] **Step 1: Test (RED)** in `test/test.this`: replace the `this.git.commits.count` cases' direct expectations with one delegation case:
+- [x] **Step 1: Test (RED)** in `test/test.this`: replace the `this.git.commits.count` cases' direct expectations with one delegation case:
 
 ```bash
 test.this.gitAliasesDelegate() {
@@ -1550,7 +1550,7 @@ test.case $level "T-THIS-GIT-ALIASES: this.git.branch.short / commits.count dele
 expect 0 "this.git.* delegate to ogit and still answer" "callers outside this tree keep working"
 ```
 
-- [ ] **Step 2: Implement in `this`** (replace `this.git.branch.short` and `this.git.commits.count` bodies with `replace block this "<signature line>" "}" by "<new body>"` → `replace commit this` → `replace cleanup this`; keep their docstrings and completions; `private.this.script.load` exists since Task M):
+- [x] **Step 2: Implement in `this`** (replace `this.git.branch.short` and `this.git.commits.count` bodies with `replace block this "<signature line>" "}" by "<new body>"` → `replace commit this` → `replace cleanup this`; keep their docstrings and completions; `private.this.script.load` exists since Task M):
 
 ```bash
 this.git.branch.short() # <?gitDir:$OOSH_DIR> # print the sanitised short branch name of <gitDir> (delegates to ogit branch.get)
@@ -1561,14 +1561,14 @@ this.git.commits.count() # <gitDir> <fromRef> <toRef> # count commits in <toRef>
 ```
 Note the argument order flip: `this.git.commits.count <gitDir> <from> <to>` → `ogit.commit.count <from> <to> <dir>`.
 
-- [ ] **Step 3: `promote.branch.alignment`** becomes the alias `{ private.this.script.load ogit ogit.branch.get; ogit.branch.compare "$1" "$2" "$OOSH_DIR"; }` (via `replace block promote …`, keeping its docstring). The body already lives in `ogit.branch.compare` since Task 4 — nothing to paste.
+- [x] **Step 3: `promote.branch.alignment`** becomes the alias `{ private.this.script.load ogit ogit.branch.get; ogit.branch.compare "$1" "$2" "$OOSH_DIR"; }` (via `replace block promote …`, keeping its docstring). The body already lives in `ogit.branch.compare` since Task 4 — nothing to paste.
 
-- [ ] **Step 4: Re-aim pins**
+- [x] **Step 4: Re-aim pins**
   - `test/test.ossh:720-735` (T-BRANCH-SHORT-STRIP-*): `BRANCH_BODY=$(declare -f ogit.branch.get 2>/dev/null)` after `private.this.script.load ogit ogit.branch.get` — the four `${b#…}` strips are asserted there.
   - `test/test.ossh:738-748` (T-BRANCH-SHORT-CALLER): accept either name: `grep -qE 'this\.git\.branch\.short|ogit\.branch\.get'`.
   - `test/test.promote` alignment cases: call `promote.branch.alignment` as before (alias) — they should pass unchanged; if a case greps the body, point it at `ogit.branch.compare`.
 
-- [ ] **Step 5: Run** `this`, `ossh`, `promote`, `ogit` suites → PASS. Re-check `test/test.this:212-254` (T-GIT-COUNT-*) explicitly: `this.git.commits.count` always prefixed `refs/heads/`, `ogit.commit.count` does so only for bare names — the cases (and promote:293-294) pass bare names, so the answers must be identical. **Commit** `refactor(this,promote): git wrappers delegate to ogit; pins re-aimed`.
+- [x] **Step 5: Run** `this`, `ossh`, `promote`, `ogit` suites → PASS. Re-check `test/test.this:212-254` (T-GIT-COUNT-*) explicitly: `this.git.commits.count` always prefixed `refs/heads/`, `ogit.commit.count` does so only for bare names — the cases (and promote:293-294) pass bare names, so the answers must be identical. **Commit** `refactor(this,promote): git wrappers delegate to ogit; pins re-aimed`.
 
 ---
 
