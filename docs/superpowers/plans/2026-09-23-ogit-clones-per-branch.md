@@ -1792,8 +1792,8 @@ Every method below that calls `ogit.*` gets `private.this.script.load ogit ogit.
 | 2539 `oo.install.dev` | `call git clone git@github.com:…` inside the `check … call` DSL | `call ogit repo.clone git@github.com:… <branch> <dir>` |
 | 418-457 | done in Task 10 | — |
 
-- [ ] Run `./test.suite run oo 1` → PASS (fix any re-aimed pin listed above). Also `LOG_LEVEL=1 ./ogit caller.validate` shrinks by ≈76 (oo's non-comment hits at 9b69114).
-- [ ] Commit `refactor(oo): every git call goes through ogit`.
+- [x] Run `./test.suite run oo 1` → PASS (fix any re-aimed pin listed above). Also `LOG_LEVEL=1 ./ogit caller.validate` shrinks by ≈76 (oo's non-comment hits at 9b69114).
+- [x] Commit `refactor(oo): every git call goes through ogit`.
 
 ---
 
