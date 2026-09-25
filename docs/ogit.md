@@ -267,8 +267,8 @@ prod           clone     dirty 0   ahead 0   behind 0   shared=group setgid=yes 
 
 | Command | Does |
 |---|---|
-| `sudo ogit worktree.remove <?base>` | every linked worktree of `<base>/main` → an independent clone of the same branch |
-| `sudo ogit worktree.restore <?base>` | every sibling clone of `<base>/main` with the same origin → a linked worktree of `main` again |
+| `ogit worktree.remove <?base>` | every linked worktree of `<base>/main` → an independent clone of the same branch |
+| `ogit worktree.restore <?base>` | every sibling clone of `<base>/main` with the same origin → a linked worktree of `main` again |
 
 Their gates, checked for **every** folder (and `main/`) **before any folder is touched** — each refusal names the folder and the fix:
 
@@ -280,7 +280,7 @@ Their gates, checked for **every** folder (and `main/`) **before any folder is t
 
 **Ignored files are carried.** A folder's gitignored files (on a dev host e.g. `sessions/`) are copied before the folder is removed and copied into the new folder once it is finished. The copy is a **backup that is kept**: `$HOME/.oosh.backups/<UTC-stamp>-ogit-<folder>` — under `sudo` that is root's `$HOME`. Nothing deletes it; remove it yourself once you are satisfied.
 
-**Run them with sudo on a shared tree.** The folders belong to different users of the `dev` group; the converters delete and recreate them. Under sudo each new folder is trusted for root **and** for the user who typed the command (`SUDO_USER`); other users get their entries from `oo update` / `oo user.fix`.
+**They ask for sudo by themselves.** The folders of a shared tree belong to different users of the `dev` group, and the converters delete and recreate them — so when you do not own the base, a folder or its `.git`, `ogit worktree.remove` / `ogit worktree.restore` re-run themselves through sudo (by the canonical path of `ogit` with the base already resolved: sudo's `PATH` has no oosh) and your password is asked. On a tree you own (a single-user host) they run directly. Under sudo each new folder is trusted for root **and** for the user who typed the command (`SUDO_USER`); other users get their entries from `oo update` / `oo user.fix`. `<base>` Tab-completes to the components base.
 
 ## Migrating a host from worktrees to clones
 
@@ -288,7 +288,7 @@ A **user-run** runbook — never automatic. It is written for a dev host install
 
 **Before you start:** stop other shells, agents and editors that work inside `dev/` or `prod/` (their working directory is deleted and recreated), and push everything — the conversion refuses a dirty or unpushed folder.
 
-`sudo` resets `PATH`, so it cannot find `ogit` by name. Run the script by path from `~/oosh`, and pass the base explicitly so root's own `oo mode.base.get` does not matter:
+No `sudo` in front: the converters ask for it themselves when the tree is shared (see above). Keep the base in a variable for the checks:
 
 ```bash
 cd ~/oosh
@@ -308,7 +308,7 @@ Expect `main clone`, `dev worktree`, `prod worktree`, every line `dirty 0` and `
 **3. Convert.**
 
 ```bash
-sudo ./ogit worktree.remove "$base"
+ogit worktree.remove          # asks for your sudo password on a shared tree
 ```
 
 Expect, per folder, `carrying ignored dev/sessions` then `dev: worktree → clone (dev)` and `prod: worktree → clone (prod)`, and finally `2 folder(s) converted to clones under <base>`. A refusal stops before anything is touched — fix what it names and re-run. Your shell's working directory was the old `dev/`: re-enter it with `cd ~/oosh`.
@@ -352,9 +352,9 @@ promote status
 **8. Optional — prove it is reversible.**
 
 ```bash
-sudo ./ogit worktree.restore "$base" # dev, prod, testing → worktrees of main again
-ogit layout.status "$base"           # main clone, the rest worktree
-sudo ./ogit worktree.remove "$base"  # and back to clones
+ogit worktree.restore                # dev, prod, testing → worktrees of main again
+cd ~/oosh; ogit layout.status "$base" # main clone, the rest worktree
+ogit worktree.remove                 # and back to clones
 cd ~/oosh && cat sessions/agent.context.md   # still intact after the round trip
 ```
 

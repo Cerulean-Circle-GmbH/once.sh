@@ -181,7 +181,7 @@ then share and trust the new folder. Without a base both refuse with
 `no components base — run oo mode.setup`; there is no "clone beside `~/oosh`"
 mode any more. An existing folder is never cloned over: a clone on the right
 branch is kept, a linked worktree from an older install is left alone with a
-pointer to `sudo ogit worktree.remove`, anything else refuses.
+pointer to `ogit worktree.remove`, anything else refuses.
 
 **Trust is per folder.** git's `safe.directory` is per repository, so every
 folder under the base needs its own entry for every user who touches it
@@ -207,8 +207,8 @@ convert it — conversion is an explicit, user-run step:
 
 ```bash
 ogit layout.status            # see what you have
-sudo ogit worktree.remove     # every linked worktree → an independent clone
-sudo ogit worktree.restore    # the exact reverse, if you need the old layout back
+ogit worktree.remove     # every linked worktree → an independent clone
+ogit worktree.restore    # the exact reverse, if you need the old layout back
 ```
 
 Both are gated: they refuse, naming the folder and the fix, on a dirty folder,
@@ -216,8 +216,8 @@ an unpushed one, one without an upstream, or a detached one — before touching
 anything. Gitignored files are carried across, and a copy is kept under
 `~/.oosh.backups/<UTC-stamp>-ogit-<folder>` (root's `$HOME` under sudo).
 `worktree.restore` additionally refuses when `main/` holds unpushed commits on
-a local branch it would reset. `sudo` resets `PATH`, so on a host where root's
-PATH has no oosh, run the script by path: `cd ~/oosh && sudo ./ogit worktree.remove "$(oo mode.base.get)"`. The step-by-step runbook is
+a local branch it would reset. On a shared tree they ask for sudo by themselves
+(no `sudo` in front — sudo's PATH has no oosh). The step-by-step runbook is
 [ogit.md § Migrating a host from worktrees to clones](ogit.md#migrating-a-host-from-worktrees-to-clones).
 
 ### oo.mode.setup

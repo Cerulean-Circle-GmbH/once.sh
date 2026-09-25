@@ -24,7 +24,7 @@ listed here run only when invoked.
 | [`ogit layout.status [base]`](ogit.md#layout) | Read-only report: one line per branch folder under the components base — `clone`/`worktree`, dirty/ahead/behind, `shared=` `setgid=` `trusted=` | First stop for any branch-folder trouble; rc 1 on a mixed layout. No privilege needed |
 | [`ogit safeDirectory.ensure [base]`](ogit.md#safedirectory) | One `safe.directory` entry per branch folder, for the calling user | `fatal: detected dubious ownership`; `layout.status` shows `trusted=no`. `oo update` and `oo user.fix` run it for you |
 | [`ogit repo.share <dir>`](ogit.md#repo) | One folder's `.git`: group `dev` + g+w, setgid, `core.sharedRepository=group` | `layout.status` shows `shared=no` or `setgid=no`; another dev user gets "Permission denied" writing objects. `sudo` when you do not own the folder |
-| [`sudo ogit worktree.remove [base]`](ogit.md#migrating-a-host-from-worktrees-to-clones) | Converts every linked worktree under the base into an independent clone (gated; ignored files carried, backup kept in `~/.oosh.backups/`) | A host installed before the clone layout (`layout.status` shows `worktree` lines); a half-finished conversion. `sudo ogit worktree.restore` is the reverse |
+| [`ogit worktree.remove [base]`](ogit.md#migrating-a-host-from-worktrees-to-clones) | Converts every linked worktree under the base into an independent clone (gated; ignored files carried, backup kept in `~/.oosh.backups/`) | A host installed before the clone layout (`layout.status` shows `worktree` lines); a half-finished conversion. `ogit worktree.restore` is the reverse |
 | `user ssh.backup.status` | Legacy `$HOME/ssh.*` backup directories | A root-owned `ssh.original` or `ssh.<user>.<host>.for.<host>` in your home. Reports only, works unprivileged, rc 1 when it finds any |
 | `user ssh.backup.migrate` | The same, acting | Moves them under `~/.ssh.backups/legacy/`. **Moves, never deletes** — they hold private keys. Needs `$SUDO` when they belong to another user |
 
@@ -99,8 +99,8 @@ explicitly when something drifts.
 | Legacy `~/.ssh/2cuGitHub` host block | `ossh folder.fix strict` |
 | `~/.ssh/id_ed25519.previous` / `.bak.*` cruft | `ossh folder.fix strict` |
 | `fatal: detected dubious ownership in repository` in a branch folder | `oo update` (runs `ogit safeDirectory.ensure`), or `ogit safeDirectory.ensure` directly |
-| `ogit layout.status` shows `worktree` lines (host installed before the clone layout) | `sudo ogit worktree.remove` — runbook: [ogit.md § Migrating a host](ogit.md#migrating-a-host-from-worktrees-to-clones) |
-| `ogit layout.status` says `mixed layout` (rc 1) | finish the conversion you started: `sudo ogit worktree.remove` (or `sudo ogit worktree.restore` to go back) |
+| `ogit layout.status` shows `worktree` lines (host installed before the clone layout) | `ogit worktree.remove` — runbook: [ogit.md § Migrating a host](ogit.md#migrating-a-host-from-worktrees-to-clones) |
+| `ogit layout.status` says `mixed layout` (rc 1) | finish the conversion you started: `ogit worktree.remove` (or `ogit worktree.restore` to go back) |
 | `ogit layout.status` shows `shared=no` / `setgid=no` for a folder | `ogit repo.share <base>/<folder>` (with `sudo` when you do not own it) |
 | `test.platform.shared.layout.invariant` red | the recovery command in its FAIL line — one of the four rows above, or `sudo chgrp dev <base> && sudo chmod g+ws <base>` for the base |
 | `promote` refuses with `no folder holds branch testing` | `oo checkout testing`, then re-run `promote testing` |
