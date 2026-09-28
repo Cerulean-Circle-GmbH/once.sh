@@ -101,9 +101,15 @@ error — writes through `private.log.emit`:
 - **stdout is never written**, so `$(command …)` captures only what a command prints on
   purpose (BUG5 — log text used to contaminate captured values and c2 parameters).
 
-`log.device` probes only a file device. Back-port of Marcel's #41 (`c0e6036`, kept on
-`test/macos.latest`). The one exception is `info.log` in `this` (LOG_LEVEL > 3), which
-runs before `log` is loaded.
+`log.device <device>` and `log.init` share one probe, `private.log.device.probe`: a device
+that cannot be opened — `/dev/tty` without a controlling terminal (ssh exec, cron), a file
+nobody may write — falls back to `/dev/stderr`; the fd 1 / fd 2 spellings
+(`private.log.device.is.capture`) are never probed, because a probe of fd 1 is exactly the
+leak into `$(…)`. The probe writes no line. `log.device` sets and reports only; `LOG_DEVICE`
+is persisted per user by `log.session.save`, never through `config save`. Back-port of
+Marcel's #41 (`c0e6036`, kept on `test/macos.latest`). `info.log` in `this` (LOG_LEVEL > 3)
+runs before `log` is loaded and applies the same rule inline; `ossh`'s dry-run lines and
+`c2`'s level-5 dumps go through `private.log.emit` too.
 
 ### Environment Variables
 
