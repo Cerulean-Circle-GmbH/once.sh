@@ -645,7 +645,7 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
       #
       # Documented at docs/config.md § Excluded variables and pinned by
       # test/test.config T29 — change all three together.
-      *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|OOSH_CONFIG_VERSION|SUDO_*|_) continue ;;
+      *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|OOSH_CONFIG_VERSION|OOSH_MODE|SUDO_*|_) continue ;;
     esac
     echo "$variableName"
   done
@@ -934,6 +934,7 @@ private.config.chain.files.get()     # <?userEnv:$CONFIG_PATH/user.env> # the en
              $(grep -E '^\. \$CONFIG_PATH/[A-Za-z0-9_.-]+\.env$' "$userEnv" 2>/dev/null | sed 's|^\. \$CONFIG_PATH/||'); do
    name="${name%.env}"
    [ "$name" = user ] && continue
+   case "$name" in "~"*) continue ;; esac   # per-user: loaded by private.config.user.load.line.get
    case "$seen" in *" $name "*) continue ;; esac
    seen="$seen$name "
    if private.config.required.variables.get | awk '{print $2}' | grep -qx "$name.env" || [ -f "$CONFIG_PATH/$name.env" ]; then
@@ -965,6 +966,43 @@ private.config.derive.odocker.workspaces()     #  # the Docker workspaces root f
  [ -n "$ODOCKER_WORKSPACES" ] && { echo "$ODOCKER_WORKSPACES"; return 0; }
  private.this.script.load odocker private.odocker.workspaces.default.get || return 1
  private.odocker.workspaces.default.get
+}
+
+
+config.user.save()     #  # write the per-user env file of the required manifest ($OOSH_USER_CONFIG_PATH/oosh.user.env: OOSH_MODE) from this shell; the shared tier never carries it #
+{
+ # The per-user half of config save: every `~<file>` row of the required
+ # manifest (today OOSH_MODE), from this shell, into
+ # $OOSH_USER_CONFIG_PATH/<file> — pure data, one export line per set value
+ # (private.config.variable.export.line). oo mode calls it on every switch.
+ local dir="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}" variable file rest userFile
+ if ! mkdir -p "$dir" 2>/dev/null; then
+   create.result 1 "config.user.save: cannot create $dir"
+   return $(result)
+ fi
+ for userFile in $(private.config.required.variables.get | awk '$2 ~ /^~/ && !seen[$2]++ {print $2}'); do
+   while read -r variable file rest; do
+     [ "$file" = "$userFile" ] || continue
+     [ -n "${!variable}" ] && private.config.variable.export.line "$variable"
+   done <<REQUIRED > "$dir/${userFile#\~}"
+$(private.config.required.variables.get)
+REQUIRED
+ done
+ create.result 0 "per-user config written to $dir"
+ return $(result)
+}
+
+
+config.user.save.completion() { :; }
+private.config.user.load.line.get()     #  # the one guarded line user.env ends with: load the per-user oosh.user.env when it exists — the only logic a pure-data user.env may hold #
+{
+ # A getter consumed as $(…): no create.result. OOSH_MODE names the branch
+ # ~/oosh points at, and ~/oosh is per user — so it lives in the per-user
+ # $OOSH_USER_CONFIG_PATH/oosh.user.env, never in the shared tier. user.env is
+ # shared and has to load it, but a POSIX sh exits on `.` of a missing file:
+ # this ONE guarded line is the only logic config.validate lets user.env hold.
+ # Single-quoted: written unexpanded, expanded by each user's own shell.
+ echo '[ -f "$OOSH_USER_CONFIG_PATH/oosh.user.env" ] && . "$OOSH_USER_CONFIG_PATH/oosh.user.env"'
 }
 
 
@@ -1167,7 +1205,7 @@ REQUIRED
     # Every env file the required manifest names (oosh, log, odocker, …), each
     # with its own prefix — no longer a hard-coded oosh + log.
     local manifestFile
-    for manifestFile in $(private.config.required.variables.get | awk '$2 != "user.env" && !seen[$2]++ {print $2}'); do
+    for manifestFile in $(private.config.required.variables.get | awk '$2 != "user.env" && $2 !~ /^~/ && !seen[$2]++ {print $2}'); do
       manifestFile="${manifestFile%.env}"
       config.save "$manifestFile" "$(private.config.string.upper "$manifestFile")"
     done
@@ -1179,6 +1217,10 @@ REQUIRED
     for chainFile in $chainFiles; do
       config.add "$chainFile"
     done
+    # Last: the per-user file (OOSH_MODE), so it wins over the shared tier —
+    # and this user's own copy of it.
+    private.config.user.load.line.get >> "$CONFIG_PATH/user.env"
+    config.user.save >/dev/null
 
     # Guard: user.env may hold export/comment/blank + `source *.env` chaining
     # (composition, NOT logic); oosh.env / log.env must be pure. config.validate
@@ -1260,6 +1302,8 @@ config.validate() # <?name:user> # verify an env file is PURE DATA (only export/
     if echo "$trimmed" | grep -qE '^(source|\.)[[:space:]]+[^[:space:]]*\.env[[:space:]]*$'; then
       continue
     fi
+    # The one allowed piece of logic: the guarded per-user load (OOSH_MODE).
+    [ "$trimmed" = "$(private.config.user.load.line.get)" ] && continue
     error.log "config.validate: $f:$lineNum is not pure data: $line"
     violations=$((violations + 1))
   done < "$f"
@@ -1291,7 +1335,7 @@ private.config.required.variables.get() # # the variables a config must carry fo
 BASH_FILE user.env private.config.derive.bash.file derived
 CONFIG_FILE user.env private.config.derive.config.file derived
 OOSH_CONFIG_VERSION user.env private.config.version.get derived
-OOSH_MODE oosh.env private.config.derive.oosh.mode derived
+OOSH_MODE ~oosh.user.env private.config.derive.oosh.mode derived
 OOSH_OS oosh.env private.config.derive.oosh.os derived
 OOSH_PM oosh.env private.config.derive.oosh.pm kept
 LOG_LEVEL log.env private.config.derive.log.level kept
@@ -1310,7 +1354,9 @@ config.validate.required() # # verify the persisted config carries every variabl
   local missing="" variable file rest
   while read -r variable file rest; do
     [ -z "$variable" ] && continue
-    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$CONFIG_PATH/$file" 2>/dev/null \
+    local requiredPath="$CONFIG_PATH/$file"
+    case "$file" in "~"*) requiredPath="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/${file#\~}" ;; esac
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$requiredPath" 2>/dev/null \
       || missing="$missing $variable"
   done <<REQUIRED
 $(private.config.required.variables.get)
@@ -1323,6 +1369,8 @@ REQUIRED
     [ -f "$CONFIG_PATH/$chainName.env" ] || missing="$missing file:$chainName.env"
     grep -qxF ". \$CONFIG_PATH/$chainName.env" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:$chainName.env"
   done
+
+  grep -qxF "$(private.config.user.load.line.get)" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:oosh.user.env"
 
   # The config-format stamp: a config written by another branch version is
   # foreign, not merely incomplete (a missing stamp is caught by the table).
@@ -1345,7 +1393,7 @@ REQUIRED
   # points at. This is the T7 bug — persisted prod/released on a dev box, with
   # nothing in the tree ever comparing the two.
   local drift="" persistedMode actualMode
-  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$CONFIG_PATH/oosh.env" 2>/dev/null \
+  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/oosh.user.env" 2>/dev/null \
                   | cut -d= -f2- | tr -d '"')
   # The SAME accessor the repair uses. This was two inline steps here and two
   # more at oo:2631-2633; three answers to "which branch is this host on" could
