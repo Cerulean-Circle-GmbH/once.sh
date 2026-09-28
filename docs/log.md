@@ -88,6 +88,23 @@ log.device /tmp/my.log
 log.device
 ```
 
+### Where a log line goes (`private.log.emit`)
+
+Every level — console, test.console, silent, success, warn, important, debug, stop,
+error — writes through `private.log.emit`:
+
+- a **terminal-type** `LOG_DEVICE` (unset, `/dev/stdout`, `/proc/self/fd/1`, `/dev/fd/1`,
+  `/dev/stderr`, fd 2, `/dev/tty` — `private.log.device.is.terminal`) is written to
+  **fd 2 by dup** — never by reopening `/dev/stderr`, which fails `EACCES` after `su -`
+  on a root-owned tty;
+- a **file** `LOG_DEVICE` is appended to (fd 2 if it cannot be written);
+- **stdout is never written**, so `$(command …)` captures only what a command prints on
+  purpose (BUG5 — log text used to contaminate captured values and c2 parameters).
+
+`log.device` probes only a file device. Back-port of Marcel's #41 (`c0e6036`, kept on
+`test/macos.latest`). The one exception is `info.log` in `this` (LOG_LEVEL > 3), which
+runs before `log` is loaded.
+
 ### Environment Variables
 
 | Variable | Default | Description | Scope |

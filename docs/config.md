@@ -370,6 +370,20 @@ classic post-install "log out fully and log back in" condition).
 #### `config.save [name] [PREFIX]`
 Saves environment variables to a config file.
 
+- A plain `config save` always writes `user.env` (anchors, then one load line per env
+  file, then the guarded per-user line), whatever `config file` selected — it no longer
+  truncates a custom file. `config save user` is **refused** (rc 2): its prefix would be
+  the system `USER`, and it would replace the shared `user.env` with one line.
+- A required variable the saving shell lacks keeps the value its file already had
+  (`private.config.required.carry`, per-user file included, escapes intact).
+- A value that is not pure data (tab, newline, control character — bash prints it
+  `$'…'`) is **not persisted and reported** by name with `error.log`.
+- A file it cannot write fails up front (rc 1, named). A named save validates the file
+  it wrote; a plain save validates every file `user.env` loads. Saving twice writes
+  byte-identical files.
+- It prints nothing to stdout: its log lines go through `private.log.emit` (log.md), so
+  `$(config save …)` captures nothing.
+
 ```bash
 # Save to user.env (default)
 ./config save
@@ -531,7 +545,12 @@ Sets or adds an environment variable in the config.
 ./config set MY_CUSTOM_VAR "some value"
 ```
 
-If the variable exists, it's updated. If not, it's appended.
+If the variable exists, it's updated (one line, the legacy `export declare X=` form
+normalised). If not, it's appended. The line is rendered with `config save`'s own quoting
+(`private.config.variable.export.line`), so any value — `"`, `$`, `` ` ``, `\`, `|`, `&` —
+sources back byte for byte; a value with a newline or control character is refused.
+`config set` and `config unset` write the file back **in place** (identity, group-write),
+and `config unset` removes a file's last variable too.
 
 ### Managing Config Files
 
