@@ -439,13 +439,13 @@ The exclusion list above says what must **never** persist. This says what a conf
 | Variable | Lives in | Re-derived by | Authority |
 |---|---|---|---|
 | `BASH_FILE` | `user.env` | `command -v bash` | derived |
-| `CONFIG_FILE` | `user.env` | `config.init` | derived |
+| `CONFIG_FILE` | `user.env` | `config.anchors.init` | derived |
 | `OOSH_CONFIG_VERSION` | `user.env` (the anchor head) | `private.config.version.get` — the config format this branch writes | derived |
 | `OOSH_MODE` | **per user**: `$OOSH_USER_CONFIG_PATH/oosh.user.env` (`~oosh.user.env` in the manifest) | `basename` of the canonical `~/oosh` | derived |
 | `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` | derived |
 | `OOSH_PM` | `oosh.env` | side-effect-free package-manager detection | kept |
 | `LOG_LEVEL` | `log.env` | defaults to `3` | kept |
-| `ODOCKER_WORKSPACES` | `odocker.env` | `DockerWorkspaces` beside the Once.sh base (`odocker`) | kept |
+| `ODOCKER_WORKSPACES` | `odocker.env` — **optional**: the file is written and required only when it exists, a value is set, or the deriver answers (no components base → no odocker.env, still healthy) | `DockerWorkspaces` beside the Once.sh base (`odocker`) | kept |
 
 **Authority.** `derived`: the host or the checkout is the truth, so `config init.env`
 re-derives it even when it is set — a stale value is repaired, not only a missing one.
@@ -469,7 +469,10 @@ env file: a POSIX `sh` exits on `.` of a missing file, and a user who never save
 
 **Env files.** Every file named here is written by `config save` and loaded by
 `user.env` (`. $CONFIG_PATH/<name>.env`), together with any other file registered
-with `config add` whose file exists (`private.config.chain.files.get`).
+with `config add` whose file exists (`private.config.chain.files.get` — a legacy
+`source $CONFIG_PATH/<name>.env` line counts too and is rewritten in the `.` form). Which
+manifest files exist for a host is `private.config.manifest.files.get`: a file with a
+`derived` row always, a `kept`-only file when it exists, a value is set or a deriver answers.
 `config validate required` reports a missing file (`file:`), a missing load line
 (`load:`) and a stamp of another branch version (`version:`).
 

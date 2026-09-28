@@ -683,7 +683,9 @@ See [docs/log.md](log.md) for complete documentation.
 | `LOG_LEVEL` | Logging verbosity (0-6) | `3` |
 | `LOG_DEVICE` | Log output device | `/dev/tty` |
 | `OOSH_PROMPT` | PS1 prefix indicator | `"oosh "` |
-| `OOSH_MODE` | Operation mode | `"dev"` |
+| `OOSH_MODE` | The branch `~/oosh` points at, relative to the components base (`test/macos` for a slash branch) — per user, in `$OOSH_USER_CONFIG_PATH/oosh.user.env` | `"dev"` |
+| `OOSH_USER_CONFIG_PATH` | Per-user config dir (`oosh.user.env`, `log.session.env`, `mode-env.bash`) — an anchor line of `user.env` | `~/.config/oosh` |
+| `OOSH_CONFIG_VERSION` | The config-format stamp `config save` writes into `user.env` (`private.config.version.get`); another branch version's stamp is reported by `config validate required`, never auto-repaired | `1` |
 
 ---
 
