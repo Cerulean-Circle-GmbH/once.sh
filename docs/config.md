@@ -452,7 +452,9 @@ re-derives it even when it is set — a stale value is repaired, not only a miss
 **Per user.** `~/oosh` is per user, so the branch it names is too: `OOSH_MODE` is written
 by `config user.save` (and by `oo mode`) into `$OOSH_USER_CONFIG_PATH/oosh.user.env`, never
 into the shared `oosh.env`. `user.env` ends with the one guarded line
-`[ -f "$OOSH_USER_CONFIG_PATH/oosh.user.env" ] && . "$OOSH_USER_CONFIG_PATH/oosh.user.env"`
+`[ ! -f "$OOSH_USER_CONFIG_PATH/oosh.user.env" ] || . "$OOSH_USER_CONFIG_PATH/oosh.user.env"`
+(the `||` form: a sourced file returns its last command's status, so the `&&` form made
+`. ~/config/user.env` return 1 for every user who has no per-user file yet)
 (`private.config.user.load.line.get`) — the only logic `config validate` allows in an
 env file: a POSIX `sh` exits on `.` of a missing file, and a user who never saved has none.
 
