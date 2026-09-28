@@ -408,8 +408,9 @@ Without parameters, saves:
 The per-user `LOG_*` vars are deliberately NOT persisted into the shared
 `log.env`; they are written to the per-user `$OOSH_USER_CONFIG_PATH/log.session.env`
 by `log.session.save` (see [log.md](log.md)). If you add a new persisted env var
-that resolves to an absolute per-user path, extend the same exclusion `case` in
-`config.save` — and the `for leaker in …` list in `test/test.config` T29, which is the
+that resolves to an absolute per-user path, extend the exclusion `case` in
+`private.config.variable.persistable` — the one never-persist list, asked by `config.save`
+and by `config init.env`'s refuse-to-worsen guard — and the `for leaker in …` list in `test/test.config` T29, which is the
 value-level mirror of that `case` and the only thing that pins it.
 
 ### Required variables

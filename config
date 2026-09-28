@@ -526,8 +526,12 @@ REQUIRED
     local _bak="$CONFIG_PATH/$_envName.env.bak.$_ts"
     [ -f "$_bak" ] || continue
     local _wasCount _nowCount
-    _wasCount=$(grep -c '^[[:space:]]*export ' "$_bak" 2>/dev/null)
-    _nowCount=$(grep -c '^[[:space:]]*export ' "$CONFIG_PATH/$_envName.env" 2>/dev/null)
+    # Count only exports that may still be persisted: a variable that moved out
+    # of the shared tier (OOSH_MODE, T100) is a migration, not damage (T108).
+    _wasCount=$(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$_bak" 2>/dev/null \
+                | while read -r _n; do private.config.variable.persistable "$_n" && echo "$_n"; done | grep -c .)
+    _nowCount=$(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CONFIG_PATH/$_envName.env" 2>/dev/null \
+                | while read -r _n; do private.config.variable.persistable "$_n" && echo "$_n"; done | grep -c .)
     if [ "${_nowCount:-0}" -lt "${_wasCount:-0}" ]; then
       echo "config.init.env: REFUSING — $_envName.env went from ${_wasCount:-0} to ${_nowCount:-0} export lines; restoring $_bak"
       cp -p "$_bak" "$CONFIG_PATH/$_envName.env" 2>/dev/null
@@ -620,36 +624,7 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
     # Prefix as a whole name or a `name_…` family — never `${envPrefix}*`,
     # which for LOG would also grab LOGNAME.
     case "$variableName" in ${envPrefix}|${envPrefix}_*) ;; *) continue ;; esac
-    case "$variableName" in
-      # per-user / volatile / install-only / sudo-injected — never persist.
-      #
-      # Derived per-user paths are dynamically rebuilt from $HOME at every
-      # shell init (~/config/user.env's anchor lines and this.init set
-      # CONFIG_PATH / OOSH_DIR / OOSH_USER_CONFIG_PATH), so persisting their
-      # ABSOLUTE expanded value
-      # into shared config (the saving user's $HOME) only causes EACCES leaks
-      # when a different user later sources it. Same reasoning as
-      # LOG_LIVE/LOG_NAME/LOG_DEVICE (per-user, kept in
-      # $OOSH_USER_CONFIG_PATH/log.session.env, not the shared log.env).
-      # Install-only vars (LOG_INSTALL, INSTALL_LOG) must not persist into user
-      # sessions. OOSH_COMPONENTS_DIR is a transient /tmp/test.oo.* path from
-      # test runs — never share.
-      #
-      # OOSH_BRANCH is the install INPUT: the branch the OPERATOR ASKED FOR,
-      # meaningful for the length of one install and meaningless afterwards. It
-      # is not an absolute path, so it is here for the other reason this list
-      # exists — state that must be DERIVED, never remembered. Persisting it
-      # closed a loop (oosh.env seeds a shell, the shell reaches a config save,
-      # the save writes it back) in which nothing ever consults the checkout,
-      # and it left private.oo.install.branch.get answering "prod" on a dev box
-      # for weeks. The branch a host is ON is derived from the canonical
-      # ~/oosh (`this.git.branch.short "$HOME/oosh"` inside
-      # private.oo.install.branch.get, once OOSH_BRANCH is unset). That is T7.
-      #
-      # Documented at docs/config.md § Excluded variables and pinned by
-      # test/test.config T29 — change all three together.
-      *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|OOSH_CONFIG_VERSION|OOSH_MODE|SUDO_*|_) continue ;;
-    esac
+    private.config.variable.persistable "$variableName" || continue
     echo "$variableName"
   done
 }
@@ -1047,6 +1022,21 @@ private.config.healthy()     #  # rc 0 when the config is usable: CONFIG_PATH an
 }
 
 
+private.config.variable.persistable()     # <variableName> # rc 0 when <variableName> may be persisted to a shared env file — not an anchor, not per user, not install input; the ONE never-persist list, used by config save and by init.env refuse-to-worsen guard #
+{
+ # A predicate: rc only. The ONE never-persist list — it was inline in
+ # private.config.variables.list, so the refuse-to-worsen guard in
+ # config.init.env could not ask it and mistook a migration for damage (T108).
+ # Anchors and per-session/per-user values, install input, the version stamp
+ # the user.env head writes, and OOSH_MODE, which is per user (T100).
+ # docs/config.md's exclusion table and T29's leaker list mirror it.
+ case "$1" in
+   *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|OOSH_CONFIG_VERSION|OOSH_MODE|SUDO_*|_) return 1 ;;
+ esac
+ return 0
+}
+
+
 ### new.method
 
 config.usage()
@@ -1409,6 +1399,12 @@ REQUIRED
   for chainName in $(private.config.chain.files.get "$CONFIG_PATH/user.env"); do
     [ -f "$CONFIG_PATH/$chainName.env" ] || missing="$missing file:$chainName.env"
     grep -qxF ". \$CONFIG_PATH/$chainName.env" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:$chainName.env"
+    # A never-persist variable left in a shared file (the legacy OOSH_MODE in
+    # oosh.env, T100) makes the config unhealthy, so config init migrates it.
+    local staleName
+    for staleName in $(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CONFIG_PATH/$chainName.env" 2>/dev/null); do
+      private.config.variable.persistable "$staleName" || missing="$missing stale:$staleName@$chainName.env"
+    done
   done
 
   grep -qxF "$(private.config.user.load.line.get)" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:oosh.user.env"
