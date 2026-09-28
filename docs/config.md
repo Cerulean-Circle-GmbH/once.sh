@@ -260,7 +260,9 @@ is left untouched; a missing or broken one is **repaired** with `config init.ful
 re-checked (rc 1 naming what is still broken). The cheap anchors-only path,
 `config anchors.init`, is what `config.start`, `config file reset` and the `this`
 bootstrap use — `init/oosh` runs `this` during install, so it must never repair.
-`oo mode <branch>` runs the target branch's `config init` after every switch.
+`oo mode <branch>` only **checks** — the target branch's `config validate required` — and says
+`run: config init` when the config is not in that branch's format; a branch switch never
+repairs the shared tier (that is the operator's call, and `config init` shows what it does).
 
 ```bash
 ./config init

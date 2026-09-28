@@ -14,7 +14,7 @@ listed here run only when invoked.
 | Primitive | Scope | When to use |
 |---|---|---|
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
-| [`config init [user]`](config.md) | The whole config: checks, and repairs only a missing or broken one (`config init.full`) | `config validate required` says `INCOMPLETE` (missing variable, `file:`/`load:` of an env file, `version:` of another branch version); after `oo mode` it runs by itself |
+| [`config init`](config.md) | The whole config: checks, and repairs only a missing or broken one (`config init.full` for the caller; `config init.full <user>` for another user) | `config validate required` says `INCOMPLETE` (missing variable, `file:`/`load:` of an env file, `stale:`, OOSH_MODE drift); `oo mode` says so after a switch. A `version:` verdict alone is reported, not repaired — `config init.env` rewrites the format |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
 | [`config init.shared`](config.md) | `sharedConfig` dir exists, group `dev`, `g+w` (adds no SGID; a `2775` set at install is kept) | After cross-user perm drift, "Permission denied" on shared config writes; `sharedConfig` missing |
 | [`oo profile.status`](oo.md#ooprofilestatus) | Read-only report on `/etc/profile.d/oosh.sh`: missing, stale (still sources the retired `/etc/oosh/boot`) or OK; N/A on macOS | Before `oo profile.fix`; rc 1 when the drop-in needs repair, no privilege needed |
