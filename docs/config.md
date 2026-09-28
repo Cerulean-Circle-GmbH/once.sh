@@ -403,6 +403,7 @@ Without parameters, saves:
 | `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
 | `OOSH_CONFIG_VERSION` | the config-format stamp — written only by the `user.env` anchor head | `private.config.anchor.lines.get` |
 | `OOSH_MODE` | per user — the branch **this** user's `~/oosh` points at; in the shared tier the last writer's branch won for everyone | `config user.save` → `$OOSH_USER_CONFIG_PATH/oosh.user.env` |
+| `OOSH_WORKTREE_BASE` | the retired worktree layout — nothing sets or needs it any more; the clone layout always has `main/`. `oosh.env` exported it and every save wrote it back (the T7 loop) | (none — `config init` removes a leftover as `stale:`) |
 | `OOSH_BRANCH` | Install **input** — the branch the operator asked for. Not a path; excluded for the other reason this list exists: state that must be **derived, never remembered**. Persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** | not re-derived at shell init at all — the branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh` |
 
 The per-user `LOG_*` vars are deliberately NOT persisted into the shared
