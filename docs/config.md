@@ -449,6 +449,13 @@ The exclusion list above says what must **never** persist. This says what a conf
 re-derives it even when it is set — a stale value is repaired, not only a missing one.
 `kept`: a user's choice; only a missing value is re-derived.
 
+**Version.** A `version:` verdict (the stamp of another branch version) is a report for the
+operator: `config validate required` names it, but `private.config.healthy` — what `config init`
+and `oo mode` act on — ignores it, and only an explicit `config init.env` rewrites the format.
+Two users on branch versions with different stamps would otherwise rewrite the shared `user.env`
+back and forth on every `config init`. The reasons are one list,
+`private.config.required.missing.get`, read by both.
+
 **Per user.** `~/oosh` is per user, so the branch it names is too: `OOSH_MODE` is written
 by `config user.save` (and by `oo mode`) into `$OOSH_USER_CONFIG_PATH/oosh.user.env`, never
 into the shared `oosh.env`. `user.env` ends with the one guarded line

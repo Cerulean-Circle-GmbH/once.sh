@@ -1033,7 +1033,7 @@ config.anchors.init()     #  # set CONFIG_PATH (kept when given, else ~/config),
 
 
 config.anchors.init.completion() { :; }
-private.config.healthy()     #  # rc 0 when the config is usable: CONFIG_PATH and user.env exist, ~/config and ~/oosh resolve, and config validate required passes (version stamp included); no writes #
+private.config.healthy()     #  # rc 0 when the config is usable: CONFIG_PATH and user.env exist, ~/config and ~/oosh resolve, and private.config.required.missing.get reports nothing but a version: stamp (reported, never auto-repaired); no writes #
 {
  # A predicate: rc only, no create.result worth keeping, NO writes — it runs on
  # every `config init`, so a healthy config stays fast and untouched (T106).
@@ -1041,7 +1041,12 @@ private.config.healthy()     #  # rc 0 when the config is usable: CONFIG_PATH an
  [ -f "$CONFIG_PATH/user.env" ] || return 1
  [ -d "${OOSH_DIR:-$HOME/oosh}" ] || return 1              # a dangling ~/oosh is not -d
  [ ! -L "$HOME/config" ] || [ -d "$HOME/config" ] || return 1   # a dangling ~/config
- config.validate.required >/dev/null 2>&1
+ # Every reason but version: — a stamp of another branch version is reported
+ # by config validate required and rewritten only by an explicit config
+ # init.env. Acting on it here made two users on different branch versions
+ # rewrite the SHARED user.env into their own format on every config init and
+ # oo mode (F3); which format the shared tier carries is an operator decision.
+ [ -z "$(private.config.required.missing.get | grep -v '^version:')" ]
 }
 
 
@@ -1117,6 +1122,82 @@ MANIFEST
 $(private.config.required.variables.get)
 MANIFEST
  return 0
+}
+
+
+private.config.required.missing.get()     #  # every reason the persisted config is not the one this branch needs, one token per line: <variable>, file:<name>, load:<name>, stale:<v>@<file>, version:<got>(expected:<want>), anchor:<line>, drift:<persisted>|<actual> — empty when complete; the one list config validate required reports and private.config.healthy acts on #
+{
+ # A getter consumed as $(…): no create.result. The computation that lived in
+ # config.validate.required, moved out so that the report (validate.required)
+ # and the decision to REPAIR (private.config.healthy) read one list and can
+ # weigh its tokens differently: a version: token is a report for the
+ # operator, never a reason to rewrite the shared boot file by itself (F3).
+  local missing="" variable file rest manifestFiles
+  manifestFiles=" $(private.config.manifest.files.get | tr '\n' ' ') "
+  while read -r variable file rest; do
+    [ -z "$variable" ] && continue
+    # A row of an OPTIONAL manifest file (all rows kept, file absent, nothing
+    # to derive — private.config.manifest.files.get) is not missing (F2).
+    case "$file" in user.env|"~"*) ;; *) case "$manifestFiles" in *" ${file%.env} "*) ;; *) continue ;; esac ;; esac
+    local requiredPath="$CONFIG_PATH/$file"
+    case "$file" in "~"*) requiredPath="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/${file#\~}" ;; esac
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$requiredPath" 2>/dev/null \
+      || missing="$missing $variable"
+  done <<REQUIRED
+$(private.config.required.variables.get)
+REQUIRED
+
+  # Every env file user.env must load exists and is loaded — a missing
+  # odocker.env or a lost load line is a broken config too.
+  local chainName
+  for chainName in $(private.config.chain.files.get "$CONFIG_PATH/user.env"); do
+    [ -f "$CONFIG_PATH/$chainName.env" ] || missing="$missing file:$chainName.env"
+    grep -qxF ". \$CONFIG_PATH/$chainName.env" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:$chainName.env"
+    # A never-persist variable left in a shared file (the legacy OOSH_MODE in
+    # oosh.env, T100) makes the config unhealthy, so config init migrates it.
+    local staleName
+    for staleName in $(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CONFIG_PATH/$chainName.env" 2>/dev/null); do
+      private.config.variable.persistable "$staleName" || missing="$missing stale:$staleName@$chainName.env"
+    done
+  done
+
+  grep -qxF "$(private.config.user.load.line.get)" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:oosh.user.env"
+
+  # The config-format stamp: a config written by another branch version is
+  # foreign, not merely incomplete (a missing stamp is caught by the table).
+  local persistedVersion expectedVersion
+  expectedVersion=$(private.config.version.get)
+  persistedVersion=$(grep -m1 -E '^export OOSH_CONFIG_VERSION=' "$CONFIG_PATH/user.env" 2>/dev/null | cut -d= -f2- | tr -d '"')
+  [ -n "$persistedVersion" ] && [ "$persistedVersion" != "$expectedVersion" ] \
+    && missing="$missing version:OOSH_CONFIG_VERSION=$persistedVersion(expected:$expectedVersion)"
+
+  # The boot data: every anchor line the emitter writes must be present verbatim.
+  local anchorLine
+  while IFS= read -r anchorLine; do
+    # path-exception: a READ pattern that matches the emitter's line, not a PATH
+    # assignment — the two host-specific lines are skipped by this check.
+    case "$anchorLine" in 'export BASH_FILE='*|'export PATH="'/*|'export OOSH_CONFIG_VERSION='*) continue ;; esac
+    grep -Fxq "$anchorLine" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing anchor:${anchorLine#export }"
+  done <<< "$(private.config.anchor.lines.get "${BASH_FILE:-/bin/bash}")"
+
+  # Branch drift: the persisted OOSH_MODE against the branch ~/oosh actually
+  # points at. This is the T7 bug — persisted prod/released on a dev box, with
+  # nothing in the tree ever comparing the two.
+  local drift="" persistedMode actualMode
+  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/oosh.user.env" 2>/dev/null \
+                  | cut -d= -f2- | tr -d '"')
+  # The SAME accessor the repair uses. This was two inline steps here and two
+  # more at oo:2631-2633; three answers to "which branch is this host on" could
+  # drift apart, and the drift check disagreeing with the repair is the one
+  # disagreement that would be hardest to see.
+  actualMode=$(private.config.derive.oosh.mode 2>/dev/null)
+  if [ -n "$persistedMode" ] && [ -n "$actualMode" ] && [ "$persistedMode" != "$actualMode" ]; then
+    drift="OOSH_MODE=$persistedMode but ~/oosh is on $actualMode"
+  fi
+  local token
+  for token in $missing; do echo "$token"; done
+  [ -n "$persistedMode" ] && [ -n "$actualMode" ] && [ "$persistedMode" != "$actualMode" ] && echo "drift:$persistedMode|$actualMode"
+  return 0
 }
 
 
@@ -1497,68 +1578,16 @@ config.validate.required() # # verify the persisted config carries every variabl
   # internal caller in config.save are untouched. (Before this existed,
   # `config validate required` silently resolved to a non-existent
   # required.env and returned 2.)
-  local missing="" variable file rest manifestFiles
-  manifestFiles=" $(private.config.manifest.files.get | tr '\n' ' ') "
-  while read -r variable file rest; do
-    [ -z "$variable" ] && continue
-    # A row of an OPTIONAL manifest file (all rows kept, file absent, nothing
-    # to derive — private.config.manifest.files.get) is not missing (F2).
-    case "$file" in user.env|"~"*) ;; *) case "$manifestFiles" in *" ${file%.env} "*) ;; *) continue ;; esac ;; esac
-    local requiredPath="$CONFIG_PATH/$file"
-    case "$file" in "~"*) requiredPath="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/${file#\~}" ;; esac
-    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$requiredPath" 2>/dev/null \
-      || missing="$missing $variable"
-  done <<REQUIRED
-$(private.config.required.variables.get)
-REQUIRED
-
-  # Every env file user.env must load exists and is loaded — a missing
-  # odocker.env or a lost load line is a broken config too.
-  local chainName
-  for chainName in $(private.config.chain.files.get "$CONFIG_PATH/user.env"); do
-    [ -f "$CONFIG_PATH/$chainName.env" ] || missing="$missing file:$chainName.env"
-    grep -qxF ". \$CONFIG_PATH/$chainName.env" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:$chainName.env"
-    # A never-persist variable left in a shared file (the legacy OOSH_MODE in
-    # oosh.env, T100) makes the config unhealthy, so config init migrates it.
-    local staleName
-    for staleName in $(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CONFIG_PATH/$chainName.env" 2>/dev/null); do
-      private.config.variable.persistable "$staleName" || missing="$missing stale:$staleName@$chainName.env"
-    done
+  # The reasons come from private.config.required.missing.get — the one list
+  # this report and private.config.healthy share; this method only formats it.
+  local tokens missing="" drift="" token
+  tokens=$(private.config.required.missing.get)
+  for token in $tokens; do
+    case "$token" in
+      drift:*) token="${token#drift:}"; drift="OOSH_MODE=${token%%|*} but ~/oosh is on ${token#*|}" ;;
+      *) missing="$missing $token" ;;
+    esac
   done
-
-  grep -qxF "$(private.config.user.load.line.get)" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:oosh.user.env"
-
-  # The config-format stamp: a config written by another branch version is
-  # foreign, not merely incomplete (a missing stamp is caught by the table).
-  local persistedVersion expectedVersion
-  expectedVersion=$(private.config.version.get)
-  persistedVersion=$(grep -m1 -E '^export OOSH_CONFIG_VERSION=' "$CONFIG_PATH/user.env" 2>/dev/null | cut -d= -f2- | tr -d '"')
-  [ -n "$persistedVersion" ] && [ "$persistedVersion" != "$expectedVersion" ] \
-    && missing="$missing version:OOSH_CONFIG_VERSION=$persistedVersion(expected:$expectedVersion)"
-
-  # The boot data: every anchor line the emitter writes must be present verbatim.
-  local anchorLine
-  while IFS= read -r anchorLine; do
-    # path-exception: a READ pattern that matches the emitter's line, not a PATH
-    # assignment — the two host-specific lines are skipped by this check.
-    case "$anchorLine" in 'export BASH_FILE='*|'export PATH="'/*|'export OOSH_CONFIG_VERSION='*) continue ;; esac
-    grep -Fxq "$anchorLine" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing anchor:${anchorLine#export }"
-  done <<< "$(private.config.anchor.lines.get "${BASH_FILE:-/bin/bash}")"
-
-  # Branch drift: the persisted OOSH_MODE against the branch ~/oosh actually
-  # points at. This is the T7 bug — persisted prod/released on a dev box, with
-  # nothing in the tree ever comparing the two.
-  local drift="" persistedMode actualMode
-  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/oosh.user.env" 2>/dev/null \
-                  | cut -d= -f2- | tr -d '"')
-  # The SAME accessor the repair uses. This was two inline steps here and two
-  # more at oo:2631-2633; three answers to "which branch is this host on" could
-  # drift apart, and the drift check disagreeing with the repair is the one
-  # disagreement that would be hardest to see.
-  actualMode=$(private.config.derive.oosh.mode 2>/dev/null)
-  if [ -n "$persistedMode" ] && [ -n "$actualMode" ] && [ "$persistedMode" != "$actualMode" ]; then
-    drift="OOSH_MODE=$persistedMode but ~/oosh is on $actualMode"
-  fi
 
   # Status-output idiom: the verdict goes to stdout so it survives any
   # LOG_LEVEL or LOG_DEVICE, exactly as config.validate does.
