@@ -1,7 +1,7 @@
 # OOSH Architecture - Complete Reference
 
 **Purpose:** Comprehensive OOSH framework documentation
-**Location:** `/var/dev/Workspaces/2cuGitHub/once.sh/`
+**Location:** `~/oosh` → `/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/<branch>/`
 
 For detailed tool documentation, see [docs/wiki-index.md](wiki-index.md).
 
