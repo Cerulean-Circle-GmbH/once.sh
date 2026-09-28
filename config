@@ -959,6 +959,8 @@ config.user.save()     #  # write the per-user env file of the required manifest
    return $(result)
  fi
  for userFile in $(private.config.required.variables.get | awk '$2 ~ /^~/ && !seen[$2]++ {print $2}'); do
+   # Carry forward first: a shell without OOSH_MODE must not empty the file.
+   private.config.required.carry "$userFile" "$dir/${userFile#\~}"
    while read -r variable file rest; do
      [ "$file" = "$userFile" ] || continue
      [ -n "${!variable}" ] && private.config.variable.export.line "$variable"
@@ -1033,6 +1035,29 @@ private.config.variable.persistable()     # <variableName> # rc 0 when <variable
  case "$1" in
    *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|OOSH_CONFIG_VERSION|OOSH_MODE|OOSH_WORKTREE_BASE|SUDO_*|_) return 1 ;;
  esac
+ return 0
+}
+
+
+private.config.required.carry()     # <fileKey> <path> # export every required variable of the manifest file <fileKey> that this shell lacks, with the value <path> already holds (evaluated as the pure-data line it is, escapes intact) — the one carry-forward rule of config save and config user.save #
+{
+ # One rule, two writers (config.save, config.user.save): a required variable
+ # the shell lacks keeps the value its file already had — nothing that was
+ # there is thrown away by a shell that simply does not hold it. The line is
+ # pure data (config.validate), so it is evaluated in a subshell: the old
+ # cut/sed strip kept backslash escapes and changed a quoted value every save.
+ local fileKey="$1" path="$2" variable file rest line value
+ [ -f "$path" ] || return 0
+ while read -r variable file rest; do
+   [ "$file" = "$fileKey" ] || continue
+   [ -n "${!variable}" ] && continue
+   line=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$path" 2>/dev/null)
+   [ -n "$line" ] || continue
+   value=$(eval "$line" 2>/dev/null; printf '%s' "${!variable}")
+   [ -n "$value" ] && export "$variable=$value"
+ done <<REQUIRED
+$(private.config.required.variables.get)
+REQUIRED
  return 0
 }
 
@@ -1147,10 +1172,20 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   fi
 
 
+  # `config save user` would take the prefix USER — the system variable — and
+  # replace the SHARED user.env, every user's boot, with one line.
+  if [ "$file" = "user" ]; then
+    error.log "config.save: user.env is written by a plain ${YELLOW}config save${NORMAL} only (anchors + load lines) — not by config save user"
+    create.result 2 "config save user refused"
+    return $(result)
+  fi
   if [ -n "$file" ]; then
     config.file $file.env
   else
     name="CONFIG"
+    # A plain save writes user.env, whatever file `config file` selected — it
+    # used to truncate that custom file (config file myapp.env; config save).
+    config.file user.env
   fi
   
   stop.log "
@@ -1173,17 +1208,7 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   #
   # Read BEFORE the redirect: by the time `>$CONFIG` has run the old values are
   # gone, which is exactly how config.init.env lost OOSH_PM before card 2.
-  local requiredVariable requiredFile requiredDeriver carriedValue
-  while read -r requiredVariable requiredFile requiredDeriver requiredAuthority; do
-    [ -z "$requiredVariable" ] && continue
-    [ "$requiredFile" = "$CONFIG_FILE" ] || continue   # only rows for the file being written
-    [ -n "${!requiredVariable}" ] && continue          # the shell has it; it will be persisted
-    carriedValue=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?${requiredVariable}=" "$CONFIG" 2>/dev/null \
-                   | cut -d= -f2- | sed 's/^"//; s/"$//')
-    [ -n "$carriedValue" ] && export "$requiredVariable=$carriedValue"
-  done <<REQUIRED
-$(private.config.required.variables.get)
-REQUIRED
+  private.config.required.carry "$CONFIG_FILE" "$CONFIG"
 
   # The env files user.env loads, read NOW: the export block below truncates
   # $CONFIG, and for a no-argument save that is user.env itself.
@@ -1723,22 +1748,37 @@ config.set() # <envVariable> <value> # adds or sets an environment variable to t
   if [ -n "$value" ]; then
       shift
   fi
-
-  # Matches both "export X=..." and the legacy malformed "export declare X=..." form.
+  # The line is rendered by private.config.variable.export.line — the quoting
+  # config save uses — and swapped in by awk (ENVIRON, the whole line by name):
+  # sed broke on | & \ and never escaped " $ `. Also normalises the legacy
+  # "export declare X=" form, and leaves one line per variable.
+  local newLine
+  if ! newLine=$(export "$envVariable=$value"; private.config.variable.export.line "$envVariable"); then
+    error.log "config.set: $envVariable cannot be written as pure data (a newline or control character in the value)"
+    return 1
+  fi
   local currentDefinition="$( grep -E "^export( declare)? ${envVariable}=" "$CONFIG" 2>/dev/null )"
-  if [ -n "$currentDefinition" ]; then
-    if [ -z "$value" ]; then
-      warn.log "set blank value on
+  if [ -n "$currentDefinition" ] && [ -z "$value" ]; then
+    warn.log "set blank value on
       $currentDefinition
 
       "
-    fi
-    local tmpFile="${CONFIG}.tmp.$$"
-    # Replace the whole line (any form) with the clean "export X=value" form — normalizes on update.
-    sed -E "s|^export( declare)? ${envVariable}=.*|export ${envVariable}=\"${value}\"|" "$CONFIG" > "$tmpFile" && mv "$tmpFile" "$CONFIG"
-  else
-    echo "export $envVariable=\"$value\"" >>$CONFIG
   fi
+  [ -f "$CONFIG" ] || : > "$CONFIG"
+  local tmpFile="${CONFIG}.tmp.$$"
+  if ! CONFIG_SET_NAME="$envVariable" CONFIG_SET_LINE="$newLine" awk '
+         BEGIN { n = ENVIRON["CONFIG_SET_NAME"]; l = ENVIRON["CONFIG_SET_LINE"]; done = 0 }
+         $0 ~ ("^export( declare)? " n "=") { if (!done) print l; done = 1; next }
+         { print }
+         END { if (!done) print l }' "$CONFIG" > "$tmpFile"; then
+    rm -f "$tmpFile"
+    error.log "config.set: could not rewrite $CONFIG"
+    return 1
+  fi
+  # In place: a shared or symlinked file keeps its identity and group-write.
+  cat "$tmpFile" > "$CONFIG"
+  rm -f "$tmpFile"
+  private.ensure.groupWrite "$CONFIG"
 }
 
 
@@ -1755,9 +1795,19 @@ config.unset() # <envVariable> # removes <envVariable> from the current $CONFIG 
   [ ! -f "$CONFIG" ] && return 0
 
   if grep -q "^export $envVariable=" "$CONFIG" 2>/dev/null; then
-    local tmpFile="${CONFIG}.tmp.$$"
-    grep -v "^export $envVariable=" "$CONFIG" > "$tmpFile" && mv "$tmpFile" "$CONFIG"
-    debug.log "config.unset: removed $envVariable from $CONFIG"
+    local tmpFile="${CONFIG}.tmp.$$" rc
+    # grep -v exits 1 when it removed EVERY line — a success here; only rc 2 is
+    # an error. Written back IN PLACE, so a shared or symlinked file keeps its
+    # identity and group-write.
+    grep -v "^export $envVariable=" "$CONFIG" > "$tmpFile"; rc=$?
+    if [ "$rc" -le 1 ]; then
+      cat "$tmpFile" > "$CONFIG"
+      private.ensure.groupWrite "$CONFIG"
+      debug.log "config.unset: removed $envVariable from $CONFIG"
+    else
+      error.log "config.unset: could not rewrite $CONFIG"
+    fi
+    rm -f "$tmpFile"
   fi
 }
 
