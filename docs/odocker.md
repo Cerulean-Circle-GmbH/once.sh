@@ -19,15 +19,24 @@ install creates it**. On a fresh machine `$ODOCKER_WORKSPACES` therefore names a
 directory that is not there, and `odocker build` / `odocker workspace.list` /
 `os platform.test` (when it has to build an image, `os:212-220`) will say so.
 
-That is expected, not a defect: point oosh at a checkout, or start an empty root.
+That is expected, not a defect: seed the root from an existing tree, point oosh at a checkout, or start an empty root.
 
 ```bash
+odocker workspace.seed /path/to/old/DockerWorkspaces           # create beside Once.sh, copy the old tree in, share, set
 odocker workspace.set /path/to/EAMD.ucp/.../DockerWorkspaces   # existing tree
 odocker workspace.init /path/to/new/DockerWorkspaces           # create, then set
 ```
 
+With no path, `init`, `set` and `seed` use the default: `DockerWorkspaces` beside
+the Once.sh components base (`oo mode.base.get`) — on a shared host
+`/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces`.
+`/var/dev` is history.
+
 `workspace.set` **refuses** a directory that is not there; `workspace.init`
-creates it first, which is the difference between the two verbs.
+creates it first, which is the difference between the two verbs. `workspace.seed`
+creates it too and copies an existing root in (`private.this.folder.entries.copy`),
+then shares it with group dev (`private.this.folder.share`) — only into a root that
+holds no workspace yet, so a rerun never overwrites; the source is only read.
 
 To check a machine is ready to build platform images:
 
@@ -45,14 +54,15 @@ as part of `test.suite core` — a machine without the tree is not a broken oosh
 # persisted in $CONFIG_PATH/odocker.env, which user.env sources on
 # every shell startup. Relative paths (e.g. "./workspaces") are resolved
 # against the current cwd, not stored verbatim. With no argument it
-# resets to the platform default (/var/dev/EAMD.ucp/.../DockerWorkspaces).
+# resets to the default: DockerWorkspaces beside the Once.sh base (oo mode.base.get).
 odocker workspace.set "/path/to/DockerWorkspaces"
 odocker workspace.set                               # reset to default
 
 # Show current workspace directory (and its persistence location)
 odocker workspace.get
 
-# Default (if not set): /var/dev/EAMD.ucp/.../DockerWorkspaces
+# Default (if not set): <parent of oo mode.base.get>/DockerWorkspaces, e.g.
+# /home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces
 ```
 
 ## Quick Start
@@ -158,8 +168,9 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `workspace.get <?path>` | directory path (optional) | With no argument: show the current Docker workspaces directory, where it is persisted, **and whether it is usable** — rc 1 when it is not. With a path: report whether **that** path would be a usable root. A reporter only; it never sets, persists or creates |
-| `workspace.init <?path>` | directory path (optional — defaults to the platform default) | **Create** the directory if it is absent, then hand over to `workspace.set`. Idempotent. The verb to use on a fresh host, where `workspace.set` would refuse because the directory is not there yet |
-| `workspace.set <?path>` | directory path (optional — defaults to the platform default) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to `$ODOCKER_WORKSPACES_DEFAULT` |
+| `workspace.init <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | **Create** the directory if it is absent, then hand over to `workspace.set`. Idempotent. The verb to use on a fresh host, where `workspace.set` would refuse because the directory is not there yet |
+| `workspace.seed <from> <?path>` | an existing workspaces root; directory path (optional — the same default) | **Create** the root (via `workspace.init`), copy `<from>` in when the root holds no workspace yet, share it with group dev, set it. Refuses a `<from>` without Dockerfiles (rc 3). Idempotent; never overwrites; `<from>` is only read |
+| `workspace.set <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to that default |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
 
 > **Which verb:** `init` creates and sets, `set` sets an existing directory and
