@@ -1214,6 +1214,13 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   # $CONFIG, and for a no-argument save that is user.env itself.
   local chainFiles=""
   [ -z "$file" ] && chainFiles=$(private.config.chain.files.get "$CONFIG_PATH/user.env")
+  # A file config save cannot write fails HERE, naming it — the redirect below
+  # used to fail with a bare "Permission denied" and config save still said 0.
+  if ! { : >> "$CONFIG"; } 2>/dev/null; then
+    error.log "config.save: cannot write $CONFIG — check its owner and group-write"
+    create.result 1 "cannot write $CONFIG"
+    return $(result)
+  fi
   RESULT=""
   {
     # The harvesting loop that used to live here is now
@@ -1233,6 +1240,18 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # a single debug.log would be written into the generated env file.
     private.config.variables.export "$name"
   } >$CONFIG
+  # Reported AFTER the redirect (inside it, a log line would land in the file):
+  # a value bash can only render as $'…' — tab, newline, control characters —
+  # is not pure data, so it was skipped, and nobody was told.
+  if [ -n "$file" ]; then
+    local droppedName dropped=""
+    for droppedName in $(private.config.variables.list "$name"); do
+      private.config.variable.export.line "$droppedName" >/dev/null 2>&1 || dropped="$dropped $droppedName"
+    done
+    # error.log, not warn.log: a value that goes missing is data loss, and warn.log
+    # is silent at LOG_LEVEL 1 — the level most shells and the test suite run at.
+    [ -n "$dropped" ] && error.log "config.save: not persisted (a newline or control character in the value):$dropped"
+  fi
   private.ensure.groupWrite "$CONFIG"
 
   if [ -z "$file" ]; then
@@ -1303,12 +1322,20 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # a non-zero rc here is already more than any caller acts on today (audited
     # 2026-09-17 — nothing branches on it; private.check.pm is the only place it
     # could propagate and oo.pm.discover masks it with `RETURN=$1`).
-    local _envName _invalid=""
-    for _envName in user oosh log; do
-      config.validate "$_envName" >/dev/null 2>&1 || _invalid="$_invalid $_envName"
+    # EVERY file user.env loads (odocker.env, any `config add` file), not only
+    # user/oosh/log. rc 2 from config.validate is a missing file, not logic.
+    local _envName _invalid="" _missing="" _rc
+    for _envName in user $(private.config.chain.files.get "$CONFIG_PATH/user.env"); do
+      config.validate "$_envName" >/dev/null 2>&1; _rc=$?
+      [ "$_rc" -eq 1 ] && _invalid="$_invalid $_envName"
+      [ "$_rc" -eq 2 ] && _missing="$_missing $_envName"
     done
     if [ -n "$_invalid" ]; then
       echo "INVALID: config.save wrote$_invalid with logic in it — run 'config validate <name>' to see why" >&2
+      configSaveRc=1
+    fi
+    if [ -n "$_missing" ]; then
+      echo "INVALID: user.env loads$_missing but the file does not exist" >&2
       configSaveRc=1
     fi
     # if [ -x "$(command -v once)" ]; then
@@ -1316,6 +1343,11 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # fi
   fi
   config.info.log
+  # A named save validates the file it wrote — it used to always return 0.
+  if [ -n "$file" ] && ! config.validate "$CONFIG" >/dev/null 2>&1; then
+    echo "INVALID: config.save wrote $CONFIG with logic in it — run 'config validate $file' to see why" >&2
+    configSaveRc=1
+  fi
   return $configSaveRc
 }
 
@@ -1344,11 +1376,12 @@ config.validate() # <?name:user> # verify an env file is PURE DATA (only export/
     # Reject command substitution / backticks ANYWHERE (even inside a value):
     # they EXECUTE when the file is sourced, so they are logic, never pure data.
     # `export FOO="$(echo hi)"` used to pass (the export regex only anchored to `=`).
-    case "$line" in
-      *'$('* | *'`'*)
-        error.log "config.validate: $f:$lineNum contains command substitution (not pure data): $line"
-        violations=$((violations + 1)); continue ;;
-    esac
+    # Only a LIVE substitution: `\$(` is data (config save writes `$(` that way);
+    # an EVEN number of backslashes before `$(` or a backtick leaves it live.
+    if printf '%s\n' "$line" | grep -qE '(^|[^\\])(\\\\)*(\$\(|`)'; then
+      error.log "config.validate: $f:$lineNum contains command substitution (not pure data): $line"
+      violations=$((violations + 1)); continue
+    fi
     # allow: `export IDENT=…`, `export declare IDENT=…` (legacy), bare `IDENT=…`
     if echo "$trimmed" | grep -qE '^(export[[:space:]]+(declare[[:space:]]+)?)?[A-Za-z_][A-Za-z0-9_]*='; then
       continue
