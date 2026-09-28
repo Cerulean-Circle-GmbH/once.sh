@@ -446,7 +446,7 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
   return 0
 }
 
-config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (mirrors install at oo:1456)
+config.init.env() # # regenerate user.env and every manifest / loaded env file via config.save (mirrors install at oo:1456); backs them up first and refuses to worsen any of them
 {
   if [ -z "$OOSH_DIR" ]; then
     error.log "config.init.env: \$OOSH_DIR is empty — re-source ${YELLOW}this${NORMAL} or rerun under ${YELLOW}sudo -E${NORMAL}"
@@ -466,12 +466,17 @@ config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (
   # left to restore from. The refuse-to-worsen guard below restores from these.
   local _ts _envName
   _ts=$(date +%Y%m%d-%H%M%S)
-  for _envName in user oosh log; do
+  # EVERY file the save will rewrite — user.env, each manifest file, each
+  # loaded file — not a hard-coded user/oosh/log: the cascade truncates
+  # odocker.env and any `config add` file too, and those had no backup (F7).
+  local _envFiles
+  _envFiles="user $(private.config.chain.files.get "$CONFIG_PATH/user.env" | tr '\n' ' ')"
+  for _envName in $_envFiles; do
     [ -f "$CONFIG_PATH/$_envName.env" ] || continue
     cp -p "$CONFIG_PATH/$_envName.env" "$CONFIG_PATH/$_envName.env.bak.$_ts" 2>/dev/null \
       || warn.log "config.init.env: failed to back up $_envName.env (continuing)"
   done
-  important.log "config.init.env: backed up user/oosh/log .env → ${GREEN}*.env.bak.$_ts${NORMAL}"
+  important.log "config.init.env: backed up${_envFiles:+ $(echo $_envFiles | sed 's/ /.env, /g').env} → ${GREEN}*.env.bak.$_ts${NORMAL}"
 
   # WHAT WAS MISSING BEFORE THIS TICKET. config.save persists the ENVIRONMENT,
   # and the environment is populated FROM the config — a closed loop with no
@@ -489,7 +494,7 @@ config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (
   # derived one. The verdicts go to stdout — nothing captures config.init.env,
   # unlike config.save — so an operator running the advertised repair can see
   # what was reconstructed and what could not be.
-  local _variable _file _deriver _derived _repaired="" _unrecoverable=""
+  local _variable _file _deriver _derived _repaired="" _unrecoverable="" _optional=""
   while read -r _variable _file _deriver _authority; do
     [ -z "$_variable" ] && continue
     # `kept`: a user's choice (LOG_LEVEL, OOSH_PM, ODOCKER_WORKSPACES) — only a
@@ -502,16 +507,22 @@ config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (
     if [ -n "$_derived" ]; then
       [ "$_derived" = "${!_variable}" ] || _repaired="$_repaired $_variable"
       export "$_variable=$_derived"
-    elif [ -z "${!_variable}" ]; then
+    elif [ -z "${!_variable}" ] && [ "$_authority" = derived ]; then
       _unrecoverable="$_unrecoverable $_variable"
+    elif [ -z "${!_variable}" ]; then
+      # A kept row nothing derives is OPTIONAL, not unrecoverable (F2):
+      # ODOCKER_WORKSPACES without a components base. Its file is simply not
+      # written — private.config.manifest.files.get leaves it out.
+      _optional="$_optional $_variable"
     fi
   done <<REQUIRED
 $(private.config.required.variables.get)
 REQUIRED
   [ -n "$_repaired" ]      && echo "config.init.env: re-derived:$_repaired"
   [ -n "$_unrecoverable" ] && echo "config.init.env: could NOT derive:$_unrecoverable — the regenerated config will still be missing these"
+  [ -n "$_optional" ]      && echo "config.init.env: optional, nothing to derive:$_optional — its env file is not written"
 
-  important.log "config.init.env: regenerating ${YELLOW}user.env${NORMAL} + ${YELLOW}oosh.env${NORMAL} + ${YELLOW}log.env${NORMAL} via ${YELLOW}config save${NORMAL} (mirrors install)"
+  important.log "config.init.env: regenerating ${YELLOW}user.env${NORMAL} + every manifest / loaded env file via ${YELLOW}config save${NORMAL} (mirrors install)"
   # `config save` (no args) cascades internally: writes user.env, then calls
   # itself with (oosh OOSH) and (log LOG).
   config.save || warn.log "config.init.env: config.save returned non-zero — env files may be partial"
@@ -522,7 +533,7 @@ REQUIRED
   # tier came out with FEWER export lines than it went in with, put the backups
   # back and say so.
   local _envRc=0
-  for _envName in user oosh log; do
+  for _envName in $_envFiles; do
     local _bak="$CONFIG_PATH/$_envName.env.bak.$_ts"
     [ -f "$_bak" ] || continue
     local _wasCount _nowCount
@@ -574,6 +585,7 @@ config.init.full() # <username:$USER> # repair end-to-end: shared dir + user sym
   return $rc
 }
 
+config.init.completion()        { :; }
 config.init.shared.completion() { :; }
 config.init.env.completion()    { :; }
 config.init.user.completion.username()  { user.list; }
@@ -907,17 +919,21 @@ private.config.chain.files.get()     # <?userEnv:$CONFIG_PATH/user.env> # the en
  # The manifest's files come first and always (config.save writes them); an
  # extra load line survives only when its file exists — a load of a missing
  # file is how a POSIX login shell dies on `. $CONFIG_PATH/<gone>.env`.
- local userEnv="${1:-$CONFIG_PATH/user.env}" name seen=" "
- for name in $(private.config.required.variables.get | awk '{print $2}') \
-             $(grep -E '^\. \$CONFIG_PATH/[A-Za-z0-9_.-]+\.env$' "$userEnv" 2>/dev/null | sed 's|^\. \$CONFIG_PATH/||'); do
+ # The manifest list ONCE (it was re-read per candidate), and BOTH spellings
+ # config.validate accepts for a load line — `. $CONFIG_PATH/x.env` and the
+ # legacy `source $CONFIG_PATH/x.env` — so a file registered the old way is
+ # not dropped on the next save (the guard counted 0 → 0 and saw nothing).
+ local userEnv="${1:-$CONFIG_PATH/user.env}" name seen=" " manifestFiles
+ manifestFiles=" $(private.config.manifest.files.get | tr '\n' ' ') "
+ for name in $manifestFiles \
+             $(grep -E '^(source|\.)[[:space:]]+\$CONFIG_PATH/[A-Za-z0-9_.-]+\.env[[:space:]]*$' "$userEnv" 2>/dev/null | sed -E 's|^(source\|\.)[[:space:]]+\$CONFIG_PATH/||; s/[[:space:]]*$//'); do
    name="${name%.env}"
    [ "$name" = user ] && continue
    case "$name" in "~"*) continue ;; esac   # per-user: loaded by private.config.user.load.line.get
    case "$seen" in *" $name "*) continue ;; esac
    seen="$seen$name "
-   if private.config.required.variables.get | awk '{print $2}' | grep -qx "$name.env" || [ -f "$CONFIG_PATH/$name.env" ]; then
-     echo "$name"
-   fi
+   case "$manifestFiles" in *" $name "*) echo "$name"; continue ;; esac
+   [ -f "$CONFIG_PATH/$name.env" ] && echo "$name"
  done
 }
 
@@ -1063,6 +1079,43 @@ private.config.required.carry()     # <fileKey> <path> # export every required v
  done <<REQUIRED
 $(private.config.required.variables.get)
 REQUIRED
+ return 0
+}
+
+
+private.config.manifest.files.get()     #  # the manifest env files required NOW, one name per line without .env: a file with a derived row always; a file with only kept rows when it exists, a value is set, or one of its derivers answers — so ODOCKER_WORKSPACES does not make a Docker-less host unhealthy #
+{
+ # A getter consumed as $(…): no create.result. Used by config.save (which
+ # files to write), private.config.chain.files.get (which files user.env must
+ # load) and config.validate.required (which rows are required) — one answer.
+ # A `derived` row: the host or the checkout is its truth, always required. A
+ # file whose rows are all `kept` is a user's choice: required when the file
+ # exists, a value is set in this shell, or a deriver answers (F2: on a host
+ # with no components base, ODOCKER_WORKSPACES derives nothing — Docker is
+ # optional, the shared config is healthy without it).
+ local variable file deriver authority name seen=" " required v f d a
+ while read -r variable file deriver authority; do
+   [ -z "$variable" ] && continue
+   case "$file" in user.env|"~"*) continue ;; esac
+   name="${file%.env}"
+   case "$seen" in *" $name "*) continue ;; esac
+   seen="$seen$name "
+   required=""
+   [ -f "$CONFIG_PATH/$file" ] && required=1
+   if [ -z "$required" ]; then
+     while read -r v f d a; do
+       [ "$f" = "$file" ] || continue
+       [ "$a" = derived ] && { required=1; break; }
+       [ -n "${!v}" ] && { required=1; break; }
+       [ "$(type -t "$d")" = function ] && [ -n "$("$d" 2>/dev/null)" ] && { required=1; break; }
+     done <<MANIFEST
+$(private.config.required.variables.get)
+MANIFEST
+   fi
+   [ -n "$required" ] && echo "$name"
+ done <<MANIFEST
+$(private.config.required.variables.get)
+MANIFEST
  return 0
 }
 
@@ -1285,8 +1338,7 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # Every env file the required manifest names (oosh, log, odocker, …), each
     # with its own prefix — no longer a hard-coded oosh + log.
     local manifestFile
-    for manifestFile in $(private.config.required.variables.get | awk '$2 != "user.env" && $2 !~ /^~/ && !seen[$2]++ {print $2}'); do
-      manifestFile="${manifestFile%.env}"
+    for manifestFile in $(private.config.manifest.files.get); do
       config.save "$manifestFile" "$(private.config.string.upper "$manifestFile")"
     done
     config.file user.env
@@ -1410,7 +1462,7 @@ config.validate() # <?name:user> # verify an env file is PURE DATA (only export/
   return 0
 }
 
-config.validate.completion.name() { echo "user oosh log"; }
+config.validate.completion.name() { echo user; private.config.chain.files.get; }
 
 private.config.required.variables.get() # # the variables a config must carry for a branch version: "<variable> <file> <deriverFunction> <authority>", one per line; authority derived = always re-derived, kept = re-derived only when missing
 {
@@ -1445,9 +1497,13 @@ config.validate.required() # # verify the persisted config carries every variabl
   # internal caller in config.save are untouched. (Before this existed,
   # `config validate required` silently resolved to a non-existent
   # required.env and returned 2.)
-  local missing="" variable file rest
+  local missing="" variable file rest manifestFiles
+  manifestFiles=" $(private.config.manifest.files.get | tr '\n' ' ') "
   while read -r variable file rest; do
     [ -z "$variable" ] && continue
+    # A row of an OPTIONAL manifest file (all rows kept, file absent, nothing
+    # to derive — private.config.manifest.files.get) is not missing (F2).
+    case "$file" in user.env|"~"*) ;; *) case "$manifestFiles" in *" ${file%.env} "*) ;; *) continue ;; esac ;; esac
     local requiredPath="$CONFIG_PATH/$file"
     case "$file" in "~"*) requiredPath="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/${file#\~}" ;; esac
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$requiredPath" 2>/dev/null \
@@ -1832,12 +1888,12 @@ config.unset() # <envVariable> # removes <envVariable> from the current $CONFIG 
 
   [ ! -f "$CONFIG" ] && return 0
 
-  if grep -q "^export $envVariable=" "$CONFIG" 2>/dev/null; then
+  if grep -qE "^export( declare)? $envVariable=" "$CONFIG" 2>/dev/null; then
     local tmpFile="${CONFIG}.tmp.$$" rc
     # grep -v exits 1 when it removed EVERY line — a success here; only rc 2 is
     # an error. Written back IN PLACE, so a shared or symlinked file keeps its
     # identity and group-write.
-    grep -v "^export $envVariable=" "$CONFIG" > "$tmpFile"; rc=$?
+    grep -vE "^export( declare)? $envVariable=" "$CONFIG" > "$tmpFile"; rc=$?
     if [ "$rc" -le 1 ]; then
       cat "$tmpFile" > "$CONFIG"
       private.ensure.groupWrite "$CONFIG"
