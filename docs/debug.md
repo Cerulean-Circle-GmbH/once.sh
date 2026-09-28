@@ -119,6 +119,15 @@ Sets up all debugging traps:
 debug.setTrap  # Enable all traps
 ```
 
+### debug.removeTrap()
+
+Switches stepping off (`STEP_DEBUG=OFF`); the traps stay armed. This is what the `r` step
+command (continue till the next return) does before it goes on.
+
+```bash
+debug.removeTrap
+```
+
 ### debug.onError()
 
 Trap handler for errors. Shows error details and optionally stack trace.
