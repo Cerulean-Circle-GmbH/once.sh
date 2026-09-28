@@ -386,6 +386,7 @@ Without parameters, saves:
 | `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config` (derived from CONFIG_PATH) |
 | `OOSH_DIR` | per-user oosh tree path | the `user.env` anchor line (`$HOME/oosh`, unexpanded); `this` falls back to the same literal |
 | `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
+|  | the config-format stamp — written only by the  anchor head |  |
 | `OOSH_BRANCH` | Install **input** — the branch the operator asked for. Not a path; excluded for the other reason this list exists: state that must be **derived, never remembered**. Persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** | not re-derived at shell init at all — the branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh` |
 
 The per-user `LOG_*` vars are deliberately NOT persisted into the shared
@@ -401,14 +402,26 @@ The exclusion list above says what must **never** persist. This says what a conf
 **carry**. It is declared as data in `config` by `private.config.required.variables.get`
 — change both together.
 
-| Variable | Lives in | Re-derived by |
-|---|---|---|
-| `BASH_FILE` | `user.env` | `command -v bash` |
-| `CONFIG_FILE` | `user.env` | `config.init` |
-| `OOSH_MODE` | `oosh.env` | `basename` of the canonical `~/oosh` |
-| `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` |
-| `OOSH_PM` | `oosh.env` | `oo pm.discover` |
-| `LOG_LEVEL` | `log.env` | defaults to `1` |
+| Variable | Lives in | Re-derived by | Authority |
+|---|---|---|---|
+| `BASH_FILE` | `user.env` | `command -v bash` | derived |
+| `CONFIG_FILE` | `user.env` | `config.init` | derived |
+| `OOSH_CONFIG_VERSION` | `user.env` (the anchor head) | `private.config.version.get` — the config format this branch writes | derived |
+| `OOSH_MODE` | `oosh.env` | `basename` of the canonical `~/oosh` | derived |
+| `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` | derived |
+| `OOSH_PM` | `oosh.env` | side-effect-free package-manager detection | kept |
+| `LOG_LEVEL` | `log.env` | defaults to `3` | kept |
+| `ODOCKER_WORKSPACES` | `odocker.env` | `DockerWorkspaces` beside the Once.sh base (`odocker`) | kept |
+
+**Authority.** `derived`: the host or the checkout is the truth, so `config init.env`
+re-derives it even when it is set — a stale value is repaired, not only a missing one.
+`kept`: a user's choice; only a missing value is re-derived.
+
+**Env files.** Every file named here is written by `config save` and loaded by
+`user.env` (`. $CONFIG_PATH/<name>.env`), together with any other file registered
+with `config add` whose file exists (`private.config.chain.files.get`).
+`config validate required` reports a missing file (`file:`), a missing load line
+(`load:`) and a stamp of another branch version (`version:`).
 
 It **also** checks the anchor lines. `config.validate.required` re-runs
 `private.config.anchor.lines.get` and requires each of its host-independent lines
