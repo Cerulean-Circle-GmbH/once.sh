@@ -157,37 +157,26 @@ config.string.quote() { # <string> # quote the string to be used as a command li
   echo $RESULT
 }
 
-config.init() # # inititalizes the $CONFIG environment if $CONFIG is empty
+config.init() # # set the config anchors, then check the config; when it is missing or broken, repair it with config init.full
 {
-  # HONOUR an anchor already set; default to the constant when there is none.
-  # This used to be an unconditional `export CONFIG_PATH=~/config`, and
-  # config.start re-runs config.init whenever $CONFIG is not a file — so
-  # sourcing `config` silently moved the anchor back and undid any fixture
-  # FROM INSIDE the file under test. That is why test/test.config and
-  # test/test.completion.audit had to declare TEST_SHARED_TIER_WRITER instead
-  # of isolating.
-  #
-  # The conditional form is not a bend of the anchor rule, it IS the rule:
-  # private.this.anchor.validate.one counts `: ${CONFIG_PATH:=~/config}` as
-  # CONFORMING, and `this`, `log` and `ossh` already use exactly this shape for
-  # exactly this variable. A cold shell still lands on the constant.
-  # CONFIG_PATH only. CONFIG_FILE is NOT an anchor — it is the currently
-  # selected file, and `config file reset` means "go back to user.env" and
-  # reaches that through here (config.file's reset branch). Making it
-  # conditional too broke T16, which is exactly the assertion that pins it.
-  : ${CONFIG_PATH:=~/config}
-  export CONFIG_PATH
-  export CONFIG_FILE=user.env
-
-  if [ ! -d $CONFIG_PATH ]; then
-    mkdir $CONFIG_PATH
-  #else
-  #  source $CONFIG
+  # It used to only set the anchors and make a directory — a missing user.env,
+  # a dangling ~/config, a foreign branch version all passed `config init`
+  # untouched. Now: the anchors (config.anchors.init), a cheap no-write check
+  # (private.config.healthy), and only on failure the repair family.
+  config.anchors.init
+  if private.config.healthy; then
+    create.result 0 "config healthy: $CONFIG_PATH"
+    return $(result)
   fi
-  touch $CONFIG_PATH/error.txt
-
-  export CONFIG=$CONFIG_PATH/$CONFIG_FILE
-  debug.log "$CONFIG"
+  important.log "config init: ${YELLOW}$CONFIG_PATH${NORMAL} is missing or broken — repairing with ${YELLOW}config init.full${NORMAL}"
+  config.init.full "$USER"
+  if private.config.healthy; then
+    create.result 0 "config repaired: $CONFIG_PATH"
+  else
+    create.result 1 "config init: still broken after config init.full — $(config.validate.required 2>/dev/null | head -1)"
+    error.log "$RESULT"
+  fi
+  return $(result)
 }
 
 # ---------------------------------------------------------------------------
@@ -198,7 +187,7 @@ config.init() # # inititalizes the $CONFIG environment if $CONFIG is empty
 # sharedConfig dir mode 2775 group dev; no self-referential symlinks.
 # ---------------------------------------------------------------------------
 
-config.init.shared() # # ensure sharedConfig dir is mode 2775 group dev; remove self-loops; idempotent
+config.init.shared() # # ensure sharedConfig exists, group dev, g+w (no SGID — see private.ensure.sharedTree); remove self-loops; idempotent
 {
   # `user` script provides user.get, private.as.user, user.group.add — not
   # auto-loaded by `source this`. Source on demand so `./config init.*` works
@@ -215,10 +204,15 @@ config.init.shared() # # ensure sharedConfig dir is mode 2775 group dev; remove 
   baseDir=$(dirname "$devHome")
   local sharedConfig="$baseDir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
   if [ ! -d "$sharedConfig" ]; then
-    error.log "config.init.shared: sharedConfig missing: ${RED}$sharedConfig${NORMAL} — install not completed"
-    return 1
+    # A NONEXISTING config is repaired too: create it when the caller may
+    # (its parent is group dev, g+w); otherwise say exactly what to run.
+    if ! mkdir -p "$sharedConfig" 2>/dev/null; then
+      error.log "config.init.shared: cannot create ${RED}$sharedConfig${NORMAL} — run ${YELLOW}sudo -E ./config init.shared${NORMAL}"
+      return 1
+    fi
+    important.log "config.init.shared: created ${YELLOW}$sharedConfig${NORMAL}"
   fi
-  important.log "config.init.shared: normalising ${YELLOW}$sharedConfig${NORMAL} (mode 2775, group dev)"
+  important.log "config.init.shared: normalising ${YELLOW}$sharedConfig${NORMAL} (group dev, g+w)"
   private.ensure.sharedTree "$sharedConfig"
 }
 
@@ -253,6 +247,10 @@ config.init.user() # <username:$USER> # ensure the user's ~/config + ~/oosh syml
   # Avoids the case where $OOSH_MODE is set to a stale value like "released"
   # that doesn't have a corresponding worktree on disk.
   local sharedOoshBase="$baseDir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
+  if [ ! -d "$sharedConfig" ]; then
+    error.log "config.init.user: ${RED}$sharedConfig${NORMAL} does not exist — run ${YELLOW}config init.shared${NORMAL} first"
+    return 1
+  fi
   local sharedOosh=""
   # OOSH_DIR is ~/oosh (a symlink), so the prefix test needs its PHYSICAL
   # target — the literal never starts with $sharedOoshBase. See
@@ -412,6 +410,7 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
       fi
     fi
     # Symlink owner should be <user>:<user>, not <user>:dev
+    [ -d "$cTarget" ] || warn.log "  ~/config points at nothing ($cTarget) — run ${YELLOW}config init${NORMAL}"
     case "$cOwner" in
       "$username:$username") : ;;
       *) warn.log "  ~/config owner ${RED}$cOwner${NORMAL} drifted from canonical ${GREEN}$username:$username${NORMAL} — run ${YELLOW}config init.user${NORMAL}" ;;
@@ -423,6 +422,10 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
   # Stale-dev-group warning: in /etc/group but not in active group set.
   # We can only check the *running* shell's group set when the username is
   # the caller; for other users we just check static membership.
+  if [ ! -d "$targetHome/oosh" ]; then
+    warn.log "  ~/oosh is missing or points at nothing — run ${YELLOW}config init${NORMAL}"
+  fi
+
   if getent group dev 2>/dev/null | grep -qE "(:|,)$username(,|$)"; then
     if [ "$username" = "$USER" ]; then
       if ! id -nG | grep -qw dev; then
@@ -1006,6 +1009,44 @@ private.config.user.load.line.get()     #  # the one guarded line user.env ends 
 }
 
 
+config.anchors.init()     #  # set CONFIG_PATH (kept when given, else ~/config), CONFIG_FILE and CONFIG in this shell and create CONFIG_PATH when absent — no check, no repair: the cheap path config.start, config file reset and the this bootstrap use #
+{
+  # The CHEAP half of what config.init used to be, unchanged: config.start,
+  # `config file reset` / `config location reset` and the `this` bootstrap
+  # need the anchors on every call, never a repair (init/oosh runs `this`
+  # during install, as root). `config init` is the user-facing check + repair.
+  #
+  # HONOUR an anchor already set; default to the constant when there is none —
+  # an unconditional export here undid test fixtures from inside the file under
+  # test (T72). private.this.anchor.validate.one counts this shape CONFORMING.
+  # CONFIG_FILE is not an anchor: `config file reset` means "back to user.env".
+  : ${CONFIG_PATH:=~/config}
+  export CONFIG_PATH
+  export CONFIG_FILE=user.env
+
+  if [ ! -d $CONFIG_PATH ]; then
+    mkdir $CONFIG_PATH
+  fi
+  touch $CONFIG_PATH/error.txt
+
+  export CONFIG=$CONFIG_PATH/$CONFIG_FILE
+  debug.log "$CONFIG"
+}
+
+
+config.anchors.init.completion() { :; }
+private.config.healthy()     #  # rc 0 when the config is usable: CONFIG_PATH and user.env exist, ~/config and ~/oosh resolve, and config validate required passes (version stamp included); no writes #
+{
+ # A predicate: rc only, no create.result worth keeping, NO writes — it runs on
+ # every `config init`, so a healthy config stays fast and untouched (T106).
+ [ -d "$CONFIG_PATH" ] || return 1
+ [ -f "$CONFIG_PATH/user.env" ] || return 1
+ [ -d "${OOSH_DIR:-$HOME/oosh}" ] || return 1              # a dangling ~/oosh is not -d
+ [ ! -L "$HOME/config" ] || [ -d "$HOME/config" ] || return 1   # a dangling ~/config
+ config.validate.required >/dev/null 2>&1
+}
+
+
 ### new.method
 
 config.usage()
@@ -1412,7 +1453,7 @@ REQUIRED
     [ -n "$drift" ] && reason="${reason:+$reason; }$drift"
     create.result 1 "INCOMPLETE: $CONFIG_PATH — $reason"
     echo "$RESULT"
-    echo "  repair with: config init.env   (regenerates user.env + oosh.env + log.env)"
+    echo "  repair with: config init   (checks, then repairs with config init.full)"
     return $(result)
   fi
   create.result 0 "OK: $CONFIG_PATH carries every required variable and agrees with the checkout"
@@ -1572,7 +1613,7 @@ config.file() # <configfile> # sets the default config file to <configfile> if i
   else
     case "$1" in
       reset)
-        config.init
+        config.anchors.init
         echo "CONFIG_PATH=$CONFIG_PATH"
         echo "CONFIG_FILE=$CONFIG_FILE"
         echo
@@ -1595,7 +1636,7 @@ config.location() # <configfile> # sets the default config location to <configfi
   else
     case "$1" in
       reset)
-        config.init
+        config.anchors.init
         echo "CONFIG_PATH=$CONFIG_PATH"
         echo "CONFIG_FILE=$CONFIG_FILE"
         echo
@@ -1740,7 +1781,7 @@ config.start() # <method> <parameter> # default start and parameter processing
   #check.debug.level 6
 
   if [ -z "$CONFIG_PATH" ] || ! [ -f "$CONFIG" ]; then
-      config.init
+      config.anchors.init
   fi
   if [ "$(type -t this.start)" = "function" ]; then
     this.start "$@"
