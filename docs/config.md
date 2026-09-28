@@ -253,7 +253,14 @@ chain still resolves — but `config validate required` reports INCOMPLETE until
 ### Initialization
 
 #### `config.init`
-Initializes the config environment. Creates `~/config/` directory if needed.
+Sets the config anchors (`config anchors.init`), then **checks** the config with
+`private.config.healthy` — `CONFIG_PATH` and `user.env` exist, `~/config` and `~/oosh`
+resolve, `config validate required` passes (version stamp included). A healthy config
+is left untouched; a missing or broken one is **repaired** with `config init.full` and
+re-checked (rc 1 naming what is still broken). The cheap anchors-only path,
+`config anchors.init`, is what `config.start`, `config file reset` and the `this`
+bootstrap use — `init/oosh` runs `this` during install, so it must never repair.
+`oo mode <branch>` runs the target branch's `config init` after every switch.
 
 ```bash
 ./config init
@@ -300,7 +307,8 @@ sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_
 ```
 
 #### `config.init.shared`
-Ensures the shared `sharedConfig/` directory has group `dev`, recursively
+Creates the shared `sharedConfig/` directory when it is missing (or names
+`sudo -E ./config init.shared` when the caller may not), then ensures it has group `dev`, recursively
 `g+w`, and removes any self-referential symlink at
 `sharedConfig/sharedConfig`. Mirrors install at `oo:1462–1463`. Idempotent.
 
@@ -314,7 +322,9 @@ shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
 `~/oosh` directories are renamed to `~/config.orig.<timestamp>` (data
 preserved, never deleted). Installs `templates/user/bashrcTemplate` if the
 OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
-backup). Adds `<user>` to group `dev` if not already a member.
+backup). Adds `<user>` to group `dev` if not already a member. Refuses when
+`sharedConfig` does not exist — run `config init.shared` first — rather than link
+`~/config` to nothing.
 
 ```bash
 ./config init.user           # self
@@ -323,10 +333,14 @@ backup). Adds `<user>` to group `dev` if not already a member.
 
 #### `config.init.env`
 Regenerates `user.env`, `oosh.env`, and `log.env` by calling `config save`
-(no args) — the same flow the install uses at `oo:1456`. **Backs up
-`user.env` to `user.env.bak.<timestamp>` first** so any hand-edited
+(no args) — the same flow the install uses at `oo:1456`. Re-derives every
+`derived` required variable (even a stale one) and every missing `kept` one first
+(§ Required variables). **Backs up `user.env`, `oosh.env` and `log.env` to
+`<name>.env.bak.<timestamp>` first** so any hand-edited
 customisations (custom non-`CONFIG_*` exports, hand-added source lines beyond
-what `config add` writes) are recoverable. Caller's shell must have `OOSH_DIR`
+what `config add` writes) are recoverable, and **refuses** — restoring the backups —
+when a file ends with fewer `export` lines or `user.env` loads fewer env files
+than before. Caller's shell must have `OOSH_DIR`
 and the relevant `OOSH_*`/`LOG_*` vars set — true for any normal `./config`
 invocation, but under `sudo` use `sudo -E` to preserve env.
 
@@ -341,7 +355,8 @@ will pass.
 
 #### `config.init.check [<username>]`
 Diagnostic only — never modifies anything, always returns `0`. Reports the
-`~/config` symlink owner, the `sharedConfig/` group, presence of any
+`~/config` symlink owner and whether it points at anything, a missing or dangling
+`~/oosh`, the `sharedConfig/` group, presence of any
 self-referential symlink, and warns if the user is in `/etc/group`'s `dev`
 membership but the *running shell's* active group set doesn't include it (the
 classic post-install "log out fully and log back in" condition).
