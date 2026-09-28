@@ -658,8 +658,6 @@ These functions are used internally and generally not called directly:
 
 | Function | Description |
 |----------|-------------|
-| `config.path.create` | Creates directory paths (deprecated) |
-| `config.folder.create` | Creates single directory (deprecated) |
 | `config.string.quote` | Quotes strings for command line |
 | `config.info.log` | Logs config at info level |
 | `config.completion.*` | Tab completion helpers |
