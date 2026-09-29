@@ -373,7 +373,7 @@ classic post-install "log out fully and log back in" condition).
 Saves environment variables to a config file.
 
 - A plain `config save` always writes `user.env` (anchors, then one load line per env
-  file, then the guarded per-user line), whatever `config file` selected — it no longer
+  file — exports and chain lines only, never logic), whatever `config file` selected — it no longer
   truncates a custom file. `config save user` is **refused** (rc 2): its prefix would be
   the system `USER`, and it would replace the shared `user.env` with one line.
 - A required variable the saving shell lacks keeps the value its file already had
@@ -460,12 +460,14 @@ back and forth on every `config init`. The reasons are one list,
 
 **Per user.** `~/oosh` is per user, so the branch it names is too: `OOSH_MODE` is written
 by `config user.save` (and by `oo mode`) into `$OOSH_USER_CONFIG_PATH/oosh.user.env`, never
-into the shared `oosh.env`. `user.env` ends with the one guarded line
-`[ ! -f "$OOSH_USER_CONFIG_PATH/oosh.user.env" ] || . "$OOSH_USER_CONFIG_PATH/oosh.user.env"`
-(the `||` form: a sourced file returns its last command's status, so the `&&` form made
-`. ~/config/user.env` return 1 for every user who has no per-user file yet)
-(`private.config.user.load.line.get`) — the only logic `config validate` allows in an
-env file: a POSIX `sh` exits on `.` of a missing file, and a user who never saved has none.
+into the shared `oosh.env`. **`user.env` carries no line for it.** A per-user file cannot be
+a chain line of the shared `user.env` — a POSIX `sh` exits on `.` of a missing file, and a
+guard against that is logic, which no env file may hold. The kernel loads it **in code**:
+`this.init` calls `private.this.user.env.load`, which sources the file when it exists and
+keeps an `OOSH_MODE` the environment already carries — the same way `log` owns and loads
+`log.session.env`. (For one day, 2026-09-28, `config save` appended a guarded load line
+`[ … ] || . …` to `user.env` and `config validate` allowed it. `config validate required`
+now reports such a line as `logic:user.env`, and `config init` rewrites the file.)
 
 **Env files.** Every file named here is written by `config save` and loaded by
 `user.env` (`. $CONFIG_PATH/<name>.env`), together with any other file registered

@@ -313,7 +313,10 @@ boots via `source this`:
    │   (`log` creates and sources $OOSH_USER_CONFIG_PATH/log.session.env itself)
    │
    ├─ private.this.path.dedup     # the PATH line is data and cannot guard itself
-   ├─ this.init                   # re-sources $CONFIG for executed scripts,
+   ├─ this.init                   # loads the per-user data file in CODE
+   │                              #   (private.this.user.env.load: OOSH_MODE from
+   │                              #   $OOSH_USER_CONFIG_PATH/oosh.user.env), then
+   │                              #   re-sources $CONFIG for executed scripts,
    │                              #   saving/restoring PATH and the anchors
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
