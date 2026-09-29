@@ -253,16 +253,7 @@ chain still resolves — but `config validate required` reports INCOMPLETE until
 ### Initialization
 
 #### `config.init`
-Sets the config anchors (`config anchors.init`), then **checks** the config with
-`private.config.healthy` — `CONFIG_PATH` and `user.env` exist, `~/config` and `~/oosh`
-resolve, `config validate required` passes (version stamp included). A healthy config
-is left untouched; a missing or broken one is **repaired** with `config init.full` and
-re-checked (rc 1 naming what is still broken). The cheap anchors-only path,
-`config anchors.init`, is what `config.start`, `config file reset` and the `this`
-bootstrap use — `init/oosh` runs `this` during install, so it must never repair.
-`oo mode <branch>` only **checks** — the target branch's `config validate required` — and says
-`run: config init` when the config is not in that branch's format; a branch switch never
-repairs the shared tier (that is the operator's call, and `config init` shows what it does).
+Initializes the config environment. Creates `~/config/` directory if needed.
 
 ```bash
 ./config init
@@ -309,8 +300,7 @@ sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_
 ```
 
 #### `config.init.shared`
-Creates the shared `sharedConfig/` directory when it is missing (or names
-`sudo -E ./config init.shared` when the caller may not), then ensures it has group `dev`, recursively
+Ensures the shared `sharedConfig/` directory has group `dev`, recursively
 `g+w`, and removes any self-referential symlink at
 `sharedConfig/sharedConfig`. Mirrors install at `oo:1462–1463`. Idempotent.
 
@@ -324,11 +314,7 @@ shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
 `~/oosh` directories are renamed to `~/config.orig.<timestamp>` (data
 preserved, never deleted). Installs `templates/user/bashrcTemplate` if the
 OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
-backup). Adds `<user>` to group `dev` if not already a member. Writes the user's own
-`$OOSH_USER_CONFIG_PATH/oosh.user.env` (`OOSH_MODE`, derived from where **their** `~/oosh` points —
-`private.config.user.mode.save`, run as them). Refuses when
-`sharedConfig` does not exist — run `config init.shared` first — rather than link
-`~/config` to nothing.
+backup). Adds `<user>` to group `dev` if not already a member.
 
 ```bash
 ./config init.user           # self
@@ -337,14 +323,10 @@ backup). Adds `<user>` to group `dev` if not already a member. Writes the user's
 
 #### `config.init.env`
 Regenerates `user.env`, `oosh.env`, and `log.env` by calling `config save`
-(no args). The install itself ends with it: state 51 (`headless.setup.finished`) runs `config init.env`, because state 31 only does a plain `config save`, which persists and never derives — a fresh install used to end with an empty `odocker.env`. Re-derives every
-`derived` required variable (even a stale one) and every missing `kept` one first
-(§ Required variables). **Backs up `user.env`, `oosh.env` and `log.env` to
-`<name>.env.bak.<timestamp>` first** so any hand-edited
+(no args) — the same flow the install uses at `oo:1456`. **Backs up
+`user.env` to `user.env.bak.<timestamp>` first** so any hand-edited
 customisations (custom non-`CONFIG_*` exports, hand-added source lines beyond
-what `config add` writes) are recoverable, and **refuses** — restoring the backups —
-when a file ends with fewer `export` lines or `user.env` loads fewer env files
-than before. Caller's shell must have `OOSH_DIR`
+what `config add` writes) are recoverable. Caller's shell must have `OOSH_DIR`
 and the relevant `OOSH_*`/`LOG_*` vars set — true for any normal `./config`
 invocation, but under `sudo` use `sudo -E` to preserve env.
 
@@ -359,8 +341,7 @@ will pass.
 
 #### `config.init.check [<username>]`
 Diagnostic only — never modifies anything, always returns `0`. Reports the
-`~/config` symlink owner and whether it points at anything, a missing or dangling
-`~/oosh`, the `sharedConfig/` group, presence of any
+`~/config` symlink owner, the `sharedConfig/` group, presence of any
 self-referential symlink, and warns if the user is in `/etc/group`'s `dev`
 membership but the *running shell's* active group set doesn't include it (the
 classic post-install "log out fully and log back in" condition).
@@ -373,27 +354,6 @@ classic post-install "log out fully and log back in" condition).
 
 #### `config.save [name] [PREFIX]`
 Saves environment variables to a config file.
-
-- A plain `config save` always writes `user.env` (anchors, then one load line per env
-  file — exports and chain lines only, never logic), whatever `config file` selected — it no longer
-  truncates a custom file. `config save user` is **refused** (rc 2): its prefix would be
-  the system `USER`, and it would replace the shared `user.env` with one line.
-- A save never drops a value only because the saving shell does not hold it. Every
-  variable of the file's family that the file already holds and the shell lacks is carried
-  forward (`private.config.file.carry`; the manifest variables, per-user file included, by
-  `private.config.required.carry`), escapes intact (`private.config.file.value.get`). A
-  never-persist variable is not carried — that is how a migration leaves the shared tier.
-  To **remove** a variable use `config unset`.
-- A value holding ANY control character (tab, newline, ESC, …) is judged by the value
-  itself, so the answer does not depend on the bash that runs the save: bash 5.1 would
-  write a raw tab inside double quotes where 5.2 and 3.2 reach for `$'…'`.
-- A value that is not pure data (tab, newline, control character — bash prints it
-  `$'…'`) is **not persisted and reported** by name with `error.log`.
-- A file it cannot write fails up front (rc 1, named). A named save validates the file
-  it wrote; a plain save validates every file `user.env` loads. Saving twice writes
-  byte-identical files.
-- It prints nothing to stdout: its log lines go through `private.log.emit` (log.md), so
-  `$(config save …)` captures nothing.
 
 ```bash
 # Save to user.env (default)
@@ -426,17 +386,14 @@ Without parameters, saves:
 | `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config` (derived from CONFIG_PATH) |
 | `OOSH_DIR` | per-user oosh tree path | the `user.env` anchor line (`$HOME/oosh`, unexpanded); `this` falls back to the same literal |
 | `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
-| `OOSH_CONFIG_VERSION` | the config-format stamp — written only by the `user.env` anchor head | `private.config.anchor.lines.get` |
-| `OOSH_MODE` | per user — the branch **this** user's `~/oosh` points at; in the shared tier the last writer's branch won for everyone | `config user.save` → `$OOSH_USER_CONFIG_PATH/oosh.user.env` |
-| `OOSH_WORKTREE_BASE` | the retired worktree layout — nothing sets or needs it any more; the clone layout always has `main/`. `oosh.env` exported it and every save wrote it back (the T7 loop) | (none — `config init` removes a leftover as `stale:`) |
+|  | the config-format stamp — written only by the  anchor head |  |
 | `OOSH_BRANCH` | Install **input** — the branch the operator asked for. Not a path; excluded for the other reason this list exists: state that must be **derived, never remembered**. Persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** | not re-derived at shell init at all — the branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh` |
 
 The per-user `LOG_*` vars are deliberately NOT persisted into the shared
 `log.env`; they are written to the per-user `$OOSH_USER_CONFIG_PATH/log.session.env`
 by `log.session.save` (see [log.md](log.md)). If you add a new persisted env var
-that resolves to an absolute per-user path, extend the exclusion `case` in
-`private.config.variable.persistable` — the one never-persist list, asked by `config.save`
-and by `config init.env`'s refuse-to-worsen guard — and the `for leaker in …` list in `test/test.config` T29, which is the
+that resolves to an absolute per-user path, extend the same exclusion `case` in
+`config.save` — and the `for leaker in …` list in `test/test.config` T29, which is the
 value-level mirror of that `case` and the only thing that pins it.
 
 ### Required variables
@@ -448,49 +405,21 @@ The exclusion list above says what must **never** persist. This says what a conf
 | Variable | Lives in | Re-derived by | Authority |
 |---|---|---|---|
 | `BASH_FILE` | `user.env` | `command -v bash` | derived |
-| `CONFIG_FILE` | `user.env` | `config.anchors.init` | derived |
+| `CONFIG_FILE` | `user.env` | `config.init` | derived |
 | `OOSH_CONFIG_VERSION` | `user.env` (the anchor head) | `private.config.version.get` — the config format this branch writes | derived |
-| `OOSH_MODE` | **per user**: `$OOSH_USER_CONFIG_PATH/oosh.user.env` (`~oosh.user.env` in the manifest) | `basename` of the canonical `~/oosh` | derived |
+| `OOSH_MODE` | `oosh.env` | `basename` of the canonical `~/oosh` | derived |
 | `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` | derived |
 | `OOSH_PM` | `oosh.env` | side-effect-free package-manager detection | kept |
 | `LOG_LEVEL` | `log.env` | defaults to `3` | kept |
-| `ODOCKER_WORKSPACES` | `odocker.env` — **optional**: the file is written and required only when it exists, a value is set, or the deriver answers (no components base → no odocker.env, still healthy) | `DockerWorkspaces` beside the Once.sh base (`odocker`) | kept |
+| `ODOCKER_WORKSPACES` | `odocker.env` | `DockerWorkspaces` beside the Once.sh base (`odocker`) | kept |
 
 **Authority.** `derived`: the host or the checkout is the truth, so `config init.env`
 re-derives it even when it is set — a stale value is repaired, not only a missing one.
 `kept`: a user's choice; only a missing value is re-derived.
 
-**Version.** A `version:` verdict (the stamp of another branch version) is a report for the
-operator: `config validate required` names it, but `private.config.healthy` — what `config init`
-and `oo mode` act on — ignores it, and only an explicit `config init.env` rewrites the format.
-Two users on branch versions with different stamps would otherwise rewrite the shared `user.env`
-back and forth on every `config init`. The reasons are one list,
-`private.config.required.missing.get`, read by both.
-
-**Who writes it.** `config save` and `oo mode` write the file for the user who runs them. For
-every other user it is written **as them** by the two as-user hops — `user oosh.install` (the
-install) and `config init.user` (`oo update`, `oo user.fix`) — through
-`private.config.user.mode.save`. The hop preamble drops the caller's `OOSH_MODE` and
-`OOSH_USER_CONFIG_PATH`, so the branch is always derived from the target's own `~/oosh`.
-A user installed before this existed gets the file on the next `oo update`.
-
-**Per user.** `~/oosh` is per user, so the branch it names is too: `OOSH_MODE` is written
-by `config user.save` (and by `oo mode`) into `$OOSH_USER_CONFIG_PATH/oosh.user.env`, never
-into the shared `oosh.env`. **`user.env` carries no line for it.** A per-user file cannot be
-a chain line of the shared `user.env` — a POSIX `sh` exits on `.` of a missing file, and a
-guard against that is logic, which no env file may hold. The kernel loads it **in code**:
-`this.init` calls `private.this.user.env.load`, which sources the file when it exists and
-keeps an `OOSH_MODE` the environment already carries — the same way `log` owns and loads
-`log.session.env`. (For one day, 2026-09-28, `config save` appended a guarded load line
-`[ … ] || . …` to `user.env` and `config validate` allowed it. `config validate required`
-now reports such a line as `logic:user.env`, and `config init` rewrites the file.)
-
 **Env files.** Every file named here is written by `config save` and loaded by
 `user.env` (`. $CONFIG_PATH/<name>.env`), together with any other file registered
-with `config add` whose file exists (`private.config.chain.files.get` — a legacy
-`source $CONFIG_PATH/<name>.env` line counts too and is rewritten in the `.` form). Which
-manifest files exist for a host is `private.config.manifest.files.get`: a file with a
-`derived` row always, a `kept`-only file when it exists, a value is set or a deriver answers.
+with `config add` whose file exists (`private.config.chain.files.get`).
 `config validate required` reports a missing file (`file:`), a missing load line
 (`load:`) and a stamp of another branch version (`version:`).
 
@@ -577,12 +506,7 @@ Sets or adds an environment variable in the config.
 ./config set MY_CUSTOM_VAR "some value"
 ```
 
-If the variable exists, it's updated (one line, the legacy `export declare X=` form
-normalised). If not, it's appended. The line is rendered with `config save`'s own quoting
-(`private.config.variable.export.line`), so any value — `"`, `$`, `` ` ``, `\`, `|`, `&` —
-sources back byte for byte; a value with a newline or control character is refused.
-`config set` and `config unset` write the file back **in place** (identity, group-write),
-and `config unset` removes a file's last variable too.
+If the variable exists, it's updated. If not, it's appended.
 
 ### Managing Config Files
 

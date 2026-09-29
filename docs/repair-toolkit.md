@@ -14,9 +14,8 @@ listed here run only when invoked.
 | Primitive | Scope | When to use |
 |---|---|---|
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
-| [`config init`](config.md) | The whole config: checks, and repairs only a missing or broken one (`config init.full` for the caller; `config init.full <user>` for another user) | `config validate required` says `INCOMPLETE` (missing variable, `file:`/`load:` of an env file, `stale:`, OOSH_MODE drift); `oo mode` says so after a switch. A `version:` verdict alone is reported, not repaired — `config init.env` rewrites the format |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
-| [`config init.shared`](config.md) | `sharedConfig` dir exists, group `dev`, `g+w` (adds no SGID; a `2775` set at install is kept) | After cross-user perm drift, "Permission denied" on shared config writes; `sharedConfig` missing |
+| [`config init.shared`](config.md) | `sharedConfig` dir mode 2775 + group `dev` | After cross-user perm drift, "Permission denied" on shared config writes |
 | [`oo profile.status`](oo.md#ooprofilestatus) | Read-only report on `/etc/profile.d/oosh.sh`: missing, stale (still sources the retired `/etc/oosh/boot`) or OK; N/A on macOS | Before `oo profile.fix`; rc 1 when the drop-in needs repair, no privilege needed |
 | [`oo profile.fix`](oo.md#ooprofilefix) | `/etc/profile.d/oosh.sh` — the login-shell drop-in that recovers `$HOME` and sources `~/config/user.env` | `env -i sh -l` does not come up as an oosh shell; host installed before install state 34 (`root.profile.dropin.installed`). `oo profile.status` reports first. Needs root, or `dev` + sudo |
 | [`ossh rights.fix`](ossh.md) | `~/.ssh` file modes (600 private, 644 public, 700 dirs) | After SSH client complains about world-readable keys |
@@ -91,9 +90,7 @@ explicitly when something drifts.
 | `env -i sh -l` does not come up as an oosh shell | `oo profile.fix` (the `/etc/profile.d/oosh.sh` drop-in is missing) |
 | `/etc/profile.d/oosh.sh` missing, or it no longer sources `~/config/user.env` | `oo profile.fix` |
 | `env -i sh` cannot bootstrap oosh at all | nothing can — see below. Use `env -i sh -l`, or `. ~/config/user.env` with `HOME` set |
-| `config validate required` says `INCOMPLETE …` (anchor, `file:`, `load:`, `logic:`, a missing variable, `OOSH_MODE` drift) | `config init` — checks, then repairs with `config init.full`. A `version:` verdict alone is reported, not repaired |
-| an env file holds a test, a conditional or any other code (`logic:user.env` — e.g. the `[ … ] \|\| . …` line `config save` wrote on 2026-09-28) | `config init` (or `config init.env`) — env files are pure data; per-user data is loaded by the kernel |
-| `OOSH_MODE` is empty in a user's shell, `~/.config/oosh/oosh.user.env` is missing | `oo update` (or `config init.user <user>`) — writes the per-user file as that user, from where their `~/oosh` points |
+| `config validate required` says `INCOMPLETE … anchor:OOSH_DIR=…` | `config save` — the host's `user.env` predates the anchor lines |
 | `test.platform.shared.config.invariant` red after a pull | `config save` |
 | a `/bin/sh` login dies at `log.session.env: No such file` | `config save` — the legacy chain line is still in `log.env` |
 | `.bashrc` still sources a `boot` that no longer exists | `config init.user <user>` re-templates it |

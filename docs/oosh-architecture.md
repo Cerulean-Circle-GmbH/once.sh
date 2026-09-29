@@ -313,10 +313,7 @@ boots via `source this`:
    │   (`log` creates and sources $OOSH_USER_CONFIG_PATH/log.session.env itself)
    │
    ├─ private.this.path.dedup     # the PATH line is data and cannot guard itself
-   ├─ this.init                   # loads the per-user data file in CODE
-   │                              #   (private.this.user.env.load: OOSH_MODE from
-   │                              #   $OOSH_USER_CONFIG_PATH/oosh.user.env), then
-   │                              #   re-sources $CONFIG for executed scripts,
+   ├─ this.init                   # re-sources $CONFIG for executed scripts,
    │                              #   saving/restoring PATH and the anchors
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
@@ -686,9 +683,7 @@ See [docs/log.md](log.md) for complete documentation.
 | `LOG_LEVEL` | Logging verbosity (0-6) | `3` |
 | `LOG_DEVICE` | Log output device | `/dev/tty` |
 | `OOSH_PROMPT` | PS1 prefix indicator | `"oosh "` |
-| `OOSH_MODE` | The branch `~/oosh` points at, relative to the components base (`test/macos` for a slash branch) — per user, in `$OOSH_USER_CONFIG_PATH/oosh.user.env` | `"dev"` |
-| `OOSH_USER_CONFIG_PATH` | Per-user config dir (`oosh.user.env`, `log.session.env`, `mode-env.bash`) — an anchor line of `user.env` | `~/.config/oosh` |
-| `OOSH_CONFIG_VERSION` | The config-format stamp `config save` writes into `user.env` (`private.config.version.get`); another branch version's stamp is reported by `config validate required`, never auto-repaired | `1` |
+| `OOSH_MODE` | Operation mode | `"dev"` |
 
 ---
 
