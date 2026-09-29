@@ -384,6 +384,9 @@ Saves environment variables to a config file.
   `private.config.required.carry`), escapes intact (`private.config.file.value.get`). A
   never-persist variable is not carried — that is how a migration leaves the shared tier.
   To **remove** a variable use `config unset`.
+- A value holding ANY control character (tab, newline, ESC, …) is judged by the value
+  itself, so the answer does not depend on the bash that runs the save: bash 5.1 would
+  write a raw tab inside double quotes where 5.2 and 3.2 reach for `$'…'`.
 - A value that is not pure data (tab, newline, control character — bash prints it
   `$'…'`) is **not persisted and reported** by name with `error.log`.
 - A file it cannot write fails up front (rc 1, named). A named save validates the file
