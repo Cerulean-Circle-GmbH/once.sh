@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+TEST_CATEGORY=platform
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# platform.boot.system.path.invariant — post-state-34 invariant for the fixed
+# host-wide boot path. Ticket T9
+# (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md).
+#
+# `boot` recovers $HOME from the password database, so it survives `env -i`.
+# But `. ~/oosh/boot` cannot be REACHED under `env -i sh`: with HOME unset,
+# dash and ash leave `~` LITERAL (bash falls back to getpwuid, which is why
+# nobody noticed). State 34 (root.boot.path.installed) therefore creates a
+# host-wide symlink /etc/oosh/boot into the shared tree, so
+# `. /etc/oosh/boot` works for any user, in any shell, with no environment.
+#
+# Run inside EVERY user shell of `os platform.test <platform> terminal` after
+# install completes — root, the test user, the oosh user, the bash user:
+#
+#   ./test.suite run platform.boot.system.path.invariant 1
+#
+# The per-user run is the point. A host-scope symlink into a group-owned tree
+# can lose read-through for exactly one class of caller and stay perfectly
+# healthy-looking from root's shell.
+#
+# Asserts:
+#   0. /etc/oosh/boot exists (precondition — else `oo boot.fix`).
+#   1. It is a SYMLINK, not a copy and not a generated stub.
+#   2. Its target lives under the shared Once.sh tree.
+#   3. THIS user can read through it (the silent-loss property).
+#   4. `. /etc/oosh/boot` under `env -i` yields THIS user's own anchors,
+#      in every shell present on the box.
+
+systemBoot="/etc/oosh/boot"
+me=$(id -un 2>/dev/null)
+
+# ---------------------------------------------------------------------------
+# INVARIANT-0 (precondition): the fixed path exists at all.
+# ---------------------------------------------------------------------------
+test.case $level "platform.boot.system.path INVARIANT-0: $systemBoot exists" \
+  test -e "$systemBoot"
+if [ ! -e "$systemBoot" ] && [ ! -L "$systemBoot" ]; then
+  expect.fail "$systemBoot does not exist — install predates state 34 (root.boot.path.installed), or the 20-lane (user-rights-only) install ran. Repair with \`oo boot.fix\` as root or a dev member with sudo"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "$systemBoot present"
+fi
+
+# ---------------------------------------------------------------------------
+# INVARIANT-1: a SYMLINK. A copy would boot this user into whatever bootstrap
+# was current when it was copied, in silence; a generated stub would be a
+# second hand-rolled bootstrap fragment living outside `boot`.
+# ---------------------------------------------------------------------------
+test.case $level "platform.boot.system.path INVARIANT-1: $systemBoot is a symlink" \
+  test -L "$systemBoot"
+if [ -L "$systemBoot" ]; then
+  expect.pass "$systemBoot is a symlink"
+else
+  expect.fail "$systemBoot is NOT a symlink ($(ls -ld "$systemBoot" 2>&1)) — a copy or a stub drifts silently; run \`oo boot.fix\` to replace it"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# INVARIANT-2: the target lives under the canonical shared tree. Resolved via
+# private.this.path.canonical (this) — GNU `readlink -f` is missing on
+# BSD/macOS. Matched with a glob so /home/shared (Linux) and /Users/Shared
+# (macOS) both pass.
+# ---------------------------------------------------------------------------
+resolved=$(private.this.path.canonical "$systemBoot")
+rawTarget=$(readlink "$systemBoot" 2>/dev/null)
+
+# Dangle first: a dangling link resolves to nothing, so asking where it points
+# would report the link's own path and mask the real fault.
+test.case $level "platform.boot.system.path INVARIANT-2: target is a real file" test -f "$resolved"
+if [ -f "$resolved" ]; then
+  expect.pass "target exists: $resolved"
+else
+  expect.fail "$systemBoot DANGLES at '$rawTarget' — \`. $systemBoot\` fails for every user on this host; run \`oo boot.fix\`"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+fi
+
+test.case $level "platform.boot.system.path INVARIANT-2: target is under the shared tree" true
+case "$resolved" in
+  */shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/*/boot)
+    expect.pass "target under shared tree: $resolved"
+    ;;
+  *)
+    expect.fail "target NOT under the shared tree (got: '$resolved') — $systemBoot must point into the canonical install, never at a private clone (e.g. /root/oosh, mode 700, unreadable by ordinary users); run \`oo boot.fix\`"
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# INVARIANT-3: THIS user can read THROUGH the link. This is the one property a
+# host-scope symlink into a group-owned tree loses silently — every directory
+# on the path to the target must be traversable by this user, not just the
+# link itself. Root will never notice; an ordinary user gets
+# "cannot open /etc/oosh/boot".
+# ---------------------------------------------------------------------------
+test.case $level "platform.boot.system.path INVARIANT-3: readable by $me" test -r "$systemBoot"
+if [ -r "$systemBoot" ]; then
+  expect.pass "$me can read through $systemBoot"
+else
+  expect.fail "$me CANNOT read through $systemBoot to $resolved — check dev-group membership (\`id $me\`) and traverse bits on the shared tree; \`config init.shared\` repairs shared-config perms"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# INVARIANT-4 (behavioural): the user-visible promise. Sourcing the fixed path
+# with NO environment at all must hand THIS user THEIR OWN anchors — boot
+# names no user and no branch, so the canonical copy serves everyone.
+# Every shell on the box, because dash/ash are exactly where `~` fails.
+# ---------------------------------------------------------------------------
+# One harness for every boot-from-nothing assertion (test.suite): sh, dash,
+# ash, bash, busybox ash, plus caller survival. Expected against the PASSWD
+# home, which is what boot derives — not the runner's $HOME.
+pwHome=$(test.suite.home.passwd)
+expected="[$pwHome|$pwHome/oosh|$pwHome/config]"
+bad=$(test.suite.boot.anchors.check ". $systemBoot")
+
+test.case $level "platform.boot.system.path INVARIANT-4: \`. $systemBoot\` boots every shell under env -i" true
+if [ -z "$bad" ]; then
+  expect.pass "every shell recovered $expected for $me"
+else
+  expect.fail "expected $expected —$bad ; \`. $systemBoot\` is the documented one-command recovery and it does not work for $me"
+fi
+
+# ---------------------------------------------------------------------------
+# INVARIANT-5: the LOGIN-SHELL route is deployed — /etc/profile.d/oosh.sh.
+#
+# The symlink makes `. /etc/oosh/boot` POSSIBLE; this makes `env -i sh -l`
+# AUTOMATIC. Created by the same state 34 and healed by the same `oo boot.fix`.
+#
+# Linux-only BY FACT: macOS has no /etc/profile.d — its /etc/profile runs
+# path_helper and sources /etc/bashrc, and globs nothing — so a file there
+# would never be read. That is a SKIP, not a failure.
+#
+# The `.sh` suffix is asserted through /etc/profile's OWN glob rather than by
+# eyeballing the name, because a file that the glob misses is invisible while
+# looking perfectly correct in `ls`.
+# ---------------------------------------------------------------------------
+profileDir="/etc/profile.d"
+dropIn="$profileDir/oosh.sh"
+
+if [ ! -d "$profileDir" ]; then
+  test.case $level "platform.boot.system.path: login-shell drop-in (N/A on this host)" true
+  expect.pass "$profileDir does not exist on $(uname -s) — the login route does not exist here; \`. $systemBoot\` and \`env -i ENV=$systemBoot sh\` are unaffected"
+else
+  test.case $level "platform.boot.system.path: $dropIn exists" test -r "$dropIn"
+  if [ -r "$dropIn" ]; then
+    expect.pass "$dropIn present and readable by $me"
+  else
+    expect.fail "$dropIn is MISSING or unreadable by $me — /etc/profile globs $profileDir/*.sh and finds no oosh line, so \`env -i sh -l\` does not come up as an oosh shell. Repair with \`oo boot.fix\` as root or a dev member with sudo"
+  fi
+
+  if [ -r "$dropIn" ]; then
+    # Matched by /etc/profile's own glob — the only reason it is ever read.
+    globbed=no
+    for g in "$profileDir"/*.sh; do [ "$g" = "$dropIn" ] && globbed=yes; done
+    test.case $level "platform.boot.system.path: $dropIn is matched by /etc/profile's *.sh glob" true
+    if [ "$globbed" = "yes" ]; then
+      expect.pass "/etc/profile would source $dropIn"
+    else
+      expect.fail "$dropIn is NOT matched by $profileDir/*.sh — it will never be read; run \`oo boot.fix\`"
+    fi
+
+    test.case $level "platform.boot.system.path: $dropIn sources $systemBoot" true
+    if grep -Fq "$systemBoot" "$dropIn"; then
+      expect.pass "drop-in sources $systemBoot"
+    else
+      expect.fail "$dropIn does not name $systemBoot (STALE: $(cat "$dropIn" 2>&1 | tr '\n' ' ')) — run \`oo boot.fix\`"
+    fi
+
+    # Every login shell on the box reads this. A parse error here breaks
+    # logins for users who have never heard of oosh.
+    test.case $level "platform.boot.system.path: $dropIn parses under /bin/sh" true
+    if sh -n "$dropIn" 2>/dev/null; then
+      expect.pass "drop-in is POSIX sh"
+    else
+      expect.fail "$dropIn does NOT parse under /bin/sh ($(sh -n "$dropIn" 2>&1 | head -1)) — every login on this host is at risk; run \`oo boot.fix\`"
+    fi
+
+    # THE user-visible promise of this route: a login shell with NO
+    # environment comes up as an oosh shell, by itself.
+    test.case $level "platform.boot.system.path: \`env -i sh -l\` recovers by itself for $me" true
+    loginOut=$(cd /tmp && env -i sh -lc 'echo "<[$HOME|$OOSH_DIR|$CONFIG_PATH]>"' 2>/dev/null | grep -o '<\[[^]]*\]>' | tail -1)
+    if [ "$loginOut" = "<$expected>" ]; then
+      expect.pass "env -i sh -l recovered $expected"
+    else
+      expect.fail "env -i sh -l gave '${loginOut:-<nothing>}', expected '<$expected>' — /etc/profile did not reach $dropIn, or its guards rejected $me (does $HOME/oosh exist?). Diagnose with \`oo boot.status\`"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# INVARIANT-6: the $ENV route, and the limit that must never be overclaimed.
+#
+#   env -i ENV=/etc/oosh/boot sh   -> recovers   (that is sh's only rc hook)
+#   env -i sh                      -> does NOT   (env -i is what erased it)
+#
+# The negative half is asserted deliberately. If it ever starts passing, the
+# docs' "bare `env -i sh` can never self-recover" claim is stale and someone
+# should find out WHY a bare sh is now sourcing something.
+# ---------------------------------------------------------------------------
+test.case $level "platform.boot.system.path INVARIANT-6: \`env -i ENV=$systemBoot sh\` recovers for $me" true
+envOut=$(cd /tmp && printf '%s\n' 'echo "<[$HOME|$OOSH_DIR|$CONFIG_PATH]>"' | env -i ENV="$systemBoot" sh -i 2>/dev/null | grep -o '<\[[^]]*\]>' | tail -1)
+if [ "$envOut" = "<$expected>" ]; then
+  expect.pass "the ENV hook recovered $expected"
+else
+  expect.fail "env -i ENV=$systemBoot sh gave '${envOut:-<nothing>}', expected '<$expected>' — \$ENV is /bin/sh's rc hook and the documented no-typing recovery; note it is INTERACTIVE-only, and bash honours it only when invoked as \`sh\`"
+fi
+
+test.case $level "platform.boot.system.path INVARIANT-6: bare \`env -i sh\` still cannot self-recover (documented limit)" true
+bareOut=$(cd /tmp && printf '%s\n' 'echo "<[$OOSH_DIR]>"' | env -i sh -i 2>/dev/null | grep -o '<\[[^]]*\]>' | tail -1)
+case "$bareOut" in
+  *"/oosh"*)
+    expect.fail "bare \`env -i sh\` now recovers ($bareOut) — docs/boot.md states it cannot, so either the docs are stale or a bare sh is sourcing something it should not be"
+    ;;
+  *)
+    expect.pass "bare \`env -i sh\` does not self-recover, as documented (no rc hook survives env -i)"
+    ;;
+esac
+
+test.suite.save.results

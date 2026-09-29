@@ -11,28 +11,6 @@
 # with the old %r@%h:%p template exceeded this on Termux/Android.
 : ${OSSH_CONTROL_PATH:="${TMPDIR:-/tmp}/ossh-%C"}
 
-ossh.remote.prelude.get()     # <?home:~> # echo the shell prelude every remote command runs first: source <home>/config/user.env (the anchors, env chain and PATH as data), else degrade to <home>/oosh on PATH; POSIX sh, one line #
-{
- # THE owner of the degrade one-liner. It used to be hand-copied into
- # ossh.exec, ossh.exec.tty, private.push.init.oosh, the three rootkey pushes
- # in `user`, os.platform.test and odocker.install; T-OSSH-REMOTE-PRELUDE
- # judges it by behaviour and test.config T49 pins that every caller uses it.
- #
- # <home> defaults to a literal `~`, expanded by the REMOTE shell (dash
- # expands a tilde after `=` and `:` in an assignment, measured). Pass the home
- # explicitly where `~` is not the target's — root under `sudo bash -lc`,
- # /var/root on macOS.
- #
- # NO create.result — a getter consumed as $(...), a subshell. Answers on
- # stdout so it also works dispatched: $(ossh remote.prelude.get /root).
- local home="${1:-~}"
- # path-exception: the sanctioned DEGRADE branch, emitted as a string for a
- # remote shell — user.env first, and only if it is not there does that shell
- # fall back to a bare prepend.
- echo "[ -f $home/config/user.env ] && . $home/config/user.env || export PATH=$home/oosh:$home/oosh/ng:\$PATH"
- return 0
-}
-ossh.remote.prelude.get.completion.home() { compgen -d "$1"; }
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -498,7 +476,7 @@ private.push.init.oosh() {
 
   # Skip bootstrap if oosh is already installed (state machine at [99])
   # Use bash explicitly (Alpine default shell is ash which doesn't support source/declare)
-  if private.ossh.ssh "$sshConfigHost" "bash -c '$(ossh.remote.prelude.get); source ~/config/current.state.machine.env 2>/dev/null && [ \"\$state\" = \"99\" ]'" 2>/dev/null; then
+  if private.ossh.ssh "$sshConfigHost" "bash -c 'source ~/oosh/boot 2>/dev/null; source ~/config/current.state.machine.env 2>/dev/null && [ \"\$state\" = \"99\" ]'" 2>/dev/null; then
     important.log "oosh already installed on $sshConfigHost (state [99]) — skipping bootstrap"
     ossh.install.finish.local "$sshConfigHost" "$OSSH_INSTALL_TARGET_USER"
     return $?
@@ -570,7 +548,6 @@ private.ossh.identity.stage() # <toHost> # stage runner email + id_ed25519 keypa
 # pushed to both file sets. ProxyJump (future) will diverge the two roles
 # runner-side; the consumer (osshLayout) never collapses.
 {
-  private.this.script.load ogit ogit.branch.get
   local toHost="$1"
   if [ -z "$toHost" ]; then
     error.log "private.ossh.identity.stage: <toHost> required"
@@ -578,8 +555,8 @@ private.ossh.identity.stage() # <toHost> # stage runner email + id_ed25519 keypa
   fi
 
   local installerEmail
-  # ogit.config.email.get: global user.email, else the repository one of $PWD.
-  installerEmail="${USER_EMAIL:-$(ogit.config.email.get "$PWD")}"
+  installerEmail="${USER_EMAIL:-$(git config --global user.email 2>/dev/null)}"
+  [ -z "$installerEmail" ] && installerEmail="$(git config user.email 2>/dev/null)"
   [ -z "$installerEmail" ] && installerEmail="$(whoami)@$(hostname)"
 
   local privKey="$HOME/.ssh/id_ed25519"
@@ -638,8 +615,7 @@ private.ossh.identity.stage.outer.proxyJump() # <toHost> <jumpHost> # stage oute
 
   # Pull email from jump host (git config preferred, whoami@hostname fallback).
   local outerEmail
-  # ogit-exception: jump host may have no oosh — ogit when it is there, raw git otherwise
-  outerEmail=$(ossh.exec "$jumpHost" "command -v ogit >/dev/null 2>&1 && ogit config.email.get || git config --global user.email 2>/dev/null || git config user.email 2>/dev/null" 2>/dev/null \
+  outerEmail=$(ossh.exec "$jumpHost" "git config --global user.email 2>/dev/null || git config user.email 2>/dev/null" 2>/dev/null \
                 | sed -E 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | awk 'NF{print; exit}')
   if [ -z "$outerEmail" ]; then
     outerEmail=$(ossh.exec "$jumpHost" "printf '%s@%s\n' \"\$(whoami)\" \"\$(hostname)\"" 2>/dev/null \
@@ -936,8 +912,8 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
   # doesn't exist yet), we export PATH and OOSH_DIR explicitly so the
   # normal bootstrap succeeds.
   # oosh-dir-exception: string executed on a REMOTE host whose ~/oosh does not exist yet
-  # path-exception: a string executed on a REMOTE host, whose ~/config/user.env
-  # may not exist yet — this is the bootstrap that makes it reachable.
+  # path-exception: a string executed on a REMOTE host, whose ~/oosh/boot may
+  # not exist yet — this is the bootstrap that makes it reachable.
   local remoteInvoke="export OOSH_DIR='$sharedOosh'; export PATH='$sharedOosh':\$PATH"
 
   # 1. Create user on remote if missing. Invoke via the shared script path
@@ -1176,27 +1152,23 @@ private.ossh.folder.fix.config.strip.legacy() # <sshDir> # remove the legacy Hos
   chmod 600 "$cfg"
 }
 
-# ogit-exception: docstring text, not an invocation
 private.ossh.folder.fix.scan.git.remotes() # <hostAlias> # scan git repos under $HOME for remotes that reference <hostAlias>: and warn the user to update them
 {
-  private.this.script.load ogit ogit.branch.get
   local alias="$1"
-  ogit.binary.check || return 0
+  command -v git >/dev/null 2>&1 || return 0
   # Find .git dirs up to 4 levels deep under $HOME. Skip the .ssh tree and
   # any hidden dotdirs other than .git itself. Cap depth to avoid huge home
   # dirs; deeper consumers can run the scan manually.
   local gitDir repo url found=0
   while IFS= read -r gitDir; do
     repo="${gitDir%/.git}"
-    url=$(ogit.remote.url.get origin "$repo")
+    url=$(git -C "$repo" remote get-url origin 2>/dev/null)
     if [[ "$url" == "${alias}:"* ]] || [[ "$url" == *"@${alias}:"* ]]; then
       if [ "$found" -eq 0 ]; then
-        # ogit-exception: printed text, not an invocation
         warn.log "private.ossh.folder.fix.scan.git.remotes: removing Host $alias from ~/.ssh/config will break these git remotes:"
         found=1
       fi
       warn.log "  $repo -> $url"
-      # ogit-exception: printed hint for the user, not an invocation
       warn.log "    fix: git -C $repo remote set-url origin git@github.com:OWNER/REPO.git"
     fi
   done < <(find "$HOME" -maxdepth 5 -type d -name .git 2>/dev/null | grep -v '/\.ssh/')
@@ -2586,11 +2558,12 @@ ossh.exec() # <toHost> <command> # executes the command on host <toHost>
   fi
 
 
-  # The remote shell sources ~/config/user.env if present — the anchors, the env
-  # chain and the PATH prepend as data — else degrades to ~/oosh on PATH so the
-  # command still resolves (a host mid-install). One owner of that string:
-  # ossh.remote.prelude.get.
-  private.ossh.ssh "$toHost" "$(ossh.remote.prelude.get); $@"
+  # Source boot if present; otherwise (testing/prod/main, or any host without the
+  # boot loader) fall back to putting ~/oosh on PATH so the command still resolves.
+  # path-exception: the sanctioned DEGRADE branch — boot first, and only if it
+  # is not there does the remote shell fall back to a bare prepend.
+  # docs/boot.md, Cross-branch note.
+  private.ossh.ssh "$toHost" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; $@"
 }
 
 
@@ -2608,8 +2581,9 @@ ossh.exec.tty() # <toHost> <command> # executes command on host with TTY allocat
     return 1
   fi
 
-  # Same prelude as ossh.exec (ossh.remote.prelude.get), tty form.
-  private.ossh.ssh -tt "$toHost" "$(ossh.remote.prelude.get); $@"
+  # Same boot-or-PATH-fallback as ossh.exec (works when boot is absent).
+  # path-exception: the sanctioned degrade branch, tty form. docs/boot.md.
+  private.ossh.ssh -tt "$toHost" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; $@"
 }
 ossh.exec.tty.completion() {
   ossh.config.get.completion "$@"
@@ -2674,17 +2648,12 @@ ossh.cmd() # <sshConfigHost> <pkg> # install pkg on the remote host if missing �
   esac
 
   important.log "Installing '$pkg' on $host via: $pmCmd"
-  # The same non-interactive prefix oo.cmd sends (private.oo.pm.env.get: apt's
-  # tzdata debconf prompt, brew's ask mode) — as `sudo env …`, because sudo's
-  # env_reset strips a VAR=val prefix. T-OSSH-CMD-NONINTERACTIVE.
-  [ "$(type -t private.oo.pm.env.get)" = "function" ] || source "$OOSH_DIR/oo" >/dev/null 2>&1
-  private.ossh.ssh -tt "$host" "sudo $(private.oo.pm.env.get "$pmCmd") $pmCmd $pkg"
+  private.ossh.ssh -tt "$host" "sudo $pmCmd $pkg"
 }
 ossh.cmd.completion.sshConfigHost() {
   ossh.parameter.completion.sshConfigHost "$@"
 }
 ossh.cmd.completion.pkg() {
-  # ogit-exception: package names offered by completion, not an invocation
   compgen -W "bash curl git wget tree expect python3 jq" -- "$1"
 }
 
@@ -2881,12 +2850,8 @@ ossh.harden.packages() # <sshConfigHost> # install unattended-upgrades, fail2ban
   private.ossh.harden.preflight "$sshConfigHost" || return 1
 
   important.log "ossh.harden.packages: apt update + install on $sshConfigHost"
-  # The apt prefix table lives in private.oo.pm.env.get ("env K=V K=V"); this
-  # script exports the same pairs once for its three apt-get calls.
-  [ "$(type -t private.oo.pm.env.get)" = "function" ] || source "$OOSH_DIR/oo" >/dev/null 2>&1
-  local pmEnv; pmEnv=$(private.oo.pm.env.get apt-get)
   private.ossh.ssh -tt "$sshConfigHost" "sudo bash -c '
-    export ${pmEnv#env }
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update &&
     apt-get -y dist-upgrade &&
     apt-get -y install unattended-upgrades fail2ban ufw htop nano bzip2
@@ -3619,17 +3584,25 @@ ossh.start()
   # below. Those resolve via PATH; a context that invoked ossh without setting
   # up the environment (e.g. a mid-install sub-shell) would otherwise fail with
   # "this: No such file or directory". OOSH_DIR is the constant ~/oosh (see
-  # docs/oosh-architecture.md) — NOT derived from $0, which is the HOST process whenever
+  # docs/boot.md) — NOT derived from $0, which is the HOST process whenever
   # ossh is *sourced* (myId, config, user, test.ossh) and then yielded the
   # caller's directory. `:=` only fires when unset, so an explicit override
   # (the remote-invoke exception below) still wins.
   : ${OOSH_DIR:="$HOME/oosh"}
   # path-exception: ossh is SOURCED by myId, config, user and test.ossh, in
-  # contexts that never sourced ~/config/user.env. Colon-anchored, the same
-  # segment user.env's own prepend uses, so re-sourcing never grows PATH.
+  # contexts that never reach boot. Colon-anchored, so it is the same
+  # segment test boot does and re-sourcing never grows PATH.
   case ":$PATH:" in *":$OOSH_DIR:"*) ;; *) export PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH" ;; esac
-  # The cold start from ~/config/user.env is `this`'s, at its file scope — the
-  # copy that stood here ran BEFORE `source this` and lacked its guards.
+  if [ -z "$CONFIG" ]; then
+    # Path anchors before the direct env-chain source — log.env chains
+    # $OOSH_USER_CONFIG_PATH/log.session.env, so the var must be set or it
+    # expands to `/log.session.env`. Same defaults boot/this set.
+    : ${CONFIG_PATH:=$HOME/config}
+    : ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}
+    export CONFIG_PATH OOSH_USER_CONFIG_PATH
+    CONFIG=$HOME/config/user.env
+    [ -f "$CONFIG" ] && source $CONFIG
+  fi
   source this
   source line
   source os
