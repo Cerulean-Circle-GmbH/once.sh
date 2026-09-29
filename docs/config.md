@@ -337,7 +337,7 @@ backup). Adds `<user>` to group `dev` if not already a member. Writes the user's
 
 #### `config.init.env`
 Regenerates `user.env`, `oosh.env`, and `log.env` by calling `config save`
-(no args) — the same flow the install uses at `oo:1456`. Re-derives every
+(no args). The install itself ends with it: state 51 (`headless.setup.finished`) runs `config init.env`, because state 31 only does a plain `config save`, which persists and never derives — a fresh install used to end with an empty `odocker.env`. Re-derives every
 `derived` required variable (even a stale one) and every missing `kept` one first
 (§ Required variables). **Backs up `user.env`, `oosh.env` and `log.env` to
 `<name>.env.bak.<timestamp>` first** so any hand-edited
