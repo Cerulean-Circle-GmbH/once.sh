@@ -84,6 +84,25 @@ enumerator against a fixture built with `odocker workspace.init` and passes
 anywhere — and `test/test.platform.odocker.workspaces.invariant`, which keeps
 the host-readiness question where it belongs.
 
+### Bootstrap-from-nothing assertions: `test.suite.anchors.check`
+
+`test.suite.anchors.check <sourceCommand>` is the one harness behind every
+"stand the environment up from `~/config/user.env`" assertion (test.config T65,
+test.platform.profile.dropin.invariant INVARIANT-5). It runs `<sourceCommand>`
+under `env -i` — with `HOME` set from the password database, via
+`test.suite.home.passwd` — in `sh`, `dash`, `ash`, `bash` and `busybox ash`,
+and prints nothing when every shell yields this user's `[$HOME|~/oosh|~/config]`
+anchors and survives the source; otherwise one `shell=>output` per failure.
+
+```bash
+bad=$(test.suite.anchors.check '. "$HOME/config/user.env"')
+[ -z "$bad" ] && create.result 0 "every shell anchors" || create.result 1 "shells that did not:$bad"
+```
+
+`HOME` is *passed*, deliberately: the data route cannot derive it. Deriving
+`$HOME` is the login drop-in's job (`/etc/profile.d/oosh.sh`), asserted
+separately through `env -i sh -l` in the platform test.
+
 ## The runner guards the shared config tier
 
 You do not have to remember to isolate for the guard to catch you. Before the first test file, the

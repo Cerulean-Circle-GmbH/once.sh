@@ -16,7 +16,9 @@ Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branchin
 - **bash 4+** — macOS: `brew install bash` · Debian/Ubuntu/RHEL: already present (Ubuntu 22/24 ships bash 5)
 - **git** — macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install git` · RHEL/Fedora: `sudo dnf install git` · Alpine: `apk add git`
 
-> **Why curl/wget/fetch is listed first:** the install one-liner below (`sh -c "$(curl …)"`) relies on the shell's command-substitution to pull the installer from GitHub. If the fetcher is missing, the shell silently runs `sh -c ""` and nothing happens — you'll see *`sh: curl: command not found`* with no framed error. Install a fetcher first (any one of curl / wget / fetch), then run the one-liner.
+> **Why curl/wget/fetch is listed first:** the install one-liner below (`sh -c "$(curl …)"`) relies on the shell's command-substitution to pull the installer from GitHub. If the fetcher is missing, the shell silently runs `sh -c ""` and nothing happens — you'll see *`sh: curl: command not found`* with no framed error. This is inherent to a one-liner and cannot be fixed without it ceasing to be one, so install a fetcher first (any one of curl / wget / fetch), then run it.
+>
+> The **`Install oosh.command` wrapper does check**: with no fetcher on PATH it names the three it accepts, prints the install command for your platform, and exits non-zero. It used to share the one-liner's failure mode and report `✓ Install complete.` having installed nothing.
 >
 > The installer itself checks **bash 4+** and **git** and prints a consolidated error with per-platform install hints if either is missing.
 

@@ -1,4 +1,17 @@
-# T9 — a fixed system path to `boot` 🔍 In Review
+# T9 — a fixed system path to `boot` ⚪ SUPERSEDED
+
+> **⚠️ SUPERSEDED (2026-09-22)** — see
+> `docs/superpowers/plans/2026-09-22-remove-boot-user-env-is-the-boot.md`.
+> `$OOSH_DIR/boot` has been **deleted**, so the fixed path `/etc/oosh/boot` this card
+> designs no longer exists, and neither do `oo boot.fix` / `oo boot.status`. What
+> survives: the `/etc/profile.d/oosh.sh` login-shell drop-in, install state **34
+> `root.profile.dropin.installed`**, `oo profile.fix` / `oo profile.status`, and the
+> `$HOME`-recovery block (now duplicated between `templates/user/profile.d.oosh.sh` and
+> `init/oosh`). The drop-in sources `~/config/user.env`, which carries the anchors, the
+> PATH prepend and the env chain as data. Current model:
+> [config.md § user.env is the boot](../config.md#userenv-is-the-boot) and
+> [repair-toolkit.md](../repair-toolkit.md). Retained as the design record only; nothing
+> below has been rewritten, so read every mention of `boot` and `/etc/oosh/boot` as history.
 
 > **Card:** `. /etc/oosh/boot` — one command that recovers any user, in any shell,
 > with no environment at all.

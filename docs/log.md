@@ -88,6 +88,29 @@ log.device /tmp/my.log
 log.device
 ```
 
+### Where a log line goes (`private.log.emit`)
+
+Every level — console, test.console, silent, success, warn, important, debug, stop,
+error — writes through `private.log.emit`:
+
+- a **terminal-type** `LOG_DEVICE` (unset, `/dev/stdout`, `/proc/self/fd/1`, `/dev/fd/1`,
+  `/dev/stderr`, fd 2, `/dev/tty` — `private.log.device.is.terminal`) is written to
+  **fd 2 by dup** — never by reopening `/dev/stderr`, which fails `EACCES` after `su -`
+  on a root-owned tty;
+- a **file** `LOG_DEVICE` is appended to (fd 2 if it cannot be written);
+- **stdout is never written**, so `$(command …)` captures only what a command prints on
+  purpose (BUG5 — log text used to contaminate captured values and c2 parameters).
+
+`log.device <device>` and `log.init` share one probe, `private.log.device.probe`: a device
+that cannot be opened — `/dev/tty` without a controlling terminal (ssh exec, cron), a file
+nobody may write — falls back to `/dev/stderr`; the fd 1 / fd 2 spellings
+(`private.log.device.is.capture`) are never probed, because a probe of fd 1 is exactly the
+leak into `$(…)`. The probe writes no line. `log.device` sets and reports only; `LOG_DEVICE`
+is persisted per user by `log.session.save`, never through `config save`. Back-port of
+Marcel's #41 (`c0e6036`, kept on `test/macos.latest`). `info.log` in `this` (LOG_LEVEL > 3)
+runs before `log` is loaded and applies the same rule inline; `ossh`'s dry-run lines and
+`c2`'s level-5 dumps go through `private.log.emit` too.
+
 ### Environment Variables
 
 | Variable | Default | Description | Scope |
@@ -111,14 +134,19 @@ cross-user permission errors). `config.save` therefore filters `LOG_NAME`,
 `LOG_DEVICE` and `LOG_LIVE` out of the shared `log.env`. They are instead written
 to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
 `~/.config/oosh`) — the same per-user directory OOSH already uses for
-`mode-env.bash`. The `boot` loader materialises that file once per shell (it
-delegates to `log.session.save`).
+`mode-env.bash`.
 
-The shared `log.env` is linked to the per-user file by a source chain — its last
-line is `. $OOSH_USER_CONFIG_PATH/log.session.env` (POSIX `.`, not the bash
-`source`, so `boot` parses under dash/ash; the var is written **unexpanded**, so
-each user loads their OWN file). This means a value you set with `log name
-<value>` is **loaded back on every login**, not just recorded: `log`'s top-level
+**`log` owns that file.** Its top level creates `$OOSH_USER_CONFIG_PATH`,
+touch-guards `log.session.env` and sources it (the file-scope block at the top of `log`); `log.session.save`
+writes it. The shared `log.env` used to chain it with a last line
+`. $OOSH_USER_CONFIG_PATH/log.session.env`, and that was removed: a failed `.`
+ends a POSIX shell, so a per-user file that did not exist yet aborted a
+`/bin/sh` login outright. A host whose `log.env` still carries that line gets it
+dropped by its next `config save` — see
+[repair-toolkit.md](repair-toolkit.md) § *Migrating a host that predates this*.
+
+Because `log` sources the file itself, a value you set with `log name
+<value>` is still **loaded back on every login**, not just recorded: `log`'s top-level
 keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so the saved name
 wins and the `user@host` default only fills in when none is saved.
 
@@ -382,6 +410,11 @@ Coordinated defenses keep `LOG_LIVE` correct across `user login` chains:
 * **Write-side:** `config.save` filters `LOG_LIVE` (and `LOG_NAME`/`LOG_DEVICE`/`OOSH_USER_CONFIG_PATH`) out of the shared `log.env` deny-`case`. Stops the leak at the source.
 
 Result: `console.log` and `silent.log` always write to the current user's `$OOSH_USER_CONFIG_PATH/log.live.out`, even after `user login <other>` chains across users with non-traversable home directories.
+
+`user login` hands the target a clean environment (`env -i`) with one exception, `TERM`: it
+describes the terminal, not the caller. Without it `su` sets `TERM=dumb` and the target shell has no
+colour — git prints its status plain — and `less`, `vi`, `clear` and tmux degrade
+(`T-USER-LOGIN-KEEPS-TERM`, `test/test.user`).
 
 Verified by `T-THIS-INIT-LOG-LIVE-PRESERVED` / `T-CONFIG-SAVE-EXCLUDES-LOG-LIVE` (`test/test.oo`) and `test/test.log` T46–T50.
 

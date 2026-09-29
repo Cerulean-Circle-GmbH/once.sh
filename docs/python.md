@@ -49,7 +49,7 @@ The reporting script is **stand-alone** — never invoked from any OOSH method. 
 
 ### Python source files (TestSuite component, used by `otest`)
 
-Component root: `$OTEST_DIR` → `/home/hannesn/WODA.2023/_var_dev/EAMD.ucp/Components/me/hannesnortje/TestSuite/2.0.0/` (auto-discovered by `otest:460–486`; secondary candidate `/var/dev/EAMD.ucp/...`).
+Component root: `$OTEST_DIR` → `…/EAMD.ucp/Components/me/hannesnortje/TestSuite/2.0.0/`, auto-discovered by `private.ensureDir` (otest): the cwd walk-up, then the EAMD.ucp root above the Once.sh components base (`oo mode.base.get` — the shared `/home/shared/EAMD.ucp` layout), then the legacy `~/WODA.2023/_var_dev/EAMD.ucp` and `/var/dev/EAMD.ucp` until TestSuite moves.
 
 | Path | Lines | Purpose |
 | --- | --- | --- |

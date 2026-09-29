@@ -1,4 +1,14 @@
-# Review: boot loader + pure-data env files ("config has code!")
+# Review: boot loader + pure-data env files ("config has code!") ⚪ SUPERSEDED
+
+> **⚠️ SUPERSEDED (2026-09-22)** — see
+> `docs/superpowers/plans/2026-09-22-remove-boot-user-env-is-the-boot.md`. The `boot`
+> loader this review examines has been **deleted**. Env files are still pure data, but
+> `~/config/user.env` now carries the `$HOME`-relative anchors, the PATH prepend and
+> `BASH_FILE` as `export` lines of its own — data, not logic — and every caller sources
+> that file directly. Current model:
+> [config.md § user.env is the boot](../config.md#userenv-is-the-boot) and
+> [oosh-architecture.md § The anchors are data](../oosh-architecture.md#the-anchors-are-data).
+> Retained as the 2026-09-09 review record only; nothing below has been rewritten.
 
 **Status:** research — report only, nothing changed.
 **Date:** 2026-09-09
