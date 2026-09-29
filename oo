@@ -170,16 +170,20 @@ private.oo.new.method()   # <newScript.newMethod> # creates a new method in a sc
     # and exactly one of them. `replace within` matches a substring on every
     # line, and the marker text also appears in this very function's source a
     # few lines above — running the tool against `oo` itself corrupted it.
-    if replace line "$OOSH_DIR/$newScript" "### new.method" by "$tweakedMethod" \
-       && replace commit "$OOSH_DIR/$newScript"; then
-      replace cleanup "$OOSH_DIR/$newScript"
-      success.log "created method $functionName in $OOSH_DIR/$newScript"
+    # Edit the REAL file: a script may be a symlink (top-level c2 -> ng/c2),
+    # and replace commit refuses a link rather than turn it into a copy.
+    local scriptFile
+    scriptFile=$(private.this.path.canonical "$OOSH_DIR/$newScript")
+    if replace line "$scriptFile" "### new.method" by "$tweakedMethod" \
+       && replace commit "$scriptFile"; then
+      replace cleanup "$scriptFile"
+      success.log "created method $functionName in $scriptFile"
     else
       # Deliberately no `replace commit` on this path. It used to run
       # unconditionally, and committing with no working copy left the script
       # with no file under its own name.
-      error.log "could not insert $functionName — $OOSH_DIR/$newScript is unchanged"
-      replace cleanup "$OOSH_DIR/$newScript"
+      error.log "could not insert $functionName — $scriptFile is unchanged"
+      replace cleanup "$scriptFile"
       return 3
     fi
   fi
@@ -248,15 +252,21 @@ private.oo.method.stubs.get() # <script.method> <parameters> # the completion fu
 
 oo.commit() # <?mode:force> # commits latest changes to the oosh environment and publishes them.
 {
+  private.this.script.load ogit ogit.branch.get
   cd $OOSH_DIR
 
-  local branch=$( git branch | line find "\*" )
+  local branch=$( ogit.branch.get "$OOSH_DIR" )
+  # ogit-exception: printed text, not an invocation
   console.log "git branch is: $branch"
-  if [ "$branch" = "* dev" ] || [ "$1" = "force" ]; then
+  if [ "$branch" = "dev" ] || [ "$1" = "force" ]; then
     rm *\:
-    git add *
-    git commit
-    git push
+    # The top-level glob, not `ogit.index.add all` (-A): `*` never matches the
+    # top-level dotfiles (.claude/, .cursor/, .github/, .gitignore, …) nor
+    # stages top-level deletions, and -A would. Same pathspecs, same git add.
+    ogit.index.add all "$OOSH_DIR" *
+    ogit.commit.create "" "" "" "$OOSH_DIR"
+    # ogit.remote.push keeps git's stderr quiet; say why it was refused.
+    ogit.remote.push "" no "$OOSH_DIR" || error.log "$RESULT"
   else
     error.log "not on the dev branch"
     console.log "switch branch with
@@ -269,9 +279,10 @@ oo.commit() # <?mode:force> # commits latest changes to the oosh environment and
 
 oo.update() # # updates oosh environment and pulls latest changes from github.
 {
+  private.this.script.load ogit ogit.branch.get
   cd "$OOSH_DIR" || return 1
   local pulled=0
-  if git pull; then
+  if ogit.remote.pull "" "" "$OOSH_DIR"; then
     pulled=1
   else
     # SSH-based pull failed. The shared clone at oo:1332 uses the 2cuGitHub
@@ -285,10 +296,11 @@ oo.update() # # updates oosh environment and pulls latest changes from github.
     local fallbackUrl="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
     local branch
     branch=$(this.git.branch.short "$OOSH_DIR" 2>/dev/null)
-    [ -z "$branch" ] && branch=$(git -C "$OOSH_DIR" symbolic-ref --short HEAD 2>/dev/null)
+    [ -z "$branch" ] && branch=$(ogit.branch.get "$OOSH_DIR")
     [ -z "$branch" ] && branch="dev"
+    # ogit-exception: printed text, not an invocation
     warn.log "git pull (SSH remote) failed; trying HTTPS fallback: $fallbackUrl $branch"
-    if git pull "$fallbackUrl" "$branch"; then
+    if ogit.remote.pull "$fallbackUrl" "$branch" "$OOSH_DIR"; then
       important.log "oo update succeeded via HTTPS fallback (configured remote unchanged)"
       pulled=1
     fi
@@ -296,6 +308,17 @@ oo.update() # # updates oosh environment and pulls latest changes from github.
   if [ "$pulled" -ne 1 ]; then
     error.log "oo update failed via both SSH remote and HTTPS fallback"
     return 1
+  fi
+  # Trust: in the clone layout every folder under the base is its own
+  # repository and needs its own safe.directory entry for the caller (spec
+  # § 4). Idempotent; a folder added since the last run is trusted here.
+  # No base yet (the installer's first pass runs in root's plain ~/oosh clone,
+  # before state 31 builds the shared tree): nothing to trust — skip quietly.
+  local base
+  if base=$(oo.mode.base.get 2>/dev/null) && [ -n "$base" ]; then
+    ogit.safeDirectory.ensure "$base" >/dev/null || warn.log "oo update: could not ensure safe.directory — $RESULT"
+  else
+    info.log "oo update: no components base yet — safe.directory ensure skipped"
   fi
   # Self-heal: rewire ~/config + ~/oosh symlinks via config.init.user.
   # Catches the case where init/oosh was re-run out of band and clobbered
@@ -330,156 +353,50 @@ private.oo.update.heal.symlinks() # # heal current user's ~/config + ~/oosh syml
     || warn.log "oo update: \`config init.user $USER\` reported an issue — run \`oo user.fix\` for details"
 }
 
-oo.boot.fix() # <?systemPath:/etc/oosh> <?profileDir:/etc/profile.d> # install or repair the fixed host-wide boot path <systemPath>/boot -> the canonical shared boot, and the <profileDir>/oosh.sh login-shell drop-in; idempotent
+oo.profile.fix() # <?profileDir:/etc/profile.d> # install or repair the login-shell drop-in <profileDir>/oosh.sh that makes `env -i sh -l` come up as an oosh shell; idempotent
 {
-  # T9 (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md).
-  #
-  # NOT a convenience. The state-machine declaration is FROZEN per host at
-  # first install — state.machine.init writes the state array
-  # once and oo.state() re-creates the machine only when it does not
-  # exist — so no ALREADY-INSTALLED host will ever see state 34. This is the
-  # only path onto those machines.
-  #
-  # Deliberately NOT auto-triggered: `oo update` runs as an ordinary user with
-  # no sudo, and implicit auto-repair on startup was removed after the May-8
-  # sudo-chain incident (docs/repair-toolkit.md). Naming follows `oo user.fix`.
-  #
-  # TWO host resources, one command: the fixed path <systemPath>/boot, and the
-  # <profileDir>/oosh.sh drop-in that makes `env -i sh -l` recover by itself.
-  # Both are parameters so tests can drive this against fixtures without root —
-  # pass BOTH when you do, or the drop-in half still aims at the real
-  # /etc/profile.d and asks for a sudo password.
-  local systemPath="${1:-/etc/oosh}"
-  local profileDir="${2:-/etc/profile.d}"
-
-  # ── Privilege pre-flight (decision 4) ──────────────────────────────────────
-  # $SUDO INTERNALLY, not `sudo oo boot.fix`: one documented command that works
-  # whether the caller is already root or a `dev` member with sudo — the
-  # `$SUDO tee` idiom init/oosh uses for /etc/paths.d. If NEITHER applies, fail loudly naming what it
-  # needed; it must never half-succeed.
-  #
-  # One privilege rule (private.oo.path.sudo.get, built on $SUDO — "" for
-  # root): a prefix is needed for <systemPath>, or for <profileDir> where it
-  # EXISTS (a host without it, macOS, skips that half and must not be told it
-  # needs root). If a prefix is needed and there is no sudo to provide it,
-  # fail loudly before creating anything.
-  local needsSudo
-  needsSudo=$(private.oo.path.sudo.get "$systemPath")
-  if [ -d "$profileDir" ] && [ -z "$needsSudo" ]; then
-    needsSudo=$(private.oo.path.sudo.get "$profileDir")
-  fi
+  # Successor of the T9 `oo boot.fix`: there is no /etc/oosh/boot any more —
+  # the boot data lives in ~/config/user.env and the drop-in sources it after
+  # recovering $HOME. NOT auto-triggered (see docs/repair-toolkit.md).
+  local profileDir="${1:-/etc/profile.d}"
+  local needsSudo=""
+  [ -d "$profileDir" ] && needsSudo=$(private.oo.path.sudo.get "$profileDir")
   if [ -n "$needsSudo" ] && ! command -v sudo >/dev/null 2>&1; then
-    # Bare `echo` to stderr, NOT error.log — doctrine, and guarded in
-    # test.promote / test.ossh.certificates.update (bare-echo doctrine): error.log
-    # routes to $LOG_DEVICE, so when that is a file or /dev/null (a capture,
-    # `log device <file>`, a non-tty CI run) this instruction vanishes and the
-    # user is left with a bare non-zero exit. A fatal message that tells the
-    # caller what to do must survive every LOG_LEVEL and LOG_DEVICE.
-    echo "oo boot.fix: $systemPath needs root — you are '${USER:-?}' and no usable sudo was found. Re-run as root (e.g. \`su - -c 'oo boot.fix'\`) or install sudo." >&2
-    create.result 1 "oo boot.fix: neither root nor sudo"
+    # bare echo: a fatal instruction must survive every LOG_LEVEL / LOG_DEVICE
+    echo "oo profile.fix: $profileDir needs root — you are '${USER:-?}' and no usable sudo was found. Re-run as root (e.g. \`su - -c 'oo profile.fix'\`) or install sudo." >&2
+    create.result 1 "oo profile.fix: neither root nor sudo"
     return $(result)
   fi
-
-  # ── Derive the canonical shared base + branch ─────────────────────────────
-  # One rule for state 31, state 34 and this method: private.oo.shared.base.get.
-  # Pins to the INSTALL branch by construction — `oo mode` does not re-point
-  # it, and that is fine: `boot` names no branch, so all a user on another
-  # branch inherits is the anchoring prologue; their own config and `log`
-  # still load from their own tree.
-  local base branch
-  { read -r base; read -r branch; } <<< "$(private.oo.shared.base.get)"
-  if [ -z "$base" ] || [ ! -d "$base" ] || [ -z "$branch" ]; then
-    error.log "oo boot.fix: could not derive the shared base/branch from OOSH_DIR=$OOSH_DIR (got '$base' '$branch') — run \`oo user.fix\` first"
-    create.result 1 "oo boot.fix: no shared base/branch"
-    return $(result)
-  fi
-
-  private.oo.boot.path.ensure "$base" "$branch" "$systemPath" "$profileDir"
+  private.oo.profile.dropin.ensure "$profileDir"
   return $(result)
 }
+oo.profile.fix.completion.profileDir() { oo.parameter.completion.profileDir "$@"; }
 
-oo.boot.status() # <?systemPath:/etc/oosh> <?profileDir:/etc/profile.d> # read-only report on the fixed host-wide boot path and its login-shell drop-in; rc 0 when healthy
+oo.profile.status() # <?profileDir:/etc/profile.d> # read-only report on the login-shell drop-in; rc 0 when healthy
 {
-  # Status-command idiom: a user-invoked report emits its ANSWER on plain
-  # stdout, never gated behind console.log / important.log — otherwise it is
-  # silent at the log level CI and installs run with. Read-only: it diagnoses,
-  # `oo boot.fix` repairs.
-  local systemPath="${1:-/etc/oosh}"
-  local profileDir="${2:-/etc/profile.d}"
-  local link="$systemPath/boot"
-
-  echo "oosh boot system path: $link"
-
-  if [ ! -L "$link" ]; then
-    if [ -e "$link" ]; then
-      echo "  state:   PRESENT but NOT a symlink ($(ls -ld "$link" 2>/dev/null))"
-    else
-      echo "  state:   MISSING"
-    fi
-    echo "  cause:   this host was installed before state 34 (root.boot.path.installed),"
-    echo "           or the link was removed."
-    echo "  fix:     oo boot.fix"
-    create.result 1 "$link missing or not a symlink — run oo boot.fix"
-    return $(result)
-  fi
-
-  local target
-  target=$(readlink "$link" 2>/dev/null)
-  echo "  target:  $target"
-
-  local rc=0
-  if [ ! -f "$target" ]; then
-    echo "  state:   DANGLING — the target does not exist"
-    echo "  fix:     oo boot.fix"
-    rc=1
-  elif [ ! -r "$link" ]; then
-    echo "  state:   NOT READABLE by ${USER:-$(id -un 2>/dev/null)}"
-    echo "  fix:     oo boot.fix   (and check group/mode on the shared tree)"
-    rc=1
-  else
-    echo "  state:   OK"
-    echo "  use:     . $link          # any user, any shell, no environment at all"
-  fi
-
-  # ── The login-shell route ────────────────────────────────────────────────
-  # Reported here or a broken `env -i sh -l` stays invisible until someone
-  # needs it in anger. A host with no <profileDir> (macOS) is NOT a fault:
-  # /etc/profile there globs nothing, so the route simply does not exist.
-  local dropIn="$profileDir/oosh.sh"
+  # Status-command idiom: the ANSWER goes to plain stdout, never behind
+  # console.log. Read-only: it diagnoses, `oo profile.fix` repairs.
+  local profileDir="${1:-/etc/profile.d}"
+  local dropIn="$profileDir/oosh.sh" rc=0
   echo "oosh login-shell drop-in: $dropIn"
   if [ ! -d "$profileDir" ]; then
     echo "  state:   N/A — this host has no $profileDir (macOS); the login route does not exist here"
-    echo "  use:     . $link          # or: env -i ENV=$link sh"
+    echo "  use:     . ~/config/user.env      # any shell, HOME set"
   elif [ ! -r "$dropIn" ]; then
     echo "  state:   MISSING — /etc/profile globs $profileDir/*.sh and finds no oosh line"
     echo "  effect:  \`env -i sh -l\` does NOT come up as an oosh shell on this host"
-    echo "  fix:     oo boot.fix"
-    rc=1
-  elif ! grep -Fq "$link" "$dropIn" 2>/dev/null; then
-    echo "  state:   STALE — present, but it does not source $link"
-    echo "  fix:     oo boot.fix"
-    rc=1
+    echo "  fix:     oo profile.fix"; rc=1
+  elif ! grep -Fq 'config/user.env' "$dropIn" 2>/dev/null; then
+    echo "  state:   STALE — present, but it does not source ~/config/user.env"
+    echo "  fix:     oo profile.fix"; rc=1
   else
     echo "  state:   OK"
-    echo "  use:     env -i sh -l     # login shells recover by themselves"
+    echo "  use:     env -i sh -l             # login shells recover by themselves"
   fi
-  echo "  note:    bare \`env -i sh\` can NEVER self-recover — \$ENV is a non-login"
-  echo "           POSIX sh's only rc hook and \`env -i\` is what erased it."
-  echo "           Hand it back: env -i ENV=$link sh"
-
-  # Trust note (T9 decision 1a) — see docs/boot.md and the creation site in
-  # private.oo.boot.path.ensure. Reported here too so nobody reading the
-  # status output concludes /etc means root-owned.
-  echo "  trust:   the target is DEV-GROUP-WRITABLE (state 31 runs chmod -R g+w on"
-  echo "           the shared tree). Same trust model as root's own ~/oosh, which is"
-  echo "           already a symlink into that tree — the path merely LOOKS root-owned."
-  if [ "$rc" = 0 ]; then
-    create.result 0 "boot system path healthy"
-  else
-    create.result 1 "boot system path or login drop-in needs oo boot.fix"
-  fi
+  if [ "$rc" = 0 ]; then create.result 0 "login-shell drop-in healthy"; else create.result 1 "login-shell drop-in needs oo profile.fix"; fi
   return $(result)
 }
+oo.profile.status.completion.profileDir() { oo.parameter.completion.profileDir "$@"; }
 
 oo.user.fix() # <?username:$USER> # repair this user's ~/config + ~/oosh symlinks to the canonical shared tree; idempotent
 {
@@ -500,71 +417,12 @@ oo.user.fix.completion.username() {
   user.list
 }
 
-oo.safeDirectory.prune() # # remove git safe.directory entries whose paths no longer exist on disk
-{
-  # Explicit, idempotent repair primitive. `git config --global
-  # safe.directory` accumulates entries from install passes, `oo mode`
-  # iterations on temp fixtures, and dev-group worktree adds. When the
-  # list grows large (especially with stale /tmp/* paths) the Cursor /
-  # VS Code Git extension can hang while validating each entry, leaving
-  # the Source Control panel and branch picker empty. This primitive
-  # walks the list, drops entries whose paths no longer exist, and
-  # leaves real paths untouched. Honours $GIT_CONFIG_GLOBAL so tests
-  # can sandbox without touching the user's real ~/.gitconfig.
-  local entry pruned=0
-  local -a kept=()
+# ogit-exception: docstring text, not an invocation
+oo.safeDirectory.prune() # # remove git safe.directory entries whose paths no longer exist on disk (delegates to ogit safeDirectory.prune)
+{ private.this.script.load ogit ogit.branch.get; ogit.safeDirectory.prune "$@"; }
 
-  while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    if [ -e "$entry" ]; then
-      kept+=("$entry")
-    else
-      pruned=$((pruned + 1))
-    fi
-  done < <(git config --global --get-all safe.directory 2>/dev/null)
-
-  if [ "$pruned" -gt 0 ]; then
-    git config --global --unset-all safe.directory 2>/dev/null
-    local k
-    for k in "${kept[@]}"; do
-      git config --global --add safe.directory "$k"
-    done
-    console.log "Pruned $pruned stale safe.directory entries; ${#kept[@]} preserved"
-  else
-    info.log "No stale safe.directory entries to prune (${#kept[@]} present)"
-  fi
-
-  create.result 0 "pruned=$pruned kept=${#kept[@]}"
-  return $(result)
-}
-
-private.oo.safeDirectory.add() # <path> # idempotently add path to git's global safe.directory list (no-op if already present)
-{
-  # Private helper used by install/setup paths that must declare a
-  # shared worktree as trusted (`/home/shared/.../Once.sh/{main,dev,prod}`
-  # is owned by developking:dev — other dev-group users hit dubious-
-  # ownership without an explicit safe.directory entry). Calling
-  # `git config --global --add safe.directory` blindly on every
-  # (re)install accumulates duplicates; this helper short-circuits
-  # when the exact path is already present.
-  #
-  # Uses `grep -qFx` (fixed string, full-line match) so that a path
-  # which is a substring of another doesn't false-positive. Honours
-  # $GIT_CONFIG_GLOBAL so tests can sandbox.
-  local path="$1"
-  if [ -z "$path" ]; then
-    error.log "private.oo.safeDirectory.add: <path> required"
-    create.result 1 "path required"
-    return $(result)
-  fi
-  if git config --global --get-all safe.directory 2>/dev/null | grep -qFx "$path"; then
-    create.result 0 "already present: $path"
-  else
-    git config --global --add safe.directory "$path"
-    create.result 0 "added: $path"
-  fi
-  return $(result)
-}
+private.oo.safeDirectory.add() # <path> # idempotently add path to git's global safe.directory list (delegates to ogit safeDirectory.add)
+{ private.this.script.load ogit ogit.branch.get; ogit.safeDirectory.add "$@"; }
 
 oo.remote.update() { # <sshConfigHost> # updates the oosh environment on <sshConfigHost>
   local sshConfigHost="$1"
@@ -628,13 +486,14 @@ private.oo.promote.report() # # show promotion history
 
 oo.mode.base.get() # # returns the OOSH components base directory
 {
+  private.this.script.load ogit ogit.branch.get
   # Strategy 1: Explicit config (set by oo mode.base.set or oo mode.setup)
   if [ -n "$OOSH_COMPONENTS_DIR" ] && [ -d "$OOSH_COMPONENTS_DIR" ]; then
     echo "$OOSH_COMPONENTS_DIR"
     return 0
   fi
 
-  # OOSH_DIR is the ~/oosh symlink (docs/boot.md). Strategies 3 and 4 do path
+  # OOSH_DIR is the ~/oosh symlink (docs/oosh-architecture.md). Strategies 3 and 4 do path
   # arithmetic (dirname/basename) on it, which needs the PHYSICAL worktree —
   # `dirname ~/oosh` is just $HOME. Resolve once, here.
   local ooshDir
@@ -643,7 +502,7 @@ oo.mode.base.get() # # returns the OOSH components base directory
   # Strategy 2: Use git worktree list to find main worktree, derive base as its parent
   if [ -d "$ooshDir/.git" ] || [ -f "$ooshDir/.git" ]; then
     local mainWt
-    mainWt=$(git -C "$ooshDir" worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')
+    mainWt=$(ogit.worktree.list "$ooshDir" | head -1 | sed 's/^worktree //')
     if [ -n "$mainWt" ]; then
       local mainBase
       mainBase=$(basename "$mainWt")
@@ -654,33 +513,29 @@ oo.mode.base.get() # # returns the OOSH components base directory
     fi
   fi
 
-  # Strategy 3: Check if the worktree is inside a worktree (.git file with gitdir: pointer)
-  if [ -f "$ooshDir/.git" ]; then
-    local parent
-    parent=$(dirname "$ooshDir")
-    if [ -d "$parent/main" ]; then
-      echo "$parent"
-      return 0
-    fi
-  fi
-
-  # Strategy 4: Fall back to dirname if sibling "main" directory exists
+  # Strategy 3: walk UP from the checkout until a sibling main/ appears — one
+  # level for <base>/dev, two for a slash branch cloned at <base>/test/macos
+  # (a single dirname answered <base>/test there, which has no main/, so a
+  # nested clone had no base and OOSH_MODE could not be derived relative to
+  # it — F5). A checkout that IS main/ answers its parent.
   if [ -n "$ooshDir" ]; then
-    local parent
-    parent=$(dirname "$ooshDir")
-    local selfName
-    selfName=$(basename "$ooshDir")
-    if [ "$selfName" = "main" ] && [ -d "$ooshDir/.git" ]; then
-      echo "$parent"
+    local up="$ooshDir" parent level
+    if [ "$(basename "$ooshDir")" = "main" ] && [ -d "$ooshDir/.git" ]; then
+      echo "$(dirname "$ooshDir")"
       return 0
     fi
-    if [ -d "$parent/main" ] && [ "$parent/main" != "$ooshDir" ]; then
-      echo "$parent"
-      return 0
-    fi
+    for level in 1 2 3; do
+      parent=$(dirname "$up")
+      [ "$parent" = "/" ] || [ "$parent" = "$up" ] && break
+      if [ -d "$parent/main" ] && [ "$parent/main" != "$ooshDir" ]; then
+        echo "$parent"
+        return 0
+      fi
+      up="$parent"
+    done
   fi
 
-  # No worktree structure detected
+  # No clone layout detected
   return 1
 }
 
@@ -710,8 +565,10 @@ oo.mode.base.set() # <path> # set the OOSH components base directory FOR THIS PR
   console.log "Base set to: $path (this process only — see oo mode.setup)"
 }
 
+# ogit-exception: docstring text, not an invocation
 oo.mode.list() # # list available branches with git status
 {
+  private.this.script.load ogit ogit.branch.get
   local base
   base=$(oo.mode.base.get) || {
     error.log "No worktree structure detected. Run 'oo mode.setup' to convert your install."
@@ -730,9 +587,11 @@ oo.mode.list() # # list available branches with git status
     # (oo.user.fix → config.init.user) per docs/repair-toolkit.md.
     if [ -d "$dir/.git" ] || [ -f "$dir/.git" ]; then
       local statusOut="" statusErr=""
-      statusOut=$(cd "$dir" && git status --short --branch 2>/dev/null | head -1)
+      statusOut=$(ogit.status.show short "$dir" | head -1)
       if [ -z "$statusOut" ]; then
-        statusErr=$(cd "$dir" && git status --short --branch 2>&1 >/dev/null)
+        # ogit.raw, not ogit.status.show: the probe needs git's STDERR (the
+        # "dubious ownership" refusal text), which ogit.status.show discards.
+        statusErr=$(ogit.raw "$dir" status --short --branch 2>&1 >/dev/null)
         if echo "$statusErr" | grep -q "dubious ownership"; then
           statusOut="(unsafe ownership — run 'oo user.fix')"
         fi
@@ -744,6 +603,7 @@ oo.mode.list() # # list available branches with git status
 
 oo.branch.list() # <?source:all> # list available branches from worktrees, local git, and/or remote
 {
+  private.this.script.load ogit ogit.branch.get
   local source="${1:-all}"
 
   # Validate source parameter
@@ -776,7 +636,7 @@ oo.branch.list() # <?source:all> # list available branches from worktrees, local
 
     # Local git branches
     local localBranches
-    localBranches=$(git -C "${OOSH_DIR:-$HOME/oosh}" branch --format='%(refname:short)' 2>/dev/null)
+    localBranches=$(ogit.branch.list local "${OOSH_DIR:-$HOME/oosh}")
     if [ -n "$localBranches" ]; then
       branches="${branches}${localBranches}"$'\n'
     fi
@@ -784,11 +644,9 @@ oo.branch.list() # <?source:all> # list available branches from worktrees, local
 
   # Remote branches (with fetch)
   if [ "$source" = "all" ] || [ "$source" = "remote" ]; then
-    git -C "${OOSH_DIR:-$HOME/oosh}" fetch origin 2>/dev/null
+    ogit.remote.fetch no "${OOSH_DIR:-$HOME/oosh}"
     local remoteBranches
-    remoteBranches=$(git -C "${OOSH_DIR:-$HOME/oosh}" branch -r --format='%(refname:short)' 2>/dev/null \
-      | sed 's|^origin/||' \
-      | grep -v '^HEAD$')
+    remoteBranches=$(ogit.branch.list remote "${OOSH_DIR:-$HOME/oosh}")
     if [ -n "$remoteBranches" ]; then
       branches="${branches}${remoteBranches}"$'\n'
     fi
@@ -813,11 +671,14 @@ oo.branch.list.completion.source() {
   echo "remote"
 }
 
-oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
+oo.mode() # <?branch> # switch oosh to a branch folder under the base (cloned when missing), or show current mode
 {
-  local WORKTREE_BASE
-  WORKTREE_BASE=$(oo.mode.base.get)
-  local hasWorktrees=$?
+  private.this.script.load ogit ogit.branch.get
+  # The components base (…/Once.sh) — whatever the layout (clones since the
+  # 2026-09-23 design, linked worktrees on hosts not yet converted).
+  local componentsBase
+  componentsBase=$(oo.mode.base.get)
+  local hasBase=$?
   local OOSH_LINK="$HOME/oosh"
   local branch="$1"
 
@@ -825,9 +686,9 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
   current_target=$(readlink "$OOSH_LINK" 2>/dev/null)
 
   if [ -z "$branch" ]; then
-    # No argument: show current worktree status
+    # No argument: show the current mode
     # Resolve from symlink to show the actual target, not a stale OOSH_DIR.
-    # `private.this.path.canonical` (this:144) is the portable resolver —
+    # `private.this.path.canonical` (in `this`) is the portable resolver —
     # macOS BSD readlink predating 12.3 lacks `-f`, on those systems plain
     # `readlink -f` silently returns nothing and we'd report the symlink
     # path verbatim instead of its target.
@@ -837,20 +698,20 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
     currentName=$(basename "$actualPath")
     echo "Mode: $currentName"
     echo "Path: $actualPath"
-    if [ -n "$WORKTREE_BASE" ]; then
-      echo "Worktree base: $WORKTREE_BASE"
+    if [ -n "$componentsBase" ]; then
+      echo "Base: $componentsBase"
     else
-      echo "Worktree base: (none — run 'oo mode.setup' to enable branch switching)"
+      echo "Base: (none — run 'oo mode.setup' to enable branch switching)"
     fi
     if [ -d "$actualPath" ]; then
-      (cd "$actualPath" && git status --short --branch 2>/dev/null)
+      ogit.status.show short "$actualPath"
     fi
-    # Consistency check: git branch vs directory name (only in worktree environments)
-    if [ -n "$WORKTREE_BASE" ]; then
+    # Consistency check: git branch vs folder name (only under a components base)
+    if [ -n "$componentsBase" ]; then
       local gitBranch
-      gitBranch=$(git -C "$actualPath" branch --show-current 2>/dev/null)
+      gitBranch=$(ogit.branch.get "$actualPath")
       if [ -n "$gitBranch" ] && [ "$gitBranch" != "$currentName" ]; then
-        echo "Git branch is '$gitBranch' but worktree directory is '$currentName'"
+        echo "Git branch is '$gitBranch' but the branch folder is '$currentName'"
         echo "  To fix: oo mode.align"
       fi
     fi
@@ -874,20 +735,20 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
     return 0
   fi
 
-  # Require worktree structure for switching
-  if [ $hasWorktrees -ne 0 ] || [ -z "$WORKTREE_BASE" ]; then
-    error.log "No worktree structure detected. Run 'oo mode.setup' to convert your install."
+  # Switching needs a components base (branch folders side by side)
+  if [ $hasBase -ne 0 ] || [ -z "$componentsBase" ]; then
+    error.log "No components base detected. Run 'oo mode.setup' to convert your install."
     return 1
   fi
 
-  local target_dir="$WORKTREE_BASE/$branch"
+  local target_dir="$componentsBase/$branch"
 
   if [ ! -d "$target_dir" ]; then
     console.log "Directory '$branch' not found. Checking remote branches..."
     # Strict match: exact branch name (origin/<branch>), not regex/substring.
     # The previous `grep -i "${branch//\./.*}"` matched partial names —
     # `oo mode test` would silently select `origin/test/ish` (alphabetical
-    # first) and try to wedge a worktree at $WORKTREE_BASE/test for a
+    # first) and try to wedge a worktree at <base>/test for a
     # branch actually named `test/ish`. Worse, when that worktree-add
     # silently failed but the rest of oo.mode ran anyway, OOSH_DIR was
     # exported to a non-existent path, breaking every subsequent c2
@@ -895,28 +756,44 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
     # `grep -Fx` = fixed-string, full-line match; the user gets a clean
     # error and can retype the full name (e.g. `oo mode test/ish`).
     local remote_branch
-    remote_branch=$(cd "$current_target" && git branch -r 2>/dev/null \
-      | sed 's/^ *//' \
-      | grep -v 'HEAD' \
+    # ogit.branch.list remote answers bare names (origin/ stripped, HEAD
+    # dropped); put the prefix back so the match stays the anchored one.
+    remote_branch=$(ogit.branch.list remote "$current_target" \
+      | sed 's|^|origin/|' \
       | grep -Fx "origin/$branch" | head -1)
     if [ -z "$remote_branch" ]; then
       error.log "No remote branch named '$branch' found (use full name, e.g. \`oo mode test/macos\`)"
       create.result 1 "branch not found"
       return $(result)
     fi
-    console.log "Creating worktree for $remote_branch..."
-    if ! (cd "$current_target" && git worktree add -B "${remote_branch#origin/}" "$target_dir" "$remote_branch"); then
-      error.log "git worktree add failed for $remote_branch → $target_dir"
-      create.result 1 "worktree add failed"
+    # The clone layout (2026-09-23 design): every folder under the base is
+    # its own repository. private.oo.branch.clone.ensure owns the decision
+    # (the helper install state 31 uses; never clones over a folder it did
+    # not make). Cloned from origin's URL, then group-shared and trusted.
+    console.log "Cloning $remote_branch into $target_dir..."
+    local originUrl
+    originUrl=$(ogit.remote.url.get origin "$current_target")
+    if [ -z "$originUrl" ]; then
+      error.log "clone failed for $remote_branch → $target_dir — no origin URL in ${current_target:-$OOSH_DIR}"
+      create.result 1 "clone failed"
+      return $(result)
+    fi
+    if ! private.oo.branch.clone.ensure "$originUrl" "${remote_branch#origin/}" "$target_dir" >/dev/null; then
+      error.log "clone failed for $remote_branch → $target_dir — $RESULT"
+      create.result 1 "clone failed"
       return $(result)
     fi
     # Post-condition: target_dir MUST exist before we touch any symlink.
-    # Even when `git worktree add` reports success, defensive check.
+    # Even when the clone reports success, defensive check.
     if [ ! -d "$target_dir" ]; then
-      error.log "Worktree add reported success but $target_dir is missing"
-      create.result 1 "worktree add post-condition violated"
+      error.log "Clone reported success but $target_dir is missing"
+      create.result 1 "clone post-condition violated"
       return $(result)
     fi
+    ogit.repo.share "$target_dir" >/dev/null || warn.log "oo mode: $RESULT"
+    # macOS: safe.directory is a string match — the file system's letter case.
+    ogit.safeDirectory.add "$(private.this.path.case.get "$target_dir")" >/dev/null \
+      || warn.log "oo mode: $RESULT"
   fi
 
   # Switch symlink
@@ -957,7 +834,20 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
   # OOSH_DIR is NOT reassigned: it is the constant ~/oosh, and the `ln -s`
   # above already repointed it at $target_dir. Only OOSH_MODE changes.
   export OOSH_MODE="$branch"
-  config save oosh OOSH 2>/dev/null
+  config user.save   # per user: ~/oosh is per user (the shared tier never carries OOSH_MODE)
+
+  # CHECK the config against the TARGET branch's format (command form — ~/oosh
+  # now resolves to the target) and TELL; never repair from a branch switch.
+  # `config init` from here ran init.full silently: init.shared, init.user's
+  # private.as.user hop and .bashrc re-template, regeneration of the SHARED env
+  # files — for every pre-existing install on its first switch, with the
+  # verdicts thrown away (F4). Repairing the shared tier is the operator's call.
+  # No 2>/dev/null: log lines are fd2-safe since private.log.emit, and the
+  # verdict is what the user needs to see. A branch without the script (or an
+  # older one without validate required) is fine.
+  if [ -x "$OOSH_DIR/config" ] && ! "$OOSH_DIR/config" validate required >/dev/null 2>&1; then
+    important.log "oo mode: the config is not in $branch's format — run: ${YELLOW}config init${NORMAL}   (config validate required shows why)"
+  fi
 
   # Write env pickup file so the shim can update the parent shell next time
   mkdir -p "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}"
@@ -985,26 +875,30 @@ oo.mode() # <?branch> # switch oosh to a branch worktree, or show current mode
   fi
 }
 
+# ogit-exception: docstring text, not an invocation
 oo.mode.align() # # align git branch to match the current worktree directory name
 {
+  private.this.script.load ogit ogit.branch.get
   local OOSH_LINK="$HOME/oosh"
   local actualPath
-  # private.this.path.canonical (this:144) — portable resolver; see comment
+  # private.this.path.canonical (in `this`) — portable resolver; see comment
   # at oo.mode for the macOS BSD-readlink rationale.
   actualPath=$(private.this.path.canonical "$OOSH_LINK" 2>/dev/null || echo "$OOSH_DIR")
   local currentName
   currentName=$(basename "$actualPath")
 
   local gitBranch
-  gitBranch=$(git -C "$actualPath" branch --show-current 2>/dev/null)
+  gitBranch=$(ogit.branch.get "$actualPath")
 
   if [ -z "$gitBranch" ]; then
+    # ogit-exception: printed text, not an invocation
     error.log "Cannot determine current git branch in $actualPath"
     create.result 1 "no git branch"
     return $(result)
   fi
 
   if [ "$gitBranch" = "$currentName" ]; then
+    # ogit-exception: printed text, not an invocation
     console.log "Already aligned: git branch '$gitBranch' matches directory '$currentName'"
     create.result 0 "already aligned"
     return $(result)
@@ -1013,7 +907,8 @@ oo.mode.align() # # align git branch to match the current worktree directory nam
   warn.log "Git branch is '$gitBranch' but directory is '$currentName'"
   console.log "Checking out '$currentName'..."
 
-  if git -C "$actualPath" checkout "$currentName" 2>/dev/null; then
+  if ogit.branch.checkout "$currentName" "$actualPath"; then
+    # ogit-exception: printed text, not an invocation
     success.log "Aligned: git branch now matches directory '$currentName'"
     create.result 0 "$currentName"
   else
@@ -1048,7 +943,7 @@ private.oo.install.shim() {
   echo "  Shim:    $shimDst (oo function loaded — mode/use update current shell)"
 }
 
-oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main/ + <branch>/ worktree layout and point ~/oosh at it
+oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main/ + <branch>/ clone layout and point ~/oosh at it
 {
   # It builds ONE layout, and it is not this function's own. The layout half is
   # private.oo.shared.tree.from.local — validated, idempotent, git-fallback'd,
@@ -1068,7 +963,7 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main
   # helper copies, verifies, and only then consumes the source.
   local OOSH_LINK="$HOME/oosh"
   local currentDir
-  # private.this.path.canonical (this:144) — portable resolver.
+  # private.this.path.canonical (in `this`) — portable resolver.
   currentDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
 
   # 1. Validate the argument. Nothing did, so a typo'd base silently became the
@@ -1097,8 +992,8 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main
   #    branch first would turn a no-op into a refusal.
   #    The old guard accepted ANY subdirectory holding a .git, so a
   #    half-converted tree read as done. The canonical shape is main/ with a
-  #    real .git DIRECTORY — main/ is the repository, the branch directories
-  #    are linked worktrees whose .git is a pointer file.
+  #    real .git DIRECTORY — main/ is a repository, and so is every branch
+  #    directory beside it (the clone layout; older installs: linked worktrees).
   if [ -d "$base/main/.git" ]; then
     echo "Worktree structure already exists at: $base"
     create.result 0 "already set up at $base" "$1"
@@ -1107,6 +1002,7 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main
 
   # 3. A main/ that is not a repository is a refusal, not something to copy over.
   if [ -e "$base/main" ]; then
+    # ogit-exception: printed text, not an invocation
     error.log "oo.mode.setup: $base/main exists but is not a git repository — move it aside first"
     create.result 3 "$base/main is not a repository" "$1"
     return $(result)
@@ -1116,6 +1012,7 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main
   local currentBranch
   currentBranch=$(this.git.branch.short "$currentDir")
   if [ -z "$currentBranch" ]; then
+    # ogit-exception: printed text, not an invocation
     error.log "oo.mode.setup: cannot detect a branch in $currentDir — is it a git clone?"
     create.result 1 "no branch detected in $currentDir" "$1"
     return $(result)
@@ -1234,8 +1131,9 @@ oo.mode.completion.branch() {
   private.oo.completion.worktree.branches
 }
 
-oo.checkout() # <version> # clone or add worktree for a remote branch
+oo.checkout() # <version> # clone a remote branch as its own folder under the components base (prefix stripped, slashes as dots); an existing folder is aligned, never pulled
 {
+  private.this.script.load ogit ogit.branch.get
   local version="$1"
 
   if [ -z "$version" ]; then
@@ -1251,99 +1149,81 @@ oo.checkout() # <version> # clone or add worktree for a remote branch
   dirName="${dirName#bugfix/}"
   dirName=$(echo "$dirName" | tr '/' '.')
 
-  # Detect environment
+  # ONE layout (2026-09-23 design): every branch is its own clone under the
+  # components base. No base means no layout to add to — fail loud with the
+  # fix instead of dropping a clone beside whatever $OOSH_DIR happens to be
+  # (the old plain-clone mode).
   local base
   base=$(oo.mode.base.get 2>/dev/null)
-  local hasWorktrees=$?
+  if [ -z "$base" ] || [ ! -d "$base" ]; then
+    create.result 1 "no components base — run oo mode.setup"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  local oosh="${OOSH_DIR:-$HOME/oosh}"
+  local targetDir="$base/$dirName"
 
-  if [ $hasWorktrees -eq 0 ] && [ -d "$base" ]; then
-    # --- Worktree mode ---
-    local targetDir="$base/$dirName"
+  if [ -d "$targetDir" ]; then
+    # Already exists — check if git branch matches directory name
+    local currentGitBranch
+    currentGitBranch=$(ogit.branch.get "$targetDir")
 
-    if [ -d "$targetDir" ]; then
-      # Already exists — check if git branch matches directory name
-      local currentGitBranch
-      currentGitBranch=$(git -C "$targetDir" branch --show-current 2>/dev/null)
-
-      if [ -n "$currentGitBranch" ] && [ "$currentGitBranch" != "$dirName" ]; then
-        # Misaligned: git branch doesn't match directory name — fix it
-        info.log "Aligning git branch to directory name: $dirName"
-        if git -C "$targetDir" checkout "$dirName" 2>/dev/null; then
-          success.log "Aligned branch to '$dirName' in $targetDir"
-          create.result 0 "$targetDir"
-          return $(result)
-        else
-          error.log "Failed to checkout branch '$dirName' in $targetDir"
-          create.result 1 "checkout failed"
-          return $(result)
-        fi
-      fi
-
-      # Already aligned and present — nothing to do. Pulling latest is NOT
-      # `oo.checkout`'s job; merging branches lives in `promote` /
-      # `oo stage` (the canonical promotion pipeline) and pulling lives
-      # in `oo update` (the explicit user-invoked refresh). Conflating
-      # them here meant `oo checkout dev` (with dev/ already present)
-      # silently fetched + merged origin/dev — surprising for a command
-      # whose name says "checkout", not "pull".
-      success.log "Worktree '$dirName' already present at $targetDir — run \`oo update\` to refresh"
-      create.result 0 "$targetDir"
-      return $(result)
-    fi
-
-    # New worktree
-    git -C "${OOSH_DIR:-$HOME/oosh}" fetch origin 2>/dev/null
-    info.log "Creating worktree for $version at $targetDir"
-    if git -C "${OOSH_DIR:-$HOME/oosh}" worktree add -B "$dirName" "$targetDir" "origin/$version" 2>/dev/null; then
-      success.log "Created worktree for $version at $targetDir"
-      console.log "  Use 'oo mode $dirName' to switch to it"
-      create.result 0 "$targetDir"
-    else
-      error.log "git worktree add failed for '$version'"
-      create.result 1 "worktree add failed"
-    fi
-
-  else
-    # --- Plain clone mode ---
-    local repoUrl
-    repoUrl=$(git -C "${OOSH_DIR:-$HOME/oosh}" remote get-url origin 2>/dev/null)
-    if [ -z "$repoUrl" ]; then
-      error.log "Cannot determine git remote URL from ${OOSH_DIR:-$HOME/oosh}"
-      create.result 1 "no remote URL"
-      return $(result)
-    fi
-
-    local targetDir
-    targetDir="$(dirname "${OOSH_DIR:-$HOME/oosh}")/$dirName"
-
-    if [ -d "$targetDir" ]; then
-      if [ -d "$targetDir/.git" ] || [ -f "$targetDir/.git" ]; then
-        # Same rationale as the worktree-mode branch above: oo.checkout
-        # does NOT pull. Pulls live in `oo update`; merges in `promote`.
-        success.log "Clone '$dirName' already present at $targetDir — run \`oo update\` to refresh"
+    if [ -n "$currentGitBranch" ] && [ "$currentGitBranch" != "$dirName" ]; then
+      # Misaligned: git branch doesn't match directory name — fix it
+      # ogit-exception: printed text, not an invocation
+      info.log "Aligning git branch to directory name: $dirName"
+      if ogit.branch.checkout "$dirName" "$targetDir"; then
+        success.log "Aligned branch to '$dirName' in $targetDir"
         create.result 0 "$targetDir"
         return $(result)
       else
-        error.log "Directory exists but is not a git repo: $targetDir"
-        create.result 1 "not a git repo"
+        error.log "Failed to checkout branch '$dirName' in $targetDir"
+        create.result 1 "checkout failed"
         return $(result)
       fi
     fi
 
-    # Fetch before clone to ensure branch is available
-    git -C "${OOSH_DIR:-$HOME/oosh}" fetch origin 2>/dev/null
-    info.log "Cloning $version into $targetDir"
-    if git clone "$repoUrl" -b "$version" "$targetDir" 2>/dev/null; then
-      success.log "Cloned $version to $targetDir"
-      console.log "  Use 'oo mode $dirName' to switch to it"
-      create.result 0 "$targetDir"
-    else
-      error.log "git clone failed for branch '$version'"
-      rm -rf "$targetDir" 2>/dev/null
-      create.result 1 "clone failed"
-    fi
+    # Already aligned and present — nothing to do. Pulling latest is NOT
+    # `oo.checkout`'s job; merging branches lives in `promote` /
+    # `oo stage` (the canonical promotion pipeline) and pulling lives
+    # in `oo update` (the explicit user-invoked refresh). Conflating
+    # them here meant `oo checkout dev` (with dev/ already present)
+    # silently fetched + merged origin/dev — surprising for a command
+    # whose name says "checkout", not "pull".
+    success.log "Folder '$dirName' already present at $targetDir — run \`oo update\` to refresh"
+    create.result 0 "$targetDir"
+    return $(result)
   fi
 
+  local repoUrl
+  repoUrl=$(ogit.remote.url.get origin "$oosh")
+  if [ -z "$repoUrl" ]; then
+    # ogit-exception: printed text, not an invocation
+    error.log "Cannot determine git remote URL from $oosh"
+    create.result 1 "no remote URL"
+    return $(result)
+  fi
+
+  # Fetch first: a branch pushed since the last fetch becomes known here, and
+  # the local fallback of oo.checkout.completion.version sees it next time.
+  ogit.remote.fetch no "$oosh" >/dev/null || warn.log "oo checkout: $RESULT"
+  info.log "Cloning $version into $targetDir"
+  # private.oo.branch.clone.ensure: the clone decision install state 31 and
+  # oo mode use — ogit repo.clone removes only a half-made dir it created
+  # itself, so no rm -rf here.
+  if ! private.oo.branch.clone.ensure "$repoUrl" "$version" "$targetDir" >/dev/null; then
+    error.log "clone failed for '$version' — $RESULT"
+    create.result 1 "clone failed"
+    return $(result)
+  fi
+  # Each folder is its own repository: group-shared, and trusted by the
+  # caller (macOS: safe.directory is a string match — the file system's case).
+  ogit.repo.share "$targetDir" >/dev/null || warn.log "oo checkout: $RESULT"
+  ogit.safeDirectory.add "$(private.this.path.case.get "$targetDir")" >/dev/null \
+    || warn.log "oo checkout: $RESULT"
+  success.log "Cloned $version to $targetDir"
+  console.log "  Use 'oo mode $dirName' to switch to it"
+  create.result 0 "$targetDir"
   return $(result)
 }
 oo.checkout.completion.version() {
@@ -1357,14 +1237,14 @@ oo.checkout.completion.version() {
   # at least sees the branches they last fetched. Linux with a reachable
   # origin gets the same output as before (out is non-empty → printed
   # directly). Pure-additive change for the unreachable case.
+  private.this.script.load ogit ogit.branch.get
   local oosh="${OOSH_DIR:-$HOME/oosh}"
   local out
-  out=$(git -C "$oosh" ls-remote --heads origin 2>/dev/null | sed 's|.*refs/heads/||')
+  out=$(ogit.remote.branch.list origin "$oosh")
   if [ -n "$out" ]; then
     printf '%s\n' "$out"
   else
-    git -C "$oosh" for-each-ref refs/remotes/origin --format='%(refname:short)' 2>/dev/null \
-      | sed 's|^origin/||'
+    ogit.branch.list remote "$oosh"
   fi
 }
 
@@ -1433,6 +1313,7 @@ oo.use.completion.command() {
 
 oo.branches.check() # <featureBranchPrefix> <baseBranch> <startCommit> # show state of branches
 {
+  private.this.script.load ogit ogit.branch.get
   local featureBranchPrefix=$1
   shift
   local R=remotes/origin
@@ -1460,14 +1341,18 @@ oo.branches.check() # <featureBranchPrefix> <baseBranch> <startCommit> # show st
   console.log
   console.log "==========================================================================="
   console.log "Update local repository (fetch --prune to remove all deleted branches)"
-  git fetch --prune
+  # This method works on the repository of the CURRENT directory (it always
+  # did: bare git), so every ogit call below names "$PWD".
+  ogit.remote.fetch yes "$PWD"
   console.log "First commit for branches:"
-  console.log `git show $startCommit`
+  console.log `ogit.commit.show $startCommit "$PWD"`
 
   console.log
   console.log "==========================================================================="
   console.log "Check all relevant branches:"
-  branches=`git branch -a --contains $startCommit | grep $R | grep -v $R/HEAD`
+  # ogit.branch.find answers short names (origin/x); `git branch -a` said
+  # remotes/origin/x, which is what $R and the loop below expect.
+  branches=`ogit.branch.find $startCommit "$PWD" | sed 's;^;remotes/;' | grep "^$R/" | grep -v $R/HEAD`
   for bl in $branches
   do
       b=`echo $bl | sed "s;$R/;;"`
@@ -1479,8 +1364,8 @@ oo.branches.check() # <featureBranchPrefix> <baseBranch> <startCommit> # show st
           console.log ONHOLD: $b
           ;;
       *)
-          NAME=`git log -1 --pretty=format:"%cn <%ce>" $bl`
-          AGO=`git log -1 --pretty=format:"%cr" $bl`
+          NAME=`ogit.commit.log.show $bl 1 "%cn <%ce>" "$PWD"`
+          AGO=`ogit.commit.log.show $bl 1 "%cr" "$PWD"`
           console.log
           console.log $b
           console.log "--> https://bitbucket.org/donges/eamd.ucp/branch/$b"
@@ -1505,13 +1390,13 @@ oo.branches.check() # <featureBranchPrefix> <baseBranch> <startCommit> # show st
           fi
 
           # merged and not deleted?
-          MY_COMMIT=`git log -1 --pretty=format:"%H" $bl`
-          COMMON_COMMIT=`git merge-base $bl $baseBranch`
+          MY_COMMIT=`ogit.commit.log.show $bl 1 "%H" "$PWD"`
+          COMMON_COMMIT=`ogit.merge.base.get $bl $baseBranch "$PWD"`
           if [[ "$MY_COMMIT" == "$COMMON_COMMIT" ]]; then
               error.log "Branch is merged but not deleted."
           else
               console.log "Here are the changes compared to branch: $R/dev/neom"
-              console.log "$(git diff --stat $R/dev/neom...$bl)"
+              console.log "$(ogit.diff.show $R/dev/neom $bl stat "$PWD")"
           fi
 
           ;;
@@ -1581,12 +1466,13 @@ private.init.state.machine() # <machine> # creates the state machine
   state.add root.shared.dev.folder.created       silent 
   state.add root.dev.keys.installed              silent 
   state.add root.installation.done               silent
-  # T9 — the fixed host-wide boot path /etc/oosh/boot. Inserted HERE, after
-  # the last named 30-lane state and before the `40` transition marker, so it
-  # lands at 34 and pushes only the marker to 35: state.add treats a numeric
-  # argument as a jump, so no existing state NUMBER moves (many are hard-coded
-  # in comments across oo and ossh). Pinned by T-BOOTPATH-STATE-34 in test/test.oo.
-  state.add root.boot.path.installed             silent
+  # The login-shell drop-in /etc/profile.d/oosh.sh — what makes `env -i sh -l`
+  # come up as an oosh shell. Inserted HERE, after the last named 30-lane state
+  # and before the `40` transition marker, so it lands at 34 and pushes only
+  # the marker to 35: state.add treats a numeric argument as a jump, so no
+  # existing state NUMBER moves (many are hard-coded in comments across oo and
+  # ossh). Pinned by T-PROFILE-STATE-34 in test/test.oo.
+  state.add root.profile.dropin.installed        silent
   state.add 40                                   silent
   state.add user.shared.dev.folder.linked        silent 
   state.add user.state.machine.synced.with.root  silent 
@@ -1741,8 +1627,9 @@ private.check.root.rights() {
 }
 
 
-private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:no> # produce canonical `main/ + <branchName>/` worktree layout in $(pwd) from a local clone. Idempotent — skips if main/ already exists. With <consumeSource> = yes the source is removed once main/ is verified, which is what `oo mode.setup` needs when the clone already sits where the branch worktree has to go. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 2/4 then succeeds and `oo mode <branch>` works).
+private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:no> # produce the canonical `main/ + <branchName>/` clone layout in $(pwd) from a local clone: <branchName>/ is an independent clone of main/ (origin re-pointed at main/'s origin, group-shared). Idempotent — skips if main/ already exists. With <consumeSource> = yes the source is removed once main/ is verified, which is what `oo mode.setup` needs when the clone already sits where the branch clone has to go. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 4 then succeeds and `oo mode <branch>` works).
 {
+  private.this.script.load ogit ogit.branch.get
   local src="$1"
   local branch="$2"
   local consume="${3:-no}"
@@ -1770,15 +1657,15 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:n
   #    from origin/main if available. If origin/main isn't fetched either,
   #    warn but proceed — oo.mode.base.get strategy 4 just checks dir
   #    existence so the layout is still usable.
-  if ! git -C main rev-parse --verify main >/dev/null 2>&1; then
-    if git -C main rev-parse --verify origin/main >/dev/null 2>&1; then
-      git -C main checkout -B main origin/main >/dev/null 2>&1 \
+  if ! ogit.branch.check main main; then
+    if ogit.branch.check origin/main main; then
+      ogit.branch.reset main origin/main main \
         || warn.log "private.oo.shared.tree.from.local: could not create local main from origin/main"
     else
       warn.log "private.oo.shared.tree.from.local: no origin/main ref in source — main/ stays on '$branch' branch (oo.mode.base.get sibling-dir check still satisfied)"
     fi
   else
-    git -C main checkout main >/dev/null 2>&1 \
+    ogit.branch.checkout main main >/dev/null \
       || warn.log "private.oo.shared.tree.from.local: could not checkout main in main/"
   fi
 
@@ -1790,7 +1677,7 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:n
   #     already holds every commit the source had. Default no, so state 31's
   #     call is unchanged.
   if [ "$consume" = "yes" ]; then
-    if [ ! -d "main/.git" ] || ! git -C main rev-parse --git-dir >/dev/null 2>&1; then
+    if [ ! -d "main/.git" ] || ! ogit.repo.check main; then
       error.log "private.oo.shared.tree.from.local: refusing to remove $src — main/ is not a usable repository"
       return 1
     fi
@@ -1799,15 +1686,38 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:n
     important.log "private.oo.shared.tree.from.local: source consumed: $src"
   fi
 
-  # 3. Add the active branch as a worktree of main/. Skip when the active
-  #    branch IS main — main/ already serves that role.
+  # 3. The active branch as an INDEPENDENT CLONE beside main/ (clone layout,
+  #    2026-09-23 design). Skip when the active branch IS main — main/ already
+  #    serves that role. Cloned from main/ (offline-safe), so main/ must hold
+  #    a LOCAL <branch>: a clone from a local path sees only its local heads.
+  #    When only origin/<branch> exists (the source was a clone of another
+  #    branch), create it from there first — the fallback the old
+  #    `worktree add … "$branch" || … "origin/$branch"` pair had — and put
+  #    main/ back on main. Then origin is re-pointed at main/'s origin so the
+  #    clone pulls from GitHub like every folder, and the clone is shared.
   if [ "$branch" != "main" ]; then
-    git -C main worktree add -B "$branch" "../$branch" "$branch" >/dev/null 2>&1 \
-      || git -C main worktree add -B "$branch" "../$branch" "origin/$branch" >/dev/null 2>&1 \
-      || { error.log "private.oo.shared.tree.from.local: git worktree add ../$branch failed in main/"; return 1; }
+    local here originUrl
+    here=$(private.this.path.canonical "$PWD")
+    if ! ogit.branch.check "refs/heads/$branch" main; then
+      ogit.branch.reset "$branch" "origin/$branch" main >/dev/null \
+        || { error.log "private.oo.shared.tree.from.local: neither $branch nor origin/$branch exists in main/ — $RESULT"; return 1; }
+      ogit.branch.checkout main main >/dev/null \
+        || warn.log "private.oo.shared.tree.from.local: could not put main/ back on main (no local main — see step 2)"
+    fi
+    originUrl=$(ogit.remote.url.get origin main)
+    private.oo.branch.clone.ensure "$here/main" "$branch" "$here/$branch" >/dev/null \
+      || { error.log "private.oo.shared.tree.from.local: clone of $branch from main/ failed — $RESULT"; return 1; }
+    if [ -n "$originUrl" ]; then
+      ogit.remote.url.set "$originUrl" origin "$here/$branch" >/dev/null \
+        || { error.log "private.oo.shared.tree.from.local: $RESULT"; return 1; }
+    fi
+    # Not fatal: state 31 re-shares every folder right after (fail-loud there),
+    # and oo mode.setup's user owns the clone it just made.
+    ogit.repo.share "$here/$branch" >/dev/null \
+      || warn.log "private.oo.shared.tree.from.local: $RESULT"
   fi
 
-  important.log "private.oo.shared.tree.from.local: canonical layout produced in $(pwd) (main/ + ${branch}/)"
+  important.log "private.oo.shared.tree.from.local: canonical clone layout produced in $(pwd) (main/ + ${branch}/)"
   return 0
 }
 
@@ -1845,7 +1755,7 @@ private.oo.user.shared.symlinks.ensure() # <userHome> <sharedConfigPath> <onceSh
   return $(result)
 }
 
-private.oo.install.branch.get() # # print the install branch: $OOSH_BRANCH, else the branch $HOME/oosh is on, else main — the one rule behind state 31, state 34 and oo boot.fix
+private.oo.install.branch.get() # # print the install branch: $OOSH_BRANCH, else the branch $HOME/oosh is on, else main — the one rule behind install state 31
 {
   local branch="${OOSH_BRANCH}"
   if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
@@ -1858,39 +1768,7 @@ private.oo.install.branch.get() # # print the install branch: $OOSH_BRANCH, else
   echo "$branch"
 }
 
-private.oo.shared.base.get() # # print two lines — the canonical shared Once.sh base and the branch under it — derived ONCE for install state 31/34 and oo boot.fix
-{
-  # Three sources, most concrete first:
-  #   1. what ~/oosh RESOLVES to — on any installed host (root included, once
-  #      state 31 has symlinked root's ~/oosh) this IS the truth;
-  #   2. the worktree base oo.mode.base.get already knows;
-  #   3. the basehome state 31 builds under (developking, else this user's),
-  #      which is the only answer available BEFORE the shared tree exists.
-  local ooshDir base="" branch=""
-  ooshDir=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null)
-  case "$ooshDir" in
-    */Once.sh/*)
-      base="${ooshDir%/*}"
-      branch="${ooshDir##*/}"
-      ;;
-  esac
-  if [ -z "$base" ] || [ ! -d "$base" ]; then
-    base=$(oo.mode.base.get 2>/dev/null)
-  fi
-  if [ -z "$base" ] || [ ! -d "$base" ]; then
-    local dir
-    dir="$( user get basehome developking )"
-    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
-      dir="$( user get basehome )"
-    fi
-    [ -n "$dir" ] && base="$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
-  fi
-  [ -z "$branch" ] && branch=$(private.oo.install.branch.get)
-  echo "$base"
-  echo "$branch"
-}
-
-private.oo.path.sudo.get() # <path> # print the $SUDO prefix needed to write <path> (its parent while it does not exist yet), or nothing when the caller can already write there — the one privilege rule behind oo boot.fix and private.oo.boot.path.ensure
+private.oo.path.sudo.get() # <path> # print the $SUDO prefix needed to write <path> (its parent while it does not exist yet), or nothing when the caller can already write there — the one privilege rule behind oo profile.fix and private.oo.profile.dropin.ensure
 {
   # Builds on the framework contract: `this` sets $SUDO to "" for root and
   # "sudo " otherwise, so root never gets a prefix and a fixture under $HOME
@@ -1907,105 +1785,22 @@ private.oo.path.sudo.get() # <path> # print the $SUDO prefix needed to write <pa
   [ -w "$probe" ] || printf '%s' "$SUDO"
 }
 
-private.oo.boot.path.ensure() # <sharedOoshBase> <branch> <?systemPath:/etc/oosh> <?profileDir:/etc/profile.d> # ensure <systemPath>/boot is a symlink to <sharedOoshBase>/<branch>/boot AND <profileDir>/oosh.sh sources it for login shells; idempotent; warns and skips (rc=0) when the target does not exist, skips the drop-in when <profileDir> does not (macOS)
+private.oo.profile.dropin.ensure() # <?profileDir:/etc/profile.d> # ensure <profileDir>/oosh.sh is the login-shell drop-in from templates/user/profile.d.oosh.sh; idempotent; skips (rc 0) when <profileDir> does not exist (macOS)
 {
-  # T9 — the FIXED system path to `boot`
-  # (docs/plans/2026-09-14-fixed-system-boot-path.md, docs/boot.md).
-  #
-  # `boot` recovers $HOME, but `. ~/oosh/boot` cannot be REACHED under dash/ash
-  # with HOME unset (`~` stays literal): a host-wide <systemPath>/boot collapses
-  # recovery to one command. docs/boot.md § The tilde caveat.
-  #
-  # A SYMLINK, never a stub or a copy: `boot` is the single entry point that
-  # owns ALL bootstrap logic (its header says so), a stub would need its own copy of the
-  # getent→dscl→/etc/passwd lookup that boot's HOME block already forbids a third
-  # copy of, and a stale copy would boot you into last month's bootstrap in
-  # silence where a dangling symlink fails loudly.
-  #
-  # TRUST: <systemPath>/boot resolves to DEV-GROUP-WRITABLE content (state 31
-  # runs chmod -R g+w on the shared tree) — exactly as trusted as the dev group,
-  # the same as root's own ~/oosh; the path merely LOOKS root-owned.
-  # docs/boot.md § Guarantees.
-  #
-  # Paths are PARAMETERS (same shape as private.oo.user.shared.symlinks.ensure
-  # above) so tests can drive this against a fixture without root.
-  local sharedOoshBase="$1"
-  local branch="$2"
-  local systemPath="${3:-/etc/oosh}"
-
-  if [ -z "$sharedOoshBase" ] || [ -z "$branch" ]; then
-    create.result 1 "private.oo.boot.path.ensure requires <sharedOoshBase> <branch> [<systemPath:/etc/oosh>] [<profileDir:/etc/profile.d>]"
-    error.log "$RESULT"
-    return $(result)
-  fi
-
-  local target="$sharedOoshBase/$branch/boot"
-
-  # Warn-and-SKIP, never dangle. `boot` lives on `dev` only; an install from
-  # `testing`/`prod` legitimately has no target yet, and a dangling
-  # /etc/oosh/boot would break `. /etc/oosh/boot` for every user on the box.
-  # Absence is CORRECT there, so state 34 must pass, not halt.
-  if [ ! -f "$target" ]; then
-    warn.log "private.oo.boot.path.ensure: no \`boot\` at $target — skipping $systemPath/boot (expected on a branch without boot)"
-    create.result 0 "boot system path skipped (no $target)"
-    return $(result)
-  fi
-
-  # Privilege: /etc needs root, a test fixture under $HOME does not — one
-  # rule, private.oo.path.sudo.get, prefixing only the commands that need it.
-  local sudoCmd
-  sudoCmd=$(private.oo.path.sudo.get "$systemPath")
-
-  $sudoCmd mkdir -p "$systemPath"
-  $sudoCmd chmod 755 "$systemPath"
-  # -n is load-bearing: without it `ln -sf` DEREFERENCES an existing
-  # symlink-to-directory and creates the link INSIDE it, so a re-run over a
-  # stale dir symlink silently produces <systemPath>/boot/boot.
-  $sudoCmd ln -sfn "$target" "$systemPath/boot"
-
-  # Post-condition — fail loud rather than half-succeed (decision 4).
-  if [ ! -L "$systemPath/boot" ] || [ ! -r "$systemPath/boot" ]; then
-    create.result 1 "failed to ensure $systemPath/boot -> $target (isLink=$([ -L "$systemPath/boot" ] && echo y || echo n) readable=$([ -r "$systemPath/boot" ] && echo y || echo n) points.at=$(readlink "$systemPath/boot" 2>/dev/null))"
-    error.log "$RESULT"
-    return $(result)
-  fi
-
-  # ── The LOGIN-SHELL route: <profileDir>/oosh.sh ───────────────────────────
-  # T9 follow-on. The symlink above makes `. /etc/oosh/boot` POSSIBLE; this
-  # makes `env -i sh -l` AUTOMATIC. Measured:
-  #
-  #   env -i sh                     no   — $ENV is a non-login POSIX sh's ONLY
-  #                                        rc hook, and `env -i` erased it.
-  #                                        Nothing can recover this.
-  #   env -i ENV=/etc/oosh/boot sh  yes  — that hook, handed back by hand.
-  #   env -i sh -l                  yes, ONCE /etc/profile has an oosh line.
-  #
-  # dash's own `-lxc` trace runs /etc/profile (`[ -d /etc/profile.d ]`, then
-  # `for i in /etc/profile.d/*.sh`) while `-xc` shows only `+ :`. So this
-  # drop-in — SAME state 34, SAME `oo boot.fix`, one mechanism — is what makes
-  # the login route work. The `.sh` suffix is load-bearing: that glob is the
-  # only reason the file is ever read.
-  local profileDir="${4:-/etc/profile.d}"
+  local profileDir="${1:-/etc/profile.d}"
   local dropIn="$profileDir/oosh.sh"
-
-  # macOS has NO /etc/profile.d: its /etc/profile runs path_helper and sources
-  # /etc/bashrc, and globs nothing — a directory created there would never be
-  # read. So absence is a graceful SKIP, never a failure, and we do NOT create
-  # the directory. The Linux-only-ness of this route is a fact about
-  # /etc/profile, not a defect. The other two routes are unaffected.
+  # macOS has NO /etc/profile.d: its /etc/profile runs path_helper and globs
+  # nothing — a directory created there would never be read. Graceful SKIP.
   if [ ! -d "$profileDir" ]; then
-    info.log "private.oo.boot.path.ensure: no $profileDir on this host — skipping the login-shell drop-in (macOS has none; \`. $systemPath/boot\` and the ENV= route are unaffected)"
-    create.result 0 "boot system path ensured at $systemPath/boot -> $target (no $profileDir; login-shell drop-in skipped)"
+    info.log "private.oo.profile.dropin.ensure: no $profileDir on this host — skipping the login-shell drop-in (macOS has none)"
+    create.result 0 "login-shell drop-in skipped (no $profileDir)"
     return $(result)
   fi
-
-  local sudoProfile
-  sudoProfile=$(private.oo.path.sudo.get "$profileDir")
-  private.oo.boot.profile.content.get "$systemPath" | $sudoProfile tee "$dropIn" >/dev/null
+  local sudoProfile; sudoProfile=$(private.oo.path.sudo.get "$profileDir")
+  private.oo.profile.content.get | $sudoProfile tee "$dropIn" >/dev/null
   $sudoProfile chmod 644 "$dropIn"
-
-  if [ -r "$dropIn" ] && grep -Fq "$systemPath/boot" "$dropIn" 2>/dev/null; then
-    create.result 0 "boot system path ensured at $systemPath/boot -> $target (login-shell drop-in at $dropIn)"
+  if [ -r "$dropIn" ] && grep -Fq 'config/user.env' "$dropIn" 2>/dev/null; then
+    create.result 0 "login-shell drop-in ensured at $dropIn"
   else
     create.result 1 "failed to write the login-shell drop-in $dropIn (readable=$([ -r "$dropIn" ] && echo y || echo n)) — \`env -i sh -l\` will not recover on this host"
     error.log "$RESULT"
@@ -2013,24 +1808,31 @@ private.oo.boot.path.ensure() # <sharedOoshBase> <branch> <?systemPath:/etc/oosh
   return $(result)
 }
 
-private.oo.boot.profile.content.get() # <?systemPath:/etc/oosh> # emit the POSIX-sh /etc/profile.d drop-in that sources <systemPath>/boot for login shells, from templates/user/profile.d.oosh.sh
+private.oo.profile.content.get() # # emit the POSIX-sh /etc/profile.d drop-in, verbatim from templates/user/profile.d.oosh.sh
 {
   # Managed-file content lives in templates/user/ like every other file oosh
-  # writes for a host or user (bashrcTemplate, ooShim, sudo); this method only
-  # substitutes the path. Separated from the writer so tests can lint and
-  # EXECUTE the content against fixture paths without root — guarded by
-  # test.oo T-BOOTPATH-PROFILED-CONTENT-IS-POSIX / T-BOOTPATH-PROFILED-CONTENT-IS-GUARDED.
-  local systemPath="${1:-/etc/oosh}"
+  # writes for a host or user (bashrcTemplate, ooShim, sudo); there is nothing
+  # left to substitute, so this is a plain `cat`. Separated from the writer so
+  # tests can lint and EXECUTE the content without root — guarded by test.oo
+  # T-PROFILE-CONTENT-{FROM-TEMPLATE,IS-POSIX,IS-GUARDED,RECOVERS-HOME}.
+  #
+  # NO create.result on the SUCCESS path: this is a getter consumed in a
+  # pipeline / $(...) — a subshell — so RESULT would never reach the caller,
+  # and create.result inside a completion-reachable getter breaks c2
+  # completion ([[project-create-result-breaks-c2-completion]]). The error path
+  # below does set it: there is no stdout to carry the answer, and the caller
+  # must be able to tell "template gone" from "empty file".
   local template="$OOSH_DIR/templates/user/profile.d.oosh.sh"
   if [ ! -r "$template" ]; then
-    create.result 1 "private.oo.boot.profile.content.get: template missing: $template"
+    create.result 1 "private.oo.profile.content.get: template missing: $template"
     error.log "$RESULT"
     return $(result)
   fi
-  sed "s|@SYSTEM_PATH@|$systemPath|g" "$template"
+  cat "$template"
 }
 
 private.check.root.shared.dev.folder.created() {
+  private.this.script.load ogit ogit.branch.get
   #check.debug.level 6
   #source user
   user get home
@@ -2233,12 +2035,12 @@ EOF
 
 
     cd "$dir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
-    git clone git@github.com:Cerulean-Circle-GmbH/once.sh.git main
+    ogit.repo.clone git@github.com:Cerulean-Circle-GmbH/once.sh.git main main
     RETURN_VALUE=$?
     if ! [ "$RETURN_VALUE" = "0" ]; then
       warn.log "SSH clone failed — falling back to local copy from \$HOME/oosh"
       if [ -d "$HOME/oosh" ]; then
-        # Produce the canonical layout (main/ + ${OOSH_BRANCH}/ worktree) from
+        # Produce the canonical layout (main/ + ${OOSH_BRANCH}/ clone) from
         # the local clone at \$HOME/oosh, mirroring what a successful network
         # clone above would have produced. Without this, the layout used to
         # be just `${OOSH_BRANCH}/` with no `main/` sibling — and
@@ -2260,29 +2062,24 @@ EOF
       elif [ "$OOSH_BRANCH" = "main" ]; then
         important.log "<oo> Branch is main — already cloned"
       else
-        important.log "<oo> Creating worktree for branch ${OOSH_BRANCH}"
-        cd main
-        git fetch origin 2>&1
-        RETURN_VALUE=$?
-        if ! [ "$RETURN_VALUE" = "0" ]; then
-          error.log "state 31: 'git fetch origin' failed (rc=$RETURN_VALUE) in $(pwd)"
-          return $RETURN_VALUE
-        fi
-        # Defence in depth: if an older (unpatched) caller sent a polluted
-        # $OOSH_BRANCH like "heads/origin/dev", strip it here before we
-        # concatenate "origin/" below — otherwise git sees
-        # "origin/heads/origin/dev" and fails with "invalid reference".
+        # ─── state 31 [5/5: dev.repo.cloned] — the branch as its OWN clone
+        # beside main/ (clone layout, 2026-09-23 design). Absolute target, no
+        # cd. Defence in depth: an older (unpatched) caller may send a
+        # polluted $OOSH_BRANCH like "heads/origin/dev" — strip it before it
+        # names a branch and a folder.
         OOSH_BRANCH="${OOSH_BRANCH#refs/heads/}"
         OOSH_BRANCH="${OOSH_BRANCH#refs/remotes/origin/}"
         OOSH_BRANCH="${OOSH_BRANCH#heads/origin/}"
         OOSH_BRANCH="${OOSH_BRANCH#origin/}"
-        git worktree add -B "${OOSH_BRANCH}" "../${OOSH_BRANCH}" "origin/${OOSH_BRANCH}" 2>&1
-        RETURN_VALUE=$?
-        if ! [ "$RETURN_VALUE" = "0" ]; then
-          error.log "state 31: 'git worktree add -B ${OOSH_BRANCH} ../${OOSH_BRANCH} origin/${OOSH_BRANCH}' failed (rc=$RETURN_VALUE) in $(pwd)"
-          return $RETURN_VALUE
+        important.log "state 31 [5/5: dev.repo.cloned]: cloning ${OOSH_BRANCH} beside main/ in $onceShBase"
+        # Re-runs: an existing clone of the branch is kept, an old-install
+        # linked worktree is left alone (ogit worktree.remove converts
+        # it), anything else refuses — see private.oo.branch.clone.ensure.
+        if ! private.oo.branch.clone.ensure git@github.com:Cerulean-Circle-GmbH/once.sh.git "${OOSH_BRANCH}" "$onceShBase/${OOSH_BRANCH}"; then
+          error.log "state 31 [5/5: dev.repo.cloned]: clone of ${OOSH_BRANCH} into $onceShBase failed — $RESULT"
+          create.result 1 "state 31 step 5/5 failed: clone of ${OOSH_BRANCH} failed"
+          return $(result)
         fi
-        cd ..
       fi
     fi
 
@@ -2327,7 +2124,7 @@ EOF
     # Always link ROOT's config AND oosh to the shared tree. State 31
     # runs as root regardless of which paramerUser is being set up —
     # without these symlinks, root's OOSH_DIR (always ~/oosh, see
-    # docs/boot.md) resolves at point of use to root's private clone, and
+    # docs/oosh-architecture.md) resolves at point of use to root's private clone, and
     # root can't see the shared worktrees (the macstudio-root regression).
     #
     # Previous guard `[ "$paramerUser" != "root" ]` was wrong: when
@@ -2349,40 +2146,37 @@ EOF
       "$onceShBase" \
       "${OOSH_BRANCH}"
 
-    # Enable git's shared-repository mode on both worktrees so subsequent
-    # git operations (root's `git pull` on re-install at init/oosh:271,
-    # any dev-group user running `oo update`) create files with group rw
-    # and honour the setgid bit on .git directories. Without this, root's
-    # git ops write FETCH_HEAD/ORIG_HEAD/objects as root:root 644 and
-    # lock out dev-group users from further updates.
-    for _wt in "$onceShBase/main" "$onceShBase/${OOSH_BRANCH}"; do
-      if [ -e "$_wt/.git" ]; then
-        git -C "$_wt" config core.sharedRepository group 2>/dev/null || true
+    # Each folder is its own repository now (clone layout, 2026-09-23 design):
+    # shared mode, setgid, g+w and the caller's trust PER FOLDER (ogit
+    # repo.share / safeDirectory.add), not on main/.git only. Shared mode is
+    # what keeps root's git ops (`git pull` on re-install, init/oosh) from
+    # writing FETCH_HEAD/ORIG_HEAD/objects as root:root 644 and locking the
+    # dev group out. safe.directory: the tree is developking:dev, so without
+    # an entry per folder root hits dubious-ownership on `oo mode <folder>`.
+    # The BASE gets group dev + setgid (a live host had root:dev WITHOUT
+    # setgid), so a folder added later by oo checkout / oo mode inherits the
+    # group. No recursive chown (T-STATE-31-CHOWN-NOT-RECURSIVE). A folder
+    # left as an old-install worktree shares main/.git, which main/'s own
+    # pass covers. Re-runs are idempotent.
+    if private.this.group.exists dev; then
+      if ! { chgrp dev "$onceShBase" && chmod g+ws "$onceShBase"; }; then
+        error.log "state 31 [5/5: dev.repo.cloned]: cannot set group dev + setgid on $onceShBase"
+        create.result 1 "state 31 step 5/5 failed: base $onceShBase is not group dev + setgid"
+        return $(result)
       fi
-    done
-    # Propagate setgid to all .git dirs so new files inherit group=dev
-    find "$onceShBase/main/.git" -type d -exec chmod g+s {} + 2>/dev/null
-    chmod -R g+w "$onceShBase/main/.git" 2>/dev/null
-    # Resolve canonical path — macOS case-insensitive FS needs exact case for safe.directory
-    local resolvedOoshDir="$onceShBase/${OOSH_BRANCH}"
-    if command -v osascript >/dev/null 2>&1; then
-      resolvedOoshDir=$(osascript -e "POSIX path of (POSIX file \"$resolvedOoshDir\" as alias)" 2>/dev/null | sed 's:/$::') || resolvedOoshDir="$onceShBase/${OOSH_BRANCH}"
     fi
-    private.oo.safeDirectory.add "$resolvedOoshDir" >/dev/null
-    # Also add safe.directory for the `main` worktree (created in
-    # step 2 above). Without this, root running `oo mode main` or any
-    # git op against /Users/Shared/.../Once.sh/main hits dubious-
-    # ownership rejection (shared tree is owned by developking:dev).
-    # Future worktrees added via `oo checkout <branch>` would need
-    # their own safe.directory entry — that's a separate concern at
-    # the checkout site. Uses private.oo.safeDirectory.add for
-    # idempotent dedup — earlier versions called `git config --add`
-    # directly and accumulated duplicate entries on re-install.
-    local resolvedMainDir="$onceShBase/main"
-    if command -v osascript >/dev/null 2>&1; then
-      resolvedMainDir=$(osascript -e "POSIX path of (POSIX file \"$resolvedMainDir\" as alias)" 2>/dev/null | sed 's:/$::') || resolvedMainDir="$onceShBase/main"
-    fi
-    private.oo.safeDirectory.add "$resolvedMainDir" >/dev/null
+    local _wt
+    while IFS= read -r _wt; do
+      if ! ogit.repo.share "$_wt" >/dev/null; then
+        error.log "state 31 [5/5: dev.repo.cloned]: ogit repo.share $_wt failed — $RESULT"
+        create.result 1 "state 31 step 5/5 failed: $_wt is not group-shared"
+        return $(result)
+      fi
+      # macOS: safe.directory is a string match on a case-insensitive FS —
+      # the entry must carry the file system's own letter case.
+      ogit.safeDirectory.add "$(private.this.path.case.get "$_wt")" >/dev/null \
+        || warn.log "state 31 [5/5: dev.repo.cloned]: could not trust $_wt — $RESULT"
+    done < <(private.ogit.base.folders.list "$onceShBase")
 
     # path-exception: install-time, and already marked for removal below.
     # TODO: This should be removed to only use $HOME/oosh in the PATH
@@ -2451,7 +2245,6 @@ EOF
           if [ -n "$OOSH_BRANCH" ] && [ "$OOSH_BRANCH" != "dev" ]; then
             eval sed $_sedFlag "'s|${_rootHome}/${OOSH_BRANCH}|\$HOME/oosh|g'" "'$_f'"
           fi
-          eval sed $_sedFlag "'s|OOSH_WORKTREE_BASE=\"${_rootHome}\"|OOSH_WORKTREE_BASE=\"\$HOME\"|g'" "'$_f'"
         fi
       done
     fi
@@ -2512,12 +2305,12 @@ EOF
     # macOS landed in the wrong directory (no /root on macOS — root's
     # home is /var/root). Removed.
     # ─── state 31 [5/5: dev.repo.cloned] ─────────────────────────────────
-    # Post-body verification: without this, a silent failure in git clone /
-    # worktree add leaves the state machine thinking state 31 succeeded while
+    # Post-body verification: without this, a silent failure in a clone
+    # leaves the state machine thinking state 31 succeeded while
     # $sharedOosh never materialized, causing downstream user.oosh.install to
     # time out polling for a dir that's never going to appear.
     if [ ! -d "$onceShBase/${OOSH_BRANCH}" ]; then
-      error.log "state 31 [5/5: dev.repo.cloned]: $onceShBase/${OOSH_BRANCH} missing — check git clone/worktree-add logs above"
+      error.log "state 31 [5/5: dev.repo.cloned]: $onceShBase/${OOSH_BRANCH} missing — check the ogit repo.clone log above"
       create.result 1 "state 31 step 5/5 failed: dev folder not created at $onceShBase/${OOSH_BRANCH}"
       return $(result)
     fi
@@ -2567,13 +2360,13 @@ private.check.root.dev.keys.installed() {
   return 0
 }
 private.check.root.installation.done() {
-  # Install bashrcTemplate so root's interactive shell initializes oosh
-  if [ -f "$OOSH_DIR/templates/user/bashrcTemplate" ]; then
-    if [ -f "$HOME/.bashrc" ] && [ ! -f "$HOME/.bashrc.pre-oosh" ]; then
-      cp "$HOME/.bashrc" "$HOME/.bashrc.pre-oosh"
-    fi
-    cp "$OOSH_DIR/templates/user/bashrcTemplate" "$HOME/.bashrc"
-  fi
+  # root's own .bashrc so its interactive shell initialises oosh. The ONE
+  # writer is private.config.bashrc.ensure (config; T86/T87) — template unless
+  # a live user.env hook exists, stamped backup, .bash_profile. In-process:
+  # this state already runs as root in root's home.
+  [ "$(type -t private.config.bashrc.ensure)" = "function" ] || source "$OOSH_DIR/config" >/dev/null 2>&1
+  private.config.bashrc.ensure "$HOME" "$OOSH_DIR" \
+    || warn.log "state 33 [root.installation.done]: could not ensure $HOME/.bashrc — $RESULT"
 
   # Ensure login shell is bash (Alpine defaults to ash)
   local currentShell bashPath
@@ -2606,23 +2399,11 @@ private.check.root.installation.done() {
   return 0
 }
 
-private.check.root.boot.path.installed() # # state 34 — install the fixed host-wide boot path /etc/oosh/boot
+private.check.root.profile.dropin.installed() # # state 34 — install the login-shell drop-in /etc/profile.d/oosh.sh
 {
-  # T9. Runs in the 30-lane, so $USER is root (private.check.priviledges.checked
-  # routes here only for root / working sudo, and ossh.install re-enters as root).
-  # Derives the same shared base state 31 built, then delegates to the testable
-  # helper. Dedicated state (not folded into 31's idempotent fast-path, nor into
-  # 33's best-effort chsh/.bashrc work) so a failure reads
-  # "halted at [34] root.boot.path.installed".
-  local base branch
-  { read -r base; read -r branch; } <<< "$(private.oo.shared.base.get)"
-  if [ -z "$base" ] || [ ! -d "$base" ]; then
-    error.log "state 34 [root.boot.path.installed]: could not determine the shared base (got '$base') — state 31 must run first"
-    create.result 1 "state 34 failed: no shared base"
-    return $(result)
-  fi
-
-  private.oo.boot.path.ensure "$base" "$branch"
+  # Runs in the 30-lane as root. Dedicated state so a failure reads
+  # "halted at [34] root.profile.dropin.installed".
+  private.oo.profile.dropin.ensure
   return $(result)
 }
 
@@ -2646,7 +2427,7 @@ private.check.user.shared.dev.folder.linked() {
     # to the correct branch folder): OOSH_MODE is that folder's BRANCH name, and
     # the `ln -s` below must point at a real directory — linking $OOSH_DIR itself
     # would create $HOME/oosh -> $HOME/oosh ("Too many levels of symbolic
-    # links"). private.this.path.canonical (this:144) is the portable resolver —
+    # links"). private.this.path.canonical (in `this`) is the portable resolver —
     # see oo.mode for the macOS BSD-readlink rationale.
     local ooshTarget
     ooshTarget=$(private.this.path.canonical "$HOME/oosh")
@@ -2674,7 +2455,18 @@ private.check.headless.setup.started() {
   return 0
 }
 
-private.check.headless.setup.finished() {
+private.check.headless.setup.finished() # # state 51 — the install ends with a COMPLETE config: config init.env derives every derivable required variable, then saves
+{
+  # The last oosh state of the install. State 31 does a plain `config save`,
+  # and config save is a pure persister: it writes what the shell holds and
+  # derives nothing. So a fresh install ended with every variable nothing had
+  # exported yet missing — ODOCKER_WORKSPACES, with an EMPTY odocker.env (0
+  # bytes) and `config validate required` INCOMPLETE straight after install
+  # (tart sequoia VM and ubuntu_24_04, 2026-09-29). config init.env is the
+  # repair that derives; here, not in state 31, because the default needs the
+  # components base and main/ is only there by now. Never fails the install.
+  [ "$(type -t config.init.env)" = "function" ] || source "$OOSH_DIR/config" >/dev/null 2>&1
+  config.init.env || warn.log "install: config init.env reported a problem — run: config validate required"
   return 0
 }
 
@@ -2728,7 +2520,7 @@ oo.tmp.cleanup.testing() { # # clean test BE CAREFULL removes oosh and SSH KEYS 
     #sudo rm -rf /home/shared
     rm config
     mv config.initial config
-    source ~/oosh/boot
+    source ~/config/user.env
     #oo update
     rm -rf oosh.http
     sudo rm -rf .ssh
@@ -2762,7 +2554,7 @@ oo.install.dev() # # DEPRECATED install the official dev oosh. GitHub keys requi
 
   cd /var/dev/Workspaces/2cuGitHub
   check dir /var/dev/Workspaces/2cuGitHub/once.sh/.git not exists \
-    call git clone git@github.com:Cerulean-Circle-GmbH/once.sh.git
+    call ogit repo.clone git@github.com:Cerulean-Circle-GmbH/once.sh.git main once.sh
   check dir ~/oosh exists \
     call mv ~/oosh/ ~/oosh.https
   ln -s /var/dev/Workspaces/2cuGitHub/once.sh ~/oosh
@@ -2813,7 +2605,7 @@ private.oo.cmd.verify() # <cmd> # predicate: is <cmd> on PATH after an install a
   return $(result)
 }
 
-oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it with: $SUDO $OOSH_PM <?packageName>, then verifies it landed
+oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it with: $SUDO $pmEnv $OOSH_PM <?packageName>, then verifies it landed
 {
     # Argument order is the chaining protocol: consume our own arguments, then
     # hand the token the NEXT command starts at to create.result's third
@@ -2843,6 +2635,45 @@ oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it w
       oo.pm.discover
     fi
 
+    # Non-interactive prefix for the apt family. Debian's debconf defaults to
+    # the Dialog frontend: `apt-get -y install vim` pulls tzdata, tzdata's
+    # postinst asks "Geographic area:" over the debconf pipe, and in an
+    # unattended install nobody is there to answer — it blocks in
+    # anon_pipe_read forever, with no output and no timeout. Observed
+    # 2026-09-21 in a naked ubuntu:24.04: SETUP_SERVER -> test.suite core 1 ->
+    # test.ossh.certificates.update -> state.machine.delete -> oo cmd vim ->
+    # wedged, last line printed "no vim".
+    #
+    # `-y` does NOT cover this: -y answers apt's own "Do you want to
+    # continue?", while debconf is a separate questioner running inside the
+    # maintainer script. needrestart (default on Ubuntu 22.04+ servers) is a
+    # third one again, with its own whiptail UI that ignores DEBIAN_FRONTEND;
+    # SUSPEND=1 skips it, where MODE=a would auto-restart the user's daemons.
+    #
+    # It MUST be `env` and not a shell-assignment prefix: $SUDO is "sudo ",
+    # and sudo's env_reset drops whatever the CALLING shell exported, so
+    # `DEBIAN_FRONTEND=x $SUDO apt-get ...` would never reach apt. `sudo -E`
+    # and `sudo VAR=val cmd` are both refused by default sudoers (no SETENV
+    # tag); `sudo env VAR=val cmd` is just a command with arguments, so it
+    # always works.
+    #
+    # brew has its own questioner: Homebrew 6 made ask mode the default for
+    # `brew install`, which prints "Do you want to proceed? [y/n]" on a TTY
+    # whenever the plan pulls in dependencies. A virgin Sequoia VM waited on it
+    # forever at `brew install bash`. HOMEBREW_NO_ASK=1 is the opt-out;
+    # NONINTERACTIVE=1 is not — only Homebrew's bootstrap install.sh reads it.
+    # The same `env` rule applies: the root branch below hops through
+    # `sudo -u $SUDO_USER`, whose env_reset would strip a plain prefix.
+    #
+    # Gated on the PM string the same way ossh.cmd gates its apt-get
+    # update preflight — each PM's variables mean nothing to the others.
+    # Deliberately NOT folded into $OOSH_PM: that table exists four times
+    # (private.check.all.pm in oo, oosh_pm_detect in init/oosh, the PM table in config, ossh.pm.discover in ossh), T-PM-TABLES-AGREE pins
+    # them equal, and `config save` persists $OOSH_PM verbatim into
+    # ~/config/oosh.env where a change would outlive this file. The prefix
+    # table itself is private.oo.pm.env.get, shared with oo.prereqs.install.
+    local pmEnv; pmEnv=$(private.oo.pm.env.get)
+
     if command -v "$current" >/dev/null 2>&1; then
       # Already present — the idempotency every caller relies on. The package
       # manager must NOT be invoked here.
@@ -2851,7 +2682,7 @@ oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it w
           # BusyBox ships a wget stub with too few options for our use.
           if wget --help 2>&1 | grep -q "BusyBox"; then
             console.log "BusyBox wget detected — installing full wget"
-            $SUDO $OOSH_PM wget
+            $SUDO $pmEnv $OOSH_PM wget
             # The stub is still there, so this is advisory, not a failure.
             private.oo.cmd.verify wget || warn.log "$RESULT"
           fi
@@ -2967,12 +2798,12 @@ oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it w
           # user. -H sets HOME to that user's home so brew finds its config
           # and cache there.
           if [ "$(id -u)" = "0" ] && [ -n "$SUDO_USER" ]; then
-            sudo -u "$SUDO_USER" -H brew install $package || rc=$?
+            sudo -u "$SUDO_USER" -H $pmEnv brew install $package || rc=$?
           else
-            brew install $package || rc=$?
+            $pmEnv brew install $package || rc=$?
           fi
         else
-          $SUDO $OOSH_PM $package || rc=$?
+          $SUDO $pmEnv $OOSH_PM $package || rc=$?
         fi
         ;;
     esac
@@ -3002,6 +2833,7 @@ oo.cmd.completion.packageName() {
   compgen -c "$1" 2>/dev/null | head -20
 }
 
+# ogit-exception: docstring text, not an invocation
 oo.prereqs.install() # # install the oosh install-time prereqs locally — git and curl — plus bash 4+ if the running shell is older
 {
   # Ensure we know the PM. Idempotent — `oo cmd` also calls this if needed.
@@ -3022,13 +2854,14 @@ oo.prereqs.install() # # install the oosh install-time prereqs locally — git a
   # already in PATH (oo:1689 `command -v` check), and macOS ships bash 3.2
   # at /bin/bash — so oo cmd bash would NO-OP and the upgrade never fires.
   # Bypass the existence check by dispatching directly to the PM. Same
-  # case-sudo split oo cmd does at oo:1756-1759 (brew runs as caller; all
-  # other PMs need $SUDO).
+  # case-sudo split oo cmd does (brew runs as caller; all other PMs need
+  # $SUDO), and the same non-interactive prefix — bypassing oo cmd must not
+  # bypass that too (apt: tzdata's debconf prompt; brew: ask mode).
   if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
     [ -z "$OOSH_PM" ] && oo pm.discover
     case "${OOSH_PM:-}" in
-      "brew install"*) $OOSH_PM bash || rc=1 ;;
-      *)               $SUDO $OOSH_PM bash || rc=1 ;;
+      "brew install"*) $(private.oo.pm.env.get) $OOSH_PM bash || rc=1 ;;
+      *)               $SUDO $(private.oo.pm.env.get) $OOSH_PM bash || rc=1 ;;
     esac
     important.log "bash 4+ installed — re-exec the installer from a fresh shell to pick it up"
   fi
@@ -3089,7 +2922,7 @@ private.check.pm()             # checks for a package manager
             export OOSH_PM=$packageManagerCommand
             # Only write what we were GIVEN. These two exports were
             # unconditional, so a call site that passes no group/user command —
-            # `brew`, the macOS one (oo:3093), and dpkg/pkg/pacman — set both to
+            # `brew`, the macOS one (private.check.all.pm), and dpkg/pkg/pacman — set both to
             # the EMPTY STRING and then persisted them with the
             # `config save os.commands` below. A clean Sequoia install therefore
             # carried OS_CMD_GROUP_ADD="" and OS_CMD_USER_ADD="" for good, while
@@ -3141,7 +2974,7 @@ private.check.all.pm()         # adds tools and configurations to package manage
     # -y / --noconfirm are NOT optional. `oo cmd <tool>` runs these during an
     # install; without them pacman and pkg stop on a confirmation prompt and the
     # install hangs with no output explaining why. init/oosh:214-222 and
-    # ossh:2604-2616 have always carried the flags — oo was the odd one out, and
+    # ossh.pm.discover has always carried the flags — oo was the odd one out, and
     # nothing compared the four copies until T-PM-TABLES-AGREE.
     private.check.pm pacman "pacman -S --noconfirm"
 
@@ -3241,15 +3074,25 @@ oo.method.delete()     # <script.method> # removes a method and its completion f
     create.result 1 "no method given"
     return $(result)
   fi
-  local script="${name%%.*}"
-  local method="${name#*.}"
-  if [ -z "$method" ] || [ "$method" = "$name" ]; then
+  # A PRIVATE method is named private.<script>.<method>: the SCRIPT is the
+  # second segment, the function keeps its full dotted name. Splitting on the
+  # first dot aimed `oo method.delete private.config.x.y` at a file called
+  # `private` — the defect oo method.new had, fixed there and not here.
+  local functionName="$name" nameBody="$name"
+  case "$name" in private.*) nameBody="${name#private.}" ;; esac
+  local script="${nameBody%%.*}"
+  local method="${nameBody#*.}"
+  [ "$method" = "$nameBody" ] && method=""
+  if [ -z "$method" ]; then
     error.log "oo.method.delete: no method name in '$name' — expected <script>.<method>, e.g. path.status"
     create.result 2 "no method name in '$name'"
     return $(result)
   fi
 
-  local file="$OOSH_DIR/$script"
+  # The REAL file: a script may be a symlink (top-level c2 -> ng/c2), and
+  # replace commit refuses a link rather than turn it into a copy.
+  local file
+  file=$(private.this.path.canonical "$OOSH_DIR/$script")
   if ! check file "$file" exists fix error.log "$file does not exist"; then
     create.result 3 "$file does not exist"
     return $(result)
@@ -3259,7 +3102,7 @@ oo.method.delete()     # <script.method> # removes a method and its completion f
   # <script>.<method>.completion and <script>.<method>.completion.<param>.
   # A `private.` sibling is NOT swept — nothing can prove it had only this
   # one caller — so it is reported like the tests are.
-  local escaped="$(private.oo.regex.escape.get "$script.$method")"
+  local escaped="$(private.oo.regex.escape.get "$functionName")"
   local targets removed=0 target startLine
   # `[[:space:]]*` before the parens: a handful of legacy methods are written
   # `name ()` with a space (path.file.global.use was one), and the tool has to
@@ -3346,6 +3189,94 @@ oo.method.delete.completion.script() {
 }
 
 
+private.oo.pm.env.get()     # <?pm:$OOSH_PM> # echo the env prefix that makes a package-manager install non-interactive (apt: DEBIAN_FRONTEND, brew: HOMEBREW_NO_ASK), or nothing; the one table behind oo.cmd and oo.prereqs.install #
+{
+ # NO create.result, no logging — a getter consumed as $(...). The why of
+ # each prefix is the long comment in oo.cmd; init/oosh carries a POSIX twin,
+ # oosh_pm_env (it runs before oo exists), pinned equal by test.install
+ # T-INIT-PM-ENV-AGREES. ossh.cmd / ossh.harden.packages consume this one.
+ case "${1-$OOSH_PM}" in
+   apt-get*|dpkg*) echo "env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1" ;;
+   brew*)          echo "env HOMEBREW_NO_ASK=1" ;;
+ esac
+}
+
+
+oo.test.platform.new()     # <scope> <aspect> # generate test/test.platform.<scope>.<aspect>.invariant from templates/code/newPlatformInvariantTest; refuses an existing file #
+{
+ local scope="$1" aspect="$2"
+ if [ -z "$scope" ] || [ -z "$aspect" ]; then
+   create.result 1 "oo test.platform.new requires <scope> <aspect>"; error.log "$RESULT"; return $(result)
+ fi
+ # camelCase words only: the name becomes a file name and a sed replacement.
+ case "$scope$aspect" in
+   *[!A-Za-z0-9]*) create.result 1 "oo test.platform.new: <scope> and <aspect> are camelCase words, got '$scope' '$aspect'"; error.log "$RESULT"; return $(result) ;;
+ esac
+ local template="$OOSH_DIR/templates/code/newPlatformInvariantTest"
+ local target="$OOSH_DIR/test/test.platform.$scope.$aspect.invariant"
+ if [ ! -f "$template" ]; then create.result 1 "oo test.platform.new: template missing: $template"; error.log "$RESULT"; return $(result); fi
+ if [ -e "$target" ]; then create.result 1 "oo test.platform.new: refusing to overwrite $target"; error.log "$RESULT"; return $(result); fi
+ if sed -e "s/<scope>/$scope/g" -e "s/<aspect>/$aspect/g" "$template" > "$target" && chmod +x "$target"; then
+   success.log "created test/test.platform.$scope.$aspect.invariant — replace its INVARIANT blocks, then: ./test.suite run platform.$scope.$aspect.invariant 1"
+   create.result 0 "created test/test.platform.$scope.$aspect.invariant"
+ else
+   # Only reachable after the existence refusal above: this removes what this call wrote.
+   rm -f "$target"
+   create.result 1 "oo test.platform.new: could not write $target"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+
+oo.test.platform.new.completion.scope() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo shared
+}
+oo.test.platform.new.completion.aspect() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo config
+  echo oosh
+  echo layout
+}
+private.oo.branch.clone.ensure()     # <url> <branch> <targetDir> # ensure <targetDir> is an independent clone of <branch>: clone <url> when it is absent or empty; an existing clone on <branch> is kept; a linked worktree from an older install is left alone (convert with ogit worktree.remove); anything else refuses #
+{
+ private.this.script.load ogit ogit.branch.get
+ local url="$1" branch="$2" target="$3"
+ if [ -z "$url" ] || [ -z "$branch" ] || [ -z "$target" ]; then
+   create.result 1 "private.oo.branch.clone.ensure requires <url> <branch> <targetDir>"; error.log "$RESULT"; return $(result)
+ fi
+ # Re-runs of install state 31 arrive here with the folder already present.
+ # ogit repo.clone refuses a non-empty target — right for it, wrong as the
+ # answer to "is the layout there?". Decide here, and never delete: a folder
+ # this call did not make is somebody's work.
+ if [ -e "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+   local have
+   have=$(ogit.branch.get "$target")
+   case "$(private.ogit.folder.shape "$target")" in
+     clone)
+       if [ "$have" = "$branch" ]; then
+         create.result 0 "kept: $target is already a clone of $branch"
+       else
+         create.result 1 "$target is a clone of '${have:-detached}', not $branch — refusing to touch it"; error.log "$RESULT"
+       fi
+       ;;
+     worktree)
+       # An install from before the clone layout. Converting it is gated work
+       # (clean + pushed, ignored files carried) that ogit owns — not the install.
+       create.result 0 "left alone: $target is a linked worktree from an older install — convert it with: ogit worktree.remove"
+       warn.log "$RESULT"
+       ;;
+     *)
+       create.result 1 "$target exists, is not empty and is not a repository — refusing to clone over it"; error.log "$RESULT"
+       ;;
+   esac
+   return $(result)
+ fi
+ ogit.repo.clone "$url" "$branch" "$target"
+ return $(result)
+}
+
+
 ### new.method
 
 oo.usage()
@@ -3389,17 +3320,8 @@ oo.parameter.completion.stage() {
 
 oo.mode.base.set.completion.path() { compgen -d "$1"; }
 
-oo.parameter.completion.systemPath() {
-  # <systemPath> of oo boot.fix / oo boot.status. Offer the canonical default
-  # first, then whatever directories the user is typing towards (tests and
-  # dry-runs drive these methods against a fixture path). Direct compgen, no
-  # create.result — see [[project-create-result-breaks-c2-completion]].
-  echo "/etc/oosh"
-  compgen -d "$1"
-}
-
 oo.parameter.completion.profileDir() {
-  # <profileDir> of oo boot.fix / oo boot.status. Canonical default first, then
+  # <profileDir> of oo profile.fix / oo profile.status. Canonical default first, then
   # whatever the user is typing towards (tests drive these against fixtures).
   # Direct compgen, no create.result — see
   # [[project-create-result-breaks-c2-completion]].

@@ -15,6 +15,18 @@ The oosh/once.sh project features a dynamic Bash completion system, primarily im
 - Completion logic is modular and can be extended for new scripts and methods.
 - Parameter and default value parsing is automatic, reducing duplication.
 
+### Where a parameter's candidates come from
+
+For the parameter under the cursor `c2` tries, in order: the method catch-all
+`script.method.completion()`, **method completion** `script.method.completion.<param>()`,
+**parameter completion** `script.parameter.completion.<param>()` (a domain type shared by every
+method with that parameter name), then the signature's default. Which form to write is set out in
+[oosh-architecture.md § Completion Function Rules](oosh-architecture.md#completion-function-rules).
+
+`c2` reads the parameter names from the signature line. An unpaired apostrophe in the docstring
+(`<dir>'s`) breaks that parse and the method stops completing — verify with
+`./c2 signature.validate <script>`.
+
 ## Advanced Usage
 - Custom completions for advanced scenarios.
 - Debugging and troubleshooting completion issues.

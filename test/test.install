@@ -78,19 +78,21 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
-# T-INIT-SIZE-CAP: init/oosh stays bounded — ≤ 700 lines.
-# History: was ~650 (fat), shrunk to ~350 (thin), now ~600 (self-installing
+# T-INIT-SIZE-CAP: init/oosh stays bounded — ≤ 720 lines.
+# History: was ~650 (fat), shrunk to ~350 (thin), then ~600 (self-installing
 # again — POSIX prelude in Phase A handles platform deps so ossh.prereqs.install
-# becomes a thin SCP-and-run wrapper). The 700-line cap is a soft anti-bloat
-# guard, not a thin-bootstrap target.
+# becomes a thin SCP-and-run wrapper), now ~700: the userEnvSeed block below
+# adds the ~/config/user.env head the first login shell boots from, which `boot`
+# used to supply. Raised 700 → 720 for it, deliberately leaving little headroom.
+# It is a soft anti-bloat guard, not a thin-bootstrap target.
 # ─────────────────────────────────────────────────────────────────────────
-test.case $level "T-INIT-SIZE-CAP: init/oosh is bounded (≤ 700 lines)" \
+test.case $level "T-INIT-SIZE-CAP: init/oosh is bounded (≤ 720 lines)" \
   echo "(wc -l)"
 lines=$(wc -l < "$INIT_SCRIPT")
-if [ "$lines" -le 700 ]; then
-  expect.pass "init/oosh is $lines lines (cap 700; POSIX prelude + bash phase)"
+if [ "$lines" -le 720 ]; then
+  expect.pass "init/oosh is $lines lines (cap 720; POSIX prelude + bash phase + userEnvSeed)"
 else
-  expect.fail "init/oosh is $lines lines — over the 700-line anti-bloat cap"
+  expect.fail "init/oosh is $lines lines — over the 720-line anti-bloat cap"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -157,6 +159,62 @@ if [ -x "$CMD" ] && grep -qE '\./init/oosh' "$CMD"; then
 else
   expect.fail "Install oosh.command missing, not executable, or doesn't invoke init/oosh"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# T-INSTALL-NO-FETCHER: with no curl/wget/fetch and no sibling init/oosh, the
+# wrapper must fail LOUDLY. It used to run `sh -c "$(curl -fsSL "$url")"` —
+# command-substituting a MISSING curl yields "", `sh -c ""` exits 0, and the
+# wrapper printed "✓ Install complete." having installed nothing. Silence plus
+# a green tick is the worst failure mode an installer can have. Reproduced
+# 2026-09-21 on a naked ubuntu:24.04, which ships none of the three fetchers.
+# ─────────────────────────────────────────────────────────────────────────
+test.install.noFetcherFailsLoud() {
+  local d
+  d=$(mktemp -d "${TMPDIR:-/tmp}/test.install.nofetch.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  cp "$OOSH_DIR/Install oosh.command" "$d/Install oosh.command" || {
+    rm -rf "$d"; create.result 1 "could not copy the wrapper"; return $(result); }
+  chmod +x "$d/Install oosh.command"
+
+  # A PATH holding the externals the wrapper needs and NO curl / wget / fetch.
+  # `dirname` is NOT optional: the wrapper opens with `cd "$(dirname "$0")"`,
+  # and without it that collapses to `cd ""`, which silently leaves the cwd
+  # alone — the run then finds the REPO's ./init/oosh and tests nothing.
+  mkdir -p "$d/bin"
+  local b p
+  for b in sh bash dirname mktemp rm cat wc; do
+    p=$(type -P "$b" 2>/dev/null) && ln -s "$p" "$d/bin/$b"
+  done
+
+  # cd into $d so there is no ./init/oosh sibling -> the fetch branch is taken.
+  # </dev/null feeds the trailing `read -r _` an EOF so this cannot hang the
+  # suite; that is also why the wrapper must end in `exit "$rc"` — without it
+  # the status would be read's, and this case would pass for the wrong reason.
+  local out rc
+  out=$(cd "$d" && env -i PATH="$d/bin" HOME="$HOME" TERM=dumb \
+          "$d/Install oosh.command" </dev/null 2>&1)
+  rc=$?
+  rm -rf "$d" 2>/dev/null
+
+  local flat
+  flat=$(printf '%s' "$out" | tr '\n' '|')
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "no fetcher on PATH, yet the wrapper exited 0: [$flat]"
+  elif [ "${out#*Install complete}" != "$out" ]; then
+    create.result 1 "printed '✓ Install complete' having installed nothing: [$flat]"
+  elif [ "${out#*No sibling init/oosh}" = "$out" ]; then
+    create.result 1 "never reached the fetch branch — dirname/cwd rig is wrong, not the wrapper: [$flat]"
+  elif [ "${out#*curl}" = "$out" ]; then
+    create.result 1 "failed without naming a fetcher to install: [$flat]"
+  else
+    create.result 0 "a missing fetcher is a named, non-zero failure"
+  fi
+  return $(result)
+}
+test.case $level "T-INSTALL-NO-FETCHER: no curl/wget/fetch is a loud failure, not a green tick" \
+  test.install.noFetcherFailsLoud
+expect 0 "a missing fetcher is a named, non-zero failure" \
+  "sh -c \"\$(curl …)\" with curl absent is sh -c \"\" — exit 0, nothing installed, ✓ printed"
 
 # ─────────────────────────────────────────────────────────────────────────
 # T-INIT-NO-OLD-SCAFFOLDING: dead-weight bootstrap functions are gone
@@ -228,6 +286,29 @@ if grep -qE 'NONINTERACTIVE=1.*Homebrew/install' "$INIT_SCRIPT" \
   expect.pass "init/oosh prelude bootstraps Homebrew when no PM is detected on macOS"
 else
   expect.fail "init/oosh prelude missing Homebrew bootstrap — naked macOS images (no PM) will leave bash 4+ never landed"
+fi
+
+# T-INIT-BREW-INSTALL-NONINTERACTIVE: every package install in init/oosh runs
+# with its non-interactive prefix. Homebrew 6 asks "Do you want to proceed?
+# [y/n]" by default on a TTY when the plan has dependencies — `brew install
+# bash` on a virgin Sequoia VM waited on it forever. The bootstrap's
+# NONINTERACTIVE=1 does not reach `brew install`; HOMEBREW_NO_ASK=1 does. So
+# any executable line that invokes the PM (`$OOSH_PM …` or a literal
+# `brew install`) must carry either the per-PM `$_pmEnv` or HOMEBREW_NO_ASK.
+# Comments, messages (echo/die) and the PM table itself are not invocations.
+# The root -> `sudo -u $SUDO_USER` branch cannot be run on a Linux host, which
+# is why this is a structural check and test.oo's behavioural one is not.
+test.case $level "T-INIT-BREW-INSTALL-NONINTERACTIVE: no package-manager call in init/oosh can prompt" \
+  echo "(grep)"
+unguarded=$(grep -nE '\$OOSH_PM ["'"'"'$]|brew install' "$INIT_SCRIPT" \
+  | grep -vE '^[0-9]+:[[:space:]]*(#|echo |die )|OOSH_PM="brew install"' \
+  | grep -vE '_pmEnv|HOMEBREW_NO_ASK=1|oosh_pm_env')
+if ! grep -qE 'brew\*\).*HOMEBREW_NO_ASK=1' "$INIT_SCRIPT"; then
+  expect.fail "init/oosh has no brew arm setting HOMEBREW_NO_ASK=1 — a fresh macOS waits on brew's 'proceed? [y/n]'"
+elif [ -n "$unguarded" ]; then
+  expect.fail "package-manager calls without a non-interactive prefix: $(echo "$unguarded" | tr '\n' ' ')"
+else
+  expect.pass "every package-manager call in init/oosh is non-interactive (apt: DEBIAN_FRONTEND, brew: HOMEBREW_NO_ASK)"
 fi
 
 # T-INIT-INSTALL-BREW-PATHSD: brew bash install must wire /etc/paths.d/oosh-homebrew
@@ -655,15 +736,19 @@ expect 0 "/opt/homebrew/bin is on the child's PATH" \
 # fallbacks are skipped, and `[ -d ]` on the two-line string is false — the
 # recovery REFUSES while holding a perfectly good home on line 1.
 # Asserted by EFFECT, not by grepping for `head -1`: both recovery blocks
-# (init/oosh and boot, between their BEGIN/END homeRecovery markers) run with
-# a stub getent that answers two lines, and must come out with line 1's home.
+# (init/oosh and templates/user/profile.d.oosh.sh, between their BEGIN/END
+# homeRecovery markers) run with a stub getent that answers two lines, and must
+# come out with line 1's home. By EFFECT and not byte-identity on purpose: the
+# installer's block also reports and aborts when nothing could be derived, the
+# login drop-in's falls through silently — they must AGREE on success, not be
+# the same text.
 test.install.homeRecoveryNssMultiline() {
   local stub goodHome bad="" file out
   stub=$(mktemp -d "${TMPDIR:-/tmp}/test.install.nss.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
   goodHome="$stub/home"; mkdir -p "$goodHome"
   printf '%s\n' '#!/bin/sh' "echo \"u:x:1:1::$goodHome:/bin/sh\"" 'echo "u:x:1:1::/nonexistent/second-source:/bin/sh"' > "$stub/getent"
   chmod +x "$stub/getent"
-  for file in "$INIT_SCRIPT" "$OOSH_DIR/boot"; do
+  for file in "$INIT_SCRIPT" "$OOSH_DIR/templates/user/profile.d.oosh.sh"; do
     sed -n '/^# BEGIN homeRecovery$/,/^# END homeRecovery$/p' "$file" > "$stub/block"
     if [ ! -s "$stub/block" ]; then bad="$bad no-homeRecovery-markers:${file##*/}"; continue; fi
     out=$(cd /tmp && env -i PATH="$stub:/usr/bin:/bin" sh -c ". $stub/block; echo \"HOME=[\$HOME]\"" 2>/dev/null | tail -1)
@@ -677,7 +762,7 @@ test.install.homeRecoveryNssMultiline() {
   fi
   return $(result)
 }
-test.case $level "T-HOME-RECOVERY-NSS: a two-line getent answer still recovers \$HOME (init/oosh and boot)" \
+test.case $level "T-HOME-RECOVERY-NSS: a two-line getent answer still recovers \$HOME (init/oosh and the login drop-in)" \
   test.install.homeRecoveryNssMultiline
 expect 0 "two-line getent output recovers line 1's home in both blocks" \
   "files+LDAP hosts return two passwd lines; the recovery must take the first, not refuse"
@@ -746,5 +831,149 @@ test.case $level "T-INIT-CLEAN-ENV-PASSTHROUGH: TERM is carried, and defaults to
   test.install.cleanEnvTermDefault
 expect 0 "TERM carried when set, defaulted to dumb when not" \
   "an empty TERM is worse than an absent one — bash defaults unset to dumb, tput rejects empty"
+
+
+# ============================================================================
+# T-INIT-SEEDS-USER-ENV: init/oosh seeds ~/config/user.env after the clone
+# ============================================================================
+# ~/config/user.env IS the boot — every later shell sources it for its anchors
+# and PATH. Install state 31's `config save` writes it, but the FIRST login
+# shell after a fresh install happens before that. So init/oosh writes the same
+# head itself, once, between BEGIN/END userEnvSeed markers. POSIX sh cannot
+# call private.config.anchor.lines.get, so the block is a deliberate duplicate
+# — the same pattern as the $HOME recovery block (T-HOME-RECOVERY-NSS). This
+# case runs the duplicate and diffs it against the emitter so they cannot drift.
+# `config` runs `config.start "$@"` at source time, and config.start re-exports
+# CONFIG_PATH to the shared ~/config whenever $CONFIG is not a file. So the
+# emitter is reached in a SUBSHELL with no positional arguments rather than
+# sourced into this file, which dispatches `config` as a command elsewhere.
+test.install.anchorLinesGet() {
+  # BASH_FILE through the ENVIRONMENT, no positional argument: the emitter's
+  # `${1:-$BASH_FILE}` treats an explicit empty argument as "use the default",
+  # which is this shell's bash — so the "" case could never be compared.
+  BASH_FILE="$1" bash -c \
+    'source "$OOSH_DIR/config" >/dev/null 2>&1; private.config.anchor.lines.get'
+}
+
+test.install.initSeedsUserEnv() {
+  # The seed block in init/oosh is a POSIX duplicate of private.config.anchor.lines.get;
+  # extract it by its markers, run it under sh into a fixture HOME, diff against the emitter.
+  local fx; fx=$(test.suite.fixture.make seed) || { create.result 1 "mktemp failed"; return $(result); }
+  local block; block=$(sed -n '/^# BEGIN userEnvSeed/,/^# END userEnvSeed/p' "$INIT_SCRIPT")
+  if [ -z "$block" ]; then rm -rf "$fx"; create.result 1 "no BEGIN/END userEnvSeed block in init/oosh"; return $(result); fi
+  printf '%s\n' "$block" | env -i HOME="$fx" BASH_FILE=/opt/homebrew/bin/bash PATH=/usr/bin:/bin sh
+  if ! diff <(test.install.anchorLinesGet /opt/homebrew/bin/bash) "$fx/config/user.env" >/dev/null 2>&1; then
+    rm -rf "$fx"; create.result 1 "seeded user.env differs from private.config.anchor.lines.get"; return $(result)
+  fi
+  echo 'export PLANTED=1' >> "$fx/config/user.env"
+  printf '%s\n' "$block" | env -i HOME="$fx" BASH_FILE=/opt/homebrew/bin/bash PATH=/usr/bin:/bin sh
+  local kept; kept=$(grep -c PLANTED "$fx/config/user.env"); rm -rf "$fx"
+  if [ "$kept" = 1 ]; then create.result 0 "seed matches emitter and is write-once"; else create.result 1 "second run rewrote an existing user.env"; fi
+  return $(result)
+}
+test.case - "T-INIT-SEEDS-USER-ENV: init/oosh seeds ~/config/user.env once, identical to config's emitter" \
+  test.install.initSeedsUserEnv
+expect 0 "seed matches emitter and is write-once" "the first login after a fresh install boots from this file before state 31 ever runs config save"
+
+# ============================================================================
+# T-INIT-SEED-GATES: the seed drops a non-absolute BASH_FILE
+# ============================================================================
+# The emitter gates the brew-bash PATH line on the INPUT being an absolute
+# path, not on dirname's ANSWER — dirname says "." for a slash-less or empty
+# argument, which would write `export PATH=".:$PATH"` and put the working
+# directory on every login shell's PATH (CWE-426, the hole ticket T8 closed).
+test.install.initSeedNeverPutsCwdOnPath() {
+  # The seed reproduces the emitter's INPUT gate: a slash-less or empty BASH_FILE
+  # must not become `export PATH=".:$PATH"` (CWE-426, ticket T8), and an empty one
+  # must emit no BASH_FILE line at all.
+  local fx block bad=""
+  block=$(sed -n '/^# BEGIN userEnvSeed/,/^# END userEnvSeed/p' "$INIT_SCRIPT")
+  local bf
+  for bf in bash ""; do
+    fx=$(test.suite.fixture.make seedgate) || { create.result 1 "mktemp failed"; return $(result); }
+    printf '%s\n' "$block" | env -i HOME="$fx" BASH_FILE="$bf" PATH=/usr/bin:/bin sh
+    # Byte-equal to the emitter for THIS input too, not only for the absolute
+    # path T-INIT-SEEDS-USER-ENV compares — the gates are half the contract.
+    diff <(test.install.anchorLinesGet "$bf") "$fx/config/user.env" >/dev/null 2>&1 || bad="$bad differs-from-emitter[$bf]"
+    grep -q '^export PATH="\.' "$fx/config/user.env" 2>/dev/null && bad="$bad cwd-on-path[$bf]"
+    [ "$(grep -c '^export PATH=' "$fx/config/user.env" 2>/dev/null)" = 1 ] || bad="$bad extra-path-line[$bf]"
+    if [ -z "$bf" ] && grep -q '^export BASH_FILE=' "$fx/config/user.env" 2>/dev/null; then
+      bad="$bad empty-bash-file-persisted"
+    fi
+    rm -rf "$fx"
+  done
+  if [ -z "$bad" ]; then create.result 0 "seed gates match the emitter"; else create.result 1 "seed gate failures:$bad"; fi
+  return $(result)
+}
+test.case - "T-INIT-SEED-GATES: the seed drops a non-absolute BASH_FILE like the emitter does" \
+  test.install.initSeedNeverPutsCwdOnPath
+expect 0 "seed gates match the emitter" "a bad BASH_FILE must never put the working directory on every login shell's PATH"
+
+# ============================================================================
+# T-INIT-PM-ENV-AGREES: init/oosh's POSIX twin of the non-interactive prefix
+# table answers exactly what private.oo.pm.env.get answers
+# ============================================================================
+# init/oosh cannot call the bash getter (it runs from a curl one-liner before
+# oosh exists), so it carries a POSIX twin, oosh_pm_env. Two literal copies
+# of the table inside init/oosh (oosh_cmd_install's _pmEnv and the brew-bash
+# upgrade line) is how the brew arm was missed once already (6f4a8e9). One
+# function, extracted here and run for every PM the table knows.
+test.install.pmEnvAgrees() {
+  [ "$(type -t private.oo.pm.env.get)" = "function" ] || source "$OOSH_DIR/oo" >/dev/null 2>&1
+  local twin pm want got bad=""
+  twin=$(sed -n '/^oosh_pm_env() {/,/^}/p' "$INIT_SCRIPT")
+  [ -n "$twin" ] || { create.result 1 "init/oosh has no oosh_pm_env() — the prefix table is still inlined"; return $(result); }
+  for pm in "apt-get install -y" "dpkg -i" "brew install" "apk add" "dnf install -y" "pacman -S"; do
+    want=$(private.oo.pm.env.get "$pm")
+    got=$(sh -c "$twin; oosh_pm_env \"\$1\"" sh "$pm" 2>&1)
+    [ "$got" = "$want" ] || bad="$bad [$pm: twin='$got' getter='$want']"
+  done
+  if [ -n "$bad" ]; then
+    create.result 1 "the twins disagree:$bad"
+  else
+    create.result 0 "oosh_pm_env answers exactly what private.oo.pm.env.get answers"
+  fi
+  return $(result)
+}
+test.case $level "T-INIT-PM-ENV-AGREES: init/oosh's oosh_pm_env twin matches private.oo.pm.env.get for every PM" \
+  test.install.pmEnvAgrees
+expect 0 "oosh_pm_env answers exactly what private.oo.pm.env.get answers" \
+  "two literal copies of the table inside init/oosh is how the brew arm was missed before"
+
+# ============================================================================
+# T-INIT-HOME-LINK-NOT-MOVED: a re-run through the ~/oosh symlink never moves
+# the shared branch folder into $HOME
+# ============================================================================
+# init/oosh resolves OOSH_DIR physically when ../.git is a DIRECTORY. In the
+# clone layout (2026-09-23 design) the shared dev/ folder IS such a clone, so a
+# re-run via ~/oosh -> …/Once.sh/dev resolved OOSH_DIR to the shared path, saw
+# it differ from "$HOME/oosh", deleted the link and MOVED the shared dev/ into
+# /root/oosh (os platform.test ubuntu_24_04, once init at state 60; every later
+# user install then failed with "Once.sh/dev missing"). The worktree layout hid
+# it: dev/.git was a file. oosh_dir_is_home_link recognises the link's target.
+test.install.homeLinkNotMoved() {
+  local fx fn bad=""
+  fn=$(grep '^oosh_dir_is_home_link() {' "$INIT_SCRIPT")   # a one-liner: a sed range would run on into the installer
+  [ -n "$fn" ] || { create.result 1 "init/oosh has no oosh_dir_is_home_link() — a re-run moves the shared folder"; return $(result); }
+  fx=$(test.suite.fixture.make homelink)
+  mkdir -p "$fx/home" "$fx/shared/dev/.git" "$fx/elsewhere/.git"
+  ln -s "$fx/shared/dev" "$fx/home/oosh"
+  sh -c "$fn; oosh_dir_is_home_link \"\$1\" \"\$2\"" sh "$fx/shared/dev" "$fx/home" || bad="$bad link-target-not-recognised"
+  sh -c "$fn; oosh_dir_is_home_link \"\$1\" \"\$2\"" sh "$fx/elsewhere" "$fx/home" && bad="$bad other-dir-taken-for-link"
+  rm "$fx/home/oosh"; mkdir "$fx/home/oosh"
+  sh -c "$fn; oosh_dir_is_home_link \"\$1\" \"\$2\"" sh "$fx/shared/dev" "$fx/home" && bad="$bad real-dir-taken-for-link"
+  rm -rf "$fx"
+  # …and the guard runs BEFORE the move, so the move block never sees the link case.
+  local guard move
+  guard=$(grep -n 'oosh_dir_is_home_link "\$OOSH_DIR" "\$HOME" && OOSH_DIR="\$HOME/oosh"' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  move=$(grep -n 'mv "\$OOSH_DIR" "\$HOME/oosh"' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  { [ -n "$guard" ] && [ -n "$move" ] && [ "$guard" -lt "$move" ]; } || bad="$bad guard-not-before-move(guard=$guard move=$move)"
+  [ -z "$bad" ] && create.result 0 "a re-run through the ~/oosh link keeps the shared folder where it is" || create.result 1 "home link:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-HOME-LINK-NOT-MOVED: a re-run via the ~/oosh symlink never moves the shared branch folder" \
+  test.install.homeLinkNotMoved
+expect 0 "a re-run through the ~/oosh link keeps the shared folder where it is" \
+  "the clone layout made the shared dev/ look like a stray repo and init/oosh moved it into /root/oosh"
 
 test.suite.save.results

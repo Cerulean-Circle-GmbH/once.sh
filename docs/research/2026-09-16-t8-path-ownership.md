@@ -1,5 +1,12 @@
 # T8 — research: who owns `PATH`
 
+> **⚠️ Partly superseded (2026-09-22).** `$OOSH_DIR/boot` has been deleted — the PATH
+> builder is now a data line in `~/config/user.env`, emitted by `config`'s
+> `private.config.anchor.lines.get` and marked `# path-writer:`. The rule this research
+> argues for survives intact and lives at
+> [config.md § The PATH-writer rule](../config.md#the-path-writer-rule); references below
+> to `boot` and to the deleted `docs/boot.md` are history.
+
 **Written 2026-09-16 · Branch `dev` (`97ad59c`) · Status: DELIVERED — decisions in § 11, what actually shipped in § 12.**
 **Card (Ideas):** `review hot PATH is bootstrapped` · `PATH=` · `and the path script`
 
@@ -7,7 +14,7 @@ Ticket: [boot tickets tracker](../plans/2026-09-10-oosh-boot-tickets.md) § T8 �
 [board backlog](../plans/2026-09-15-board-backlog.md) § 5.
 
 `OOSH_DIR` and `CONFIG_PATH` each got a stated rule, a marker syntax, a validator and
-planted-violation tests out of T4+T5 ([boot.md § The path-anchor rule](../boot.md)). `PATH` got
+planted-violation tests out of T4+T5 ([oosh-architecture.md § The anchors are data](../oosh-architecture.md#the-anchors-are-data)). `PATH` got
 none of that. `boot` builds it correctly and is not the only thing that builds it; nothing says it
 should be; and the one script named after `PATH` has no production callers at all.
 
@@ -64,7 +71,7 @@ in this environment honours `.gitignore`, which **silently hides `init/once`** f
 `user:156`, `user:180` all carry the byte-identical
 `[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:$PATH`, and
 `templates/user/bashrcTemplate:191-200` carries the `elif [ -d "$HOME/oosh" ]` form. The ticket's
-count is right. Documented at [boot.md § Cross-branch note](../boot.md) and pinned structurally by
+count is right. Documented at `docs/boot.md` § Cross-branch note and pinned structurally by
 `test/test.config:1252-1276` (T49) — which proves *presence* only, so it would still pass with one
 of the five deleted.
 
@@ -90,7 +97,7 @@ true segment test, so a pre-seeded `$OOSH_DIR` anywhere in PATH is neither moved
 front of PATH only**. If `$BASH_FILE`'s directory is present but not first, `boot` prepends it
 again. That is deliberate, because brew bash must beat the `/bin/bash` that macOS `path_helper`
 appends. But it means the claim *"re-sourcing `boot` never grows PATH"* — stated at `boot:13-15`
-and in [boot.md § Idempotent](../boot.md) — is **false** in precisely that case, and the case is
+and in `docs/boot.md` § Idempotent — is **false** in precisely that case, and the case is
 reachable: block 1 prepending `$OOSH_DIR` pushes the bash dir back one position.
 
 Either the behaviour or the claim has to give way. Recommendation in § 11: the claim gives way —
@@ -100,7 +107,7 @@ brew bash winning is the point of the block, and the documentation is what is in
 `[ -n "$OOSH_DIR" ]`, and `OOSH_DIR` was set unconditionally 36 lines earlier at `boot:67`. This
 was decided under T9, with reasoning, at
 `docs/plans/2026-09-14-fixed-system-boot-path.md:264-295` and shipped at
-[boot.md § The three recovery routes](../boot.md): a `[ -d "$OOSH_DIR" ]` guard inside `boot` would
+`docs/boot.md` § The three recovery routes: a `[ -d "$OOSH_DIR" ]` guard inside `boot` would
 also skip PATH **during install, before `~/oosh` exists**. The existence gate lives instead in
 `templates/user/profile.d.oosh.sh:27-31`, which install state 34 owns. Cite; do not reopen; do not
 edit that template.
@@ -213,7 +220,7 @@ Modelled on the anchor rule, because that precedent is complete, tested, and alr
 
 | Piece | Anchors today | PATH equivalent |
 |---|---|---|
-| stated rule | [boot.md § The path-anchor rule](../boot.md) | a sibling section |
+| stated rule | [oosh-architecture.md § The anchors are data](../oosh-architecture.md#the-anchors-are-data) | a sibling section |
 | marker | `# oosh-dir-exception:` / `-exception-file:` | `# path-exception:` — `private.this.anchor.validate.one` already derives the slug from the variable name (`this:189`), so no new syntax |
 | validator | `this.anchor.validate` + `private.this.anchor.validate.one` (`this:180-304`) | a sibling method |
 | proof | planted violations in a throwaway git repo, `test/test.this:463-534` | the same mechanism, verbatim |
@@ -263,7 +270,7 @@ The proposals above are checked against the methodology before being proposed, n
   `:578-593` (the PATH one).
 - **The PATH T24 cannot fail.** It greps `boot` for `":$PATH:"` and `":$OOSH_DIR:"`. Both literals
   **also appear in `boot`'s own comment at `:101`**, so it would pass with the `case` statements
-  deleted. [boot.md](../boot.md) advertises it as pinning PATH idempotency; it does not. **Nothing
+  deleted. `docs/boot.md` advertised it as pinning PATH idempotency; it does not. **Nothing
   anywhere sources `boot` and inspects the resulting `$PATH`** — not for content, not for ordering,
   not across a double source.
 - **`test/test.path`'s `path.usage` assertion cannot fail either** (`:196`): its second disjunct is

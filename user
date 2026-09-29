@@ -287,11 +287,10 @@ user.ssh.rootkey.push() {
 
   "$OOSH_DIR/ossh" connection.open "$sshConfigName"
   rsync -avz --mkpath -e "ssh -o ControlPath=$OSSH_CONTROL_PATH" "$sshDir/public_keys/$sshKeyName.public_key" "$sshConfigName:/root/.ssh/public_keys/"
-  # path-exception: the sanctioned degrade branch. docs/boot.md, Cross-branch note.
-  # Source boot if present, else fall back to ~/oosh on PATH (boot is absent on
-  # non-dev branches). Check the ssh rc — a silent failure here means the key is
-  # pushed but never authorised.
-  ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; user authorized.keys.update"
+  # ossh.exec carries the remote prelude (ossh.remote.prelude.get: user.env if
+  # present, else ~/oosh on PATH) and the ControlPath. Check the rc — a silent
+  # failure here means the key is pushed but never authorised.
+  ossh.exec "$sshConfigName" "user authorized.keys.update"
   local _rc=$?
   [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.push: authorize failed on $sshConfigName (ssh rc=$_rc) — key may be pushed but NOT authorised"
 }
@@ -311,9 +310,8 @@ user.ssh.rootkey.file.push() {
     shift
     "$OOSH_DIR/ossh" connection.open "$sshConfigName"
     rsync -avz --mkpath -e "ssh -o ControlPath=$OSSH_CONTROL_PATH" "$sshPublicKeyFile" "$sshConfigName:/root/.ssh/public_keys/"
-    # path-exception: the sanctioned degrade branch. docs/boot.md.
-    # boot-or-PATH fallback + rc check (see user.ssh.rootkey.push)
-    ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; user authorized.keys.update"
+    # prelude + ControlPath via ossh.exec, rc check (see user.ssh.rootkey.push)
+    ossh.exec "$sshConfigName" "user authorized.keys.update"
     local _rc=$?
     [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.file.push: authorize failed on $sshConfigName (ssh rc=$_rc) — key may be pushed but NOT authorised"
   else
@@ -336,9 +334,8 @@ user.ssh.rootkey.file.revoke() {
   local sshPublicKeyFile="$1"
   if [ -n "$sshPublicKeyFile" ]; then
     shift
-    # boot-or-PATH fallback + rc check (see user.ssh.rootkey.push)
-    # path-exception: the sanctioned degrade branch. docs/boot.md.
-    ssh -o ControlPath="$OSSH_CONTROL_PATH" $sshConfigName "[ -f ~/oosh/boot ] && . ~/oosh/boot || export PATH=~/oosh:~/oosh/ng:\$PATH; mv  /root/.ssh/public_keys/$(basename $sshPublicKeyFile)  /root/.ssh/deactive.public_keys/$(basename $sshPublicKeyFile);    user authorized.keys.update"
+    # prelude + ControlPath via ossh.exec, rc check (see user.ssh.rootkey.push)
+    ossh.exec "$sshConfigName" "mv /root/.ssh/public_keys/$(basename $sshPublicKeyFile) /root/.ssh/deactive.public_keys/$(basename $sshPublicKeyFile); user authorized.keys.update"
     local _rc=$?
     [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.file.revoke: revoke/authorize failed on $sshConfigName (ssh rc=$_rc)"
   else
@@ -363,7 +360,7 @@ user.ssh.rootkey.pull() {
 
   "$OOSH_DIR/ossh" connection.open "$sshConfigName"
   rsync -avz -e "ssh -o ControlPath=$OSSH_CONTROL_PATH" "$sshConfigName:/root/.ssh/id_rsa.pub" "./root.$sshConfigName.public_key"
-  #ssh $sshConfigName ". /root/oosh/boot; user authorized.keys.update"
+  #ssh $sshConfigName ". /root/config/user.env; user authorized.keys.update"
 }
 
 user.ssh.rootkey.push.completion() {
@@ -1066,29 +1063,31 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
     fi
   " 2>/dev/null
 
-  # Mark the shared oosh repo as safe (owned by root/developking, read by the new user).
-  # macOS HFS+ is case-insensitive but git's safe.directory is a string match —
-  # /Users/shared and /Users/Shared are the same inode but different strings.
-  # Add the as-computed path AND the canonical-case path via osascript on darwin.
-  private.as.user "$username" git config --global --add safe.directory "$sharedOosh" 2>/dev/null
-  if command -v osascript >/dev/null 2>&1; then
-    local canonicalOosh
-    canonicalOosh=$(osascript -e "POSIX path of (POSIX file \"$sharedOosh\" as alias)" 2>/dev/null | sed 's:/$::')
-    if [ -n "$canonicalOosh" ] && [ "$canonicalOosh" != "$sharedOosh" ]; then
-      private.as.user "$username" git config --global --add safe.directory "$canonicalOosh" 2>/dev/null
-    fi
-  fi
+  # Mark every folder under the shared base as safe for the new user (owned by
+  # root/developking, read by them). Clone layout (spec § 4): each folder is
+  # its own repository with its own safe.directory entry, so ogit
+  # safeDirectory.ensure walks the base. macOS HFS+ is case-insensitive but
+  # git's safe.directory is a string match — /Users/shared and /Users/Shared
+  # are the same inode but different strings — so the base is passed in the
+  # file system's own case (private.this.path.case.get); the folder names come
+  # from the file system. Run AS the user through the shared preamble, calling
+  # ogit as a command (their --global config; only missing entries are added).
+  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.ensure '$(private.this.path.case.get "$(dirname "$sharedOosh")")'" 2>/dev/null
 
-  # Install bashrcTemplate (or append source line), ensure .bash_profile
-  private.as.user "$username" bash -c "
-    [ -f ~/.bashrc ] && [ ! -f ~/.bashrc.pre-oosh ] && cp ~/.bashrc ~/.bashrc.pre-oosh
-    if [ -f ~/oosh/templates/user/bashrcTemplate ]; then
-      cp ~/oosh/templates/user/bashrcTemplate ~/.bashrc
-    elif ! grep -q 'oosh/boot' ~/.bashrc 2>/dev/null; then
-      printf '\n# oosh environment\n[ -f ~/oosh/boot ] && source ~/oosh/boot\n' >> ~/.bashrc
-    fi
-    [ ! -f ~/.bash_profile ] && echo '[ -f ~/.bashrc ] && source ~/.bashrc' > ~/.bash_profile
-  "
+  # .bashrc + .bash_profile — the ONE writer is private.config.bashrc.ensure
+  # (config; T86 judges it, T87 counts it): template unless a live user.env
+  # hook already exists, stamped backup of whatever it replaces. The inline
+  # copy that stood here overwrote unconditionally, kept no second backup and
+  # guarded its fallback on the very `grep -q 'config/user.env'` that T86
+  # showed matches line 9's CONFIG= assignment. Run AS the user through the
+  # shared preamble so the files land with their ownership.
+  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")
+    source '$sharedOosh/config' >/dev/null 2>&1
+    # The TARGET's per-user data file (OOSH_MODE), written AS them: config
+    # save writes it only for whoever runs it, and the install runs as root.
+    private.config.user.mode.save >/dev/null
+    private.config.bashrc.ensure '$targetHome' '$sharedOosh'
+  " || warn.log "user.oosh.install: could not ensure $targetHome/.bashrc for $username"
 
   # Ensure the user is in the shared-folder 'dev' group — the sharedConfig
   # tree is drwxrwsr-x developking:dev, so anything oosh writes there
@@ -1125,20 +1124,11 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # `user init` only writes to \$sshDir/config (~/.ssh/config), not to
   # ~/config. c2 dispatch may write through ~/config to sharedConfig but
   # only as the target user via dev-group writes (mode g+w preserved).
-  private.as.user "$username" bash -c "
-    export HOME='$targetHome'
-    export USER='$username'
-    unset CONFIG CONFIG_PATH CONFIG_FILE
-    cd \"\$HOME\" 2>/dev/null
-    source '$sharedOosh/this' >/dev/null 2>&1 || exit 1
-    # Guarantee OOSH_DIR is on PATH: sourcing 'this' only prepends it when
-    # OOSH_DIR was UNSET, but private.as.user (runuser) leaks the caller's
-    # already-set OOSH_DIR through, so the guard is skipped and 'user'/'ossh'
-    # (and ossh's own 'source this') would be command-not-found. Prepend
-    # explicitly — idempotent, mirrors what \$OOSH_DIR/boot does at shell init.
-    # path-exception: inside a `$SUDO bash -c` string run AS ANOTHER USER
-    # before their login shell exists; boot has not run there.
-    export PATH=\"$sharedOosh:$sharedOosh/ng:\$PATH\"
+  # The preamble (private.this.as.user.preamble.get) exports the target's
+  # HOME/USER, drops the caller's leaked anchors, sources `this` from the shared
+  # tree and puts it first on PATH so `user`/`ossh` resolve before the target's
+  # login shell exists. One preamble for every as-user hop (T87).
+  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")
     user init
   " || warn.log "user.oosh.install: 'user init' for $username did not complete cleanly — WODA aliases may be missing from $targetHome/.ssh/config"
 
@@ -1162,10 +1152,10 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # chown, ~/.ssh/ids/ is owned by root with mode 700 and the user can't
   # even read their own developking key for github auth.
   local _ownerEmail
-  _ownerEmail=$(private.as.user "$username" git config user.email 2>/dev/null) || true
+  _ownerEmail=$(private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' config.email.get" 2>/dev/null) || true
   [ -z "$_ownerEmail" ] && _ownerEmail="${username}@$(hostname)"
   # oosh-dir-exception: installs ANOTHER user before their ~/oosh symlink exists
-  # path-exception: same string, same reason — boot is unreachable there.
+  # path-exception: same string, same reason — their user.env is unreachable there.
   $SUDO bash -c "
     export OOSH_DIR='$sharedOosh'
     export PATH=\"\$OOSH_DIR:\$PATH\"
@@ -1204,7 +1194,7 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
 
 user.oosh.install.completion.username() { user.list; }
 user.oosh.install.completion.branch() {
-  # OOSH_DIR is the ~/oosh symlink (docs/boot.md), so `dirname` on it yields
+  # OOSH_DIR is the ~/oosh symlink (docs/oosh-architecture.md), so `dirname` on it yields
   # $HOME. Resolve to the physical worktree first, then list its siblings.
   # private.this.path.canonical is a pure echo — safe inside a completion
   # function, unlike anything that calls create.result.
@@ -1355,13 +1345,18 @@ user.list.groups() {
   compgen -g "$1"
 }
 
-user.login() # <userName> # switch to userName via login shell — cd to target home and reset env
+user.login() # <userName> # switch to userName via login shell — cd to target home and reset env; only TERM is kept #
 {
   # `su -` (login shell) — without it, su keeps the caller's cwd and PATH,
   # so e.g. `user login alice` from /home/bob lands alice in /home/bob
   # which she can't even read (drwxr-x--- bob:bob). A login shell runs
   # alice's .profile/.bashrc, cds to ~alice, and resets HOME/USER/etc.
-  env -i su - "$1"
+  # `env -i`: the target gets a CLEAN environment — none of the caller's PATH,
+  # HOME or anchors. TERM is the one exception, passed explicitly: it describes
+  # the TERMINAL, not the caller. Without it su sets TERM=dumb, and the shell
+  # loses colour (git prints `## dev...origin/dev` plain) and less, vi, clear
+  # and tmux degrade — seen in the ubuntu_24_04 platform container, 2026-09-29.
+  env -i TERM="${TERM:-xterm}" su - "$1"
 }
 
 user.group.add() # <groupName> <?toUsername> # adds <toUsername> to group <groupName> if both exist

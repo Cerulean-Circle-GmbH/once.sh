@@ -231,6 +231,128 @@ test.case $level "T-REPLACE-BLOCK-AMBIGUOUS: two identical start lines are refus
   test.replace.blockRefusesAmbiguous
 expect 0 "refused" "exactly one match, or nothing — the same contract as replace line"
 
+# ============================================================================
+# T-REPLACE-COMMIT-REFUSES-SYMLINK — commit never swaps a symlink for a file
+# ============================================================================
+# commit does `chmod -x FILE; mv FILE FILE.bak; mv FILE.new FILE`. On a symlink
+# (top-level `c2 -> ng/c2`) chmod follows the link and strips the TARGET's exec
+# bit, the first mv moves the LINK aside, and the edit lands as a plain file
+# under the link's name — the link is gone and the real script never changed.
+test.replace.commitRefusesSymlink() {
+  local d="$REPLACE_FIXTURE/linked" bad="" rc
+  mkdir -p "$d/ng"
+  printf 'old\n' > "$d/ng/s"; chmod +x "$d/ng/s"; ln -s ng/s "$d/s"
+  "$OOSH_DIR/replace" line "$d/s" "old" by "new" >/dev/null 2>&1
+  "$OOSH_DIR/replace" commit "$d/s" >/dev/null 2>&1; rc=$?
+  "$OOSH_DIR/replace" cleanup "$d/s" >/dev/null 2>&1
+  [ "$rc" -ne 0 ] || bad="$bad commit-rc=0"
+  [ -L "$d/s" ] || bad="$bad link-replaced"
+  [ "$(cat "$d/ng/s")" = old ] || bad="$bad target-changed"
+  [ -x "$d/ng/s" ] || bad="$bad target-lost-exec"
+  [ -e "$d/s.bak" ] && bad="$bad bak-left"
+  [ -z "$bad" ] && create.result 0 "a symlink is refused; link, target and exec bit untouched" || create.result 1 "symlink:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-REFUSES-SYMLINK: commit refuses a symlink instead of replacing it with a file" \
+  test.replace.commitRefusesSymlink
+expect 0 "a symlink is refused; link, target and exec bit untouched" \
+  "oo method.new c2.x would otherwise turn the c2 -> ng/c2 link into a stale copy and strip ng/c2's exec bit"
+
+
+# ============================================================================
+# T-REPLACE-WORD — rename an identifier: every whole-word hit, idempotent
+# ============================================================================
+# `replace line` refuses a line that occurs twice, and `replace within` takes
+# only the FIRST substring on each line and re-matches its own output
+# (step → debug.step → debug.debug.step). Renaming a function needs every
+# whole-word occurrence, and a dotted or longer name is a different word.
+test.replace.wordRenames() {
+  local f="$REPLACE_FIXTURE/word.sh"
+  {
+    echo 'step() {'
+    echo '  step; step'
+    echo '  trap step DEBUG'
+    echo '  debug.step stepping step.x STEP my_step step2'
+    echo '}'
+  } > "$f"
+
+  "$OOSH_DIR/replace" word "$f" step by debug.step >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 0 ] && { create.result 1 "replace word returned $rc"; return $(result); }
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1 || { create.result 1 "commit failed"; return $(result); }
+  "$OOSH_DIR/replace" cleanup "$f"
+
+  local want
+  want=$(printf '%s\n' 'debug.step() {' '  debug.step; debug.step' '  trap debug.step DEBUG' \
+         '  debug.step stepping step.x STEP my_step step2' '}')
+  if [ "$(cat "$f")" != "$want" ]; then
+    create.result 1 "got: $(cat "$f" | tr '\n' '|')"
+    return $(result)
+  fi
+  # A second run has nothing left to rename: rc 1, and the file is untouched.
+  "$OOSH_DIR/replace" word "$f" step by debug.step >/dev/null 2>&1
+  rc=$?
+  "$OOSH_DIR/replace" cleanup "$f"
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "a second run matched again — not idempotent"
+  elif [ "$(cat "$f")" != "$want" ]; then
+    create.result 1 "the second run changed the file"
+  else
+    create.result 0 "every whole word renamed, once"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-WORD: every whole-word occurrence is renamed; dotted and longer names are not; a rerun is a no-op" \
+  test.replace.wordRenames
+expect 0 "every whole word renamed, once" \
+  "replace line refuses repeated lines and replace within double-prefixes — renaming a function needs whole words"
+
+# ============================================================================
+# T-REPLACE-COMMIT-KEEPS-MODE — commit keeps the exec bit the original had
+# ============================================================================
+# `replace commit` did an unconditional `chmod +x`: seven docs/*.md came out
+# executable on 2026-09-28 (`replace word` renames in docs). A script must stay
+# executable, a doc or data file must not become one; rollback hands it back.
+test.replace.commitKeepsMode() {
+  local bad="" d="$REPLACE_FIXTURE/mode.md" s="$REPLACE_FIXTURE/mode.sh"
+  printf "old word\n" > "$d"; chmod 644 "$d"
+  printf "old word\n" > "$s"; chmod 755 "$s"
+  "$OOSH_DIR/replace" word "$d" old by new >/dev/null 2>&1 && "$OOSH_DIR/replace" commit "$d" >/dev/null 2>&1 || bad="$bad doc-commit"
+  [ -x "$d" ] && bad="$bad doc-became-executable"
+  [ -x "$d.bak" ] && bad="$bad doc-bak-executable"
+  "$OOSH_DIR/replace" word "$s" old by new >/dev/null 2>&1 && "$OOSH_DIR/replace" commit "$s" >/dev/null 2>&1 || bad="$bad script-commit"
+  [ -x "$s" ] || bad="$bad script-lost-exec"
+  [ -x "$s.bak" ] && bad="$bad script-bak-executable"
+  "$OOSH_DIR/replace" rollback "$s" >/dev/null 2>&1
+  [ -x "$s" ] || bad="$bad rollback-lost-exec"
+  [ "$(cat "$s")" = "old word" ] || bad="$bad rollback-content=[$(cat "$s")]"
+  "$OOSH_DIR/replace" rollback "$d" >/dev/null 2>&1
+  [ -x "$d" ] && bad="$bad rollback-doc-executable"
+  "$OOSH_DIR/replace" cleanup "$d"; "$OOSH_DIR/replace" cleanup "$s"
+  [ -z "$bad" ] && create.result 0 "commit and rollback keep the original exec bit" || create.result 1 "mode:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-KEEPS-MODE: commit and rollback keep the exec bit the original had; a doc never becomes executable" \
+  test.replace.commitKeepsMode
+expect 0 "commit and rollback keep the original exec bit" \
+  "an unconditional chmod +x made docs executable"
+
+# ============================================================================
+# T-REPLACE-CLEANUP-RC — cleanup returns 0 when there is nothing to clean
+# ============================================================================
+# `… && replace cleanup` chains (oo method.new) took rc 1 from the last
+# `[ -f … ] && rm …` when no .bak/.new existed.
+test.replace.cleanupRc() {
+  local f="$REPLACE_FIXTURE/nothing.txt" rc
+  printf "x\n" > "$f"
+  "$OOSH_DIR/replace" cleanup "$f"; rc=$?
+  [ "$rc" -eq 0 ] && create.result 0 "cleanup with nothing to clean is rc 0" || create.result 1 "rc=$rc"
+  return $(result)
+}
+test.case $level "T-REPLACE-CLEANUP-RC: replace cleanup is rc 0 when there is nothing to clean" \
+  test.replace.cleanupRc
+expect 0 "cleanup with nothing to clean is rc 0" "the chain … && replace cleanup broke on rc 1"
+
 ### test.method
 
 test.suite.save.results
