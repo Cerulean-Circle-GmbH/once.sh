@@ -93,6 +93,7 @@ explicitly when something drifts.
 | `env -i sh` cannot bootstrap oosh at all | nothing can — see below. Use `env -i sh -l`, or `. ~/config/user.env` with `HOME` set |
 | `config validate required` says `INCOMPLETE …` (anchor, `file:`, `load:`, `logic:`, a missing variable, `OOSH_MODE` drift) | `config init` — checks, then repairs with `config init.full`. A `version:` verdict alone is reported, not repaired |
 | an env file holds a test, a conditional or any other code (`logic:user.env` — e.g. the `[ … ] \|\| . …` line `config save` wrote on 2026-09-28) | `config init` (or `config init.env`) — env files are pure data; per-user data is loaded by the kernel |
+| `OOSH_MODE` is empty in a user's shell, `~/.config/oosh/oosh.user.env` is missing | `oo update` (or `config init.user <user>`) — writes the per-user file as that user, from where their `~/oosh` points |
 | `test.platform.shared.config.invariant` red after a pull | `config save` |
 | a `/bin/sh` login dies at `log.session.env: No such file` | `config save` — the legacy chain line is still in `log.env` |
 | `.bashrc` still sources a `boot` that no longer exists | `config init.user <user>` re-templates it |

@@ -324,7 +324,9 @@ shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
 `~/oosh` directories are renamed to `~/config.orig.<timestamp>` (data
 preserved, never deleted). Installs `templates/user/bashrcTemplate` if the
 OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
-backup). Adds `<user>` to group `dev` if not already a member. Refuses when
+backup). Adds `<user>` to group `dev` if not already a member. Writes the user's own
+`$OOSH_USER_CONFIG_PATH/oosh.user.env` (`OOSH_MODE`, derived from where **their** `~/oosh` points —
+`private.config.user.mode.save`, run as them). Refuses when
 `sharedConfig` does not exist — run `config init.shared` first — rather than link
 `~/config` to nothing.
 
@@ -457,6 +459,13 @@ and `oo mode` act on — ignores it, and only an explicit `config init.env` rewr
 Two users on branch versions with different stamps would otherwise rewrite the shared `user.env`
 back and forth on every `config init`. The reasons are one list,
 `private.config.required.missing.get`, read by both.
+
+**Who writes it.** `config save` and `oo mode` write the file for the user who runs them. For
+every other user it is written **as them** by the two as-user hops — `user oosh.install` (the
+install) and `config init.user` (`oo update`, `oo user.fix`) — through
+`private.config.user.mode.save`. The hop preamble drops the caller's `OOSH_MODE` and
+`OOSH_USER_CONFIG_PATH`, so the branch is always derived from the target's own `~/oosh`.
+A user installed before this existed gets the file on the next `oo update`.
 
 **Per user.** `~/oosh` is per user, so the branch it names is too: `OOSH_MODE` is written
 by `config user.save` (and by `oo mode`) into `$OOSH_USER_CONFIG_PATH/oosh.user.env`, never
