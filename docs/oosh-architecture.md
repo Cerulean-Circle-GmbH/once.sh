@@ -1,7 +1,7 @@
 # OOSH Architecture - Complete Reference
 
 **Purpose:** Comprehensive OOSH framework documentation
-**Location:** `~/oosh` → `/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/<branch>/`
+**Location:** `/var/dev/Workspaces/2cuGitHub/once.sh/`
 
 For detailed tool documentation, see [docs/wiki-index.md](wiki-index.md).
 
@@ -339,7 +339,7 @@ source $OOSH_DIR/debug
 # debug line 1: source $OOSH_DIR/log
 
 # log provides: info.log, error.log, debug.log, etc.
-# debug provides: debug.step(), debug.stackTrace(), debug.setTrap(), etc.
+# debug provides: step(), stackTrace(), setTrap(), etc.
 
 # Dependency chain:
 # myScript → debug → log → (log.env for colors/levels)
@@ -797,7 +797,7 @@ $OOSH_DIR/
 # Enable step debugging
 export STEP_DEBUG=ON
 source debug
-debug.setTrap
+setTrap
 
 # Check function existence
 type -t scriptname.method

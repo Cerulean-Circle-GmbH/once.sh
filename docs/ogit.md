@@ -54,8 +54,6 @@ my.method() # <?dir:$OOSH_DIR> # … #
 
 Where functions do not travel — `bash -c` strings, `private.as.user` hops, remote command strings — use the **command form**: `"$OOSH_DIR/ogit" <method> <params…>`.
 
-The folder helpers the converters use are kernel methods, shared with other scripts: `private.this.folder.entries.copy <from> <to>` (each entry, dotfiles included — never `<from>/.`) and `private.this.folder.share <dir>` (group dev, g+w, setgid; never chown). `odocker workspace.seed` uses the same two.
-
 ### Completion
 
 `ogit` follows [oosh-architecture.md § Completion Function Rules](oosh-architecture.md#completion-function-rules):
@@ -269,8 +267,8 @@ prod           clone     dirty 0   ahead 0   behind 0   shared=group setgid=yes 
 
 | Command | Does |
 |---|---|
-| `ogit worktree.remove <?base>` | every linked worktree of `<base>/main` → an independent clone of the same branch |
-| `ogit worktree.restore <?base>` | every sibling clone of `<base>/main` with the same origin → a linked worktree of `main` again |
+| `sudo ogit worktree.remove <?base>` | every linked worktree of `<base>/main` → an independent clone of the same branch |
+| `sudo ogit worktree.restore <?base>` | every sibling clone of `<base>/main` with the same origin → a linked worktree of `main` again |
 
 Their gates, checked for **every** folder (and `main/`) **before any folder is touched** — each refusal names the folder and the fix:
 
@@ -282,7 +280,7 @@ Their gates, checked for **every** folder (and `main/`) **before any folder is t
 
 **Ignored files are carried.** A folder's gitignored files (on a dev host e.g. `sessions/`) are copied before the folder is removed and copied into the new folder once it is finished. The copy is a **backup that is kept**: `$HOME/.oosh.backups/<UTC-stamp>-ogit-<folder>` — under `sudo` that is root's `$HOME`. Nothing deletes it; remove it yourself once you are satisfied.
 
-**They ask for sudo by themselves.** The folders of a shared tree belong to different users of the `dev` group, and the converters delete and recreate them — so when you do not own the base, a folder or its `.git`, `ogit worktree.remove` / `ogit worktree.restore` re-run themselves through sudo (by the canonical path of `ogit` with the base already resolved: sudo's `PATH` has no oosh) and your password is asked. On a tree you own (a single-user host) they run directly. Under sudo each new folder is trusted for root **and** for the user who typed the command (`SUDO_USER`); other users get their entries from `oo update` / `oo user.fix`. `<base>` Tab-completes to the components base.
+**Run them with sudo on a shared tree.** The folders belong to different users of the `dev` group; the converters delete and recreate them. Under sudo each new folder is trusted for root **and** for the user who typed the command (`SUDO_USER`); other users get their entries from `oo update` / `oo user.fix`.
 
 ## Migrating a host from worktrees to clones
 
@@ -290,7 +288,7 @@ A **user-run** runbook — never automatic. It is written for a dev host install
 
 **Before you start:** stop other shells, agents and editors that work inside `dev/` or `prod/` (their working directory is deleted and recreated), and push everything — the conversion refuses a dirty or unpushed folder.
 
-No `sudo` in front: the converters ask for it themselves when the tree is shared (see above). Keep the base in a variable for the checks:
+`sudo` resets `PATH`, so it cannot find `ogit` by name. Run the script by path from `~/oosh`, and pass the base explicitly so root's own `oo mode.base.get` does not matter:
 
 ```bash
 cd ~/oosh
@@ -310,7 +308,7 @@ Expect `main clone`, `dev worktree`, `prod worktree`, every line `dirty 0` and `
 **3. Convert.**
 
 ```bash
-ogit worktree.remove          # asks for your sudo password on a shared tree
+sudo ./ogit worktree.remove "$base"
 ```
 
 Expect, per folder, `carrying ignored dev/sessions` then `dev: worktree → clone (dev)` and `prod: worktree → clone (prod)`, and finally `2 folder(s) converted to clones under <base>`. A refusal stops before anything is touched — fix what it names and re-run. Your shell's working directory was the old `dev/`: re-enter it with `cd ~/oosh`.
@@ -354,9 +352,9 @@ promote status
 **8. Optional — prove it is reversible.**
 
 ```bash
-ogit worktree.restore                # dev, prod, testing → worktrees of main again
-cd ~/oosh; ogit layout.status "$base" # main clone, the rest worktree
-ogit worktree.remove                 # and back to clones
+sudo ./ogit worktree.restore "$base" # dev, prod, testing → worktrees of main again
+ogit layout.status "$base"           # main clone, the rest worktree
+sudo ./ogit worktree.remove "$base"  # and back to clones
 cd ~/oosh && cat sessions/agent.context.md   # still intact after the round trip
 ```
 
@@ -375,8 +373,7 @@ Before the migration it fails INVARIANT-1 (`linked worktree(s) … dev prod`) an
 - **Every refusal names the folder and the command that fixes it** — a dirty, unpushed, upstream-less or detached folder stops the conversion before anything is touched. Fix, then re-run: both converters are idempotent and skip folders that are already done.
 - **`worktree.remove` needs no network and no GitHub credentials** (root has none): it clones each branch from `<base>/main` — a worktree's branch is a local branch of main, already proven clean and pushed — into `<base>/.ogit-<folder>.new`, points it at main's origin URL, and only then removes the worktree and moves the clone into place. A clone that cannot be made changes nothing; a leftover `.ogit-<folder>.new` is named and must be removed before a re-run. (Until 2026-09-25 it removed the worktree first and cloned from the GitHub URL as root — on a real host that failed and left the folder missing; recover then with `git clone -b <branch> <url> <dir>` as your own user.)
 - **A failure mid-way** (e.g. a `worktree.restore` whose worktree could not be added after its clone was removed) says so and prints the exact recovery command, e.g. `ogit worktree.add <branch> <dir> origin/<branch> <base>/main`. `ogit layout.status` then reports a mixed layout (rc 1) until you finish it — run the recovery command, then the converter again.
-- **The backup under `~/.oosh.backups/` is never deleted** (under sudo: `/root/.oosh.backups/`). If ignored files did not come back, copy each entry yourself — e.g. `sudo cp -Rp /root/.oosh.backups/<stamp>-ogit-dev/sessions <base>/dev/` — never the backup dir itself (`…/<stamp>-ogit-dev/.`): `cp -Rp` would copy its private `700 root` mode onto the folder and lock everyone else out. If a folder did end up unreadable: `sudo chgrp -R dev <base>/<folder> && sudo chmod -R g+rwX,o+rX <base>/<folder> && sudo find <base>/<folder> -type d -exec chmod g+s {} +`.
-- **Run the converters from anywhere** — even from inside the folder they replace (`~/oosh` = `dev/`); global git config runs at `/`, so a deleted working directory no longer matters. Afterwards `cd ~/oosh` again in every shell that stood in a converted folder.
+- **The backup under `~/.oosh.backups/` is never deleted** (under sudo: `/root/.oosh.backups/`). If ignored files did not come back, copy them yourself: `sudo cp -Rp /root/.oosh.backups/<stamp>-ogit-<folder>/. <base>/<folder>/`.
 - **Committed work is never at risk**: the gate refuses anything that is not on origin, so every branch can always be re-cloned from GitHub.
 
 ## Troubleshooting
