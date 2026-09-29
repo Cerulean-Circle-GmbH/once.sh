@@ -378,8 +378,12 @@ Saves environment variables to a config file.
   file — exports and chain lines only, never logic), whatever `config file` selected — it no longer
   truncates a custom file. `config save user` is **refused** (rc 2): its prefix would be
   the system `USER`, and it would replace the shared `user.env` with one line.
-- A required variable the saving shell lacks keeps the value its file already had
-  (`private.config.required.carry`, per-user file included, escapes intact).
+- A save never drops a value only because the saving shell does not hold it. Every
+  variable of the file's family that the file already holds and the shell lacks is carried
+  forward (`private.config.file.carry`; the manifest variables, per-user file included, by
+  `private.config.required.carry`), escapes intact (`private.config.file.value.get`). A
+  never-persist variable is not carried — that is how a migration leaves the shared tier.
+  To **remove** a variable use `config unset`.
 - A value that is not pure data (tab, newline, control character — bash prints it
   `$'…'`) is **not persisted and reported** by name with `error.log`.
 - A file it cannot write fails up front (rc 1, named). A named save validates the file
