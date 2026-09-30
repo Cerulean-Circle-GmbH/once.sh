@@ -1,7 +1,7 @@
 # OOSH Architecture - Complete Reference
 
 **Purpose:** Comprehensive OOSH framework documentation
-**Location:** `~/oosh` → `/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/<branch>/`
+**Location:** `/var/dev/Workspaces/2cuGitHub/once.sh/`
 
 For detailed tool documentation, see [docs/wiki-index.md](wiki-index.md).
 
@@ -188,32 +188,11 @@ odocker.do.thing()            # vague verb
 
 #### Completion Function Rules
 
-There are **two forms**, and `c2` tries them in this order for the parameter under the cursor
-(`ng/c2` `c2.completion.discover` → `private.call.custom.completion`):
-
-| Step | Function | Form | Use it for |
-|------|----------|------|------------|
-| 1 | `script.method.completion()` | method catch-all | runs first for EVERY position of that method; only the empty `{ :; }` form is safe on a method with parameters (empty output falls through) |
-| 2 | `script.method.completion.paramName()` | **method completion** | a parameter that belongs to this method (`from`, `range`, `a`), or a *specialisation* of a shared type |
-| 3 | `script.parameter.completion.paramName()` | **parameter completion** | a **domain type** shared by every method with a parameter of that name (`container`, `image`, `branch`, `dir`) |
-| 4 | the signature's `<?param:default>` | default | nothing written |
-
-The model is `odocker`: `odocker.parameter.completion.container` (running containers) is the
-default for every `<container>`; `odocker.log.completion.container` specialises it to ALL
-containers. Both call a **private list getter** (`private.odocker.container.list.all`), never
-each other. A shared completer named after one method's parameter (`a`, `to`) is wrong: it
-silently applies to every future method that happens to use the name. An empty method completer
-cannot *suppress* a shared one — empty output falls through to step 3.
-
-1. **One completion function per completable parameter** — method form or parameter form, as above
-2. **Name must exactly match** the parameter: `script.method.completion.paramName()` / `script.parameter.completion.paramName()`
-3. **Output**: one completion candidate per line to stdout; never `create.result` (it runs in completion subshells)
-4. **No-param methods**: `oo method.new` generates the empty `script.method.completion() { :; }`; keep it (harmless — it falls through)
+1. **One completion function per completable parameter**
+2. **Name must exactly match**: `script.method.completion.paramName()`
+3. **Output**: one completion candidate per line to stdout
+4. **No-param methods**: use empty completion `script.method.completion() { :; }`
 5. **Private methods**: no completion needed (not user-facing)
-6. **No unpaired `'` in a docstring.** `c2` parses the signature line through `line.unquote`; an
-   apostrophe (`<dir>'s repository`) swallows the rest of the line and the parameters are misread,
-   so none of them completes. Paired quotes (`'all'`) are fine. Check a script with
-   `./c2 signature.validate <script>` (T11 tracks the 37 existing offenders outside `ogit`).
 
 ```bash
 # Method with two completable params — two completion functions
@@ -224,15 +203,10 @@ odocker.run.completion.image() {
 }
 # <?name> has no completion — user types it freely
 
-# A domain type shared by every method with a <container> parameter …
-odocker.parameter.completion.container() { private.odocker.container.list.running; }
-# … and one method that needs a different set specialises it
-odocker.log.completion.container() { private.odocker.container.list.all; }
-
-# No-parameter method — the empty completion oo method.new generates
+# No-parameter method — empty completion
 odocker.ps() # # list running containers
 { ... }
-odocker.ps.completion() { :; }
+# No completion function needed for parameterless methods
 ```
 
 #### Checklist for Every New Method
@@ -292,32 +266,23 @@ scriptname.start "$@"  # Entry point
 
 When a script like `myScript` boots, dependencies load in this order:
 
-An interactive login shell boots by sourcing **`~/config/user.env`** (from
-`bashrcTemplate`). That file *is* the boot: its first lines are the anchors
-(`OOSH_DIR`, `CONFIG_PATH`, `CONFIG_FILE`, `CONFIG`, `OOSH_USER_CONFIG_PATH`),
-the PATH prepend and `BASH_FILE` — pure `export` data, written by `config save`
-— and then the `. $CONFIG_PATH/oosh.env` / `. $CONFIG_PATH/log.env` chain. The
-bashrc then sources `log` (which sources `this`) and calls `log.session.save`.
-See [config.md](config.md) § *user.env is the boot*. A script invoked directly
-boots via `source this`:
+An interactive login shell boots via `$OOSH_DIR/boot` (from `bashrcTemplate`),
+which sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`),
+sources the pure-data env chain, builds PATH, and loads `log` — see
+[boot.md](boot.md). A script invoked directly boots via `source this`:
 
 ```
 1. myScript.start "$@"
    │
 2. source this                    # OOSH kernel
    │
-   ├─ cold start (file scope)     # only when CONFIG is empty
-   │   └─ . ~/config/user.env     # the boot, as data: anchors, PATH, then
-   │       ├─ . oosh.env          #   OOSH configuration
-   │       └─ . log.env           #   Log configuration (no per-user chain)
-   │   (`log` creates and sources $OOSH_USER_CONFIG_PATH/log.session.env itself)
-   │
-   ├─ private.this.path.dedup     # the PATH line is data and cannot guard itself
-   ├─ this.init                   # loads the per-user data file in CODE
-   │                              #   (private.this.user.env.load: OOSH_MODE from
-   │                              #   $OOSH_USER_CONFIG_PATH/oosh.user.env), then
-   │                              #   re-sources $CONFIG for executed scripts,
-   │                              #   saving/restoring PATH and the anchors
+   ├─ this.init                   # Initialize environment
+   │   ├─ Sets OOSH_DIR, CONFIG_PATH, OOSH_USER_CONFIG_PATH
+   │   └─ . $CONFIG               # Load user.env (pure data)
+   │       ├─ . oosh.env          # OOSH configuration
+   │       └─ . log.env           # Log configuration
+   │           └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
+   │   (PATH is built by boot/this, NOT persisted in the env files)
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
    │
@@ -342,138 +307,13 @@ source $OOSH_DIR/debug
 # debug line 1: source $OOSH_DIR/log
 
 # log provides: info.log, error.log, debug.log, etc.
-# debug provides: debug.step(), debug.stackTrace(), debug.setTrap(), etc.
+# debug provides: step(), stackTrace(), setTrap(), etc.
 
 # Dependency chain:
 # myScript → debug → log → (log.env for colors/levels)
 ```
 
 The sourcing is **idempotent** - sourcing the same script twice doesn't duplicate functions because bash simply redefines them.
-
----
-
-## The anchors are data
-
-The per-user path anchors are **constants**, and they live as `export` lines at
-the head of `~/config/user.env` — written unexpanded, so `$HOME` resolves in
-whichever shell sources the file.
-
-```sh
-export OOSH_DIR="$HOME/oosh"        # this IS ~/oosh
-export CONFIG_PATH="$HOME/config"   # this IS ~/config
-```
-
-They are written `"$HOME/oosh"` / `"$HOME/config"` rather than `~/oosh` because
-a tilde inside quotes does **not** expand (`OOSH_DIR="~/oosh"` would be seven
-literal characters and break every path built from it). `$HOME/oosh` and
-`~/oosh` are the same path; `$HOME/oosh` is the form that is safe in POSIX `sh`
-and in every quoting context.
-
-### The path-anchor rule
-
-**`OOSH_DIR` is always `~/oosh`** — the user's `oosh` symlink, never the branch
-folder it happens to point at (a clone under the components base —
-[oo.md § The clone layout](oo.md#the-clone-layout)), never a `BASH_SOURCE`/`$0` walk, never
-`oo.mode.base.get`.
-
-**`CONFIG_PATH` is always `~/config`** — the user's `config` symlink, never the
-shared `sharedConfig` directory it points at.
-
-#### Why that makes it simple
-
-Because the value is the symlink, `OOSH_DIR` is a **constant**. Switching
-branches (`oo mode`) moves only what `~/oosh` *points at*; the variable itself
-never changes. A constant needs setting in exactly **one** place, so:
-
-- **The `user.env` anchor lines are the single setter** for both. Everything
-  else just reads them. `config`'s `private.config.anchor.lines.get` is the one
-  emitter that writes those lines; `init/oosh` seeds a byte-identical copy at
-  install time (`BEGIN`/`END userEnvSeed`) because POSIX `sh` cannot call the
-  bash function.
-- The only other assignments are same-literal *fallbacks* for contexts that
-  reach a script before any `user.env` was sourced: `this`'s file-scope block
-  (`OOSH_DIR`), and `: ${CONFIG_PATH:=$HOME/config}` in `this`, `log` and
-  `ossh`.
-- `oo.mode`, `oo.mode.setup` and install state 31 do **not** export it —
-  repointing the symlink *is* the switch. `mode-env.bash` (written by `oo.mode`
-  for the `ooShim` to source into the parent shell) carries only `OOSH_MODE`,
-  `hash -r` and the PATH rewrite.
-- `ossh.start` uses the same literal. It used to derive from `$0`, which is the
-  *host* process whenever `ossh` is **sourced** (`myId`, `config`, `user`,
-  `test.ossh`) and so yielded the caller's directory.
-
-#### When you need the physical directory
-
-Resolve it **at that spot** with the portable helper
-`private.this.path.canonical` (in `this`) — never bake the resolution into
-`OOSH_DIR`. The consumers that do:
-
-| Site | Why it needs the physical path |
-|---|---|
-| install state 31 `ln -s … oosh` | linking `$OOSH_DIR` itself would create `~/oosh -> ~/oosh` ("Too many levels of symbolic links") |
-| install state 31 `OOSH_MODE` | the branch name is `basename` of the *branch folder*, not of the symlink |
-| `config.init.user` | decides "are we under the shared tree?" with a string-prefix test |
-| `promote` | `ogit worktree.find` reports physical folder paths (a sibling clone, or a linked worktree on an unconverted host); a mismatch would stash the same directory twice |
-| `oo.mode.base.get` | strategies 3/4 do `dirname`/`basename` — `dirname ~/oosh` is just `$HOME` |
-
-Everything else works fine through the symlink and is deliberately left alone:
-every `git -C "$OOSH_DIR" …`, every `$OOSH_DIR/<file>` and
-`$CONFIG_PATH/<file>` path join, `private.ensure.groupWrite "$CONFIG_PATH/…"`,
-and `ln -s "$path/$class" "$OOSH_DIR/external/$class"`. `CONFIG_PATH` needs
-**no** point-of-use fixes at all — nothing in the tree does
-`dirname`/`basename`/prefix arithmetic on it, only `-d` / `-f` / `-z` tests,
-which all follow a symlink.
-
-#### Sanctioned exceptions
-
-Each is marked in-code with `# <anchor>-exception: <reason>` — or, for a whole
-file, `# <anchor>-exception-file: <reason>` — where the slug is the variable
-name lower-cased with `_` becoming `-`: `oosh-dir-exception`,
-`config-path-exception`.
-
-**`OOSH_DIR`:**
-
-| Site | Why |
-|---|---|
-| `config`'s anchor-line emitter | it writes the persisted **data** form of the constant — the value *is* `$HOME/oosh`, emitted unexpanded for the sourcing shell |
-| `this` file scope | the last-resort fallback before any `user.env` exists (mid-install): the same literal, never a `BASH_SOURCE`/`$0` walk |
-| `oo.use` | runs one command **from another branch without switching** — a scoped child-process override; no symlink alternative by design |
-| `ossh` remote invoke | a string executed on a **remote** host whose `~/oosh` does not exist yet |
-| `user.oosh.install` sub-shell | installs **another user** before their `~/oosh` exists |
-| `init/oosh` (file-wide) | the installer runs **before** `~/oosh` exists (it may start from a clone or a ZIP); it self-corrects by moving the repo to `$HOME/oosh`, and `unset`s `OOSH_DIR` before handing off to the login shell |
-
-**`CONFIG_PATH`:**
-
-| Site | Why |
-|---|---|
-| `config`'s anchor-line emitter, and `init/oosh`'s seed copy | the same persisted data form |
-| `this` file scope | defaults the anchor **before** sourcing `user.env`, so a pre-migration file whose `. $CONFIG_PATH/oosh.env` chain has nothing to anchor still resolves |
-| `config file <path>` | the one method whose *job* is to leave `~/config` — it points the session at an arbitrary config file, so `CONFIG_PATH` must come from that path |
-| install state 31 (×2) | builds the shared tree **before** `~/config` is a symlink to it, so it must name the target directly |
-| `this.init` save/restore | restores the value the shell already had across a mid-session `source "$CONFIG"` — a restore, not a new anchor |
-| `test.suite.config.isolate` / `.restore` | points one test file at a fixture instead of the site-wide `~/config`, and puts the inherited value back afterwards |
-
-A self-assignment (`CONFIG_PATH=$CONFIG_PATH`, as in `config`'s and
-`test.suite`'s usage banners) is not an assignment site — it is a no-op, and a
-marker comment there would be *printed to the user*.
-
-#### Enforcement
-
-**`this anchor.validate <all|OOSH_DIR|CONFIG_PATH>`**, with
-`this.oosh.dir.validate` and `this.config.path.validate` as the per-anchor
-forms. (In an oosh shell `this` is itself a function, so call the method
-directly; as a script it is `./this anchor.validate`.) One `git grep` per anchor
-over the tracked tree (`docs/`, `test/`, `.claude/` and `*.md`/`*.json`
-excluded), classifying every assignment as conforming / exception / violation,
-echoing its verdict to stdout (so it survives any `LOG_LEVEL`) and returning
-rc 1 on any violation. Covered by `test.this` `T-OOSH-DIR-*` /
-`T-CONFIG-PATH-*` — including *planted* violations, so the guard is proven to
-fail, and proven to be per-anchor (an `oosh-dir` marker does not exempt a
-`CONFIG_PATH` line).
-
-> A shell opened **before** a `config save` on this host still holds whatever
-> anchors it booted with. `. ~/config/user.env`, or simply a new shell, fixes
-> it.
 
 ---
 
@@ -522,7 +362,7 @@ The file `this` is the OOSH kernel. It provides:
 | `this.functionExists` | Checks if a function is defined |
 | `this.isSourced` | Detects if script was sourced vs executed |
 | `this.init` | Initializes oosh environment |
-| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A session-scoped helper — the PATH itself is owned by the `user.env` anchor lines ([config.md](config.md) § *The PATH-writer rule*) |
+| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that never source `boot` — `boot` owns the PATH ([boot.md](boot.md)) |
 
 ### Method Dispatch Chain
 
@@ -570,7 +410,6 @@ this.call() {
 | `ossh` | SSH key/config management |
 | `state` | State machine for multi-step workflows |
 | `user` | User and SSH identity management |
-| `ogit` | The only git caller; [docs/ogit.md](ogit.md) |
 
 ---
 
@@ -590,43 +429,30 @@ this.call() {
 
 ### user.env Structure
 
-Env files are **pure data** — only `export KEY="VALUE"` and `.`-chain lines, no
-logic. `config.validate` enforces the no-logic rule.
-
-`user.env` is also the **boot**: the anchors and the PATH prepend are the first
-lines of it, written unexpanded so `$HOME` resolves in the sourcing shell. One
-shared file is therefore correct for every user on the host.
+Env files are **pure data** now — only `export KEY="VALUE"` and `.`-chain lines,
+no logic. The per-user/volatile anchors (`OOSH_DIR`, `CONFIG`, `CONFIG_PATH`,
+`PATH`) are **not** persisted here; `$OOSH_DIR/boot` computes them fresh each
+shell (see [boot.md](boot.md)). `config.validate` enforces the no-logic rule.
 
 ```bash
-# ~/config/user.env  — the anchors, then the POSIX `.` source chain
-export OOSH_DIR="$HOME/oosh"
-export CONFIG_PATH="$HOME/config"
-export CONFIG_FILE="user.env"
-export CONFIG="$CONFIG_PATH/$CONFIG_FILE"
-export OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"
-export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"
+# ~/config/user.env  — portable data + POSIX `.` source chain
 export BASH_FILE="/usr/local/bin/bash"
+export CONFIG_FILE="user.env"
 
 . $CONFIG_PATH/oosh.env
 . $CONFIG_PATH/log.env
 ```
 
-`oosh.env` and `log.env` are pure `export` data with no chain of their own:
+`log.env` in turn chains the per-user session file:
 
 ```bash
 # ~/config/log.env  (shared)
 export LOG_LEVEL="1"
 export LOG_LEVEL_RESET="1"
+. $OOSH_USER_CONFIG_PATH/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
 ```
 
-The per-user `LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE` live in
-`$OOSH_USER_CONFIG_PATH/log.session.env`, which **`log` creates and sources
-itself** (the file-scope block at the top of `log`) — the shared `log.env` does not chain it, because a
-missing per-user file in a shared chain line aborts dash outright.
-
-Note POSIX `.` (not the bash `source` builtin): every shell sources these files
-directly, including a `/bin/sh` login shell and `ossh exec` on Debian, so they
-must parse under dash/ash.
+Note POSIX `.` (not the bash `source` builtin) so `boot` parses under dash/ash.
 
 ---
 
@@ -680,15 +506,13 @@ See [docs/log.md](log.md) for complete documentation.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [The anchors are data](#the-anchors-are-data)) | `~/oosh` |
+| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [boot.md](boot.md)) | `~/oosh` |
 | `CONFIG` | Path to user.env | `~/config/user.env` |
 | `CONFIG_PATH` | Config directory | `~/config` |
 | `LOG_LEVEL` | Logging verbosity (0-6) | `3` |
 | `LOG_DEVICE` | Log output device | `/dev/tty` |
 | `OOSH_PROMPT` | PS1 prefix indicator | `"oosh "` |
-| `OOSH_MODE` | The branch `~/oosh` points at, relative to the components base (`test/macos` for a slash branch) — per user, in `$OOSH_USER_CONFIG_PATH/oosh.user.env` | `"dev"` |
-| `OOSH_USER_CONFIG_PATH` | Per-user config dir (`oosh.user.env`, `log.session.env`, `mode-env.bash`) — an anchor line of `user.env` | `~/.config/oosh` |
-| `OOSH_CONFIG_VERSION` | The config-format stamp `config save` writes into `user.env` (`private.config.version.get`); another branch version's stamp is reported by `config validate required`, never auto-repaired | `1` |
+| `OOSH_MODE` | Operation mode | `"dev"` |
 
 ---
 
@@ -802,7 +626,7 @@ $OOSH_DIR/
 # Enable step debugging
 export STEP_DEBUG=ON
 source debug
-debug.setTrap
+setTrap
 
 # Check function existence
 type -t scriptname.method
@@ -863,8 +687,8 @@ Verified by `T-OSSH-PREREQS-APK-BUSYBOX-SUID` (test/test.ossh) and `T-INIT-ALPIN
 | Site | Path covered |
 |---|---|
 | `bashrcTemplate:21–25` | Interactive + non-interactive bash that sources bashrc (Debian's `SSH_SOURCE_BASHRC` patch covers ssh-with-command on Ubuntu/Debian/Alma). |
-| `this`, the file-scope `# Ensure $SUDO is set` block | Every oosh script invocation that **didn't** go through bashrc — specifically ssh-with-command on Alpine/musl whose bash lacks the `SSH_SOURCE_BASHRC` patch. Self-heals via `id -u`. |
-| `bashrcTemplate`, the PS1 conditional (`if [ "$USER" = "root" ]` near the prompt) | Colours the root prompt. It tests `$USER`, not `$SUDO`, and exports nothing — listed because it is the third place a reader will find the root/non-root split. |
+| `this:51–66` | Every oosh script invocation that **didn't** go through bashrc — specifically ssh-with-command on Alpine/musl whose bash lacks the `SSH_SOURCE_BASHRC` patch. Self-heals via `id -u`. |
+| `bashrcTemplate:213–219` | PS1 conditional — *reads* `$SUDO` for prompt coloring; doesn't export. |
 
 Each defends a different code path; same-named variable, different sources of truth.
 

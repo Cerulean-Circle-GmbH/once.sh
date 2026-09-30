@@ -34,7 +34,7 @@ source debug
 
 ## Interactive Step Debugger
 
-When `STEP_DEBUG=ON`, the `debug.step()` function provides an interactive debugging prompt at each line.
+When `STEP_DEBUG=ON`, the `step()` function provides an interactive debugging prompt at each line.
 
 ### Step Commands
 
@@ -104,7 +104,7 @@ Displays the complete call stack with line numbers, function names, files, and a
 Toggles between debug mode (level 5) and normal mode (level 3).
 
 ```bash
-debug.toggleDebug  # Switch debug on/off (debug is sourced in every oosh shell)
+./debug toggleDebug  # Switch debug on/off
 ```
 
 ### debug.setTrap()
@@ -116,16 +116,7 @@ Sets up all debugging traps:
 - `DEBUG` trap → `debug.step()` - Interactive stepping
 
 ```bash
-debug.setTrap  # Enable all traps
-```
-
-### debug.removeTrap()
-
-Switches stepping off (`STEP_DEBUG=OFF`); the traps stay armed. This is what the `r` step
-command (continue till the next return) does before it goes on.
-
-```bash
-debug.removeTrap
+./debug setTrap  # Enable all traps
 ```
 
 ### debug.onError()
@@ -161,7 +152,7 @@ myScript.failingMethod
 No-operation function, returns 0. Useful as a placeholder.
 
 ```bash
-debug.noop  # Does nothing, returns 0
+./debug noop  # Does nothing, returns 0
 ```
 
 ## PS4 Trace Format
