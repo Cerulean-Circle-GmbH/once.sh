@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# T-CONTEXT-OCCUPANCY — RED-FIRST guard (rewind-safety defect, oopPO 2026-09-30).
+# DEFECT: on a /context PANEL, the TUI parser (private.claudeCode.context.parse, Pattern-4
+# "any %% in the bottom 10 lines") grabs the SUGGESTIONS line "Bash results using Xk tokens (17%)"
+# instead of the OCCUPANCY "536k/1m tokens (54%)" → reads a FALSE-LOW (17 not 54) → a near-wall
+# agent looks healthy → rewind-safety hazard. context.check MUST read the OCCUPANCY %, never a
+# Suggestions/breakdown %%. RED now (deployed returns 17). Expert fixes; this is the failable gate.
+level=$1; [ -z "$level" ] && level=1
+echo "starting: T-CONTEXT-OCCUPANCY <LOG_LEVEL=$level> (RED-FIRST — fails until parse reads occupancy)"
+source this
+source test.suite
+source claudeCode
+export LOG_DEVICE=/dev/null
+log.level $level
+
+# REPRESENTATIVE /context panel — occupancy near the TOP (54%), long body, Suggestions 17% near the
+# BOTTOM (exactly like the real panel: occupancy sits FAR above the bottom-10 the parser scans).
+# The earlier bug in a naive fixture: too SHORT → occupancy fell inside tail -10 → false-green.
+read -r -d '' PANEL <<'EOF'
+ Context Usage
+ Opus 4.8 (1M context)   claude-opus-4-8[1m]
+ 536.0k/1m tokens (54%)
+
+ Estimated usage by category
+   System prompt: 3.6k tokens (0.4%)
+   System tools: 19.1k tokens (1.9%)
+   Custom agents: 6.9k tokens (0.7%)
+   Memory files: 7.6k tokens (0.8%)
+   Skills: 2.2k tokens (0.2%)
+   Messages: 445.6k tokens (44.6%)
+   Compact buffer: 3k tokens (0.3%)
+   Free space: 464k (46.4%)
+
+ MCP tools · /mcp
+   6 tools · 0 tokens
+ Custom agents · .claude/agents/
+   96 agents · 6.9k tokens
+ Memory files · /memory
+   2 files · 7.6k tokens
+ Skills · /skills
+   16 skills · 2.2k tokens
+
+ Suggestions
+   Bash results using 170k tokens (17%) — run /context to clear them
+   ? for shortcuts
+EOF
+
+OCC=54   # the true occupancy %% on the panel
+TRAP=17  # the Suggestions false-LOW the parser currently grabs
+
+echo; echo "===== (1) CORE: parse a /context panel → OCCUPANCY, not the Suggestions trap ====="
+GOT=$(private.claudeCode.context.parse "$PANEL")
+test.case $level "(1) context.parse(panel) = occupancy $OCC, NOT suggestions $TRAP (got '$GOT')" echo "$GOT"
+if [ "$GOT" = "$OCC" ]; then
+  expect.pass "read occupancy $OCC% (ignored the Suggestions line)"
+elif [ "$GOT" = "$TRAP" ]; then
+  expect.fail "RED: read the Suggestions $TRAP% (FALSE-LOW) instead of occupancy $OCC% — rewind-safety hazard"
+else
+  expect.fail "RED: read '$GOT' — neither the occupancy $OCC nor a clean value (parser grabs a stray %%)"
+fi
+
+echo; echo "===== (2) HARD invariant: never return the Suggestions/near-bottom trap ====="
+test.case $level "(2) parsed %% != Suggestions trap $TRAP" echo "$GOT"
+[ "$GOT" != "$TRAP" ] && expect.pass "did not return the trap $TRAP" \
+                       || expect.fail "RED: returned the Suggestions trap $TRAP (false-LOW)"
+
+echo; echo "===== (3) ANCHOR: the status-bar path still works (no regression) ====="
+BAR='  Context left until auto-compact: 42%'
+GOTBAR=$(private.claudeCode.context.parse "$BAR")
+test.case $level "(3) status-bar 'Context left until auto-compact: 42%' → 42 (got '$GOTBAR')" echo "$GOTBAR"
+[ "$GOTBAR" = "42" ] && expect.pass "status-bar parse intact (Pattern 1)" \
+                      || expect.fail "status-bar parse regressed: got '$GOTBAR'"
+
+echo; echo "===== (4) DEPLOYED end-to-end via read.tui on a RENDERED panel pane ====="
+FX_PREFIX="fxctx_"
+sweep_fx() { tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${FX_PREFIX}" | while IFS= read -r s; do tmux kill-session -t "$s" 2>/dev/null; done; }
+sweep_fx                      # PRE-RUN sweep (survives a prior SIGKILL; orphans never accumulate)
+trap sweep_fx EXIT
+if [ -n "$TMUX" ]; then
+  S="${FX_PREFIX}$$"
+  tmux new-session -d -s "$S" -x 200 -y 30 2>/dev/null
+  # render the panel (bottom of a 30-row pane holds the Suggestions area, occupancy scrolls to top)
+  scr=$(printf '%s\n' "$PANEL" | sed "s/'/'\\\\''/g")
+  tmux send-keys -t "$S" "clear; printf '%s\n' '$scr'; exec cat" Enter 2>/dev/null
+  sleep 0.5
+  GOTTUI=$(private.claudeCode.context.read.tui "${S}:0.0" 2>/dev/null)
+  test.case $level "(4) read.tui(rendered panel) = occupancy $OCC, not $TRAP (got '$GOTTUI')" echo "$GOTTUI"
+  if [ "$GOTTUI" = "$OCC" ]; then expect.pass "deployed read.tui read occupancy $OCC"
+  elif [ "$GOTTUI" = "$TRAP" ]; then expect.fail "RED: deployed read.tui read the Suggestions trap $TRAP (false-LOW)"
+  else expect.fail "RED: deployed read.tui read '$GOTTUI'"; fi
+  sweep_fx
+else
+  test.case $level "(4) read.tui (skipped — no tmux)" echo skip; expect.pass skipped
+fi
+
+echo
+echo "=================================================================="
+echo "  T-CONTEXT-OCCUPANCY RED-FIRST: parse must read OCCUPANCY, never a Suggestions/bottom %%."
+echo "  (Semantics note: occupancy=USED%; confirm occupancy-vs-remaining w/ oopPO — the HARD"
+echo "   requirement is NEVER the Suggestions false-LOW $TRAP.)"
+echo "=================================================================="
+sweep_fx
+test.suite.save.results
