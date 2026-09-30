@@ -588,20 +588,31 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
     # which for LOG would also grab LOGNAME.
     case "$variableName" in ${envPrefix}|${envPrefix}_*) ;; *) continue ;; esac
     case "$variableName" in
-      # install-only / sudo-injected — never persist.
+      # Never persisted — three kinds, one list.
+      #
+      # 1. Install-only / sudo-injected (LOG_INSTALL, INSTALL_LOG, SUDO_*) must
+      #    not persist into user sessions.
+      #
+      # 2. RUNTIME READINGS of the one shell that ran the save: OOSH_SHLVL (the
+      #    shell level `this` counts), OOSH_STATUS, OOSH_PROMPT and
+      #    OOSH_CONFIG_NEEDS_SAVE. Saved, they come back into every new shell
+      #    and are saved again — a loop that remembers what must be measured.
+      #    (T-CONFIG-CMD-SAVE-OOSH, typed as a command: a child process sees
+      #    exactly what the parent exported, and these are all exported.)
+      #
+      # 3. The PER-USER SESSION values LOG_NAME, LOG_DEVICE, LOG_LIVE. They
+      #    belong only in each user's private
+      #    $OOSH_USER_CONFIG_PATH/log.session.env — written by log.session.save,
+      #    chained as log.env's last line — never in the SHARED log.env, where a
+      #    new user would inherit the saver's values (T-CONFIG-CMD-SAVE-LOG).
       #
       # Every other OOSH_* / LOG_* / CONFIG* variable IS persisted: the
       # MacStudio model (test/mcdonges.latest), `config save oosh` saves all
-      # OOSH_ variables. The per-user paths among them — OOSH_DIR, CONFIG_PATH,
-      # OOSH_USER_CONFIG_PATH, OOSH_COMPONENTS_DIR, LOG_LIVE — no longer leak
-      # the saving user's home into the SHARED ~/config:
+      # OOSH_ settings. The per-user paths among them — OOSH_DIR, CONFIG_PATH,
+      # OOSH_USER_CONFIG_PATH, OOSH_COMPONENTS_DIR — no longer leak the saving
+      # user's home into the SHARED ~/config:
       # private.config.variable.export.line writes a value under $HOME as
       # "$HOME/…", which every reader expands to their own home.
-      # LOG_NAME/LOG_DEVICE/LOG_LIVE are overridden per user by
-      # $OOSH_USER_CONFIG_PATH/log.session.env, which log.env chains last.
-      #
-      # Install-only vars (LOG_INSTALL, INSTALL_LOG) must not persist into user
-      # sessions.
       #
       # OOSH_BRANCH is the install INPUT: the branch the OPERATOR ASKED FOR,
       # meaningful for the length of one install and meaningless afterwards. It
@@ -615,7 +626,7 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
       #
       # Documented at docs/config.md § Excluded variables and pinned by
       # test/test.config T29 — change all three together.
-      *INSTALL*|OOSH_BRANCH|SUDO_*|_) continue ;;
+      *INSTALL*|OOSH_BRANCH|OOSH_SHLVL|OOSH_STATUS|OOSH_PROMPT|OOSH_CONFIG_NEEDS_SAVE|LOG_NAME|LOG_DEVICE|LOG_LIVE|SUDO_*|_) continue ;;
     esac
     echo "$variableName"
   done
@@ -914,6 +925,30 @@ private.config.path.line.get()     #  # echo the PATH line of user.env: a snapsh
 }
 
 
+private.config.chain.names.get()     # <file:$CONFIG> # echo the name of every env file <file> chains with a '. $CONFIG_PATH/<name>.env' (or 'source …') line, in order, one per line; silent #
+{
+  # NO create.result, NO logging — a getter consumed as $(...) by config.save,
+  # which reads the chains BEFORE `>$CONFIG` truncates the file (the same
+  # reasoning as private.config.required.variables.get). Pure bash, no
+  # subprocess: the read loop of config.validate. A legacy `source` line counts
+  # like `.` — config.add writes it back as `.`.
+  local file="${1:-$CONFIG}" line trimmed chainName
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    case "$trimmed" in
+      '. $CONFIG_PATH/'*.env) chainName="${trimmed#'. $CONFIG_PATH/'}" ;;
+      'source $CONFIG_PATH/'*.env) chainName="${trimmed#'source $CONFIG_PATH/'}" ;;
+      *) continue ;;
+    esac
+    chainName="${chainName%.env}"
+    case "$chainName" in ''|*[!A-Za-z0-9_.]*) continue ;; esac
+    echo "$chainName"
+  done < "$file"
+}
+
+
 ### new.method
 
 config.usage()
@@ -1017,25 +1052,38 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
 $(private.config.required.variables.get)
 REQUIRED
 
+  # The CHAINS user.env holds beyond oosh.env and log.env — `. $CONFIG_PATH/
+  # odocker.env`, whatever `config add myapp` appended — read BEFORE the
+  # no-argument branch below truncates user.env, and added back after the
+  # oosh/log chains. Kept even when the file is missing; a legacy `source`
+  # line comes back as `.` (T-CONFIG-CMD-SAVE-USER-KEEPS-CHAINS).
+  local chainNames=""
+  [ -z "$file" ] && chainNames=$(private.config.chain.names.get "$CONFIG")
+
   RESULT=""
-  {
-    # The harvesting loop that used to live here is now
-    # private.config.variables.export, and the exclusion list moved with it, to
-    # sit beside the comment that explains it. review-2026-09-09 § M3 named the
-    # extraction before it existed.
-    #
-    # It enumerates NAMES with `compgen -v` and renders each one with
-    # `declare -p <name>`. It never parses the NO-ARGUMENT `declare -p` stream,
-    # which on bash 3.2 is `set`-style AND contains every function body — the
-    # two facts that between them wrote rows of the required-variables table
-    # into ~/config/oosh.env on every macOS install.
-    # See docs/research/2026-09-17-config-save-bash32.md.
-    #
-    # NOTHING inside this block may log. log:35 sets
-    # LOG_DEVICE=/proc/self/fd/1, and inside this redirect fd 1 IS $CONFIG, so
-    # a single debug.log would be written into the generated env file.
-    private.config.variables.export "$name"
-  } >$CONFIG
+  # The harvest writes a NAMED file (`config save oosh`). Without a name the
+  # no-argument branch below writes user.env itself — harvesting into it first
+  # was a dead write, overwritten a few lines later.
+  if [ -n "$file" ]; then
+    {
+      # The harvesting loop that used to live here is now
+      # private.config.variables.export, and the exclusion list moved with it, to
+      # sit beside the comment that explains it. review-2026-09-09 § M3 named the
+      # extraction before it existed.
+      #
+      # It enumerates NAMES with `compgen -v` and renders each one with
+      # `declare -p <name>`. It never parses the NO-ARGUMENT `declare -p` stream,
+      # which on bash 3.2 is `set`-style AND contains every function body — the
+      # two facts that between them wrote rows of the required-variables table
+      # into ~/config/oosh.env on every macOS install.
+      # See docs/research/2026-09-17-config-save-bash32.md.
+      #
+      # NOTHING inside this block may log. log:35 sets
+      # LOG_DEVICE=/proc/self/fd/1, and inside this redirect fd 1 IS $CONFIG, so
+      # a single debug.log would be written into the generated env file.
+      private.config.variables.export "$name"
+    } >$CONFIG
+  fi
   if [ "$file" = log ]; then
     # log.env chains the PER-USER session file as its LAST line, every time it
     # is written — by `config save log` as much as by the full `config save`
@@ -1088,6 +1136,12 @@ REQUIRED
     config.file user.env
     config.add oosh OOSH    # appends: source $CONFIG_PATH/oosh.env
     config.add log LOG      # appends: source $CONFIG_PATH/log.env
+    # Every other chain user.env held, in its order; config.add de-dups.
+    local chainName
+    for chainName in $chainNames; do
+      case "$chainName" in oosh|log) continue ;; esac
+      config.add "$chainName"
+    done
 
     # Guard: user.env may hold export/comment/blank + `source *.env` chaining
     # (composition, NOT logic); oosh.env / log.env must be pure. config.validate
