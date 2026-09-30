@@ -145,6 +145,167 @@ ogit.parameter.completion.paths()      { compgen -f "$1"; }
 ogit.parameter.completion.pathspecs()  { compgen -f "$1"; }
 ogit.parameter.completion.asEmail()    { ogit.config.email.get; }
 
+ogit.commit.count()     # <from> <to> <?dir:$OOSH_DIR> # RESULT = number of commits in <to> that are not in <from> (refs/heads/ when bare names); "0" when a ref is missing #
+{
+ # Moved from this.git.commits.count (this:921). The refs may legitimately not
+ # exist on test rigs without remotes — empty counts as 0.
+ # (Created in Task 4, because ogit.branch.compare counts with it.)
+ if [ -z "$1" ] || [ -z "$2" ]; then create.result 1 "ogit.commit.count requires <from> <to>"; error.log "$RESULT"; return $(result); fi
+ local from="$1"
+ local to="$2"
+ local dir="${3:-${OOSH_DIR:-.}}"
+ local n
+ # Only a BARE branch name gets refs/heads/; @{u}, HEAD, origin/x, x~1 pass verbatim.
+ case "$from" in */*|*@*|HEAD*|*~*|*^*) ;; *) from="refs/heads/$from" ;; esac
+ case "$to"   in */*|*@*|HEAD*|*~*|*^*) ;; *) to="refs/heads/$to" ;; esac
+ n=$(git -C "$dir" rev-list --count "$from..$to" 2>/dev/null)
+ create.result 0 "${n:-0}"
+ return $(result)
+}
+
+
+ogit.branch.get()     # <?dir:$OOSH_DIR> # echo the current branch of <dir>, sanitised (refs/heads/, refs/remotes/origin/, heads/origin/, origin/ stripped); empty when detached or not a repo #
+{
+ # Moved from this.git.branch.short (this:903). Degenerate names like
+ # heads/origin/dev come from `git worktree add <path> heads/origin/dev` or
+ # `checkout -b origin/dev`; callers concatenate `origin/` onto the answer.
+ local dir="${1:-${OOSH_DIR:-.}}"
+ local b
+ b=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+ b="${b#refs/heads/}"; b="${b#refs/remotes/origin/}"; b="${b#heads/origin/}"; b="${b#origin/}"
+ printf '%s' "$b"
+}
+
+
+ogit.branch.list()     # <?source:local> <?dir:$OOSH_DIR> # echo branch names one per line: local, remote (cached origin/* refs, offline) or all #
+{
+ local source="${1:-local}"
+ local dir="${2:-${OOSH_DIR:-.}}"
+ case "$source" in
+   local)  git -C "$dir" branch --format='%(refname:short)' 2>/dev/null ;;
+   remote) git -C "$dir" for-each-ref refs/remotes/origin --format='%(refname:short)' 2>/dev/null | sed 's|^origin/||' | grep -vx HEAD ;;
+   all)    { ogit.branch.list local "$dir"; ogit.branch.list remote "$dir"; } | sort -u ;;
+   *) return 1 ;;
+ esac
+}
+ogit.branch.list.completion.source() { echo local; echo remote; echo all; }
+
+
+ogit.branch.check()     # <ref> <?dir:$OOSH_DIR> # rc 0 when <ref> resolves in <dir> #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" rev-parse --verify --quiet "$1" >/dev/null 2>&1
+}
+
+
+ogit.branch.find()     # <commit> <?dir:$OOSH_DIR> # echo every branch (local and remote) containing <commit> #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" branch -a --contains "$1" --format='%(refname:short)' 2>/dev/null
+}
+
+
+ogit.branch.checkout()     # <ref> <?dir:$OOSH_DIR> # check <ref> out in <dir> #
+{
+ private.ogit.require || return $(result)
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if git -C "$dir" checkout "$1" 2>/dev/null; then create.result 0 "checked out $1"
+ else create.result 1 "could not check out $1 in $dir"; fi
+ return $(result)
+}
+
+
+ogit.branch.upstream.set()     # <ref> <?dir:$OOSH_DIR> # make the current branch of <dir> track <ref> (e.g. origin/dev) #
+{
+ private.ogit.require || return $(result)
+ local ref="$1"
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if [ -z "$ref" ]; then create.result 1 "ogit.branch.upstream.set requires <ref>"; error.log "$RESULT"; return $(result); fi
+ if git -C "$dir" branch -q -u "$ref" 2>/dev/null; then create.result 0 "$(ogit.branch.get "$dir") tracks $ref"
+ else create.result 1 "could not set the upstream of $dir to $ref"; fi
+ return $(result)
+}
+
+
+ogit.branch.reset()     # <branch> <startPoint> <?dir:$OOSH_DIR> # create or reset <branch> at <startPoint> and check it out (checkout -B) #
+{
+ private.ogit.require || return $(result)
+ local dir="${3:-${OOSH_DIR:-.}}"
+ if git -C "$dir" checkout -B "$1" "$2" >/dev/null 2>&1; then create.result 0 "$1 reset to $2"
+ else create.result 1 "could not reset $1 to $2"; fi
+ return $(result)
+}
+
+
+ogit.branch.compare()     # <from> <to> <?dir:$OOSH_DIR> # symmetric branch comparison; RESULT = up to date with <from> | <from> merged in | N commits behind <from> | diverged: N behind <from> (moved verbatim from promote.branch.alignment) #
+{
+  # Moved verbatim from promote.branch.alignment (promote:277-316 at 8c46828);
+  # the only change is the count call: this.git.commits.count "$OOSH_DIR" A B
+  # → ogit.commit.count A B "$dir". The four verdict strings are pinned by
+  # test.promote (T-PROMOTE-BRANCH-ALIGN-*) — do not reword them.
+  local from="$1"
+  local to="$2"
+  local dir="${3:-${OOSH_DIR:-.}}"
+  if [ -z "$from" ] || [ -z "$to" ]; then
+    create.result 1 "ogit.branch.compare requires <from> <to>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  # Verdict is from <to>'s perspective relative to <from>:
+  #   behindCount = commits on <from> not on <to>  (commits <to> is behind <from> by)
+  #   aheadCount  = commits on <to> not on <from>  (commits <to> is ahead of <from> by)
+  local behindCount aheadCount
+  ogit.commit.count "$to"   "$from" "$dir"; behindCount="$RESULT"
+  ogit.commit.count "$from" "$to"   "$dir"; aheadCount="$RESULT"
+
+  if [ "$behindCount" = "0" ] && [ "$aheadCount" = "0" ]; then
+    create.result 0 "up to date with $from"
+  elif [ "$behindCount" = "0" ]; then
+    # <to> contains every commit of <from> plus its own. Post-promote
+    # steady state: <from> has been successfully merged into <to>, plus
+    # bookkeeping commits (the merge commit + OOSH_SELF_BRANCH rewrite).
+    # The bookkeeping count is not actionable — the timestamp on the <to>
+    # line shows when the merge happened.
+    create.result 0 "$from merged in"
+  elif [ "$aheadCount" = "0" ]; then
+    create.result 0 "$behindCount commits behind $from"
+  else
+    # Diverged: <from> advanced past where <to>'s last merge picked it up,
+    # AND <to> has its own bookkeeping commits from prior promotes. The
+    # ahead-count is just history (bookkeeping); only the behind-count is
+    # actionable — that's how far <to> needs to catch up via `oo stage
+    # <from>`. See docs/promote.md for the full state vocabulary.
+    create.result 0 "diverged: $behindCount behind $from"
+  fi
+  return $(result)
+}
+
+
+ogit.branch.fastForward()     # <ref> <?dir:$OOSH_DIR> # fast-forward the current branch of <dir> to <ref>; rc 1 (nothing changed) when it has diverged #
+{
+ private.ogit.require || return $(result)
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if git -C "$dir" merge --ff-only "$1" >/dev/null 2>&1; then create.result 0 "fast-forwarded to $1"; else create.result 1 "$dir has diverged from $1 — no fast-forward"; fi
+ return $(result)
+}
+
+
+ogit.branch.merge()     # <ref> <?asEmail> <?asName> <?dir:$OOSH_DIR> # merge <ref> into the current branch of <dir> (--no-edit); with <asEmail>/<asName> the merge commit carries that identity and no gpg signing #
+{
+ private.ogit.require || return $(result)
+ local ref="$1"
+ local dir="${4:-${OOSH_DIR:-.}}"
+ private.ogit.identity "$2" "$3"
+ if git -C "$dir" "${OGIT_IDENTITY[@]}" merge "$ref" --no-edit 2>/dev/null; then
+   create.result 0 "merged $ref"
+ else
+   create.result 1 "merge of $ref failed in $dir — conflicts? see ogit conflict.list"
+ fi
+ return $(result)
+}
+
+
 ### new.method
 
 ogit.usage()
