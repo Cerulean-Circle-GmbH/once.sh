@@ -312,21 +312,26 @@ export ODOCKER_WORKSPACES="…"          # only when set (config set / odocker)
 . $CONFIG_PATH/log.env
 ```
 
-- `config.save oosh OOSH` → `oosh.env`: **every** `OOSH_*` variable.
-- `config.save log LOG` → `log.env`: **every** `LOG_*` variable, and as its **last** line `. $OOSH_USER_CONFIG_PATH/log.session.env` — written by every save of `log.env`, exactly once, unguarded.
+- `config.save oosh OOSH` → `oosh.env`: **every** `OOSH_*` setting — not the runtime readings of the saving shell (see *Excluded variables*).
+- `config.save log LOG` → `log.env`: **every** `LOG_*` setting except the per-user session values (below), and as its **last** line `. $OOSH_USER_CONFIG_PATH/log.session.env` — written by every save of `log.env`, exactly once, unguarded.
 - `oosh.env` is chained **before** `log.env`: the chain line needs `OOSH_USER_CONFIG_PATH`, which lives in `oosh.env`.
 - The PATH line is data (`# path-exception:` in `config.save`); `this` de-duplicates PATH when `user.env` is sourced again.
+- **Every other chain is kept.** A line `. $CONFIG_PATH/odocker.env`, or one `config add myapp` appended, is read before `user.env` is rewritten and added back after `oosh.env` and `log.env`, in its order, once — even when its file is missing. A legacy `source $CONFIG_PATH/x.env` line comes back as `. $CONFIG_PATH/x.env` (`private.config.chain.names.get`; T-CONFIG-CMD-SAVE-USER-KEEPS-CHAINS).
 
-**The shared config and `$HOME`.** The `~/config` symlink points at a location shared by every user of the host (`…sharedConfig/`). So a value under the **saving** user's home is never written as that user's absolute path: `private.config.variable.export.line` writes it as `"$HOME/…"` (only the prefix — the rest keeps bash's `declare -p` quoting), and every reader expands it to their own home. `OOSH_DIR="$HOME/oosh"`, `CONFIG_PATH="$HOME/config"`, `LOG_LIVE="$HOME/…"` are therefore correct for everyone. Pinned by `test/test.config` T29 and T-CONFIG-SAVE-PREFIX-OOSH.
+**The shared config and `$HOME`.** The `~/config` symlink points at a location shared by every user of the host (`…sharedConfig/`). So a value under the **saving** user's home is never written as that user's absolute path: `private.config.variable.export.line` writes it as `"$HOME/…"` (only the prefix — the rest keeps bash's `declare -p` quoting), and every reader expands it to their own home. `OOSH_DIR="$HOME/oosh"`, `CONFIG_PATH="$HOME/config"`, `OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"` are therefore correct for everyone. Pinned by `test/test.config` T29 and T-CONFIG-SAVE-PREFIX-OOSH.
 
-**Per-user session values.** `LOG_NAME`, `LOG_DEVICE` and `LOG_LIVE` are saved in `log.env` like every `LOG_*` variable, **and** per user in `$OOSH_USER_CONFIG_PATH/log.session.env` (written by `log.session.save`, see [log.md](log.md)). `log.env` chains the session file last, so each user's own values win. Every user has that file: `config init.user` and the install create it with `private.config.session.file.ensure`.
+**Per-user session values.** `LOG_NAME`, `LOG_DEVICE` and `LOG_LIVE` are **not** saved in the shared `log.env`: a new user would inherit the saver's values. They live only in each user's private `$OOSH_USER_CONFIG_PATH/log.session.env` (written by `log.session.save`, see [log.md](log.md)), which `log.env` chains last. Every user has that file: `config init.user` and the install create it with `private.config.session.file.ensure`.
 
-**Excluded variables.** Only install-time state is never persisted:
+**`config save` typed at the prompt.** `config` then runs as a **child process**: it does not re-read `user.env`, so it saves what the shell **exported**. `test/test.config` T-CONFIG-CMD-SAVE-* run the real executable under `env -i` to pin exactly that.
+
+**Excluded variables.** Three kinds are never persisted — install-time state, runtime readings of the saving shell, and the per-user session values:
 
 | Variable | Why excluded |
 |---|---|
 | `LOG_INSTALL`, `INSTALL_LOG`, … (`*INSTALL*`) | Install-only state — must not persist into user sessions |
 | `SUDO_*` | Injected by sudo for one command |
+| `OOSH_SHLVL`, `OOSH_STATUS`, `OOSH_PROMPT`, `OOSH_CONFIG_NEEDS_SAVE` | **Runtime readings** of the one shell that ran the save. Saved, they come back into every new shell and are saved again. T-CONFIG-CMD-SAVE-OOSH |
+| `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | **Per-user session values** — only in each user's `log.session.env`, never the shared `log.env`. T-CONFIG-CMD-SAVE-LOG |
 | `OOSH_BRANCH` | Install **input** — the branch the operator asked for. State that must be **derived, never remembered**: persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** The branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh`. |
 
 The list is the `case` in `private.config.variables.list` (`config`); `test/test.config` T29 pins it by value. Change all three together.

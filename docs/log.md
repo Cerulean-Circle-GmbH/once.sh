@@ -105,13 +105,13 @@ OOSH config is **shared**: every user's `~/config` symlinks to one `sharedConfig
 directory, so everything written to `~/config/log.env` is seen by *all* users.
 That is where the site-wide log settings live.
 
-`config save log` writes **every** `LOG_*` variable into the shared `log.env` —
+`config save log` writes every `LOG_*` **setting** into the shared `log.env` —
 the MacStudio model — and a value under the saving user's home as `"$HOME/…"`,
 so no user's absolute path leaks to another. The per-user and per-session values
-(`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) are additionally written to the user's
-**private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default `~/.config/oosh`) by
-`log.session.save`, which `.bashrc` runs once per shell; that file exists for
-every user (`config save log`, `config init.user`).
+(`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) are **not** among them: they are written
+only to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
+`~/.config/oosh`) by `log.session.save`, which `.bashrc` runs once per shell;
+that file exists for every user (`config save log`, `config init.user`).
 
 The shared `log.env` is linked to the per-user file by a source chain — its last
 line is `. $OOSH_USER_CONFIG_PATH/log.session.env` (POSIX `.`, not the bash
@@ -378,7 +378,7 @@ Coordinated defenses keep `LOG_LIVE` correct across `user login` chains:
 
 * **Read-side:** `log`'s top-level unconditionally re-exports `LOG_LIVE="$OOSH_USER_CONFIG_PATH/log.live.out"` at shell init. Defeats stale absolute paths inherited via shared config.
 * **Read-side:** `this.init` save+restores `LOG_LIVE` around `. "$CONFIG"`. Mid-session re-sources of `$CONFIG` (every `oo` / `ossh` invocation) would otherwise re-import a stale path; preservation keeps the anchored value.
-* **Write-side:** `config.save` filters `LOG_LIVE` (and `LOG_NAME`/`LOG_DEVICE`/`OOSH_USER_CONFIG_PATH`) out of the shared `log.env` deny-`case`. Stops the leak at the source.
+* **Write-side:** `config.save` keeps `LOG_LIVE`, `LOG_NAME` and `LOG_DEVICE` out of the shared `log.env` (the never-persist `case` in `private.config.variables.list`, T-CONFIG-CMD-SAVE-LOG). Stops the leak at the source.
 
 Result: `console.log` and `silent.log` always write to the current user's `$OOSH_USER_CONFIG_PATH/log.live.out`, even after `user login <other>` chains across users with non-traversable home directories.
 
