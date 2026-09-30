@@ -330,26 +330,33 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     error.log "Failed to install oosh for bash-user on $platform"
   }
 
-  # ─── PHASE B: run test.suite core 1 on all 4 users ─────────────────────
+  # ─── PHASE B: run test.suite gate 1 (core + platform invariant) on all 4 users ─
   local rcTest=0 rcRoot=0 rcOoshUser=0 rcBashUser=0
   local testLog="" rootLog="" ooshUserLog="" bashUserLog=""
 
   if [ -z "$notests" ]; then
+    # Each user runs `test.suite gate 1`: core AND platform.shared.configLayout.invariant
+    # (the config layout, no boot), one verdict. root, oosh-user and bash-user
+    # arrive through sudo/runuser, which run no .bashrc: the prelude stands their
+    # shell up from their own ~/config/user.env (ossh.remote.prelude.get).
+    private.this.script.load ossh ossh.remote.prelude.get || return 1
+    local prelude; prelude=$(ossh.remote.prelude.get)
+
     # B.1 — test
-    console.log "Running core tests as user test..."
+    console.log "Running the gate (core + platform invariant) as user test..."
     testLog="/tmp/oosh-platform-test-test-$platform.log"
-    ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$testLog"
+    ossh exec "$platform" "test.suite gate 1" 2>&1 | tee "$testLog"
     rcTest=${PIPESTATUS[0]}
 
     # B.2 — root (via test+sudo, needs -tt for TTY)
-    console.log "Running core tests as root..."
+    console.log "Running the gate (core + platform invariant) as root..."
     # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
     # user's home). Same find-chdir-back hazard the runuser cases below
     # describe — except for root, the direct `find` calls work because
     # root reads anything; the failure mode is subprocesses (e.g. man-db's
     # postinst, which drops to user `man`) inheriting /home/test as cwd.
     rootLog="/tmp/oosh-platform-test-root-$platform.log"
-    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; source /root/oosh/boot 2>/dev/null; test.suite core 1'" 2>&1 | tee "$rootLog"
+    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; $prelude test.suite gate 1'" 2>&1 | tee "$rootLog"
     rcRoot=${PIPESTATUS[0]}
 
     # Root's test.suite writes into sharedConfig (via /root/config symlink)
@@ -368,7 +375,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # `find: Failed to restore initial working directory: /home/test:
     # Permission denied` lines on stderr. cd'ing to the new user's own
     # home keeps find happy.
-    console.log "Running core tests as oosh-user..."
+    console.log "Running the gate (core + platform invariant) as oosh-user..."
     ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
     # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
     # (busybox doesn't ship it). Use a runtime detector that prefers
@@ -377,21 +384,21 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # NOPASSWD sudoers entry installed in Phase A.
     ossh exec.tty "$platform" "
       if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       else
-        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       fi
     " 2>&1 | tee "$ooshUserLog"
     rcOoshUser=${PIPESTATUS[0]}
 
     # B.4 — bash-user (same pattern; same cwd fix)
-    console.log "Running core tests as bash-user..."
+    console.log "Running the gate (core + platform invariant) as bash-user..."
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
     ossh exec.tty "$platform" "
       if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       else
-        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       fi
     " 2>&1 | tee "$bashUserLog"
     rcBashUser=${PIPESTATUS[0]}
