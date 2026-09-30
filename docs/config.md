@@ -223,7 +223,7 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 | `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
 | `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`: **every** `OOSH_*` variable, a value under the saving user's home written `"$HOME/…"` (the config is shared). Only `OOSH_BRANCH` is left out — install input, not state. |
-| `user.env` | **pure data** — the `CONFIG_*` anchors, the PATH prepend, `BASH_FILE`, `ODOCKER_WORKSPACES`, then `. $CONFIG_PATH/oosh.env` and `. $CONFIG_PATH/log.env` | written by `config save` — what `.bashrc` and `source this` start a shell from (the MacStudio model); see *Saving Configuration* below. |
+| `user.env` | **pure data** — the `CONFIG_*` anchors, the PATH prepend, `BASH_FILE`, then `. $CONFIG_PATH/oosh.env` and `. $CONFIG_PATH/log.env` | written by `config save` — what `.bashrc` and `source this` start a shell from (the MacStudio model); see *Saving Configuration* below. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
 mirror the install steps at `oo:1456` (`config save`) and `oo:1462–1463`
@@ -319,7 +319,6 @@ export CONFIG_FILE="user.env"
 export CONFIG="$HOME/config/user.env"
 export PATH="$HOME/oosh:$HOME/oosh/ng:/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export BASH_FILE="/usr/bin/bash"
-export ODOCKER_WORKSPACES="…"          # only when set (config set / odocker)
 . $CONFIG_PATH/oosh.env
 . $CONFIG_PATH/log.env
 ```
@@ -327,6 +326,7 @@ export ODOCKER_WORKSPACES="…"          # only when set (config set / odocker)
 - `config.save oosh OOSH` → `oosh.env`: **every** `OOSH_*` setting — not the runtime readings of the saving shell (see *Excluded variables*).
 - `config.save log LOG` → `log.env`: **every** `LOG_*` setting except the per-user session values (below), and as its **last** line `. $OOSH_USER_CONFIG_PATH/log.session.env` — written by every save of `log.env`, exactly once, unguarded.
 - `oosh.env` is chained **before** `log.env`: the chain line needs `OOSH_USER_CONFIG_PATH`, which lives in `oosh.env`.
+- `ODOCKER_WORKSPACES` is **not** in `user.env`: it lives in `odocker.env` (`odocker workspace.set`), which `user.env` chains. This departs from the MacStudio branch, where `config set` put it into `user.env`.
 - The PATH line is data (`# path-exception:` in `config.save`); `this` de-duplicates PATH when `user.env` is sourced again.
 - **Every other chain is kept.** A line `. $CONFIG_PATH/odocker.env`, or one `config add myapp` appended, is read before `user.env` is rewritten and added back after `oosh.env` and `log.env`, in its order, once — even when its file is missing. A legacy `source $CONFIG_PATH/x.env` line comes back as `. $CONFIG_PATH/x.env` (`private.config.chain.names.get`; T-CONFIG-CMD-SAVE-USER-KEEPS-CHAINS).
 
