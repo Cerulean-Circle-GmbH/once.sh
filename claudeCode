@@ -1579,6 +1579,19 @@ print(m)
   echo "$CLAUDE_MAX_TOKENS_DEFAULT"
 }
 
+private.claudeCode.context.jsonl.lag() { # <jsonlFile> # 'lag' when a big un-recorded window (>8 user/tool entries) follows the last assistant-usage (mid-reboot: context.md/learnings/reads not yet reflected in a recorded turn → the last-usage is a LOWER-BOUND), else 'fresh'. Repro-calibrated on 046bbac4: normal inter-turn p95=8, reboot windows 15-52.
+  local jsonlFile="$1"
+  [ -f "$jsonlFile" ] || { echo fresh; return 0; }
+  # Count user/tool entries AFTER the last assistant-usage (reset the counter on each assistant-usage).
+  # tail window is generous; a window bigger than it has NO assistant-usage to reset on → counts high → lag.
+  local n
+  n=$(tail -400 "$jsonlFile" | awk '
+    /"type":[ ]*"assistant"/ && /"input_tokens"/ { c=0; next }
+    /"type":[ ]*"user"/ || /"type":[ ]*"tool_result"/ || /"type":[ ]*"tool"/ { c++ }
+    END { print c+0 }')
+  if [ "${n:-0}" -gt 8 ]; then echo lag; else echo fresh; fi
+}
+
 private.claudeCode.context.from.jsonl() {
   # Read context percentage from JSONL token data
   local jsonlFile="$1"
@@ -1595,6 +1608,15 @@ private.claudeCode.context.from.jsonl() {
       echo "stale"
       return 1
     fi
+  fi
+
+  # Content-lag guard (rewind-safety): a big un-recorded window after the last assistant-usage
+  # (mid-reboot injection — context.md/learnings/reads) means the last-usage is a LOWER-BOUND, not
+  # the current context → signal 'lag' so context.read DEFERS to the live panel instead of handing
+  # back a false-safe LOW number that would license a walling drive. T-JSONL-LAG.
+  if [ "$(private.claudeCode.context.jsonl.lag "$jsonlFile")" = "lag" ]; then
+    echo "lag"
+    return 1
   fi
 
   local maxTokens
@@ -1679,7 +1701,8 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
   if [ -n "$jsonlFile" ] && [ -f "$jsonlFile" ]; then
     local pct
     pct=$(private.claudeCode.context.from.jsonl "$jsonlFile")
-    if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ]; then
+    if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ] && [ "$pct" != "lag" ]; then
+      CONTEXT_SOURCE="jsonl-current"
       RESULT="$pct"
       echo "$pct"
       return 0
@@ -1695,7 +1718,8 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
         done
         if [ -n "$freshJsonl" ]; then
           pct=$(private.claudeCode.context.from.jsonl "$freshJsonl")
-          if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ]; then
+          if [ -n "$pct" ] && [ "$pct" != "unknown" ] && [ "$pct" != "stale" ] && [ "$pct" != "lag" ]; then
+            CONTEXT_SOURCE="jsonl-current"
             RESULT="$pct"
             echo "$pct"
             return 0
@@ -1705,12 +1729,27 @@ claudeCode.context.read() # <?pane> # read context % remaining from JSONL token 
     fi
   fi
 
-  # Fall back to TUI scraping if pane specified
+  # Fall back to the live TUI/panel if a pane is specified — this is ALSO the DEFER target when the
+  # JSONL read returned 'lag' (mid-reboot). Capture (don't pass-through) so we can label the source.
   if [ -n "$pane" ]; then
-    private.claudeCode.context.read.tui "$pane"
-    return $?
+    local tuiPct
+    tuiPct=$(private.claudeCode.context.read.tui "$pane")
+    if [ -n "$tuiPct" ] && [ "$tuiPct" != "unknown" ]; then
+      CONTEXT_SOURCE="panel"
+      RESULT="$tuiPct"
+      echo "$tuiPct"
+      return 0
+    fi
+    # No readable panel AND the JSONL was lagging → signal 'lag', NEVER a false-safe LOW number.
+    if [ "$pct" = "lag" ]; then
+      CONTEXT_SOURCE="jsonl-lagging"
+      RESULT="lag"
+      echo "lag"
+      return 1
+    fi
   fi
 
+  CONTEXT_SOURCE="unknown"
   RESULT="unknown"
   echo "unknown"
   return 1
