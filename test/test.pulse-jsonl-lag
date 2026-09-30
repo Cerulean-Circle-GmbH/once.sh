@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# T-PULSE-JSONL-LAG — RED-FIRST (rewind-safety follow-up, oopPO). scrumMaster.pulse's embedded python
+# ctx_from_jsonl (scrumMaster:648) shares the SAME token-math as claudeCode from.jsonl — it reads the
+# LAST assistant-usage and has NO content-lag guard, so on a mid-reboot agent (big attachment/tool_use
+# window after the last assistant-usage) it returns a FALSE-LOW used% → the MONITORING layer (pulse)
+# misleads the SAME walling direction the claudeCode guard (a317633) already fixed.
+# CONTRACT (mirror claudeCode jsonl.lag; align exact python return-shape with the expert): when the
+# content-window (>8 user/attachment/tool_result/tool_use after last assistant-usage) is large,
+# ctx_from_jsonl must SIGNAL LAG, not hand back the stale false-LOW number.
+level=$1; [ -z "$level" ] && level=1
+echo "starting: T-PULSE-JSONL-LAG <LOG_LEVEL=$level> (RED-FIRST — pulse python shares the unguarded math)"
+source this; source test.suite
+export LOG_DEVICE=/dev/null
+log.level $level
+
+D="${TMPDIR:-/tmp}/t-pulse-lag.$$"; rm -rf "${TMPDIR:-/tmp}/t-pulse-lag."* 2>/dev/null; mkdir -p "$D"
+trap 'rm -rf "${TMPDIR:-/tmp}/t-pulse-lag."* 2>/dev/null' EXIT
+
+# --- fixtures: assistant-usage (~40% used) then a content window of REAL reboot types ---
+LAG_JF="$D/lagging.jsonl"; FRESH_JF="$D/fresh.jsonl"
+{ printf '{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":1000,"cache_read_input_tokens":398999}}}\n'
+  for i in $(seq 1 20); do printf '{"type":"attachment","content":"[read: context.md %d]"}\n' "$i"; done
+  for i in $(seq 1 20); do printf '{"type":"tool_use","name":"Read","input":{"file":"learnings-%d"}}\n' "$i"; done
+} > "$LAG_JF"        # 40 content entries after last assistant-usage → mid-reboot lag (used%=40 is a LOWER-BOUND)
+printf '{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":1000,"cache_read_input_tokens":398999}}}\n' > "$FRESH_JF"
+
+# Extract the DEPLOYED ctx_from_jsonl from scrumMaster and drive it directly (gates the REAL code).
+CTX_SRC=$(sed -n '/^def ctx_from_jsonl/,/^def classify/p' "$OOSH_DIR/scrumMaster" | sed '$d')
+HARNESS="$D/harness.py"
+{ echo 'import json, sys'
+  printf '%s\n' "$CTX_SRC"
+  cat <<'PY'
+def content_window(path):
+    c = 0
+    for line in open(path):
+        try: d = json.loads(line)
+        except Exception: continue
+        t = d.get("type")
+        if t == "assistant" and d.get("message",{}).get("usage",{}).get("input_tokens") is not None: c = 0
+        elif t in ("user","attachment","tool_result","tool_use"): c += 1
+    return c
+lag, fresh = sys.argv[1], sys.argv[2]
+r_lag = ctx_from_jsonl(lag, 1000); r_fresh = ctx_from_jsonl(fresh, 1000)
+# A lag SIGNAL = anything other than a plain numeric (used,pct,denom) tuple: a 'lag' marker/flag.
+def signals_lag(r):
+    if r is None: return False
+    if isinstance(r, str): return 'lag' in r.lower()
+    if isinstance(r, (list,tuple)):
+        return any(isinstance(x,str) and 'lag' in x.lower() for x in r)
+    return False
+print("WINDOW_LAG=%d WINDOW_FRESH=%d" % (content_window(lag), content_window(fresh)))
+print("CTX_LAG=%r" % (r_lag,)); print("CTX_FRESH=%r" % (r_fresh,))
+print("SIGNALS_LAG=%s" % signals_lag(r_lag))
+PY
+} > "$HARNESS"
+OUT=$(python3 "$HARNESS" "$LAG_JF" "$FRESH_JF" 2>&1)
+WL=$(printf '%s\n' "$OUT" | sed -nE 's/.*WINDOW_LAG=([0-9]+).*/\1/p')
+CTXLAG=$(printf '%s\n' "$OUT" | sed -nE 's/^CTX_LAG=(.*)/\1/p')
+CTXFRESH=$(printf '%s\n' "$OUT" | sed -nE 's/^CTX_FRESH=(.*)/\1/p')
+SIG=$(printf '%s\n' "$OUT" | sed -nE 's/^SIGNALS_LAG=(.*)/\1/p')
+
+echo; echo "===== (1) PRE: the fixture IS a mid-reboot lag (content-window > 8) ====="
+test.case $level "(1) lagging fixture content-window=$WL (>8), fresh=0" echo "$WL"
+[ "${WL:-0}" -gt 8 ] && expect.pass "40 attachment/tool_use content entries after last assistant-usage" || expect.fail "fixture not lagging (WL=$WL)"
+
+echo; echo "===== (2) RED: deployed pulse ctx_from_jsonl SIGNALS LAG on the reboot window (not a false-LOW number) ====="
+test.case $level "(2) ctx_from_jsonl(lagging) signals lag — got CTX_LAG=$CTXLAG SIGNALS_LAG=$SIG" echo "$SIG"
+if [ "$SIG" = "True" ]; then
+  expect.pass "pulse signals lag → monitoring defers, never the false-LOW"
+else
+  expect.fail "RED: returned the plain false-LOW $CTXLAG with NO lag signal — pulse misleads the walling direction (mirror of the claudeCode gap, now in the python)"
+fi
+
+echo; echo "===== (3) ANCHOR: fresh jsonl → a plain numeric reading (no false lag; contract intact) ====="
+test.case $level "(3) ctx_from_jsonl(fresh) = numeric (used,pct,denom) — got $CTXFRESH" echo "$CTXFRESH"
+if printf '%s' "$CTXFRESH" | grep -qE '^\([0-9]+,[[:space:]]*[0-9]+,[[:space:]]*[0-9]+\)$'; then
+  expect.pass "fresh returns the plain used-% tuple (unchanged — pulse math intact)"
+else
+  expect.fail "fresh returned unexpected: $CTXFRESH"
+fi
+
+echo
+echo "=================================================================="
+echo "  T-PULSE-JSONL-LAG RED-FIRST: pulse ctx_from_jsonl must signal LAG on a >8 content-window"
+echo "  (align the python return-shape with the expert). Mirrors claudeCode jsonl.lag (a317633)."
+echo "=================================================================="
+rm -rf "${TMPDIR:-/tmp}/t-pulse-lag."* 2>/dev/null
+test.suite.save.results
