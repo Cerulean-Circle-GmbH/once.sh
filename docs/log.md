@@ -385,7 +385,9 @@ Result: `console.log` and `silent.log` always write to the current user's `$OOSH
 `user login` hands the target a clean environment (`env -i`) with one exception, `TERM`: it
 describes the terminal, not the caller. Without it `su` sets `TERM=dumb` and the target shell has no
 colour — git prints its status plain — and `less`, `vi`, `clear` and tmux degrade
-(`T-USER-LOGIN-KEEPS-TERM`, `test/test.user`).
+(`T-USER-LOGIN-KEEPS-TERM`, `test/test.user`). A `TERM` of `dumb` — what an `env -i sh` leaves, the
+clean-boot flow `env -i sh` then `user login` — or none at all is handed over as `xterm-256color`
+(`private.user.login.term.get`, `T-USER-LOGIN-TERM-GET`).
 
 Verified by `T-THIS-INIT-LOG-LIVE-PRESERVED` / `T-CONFIG-SAVE-EXCLUDES-LOG-LIVE` (`test/test.oo`) and `test/test.log` T46–T50.
 
