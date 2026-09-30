@@ -5,6 +5,14 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+# Ensure logging stubs exist — config may be sourced before log during bootstrap
+[ "$(type -t console.log)" = "function" ] || console.log() { :; }
+[ "$(type -t important.log)" = "function" ] || important.log() { :; }
+[ "$(type -t warn.log)" = "function" ] || warn.log() { :; }
+[ "$(type -t stop.log)" = "function" ] || stop.log() { :; }
+[ "$(type -t debug.log)" = "function" ] || debug.log() { :; }
+[ "$(type -t error.log)" = "function" ] || error.log() { echo "ERROR: $*" >&2; }
+
 config.completion.discover() {
   #set -x
   #info.log "completion.discover $*"
@@ -157,26 +165,37 @@ config.string.quote() { # <string> # quote the string to be used as a command li
   echo $RESULT
 }
 
-config.init() # # set the config anchors, then check the config; when it is missing or broken, repair it with config init.full
+config.init() # # inititalizes the $CONFIG environment if $CONFIG is empty
 {
-  # It used to only set the anchors and make a directory — a missing user.env,
-  # a dangling ~/config, a foreign branch version all passed `config init`
-  # untouched. Now: the anchors (config.anchors.init), a cheap no-write check
-  # (private.config.healthy), and only on failure the repair family.
-  config.anchors.init
-  if private.config.healthy; then
-    create.result 0 "config healthy: $CONFIG_PATH"
-    return $(result)
+  # HONOUR an anchor already set; default to the constant when there is none.
+  # This used to be an unconditional `export CONFIG_PATH=~/config`, and
+  # config.start re-runs config.init whenever $CONFIG is not a file — so
+  # sourcing `config` silently moved the anchor back and undid any fixture
+  # FROM INSIDE the file under test. That is why test/test.config and
+  # test/test.completion.audit had to declare TEST_SHARED_TIER_WRITER instead
+  # of isolating.
+  #
+  # The conditional form is not a bend of the anchor rule, it IS the rule:
+  # private.this.anchor.validate.one counts `: ${CONFIG_PATH:=~/config}` as
+  # CONFORMING, and `this`, `log` and `ossh` already use exactly this shape for
+  # exactly this variable. A cold shell still lands on the constant.
+  # CONFIG_PATH only. CONFIG_FILE is NOT an anchor — it is the currently
+  # selected file, and `config file reset` means "go back to user.env" and
+  # reaches that through here (config.file's reset branch). Making it
+  # conditional too broke T16, which is exactly the assertion that pins it.
+  : ${CONFIG_PATH:=~/config}
+  export CONFIG_PATH
+  export CONFIG_FILE=user.env
+
+  if [ ! -d $CONFIG_PATH ]; then
+    mkdir $CONFIG_PATH
+  #else
+  #  source $CONFIG
   fi
-  important.log "config init: ${YELLOW}$CONFIG_PATH${NORMAL} is missing or broken — repairing with ${YELLOW}config init.full${NORMAL}"
-  config.init.full "$USER"
-  if private.config.healthy; then
-    create.result 0 "config repaired: $CONFIG_PATH"
-  else
-    create.result 1 "config init: still broken after config init.full — $(config.validate.required 2>/dev/null | head -1)"
-    error.log "$RESULT"
-  fi
-  return $(result)
+  touch $CONFIG_PATH/error.txt
+
+  export CONFIG=$CONFIG_PATH/$CONFIG_FILE
+  debug.log "$CONFIG"
 }
 
 # ---------------------------------------------------------------------------
@@ -187,7 +206,7 @@ config.init() # # set the config anchors, then check the config; when it is miss
 # sharedConfig dir mode 2775 group dev; no self-referential symlinks.
 # ---------------------------------------------------------------------------
 
-config.init.shared() # # ensure sharedConfig exists, group dev, g+w (no SGID — see private.ensure.sharedTree); remove self-loops; idempotent
+config.init.shared() # # ensure sharedConfig dir is mode 2775 group dev; remove self-loops; idempotent
 {
   # `user` script provides user.get, private.as.user, user.group.add — not
   # auto-loaded by `source this`. Source on demand so `./config init.*` works
@@ -204,21 +223,15 @@ config.init.shared() # # ensure sharedConfig exists, group dev, g+w (no SGID —
   baseDir=$(dirname "$devHome")
   local sharedConfig="$baseDir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
   if [ ! -d "$sharedConfig" ]; then
-    # A NONEXISTING config is repaired too: create it when the caller may
-    # (its parent is group dev, g+w); otherwise say exactly what to run.
-    if ! mkdir -p "$sharedConfig" 2>/dev/null; then
-      error.log "config.init.shared: cannot create ${RED}$sharedConfig${NORMAL} — run ${YELLOW}sudo -E ./config init.shared${NORMAL}"
-      return 1
-    fi
-    important.log "config.init.shared: created ${YELLOW}$sharedConfig${NORMAL}"
+    error.log "config.init.shared: sharedConfig missing: ${RED}$sharedConfig${NORMAL} — install not completed"
+    return 1
   fi
-  important.log "config.init.shared: normalising ${YELLOW}$sharedConfig${NORMAL} (group dev, g+w)"
+  important.log "config.init.shared: normalising ${YELLOW}$sharedConfig${NORMAL} (mode 2775, group dev)"
   private.ensure.sharedTree "$sharedConfig"
 }
 
 config.init.user() # <username:$USER> # ensure the user's ~/config + ~/oosh symlinks match canonical install
 {
-  private.this.script.load ogit ogit.branch.get
   [ "$(type -t user.get)" = "function" ] || source "$OOSH_DIR/user" >/dev/null 2>&1
   local username="$1"
   if [ -n "$1" ]; then shift; fi
@@ -247,14 +260,9 @@ config.init.user() # <username:$USER> # ensure the user's ~/config + ~/oosh syml
   # Avoids the case where $OOSH_MODE is set to a stale value like "released"
   # that doesn't have a corresponding worktree on disk.
   local sharedOoshBase="$baseDir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
-  if [ ! -d "$sharedConfig" ]; then
-    error.log "config.init.user: ${RED}$sharedConfig${NORMAL} does not exist — run ${YELLOW}config init.shared${NORMAL} first"
-    return 1
-  fi
   local sharedOosh=""
   # OOSH_DIR is ~/oosh (a symlink), so the prefix test needs its PHYSICAL
-  # target — the literal never starts with $sharedOoshBase. See
-  # docs/oosh-architecture.md § The anchors are data.
+  # target — the literal never starts with $sharedOoshBase. See docs/boot.md.
   local ooshPhysical
   ooshPhysical=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null || echo "$OOSH_DIR")
   if [ -d "$ooshPhysical" ] && [ "${ooshPhysical#$sharedOoshBase/}" != "$ooshPhysical" ]; then
@@ -304,75 +312,49 @@ config.init.user() # <username:$USER> # ensure the user's ~/config + ~/oosh syml
   || [ -d "$targetHome/oosh"   -a ! -L "$targetHome/oosh"   ]; then
     _needsRecreate=1
   fi
-  # ONE hop as the target user: symlink convergence (only when needed) via the
-  # shared primitive private.this.symlink.with.backup — run AS the target so
-  # new symlinks inherit <user>:<user> — then the .bashrc heal, which always
-  # runs (idempotent, T86). The preamble comes from
-  # private.this.as.user.preamble.get: it exports the TARGET's HOME/USER,
-  # drops the caller's leaked anchors and sources `this` from the SHARED tree.
-  # The string used to source "$OOSH_DIR/this", expanded by the CALLER — root
-  # healing another user made them source /root/oosh/this, unreadable under a
-  # 0700 /root, so every step failed silently (T87).
-  #
-  # Deliberately no `set -e`: `this` returns non-zero at load-time as part of
-  # its dispatch protocol, so `set -e` + source would exit before anything
-  # ran. Explicit `|| exit 1` on the symlink steps gives the same fail-fast.
-  # The heal's RESULT is echoed on the last line so this shell can report a
-  # re-template (a create.result inside the hop never reaches us).
-  local bashrcOutcome
-  bashrcOutcome=$(private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")
-    if [ '$_needsRecreate' = 1 ]; then
+  if [ "$_needsRecreate" = "1" ]; then
+    # Delegate symlink convergence to the shared primitive
+    # private.this.symlink.with.backup (this:171). private.as.user runs
+    # the operations AS the target user, so the symlinks naturally inherit
+    # <user>:<user> ownership — the canonical install layout.
+    #
+    # The bash -c subshell sources $OOSH_DIR/this to bring the primitive
+    # (and its create.result / error.log / result dependencies) into
+    # scope. We deliberately DON'T `set -e` here: `this` returns non-zero
+    # at load-time as part of its dispatch protocol (it's a callable
+    # script as well as a sourceable library), so `set -e` + source would
+    # exit the subshell before the primitive ever ran. Explicit
+    # `|| exit 1` after each primitive call gives the same fail-fast
+    # behaviour without the false-positive on the source.
+    private.as.user "$username" bash -c "
+      cd \"$targetHome\" || exit 1
+      source \"$OOSH_DIR/this\" >/dev/null 2>&1
       private.this.symlink.with.backup config '$sharedConfig' '$_ts' || exit 1
       private.this.symlink.with.backup oosh   '$sharedOosh'   '$_ts' || exit 1
-    fi
-    # config AFTER the symlinks: config.start runs config.init when CONFIG is
-    # unset, and that mkdirs a REAL ~/config the symlink step would then have
-    # to move aside as config.orig.<ts>.
-    source '$sharedOosh/config' >/dev/null 2>&1
-    private.config.bashrc.ensure '$targetHome' '$sharedOosh' '$_ts' >/dev/null
-    _bashrcResult=\"\$RESULT\"
-    # The TARGET's git trust of every folder under the base (clone layout,
-    # spec § 4) — their --global config, so it runs here, as them.
-    '$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")' >/dev/null
-    # The TARGET's per-user data file (OOSH_MODE), written here, AS them, from
-    # where THEIR ~/oosh points. config save writes it only for whoever runs
-    # it — the install runs as root, so every other installed user had none
-    # and an empty OOSH_MODE (ubuntu_24_04 platform container, 2026-09-29).
-    # oo update and oo user.fix reach here, which heals installed users.
-    private.config.user.mode.save >/dev/null
-    echo \"\$_bashrcResult\"
-  ")
-  local hopRc=$?
-  if [ "$hopRc" -ne 0 ]; then
-    if [ "$(readlink "$targetHome/config" 2>/dev/null)" != "$sharedConfig" ] \
-    || [ "$(readlink "$targetHome/oosh"   2>/dev/null)" != "$sharedOosh"   ]; then
+    " || {
       error.log "config.init.user: failed to create symlinks for ${RED}$username${NORMAL}"
       return 1
-    fi
-    warn.log "config.init.user: could not ensure ${YELLOW}$targetHome/.bashrc${NORMAL}"
+    }
   fi
-  case "$bashrcOutcome" in
-    re-templated*) important.log "config.init.user: $bashrcOutcome (previous file kept as .bashrc.pre-oosh / .bashrc.orig.$_ts)" ;;
-  esac
-
-  # The shared log.env: strip the boot-era log.session.env chain line (one
-  # file per host, so the caller's copy is everyone's). `oo update` reaches
-  # here, which is how already-installed hosts leave the migration window the
-  # guard in `this` covers. T88.
-  private.config.log.env.migrate >/dev/null
-  case "$RESULT" in
-    stripped*) important.log "config.init.user: $RESULT (log owns the per-user session file now)" ;;
-  esac
-  # The CALLER's git trust of every folder under the base (clone layout, spec
-  # § 4): each folder is its own repository with its own safe.directory entry.
-  # `oo update` and `oo user.fix` reach here, which makes them the repair.
-  ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null \
-    || warn.log "config.init.user: could not ensure safe.directory — $RESULT"
   # Phase 2 — force canonical owner on the symlinks. Only when this shell has
   # the privilege to do so (root, or self).
   if [ "$(id -u)" = "0" ] || [ "$username" = "$USER" ]; then
     chown -h "$username:$username" "$targetHome/config" "$targetHome/oosh" 2>/dev/null || true
   fi
+
+  # bashrc — install template if the OOSH section is missing (idempotent).
+  # Same one-shot .bashrc.pre-oosh backup convention as user:850.
+  private.as.user "$username" bash -c "
+    [ -f \"$targetHome/.bashrc\" ] && [ ! -f \"$targetHome/.bashrc.pre-oosh\" ] && cp \"$targetHome/.bashrc\" \"$targetHome/.bashrc.pre-oosh\"
+    if ! grep -q 'oosh/boot' \"$targetHome/.bashrc\" 2>/dev/null; then
+      if [ -f \"$sharedOosh/templates/user/bashrcTemplate\" ]; then
+        cp \"$sharedOosh/templates/user/bashrcTemplate\" \"$targetHome/.bashrc\"
+      else
+        printf '\n# oosh environment\n[ -f ~/oosh/boot ] && source ~/oosh/boot\n' >> \"$targetHome/.bashrc\"
+      fi
+    fi
+    [ ! -f \"$targetHome/.bash_profile\" ] && echo '[ -f ~/.bashrc ] && source ~/.bashrc' > \"$targetHome/.bash_profile\"
+  " 2>/dev/null
 
   # Ensure dev group membership (idempotent; user.group.add no-ops if already a member).
   if private.user.check.group dev >/dev/null 2>&1; then
@@ -416,7 +398,6 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
       fi
     fi
     # Symlink owner should be <user>:<user>, not <user>:dev
-    [ -d "$cTarget" ] || warn.log "  ~/config points at nothing ($cTarget) — run ${YELLOW}config init${NORMAL}"
     case "$cOwner" in
       "$username:$username") : ;;
       *) warn.log "  ~/config owner ${RED}$cOwner${NORMAL} drifted from canonical ${GREEN}$username:$username${NORMAL} — run ${YELLOW}config init.user${NORMAL}" ;;
@@ -428,10 +409,6 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
   # Stale-dev-group warning: in /etc/group but not in active group set.
   # We can only check the *running* shell's group set when the username is
   # the caller; for other users we just check static membership.
-  if [ ! -d "$targetHome/oosh" ]; then
-    warn.log "  ~/oosh is missing or points at nothing — run ${YELLOW}config init${NORMAL}"
-  fi
-
   if getent group dev 2>/dev/null | grep -qE "(:|,)$username(,|$)"; then
     if [ "$username" = "$USER" ]; then
       if ! id -nG | grep -qw dev; then
@@ -452,7 +429,7 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
   return 0
 }
 
-config.init.env() # # regenerate user.env and every manifest / loaded env file via config.save (mirrors install at oo:1456); backs them up first and refuses to worsen any of them
+config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (mirrors install at oo:1456)
 {
   if [ -z "$OOSH_DIR" ]; then
     error.log "config.init.env: \$OOSH_DIR is empty — re-source ${YELLOW}this${NORMAL} or rerun under ${YELLOW}sudo -E${NORMAL}"
@@ -472,17 +449,12 @@ config.init.env() # # regenerate user.env and every manifest / loaded env file v
   # left to restore from. The refuse-to-worsen guard below restores from these.
   local _ts _envName
   _ts=$(date +%Y%m%d-%H%M%S)
-  # EVERY file the save will rewrite — user.env, each manifest file, each
-  # loaded file — not a hard-coded user/oosh/log: the cascade truncates
-  # odocker.env and any `config add` file too, and those had no backup (F7).
-  local _envFiles
-  _envFiles="user $(private.config.chain.files.get "$CONFIG_PATH/user.env" | tr '\n' ' ')"
-  for _envName in $_envFiles; do
+  for _envName in user oosh log; do
     [ -f "$CONFIG_PATH/$_envName.env" ] || continue
     cp -p "$CONFIG_PATH/$_envName.env" "$CONFIG_PATH/$_envName.env.bak.$_ts" 2>/dev/null \
       || warn.log "config.init.env: failed to back up $_envName.env (continuing)"
   done
-  important.log "config.init.env: backed up${_envFiles:+ $(echo $_envFiles | sed 's/ /.env, /g').env} → ${GREEN}*.env.bak.$_ts${NORMAL}"
+  important.log "config.init.env: backed up user/oosh/log .env → ${GREEN}*.env.bak.$_ts${NORMAL}"
 
   # WHAT WAS MISSING BEFORE THIS TICKET. config.save persists the ENVIRONMENT,
   # and the environment is populated FROM the config — a closed loop with no
@@ -500,35 +472,25 @@ config.init.env() # # regenerate user.env and every manifest / loaded env file v
   # derived one. The verdicts go to stdout — nothing captures config.init.env,
   # unlike config.save — so an operator running the advertised repair can see
   # what was reconstructed and what could not be.
-  local _variable _file _deriver _derived _repaired="" _unrecoverable="" _optional=""
-  while read -r _variable _file _deriver _authority; do
+  local _variable _file _deriver _derived _repaired="" _unrecoverable=""
+  while read -r _variable _file _deriver; do
     [ -z "$_variable" ] && continue
-    # `kept`: a user's choice (LOG_LEVEL, OOSH_PM, ODOCKER_WORKSPACES) — only a
-    # missing one is derived. `derived`: the host or the checkout is the truth,
-    # so a STALE value is replaced too; skipping every set variable is how the
-    # OOSH_MODE drift survived this very repair (T98).
-    [ "$_authority" = derived ] || { [ -n "${!_variable}" ] && continue; }
-    [ "$(type -t "$_deriver")" = "function" ] || { [ -n "${!_variable}" ] || _unrecoverable="$_unrecoverable $_variable"; continue; }
+    [ -n "${!_variable}" ] && continue          # it survived; leave it alone
+    [ "$(type -t "$_deriver")" = "function" ] || { _unrecoverable="$_unrecoverable $_variable"; continue; }
     _derived=$("$_deriver" 2>/dev/null)
     if [ -n "$_derived" ]; then
-      [ "$_derived" = "${!_variable}" ] || _repaired="$_repaired $_variable"
       export "$_variable=$_derived"
-    elif [ -z "${!_variable}" ] && [ "$_authority" = derived ]; then
+      _repaired="$_repaired $_variable"
+    else
       _unrecoverable="$_unrecoverable $_variable"
-    elif [ -z "${!_variable}" ]; then
-      # A kept row nothing derives is OPTIONAL, not unrecoverable (F2):
-      # ODOCKER_WORKSPACES without a components base. Its file is simply not
-      # written — private.config.manifest.files.get leaves it out.
-      _optional="$_optional $_variable"
     fi
   done <<REQUIRED
 $(private.config.required.variables.get)
 REQUIRED
   [ -n "$_repaired" ]      && echo "config.init.env: re-derived:$_repaired"
   [ -n "$_unrecoverable" ] && echo "config.init.env: could NOT derive:$_unrecoverable — the regenerated config will still be missing these"
-  [ -n "$_optional" ]      && echo "config.init.env: optional, nothing to derive:$_optional — its env file is not written"
 
-  important.log "config.init.env: regenerating ${YELLOW}user.env${NORMAL} + every manifest / loaded env file via ${YELLOW}config save${NORMAL} (mirrors install)"
+  important.log "config.init.env: regenerating ${YELLOW}user.env${NORMAL} + ${YELLOW}oosh.env${NORMAL} + ${YELLOW}log.env${NORMAL} via ${YELLOW}config save${NORMAL} (mirrors install)"
   # `config save` (no args) cascades internally: writes user.env, then calls
   # itself with (oosh OOSH) and (log LOG).
   config.save || warn.log "config.init.env: config.save returned non-zero — env files may be partial"
@@ -539,35 +501,18 @@ REQUIRED
   # tier came out with FEWER export lines than it went in with, put the backups
   # back and say so.
   local _envRc=0
-  for _envName in $_envFiles; do
+  for _envName in user oosh log; do
     local _bak="$CONFIG_PATH/$_envName.env.bak.$_ts"
     [ -f "$_bak" ] || continue
     local _wasCount _nowCount
-    # Count only exports that may still be persisted: a variable that moved out
-    # of the shared tier (OOSH_MODE, T100) is a migration, not damage (T108).
-    _wasCount=$(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$_bak" 2>/dev/null \
-                | while read -r _n; do private.config.variable.persistable "$_n" && echo "$_n"; done | grep -c .)
-    _nowCount=$(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CONFIG_PATH/$_envName.env" 2>/dev/null \
-                | while read -r _n; do private.config.variable.persistable "$_n" && echo "$_n"; done | grep -c .)
+    _wasCount=$(grep -c '^[[:space:]]*export ' "$_bak" 2>/dev/null)
+    _nowCount=$(grep -c '^[[:space:]]*export ' "$CONFIG_PATH/$_envName.env" 2>/dev/null)
     if [ "${_nowCount:-0}" -lt "${_wasCount:-0}" ]; then
       echo "config.init.env: REFUSING — $_envName.env went from ${_wasCount:-0} to ${_nowCount:-0} export lines; restoring $_bak"
       cp -p "$_bak" "$CONFIG_PATH/$_envName.env" 2>/dev/null
       _envRc=1
     fi
   done
-  # …and the LOAD LINES. The export counts above cannot see a lost
-  # `. $CONFIG_PATH/odocker.env` — the hole config.save had until T96. Count
-  # the env files user.env loads (existing ones only) before and after.
-  local _bakUser="$CONFIG_PATH/user.env.bak.$_ts" _wasChain _nowChain
-  if [ -f "$_bakUser" ]; then
-    _wasChain=$(private.config.chain.files.get "$_bakUser" | grep -c .)
-    _nowChain=$(private.config.chain.files.get "$CONFIG_PATH/user.env" | grep -c .)
-    if [ "${_nowChain:-0}" -lt "${_wasChain:-0}" ]; then
-      echo "config.init.env: REFUSING — user.env went from ${_wasChain:-0} to ${_nowChain:-0} loaded env files; restoring $_bakUser"
-      cp -p "$_bakUser" "$CONFIG_PATH/user.env" 2>/dev/null
-      _envRc=1
-    fi
-  fi
   return $_envRc
 }
 
@@ -591,7 +536,6 @@ config.init.full() # <username:$USER> # repair end-to-end: shared dir + user sym
   return $rc
 }
 
-config.init.completion()        { :; }
 config.init.shared.completion() { :; }
 config.init.env.completion()    { :; }
 config.init.user.completion.username()  { user.list; }
@@ -642,7 +586,34 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
     # Prefix as a whole name or a `name_…` family — never `${envPrefix}*`,
     # which for LOG would also grab LOGNAME.
     case "$variableName" in ${envPrefix}|${envPrefix}_*) ;; *) continue ;; esac
-    private.config.variable.persistable "$variableName" || continue
+    case "$variableName" in
+      # per-user / volatile / install-only / sudo-injected — never persist.
+      #
+      # Derived per-user paths are dynamically rebuilt from $HOME at every
+      # shell init ($OOSH_DIR/boot and this.init set CONFIG_PATH / OOSH_DIR /
+      # OOSH_USER_CONFIG_PATH), so persisting their ABSOLUTE expanded value
+      # into shared config (the saving user's $HOME) only causes EACCES leaks
+      # when a different user later sources it. Same reasoning as
+      # LOG_LIVE/LOG_NAME/LOG_DEVICE (per-user, kept in
+      # $OOSH_USER_CONFIG_PATH/log.session.env, not the shared log.env).
+      # Install-only vars (LOG_INSTALL, INSTALL_LOG) must not persist into user
+      # sessions. OOSH_COMPONENTS_DIR is a transient /tmp/test.oo.* path from
+      # test runs — never share.
+      #
+      # OOSH_BRANCH is the install INPUT: the branch the OPERATOR ASKED FOR,
+      # meaningful for the length of one install and meaningless afterwards. It
+      # is not an absolute path, so it is here for the other reason this list
+      # exists — state that must be DERIVED, never remembered. Persisting it
+      # closed a loop (oosh.env seeds a shell, the shell reaches a config save,
+      # the save writes it back) in which nothing ever consults the checkout,
+      # and it left private.oo.install.branch.get answering "prod" on a dev box
+      # for weeks. The branch a host is ON is derived from the canonical
+      # ~/oosh; see private.oo.shared.base.get. That is T7.
+      #
+      # Documented at docs/config.md § Excluded variables and pinned by
+      # test/test.config T29 — change all three together.
+      *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|SUDO_*|_) continue ;;
+    esac
     echo "$variableName"
   done
 }
@@ -686,17 +657,10 @@ private.config.variable.export.line()     # <variableName> # echo ONE export lin
   # used to sit here claimed ANSI-C quoting happened "on 3.2 as well as 5";
   # that was never measured and is false for every 5.1.
   local value="${!variableName}"
-  # EVERY control character, not only newline and carriage return: a tab or an
-  # ESC is rendered $'…' by bash >= 5.2 and 3.2 (refused by gate 2) but as a
-  # plain double-quoted string with the raw character inside by bash 5.1 — so
-  # on AlmaLinux 9 the same value was WRITTEN that every other platform refused
-  # and reported (T116 red on bash 5.1.8, 2026-09-29). Judged by the value, the
-  # answer no longer depends on the bash that happens to run the save.
-  case "$value" in *[[:cntrl:]]*) return 1 ;; esac
+  case "$value" in *$'\n'*|*$'\r'*) return 1 ;; esac
   # (2) THE RENDERING, still worth keeping: if bash reaches for $'…' for any
-  # other reason, that is a BASHISM, and every shell — including dash/ash
-  # /bin/sh login shells — sources these files directly, and dash/ash read
-  # $'…' literally (review-2026-09-09 § D1).
+  # other reason, that is a BASHISM, and $OOSH_DIR/boot sources these files
+  # under dash/ash, which reads $'…' literally (review-2026-09-09 § D1).
   case "$assignment" in "${variableName}=\$'"*) return 1 ;; esac
   # PREPEND `export`. The old code sed-patched a `declare -` prefix into it,
   # which bash 3.2's no-argument form never prints — so on macOS the
@@ -750,7 +714,7 @@ private.config.string.upper()     # <string> # echo string upper-cased, without 
 # `config save log LOG`), so derivation belongs in the REPAIR and never in the
 # WRITER. See docs/research/2026-09-17-config-save-bash32.md § 2.
 
-private.config.derive.oosh.mode()     # # the branch $HOME/oosh actually points at: its path relative to the components base (test/macos for a slash branch), the basename when no base is detectable #
+private.config.derive.oosh.mode()     # # the branch $HOME/oosh actually points at, its canonical basename #
 {
   # The same two steps config.validate.required's drift check used inline
   # (and oo:2631-2633 a third time). Now one accessor, so the check and the
@@ -761,22 +725,7 @@ private.config.derive.oosh.mode()     # # the branch $HOME/oosh actually points 
   [ -n "$ooshTarget" ] || return 1
   # A ~/oosh that is not there canonicalises to itself; that is not a branch.
   [ -d "$ooshTarget" ] || return 1
-  # RELATIVE to the components base, not the basename: `oo mode test/macos`
-  # clones to <base>/test/macos and writes OOSH_MODE="test/macos" — the
-  # basename `macos` never agreed with it, so the drift check failed on every
-  # switch and init.env rewrote the per-user file to `macos` (F5). oo is
-  # loaded the documented way; no base → the basename, as before.
-  local base
-  private.this.script.load oo oo.mode.base.get
-  base=$(oo.mode.base.get 2>/dev/null)
-  [ -n "$base" ] && base=$(private.this.path.canonical "$base" 2>/dev/null || echo "$base")
-  case "$base" in
-    "") echo "${ooshTarget##*/}" ;;
-    *)  case "$ooshTarget" in
-          "$base"/*) echo "${ooshTarget#"$base"/}" ;;
-          *) echo "${ooshTarget##*/}" ;;
-        esac ;;
-  esac
+  echo "${ooshTarget##*/}"
 }
 
 private.config.derive.oosh.os()     # # the OS family for this host, via os.check.env #
@@ -800,7 +749,7 @@ private.config.derive.oosh.pm()     # # the package-manager install command for 
   [ -n "$OOSH_PM_BIN" ] && { private.config.pm.command.get "$OOSH_PM_BIN"; return $?; }
 
   # NOT `oo pm.discover`. That verb is not a detector — it runs the platform's
-  # package manager for real (`$SUDO apt-get update`, private.check.all.pm) and then
+  # package manager for real (`$SUDO apt-get update`, oo:3093-3104) and then
   # `config save`, so calling it from here hung a test run on a sudo password
   # prompt and would have re-entered the writer this card deliberately keeps
   # pure. test.suite:895-905 records the same trap being sprung once before.
@@ -819,7 +768,7 @@ private.config.derive.oosh.pm()     # # the package-manager install command for 
 private.config.pm.command.get()     # <packageManagerBinary> # the install command for a package-manager binary #
 {
   # THE THIRD COPY of this table — init/oosh:214-222 has it in POSIX sh for the
-  # bootstrap, and private.check.all.pm has it as arguments to private.check.pm. A
+  # bootstrap, and oo:3093-3101 has it as arguments to private.check.pm. A
   # fourth would be indefensible; even this one is only justified because the
   # other two are unreachable from here (init/oosh self-installs when sourced,
   # and oo's copy is fused to the installer that runs sudo). Carded: one
@@ -851,8 +800,8 @@ private.config.derive.bash.file()     # # the bash interpreter this host should 
 
 private.config.derive.config.file()     # # the name of the config file a shell starts from #
 {
-  # A constant, and deliberately so: config.init and the anchor
-  # header user.env carries both hard-set it, and `config file reset` means "go back to user.env". It is a
+  # A constant, and deliberately so: config.init (config:188) and boot:77 both
+  # hard-set it, and `config file reset` means "go back to user.env". It is a
   # row in the required table because a config without it is broken, not
   # because it is ever in doubt.
   echo "user.env"
@@ -866,434 +815,6 @@ private.config.derive.log.level()     # # the default log level #
   [ -n "$LOG_LEVEL" ] && { echo "$LOG_LEVEL"; return 0; }
   echo "3"
 }
-private.config.bashrc.ensure()     # <targetHome> <sharedOosh> <?stamp:now> # install bashrcTemplate into targetHome unless its .bashrc already sources ~/config/user.env on a live line; backs up whatever it replaces; ensures .bash_profile; run as the target user #
-{
- # The hook is a LIVE line that sources user.env — `. "$HOME/config/user.env"`
- # (bashrcTemplate) or `… && . ~/config/user.env` (the appended fallback).
- # NOT the bare string config/user.env: every template era carries
- # `CONFIG=~/config/user.env` on line 9, so that guard matched a boot-era
- # .bashrc and the heal never replaced its dead `. "$HOME/oosh/boot"` (T86).
- # Same stamp format as config.init.user's `_ts`, so a run that converged the
- # symlinks and re-templated .bashrc leaves ONE timestamp behind, not two.
- local targetHome="$1" sharedOosh="$2" stamp="${3:-$(date +%Y%m%d-%H%M%S)}"
- local bashrc="$targetHome/.bashrc"
- local hook='(^|&&|;)[[:space:]]*(\.|source)[[:space:]]+"?(\$HOME|~)/config/user\.env'
- if ! grep -Eq "$hook" "$bashrc" 2>/dev/null; then
-   # Back up whatever is replaced: the first ever to the one-shot
-   # .bashrc.pre-oosh (the one-shot convention user.oosh.install started), any later one stamped, so a
-   # second re-template cannot silently lose a hand-edited file.
-   if [ -f "$bashrc" ]; then
-     if [ ! -f "$targetHome/.bashrc.pre-oosh" ]; then
-       cp "$bashrc" "$targetHome/.bashrc.pre-oosh"
-     else
-       cp "$bashrc" "$targetHome/.bashrc.orig.$stamp"
-     fi
-   fi
-   if [ -f "$sharedOosh/templates/user/bashrcTemplate" ]; then
-     cp "$sharedOosh/templates/user/bashrcTemplate" "$bashrc"
-   else
-     printf '\n# oosh environment\n[ -f ~/config/user.env ] && . ~/config/user.env\n' >> "$bashrc"
-   fi
-   create.result 0 "re-templated $bashrc"
- else
-   create.result 0 "$bashrc already sources ~/config/user.env"
- fi
- [ -f "$targetHome/.bash_profile" ] || echo '[ -f ~/.bashrc ] && source ~/.bashrc' > "$targetHome/.bash_profile"
- return $(result)
-}
-
-
-private.config.log.env.migrate()     # <?logEnv:$CONFIG_PATH/log.env> # strip the boot-era `. $OOSH_USER_CONFIG_PATH/log.session.env` chain line from the shared log.env (log owns that file now); idempotent; rc 0 when nothing to do #
-{
- # 2e2e6a6 stopped config.save from chaining the PER-USER session file from
- # the SHARED log.env (a missing per-user file in a shared chain line aborts
- # dash outright); `log` creates and sources it itself. Every host installed
- # before that kept the line until its next `config save log LOG`, which
- # nothing routine runs — so the touch-guard in `this` had no exit. This is
- # the exit: config.init.user (which `oo update` runs) calls it. log.env is
- # shared, so one strip per host is enough. T88.
- #
- # `cat > "$f"`, not mv: the shared file keeps its owner/group/mode.
- local f="${1:-$CONFIG_PATH/log.env}" tmp
- if [ ! -f "$f" ]; then
-   create.result 0 "no $f — nothing to migrate"
-   return $(result)
- fi
- if ! grep -qE '^[[:space:]]*(\.|source)[[:space:]]+[^[:space:]]*/log\.session\.env[[:space:]]*$' "$f"; then
-   create.result 0 "$f carries no log.session.env chain line"
-   return $(result)
- fi
- tmp="$f.migrate.$$"
- grep -vE '^[[:space:]]*(\.|source)[[:space:]]+[^[:space:]]*/log\.session\.env[[:space:]]*$' "$f" > "$tmp"
- if [ $? -gt 1 ] || ! cat "$tmp" > "$f"; then
-   rm -f "$tmp"
-   create.result 1 "could not rewrite $f"
-   error.log "private.config.log.env.migrate: $RESULT"
-   return $(result)
- fi
- rm -f "$tmp"
- create.result 0 "stripped the log.session.env chain line from $f"
- return $(result)
-}
-
-
-private.config.chain.files.get()     # <?userEnv:$CONFIG_PATH/user.env> # the env files user.env must load, in order: the files the required manifest names, then every other <name>.env the given user.env already loads whose file exists; one name per line #
-{
- # A getter consumed as $(…): no create.result. config.save used to hard-code
- # `config.add oosh` / `config.add log`, so every full save — and so every
- # config.init.env — silently dropped any file registered with `config add`
- # (odocker.env, from odocker workspace.set), and ODOCKER_WORKSPACES with it.
- # The manifest's files come first and always (config.save writes them); an
- # extra load line survives only when its file exists — a load of a missing
- # file is how a POSIX login shell dies on `. $CONFIG_PATH/<gone>.env`.
- # The manifest list ONCE (it was re-read per candidate), and BOTH spellings
- # config.validate accepts for a load line — `. $CONFIG_PATH/x.env` and the
- # legacy `source $CONFIG_PATH/x.env` — so a file registered the old way is
- # not dropped on the next save (the guard counted 0 → 0 and saw nothing).
- local userEnv="${1:-$CONFIG_PATH/user.env}" name seen=" " manifestFiles
- manifestFiles=" $(private.config.manifest.files.get | tr '\n' ' ') "
- for name in $manifestFiles \
-             $(grep -E '^(source|\.)[[:space:]]+\$CONFIG_PATH/[A-Za-z0-9_.-]+\.env[[:space:]]*$' "$userEnv" 2>/dev/null | sed -E 's|^(source\|\.)[[:space:]]+\$CONFIG_PATH/||; s/[[:space:]]*$//'); do
-   name="${name%.env}"
-   [ "$name" = user ] && continue
-   case "$name" in "~"*) continue ;; esac   # per-user: loaded by the kernel (private.this.user.env.load)
-   case "$seen" in *" $name "*) continue ;; esac
-   seen="$seen$name "
-   case "$manifestFiles" in *" $name "*) echo "$name"; continue ;; esac
-   [ -f "$CONFIG_PATH/$name.env" ] && echo "$name"
- done
-}
-
-
-private.config.version.get()     #  # the config-format version this branch writes into user.env as OOSH_CONFIG_VERSION; bump it whenever the required manifest or the user.env format changes #
-{
- # A getter consumed as $(…): no create.result. The format of the config THIS
- # branch writes — the required manifest plus the user.env head. Another branch
- # version writes another format (testing/prod: no anchors, a boot file; main:
- # absolute paths), and nothing recorded which one a file came from, so a
- # foreign config could not be told from a broken one. Bump this on every
- # change to private.config.required.variables.get or
- # private.config.anchor.lines.get.
- echo 2
-}
-
-
-private.config.derive.odocker.workspaces()     #  # the Docker workspaces root for this host: the value already set, else DockerWorkspaces beside the Once.sh components base (odocker) #
-{
- # One row of private.config.required.variables.get, authority `kept`: a root
- # the user chose (odocker workspace.set / seed) wins, only a missing one is
- # derived — from odocker's own getter, loaded the documented way, so config
- # and odocker cannot disagree about the default.
- [ -n "$ODOCKER_WORKSPACES" ] && { echo "$ODOCKER_WORKSPACES"; return 0; }
- private.this.script.load odocker private.odocker.workspaces.default.get || return 1
- private.odocker.workspaces.default.get
-}
-
-
-config.user.save()     #  # write the per-user env file of the required manifest ($OOSH_USER_CONFIG_PATH/oosh.user.env: OOSH_MODE) from this shell; the shared tier never carries it #
-{
- # The per-user half of config save: every `~<file>` row of the required
- # manifest (today OOSH_MODE), from this shell, into
- # $OOSH_USER_CONFIG_PATH/<file> — pure data, one export line per set value
- # (private.config.variable.export.line). oo mode calls it on every switch.
- local dir="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}" variable file rest userFile
- if ! mkdir -p "$dir" 2>/dev/null; then
-   create.result 1 "config.user.save: cannot create $dir"
-   error.log "$RESULT"
-   return $(result)
- fi
- # Probe BEFORE writing, like config.save: the heredoc redirect below was
- # unchecked, so a per-user file another user owns (root's after
- # `sudo -E config init.full`) failed with a bare "Permission denied" while
- # this method still said 0 — and the stale OOSH_MODE stayed (F6).
- for userFile in $(private.config.required.variables.get | awk '$2 ~ /^~/ && !seen[$2]++ {print $2}'); do
-   if ! { : >> "$dir/${userFile#\~}"; } 2>/dev/null; then
-     create.result 1 "config.user.save: cannot write $dir/${userFile#\~} — check its owner"
-     error.log "$RESULT"
-     return $(result)
-   fi
- done
- for userFile in $(private.config.required.variables.get | awk '$2 ~ /^~/ && !seen[$2]++ {print $2}'); do
-   # Carry forward first: a shell without OOSH_MODE must not empty the file.
-   private.config.required.carry "$userFile" "$dir/${userFile#\~}"
-   while read -r variable file rest; do
-     [ "$file" = "$userFile" ] || continue
-     [ -n "${!variable}" ] && private.config.variable.export.line "$variable"
-   done <<REQUIRED > "$dir/${userFile#\~}"
-$(private.config.required.variables.get)
-REQUIRED
- done
- create.result 0 "per-user config written to $dir"
- return $(result)
-}
-
-
-config.user.save.completion() { :; }
-
-
-config.anchors.init()     #  # set CONFIG_PATH (kept when given, else ~/config), CONFIG_FILE and CONFIG in this shell and create CONFIG_PATH when absent — no check, no repair: the cheap path config.start, config file reset and the this bootstrap use #
-{
-  # The CHEAP half of what config.init used to be, unchanged: config.start,
-  # `config file reset` / `config location reset` and the `this` bootstrap
-  # need the anchors on every call, never a repair (init/oosh runs `this`
-  # during install, as root). `config init` is the user-facing check + repair.
-  #
-  # HONOUR an anchor already set; default to the constant when there is none —
-  # an unconditional export here undid test fixtures from inside the file under
-  # test (T72). private.this.anchor.validate.one counts this shape CONFORMING.
-  # CONFIG_FILE is not an anchor: `config file reset` means "back to user.env".
-  : ${CONFIG_PATH:=~/config}
-  export CONFIG_PATH
-  export CONFIG_FILE=user.env
-
-  if [ ! -d $CONFIG_PATH ]; then
-    mkdir $CONFIG_PATH
-  fi
-  touch $CONFIG_PATH/error.txt
-
-  export CONFIG=$CONFIG_PATH/$CONFIG_FILE
-  debug.log "$CONFIG"
-}
-
-
-config.anchors.init.completion() { :; }
-private.config.healthy()     #  # rc 0 when the config is usable: CONFIG_PATH and user.env exist, ~/config and ~/oosh resolve, and private.config.required.missing.get reports nothing but a version: stamp (reported, never auto-repaired); no writes #
-{
- # A predicate: rc only, no create.result worth keeping, NO writes — it runs on
- # every `config init`, so a healthy config stays fast and untouched (T106).
- [ -d "$CONFIG_PATH" ] || return 1
- [ -f "$CONFIG_PATH/user.env" ] || return 1
- [ -d "${OOSH_DIR:-$HOME/oosh}" ] || return 1              # a dangling ~/oosh is not -d
- [ ! -L "$HOME/config" ] || [ -d "$HOME/config" ] || return 1   # a dangling ~/config
- # Every reason but version: — a stamp of another branch version is reported
- # by config validate required and rewritten only by an explicit config
- # init.env. Acting on it here made two users on different branch versions
- # rewrite the SHARED user.env into their own format on every config init and
- # oo mode (F3); which format the shared tier carries is an operator decision.
- [ -z "$(private.config.required.missing.get | grep -v '^version:')" ]
-}
-
-
-private.config.variable.persistable()     # <variableName> # rc 0 when <variableName> may be persisted to a shared env file — not an anchor, not per user, not install input; the ONE never-persist list, used by config save and by init.env refuse-to-worsen guard #
-{
- # A predicate: rc only. The ONE never-persist list — it was inline in
- # private.config.variables.list, so the refuse-to-worsen guard in
- # config.init.env could not ask it and mistook a migration for damage (T108).
- # Anchors and per-session/per-user values, install input, the version stamp
- # the user.env head writes, and OOSH_MODE, which is per user (T100).
- # docs/config.md's exclusion table and T29's leaker list mirror it.
- case "$1" in
-   *INSTALL*|LOG_NAME|LOG_LIVE|LOG_DEVICE|CONFIG_PATH|OOSH_USER_CONFIG_PATH|CONFIG|OOSH_DIR|OOSH_COMPONENTS_DIR|OOSH_BRANCH|OOSH_CONFIG_VERSION|OOSH_MODE|OOSH_WORKTREE_BASE|SUDO_*|_) return 1 ;;
- esac
- return 0
-}
-
-
-private.config.required.carry()     # <fileKey> <path> # export every required variable of the manifest file <fileKey> that this shell lacks, with the value <path> already holds (evaluated as the pure-data line it is, escapes intact) — the one carry-forward rule of config save and config user.save #
-{
- # One rule, two writers (config.save, config.user.save): a required variable
- # the shell lacks keeps the value its file already had — nothing that was
- # there is thrown away by a shell that simply does not hold it. The line is
- # pure data (config.validate), so it is evaluated in a subshell: the old
- # cut/sed strip kept backslash escapes and changed a quoted value every save.
- local fileKey="$1" path="$2" variable file rest value
- [ -f "$path" ] || return 0
- while read -r variable file rest; do
-   [ "$file" = "$fileKey" ] || continue
-   [ -n "${!variable}" ] && continue
-   value=$(private.config.file.value.get "$path" "$variable")
-   [ -n "$value" ] && export "$variable=$value"
- done <<REQUIRED
-$(private.config.required.variables.get)
-REQUIRED
- return 0
-}
-
-
-private.config.manifest.files.get()     #  # the manifest env files required NOW, one name per line without .env: a file with a derived row always; a file with only kept rows when it exists, a value is set, or one of its derivers answers — so ODOCKER_WORKSPACES does not make a Docker-less host unhealthy #
-{
- # A getter consumed as $(…): no create.result. Used by config.save (which
- # files to write), private.config.chain.files.get (which files user.env must
- # load) and config.validate.required (which rows are required) — one answer.
- # A `derived` row: the host or the checkout is its truth, always required. A
- # file whose rows are all `kept` is a user's choice: required when the file
- # exists, a value is set in this shell, or a deriver answers (F2: on a host
- # with no components base, ODOCKER_WORKSPACES derives nothing — Docker is
- # optional, the shared config is healthy without it).
- local variable file deriver authority name seen=" " required v f d a
- while read -r variable file deriver authority; do
-   [ -z "$variable" ] && continue
-   case "$file" in user.env|"~"*) continue ;; esac
-   name="${file%.env}"
-   case "$seen" in *" $name "*) continue ;; esac
-   seen="$seen$name "
-   required=""
-   [ -f "$CONFIG_PATH/$file" ] && required=1
-   if [ -z "$required" ]; then
-     while read -r v f d a; do
-       [ "$f" = "$file" ] || continue
-       [ "$a" = derived ] && { required=1; break; }
-       [ -n "${!v}" ] && { required=1; break; }
-       [ "$(type -t "$d")" = function ] && [ -n "$("$d" 2>/dev/null)" ] && { required=1; break; }
-     done <<MANIFEST
-$(private.config.required.variables.get)
-MANIFEST
-   fi
-   [ -n "$required" ] && echo "$name"
- done <<MANIFEST
-$(private.config.required.variables.get)
-MANIFEST
- return 0
-}
-
-
-private.config.required.missing.get()     #  # every reason the persisted config is not the one this branch needs, one token per line: <variable>, file:<name>, load:<name>, stale:<v>@<file>, version:<got>(expected:<want>), anchor:<line>, drift:<persisted>|<actual> — empty when complete; the one list config validate required reports and private.config.healthy acts on #
-{
- # A getter consumed as $(…): no create.result. The computation that lived in
- # config.validate.required, moved out so that the report (validate.required)
- # and the decision to REPAIR (private.config.healthy) read one list and can
- # weigh its tokens differently: a version: token is a report for the
- # operator, never a reason to rewrite the shared boot file by itself (F3).
-  local missing="" variable file rest manifestFiles
-  manifestFiles=" $(private.config.manifest.files.get | tr '\n' ' ') "
-  while read -r variable file rest; do
-    [ -z "$variable" ] && continue
-    # A row of an OPTIONAL manifest file (all rows kept, file absent, nothing
-    # to derive — private.config.manifest.files.get) is not missing (F2).
-    case "$file" in user.env|"~"*) ;; *) case "$manifestFiles" in *" ${file%.env} "*) ;; *) continue ;; esac ;; esac
-    local requiredPath="$CONFIG_PATH/$file"
-    case "$file" in "~"*) requiredPath="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/${file#\~}" ;; esac
-    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$requiredPath" 2>/dev/null \
-      || missing="$missing $variable"
-  done <<REQUIRED
-$(private.config.required.variables.get)
-REQUIRED
-
-  # Every env file user.env must load exists and is loaded — a missing
-  # odocker.env or a lost load line is a broken config too.
-  local chainName
-  for chainName in $(private.config.chain.files.get "$CONFIG_PATH/user.env"); do
-    [ -f "$CONFIG_PATH/$chainName.env" ] || missing="$missing file:$chainName.env"
-    grep -qxF ". \$CONFIG_PATH/$chainName.env" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing load:$chainName.env"
-    # A never-persist variable left in a shared file (the legacy OOSH_MODE in
-    # oosh.env, T100) makes the config unhealthy, so config init migrates it.
-    local staleName
-    for staleName in $(sed -n 's/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$CONFIG_PATH/$chainName.env" 2>/dev/null); do
-      private.config.variable.persistable "$staleName" || missing="$missing stale:$staleName@$chainName.env"
-    done
-  done
-
-  # Logic in an env file makes the config unhealthy, so config init rewrites
-  # it: the guarded per-user load line of 2026-09-28 (either form) is the case
-  # in the field. config.validate is the one judge; rc 2 is a missing file,
-  # which the file: tokens above already name.
-  local logicName logicRc
-  for logicName in user $(private.config.chain.files.get "$CONFIG_PATH/user.env"); do
-    config.validate "$CONFIG_PATH/$logicName.env" >/dev/null 2>&1; logicRc=$?
-    [ "$logicRc" -eq 1 ] && missing="$missing logic:$logicName.env"
-  done
-
-  # The config-format stamp: a config written by another branch version is
-  # foreign, not merely incomplete (a missing stamp is caught by the table).
-  local persistedVersion expectedVersion
-  expectedVersion=$(private.config.version.get)
-  persistedVersion=$(grep -m1 -E '^export OOSH_CONFIG_VERSION=' "$CONFIG_PATH/user.env" 2>/dev/null | cut -d= -f2- | tr -d '"')
-  [ -n "$persistedVersion" ] && [ "$persistedVersion" != "$expectedVersion" ] \
-    && missing="$missing version:OOSH_CONFIG_VERSION=$persistedVersion(expected:$expectedVersion)"
-
-  # The boot data: every anchor line the emitter writes must be present verbatim.
-  local anchorLine
-  while IFS= read -r anchorLine; do
-    # path-exception: a READ pattern that matches the emitter's line, not a PATH
-    # assignment — the two host-specific lines are skipped by this check.
-    case "$anchorLine" in 'export BASH_FILE='*|'export PATH="'/*|'export OOSH_CONFIG_VERSION='*) continue ;; esac
-    grep -Fxq "$anchorLine" "$CONFIG_PATH/user.env" 2>/dev/null || missing="$missing anchor:${anchorLine#export }"
-  done <<< "$(private.config.anchor.lines.get "${BASH_FILE:-/bin/bash}")"
-
-  # Branch drift: the persisted OOSH_MODE against the branch ~/oosh actually
-  # points at. This is the T7 bug — persisted prod/released on a dev box, with
-  # nothing in the tree ever comparing the two.
-  local drift="" persistedMode actualMode
-  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/oosh.user.env" 2>/dev/null \
-                  | cut -d= -f2- | tr -d '"')
-  # The SAME accessor the repair uses. This was two inline steps here and two
-  # more at oo:2631-2633; three answers to "which branch is this host on" could
-  # drift apart, and the drift check disagreeing with the repair is the one
-  # disagreement that would be hardest to see.
-  actualMode=$(private.config.derive.oosh.mode 2>/dev/null)
-  if [ -n "$persistedMode" ] && [ -n "$actualMode" ] && [ "$persistedMode" != "$actualMode" ]; then
-    drift="OOSH_MODE=$persistedMode but ~/oosh is on $actualMode"
-  fi
-  local token
-  for token in $missing; do echo "$token"; done
-  [ -n "$persistedMode" ] && [ -n "$actualMode" ] && [ "$persistedMode" != "$actualMode" ] && echo "drift:$persistedMode|$actualMode"
-  return 0
-}
-
-
-private.config.user.mode.save()     #  # write the per-user data file of the user this runs as, from where ~/oosh points: derive OOSH_MODE (private.config.derive.oosh.mode), then config user.save — the step an as-user hop runs for a user who never ran config save #
-{
- # ONE definition for both as-user hops (config.init.user, user.oosh.install).
- # config save writes oosh.user.env only for whoever runs it; the install runs
- # as root, so every other installed user had no file and an empty OOSH_MODE.
- # DERIVED, never the caller's: the hop preamble unsets the caller's OOSH_MODE
- # and OOSH_USER_CONFIG_PATH, and the branch is read from THIS user's ~/oosh.
- local mode
- mode=$(private.config.derive.oosh.mode 2>/dev/null)
- if [ -z "$mode" ]; then
-   create.result 1 "no branch derivable from $HOME/oosh — per-user file not written"
-   return $(result)
- fi
- export OOSH_MODE="$mode"
- config.user.save >/dev/null || return $(result)
- create.result 0 "OOSH_MODE=$mode written for ${USER:-$(id -un)}"
- return $(result)
-}
-
-
-private.config.file.value.get()     # <path> <variable> # echo the value the env file <path> holds for <variable>, evaluated as the pure-data line it is (escapes intact); empty when the file has no such line #
-{
- # A getter consumed as $(…): no create.result. ONE reader for both carry
- # rules. The line is pure data (config.validate), so it is evaluated — in the
- # $( ) subshell, nothing reaches the caller — instead of stripped with
- # cut/sed, which kept backslash escapes and changed a quoted value every save.
- local path="$1" variable="$2" line
- [ -f "$path" ] || return 0
- line=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$path" 2>/dev/null)
- [ -n "$line" ] || return 0
- eval "$line" 2>/dev/null
- printf "%s" "${!variable}"
- return 0
-}
-
-
-private.config.file.carry()     # <path> <?envPrefix> # export every persistable variable the env file <path> holds and this shell lacks — of the family <envPrefix> when given — so a save never drops a value only because the saving shell does not hold it; config unset is how a variable is removed #
-{
- # The GENERAL carry-forward (private.config.required.carry is the manifest
- # one). config save writes what the shell holds; a shell that lacks a
- # variable used to rewrite the file without it, and only MANIFEST variables
- # were protected. So the install shell, which has no LOG_LEVEL_RESET, dropped
- # it from log.env, and config init.env answered "REFUSING — log.env went from
- # 2 to 1 export lines" on every fresh install (tart sequoia VM, 2026-09-29).
- # A never-persist variable is NOT carried: leaving the shared tier is how a
- # migration works (OOSH_MODE, T108). Only the family the save writes is
- # carried, so nothing foreign is exported into the shell. No create.result:
- # it runs inside config.save.
- local path="$1" envPrefix="${2%_}" variable value
- [ -f "$path" ] || return 0
- for variable in $(sed -n "s/^[[:space:]]*export[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p" "$path" 2>/dev/null); do
-   [ -n "${!variable}" ] && continue
-   private.config.variable.persistable "$variable" || continue
-   if [ -n "$envPrefix" ]; then
-     case "$variable" in ${envPrefix}|${envPrefix}_*) ;; *) continue ;; esac
-   fi
-   value=$(private.config.file.value.get "$path" "$variable")
-   [ -n "$value" ] && export "$variable=$value"
- done
- return 0
-}
-
-
 ### new.method
 
 config.usage()
@@ -1329,51 +850,6 @@ config.usage()
   #loop.list PATH print '---------------------: '
 }
 
-private.config.anchor.lines.get() # <?bashFile:$BASH_FILE> # emit the head of user.env: the $HOME-relative anchors, the PATH prepend and BASH_FILE — pure data, one line each
-{
-  # THE boot. Every shell sources these lines (bashrcTemplate, ossh exec, the
-  # platform runners, `this` on a cold start). They are DATA: $HOME expands when
-  # sourced, so one shared user.env is right for every user on the host.
-  # init/oosh duplicates this verbatim (BEGIN/END userEnvSeed) because POSIX sh
-  # cannot call this — the two copies are pinned together by test.install
-  # T-INIT-SEEDS-USER-ENV.
-  local bashFile="${1:-$BASH_FILE}" bashDir=""
-  # oosh-dir-exception: the persisted DATA form of the constant — the value IS
-  # "$HOME/oosh", written unexpanded for the sourcing shell to expand.
-  echo 'export OOSH_DIR="$HOME/oosh"'
-  # config-path-exception: same, for CONFIG_PATH.
-  echo 'export CONFIG_PATH="$HOME/config"'
-  echo 'export CONFIG_FILE="user.env"'
-  echo 'export CONFIG="$CONFIG_PATH/$CONFIG_FILE"'
-  echo 'export OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"'
-  echo "export OOSH_CONFIG_VERSION=\"$(private.config.version.get)\""
-  # path-writer: the ONE sanctioned PATH builder in the tree (path.validate).
-  # Grows by one segment per re-source, because a data line cannot guard
-  # itself; `this` de-duplicates PATH by whole segment on load, so the growth
-  # never reaches a command.
-  echo 'export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"'
-  # Brew bash must beat the /bin/bash that macOS path_helper appends. Host-wide,
-  # so safe in shared config; skipped where bash lives in a default directory.
-  #
-  # Gated on the INPUT, not on dirname's output: dirname NEVER returns empty —
-  # it answers "." for a slash-less or empty argument — so a bad $BASH_FILE
-  # ("bash", "") would emit `export PATH=".:$PATH"` and put the working
-  # directory on the PATH of every login shell on the host (CWE-426, the hole
-  # ticket T8 removed). config.save runs as root during install, so this is the
-  # one arm that must not be permissive. Only an ABSOLUTE path yields a dir.
-  case "$bashFile" in /*) bashDir=$(dirname "$bashFile") ;; esac
-  case "$bashDir" in
-    /bin|/usr/bin|"") ;;
-    # path-writer: the same builder, brew-bash half.
-    *) echo "export PATH=\"$bashDir:\$PATH\"" ;;
-  esac
-  # No BASH_FILE line at all when there is no value: `export BASH_FILE=""`
-  # would satisfy config.validate.required's presence grep and report OK,
-  # hiding the problem. Omitting the line makes it report BASH_FILE missing.
-  [ -n "$bashFile" ] && echo "export BASH_FILE=\"$bashFile\""
-  return 0
-}
-
 config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $CONFIG_PATH containing all env variables that match <ENV_PREFIX>
 # without parameters it inititlises the $CONFIG_PATH/user.env
 {
@@ -1404,20 +880,10 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   fi
 
 
-  # `config save user` would take the prefix USER — the system variable — and
-  # replace the SHARED user.env, every user's boot, with one line.
-  if [ "$file" = "user" ]; then
-    error.log "config.save: user.env is written by a plain ${YELLOW}config save${NORMAL} only (anchors + load lines) — not by config save user"
-    create.result 2 "config save user refused"
-    return $(result)
-  fi
   if [ -n "$file" ]; then
     config.file $file.env
   else
     name="CONFIG"
-    # A plain save writes user.env, whatever file `config file` selected — it
-    # used to truncate that custom file (config file myapp.env; config save).
-    config.file user.env
   fi
   
   stop.log "
@@ -1440,22 +906,18 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   #
   # Read BEFORE the redirect: by the time `>$CONFIG` has run the old values are
   # gone, which is exactly how config.init.env lost OOSH_PM before card 2.
-  private.config.required.carry "$CONFIG_FILE" "$CONFIG"
-  # …and every OTHER variable of this file's family the shell lacks: a save
-  # never drops a value only because the saving shell does not hold it.
-  private.config.file.carry "$CONFIG" "$name"
+  local requiredVariable requiredFile requiredDeriver carriedValue
+  while read -r requiredVariable requiredFile requiredDeriver; do
+    [ -z "$requiredVariable" ] && continue
+    [ "$requiredFile" = "$CONFIG_FILE" ] || continue   # only rows for the file being written
+    [ -n "${!requiredVariable}" ] && continue          # the shell has it; it will be persisted
+    carriedValue=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?${requiredVariable}=" "$CONFIG" 2>/dev/null \
+                   | cut -d= -f2- | sed 's/^"//; s/"$//')
+    [ -n "$carriedValue" ] && export "$requiredVariable=$carriedValue"
+  done <<REQUIRED
+$(private.config.required.variables.get)
+REQUIRED
 
-  # The env files user.env loads, read NOW: the export block below truncates
-  # $CONFIG, and for a no-argument save that is user.env itself.
-  local chainFiles=""
-  [ -z "$file" ] && chainFiles=$(private.config.chain.files.get "$CONFIG_PATH/user.env")
-  # A file config save cannot write fails HERE, naming it — the redirect below
-  # used to fail with a bare "Permission denied" and config save still said 0.
-  if ! { : >> "$CONFIG"; } 2>/dev/null; then
-    error.log "config.save: cannot write $CONFIG — check its owner and group-write"
-    create.result 1 "cannot write $CONFIG"
-    return $(result)
-  fi
   RESULT=""
   {
     # The harvesting loop that used to live here is now
@@ -1475,36 +937,26 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # a single debug.log would be written into the generated env file.
     private.config.variables.export "$name"
   } >$CONFIG
-  # Reported AFTER the redirect (inside it, a log line would land in the file):
-  # a value bash can only render as $'…' — tab, newline, control characters —
-  # is not pure data, so it was skipped, and nobody was told.
-  if [ -n "$file" ]; then
-    local droppedName dropped=""
-    for droppedName in $(private.config.variables.list "$name"); do
-      private.config.variable.export.line "$droppedName" >/dev/null 2>&1 || dropped="$dropped $droppedName"
-    done
-    # error.log, not warn.log: a value that goes missing is data loss, and warn.log
-    # is silent at LOG_LEVEL 1 — the level most shells and the test suite run at.
-    [ -n "$dropped" ] && error.log "config.save: not persisted (a newline or control character in the value):$dropped"
-  fi
   private.ensure.groupWrite "$CONFIG"
 
   if [ -z "$file" ]; then
     #problem.log "regenerate config"
 
     important.log "generating $CONFIG"
-    # user.env IS the boot: private.config.anchor.lines.get writes the anchors,
-    # the PATH prepend and BASH_FILE as data, then config.add appends the source
-    # chain. No loader stands between a shell and this file.
-    #
-    # $CONFIG_PATH/user.env, NOT $CONFIG. With a non-default CONFIG_FILE (say
-    # `config file myapp.env` then `config save`) $CONFIG points elsewhere,
-    # while `config.file user.env` below resets it before config.add appends
-    # the chain — so the anchors landed in myapp.env and user.env was left
-    # holding two source lines and nothing to anchor them. Once boot is gone
-    # that file is unbootable. The anchors belong to user.env by definition.
+    # user.env holds only PORTABLE config values (BASH_FILE = per-host bash;
+    # CONFIG_FILE) followed by the source chain, so `config list` (cat user.env)
+    # shows a meaningful config and sourcing user.env stands up the whole
+    # environment. The per-user / volatile anchors (OOSH_DIR, CONFIG_PATH,
+    # CONFIG, PATH) are deliberately NOT persisted — $OOSH_DIR/boot computes them
+    # fresh at every shell init (correct per-user, robust to a moved config, no
+    # cross-user leak). boot sets CONFIG_PATH BEFORE sourcing user.env, so the
+    # appended `source $CONFIG_PATH/*.env` chain resolves. oosh.env / log.env
+    # stay single-purpose (OOSH_* / LOG_*), no chaining of their own.
     [ -z "$BASH_FILE" ] && BASH_FILE=$(command -v bash)
-    private.config.anchor.lines.get "$BASH_FILE" > "$CONFIG_PATH/user.env"
+    {
+      echo "export BASH_FILE=\"$BASH_FILE\""
+      echo "export CONFIG_FILE=\"$CONFIG_FILE\""
+    } >$CONFIG
 
 
     ### HACK should be in log.init only. but is needed for ssh remote logging
@@ -1512,24 +964,20 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     ###
 
 
-    # Every env file the required manifest names (oosh, log, odocker, …), each
-    # with its own prefix — no longer a hard-coded oosh + log.
-    local manifestFile
-    for manifestFile in $(private.config.manifest.files.get); do
-      config.save "$manifestFile" "$(private.config.string.upper "$manifestFile")"
-    done
+    config.save oosh OOSH   # pure `export OOSH_*` lines
+    config.save log LOG     # pure `export LOG_*` lines
+    # log.env chains the PER-USER session file (LOG_NAME/LOG_DEVICE/LOG_LIVE live
+    # there — see $OOSH_USER_CONFIG_PATH). Written with the var UNEXPANDED (single
+    # quotes), like user.env's `source $CONFIG_PATH/*.env`, so each user loads
+    # their OWN file — no cross-user leak. This both makes `config list log` show
+    # the session and LOADS the saved per-user values at shell init. boot
+    # touch-guards the file so a first-ever shell has no missing-source error.
+    # Appended here (not via config.add, which hardcodes $CONFIG_PATH).
+    # POSIX `.` (not `source`) so boot parses under dash/ash — see config.add.
+    echo '. $OOSH_USER_CONFIG_PATH/log.session.env' >> "$CONFIG_PATH/log.env"
     config.file user.env
-    # One load line per env file user.env must load — the manifest's, then the
-    # ones it already loaded (private.config.chain.files.get, read before this
-    # save truncated user.env). No longer a hard-coded oosh + log.
-    local chainFile
-    for chainFile in $chainFiles; do
-      config.add "$chainFile"
-    done
-    # The per-user file (OOSH_MODE) is WRITTEN here and LOADED by the kernel
-    # (private.this.user.env.load) — user.env gets no line for it: a guarded
-    # load is logic, and an env file is pure data.
-    config.user.save >/dev/null
+    config.add oosh OOSH    # appends: source $CONFIG_PATH/oosh.env
+    config.add log LOG      # appends: source $CONFIG_PATH/log.env
 
     # Guard: user.env may hold export/comment/blank + `source *.env` chaining
     # (composition, NOT logic); oosh.env / log.env must be pure. config.validate
@@ -1556,20 +1004,12 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # a non-zero rc here is already more than any caller acts on today (audited
     # 2026-09-17 — nothing branches on it; private.check.pm is the only place it
     # could propagate and oo.pm.discover masks it with `RETURN=$1`).
-    # EVERY file user.env loads (odocker.env, any `config add` file), not only
-    # user/oosh/log. rc 2 from config.validate is a missing file, not logic.
-    local _envName _invalid="" _missing="" _rc
-    for _envName in user $(private.config.chain.files.get "$CONFIG_PATH/user.env"); do
-      config.validate "$_envName" >/dev/null 2>&1; _rc=$?
-      [ "$_rc" -eq 1 ] && _invalid="$_invalid $_envName"
-      [ "$_rc" -eq 2 ] && _missing="$_missing $_envName"
+    local _envName _invalid=""
+    for _envName in user oosh log; do
+      config.validate "$_envName" >/dev/null 2>&1 || _invalid="$_invalid $_envName"
     done
     if [ -n "$_invalid" ]; then
       echo "INVALID: config.save wrote$_invalid with logic in it — run 'config validate <name>' to see why" >&2
-      configSaveRc=1
-    fi
-    if [ -n "$_missing" ]; then
-      echo "INVALID: user.env loads$_missing but the file does not exist" >&2
       configSaveRc=1
     fi
     # if [ -x "$(command -v once)" ]; then
@@ -1577,11 +1017,6 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
     # fi
   fi
   config.info.log
-  # A named save validates the file it wrote — it used to always return 0.
-  if [ -n "$file" ] && ! config.validate "$CONFIG" >/dev/null 2>&1; then
-    echo "INVALID: config.save wrote $CONFIG with logic in it — run 'config validate $file' to see why" >&2
-    configSaveRc=1
-  fi
   return $configSaveRc
 }
 
@@ -1610,12 +1045,11 @@ config.validate() # <?name:user> # verify an env file is PURE DATA (only export/
     # Reject command substitution / backticks ANYWHERE (even inside a value):
     # they EXECUTE when the file is sourced, so they are logic, never pure data.
     # `export FOO="$(echo hi)"` used to pass (the export regex only anchored to `=`).
-    # Only a LIVE substitution: `\$(` is data (config save writes `$(` that way);
-    # an EVEN number of backslashes before `$(` or a backtick leaves it live.
-    if printf '%s\n' "$line" | grep -qE '(^|[^\\])(\\\\)*(\$\(|`)'; then
-      error.log "config.validate: $f:$lineNum contains command substitution (not pure data): $line"
-      violations=$((violations + 1)); continue
-    fi
+    case "$line" in
+      *'$('* | *'`'*)
+        error.log "config.validate: $f:$lineNum contains command substitution (not pure data): $line"
+        violations=$((violations + 1)); continue ;;
+    esac
     # allow: `export IDENT=…`, `export declare IDENT=…` (legacy), bare `IDENT=…`
     if echo "$trimmed" | grep -qE '^(export[[:space:]]+(declare[[:space:]]+)?)?[A-Za-z_][A-Za-z0-9_]*='; then
       continue
@@ -1625,14 +1059,11 @@ config.validate() # <?name:user> # verify an env file is PURE DATA (only export/
     if echo "$trimmed" | grep -qE '^(source|\.)[[:space:]]+[^[:space:]]*\.env[[:space:]]*$'; then
       continue
     fi
-    # NO exception. A guarded per-user load was allowed here for a day
-    # (2026-09-28) — and so a test plus a conditional source sat in the shared
-    # user.env with the validator's blessing.
     error.log "config.validate: $f:$lineNum is not pure data: $line"
     violations=$((violations + 1))
   done < "$f"
   if [ "$violations" -gt 0 ]; then
-    error.log "config.validate: $f has $violations violation(s) — env files must contain only export/comment/blank lines; the bootstrap anchors are emitted into user.env by config.save, they are not hand-written logic"
+    error.log "config.validate: $f has $violations violation(s) — env files must contain only export/comment/blank lines (logic belongs in $OOSH_DIR/boot)"
     echo "INVALID: $f — $violations violation(s) (logic in an env file)"
     return 1
   fi
@@ -1640,9 +1071,9 @@ config.validate() # <?name:user> # verify an env file is PURE DATA (only export/
   return 0
 }
 
-config.validate.completion.name() { echo user; private.config.chain.files.get; }
+config.validate.completion.name() { echo "user oosh log"; }
 
-private.config.required.variables.get() # # the variables a config must carry for a branch version: "<variable> <file> <deriverFunction> <authority>", one per line; authority derived = always re-derived, kept = re-derived only when missing
+private.config.required.variables.get() # # the variables a config must carry for a branch version: "<variable> <file> <deriverFunction>", one per line
 {
   # NO create.result — a getter consumed as $(...), which runs in a subshell.
   # Same reasoning as private.config.file.resolve.
@@ -1656,14 +1087,12 @@ private.config.required.variables.get() # # the variables a config must carry fo
   # OOSH_BRANCH is deliberately absent: it is install INPUT, excluded from
   # persistence since T7, and a config that carried it would be the bug.
   cat <<'REQUIRED'
-BASH_FILE user.env private.config.derive.bash.file derived
-CONFIG_FILE user.env private.config.derive.config.file derived
-OOSH_CONFIG_VERSION user.env private.config.version.get derived
-OOSH_MODE ~oosh.user.env private.config.derive.oosh.mode derived
-OOSH_OS oosh.env private.config.derive.oosh.os derived
-OOSH_PM oosh.env private.config.derive.oosh.pm kept
-LOG_LEVEL log.env private.config.derive.log.level kept
-ODOCKER_WORKSPACES odocker.env private.config.derive.odocker.workspaces kept
+BASH_FILE user.env private.config.derive.bash.file
+CONFIG_FILE user.env private.config.derive.config.file
+OOSH_MODE oosh.env private.config.derive.oosh.mode
+OOSH_OS oosh.env private.config.derive.oosh.os
+OOSH_PM oosh.env private.config.derive.oosh.pm
+LOG_LEVEL log.env private.config.derive.log.level
 REQUIRED
 }
 
@@ -1675,16 +1104,29 @@ config.validate.required() # # verify the persisted config carries every variabl
   # internal caller in config.save are untouched. (Before this existed,
   # `config validate required` silently resolved to a non-existent
   # required.env and returned 2.)
-  # The reasons come from private.config.required.missing.get — the one list
-  # this report and private.config.healthy share; this method only formats it.
-  local tokens missing="" drift="" token
-  tokens=$(private.config.required.missing.get)
-  for token in $tokens; do
-    case "$token" in
-      drift:*) token="${token#drift:}"; drift="OOSH_MODE=${token%%|*} but ~/oosh is on ${token#*|}" ;;
-      *) missing="$missing $token" ;;
-    esac
-  done
+  local missing="" variable file rest
+  while read -r variable file rest; do
+    [ -z "$variable" ] && continue
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$CONFIG_PATH/$file" 2>/dev/null \
+      || missing="$missing $variable"
+  done <<REQUIRED
+$(private.config.required.variables.get)
+REQUIRED
+
+  # Branch drift: the persisted OOSH_MODE against the branch ~/oosh actually
+  # points at. This is the T7 bug — persisted prod/released on a dev box, with
+  # nothing in the tree ever comparing the two.
+  local drift="" persistedMode actualMode
+  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$CONFIG_PATH/oosh.env" 2>/dev/null \
+                  | cut -d= -f2- | tr -d '"')
+  # The SAME accessor the repair uses. This was two inline steps here and two
+  # more at oo:2631-2633; three answers to "which branch is this host on" could
+  # drift apart, and the drift check disagreeing with the repair is the one
+  # disagreement that would be hardest to see.
+  actualMode=$(private.config.derive.oosh.mode 2>/dev/null)
+  if [ -n "$persistedMode" ] && [ -n "$actualMode" ] && [ "$persistedMode" != "$actualMode" ]; then
+    drift="OOSH_MODE=$persistedMode but ~/oosh is on $actualMode"
+  fi
 
   # Status-output idiom: the verdict goes to stdout so it survives any
   # LOG_LEVEL or LOG_DEVICE, exactly as config.validate does.
@@ -1694,7 +1136,7 @@ config.validate.required() # # verify the persisted config carries every variabl
     [ -n "$drift" ] && reason="${reason:+$reason; }$drift"
     create.result 1 "INCOMPLETE: $CONFIG_PATH — $reason"
     echo "$RESULT"
-    echo "  repair with: config init   (checks, then repairs with config init.full)"
+    echo "  repair with: config init.env   (regenerates user.env + oosh.env + log.env)"
     return $(result)
   fi
   create.result 0 "OK: $CONFIG_PATH carries every required variable and agrees with the checkout"
@@ -1783,8 +1225,7 @@ config.clean() #  # reinitalises a clean config and removes any custom addons
   # Order-preserving de-dup (drop duplicate lines, keep first occurrence).
   # Kept order-preserving rather than `sort -u` as a matter of hygiene — env
   # files are now pure `export K="V"` data (no bootstrap header to protect;
-  # config.save emits the anchor header into user.env), so order is no
-  # longer load-bearing,
+  # that logic moved to $OOSH_DIR/boot), so order is no longer load-bearing,
   # but there's no reason to alphabetically shuffle a user's config either.
   awk '!seen[$0]++' "$CONFIG" >"$CONFIG_PATH/$CONFIG_FILE.clean"
   rm $CONFIG_PATH/$CONFIG_FILE
@@ -1822,9 +1263,9 @@ config.add() # <name:$CONFIG> # adds the config <name> into the user.env permane
   console.log "
   config.add [file:$file] [name:$name] to $CONFIG"
   {
-    # POSIX `.` not bash `source` — env files are sourced directly by every
-    # shell, which must parse under dash/ash (/bin/sh login shells, `ossh exec`
-    # on Debian). `source` is a bashism (dash: "source: not found").
+    # POSIX `.` not bash `source` — env files are sourced by $OOSH_DIR/boot,
+    # which must parse under dash/ash (/bin/sh login shells, `ossh exec` on
+    # Debian). `source` is a bashism (dash: "source: not found").
     echo . \$CONFIG_PATH/$file.env
   } >>$CONFIG
   config.clean
@@ -1854,7 +1295,7 @@ config.file() # <configfile> # sets the default config file to <configfile> if i
   else
     case "$1" in
       reset)
-        config.anchors.init
+        config.init
         echo "CONFIG_PATH=$CONFIG_PATH"
         echo "CONFIG_FILE=$CONFIG_FILE"
         echo
@@ -1877,7 +1318,7 @@ config.location() # <configfile> # sets the default config location to <configfi
   else
     case "$1" in
       reset)
-        config.anchors.init
+        config.init
         echo "CONFIG_PATH=$CONFIG_PATH"
         echo "CONFIG_FILE=$CONFIG_FILE"
         echo
@@ -1920,6 +1361,40 @@ config.parameter.completion.name() {
 config.parameter.completion.sshConfigName() {
   source ossh 2>/dev/null
   ossh.parameter.completion.sshConfigHost "$@"
+}
+
+function config.path.create() # <pathString> # (internal deprecated) creates respective paths
+{
+    debug.log " function ${FUNCNAME[0]}($1) $@"
+
+    if [[ "$1" = /* ]]; then
+        cd "/"
+    fi
+
+    path=""
+    info.log "creating path in $(pwd): $1"
+
+    for current in ${1//// }; do
+
+        if [ -z "$path" ]; then
+            path=$current
+        else
+            path=$path/$current
+        fi
+        debug.log "checking path: $path"
+
+        config.folder.create $path
+    done
+}
+
+function config.folder.create() # <folderName> # (internal deprecated) creates respective directory requested in parameter 
+{
+
+    local current=$1
+    if [ ! -d $current ]; then
+        debug.log "$current does not exist: creating it..."
+        mkdir -p $current
+    fi
 }
 
 config.ssh.host.set() # <sshConfigName> # configures the PROMPT and the name of this host for ssh config
@@ -1968,37 +1443,22 @@ config.set() # <envVariable> <value> # adds or sets an environment variable to t
   if [ -n "$value" ]; then
       shift
   fi
-  # The line is rendered by private.config.variable.export.line — the quoting
-  # config save uses — and swapped in by awk (ENVIRON, the whole line by name):
-  # sed broke on | & \ and never escaped " $ `. Also normalises the legacy
-  # "export declare X=" form, and leaves one line per variable.
-  local newLine
-  if ! newLine=$(export "$envVariable=$value"; private.config.variable.export.line "$envVariable"); then
-    error.log "config.set: $envVariable cannot be written as pure data (a newline or control character in the value)"
-    return 1
-  fi
+
+  # Matches both "export X=..." and the legacy malformed "export declare X=..." form.
   local currentDefinition="$( grep -E "^export( declare)? ${envVariable}=" "$CONFIG" 2>/dev/null )"
-  if [ -n "$currentDefinition" ] && [ -z "$value" ]; then
-    warn.log "set blank value on
+  if [ -n "$currentDefinition" ]; then
+    if [ -z "$value" ]; then
+      warn.log "set blank value on
       $currentDefinition
 
       "
+    fi
+    local tmpFile="${CONFIG}.tmp.$$"
+    # Replace the whole line (any form) with the clean "export X=value" form — normalizes on update.
+    sed -E "s|^export( declare)? ${envVariable}=.*|export ${envVariable}=\"${value}\"|" "$CONFIG" > "$tmpFile" && mv "$tmpFile" "$CONFIG"
+  else
+    echo "export $envVariable=\"$value\"" >>$CONFIG
   fi
-  [ -f "$CONFIG" ] || : > "$CONFIG"
-  local tmpFile="${CONFIG}.tmp.$$"
-  if ! CONFIG_SET_NAME="$envVariable" CONFIG_SET_LINE="$newLine" awk '
-         BEGIN { n = ENVIRON["CONFIG_SET_NAME"]; l = ENVIRON["CONFIG_SET_LINE"]; done = 0 }
-         $0 ~ ("^export( declare)? " n "=") { if (!done) print l; done = 1; next }
-         { print }
-         END { if (!done) print l }' "$CONFIG" > "$tmpFile"; then
-    rm -f "$tmpFile"
-    error.log "config.set: could not rewrite $CONFIG"
-    return 1
-  fi
-  # In place: a shared or symlinked file keeps its identity and group-write.
-  cat "$tmpFile" > "$CONFIG"
-  rm -f "$tmpFile"
-  private.ensure.groupWrite "$CONFIG"
 }
 
 
@@ -2014,20 +1474,10 @@ config.unset() # <envVariable> # removes <envVariable> from the current $CONFIG 
 
   [ ! -f "$CONFIG" ] && return 0
 
-  if grep -qE "^export( declare)? $envVariable=" "$CONFIG" 2>/dev/null; then
-    local tmpFile="${CONFIG}.tmp.$$" rc
-    # grep -v exits 1 when it removed EVERY line — a success here; only rc 2 is
-    # an error. Written back IN PLACE, so a shared or symlinked file keeps its
-    # identity and group-write.
-    grep -vE "^export( declare)? $envVariable=" "$CONFIG" > "$tmpFile"; rc=$?
-    if [ "$rc" -le 1 ]; then
-      cat "$tmpFile" > "$CONFIG"
-      private.ensure.groupWrite "$CONFIG"
-      debug.log "config.unset: removed $envVariable from $CONFIG"
-    else
-      error.log "config.unset: could not rewrite $CONFIG"
-    fi
-    rm -f "$tmpFile"
+  if grep -q "^export $envVariable=" "$CONFIG" 2>/dev/null; then
+    local tmpFile="${CONFIG}.tmp.$$"
+    grep -v "^export $envVariable=" "$CONFIG" > "$tmpFile" && mv "$tmpFile" "$CONFIG"
+    debug.log "config.unset: removed $envVariable from $CONFIG"
   fi
 }
 
@@ -2039,7 +1489,7 @@ config.discover() # # lists the existing config files and where they are
 }
 
 
-config.start() # <method> <parameter> # default start and parameter processing
+function config.start() # <method> <parameter> # default start and parameter processing
 {
   #echo "sourcing init"
   COMMANDS="$@"
@@ -2047,7 +1497,7 @@ config.start() # <method> <parameter> # default start and parameter processing
   #check.debug.level 6
 
   if [ -z "$CONFIG_PATH" ] || ! [ -f "$CONFIG" ]; then
-      config.anchors.init
+      config.init
   fi
   if [ "$(type -t this.start)" = "function" ]; then
     this.start "$@"

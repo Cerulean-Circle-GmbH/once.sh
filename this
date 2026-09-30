@@ -36,62 +36,17 @@ if [ "$EXPECTED_RETURN_VALUE" -lt 1 ]; then
   export EXPECTED_RETURN_VALUE=1
 fi
 
-# The reconfigure exit code, a constant like the ones above. It used to be set
-# only by this.init's first-init arm, which the cold start below now skips in
-# almost every context — and it was already empty in a live login shell, because
-# bashrcTemplate:9 sets CONFIG above the non-interactive early return. That left
-# bashrcTemplate's own reconfigure() doing `exit $ERROR_CODE_RECONFIG` with an
-# empty value, i.e. exiting 0: a silent no-op on the interactive reconfigure
-# path. `fix` already self-heals the same 117 when it finds it unset.
-if [ -z "$ERROR_CODE_RECONFIG" ]; then
-  export ERROR_CODE_RECONFIG=117
-fi
 
-
-# The anchors, the env chain and the PATH prepend are DATA in ~/config/user.env
-# (config.save writes them, init/oosh seeds them). A context that never sourced
-# it — a bare `source this`, an ssh command without bashrc, a mid-install
-# sub-shell — loads it here, once, before anything else. Same gate as this.init
-# and ossh.start: CONFIG set means someone already stood the environment up
-# (or a test isolated it — never override that). The gate stays `-z`, and a
-# STALE $CONFIG (set, but the file is gone) is deliberately NOT recovered here:
-# widening the gate to `[ ! -f "$CONFIG" ]` would re-source the real user.env
-# underneath a test that isolated CONFIG at a fixture it had already deleted,
-# weakening exactly the isolation T74c exists to protect.
-if [ -z "$CONFIG" ] && [ -f "$HOME/config/user.env" ]; then
-  # config-path-exception: defaults BEFORE the source — a pre-migration user.env
-  # has no anchors of its own and its `. $CONFIG_PATH/oosh.env` chain needs them.
-  : ${CONFIG_PATH:=$HOME/config}
-  : ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}
-  export CONFIG_PATH OOSH_USER_CONFIG_PATH
-  # Migration-window guard (carried over from the deleted boot loader). A
-  # boot-era log.env ends in `. $OOSH_USER_CONFIG_PATH/log.session.env`, and a
-  # missing file there aborts dash outright — so the very first cold shell of a
-  # fresh user (the `os platform.test` per-user runners, mid-install sub-shells)
-  # needs the file to exist before the chain runs. `config.save` no longer
-  # WRITES that line and `log` owns the file now; already-installed hosts lose
-  # the line when `oo update` → config.init.user → private.config.log.env.migrate
-  # runs (T88). REMOVE this guard once every host has updated — tracked as T10
-  # in docs/plans/2026-09-10-oosh-boot-tickets.md.
-  [ -f "$OOSH_USER_CONFIG_PATH/log.session.env" ] || {
-    mkdir -p "$OOSH_USER_CONFIG_PATH" 2>/dev/null
-    : > "$OOSH_USER_CONFIG_PATH/log.session.env" 2>/dev/null
-  }
-  . "$HOME/config/user.env"
-  : ${CONFIG:=$CONFIG_PATH/${CONFIG_FILE:-user.env}}
-  export CONFIG
-fi
-# oosh-dir-exception: the last-resort fallback when no user.env exists yet
-# (mid-install, before init/oosh seeded it): the same literal constant, never a
-# BASH_SOURCE/$0 walk, never a resolved physical path.
-# path-exception: the same fallback — without $OOSH_DIR on PATH nothing resolves.
+# OOSH_DIR is ALWAYS ~/oosh — a constant, set by $OOSH_DIR/boot (the single
+# setter, see docs/boot.md). This is only a fallback for contexts that never
+# sourced boot (a bare `source this`, a mid-install sub-shell): same literal
+# value, never a BASH_SOURCE/$0 walk, never a resolved physical path.
+# path-exception: the same fallback, one line down — without $OOSH_DIR on PATH
+# nothing in oosh resolves, and boot has not run in these contexts.
 if [ -z "$OOSH_DIR" ]; then
-  export OOSH_DIR="$HOME/oosh"
-  PATH="$OOSH_DIR:$OOSH_DIR/ng:$PATH"
+  OOSH_DIR="$HOME/oosh"
+  PATH="$OOSH_DIR:$PATH"
 fi
-
-# PATH de-duplication happens once per `source this`, at the bottom of this
-# file (private.this.path.dedup, which has to be defined before it can run).
 
 # Ensure $SUDO is set for ALL oosh contexts. bashrcTemplate exports it
 # for interactive shells, but ssh-with-command (e.g. ossh exec.tty) on
@@ -130,15 +85,7 @@ private.log.install.append() # <prefix> <messageBody> # idempotent guarded appen
 info.log() {
   private.log.install.append "INFO" "$*"
   if [ "$LOG_LEVEL" -gt "3" ]; then
-    # The rule of log's private.log.emit, inlined — this is the kernel and runs
-    # before log is loaded: a terminal-type device is fd2 by dup (never a
-    # reopen, never fd1), a file is appended, an unwritable one falls back to fd2.
-    case "${LOG_DEVICE:-}" in
-      ""|/dev/stdout|/dev/stderr|/proc/self/fd/1|/dev/fd/1|/proc/self/fd/2|/dev/fd/2|/dev/tty)
-        echo -e "\e[90mINFO> $*\e[0m" >&2 ;;
-      *)
-        { echo -e "\e[90mINFO> $*\e[0m" >>"$LOG_DEVICE"; } 2>/dev/null || echo -e "\e[90mINFO> $*\e[0m" >&2 ;;
-    esac
+    echo -e "\e[90mINFO> $*\e[0m" >>$LOG_DEVICE ## normal
   fi
 }
 
@@ -234,7 +181,6 @@ private.this.path.canonical() { # <path> # echo canonical absolute path; portabl
 
 private.this.anchor.validate.one() # <anchor> <leaf> <treeRoot> # scan <treeRoot> for assignments of <anchor>; echo the verdict; rc 0 clean / 1 violations
 {
-  private.this.script.load ogit ogit.branch.get
   # ONE scan of the tracked tree (git grep = a single process, and it honours
   # .gitignore). Excluded on purpose: docs/ (prose about the rule), test/
   # (fixtures legitimately point an anchor at a fixture dir), .claude/ and
@@ -252,8 +198,8 @@ private.this.anchor.validate.one() # <anchor> <leaf> <treeRoot> # scan <treeRoot
   slug="${slug//_/-}"
 
   local matches
-  matches=$(ogit.repo.grep "(export[[:space:]]+${anchor}=|^[[:space:]]*${anchor}=|\\\$\\{${anchor}:=)" "$treeRoot" \
-              ':!docs' ':!test' ':!.claude' ':!*.md' ':!*.json')
+  matches=$(git -C "$treeRoot" grep -nE "(export[[:space:]]+${anchor}=|^[[:space:]]*${anchor}=|\\\$\\{${anchor}:=)" -- \
+              ':!docs' ':!test' ':!.claude' ':!*.md' ':!*.json' 2>/dev/null)
 
   local conforming=0 exceptions=0 violations=0
   local match file lineNo content trimmed prevLine windowFrom
@@ -314,7 +260,7 @@ private.this.anchor.validate.one() # <anchor> <leaf> <treeRoot> # scan <treeRoot
   done <<< "$matches"
 
   if [ "$violations" -gt 0 ]; then
-    error.log "this.anchor.validate: $anchor — $violations violation(s); it is always \$HOME/$leaf (see ${YELLOW}docs/oosh-architecture.md${NORMAL}). Resolve physical paths at point of use with private.this.path.canonical, or mark a genuine exception with '# ${slug}-exception: <reason>'"
+    error.log "this.anchor.validate: $anchor — $violations violation(s); it is always \$HOME/$leaf (see ${YELLOW}docs/boot.md${NORMAL}). Resolve physical paths at point of use with private.this.path.canonical, or mark a genuine exception with '# ${slug}-exception: <reason>'"
     echo "INVALID: $anchor in $treeRoot — $violations violation(s), $conforming conforming, $exceptions exception(s)"
     return 1
   fi
@@ -324,9 +270,8 @@ private.this.anchor.validate.one() # <anchor> <leaf> <treeRoot> # scan <treeRoot
 
 this.anchor.validate() # <?anchor:all> <?treeRoot:$OOSH_DIR> # verify every assignment of a path anchor (all|OOSH_DIR|CONFIG_PATH) in the tree is its ~/… constant; rc 1 + report on any violation
 {
-  # THE RULE (docs/oosh-architecture.md § The anchors are data): the per-user
-  # path anchors are ALWAYS the symlink in the user's home — OOSH_DIR is
-  # ~/oosh, CONFIG_PATH is ~/config — written
+  # THE RULE (docs/boot.md): the per-user path anchors are ALWAYS the symlink
+  # in the user's home — OOSH_DIR is ~/oosh, CONFIG_PATH is ~/config — written
   # "$HOME/…" because a quoted tilde does not expand. They are therefore
   # CONSTANTS: switching branches or re-pointing the shared tree moves only what
   # the symlink points AT. Code that needs the PHYSICAL directory resolves it at
@@ -625,17 +570,14 @@ this.init() {
   # reference $OOSH_USER_CONFIG_PATH rather than re-spelling the path.
   : ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}
   export OOSH_USER_CONFIG_PATH
-  # The per-user data (OOSH_MODE) — loaded by the kernel, never by user.env.
-  private.this.user.env.load
   if [ -n "$CONFIG" ]; then
     info.log "inititlized"
     if [ -f "$CONFIG" ]; then
       if ! (this.isSourced); then
         # Preserve current PATH and LOG_LIVE — config may contain stale
         # values from a different user or install phase (e.g. root's PATH
-        # saved during install; a stale LOG_LIVE). PATH comes from user.env's
-        # data line and is de-duplicated at the top of this file (and grown by
-        # this.path.add); LOG_LIVE is re-anchored to the
+        # saved during install; a stale LOG_LIVE). PATH is built dynamically
+        # by $OOSH_DIR/boot and this.path.add; LOG_LIVE is re-anchored to the
         # current user's $OOSH_USER_CONFIG_PATH by log's top-level each shell
         # — same anchor must hold across mid-session $CONFIG re-sources or
         # console.log starts writing to another user's directory and hits
@@ -643,21 +585,11 @@ this.init() {
         # (Write-side complement: config.save filters LOG_LIVE out of the
         # shared log.env so the value never gets persisted in the first place.)
         # path-exception: SAVE AND RESTORE across a mid-session `source "$CONFIG"`,
-        # not a write — the value put back is the one that was there. The four
-        # anchors are restored too: user.env now carries them as $HOME-relative
-        # data, and a test that isolated CONFIG_PATH must not be repointed at
-        # the real shared tier by this re-source.
+        # not a write — the value put back is the one that was there.
         local _savedPath="$PATH" _savedLogLive="$LOG_LIVE"
-        local _savedConfigPath="$CONFIG_PATH" _savedConfig="$CONFIG" _savedConfigFile="$CONFIG_FILE" _savedUserCfg="$OOSH_USER_CONFIG_PATH"
         source "$CONFIG"
-        # path-exception: the RESTORE half of the save above, not a write.
         export PATH="$_savedPath"
         [ -n "$_savedLogLive" ] && export LOG_LIVE="$_savedLogLive"
-        # config-path-exception: the RESTORE half of the save two lines up — the
-        # value put back is the one that was already there, never a new path.
-        # No `[ -n … ] &&` guard on OOSH_USER_CONFIG_PATH: this.init defaults it
-        # a few lines above, so it can never be empty by the time we get here.
-        export CONFIG_PATH="$_savedConfigPath" CONFIG="$_savedConfig" CONFIG_FILE="$_savedConfigFile" OOSH_USER_CONFIG_PATH="$_savedUserCfg"
       fi
     fi
     return 0
@@ -696,12 +628,12 @@ this.init() {
   fi
   if [ -z "$OOSH_PROMPT" ]; then
     export OOSH_STATUS="0: started in shell level: $shellLevel"
-    # No OOSH_DIR here: it is the constant ~/oosh, already set by user.env or
-    # by this file's top-level fallback. Assigning $initStartPath (a dirname of
+    # No OOSH_DIR here: it is the constant ~/oosh, already set by boot or by
+    # this scripts top-level fallback. Assigning $initStartPath (a dirname of
     # BASH_SOURCE, often relative) violated the rule and overrode a good value.
     export OOSH_SHLVL=$ooShellLevel
     export OOSH_PROMPT="oosh "
-    # ERROR_CODE_RECONFIG is a file-scope constant of this file, set above.
+    export ERROR_CODE_RECONFIG=117
     export OOSH_CONFIG_NEEDS_SAVE=~/config/user.env
   fi
 }
@@ -911,11 +843,43 @@ this.absolutePath()     # <?path:"."> <?option:"pipe"> echos the absolut path if
   fi
 }
 
-this.git.branch.short() # <?gitDir:$OOSH_DIR> # print the sanitised short branch name of <gitDir> (delegates to ogit branch.get)
-{ private.this.script.load ogit ogit.branch.get; ogit.branch.get "$@"; }
+this.git.branch.short() # <?gitDir:$OOSH_DIR> # print the sanitised short branch name of <gitDir>'s current HEAD (strips refs/heads/, refs/remotes/origin/, heads/origin/, origin/ prefixes). Returns empty string if HEAD is detached or the dir is not a git repo.
+{
+  local dir="${1:-${OOSH_DIR:-.}}"
+  local b
+  b=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  # Degenerate branch names like `heads/origin/dev` — produced by
+  # `git worktree add <path> heads/origin/dev` or `git checkout -b origin/dev`
+  # followed by odd promotion sequences — would otherwise poison any caller
+  # that concatenates `origin/` onto the returned value (see oo:1342,
+  # init/oosh:247). Strip the known bad prefixes so downstream code can
+  # assume a bare branch name like `dev`, `testing`, `prod`.
+  b="${b#refs/heads/}"
+  b="${b#refs/remotes/origin/}"
+  b="${b#heads/origin/}"
+  b="${b#origin/}"
+  printf '%s' "$b"
+}
 
-this.git.commits.count() # <gitDir> <fromRef> <toRef> # count commits in <toRef> not in <fromRef>; RESULT = count (delegates to ogit commit.count)
-{ private.this.script.load ogit ogit.branch.get; ogit.commit.count "$2" "$3" "$1"; }
+this.git.commits.count() # <gitDir> <fromRef> <toRef> # count commits reachable from <toRef> but not <fromRef> in <gitDir> via `git rev-list --count refs/heads/<fromRef>..refs/heads/<toRef>`; sets RESULT to the count (numeric string), "0" when the range is empty or a ref is missing
+{
+  local gitDir="$1"
+  local fromRef="$2"
+  local toRef="$3"
+
+  if [ -z "$gitDir" ] || [ -z "$fromRef" ] || [ -z "$toRef" ]; then
+    create.result 1 "this.git.commits.count requires <gitDir> <fromRef> <toRef>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  local _n
+  # Defensive 2>/dev/null on the git invocation itself: refs may legitimately
+  # not exist on test rigs without remotes — caller treats empty as 0.
+  _n=$(git -C "$gitDir" rev-list --count "refs/heads/$fromRef..refs/heads/$toRef" 2>/dev/null)
+  create.result 0 "${_n:-0}"
+  return $(result)
+}
 
 this.git.commits.count.completion.gitDir()  { c2 files.completion $1; }
 this.git.commits.count.completion.fromRef() { echo dev; echo testing; echo prod; }
@@ -1012,12 +976,11 @@ this.call() # <aFunction> <?aShellScript> # loads <aFunction> from a <aShellScri
 
 
 
-this.path.add() # <dir> # prepends dir to this process's PATH, de-duping by whole segment; the PATH itself is owned by the user.env anchor lines
+this.path.add() # <dir> # prepends dir to this process's PATH, de-duping by whole segment; the PATH itself is owned by boot
 {
-  # A BOOTSTRAP helper, not a PATH builder — the `# path-writer:` data lines at
-  # the head of ~/config/user.env own the PATH (path.validate enforces it). The
-  # executed-script branch at the bottom of this file uses it to get the oosh
-  # directories in front in contexts that never source user.env.
+  # A BOOTSTRAP helper, not a PATH builder — `boot` owns the PATH
+  # (docs/boot.md). The executed-script branch at the bottom of this file uses
+  # it to get the oosh directories in front in contexts that never source boot.
   #
   # It carried NO signature comment, which made it invisible to
   # test/test.completion.audit and to every usage table while
@@ -1029,7 +992,7 @@ this.path.add() # <dir> # prepends dir to this process's PATH, de-duping by whol
   # a home to be written to.
   if ! this.functionExists "line.add"; then
     # path-exception: bootstrap — `line` has to be reachable before the
-    # pipeline below can run, and nothing has sourced user.env in this context.
+    # pipeline below can run, and boot has not run in this context.
     case ":$PATH:" in
       *":$OOSH_DIR:"*) : ;;
       *) export PATH="$OOSH_DIR:$PATH" ;;
@@ -1073,166 +1036,6 @@ this.help.table() {
   | grep "$1" \
   | line table '#' 
 }
-
-private.this.as.user.preamble.get()     # <username> <targetHome> <sharedOosh> # echo the bash -c preamble that stands the TARGET user's oosh environment up before a command runs as them: HOME/USER, no leaked anchors, this from the shared tree, its dirs first on PATH #
-{
- # The one preamble behind every `private.as.user "$u" bash -c "…"` hop
- # (config.init.user, user.oosh.install). runuser keeps the CALLER's
- # environment, so without this the target inherits root's CONFIG/CONFIG_PATH/
- # OOSH_DIR, and a string that sources "$OOSH_DIR/this" is expanded by the
- # caller — /root/oosh/this, unreadable under a 0700 /root — so every source
- # failed silently and the bashrc heal of another user never ran (T86's
- # sibling, T-THIS-AS-USER-PREAMBLE).
- #
- # OOSH_USER_CONFIG_PATH and OOSH_MODE are the CALLER's per-user values: left
- # in place, the target would write into the caller's ~/.config/oosh and take
- # the caller's branch for its own (the kernel keeps an OOSH_MODE it finds in
- # the environment). Unset, `this` re-anchors both on the target's HOME.
- #
- # Unsetting the anchors is what lets `this` cold-start from the TARGET's
- # ~/config/user.env (or fall back to their $HOME/oosh); sourcing `this` from
- # <sharedOosh> is what makes that possible before their ~/oosh symlink exists;
- # the explicit PATH prepend is why `user`/`ossh` resolve in that same window.
- # NO create.result — a getter consumed as $(...), a subshell.
- local username="$1" targetHome="$2" sharedOosh="$3"
- printf '%s\n' \
-   "export HOME='$targetHome'" \
-   "export USER='$username'" \
-   "unset CONFIG CONFIG_PATH CONFIG_FILE OOSH_DIR OOSH_USER_CONFIG_PATH OOSH_MODE" \
-   'cd "$HOME" 2>/dev/null' \
-   "source '$sharedOosh/this' >/dev/null 2>&1 || exit 1"
- # path-exception: a string run AS ANOTHER USER before their login shell
- # exists — their user.env may not exist yet, so the shared tree is prepended
- # by hand there; the same exception the inline copies carried.
- echo "export PATH=\"$sharedOosh:$sharedOosh/ng:\$PATH\""
- return 0
-}
-
-
-private.this.path.dedup()     #  # de-duplicate PATH in THIS shell by whole segment — first occurrence wins, order kept, empty segments (the CWD, CWE-426) dropped; runs once per source this; pure parameter expansion, no subshell #
-{
- # user.env's `export PATH="$HOME/oosh:…:$PATH"` is data and cannot guard
- # itself, so a shell that sources it twice (bashrc + a nested `source this`,
- # a re-login inside tmux) carries the prepend twice. Called once at the bottom
- # of this file; T-THIS-PATH-DEDUP drives it directly, T74/T74d through a
- # whole `source this`.
- #
- # Pure parameter expansion, no `read`/here-string: bash before 5.1 backs a
- # here-string with a TMPDIR temp file, so that form did filesystem I/O on
- # every single `source this` on macOS bash 3.2 and broke outright on a
- # read-only or noexec /tmp during install. NO create.result: a mutator of the
- # caller's PATH, run before `create.result` matters and never as $(...).
- local newPath="" seen=":" rest="$PATH:" seg
- while [ -n "$rest" ]; do
-   seg=${rest%%:*}; rest=${rest#*:}
-   # An EMPTY segment ("::", a leading or trailing colon) means the current
-   # directory — CWE-426, the same hole ticket T8 closed for a literal `.` in
-   # config.save's brew-bash line. Dropped here, never preserved. This does NOT
-   # shut the hole: a LITERAL `.` segment is a non-empty segment and survives
-   # de-duplication untouched, exactly as it did before.
-   if [ -n "$seg" ]; then
-     case "$seen" in *":$seg:"*) ;; *)
-       seen="$seen$seg:"
-       newPath="${newPath:+$newPath:}$seg" ;;
-     esac
-   fi
- done
- # path-exception: a REWRITE of the value already there, not a build — the
- # segments put back are exactly the ones that came in, minus the repeats. A
- # no-op when nothing changed, which is the common case.
- [ "$newPath" = "$PATH" ] || export PATH="$newPath"
- return 0
-}
-
-
-private.this.script.load()     # <script> <probeFn> # source $OOSH_DIR/<script> into this shell once, unless <probeFn> is already a function; This is saved and restored around the source; rc 0 when <probeFn> is a function afterwards #
-{
- # A predicate (rc only, no create.result): it runs inside completion paths.
- # Lazy, because <script> sources `this` and every consumer (oo, promote, …)
- # may itself be merely sourced by the ooShim or a test. Not this.load: that
- # one CALLS the method and overwrites This (this:551-578). Sourcing re-runs
- # this.start, which points This at the sourced file — restore it, or the
- # caller's own dispatch/help would describe the wrong script.
- [ "$(type -t "$2")" = function ] && return 0
- local savedThis="$This"
- [ -f "$OOSH_DIR/$1" ] && source "$OOSH_DIR/$1" >/dev/null 2>&1
- This="$savedThis"
- [ "$(type -t "$2")" = function ]
-}
-
-
-private.this.path.case.get()     # <path> # echo <path> in the file system canonical letter case (macOS: osascript POSIX path, trailing / dropped); echo <path> unchanged when osascript is absent or fails #
-{
- # A getter consumed as $(...): no create.result. macOS HFS+/APFS is
- # case-insensitive, but git's safe.directory is a string match:
- # /Users/shared and /Users/Shared are one inode, two strings. Moved from the
- # hand-copies at oo:2154, oo:2168 and user:1071 (their call sites move with
- # the ogit plan, Tasks 17, 22 and 23).
- local p="$1" r=""
- [ -z "$p" ] && return 1
- if command -v osascript >/dev/null 2>&1; then
-   r=$(osascript -e "POSIX path of (POSIX file \"$p\" as alias)" 2>/dev/null | sed 's:/$::')
- fi
- printf '%s\n' "${r:-$p}"
-}
-
-
-private.this.folder.entries.copy()     # <from> <to> # copy every entry of <from> (dotfiles included) into <to>, keeping relative paths — never <from>/. itself, whose own mode and owner would land on <to>; rc 1 names the entries that failed #
-{
- # One definition, shared by ogit (private.ogit.folder.ignored.restore) and
- # odocker (workspace.seed). Each ENTRY, dotfiles included — never
- # `cp -Rp <from>/. <to>/`: that also copies <from>'s own mode/owner onto <to>
- # (the host dev/ came out drwx------ root:root, 2026-09-25). Plain [ -d ]
- # tests, not `check dir`: check sources this, and this is the kernel.
- local from="$1" to="$2" entry failed=""
- if [ ! -d "$from" ]; then create.result 1 "no such folder: $from"; return $(result); fi
- if [ ! -d "$to" ]; then create.result 1 "no such folder: $to"; return $(result); fi
- for entry in "$from"/* "$from"/.[!.]* "$from"/..?*; do
-   [ -e "$entry" ] || continue
-   cp -Rp "$entry" "$to/" || failed="$failed ${entry##*/}"
- done
- if [ -n "$failed" ]; then create.result 1 "entries not copied:$failed"; return $(result); fi
- create.result 0 "copied the entries of $from into $to"
- return $(result)
-}
-
-
-private.this.folder.share()     # <dir> # share <dir> with group dev: private.ensure.sharedTree (chgrp dev, g+w) plus setgid on every directory so new files inherit the group; rc 0 without a dev group; never chown #
-{
- # One definition, shared by ogit (private.ogit.folder.finish) and odocker
- # (workspace.seed). private.ensure.sharedTree deliberately sets no SGID —
- # sharedConfig relies on its writers calling private.ensure.groupWrite — but a
- # NEW folder under the shared tree needs setgid dirs so that files created
- # later inherit group dev. Never chown (T-STATE-31-CHOWN-NOT-RECURSIVE).
- local dir="$1"
- if [ ! -d "$dir" ]; then create.result 1 "no such folder: $dir"; return $(result); fi
- if ! private.this.group.exists dev; then create.result 0 "no dev group — $dir left as it is"; return $(result); fi
- if ! private.ensure.sharedTree "$dir" >/dev/null 2>&1 || ! find "$dir" -type d -exec chmod g+s {} + 2>/dev/null; then
-   create.result 1 "could not share $dir with group dev"; return $(result)
- fi
- create.result 0 "$dir shared with group dev (g+w, setgid)"
- return $(result)
-}
-
-
-private.this.user.env.load()     #  # source $OOSH_USER_CONFIG_PATH/oosh.user.env (per-user DATA: OOSH_MODE) when it exists — in CODE, never as a line of the shared user.env; a value already in the environment wins; rc 0 always #
-{
- # No create.result: it runs inside this.init, on every `source this`.
- # ENV FILES ARE PURE DATA. The shared ~/config/user.env may hold exports and
- # `. $CONFIG_PATH/<name>.env` lines, nothing else — and a per-user file cannot
- # be a chain line of it: dash aborts on `.` of a missing file, and the guard
- # that would prevent that is logic. `[ ! -f … ] || . …` stood in user.env for
- # a day (2026-09-28) with config.validate taught to allow it; that was the
- # regression. The guard belongs HERE, in code — exactly as `log` owns and
- # loads log.session.env.
- # An OOSH_MODE the environment already carries wins (oo use, oo mode, the
- # shim's mode-env.bash, a test): the file fills a shell that has none.
- [ -n "$OOSH_MODE" ] && return 0
- local userEnv="${OOSH_USER_CONFIG_PATH:-$HOME/.config/oosh}/oosh.user.env"
- [ -f "$userEnv" ] && . "$userEnv"
- return 0
-}
-
 
 ### new.method
 
@@ -1441,11 +1244,6 @@ still in ${BASH_SOURCE[0]##*/}
 "
 #set -x
 
-# Once per `source this`, before this.init: the cold start at the top of this
-# file (or bashrc before it) sourced user.env, whose PATH line cannot guard
-# itself. this.init's own re-source saves/restores PATH, so this is the one
-# place the growth is collapsed.
-private.this.path.dedup
 this.init
 
 
@@ -1472,9 +1270,9 @@ case "${0##*/}" in
 
     if [ -n "$OOSH_CONFIG_NEEDS_SAVE" ]; then
       unset OOSH_CONFIG_NEEDS_SAVE
-      # Not while `log` is still loading: log sources this (log:145) before it
-      # defines console.log …, and config.save needs the full log API.
-      if this.functionExists console.log; then
+      # Only save config if logging functions are available.
+      # When log sources this, console.log isn't defined yet — skip to avoid errors.
+      if [ "$(type -t console.log)" = "function" ]; then
         source $OOSH_DIR/config
         config.save
       fi
@@ -1520,7 +1318,7 @@ else
       rm -r $OOSH_DIR/init
       ln -s $OOSH_DIR/oosh/init
     fi
-    config anchors.init   # the cheap anchors only: init/oosh runs `this` during install
+    config init
     if [ -z "$BASH_FILE" ]; then
       export BASH_FILE="$(command -v bash)"
       #   echo "BASH_FILE was not set"

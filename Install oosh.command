@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# ogit-exception-file: macOS double-click installer wrapper, runs before oosh exists
 # macOS drag-and-drop wrapper for oosh install. Two usage modes:
 #
 #   1. Downloaded standalone (single file in ~/Downloads or wherever).
@@ -18,7 +17,7 @@
 # Rewritten by `promote` during dev→testing→prod advancement
 # (see private.promote.rewrite.self.branch in promote). Must match the
 # same pattern init/oosh uses so the rewriter's regex matches this line.
-OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"
+OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"
 
 cd "$(dirname "$0")" || exit 1
 
