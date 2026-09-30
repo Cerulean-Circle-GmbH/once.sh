@@ -1,96 +1,97 @@
 #!/usr/bin/env bash
-# T-JSONL-LAG — RED-FIRST guard (rewind-safety defect b, oopPO 2026-09-30).
-# DEFECT: private.claudeCode.context.from.jsonl reads the LAST assistant-usage entry. A mid-reboot
-# agent injects a BIG un-recorded window AFTER that turn (context.md + learnings + file reads = user/
-# tool entries with no assistant-usage yet) → the number reflects only the PRE-injection state →
-# a ~30pt FALSE-SAFE reading with NO lag signal → licenses a walling drive. Today's ONLY guard is
-# TIME-based (mtime>600s→'stale'); there is NO CONTENT-lag guard.
-#
-# CONTRACT this RED pins (align exact names/threshold with the expert; repro jsonl = oopTeam:0.0):
-#   (i)  DETECT a large un-recorded lag-window (content AFTER the last assistant-usage) → LAG signal
-#        so context.read DEFERS TO THE PANEL, not the lagging-low number.
-#   (ii) the threshold is STRUCTURAL (entries/bytes AFTER last assistant-usage), NOT a guessed byte
-#        constant — proven by tracking the STRUCTURE (big window→lag, zero window→fresh).
-#   (iii)the LAG label is a SEPARATE FIELD — the BARE numeric output stays UNCHANGED (context.check /
-#        scrumMaster.pulse / views parse it; a contract break would regress them).
-#   (iv) remaining-convention (bare number = remaining%).
-#
-# PROPOSED interface (CONFIRM with expert): private.claudeCode.context.jsonl.lag <jsonl> → 'lag'|'fresh'.
-# If the expert names it differently, only the LAGFN below changes; the scenario/contract stand.
+# T-JSONL-LAG — content-lag guard (rewind-safety defect b, oopPO). RED-first → GREEN on 390325e.
+# DEFECT: from.jsonl reads the LAST assistant-usage; a big un-recorded window AFTER it (mid-reboot
+# context.md/learnings/reads) makes it a LOWER-BOUND → false-safe reading → licenses a walling drive.
+# FIX (390325e): private.claudeCode.context.jsonl.lag ('lag' when >8 un-recorded user/tool entries
+# after the last assistant-usage) → from.jsonl signals 'lag' → context.read DEFERS to the panel, or
+# returns 'lag' (never a false-LOW). CONTEXT_SOURCE label is SEPARATE; the bare number is unchanged.
+# Convention = REMAINING. Gated on BOTH the reconstructed REAL reboot-moment AND a portable synthetic.
 LAGFN="private.claudeCode.context.jsonl.lag"
-
 level=$1; [ -z "$level" ] && level=1
-echo "starting: T-JSONL-LAG <LOG_LEVEL=$level> (RED-FIRST — no content-lag guard exists yet)"
-source this
-source test.suite
-source claudeCode
+echo "starting: T-JSONL-LAG <LOG_LEVEL=$level>"
+source this; source test.suite; source claudeCode
 export LOG_DEVICE=/dev/null
 log.level $level
 
-D="${TMPDIR:-/tmp}/t-jsonl-lag.$$"; rm -rf "$D"; mkdir -p "$D"
-cleanup() { rm -rf "$D" 2>/dev/null; }
-trap cleanup EXIT
+D="${TMPDIR:-/tmp}/t-jsonl-lag.$$"; rm -rf "${TMPDIR:-/tmp}/t-jsonl-lag."* 2>/dev/null; mkdir -p "$D"
+trap 'rm -rf "${TMPDIR:-/tmp}/t-jsonl-lag."* 2>/dev/null' EXIT   # PRE+POST sweep-by-prefix (survives SIGKILL)
 
-# Build a JSONL: one assistant-usage entry (~40% used) then <window> un-recorded user entries after it.
-mk_jsonl() {   # <file> <window>
-  local f="$1" window="$2" i
-  local max used cr
+# --- synthetic fixture: one assistant-usage (~40% used) then <window> un-recorded user entries ---
+mk_jsonl() { local f="$1" window="$2" i max used cr
   max=$(private.claudeCode.max.tokens.for.jsonl "$f" 2>/dev/null); max=${max:-200000}
   used=$(awk "BEGIN{printf \"%d\", $max*0.40}"); cr=$((used-1001))
   printf '{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":1000,"cache_read_input_tokens":%d}}}\n' "$cr" > "$f"
-  for ((i=1;i<=window;i++)); do
-    printf '{"type":"user","message":{"role":"user","content":"[injected boot chunk %d: context.md/learnings/read — big un-recorded tokens]"}}\n' "$i" >> "$f"
-  done
-  touch "$f"   # fresh mtime — isolates CONTENT-lag from the existing TIME-staleness guard
-}
+  for ((i=1;i<=window;i++)); do printf '{"type":"user","message":{"role":"user","content":"[boot chunk %d]"}}\n' "$i" >> "$f"; done
+  touch "$f"; }
+LAG_JF="$D/lagging.jsonl";  mk_jsonl "$LAG_JF" 40   # 40 "user" entries > 8 → lag
+FRESH_JF="$D/fresh.jsonl";  mk_jsonl "$FRESH_JF" 0  # 0 → fresh
 
-LAG_JF="$D/lagging.jsonl";  mk_jsonl "$LAG_JF" 40   # BIG un-recorded window (mid-reboot injection)
-FRESH_JF="$D/fresh.jsonl";  mk_jsonl "$FRESH_JF" 0  # last assistant-usage IS the last entry — no lag
+# REPRESENTATIVE reboot fixture — the REAL mid-reboot injection is dominated by ATTACHMENT (file reads:
+# context.md/learnings/boot) + TOOL_USE, NOT plain "user". (Measured on 046bbac4: content-window max 32;
+# user/tool_result-only window max 4.) A guard that ignores these types is BLIND to the real reboot.
+REAL_TYPES_JF="$D/reboot.realtypes.jsonl"
+{ printf '{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":1000,"cache_read_input_tokens":78999}}}\n'
+  for i in $(seq 1 20); do printf '{"type":"attachment","content":"[read: context.md chunk %d]"}\n' "$i"; done
+  for i in $(seq 1 20); do printf '{"type":"tool_use","name":"Read","input":{"file":"learnings-%d"}}\n' "$i"; done
+} > "$REAL_TYPES_JF"; touch "$REAL_TYPES_JF"   # 40 content entries, ZERO user/tool_result — ISOLATES the
+# attachment/tool_use blindness (deployed filter counts only user/tool_result/tool → would read 'fresh').
 
-echo; echo "===== (1) STRUCTURAL DETECT: big un-recorded window → 'lag', zero window → 'fresh' ====="
-if type -t "$LAGFN" >/dev/null 2>&1; then
-  GLAG=$("$LAGFN" "$LAG_JF" 2>/dev/null); GFRESH=$("$LAGFN" "$FRESH_JF" 2>/dev/null)
-  test.case $level "(1a) lag-detector: big window → 'lag' (got '$GLAG')" echo "$GLAG"
-  [ "$GLAG" = "lag" ] && expect.pass "detected the un-recorded lag-window" || expect.fail "RED: no 'lag' on a 40-entry un-recorded window (got '$GLAG')"
-  test.case $level "(1b) lag-detector: zero window → 'fresh' (got '$GFRESH')" echo "$GFRESH"
-  [ "$GFRESH" = "fresh" ] && expect.pass "no false lag on a current jsonl" || expect.fail "RED/over-trigger: got '$GFRESH' on a no-window jsonl"
-else
-  test.case $level "(1) lag-detector $LAGFN defined" echo "absent"
-  expect.fail "RED: $LAGFN not defined — no STRUCTURAL content-lag guard exists (defect open)"
+# --- REAL repro 046bbac4: reconstruct the reboot lag-moment (transient — the current file caught up) ---
+REPRO=$(ls "$HOME/.claude/projects"/*/046bbac4-*.jsonl 2>/dev/null | head -1)
+REAL_LAG="$D/real.reboot.jsonl"; REAL_FRESH="$D/real.caughtup.jsonl"; HAVE_REAL=0
+if [ -n "$REPRO" ] && [ -f "$REPRO" ]; then
+  head -1250 "$REPRO" > "$REAL_LAG" 2>/dev/null    # truncate to the reboot moment = the 46-entry window
+  cp "$REPRO" "$REAL_FRESH" 2>/dev/null; touch "$REAL_LAG" "$REAL_FRESH"
+  HAVE_REAL=1
 fi
 
-echo; echo "===== (2) DEFER-TO-PANEL: context.read must SIGNAL lag, not hand back the lagging-low number ====="
-# On a lagging jsonl the reader must NOT silently return a trustworthy-looking bare number. Whether via
-# a 'lag'/'defer' state or an rc that routes to the panel — the caller must be told to distrust it.
-GOT=$(private.claudeCode.context.from.jsonl "$LAG_JF" 2>/dev/null)
-test.case $level "(2) from.jsonl on a lagging jsonl signals lag/defer (got '$GOT')" echo "$GOT"
-case "$GOT" in
-  *lag*|*defer*|*panel*|stale|unknown) expect.pass "signals lag/defer → caller uses the panel" ;;
-  *) expect.fail "RED: returned bare '$GOT' with NO lag signal — FALSE-SAFE, licenses a walling drive" ;;
-esac
+echo; echo "===== (1) STRUCTURAL entry-count detect (synthetic): >8 window→lag, 0→fresh ====="
+test.case $level "(1a) jsonl.lag: 40-entry window → 'lag' (got '$($LAGFN "$LAG_JF")')" echo x
+[ "$($LAGFN "$LAG_JF")" = "lag" ] && expect.pass "big un-recorded window = lag" || expect.fail "RED: not lag on 40 entries"
+test.case $level "(1b) jsonl.lag: 0-entry window → 'fresh' (got '$($LAGFN "$FRESH_JF")')" echo x
+[ "$($LAGFN "$FRESH_JF")" = "fresh" ] && expect.pass "no window = fresh (no over-trigger)" || expect.fail "RED: false lag on 0 entries"
+test.case $level "(1c) jsonl.lag: 40 REAL-reboot-type entries (attachment/tool_use/user) → 'lag' (got '$($LAGFN "$REAL_TYPES_JF")')" echo x
+[ "$($LAGFN "$REAL_TYPES_JF")" = "lag" ] && expect.pass "real reboot types detected as lag" \
+  || expect.fail "RED: 'fresh' on 40 attachment/tool_use/user entries — guard filter BLIND to real reboot types (counts only user/tool_result/tool)"
 
-echo; echo "===== (3) SEPARATE FIELD: the BARE numeric output is UNCHANGED on a FRESH jsonl (no contract break) ====="
+echo; echo "===== (2) REAL artifact 046bbac4 — lag on the reconstructed reboot-moment ====="
+if [ "$HAVE_REAL" = 1 ]; then
+  test.case $level "(2) jsonl.lag(046bbac4→line1250, ~46-entry reboot window) → 'lag' (got '$($LAGFN "$REAL_LAG")')" echo x
+  [ "$($LAGFN "$REAL_LAG")" = "lag" ] && expect.pass "REAL reboot-moment detected as lag (gated under the real defect condition)" \
+                                       || expect.fail "RED: real reboot-moment not detected as lag"
+else
+  test.case $level "(2) real repro absent — skipped" echo skip; expect.pass "skipped (repro not on this host)"
+fi
+
+echo; echo "===== (3) TRANSIENT distinction — the CURRENT (caught-up) real file reads 'fresh' (refuse false-pass) ====="
+if [ "$HAVE_REAL" = 1 ]; then
+  test.case $level "(3) jsonl.lag(full current 046bbac4, caught up) → 'fresh' (got '$($LAGFN "$REAL_FRESH")')" echo x
+  [ "$($LAGFN "$REAL_FRESH")" = "fresh" ] && expect.pass "caught-up real file = fresh (gating it as-is would've FALSE-PASSED; the guard is condition-specific)" \
+                                           || expect.fail "over-trigger: caught-up file flagged lag"
+else
+  test.case $level "(3) real repro absent — skipped" echo skip; expect.pass "skipped"
+fi
+
+echo; echo "===== (4) from.jsonl SIGNALS 'lag' on a lagging jsonl (never a false-safe LOW number) ====="
+GOTLAG=$(private.claudeCode.context.from.jsonl "$LAG_JF" 2>/dev/null)
+test.case $level "(4) from.jsonl(lagging) = 'lag' (got '$GOTLAG')" echo "$GOTLAG"
+[ "$GOTLAG" = "lag" ] && expect.pass "signals lag → context.read defers to panel, never false-LOW" \
+                       || expect.fail "RED: bare '$GOTLAG' with no lag signal (false-safe)"
+
+echo; echo "===== (5) SEPARATE FIELD + bare unchanged + remaining-convention (pulse/views contract) ====="
 BARE=$(private.claudeCode.context.from.jsonl "$FRESH_JF" 2>/dev/null)
-test.case $level "(3) fresh jsonl → bare numeric remaining, parseable by pulse/views (got '$BARE')" echo "$BARE"
-if printf '%s' "$BARE" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
-  expect.pass "bare output is a plain remaining number (contract intact for context.check/pulse/views)"
+HAS_LABEL=$(grep -c 'CONTEXT_SOURCE' "$OOSH_DIR/claudeCode")
+test.case $level "(5) fresh bare = remaining number (0-100) + CONTEXT_SOURCE is a separate label (bare='$BARE', label-refs=$HAS_LABEL)" echo "$BARE"
+if printf '%s' "$BARE" | grep -qE '^[0-9]+(\.[0-9]+)?$' && awk "BEGIN{exit !($BARE>=0 && $BARE<=100)}" && [ "$HAS_LABEL" -ge 1 ]; then
+  expect.pass "bare output unchanged (plain remaining%, pulse/views safe) + CONTEXT_SOURCE label separate"
 else
-  expect.fail "CONTRACT BREAK: fresh bare output '$BARE' is not a plain number — pulse/views would regress"
-fi
-
-echo; echo "===== (4) remaining-convention anchor ====="
-test.case $level "(4) fresh bare number is REMAINING (0-100)" echo "$BARE"
-if printf '%s' "$BARE" | grep -qE '^[0-9]+(\.[0-9]+)?$' && awk "BEGIN{exit !($BARE>=0 && $BARE<=100)}"; then
-  expect.pass "remaining in [0,100]"
-else
-  expect.fail "not a remaining% in [0,100]: '$BARE'"
+  expect.fail "contract break: bare='$BARE' (want plain remaining 0-100) or CONTEXT_SOURCE label missing"
 fi
 
 echo
 echo "=================================================================="
-echo "  T-JSONL-LAG RED-FIRST: a big un-recorded window after the last assistant-usage must raise a"
-echo "  SEPARATE lag signal (bare number unchanged) so context.read/pulse DEFER to the panel."
-echo "  Align $LAGFN name + structural threshold with the expert (repro jsonl = oopTeam:0.0)."
+echo "  T-JSONL-LAG: lag on reboot window (real 046bbac4 + synthetic), fresh on caught-up,"
+echo "  from.jsonl signals lag, bare output unchanged (CONTEXT_SOURCE separate), remaining-convention."
 echo "=================================================================="
-cleanup
+rm -rf "${TMPDIR:-/tmp}/t-jsonl-lag."* 2>/dev/null
 test.suite.save.results
