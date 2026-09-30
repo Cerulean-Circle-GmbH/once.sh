@@ -103,20 +103,19 @@ log.device
 
 OOSH config is **shared**: every user's `~/config` symlinks to one `sharedConfig`
 directory, so everything written to `~/config/log.env` is seen by *all* users.
-Only the site-wide verbosity (`LOG_LEVEL`, `LOG_LEVEL_RESET`) belongs there.
+That is where the site-wide log settings live.
 
-Anything per-user or per-session must NOT go into the shared `log.env` — it would
-leak one user's absolute paths, tty, or identity onto everyone else (and cause
-cross-user permission errors). `config.save` therefore filters `LOG_NAME`,
-`LOG_DEVICE` and `LOG_LIVE` out of the shared `log.env`. They are instead written
-to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
-`~/.config/oosh`) — the same per-user directory OOSH already uses for
-`mode-env.bash`. The `boot` loader materialises that file once per shell (it
-delegates to `log.session.save`).
+`config save log` writes **every** `LOG_*` variable into the shared `log.env` —
+the MacStudio model — and a value under the saving user's home as `"$HOME/…"`,
+so no user's absolute path leaks to another. The per-user and per-session values
+(`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) are additionally written to the user's
+**private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default `~/.config/oosh`) by
+`log.session.save`, which `.bashrc` runs once per shell; that file exists for
+every user (`config save log`, `config init.user`).
 
 The shared `log.env` is linked to the per-user file by a source chain — its last
 line is `. $OOSH_USER_CONFIG_PATH/log.session.env` (POSIX `.`, not the bash
-`source`, so `boot` parses under dash/ash; the var is written **unexpanded**, so
+`source`, so dash/ash shells can source it; the var is written **unexpanded**, so
 each user loads their OWN file). This means a value you set with `log name
 <value>` is **loaded back on every login**, not just recorded: `log`'s top-level
 keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so the saved name

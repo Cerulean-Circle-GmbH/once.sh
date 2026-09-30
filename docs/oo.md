@@ -107,7 +107,7 @@ text wherever else it appears — including inside this tool's own source.
 
 Requires the markers to be present. `templates/code/newScript` and `templates/code/newScriptTest`
 carry them, and each template re-emits the marker after what it inserts, so the next call has
-somewhere to go. Scripts without a `<script>.start` dispatcher — `boot`, `debug` — are not
+somewhere to go. Scripts without a `<script>.start` dispatcher — such as `debug` — are not
 method-scripts and deliberately have no marker.
 
 ### oo.test.new
@@ -237,7 +237,7 @@ The branch directory is found under the worktree base, falling back to a
 sibling of `~/oosh`. The command is then executed with `OOSH_DIR` pointed at
 that branch — a scoped child-process override, which is the one sanctioned
 exception to the `OOSH_DIR` anchor rule (`oosh-dir-exception` in the code;
-[boot.md § Sanctioned exceptions](boot.md)). There is no symlink alternative
+[config.md § The anchor rule](config.md#the-anchor-rule)). There is no symlink alternative
 by design: the symlink is what `oo mode` moves, and `use` must not move it.
 
 Its exit status is **the command's own**, deliberately — it is a runner, so a
@@ -327,39 +327,15 @@ already-correct layout is a no-op. Naming follows the OOSH
 `ossh.folder.fix` per-scope pattern. See
 [Repair toolkit](repair-toolkit.md) for related primitives.
 
-### oo.boot.fix
+### The retired login drop-in
 
-Install or repair the two host-wide resources that let a shell with **no
-environment at all** become an oosh shell: the fixed path `/etc/oosh/boot`
-(a symlink into the shared tree) and the login-shell drop-in
-`/etc/profile.d/oosh.sh` (from `templates/user/profile.d.oosh.sh`).
-
-```bash
-oo boot.status                       # read-only report first
-oo boot.fix                          # install or repair both
-oo boot.fix <systemPath> <profileDir> # fixture paths, for tests — pass BOTH
-```
-
-`<?systemPath:/etc/oosh>` and `<?profileDir:/etc/profile.d>` are optional.
-Created during install by state **`34 root.boot.path.installed`**; because
-the state-machine declaration is frozen per host at first install,
-`oo boot.fix` is the only way onto hosts that already exist. `$SUDO` is
-used internally — run `oo boot.fix`, not `sudo oo boot.fix`; it fails loudly
-before creating anything when sudo is absent. Idempotent, never
-auto-triggered. On a branch without `boot` it warns and skips rather than
-leaving a dangling link; on a host without `/etc/profile.d` (macOS) it
-skips the drop-in and says so. Why the fixed path exists, what the drop-in
-can and cannot recover, and the trust note on dev-group-writable content
-behind a root-looking path: [`boot.md` § The tilde caveat](boot.md#the-tilde-caveat--reaching-boot-is-not-the-same-as-running-it),
-[§ The three recovery routes](boot.md#the-three-recovery-routes) and
-[§ Guarantees](boot.md#guarantees). See also [Repair toolkit](repair-toolkit.md).
-
-### oo.boot.status
-
-Read-only report on both resources — present, a symlink, where it resolves,
-readable by you, and whether the drop-in sources it — with the recovery
-command when not. Same two optional parameters as `oo boot.fix`. Emits on
-plain stdout, so it answers at any log level; rc 0 only when both are healthy.
+`boot` is gone — a shell starts from `~/config/user.env` (see
+[config.md § The PATH line](config.md#the-path-line)) — and with it the former
+`boot.fix` and `boot.status` methods and the host-wide drop-in they installed (`/etc/oosh/boot`,
+`/etc/profile.d/oosh.sh`). `oo update` removes that drop-in from a host that still
+has one (`private.oo.dropin.remove`; only an `oosh.sh` that names the boot path is
+touched), and install state 34 does the same on a fresh install. Removing it needs
+write access to `/etc`, so `oo update` may ask for the sudo password once.
 
 ### oo.safeDirectory.prune
 
@@ -573,7 +549,7 @@ States include:
 | 31 | root.shared.dev.folder.created | Shared tree, developking, dev repo |
 | 32 | root.dev.keys.installed | Deploy keys |
 | 33 | root.installation.done | root bashrc + login shell |
-| 34 | root.boot.path.installed | `/etc/oosh/boot` fixed path (see [`oo.boot.fix`](#oobootfix)) |
+| 34 | root.boot.path.installed | removes the retired login drop-in (see [The retired login drop-in](#the-retired-login-drop-in)) |
 | 40+ | shared/headless/once | Advanced setup stages |
 
 ## Promotion Pipeline

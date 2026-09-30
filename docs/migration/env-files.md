@@ -9,7 +9,8 @@
 > `user.env`/`oosh.env`, read it as **history** — the current design does that in
 > `boot`. Per-user log vars (`LOG_NAME`/`LOG_DEVICE`/`LOG_LIVE`) now live in the
 > per-user `$OOSH_USER_CONFIG_PATH/log.session.env`, chained from `log.env`.
-> See **[../boot.md](../boot.md)** and **[../config.md](../config.md)** for the
+> `boot` itself was removed later (dev.config, 2026-09-30): a shell starts from
+> `~/config/user.env`. See **[../config.md](../config.md)** for the
 > current model. This document is retained for the `main → dev` history only.
 
 A reference for understanding how `~/config/user.env`, `~/config/oosh.env`, and `~/config/log.env` are generated, why the `dev` versions look the way they do, and how an older host running pre-April-2026 code differs.

@@ -266,10 +266,12 @@ scriptname.start "$@"  # Entry point
 
 When a script like `myScript` boots, dependencies load in this order:
 
-An interactive login shell boots via `$OOSH_DIR/boot` (from `bashrcTemplate`),
-which sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`),
-sources the pure-data env chain, builds PATH, and loads `log` — see
-[boot.md](boot.md). A script invoked directly boots via `source this`:
+An interactive shell starts from `~/config/user.env` (sourced by `bashrcTemplate`),
+whose pure-data chain sets the anchors (`CONFIG_PATH`, `OOSH_DIR`,
+`OOSH_USER_CONFIG_PATH`) and the PATH line; `.bashrc` then loads `log` — see
+[config.md § The PATH line](config.md#the-path-line). A script invoked directly
+starts via `source this`, which reads `~/config/user.env` itself when no
+`.bashrc` ran:
 
 ```
 1. myScript.start "$@"
@@ -282,7 +284,7 @@ sources the pure-data env chain, builds PATH, and loads `log` — see
    │       ├─ . oosh.env          # OOSH configuration
    │       └─ . log.env           # Log configuration
    │           └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
-   │   (PATH is built by boot/this, NOT persisted in the env files)
+   │   (PATH is one data line in user.env; this de-duplicates it)
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
    │
@@ -362,7 +364,7 @@ The file `this` is the OOSH kernel. It provides:
 | `this.functionExists` | Checks if a function is defined |
 | `this.isSourced` | Detects if script was sourced vs executed |
 | `this.init` | Initializes oosh environment |
-| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that never source `boot` — `boot` owns the PATH ([boot.md](boot.md)) |
+| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that have not read `~/config/user.env` — the login PATH is data there ([config.md § The PATH line](config.md#the-path-line)) |
 
 ### Method Dispatch Chain
 
@@ -430,9 +432,10 @@ this.call() {
 ### user.env Structure
 
 Env files are **pure data** now — only `export KEY="VALUE"` and `.`-chain lines,
-no logic. The per-user/volatile anchors (`OOSH_DIR`, `CONFIG`, `CONFIG_PATH`,
-`PATH`) are **not** persisted here; `$OOSH_DIR/boot` computes them fresh each
-shell (see [boot.md](boot.md)). `config.validate` enforces the no-logic rule.
+no logic. The anchors (`CONFIG_PATH`, `CONFIG`, `OOSH_DIR`) are written as the
+`"$HOME/…"` constants and PATH as one prepend line, so the shared files are right
+for every user (see [config.md § The anchor rule](config.md#the-anchor-rule)).
+`config.validate` enforces the no-logic rule.
 
 ```bash
 # ~/config/user.env  — portable data + POSIX `.` source chain
@@ -452,7 +455,7 @@ export LOG_LEVEL_RESET="1"
 . $OOSH_USER_CONFIG_PATH/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
 ```
 
-Note POSIX `.` (not the bash `source` builtin) so `boot` parses under dash/ash.
+Note POSIX `.` (not the bash `source` builtin) so dash/ash shells can source the chain.
 
 ---
 
@@ -506,7 +509,7 @@ See [docs/log.md](log.md) for complete documentation.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [boot.md](boot.md)) | `~/oosh` |
+| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [config.md § The anchor rule](config.md#the-anchor-rule)) | `~/oosh` |
 | `CONFIG` | Path to user.env | `~/config/user.env` |
 | `CONFIG_PATH` | Config directory | `~/config` |
 | `LOG_LEVEL` | Logging verbosity (0-6) | `3` |

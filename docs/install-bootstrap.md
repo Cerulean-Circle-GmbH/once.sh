@@ -1,16 +1,16 @@
 # The install bootstrap: `init/oosh` re-execs clean
 
 `init/oosh` is the installer — it runs before oosh exists, so it is POSIX `sh` and
-shares nothing with `boot` except one deliberately duplicated block (the `$HOME`
-recovery). This page documents its **clean-environment guarantee**: the `env -i`
+self-contained, including its `$HOME` recovery block (its twin in `boot` went with
+`boot`). This page documents its **clean-environment guarantee**: the `env -i`
 self-re-exec (the `cleanEnv` block), what is carried, what is seeded, and why.
-For `boot` itself see [boot.md](boot.md); for the design record see
+For how a shell starts once installed see [config.md § The PATH line](config.md#the-path-line); for the design record see
 [the clean-environment spec](superpowers/specs/2026-09-14-clean-environment-guarantee-design.md).
 
 
 ## The clean re-exec
 
-`boot` recovering `$HOME` makes `env -i sh` *survivable*. The guarantee that the installer runs in
+Recovering `$HOME` makes an `env -i` start *survivable*. The guarantee that the installer runs in
 a clean environment is a separate thing, and it used to come from a shebang:
 
 ```sh

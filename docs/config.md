@@ -62,8 +62,8 @@ The two tiers are linked by a source chain, exactly like `user.env` chains
 so each user loads their OWN file — no leak). So `config list log` shows the
 session file nested under it, and — because the chain is sourced at shell init —
 the saved per-user `LOG_NAME` (and the rest) are actually **loaded** each login,
-not just recorded. `boot` touch-creates the session file before the chain runs,
-so a first-ever shell has no missing-source error. See
+not just recorded. `config save log` and `config init.user` create the session file (`private.config.session.file.ensure`),
+so the chain line needs no guard and a first-ever shell has no missing-source error. See
 [Log System Documentation](log.md) for the per-user log vars.
 
 ## Environment Variables
@@ -71,9 +71,109 @@ so a first-ever shell has no missing-source error. See
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
-| `$CONFIG_PATH` | `~/config` | Shared config directory — **always** the `~/config` symlink itself, never the `sharedConfig` it points at (see [boot.md](boot.md)) |
+| `$CONFIG_PATH` | `~/config` | Shared config directory — **always** the `~/config` symlink itself, never the `sharedConfig` it points at (see [The anchor rule](#the-anchor-rule)) |
 | `$CONFIG_FILE` | `user.env` | Current config filename |
-| `$OOSH_USER_CONFIG_PATH` | `~/.config/oosh` | **Per-user** (non-shared) oosh config dir — single source of truth, anchored by `this.init`/`boot` |
+| `$OOSH_USER_CONFIG_PATH` | `~/.config/oosh` | **Per-user** (non-shared) oosh config dir — single source of truth, anchored by `this.init` and carried by `oosh.env` |
+
+## The anchor rule
+
+**`OOSH_DIR` is always `~/oosh`** — the user's `oosh` symlink, never the branch
+folder it happens to point at, never a `BASH_SOURCE`/`$0` walk, never
+`oo.mode.base.get`. **`CONFIG_PATH` is always `~/config`** — the user's `config`
+symlink, never the shared `sharedConfig` directory it points at. `CONFIG` is
+`~/config/user.env` and `OOSH_USER_CONFIG_PATH` is `~/.config/oosh`.
+
+In code and in the env files they are written `"$HOME/oosh"` / `"$HOME/config"`,
+because a tilde inside quotes does **not** expand, and `$HOME/…` is safe in POSIX
+`sh` and in every quoting context.
+
+```sh
+export CONFIG_PATH="$HOME/config"   # ~/config/user.env
+export OOSH_DIR="$HOME/oosh"        # ~/config/oosh.env
+```
+
+**Where they come from.** `config save` writes them as these constants, whatever
+the saving shell holds (`private.config.variable.export.line`, pinned by
+`test/test.config` T-CONFIG-SAVE-ANCHORS-CONSTANT) — the installer's shell holds
+the *resolved* `sharedConfig`, and that must never reach a user. A shell that has
+not read `user.env` yet uses the same literals as fallbacks: `this` (file scope,
+and `: ${CONFIG_PATH:=$HOME/config}` in `this.init`), `log`, `ossh.start`.
+Switching branches (`oo mode`) moves only what `~/oosh` points at; the variable
+never changes.
+
+**When you need the physical directory**, resolve it at that spot with the
+portable `private.this.path.canonical` — never bake the resolution into the anchor:
+
+| Site | Why it needs the physical path |
+|---|---|
+| install state 31 `ln -s … oosh` | linking `$OOSH_DIR` itself would create `~/oosh -> ~/oosh` |
+| install state 31 `OOSH_MODE` | the branch name is `basename` of the branch folder, not of the symlink |
+| `config.init.user` | decides "are we under the shared tree?" with a string-prefix test |
+| `promote` | `git worktree list` reports physical paths |
+| `oo.mode.base.get` | strategies 3/4 do `dirname`/`basename` — `dirname ~/oosh` is just `$HOME` |
+
+**Sanctioned exceptions** are marked in code with `# <anchor>-exception: <reason>`
+(or `# <anchor>-exception-file: <reason>` for a whole file), `<anchor>` being the
+variable name lower-cased with `_` → `-`: `oosh-dir-exception`, `config-path-exception`.
+
+| Anchor | Site | Why |
+|---|---|---|
+| `OOSH_DIR` | `oo.use` | runs one command from another branch without switching — a scoped child-process override |
+| `OOSH_DIR` | `ossh` remote invoke | a string executed on a remote host whose `~/oosh` does not exist yet |
+| `OOSH_DIR` | `user.oosh.install`, `config.init.user` hops | run as **another user** before their `~/oosh` exists; they source the shared tree |
+| `OOSH_DIR` | `init/oosh` (file-wide) | the installer runs before `~/oosh` exists |
+| both | `private.config.variable.export.line` | writes the constants as data into the env files |
+| `CONFIG_PATH` | `config file <path>` | its job is to point the session at an arbitrary config file |
+| `CONFIG_PATH` | install state 31 (×2) | builds the shared tree before `~/config` is a symlink to it |
+
+Enforced by **`this.anchor.validate <all|OOSH_DIR|CONFIG_PATH>`**: one `git grep`
+per anchor over the tracked tree (`docs/`, `test/`, `.claude/`, `*.md`, `*.json`
+excluded), every assignment classified as conforming / exception / violation, the
+verdict echoed to stdout (it survives any `LOG_LEVEL`), rc 1 on any violation.
+Covered by `test.this` T-OOSH-DIR-* / T-CONFIG-PATH-* (with planted violations) and
+`test.config` T31.
+
+## The PATH line
+
+**No file in the tree builds `PATH`.** A shell's PATH comes from
+`~/config/user.env`, where `config save` writes the oosh directories — and a bash
+outside `/bin` and `/usr/bin`, such as brew's — as one line of data:
+
+```sh
+export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"
+```
+
+`.bashrc`, `source this` and the remote prelude (`ossh.remote.prelude.get`) all
+read it. It cannot guard itself, so `this` drops repeated segments on every
+`source this` (`private.this.path.dedup`, T-THIS-PATH-NO-GROWTH).
+
+Every `PATH=` / `export PATH=` in the tracked tree is therefore a violation unless
+it carries a marker:
+
+```sh
+# path-exception: <reason>            # this line, or one of the five above it
+# path-exception-file: <reason>       # anywhere in the file — the whole file
+```
+
+The five-line window exists because these assignments often sit inside an `ssh`
+command string, a `bash -c` string or a heredoc, where the marker cannot go on the
+line itself.
+
+| Kind | Sites | Why |
+|---|---|---|
+| whole file | `init/oosh`, `init/once` | the installer runs before `~/oosh` and `user.env` exist; `init/once` is the superseded ONCE installer, still tracked |
+| the data line | `config.save` | writes user.env's PATH line |
+| fallback | `ossh.remote.prelude.get`, the `bashrcTemplate` degrade branch, the CI steps | `~/config/user.env` first, a bare prepend only when it is missing (mid-install) |
+| remote / sudo string | `ossh`, `user` ×2, `hiveMind` ×3 | executed on another host or as another user, where no `user.env` has been read |
+| sourced before `user.env` | `ossh.start`, `this` (file scope, `this.path.add`, `private.this.path.dedup`) | colon-anchored or a rewrite of the value already there |
+| repair, not build | `oo.mode` ×2, `this.init` | rewriting a branch name already in PATH, or saving and restoring PATH across a mid-session `source "$CONFIG"` |
+| session scope | `oo` (brew, `ONCE_LOAD_DIR`), `claudeCode`, `path.append`/`prepend`/`remove` | deliberately affects only the running shell |
+| diagnostics | `debug`'s `p`, banners, `path.env` | they print `PATH=`, they do not set it |
+
+Enforced by **`path validate [<treeRoot>]`** — the same sweep as the anchors (plus
+`old/` and `restore/` excluded), rc 1 on any violation. Covered by `test.path`
+`T-PATH-VALIDATE-*`, including T-PATH-VALIDATE-NO-OWNER (a file named `boot` is no
+exception any more).
 
 ## Commands
 
@@ -498,7 +598,7 @@ export ANOTHER_VAR="another value"
 source $CONFIG_PATH/other.env
 ```
 
-**`export` is mandatory, not decoration.** `boot` sources these files with POSIX
+**`export` is mandatory, not decoration.** `.bashrc`, `this` and dash/ash shells source these files with POSIX
 `.`, and a bare `NAME=value` assigns in the sourcing shell but exports nothing to
 its children — so `OOSH_MODE` would be set at login and empty in every command
 the user then runs.

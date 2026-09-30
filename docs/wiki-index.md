@@ -28,7 +28,7 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [Debug System Documentation](debug.md) - Interactive step debugger, stack traces, and trap handlers
 - [OO Framework Documentation](oo.md) - Script creation, version control, package management
 - [State Machine Documentation](state.md) - Creating and managing state machines for multi-step workflows
-- [Repair Toolkit](repair-toolkit.md) - The explicit repair primitives (`oo user.fix`, `oo boot.fix`, `config init.*`, `ossh rights.fix` / `folder.fix`) and which symptom needs which
+- [Repair Toolkit](repair-toolkit.md) - The explicit repair primitives (`oo user.fix`,  `config init.*`, `ossh rights.fix` / `folder.fix`) and which symptom needs which
 - [Install bootstrap (init/oosh)](install-bootstrap.md) - The installer's clean-environment re-exec: what is carried, what is seeded, why
 
 ## Infrastructure Tools
@@ -84,16 +84,14 @@ The heart of the oosh/once.sh system is an advanced Bash completion engine, impl
 - Supports custom completions for specific parameters and methods, and can fall back to standard Bash completions.
 - Is designed to be modular and extensible, allowing new scripts and methods to be added without duplicating completion logic.
 
-### The `boot` Loader
-The `boot` script (`$OOSH_DIR/boot`) is the single entry point that turns a bare
-shell into an oosh shell — every context (login shell, `ossh exec`, platform
-tests, CI) sources it. It owns the bootstrap logic that used to live inside the
-config env files (so those stay pure data), is POSIX-`sh` clean (dash/ash), and
-sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`), the source
-chain, PATH, and the logging primitives. It recovers `$HOME` from the password
-database, so `env -i sh` can boot; the fixed host-wide path `/etc/oosh/boot`
-(install state 34, `oo boot.fix`) makes that one command for any user and any
-shell — see **[boot.md](boot.md)** § The three recovery routes.
+### How a shell starts
+There is no loader script: a shell starts from **`~/config/user.env`**, which
+`config save` writes as pure data (the `CONFIG_*` anchors, the PATH line,
+`BASH_FILE`, then `. oosh.env` and `. log.env`; `log.env` chains the per-user
+`log.session.env`). `.bashrc` sources it; a shell without `.bashrc` gets there
+through `source ~/oosh/this`, and commands over ssh/`runuser`/`docker exec`
+through `ossh.remote.prelude.get` — see **[config.md](config.md)** § The anchor
+rule and § The PATH line.
 
 ### The "this" Boot Script
 The `this` script is the bootstrapper and foundation of the environment:
