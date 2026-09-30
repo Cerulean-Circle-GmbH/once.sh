@@ -136,11 +136,16 @@ Covered by `test.this` T-OOSH-DIR-* / T-CONFIG-PATH-* (with planted violations) 
 ## The PATH line
 
 **No file in the tree builds `PATH`.** A shell's PATH comes from
-`~/config/user.env`, where `config save` writes the oosh directories — and a bash
-outside `/bin` and `/usr/bin`, such as brew's — as one line of data:
+`~/config/user.env`, where `config save` writes it as one line of data — a
+snapshot of the saving shell's PATH, as on the MacStudio, made safe for the shared
+config by `private.config.path.line.get` (T-CONFIG-PATH-LINE): `~/oosh` and
+`~/oosh/ng` first, a bash outside `/bin` and `/usr/bin` (brew) next, every segment
+under the saver's home written `$HOME/…`, trailing slashes dropped, no empty, `.`,
+relative or transient (`/tmp`, `.vscode-server`) segment, each segment once, and
+`:$PATH` last so what the system adds after the save still reaches the shell:
 
 ```sh
-export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"
+export PATH="$HOME/oosh:$HOME/oosh/ng:/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 ```
 
 `.bashrc`, `source this` and the remote prelude (`ossh.remote.prelude.get`) all
@@ -300,7 +305,7 @@ Without parameters, it writes the whole config the MacStudio way (`test/mcdonges
 export CONFIG_PATH="$HOME/config"
 export CONFIG_FILE="user.env"
 export CONFIG="$HOME/config/user.env"
-export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"
+export PATH="$HOME/oosh:$HOME/oosh/ng:/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export BASH_FILE="/usr/bin/bash"
 export ODOCKER_WORKSPACES="…"          # only when set (config set / odocker)
 . $CONFIG_PATH/oosh.env
