@@ -152,6 +152,18 @@ export PATH="$HOME/oosh:$HOME/oosh/ng:/opt/homebrew/bin:$HOME/.local/bin:/usr/lo
 read it. It cannot guard itself, so `this` drops repeated segments on every
 `source this` (`private.this.path.dedup`, T-THIS-PATH-NO-GROWTH).
 
+**What oosh cannot reach.** A login file that changes PATH *after* it sourced
+`.bashrc` — an installer's `export PATH="$HOME/.local/bin:$PATH"` appended to
+`~/.bash_profile` — puts its directory in front again once oosh has finished.
+Remove such a line: `user.env`'s PATH line already carries the directory.
+`platform.shared.configLayout` invariant 8 checks a login shell for it.
+
+**A shell needs `HOME`.** There is no host-wide login file (the MacStudio model),
+so a bare `env -i bash -l` — no `HOME`, so bash cannot find `~/.bash_profile` —
+is not an oosh shell. The routes from an empty environment are `user login
+<user>` (`su -` sets `HOME`) and `source ~/oosh/this`, which derives `HOME` itself
+(invariant 7). `env -i HOME="$HOME" bash -l` works too.
+
 Every `PATH=` / `export PATH=` in the tracked tree is therefore a violation unless
 it carries a marker:
 
