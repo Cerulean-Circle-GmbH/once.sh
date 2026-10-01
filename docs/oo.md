@@ -125,7 +125,8 @@ Creates `test/test.myscript` from `templates/code/newScriptTest`.
 ### oo.mode
 
 With no argument, shows current branch status and git remote configuration.
-With a branch, switches to that branch's worktree.
+With a branch, switches `~/oosh` to that branch's folder under the base —
+cloning it first when the folder is missing.
 
 ```bash
 oo mode
@@ -133,35 +134,91 @@ oo mode
 # git branch is: * dev
 # OOSH_MODE=dev
 
-oo mode dev        # switch to the dev worktree
-oo mode testing
+oo mode dev        # switch to the dev folder
+oo mode testing    # cloned into <base>/testing first if it is not there
 ```
 
 The branch is an **argument**, not part of the method name — `oo.mode()` takes
-`<?branch>`. Tab completion offers the available worktree branches.
+`<?branch>`. Tab completion offers the available branch folders.
 
-### The worktree layout
+### The clone layout
 
 Every `oo mode*` verb assumes one on-disk shape, and it is a **contract**, not a
-convention:
+convention. Since the ogit plan (design:
+[spec § 2](superpowers/specs/2026-09-23-ogit-clones-per-branch-design.md)) every
+folder is an **independent clone** — the linked-worktree layout it replaced is
+described under [§ Converting between the layouts](#converting-between-the-layouts):
 
 ```
-<base>/
-├── main/          ← the repository. .git is a real DIRECTORY
-├── dev/           ← a linked worktree. .git is a FILE: "gitdir: …/main/.git/worktrees/dev"
-└── prod/          ← likewise
+<base>/            ← "the base": group dev, setgid (g+ws) — new folders inherit the group
+├── main/          ← clone of main. Always present: it is how the base is found
+├── dev/           ← clone of dev.     .git is a DIRECTORY, origin = GitHub
+├── testing/       ← clone of testing  (created on demand: oo checkout testing)
+├── prod/          ← clone of prod
+└── my.thing/      ← clone of feature/my-thing (prefix stripped, / → .)
 ```
 
-`main` is load-bearing. `oo.mode.base.get` has four strategies and the three that
-work without an environment variable all key on a directory **named** `main`:
-the first worktree in `git worktree list` being called `main`, a sibling `main/`
-next to a linked worktree, or being `main/` itself. A layout with no `main/` is
-undetectable — which is exactly the bug
-[item 7](research/2026-09-16-item7-oo-mode-setup.md) fixed.
+Each folder has its own `.git` **directory**, `origin` on GitHub, and is checked
+out on the branch its name says. Each `.git` is group-shared:
+`core.sharedRepository=group`, group `dev`, g+w and setgid (`ogit repo.share`).
+
+**The `main/` rule.** `main/` is load-bearing. `oo.mode.base.get` has four
+strategies and the ones that work without an environment variable key on a
+directory **named** `main`: a sibling `main/` with a `.git` directory, or being
+`main/` itself (the worktree-list strategy still matches a host that has not
+been converted). A layout with no `main/` is undetectable — which is exactly
+the bug [item 7](research/2026-09-16-item7-oo-mode-setup.md) fixed. Nothing
+ever removes `main/`.
 
 `$OOSH_COMPONENTS_DIR` is the fourth route, and it is **process-scoped only**:
 `config` excludes it from every save on purpose. Do not rely on it surviving a
 shell. Build the layout instead.
+
+**New folders are always clones under the base.** `oo checkout <version>` and
+`oo mode <branch>` (for a folder that is missing) clone into `<base>/<dir>` via
+`private.oo.branch.clone.ensure` — the same helper install state 31 uses — and
+then share and trust the new folder. Without a base both refuse with
+`no components base — run oo mode.setup`; there is no "clone beside `~/oosh`"
+mode any more. An existing folder is never cloned over: a clone on the right
+branch is kept, a linked worktree from an older install is left alone with a
+pointer to `sudo ogit worktree.remove`, anything else refuses.
+
+**Trust is per folder.** git's `safe.directory` is per repository, so every
+folder under the base needs its own entry for every user who touches it
+(otherwise `fatal: detected dubious ownership`). `ogit safeDirectory.ensure
+<?base>` adds them for the calling user; `oo update`, `oo user.fix` /
+`config init.user` and `user.oosh.install` run it for you; install state 31
+trusts every folder for root, shares each one, and sets group `dev` + setgid on
+the base.
+
+**Reporting.** `ogit layout.status` prints one line per folder — `clone` or
+`worktree`, dirty/ahead/behind counts, `shared=` `setgid=` `trusted=` — and
+returns 1 on a mixed layout. The platform test
+`./test.suite run platform.shared.layout.invariant 1` asserts the whole
+contract (every folder a trusted, shared clone; the base group `dev` with
+setgid) and names the recovery command for each failure.
+
+### Converting between the layouts
+
+A host installed before the clone layout still has `main/` as the only
+repository and the other folders as **linked worktrees** of it (`.git` is a
+FILE: `gitdir: …/main/.git/worktrees/dev`). Install and `oo update` never
+convert it — conversion is an explicit, user-run step:
+
+```bash
+ogit layout.status            # see what you have
+sudo ogit worktree.remove     # every linked worktree → an independent clone
+sudo ogit worktree.restore    # the exact reverse, if you need the old layout back
+```
+
+Both are gated: they refuse, naming the folder and the fix, on a dirty folder,
+an unpushed one, one without an upstream, or a detached one — before touching
+anything. Gitignored files are carried across, and a copy is kept under
+`~/.oosh.backups/<UTC-stamp>-ogit-<folder>` (root's `$HOME` under sudo).
+`worktree.restore` additionally refuses when `main/` holds unpushed commits on
+a local branch it would reset. `sudo` resets `PATH`, so on a host where root's
+PATH has no oosh, run the script by path: `cd ~/oosh && sudo ./ogit worktree.remove "$(oo mode.base.get)"`. The step-by-step runbook is
+[ogit.md § Migrating a host from worktrees to clones](ogit.md#migrating-a-host-from-worktrees-to-clones).
 
 ### oo.mode.setup
 
@@ -173,7 +230,8 @@ oo mode.setup /var/dev/trees  # or name the base explicitly
 ```
 
 It copies the clone to `<base>/main`, verifies that copy is a real repository,
-removes the original, adds `<base>/<branch>` as a worktree, and **checks that
+removes the original, makes `<base>/<branch>` an independent clone of it (origin
+re-pointed at `main/`'s origin, group-shared), and **checks that
 `oo.mode.base.get` can find the base with `OOSH_COMPONENTS_DIR` unset** before
 it touches `~/oosh`. If that check fails it stops with the layout built and the
 old symlink intact.
@@ -195,8 +253,8 @@ shell, run `oo mode.setup`.
 
 ### oo.checkout
 
-Bring a remote branch onto this machine — as a worktree when the canonical
-layout is there, as a plain clone when it is not.
+Bring a remote branch onto this machine — always as its own clone under the
+components base.
 
 ```bash
 oo checkout testing              # → <base>/testing
@@ -207,22 +265,27 @@ The directory name is derived, not copied: a leading `test/`, `feature/` or
 `bugfix/` is stripped and the remaining slashes become dots, so
 `feature/my-thing` lands at `my.thing` and `oo mode my.thing` works.
 
-Which mode it takes depends on `oo.mode.base.get` — see
-[§ The worktree layout](#the-worktree-layout). With a base it runs
-`git worktree add` under it; without one it clones as a sibling of `~/oosh`,
-taking the remote URL from the existing checkout.
+It needs a base — see [§ The clone layout](#the-clone-layout). It fetches,
+clones `<version>` from the existing checkout's `origin` URL into
+`<base>/<dir>` (`private.oo.branch.clone.ensure`, the helper install state 31
+uses), then shares the folder (`ogit repo.share`) and trusts it for you
+(`ogit safeDirectory.add`). Without a base it refuses with
+`no components base — run oo mode.setup` — the old "plain clone beside
+`~/oosh`" mode is gone. `oo checkout testing` is the prerequisite for the first
+`promote testing` on a host without a `testing/` folder
+([promote.md § Where the merge happens](promote.md#where-the-merge-happens--each-stage-in-its-own-folder)).
 
 **It does not pull.** A branch that is already present is reported and left
 alone, with a pointer to `oo update`. That is deliberate: pulling belongs to
 `oo update` and merging belongs to `promote` / `oo stage`, and conflating them
 here meant `oo checkout dev` silently fetched and merged `origin/dev` — a
 surprise from a command whose name says checkout. The one thing it *will*
-change is a worktree whose git branch has drifted from its directory name: it
+change is a folder whose git branch has drifted from its directory name: it
 checks the branch out again to realign them, which is what `oo mode` assumes.
 
 `create.result` on every branch and `return $(result)` at the end, so it can be
-chained and its status trusted. On a failed clone it removes the half-made
-directory rather than leaving one behind.
+chained and its status trusted. On a failed clone `ogit repo.clone` removes
+the half-made directory it created, and never one it did not.
 
 ### oo.use
 
@@ -233,7 +296,7 @@ oo use main ossh status          # run main's ossh, stay on dev
 oo use testing test.suite core 1
 ```
 
-The branch directory is found under the worktree base, falling back to a
+The branch directory is found under the components base, falling back to a
 sibling of `~/oosh`. The command is then executed with `OOSH_DIR` pointed at
 that branch — a scoped child-process override, which is the one sanctioned
 exception to the `OOSH_DIR` anchor rule (`oosh-dir-exception` in the code;
@@ -286,9 +349,9 @@ so `oo <TAB>` offered verbs with nothing behind them.
 
 | Verb | What it does |
 |---|---|
-| `oo mode.list` | the branches available as worktrees, with each one's git status |
+| `oo mode.list` | the branch folders under the base, with each one's git status (for the layout itself: `ogit layout.status`) |
 | `oo branch.list <?source:all>` | branches from `worktrees`, local `git`, and/or `remote` — `all` merges them |
-| `oo mode.align` | checks the git branch out again to match the worktree's directory name, for a tree that has drifted. `oo checkout` does the same repair for a branch it is asked to bring in |
+| `oo mode.align` | checks the git branch out again to match the folder's directory name, for a tree that has drifted. `oo checkout` does the same repair for a branch it is asked to bring in |
 | `oo mode.stage <stage>` | promote a stage forward (`dev` → `testing` → `prod`). An alias of `oo stage`; the pipeline itself is [§ Promotion Commands](#promotion-commands-via-oo-wrappers) and lives in `promote` |
 | `oo prereqs.install` | install the install-time prereqs locally — `git`, `curl`, and `bash` 4+ when the running shell is older. Called by `init/oosh` through `ossh prereqs.install`; you rarely type it |
 ### oo.update
