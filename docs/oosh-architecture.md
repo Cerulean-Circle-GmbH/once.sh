@@ -412,6 +412,7 @@ this.call() {
 | `ossh` | SSH key/config management |
 | `state` | State machine for multi-step workflows |
 | `user` | User and SSH identity management |
+| `ogit` | The only git caller; [docs/ogit.md](ogit.md) |
 
 ---
 

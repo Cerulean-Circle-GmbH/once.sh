@@ -45,6 +45,7 @@ These scripts wrap external tools with oosh method syntax for easier use:
 | `claudeCode` | Claude Code CLI | `claudeCode session`, `claudeCode resume` |
 | `claudeFlow` | Claude Flow orchestration | `claudeFlow tmux.init`, `claudeFlow list`, `claudeFlow swarm.status` |
 | `otmux` | tmux terminal multiplexer | `otmux new`, `otmux list`, `otmux attach` |
+| `ogit` | git | `ogit branch.get`, `ogit remote.pull`, `ogit safeDirectory.ensure`, `ogit caller.validate` |
 
 **Repair toolkit** — when something feels broken, see [docs/repair-toolkit.md](docs/repair-toolkit.md): `oo user.fix`, `config init.user`, `config init.shared`, `ossh rights.fix`, `ossh folder.fix`. The first two heal user-level `~/config` + `~/oosh` symlinks; the others handle shared-config perms and SSH layout drift.
 
