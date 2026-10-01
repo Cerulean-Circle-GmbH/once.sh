@@ -647,20 +647,33 @@ def resolve_jsonl(pane):
 
 def ctx_from_jsonl(path, denom_k):
     used = 0
+    pending = 0   # content-bearing entries since the last assistant-usage (rewind-safety content-lag guard)
     try:
         with open(path) as fh:
             for line in fh:
-                if '"input_tokens"' not in line: continue
-                try:
-                    d = json.loads(line)
-                    if d.get("type") == "assistant":
-                        u = d.get("message", {}).get("usage", {})
-                        if u and "input_tokens" in u:
-                            t = u["input_tokens"] + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                            if t > 0: used = t
-                except Exception: pass
+                if '"input_tokens"' in line:
+                    try:
+                        d = json.loads(line)
+                        if d.get("type") == "assistant":
+                            u = d.get("message", {}).get("usage", {})
+                            if u and "input_tokens" in u:
+                                t = u["input_tokens"] + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                                if t > 0:
+                                    used = t
+                                    pending = 0   # a recorded turn resets the un-recorded window
+                                    continue
+                    except Exception: pass
+                # content-bearing entries inflate the un-recorded window (mid-reboot: context.md/learnings/reads).
+                # attachment/tool_use dominate a real reboot — user/tool_result-only would be BLIND (per a317633).
+                if ('"type":"user"' in line or '"type":"attachment"' in line or '"type":"tool_result"' in line or '"type":"tool_use"' in line
+                    or '"type": "user"' in line or '"type": "attachment"' in line or '"type": "tool_result"' in line or '"type": "tool_use"' in line):
+                    pending += 1
     except Exception: return None
     if used == 0: return None
+    # Content-lag guard (mirror claudeCode a317633): a big un-recorded window (>8 content-bearing entries)
+    # after the last assistant-usage means 'used' is a stale LOWER-BOUND (mid-reboot) → SIGNAL lag, not a
+    # false-LOW number that would mislead the walling direction. 'lag' is distinct from the tuple AND None.
+    if pending > 8: return "lag"
     return used, round(used * 100 / (denom_k * 1000)), denom_k
 
 def classify(cap):
@@ -712,12 +725,18 @@ def main():
             state = classify(cap)
             jl = resolve_jsonl(f"{sess}:{idx}")
             ctx = ctx_from_jsonl(jl, 1000) if jl else None
-            if state == "ON-WALL" and (ctx is None or ctx[1] < 98):
+            lagging = (ctx == "lag")   # content-lag sentinel: JSONL is a stale LOWER-BOUND mid-reboot
+            # ON-WALL double-gate: a wall banner + a RELIABLE pct<98 is stale → IDLE. A LAGGING ctx is NOT
+            # reliable (false-LOW) and must NEVER downgrade a VISIBLE wall (oopPO: a ~67%-used rebooting agent
+            # reads false-low). 'not lagging' short-circuits BEFORE ctx[1] so 'lag' is never indexed (py3 str<int raises).
+            if state == "ON-WALL" and not lagging and (ctx is None or ctx[1] < 98):
                 state = "IDLE"   # double-gate: a wall banner without pct>=98 is stale, not the wall
             if rewind_marked(f"{sess}:{idx}"):
                 state = "DURING-REWIND"   # DECLARED by the driver — overrides capture (hands-off window)
             sc = STATE_COLOR.get(state, "")
-            if ctx:
+            if lagging:
+                ctxs = f"{DIM}?ctx-lag(reboot){RST}"   # defer the pct — JSONL lags the live context mid-reboot
+            elif ctx:
                 used, pct, dk = ctx
                 cc = "\033[91m" if pct >= 90 else ("\033[93m" if pct >= 80 else "\033[32m")
                 mark = "⚠" if pct >= 80 else " "
