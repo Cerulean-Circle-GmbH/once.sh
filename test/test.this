@@ -784,6 +784,107 @@ test.this.gitAliasesDelegate() {
 test.case $level "T-THIS-GIT-ALIASES: this.git.branch.short / commits.count delegate to ogit" test.this.gitAliasesDelegate
 expect 0 "this.git.* delegate to ogit and still answer" "callers outside this tree keep working"
 
+
+# ============================================================================
+# T-THIS-AS-USER-PREAMBLE: the preamble anchors on the TARGET home, not the caller
+# ============================================================================
+# config.init.user and user.oosh.install both hop into `private.as.user … bash -c`
+# to work as another user. runuser keeps the caller's environment, so root's
+# CONFIG/CONFIG_PATH/OOSH_DIR leaked through, and the string used to source
+# "$OOSH_DIR/this" — expanded by the CALLER, i.e. /root/oosh/this, which the
+# target user cannot read (/root is 0700). Every source then failed silently
+# and the bashrc heal of another user never ran. This drives the preamble as
+# the same user against a fixture home, with the caller's anchors deliberately
+# poisoned, and reads back what the inner shell actually stood up.
+test.this.asUserPreamble() {
+  local shared home out expected bad=""
+  shared=$(private.this.path.canonical "$OOSH_DIR")
+  # (a) a user WITH a user.env — the anchors must be the target's, as data.
+  home=$(test.suite.fixture.make asUserPreamble)
+  mkdir -p "$home/config"
+  # The fixture's user.env in the MacStudio layout config save writes (pure data;
+  # T-CONFIG-SAVE-USER-ENV-LAYOUT pins it), without the chain lines: no oosh.env here.
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' 'export CONFIG_FILE="user.env"' \
+    'export CONFIG="$HOME/config/user.env"' 'export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"' \
+    'export BASH_FILE="/usr/bin/bash"' > "$home/config/user.env"
+  out=$(CONFIG=/caller/config/user.env CONFIG_PATH=/caller/config OOSH_DIR=/caller/oosh USER=caller \
+        bash -c "$(private.this.as.user.preamble.get target "$home" "$shared")
+echo \"[\$HOME|\$USER|\$OOSH_DIR|\$CONFIG_PATH|\$CONFIG|\${PATH%%:*}]\"" 2>&1 | tail -1)
+  expected="[$home|target|$home/oosh|$home/config|$home/config/user.env|$shared]"
+  [ "$out" = "$expected" ] || bad="$bad with-user.env=>$out (want $expected)"
+  rm -rf "$home"
+  # (b) a user WITHOUT one yet (mid-install): the constants still hang off the
+  # target's HOME, and the shared tree is first on PATH so `user`/`ossh` resolve.
+  home=$(test.suite.fixture.make asUserPreambleBare)
+  out=$(CONFIG=/caller/config/user.env CONFIG_PATH=/caller/config OOSH_DIR=/caller/oosh USER=caller \
+        bash -c "$(private.this.as.user.preamble.get target "$home" "$shared")
+echo \"[\$HOME|\$USER|\$OOSH_DIR|\$CONFIG_PATH|\$CONFIG|\${PATH%%:*}]\"" 2>&1 | tail -1)
+  expected="[$home|target|$home/oosh|$home/config||$shared]"
+  [ "$out" = "$expected" ] || bad="$bad without-user.env=>$out (want $expected)"
+  rm -rf "$home"
+  if [ -n "$bad" ]; then
+    create.result 1 "the inner shell did not anchor on the target:$bad"
+  else
+    create.result 0 "the inner shell anchors on the target home and finds the shared tree first"
+  fi
+  return $(result)
+}
+test.case $level "T-THIS-AS-USER-PREAMBLE: the preamble anchors on the target home, not the caller" \
+  test.this.asUserPreamble
+expect 0 "the inner shell anchors on the target home and finds the shared tree first" \
+  "config.init.user used to make the target source the CALLER's \$OOSH_DIR/this — unreadable under /root"
+
+
+# ============================================================================
+# T-PRIVATE-CALLS-DEFINED: no script calls a private.* function that does not exist
+# ============================================================================
+# Task 17 (carried over 2026-10-01) made user.oosh.install call
+# private.this.as.user.preamble.get, which the rolled-back tree no longer had.
+# The call sat behind 2>/dev/null, so the git trust entry for every other user
+# was silently never written — only the platform run (oosh-user, bash-user:
+# "dubious ownership") showed it. This scans every tracked bash script (docs,
+# test, templates, old, restore, sessions, .claude and the legacy init/once
+# aside) for private.* names, comments stripped, names built at runtime
+# (followed by $ or .$) skipped. A name is defined when a function of that
+# name exists, or when it is the stem of a family (os.check private.x picks
+# private.x.linux / private.x.darwin at runtime).
+test.this.privateCallsUndefined() { # <treeRoot> # echo "<file> <name>" for every call to an undefined private.* function
+  local root="$1" files f
+  files=$(ogit.repo.files.list "$root" | grep -vE '^(docs|test|old|restore|templates|sessions|\.claude)/|^init/once$' \
+    | while IFS= read -r f; do [ -f "$root/$f" ] && head -1 "$root/$f" | grep -qE '^#!.*(ba)?sh' && printf '%s\n' "$f"; done)
+  local defined; defined=$(printf '%s\n' "$files" | while IFS= read -r f; do
+    grep -oE '^[[:space:]]*private\.[A-Za-z0-9_.]+\(\)' "$root/$f"; done | sed -E 's/^[[:space:]]*//; s/\(\)$//' | sort -u)
+  printf '%s\n' "$files" | while IFS= read -r f; do
+    sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#[[:space:]].*$//' "$root/$f" \
+      | grep -oE 'private\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*[.]?[$]?' | grep -vE '[.$]$' | sort -u \
+      | while IFS= read -r name; do
+          printf '%s\n' "$defined" | grep -qxF "$name" && continue
+          printf '%s\n' "$defined" | grep -qF "$name." && continue
+          echo "$f $name"
+        done
+  done
+}
+test.this.privateCallsDefined() {
+  [ "$(type -t ogit.repo.files.list)" = function ] || private.this.script.load ogit ogit.branch.get
+  local fx bad="" out
+  # planted: one undefined call, one defined, one os.check family — only the first is reported
+  fx=$(test.suite.fixture.make privcalls); ogit.raw "$fx" init -q
+  printf '%s\n' '#!/usr/bin/env bash' 'private.p.defined() { :; }' 'private.p.family.linux() { :; }' \
+    'a() { private.p.defined; os.check private.p.family; private.p.missing; x=private.p.built.$y; }' \
+    '# private.p.inAComment' > "$fx/probe"
+  ogit.raw "$fx" add probe; ogit.raw "$fx" -c user.email=t@t -c user.name=t commit -q -m plant
+  out=$(test.this.privateCallsUndefined "$fx" | tr '\n' ' ')
+  [ "$out" = "probe private.p.missing " ] || bad="$bad planted=[$out]"
+  rm -rf "$fx"
+  out=$(test.this.privateCallsUndefined "$OOSH_DIR" | tr '\n' ' ')
+  [ -z "$out" ] || bad="$bad tree=[$out]"
+  [ -z "$bad" ] && create.result 0 "every private.* call has a definition" || create.result 1 "undefined private calls:$bad"
+  return $(result)
+}
+test.case $level "T-PRIVATE-CALLS-DEFINED: no script calls a private.* function that does not exist" test.this.privateCallsDefined
+expect 0 "every private.* call has a definition" \
+  "user.oosh.install called a missing helper behind 2>/dev/null; every other user lost git trust"
+
 ### test.method
 
 test.suite.save.results
