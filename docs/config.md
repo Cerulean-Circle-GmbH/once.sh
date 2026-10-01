@@ -36,7 +36,7 @@ The config system supports:
 | `~/config/oosh.env` | OOSH-specific variables |
 | `~/config/log.env` | Logging configuration (shared: `LOG_LEVEL`, `LOG_LEVEL_RESET`) |
 | `~/config/<name>.env` | Custom named configs |
-| `$OOSH_USER_CONFIG_PATH/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
+| `$HOME/.config/oosh/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
 
 > **Tests must never write the shared tier.** It is site-wide: a test that reaches `config save`
 > rewrites `user.env` / `oosh.env` / `log.env` for every user on the box. Use
@@ -50,7 +50,7 @@ The config system supports:
 `~/config` (`$CONFIG_PATH`) usually symlinks to one shared `sharedConfig`
 directory, so everything in it is **shared across all users** — only site-wide
 data belongs there. Anything per-user or per-session lives instead in the
-user's private `$OOSH_USER_CONFIG_PATH` (default `~/.config/oosh`, the same dir
+user's private `~/.config/oosh` (the same dir
 `oo` uses for `mode-env.bash`). `config list` reads both tiers by name, so
 `config list log.session` shows the per-user `log.session.env`. The per-user
 lookup is **read-only** — `config save`/`add`/`delete`/`edit` operate only on
@@ -58,7 +58,7 @@ the shared `$CONFIG_PATH` tier.
 
 The two tiers are linked by a source chain, exactly like `user.env` chains
 `oosh.env`/`log.env`: the generated shared `log.env` ends with
-`source $OOSH_USER_CONFIG_PATH/log.session.env` (the var written **unexpanded**,
+`. $HOME/.config/oosh/log.session.env` (written **unexpanded**,
 so each user loads their OWN file — no leak). So `config list log` shows the
 session file nested under it, and — because the chain is sourced at shell init —
 the saved per-user `LOG_NAME` (and the rest) are actually **loaded** each login,
@@ -73,7 +73,7 @@ so the chain line needs no guard and a first-ever shell has no missing-source er
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
 | `$CONFIG_PATH` | `~/config` | Shared config directory — **always** the `~/config` symlink itself, never the `sharedConfig` it points at (see [The anchor rule](#the-anchor-rule)) |
 | `$CONFIG_FILE` | `user.env` | Current config filename |
-| `$OOSH_USER_CONFIG_PATH` | `~/.config/oosh` | **Per-user** (non-shared) oosh config dir — single source of truth, anchored by `this.init` and carried by `oosh.env` |
+| — | `~/.config/oosh` | **Per-user** (non-shared) oosh dir, spelled `$HOME/.config/oosh` directly. The `OOSH_USER_CONFIG_PATH` variable that used to name it was removed 2026-10-01: it was always this value (T44) |
 
 ## The anchor rule
 
@@ -81,7 +81,7 @@ so the chain line needs no guard and a first-ever shell has no missing-source er
 folder it happens to point at, never a `BASH_SOURCE`/`$0` walk, never
 `oo.mode.base.get`. **`CONFIG_PATH` is always `~/config`** — the user's `config`
 symlink, never the shared `sharedConfig` directory it points at. `CONFIG` is
-`~/config/user.env` and `OOSH_USER_CONFIG_PATH` is `~/.config/oosh`.
+`~/config/user.env`, and the per-user dir is always `~/.config/oosh` (no variable).
 
 In code and in the env files they are written `"$HOME/oosh"` / `"$HOME/config"`,
 because a tilde inside quotes does **not** expand, and `$HOME/…` is safe in POSIX
@@ -324,15 +324,15 @@ export BASH_FILE="/usr/bin/bash"
 ```
 
 - `config.save oosh OOSH` → `oosh.env`: **every** `OOSH_*` setting — not the runtime readings of the saving shell (see *Excluded variables*).
-- `config.save log LOG` → `log.env`: **every** `LOG_*` setting except the per-user session values (below), and as its **last** line `. $OOSH_USER_CONFIG_PATH/log.session.env` — written by every save of `log.env`, exactly once, unguarded.
-- `oosh.env` is chained **before** `log.env`: the chain line needs `OOSH_USER_CONFIG_PATH`, which lives in `oosh.env`.
+- `config.save log LOG` → `log.env`: **every** `LOG_*` setting except the per-user session values (below), and as its **last** line `. $HOME/.config/oosh/log.session.env` — written by every save of `log.env`, exactly once, unguarded.
+- `log.env`'s last line spells `$HOME/.config/oosh` directly, so it needs nothing from `oosh.env`. A host's old line (`. $OOSH_USER_CONFIG_PATH/log.session.env`) is rewritten by `config save` and by `oo update` / `oo user.fix` (`private.config.log.chain.migrate`, T-CONFIG-LOG-CHAIN-MIGRATE).
 - `ODOCKER_WORKSPACES` is **not** in `user.env`: it lives in `odocker.env` (`odocker workspace.set`), which `user.env` chains. This departs from the MacStudio branch, where `config set` put it into `user.env`.
 - The PATH line is data (`# path-exception:` in `config.save`); `this` de-duplicates PATH when `user.env` is sourced again.
 - **Every other chain is kept.** A line `. $CONFIG_PATH/odocker.env`, or one `config add myapp` appended, is read before `user.env` is rewritten and added back after `oosh.env` and `log.env`, in its order, once — even when its file is missing. A legacy `source $CONFIG_PATH/x.env` line comes back as `. $CONFIG_PATH/x.env` (`private.config.chain.names.get`; T-CONFIG-CMD-SAVE-USER-KEEPS-CHAINS).
 
 **The shared config and `$HOME`.** The `~/config` symlink points at a location shared by every user of the host (`…sharedConfig/`). So a value under the **saving** user's home is never written as that user's absolute path: `private.config.variable.export.line` writes it as `"$HOME/…"` (only the prefix — the rest keeps bash's `declare -p` quoting), and every reader expands it to their own home. `OOSH_DIR="$HOME/oosh"`, `CONFIG_PATH="$HOME/config"`, `OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"` are therefore correct for everyone. Pinned by `test/test.config` T29 and T-CONFIG-SAVE-PREFIX-OOSH.
 
-**Per-user session values.** `LOG_NAME`, `LOG_DEVICE` and `LOG_LIVE` are **not** saved in the shared `log.env`: a new user would inherit the saver's values. They live only in each user's private `$OOSH_USER_CONFIG_PATH/log.session.env` (written by `log.session.save`, see [log.md](log.md)), which `log.env` chains last. Every user has that file: `config init.user` and the install create it with `private.config.session.file.ensure`.
+**Per-user session values.** `LOG_NAME`, `LOG_DEVICE` and `LOG_LIVE` are **not** saved in the shared `log.env`: a new user would inherit the saver's values. They live only in each user's private `$HOME/.config/oosh/log.session.env` (written by `log.session.save`, see [log.md](log.md)), which `log.env` chains last. Every user has that file: `config init.user` and the install create it with `private.config.session.file.ensure`.
 
 **`config save` typed at the prompt.** `config` then runs as a **child process**: it does not re-read `user.env`, so it saves what the shell **exported**. `test/test.config` T-CONFIG-CMD-SAVE-* run the real executable under `env -i` to pin exactly that.
 
@@ -406,7 +406,7 @@ Lists the content of a config file.
 ./config list oosh
 ./config list log
 
-# List the per-user tier by name (reads $OOSH_USER_CONFIG_PATH/log.session.env)
+# List the per-user tier by name (reads $HOME/.config/oosh/log.session.env)
 ./config list log.session
 ```
 

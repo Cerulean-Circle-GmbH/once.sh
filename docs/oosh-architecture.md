@@ -267,8 +267,8 @@ scriptname.start "$@"  # Entry point
 When a script like `myScript` boots, dependencies load in this order:
 
 An interactive shell starts from `~/config/user.env` (sourced by `bashrcTemplate`),
-whose pure-data chain sets the anchors (`CONFIG_PATH`, `OOSH_DIR`,
-`OOSH_USER_CONFIG_PATH`) and the PATH line; `.bashrc` then loads `log` — see
+whose pure-data chain sets the anchors (`CONFIG_PATH`, `OOSH_DIR`) and the
+PATH line; `.bashrc` then loads `log` — see
 [config.md § The PATH line](config.md#the-path-line). A script invoked directly
 starts via `source this`, which reads `~/config/user.env` itself when no
 `.bashrc` ran:
@@ -279,7 +279,7 @@ starts via `source this`, which reads `~/config/user.env` itself when no
 2. source this                    # OOSH kernel
    │
    ├─ this.init                   # Initialize environment
-   │   ├─ Sets OOSH_DIR, CONFIG_PATH, OOSH_USER_CONFIG_PATH
+   │   ├─ Sets OOSH_DIR, CONFIG_PATH
    │   └─ . $CONFIG               # Load user.env (pure data)
    │       ├─ . oosh.env          # OOSH configuration
    │       └─ . log.env           # Log configuration
@@ -453,7 +453,7 @@ export CONFIG_FILE="user.env"
 # ~/config/log.env  (shared)
 export LOG_LEVEL="1"
 export LOG_LEVEL_RESET="1"
-. $OOSH_USER_CONFIG_PATH/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
+. $HOME/.config/oosh/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
 ```
 
 Note POSIX `.` (not the bash `source` builtin) so dash/ash shells can source the chain.
@@ -702,7 +702,7 @@ Verified by `T-THIS-SUDO-SELF-HEAL` (test/test.oo).
 
 In multi-user installs (`~/config` is a shared symlink), the per-user log vars
 must never leak into the shared config. `LOG_LIVE` (and `LOG_NAME`/`LOG_DEVICE`)
-live in the **per-user** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
+live in the **per-user** `$HOME/.config/oosh/log.session.env` (default
 `~/.config/oosh/log.session.env`), not in the shared `~/config/log.env`;
 `config.save` filters them out of the shared tier. See [Log System](log.md) and
 [config.md § two config tiers](config.md) for the read+write defenses.
