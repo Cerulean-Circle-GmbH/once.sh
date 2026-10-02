@@ -103,7 +103,7 @@ declare -- TEST_LOG_LIVE="/tmp/test.log.live.44933"       # test internal
 |----------|------|------|
 | `test/test.log:175` | `export LOG_LEVEL=5` | Needed to test `debug.log` — can leak via `config.save` |
 | `test/test.log:191` | `export LOG_LEVEL=4` | Same |
-| `test/test.debug:94` | `export LOG_LEVEL=5` | Needed to test `toggleDebug` — same leak risk |
+| `test/test.debug:94` | `export LOG_LEVEL=5` | Needed to test `debug.toggleDebug` — same leak risk |
 | `test/test.debug:272` | `export LOG_LEVEL=4` | Same |
 | `debug:31-32` | `if [ -z "$LOG_LEVEL" ]; then LOG_LEVEL=5` | Fallback if LOG_LEVEL is empty — silently elevates |
 

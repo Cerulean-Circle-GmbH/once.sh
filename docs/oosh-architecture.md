@@ -309,7 +309,7 @@ source $OOSH_DIR/debug
 # debug line 1: source $OOSH_DIR/log
 
 # log provides: info.log, error.log, debug.log, etc.
-# debug provides: step(), stackTrace(), setTrap(), etc.
+# debug provides: debug.step(), debug.stackTrace(), debug.setTrap(), etc.
 
 # Dependency chain:
 # myScript → debug → log → (log.env for colors/levels)
@@ -630,7 +630,7 @@ $OOSH_DIR/
 # Enable step debugging
 export STEP_DEBUG=ON
 source debug
-setTrap
+debug.setTrap
 
 # Check function existence
 type -t scriptname.method
