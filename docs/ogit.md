@@ -54,6 +54,8 @@ my.method() # <?dir:$OOSH_DIR> # … #
 
 Where functions do not travel — `bash -c` strings, `private.as.user` hops, remote command strings — use the **command form**: `"$OOSH_DIR/ogit" <method> <params…>`.
 
+The folder helpers the converters use are kernel methods, shared with other scripts: `private.this.folder.entries.copy <from> <to>` (each entry, dotfiles included — never `<from>/.`) and `private.this.folder.share <dir>` (group dev, g+w, setgid; never chown). `odocker workspace.seed` uses the same two.
+
 ### Completion
 
 `ogit` follows [oosh-architecture.md § Completion Function Rules](oosh-architecture.md#completion-function-rules):
