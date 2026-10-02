@@ -37,7 +37,8 @@ The config system supports:
 | `~/config/log.env` | Logging configuration (shared: `LOG_LEVEL`, `LOG_LEVEL_RESET`) |
 | `~/config/<name>.env` | Custom named configs |
 | `$HOME/.config/oosh/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
-| `$HOME/.config/oosh/user.session.env` | **Per-user** half of `user.env`: the user's real `PATH` (no `$` at all) and `OOSH_MODE` (`config session.save`) |
+| `$HOME/.config/oosh/user.session.env` | **Per-user** half of `user.env`: the user's real `PATH` (no `$` at all) (`config session.save`) |
+| `$HOME/.config/oosh/oosh.session.env` | **Per-user** half of `oosh.env`: `OOSH_MODE`, the branch the user's own `~/oosh` points at (`config session.save`) |
 
 > **Tests must never write the shared tier.** It is site-wide: a test that reaches `config save`
 > rewrites `user.env` / `oosh.env` / `log.env` for every user on the box. Use
@@ -71,9 +72,17 @@ so the chain line needs no guard and a first-ever shell has no missing-source er
 what is the same for everyone — the `CONFIG_*` anchors and `BASH_FILE`, in their
 `$HOME` form — and its **last** line is `. $HOME/.config/oosh/user.session.env`.
 That per-user file holds what belongs to one user only: their **real `PATH`**,
-written out in full (no `$HOME`, no `:$PATH` — the file is theirs alone), and
-`OOSH_MODE`, the branch **their** `~/oosh` points at. Coming last, the personal
-values win. `config session.save` writes it; `config save` writes the saving
+written out in full (no `$HOME`, no `:$PATH` — the file is theirs alone).
+Coming last, the personal values win. **`oosh.env` forks the same way:** its last
+line is `. $HOME/.config/oosh/oosh.session.env`, which holds `OOSH_MODE` — the
+branch **their** `~/oosh` points at — so `config list oosh` shows it nested, as
+`config list log` shows `log.session`. One family, one personal file:
+
+| Shared (`~/config`) | last line chains | Personal (`~/.config/oosh`) |
+|---|---|---|
+| `user.env` | `. $HOME/.config/oosh/user.session.env` | `PATH` |
+| `oosh.env` | `. $HOME/.config/oosh/oosh.session.env` | `OOSH_MODE` |
+| `log.env` | `. $HOME/.config/oosh/log.session.env` | `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | `config session.save` writes it; `config save` writes the saving
 user's; `config init.user` and the install create it for every user, filled in
 their own hop (`private.config.session.file.ensure`).
 
@@ -349,6 +358,8 @@ export BASH_FILE="/usr/bin/bash"
 
 # ~/.config/oosh/user.session.env  (per user — config session.save)
 export PATH="/home/me/oosh:/home/me/oosh/ng:/home/me/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# ~/.config/oosh/oosh.session.env  (per user — config session.save; oosh.env chains it last)
 export OOSH_MODE="dev"
 ```
 
@@ -397,7 +408,11 @@ unguarded, and a plain `sh` ends on `.` of a missing file.
   switches: `config init.user` gives every linked user their files, each in their
   own hop (`private.config.session.files.ensure.all`), then
   `private.config.user.session.migrate` switches the shared files in place —
-  owner, group and mode kept, idempotent (T-CONFIG-USER-SESSION-MIGRATE).
+  owner, group and mode kept, idempotent (T-CONFIG-USER-SESSION-MIGRATE) —
+  and `private.config.oosh.session.migrate` gives `oosh.env` its chain to
+  `oosh.session.env` the same way, through its own gate (every linked user has
+  an `oosh.session.env`), then takes the transition copy of `OOSH_MODE` out of
+  the users' `user.session.env` (T-CONFIG-OOSH-SESSION-MIGRATE).
 
 ### Required variables
 
@@ -409,7 +424,7 @@ The exclusion list above says what must **never** persist. This says what a conf
 |---|---|---|
 | `BASH_FILE` | `user.env` | `command -v bash` |
 | `CONFIG_FILE` | `user.env` | `config.init` |
-| `OOSH_MODE` | `user.session.env` (per user — `private.config.required.file.path`) | `basename` of the canonical `~/oosh` |
+| `OOSH_MODE` | `oosh.session.env` (per user — `private.config.required.file.path`) | `basename` of the canonical `~/oosh` |
 | `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` |
 | `OOSH_PM` | `oosh.env` | `oo pm.discover` |
 | `LOG_LEVEL` | `log.env` | defaults to `1` |
