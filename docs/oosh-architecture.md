@@ -266,12 +266,24 @@ scriptname.start "$@"  # Entry point
 
 When a script like `myScript` boots, dependencies load in this order:
 
-An interactive shell starts from `~/config/user.env` (sourced by `bashrcTemplate`),
-whose pure-data chain sets the anchors (`CONFIG_PATH`, `OOSH_DIR`) and the
-PATH line; `.bashrc` then loads `log` — see
-[config.md § The PATH line](config.md#the-path-line). A script invoked directly
-starts via `source this`, which reads `~/config/user.env` itself when no
-`.bashrc` ran:
+The boot order is **bash → this → log → debug → config → every other oosh
+command**, from any entry — an empty shell (`env -i sh`) included:
+
+- **`bash`** reads `~/.bashrc` (`bashrcTemplate`) even without `HOME` (`~` reads
+  the password database). An old bash — macOS `/bin/bash` 3.2 from the system
+  PATH — first hands over to the config's `BASH_FILE`; then `.bashrc` runs
+  `unset CONFIG; source ~/oosh/this`.
+- **`this`** from an empty shell is found on the system PATH:
+  `/usr/local/bin/this` (`templates/user/thisLauncher`, installed by the
+  install, `oo update`, `oo user.fix`) recovers `HOME` from the OS identity and
+  starts the caller's own `~/oosh/this`. `this <method>` runs the method and
+  returns; plain `this` enters an interactive oosh bash and writes only the
+  user's own `user.session.env`.
+- **`this`** itself derives `HOME` when it is missing, then reads
+  `~/config/user.env`: the shared anchors and chains, and last the user's own
+  `~/.config/oosh/user.session.env` with their real PATH — see
+  [config.md § The PATH line](config.md#the-path-line). A script invoked
+  directly starts the same way, via `source this`:
 
 ```
 1. myScript.start "$@"
@@ -282,9 +294,10 @@ starts via `source this`, which reads `~/config/user.env` itself when no
    │   ├─ Sets OOSH_DIR, CONFIG_PATH
    │   └─ . $CONFIG               # Load user.env (pure data)
    │       ├─ . oosh.env          # OOSH configuration
-   │       └─ . log.env           # Log configuration
-   │           └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
-   │   (PATH is one data line in user.env; this de-duplicates it)
+   │       ├─ . log.env           # Log configuration
+   │       │   └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
+   │       └─ . user.session.env  # per-user real PATH + OOSH_MODE (last)
+   │   (PATH is one data line there; this de-duplicates it)
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
    │

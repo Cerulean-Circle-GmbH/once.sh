@@ -179,11 +179,15 @@ shared `user.env` still carries the old shared line written by
 Remove such a line: `user.env`'s PATH line already carries the directory.
 `platform.shared.configLayout` invariant 8 checks a login shell for it.
 
-**A shell needs `HOME`.** There is no host-wide login file (the MacStudio model),
-so a bare `env -i bash -l` — no `HOME`, so bash cannot find `~/.bash_profile` —
-is not an oosh shell. The routes from an empty environment are `user login
-<user>` (`su -` sets `HOME`) and `source ~/oosh/this`, which derives `HOME` itself
-(invariant 7). `env -i HOME="$HOME" bash -l` works too.
+**An empty shell is an oosh shell** (boss, 2026-10-02 — this reverses the
+30 Sep decision that a bare `env -i bash` is not one). From `env -i sh` — no
+`HOME`, only the system PATH — both `bash` and `this` bring the user back:
+`bash` still finds `~/.bashrc` (`~` reads the password database), which hands an
+old bash over to `BASH_FILE` and then loads `this` first, and `this` derives
+`HOME` from the OS identity; `this` is found on the system PATH as the launcher
+`/usr/local/bin/this` (one host-wide command, not a login file). A login file of
+the user's own must say `~/.bashrc`, not `$HOME/.bashrc`. `user login <user>`
+works as before. `platform.shared.boot` checks it all on every install.
 
 Every `PATH=` / `export PATH=` in the tracked tree is therefore a violation unless
 it carries a marker:
