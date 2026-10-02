@@ -1,0 +1,1349 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+# ogit - git wrapper for oosh
+# No flags, positional params only. Following: tmux→otmux, ssh→ossh, docker→odocker, git→ogit
+#
+# THE ONLY CALLER of the git binary in this tree (ogit caller.validate; T-OGIT-ONLY-CALLER).
+# Nouns are git objects, verbs are actions, qualifiers are parameters
+# (docs/superpowers/specs/2026-09-23-ogit-clones-per-branch-design.md § 3).
+# Every method takes <?dir:$OOSH_DIR> LAST — resolved inline as
+# `local dir="${N:-${OOSH_DIR:-.}}"` — and runs `git -C "$dir" …`, never `cd`.
+# Variadic exceptions, where <?dir> precedes the list: repo.grep, index.add, diff.check, raw.
+# Getters answer on stdout with no create.result; mutators create.result + return $(result).
+# Getters stay silent (2>/dev/null — they run in completion subshells). Mutators run
+# git through private.ogit.git.run, which keeps git stderr in OGIT_GIT_ERROR; a
+# failure RESULT is the ogit message + " — git: <reason>" (private.ogit.git.reason.get).
+
+private.ogit.require()     #  # rc 0 when the git binary is present; error.log + create.result 127 when it is not #
+{
+ # The one place a mutator learns git is missing; the check itself is ogit.binary.check.
+ ogit.binary.check && return 0
+ create.result 127 "ogit: git is not installed — run \`oo cmd git\`"
+ error.log "$RESULT"
+ return 127
+}
+
+
+private.ogit.identity()     # <?asEmail> <?asName> # fill the array OGIT_IDENTITY with the -c flags for a bot commit/merge (empty when no email) — arrays, because a name like "oosh promote" has a space #
+{
+ OGIT_IDENTITY=()
+ [ -n "$1" ] && OGIT_IDENTITY=(-c "user.email=$1" -c "user.name=${2:-$1}" -c commit.gpgsign=false)
+ return 0
+}
+
+
+ogit.binary.check()     #  # rc 0 when the git binary is on PATH #
+{
+ # A predicate: rc only. Getters/completion paths call it too.
+ command -v git >/dev/null 2>&1
+}
+
+
+ogit.binary.check.completion() { :; }
+private.ogit.gitdir()     # <?dir:$OOSH_DIR> # echo the absolute .git directory of <dir>'s repository #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null
+}
+
+
+ogit.repo.clone()     # <url> <branch> <targetDir> # clone <url> at <branch> into <targetDir>; refuses a non-empty <targetDir>; on failure removes only a dir this call created #
+{
+ private.ogit.require || return $(result)
+ local url="$1" branch="$2" target="$3"
+ if [ -z "$url" ] || [ -z "$branch" ] || [ -z "$target" ]; then
+   create.result 1 "ogit.repo.clone requires <url> <branch> <targetDir>"; error.log "$RESULT"; return $(result)
+ fi
+ # Never clone over, and never delete, a folder this call did not make: a
+ # re-run of state 31 over an existing dev/ must not lose it.
+ if [ -e "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+   create.result 1 "ogit.repo.clone: $target exists and is not empty — refusing to clone over it"; error.log "$RESULT"; return $(result)
+ fi
+ local created=no
+ [ -e "$target" ] || created=yes
+ # Relative <targetDir>/<url>: resolved from here (-C .), as before. Absolute
+ # target: run at / — the caller may stand in a folder a converter just
+ # replaced, and plain git dies on a deleted working directory.
+ local at=.
+ case "$target" in /*) case "$url" in /*|*:*) at=/ ;; esac ;; esac
+ if private.ogit.git.run "$at" clone -b "$branch" "$url" "$target"; then
+   create.result 0 "cloned $branch into $target"
+ else
+   [ "$created" = yes ] && rm -rf "$target" 2>/dev/null
+   create.result 1 "clone of $branch from $url failed$(private.ogit.git.reason.get)"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+
+ogit.repo.check()     # <?dir:$OOSH_DIR> # rc 0 when <dir> is inside a git repository #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ git -C "$dir" rev-parse --git-dir >/dev/null 2>&1
+}
+
+
+ogit.repo.root.get()     # <?dir:$PWD> # echo the toplevel of the repository containing <dir> #
+{
+ git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null
+}
+
+
+ogit.repo.share()     # <?dir:$OOSH_DIR> # make the repository of <dir> group-writable: dev group + g+w (private.ensure.sharedTree), setgid on every .git dir, core.sharedRepository group #
+{
+ private.ogit.require || return $(result)
+ local dir="${1:-${OOSH_DIR:-.}}"
+ local gitDir
+ gitDir=$(private.ogit.gitdir "$dir")
+ if [ -z "$gitDir" ]; then create.result 1 "ogit.repo.share: $dir is not a repository"; error.log "$RESULT"; return $(result); fi
+ # chgrp dev + g+w is the kernel's job (this:420; it skips cleanly on a
+ # single-user host without a dev group). setgid is NOT — sharedTree
+ # deliberately sets none on config trees — so it is the one piece done here.
+ OGIT_GIT_ERROR=""
+ if private.ensure.sharedTree "$gitDir" \
+    && find "$gitDir" -type d -exec chmod g+s {} + 2>/dev/null \
+    && private.ogit.git.run "$dir" config core.sharedRepository group; then
+   create.result 0 "shared: $dir"
+ else
+   create.result 1 "ogit.repo.share: could not set group mode on $gitDir$(private.ogit.git.reason.get)"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+
+ogit.repo.grep()     # <pattern> <?dir:$OOSH_DIR> <?pathspecs...> # git grep -nE <pattern> over the tracked files of <dir> (the tree sweeps); variadic, so <?dir> precedes <pathspecs> #
+{
+ local pattern="$1"
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if [ $# -ge 2 ]; then shift 2; else shift; fi
+ git -C "$dir" grep -nE "$pattern" -- "$@" 2>/dev/null
+}
+
+
+ogit.repo.files.list()     # <?dir:$OOSH_DIR> # echo the tracked files of <dir>, one per line #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ git -C "$dir" ls-files 2>/dev/null
+}
+
+
+ogit.commit.count()     # <from> <to> <?dir:$OOSH_DIR> # RESULT = number of commits in <to> that are not in <from> (refs/heads/ when bare names); "0" when a ref is missing #
+{
+ # Moved from this.git.commits.count (this:921). The refs may legitimately not
+ # exist on test rigs without remotes — empty counts as 0.
+ # (Created in Task 4, because ogit.branch.compare counts with it.)
+ if [ -z "$1" ] || [ -z "$2" ]; then create.result 1 "ogit.commit.count requires <from> <to>"; error.log "$RESULT"; return $(result); fi
+ local from="$1"
+ local to="$2"
+ local dir="${3:-${OOSH_DIR:-.}}"
+ local n
+ # Only a BARE branch name gets refs/heads/; @{u}, HEAD, origin/x, x~1 pass verbatim.
+ case "$from" in */*|*@*|HEAD*|*~*|*^*) ;; *) from="refs/heads/$from" ;; esac
+ case "$to"   in */*|*@*|HEAD*|*~*|*^*) ;; *) to="refs/heads/$to" ;; esac
+ n=$(git -C "$dir" rev-list --count "$from..$to" 2>/dev/null)
+ create.result 0 "${n:-0}"
+ return $(result)
+}
+
+
+ogit.branch.get()     # <?dir:$OOSH_DIR> # echo the current branch of <dir>, sanitised (refs/heads/, refs/remotes/origin/, heads/origin/, origin/ stripped); empty when detached or not a repo #
+{
+ # Moved from this.git.branch.short (this:903). Degenerate names like
+ # heads/origin/dev come from `git worktree add <path> heads/origin/dev` or
+ # `checkout -b origin/dev`; callers concatenate `origin/` onto the answer.
+ local dir="${1:-${OOSH_DIR:-.}}"
+ local b
+ b=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+ # Detached, rev-parse answers the literal "HEAD" — not a branch.
+ [ "$b" = HEAD ] && b=""
+ b="${b#refs/heads/}"; b="${b#refs/remotes/origin/}"; b="${b#heads/origin/}"; b="${b#origin/}"
+ printf '%s' "$b"
+}
+
+
+ogit.branch.list()     # <?source:local> <?dir:$OOSH_DIR> # echo branch names one per line: local, remote (cached origin/* refs, offline) or all #
+{
+ local source="${1:-local}"
+ local dir="${2:-${OOSH_DIR:-.}}"
+ case "$source" in
+   local)  git -C "$dir" branch --format='%(refname:short)' 2>/dev/null ;;
+   # Full refnames: refs/remotes/origin/HEAD's SHORT name is "origin", which no filter on HEAD catches.
+   remote) git -C "$dir" for-each-ref refs/remotes/origin --format='%(refname)' 2>/dev/null | sed 's|^refs/remotes/origin/||' | grep -vx HEAD ;;
+   all)    { ogit.branch.list local "$dir"; ogit.branch.list remote "$dir"; } | sort -u ;;
+   *) return 1 ;;
+ esac
+}
+ogit.branch.list.completion.source() { echo local; echo remote; echo all; }
+
+
+ogit.branch.check()     # <ref> <?dir:$OOSH_DIR> # rc 0 when <ref> resolves in <dir> #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" rev-parse --verify --quiet "$1" >/dev/null 2>&1
+}
+
+
+ogit.branch.find()     # <commit> <?dir:$OOSH_DIR> # echo every branch (local and remote) containing <commit> #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" branch -a --contains "$1" --format='%(refname:short)' 2>/dev/null
+}
+
+
+ogit.branch.checkout()     # <ref> <?dir:$OOSH_DIR> # check <ref> out in <dir> #
+{
+ private.ogit.require || return $(result)
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" checkout "$1"; then create.result 0 "checked out $1"
+ else create.result 1 "could not check out $1 in $dir$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.branch.upstream.set()     # <ref> <?dir:$OOSH_DIR> # make the current branch of <dir> track <ref> (e.g. origin/dev) #
+{
+ private.ogit.require || return $(result)
+ local ref="$1"
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if [ -z "$ref" ]; then create.result 1 "ogit.branch.upstream.set requires <ref>"; error.log "$RESULT"; return $(result); fi
+ if private.ogit.git.run "$dir" branch -q -u "$ref"; then create.result 0 "$(ogit.branch.get "$dir") tracks $ref"
+ else create.result 1 "could not set the upstream of $dir to $ref$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.branch.reset()     # <branch> <startPoint> <?dir:$OOSH_DIR> # create or reset <branch> at <startPoint> and check it out (checkout -B) #
+{
+ private.ogit.require || return $(result)
+ local dir="${3:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" checkout -B "$1" "$2" >/dev/null; then create.result 0 "$1 reset to $2"
+ else create.result 1 "could not reset $1 to $2$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.branch.compare()     # <from> <to> <?dir:$OOSH_DIR> # symmetric branch comparison; RESULT = up to date with <from> | <from> merged in | N commits behind <from> | diverged: N behind <from> (moved verbatim from promote.branch.alignment) #
+{
+  # Moved verbatim from promote.branch.alignment (promote:277-316 at 8c46828);
+  # the only change is the count call: this.git.commits.count "$OOSH_DIR" A B
+  # → ogit.commit.count A B "$dir". The four verdict strings are pinned by
+  # test.promote (T-PROMOTE-BRANCH-ALIGN-*) — do not reword them.
+  local from="$1"
+  local to="$2"
+  local dir="${3:-${OOSH_DIR:-.}}"
+  if [ -z "$from" ] || [ -z "$to" ]; then
+    create.result 1 "ogit.branch.compare requires <from> <to>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  # Verdict is from <to>'s perspective relative to <from>:
+  #   behindCount = commits on <from> not on <to>  (commits <to> is behind <from> by)
+  #   aheadCount  = commits on <to> not on <from>  (commits <to> is ahead of <from> by)
+  local behindCount aheadCount
+  ogit.commit.count "$to"   "$from" "$dir"; behindCount="$RESULT"
+  ogit.commit.count "$from" "$to"   "$dir"; aheadCount="$RESULT"
+
+  if [ "$behindCount" = "0" ] && [ "$aheadCount" = "0" ]; then
+    create.result 0 "up to date with $from"
+  elif [ "$behindCount" = "0" ]; then
+    # <to> contains every commit of <from> plus its own. Post-promote
+    # steady state: <from> has been successfully merged into <to>, plus
+    # bookkeeping commits (the merge commit + OOSH_SELF_BRANCH rewrite).
+    # The bookkeeping count is not actionable — the timestamp on the <to>
+    # line shows when the merge happened.
+    create.result 0 "$from merged in"
+  elif [ "$aheadCount" = "0" ]; then
+    create.result 0 "$behindCount commits behind $from"
+  else
+    # Diverged: <from> advanced past where <to>'s last merge picked it up,
+    # AND <to> has its own bookkeeping commits from prior promotes. The
+    # ahead-count is just history (bookkeeping); only the behind-count is
+    # actionable — that's how far <to> needs to catch up via `oo stage
+    # <from>`. See docs/promote.md for the full state vocabulary.
+    create.result 0 "diverged: $behindCount behind $from"
+  fi
+  return $(result)
+}
+
+
+ogit.branch.fastForward()     # <ref> <?dir:$OOSH_DIR> # fast-forward the current branch of <dir> to <ref>; rc 1 (nothing changed) when it has diverged #
+{
+ private.ogit.require || return $(result)
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" merge --ff-only "$1" >/dev/null; then create.result 0 "fast-forwarded to $1"; else create.result 1 "$dir has diverged from $1 — no fast-forward$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.branch.merge()     # <ref> <?asEmail> <?asName> <?dir:$OOSH_DIR> # merge <ref> into the current branch of <dir> (--no-edit); with <asEmail>/<asName> the merge commit carries that identity and no gpg signing #
+{
+ private.ogit.require || return $(result)
+ local ref="$1"
+ local dir="${4:-${OOSH_DIR:-.}}"
+ private.ogit.identity "$2" "$3"
+ if private.ogit.git.run "$dir" "${OGIT_IDENTITY[@]}" merge "$ref" --no-edit; then
+   create.result 0 "merged $ref"
+ else
+   create.result 1 "merge of $ref failed in $dir — conflicts? see ogit conflict.list$(private.ogit.git.reason.get)"
+ fi
+ return $(result)
+}
+
+
+ogit.merge.abort()     # <?dir:$OOSH_DIR> # abort the merge in progress in <dir> #
+{
+ private.ogit.require || return $(result)
+ local dir="${1:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" merge --abort; then create.result 0 "merge aborted"; else create.result 1 "no merge to abort in $dir$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.merge.base.get()     # <a> <b> <?dir:$OOSH_DIR> # echo the merge base commit of <a> and <b> #
+{
+ local dir="${3:-${OOSH_DIR:-.}}"
+ git -C "$dir" merge-base "$1" "$2" 2>/dev/null
+}
+
+
+ogit.conflict.list()     # <?dir:$OOSH_DIR> # echo the conflicted paths of the merge in progress, one per line #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ git -C "$dir" diff --name-only --diff-filter=U 2>/dev/null
+}
+
+
+ogit.conflict.resolve()     # <file> <?side:theirs> <?dir:$OOSH_DIR> # resolve the conflict in <file> by taking <side> (theirs = the merged-in branch, ours = the current one) and stage it #
+{
+ private.ogit.require || return $(result)
+ local side="${2:-theirs}"
+ local dir="${3:-${OOSH_DIR:-.}}"
+ case "$side" in theirs|ours) ;; *) create.result 1 "ogit.conflict.resolve: side must be theirs or ours"; error.log "$RESULT"; return $(result) ;; esac
+ if private.ogit.git.run "$dir" checkout "--$side" -- "$1" && private.ogit.git.run "$dir" add -- "$1"; then create.result 0 "took $side for $1"
+ else create.result 1 "could not resolve $1$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+ogit.conflict.resolve.completion.file() { ogit.conflict.list; }
+ogit.conflict.resolve.completion.side() { echo theirs; echo ours; }
+
+
+ogit.remote.url.get()     # <?remote:origin> <?dir:$OOSH_DIR> # echo the URL of <remote>, empty when there is none #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" remote get-url "${1:-origin}" 2>/dev/null
+}
+
+
+ogit.remote.branch.list()     # <?remote:origin> <?dir:$OOSH_DIR> # echo the branches <remote> has right now (ls-remote — needs the network); empty when unreachable #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" ls-remote --heads "${1:-origin}" 2>/dev/null | sed 's|.*refs/heads/||'
+}
+
+
+ogit.remote.url.set()     # <url> <?remote:origin> <?dir:$OOSH_DIR> # point <remote> of <dir> at <url> #
+{
+ private.ogit.require || return $(result)
+ local dir="${3:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" remote set-url "${2:-origin}" "$1"; then create.result 0 "${2:-origin} → $1"; else create.result 1 "could not set ${2:-origin} to $1$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.remote.fetch()     # <?prune:no> <?dir:$OOSH_DIR> # fetch origin into <dir>; prune=yes drops deleted remote branches #
+{
+ private.ogit.require || return $(result)
+ local dir="${2:-${OOSH_DIR:-.}}"
+ local prune=""
+ [ "$1" = yes ] && prune="--prune"
+ local rc
+ private.ogit.git.run "$dir" fetch $prune origin; rc=$?
+ private.ogit.fetchhead.share "$dir"   # T-OGIT-FETCHHEAD-SHARED
+ if [ "$rc" = 0 ]; then create.result 0 "fetched origin into $dir"
+ else create.result 1 "fetch from origin failed in $dir$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+ogit.remote.fetch.completion.prune() { echo no; echo yes; }
+
+
+ogit.remote.pull()     # <?url> <?branch> <?dir:$OOSH_DIR> # pull into <dir>; with <url> <branch> pull that branch from that URL instead of the tracking remote (the https fallback of oo.update) #
+{
+ private.ogit.require || return $(result)
+ local url="$1"
+ local branch="$2"
+ local dir="${3:-${OOSH_DIR:-.}}"
+ local rc
+ if [ -n "$url" ]; then private.ogit.git.run "$dir" pull "$url" "$branch"; rc=$?; else private.ogit.git.run "$dir" pull; rc=$?; fi
+ private.ogit.fetchhead.share "$dir"   # T-OGIT-FETCHHEAD-SHARED
+ if [ "$rc" = 0 ]; then create.result 0 "pulled into $dir"; else create.result "$rc" "pull failed in $dir (rc=$rc)$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.remote.push()     # <?branch> <?tags:no> <?dir:$OOSH_DIR> # push <branch> (default: the tracking branch) to origin; tags=yes pushes tags too #
+{
+ private.ogit.require || return $(result)
+ local branch="$1"
+ local dir="${3:-${OOSH_DIR:-.}}"
+ local tags=""
+ [ "$2" = yes ] && tags="--tags"
+ local rc
+ if [ -n "$branch" ]; then private.ogit.git.run "$dir" push origin "$branch" $tags; rc=$?
+ else private.ogit.git.run "$dir" push $tags; rc=$?; fi
+ if [ "$rc" = 0 ]; then
+   create.result 0 "pushed ${branch:-tracking branch}${tags:+ with tags}"
+ else
+   create.result 1 "push of ${branch:-tracking branch} rejected — pull/resolve first$(private.ogit.git.reason.get)"
+ fi
+ return $(result)
+}
+ogit.remote.push.completion.tags()   { echo no; echo yes; }
+
+
+ogit.index.add()     # <?scope:all> <?dir:$OOSH_DIR> <?paths...> # stage: all (-A), updated (-u, tracked files only), or the given <paths>; variadic, so <?dir> precedes <paths> #
+{
+ private.ogit.require || return $(result)
+ local scope="${1:-all}"
+ local dir="${2:-${OOSH_DIR:-.}}"
+ # scope, then dir, then paths: `shift 2` with a single argument shifts nothing
+ # and would stage a file literally named "all".
+ shift
+ [ $# -gt 0 ] && shift
+ local rc
+ if [ $# -gt 0 ]; then private.ogit.git.run "$dir" add -- "$@"; rc=$?
+ elif [ "$scope" = updated ]; then private.ogit.git.run "$dir" add -u; rc=$?
+ else private.ogit.git.run "$dir" add -A; rc=$?; fi
+ if [ "$rc" = 0 ]; then create.result 0 "staged ${*:-$scope}"; else create.result 1 "add failed in $dir$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+ogit.index.add.completion.scope() { echo all; echo updated; }
+
+
+ogit.commit.create()     # <?message> <?asEmail> <?asName> <?dir:$OOSH_DIR> # commit the index of <dir>; no <message> opens the editor; <asEmail>/<asName> give a bot identity without gpg signing #
+{
+ private.ogit.require || return $(result)
+ local msg="$1"
+ local dir="${4:-${OOSH_DIR:-.}}"
+ private.ogit.identity "$2" "$3"
+ local rc
+ # Only the -m path is captured: the editor path needs the terminal.
+ OGIT_GIT_ERROR=""
+ if [ -n "$msg" ]; then private.ogit.git.run "$dir" "${OGIT_IDENTITY[@]}" commit -q -m "$msg"; rc=$?
+ else git -C "$dir" "${OGIT_IDENTITY[@]}" commit; rc=$?; fi
+ if [ "$rc" = 0 ]; then create.result 0 "committed: ${msg:-(editor)}"; else create.result 1 "commit failed in $dir (nothing staged?)$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.commit.show()     # <ref> <?dir:$OOSH_DIR> # show commit <ref> #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" show "$1" 2>/dev/null
+}
+
+
+ogit.commit.log.show()     # <?range> <?limit> <?format> <?dir:$OOSH_DIR> # git log of <range> (default HEAD), at most <limit> commits; <format> is oneline or a --pretty=format: string #
+{
+ local range="$1" limit="$2" format="$3"
+ local dir="${4:-${OOSH_DIR:-.}}"
+ local -a args=()
+ [ -n "$limit" ] && args+=("-$limit")
+ case "$format" in "") ;; oneline) args+=(--oneline) ;; *) args+=("--pretty=format:$format") ;; esac
+ git -C "$dir" log "${args[@]}" ${range:+"$range"} 2>/dev/null
+}
+ogit.commit.log.show.completion.format() { echo oneline; echo '%h %ci'; }
+
+
+ogit.status.show()     # <?format:short> <?dir:$OOSH_DIR> # working-tree status: short (--short --branch) or porcelain #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ case "${1:-short}" in
+   porcelain) git -C "$dir" status --porcelain 2>/dev/null ;;
+   *)         git -C "$dir" status --short --branch 2>/dev/null ;;
+ esac
+}
+ogit.status.show.completion.format() { echo short; echo porcelain; }
+
+
+ogit.status.check()     # <?dir:$OOSH_DIR> # rc 0 when the working tree and the index of <dir> are clean #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ git -C "$dir" diff --quiet 2>/dev/null && git -C "$dir" diff --cached --quiet 2>/dev/null
+}
+
+
+ogit.diff.check()     # <?dir:$OOSH_DIR> <?paths...> # rc 0 when <paths> (default: everything) have no unstaged changes; variadic, so <?dir> comes first #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ [ $# -gt 0 ] && shift
+ git -C "$dir" diff --quiet -- "$@" 2>/dev/null
+}
+
+
+ogit.diff.show()     # <a> <b> <?format:stat> <?dir:$OOSH_DIR> # diff between <a> and <b> (three-dot); format stat or full #
+{
+ local dir="${4:-${OOSH_DIR:-.}}"
+ case "${3:-stat}" in
+   stat) git -C "$dir" diff --stat "$1...$2" 2>/dev/null ;;
+   *)    git -C "$dir" diff "$1...$2" 2>/dev/null ;;
+ esac
+}
+ogit.diff.show.completion.format() { echo stat; echo full; }
+
+
+ogit.tag.list()     # <?pattern> <?dir:$OOSH_DIR> # echo tags matching <pattern> (default all), newest creation date first #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" tag -l ${1:+"$1"} --sort=-creatordate 2>/dev/null
+}
+ogit.tag.list.completion.pattern() { echo 'v*'; echo 'testing-*'; }
+
+
+ogit.tag.check()     # <tag> <?dir:$OOSH_DIR> # rc 0 when <tag> exists #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" rev-parse --verify --quiet "refs/tags/$1" >/dev/null 2>&1
+}
+
+
+ogit.tag.latest.get()     # <?pattern:v*> <?dir:$OOSH_DIR> # echo the highest tag matching <pattern> by version sort #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ git -C "$dir" tag -l "${1:-v*}" --sort=-version:refname 2>/dev/null | head -1
+}
+ogit.tag.latest.get.completion.pattern() { echo 'v*'; echo 'testing-*'; }
+
+
+ogit.tag.create()     # <tag> <?ref:HEAD> <?dir:$OOSH_DIR> # create lightweight <tag> at <ref> #
+{
+ private.ogit.require || return $(result)
+ local dir="${3:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" tag "$1" "${2:-HEAD}"; then create.result 0 "tagged $1"; else create.result 1 "could not tag $1 (exists?)$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.stash.push()     # <message> <?dir:$OOSH_DIR> # stash the working tree of <dir> under <message> #
+{
+ private.ogit.require || return $(result)
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" stash push -q -m "$1"; then create.result 0 "stashed: $1"; else create.result 1 "stash push failed$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.stash.pop()     # <?dir:$OOSH_DIR> # pop the top stash of <dir> #
+{
+ private.ogit.require || return $(result)
+ local dir="${1:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" stash pop -q; then create.result 0 "stash popped"; else create.result 1 "stash pop failed (nothing stashed, or conflicts)$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.stash.top.get()     # <?dir:$OOSH_DIR> # echo the message of stash@{0}, empty when the stack is empty #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ git -C "$dir" stash list --format=%s -1 2>/dev/null
+}
+
+
+private.ogit.base.get()     # <?base> # echo <base>, else the components base: oo.mode.base.get when it is loaded in this shell, else the oo command #
+{
+ # Not `oo mode.base.get` unconditionally: that spawns a whole oo. Inside an
+ # oo process (state 31, oo.update, the ooShim) the function is right here.
+ if [ -n "$1" ]; then printf '%s\n' "$1"; return 0; fi
+ { [ "$(type -t oo.mode.base.get)" = function ] && oo.mode.base.get; } 2>/dev/null || oo mode.base.get 2>/dev/null
+}
+
+
+private.ogit.base.folders.list()     # <base> # echo every repository folder directly under <base> (a .git dir or file), one per line; symlinks and dot-dirs skipped (the oo:1093-1122 rules) #
+{
+ local base="$1" d
+ { [ -n "$base" ] && [ -d "$base" ]; } || return 0
+ for d in "$base"/*/; do
+   d="${d%/}"
+   [ -L "$d" ] && continue
+   case "${d##*/}" in .*) continue ;; esac
+   [ -e "$d/.git" ] || continue
+   printf '%s\n' "$d"
+ done
+}
+
+
+ogit.config.get()     # <key> <?scope:any> <?dir:$OOSH_DIR> # echo <key>: scope any = the global git config, else the repository config of <dir>; scope local = the repository config of <dir> only #
+{
+ local key="$1"
+ local scope="${2:-any}"
+ local dir="${3:-${OOSH_DIR:-.}}"
+ case "$scope" in
+   local) git -C "$dir" config --local --get "$key" 2>/dev/null ;;
+   *)     git -C / config --global --get "$key" 2>/dev/null || git -C "$dir" config --get "$key" 2>/dev/null ;;
+ esac
+}
+ogit.config.get.completion.key()   { echo user.email; echo user.name; echo core.sharedRepository; }
+ogit.config.get.completion.scope() { echo any; echo local; }
+
+
+ogit.config.set()     # <key> <value> <?dir:$OOSH_DIR> # set <key> in the repository config of <dir> #
+{
+ private.ogit.require || return $(result)
+ local dir="${3:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" config "$1" "$2"; then create.result 0 "$1=$2"; else create.result 1 "could not set $1$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+ogit.config.set.completion.key() { echo user.email; echo user.name; echo core.sharedRepository; }
+
+
+ogit.config.email.get()     # <?dir:$OOSH_DIR> # echo the committer email: global user.email, else that of <dir> #
+{
+ ogit.config.get user.email any "$1"
+}
+
+
+ogit.safeDirectory.list()     #  # echo the global safe.directory entries, one per line (honours GIT_CONFIG_GLOBAL) #
+{
+ # -C /: global config needs no working directory — and the caller may stand in
+ # a folder a converter just replaced (plain git dies on a deleted cwd).
+ git -C / config --global --get-all safe.directory 2>/dev/null
+}
+ogit.safeDirectory.list.completion() { :; }
+
+
+ogit.safeDirectory.add()     # <path> # add <path> to the global safe.directory list once (moved from private.oo.safeDirectory.add) #
+{
+ private.ogit.require || return $(result)
+ if [ -z "$1" ]; then create.result 1 "ogit.safeDirectory.add: <path> required"; error.log "$RESULT"; return $(result); fi
+ if ogit.safeDirectory.list | grep -qFx "$1"; then create.result 0 "already present: $1"
+ elif private.ogit.git.run / config --global --add safe.directory "$1"; then create.result 0 "added: $1"
+ else create.result 1 "could not add safe.directory $1$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.safeDirectory.clear()     #  # remove every global safe.directory entry #
+{
+ # rc 5 = there was no entry to unset: already clear, not a failure.
+ private.ogit.git.run / config --global --unset-all safe.directory
+ case $? in
+   0|5) create.result 0 "safe.directory cleared" ;;
+   *)   create.result 1 "could not clear safe.directory$(private.ogit.git.reason.get)" ;;
+ esac
+ return $(result)
+}
+ogit.safeDirectory.clear.completion() { :; }
+
+
+ogit.safeDirectory.prune()     #  # drop global safe.directory entries whose paths no longer exist (moved from oo.safeDirectory.prune) #
+{
+ # A long list with stale /tmp/* paths makes the VS Code / Cursor git extension
+ # hang validating each entry, leaving Source Control empty.
+ local entry pruned=0; local -a kept=()
+ while IFS= read -r entry; do
+   [ -z "$entry" ] && continue
+   if [ -e "$entry" ]; then kept+=("$entry"); else pruned=$((pruned + 1)); fi
+ done < <(ogit.safeDirectory.list)
+ if [ "$pruned" -gt 0 ]; then
+   ogit.safeDirectory.clear >/dev/null
+   local k failed=""
+   for k in "${kept[@]}"; do
+     private.ogit.git.run / config --global --add safe.directory "$k" || failed="$failed $k$(private.ogit.git.reason.get)"
+   done
+   if [ -n "$failed" ]; then create.result 1 "could not re-add safe.directory:$failed"; return $(result); fi
+   console.log "Pruned $pruned stale safe.directory entries; ${#kept[@]} preserved"
+ else
+   info.log "No stale safe.directory entries to prune (${#kept[@]} present)"
+ fi
+ create.result 0 "pruned=$pruned kept=${#kept[@]}"; return $(result)
+}
+ogit.safeDirectory.prune.completion() { :; }
+
+
+ogit.safeDirectory.ensure()     # <?base:$(oo.mode.base.get)> # one global safe.directory entry per repository folder under <base>, for the calling user; idempotent #
+{
+ private.ogit.require || return $(result)
+ local base
+ base=$(private.ogit.base.get "$1")
+ if [ -z "$base" ] || [ ! -d "$base" ]; then create.result 1 "ogit.safeDirectory.ensure: no base (pass <base> or fix oo mode.base.get)"; error.log "$RESULT"; return $(result); fi
+ local d added=0
+ while IFS= read -r d; do
+   ogit.safeDirectory.add "$d" >/dev/null || return $(result)
+   case "$RESULT" in added:*) added=$((added + 1)) ;; esac
+ done < <(private.ogit.base.folders.list "$base")
+ create.result 0 "safe.directory ensured under $base ($added added)"; return $(result)
+}
+
+
+private.ogit.worktree.paths.get()     # <?dir:$OOSH_DIR> # echo the folder of every worktree of <dir>'s repository (the main one first), one per line; a path with spaces stays whole #
+{
+ # The one porcelain parse. `awk '{print $2}'` cut a path at its first space.
+ local dir="${1:-${OOSH_DIR:-.}}"
+ local l
+ while IFS= read -r l; do
+   case "$l" in 'worktree '*) printf '%s\n' "${l#worktree }" ;; esac
+ done < <(ogit.worktree.list "$dir")
+}
+
+
+ogit.worktree.add()     # <branch> <targetDir> <startPoint> <?dir:$OOSH_DIR> # add <targetDir> as a linked worktree of <dir> with <branch> (re)created at <startPoint> #
+{
+ private.ogit.require || return $(result)
+ local dir="${4:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" worktree add -B "$1" "$2" "$3" && [ -d "$2" ]; then create.result 0 "worktree $2 on $1"
+ else create.result 1 "git worktree add failed for $1 → $2$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.worktree.list()     # <?dir:$OOSH_DIR> # git worktree list --porcelain of the repository of <dir> #
+{
+ local dir="${1:-${OOSH_DIR:-.}}"
+ git -C "$dir" worktree list --porcelain 2>/dev/null
+}
+
+
+ogit.worktree.find()     # <branch> <?dir:$OOSH_DIR> # echo the folder that has <branch> checked out: a linked worktree of the repository of <dir>, else the sibling clone <base>/<branch> when it is on <branch>; empty when none #
+{
+ local dir="${2:-${OOSH_DIR:-.}}"
+ local wt
+ while IFS= read -r wt; do
+   # symbolic-ref --short answers X exactly when the porcelain says "branch refs/heads/X".
+   if [ "$(git -C "$wt" symbolic-ref -q --short HEAD 2>/dev/null)" = "$1" ]; then printf '%s\n' "$wt"; return 0; fi
+ done < <(private.ogit.worktree.paths.get "$dir")
+ # The base is the parent of THIS repository when a sibling main/ exists — derived
+ # from <dir>, not from oo mode.base.get, so a fixture never resolves to the real tree.
+ local self base
+ self=$(private.this.path.canonical "$dir") || return 0
+ base=$(dirname "$self")
+ if [ -d "$base/main/.git" ] && [ -d "$base/$1/.git" ] && [ "$(ogit.branch.get "$base/$1")" = "$1" ]; then printf '%s\n' "$base/$1"; fi
+ return 0
+}
+
+
+ogit.worktree.delete()     # <path> <?dir:$OOSH_DIR> # unregister and delete the linked worktree at <path> from the repository of <dir> (refuses a dirty one — gate first) #
+{
+ private.ogit.require || return $(result)
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" worktree remove "$1"; then create.result 0 "worktree $1 removed"; else create.result 1 "git worktree remove $1 failed (dirty, or not a linked worktree)$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+ogit.worktree.prune()     # <?dir:$OOSH_DIR> # drop worktree registrations whose folders are gone #
+{
+ private.ogit.require || return $(result)
+ local dir="${1:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" worktree prune; then create.result 0 "worktrees pruned"; else create.result 1 "worktree prune failed in $dir$(private.ogit.git.reason.get)"; fi
+ return $(result)
+}
+
+
+# ogit.binary.check already exists — created in Task 1 (35d44b7) so that
+# private.ogit.require could delegate to it from the start. Do not add it again.
+
+ogit.raw()     # <dir> <args...> # run git -C <dir> <args...> verbatim — the documented last resort; every use needs a comment saying why no method fits; variadic, so <dir> comes first #
+{
+ private.ogit.require || return $(result)
+ local dir="$1"
+ shift
+ git -C "$dir" "$@"
+}
+
+
+ogit.index.remove()     # <path> <?dir:$OOSH_DIR> # remove <path> from the index and the working tree of <dir> (git rm); rc 1 when <path> is not tracked #
+{
+ private.ogit.require || return $(result)
+ local path="$1"
+ local dir="${2:-${OOSH_DIR:-.}}"
+ if [ -z "$path" ]; then
+   create.result 1 "ogit index.remove requires <path>"; error.log "$RESULT"; return $(result)
+ fi
+ if git -C "$dir" rm -q -- "$path" >/dev/null 2>&1; then
+   create.result 0 "removed $path"
+ else
+   create.result 1 "$path is not tracked in $dir"
+ fi
+ return $(result)
+}
+
+
+ogit.index.remove.completion.path() { ogit.repo.files.list; }
+ogit.commit.pick()     # <commit> <?asEmail> <?asName> <?dir:$OOSH_DIR> # cherry-pick <commit> onto the current branch of <dir> with -x; on a conflict rc 1, the pick stays in progress and RESULT names the conflicted paths #
+{
+ private.ogit.require || return $(result)
+ local commit="$1"
+ local dir="${4:-${OOSH_DIR:-.}}"
+ if [ -z "$commit" ]; then
+   create.result 1 "ogit commit.pick requires <commit>"; error.log "$RESULT"; return $(result)
+ fi
+ private.ogit.identity "$2" "$3"
+ if git -C "$dir" "${OGIT_IDENTITY[@]}" cherry-pick -x "$commit" >/dev/null 2>&1; then
+   create.result 0 "picked $commit"
+ else
+   # Left in progress on purpose: resolve with replace, stage with ogit index.add,
+   # then ogit commit.pick.continue — or ogit commit.pick.abort.
+   local conflicts; conflicts=$(ogit.conflict.list "$dir" | tr '\n' ' ')
+   create.result 1 "pick of $commit stopped; conflicts: ${conflicts:-none, see ogit status.show}"
+ fi
+ return $(result)
+}
+
+
+ogit.commit.pick.continue()     # <?asEmail> <?asName> <?dir:$OOSH_DIR> # finish the pick in progress in <dir> after its conflicts are resolved and staged; keeps the picked message; <asEmail>/<asName> give a bot identity #
+{
+ private.ogit.require || return $(result)
+ local dir="${3:-${OOSH_DIR:-.}}"
+ private.ogit.identity "$1" "$2"
+ # GIT_EDITOR=true keeps the picked message (with its -x line) instead of opening an editor.
+ if GIT_EDITOR=true git -C "$dir" "${OGIT_IDENTITY[@]}" cherry-pick --continue >/dev/null 2>&1; then
+   create.result 0 "pick continued"
+ else
+   create.result 1 "no resolved pick to continue in $dir"
+ fi
+ return $(result)
+}
+
+
+ogit.commit.pick.abort()     # <?dir:$OOSH_DIR> # abort the pick in progress in <dir>; the tree is back to what it was before the pick #
+{
+ private.ogit.require || return $(result)
+ local dir="${1:-${OOSH_DIR:-.}}"
+ if git -C "$dir" cherry-pick --abort >/dev/null 2>&1; then
+   create.result 0 "pick aborted"
+ else
+   create.result 1 "no pick to abort in $dir"
+ fi
+ return $(result)
+}
+
+
+ogit.caller.validate()     # <?treeRoot:$OOSH_DIR> # verify ogit is the only caller of the git binary in the tracked tree: every other raw git call carries a comment-anchored ogit-exception marker; echo an OK:/INVALID: verdict; rc 1 on any violation #
+{
+  # THE RULE (D2 of docs/superpowers/specs/2026-09-23-ogit-clones-per-branch-design.md):
+  # ogit is the single caller of the git binary. Every other invocation is a
+  # violation unless it carries `# ogit-exception: <reason>` on the line or in
+  # the 5 lines above it (these calls often sit inside a heredoc or a `bash -c`
+  # string, where the marker cannot go on the line), or
+  # `# ogit-exception-file: <reason>` anywhere in the file (init/oosh, init/once,
+  # Install oosh.command — they run before oosh exists).
+  #
+  # Sibling of path.validate and private.this.anchor.validate.one, same shape:
+  # one scan of the tracked tree, markers anchored to a COMMENT, the verdict
+  # echoed to stdout (it survives any LOG_LEVEL — the status-output idiom),
+  # each violation named by error.log, create.result / return $(result).
+  local treeRoot="${1:-$OOSH_DIR}"
+  if [ ! -d "$treeRoot" ]; then
+    error.log "ogit.caller.validate: no such directory: $treeRoot"
+    echo "INVALID: no such directory: $treeRoot"
+    create.result 2 "no such directory: $treeRoot"
+    return $(result)
+  fi
+
+  # A sweep that reads nothing reports OK: no repository, or git's "dubious
+  # ownership" refusal (root in a container against an oosh-user tree), both
+  # come back empty — indistinguishable from a clean tree. Prove git can see
+  # the files BEFORE trusting that it found nothing in them (test.suite:1261-1274).
+  if [ -z "$(ogit.repo.files.list "$treeRoot" | head -1)" ]; then
+    error.log "ogit.caller.validate: git cannot list tracked files under $treeRoot — no repository, or ownership refused (ogit safeDirectory.ensure). A sweep that reads nothing reports OK, so this is a failure, not a pass."
+    echo "INVALID: cannot read $treeRoot through git — no tracked files visible"
+    create.result 2 "git sees no tracked files under $treeRoot"
+    return $(result)
+  fi
+
+  # ONE scan of the tracked tree. Excluded on purpose, as in path.validate:
+  #   ogit                                  — it IS the caller
+  #   docs/  test/  .claude/  *.md  *.json  — prose, fixtures, tool config
+  #   old/  restore/                        — the legacy graveyards
+  # init/oosh, init/once and Install oosh.command are NOT excluded here: they
+  # carry `# ogit-exception-file:`, so the reason lives in the file itself.
+  # The leading class keeps ogit, .git, digit, _git and path/git out; a word
+  # after the whitespace is required, so prose like "git." never matches.
+  local matches
+  matches=$(ogit.repo.grep '(^|[^A-Za-z0-9_./-])git[[:space:]]+[a-z-]+' "$treeRoot" \
+              ':!ogit' ':!docs' ':!test' ':!.claude' ':!old' ':!restore' ':!*.md' ':!*.json')
+
+  local exceptions=0 violations=0
+  local match file lineNo content trimmed prevLine windowFrom
+  while IFS= read -r match; do
+    [ -z "$match" ] && continue
+    file="${match%%:*}"
+    content="${match#*:}"
+    lineNo="${content%%:*}"
+    content="${content#*:}"
+
+    # A line that only TALKS about git is not an invocation.
+    trimmed="${content#"${content%%[![:space:]]*}"}"
+    case "$trimmed" in '#'*) continue ;; esac
+
+    # Sanctioned exception, anchored to a COMMENT so a marker only counts where
+    # a human wrote one: on the line, file-wide, or in the 5 lines above.
+    if printf '%s' "$content" | grep -qE '#[[:space:]]*ogit-exception:'; then
+      exceptions=$((exceptions + 1)); continue
+    fi
+    if grep -qE '^[[:space:]]*#[[:space:]]*ogit-exception-file:' "$treeRoot/$file" 2>/dev/null; then
+      exceptions=$((exceptions + 1)); continue
+    fi
+    prevLine=""
+    if [ "$lineNo" -gt 1 ]; then
+      windowFrom=$((lineNo - 5))
+      [ "$windowFrom" -lt 1 ] && windowFrom=1
+      prevLine=$(sed -n "${windowFrom},$((lineNo - 1))p" "$treeRoot/$file" 2>/dev/null)
+    fi
+    if printf '%s' "$prevLine" | grep -qE '#[[:space:]]*ogit-exception:'; then
+      exceptions=$((exceptions + 1)); continue
+    fi
+
+    error.log "ogit.caller.validate: $file:$lineNo calls git directly — use an ogit method: $trimmed"
+    violations=$((violations + 1))
+  done <<< "$matches"
+
+  if [ "$violations" -gt 0 ]; then
+    error.log "ogit.caller.validate: $violations violation(s); ${YELLOW}ogit${NORMAL} is the only git caller (docs/ogit.md). Call the ogit method, or mark a genuine exception with '# ogit-exception: <reason>'"
+    echo "INVALID: git callers in $treeRoot — $violations violation(s), $exceptions exception(s)"
+    create.result 1 "git callers: violations found"
+    return $(result)
+  fi
+  echo "OK: git callers in $treeRoot — only ogit, $exceptions exception(s), 0 violations"
+  create.result 0 "git callers: 0 violations"
+  return $(result)
+}
+
+
+ogit.caller.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
+private.ogit.git.run()     # <dir> <args...> # run git -C <dir> <args...>: stdout passes through, git stderr is kept in OGIT_GIT_ERROR (one line) instead of the terminal; rc is the git rc #
+{
+ # The mutators runner (decided 2026-09-24): git's own reason for a failure
+ # reaches RESULT instead of /dev/null. fd 3 carries stdout past the $( ),
+ # which captures stderr only; no subshell around the assignment, so
+ # OGIT_GIT_ERROR is set in the calling shell. bash 3.2 safe.
+ # Getters do NOT use it — they stay silent (2>/dev/null) for completion.
+ local dir="$1"
+ shift
+ local rc mask=""
+ # A shared repository (core.sharedRepository set): git does not apply it to
+ # every file it writes — FETCH_HEAD came out -rw-r--r-- after root pulled in
+ # the shared dev/ clone and locked every other dev-group user out of `fetch`.
+ # Run git with umask 002 there (inside the $( ) subshell — the caller keeps its own).
+ case "$(git -C "$dir" config --get core.sharedRepository 2>/dev/null)" in ''|false|umask|0) ;; *) mask=002 ;; esac
+ { OGIT_GIT_ERROR=$( [ -n "$mask" ] && umask "$mask"; git -C "$dir" "$@" 2>&1 1>&3 3>&-); rc=$?; } 3>&1
+ OGIT_GIT_ERROR=$(printf '%s' "$OGIT_GIT_ERROR" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+ return $rc
+}
+
+
+private.ogit.git.reason.get()     #  # echo the suffix — git: plus OGIT_GIT_ERROR when git left an error text, else nothing; a mutator appends it to its failure RESULT #
+{
+ # A getter: stdout only, no create.result (it is called inside the message).
+ [ -n "$OGIT_GIT_ERROR" ] && printf ' — git: %s' "$OGIT_GIT_ERROR"
+ return 0
+}
+
+
+private.ogit.folder.shape()     # <folder> # echo worktree | clone | missing for <folder> #
+{
+ if   [ -f "$1/.git" ]; then echo worktree
+ elif [ -d "$1/.git" ]; then echo clone
+ else echo missing; fi
+}
+
+
+ogit.layout.status()     # <?base:$(oo mode.base.get)> # one line per folder under <base>: shape (worktree|clone), dirty/ahead/behind counts, shared/setgid/trusted; rc 1 when the folders are not all the same shape #
+{
+ # Status idiom: the answer is plain echo, never behind console.log.
+ local base
+ base=$(private.ogit.base.get "$1")
+ if [ -z "$base" ] || [ ! -d "$base" ]; then echo "no base"; create.result 1 "ogit.layout.status: no base"; return $(result); fi
+ local d name shape dirty ahead behind shared setgid trusted shapes="" rc=0
+ while IFS= read -r d; do
+   name="${d##*/}"
+   shape=$(private.ogit.folder.shape "$d")
+   shapes="$shapes $shape"
+   dirty=$(ogit.status.show porcelain "$d" | grep -c .)
+   if ogit.branch.check '@{u}' "$d"; then
+     ogit.commit.count '@{u}' HEAD "$d" >/dev/null; ahead="$RESULT"
+     ogit.commit.count HEAD '@{u}' "$d" >/dev/null; behind="$RESULT"
+   else ahead='?'; behind='?'; fi
+   # the folder's OWN repository value, not the global one (scope local, Task 10)
+   [ "$(ogit.config.get core.sharedRepository local "$d")" = group ] && shared=group || shared=no
+   [ -g "$(private.ogit.gitdir "$d")" ] && setgid=yes || setgid=no
+   ogit.safeDirectory.list | grep -qFx "$d" && trusted=yes || trusted=no
+   printf '%-14s %-9s dirty %-3s ahead %-3s behind %-3s shared=%s setgid=%s trusted=%s\n' "$name" "$shape" "$dirty" "$ahead" "$behind" "$shared" "$setgid" "$trusted"
+ done < <(private.ogit.base.folders.list "$base")
+ # main is always a clone; the OTHER folders must all share one shape.
+ case "$shapes" in *worktree*clone*|*clone*worktree*) [ "$(printf '%s\n' $shapes | grep -c clone)" = 1 ] || rc=1 ;; esac
+ if [ "$rc" = 0 ]; then create.result 0 "layout under $base is consistent"
+ else create.result 1 "mixed layout under $base — finish ogit worktree.remove or worktree.restore"; fi
+ return $(result)
+}
+
+
+private.ogit.folder.ignored.save()     # <folder> <stashDir> # copy every gitignored path of <folder> into <stashDir>, keeping relative paths; RESULT = the number carried; rc 1 when a copy fails (RESULT names <stashDir>) #
+{
+ local folder="$1" stash="$2"
+ local p n=0
+ local -a paths=()
+ # Rule 3: a failing status must not read as "nothing ignored" and let the
+ # conversion delete the folder with its ignored files. Checked once through
+ # the runner (the -z stream itself needs a process substitution).
+ if ! private.ogit.git.run "$folder" status --porcelain --ignored -z >/dev/null; then
+   create.result 1 "ogit: cannot list the ignored files of $folder — nothing in $folder was touched$(private.ogit.git.reason.get)"; return $(result)
+ fi
+ # `!! <path>` entries are the ignored ones; -z keeps odd names whole. A fully
+ # ignored directory is one entry ending in /.
+ while IFS= read -r -d '' p; do
+   case "$p" in '!! '*) paths+=("${p#!! }") ;; esac
+ done < <(private.ogit.git.run "$folder" status --porcelain --ignored -z)
+ if [ ${#paths[@]} = 0 ]; then create.result 0 "0"; return $(result); fi
+ if ! mkdir -p "$stash" || ! chmod 700 "$stash"; then
+   create.result 1 "ogit: cannot create the backup $stash — nothing in $folder was touched"; return $(result)
+ fi
+ for p in "${paths[@]}"; do
+   p="${p%/}"
+   if mkdir -p "$stash/$(dirname "$p")" && cp -Rp "$folder/$p" "$stash/$(dirname "$p")/"; then
+     success.log "carrying ignored ${folder##*/}/$p"
+     n=$((n + 1))
+   else
+     create.result 1 "ogit: could not back up $folder/$p — nothing in $folder was touched; the partial backup is in $stash"; return $(result)
+   fi
+ done
+ create.result 0 "$n"
+ return $(result)
+}
+
+
+private.ogit.folder.ignored.restore()     # <stashDir> <folder> # copy everything saved in <stashDir> back into <folder>, keeping relative paths; the backup itself is kept #
+{
+ local stash="$1" folder="$2"
+ if [ ! -d "$stash" ]; then create.result 0 "no ignored files to carry"; return $(result); fi
+ # Each ENTRY, never the backup dir itself — see private.this.folder.entries.copy.
+ if private.this.folder.entries.copy "$stash" "$folder" >/dev/null; then
+   success.log "ignored files carried into $folder (backup kept: $stash)"
+   create.result 0 "restored from $stash"
+ else
+   create.result 1 "ogit: could not copy the ignored files back into $folder — they are safe in $stash; copy each entry by hand (not the dir itself):${RESULT#entries not copied:} → cp -Rp '$stash'/<entry> '$folder/'"
+ fi
+ return $(result)
+}
+
+
+private.ogit.folder.gate()     # <folder> # rc 0 when <folder> is clean, has an upstream and is not ahead of it; RESULT names the folder and the fix otherwise #
+{
+ local d="$1" name="${1##*/}" n
+ n=$(ogit.status.show porcelain "$d" | grep -c .)
+ if [ "$n" != 0 ]; then create.result 1 "$name has $n uncommitted change(s) — commit or stash them in $d first"; return $(result); fi
+ if ! ogit.branch.check '@{u}' "$d"; then create.result 1 "$name tracks no upstream — set it with: ogit branch.upstream.set origin/<branch> $d, then ogit remote.push <branch> no $d"; return $(result); fi
+ ogit.commit.count '@{u}' HEAD "$d" >/dev/null; n="$RESULT"
+ if [ "${n:-0}" != 0 ]; then create.result 1 "$name is $n commit(s) ahead of its upstream — push it first"; return $(result); fi
+ create.result 0 "$name is clean and pushed"
+ return $(result)
+}
+
+
+private.ogit.folder.finish()     # <folder> # after a clone/worktree lands under the base: shared group mode (ogit repo.share, when a dev group exists), trust for the caller and — under sudo — for the person who typed the command; no ownership change #
+{
+ # No chown: the policy is chgrp dev + g+w + setgid, never a recursive chown
+ # (T-STATE-31-CHOWN-NOT-RECURSIVE, test/test.install:406-412). A single-user
+ # host without a dev group has nothing to share with; trust is still added.
+ if private.this.group.exists dev; then
+   ogit.repo.share "$1" >/dev/null || return $(result)
+   # …and the WORKING TREE, not only .git: every dev-group user must be able to
+   # update the checked-out files (the host prod/ clone made under sudo came out
+   # root:root). chgrp dev + g+w via the kernel helper, setgid dirs so new files
+   # inherit the group. Still no chown.
+   if ! private.this.folder.share "$1" >/dev/null; then
+     create.result 1 "ogit: could not share the working tree of $1 with group dev"; return $(result)
+   fi
+ fi
+ ogit.safeDirectory.add "$1" >/dev/null || return $(result)
+ # Under sudo the entry above is ROOT's; the person who typed the command needs
+ # one too. Through the as-user preamble (this:1098), and with the PHYSICAL
+ # shared tree: root's $OOSH_DIR is /root/oosh, unreadable to that user.
+ if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ]; then
+   local sharedOosh
+   sharedOosh=$(private.this.path.canonical "$OOSH_DIR")
+   if private.this.script.load user private.as.user; then
+     private.as.user "$SUDO_USER" bash -c "$(private.this.as.user.preamble.get "$SUDO_USER" "$(user.get home "$SUDO_USER")" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.add '$1'" >/dev/null 2>&1 \
+       || warn.log "ogit: could not add $1 to $SUDO_USER's safe.directory — they run: ogit safeDirectory.ensure"
+   else
+     warn.log "ogit: user script not loadable — $SUDO_USER runs: ogit safeDirectory.ensure"
+   fi
+ fi
+ create.result 0 "finished: $1"
+ return $(result)
+}
+
+
+ogit.worktree.remove()     # <?base:$(oo mode.base.get)> # turn every linked worktree of <base>/main into an independent clone of the same branch, carrying its gitignored files across; refuses on a dirty or unpushed folder; idempotent; run with sudo on a shared tree #
+{
+ private.ogit.require || return $(result)
+ local base
+ base=$(private.ogit.base.get "$1")
+ if [ ! -d "$base/main/.git" ]; then create.result 1 "ogit.worktree.remove: no repository at $base/main"; error.log "$RESULT"; return $(result); fi
+ # A shared tree is not the caller's to change: ask for sudo here, so
+ # `ogit worktree.remove` works as typed (sudo's PATH has no ogit).
+ if private.ogit.root.check "$base"; then private.ogit.sudo.rerun worktree.remove "$base"; return $(result); fi
+ local url
+ url=$(ogit.remote.url.get origin "$base/main")
+ if [ -z "$url" ]; then create.result 1 "ogit.worktree.remove: $base/main has no origin"; error.log "$RESULT"; return $(result); fi
+ # Gate EVERY folder before touching ANY: main, then each linked worktree.
+ local -a folders=() branches=()
+ local wt branch mainPhys
+ mainPhys=$(private.this.path.canonical "$base/main")
+ while IFS= read -r wt; do
+   [ "$wt" = "$mainPhys" ] && continue
+   folders+=("$wt")
+ done < <(private.ogit.worktree.paths.get "$base/main")
+ private.ogit.folder.gate "$base/main" || { error.log "$RESULT"; return $(result); }
+ for wt in "${folders[@]}"; do
+   private.ogit.folder.gate "$wt" || { error.log "$RESULT"; return $(result); }
+   branch=$(ogit.branch.get "$wt")
+   [ -n "$branch" ] || { create.result 1 "${wt##*/} is detached — check a branch out first"; error.log "$RESULT"; return $(result); }
+   branches+=("$branch")
+ done
+ if [ ${#folders[@]} = 0 ]; then create.result 0 "no linked worktrees under $base — nothing to remove"; success.log "$RESULT"; return $(result); fi
+ local i stash keep tmp
+ for i in "${!folders[@]}"; do
+   wt="${folders[$i]}"; branch="${branches[$i]}"
+   # Build the clone BESIDE the worktree first, from main/ — offline and without
+   # credentials (root has no GitHub key on a real host: the 2026-09-25 host
+   # migration lost dev/ that way). A worktree's branch is a local branch of
+   # main, and the gate proved it clean and pushed, so main holds exactly the
+   # pushed commit. Only when the clone exists is the worktree removed.
+   tmp="$(dirname "$wt")/.ogit-${wt##*/}.new"
+   if [ -e "$tmp" ]; then
+     create.result 1 "${wt##*/}: $tmp is in the way (left by an earlier run?) — remove it and re-run; nothing was changed"; error.log "$RESULT"; return $(result)
+   fi
+   ogit.repo.clone "$base/main" "$branch" "$tmp" >/dev/null 2>&1 \
+     || { create.result 1 "${wt##*/}: clone of $branch from $base/main failed — nothing was changed$(private.ogit.git.reason.get)"; error.log "$RESULT"; return $(result); }
+   ogit.remote.url.set "$url" origin "$tmp" >/dev/null \
+     || { rm -rf "$tmp"; create.result 1 "${wt##*/}: could not point the new clone at $url — nothing was changed$(private.ogit.git.reason.get)"; error.log "$RESULT"; return $(result); }
+   stash="$HOME/.oosh.backups/$(date -u +%Y%m%dT%H%M%SZ)-ogit-${wt##*/}"
+   [ -e "$stash" ] && stash="$stash.$$"
+   private.ogit.folder.ignored.save "$wt" "$stash" || { rm -rf "$tmp"; error.log "$RESULT"; return $(result); }
+   keep=""; [ -d "$stash" ] && keep=" — its ignored files are kept in $stash"
+   ogit.worktree.delete "$wt" "$base/main" >/dev/null \
+     || { rm -rf "$tmp"; create.result 1 "worktree delete of $wt failed — stop; nothing after this folder was touched$keep$(private.ogit.git.reason.get)"; error.log "$RESULT"; return $(result); }
+   mv "$tmp" "$wt" \
+     || { create.result 1 "${wt##*/}: worktree removed but the new clone could not be moved into place — recover with: mv $tmp $wt$keep"; error.log "$RESULT"; return $(result); }
+   private.ogit.folder.finish "$wt" || { error.log "$RESULT$keep"; return $(result); }
+   private.ogit.folder.ignored.restore "$stash" "$wt" || { error.log "$RESULT"; return $(result); }
+   success.log "${wt##*/}: worktree → clone ($branch)"
+ done
+ ogit.worktree.prune "$base/main" >/dev/null
+ create.result 0 "${#folders[@]} folder(s) converted to clones under $base"
+ return $(result)
+}
+
+
+ogit.worktree.restore()     # <?base:$(oo mode.base.get)> # turn every sibling clone of <base>/main (same origin) back into a linked worktree of main, carrying its gitignored files across; refuses on a dirty or unpushed folder; idempotent; run with sudo on a shared tree #
+{
+ private.ogit.require || return $(result)
+ local base
+ base=$(private.ogit.base.get "$1")
+ if [ ! -d "$base/main/.git" ]; then create.result 1 "ogit.worktree.restore: no repository at $base/main"; error.log "$RESULT"; return $(result); fi
+ if private.ogit.root.check "$base"; then private.ogit.sudo.rerun worktree.restore "$base"; return $(result); fi
+ local url
+ url=$(ogit.remote.url.get origin "$base/main")
+ local d branch
+ local -a folders=() branches=()
+ while IFS= read -r d; do
+   [ "${d##*/}" = main ] && continue
+   [ -d "$d/.git" ] || continue                                   # worktrees (.git file) are already done
+   [ "$(ogit.remote.url.get origin "$d")" = "$url" ] || continue   # a foreign clone is not ours
+   private.ogit.folder.gate "$d" || { error.log "$RESULT"; return $(result); }
+   branch=$(ogit.branch.get "$d")
+   [ -n "$branch" ] || { create.result 1 "${d##*/} is detached — check a branch out first"; error.log "$RESULT"; return $(result); }
+   folders+=("$d"); branches+=("$branch")
+ done < <(private.ogit.base.folders.list "$base")
+ private.ogit.folder.gate "$base/main" || { error.log "$RESULT"; return $(result); }
+ if [ ${#folders[@]} = 0 ]; then create.result 0 "no sibling clones under $base — nothing to restore"; success.log "$RESULT"; return $(result); fi
+ local i stash keep
+ # No fetch from origin: under sudo root has no GitHub key. Import each clone's
+ # branch into main/ locally (the gate proved it clean and pushed), so
+ # origin/<branch> in main is exactly the commit the new worktree gets.
+ for i in "${!folders[@]}"; do
+   private.ogit.branch.import "${folders[$i]}" "${branches[$i]}" "$base/main" >/dev/null \
+     || { error.log "$RESULT — nothing was changed"; return $(result); }
+ done
+ # main/ keeps its own local copy of every branch, and `worktree add -B <branch> …
+ # origin/<branch>` below RESETS it. Commits there that origin does not have would
+ # survive only in the reflog, so refuse before anything is deleted.
+ for i in "${!branches[@]}"; do
+   branch="${branches[$i]}"
+   ogit.branch.check "refs/heads/$branch" "$base/main" || continue
+   ogit.commit.count "origin/$branch" "refs/heads/$branch" "$base/main" >/dev/null
+   if [ "${RESULT:-0}" != 0 ]; then
+     create.result 1 "main/ has $RESULT unpushed commit(s) on its local $branch branch, which restore would reset — push it or delete it in $base/main first"
+     error.log "$RESULT"; return $(result)
+   fi
+ done
+ for i in "${!folders[@]}"; do
+   d="${folders[$i]}"; branch="${branches[$i]}"
+   stash="$HOME/.oosh.backups/$(date -u +%Y%m%dT%H%M%SZ)-ogit-${d##*/}"
+   [ -e "$stash" ] && stash="$stash.$$"
+   private.ogit.folder.ignored.save "$d" "$stash" || { error.log "$RESULT"; return $(result); }
+   keep=""; [ -d "$stash" ] && keep=" — its ignored files are kept in $stash"
+   rm -rf "$d" || { create.result 1 "could not remove $d$keep"; error.log "$RESULT"; return $(result); }
+   ogit.worktree.add "$branch" "$d" "origin/$branch" "$base/main" >/dev/null \
+     || { create.result 1 "${d##*/}: clone removed but worktree add failed — recover with: ogit worktree.add $branch $d origin/$branch $base/main$keep$(private.ogit.git.reason.get)"; error.log "$RESULT"; return $(result); }
+   ogit.branch.upstream.set "origin/$branch" "$d" >/dev/null
+   private.ogit.folder.finish "$d" || { error.log "$RESULT$keep"; return $(result); }
+   private.ogit.folder.ignored.restore "$stash" "$d" || { error.log "$RESULT"; return $(result); }
+   success.log "${d##*/}: clone → worktree ($branch)"
+ done
+ ogit.repo.share "$base/main" >/dev/null
+ create.result 0 "${#folders[@]} folder(s) restored as worktrees of $base/main"
+ return $(result)
+}
+
+
+private.ogit.fetchhead.share()     # <?dir:$OOSH_DIR> # make the FETCH_HEAD of <dir> group-writable when its repository is shared (core.sharedRepository) and this user owns the file; silent #
+{
+ # NO create.result — called after a fetch or pull, whose RESULT must stand.
+ # git applies core.sharedRepository to what it creates through its shared-
+ # permission path, but writes FETCH_HEAD with the caller's umask: after root
+ # fetched in a shared folder, no other dev user could fetch there again
+ # (platform container, 2026-10-01; T-OGIT-FETCHHEAD-SHARED). Only the owner
+ # can chmod it — which is exactly the user who just wrote it. An unshared
+ # repository is left alone: never widen permissions nobody asked for.
+ local dir="${1:-${OOSH_DIR:-.}}" shared gitDir
+ shared=$(ogit.config.get core.sharedRepository local "$dir")
+ case "$shared" in ''|umask|false|0) return 0 ;; esac
+ gitDir=$(private.ogit.gitdir "$dir")
+ [ -n "$gitDir" ] && [ -O "$gitDir/FETCH_HEAD" ] && chmod g+w "$gitDir/FETCH_HEAD" 2>/dev/null
+ return 0
+}
+
+
+private.ogit.root.check()     # <base> # rc 0 when a converter must run as root on <base>: the caller is not root and does not own <base>, a folder under it or its .git #
+{
+ # A predicate (rc only). The framework contract: $SUDO is "" for root and
+ # "sudo " otherwise (see private.oo.path.sudo.get) — root never re-runs. A tree
+ # the caller owns (fixtures, a single-user host) needs no root: chgrp/chmod
+ # need ownership, so the test is -O on the base, every folder and its .git.
+ [ -n "$SUDO" ] || return 1
+ local base="$1" d
+ [ -O "$base" ] || return 0
+ while IFS= read -r d; do
+   [ -O "$d" ] || return 0
+   [ -e "$d/.git" ] && { [ -O "$d/.git" ] || return 0; }
+ done < <(private.ogit.base.folders.list "$base")
+ return 1
+}
+
+
+private.ogit.sudo.rerun()     # <method> <base> # run ogit <method> <base> again through sudo, by the canonical path of ogit (the PATH of sudo has no oosh); RESULT and rc are those of that run #
+{
+ # sudo resets PATH (no oosh on it) and root's own oo mode.base.get is not
+ # ours: run THIS ogit by its canonical path with the base already resolved.
+ # Output and the password prompt pass straight through.
+ local method="$1" base="$2" self rc
+ if ! command -v sudo >/dev/null 2>&1 && [ "$(type -t sudo)" != function ]; then
+   create.result 1 "ogit $method: $base belongs to other users and sudo is missing — run it as root"; error.log "$RESULT"; return $(result)
+ fi
+ self=$(private.this.path.canonical "$OOSH_DIR/ogit")
+ important.log "ogit $method: $base is shared with other users — running as root via sudo (enter your password if asked)"
+ sudo "$self" "$method" "$base"; rc=$?
+ [ "$rc" = 0 ] && create.result 0 "ogit $method ran as root via sudo" || create.result "$rc" "ogit $method as root via sudo failed (rc=$rc)"
+ return $(result)
+}
+
+
+private.ogit.branch.import()     # <srcDir> <branch> <?dir:$OOSH_DIR> # make refs/remotes/origin/<branch> of <dir> point at the <branch> of the repository in <srcDir> (a local fetch, no network, no credentials) #
+{
+ # A LOCAL fetch: restore runs under sudo, and root has no GitHub key. The gate
+ # proved <srcDir> clean and not ahead of origin, so its <branch> is a pushed commit.
+ # Forced (+): origin/<branch> in <dir> may be older than, or diverge from, it.
+ private.ogit.require || return $(result)
+ local src="$1" branch="$2"
+ local dir="${3:-${OOSH_DIR:-.}}"
+ if private.ogit.git.run "$dir" fetch -q "$src" "+refs/heads/$branch:refs/remotes/origin/$branch"; then
+   create.result 0 "origin/$branch of $dir now at the $branch of $src"
+ else
+   create.result 1 "could not import $branch from $src into $dir$(private.ogit.git.reason.get)"
+ fi
+ return $(result)
+}
+
+
+### new.method
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED PARAMETER COMPLETION — c2 falls back to these for every method
+# (ng/c2:483,518). Direct git / filesystem, no create.result (c2 rule).
+# A method keeps its own .completion.<param> only for an enumeration of its own.
+# Kept BELOW the ### new.method marker so oo method.new keeps the methods together.
+# ─────────────────────────────────────────────────────────────────────────────
+ogit.parameter.completion.dir()        { compgen -d "$1"; }
+ogit.parameter.completion.targetDir()  { compgen -d "$1"; }
+ogit.parameter.completion.path()       { compgen -d "$1"; }
+ogit.parameter.completion.base()       {
+  # <base> has one real value: the components base. Empty word → that (not the
+  # folders of wherever the user stands); a typed path → the base when it
+  # matches, plus folder completion. private.ogit.base.get is a plain getter —
+  # no create.result on a completion path.
+  local base; base=$(private.ogit.base.get "" 2>/dev/null)
+  if [ -z "$1" ]; then [ -n "$base" ] && printf '%s\n' "$base" || compgen -d "$1"; return 0; fi
+  case "$base" in "$1"*) printf '%s\n' "$base" ;; esac
+  compgen -d "$1"
+}
+ogit.parameter.completion.branch()     { ogit.branch.list all; }
+ogit.parameter.completion.ref()        { ogit.branch.list all; ogit.tag.list; }
+ogit.parameter.completion.startPoint() { ogit.parameter.completion.ref "$@"; }
+ogit.parameter.completion.commit()     { ogit.parameter.completion.ref "$@"; }
+ogit.parameter.completion.to()         { ogit.parameter.completion.ref "$@"; }
+ogit.parameter.completion.a()          { ogit.parameter.completion.ref "$@"; }
+ogit.parameter.completion.b()          { ogit.parameter.completion.ref "$@"; }
+ogit.parameter.completion.range()      { ogit.parameter.completion.ref "$@"; }
+ogit.parameter.completion.tag()        { ogit.tag.list; }
+ogit.parameter.completion.remote()     { git -C "${OOSH_DIR:-.}" remote 2>/dev/null; }
+ogit.parameter.completion.paths()      { compgen -f "$1"; }
+ogit.parameter.completion.pathspecs()  { compgen -f "$1"; }
+ogit.parameter.completion.asEmail()    { ogit.config.email.get; }
+
+ogit.usage()
+{
+  local this=${0##*/}
+  echo "You started" 
+  echo "$0
+
+  Usage:
+  $this: command   Parameter and Description"
+  this.help
+  echo "
+  
+  Examples
+    $this repo.clone git@github.com:Cerulean-Circle-GmbH/once.sh.git dev /tmp/dev
+    $this branch.get
+    $this branch.list all
+    $this remote.pull
+    $this commit.log.show dev..testing 20 oneline
+    $this status.show short
+    $this tag.latest.get
+    $this safeDirectory.ensure
+    $this worktree.find prod
+    $this layout.status
+    $this caller.validate
+    ----------
+  "
+}
+
+ogit.start()
+{
+  #echo "sourcing init"
+  source this
+
+  # if [ -z "$1" ]; then
+  #   status.discover "$@"
+  #   return 0
+  # fi
+
+  this.start "$@"
+}
+
+ogit.start "$@"
+

@@ -1,5 +1,7 @@
 # Worktrees vs. the EAMD.ucp version convention — research: remove worktrees, or reconcile the naming?
 
+> **Superseded 2026-09-23** by the ogit design ([spec](../superpowers/specs/2026-09-23-ogit-clones-per-branch-design.md)); the user decided for clones. The layout as built: [oo.md § The clone layout](../oo.md#the-clone-layout).
+
 **Written 2026-09-22 · Branch `dev` (`09020ba`) · Status: RESEARCH — no code changed. Verdicts in § 2, § 3; recommendation in § 5; hand-off in § 6.**
 **Question (verbatim):** "What will it take to remove worktrees and use real folders only in the repository? If it doesn't make sense, how can we fix worktrees to be consistent with naming conventions like it would have been without worktrees?"
 

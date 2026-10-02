@@ -266,10 +266,24 @@ scriptname.start "$@"  # Entry point
 
 When a script like `myScript` boots, dependencies load in this order:
 
-An interactive login shell boots via `$OOSH_DIR/boot` (from `bashrcTemplate`),
-which sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`),
-sources the pure-data env chain, builds PATH, and loads `log` — see
-[boot.md](boot.md). A script invoked directly boots via `source this`:
+The boot order is **bash → this → log → debug → config → every other oosh
+command**, from any entry — an empty shell (`env -i sh`) included:
+
+- **`bash`** reads `~/.bashrc` (`bashrcTemplate`) even without `HOME` (`~` reads
+  the password database). An old bash — macOS `/bin/bash` 3.2 from the system
+  PATH — first hands over to the config's `BASH_FILE`; then `.bashrc` runs
+  `unset CONFIG; source ~/oosh/this`.
+- **`this`** from an empty shell is found on the system PATH:
+  `/usr/local/bin/this` (`templates/user/thisLauncher`, installed by the
+  install, `oo update`, `oo user.fix`) recovers `HOME` from the OS identity and
+  starts the caller's own `~/oosh/this`. `this <method>` runs the method and
+  returns; plain `this` enters an interactive oosh bash and writes only the
+  user's own `user.session.env`.
+- **`this`** itself derives `HOME` when it is missing, then reads
+  `~/config/user.env`: the shared anchors and chains, and last the user's own
+  `~/.config/oosh/user.session.env` with their real PATH — see
+  [config.md § The PATH line](config.md#the-path-line). A script invoked
+  directly starts the same way, via `source this`:
 
 ```
 1. myScript.start "$@"
@@ -277,12 +291,13 @@ sources the pure-data env chain, builds PATH, and loads `log` — see
 2. source this                    # OOSH kernel
    │
    ├─ this.init                   # Initialize environment
-   │   ├─ Sets OOSH_DIR, CONFIG_PATH, OOSH_USER_CONFIG_PATH
+   │   ├─ Sets OOSH_DIR, CONFIG_PATH
    │   └─ . $CONFIG               # Load user.env (pure data)
    │       ├─ . oosh.env          # OOSH configuration
-   │       └─ . log.env           # Log configuration
-   │           └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
-   │   (PATH is built by boot/this, NOT persisted in the env files)
+   │       ├─ . log.env           # Log configuration
+   │       │   └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
+   │       └─ . user.session.env  # per-user real PATH + OOSH_MODE (last)
+   │   (PATH is one data line there; this de-duplicates it)
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
    │
@@ -307,7 +322,7 @@ source $OOSH_DIR/debug
 # debug line 1: source $OOSH_DIR/log
 
 # log provides: info.log, error.log, debug.log, etc.
-# debug provides: step(), stackTrace(), setTrap(), etc.
+# debug provides: debug.step(), debug.stackTrace(), debug.setTrap(), etc.
 
 # Dependency chain:
 # myScript → debug → log → (log.env for colors/levels)
@@ -362,7 +377,7 @@ The file `this` is the OOSH kernel. It provides:
 | `this.functionExists` | Checks if a function is defined |
 | `this.isSourced` | Detects if script was sourced vs executed |
 | `this.init` | Initializes oosh environment |
-| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that never source `boot` — `boot` owns the PATH ([boot.md](boot.md)) |
+| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that have not read `~/config/user.env` — the login PATH is data there ([config.md § The PATH line](config.md#the-path-line)) |
 
 ### Method Dispatch Chain
 
@@ -410,6 +425,7 @@ this.call() {
 | `ossh` | SSH key/config management |
 | `state` | State machine for multi-step workflows |
 | `user` | User and SSH identity management |
+| `ogit` | The only git caller; [docs/ogit.md](ogit.md) |
 
 ---
 
@@ -430,9 +446,10 @@ this.call() {
 ### user.env Structure
 
 Env files are **pure data** now — only `export KEY="VALUE"` and `.`-chain lines,
-no logic. The per-user/volatile anchors (`OOSH_DIR`, `CONFIG`, `CONFIG_PATH`,
-`PATH`) are **not** persisted here; `$OOSH_DIR/boot` computes them fresh each
-shell (see [boot.md](boot.md)). `config.validate` enforces the no-logic rule.
+no logic. The anchors (`CONFIG_PATH`, `CONFIG`, `OOSH_DIR`) are written as the
+`"$HOME/…"` constants and PATH as one prepend line, so the shared files are right
+for every user (see [config.md § The anchor rule](config.md#the-anchor-rule)).
+`config.validate` enforces the no-logic rule.
 
 ```bash
 # ~/config/user.env  — portable data + POSIX `.` source chain
@@ -449,10 +466,10 @@ export CONFIG_FILE="user.env"
 # ~/config/log.env  (shared)
 export LOG_LEVEL="1"
 export LOG_LEVEL_RESET="1"
-. $OOSH_USER_CONFIG_PATH/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
+. $HOME/.config/oosh/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
 ```
 
-Note POSIX `.` (not the bash `source` builtin) so `boot` parses under dash/ash.
+Note POSIX `.` (not the bash `source` builtin) so dash/ash shells can source the chain.
 
 ---
 
@@ -506,7 +523,7 @@ See [docs/log.md](log.md) for complete documentation.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [boot.md](boot.md)) | `~/oosh` |
+| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [config.md § The anchor rule](config.md#the-anchor-rule)) | `~/oosh` |
 | `CONFIG` | Path to user.env | `~/config/user.env` |
 | `CONFIG_PATH` | Config directory | `~/config` |
 | `LOG_LEVEL` | Logging verbosity (0-6) | `3` |
@@ -626,7 +643,7 @@ $OOSH_DIR/
 # Enable step debugging
 export STEP_DEBUG=ON
 source debug
-setTrap
+debug.setTrap
 
 # Check function existence
 type -t scriptname.method
@@ -698,7 +715,7 @@ Verified by `T-THIS-SUDO-SELF-HEAL` (test/test.oo).
 
 In multi-user installs (`~/config` is a shared symlink), the per-user log vars
 must never leak into the shared config. `LOG_LIVE` (and `LOG_NAME`/`LOG_DEVICE`)
-live in the **per-user** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
+live in the **per-user** `$HOME/.config/oosh/log.session.env` (default
 `~/.config/oosh/log.session.env`), not in the shared `~/config/log.env`;
 `config.save` filters them out of the shared tier. See [Log System](log.md) and
 [config.md § two config tiers](config.md) for the read+write defenses.

@@ -41,6 +41,75 @@ expect 0 "*" "Test start"
 
 source ossh
 
+# ============================================================================
+# T-OSSH-REMOTE-PRELUDE: one owner for "stand a remote/non-interactive shell up"
+# ============================================================================
+# A command over ssh (ossh exec), runuser/sudo -u or docker exec never runs
+# .bashrc. It used to start with `[ -f ~/oosh/boot ] && . ~/oosh/boot || export
+# PATH=…` — copied into ossh, user, os, odocker, c2 and the CI workflow — and
+# the `&& … ||` form takes the fallback whenever sourcing returns non-zero
+# (regression 5d06827). ossh.remote.prelude.get is the one text: POSIX, `if`,
+# ~/config/user.env when present, else ~/oosh on PATH.
+test.ossh.remotePrelude() {
+  local fx bare bad="" p out; fx=$(test.suite.fixture.make prelude); bare=$(test.suite.fixture.make preludebare)
+  mkdir -p "$fx/config"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' 'export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"' > "$fx/config/user.env"
+  p=$(ossh.remote.prelude.get)
+  case "$p" in *"&&"*"||"*) bad="$bad and-or-chain" ;; esac
+  out=$(env -i HOME="$fx" PATH=/usr/bin:/bin sh -c "$p"' printf "%s|%s" "$CONFIG_PATH" "${PATH%%:*}"' 2>/dev/null)
+  [ "$out" = "$fx/config|$fx/oosh" ] || bad="$bad with-user.env=[$out]"
+  out=$(env -i HOME="$bare" PATH=/usr/bin:/bin sh -c "$p"' printf "%s|%s" "$CONFIG_PATH" "${PATH%%:*}"' 2>/dev/null)
+  [ "$out" = "|$bare/oosh" ] || bad="$bad without-user.env=[$out]"
+  rm -rf "$fx" "$bare"
+  [ -z "$bad" ] && create.result 0 "remote prelude: user.env when present, ~/oosh on PATH otherwise, POSIX, no && ||" || create.result 1 "remote prelude:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-REMOTE-PRELUDE: ossh.remote.prelude.get stands a non-interactive shell up from user.env" test.ossh.remotePrelude
+expect 0 "remote prelude: user.env when present, ~/oosh on PATH otherwise, POSIX, no && ||" \
+  "seven copies of a boot line, and the && || form hid a failing source"
+
+# ============================================================================
+# T-OSSH-CMD-NONINTERACTIVE: remote package installs carry the non-interactive
+# prefix
+# ============================================================================
+# oo.cmd and oo.prereqs.install learned the apt/brew prefix table
+# (private.oo.pm.env.get) in 6f4a8e9/85ef5b1; ossh.cmd — the REMOTE
+# counterpart — still sent a bare `sudo $pmCmd $pkg`, so apt could hang on
+# tzdata's "Geographic area:" exactly as oo.cmd used to, and
+# ossh.harden.packages carried a fifth hand copy missing NEEDRESTART_SUSPEND.
+# Drives both with private.ossh.ssh mocked to echo the string it would send.
+test.ossh.cmdNonInteractive() {
+  local out bad=""
+  out=$(
+    private.ossh.ssh() { case "$*" in *"command -v"*) return 1 ;; esac; echo "$*"; }
+    ossh.pm.discover() { echo "apt-get install -y"; }
+    ossh.cmd somehost tree 2>/dev/null
+  )
+  case "$out" in
+    *"sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y tree"*) ;;
+    *) bad="$bad ossh.cmd=>[$out]" ;;
+  esac
+  out=$(
+    private.ossh.ssh() { echo "$*"; }
+    private.ossh.harden.preflight() { return 0; }
+    ossh.harden.packages somehost 2>/dev/null
+  )
+  case "$out" in
+    *"export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1"*) ;;
+    *) bad="$bad harden.packages=>[$out]" ;;
+  esac
+  if [ -n "$bad" ]; then
+    create.result 1 "a remote package install can still prompt:$bad"
+  else
+    create.result 0 "ossh.cmd and ossh.harden.packages send the non-interactive prefix"
+  fi
+  return $(result)
+}
+test.case - "T-OSSH-CMD-NONINTERACTIVE: ossh.cmd and ossh.harden.packages run the remote PM non-interactively" \
+  test.ossh.cmdNonInteractive
+expect 0 "ossh.cmd and ossh.harden.packages send the non-interactive prefix" \
+  "the remote counterpart of oo cmd sent a bare sudo \$pmCmd — apt's tzdata prompt hangs it"
+
 ### test.method
 
 # ============================================================================
@@ -629,9 +698,11 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # T-BRANCH-SHORT-* : this.git.branch.short strips the four known ref prefixes
-# and the rev-parse sites all delegate to it.
+# and the rev-parse sites all delegate to it. Since Task 12 of the ogit plan
+# this.git.branch.short is an alias; the strips live in ogit.branch.get.
 # ─────────────────────────────────────────────────────────────────────────────
-BRANCH_BODY=$(declare -f this.git.branch.short 2>/dev/null)
+private.this.script.load ogit ogit.branch.get
+BRANCH_BODY=$(declare -f ogit.branch.get 2>/dev/null)
 test.case $level "T-BRANCH-SHORT-EXISTS: this.git.branch.short is defined" \
   type this.git.branch.short
 if [ "$RETURN_VALUE" -eq 0 ]; then
@@ -653,12 +724,12 @@ done
 # T-BRANCH-SHORT-CALLER-*: every caller-side rev-parse site delegates to the helper
 for pair in "ossh:449" "ossh:510" "ossh:720" "oo:1233" "user:701" "promote:437" "promote:556"; do
   file="${pair%:*}"
-  test.case $level "T-BRANCH-SHORT-CALLER-$pair: $file uses this.git.branch.short" \
+  test.case $level "T-BRANCH-SHORT-CALLER-$pair: $file uses this.git.branch.short or ogit.branch.get" \
     echo "(grep below)"
-  if grep -q "this\.git\.branch\.short" "$OOSH_DIR/$file" 2>/dev/null; then
-    expect.pass "$file references this.git.branch.short"
+  if grep -qE 'this\.git\.branch\.short|ogit\.branch\.get' "$OOSH_DIR/$file" 2>/dev/null; then
+    expect.pass "$file references this.git.branch.short or ogit.branch.get"
   else
-    expect.fail "$file has a rev-parse that wasn't migrated to this.git.branch.short"
+    expect.fail "$file has a rev-parse that wasn't migrated to this.git.branch.short / ogit.branch.get"
   fi
 done
 
@@ -939,7 +1010,10 @@ test.ossh.prereqs.local.stub() { # <stubDir> # a PATH with the coreutils the scr
 test.ossh.prereqs.local.run() { # <stubDir> # ossh.prereqs.install (local) in a pinned child; echoes its output plus a final rc= line
   # TEST_OSSH_PREREQS_OVERRIDE, when set, is spliced in after ossh is sourced
   # (the negative control below plants the pre-fix symptom with it).
-  env -i PATH="$1" HOME="$HOME" OOSH_DIR="$OOSH_DIR" TERM=dumb LOG_LEVEL=2 LOG_DEVICE=/proc/self/fd/1 SUDO="" \
+  # LOG_DEVICE=/dev/fd/1, not /proc/self/fd/1: macOS has no /proc, so `this`
+  # found the device unwritable and replaced it with the live tty — the
+  # warnings went to the terminal, past the 2>&1 capture below.
+  env -i PATH="$1" HOME="$HOME" OOSH_DIR="$OOSH_DIR" TERM=dumb LOG_LEVEL=2 LOG_DEVICE=/dev/fd/1 SUDO="" \
       OOSH_PM="fakepm install" PM_LOG="$1/pm.calls" \
       CONFIG_PATH="$CONFIG_PATH" CONFIG="$CONFIG" CONFIG_FILE="$CONFIG_FILE" \
       bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1
@@ -955,15 +1029,15 @@ test.ossh.prereqsLocalNamesTool() {
   local calls=""; [ -f "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
   rm -rf "$stub"
   local tool missing=""
-  for tool in rsync tree; do
+  for tool in rsync tree diff; do
     [ "$(echo "$out" | grep -c "WARNING> ossh.prereqs.install: continuing without $tool")" = "1" ] || missing="$missing $tool"
   done
   if ! echo "$out" | grep -q '^rc=0$'; then
     create.result 1 "local mode must continue (rc 0) — got: $(echo "$out" | grep '^rc=')"
   elif [ -n "$missing" ]; then
     create.result 1 "warning does not name the tool (exactly once) for:$missing — warnings: $(echo "$out" | grep WARNING | tr '\n' '|')"
-  elif [ "${calls#*install rsync}" = "$calls" ] || [ "${calls#*install tree}" = "$calls" ]; then
-    create.result 1 "the package manager was not asked for both tools: [$calls]"
+  elif [ "${calls#*install rsync}" = "$calls" ] || [ "${calls#*install tree}" = "$calls" ] || [ "${calls#*install diffutils}" = "$calls" ]; then
+    create.result 1 "the package manager was not asked for every tool (diff by its package name, diffutils): [$calls]"
   else
     create.result 0 "each missing prereq is named once, install continues"
   fi

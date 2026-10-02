@@ -102,7 +102,7 @@ For each Docker-testable platform, `os platform.test` runs fully automated (no i
 10. `terminal` modifier drops into an interactive `bash-user` shell before cleanup (same last-user-created convention as before)
 11. `ossh connection.close` + container cleanup
 
-> **Why `sudo runuser -u <user> -- bash -lc …` for the two new users?** `user.login` itself (`env -i su - "$1"`) is interactive and can't be fed a command. `sudo runuser -u <user> -- bash -lc …` is functionally identical — login-shell (`-lc`), fresh env, explicit user-switch — and scripts cleanly over one ssh-tt session. `runuser` ships from `util-linux` on every Linux target — present in the base image on Debian-derivatives and RHEL, installed by step 7 (`ossh prereqs.install`) on Alpine.
+> **Why `sudo runuser -u <user> -- bash -lc …` for the two new users?** `user.login` itself (`env -i TERM="$(private.user.login.term.get)" su - "$1"` — a clean environment, TERM kept) is interactive and can't be fed a command. `sudo runuser -u <user> -- bash -lc …` is functionally identical — login-shell (`-lc`), fresh env, explicit user-switch — and scripts cleanly over one ssh-tt session. `runuser` ships from `util-linux` on every Linux target — present in the base image on Debian-derivatives and RHEL, installed by step 7 (`ossh prereqs.install`) on Alpine.
 
 Non-interactive `ssh-keygen` (`-N ''`) is handled in `user`/`ossh` so key generation never prompts.
 

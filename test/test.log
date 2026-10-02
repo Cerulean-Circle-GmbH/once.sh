@@ -166,12 +166,14 @@ export LOG_LEVEL=2
 test.case - "T7: warn.log outputs at level 2" \
   warn.log "test warning message"
 
-# warn.log outputs to stdout, not LOG_DEVICE
-OUTPUT=$(warn.log "test warning" 2>&1)
-if echo "$OUTPUT" | grep -q "WARNING"; then
+# warn.log writes through private.log.emit like every other level — to
+# LOG_DEVICE (a file here), never stdout (T-LOG-EMIT). It used to be the one
+# level that printed to stdout, straight into any $() capture.
+warn.log "test warning"
+if grep -q "WARNING> test warning" "$TEST_LOG_DEVICE"; then
   create.result 0 "Warning logged"
 else
-  create.result 1 "Warning not found: $OUTPUT"
+  create.result 1 "Warning not found in $TEST_LOG_DEVICE"
 fi
 expect 0 "Warning logged" "warn.log outputs at level > 1"
 
@@ -919,17 +921,16 @@ expect 0 "3 vars present, no LOGNAME" "log.session.save persists the 3 LOG_ vars
 test.case - "T49: LOG_LIVE is per-user under ~/.config/oosh" \
   echo "testing LOG_LIVE relocation"
 
-# log.live() default must anchor under the per-user dir — now expressed via the
-# single-source-of-truth $OOSH_USER_CONFIG_PATH (fallback ~/.config/oosh), NOT a
-# re-spelled literal. Assert both the var reference and the log.live.out file.
+# log.live() default must anchor under the per-user dir $HOME/.config/oosh (the
+# variable that used to name it is gone, T44). Assert the dir and the file.
 DEFAULT_BODY=$(declare -f log.live)
-if echo "$DEFAULT_BODY" | grep -q 'OOSH_USER_CONFIG_PATH' \
+if echo "$DEFAULT_BODY" | grep -qF '$HOME/.config/oosh' \
    && echo "$DEFAULT_BODY" | grep -q 'log\.live\.out'; then
-  create.result 0 "LOG_LIVE default under \$OOSH_USER_CONFIG_PATH"
+  create.result 0 "LOG_LIVE default under \$HOME/.config/oosh"
 else
   create.result 1 "log.live default not relocated: $DEFAULT_BODY"
 fi
-expect 0 "LOG_LIVE default under \$OOSH_USER_CONFIG_PATH" "LOG_LIVE default lives under the per-user \$OOSH_USER_CONFIG_PATH"
+expect 0 "LOG_LIVE default under \$HOME/.config/oosh" "LOG_LIVE default lives under the per-user \$HOME/.config/oosh"
 
 # ============================================================================
 # T50: the LIVE terminal wins over a stale chained LOG_DEVICE (needs a pty)
@@ -996,6 +997,123 @@ fi
 # Cleanup
 # ============================================================================
 cleanup.testFiles
+
+
+console.log "
+Test: T-LOG-TERMINAL
+===================================================================="
+
+# T-LOG-TERMINAL: one list of terminal-type devices — fd1/stdout, fd2/stderr,
+# the tty, unset — shared by private.log.emit and log.device.
+test.log.deviceIsTerminal() {
+  local bad="" d
+  for d in "" /dev/stdout /dev/stderr /proc/self/fd/1 /dev/fd/1 /proc/self/fd/2 /dev/fd/2 /dev/tty; do
+    private.log.device.is.terminal "$d" || bad="$bad [$d]-not-terminal"
+  done
+  private.log.device.is.terminal "/tmp/some.log" && bad="$bad file-called-terminal"
+  [ -z "$bad" ] && create.result 0 "terminal-type devices recognised, a file is not" || create.result 1 "terminal:$bad"
+  return $(result)
+}
+test.case - "T-LOG-TERMINAL: private.log.device.is.terminal knows every terminal-type device and no file" test.log.deviceIsTerminal
+expect 0 "terminal-type devices recognised, a file is not" "one list for the emitter and log.device"
+
+
+console.log "
+Test: T-LOG-EMIT
+===================================================================="
+
+# T-LOG-EMIT: a log line never lands on stdout (#41 / c0e6036, lost in the dev
+# rebuild): a terminal-type LOG_DEVICE is written to fd2 by DUP (no reopen —
+# the su- EACCES), a file LOG_DEVICE is appended to. So `$(anything)` captures
+# only what a command prints on purpose (BUG5 — param-env contamination).
+test.log.emitNeverStdout() {
+  local bad="" out f="$TEST_LOG_DEVICE.emit"
+  # portability-exception: same process — log classifies /proc/self/fd/1 by NAME as a capture and never opens it
+  out=$( { LOG_DEVICE=/proc/self/fd/1; LOG_LEVEL=3
+           console.log "emit-console"; warn.log "emit-warn"; important.log "emit-important"
+           success.log "emit-success"; error.log "emit-error"; } 2>"$f.err" )
+  [ -z "$out" ] || bad="$bad stdout=[$(printf '%s' "$out" | tr '\n' ' ')]"
+  grep -q 'emit-console' "$f.err" 2>/dev/null || bad="$bad console-not-on-stderr"
+  grep -q 'emit-warn' "$f.err" 2>/dev/null || bad="$bad warn-not-on-stderr"
+  ( LOG_DEVICE="$f"; LOG_LEVEL=3; : > "$f"; console.log "emit-file" ) 2>/dev/null
+  grep -q 'emit-file' "$f" 2>/dev/null || bad="$bad file-not-appended"
+  rm -f "$f" "$f.err"
+  [ -z "$bad" ] && create.result 0 "log lines go to stderr or the device file, never stdout" || create.result 1 "emit:$bad"
+  return $(result)
+}
+test.case - "T-LOG-EMIT: console/warn/important/success/error.log never write to stdout" test.log.emitNeverStdout
+expect 0 "log lines go to stderr or the device file, never stdout" "a log line inside \$(…) contaminated the captured value"
+
+
+console.log "
+Test: T-LOG-CAPTURE
+===================================================================="
+
+# T-LOG-CAPTURE: the fd1/fd2 spellings — never probed (a probe of fd1 is the
+# #41 leak into $()); /dev/tty and files are probed by private.log.device.probe.
+test.log.deviceIsCapture() {
+  local bad="" d
+  for d in /dev/stdout /proc/self/fd/1 /dev/fd/1 /dev/stderr /proc/self/fd/2 /dev/fd/2; do
+    private.log.device.is.capture "$d" || bad="$bad [$d]-not-capture"
+  done
+  for d in "" /dev/tty /tmp/some.log; do
+    private.log.device.is.capture "$d" && bad="$bad [$d]-called-capture"
+  done
+  [ -z "$bad" ] && create.result 0 "fd1/fd2 spellings are capture devices; tty, files and unset are not" || create.result 1 "capture:$bad"
+  return $(result)
+}
+test.case - "T-LOG-CAPTURE: private.log.device.is.capture knows the fd1/fd2 spellings and nothing else" test.log.deviceIsCapture
+expect 0 "fd1/fd2 spellings are capture devices; tty, files and unset are not" "the probe must skip exactly the devices whose probe would leak or cannot fail"
+
+
+console.log "
+Test: T-LOG-DEVICE-PROBE
+===================================================================="
+
+# T-LOG-DEVICE-PROBE: one probe for log.device and log.init — a device that
+# cannot be opened (/dev/tty with no controlling terminal, an unwritable file)
+# falls back to /dev/stderr; a capture spelling is left alone; a writable file
+# is kept and gets NO probe line written into it.
+test.log.deviceProbe() {
+  local bad="" got f="$TEST_LOG_DEVICE.probe"
+  # /dev/tty WITHOUT a controlling terminal needs a new session, and only
+  # util-linux ships `setsid` — macOS has none, so there this case is covered
+  # by the unopenable-file case below (the same branch of the probe).
+  if command -v setsid >/dev/null 2>&1; then
+    got=$(env -i PATH="$PATH" HOME="$HOME" OOSH_DIR="$OOSH_DIR" LOG_LEVEL=1 \
+          setsid bash -c "source \"$OOSH_DIR/log\" >/dev/null 2>&1; LOG_DEVICE=/dev/tty; private.log.device.probe 2>/dev/null; echo \"\$LOG_DEVICE\"" </dev/null 2>/dev/null)
+    [ "$got" = /dev/stderr ] || bad="$bad tty-without-terminal=[$got]"
+  fi
+  got=$( LOG_DEVICE="$TEST_LOG_DEVICE.nodir/x"; private.log.device.probe 2>/dev/null; echo "$LOG_DEVICE" )
+  [ "$got" = /dev/stderr ] || bad="$bad unwritable-file=[$got]"
+  # portability-exception: same process — log classifies /proc/self/fd/1 by NAME as a capture and never opens it
+  got=$( LOG_DEVICE=/proc/self/fd/1; private.log.device.probe; echo "$LOG_DEVICE" )
+  [ "$got" = /proc/self/fd/1 ] || bad="$bad capture-changed=[$got]"
+  : > "$f"; ( LOG_DEVICE="$f"; private.log.device.probe )
+  [ -s "$f" ] && bad="$bad probe-wrote-into-file"
+  got=$( LOG_LEVEL= LOG_DEVICE=/proc/self/fd/1 log.init 3 2>/dev/null )
+  [ -z "$got" ] || bad="$bad log.init-stdout=[$got]"
+  rm -f "$f"
+  [ -z "$bad" ] && create.result 0 "unopenable devices fall back to stderr; capture and file devices are kept, silently" || create.result 1 "probe:$bad"
+  return $(result)
+}
+test.case - "T-LOG-DEVICE-PROBE: private.log.device.probe falls back to /dev/stderr only for a device that cannot be opened; log.init prints nothing to stdout" test.log.deviceProbe
+expect 0 "unopenable devices fall back to stderr; capture and file devices are kept, silently" "log device kept /dev/tty off-tty, and log.init still probed fd1"
+
+# T-LOG-DEVICE-ONE: exactly one log.device, and `log device <file>` sets it
+# without persisting or recursing into config save.
+test.log.deviceOne() {
+  local bad="" n f="$TEST_LOG_DEVICE.one"
+  n=$(grep -cE "^log\.device\(\)" "$OOSH_DIR/log"); [ "$n" = 1 ] || bad="$bad definitions=$n"
+  ( config() { echo "CONFIG-CALLED $*"; }; this.call() { echo "THIS-CALL $*"; }
+    log.device "$f" 2>/dev/null | grep -qE "CALLED|THIS-CALL" ) && bad="$bad recursed-into-config"
+  rm -f "$f"
+  [ -z "$bad" ] && create.result 0 "one log.device; no config save recursion" || create.result 1 "one:$bad"
+  return $(result)
+}
+test.case - "T-LOG-DEVICE-ONE: log.device is defined once and no longer recurses into config save" test.log.deviceOne
+expect 0 "one log.device; no config save recursion" "a second definition overrode the first on every source"
+
 
 ### test.method
 

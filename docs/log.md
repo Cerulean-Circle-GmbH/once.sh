@@ -88,6 +88,29 @@ log.device /tmp/my.log
 log.device
 ```
 
+### Where a log line goes (`private.log.emit`)
+
+Every level — console, test.console, silent, success, warn, important, debug, stop,
+error — writes through `private.log.emit`:
+
+- a **terminal-type** `LOG_DEVICE` (unset, `/dev/stdout`, `/proc/self/fd/1`, `/dev/fd/1`,
+  `/dev/stderr`, fd 2, `/dev/tty` — `private.log.device.is.terminal`) is written to
+  **fd 2 by dup** — never by reopening `/dev/stderr`, which fails `EACCES` after `su -`
+  on a root-owned tty;
+- a **file** `LOG_DEVICE` is appended to (fd 2 if it cannot be written);
+- **stdout is never written**, so `$(command …)` captures only what a command prints on
+  purpose (BUG5 — log text used to contaminate captured values and c2 parameters).
+
+`log.device <device>` and `log.init` share one probe, `private.log.device.probe`: a device
+that cannot be opened — `/dev/tty` without a controlling terminal (ssh exec, cron), a file
+nobody may write — falls back to `/dev/stderr`; the fd 1 / fd 2 spellings
+(`private.log.device.is.capture`) are never probed, because a probe of fd 1 is exactly the
+leak into `$(…)`. The probe writes no line. `log.device` sets and reports only; `LOG_DEVICE`
+is persisted per user by `log.session.save`, never through `config save`. Back-port of
+Marcel's #41 (`c0e6036`, kept on `test/macos.latest`). `info.log` in `this` (LOG_LEVEL > 3)
+runs before `log` is loaded and applies the same rule inline; `ossh`'s dry-run lines and
+`c2`'s level-5 dumps go through `private.log.emit` too.
+
 ### Environment Variables
 
 | Variable | Default | Description | Scope |
@@ -103,20 +126,19 @@ log.device
 
 OOSH config is **shared**: every user's `~/config` symlinks to one `sharedConfig`
 directory, so everything written to `~/config/log.env` is seen by *all* users.
-Only the site-wide verbosity (`LOG_LEVEL`, `LOG_LEVEL_RESET`) belongs there.
+That is where the site-wide log settings live.
 
-Anything per-user or per-session must NOT go into the shared `log.env` — it would
-leak one user's absolute paths, tty, or identity onto everyone else (and cause
-cross-user permission errors). `config.save` therefore filters `LOG_NAME`,
-`LOG_DEVICE` and `LOG_LIVE` out of the shared `log.env`. They are instead written
-to the user's **private** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
-`~/.config/oosh`) — the same per-user directory OOSH already uses for
-`mode-env.bash`. The `boot` loader materialises that file once per shell (it
-delegates to `log.session.save`).
+`config save log` writes every `LOG_*` **setting** into the shared `log.env` —
+the MacStudio model — and a value under the saving user's home as `"$HOME/…"`,
+so no user's absolute path leaks to another. The per-user and per-session values
+(`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) are **not** among them: they are written
+only to the user's **private** `$HOME/.config/oosh/log.session.env` (default
+`~/.config/oosh`) by `log.session.save`, which `.bashrc` runs once per shell;
+that file exists for every user (`config save log`, `config init.user`).
 
 The shared `log.env` is linked to the per-user file by a source chain — its last
-line is `. $OOSH_USER_CONFIG_PATH/log.session.env` (POSIX `.`, not the bash
-`source`, so `boot` parses under dash/ash; the var is written **unexpanded**, so
+line is `. $HOME/.config/oosh/log.session.env` (POSIX `.`, not the bash
+`source`, so dash/ash shells can source it; the var is written **unexpanded**, so
 each user loads their OWN file). This means a value you set with `log name
 <value>` is **loaded back on every login**, not just recorded: `log`'s top-level
 keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so the saved name
@@ -358,14 +380,14 @@ bash
 - All logging functions write to `$LOG_DEVICE`
 - Default is the live terminal (`tty`); `log`'s top-level re-derives it each shell
 - During testing, it may be redirected to a temp file for capture
-- Per-user/session log vars persist to `$OOSH_USER_CONFIG_PATH/log.session.env` (not the shared `~/config/log.env`)
+- Per-user/session log vars persist to `$HOME/.config/oosh/log.session.env` (not the shared `~/config/log.env`)
 
 ### Understanding LOG_DEVICE and LOG_LIVE
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `LOG_DEVICE` | Where log output goes (terminal or file) | live `tty` (re-derived each shell; see D4 note above) |
-| `LOG_LIVE` | Additional file for live monitoring | `$OOSH_USER_CONFIG_PATH/log.live.out` |
+| `LOG_LIVE` | Additional file for live monitoring | `$HOME/.config/oosh/log.live.out` |
 
 The logging functions use `tee` to write to both destinations when `LOG_LIVE` is set:
 1. Primary output → `LOG_DEVICE`
@@ -373,15 +395,22 @@ The logging functions use `tee` to write to both destinations when `LOG_LIVE` is
 
 ### LOG_LIVE per-user anchor (multi-user installs)
 
-In multi-user oosh installs (`~/config` is a shared symlink to a per-host shared dir), shared `log.env` is sourced by every user. `LOG_LIVE` is **per-user** and now lives under the private `$OOSH_USER_CONFIG_PATH/log.live.out` (default `~/.config/oosh/log.live.out`) — genuinely per-user, never the shared `~/config`. It is never persisted into the shared `log.env` and is re-anchored each shell.
+In multi-user oosh installs (`~/config` is a shared symlink to a per-host shared dir), shared `log.env` is sourced by every user. `LOG_LIVE` is **per-user** and now lives under the private `$HOME/.config/oosh/log.live.out` (default `~/.config/oosh/log.live.out`) — genuinely per-user, never the shared `~/config`. It is never persisted into the shared `log.env` and is re-anchored each shell.
 
 Coordinated defenses keep `LOG_LIVE` correct across `user login` chains:
 
-* **Read-side:** `log`'s top-level unconditionally re-exports `LOG_LIVE="$OOSH_USER_CONFIG_PATH/log.live.out"` at shell init. Defeats stale absolute paths inherited via shared config.
+* **Read-side:** `log`'s top-level unconditionally re-exports `LOG_LIVE="$HOME/.config/oosh/log.live.out"` at shell init. Defeats stale absolute paths inherited via shared config.
 * **Read-side:** `this.init` save+restores `LOG_LIVE` around `. "$CONFIG"`. Mid-session re-sources of `$CONFIG` (every `oo` / `ossh` invocation) would otherwise re-import a stale path; preservation keeps the anchored value.
-* **Write-side:** `config.save` filters `LOG_LIVE` (and `LOG_NAME`/`LOG_DEVICE`/`OOSH_USER_CONFIG_PATH`) out of the shared `log.env` deny-`case`. Stops the leak at the source.
+* **Write-side:** `config.save` keeps `LOG_LIVE`, `LOG_NAME` and `LOG_DEVICE` out of the shared `log.env` (the never-persist `case` in `private.config.variables.list`, T-CONFIG-CMD-SAVE-LOG). Stops the leak at the source.
 
-Result: `console.log` and `silent.log` always write to the current user's `$OOSH_USER_CONFIG_PATH/log.live.out`, even after `user login <other>` chains across users with non-traversable home directories.
+Result: `console.log` and `silent.log` always write to the current user's `$HOME/.config/oosh/log.live.out`, even after `user login <other>` chains across users with non-traversable home directories.
+
+`user login` hands the target a clean environment (`env -i`) with one exception, `TERM`: it
+describes the terminal, not the caller. Without it `su` sets `TERM=dumb` and the target shell has no
+colour — git prints its status plain — and `less`, `vi`, `clear` and tmux degrade
+(`T-USER-LOGIN-KEEPS-TERM`, `test/test.user`). A `TERM` of `dumb` — what an `env -i sh` leaves, the
+clean-boot flow `env -i sh` then `user login` — or none at all is handed over as `xterm-256color`
+(`private.user.login.term.get`, `T-USER-LOGIN-TERM-GET`).
 
 Verified by `T-THIS-INIT-LOG-LIVE-PRESERVED` / `T-CONFIG-SAVE-EXCLUDES-LOG-LIVE` (`test/test.oo`) and `test/test.log` T46–T50.
 

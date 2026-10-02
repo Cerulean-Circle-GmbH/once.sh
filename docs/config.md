@@ -36,7 +36,8 @@ The config system supports:
 | `~/config/oosh.env` | OOSH-specific variables |
 | `~/config/log.env` | Logging configuration (shared: `LOG_LEVEL`, `LOG_LEVEL_RESET`) |
 | `~/config/<name>.env` | Custom named configs |
-| `$OOSH_USER_CONFIG_PATH/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
+| `$HOME/.config/oosh/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
+| `$HOME/.config/oosh/user.session.env` | **Per-user** half of `user.env`: the user's real `PATH` (no `$` at all) and `OOSH_MODE` (`config session.save`) |
 
 > **Tests must never write the shared tier.** It is site-wide: a test that reaches `config save`
 > rewrites `user.env` / `oosh.env` / `log.env` for every user on the box. Use
@@ -50,7 +51,7 @@ The config system supports:
 `~/config` (`$CONFIG_PATH`) usually symlinks to one shared `sharedConfig`
 directory, so everything in it is **shared across all users** — only site-wide
 data belongs there. Anything per-user or per-session lives instead in the
-user's private `$OOSH_USER_CONFIG_PATH` (default `~/.config/oosh`, the same dir
+user's private `~/.config/oosh` (the same dir
 `oo` uses for `mode-env.bash`). `config list` reads both tiers by name, so
 `config list log.session` shows the per-user `log.session.env`. The per-user
 lookup is **read-only** — `config save`/`add`/`delete`/`edit` operate only on
@@ -58,22 +59,163 @@ the shared `$CONFIG_PATH` tier.
 
 The two tiers are linked by a source chain, exactly like `user.env` chains
 `oosh.env`/`log.env`: the generated shared `log.env` ends with
-`source $OOSH_USER_CONFIG_PATH/log.session.env` (the var written **unexpanded**,
+`. $HOME/.config/oosh/log.session.env` (written **unexpanded**,
 so each user loads their OWN file — no leak). So `config list log` shows the
 session file nested under it, and — because the chain is sourced at shell init —
 the saved per-user `LOG_NAME` (and the rest) are actually **loaded** each login,
-not just recorded. `boot` touch-creates the session file before the chain runs,
-so a first-ever shell has no missing-source error. See
+not just recorded. `config save log` and `config init.user` create the session file (`private.config.session.file.ensure`),
+so the chain line needs no guard and a first-ever shell has no missing-source error. See
 [Log System Documentation](log.md) for the per-user log vars.
+
+**`user.env` forks the same way** (boss, 2026-10-02). The shared `user.env` keeps
+what is the same for everyone — the `CONFIG_*` anchors and `BASH_FILE`, in their
+`$HOME` form — and its **last** line is `. $HOME/.config/oosh/user.session.env`.
+That per-user file holds what belongs to one user only: their **real `PATH`**,
+written out in full (no `$HOME`, no `:$PATH` — the file is theirs alone), and
+`OOSH_MODE`, the branch **their** `~/oosh` points at. Coming last, the personal
+values win. `config session.save` writes it; `config save` writes the saving
+user's; `config init.user` and the install create it for every user, filled in
+their own hop (`private.config.session.file.ensure`).
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$CONFIG` | `~/config/user.env` | Full path to current config file |
-| `$CONFIG_PATH` | `~/config` | Shared config directory — **always** the `~/config` symlink itself, never the `sharedConfig` it points at (see [boot.md](boot.md)) |
+| `$CONFIG_PATH` | `~/config` | Shared config directory — **always** the `~/config` symlink itself, never the `sharedConfig` it points at (see [The anchor rule](#the-anchor-rule)) |
 | `$CONFIG_FILE` | `user.env` | Current config filename |
-| `$OOSH_USER_CONFIG_PATH` | `~/.config/oosh` | **Per-user** (non-shared) oosh config dir — single source of truth, anchored by `this.init`/`boot` |
+| — | `~/.config/oosh` | **Per-user** (non-shared) oosh dir, spelled `$HOME/.config/oosh` directly. The `OOSH_USER_CONFIG_PATH` variable that used to name it was removed 2026-10-01: it was always this value (T44) |
+
+## The anchor rule
+
+**`OOSH_DIR` is always `~/oosh`** — the user's `oosh` symlink, never the branch
+folder it happens to point at, never a `BASH_SOURCE`/`$0` walk, never
+`oo.mode.base.get`. **`CONFIG_PATH` is always `~/config`** — the user's `config`
+symlink, never the shared `sharedConfig` directory it points at. `CONFIG` is
+`~/config/user.env`, and the per-user dir is always `~/.config/oosh` (no variable).
+
+In code and in the env files they are written `"$HOME/oosh"` / `"$HOME/config"`,
+because a tilde inside quotes does **not** expand, and `$HOME/…` is safe in POSIX
+`sh` and in every quoting context.
+
+```sh
+export CONFIG_PATH="$HOME/config"   # ~/config/user.env
+export OOSH_DIR="$HOME/oosh"        # ~/config/oosh.env
+```
+
+**Where they come from.** `config save` writes them as these constants, whatever
+the saving shell holds (`private.config.variable.export.line`, pinned by
+`test/test.config` T-CONFIG-SAVE-ANCHORS-CONSTANT) — the installer's shell holds
+the *resolved* `sharedConfig`, and that must never reach a user. A shell that has
+not read `user.env` yet uses the same literals as fallbacks: `this` (file scope,
+and `: ${CONFIG_PATH:=$HOME/config}` in `this.init`), `log`, `ossh.start`.
+Switching branches (`oo mode`) moves only what `~/oosh` points at; the variable
+never changes.
+
+**When you need the physical directory**, resolve it at that spot with the
+portable `private.this.path.canonical` — never bake the resolution into the anchor:
+
+| Site | Why it needs the physical path |
+|---|---|
+| install state 31 `ln -s … oosh` | linking `$OOSH_DIR` itself would create `~/oosh -> ~/oosh` |
+| install state 31 `OOSH_MODE` | the branch name is `basename` of the branch folder, not of the symlink |
+| `config.init.user` | decides "are we under the shared tree?" with a string-prefix test |
+| `promote` | `git worktree list` reports physical paths |
+| `oo.mode.base.get` | strategies 3/4 do `dirname`/`basename` — `dirname ~/oosh` is just `$HOME` |
+
+**Sanctioned exceptions** are marked in code with `# <anchor>-exception: <reason>`
+(or `# <anchor>-exception-file: <reason>` for a whole file), `<anchor>` being the
+variable name lower-cased with `_` → `-`: `oosh-dir-exception`, `config-path-exception`.
+
+| Anchor | Site | Why |
+|---|---|---|
+| `OOSH_DIR` | `oo.use` | runs one command from another branch without switching — a scoped child-process override |
+| `OOSH_DIR` | `ossh` remote invoke | a string executed on a remote host whose `~/oosh` does not exist yet |
+| `OOSH_DIR` | `user.oosh.install`, `config.init.user` hops | run as **another user** before their `~/oosh` exists; they source the shared tree |
+| `OOSH_DIR` | `init/oosh` (file-wide) | the installer runs before `~/oosh` exists |
+| both | `private.config.variable.export.line` | writes the constants as data into the env files |
+| `CONFIG_PATH` | `config file <path>` | its job is to point the session at an arbitrary config file |
+| `CONFIG_PATH` | install state 31 (×2) | builds the shared tree before `~/config` is a symlink to it |
+
+Enforced by **`this.anchor.validate <all|OOSH_DIR|CONFIG_PATH>`**: one `git grep`
+per anchor over the tracked tree (`docs/`, `test/`, `.claude/`, `*.md`, `*.json`
+excluded), every assignment classified as conforming / exception / violation, the
+verdict echoed to stdout (it survives any `LOG_LEVEL`), rc 1 on any violation.
+Covered by `test.this` T-OOSH-DIR-* / T-CONFIG-PATH-* (with planted violations) and
+`test.config` T31.
+
+## The PATH line
+
+**No file in the tree builds `PATH`.** A shell's PATH comes from the user's
+own `~/.config/oosh/user.session.env`, chained as the shared `user.env`'s last
+line, where `config session.save` writes it as one line of data — a snapshot of
+the saving shell's PATH, as on the MacStudio, written as the **real path**
+(`private.config.path.line.absolute.get`, T-CONFIG-USER-SESSION-PATH-ABSOLUTE):
+`~/oosh` and `~/oosh/ng` first, a bash outside `/bin` and `/usr/bin` (brew) next,
+trailing slashes dropped, no empty, `.`, relative or transient (`/tmp`,
+`.vscode-server`) segment, each segment once — and, because a polluted shell must
+not be frozen into the user's PATH, no segment holding `$ " \` or a backtick, no
+active `VIRTUAL_ENV` / `CONDA_PREFIX`, no directory that does not exist
+(T-CONFIG-USER-SESSION-PATH-FILTERED). No `$` at all, no `:$PATH`:
+
+```sh
+export PATH="/home/me/oosh:/home/me/oosh/ng:/opt/homebrew/bin:/home/me/.local/bin:/usr/local/bin:/usr/bin:/bin"
+```
+
+The PATH is frozen per user until the next save: a directory the system adds
+later reaches the shell after `config session.save` (starting `this` saves too).
+`.bashrc`, `source this` and the remote prelude (`ossh.remote.prelude.get`) all
+read it. It cannot guard itself, so `this` drops repeated segments on every
+`source this` (`private.this.path.dedup`, T-THIS-PATH-NO-GROWTH).
+
+Before a shared config is switched (*The switch and its gate*, below), the
+shared `user.env` still carries the old shared line written by
+`private.config.path.line.get` — every segment under the saver's home as
+`$HOME/…`, `:$PATH` last.
+
+**What oosh cannot reach.** A login file that changes PATH *after* it sourced
+`.bashrc` — an installer's `export PATH="$HOME/.local/bin:$PATH"` appended to
+`~/.bash_profile` — puts its directory in front again once oosh has finished.
+Remove such a line: `user.env`'s PATH line already carries the directory.
+`platform.shared.configLayout` invariant 8 checks a login shell for it.
+
+**An empty shell is an oosh shell** (boss, 2026-10-02 — this reverses the
+30 Sep decision that a bare `env -i bash` is not one). From `env -i sh` — no
+`HOME`, only the system PATH — both `bash` and `this` bring the user back:
+`bash` still finds `~/.bashrc` (`~` reads the password database), which hands an
+old bash over to `BASH_FILE` and then loads `this` first, and `this` derives
+`HOME` from the OS identity; `this` is found on the system PATH as the launcher
+`/usr/local/bin/this` (one host-wide command, not a login file). A login file of
+the user's own must say `~/.bashrc`, not `$HOME/.bashrc`. `user login <user>`
+works as before. `platform.shared.boot` checks it all on every install.
+
+Every `PATH=` / `export PATH=` in the tracked tree is therefore a violation unless
+it carries a marker:
+
+```sh
+# path-exception: <reason>            # this line, or one of the five above it
+# path-exception-file: <reason>       # anywhere in the file — the whole file
+```
+
+The five-line window exists because these assignments often sit inside an `ssh`
+command string, a `bash -c` string or a heredoc, where the marker cannot go on the
+line itself.
+
+| Kind | Sites | Why |
+|---|---|---|
+| whole file | `init/oosh`, `init/once` | the installer runs before `~/oosh` and `user.env` exist; `init/once` is the superseded ONCE installer, still tracked |
+| the data line | `config.save` | writes user.env's PATH line |
+| fallback | `ossh.remote.prelude.get`, the `bashrcTemplate` degrade branch, the CI steps | `~/config/user.env` first, a bare prepend only when it is missing (mid-install) |
+| remote / sudo string | `ossh`, `user` ×2, `hiveMind` ×3, `this` (as-user preamble) | executed on another host or as another user, where no `user.env` has been read |
+| sourced before `user.env` | `ossh.start`, `this` (file scope, `this.path.add`, `private.this.path.dedup`) | colon-anchored or a rewrite of the value already there |
+| repair, not build | `oo.mode` ×2, `this.init` | rewriting a branch name already in PATH, or saving and restoring PATH across a mid-session `source "$CONFIG"` |
+| session scope | `oo` (brew, `ONCE_LOAD_DIR`), `claudeCode`, `path.append`/`prepend`/`remove` | deliberately affects only the running shell |
+| diagnostics | `debug`'s `p`, banners, `path.env` | they print `PATH=`, they do not set it |
+
+Enforced by **`path validate [<treeRoot>]`** — the same sweep as the anchors (plus
+`old/` and `restore/` excluded), rc 1 on any violation. Covered by `test.path`
+`T-PATH-VALIDATE-*`, including T-PATH-VALIDATE-NO-OWNER (a file named `boot` is no
+exception any more).
 
 ## Commands
 
@@ -105,8 +247,8 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
 | `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
-| `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`. `OOSH_DIR`/`CONFIG_PATH`/`CONFIG` are filtered out on purpose — they are per-user anchors, set by [`boot`](boot.md) — and so is `OOSH_BRANCH`, which is install input rather than state. |
-| `user.env` | **pure data** — a `. $CONFIG_PATH/<name>.env` chain, no bootstrap header | written by `config save`. The old self-anchoring header moved into [`boot`](boot.md); see [migration/env-files.md](migration/env-files.md) for what it used to look like and why. |
+| `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`: **every** `OOSH_*` variable, a value under the saving user's home written `"$HOME/…"` (the config is shared). Only `OOSH_BRANCH` is left out — install input, not state. |
+| `user.env` | **pure data** — the `CONFIG_*` anchors, `BASH_FILE`, then `. $CONFIG_PATH/oosh.env` and `. $CONFIG_PATH/log.env`, last `. $HOME/.config/oosh/user.session.env` | written by `config save` — what `.bashrc` and `source this` start a shell from (the MacStudio model); see *Saving Configuration* below. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
 mirror the install steps at `oo:1456` (`config save`) and `oo:1462–1463`
@@ -193,34 +335,69 @@ Saves environment variables to a config file.
 ./config save myconfig MYAPP
 ```
 
-Without parameters, saves:
-- All CONFIG_* variables (except per-user dynamic paths — see *Excluded variables* below)
-- BASH_FILE
-- Then calls `config.save oosh` and `config.save log`
+Without parameters, it writes the whole config the MacStudio way (`test/mcdonges.latest`) — `user.env` is what a shell starts from, there is no `boot`:
 
-**PATH is intentionally NOT saved** — it is built at login by **`boot`**, which is its single owner (see [boot.md § The PATH-writer rule](boot.md)). Saving root's PATH would overwrite the user's PATH in subprocesses. Note the mechanism: PATH never reaches the *Excluded variables* table below, because `config.save`'s **inclusion gate** only ever considers `CONFIG_*` and `BASH_FILE`. (`bashrcTemplate` has carried no `this.path.add` since the boot-loader migration; its only PATH action is the degrade `elif` for branches that have no `boot` yet.)
+```bash
+# ~/config/user.env
+export CONFIG_PATH="$HOME/config"
+export CONFIG_FILE="user.env"
+export CONFIG="$HOME/config/user.env"
+export BASH_FILE="/usr/bin/bash"
+. $CONFIG_PATH/oosh.env
+. $CONFIG_PATH/log.env
+. $HOME/.config/oosh/user.session.env
 
-**Excluded variables.** `config.save` skips per-user dynamic paths so they don't leak from one user's saved config into another user's environment. The `~/config` symlink usually points at a shared location (`…sharedConfig/`), so a value written by root would otherwise be sourced verbatim by every other user — typically pointing at a path they can't access (EACCES). The exclusion list:
+# ~/.config/oosh/user.session.env  (per user — config session.save)
+export PATH="/home/me/oosh:/home/me/oosh/ng:/home/me/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export OOSH_MODE="dev"
+```
 
-| Variable | Why excluded | Re-derived at shell init by |
-|---|---|---|
-| `LOG_INSTALL`, `INSTALL_LOG`, etc. | Install-only state — must not persist into user sessions | (none — only set during install) |
-| `LOG_NAME` | OOSH log identity (`user@host`) — per-user | `log` top-level (`${LOG_NAME:-user@host}`); persisted per-user in `log.session.env` |
-| `LOG_DEVICE` | per-session tty | `this`/`log` (per shell); persisted per-user in `log.session.env` |
-| `LOG_LIVE` | `$OOSH_USER_CONFIG_PATH/log.live.out` is per-user; saving root's path EACCES-cascades | `log` (re-anchored at every bashrc); persisted per-user in `log.session.env` |
-| `CONFIG_PATH` | `$HOME/config` — per-user | `this` (`: ${CONFIG_PATH:=$HOME/config}`) |
-| `OOSH_USER_CONFIG_PATH` | `$HOME/.config/oosh` — per-user | `this`/`boot` (`: ${OOSH_USER_CONFIG_PATH:=$HOME/.config/oosh}`) |
-| `CONFIG` | `$CONFIG_PATH/user.env` — per-user | `config` (derived from CONFIG_PATH) |
-| `OOSH_DIR` | per-user oosh tree path | `boot`/`this` (resolved from `~/oosh`) |
-| `OOSH_COMPONENTS_DIR` | `/tmp/test.oo.*` transient test path — pure noise | (none — set per test run) |
-| `OOSH_BRANCH` | Install **input** — the branch the operator asked for. Not a path; excluded for the other reason this list exists: state that must be **derived, never remembered**. Persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** | not re-derived at shell init at all — the branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh` |
+- `config.save oosh OOSH` → `oosh.env`: **every** `OOSH_*` setting — not the runtime readings of the saving shell (see *Excluded variables*).
+- `config.save log LOG` → `log.env`: **every** `LOG_*` setting except the per-user session values (below), and as its **last** line `. $HOME/.config/oosh/log.session.env` — written by every save of `log.env`, exactly once, unguarded.
+- `log.env`'s last line spells `$HOME/.config/oosh` directly, so it needs nothing from `oosh.env`. A host's old line (`. $OOSH_USER_CONFIG_PATH/log.session.env`) is rewritten by `config save` and by `oo update` / `oo user.fix` (`private.config.log.chain.migrate`, T-CONFIG-LOG-CHAIN-MIGRATE).
+- `ODOCKER_WORKSPACES` is **not** in `user.env`: it lives in `odocker.env` (`odocker workspace.set`), which `user.env` chains. This departs from the MacStudio branch, where `config set` put it into `user.env`.
+- `user.env`'s **last** line is `. $HOME/.config/oosh/user.session.env`, exactly once, unguarded; `config save` writes the saving user's file there too (`config session.save`: the real PATH and `OOSH_MODE`). T-CONFIG-USER-SESSION-SPLIT.
+- The PATH line is data (`# path-exception:` in the getters); `this` de-duplicates PATH when `user.env` is sourced again.
+- **Every other chain is kept.** A line `. $CONFIG_PATH/odocker.env`, or one `config add myapp` appended, is read before `user.env` is rewritten and added back after `oosh.env` and `log.env`, in its order, once — even when its file is missing. A legacy `source $CONFIG_PATH/x.env` line comes back as `. $CONFIG_PATH/x.env` (`private.config.chain.names.get`; T-CONFIG-CMD-SAVE-USER-KEEPS-CHAINS).
 
-The per-user `LOG_*` vars are deliberately NOT persisted into the shared
-`log.env`; they are written to the per-user `$OOSH_USER_CONFIG_PATH/log.session.env`
-by `log.session.save` (see [log.md](log.md)). If you add a new persisted env var
-that resolves to an absolute per-user path, extend the same exclusion `case` in
-`config.save` — and the `for leaker in …` list in `test/test.config` T29, which is the
-value-level mirror of that `case` and the only thing that pins it.
+**The shared config and `$HOME`.** The `~/config` symlink points at a location shared by every user of the host (`…sharedConfig/`). So a value under the **saving** user's home is never written as that user's absolute path: `private.config.variable.export.line` writes it as `"$HOME/…"` (only the prefix — the rest keeps bash's `declare -p` quoting), and every reader expands it to their own home. `OOSH_DIR="$HOME/oosh"`, `CONFIG_PATH="$HOME/config"`, `OOSH_USER_CONFIG_PATH="$HOME/.config/oosh"` are therefore correct for everyone. Pinned by `test/test.config` T29 and T-CONFIG-SAVE-PREFIX-OOSH.
+
+**Per-user session values.** `LOG_NAME`, `LOG_DEVICE` and `LOG_LIVE` are **not** saved in the shared `log.env`: a new user would inherit the saver's values. They live only in each user's private `$HOME/.config/oosh/log.session.env` (written by `log.session.save`, see [log.md](log.md)), which `log.env` chains last. Every user has that file: `config init.user` and the install create it with `private.config.session.file.ensure`.
+
+**`config save` typed at the prompt.** `config` then runs as a **child process**: it does not re-read `user.env`, so it saves what the shell **exported**. `test/test.config` T-CONFIG-CMD-SAVE-* run the real executable under `env -i` to pin exactly that.
+
+**Excluded variables.** Three kinds are never persisted — install-time state, runtime readings of the saving shell, and the per-user session values:
+
+| Variable | Why excluded |
+|---|---|
+| `LOG_INSTALL`, `INSTALL_LOG`, … (`*INSTALL*`) | Install-only state — must not persist into user sessions |
+| `SUDO_*` | Injected by sudo for one command |
+| `OOSH_SHLVL`, `OOSH_STATUS`, `OOSH_PROMPT`, `OOSH_CONFIG_NEEDS_SAVE` | **Runtime readings** of the one shell that ran the save. Saved, they come back into every new shell and are saved again. T-CONFIG-CMD-SAVE-OOSH |
+| `OOSH_CLEAN_ENV`, `OOSH_APT_UPDATED` | **One-run gates** of `init/oosh`, exported during the install. Saved, a later `init/oosh` run from a normal shell skipped its clean-environment restart and its `apt-get update`. T-CONFIG-CMD-SAVE-OOSH |
+| `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | **Per-user session values** — only in each user's `log.session.env`, never the shared `log.env`. T-CONFIG-CMD-SAVE-LOG |
+| `OOSH_MODE` (once switched) | **Per user** — the branch the user's own `~/oosh` points at, in their `user.session.env`. Decided below the `case` by the layout: before the switch it stays in the shared `oosh.env`, which other users still read. T29, T-CONFIG-CMD-SAVE-OOSH |
+| `OOSH_BRANCH` | Install **input** — the branch the operator asked for. State that must be **derived, never remembered**: persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** The branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh`. |
+
+The list is the `case` in `private.config.variables.list` (`config`); `test/test.config` T29 pins it by value. Change all three together.
+
+### The switch and its gate
+
+A shared config written before the fork switches **once**, and only when no user
+would be left without a file: the shared `user.env` chains `user.session.env`
+unguarded, and a plain `sh` ends on `.` of a missing file.
+
+- **The gate** (`private.config.session.chain.ready`): every **other** user linked
+  to the same `sharedConfig` has a **filled** `user.session.env`. A home the caller
+  cannot look into (0750 homes, a non-root caller) is not proven.
+- **`config save`** keeps a switched config switched (`private.config.session.split.is`)
+  and switches an old one only through the gate. While it is closed it writes the
+  old shared layout — the shared PATH line, `OOSH_MODE` in `oosh.env` — and the
+  saver's own file (T-CONFIG-USER-SESSION-SAVE-GATED).
+- **`sudo oo update`** (or `oo user.fix` as root) is how a multi-user host
+  switches: `config init.user` gives every linked user their files, each in their
+  own hop (`private.config.session.files.ensure.all`), then
+  `private.config.user.session.migrate` switches the shared files in place —
+  owner, group and mode kept, idempotent (T-CONFIG-USER-SESSION-MIGRATE).
 
 ### Required variables
 
@@ -232,7 +409,7 @@ The exclusion list above says what must **never** persist. This says what a conf
 |---|---|---|
 | `BASH_FILE` | `user.env` | `command -v bash` |
 | `CONFIG_FILE` | `user.env` | `config.init` |
-| `OOSH_MODE` | `oosh.env` | `basename` of the canonical `~/oosh` |
+| `OOSH_MODE` | `user.session.env` (per user — `private.config.required.file.path`) | `basename` of the canonical `~/oosh` |
 | `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` |
 | `OOSH_PM` | `oosh.env` | `oo pm.discover` |
 | `LOG_LEVEL` | `log.env` | defaults to `1` |
@@ -279,7 +456,7 @@ Lists the content of a config file.
 ./config list oosh
 ./config list log
 
-# List the per-user tier by name (reads $OOSH_USER_CONFIG_PATH/log.session.env)
+# List the per-user tier by name (reads $HOME/.config/oosh/log.session.env)
 ./config list log.session
 ```
 
@@ -466,8 +643,6 @@ These functions are used internally and generally not called directly:
 
 | Function | Description |
 |----------|-------------|
-| `config.path.create` | Creates directory paths (deprecated) |
-| `config.folder.create` | Creates single directory (deprecated) |
 | `config.string.quote` | Quotes strings for command line |
 | `config.info.log` | Logs config at info level |
 | `config.completion.*` | Tab completion helpers |
@@ -494,7 +669,7 @@ export ANOTHER_VAR="another value"
 source $CONFIG_PATH/other.env
 ```
 
-**`export` is mandatory, not decoration.** `boot` sources these files with POSIX
+**`export` is mandatory, not decoration.** `.bashrc`, `this` and dash/ash shells source these files with POSIX
 `.`, and a bare `NAME=value` assigns in the sourcing shell but exports nothing to
 its children — so `OOSH_MODE` would be set at login and empty in every command
 the user then runs.

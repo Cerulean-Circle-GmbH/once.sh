@@ -690,6 +690,50 @@ test.case $level "T-PORTABILITY-PAIRED: stat -c with a stat -f fallback on the n
 expect 0 "paired fallback accepted" "a continued line is one command and is judged as one"
 
 # ----------------------------------------------------------------------------
+# T-PORTABILITY-SETSID: `setsid` ships with util-linux only — macOS has none,
+# and T-LOG-DEVICE-PROBE died on the sequoia VM (fc0aaee). A bare setsid is a
+# violation; one guarded by `command -v setsid` in the lines above is the fix.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilitySetsid() {
+  private.test.suite.portability.clear
+  local out bad=""
+  # portability-exception: the planted lines are the FIXTURE, not a use
+  out=$(private.test.suite.portability.plant bare '#!/usr/bin/env bash' 'setsid bash -c true')
+  case "$out" in *"INVALID:"*"1 violation"*) ;; *) bad="$bad bare=[$out]" ;; esac
+  private.test.suite.portability.clear
+  out=$(private.test.suite.portability.plant guarded '#!/usr/bin/env bash' \
+        'if command -v setsid >/dev/null 2>&1; then' '  setsid bash -c true' 'fi')
+  case "$out" in *"OK:"*"0 violations"*) ;; *) bad="$bad guarded=[$out]" ;; esac
+  [ -z "$bad" ] && create.result 0 "an unguarded call rejected, a guarded call accepted" || create.result 1 "setsid:$bad"
+  return $(result)
+}
+test.case $level "T-PORTABILITY-SETSID: an unguarded new-session call is a violation, a guarded one is not" \
+  test.test.suite.portabilitySetsid
+expect 0 "an unguarded call rejected, a guarded call accepted" "only util-linux ships setsid"
+
+# ----------------------------------------------------------------------------
+# T-PORTABILITY-PROC: macOS has no /proc. Handed to a fresh shell as
+# LOG_DEVICE, `this` finds the device unwritable and swaps in the live tty, so
+# the output escapes the capture (T-OSSH-PREREQS-LOCAL-NAMES-TOOL, fc0aaee).
+# /dev/fd/N exists on both.
+# ----------------------------------------------------------------------------
+test.test.suite.portabilityProc() {
+  private.test.suite.portability.clear
+  local out bad=""
+  # portability-exception: the planted lines are the FIXTURE, not a use
+  out=$(private.test.suite.portability.plant procdev '#!/usr/bin/env bash' 'env -i LOG_DEVICE=/proc/self/fd/1 bash -c true')
+  case "$out" in *"INVALID:"*"1 violation"*) ;; *) bad="$bad proc=[$out]" ;; esac
+  private.test.suite.portability.clear
+  out=$(private.test.suite.portability.plant fddev '#!/usr/bin/env bash' 'env -i LOG_DEVICE=/dev/fd/1 bash -c true')
+  case "$out" in *"OK:"*"0 violations"*) ;; *) bad="$bad fd=[$out]" ;; esac
+  [ -z "$bad" ] && create.result 0 "LOG_DEVICE=/proc rejected, /dev/fd accepted" || create.result 1 "proc:$bad"
+  return $(result)
+}
+test.case $level "T-PORTABILITY-PROC: a /proc log device for a fresh shell is a violation, /dev/fd is not" \
+  test.test.suite.portabilityProc
+expect 0 "LOG_DEVICE=/proc rejected, /dev/fd accepted" "macOS has no /proc"
+
+# ----------------------------------------------------------------------------
 # T-PORTABILITY-ADVISORY: `mktemp` is LATENT, not wrong — 116 sites in the tree
 # today. It is counted and reported, and it does NOT fail the gate. If this
 # ever goes red the two severities have collapsed into one and the sweep
@@ -765,6 +809,103 @@ expect 0 "blind sweep refused" "an empty git grep looks exactly like a conformin
 
 private.test.suite.portability.clear
 rm -rf "$PORT_FIXTURE"
+
+# ============================================================================
+# T-TEST-SUITE-GATE: core AND the post-install platform invariants, one verdict
+# ============================================================================
+# os platform.test ran only `test.suite core 1` per user, so a platform
+# invariant (the config layout, no boot) never gated anything. test.suite gate
+# runs core and platform.shared.configLayout.invariant and fails when either
+# fails. Composition is judged with both halves stubbed.
+test.test.suite.gate() {
+  local bad="" rc calls
+  rc=$( test.suite.core() { return 0; }; test.suite.run() { echo "run:$*" >&2; return 0; }; test.suite.gate 1 >/dev/null 2>&1; echo $? )
+  [ "$rc" = 0 ] || bad="$bad both-pass-rc=$rc"
+  calls=$( test.suite.core() { echo core; return 0; }; test.suite.run() { echo "run:$*"; return 0; }; test.suite.gate 1 2>/dev/null )
+  case "$calls" in *core*"run:platform.shared.configLayout.invariant 1"*) ;; *) bad="$bad calls=[$(echo $calls)]" ;; esac
+  rc=$( test.suite.core() { return 1; }; test.suite.run() { return 0; }; test.suite.gate 1 >/dev/null 2>&1; echo $? )
+  [ "$rc" = 1 ] || bad="$bad core-fail-rc=$rc"
+  rc=$( test.suite.core() { return 0; }; test.suite.run() { return 1; }; test.suite.gate 1 >/dev/null 2>&1; echo $? )
+  [ "$rc" = 1 ] || bad="$bad platform-fail-rc=$rc"
+  [ -z "$bad" ] && create.result 0 "gate: core then the platform invariant; rc 1 when either fails" || create.result 1 "gate:$bad"
+  return $(result)
+}
+test.case $level "T-TEST-SUITE-GATE: test.suite gate runs core and the platform invariant, one verdict" test.test.suite.gate
+expect 0 "gate: core then the platform invariant; rc 1 when either fails" \
+  "os platform.test ran core only, so no platform invariant ever gated a run"
+
+# ----------------------------------------------------------------------------
+# T-SUITE-SESSION-RESTORE: the runner puts its user's own user.session.env back
+# The per-user half of the forked user.env hangs off HOME, which
+# test.suite.config.isolate cannot divert: a test that runs a production
+# `config save` with the real HOME rewrote the runner's own file (test.config,
+# test.user: OOSH_MODE="dev", 2026-10-02). Snapshot, change, restore — and a
+# file that was absent is absent again.
+# ----------------------------------------------------------------------------
+test.test.suite.sessionRestore() {
+  local fx bad="" f; fx=$(test.suite.fixture.make suitesession)
+  f="$fx/home/.config/oosh/user.session.env"; mkdir -p "$fx/home/.config/oosh" "$fx/run"
+  printf 'export OOSH_MODE="mine"\n' > "$f"
+  printf 'export LOG_DEVICE="/dev/pts/9"\n' > "$fx/home/.config/oosh/log.session.env"
+  ( export HOME="$fx/home" TEST_SUITE_RESULT_PATH="$fx/run"
+    private.test.suite.session.snapshot >/dev/null 2>&1
+    printf 'export OOSH_MODE="test"\n' > "$f"
+    printf 'export LOG_DEVICE="/dev/stderr"\n' > "$fx/home/.config/oosh/log.session.env"
+    private.test.suite.session.restore >/dev/null 2>&1 )
+  [ "$(cat "$f" 2>/dev/null)" = 'export OOSH_MODE="mine"' ] || bad="$bad not-restored=[$(cat "$f" 2>/dev/null)]"
+  [ "$(cat "$fx/home/.config/oosh/log.session.env" 2>/dev/null)" = 'export LOG_DEVICE="/dev/pts/9"' ] || bad="$bad log-session-not-restored"
+  rm -f "$f"
+  ( export HOME="$fx/home" TEST_SUITE_RESULT_PATH="$fx/run"
+    private.test.suite.session.snapshot >/dev/null 2>&1
+    printf 'export OOSH_MODE="test"\n' > "$f"
+    private.test.suite.session.restore >/dev/null 2>&1 )
+  [ -e "$f" ] && bad="$bad absent-file-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the runner's own session files are put back, an absent one stays absent" || create.result 1 "session restore:$bad"
+  return $(result)
+}
+test.case $level "T-SUITE-SESSION-RESTORE: the runner puts its user's own user.session.env back" \
+  test.test.suite.sessionRestore
+expect 0 "the runner's own session files are put back, an absent one stays absent" \
+  "a test that saves through config save with the real HOME rewrote the runner's own file"
+
+# ----------------------------------------------------------------------------
+# T-SUITE-SESSION-RESTORE-RUNNER: end to end, through the real runner
+# ----------------------------------------------------------------------------
+test.test.suite.sessionRestoreRunner() {
+  local probe="$OOSH_DIR/test/test.sessionTierProbe"
+  local fix; fix=$(mktemp -d "${TMPDIR:-/tmp}/test.test.suite.session.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  trap 'rm -f "'"$probe"'"; rm -rf "'"$fix"'"' RETURN
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run" "$fix/home/.config/oosh"
+  printf 'export OOSH_MODE="mine"\n' > "$fix/home/.config/oosh/user.session.env"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'TEST_CATEGORY=core'
+    echo 'source this'
+    echo 'source test.suite'
+    # what a production config save does with the real HOME
+    echo 'printf %s\\n "export OOSH_MODE=\"probe\"" > "$HOME/.config/oosh/user.session.env"'
+    echo 'expect.pass "the probe asserted something"'
+    echo 'test.suite.save.results'
+  } > "$probe"
+  chmod +x "$probe"
+  env HOME="$fix/home" CONFIG_PATH="$fix" CONFIG_FILE=user.env CONFIG="$fix/user.env" \
+      TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run" \
+      "$OOSH_DIR/test.suite" run sessionTierProbe 1 >/dev/null 2>&1
+  local after; after=$(cat "$fix/home/.config/oosh/user.session.env" 2>/dev/null)
+  if [ "$after" = 'export OOSH_MODE="mine"' ]; then
+    create.result 0 "the runner restores its user's own session file after a test file"
+  else
+    create.result 1 "the probe's write stayed: [$after]"
+  fi
+  return $(result)
+}
+test.case $level "T-SUITE-SESSION-RESTORE-RUNNER: end to end, the runner restores its user's own session file" \
+  test.test.suite.sessionRestoreRunner
+expect 0 "the runner restores its user's own session file after a test file" \
+  "only this proves the runner calls the restore"
 
 ### test.method
 
