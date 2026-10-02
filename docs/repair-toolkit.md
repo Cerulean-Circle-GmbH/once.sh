@@ -80,6 +80,8 @@ explicitly when something drifts.
 |---|---|
 | Root-owned `ssh.*` directories in my home that I cannot read | `user ssh.backup.status`, then `user ssh.backup.migrate` |
 | `oo mode <TAB>` empty | `oo user.fix` |
+| `config save` says the shared `user.env` keeps its PATH line until every user has `~/.config/oosh/user.session.env` | `sudo oo update` — as root it gives every linked user their file and switches the shared config ([config.md](config.md) § *The switch and its gate*) |
+| `. …/user.session.env: not found` / a plain `sh` stops at login | `oo user.fix` (as root: `oo user.fix <user>`) — creates and fills the user's own file |
 | `OOSH_DIR=/var/<user>/oosh` (private clone resolved) | `oo user.fix` |
 | `~/oosh` is a real directory not a symlink | `oo user.fix` |
 | `~/config` not a symlink | `oo user.fix` |
