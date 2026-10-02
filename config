@@ -361,6 +361,8 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   private.config.session.files.ensure.all "$sharedConfig" "$sharedOosh"
   private.config.user.session.migrate "$sharedConfig" \
     || info.log "config.init.user: the shared user.env keeps its PATH line until every user of it has ~/.config/oosh/user.session.env — run: sudo oo update"
+  private.config.oosh.session.migrate "$sharedConfig" \
+    || info.log "config.init.user: the shared oosh.env chains oosh.session.env once every user of it has one — run: sudo oo update"
 
   # Git trust of every folder under the base (clone layout, spec § 4): each
   # folder is its own repository with its own safe.directory entry, and
@@ -905,7 +907,7 @@ private.config.derive.log.level()     # # the default log level #
   [ -n "$LOG_LEVEL" ] && { echo "$LOG_LEVEL"; return 0; }
   echo "3"
 }
-private.config.session.file.ensure()     # <targetHome> # create log.session.env and user.session.env under <targetHome>/.config/oosh when missing, never overwrite them; the shared env files chain them unguarded, so every user must have both #
+private.config.session.file.ensure()     # <targetHome> # create log.session.env, user.session.env and oosh.session.env under <targetHome>/.config/oosh when missing, never overwrite them; the shared env files chain them unguarded, so every user must have all three #
 {
  # log.env's last line is `. $HOME/.config/oosh/log.session.env`, and user.env
  # chains user.session.env the same way, with no guard — env files are pure
@@ -922,14 +924,15 @@ private.config.session.file.ensure()     # <targetHome> # create log.session.env
  local sessionDir="$targetHome/.config/oosh"
  check dir "$sessionDir" not exists call mkdir -p "$sessionDir"
  check file "$sessionDir/log.session.env" not exists call touch "$sessionDir/log.session.env"
- if [ ! -s "$sessionDir/user.session.env" ] && [ "${targetHome%/}" = "${HOME%/}" ]; then
+ if { [ ! -s "$sessionDir/user.session.env" ] || [ ! -s "$sessionDir/oosh.session.env" ]; } && [ "${targetHome%/}" = "${HOME%/}" ]; then
    ( [ -n "$OOSH_MODE" ] || export OOSH_MODE="$(private.config.derive.oosh.mode)"
      config.session.save >/dev/null 2>&1 )
  fi
  # Not the caller's home: only created — nobody writes another user's file.
  check file "$sessionDir/user.session.env" not exists call touch "$sessionDir/user.session.env"
- if [ -f "$sessionDir/log.session.env" ] && [ -f "$sessionDir/user.session.env" ]; then
-   create.result 0 "$sessionDir/log.session.env and user.session.env present"
+ check file "$sessionDir/oosh.session.env" not exists call touch "$sessionDir/oosh.session.env"
+ if [ -f "$sessionDir/log.session.env" ] && [ -f "$sessionDir/user.session.env" ] && [ -f "$sessionDir/oosh.session.env" ]; then
+   create.result 0 "$sessionDir/log.session.env, user.session.env and oosh.session.env present"
  else
    create.result 1 "could not create the session files in $sessionDir"
  fi
@@ -1089,13 +1092,17 @@ private.config.user.session.file.get()     # <?home:$HOME> # echo the path of th
 }
 
 
-config.session.save()     #  # write the own ~/.config/oosh/user.session.env of this user: the real absolute PATH and OOSH_MODE; refuses a HOME the caller does not own #
+config.session.save()     #  # write the own session files of this user under ~/.config/oosh: the real absolute PATH into user.session.env, OOSH_MODE into oosh.session.env; refuses a HOME the caller does not own #
 {
-  # The per-user half of the forked user.env (boss, 2026-10-02), the twin of
-  # log.session.save: each user's PATH (real directories, no $ —
-  # private.config.path.line.absolute.get) and OOSH_MODE (the branch THEIR
-  # ~/oosh points at) in their OWN file, so one user's save never reaches
-  # another user's shell.
+  # The per-user halves of the forked env files (boss, 2026-10-02), the twin
+  # of log.session.save, one file per family: the user's PATH (real
+  # directories, no $ — private.config.path.line.absolute.get) in
+  # user.session.env, which the shared user.env chains last; OOSH_MODE (the
+  # branch THEIR ~/oosh points at) in oosh.session.env, which the shared
+  # oosh.env chains last. One user's save never reaches another user's shell.
+  # Until the shared oosh.env chains oosh.session.env (the switch waits for
+  # every user's file), OOSH_MODE goes into user.session.env too, so no shell
+  # loses its branch in between.
   if [ -z "$HOME" ] || [ ! -O "$HOME" ]; then
     # sudo on macOS keeps the invoking user's HOME: root would leave a
     # root-owned file in somebody else's ~/.config/oosh.
@@ -1103,35 +1110,45 @@ config.session.save()     #  # write the own ~/.config/oosh/user.session.env of 
     create.result 1 "HOME ($HOME) is not owned by $(id -un)"
     return $(result)
   fi
-  local f mode="$OOSH_MODE"
+  local f o mode="$OOSH_MODE" f2
   f=$(private.config.user.session.file.get)
+  o=$(private.config.oosh.session.file.get)
   mkdir -p "${f%/*}" 2>/dev/null
   # A writer does not throw away what it held: no OOSH_MODE in this shell →
-  # the user's saved one, else the one a host still keeps in the shared
-  # oosh.env from before the split. Sourced in a subshell: both are pure data.
-  [ -z "$mode" ] && [ -f "$f" ] && mode=$( unset OOSH_MODE; . "$f" 2>/dev/null; echo "$OOSH_MODE" )
-  [ -z "$mode" ] && [ -f "$CONFIG_PATH/oosh.env" ] && mode=$( unset OOSH_MODE; . "$CONFIG_PATH/oosh.env" 2>/dev/null; echo "$OOSH_MODE" )
-  if ! { : >>"$f"; } 2>/dev/null; then
-    error.log "config.session.save: cannot write $f"
-    create.result 1 "cannot write $f"
-    return $(result)
-  fi
-  # Nothing inside the redirect may log: LOG_DEVICE can be fd1.
+  # the user's oosh.session.env, else their user.session.env, else the one a
+  # host still keeps in the shared oosh.env from before the split. Sourced in
+  # a subshell: all are pure data.
+  for f2 in "$o" "$f" "$CONFIG_PATH/oosh.env"; do
+    [ -n "$mode" ] && break
+    [ -f "$f2" ] && mode=$( unset OOSH_MODE; . "$f2" 2>/dev/null; echo "$OOSH_MODE" )
+  done
+  for f2 in "$f" "$o"; do
+    if ! { : >>"$f2"; } 2>/dev/null; then
+      error.log "config.session.save: cannot write $f2"
+      create.result 1 "cannot write $f2"
+      return $(result)
+    fi
+  done
+  # Nothing inside the redirects may log: LOG_DEVICE can be fd1.
   {
     private.config.path.line.absolute.get
-    [ -n "$mode" ] && echo "export OOSH_MODE=\"$mode\""
+    private.config.oosh.session.split.is "$CONFIG_PATH" || { [ -n "$mode" ] && echo "export OOSH_MODE=\"$mode\""; }
   } >"$f"
-  create.result 0 "$f"
+  {
+    [ -n "$mode" ] && echo "export OOSH_MODE=\"$mode\""
+  } >"$o"
+  create.result 0 "$f $o"
   return $(result)
 }
 config.session.save.completion() { :; }
 
 
-private.config.required.file.path()     # <file> # echo where a row of the required table lives: user.session.env is the per-user file of this user, every other file is under CONFIG_PATH #
+private.config.required.file.path()     # <file> # echo where a row of the required table lives: user.session.env and oosh.session.env are the per-user files of this user, every other file is under CONFIG_PATH #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
  case "$1" in
    user.session.env) private.config.user.session.file.get ;;
+   oosh.session.env) private.config.oosh.session.file.get ;;
    *)                echo "$CONFIG_PATH/$1" ;;
  esac
 }
@@ -1159,7 +1176,7 @@ private.config.session.split.is()     # <?configPath:$CONFIG_PATH> # rc 0 when t
 }
 
 
-private.config.session.chain.ready()     # <?configPath:$CONFIG_PATH> # rc 0 when every other user linked to this shared config has a filled user.session.env, so the shared user.env may chain it; rc 1 when one has none or a home cannot be looked into #
+private.config.session.chain.ready()     # <?configPath:$CONFIG_PATH> <?family:user> # rc 0 when every other user linked to this shared config has their <family>.session.env (user: filled), so the shared <family>.env may chain it; rc 1 when one has none or a home cannot be looked into #
 {
  # Silent predicate — the GATE of the split. The shared user.env chains
  # ~/.config/oosh/user.session.env unguarded (env files are pure data), and a
@@ -1168,7 +1185,7 @@ private.config.session.chain.ready()     # <?configPath:$CONFIG_PATH> # rc 0 whe
  # look into (0750 homes, a non-root caller) is NOT proven, so the switch waits
  # for root (sudo oo update → config.init.user). The caller's own file is
  # written by the save itself.
- local target h link
+ local target h link family="${2:-user}"
  target=$(private.this.path.canonical "${1:-$CONFIG_PATH}" 2>/dev/null)
  [ -n "$target" ] || return 1
  while IFS= read -r h; do
@@ -1178,7 +1195,12 @@ private.config.session.chain.ready()     # <?configPath:$CONFIG_PATH> # rc 0 whe
    [ -L "$h/config" ] || continue
    link=$(private.this.path.canonical "$h/config" 2>/dev/null)
    [ "$link" = "$target" ] || continue
+   if [ "$family" = "user" ]; then
    [ -s "$h/.config/oosh/user.session.env" ] || return 1
+ else
+   # oosh.session.env may be empty (no branch derivable): it must exist.
+   [ -f "$h/.config/oosh/$family.session.env" ] || return 1
+ fi
  done <<HOMES
 $(private.config.homes.list)
 HOMES
@@ -1235,12 +1257,71 @@ private.config.session.files.ensure.all()     # <sharedConfig> <sharedOosh> # as
    [ -L "$h/config" ] || continue
    link=$(private.this.path.canonical "$h/config" 2>/dev/null)
    [ "$link" = "$target" ] || continue
-   [ -s "$h/.config/oosh/user.session.env" ] && continue
+   [ -s "$h/.config/oosh/user.session.env" ] && [ -f "$h/.config/oosh/oosh.session.env" ] && continue
    owner=$(stat -c %U "$h" 2>/dev/null || stat -f %Su "$h" 2>/dev/null)
    [ -n "$owner" ] || continue
    private.as.user "$owner" bash -c "$(private.this.as.user.preamble.get "$owner" "$h" "$sharedOosh")
      private.this.script.load config private.config.session.file.ensure || exit 1
      private.config.session.file.ensure \"$h\" >/dev/null" >/dev/null 2>&1
+ done <<HOMES
+$(private.config.homes.list)
+HOMES
+ return 0
+}
+
+
+private.config.oosh.session.file.get()     # <?home:$HOME> # echo the path of the per-user oosh.session.env under <home> #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ local home="${1:-$HOME}"
+ echo "${home%/}/.config/oosh/oosh.session.env"
+}
+
+
+private.config.oosh.session.split.is()     # <?configPath:$CONFIG_PATH> # rc 0 when the shared oosh.env already chains the per-user oosh.session.env #
+{
+ # Silent predicate, the twin of private.config.session.split.is.
+ grep -qxF '. $HOME/.config/oosh/oosh.session.env' "${1:-$CONFIG_PATH}/oosh.env" 2>/dev/null
+}
+
+
+private.config.oosh.session.migrate()     # <?configPath:$CONFIG_PATH> # chain the per-user oosh.session.env as the last line of the shared oosh.env, in place, OOSH_MODE out of it; only when every linked user has one; then OOSH_MODE leaves the user.session.env files the caller may write; idempotent, silent #
+{
+ # OOSH_MODE belongs to the oosh family (boss, 2026-10-02): the shared
+ # oosh.env chains each user's ~/.config/oosh/oosh.session.env, as log.env
+ # chains log.session.env. In place (`>` keeps owner, group and mode), only
+ # through the gate (a plain sh ends on a missing file). After the switch the
+ # transition copy of OOSH_MODE in user.session.env goes — root reaches every
+ # linked user's. No create.result: the callers' RESULT must stand.
+ # T-CONFIG-OOSH-SESSION-MIGRATE.
+ local configPath="${1:-$CONFIG_PATH}" f line out target h link
+ local chain='. $HOME/.config/oosh/oosh.session.env'
+ f="$configPath/oosh.env"
+ [ -f "$f" ] || return 0
+ if ! private.config.oosh.session.split.is "$configPath"; then
+   private.config.session.chain.ready "$configPath" oosh || return 1
+   out=""
+   while IFS= read -r line || [ -n "$line" ]; do
+     case "$line" in "export OOSH_MODE="*|"OOSH_MODE="*) continue ;; esac
+     out="$out$line"$'\n'
+   done < "$f"
+   printf '%s%s\n' "$out" "$chain" > "$f" 2>/dev/null
+ fi
+ target=$(private.this.path.canonical "$configPath" 2>/dev/null)
+ [ -n "$target" ] || return 0
+ while IFS= read -r h; do
+   [ -z "$h" ] && continue
+   [ -L "$h/config" ] || continue
+   link=$(private.this.path.canonical "$h/config" 2>/dev/null)
+   [ "$link" = "$target" ] || continue
+   f="$h/.config/oosh/user.session.env"
+   [ -w "$f" ] && grep -q '^export OOSH_MODE=' "$f" 2>/dev/null || continue
+   out=""
+   while IFS= read -r line || [ -n "$line" ]; do
+     case "$line" in "export OOSH_MODE="*) continue ;; esac
+     out="$out$line"$'\n'
+   done < "$f"
+   printf '%s' "$out" > "$f" 2>/dev/null
  done <<HOMES
 $(private.config.homes.list)
 HOMES
@@ -1362,6 +1443,11 @@ REQUIRED
   local chainNames=""
   [ -z "$file" ] && chainNames=$(private.config.chain.names.get "$CONFIG")
 
+  # A named oosh save keeps the oosh.session.env chain the file had — read
+  # before the harvest below truncates it.
+  local _ooshChainHad=""
+  [ "$file" = oosh ] && private.config.oosh.session.split.is "$CONFIG_PATH" && _ooshChainHad=yes
+
   RESULT=""
   # The harvest writes a NAMED file (`config save oosh`). Without a name the
   # no-argument branch below writes user.env itself — harvesting into it first
@@ -1385,6 +1471,16 @@ REQUIRED
       # a single debug.log would be written into the generated env file.
       private.config.variables.export "$name"
     } >$CONFIG
+  fi
+  if [ "$file" = oosh ]; then
+    # oosh.env chains the user's own oosh.session.env (OOSH_MODE) as its LAST
+    # line, the twin of log.env below — once the shared config is switched:
+    # a full save decides it up front (_configOoshSplit), a named save keeps
+    # what the file had (T-CONFIG-OOSH-CHAIN-KEPT). Unguarded: every user has
+    # the file (private.config.session.file.ensure).
+    local _ooshChain="${_configOoshSplit:-}"
+    [ -z "$_ooshChain" ] && [ -n "$_ooshChainHad" ] && _ooshChain=yes
+    [ "$_ooshChain" = "yes" ] && echo '. $HOME/.config/oosh/oosh.session.env' >> "$CONFIG"
   fi
   if [ "$file" = log ]; then
     # log.env chains the PER-USER session file as its LAST line, every time it
@@ -1422,9 +1518,13 @@ REQUIRED
     # switched stays switched; an old one switches only when every user linked
     # to it has their own user.session.env (the gate). Until then the shared
     # user.env keeps its PATH line and OOSH_MODE stays in oosh.env.
-    local _configSessionSplit=no
+    local _configSessionSplit=no _configOoshSplit=no
     if private.config.session.split.is "$CONFIG_PATH" || private.config.session.chain.ready "$CONFIG_PATH"; then
       _configSessionSplit=yes
+    fi
+    # The same for oosh.env's chain to the user's own oosh.session.env.
+    if private.config.oosh.session.split.is "$CONFIG_PATH" || private.config.session.chain.ready "$CONFIG_PATH" oosh; then
+      _configOoshSplit=yes
     fi
     {
       private.config.variable.export.line CONFIG_PATH
@@ -1575,7 +1675,7 @@ private.config.required.variables.get() # # the variables a config must carry fo
   cat <<'REQUIRED'
 BASH_FILE user.env private.config.derive.bash.file
 CONFIG_FILE user.env private.config.derive.config.file
-OOSH_MODE user.session.env private.config.derive.oosh.mode
+OOSH_MODE oosh.session.env private.config.derive.oosh.mode
 OOSH_OS oosh.env private.config.derive.oosh.os
 OOSH_PM oosh.env private.config.derive.oosh.pm
 LOG_LEVEL log.env private.config.derive.log.level
@@ -1605,7 +1705,7 @@ REQUIRED
   local drift="" persistedMode actualMode
   # The user's own session file; a host from before the split still has it in
   # the shared oosh.env.
-  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$(private.config.required.file.path user.session.env)" 2>/dev/null \
+  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$(private.config.required.file.path oosh.session.env)" "$(private.config.required.file.path user.session.env)" 2>/dev/null \
                   | cut -d= -f2- | tr -d '"')
   [ -z "$persistedMode" ] && persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$CONFIG_PATH/oosh.env" 2>/dev/null \
                   | cut -d= -f2- | tr -d '"')
