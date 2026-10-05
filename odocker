@@ -185,6 +185,46 @@ private.odocker.prereqs.ensure()     #  # install what odocker needs and the sys
 }
 
 
+private.odocker.socket.access.ensure()     # <?socket:/var/run/docker.sock> # make the mounted docker socket usable for this user: a group with its GID, created when missing, with this user in it; rc 0 when nothing is needed, rc 2 naming the group in RESULT when the membership is new, rc 1 when it cannot #
+{
+  # In a platform container the host's socket is mounted with the HOST's group
+  # number: bash-user got `permission denied` right after the automatic docker
+  # install (2026-10-05). The socket itself is never changed — odocker.install:
+  # never chgrp the host's socket. A group with its GID is created when there is
+  # none (as odocker.install does from the host), and the user joins it.
+  local socket="${1:-/var/run/docker.sock}" gid group
+  if [ ! -e "$socket" ] || docker info >/dev/null 2>&1 || [ "$(id -u)" = "0" ]; then
+    create.result 0 "the docker socket needs nothing"
+    return $(result)
+  fi
+  gid=$(stat -c %g "$socket" 2>/dev/null || stat -f %g "$socket" 2>/dev/null)
+  if [ -z "$gid" ]; then
+    create.result 1 "cannot read the group of $socket"; error.log "$RESULT"; return $(result)
+  fi
+  private.this.script.load user user.group.add
+  group=$(getent group "$gid" 2>/dev/null | cut -d: -f1)
+  if [ -z "$group" ]; then
+    os.check.env
+    group="docker"
+    getent group docker >/dev/null 2>&1 && group="dockerhost"
+    console.log "odocker: the docker socket belongs to group number $gid — creating group $group for it"
+    if ! $SUDO $OS_CMD_GROUP_ADD -g "$gid" "$group" >/dev/null 2>&1; then
+      create.result 1 "could not create group $group ($gid) for $socket"; error.log "$RESULT"; return $(result)
+    fi
+  fi
+  case " $(id -nG "$USER" 2>/dev/null) " in
+    *" $group "*) ;;
+    *) console.log "odocker: adding $USER to group $group, which owns the docker socket"
+       user.group.add "$group" "$USER" >/dev/null 2>&1 ;;
+  esac
+  case " $(id -nG "$USER" 2>/dev/null) " in
+    *" $group "*) create.result 2 "$group" ;;
+    *) create.result 1 "could not add $USER to group $group"; error.log "$RESULT" ;;
+  esac
+  return $(result)
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1700,7 +1740,14 @@ odocker.start()
   if [ "${0##*/}" = "odocker" ]; then
     case "${1:-}" in
       ""|usage|help*|completion.discover|workspace|workspace.*) ;;
-      *) private.odocker.prereqs.ensure || return $(result) ;;
+      *) private.odocker.prereqs.ensure || return $(result)
+         # The mounted socket belongs to the host's group: join a group with its
+         # GID. A membership this shell does not know yet takes effect for this
+         # very call through `sg`, once (ODOCKER_SG guards against a loop).
+         private.odocker.socket.access.ensure
+         if [ "$?" = 2 ] && [ -z "$ODOCKER_SG" ] && command -v sg >/dev/null 2>&1; then
+           exec env ODOCKER_SG=1 sg "$RESULT" -c "$(printf '%q ' "$0" "$@")"
+         fi ;;
     esac
   fi
   this.start "$@"

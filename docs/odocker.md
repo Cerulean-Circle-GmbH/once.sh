@@ -25,8 +25,12 @@ Only a **started** method that runs Docker does this: Tab completion and the
 tests *source* `odocker`, and `usage`, `help` and the `workspace` methods need
 no Docker (T-ODOCKER-PREREQ-START). In a platform container the host's Docker
 socket is mounted (`private.odocker.docker.socket.opt`), so the CLI talks to the
-host's daemon; a non-root user there needs the socket's group
-(`odocker install <container>` from the host sets it up).
+host's daemon. The socket keeps the **host's** group number, so a non-root user
+there got `permission denied`: `private.odocker.socket.access.ensure` creates a
+group with that number when there is none (`docker`, or `dockerhost` when
+`docker` has another number), adds the user to it, and the started call runs
+once more through `sg <group>`, so the new membership counts at once. The socket
+itself is never changed (T-ODOCKER-SOCKET-ACCESS, -SG).
 
 ## Configuration
 
