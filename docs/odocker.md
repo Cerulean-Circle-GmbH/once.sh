@@ -237,7 +237,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 |--------|-----------|-------------|
 | `run <image>` | image name, optional name, optional `docker` | Run container interactively |
 | `run.sshd <image>` | image name, optional name, optional `<?portOrOffset:0>`, optional `docker` | Run container detached with port mappings (see [Port Mapping](#port-mapping)) |
-| `reset <image>` | image name, optional `<?portOrOffset:0>`, optional `docker`, optional name | Stop container, remove it, clear host key, start fresh — named `<name>` (default `<image>_<sshPort>`; `os platform.test` passes the platform) |
+| `reset <image>` | image name, optional `<?portOrOffset:0>`, optional `docker`, optional name | Stop container, remove it, clear host key, start fresh — named `<name>`, else Docker's random name |
 
 ### Container Operations
 
@@ -248,11 +248,13 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
 
-A container `run`, `run.sshd` or `create` starts **without a name** gets one from
-odocker — `<image>_<port>` (`/` and `:` as `_`, a number appended when taken) —
-and every name is passed as the **host name** too. So the container knows its
-name from the first second, and the oosh install inside names the computer by
-it (`[oosh ubuntu_24_04] bash-user@ubuntu_24_04`), not by its ID. A container
+A container `run`, `run.sshd` or `create` starts **without a name** keeps
+Docker's **random name** — but odocker learns it before the container starts:
+an empty `docker create` lets Docker pick it, the entry is removed again, and
+the container starts with that name — passed as the **host name** too, like
+every given name. So the container knows its name from the first second, and
+the oosh install inside names the computer by it
+(`[oosh xenodochial_brown] bash-user@xenodochial_brown`), not by its ID. A container
 started by plain `docker run` learns its name once odocker has installed the
 docker program there (T-ODOCKER-CONTAINER-NAME-NEW, -UNNAMED-GETS-NAME,
 -START-NAME-REFRESH).

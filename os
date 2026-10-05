@@ -222,9 +222,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   fi
 
   # Fresh container
-  # Named by the platform — as container and host name, so the install
-  # inside names the computer by it, not by the container's ID.
-  odocker reset "$imageTag" "$sshPort" "" "$platform"
+  # Docker's random name, as container and host name (odocker.run.sshd), so
+  # the install inside names the computer by it, not by the container's ID.
+  odocker reset "$imageTag" "$sshPort"
   sleep 2
 
   # SSH setup
