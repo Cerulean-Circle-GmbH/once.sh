@@ -387,6 +387,7 @@ export OOSH_MODE="dev"
 | `OOSH_CLEAN_ENV`, `OOSH_APT_UPDATED` | **One-run gates** of `init/oosh`, exported during the install. Saved, a later `init/oosh` run from a normal shell skipped its clean-environment restart and its `apt-get update`. T-CONFIG-CMD-SAVE-OOSH |
 | `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | **Per-user session values** — only in each user's `log.session.env`, never the shared `log.env`. T-CONFIG-CMD-SAVE-LOG |
 | `OOSH_MODE` (once switched) | **Per user** — the branch the user's own `~/oosh` points at, in their `user.session.env`. Decided below the `case` by the layout: before the switch it stays in the shared `oosh.env`, which other users still read. T29, T-CONFIG-CMD-SAVE-OOSH |
+| `ODOCKER_SG` | **Runtime marker** of odocker's one `sg` re-run (the socket group a shell does not know yet). T-CONFIG-ODOCKER-SG-NOT-SAVED |
 | `OOSH_BRANCH` | Install **input** — the branch the operator asked for. State that must be **derived, never remembered**: persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** The branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh`. |
 
 The list is the `case` in `private.config.variables.list` (`config`); `test/test.config` T29 pins it by value. Change all three together.
