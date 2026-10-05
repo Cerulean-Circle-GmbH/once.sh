@@ -1257,6 +1257,77 @@ test.case $level "T-ODOCKER-WORKSPACES-INSTALL: every install gives the host its
 expect 0 "the workspaces root is created and set, odocker.env and its chain written once" \
   "a fresh install had no odocker.env — only odocker workspace.set wrote it"
 
+# T-ODOCKER-PREREQ-PACKAGE-ENGINE: a bare computer gets the Docker ENGINE package per package manager
+# With the host's socket mounted (a container) the client is enough; with no
+# Docker at all the engine is installed on this computer. macOS: colima.
+test.odocker.prereqPackageEngine() {
+  local bad="" pm want got
+  for pm in "apt-get -y install|docker.io" "apk add|docker" \
+            "dnf -y install|docker-ce docker-ce-cli containerd.io" "brew install|colima docker"; do
+    want="${pm#*|}"
+    got=$(OOSH_PM="${pm%%|*}" private.odocker.prereq.package.get docker engine)
+    [ "$got" = "$want" ] || bad="$bad ${pm%% *}=[$got]"
+  done
+  got=$(OOSH_PM="apk add" private.odocker.prereq.package.get docker)
+  [ "$got" = "docker-cli" ] || bad="$bad client-default=[$got]"
+  [ -z "$bad" ] && create.result 0 "engine packages per package manager, client by default" || create.result 1 "engine packages:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-PREREQ-PACKAGE-ENGINE: a bare computer gets the Docker engine package per package manager" test.odocker.prereqPackageEngine
+expect 0 "engine packages per package manager, client by default" "on a bare computer the client alone reaches no Docker"
+
+# T-ODOCKER-ENGINE-START: the engine is started the way this computer starts services
+# systemd first, then OpenRC (Alpine), then SysV `service`; macOS starts colima.
+# Stubs in a fixture bin record which one ran.
+test.odocker.engineStart() {
+  local fx bad="" log; fx=$(test.suite.fixture.make odockerengine); log="$fx/log"; mkdir -p "$fx/bin"; : > "$fx/docker.sock"
+  local c; for c in systemctl rc-update rc-service service colima; do
+    printf '%s\n' '#!/bin/sh' "echo \"$c \$*\" >> \"\$LOGF\"" 'v=$(echo "'"$c"'" | tr - _ | tr a-z A-Z)_RC; eval "exit \${$v:-0}"' > "$fx/bin/$c"; chmod +x "$fx/bin/$c"
+  done
+  test.odocker.engineStart.run() { # <env assignments…>
+    : > "$log"
+    env PATH="$fx/bin:$PATH" SUDO="" LOGF="$log" FX="$fx" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+      private.odocker.socket.get() { echo "$FX/docker.sock"; }
+      private.odocker.engine.start >/dev/null 2>&1' >/dev/null 2>&1
+    tr '\n' '|' < "$log"
+  }
+  [ "$(test.odocker.engineStart.run OOSH_OS=linux-gnu)" = "systemctl enable --now docker|" ] || bad="$bad systemd=[$(test.odocker.engineStart.run OOSH_OS=linux-gnu)]"
+  [ "$(test.odocker.engineStart.run OOSH_OS=linux-gnu SYSTEMCTL_RC=1)" = "systemctl enable --now docker|rc-update add docker default|rc-service docker start|" ] || bad="$bad openrc=[$(test.odocker.engineStart.run OOSH_OS=linux-gnu SYSTEMCTL_RC=1)]"
+  [ "$(test.odocker.engineStart.run OOSH_OS=linux-gnu SYSTEMCTL_RC=1 RC_SERVICE_RC=1)" = "systemctl enable --now docker|rc-update add docker default|rc-service docker start|service docker start|" ] || bad="$bad sysv"
+  case "$(test.odocker.engineStart.run OOSH_OS=darwin)" in "colima start|"*) ;; *) bad="$bad colima=[$(test.odocker.engineStart.run OOSH_OS=darwin)]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "systemd, then OpenRC, then service; colima on macOS" || create.result 1 "engine start:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-ENGINE-START: the engine starts the way this computer starts services" test.odocker.engineStart
+expect 0 "systemd, then OpenRC, then service; colima on macOS" "an installed engine that is not running answers nothing"
+
+# T-ODOCKER-PREREQ-MODE: no socket → the engine is installed and started; a mounted socket → the client only
+test.odocker.prereqMode() {
+  local fx bad="" log; fx=$(test.suite.fixture.make odockermode); log="$fx/pm.log"; mkdir -p "$fx/bin"
+  # The stub package manager logs the install and marks docker as installed.
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$PM_LOG"' ': > "$FX/installed"' > "$fx/bin/apk"; chmod +x "$fx/bin/apk"
+  test.odocker.prereqMode.run() { # <socket present: yes|no>
+    : > "$log"; rm -f "$fx/docker.sock" "$fx/installed"; [ "$1" = yes ] && : > "$fx/docker.sock"
+    env PATH="$fx/bin:$PATH" SUDO="" OOSH_PM="apk add" PM_LOG="$log" FX="$fx" OOSH_DIR="$OOSH_DIR" bash -c '
+      command() { if [ "$1" = -v ] && [ "$2" = docker ] && [ ! -e "$FX/installed" ]; then return 1; fi; builtin command "$@"; }
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+      docker() { return 1; }
+      private.odocker.socket.get() { echo "$FX/docker.sock"; }
+      private.odocker.engine.start() { echo "ENGINE-START" >> "$PM_LOG"; return 0; }
+      private.odocker.prereqs.ensure >/dev/null 2>&1' >/dev/null 2>&1
+    tr '\n' '|' < "$log"
+  }
+  case "$(test.odocker.prereqMode.run no)" in *"add docker|"*ENGINE-START*) ;; *) bad="$bad bare=[$(test.odocker.prereqMode.run no)]" ;; esac
+  case "$(test.odocker.prereqMode.run yes)" in *"add docker-cli|"*) case "$(test.odocker.prereqMode.run yes)" in *ENGINE-START*) bad="$bad container-started-engine" ;; esac ;; *) bad="$bad container=[$(test.odocker.prereqMode.run yes)]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "bare computer: engine installed and started; container: client only" || create.result 1 "prereq mode:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-PREREQ-MODE: no socket installs and starts the engine, a mounted socket only the client" test.odocker.prereqMode
+expect 0 "bare computer: engine installed and started; container: client only" "a bare computer needs Docker itself, a container only the client"
+
 ### test.method
 
 test.suite.save.results

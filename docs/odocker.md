@@ -11,15 +11,29 @@ The `odocker` script wraps Docker commands following oosh conventions: positiona
 ### Prerequisites are installed on first use
 
 `odocker` runs `docker` and lays its tables out with `column`. A minimal system
-— a platform container — has neither. So the first `odocker` method that runs
-Docker installs what is missing through `oo cmd`, with the package of this
-package manager (`private.odocker.prereq.package.get`; `oo cmd` itself knows no
-per-platform names):
+— a platform container, or a bare computer — has neither. So the first `odocker`
+method that runs Docker installs what is missing through `oo cmd`, with the
+package of this package manager (`private.odocker.prereq.package.get`; `oo cmd`
+itself knows no per-platform names). Which Docker depends on the computer:
+
+- **A container whose host's socket is mounted** (`/var/run/docker.sock`,
+  `private.odocker.socket.get`): only the Docker **client** — it talks to the
+  host's Docker.
+- **A bare computer** (no socket): the Docker **engine**, installed on this
+  computer and started (`private.odocker.engine.start`): systemd, else OpenRC
+  (Alpine), else a SysV `service`; on macOS **colima**, the Docker VM
+  (`colima start`).
 
 | | apt (Ubuntu/Debian) | apk (Alpine) | dnf / yum (Alma/RHEL) | brew (macOS) |
 |---|---|---|---|---|
-| `docker` | `docker.io` | `docker-cli` | `docker-ce-cli` (Docker's repo is added first) | `docker` |
+| `docker` — client | `docker.io` | `docker-cli` | `docker-ce-cli` | `docker` |
+| `docker` — engine | `docker.io` | `docker` | `docker-ce docker-ce-cli containerd.io` | `colima docker` |
 | `column` | `bsdextrautils` | `util-linux-misc` | `util-linux` | part of macOS |
+
+On dnf/yum Docker's own repository is added first. The engine packages create
+the group `docker`; the socket access below adds the user to it (colima's socket
+belongs to the user — no group). T-ODOCKER-PREREQ-PACKAGE-ENGINE, -ENGINE-START,
+-PREREQ-MODE.
 
 Only a **started** method that runs Docker does this: Tab completion and the
 tests *source* `odocker`, and `usage`, `help` and the `workspace` methods need
@@ -38,10 +52,13 @@ itself is never changed (T-ODOCKER-SOCKET-ACCESS, -SG).
 
 **No Dockerfile ships with oosh.** `find . -name Dockerfile` in this repository
 returns nothing. The workspaces tree lives in **EAMD.ucp**
-(`donges/eamd.ucp.git`) — a different repository — and **no part of the oosh
-install creates it**. On a fresh machine `$ODOCKER_WORKSPACES` therefore names a
-directory that is not there, and `odocker build` / `odocker workspace.list` /
-`os platform.test` (when it has to build an image, `os:212-220`) will say so.
+(`donges/eamd.ucp.git`) — a different repository. **Every install creates the
+root** — `DockerWorkspaces` beside the Once.sh components, shared with group
+`dev` — and the shared `$CONFIG_PATH/odocker.env` that names it, chained from
+`user.env` (`private.odocker.workspaces.install`; `oo update` as root heals an
+older host; an existing value is kept). But the root starts **empty**: `odocker
+build` / `odocker workspace.list` / `os platform.test` (when it has to build an
+image, `os:212-220`) will say so.
 
 That is expected, not a defect: seed the root from an existing tree, point oosh at a checkout, or start an empty root.
 
