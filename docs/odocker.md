@@ -237,7 +237,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 |--------|-----------|-------------|
 | `run <image>` | image name, optional name, optional `docker` | Run container interactively |
 | `run.sshd <image>` | image name, optional name, optional `<?portOrOffset:0>`, optional `docker` | Run container detached with port mappings (see [Port Mapping](#port-mapping)) |
-| `reset <image>` | image name, optional `<?portOrOffset:0>`, optional `docker` | Stop container, remove it, clear host key, start fresh |
+| `reset <image>` | image name, optional `<?portOrOffset:0>`, optional `docker`, optional name | Stop container, remove it, clear host key, start fresh — named `<name>` (default `<image>_<sshPort>`; `os platform.test` passes the platform) |
 
 ### Container Operations
 
@@ -247,6 +247,15 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | `exec.command <container> <command...>` | container name, command to run | Run a non-interactive command inside a running container (no TTY); for scripts/state machines |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
+
+A container `run`, `run.sshd` or `create` starts **without a name** gets one from
+odocker — `<image>_<port>` (`/` and `:` as `_`, a number appended when taken) —
+and every name is passed as the **host name** too. So the container knows its
+name from the first second, and the oosh install inside names the computer by
+it (`[oosh ubuntu_24_04] bash-user@ubuntu_24_04`), not by its ID. A container
+started by plain `docker run` learns its name once odocker has installed the
+docker program there (T-ODOCKER-CONTAINER-NAME-NEW, -UNNAMED-GETS-NAME,
+-START-NAME-REFRESH).
 | `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
 | `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount) |
 | `stop <container>` | container name | Stop a running container |
