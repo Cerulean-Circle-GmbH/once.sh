@@ -8,6 +8,26 @@ The `odocker` script wraps Docker commands following oosh conventions: positiona
 - Dockerfiles live in `DockerWorkspaces` (EAMD convention), referenced via `$ODOCKER_WORKSPACES`
 - Naming: `tmux→otmux, ssh→ossh, docker→odocker`
 
+### Prerequisites are installed on first use
+
+`odocker` runs `docker` and lays its tables out with `column`. A minimal system
+— a platform container — has neither. So the first `odocker` method that runs
+Docker installs what is missing through `oo cmd`, with the package of this
+package manager (`private.odocker.prereq.package.get`; `oo cmd` itself knows no
+per-platform names):
+
+| | apt (Ubuntu/Debian) | apk (Alpine) | dnf / yum (Alma/RHEL) | brew (macOS) |
+|---|---|---|---|---|
+| `docker` | `docker.io` | `docker-cli` | `docker-ce-cli` (Docker's repo is added first) | `docker` |
+| `column` | `bsdextrautils` | `util-linux-misc` | `util-linux` | part of macOS |
+
+Only a **started** method that runs Docker does this: Tab completion and the
+tests *source* `odocker`, and `usage`, `help` and the `workspace` methods need
+no Docker (T-ODOCKER-PREREQ-START). In a platform container the host's Docker
+socket is mounted (`private.odocker.docker.socket.opt`), so the CLI talks to the
+host's daemon; a non-root user there needs the socket's group
+(`odocker install <container>` from the host sets it up).
+
 ## Configuration
 
 ### `DockerWorkspaces` is an external prerequisite
