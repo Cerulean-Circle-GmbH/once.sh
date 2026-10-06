@@ -342,9 +342,15 @@ leaves the rest orphaned, which is how `path` came to carry completion
 functions for verbs it no longer had.
 
 Built on `replace block`, so the `.bak`/`.new` transaction and the
-exactly-one-match refusal come for free. It handles the one-liner completion
-form (`x.completion.y() { echo a; }` has no closing brace *line*, so the block
-form alone would run past it).
+exactly-one-match refusal come for free. Where a definition ends is
+`private.oo.method.end.get`'s: a one-liner (`x.completion.y() { echo a; }`)
+ends on its own line, a signature with a one-line body (`x() # doc` then
+`{ …; }`) on that body line, a block on its first `}` line. "The first `}`
+line" alone ran a `{ …; }` body on into the next method and deleted it
+(`private.oo.safeDirectory.add` took `oo.remote.update`,
+T-METHOD-DELETE-ONE-LINE). When another definition or the `### new.method`
+marker comes before any end, the definition is left as it is and the tool
+says so — it never guesses.
 
 **It does not delete the test case.** A test case has no delimiters — a
 `test.case` line, a call and one or more `expect`s, freely interleaved with
@@ -581,6 +587,12 @@ do it this way.
 **Chaining limit.** `<packageName>` is optional and positional, so `oo cmd X cmd Y` cannot chain —
 the second `cmd` is read as X's package name. Use one `oo cmd` per line.
 
+**A test run installs nothing.** Under `OOSH_NO_INSTALL` (test.suite exports it for every test
+file) a missing `<cmd>` is refused: rc 1, `$RESULT` `<cmd> missing — a test run installs nothing`,
+a warning, no package manager and no sudo. A present one is still rc 0. `oo.cmd` is the one door
+every install goes through, so it owns this rule (T-CMD-NO-INSTALL; see
+[test-suite.md](test-suite.md#a-test-run-installs-nothing)).
+
 ### oo.cmd.find
 
 Searches apt repositories for a command. The method is `oo.cmd.find` — this
@@ -813,6 +825,9 @@ Internal functions (not for direct use):
 | `private.check.all.pm` | Tests all package managers |
 | `private.install.dev.configs` | Installs dev SSH configs |
 | `private.oo.cmd.verify` | Predicate: is `<cmd>` on PATH after an install attempt; reason (incl. the macOS installed-but-not-on-PATH diagnostic) in `$RESULT`, never logged by itself — the caller logs it once at its own severity |
+| `private.oo.method.end.get <file> <startLine>` | The line that closes the definition starting at `<startLine>`; empty when another definition or the marker comes first — `oo method.delete` refuses then |
+| `private.oo.path.sudo.get <path> <?mode>` | The one privilege rule: nothing when this user may write `<path>` (its nearest existing parent while it is not there) or is root (`$SUDO` empty); else `$SUDO`, or `sudo -n ` in mode `quiet`, which never asks for a password. `oo update`'s drop-in cleanup and launcher install use quiet (T-OO-PATH-SUDO-GET, T-OO-PRIVILEGE-QUIET) |
+| `private.oo.path.writable.is <path>` | Predicate: may this user write `<path>`, or its nearest existing parent — the probe behind `private.oo.path.sudo.get`, separate so a test can answer "cannot write" for root too |
 
 ## See Also
 
