@@ -206,6 +206,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `stash.push` | `<message> <?dir:$OOSH_DIR>` | stash the working tree of `<dir>` under `<message>` |
 | `stash.pop` | `<?dir:$OOSH_DIR>` | pop the top stash of `<dir>` |
 | `stash.top.get` | `<?dir:$OOSH_DIR>` | echo the message of `stash@{0}`, empty when the stack is empty |
+| `stash.drop` | `<?dir:$OOSH_DIR>` | drop the top stash of `<dir>`; rc 1 `no stash to drop in <dir>` on an empty stack. The follow-up to a `stash.pop` that conflicted: git wrote the markers into the work tree and kept the stash — after the resolve the change is in the tree, and popping again would re-apply it (T-OGIT-STASH-DROP) |
 
 ### config
 
