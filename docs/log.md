@@ -94,7 +94,8 @@ Every level — console, test.console, silent, success, warn, important, debug, 
 error — writes through `private.log.emit`:
 
 - a **terminal-type** `LOG_DEVICE` (unset, `/dev/stdout`, `/proc/self/fd/1`, `/dev/fd/1`,
-  `/dev/stderr`, fd 2, `/dev/tty` — `private.log.device.is.terminal`) is written to
+  `/dev/stderr`, fd 2, `/dev/tty` — the kernel's `private.this.device.is.terminal`, which
+  `this`'s own `info.log` asks too, before `log` is loaded; T-LOG-TERMINAL-ONE-LIST) is written to
   **fd 2 by dup** — never by reopening `/dev/stderr`, which fails `EACCES` after `su -`
   on a root-owned tty;
 - a **file** `LOG_DEVICE` is appended to (fd 2 if it cannot be written);
