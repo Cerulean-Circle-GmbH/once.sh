@@ -1660,28 +1660,76 @@ expect 0 "without sg the new membership is announced for the next login" "Alpine
 # Debian 12's docker.io is Docker 20.10 (API 1.41); a host's Docker 29 accepts
 # 1.44 and up: "client version 1.41 is too old" (2026-10-06). Docker's
 # repository has the current docker-ce-cli, as on dnf/yum.
+# Once there it is left alone: every call downloaded the key again, rewrote the
+# list and ran apt-get update (dnf: config-manager --add-repo). A failed or
+# empty download left an empty key and a list that broke every later
+# apt-get update — curl's rc was lost in a pipe. A package manager without a
+# Docker repository is told so. All on a fixture root: stubs record every call,
+# install and tee write there for real; SUDO is empty.
 test.odocker.dockerRepoApt() {
-  local fx bad=""; fx=$(test.suite.fixture.make odockerrepoapt)
-  FX="$fx" bash -c '
-    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
-    export OOSH_PM="apt-get -y install" SUDO=""
-    private.odocker.os.release.get() { case "$1" in ID) echo debian ;; VERSION_CODENAME) echo bookworm ;; esac; }
-    oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; }
-    dpkg() { echo amd64; }
-    install() { echo "install $*" >> "$FX/log"; }
-    curl() { echo "curl $*" >> "$FX/log"; echo KEY; }
-    tee() { case "$1" in /etc/apt/*) local l; while IFS= read -r l; do echo "tee $1 <- $l" >> "$FX/log"; done ;; *) command tee "$@" ;; esac; }
-    apt-get() { echo "apt-get $*" >> "$FX/log"; }
-    private.odocker.docker.repo.add >/dev/null 2>&1' >/dev/null 2>&1
-  grep -q 'curl -fsSL https://download.docker.com/linux/debian/gpg' "$fx/log" || bad="$bad no-key"
-  grep -qx 'tee /etc/apt/sources.list.d/docker.list <- deb \[arch=amd64 signed-by=/etc/apt/keyrings/docker.asc\] https://download.docker.com/linux/debian bookworm stable' "$fx/log" || bad="$bad no-source=[$(tr '\n' '|' < "$fx/log")]"
-  grep -q '^apt-get update' "$fx/log" || bad="$bad no-update"
+  local fx bad="" out logSize sums realTee realInstall c deb
+  fx=$(test.suite.fixture.make odockerrepoapt); mkdir -p "$fx/bin" "$fx/tmp"; : > "$fx/log"
+  realTee=$(command -v tee); realInstall=$(command -v install)
+  printf '%s\n' '#!/bin/sh' 'echo "curl $*" >> "$FX/log"' '[ "${CURL_RC:-0}" = 0 ] || exit "$CURL_RC"' 'printf "%s" "${CURL_OUT-KEY}"' > "$fx/bin/curl"
+  for c in apt-get dnf yum; do printf '%s\n' '#!/bin/sh' "echo \"$c \$*\" >> \"\$FX/log\"" > "$fx/bin/$c"; done
+  printf '%s\n' '#!/bin/sh' 'echo "dpkg $*" >> "$FX/log"' 'echo amd64' > "$fx/bin/dpkg"
+  printf '%s\n' '#!/bin/sh' 'echo "install $*" >> "$FX/log"' "exec $realInstall \"\$@\"" > "$fx/bin/install"
+  printf '%s\n' '#!/bin/sh' 'echo "tee $*" >> "$FX/log"' "exec $realTee \"\$@\"" > "$fx/bin/tee"
+  chmod +x "$fx/bin/"*
+  test.odocker.dockerRepoApt.run() { # <package manager> <root> <env assignments…>
+    local pm="$1" root="$2"; shift 2
+    env PATH="$fx/bin:$PATH" SUDO="" TMPDIR="$fx/tmp" FX="$fx" OOSH_PM="$pm" ROOT="$root" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+      private.odocker.os.release.get() { case "$1" in ID) echo debian ;; VERSION_CODENAME) echo bookworm ;; esac; }
+      oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; }
+      private.odocker.docker.repo.add "$ROOT" >/dev/null 2>&1; echo "rc=$? $RESULT"' </dev/null 2>/dev/null | tail -1
+  }
+  deb='deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable'
+  # apt, first run: key, list, one update
+  out=$(test.odocker.dockerRepoApt.run "apt-get -y install" "$fx/apt")
+  case "$out" in "rc=0 "*) ;; *) bad="$bad first=[$out]" ;; esac
+  grep -q 'curl -fsSL https://download.docker.com/linux/debian/gpg' "$fx/log" || bad="$bad no-key-download"
+  [ "$(cat "$fx/apt/etc/apt/keyrings/docker.asc" 2>/dev/null)" = KEY ] || bad="$bad key-file"
+  [ "$(cat "$fx/apt/etc/apt/sources.list.d/docker.list" 2>/dev/null)" = "$deb" ] || bad="$bad list=[$(cat "$fx/apt/etc/apt/sources.list.d/docker.list" 2>/dev/null)]"
+  [ "$(grep -c '^apt-get update' "$fx/log")" = 1 ] || bad="$bad updates=$(grep -c '^apt-get update' "$fx/log")"
+  # apt, second run: nothing called, nothing changed
+  logSize=$(wc -c < "$fx/log"); sums=$(cksum "$fx/apt/etc/apt/keyrings/docker.asc" "$fx/apt/etc/apt/sources.list.d/docker.list" 2>&1)
+  out=$(test.odocker.dockerRepoApt.run "apt-get -y install" "$fx/apt")
+  case "$out" in "rc=0 "*) ;; *) bad="$bad second=[$out]" ;; esac
+  [ "$(wc -c < "$fx/log")" = "$logSize" ] || bad="$bad second-run-called=[$(tail -n +1 "$fx/log" | tail -3 | tr '\n' '|')]"
+  [ "$(cksum "$fx/apt/etc/apt/keyrings/docker.asc" "$fx/apt/etc/apt/sources.list.d/docker.list" 2>&1)" = "$sums" ] || bad="$bad second-run-changed"
+  # a failing download, an empty download: rc 1, nothing left behind
+  for c in "fail CURL_RC=22" "empty CURL_OUT="; do
+    : > "$fx/log"
+    out=$(test.odocker.dockerRepoApt.run "apt-get -y install" "$fx/${c%% *}" "${c#* }")
+    case "$out" in "rc=1 "*) ;; *) bad="$bad ${c%% *}=[$out]" ;; esac
+    [ -e "$fx/${c%% *}/etc/apt/keyrings/docker.asc" ] && bad="$bad ${c%% *}-key-left"
+    [ -e "$fx/${c%% *}/etc/apt/sources.list.d/docker.list" ] && bad="$bad ${c%% *}-list-left"
+    grep -q '^apt-get update' "$fx/log" && bad="$bad ${c%% *}-updated"
+    [ -z "$(ls -A "$fx/tmp")" ] || bad="$bad ${c%% *}-tmp-left=[$(ls -A "$fx/tmp" | tr '\n' ' ')]"
+  done
+  # dnf: the repository file once, then nothing
+  : > "$fx/log"
+  out=$(test.odocker.dockerRepoApt.run "dnf -y install" "$fx/dnf" CURL_OUT="[docker-ce-stable]")
+  case "$out" in "rc=0 "*) ;; *) bad="$bad dnf=[$out]" ;; esac
+  [ "$(cat "$fx/dnf/etc/yum.repos.d/docker-ce.repo" 2>/dev/null)" = "[docker-ce-stable]" ] || bad="$bad dnf-repo-file=[$(tr '\n' '|' < "$fx/log")]"
+  logSize=$(wc -c < "$fx/log")
+  out=$(test.odocker.dockerRepoApt.run "dnf -y install" "$fx/dnf")
+  case "$out" in "rc=0 "*) ;; *) bad="$bad dnf-second=[$out]" ;; esac
+  [ "$(wc -c < "$fx/log")" = "$logSize" ] || bad="$bad dnf-second-run-called"
+  # apk: no Docker repository — rc 1 naming it, nothing called
+  : > "$fx/log"
+  out=$(test.odocker.dockerRepoApt.run "apk add" "$fx/apk")
+  case "$out" in "rc=1 "*apk*) ;; *) bad="$bad apk=[$out]" ;; esac
+  [ -s "$fx/log" ] && bad="$bad apk-called=[$(tr '\n' '|' < "$fx/log")]"
+  [ -e "$fx/apk" ] && bad="$bad apk-wrote"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "Docker's apt repository: key, source line, update" || create.result 1 "repo apt:$bad"
+  [ -z "$bad" ] && create.result 0 "Docker's repository: key, list and update once; a failed download leaves nothing; apk is refused" || create.result 1 "repo:$bad"
   return $(result)
 }
-test.case $level "T-ODOCKER-DOCKER-REPO-APT: on apt systems the docker client comes from Docker's own repository" test.odocker.dockerRepoApt
-expect 0 "Docker's apt repository: key, source line, update" "Debian 12's docker.io 20.10 is too old for a host's Docker"
+test.case $level "T-ODOCKER-DOCKER-REPO-APT: Docker's own repository is added once, a failed download leaves nothing behind" test.odocker.dockerRepoApt
+expect 0 "Docker's repository: key, list and update once; a failed download leaves nothing; apk is refused" \
+  "every call re-downloaded the key; a failed download left an empty key that broke apt-get update"
 
 ### test.method
 

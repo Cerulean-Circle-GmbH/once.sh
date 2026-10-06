@@ -39,7 +39,13 @@ itself knows no per-platform names). Which Docker depends on the computer:
 On apt (the client) and dnf/yum, Docker's own repository is added first
 (`private.odocker.docker.repo.add`): Debian 12's `docker.io` is Docker 20.10,
 too old for a current host's Docker ("client version 1.41 is too old",
-T-ODOCKER-DOCKER-REPO-APT). The engine packages create
+T-ODOCKER-DOCKER-REPO-APT). It is added **once**: when its file is there
+(`/etc/apt/sources.list.d/docker.list`, `/etc/yum.repos.d/docker-ce.repo`)
+nothing is downloaded, written or updated. The key (apt) or the `.repo` file
+(dnf/yum) is downloaded to a temporary file first; a failed or empty download
+leaves nothing behind and answers rc 1 — an empty key used to break every later
+`apt-get update`. Any other package manager has no Docker repository (rc 1).
+The optional `<root>` (default `/`) lets the test work on a fixture. The engine packages create
 the group `docker`; the socket access below adds the user to it (colima's socket
 belongs to the user — no group). T-ODOCKER-PREREQ-PACKAGE-ENGINE, -ENGINE-START,
 -PREREQ-MODE.
