@@ -52,13 +52,20 @@ socket odocker looks for is `$ODOCKER_SOCKET`, else `/var/run/docker.sock`
 Only a **started** method that runs Docker does this: Tab completion and the
 tests *source* `odocker`, and `usage`, `help` and the `workspace` methods need
 no Docker (T-ODOCKER-PREREQ-START). In a platform container the host's Docker
-socket is mounted (`private.odocker.docker.socket.opt`), so the CLI talks to the
+socket is mounted (`private.odocker.docker.socket.opt` mounts the socket odocker
+found, `private.odocker.socket.get`), so the CLI talks to the
 host's daemon. The socket keeps the **host's** group number, so a non-root user
 there got `permission denied`: `private.odocker.socket.access.ensure` creates a
 group with that number when there is none (`docker`, or `dockerhost` when
 `docker` has another number), adds the user to it, and the started call runs
-once more through `sg <group>`, so the new membership counts at once. The socket
-itself is never changed (T-ODOCKER-SOCKET-ACCESS, -SG). Alpine (BusyBox) has no
+once more through `sg <group>`, so the new membership counts at once. The group
+is found and made with kernel methods only — a started odocker has sourced
+nothing but `this`: `private.this.group.name.get <gid>` (getent, else
+`/etc/group`, `dscl` on macOS) and `private.this.group.create <name> <gid>`
+(`groupadd -g`, `addgroup -g`, `dseditgroup -i`, through `$SUDO`;
+T-THIS-GROUP-NAME-GET, -GROUP-CREATE-GID, T-ODOCKER-SOCKET-GROUP-ENSURE). The
+socket itself is never changed — no odocker method runs `chgrp` or `sudo` on it
+(T-ODOCKER-SOCKET-ACCESS, -SG, -NEVER-CHANGED). Alpine (BusyBox) has no
 `sg`, and no package provides one: there odocker says the membership counts from
 the next login (T-ODOCKER-NO-SG-NEXT-LOGIN). So that it rarely comes to that,
 **the install already adds every user to the socket's group** when a socket is
