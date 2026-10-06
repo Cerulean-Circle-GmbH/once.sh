@@ -35,6 +35,15 @@ the group `docker`; the socket access below adds the user to it (colima's socket
 belongs to the user — no group). T-ODOCKER-PREREQ-PACKAGE-ENGINE, -ENGINE-START,
 -PREREQ-MODE.
 
+**A Mac that is itself a VM** (a tart VM) cannot run colima — it has no
+virtualization (`kern.hv_support`), so nothing is installed there and odocker
+says why (`private.odocker.engine.supported`, T-ODOCKER-ENGINE-SUPPORTED,
+-PREREQ-NO-ENGINE). A missing prerequisite is a **warning**: a method that needs
+no docker (the picker of `odocker up`) still runs, a docker call fails on its own
+(T-ODOCKER-START-CONTINUES). **During a test run nothing is installed**:
+`test.suite` exports `OOSH_NO_INSTALL=1`, and a started odocker then installs
+nothing and changes no group or config (T-ODOCKER-START-NO-INSTALL).
+
 Only a **started** method that runs Docker does this: Tab completion and the
 tests *source* `odocker`, and `usage`, `help` and the `workspace` methods need
 no Docker (T-ODOCKER-PREREQ-START). In a platform container the host's Docker

@@ -179,6 +179,15 @@ config tier.
 **What `CONFIG_PATH` does not cover:** `~/.gitconfig` (use `GIT_CONFIG_GLOBAL`), and `log`'s
 `~/config/result.txt` / `error.txt`, which are hardcoded to `$HOME`.
 
+## A test run installs nothing
+
+`test.suite` exports `OOSH_NO_INSTALL=1` for every test file. Tests start real
+scripts (`odocker up`), and a script that installs what it misses did so
+during the tests — colima, docker and lima on a Mac VM (2026-10-06). A script
+that installs on first use honours it; a test OF such an install lifts it with
+`env -u OOSH_NO_INSTALL` and stubs the package manager (T-SUITE-NO-INSTALL,
+T-ODOCKER-START-NO-INSTALL).
+
 ## Every file scores itself
 
 `test.suite.save.results` at the end of a test file is **mandatory**, not decorative. Test files run
