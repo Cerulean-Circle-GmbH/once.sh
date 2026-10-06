@@ -944,6 +944,69 @@ test.case $level "T-USER-GROUP-MEMBER-PENDING: a membership this process does no
 expect 0 "pending only when the database has the group and this process does not" \
   "odocker said log out and back in on every call when docker failed for another reason"
 
+# T-USER-GROUP-ADD-IDEMPOTENT: an existing member is left alone — no sudo, no membership command
+# user.group.add ran `$SUDO usermod` (Alpine: addgroup, macOS: dseditgroup) also
+# for a user who was a member already. config.init.user adds every user to dev
+# on every oo update and oo user.fix: a user without passwordless sudo was asked
+# for a password each time, for nothing (2026-10-06). Every program it may call
+# is a recording stub on a fixture PATH; the group database is a fixture file.
+test.user.groupAdd.run() { # <fx> <OS_CMD_USER_MOD> <groups of tester> <existing groups>
+  local fx="$1" b="$1/bin" name
+  rm -rf "$b" "$fx/calls"; mkdir -p "$b"
+  printf '%s\n' "$3" > "$fx/db"; printf '%s\n' $4 > "$fx/groups"
+  printf '#!/bin/sh\ncase "$*" in -un) echo tester ;; "-nG tester") cat "$FX/db" ;; *) exec /usr/bin/id "$@" ;; esac\n' > "$b/id"
+  printf '#!/bin/sh\nc="${1##*/}"; shift; echo "sudo $c $*" >> "$FX/calls"; exec "$c" "$@"\n' > "$b/sudo"
+  printf '#!/bin/sh\necho "usermod $*" >> "$FX/calls"; [ "$1 $2" = "-a -G" ] && echo "$(cat "$FX/db") $3" > "$FX/db"; exit 0\n' > "$b/usermod"
+  printf '#!/bin/sh\necho "addgroup $*" >> "$FX/calls"; [ $# = 2 ] && echo "$(cat "$FX/db") $2" > "$FX/db"; exit 0\n' > "$b/addgroup"
+  printf '#!/bin/sh\necho "groupadd $*" >> "$FX/calls"; echo "$1" >> "$FX/groups"; exit 0\n' > "$b/groupadd"
+  printf '#!/bin/sh\necho "dseditgroup $*" >> "$FX/calls"; exit 0\n' > "$b/dseditgroup"
+  printf '#!/bin/sh\n[ "$1" = group ] && grep -qx "$2" "$FX/groups"\n' > "$b/getent"
+  printf '#!/bin/sh\ngrep -qx "${3#/Groups/}" "$FX/groups"\n' > "$b/dscl"
+  for name in id sudo usermod addgroup groupadd dseditgroup getent dscl; do chmod +x "$b/$name"; done
+  FX="$fx" USERMOD="$2" PATH="$b:$PATH" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+    export SUDO="sudo " OOSH_OS=linux-gnu OS_CMD_USER_MOD="$USERMOD" OS_CMD_GROUP_ADD=groupadd
+    user.group.add ooshtestgrp tester >/dev/null 2>&1; echo "rc=$?" >> "$FX/calls"
+    user.group.add ooshtestgrp tester >/dev/null 2>&1; echo "rc=$?" >> "$FX/calls"' >/dev/null 2>&1
+  tr '\n' '|' < "$fx/calls" 2>/dev/null
+}
+test.user.groupAddIdempotent() {
+  local fx bad="" got; fx=$(test.suite.fixture.make usergroupadd)
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester ooshtestgrp" "ooshtestgrp")
+  [ "$got" = "rc=0|rc=0|" ] || bad="$bad member=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester" "ooshtestgrp")
+  [ "$got" = "sudo usermod -a -G ooshtestgrp tester|usermod -a -G ooshtestgrp tester|rc=0|rc=0|" ] || bad="$bad usermod=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "addgroup" "tester" "ooshtestgrp")
+  [ "$got" = "sudo addgroup tester ooshtestgrp|addgroup tester ooshtestgrp|rc=0|rc=0|" ] || bad="$bad alpine=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester" "")
+  [ "$got" = "sudo groupadd ooshtestgrp|groupadd ooshtestgrp|sudo usermod -a -G ooshtestgrp tester|usermod -a -G ooshtestgrp tester|rc=0|rc=0|" ] || bad="$bad new-group=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a member is left alone, a non-member is added once" || create.result 1 "group.add:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-ADD-IDEMPOTENT: an existing member is left alone — no sudo, no membership command" test.user.groupAddIdempotent
+expect 0 "a member is left alone, a non-member is added once" \
+  "config.init.user ran sudo usermod for dev on every oo update — a password prompt for nothing"
+
+# T-USER-GROUP-MEMBER-IS: membership per the group database, whole names only
+test.user.groupMemberIs() {
+  local bad=""
+  test.user.groupMemberIs.run() { # <database groups of tester> <?user>
+    ( DB="$1"; unset USER
+      id() { case "$*" in -un) echo tester ;; "-nG tester") echo "$DB" ;; *) return 1 ;; esac; }
+      private.user.group.member.is docker ${2:+"$2"} ); echo $?
+  }
+  [ "$(test.user.groupMemberIs.run "tester docker")" = 0 ] || bad="$bad member-missed"
+  [ "$(test.user.groupMemberIs.run "tester docker" tester)" = 0 ] || bad="$bad named-user"
+  [ "$(test.user.groupMemberIs.run "tester")" = 1 ] || bad="$bad not-a-member"
+  [ "$(test.user.groupMemberIs.run "tester dockerx")" = 1 ] || bad="$bad partial-name"
+  [ "$(test.user.groupMemberIs.run "tester docker" nobodyelse)" = 1 ] || bad="$bad unknown-user"
+  [ -z "$bad" ] && create.result 0 "a member only when the database lists the whole group name" || create.result 1 "member is:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-MEMBER-IS: membership per the group database, whole names only" test.user.groupMemberIs
+expect 0 "a member only when the database lists the whole group name" "user.group.add asked nobody and ran usermod every time"
+
 ### test.method
 
 test.suite.save.results
