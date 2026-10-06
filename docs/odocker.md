@@ -66,8 +66,8 @@ socket odocker looks for is `$ODOCKER_SOCKET`, else `/var/run/docker.sock`
 Only a **started** method that runs Docker does this: Tab completion and the
 tests *source* `odocker`, and `usage`, `help` and the `workspace` methods need
 no Docker (T-ODOCKER-PREREQ-START). In a platform container the host's Docker
-socket is mounted (`private.odocker.docker.socket.opt` mounts the socket odocker
-found, `private.odocker.socket.get`), so the CLI talks to the
+socket is mounted (`private.odocker.docker.socket.opt` mounts the daemon's
+`/var/run/docker.sock`, see Docker Socket below), so the CLI talks to the
 host's daemon. The socket keeps the **host's** group number, so a non-root user
 there got `permission denied`: `private.odocker.socket.access.ensure` creates a
 group with that number when there is none (`docker`, or `dockerhost` when
@@ -239,9 +239,15 @@ odocker up naked_ubuntu_24_04 9022
 ## Docker Socket
 
 **Every container odocker starts has the socket.** `run`, `run.sshd`, `up`,
-`reset` and `clone` always mount the socket odocker found
-(`private.odocker.docker.socket.opt`: `$(private.odocker.socket.get)` →
-`/var/run/docker.sock`), with or without the option. The optional last `docker`
+`reset` and `clone` always mount the daemon's socket
+(`private.odocker.docker.socket.opt`: `-v /var/run/docker.sock:/var/run/docker.sock`),
+with or without the option. The source of that mount is **always the constant
+`/var/run/docker.sock`**, never `private.odocker.socket.get`: the Docker daemon
+resolves it on its own host (or in colima's VM on a Mac), where the socket is
+`/var/run/docker.sock` whatever path this client reaches it by (`ODOCKER_SOCKET`,
+`~/.colima/…/docker.sock`, a container where the host's socket is mounted
+elsewhere). With the client's path Docker creates an empty directory on the host
+and mounts that — the new container has no socket (T-ODOCKER-SOCKET-NEVER-CHANGED). The optional last `docker`
 parameter only decides whether the Docker client is installed in the new
 container (`odocker install`). It does so for `run.sshd`, and for `up`, `reset`
 and `clone` when they start the container through `run.sshd` (an image that
