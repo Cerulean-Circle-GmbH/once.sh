@@ -827,6 +827,7 @@ Internal functions (not for direct use):
 | `private.oo.cmd.verify` | Predicate: is `<cmd>` on PATH after an install attempt; reason (incl. the macOS installed-but-not-on-PATH diagnostic) in `$RESULT`, never logged by itself — the caller logs it once at its own severity |
 | `private.oo.method.end.get <file> <startLine>` | The line that closes the definition starting at `<startLine>`; empty when another definition or the marker comes first — `oo method.delete` refuses then |
 | `private.oo.path.sudo.get <path> <?mode>` | The one privilege rule: nothing when this user may write `<path>` (its nearest existing parent while it is not there) or is root (`$SUDO` empty); else `$SUDO`, or `sudo -n ` in mode `quiet`, which never asks for a password. `oo update`'s drop-in cleanup and launcher install use quiet (T-OO-PATH-SUDO-GET, T-OO-PRIVILEGE-QUIET) |
+| `private.oo.pm.install.prefix.get <?pmCmd>` | What goes in front of the package-manager command: the sudo decision — none for brew (Homebrew refuses root; root under sudo hops back to `$SUDO_USER`), none for root (`$SUDO` empty), else `$SUDO` — and the non-interactive env of `private.oo.pm.env.get`. `oo.cmd` and `oo.prereqs.install` both use it (T-OO-PM-INSTALL-PREFIX-GET) |
 | `private.oo.path.writable.is <path>` | Predicate: may this user write `<path>`, or its nearest existing parent — the probe behind `private.oo.path.sudo.get`, separate so a test can answer "cannot write" for root too |
 
 ## See Also

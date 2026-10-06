@@ -2461,7 +2461,7 @@ private.oo.cmd.verify() # <cmd> # predicate: is <cmd> on PATH after an install a
   return $(result)
 }
 
-oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it with: $SUDO $pmEnv $OOSH_PM <?packageName>, then verifies it landed
+oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it with: $pmPrefix $OOSH_PM <?packageName>, then verifies it landed
 {
     # Argument order is the chaining protocol: consume our own arguments, then
     # hand the token the NEXT command starts at to create.result's third
@@ -2527,8 +2527,10 @@ oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it w
     # (oo:3133, init/oosh:214, config:776, ossh:2604), T-PM-TABLES-AGREE pins
     # them equal, and `config save` persists $OOSH_PM verbatim into
     # ~/config/oosh.env where a change would outlive this file. The prefix
-    # table itself is private.oo.pm.env.get, shared with oo.prereqs.install.
-    local pmEnv; pmEnv=$(private.oo.pm.env.get)
+    # table itself is private.oo.pm.env.get; the whole prefix — sudo decision
+    # plus env — is private.oo.pm.install.prefix.get, shared with
+    # oo.prereqs.install.
+    local pmPrefix; pmPrefix=$(private.oo.pm.install.prefix.get)
 
     if command -v "$current" >/dev/null 2>&1; then
       # Already present — the idempotency every caller relies on. The package
@@ -2538,7 +2540,7 @@ oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it w
           # BusyBox ships a wget stub with too few options for our use.
           if wget --help 2>&1 | grep -q "BusyBox"; then
             console.log "BusyBox wget detected — installing full wget"
-            $SUDO $pmEnv $OOSH_PM wget
+            $pmPrefix $OOSH_PM wget
             # The stub is still there, so this is advisory, not a failure.
             private.oo.cmd.verify wget || warn.log "$RESULT"
           fi
@@ -2654,22 +2656,11 @@ oo.cmd() # <cmd> <?packageName> # checks if <cmd> is installed and installs it w
         oo cmd python3 python3 || rc=$?
         ;;
       *)
-        if [ "$OOSH_PM" = "brew install" ]; then
-          # Homebrew refuses to run as root since v2.0 ("Running Homebrew as
-          # root is extremely dangerous and no longer supported"). When
-          # init/oosh has sudo-re-exec'd to root before reaching `oo cmd
-          # <pkg>` (the standard install path), drop privileges back to
-          # $SUDO_USER — sudo preserves this var to the original invoking
-          # user. -H sets HOME to that user's home so brew finds its config
-          # and cache there.
-          if [ "$(id -u)" = "0" ] && [ -n "$SUDO_USER" ]; then
-            sudo -u "$SUDO_USER" -H $pmEnv brew install $package || rc=$?
-          else
-            $pmEnv brew install $package || rc=$?
-          fi
-        else
-          $SUDO $pmEnv $OOSH_PM $package || rc=$?
-        fi
+        # Sudo or not — none for brew (Homebrew refuses root; root under sudo
+        # hops back to $SUDO_USER), none for root, else $SUDO — and the
+        # non-interactive env: private.oo.pm.install.prefix.get, the one
+        # answer oo.prereqs.install uses too (T-OO-PM-INSTALL-PREFIX-GET).
+        $pmPrefix $OOSH_PM $package || rc=$?
         ;;
     esac
 
@@ -2718,16 +2709,13 @@ oo.prereqs.install() # # install the oosh install-time prereqs locally — git a
   # bash 4+ case is subtle: `oo cmd bash` short-circuits when bash is
   # already in PATH (oo:1689 `command -v` check), and macOS ships bash 3.2
   # at /bin/bash — so oo cmd bash would NO-OP and the upgrade never fires.
-  # Bypass the existence check by dispatching directly to the PM. Same
-  # case-sudo split oo cmd does (brew runs as caller; all other PMs need
-  # $SUDO), and the same non-interactive prefix — bypassing oo cmd must not
-  # bypass that too (apt: tzdata's debconf prompt; brew: ask mode).
+  # Bypass the existence check by dispatching directly to the PM — with the
+  # prefix oo cmd uses, private.oo.pm.install.prefix.get: bypassing oo cmd
+  # must not bypass the sudo decision (brew refuses root) or the
+  # non-interactive env (apt: tzdata's debconf prompt; brew: ask mode).
   if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
     [ -z "$OOSH_PM" ] && oo pm.discover
-    case "${OOSH_PM:-}" in
-      "brew install"*) $(private.oo.pm.env.get) $OOSH_PM bash || rc=1 ;;
-      *)               $SUDO $(private.oo.pm.env.get) $OOSH_PM bash || rc=1 ;;
-    esac
+    $(private.oo.pm.install.prefix.get) $OOSH_PM bash || rc=1
     important.log "bash 4+ installed — re-exec the installer from a fresh shell to pick it up"
   fi
   return $rc
@@ -3343,6 +3331,27 @@ private.oo.path.writable.is()     # <path> # rc 0 when this user may write <path
    esac
  done
  [ -w "$probe" ]
+}
+
+
+private.oo.pm.install.prefix.get()     # <?pmCmd:$OOSH_PM> # echo what goes in front of the package-manager command: the sudo decision (none for brew, none for root, else $SUDO; brew under sudo hops back to SUDO_USER) and the non-interactive env of private.oo.pm.env.get #
+{
+ # A getter consumed as $(...): no create.result, no logging. "How to call a
+ # package manager" lived in oo.cmd, again in oo.prereqs.install and a third
+ # time in ossh.cmd (T-OO-PM-INSTALL-PREFIX-GET). Root or not is $SUDO — ""
+ # for root, "sudo " for a user (`this`) — the variable oo.cmd always used.
+ # Homebrew refuses to run as root ("extremely dangerous and no longer
+ # supported"): never sudo in front of it; root reached through sudo (init/oosh
+ # re-execs that way) hops back to $SUDO_USER, -H so brew finds its own
+ # config and cache. The env goes after the sudo — sudo's env_reset would drop
+ # a shell-assignment prefix (the long comment in oo.cmd).
+ local pmCmd="${1:-$OOSH_PM}" asRoot=""
+ case "$pmCmd" in
+   brew*) if [ -z "$SUDO" ] && [ -n "$SUDO_USER" ]; then asRoot="sudo -u $SUDO_USER -H"; fi ;;
+   *)     asRoot="$SUDO" ;;
+ esac
+ set -- $asRoot $(private.oo.pm.env.get "$pmCmd")
+ echo "$*"
 }
 
 
