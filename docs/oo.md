@@ -192,7 +192,11 @@ then share and trust the new folder. Without a base both refuse with
 `no components base — run oo mode.setup`; there is no "clone beside `~/oosh`"
 mode any more. An existing folder is never cloned over: a clone on the right
 branch is kept, a linked worktree from an older install is left alone with a
-pointer to `ogit worktree.remove`, anything else refuses.
+pointer to `ogit worktree.remove`, anything else refuses. Install state 31
+builds `main/` and the branch folder with `private.oo.shared.tree.ensure`, on
+the same helper: a re-run keeps what is there and makes what is missing, so a
+half-made first run heals; the local copy of `~/oosh` runs only when `main/`
+could really not be cloned.
 
 **Trust is per folder.** git's `safe.directory` is per repository, so every
 folder under the base needs its own entry for every user who touches it
