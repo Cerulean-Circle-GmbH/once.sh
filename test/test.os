@@ -12,13 +12,13 @@ else
   # remove the level parameter
   shift
 fi
-info.log "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
 #echo "sourcing init"
 source this
 source test.suite
 
 log.level $level
+info.log "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
 completionArray=(once config list file ite)
 source oo
