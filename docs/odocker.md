@@ -267,7 +267,9 @@ This allows the container to control the host's Docker daemon.
 `odocker install <container>` has **one** implementation of the install and of
 the socket's group. It takes one of two paths:
 
-- **A container with oosh** (`~/oosh/odocker` there): it runs
+- **A container with oosh** (`~/oosh/odocker` there, and it defines
+  `odocker.prereqs.install()` — asked with `grep` through `docker exec`; an
+  older oosh without it takes the raw path, T-ODOCKER-INSTALL-OOSH-OLD): it runs
   `odocker prereqs.install` in the container through the prelude
   (`ossh.remote.prelude.get`). The container installs and groups itself with the
   very methods a started odocker uses:
@@ -309,7 +311,11 @@ the socket's group. It takes one of two paths:
       naming why.
   - **Alpine:** `docker-cli` from apk, no repository.
   - **The socket's group:** the same group rule as above (T-ODOCKER-INSTALL-RAW,
-    T-ODOCKER-DOCKER-REPO-GET).
+    T-ODOCKER-DOCKER-REPO-GET). After a create the group of the socket's number
+    is read back from the container: a group of that name with another number
+    (an image committed on another host) is a loud rc 1 naming group and number,
+    and nobody joins. A member is left alone; a join that fails is reported
+    with rc 1 (T-ODOCKER-INSTALL-RAW-VERIFIED).
 
 ### Usage
 

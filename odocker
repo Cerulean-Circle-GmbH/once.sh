@@ -534,7 +534,7 @@ private.odocker.container.prereqs.install()     # <container> # install the Dock
  # container's package manager; the group rule is socket.group.ensure's: the
  # group of the socket's number, else docker, else dockerhost — an existing
  # group is never renumbered (T-ODOCKER-INSTALL-RAW).
- local container="$1" pm cmd pkgs gid group u
+ local container="$1" pm cmd pkgs gid group u lookup failed=""
  [ -n "$1" ] && shift
  pm=$(docker exec "$container" sh -c 'for pm in apk apt-get dnf yum; do if command -v "$pm" >/dev/null 2>&1; then echo "$pm"; break; fi; done' 2>/dev/null)
  case "$pm" in
@@ -568,16 +568,32 @@ private.odocker.container.prereqs.install()     # <container> # install the Dock
    create.result 1 "installed $pkgs in $container, but $RESULT"; error.log "$RESULT"
    return $(result)
  fi
- group=$(docker exec "$container" sh -c "getent group $gid 2>/dev/null || grep '^[^:]*:[^:]*:$gid:' /etc/group" 2>/dev/null | cut -d: -f1)
+ # The group of the socket's number, asked in the container — before and,
+ # after a create, again: a group of that name with another number (an image
+ # committed on another host) makes both creates fail, and its members still
+ # get "permission denied" (T-ODOCKER-INSTALL-RAW-VERIFIED).
+ lookup="getent group $gid 2>/dev/null || grep '^[^:]*:[^:]*:$gid:' /etc/group"
+ group=$(docker exec "$container" sh -c "$lookup" 2>/dev/null | cut -d: -f1)
  if [ -z "$group" ]; then
    group="docker"
    [ -n "$(docker exec "$container" sh -c "getent group docker 2>/dev/null || grep '^docker:' /etc/group" 2>/dev/null)" ] && group="dockerhost"
    console.log "odocker: the docker socket in $container belongs to group number $gid — creating group $group for it"
-   docker exec "$container" sh -c "groupadd -g $gid $group 2>/dev/null || addgroup -g $gid $group"
+   docker exec "$container" sh -c "groupadd -g $gid $group 2>/dev/null || addgroup -g $gid $group" >/dev/null 2>&1
+   if [ "$(docker exec "$container" sh -c "$lookup" 2>/dev/null | cut -d: -f1)" != "$group" ]; then
+     create.result 1 "installed $pkgs in $container, but group number $gid of its docker socket is not $group — is there a $group with another number? Nobody was added"
+     error.log "$RESULT"; return $(result)
+   fi
  fi
+ # A member is left alone: BusyBox addgroup fails for one, so a second
+ # install would report it.
  for u in $(docker exec "$container" awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd 2>/dev/null); do
-   docker exec "$container" sh -c "usermod -aG $group $u 2>/dev/null || addgroup $u $group 2>/dev/null"
+   case " $(docker exec "$container" id -nG "$u" 2>/dev/null) " in *" $group "*) continue ;; esac
+   docker exec "$container" sh -c "usermod -aG $group $u 2>/dev/null || addgroup $u $group 2>/dev/null" || failed="$failed $u"
  done
+ if [ -n "$failed" ]; then
+   create.result 1 "installed $pkgs in $container; could not add to group $group:$failed"; error.log "$RESULT"
+   return $(result)
+ fi
  create.result 0 "installed $pkgs in $container; group $group owns its docker socket"
  return $(result)
 }
@@ -1718,7 +1734,9 @@ odocker.install() # <container> # install Docker CLI inside a running container
   private.this.script.load ossh ossh.remote.prelude.get
   prelude=$(ossh.remote.prelude.get)
   ooshDir=$(docker exec "$container" bash -c "$prelude"' echo "${OOSH_DIR:-$HOME/oosh}"' 2>/dev/null)
-  if [ -n "$ooshDir" ] && docker exec "$container" test -f "$ooshDir/odocker" 2>/dev/null; then
+  # An older oosh there has odocker but not prereqs.install: the raw path
+  # (T-ODOCKER-INSTALL-OOSH-OLD) — the container is asked for the method's line.
+  if [ -n "$ooshDir" ] && docker exec "$container" grep -q '^odocker\.prereqs\.install()' "$ooshDir/odocker" 2>/dev/null; then
     console.log "Installing what odocker needs in $container: odocker prereqs.install there"
     docker exec "$container" bash -c "$prelude $ooshDir/odocker prereqs.install"
     rc=$?

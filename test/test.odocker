@@ -1861,15 +1861,19 @@ expect 0 "a failing update keeps the repository, rc 1; a failed write removes on
 
 # Stand-in for docker in odocker.install: a running container with the socket
 # mounted. $FX/log records every call. HASOOSH=yes: oosh is in the container
-# (/root/oosh/odocker); PM: its package manager; SOCKGRP: the /etc/group line of
-# the socket's number 4242, if any; DOCKERGRP=yes: a group docker (another number).
+# (/root/oosh/odocker), OLDOOSH=yes: an older one without prereqs.install; PM: its
+# package manager; SOCKGID: the socket's number (4242); SOCKGRP: the /etc/group
+# line of that number, if any — else the group a groupadd made in this run
+# (<fx>/ctgroup); STALEGRP: a group that exists with another number, so its
+# groupadd changes nothing; DOCKERGRP=yes: a group docker (another number);
+# JOINFAIL=yes: every usermod fails.
 # The container's files live under $CT (default <fx>/ct): test -e, cat, mkdir -p,
 # rm -f and `sh -c cat > <file>` work there; dpkg answers $CTARCH (arm64, not
 # this host's). curl is a recording stand-in on a fixture PATH (CURL_RC, CURL_OUT);
 # temporary files go to <fx>/tmp.
 test.odocker.installRun() { # <fx> <env assignments…>
   local fx="$1"; shift
-  mkdir -p "$fx/bin" "$fx/tmp" "$fx/ct"
+  mkdir -p "$fx/bin" "$fx/tmp" "$fx/ct"; rm -f "$fx/ctgroup"
   printf '%s\n' '#!/bin/sh' 'echo "curl $*" >> "$FX/curl.log"' '[ "${CURL_RC:-0}" = 0 ] || exit "$CURL_RC"' 'printf "%s" "${CURL_OUT-KEY}"' > "$fx/bin/curl"; chmod +x "$fx/bin/curl"
   env PATH="$fx/bin:$PATH" TMPDIR="$fx/tmp" FX="$fx" CT="$fx/ct" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
     source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
@@ -1880,7 +1884,7 @@ test.odocker.installRun() { # <fx> <env assignments…>
         exec) shift; [ "$1" = -i ] && shift; shift
           case "$*" in
             *"echo \"\${OOSH_DIR"*) [ "$HASOOSH" = yes ] && echo /root/oosh ;;
-            "test -f /root/oosh/odocker") [ "$HASOOSH" = yes ] ;;
+            "grep -q "*"prereqs"*" /root/oosh/odocker") [ "$HASOOSH" = yes ] && [ "$OLDOOSH" != yes ] ;;
             "test -e "*) [ -e "$CT$3" ] ;;
             "cat /etc/os-release") cat "$CT/etc/os-release" ;;
             "dpkg --print-architecture") echo "${CTARCH:-arm64}" ;;
@@ -1892,12 +1896,15 @@ test.odocker.installRun() { # <fx> <env assignments…>
             *"command -v"*) echo "$PM" ;;
             # portability-exception: matches the command text odocker sends into a Linux container, runs no stat
             "stat -c %g /var/run/docker.sock") echo "${SOCKGID:-4242}" ;;
-            *"getent group ${SOCKGID:-4242} "*) [ -n "$SOCKGRP" ] && echo "$SOCKGRP" ;;
+            *"getent group ${SOCKGID:-4242} "*) if [ -n "$SOCKGRP" ]; then echo "$SOCKGRP"; else cat "$FX/ctgroup" 2>/dev/null; fi ;;
             *"getent group docker"*) [ "$DOCKERGRP" = yes ] && echo "docker:x:999:" ;;
+            # a group that exists already (STALEGRP, another number) is not created
+            *"groupadd -g "*) set -- $*; [ "$6" != "$STALEGRP" ] && echo "$6:x:$5:" > "$FX/ctgroup" ;;
+            *"usermod -aG "*) [ "$JOINFAIL" != yes ] ;;
             awk*) echo tester ;;
           esac ;;
       esac
-      # the answer of the arm that ran (test -e, test -f), else 0
+      # the answer of the arm that ran (test -e, grep -q, usermod), else 0
       return; }
     odocker.install somecontainer >/dev/null 2>&1; echo "rc=$?"' </dev/null 2>/dev/null | tail -1
 }
@@ -2033,6 +2040,53 @@ test.odocker.socketGroupRoot() {
 test.case $level "T-ODOCKER-SOCKET-GROUP-ROOT: a docker socket of root's group (number 0) is refused — nobody joins group root" test.odocker.socketGroupRoot
 expect 0 "a socket of root's group is refused: no group answered, nobody added, here or in a container" \
   "a socket owned by root:root made odocker add users to group root"
+
+# T-ODOCKER-INSTALL-RAW-VERIFIED: the raw install checks that the socket's number has its group, and reports a join that fails
+# Both creates and every join discarded their rc, and the raw path ended
+# "group … owns its docker socket" with rc 0. A container where dockerhost
+# exists with another number (recreated from a committed image on another
+# host): both creates fail, the users join the stale group, rc 0 — and
+# "permission denied" (review, 2026-10-06).
+test.odocker.installRawVerified() {
+  local fx bad="" out; fx=$(test.suite.fixture.make odockerinstallverified)
+  : > "$fx/log"
+  out=$(test.odocker.installRun "$fx" PM=apk DOCKERGRP=yes STALEGRP=dockerhost)
+  [ "$out" = "rc=1" ] || bad="$bad stale-rc=[$out]"
+  grep -q 'usermod' "$fx/log" && bad="$bad stale-joined=[$(grep usermod "$fx/log" | tr '\n' '|')]"
+  # a fresh dockerhost: read back, joined, rc 0
+  : > "$fx/log"
+  out=$(test.odocker.installRun "$fx" PM=apk DOCKERGRP=yes)
+  [ "$out" = "rc=0" ] || bad="$bad fresh-rc=[$out]"
+  grep -q 'usermod -aG dockerhost tester' "$fx/log" || bad="$bad fresh-not-joined"
+  # a join that fails is reported
+  : > "$fx/log"
+  out=$(test.odocker.installRun "$fx" PM=apk SOCKGRP="sockgrp:x:4242:" JOINFAIL=yes)
+  [ "$out" = "rc=1" ] || bad="$bad join-fail-rc=[$out]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a stale group is a loud failure, a fresh one is read back; a failed join is reported" || create.result 1 "install raw verified:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-INSTALL-RAW-VERIFIED: the raw install checks the group of the socket's number and reports a failed join" test.odocker.installRawVerified
+expect 0 "a stale group is a loud failure, a fresh one is read back; a failed join is reported" \
+  "users joined a stale dockerhost of another number, rc 0, and docker said permission denied"
+
+# T-ODOCKER-INSTALL-OOSH-OLD: an older oosh in the container without odocker prereqs.install takes the raw path
+# The oosh path was chosen when the container had $ooshDir/odocker; an older
+# checkout has the file but not the method, so the call failed and nothing fell
+# back (review, 2026-10-06). The container is asked for the method's line.
+test.odocker.installOoshOld() {
+  local fx bad="" out; fx=$(test.suite.fixture.make odockerinstallold); : > "$fx/log"
+  out=$(test.odocker.installRun "$fx" HASOOSH=yes OLDOOSH=yes PM=apk)
+  [ "$out" = "rc=0" ] || bad="$bad rc=[$out]"
+  grep -q 'odocker prereqs.install' "$fx/log" && bad="$bad oosh-path"
+  grep -q 'sh -c apk add --no-cache docker-cli' "$fx/log" || bad="$bad no-raw-install=[$(grep exec "$fx/log" | head -3 | tr '\n' '|')]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an oosh without odocker prereqs.install gets the raw install" || create.result 1 "install old oosh:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-INSTALL-OOSH-OLD: an older oosh in the container without odocker prereqs.install takes the raw path" test.odocker.installOoshOld
+expect 0 "an oosh without odocker prereqs.install gets the raw install" \
+  "a container with an older oosh ran a method it did not have, and nothing fell back"
 
 # T-ODOCKER-PREREQS-INSTALL: odocker prereqs.install installs here and joins the socket's group — once; nothing in a test run
 test.odocker.prereqsInstall() {
