@@ -122,7 +122,8 @@ debug.setTrap  # Enable all traps
 ### debug.removeTrap()
 
 Switches stepping off (`STEP_DEBUG=OFF`); the traps stay armed. This is what the `r` step
-command (continue till the next return) does before it goes on.
+command (continue till the next return) does before it goes on. It sets no `RESULT`: it runs
+inside the DEBUG trap handler, and `RESULT` belongs to the program being debugged.
 
 ```bash
 debug.removeTrap
