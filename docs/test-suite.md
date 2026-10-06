@@ -15,7 +15,7 @@ The oosh/once.sh project uses a comprehensive Bash-based test suite to ensure re
 - **Result Tracking:** Results are summarized for each test and the overall suite.
 
 ## Running Tests
-- **Single Test:** `test.suite run <command>` (e.g., `test.suite run mycmd`)
+- **Single Test:** `test.suite run <command>` (e.g., `test.suite run mycmd`). `./test.suite run <path/to/test.file> <level>` runs a test file from any folder: an argument containing `/` is the file itself, a bare name is `test/test.<name>`.
 - **All Tests:** `test.suite all`
 - **Output:** Test results are summarized, showing the number of successful and expected cases, and reporting any failures.
 
