@@ -263,10 +263,15 @@ the socket's group. It takes one of two paths:
   - `private.odocker.socket.group.ensure`: the socket's group, else `docker`,
     else `dockerhost`. An existing group is never renumbered.
 
-  Every user with uid 1000 and up joins that group (T-ODOCKER-INSTALL-OOSH).
+  Every user with uid 1000 and up joins that group (T-ODOCKER-INSTALL-OOSH;
+  the accounts come from `private.odocker.passwd.users.get`).
   `odocker prereqs.install <?user>` is a command of its own too: typed in a
   container, it installs what odocker needs there and joins the socket's group.
-  It does nothing under `OOSH_NO_INSTALL` (T-ODOCKER-PREREQS-INSTALL).
+  It does nothing under `OOSH_NO_INSTALL` (T-ODOCKER-PREREQS-INSTALL). **Every
+  account only in a container:** on a bare computer the socket's group is the
+  local `docker` group, which is as good as root, so as root without `<user>`
+  only the person who ran `sudo` (`$SUDO_USER`, not root) joins it — else nobody,
+  and RESULT says to name the user (T-ODOCKER-PREREQS-INSTALL-WHO).
 - **A container without oosh** (a naked ubuntu, debian or almalinux image)
   takes the raw path, `private.odocker.container.prereqs.install`:
   - **Packages:** the names come from the same table, asked on the host with
@@ -368,7 +373,7 @@ docker program there (T-ODOCKER-CONTAINER-NAME-NEW, -UNNAMED-GETS-NAME,
 -START-NAME-REFRESH).
 | `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
 | `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount): `odocker prereqs.install` there when it has oosh |
-| `prereqs.install <?user>` | user (optional) | Install what odocker needs on this computer and join the docker socket's group: `<user>`, else every user as root, else this user; nothing under `OOSH_NO_INSTALL` |
+| `prereqs.install <?user>` | user (optional) | Install what odocker needs on this computer and join the docker socket's group: `<user>`, else as root every user in a container and the one who ran `sudo` on a computer, else this user; nothing under `OOSH_NO_INSTALL` |
 | `stop <container>` | container name | Stop a running container |
 | `container.remove <container>` | container name | Remove a stopped container (old name: `rm`, still works) |
 | `log <container>` | container name, optional line count (default: 50) | Show container logs |
