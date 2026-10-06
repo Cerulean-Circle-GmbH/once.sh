@@ -283,6 +283,7 @@ Their gates, checked for **every** folder (and `main/`) **before any folder is t
 - **unpushed** — `<folder> is N commit(s) ahead of its upstream — push it first`;
 - **detached** — `<folder> is detached — check a branch out first`;
 - `worktree.restore` only: **unpushed commits on a `main/` local branch** it would reset — `main/ has N unpushed commit(s) on its local <branch> branch, which restore would reset — push it or delete it in <base>/main first`.
+- `worktree.restore` only: **refs the clone owns** (`private.ogit.clone.gate`) — restore deletes the clone, and every ref in it goes too: a **stash** (`<folder> holds a stash (…) that restore would delete — pop or drop it…`), **another local branch** that its cached `origin/<branch>` lacks or is behind (`<folder> has N unpushed commit(s) on its local branch <b> — push it … or delete it first`), a **tag** that `main/` does not have. A linked worktree shares its refs with `main/`, so `worktree.remove` does not need this gate.
 
 **Ignored files are carried.** A folder's gitignored files (on a dev host e.g. `sessions/`) are copied before the folder is removed and copied into the new folder once it is finished. The copy is a **backup that is kept**: `$HOME/.oosh.backups/<UTC-stamp>-ogit-<folder>` — under `sudo` that is root's `$HOME`. Nothing deletes it; remove it yourself once you are satisfied.
 
