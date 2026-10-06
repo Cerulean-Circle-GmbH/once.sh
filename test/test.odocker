@@ -1188,6 +1188,26 @@ test.case $level "T-ODOCKER-PREREQ-START: only a started odocker method that run
 expect 0 "a started docker method installs; workspace, usage and a sourced odocker do not" \
   "Tab completion and the tests source odocker — they must never install"
 
+# Stand-ins for the programs the socket methods call, in <fx>/bin, for a shell
+# that has sourced only this and odocker — as a started odocker has. They work
+# on <fx>/group (name:x:gid: lines), <fx>/dbgroups (the user's groups in the
+# database) and <fx>/procgroups (the groups of this process), and record every
+# call in <fx>/log. stat answers $SGID for <fx>/docker.sock; sudo runs only
+# programs of the fixture, never a real groupadd or chgrp; docker answers no.
+test.odocker.socketStubs() { # <fx>
+  local fx="$1" realStat realId; realStat=$(command -v stat); realId=$(command -v id)
+  mkdir -p "$fx/bin"; : > "$fx/docker.sock"; : > "$fx/group"; : > "$fx/log"; : > "$fx/dbgroups"; : > "$fx/procgroups"
+  printf '%s\n' '#!/bin/sh' 'awk -F: -v k="$2" '"'"'$1 == k || $3 == k { print; f = 1 } END { exit !f }'"'"' "$FX/group"' > "$fx/bin/getent"
+  printf '%s\n' '#!/bin/sh' 'echo "${0##*/} $*" >> "$FX/log"' 'for a; do n="$a"; done' 'echo "$n:x:$2:" >> "$FX/group"' > "$fx/bin/groupadd"
+  cp "$fx/bin/groupadd" "$fx/bin/addgroup"
+  printf '%s\n' '#!/bin/sh' 'echo "sudo $*" >> "$FX/log"' 'case "$1" in "$FX"/*) exec "$@" ;; esac' > "$fx/bin/sudo"
+  printf '%s\n' '#!/bin/sh' 'echo "chgrp $*" >> "$FX/log"' > "$fx/bin/chgrp"
+  printf '%s\n' '#!/bin/sh' 'case "$*" in *"$FX/docker.sock") echo "${SGID:-124}"; exit 0 ;; esac' "exec $realStat \"\$@\"" > "$fx/bin/stat"
+  printf '%s\n' '#!/bin/sh' 'case "$*" in' '  -u) echo "${TUID:-1000}" ;;' '  -un) echo tester ;;' '  -nG) cat "$FX/procgroups" ;;' '  "-nG "*) cat "$FX/dbgroups" ;;' "  *) exec $realId \"\$@\" ;;" 'esac' > "$fx/bin/id"
+  printf '%s\n' '#!/bin/sh' 'echo "docker $*" >> "$FX/log"' 'exit 1' > "$fx/bin/docker"
+  chmod +x "$fx/bin/"*
+}
+
 # T-ODOCKER-SOCKET-ACCESS: a user who cannot reach the mounted socket joins a group with its GID
 # In a platform container the host's /var/run/docker.sock is mounted with the
 # HOST's group number: bash-user got `permission denied` right after the
@@ -1197,16 +1217,13 @@ expect 0 "a started docker method installs; workspace, usage and a sourced odock
 # so RESULT asks for an `sg` re-run (sg:<group>) — with rc 0: a non-zero rc
 # made oosh's error trap print "EXIT 2 Misuse of shell builtins" on every call.
 test.odocker.socketAccess() {
-  local fx bad="" out; fx=$(test.suite.fixture.make odockersocket); mkdir -p "$fx/bin"; : > "$fx/docker.sock"; : > "$fx/log"
-  printf '%s\n' '#!/bin/sh' 'echo "groupadd $*" >> "$LOGF"' > "$fx/bin/groupadd"; chmod +x "$fx/bin/groupadd"
-  out=$(env SUDO="" LOGF="$fx/log" FX="$fx" OOSH_DIR="$OOSH_DIR" bash -c '
+  local fx bad="" out; fx=$(test.suite.fixture.make odockersocket); test.odocker.socketStubs "$fx"
+  # A started odocker has sourced only this and odocker: no os.check.env, no
+  # OS_CMD_GROUP_ADD (2026-10-06). user.group.add is the next script's job.
+  out=$(env -u OS_CMD_GROUP_ADD SUDO="sudo " SGID=4242 FX="$fx" PATH="$fx/bin:$PATH" OOSH_DIR="$OOSH_DIR" bash -c '
+    OSTYPE=linux-gnu
     source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
-    docker() { return 1; }
-    stat() { echo 4242; }
-    getent() { return 2; }
-    id() { case "$1" in -u) echo 1000 ;; -nG) cat "$FX/groups" 2>/dev/null ;; *) builtin command id "$@" ;; esac; }
-    os.check.env() { :; }; export OS_CMD_GROUP_ADD="$FX/bin/groupadd"
-    user.group.add() { echo "join $*" >> "$LOGF"; echo "$1" > "$FX/groups"; }
+    user.group.add() { echo "join $*" >> "$FX/log"; echo "$1" >> "$FX/dbgroups"; }
     private.odocker.socket.access.ensure "$FX/docker.sock" >/dev/null 2>&1; echo "rc=$? group=$RESULT"' 2>/dev/null | tail -1)
   [ "$out" = "rc=0 group=sg:docker" ] || bad="$bad result=[$out]"
   grep -qx 'groupadd -g 4242 docker' "$fx/log" || bad="$bad no-group-created=[$(tr '\n' '|' < "$fx/log")]"
@@ -1547,26 +1564,34 @@ expect 0 "ODOCKER_SOCKET, else /var/run/docker.sock" "the prerequisite tests dep
 # which adds every user to it (Alpine has no sg to apply a new membership at
 # once, 2026-10-06).
 test.odocker.socketGroupEnsure() {
-  local fx bad="" got; fx=$(test.suite.fixture.make odockersocketgroup); : > "$fx/docker.sock"
-  test.odocker.socketGroupEnsure.run() { # <getent answer for 124|-> <docker group exists: yes|no>
+  local fx bad="" got; fx=$(test.suite.fixture.make odockersocketgroup); test.odocker.socketStubs "$fx"
+  test.odocker.socketGroupEnsure.run() { # prints the rc, RESULT and the group programs called (not sudo)
     : > "$fx/log"
-    FX="$fx" GA="$1" DG="$2" bash -c '
+    # A started odocker has sourced only this and odocker: no os.check.env, no
+    # OS_CMD_GROUP_ADD — a normal user, so SUDO is sudo.
+    env -u OS_CMD_GROUP_ADD SUDO="sudo " SGID=124 FX="$fx" PATH="$fx/bin:$PATH" OOSH_DIR="$OOSH_DIR" bash -c '
+      OSTYPE=linux-gnu
       source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
-      stat() { echo 124; }
-      getent() { case "$2" in 124) [ "$GA" = "-" ] && return 2; echo "$GA:x:124:" ;; docker) [ "$DG" = yes ] || return 2; echo "docker:x:999:" ;; esac; }
-      os.check.env() { :; }; export OS_CMD_GROUP_ADD="groupadd" SUDO=""
-      groupadd() { echo "groupadd $*" >> "$FX/log"; }
-      private.odocker.socket.group.ensure "$FX/docker.sock" >/dev/null 2>&1; echo "rc=$? group=$RESULT"' 2>/dev/null
+      private.odocker.socket.group.ensure "$FX/docker.sock" >/dev/null 2>&1; echo "rc=$? group=$RESULT"' 2>/dev/null | tail -1
+    grep -E '^(groupadd|addgroup) ' "$fx/log" | tr '\n' '|'
   }
-  got=$(test.odocker.socketGroupEnsure.run docker no);  [ "$got" = "rc=0 group=docker" ] && [ ! -s "$fx/log" ] || bad="$bad existing=[$got|$(cat "$fx/log")]"
-  got=$(test.odocker.socketGroupEnsure.run - no);       [ "$got" = "rc=0 group=docker" ] && grep -qx 'groupadd -g 124 docker' "$fx/log" || bad="$bad created=[$got|$(cat "$fx/log")]"
-  got=$(test.odocker.socketGroupEnsure.run - yes);      [ "$got" = "rc=0 group=dockerhost" ] && grep -qx 'groupadd -g 124 dockerhost' "$fx/log" || bad="$bad dockerhost=[$got|$(cat "$fx/log")]"
+  echo "sockgrp:x:124:" > "$fx/group"
+  got=$(test.odocker.socketGroupEnsure.run); [ "$got" = "rc=0 group=sockgrp" ] || bad="$bad existing=[$got]"
+  : > "$fx/group"
+  got=$(test.odocker.socketGroupEnsure.run); [ "$got" = "rc=0 group=docker
+groupadd -g 124 docker|" ] || bad="$bad created=[$got]"
+  # A second run finds the group it made: nothing is created again.
+  got=$(test.odocker.socketGroupEnsure.run); [ "$got" = "rc=0 group=docker" ] || bad="$bad second-run=[$got]"
+  echo "docker:x:999:" > "$fx/group"
+  got=$(test.odocker.socketGroupEnsure.run); [ "$got" = "rc=0 group=dockerhost
+groupadd -g 124 dockerhost|" ] || bad="$bad dockerhost=[$got]"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "the socket's group found, else docker or dockerhost created with its number" || create.result 1 "socket group:$bad"
+  [ -z "$bad" ] && create.result 0 "the socket's group found, else docker or dockerhost created with its number, once" || create.result 1 "socket group:$bad"
   return $(result)
 }
 test.case $level "T-ODOCKER-SOCKET-GROUP-ENSURE: the group of the docker socket's number — found, or created" test.odocker.socketGroupEnsure
-expect 0 "the socket's group found, else docker or dockerhost created with its number" "the install could not reach the socket's group"
+expect 0 "the socket's group found, else docker or dockerhost created with its number, once" \
+  "a started odocker ran sudo -g <gid> docker — os.check.env and OS_CMD_GROUP_ADD live in os and user"
 
 # T-ODOCKER-NO-SG-NEXT-LOGIN: without sg, a new membership is announced for the next login
 # Alpine (BusyBox) has no sg, and no package provides one: `odocker list` ended

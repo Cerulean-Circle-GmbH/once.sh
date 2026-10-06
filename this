@@ -127,32 +127,43 @@ private.ensure.groupWrite() { # <file...> # ensure files are group-writable (mul
   done
 }
 
-private.this.group.create() { # <groupName> # cross-platform create a system group if it doesn't exist. Idempotent — succeeds silently when the group is already there. Tries groupadd (RHEL/Debian/most Linux), falls back to addgroup (Alpine/busybox-based images), then to a /etc/group append if neither command is available.
+private.this.group.create() { # <groupName> <?gid> # cross-platform create a system group if it does not exist, with number <gid> when given. Idempotent — succeeds silently when the group is already there. Through $SUDO (empty for root). Tries groupadd (RHEL/Debian/most Linux), addgroup (Alpine/busybox-based images), dseditgroup (macOS), then a /etc/group append if none is available.
   # Sibling to private.this.group.exists. Used by install state machine
   # (state 31 step 1) to ensure the `dev` group exists before any
-  # user.group.add invocation. On Alma minimal `groupadd` is present;
-  # on Alpine 3.x only `addgroup` (busybox) is — neither image ships both.
-  if private.this.group.exists "$1"; then
+  # user.group.add invocation, and by odocker for the group of the docker
+  # socket's number (T-THIS-GROUP-CREATE-GID). On Alma minimal `groupadd` is
+  # present; on Alpine 3.x only `addgroup` (busybox) is — neither image ships
+  # both; macOS has dseditgroup.
+  local name="$1" gid="$2" cmd cmdPath
+  if private.this.group.exists "$name"; then
     return 0
   fi
-  if command -v groupadd >/dev/null 2>&1; then
-    groupadd -f "$1" 2>/dev/null && return 0
+  if [ -n "$gid" ] && ! this.isNumber "$gid"; then
+    error.log "private.this.group.create: group number '$gid' is not a number"
+    return 1
   fi
-  if command -v addgroup >/dev/null 2>&1; then
-    addgroup "$1" 2>/dev/null && return 0
-  fi
-  warn.log "private.this.group.create: neither groupadd nor addgroup found — trying /etc/group append"
-  # Last-resort fallback: derive next free GID >=500, append the line.
+  for cmd in groupadd addgroup dseditgroup; do
+    # path-exception: a lookup for this one command, PATH itself stays — Debian
+    # puts groupadd in /usr/sbin, which is not on a normal user's PATH.
+    cmdPath=$(PATH="$PATH:/usr/sbin:/sbin" command -v "$cmd" 2>/dev/null) || continue
+    # The one platform difference: how each program spells the number.
+    case "$cmd" in
+      dseditgroup) $SUDO "$cmdPath" -o create ${gid:+-i "$gid"} "$name" >/dev/null 2>&1 && return 0 ;;
+      *)           $SUDO "$cmdPath" ${gid:+-g "$gid"} "$name" >/dev/null 2>&1 && return 0 ;;
+    esac
+  done
+  warn.log "private.this.group.create: neither groupadd, addgroup nor dseditgroup worked — trying /etc/group append"
+  # Last-resort fallback: <gid>, else the next free GID >=500, append the line.
   # Sufficient for OOSH's needs (just owning the group); login-shell
   # group resolution will pick it up.
   if [ -w /etc/group ] || [ "$(id -u 2>/dev/null)" = "0" ]; then
-    local nextGid=500
-    while grep -qE "^[^:]*:[^:]*:${nextGid}:" /etc/group 2>/dev/null; do
+    local nextGid="${gid:-500}"
+    while [ -z "$gid" ] && grep -qE "^[^:]*:[^:]*:${nextGid}:" /etc/group 2>/dev/null; do
       nextGid=$((nextGid + 1))
     done
-    echo "$1:x:${nextGid}:" >> /etc/group 2>/dev/null && return 0
+    echo "$name:x:${nextGid}:" >> /etc/group 2>/dev/null && return 0
   fi
-  error.log "private.this.group.create: cannot create group '$1' — no groupadd, no addgroup, can't write /etc/group"
+  error.log "private.this.group.create: cannot create group '$name' — no groupadd, addgroup or dseditgroup, cannot write /etc/group"
   return 1
 }
 
@@ -1180,6 +1191,27 @@ private.this.folder.share()     # <dir> # share <dir> with group dev: private.en
  fi
  create.result 0 "$dir shared with group dev (g+w, setgid)"
  return $(result)
+}
+
+
+private.this.group.name.get()     # <gid> # echo the name of the group with number <gid>: getent where present, else /etc/group, dscl on macOS; nothing when there is none #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # Sibling of private.this.group.exists, by number instead of name: the docker
+ # socket of a container carries the HOST's group number, and odocker asked a
+ # bare getent for it — macOS has none, a minimal image may have none
+ # (2026-10-06, T-THIS-GROUP-NAME-GET).
+ this.isNumber "$1" || return 1
+ case "$OSTYPE" in
+   darwin*)
+     dscl . -search /Groups PrimaryGroupID "$1" 2>/dev/null | awk 'NR == 1 { print $1 }' ;;
+   *)
+     if command -v getent >/dev/null 2>&1; then
+       getent group "$1" 2>/dev/null | cut -d: -f1
+     else
+       awk -F: -v gid="$1" '$3 == gid { print $1; exit }' /etc/group 2>/dev/null
+     fi ;;
+ esac
 }
 
 

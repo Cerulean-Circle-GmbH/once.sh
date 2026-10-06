@@ -995,6 +995,76 @@ test.this.startNoRm() {
 test.case $level "T-THIS-START-NO-RM: starting this never deletes ~/oosh/init" test.this.startNoRm
 expect 0 "no rm -r of ~/oosh/init, SHELL is BASH_FILE" "a start must not delete anything"
 
+
+# Stand-ins for the programs that read and create groups, in <fx>/bin. They
+# work on <fx>/group (name:x:gid: lines) and record every call in <fx>/log;
+# sudo runs only programs of the fixture — never a real groupadd.
+test.this.groupStubs() { # <fx>
+  local fx="$1"; mkdir -p "$fx/bin"; : > "$fx/group"; : > "$fx/log"
+  printf '%s\n' '#!/bin/sh' 'awk -F: -v k="$2" '"'"'$1 == k || $3 == k { print; f = 1 } END { exit !f }'"'"' "$FX/group"' > "$fx/bin/getent"
+  printf '%s\n' '#!/bin/sh' 'echo "${0##*/} $*" >> "$FX/log"' 'for a; do n="$a"; done' 'echo "$n:x:$2:" >> "$FX/group"' > "$fx/bin/groupadd"
+  cp "$fx/bin/groupadd" "$fx/bin/addgroup"; cp "$fx/bin/groupadd" "$fx/bin/dseditgroup"
+  printf '%s\n' '#!/bin/sh' 'echo "sudo $*" >> "$FX/log"' 'case "$1" in "$FX"/*) exec "$@" ;; esac' > "$fx/bin/sudo"
+  printf '%s\n' '#!/bin/sh' '[ "$5" = 4242 ] && printf "sockgrp\t\tPrimaryGroupID = (\n    4242\n)\n"' > "$fx/bin/dscl"
+  chmod +x "$fx/bin/"*
+}
+
+# T-THIS-GROUP-NAME-GET: the name of the group with a number — getent, else /etc/group, dscl on macOS
+# odocker needs the group that owns the docker socket's number; it asked a
+# bare getent, which macOS lacks and a minimal image may lack (2026-10-06).
+test.this.groupNameGet() {
+  local fx bad="" got want="" n x g; fx=$(test.suite.fixture.make thisgroupname); test.this.groupStubs "$fx"
+  echo "sockgrp:x:4242:" > "$fx/group"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=linux-gnu; private.this.group.name.get 4242); [ "$got" = sockgrp ] || bad="$bad getent=[$got]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=linux-gnu; private.this.group.name.get 4343); [ -z "$got" ] || bad="$bad getent-none=[$got]"
+  # No getent: /etc/group itself, read only.
+  while IFS=: read -r n x g x; do [ "$g" = 0 ] && { want="$n"; break; }; done < /etc/group
+  got=$(OSTYPE=linux-gnu; command() { [ "$1 $2" = "-v getent" ] && return 1; builtin command "$@"; }; private.this.group.name.get 0)
+  [ -n "$want" ] && [ "$got" = "$want" ] || bad="$bad etc-group=[$got/$want]"
+  got=$(OSTYPE=linux-gnu; command() { [ "$1 $2" = "-v getent" ] && return 1; builtin command "$@"; }; private.this.group.name.get 987654); [ -z "$got" ] || bad="$bad etc-group-none=[$got]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=darwin23; private.this.group.name.get 4242); [ "$got" = sockgrp ] || bad="$bad dscl=[$got]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=darwin23; private.this.group.name.get 4343); [ -z "$got" ] || bad="$bad dscl-none=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the group of a number by getent, /etc/group or dscl; nothing when there is none" || create.result 1 "group name:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-GROUP-NAME-GET: the name of the group with a number — getent, else /etc/group, dscl on macOS" test.this.groupNameGet
+expect 0 "the group of a number by getent, /etc/group or dscl; nothing when there is none" \
+  "odocker asked a bare getent for the socket's group — macOS has none"
+
+# T-THIS-GROUP-CREATE-GID: a group is created with a given number — groupadd, addgroup or dseditgroup, through $SUDO, once
+# The socket of a container carries the HOST's group number; odocker created
+# its group with $OS_CMD_GROUP_ADD, which only `user` sets — a started odocker
+# ran `sudo -g <gid> docker` (2026-10-06).
+test.this.groupCreateGid() {
+  local fx bad="" got; fx=$(test.suite.fixture.make thisgroupcreate); test.this.groupStubs "$fx"
+  test.this.groupCreateGid.run() { # <programs hidden> <groupName> <?gid>
+    : > "$fx/group"; : > "$fx/log"
+    FX="$fx" HIDE="$1" PATH="$fx/bin:$PATH" SUDO="sudo " bash -c '
+      OSTYPE=linux-gnu
+      source "$OOSH_DIR/this" >/dev/null 2>&1
+      command() { if [ "$1" = -v ]; then case " $HIDE " in *" $2 "*) return 1 ;; esac; fi; builtin command "$@"; }
+      private.this.group.create "$0" "$1" >/dev/null 2>&1; echo "rc=$?"
+      private.this.group.create "$0" "$1" >/dev/null 2>&1; echo "rc=$?"' "$2" "$3" 2>/dev/null | tr '\n' ' '
+    grep -v '^sudo ' "$fx/log" | tr '\n' '|'
+  }
+  got=$(test.this.groupCreateGid.run "-" sockgrp 4242)
+  [ "$got" = "rc=0 rc=0 groupadd -g 4242 sockgrp|" ] || bad="$bad groupadd=[$got]"
+  grep -q "^sudo $fx/bin/groupadd -g 4242 sockgrp" "$fx/log" || bad="$bad no-SUDO"
+  got=$(test.this.groupCreateGid.run "groupadd" sockgrp 4242)
+  [ "$got" = "rc=0 rc=0 addgroup -g 4242 sockgrp|" ] || bad="$bad addgroup=[$got]"
+  got=$(test.this.groupCreateGid.run "groupadd addgroup" sockgrp 4242)
+  case "$got" in "rc=0 rc=0 dseditgroup -o create -i 4242 sockgrp|"*) ;; *) bad="$bad dseditgroup=[$got]" ;; esac
+  got=$(test.this.groupCreateGid.run "-" dev)
+  [ "$got" = "rc=0 rc=0 groupadd dev|" ] || bad="$bad no-gid=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "groupadd -g, addgroup -g or dseditgroup -i through SUDO, once" || create.result 1 "group create:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-GROUP-CREATE-GID: a group is created with a given number, through SUDO, once" test.this.groupCreateGid
+expect 0 "groupadd -g, addgroup -g or dseditgroup -i through SUDO, once" \
+  "a started odocker ran sudo -g <gid> docker"
+
 ### test.method
 
 test.suite.save.results
