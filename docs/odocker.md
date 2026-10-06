@@ -114,7 +114,12 @@ odocker workspace.init /path/to/new/DockerWorkspaces           # create, then se
 With no path, `init`, `set` and `seed` use the default: `DockerWorkspaces` beside
 the Once.sh components base (`oo mode.base.get`) — on a shared host
 `/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces`.
-`/var/dev` is history.
+On a layout without a `main/` folder, where `oo mode.base.get` has no answer, the
+default is still `DockerWorkspaces` beside the `Once.sh` folder that holds
+`~/oosh` — one rule, `private.odocker.workspaces.default.get`, for `init`, `seed`
+and the install (T-WS-DEFAULT-NO-MAIN). The install keeps an existing value,
+else runs `odocker workspace.init` and shares the root with group dev; a failing
+`workspace.init` is its answer. `/var/dev` is history.
 
 `workspace.set` **refuses** a directory that is not there; `workspace.init`
 creates it first, which is the difference between the two verbs. `workspace.seed`
