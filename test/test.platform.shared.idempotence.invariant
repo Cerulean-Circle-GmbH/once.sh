@@ -18,11 +18,16 @@
 # fails (network, credentials), is NOT CHECKED: an expect.fail that says so
 # and why — a skip that scores as a pass is how a check silently stops
 # checking (docs/test-suite.md, test.platform.odocker.workspaces.invariant).
+# Every method must end rc 0 on both runs: a non-zero rc is a failure naming
+# the rc and the last line it printed, also when nothing changed.
 #
 # Each method runs in a fresh process with the user's own environment only
-# (env -i HOME USER LOGNAME PATH TERM): the env files load as in a new shell of
-# the user, and nothing of this test run (LOG_LEVEL 1, TEST_SUITE_*) can leak
-# into a `config save`.
+# (env -i HOME USER LOGNAME PATH TERM) plus OOSH_NO_INSTALL=1: the env files
+# load as in a new shell of the user, nothing of this test run (LOG_LEVEL 1,
+# TEST_SUITE_*) can leak into a `config save` — and a TEST installs nothing:
+# no package, no Docker repository, no group, no join, also as root or with
+# passwordless sudo. odocker prereqs.install then answers "nothing installed";
+# checked as far as that means anything: both runs rc 0, nothing changed.
 #
 # Invoke: ./test.suite run platform.shared.idempotence.invariant 1
 # ============================================================================
@@ -123,7 +128,6 @@ else
 fi
 
 private.this.script.load ogit ogit.safeDirectory.list
-private.this.script.load odocker private.odocker.socket.get
 
 userName=$(id -un)
 sharedConfig=$(private.this.path.canonical "$HOME/config")
@@ -156,11 +160,11 @@ test.platform.shared.idempotence.snapshotAll() # <file> # the whole snapshot of 
   } > "$1"
 }
 
-test.platform.shared.idempotence.run() # <outFile> <script> <method...> # the method in a fresh process of this user, stdin closed; its rc
+test.platform.shared.idempotence.run() # <outFile> <script> <method...> # the method in a fresh process of this user, stdin closed, OOSH_NO_INSTALL=1 so it installs nothing; its rc
 {
   local outFile="$1" script="$2"
   shift 2
-  ( cd "$HOME" && env -i HOME="$HOME" USER="$userName" LOGNAME="$userName" PATH="$PATH" TERM="${TERM:-dumb}" \
+  ( cd "$HOME" && env -i HOME="$HOME" USER="$userName" LOGNAME="$userName" PATH="$PATH" TERM="${TERM:-dumb}" OOSH_NO_INSTALL=1 \
       "$HOME/oosh/$script" "$@" ) </dev/null >"$outFile" 2>&1
 }
 
@@ -168,35 +172,16 @@ test.platform.shared.idempotence.run() # <outFile> <script> <method...> # the me
 sudoFree=no
 if [ "$(id -u)" = "0" ] || sudo -n true >/dev/null 2>&1; then sudoFree=yes; fi
 
-# config.init.user ends in `user.group.add dev <user>`, which runs
-# `$SUDO usermod` even for a member: a user who would be asked is not run.
+# config.init.user ends in `user.group.add dev <user>`. Since 446de0a that
+# leaves a member alone and calls no sudo; only a user who is NOT yet in group
+# dev gets `$SUDO usermod` — and is not run when that would ask for a password.
+# The other sudo a normal user reaches in config init.user, oo user.fix and
+# oo update is `sudo -n` (the launcher install, the drop-in removal), which
+# never asks; the all-users steps run only as root.
+private.this.script.load user private.user.group.member.is
 initUserBlock=""
-if [ "$sudoFree" = no ] && private.this.group.exists dev; then
-  initUserBlock="$userName has no passwordless sudo and config.init.user always runs \$SUDO usermod for group dev (user.group.add)"
-fi
-
-# odocker.prereqs.install calls sudo to install docker/column, start an
-# engine, create the socket's group or join it — the same cases as
-# private.odocker.prereqs.ensure and odocker.prereqs.install.
-odockerBlock=""
-if [ "$sudoFree" = no ]; then
-  socket=$(private.odocker.socket.get)
-  command -v column >/dev/null 2>&1 || odockerBlock="column is missing (an install)"
-  if [ -e "$socket" ]; then
-    command -v docker >/dev/null 2>&1 || odockerBlock="the docker client is missing (an install)"
-    socketGid=$(stat -c %g "$socket" 2>/dev/null || stat -f %g "$socket" 2>/dev/null)
-    socketGroup=$(private.this.group.name.get "$socketGid")
-    case " $(id -nG "$userName" 2>/dev/null) " in
-      *" ${socketGroup:-<none>} "*) ;;
-      *) odockerBlock="$userName is not in the group of $socket (a group change)" ;;
-    esac
-  elif private.this.container.is; then
-    command -v docker >/dev/null 2>&1 || odockerBlock="the docker client is missing (an install)"
-  elif private.odocker.engine.supported >/dev/null 2>&1; then
-    { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; } \
-      || odockerBlock="the Docker engine is missing or stopped (an install or a start)"
-  fi
-  [ -n "$odockerBlock" ] && odockerBlock="$userName has no passwordless sudo and odocker would need it: $odockerBlock"
+if [ "$sudoFree" = no ] && private.this.group.exists dev && ! private.user.group.member.is dev "$userName"; then
+  initUserBlock="$userName is not yet in group dev and has no passwordless sudo — config.init.user would run \$SUDO usermod for it (user.group.add)"
 fi
 
 # ----------------------------------------------------------------------------
@@ -208,7 +193,7 @@ methods="config init.user	${initUserBlock:--}	config init.check	config init.user
 oo user.fix	${initUserBlock:--}	config init.check	oo user.fix
 config save	-	config validate.required	config save
 oo update	${initUserBlock:--}	config init.check	oo update
-odocker prereqs.install	${odockerBlock:--}	odocker status	odocker prereqs.install"
+odocker prereqs.install	-	odocker status	odocker prereqs.install"
 
 while IFS='	' read -r label blocked recovery command; do
   [ "$blocked" = "-" ] && blocked=""
@@ -220,8 +205,12 @@ while IFS='	' read -r label blocked recovery command; do
   fi
   # shellcheck disable=SC2086 # <command> is two words: script and method
   test.platform.shared.idempotence.run "$work/$slug.first.out" $command; firstRc=$?
-  if [ "$label" = "oo update" ] && [ "$firstRc" != 0 ]; then
-    expect.fail "NOT CHECKED: \`oo update\` could not pull (rc $firstRc; network or credentials): $(grep . "$work/$slug.first.out" | tail -1) — see: ogit remote.pull"
+  if [ "$firstRc" != 0 ]; then
+    if [ "$label" = "oo update" ]; then
+      expect.fail "NOT CHECKED: \`oo update\` could not pull (rc $firstRc; network or credentials): $(grep . "$work/$slug.first.out" | tail -1) — see: ogit remote.pull"
+    else
+      expect.fail "\`$label\` failed on its first run (rc $firstRc): $(grep . "$work/$slug.first.out" | tail -1) — see: $recovery"
+    fi
     continue
   fi
   test.platform.shared.idempotence.snapshotAll "$work/$slug.before"
@@ -233,13 +222,14 @@ while IFS='	' read -r label blocked recovery command; do
   test.platform.shared.idempotence.snapshotAll "$work/$slug.after"
   lastWords=$(grep . "$work/$slug.second.out" | tail -1)
   if differences=$(test.platform.shared.idempotence.compare "$work/$slug.before" "$work/$slug.after"); then
-    if [ "$secondRc" = 0 ] || [ "$label" = "odocker prereqs.install" ]; then
+    # Every method, odocker prereqs.install too: rc 0 on both runs.
+    if [ "$secondRc" = 0 ]; then
       expect.pass "\`$label\` twice: nothing changed (rc $firstRc then $secondRc)${lastWords:+ — $lastWords}"
     else
-      expect.fail "\`$label\` changed nothing but failed (rc $secondRc): $lastWords — see: $recovery"
+      expect.fail "\`$label\` changed nothing but its second run failed (rc $secondRc): $lastWords — see: $recovery"
     fi
   else
-    expect.fail "\`$label\` is not idempotent — its second run changed:
+    expect.fail "\`$label\` is not idempotent — its second run (rc $secondRc${lastWords:+: $lastWords}) changed:
 $(printf '%s\n' "$differences" | sed 's/^/      /')
     — see: $recovery"
   fi
