@@ -445,7 +445,7 @@ The exclusion list above says what must **never** persist. This says what a conf
 |---|---|---|
 | `BASH_FILE` | `user.env` | `command -v bash` |
 | `CONFIG_FILE` | `user.env` | `config.init` |
-| `OOSH_MODE` | `oosh.session.env` (per user — `private.config.required.file.path`) | `basename` of the canonical `~/oosh` |
+| `OOSH_MODE` | `oosh.session.env` (per user — `private.config.required.file.path.get`) | `basename` of the canonical `~/oosh` |
 | `OOSH_OS` | `oosh.env` | `$OSTYPE`, via `os` |
 | `OOSH_PM` | `oosh.env` | `oo pm.discover` |
 | `LOG_LEVEL` | `log.env` | defaults to `1` |
