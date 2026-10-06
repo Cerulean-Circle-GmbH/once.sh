@@ -382,13 +382,20 @@ private.promote.merge.into.folder()     # <source> <target> # push <source>; in 
  # (alma containers, fresh CI runners).
  if ogit.branch.merge "origin/$source" oosh-promote@local "oosh promote" "$dir" >/dev/null; then
    # Rewrite init/oosh's OOSH_SELF_BRANCH default so /<branch>/init/oosh curl
-   # installs auto-select the matching folder (see init/oosh).
-   private.promote.rewrite.self.branch "$dir"
-   private.promote.merge.finish 0 "Merged $source into $target (in $dir)" "$stashed" "$dir"
+   # installs auto-select the matching folder (see init/oosh). A default that
+   # cannot be set stops the step: the merge is done, the stage is not ready.
+   if private.promote.rewrite.self.branch "$dir"; then
+     private.promote.merge.finish 0 "Merged $source into $target (in $dir)" "$stashed" "$dir"
+   else
+     private.promote.merge.finish 1 "Merged $source into $target (in $dir), but $RESULT — fix it there, then promote again" "$stashed" "$dir"
+   fi
  elif private.promote.try.resolve.self.branch.conflict "$dir" "$source"; then
    important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
-   private.promote.rewrite.self.branch "$dir"
-   private.promote.merge.finish 0 "Merged $source into $target (auto-resolved OOSH_SELF_BRANCH drift, in $dir)" "$stashed" "$dir"
+   if private.promote.rewrite.self.branch "$dir"; then
+     private.promote.merge.finish 0 "Merged $source into $target (auto-resolved OOSH_SELF_BRANCH drift, in $dir)" "$stashed" "$dir"
+   else
+     private.promote.merge.finish 1 "Merged $source into $target (auto-resolved OOSH_SELF_BRANCH drift, in $dir), but $RESULT — fix it there, then promote again" "$stashed" "$dir"
+   fi
  else
    error.log "Merge conflict — aborting"
    ogit.merge.abort "$dir" >/dev/null
@@ -751,7 +758,7 @@ private.check.confirmation.received() # <script> <stageTo> <stateFound> # confir
   return $(result)
 }
 
-private.promote.rewrite.self.branch() # <ooshDir> # rewrite OOSH_SELF_BRANCH defaults in init/oosh and Install oosh.command to the currently-checked-out branch and commit if changed
+private.promote.rewrite.self.branch() # <ooshDir> # rewrite EVERY OOSH_SELF_BRANCH default line in init/oosh and Install oosh.command to the currently-checked-out branch and commit if changed; rc 1 (RESULT names the files) when one keeps another default
 {
   private.this.script.load ogit ogit.branch.get
   local ooshDir="$1"
@@ -761,35 +768,54 @@ private.promote.rewrite.self.branch() # <ooshDir> # rewrite OOSH_SELF_BRANCH def
 
   # replace edits the file the same way on every platform: no sed -i, and the
   # path is an argument, not text for eval (a quote in it cannot break it).
-  private.this.script.load replace replace.line || { error.log "promote: cannot load replace"; return 1; }
-
   # Files that carry an OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-<branch>}"
-  # default line that must match the file's branch of origin.
+  # default line that must match the file's branch of origin. EVERY such line
+  # (the old sed rewrote them all): `replace lines` takes identical duplicates
+  # together, each distinct line once. A file that does not end up with the
+  # branch on every default line is a STOP, not a log line — the stage would
+  # ship with the wrong default (T-PROMOTE-SELF-BRANCH-EVERY-LINE / -STOPS).
   local targets=("init/oosh" "Install oosh.command")
-  local t file current wanted
+  local pattern='^OOSH_SELF_BRANCH="\$\{OOSH_SELF_BRANCH:-[A-Za-z0-9_-]*\}"'
+  local t file current wanted failed=""
   for t in "${targets[@]}"; do
     file="$ooshDir/$t"
     [ -f "$file" ] || continue
-    current=$(grep -m1 -E '^OOSH_SELF_BRANCH="\$\{OOSH_SELF_BRANCH:-[A-Za-z0-9_-]*\}"' "$file")
-    [ -z "$current" ] && continue
-    # what follows the default on the line (a comment, say) stays
-    wanted="OOSH_SELF_BRANCH=\"\${OOSH_SELF_BRANCH:-$branch}\"${current#*\}\"}"
-    [ "$current" = "$wanted" ] && continue
-    replace.line "$file" "$current" by
-    replace.by "$wanted" || { error.log "promote: cannot rewrite OOSH_SELF_BRANCH in $file"; replace.cleanup "$file"; continue; }
-    replace.commit "$file" || { replace.cleanup "$file"; continue; }
-    replace.cleanup "$file"
+    while IFS= read -r current; do
+      # what follows the default on the line (a comment, say) stays
+      wanted="OOSH_SELF_BRANCH=\"\${OOSH_SELF_BRANCH:-$branch}\"${current#*\}\"}"
+      [ "$current" = "$wanted" ] && continue
+      # loaded only when a line needs it; a load that fails leaves the line,
+      # and the check below names the file
+      private.this.script.load replace replace.lines || break
+      if replace.lines "$file" "$current" by && replace.by "$wanted" >/dev/null && replace.commit "$file" >/dev/null; then
+        replace.cleanup "$file"
+      else
+        replace.cleanup "$file"
+        break
+      fi
+    done < <(grep -E "$pattern" "$file" | sort -u)
+    # The check is the file itself: no default line may differ from the wanted one.
+    while IFS= read -r current; do
+      [ "$current" = "OOSH_SELF_BRANCH=\"\${OOSH_SELF_BRANCH:-$branch}\"${current#*\}\"}" ] || { failed="$failed $t"; break; }
+    done < <(grep -E "$pattern" "$file")
   done
+  if [ -n "$failed" ]; then
+    create.result 1 "the OOSH_SELF_BRANCH default could not be set to $branch in:$failed (in $ooshDir)"
+    error.log "promote: $RESULT"
+    return $(result)
+  fi
 
   if ! ogit.diff.check "$ooshDir" "${targets[@]}"; then
-    ogit.index.add all "$ooshDir" "${targets[@]}"
+    ogit.index.add all "$ooshDir" "${targets[@]}" >/dev/null || return $(result)
     # Pass committer identity inline so the commit succeeds even on
     # containers / CI runners without a global `git config user.email`
     # (e.g. test.promote's temp-dir rig). Uses a stable sentinel identity
     # so the git log shows this commit was machine-generated by promote.
     ogit.commit.create "chore(promote): set OOSH_SELF_BRANCH default to $branch" \
-        oosh-promote@local "oosh promote" "$ooshDir"
+        oosh-promote@local "oosh promote" "$ooshDir" >/dev/null || return $(result)
   fi
+  create.result 0 "OOSH_SELF_BRANCH default is $branch"
+  return $(result)
 }
 
 

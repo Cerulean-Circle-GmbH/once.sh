@@ -387,6 +387,7 @@ transaction.
 |---|---|
 | `replace within <file> <text>` | a substring, on every line |
 | `replace line <file> <exactLine>` | a whole line, exactly one match, else it refuses |
+| `replace lines <file> <exactLine>` | every whole line equal to it, identical duplicates too; none is a refusal (T-REPLACE-LINES) |
 | `replace block <file> <startLine> <endLine>` | the block between two whole lines, inclusive; `by ""` deletes it |
 | `replace word <file> <word>` | every WHOLE-WORD occurrence on every line |
 
