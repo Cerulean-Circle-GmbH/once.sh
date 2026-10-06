@@ -111,6 +111,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `repo.check` | `<?dir:$OOSH_DIR>` | rc 0 when `<dir>` is inside a git repository |
 | `repo.root.get` | `<?dir:$PWD>` | echo the toplevel of the repository containing `<dir>` |
 | `repo.share` | `<?dir:$OOSH_DIR>` | make the repository of `<dir>` group-writable: dev group + g+w (`private.ensure.sharedTree`), setgid on every .git dir, `core.sharedRepository group` |
+| `folder.finish` | `<folder>` | everything a new branch folder under the base needs: with a dev group `repo.share` (.git) and `private.this.folder.share` (the WORKING TREE: group dev, g+w, setgid dirs), then `safeDirectory.add`, and under sudo the trust entry of the person who typed the command; no ownership change. `oo checkout`, `oo mode`, `oo mode.setup` and install state 31 call it, so does `worktree.remove` / `worktree.restore` |
 | `repo.grep` | `<pattern> <?dir:$OOSH_DIR> <?pathspecs...>` | `git grep -nE <pattern>` over the tracked files of `<dir>` (the tree sweeps); variadic, so `<?dir>` precedes `<pathspecs>` |
 | `repo.files.list` | `<?dir:$OOSH_DIR>` | echo the tracked files of `<dir>`, one per line |
 
