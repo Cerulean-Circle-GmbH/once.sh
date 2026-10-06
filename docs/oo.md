@@ -381,7 +381,13 @@ out of its reach; remove one of those with the command this is built on:
 `oo method.new` and `oo method.delete` edit scripts through `replace`. It picks what to
 change, then `by <newText>` writes the result to `<file>.new`; `replace diff`,
 `replace commit` (the file becomes `<file>.bak`) and `replace rollback` finish the
-transaction.
+transaction. Both write the content into a NEW file first and give it the original's
+whole mode and group afterwards (`private.replace.copy.make`: the kernel getter
+`private.this.path.stat.get <file> mode` + `chmod`, `chgrp` when the caller may), then
+swap names — so a read-only 0444 / 0555 file commits too, a running script keeps
+reading the old inode (the `.bak`), and no `cp -p` (BusyBox: "can't preserve
+ownership") is involved (T-REPLACE-COMMIT-READ-ONLY). Every `rm` of a `.bak` / `.new`
+is `rm -f`: a read-only one must not ask on a terminal.
 
 | Verb | What it matches |
 |---|---|

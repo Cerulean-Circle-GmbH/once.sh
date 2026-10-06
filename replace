@@ -89,6 +89,31 @@ replace.lines.completion.exactLine() {
   # one candidate per line on stdout; $1 is the word being completed
   echo ""
 }
+private.replace.copy.make()     # <file> <content> <next> # write <content> into the new file <next> and give it the whole mode of <file> afterwards (kernel stat getter + chmod) and its group when the caller may; rc 1 and <next> removed when the copy or the mode fails #
+{
+ # The new file is written FIRST and given the mode AFTERWARDS: cp -p gave the
+ # copy the original's mode before the content went in, so a 0444 / 0555 file
+ # of a normal user refused the write (EACCES); and BusyBox cp -p, run by a
+ # dev-group member who does not own the file, printed "can't preserve
+ # ownership" on every commit. The mode comes from the kernel getter, the
+ # group through chgrp when the caller may — silent when not (best effort: the
+ # setgid directories of the shared tree hand new files the group anyway).
+ local file="$1" content="$2" next="$3" mode group
+ if [ -z "$file" ] || [ -z "$content" ] || [ -z "$next" ]; then
+   create.result 1 "private.replace.copy.make requires <file> <content> <next>"; return $(result)
+ fi
+ mode=$(private.this.path.stat.get "$file" mode)
+ group=$(private.this.path.stat.get "$file" group)
+ if [ -z "$mode" ] || ! cat "$content" > "$next" || ! chmod "$mode" "$next"; then
+   rm -f "$next"
+   create.result 1 "could not write $next with the content of $content and the mode of $file"; return $(result)
+ fi
+ [ -n "$group" ] && chgrp "$group" "$next" 2>/dev/null
+ create.result 0 "${next##*/} written with the mode of ${file##*/}"
+ return $(result)
+}
+
+
 ### new.method
 
 
@@ -284,20 +309,22 @@ replace.commit() # <file> # swap the transformed copy in: <file> becomes <file>.
     return $(result)
   fi
   # Use standard bash test - works on case-insensitive APFS
-  [ -f "$FILE.bak" ] && rm "$FILE.bak"
+  # rm -f: the .bak of a read-only file is read-only, and a plain rm asks
+  # "remove write-protected file?" on a terminal (T-REPLACE-COMMIT-READ-ONLY).
+  [ -f "$FILE.bak" ] && rm -f "$FILE.bak"
   # The WHOLE mode of the original stays (and its group; its owner as root):
   # `mv <file>.new <file>` put the editor's umask under the name — on the
   # shared tree a 664 script came back 644 and the next dev-group user could
-  # not edit it; only the exec bit was put back. A cp -p copy of the ORIGINAL
-  # takes the new content and then the name — no stat -c / chmod --reference
-  # (GNU-only). Not written INTO the original: a running bash script (oo
-  # method.new oo.x edits oo) reads on from its offset in the file it opened,
-  # and must go on reading the old content — which mv keeps as the .bak.
+  # not edit it; only the exec bit was put back. A new file takes the new
+  # content, then the original's mode (private.replace.copy.make — written
+  # first, so a read-only original works too), then the name. Not written
+  # INTO the original: a running bash script (oo method.new oo.x edits oo)
+  # reads on from its offset in the file it opened, and must go on reading
+  # the old content — which mv keeps as the .bak.
   # The .bak is made non-executable so completion never lists it as a command.
   local next="$FILE.new.$$"
-  if ! cp -p "$FILE" "$next" || ! cat "$FILE.new" > "$next"; then
-    rm -f "$next"
-    create.result 1 "replace commit: could not copy $FILE to $next — $FILE is unchanged"
+  if ! private.replace.copy.make "$FILE" "$FILE.new" "$next" >/dev/null; then
+    create.result 1 "replace commit: $RESULT — $FILE is unchanged"
     error.log "$RESULT"
     return $(result)
   fi
@@ -313,7 +340,7 @@ replace.rollback() # <file> # undo: drop an uncommitted <file>.new, else write <
 {
   FILE="$1"
   if [ -f "$FILE.new" ]; then
-    rm "$FILE.new"
+    rm -f "$FILE.new"
   elif [ ! -f "$FILE.bak" ]; then
     # It used to move <file> to <file>.new and then fail to move a missing
     # .bak back: nothing was left under the file's own name.
@@ -321,12 +348,12 @@ replace.rollback() # <file> # undo: drop an uncommitted <file>.new, else write <
     error.log "$RESULT"
     return $(result)
   else
-    # As replace.commit: a cp -p copy of <file> (its whole mode) takes the
-    # .bak content and then the name; the committed edit is kept as <file>.new.
+    # As replace.commit: a new file takes the .bak content, then the whole
+    # mode of <file> (private.replace.copy.make), then the name; the committed
+    # edit is kept as <file>.new.
     local next="$FILE.new.$$"
-    if ! cp -p "$FILE" "$next" || ! cat "$FILE.bak" > "$next"; then
-      rm -f "$next"
-      create.result 1 "replace rollback: could not copy $FILE to $next — $FILE is unchanged, the previous content is in $FILE.bak"
+    if ! private.replace.copy.make "$FILE" "$FILE.bak" "$next" >/dev/null; then
+      create.result 1 "replace rollback: $RESULT — $FILE is unchanged, the previous content is in $FILE.bak"
       error.log "$RESULT"
       return $(result)
     fi
@@ -342,8 +369,9 @@ replace.cleanup()
 {
   if [ -n "$1" ]; then
     # Use standard bash test - works on case-insensitive APFS
-    [ -f "$1.bak" ] && rm "$1.bak"
-    [ -f "$1.new" ] && rm "$1.new"
+    # -f: a read-only .bak / .new must not ask on a terminal
+    [ -f "$1.bak" ] && rm -f "$1.bak"
+    [ -f "$1.new" ] && rm -f "$1.new"
   else
     rm -f $OOSH_DIR/*.bak 2>/dev/null
     rm -f $OOSH_DIR/*.new 2>/dev/null
