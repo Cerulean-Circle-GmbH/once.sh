@@ -674,9 +674,9 @@ These functions are used internally and generally not called directly:
 | `config.string.quote` | Quotes strings for command line |
 | `config.info.log` | Logs config at info level |
 | `config.completion.*` | Tab completion helpers |
-| `private.config.variables.list` | `<envPrefix>` → one persistable variable NAME per line (`compgen -v`, shape gates, exclusion list) |
+| `private.config.variables.list` | `<envPrefix> <?sessionSplit>` → one persistable variable NAME per line (`compgen -v`, shape gates, exclusion list); `sessionSplit` (`yes`/`no`) is the layout a full `config save` decided and hands down (`config.save oosh OOSH <sessionSplit> <ooshSplit>`), empty reads it off `user.env` |
 | `private.config.variable.export.line` | `<variableName>` → one `export NAME="value"` line; rc 1 for unset, array, or an ANSI-C-quoted value |
-| `private.config.variables.export` | `<envPrefix>` → the whole body of a generated env file |
+| `private.config.variables.export` | `<envPrefix> <?sessionSplit>` → the whole body of a generated env file |
 | `private.config.string.upper` | `<string>` → upper-cased, without the bash-4 `${var^^}` operator |
 | `private.config.required.variables.get` | the required-variable table, as data |
 | `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
