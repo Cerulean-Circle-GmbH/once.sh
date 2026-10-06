@@ -71,8 +71,8 @@ invariants on real machines. They run inside
 **A host-resource check belongs here, not in `core`.** If an assertion needs
 something the oosh install does not itself create — a checkout of another
 repository, a daemon, a tree under `/var` — it cannot pass on a fresh machine or
-inside a container, and `os platform.test` runs `test.suite core 1` four times
-per gate. Do not reach for a `[ -d … ] → expect.pass "skipped"` guard either:
+inside a container, and `os platform.test` runs `test.suite gate 1` four times
+(core included) per gate. Do not reach for a `[ -d … ] → expect.pass "skipped"` guard either:
 `expect.pass` bumps both counters and `expect.fail` only one, so **a skip is
 indistinguishable from a pass** and the assertion silently stops asserting
 everywhere it matters.
@@ -83,6 +83,21 @@ every container gate. They split into `T-WS-LIST` in `core` — which tests the
 enumerator against a fixture built with `odocker workspace.init` and passes
 anywhere — and `test/test.platform.odocker.workspaces.invariant`, which keeps
 the host-readiness question where it belongs.
+
+### `test.suite gate <level>`
+
+```bash
+./test.suite gate 1
+```
+
+The post-install gate. It runs `test.suite core <level>`, then
+`platform.shared.configLayout.invariant` at the same level (default level 1). Both
+halves always run, so a red core cannot hide what the platform invariant says about
+the install. rc 0 when both pass, rc 1 when either fails.
+
+Use it on an installed machine to ask "is this install sound?". `os platform.test`
+runs it for each of its four users (`test.suite gate 1`), so a platform invariant
+gates the run instead of only the core tests.
 
 ## The runner guards the shared config tier
 

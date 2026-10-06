@@ -120,6 +120,17 @@ oo test.new myscript
 
 Creates `test/test.myscript` from `templates/code/newScriptTest`.
 
+### oo.test.platform.new
+
+Creates a platform invariant test: a post-install check that runs on a real machine.
+
+```bash
+oo test.platform.new <scope> <aspect>
+oo test.platform.new shared layout
+```
+
+Creates `test/test.platform.<scope>.<aspect>.invariant` from `templates/code/newPlatformInvariantTest`, executable. `<scope>` and `<aspect>` are camelCase words (letters and digits only). It refuses to overwrite a file that exists. Replace the `INVARIANT` blocks in the new file, then run it with `./test.suite run platform.<scope>.<aspect>.invariant 1`. Tab completion offers `shared` for the scope, and `config`, `oosh`, `layout` for the aspect.
+
 ## Version Control
 
 ### oo.mode
@@ -342,6 +353,30 @@ A legacy `private.` helper whose name carries no script segment
 out of its reach; remove one of those with the command this is built on:
 `replace block <file> "<its first line>" "}" by ""`.
 
+### The `replace` verbs
+
+`oo method.new` and `oo method.delete` edit scripts through `replace`. It picks what to
+change, then `by <newText>` writes the result to `<file>.new`; `replace diff`,
+`replace commit` (the file becomes `<file>.bak`) and `replace rollback` finish the
+transaction.
+
+| Verb | What it matches |
+|---|---|
+| `replace within <file> <text>` | a substring, on every line |
+| `replace line <file> <exactLine>` | a whole line, exactly one match, else it refuses |
+| `replace block <file> <startLine> <endLine>` | the block between two whole lines, inclusive; `by ""` deletes it |
+| `replace word <file> <word>` | every WHOLE-WORD occurrence on every line |
+
+`replace word` renames an identifier. A hit counts only when the characters around
+it are not letters, digits, `_` or `.`, so `debug.step`, `step.x`, `stepping` and
+`my_step` are other words. A rerun matches nothing, so it is safe to repeat. It
+refuses (rc 1) when the file has no whole-word match.
+
+```bash
+replace word some.File.txt step by debug.step   # step -> debug.step, once
+replace commit some.File.txt
+```
+
 ### The rest of the mode family
 
 Short, because each one does what its name says — but they were undocumented,
@@ -350,7 +385,7 @@ so `oo <TAB>` offered verbs with nothing behind them.
 | Verb | What it does |
 |---|---|
 | `oo mode.list` | the branch folders under the base, with each one's git status (for the layout itself: `ogit layout.status`) |
-| `oo branch.list <?source:all>` | branches from `worktrees`, local `git`, and/or `remote` — `all` merges them |
+| `oo branch.list <?source:all>` | the branch folders under the base plus local git branches (`local`), or remote ones (`remote`) — `all` (the default) merges them |
 | `oo mode.align` | checks the git branch out again to match the folder's directory name, for a tree that has drifted. `oo checkout` does the same repair for a branch it is asked to bring in |
 | `oo mode.stage <stage>` | promote a stage forward (`dev` → `testing` → `prod`). An alias of `oo stage`; the pipeline itself is [§ Promotion Commands](#promotion-commands-via-oo-wrappers) and lives in `promote` |
 | `oo prereqs.install` | install the install-time prereqs locally — `git`, `curl`, and `bash` 4+ when the running shell is older. Called by `init/oosh` through `ossh prereqs.install`; you rarely type it |

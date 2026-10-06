@@ -60,8 +60,8 @@ The folder helpers the converters use are kernel methods, shared with other scri
 
 `ogit` follows [oosh-architecture.md § Completion Function Rules](oosh-architecture.md#completion-function-rules):
 
-- **Parameter completion** (`ogit.parameter.completion.<param>`) holds only the **domain types** shared by every method with that parameter name: `dir targetDir path base branch ref tag remote paths pathspecs asEmail`.
-- **Method completion** (`ogit.<method>.completion.<param>`) holds a method's own parameters (`from`, `to`, `a`, `b`, `range`, `startPoint`, `commit`, `treeRoot`), method-specific enumerations (`source`, `format`, `scope`, `side`, `tags`, `prune`, `pattern`, `key`, `file`) and specialisations (`worktree.delete <path>` offers only linked worktrees).
+- **Parameter completion** (`ogit.parameter.completion.<param>`) holds only the **domain types** shared by every method with that parameter name: `dir targetDir path base branch ref tag remote paths pathspecs asEmail`, and `startPoint commit to a b range`, which answer like `ref`.
+- **Method completion** (`ogit.<method>.completion.<param>`) holds a method's own parameters (`treeRoot`) and method-specific enumerations (`source`, `format`, `scope`, `side`, `tags`, `prune`, `pattern`, `key`, `file`).
 - Both call private list getters, never each other. Docstrings carry no unpaired apostrophe; check with `./c2 signature.validate ogit`.
 
 ![ogit method tree](puml/ogit.tree/ogit.tree.drawio)

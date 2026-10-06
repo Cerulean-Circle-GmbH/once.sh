@@ -323,6 +323,10 @@ Workspaces in DockerWorkspaces follow camelCase directory naming. The image tag 
 | `nakedDebian/12` | `naked_debian_12` |
 | `nakedAlpine/3.19` | `naked_alpine_3_19` |
 
+## Container Names
+
+A container started without `--name` gets Docker's random name as its name and host name (`private.odocker.container.name.new`). How oosh uses it as the computer's name: [config.md § The computer's name](config.md#the-computers-name).
+
 ## Typical Workflow: Platform Install Test
 
 ```bash
@@ -352,28 +356,19 @@ odocker container.remove <container_name>      # old name: `odocker rm` still wo
 
 ### Docker Socket Permission Denied
 
-If you see `permission denied while trying to connect to the Docker daemon socket`, the Docker socket group may be wrong (e.g. `systemd-network` instead of `docker`).
+If you see `permission denied while trying to connect to the Docker daemon socket`, your user is not yet in the group that owns the socket.
 
-**Quick fix** (until next reboot):
+odocker never changes the socket itself (no `chgrp`, no systemd override — see the section on the socket above). What to do:
+
+1. Run the odocker command again. `private.odocker.socket.access.ensure` finds or creates a group with the socket's group number, adds you to it, and runs the call through `sg` so the new membership counts at once.
+2. Where there is no `sg` (Alpine), odocker says so: log out and back in. The membership counts from the next login.
+3. To see what is going on:
 ```bash
-sudo chgrp docker /var/run/docker.sock
+stat -c '%G (%g) %A' /var/run/docker.sock   # the socket's group and mode
+id -nG                                       # your groups in this shell
+getent group <group>                         # who is a member of that group
 ```
-
-**Permanent fix** (persists across reboots):
-```bash
-sudo mkdir -p /etc/systemd/system/docker.socket.d
-printf "[Socket]\nSocketGroup=docker\nSocketMode=0660\n" | sudo tee /etc/systemd/system/docker.socket.d/override.conf
-sudo systemctl daemon-reload
-sudo systemctl restart docker.socket
-```
-
-This overrides the systemd socket unit to always set the correct group. Verify with:
-```bash
-ls -la /var/run/docker.sock
-# Should show: srw-rw---- 1 root docker
-```
-
-**Note:** `odocker` automatically detects and fixes the socket group with `sudo` when running `build`, `rebuild`, `reset`, `run`, `run.sshd`, `up`, or `clone`. The permanent fix above avoids the sudo prompt entirely.
+If you are listed in `getent` but your group is missing from `id -nG`, the membership is new: log in again.
 
 ## See Also
 

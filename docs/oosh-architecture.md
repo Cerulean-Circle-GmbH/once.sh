@@ -435,7 +435,7 @@ this.call() {
 
 ```
 ~/config/
-├── user.env          # Main user configuration (PATH, exports)
+├── user.env          # Main user configuration (anchors, chain lines; no PATH)
 ├── oosh.env          # OOSH-specific variables
 ├── log.env           # Logging configuration
 ├── setup.color.env   # Terminal color definitions
@@ -447,19 +447,26 @@ this.call() {
 
 Env files are **pure data** now — only `export KEY="VALUE"` and `.`-chain lines,
 no logic. The anchors (`CONFIG_PATH`, `CONFIG`, `OOSH_DIR`) are written as the
-`"$HOME/…"` constants and PATH as one prepend line, so the shared files are right
+`"$HOME/…"` constants. The shared `user.env` holds no PATH: the user's real PATH
+and `OOSH_MODE` live in per-user files under `$HOME/.config/oosh`, chained as the
+last line of each shared file (`config session.save`). So the shared files are right
 for every user (see [config.md § The anchor rule](config.md#the-anchor-rule)).
 `config.validate` enforces the no-logic rule.
 
 ```bash
 # ~/config/user.env  — portable data + POSIX `.` source chain
-export BASH_FILE="/usr/local/bin/bash"
+export CONFIG_PATH="$HOME/config"
 export CONFIG_FILE="user.env"
+export CONFIG="$HOME/config/user.env"
+export BASH_FILE="/usr/local/bin/bash"
 
 . $CONFIG_PATH/oosh.env
 . $CONFIG_PATH/log.env
+. $HOME/.config/oosh/user.session.env   # per-user: the real absolute PATH
 ```
 
+`oosh.env` ends the same way, with `. $HOME/.config/oosh/oosh.session.env`
+(per-user `OOSH_MODE`, the branch the user's own `~/oosh` points at).
 `log.env` in turn chains the per-user session file:
 
 ```bash
