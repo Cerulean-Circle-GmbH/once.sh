@@ -140,7 +140,7 @@ private.ensure.groupWrite() { # <file...> # ensure files are group-writable (mul
   done
 }
 
-private.this.group.create() { # <groupName> <?gid> # cross-platform create a system group if it does not exist, with number <gid> when given. Idempotent — succeeds silently when the group is already there. Through $SUDO (empty for root). Tries groupadd (RHEL/Debian/most Linux), addgroup (Alpine/busybox-based images), dseditgroup (macOS), then a /etc/group append if none is available.
+private.this.group.create() { # <groupName> <?gid> # cross-platform create a system group if it does not exist, with number <gid> when given. Idempotent — succeeds silently when the group is already there. Through $SUDO (empty for root). Uses the first that exists of groupadd (RHEL/Debian/most Linux), addgroup (Alpine/busybox-based images), dseditgroup (macOS), once — its failure is the answer; only when none exists a /etc/group append (never on macOS, never a number another group holds).
   # Sibling to private.this.group.exists. Used by install state machine
   # (state 31 step 1) to ensure the `dev` group exists before any
   # user.group.add invocation, and by odocker for the group of the docker
@@ -155,6 +155,10 @@ private.this.group.create() { # <groupName> <?gid> # cross-platform create a sys
     error.log "private.this.group.create: group number '$gid' is not a number"
     return 1
   fi
+  # The FIRST tool that exists is used, once: its failure (a wrong sudo
+  # password, no rights) is the answer. Going on to the next one ran Debian's
+  # perl addgroup with busybox syntax — a second password prompt and a
+  # misparsed command (T-THIS-GROUP-CREATE-FAIL).
   for cmd in groupadd addgroup dseditgroup; do
     # path-exception: a lookup for this one command, PATH itself stays — Debian
     # puts groupadd in /usr/sbin, which is not on a normal user's PATH.
@@ -164,19 +168,37 @@ private.this.group.create() { # <groupName> <?gid> # cross-platform create a sys
       dseditgroup) $SUDO "$cmdPath" -o create ${gid:+-i "$gid"} "$name" >/dev/null 2>&1 && return 0 ;;
       *)           $SUDO "$cmdPath" ${gid:+-g "$gid"} "$name" >/dev/null 2>&1 && return 0 ;;
     esac
+    error.log "private.this.group.create: $cmd could not create group '$name'${gid:+ with number $gid}"
+    return 1
   done
-  warn.log "private.this.group.create: neither groupadd, addgroup nor dseditgroup worked — trying /etc/group append"
-  # Last-resort fallback: <gid>, else the next free GID >=500, append the line.
-  # Sufficient for OOSH's needs (just owning the group); login-shell
-  # group resolution will pick it up.
-  if [ -w /etc/group ] || [ "$(id -u 2>/dev/null)" = "0" ]; then
+  # Last resort, only where no tool exists: <gid>, else the next free GID
+  # >=500, appended to the group file. Sufficient for OOSH's needs (just
+  # owning the group); login-shell group resolution will pick it up. No group
+  # file on macOS (private.this.group.file.get): Directory Services ignores it.
+  local groupFile holder
+  groupFile=$(private.this.group.file.get)
+  if [ -z "$groupFile" ]; then
+    error.log "private.this.group.create: cannot create group '$name' — no group tool, and no group file on this system"
+    return 1
+  fi
+  # A given number another group holds is never written a second time.
+  if [ -n "$gid" ]; then
+    holder=$(private.this.group.name.get "$gid")
+    [ -z "$holder" ] && holder=$(grep -E "^[^:]*:[^:]*:${gid}:" "$groupFile" 2>/dev/null | cut -d: -f1 | head -n 1)
+    if [ -n "$holder" ]; then
+      error.log "private.this.group.create: group number $gid is held by '$holder' — '$name' not created"
+      return 1
+    fi
+  fi
+  warn.log "private.this.group.create: neither groupadd, addgroup nor dseditgroup exists — appending to $groupFile"
+  if [ -w "$groupFile" ] || [ "$(id -u 2>/dev/null)" = "0" ]; then
     local nextGid="${gid:-500}"
-    while [ -z "$gid" ] && grep -qE "^[^:]*:[^:]*:${nextGid}:" /etc/group 2>/dev/null; do
+    while [ -z "$gid" ] && grep -qE "^[^:]*:[^:]*:${nextGid}:" "$groupFile" 2>/dev/null; do
       nextGid=$((nextGid + 1))
     done
-    echo "$name:x:${nextGid}:" >> /etc/group 2>/dev/null && return 0
+    echo "$name:x:${nextGid}:" >> "$groupFile" 2>/dev/null && return 0
   fi
-  error.log "private.this.group.create: cannot create group '$name' — no groupadd, addgroup or dseditgroup, cannot write /etc/group"
+  error.log "private.this.group.create: cannot create group '$name' — no groupadd, addgroup or dseditgroup, cannot write $groupFile"
   return 1
 }
 
@@ -1409,6 +1431,20 @@ private.this.marker.sweep()     # <pattern> <markerSlug> <treeRoot> <?excludes..
    printf '%s %s\n' "$class" "$match"
  done <<< "$matches"
  return 0
+}
+
+
+private.this.group.file.get()     #  # echo the group file the last-resort append of private.this.group.create may write: /etc/group; nothing on macOS, where Directory Services ignores that file #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # The platform difference of the last resort, as a VALUE in one place: a
+ # line appended to /etc/group on macOS is ignored by Directory Services, so
+ # there is no file there and the append is not tried (T-THIS-GROUP-CREATE-FAIL).
+ # A test points private.this.group.create at a fixture through this getter.
+ case "$OSTYPE" in
+   darwin*) return 1 ;;
+ esac
+ echo /etc/group
 }
 
 

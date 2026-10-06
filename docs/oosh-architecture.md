@@ -389,7 +389,8 @@ answer by rc):
 | Method | What it does |
 |---|---|
 | `private.this.container.is <?root:/>` | rc 0 when this computer is a container: `<root>/.dockerenv` (Docker) or `<root>/run/.containerenv` (Podman) exists |
-| `private.this.group.create <group> <?gid>` | create a system group if it does not exist, with number `<gid>` when given; idempotent; through `$SUDO`; groupadd, addgroup, dseditgroup, then an `/etc/group` append |
+| `private.this.group.create <group> <?gid>` | create a system group if it does not exist, with number `<gid>` when given; idempotent; through `$SUDO`; the first that exists of groupadd, addgroup, dseditgroup, once — its failure is the answer; only when none exists an append to the group file, never with a number another group holds |
+| `private.this.group.file.get` | echo the group file that last-resort append may write: `/etc/group`; nothing (rc 1) on macOS, where Directory Services ignores it |
 | `private.this.group.name.get <gid>` | echo the name of the group with number `<gid>`: getent where present, else `/etc/group`, dscl on macOS; nothing when there is none |
 | `private.this.path.stat.get <path> <owner\|group\|uid\|gid\|mode>` | echo one stat field of the path itself (a symlink not followed); GNU format first, else BSD, both from one table; nothing and rc 1 for a missing path or an unknown field |
 | `private.this.file.same <fileA> <fileB>` | rc 0 when both files exist with identical bytes: `cmp -s` where it exists, else an exact `od` byte dump of each (AlmaLinux minimal has no diffutils) |
