@@ -21,7 +21,9 @@ itself knows no per-platform names). Which Docker depends on the computer:
   host's Docker.
 - **A bare computer** (no socket): the Docker **engine**, installed on this
   computer and started (`private.odocker.engine.start`): systemd, else OpenRC
-  (Alpine), else a SysV `service`; on macOS **colima**, the Docker VM
+  (Alpine), else a SysV `service` — then up to five seconds for the socket,
+  which OpenRC and SysV starts make only after they return
+  (T-ODOCKER-ENGINE-START-WAIT); on macOS **colima**, the Docker VM
   (`colima start`).
 - **A container without the host's socket** (`private.this.container.is`:
   `/.dockerenv` or `/run/.containerenv`): only the **client** — no engine can
