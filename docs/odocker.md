@@ -353,7 +353,12 @@ The Docker socket gives the container root-level access to the host's Docker dae
 > **Persistence:** `workspace.set` stores the setting in `$CONFIG_PATH/odocker.env`
 > and registers it with `config add` so every new shell inherits the value.
 > Legacy installs that had `ODOCKER_WORKSPACES=` in `user.env` are migrated on
-> the next `workspace.set` call — no dead keys are left behind.
+> the next `workspace.set` call — no dead keys are left behind. Its rc is the
+> save's: when `odocker.env` does not hold the value afterwards (read back — the
+> save itself answers 0 when it cannot write the file) or the chain line in
+> `user.env` cannot be added, `workspace.set` answers rc 1, and so do
+> `workspace.init` and the install's `private.odocker.workspaces.install`
+> (T-WS-SET-SAVE-FAILS).
 
 ### Build
 
