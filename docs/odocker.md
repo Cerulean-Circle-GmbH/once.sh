@@ -79,7 +79,9 @@ socket itself is never changed — no odocker method runs `chgrp` or `sudo` on i
 `sg`, and no package provides one: there odocker says the membership counts from
 the next login (T-ODOCKER-NO-SG-NEXT-LOGIN). So that it rarely comes to that,
 **the install already adds every user to the socket's group** when a socket is
-mounted (`private.odocker.socket.group.ensure`, T-USER-INSTALL-SOCKET-GROUP).
+mounted (`private.odocker.socket.group.ensure`, T-USER-INSTALL-SOCKET-GROUP) —
+also when the image ships a docker program; the local group `docker` only
+without a socket (T-USER-INSTALL-SOCKET-GROUP-OVER-DOCKER).
 
 ## Configuration
 
