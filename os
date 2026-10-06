@@ -5,6 +5,28 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+private.os.release.get()     # <key> <?file:/etc/os-release> # echo one value of the os-release <file> (ID, VERSION_CODENAME, PRETTY_NAME …) with its quotes removed, without running the file; rc 1 and nothing when the key or the file is missing #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT. Read
+ # line by line, never sourced: the file is data, and the caller's shell keeps
+ # its variables. Moved from odocker (T-OS-RELEASE-GET).
+ local key="$1" file="${2:-/etc/os-release}" name value
+ case "$key" in ""|*[!A-Za-z0-9_]*) return 1 ;; esac
+ [ -r "$file" ] || return 1
+ while IFS='=' read -r name value || [ -n "$name" ]; do
+   [ "$name" = "$key" ] || continue
+   case "$value" in
+     \"*\") value="${value#\"}"; value="${value%\"}"
+            value="${value//\\\"/\"}"; value="${value//\\\$/\$}"; value="${value//\\\`/\`}"; value="${value//\\\\/\\}" ;;
+     \'*\') value="${value#\'}"; value="${value%\'}" ;;
+   esac
+   printf '%s\n' "$value"
+   return 0
+ done < "$file"
+ return 1
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,10 +606,9 @@ os.platform.test.all() # # tests all must-pass platforms, reports summary
 
 os.info()  # <verbose:> # shows info abut the running os. add v to get more details
 {
-  if [ -f /etc/os-release ]; then
-    source /etc/os-release
-  fi
-  echo "              
+  local prettyName
+  prettyName=$(private.os.release.get PRETTY_NAME)
+  echo "
           shell level: $SHLVL
 
                 script: $0
@@ -598,7 +619,7 @@ os.info()  # <verbose:> # shows info abut the running os. add v to get more deta
                 type  : $HOSTTYPE
                 OS    : $OSTYPE
 
-                Name  : ${GREEN}$PRETTY_NAME${NORMAL}
+                Name  : ${GREEN}$prettyName${NORMAL}
 
        package manager: $OOSH_PM
     "

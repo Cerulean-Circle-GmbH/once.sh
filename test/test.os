@@ -227,6 +227,35 @@ else
   expect.fail "os.check.env still uses narrow linux-gnu* pattern — alpine's linux-musl will fall through to 'could not determine OS'"
 fi
 
+
+console.log "
+Test: private.os.release.get
+===================================================================="
+
+# T-OS-RELEASE-GET: one value of an os-release file, quotes removed, the file never run
+# Moved from odocker (private.odocker.os.release.get read only /etc/os-release
+# and had no test). <file> lets the test use a fixture.
+test.os.releaseGet() {
+  local fx bad="" got; fx=$(test.suite.fixture.make osrelease)
+  printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"' 'NAME="Debian GNU/Linux"' 'ID=debian' \
+    "VERSION_CODENAME='bookworm'" 'HOME_URL="https://www.debian.org/"' 'QUOTED="a \"b\" \$c"' 'EVIL=$(touch '"$fx"'/ran)' > "$fx/os-release"
+  got=$(private.os.release.get ID "$fx/os-release") || bad="$bad id-rc"
+  [ "$got" = debian ] || bad="$bad id=[$got]"
+  got=$(private.os.release.get PRETTY_NAME "$fx/os-release"); [ "$got" = "Debian GNU/Linux 12 (bookworm)" ] || bad="$bad double=[$got]"
+  got=$(private.os.release.get VERSION_CODENAME "$fx/os-release"); [ "$got" = bookworm ] || bad="$bad single=[$got]"
+  got=$(private.os.release.get QUOTED "$fx/os-release"); [ "$got" = 'a "b" $c' ] || bad="$bad escaped=[$got]"
+  private.os.release.get EVIL "$fx/os-release" >/dev/null; [ -e "$fx/ran" ] && bad="$bad file-was-run"
+  got=$(private.os.release.get NAME "$fx/os-release"); [ "$got" = "Debian GNU/Linux" ] || bad="$bad name=[$got]"
+  got=$(private.os.release.get VERSION_ID "$fx/os-release"); [ "$?" = 1 ] && [ -z "$got" ] || bad="$bad missing-key=[$? $got]"
+  got=$(private.os.release.get ID "$fx/none"); [ "$?" = 1 ] && [ -z "$got" ] || bad="$bad missing-file=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "values with and without quotes; rc 1 for a missing key or file; the file is never run" || create.result 1 "os release:$bad"
+  return $(result)
+}
+test.case $level "T-OS-RELEASE-GET: one value of an os-release file, quotes removed, the file never run" test.os.releaseGet
+expect 0 "values with and without quotes; rc 1 for a missing key or file; the file is never run" \
+  "the os-release reader lived in odocker, had no test and read only /etc/os-release"
+
 ### test.method
 
 test.suite.save.results
