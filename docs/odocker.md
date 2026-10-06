@@ -26,11 +26,14 @@ itself knows no per-platform names). Which Docker depends on the computer:
 
 | | apt (Ubuntu/Debian) | apk (Alpine) | dnf / yum (Alma/RHEL) | brew (macOS) |
 |---|---|---|---|---|
-| `docker` — client | `docker.io` | `docker-cli` | `docker-ce-cli` | `docker` |
+| `docker` — client | `docker-ce-cli` | `docker-cli` | `docker-ce-cli` | `docker` |
 | `docker` — engine | `docker.io` | `docker` | `docker-ce docker-ce-cli containerd.io` | `colima docker` |
 | `column` | `bsdextrautils` | `util-linux-misc` | `util-linux` | part of macOS |
 
-On dnf/yum Docker's own repository is added first. The engine packages create
+On apt (the client) and dnf/yum, Docker's own repository is added first
+(`private.odocker.docker.repo.add`): Debian 12's `docker.io` is Docker 20.10,
+too old for a current host's Docker ("client version 1.41 is too old",
+T-ODOCKER-DOCKER-REPO-APT). The engine packages create
 the group `docker`; the socket access below adds the user to it (colima's socket
 belongs to the user — no group). T-ODOCKER-PREREQ-PACKAGE-ENGINE, -ENGINE-START,
 -PREREQ-MODE.
