@@ -219,10 +219,13 @@ file — so it exists if and only if that file wrote it — and a file that prod
 If you see `⚠ NO RESULTS: test.<name> produced no score of its own`, that file is not being
 measured. Add `test.suite.save.results` as its last line.
 
-Since 2026-09-16 that warning **fails a `core` run**. All twenty-six `core` files score today, so
-the rule costs nothing now and exists to catch the regression. `extended` keeps the warning without
-failing, because twelve of its files have never scored and giving them one is content work, not
-runner work.
+Since 2026-09-16 that warning **fails a `core` run**, and since 2026-10-06 a `platform` run and a
+single `test.suite run <name>` too (`✗ NO RESULTS: test.<name> ended before test.suite.save.results`,
+rc 1): a platform invariant that died used to pass `test.suite gate`. Every `core` and `platform`
+file scores today, so the rule costs nothing now and exists to catch the regression. `extended`
+(and `test.suite all`, which runs it) keeps the warning without failing, because twelve of its files
+have never scored and giving them one is content work, not runner work
+(T-VERDICT, T-SUITE-NO-RESULTS-RUNNER).
 
 The whole pass/fail rule lives in one place, `private.test.suite.verdict`, so it can be tested. It
 used to be an if/elif chain in the tail of the runner that nothing could reach — which is how both
