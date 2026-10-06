@@ -200,7 +200,10 @@ read it. It cannot guard itself, so `this` drops repeated segments on every
 Before a shared config is switched (*The switch and its gate*, below), the
 shared `user.env` still carries the old shared line written by
 `private.config.path.line.get` — every segment under the saver's home as
-`$HOME/…`, `:$PATH` last.
+`$HOME/…`, `:$PATH` last. The same segment rules apply, and a segment holding
+`$ " \` or a backtick is dropped there too — checked on the raw segment, before
+the `$HOME` rewrite adds its own `$` (T-CONFIG-PATH-LINE-NO-CODE): every user's
+shell executes that line.
 
 **What oosh cannot reach.** A login file that changes PATH *after* it sourced
 `.bashrc` — an installer's `export PATH="$HOME/.local/bin:$PATH"` appended to
