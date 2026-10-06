@@ -152,6 +152,14 @@ one and send this shell's output to the old terminal); it falls back to the
 `fd/1` → `/dev/null` cascade only for non-tty contexts (`ssh exec`, cron, CI).
 `LOG_LIVE` re-anchors to the per-user default.
 
+**The session file is pure data, whatever you name yourself.** `log.session.save`
+builds each line with the kernel's `private.this.env.export.line.get` — the same
+rule `config save` uses (`private.config.variable.export.line`): bash quotes the
+value, so a quote, `$`, backslash or backtick in `log name '<x>'` is written
+escaped and reads back as given, nothing runs. A value no single line can hold
+(a control character) is refused: rc 1, an error line, and the file keeps its
+previous content (T-LOG-SESSION-PURE-DATA).
+
 ```bash
 log name                 # show LOG_NAME (defaults to user@host)
 log name ci-run@box      # set LOG_NAME and re-persist the session file
