@@ -51,19 +51,25 @@ mkdir -p "$HOME/.config/oosh" 2>/dev/null
 export LOG_LIVE="$HOME/.config/oosh/log.live.out"
 touch "$LOG_LIVE" 2>/dev/null
 
-log.device() # <?device> # set LOG_DEVICE to <device>, probed by private.log.device.probe (/dev/tty without a terminal, a file nobody may write: falls back to /dev/stderr; fd1/fd2 spellings are never probed); without <device>: report the current one #
+log.device() # <?device> # set LOG_DEVICE to <device>, probed by private.log.device.probe (/dev/tty without a terminal, a file nobody may write: falls back to /dev/stderr; fd1/fd2 spellings are never probed) and remembered in log.session.env (a file saved, a terminal removes the saved file); without <device>: report the current one #
 {
   # ONE definition. A second `log.device() {` further down the file (2024)
   # overrode this one on every source — so the probe here was dead code and
   # `log device` only reported and re-ran `config save log LOG` (the D10
-  # recursion out of config.save's HACK). Now: set, probe, report a change.
-  # Persistence is not this method's job: LOG_DEVICE is per user and
-  # log.session.save (bashrc) writes it to log.session.env.
+  # recursion out of config.save's HACK). Now: set, probe, report a change —
+  # and remember the choice in the user's own log.session.env (never config
+  # save): a file is saved, a terminal removes the saved file. It is the one
+  # place that changes the saved device; a shell start keeps it
+  # (log.session.save, T-BASHRC-LOG-DEVICE-KEPT). The typed `log device …`
+  # runs in its own process, so the saved line is all it can change for the
+  # shells to come. A device the probe could not open is not remembered.
   if [ -n "$1" ]; then
     local before="${LOG_DEVICE:-}"
     export LOG_DEVICE=$1
     private.log.device.probe
     [ "$LOG_DEVICE" = "$before" ] || important.log "new LOG_DEVICE=$LOG_DEVICE"
+    [ "$LOG_DEVICE" = "$1" ] || return 1
+    private.log.session.write forget >/dev/null
   else
     important.log "LOG_DEVICE=${LOG_DEVICE:-<unset>}"
   fi
@@ -465,51 +471,12 @@ log.name() { # <?name> # set or show the OOSH log name (default user@host). NOT 
 
 log.name.completion() { :; }
 
-log.session.save() { # # persist per-user/session log vars (LOG_NAME, LOG_DEVICE, LOG_LIVE) to $HOME/.config/oosh/log.session.env
-  # Per-user / per-session: these must NOT go into the shared log.env (every
-  # user symlinks ~/config to one sharedConfig — they would leak). Written to
-  # the user's OWN $HOME/.config/oosh, the same private dir oo uses for
-  # mode-env.bash (oo.mode). Deliberately no system LOGNAME (see log.name).
-  # The file is chained unguarded into every shell of this user, so each line
-  # is built by the kernel's pure-data rule (private.this.env.export.line.get,
-  # the one config uses): the raw value let a log name holding a quote run
-  # code at every login (T-LOG-SESSION-PURE-DATA). A value that cannot be pure
-  # data is refused and the file keeps its previous content.
-  # Every interactive shell runs this (.bashrc): a file whose text already is
-  # the built text is left alone — no rewrite, no new mtime — so parallel
-  # terminals and a second run change nothing (T-LOG-SESSION-SAVE-IDEMPOTENT).
-  # read -d '' takes the whole file, trailing newlines included; it answers
-  # rc 0 only when it met a NUL byte, which the built text never holds.
-  # LOG_DEVICE is written only when the user chose a file (or another
-  # non-terminal device): a terminal device belongs to one session, every new
-  # shell derives its own, and a process without a terminal that sources the
-  # chain would write into another terminal (T-LOG-SESSION-DEVICE-TERMINAL,
-  # T-LOG-SESSION-DEVICE-TWO-TERMINALS). No line is pure data too: a brand-new
-  # user's file has none.
-  local d="$HOME/.config/oosh" body="" variableName line saved=""
-  for variableName in LOG_NAME LOG_DEVICE LOG_LIVE; do
-    [ "$variableName" = LOG_DEVICE ] && private.log.device.is.session "${LOG_DEVICE:-}" && continue
-    if ! line=$(private.this.env.export.line.get "$variableName" "${!variableName}"); then
-      create.result 1 "log.session.save: $variableName cannot be written as pure data — $d/log.session.env kept"
-      error.log "$RESULT"
-      return $(result)
-    fi
-    body="$body$line"$'\n'
-  done
-  if [ -f "$d/log.session.env" ] && ! IFS= read -r -d '' saved < "$d/log.session.env" && [ "$saved" = "$body" ]; then
-    create.result 0 "$d/log.session.env"
-    return $(result)
-  fi
-  mkdir -p "$d" 2>/dev/null
-  # The rc of the write is the answer: a file left to root by a sudo session
-  # or a full disk keeps nothing (T-LOG-SESSION-SAVE-WRITE-FAIL).
-  if ! { printf '%s' "$body" > "$d/log.session.env"; } 2>/dev/null; then
-    create.result 1 "log.session.save: cannot write $d/log.session.env — nothing was kept"
-    error.log "$RESULT"
-    return $(result)
-  fi
-  create.result 0 "$d/log.session.env"
-  return $(result)
+log.session.save() { # # persist per-user/session log vars (LOG_NAME, LOG_DEVICE, LOG_LIVE) to $HOME/.config/oosh/log.session.env; a file device chosen earlier is kept
+  # Every interactive shell runs this (.bashrc) with ITS terminal as device: a
+  # terminal is never saved, and the file device the user chose with `log
+  # device <file>` stays saved — only log.device changes or removes it
+  # (T-BASHRC-LOG-DEVICE-KEPT). The work is private.log.session.write.
+  private.log.session.write keep
 }
 
 log.session() { # # show the per-user/session log config (LOG_NAME, LOG_DEVICE, LOG_LIVE)
@@ -708,6 +675,70 @@ private.log.device.is.session()     # <device> # rc 0 when <device> belongs to o
    /dev/pts/*|/dev/tty*) return 0 ;;
  esac
  private.this.device.is.terminal "${1:-}"
+}
+
+
+private.log.session.write()     # <savedDevice> # write log.session.env from LOG_NAME, LOG_DEVICE and LOG_LIVE of this shell; a terminal LOG_DEVICE is never written, savedDevice keep carries the file device the session file holds over, forget drops it #
+{
+ # Per-user / per-session: these must NOT go into the shared log.env (every
+ # user symlinks ~/config to one sharedConfig — they would leak). Written to
+ # the user's OWN $HOME/.config/oosh, the same private dir oo uses for
+ # mode-env.bash (oo.mode). Deliberately no system LOGNAME (see log.name).
+ # The file is chained unguarded into every shell of this user, so each line
+ # is built by the kernel's pure-data rule (private.this.env.export.line.get,
+ # the one config uses): the raw value let a log name holding a quote run
+ # code at every login (T-LOG-SESSION-PURE-DATA). A value that cannot be pure
+ # data is refused and the file keeps its previous content.
+ # Every interactive shell runs this (.bashrc): a file whose text already is
+ # the built text is left alone — no rewrite, no new mtime — so parallel
+ # terminals and a second run change nothing (T-LOG-SESSION-SAVE-IDEMPOTENT).
+ # read -d '' takes the whole file, trailing newlines included; it answers
+ # rc 0 only when it met a NUL byte, which the built text never holds.
+ # LOG_DEVICE: a terminal device (private.log.device.is.session) belongs to
+ # one session and is never written — every new shell derives its own, and a
+ # process without a terminal that sources the chain would write into another
+ # terminal (T-LOG-SESSION-DEVICE-TWO-TERMINALS). A file device is written.
+ # With a terminal, <savedDevice> decides the line: keep (every shell start)
+ # carries over the file device the session file holds — its one line read
+ # back in a subshell when it is pure data, and written again through the
+ # same pure-data rule — so the next terminal does not erase the
+ # user's choice, which a process without a terminal is the reader of; forget
+ # (log.device with a terminal) drops it (T-BASHRC-LOG-DEVICE-KEPT,
+ # T-LOG-SESSION-WRITE). No line is pure data too: a brand-new user's file has none.
+ local savedDevice="$1"
+ local d="$HOME/.config/oosh" body="" variableName value line saved=""
+ for variableName in LOG_NAME LOG_DEVICE LOG_LIVE; do
+   value="${!variableName}"
+   if [ "$variableName" = LOG_DEVICE ] && private.log.device.is.session "${LOG_DEVICE:-}"; then
+     [ "$savedDevice" = keep ] || continue
+     # The saved line only, and only when config.validate would accept it (no
+     # $( and no backtick): then reading it back runs nothing.
+     line=$(grep '^export LOG_DEVICE=' "$d/log.session.env" 2>/dev/null | tail -n 1)
+     case "$line" in ''|*'$('*|*'`'*) continue ;; esac
+     value=$( unset LOG_DEVICE; eval "$line" 2>/dev/null; printf '%s' "${LOG_DEVICE:-}" )
+     { [ -z "$value" ] || private.log.device.is.session "$value"; } && continue
+   fi
+   if ! line=$(private.this.env.export.line.get "$variableName" "$value"); then
+     create.result 1 "log.session.save: $variableName cannot be written as pure data — $d/log.session.env kept"
+     error.log "$RESULT"
+     return $(result)
+   fi
+   body="$body$line"$'\n'
+ done
+ if [ -f "$d/log.session.env" ] && ! IFS= read -r -d '' saved < "$d/log.session.env" && [ "$saved" = "$body" ]; then
+   create.result 0 "$d/log.session.env"
+   return $(result)
+ fi
+ mkdir -p "$d" 2>/dev/null
+ # The rc of the write is the answer: a file left to root by a sudo session
+ # or a full disk keeps nothing (T-LOG-SESSION-SAVE-WRITE-FAIL).
+ if ! { printf '%s' "$body" > "$d/log.session.env"; } 2>/dev/null; then
+   create.result 1 "log.session.save: cannot write $d/log.session.env — nothing was kept"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ create.result 0 "$d/log.session.env"
+ return $(result)
 }
 
 
