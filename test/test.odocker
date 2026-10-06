@@ -1833,8 +1833,8 @@ test.odocker.installRun() { # <fx> <env assignments…>
             "sh -c cat > "*) local a="$*"; cat > "$CT${a##*cat > }" ;;
             *"command -v"*) echo "$PM" ;;
             # portability-exception: matches the command text odocker sends into a Linux container, runs no stat
-            "stat -c %g /var/run/docker.sock") echo 4242 ;;
-            *"getent group 4242"*) [ -n "$SOCKGRP" ] && echo "$SOCKGRP" ;;
+            "stat -c %g /var/run/docker.sock") echo "${SOCKGID:-4242}" ;;
+            *"getent group ${SOCKGID:-4242} "*) [ -n "$SOCKGRP" ] && echo "$SOCKGRP" ;;
             *"getent group docker"*) [ "$DOCKERGRP" = yes ] && echo "docker:x:999:" ;;
             awk*) echo tester ;;
           esac ;;
@@ -1931,6 +1931,41 @@ test.case $level "T-ODOCKER-INSTALL-RAW: a container without oosh gets Docker's 
 expect 0 "the table's client names; Docker's repository written into the container once, nothing on a failed download; the socket's group never renumbered" \
   "an apt or dnf container without oosh got no docker-ce-cli: Docker's repository was missing there"
 
+# T-ODOCKER-SOCKET-GROUP-ROOT: a docker socket of root's group (number 0) is refused — nobody joins group root
+# Docker Desktop's socket seen inside a container, a rootful podman or snap
+# socket, a host without a docker group: the socket belongs to root:root.
+# socket.group.ensure answered root (wheel on macOS), and the access of a
+# started odocker, odocker prereqs.install and the raw container install added
+# users to it — to root's group (review, 2026-10-06).
+test.odocker.socketGroupRoot() {
+  local fx bad="" out; fx=$(test.suite.fixture.make odockersocketroot); test.odocker.socketStubs "$fx"
+  echo "root:x:0:" > "$fx/group"; echo tester > "$fx/dbgroups"; echo tester > "$fx/procgroups"
+  out=$(env -u OS_CMD_GROUP_ADD -u OOSH_NO_INSTALL SUDO="sudo " SGID=0 FX="$fx" ODOCKER_SOCKET="$fx/docker.sock" PATH="$fx/bin:$PATH" OOSH_DIR="$OOSH_DIR" bash -c '
+    OSTYPE=linux-gnu
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+    private.this.script.load user user.group.add >/dev/null 2>&1
+    user.group.add() { echo "join $*" >> "$FX/log"; }
+    private.odocker.prereqs.ensure() { create.result 0 "present"; return 0; }
+    private.odocker.socket.group.ensure "$FX/docker.sock" >/dev/null 2>&1; echo "ensure=$? $RESULT"
+    private.odocker.socket.access.ensure "$FX/docker.sock" >/dev/null 2>&1; echo "access=$?"
+    odocker.prereqs.install tester >/dev/null 2>&1; echo "install=$?"' </dev/null 2>/dev/null)
+  case "$out" in "ensure=1 "*"root"*"no user is added"*) ;; *) bad="$bad ensure=[$(echo "$out" | grep '^ensure=')]" ;; esac
+  case "$out" in *"access=1"*) ;; *) bad="$bad access=[$(echo "$out" | grep '^access=')]" ;; esac
+  case "$out" in *"install=1"*) ;; *) bad="$bad install=[$(echo "$out" | grep '^install=')]" ;; esac
+  grep -qE '^(join|groupadd|addgroup) ' "$fx/log" && bad="$bad joined=[$(grep -E '^(join|groupadd|addgroup) ' "$fx/log" | tr '\n' '|')]"
+  # the raw container install: the socket in the container is of root's group too
+  mkdir -p "$fx/raw"; : > "$fx/raw/log"
+  out=$(test.odocker.installRun "$fx/raw" PM=apk SOCKGID=0)
+  [ "$out" = "rc=1" ] || bad="$bad raw-rc=[$out]"
+  grep -qE 'usermod|addgroup|groupadd' "$fx/raw/log" && bad="$bad raw-joined=[$(grep -E 'usermod|addgroup|groupadd' "$fx/raw/log" | tr '\n' '|')]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a socket of root's group is refused: no group answered, nobody added, here or in a container" || create.result 1 "socket of root's group:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-SOCKET-GROUP-ROOT: a docker socket of root's group (number 0) is refused — nobody joins group root" test.odocker.socketGroupRoot
+expect 0 "a socket of root's group is refused: no group answered, nobody added, here or in a container" \
+  "a socket owned by root:root made odocker add users to group root"
+
 # T-ODOCKER-PREREQS-INSTALL: odocker prereqs.install installs here and joins the socket's group — once; nothing in a test run
 test.odocker.prereqsInstall() {
   local fx bad="" out; fx=$(test.suite.fixture.make odockerprereqsinstall); : > "$fx/log"; : > "$fx/docker.sock"; : > "$fx/member"
@@ -1992,6 +2027,28 @@ test.odocker.dockerRepoGet() {
 test.case $level "T-ODOCKER-DOCKER-REPO-GET: the data of Docker's repository per package manager, from one getter" test.odocker.dockerRepoGet
 expect 0 "marker, url, file and line per package manager; rc 1 for apk or missing apt values" \
   "the URLs, files and the list line lived inside the local add only"
+
+
+console.log "
+Test: private.odocker.socket.gid.check
+===================================================================="
+
+# T-ODOCKER-SOCKET-GID-CHECK: the group number 0 of root is refused, any other is usable
+# The one rule socket.group.ensure (here) and the raw container install ask
+# (T-ODOCKER-SOCKET-GROUP-ROOT tests both callers).
+test.odocker.socketGidCheck() {
+  local bad=""
+  private.odocker.socket.gid.check 0 >/dev/null 2>&1 && bad="$bad 0-usable"
+  case "$RESULT" in *"group of root"*"no user is added"*"docker group"*) ;; *) bad="$bad 0-result=[$RESULT]" ;; esac
+  private.odocker.socket.gid.check 4242 >/dev/null 2>&1 || bad="$bad 4242-refused=[$RESULT]"
+  private.odocker.socket.gid.check "" >/dev/null 2>&1 && bad="$bad empty-usable"
+  private.odocker.socket.gid.check root >/dev/null 2>&1 && bad="$bad name-usable"
+  [ -z "$bad" ] && create.result 0 "number 0 is refused with the reason and what to do, another number is usable" || create.result 1 "gid check:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-SOCKET-GID-CHECK: the group number 0 of root is refused, any other is usable" test.odocker.socketGidCheck
+expect 0 "number 0 is refused with the reason and what to do, another number is usable" \
+  "users were added to the group of root that owned the docker socket"
 
 ### test.method
 

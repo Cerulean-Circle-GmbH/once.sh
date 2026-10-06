@@ -91,6 +91,16 @@ mounted (`private.odocker.socket.group.ensure`, T-USER-INSTALL-SOCKET-GROUP) —
 also when the image ships a docker program; the local group `docker` only
 without a socket (T-USER-INSTALL-SOCKET-GROUP-OVER-DOCKER).
 
+**Never the group of root.** A socket owned by `root:root` — Docker Desktop's
+socket seen from a container, a rootful podman or snap socket, a host without a
+`docker` group — has group number 0 (`root`, `wheel` on macOS). Membership there
+is far more than Docker access, so `private.odocker.socket.gid.check` refuses
+number 0: `socket.group.ensure` answers rc 1 and the access of a started odocker,
+`odocker prereqs.install`, the install (`user`) and the raw path of
+`odocker install` add nobody. RESULT says why and what to do: the owner of the
+socket on the host gives it a docker group of its own (T-ODOCKER-SOCKET-GID-CHECK,
+T-ODOCKER-SOCKET-GROUP-ROOT, T-USER-INSTALL-SOCKET-GROUP-ROOT).
+
 ## Configuration
 
 ### `DockerWorkspaces` is an external prerequisite
@@ -450,6 +460,8 @@ id -nG                                       # your groups in this shell
 getent group <group>                         # who is a member of that group
 ```
 If you are listed in `getent` but your group is missing from `id -nG`, the membership is new: log in again.
+
+4. If `stat` shows the group `root` (`wheel`, number 0), odocker adds nobody to it and says so: on the host, give the socket a docker group of its own (`groupadd docker; chgrp docker /var/run/docker.sock`, or the daemon's `group` setting) — never put users in the group of root.
 
 ## See Also
 
