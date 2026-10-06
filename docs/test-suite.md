@@ -198,10 +198,17 @@ config tier.
 
 `test.suite` exports `OOSH_NO_INSTALL=1` for every test file. Tests start real
 scripts (`odocker up`), and a script that installs what it misses did so
-during the tests — colima, docker and lima on a Mac VM (2026-10-06). A script
-that installs on first use honours it; a test OF such an install lifts it with
-`env -u OOSH_NO_INSTALL` and stubs the package manager (T-SUITE-NO-INSTALL,
-T-ODOCKER-START-NO-INSTALL).
+during the tests — colima, docker and lima on a Mac VM (2026-10-06). The rule
+has one owner: `oo.cmd`, the door every install goes through. Under
+`OOSH_NO_INSTALL` a missing tool is refused there — rc 1, RESULT
+`<tool> missing — a test run installs nothing`, a warning, no package manager
+and no sudo (T-CMD-NO-INSTALL). A present tool is still rc 0. One script keeps
+a gate of its own because it changes more than packages: a started `odocker`
+also adds Docker's repository, starts the engine and joins the socket's group,
+so under `OOSH_NO_INSTALL` it skips its prerequisite step altogether
+(T-ODOCKER-START-NO-INSTALL). A test OF an install lifts the variable with
+`env -u OOSH_NO_INSTALL` and stubs the package manager and sudo
+(T-SUITE-NO-INSTALL, the T-CMD-* cases of test.oo).
 
 ## Every file scores itself
 
