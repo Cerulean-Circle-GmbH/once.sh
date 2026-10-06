@@ -63,8 +63,12 @@ found, `private.odocker.socket.get`), so the CLI talks to the
 host's daemon. The socket keeps the **host's** group number, so a non-root user
 there got `permission denied`: `private.odocker.socket.access.ensure` creates a
 group with that number when there is none (`docker`, or `dockerhost` when
-`docker` has another number), adds the user to it, and the started call runs
-once more through `sg <group>`, so the new membership counts at once. The group
+`docker` has another number), adds the user (`id -un`) to it, and the started
+call runs once more through `sg <group>`, so the new membership counts at once —
+only while the membership is pending: in the group database, not yet in this
+process (`private.user.group.member.pending`, T-USER-GROUP-MEMBER-PENDING). A
+process that has the group already gets no `sg` and no "log out and back in":
+docker fails there for another reason, and RESULT says so. The group
 is found and made with kernel methods only — a started odocker has sourced
 nothing but `this`: `private.this.group.name.get <gid>` (getent, else
 `/etc/group`, `dscl` on macOS) and `private.this.group.create <name> <gid>`
