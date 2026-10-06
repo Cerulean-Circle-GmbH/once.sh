@@ -84,7 +84,10 @@ branch **their** `~/oosh` points at — so `config list oosh` shows it nested, a
 | `oosh.env` | `. $HOME/.config/oosh/oosh.session.env` | `OOSH_MODE` |
 | `log.env` | `. $HOME/.config/oosh/log.session.env` | `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | `config session.save` writes it; `config save` writes the saving
 user's; `config init.user` and the install create it for every user, filled in
-their own hop (`private.config.session.file.ensure`).
+their own hop (`private.config.session.file.ensure`). The ensure creates and
+**first**-fills only — an empty `user.session.env` or a missing `oosh.session.env`;
+an empty `oosh.session.env` is legal (no branch derivable) and is left alone. One
+`config save` writes each session file once (T-CONFIG-SESSION-WRITES-ONCE).
 
 ## Environment Variables
 
