@@ -187,7 +187,9 @@ export PATH="/home/me/oosh:/home/me/oosh/ng:/opt/homebrew/bin:/home/me/.local/bi
 ```
 
 The PATH is frozen per user until the next save: a directory the system adds
-later reaches the shell after `config session.save` (starting `this` saves too).
+later reaches the shell after `config session.save` (starting `this` or `log` saves
+too — before it puts the session-only `~/oosh/init` and `~/oosh/external` on PATH,
+which a login PATH never carries; T-THIS-START-SESSION-PATH).
 `.bashrc`, `source this` and the remote prelude (`ossh.remote.prelude.get`) all
 read it. It cannot guard itself, so `this` drops repeated segments on every
 `source this` (`private.this.path.dedup`, T-THIS-PATH-NO-GROWTH).
