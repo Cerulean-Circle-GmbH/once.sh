@@ -398,6 +398,8 @@ answer by rc):
 | `private.this.env.export.line.get <variableName> <value>` | echo one pure-data `export NAME="value"` line, quoted by bash; rc 1 for a control character or a `$'…'` rendering — the rule `config save` and `log.session.save` share |
 | `private.this.device.is.terminal <device>` | rc 0 when a log device is terminal-type (unset, fd 1, fd 2, the tty) — the one list `info.log` and `log`'s emitter ask |
 | `private.this.path.canonical <path>` | echo the canonical absolute path; GNU `readlink -f` or the BSD fallback |
+| `private.this.tree.tracked.check <treeRoot> <?caller:sweep>` | rc 0 when git lists tracked files under `<treeRoot>`; else an `INVALID:` verdict on stdout and rc 2 — the one guard of the four tree validators, so a sweep that reads nothing (no repository, nothing tracked, "dubious ownership") never reports OK |
+| `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate` and `test.suite.portability.validate`, which keep their own rules and summaries |
 
 `config` owns two more for its shared env files: `private.config.env.lines.drop <file> <prefix…>`
 (drop every line starting with a prefix, in place, owner/group/mode kept; an unchanged file is

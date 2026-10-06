@@ -25,7 +25,9 @@ A raw git call is allowed only when it carries a comment-anchored marker:
 | `# ogit-exception: <reason>` | on the same line, or within the **5 lines above** it (calls inside a heredoc or a `bash -c` string cannot carry it on the line) | one sanctioned call |
 | `# ogit-exception-file: <reason>` | on its own comment line, anywhere in the file | a whole file that runs before oosh exists (`init/oosh`, `init/once`, `Install oosh.command`) |
 
-Excluded from the sweep: `ogit` itself, `docs/`, `test/`, `.claude/`, `old/`, `restore/`, `*.md`, `*.json`. Lines that are only comments never count. If git cannot list any tracked files (no repository, or a "dubious ownership" refusal) the validator reports `INVALID`, never a silent `OK`.
+A raw git call is any of four spellings: `git <subcommand>`; the binary by its path, `/usr/bin/git <subcommand>`; a lookup used as the command, `"$(command -v git)" <subcommand>` or `$(which git) <subcommand>`; and the assignment of the binary to a variable, `GIT=$(command -v git)`, `gitBin=/usr/bin/git` — the later call through `$GIT` cannot be seen, so the assignment is what counts. A presence check such as `[ -x "$(command -v git)" ]` is no call.
+
+Excluded from the sweep: `ogit` itself, `docs/`, `test/`, `.claude/`, `old/`, `restore/`, `*.md`, `*.json`. Lines that are only comments never count. If git cannot list any tracked files (no repository, nothing tracked, or a "dubious ownership" refusal) the validator reports `INVALID` with rc 2, never a silent `OK` — the kernel's `private.this.tree.tracked.check`, the guard all four tree validators share; the sweep itself is `private.this.marker.sweep` ([oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)).
 
 ### Conventions
 
