@@ -106,8 +106,9 @@ error — writes through `private.log.emit`:
 that cannot be opened — `/dev/tty` without a controlling terminal (ssh exec, cron), a file
 nobody may write — falls back to `/dev/stderr`; the fd 1 / fd 2 spellings
 (`private.log.device.is.capture`) are never probed, because a probe of fd 1 is exactly the
-leak into `$(…)`. The probe writes no line. `log.device` sets and reports only; `LOG_DEVICE`
-is persisted per user by `log.session.save`, never through `config save`. Back-port of
+leak into `$(…)`. The probe writes no line. `log.device` sets and reports only; a `LOG_DEVICE`
+that is a file is persisted per user by `log.session.save` (a terminal never is, below), never
+through `config save`. Back-port of
 Marcel's #41 (`c0e6036`, kept on `test/macos.latest`). `info.log` in `this` (LOG_LEVEL > 3)
 runs before `log` is loaded and applies the same rule inline; `ossh`'s dry-run lines and
 `c2`'s level-5 dumps go through `private.log.emit` too.
@@ -119,7 +120,7 @@ runs before `log` is loaded and applies the same rule inline; `ossh`'s dry-run l
 | `LOG_LEVEL` | 3 | Current log verbosity | shared (`log.env`) |
 | `LOG_LEVEL_RESET` | - | Previous level for toggle | shared (`log.env`) |
 | `LOG_NAME` | `user@host` | OOSH log identity (see below) | per-user (`log.session.env`) |
-| `LOG_DEVICE` | /dev/tty | Output destination | per-session (`log.session.env`) |
+| `LOG_DEVICE` | the live tty | Output destination | per-session; only a chosen file is saved (`log.session.env`) |
 | `LOG_LIVE` | `~/.config/oosh/log.live.out` | Live log file path | per-user (`log.session.env`) |
 | `STEP_DEBUG` | OFF | Interactive debug mode | volatile |
 
@@ -140,8 +141,18 @@ that file exists for every user (`config save log`, `config init.user`).
 a new terminal with the same values leaves the file (and its mtime) alone
 (T-LOG-SESSION-SAVE-IDEMPOTENT). The `.bashrc` does not source `log` itself:
 `source ~/oosh/this` has loaded it already (this → debug → log; T-BASHRC-LOG-ONCE).
-`LOG_DEVICE` names the terminal, so two terminals of one user still take turns
-rewriting the file — the device is re-derived at every shell start (below).
+
+**A terminal is never saved — only a file you chose.** `log.session.save` writes the
+`LOG_DEVICE` line only when the device is a file or another non-terminal device
+(`log device ~/my.log`, `/dev/null`). A terminal — `/dev/tty`, `/dev/pts/N`, `/dev/ttyN`,
+stdout/stderr and their fd spellings, or unset — is left out, and the file simply has no
+`LOG_DEVICE` line, exactly like a brand-new user's. Every terminal has its own device and
+derives it at start anyway; saving it made two terminals of one user take turns rewriting
+the file, and a process without a terminal (`sh -c '. ~/config/user.env; …'`, cron) inherited
+the last terminal and wrote its lines into it. The one rule for "a device of one terminal
+session" is `private.log.device.is.session` (the kernel's terminal-type list plus
+`/dev/pts/*` and `/dev/tty*`); `log`'s top-level uses the same rule (T-LOG-DEVICE-IS-SESSION,
+T-LOG-SESSION-DEVICE-TERMINAL, T-LOG-SESSION-DEVICE-TWO-TERMINALS).
 
 The shared `log.env` is linked to the per-user file by a source chain — its last
 line is `. $HOME/.config/oosh/log.session.env` (POSIX `.`, not the bash
@@ -151,12 +162,13 @@ each user loads their OWN file). This means a value you set with `log name
 keeps an already-set `LOG_NAME` (`${LOG_NAME:-user@host}`), so the saved name
 wins and the `user@host` default only fills in when none is saved.
 
-`LOG_DEVICE` is a per-session value and the saved one is the PREVIOUS session's
-tty, so `log` must not let it win: when the shell has a live tty, `log`'s
-top-level **always re-derives `LOG_DEVICE` to the current tty** (a pts owned by
-the same user is writable, so a plain `-w` check would wrongly keep the stale
-one and send this shell's output to the old terminal); it falls back to the
-`fd/1` → `/dev/null` cascade only for non-tty contexts (`ssh exec`, cron, CI).
+`LOG_DEVICE` is a per-session value. An older session file, or a parent shell's
+environment, can still carry another terminal's device, so `log` must not let it win:
+when the shell has a live tty, `log`'s top-level **always re-derives a terminal
+`LOG_DEVICE` to the current tty** (a pts owned by the same user is writable, so a plain
+`-w` check would wrongly keep the stale one and send this shell's output to the old
+terminal); a file, `/dev/null` and the fd 1 / fd 2 spellings are kept. It falls back to
+the `fd/1` → `/dev/null` cascade only for non-tty contexts (`ssh exec`, cron, CI).
 `LOG_LIVE` re-anchors to the per-user default.
 
 **The session file is pure data, whatever you name yourself.** `log.session.save`
@@ -395,7 +407,7 @@ bash
 - All logging functions write to `$LOG_DEVICE`
 - Default is the live terminal (`tty`); `log`'s top-level re-derives it each shell
 - During testing, it may be redirected to a temp file for capture
-- Per-user/session log vars persist to `$HOME/.config/oosh/log.session.env` (not the shared `~/config/log.env`)
+- Per-user/session log vars persist to `$HOME/.config/oosh/log.session.env` (not the shared `~/config/log.env`); `LOG_DEVICE` only when it is a file you chose
 
 ### Understanding LOG_DEVICE and LOG_LIVE
 

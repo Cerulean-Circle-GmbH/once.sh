@@ -7,28 +7,57 @@
 # export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
 # set -x
 
+private.log.device.is.session()     # <device> # rc 0 when <device> belongs to one terminal session and is never saved: a terminal-type device of the kernel list or a /dev/pts/N or /dev/ttyN terminal #
+{
+ # A predicate: rc only. The ONE rule for "a device of one terminal session":
+ # the file-scope block below refreshes such a device to the live terminal,
+ # log.session.save never writes it (T-LOG-DEVICE-IS-SESSION,
+ # T-LOG-SESSION-DEVICE-TERMINAL). The kernel's list
+ # (private.this.device.is.terminal) does not know /dev/pts/N or /dev/ttyN —
+ # the terminal paths every new shell derives for itself. Created by
+ # oo method.new and moved up here: the file-scope block runs at source time.
+ # The pts/ttyN case is asked first, so it holds where log is sourced alone.
+ case "${1:-}" in
+   /dev/pts/*|/dev/tty*) return 0 ;;
+ esac
+ private.this.device.is.terminal "${1:-}"
+}
+
+
+private.log.device.is.capture()     # <device> # rc 0 when <device> is a capture spelling of fd1 or fd2 (/dev/stdout, /proc/self/fd/1, /dev/fd/1, /dev/stderr, /proc/self/fd/2, /dev/fd/2) — never probed by log.device: a probe of fd1 is the #41 leak into $() #
+{
+ # A predicate: rc only. The fd1/fd2 spellings — writing them is a dup that
+ # never fails, and a probe of fd1 IS the leak into a $() capture (#41). Every
+ # other device (/dev/tty, a file) is probed by private.log.device.probe.
+ # Moved up here: the file-scope block below keeps a capture spelling.
+ case "${1:-}" in
+   /dev/stdout|/proc/self/fd/1|/dev/fd/1|/dev/stderr|/proc/self/fd/2|/dev/fd/2) return 0 ;;
+ esac
+ return 1
+}
+
+
 # Ensure LOG_DEVICE points at the LIVE terminal — prevents "ambiguous redirect"
-# errors AND the stale-device trap: LOG_DEVICE is now loaded from the chained
-# log.session.env (user.env's chain sources it before this runs), where it holds the PREVIOUS
-# session's tty (e.g. /dev/pts/1). A pts owned by the same user is still writable,
-# so a plain `-w` guard would keep it and this shell's console.log/important.log
-# would land on the WRONG terminal. So: when stdout is a live tty, ALWAYS
-# re-derive it (the live terminal wins); only fall back to the fd/null cascade for
-# non-tty contexts (ssh exec, cron, CI) with no usable device set.
+# errors AND the stale-device trap. log.session.save no longer writes a
+# terminal device (only a file the user chose), but a parent shell may still
+# hand down another terminal's /dev/pts/N in the environment. A pts owned by
+# the same user is still writable, so a plain `-w` guard would keep it and this
+# shell's console.log/important.log would land on the WRONG terminal. So: when
+# stdout is a live tty, ALWAYS re-derive it (the live terminal wins); only fall
+# back to the fd/null cascade for non-tty contexts (ssh exec, cron, CI) with no
+# usable device set.
 _oosh_livetty="$(tty 2>/dev/null)"
 if [ -n "$_oosh_livetty" ] && [ "$_oosh_livetty" != "not a tty" ] && [ -w "$_oosh_livetty" ]; then
   # A controlling terminal is attached. The LIVE terminal wins over a STALE
-  # terminal device loaded from the chained log.session.env (a PREVIOUS session's
-  # /dev/pts/N, still writable because same-user — it would send this shell's
-  # output to the old terminal). But do NOT override an EXPLICIT non-terminal
-  # device: a capture file (tests set `LOG_DEVICE=/tmp/…`), `log device <file>`,
-  # or /dev/null must be respected. So refresh only when LOG_DEVICE is empty or
-  # is itself a terminal path; leave any other value alone.
-  case "$LOG_DEVICE" in
-    "" | "$_oosh_livetty") export LOG_DEVICE="$_oosh_livetty" ;;
-    /dev/pts/* | /dev/tty*)  export LOG_DEVICE="$_oosh_livetty" ;;  # stale terminal → refresh
-    *) : ;;                                                          # explicit non-terminal → respect
-  esac
+  # terminal device (another session's /dev/pts/N, still writable because
+  # same-user — it would send this shell's output to the old terminal). But do
+  # NOT override an EXPLICIT device: a capture file (tests set
+  # `LOG_DEVICE=/tmp/…`), `log device <file>`, /dev/null, or an fd1/fd2 capture
+  # spelling must be respected. So refresh only a session device (empty,
+  # /dev/tty, a pts or ttyN) that is not a capture spelling.
+  if private.log.device.is.session "${LOG_DEVICE:-}" && ! private.log.device.is.capture "${LOG_DEVICE:-}"; then
+    export LOG_DEVICE="$_oosh_livetty"
+  fi
 elif [ -z "$LOG_DEVICE" ] || [ ! -w "$LOG_DEVICE" ]; then
   # No terminal (ssh exec, cron, CI) and no usable device set — fall back.
   if [ -w /proc/self/fd/1 ]; then
@@ -477,8 +506,15 @@ log.session.save() { # # persist per-user/session log vars (LOG_NAME, LOG_DEVICE
   # terminals and a second run change nothing (T-LOG-SESSION-SAVE-IDEMPOTENT).
   # read -d '' takes the whole file, trailing newlines included; it answers
   # rc 0 only when it met a NUL byte, which the built text never holds.
+  # LOG_DEVICE is written only when the user chose a file (or another
+  # non-terminal device): a terminal device belongs to one session, every new
+  # shell derives its own, and a process without a terminal that sources the
+  # chain would write into another terminal (T-LOG-SESSION-DEVICE-TERMINAL,
+  # T-LOG-SESSION-DEVICE-TWO-TERMINALS). No line is pure data too: a brand-new
+  # user's file has none.
   local d="$HOME/.config/oosh" body="" variableName line saved=""
   for variableName in LOG_NAME LOG_DEVICE LOG_LIVE; do
+    [ "$variableName" = LOG_DEVICE ] && private.log.device.is.session "${LOG_DEVICE:-}" && continue
     if ! line=$(private.this.env.export.line.get "$variableName" "${!variableName}"); then
       create.result 1 "log.session.save: $variableName cannot be written as pure data — $d/log.session.env kept"
       error.log "$RESULT"
@@ -646,18 +682,6 @@ private.log.emit()     # <line> # write one preformatted log line: a terminal-ty
  else
    { printf '%b\n' "$1" >>"$LOG_DEVICE"; } 2>/dev/null || printf '%b\n' "$1" >&2
  fi
-}
-
-
-private.log.device.is.capture()     # <device> # rc 0 when <device> is a capture spelling of fd1 or fd2 (/dev/stdout, /proc/self/fd/1, /dev/fd/1, /dev/stderr, /proc/self/fd/2, /dev/fd/2) — never probed by log.device: a probe of fd1 is the #41 leak into $() #
-{
- # A predicate: rc only. The fd1/fd2 spellings — writing them is a dup that
- # never fails, and a probe of fd1 IS the leak into a $() capture (#41). Every
- # other device (/dev/tty, a file) is probed by private.log.device.probe.
- case "${1:-}" in
-   /dev/stdout|/proc/self/fd/1|/dev/fd/1|/dev/stderr|/proc/self/fd/2|/dev/fd/2) return 0 ;;
- esac
- return 1
 }
 
 
