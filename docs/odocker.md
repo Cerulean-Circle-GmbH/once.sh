@@ -42,7 +42,9 @@ says why (`private.odocker.engine.supported`, T-ODOCKER-ENGINE-SUPPORTED,
 no docker (the picker of `odocker up`) still runs, a docker call fails on its own
 (T-ODOCKER-START-CONTINUES). **During a test run nothing is installed**:
 `test.suite` exports `OOSH_NO_INSTALL=1`, and a started odocker then installs
-nothing and changes no group or config (T-ODOCKER-START-NO-INSTALL).
+nothing and changes no group or config (T-ODOCKER-START-NO-INSTALL). The
+socket odocker looks for is `$ODOCKER_SOCKET`, else `/var/run/docker.sock`
+(T-ODOCKER-SOCKET-ENV) — how a test gives a started odocker a socket of its own.
 
 Only a **started** method that runs Docker does this: Tab completion and the
 tests *source* `odocker`, and `usage`, `help` and the `workspace` methods need
