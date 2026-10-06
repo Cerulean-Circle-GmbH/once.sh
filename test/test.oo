@@ -2882,7 +2882,7 @@ expect 0 "drop-in cleanup and launcher install both use sudo -n" \
 # Driven through a PATH shim that LOGS ITS ARGV, so "the PM was never invoked"
 # is an assertion with a diagnostic rather than a bare sentinel. OOSH_PM is
 # pinned in every case: left empty, oo.cmd calls oo.pm.discover, which does a
-# real `config save` and on apt hosts a real `apt-get update`.
+# real `config save` (the apt refresh is T-OO-CMD-REFRESH-ONCE's, on a fixture).
 # CONFIG_PATH is passed through from this file's fixture (test.suite.config.isolate
 # at the top), never env -i'd away, so the child cannot reach the shared tier.
 
@@ -4532,6 +4532,105 @@ test.case - "T-OO-PM-INSTALL-PREFIX-GET: apt-get, dnf, apk and brew as root and 
    test.oo.pmInstallPrefixGet
 expect 0 "sudo none for brew and root, else \$SUDO; apt and brew get their env" \
   "how to call a package manager existed three times: oo.cmd, oo.prereqs.install, ossh.cmd"
+
+# test.oo.pmHost <fx> <pm…>: a fixture host whose package managers are exactly
+# <pm…> — recording stubs on <fx>/bin, as is sudo (it records, then runs the
+# command). An install stub puts the package on <fx>/bin, so oo.cmd's verify
+# finds it. Config, HOME and every record live in <fx>.
+test.oo.pmHost() {
+  local fx="$1" pm; shift
+  mkdir -p "$fx/bin" "$fx/config/stateMachines" "$fx/home"
+  : > "$fx/calls"; : > "$fx/config/user.env"; : > "$fx/config/result.env"; : > "$fx/config/error.txt"
+  printf '#!/bin/sh\necho "sudo $*" >> "$FX/calls"; exec "$@"\n' > "$fx/bin/sudo"
+  for pm; do
+    printf '#!/bin/sh\necho "%s $*" >> "$FX/calls"\ncase " $* " in *" install "*|*" add "*) for p; do :; done; printf "#!/bin/sh\\n" > "$FX/bin/$p"; chmod +x "$FX/bin/$p" ;; esac\nexit 0\n' "$pm" > "$fx/bin/$pm"
+  done
+  chmod +x "$fx/bin/"*
+}
+# test.oo.pmHost.run <fx> <code>: run <code> after sourcing this and oo, in a
+# child that sees only the fixture's package managers (every other one is
+# hidden from `command -v`, also in child processes), with an isolated config,
+# a fixture HOME, SUDO="sudo " and nothing of this shell's package manager state.
+test.oo.pmHost.run() {
+  FX="$1" CODE="$2" env -u OOSH_NO_INSTALL -u OOSH_PM -u OOSH_PM_UPDATED -u OOSH_APT_UPDATED \
+    -u OS_CMD_USER_ADD -u OS_CMD_USER_DEL -u OS_CMD_USER_MOD -u OS_CMD_GROUP_ADD \
+    PATH="$1/bin:$PATH" HOME="$1/home" CONFIG_PATH="$1/config" CONFIG_FILE=user.env CONFIG="$1/config/user.env" \
+    ${TEST_OO_PM_ENV:-} bash -c '
+      command() {
+        if [ "$1" = -v ]; then
+          case "$2" in brew|apt-get|dnf|yum|apk|dpkg|pkg|pacman) [ -x "$FX/bin/$2" ] && echo "$FX/bin/$2"; return ;; esac
+        fi
+        builtin command "$@"
+      }
+      export -f command
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/oo" >/dev/null 2>&1
+      export SUDO="sudo "
+      eval "$CODE"' </dev/null >/dev/null 2>&1
+  tr '\n' '|' < "$1/calls"
+}
+
+# T-OO-PM-DISCOVER-RECORDS: discovering the package manager runs nothing — no sudo, no apt-get update
+# private.check.pm ran "$SUDO apt-get update" the moment it found apt-get, and
+# private.user.init runs oo pm.discover whenever os.commands.env is incomplete:
+# merely sourcing user asked for a sudo password on an apt host (a new user's
+# first shell, every test with an isolated config — 2026-10-06).
+test.oo.pmDiscoverRecords() {
+  local fx bad="" got; fx=$(test.suite.fixture.make oopmdiscover)
+  test.oo.pmHost "$fx" apt-get
+  got=$(test.oo.pmHost.run "$fx" 'oo.pm.discover; echo "pm=[$OOSH_PM]" >> "$FX/calls"')
+  [ "$got" = "pm=[apt-get -y install]|" ] || bad="$bad apt=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "discovery records apt-get and calls nothing" || create.result 1 "discover:$bad"
+  return $(result)
+}
+test.case $level "T-OO-PM-DISCOVER-RECORDS: discovering the package manager runs nothing — no sudo, no apt-get update" test.oo.pmDiscoverRecords
+expect 0 "discovery records apt-get and calls nothing" \
+  "sourcing user on an apt host ran sudo apt-get update — a password prompt in a new shell and in a test run"
+
+# T-OO-CMD-REFRESH-ONCE: the first real install refreshes the package lists once, before it
+# A fresh apt image has empty package lists: the first real install must be
+# preceded by apt-get update — once, also for a second install in the same
+# shell, never for a tool that is there, never in a test run.
+test.oo.cmdRefreshOnce() {
+  local fx bad="" got; fx=$(test.suite.fixture.make oocmdrefresh)
+  test.oo.pmHost "$fx" apt-get
+  got=$(test.oo.pmHost.run "$fx" 'oo.cmd ooshtoolone; echo "rc=$?" >> "$FX/calls"; oo.cmd ooshtooltwo; echo "rc=$?" >> "$FX/calls"')
+  [ "$got" = "sudo apt-get update|apt-get update|sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 LC_ALL=C.UTF-8 DEBCONF_NOWARNINGS=yes apt-get -y install ooshtoolone|apt-get -y install ooshtoolone|rc=0|sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 LC_ALL=C.UTF-8 DEBCONF_NOWARNINGS=yes apt-get -y install ooshtooltwo|apt-get -y install ooshtooltwo|rc=0|" ] \
+    || bad="$bad install=[$got]"
+  test.oo.pmHost "$fx" apt-get
+  got=$(test.oo.pmHost.run "$fx" 'oo.cmd sh; echo "rc=$? pm=[$OOSH_PM]" >> "$FX/calls"')
+  [ "$got" = "rc=0 pm=[]|" ] || bad="$bad present=[$got]"
+  test.oo.pmHost "$fx" apt-get
+  got=$(TEST_OO_PM_ENV="OOSH_NO_INSTALL=1" test.oo.pmHost.run "$fx" 'oo.cmd ooshtoolthree; echo "rc=$?" >> "$FX/calls"')
+  [ "$got" = "rc=1|" ] || bad="$bad no-install=[$got]"
+  test.oo.pmHost "$fx" apt-get
+  got=$(TEST_OO_PM_ENV="OOSH_APT_UPDATED=1" test.oo.pmHost.run "$fx" 'oo.cmd ooshtoolfour; echo "rc=$?" >> "$FX/calls"')
+  [ "$got" = "sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 LC_ALL=C.UTF-8 DEBCONF_NOWARNINGS=yes apt-get -y install ooshtoolfour|apt-get -y install ooshtoolfour|rc=0|" ] || bad="$bad init-refreshed=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "one refresh before the first real install, none otherwise" || create.result 1 "refresh:$bad"
+  return $(result)
+}
+test.case $level "T-OO-CMD-REFRESH-ONCE: the first real install refreshes the package lists once, before it" test.oo.cmdRefreshOnce
+expect 0 "one refresh before the first real install, none otherwise" \
+  "a fresh apt image has empty package lists — the install must still refresh them, once"
+
+# T-OO-PM-OTHER-UNCHANGED: dnf and apk — discovery and install call what they called before
+# Discovery never refreshed dnf, yum or apk; oo.cmd installs on them without a
+# refresh. Recorded on the code before the apt-get change.
+test.oo.pmOtherUnchanged() {
+  local fx bad="" got pm; fx=$(test.suite.fixture.make oopmother)
+  test.oo.pmHost "$fx" dnf
+  got=$(test.oo.pmHost.run "$fx" 'oo.pm.discover; echo "pm=[$OOSH_PM]" >> "$FX/calls"; oo.cmd ooshtoolone; echo "rc=$?" >> "$FX/calls"')
+  [ "$got" = "pm=[dnf -y install]|sudo dnf -y install ooshtoolone|dnf -y install ooshtoolone|rc=0|" ] || bad="$bad dnf=[$got]"
+  rm -rf "$fx/bin"; test.oo.pmHost "$fx" apk
+  got=$(test.oo.pmHost.run "$fx" 'oo.pm.discover; echo "pm=[$OOSH_PM]" >> "$FX/calls"; oo.cmd ooshtoolone; echo "rc=$?" >> "$FX/calls"')
+  [ "$got" = "pm=[apk add]|sudo apk add ooshtoolone|apk add ooshtoolone|rc=0|" ] || bad="$bad apk=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "dnf and apk: no refresh, one install" || create.result 1 "other pms:$bad"
+  return $(result)
+}
+test.case $level "T-OO-PM-OTHER-UNCHANGED: dnf and apk — discovery and install call what they called before" test.oo.pmOtherUnchanged
+expect 0 "dnf and apk: no refresh, one install" "the apt-get fix must not change dnf, yum, apk or brew"
 
 ### test.method
 

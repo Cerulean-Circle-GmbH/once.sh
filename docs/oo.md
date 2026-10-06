@@ -547,6 +547,13 @@ Detects and configures:
 | `pkg install` | FreeBSD |
 | `pacman -S` | Arch Linux |
 
+Discovery only **records**: it sets `OOSH_PM` (and the `OS_CMD_*` group/user
+commands it knows) and saves them — it runs no package manager and no `sudo`.
+It used to run `$SUDO apt-get update` on an apt host, and `private.user.init`
+discovers whenever `os.commands.env` is incomplete, so merely sourcing `user`
+asked for a sudo password (T-OO-PM-DISCOVER-RECORDS, T-USER-SOURCE-NO-SUDO).
+The package lists are refreshed by `oo cmd`, before its first real install.
+
 ### oo.cmd
 
 Ensures a command is installed, installing it if missing.
@@ -563,8 +570,18 @@ The two-argument form installs a package whose name differs from the command:
 oo cmd sshd openssh-server   # command is sshd, package is openssh-server
 ```
 
+A command that is already there costs one `command -v`: no package manager, not
+even its discovery. Under `OOSH_NO_INSTALL` (every test run) nothing is installed
+or refreshed. Otherwise `oo cmd` discovers the package manager if `OOSH_PM` is
+empty and, on apt, refreshes the package lists **once** before the first real
+install — a fresh apt image has empty lists (T-OO-CMD-REFRESH-ONCE). Once means:
+`OOSH_PM_UPDATED` in this shell, and `OOSH_APT_UPDATED`, which `init/oosh`
+exports after its own `apt-get update` and `oo cmd` exports after one, so the
+`oo cmd` children of an install do not refresh again (`config save` never
+persists it). dnf, yum, apk and brew get no refresh before an install.
+
 Special cases:
-- `update` - Refreshes the package-manager cache (`apt-get update` / `dnf makecache` / `yum makecache`)
+- `update` - Refreshes the package-manager cache (`apt-get update` / `dnf makecache` / `yum makecache`), once per process chain as above
 - `errno` - Installs python3
 - `eamd`, `oosh`, `once` - Loads from the ONCE repository; fails naming `once` when it is not installed
 - `mkcert` - Delegates to `once.su.mkcert.install`; fails naming it when undefined
