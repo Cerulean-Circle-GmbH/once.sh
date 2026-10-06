@@ -55,7 +55,11 @@ there got `permission denied`: `private.odocker.socket.access.ensure` creates a
 group with that number when there is none (`docker`, or `dockerhost` when
 `docker` has another number), adds the user to it, and the started call runs
 once more through `sg <group>`, so the new membership counts at once. The socket
-itself is never changed (T-ODOCKER-SOCKET-ACCESS, -SG).
+itself is never changed (T-ODOCKER-SOCKET-ACCESS, -SG). Alpine (BusyBox) has no
+`sg`, and no package provides one: there odocker says the membership counts from
+the next login (T-ODOCKER-NO-SG-NEXT-LOGIN). So that it rarely comes to that,
+**the install already adds every user to the socket's group** when a socket is
+mounted (`private.odocker.socket.group.ensure`, T-USER-INSTALL-SOCKET-GROUP).
 
 ## Configuration
 
