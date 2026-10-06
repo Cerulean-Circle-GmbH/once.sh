@@ -110,7 +110,9 @@ The PROMOTE state machine has two promotion paths that share a common entry and 
 Testing path (dev → testing):
   [13] uncommitted.checked   ← Clean working tree required
   [14] test.suite.passed     ← test.suite core 1 must pass
-  [15] confirmation.received ← User confirms merge (diff stats shown)
+  [15] confirmation.received ← User confirms merge; the commits listed first come
+                               from dev's folder: dev against its fetched
+                               origin/testing ("nothing to merge" when none)
   [16] merged.to.testing     ← merge origin/dev into testing, in <base>/testing
   [17] testing.tagged        ← Tag: testing-YYYY-MM-DD (in <base>/testing)
   [18] testing.pushed        ← push testing + tags from <base>/testing
@@ -125,7 +127,9 @@ Prod path (testing → prod):
                                   failing platform stops the machine at
                                   that state; re-running `oo stage testing`
                                   re-runs only that platform.
-  [N+1] confirmation.received.prod ← User confirms merge testing → prod
+  [N+1] confirmation.received.prod ← User confirms merge testing → prod; the
+                                  commits listed come from <base>/testing
+                                  against its fetched origin/prod
   [N+2] merged.to.prod          ← merge origin/testing into prod, in
                                   <base>/prod (with auto-resolve for
                                   OOSH_SELF_BRANCH drift on init/oosh +
