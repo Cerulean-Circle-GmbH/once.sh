@@ -13,6 +13,18 @@
 # CONTENT (cksum, POSIX) and REWRITTEN (inode + mtime, stat -c with its stat -f
 # twin) of what those methods own for the user running this file.
 #
+# Log output is not state: every method run appends to it. The snapshot leaves
+# out exactly the files the log system writes — LOG_LIVE (default
+# ~/.config/oosh/log.live.out), LOG_INSTALL and a LOG_DEVICE that is a file —
+# as a fresh shell of the user names them; every *.env file stays in.
+#
+# What is accepted, for which method (the 5th field of the method table):
+#   config save — a file REWRITTEN with the same content is a WARNING line,
+#     visible with the file list, not a failure; a content change, a file
+#     added or removed still fails. Owner's decision 2026-10-06: config save's
+#     writer is not changed now (it rewrites the files it saves, unchanged).
+#   every other method — nothing: a rewrite of an unchanged file fails too.
+#
 # A method that cannot be run here without a password prompt (a user without
 # passwordless sudo, where the method calls sudo), or `oo update` whose pull
 # fails (network, credentials), is NOT CHECKED: an expect.fail that says so
@@ -98,6 +110,17 @@ test.platform.shared.idempotence.compare() # <beforeFile> <afterFile> # one line
   return 1
 }
 
+test.platform.shared.idempotence.without() # <listFile> # stdin a snapshot; echo it without the entries whose path is a line of listFile (the log files)
+{
+  # FILENAME, not NR == FNR: an empty listFile must not swallow the snapshot.
+  awk -F '\t' 'FILENAME == ARGV[1] { if ($0 != "") drop[$0] = 1; next } !($1 in drop)' "$1" -
+}
+
+test.platform.shared.idempotence.unaccepted() # <acceptedKind|-> # stdin the lines of compare; echo those that are not of the accepted kind (changed, rewritten, added, removed) — all of them for -
+{
+  grep -v "^$1: " || true
+}
+
 [ -n "$TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY" ] && { return 0 2>/dev/null || exit 0; }
 
 level=$1
@@ -149,23 +172,41 @@ $HOME/config
 /etc/apt/keyrings
 /etc/yum.repos.d"
 
-test.platform.shared.idempotence.snapshotAll() # <file> # the whole snapshot of this user into <file>
+test.platform.shared.idempotence.snapshotAll() # <file> # the whole snapshot of this user into <file>, without the log files listed in $work/logFiles
 {
   local IFS='
 '
   {
-    test.platform.shared.idempotence.snapshot $snapshotPaths
+    test.platform.shared.idempotence.snapshot $snapshotPaths | test.platform.shared.idempotence.without "$work/logFiles"
     printf 'groups of %s\t%s\t-\n' "$userName" "$(id -nG "$userName" 2>/dev/null | tr ' ' '\n' | sort | tr '\n' ' ')"
     printf 'safe.directory\t%s\t-\n' "$(ogit.safeDirectory.list | sort | tr '\n' ' ')"
   } > "$1"
 }
 
-test.platform.shared.idempotence.run() # <outFile> <script> <method...> # the method in a fresh process of this user, stdin closed, OOSH_NO_INSTALL=1 so it installs nothing; its rc
+test.platform.shared.idempotence.fresh() # <command...> # run command in a fresh process of this user: cwd HOME, stdin closed, only HOME USER LOGNAME PATH TERM and OOSH_NO_INSTALL=1 so it installs nothing; its rc
+{
+  ( cd "$HOME" && env -i HOME="$HOME" USER="$userName" LOGNAME="$userName" PATH="$PATH" TERM="${TERM:-dumb}" OOSH_NO_INSTALL=1 \
+      "$@" ) </dev/null
+}
+
+test.platform.shared.idempotence.run() # <outFile> <script> <method...> # the method in a fresh process of this user, output into outFile; its rc
 {
   local outFile="$1" script="$2"
   shift 2
-  ( cd "$HOME" && env -i HOME="$HOME" USER="$userName" LOGNAME="$userName" PATH="$PATH" TERM="${TERM:-dumb}" OOSH_NO_INSTALL=1 \
-      "$HOME/oosh/$script" "$@" ) </dev/null >"$outFile" 2>&1
+  test.platform.shared.idempotence.fresh "$HOME/oosh/$script" "$@" >"$outFile" 2>&1
+}
+
+test.platform.shared.idempotence.logFiles.get() # # echo the files the log system writes for this user — LOG_LIVE, LOG_INSTALL, a LOG_DEVICE that is a file — as a fresh shell of the user names them
+{
+  local file
+  test.platform.shared.idempotence.fresh bash -c \
+    '. "$HOME/oosh/this" >/dev/null 2>&1; printf "%s\n" "$LOG_LIVE" "$LOG_INSTALL" "$LOG_DEVICE"' 2>/dev/null \
+    | while IFS= read -r file; do
+        case "$file" in
+          ""|/dev/*|/proc/*|*.env) ;;
+          *) printf '%s\n' "$file" ;;
+        esac
+      done
 }
 
 # Who may sudo here without a prompt. Root needs none.
@@ -186,16 +227,22 @@ fi
 
 # ----------------------------------------------------------------------------
 # INVARIANT-1..5: per method — run, snapshot, run again, snapshot, compare.
-# Fields of each row: <label> TAB <blocked reason> TAB <recovery> TAB <command>
+# Fields of each row: <label> TAB <blocked reason> TAB <recovery> TAB
+# <accepted kind> TAB <command>. The accepted kind is the one difference that
+# is a WARNING, not a failure, for that method (see the header: config save's
+# rewritten, owner's decision 2026-10-06).
 # ----------------------------------------------------------------------------
 # A tab is IFS white space, so `read` would collapse an empty field: "-" is none.
-methods="config init.user	${initUserBlock:--}	config init.check	config init.user
-oo user.fix	${initUserBlock:--}	config init.check	oo user.fix
-config save	-	config validate.required	config save
-oo update	${initUserBlock:--}	config init.check	oo update
-odocker prereqs.install	-	odocker status	odocker prereqs.install"
+methods="config init.user	${initUserBlock:--}	config init.check	-	config init.user
+oo user.fix	${initUserBlock:--}	config init.check	-	oo user.fix
+config save	-	config validate.required	rewritten	config save
+oo update	${initUserBlock:--}	config init.check	-	oo update
+odocker prereqs.install	-	odocker status	-	odocker prereqs.install"
 
-while IFS='	' read -r label blocked recovery command; do
+# The log files of this user, left out of every snapshot (see the header).
+test.platform.shared.idempotence.logFiles.get > "$work/logFiles"
+
+while IFS='	' read -r label blocked recovery accepted command; do
   [ "$blocked" = "-" ] && blocked=""
   slug=$(printf '%s' "$label" | tr ' .' '__')
   test.case $level "platform.shared.idempotence: a second \`$label\` changes nothing" true
@@ -228,10 +275,16 @@ while IFS='	' read -r label blocked recovery command; do
     else
       expect.fail "\`$label\` changed nothing but its second run failed (rc $secondRc): $lastWords — see: $recovery"
     fi
-  else
+  elif [ -n "$(printf '%s\n' "$differences" | test.platform.shared.idempotence.unaccepted "$accepted")" ]; then
     expect.fail "\`$label\` is not idempotent — its second run (rc $secondRc${lastWords:+: $lastWords}) changed:
 $(printf '%s\n' "$differences" | sed 's/^/      /')
     — see: $recovery"
+  elif [ "$secondRc" != 0 ]; then
+    expect.fail "\`$label\` changed only what is accepted for it ($accepted) but its second run failed (rc $secondRc): $lastWords — see: $recovery"
+  else
+    expect.pass "\`$label\` twice: no content change, no file added or removed (rc $firstRc then $secondRc)
+    WARNING: accepted for \`$label\` (owner's decision 2026-10-06: its writer is not changed now) — $accepted:
+$(printf '%s\n' "$differences" | sed 's/^/      /')"
   fi
 done <<EOF
 $methods
