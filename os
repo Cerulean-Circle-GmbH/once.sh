@@ -275,9 +275,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # Install oosh. init/oosh's POSIX prelude handles its own prereqs
   # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
   # no separate `ossh prereqs.install <host>` pre-step is needed. See
-  # `private.push.init.oosh` (ossh:433) which SCPs init/oosh and runs
-  # its self-install, and init/oosh:188 (git install) + 192-232
-  # (bash install).
+  # `private.push.init.oosh` in ossh which SCPs init/oosh and runs
+  # its self-install, and the git install + the bash install steps of
+  # Phase A in init/oosh.
   ossh install "$platform" test
 
   # The git install above may upgrade openssh-server in place (AlmaLinux 9.8
@@ -312,8 +312,8 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     error.log "Failed to create oosh-user on $platform"
   }
   # Give oosh-user NOPASSWD sudo. Append to /etc/sudoers directly (not
-  # sudoers.d) — matches the existing pattern at os:217 for the test
-  # user; sudoers.d isn't always included on minimal images (alma's
+  # sudoers.d) — matches the sudoers append for the test
+  # user above; sudoers.d isn't always included on minimal images (alma's
   # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
   ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
@@ -397,7 +397,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
     # home, mode 700 owned by test). After `runuser -u oosh-user`, the new
     # user can't read /home/test, so any `find` invocation in test.suite
-    # (e.g. state.machine.exists at state:865) emits hundreds of
+    # (e.g. state.machine.exists in state) emits hundreds of
     # `find: Failed to restore initial working directory: /home/test:
     # Permission denied` lines on stderr. cd'ing to the new user's own
     # home keeps find happy.
@@ -504,7 +504,7 @@ private.os.platform.shared.config.repair() # <platform> # reset sharedConfig gro
   fi
 
   # Resolve the sharedConfig path inside the container via root's
-  # ~/config symlink (set up by user.oosh.install per user:821).
+  # ~/config symlink (set up by user.oosh.install).
   # chgrp+chmod+setgid recover the dev-group-writable invariant; setgid
   # on dirs causes new files to inherit the dev group ownership, so
   # this doesn't have to run between every step — once after root is
@@ -669,7 +669,7 @@ os.check.env() # #
       linux*)
         # Match linux-gnu (glibc), linux-musl (Alpine), and any future
         # variants. Tag as "linux-gnu" — the historical value, kept for
-        # downstream consumers; mirrors the broader pattern in oo:1504.
+        # downstream consumers; mirrors the linux* case in private.check.root.installation.done (oo).
         info.log "      Linux detected"
         export OOSH_OS="linux-gnu"
         ;;
