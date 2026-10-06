@@ -164,7 +164,7 @@ oosh names the computer for the prompt, the logs and ssh (`private.config.host.n
 |---|---|
 | A container | The container's Docker name, read through the mounted docker socket (`private.config.host.container.name.get`). Inside a container `hostname` is only the start of the container ID, so it is not used. |
 | A Mac | The `LocalHostName` (`scutil`), without the router's domain. |
-| A bare computer | The short host name (`hostname -s`). |
+| A bare computer | The short host name (`private.this.host.name.get short`: the `hostname` program, else bash's `$HOSTNAME` — AlmaLinux minimal has no `hostname`; T-CONFIG-HOST-NAME-NO-HOSTNAME). |
 | None found | `localhost` |
 
 A container started by odocker without a name gets Docker's own random name as its name and host name, so the install knows it from the start (`private.odocker.container.name.new`, see [odocker.md](odocker.md)).
