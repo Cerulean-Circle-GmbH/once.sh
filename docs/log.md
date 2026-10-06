@@ -136,6 +136,12 @@ so no user's absolute path leaks to another. The per-user and per-session values
 only to the user's **private** `$HOME/.config/oosh/log.session.env` (default
 `~/.config/oosh`) by `log.session.save`, which `.bashrc` runs once per shell;
 that file exists for every user (`config save log`, `config init.user`).
+`log.session.save` writes only when the built text differs from the file's —
+a new terminal with the same values leaves the file (and its mtime) alone
+(T-LOG-SESSION-SAVE-IDEMPOTENT). The `.bashrc` does not source `log` itself:
+`source ~/oosh/this` has loaded it already (this → debug → log; T-BASHRC-LOG-ONCE).
+`LOG_DEVICE` names the terminal, so two terminals of one user still take turns
+rewriting the file — the device is re-derived at every shell start (below).
 
 The shared `log.env` is linked to the per-user file by a source chain — its last
 line is `. $HOME/.config/oosh/log.session.env` (POSIX `.`, not the bash
