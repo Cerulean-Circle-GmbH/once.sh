@@ -746,6 +746,16 @@ literally at every `/bin/sh` login. Nothing in the `OOSH_*` / `LOG_*` / `CONFIG_
 families is meant to hold a newline, so such a value is an upstream bug;
 `config validate required` is what reports the variable as missing.
 
+A value holding a command substitution `$(` or a backtick is **refused** too. Bash would
+escape it and nothing would run, but `config.validate` rejects every line that holds one —
+env files are pure data and the validator has no exception — so the writer
+(`private.this.env.export.line.get`) gives way, and `config save` never reports its own
+file INVALID. A refused variable is not written, and `config save` says so with an error
+line naming it. Everything else round-trips as given in bash and every POSIX `sh`: spaces,
+quotes, a backslash, `$NAME` or `${NAME}` as literal text (T77,
+T-CONFIG-WRITER-VALIDATOR-AGREE). A saved PATH segment is stricter still: one holding any
+`$ " \` or backtick is dropped (`private.config.path.segments.get`).
+
 ## Completion Support
 
 The config script provides tab completion for:

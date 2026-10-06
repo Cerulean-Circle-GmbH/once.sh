@@ -395,7 +395,7 @@ answer by rc):
 | `private.this.file.same <fileA> <fileB>` | rc 0 when both files exist with identical bytes: `cmp -s` where it exists, else an exact `od` byte dump of each (AlmaLinux minimal has no diffutils) |
 | `private.this.host.name.get <?form:full\|short>` | echo the host name: the `hostname` program when it exists, else bash's `$HOSTNAME`; `short` is up to the first dot |
 | `private.this.temp.dir.get <?label:oosh>` | echo the canonical path of a new private directory (mode 700) under `TMPDIR`, else `/tmp`; the caller removes it (tests use `test.suite.fixture.make`) |
-| `private.this.env.export.line.get <variableName> <value>` | echo one pure-data `export NAME="value"` line, quoted by bash; rc 1 for a control character or a `$'…'` rendering — the rule `config save` and `log.session.save` share |
+| `private.this.env.export.line.get <variableName> <value>` | echo one pure-data `export NAME="value"` line, quoted by bash; rc 1 for a control character, a `$(` or backtick (the validator rejects them), or a `$'…'` rendering — the rule `config save` and `log.session.save` share |
 | `private.this.device.is.terminal <device>` | rc 0 when a log device is terminal-type (unset, fd 1, fd 2, the tty) — the one list `info.log` and `log`'s emitter ask |
 | `private.this.path.canonical <path>` | echo the canonical absolute path; GNU `readlink -f` or the BSD fallback |
 | `private.this.path.case.get <path>` | echo the path in the file system's canonical letter case (macOS: osascript POSIX path, trailing `/` dropped); the path unchanged when osascript is absent or fails |
