@@ -23,6 +23,12 @@ itself knows no per-platform names). Which Docker depends on the computer:
   computer and started (`private.odocker.engine.start`): systemd, else OpenRC
   (Alpine), else a SysV `service`; on macOS **colima**, the Docker VM
   (`colima start`).
+- **A container without the host's socket** (`private.this.container.is`:
+  `/.dockerenv` or `/run/.containerenv`): only the **client** — no engine can
+  start in a container — and a warning that no docker socket is mounted and the
+  container must be started with the `docker` option (as
+  `odocker reset <image> <port> docker` does); the called method still runs
+  (T-THIS-CONTAINER-IS, T-ODOCKER-PREREQ-CONTAINER-NO-SOCKET, -ENGINE-SUPPORTED).
 
 | | apt (Ubuntu/Debian) | apk (Alpine) | dnf / yum (Alma/RHEL) | brew (macOS) |
 |---|---|---|---|---|
