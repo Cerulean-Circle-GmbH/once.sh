@@ -33,7 +33,7 @@ Excluded from the sweep: `ogit` itself, `docs/`, `test/`, `.claude/`, `old/`, `r
 - **Skipping an optional positional:** pass an empty string — `ogit remote.push "" no "$dir"` pushes the tracking branch, without tags, in `$dir`.
 - **Getters vs mutators.**
   - *Getters* (`*.get`, `*.list`, `*.check`, `*.show`, `branch.find`, …) answer on stdout or by rc, never call `create.result`, and are silent (git stderr goes to `/dev/null`). That makes them safe inside tab completion and `$( … )`.
-  - *Mutators* (`branch.checkout`, `remote.pull`, `commit.create`, `safeDirectory.add`, …) call `create.result` and `return $(result)`. They run git through `private.ogit.git.run`, which keeps git's stderr; on failure `RESULT` is the ogit message followed by ` — git: <git's own error text>`, e.g. `could not check out feature/x in /home/…/dev — git: error: pathspec 'feature/x' did not match any file(s) known to git`.
+  - *Mutators* (`branch.checkout`, `remote.pull`, `commit.create`, `safeDirectory.add`, …) call `create.result` and `return $(result)`. They run git through `private.ogit.git.run`, which keeps git's stderr; on failure `RESULT` is the ogit message followed by ` — git: <git's own error text>`, e.g. `could not check out feature/x in /home/…/dev — git: error: pathspec 'feature/x' did not match any file(s) known to git`. In a shared repository (`core.sharedRepository` set) git runs with umask 002 — git does not apply the setting to every file it writes (FETCH_HEAD, COMMIT_EDITMSG, a checked-out work-tree file). `private.ogit.umask.get` makes that decision once; `commit.create` with the editor (which needs the terminal, so its output is not captured) applies the same umask.
   - A mutator that finds no git binary fails with rc 127 and ``ogit: git is not installed — run `oo cmd git` ``.
 - Some getters return their answer in `RESULT` rather than on stdout; the tables say so (`commit.count`, `branch.compare`).
 
@@ -159,7 +159,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `index.add` | `<?scope:all> <?dir:$OOSH_DIR> <?paths...>` | stage: `all` (`-A`), `updated` (`-u`, tracked files only), or the given `<paths>`; variadic, so `<?dir>` precedes `<paths>` |
-| `index.remove` | `<path> <?dir:$OOSH_DIR>` | remove `<path>` from the index and the working tree of `<dir>` (`git rm`); rc 1 when `<path>` is not tracked |
+| `index.remove` | `<path> <?dir:$OOSH_DIR>` | remove `<path>` from the index and the working tree of `<dir>` (`git rm`); rc 1 when git refuses (not tracked, local changes) — `RESULT` carries git's reason |
 
 ### commit
 
