@@ -351,7 +351,12 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   # The shared log.env's OLD chain line becomes . $HOME/.config/oosh/…: oo
   # update and oo user.fix reach here, which is how an installed host leaves
   # it (T-CONFIG-LOG-CHAIN-MIGRATE).
-  private.config.log.chain.migrate "$sharedConfig"
+  # A migrate answers rc 2 + RESULT "cannot write <file>" for a failed write —
+  # warned, visible, and named in this method's own result — and rc 1 for a
+  # closed gate, which keeps its info line (T-CONFIG-INIT-USER-WRITE-FAIL).
+  local writeFailed="" migrateRc
+  private.config.log.chain.migrate "$sharedConfig" \
+    || { warn.log "config.init.user: $RESULT"; writeFailed="$writeFailed; $RESULT"; }
 
   # The forked user.env (boss, 2026-10-02): as root, every user linked to the
   # shared config first gets their own user.session.env (each in their own
@@ -362,10 +367,18 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   # …and every one of them the oosh .bashrc this tree carries — one
   # `sudo oo update` brings a new prompt to all (T-CONFIG-BASHRC-ALL).
   private.config.bashrc.ensure.all "$sharedConfig" "$sharedOosh"
-  private.config.user.session.migrate "$sharedConfig" \
-    || info.log "config.init.user: the shared user.env keeps its PATH line until every user of it has ~/.config/oosh/user.session.env — run: sudo oo update"
-  private.config.oosh.session.migrate "$sharedConfig" \
-    || info.log "config.init.user: the shared oosh.env chains oosh.session.env once every user of it has one — run: sudo oo update"
+  private.config.user.session.migrate "$sharedConfig"; migrateRc=$?
+  case "$migrateRc" in
+    0) ;;
+    1) info.log "config.init.user: the shared user.env keeps its PATH line until every user of it has ~/.config/oosh/user.session.env — run: sudo oo update" ;;
+    *) warn.log "config.init.user: $RESULT"; writeFailed="$writeFailed; $RESULT" ;;
+  esac
+  private.config.oosh.session.migrate "$sharedConfig"; migrateRc=$?
+  case "$migrateRc" in
+    0) ;;
+    1) info.log "config.init.user: the shared oosh.env chains oosh.session.env once every user of it has one — run: sudo oo update" ;;
+    *) warn.log "config.init.user: $RESULT"; writeFailed="$writeFailed; $RESULT" ;;
+  esac
 
   # Git trust of every folder under the base (clone layout, spec § 4): each
   # folder is its own repository with its own safe.directory entry, and
@@ -389,6 +402,10 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
     user.group.add dev "$username" >/dev/null 2>&1
   fi
 
+  if [ -n "$writeFailed" ]; then
+    create.result 1 "config.init.user: $username aligned, but the shared config could not be written${writeFailed}"
+    return $(result)
+  fi
   success.log "config.init.user: ${GREEN}$username${NORMAL} aligned"
 }
 
@@ -784,10 +801,15 @@ private.config.variables.export()     # <envPrefix> <?sessionSplit> # echo the c
   # Line by line, for the same reason as private.config.variables.list.
   # A refused value is said, not dropped silently: error.log goes through
   # private.log.emit, which never writes stdout — this file's body
-  # (T-CONFIG-WRITER-VALIDATOR-AGREE).
+  # (T-CONFIG-WRITER-VALIDATOR-AGREE). The line is built first and written
+  # after, so a write that fails (a full disk) is not mistaken for a refusal.
+  local line
   private.config.variables.list "$envPrefix" "$sessionSplit" | while IFS= read -r variableName; do
-    private.config.variable.export.line "$variableName" \
-      || error.log "config save: $variableName is not saved — its value cannot be one line of pure data (a control character, \$( or a backtick)"
+    if line=$(private.config.variable.export.line "$variableName"); then
+      printf '%s\n' "$line"
+    else
+      error.log "config save: $variableName is not saved — its value cannot be one line of pure data (a control character, \$( or a backtick)"
+    fi
   done
 }
 
@@ -1006,17 +1028,19 @@ private.config.log.chain.migrate()     # <?configPath:$CONFIG_PATH> # rewrite lo
  # `/log.session.env` — a plain sh stops there. config save (before it writes)
  # and config.init.user (oo update, oo user.fix) run this. In place (owner,
  # group and mode kept): the new chain goes on as the LAST line — where log.env
- # keeps it — then the old one leaves, so no moment is without a chain. rc 1
- # (RESULT says why) when log.env cannot be written. T-CONFIG-LOG-CHAIN-MIGRATE,
- # T-CONFIG-MIGRATE-WRITE-FAIL.
+ # keeps it — then the old one leaves, so no moment is without a chain. The
+ # migrates share one answer: rc 2 + RESULT "cannot write <file>" when a file
+ # cannot be written, rc 1 only for a closed gate (this one has none) — so a
+ # caller warns about the one and keeps its gate message for the other.
+ # T-CONFIG-LOG-CHAIN-MIGRATE, T-CONFIG-MIGRATE-WRITE-FAIL.
  local configPath="${1:-$CONFIG_PATH}" f
  local old='. $OOSH_USER_CONFIG_PATH/log.session.env'   # legacy-chain: the line being migrated away
  local new='. $HOME/.config/oosh/log.session.env'
  f="$configPath/log.env"
  [ -f "$f" ] || return 0
  grep -qxF "$old" "$f" 2>/dev/null || return 0
- private.config.env.line.append "$f" "$new" || return 1
- private.config.env.lines.drop "$f" "$old"
+ private.config.env.line.append "$f" "$new" || return 2
+ private.config.env.lines.drop "$f" "$old" || return 2
 }
 
 
@@ -1232,18 +1256,19 @@ private.config.user.session.migrate()     # <?configPath:$CONFIG_PATH> # switch 
  # gate checks it). In place (owner, group and mode of the shared files
  # kept), as private.config.log.chain.migrate: the chain goes on last first,
  # then PATH leaves — a shell started in between still has a PATH. rc 1 when
- # the gate is closed or a shared file cannot be written (RESULT says which
- # file). T-CONFIG-USER-SESSION-MIGRATE, T-CONFIG-MIGRATE-WRITE-FAIL.
+ # the gate is closed; rc 2 when a shared file cannot be written (RESULT
+ # "cannot write <file>"), as private.config.log.chain.migrate.
+ # T-CONFIG-USER-SESSION-MIGRATE, T-CONFIG-MIGRATE-WRITE-FAIL.
  local configPath="${1:-$CONFIG_PATH}" f
  local chain='. $HOME/.config/oosh/user.session.env'
  f="$configPath/user.env"
  [ -f "$f" ] || return 0
  private.config.session.split.is "$configPath" && return 0
  private.config.session.chain.ready "$configPath" || return 1
- private.config.env.line.append "$f" "$chain" || return 1
+ private.config.env.line.append "$f" "$chain" || return 2
  # path-exception: the prefixes of the line being moved out, not an assignment.
- private.config.env.lines.drop "$f" "export PATH=" "PATH=" || return 1
- private.config.env.lines.drop "$configPath/oosh.env" "export OOSH_MODE=" "OOSH_MODE="
+ private.config.env.lines.drop "$f" "export PATH=" "PATH=" || return 2
+ private.config.env.lines.drop "$configPath/oosh.env" "export OOSH_MODE=" "OOSH_MODE=" || return 2
 }
 
 
@@ -1292,7 +1317,8 @@ private.config.oosh.session.migrate()     # <?configPath:$CONFIG_PATH> # chain t
  # last first, then OOSH_MODE leaves. After the switch the transition copy of
  # OOSH_MODE in user.session.env goes — root reaches every linked user's; a
  # file the caller may not write is left to its owner. rc 1 when the gate is
- # closed or a file cannot be written (RESULT says which).
+ # closed; rc 2 when a file cannot be written (RESULT "cannot write <file>"),
+ # as private.config.log.chain.migrate.
  # T-CONFIG-OOSH-SESSION-MIGRATE, T-CONFIG-MIGRATE-WRITE-FAIL.
  local configPath="${1:-$CONFIG_PATH}" f h owner rc=0
  local chain='. $HOME/.config/oosh/oosh.session.env'
@@ -1300,14 +1326,14 @@ private.config.oosh.session.migrate()     # <?configPath:$CONFIG_PATH> # chain t
  [ -f "$f" ] || return 0
  if ! private.config.oosh.session.split.is "$configPath"; then
    private.config.session.chain.ready "$configPath" oosh || return 1
-   private.config.env.line.append "$f" "$chain" || return 1
-   private.config.env.lines.drop "$f" "export OOSH_MODE=" "OOSH_MODE=" || return 1
+   private.config.env.line.append "$f" "$chain" || return 2
+   private.config.env.lines.drop "$f" "export OOSH_MODE=" "OOSH_MODE=" || return 2
  fi
  while read -r h owner; do
    [ -z "$h" ] && continue
    f="$h/.config/oosh/user.session.env"
    [ -w "$f" ] || continue
-   private.config.env.lines.drop "$f" "export OOSH_MODE=" || rc=1
+   private.config.env.lines.drop "$f" "export OOSH_MODE=" || rc=2
  done <<HOMES
 $(private.config.linked.homes.get "$configPath")
 HOMES
@@ -1558,8 +1584,10 @@ private.config.save()     # <?name> <?ENV_PREFIX> <?sessionSplit> <?ooshSplit> #
   # the end of the no-arg branch).
   local configSaveRc=0
   # A host's OLD log.env chain line first: this save may drop the removed
-  # per-user dir variable from oosh.env (T-CONFIG-LOG-CHAIN-MIGRATE).
-  private.config.log.chain.migrate "$CONFIG_PATH"
+  # per-user dir variable from oosh.env (T-CONFIG-LOG-CHAIN-MIGRATE). A
+  # log.env that cannot be written is said, not stepped over
+  # (T-CONFIG-SAVE-MIGRATE-WRITE-FAIL); the save goes on.
+  private.config.log.chain.migrate "$CONFIG_PATH" || warn.log "config.save: $RESULT"
 
   local file=$1
   shift

@@ -701,7 +701,13 @@ serve odocker, os and c2.
 The last two are how the migrates (`private.config.log.chain.migrate`,
 `private.config.user.session.migrate`, `private.config.oosh.session.migrate`) edit the
 shared env files: the chain line goes on first, then the old lines leave, and a failed
-write is rc 1, never a silent success (T-CONFIG-MIGRATE-WRITE-FAIL). They write in
+write is never a silent success. The migrates answer in one convention: **rc 2** + `RESULT`
+`cannot write <file>` for a write that failed, **rc 1** only for a closed gate
+(T-CONFIG-MIGRATE-WRITE-FAIL). `config init.user` warns the `RESULT` of a failed write
+(visible at the default log level), keeps its info line with `run: sudo oo update` for a
+closed gate, and answers rc 1 with a result that names what could not be written
+(T-CONFIG-INIT-USER-WRITE-FAIL); `config save` warns too and goes on
+(T-CONFIG-SAVE-MIGRATE-WRITE-FAIL). They write in
 place, not through `replace commit`: that puts a new file under the name, so a
 dev-group user who is not the owner would become the shared file's owner.
 
