@@ -623,6 +623,11 @@ a warning, no package manager and no sudo. A present one is still rc 0. `oo.cmd`
 every install goes through, so it owns this rule (T-CMD-NO-INSTALL; see
 [test-suite.md](test-suite.md#a-test-run-installs-nothing)).
 
+**BusyBox wget** (alpine) is present but too limited, so `oo cmd wget` upgrades it to full wget —
+through the same refusal and the same package-manager check as any install: nothing under
+`OOSH_NO_INSTALL`, nothing when no package manager is known (never a bare `sudo wget`). The stub
+works, so both answer rc 0 with a warning (T-CMD-NO-INSTALL-BUSYBOX).
+
 ### oo.cmd.find
 
 Searches apt repositories for a command. The method is `oo.cmd.find` — this
