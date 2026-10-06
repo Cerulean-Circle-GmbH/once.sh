@@ -46,7 +46,14 @@ T-ODOCKER-DOCKER-REPO-APT). It is added **once**: when its file is there
 nothing is downloaded, written or updated. The key (apt) or the `.repo` file
 (dnf/yum) is downloaded to a temporary file first; a failed or empty download
 leaves nothing behind and answers rc 1 — an empty key used to break every later
-`apt-get update`. Any other package manager has no Docker repository (rc 1).
+`apt-get update`. A write that fails removes **only what this call wrote**: a
+key at Docker's documented `/etc/apt/keyrings/docker.asc` that was there before
+(a person's own setup) stays. An `apt-get update` that fails after a good write
+(another repository, a mirror) keeps the key and the list and answers rc 1,
+"added, but the package lists could not be refreshed: …" — the caller warns and
+goes on, and the next call finds the list and does nothing
+(T-ODOCKER-DOCKER-REPO-CLEANUP; the container add the same, T-ODOCKER-INSTALL-RAW).
+Any other package manager has no Docker repository (rc 1).
 The optional `<root>` (default `/`) lets the test work on a fixture. The engine packages create
 the group `docker`; the socket access below adds the user to it (colima's socket
 belongs to the user — no group). T-ODOCKER-PREREQ-PACKAGE-ENGINE, -ENGINE-START,

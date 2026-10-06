@@ -1805,6 +1805,59 @@ test.case $level "T-ODOCKER-DOCKER-REPO-APT: Docker's own repository is added on
 expect 0 "Docker's repository: key, list and update once; a failed download leaves nothing; apk is refused" \
   "every call re-downloaded the key; a failed download left an empty key that broke apt-get update"
 
+# T-ODOCKER-DOCKER-REPO-CLEANUP: a failure removes only what this call wrote; a failing apt-get update keeps the repository
+# Any rc != 0 removed key and list (review, 2026-10-06): (a) an apt-get update
+# that failed for another repository or a mirror deleted the correct new key
+# and list, so every later odocker call downloaded, wrote and updated again;
+# (b) /etc/apt/keyrings/docker.asc is Docker's documented path — a key the
+# person had set up before (with a list of another name) was deleted too.
+# Stubs as in T-ODOCKER-DOCKER-REPO-APT; apt-get answers $APT_RC, install
+# fails for a destination that ends in $INSTALL_FAIL.
+test.odocker.dockerRepoCleanup() {
+  local fx bad="" out logSize realInstall key list
+  fx=$(test.suite.fixture.make odockerrepocleanup); mkdir -p "$fx/bin" "$fx/tmp"; : > "$fx/log"
+  realInstall=$(command -v install); key=etc/apt/keyrings/docker.asc; list=etc/apt/sources.list.d/docker.list
+  printf '%s\n' '#!/bin/sh' 'echo "curl $*" >> "$FX/log"' 'printf "%s" KEY' > "$fx/bin/curl"
+  printf '%s\n' '#!/bin/sh' 'echo "apt-get $*" >> "$FX/log"' 'exit "${APT_RC:-0}"' > "$fx/bin/apt-get"
+  printf '%s\n' '#!/bin/sh' 'echo amd64' > "$fx/bin/dpkg"
+  printf '%s\n' '#!/bin/sh' 'echo "install $*" >> "$FX/log"' 'for a; do last="$a"; done' 'case "$last" in *"${INSTALL_FAIL:-/none}") exit 1 ;; esac' "exec $realInstall \"\$@\"" > "$fx/bin/install"
+  chmod +x "$fx/bin/"*
+  test.odocker.dockerRepoCleanup.run() { # <root> <env assignments…>
+    local root="$1"; shift
+    mkdir -p "$root/etc"; printf '%s\n' 'ID=debian' 'VERSION_CODENAME=bookworm' > "$root/etc/os-release"
+    env PATH="$fx/bin:$PATH" SUDO="" TMPDIR="$fx/tmp" FX="$fx" OOSH_PM="apt-get -y install" ROOT="$root" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+      oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; }
+      private.odocker.docker.repo.add "$ROOT" >/dev/null 2>&1; echo "rc=$? $RESULT"' </dev/null 2>/dev/null | tail -1
+  }
+  # (a) apt-get update fails after a good write: rc 1 "added, but …", key and list kept
+  out=$(test.odocker.dockerRepoCleanup.run "$fx/a" APT_RC=100)
+  case "$out" in "rc=1 "*"added, but the package lists could not be refreshed"*) ;; *) bad="$bad update-fail=[$out]" ;; esac
+  [ -s "$fx/a/$key" ] || bad="$bad update-fail-key-removed"
+  [ -s "$fx/a/$list" ] || bad="$bad update-fail-list-removed"
+  # … and the next call finds the marker: nothing downloaded, written or updated
+  logSize=$(wc -c < "$fx/log")
+  out=$(test.odocker.dockerRepoCleanup.run "$fx/a")
+  case "$out" in "rc=0 "*) ;; *) bad="$bad next=[$out]" ;; esac
+  [ "$(wc -c < "$fx/log")" = "$logSize" ] || bad="$bad next-run-called=[$(tail -3 "$fx/log" | tr '\n' '|')]"
+  # (b) a key that was there before stays when the list cannot be written
+  mkdir -p "$fx/b/etc/apt/keyrings"; printf '%s' MYKEY > "$fx/b/$key"
+  out=$(test.odocker.dockerRepoCleanup.run "$fx/b" INSTALL_FAIL=/docker.list)
+  case "$out" in "rc=1 "*) ;; *) bad="$bad list-fail=[$out]" ;; esac
+  [ -e "$fx/b/$key" ] || bad="$bad own-key-removed"
+  [ -e "$fx/b/$list" ] && bad="$bad list-left"
+  # … and a key this call wrote is removed when the list cannot be written
+  out=$(test.odocker.dockerRepoCleanup.run "$fx/c" INSTALL_FAIL=/docker.list)
+  case "$out" in "rc=1 "*) ;; *) bad="$bad new-list-fail=[$out]" ;; esac
+  [ -e "$fx/c/$key" ] && bad="$bad new-key-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a failing update keeps the repository, rc 1; a failed write removes only what this call wrote" || create.result 1 "repo cleanup:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-DOCKER-REPO-CLEANUP: a failure removes only what this call wrote; a failing apt-get update keeps the repository" test.odocker.dockerRepoCleanup
+expect 0 "a failing update keeps the repository, rc 1; a failed write removes only what this call wrote" \
+  "a failing apt-get update deleted the new key and list on every call; a key of the person's own was deleted"
+
 
 # Stand-in for docker in odocker.install: a running container with the socket
 # mounted. $FX/log records every call. HASOOSH=yes: oosh is in the container
@@ -1833,7 +1886,9 @@ test.odocker.installRun() { # <fx> <env assignments…>
             "dpkg --print-architecture") echo "${CTARCH:-arm64}" ;;
             "mkdir -p "*) shift 2; local d; for d; do mkdir -p "$CT$d"; done ;;
             "rm -f "*) shift 2; local f; for f; do rm -f "$CT$f"; done ;;
-            "sh -c cat > "*) local a="$*"; cat > "$CT${a##*cat > }" ;;
+            "sh -c cat > "*) local a="$*"
+              if [ -n "$FAILWRITE" ] && [ "${a##*cat > }" = "$FAILWRITE" ]; then cat > /dev/null; return 1; fi
+              cat > "$CT${a##*cat > }" ;;
             *"command -v"*) echo "$PM" ;;
             # portability-exception: matches the command text odocker sends into a Linux container, runs no stat
             "stat -c %g /var/run/docker.sock") echo "${SOCKGID:-4242}" ;;
@@ -1916,6 +1971,16 @@ test.odocker.installRaw() {
   [ -e "$fx/ct.fail/etc/apt" ] && bad="$bad fail-wrote"
   grep -q 'install docker-ce-cli' "$fx/log" && bad="$bad fail-installed"
   [ -z "$(ls -A "$fx/tmp")" ] || bad="$bad fail-host-tmp-left"
+  # a list that cannot be written: only what this call wrote goes — a key that
+  # was in the container before stays (T-ODOCKER-DOCKER-REPO-CLEANUP, here)
+  mkdir -p "$fx/ct.ownkey/etc/apt/keyrings"; cp "$fx/ct.fail/etc/os-release" "$fx/ct.ownkey/etc/"; printf '%s' MYKEY > "$fx/ct.ownkey/etc/apt/keyrings/docker.asc"
+  : > "$fx/log"
+  out=$(test.odocker.installRun "$fx" PM=apt-get CT="$fx/ct.ownkey" FAILWRITE=/etc/apt/sources.list.d/docker.list)
+  [ "$out" = "rc=1" ] || bad="$bad ownkey-rc=[$out]"
+  [ -e "$fx/ct.ownkey/etc/apt/keyrings/docker.asc" ] || bad="$bad own-key-removed"
+  : > "$fx/log"; rm -rf "$fx/ct.fail/etc/apt"
+  out=$(test.odocker.installRun "$fx" PM=apt-get CT="$fx/ct.fail" FAILWRITE=/etc/apt/sources.list.d/docker.list)
+  [ -e "$fx/ct.fail/etc/apt/keyrings/docker.asc" ] && bad="$bad new-key-left"
   : > "$fx/log"; test.odocker.installRun "$fx" PM=apt-get CT="$fx/ct.apt-get" >/dev/null
   grep -q 'DEBIAN_FRONTEND=noninteractive.* apt-get -y install' "$fx/log" || bad="$bad apt-interactive"
   # a docker group with another number is left alone: dockerhost gets the socket's number
