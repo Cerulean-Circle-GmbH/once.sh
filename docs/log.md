@@ -179,8 +179,8 @@ Live logging writes to a separate file for real-time monitoring in another termi
 ### Setup
 
 ```bash
-# Set live log file
-log.live.file ~/config/live.log
+# Set live log file (saved to your own ~/.config/oosh/log.session.env)
+log.live.file ~/.config/oosh/live.log
 
 # In another terminal, watch the live log
 ./log live
@@ -191,7 +191,7 @@ log.live.file ~/config/live.log
 | Command | Description |
 |---------|-------------|
 | `log.live` | Tail the LOG_LIVE file |
-| `log.live.file <path>` | Set LOG_LIVE path |
+| `log.live.file <path>` | Set LOG_LIVE path and save it to your own `log.session.env` (`log.session.save`, like `log.name`) — never the shared `log.env` (T-LOG-LIVE-FILE-SESSION) |
 | `log.live.result` | Tail ~/config/result.txt |
 | `log.live.error` | Tail ~/config/error.txt |
 
