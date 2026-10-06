@@ -1455,12 +1455,18 @@ test.oo.setup.producesDetectableLayout() {
   local CLONE_DIR="$BASE_DIR/oosh-clone"
   mkdir -p "$BASE_DIR"
   git init --initial-branch=main -q "$CLONE_DIR" >/dev/null 2>&1
+  # Pushed, with upstreams: the source is consumed only after ogit's gate
+  # (T-SETUP-SOURCE-GATE), and a clone with no origin would be refused.
+  git init -q --bare -b main "$SETUP_FIXTURE/origin.git" >/dev/null 2>&1
   (
     cd "$CLONE_DIR"
     git config user.email "test@test.local"
     git config user.name "test"
     git commit --allow-empty -q -m init
+    git remote add origin "$SETUP_FIXTURE/origin.git"
+    git push -q -u origin main
     git checkout -q -b dev
+    git push -q -u origin dev
   ) >/dev/null 2>&1
 
   export OOSH_DIR="$CLONE_DIR"
@@ -1555,6 +1561,115 @@ test.oo.setupSafeSwap() {
 test.case $level "T-SETUP-SAFE-SWAP: oo mode.setup never leaves ~/oosh dangling, and a re-run finishes a half-made layout" test.oo.setupSafeSwap
 expect 0 "a failed branch clone keeps the source; a re-run completes; a third run changes nothing" \
   "the source was removed before the branch clone, and the fast path hid the failure"
+
+# ============================================================================
+# T-SETUP-LAYOUT-EXISTS / T-SETUP-SOURCE-GATE: mode.setup never deletes a layout folder
+# ============================================================================
+# "Already set up" keyed on the BRANCH checked out in ~/oosh's folder: a
+# finished layout with branch hotfix checked out inside prod/ missed it, cloned
+# hotfix/ and then consumed — rm -rf — prod/ with its uncommitted work. A
+# detached HEAD refused, and an older linked-worktree layout (.git is a FILE)
+# was redone on every run. A plain source tree was consumed without the gate
+# ogit owns for exactly that (stash, unpushed commits). Fixture HOME and base,
+# a local bare origin; ogit.repo.clone and ogit.folder.finish are recording
+# wrappers that run the real methods.
+test.oo.setupLayout.run() { # <home> <base> # run oo.mode.setup <base> in a pinned child shell; RESULT into $TEST_OO_LAYOUT_FX/result; echo its rc
+  local home="$1" base="$2"
+  (
+    private.this.script.load ogit ogit.branch.get
+    eval "test.oo.realRepoClone() $(declare -f ogit.repo.clone | tail -n +2)"
+    eval "test.oo.realFolderFinish() $(declare -f ogit.folder.finish | tail -n +2)"
+    ogit.repo.clone() { echo "$*" >> "$TEST_OO_LAYOUT_FX/clone.calls"; test.oo.realRepoClone "$@"; }
+    ogit.folder.finish() { echo "$*" >> "$TEST_OO_LAYOUT_FX/finish.calls"; test.oo.realFolderFinish "$@"; }
+    HOME="$home"; GIT_CONFIG_GLOBAL="$home/.gitconfig"
+    export HOME GIT_CONFIG_GLOBAL
+    unset OOSH_COMPONENTS_DIR
+    OOSH_DIR="$home/oosh"
+    oo.mode.setup "$base" >/dev/null 2>&1
+    local rc=$?
+    echo "$RESULT" > "$TEST_OO_LAYOUT_FX/result"
+    echo "$rc"
+  )
+}
+test.oo.setupLayout.case() { # <label> <shape:clone|worktree> <folder> <prepare> # build a layout, point a fixture ~/oosh at <base>/<folder>, run <prepare> <base>/<folder>, run mode.setup; echo the problems found
+  local base fx home rc bad=""
+  base=$(test.oo.base "test.oo.setup.$1" "$2") || { echo " fixture-failed"; return 0; }
+  fx="${base%/*}"; home="$fx/home"; mkdir -p "$home"
+  ln -s "$base/$3" "$home/oosh"
+  "$4" "$base/$3" "$base"
+  printf 'work\n' > "$base/$3/work.txt"
+  TEST_OO_LAYOUT_FX="$fx"
+  rc=$(test.oo.setupLayout.run "$home" "$base")
+  [ "$rc" = 0 ] || bad="$bad $1:rc=$rc[$(cat "$fx/result")]"
+  [ -f "$base/$3/work.txt" ] || bad="$bad $1:$3-or-its-work-gone"
+  [ "$(readlink "$home/oosh")" = "$base/$3" ] || bad="$bad $1:link=[$(readlink "$home/oosh")]"
+  [ -s "$fx/clone.calls" ] && bad="$bad $1:cloned=[$(tr '\n' ' ' < "$fx/clone.calls")]"
+  [ -s "$fx/finish.calls" ] && bad="$bad $1:re-shared=[$(tr '\n' ' ' < "$fx/finish.calls")]"
+  unset TEST_OO_LAYOUT_FX
+  rm -rf "$fx"
+  echo "$bad"
+}
+test.oo.setupLayout.hotfix() { # <folder> <base> # check out a pushed branch hotfix inside <folder>; main/ knows origin/hotfix
+  git -C "$1" checkout -q -b hotfix
+  git -C "$1" push -q origin hotfix >/dev/null 2>&1
+  git -C "$2/main" fetch -q origin >/dev/null 2>&1
+}
+test.oo.setupLayout.detach() { # <folder> <base> # detach the HEAD of <folder>
+  git -C "$1" checkout -q --detach
+}
+test.oo.setupLayout.none() { # <folder> <base> # leave <folder> as it is
+  return 0
+}
+test.oo.setupLayoutExists() {
+  local bad=""
+  bad="$bad$(test.oo.setupLayout.case hotfix clone prod test.oo.setupLayout.hotfix)"
+  bad="$bad$(test.oo.setupLayout.case detached clone prod test.oo.setupLayout.detach)"
+  bad="$bad$(test.oo.setupLayout.case worktrees worktree dev test.oo.setupLayout.none)"
+  [ -z "$bad" ] && create.result 0 "a finished layout is left alone, whatever is checked out in it" || create.result 1 "mode.setup:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-LAYOUT-EXISTS: a finished layout is left alone — another branch, a detached HEAD, linked worktrees" test.oo.setupLayoutExists
+expect 0 "a finished layout is left alone, whatever is checked out in it" \
+  "already set up keyed on the branch name: prod/ with hotfix checked out was rm -rf'd"
+
+test.oo.setupGate.case() { # <label> <prepare> # a plain source tree beside a fixture ~/oosh, made unsafe to delete by <prepare> <source>; echo the problems found
+  local origin fx home lay rc bad="" stashes
+  origin=$(test.oo.base "test.oo.setup.gate.$1" clone) || { echo " fixture-failed"; return 0; }
+  fx="${origin%/*}"; home="$fx/home"; lay="$fx/layout"; mkdir -p "$home" "$lay"
+  git clone -q -b dev "$fx/origin.git" "$lay/oosh-clone" >/dev/null 2>&1
+  ln -s "$lay/oosh-clone" "$home/oosh"
+  "$2" "$lay/oosh-clone"
+  stashes=$(git -C "$lay/oosh-clone" stash list | grep -c .)
+  TEST_OO_LAYOUT_FX="$fx"
+  rc=$(test.oo.setupLayout.run "$home" "$lay")
+  [ "$rc" != 0 ] || bad="$bad $1:rc0"
+  grep -q "oosh-clone" "$fx/result" || bad="$bad $1:result-names-no-folder=[$(cat "$fx/result")]"
+  [ -d "$lay/oosh-clone/.git" ] || bad="$bad $1:source-gone"
+  [ "$(git -C "$lay/oosh-clone" stash list 2>/dev/null | grep -c .)" = "$stashes" ] || bad="$bad $1:stash-lost"
+  [ -e "$lay/main" ] && bad="$bad $1:main-built"
+  [ -d "$home/oosh/.git" ] || bad="$bad $1:oosh-dangling"
+  unset TEST_OO_LAYOUT_FX
+  rm -rf "$fx"
+  echo "$bad"
+}
+test.oo.setupGate.stash() { # <source> # leave a stash in <source>
+  printf 'stashed\n' >> "$1/file"
+  git -C "$1" -c user.email=t@t -c user.name=t stash -q
+}
+test.oo.setupGate.unpushed() { # <source> # leave an unpushed commit in <source>
+  printf 'unpushed\n' >> "$1/file"
+  git -C "$1" -c user.email=t@t -c user.name=t commit -q -am unpushed
+}
+test.oo.setupSourceGate() {
+  local bad=""
+  bad="$bad$(test.oo.setupGate.case stash test.oo.setupGate.stash)"
+  bad="$bad$(test.oo.setupGate.case unpushed test.oo.setupGate.unpushed)"
+  [ -z "$bad" ] && create.result 0 "a source holding a stash or an unpushed commit is refused and left intact" || create.result 1 "mode.setup:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-SOURCE-GATE: a plain source tree is consumed only after the ogit gate" test.oo.setupSourceGate
+expect 0 "a source holding a stash or an unpushed commit is refused and left intact" \
+  "the source was rm -rf'd with its stash and unpushed commit"
 
 # ============================================================================
 # T-BASE-GET-*: oo.mode.base.get without OOSH_COMPONENTS_DIR
@@ -2605,19 +2720,24 @@ expect 0 "only main/ created" "private.oo.shared.tree.from.local skips worktree-
 # keeps ONE layout builder and puts the destructive step next to the rc checks
 # that already guard the copy. Default `no`, which is what pins install state
 # 31's call.
-private.test.oo.consume.fixture() { # <fixtureRoot> # a source clone on dev + an empty target
+private.test.oo.consume.fixture() { # <fixtureRoot> # a source clone on dev, both branches pushed to a local bare origin + an empty target
+  # Pushed with upstreams: consume runs ogit's gate first (T-SETUP-SOURCE-GATE),
+  # and a source with unpushed work is kept.
   mkdir -p "$1/source" "$1/target"
+  git init -q --bare -b main "$1/origin.git" >/dev/null 2>&1
   (
     cd "$1/source"
     git init --initial-branch=main -q
     git config user.email "test@test.local"
     git config user.name "test"
-    git remote add origin "$TEST_OO_STREE_ORIGIN"
+    git remote add origin "$1/origin.git"
     echo seed > README.md
     git add README.md
     git commit -q -m seed
+    git push -q -u origin main
     git branch dev
     git checkout -q dev
+    git push -q -u origin dev
   ) >/dev/null 2>&1
 }
 
@@ -4651,6 +4771,55 @@ test.oo.branchNoAlias() {
 }
 test.case $level "T-OO-BRANCH-NO-ALIAS: oo and user ask ogit.branch.get — they work without this.git.branch.short" test.oo.branchNoAlias
 expect 0 "the branch comes from ogit.branch.get, the alias is not called" "one getter had two names"
+
+
+console.log "
+Test: private.oo.layout.folder.check
+===================================================================="
+
+test.oo.layoutFolderCheck() { # # prod/ with a detached HEAD is a layout folder; a plain clone beside main/ is not, and not under byBranch no once its branch folder stands
+  local base fx bad=""
+  base=$(test.oo.base test.oo.layout.folder clone) || { create.result 1 "fixture failed"; return $(result); }
+  fx="${base%/*}"
+  git -C "$base/prod" checkout -q --detach
+  git clone -q -b dev "$fx/origin.git" "$base/oosh-clone" >/dev/null 2>&1
+  private.oo.layout.folder.check "$base/oosh-clone" "$base" >/dev/null || bad="$bad beside-dev-not-layout[$RESULT]"
+  private.oo.layout.folder.check "$base/oosh-clone" "$base" no >/dev/null && bad="$bad source-is-layout[$RESULT]"
+  private.oo.layout.folder.check "$fx/origin.git" "$base" >/dev/null && bad="$bad outside-is-layout[$RESULT]"
+  private.oo.layout.folder.check "$base/prod" "$base" >/dev/null
+  local rc=$? res="$RESULT"
+  rm -rf "$fx"
+  [ -z "$bad" ] || { create.result 1 "layout.folder.check:$bad"; return $(result); }
+  create.result "$rc" "$res"
+  return $(result)
+}
+test.case - "T-OO-LAYOUT-FOLDER-CHECK: a layout folder is recognised whatever is checked out in it" \
+   test.oo.layoutFolderCheck
+expect 0 "prod is a folder of the layout"
+
+
+console.log "
+Test: private.oo.source.consume.gate
+===================================================================="
+
+test.oo.sourceConsumeGate() { # # a clean pushed clone passes; one with an uncommitted change is refused by name
+  local origin fx src bad=""
+  origin=$(test.oo.base test.oo.source.gate clone) || { create.result 1 "fixture failed"; return $(result); }
+  fx="${origin%/*}"; src="$fx/oosh-clone"
+  git clone -q -b dev "$fx/origin.git" "$src" >/dev/null 2>&1
+  private.oo.source.consume.gate "$src" "$src" >/dev/null
+  local rc=$? res="$RESULT"
+  printf 'dirty\n' >> "$src/file"
+  if private.oo.source.consume.gate "$src" "$src" >/dev/null; then bad="$bad dirty-passed"
+  else case "$RESULT" in (*"$src"*uncommitted*) ;; (*) bad="$bad dirty-result=[$RESULT]" ;; esac; fi
+  rm -rf "$fx"
+  [ -z "$bad" ] || { create.result 1 "source.consume.gate:$bad"; return $(result); }
+  create.result "$rc" "$res"
+  return $(result)
+}
+test.case - "T-OO-SOURCE-CONSUME-GATE: a clean pushed source passes the gate" \
+   test.oo.sourceConsumeGate
+expect 0 "oosh-clone holds no ref of its own"
 
 ### test.method
 

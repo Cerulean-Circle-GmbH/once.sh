@@ -253,11 +253,21 @@ that already sits at `<base>/<branch>` is kept as that clone. It **checks that
 it touches `~/oosh`. If that check fails it stops with the layout built and the
 old symlink intact.
 
-It is a no-op when `<base>/main` and `<base>/<branch>` already exist as
-repositories; `main/` alone is a half-made run, and a re-run finishes it. It refuses
-rather than guessing when `<base>/main` exists but is not one, when the source
-has no detectable branch, or when `~/oosh` is a real directory rather than a
-symlink.
+"Already set up" is a property of the layout, not of what is checked out
+(`private.oo.layout.folder.check`, T-SETUP-LAYOUT-EXISTS):
+
+| `~/oosh`'s folder | what `oo mode.setup` does |
+|---|---|
+| directly under a base whose `main/` is a repository (`.git` a directory or a file), and it is `main/`, carries the name of a branch `main/` knows, or its branch has its own folder beside it | nothing — rc 0 "already set up", whatever branch or detached HEAD is checked out, clones and linked worktrees alike |
+| a plain source tree (anywhere else) that fails ogit's gate — uncommitted change, no upstream, unpushed commit, a stash, another unpushed branch, a tag `main/` lacks (`private.oo.source.consume.gate` = `private.ogit.folder.gate` + `private.ogit.clone.gate`) | refuses with rc 7, RESULT names the folder and what would be lost; nothing is built, `~/oosh` unchanged (T-SETUP-SOURCE-GATE) |
+| a plain source tree that passes the gate | builds `main/` + `<branch>/`, removes the source last, re-points `~/oosh` |
+| … and the branch clone fails | rc 4; the source and `~/oosh` stay as they were, a re-run finishes the layout (T-SETUP-SAFE-SWAP) |
+
+The consume step itself never removes `main/`, the branch folder or any folder
+of the layout, and re-runs the gate right before it removes anything. It refuses
+rather than guessing when `<base>/main` exists but is not a repository, when the
+source has no detectable branch, or when `~/oosh` is a real directory rather
+than a symlink.
 
 The layout itself is built by `private.oo.shared.tree.from.local` — the same
 helper install state 31 uses, so there is one definition of "canonical".
