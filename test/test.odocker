@@ -1731,6 +1731,113 @@ test.case $level "T-ODOCKER-DOCKER-REPO-APT: Docker's own repository is added on
 expect 0 "Docker's repository: key, list and update once; a failed download leaves nothing; apk is refused" \
   "every call re-downloaded the key; a failed download left an empty key that broke apt-get update"
 
+
+# Stand-in for docker in odocker.install: a running container with the socket
+# mounted. $FX/log records every call. HASOOSH=yes: oosh is in the container
+# (/root/oosh/odocker); PM: its package manager; SOCKGRP: the /etc/group line of
+# the socket's number 4242, if any; DOCKERGRP=yes: a group docker (another number).
+test.odocker.installRun() { # <fx> <env assignments…>
+  local fx="$1"; shift
+  env FX="$fx" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+    docker() {
+      echo "docker $*" >> "$FX/log"
+      case "$1" in
+        inspect) case "$*" in *State*) echo running ;; *Mounts*) echo yes ;; esac ;;
+        exec) shift 2
+          case "$*" in
+            *"echo \"\${OOSH_DIR"*) [ "$HASOOSH" = yes ] && echo /root/oosh ;;
+            "test -f /root/oosh/odocker") [ "$HASOOSH" = yes ] ;;
+            *"command -v"*) echo "$PM" ;;
+            # portability-exception: matches the command text odocker sends into a Linux container, runs no stat
+            "stat -c %g /var/run/docker.sock") echo 4242 ;;
+            *"getent group 4242"*) [ -n "$SOCKGRP" ] && echo "$SOCKGRP" ;;
+            *"getent group docker"*) [ "$DOCKERGRP" = yes ] && echo "docker:x:999:" ;;
+            awk*) echo tester ;;
+          esac ;;
+      esac
+      return 0; }
+    odocker.install somecontainer >/dev/null 2>&1; echo "rc=$?"' </dev/null 2>/dev/null | tail -1
+}
+
+# T-ODOCKER-INSTALL-OOSH: odocker install runs odocker prereqs.install in a container with oosh
+# odocker.install was a second, hand-forked copy of the client install (apt:
+# docker.io, too old for a current host — Debian 12) and of the group rule
+# (groupmod / delgroup renumbered an existing docker group). With oosh in the
+# container, the container installs and groups itself, through the prelude.
+test.odocker.installOosh() {
+  local fx bad="" out; fx=$(test.suite.fixture.make odockerinstalloosh); : > "$fx/log"
+  out=$(test.odocker.installRun "$fx" HASOOSH=yes PM=apt-get)
+  [ "$out" = "rc=0" ] || bad="$bad rc=[$out]"
+  grep -q "^docker exec somecontainer bash -c if \[ -f ~/config/user.env \].* /root/oosh/odocker prereqs.install" "$fx/log" || bad="$bad no-prereqs.install=[$(grep 'exec' "$fx/log" | tr '\n' '|')]"
+  grep -qE 'docker\.io|groupmod|delgroup|apt-get|usermod|addgroup|groupadd' "$fx/log" && bad="$bad by-hand=[$(grep -E 'docker\.io|groupmod|delgroup|apt-get|usermod|addgroup|groupadd' "$fx/log" | tr '\n' '|')]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the container with oosh runs odocker prereqs.install through the prelude, nothing by hand" || create.result 1 "install oosh:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-INSTALL-OOSH: odocker install runs odocker prereqs.install in a container with oosh" test.odocker.installOosh
+expect 0 "the container with oosh runs odocker prereqs.install through the prelude, nothing by hand" \
+  "odocker install put docker.io (too old) in an apt container and renumbered its docker group"
+
+# T-ODOCKER-INSTALL-RAW: a container without oosh gets the table's package names; no group is renumbered
+test.odocker.installRaw() {
+  local fx bad="" out pm want; fx=$(test.suite.fixture.make odockerinstallraw)
+  for pm in apk apt-get dnf; do
+    : > "$fx/log"
+    out=$(test.odocker.installRun "$fx" PM="$pm")
+    [ "$out" = "rc=0" ] || bad="$bad $pm-rc=[$out]"
+    want="$(OOSH_PM="$pm" private.odocker.prereq.package.get docker) $(OOSH_PM="$pm" private.odocker.prereq.package.get column)"
+    grep -q "^docker exec somecontainer sh -c .*$pm.* $want\$" "$fx/log" || bad="$bad $pm-packages=[$(grep -vE 'command -v|inspect|OOSH_DIR' "$fx/log" | head -2 | tr '\n' '|')]"
+  done
+  grep -q 'DEBIAN_FRONTEND=noninteractive' "$fx/log" && bad="$bad dnf-has-apt-env"
+  : > "$fx/log"; test.odocker.installRun "$fx" PM=apt-get >/dev/null
+  grep -q 'DEBIAN_FRONTEND=noninteractive.* apt-get -y install' "$fx/log" || bad="$bad apt-interactive"
+  # a docker group with another number is left alone: dockerhost gets the socket's number
+  : > "$fx/log"; test.odocker.installRun "$fx" PM=apk DOCKERGRP=yes >/dev/null
+  grep -q 'groupadd -g 4242 dockerhost' "$fx/log" || bad="$bad no-dockerhost=[$(grep group "$fx/log" | tr '\n' '|')]"
+  grep -qE 'groupmod|delgroup|docker\.io' "$fx/log" && bad="$bad renumbered"
+  # the socket's number has a group: it is used, nothing created
+  : > "$fx/log"; test.odocker.installRun "$fx" PM=apk SOCKGRP="sockgrp:x:4242:" >/dev/null
+  grep -q 'groupadd' "$fx/log" && bad="$bad created-over-existing"
+  grep -q 'usermod -aG sockgrp tester' "$fx/log" || bad="$bad not-joined"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the table's client names per package manager; the socket's group found or created, never renumbered" || create.result 1 "install raw:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-INSTALL-RAW: a container without oosh gets the table's package names; no group is renumbered" test.odocker.installRaw
+expect 0 "the table's client names per package manager; the socket's group found or created, never renumbered" \
+  "a second package table in odocker.install, and groupmod/delgroup on an existing docker group"
+
+# T-ODOCKER-PREREQS-INSTALL: odocker prereqs.install installs here and joins the socket's group — once; nothing in a test run
+test.odocker.prereqsInstall() {
+  local fx bad="" out; fx=$(test.suite.fixture.make odockerprereqsinstall); : > "$fx/log"; : > "$fx/docker.sock"; : > "$fx/member"
+  test.odocker.prereqsInstall.run() { # <env assignments…>
+    env -u OOSH_NO_INSTALL FX="$fx" ODOCKER_SOCKET="$fx/docker.sock" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+      private.odocker.prereqs.ensure() { echo "prereqs.ensure" >> "$FX/log"; create.result 0 "present"; return 0; }
+      private.odocker.socket.group.ensure() { echo "socket.group.ensure" >> "$FX/log"; create.result 0 "docker"; return 0; }
+      user.group.add() { echo "join $*" >> "$FX/log"; echo docker >> "$FX/member"; }
+      id() { case "$*" in "-nG tester") cat "$FX/member" ;; -u) echo 1000 ;; -un) echo tester ;; *) command id "$@" ;; esac; }
+      odocker.prereqs.install tester >/dev/null 2>&1; echo "rc=$? $RESULT"' </dev/null 2>/dev/null | tail -1
+  }
+  out=$(test.odocker.prereqsInstall.run OOSH_NO_INSTALL=1)
+  case "$out" in "rc=0 "*) ;; *) bad="$bad no-install-rc=[$out]" ;; esac
+  [ -s "$fx/log" ] && bad="$bad no-install-called=[$(tr '\n' '|' < "$fx/log")]"
+  # A test run sets OOSH_NO_INSTALL; this test IS about installing (with stand-ins).
+  out=$(test.odocker.prereqsInstall.run)
+  case "$out" in "rc=0 "*) ;; *) bad="$bad rc=[$out]" ;; esac
+  [ "$(tr '\n' '|' < "$fx/log")" = "prereqs.ensure|socket.group.ensure|join docker tester|" ] || bad="$bad calls=[$(tr '\n' '|' < "$fx/log")]"
+  # second run: the member is not added again
+  test.odocker.prereqsInstall.run >/dev/null
+  [ "$(grep -c '^join' "$fx/log")" = 1 ] || bad="$bad joined-again"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "prerequisites and the socket's group here; joined once; nothing under OOSH_NO_INSTALL" || create.result 1 "prereqs install:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-PREREQS-INSTALL: odocker prereqs.install installs here and joins the socket's group, once; nothing in a test run" test.odocker.prereqsInstall
+expect 0 "prerequisites and the socket's group here; joined once; nothing under OOSH_NO_INSTALL" \
+  "a container installed and grouped itself only through a second copy in odocker.install"
+
 ### test.method
 
 test.suite.save.results

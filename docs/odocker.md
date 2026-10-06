@@ -224,9 +224,26 @@ odocker up naked_ubuntu_24_04 9022
 Commands `run`, `run.sshd`, `up`, `reset`, and `clone` accept an optional `docker` parameter as the last argument. When provided:
 
 1. Mounts `/var/run/docker.sock` into the container (socket forwarding)
-2. Installs Docker CLI inside the container (auto-detects OS via package manager)
+2. Installs Docker CLI inside the container (`odocker install`)
 
 This allows the container to control the host's Docker daemon.
+
+`odocker install <container>` has **one** implementation of the install and of
+the socket's group. With oosh in the container (`~/oosh/odocker` there) it runs
+`odocker prereqs.install` in it, through the prelude (`ossh.remote.prelude.get`):
+the container installs and groups itself with the very methods a started odocker
+uses — `private.odocker.prereqs.ensure` (the package table, Docker's repository)
+and `private.odocker.socket.group.ensure` (the socket's group, else `docker`,
+else `dockerhost`; an existing group is never renumbered), and every user (uid
+1000 and up) joins it (T-ODOCKER-INSTALL-OOSH). `odocker prereqs.install <?user>`
+is a command of its own, too: typed in a container it installs what odocker
+needs there and joins the socket's group; nothing under `OOSH_NO_INSTALL`
+(T-ODOCKER-PREREQS-INSTALL). A container **without** oosh gets a raw path
+(`private.odocker.container.prereqs.install`): the package names of the same
+table, asked on the host with the container's package manager (`apt-get`
+non-interactive), and the same group rule (T-ODOCKER-INSTALL-RAW). `docker-ce-cli`
+(apt, dnf/yum) comes from Docker's repository, which only oosh adds — in a
+container without oosh and without that repository the install fails and says so.
 
 ### Usage
 
@@ -302,7 +319,8 @@ started by plain `docker run` learns its name once odocker has installed the
 docker program there (T-ODOCKER-CONTAINER-NAME-NEW, -UNNAMED-GETS-NAME,
 -START-NAME-REFRESH).
 | `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
-| `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount) |
+| `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount): `odocker prereqs.install` there when it has oosh |
+| `prereqs.install <?user>` | user (optional) | Install what odocker needs on this computer and join the docker socket's group: `<user>`, else every user as root, else this user; nothing under `OOSH_NO_INSTALL` |
 | `stop <container>` | container name | Stop a running container |
 | `container.remove <container>` | container name | Remove a stopped container (old name: `rm`, still works) |
 | `log <container>` | container name, optional line count (default: 50) | Show container logs |

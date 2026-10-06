@@ -139,7 +139,8 @@ private.odocker.prereq.package.get()     # <cmd> <?mode:client> # echo the packa
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
  # oo.cmd has no per-platform package names (a package called `docker` is not
- # Docker on Ubuntu); these are the names odocker.install uses for containers.
+ # Docker on Ubuntu). The one table: a started odocker, odocker prereqs.install
+ # and the raw path of odocker install (a container without oosh) ask it.
  # mode engine: a bare computer runs Docker itself — the engine (macOS: colima,
  # the Docker VM, plus the client).
  if [ "$1" = "docker" ] && [ "${2:-client}" = "engine" ]; then
@@ -475,6 +476,93 @@ private.odocker.docker.repo.add()     # <?root:/> # add the own package reposito
   rm -f "$tmp"
   create.result 0 "Docker's repository added for $pm: $root$file"
   return $(result)
+}
+
+
+odocker.prereqs.install()     # <?user> # install what odocker needs here and join the group of the docker socket: <user>, else every user (uid 1000 and up) when run as root, else this user; nothing under OOSH_NO_INSTALL; idempotent #
+{
+ # The one install of a container: odocker install runs this in a container
+ # with oosh (through the prelude), a user can type it there too. The same
+ # methods a started odocker uses — no second package table, no second group
+ # rule (T-ODOCKER-PREREQS-INSTALL, T-ODOCKER-INSTALL-OOSH).
+ local user="$1" group users u missing="" rc=0
+ [ -n "$1" ] && shift
+ if [ -n "$OOSH_NO_INSTALL" ]; then
+   create.result 0 "OOSH_NO_INSTALL is set: nothing installed, no group changed"
+   return $(result)
+ fi
+ private.odocker.prereqs.ensure || { rc=1; missing="$RESULT"; warn.log "$RESULT"; }
+ if [ ! -e "$(private.odocker.socket.get)" ]; then
+   create.result "$rc" "${missing:-odocker prerequisites here}; no docker socket, so no group to join"
+   return $(result)
+ fi
+ private.odocker.socket.group.ensure || return $(result)
+ group="$RESULT"
+ if [ -n "$user" ]; then
+   users="$user"
+ elif [ "$(id -u)" = "0" ]; then
+   users=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd 2>/dev/null)
+ else
+   users=$(id -un 2>/dev/null)
+ fi
+ private.this.script.load user user.group.add
+ for u in $users; do
+   case " $(id -nG "$u" 2>/dev/null) " in *" $group "*) continue ;; esac
+   console.log "odocker: adding $u to group $group, which owns the docker socket"
+   user.group.add "$group" "$u" >/dev/null 2>&1 || warn.log "odocker: could not add $u to group $group"
+ done
+ create.result "$rc" "${missing:-odocker prerequisites here}; group $group:${users:+ $users}"
+ return $(result)
+}
+
+
+odocker.prereqs.install.completion.user() {
+  # one candidate per line on stdout; $1 is the word being completed
+  compgen -u "$1"
+}
+private.odocker.container.prereqs.install()     # <container> # install the Docker client and column in a running <container> that has no oosh, with the package names of private.odocker.prereq.package.get, and add its users to the group of the docker socket without renumbering a group; rc 1 naming what failed #
+{
+ # The raw path of odocker install: a container WITHOUT oosh, so none of its
+ # methods run there. The package names are the table's
+ # (private.odocker.prereq.package.get), asked on this host with the
+ # container's package manager; the group rule is socket.group.ensure's: the
+ # group of the socket's number, else docker, else dockerhost — an existing
+ # group is never renumbered (T-ODOCKER-INSTALL-RAW).
+ local container="$1" pm cmd pkgs gid group u hint=""
+ [ -n "$1" ] && shift
+ pm=$(docker exec "$container" sh -c 'for pm in apk apt-get dnf yum; do if command -v "$pm" >/dev/null 2>&1; then echo "$pm"; break; fi; done' 2>/dev/null)
+ case "$pm" in
+   apk)     cmd="apk add --no-cache" ;;
+   apt-get) private.this.script.load oo private.oo.pm.env.get
+            cmd="apt-get update && $(private.oo.pm.env.get apt-get) apt-get -y install" ;;
+   dnf|yum) cmd="$pm -y install" ;;
+   *) create.result 1 "no known package manager in $container (apk, apt-get, dnf, yum)"; error.log "$RESULT"
+      return $(result) ;;
+ esac
+ pkgs="$(OOSH_PM="$pm" private.odocker.prereq.package.get docker) $(OOSH_PM="$pm" private.odocker.prereq.package.get column)"
+ console.log "Installing $pkgs in $container ($pm; no oosh there)"
+ if ! docker exec "$container" sh -c "$cmd $pkgs"; then
+   case "$pkgs" in docker-ce*) hint=" — $pkgs comes from the package repository of Docker, which only oosh adds: install oosh in $container, then odocker install runs odocker prereqs.install there" ;; esac
+   create.result 1 "the install of $pkgs failed in $container$hint"; error.log "$RESULT"
+   return $(result)
+ fi
+ gid=$(docker exec "$container" stat -c %g /var/run/docker.sock 2>/dev/null)
+ if [ -z "$gid" ]; then
+   create.result 0 "installed $pkgs in $container; no docker socket there, so no group"
+   return $(result)
+ fi
+ group=$(docker exec "$container" sh -c "getent group $gid 2>/dev/null || grep '^[^:]*:[^:]*:$gid:' /etc/group" 2>/dev/null | cut -d: -f1)
+ if [ -z "$group" ]; then
+   group="docker"
+   [ -n "$(docker exec "$container" sh -c "getent group docker 2>/dev/null || grep '^docker:' /etc/group" 2>/dev/null)" ] && group="dockerhost"
+   console.log "odocker: the docker socket in $container belongs to group number $gid — creating group $group for it"
+   docker exec "$container" sh -c "groupadd -g $gid $group 2>/dev/null || addgroup -g $gid $group"
+ fi
+ for u in $(docker exec "$container" awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd 2>/dev/null); do
+   docker exec "$container" sh -c "usermod -aG $group $u 2>/dev/null || addgroup $u $group 2>/dev/null"
+ done
+ create.result 0 "installed $pkgs in $container; group $group owns its docker socket"
+ return $(result)
 }
 
 
@@ -1455,69 +1543,24 @@ odocker.install() # <container> # install Docker CLI inside a running container
     return 1
   fi
 
-  # Detect OS via package manager and install Docker CLI
-  console.log "Installing Docker CLI in $container..."
-  local rc
-  if docker exec "$container" sh -c 'command -v apk' >/dev/null 2>&1; then
-    info.log "Detected Alpine (apk)"
-    docker exec "$container" apk add --no-cache docker-cli util-linux-misc
-    rc=$?
-  elif docker exec "$container" sh -c 'command -v apt-get' >/dev/null 2>&1; then
-    info.log "Detected Debian/Ubuntu (apt-get)"
-    docker exec "$container" sh -c 'apt-get update && apt-get install -y docker.io bsdextrautils'
-    rc=$?
-  elif docker exec "$container" sh -c 'command -v dnf' >/dev/null 2>&1; then
-    info.log "Detected RHEL/Alma/Fedora (dnf)"
-    docker exec "$container" sh -c 'dnf install -y yum-utils && dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && dnf install -y docker-ce-cli'
-    rc=$?
-  elif docker exec "$container" sh -c 'command -v yum' >/dev/null 2>&1; then
-    info.log "Detected CentOS/older RHEL (yum)"
-    docker exec "$container" sh -c 'yum install -y yum-utils && yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && yum install -y docker-ce-cli'
+  # One install for every container: with oosh there, the container installs
+  # and groups itself with the methods a started odocker uses —
+  # odocker prereqs.install, through the prelude. Without oosh, the raw path
+  # with the same package table and group rule (T-ODOCKER-INSTALL-OOSH, -RAW).
+  local rc prelude ooshDir
+  private.this.script.load ossh ossh.remote.prelude.get
+  prelude=$(ossh.remote.prelude.get)
+  ooshDir=$(docker exec "$container" bash -c "$prelude"' echo "${OOSH_DIR:-$HOME/oosh}"' 2>/dev/null)
+  if [ -n "$ooshDir" ] && docker exec "$container" test -f "$ooshDir/odocker" 2>/dev/null; then
+    console.log "Installing what odocker needs in $container: odocker prereqs.install there"
+    docker exec "$container" bash -c "$prelude $ooshDir/odocker prereqs.install"
     rc=$?
   else
-    error.log "Unsupported OS in $container: no known package manager found"
-    return 1
+    private.odocker.container.prereqs.install "$container"
+    rc=$?
   fi
-
-  if [ $rc -eq 0 ]; then
+  if [ "$rc" -eq 0 ]; then
     success.log "Docker CLI installed in $container"
-    # Grant non-root users access to the bind-mounted Docker socket.
-    # Strategy: find or create a group matching the socket's GID, then add users to it.
-    # Never chgrp the socket — it's bind-mounted from the host and changing it breaks host perms.
-    local socketGid
-    socketGid=$(docker exec "$container" stat -c "%g" /var/run/docker.sock 2>/dev/null)
-    if [ -z "$socketGid" ]; then
-      info.log "Docker socket not found in $container — skipping group setup"
-    else
-      # Find or create a group matching the socket's GID
-      local socketGroup
-      socketGroup=$(docker exec "$container" sh -c "getent group $socketGid 2>/dev/null | cut -d: -f1")
-      if [ -z "$socketGroup" ]; then
-        # No group with this GID — align existing docker group or create one
-        local existingGid
-        existingGid=$(docker exec "$container" sh -c "getent group docker 2>/dev/null | cut -d: -f3")
-        if [ -n "$existingGid" ] && [ "$existingGid" != "$socketGid" ]; then
-          # docker group exists with wrong GID — fix it
-          docker exec "$container" sh -c "groupmod -g $socketGid docker 2>/dev/null || { delgroup docker 2>/dev/null; addgroup -g $socketGid docker 2>/dev/null; }"
-        else
-          docker exec "$container" sh -c "groupadd -g $socketGid docker 2>/dev/null || addgroup -g $socketGid docker 2>/dev/null"
-        fi
-        socketGroup="docker"
-      fi
-      # Add all non-system users to the socket's group
-      local ooshDir
-      private.this.script.load ossh ossh.remote.prelude.get
-      local prelude; prelude=$(ossh.remote.prelude.get)
-      ooshDir=$(docker exec "$container" bash -c "$prelude"' echo "${OOSH_DIR:-$HOME/oosh}"' 2>/dev/null)
-      local u
-      for u in $(docker exec "$container" awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
-        if [ -n "$ooshDir" ] && docker exec "$container" test -f "$ooshDir/user" 2>/dev/null; then
-          docker exec "$container" bash -c "$prelude LOG_LEVEL=0 $ooshDir/user group.add $socketGroup $u"
-        else
-          docker exec "$container" sh -c "usermod -aG $socketGroup $u 2>/dev/null || addgroup $u $socketGroup 2>/dev/null"
-        fi
-      done
-    fi
   else
     error.log "Docker CLI installation failed in $container (exit code: $rc)"
   fi
