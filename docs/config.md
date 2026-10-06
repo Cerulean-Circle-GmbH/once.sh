@@ -411,6 +411,7 @@ export OOSH_MODE="dev"
 | `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | **Per-user session values** — only in each user's `log.session.env`, never the shared `log.env`. T-CONFIG-CMD-SAVE-LOG |
 | `OOSH_MODE` (once switched) | **Per user** — the branch the user's own `~/oosh` points at, in their `oosh.session.env`. Decided below the `case` by the layout: before the switch it stays in the shared `oosh.env`, which other users still read. T29, T-CONFIG-CMD-SAVE-OOSH |
 | `ODOCKER_SG` | **Runtime marker** of odocker's one `sg` re-run (the socket group a shell does not know yet). T-CONFIG-ODOCKER-SG-NOT-SAVED |
+| `ODOCKER_SOCKET` | **Test/override knob** of `private.odocker.socket.get`. One user's export must not reach the shared `odocker.env` through `odocker workspace.set`. T-CONFIG-ODOCKER-SG-NOT-SAVED |
 | `OOSH_BRANCH` | Install **input** — the branch the operator asked for. State that must be **derived, never remembered**: persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** The branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh`. |
 
 The list is the `case` in `private.config.variables.list` (`config`); `test/test.config` T29 pins it by value. Change all three together.
@@ -685,6 +686,16 @@ These functions are used internally and generally not called directly:
 | `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
 | `private.config.env.lines.drop` | `<file> <prefix…>` → drops every line starting with a prefix, in place (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
 | `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written |
+
+`config` also leans on the kernel's helpers (full list:
+[oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)):
+`private.this.env.export.line.get` renders every value `private.config.variable.export.line`
+writes, `private.this.host.name.get` names the computer, `private.this.file.same` decides
+whether a user's `.bashrc` differs from their branch's template, and
+`private.this.path.stat.get` reads owners, groups and modes (`config init.check`,
+`private.config.linked.homes.get`). The others listed there — `private.this.container.is`,
+`private.this.group.create`, `private.this.group.name.get`, `private.this.temp.dir.get` —
+serve odocker, os and c2.
 
 The last two are how the migrates (`private.config.log.chain.migrate`,
 `private.config.user.session.migrate`, `private.config.oosh.session.migrate`) edit the

@@ -379,6 +379,32 @@ The file `this` is the OOSH kernel. It provides:
 | `this.init` | Initializes oosh environment |
 | `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that have not read `~/config/user.env` — the login PATH is data there ([config.md § The PATH line](config.md#the-path-line)) |
 
+### Kernel helpers
+
+Private methods of `this` that own a platform difference or a repeated idiom, so
+no script hand-writes it. Use them instead of the raw command (one line each,
+from the method's own docstring; getters are consumed as `$(…)`, predicates
+answer by rc):
+
+| Method | What it does |
+|---|---|
+| `private.this.container.is <?root:/>` | rc 0 when this computer is a container: `<root>/.dockerenv` (Docker) or `<root>/run/.containerenv` (Podman) exists |
+| `private.this.group.create <group> <?gid>` | create a system group if it does not exist, with number `<gid>` when given; idempotent; through `$SUDO`; groupadd, addgroup, dseditgroup, then an `/etc/group` append |
+| `private.this.group.name.get <gid>` | echo the name of the group with number `<gid>`: getent where present, else `/etc/group`, dscl on macOS; nothing when there is none |
+| `private.this.path.stat.get <path> <owner\|group\|uid\|gid\|mode>` | echo one stat field of the path itself (a symlink not followed); GNU format first, else BSD, both from one table; nothing and rc 1 for a missing path or an unknown field |
+| `private.this.file.same <fileA> <fileB>` | rc 0 when both files exist with identical bytes: `cmp -s` where it exists, else an exact `od` byte dump of each (AlmaLinux minimal has no diffutils) |
+| `private.this.host.name.get <?form:full\|short>` | echo the host name: the `hostname` program when it exists, else bash's `$HOSTNAME`; `short` is up to the first dot |
+| `private.this.temp.dir.get <?label:oosh>` | echo the canonical path of a new private directory (mode 700) under `TMPDIR`, else `/tmp`; the caller removes it (tests use `test.suite.fixture.make`) |
+| `private.this.env.export.line.get <variableName> <value>` | echo one pure-data `export NAME="value"` line, quoted by bash; rc 1 for a control character or a `$'…'` rendering — the rule `config save` and `log.session.save` share |
+| `private.this.device.is.terminal <device>` | rc 0 when a log device is terminal-type (unset, fd 1, fd 2, the tty) — the one list `info.log` and `log`'s emitter ask |
+| `private.this.path.canonical <path>` | echo the canonical absolute path; GNU `readlink -f` or the BSD fallback |
+
+`config` owns two more for its shared env files: `private.config.env.lines.drop <file> <prefix…>`
+(drop every line starting with a prefix, in place, owner/group/mode kept; an unchanged file is
+not rewritten; rc 1 when it cannot be written) and `private.config.env.line.append <file> <line>`
+(append the line unless it is already there, in place; rc 1 when it cannot be written) — see
+[config.md § Internal Functions](config.md#internal-functions).
+
 ### Method Dispatch Chain
 
 The `this.call` function resolves method calls in this order:
