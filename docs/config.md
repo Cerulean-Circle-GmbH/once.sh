@@ -680,6 +680,15 @@ These functions are used internally and generally not called directly:
 | `private.config.string.upper` | `<string>` → upper-cased, without the bash-4 `${var^^}` operator |
 | `private.config.required.variables.get` | the required-variable table, as data |
 | `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
+| `private.config.env.lines.drop` | `<file> <prefix…>` → drops every line starting with a prefix, in place (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
+| `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written |
+
+The last two are how the migrates (`private.config.log.chain.migrate`,
+`private.config.user.session.migrate`, `private.config.oosh.session.migrate`) edit the
+shared env files: the chain line goes on first, then the old lines leave, and a failed
+write is rc 1, never a silent success (T-CONFIG-MIGRATE-WRITE-FAIL). They write in
+place, not through `replace commit`: that puts a new file under the name, so a
+dev-group user who is not the owner would become the shared file's owner.
 
 All six are getters consumed as `$(…)`, so none calls `create.result` — it runs
 in a subshell and the result could never reach the caller. The first three are
