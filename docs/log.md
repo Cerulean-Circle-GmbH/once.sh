@@ -149,10 +149,12 @@ stdout/stderr and their fd spellings, or unset — is left out, and the file sim
 `LOG_DEVICE` line, exactly like a brand-new user's. Every terminal has its own device and
 derives it at start anyway; saving it made two terminals of one user take turns rewriting
 the file, and a process without a terminal (`sh -c '. ~/config/user.env; …'`, cron) inherited
-the last terminal and wrote its lines into it. The one rule for "a device of one terminal
+the last terminal and wrote its lines into it. The rule for "a device of one terminal
 session" is `private.log.device.is.session` (the kernel's terminal-type list plus
-`/dev/pts/*` and `/dev/tty*`); `log`'s top-level uses the same rule (T-LOG-DEVICE-IS-SESSION,
-T-LOG-SESSION-DEVICE-TERMINAL, T-LOG-SESSION-DEVICE-TWO-TERMINALS).
+`/dev/pts/*` and `/dev/tty*`; T-LOG-DEVICE-IS-SESSION, T-LOG-SESSION-DEVICE-TERMINAL,
+T-LOG-SESSION-DEVICE-TWO-TERMINALS). `log`'s top-level spells its own terminal-path test,
+because it runs before `log` loads `this` and no kernel method exists yet
+(T-LOG-STANDALONE-START).
 
 The shared `log.env` is linked to the per-user file by a source chain — its last
 line is `. $HOME/.config/oosh/log.session.env` (POSIX `.`, not the bash
