@@ -179,7 +179,9 @@ rule `config save` uses (`private.config.variable.export.line`): bash quotes the
 value, so a quote, `$`, backslash or backtick in `log name '<x>'` is written
 escaped and reads back as given, nothing runs. A value no single line can hold
 (a control character) is refused: rc 1, an error line, and the file keeps its
-previous content (T-LOG-SESSION-PURE-DATA).
+previous content (T-LOG-SESSION-PURE-DATA). A session file that cannot be written — left to
+root by a sudo session, a full disk — is a failure too: rc 1, an error line naming the file,
+and `log name` / `log live.file` answer that rc (T-LOG-SESSION-SAVE-WRITE-FAIL).
 
 ```bash
 log name                 # show LOG_NAME (defaults to user@host)
