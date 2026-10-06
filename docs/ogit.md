@@ -218,8 +218,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 |--------|-----------|-------------|
 | `safeDirectory.list` | | echo the global `safe.directory` entries, one per line (honours `GIT_CONFIG_GLOBAL`) |
 | `safeDirectory.add` | `<path>` | add `<path>` to the global `safe.directory` list once (moved from `private.oo.safeDirectory.add`) |
-| `safeDirectory.clear` | | remove every global `safe.directory` entry |
-| `safeDirectory.prune` | | drop global `safe.directory` entries whose paths no longer exist (moved from `oo.safeDirectory.prune`) |
+| `safeDirectory.prune` | | drop global `safe.directory` entries whose paths no longer exist (moved from `oo.safeDirectory.prune`): in place, one `--unset-all` per stale value (anchored, regex-escaped — old git has no `--fixed-value`), so a kept entry is never absent; a second run changes nothing. There is no `safeDirectory.clear`: a one-word wipe of every entry is not a method |
 | `safeDirectory.ensure` | `<?base:$(oo.mode.base.get)>` | one global `safe.directory` entry per repository folder under `<base>`, for the calling user; idempotent |
 
 ### worktree
