@@ -584,11 +584,15 @@ A command that is already there costs one `command -v`: no package manager, not
 even its discovery. Under `OOSH_NO_INSTALL` (every test run) nothing is installed
 or refreshed. Otherwise `oo cmd` discovers the package manager if `OOSH_PM` is
 empty and, on apt, refreshes the package lists **once** before the first real
-install — a fresh apt image has empty lists (T-OO-CMD-REFRESH-ONCE). Once means:
-`OOSH_PM_UPDATED` in this shell, and `OOSH_APT_UPDATED`, which `init/oosh`
-exports after its own `apt-get update` and `oo cmd` exports after one, so the
-`oo cmd` children of an install do not refresh again (`config save` never
-persists it). dnf, yum, apk and brew get no refresh before an install.
+install — a fresh apt image has empty lists (T-OO-CMD-REFRESH-ONCE). Once means
+`OOSH_APT_UPDATED`, which `init/oosh` exports after its own `apt-get update` and
+`oo cmd` exports after one **that worked** — a failed refresh is retried by the
+next `oo cmd` — so the `oo cmd` children of an install do not refresh again
+(`config save` never persists it). There is no other marker: the old
+`OOSH_PM_UPDATED` was set before the refresh ran and `config save` harvested it
+into the shared `oosh.env`, which made every later shell skip the refresh for
+good (T-OO-CMD-REFRESH-MARKER). dnf, yum, apk and brew get no refresh before an
+install; an explicit `oo cmd update` on dnf/yum runs `makecache` each time.
 
 Special cases:
 - `update` - Refreshes the package-manager cache (`apt-get update` / `dnf makecache` / `yum makecache`), once per process chain as above
@@ -773,7 +777,7 @@ oo usage
 | `$OOSH_DIR` | Installation directory |
 | `$OOSH_MODE` | Current mode (dev/released) |
 | `$OOSH_PM` | Package manager command |
-| `$OOSH_PM_UPDATED` | Package manager update command |
+| `$OOSH_APT_UPDATED` | apt package lists refreshed in this process chain — exported only after a refresh that worked, never saved by `config save` |
 | `$OS_CMD_GROUP_ADD` | Command to add groups |
 | `$OS_CMD_USER_ADD` | Command to add users |
 
