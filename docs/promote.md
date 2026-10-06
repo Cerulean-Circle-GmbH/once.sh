@@ -16,8 +16,8 @@ Since the clone layout ([oo.md § The clone layout](oo.md#the-clone-layout); ogi
 For each merge (`private.promote.merge.into.folder <source> <target>`):
 
 1. push `<source>` to origin (from `<source>`'s folder when one exists) — fails fast if origin has diverged;
-2. in `<base>/<target>`: stash local changes, `fetch`, fast-forward `<target>` to `origin/<target>` — a target that has **diverged** from origin is refused and left untouched;
-3. merge `origin/<source>` as the promote bot (`oosh-promote@local` / `oosh promote`), rewrite `OOSH_SELF_BRANCH` there (auto-resolving the known `OOSH_SELF_BRANCH` drift conflict, else abort), pop the stash.
+2. in `<base>/<target>`: stash local changes (staged or not — `ogit.status.check`), `fetch`, fast-forward `<target>` to `origin/<target>` — a target that has **diverged** from origin is refused and left untouched;
+3. merge `origin/<source>` as the promote bot (`oosh-promote@local` / `oosh promote`), rewrite `OOSH_SELF_BRANCH` there (auto-resolving the known `OOSH_SELF_BRANCH` drift conflict, else abort), pop the stash. Every way out — success, refusal or abort — pops it through `private.promote.merge.finish`; a pop that fails (the merge changed the same lines) keeps the change in the stash, warns, and the `RESULT` ends with `resolve, then run: ogit stash.pop <base>/<target>`.
 
 `testing.tagged` / `prod.tagged` tag in that folder, `testing.pushed` / `prod.pushed` push the branch and tags from it.
 
