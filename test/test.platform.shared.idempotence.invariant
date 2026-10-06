@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Platform invariant: every repair a user runs after an install is IDEMPOTENT.
+#
+# The owner's rule: a second run of an install/repair method changes nothing —
+# no rewritten file, no new backup, no duplicate entry — and the same method
+# runs on ubuntu 24.04, debian 12, AlmaLinux 9, alpine 3.19 and macOS. This
+# file asks it on the real installed machine, per method, so the report names
+# the culprit:
+#   config init.user · oo user.fix · config save · oo update · odocker prereqs.install
+# Each one: run (reach its fixed point — the install may not have run this
+# exact method) → snapshot → run again → snapshot → compare. The snapshot holds
+# CONTENT (cksum, POSIX) and REWRITTEN (inode + mtime, stat -c with its stat -f
+# twin) of what those methods own for the user running this file.
+#
+# A method that cannot be run here without a password prompt (a user without
+# passwordless sudo, where the method calls sudo), or `oo update` whose pull
+# fails (network, credentials), is NOT CHECKED: an expect.fail that says so
+# and why — a skip that scores as a pass is how a check silently stops
+# checking (docs/test-suite.md, test.platform.odocker.workspaces.invariant).
+#
+# Each method runs in a fresh process with the user's own environment only
+# (env -i HOME USER LOGNAME PATH TERM): the env files load as in a new shell of
+# the user, and nothing of this test run (LOG_LEVEL 1, TEST_SUITE_*) can leak
+# into a `config save`.
+#
+# Invoke: ./test.suite run platform.shared.idempotence.invariant 1
+# ============================================================================
+
+TEST_CATEGORY=platform
+# By design this file runs the REAL repair methods on the REAL machine, so a
+# first run that moves the shared tier to its fixed point writes it. Whether a
+# SECOND run writes it is what this file asserts itself, per method.
+TEST_SHARED_TIER_WRITER="by design: runs config save, config init.user and oo update for real; their second runs are asserted by this file"
+
+# ----------------------------------------------------------------------------
+# Helpers — POSIX tools only, so a driver can source them without oosh:
+#   TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1 . test/test.platform.shared.idempotence.invariant
+# ----------------------------------------------------------------------------
+test.platform.shared.idempotence.snapshot() # <path|dir|glob...> # one line per entry, sorted: <path> TAB <content> TAB <stamp>; content is the cksum (a file), -> target (a symlink) or absent; stamp is inode and mtime; a directory stands for its entries, a glob for its matches
+{
+  local arg path content stamp IFS='
+'
+  for arg in "$@"; do
+    # A directory stands for its entries (one level), a glob for its matches;
+    # an unmatched glob stays literal and is recorded as absent.
+    if [ -d "$arg" ] && [ ! -L "$arg" ]; then
+      set -- "$arg"/* "$arg"/.[!.]*
+    else
+      set -- $arg
+    fi
+    for path in "$@"; do
+      if [ -L "$path" ]; then
+        content="-> $(readlink "$path")"
+      elif [ -f "$path" ]; then
+        content=$(cksum < "$path" 2>/dev/null | awk '{ print $1 "/" $2 }')
+      elif [ -e "$path" ]; then
+        content="present"
+      else
+        case "$path" in
+          *'/.[!.]*') continue ;;
+        esac
+        printf '%s\tabsent\t-\n' "$path"
+        continue
+      fi
+      stamp=$(stat -c '%i %Y' "$path" 2>/dev/null || stat -f '%i %m' "$path" 2>/dev/null)
+      printf '%s\t%s\t%s\n' "$path" "$content" "${stamp:--}"
+    done
+  done | sort -u
+}
+
+test.platform.shared.idempotence.compare() # <beforeFile> <afterFile> # one line per difference — changed (content), rewritten (same content, new inode or mtime), added, removed; nothing and rc 0 when the two snapshots are the same
+{
+  local differences
+  differences=$(awk -F '\t' '
+    NR == FNR { content[$1] = $2; stamp[$1] = $3; next }
+    {
+      seen[$1] = 1
+      if (!($1 in content) || content[$1] == "absent") {
+        if ($2 != "absent") print "added: " $1 " (" $2 ")"
+      } else if ($2 == "absent") {
+        print "removed: " $1
+      } else if (content[$1] != $2) {
+        print "changed: " $1 " (" content[$1] " -> " $2 ")"
+      } else if (stamp[$1] != $3) {
+        print "rewritten: " $1 " (same content; inode mtime " stamp[$1] " -> " $3 ")"
+      }
+    }
+    END { for (k in content) if (!(k in seen) && content[k] != "absent") print "removed: " k }
+  ' "$1" "$2" | sort)
+  [ -z "$differences" ] && return 0
+  printf '%s\n' "$differences"
+  return 1
+}
+
+[ -n "$TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY" ] && { return 0 2>/dev/null || exit 0; }
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# ----------------------------------------------------------------------------
+# INVARIANT-0 (precondition): an installed user — ~/oosh and ~/config are the
+# shared tree's symlinks. Without them no repair method can mean anything.
+# ----------------------------------------------------------------------------
+test.case $level "platform.shared.idempotence: precondition — ~/oosh and ~/config are symlinks" \
+  test -L "$HOME/oosh"
+if [ ! -L "$HOME/oosh" ] || [ ! -L "$HOME/config" ]; then
+  expect.fail "~/oosh or ~/config is not a symlink — run \`ossh install <host>\` first, or \`oo user.fix\`"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "~/oosh -> $(readlink "$HOME/oosh"), ~/config -> $(readlink "$HOME/config")"
+fi
+
+private.this.script.load ogit ogit.safeDirectory.list
+private.this.script.load odocker private.odocker.socket.get
+
+userName=$(id -un)
+sharedConfig=$(private.this.path.canonical "$HOME/config")
+work=$(test.suite.fixture.make idempotence)
+
+# What the repeatable methods own, as data: a missing path is an empty
+# listing, never a per-distro branch.
+snapshotPaths="$HOME/.bashrc
+$HOME/.bashrc*
+$HOME/.bash_profile*
+$HOME/.gitconfig
+$HOME/*.orig.*
+$HOME/.config/oosh
+$sharedConfig/*.env
+$HOME/oosh
+$HOME/config
+/usr/local/bin/this
+/etc/apt/sources.list.d
+/etc/apt/keyrings
+/etc/yum.repos.d"
+
+test.platform.shared.idempotence.snapshotAll() # <file> # the whole snapshot of this user into <file>
+{
+  local IFS='
+'
+  {
+    test.platform.shared.idempotence.snapshot $snapshotPaths
+    printf 'groups of %s\t%s\t-\n' "$userName" "$(id -nG "$userName" 2>/dev/null | tr ' ' '\n' | sort | tr '\n' ' ')"
+    printf 'safe.directory\t%s\t-\n' "$(ogit.safeDirectory.list | sort | tr '\n' ' ')"
+  } > "$1"
+}
+
+test.platform.shared.idempotence.run() # <outFile> <script> <method...> # the method in a fresh process of this user, stdin closed; its rc
+{
+  local outFile="$1" script="$2"
+  shift 2
+  ( cd "$HOME" && env -i HOME="$HOME" USER="$userName" LOGNAME="$userName" PATH="$PATH" TERM="${TERM:-dumb}" \
+      "$HOME/oosh/$script" "$@" ) </dev/null >"$outFile" 2>&1
+}
+
+# Who may sudo here without a prompt. Root needs none.
+sudoFree=no
+if [ "$(id -u)" = "0" ] || sudo -n true >/dev/null 2>&1; then sudoFree=yes; fi
+
+# config.init.user ends in `user.group.add dev <user>`, which runs
+# `$SUDO usermod` even for a member: a user who would be asked is not run.
+initUserBlock=""
+if [ "$sudoFree" = no ] && private.this.group.exists dev; then
+  initUserBlock="$userName has no passwordless sudo and config.init.user always runs \$SUDO usermod for group dev (user.group.add)"
+fi
+
+# odocker.prereqs.install calls sudo to install docker/column, start an
+# engine, create the socket's group or join it — the same cases as
+# private.odocker.prereqs.ensure and odocker.prereqs.install.
+odockerBlock=""
+if [ "$sudoFree" = no ]; then
+  socket=$(private.odocker.socket.get)
+  command -v column >/dev/null 2>&1 || odockerBlock="column is missing (an install)"
+  if [ -e "$socket" ]; then
+    command -v docker >/dev/null 2>&1 || odockerBlock="the docker client is missing (an install)"
+    socketGid=$(stat -c %g "$socket" 2>/dev/null || stat -f %g "$socket" 2>/dev/null)
+    socketGroup=$(private.this.group.name.get "$socketGid")
+    case " $(id -nG "$userName" 2>/dev/null) " in
+      *" ${socketGroup:-<none>} "*) ;;
+      *) odockerBlock="$userName is not in the group of $socket (a group change)" ;;
+    esac
+  elif private.this.container.is; then
+    command -v docker >/dev/null 2>&1 || odockerBlock="the docker client is missing (an install)"
+  elif private.odocker.engine.supported >/dev/null 2>&1; then
+    { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; } \
+      || odockerBlock="the Docker engine is missing or stopped (an install or a start)"
+  fi
+  [ -n "$odockerBlock" ] && odockerBlock="$userName has no passwordless sudo and odocker would need it: $odockerBlock"
+fi
+
+# ----------------------------------------------------------------------------
+# INVARIANT-1..5: per method — run, snapshot, run again, snapshot, compare.
+# Fields of each row: <label> TAB <blocked reason> TAB <recovery> TAB <command>
+# ----------------------------------------------------------------------------
+# A tab is IFS white space, so `read` would collapse an empty field: "-" is none.
+methods="config init.user	${initUserBlock:--}	config init.check	config init.user
+oo user.fix	${initUserBlock:--}	config init.check	oo user.fix
+config save	-	config validate.required	config save
+oo update	${initUserBlock:--}	config init.check	oo update
+odocker prereqs.install	${odockerBlock:--}	odocker status	odocker prereqs.install"
+
+while IFS='	' read -r label blocked recovery command; do
+  [ "$blocked" = "-" ] && blocked=""
+  slug=$(printf '%s' "$label" | tr ' .' '__')
+  test.case $level "platform.shared.idempotence: a second \`$label\` changes nothing" true
+  if [ -n "$blocked" ]; then
+    expect.fail "NOT CHECKED: \`$label\` — $blocked — see: sudo -n true (give $userName passwordless sudo, or run this file as root)"
+    continue
+  fi
+  # shellcheck disable=SC2086 # <command> is two words: script and method
+  test.platform.shared.idempotence.run "$work/$slug.first.out" $command; firstRc=$?
+  if [ "$label" = "oo update" ] && [ "$firstRc" != 0 ]; then
+    expect.fail "NOT CHECKED: \`oo update\` could not pull (rc $firstRc; network or credentials): $(grep . "$work/$slug.first.out" | tail -1) — see: ogit remote.pull"
+    continue
+  fi
+  test.platform.shared.idempotence.snapshotAll "$work/$slug.before"
+  # A rewrite within the same second keeps the mtime; the inode alone would
+  # miss an in-place rewrite.
+  sleep 1
+  # shellcheck disable=SC2086
+  test.platform.shared.idempotence.run "$work/$slug.second.out" $command; secondRc=$?
+  test.platform.shared.idempotence.snapshotAll "$work/$slug.after"
+  lastWords=$(grep . "$work/$slug.second.out" | tail -1)
+  if differences=$(test.platform.shared.idempotence.compare "$work/$slug.before" "$work/$slug.after"); then
+    if [ "$secondRc" = 0 ] || [ "$label" = "odocker prereqs.install" ]; then
+      expect.pass "\`$label\` twice: nothing changed (rc $firstRc then $secondRc)${lastWords:+ — $lastWords}"
+    else
+      expect.fail "\`$label\` changed nothing but failed (rc $secondRc): $lastWords — see: $recovery"
+    fi
+  else
+    expect.fail "\`$label\` is not idempotent — its second run changed:
+$(printf '%s\n' "$differences" | sed 's/^/      /')
+    — see: $recovery"
+  fi
+done <<EOF
+$methods
+EOF
+
+rm -rf "$work"
+test.suite.save.results
