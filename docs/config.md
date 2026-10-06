@@ -36,7 +36,7 @@ The config system supports:
 | `~/config/oosh.env` | OOSH-specific variables |
 | `~/config/log.env` | Logging configuration (shared: `LOG_LEVEL`, `LOG_LEVEL_RESET`) |
 | `~/config/<name>.env` | Custom named configs |
-| `$HOME/.config/oosh/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE`) |
+| `$HOME/.config/oosh/log.session.env` | **Per-user** log identity/session (`LOG_NAME`, `LOG_LIVE`, and `LOG_DEVICE` only when it is a file chosen with `log device <file>` — a terminal is never saved) |
 | `$HOME/.config/oosh/user.session.env` | **Per-user** half of `user.env`: the user's real `PATH` (no `$` at all) (`config session.save`) |
 | `$HOME/.config/oosh/oosh.session.env` | **Per-user** half of `oosh.env`: `OOSH_MODE`, the branch the user's own `~/oosh` points at (`config session.save`) |
 
@@ -82,7 +82,7 @@ branch **their** `~/oosh` points at — so `config list oosh` shows it nested, a
 |---|---|---|
 | `user.env` | `. $HOME/.config/oosh/user.session.env` | `PATH` |
 | `oosh.env` | `. $HOME/.config/oosh/oosh.session.env` | `OOSH_MODE` |
-| `log.env` | `. $HOME/.config/oosh/log.session.env` | `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | `config session.save` writes it; `config save` writes the saving
+| `log.env` | `. $HOME/.config/oosh/log.session.env` | `LOG_NAME`, `LOG_LIVE`, `LOG_DEVICE` (only a chosen file) | `config session.save` writes it; `config save` writes the saving
 user's; `config init.user` and the install create it for every user, filled in
 their own hop (`private.config.session.file.ensure`). The ensure creates and
 **first**-fills only — an empty `user.session.env` or a missing `oosh.session.env`;
