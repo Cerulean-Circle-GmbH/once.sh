@@ -244,14 +244,17 @@ oo mode.setup                 # base defaults to the clone's parent directory
 oo mode.setup /var/dev/trees  # or name the base explicitly
 ```
 
-It copies the clone to `<base>/main`, verifies that copy is a real repository,
-removes the original, makes `<base>/<branch>` an independent clone of it (origin
-re-pointed at `main/`'s origin, group-shared), and **checks that
+It copies the clone to `<base>/main`, makes `<base>/<branch>` an independent
+clone of it (origin re-pointed at `main/`'s origin, group-shared), and only
+then removes the original — never before: a failed branch clone leaves the
+original, and `~/oosh` with it, as they were (T-SETUP-SAFE-SWAP). An original
+that already sits at `<base>/<branch>` is kept as that clone. It **checks that
 `oo.mode.base.get` can find the base with `OOSH_COMPONENTS_DIR` unset** before
 it touches `~/oosh`. If that check fails it stops with the layout built and the
 old symlink intact.
 
-It is a no-op when `<base>/main` already exists as a repository, and it refuses
+It is a no-op when `<base>/main` and `<base>/<branch>` already exist as
+repositories; `main/` alone is a half-made run, and a re-run finishes it. It refuses
 rather than guessing when `<base>/main` exists but is not one, when the source
 has no detectable branch, or when `~/oosh` is a real directory rather than a
 symlink.

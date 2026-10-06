@@ -926,14 +926,19 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main
   #    half-converted tree read as done. The canonical shape is main/ with a
   #    real .git DIRECTORY — main/ is a repository, and so is every branch
   #    directory beside it (the clone layout; older installs: linked worktrees).
-  if [ -d "$base/main/.git" ]; then
+  #    Done means main/ AND the folder of this branch: main/ alone is a run
+  #    whose branch clone failed, and "already set up" hid it on every re-run
+  #    (T-SETUP-SAFE-SWAP) — that falls through and finishes the layout.
+  local setupBranch
+  setupBranch=$(this.git.branch.short "$currentDir")
+  if [ -d "$base/main/.git" ] && [ -n "$setupBranch" ] && [ -d "$base/$setupBranch/.git" ]; then
     echo "Worktree structure already exists at: $base"
     create.result 0 "already set up at $base" "$1"
     return $(result)
   fi
 
   # 3. A main/ that is not a repository is a refusal, not something to copy over.
-  if [ -e "$base/main" ]; then
+  if [ -e "$base/main" ] && [ ! -d "$base/main/.git" ]; then
     # ogit-exception: printed text, not an invocation
     error.log "oo.mode.setup: $base/main exists but is not a git repository — move it aside first"
     create.result 3 "$base/main is not a repository" "$1"
@@ -957,9 +962,9 @@ oo.mode.setup() # <?worktree_base> # convert a plain clone to the canonical main
   echo "  Source: $currentDir (branch: $currentBranch)"
   echo "  Base:   $base"
 
-  # 5. Build it. `yes` consumes the source AFTER main/ is verified — the only
-  #    ordering that works when the clone already sits where the branch
-  #    worktree has to go, and the only one in which nothing can be lost.
+  # 5. Build it. `yes` consumes the source LAST, once main/ and the branch
+  #    folder stand (a source that IS the branch folder is kept as its clone):
+  #    a failed branch clone leaves the source — and ~/oosh — as they were.
   if ! ( cd "$base" && private.oo.shared.tree.from.local "$currentDir" "$currentBranch" yes ); then
     error.log "oo.mode.setup: could not build the canonical layout in $base — $currentDir is untouched unless the log above says otherwise"
     create.result 4 "layout build failed in $base" "$1"
@@ -1551,7 +1556,7 @@ private.check.root.rights() {
 }
 
 
-private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:no> # produce the canonical `main/ + <branchName>/` clone layout in $(pwd) from a local clone: <branchName>/ is an independent clone of main/ (origin re-pointed at main/'s origin, group-shared). Idempotent — skips if main/ already exists. With <consumeSource> = yes the source is removed once main/ is verified, which is what `oo mode.setup` needs when the clone already sits where the branch clone has to go. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 4 then succeeds and `oo mode <branch>` works).
+private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:no> # produce the canonical `main/ + <branchName>/` clone layout in $(pwd) from a local clone: <branchName>/ is an independent clone of main/ (origin re-pointed at main/'s origin, group-shared). Idempotent — skips when main/ and <branchName>/ exist; a main/ alone gets its branch folder. With <consumeSource> = yes the source is removed last, once main/ and <branchName>/ stand — never when it IS the branch folder (kept as the clone); what `oo mode.setup` needs. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 4 then succeeds and `oo mode <branch>` works).
 {
   private.this.script.load ogit ogit.branch.get
   local src="$1"
@@ -1566,15 +1571,17 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:n
     return 1
   fi
 
-  # Idempotent fast-path: main/ already present → nothing to do.
-  if [ -d "main" ]; then
-    important.log "private.oo.shared.tree.from.local: main/ already present in $(pwd) — skipping"
+  # Idempotent fast-path: main/ and the branch folder present → nothing to do.
+  # main/ alone is a run whose branch clone failed: go on and make it.
+  if [ -d "main" ] && { [ "$branch" = "main" ] || [ -d "$branch/.git" ]; }; then
+    important.log "private.oo.shared.tree.from.local: main/ and $branch/ already present in $(pwd) — skipping"
     return 0
   fi
 
-  # 1. Copy source → main/. The .git/ from the source comes along, so main/
-  #    is a self-contained clone that can host worktrees.
-  cp -a "$src" "main" || { error.log "private.oo.shared.tree.from.local: copy $src → main/ failed"; return 1; }
+  # 1. Copy source → main/ (kept when a half-made run left it). The .git/
+  #    from the source comes along, so main/ is a self-contained clone.
+  [ -d "main" ] || cp -a "$src" "main" \
+    || { error.log "private.oo.shared.tree.from.local: copy $src → main/ failed"; return 1; }
 
   # 2. Make sure main/'s active branch is 'main'. Local sources are typically
   #    cloned with `-b dev` so their HEAD points at dev. Create local 'main'
@@ -1591,23 +1598,6 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:n
   else
     ogit.branch.checkout main main >/dev/null \
       || warn.log "private.oo.shared.tree.from.local: could not checkout main in main/"
-  fi
-
-  # 2b. Optionally consume the source. `oo mode.setup` needs this: when the
-  #     plain clone already sits at <base>/<branch>, the `git worktree add
-  #     ../<branch>` below collides with it — git refuses an existing,
-  #     non-empty path. Removing it HERE is the only ordering in which nothing
-  #     can be lost: main/ is verified to be a real repository first, and it
-  #     already holds every commit the source had. Default no, so state 31's
-  #     call is unchanged.
-  if [ "$consume" = "yes" ]; then
-    if [ ! -d "main/.git" ] || ! ogit.repo.check main; then
-      error.log "private.oo.shared.tree.from.local: refusing to remove $src — main/ is not a usable repository"
-      return 1
-    fi
-    rm -rf "$src" \
-      || { error.log "private.oo.shared.tree.from.local: could not remove the consumed source $src"; return 1; }
-    important.log "private.oo.shared.tree.from.local: source consumed: $src"
   fi
 
   # 3. The active branch as an INDEPENDENT CLONE beside main/ (clone layout,
@@ -1639,6 +1629,22 @@ private.oo.shared.tree.from.local() # <sourceDir> <branchName> <?consumeSource:n
     # and oo mode.setup's user owns the clone it just made.
     ogit.folder.finish "$here/$branch" >/dev/null \
       || warn.log "private.oo.shared.tree.from.local: $RESULT"
+  fi
+
+  # 4. Optionally consume the source (`oo mode.setup`) — LAST, once main/ and
+  #    <branch>/ both stand: it is the tree ~/oosh points at. Removing it
+  #    before the branch clone left ~/oosh dangling when that clone failed
+  #    (T-SETUP-SAFE-SWAP). A source that IS the branch folder was kept by
+  #    private.oo.branch.clone.ensure as the clone: nothing to remove.
+  if [ "$consume" = "yes" ] \
+     && [ "$(private.this.path.canonical "$src")" != "$(private.this.path.canonical "$PWD")/$branch" ]; then
+    if [ ! -d "main/.git" ] || ! ogit.repo.check main; then
+      error.log "private.oo.shared.tree.from.local: refusing to remove $src — main/ is not a usable repository"
+      return 1
+    fi
+    rm -rf "$src" \
+      || { error.log "private.oo.shared.tree.from.local: could not remove the consumed source $src"; return 1; }
+    important.log "private.oo.shared.tree.from.local: source consumed: $src"
   fi
 
   important.log "private.oo.shared.tree.from.local: canonical clone layout produced in $(pwd) (main/ + ${branch}/)"
