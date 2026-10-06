@@ -267,8 +267,10 @@ the socket's group. It takes one of two paths:
       It uses the container's `ID` and `VERSION_CODENAME` (its `/etc/os-release`,
       read with `private.os.release.get`) and the container's `dpkg`
       architecture, never the host's.
-    - The download is the same too, `private.odocker.docker.repo.download`. It
-      runs on the host, because a naked image may have no curl.
+    - The download is the same too, `private.odocker.docker.repo.download <url> <file>`.
+      It runs on the host, because a naked image may have no curl. The file
+      (and the container's os-release) lie in one private directory from the
+      kernel's `private.this.temp.dir.get`, removed on every exit path.
     - The key and the list (apt) or the `.repo` file (dnf/yum) are then written
       into the container with `docker exec -i … sh -c 'cat > <file>'`. apt
       first gets `ca-certificates`. Then the container's own `apt-get update`
