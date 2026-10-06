@@ -228,29 +228,58 @@ odocker up naked_ubuntu_24_04 9022
 
 ## Docker Socket
 
-Commands `run`, `run.sshd`, `up`, `reset`, and `clone` accept an optional `docker` parameter as the last argument. When provided:
-
-1. Mounts `/var/run/docker.sock` into the container (socket forwarding)
-2. Installs Docker CLI inside the container (`odocker install`)
+**Every container odocker starts has the socket.** `run`, `run.sshd`, `up`,
+`reset` and `clone` always mount the socket odocker found
+(`private.odocker.docker.socket.opt`: `$(private.odocker.socket.get)` →
+`/var/run/docker.sock`), with or without the option. The optional last `docker`
+parameter only decides whether the Docker client is installed in the new
+container (`odocker install`). It does so for `run.sshd`, and for `up`, `reset`
+and `clone` when they start the container through `run.sshd` (an image that
+exposes port 22). `run` takes the parameter but installs nothing. So does `up`
+or `clone` of an image without port 22. Run `odocker install <container>` there
+yourself.
 
 This allows the container to control the host's Docker daemon.
 
 `odocker install <container>` has **one** implementation of the install and of
-the socket's group. With oosh in the container (`~/oosh/odocker` there) it runs
-`odocker prereqs.install` in it, through the prelude (`ossh.remote.prelude.get`):
-the container installs and groups itself with the very methods a started odocker
-uses — `private.odocker.prereqs.ensure` (the package table, Docker's repository)
-and `private.odocker.socket.group.ensure` (the socket's group, else `docker`,
-else `dockerhost`; an existing group is never renumbered), and every user (uid
-1000 and up) joins it (T-ODOCKER-INSTALL-OOSH). `odocker prereqs.install <?user>`
-is a command of its own, too: typed in a container it installs what odocker
-needs there and joins the socket's group; nothing under `OOSH_NO_INSTALL`
-(T-ODOCKER-PREREQS-INSTALL). A container **without** oosh gets a raw path
-(`private.odocker.container.prereqs.install`): the package names of the same
-table, asked on the host with the container's package manager (`apt-get`
-non-interactive), and the same group rule (T-ODOCKER-INSTALL-RAW). `docker-ce-cli`
-(apt, dnf/yum) comes from Docker's repository, which only oosh adds — in a
-container without oosh and without that repository the install fails and says so.
+the socket's group. It takes one of two paths:
+
+- **A container with oosh** (`~/oosh/odocker` there): it runs
+  `odocker prereqs.install` in the container through the prelude
+  (`ossh.remote.prelude.get`). The container installs and groups itself with the
+  very methods a started odocker uses:
+  - `private.odocker.prereqs.ensure`: the package table and Docker's
+    repository.
+  - `private.odocker.socket.group.ensure`: the socket's group, else `docker`,
+    else `dockerhost`. An existing group is never renumbered.
+
+  Every user with uid 1000 and up joins that group (T-ODOCKER-INSTALL-OOSH).
+  `odocker prereqs.install <?user>` is a command of its own too: typed in a
+  container, it installs what odocker needs there and joins the socket's group.
+  It does nothing under `OOSH_NO_INSTALL` (T-ODOCKER-PREREQS-INSTALL).
+- **A container without oosh** (a naked ubuntu, debian or almalinux image)
+  takes the raw path, `private.odocker.container.prereqs.install`:
+  - **Packages:** the names come from the same table, asked on the host with
+    the container's package manager. apt runs non-interactively.
+  - **Docker's repository:** `docker-ce-cli` (apt, dnf/yum) comes from it, so
+    `private.odocker.container.repo.add` adds it first, from the host:
+    - The data is the same as the local add, from `private.odocker.docker.repo.get`.
+      It uses the container's `ID` and `VERSION_CODENAME` (its `/etc/os-release`,
+      read with `private.os.release.get`) and the container's `dpkg`
+      architecture, never the host's.
+    - The download is the same too, `private.odocker.docker.repo.download`. It
+      runs on the host, because a naked image may have no curl.
+    - The key and the list (apt) or the `.repo` file (dnf/yum) are then written
+      into the container with `docker exec -i … sh -c 'cat > <file>'`. apt
+      first gets `ca-certificates`. Then the container's own `apt-get update`
+      and the install run.
+    - When the marker file is already in the container, nothing is downloaded
+      or written.
+    - A failed download writes nothing into the container and answers rc 1,
+      naming why.
+  - **Alpine:** `docker-cli` from apk, no repository.
+  - **The socket's group:** the same group rule as above (T-ODOCKER-INSTALL-RAW,
+    T-ODOCKER-DOCKER-REPO-GET).
 
 ### Usage
 

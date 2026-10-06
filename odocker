@@ -410,63 +410,46 @@ private.odocker.docker.repo.add()     # <?root:/> # add the own package reposito
  # Once there it is left alone, and a download that fails or is empty leaves
  # nothing behind: an empty key broke every later apt-get update — curl's rc
  # was lost in a pipe (T-ODOCKER-DOCKER-REPO-APT).
- local root="${1:-/}" pm="${OOSH_PM%% *}" file url keyPath="/etc/apt/keyrings/docker.asc" keyFile="" line="" id codename arch tmp
+ # The data is private.odocker.docker.repo.get's, the download
+ # private.odocker.docker.repo.download's — shared with the add into a
+ # container without oosh (private.odocker.container.repo.add).
+ local root="${1:-/}" pm="${OOSH_PM%% *}" marker file url line arch tmp rc
  root="${root%/}"
- # The data per package manager: the file that marks the repository present
- # (written last) and what is downloaded into it. dnf/yum: the .repo file
- # config-manager --add-repo would fetch; apt: the key, then the list.
- case "$pm" in
-   apt-get|dpkg) file="/etc/apt/sources.list.d/docker.list" ;;
-   dnf|yum)      file="/etc/yum.repos.d/docker-ce.repo"; url="https://download.docker.com/linux/centos/docker-ce.repo" ;;
-   *) create.result 1 "Docker has no package repository for ${pm:-this package manager} — its own docker package is used"
-      return $(result) ;;
- esac
- if [ -e "$root$file" ]; then
-   create.result 0 "Docker's repository is there: $root$file"
+ if ! marker=$(private.odocker.docker.repo.get marker "$pm"); then
+   create.result 1 "Docker has no package repository for ${pm:-this package manager} — its own docker package is used"
+   return $(result)
+ fi
+ if [ -e "$root$marker" ]; then
+   create.result 0 "Docker's repository is there: $root$marker"
    return $(result)
  fi
  private.this.script.load oo oo.cmd
  oo.cmd curl >/dev/null 2>&1
- if [ -z "$url" ]; then
-   # An OS fact: os owns it; <root>'s own os-release.
-   private.this.script.load os private.os.release.get
-   id=$(private.os.release.get ID "$root/etc/os-release")
-   codename=$(private.os.release.get VERSION_CODENAME "$root/etc/os-release")
-   arch=$(dpkg --print-architecture 2>/dev/null)
-   if [ -z "$id" ] || [ -z "$codename" ] || [ -z "$arch" ]; then
-     create.result 1 "Docker's apt repository needs ID, VERSION_CODENAME and the architecture (got: ${id:-?} ${codename:-?} ${arch:-?})"
-     return $(result)
-   fi
-   oo.cmd update-ca-certificates ca-certificates >/dev/null 2>&1
-   url="https://download.docker.com/linux/$id/gpg"
-   line="deb [arch=$arch signed-by=$keyPath] https://download.docker.com/linux/$id $codename stable"
-   keyFile="$root$keyPath"
+ # <root>'s own os-release; the architecture of this computer (apt only).
+ arch=$(dpkg --print-architecture 2>/dev/null)
+ if ! url=$(private.odocker.docker.repo.get url "$pm" "$root/etc/os-release" "$arch"); then
+   create.result 1 "Docker's apt repository needs ID and VERSION_CODENAME of $root/etc/os-release and the architecture (arch: ${arch:-?})"
+   return $(result)
  fi
- # Downloaded to a temporary file first: only a complete, non-empty download
- # is moved into place.
- tmp=$(mktemp 2>/dev/null) || { create.result 1 "no temporary file for the download of $url"; return $(result); }
- if ! curl -fsSL "$url" > "$tmp" 2>/dev/null; then
-   rm -f "$tmp"; create.result 1 "could not download $url"; return $(result)
- fi
- if [ ! -s "$tmp" ]; then
-   rm -f "$tmp"; create.result 1 "the download of $url is empty"; return $(result)
- fi
- if [ -n "$line" ]; then
-   # apt: the key goes to $keyPath, the list names it.
-   $SUDO install -m 0755 -d "$root${keyPath%/*}" "$root${file%/*}" \
-     && $SUDO install -m 0644 "$tmp" "$keyFile" \
-     && printf '%s\n' "$line" > "$tmp" \
-     && $SUDO install -m 0644 "$tmp" "$root$file" \
-     && $SUDO apt-get update >/dev/null 2>&1
- else
-   $SUDO install -m 0755 -d "$root${file%/*}" && $SUDO install -m 0644 "$tmp" "$root$file"
- fi
- if [ "$?" != 0 ]; then
-   rm -f "$tmp"; $SUDO rm -f "$root$file" ${keyFile:+"$keyFile"}
-   create.result 1 "could not add Docker's repository at $root$file"; return $(result)
- fi
+ file=$(private.odocker.docker.repo.get file "$pm" "$root/etc/os-release" "$arch")
+ line=$(private.odocker.docker.repo.get line "$pm" "$root/etc/os-release" "$arch")
+ [ -n "$line" ] && oo.cmd update-ca-certificates ca-certificates >/dev/null 2>&1
+ private.odocker.docker.repo.download "$url" || return $(result)
+ tmp="$RESULT"
+ # The download goes to <file>; apt: then the list (the marker) names it, and
+ # apt reads its sources again.
+ $SUDO install -m 0755 -d "$root${file%/*}" "$root${marker%/*}" \
+   && $SUDO install -m 0644 "$tmp" "$root$file" \
+   && { [ -z "$line" ] || { printf '%s\n' "$line" > "$tmp" \
+          && $SUDO install -m 0644 "$tmp" "$root$marker" \
+          && $SUDO apt-get update >/dev/null 2>&1; }; }
+ rc=$?
  rm -f "$tmp"
- create.result 0 "Docker's repository added for $pm: $root$file"
+ if [ "$rc" != 0 ]; then
+   $SUDO rm -f "$root$marker" "$root$file"
+   create.result 1 "could not add Docker's repository at $root$marker"; return $(result)
+ fi
+ create.result 0 "Docker's repository added for $pm: $root$marker"
  return $(result)
 }
 
@@ -520,7 +503,7 @@ private.odocker.container.prereqs.install()     # <container> # install the Dock
  # container's package manager; the group rule is socket.group.ensure's: the
  # group of the socket's number, else docker, else dockerhost — an existing
  # group is never renumbered (T-ODOCKER-INSTALL-RAW).
- local container="$1" pm cmd pkgs gid group u hint=""
+ local container="$1" pm cmd pkgs gid group u
  [ -n "$1" ] && shift
  pm=$(docker exec "$container" sh -c 'for pm in apk apt-get dnf yum; do if command -v "$pm" >/dev/null 2>&1; then echo "$pm"; break; fi; done' 2>/dev/null)
  case "$pm" in
@@ -532,10 +515,16 @@ private.odocker.container.prereqs.install()     # <container> # install the Dock
       return $(result) ;;
  esac
  pkgs="$(OOSH_PM="$pm" private.odocker.prereq.package.get docker) $(OOSH_PM="$pm" private.odocker.prereq.package.get column)"
+ # docker-ce-cli (apt, dnf/yum) comes from Docker's repository: added from
+ # this host, as prereqs.ensure adds it on a computer with oosh.
+ case "$pkgs" in
+   docker-ce*) if ! private.odocker.container.repo.add "$container" "$pm"; then
+                 error.log "$RESULT"; return $(result)
+               fi ;;
+ esac
  console.log "Installing $pkgs in $container ($pm; no oosh there)"
  if ! docker exec "$container" sh -c "$cmd $pkgs"; then
-   case "$pkgs" in docker-ce*) hint=" — $pkgs comes from the package repository of Docker, which only oosh adds: install oosh in $container, then odocker install runs odocker prereqs.install there" ;; esac
-   create.result 1 "the install of $pkgs failed in $container$hint"; error.log "$RESULT"
+   create.result 1 "the install of $pkgs failed in $container"; error.log "$RESULT"
    return $(result)
  fi
  gid=$(docker exec "$container" stat -c %g /var/run/docker.sock 2>/dev/null)
@@ -554,6 +543,110 @@ private.odocker.container.prereqs.install()     # <container> # install the Dock
    docker exec "$container" sh -c "usermod -aG $group $u 2>/dev/null || addgroup $u $group 2>/dev/null"
  done
  create.result 0 "installed $pkgs in $container; group $group owns its docker socket"
+ return $(result)
+}
+
+
+private.odocker.docker.repo.get()     # <field> <pm> <?osRelease:/etc/os-release> <?arch> # echo one field of the package repository of Docker for package manager <pm>: marker (the file that marks it present), url (what is downloaded), file (where the download goes), line (apt: the source line from ID, VERSION_CODENAME of <osRelease> and <arch>); rc 1 and nothing when <pm> has none or apt lacks a value #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT. The one
+ # source of the data of Docker's repository: the local add
+ # (private.odocker.docker.repo.add) and the add into a container without oosh
+ # (private.odocker.container.repo.add) ask it (T-ODOCKER-DOCKER-REPO-GET).
+ # apt: the key is the download, the list (written last) the marker; dnf/yum:
+ # the .repo file is both — what config-manager --add-repo would fetch.
+ local field="$1" pm="${2%% *}" osRelease="${3:-/etc/os-release}" arch="$4" key="/etc/apt/keyrings/docker.asc" id codename
+ case "$pm:$field" in
+   apt-get:marker|dpkg:marker) echo "/etc/apt/sources.list.d/docker.list" ;;
+   apt-get:file|dpkg:file)     echo "$key" ;;
+   apt-get:url|dpkg:url|apt-get:line|dpkg:line)
+     private.this.script.load os private.os.release.get || return 1
+     id=$(private.os.release.get ID "$osRelease")
+     codename=$(private.os.release.get VERSION_CODENAME "$osRelease")
+     [ -n "$id" ] && [ -n "$codename" ] && [ -n "$arch" ] || return 1
+     if [ "$field" = url ]; then
+       echo "https://download.docker.com/linux/$id/gpg"
+     else
+       echo "deb [arch=$arch signed-by=$key] https://download.docker.com/linux/$id $codename stable"
+     fi ;;
+   dnf:marker|yum:marker|dnf:file|yum:file) echo "/etc/yum.repos.d/docker-ce.repo" ;;
+   dnf:url|yum:url)   echo "https://download.docker.com/linux/centos/docker-ce.repo" ;;
+   dnf:line|yum:line) ;;
+   *) return 1 ;;
+ esac
+}
+
+
+private.odocker.docker.repo.download()     # <url> # download <url> to a temporary file of this host: rc 0 and RESULT the file; rc 1 naming why when curl fails or the download is empty, and no file left #
+{
+ # Only a complete, non-empty download counts: an empty key broke every later
+ # apt-get update — curl's rc was lost in a pipe (T-ODOCKER-DOCKER-REPO-APT).
+ # On this host for a container too: a naked image may have no curl.
+ local url="$1" tmp
+ [ -n "$1" ] && shift
+ if ! tmp=$(mktemp 2>/dev/null); then
+   create.result 1 "no temporary file for the download of $url"
+ elif ! curl -fsSL "$url" > "$tmp" 2>/dev/null; then
+   rm -f "$tmp"; create.result 1 "could not download $url"
+ elif [ ! -s "$tmp" ]; then
+   rm -f "$tmp"; create.result 1 "the download of $url is empty"
+ else
+   create.result 0 "$tmp"
+ fi
+ return $(result)
+}
+
+
+private.odocker.container.repo.add()     # <container> <pm> # add the package repository of Docker to a running <container> without oosh: the data of private.odocker.docker.repo.get from the os-release and architecture of the container, downloaded on this host, written into the container; nothing when its marker is there; rc 1 naming why #
+{
+ # A naked image (ubuntu, debian, almalinux) has no oosh, maybe no curl and no
+ # ca-certificates: the same data and the same download as the local add, done
+ # here, then written into the container. Its ID, VERSION_CODENAME and
+ # architecture are the container's, never this host's (T-ODOCKER-INSTALL-RAW).
+ local container="$1" pm="$2" marker file url line arch osRelease tmp rc
+ [ -n "$1" ] && shift
+ [ -n "$1" ] && shift
+ if ! marker=$(private.odocker.docker.repo.get marker "$pm"); then
+   create.result 1 "Docker has no package repository for ${pm:-this package manager}"
+   return $(result)
+ fi
+ if docker exec "$container" test -e "$marker" 2>/dev/null; then
+   create.result 0 "Docker's repository is there in $container: $marker"
+   return $(result)
+ fi
+ if ! osRelease=$(mktemp 2>/dev/null); then
+   create.result 1 "no temporary file for the os-release of $container"; return $(result)
+ fi
+ docker exec "$container" cat /etc/os-release > "$osRelease" 2>/dev/null
+ arch=$(docker exec "$container" dpkg --print-architecture 2>/dev/null)
+ url=$(private.odocker.docker.repo.get url "$pm" "$osRelease" "$arch")
+ file=$(private.odocker.docker.repo.get file "$pm" "$osRelease" "$arch")
+ line=$(private.odocker.docker.repo.get line "$pm" "$osRelease" "$arch")
+ rm -f "$osRelease"
+ if [ -z "$url" ]; then
+   create.result 1 "Docker's repository for $container needs ID and VERSION_CODENAME of its /etc/os-release and its architecture (arch: ${arch:-?})"
+   return $(result)
+ fi
+ if ! private.odocker.docker.repo.download "$url"; then
+   create.result 1 "$RESULT — nothing was written into $container; check the network of this host, or install oosh in $container and run odocker install again"
+   return $(result)
+ fi
+ tmp="$RESULT"
+ # apt fetches the repository over https: the container needs the CA list.
+ if [ -n "$line" ]; then
+   private.this.script.load oo private.oo.pm.env.get
+   docker exec "$container" sh -c "command -v update-ca-certificates >/dev/null 2>&1 || { apt-get update && $(private.oo.pm.env.get apt-get) apt-get -y install ca-certificates; }" >/dev/null 2>&1
+ fi
+ docker exec "$container" mkdir -p "${file%/*}" "${marker%/*}" \
+   && docker exec -i "$container" sh -c "cat > $file" < "$tmp" \
+   && { [ -z "$line" ] || printf '%s\n' "$line" | docker exec -i "$container" sh -c "cat > $marker"; }
+ rc=$?
+ rm -f "$tmp"
+ if [ "$rc" != 0 ]; then
+   docker exec "$container" rm -f "$marker" "$file" >/dev/null 2>&1
+   create.result 1 "could not write Docker's repository into $container"; return $(result)
+ fi
+ create.result 0 "Docker's repository added in $container: $marker"
  return $(result)
 }
 

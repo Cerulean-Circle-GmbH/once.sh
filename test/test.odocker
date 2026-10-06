@@ -1802,18 +1802,30 @@ expect 0 "Docker's repository: key, list and update once; a failed download leav
 # mounted. $FX/log records every call. HASOOSH=yes: oosh is in the container
 # (/root/oosh/odocker); PM: its package manager; SOCKGRP: the /etc/group line of
 # the socket's number 4242, if any; DOCKERGRP=yes: a group docker (another number).
+# The container's files live under $CT (default <fx>/ct): test -e, cat, mkdir -p,
+# rm -f and `sh -c cat > <file>` work there; dpkg answers $CTARCH (arm64, not
+# this host's). curl is a recording stand-in on a fixture PATH (CURL_RC, CURL_OUT);
+# temporary files go to <fx>/tmp.
 test.odocker.installRun() { # <fx> <env assignments…>
   local fx="$1"; shift
-  env FX="$fx" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
+  mkdir -p "$fx/bin" "$fx/tmp" "$fx/ct"
+  printf '%s\n' '#!/bin/sh' 'echo "curl $*" >> "$FX/curl.log"' '[ "${CURL_RC:-0}" = 0 ] || exit "$CURL_RC"' 'printf "%s" "${CURL_OUT-KEY}"' > "$fx/bin/curl"; chmod +x "$fx/bin/curl"
+  env PATH="$fx/bin:$PATH" TMPDIR="$fx/tmp" FX="$fx" CT="$fx/ct" OOSH_DIR="$OOSH_DIR" "$@" bash -c '
     source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
     docker() {
       echo "docker $*" >> "$FX/log"
       case "$1" in
         inspect) case "$*" in *State*) echo running ;; *Mounts*) echo yes ;; esac ;;
-        exec) shift 2
+        exec) shift; [ "$1" = -i ] && shift; shift
           case "$*" in
             *"echo \"\${OOSH_DIR"*) [ "$HASOOSH" = yes ] && echo /root/oosh ;;
             "test -f /root/oosh/odocker") [ "$HASOOSH" = yes ] ;;
+            "test -e "*) [ -e "$CT$3" ] ;;
+            "cat /etc/os-release") cat "$CT/etc/os-release" ;;
+            "dpkg --print-architecture") echo "${CTARCH:-arm64}" ;;
+            "mkdir -p "*) shift 2; local d; for d; do mkdir -p "$CT$d"; done ;;
+            "rm -f "*) shift 2; local f; for f; do rm -f "$CT$f"; done ;;
+            "sh -c cat > "*) local a="$*"; cat > "$CT${a##*cat > }" ;;
             *"command -v"*) echo "$PM" ;;
             # portability-exception: matches the command text odocker sends into a Linux container, runs no stat
             "stat -c %g /var/run/docker.sock") echo 4242 ;;
@@ -1822,7 +1834,8 @@ test.odocker.installRun() { # <fx> <env assignments…>
             awk*) echo tester ;;
           esac ;;
       esac
-      return 0; }
+      # the answer of the arm that ran (test -e, test -f), else 0
+      return; }
     odocker.install somecontainer >/dev/null 2>&1; echo "rc=$?"' </dev/null 2>/dev/null | tail -1
 }
 
@@ -1846,17 +1859,56 @@ expect 0 "the container with oosh runs odocker prereqs.install through the prelu
   "odocker install put docker.io (too old) in an apt container and renumbered its docker group"
 
 # T-ODOCKER-INSTALL-RAW: a container without oosh gets the table's package names; no group is renumbered
+# docker-ce-cli (apt, dnf/yum) comes from Docker's repository: the host
+# downloads it with the data of private.odocker.docker.repo.get — the
+# container's ID, VERSION_CODENAME and architecture — and writes it into the
+# container (a naked image may have no curl), once. A failed download writes
+# nothing into the container.
 test.odocker.installRaw() {
-  local fx bad="" out pm want; fx=$(test.suite.fixture.make odockerinstallraw)
+  local fx bad="" out pm want n deb; fx=$(test.suite.fixture.make odockerinstallraw)
+  mkdir -p "$fx/ct.apt-get/etc" "$fx/ct.dnf/etc" "$fx/ct.fail/etc"
+  printf '%s\n' 'PRETTY_NAME="Ubuntu 24.04 LTS"' 'ID=ubuntu' 'VERSION_CODENAME=noble' | tee "$fx/ct.apt-get/etc/os-release" > "$fx/ct.fail/etc/os-release"
+  printf '%s\n' 'ID="almalinux"' > "$fx/ct.dnf/etc/os-release"
+  deb='deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable'
   for pm in apk apt-get dnf; do
-    : > "$fx/log"
-    out=$(test.odocker.installRun "$fx" PM="$pm")
+    : > "$fx/log"; : > "$fx/curl.log"
+    out=$(test.odocker.installRun "$fx" PM="$pm" CT="$fx/ct.$pm" CURL_OUT="[$pm-data]")
     [ "$out" = "rc=0" ] || bad="$bad $pm-rc=[$out]"
     want="$(OOSH_PM="$pm" private.odocker.prereq.package.get docker) $(OOSH_PM="$pm" private.odocker.prereq.package.get column)"
     grep -q "^docker exec somecontainer sh -c .*$pm.* $want\$" "$fx/log" || bad="$bad $pm-packages=[$(grep -vE 'command -v|inspect|OOSH_DIR' "$fx/log" | head -2 | tr '\n' '|')]"
+    case "$pm" in
+      apk) [ -s "$fx/curl.log" ] && bad="$bad apk-downloaded"
+           [ -e "$fx/ct.apk/etc" ] && bad="$bad apk-wrote" ;;
+      apt-get)
+        grep -q 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg' "$fx/curl.log" || bad="$bad apt-no-key-download=[$(tr '\n' '|' < "$fx/curl.log")]"
+        [ "$(cat "$fx/ct.apt-get/etc/apt/keyrings/docker.asc" 2>/dev/null)" = "[apt-get-data]" ] || bad="$bad apt-key"
+        [ "$(cat "$fx/ct.apt-get/etc/apt/sources.list.d/docker.list" 2>/dev/null)" = "$deb" ] || bad="$bad apt-list=[$(cat "$fx/ct.apt-get/etc/apt/sources.list.d/docker.list" 2>/dev/null)]"
+        # the list is written before docker-ce-cli is installed
+        n=$(grep -n 'cat > /etc/apt/sources.list.d/docker.list' "$fx/log" | cut -d: -f1)
+        [ -n "$n" ] && [ "$n" -lt "$(grep -n 'apt-get -y install docker-ce-cli' "$fx/log" | cut -d: -f1)" ] || bad="$bad apt-order" ;;
+      dnf)
+        grep -q 'curl -fsSL https://download.docker.com/linux/centos/docker-ce.repo' "$fx/curl.log" || bad="$bad dnf-no-download"
+        [ "$(cat "$fx/ct.dnf/etc/yum.repos.d/docker-ce.repo" 2>/dev/null)" = "[dnf-data]" ] || bad="$bad dnf-repo-file"
+        grep -q 'DEBIAN_FRONTEND=noninteractive' "$fx/log" && bad="$bad dnf-has-apt-env" ;;
+    esac
   done
-  grep -q 'DEBIAN_FRONTEND=noninteractive' "$fx/log" && bad="$bad dnf-has-apt-env"
-  : > "$fx/log"; test.odocker.installRun "$fx" PM=apt-get >/dev/null
+  [ -z "$(ls -A "$fx/tmp")" ] || bad="$bad host-tmp-left"
+  # second run: no download, no write into the container
+  for pm in apt-get dnf; do
+    : > "$fx/log"; : > "$fx/curl.log"
+    out=$(test.odocker.installRun "$fx" PM="$pm" CT="$fx/ct.$pm")
+    [ "$out" = "rc=0" ] || bad="$bad $pm-second-rc=[$out]"
+    [ -s "$fx/curl.log" ] && bad="$bad $pm-second-downloaded"
+    grep -qE 'exec -i|mkdir' "$fx/log" && bad="$bad $pm-second-wrote"
+  done
+  # a failing download: rc 1, nothing written into the container, no install of docker-ce-cli
+  : > "$fx/log"
+  out=$(test.odocker.installRun "$fx" PM=apt-get CT="$fx/ct.fail" CURL_RC=22)
+  [ "$out" = "rc=1" ] || bad="$bad fail-rc=[$out]"
+  [ -e "$fx/ct.fail/etc/apt" ] && bad="$bad fail-wrote"
+  grep -q 'install docker-ce-cli' "$fx/log" && bad="$bad fail-installed"
+  [ -z "$(ls -A "$fx/tmp")" ] || bad="$bad fail-host-tmp-left"
+  : > "$fx/log"; test.odocker.installRun "$fx" PM=apt-get CT="$fx/ct.apt-get" >/dev/null
   grep -q 'DEBIAN_FRONTEND=noninteractive.* apt-get -y install' "$fx/log" || bad="$bad apt-interactive"
   # a docker group with another number is left alone: dockerhost gets the socket's number
   : > "$fx/log"; test.odocker.installRun "$fx" PM=apk DOCKERGRP=yes >/dev/null
@@ -1867,12 +1919,12 @@ test.odocker.installRaw() {
   grep -q 'groupadd' "$fx/log" && bad="$bad created-over-existing"
   grep -q 'usermod -aG sockgrp tester' "$fx/log" || bad="$bad not-joined"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "the table's client names per package manager; the socket's group found or created, never renumbered" || create.result 1 "install raw:$bad"
+  [ -z "$bad" ] && create.result 0 "the table's client names; Docker's repository written into the container once, nothing on a failed download; the socket's group never renumbered" || create.result 1 "install raw:$bad"
   return $(result)
 }
-test.case $level "T-ODOCKER-INSTALL-RAW: a container without oosh gets the table's package names; no group is renumbered" test.odocker.installRaw
-expect 0 "the table's client names per package manager; the socket's group found or created, never renumbered" \
-  "a second package table in odocker.install, and groupmod/delgroup on an existing docker group"
+test.case $level "T-ODOCKER-INSTALL-RAW: a container without oosh gets Docker's repository and the table's package names; no group is renumbered" test.odocker.installRaw
+expect 0 "the table's client names; Docker's repository written into the container once, nothing on a failed download; the socket's group never renumbered" \
+  "an apt or dnf container without oosh got no docker-ce-cli: Docker's repository was missing there"
 
 # T-ODOCKER-PREREQS-INSTALL: odocker prereqs.install installs here and joins the socket's group — once; nothing in a test run
 test.odocker.prereqsInstall() {
@@ -1903,6 +1955,38 @@ test.odocker.prereqsInstall() {
 test.case $level "T-ODOCKER-PREREQS-INSTALL: odocker prereqs.install installs here and joins the socket's group, once; nothing in a test run" test.odocker.prereqsInstall
 expect 0 "prerequisites and the socket's group here; joined once; nothing under OOSH_NO_INSTALL" \
   "a container installed and grouped itself only through a second copy in odocker.install"
+
+
+console.log "
+Test: private.odocker.docker.repo.get
+===================================================================="
+
+# T-ODOCKER-DOCKER-REPO-GET: the one source of the data of Docker's repository
+# The local add (T-ODOCKER-DOCKER-REPO-APT) and the container add
+# (T-ODOCKER-INSTALL-RAW) both ask it; private.odocker.docker.repo.download and
+# private.odocker.container.repo.add are tested through those two.
+test.odocker.dockerRepoGet() {
+  local fx bad="" got; fx=$(test.suite.fixture.make odockerrepoget)
+  printf '%s\n' 'ID=debian' 'VERSION_CODENAME="bookworm"' > "$fx/os-release"
+  got=$(private.odocker.docker.repo.get marker apt-get); [ "$got" = /etc/apt/sources.list.d/docker.list ] || bad="$bad apt-marker=[$got]"
+  got=$(private.odocker.docker.repo.get file apt-get "$fx/os-release" amd64); [ "$got" = /etc/apt/keyrings/docker.asc ] || bad="$bad apt-file=[$got]"
+  got=$(private.odocker.docker.repo.get url apt-get "$fx/os-release" amd64); [ "$got" = https://download.docker.com/linux/debian/gpg ] || bad="$bad apt-url=[$got]"
+  got=$(private.odocker.docker.repo.get line apt-get "$fx/os-release" amd64)
+  [ "$got" = "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" ] || bad="$bad apt-line=[$got]"
+  got=$(private.odocker.docker.repo.get url apt-get "$fx/os-release"); [ "$?" = 1 ] && [ -z "$got" ] || bad="$bad apt-no-arch=[$got]"
+  got=$(private.odocker.docker.repo.get url apt-get "$fx/none" amd64); [ "$?" = 1 ] && [ -z "$got" ] || bad="$bad apt-no-os-release=[$got]"
+  got=$(private.odocker.docker.repo.get marker dnf); [ "$got" = /etc/yum.repos.d/docker-ce.repo ] || bad="$bad dnf-marker=[$got]"
+  got=$(private.odocker.docker.repo.get file yum); [ "$got" = /etc/yum.repos.d/docker-ce.repo ] || bad="$bad yum-file=[$got]"
+  got=$(private.odocker.docker.repo.get url dnf); [ "$got" = https://download.docker.com/linux/centos/docker-ce.repo ] || bad="$bad dnf-url=[$got]"
+  got=$(private.odocker.docker.repo.get line dnf); [ "$?" = 0 ] && [ -z "$got" ] || bad="$bad dnf-line=[$got]"
+  got=$(private.odocker.docker.repo.get marker apk); [ "$?" = 1 ] && [ -z "$got" ] || bad="$bad apk=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "marker, url, file and line per package manager; rc 1 for apk or missing apt values" || create.result 1 "repo get:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-DOCKER-REPO-GET: the data of Docker's repository per package manager, from one getter" test.odocker.dockerRepoGet
+expect 0 "marker, url, file and line per package manager; rc 1 for apk or missing apt values" \
+  "the URLs, files and the list line lived inside the local add only"
 
 ### test.method
 
