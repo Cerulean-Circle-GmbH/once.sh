@@ -363,6 +363,13 @@ what `config add` writes) are recoverable. Caller's shell must have `OOSH_DIR`
 and the relevant `OOSH_*`/`LOG_*` vars set — true for any normal `./config`
 invocation, but under `sudo` use `sudo -E` to preserve env.
 
+It backs up all three files and **refuses to worsen** them: a variable exported in a
+backup and in none of the three regenerated files is a loss, and then all three backups
+go back (`REFUSING — the regenerated files lost: …`, rc 1). A variable that only moved
+files is no loss — an old user.env's `OOSH_DIR` now lives in `oosh.env` — and neither
+are PATH and OOSH_MODE (per-user session files), `OOSH_USER_CONFIG_PATH` (removed
+2026-10-01) and `OOSH_CONFIG_VERSION` (an old version stamp) (T-CONFIG-INIT-ENV-OLD-USER-ENV).
+
 ```bash
 ./config init.env                 # repair self's env files
 sudo -E ./config init.env         # repair from root context (env preserved)
