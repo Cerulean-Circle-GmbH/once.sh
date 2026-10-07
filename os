@@ -267,7 +267,7 @@ private.os.platform.gate.run()     # <platform> <user> # Phase B for ONE user (t
 }
 
 
-private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for platform.test: rc 0 when the init/oosh of <branch> (a branch name or commit sha of the repo in <dir>) carries the mode root installer contract, rc 1 and a message when the ref is missing or older than commit b8b90b82 #
+private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for platform.test: rc 0 when the init/oosh of <branch> (a branch on origin of the repo in <dir>) carries the mode root installer contract, rc 1 and a message when the ref is missing or older than commit b8b90b82 #
 {
  local branch="$1" dir="${2:-$OOSH_DIR}"
  if [ -z "$branch" ]; then
@@ -283,19 +283,24 @@ private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for
  private.this.script.load ogit ogit.branch.check || return $(result)
  local contract="only 'mode root' is supported" content
  case "$branch" in
-   -*) create.result 1 "<branch> $branch is not a branch name or commit sha"
+   -*) create.result 1 "<branch> $branch is not a branch name"
        error.log "$RESULT"
        return $(result) ;;
  esac
- # The gate reads the LOCAL repo in <dir>, while the container clones from the
- # remote: a local-only commit sha or branch passes the gate and then fails in the
- # container. A branch name known only as origin/<branch> (what the completion of
- # os platform.test offers) is resolved through ogit.branch.check.
- # The old installer is read through ogit.file.show.
- local ref="$branch"
- if ! ogit.branch.check "$branch" "$dir" && ogit.branch.check "origin/$branch" "$dir"; then ref="origin/$branch"; fi
+ # The container clones from origin, so only a branch that origin has is accepted
+ # (ogit.branch.check "origin/<branch>", tried first and the only candidate: a stale
+ # local branch of the same name must not win, and a sha is not cloneable). The
+ # scenario test os platform.heal.test ships a sha as a temporary branch
+ # platform-test/<sha>. The gate reads the remote-tracking ref in <dir>, which can be
+ # stale until the next fetch. The old installer is read through ogit.file.show.
+ local ref="origin/$branch"
+ if ! ogit.branch.check "$ref" "$dir"; then
+   create.result 1 "<branch> $branch is not a branch on origin (a sha or a local-only branch cannot be cloned by the container); the scenario test os platform.heal.test ships a sha as a temporary branch platform-test/<sha>"
+   error.log "$RESULT"
+   return $(result)
+ fi
  if ! content=$(ogit.file.show "$ref" init/oosh "$dir" 2>/dev/null); then
-   create.result 1 "ref $branch has no init/oosh in $dir (unknown branch or commit sha?)"
+   create.result 1 "ref $ref has no init/oosh in $dir"
    error.log "$RESULT"
    return $(result)
  fi
@@ -483,7 +488,7 @@ os.platform.list() # # lists all platforms with tier info
   done
 }
 
-os.platform.test()     # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch name or commit sha of this repo, installer contract mode root i.e. b8b90b82 or newer; a name known only as origin/<branch> is accepted; the gate reads the LOCAL repo, so a local-only sha passes the gate and fails in the container) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
+os.platform.test()     # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch on origin of this repo, installer contract mode root i.e. b8b90b82 or newer; a sha or a local-only branch is refused by the gate, the scenario test os platform.heal.test ships a sha as platform-test/<sha>) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
 {
  local platform="$1"
  if [ -z "$platform" ]; then

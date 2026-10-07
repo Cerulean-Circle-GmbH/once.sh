@@ -328,25 +328,31 @@ test.os.branchEra() {
   printf '%s\n' '#!/usr/bin/env bash' "  [ \"\$1\" = \"root\" ] || die \"only 'mode root' is supported (got '\$1')\"" > "$fx/repo/init/oosh"
   ogit.index.add all "$fx/repo" >/dev/null && ogit.commit.create new t@t t "$fx/repo" >/dev/null
   new=$(ogit.commit.log.show HEAD 1 %H "$fx/repo")
-  private.os.platform.branch.gate "$old" "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
-  [ $rc = 1 ] || bad="$bad old-rc=$rc"
-  case "$msg" in *"$old"*"b8b90b82"*"mode ssh"*) ;; *) bad="$bad old-msg=[$msg]" ;; esac
-  case "$msg" in *eraB*platform.heal.test*) ;; *) bad="$bad old-msg-lacks-eraB" ;; esac
-  private.os.platform.branch.gate "$new" "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad new-rc=$rc"
-  private.os.platform.branch.gate HEAD "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad head-rc=$rc"
   # ogit.raw: no ogit method creates a remote-tracking ref in a fixture without a remote
+  ogit.raw "$fx/repo" update-ref refs/remotes/origin/oldb "$old"
   ogit.raw "$fx/repo" update-ref refs/remotes/origin/feat "$new"
-  private.os.platform.branch.gate feat "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad remote-only-branch-rc=$rc"
+  private.os.platform.branch.gate oldb "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
+  [ $rc = 1 ] || bad="$bad old-rc=$rc"
+  case "$msg" in *oldb*"b8b90b82"*"mode ssh"*) ;; *) bad="$bad old-msg=[$msg]" ;; esac
+  case "$msg" in *eraB*platform.heal.test*) ;; *) bad="$bad old-msg-lacks-eraB" ;; esac
+  private.os.platform.branch.gate feat "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad origin-branch-rc=$rc"
+  # a sha is the scenario test's job (platform-test/<sha>): refused before anything starts
+  private.os.platform.branch.gate "$new" "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
+  [ $rc = 1 ] || bad="$bad sha-rc=$rc"
+  case "$msg" in *"platform.heal.test"*"platform-test/"*) ;; *) bad="$bad sha-msg=[$msg]" ;; esac
+  # a branch that exists only locally is not what the container clones
+  private.os.platform.branch.gate "$(ogit.branch.get "$fx/repo")" "$fx/repo" >/dev/null 2>&1; rc=$?
+  [ $rc = 1 ] || bad="$bad local-only-rc=$rc"
   private.os.platform.branch.gate no/such-ref "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
   [ $rc = 1 ] || bad="$bad missing-rc=$rc"
   case "$msg" in *no/such-ref*) ;; *) bad="$bad missing-msg=[$msg]" ;; esac
   private.os.platform.branch.gate --upload-pack=x "$fx/repo" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad dash-ref-accepted"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "an init/oosh without the mode root contract and a missing ref are refused with rc 1, a ref with it passes" || create.result 1 "branch era:$bad"
+  [ -z "$bad" ] && create.result 0 "an old origin branch, a sha, a local-only and a missing branch are refused with rc 1, an origin branch with the mode root contract passes" || create.result 1 "branch era:$bad"
   return $(result)
 }
 test.case $level "T-OS-PLATFORM-TEST-BRANCH-ERA: platform.test <branch> refuses refs older than the mode-root installer contract" test.os.branchEra
-expect 0 "an init/oosh without the mode root contract and a missing ref are refused with rc 1, a ref with it passes" \
+expect 0 "an old origin branch, a sha, a local-only and a missing branch are refused with rc 1, an origin branch with the mode root contract passes" \
   "refs before b8b90b82 use mode ssh and cannot be driven by the current ossh install"
 
 # T-OS-PLATFORM-TEST-STUBBED: the orchestration with every outside world stubbed (no docker, no ssh).
@@ -389,18 +395,19 @@ test.case $level "T-OS-CONTAINER-UP-PORT: container.up hands the port it was giv
 expect 0 "the ssh port given reaches odocker reset and sshd.reload, and test gets installed" \
   "container.up used an undefined \$port: sshd.reload did nothing"
 
-# T-OS-PLATFORM-TEST-BRANCH-ENV gates HEAD of the REAL repo ($OOSH_DIR): its init/oosh must carry the mode root contract.
+# T-OS-PLATFORM-TEST-BRANCH-ENV stubs the gate (T-OS-PLATFORM-TEST-BRANCH-ERA tests it on a fixture).
 test.os.platformTestBranch() {
   # isolated from the caller: own HOME, no inherited branch or control path
   local fx; fx=$(test.suite.fixture.make osbranch)
   local HOME="$fx" OSSH_CONTROL_PATH OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH OSSH_CONTROL_PATH
   local bad="" rec rc
   test.os.stubs.set
-  os.platform.test ubuntu_24_04 "" notests HEAD >/dev/null 2>&1; rc=$?
+  private.os.platform.branch.gate() { echo "gate $*" >> "$OS_T_REC"; return 0; }
+  os.platform.test ubuntu_24_04 "" notests feat >/dev/null 2>&1; rc=$?
   rec=$(cat "$OS_T_REC")
   [ $rc = 0 ] || bad="$bad rc=$rc"
   case "$rec" in *"ossh install ubuntu_24_04 test"*) ;; *) bad="$bad no-install-test" ;; esac
-  [ "$(printf '%s\n' "$rec" | grep '^ossh install' | grep -vc 'branch=\[HEAD\]')" = 0 ] || bad="$bad install-without-branch"
+  [ "$(printf '%s\n' "$rec" | grep '^ossh install' | grep -vc 'branch=\[feat\]')" = 0 ] || bad="$bad install-without-branch"
   [ "$(printf '%s\n' "$rec" | grep -c '^ossh install')" = 2 ] || bad="$bad installs=$(printf '%s\n' "$rec" | grep -c '^ossh install')"
   [ -z "${OSSH_INSTALL_BRANCH+x}" ] || bad="$bad branch-leaked-after"
   # empty placeholders must not swallow the later parameters: notests skips every gate run
@@ -416,7 +423,7 @@ test.os.platformTestBranch() {
   grep -q '^ossh install' "$OS_T_REC" && bad="$bad install-after-fail"
   # branch on macos is refused, the CI is not started
   private.os.platform.test.ci() { echo "ci called" >> "$OS_T_REC"; }
-  os.platform.test macos "" "" HEAD >/dev/null 2>&1; rc=$?
+  os.platform.test macos "" "" feat >/dev/null 2>&1; rc=$?
   [ $rc = 1 ] || bad="$bad macos-branch-rc=$rc"
   grep -q "ci called" "$OS_T_REC" && bad="$bad macos-ci-started"
   test.os.stubs.unset
