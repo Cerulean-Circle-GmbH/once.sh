@@ -67,8 +67,26 @@ fi
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `os platform.list` | | List all platforms with workspace, package manager, and tier |
-| `os platform.test` | `<platform> <?terminal>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests |
+| `os platform.test` | `<platform> <?terminal> <?notests> <?branch>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests, `notests` to skip Phase B, `<branch>` to install an older ref first (see [Installing an older ref first](#installing-an-older-ref-first)). Arguments are positional: an empty placeholder keeps its place, so `os platform.test ubuntu_24_04 "" notests` runs without tests and without a terminal |
 | `os platform.test.all` | | Test all platforms, report summary. Exit 0 only if all must-pass platforms pass |
+
+### Platform test building blocks
+
+`os platform.test` is three private methods in a row, so a scenario test (the coming `os platform.heal.test`) can reuse any of them:
+
+| Method | What it does |
+|---|---|
+| `private.os.platform.container.up <platform> <image> <port>` | steps 1-6 and the first install: a fresh container from `<image>` on ssh `<port>`, the ssh config and ControlMaster, the pushed key, `NOPASSWD` sudo for `test`, `ossh install` of `test`, then sshd and the ControlMaster settled; rc 1 when the image cannot be built |
+| `private.os.platform.users.install <platform>` | Phase A for the other users: `oosh-user` through `user create`, `bash-user` through `useradd`/`adduser`, both with `NOPASSWD` sudo, then `ossh install <platform> bash-user` from the caller; failures are logged, not fatal |
+| `private.os.platform.gate.run <platform> <user>` | Phase B for ONE user (`test`, `root`, `oosh-user`, `bash-user`): `test.suite gate 1` (core plus the platform invariants) through the transport that fits the user, teed into the log of `private.os.platform.gate.log.get <user> <platform>`; rc is that user's gate rc |
+
+`private.os.platform.gate.log.get <user> <platform>` echoes `/tmp/oosh-platform-test-<user>-<platform>.log` (a silent getter; `gate.run` and `platform.test` share it). `private.os.platform.socket.remove <port>` removes the stale ControlMaster socket `/tmp/ossh-test@localhost:<port>` (silent, idempotent) and is a method of its own so tests can stub it instead of deleting a live socket.
+
+### Installing an older ref first
+
+`os platform.test <platform> "" "" <branch>` takes a branch name or commit sha of this repo. `<branch>` is exported as `OSSH_INSTALL_BRANCH` to the two install steps only (`ossh install` of `test` in `container.up`, of `bash-user` in `users.install`; a prefix assignment, so it lives for that one call). **Planned:** `ossh install` honours `OSSH_INSTALL_BRANCH` once package B4 lands; until then the variable is set and ignored. macOS refuses a `<branch>` (the CI workflow installs its own branch).
+
+Before anything starts, the era gate `private.os.platform.branch.gate <branch> <?dir>` reads `init/oosh` of the ref through `ogit.file.show` and refuses a ref whose installer lacks the `mode root` contract, i.e. older than commit `b8b90b82` (older refs use `mode ssh` and rsync, which the current `ossh install` cannot drive). It tries `<branch>`, then `origin/<branch>` (what the completion offers), and reads the **local** repo: a local-only sha passes the gate and then fails in the container, which clones from the remote.
 
 ### Platform Test Flow (Docker platforms)
 
@@ -96,10 +114,7 @@ For each Docker-testable platform, `os platform.test` runs fully automated (no i
    - Raw `useradd -m -G sudo bash-user` + NOPASSWD sudoers snippet — creates bash-user
    - `ossh install <platform> bash-user` — caller-initiated install for bash-user
 9. **Phase B — tests** (skipped when `notests` modifier is passed):
-   - `ossh exec <platform> "test.suite core 1"` → `test` log
-   - `ossh exec.tty <platform> "sudo bash -lc '… test.suite core 1'"` → `root` log
-   - `ossh exec.tty <platform> "sudo runuser -u oosh-user -- bash -lc 'test.suite core 1'"` → `oosh-user` log
-   - `ossh exec.tty <platform> "sudo runuser -u bash-user -- bash -lc 'test.suite core 1'"` → `bash-user` log
+   - `private.os.platform.gate.run <platform> <user>` once per user, each running `test.suite gate 1` (core plus `platform.shared.configLayout.invariant`): `ossh exec` for `test`, `ossh exec.tty` with `sudo bash -lc` for `root`, `sudo runuser -u <user>` (else `sudo -H -u <user>`) for `oosh-user` and `bash-user`; logs per `private.os.platform.gate.log.get`
 10. `terminal` modifier drops into an interactive `bash-user` shell before cleanup (same last-user-created convention as before)
 11. `ossh connection.close` + container cleanup
 

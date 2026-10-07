@@ -85,6 +85,18 @@ ogit remote.pull "" "" ~/oosh
 ogit status.check && echo clean
 ogit status.show
 
+# Is a merge, rebase or cherry-pick in progress? (RESULT: none | merge | rebase | pick)
+ogit merge.check ~/oosh
+
+# Fetch a branch from a URL into FETCH_HEAD, no remote, no merge (RESULT = sha)
+ogit remote.fetch.url https://github.com/Cerulean-Circle-GmbH/once.sh.git dev ~/oosh
+
+# Read a file as it is at a ref, without a checkout
+ogit file.show origin/dev init/oosh ~/oosh
+
+# A bare repository with dev as its initial branch
+ogit repo.init /tmp/fixture.git yes dev
+
 # Where do dev and main stand relative to each other? (answer in RESULT)
 ogit branch.compare main dev
 
@@ -116,6 +128,13 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `folder.finish` | `<folder>` | everything a new branch folder under the base needs: with a dev group `repo.share` (.git) and `private.this.folder.share` (the WORKING TREE: group dev, g+w, setgid dirs), then `safeDirectory.add`, and under sudo the trust entry of the person who typed the command; no ownership change. `oo checkout`, `oo mode`, `oo mode.setup` and install state 31 call it, so does `worktree.remove` / `worktree.restore` |
 | `repo.grep` | `<pattern> <?dir:$OOSH_DIR> <?pathspecs...>` | `git grep -nE <pattern>` over the tracked files of `<dir>` (the tree sweeps); variadic, so `<?dir>` precedes `<pathspecs>` |
 | `repo.files.list` | `<?dir:$OOSH_DIR>` | echo the tracked files of `<dir>`, one per line |
+| `repo.init` | `<dir> <?bare:no> <?branch:main>` | initialise a repository in `<dir>` (`bare=yes` for a bare one) with `<branch>` as its initial branch; git creates a missing parent. The branch name is checked first (`check-ref-format --branch`), so an invalid one is refused before anything is created; whether git knows `-b` is decided before `init` runs (a git older than 2.28 gets a plain init, then `symbolic-ref HEAD`), so a real failure never triggers a second run; rc 1 with git's reason when it cannot |
+
+### file
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `file.show` | `<ref> <path> <?dir:$OOSH_DIR>` | echo the content of `<path>` at `<ref>` in `<dir>` (`cat-file blob`, so a directory is refused, not listed); rc 1 and nothing when the ref or the path does not exist, or the path is a directory; git's reason reaches RESULT. `<ref>` completes through the shared `ogit.parameter.completion.ref`; `<path>` completes from the tracked files of the current tree |
 
 ### branch
 
@@ -141,6 +160,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 |--------|-----------|-------------|
 | `merge.abort` | `<?dir:$OOSH_DIR>` | abort the merge in progress in `<dir>` |
 | `merge.base.get` | `<a> <b> <?dir:$OOSH_DIR>` | echo the merge base commit of `<a>` and `<b>` |
+| `merge.check` | `<?dir:$OOSH_DIR>` | is an operation in progress in `<dir>`? RESULT = `none` (rc 0), or `merge` \| `rebase` \| `pick` with rc 1; rc 2 when `<dir>` is not a repository. Probe order: `rebase-merge`, `rebase-apply`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `sequencer` — the outer rebase first, because a `rebase -r` stopped on a merge commit has a `MERGE_HEAD` inside `rebase-merge`. git names the files (`--git-path`), so a linked worktree or a separate git dir is found too. `<dir>` completes through the shared `ogit.parameter.completion.dir` |
 
 ### conflict
 
@@ -158,6 +178,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `remote.url.set` | `<url> <?remote:origin> <?dir:$OOSH_DIR>` | point `<remote>` of `<dir>` at `<url>` |
 | `remote.fetch` | `<?prune:no> <?dir:$OOSH_DIR>` | fetch origin into `<dir>`; `prune=yes` drops deleted remote branches |
 | `remote.pull` | `<?url> <?branch> <?dir:$OOSH_DIR>` | pull into `<dir>`; with `<url> <branch>` pull that branch from that URL instead of the tracking remote (the https fallback of `oo.update`) |
+| `remote.fetch.url` | `<url> <branch> <?dir:$OOSH_DIR>` | fetch `<branch>` from `<url>` into `FETCH_HEAD` of `<dir>` without adding a remote and without merging; RESULT = the fetched commit sha, rc from git. The fetch half of the HTTPS fallback of `oo update` (the gate looks at the sha before anything is merged). `<url>` completes with the origin URL, `<branch>` with the cached origin branches, `<dir>` through the shared `ogit.parameter.completion.dir` |
 | `remote.push` | `<?branch> <?tags:no> <?dir:$OOSH_DIR>` | push `<branch>` (default: the tracking branch) to origin; `tags=yes` pushes tags too |
 
 ### index

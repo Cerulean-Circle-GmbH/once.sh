@@ -316,6 +316,10 @@ shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
 preserved, never deleted). Installs `templates/user/bashrcTemplate` if the
 OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
 backup). Adds `<user>` to group `dev` if not already a member.
+The symlink hop runs AS `<user>` and loads the shared tree's `this` through
+`private.this.as.user.preamble.get`, like the later hops. It used to source the
+caller's `$OOSH_DIR`, which the caller expands: root's 0700 `/root/oosh` or a
+temp clone the target cannot read.
 
 ```bash
 ./config init.user           # self

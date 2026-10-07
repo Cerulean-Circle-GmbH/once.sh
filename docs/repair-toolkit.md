@@ -24,6 +24,7 @@ listed here run only when invoked.
 | [`ogit safeDirectory.ensure [base]`](ogit.md#safedirectory) | One `safe.directory` entry per branch folder, for the calling user | `fatal: detected dubious ownership`; `layout.status` shows `trusted=no`. `oo update` and `oo user.fix` run it for you |
 | [`ogit repo.share <dir>`](ogit.md#repo) | One folder's `.git`: group `dev` + g+w, setgid, `core.sharedRepository=group` | `layout.status` shows `shared=no` or `setgid=no`; another dev user gets "Permission denied" writing objects. `sudo` when you do not own the folder |
 | [`ogit worktree.remove [base]`](ogit.md#migrating-a-host-from-worktrees-to-clones) | Converts every linked worktree under the base into an independent clone (gated; ignored files carried, backup kept in `~/.oosh.backups/`) | A host installed before the clone layout (`layout.status` shows `worktree` lines); a half-finished conversion. `ogit worktree.restore` is the reverse |
+| `user oosh.install <user>` / `oo user.fix` | Backups, never deletions: a real `~/config` or `~/oosh` is kept as `~/config.orig.<ts>` / `~/oosh.orig.<ts>` through `private.this.symlink.with.backup` | See [Backups](#backups) |
 | `user ssh.backup.status` | Legacy `$HOME/ssh.*` backup directories | A root-owned `ssh.original` or `ssh.<user>.<host>.for.<host>` in your home. Reports only, works unprivileged, rc 1 when it finds any |
 | `user ssh.backup.migrate` | The same, acting | Moves them under `~/.ssh.backups/legacy/`. **Moves, never deletes** — they hold private keys. Needs `$SUDO` when they belong to another user |
 
@@ -73,6 +74,20 @@ explicit user actions invoke them silently as part of their flow:
 
 Outside those two entry points, the user runs the primitives
 explicitly when something drifts.
+
+## Backups
+
+The install and the repairs keep what they replace, with a timestamp, and never
+delete it:
+
+- A real `~/config` or `~/oosh` becomes `<name>.orig.<ts>` (one `<ts>` for both)
+  and the symlink takes its place. A backup is **never nested**: when
+  `<name>.orig.<ts>` already exists (a second run in the same second) the stamp is
+  bumped (`<ts>-1`, `<ts>-2`), so a second run gives a second stamp and a real
+  directory is not moved *into* the first backup. A stale symlink that is relinked
+  is logged with its old target.
+- A `.bashrc` hand-edited after the install is kept as `.bashrc.orig.<ts>` (the very
+  first original stays `.bashrc.pre-oosh`); an unchanged repeat adds no copy.
 
 ## Diagnostic: which primitive do I need?
 

@@ -149,3 +149,19 @@ unattended installer cannot answer anyway).
 > The probe deliberately runs at `mktemp`'s mode 600 — the one permission the real
 > `ossh.prereqs.install` call site grants, and no more.
 
+## The `brokenTree` check
+
+After the `OOSH_DIR` resolve (the `~/oosh` link, then the clone layout), and before
+anything is reused, the installer looks at the tree it is about to use (the
+`brokenTree` block). It refuses to reuse an `$OOSH_DIR` whose `.git` **directory**
+has a `MERGE_HEAD` (a merge in progress) or a `HEAD` that is not a `ref: ` line (a
+detached HEAD): its conflicted files would otherwise be executed. It dies with
+the message `existing <dir> is mid-merge or detached and is not reused` and the
+one command to run, which points at the coming `heal`
+(`curl … init/oosh | sh -s -- heal`).
+
+The block reads `.git/MERGE_HEAD` and `.git/HEAD` itself and never calls `git`:
+the tree may belong to another user, and `git` would answer "dubious ownership",
+which must not be mistaken for a broken tree. A `.git` **file** (a linked
+worktree) is not a directory and passes. `init/oosh` is 691 lines of its
+700-line cap.

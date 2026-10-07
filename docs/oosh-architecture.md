@@ -403,15 +403,45 @@ answer by rc):
 | `private.this.script.load <script> <probeFn>` | source `$OOSH_DIR/<script>` into this shell once, unless `<probeFn>` is already a function; `this` is saved and restored around the source; rc 0 when `<probeFn>` is a function afterwards |
 | `private.this.folder.entries.copy <from> <to>` | copy every entry of `<from>` (dotfiles included) into `<to>`, keeping relative paths — never `<from>/.` itself, whose mode and owner would land on `<to>`; rc 1 names the entries that failed |
 | `private.this.folder.share <dir>` | share `<dir>` with group dev: `private.ensure.sharedTree` (chgrp dev, g+w) plus setgid on every directory so new files inherit the group; rc 0 without a dev group; never chown |
-| `private.this.symlink.with.backup <linkPath> <target> <ts>` | ensure `<linkPath>` is a symlink to `<target>`; a pre-existing real entry is kept as `<linkPath>.orig.<ts>`; idempotent; fails loud on every step |
+| `private.this.symlink.with.backup <linkPath> <target> <?ts>` | ensure `<linkPath>` is a symlink to `<target>`; a pre-existing real entry is kept as `<linkPath>.orig.<ts>` and never nested: a taken `<ts>` is bumped with `-<n>` (`private.this.orig.stamp.free.get`), no `<ts>` takes a clock stamp (`private.this.orig.stamp.get`); a stale symlink is relinked and the old target logged (`info.log`); idempotent; fails loud on every step |
+| `private.this.orig.stamp.get <dir> <names...>` | echo a `YYYYmmdd-HHMMSS` stamp for which `<dir>/<name>.orig.<stamp>` is free for every name, bumped with `-<n>` when taken; silent getter, rc 1 on missing arguments — the one stamp behind every "keep it as `<name>.orig.<ts>`" |
+| `private.this.orig.stamp.free.get <dir> <base> <names...>` | echo `<base>`, bumped with `-<n>` until `<dir>/<name>.orig.<stamp>` is free for every name (a dangling symlink counts as taken); silent getter — the one bump loop both the stamp getter and `symlink.with.backup` end in |
+| `private.this.dir.ensure <dir> <?group> <?mode> <?owner>` | create only the missing path segments of `<dir>`, from the first existing ancestor down, and give only those segments the owner, then the group, then the mode; a directory that existed is never touched, so no recursion is needed; `$SUDO` only where the parent is not writable or the owner is another user; refuses a `.` or `..` segment; RESULT = the created segments, or `exists`; rc 1 when it cannot create |
 | `private.this.tree.tracked.check <treeRoot> <?caller:sweep>` | rc 0 when git lists tracked files under `<treeRoot>`; else an `INVALID:` verdict on stdout and rc 2 — the one guard of the four tree validators, so a sweep that reads nothing (no repository, nothing tracked, "dubious ownership") never reports OK |
-| `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate` and `test.suite.portability.validate`, which keep their own rules and summaries |
+| `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate`, `test.suite.portability.validate` and `this.recursive.validate`, which keep their own rules and summaries |
 
 `config` owns two more for its shared env files: `private.config.env.lines.drop <file> <prefix…>`
 (drop every line starting with a prefix, in place, owner/group/mode kept; an unchanged file is
 not rewritten; rc 1 when it cannot be written) and `private.config.env.line.append <file> <line>`
 (append the line unless it is already there, in place; rc 1 when it cannot be written) — see
 [config.md § Internal Functions](config.md#internal-functions).
+
+### Tree validators and their exception markers
+
+Five validators sweep the tracked files through `private.this.marker.sweep` and
+echo an `OK:` or `INVALID:` verdict. A line that must break a rule says so in a
+comment, with a reason:
+
+| Validator | Rule | Marker |
+|---|---|---|
+| `path.validate` | no PATH writer outside the sanctioned ones | `# path-exception: <why>` |
+| `ogit.caller.validate` | no raw `git` call; use `ogit` | `# ogit-exception: <why>` |
+| `this.recursive.validate` | every recursive `chown`/`chgrp`/`chmod` declares itself | `# recursive-exception: <why>` on the **same line** |
+
+`this.anchor.validate` and `test.suite.portability.validate` are the other two users of the sweep.
+
+`this.recursive.validate` exists because install state 31 once changed owner and
+mode of a whole shared folder (on macOS `/Users/Shared`). Change only what oosh
+created (`private.this.dir.ensure` creates segments, never recurses), or name the
+reason next to the call. Unlike the other markers, a comment in the lines above
+or a file-wide marker does not count. Accepted limits: the marker must be on the
+same line even inside a heredoc or a `bash -c` string; a call through a variable
+(`CHMOD=chmod; $CHMOD -R`) is not caught; the command word is not tied to command
+position, so the word `chmod` in an argument followed by an R flag matches too.
+
+Run the `this` validators **sourced**: `source ~/oosh/this; this.recursive.validate`
+(likewise `this.anchor.validate all`). The bare `this <method>` command prints
+nothing for them — a known limitation.
 
 ### Method Dispatch Chain
 
