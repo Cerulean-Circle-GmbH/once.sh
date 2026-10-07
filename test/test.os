@@ -776,6 +776,36 @@ test.case $level "T-OS-HEAL-SECOND-RUN: a second oo heal must end rc 0 and chang
 expect 0 "rc 0 and the same snapshot pass, a same-content rewrite with a WARNING; a change, an addition or rc 1 fail and are named" \
   "the heal is idempotent or it is no heal"
 
+# T-OS-HEAL-SECOND-RUN-REPORTS: a second heal whose rc 1 comes only from reports (legacy ssh.*
+# folders, a zsh login — reported, never changed; owner decision 9) passes: its summary ends
+# "rc 1: …; install state 99", which the heal writes only when every step and verify is green.
+# Gate 3b (2026-10-07): ssh.legacy made every second heal rc 1 with nothing changed. A rc 1 with
+# a step left (no "install state 99") still fails.
+test.os.healSecondRunReports() {
+  local fx; fx=$(test.suite.fixture.make healsecondrep)
+  local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
+  local bad="" rc
+  test.os.stubs.set
+  private.os.platform.heal.snapshot.get() { printf '/b\t1/1\t1 1\n'; }
+  private.os.platform.user.run() { printf '%s\r\n' "$OS_T_HEAL_LINE" > "$4"; return 1; }
+  OS_T_HEAL_LINE="rc 1: something is left for you — the lines marked left above; install state 99"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] || bad="$bad reports-rc=$rc [$RESULT]"
+  case "$RESULT" in *report*) ;; *) bad="$bad reports-unnamed=[$RESULT]" ;; esac
+  OS_T_HEAL_LINE="rc 1: something is left for you — the lines marked left above"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] || bad="$bad left-step-accepted"
+  rm -f "$(private.os.platform.heal.log.get second-heal p)"
+  test.os.stubs.unset
+  unset OS_T_HEAL_LINE
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "rc 1 with install state 99 (reports only) passes; rc 1 with a step left fails" || create.result 1 "second heal reports:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-SECOND-RUN-REPORTS: a second heal left with reports only (install state 99) passes" test.os.healSecondRunReports
+expect 0 "rc 1 with install state 99 (reports only) passes; rc 1 with a step left fails" \
+  "gate 3b: legacy ssh.* folders are reported on every heal, so the second heal could never pass"
+
 # T-OS-HEAL-PIPE-RUN: the pure pipe form through the public ossh heal.pipe with the local
 # bundle (OOSH_HEAL_LOCAL=1 for that call only); its rc comes back, its ssh -tt \r is gone
 # from the log; no private method of ossh is called from os.

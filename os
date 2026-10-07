@@ -890,7 +890,7 @@ OOSH_HEAL_SNAPSHOT
 }
 
 
-private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), <base>/<branch>/oo heal <branch> all as root (the base through root's ~/oosh — oo on root's PATH may be an older branch without oo heal) (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 and the snapshots differ in nothing but same-content rewrites (a WARNING, as the idempotence invariant accepts them; result.env left out through test.platform.shared.idempotence.volatile.without), else rc 1 with every other difference printed #
+private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), <base>/<branch>/oo heal <branch> all as root (the base through root's ~/oosh — oo on root's PATH may be an older branch without oo heal) (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 (or rc 1 from reports only: its rc line names install state 99) and the snapshots differ in nothing but same-content rewrites (a WARNING, as the idempotence invariant accepts them; result.env left out through test.platform.shared.idempotence.volatile.without), else rc 1 with every other difference printed #
 {
  local platform="$1" branch="$2" log work rcHeal differences
  if [ -z "$platform" ] || [ -z "$branch" ]; then
@@ -915,6 +915,14 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
  console.log "second heal: <base>/$branch/oo heal $branch all as root on $platform — it must change nothing"
  private.os.platform.user.run "$platform" root "\"\$(dirname \"\$(readlink -f ~root/oosh)\")/$branch/oo\" heal $branch all" "$log"
  rcHeal=$?
+ # rc 1 from reports only (legacy ssh.* folders, a zsh login — reported on
+ # every heal, never changed: owner decision 9) is green: the heal writes
+ # "install state 99" into its rc line only when every step and verify is
+ # (private.oo.heal.summary). Gate 3b: ssh.legacy made every second heal rc 1.
+ local reports=""
+ if [ "$rcHeal" = 1 ] && tr -d '\r' < "$log" 2>/dev/null | grep -q '^rc 1: .*; install state 99$'; then
+   rcHeal=0; reports=" (left: reports only, install state 99)"
+ fi
  private.os.platform.heal.snapshot.get "$platform" "$branch" > "$work/after"
  # The helpers of the idempotence invariant, sourced alone (its POSIX helpers
  # only) in a subshell: the file also sets globals of a test run
@@ -933,12 +941,12 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
    printf '%s\n' "$differences" | grep . | test.platform.shared.idempotence.unaccepted rewritten)
  if [ "$rcHeal" = 0 ] && [ -z "$unaccepted" ]; then
    if [ -n "$differences" ]; then
-     create.result 0 "second heal on $platform: rc 0, no content change — WARNING, same-content rewrites (accepted as the idempotence invariant accepts them):
+     create.result 0 "second heal on $platform: rc 0$reports, no content change — WARNING, same-content rewrites (accepted as the idempotence invariant accepts them):
 $differences"
      warn.log "$RESULT"
      printf '%s\n' "$RESULT" >> "$log"
    else
-     create.result 0 "second heal on $platform: rc 0, nothing changed"
+     create.result 0 "second heal on $platform: rc 0$reports, nothing changed"
    fi
  else
    create.result 1 "second heal on $platform: rc $rcHeal${unaccepted:+, it changed:
