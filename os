@@ -322,6 +322,401 @@ private.os.platform.socket.remove()     # <port> # remove the stale ControlMaste
 }
 
 
+private.os.platform.heal.breakage.names.get()     #  # echo the breakage names of os platform.heal.test one per line, in the order they are applied; silent getter #
+{
+ # NO create.result — a getter consumed as $(...) and by the completion of
+ # os.platform.heal.test. The order is the order of application, whatever
+ # order is typed (private.os.platform.heal.breakage.list.get keeps it): the
+ # users' shapes, the system's, then the canonical folder <base>/<branch>.
+ # The folder arms build on one another in this order: missing.branch clears
+ # <base>/<branch>; diverged clones it again from the installed tree (an
+ # install of another ref has no such folder) and commits on it;
+ # markers.committed commits on it; merge.conflict leaves a merge in
+ # progress, which refuses any further commit; dirty changes a file the merge
+ # does not touch; detached comes last, through update-ref, because a merge
+ # in progress refuses a checkout. worktree.layout breaks <base>/testing, a
+ # folder of its own: one folder holds one shape of a worktree.
+ printf '%s\n' eraB.config private.clone foreign.symlink devhome.missing boot.era no.bashrc \
+   safe.directory.stale ssh.legacy state.30 launcher.missing worktree.layout \
+   missing.branch diverged markers.committed merge.conflict dirty detached
+}
+
+
+private.os.platform.heal.breakage.list.get()     # <?names...:all> # RESULT = the breakages to apply, space-separated, in the order of private.os.platform.heal.breakage.names.get: all, or no name, is every one; rc 1 naming the first unknown name #
+{
+ local names word wanted=" " list=""
+ names=$(private.os.platform.heal.breakage.names.get | tr '\n' ' ')
+ [ $# -gt 0 ] || set -- all
+ for word in "$@"; do
+   if [ "$word" = all ]; then
+     wanted=" $names"
+     continue
+   fi
+   # A name is letters, digits and dots: a glob character never reaches the case pattern below.
+   case "$word" in
+     ""|*[!A-Za-z0-9.]*) ;;
+     *) case " $names" in *" $word "*) wanted="$wanted$word "; continue ;; esac ;;
+   esac
+   create.result 1 "unknown breakage '$word' — one of: all ${names% }"
+   error.log "$RESULT"
+   return $(result)
+ done
+ for word in $names; do
+   case "$wanted" in *" $word "*) list="$list $word" ;; esac
+ done
+ create.result 0 "${list# }"
+ return $(result)
+}
+
+
+private.os.platform.heal.fixture.script.get()     # <fixture> <target> # echo POSIX sh that writes the file or folder test/fixtures/heal/<fixture> to <target> where it runs, each file as a quoted here-document (nothing in it expanded); <target> is shell text the remote shell expands, e.g. $h/config; silent getter, rc 1 when the fixture is missing #
+{
+ # NO create.result — a getter consumed as $(...); its text is part of a
+ # breakage script (private.os.platform.heal.breakage.script.get). The files
+ # travel as text inside the one script: the script is the only thing that
+ # reaches the container (private.os.platform.root.script.run).
+ local fixture="$1" target="$2" src file rel
+ src="$OOSH_DIR/test/fixtures/heal/$fixture"
+ [ -n "$fixture" ] && [ -n "$target" ] && [ -e "$src" ] || return 1
+ if [ -f "$src" ]; then
+   printf "cat > \"%s\" <<'OOSH_HEAL_FIXTURE_EOF'\n" "$target"
+   # raw: the fixture's bytes, no method reads a file; a last line without a newline gets one
+   cat "$src"
+   [ -z "$(tail -c 1 "$src")" ] || echo
+   echo OOSH_HEAL_FIXTURE_EOF
+   return 0
+ fi
+ printf 'mkdir -p "%s"\n' "$target"
+ while IFS= read -r file; do
+   rel="${file#"$src"/}"
+   case "$rel" in */*) printf 'mkdir -p "%s/%s"\n' "$target" "${rel%/*}" ;; esac
+   printf "cat > \"%s/%s\" <<'OOSH_HEAL_FIXTURE_EOF'\n" "$target" "$rel"
+   cat "$file"
+   [ -z "$(tail -c 1 "$file")" ] || echo
+   echo OOSH_HEAL_FIXTURE_EOF
+ done < <(find "$src" -type f | LC_ALL=C sort)
+}
+
+
+private.os.platform.heal.remote.preamble.get()     # <branch> # echo the POSIX sh preamble of every script os platform.heal.test runs as root in a container: H=<branch>, home_of from /etc/passwd, the base B, the sharedConfig S, the canonical folder D=B/H, rgit, say and fail, the installed tree and a clone of it, the foreign sums; silent getter, rc 1 for a missing or bad <branch> #
+{
+ # NO create.result — a getter consumed as $(...). Raw POSIX sh ON PURPOSE:
+ # these scripts reproduce and inspect what an OLD install left behind, and
+ # must not depend on the oosh under test (an old ref, broken further by the
+ # earlier breakages); /bin/sh may be dash or busybox ash. The base and the
+ # sharedConfig are the paths of private.oo.heal.path.get under the parent of
+ # developking's home from /etc/passwd (kept there when its home is removed),
+ # else /home. N names the breakage in say and fail; the caller sets it.
+ local branch="$1"
+ case "$branch" in ""|-*|*[!A-Za-z0-9._/@+-]*) return 1 ;; esac
+ printf "H='%s'\n" "$branch"
+ cat <<'OOSH_HEAL_PREAMBLE'
+set -u
+N=${N:-heal}
+say()  { echo "breakage $N: $*"; }
+fail() { echo "breakage $N: FAILED — $*" >&2; exit 1; }
+# ogit-exception: inside the platform container, as root — the oosh there is the old ref under test; safe.directory for this call only
+rgit() { git -c safe.directory='*' -c user.email=heal-test@oosh.invalid -c user.name='oosh heal test' -c commit.gpgsign=false "$@"; }
+home_of() { awk -F: -v u="$1" '$1 == u { print $6; exit }' /etc/passwd; }
+dh=$(home_of developking)
+bh=/home
+[ -n "$dh" ] && bh=${dh%/*}
+B="$bh/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
+S="$bh/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
+D="$B/$H"
+installed() { t=$(readlink -f "$(home_of test)/oosh" 2>/dev/null); [ -n "$t" ] && [ -e "$t/.git" ] && echo "$t"; }
+clone_installed() {
+  src=$(installed) || fail "the user test has no installed ~/oosh to clone"
+  url=$(rgit -C "$src" remote get-url origin) || fail "$src has no origin"
+  mkdir -p "${1%/*}"
+  rgit clone -q "$src" "$1" || fail "clone of $src into $1"
+  rgit -C "$1" checkout -q -B "$2" || fail "branch $2 in $1"
+  rgit -C "$1" remote set-url origin "$url" || fail "origin of $1"
+  }
+branch_dir_ensure() {
+  [ -e "$D/.git" ] && return 0
+  [ -e "$D" ] && rm -rf "$D"
+  clone_installed "$D" "$H"
+  say "$D cloned from $(installed) on branch $H"
+  }
+foreign_sums() { ( cd /opt/foreign && find . -print | LC_ALL=C sort && find . -type f -exec cksum {} + | LC_ALL=C sort ); }
+OOSH_HEAL_PREAMBLE
+}
+
+
+private.os.platform.heal.breakage.script.get()     # <name> <branch> # echo the POSIX sh that applies the breakage <name> as root in a platform container: the preamble of private.os.platform.heal.remote.preamble.get and the arm of <name>; each arm looks first, says already and changes nothing when its shape is there, else breaks and says what it did; silent getter, rc 1 for an unknown name or a bad <branch> #
+{
+ # NO create.result — a getter consumed as $(...); private.os.platform.heal.breakage.apply
+ # runs the text. The container is disposable (os platform.heal.test removes
+ # it), so an arm may delete; what the real machines must never lose is
+ # oo heal's concern, and the scenario proves it on these copies.
+ local name="$1" branch="$2" preamble
+ [ -n "$name" ] || return 1
+ private.os.platform.heal.breakage.names.get | grep -qxF -- "$name" || return 1
+ preamble=$(private.os.platform.heal.remote.preamble.get "$branch") || return 1
+ printf "N='%s'\n%s\n" "$name" "$preamble"
+ case "$name" in
+   eraB.config)
+     # test's ~/config: the MacStudio's era-B folder (sanitised), /Users/donges -> test's home
+     cat <<'OOSH_HEAL_ARM'
+h=$(home_of test); [ -n "$h" ] || fail "no user test"
+c="$h/config"
+if [ -d "$c" ] && [ ! -L "$c" ] && grep -q 'OOSH_MODE="mcdonges.latest"' "$c/user.env" 2>/dev/null; then say "already: $c is the era-B config"; exit 0; fi
+if [ -L "$c" ]; then rm -f "$c"; elif [ -e "$c" ]; then mv "$c" "$c.before-eraB"; fi
+OOSH_HEAL_ARM
+     private.os.platform.heal.fixture.script.get eraB.config '$c' || return 1
+     cat <<'OOSH_HEAL_ARM'
+sed -i "s#/Users/donges#$h#g" "$c/user.env" "$c/oosh.env"
+chown -R test "$c" # recursive-exception: the era-B config this arm just wrote, in a disposable container
+say "$c is a real folder with the era-B files of the MacStudio, /Users/donges rewritten to $h"
+OOSH_HEAL_ARM
+     ;;
+   private.clone)
+     # once_dev's root: ~/oosh a real clone (dev at the old ref) with an oosh.orig.<ts>, ~/config real with OOSH_MODE="oosh"
+     cat <<'OOSH_HEAL_ARM'
+r=$(home_of root); [ -n "$r" ] || fail "no root in /etc/passwd"
+if [ -d "$r/oosh/.git" ] && [ ! -L "$r/oosh" ]; then
+  say "already: $r/oosh is a real clone"
+else
+  if [ -L "$r/oosh" ]; then rm -f "$r/oosh"; elif [ -e "$r/oosh" ]; then mv "$r/oosh" "$r/oosh.before-private-clone"; fi
+  clone_installed "$r/oosh" dev
+  say "$r/oosh is a real clone of $(installed) on branch dev"
+fi
+o="$r/oosh.orig.20260910-093000"
+if [ -e "$o" ]; then say "already: $o"; else cp -a "$r/oosh" "$o" || fail "copy to $o"; say "$o copied from $r/oosh"; fi
+if [ -L "$r/config" ]; then
+  t=$(readlink -f "$r/config"); rm -f "$r/config"
+  cp -a "$t" "$r/config" || fail "copy of $t"
+  say "$r/config is a real copy of $t"
+elif [ -d "$r/config" ]; then
+  say "already: $r/config is a real folder"
+else
+  mkdir -p "$r/config"; say "$r/config made"
+fi
+f="$r/config/oosh.session.env"
+if grep -qx 'export OOSH_MODE="oosh"' "$f" 2>/dev/null; then say "already: OOSH_MODE=oosh in $f"
+elif grep -q '^export OOSH_MODE=' "$f" 2>/dev/null; then sed -i 's/^export OOSH_MODE=.*/export OOSH_MODE="oosh"/' "$f"; say "OOSH_MODE=oosh in $f"
+else echo 'export OOSH_MODE="oosh"' >> "$f"; say "OOSH_MODE=oosh added to $f"; fi
+OOSH_HEAL_ARM
+     ;;
+   foreign.symlink)
+     # bash-user's ~/oosh -> a clone outside the base; its sums and a marker are recorded for private.os.platform.heal.foreign.check
+     cat <<'OOSH_HEAL_ARM'
+u=$(home_of bash-user); [ -n "$u" ] || fail "no bash-user"
+f=/opt/foreign/OOSH/x
+if [ -e "$f/.git" ]; then say "already: $f is a clone"; else clone_installed "$f" dev; say "$f is a real clone of $(installed)"; fi
+if [ "$(readlink "$u/oosh" 2>/dev/null)" = "$f" ]; then
+  say "already: $u/oosh -> $f"
+else
+  if [ -L "$u/oosh" ]; then rm -f "$u/oosh"; elif [ -e "$u/oosh" ]; then mv "$u/oosh" "$u/oosh.before-foreign"; fi
+  ln -s "$f" "$u/oosh" && chown -h bash-user "$u/oosh" || fail "link $u/oosh"
+  say "$u/oosh -> $f"
+fi
+if [ -f /opt/foreign.heal.sums ]; then
+  say "already: the sums of /opt/foreign are recorded"
+else
+  foreign_sums > /opt/foreign.heal.sums && touch /opt/foreign.heal.marker || fail "sums of /opt/foreign"
+  say "the sums of /opt/foreign are in /opt/foreign.heal.sums, its marker /opt/foreign.heal.marker"
+fi
+OOSH_HEAL_ARM
+     ;;
+   devhome.missing)
+     cat <<'OOSH_HEAL_ARM'
+[ -n "$dh" ] || fail "developking is not in /etc/passwd"
+if [ -d "$dh" ]; then rm -rf "$dh"; say "$dh removed, developking stays in /etc/passwd"; else say "already: $dh is missing"; fi
+OOSH_HEAL_ARM
+     ;;
+   boot.era)
+     # oosh-user's .bashrc of the boot era (templates/user/bashrcTemplate before 9dcf8021), the T9 drop-in and /etc/oosh/boot
+     cat <<'OOSH_HEAL_ARM'
+u=$(home_of oosh-user); [ -n "$u" ] || fail "no oosh-user"
+if grep -q 'oosh/boot' "$u/.bashrc" 2>/dev/null; then
+  say "already: $u/.bashrc is of the boot era"
+else
+OOSH_HEAL_ARM
+     private.os.platform.heal.fixture.script.get boot.era/bashrc '$u/.bashrc' || return 1
+     cat <<'OOSH_HEAL_ARM'
+  chown oosh-user "$u/.bashrc"
+  say "$u/.bashrc is the boot-era template"
+fi
+if grep -q 'root.boot.path.installed' /etc/profile.d/oosh.sh 2>/dev/null; then
+  say "already: /etc/profile.d/oosh.sh is the T9 drop-in"
+else
+  mkdir -p /etc/profile.d
+OOSH_HEAL_ARM
+     private.os.platform.heal.fixture.script.get boot.era/profile.d.oosh.sh /etc/profile.d/oosh.sh || return 1
+     cat <<'OOSH_HEAL_ARM'
+  chmod 644 /etc/profile.d/oosh.sh
+  say "/etc/profile.d/oosh.sh is the T9 drop-in"
+fi
+if [ -L /etc/oosh/boot ]; then say "already: /etc/oosh/boot"; else mkdir -p /etc/oosh && ln -sfn "$D/boot" /etc/oosh/boot || fail "/etc/oosh/boot"; say "/etc/oosh/boot -> $D/boot"; fi
+OOSH_HEAL_ARM
+     ;;
+   no.bashrc)
+     cat <<'OOSH_HEAL_ARM'
+r=$(home_of root)
+if [ ! -e "$r/.bashrc" ]; then say "already: no $r/.bashrc"
+elif [ -e "$r/.bashrc.pre-oosh" ]; then rm -f "$r/.bashrc"; say "$r/.bashrc removed, $r/.bashrc.pre-oosh left"
+else mv "$r/.bashrc" "$r/.bashrc.pre-oosh"; say "$r/.bashrc moved to $r/.bashrc.pre-oosh"; fi
+OOSH_HEAL_ARM
+     ;;
+   safe.directory.stale)
+     cat <<'OOSH_HEAL_ARM'
+r=$(home_of root)
+for e in /Users/Shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/dev /Users/Shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/main; do
+  if rgit config --file "$r/.gitconfig" --get-all safe.directory 2>/dev/null | grep -qxF "$e"; then say "already: $e"
+  else rgit config --file "$r/.gitconfig" --add safe.directory "$e" || fail "safe.directory $e"; say "safe.directory $e added to $r/.gitconfig"; fi
+done
+OOSH_HEAL_ARM
+     ;;
+   ssh.legacy)
+     # the names user.ssh.backup.status looks for: ssh.original and ssh.<user>.<host>.for.<host>
+     cat <<'OOSH_HEAL_ARM'
+r=$(home_of root)
+for d in "$r/ssh.original" "$r/ssh.root.oncedev.for.oncedev"; do
+  if [ -d "$d" ]; then say "already: $d"; else mkdir -p "$d" && chmod 700 "$d" && : > "$d/known_hosts" || fail "$d"; say "$d made"; fi
+done
+OOSH_HEAL_ARM
+     ;;
+   state.30)
+     cat <<'OOSH_HEAL_ARM'
+r=$(home_of root); f="$r/config/current.state.machine.env"
+if grep -qx 'state=30' "$f" 2>/dev/null && grep -qx 'machine=SETUP_SERVER' "$f"; then say "already: $f is at SETUP_SERVER 30"
+elif [ -f "$f" ]; then sed -i -e 's/^machine=.*/machine=SETUP_SERVER/' -e 's/^state=.*/state=30/' "$f"; say "$f set to SETUP_SERVER 30"
+else mkdir -p "${f%/*}"; printf 'machine=SETUP_SERVER\nstate=30\n' > "$f"; say "$f written at SETUP_SERVER 30"; fi
+OOSH_HEAL_ARM
+     ;;
+   launcher.missing)
+     cat <<'OOSH_HEAL_ARM'
+if [ -e /usr/local/bin/this ] || [ -L /usr/local/bin/this ]; then rm -f /usr/local/bin/this; say "/usr/local/bin/this removed"; else say "already: no /usr/local/bin/this"; fi
+OOSH_HEAL_ARM
+     ;;
+   worktree.layout)
+     cat <<'OOSH_HEAL_ARM'
+w="$B/testing"
+if [ -f "$w/.git" ]; then say "already: $w is a linked worktree"; exit 0; fi
+[ -d "$B/main/.git" ] || fail "no $B/main to hang a worktree on"
+[ -e "$w" ] && rm -rf "$w"
+rgit -C "$B/main" worktree add -f -B testing "$w" HEAD >/dev/null 2>&1 || fail "worktree add $w"
+say "$w is a linked worktree of $B/main on branch testing"
+OOSH_HEAL_ARM
+     ;;
+   missing.branch)
+     cat <<'OOSH_HEAL_ARM'
+if [ -e "$D" ] || [ -L "$D" ]; then rm -rf "$D"; say "$D removed"; else say "already: $D is missing"; fi
+OOSH_HEAL_ARM
+     ;;
+   diverged)
+     # a local commit origin lacks, and origin/<branch> one the folder lacks
+     cat <<'OOSH_HEAL_ARM'
+branch_dir_ensure
+if rgit -C "$D" rev-parse -q --verify refs/heal-test/diverged >/dev/null; then say "already: $D has diverged"; exit 0; fi
+rgit -C "$D" commit -q --allow-empty -m 'heal test: a local commit origin lacks' || fail "local commit"
+up=$(rgit -C "$D" commit-tree 'HEAD~1^{tree}' -p HEAD~1 -m 'heal test: origin ahead') || fail "origin commit"
+rgit -C "$D" update-ref "refs/remotes/origin/$H" "$up" && rgit -C "$D" update-ref refs/heal-test/diverged HEAD || fail "refs"
+say "$D has a local commit origin lacks, origin/$H one $D lacks"
+OOSH_HEAL_ARM
+     ;;
+   markers.committed)
+     # the Mac's 6 Oct shape: conflict markers committed in this, log, oo and config
+     cat <<'OOSH_HEAL_ARM'
+branch_dir_ensure
+if rgit -C "$D" grep -q -e '^>>>>>>> ' HEAD -- this log oo config 2>/dev/null; then say "already: markers are committed in $D"; exit 0; fi
+for f in this log oo config; do
+  [ -f "$D/$f" ] && printf '%s\n' '<<<<<<< HEAD' '# ours' '=======' '# theirs' '>>>>>>> origin/dev' >> "$D/$f"
+done
+rgit -C "$D" commit -q -m "Merge remote-tracking branch 'origin/dev' (heal test: conflict markers committed)" -- this log oo config || fail "commit of the markers"
+say "conflict markers committed in $D: this log oo config"
+OOSH_HEAL_ARM
+     ;;
+   merge.conflict)
+     # a half-done merge: theirs is built with a temporary index, so no checkout moves the folder
+     cat <<'OOSH_HEAL_ARM'
+branch_dir_ensure
+if [ -f "$D/.git/MERGE_HEAD" ]; then say "already: a merge is in progress in $D"; exit 0; fi
+base=$(rgit -C "$D" rev-parse HEAD) || fail "HEAD of $D"
+blob=$(printf 'theirs\n' | rgit -C "$D" hash-object -w --stdin) || fail "blob"
+GIT_INDEX_FILE="$D/.git/heal-test.index"; export GIT_INDEX_FILE
+rgit -C "$D" read-tree "$base" && rgit -C "$D" update-index --add --cacheinfo "100644,$blob,heal.conflict.txt" && tree=$(rgit -C "$D" write-tree)
+ok=$?; unset GIT_INDEX_FILE; rm -f "$D/.git/heal-test.index"
+[ "$ok" = 0 ] || fail "tree of theirs"
+theirs=$(rgit -C "$D" commit-tree "$tree" -p "$base" -m 'heal test: theirs') || fail "commit of theirs"
+printf 'ours\n' > "$D/heal.conflict.txt"
+rgit -C "$D" add heal.conflict.txt && rgit -C "$D" commit -q -m 'heal test: ours' -- heal.conflict.txt || fail "commit of ours"
+rgit -C "$D" merge --no-edit "$theirs" >/dev/null 2>&1
+[ -f "$D/.git/MERGE_HEAD" ] || fail "the merge did not stop on its conflict"
+say "$D is mid-merge: MERGE_HEAD set, markers in heal.conflict.txt"
+OOSH_HEAL_ARM
+     ;;
+   dirty)
+     cat <<'OOSH_HEAL_ARM'
+branch_dir_ensure
+if grep -qx '# heal test: an uncommitted change' "$D/os" 2>/dev/null; then say "already: $D/os is changed"
+else echo '# heal test: an uncommitted change' >> "$D/os" || fail "$D/os"; say "$D/os changed, not committed"; fi
+OOSH_HEAL_ARM
+     ;;
+   detached)
+     cat <<'OOSH_HEAL_ARM'
+branch_dir_ensure
+if ! rgit -C "$D" symbolic-ref -q HEAD >/dev/null; then say "already: $D is on a detached HEAD"; exit 0; fi
+rgit -C "$D" update-ref --no-deref HEAD "$(rgit -C "$D" rev-parse HEAD)" || fail "detach"
+say "$D is on a detached HEAD"
+OOSH_HEAL_ARM
+     ;;
+ esac
+}
+
+
+private.os.platform.root.script.run()     # <platform> <shell> <script> # run the text <script> as root in the platform container: base64 through ossh exec (the prelude, as test), decoded there and fed to sudo <shell> -s; stdout and stderr of the script pass through; rc of the script (ssh: 255) #
+{
+ # One transport for every script os platform.heal.test runs as root. The
+ # script travels INSIDE the command line, base64-encoded: no quoting of its
+ # text, and nothing depends on stdin reaching ssh through the ossh command.
+ # test has NOPASSWD sudo in a platform container (private.os.platform.container.up).
+ local platform="$1" shell="$2" script="$3" encoded
+ if [ -z "$platform" ] || [ -z "$shell" ] || [ -z "$script" ]; then
+   create.result 1 "private.os.platform.root.script.run requires <platform> <shell> <script>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ case "$shell" in
+   sh|bash) ;;
+   *) create.result 1 "private.os.platform.root.script.run: <shell> is sh or bash, not $shell"; error.log "$RESULT"; return $(result) ;;
+ esac
+ # raw: an encoding, no oosh method; one line, the remote base64 -d reads it
+ encoded=$(printf '%s\n' "$script" | base64 | tr -d '\n')
+ ossh exec "$platform" "echo $encoded | base64 -d | sudo $shell -s"
+ local rc=$?
+ create.result "$rc" "the script ran as root on $platform with rc $rc"
+ return $rc
+}
+
+
+private.os.platform.heal.breakage.apply()     # <platform> <name> <?branch> # apply the breakage <name> in the platform container as root (private.os.platform.heal.breakage.script.get through private.os.platform.root.script.run); <branch> (default: the branch of this tree) names the canonical folder the folder arms break; rc of the arm, rc 1 for an unknown name #
+{
+ local platform="$1" name="$2" branch="$3" script
+ if [ -z "$platform" ] || [ -z "$name" ]; then
+   create.result 1 "private.os.platform.heal.breakage.apply requires <platform> <name>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ if [ -z "$branch" ]; then
+   private.this.script.load ogit ogit.branch.get || return $(result)
+   branch=$(ogit.branch.get "$OOSH_DIR")
+ fi
+ if ! script=$(private.os.platform.heal.breakage.script.get "$name" "$branch"); then
+   create.result 1 "unknown breakage '$name' or no branch '$branch' — one of: $(private.os.platform.heal.breakage.names.get | tr '\n' ' ')"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ console.log "breakage $name on $platform (canonical folder: $branch)"
+ private.os.platform.root.script.run "$platform" sh "$script"
+ local rc=$?
+ create.result "$rc" "breakage $name on $platform: rc $rc"
+ return $rc
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────

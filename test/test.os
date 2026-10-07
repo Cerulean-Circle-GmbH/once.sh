@@ -465,6 +465,101 @@ test.os.socketRemove() {
 test.case $level "T-OS-SOCKET-REMOVE: the socket of a port is removed and a missing one is no error" test.os.socketRemove
 expect 0 "removed" "the removal must be a stubbable method, tests must not touch a live socket"
 
+console.log "
+Test: os platform.heal.test — the breakages
+===================================================================="
+
+# T-OS-HEAL-BREAKAGE-NAMES: every breakage the scenario names has an arm of its own, the
+# arms parse as POSIX sh, all expands to the full list in the order of application, and
+# an unknown name is refused before anything starts. No container: the scripts are text.
+test.os.healBreakageNames() {
+  local bad="" names n script preamble list want
+  names=$(private.os.platform.heal.breakage.names.get)
+  for n in merge.conflict markers.committed dirty detached diverged eraB.config private.clone \
+           foreign.symlink missing.branch devhome.missing boot.era no.bashrc worktree.layout \
+           safe.directory.stale ssh.legacy state.30 launcher.missing; do
+    printf '%s\n' "$names" | grep -qxF "$n" || bad="$bad not-named:$n"
+  done
+  [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" = 17 ] || bad="$bad count=$(printf '%s\n' "$names" | wc -l)"
+  preamble=$(private.os.platform.heal.remote.preamble.get dev.heal) || bad="$bad no-preamble"
+  for n in $names; do
+    if ! script=$(private.os.platform.heal.breakage.script.get "$n" dev.heal); then bad="$bad no-arm:$n"; continue; fi
+    # an arm of its own: more than the N line and the preamble, and it says what it did
+    [ "${#script}" -gt $(( ${#preamble} + ${#n} + 40 )) ] || bad="$bad empty-arm:$n"
+    case "$script" in *"N='$n'"*"say "*) ;; *) bad="$bad no-say:$n" ;; esac
+    printf '%s\n' "$script" | sh -n 2>/dev/null || bad="$bad sh-n:$n"
+    if command -v dash >/dev/null 2>&1; then printf '%s\n' "$script" | dash -n 2>/dev/null || bad="$bad dash-n:$n"; fi
+  done
+  private.os.platform.heal.breakage.script.get no.such.breakage dev.heal >/dev/null 2>&1 && bad="$bad unknown-has-arm"
+  private.os.platform.heal.breakage.script.get dirty -x >/dev/null 2>&1 && bad="$bad dash-branch-accepted"
+  want=$(printf '%s\n' "$names" | tr '\n' ' '); want="${want% }"
+  private.os.platform.heal.breakage.list.get >/dev/null 2>&1; [ "$RESULT" = "$want" ] || bad="$bad default=[$RESULT]"
+  private.os.platform.heal.breakage.list.get all >/dev/null 2>&1; [ "$RESULT" = "$want" ] || bad="$bad all=[$RESULT]"
+  private.os.platform.heal.breakage.list.get detached eraB.config detached >/dev/null 2>&1
+  [ "$RESULT" = "eraB.config detached" ] || bad="$bad order=[$RESULT]"
+  private.os.platform.heal.breakage.list.get eraB.config bogus >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-accepted"
+  case "$RESULT" in *bogus*) ;; *) bad="$bad unknown-unnamed=[$RESULT]" ;; esac
+  for n in '*' 'dirt?' 'state.[3]0' ''; do
+    private.os.platform.heal.breakage.list.get "$n" >/dev/null 2>&1 && bad="$bad pattern-accepted:[$n]"
+  done
+  [ -z "$bad" ] && create.result 0 "17 breakages, each its own POSIX sh arm; all is every one in the order of application; unknown names refused" || create.result 1 "breakage names:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-BREAKAGE-NAMES: every breakage maps to an arm, all expands to the full list, an unknown name is refused" test.os.healBreakageNames
+expect 0 "17 breakages, each its own POSIX sh arm; all is every one in the order of application; unknown names refused" \
+  "the scenario test needs the real machines' shapes, each reproducible on its own"
+
+# T-OS-HEAL-FIXTURE-SCRIPT: a fixture folder or file travels as quoted here-documents and
+# arrives byte for byte — $HOME, backticks and quotes in it are not expanded.
+test.os.healFixtureScript() {
+  local fx bad="" script
+  fx=$(test.suite.fixture.make healfixture)
+  script=$(private.os.platform.heal.fixture.script.get eraB.config "$fx/config") || bad="$bad folder-rc"
+  ( cd "$fx" && printf '%s\n' "$script" | sh ) || bad="$bad folder-run"
+  diff -r "$OOSH_DIR/test/fixtures/heal/eraB.config" "$fx/config" >/dev/null 2>&1 || bad="$bad folder-differs"
+  script=$(private.os.platform.heal.fixture.script.get boot.era/bashrc '$t/bashrc') || bad="$bad file-rc"
+  ( t="$fx"; export t; printf '%s\n' "$script" | sh ) || bad="$bad file-run"
+  cmp -s "$OOSH_DIR/test/fixtures/heal/boot.era/bashrc" "$fx/bashrc" || bad="$bad file-differs"
+  private.os.platform.heal.fixture.script.get no.such.fixture "$fx/x" >/dev/null && bad="$bad missing-fixture-accepted"
+  private.os.platform.heal.fixture.script.get eraB.config >/dev/null && bad="$bad no-target-accepted"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the eraB.config folder and the boot-era .bashrc arrive byte for byte" || create.result 1 "fixture script:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-FIXTURE-SCRIPT: a heal fixture travels inside the breakage script and arrives byte for byte" test.os.healFixtureScript
+expect 0 "the eraB.config folder and the boot-era .bashrc arrive byte for byte" \
+  "the breakage script is the one thing that reaches the container"
+
+# T-OS-HEAL-BREAKAGE-APPLY: the arm runs as root through ossh exec, base64 in the command
+# line (no quoting of the script, no stdin through the ossh command); an unknown breakage
+# never reaches ossh.
+test.os.healBreakageApply() {
+  local fx; fx=$(test.suite.fixture.make healapply)
+  local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
+  local bad="" rec encoded want rc
+  test.os.stubs.set
+  private.os.platform.heal.breakage.apply p dirty dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] || bad="$bad rc=$rc"
+  rec=$(grep '^ossh exec p ' "$OS_T_REC")
+  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad not-root-sh=[$rec]" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d | sudo sh -s.*/\1/p')
+  want=$(private.os.platform.heal.breakage.script.get dirty dev.heal)
+  [ -n "$encoded" ] && [ "$(printf '%s' "$encoded" | base64 -d)" = "$want" ] || bad="$bad script-differs"
+  : > "$OS_T_REC"
+  private.os.platform.heal.breakage.apply p no.such.breakage dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] || bad="$bad unknown-rc=$rc"
+  [ -s "$OS_T_REC" ] && bad="$bad unknown-reached-ossh"
+  private.os.platform.heal.breakage.apply p >/dev/null 2>&1; [ $? = 1 ] || bad="$bad no-name-accepted"
+  private.os.platform.root.script.run p zsh 'true' >/dev/null 2>&1; [ $? = 1 ] || bad="$bad other-shell-accepted"
+  test.os.stubs.unset
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the arm reaches sudo sh -s byte for byte; an unknown breakage never reaches ossh" || create.result 1 "breakage apply:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-BREAKAGE-APPLY: a breakage runs as root in the container through ossh exec" test.os.healBreakageApply
+expect 0 "the arm reaches sudo sh -s byte for byte; an unknown breakage never reaches ossh" \
+  "the breakage must not depend on the oosh under test"
+
 ### test.method
 
 test.suite.save.results
