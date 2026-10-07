@@ -876,7 +876,7 @@ OOSH_HEAL_SNAPSHOT
 }
 
 
-private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), oo heal <branch> all as root (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 and the snapshots differ in nothing but same-content rewrites (a WARNING, as the idempotence invariant accepts them; result.env left out through test.platform.shared.idempotence.volatile.without), else rc 1 with every other difference printed #
+private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), <base>/<branch>/oo heal <branch> all as root (the base through root's ~/oosh — oo on root's PATH may be an older branch without oo heal) (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 and the snapshots differ in nothing but same-content rewrites (a WARNING, as the idempotence invariant accepts them; result.env left out through test.platform.shared.idempotence.volatile.without), else rc 1 with every other difference printed #
 {
  local platform="$1" branch="$2" log work rcHeal differences
  if [ -z "$platform" ] || [ -z "$branch" ]; then
@@ -894,8 +894,12 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
  fi
  # A rewrite within the same second keeps the mtime (as the invariant waits).
  sleep 1
- console.log "second heal: oo heal $branch all as root on $platform — it must change nothing"
- private.os.platform.user.run "$platform" root "oo heal $branch all" "$log"
+ # From the tree that carries the heal, <base>/<branch>, named through root's
+ # ~/oosh (a link into the base after the first heal): `oo` on root's PATH is
+ # the installed branch, which in this scenario is older and has no oo heal
+ # (rc 127 in the first container gate).
+ console.log "second heal: <base>/$branch/oo heal $branch all as root on $platform — it must change nothing"
+ private.os.platform.user.run "$platform" root "\"\$(dirname \"\$(readlink -f ~root/oosh)\")/$branch/oo\" heal $branch all" "$log"
  rcHeal=$?
  private.os.platform.heal.snapshot.get "$platform" "$branch" > "$work/after"
  # The helpers of the idempotence invariant, sourced alone (its POSIX helpers
