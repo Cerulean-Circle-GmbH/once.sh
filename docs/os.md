@@ -69,16 +69,18 @@ fi
 | `os platform.list` | | List all platforms with workspace, package manager, and tier |
 | `os platform.test` | `<platform> <?terminal> <?notests> <?branch>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests, `notests` to skip Phase B, `<branch>` (a branch on origin) to install an older ref first (see [Installing an older ref first](#installing-an-older-ref-first)). Arguments are positional: an empty placeholder keeps its place, so `os platform.test ubuntu_24_04 "" notests` runs without tests and without a terminal |
 | `os platform.test.all` | | Test all platforms, report summary. Exit 0 only if all must-pass platforms pass |
+| `os platform.heal.test` | `<platform> <oldRef> <?breakages...:all>` | Install an old ref, break it the ways real machines are broken, heal once, check everything (see [The heal scenario](#the-heal-scenario-os-platformhealtest)). `terminal` keeps the container, `pipe` runs the pure pipe form too |
 
 ### Platform test building blocks
 
-`os platform.test` is three private methods in a row, so a scenario test (`os platform.heal.test` — planned, see the plan; it has not landed yet) can reuse any of them:
+`os platform.test` is three private methods in a row, so a scenario test (`os platform.heal.test`, [below](#the-heal-scenario-os-platformhealtest)) can reuse any of them:
 
 | Method | What it does |
 |---|---|
 | `private.os.platform.container.up <platform> <image> <port>` | steps 1-6 and the first install: a fresh container from `<image>` on ssh `<port>`, the ssh config and ControlMaster, the pushed key, `NOPASSWD` sudo for `test`, `ossh install` of `test`, then sshd and the ControlMaster settled; rc 1 when the image cannot be built |
 | `private.os.platform.users.install <platform>` | Phase A for the other users: `oosh-user` through `user create`, `bash-user` through `useradd`/`adduser`, both with `NOPASSWD` sudo, then `ossh install <platform> bash-user` from the caller; failures are logged, not fatal |
-| `private.os.platform.gate.run <platform> <user>` | Phase B for ONE user (`test`, `root`, `oosh-user`, `bash-user`): `test.suite gate 1` (core plus the platform invariants) through the transport that fits the user, teed into the log of `private.os.platform.gate.log.get <user> <platform>`; rc is that user's gate rc |
+| `private.os.platform.gate.run <platform> <user> <?log>` | Phase B for ONE user (`test`, `root`, `oosh-user`, `bash-user`): `test.suite gate 1` (core plus the platform invariants) through `private.os.platform.user.run`, teed into `<log>` (default `private.os.platform.gate.log.get <user> <platform>`); rc is that user's gate rc |
+| `private.os.platform.user.run <platform> <user> <command> <log>` | Runs any `<command>` as one of the four users through the transport that fits (`ossh exec` for `test`, `sudo bash -lc` for `root`, `runuser` or `sudo -H -u` for the others), from the user's home, teed into `<log>`; rc is the command's. `gate.run` and the heal scenario share it |
 
 `private.os.platform.gate.log.get <user> <platform>` echoes `/tmp/oosh-platform-test-<user>-<platform>.log` (a silent getter; `gate.run` and `platform.test` share it). `private.os.platform.socket.remove <port>` removes the stale ControlMaster socket `/tmp/ossh-test@localhost:<port>` (silent, idempotent) and is a method of its own so tests can stub it instead of deleting a live socket.
 
@@ -86,7 +88,91 @@ fi
 
 `os platform.test <platform> "" "" <branch>` takes a **branch on origin** of this repo. `<branch>` is exported as `OSSH_INSTALL_BRANCH` to the two install steps only (`ossh install` of `test` in `container.up`, of `bash-user` in `users.install`; a prefix assignment, so it lives for that one call). `ossh install` honours it: it pushes **that ref's own `init/oosh`** and hands the remote installer that branch ([ossh.md § Remote Installation](ossh.md#remote-installation)). macOS refuses a `<branch>` (the CI workflow installs its own branch).
 
-Before anything starts, the era gate `private.os.platform.branch.gate <branch> <?dir>` reads `init/oosh` of the ref through `ogit.file.show` and refuses a ref whose installer lacks the `mode root` contract, i.e. older than commit `b8b90b82` (older refs use `mode ssh` and rsync, which the current `ossh install` cannot drive). It tries `origin/<branch>` — and only that: the container clones from origin, so a local-only branch, or a stale local branch of the same name, must not pass, and a commit sha cannot be cloned. The gate reads the remote-tracking ref of the local repo, which can be stale until the next fetch. A sha is the scenario test's job (`os platform.heal.test` ships it as a temporary branch first; planned, see the plan).
+Before anything starts, the era gate `private.os.platform.branch.gate <branch> <?dir>` reads `init/oosh` of the ref through `ogit.file.show` and refuses a ref whose installer lacks the `mode root` contract, i.e. older than commit `b8b90b82` (older refs use `mode ssh` and rsync, which the current `ossh install` cannot drive). It accepts only `origin/<branch>`: the container clones from origin, so a local-only branch, or a stale local branch of the same name, must not pass, and a commit sha cannot be cloned. The gate reads the remote-tracking ref of the local repo, which can be stale until the next fetch. A sha is the scenario test's job: `os platform.heal.test` pushes it as the temporary branch `platform-test/<sha>` first.
+
+### The heal scenario (`os platform.heal.test`)
+
+```bash
+os platform.heal.test <platform> <oldRef> <?breakages...:all>
+```
+
+The proof `oo heal` needs before it touches a real machine: an OLD install, broken the ways the real machines
+are broken, healed **once**, then everything that checks an install. `<platform>` is a Docker platform (a
+native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<breakages>` are the names below
+(default and `all`: every one). The words **`terminal`** (keep the container for a look inside) and **`pipe`**
+(also run the pure pipe form once) may stand among the breakages. The heal under test is **this tree**:
+`OOSH_HEAL_LOCAL=1 ossh heal` ships this tree's `init/oosh` and a bundle of its branch
+([ossh.md](ossh.md#healing-a-remote-host-ossh-heal)). Docker port 8022, as `platform.test`.
+
+**The flow.**
+
+1. Parse the arguments (`private.os.platform.heal.breakage.list.get` keeps the fixed order, rc 1 on an unknown name) and the platform.
+2. `private.os.platform.ref.branch.ensure <ref>`: a branch on origin is used as it is (one fetch on a miss);
+   a commit sha of this repo is pushed as the temporary branch `platform-test/<sha>` (`ogit.remote.push` with
+   the refspec `<sha>:refs/heads/platform-test/<sha>`, so no local branch is made and this tree does not move).
+3. The era gate (`private.os.platform.branch.gate`) refuses a ref older than the `mode root` installer contract.
+4. `private.os.platform.container.up` with `OSSH_INSTALL_BRANCH` set, then `private.os.platform.users.install`:
+   `test`, `root`, `oosh-user` and `bash-user` are installed at the OLD ref.
+5. The breakages, each as root in the container.
+6. One heal: `OOSH_HEAL_LOCAL=1 ossh heal <platform> all <branch>`. Its rc 1 is no failure (it moves broken
+   canonical folders aside and says so); rc 2 or an ssh failure is. With `pipe`, the pure pipe form runs once
+   more as `test` (`private.os.platform.heal.pipe.run`).
+7. `private.os.platform.gate.run` four times (`test`, `root`, `oosh-user`, `bash-user`), with
+   `private.os.platform.shared.config.repair` after root's run.
+8. The idempotence invariant (`test.suite run platform.shared.idempotence.invariant 1`) as root and as `bash-user`.
+9. The second heal (`private.os.platform.heal.second.run`): a snapshot of what `oo heal` owns, `oo heal <branch> all`
+   as root, a snapshot again — rc 0 and an identical snapshot, else every difference is printed.
+10. The foreign check (`private.os.platform.heal.foreign.check`, only when `foreign.symlink` ran): `/opt/foreign`
+    has the same entries and checksums and nothing newer than the marker.
+11. The verdict line `PASS: heal <platform> <oldRef> (breakages=0 heal=… test=… … second-heal=0 foreign=…)` or
+    `FAIL:` with the first FAIL lines of the logs; then `private.os.platform.ref.branch.drop` deletes a
+    `platform-test/*` branch (any other branch is left alone) and, unless `terminal`, the container is removed.
+    On PASS the logs are removed too.
+
+**The breakages**, applied in this fixed order whatever order is typed
+(`private.os.platform.heal.breakage.names.get`). Each is an idempotent POSIX sh arm run as root
+(`private.os.platform.heal.breakage.script.get`): it looks first, says `already` and changes nothing when its
+shape is there. The container is disposable, so an arm may delete.
+
+| Name | What it does | Where |
+|---|---|---|
+| `eraB.config` | The MacStudio's era-B `~/config` (mode `mcdonges.latest`, from `test/fixtures/heal/eraB.config`), `/Users/donges` rewritten to the home | `test` |
+| `root.clone` | `~/oosh` a real clone of the old ref with an `oosh.orig.<ts>`, `~/config` a real copy with `OOSH_MODE="oosh"` | `root` |
+| `foreign.symlink` | `~/oosh` points to a clone outside the base (`/opt/foreign/OOSH/x`); its checksums and a marker are recorded | `bash-user` |
+| `devhome.missing` | `developking`'s home removed, the user stays in `/etc/passwd` | system |
+| `boot.era` | The boot-era `.bashrc` (`test/fixtures/heal/boot.era/bashrc`), the T9 drop-in `/etc/profile.d/oosh.sh` and `/etc/oosh/boot` | `oosh-user`, system |
+| `no.bashrc` | `~/.bashrc` moved to `.bashrc.pre-oosh` | `root` |
+| `safe.directory.stale` | Dead `safe.directory` entries (`/Users/Shared/...`) in `.gitconfig` | `root` |
+| `ssh.legacy` | Legacy `ssh.original` and `ssh.<user>.<host>.for.<host>` folders | `root` |
+| `state.30` | The install state machine set back to `SETUP_SERVER` 30 | `root` |
+| `launcher.missing` | `/usr/local/bin/this` removed | system |
+| `worktree.layout` | `<base>/testing` a linked worktree of `<base>/main` | base |
+| `missing.branch` | `<base>/<branch>` removed | base |
+| `diverged` | A local commit origin lacks, and an `origin/<branch>` the folder lacks | `<base>/<branch>` |
+| `markers.committed` | Conflict markers committed in `this`, `log`, `oo` and `config` (the Mac's 6 Oct shape) | `<base>/<branch>` |
+| `merge.conflict` | A half-done merge: `MERGE_HEAD` set, markers in `heal.conflict.txt` | `<base>/<branch>` |
+| `dirty` | An uncommitted change in `os` | `<base>/<branch>` |
+| `detached` | `HEAD` detached (through `update-ref`, last: a merge in progress refuses a checkout) | `<base>/<branch>` |
+
+The folder arms build on one another in this order: `missing.branch` clears `<base>/<branch>`; `diverged`
+clones it again from the installed tree and commits on it; `markers.committed` commits on it; `merge.conflict`
+leaves a merge in progress; `dirty` changes a file the merge does not touch. The fixture files travel as text
+inside the one script (`private.os.platform.heal.fixture.script.get`, `private.os.platform.root.script.run`).
+
+**Logs.** `private.os.platform.heal.log.get <step> <platform>` is `/tmp/oosh-heal-test-<step>-<platform>.log` for
+the steps `breakages`, `heal`, `pipe`, `test`, `root`, `oosh-user`, `bash-user`, `idempotence-root`,
+`idempotence-bash-user`, `second-heal` and `foreign`. They are emptied at the start and removed on PASS.
+
+**The C2 command lines** (inside the disposable containers only, never on a real host):
+
+```bash
+os platform.heal.test ubuntu_24_04 26d15a4 all pipe     # the full scenario on the first platform, pipe form included
+os platform.heal.test ubuntu_24_04 51d7fb3              # all breakages, an older ref
+os platform.heal.test debian_12 51d7fb3
+os platform.heal.test almalinux_9 51d7fb3
+os platform.heal.test alpine_3_19 51d7fb3
+os platform.heal.test ubuntu_24_04 51d7fb3 all terminal  # keep the container: ossh exec.tty ubuntu_24_04 'sudo -i'
+```
 
 ### Platform Test Flow (Docker platforms)
 

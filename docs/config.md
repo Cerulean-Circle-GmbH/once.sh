@@ -722,8 +722,9 @@ These functions are used internally and generally not called directly:
 | `private.config.shared.oosh.base.get` | the components base the branch folders sit in — the parent of developking's home + `/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh`, in the file system's letter case; the one base of `config init.user`'s `<sharedOosh>` check and of its completion; nothing and rc 1 when developking has no home; silent |
 | `private.config.orig.import` | `<origDir> <sharedConfig>` → carries an allow-listed few values from a kept-aside `~/config` into the shared config (see below) |
 
-**`private.config.orig.import`** is what `oo heal` calls after `config init.user` kept a real
-`~/config` as `config.orig.<ts>`. The old files (`user.env`, `oosh.env`, `log.env` of
+**`private.config.orig.import`** is what `oo heal` calls (`private.oo.heal.env`) for each real `~/config` that
+`config init.user` kept as `config.orig.<ts>` — after `config init.env` has filled the shared config, because it
+writes into `log.env` and `oosh.env` only when they exist. The old files (`user.env`, `oosh.env`, `log.env` of
 `<origDir>`) are read as **data** through `private.config.env.names.read` and
 `private.config.env.value.read` — nothing is sourced, because old files may hold code, and
 nothing in `<origDir>` is written. The last assignment of a name wins across the three files.
@@ -763,9 +764,12 @@ closed gate, and answers rc 1 with a result that names what could not be written
 place, not through `replace commit`: that puts a new file under the name, so a
 dev-group user who is not the owner would become the shared file's owner.
 
-All six are getters consumed as `$(…)`, so none calls `create.result` — it runs
-in a subshell and the result could never reach the caller. The first three are
-additionally **silent by contract**: their only caller runs inside
+The getters of the table above (`private.config.variables.list`, `private.config.variable.export.line`,
+`private.config.variables.export`, `private.config.string.upper`, `private.config.required.variables.get`,
+`private.config.env.value.read`, `private.config.env.names.read`, `private.config.shared.oosh.base.get`,
+`private.config.host.name.get`) are consumed as `$(…)`, so none calls `create.result` — it runs
+in a subshell and the result could never reach the caller. The first three (the generators of an env file's
+body) are additionally **silent by contract**: their only caller runs inside
 `{ … } >$CONFIG`, and `log:35` sets `LOG_DEVICE=/proc/self/fd/1`, so inside that
 redirect a single `debug.log` would be written into the generated env file.
 

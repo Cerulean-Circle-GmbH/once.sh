@@ -13,7 +13,7 @@ listed here run only when invoked.
 
 | Primitive | Scope | When to use |
 |---|---|---|
-| [`oo heal.status`, then `oo heal [<branch>] [all]`](oo.md#ooheal) | The whole computer: group `dev`, `developking`, the canonical base with `main/` and `<branch>/` as clean clones, the `sharedConfig`, the launcher, and `~/oosh` + `~/config` of every healed user; then a verify of four invariants | **Not sure what is wrong.** `oo heal.status` reads and changes nothing; `oo heal` brings the machine to the standard dev model. Three forms: `oo heal` (oosh runs here), `ossh heal <host> [<user>\|all] [<branch>]` (a remote host), and `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh \| sh -s -- heal [<branch>] [all]` (oosh missing, old or broken). rc 0 healed and verified, 1 something is left for you, 2 cannot heal |
+| [`oo heal.status`, then `oo heal [<branch>] [all]`](oo.md#ooheal) | The whole computer: group `dev`, `developking`, the canonical base with `main/` and `<branch>/` as clean clones, the `sharedConfig`, the launcher, and `~/oosh` + `~/config` of every healed user; then a verify of four invariants | **Not sure what is wrong.** `oo heal.status` reads and changes nothing; `oo heal` brings the machine to the standard dev model. Three forms: `oo heal` (oosh runs here), `ossh heal <host> [<user>\|all] [<branch>]` (a remote host), and `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh \| sh -s -- heal [<branch>] [all]` (oosh missing, old or broken). rc 0 healed and verified, 1 something is left for you, 2 cannot heal. **Root:** on a host `oo heal` needs a terminal for the one sudo password prompt (asked once, up front) or passwordless sudo; a non-interactive run (no terminal, `OOSH_NO_INSTALL` or `OOSH_HEAL_NONINTERACTIVE` set) uses `sudo -n` only and ends with rc 2 before any change when root is needed and unavailable |
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
 | [`config init.shared`](config.md) | `sharedConfig` dir mode 2775 + group `dev` | After cross-user perm drift, "Permission denied" on shared config writes |
@@ -96,7 +96,7 @@ delete it. Everywhere the move-aside is the kernel's `private.this.entry.aside`
 - `oo deinstall` keeps `~/config`, `~/init`, `~/.once`, `~/.bashrc`, `~/oosh` and an older
   `~/install.oosh` the same way, after it asked for the word `deinstall` (or `--yes`).
 - A broken **canonical** folder (`main/` or `<branch>/` of the base, with a merge in progress, markers, changes,
-  a detached HEAD or a diverged history) is moved by `oo heal` to `<base>.aside/<name>.<ts>`, a sibling of the
+  a detached HEAD or a diverged history) is moved by `oo heal` to `<base>.aside/<name>.orig.<ts>` (`private.this.entry.aside <path> <?ts> <?asideDir>`), a sibling of the
   base, so it is never mistaken for a branch folder. It is reported and left for you to look at, never deleted.
 - `init/deinstall.oosh` is **retired**: it removed `/home/shared`, `~/oosh`, `~/config` and `developking`
   without asking. It refuses now and points at `oo deinstall`. `oo tmp.cleanup.testing` refuses too.
