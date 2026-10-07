@@ -967,31 +967,21 @@ OOSH_HEAL_FOREIGN
 }
 
 
-private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe form once, as the user test: this tree's init/oosh and a bundle of <branch> go to temp files on the platform (private.ossh.heal.push, private.ossh.heal.bundle.push), then cat <init> | env OOSH_REPO=<bundle> sh -s -- heal <branch> through ossh exec.tty, tee into the log of step pipe; the temp files are removed; rc of the heal #
+private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe form once, as the user test: OOSH_HEAL_LOCAL=1 ossh heal.pipe <platform> <branch> (cat <init> | sh -s -- heal <branch> on the platform, this tree's init/oosh and a bundle of <branch> as OOSH_REPO, the temp files removed by ossh), tee into the log of step pipe without the \r of ssh -tt; rc of the heal #
 {
  # ossh heal runs `sh <file> heal …` — the arm from a FILE. The curl form a
  # user types reads the script from STDIN (`curl … | sh -s -- heal`), where
- # stdin IS the script; this runs that form for real, once.
- local platform="$1" branch="$2" log init bundle rc
+ # stdin IS the script; ossh heal.pipe runs that form for real.
+ local platform="$1" branch="$2" log rc
  if [ -z "$platform" ] || [ -z "$branch" ]; then
    create.result 1 "private.os.platform.heal.pipe.run requires <platform> <branch>"
    error.log "$RESULT"
    return $(result)
  fi
- private.this.script.load ossh private.ossh.heal.push || return $(result)
  log=$(private.os.platform.heal.log.get pipe "$platform")
- private.ossh.heal.push "$platform" || return $(result)
- init="$RESULT"
- if ! private.ossh.heal.bundle.push "$platform" "$branch"; then
-   ossh exec "$platform" "rm -f '$init'"
-   return $(result)
- fi
- bundle="$RESULT"
- console.log "pipe form: cat $init | sh -s -- heal $branch as test on $platform"
- ossh exec.tty "$platform" "cat '$init' | env OOSH_REPO='$bundle' sh -s -- heal $branch" 2>&1 | tee "$log"
+ console.log "pipe form: cat <init> | sh -s -- heal $branch as test on $platform"
+ OOSH_HEAL_LOCAL=1 ossh heal.pipe "$platform" "$branch" 2>&1 | tr -d '\r' | tee "$log"
  rc=${PIPESTATUS[0]}
- ossh exec "$platform" "rm -f '$init' '$bundle'" \
-   || warn.log "pipe form: could not remove $init $bundle on $platform"
  create.result "$rc" "pipe form heal on $platform: rc $rc (log: $log)"
  return $rc
 }

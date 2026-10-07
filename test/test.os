@@ -766,36 +766,37 @@ test.case $level "T-OS-HEAL-SECOND-RUN: a second oo heal must end rc 0 and chang
 expect 0 "rc 0 and the same snapshot pass, a same-content rewrite with a WARNING; a change, an addition or rc 1 fail and are named" \
   "the heal is idempotent or it is no heal"
 
-# T-OS-HEAL-PIPE-RUN: the pure pipe form — the init file and the bundle reach the host,
-# cat <init> | sh -s -- heal <branch> runs as test with OOSH_REPO=<bundle>, both are removed.
+# T-OS-HEAL-PIPE-RUN: the pure pipe form through the public ossh heal.pipe with the local
+# bundle (OOSH_HEAL_LOCAL=1 for that call only); its rc comes back, its ssh -tt \r is gone
+# from the log; no private method of ossh is called from os.
 test.os.healPipeRun() {
   local fx; fx=$(test.suite.fixture.make healpipe)
-  local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
-  local bad="" rec rc
+  local HOME="$fx" OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL; unset OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL
+  local bad="" rec rc log
   test.os.stubs.set
-  private.ossh.heal.push() { echo "heal.push $*" >> "$OS_T_REC"; create.result 0 /tmp/oosh-heal-init.AAA; }
-  private.ossh.heal.bundle.push() { echo "bundle.push $*" >> "$OS_T_REC"; create.result 0 /tmp/oosh-heal-bundle.BBB; }
+  OS_T_PIPE_RC=0
+  ossh() { echo "ossh $* local=[${OOSH_HEAL_LOCAL-unset}]" >> "$OS_T_REC"; printf 'healed\r\n'; return "$OS_T_PIPE_RC"; }
+  log=$(private.os.platform.heal.log.get pipe p)
   private.os.platform.heal.pipe.run p dev.heal >/dev/null 2>&1; rc=$?
   [ "$rc" = 0 ] || bad="$bad rc=$rc"
   rec=$(cat "$OS_T_REC")
-  case "$rec" in *"bundle.push p dev.heal"*) ;; *) bad="$bad no-bundle" ;; esac
-  case "$rec" in *"ossh exec.tty p cat '/tmp/oosh-heal-init.AAA' | env OOSH_REPO='/tmp/oosh-heal-bundle.BBB' sh -s -- heal dev.heal"*) ;; *) bad="$bad not-the-pipe-form" ;; esac
-  case "$rec" in *"ossh exec p rm -f '/tmp/oosh-heal-init.AAA' '/tmp/oosh-heal-bundle.BBB'"*) ;; *) bad="$bad not-removed" ;; esac
-  : > "$OS_T_REC"
-  private.ossh.heal.bundle.push() { create.result 1 "no bundle"; return 1; }
-  private.os.platform.heal.pipe.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad bundle-fail-rc"
-  grep -q "exec.tty" "$OS_T_REC" && bad="$bad ran-without-bundle"
-  grep -q "rm -f '/tmp/oosh-heal-init.AAA'" "$OS_T_REC" || bad="$bad init-left-behind"
-  rm -f "$(private.os.platform.heal.log.get pipe p)"
-  unset -f private.ossh.heal.push private.ossh.heal.bundle.push
+  [ "$rec" = "ossh heal.pipe p dev.heal local=[1]" ] || bad="$bad not-the-public-call=[$rec]"
+  [ "$(cat "$log" 2>/dev/null)" = healed ] || bad="$bad log-not-clean"
+  [ -z "${OOSH_HEAL_LOCAL+x}" ] || bad="$bad local-leaked"
+  OS_T_PIPE_RC=1
+  private.os.platform.heal.pipe.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad rc-not-returned"
+  private.os.platform.heal.pipe.run p >/dev/null 2>&1; [ $? = 1 ] || bad="$bad no-branch-accepted"
+  case "$(declare -f private.os.platform.heal.pipe.run)" in *private.ossh.*) bad="$bad private-ossh-call" ;; esac
+  rm -f "$log"
   test.os.stubs.unset
+  unset OS_T_PIPE_RC
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "cat <init> | env OOSH_REPO=<bundle> sh -s -- heal <branch> as test, the temp files removed" || create.result 1 "pipe form:$bad"
+  [ -z "$bad" ] && create.result 0 "OOSH_HEAL_LOCAL=1 ossh heal.pipe <platform> <branch>, its rc returned, its log without \\r" || create.result 1 "pipe form:$bad"
   return $(result)
 }
-test.case $level "T-OS-HEAL-PIPE-RUN: the pure pipe form of the heal runs once as test" test.os.healPipeRun
-expect 0 "cat <init> | env OOSH_REPO=<bundle> sh -s -- heal <branch> as test, the temp files removed" \
-  "ossh heal runs the arm from a file; the curl form reads it from stdin"
+test.case $level "T-OS-HEAL-PIPE-RUN: the pure pipe form of the heal runs once through ossh heal.pipe" test.os.healPipeRun
+expect 0 "OOSH_HEAL_LOCAL=1 ossh heal.pipe <platform> <branch>, its rc returned, its log without \\r" \
+  "the curl form reads the script from stdin; os calls no private method of ossh"
 
 console.log "
 Test: os.platform.heal.test
