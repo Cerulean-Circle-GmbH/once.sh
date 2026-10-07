@@ -512,8 +512,8 @@ private.os.platform.shared.config.repair() # <platform> # reset sharedConfig gro
   ossh exec.tty "$platform" "sudo bash -c '
     shared=\$(readlink -f /root/config 2>/dev/null)
     if [ -n \"\$shared\" ] && [ -d \"\$shared\" ]; then
-      chgrp -R dev \"\$shared\" 2>/dev/null
-      chmod -R g+rw \"\$shared\" 2>/dev/null
+      chgrp -R dev \"\$shared\" 2>/dev/null # recursive-exception: ephemeral platform container, the shared tree it created
+      chmod -R g+rw \"\$shared\" 2>/dev/null # recursive-exception: ephemeral platform container, the shared tree it created
       find \"\$shared\" -type d -exec chmod g+s {} + 2>/dev/null
     fi
   '"
