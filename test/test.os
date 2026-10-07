@@ -560,6 +560,55 @@ test.case $level "T-OS-HEAL-BREAKAGE-APPLY: a breakage runs as root in the conta
 expect 0 "the arm reaches sudo sh -s byte for byte; an unknown breakage never reaches ossh" \
   "the breakage must not depend on the oosh under test"
 
+console.log "
+Test: private.os.platform.ref.branch.ensure / drop
+===================================================================="
+
+# T-OS-REF-BRANCH: a branch on origin is used as it is; a sha travels as platform-test/<sha>,
+# pushed at that commit, and is dropped afterwards; nothing else is ever deleted. A bare
+# repository replaces GitHub (raw git on the fixture side, as test.ogit.fixture).
+test.os.refBranch() {
+  local fx bad="" w rc sha old
+  fx=$(test.suite.fixture.make refbranch); w="$fx/work"
+  local HOME="$fx/home" GIT_CONFIG_GLOBAL="$fx/home/.gitconfig"; mkdir -p "$HOME"; : > "$GIT_CONFIG_GLOBAL"; export HOME GIT_CONFIG_GLOBAL
+  git init -q --bare -b dev "$fx/origin.git"
+  git init -q -b dev "$w"; git -C "$w" remote add origin "$fx/origin.git"
+  printf 'one\n' > "$w/file"; git -C "$w" add file; git -C "$w" -c user.email=t@t -c user.name=t commit -q -m one
+  old=$(git -C "$w" rev-parse --short=7 HEAD)
+  printf 'two\n' >> "$w/file"; git -C "$w" -c user.email=t@t -c user.name=t commit -q -am two
+  git -C "$w" push -q -u origin dev
+  # a branch on origin: itself, nothing pushed
+  private.os.platform.ref.branch.ensure dev "$w" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] && [ "$RESULT" = dev ] || bad="$bad branch=[$rc $RESULT]"
+  [ "$(git -C "$fx/origin.git" for-each-ref --format=x refs/heads | wc -l | tr -d ' ')" = 1 ] || bad="$bad branch-pushed-something"
+  # a sha: platform-test/<sha> on origin at that commit, cached as origin/platform-test/<sha>
+  private.os.platform.ref.branch.ensure "$old" "$w" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] && [ "$RESULT" = "platform-test/$old" ] || bad="$bad sha=[$rc $RESULT]"
+  sha=$(git -C "$fx/origin.git" rev-parse -q --verify "refs/heads/platform-test/$old")
+  [ -n "$sha" ] && [ "$sha" = "$(git -C "$w" rev-parse "$old")" ] || bad="$bad not-at-sha=[$sha]"
+  git -C "$w" rev-parse -q --verify "refs/remotes/origin/platform-test/$old" >/dev/null || bad="$bad not-cached"
+  git -C "$w" rev-parse -q --verify "refs/heads/platform-test/$old" >/dev/null && bad="$bad local-branch-made"
+  # again: the same branch, rc 0
+  private.os.platform.ref.branch.ensure "$old" "$w" >/dev/null 2>&1; [ $? = 0 ] || bad="$bad again-rc"
+  # neither a branch nor a commit; a leading dash
+  private.os.platform.ref.branch.ensure no-such-ref "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-accepted"
+  private.os.platform.ref.branch.ensure deadbeefdeadbeef "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-sha-accepted"
+  private.os.platform.ref.branch.ensure --all "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad dash-accepted"
+  # drop: only platform-test/*; dev stays
+  private.os.platform.ref.branch.drop dev "$w" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] && git -C "$fx/origin.git" rev-parse -q --verify refs/heads/dev >/dev/null || bad="$bad dev-touched=[$rc]"
+  private.os.platform.ref.branch.drop "platform-test/$old" "$w" >/dev/null 2>&1; [ $? = 0 ] || bad="$bad drop-rc=[$RESULT]"
+  git -C "$fx/origin.git" rev-parse -q --verify "refs/heads/platform-test/$old" >/dev/null && bad="$bad not-dropped"
+  private.os.platform.ref.branch.drop "platform-test/$old" "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad drop-missing-not-reported"
+  private.os.platform.ref.branch.drop >/dev/null 2>&1; [ $? = 1 ] || bad="$bad drop-no-branch-accepted"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a branch on origin as it is; a sha as platform-test/<sha> at that commit, dropped afterwards; nothing else deleted" || create.result 1 "ref branch:$bad"
+  return $(result)
+}
+test.case $level "T-OS-REF-BRANCH: a sha travels as the temporary branch platform-test/<sha>" test.os.refBranch
+expect 0 "a branch on origin as it is; a sha as platform-test/<sha> at that commit, dropped afterwards; nothing else deleted" \
+  "the container clones a branch: git clone -b takes no sha"
+
 ### test.method
 
 test.suite.save.results

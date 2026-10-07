@@ -717,6 +717,76 @@ private.os.platform.heal.breakage.apply()     # <platform> <name> <?branch> # ap
 }
 
 
+private.os.platform.ref.branch.ensure()     # <ref> <?dir:$OOSH_DIR> # RESULT = the branch a platform container clones for <ref>: <ref> itself when it is a branch on origin (fetched once on a miss), else, for a commit sha of <dir>, the temporary branch platform-test/<sha>, pushed to origin at that commit (ogit.remote.push); rc 1 when <ref> is neither #
+{
+ # RESULT, not an echo: a log line (LOG_DEVICE may be /dev/stdout) would
+ # end up in a $(...) that captured the name. The container
+ # clones a BRANCH (init/oosh: git clone -b), and ossh install refuses
+ # anything origin does not list (private.ossh.origin.branch.check), so a
+ # sha travels as platform-test/<sha>; private.os.platform.ref.branch.drop
+ # deletes it afterwards.
+ local ref="$1" dir="${2:-$OOSH_DIR}" branch
+ if [ -z "$ref" ] || [ "${ref#-}" != "$ref" ]; then
+   create.result 1 "private.os.platform.ref.branch.ensure requires <ref> (no leading -): [$ref]"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ private.this.script.load ogit ogit.branch.check || return $(result)
+ private.this.script.load ogit ogit.remote.fetch || return $(result)
+ private.this.script.load ogit ogit.remote.push || return $(result)
+ if ogit.branch.check "refs/remotes/origin/$ref" "$dir" \
+    || { ogit.remote.fetch no "$dir" >/dev/null 2>&1 && ogit.branch.check "refs/remotes/origin/$ref" "$dir"; }; then
+   create.result 0 "$ref"
+   return $(result)
+ fi
+ case "$ref" in
+   *[!0-9a-f]*) ;;
+   *)
+     if [ "${#ref}" -ge 7 ] && [ "${#ref}" -le 40 ] && ogit.branch.check "$ref^{commit}" "$dir"; then
+       branch="platform-test/$ref"
+       # ogit.remote.push hands <branch> to git push as the refspec: <sha>:refs/heads/<branch>
+       # makes the remote branch at the commit without a local branch — ogit.branch.reset,
+       # the method that makes one, checks it out, which would move this tree.
+       if ogit.remote.push "$ref:refs/heads/$branch" no "$dir" >/dev/null; then
+         important.log "temporary branch $branch pushed to origin at $ref"
+         create.result 0 "$branch"
+         return $(result)
+       fi
+       create.result 1 "could not push the temporary branch $branch: $RESULT"
+       error.log "$RESULT"
+       return $(result)
+     fi ;;
+ esac
+ create.result 1 "<ref> $ref is no branch on origin (fetched once) and no commit sha of $dir"
+ error.log "$RESULT"
+ return $(result)
+}
+
+
+private.os.platform.ref.branch.drop()     # <branch> <?dir:$OOSH_DIR> # delete the temporary branch <branch> on origin (ogit.remote.branch.delete) when it is a platform-test/* branch; any other branch is left alone with rc 0; rc 1 when origin refuses #
+{
+ local branch="$1" dir="${2:-$OOSH_DIR}"
+ if [ -z "$branch" ]; then
+   create.result 1 "private.os.platform.ref.branch.drop requires <branch>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ case "$branch" in
+   platform-test/?*) ;;
+   *) create.result 0 "$branch is no temporary branch of the platform test — left alone"; return $(result) ;;
+ esac
+ private.this.script.load ogit ogit.remote.branch.delete || return $(result)
+ if ogit.remote.branch.delete "$branch" origin "$dir"; then
+   create.result 0 "temporary branch $branch deleted on origin"
+   important.log "$RESULT"
+ else
+   create.result 1 "temporary branch $branch stays on origin: $RESULT — delete it: ogit remote.branch.delete $branch"
+   error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
