@@ -319,20 +319,22 @@ expect 1 "private.os.platform.branch.gate requires <branch>"
 test.os.branchEra() {
   local fx bad="" old new msg rc; fx=$(test.suite.fixture.make branchera)
   mkdir -p "$fx/repo/init" || return 1
+  private.this.script.load ogit ogit.repo.init || return 1
   private.this.script.load ogit ogit.raw || return 1
-  ogit.raw "$fx/repo" init -q
+  ogit.repo.init "$fx/repo" >/dev/null
   printf '%s\n' '#!/usr/bin/env -iS bash' '# ./oosh mode ssh <host>' > "$fx/repo/init/oosh"
   ogit.index.add all "$fx/repo" >/dev/null && ogit.commit.create old t@t t "$fx/repo" >/dev/null
-  old=$(ogit.raw "$fx/repo" rev-parse HEAD)
+  old=$(ogit.commit.log.show HEAD 1 %H "$fx/repo")
   printf '%s\n' '#!/usr/bin/env bash' "  [ \"\$1\" = \"root\" ] || die \"only 'mode root' is supported (got '\$1')\"" > "$fx/repo/init/oosh"
   ogit.index.add all "$fx/repo" >/dev/null && ogit.commit.create new t@t t "$fx/repo" >/dev/null
-  new=$(ogit.raw "$fx/repo" rev-parse HEAD)
+  new=$(ogit.commit.log.show HEAD 1 %H "$fx/repo")
   private.os.platform.branch.gate "$old" "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
   [ $rc = 1 ] || bad="$bad old-rc=$rc"
   case "$msg" in *"$old"*"b8b90b82"*"mode ssh"*) ;; *) bad="$bad old-msg=[$msg]" ;; esac
   case "$msg" in *eraB*platform.heal.test*) ;; *) bad="$bad old-msg-lacks-eraB" ;; esac
   private.os.platform.branch.gate "$new" "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad new-rc=$rc"
   private.os.platform.branch.gate HEAD "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad head-rc=$rc"
+  # ogit.raw: no ogit method creates a remote-tracking ref in a fixture without a remote
   ogit.raw "$fx/repo" update-ref refs/remotes/origin/feat "$new"
   private.os.platform.branch.gate feat "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad remote-only-branch-rc=$rc"
   private.os.platform.branch.gate no/such-ref "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
@@ -414,8 +416,17 @@ test.case $level "T-OS-PLATFORM-TEST-BRANCH-ENV: OSSH_INSTALL_BRANCH lives for t
 expect 0 "OSSH_INSTALL_BRANCH is <branch> inside both ossh install calls and gone afterwards; empty placeholders keep notests; container.up failing gives rc 1; macos refuses a branch" \
   "os platform.test p \"\" notests used to run the tests: an empty argument was not shifted"
 
-test.case $level "T-OS-GATE-LOG-GET: the gate log path of a user and platform" private.os.platform.gate.log.get root ubuntu_24_04
-expect 0 "*" "one getter for gate.run and platform.test"
+# the getter is silent by contract (consumed as $(...)): the test reads its output
+test.os.gateLogGet() {
+  local got bad=""
+  got=$(private.os.platform.gate.log.get root ubuntu_24_04)
+  [ "$got" = /tmp/oosh-platform-test-root-ubuntu_24_04.log ] || bad="$bad path=[$got]"
+  private.os.platform.gate.log.get root >/dev/null 2>&1 && bad="$bad missing-platform-accepted"
+  [ -z "$bad" ] && create.result 0 "/tmp/oosh-platform-test-root-ubuntu_24_04.log" || create.result 1 "gate.log.get:$bad"
+  return $(result)
+}
+test.case $level "T-OS-GATE-LOG-GET: the gate log path of a user and platform" test.os.gateLogGet
+expect 0 "/tmp/oosh-platform-test-root-ubuntu_24_04.log" "one getter for gate.run and platform.test"
 
 ### test.method
 

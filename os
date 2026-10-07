@@ -279,33 +279,32 @@ private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for
  # "only 'mode root' is supported"; the older refs (b492b2e, 9824746e, 0f63df38, 1604e3e,
  # 596ab0c) use `mode ssh` + rsync and do not contain that text. A ref beginning with
  # a dash is never a ref (it would be read as an option by git).
- private.this.script.load ogit ogit.raw || return 1
+ private.this.script.load ogit ogit.file.show || return 1
  private.this.script.load ogit ogit.branch.check || return 1
  local contract="only 'mode root' is supported" content
  case "$branch" in
    -*) create.result 1 "<branch> $branch is not a branch name or commit sha"
        error.log "$RESULT"
-       return 1 ;;
+       return $(result) ;;
  esac
  # The gate reads the LOCAL repo in <dir>, while the container clones from the
  # remote: a local-only commit sha or branch passes the gate and then fails in the
  # container. A branch name known only as origin/<branch> (what the completion of
  # os platform.test offers) is resolved through ogit.branch.check.
- # ogit.raw is the last resort here: no ogit method shows one file at a ref yet
- # (ogit.commit.show shows a commit); the planned ogit.file.show <ref> <path> <?dir> replaces it.
+ # The old installer is read through ogit.file.show.
  local ref="$branch"
  if ! ogit.branch.check "$branch" "$dir" && ogit.branch.check "origin/$branch" "$dir"; then ref="origin/$branch"; fi
- if ! content=$(ogit.raw "$dir" show "$ref:init/oosh" 2>/dev/null); then
+ if ! content=$(ogit.file.show "$ref" init/oosh "$dir" 2>/dev/null); then
    create.result 1 "ref $branch has no init/oosh in $dir (unknown branch or commit sha?)"
    error.log "$RESULT"
-   return 1
+   return $(result)
  fi
  case "$content" in
-   *"$contract"*) create.result 0 "ref $branch carries the mode root installer contract"; return 0 ;;
+   *"$contract"*) create.result 0 "ref $branch carries the mode root installer contract"; return $(result) ;;
  esac
  create.result 1 "ref $branch is older than commit b8b90b82: its init/oosh uses the mode ssh contract, which the current ossh install cannot drive; such refs are reproduced by the eraB.* breakages of os platform.heal.test"
  error.log "$RESULT"
- return 1
+ return $(result)
 }
 
 
@@ -476,149 +475,149 @@ os.platform.list() # # lists all platforms with tier info
 
 os.platform.test() # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch name or commit sha of this repo, installer contract mode root i.e. b8b90b82 or newer) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
 {
-  local platform="$1"
-  if [ -z "$platform" ]; then
-    error.log "Usage: os platform.test <platform> <?terminal> <?notests> <?branch>"
+ local platform="$1"
+ if [ -z "$platform" ]; then
+  error.log "Usage: os platform.test <platform> <?terminal> <?notests> <?branch>"
+  return 1
+ fi
+ shift
+ # positional: an empty placeholder ("") for <terminal> or <notests> must still
+ # move on to the next parameter, so <branch> can be given without them
+ local terminal="$1"
+ if [ $# -gt 0 ]; then shift; fi
+ local notests="$1"
+ if [ $# -gt 0 ]; then shift; fi
+ local branch="$1"
+ if [ $# -gt 0 ]; then shift; fi
+
+ private.os.platform.parse "$platform" || return 1
+
+ if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+  if [ "$platform" = "macos" ]; then
+   if [ -n "$branch" ]; then
+    create.result 1 "<branch> $branch cannot be installed first on macos: the CI workflow installs its own branch"
+    error.log "$RESULT"
     return 1
+   fi
+   private.os.platform.test.ci "$platform" "$terminal" "$notests"
+   return $?
   fi
-  shift
-  # positional: an empty placeholder ("") for <terminal> or <notests> must still
-  # move on to the next parameter, so <branch> can be given without them
-  local terminal="$1"
-  if [ $# -gt 0 ]; then shift; fi
-  local notests="$1"
-  if [ $# -gt 0 ]; then shift; fi
-  local branch="$1"
-  if [ $# -gt 0 ]; then shift; fi
+  console.log "SKIP: $platform is a native platform (no Docker test)"
+  create.result 1 "SKIP"
+  return 1
+ fi
 
-  private.os.platform.parse "$platform" || return 1
+ # Era gate, before anything starts: the ref must carry the mode root installer contract
+ if [ -n "$branch" ]; then
+  private.os.platform.branch.gate "$branch" || return 1
+ fi
 
-  if [ "$PLATFORM_WORKSPACE" = "native" ]; then
-    if [ "$platform" = "macos" ]; then
-      if [ -n "$branch" ]; then
-        create.result 1 "<branch> $branch cannot be installed first on macos: the CI workflow installs its own branch"
-        error.log "$RESULT"
-        return 1
-      fi
-      private.os.platform.test.ci "$platform" "$terminal" "$notests"
-      return $?
-    fi
-    console.log "SKIP: $platform is a native platform (no Docker test)"
-    create.result 1 "SKIP"
-    return 1
-  fi
+ local imageTag sshPort rc
+ imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
+ sshPort=8022
 
-  # Era gate, before anything starts: the ref must carry the mode root installer contract
-  if [ -n "$branch" ]; then
-    private.os.platform.branch.gate "$branch" || return 1
-  fi
+ # <branch> reaches ossh install (container.up installs test, users.install bash-user)
+ # as OSSH_INSTALL_BRANCH: a prefix assignment lives for that one call only.
+ if [ -n "$branch" ]; then
+  OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
+ else
+  private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
+ fi
 
-  local imageTag sshPort rc
-  imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
-  sshPort=8022
+ # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
+ # Covers every install path we support in one run:
+ #   test      — initial `ossh install <platform> test` (caller-side + user.oosh.install)
+ #   root      — sudo re-exec during the above state-machine install
+ #   oosh-user — `user create oosh-user password oosh-user` from test session
+ #               (oosh-native user creation; user.create calls user.oosh.install internally)
+ #   bash-user — raw `useradd` on remote, then `ossh install <platform> bash-user`
+ #               (caller-initiated install for a pre-existing account)
+ if [ -n "$branch" ]; then
+  OSSH_INSTALL_BRANCH="$branch" private.os.platform.users.install "$platform"
+ else
+  private.os.platform.users.install "$platform"
+ fi
 
-  # <branch> reaches ossh install (container.up installs test, users.install bash-user)
-  # as OSSH_INSTALL_BRANCH: a prefix assignment lives for that one call only.
-  if [ -n "$branch" ]; then
-    OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
-  else
-    private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
-  fi
+ # ─── PHASE B: run test.suite gate 1 (core + platform invariant) on all 4 users ─
+ local rcTest=0 rcRoot=0 rcOoshUser=0 rcBashUser=0
+ local testLog="" rootLog="" ooshUserLog="" bashUserLog=""
 
-  # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
-  # Covers every install path we support in one run:
-  #   test      — initial `ossh install <platform> test` (caller-side + user.oosh.install)
-  #   root      — sudo re-exec during the above state-machine install
-  #   oosh-user — `user create oosh-user password oosh-user` from test session
-  #               (oosh-native user creation; user.create calls user.oosh.install internally)
-  #   bash-user — raw `useradd` on remote, then `ossh install <platform> bash-user`
-  #               (caller-initiated install for a pre-existing account)
-  if [ -n "$branch" ]; then
-    OSSH_INSTALL_BRANCH="$branch" private.os.platform.users.install "$platform"
-  else
-    private.os.platform.users.install "$platform"
-  fi
+ if [ -z "$notests" ]; then
+  private.this.script.load ossh ossh.remote.prelude.get || return 1
 
-  # ─── PHASE B: run test.suite gate 1 (core + platform invariant) on all 4 users ─
-  local rcTest=0 rcRoot=0 rcOoshUser=0 rcBashUser=0
-  local testLog="" rootLog="" ooshUserLog="" bashUserLog=""
+  testLog=$(private.os.platform.gate.log.get test "$platform")
+  private.os.platform.gate.run "$platform" test
+  rcTest=$?
 
-  if [ -z "$notests" ]; then
-    private.this.script.load ossh ossh.remote.prelude.get || return 1
+  rootLog=$(private.os.platform.gate.log.get root "$platform")
+  private.os.platform.gate.run "$platform" root
+  rcRoot=$?
 
-    testLog=$(private.os.platform.gate.log.get test "$platform")
-    private.os.platform.gate.run "$platform" test
-    rcTest=$?
+  # Root's test.suite writes into sharedConfig (via /root/config symlink)
+  # with root:root ownership, blocking the unprivileged users that come
+  # next. Repair group+perms + setgid so oosh-user and bash-user can write.
+  private.os.platform.shared.config.repair "$platform"
 
-    rootLog=$(private.os.platform.gate.log.get root "$platform")
-    private.os.platform.gate.run "$platform" root
-    rcRoot=$?
+  ooshUserLog=$(private.os.platform.gate.log.get oosh-user "$platform")
+  private.os.platform.gate.run "$platform" oosh-user
+  rcOoshUser=$?
 
-    # Root's test.suite writes into sharedConfig (via /root/config symlink)
-    # with root:root ownership, blocking the unprivileged users that come
-    # next. Repair group+perms + setgid so oosh-user and bash-user can write.
-    private.os.platform.shared.config.repair "$platform"
+  bashUserLog=$(private.os.platform.gate.log.get bash-user "$platform")
+  private.os.platform.gate.run "$platform" bash-user
+  rcBashUser=$?
+ else
+  console.log "Skipping tests (notests)"
+ fi
 
-    ooshUserLog=$(private.os.platform.gate.log.get oosh-user "$platform")
-    private.os.platform.gate.run "$platform" oosh-user
-    rcOoshUser=$?
+ # Interactive terminal — drop into bash-user shell (last-user-created convention)
+ if [ -n "$terminal" ]; then
+  console.log "Opening interactive terminal as bash-user on $platform..."
+  console.log "Type 'exit' to end the session and clean up."
+  # Same runuser-vs-sudo portability dance as the test invocations above.
+  ossh exec.tty "$platform" "
+   if command -v runuser >/dev/null 2>&1; then
+    sudo runuser -u bash-user -- bash -l
+   else
+    sudo -H -u bash-user bash -l
+   fi
+  "
+ fi
 
-    bashUserLog=$(private.os.platform.gate.log.get bash-user "$platform")
-    private.os.platform.gate.run "$platform" bash-user
-    rcBashUser=$?
-  else
-    console.log "Skipping tests (notests)"
-  fi
+ # Cleanup
+ ossh connection.close "$platform" 2>/dev/null
+ private.os.platform.cleanup "$sshPort"
 
-  # Interactive terminal — drop into bash-user shell (last-user-created convention)
-  if [ -n "$terminal" ]; then
-    console.log "Opening interactive terminal as bash-user on $platform..."
-    console.log "Type 'exit' to end the session and clean up."
-    # Same runuser-vs-sudo portability dance as the test invocations above.
-    ossh exec.tty "$platform" "
-      if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u bash-user -- bash -l
-      else
-        sudo -H -u bash-user bash -l
-      fi
-    "
-  fi
-
-  # Cleanup
-  ossh connection.close "$platform" 2>/dev/null
-  private.os.platform.cleanup "$sshPort"
-
-  if [ -n "$notests" ]; then
-    printf "PASS: %s (tests=skipped)\n" "$platform"
-    important.log "PASS: $platform (tests=skipped)"
-    create.result 0 "PASS"
-    rc=0
-  elif [ $rcTest -eq 0 ] && [ $rcRoot -eq 0 ] && [ $rcOoshUser -eq 0 ] && [ $rcBashUser -eq 0 ]; then
-    printf "PASS: %s (test=%d root=%d oosh-user=%d bash-user=%d)\n" "$platform" "$rcTest" "$rcRoot" "$rcOoshUser" "$rcBashUser"
-    important.log "PASS: $platform (test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser)"
-    create.result 0 "PASS"
-    rm -f "$testLog" "$rootLog" "$ooshUserLog" "$bashUserLog"
-    rc=0
-  else
-    printf "FAIL: %s (test=%d root=%d oosh-user=%d bash-user=%d)\n" "$platform" "$rcTest" "$rcRoot" "$rcOoshUser" "$rcBashUser"
-    error.log "FAIL: $platform (test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser)"
-    local _u _l
-    for pair in "test:$testLog" "root:$rootLog" "oosh-user:$ooshUserLog" "bash-user:$bashUserLog"; do
-      _u="${pair%%:*}"; _l="${pair#*:}"
-      case "$_u" in
-        test)      [ $rcTest -eq 0 ]     && continue ;;
-        root)      [ $rcRoot -eq 0 ]     && continue ;;
-        oosh-user) [ $rcOoshUser -eq 0 ] && continue ;;
-        bash-user) [ $rcBashUser -eq 0 ] && continue ;;
-      esac
-      error.log "--- $_u test failures (grep FAIL) ---"
-      grep -i "FAIL\|✗" "$_l" 2>/dev/null
-      error.log "--- Full $_u log: $_l ---"
-    done
-    create.result 1 "FAIL"
-    rc=1
-  fi
-  return $rc
+ if [ -n "$notests" ]; then
+  printf "PASS: %s (tests=skipped)\n" "$platform"
+  important.log "PASS: $platform (tests=skipped)"
+  create.result 0 "PASS"
+  rc=0
+ elif [ $rcTest -eq 0 ] && [ $rcRoot -eq 0 ] && [ $rcOoshUser -eq 0 ] && [ $rcBashUser -eq 0 ]; then
+  printf "PASS: %s (test=%d root=%d oosh-user=%d bash-user=%d)\n" "$platform" "$rcTest" "$rcRoot" "$rcOoshUser" "$rcBashUser"
+  important.log "PASS: $platform (test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser)"
+  create.result 0 "PASS"
+  rm -f "$testLog" "$rootLog" "$ooshUserLog" "$bashUserLog"
+  rc=0
+ else
+  printf "FAIL: %s (test=%d root=%d oosh-user=%d bash-user=%d)\n" "$platform" "$rcTest" "$rcRoot" "$rcOoshUser" "$rcBashUser"
+  error.log "FAIL: $platform (test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser)"
+  local _u _l
+  for pair in "test:$testLog" "root:$rootLog" "oosh-user:$ooshUserLog" "bash-user:$bashUserLog"; do
+   _u="${pair%%:*}"; _l="${pair#*:}"
+   case "$_u" in
+    test)      [ $rcTest -eq 0 ]     && continue ;;
+    root)      [ $rcRoot -eq 0 ]     && continue ;;
+    oosh-user) [ $rcOoshUser -eq 0 ] && continue ;;
+    bash-user) [ $rcBashUser -eq 0 ] && continue ;;
+   esac
+   error.log "--- $_u test failures (grep FAIL) ---"
+   grep -i "FAIL\|✗" "$_l" 2>/dev/null
+   error.log "--- Full $_u log: $_l ---"
+  done
+  create.result 1 "FAIL"
+  rc=1
+ fi
+ return $rc
 }
 os.platform.test.completion.platform() {
   private.os.platform.names
