@@ -70,16 +70,16 @@ branch, `oo mode` finding nothing) is healed with one command. Like the installe
 
 The heal clones `<branch>` fresh into a temporary folder and runs *that* tree's `oo heal` — it never touches
 your `~/oosh`, so it works when `~/oosh` is the broken part. `<branch>` defaults to the branch of the URL
-(the `prod` one-liner heals to `prod`); `all` heals every user and needs root: from a terminal it asks `sudo` for the password once, up front; without a terminal (or with `OOSH_HEAL_NONINTERACTIVE` set) it uses `sudo -n` only and stops with `2` before any change when root is not available. It builds
+(the `prod` one-liner heals to `prod`); `all` heals every user and needs root: `heal all` always needs root: from a terminal it asks `sudo` for the password once, up front; without a terminal it needs root or passwordless sudo and stops with `2` before anything is cloned. A plain `heal` asks for sudo only when a step needs root (a user whose machine is already set up is never asked), and with `OOSH_HEAL_NONINTERACTIVE` set it uses `sudo -n` only and stops with `2` before any change when root is not available. It builds
 the standard dev model — group `dev`, `developking`, the shared base with `main/` and `<branch>/` as clean
 clones, the shared config, and `~/oosh` + `~/config` of each user — and prints what it found, what it changed
 and what is left for you. Nothing is deleted: a broken folder is moved to `<base>.aside/<name>.orig.<ts>`, a real
 `~/config` is kept as `config.orig.<ts>` (a few values are imported), and a folder it does not own is only reported.
 It ends with a check of four invariants and exits `0` (healed and verified), `1` (something is left for you) or
-`2` (it cannot heal). Afterwards open a new terminal and `oo mode <branch>`.
+`2` (it cannot heal); legacy `ssh.*` folders or a login shell other than bash (macOS zsh) are reported as `left` with rc `1` but do not stop the install state reaching 99. Afterwards open a new terminal, type `bash`, then `oo mode <branch>`.
 
 On a machine where oosh runs, the same thing is `oo heal [<branch>] [all]` (read-only first look: `oo heal.status`);
-for a remote host `ossh heal <host> [<user>|all] [<branch>]`. See [docs/oo.md](docs/oo.md#ooheal) and
+for a remote host `ossh heal <host> [<user>|all] [<branch>]` (`ossh heal.pipe <host> [<branch>]` runs the pure pipe form there as the login user). See [docs/oo.md](docs/oo.md#ooheal) and
 [docs/repair-toolkit.md](docs/repair-toolkit.md).
 
 ### More detailed logging for debugging is available with these commands

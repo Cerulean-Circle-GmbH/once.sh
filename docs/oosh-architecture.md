@@ -403,10 +403,11 @@ answer by rc):
 | `private.this.script.load <script> <probeFn>` | source `$OOSH_DIR/<script>` into this shell once, unless `<probeFn>` is already a function; `this` is saved and restored around the source; rc 0 when `<probeFn>` is a function afterwards |
 | `private.this.folder.entries.copy <from> <to>` | copy every entry of `<from>` (dotfiles included) into `<to>`, keeping relative paths — never `<from>/.` itself, whose mode and owner would land on `<to>`; rc 1 names the entries that failed |
 | `private.this.folder.share <dir>` | share `<dir>` with group dev: `private.ensure.sharedTree` (chgrp dev, g+w) plus setgid on every directory so new files inherit the group; rc 0 without a dev group; never chown |
-| `private.this.symlink.with.backup <linkPath> <target> <?ts>` | ensure `<linkPath>` is a symlink to `<target>`; a pre-existing real entry is kept as `<linkPath>.orig.<ts>` and never nested: a taken `<ts>` is bumped with `-<n>` (`private.this.orig.stamp.free.get`), no `<ts>` takes a clock stamp (`private.this.orig.stamp.get`); a stale symlink is relinked and the old target logged (`info.log`); idempotent; fails loud on every step |
+| `private.this.symlink.with.backup <linkPath> <target> <?ts>` | ensure `<linkPath>` is a symlink to `<target>`; a pre-existing real entry is kept as `<linkPath>.orig.<ts>` and never nested: a taken `<ts>` is bumped with `-<n>` (`private.this.orig.stamp.free.get`), no `<ts>` takes a clock stamp (`private.this.orig.stamp.get`); a stale symlink is relinked and the old target logged (`info.log`); idempotent; fails loud on every step; sets `RESULT` on success: `unchanged`, or `linked <link> → <target>` |
+| `private.this.entry.aside <path> <?ts> <?asideDir>` | the one move-aside: a real file or directory is renamed whole to `<asideDir>/<name>.orig.<ts>` (`<asideDir>` defaults to the entry's own parent and must exist; the stamp is probed there and bumped when taken), a symlink is removed and its target left, nothing is ever deleted or nested; `RESULT` = the new path, `removed link` or `nothing`; rc 1 when it cannot. `symlink.with.backup`, `oo deinstall` and the heal (which keeps a broken branch folder in `<base>.aside`) all use it |
 | `private.this.orig.stamp.get <dir> <names...>` | echo a `YYYYmmdd-HHMMSS` stamp for which `<dir>/<name>.orig.<stamp>` is free for every name, bumped with `-<n>` when taken; silent getter, rc 1 on missing arguments — the one stamp behind every "keep it as `<name>.orig.<ts>`" |
 | `private.this.orig.stamp.free.get <dir> <base> <names...>` | echo `<base>`, bumped with `-<n>` until `<dir>/<name>.orig.<stamp>` is free for every name (a dangling symlink counts as taken); silent getter — the one bump loop both the stamp getter and `symlink.with.backup` end in |
-| `private.this.dir.ensure <dir> <?group> <?mode> <?owner>` | create only the missing path segments of `<dir>`, from the first existing ancestor down, and give only those segments the owner, then the group, then the mode; a directory that existed is never touched, so no recursion is needed; `$SUDO` only where the parent is not writable or the owner is another user; refuses a `.` or `..` segment; RESULT = the created segments, or `exists`; rc 1 when it cannot create |
+| `private.this.dir.ensure <dir> <?group> <?mode> <?owner>` | create only the missing path segments of `<dir>`, from the first existing ancestor down, and give only those segments the owner, then the group, then the mode; a directory that existed is never touched, so no recursion is needed; `$SUDO` only where the parent is not writable or the owner is another user, and also for the group when the caller is not in it (a user just added to `dev` is not before the next login); refuses a `.` or `..` segment; RESULT = the created segments, or `exists`; rc 1 when it cannot create |
 | `private.this.tree.tracked.check <treeRoot> <?caller:sweep>` | rc 0 when git lists tracked files under `<treeRoot>`; else an `INVALID:` verdict on stdout and rc 2 — the one guard of the four tree validators, so a sweep that reads nothing (no repository, nothing tracked, "dubious ownership") never reports OK |
 | `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate`, `test.suite.portability.validate` and `this.recursive.validate`, which keep their own rules and summaries |
 
@@ -415,6 +416,17 @@ answer by rc):
 not rewritten; rc 1 when it cannot be written) and `private.config.env.line.append <file> <line>`
 (append the line unless it is already there, in place; rc 1 when it cannot be written) — see
 [config.md § Internal Functions](config.md#internal-functions).
+
+**Repair helpers of `user`.** The heal and the installer reach the home of a user through these (each in `user`,
+each with a test; the callers hop as the target user with `private.as.user`):
+
+| Method | What it does |
+|---|---|
+| `private.user.home.ensure <username> <?home>` | creates a missing home for a passwd entry (once_dev has `developking` without a home): owner and primary group of the user, the home mode of the platform, through `private.this.dir.ensure`; missing parents get no owner and 0755; `RESULT` `created: …` or `exists: …` |
+| `private.user.home.mode.get.linux <?loginDefs>` | the mode `useradd` gives a new home: `HOME_MODE` of `login.defs`, else `0777` minus its `UMASK` (only an octal `UMASK` is used), else `0755` (BusyBox); silent getter |
+| `private.user.home.mode.get.darwin` | `0755`; silent getter (`os.check private.user.home.mode.get` picks the platform's one) |
+| `private.user.oosh.install.links <targetHome> <sharedConfig> <sharedOosh>` | links `~/config` and `~/oosh` to the shared trees through `private.this.symlink.with.backup`, one stamp for both; a real entry is kept as `.orig.<ts>` |
+| `private.user.bashrc.old.template.is <bashrc> <?ooshDir>` | rc 0 when the file equals a committed revision of `templates/user/bashrcTemplate` within the last 200 commits of `<ooshDir>` (read through `ogit.commit.log.show` and `ogit.file.show`): an earlier oosh template is no hand edit, so `private.user.bashrc.install` keeps no `.bashrc.orig.<ts>` of it. A tree that is no repository, or a template older than the bound, counts as a hand edit — a copy is made, nothing is lost |
 
 ### Tree validators and their exception markers
 
@@ -439,9 +451,10 @@ same line even inside a heredoc or a `bash -c` string; a call through a variable
 (`CHMOD=chmod; $CHMOD -R`) is not caught; the command word is not tied to command
 position, so the word `chmod` in an argument followed by an R flag matches too.
 
-Run the `this` validators **sourced**: `source ~/oosh/this; this.recursive.validate`
-(likewise `this.anchor.validate all`). The bare `this <method>` command prints
-nothing for them — a known limitation.
+Run the `this` validators **sourced, in a fresh shell**:
+`bash -c 'source ~/oosh/this; this.recursive.validate'` (likewise `this.anchor.validate all`). A shell that sourced an
+older `this` at start-up lacks the newer functions, and the bare `this <method>` command prints nothing for
+them — a known limitation.
 
 ### Method Dispatch Chain
 

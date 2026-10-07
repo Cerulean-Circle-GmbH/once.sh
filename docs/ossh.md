@@ -206,7 +206,7 @@ tree's bootstrap would drive the old tree) — read with `ogit file.show`, `orig
 (`private.ossh.install.installer.get`, `private.ossh.install.branch.get`). The remote installer clones a
 branch (`git clone -b`), so a value that is not a branch on origin — a commit sha, a local-only branch — is refused before any connection (rc 1),
 after **one fetch** (`private.ossh.origin.branch.check`; if the branch was pushed since, run
-`ogit remote.fetch`). A commit sha cannot be installed as it is: `os platform.heal.test` pushes it as the temporary branch `platform-test/<sha>` first. Unset, the install uses this tree's `init/oosh` and branch, as before.
+`ogit remote.fetch`). A commit sha cannot be installed as it is: `os platform.heal.test` pushes it as the temporary branch `platform-test-<sha>` first. Unset, the install uses this tree's `init/oosh` and branch, as before.
 
 ### Prereqs (`ossh prereqs.install`)
 
@@ -280,6 +280,24 @@ the bundle is the **committed** branch, but the `init/oosh` pushed beside it is 
 Without the variable, a branch that is not on origin gets a warning after **one fetch** (the clone on the host
 may fail).
 
+**`ossh heal.pipe`** is the same flow for the pure pipe form, exactly as a user types it:
+
+```bash
+ossh heal.pipe <sshConfigHost> <?branch>
+```
+
+This tree's `init/oosh` goes to a temp file on the host and the remote command is
+`cat '<initFile>' | sh -s -- heal <branch>` (`private.ossh.heal.pipe.command.get`) — as the **login user**, with no
+sudo and no `<user>` argument. With `OOSH_HEAL_LOCAL=1` the bundle is the `OOSH_REPO` of that `sh`
+(`env OOSH_REPO='<bundle>' sh -s -- heal <branch>`). Both temp files are removed afterwards. The run is `ssh -tt`
+here too, so a caller that captures the output must `tr -d '\r'`. `os platform.heal.test … pipe` calls it
+(`private.os.platform.heal.pipe.run`) instead of a private method of `ossh`.
+
+**One flow.** `ossh heal` and `ossh heal.pipe` are both `private.ossh.heal.run <form:arm|pipe> <host> <user> <branch>`:
+it checks host, user and branch, pushes `init/oosh` (and with `OOSH_HEAL_LOCAL=1` the bundle), runs the arm or the
+pipe form and removes the temp files. Anything that could not be pushed answers rc 2 — in the return code and in
+`RESULT` alike (the message of the failed push).
+
 **Return code.** The remote `rc` unchanged: `0` healed and verified, `1` something is left for you, `2` cannot
 heal (these are [`oo heal`'s](oo.md#ooheal)); `ssh` itself answers `255` when the connection fails. `ossh heal`
 also returns `2` when nothing could be sent (no connection, a temp file or bundle that could not be written,
@@ -350,6 +368,9 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh config.shared.link` | Link user to shared config |
 | `ossh install` | Install oosh on remote host |
 | `ossh heal` | Heal oosh on a remote host: `<sshConfigHost> <?user:all> <?branch>`; rc is the remote `oo heal`'s |
+| `ossh heal.pipe` | The pure pipe form on a remote host: `<sshConfigHost> <?branch>`; as the login user, no sudo; rc is the remote `oo heal`'s |
+| `private.ossh.heal.run` | `<form:arm\|pipe> <host> <user> <branch>` — the one flow of `ossh heal` and `ossh heal.pipe`; rc 2 when nothing could be sent |
+| `private.ossh.heal.pipe.command.get` | `<initFile> <branch> <?bundle>` — the remote command of the pure pipe form; silent getter |
 | `private.ossh.heal.push` | `<host>` — writes this tree's `init/oosh` to a fresh `/tmp/oosh-heal-init.XXXXXX` on the host; `RESULT` = the remote path |
 | `private.ossh.heal.bundle.push` | `<host> <branch>` — writes a bundle of `main` and the local branch to `/tmp/oosh-heal-bundle.XXXXXX` (`OOSH_HEAL_LOCAL=1`) |
 | `private.ossh.heal.command.get` | `<initFile> <branch> <user> <?bundle>` — the remote command that runs the heal arm; silent getter |

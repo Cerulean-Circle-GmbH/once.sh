@@ -323,6 +323,10 @@ shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
 preserved, never deleted). Installs `templates/user/bashrcTemplate` if the
 OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
 backup). Adds `<user>` to group `dev` if not already a member.
+It loads `ogit` for the branch-folder check and **fails loudly** when it cannot (rc 1, `RESULT` names
+`$OOSH_DIR/ogit`). The shared config path is `private.config.shared.config.get`, so a case-different
+spelling of the same folder never reads as a wrong link. The symlink hop passes no stamp: the kernel's
+`private.this.symlink.with.backup` stamps a free `.orig.<ts>` itself (no `date` in `config`).
 The symlink hop runs AS `<user>` and loads the shared tree's `this` through
 `private.this.as.user.preamble.get`, like the later hops. It used to source the
 caller's `$OOSH_DIR`, which the caller expands: root's 0700 `/root/oosh` or a
@@ -715,11 +719,12 @@ These functions are used internally and generally not called directly:
 | `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
 | `private.config.env.lines.drop` | `<file> <prefix…>` → drops every line starting with a prefix, in place (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
 | `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written |
-| `private.config.env.line.set` | `<file> <name> <line>` → sets the definition of `<name>` in an env file to `<line>`, in place: every `export NAME=` and `export declare NAME=` line leaves, `<line>` goes in before the trailing chain block (the `.` and `source` lines at the end), one read and one write (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
+| `private.config.env.line.set` | `<file> <name> <line>` → sets the definition of `<name>` in an env file to `<line>`, in place: every `export NAME=`, `export declare NAME=` and `declare -x NAME=` line leaves (the shapes `private.config.env.value.read` reads), `<line>` goes in before the trailing chain block (the `.` and `source` lines at the end), one read and one write (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written or `<name>` is no variable name (digits first, or anything but letters, digits and `_`) |
 | `private.config.env.value.read` | `<file> <name>` → the value of the last `export NAME=` or `declare -x NAME=` line, read as data and never sourced, one pair of enclosing quotes taken off; rc 1 when there is no such line; silent |
 | `private.config.env.names.read` | `<file>` → the name of every variable an `export NAME=` or `declare -x NAME=` line assigns, once each, in order, read as data and never sourced; silent |
 | `private.config.host.name.valid` | `<name>` → rc 0 when `<name>` can be the computer name: letters, digits, `-` and `_`, starting with a letter or digit, no dot, at most 63 characters |
 | `private.config.shared.oosh.base.get` | the components base the branch folders sit in — the parent of developking's home + `/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh`, in the file system's letter case; the one base of `config init.user`'s `<sharedOosh>` check and of its completion; nothing and rc 1 when developking has no home; silent |
+| `private.config.shared.config.get` | the shared config directory — the parent of developking's home + `/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig`, in the file system's letter case, the sibling of `private.config.shared.oosh.base.get`; the one sharedConfig of `config init.shared`, `config init.user` and the heal (`private.oo.heal.path.get`); nothing and rc 1 when developking has no home; silent. A literal lowercase `shared` linked `~/config` as `/Users/shared/…` on macOS (`/Users/Shared`), so every run found the link wrong and relinked it |
 | `private.config.orig.import` | `<origDir> <sharedConfig>` → carries an allow-listed few values from a kept-aside `~/config` into the shared config (see below) |
 
 **`private.config.orig.import`** is what `oo heal` calls (`private.oo.heal.env`) for each real `~/config` that
@@ -738,7 +743,7 @@ nothing in `<origDir>` is written. The last assignment of a name wins across the
 - **Only into empty values.** A value the shared config already has is kept (a missing line counts as
   empty). The line is rendered by `private.this.env.export.line.get` and written by
   `private.config.env.line.set`, so the chain block stays last.
-- **RESULT:** `imported: <names or none> | skipped: <count>`. rc 1 for a missing argument; rc 2 and
+- **RESULT:** `imported: <names or none> | skipped: <count>`. rc 1 for a missing argument (the error is logged, not only returned); rc 2 and
   `cannot write <file> …` when a write failed — the convention of the migrates.
 
 `config` also leans on the kernel's helpers (full list:
@@ -767,7 +772,7 @@ dev-group user who is not the owner would become the shared file's owner.
 The getters of the table above (`private.config.variables.list`, `private.config.variable.export.line`,
 `private.config.variables.export`, `private.config.string.upper`, `private.config.required.variables.get`,
 `private.config.env.value.read`, `private.config.env.names.read`, `private.config.shared.oosh.base.get`,
-`private.config.host.name.get`) are consumed as `$(…)`, so none calls `create.result` — it runs
+`private.config.shared.config.get`, `private.config.host.name.get`) are consumed as `$(…)`, so none calls `create.result` — it runs
 in a subshell and the result could never reach the caller. The first three (the generators of an env file's
 body) are additionally **silent by contract**: their only caller runs inside
 `{ … } >$CONFIG`, and `log:35` sets `LOG_DEVICE=/proc/self/fd/1`, so inside that

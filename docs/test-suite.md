@@ -313,6 +313,26 @@ return zero — it returns **1 where the answer is 2**. A wrong count, silently,
 reports the code under test as broken. The full probe table is in
 [the research doc](research/2026-09-17-shared-tier-leak-macos.md).
 
+## The `this` tree validators
+
+Beside `test.suite portability.validate`, `this` carries the sweeps that every package runs before it reports
+done: `this path.validate`, `this anchor.validate all`, `ogit caller.validate` and `this recursive.validate`
+(all through `private.this.marker.sweep`, see [oosh-architecture.md § Tree validators](oosh-architecture.md#tree-validators-and-their-exception-markers)).
+
+`this recursive.validate [<treeRoot>]` finds every recursive `chown`, `chgrp` or `chmod` in the tracked tree and
+wants the reason on the **same line**: `# recursive-exception: <why>`. A marker in the lines above or a file-wide
+one does not count. It echoes an `OK:` or `INVALID:` verdict, rc 1 on a violation and rc 2 when the sweep read
+nothing.
+
+Run the `this` validators **in a fresh shell**, so they come from the tree under test and not from a `this` the
+pane sourced at start-up:
+
+```bash
+bash -c 'source ./this; this.recursive.validate; this.anchor.validate all'
+```
+
+The bare `this <method>` command prints nothing for them.
+
 ## Best Practices
 - Use `test.case` for each logical test scenario.
 - Use `expect` to assert both return values and output.

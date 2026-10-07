@@ -427,6 +427,9 @@ Pulls the latest changes from GitHub through a gate, then heals.
 oo update
 ```
 
+Its signature line is `oo.update() # # updates oosh environment: pulls the latest changes through a gate (fetch + fast-forward), then heals; rc 1 when the pull was refused, RESULT names the one command to run #` —
+no parameters, the empty parameter field kept and the trailing ` #` that `this.help` and `c2` read.
+
 **The pull gate.** `oo update` used to run a plain `git pull`, which on a tree that
 had diverged from origin *merged* origin into it. It is now a **fetch and a
 fast-forward**, never a merge, and it runs only when nothing is in the way
@@ -523,10 +526,22 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
   `PATH`, `HOME`, `LOG_DEVICE`, `OOSH_DIR`, `OOSH_MODE` and `CONFIG_CHAIN_*` are never carried
   (`private.config.orig.import`, [config.md](config.md)). Old formats in a real `~/config` (a `PATH` or
   `HOME` export, `LOG_DEVICE=/dev/stdout`, `CONFIG_CHAIN_*`) are reported, never carried over.
-- **Legacy `ssh.*` backup folders** in the home are reported (`[left]`) with the command that deals with
-  them: `user ssh.backup.migrate`.
-- **State 99 on green.** After a green verify the install state machine `SETUP_SERVER` is set to 99
-  (created first when missing), so `ossh install` skips the computer and `oo state` agrees.
+- **Info notes.** Two findings are reports, not repairs, and each ends the heal with rc 1 so you see them
+  (`private.oo.heal.note … info`): the **legacy `ssh.*` backup folders** in the home (`user ssh.backup.migrate`
+  deals with them) and a **login shell that is not bash** — `private.oo.heal.login.shell.check <user>` reads
+  the shell from the user database and never changes it:
+  `[left] <user> login shell /bin/zsh — oo lives in bash: type bash first, or chsh -s <bash>` (on macOS the
+  Homebrew bash is named when it is there). The Mac procedure: open a new terminal, type `bash`, then
+  `oo mode dev`. `oo heal.status` shows the shell line too.
+- **A re-login is a note at rc 0.** A user the heal put into group `dev` needs one new login for the group to
+  take effect; the summary says `<user> is in group dev now — log out and in once (group dev)` as a healed line.
+  Root gets no such note.
+- **State 99 on green.** When every step and the verify are green — whatever the info notes say — the install
+  state machine `SETUP_SERVER` is set to 99 (created first when missing) **in the sharedConfig**
+  (`private.oo.heal.state.finish <configPath>`, read back with `state.of`; the heal's own `CONFIG_PATH` is a
+  scratch folder), so `ossh install` skips the computer and `oo state` agrees. The rc stays 1 while an info note
+  stands: 99 says the install is done, rc 1 says something is left for you. When 99 cannot be written the
+  summary says so and the rc is 1.
 - **Never automatic.** The heal runs only when invoked — never at shell start (the May-8 rule).
 - **`oo mode` is not called.** The heal leaves `~/oosh` on `<base>/<branch>` and writes `OOSH_MODE=<branch>` into the
   user's session files and `~/.config/oosh/mode-env.bash` (`private.oo.mode.env.write`, the file `oo mode`
@@ -544,17 +559,20 @@ folders run, then `config validate required`) → `verify` → `summary` (one li
 when they exist, and on a `sharedConfig` the heal just made they exist only after `init.env`
 (T-OO-HEAL-USER-REAL-CONFIG).
 
-**The privilege rule** (`private.oo.heal.privilege.ensure`, decided **once** before anything changes;
-`private.oo.heal.root.need` names what needs root: `group-dev`, `developking`, `developking-home`, `base`,
-`launcher`, `drop-in`, `worktrees`):
+**The privilege rule.** `private.oo.heal.root.need <base> <branch>` is computed **first** and names what needs
+root: `group-dev`, `developking`, `developking-home`, `base`, `launcher`, `drop-in`, `worktrees`. Then
+`private.oo.heal.privilege.ensure <need>` decides **once**, before anything changes:
 
+- **Nothing needs root** (the need is empty — a user healing their own canonical account): sudo is **not asked
+  at all**, no prompt, no password typed for nothing (`OOSH_HEAL_ROOT=no`). Root itself is always `yes`.
 - **Interactive** — stdin is a terminal and neither `OOSH_NO_INSTALL` nor `OOSH_HEAL_NONINTERACTIVE` is set:
-  the heal may ask for the sudo password **once**, up front (`sudo -v`) and then runs on the cached credential.
+  when root is needed the heal may ask for the sudo password **once**, up front (`sudo -v`) and then runs on the
+  cached credential.
 - **Otherwise** (CI, `os platform.test`, a script, a pipe) only `sudo -n` is used, for `$SUDO` and for `sudo`
   itself in that process, so nothing can stop at a password prompt. When root is needed and unavailable the
   heal ends with **rc 2 before any change**: `needs root (<what>) — run: sudo -H oo heal <branch>`.
-- A user who needs no root part heals their own account without sudo. So on a host `oo heal` needs either a
-  terminal for the one sudo prompt or passwordless sudo.
+- A user who needs no root part heals their own account without sudo. So the one prompt exists only when a step
+  needs root, and then `oo heal` needs either a terminal for it or passwordless sudo.
 
 **The clean re-exec, from a copy.** Every form ends in **one clean process** (`private.oo.heal.env.clean`):
 `oo heal` copies its own tree to a world-readable `/tmp/oosh-heal.*/t` (the layout of the curl form) and runs
@@ -566,24 +584,31 @@ sets `OOSH_HEAL_CLEAN=1`, `OOSH_DIR=<the copy>` and `PATH` to the copy plus the 
 `SUDO_USER` is **dropped on purpose** (the user hop trusts the folders itself); the login that invoked sudo
 goes in as `OOSH_HEAL_LOGIN`, used by `all` only. `CONFIG` is set to a file that **does not exist** (`<tree>/.heal.noconfig`), so the cold
 start of `this` never sources an old `~/config/user.env` — the Mac's old one exported `PATH` with `.`,
-`HOME` and `LOG_DEVICE=/dev/stdout`. The bash that runs the heal is the bash the process was started with
+`HOME` and `LOG_DEVICE=/dev/stdout`. `CONFIG_PATH` is a **scratch folder in the copy** (`<tree>/.heal.config`):
+loading `config` runs `config.init` (it makes `$CONFIG_PATH` and touches `error.txt` in it), which on `~/config`
+made the heal a `~/config` of its own that the user step then kept aside as a fake `config.orig` — and wrote
+into a real one before it was kept aside. Every step names the folders it writes (the sharedConfig, the homes),
+never the process's `CONFIG_PATH`. A copy under `$TMPDIR` is recognised as the heal's own tree too. The bash that runs the heal is the bash the process was started with
 (`$BASH`), not the system's 3.2 on macOS.
 
-**Return codes.** `0` healed and every invariant PASS; `1` something is left for you (the lines marked
-`left`, or a FAIL from verify); `2` cannot heal (the line marked `cannot` — no root, no source for the clones,
+**Return codes.** `0` healed and every invariant PASS or NOT CHECKED; `1` something is left for you (the lines
+marked `left` — a folder moved aside, the info notes above — or a FAIL from verify); `2` cannot heal (the line marked `cannot` — no root, no source for the clones,
 a folder in the way).
 
 **The summary lines.** One line per step. The ones to know: `users: healed: <names>`;
-`<user> is in group dev now — log out and in once (group dev)` (rc 1, the group takes effect after the next
-login; `verify` marks an invariant that fails only for that reason NOT CHECKED, never FAIL);
+`<user> is in group dev now — log out and in once (group dev)` (a note at rc 0, none for root; the group takes
+effect after the next login, and `verify` marks an invariant that fails only for that reason NOT CHECKED, never
+FAIL);
 `developking created (admin, password = developking — state 31 precedent)` when the heal had to create
-`developking`; and the legacy `ssh.*` backup folders as `[left]` with `user ssh.backup.migrate`. Path or
+`developking`; the legacy `ssh.*` backup folders as `[left]` with `user ssh.backup.migrate`; and a login shell other than bash
+as `[left]` with the way into bash (both info notes, see above). Path or
 bundle origins of a healed folder are re-pointed to the canonical URL; the source of the clones is
 `$OOSH_REPO` (a URL, a path or a bundle) else the canonical URL.
 
 **Verify** runs the four platform invariants as the healed user, in a fresh process, from their `~/oosh`:
 `configLayout`, `layout`, `boot` and `oosh` (`./test.suite run platform.shared.<name>.invariant 1`). One line
-each: `PASS`, `FAIL <invariant> <user>: <its recovery>` (rc 1) or `NOT CHECKED <invariant> <user>: <why>`,
+each: `PASS`, `FAIL <invariant> <user>: <its recovery>` (rc 1; the recovery is quoted without the colour escapes of the
+loggers — `private.oo.heal.text.plain`, the one strip, also used for `config validate required`) or `NOT CHECKED <invariant> <user>: <why>`,
 which does not fail the heal. It says NOT CHECKED when the invariant file is not in the branch, and when
 another user's invariants would have to run without being root.
 
@@ -1049,13 +1074,13 @@ Internal functions (not for direct use):
 | `private.oo.method.end.get <file> <startLine>` | The line that closes the definition starting at `<startLine>`; empty when another definition or the marker comes first — `oo method.delete` refuses then |
 | `private.oo.path.sudo.get <path> <?mode>` | The one privilege rule: nothing when this user may write `<path>` (its nearest existing parent while it is not there) or is root (`$SUDO` empty); else `$SUDO`, or `sudo -n ` in mode `quiet`, which never asks for a password. `oo update`'s drop-in cleanup and launcher install use quiet (T-OO-PATH-SUDO-GET, T-OO-PRIVILEGE-QUIET) |
 | `private.oo.pm.install.prefix.get <?pmCmd>` | What goes in front of the package-manager command: the sudo decision — none for brew (Homebrew refuses root; root under sudo hops back to `$SUDO_USER`), none for root (`$SUDO` empty), else `$SUDO` — and the non-interactive env of `private.oo.pm.env.get`. `oo.cmd` and `oo.prereqs.install` both use it (T-OO-PM-INSTALL-PREFIX-GET) |
-| `private.oo.heal.env.clean <?branch> <?who> <?tree>` | Runs `oo heal` again in one clean process from a world-readable copy of `<tree>` under `/tmp/oosh-heal.*` (`env -i`, the carried list above, `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_LOGIN`, `CONFIG` naming a file that is not there); the copy goes afterwards; plain bash, called before `this` is loaded |
+| `private.oo.heal.env.clean <?branch> <?who> <?tree>` | Runs `oo heal` again in one clean process from a world-readable copy of `<tree>` under `/tmp/oosh-heal.*` (`env -i`, the carried list above, `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_LOGIN`, `CONFIG` naming a file that is not there, `CONFIG_PATH` a scratch folder `<copy>/.heal.config`); the copy goes afterwards; plain bash, called before `this` is loaded |
 | `private.oo.heal.path.system.get` | The system `PATH` of a clean process (`/usr/local`, `/usr`, `/` `bin` and `sbin`; Homebrew's `/opt/homebrew` on macOS); silent getter |
 | `private.oo.heal.branch.get` | The branch `oo heal` heals to by default: the branch of the tree running it, else `$OOSH_BRANCH`, else `dev`; silent getter |
 | `private.oo.heal.basehome.get` | The folder the homes live in: the parent of `developking`'s home, else `/Users` (macOS) or `/home`; silent getter |
-| `private.oo.heal.path.get <basehome> <which>` | `base` (the components base) or `sharedConfig` under `<basehome>`; silent getter |
+| `private.oo.heal.path.get <basehome> <which>` | `base` (the components base, `private.config.shared.oosh.base.get`) or `sharedConfig` (`private.config.shared.config.get`) under `<basehome>`, in the file system's letter case; before developking exists the fallback is `<basehome>/shared` through `private.this.path.case.get`; silent getter |
 | `private.oo.heal.root.check` | Predicate: this process may act as root — decided once by `private.oo.heal.privilege.ensure` |
-| `private.oo.heal.privilege.ensure` | Decides once, before anything changes, whether the heal may act as root: interactive may ask `sudo -v` once, non-interactive is `sudo -n` only (`$SUDO` and `sudo` itself); sets `OOSH_HEAL_ROOT` and `OOSH_HEAL_INTERACTIVE` |
+| `private.oo.heal.privilege.ensure <?need>` | Decides once, before anything changes, whether the heal may act as root: with an empty `<need>` (from `private.oo.heal.root.need`) sudo is not asked at all; else interactive may ask `sudo -v` once, non-interactive is `sudo -n` only (`$SUDO` and `sudo` itself); sets `OOSH_HEAL_ROOT` and `OOSH_HEAL_INTERACTIVE` |
 | `private.oo.heal.root.need <base> <branch>` | What of the heal needs root, space-separated (`group-dev developking developking-home base launcher drop-in worktrees`); silent getter |
 | `private.oo.heal.system.diagnose <base> <branch>` | Read-only lines of the system part (`[ok]`/`[heal]`/`[left]`); rc 1 when anything is not canonical |
 | `private.oo.heal.user.diagnose <user> <home> <base> <branch>` | Read-only lines of one home: `~/oosh` (canonical, foreign, worktree, plain-clone, plain-dir, none), `~/config`, old env formats, `.bashrc`, `~/.once`, legacy `ssh.*` folders, dead `safe.directory` entries, `mode-env.bash`, self-links, old backups |
@@ -1072,8 +1097,11 @@ Internal functions (not for direct use):
 | `private.oo.heal.fresh.run <home> <command>` | Runs `<command>` in a fresh process of this user (`env -i`, `HOME=<home>`, `~/oosh` first on the system `PATH`); prints its output; rc of the command |
 | `private.oo.heal.users.list` | The users `oo heal all` heals, one per line; silent getter |
 | `private.oo.heal.verify <user> <home>` | Runs the four invariants as `<user>`: `PASS` / `FAIL` / `NOT CHECKED` lines |
-| `private.oo.heal.note <rc> <step> <text>`, `private.oo.heal.summary` | The summary lines of the run and its rc; on rc 0 the install state goes to 99 |
-| `private.oo.heal.state.finish` | Sets `SETUP_SERVER` to 99 (creating it when missing) |
+| `private.oo.heal.note <rc> <step> <text> <?kind:step>` | Adds one summary line and raises the heal's rc; `kind` `info` is a report only (legacy `ssh.*` folders, a non-bash login shell): it raises the rc but not the rc of the steps that decides state 99 |
+| `private.oo.heal.summary <?sharedConfig>` | Prints the summary, one line per step, and the rc; when the steps and verify are green (info notes aside) the install state goes to 99 in `<sharedConfig>` |
+| `private.oo.heal.state.finish <configPath>` | Sets `SETUP_SERVER` to 99 in `<configPath>` (the sharedConfig; creating the machine when missing), checked with `state.of`; rc 1 when it cannot |
+| `private.oo.heal.login.shell.check <user>` | rc 0 when the login shell of `<user>` is bash (or unknown); rc 1 and a `RESULT` naming the way into bash otherwise — reported, never changed |
+| `private.oo.heal.text.plain` | A filter: stdin to stdout without the colour escapes of the oosh loggers and `test.suite`; the one strip for the lines the heal quotes from another process |
 | `private.oo.state.machine.create <?machine>` | Creates the install state machine with every state of the install lane, standing at `setup`; `private.init.state.machine` and the heal both call it |
 | `private.oo.update.pull.gate <?dir>` | rc 0 when `<dir>` may be pulled; else rc 1 and the one command to run in `RESULT` |
 | `private.oo.update.pull <?dir>` | The pull through the gate: fetch (HTTPS fallback) and fast-forward, never a merge |
@@ -1084,7 +1112,7 @@ Internal functions (not for direct use):
 | `private.oo.shared.base.share <base>` | Gives the base group `dev` and setgid (only when a `dev` group exists; the base only, never recursive) |
 | `private.oo.shared.dir.ensure <dir> <?owner>` | Creates the missing segments with the dev-group policy (group `dev`, mode 2775 when a `dev` group exists); an existing directory is never changed |
 | `private.oo.shared.config.ensure <sharedConfig> <rootConfig> <?userConfig>` | Seeds the shared config once and links the user config to it; an existing one is never copied into, but the installing state machine is carried in every run |
-| `private.oo.shared.config.state.carry <sharedConfig> <rootConfig> <?userConfig>` | Carries `stateMachines` and `current.state.machine.env` into the shared config, the old ones kept as `.orig.<ts>` |
+| `private.oo.shared.config.state.carry <sharedConfig> <rootConfig> <?userConfig>` | Carries `stateMachines` and `current.state.machine.env` into the shared config, the old ones kept as `.orig.<ts>`; a missing shared `stateMachines` folder is created through `private.oo.shared.dir.ensure` (group `dev`, 2775) |
 | `private.oo.path.writable.is <path>` | Predicate: may this user write `<path>`, or its nearest existing parent — the probe behind `private.oo.path.sudo.get`, separate so a test can answer "cannot write" for root too |
 
 `private.oo.entry.aside` is gone: the one move-aside is the kernel's `private.this.entry.aside <path> <?ts> <?asideDir>` ([oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)), shared by `symlink.with.backup`, `oo deinstall` and the heal.

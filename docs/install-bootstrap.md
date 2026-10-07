@@ -77,6 +77,7 @@ load-bearing and *wrongly* conclude Group 2 is removable.
 | `OOSH_REPO` | assigned nowhere in the file. A fork or private-repo override would otherwise fall back to public GitHub with no error |
 | `USER`, `LOGNAME` | login sets them, **bash does not** — `env -i bash` arrives with both empty. Install state 13 (`private.check.priviledges.checked`) routes root vs user on `$USER`, so a root install with no later sudo hop was routed into the user lane. `this` now heals `USER` from `id -un` exactly as it heals `$SUDO`; the re-exec carries both for every non-oosh child |
 | `TMPDIR` | read by the heal arm (`${TMPDIR:-/tmp}`): the folder its fresh clone is made under. Carried only when the caller has one |
+| `OOSH_HEAL_NONINTERACTIVE`, `OOSH_NO_INSTALL` | read by `oo heal` (`private.oo.heal.privilege.ensure`): either one makes the heal non-interactive, so it never stops at a password prompt. The heal arm hands them on to the child `oo heal` (`env OOSH_HEAL_NONINTERACTIVE=1 …`) when set |
 
 **Group 2 — pass-through.** `init/oosh` reads **none** of these. They are carried for the children.
 
@@ -184,10 +185,18 @@ reason.
   the environment and a plain assignment would be lost.
 - **`all` runs under `sudo -H`** when the caller is not root; with no `sudo` installed the arm dies naming
   it (`'all' heals every user as root — run it as root, or install sudo`).
+- **No terminal, no prompt.** When `/dev/tty` cannot be opened (a script, CI, a container exec without `-t`),
+  `heal all` needs root or **passwordless sudo**: the arm tests `sudo -n true` and, if it fails, ends with
+  **rc 2 before anything is cloned** (`heal all needs root — run as root or with passwordless sudo`); otherwise
+  the child runs under `sudo -n -H`. With a terminal the plain `sudo -H` may ask once.
 - **stdin.** In the pipe form stdin *is* the script, so the child must never read it: it reads `/dev/tty`
   when there is a terminal (so it can ask for the sudo password), else `/dev/null`.
-- **The child's rc is kept** (`exit "$_hr"`): 0 healed, 1 something is left for you, 2 cannot heal. The temp
-  clone is removed afterwards.
+- **The non-interactive flags travel.** `OOSH_HEAL_NONINTERACTIVE` and `OOSH_NO_INSTALL` are handed to the
+  child with `env`, like `OOSH_REPO`, so they survive `sudo`'s environment reset.
+- **The child's rc is kept** (`exit "$_hr"`): 0 healed, 1 something is left for you, 2 cannot heal.
+- **The cleanup never prompts.** The sudo timestamp may have expired during the heal, so the temp clone is removed
+  with `sudo -n rm -rf` when the heal ran under sudo, else as the user; when neither works the arm says
+  `remove <dir> yourself` and still exits with the child's rc.
 
 The child is `oo heal` of the clone, which re-runs itself once in a clean process (`env -i`).
 
@@ -195,7 +204,7 @@ The child is `oo heal` of the clone, which re-runs itself once in a clean proces
 all-or-nothing and has to live in the one file the curl form fetches. Its block says why on the line after
 `# BEGIN healArm` (`# size-exception: …`) and **leaves the count**; a block without that reason line counts
 fully (`homeRecovery`, `cleanEnv` and `brokenTree` count). **T-INIT-SIZE-CAP** prints both numbers —
-now `init/oosh is 715 lines, 695 counted (cap 700; 20 lines in size-exception blocks)`.
+now `init/oosh is 720 lines, 696 counted (cap 700; 24 lines in size-exception blocks)`.
 
 ## The `brokenTree` check
 
@@ -207,7 +216,8 @@ detached HEAD): its conflicted files would otherwise be executed. It dies with
 the message `existing <dir> is mid-merge or detached and is not reused` and the
 one command to run, which is the heal: `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<OOSH_SELF_BRANCH>/init/oosh | sh -s -- heal`.
 
-The block reads `.git/MERGE_HEAD` and `.git/HEAD` itself and never calls `git`:
+The block reads `.git/MERGE_HEAD` and `.git/HEAD` itself (the read of `HEAD` is guarded, so an unreadable one
+does not end the installer under `set -e`; it is then no `ref: ` line and the tree counts as broken) and never calls `git`:
 the tree may belong to another user, and `git` would answer "dubious ownership",
 which must not be mistaken for a broken tree. A `.git` **file** (a linked
 worktree) is not a directory and passes.
