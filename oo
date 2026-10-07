@@ -3667,7 +3667,7 @@ oo.tmp.cleanup.testing.completion() { :; }
 # something is left for the user, 2 cannot heal. Three forms: `oo heal`, the
 # curl form (init/oosh healArm runs a fresh clone's `oo heal`), `ossh heal`.
 
-oo.heal()     # <?branch> <?who:$USER> # heal this computer to the standard dev model: the canonical base, developking, sharedConfig, the launcher, ~/oosh and ~/config of <who> (a user, or all = every user, root only); diagnosis first; rc 0 healed and verified, 1 something is left for you, 2 cannot heal #
+oo.heal()     # <?branch> <?who:$USER> # heal this computer to the standard dev model: the canonical base with main/ and <branch>/ (and dev/ when <branch> is main), developking, sharedConfig, the launcher, ~/oosh and ~/config of <who> (a user, or all = root, developking, every user with ~/oosh or ~/config and the login that ran sudo; root only); diagnosis first; rc 0 healed and verified, 1 something is left for you, 2 cannot heal #
 {
  # Every form ends in ONE clean process (private.oo.heal.env.clean): an old
  # ~/config/user.env (the Mac's exports PATH with `.`, HOME, LOG_DEVICE) is
@@ -3679,9 +3679,11 @@ oo.heal()     # <?branch> <?who:$USER> # heal this computer to the standard dev 
  fi
  private.this.script.load ogit ogit.branch.get
  private.this.script.load user user.get
- local branch="$1" who="$2" basehome base sharedConfig r u home users keep=no
- # Read by private.oo.heal.note / private.oo.heal.summary (dynamic scope).
- local healNotes="" healRc=0
+ local branch="$1" who="$2" basehome base sharedConfig r u home users keep=no need
+ # Read by private.oo.heal.note / private.oo.heal.summary / private.oo.heal.env
+ # (dynamic scope): the summary lines, the rc, the real ~/config folders kept
+ # aside for the import.
+ local healNotes="" healRc=0 healOrigs=""
  if [ "$branch" = all ]; then branch=""; who=all; fi
  [ -n "$branch" ] || branch=$(private.oo.heal.branch.get)
  [ -n "$who" ] || who=$(id -un)
@@ -3693,6 +3695,14 @@ oo.heal()     # <?branch> <?who:$USER> # heal this computer to the standard dev 
  base=$(private.oo.heal.path.get "$basehome" base)
  important.log "oo heal $branch $who — what is not canonical (nothing changed yet):"
  oo.heal.status "$branch" "$who"
+ # Root, decided ONCE before anything changes: a run that needs root and
+ # cannot get it — never by a prompt in a non-interactive run — stops here.
+ private.oo.heal.privilege.ensure
+ need=$(private.oo.heal.root.need "$base" "$branch")
+ if [ -n "$need" ] && ! private.oo.heal.root.check; then
+   private.oo.heal.note 2 root "needs root (${need}) — run: sudo -H oo heal $branch${2:+ $2}"
+   private.oo.heal.summary; return $(result)
+ fi
 
  private.oo.heal.system "$branch"; r=$?
  private.oo.heal.note "$r" system "$RESULT"
@@ -3713,12 +3723,13 @@ oo.heal()     # <?branch> <?who:$USER> # heal this computer to the standard dev 
  [ "$r" -ge 2 ] && { private.oo.heal.summary; return $(result); }
 
  if [ "$who" = all ]; then users=$(private.oo.heal.users.list); keep=yes; else users="$who"; fi
+ private.oo.heal.note 0 users "healed: $(echo $users)"
  for u in $users; do
    private.oo.heal.user "$u" "$base" "$branch" "$sharedConfig" "$keep"; r=$?
    private.oo.heal.note "$r" "user $u" "$RESULT"
  done
 
- private.oo.heal.env "$HOME"; r=$?
+ private.oo.heal.env "$sharedConfig"; r=$?
  private.oo.heal.note "$r" env "$RESULT"
 
  for u in $users; do
@@ -3776,26 +3787,52 @@ oo.heal.status.completion.who() {
   echo all
 }
 
-private.oo.heal.env.clean()     # <?branch> <?who> <?tree> # run oo heal of <tree> (the folder this oo is in) again in ONE clean process: env -i keeping HOME USER LOGNAME TERM LANG LC_ALL LOG_LEVEL OOSH_REPO SSH_AUTH_SOCK, with OOSH_HEAL_CLEAN=1, OOSH_DIR=<tree>, CONFIG naming a file that is not there and PATH = <tree> and the system PATH; rc of that process #
+private.oo.heal.env.clean()     # <?branch> <?who> <?tree> # run oo heal again in ONE clean process from a world-readable copy of <tree> (the folder this oo is in) under /tmp/oosh-heal.*: env -i keeping HOME USER LOGNAME TERM, the locale, LOG_LEVEL, OOSH_REPO, SSH_AUTH_SOCK, the proxy variables and OOSH_NO_INSTALL, with OOSH_HEAL_CLEAN=1, OOSH_HEAL_LOGIN (the login that ran sudo), OOSH_DIR=<the copy>, CONFIG naming a file that is not there and PATH = the copy and the system PATH; the copy goes afterwards; rc of that process #
 {
  # Called by oo.start BEFORE `source this` (a fresh computer has no `this` on
  # PATH, an old one the wrong one), so nothing of oosh is used here: plain
- # bash only. CONFIG names <tree>/.heal.noconfig, a file that is not there,
+ # bash only. CONFIG names <copy>/.heal.noconfig, a file that is not there,
  # so the cold start of `this` never sources an old ~/config/user.env; an
  # OOSH_DIR set from outside survives `this` (T-OO-HEAL-NO-USERENV-READ).
  # "$BASH": the bash running now — under env -i on macOS `bash` would be the
  # system's 3.2.
- local branch="$1" who="$2" tree="$3" args=()
+ # The COPY: typed from a real ~/oosh (root in once_dev: /root/oosh under a
+ # 0700 home) the user step would move the heal's own running tree, and the
+ # as-user hops could not read it. A world-readable copy under /tmp — the
+ # layout of the curl form, /tmp/oosh-heal.*/t — is what runs; the curl
+ # form's tree is one already (T-OO-HEAL-RUNS-FROM-COPY).
+ # SUDO_USER is NOT carried (the user hop trusts the folders itself); the
+ # login that ran sudo goes in as OOSH_HEAL_LOGIN, for `all` only.
+ local branch="$1" who="$2" tree="$3" args=() vars=() name copy="" rc dir
  if [ -z "$tree" ]; then
-   # The physical folder of this file: plain bash, `this` is not loaded yet.
-   tree=$(cd "${BASH_SOURCE[0]%/*}" 2>/dev/null && pwd -P)
+   case "${BASH_SOURCE[0]}" in */*) dir="${BASH_SOURCE[0]%/*}" ;; *) dir=. ;; esac
+   tree=$(cd "$dir" 2>/dev/null && pwd -P)
  fi
+ case "$tree" in
+   /tmp/oosh-heal.*/*|/private/tmp/oosh-heal.*/*) ;;
+   *)
+     copy=$(mktemp -d /tmp/oosh-heal.XXXXXX) || { echo "oo heal: no temp folder under /tmp" >&2; return 2; }
+     # The copy is readable for the as-user hops (recursive: only the copy this call just made).
+     if ! { chmod 755 "$copy" && cp -pR "$tree" "$copy/t" && chmod -R go+rX "$copy/t"; }; then # recursive-exception: the heal's own fresh copy under /tmp
+       echo "oo heal: could not copy $tree to $copy/t" >&2; rm -rf "$copy"; return 2
+     fi
+     tree="$copy/t" ;;
+ esac
  [ -n "$branch" ] && args+=("$branch")
  [ -n "$who" ] && args+=("$who")
- # oosh-dir-exception: the heal runs from the tree it was started from (a temp clone in the curl form); ~/oosh is what it repairs
- # path-exception: the one clean PATH of the heal process — <tree>, the bash it runs under and the system directories
- env -i HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" TERM="${TERM:-dumb}" LANG="$LANG" LC_ALL="$LC_ALL" LOG_LEVEL="${LOG_LEVEL:-3}" OOSH_REPO="$OOSH_REPO" SSH_AUTH_SOCK="$SSH_AUTH_SOCK" OOSH_HEAL_CLEAN=1 OOSH_DIR="$tree" CONFIG="$tree/.heal.noconfig" PATH="$tree:${BASH%/*}:$(private.oo.heal.path.system.get)" "$BASH" "$tree/oo" heal "${args[@]}"
+ for name in LANG LC_ALL OOSH_REPO SSH_AUTH_SOCK http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY OOSH_NO_INSTALL OOSH_HEAL_NONINTERACTIVE; do
+   [ -n "${!name}" ] && vars+=("$name=${!name}")
+ done
+ [ -n "${OOSH_HEAL_LOGIN:-$SUDO_USER}" ] && vars+=("OOSH_HEAL_LOGIN=${OOSH_HEAL_LOGIN:-$SUDO_USER}")
+ # oosh-dir-exception: the heal runs from its own copy of the tree it was started from; ~/oosh is what it repairs
+ # path-exception: the one clean PATH of the heal process — the copy, the bash it runs under and the system directories
+ env -i HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" TERM="${TERM:-dumb}" LOG_LEVEL="${LOG_LEVEL:-3}" "${vars[@]}" OOSH_HEAL_CLEAN=1 OOSH_DIR="$tree" CONFIG="$tree/.heal.noconfig" PATH="$tree:${BASH%/*}:$(private.oo.heal.path.system.get)" "$BASH" "$tree/oo" heal "${args[@]}"
+ rc=$?
+ # The copy this call made, and only that: a temp folder of the heal itself.
+ [ -n "$copy" ] && rm -rf "$copy"
+ return "$rc"
 }
+
 
 private.oo.heal.path.system.get()     #  # echo the system PATH of a clean process: /usr/local, /usr and / bin and sbin, and on macOS Homebrew's /opt/homebrew; silent getter #
 {
@@ -3836,28 +3873,36 @@ private.oo.heal.basehome.get()     #  # echo the folder the homes of this comput
  case "$OSTYPE" in darwin*) echo /Users ;; *) echo /home ;; esac
 }
 
-private.oo.heal.path.get()     # <basehome> <which> # echo a path of the standard model under <basehome>: base (the components base, Once.sh) or sharedConfig; silent getter #
+private.oo.heal.path.get()     # <basehome> <which> # echo a path of the standard model under <basehome> in the file system letter case: base (the components base, Once.sh — private.config.shared.oosh.base.get once developking exists) or sharedConfig; silent getter #
 {
- # The two paths install state 31 and config.init.user spell out; one place
- # for the heal (the tests replace it with a fixture).
- local basehome="${1%/}"
+ # macOS: /Users/shared and /Users/Shared are one folder and two strings;
+ # config.init.user writes the file system's case, so the heal spells every
+ # path it compares the same way (T-OO-HEAL-BASE-CASE). One owner of the base:
+ # private.config.shared.oosh.base.get; before developking exists the
+ # <basehome>/shared that is there goes through private.this.path.case.get.
+ local basehome="${1%/}" shared
+ shared=$(private.this.path.case.get "$basehome/shared")
  case "$2" in
-   base)         echo "$basehome/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh" ;;
-   sharedConfig) echo "$basehome/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig" ;;
+   base)
+     private.this.script.load config private.config.shared.oosh.base.get
+     private.oo.heal.config.guard
+     private.config.shared.oosh.base.get 2>/dev/null \
+       || echo "$shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh" ;;
+   sharedConfig) echo "$shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig" ;;
    *)            return 1 ;;
  esac
 }
 
-private.oo.heal.root.check()     #  # rc 0 when this process may act as root: it is root, or sudo works — without a password, or after asking for it once on a terminal #
+
+private.oo.heal.root.check()     #  # rc 0 when this process may act as root: it is root, or sudo works — decided once (private.oo.heal.privilege.ensure) #
 {
- # A predicate: rc only. $SUDO is the framework's prefix ("" for root,
- # "sudo " for a user); the tests replace it with a recorder, never a prompt.
+ # A predicate: rc only. The decision is made once, up front, by
+ # private.oo.heal.privilege.ensure; a step asks here.
  [ "$(id -u)" = 0 ] && return 0
- [ -n "$SUDO" ] || return 1
- $SUDO -n true 2>/dev/null && return 0
- [ -t 0 ] || return 1
- $SUDO -v
+ [ -n "$OOSH_HEAL_ROOT" ] || private.oo.heal.privilege.ensure
+ [ "$OOSH_HEAL_ROOT" = yes ]
 }
+
 
 private.oo.heal.system.diagnose()     # <base> <branch> # print, read-only, what of the system part is not canonical: group dev, developking and its home, the base with group dev and setgid, main and <branch> under it (private.oo.heal.folder.gate), linked worktrees, the launcher, the retired drop-in, the install state; rc 1 when anything is not canonical #
 {
@@ -3927,12 +3972,13 @@ private.oo.heal.user.diagnose()     # <user> <home> <base> <branch> # print, rea
  private.this.script.load ogit ogit.branch.get
  private.this.script.load user user.ssh.backup.status
  local user="$1" home="$2" base="$3" branch="$4" rc=0 kind target="" baseReal sharedConfig link cfg f found entry dead=0 name
- baseReal=$(private.this.path.canonical "$base" 2>/dev/null || echo "$base")
+ baseReal=$(private.this.path.case.get "$(private.this.path.canonical "$base" 2>/dev/null || echo "$base")")
  # <base> is <basehome>/shared/EAMD.ucp/Components/…: its sharedConfig is beside it.
  sharedConfig=$(private.oo.heal.path.get "${base%%/shared/EAMD.ucp/*}" sharedConfig)
  # ~/oosh
  if [ -L "$home/oosh" ]; then
    target=$(private.this.path.canonical "$home/oosh" 2>/dev/null)
+   [ -n "$target" ] && target=$(private.this.path.case.get "$target")
    if [ -z "$target" ] || [ ! -d "$target" ]; then kind=none
    elif [ "${target%/*}" = "$baseReal" ]; then kind=canonical
    else kind=foreign; fi
@@ -3987,14 +4033,15 @@ private.oo.heal.user.diagnose()     # <user> <home> <base> <branch> # print, rea
  # Old formats in a config that is not the sharedConfig: read as data.
  cfg="$home/config"
  if [ -d "$cfg" ] && [ "$(private.this.path.canonical "$cfg")" != "$(private.this.path.canonical "$sharedConfig" 2>/dev/null)" ]; then
+   private.oo.heal.config.load private.config.env.names.read
    for f in user.env oosh.env log.env; do
      [ -f "$cfg/$f" ] || continue
      found=""
-     # path-exception: the grep matches old PATH lines in a file read as data, not an assignment
-     grep -Eq '^[[:space:]]*(export[[:space:]]+)?PATH=' "$cfg/$f" && found="$found PATH"
-     grep -Eq '^[[:space:]]*(export[[:space:]]+)?HOME=' "$cfg/$f" && found="$found HOME"
-     grep -Eq 'LOG_DEVICE="?/dev/stdout' "$cfg/$f" && found="$found LOG_DEVICE=/dev/stdout"
-     grep -Eq 'CONFIG_CHAIN_' "$cfg/$f" && found="$found CONFIG_CHAIN_*"
+     # Read as data by config's readers, never sourced.
+     for name in $(private.config.env.names.read "$cfg/$f"); do
+       case "$name" in PATH|HOME|CONFIG_CHAIN_*) found="$found $name" ;; esac
+     done
+     [ "$(private.config.env.value.read "$cfg/$f" LOG_DEVICE)" = /dev/stdout ] && found="$found LOG_DEVICE=/dev/stdout"
      [ -n "$found" ] && echo "  [left] $user ~/config/$f: old format ($found ) — never carried over"
    done
  fi
@@ -4022,7 +4069,14 @@ private.oo.heal.user.diagnose()     # <user> <home> <base> <branch> # print, rea
  fi
  if [ -n "$target" ] && [ -d "$target" ]; then
    for name in oosh "${target##*/}"; do
-     [ -L "$target/$name" ] && { echo "  [heal] $user self-link $target/$name from an old install — removed"; rc=1; }
+     [ -L "$target/$name" ] || continue
+     rc=1
+     if [ "$kind" = canonical ]; then
+       echo "  [heal] $user self-link $target/$name from an old install — removed"
+     else
+       # A tree outside the base is never touched.
+       echo "  [left] $kind self-link $target/$name — in a tree oo heal never touches"
+     fi
    done
  fi
  for name in config.initial config.orig oosh.orig; do
@@ -4053,50 +4107,42 @@ private.oo.heal.folder.gate()     # <dir> <branch> # echo what oo heal does with
  esac
 }
 
-private.oo.heal.folder.aside()     # <dir> # move a canonical folder, whole, out of the base to <base>.aside/<name>.<ts> — a sibling of the base, never a branch folder — and never delete it; refuses the tree oo heal runs from; RESULT = the new path #
+private.oo.heal.folder.aside()     # <dir> # move a canonical folder, whole, out of the base to <base>.aside/<name>.orig.<ts> — a sibling of the base, never a branch folder — through private.this.entry.aside, never deleting it; refuses the tree oo heal runs from; RESULT = the new path #
 {
  # Owner decision 6: a broken canonical folder (merge in progress, committed
  # markers, detached, diverged, dirty) is moved aside and cloned again; the
  # move is reported, nothing is deleted (T-OO-HEAL-ASIDE-NEVER-DELETES). The
- # tree the heal runs from is never moved (T-OO-HEAL-NOT-OWN-TREE): the curl
- # form runs from a fresh clone.
- local dir="${1%/}" base name aside stamp ts n=0 here target
+ # name is <base>.aside/<name>.orig.<ts> (coordinator decision 2026-10-07):
+ # the kernel's one move-aside, into the aside folder. The tree the heal runs
+ # from is never moved (T-OO-HEAL-NOT-OWN-TREE).
+ local dir="${1%/}" here target aside
  if [ -z "$dir" ]; then
    create.result 1 "private.oo.heal.folder.aside requires <dir>"; error.log "$RESULT"; return $(result)
  fi
  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
    create.result 0 "nothing"; return $(result)
  fi
- here=$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null)
- target=$(private.this.path.canonical "$dir" 2>/dev/null)
+ here=$(private.this.path.case.get "$(private.this.path.canonical "$OOSH_DIR" 2>/dev/null)")
+ target=$(private.this.path.case.get "$(private.this.path.canonical "$dir" 2>/dev/null)")
  if [ -n "$here" ] && [ -n "$target" ] && { [ "$here" = "$target" ] || [ "${here#"$target"/}" != "$here" ]; }; then
    create.result 1 "$dir is the tree oo heal runs from — not moved; use the curl form: curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh | sh -s -- heal"
    error.log "$RESULT"; return $(result)
  fi
- base="${dir%/*}"; name="${dir##*/}"; aside="$base.aside"
+ aside="${dir%/*}.aside"
  private.oo.shared.dir.ensure "$aside" >/dev/null || { error.log "$RESULT"; return $(result); }
- stamp=$(private.this.orig.stamp.get "$aside" "$name"); ts="$stamp"
- while [ -e "$aside/$name.$ts" ] || [ -L "$aside/$name.$ts" ]; do
-   n=$((n + 1)); ts="$stamp-$n"
- done
- # The one mv of the heal: private.this.entry.aside keeps an entry BESIDE
- # itself (<path>.orig.<ts>), and the owner decided a canonical folder goes
- # to a sibling of the base, so it is never taken for a branch folder.
- if ! mv "$dir" "$aside/$name.$ts"; then
-   create.result 1 "could not move $dir to $aside/$name.$ts"; error.log "$RESULT"; return $(result)
- fi
- warn.log "moved aside: $dir → $aside/$name.$ts (nothing deleted)"
- create.result 0 "$aside/$name.$ts"
+ private.this.entry.aside "$dir" "" "$aside" >/dev/null || return $(result)
+ warn.log "moved aside: $dir → $RESULT (nothing deleted)"
  return $(result)
 }
 
-private.oo.heal.system()     # <branch> # the system part of the standard model: group dev, developking with a home, the shared base with group dev and setgid, the launcher (may ask for the sudo password once), no retired drop-in; rc 2 when a step needs root and there is neither root nor a working sudo #
+
+private.oo.heal.system()     # <branch> # the system part of the standard model: group dev, developking with a home, the shared base with group dev and setgid, the launcher (asks for the sudo password at most once, only in an interactive run), no retired drop-in; rc 2 when a step needs root and there is neither root nor a working sudo #
 {
  # As install state 31 does it, through the same methods; every step is
  # idempotent. A user heals their own account without sudo when the system
  # part is there already (the B3 heal arm runs before any sudo check).
  private.this.script.load user user.get
- local branch="$1" need="" devHome basehome base rc=0 left=""
+ local branch="$1" need="" devHome basehome base rc=0 left="" made="" mode=quiet
  private.this.group.exists dev || need="$need group-dev"
  devHome=$(user.get home developking 2>/dev/null)
  [ -n "$devHome" ] || need="$need developking"
@@ -4112,12 +4158,15 @@ private.oo.heal.system()     # <branch> # the system part of the standard model:
    create.result 2 "could not create the group dev"; error.log "$RESULT"; return $(result)
  fi
  if [ -z "$devHome" ]; then
-   user.create developking >/dev/null 2>&1
+   # user.create also runs user.oosh.install, which soft-fails before the base
+   # exists: said at info level, not hidden.
+   user.create developking >/dev/null || info.log "user create developking: $RESULT (oosh for developking comes with the user step)"
    user.group.add dev developking >/dev/null 2>&1
    devHome=$(user.get home developking 2>/dev/null)
    if [ -z "$devHome" ]; then
      create.result 2 "could not create developking"; error.log "$RESULT"; return $(result)
    fi
+   made="developking created (admin, password = developking — state 31 precedent); "
  fi
  if ! private.user.home.ensure developking >/dev/null; then
    create.result 2 "developking has no home — $RESULT"; error.log "$RESULT"; return $(result)
@@ -4128,20 +4177,24 @@ private.oo.heal.system()     # <branch> # the system part of the standard model:
    create.result 2 "the base $base could not be made — $RESULT"; error.log "$RESULT"; return $(result)
  fi
  private.oo.shared.base.share "$base" >/dev/null || { rc=1; left="$left; $RESULT"; }
- private.oo.install.launcher "$OOSH_DIR" /usr/local/bin/this interactive >/dev/null || { rc=1; left="$left; $RESULT"; }
+ # The one prompt the owner allows — in an interactive run only.
+ [ "$OOSH_HEAL_INTERACTIVE" = yes ] && mode=interactive
+ private.oo.install.launcher "$OOSH_DIR" /usr/local/bin/this "$mode" >/dev/null || { rc=1; left="$left; $RESULT"; }
  private.oo.dropin.remove >/dev/null || { rc=1; left="$left; $RESULT"; }
  if [ "$rc" = 0 ]; then
-   create.result 0 "group dev, developking, the base $base, the launcher"
+   create.result 0 "${made}group dev, developking, the base $base, the launcher"
  else
-   create.result 1 "system part made, left for you:${left#;}"
+   create.result 1 "${made}system part made, left for you:${left#;}"
  fi
  return $(result)
 }
 
-private.oo.shared.base.share()     # <base> # give the components base group dev and the setgid bit, so a folder added later inherits the group; only when a dev group exists; $SUDO only when the caller does not own it; RESULT shared or exists; rc 1 when it cannot #
+
+private.oo.shared.base.share()     # <base> # give the components base group dev and the setgid bit, so a folder added later inherits the group; only when a dev group exists; sudo -n only when the caller does not own it, never a password prompt; RESULT shared or exists; rc 1 when it cannot #
 {
  # Install state 31 did it inline (chgrp dev + chmod g+ws on the base): one
  # place now, for the state and the heal. The base only — never recursive.
+ # `sudo -n`: the launcher is the one step allowed to ask (oo heal).
  local base="$1" asRoot=""
  if [ -z "$base" ] || [ ! -d "$base" ]; then
    create.result 1 "private.oo.shared.base.share requires an existing <base>, got '$base'"; error.log "$RESULT"; return $(result)
@@ -4152,7 +4205,7 @@ private.oo.shared.base.share()     # <base> # give the components base group dev
  if [ "$(private.this.path.stat.get "$base" group)" = dev ] && [ -g "$base" ]; then
    create.result 0 "exists"; return $(result)
  fi
- [ "$(private.this.path.stat.get "$base" owner)" = "$(id -un)" ] || asRoot="$SUDO"
+ [ "$(private.this.path.stat.get "$base" owner)" = "$(id -un)" ] || [ "$(id -u)" = 0 ] || asRoot="sudo -n "
  if ! { ${asRoot}chgrp dev "$base" && ${asRoot}chmod g+ws "$base"; }; then
    create.result 1 "cannot set group dev + setgid on $base — run: sudo chgrp dev $base && sudo chmod g+ws $base"
    error.log "$RESULT"; return $(result)
@@ -4161,15 +4214,23 @@ private.oo.shared.base.share()     # <base> # give the components base group dev
  return $(result)
 }
 
-private.oo.heal.code()     # <base> <branch> # the code part: <base>/main and <base>/<branch> as clean clones of origin — a folder the gate refuses is moved to <base>.aside and cloned again, a behind one fast-forwarded, linked worktrees converted (ogit worktree.remove) when their gate lets them; offline the tree running the heal is the source; every folder finished (shared, trusted), a path or bundle origin re-pointed at the canonical URL; rc 1 when something is left for you, 2 when there is no source #
+
+private.oo.heal.code()     # <base> <branch> # the code part: <base>/main and <base>/<branch> — and <base>/dev too when <branch> is main, so oo mode has a second folder — as clean clones: a folder the gate refuses is moved to <base>.aside and cloned again, a behind one fast-forwarded, linked worktrees converted (ogit worktree.remove) when their gate lets them; the source is OOSH_REPO (a URL, a path or a bundle) else the canonical URL, offline the tree running the heal; every path or bundle origin re-pointed at the canonical URL, every folder finished (shared, trusted); rc 1 when something is left for you, 2 when there is no source #
 {
  private.this.script.load ogit ogit.branch.get
- local base="$1" branch="$2" url="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
- local rc=0 left="" folder d verdict worktreesLeft=no origin folders="main"
+ # The canonical URL is the origin of every folder (owner decision 11); the
+ # SOURCE may be a bundle or a path (ossh heal ships one) that is gone after
+ # the heal — the origin never names it (T-OO-HEAL-CODE-BUNDLE-ORIGIN).
+ local base="$1" branch="$2" canonical="https://github.com/Cerulean-Circle-GmbH/once.sh.git" src
+ src="${OOSH_REPO:-$canonical}"
+ local rc=0 left="" folder d verdict worktreesLeft=no origin folders="main" second="$2"
  if [ -z "$base" ] || [ -z "$branch" ] || [ ! -d "$base" ]; then
    create.result 2 "private.oo.heal.code requires an existing <base> and a <branch>, got '$base' '$branch'"; error.log "$RESULT"; return $(result)
  fi
- [ "$branch" = main ] || folders="main $branch"
+ # main/ and <branch>/ always; healing to main brings dev/ beside it — the
+ # oosh invariant wants a second folder to switch to (coordinator decision).
+ [ "$branch" = main ] && second=dev
+ folders="main $second"
  # Linked worktrees first: they live in main/.git — moving main aside would
  # orphan them.
  while IFS= read -r d; do
@@ -4206,7 +4267,7 @@ private.oo.heal.code()     # <base> <branch> # the code part: <base>/main and <b
  done
  # Offline, the tree running the heal is the source — never ~/oosh, which
  # can be the broken tree (T-OO-HEAL-CODE-LOCAL-SOURCE).
- if ! private.oo.shared.tree.ensure "$url" "$base" "$branch" "$OOSH_DIR" >/dev/null; then
+ if ! private.oo.shared.tree.ensure "$src" "$base" "$second" "$OOSH_DIR" >/dev/null; then
    create.result 2 "no source for $base: $RESULT"; error.log "$RESULT"; return $(result)
  fi
  for folder in $folders; do
@@ -4214,25 +4275,28 @@ private.oo.heal.code()     # <base> <branch> # the code part: <base>/main and <b
    [ "$(private.ogit.folder.shape "$d")" = clone ] || continue
    origin=$(ogit.remote.url.get origin "$d")
    case "$origin" in
+     "$canonical") ;;
      /*|./*|../*|file://*|*.bundle)
-       [ "$origin" = "$url" ] || ogit.remote.url.set "$url" origin "$d" >/dev/null \
+       ogit.remote.url.set "$canonical" origin "$d" >/dev/null \
          || { rc=1; left="$left; the origin of $d stays $origin — $RESULT"; } ;;
    esac
    ogit.folder.finish "$d" >/dev/null || { rc=1; left="$left; $RESULT"; }
  done
  if [ "$rc" = 0 ]; then
-   create.result 0 "$base/main and $base/$branch are clean clones"
+   create.result 0 "$base/main and $base/$second are clean clones"
  else
    create.result 1 "clones stand, left for you:${left#;}"
  fi
  return $(result)
 }
 
-private.oo.heal.config()     # <sharedConfig> # the shared config: made (private.oo.shared.dir.ensure, owner developking) when it is missing — config init.env fills it later — then config init.shared (2775, group dev, no self-loops); rc 2 when it cannot be made #
+
+private.oo.heal.config()     # <sharedConfig> # the shared config: made (private.oo.shared.dir.ensure, owner developking) when it is missing — the env step fills it — then config init.shared (2775, group dev, no self-loops); rc 2 when it cannot be made #
 {
  # A missing sharedConfig is NOT seeded from a real ~/config: that is the old
- # format the owner keeps aside (config.orig.<ts>) and imports from by an
- # allow-list (private.config.orig.import, the user step).
+ # format the owner keeps aside (config.orig.<ts>); the allow-listed values
+ # are imported after config init.env has written the shared files (the env
+ # step, private.oo.heal.env).
  local sharedConfig="$1" made=""
  if [ -z "$sharedConfig" ]; then
    create.result 2 "private.oo.heal.config requires <sharedConfig>"; error.log "$RESULT"; return $(result)
@@ -4241,9 +4305,9 @@ private.oo.heal.config()     # <sharedConfig> # the shared config: made (private
    if ! private.oo.shared.dir.ensure "$sharedConfig" developking >/dev/null; then
      create.result 2 "the sharedConfig $sharedConfig could not be made — $RESULT"; error.log "$RESULT"; return $(result)
    fi
-   made=" (made empty — config init.env fills it)"
+   made=" (made empty — the env step fills it)"
  fi
- private.this.script.load config config.init.shared
+ private.oo.heal.config.load config.init.shared
  if ! config.init.shared >/dev/null 2>&1; then
    create.result 1 "config init.shared reported a problem with $sharedConfig — run: config init.shared"
    return $(result)
@@ -4252,33 +4316,44 @@ private.oo.heal.config()     # <sharedConfig> # the shared config: made (private
  return $(result)
 }
 
-private.oo.heal.user()     # <user> <base> <branch> <sharedConfig> <?keep:no> # heal one user: ~/oosh → <base>/<branch> and ~/config → <sharedConfig> (config.init.user), a real ~/config kept as config.orig.<ts> with an allow-listed import, then as the user their session files with OOSH_MODE=<branch>, mode-env.bash and the shell step; self-links of old installs removed; keep yes leaves a canonical ~/oosh on its branch #
+
+private.oo.heal.user()     # <user> <base> <branch> <sharedConfig> <?keep:no> # heal one user: a real ~/config kept as config.orig.<ts> (private.this.entry.aside, its path queued for the import of the env step), ~/oosh → <base>/<branch> and ~/config → <sharedConfig> (config.init.user), then as the user their session files with OOSH_MODE=<branch>, mode-env.bash and the shell step; self-links of old installs moved off; a new member of group dev and legacy ssh.* folders go to the summary; keep yes leaves a canonical ~/oosh on its branch #
 {
  private.this.script.load user user.get
- private.this.script.load config config.init.user
- local user="$1" base="$2" branch="$3" sharedConfig="$4" keep="${5:-no}" home link wasReal=no orig rc=0 left="" tree name
+ private.oo.heal.config.load config.init.user
+ local user="$1" base="$2" branch="$3" sharedConfig="$4" keep="${5:-no}" home link orig rc=0 left="" tree name groupsBefore
  home=$(user.get home "$user" 2>/dev/null)
  if [ -z "$home" ] || [ ! -d "$home" ]; then
    create.result 1 "$user has no home — not healed"; warn.log "$RESULT"; return $(result)
  fi
  # Under all, a user who is canonical already keeps their branch.
  if [ "$keep" = yes ] && [ -L "$home/oosh" ]; then
-   link=$(readlink "$home/oosh")
+   link=$(private.this.path.case.get "$(readlink "$home/oosh")")
    [ "${link%/*}" = "$base" ] && [ -d "$link" ] && branch="${link##*/}"
  fi
- [ -d "$home/config" ] && [ ! -L "$home/config" ] && wasReal=yes
+ # A real ~/config is moved here, by the kernel, and its path taken from the
+ # RESULT: config.init.user then only links. The import waits for the env
+ # step — config init.env writes the shared files it imports into (healOrigs,
+ # oo.heal's local).
+ if [ -d "$home/config" ] && [ ! -L "$home/config" ]; then
+   if ! private.this.entry.aside "$home/config" >/dev/null; then
+     create.result 1 "$user: the real ~/config could not be kept aside — $RESULT"; error.log "$RESULT"; return $(result)
+   fi
+   orig="$RESULT"
+   healOrigs="${healOrigs}${orig}"$'\n'
+   important.log "$user: the real ~/config is kept as $orig"
+ fi
+ groupsBefore=" $(id -nG "$user" 2>/dev/null) "
  if ! config.init.user "$user" "$base/$branch" >/dev/null 2>&1; then
    create.result 1 "config init.user $user $base/$branch failed — run it to see why"; error.log "$RESULT"; return $(result)
  fi
- if [ "$wasReal" = yes ]; then
-   # The stamp config.init.user's move used: the newest config.orig.<ts>.
-   orig=$(ls -1d "$home"/config.orig.* 2>/dev/null | sort | tail -1)
-   if [ -n "$orig" ]; then
-     private.config.orig.import "$orig" "$sharedConfig" >/dev/null \
-       || { rc=1; left="$left; the import from $orig failed — $RESULT"; }
-     important.log "$user: the real ~/config is kept as $orig"
-   fi
- fi
+ # Group dev is in effect after the next login only.
+ case "$groupsBefore" in
+   *" dev "*) ;;
+   *) case " $(id -nG "$user" 2>/dev/null) " in
+        *" dev "*) private.oo.heal.note 1 "relogin $user" "$user is in group dev now — log out and in once (group dev)" ;;
+      esac ;;
+ esac
  # As the user, in their own environment from the shared tree: their PATH
  # and OOSH_MODE (config session.save), mode-env.bash as oo mode writes it,
  # and the shell step oo update runs. The functions come from the tree that
@@ -4295,17 +4370,22 @@ private.oo.heal.shell \"\$HOME\" '$base'" >/dev/null 2>&1; then
    rc=1; left="$left; the session files, mode-env.bash or the shell step of $user failed — run as $user: config session.save"
  fi
  # Self-links an old non-root install left in the tree (<branch>/<branch>,
- # ~/oosh/oosh): links only, and only when git does not track them.
+ # ~/oosh/oosh): links only, untracked only, through the kernel move-aside
+ # (a link is removed, its target stays).
  tree="$base/$branch"
  for name in oosh "$branch"; do
    [ -L "$tree/$name" ] || continue
    ogit.repo.files.list "$tree" | grep -qx "$name" && continue
-   if rm -f "$tree/$name"; then
+   if private.this.entry.aside "$tree/$name" >/dev/null; then
      important.log "removed the self-link $tree/$name of an old install"
    else
      rc=1; left="$left; could not remove the self-link $tree/$name"
    fi
  done
+ # Legacy ssh.* folders: reported, never moved (owner decision 9) — in the summary too.
+ if ! ( LOG_DEVICE=/dev/null; user.ssh.backup.status "$home" ) >/dev/null 2>&1; then
+   private.oo.heal.note 1 "ssh $user" "legacy ssh.* backup folders in $home — run: user ssh.backup.migrate"
+ fi
  if [ "$rc" = 0 ]; then
    create.result 0 "~/oosh → $base/$branch, ~/config → sharedConfig, OOSH_MODE=$branch"
  else
@@ -4313,6 +4393,7 @@ private.oo.heal.shell \"\$HOME\" '$base'" >/dev/null 2>&1; then
  fi
  return $(result)
 }
+
 
 private.oo.mode.env.write()     # <branch> <?oldBranch> # write ~/.config/oosh/mode-env.bash, which the oo shim sources into the parent shell: hash -r and OOSH_MODE=<branch>, and only when <oldBranch> is given and differs the PATH repair from <oldBranch> to <branch>; rc 1 when it cannot write #
 {
@@ -4372,23 +4453,41 @@ private.oo.heal.shell()     # <?home:$HOME> <?base> <?load:yes> # the shell step
  return "$rc"
 }
 
-private.oo.heal.env()     # <?home:$HOME> # once, in a fresh process of this user (env -i, ~/oosh/this, the shared config): config init.env writes the env files again, config validate required checks them; rc 1 naming what is missing #
+private.oo.heal.env()     # <sharedConfig> # once, for this user: config init.env in a fresh process writes the env files, the queued real ~/config folders (healOrigs) are imported into <sharedConfig> by the allow-list (private.config.orig.import), then config validate required in a fresh process; rc 1 naming what is missing #
 {
- local home="${1:-$HOME}" out rc
- # path-exception: the PATH of a fresh process of this user, from ~/oosh and the system
- out=$(env -i HOME="$home" USER="$(id -un)" LOGNAME="$(id -un)" TERM="${TERM:-dumb}" LOG_LEVEL=1 PATH="$home/oosh:$home/oosh/ng:$(private.oo.heal.path.system.get)" \
-   "$BASH" -c 'source "$HOME/oosh/this" >/dev/null 2>&1 || exit 2; config init.env >/dev/null 2>&1; config validate required' 2>&1); rc=$?
- if [ "$rc" = 0 ]; then
-   create.result 0 "env files written again, every required variable present"
+ # The order is the point: the import writes into log.env and oosh.env only
+ # when they exist, and on a sharedConfig the heal made they exist only after
+ # config init.env (T-OO-HEAL-USER-REAL-CONFIG).
+ local sharedConfig="$1" out rc orig imported="" left=""
+ private.oo.heal.fresh.run "$HOME" 'config init.env' >/dev/null 2>&1 \
+   || left="$left; config init.env failed"
+ private.oo.heal.config.load private.config.orig.import
+ while IFS= read -r orig; do
+   [ -n "$orig" ] || continue
+   if private.config.orig.import "$orig" "$sharedConfig" >/dev/null; then
+     imported="$imported; ${orig##*/}: $RESULT"
+   else
+     left="$left; the import from $orig failed — $RESULT"
+   fi
+ done <<< "$healOrigs"
+ out=$(private.oo.heal.fresh.run "$HOME" 'config validate required' 2>&1); rc=$?
+ if [ "$rc" != 0 ]; then
+   left="$left; config validate required (rc $rc): $(printf '%s\n' "$out" | tr -d '\033' | sed 's/\[[0-9;]*m//g' | grep -v '^[[:space:]]*$' | tail -3 | tr '\n' ' ')— run: config init.env"
+ fi
+ if [ -z "$left" ]; then
+   create.result 0 "env files written, every required variable present${imported}"
  else
-   create.result 1 "config validate required (rc $rc): $(printf '%s\n' "$out" | tr -d '\033' | sed 's/\[[0-9;]*m//g' | grep -v '^[[:space:]]*$' | tail -3 | tr '\n' ' ')— run: config init.env"
+   create.result 1 "env:${left#;}${imported}"
  fi
  return $(result)
 }
 
-private.oo.heal.users.list()     #  # echo the users oo heal all heals, one per line: root, developking, and every user.list entry whose home holds ~/oosh or ~/config (a link, even a dangling one, or a real entry); silent getter #
+
+private.oo.heal.users.list()     #  # echo the users oo heal all heals, one per line: root, developking, every user.list entry whose home holds ~/oosh or ~/config (a link, even a dangling one, or a real entry), and the login that ran sudo (OOSH_HEAL_LOGIN); silent getter #
 {
- # NO create.result — a getter consumed as $(...).
+ # NO create.result — a getter consumed as $(...). The login that ran sudo
+ # is healed even when it never had oosh (once_dev's ssh login `test`,
+ # coordinator decision 2026-10-07).
  private.this.script.load user user.list
  local u home seen=" "
  for u in root developking $(user.list); do
@@ -4397,6 +4496,7 @@ private.oo.heal.users.list()     #  # echo the users oo heal all heals, one per 
    case "$u" in
      root|developking) echo "$u"; continue ;;
    esac
+   if [ -n "$OOSH_HEAL_LOGIN" ] && [ "$u" = "$OOSH_HEAL_LOGIN" ]; then echo "$u"; continue; fi
    home=$(user.get home "$u" 2>/dev/null)
    [ -n "$home" ] || continue
    if [ -e "$home/oosh" ] || [ -L "$home/oosh" ] || [ -e "$home/config" ] || [ -L "$home/config" ]; then
@@ -4405,11 +4505,20 @@ private.oo.heal.users.list()     #  # echo the users oo heal all heals, one per 
  done
 }
 
+
 private.oo.heal.verify()     # <user> <home> # run the platform invariants configLayout, layout, boot and oosh as <user> in a fresh process; one line each: PASS <inv> <user> | FAIL <inv> <user>: <its recovery> | NOT CHECKED <inv> <user>: <why>; rc 1 on a FAIL #
 {
  # Status idiom: the lines are plain echo. An invariant that cannot run here
- # is NOT CHECKED, with the reason, and does not fail the heal.
- local user="$1" home="$2" inv f out r fail rc=0 checked=0 failed=0
+ # is NOT CHECKED, with the reason, and does not fail the heal. A self-heal
+ # whose process lacks group dev the user database already gives them runs
+ # with the old groups (private.as.user runs the caller directly): a failed
+ # invariant is NOT CHECKED until the re-login, never a FAIL.
+ local user="$1" home="$2" inv f out r fail rc=0 checked=0 failed=0 pending=no
+ if [ "$user" = "$(id -un)" ]; then
+   case " $(id -nG "$user" 2>/dev/null) " in
+     *" dev "*) case " $(id -nG 2>/dev/null) " in *" dev "*) ;; *) pending=yes ;; esac ;;
+   esac
+ fi
  for inv in configLayout layout boot oosh; do
    f="$home/oosh/test/test.platform.shared.$inv.invariant"
    if [ "$user" != "$(id -un)" ] && [ "$(id -u)" != 0 ]; then
@@ -4422,13 +4531,14 @@ private.oo.heal.verify()     # <user> <home> # run the platform invariants confi
    out=$(private.as.user "$user" env -i HOME="$home" USER="$user" LOGNAME="$user" TERM="${TERM:-dumb}" \
      PATH="$home/oosh:$home/oosh/ng:$(private.oo.heal.path.system.get)" "$BASH" -c \
      "cd \"\$HOME/oosh\" && ./test.suite run platform.shared.$inv.invariant 1" 2>&1); r=$?
-   checked=$((checked + 1))
+   fail=$(printf '%s\n' "$out" | tr -d '\033' | sed 's/\[[0-9;]*m//g' | grep -a 'FAIL:' | head -1 | sed 's/.*FAIL:[[:space:]]*//')
    if [ "$r" = 0 ]; then
-     echo "  PASS $inv $user"
+     checked=$((checked + 1)); echo "  PASS $inv $user"
+   elif [ "$pending" = yes ]; then
+     echo "  NOT CHECKED $inv $user: group dev takes effect after a re-login (${fail:-rc $r})"
    else
-     fail=$(printf '%s\n' "$out" | tr -d '\033' | sed 's/\[[0-9;]*m//g' | grep -a 'FAIL:' | head -1 | sed 's/.*FAIL:[[:space:]]*//')
+     checked=$((checked + 1)); rc=1; failed=$((failed + 1))
      echo "  FAIL $inv $user: ${fail:-rc $r}"
-     rc=1; failed=$((failed + 1))
    fi
  done
  if [ "$rc" = 0 ]; then
@@ -4438,6 +4548,7 @@ private.oo.heal.verify()     # <user> <home> # run the platform invariants confi
  fi
  return $(result)
 }
+
 
 private.oo.heal.note()     # <rc> <step> <text> # add one line to the summary of oo heal and raise its rc to <rc> when that is higher #
 {
@@ -4452,11 +4563,11 @@ private.oo.heal.summary()     #  # print the summary of oo heal, one line per st
 {
  # Owner decision 10: after a green verify the install state is 99, so
  # `ossh install` skips the computer and `oo state` agrees.
- local r step text mark
+ local r step text mark cannot=""
  echo "oo heal — summary"
  while IFS='|' read -r r step text; do
    [ -n "$step" ] || continue
-   case "$r" in 0) mark="healed" ;; 1) mark="left  " ;; *) mark="cannot" ;; esac
+   case "$r" in 0) mark="healed" ;; 1) mark="left  " ;; *) mark="cannot"; [ -n "$cannot" ] || cannot="$step: $text" ;; esac
    echo "  $mark  $step: $text"
  done <<< "$healNotes"
  case "${healRc:-0}" in
@@ -4467,7 +4578,7 @@ private.oo.heal.summary()     #  # print the summary of oo heal, one line per st
        create.result 1 "healed, but the install state could not be set to 99 — $RESULT"
      fi ;;
    1) create.result 1 "something is left for you — the lines marked left above" ;;
-   *) create.result 2 "cannot heal — the line marked cannot above" ;;
+   *) create.result 2 "cannot heal — $cannot" ;;
  esac
  echo "rc $(result): $RESULT"
  return $(result)
@@ -4528,6 +4639,100 @@ private.oo.state.machine.create()     # <?machine:SETUP_SERVER> # create the ins
  create.result 0 "${machine} created"
  return $(result)
 }
+
+private.oo.heal.config.guard()     #  # in the clean process of oo heal, point CONFIG at the file that is not there again — loading config (config.init) points it at ~/config/user.env; outside the heal nothing happens #
+{
+ # The guard holds only until `config` is loaded: config.start runs
+ # config.init, which sets CONFIG=$CONFIG_PATH/user.env. Every load in the
+ # heal is followed by this (T-OO-HEAL-CONFIG-GUARD). A guard on the config
+ # side (config.init honouring OOSH_HEAL_CLEAN) would be the better place —
+ # config is not this package's file; not now.
+ [ -n "$OOSH_HEAL_CLEAN" ] && export CONFIG="$OOSH_DIR/.heal.noconfig"
+ return 0
+}
+
+
+
+private.oo.heal.config.load()     # <probeFn> # load config through private.this.script.load (unless <probeFn> is a function already) and keep the heal's CONFIG guard; rc 0 when <probeFn> is a function afterwards #
+{
+ private.this.script.load config "$1"; local rc=$?
+ private.oo.heal.config.guard
+ return "$rc"
+}
+
+
+
+private.oo.heal.privilege.ensure()     #  # decide ONCE, before anything changes, whether this heal may act as root: root; else interactive (stdin a terminal, no OOSH_NO_INSTALL or OOSH_HEAL_NONINTERACTIVE) may ask for the sudo password once (sudo -v) and runs on the cached credential; non-interactive only sudo -n, and every later sudo of this process is sudo -n; OOSH_HEAL_ROOT=yes|no, OOSH_HEAL_INTERACTIVE=yes|no #
+{
+ # A non-interactive run (CI, os platform.test, the idempotence invariant, a
+ # script) must never stop at a password prompt: sudo prompts on /dev/tty
+ # even with stdin closed. The owner allowed ONE prompt, for a person. In a
+ # non-interactive run $SUDO is `sudo -n ` and `sudo` itself a function adding
+ # -n, so no method of this process (ogit's sudo re-run included) can ask
+ # (T-OO-HEAL-NONINTERACTIVE-NO-PROMPT).
+ OOSH_HEAL_INTERACTIVE=no
+ if [ -t 0 ] && [ -z "$OOSH_NO_INSTALL" ] && [ -z "$OOSH_HEAL_NONINTERACTIVE" ]; then
+   OOSH_HEAL_INTERACTIVE=yes
+ fi
+ if [ "$(id -u)" = 0 ]; then
+   OOSH_HEAL_ROOT=yes
+ elif ! command -v sudo >/dev/null 2>&1 && [ "$(type -t sudo)" != function ]; then
+   OOSH_HEAL_ROOT=no
+ elif sudo -n true 2>/dev/null; then
+   OOSH_HEAL_ROOT=yes
+ elif [ "$OOSH_HEAL_INTERACTIVE" = yes ] && sudo -v; then
+   OOSH_HEAL_ROOT=yes
+ else
+   OOSH_HEAL_ROOT=no
+ fi
+ if [ "$OOSH_HEAL_INTERACTIVE" = no ] && [ "$(id -u)" != 0 ]; then
+   SUDO="sudo -n "
+   sudo() { command sudo -n "$@"; }
+ fi
+ export OOSH_HEAL_ROOT OOSH_HEAL_INTERACTIVE SUDO
+ return 0
+}
+
+
+
+private.oo.heal.root.need()     # <base> <branch> # echo what of the heal needs root on this computer, space-separated: group-dev, developking, developking-home, base, launcher, drop-in, worktrees; nothing when the heal needs no root; silent getter #
+{
+ # NO create.result — a getter consumed as $(...). The up-front question of
+ # oo heal: a run that needs root and cannot get it stops with rc 2 BEFORE
+ # anything is changed; a user heals their own account without sudo.
+ private.this.script.load user user.get
+ private.this.script.load ogit ogit.branch.get
+ local base="$1" need="" devHome d
+ private.this.group.exists dev || need="$need group-dev"
+ devHome=$(user.get home developking 2>/dev/null)
+ [ -n "$devHome" ] || need="$need developking"
+ [ -n "$devHome" ] && [ ! -d "$devHome" ] && need="$need developking-home"
+ [ -d "$base" ] || need="$need base"
+ private.this.file.same "$OOSH_DIR/templates/user/thisLauncher" /usr/local/bin/this \
+   || private.oo.path.writable.is /usr/local/bin/this || need="$need launcher"
+ { [ -e /etc/oosh/boot ] || [ -L /etc/oosh/boot ] || grep -q oosh /etc/profile.d/oosh.sh 2>/dev/null; } \
+   && ! private.oo.path.writable.is /etc/profile.d && need="$need drop-in"
+ if [ -d "$base" ]; then
+   while IFS= read -r d; do
+     [ "$(private.ogit.folder.shape "$d")" = worktree ] && { need="$need worktrees"; break; }
+   done < <(private.ogit.base.folders.list "$base")
+ fi
+ echo "${need# }"
+}
+
+
+
+private.oo.heal.fresh.run()     # <home> <command> # run <command> in a fresh process of this user: env -i with HOME=<home>, ~/oosh first on the system PATH, `this` from ~/oosh; prints its output; rc of the command #
+{
+ # The heal's own process carries the clean environment of the tree it runs
+ # from; what the user's next shell will see is only seen in a fresh one.
+ local home="${1:-$HOME}" command="$2"
+ # path-exception: the PATH of a fresh process of this user, from ~/oosh and the system
+ env -i HOME="$home" USER="$(id -un)" LOGNAME="$(id -un)" TERM="${TERM:-dumb}" LOG_LEVEL=1 PATH="$home/oosh:$home/oosh/ng:$(private.oo.heal.path.system.get)" \
+   "$BASH" -c 'source "$HOME/oosh/this" >/dev/null 2>&1 || exit 2; '"$command"
+}
+
+
 
 ### new.method
 
@@ -4600,8 +4805,8 @@ oo.start() # <method> <parameter> # default start and parameter processing
   # fresh computer has no `this` on PATH, an old one the wrong one, and its
   # ~/config/user.env must not be read (private.oo.heal.env.clean).
   if [ "$1" = heal ] && [ -z "$OOSH_HEAL_CLEAN" ]; then
-    shift
-    private.oo.heal.env.clean "$@"
+    # <branch> <who> only — a third word must not become the tree.
+    private.oo.heal.env.clean "$2" "$3"
     return $?
   fi
   #echo "sourcing init"
