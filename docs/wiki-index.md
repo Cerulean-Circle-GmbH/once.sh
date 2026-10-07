@@ -26,13 +26,13 @@ Welcome to the documentation wiki for the oosh / once.sh project. This wiki prov
 - [Log Levels and Testing](log-levels-and-testing.md) - Diagnostic reference: log level 0-7 details, config.save pollution bug, set +x bug, debugging guide, and proposed fixes
 - [Config System Documentation](config.md) - Environment configuration persistence and management
 - [Debug System Documentation](debug.md) - Interactive step debugger, stack traces, and trap handlers
-- [OO Framework Documentation](oo.md) - Script creation, version control, package management
+- [OO Framework Documentation](oo.md) - Script creation, version control, package management, `oo heal`, `oo update`, `oo deinstall`
 - [State Machine Documentation](state.md) - Creating and managing state machines for multi-step workflows
-- [Repair Toolkit](repair-toolkit.md) - The explicit repair primitives (`oo user.fix`,  `config init.*`, `ossh rights.fix` / `folder.fix`) and which symptom needs which
+- [Repair Toolkit](repair-toolkit.md) - Not sure what is wrong? `oo heal.status`, then `oo heal` ([oo.md](oo.md#ooheal)). The explicit repair primitives (`oo user.fix`,  `config init.*`, `ossh rights.fix` / `folder.fix`) and which symptom needs which
 - [Test Suite](test-suite.md) - Writing and running tests with `test.suite`: core and platform categories, the post-install gate, the runner's guards
 - [FAQ](faq.md) - Frequently asked questions
 - [Troubleshooting](troubleshooting.md) - Symptoms and their fixes
-- [Install bootstrap (init/oosh)](install-bootstrap.md) - The installer's clean-environment re-exec: what is carried, what is seeded, why
+- [Install bootstrap (init/oosh)](install-bootstrap.md) - The installer's clean-environment re-exec: what is carried, what is seeded, why; and the heal arm (`curl … | sh -s -- heal`)
 
 ## Infrastructure Tools
 

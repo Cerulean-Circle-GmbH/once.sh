@@ -27,7 +27,7 @@
 - Integration with Keycloak
 
 ## Directory Structure (High-level)
-- `init/` : Installation and bootstrap scripts (once, oosh, deinstall.oosh)
+- `init/` : Installation and bootstrap scripts (once, oosh — the installer and, with `heal`, the curl form of `oo heal`; `deinstall.oosh` is retired, use `oo deinstall`)
 - `docs/` : Documentation (this outline, diagrams)
 - `test/` : Test scripts and scenarios
 - `ng/`, `su/`, `os.specific/`, `templates/`, `external/`, `old/` : Modules, OS-specific, templates, external, and legacy code

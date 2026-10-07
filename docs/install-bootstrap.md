@@ -4,7 +4,8 @@
 self-contained, including its `$HOME` recovery block (its twin in `boot` went with
 `boot`). This page documents its **clean-environment guarantee**: the `env -i`
 self-re-exec (the `cleanEnv` block), what is carried, what is seeded, and why.
-For how a shell starts once installed see [config.md § The PATH line](config.md#the-path-line); for the design record see
+The file serves **four delivery paths** — the curl one-liner, `ossh install <host>` (which copies it over),
+drag-and-drop, and the **heal** (`curl … | sh -s -- heal`, see [The heal arm](#the-heal-arm)). For how a shell starts once installed see [config.md § The PATH line](config.md#the-path-line); for the design record see
 [the clean-environment spec](superpowers/specs/2026-09-14-clean-environment-guarantee-design.md).
 
 
@@ -75,6 +76,7 @@ load-bearing and *wrongly* conclude Group 2 is removable.
 | `SUDO_USER` | assigned nowhere in the file. `sudo ./init/oosh` would otherwise lose the invoker, and the post-install `user oosh.install "$SUDO_USER"` silently never runs |
 | `OOSH_REPO` | assigned nowhere in the file. A fork or private-repo override would otherwise fall back to public GitHub with no error |
 | `USER`, `LOGNAME` | login sets them, **bash does not** — `env -i bash` arrives with both empty. Install state 13 (`private.check.priviledges.checked`) routes root vs user on `$USER`, so a root install with no later sudo hop was routed into the user lane. `this` now heals `USER` from `id -un` exactly as it heals `$SUDO`; the re-exec carries both for every non-oosh child |
+| `TMPDIR` | read by the heal arm (`${TMPDIR:-/tmp}`): the folder its fresh clone is made under. Carried only when the caller has one |
 
 **Group 2 — pass-through.** `init/oosh` reads **none** of these. They are carried for the children.
 
@@ -149,6 +151,52 @@ unattended installer cannot answer anyway).
 > The probe deliberately runs at `mktemp`'s mode 600 — the one permission the real
 > `ossh.prereqs.install` call site grants, and no more.
 
+## The heal arm
+
+`init/oosh heal [<branch>] [all]` is the installer's fourth delivery path: it does not install, it hands
+over to a **fresh clone's `oo heal`** ([oo.md § oo.heal](oo.md#ooheal) has the heal itself). It is the form
+for a computer where `~/oosh` is missing, old or broken.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh | sh -s -- heal [<branch>] [all]
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh)" sh heal
+```
+
+**Never `sh -c "$(curl …)" heal`**: after the command string the first word is `$0`, so the script would
+start with *no* arguments and run an install. The extra `sh` makes `heal` the first argument. (In the pipe
+form `sh -s -- heal` the arguments are positional as usual.)
+
+**Position.** The arm sits after the `git` and bash 4+ checks and **before** the sudo check
+(`# BEGIN healArm` … `# END healArm`): healing one's own account needs no sudo, so a user on a machine without
+sudo can heal. Phase A's package-list refresh runs only when it must install `git` or bash, for the same
+reason.
+
+**The contract.**
+
+- **Arguments:** `all` means every user; any other word is the branch, with a leading `origin/` stripped. The
+  default branch is `OOSH_SELF_BRANCH`, so the one-liner of the prod branch heals to prod. An empty argument or
+  one starting with `-` is refused (`heal: bad argument`); `id -un` failing is refused too.
+- **A fresh temp clone.** `mktemp -d` makes `oosh-heal.XXXXXX` under `$TMPDIR` (else `/tmp`), mode `755`, and
+  `git clone -b <branch> $OOSH_REPO` (default: the public HTTPS URL) goes into `t` beneath it, reading
+  `/dev/null`; then `chmod -R go+rX` on it, so another user's hop can read it. For `all` the folder is
+  always under `/tmp`, because every user's hop must reach it. The clone is **never** `~/oosh`.
+- **`OOSH_REPO` is handed over with `env`** (`env OOSH_REPO=… bash <clone>/oo heal …`), because `sudo` resets
+  the environment and a plain assignment would be lost.
+- **`all` runs under `sudo -H`** when the caller is not root; with no `sudo` installed the arm dies naming
+  it (`'all' heals every user as root — run it as root, or install sudo`).
+- **stdin.** In the pipe form stdin *is* the script, so the child must never read it: it reads `/dev/tty`
+  when there is a terminal (so it can ask for the sudo password), else `/dev/null`.
+- **The child's rc is kept** (`exit "$_hr"`): 0 healed, 1 something is left for you, 2 cannot heal. The temp
+  clone is removed afterwards.
+
+The child is `oo heal` of the clone, which re-runs itself once in a clean process (`env -i`).
+
+**The size exception.** The cap on `init/oosh` stays 700 lines for everything else, but the heal arm is
+all-or-nothing and has to live in the one file the curl form fetches. Its block says why on the line after
+`# BEGIN healArm` (`# size-exception: …`) and **leaves the count**; a block without that reason line counts
+fully (`homeRecovery`, `cleanEnv` and `brokenTree` count). **T-INIT-SIZE-CAP** prints both numbers —
+now `init/oosh is 715 lines, 695 counted (cap 700; 20 lines in size-exception blocks)`.
+
 ## The `brokenTree` check
 
 After the `OOSH_DIR` resolve (the `~/oosh` link, then the clone layout), and before
@@ -157,11 +205,9 @@ anything is reused, the installer looks at the tree it is about to use (the
 has a `MERGE_HEAD` (a merge in progress) or a `HEAD` that is not a `ref: ` line (a
 detached HEAD): its conflicted files would otherwise be executed. It dies with
 the message `existing <dir> is mid-merge or detached and is not reused` and the
-one command to run, which points at the coming `heal`
-(`curl … init/oosh | sh -s -- heal`).
+one command to run, which is the heal: `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<OOSH_SELF_BRANCH>/init/oosh | sh -s -- heal`.
 
 The block reads `.git/MERGE_HEAD` and `.git/HEAD` itself and never calls `git`:
 the tree may belong to another user, and `git` would answer "dubious ownership",
 which must not be mistaken for a broken tree. A `.git` **file** (a linked
-worktree) is not a directory and passes. `init/oosh` is 691 lines of its
-700-line cap.
+worktree) is not a directory and passes.

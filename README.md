@@ -54,6 +54,34 @@ Substitute the `prod` segment of the URL with `dev` (or any branch name) to
 install from a non-default branch, e.g. `…/dev/init/oosh`.
 
 
+## heal - bring a computer to the standard dev model
+
+A machine whose oosh is old, half-installed or broken (a conflicted `~/oosh`, a real `~/config`, an old
+branch, `oo mode` finding nothing) is healed with one command. Like the installer, it is fetched from GitHub:
+
+| Method    | Command                                                                                           |
+|:----------|:--------------------------------------------------------------------------------------------------|
+| **curl**  | `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh \| sh -s -- heal [<branch>] [all]` |
+| **wget**  | `wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh \| sh -s -- heal [<branch>] [all]` |
+| **sh -c** | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" sh heal [<branch>] [all]` |
+
+> **The `sh` before `heal` in the `sh -c` form is required.** The first word after the command string is
+> `$0`, so `sh -c "$(curl …)" heal` starts the script with no arguments and runs an *install*, not a heal.
+
+The heal clones `<branch>` fresh into a temporary folder and runs *that* tree's `oo heal` — it never touches
+your `~/oosh`, so it works when `~/oosh` is the broken part. `<branch>` defaults to the branch of the URL
+(the `prod` one-liner heals to `prod`); `all` heals every user and needs root (it asks `sudo` for it). It builds
+the standard dev model — group `dev`, `developking`, the shared base with `main/` and `<branch>/` as clean
+clones, the shared config, and `~/oosh` + `~/config` of each user — and prints what it found, what it changed
+and what is left for you. Nothing is deleted: a broken folder is moved to `<base>.aside/<name>.<ts>`, a real
+`~/config` is kept as `config.orig.<ts>` (a few values are imported), and a folder it does not own is only reported.
+It ends with a check of four invariants and exits `0` (healed and verified), `1` (something is left for you) or
+`2` (it cannot heal). Afterwards open a new terminal and `oo mode <branch>`.
+
+On a machine where oosh runs, the same thing is `oo heal [<branch>] [all]` (read-only first look: `oo heal.status`);
+for a remote host `ossh heal <host> [<user>|all] [<branch>]`. See [docs/oo.md](docs/oo.md#ooheal) and
+[docs/repair-toolkit.md](docs/repair-toolkit.md).
+
 ### More detailed logging for debugging is available with these commands
 ```
 unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" | tee install.log.txt

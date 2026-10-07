@@ -198,6 +198,17 @@ What happens during install:
 6. Creates user account and symlinks
 7. Sets login shell to bash 4+
 
+**Installing a different ref (`OSSH_INSTALL_BRANCH`).** `os platform.test <branch>` exports
+`OSSH_INSTALL_BRANCH` around its `ossh install` calls so an older ref is installed first. When it is set,
+`ossh install` pushes **that ref's own `init/oosh`** (the installer contract changes between refs; this
+tree's bootstrap would drive the old tree) — read with `ogit file.show`, `origin/<branch>` first, the local
+`<branch>` only when `origin/<branch>` does not resolve — and hands the remote installer **that branch**
+(`private.ossh.install.installer.get`, `private.ossh.install.branch.get`). The remote installer clones a
+branch (`git clone -b`), so a value that is not a branch on origin is refused before any connection (rc 1),
+after **one fetch** (`private.ossh.origin.branch.check`; if the branch was pushed since, run
+`ogit remote.fetch`). A commit sha cannot be installed as it is: `os platform.heal.test` ships it as a
+temporary branch first. Unset, the install uses this tree's `init/oosh` and branch, as before.
+
 ### Prereqs (`ossh prereqs.install`)
 
 If the remote is missing oosh's install-time tools, run `ossh prereqs.install <host>` first. It installs the package list appropriate to the remote's package manager (detected via `ossh pm.discover`):
@@ -231,6 +242,49 @@ The remote install runs over ssh+sh (no bash on remote required), so this works 
 Either way, `user.oosh.install` then copies `/home/shared/.ssh/`'s `2cuGitHub` + `config` (with the `Host 2cuGitHub` block) + `known_hosts` into every new user's own `~/.ssh/`, so `git clone 2cuGitHub:…`, `oo update`, and `oo checkout` just work for every oosh user.
 
 If both paths fail (test.wo-da.de unreachable AND no local templates AND no caller-side deploy key), install still succeeds — only the GitHub-access setup is skipped. A `warn.log` line flags this.
+
+## Healing a remote host (`ossh heal`)
+
+```bash
+ossh heal <sshConfigHost> [<user>|all] [<branch>]
+```
+
+The [curl form of `oo heal`](oo.md#ooheal) over ssh, for a host you reach from another machine (a container
+behind a port, a Mac in the next room). `<user>` defaults to `all`; `<branch>` defaults to the branch of this
+tree. It is **not** `ossh install`'s push, which writes `~/oosh` and skips a host at state 99 or with a `~/oosh`
+— exactly the hosts a heal is for.
+
+**What is pushed where.** This tree's `init/oosh` is written to a fresh
+`/tmp/oosh-heal-init.XXXXXX` on the host (`mktemp` there: a new name, never a file someone else placed in
+`/tmp`; `private.ossh.heal.push`) — never to `~/oosh`, and with no state-99 or `~/oosh` skip. Its heal arm then
+clones `<branch>` fresh on the host and runs *that* tree's `oo heal`
+([install-bootstrap.md § The heal arm](install-bootstrap.md#the-heal-arm)). Both temp files are removed
+afterwards (best effort; the arm removes its own clone). The path that comes back must be the **clean last
+line** of the answer and a name of the expected prefix: a host whose `.bashrc` prints noise never has that
+noise spliced into the next remote command (`private.ossh.heal.path.get`).
+
+**`<user>` or `all`.**
+
+| Argument | The remote command (`private.ossh.heal.command.get`) |
+|---|---|
+| `all` (the default) | `sh <initFile> heal <branch> all` — root heals every user; when the login is not root the arm uses `sudo -H` |
+| one user | the arm runs **as that user**: directly when that is the login, else `sudo -H -u <user>` (the temp files are made readable first) |
+
+`<user>` and `<branch>` are put into a remote command line, so only name characters are accepted and no
+leading `-`; anything else is refused (rc 2, before a connection).
+
+**`OOSH_HEAL_LOCAL=1`** heals from code that is not pushed. A bundle of the **local** `<branch>` of this tree
+(`ogit bundle.create`) is written to `/tmp/oosh-heal-bundle.XXXXXX` on the host and becomes `OOSH_REPO`
+there — the arm clones a bundle as it clones a URL. `<branch>` must be a local branch. Mind what is shipped:
+the bundle is the **committed** branch, but the `init/oosh` pushed beside it is the **working-tree** file.
+Without the variable, a branch that is not on origin gets a warning after **one fetch** (the clone on the host
+may fail).
+
+**Return code.** The remote `rc` unchanged: `0` healed and verified, `1` something is left for you, `2` cannot
+heal (these are [`oo heal`'s](oo.md#ooheal)); `ssh` itself answers `255` when the connection fails. `ossh heal`
+also returns `2` when nothing could be sent (no connection, a temp file or bundle that could not be written,
+a bad argument). The run is `ssh -tt`, so the output carries carriage returns: **a caller that captures it
+must `tr -d '\r'`** before comparing lines. The remote summary and the PASS/FAIL table of the verify are shown.
 
 ## Hardening
 
@@ -295,6 +349,14 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh config.shared.create` | Create shared SSH config |
 | `ossh config.shared.link` | Link user to shared config |
 | `ossh install` | Install oosh on remote host |
+| `ossh heal` | Heal oosh on a remote host: `<sshConfigHost> <?user:all> <?branch>`; rc is the remote `oo heal`'s |
+| `private.ossh.heal.push` | `<host>` — writes this tree's `init/oosh` to a fresh `/tmp/oosh-heal-init.XXXXXX` on the host; `RESULT` = the remote path |
+| `private.ossh.heal.bundle.push` | `<host> <branch>` — writes a bundle of the local branch to `/tmp/oosh-heal-bundle.XXXXXX` (`OOSH_HEAL_LOCAL=1`) |
+| `private.ossh.heal.command.get` | `<initFile> <branch> <user> <?bundle>` — the remote command that runs the heal arm; silent getter |
+| `private.ossh.heal.path.get` | `<prefix>` — the last line of stdin when it is `<prefix>` plus name characters only; silent getter |
+| `private.ossh.origin.branch.check` | `<branch>` — rc 0 when `origin/<branch>` resolves; on a miss one fetch, then again; silent |
+| `private.ossh.install.branch.get` | The branch `ossh install` hands the remote installer: `$OSSH_INSTALL_BRANCH`, else this tree's; silent getter |
+| `private.ossh.install.installer.get` | The `init/oosh` `ossh install` pushes: that of `$OSSH_INSTALL_BRANCH` when set, else this tree's; silent getter |
 | `ossh login` | Interactive SSH login |
 | `ossh key.push` | Push SSH key to remote host |
 | `ossh id.create` | Create new SSH key pair |

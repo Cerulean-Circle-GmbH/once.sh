@@ -129,6 +129,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `repo.grep` | `<pattern> <?dir:$OOSH_DIR> <?pathspecs...>` | `git grep -nE <pattern>` over the tracked files of `<dir>` (the tree sweeps); variadic, so `<?dir>` precedes `<pathspecs>` |
 | `repo.files.list` | `<?dir:$OOSH_DIR>` | echo the tracked files of `<dir>`, one per line |
 | `repo.init` | `<dir> <?bare:no> <?branch:main>` | initialise a repository in `<dir>` (`bare=yes` for a bare one) with `<branch>` as its initial branch; git creates a missing parent. The branch name is checked first (`check-ref-format --branch`), so an invalid one is refused before anything is created; whether git knows `-b` is decided before `init` runs (a git older than 2.28 gets a plain init, then `symbolic-ref HEAD`), so a real failure never triggers a second run; rc 1 with git's reason when it cannot |
+| `bundle.create` | `<ref> <?dir:$OOSH_DIR> <?out:->` | write a bundle of `<ref>` from `<dir>` to `<out>` (`-` = stdout, so it streams over ssh byte for byte; nothing else prints to stdout); a relative `<out>` resolves inside `<dir>`; rc 1 and the reason when `<ref>` is unknown. `ossh heal` with `OOSH_HEAL_LOCAL=1` ships unpushed code this way |
 
 ### file
 
@@ -142,7 +143,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 |--------|-----------|-------------|
 | `branch.get` | `<?dir:$OOSH_DIR>` | echo the current branch of `<dir>`, sanitised (`refs/heads/`, `refs/remotes/origin/`, `heads/origin/`, `origin/` stripped); empty when detached or not a repo |
 | `branch.list` | `<?source:local> <?dir:$OOSH_DIR>` | echo branch names one per line: `local`, `remote` (cached origin/* refs, offline) or `all` |
-| `branch.check` | `<ref> <?dir:$OOSH_DIR>` | rc 0 when `<ref>` resolves in `<dir>` |
+| `branch.check` | `<ref> <?dir:$OOSH_DIR>` | rc 0 when `<ref>` resolves in `<dir>` — the one existence check (`ossh`, `os platform.test` and `oo update` ask it); pass `origin/<name>` for a branch that exists only on origin, `refs/remotes/origin/<name>` to be exact |
 | `branch.find` | `<commit> <?dir:$OOSH_DIR>` | echo every branch (local and remote) containing `<commit>` |
 | `branch.checkout` | `<ref> <?dir:$OOSH_DIR>` | check `<ref>` out in `<dir>` |
 | `branch.upstream.set` | `<ref> <?dir:$OOSH_DIR>` | make the current branch of `<dir>` track `<ref>` (e.g. `origin/dev`) |
@@ -178,8 +179,9 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `remote.url.set` | `<url> <?remote:origin> <?dir:$OOSH_DIR>` | point `<remote>` of `<dir>` at `<url>` |
 | `remote.fetch` | `<?prune:no> <?dir:$OOSH_DIR>` | fetch origin into `<dir>`; `prune=yes` drops deleted remote branches |
 | `remote.pull` | `<?url> <?branch> <?dir:$OOSH_DIR>` | pull into `<dir>`; with `<url> <branch>` pull that branch from that URL instead of the tracking remote (the https fallback of `oo.update`) |
-| `remote.fetch.url` | `<url> <branch> <?dir:$OOSH_DIR>` | fetch `<branch>` from `<url>` into `FETCH_HEAD` of `<dir>` without adding a remote and without merging; RESULT = the fetched commit sha, rc from git. The fetch half of the HTTPS fallback of `oo update` (the gate looks at the sha before anything is merged). `<url>` completes with the origin URL, `<branch>` with the cached origin branches, `<dir>` through the shared `ogit.parameter.completion.dir` |
+| `remote.fetch.url` | `<url> <branch> <?dir:$OOSH_DIR>` | fetch `<branch>` from `<url>` into `FETCH_HEAD` of `<dir>` without adding a remote and without merging; RESULT = the fetched commit sha, rc from git. The fetch half of the HTTPS fallback of `oo update` (the pull is: fetch, then verify the ref exists, then fast-forward only — `oo update`'s gate refuses first, and nothing is ever merged). `<url>` completes with the origin URL, `<branch>` with the cached origin branches, `<dir>` through the shared `ogit.parameter.completion.dir` |
 | `remote.push` | `<?branch> <?tags:no> <?dir:$OOSH_DIR>` | push `<branch>` (default: the tracking branch) to origin; `tags=yes` pushes tags too |
+| `remote.branch.delete` | `<branch> <?remote:origin> <?dir:$OOSH_DIR>` | delete `<branch>` on `<remote>` (`push --delete`); refuses `dev`, `testing`, `prod` and `main` without asking the remote; rc 1 and the reason when git refuses. How the platform test removes the temporary branch it shipped |
 
 ### index
 

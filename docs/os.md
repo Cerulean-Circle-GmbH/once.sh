@@ -67,12 +67,12 @@ fi
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `os platform.list` | | List all platforms with workspace, package manager, and tier |
-| `os platform.test` | `<platform> <?terminal> <?notests> <?branch>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests, `notests` to skip Phase B, `<branch>` to install an older ref first (see [Installing an older ref first](#installing-an-older-ref-first)). Arguments are positional: an empty placeholder keeps its place, so `os platform.test ubuntu_24_04 "" notests` runs without tests and without a terminal |
+| `os platform.test` | `<platform> <?terminal> <?notests> <?branch>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests, `notests` to skip Phase B, `<branch>` (a branch on origin) to install an older ref first (see [Installing an older ref first](#installing-an-older-ref-first)). Arguments are positional: an empty placeholder keeps its place, so `os platform.test ubuntu_24_04 "" notests` runs without tests and without a terminal |
 | `os platform.test.all` | | Test all platforms, report summary. Exit 0 only if all must-pass platforms pass |
 
 ### Platform test building blocks
 
-`os platform.test` is three private methods in a row, so a scenario test (the coming `os platform.heal.test`) can reuse any of them:
+`os platform.test` is three private methods in a row, so a scenario test (`os platform.heal.test` — planned, see the plan; it has not landed yet) can reuse any of them:
 
 | Method | What it does |
 |---|---|
@@ -84,9 +84,9 @@ fi
 
 ### Installing an older ref first
 
-`os platform.test <platform> "" "" <branch>` takes a branch name or commit sha of this repo. `<branch>` is exported as `OSSH_INSTALL_BRANCH` to the two install steps only (`ossh install` of `test` in `container.up`, of `bash-user` in `users.install`; a prefix assignment, so it lives for that one call). **Planned:** `ossh install` honours `OSSH_INSTALL_BRANCH` once package B4 lands; until then the variable is set and ignored. macOS refuses a `<branch>` (the CI workflow installs its own branch).
+`os platform.test <platform> "" "" <branch>` takes a **branch on origin** of this repo. `<branch>` is exported as `OSSH_INSTALL_BRANCH` to the two install steps only (`ossh install` of `test` in `container.up`, of `bash-user` in `users.install`; a prefix assignment, so it lives for that one call). `ossh install` honours it: it pushes **that ref's own `init/oosh`** and hands the remote installer that branch ([ossh.md § Remote Installation](ossh.md#remote-installation)). macOS refuses a `<branch>` (the CI workflow installs its own branch).
 
-Before anything starts, the era gate `private.os.platform.branch.gate <branch> <?dir>` reads `init/oosh` of the ref through `ogit.file.show` and refuses a ref whose installer lacks the `mode root` contract, i.e. older than commit `b8b90b82` (older refs use `mode ssh` and rsync, which the current `ossh install` cannot drive). It tries `<branch>`, then `origin/<branch>` (what the completion offers), and reads the **local** repo: a local-only sha passes the gate and then fails in the container, which clones from the remote.
+Before anything starts, the era gate `private.os.platform.branch.gate <branch> <?dir>` reads `init/oosh` of the ref through `ogit.file.show` and refuses a ref whose installer lacks the `mode root` contract, i.e. older than commit `b8b90b82` (older refs use `mode ssh` and rsync, which the current `ossh install` cannot drive). It tries `origin/<branch>` — and only that: the container clones from origin, so a local-only branch, or a stale local branch of the same name, must not pass, and a commit sha cannot be cloned. The gate reads the remote-tracking ref of the local repo, which can be stale until the next fetch. A sha is the scenario test's job (`os platform.heal.test` ships it as a temporary branch first; planned, see the plan).
 
 ### Platform Test Flow (Docker platforms)
 

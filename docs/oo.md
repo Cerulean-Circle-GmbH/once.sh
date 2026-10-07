@@ -421,21 +421,156 @@ so `oo <TAB>` offered verbs with nothing behind them.
 | `oo prereqs.install` | install the install-time prereqs locally — `git`, `curl`, and `bash` 4+ when the running shell is older. Called by `init/oosh` through `ossh prereqs.install`; you rarely type it |
 ### oo.update
 
-Pulls latest changes from GitHub, then self-heals user symlinks.
+Pulls the latest changes from GitHub through a gate, then heals.
 
 ```bash
 oo update
 ```
 
-After a successful `git pull`, `oo update` delegates to
-`config init.user $USER` to re-apply the canonical `~/config` +
-`~/oosh` symlinks. This catches the case where `init/oosh` has been
-re-run out of band (e.g. a curl one-liner from the README) and
-clobbered the symlinks — `oo mode <TAB>` would otherwise show
-nothing. The heal is idempotent (no-op when symlinks are already
-canonical) and silenced during the pre-install bootstrap when
-`developking` doesn't yet exist. See
+**The pull gate.** `oo update` used to run a plain `git pull`, which on a tree that
+had diverged from origin *merged* origin into it. It is now a **fetch and a
+fast-forward**, never a merge, and it runs only when nothing is in the way
+(`private.oo.update.pull.gate`, read-only). Each refused state names the **one
+command to run**:
+
+| State of the tree | `RESULT` says |
+|---|---|
+| a merge is in progress | `run: ogit merge.abort <dir>` |
+| a cherry-pick is in progress | `run: ogit commit.pick.abort <dir>` |
+| a rebase is in progress | `run: git -C <dir> rebase --abort` |
+| conflict markers are committed (a file holding all three marker kinds — one kind alone is no conflict) | `run: oo heal` |
+| uncommitted changes | `run: ogit status.show short <dir>` |
+| detached HEAD | `run: ogit branch.checkout <branch> <dir>` |
+| diverged from `origin/<branch>` | `run: oo heal` |
+| not a repository | `run: oo heal` |
+
+`private.oo.update.pull` then fetches `origin`. When that fails (a shared clone fetching over an SSH alias
+the user does not have) it falls back to `OOSH_REPO` over HTTPS — fetching the branch into `FETCH_HEAD`,
+never merging, the configured remote unchanged. After the fetch it checks that the branch exists on
+origin (`origin has no branch <b> — <dir> is not pulled`) and fast-forwards only.
+A refusal is rc 1 with the reason in `RESULT`.
+
+**The heal steps run regardless of the pull.** Refused or not, `oo update` goes on with the steps a broken
+computer needs most: it re-applies the canonical `~/config` + `~/oosh` symlinks through
+`config init.user $USER` (idempotent — a no-op when they are canonical, silent before
+`developking` exists), and it calls `private.oo.heal.shell`, the shell step `oo heal` runs for every user:
+git trust of every folder under the base and no dead `safe.directory` entry, the oosh `.bashrc` and the
+session files, no retired login drop-in, the launcher, and no frozen `PATH` line in `~/.once`. As root on an
+installed computer it also writes the shared `odocker.env`, and it corrects a guessed computer name.
+
+**A markers refusal loads no script.** When the tree has committed conflict markers, the scripts in it do
+not parse, so the steps that load `config`, `user` or `odocker` are skipped (a warning says so and names
+`oo heal`); `oo`'s own steps run.
+
+This catches the case where `init/oosh` has been re-run out of band (e.g. a curl one-liner from the README)
+and clobbered the symlinks — `oo mode <TAB>` would otherwise show nothing. See
 [Repair toolkit](repair-toolkit.md) for the full primitive set.
+
+### oo.heal
+
+Brings **this computer** from any prior state to the standard dev model, so that `oo mode <branch>` works.
+
+```bash
+oo heal [<branch>] [all]      # <?branch> <?who:$USER> — a user name or all
+oo heal.status [<branch>] [all]   # read-only: what oo heal would do
+```
+
+`oo heal.status` reads and never writes. Each line it prints is `[ok]` (canonical), `[heal]` (`oo heal`
+changes it), `[left]` (`oo heal` reports it, you act) or `[keep]` (an old backup, kept). rc 1 when anything
+is not canonical, and `RESULT` names the command: `not canonical — run: oo heal <branch> <who>`.
+`<branch>` defaults to the branch of the tree running the heal, else `$OOSH_BRANCH`, else `dev`; `<who>`
+defaults to the calling user, and `oo heal all` (a first argument of `all`) means every user.
+
+**Three entry forms, one heal.** All end in `oo heal` of a tree:
+
+| Form | Use it when |
+|---|---|
+| `oo heal [<branch>] [all]` | oosh runs on this machine |
+| `ossh heal <host> [<user>\|all] [<branch>]` | healing a remote host from here — see [ossh.md](ossh.md#healing-a-remote-host-ossh-heal) |
+| `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh \| sh -s -- heal [<branch>] [all]` | oosh is missing, old or broken |
+
+The curl form has a wget twin and an `sh -c` twin:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh | sh -s -- heal dev all
+wget -qO- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh | sh -s -- heal dev all
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh)" sh heal
+```
+
+The `sh -c` form needs the extra `sh` before `heal`: the first word after the command string is `$0`, so
+`sh -c "$(curl …)" heal` runs the script with **no** arguments (`$0` = `heal`) and does an install, not a heal.
+The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a temporary folder and runs
+*that* tree's `oo heal` — it never touches `~/oosh`, so it works when `~/oosh` is the broken tree
+(see [install-bootstrap.md § The heal arm](install-bootstrap.md#the-heal-arm)).
+
+**The owner's rules.**
+
+- The target is the **standard dev model**: the canonical base (`<basehome>/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh`)
+  with `main/` and `<branch>/` as clean clones of origin, group `dev` with setgid, `developking` with a home,
+  the `sharedConfig`, the launcher `/usr/local/bin/this`, and `~/oosh` → `<base>/<branch>`, `~/config` →
+  `sharedConfig` for each healed user. The canonical base is **built fresh** from origin, over HTTPS.
+- **Foreign folders are untouched and reported.** A `~/oosh` that points outside the base is relinked to the
+  base; the folder it pointed to is left alone, its git state reported (`[left] … untouched`).
+- **A broken canonical folder is moved, never deleted.** A `main/` or `<branch>/` with a merge in progress,
+  committed conflict markers, uncommitted changes, a detached HEAD, a diverged history, another branch
+  checked out, or a symlink is moved whole to `<base>.aside/<name>.<ts>` (a sibling of the base, never taken
+  for a branch folder) and cloned again; the heal then reports `rc 1` so you look at it. The tree the heal
+  itself runs from is never moved. A clean clone that is only behind is fast-forwarded; a linked worktree is
+  converted with `ogit worktree.remove` when its gate lets it. A folder that is no repository and not empty
+  stops the heal (rc 2): move it away and run again.
+- **A real `~/config` is kept** as `~/config.orig.<ts>` and linked to the `sharedConfig`; an allow-listed few
+  values are imported from it — `LOG_LEVEL` and the computer name `OOSH_SSH_CONFIG_HOST` — only into empty values;
+  `PATH`, `HOME`, `LOG_DEVICE`, `OOSH_DIR`, `OOSH_MODE` and `CONFIG_CHAIN_*` are never carried
+  (`private.config.orig.import`, [config.md](config.md)). Old formats in a real `~/config` (a `PATH` or
+  `HOME` export, `LOG_DEVICE=/dev/stdout`, `CONFIG_CHAIN_*`) are reported, never carried over.
+- **Legacy `ssh.*` backup folders** in the home are reported (`[left]`) with the command that deals with
+  them: `user ssh.backup.migrate`.
+- **State 99 on green.** After a green verify the install state machine `SETUP_SERVER` is set to 99
+  (created first when missing), so `ossh install` skips the computer and `oo state` agrees.
+- **Never automatic.** The heal runs only when invoked — never at shell start (the May-8 rule).
+- **`oo mode` is not called.** The heal leaves `~/oosh` on `<base>/<branch>` and writes `OOSH_MODE=<branch>` into the
+  user's session files and `~/.config/oosh/mode-env.bash` (`private.oo.mode.env.write`, the file `oo mode`
+  writes too), so `oo mode <branch>` afterwards says "already current".
+
+**Order.** `diagnose` (read-only, printed first — the same lines as `oo heal.status`) → `system` (group `dev`,
+`developking` and its home, the base with group `dev` and setgid, the launcher, no retired drop-in; may ask
+for the sudo password once) → `code` (`main/` and `<branch>/`) → `config` (the `sharedConfig`, then
+`config init.shared`) → `user(s)` (`config init.user <user> <base>/<branch>`, the import, then as that user the
+session files, `mode-env.bash` and the shell step) → `env` (once, in a fresh process: `config init.env`, then
+`config validate required`) → `verify` → `summary` (one line per step: `healed`, `left`, `cannot`).
+Steps that cannot be done without root stop the run (rc 2) with `run: sudo -H oo heal <branch>`.
+
+**The clean re-exec.** Every form ends in **one clean process**: `oo heal` re-runs itself through
+`env -i`, keeping only `HOME`, `USER`, `LOGNAME`, `TERM`, `LANG`, `LC_ALL`, `LOG_LEVEL`, `OOSH_REPO` and
+`SSH_AUTH_SOCK`, and setting `OOSH_HEAL_CLEAN=1`, `OOSH_DIR=<the tree>` and `PATH` to the tree plus the
+system directories. `CONFIG` is set to a file that **does not exist** (`<tree>/.heal.noconfig`), so the cold
+start of `this` never sources an old `~/config/user.env` — the Mac's old one exported `PATH` with `.`,
+`HOME` and `LOG_DEVICE=/dev/stdout`. The bash that runs the heal is the bash the process was started with
+(`$BASH`), not the system's 3.2 on macOS.
+
+**Return codes.** `0` healed and every invariant PASS; `1` something is left for you (the lines marked
+`left`, or a FAIL from verify); `2` cannot heal (the line marked `cannot` — no root, no source for the clones,
+a folder in the way).
+
+**Verify** runs the four platform invariants as the healed user, in a fresh process, from their `~/oosh`:
+`configLayout`, `layout`, `boot` and `oosh` (`./test.suite run platform.shared.<name>.invariant 1`). One line
+each: `PASS`, `FAIL <invariant> <user>: <its recovery>` (rc 1) or `NOT CHECKED <invariant> <user>: <why>`,
+which does not fail the heal. It says NOT CHECKED when the invariant file is not in the branch, and when
+another user's invariants would have to run without being root.
+
+**`all`** heals every user — root, `developking` and every user whose home holds `~/oosh` or `~/config` — and
+needs root: as a user, `oo heal <branch> all` stops with rc 2 and names `sudo -H oo heal <branch> all`.
+A user who is already canonical keeps their branch under `all`. Healing a named user other than yourself
+needs root too. `sudo -H oo heal <branch>` is also what is named when the system part needs root.
+
+**Worked example — a machine on an old branch.** The tree on this machine predates the heal, so the curl
+form fetches the heal from the branch itself:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/dev/init/oosh | sh -s -- heal dev all
+# open a new terminal, then:
+oo mode dev          # "already current" — the heal left ~/oosh on <base>/dev
+```
 
 ### oo.user.fix
 
@@ -446,6 +581,9 @@ canonical shared tree. Thin alias for [`config init.user`](config.md).
 oo user.fix              # repair this user (= $USER)
 oo user.fix developking  # repair another user (requires root)
 ```
+
+`oo user.fix` takes **one** argument, the username. `config init.user`'s second parameter
+(`<sharedOosh>`, the `~/oosh` target) is the heal's, not this command's.
 
 Handles real-dir → symlink conversion (preserves originals as
 `oosh.orig.<ts>` / `config.orig.<ts>`), ownership, branch detection,
@@ -592,7 +730,7 @@ even its discovery. Under `OOSH_NO_INSTALL` (every test run) nothing is installe
 or refreshed. Otherwise `oo cmd` discovers the package manager if `OOSH_PM` is
 empty and, on apt, refreshes the package lists **once** before the first real
 install — a fresh apt image has empty lists (T-OO-CMD-REFRESH-ONCE). Once means
-`OOSH_APT_UPDATED`, which `init/oosh` exports after its own `apt-get update` and
+`OOSH_APT_UPDATED`, which `init/oosh` exports after its own `apt-get update` — run only when it must install `git` or bash 4+, and flagged only after a refresh that worked — and
 `oo cmd` exports after one **that worked** — a failed refresh is retried by the
 next `oo cmd` — so the `oo cmd` children of an install do not refresh again
 (`config save` never persists it). There is no other marker: the old
@@ -656,7 +794,7 @@ do by running one.
 
 | Verb | Status |
 |---|---|
-| `oo tmp.cleanup.testing` | **DESTRUCTIVE.** Removes oosh *and SSH keys* from the machine completely. It exists for tearing down a throwaway test host. Never run it on a machine you care about |
+| `oo tmp.cleanup.testing` | **Retired.** It used to remove oosh *and SSH keys* and `developking` with `sudo rm -rf`. It refuses now (rc 1) and points at `oo deinstall`, which keeps everything as `.orig.<ts>` |
 | `oo install.dev` | **Deprecated.** The old GitHub-keys install path. Use `init/oosh` (the curl one-liner) or `ossh install <host>` |
 | `oo install.dev.keys` | **Deprecated**, same family |
 ## Installation
@@ -673,17 +811,25 @@ Creates `$OOSH_DIR/external/myscript` → `/path/to/scripts/myscript`
 
 ### oo.deinstall
 
-Removes oosh and cleans up configurations.
+Takes oosh off this home. It **asks first and deletes nothing**.
 
 ```bash
-oo deinstall
+oo deinstall          # asks on the terminal; type the word deinstall
+oo deinstall --yes    # no question
 ```
 
-**Warning**: This removes:
-- `$HOME/oosh`
-- `$HOME/config`
-- `$HOME/.once`
-- Restores original `.bashrc`
+The question is read from the terminal (`/dev/tty`), not from stdin, so a piped `yes` cannot answer it;
+anything but the word `deinstall` refuses (rc 1, nothing changed). Then, through `private.this.entry.aside`,
+the kernel's one move-aside:
+
+- `~/config`, `~/init`, `~/.once`, `~/.bashrc` and `~/oosh` are taken off — a symlink is removed, a real entry is
+  **kept as `<name>.orig.<ts>`** (one timestamp for the run, never nested). `~/oosh` goes **last**, because the
+  scripts the command still needs come through it.
+- The installer stays reachable: `init/oosh` is copied to `~/install.oosh`; an older `~/install.oosh` is kept
+  as `install.oosh.orig.<ts>`.
+- The `.bashrc` from before oosh is restored with `cp -p` from `~/.bashrc.pre-oosh` (else from
+  `~/.bashrc.bak.without.completion`).
+- `RESULT` lists what was kept and names the way back: `reinstall with: ~/install.oosh`.
 
 ## Server Setup State Machine
 
@@ -874,7 +1020,40 @@ Internal functions (not for direct use):
 | `private.oo.method.end.get <file> <startLine>` | The line that closes the definition starting at `<startLine>`; empty when another definition or the marker comes first — `oo method.delete` refuses then |
 | `private.oo.path.sudo.get <path> <?mode>` | The one privilege rule: nothing when this user may write `<path>` (its nearest existing parent while it is not there) or is root (`$SUDO` empty); else `$SUDO`, or `sudo -n ` in mode `quiet`, which never asks for a password. `oo update`'s drop-in cleanup and launcher install use quiet (T-OO-PATH-SUDO-GET, T-OO-PRIVILEGE-QUIET) |
 | `private.oo.pm.install.prefix.get <?pmCmd>` | What goes in front of the package-manager command: the sudo decision — none for brew (Homebrew refuses root; root under sudo hops back to `$SUDO_USER`), none for root (`$SUDO` empty), else `$SUDO` — and the non-interactive env of `private.oo.pm.env.get`. `oo.cmd` and `oo.prereqs.install` both use it (T-OO-PM-INSTALL-PREFIX-GET) |
+| `private.oo.heal.env.clean <?branch> <?who> <?tree>` | Runs `oo heal` of `<tree>` again in one clean process (`env -i`, the carried list above, `OOSH_HEAL_CLEAN=1`, `CONFIG` naming a file that is not there); plain bash, called before `this` is loaded |
+| `private.oo.heal.path.system.get` | The system `PATH` of a clean process (`/usr/local`, `/usr`, `/` `bin` and `sbin`; Homebrew's `/opt/homebrew` on macOS); silent getter |
+| `private.oo.heal.branch.get` | The branch `oo heal` heals to by default: the branch of the tree running it, else `$OOSH_BRANCH`, else `dev`; silent getter |
+| `private.oo.heal.basehome.get` | The folder the homes live in: the parent of `developking`'s home, else `/Users` (macOS) or `/home`; silent getter |
+| `private.oo.heal.path.get <basehome> <which>` | `base` (the components base) or `sharedConfig` under `<basehome>`; silent getter |
+| `private.oo.heal.root.check` | Predicate: this process is root, or sudo works (without a password, or after asking once on a terminal) |
+| `private.oo.heal.system.diagnose <base> <branch>` | Read-only lines of the system part (`[ok]`/`[heal]`/`[left]`); rc 1 when anything is not canonical |
+| `private.oo.heal.user.diagnose <user> <home> <base> <branch>` | Read-only lines of one home: `~/oosh` (canonical, foreign, worktree, plain-clone, plain-dir, none), `~/config`, old env formats, `.bashrc`, `~/.once`, legacy `ssh.*` folders, dead `safe.directory` entries, `mode-env.bash`, self-links, old backups |
+| `private.oo.heal.folder.gate <dir> <branch>` | What the heal does with a canonical folder: `missing`, `keep`, `fastforward`, `aside`, `worktree` or `occupied`; read-only, built on the same probes as the pull gate |
+| `private.oo.heal.folder.aside <dir>` | Moves a canonical folder, whole, to `<base>.aside/<name>.<ts>`; never deletes; refuses the tree the heal runs from; `RESULT` = the new path |
+| `private.oo.heal.system <branch>` | The system part: group `dev`, `developking` and its home, the shared base, the launcher, no retired drop-in; rc 2 when root is needed and not there |
+| `private.oo.heal.code <base> <branch>` | `main/` and `<branch>/` as clean clones; aside, fast-forward, worktree conversion; offline the tree running the heal is the source; rc 1 left for you, rc 2 no source |
+| `private.oo.heal.config <sharedConfig>` | Makes the `sharedConfig` when missing (owner `developking`), then `config init.shared`; rc 2 when it cannot be made |
+| `private.oo.heal.user <user> <base> <branch> <sharedConfig> <?keep>` | Heals one user: `config init.user`, the import from a kept `~/config`, then as the user the session files, `mode-env.bash` and the shell step; removes old self-links |
+| `private.oo.heal.shell <?home> <?base> <?load>` | The shell step `oo update` and `oo heal` share (git trust, `.bashrc`, session files, retired drop-in, launcher, `~/.once`); `load no` skips what loads config or user |
+| `private.oo.heal.env <?home>` | Once, in a fresh process of the user: `config init.env`, then `config validate required` |
+| `private.oo.heal.users.list` | The users `oo heal all` heals, one per line; silent getter |
+| `private.oo.heal.verify <user> <home>` | Runs the four invariants as `<user>`: `PASS` / `FAIL` / `NOT CHECKED` lines |
+| `private.oo.heal.note <rc> <step> <text>`, `private.oo.heal.summary` | The summary lines of the run and its rc; on rc 0 the install state goes to 99 |
+| `private.oo.heal.state.finish` | Sets `SETUP_SERVER` to 99 (creating it when missing) |
+| `private.oo.state.machine.create <?machine>` | Creates the install state machine with every state of the install lane, standing at `setup`; `private.init.state.machine` and the heal both call it |
+| `private.oo.update.pull.gate <?dir>` | rc 0 when `<dir>` may be pulled; else rc 1 and the one command to run in `RESULT` |
+| `private.oo.update.pull <?dir>` | The pull through the gate: fetch (HTTPS fallback) and fast-forward, never a merge |
+| `private.oo.update.markers.get <?dir>` | `file:line` of committed conflicts (a file holding all three marker kinds); silent getter |
+| `private.oo.answer.get <prompt> <?device>` | Writes the prompt to the terminal and echoes the one line typed there; nothing and rc 1 on end of input; silent getter (`oo deinstall`'s question) |
+| `private.oo.mode.env.write <branch> <?oldBranch>` | Writes `~/.config/oosh/mode-env.bash` (`hash -r`, `OOSH_MODE`, and a PATH repair only when `<oldBranch>` differs); `oo mode` and the heal both call it |
+| `private.oo.shared.base.ensure <basehome> <?owner>` | Creates the shared base directories install state 31 needs; the state and the heal call it |
+| `private.oo.shared.base.share <base>` | Gives the base group `dev` and setgid (only when a `dev` group exists; the base only, never recursive) |
+| `private.oo.shared.dir.ensure <dir> <?owner>` | Creates the missing segments with the dev-group policy (group `dev`, mode 2775 when a `dev` group exists); an existing directory is never changed |
+| `private.oo.shared.config.ensure <sharedConfig> <rootConfig> <?userConfig>` | Seeds the shared config once and links the user config to it; an existing one is never copied into, but the installing state machine is carried in every run |
+| `private.oo.shared.config.state.carry <sharedConfig> <rootConfig> <?userConfig>` | Carries `stateMachines` and `current.state.machine.env` into the shared config, the old ones kept as `.orig.<ts>` |
 | `private.oo.path.writable.is <path>` | Predicate: may this user write `<path>`, or its nearest existing parent — the probe behind `private.oo.path.sudo.get`, separate so a test can answer "cannot write" for root too |
+
+`private.oo.entry.aside` is gone: the one move-aside is the kernel's `private.this.entry.aside` ([oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)), shared by `symlink.with.backup`, `oo deinstall` and the heal.
 
 ## See Also
 

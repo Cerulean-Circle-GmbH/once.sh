@@ -13,6 +13,7 @@ listed here run only when invoked.
 
 | Primitive | Scope | When to use |
 |---|---|---|
+| [`oo heal.status`, then `oo heal [<branch>] [all]`](oo.md#ooheal) | The whole computer: group `dev`, `developking`, the canonical base with `main/` and `<branch>/` as clean clones, the `sharedConfig`, the launcher, and `~/oosh` + `~/config` of every healed user; then a verify of four invariants | **Not sure what is wrong.** `oo heal.status` reads and changes nothing; `oo heal` brings the machine to the standard dev model. Three forms: `oo heal` (oosh runs here), `ossh heal <host> [<user>\|all] [<branch>]` (a remote host), and `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh \| sh -s -- heal [<branch>] [all]` (oosh missing, old or broken). rc 0 healed and verified, 1 something is left for you, 2 cannot heal |
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
 | [`config init.shared`](config.md) | `sharedConfig` dir mode 2775 + group `dev` | After cross-user perm drift, "Permission denied" on shared config writes |
@@ -61,24 +62,28 @@ listed here run only when invoked.
 The repair primitives are *not* run from shell startup, but two
 explicit user actions invoke them silently as part of their flow:
 
-- **`oo update`** (every successful `git pull`) calls
-  `config init.user $USER` to re-apply symlinks. Idempotent and
-  silent when nothing's drifted. This covers the common case
-  where init/oosh was re-run out of band — see
-  [`oo.md` § `oo.update`](oo.md#ooupdate). It also runs
-  `ogit safeDirectory.ensure` so every branch folder under the base
-  is trusted for you (skipped quietly when there is no base yet).
+- **`oo update`** pulls through a gate (a fetch and a fast-forward, never a merge; a merge or
+  rebase in progress, committed conflict markers, uncommitted changes, a detached HEAD or a diverged branch is
+  refused with the one command to run) and then, **whether or not the pull happened**, runs the heal
+  steps: `config init.user $USER` re-applies the symlinks (idempotent, silent when nothing has drifted —
+  the case where init/oosh was re-run out of band), and `private.oo.heal.shell`, the shell step `oo heal` runs
+  for every user, covers git trust of every branch folder under the base (`ogit safeDirectory.ensure`, skipped
+  quietly when there is no base yet) and no dead `safe.directory` entry, the oosh `.bashrc` and the session
+  files, the retired login drop-in, the launcher, and a frozen `PATH` line in `~/.once`. With committed conflict
+  markers the steps that load scripts are skipped and `oo heal` is named. See
+  [`oo.md` § `oo.update`](oo.md#ooupdate).
 - **`ossh install …`** (state machine state 31) calls
   `private.oo.user.shared.symlinks.ensure` for `$HOME` to set up
   root's symlinks on every install pass. Idempotent.
 
-Outside those two entry points, the user runs the primitives
+Outside those two entry points (and never at shell start), the user runs the primitives
 explicitly when something drifts.
 
 ## Backups
 
 The install and the repairs keep what they replace, with a timestamp, and never
-delete it:
+delete it. Everywhere the move-aside is the kernel's `private.this.entry.aside`
+(`private.this.symlink.with.backup`, `oo deinstall` and the heal share it):
 
 - A real `~/config` or `~/oosh` becomes `<name>.orig.<ts>` (one `<ts>` for both)
   and the symlink takes its place. A backup is **never nested**: when
@@ -88,11 +93,20 @@ delete it:
   is logged with its old target.
 - A `.bashrc` hand-edited after the install is kept as `.bashrc.orig.<ts>` (the very
   first original stays `.bashrc.pre-oosh`); an unchanged repeat adds no copy.
+- `oo deinstall` keeps `~/config`, `~/init`, `~/.once`, `~/.bashrc`, `~/oosh` and an older
+  `~/install.oosh` the same way, after it asked for the word `deinstall` (or `--yes`).
+- A broken **canonical** folder (`main/` or `<branch>/` of the base, with a merge in progress, markers, changes,
+  a detached HEAD or a diverged history) is moved by `oo heal` to `<base>.aside/<name>.<ts>`, a sibling of the
+  base, so it is never mistaken for a branch folder. It is reported and left for you to look at, never deleted.
+- `init/deinstall.oosh` is **retired**: it removed `/home/shared`, `~/oosh`, `~/config` and `developking`
+  without asking. It refuses now and points at `oo deinstall`. `oo tmp.cleanup.testing` refuses too.
 
 ## Diagnostic: which primitive do I need?
 
 | Symptom | Run |
 |---|---|
+| I do not know what is wrong with this computer | `oo heal.status` (read-only), then `oo heal` — or, when oosh is missing or broken: `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh \| sh -s -- heal [<branch>] [all]` |
+| `oo update` says the pull was refused (merge in progress, conflict markers, diverged, detached, dirty) | the one command its message names; `oo heal` for markers and a diverged tree |
 | Root-owned `ssh.*` directories in my home that I cannot read | `user ssh.backup.status`, then `user ssh.backup.migrate` |
 | `oo mode <TAB>` empty | `oo user.fix` |
 | `config save` says the shared `user.env` keeps its PATH line until every user has `~/.config/oosh/user.session.env` | `sudo oo update` — as root it gives every linked user their file and switches the shared config ([config.md](config.md) § *The switch and its gate*) |
@@ -162,7 +176,7 @@ that includes the recovery command.
 
 ## See also
 
-- [`oo.md`](oo.md) § `oo.user.fix`, `oo.update`
+- [`oo.md`](oo.md) § `oo.heal`, `oo.update`, `oo.user.fix`, `oo.deinstall`
 - [`config.md`](config.md) § Repair primitives
 - [`ossh.md`](ossh.md) § Repairing `~/.ssh`
 - [`ogit.md`](ogit.md) § Layout, § Migrating a host from worktrees to clones

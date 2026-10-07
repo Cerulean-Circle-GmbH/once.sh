@@ -289,6 +289,13 @@ SGID 2775 to the files — `private.ensure.sharedTree` sets group and `g+w` only
 group ownership on writes is enforced by every writer calling
 `private.ensure.groupWrite`.
 
+State 31 creates the shared config once and never copies into an existing one — but on
+every run it carries the **installing state machine** (`stateMachines/` and
+`current.state.machine.env` of the user's config, else root's) into an existing
+`sharedConfig`, the old ones kept as `.orig.<ts>` (`private.oo.shared.config.state.carry`,
+called from `private.oo.shared.config.ensure`). A real `~/config` is kept as
+`config.orig.<ts>` through `private.this.symlink.with.backup`, never nested.
+
 #### `config.init.full [<username>]`
 Repair end-to-end: runs `config.init.shared`, then `config.init.user`, then
 `config.init.env` (only for self / root), then `config.init.check`. Defaults to
@@ -309,7 +316,7 @@ Ensures the shared `sharedConfig/` directory has group `dev`, recursively
 ./config init.shared
 ```
 
-#### `config.init.user [<username>]`
+#### `config.init.user [<username>] [<sharedOosh>]`
 Ensures `<user>`'s `~/config` and `~/oosh` symlinks point at the canonical
 shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
 `~/oosh` directories are renamed to `~/config.orig.<timestamp>` (data
@@ -321,10 +328,27 @@ The symlink hop runs AS `<user>` and loads the shared tree's `this` through
 caller's `$OOSH_DIR`, which the caller expands: root's 0700 `/root/oosh` or a
 temp clone the target cannot read.
 
+**`<sharedOosh>` names the `~/oosh` target.** Without it the target is the first
+that resolves: the tree running the command (when it sits under the shared
+components base), the link `~/oosh` already is, then the branch of `$OOSH_MODE`
+or the git branch, else `dev`. `oo heal` names the branch folder it heals to, so
+the link that is there no longer wins over it. The explicit target must be a
+branch folder the base lists — a clone directly under the components base, no
+symlink (`private.ogit.base.folders.list`; the base is
+`private.config.shared.oosh.base.get`). It is canonicalised to the file system's
+letter case first (`/Users/shared` and `/Users/Shared` are one folder on macOS).
+Anything else is refused: rc 1, `config.init.user: <path> is not a branch folder
+under <base> — nothing changed`, and no link is touched. Tab completion of
+`<sharedOosh>` offers exactly those branch folders, and `<username>` completes
+from `user.list`.
+
 ```bash
-./config init.user           # self
-./config init.user bob       # bob (caller must be root or sudoer)
+./config init.user                          # self
+./config init.user bob                      # bob (caller must be root or sudoer)
+./config init.user bob <base>/dev           # bob, ~/oosh → <base>/dev (a branch folder of the base)
 ```
+
+`oo user.fix` takes the username only; `<sharedOosh>` belongs to the heal.
 
 #### `config.init.env`
 Regenerates `user.env`, `oosh.env`, and `log.env` by calling `config save`
@@ -411,7 +435,7 @@ export OOSH_MODE="dev"
 | `LOG_INSTALL`, `INSTALL_LOG`, … (`*INSTALL*`) | Install-only state — must not persist into user sessions |
 | `SUDO_*` | Injected by sudo for one command |
 | `OOSH_SHLVL`, `OOSH_STATUS`, `OOSH_PROMPT`, `OOSH_CONFIG_NEEDS_SAVE` | **Runtime readings** of the one shell that ran the save. Saved, they come back into every new shell and are saved again. T-CONFIG-CMD-SAVE-OOSH |
-| `OOSH_CLEAN_ENV`, `OOSH_APT_UPDATED` | **One-run gates** of `init/oosh`, exported during the install. Saved, a later `init/oosh` run from a normal shell skipped its clean-environment restart and its `apt-get update`. T-CONFIG-CMD-SAVE-OOSH |
+| `OOSH_CLEAN_ENV`, `OOSH_APT_UPDATED` | **One-run gates** of `init/oosh`, exported during the install. Saved, a later `init/oosh` run from a normal shell skipped its clean-environment restart and its package-list refresh. T-CONFIG-CMD-SAVE-OOSH |
 | `LOG_NAME`, `LOG_DEVICE`, `LOG_LIVE` | **Per-user session values** — only in each user's `log.session.env`, never the shared `log.env`. T-CONFIG-CMD-SAVE-LOG |
 | `OOSH_MODE` (once switched) | **Per user** — the branch the user's own `~/oosh` points at, in their `oosh.session.env`. Decided below the `case` by the layout: before the switch it stays in the shared `oosh.env`, which other users still read. T29, T-CONFIG-CMD-SAVE-OOSH |
 | `ODOCKER_SG` | **Runtime marker** of odocker's one `sg` re-run (the socket group a shell does not know yet). T-CONFIG-ODOCKER-SG-NOT-SAVED |
@@ -691,6 +715,30 @@ These functions are used internally and generally not called directly:
 | `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
 | `private.config.env.lines.drop` | `<file> <prefix…>` → drops every line starting with a prefix, in place (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
 | `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written |
+| `private.config.env.line.set` | `<file> <name> <line>` → sets the definition of `<name>` in an env file to `<line>`, in place: every `export NAME=` and `export declare NAME=` line leaves, `<line>` goes in before the trailing chain block (the `.` and `source` lines at the end), one read and one write (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
+| `private.config.env.value.read` | `<file> <name>` → the value of the last `export NAME=` or `declare -x NAME=` line, read as data and never sourced, one pair of enclosing quotes taken off; rc 1 when there is no such line; silent |
+| `private.config.env.names.read` | `<file>` → the name of every variable an `export NAME=` or `declare -x NAME=` line assigns, once each, in order, read as data and never sourced; silent |
+| `private.config.host.name.valid` | `<name>` → rc 0 when `<name>` can be the computer name: letters, digits, `-` and `_`, starting with a letter or digit, no dot, at most 63 characters |
+| `private.config.shared.oosh.base.get` | the components base the branch folders sit in — the parent of developking's home + `/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh`, in the file system's letter case; the one base of `config init.user`'s `<sharedOosh>` check and of its completion; nothing and rc 1 when developking has no home; silent |
+| `private.config.orig.import` | `<origDir> <sharedConfig>` → carries an allow-listed few values from a kept-aside `~/config` into the shared config (see below) |
+
+**`private.config.orig.import`** is what `oo heal` calls after `config init.user` kept a real
+`~/config` as `config.orig.<ts>`. The old files (`user.env`, `oosh.env`, `log.env` of
+`<origDir>`) are read as **data** through `private.config.env.names.read` and
+`private.config.env.value.read` — nothing is sourced, because old files may hold code, and
+nothing in `<origDir>` is written. The last assignment of a name wins across the three files.
+
+- **Allow-list:** `LOG_LEVEL` (only a level `log.level` offers) goes to the shared `log.env`;
+  `OOSH_SSH_CONFIG_HOST` (the computer name — the router domain taken off through
+  `private.config.host.name.get`, and it must pass `private.config.host.name.valid`) goes to the shared
+  `oosh.env`. There is no e-mail variable in the config model, so none is carried.
+- **Never-list:** `PATH`, `HOME`, `LOG_DEVICE`, `OOSH_DIR`, `OOSH_MODE` and `CONFIG_CHAIN_*` are skipped,
+  with one summary line. Every other variable gets one info line (`skipped NAME (not carried over)`).
+- **Only into empty values.** A value the shared config already has is kept (a missing line counts as
+  empty). The line is rendered by `private.this.env.export.line.get` and written by
+  `private.config.env.line.set`, so the chain block stays last.
+- **RESULT:** `imported: <names or none> | skipped: <count>`. rc 1 for a missing argument; rc 2 and
+  `cannot write <file> …` when a write failed — the convention of the migrates.
 
 `config` also leans on the kernel's helpers (full list:
 [oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)):
