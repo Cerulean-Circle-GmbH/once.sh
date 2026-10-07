@@ -295,12 +295,55 @@ test.os.platformSplit() {
   done
   private.os.platform.gate.run p nobody >/dev/null 2>&1; [ $? = 1 ] || bad="$bad gate.run-accepts-unknown-user"
   os.platform.test no_such_platform_xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-platform-not-refused"
+  os.platform.test ubuntu_24_04 "" notests no-such-ref-xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-branch-not-refused"
+  type os.platform.test.completion.branch >/dev/null 2>&1 || bad="$bad no-branch-completion"
   [ -z "$bad" ] && create.result 0 "container.up, users.install and gate.run exist, platform.test calls them, an unknown platform and an unknown user are refused" || create.result 1 "split:$bad"
   return $(result)
 }
 test.case $level "T-OS-PLATFORM-TEST-SPLIT: platform.test is built from container.up, users.install and gate.run" test.os.platformSplit
 expect 0 "container.up, users.install and gate.run exist, platform.test calls them, an unknown platform and an unknown user are refused" \
   "the 250-line platform.test could not be reused by a scenario test"
+
+
+console.log "
+Test: private.os.platform.branch.gate
+===================================================================="
+
+test.case - "T-OS-PLATFORM-TEST-BRANCH-ERA-ARGS: branch.gate refuses a call without branch" \
+   private.os.platform.branch.gate 
+expect 1 "private.os.platform.branch.gate requires <branch>"
+
+# T-OS-PLATFORM-TEST-BRANCH-ERA: platform.test <branch> refuses a ref whose init/oosh is older than the
+# mode-root installer contract (b8b90b82). The gate alone is exercised, on a fixture repo with two
+# versions of init/oosh — no docker, no network, no real history.
+test.os.branchEra() {
+  local fx bad="" old new msg rc; fx=$(test.suite.fixture.make branchera)
+  mkdir -p "$fx/repo/init" || return 1
+  private.this.script.load ogit ogit.raw || return 1
+  ogit.raw "$fx/repo" init -q
+  printf '%s\n' '#!/usr/bin/env -iS bash' '# ./oosh mode ssh <host>' > "$fx/repo/init/oosh"
+  ogit.index.add all "$fx/repo" >/dev/null && ogit.commit.create old t@t t "$fx/repo" >/dev/null
+  old=$(ogit.raw "$fx/repo" rev-parse HEAD)
+  printf '%s\n' '#!/usr/bin/env bash' "  [ \"\$1\" = \"root\" ] || die \"only 'mode root' is supported (got '\$1')\"" > "$fx/repo/init/oosh"
+  ogit.index.add all "$fx/repo" >/dev/null && ogit.commit.create new t@t t "$fx/repo" >/dev/null
+  new=$(ogit.raw "$fx/repo" rev-parse HEAD)
+  private.os.platform.branch.gate "$old" "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
+  [ $rc = 1 ] || bad="$bad old-rc=$rc"
+  case "$msg" in *"$old"*"b8b90b82"*"mode ssh"*) ;; *) bad="$bad old-msg=[$msg]" ;; esac
+  case "$msg" in *eraB*platform.heal.test*) ;; *) bad="$bad old-msg-lacks-eraB" ;; esac
+  private.os.platform.branch.gate "$new" "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad new-rc=$rc"
+  private.os.platform.branch.gate HEAD "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad head-rc=$rc"
+  private.os.platform.branch.gate no/such-ref "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
+  [ $rc = 1 ] || bad="$bad missing-rc=$rc"
+  case "$msg" in *no/such-ref*) ;; *) bad="$bad missing-msg=[$msg]" ;; esac
+  private.os.platform.branch.gate --upload-pack=x "$fx/repo" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad dash-ref-accepted"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an init/oosh without the mode root contract and a missing ref are refused with rc 1, a ref with it passes" || create.result 1 "branch era:$bad"
+  return $(result)
+}
+test.case $level "T-OS-PLATFORM-TEST-BRANCH-ERA: platform.test <branch> refuses refs older than the mode-root installer contract" test.os.branchEra
+expect 0 "an init/oosh without the mode root contract and a missing ref are refused with rc 1, a ref with it passes" \
+  "refs before b8b90b82 use mode ssh and cannot be driven by the current ossh install"
 
 ### test.method
 

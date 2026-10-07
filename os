@@ -257,6 +257,41 @@ private.os.platform.gate.run()     # <platform> <user:test|root|oosh-user|bash-u
 }
 
 
+private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for platform.test: rc 0 when the init/oosh of <branch> (a branch name or commit sha of the repo in <dir>) carries the mode root installer contract, rc 1 and a message when the ref is missing or older than commit b8b90b82 #
+{
+ local branch="$1" dir="${2:-$OOSH_DIR}"
+ if [ -z "$branch" ]; then
+   create.result 1 "private.os.platform.branch.gate requires <branch>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ # Probe text: since b8b90b82 (23 Apr 2026) init/oosh answers any mode but root with
+ # "only 'mode root' is supported"; the older refs (b492b2e, 9824746e, 0f63df38, 1604e3e,
+ # 596ab0c) use `mode ssh` + rsync and do not contain that text. A ref beginning with
+ # a dash is never a ref (it would be read as an option by git).
+ private.this.script.load ogit ogit.raw || return 1
+ local contract="only 'mode root' is supported" content
+ case "$branch" in
+   -*) create.result 1 "<branch> $branch is not a branch name or commit sha"
+       error.log "$RESULT"
+       return 1 ;;
+ esac
+ # ogit.raw is the last resort here: no ogit method shows one file at a ref yet
+ # (ogit.commit.show shows a commit); the planned ogit.file.show <ref> <path> <?dir> replaces it.
+ if ! content=$(ogit.raw "$dir" show "$branch:init/oosh" 2>/dev/null); then
+   create.result 1 "ref $branch has no init/oosh in $dir (unknown branch or commit sha?)"
+   error.log "$RESULT"
+   return 1
+ fi
+ case "$content" in
+   *"$contract"*) create.result 0 "ref $branch carries the mode root installer contract"; return 0 ;;
+ esac
+ create.result 1 "ref $branch is older than commit b8b90b82: its init/oosh uses the mode ssh contract, which the current ossh install cannot drive; such refs are reproduced by the eraB.* breakages of os platform.heal.test"
+ error.log "$RESULT"
+ return 1
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,6 +346,11 @@ private.os.platform.cleanup() { # <port> # stops and removes Docker container on
   if [ -n "$containerId" ]; then
     docker rm "$containerId" 2>/dev/null
   fi
+}
+
+private.os.platform.install.branch.restore() { # <branch> <hadBranch:0|1> <oldValue> # after the two ossh install calls of platform.test: put OSSH_INSTALL_BRANCH back as it was (only touched when <branch> was given)
+  [ -n "$1" ] || return 0
+  if [ "$2" = 1 ]; then export OSSH_INSTALL_BRANCH="$3"; else unset OSSH_INSTALL_BRANCH; fi
 }
 
 private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd after an in-place openssh upgrade during install
@@ -422,18 +462,22 @@ os.platform.list() # # lists all platforms with tier info
   done
 }
 
-os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation on a single platform
+os.platform.test() # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch name or commit sha of this repo, installer contract mode root i.e. b8b90b82 or newer) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
 {
   local platform="$1"
   if [ -z "$platform" ]; then
-    error.log "Usage: os platform.test <platform> <?terminal> <?notests>"
+    error.log "Usage: os platform.test <platform> <?terminal> <?notests> <?branch>"
     return 1
   fi
   shift
+  # positional: an empty placeholder ("") for <terminal> or <notests> must still
+  # move on to the next parameter, so <branch> can be given without them
   local terminal="$1"
-  if [ -n "$1" ]; then shift; fi
+  if [ $# -gt 0 ]; then shift; fi
   local notests="$1"
-  if [ -n "$1" ]; then shift; fi
+  if [ $# -gt 0 ]; then shift; fi
+  local branch="$1"
+  if [ $# -gt 0 ]; then shift; fi
 
   private.os.platform.parse "$platform" || return 1
 
@@ -447,12 +491,23 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     return 1
   fi
 
+  # Era gate, before anything starts: the ref must carry the mode root installer contract
+  if [ -n "$branch" ]; then
+    private.os.platform.branch.gate "$branch" || return 1
+  fi
+
   local imageTag sshPort rc
   imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
   sshPort=8022
 
+  # <branch> reaches ossh install (container.up installs test, users.install bash-user)
+  # through OSSH_INSTALL_BRANCH, for the duration of those two methods only.
+  local hadBranch=0 oldBranch="${OSSH_INSTALL_BRANCH-}"
+  [ -n "${OSSH_INSTALL_BRANCH+x}" ] && hadBranch=1
+  [ -n "$branch" ] && export OSSH_INSTALL_BRANCH="$branch"
+
   # Reset/build/start the container, ssh, key, sudoers and the install for `test`
-  private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
+  private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || { private.os.platform.install.branch.restore "$branch" "$hadBranch" "$oldBranch"; return 1; }
 
   # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
   # Covers every install path we support in one run:
@@ -463,6 +518,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   #   bash-user — raw `useradd` on remote, then `ossh install <platform> bash-user`
   #               (caller-initiated install for a pre-existing account)
   private.os.platform.users.install "$platform"
+  private.os.platform.install.branch.restore "$branch" "$hadBranch" "$oldBranch"
 
   # ─── PHASE B: run test.suite gate 1 (core + platform invariant) on all 4 users ─
   local rcTest=0 rcRoot=0 rcOoshUser=0 rcBashUser=0
@@ -547,6 +603,10 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
 }
 os.platform.test.completion.platform() {
   private.os.platform.names
+}
+
+os.platform.test.completion.branch() {
+  private.this.script.load ogit ogit.branch.list && ogit.branch.list remote
 }
 
 os.platform.test.completion.terminal() {
