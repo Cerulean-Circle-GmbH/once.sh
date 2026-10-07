@@ -205,6 +205,12 @@ test.ossh.installBranchEnv.fixture() { # <fx> # the fixture repo <fx>/repo: main
   git -C "$fx/repo" checkout -q -b old; printf 'installer old\n' > "$fx/repo/init/oosh"
   git -C "$fx/repo" -c user.email=t@t -c user.name=t commit -q -am old
   git -C "$fx/repo" update-ref refs/remotes/origin/old old; git -C "$fx/repo" update-ref refs/remotes/origin/main main
+  # stale: origin/stale says "installer stale origin", the local stale moved on — the host clones origin
+  git -C "$fx/repo" checkout -q -b stale main; printf 'installer stale origin\n' > "$fx/repo/init/oosh"
+  git -C "$fx/repo" -c user.email=t@t -c user.name=t commit -q -am stale-origin
+  git -C "$fx/repo" update-ref refs/remotes/origin/stale stale
+  printf 'installer stale local\n' > "$fx/repo/init/oosh"
+  git -C "$fx/repo" -c user.email=t@t -c user.name=t commit -q -am stale-local
   git -C "$fx/repo" checkout -q main; git -C "$fx/repo" branch -q -D old
   printf 'installer worktree\n' > "$fx/repo/init/oosh"
   : > "$fx/ssh/public_keys/key.public_key"; : > "$fx/config.env"
@@ -244,6 +250,8 @@ test.ossh.installBranchEnv() {
   out=$(test.ossh.installBranchEnv.run "$fx" old)
   case "$out" in *"PUSH>installer old<"*) ;; *) bad="$bad old-push=[$out]" ;; esac
   case "$out" in *"RUN>-tt somehost ./oosh mode root somehost _ old 1<"*) ;; *) bad="$bad old-run=[$out]" ;; esac
+  out=$(test.ossh.installBranchEnv.run "$fx" stale)
+  case "$out" in *"PUSH>installer stale origin<"*) ;; *) bad="$bad stale-local-won=[$out]" ;; esac
   out=$( OSSH_INSTALL_BRANCH=old; OOSH_DIR="$fx/repo"; private.ossh.install.branch.get )
   [ "$out" = old ] || bad="$bad branch.get=[$out]"
   rm -rf "$fx"
@@ -259,20 +267,26 @@ expect 0 "the push carries the installer and the branch of OSSH_INSTALL_BRANCH, 
 # The remote installer clones a BRANCH (git clone -b); a commit sha cannot be
 # cloned that way. ossh.install refuses it with rc 1 and says the platform test
 # must ship it as a temporary branch — ossh.config.parse (the connection) is
-# never reached. A branch on origin (here only as origin/old) passes.
+# never reached. A branch on origin (here only as origin/old) passes. A miss
+# fetches origin once (a local bare repo here, no network) and checks again:
+# a branch pushed after the last fetch (late) passes.
 test.ossh.installBranchRefused() {
   local fx bad="" out sha
   fx=$(test.suite.fixture.make osshinstallbranchrefused)
   sha=$(test.ossh.installBranchEnv.fixture "$fx")
+  git init -q --bare "$fx/origin.git"; git -C "$fx/repo" push -q "$fx/origin.git" main:late 2>/dev/null
+  git -C "$fx/repo" remote add origin "$fx/origin.git"
   out=$(
-    private.this.script.load ogit ogit.branch.check
+    private.this.script.load ogit ogit.branch.check; private.this.script.load ogit ogit.remote.fetch
     OOSH_DIR="$fx/repo"
     ossh.config.parse() { echo "PARSE $*"; }
+    OSSH_INSTALL_BRANCH=late ossh.install somehost 2>/dev/null; echo "late-rc=$?"
     OSSH_INSTALL_BRANCH="$sha" ossh.install somehost 2>/dev/null; echo "sha-rc=$? result=[$RESULT]"
     OSSH_INSTALL_BRANCH=old ossh.install somehost 2>/dev/null; echo "old-rc=$?"
   )
-  case "$out" in *"sha-rc=1 result=["*"not a branch on origin"*"temporary branch"*"]"*) ;; *) bad="$bad sha=[$out]" ;; esac
-  [ "$(printf '%s\n' "$out" | grep -c '^PARSE')" = 1 ] || bad="$bad parse-count=[$out]"
+  case "$out" in *"sha-rc=1 result=["*"not a branch on origin"*"temporary branch"*"ogit remote.fetch"*"]"*) ;; *) bad="$bad sha=[$out]" ;; esac
+  [ "$(printf '%s\n' "$out" | grep -c '^PARSE')" = 2 ] || bad="$bad parse-count=[$out]"
+  case "$out" in *"PARSE somehost private.push.init.oosh"*"late-rc=0"*) ;; *) bad="$bad late-not-fetched=[$out]" ;; esac
   case "$out" in *"PARSE somehost private.push.init.oosh"*"old-rc=0"*) ;; *) bad="$bad old=[$out]" ;; esac
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "a sha is refused before any connection, a branch on origin passes" || create.result 1 "install branch refusal:$bad"
@@ -294,23 +308,33 @@ expect 0 "a sha is refused before any connection, a branch on origin passes" \
 # (no probe, no skip), runs `sh <it> heal <branch> …` with -tt, passes the
 # remote rc through unchanged and removes the temp files. OOSH_HEAL_LOCAL=1
 # ships a bundle of the local <branch> and puts OOSH_REPO=<bundle> in the
-# arm's environment. private.ossh.ssh and ossh.connection.open are stubbed and
-# record; the bundle the stub receives is checked with git — no network.
-test.ossh.healPushTarget.run() { # <fx> <rc> <args...> # ossh.heal <args> with the remote heal answering <rc>; the recording goes to <fx>/rec, the pushed bytes to <fx>/pushed.*; echoes rc=<rc of ossh.heal>
+# arm's environment. Only a clean LAST line of the remote stdout is a path
+# (dotfile noise of a broken host). private.ossh.ssh and ossh.connection.open
+# are stubbed and record; the bundle the stub receives is checked with git —
+# no network (the fixture has no origin, so the one fetch fails at once).
+test.ossh.healPushTarget.run() { # <fx> <rc> <args...> # ossh.heal <args> with the remote heal answering <rc> (FX_NOISE=before|after|inside dirties the temp path answer); the recording goes to <fx>/rec, the pushed bytes to <fx>/pushed.*; echoes rc=<rc of ossh.heal>
   local fx="$1" fxRc="$2"
   shift 2
   : > "$fx/rec"; rm -f "$fx/pushed.init" "$fx/pushed.bundle"
   (
     # ogit is loaded before OOSH_DIR moves to the fixture repo (it has no scripts)
     private.this.script.load ogit ogit.branch.get; private.this.script.load ogit ogit.branch.check
-    private.this.script.load ogit ogit.bundle.create
+    private.this.script.load ogit ogit.bundle.create; private.this.script.load ogit ogit.remote.fetch
     OOSH_DIR="$fx/repo"
     ossh.connection.open() { echo "OPEN $*" >> "$fx/rec"; }
+    test.ossh.healPushTarget.answer() { # <path> # the temp path as a host prints it, with FX_NOISE
+      case "$FX_NOISE" in
+        before) printf 'Welcome to the host\n%s\n' "$1" ;;
+        after)  printf '%s\nlogout noise\n' "$1" ;;
+        inside) printf '%s;touch x\n' "$1" ;;
+        *)      printf '%s\n' "$1" ;;
+      esac
+    }
     private.ossh.ssh() {
       echo "SSH>$*<" >> "$fx/rec"
       case "$*" in
-        (*"mktemp /tmp/oosh-heal-init."*)   cat > "$fx/pushed.init";   echo /tmp/oosh-heal-init.AbC123 ;;
-        (*"mktemp /tmp/oosh-heal-bundle."*) cat > "$fx/pushed.bundle"; echo /tmp/oosh-heal-bundle.XyZ789 ;;
+        (*"mktemp /tmp/oosh-heal-init."*)   cat > "$fx/pushed.init";   test.ossh.healPushTarget.answer /tmp/oosh-heal-init.AbC123 ;;
+        (*"mktemp /tmp/oosh-heal-bundle."*) cat > "$fx/pushed.bundle"; test.ossh.healPushTarget.answer /tmp/oosh-heal-bundle.XyZ789 ;;
         (*" heal "*) echo "REMOTE PASS/FAIL TABLE"; return "$fxRc" ;;
       esac
       return 0
@@ -320,7 +344,7 @@ test.ossh.healPushTarget.run() { # <fx> <rc> <args...> # ossh.heal <args> with t
   ) </dev/null
 }
 test.ossh.healPushTarget() {
-  local fx bad="" out rec
+  local fx bad="" out rec I=/tmp/oosh-heal-init.AbC123 B=/tmp/oosh-heal-bundle.XyZ789
   fx=$(test.suite.fixture.make osshhealpushtarget)
   git init -q -b main "$fx/repo"; mkdir -p "$fx/repo/init"
   printf 'heal installer of this tree\n' > "$fx/repo/init/oosh"
@@ -332,23 +356,42 @@ test.ossh.healPushTarget() {
   case "$rec" in "OPEN somehost"*) ;; *) bad="$bad no-open=[$rec]" ;; esac
   [ "$(cat "$fx/pushed.init" 2>/dev/null)" = "heal installer of this tree" ] || bad="$bad pushed-text"
   case "$rec" in *"~/oosh"*|*state.machine*|*"[ -d"*) bad="$bad probes-or-home=[$rec]" ;; esac
-  case "$rec" in *"SSH>-tt somehost "*"sh /tmp/oosh-heal-init.AbC123 heal feat"*"sudo -H -u bob "*) ;; *) bad="$bad user-run=[$rec]" ;; esac
+  case "$rec" in *"SSH>-tt somehost if [ \"\$(id -un)\" = bob ]; then sh '$I' heal feat; else chmod 644 '$I' && sudo -H -u bob sh '$I' heal feat; fi<"*) ;; *) bad="$bad user-run=[$rec]" ;; esac
   case "$rec" in *"heal feat all"*|*OOSH_REPO*|*bundle*) bad="$bad user-extra=[$rec]" ;; esac
-  case "$rec" in *"rm -f /tmp/oosh-heal-init.AbC123"*) ;; *) bad="$bad user-no-cleanup" ;; esac
+  case "$rec" in *"rm -f '$I'<"*) ;; *) bad="$bad user-no-cleanup" ;; esac
   case "$(cat "$fx/stdout")" in *"REMOTE PASS/FAIL TABLE"*) ;; *) bad="$bad table-not-shown" ;; esac
-  # 2. defaults: user all, this tree's branch
-  out=$(test.ossh.healPushTarget.run "$fx" 0 somehost); rec=$(cat "$fx/rec")
-  [ "$out" = rc=0 ] || bad="$bad default-rc=[$out]"
-  case "$rec" in *"SSH>-tt somehost sh /tmp/oosh-heal-init.AbC123 heal main all<"*) ;; *) bad="$bad default-run=[$rec]" ;; esac
-  # 3. OOSH_HEAL_LOCAL=1: a bundle of feat, OOSH_REPO in the arm's environment, both removed
+  # 2. defaults: user all, this tree's branch; the init file readable for every hop; ssh's 255 passes through
+  out=$(test.ossh.healPushTarget.run "$fx" 255 somehost); rec=$(cat "$fx/rec")
+  [ "$out" = rc=255 ] || bad="$bad default-rc=[$out]"
+  case "$rec" in *"SSH>-tt somehost chmod 644 '$I' && sh '$I' heal main all<"*) ;; *) bad="$bad default-run=[$rec]" ;; esac
+  # 3. OOSH_HEAL_LOCAL=1, all: a bundle of feat, OOSH_REPO in the arm's environment, both readable, both removed
   out=$(OOSH_HEAL_LOCAL=1 test.ossh.healPushTarget.run "$fx" 0 somehost all feat); rec=$(cat "$fx/rec")
   [ "$out" = rc=0 ] || bad="$bad local-rc=[$out]"
   case "$(git bundle list-heads "$fx/pushed.bundle" 2>/dev/null)" in *refs/heads/feat*) ;; *) bad="$bad no-bundle-of-feat" ;; esac
-  case "$rec" in *"SSH>-tt somehost env OOSH_REPO=/tmp/oosh-heal-bundle.XyZ789 sh /tmp/oosh-heal-init.AbC123 heal feat all<"*) ;; *) bad="$bad local-run=[$rec]" ;; esac
-  case "$rec" in *"rm -f /tmp/oosh-heal-init.AbC123 /tmp/oosh-heal-bundle.XyZ789"*) ;; *) bad="$bad local-no-cleanup" ;; esac
-  # 4. a word that is no user name: rc 2, nothing sent
-  out=$(test.ossh.healPushTarget.run "$fx" 0 somehost 'a;b' feat); rec=$(cat "$fx/rec")
-  { [ "$out" = rc=2 ] && [ -z "$rec" ]; } || bad="$bad bad-user=[$out|$rec]"
+  case "$rec" in *"SSH>-tt somehost chmod 644 '$I' '$B' && env OOSH_REPO='$B' sh '$I' heal feat all<"*) ;; *) bad="$bad local-run=[$rec]" ;; esac
+  case "$rec" in *"rm -f '$I' '$B'<"*) ;; *) bad="$bad local-no-cleanup" ;; esac
+  # 4. OOSH_HEAL_LOCAL=1, one user: the id -un arm and the sudo arm both carry OOSH_REPO, both files readable
+  out=$(OOSH_HEAL_LOCAL=1 test.ossh.healPushTarget.run "$fx" 0 somehost bob feat); rec=$(cat "$fx/rec")
+  case "$rec" in *"SSH>-tt somehost if [ \"\$(id -un)\" = bob ]; then env OOSH_REPO='$B' sh '$I' heal feat; else chmod 644 '$I' '$B' && sudo -H -u bob env OOSH_REPO='$B' sh '$I' heal feat; fi<"*) ;; *) bad="$bad local-user-run=[$rec]" ;; esac
+  # 5. OOSH_HEAL_LOCAL=1 without a local branch: rc 2, after the push only its rm
+  out=$(OOSH_HEAL_LOCAL=1 test.ossh.healPushTarget.run "$fx" 0 somehost all nobranch); rec=$(cat "$fx/rec")
+  [ "$out" = rc=2 ] || bad="$bad nolocal-rc=[$out]"
+  [ "$(printf '%s\n' "$rec" | grep -c '^SSH>')" = 2 ] || bad="$bad nolocal-ssh=[$rec]"
+  case "$rec" in *"SSH>somehost rm -f '$I'<"*) ;; *) bad="$bad nolocal-no-rm=[$rec]" ;; esac
+  # 6. words that are no names, a host with a leading dash: rc 2, nothing sent
+  for args in "somehost a;b feat" "somehost -bob feat" "somehost bob -feat" "-oProxyCommand=x bob feat" "somehost b@b feat"; do
+    out=$(test.ossh.healPushTarget.run "$fx" 0 $args); rec=$(cat "$fx/rec")
+    { [ "$out" = rc=2 ] && [ -z "$rec" ]; } || bad="$bad refused[$args]=[$out|$rec]"
+  done
+  # 7. a noisy host: a line before the path is ignored; a line after it, or junk in it, is no path — rc 2, no run
+  out=$(FX_NOISE=before test.ossh.healPushTarget.run "$fx" 0 somehost); rec=$(cat "$fx/rec")
+  { [ "$out" = rc=0 ] && case "$rec" in *"sh '$I' heal main all<"*) true ;; *) false ;; esac; } || bad="$bad noise-before=[$out|$rec]"
+  case "$rec" in *Welcome*) bad="$bad noise-in-command" ;; esac
+  for noise in after inside; do
+    out=$(FX_NOISE=$noise test.ossh.healPushTarget.run "$fx" 0 somehost); rec=$(cat "$fx/rec")
+    [ "$out" = rc=2 ] || bad="$bad noise-$noise-rc=[$out]"
+    case "$rec" in *" heal "*|*noise*|*touch*) bad="$bad noise-$noise-used=[$rec]" ;; esac
+  done
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "the heal goes to a temp file, runs the heal arm, returns the remote rc; the bundle only with OOSH_HEAL_LOCAL=1" || create.result 1 "heal push:$bad"
   return $(result)
@@ -357,6 +400,7 @@ test.case $level "T-OSSH-HEAL-PUSH-TARGET: ossh heal pushes init/oosh to /tmp/oo
   test.ossh.healPushTarget
 expect 0 "the heal goes to a temp file, runs the heal arm, returns the remote rc; the bundle only with OOSH_HEAL_LOCAL=1" \
   "ossh install's push writes ~/oosh and skips exactly the hosts a heal is for"
+
 
 ### test.method
 
