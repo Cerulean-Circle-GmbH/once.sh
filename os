@@ -248,11 +248,11 @@ private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for
  # (ogit.branch.check "origin/<branch>", tried first and the only candidate: a stale
  # local branch of the same name must not win, and a sha is not cloneable). The
  # scenario test os platform.heal.test ships a sha as a temporary branch
- # platform-test/<sha>. The gate reads the remote-tracking ref in <dir>, which can be
+ # platform-test-<sha>. The gate reads the remote-tracking ref in <dir>, which can be
  # stale until the next fetch. The old installer is read through ogit.file.show.
  local ref="origin/$branch"
  if ! ogit.branch.check "$ref" "$dir"; then
-   create.result 1 "<branch> $branch is not a branch on origin (a sha or a local-only branch cannot be cloned by the container); the scenario test os platform.heal.test ships a sha as a temporary branch platform-test/<sha>"
+   create.result 1 "<branch> $branch is not a branch on origin (a sha or a local-only branch cannot be cloned by the container); the scenario test os platform.heal.test ships a sha as a temporary branch platform-test-<sha>"
    error.log "$RESULT"
    return $(result)
  fi
@@ -396,7 +396,7 @@ branch_dir_ensure() {
   clone_installed "$D" "$H"
   say "$D cloned from $(installed) on branch $H"
   }
-foreign_sums() { ( cd /opt/foreign && find . -print | LC_ALL=C sort && find . -type f -exec cksum {} + | LC_ALL=C sort ); }
+foreign_sums() { ( cd /opt/foreign && find . ! -path '*/.git/index' -print | LC_ALL=C sort && find . -type f ! -path '*/.git/index' -exec cksum {} + | LC_ALL=C sort ); }
 OOSH_HEAL_PREAMBLE
 }
 
@@ -423,7 +423,7 @@ if [ -L "$c" ]; then rm -f "$c"; elif [ -e "$c" ]; then mv "$c" "$c.before-eraB"
 OOSH_HEAL_ARM
      private.os.platform.heal.fixture.script.get eraB.config '$c' || return 1
      cat <<'OOSH_HEAL_ARM'
-sed -i "s#/Users/donges#$h#g" "$c/user.env" "$c/oosh.env"
+sed -i -e "s#/Users/donges#$h#g" -e 's#/var/folders/sanitised/T/#/tmp/#' -e 's#USER="donges"#USER="test"#' "$c/user.env" "$c/oosh.env"
 chown -R test "$c" # recursive-exception: the era-B config this arm just wrote, in a disposable container
 say "$c is a real folder with the era-B files of the MacStudio, /Users/donges rewritten to $h"
 OOSH_HEAL_ARM
@@ -472,6 +472,10 @@ fi
 if [ -f /opt/foreign.heal.sums ]; then
   say "already: the sums of /opt/foreign are recorded"
 else
+  # git's stat cache: a status a second later writes .git/index once, as the heal's
+  # diagnosis would; it stays out of the sums and of the -newer check anyway
+  sleep 1
+  rgit -C "$f" status --porcelain >/dev/null 2>&1
   foreign_sums > /opt/foreign.heal.sums && touch /opt/foreign.heal.marker || fail "sums of /opt/foreign"
   say "the sums of /opt/foreign are in /opt/foreign.heal.sums, its marker /opt/foreign.heal.marker"
 fi
@@ -503,6 +507,8 @@ else
 OOSH_HEAL_ARM
      private.os.platform.heal.fixture.script.get boot.era/profile.d.oosh.sh /etc/profile.d/oosh.sh || return 1
      cat <<'OOSH_HEAL_ARM'
+  # the T9 writer substituted the system path into the template: the drop-in is live
+  sed -i 's#@SYSTEM_PATH@#/etc/oosh#g' /etc/profile.d/oosh.sh
   chmod 644 /etc/profile.d/oosh.sh
   say "/etc/profile.d/oosh.sh is the T9 drop-in"
 fi
@@ -615,6 +621,9 @@ OOSH_HEAL_ARM
    detached)
      cat <<'OOSH_HEAL_ARM'
 branch_dir_ensure
+# one user lives in the broken tree, as on the Mac: oosh-user's ~/oosh -> <base>/<branch>
+u=$(home_of oosh-user)
+if [ -n "$u" ] && [ "$(readlink "$u/oosh" 2>/dev/null)" != "$D" ]; then ln -sfn "$D" "$u/oosh" && chown -h oosh-user "$u/oosh"; say "$u/oosh -> $D"; fi
 if ! rgit -C "$D" symbolic-ref -q HEAD >/dev/null; then say "already: $D is on a detached HEAD"; exit 0; fi
 rgit -C "$D" update-ref --no-deref HEAD "$(rgit -C "$D" rev-parse HEAD)" || fail "detach"
 say "$D is on a detached HEAD"
@@ -674,13 +683,13 @@ private.os.platform.heal.breakage.apply()     # <platform> <name> <?branch> # ap
 }
 
 
-private.os.platform.ref.branch.ensure()     # <ref> <?dir:$OOSH_DIR> # RESULT = the branch a platform container clones for <ref>: <ref> itself when it is a branch on origin (fetched once on a miss), else, for a commit sha of <dir>, the temporary branch platform-test/<sha>, pushed to origin at that commit (ogit.remote.push); rc 1 when <ref> is neither #
+private.os.platform.ref.branch.ensure()     # <ref> <?dir:$OOSH_DIR> # RESULT = the branch a platform container clones for <ref>: <ref> itself when it is a branch on origin (fetched once on a miss), else, for a commit sha of <dir> that an origin branch holds, the temporary branch platform-test-<sha>, pushed to origin at that commit (ogit.remote.push); rc 1 when <ref> is neither #
 {
  # RESULT, not an echo: a log line (LOG_DEVICE may be /dev/stdout) would
  # end up in a $(...) that captured the name. The container
  # clones a BRANCH (init/oosh: git clone -b), and ossh install refuses
  # anything origin does not list (private.ossh.origin.branch.check), so a
- # sha travels as platform-test/<sha>; private.os.platform.ref.branch.drop
+ # sha travels as platform-test-<sha>; private.os.platform.ref.branch.drop
  # deletes it afterwards.
  local ref="$1" dir="${2:-$OOSH_DIR}" branch
  if [ -z "$ref" ] || [ "${ref#-}" != "$ref" ]; then
@@ -700,7 +709,17 @@ private.os.platform.ref.branch.ensure()     # <ref> <?dir:$OOSH_DIR> # RESULT = 
    *[!0-9a-f]*) ;;
    *)
      if [ "${#ref}" -ge 7 ] && [ "${#ref}" -le 40 ] && ogit.branch.check "$ref^{commit}" "$dir"; then
-       branch="platform-test/$ref"
+       # Only a commit an origin branch already holds goes out: a local-only sha
+       # must never reach GitHub through a test (ogit.branch.find lists origin/* too).
+       private.this.script.load ogit ogit.branch.find || return $(result)
+       if ! ogit.branch.find "$ref" "$dir" | grep -q '^origin/'; then
+         create.result 1 "<ref> $ref is in no branch on origin — a local-only commit is not pushed; push its branch first"
+         error.log "$RESULT"
+         return $(result)
+       fi
+       # Flat, no slash: the old install makes <base>/<branch> and OOSH_MODE of the
+       # branch name (state 31), and ${link##*/} readers would see only the sha.
+       branch="platform-test-$ref"
        # ogit.remote.push hands <branch> to git push as the refspec: <sha>:refs/heads/<branch>
        # makes the remote branch at the commit without a local branch — ogit.branch.reset,
        # the method that makes one, checks it out, which would move this tree.
@@ -720,7 +739,7 @@ private.os.platform.ref.branch.ensure()     # <ref> <?dir:$OOSH_DIR> # RESULT = 
 }
 
 
-private.os.platform.ref.branch.drop()     # <branch> <?dir:$OOSH_DIR> # delete the temporary branch <branch> on origin (ogit.remote.branch.delete) when it is a platform-test/* branch; any other branch is left alone with rc 0; rc 1 when origin refuses #
+private.os.platform.ref.branch.drop()     # <branch> <?dir:$OOSH_DIR> # delete the temporary branch <branch> on origin (ogit.remote.branch.delete) when it is a platform-test-* branch (as refs/heads/<branch>, so a tag of that name is never meant); any other branch is left alone with rc 0; rc 1 when origin refuses #
 {
  local branch="$1" dir="${2:-$OOSH_DIR}"
  if [ -z "$branch" ]; then
@@ -729,11 +748,11 @@ private.os.platform.ref.branch.drop()     # <branch> <?dir:$OOSH_DIR> # delete t
    return $(result)
  fi
  case "$branch" in
-   platform-test/?*) ;;
+   platform-test-?*) ;;
    *) create.result 0 "$branch is no temporary branch of the platform test — left alone"; return $(result) ;;
  esac
  private.this.script.load ogit ogit.remote.branch.delete || return $(result)
- if ogit.remote.branch.delete "$branch" origin "$dir"; then
+ if ogit.remote.branch.delete "refs/heads/$branch" origin "$dir"; then
    create.result 0 "temporary branch $branch deleted on origin"
    important.log "$RESULT"
  else
@@ -857,7 +876,7 @@ OOSH_HEAL_SNAPSHOT
 }
 
 
-private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), oo heal <branch> all as root (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 and the snapshots are the same (test.platform.shared.idempotence.compare), else rc 1 with every difference printed #
+private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), oo heal <branch> all as root (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 and the snapshots differ in nothing but same-content rewrites (a WARNING, as the idempotence invariant accepts them; result.env left out through test.platform.shared.idempotence.volatile.without), else rc 1 with every other difference printed #
 {
  local platform="$1" branch="$2" log work rcHeal differences
  if [ -z "$platform" ] || [ -z "$branch" ]; then
@@ -879,16 +898,33 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
  private.os.platform.user.run "$platform" root "oo heal $branch all" "$log"
  rcHeal=$?
  private.os.platform.heal.snapshot.get "$platform" "$branch" > "$work/after"
- # The compare helper of the idempotence invariant, sourced alone (its POSIX
- # helpers only) in a subshell: the file also sets globals of a test run
+ # The helpers of the idempotence invariant, sourced alone (its POSIX helpers
+ # only) in a subshell: the file also sets globals of a test run
  # (TEST_CATEGORY, TEST_SHARED_TIER_WRITER), which must not reach this shell.
- if differences=$(TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
-       . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || { echo "no idempotence helpers in $OOSH_DIR/test"; exit 1; }
-       test.platform.shared.idempotence.compare "$work/before" "$work/after") && [ "$rcHeal" = 0 ]; then
-   create.result 0 "second heal on $platform: rc 0, nothing changed"
+ # Its acceptance too: result.env out (volatile.without), and a same-content
+ # rewrite is a WARNING, not a failure — every oo heal ends in config init.env,
+ # which writes the shared env files again (the invariant's own oo heal row).
+ local unaccepted
+ differences=$(TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
+   . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || { echo "no idempotence helpers in $OOSH_DIR/test"; exit 1; }
+   test.platform.shared.idempotence.volatile.without < "$work/before" > "$work/before.kept"
+   test.platform.shared.idempotence.volatile.without < "$work/after" > "$work/after.kept"
+   test.platform.shared.idempotence.compare "$work/before.kept" "$work/after.kept")
+ unaccepted=$(TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
+   . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || exit 1
+   printf '%s\n' "$differences" | grep . | test.platform.shared.idempotence.unaccepted rewritten)
+ if [ "$rcHeal" = 0 ] && [ -z "$unaccepted" ]; then
+   if [ -n "$differences" ]; then
+     create.result 0 "second heal on $platform: rc 0, no content change — WARNING, same-content rewrites (accepted as the idempotence invariant accepts them):
+$differences"
+     warn.log "$RESULT"
+     printf '%s\n' "$RESULT" >> "$log"
+   else
+     create.result 0 "second heal on $platform: rc 0, nothing changed"
+   fi
  else
-   create.result 1 "second heal on $platform: rc $rcHeal${differences:+, it changed:
-$differences}"
+   create.result 1 "second heal on $platform: rc $rcHeal${unaccepted:+, it changed:
+$unaccepted}"
    error.log "$RESULT"
    printf '%s\n' "$RESULT" >> "$log"
  fi
@@ -918,7 +954,7 @@ if [ "$now" != "$(cat /opt/foreign.heal.sums)" ]; then
   printf '%s\n' "$now" | awk 'NR == FNR { now[$0] = 1; next } !($0 in now) { print "foreign changed: was " $0 }' - /opt/foreign.heal.sums
   rc=1
 fi
-newer=$(find /opt/foreign -newer /opt/foreign.heal.marker)
+newer=$(find /opt/foreign -newer /opt/foreign.heal.marker ! -path '*/.git/index' ! -path '*/.git')
 if [ -n "$newer" ]; then printf 'foreign written after the breakage: %s\n' $newer; rc=1; fi
 [ "$rc" = 0 ] && say "/opt/foreign is byte-identical, nothing in it is newer than its marker"
 exit "$rc"
@@ -961,7 +997,7 @@ private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe fo
 }
 
 
-os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install <oldRef> (a branch on origin, or a sha shipped as platform-test/<sha>) for test, root, oosh-user and bash-user in a fresh <platform> container, apply the named breakages (default: all), heal once as root through the curl form, then test.suite gate 1 per user, the idempotence invariant, a second heal that must change nothing, and the untouched-foreign check; PASS/FAIL line + create.result like platform.test; the words terminal (keep the container) and pipe (run the pure pipe form too) may stand among the breakages #
+os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install <oldRef> (a branch on origin, or a sha shipped as platform-test-<sha>) for test, root, oosh-user and bash-user in a fresh <platform> container, apply the named breakages (default: all), heal once as root through the curl form, then test.suite gate 1 per user, the idempotence invariant, a second heal that must change nothing, and the untouched-foreign check; PASS/FAIL line + create.result like platform.test; the words terminal (keep the container) and pipe (run the pure pipe form too) may stand among the breakages #
 {
  # The proof the heal needs before it touches a real machine: an OLD install,
  # broken the ways the real machines are broken, healed ONCE, then everything
@@ -1005,18 +1041,41 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
    return $(result)
  fi
 
- # The ref the container clones: a branch on origin, or platform-test/<sha>.
+ # What is tested must be what ships: OOSH_HEAL_LOCAL=1 sends the COMMITTED
+ # branch as the bundle and the working-tree init/oosh, while the breakages and
+ # the checks are this working tree's os. C2 precondition besides: <healBranch>
+ # exists on origin, else the idempotence invariant's oo update row is NOT
+ # CHECKED and idempotence=1.
+ private.this.script.load ogit ogit.status.check || return $(result)
+ if ! ogit.status.check "$OOSH_DIR"; then
+   create.result 1 "$OOSH_DIR has uncommitted changes — commit first: the heal ships the committed $healBranch, the test would run other code"
+   error.log "$RESULT"
+   return $(result)
+ fi
+
+ # The ref the container clones: a branch on origin, or platform-test-<sha>.
+ local sshPort=8022
  private.os.platform.ref.branch.ensure "$oldRef" || return $(result)
  local branch="$RESULT"
+ # Ctrl-C or SIGTERM from here on: the temporary branch leaves GitHub, the
+ # container goes, and the run ENDS with 130 — exit, not return: a trap runs
+ # in the innermost function (a step), whose return would let the run go on.
+ # `os platform.heal.test` is a process of its own (this.start). On the
+ # normal paths the caller's own traps are back before the return.
+ local restoreTraps
+ restoreTraps="trap - INT TERM; $(trap -p INT TERM)"
+ # shellcheck disable=SC2064 # expanded now: the branch and the port of this run
+ trap "private.os.platform.ref.branch.drop '$branch'; private.os.platform.cleanup '$sshPort'; exit 130" INT TERM
  # Era gate: an era-B ref (mode ssh) is refused with the eraB.* hint.
  if ! private.os.platform.branch.gate "$branch"; then
    local refusal="$RESULT"
    private.os.platform.ref.branch.drop "$branch"
+   eval "$restoreTraps"
    create.result 1 "$refusal"
    return $(result)
  fi
 
- local imageTag sshPort=8022 rc step logs=""
+ local imageTag rc step logs=""
  imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
  # The logs of every step, emptied first: a step that does not run this time
  # (pipe) must not show the FAIL lines of an earlier run.
@@ -1028,6 +1087,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  if ! OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$platform" "$imageTag" "$sshPort"; then
    private.os.platform.ref.branch.drop "$branch"
    private.os.platform.cleanup "$sshPort"
+   eval "$restoreTraps"
    printf "FAIL: heal %s %s (the container did not come up)\n" "$platform" "$oldRef"
    create.result 1 "FAIL: heal $platform $oldRef — the container did not come up"
    error.log "$RESULT"
@@ -1048,6 +1108,13 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  healLog=$(private.os.platform.heal.log.get heal "$platform")
  OOSH_HEAL_LOCAL=1 ossh heal "$platform" all "$healBranch" 2>&1 | tee "$healLog"
  rcHeal=${PIPESTATUS[0]}
+ # rc 1 is accepted (folders moved aside), so the heal's own verify must be
+ # read: a "FAIL <invariant> <user>:" line of private.oo.heal.verify fails the
+ # run (the per-user gate covers core and configLayout only); NOT CHECKED is shown.
+ local verifyFails notChecked
+ verifyFails=$(tr -d '\r' < "$healLog" | grep -cE 'FAIL [A-Za-z0-9._-]+ [A-Za-z0-9._-]+:')
+ notChecked=$(tr -d '\r' < "$healLog" | grep -cE 'NOT CHECKED [A-Za-z0-9._-]+ [A-Za-z0-9._-]+:')
+ [ "$notChecked" -gt 0 ] && warn.log "the heal's verify left $notChecked invariant(s) NOT CHECKED (see $healLog)"
  # pipe: the pure pipe form as test, once (C2 runs it on the first platform)
  if [ -n "$pipe" ]; then
    private.os.platform.heal.pipe.run "$platform" "$healBranch"
@@ -1087,8 +1154,8 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  esac
 
  # ─── the verdict ──────────────────────────────────────────────────────────
- local line="breakages=$rcBreak heal=$rcHeal${rcPipe:+ pipe=$rcPipe} test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign"
- if [ "$rcBreak" = 0 ] && [ "$rcHeal" -le 1 ] && [ "${rcPipe:-0}" = 0 ] && [ "$rcTest" = 0 ] && [ "$rcRoot" = 0 ] \
+ local line="breakages=$rcBreak heal=$rcHeal verify=$verifyFails${rcPipe:+ pipe=$rcPipe} test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign"
+ if [ "$rcBreak" = 0 ] && [ "$rcHeal" -le 1 ] && [ "$verifyFails" = 0 ] && [ "${rcPipe:-0}" = 0 ] && [ "$rcTest" = 0 ] && [ "$rcRoot" = 0 ] \
     && [ "$rcOoshUser" = 0 ] && [ "$rcBashUser" = 0 ] && [ "$rcIdem" = 0 ] && [ "$rcSecond" = 0 ] \
     && { [ "$rcForeign" = 0 ] || [ "$rcForeign" = skipped ]; }; then
    printf "PASS: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
@@ -1112,6 +1179,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  fi
 
  private.os.platform.ref.branch.drop "$branch"
+ eval "$restoreTraps"
  # terminal: the container stays for a look inside (C2 debugging); else it goes.
  if [ -n "$terminal" ]; then
    console.log "terminal: the container of $platform stays on port $sshPort — enter it: ossh exec.tty $platform 'sudo -i'; remove it: docker rm -f \$(docker ps -q --filter publish=$sshPort)"
@@ -1301,7 +1369,7 @@ os.platform.list() # # lists all platforms with tier info
   done
 }
 
-os.platform.test()     # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch on origin of this repo, installer contract mode root i.e. b8b90b82 or newer; a sha or a local-only branch is refused by the gate, the scenario test os platform.heal.test ships a sha as platform-test/<sha>) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
+os.platform.test()     # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch on origin of this repo, installer contract mode root i.e. b8b90b82 or newer; a sha or a local-only branch is refused by the gate, the scenario test os platform.heal.test ships a sha as platform-test-<sha>) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
 {
  local platform="$1"
  if [ -z "$platform" ]; then

@@ -336,10 +336,10 @@ test.os.branchEra() {
   case "$msg" in *oldb*"b8b90b82"*"mode ssh"*) ;; *) bad="$bad old-msg=[$msg]" ;; esac
   case "$msg" in *eraB*platform.heal.test*) ;; *) bad="$bad old-msg-lacks-eraB" ;; esac
   private.os.platform.branch.gate feat "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad origin-branch-rc=$rc"
-  # a sha is the scenario test's job (platform-test/<sha>): refused before anything starts
+  # a sha is the scenario test's job (platform-test-<sha>): refused before anything starts
   private.os.platform.branch.gate "$new" "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
   [ $rc = 1 ] || bad="$bad sha-rc=$rc"
-  case "$msg" in *"platform.heal.test"*"platform-test/"*) ;; *) bad="$bad sha-msg=[$msg]" ;; esac
+  case "$msg" in *"platform.heal.test"*"platform-test-"*) ;; *) bad="$bad sha-msg=[$msg]" ;; esac
   # a branch that exists only locally is not what the container clones
   private.os.platform.branch.gate "$(ogit.branch.get "$fx/repo")" "$fx/repo" >/dev/null 2>&1; rc=$?
   [ $rc = 1 ] || bad="$bad local-only-rc=$rc"
@@ -492,6 +492,17 @@ test.os.healBreakageNames() {
     printf '%s\n' "$script" | sh -n 2>/dev/null || bad="$bad sh-n:$n"
     if command -v dash >/dev/null 2>&1; then printf '%s\n' "$script" | dash -n 2>/dev/null || bad="$bad dash-n:$n"; fi
   done
+  # the arms reproduce the real shapes: era-B values of the user, a live T9 drop-in, a user in
+  # the broken tree, the foreign index settled and left out of the sums
+  script=$(private.os.platform.heal.breakage.script.get eraB.config dev.heal)
+  case "$script" in *'s#/var/folders/sanitised/T/#/tmp/#'*'USER="test"'*) ;; *) bad="$bad eraB-tmpdir-user" ;; esac
+  script=$(private.os.platform.heal.breakage.script.get boot.era dev.heal)
+  case "$script" in *"s#@SYSTEM_PATH@#/etc/oosh#g"*) ;; *) bad="$bad boot-era-placeholder" ;; esac
+  script=$(private.os.platform.heal.breakage.script.get detached dev.heal)
+  case "$script" in *'ln -sfn "$D" "$u/oosh"'*) ;; *) bad="$bad nobody-in-the-broken-tree" ;; esac
+  script=$(private.os.platform.heal.breakage.script.get foreign.symlink dev.heal)
+  case "$script" in *"status --porcelain"*"foreign_sums >"*) ;; *) bad="$bad foreign-index-not-settled" ;; esac
+  case "$script" in *"! -path '*/.git/index'"*) ;; *) bad="$bad foreign-index-in-sums" ;; esac
   private.os.platform.heal.breakage.script.get no.such.breakage dev.heal >/dev/null 2>&1 && bad="$bad unknown-has-arm"
   private.os.platform.heal.breakage.script.get dirty -x >/dev/null 2>&1 && bad="$bad dash-branch-accepted"
   want=$(printf '%s\n' "$names" | tr '\n' ' '); want="${want% }"
@@ -566,7 +577,8 @@ console.log "
 Test: private.os.platform.ref.branch.ensure / drop
 ===================================================================="
 
-# T-OS-REF-BRANCH: a branch on origin is used as it is; a sha travels as platform-test/<sha>,
+# T-OS-REF-BRANCH: a branch on origin is used as it is; a sha travels as platform-test-<sha>
+# (flat: the old install makes <base>/<branch> and OOSH_MODE from it),
 # pushed at that commit, and is dropped afterwards; nothing else is ever deleted. A bare
 # repository replaces GitHub (raw git on the fixture side, as test.ogit.fixture).
 test.os.refBranch() {
@@ -583,32 +595,40 @@ test.os.refBranch() {
   private.os.platform.ref.branch.ensure dev "$w" >/dev/null 2>&1; rc=$?
   [ "$rc" = 0 ] && [ "$RESULT" = dev ] || bad="$bad branch=[$rc $RESULT]"
   [ "$(git -C "$fx/origin.git" for-each-ref --format=x refs/heads | wc -l | tr -d ' ')" = 1 ] || bad="$bad branch-pushed-something"
-  # a sha: platform-test/<sha> on origin at that commit, cached as origin/platform-test/<sha>
+  # a commit no origin branch holds is never pushed (a local-only sha must not reach GitHub)
+  printf 'three\n' >> "$w/file"; git -C "$w" -c user.email=t@t -c user.name=t commit -q -am three
+  private.os.platform.ref.branch.ensure "$(git -C "$w" rev-parse --short=7 HEAD)" "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad local-only-sha-accepted"
+  [ "$(git -C "$fx/origin.git" for-each-ref --format=x refs/heads | wc -l | tr -d ' ')" = 1 ] || bad="$bad local-only-sha-pushed"
+  # a sha: platform-test-<sha> on origin at that commit, cached as origin/platform-test-<sha>
   private.os.platform.ref.branch.ensure "$old" "$w" >/dev/null 2>&1; rc=$?
-  [ "$rc" = 0 ] && [ "$RESULT" = "platform-test/$old" ] || bad="$bad sha=[$rc $RESULT]"
-  sha=$(git -C "$fx/origin.git" rev-parse -q --verify "refs/heads/platform-test/$old")
+  [ "$rc" = 0 ] && [ "$RESULT" = "platform-test-$old" ] || bad="$bad sha=[$rc $RESULT]"
+  sha=$(git -C "$fx/origin.git" rev-parse -q --verify "refs/heads/platform-test-$old")
   [ -n "$sha" ] && [ "$sha" = "$(git -C "$w" rev-parse "$old")" ] || bad="$bad not-at-sha=[$sha]"
-  git -C "$w" rev-parse -q --verify "refs/remotes/origin/platform-test/$old" >/dev/null || bad="$bad not-cached"
-  git -C "$w" rev-parse -q --verify "refs/heads/platform-test/$old" >/dev/null && bad="$bad local-branch-made"
+  git -C "$w" rev-parse -q --verify "refs/remotes/origin/platform-test-$old" >/dev/null || bad="$bad not-cached"
+  git -C "$w" rev-parse -q --verify "refs/heads/platform-test-$old" >/dev/null && bad="$bad local-branch-made"
   # again: the same branch, rc 0
   private.os.platform.ref.branch.ensure "$old" "$w" >/dev/null 2>&1; [ $? = 0 ] || bad="$bad again-rc"
   # neither a branch nor a commit; a leading dash
   private.os.platform.ref.branch.ensure no-such-ref "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-accepted"
   private.os.platform.ref.branch.ensure deadbeefdeadbeef "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-sha-accepted"
   private.os.platform.ref.branch.ensure --all "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad dash-accepted"
-  # drop: only platform-test/*; dev stays
+  # drop: only platform-test-*; dev and a slashed name stay; a same-named tag does not make the delete ambiguous
+  private.os.platform.ref.branch.drop "platform-test/$old" "$w" >/dev/null 2>&1; [ $? = 0 ] || bad="$bad slashed-not-left-alone"
+  git -C "$w" tag "platform-test-$old" "$old"; git -C "$w" push -q origin "refs/tags/platform-test-$old"
   private.os.platform.ref.branch.drop dev "$w" >/dev/null 2>&1; rc=$?
   [ "$rc" = 0 ] && git -C "$fx/origin.git" rev-parse -q --verify refs/heads/dev >/dev/null || bad="$bad dev-touched=[$rc]"
-  private.os.platform.ref.branch.drop "platform-test/$old" "$w" >/dev/null 2>&1; [ $? = 0 ] || bad="$bad drop-rc=[$RESULT]"
-  git -C "$fx/origin.git" rev-parse -q --verify "refs/heads/platform-test/$old" >/dev/null && bad="$bad not-dropped"
-  private.os.platform.ref.branch.drop "platform-test/$old" "$w" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad drop-missing-not-reported"
+  private.os.platform.ref.branch.drop "platform-test-$old" "$w" >/dev/null 2>&1; [ $? = 0 ] || bad="$bad drop-rc=[$RESULT]"
+  git -C "$fx/origin.git" rev-parse -q --verify "refs/heads/platform-test-$old" >/dev/null && bad="$bad not-dropped"
+  # the delete names refs/heads/<branch>: the tag of the same name stays
+  private.os.platform.ref.branch.drop "platform-test-$old" "$w" >/dev/null 2>&1
+  git -C "$fx/origin.git" rev-parse -q --verify "refs/tags/platform-test-$old" >/dev/null || bad="$bad tag-deleted"
   private.os.platform.ref.branch.drop >/dev/null 2>&1; [ $? = 1 ] || bad="$bad drop-no-branch-accepted"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "a branch on origin as it is; a sha as platform-test/<sha> at that commit, dropped afterwards; nothing else deleted" || create.result 1 "ref branch:$bad"
+  [ -z "$bad" ] && create.result 0 "a branch on origin as it is; a sha origin holds as platform-test-<sha> at that commit, dropped afterwards; a local-only sha refused; nothing else deleted" || create.result 1 "ref branch:$bad"
   return $(result)
 }
-test.case $level "T-OS-REF-BRANCH: a sha travels as the temporary branch platform-test/<sha>" test.os.refBranch
-expect 0 "a branch on origin as it is; a sha as platform-test/<sha> at that commit, dropped afterwards; nothing else deleted" \
+test.case $level "T-OS-REF-BRANCH: a sha travels as the temporary branch platform-test-<sha>" test.os.refBranch
+expect 0 "a branch on origin as it is; a sha origin holds as platform-test-<sha> at that commit, dropped afterwards; a local-only sha refused; nothing else deleted" \
   "the container clones a branch: git clone -b takes no sha"
 
 console.log "
@@ -688,6 +708,7 @@ test.os.healRemoteScripts() {
   got=$(printf '%s' "$encoded" | base64 -d)
   printf '%s\n' "$got" | sh -n 2>/dev/null || bad="$bad foreign-sh-n"
   case "$got" in *"/opt/foreign.heal.sums"*"-newer /opt/foreign.heal.marker"*) ;; *) bad="$bad foreign-not-sums-and-marker" ;; esac
+  case "$got" in *"-newer /opt/foreign.heal.marker ! -path '*/.git/index' ! -path '*/.git'"*) ;; *) bad="$bad foreign-newer-counts-git-cache" ;; esac
   private.os.platform.heal.foreign.check >/dev/null 2>&1 && bad="$bad foreign-no-platform-accepted"
   test.os.stubs.unset
   rm -rf "$fx"
@@ -719,8 +740,18 @@ test.os.healSecondRun() {
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
   [ "$rc" = 1 ] || bad="$bad changed-rc=$rc"
   case "$RESULT" in *"changed: /b"*) ;; *) bad="$bad changed-unnamed=[$RESULT]" ;; esac
+  # a same-content rewrite is accepted as the idempotence invariant accepts it: a WARNING
   OS_T_SNAP_AFTER="/b	1/1	2 2"
-  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad rewritten-accepted"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] || bad="$bad rewritten-rc=$rc"
+  case "$RESULT" in *WARNING*"rewritten: /b"*) ;; *) bad="$bad rewritten-no-warning=[$RESULT]" ;; esac
+  # result.env (result save, on every this.call) is left out in one place, the invariant's
+  OS_T_SNAP_AFTER="/b	1/1	1 1
+/s/result.env	5/5	9 9"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 0 ] || bad="$bad result-env-counted"
+  OS_T_SNAP_AFTER="/b	1/1	1 1
+/c	1/1	1 1"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad added-accepted"
   OS_T_SNAP_AFTER="/b	1/1	1 1"; OS_T_HEAL_RC=1
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad heal-rc1-accepted"
   [ -z "${TEST_SHARED_TIER_WRITER+x}" ] || bad="$bad invariant-globals-leaked"
@@ -728,11 +759,11 @@ test.os.healSecondRun() {
   test.os.stubs.unset
   unset OS_T_SNAP_N OS_T_HEAL_RC OS_T_SNAP_AFTER
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "rc 0 and the same snapshot pass; a change, a rewrite or rc 1 fail and are named" || create.result 1 "second heal:$bad"
+  [ -z "$bad" ] && create.result 0 "rc 0 and the same snapshot pass, a same-content rewrite with a WARNING; a change, an addition or rc 1 fail and are named" || create.result 1 "second heal:$bad"
   return $(result)
 }
-test.case $level "T-OS-HEAL-SECOND-RUN: a second oo heal must end rc 0 and change nothing" test.os.healSecondRun
-expect 0 "rc 0 and the same snapshot pass; a change, a rewrite or rc 1 fail and are named" \
+test.case $level "T-OS-HEAL-SECOND-RUN: a second oo heal must end rc 0 and change nothing but same-content rewrites" test.os.healSecondRun
+expect 0 "rc 0 and the same snapshot pass, a same-content rewrite with a WARNING; a change, an addition or rc 1 fail and are named" \
   "the heal is idempotent or it is no heal"
 
 # T-OS-HEAL-PIPE-RUN: the pure pipe form — the init file and the bundle reach the host,
@@ -778,12 +809,14 @@ expect 1 "Usage: os platform.heal.test <platform> <oldRef> <?breakages...:all> �
 # push): parse → ref.branch.ensure → era gate → container.up (OSSH_INSTALL_BRANCH) →
 # users.install → breakages → heal → gates → idempotence → second heal → foreign →
 # result → ref.branch.drop → cleanup; a failing container.up stops with rc 1 and still
-# drops the temporary branch.
+# drops the temporary branch; so do a failing step after the heal and Ctrl-C; a dirty tree
+# is refused before anything is pushed; the heal's rc 1 passes, rc 2 and a FAIL line of its
+# verify fail.
 test.os.healTest.stubs.set() {
   test.os.stubs.set
   OS_T_GATE=0
   private.os.platform.parse()            { echo "parse $*" >> "$OS_T_REC"; PLATFORM_WORKSPACE=nakedUbuntu/24.04; return 0; }
-  private.os.platform.ref.branch.ensure() { echo "ensure $*" >> "$OS_T_REC"; create.result 0 "platform-test/$1"; }
+  private.os.platform.ref.branch.ensure() { echo "ensure $*" >> "$OS_T_REC"; create.result 0 "platform-test-$1"; }
   private.os.platform.branch.gate()      { echo "gate $*" >> "$OS_T_REC"; create.result "$OS_T_GATE" "gate"; return "$OS_T_GATE"; }
   private.os.platform.container.up()     { echo "container.up $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; return 0; }
   private.os.platform.users.install()    { echo "users.install $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; return 0; }
@@ -796,23 +829,30 @@ test.os.healTest.stubs.set() {
   private.os.platform.heal.foreign.check() { echo "foreign $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.ref.branch.drop()  { echo "drop $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.cleanup()          { echo "cleanup $*" >> "$OS_T_REC"; }
-  ossh() { echo "ossh $* local=[${OOSH_HEAL_LOCAL-unset}]" >> "$OS_T_REC"; }
+  ogit.status.check()                    { return "${OS_T_DIRTY:-0}"; }
+  ossh() {
+    echo "ossh $* local=[${OOSH_HEAL_LOCAL-unset}]" >> "$OS_T_REC"
+    [ "$1" = heal ] || return 0
+    [ -n "$OS_T_HEAL_OUT" ] && printf '%s\n' "$OS_T_HEAL_OUT"
+    return "${OS_T_HEAL_RC:-0}"
+  }
 }
 test.os.healTestOrder() {
   local fx; fx=$(test.suite.fixture.make healorder)
   local HOME="$fx" OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL; unset OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL
-  local bad="" rc out got want hb p=heal_test_stub n names
+  local bad="" rc out got want hb p=heal_test_stub n names traps
   private.this.script.load ogit ogit.branch.get
   hb=$(ogit.branch.get "$OOSH_DIR")
   names=$(private.os.platform.heal.breakage.names.get)
   test.os.healTest.stubs.set
+  traps=$(trap -p INT TERM)
   out=$(os.platform.heal.test "$p" 26d15a4 2>&1); rc=$?
   [ "$rc" = 0 ] || bad="$bad rc=$rc"
   want="parse $p
 ensure 26d15a4
-gate platform-test/26d15a4
-container.up $p naked_ubuntu_24_04 8022 branch=[platform-test/26d15a4]
-users.install $p branch=[platform-test/26d15a4]"
+gate platform-test-26d15a4
+container.up $p naked_ubuntu_24_04 8022 branch=[platform-test-26d15a4]
+users.install $p branch=[platform-test-26d15a4]"
   for n in $names; do want="$want
 breakage $n $hb"; done
   want="$want
@@ -827,13 +867,15 @@ repair
 user.run bash-user test.suite run platform.shared.idempotence.invariant 1
 second $p $hb
 foreign $p
-drop platform-test/26d15a4
+drop platform-test-26d15a4
 ossh connection.close $p local=[unset]
 cleanup 8022"
   got=$(cat "$OS_T_REC")
   [ "$got" = "$want" ] || bad="$bad order:$(diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | grep '^[<>]' | head -3 | tr '\n' '|')"
-  case "$out" in *"PASS: heal $p 26d15a4 (breakages=0 heal=0 test=0 root=0 oosh-user=0 bash-user=0 idempotence=0 second-heal=0 foreign=0)"*) ;; *) bad="$bad no-pass-line" ;; esac
+  case "$out" in *"PASS: heal $p 26d15a4 (breakages=0 heal=0 verify=0 test=0 root=0 oosh-user=0 bash-user=0 idempotence=0 second-heal=0 foreign=0)"*) ;; *) bad="$bad no-pass-line" ;; esac
   [ -z "${OSSH_INSTALL_BRANCH+x}" ] && [ -z "${OOSH_HEAL_LOCAL+x}" ] || bad="$bad env-leaked"
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1
+  [ "$(trap -p INT TERM)" = "$traps" ] || bad="$bad traps-not-restored"
   # a subset, pipe and terminal: only that breakage, the pipe form after the heal, no foreign check, the container stays
   : > "$OS_T_REC"
   os.platform.heal.test "$p" 26d15a4 dirty pipe terminal >/dev/null 2>&1 || bad="$bad subset-rc"
@@ -841,24 +883,58 @@ cleanup 8022"
   [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:ossh heal ' | sed -n 2p | cut -d: -f2-)" = "pipe $p $hb" ] || bad="$bad pipe-not-after-heal"
   grep -q '^foreign ' "$OS_T_REC" && bad="$bad foreign-without-breakage"
   grep -q '^cleanup ' "$OS_T_REC" && bad="$bad terminal-cleaned-up"
-  grep -q '^drop platform-test/26d15a4' "$OS_T_REC" || bad="$bad terminal-no-drop"
+  grep -q '^drop platform-test-26d15a4' "$OS_T_REC" || bad="$bad terminal-no-drop"
   # a failing container.up: rc 1, the temporary branch dropped, nothing installed
   : > "$OS_T_REC"
   private.os.platform.container.up() { echo "container.up" >> "$OS_T_REC"; create.result 1 "stubbed"; return 99; }
   os.platform.heal.test "$p" 26d15a4 >/dev/null 2>&1; rc=$?
   [ "$rc" = 1 ] || bad="$bad up-fail-rc=$rc"
   grep -q '^users.install' "$OS_T_REC" && bad="$bad installed-after-fail"
-  grep -q '^drop platform-test/26d15a4' "$OS_T_REC" || bad="$bad up-fail-no-drop"
+  grep -q '^drop platform-test-26d15a4' "$OS_T_REC" || bad="$bad up-fail-no-drop"
+  private.os.platform.container.up()     { echo "container.up $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; return 0; }
   # the era gate refuses: dropped, no container
   : > "$OS_T_REC"; OS_T_GATE=1
   os.platform.heal.test "$p" b492b2e >/dev/null 2>&1; [ $? = 1 ] || bad="$bad era-rc"
   grep -q '^container.up' "$OS_T_REC" && bad="$bad era-container"
-  grep -q '^drop platform-test/b492b2e' "$OS_T_REC" || bad="$bad era-no-drop"
+  grep -q '^drop platform-test-b492b2e' "$OS_T_REC" || bad="$bad era-no-drop"
   # an unknown breakage: refused before anything starts
   : > "$OS_T_REC"; OS_T_GATE=0
   os.platform.heal.test "$p" 26d15a4 bogus >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-rc"
   [ -s "$OS_T_REC" ] && bad="$bad unknown-started"
+  # the heal's rc 1 (folders moved aside, left for the user) passes; rc 2 fails
+  OS_T_HEAL_RC=1
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) || bad="$bad heal-rc1-failed"
+  case "$out" in *"PASS: heal $p 26d15a4 (breakages=0 heal=1 verify=0"*) ;; *) bad="$bad heal-rc1-line" ;; esac
+  OS_T_HEAL_RC=2
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 && bad="$bad heal-rc2-passed"
+  # a red verify of the heal fails the run, NOT CHECKED does not
+  OS_T_HEAL_RC=0; OS_T_HEAL_OUT=$(printf '  PASS layout root\r\n  FAIL boot root: run oo heal\r\n  NOT CHECKED oosh bash-user: no sudo\r')
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) && bad="$bad verify-fail-passed"
+  case "$out" in *"FAIL: heal $p 26d15a4 (breakages=0 heal=0 verify=1 "*) ;; *) bad="$bad verify-line" ;; esac
+  OS_T_HEAL_OUT=$(printf '  NOT CHECKED oosh bash-user: no sudo\r')
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 || bad="$bad not-checked-failed"
+  OS_T_HEAL_OUT=""
+  # a failing step after the heal: FAIL, the branch dropped, the container removed
+  : > "$OS_T_REC"
+  private.os.platform.gate.run() { echo "gate.run $2" >> "$OS_T_REC"; [ "$2" != root ]; }
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 && bad="$bad gate-fail-passed"
+  grep -q '^drop platform-test-26d15a4' "$OS_T_REC" && grep -q '^cleanup 8022' "$OS_T_REC" || bad="$bad gate-fail-no-drop-or-cleanup"
+  private.os.platform.gate.run() { echo "gate.run $2" >> "$OS_T_REC"; return 0; }
+  # a dirty tree: the committed branch would ship, not what is tested — refused before the push
+  : > "$OS_T_REC"; OS_T_DIRTY=1
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1; [ $? = 1 ] || bad="$bad dirty-accepted"
+  grep -q '^ensure' "$OS_T_REC" && bad="$bad dirty-pushed"
+  OS_T_DIRTY=0
+  # Ctrl-C after the push: the trap drops the temporary branch and removes the container
+  : > "$OS_T_REC"
+  private.os.platform.users.install() { echo "users.install" >> "$OS_T_REC"; kill -INT "$BASHPID"; }
+  ( os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 ); rc=$?
+  [ "$rc" = 130 ] || bad="$bad int-rc=$rc"
+  grep -q '^drop platform-test-26d15a4' "$OS_T_REC" && grep -q '^cleanup 8022' "$OS_T_REC" || bad="$bad int-no-drop-or-cleanup"
+  grep -q '^breakage ' "$OS_T_REC" && bad="$bad int-went-on"
   test.os.stubs.unset
+  unset -f ogit.status.check
+  unset OS_T_HEAL_RC OS_T_HEAL_OUT OS_T_DIRTY
   for n in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign; do
     rm -f "$(private.os.platform.heal.log.get "$n" "$p")"
   done
