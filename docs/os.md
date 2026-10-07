@@ -130,7 +130,7 @@ native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<brea
    `private.os.platform.shared.config.repair` after root's run.
 8. The idempotence invariant (`test.suite run platform.shared.idempotence.invariant 1`) as root and as `bash-user`.
 9. The second heal (`private.os.platform.heal.second.run`): a snapshot of what `oo heal` owns, `<base>/<branch>/oo heal <branch> all`
-   as root (the base through root's `~/oosh`: the `oo` on root's PATH may be an older branch without `oo heal`), a snapshot again — rc 0 and snapshots that differ in nothing but **same-content rewrites** (every
+   as root (the base through root's `~/oosh`: the `oo` on root's PATH may be an older branch without `oo heal`), a snapshot again — rc 0, or rc 1 whose rc line ends in `install state 99` (reports only: `oo heal` writes it only when every step and verify is green, so a rc 1 with a step left still fails), and snapshots that differ in nothing but **same-content rewrites** (every
    `oo heal` ends in `config init.env`, which writes the shared env files again). Those rewrites are reported as a
    WARNING, exactly as the idempotence invariant accepts them: the comparison goes through the invariant's own
    helpers (`test.platform.shared.idempotence.volatile.without`, which also leaves `result.env` out, and
@@ -163,13 +163,17 @@ shape is there. The container is disposable, so an arm may delete.
 | `ssh.legacy` | Legacy `ssh.original` and `ssh.<user>.<host>.for.<host>` folders | `root` |
 | `state.30` | The install state machine set back to `SETUP_SERVER` 30 | `root` |
 | `launcher.missing` | `/usr/local/bin/this` removed | system |
-| `worktree.layout` | `<base>/testing` a linked worktree of `<base>/main` | base |
+| `worktree.layout` | `<base>/testing` becomes a linked worktree at `origin/testing`, tracking it — the shape the old install left | base |
 | `missing.branch` | `<base>/<branch>` removed | base |
 | `diverged` | A local commit origin lacks, and an `origin/<branch>` the folder lacks | `<base>/<branch>` |
 | `markers.committed` | Conflict markers committed in `this`, `log`, `oo` and `config` (the Mac's 6 Oct shape) | `<base>/<branch>` |
 | `merge.conflict` | A half-done merge: `MERGE_HEAD` set, markers in `heal.conflict.txt` | `<base>/<branch>` |
 | `dirty` | An uncommitted change in `os` | `<base>/<branch>` |
 | `detached` | `HEAD` detached (through `update-ref`, last: a merge in progress refuses a checkout); `oosh-user`'s `~/oosh` is pointed at the broken folder, as the Mac's one user lives in it | `<base>/<branch>`, `oosh-user` |
+
+**What a PASS still shows as `[left]`.** These are reports, not failures, and they stand on every heal (the second one too): root's legacy `ssh.*` folders (`ssh.backup.migrate` moves them; the heal never does), the old-format `user.env` values of a real `~/config` that are never carried over, foreign trees left untouched (`foreign.symlink`), and a canonical folder moved aside to `<base>.aside/<name>.orig.<ts>` for you to look at.
+
+**Results so far** (ubuntu_24_04, 2026-10-07): `dev eraB.config` PASS, `dev foreign.symlink` PASS, `51d7fb3 all pipe` PASS.
 
 **The transport** (`private.os.platform.user.run`): `runuser` gets `env HOME=~<user>` (it keeps the caller's environment, so HOME would stay the ssh login's), root runs through `sudo -H`, and every command starts with `unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND` — `ogit.folder.finish` in the gates' fixtures trusts folders for `$SUDO_USER`, which filled the login's `.gitconfig`.
 

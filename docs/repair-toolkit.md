@@ -127,6 +127,7 @@ delete it. Everywhere the move-aside is the kernel's `private.this.entry.aside`
 | `~/.ssh/id_ed25519.previous` / `.bak.*` cruft | `ossh folder.fix strict` |
 | `fatal: detected dubious ownership in repository` in a branch folder | `oo update` (runs `ogit safeDirectory.ensure`), or `ogit safeDirectory.ensure` directly |
 | `ogit layout.status` shows `worktree` lines (host installed before the clone layout) | `ogit worktree.remove` — runbook: [ogit.md § Migrating a host](ogit.md#migrating-a-host-from-worktrees-to-clones) |
+| `ogit worktree.remove` refuses a folder: `<folder> tracks no upstream` (a worktree that lost its upstream) | `ogit branch.upstream.set origin/<b> <dir>`, then `ogit worktree.remove` — or let `oo heal` do it: its code step runs `private.ogit.worktree.upstream.ensure` first (only for a branch origin has) |
 | `ogit layout.status` says `mixed layout` (rc 1) | finish the conversion you started: `ogit worktree.remove` (or `ogit worktree.restore` to go back) |
 | `ogit layout.status` shows `shared=no` / `setgid=no` for a folder | `ogit repo.share <base>/<folder>` (with `sudo` when you do not own it) |
 | `test.platform.shared.layout.invariant` red | the recovery command in its FAIL line — one of the four rows above, or `sudo chgrp dev <base> && sudo chmod g+ws <base>` for the base |
