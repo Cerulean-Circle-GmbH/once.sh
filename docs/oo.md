@@ -614,7 +614,7 @@ another user's invariants would have to run without being root.
 
 **`all`** heals every user — root, `developking`, every user whose home holds `~/oosh` or `~/config`, and the
 login user that invoked sudo (`OOSH_HEAL_LOGIN`; `private.oo.heal.users.list`) — and needs root: as a user, `oo heal <branch> all` stops with rc 2 and names `sudo -H oo heal <branch> all`.
-A user who is already canonical keeps their branch under `all`. Healing a named user other than yourself
+A user who is already canonical keeps their branch under `all`, except the healer and the login that ran sudo (`OOSH_HEAL_LOGIN`): they move to `<branch>`, so the second heal finds `oo heal` from root's `~/oosh` (`private.oo.heal.user.keep.check`). When `config init.user` fails for a user, the heal shows its reason. Healing a named user other than yourself
 needs root too. `sudo -H oo heal <branch>` is also what is named when the system part needs root.
 
 **Worked example — a machine on an old branch.** The tree on this machine predates the heal, so the curl

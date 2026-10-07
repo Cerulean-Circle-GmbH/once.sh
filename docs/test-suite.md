@@ -210,6 +210,8 @@ so under `OOSH_NO_INSTALL` it skips its prerequisite step altogether
 `env -u OOSH_NO_INSTALL` and stubs the package manager and sudo
 (T-SUITE-NO-INSTALL, the T-CMD-* cases of test.oo).
 
+A test run also carries no `SUDO_USER`, `SUDO_UID`, `SUDO_GID` or `SUDO_COMMAND`: `test.suite` unsets them, because `ogit.folder.finish` trusts a fixture's folder for `$SUDO_USER` and a run under sudo would write dead `safe.directory` entries into the login user's real `~/.gitconfig` (T-TEST-SUITE-UNSETS-SUDO-ENV).
+
 ## Every file scores itself
 
 `test.suite.save.results` at the end of a test file is **mandatory**, not decorative. Test files run

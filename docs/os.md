@@ -129,8 +129,8 @@ native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<brea
 7. `private.os.platform.gate.run` four times (`test`, `root`, `oosh-user`, `bash-user`), with
    `private.os.platform.shared.config.repair` after root's run.
 8. The idempotence invariant (`test.suite run platform.shared.idempotence.invariant 1`) as root and as `bash-user`.
-9. The second heal (`private.os.platform.heal.second.run`): a snapshot of what `oo heal` owns, `oo heal <branch> all`
-   as root, a snapshot again — rc 0 and snapshots that differ in nothing but **same-content rewrites** (every
+9. The second heal (`private.os.platform.heal.second.run`): a snapshot of what `oo heal` owns, `<base>/<branch>/oo heal <branch> all`
+   as root (the base through root's `~/oosh`: the `oo` on root's PATH may be an older branch without `oo heal`), a snapshot again — rc 0 and snapshots that differ in nothing but **same-content rewrites** (every
    `oo heal` ends in `config init.env`, which writes the shared env files again). Those rewrites are reported as a
    WARNING, exactly as the idempotence invariant accepts them: the comparison goes through the invariant's own
    helpers (`test.platform.shared.idempotence.volatile.without`, which also leaves `result.env` out, and
@@ -170,6 +170,10 @@ shape is there. The container is disposable, so an arm may delete.
 | `merge.conflict` | A half-done merge: `MERGE_HEAD` set, markers in `heal.conflict.txt` | `<base>/<branch>` |
 | `dirty` | An uncommitted change in `os` | `<base>/<branch>` |
 | `detached` | `HEAD` detached (through `update-ref`, last: a merge in progress refuses a checkout); `oosh-user`'s `~/oosh` is pointed at the broken folder, as the Mac's one user lives in it | `<base>/<branch>`, `oosh-user` |
+
+**The transport** (`private.os.platform.user.run`): `runuser` gets `env HOME=~<user>` (it keeps the caller's environment, so HOME would stay the ssh login's), root runs through `sudo -H`, and every command starts with `unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND` — `ogit.folder.finish` in the gates' fixtures trusts folders for `$SUDO_USER`, which filled the login's `.gitconfig`.
+
+**Who moves.** Under `oo heal <branch> all` only the healer and the login that ran sudo move to `<branch>` (`private.oo.heal.user.keep.check`); `oosh-user`, `bash-user` and `developking` keep their installed branch, so a check of the scenario must not expect them on `<branch>`.
 
 The folder arms build on one another in this order: `missing.branch` clears `<base>/<branch>`; `diverged`
 clones it again from the installed tree and commits on it; `markers.committed` commits on it; `merge.conflict`
