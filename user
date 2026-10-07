@@ -181,21 +181,25 @@ private.user.bashrc.install()     # <targetHome> <?ooshDir:$OOSH_DIR> # install 
  if private.this.file.same "$template" "$targetHome/.bashrc"; then
    create.result 0 "$targetHome/.bashrc is the oosh template"
  else
-   # The originals are COPIED, not moved: the template is written over .bashrc
-   # right after, and a copy leaves the user a .bashrc if a step fails between.
+   # The originals are COPIED (cp -p keeps mode and mtime), not moved: the
+   # template is written over .bashrc right after, and a copy leaves the user
+   # a .bashrc if a step fails between. Raw cp, not `check … call cp`: the
+   # copy's rc must stop the install before the template overwrites the only
+   # original.
    if [ -f "$targetHome/.bashrc" ]; then
      if [ ! -e "$targetHome/.bashrc.pre-oosh" ]; then
-       cp "$targetHome/.bashrc" "$targetHome/.bashrc.pre-oosh"
+       cp -p "$targetHome/.bashrc" "$targetHome/.bashrc.pre-oosh" || { create.result 1 "could not keep $targetHome/.bashrc as .bashrc.pre-oosh"; error.log "$RESULT"; return $(result); }
      elif ! private.this.file.same "$targetHome/.bashrc" "$targetHome/.bashrc.pre-oosh"; then
        # A later hand edit: keep it as .bashrc.orig.<ts> unless it is the
-       # newest one already kept (stamps sort, so the last glob match — kept
-       # raw: no kernel method lists "the newest .orig").
+       # newest one already kept. "Newest" is the last glob match — stamps
+       # sort lexically, so a -10 bump sorts before -2 (limit; it only
+       # costs one extra copy). Raw: no kernel method lists the newest .orig.
        local _newest="" _f
        for _f in "$targetHome"/.bashrc.orig.*; do [ -f "$_f" ] && _newest="$_f"; done
        if [ -z "$_newest" ] || ! private.this.file.same "$targetHome/.bashrc" "$_newest"; then
          local _ts
          _ts=$(private.this.orig.stamp.get "$targetHome" .bashrc)
-         cp "$targetHome/.bashrc" "$targetHome/.bashrc.orig.$_ts" || { create.result 1 "could not keep $targetHome/.bashrc as .bashrc.orig.$_ts"; error.log "$RESULT"; return $(result); }
+         cp -p "$targetHome/.bashrc" "$targetHome/.bashrc.orig.$_ts" || { create.result 1 "could not keep $targetHome/.bashrc as .bashrc.orig.$_ts"; error.log "$RESULT"; return $(result); }
        fi
      fi
    fi
@@ -269,14 +273,19 @@ private.user.oosh.install.links()     # <targetHome> <sharedConfig> <sharedOosh>
 }
 
 
-private.user.home.ensure()     # <username> <?home> # create a missing home directory for a passwd entry: owner and primary group of the user, mode 0750; RESULT created or exists #
+private.user.home.ensure()     # <username> <?home> # create a missing home directory for a passwd entry: owner and primary group of the user, the platform's home mode; RESULT created or exists #
 {
  # A passwd entry can outlive its home (once_dev: developking without
- # /home/developking). 0750 is what useradd gives on Debian and Ubuntu
- # (user.create runs useradd -m). The home comes from the user database
- # (user.get home) unless <home> names it. The directory itself comes from
- # private.this.dir.ensure, which elevates only where it must.
- local username="$1" home="$2" grp
+ # /home/developking). The mode is what useradd gives on THIS platform
+ # (private.user.home.mode.get through os.check: 0750 Ubuntu, 0755 Debian and
+ # macOS, 0700 RHEL), not a guess. The home comes from the user database
+ # (user.get home) unless <home> names it. The directories come from
+ # private.this.dir.ensure, which elevates only where it must; missing
+ # PARENTS get no owner and 0755 — they belong to the system, never to the
+ # user. No /etc/skel is copied: private.user.bashrc.install supplies the
+ # .bashrc, and that is the decision.
+ # Caller: private.oo.heal.system (package B1, the heal) — nothing calls it yet.
+ local username="$1" home="$2" grp mode parent
  if [ -z "$username" ]; then
    create.result 1 "private.user.home.ensure requires a <username>"; error.log "$RESULT"; return $(result)
  fi
@@ -292,12 +301,49 @@ private.user.home.ensure()     # <username> <?home> # create a missing home dire
  if [ -z "$grp" ]; then
    create.result 1 "private.user.home.ensure: no primary group for '$username'"; error.log "$RESULT"; return $(result)
  fi
- private.this.dir.ensure "$home" "$grp" 0750 "$username" >/dev/null || { create.result 1 "private.user.home.ensure: could not create $home as $username:$grp"; error.log "$RESULT"; return $(result); }
- create.result 0 "created: $home ($username:$grp 0750)"
+ if os.check private.user.home.mode.get; then mode=$($RESULT); fi
+ [ -n "$mode" ] || mode=0755
+ parent="${home%/*}"
+ [ -n "$parent" ] || parent=/
+ private.this.dir.ensure "$parent" "" 0755 >/dev/null || { create.result 1 "private.user.home.ensure: could not create $parent"; error.log "$RESULT"; return $(result); }
+ private.this.dir.ensure "$home" "$grp" "$mode" "$username" >/dev/null || { create.result 1 "private.user.home.ensure: could not create $home as $username:$grp"; error.log "$RESULT"; return $(result); }
+ create.result 0 "created: $home ($username:$grp $mode)"
  return $(result)
 }
 
 
+private.user.home.mode.get.linux()     # <?loginDefs:/etc/login.defs> # echo the mode useradd gives a new home on Linux: HOME_MODE of login.defs, else 0777 minus its UMASK, else 0755 (BusyBox) #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # Ubuntu >= 21.04 ships HOME_MODE 0750; Debian only UMASK 022 (0755); RHEL and
+ # AlmaLinux UMASK 077 (0700); BusyBox has no login.defs (0755). Read raw:
+ # no kernel method reads a login.defs key.
+ local defs="${1:-/etc/login.defs}" key val mode="" umask=""
+ if [ -r "$defs" ]; then
+   while read -r key val _; do
+     case "$key" in
+       HOME_MODE) mode="$val" ;;
+       UMASK)     umask="$val" ;;
+     esac
+   done < "$defs"
+ fi
+ if [ -z "$mode" ]; then
+   if [ -n "$umask" ]; then
+     mode=$(printf '%04o' $(( 0777 & ~0$umask )))
+   else
+     mode=0755
+   fi
+ fi
+ echo "$mode"
+}
+
+
+private.user.home.mode.get.darwin()     #  # echo the mode a new home has on macOS: 0755 #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # sysadminctl creates /Users/<name> as 0755.
+ echo 0755
+}
 
 
 ### new.method
@@ -1169,11 +1215,14 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # whether the caller is a sudoer, already root on a minimal container
   # without sudo installed, or anything in between.
   local _lnRc=0
-  # The shared preamble stands the TARGET up and the shared tree's `user`
-  # runs the link step (private.user.oosh.install.links): a real ~/config or
+  # The shared preamble stands the TARGET up and script.load brings the shared
+  # tree's `user` in to run the link step (private.user.oosh.install.links): a real ~/config or
   # ~/oosh is kept as .orig.<ts> through private.this.symlink.with.backup.
+  # oosh-dir-exception: the target's ~/oosh does not exist yet — this step makes it —
+  # so script.load reads `user` from the shared tree.
   private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")
-    '$sharedOosh/user' private.user.oosh.install.links '$targetHome' '$sharedConfig' '$sharedOosh'
+    OOSH_DIR='$sharedOosh' private.this.script.load user private.user.oosh.install.links || exit 1
+    private.user.oosh.install.links '$targetHome' '$sharedConfig' '$sharedOosh' || exit 1
   " || _lnRc=$?
   # Verify actual state — macOS sshd + -tt ControlMaster sometimes drops the
   # SSH connection right after the inner commands complete, giving a non-zero
