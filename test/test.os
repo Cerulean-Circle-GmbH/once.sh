@@ -360,13 +360,18 @@ test.os.stubs.set() {
   sleep()     { :; }
   ossh()      { echo "ossh $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; }
   private.os.platform.sshd.reload() { echo "sshd.reload $*" >> "$OS_T_REC"; }
+  # the live ControlMaster socket of a real os platform.test on this host must stay
+  private.os.platform.socket.remove() { echo "socket.remove $*" >> "$OS_T_REC"; }
 }
 test.os.stubs.unset() {
-  unset -f odocker docker sshpass ssh sleep ossh private.os.platform.sshd.reload
+  unset -f odocker docker sshpass ssh sleep ossh private.os.platform.sshd.reload private.os.platform.socket.remove
   source "$OOSH_DIR/os"
   rm -rf "$(dirname "$OS_T_REC")"; unset OS_T_REC
 }
 test.os.containerUp() {
+  # isolated from the caller: own HOME, no inherited branch or control path
+  local fx; fx=$(test.suite.fixture.make osup)
+  local HOME="$fx" OSSH_CONTROL_PATH OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH OSSH_CONTROL_PATH
   local bad="" rec
   test.os.stubs.set
   private.os.platform.container.up p img 9022 >/dev/null 2>&1 || bad="$bad rc=$?"
@@ -374,7 +379,9 @@ test.os.containerUp() {
   case "$rec" in *"odocker reset img 9022"*) ;; *) bad="$bad reset-lacks-port" ;; esac
   case "$rec" in *"sshd.reload 9022"*) ;; *) bad="$bad sshd.reload-lacks-port" ;; esac
   case "$rec" in *"ossh install p test"*) ;; *) bad="$bad no-install-for-test" ;; esac
+  case "$rec" in *"socket.remove 9022"*) ;; *) bad="$bad socket-not-removed-through-method" ;; esac
   test.os.stubs.unset
+  rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "the ssh port given reaches odocker reset and sshd.reload, and test gets installed" || create.result 1 "container.up:$bad"
   return $(result)
 }
@@ -382,7 +389,11 @@ test.case $level "T-OS-CONTAINER-UP-PORT: container.up hands the port it was giv
 expect 0 "the ssh port given reaches odocker reset and sshd.reload, and test gets installed" \
   "container.up used an undefined \$port: sshd.reload did nothing"
 
+# T-OS-PLATFORM-TEST-BRANCH-ENV gates HEAD of the REAL repo ($OOSH_DIR): its init/oosh must carry the mode root contract.
 test.os.platformTestBranch() {
+  # isolated from the caller: own HOME, no inherited branch or control path
+  local fx; fx=$(test.suite.fixture.make osbranch)
+  local HOME="$fx" OSSH_CONTROL_PATH OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH OSSH_CONTROL_PATH
   local bad="" rec rc
   test.os.stubs.set
   os.platform.test ubuntu_24_04 "" notests HEAD >/dev/null 2>&1; rc=$?
@@ -399,16 +410,17 @@ test.os.platformTestBranch() {
   [ "$(grep '^ossh install' "$OS_T_REC" | grep -vc 'branch=\[unset\]')" = 0 ] || bad="$bad branch-set-without-param"
   # a failing container.up ends platform.test with rc 1, whatever it returned; and no ossh install follows
   : > "$OS_T_REC"
-  private.os.platform.container.up() { return 99; }
+  private.os.platform.container.up() { create.result 1 "stubbed failure"; return 99; }
   os.platform.test ubuntu_24_04 "" notests >/dev/null 2>&1; rc=$?
   [ $rc = 1 ] || bad="$bad containerup-fail-rc=$rc"
+  grep -q '^ossh install' "$OS_T_REC" && bad="$bad install-after-fail"
   # branch on macos is refused, the CI is not started
   private.os.platform.test.ci() { echo "ci called" >> "$OS_T_REC"; }
   os.platform.test macos "" "" HEAD >/dev/null 2>&1; rc=$?
   [ $rc = 1 ] || bad="$bad macos-branch-rc=$rc"
   grep -q "ci called" "$OS_T_REC" && bad="$bad macos-ci-started"
   test.os.stubs.unset
-  source "$OOSH_DIR/os"
+  rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "OSSH_INSTALL_BRANCH is <branch> inside both ossh install calls and gone afterwards; empty placeholders keep notests; container.up failing gives rc 1; macos refuses a branch" || create.result 1 "platform.test stubbed:$bad"
   return $(result)
 }
@@ -427,6 +439,24 @@ test.os.gateLogGet() {
 }
 test.case $level "T-OS-GATE-LOG-GET: the gate log path of a user and platform" test.os.gateLogGet
 expect 0 "/tmp/oosh-platform-test-root-ubuntu_24_04.log" "one getter for gate.run and platform.test"
+
+
+console.log "
+Test: private.os.platform.socket.remove
+===================================================================="
+
+test.os.socketRemove() {
+  local s=/tmp/ossh-test@localhost:59999 bad=""
+  : > "$s"
+  private.os.platform.socket.remove 59999 || bad="$bad rc"
+  [ -e "$s" ] && bad="$bad still-there"
+  private.os.platform.socket.remove 59999 || bad="$bad missing-not-idempotent"
+  private.os.platform.socket.remove >/dev/null 2>&1 && bad="$bad no-port-accepted"
+  [ -z "$bad" ] && create.result 0 "removed" || create.result 1 "socket.remove:$bad"
+  return $(result)
+}
+test.case $level "T-OS-SOCKET-REMOVE: the socket of a port is removed and a missing one is no error" test.os.socketRemove
+expect 0 "removed" "the removal must be a stubbable method, tests must not touch a live socket"
 
 ### test.method
 

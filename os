@@ -71,7 +71,7 @@ private.os.platform.container.up()     # <platform> <image> <port> # start a fre
  ossh config.save.last
  # Clean up any stale ControlMaster socket from a previous test run
  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
- rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+ private.os.platform.socket.remove "$sshPort"
 
  # Open ControlMaster with sshpass (first connection, no keys yet)
  # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
@@ -107,14 +107,14 @@ private.os.platform.container.up()     # <platform> <image> <port> # start a fre
  # Refresh ControlMaster so new sessions pick up dev group membership
  # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
  ossh connection.close "$platform" 2>/dev/null
- rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+ private.os.platform.socket.remove "$sshPort"
  SSHPASS=test sshpass -e ssh \
   -o ControlMaster=yes \
   -o ControlPath="$OSSH_CONTROL_PATH" \
   -o ControlPersist=600 \
   -o StrictHostKeyChecking=accept-new \
   "$platform" true
- create.result 0 "container for $platform is up on port $sshPort, oosh installed for test"
+ create.result 0 "container for $platform is up on port $sshPort, install of oosh for test attempted (see the log)"
  return $(result)
 }
 
@@ -185,7 +185,7 @@ private.os.platform.users.install()     # <platform> # Phase A in the platform c
  ossh install "$platform" bash-user || {
   error.log "Failed to install oosh for bash-user on $platform"
  }
- create.result 0 "oosh-user and bash-user are installed on $platform"
+ create.result 0 "creation of oosh-user and bash-user and the install for bash-user attempted on $platform (see the log)"
  return $(result)
 }
 
@@ -198,7 +198,7 @@ private.os.platform.gate.log.get()     # <user> <platform> # echo the log file p
 }
 
 
-private.os.platform.gate.run()     # <platform> <user:test|root|oosh-user|bash-user> # Phase B for ONE user in the platform container: run test.suite gate 1 through the transport that fits the user (ossh exec / sudo bash -lc / runuser or sudo -H -u), tee into private.os.platform.gate.log.get <user> <platform>; rc is the gate rc of that user #
+private.os.platform.gate.run()     # <platform> <user> # Phase B for ONE user (test, root, oosh-user or bash-user) in the platform container: run test.suite gate 1 through the transport that fits the user (ossh exec / sudo bash -lc / runuser or sudo -H -u), tee into private.os.platform.gate.log.get <user> <platform>; rc is the gate rc of that user #
 {
  local platform="$1" user="$2" log prelude rc
  if [ -z "$platform" ] || [ -z "$user" ]; then
@@ -279,8 +279,8 @@ private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for
  # "only 'mode root' is supported"; the older refs (b492b2e, 9824746e, 0f63df38, 1604e3e,
  # 596ab0c) use `mode ssh` + rsync and do not contain that text. A ref beginning with
  # a dash is never a ref (it would be read as an option by git).
- private.this.script.load ogit ogit.file.show || return 1
- private.this.script.load ogit ogit.branch.check || return 1
+ private.this.script.load ogit ogit.file.show || return $(result)
+ private.this.script.load ogit ogit.branch.check || return $(result)
  local contract="only 'mode root' is supported" content
  case "$branch" in
    -*) create.result 1 "<branch> $branch is not a branch name or commit sha"
@@ -308,6 +308,15 @@ private.os.platform.branch.gate()     # <branch> <?dir:$OOSH_DIR> # era gate for
 }
 
 
+private.os.platform.socket.remove()     # <port> # remove the stale ControlMaster socket /tmp/ossh-test@localhost:<port> of a platform test container; silent and idempotent #
+{
+ # NO create.result — silent by contract; a missing socket is no error.
+ [ -n "$1" ] || return 1
+ rm -f "/tmp/ossh-test@localhost:$1" 2>/dev/null
+ return 0
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,8 +339,9 @@ private.os.platform.parse() { # <platform> # parses platform config into PLATFOR
   private.os.platform.load
   local value="${!varname}"
   if [ -z "$value" ]; then
-    error.log "Unknown platform: $platform"
-    return 1
+    create.result 1 "Unknown platform: $platform"
+    error.log "$RESULT"
+    return $(result)
   fi
   # Parse from edges inward: workspace:...:pm:tier
   PLATFORM_TIER="${value##*:}"
@@ -473,12 +483,13 @@ os.platform.list() # # lists all platforms with tier info
   done
 }
 
-os.platform.test() # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch name or commit sha of this repo, installer contract mode root i.e. b8b90b82 or newer) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
+os.platform.test()     # <platform> <?terminal> <?notests> <?branch> # tests oosh installation on a single platform; <branch> (a branch name or commit sha of this repo, installer contract mode root i.e. b8b90b82 or newer; a name known only as origin/<branch> is accepted; the gate reads the LOCAL repo, so a local-only sha passes the gate and fails in the container) is exported as OSSH_INSTALL_BRANCH to the two ossh install calls, so an older ref can be installed first (ossh honours it: package B4) #
 {
  local platform="$1"
  if [ -z "$platform" ]; then
-  error.log "Usage: os platform.test <platform> <?terminal> <?notests> <?branch>"
-  return 1
+  create.result 1 "Usage: os platform.test <platform> <?terminal> <?notests> <?branch>"
+  error.log "$RESULT"
+  return $(result)
  fi
  shift
  # positional: an empty placeholder ("") for <terminal> or <notests> must still
@@ -490,26 +501,26 @@ os.platform.test() # <platform> <?terminal> <?notests> <?branch> # tests oosh in
  local branch="$1"
  if [ $# -gt 0 ]; then shift; fi
 
- private.os.platform.parse "$platform" || return 1
+ private.os.platform.parse "$platform" || return $(result)
 
  if [ "$PLATFORM_WORKSPACE" = "native" ]; then
   if [ "$platform" = "macos" ]; then
    if [ -n "$branch" ]; then
     create.result 1 "<branch> $branch cannot be installed first on macos: the CI workflow installs its own branch"
     error.log "$RESULT"
-    return 1
+    return $(result)
    fi
    private.os.platform.test.ci "$platform" "$terminal" "$notests"
    return $?
   fi
   console.log "SKIP: $platform is a native platform (no Docker test)"
   create.result 1 "SKIP"
-  return 1
+  return $(result)
  fi
 
  # Era gate, before anything starts: the ref must carry the mode root installer contract
  if [ -n "$branch" ]; then
-  private.os.platform.branch.gate "$branch" || return 1
+  private.os.platform.branch.gate "$branch" || return $(result)
  fi
 
  local imageTag sshPort rc
@@ -519,9 +530,9 @@ os.platform.test() # <platform> <?terminal> <?notests> <?branch> # tests oosh in
  # <branch> reaches ossh install (container.up installs test, users.install bash-user)
  # as OSSH_INSTALL_BRANCH: a prefix assignment lives for that one call only.
  if [ -n "$branch" ]; then
-  OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
+  OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return $(result)
  else
-  private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
+  private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return $(result)
  fi
 
  # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
@@ -543,8 +554,6 @@ os.platform.test() # <platform> <?terminal> <?notests> <?branch> # tests oosh in
  local testLog="" rootLog="" ooshUserLog="" bashUserLog=""
 
  if [ -z "$notests" ]; then
-  private.this.script.load ossh ossh.remote.prelude.get || return 1
-
   testLog=$(private.os.platform.gate.log.get test "$platform")
   private.os.platform.gate.run "$platform" test
   rcTest=$?
