@@ -976,6 +976,42 @@ test.os.healTestCompletion() {
 test.case $level "T-OS-HEAL-TEST-COMPLETION: platform.heal.test completes its parameters with real candidates" test.os.healTestCompletion
 expect 0 "completion: platforms, remote branches, breakages" "every public parameter completes"
 
+# T-OS-HEAL-BREAKAGE-WORKTREE-TRACKS: the worktree.layout arm makes <base>/testing the way the old
+# install did — a linked worktree of main at origin/testing, tracking it. Gate 3 (2026-10-07): the
+# arm hung testing on main's HEAD with no upstream; ogit worktree.remove refused it ("testing tracks
+# no upstream") and the layout invariant failed for every user. The arm runs on a fixture base: the
+# one B= line of the preamble is replaced, and the run is refused unless that took.
+test.os.healBreakageWorktreeTracks() {
+  local fx bad="" script B out
+  fx=$(test.suite.fixture.make healwtarm); B="$fx/Once.sh"; mkdir -p "$B"
+  git init -q --bare -b main "$fx/origin.git"
+  git init -q -b main "$B/main"; git -C "$B/main" remote add origin "$fx/origin.git"
+  printf 'seed\n' > "$B/main/file"; git -C "$B/main" add file
+  git -C "$B/main" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m seed
+  git -C "$B/main" push -q -u origin main; git -C "$B/main" push -q origin main:testing
+  # main moves on: its HEAD is not origin/testing any more
+  printf 'more\n' >> "$B/main/file"
+  git -C "$B/main" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -am more
+  git -C "$B/main" push -q origin main
+  script=$(private.os.platform.heal.breakage.script.get worktree.layout dev.heal | sed "s#^B=.*#B='$B'#")
+  if [ "$(printf '%s\n' "$script" | grep -c '^B=')" = 1 ] && printf '%s\n' "$script" | grep -qxF "B='$B'"; then
+    out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad rc=[$out]"
+    [ -f "$B/testing/.git" ] || bad="$bad not-a-worktree"
+    [ "$(git -C "$B/testing" rev-parse --abbrev-ref '@{u}' 2>/dev/null)" = origin/testing ] || bad="$bad no-upstream"
+    [ "$(git -C "$B/testing" rev-parse HEAD 2>/dev/null)" = "$(git -C "$fx/origin.git" rev-parse testing)" ] || bad="$bad not-at-origin-testing"
+    out=$(printf '%s\n' "$script" | sh 2>&1)
+    case "$out" in *already*) ;; *) bad="$bad second-run=[$out]" ;; esac
+  else
+    bad="$bad base-not-replaced"
+  fi
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "testing a linked worktree at origin/testing, tracking it; a second run says already" || create.result 1 "worktree arm:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-BREAKAGE-WORKTREE-TRACKS: the worktree.layout arm makes testing a worktree tracking origin/testing, as the old install did" test.os.healBreakageWorktreeTracks
+expect 0 "testing a linked worktree at origin/testing, tracking it; a second run says already" \
+  "gate 3: a worktree without upstream is not the old layout, and the heal rightly refused it"
+
 ### test.method
 
 test.suite.save.results

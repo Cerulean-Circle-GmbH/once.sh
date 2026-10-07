@@ -559,9 +559,15 @@ OOSH_HEAL_ARM
 w="$B/testing"
 if [ -f "$w/.git" ]; then say "already: $w is a linked worktree"; exit 0; fi
 [ -d "$B/main/.git" ] || fail "no $B/main to hang a worktree on"
+# The old install's worktrees tracked origin: testing at origin/testing with
+# its upstream set — the shape ogit worktree.remove converts.
+rgit -C "$B/main" rev-parse -q --verify refs/remotes/origin/testing >/dev/null \
+  || rgit -C "$B/main" fetch -q origin "+refs/heads/testing:refs/remotes/origin/testing" \
+  || fail "origin of $B/main has no testing"
 [ -e "$w" ] && rm -rf "$w"
-rgit -C "$B/main" worktree add -f -B testing "$w" HEAD >/dev/null 2>&1 || fail "worktree add $w"
-say "$w is a linked worktree of $B/main on branch testing"
+rgit -C "$B/main" worktree add -f -B testing "$w" origin/testing >/dev/null 2>&1 || fail "worktree add $w"
+rgit -C "$w" branch -q -u origin/testing testing || fail "upstream of $w"
+say "$w is a linked worktree of $B/main on branch testing, tracking origin/testing"
 OOSH_HEAL_ARM
      ;;
    missing.branch)
