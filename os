@@ -293,7 +293,7 @@ private.os.platform.heal.breakage.names.get()     #  # echo the breakage names o
  # does not touch; detached comes last, through update-ref, because a merge
  # in progress refuses a checkout. worktree.layout breaks <base>/testing, a
  # folder of its own: one folder holds one shape of a worktree.
- printf '%s\n' eraB.config private.clone foreign.symlink devhome.missing boot.era no.bashrc \
+ printf '%s\n' eraB.config root.clone foreign.symlink devhome.missing boot.era no.bashrc \
    safe.directory.stale ssh.legacy state.30 launcher.missing worktree.layout \
    missing.branch diverged markers.committed merge.conflict dirty detached
 }
@@ -428,7 +428,7 @@ chown -R test "$c" # recursive-exception: the era-B config this arm just wrote, 
 say "$c is a real folder with the era-B files of the MacStudio, /Users/donges rewritten to $h"
 OOSH_HEAL_ARM
      ;;
-   private.clone)
+   root.clone)
      # once_dev's root: ~/oosh a real clone (dev at the old ref) with an oosh.orig.<ts>, ~/config real with OOSH_MODE="oosh"
      cat <<'OOSH_HEAL_ARM'
 r=$(home_of root); [ -n "$r" ] || fail "no root in /etc/passwd"

@@ -475,12 +475,14 @@ Test: os platform.heal.test — the breakages
 test.os.healBreakageNames() {
   local bad="" names n script preamble list want
   names=$(private.os.platform.heal.breakage.names.get)
-  for n in merge.conflict markers.committed dirty detached diverged eraB.config private.clone \
+  for n in merge.conflict markers.committed dirty detached diverged eraB.config root.clone \
            foreign.symlink missing.branch devhome.missing boot.era no.bashrc worktree.layout \
            safe.directory.stale ssh.legacy state.30 launcher.missing; do
     printf '%s\n' "$names" | grep -qxF "$n" || bad="$bad not-named:$n"
   done
   [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" = 17 ] || bad="$bad count=$(printf '%s\n' "$names" | wc -l)"
+  # no breakage name starts with private.: the prefix is reserved for helpers (T-PRIVATE-CALLS-DEFINED)
+  printf '%s\n' "$names" | grep -q '^private\.' && bad="$bad private-prefix"
   preamble=$(private.os.platform.heal.remote.preamble.get dev.heal) || bad="$bad no-preamble"
   for n in $names; do
     if ! script=$(private.os.platform.heal.breakage.script.get "$n" dev.heal); then bad="$bad no-arm:$n"; continue; fi
