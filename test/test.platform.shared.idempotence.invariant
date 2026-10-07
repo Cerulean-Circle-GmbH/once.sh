@@ -7,7 +7,8 @@
 # runs on ubuntu 24.04, debian 12, AlmaLinux 9, alpine 3.19 and macOS. This
 # file asks it on the real installed machine, per method, so the report names
 # the culprit:
-#   config init.user · oo user.fix · config save · oo update · odocker prereqs.install
+#   config init.user · oo user.fix · config save · oo update · oo heal ·
+#   odocker prereqs.install
 # Each one: run (reach its fixed point — the install may not have run this
 # exact method) → snapshot → run again → snapshot → compare. The snapshot holds
 # CONTENT (cksum, POSIX) and REWRITTEN (inode + mtime, stat -c with its stat -f
@@ -23,6 +24,12 @@
 #     visible with the file list, not a failure; a content change, a file
 #     added or removed still fails. Owner's decision 2026-10-06: config save's
 #     writer is not changed now (it rewrites the files it saves, unchanged).
+#   oo heal — the same: its last step (config init.env, in a fresh process)
+#     writes the env files again, so a file REWRITTEN with the same content is
+#     a WARNING; a content change, a file added or removed fails. The heal
+#     writes no file with new content each time: the install state it sets
+#     (SETUP_SERVER 99) is the same on the second run, so no file is left out
+#     of the snapshot for it beyond the log files.
 #   every other method — nothing: a rewrite of an unchanged file fails too.
 #
 # A method that cannot be run here without a password prompt (a user without
@@ -30,8 +37,18 @@
 # fails (network, credentials), is NOT CHECKED: an expect.fail that says so
 # and why — a skip that scores as a pass is how a check silently stops
 # checking (docs/test-suite.md, test.platform.odocker.workspaces.invariant).
-# Every method must end rc 0 on both runs: a non-zero rc is a failure naming
-# the rc and the last line it printed, also when nothing changed.
+# `oo update` whose pull the gate REFUSED (a merge in progress, committed
+# conflict markers, uncommitted changes, a detached HEAD, a diverged branch)
+# is NOT CHECKED with the refusal verbatim — it names the one command to run;
+# only a failed fetch says "network or credentials".
+# `oo heal` ends rc 0 (healed), 1 (something is left for the user) or 2 (cannot
+# heal: no root, no passwordless sudo). A user without passwordless sudo is
+# NOT CHECKED before the run (the heal would ask for a password on the
+# terminal); rc 2 is NOT CHECKED too. rc 1 is the heal's
+# own answer for a computer with something only the user can do: it is checked
+# like rc 0 — nothing changed, and the second run ends with the same rc.
+# Every other method must end rc 0 on both runs: a non-zero rc is a failure
+# naming the rc and the last line it printed, also when nothing changed.
 #
 # Each method runs in a fresh process with the user's own environment only
 # (env -i HOME USER LOGNAME PATH TERM) plus OOSH_NO_INSTALL=1: the env files
@@ -225,6 +242,14 @@ if [ "$sudoFree" = no ] && private.this.group.exists dev && ! private.user.group
   initUserBlock="$userName is not yet in group dev and has no passwordless sudo — config.init.user would run \$SUDO usermod for it (user.group.add)"
 fi
 
+# oo heal installs the launcher in /usr/local/bin and makes the shared folders
+# with sudo; without root or passwordless sudo it asks for a password ON THE
+# TERMINAL (not on stdin), which a test run must never wait for.
+healBlock=""
+if [ "$sudoFree" = no ]; then
+  healBlock="$userName has no passwordless sudo — oo heal would ask for a password on the terminal (its system part and the launcher need root)"
+fi
+
 # ----------------------------------------------------------------------------
 # INVARIANT-1..5: per method — run, snapshot, run again, snapshot, compare.
 # Fields of each row: <label> TAB <blocked reason> TAB <recovery> TAB
@@ -237,6 +262,7 @@ methods="config init.user	${initUserBlock:--}	config init.check	-	config init.us
 oo user.fix	${initUserBlock:--}	config init.check	-	oo user.fix
 config save	-	config validate.required	rewritten	config save
 oo update	${initUserBlock:--}	config init.check	-	oo update
+oo heal	${healBlock:--}	oo heal.status	rewritten	oo heal
 odocker prereqs.install	-	odocker status	-	odocker prereqs.install"
 
 # The log files of this user, left out of every snapshot (see the header).
@@ -252,9 +278,20 @@ while IFS='	' read -r label blocked recovery accepted command; do
   fi
   # shellcheck disable=SC2086 # <command> is two words: script and method
   test.platform.shared.idempotence.run "$work/$slug.first.out" $command; firstRc=$?
-  if [ "$firstRc" != 0 ]; then
+  # oo heal answers 1 when something is left for the user: a result to check.
+  if [ "$firstRc" != 0 ] && ! { [ "$label" = "oo heal" ] && [ "$firstRc" = 1 ]; }; then
     if [ "$label" = "oo update" ]; then
-      expect.fail "NOT CHECKED: \`oo update\` could not pull (rc $firstRc; network or credentials): $(grep . "$work/$slug.first.out" | tail -1) — see: ogit remote.pull"
+      # The gate's refusal is logged "oo update: not pulled — <RESULT>"; a
+      # failed fetch ("could not fetch", "origin has no branch") is the network.
+      refusal=$(grep 'oo update: not pulled — ' "$work/$slug.first.out" | tail -1 | sed 's/^.*oo update: not pulled — //')
+      case "$refusal" in
+        ""|*"could not fetch"*|*"origin has no branch"*)
+          expect.fail "NOT CHECKED: \`oo update\` could not pull (rc $firstRc; network or credentials): $(grep . "$work/$slug.first.out" | tail -1) — see: ogit remote.pull" ;;
+        *)
+          expect.fail "NOT CHECKED: \`oo update\` pull refused — $refusal" ;;
+      esac
+    elif [ "$label" = "oo heal" ] && [ "$firstRc" = 2 ]; then
+      expect.fail "NOT CHECKED: \`oo heal\` cannot heal as $userName (rc 2; no root, no passwordless sudo): $(grep . "$work/$slug.first.out" | tail -1) — see: $recovery, then sudo -H oo heal"
     else
       expect.fail "\`$label\` failed on its first run (rc $firstRc): $(grep . "$work/$slug.first.out" | tail -1) — see: $recovery"
     fi
@@ -269,8 +306,9 @@ while IFS='	' read -r label blocked recovery accepted command; do
   test.platform.shared.idempotence.snapshotAll "$work/$slug.after"
   lastWords=$(grep . "$work/$slug.second.out" | tail -1)
   if differences=$(test.platform.shared.idempotence.compare "$work/$slug.before" "$work/$slug.after"); then
-    # Every method, odocker prereqs.install too: rc 0 on both runs.
-    if [ "$secondRc" = 0 ]; then
+    # Every method, odocker prereqs.install too: rc 0 on both runs; oo heal the
+    # rc of its first run (0, or 1 for what is left for the user).
+    if [ "$secondRc" = "$firstRc" ]; then
       expect.pass "\`$label\` twice: nothing changed (rc $firstRc then $secondRc)${lastWords:+ — $lastWords}"
     else
       expect.fail "\`$label\` changed nothing but its second run failed (rc $secondRc): $lastWords — see: $recovery"
@@ -279,7 +317,7 @@ while IFS='	' read -r label blocked recovery accepted command; do
     expect.fail "\`$label\` is not idempotent — its second run (rc $secondRc${lastWords:+: $lastWords}) changed:
 $(printf '%s\n' "$differences" | sed 's/^/      /')
     — see: $recovery"
-  elif [ "$secondRc" != 0 ]; then
+  elif [ "$secondRc" != "$firstRc" ]; then
     expect.fail "\`$label\` changed only what is accepted for it ($accepted) but its second run failed (rc $secondRc): $lastWords — see: $recovery"
   else
     expect.pass "\`$label\` twice: no content change, no file added or removed (rc $firstRc then $secondRc)
