@@ -131,6 +131,9 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `branch.compare` | `<from> <to> <?dir:$OOSH_DIR>` | symmetric branch comparison; RESULT = `up to date with <from>` \| `<from> merged in` \| `N commits behind <from>` \| `diverged: N behind <from>` (moved verbatim from `promote.branch.alignment`) |
 | `branch.fastForward` | `<ref> <?dir:$OOSH_DIR>` | fast-forward the current branch of `<dir>` to `<ref>`; rc 1 (nothing changed) when it has diverged |
 | `branch.merge` | `<ref> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | merge `<ref>` into the current branch of `<dir>` (`--no-edit`); with `<asEmail>`/`<asName>` the merge commit carries that identity and no gpg signing |
+| `branch.adopt` | `<ref> <?message> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | make the current branch of `<dir>` a merge of itself and `<ref>` whose content is exactly the tree of `<ref>` (`commit-tree`, then `branch.fastForward`); refuses a dirty tree and a ref that does not resolve; nothing to do when the branch already contains `<ref>` |
+
+`branch.adopt` exists for a promotion after tree-reset rollbacks (30 Sep 2026: prod and testing each got a commit whose tree is an older one): their merge base is still the regression both left, so a 3-way merge conflicts everywhere although the intent — the target becomes the content of the source — is plain; adopt records that intent as one merge commit, with the full history and no force push.
 
 ### merge
 
