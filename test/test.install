@@ -1093,4 +1093,112 @@ test.case $level "T-INIT-REFUSES-BROKEN-HOME-OOSH: a mid-merge or detached ~/oos
 expect 0 "mid-merge and detached trees are refused, clean and non-git trees pass" \
   "the Mac's conflicted tree was executed by a re-run of the installer"
 
+# T-INIT-HEAL-ARM: `sh init/oosh heal [<branch>] [all]` clones <branch> fresh
+# into a temp dir and runs THAT tree's oo heal. The healArm block runs
+# standalone under POSIX sh (with the installer's `set -e`) against a fixture
+# origin whose `oo` is a stub that prints what it got; the installer never
+# runs, no network, HOME and TMPDIR are the fixture's.
+test.install.healArmProbe() # <fixture> <sh-args…> # runs the extracted healArm block as `sh probe <args>`, echoes "<output> RC=<rc>"
+{
+  local fx="$1"; shift
+  local probe="$fx/probe" out rc i
+  {
+    echo '#!/usr/bin/env sh'
+    echo 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"'
+    echo ': ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}'
+    echo 'die() { echo "oosh install: $*" >&2; exit 1; }'
+    echo 'set -e'
+    sed -n '/^# BEGIN healArm$/,/^# END healArm$/p' "$INIT_SCRIPT"
+    echo 'echo FELL-THROUGH'
+    # far more than one read buffer of script text after the block: a child
+    # that inherited the pipe would read a PADDING line
+    for ((i = 0; i < 2000; i++)); do echo '# PADDING-MARKER the child must never read this script text'; done
+  } > "$probe"
+  if ! grep -q '^# BEGIN healArm$' "$probe"; then echo "NO-BLOCK RC=99"; return 0; fi
+  if [ "$1" = pipe ]; then
+    shift
+    out="$(cat "$probe" | env -u OOSH_BRANCH -u OOSH_SELF_BRANCH -u OOSH_DIR -u CONFIG HOME="$fx/home" TMPDIR="$fx/tmp" PATH="$fx/bin:$PATH" OOSH_REPO="$fx/origin.git" sh -s -- "$@" 2>&1)"
+  else
+    out="$(env -u OOSH_BRANCH -u OOSH_SELF_BRANCH -u OOSH_DIR -u CONFIG HOME="$fx/home" TMPDIR="$fx/tmp" PATH="$fx/bin:$PATH" OOSH_REPO="$fx/origin.git" sh "$probe" "$@" 2>&1 </dev/null)"
+  fi
+  rc=$?
+  echo "$out RC=$rc"
+}
+
+test.install.healArmFixture() # <label> # echo a fixture: origin.git with dev and prod whose oo is a stub printing its view and exiting 3
+{
+  local fx
+  private.this.script.load ogit ogit.repo.init
+  fx=$(test.suite.fixture.make "$1"); mkdir -p "$fx/home" "$fx/tmp" "$fx/bin"
+  ogit.repo.init "$fx/origin.git" yes dev >/dev/null 2>&1
+  ogit.repo.init "$fx/seed" no dev >/dev/null 2>&1
+  cat > "$fx/seed/oo" <<'STUB'
+#!/usr/bin/env bash
+if [ -t 0 ]; then tty=tty; first=""; else tty=notty; IFS= read -r first || true; fi
+echo "STUB args=[$*] me=[$(id -un)] OOSH_DIR=[${OOSH_DIR-<unset>}] CONFIG=[${CONFIG-<unset>}] stdin=[$tty] first=[$first] mode=[$(ls -ld "${0%/*}/.." | cut -c1-10)] self=[$0]"
+exit 3
+STUB
+  ogit.index.add all "$fx/seed" >/dev/null 2>&1
+  ogit.commit.create "stub oo" t@t.invalid t "$fx/seed" >/dev/null 2>&1
+  git -C "$fx/seed" push -q "$fx/origin.git" dev:dev dev:prod 2>/dev/null # ogit-exception: fixture push to a path — ogit.remote.push pushes only to a configured origin
+  printf '%s\n' '#!/bin/sh' "echo \"SUDO [\$*]\" >> \"$fx/sudo.log\"" 'shift' 'exec "$@"' > "$fx/bin/sudo"
+  chmod 755 "$fx/bin/sudo"
+  echo "$fx"
+}
+
+test.install.healArm() {
+  local fx out bad="" me tmpLeft
+  me=$(id -un)
+  fx=$(test.install.healArmFixture healarm)
+  out=$(test.install.healArmProbe "$fx" heal)
+  case "$out" in *"STUB args=[heal dev $me]"*"OOSH_DIR=[<unset>] CONFIG=[<unset>]"*"mode=[drwxr-xr-x]"*"self=[$fx/tmp/oosh-heal."*"/t/oo]"*"RC=3") ;; *) bad="$bad heal=[$out]" ;; esac
+  out=$(test.install.healArmProbe "$fx" heal prod)
+  case "$out" in *"STUB args=[heal prod $me]"*"RC=3") ;; *) bad="$bad heal-prod=[$out]" ;; esac
+  [ -e "$fx/sudo.log" ] && bad="$bad sudo-without-all"
+  out=$(test.install.healArmProbe "$fx" heal all)
+  if [ "$(id -u)" -ne 0 ]; then
+    case "$out" in *"STUB args=[heal dev all]"*"RC=3") ;; *) bad="$bad heal-all=[$out]" ;; esac
+    grep -q "^SUDO \[-H .*/oo heal dev all\]$" "$fx/sudo.log" 2>/dev/null || bad="$bad all-not-under-sudo-H=[$(cat "$fx/sudo.log" 2>/dev/null)]"
+  else
+    case "$out" in *"STUB args=[heal dev all]"*"RC=3") ;; *) bad="$bad heal-all-root=[$out]" ;; esac
+    [ -e "$fx/sudo.log" ] && bad="$bad root-took-sudo"
+  fi
+  out=$(test.install.healArmProbe "$fx")
+  [ "$out" = "FELL-THROUGH RC=0" ] || bad="$bad no-heal=[$out]"
+  tmpLeft=$(find "$fx/tmp" -mindepth 1 -maxdepth 1 -name 'oosh-heal.*')
+  [ -z "$tmpLeft" ] || bad="$bad temp-left=[$tmpLeft]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "heal clones <branch> fresh, runs its oo heal <branch> <who>, removes the temp dir and returns oo's rc" || create.result 1 "heal arm:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-HEAL-ARM: sh init/oosh heal [<branch>] [all] runs a fresh clone's oo heal and never touches ~/oosh" \
+  test.install.healArm
+expect 0 "heal clones <branch> fresh, runs its oo heal <branch> <who>, removes the temp dir and returns oo's rc" \
+  "a broken or absent ~/oosh must be healable by the one file the curl form fetches"
+
+# T-INIT-HEAL-ARM-STDIN: in the pipe form the script IS stdin — neither the
+# clone nor the child may read it (the child gets /dev/tty or /dev/null); a
+# clone failure says so, fails, and leaves nothing in TMPDIR.
+test.install.healArmStdin() {
+  local fx out bad="" tmpLeft
+  fx=$(test.install.healArmFixture healarmstdin)
+  out=$(test.install.healArmProbe "$fx" pipe heal)
+  case "$out" in *"STUB args=[heal dev "*) ;; *) bad="$bad pipe=[$out]" ;; esac
+  case "$out" in *PADDING-MARKER*) bad="$bad child-read-the-script" ;; esac
+  case "$out" in *"stdin=[tty] first=[]"*|*"stdin=[notty] first=[]"*) ;; *) bad="$bad stdin=[$out]" ;; esac
+  case "$out" in *"RC=3") ;; *) bad="$bad pipe-rc=[$out]" ;; esac
+  sed -n '/^# BEGIN healArm$/,/^# END healArm$/p' "$INIT_SCRIPT" | grep -v '^#' | grep 'git clone' | grep -q '</dev/null' || bad="$bad clone-reads-stdin"
+  out=$(test.install.healArmProbe "$fx" heal nosuchbranch)
+  case "$out" in *"heal: clone of nosuchbranch failed"*"RC=1") ;; *) bad="$bad bad-branch=[$out]" ;; esac
+  tmpLeft=$(find "$fx/tmp" -mindepth 1 -maxdepth 1 -name 'oosh-heal.*')
+  [ -z "$tmpLeft" ] || bad="$bad temp-left=[$tmpLeft]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the piped script is never read by the clone or the child; a failed clone is loud and leaves no temp dir" || create.result 1 "heal stdin:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-HEAL-ARM-STDIN: curl … | sh -s -- heal: the script on stdin is not eaten; a bad branch fails loud and clean" \
+  test.install.healArmStdin
+expect 0 "the piped script is never read by the clone or the child; a failed clone is loud and leaves no temp dir" \
+  "in the pipe form a child that inherits stdin swallows the rest of the installer"
+
 test.suite.save.results
