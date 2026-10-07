@@ -253,36 +253,18 @@ oo.commit() # <?mode:force> # commits latest changes to the oosh environment and
   fi
 }
 
-oo.update() # # updates oosh environment and pulls latest changes from github.
+oo.update() # # updates oosh environment: pulls the latest changes through a gate (fetch + fast-forward), then heals; rc 1 when the pull was refused, RESULT names the one command to run
 {
   private.this.script.load ogit ogit.branch.get
   cd "$OOSH_DIR" || return 1
-  local pulled=0
-  if ogit.remote.pull "" "" "$OOSH_DIR"; then
-    pulled=1
-  else
-    # SSH-based pull failed. The shared clone made in state 31 uses the 2cuGitHub
-    # SSH alias as its remote, which requires that alias to be present in the
-    # current user's ~/.ssh/config. On users where user.oosh.install couldn't
-    # seed the shared .ssh/ (e.g. fresh macOS install where developking's
-    # template wasn't fully laid out yet) the alias is missing and git pull
-    # can't resolve the host. Fall back to the same HTTPS URL init/oosh uses
-    # for the initial clone — read-only, no auth needed for a public repo.
-    # The configured remote is not changed, so future pushes keep using SSH.
-    local fallbackUrl="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
-    local branch
-    branch=$(ogit.branch.get "$OOSH_DIR")
-    [ -z "$branch" ] && branch="dev"
-    # ogit-exception: printed text, not an invocation
-    warn.log "git pull (SSH remote) failed; trying HTTPS fallback: $fallbackUrl $branch"
-    if ogit.remote.pull "$fallbackUrl" "$branch" "$OOSH_DIR"; then
-      important.log "oo update succeeded via HTTPS fallback (configured remote unchanged)"
-      pulled=1
-    fi
-  fi
-  if [ "$pulled" -ne 1 ]; then
-    error.log "oo update failed via both SSH remote and HTTPS fallback"
-    return 1
+  # The pull goes through private.oo.update.pull (gate, fetch, fast-forward —
+  # never a merge, D5). Refused or not, every step below runs: they are the
+  # heal a broken computer needs most (T-OO-UPDATE-HEALS-WHEN-REFUSED).
+  local pullRc pullResult
+  private.oo.update.pull "$OOSH_DIR"; pullRc=$?
+  pullResult="$RESULT"
+  if [ "$pullRc" -ne 0 ]; then
+    error.log "oo update: not pulled — $pullResult"
   fi
   # Trust: in the clone layout every folder under the base is its own
   # repository and needs its own safe.directory entry for the caller (spec
@@ -325,7 +307,8 @@ oo.update() # # updates oosh environment and pulls latest changes from github.
   # cloned image's old name — is corrected; a chosen one is kept.
   private.this.script.load config private.config.host.name.refresh \
     && private.config.host.name.refresh >/dev/null
-  return 0
+  create.result "$pullRc" "$pullResult"
+  return $(result)
 }
 
 private.oo.update.heal.symlinks() # # heal current user's ~/config + ~/oosh symlinks via config.init.user; idempotent
@@ -3528,6 +3511,83 @@ private.oo.shared.config.ensure()     # <sharedConfig> <rootConfig> <?userConfig
  fi
  private.this.symlink.with.backup "$userConfig" "$sharedConfig" || return $(result)
  create.result 0 "$userConfig links to $sharedConfig"
+ return $(result)
+}
+
+
+private.oo.update.pull.gate()     # <?dir:$OOSH_DIR> # rc 0 when <dir> may be pulled; rc 1 and a RESULT naming the one command to run when a merge, rebase or pick is in progress, conflict markers are committed, the tree is dirty, HEAD is detached or the branch has diverged from origin #
+{
+ # oo update pulled with a plain `git pull`: on a Mac whose tree had diverged
+ # it MERGED origin into it (D5). The pull is a fetch and a fast-forward now,
+ # and it runs only when nothing is in the way. Each refusal names the ONE
+ # command to run, so the user (or oo heal) knows the next step
+ # (T-OO-UPDATE-PULL-GATE). Read-only: nothing here changes <dir>.
+ private.this.script.load ogit ogit.branch.get
+ local dir="${1:-$OOSH_DIR}" kind markers branch verdict
+ ogit.merge.check "$dir" >/dev/null
+ case $? in
+   0) ;;
+   2) create.result 1 "$dir is not a repository — run: oo heal"; return $(result) ;;
+   *)
+     kind="$RESULT"
+     case "$kind" in
+       merge) create.result 1 "a merge is in progress in $dir — run: ogit merge.abort $dir" ;;
+       pick)  create.result 1 "a cherry-pick is in progress in $dir — run: ogit commit.pick.abort $dir" ;;
+       # ogit-exception: printed text, not an invocation — ogit has no rebase abort
+       *)     create.result 1 "a rebase is in progress in $dir — run: git -C $dir rebase --abort" ;;
+     esac
+     return $(result) ;;
+ esac
+ markers=$(ogit.repo.grep '^<<<<<<< ' "$dir" | head -3 | cut -d: -f1,2 | tr '\n' ' ')
+ if [ -n "$markers" ]; then
+   create.result 1 "conflict markers are committed in $dir (${markers% }) — run: oo heal"; return $(result)
+ fi
+ if ! ogit.status.check "$dir"; then
+   create.result 1 "$dir has uncommitted changes — run: ogit status.show short $dir"; return $(result)
+ fi
+ branch=$(ogit.branch.get "$dir")
+ if [ -z "$branch" ]; then
+   # The branch to go back to: one that holds this commit, a local one first.
+   branch=$(ogit.branch.find HEAD "$dir" | grep -v '^(' | grep -vx 'HEAD\|origin/HEAD' | sort -t/ -k2 | sed 's|^origin/||' | head -1)
+   create.result 1 "$dir is on a detached HEAD — run: ogit branch.checkout ${branch:-dev} $dir"; return $(result)
+ fi
+ ogit.branch.compare "origin/$branch" HEAD "$dir" >/dev/null
+ verdict="$RESULT"
+ case "$verdict" in
+   diverged*) create.result 1 "$dir has $verdict — run: oo heal"; return $(result) ;;
+ esac
+ create.result 0 "ready: $dir on $branch, $verdict"
+ return $(result)
+}
+
+
+private.oo.update.pull()     # <?dir:$OOSH_DIR> # pull <dir> through private.oo.update.pull.gate: fetch origin (the HTTPS fallback of OOSH_REPO when it fails) and fast-forward; rc 1 and the one command to run when refused or diverged #
+{
+ # Fetch, then fast-forward — never a merge (D5). The gate first; on a refusal
+ # its RESULT (the one command to run) stands. The shared clone made in state
+ # 31 fetches over the 2cuGitHub SSH alias, which a user without the alias in
+ # ~/.ssh/config cannot resolve: then the branch is fetched from the HTTPS URL
+ # init/oosh clones from (read-only, no auth for a public repo) into
+ # FETCH_HEAD; the configured remote is not changed.
+ private.this.script.load ogit ogit.branch.get
+ local dir="${1:-$OOSH_DIR}" branch ref fallbackUrl
+ private.oo.update.pull.gate "$dir" >/dev/null || return $(result)
+ branch=$(ogit.branch.get "$dir")
+ ref="origin/$branch"
+ if ! ogit.remote.fetch no "$dir" >/dev/null; then
+   fallbackUrl="${OOSH_REPO:-https://github.com/Cerulean-Circle-GmbH/once.sh.git}"
+   warn.log "fetch (SSH remote) failed; trying HTTPS fallback: $fallbackUrl $branch"
+   if ! ogit.remote.fetch.url "$fallbackUrl" "$branch" "$dir" >/dev/null; then
+     create.result 1 "oo update could not fetch $branch via the SSH remote nor $fallbackUrl — $RESULT"
+     error.log "$RESULT"; return $(result)
+   fi
+   ref=FETCH_HEAD
+ fi
+ if ! ogit.branch.fastForward "$ref" "$dir" >/dev/null; then
+   create.result 1 "$dir has diverged from $ref — run: oo heal"
+   return $(result)
+ fi
+ create.result 0 "pulled: $dir fast-forwarded to $ref"
  return $(result)
 }
 
