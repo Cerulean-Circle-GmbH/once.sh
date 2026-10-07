@@ -413,7 +413,7 @@ this.config.path.validate() # <?treeRoot:$OOSH_DIR> # verify every CONFIG_PATH a
 }
 this.config.path.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
 
-private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPath> is a symlink to <target>; preserve any pre-existing real entry as <linkPath>.orig.<ts>; idempotent; fail-loud on every step
+private.this.symlink.with.backup() { # <linkPath> <target> <?ts> # ensure <linkPath> is a symlink to <target>; preserve any pre-existing real entry as <linkPath>.orig.<ts>, bumped with -<n> when taken and stamped by private.this.orig.stamp.get when no ts; never nests; idempotent; fail-loud on every step
   # Shared by state 31's private.oo.user.shared.symlinks.ensure (oo) and
   # config.init.user (config). Both want the same convergence: end with a
   # symlink at <linkPath> pointing to <target>, never silently overwrite a
@@ -426,13 +426,18 @@ private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPa
   #   - <linkPath> is a real entry (dir/file)           → mv to <linkPath>.orig.<ts>, then link
   #   - <linkPath> is absent                            → link
   #
+  # Never nests (T-THIS-SYMLINK-BACKUP-NEVER-NESTS): mv of a directory onto an
+  # existing directory moves it INTO that directory — the D7 root cause, a
+  # second real ~/config inside config.orig.<ts>. A taken <ts> is bumped with
+  # -<n>; without <ts> the stamp comes from private.this.orig.stamp.get.
+  #
   # Each step fails loud (no `2>/dev/null` suppression on the operations
   # we depend on for convergence). Caller checks the return code.
   local linkPath="$1"
   local target="$2"
   local ts="$3"
-  if [ -z "$linkPath" ] || [ -z "$target" ] || [ -z "$ts" ]; then
-    create.result 1 "private.this.symlink.with.backup requires <linkPath> <target> <ts>"
+  if [ -z "$linkPath" ] || [ -z "$target" ]; then
+    create.result 1 "private.this.symlink.with.backup requires <linkPath> <target>"
     error.log "$RESULT"
     return $(result)
   fi
@@ -443,6 +448,15 @@ private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPa
       error.log "$RESULT"; return $(result)
     fi
   elif [ -e "$linkPath" ]; then
+    local linkDir=. n=0 base
+    case "$linkPath" in */*) linkDir="${linkPath%/*}" ;; esac
+    if [ -z "$ts" ]; then
+      ts=$(private.this.orig.stamp.get "${linkDir:-/}" "${linkPath##*/}")
+    fi
+    base="$ts"
+    while [ -e "$linkPath.orig.$ts" ] || [ -L "$linkPath.orig.$ts" ]; do
+      n=$((n + 1)); ts="$base-$n"
+    done
     if ! mv "$linkPath" "$linkPath.orig.$ts"; then
       create.result 1 "could not preserve $linkPath as $linkPath.orig.$ts"
       error.log "$RESULT"; return $(result)
@@ -1365,7 +1379,8 @@ private.this.temp.dir.get()     # <?label:oosh> # echo the canonical path of a n
 private.this.tree.tracked.check()     # <treeRoot> <?caller:sweep> # rc 0 when the tracked files of treeRoot are visible; else an INVALID: verdict on stdout and rc 2 — a tree sweep that reads nothing must never report OK #
 {
  # The one guard of the tree sweeps (path.validate, this.anchor.validate,
- # ogit.caller.validate, test.suite.portability.validate). ogit.repo.grep
+ # ogit.caller.validate, test.suite.portability.validate,
+ # this.recursive.validate). ogit.repo.grep
  # discards stderr, so no repository, a repository with nothing tracked and the
  # "dubious ownership" refusal (root in a container against an oosh-user tree)
  # all come back empty — indistinguishable from a clean tree. A sweep proves it
@@ -1392,9 +1407,10 @@ private.this.tree.tracked.check()     # <treeRoot> <?caller:sweep> # rc 0 when t
 
 private.this.marker.sweep()     # <pattern> <markerSlug> <treeRoot> <?excludes...> # echo one line per match of pattern in the tracked files of treeRoot: comment, marked or unmarked, a space, then file:line:content; marked is a comment markerSlug-exception: on the line or in the 5 lines above, or markerSlug-exception-file: in the file; callers run private.this.tree.tracked.check first #
 {
- # The one sweep of the four tree validators — path.validate (path),
+ # The one sweep of the five tree validators — path.validate (path),
  # this.anchor.validate (oosh-dir, config-path), ogit.caller.validate (ogit),
- # test.suite.portability.validate (portability). It owns what they shared:
+ # test.suite.portability.validate (portability), this.recursive.validate
+ # (recursive). It owns what they shared:
  # the grep of the TRACKED tree (git grep is one process and sees
  # tracked-but-gitignored files), the comment skip (a line that only TALKS
  # about a construct is not a use of it) and the three marker rules. The
@@ -1458,6 +1474,13 @@ this.recursive.validate()     # <?treeRoot:$OOSH_DIR> # verify every recursive c
  # with a non-empty reason ON THE SAME LINE. Unlike the other tree validators,
  # a marker in the lines above or a file-wide marker does not count: each
  # recursive call names its own reason, next to the folder it walks.
+ #
+ # Accepted limits: the marker must be on the same line even inside a heredoc
+ # or a `bash -c` string; a call through a variable (`CHMOD=chmod; $CHMOD -R`)
+ # is not caught — unlike ogit.caller.validate, no assignment is swept for it;
+ # and the command word is not tied to command position, so a word "chmod"
+ # in an argument followed by an R flag matches too (same as the bare git
+ # pattern of ogit.caller.validate).
  #
  # Sibling of ogit.caller.validate and path.validate, same shape: the kernel's
  # one guard (private.this.tree.tracked.check) and one sweep
@@ -1526,6 +1549,86 @@ this.recursive.validate()     # <?treeRoot:$OOSH_DIR> # verify every recursive c
 
 
 this.recursive.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
+
+
+private.this.orig.stamp.get()     # <dir> <names...> # echo a YYYYmmdd-HHMMSS stamp for which <dir>/<name>.orig.<stamp> is free for every name, bumped with -<n> when taken; silent getter, rc 1 on missing arguments #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # The one stamp behind every "keep it as <name>.orig.<ts>" (moved here from
+ # private.user.orig.ts.get). A second run inside the same second must get a new stamp,
+ # or a real entry is moved INTO the earlier backup
+ # (private.this.symlink.with.backup, T-THIS-SYMLINK-BACKUP-NEVER-NESTS).
+ # One stamp is free for every name, so names moved aside together share it.
+ local dir="$1" base ts n=0 name taken
+ [ -n "$dir" ] && [ $# -gt 1 ] || return 1
+ shift
+ # date is the one clock source; the kernel has no time getter.
+ base=$(date +%Y%m%d-%H%M%S)
+ ts="$base"
+ while :; do
+   taken=0
+   for name in "$@"; do
+     { [ -e "$dir/$name.orig.$ts" ] || [ -L "$dir/$name.orig.$ts" ]; } && taken=1
+   done
+   [ "$taken" = 0 ] && break
+   n=$((n + 1)); ts="$base-$n"
+ done
+ echo "$ts"
+}
+
+
+private.this.dir.ensure()     # <dir> <?group> <?mode> # create only the missing path segments of <dir>, from the first existing ancestor down, and give only those the <group> and <mode>; never touch a directory that existed; $SUDO only where the parent is not writable; RESULT = the created segments or exists; rc 1 when it cannot create #
+{
+ # The kernel owner of "mkdir with group and mode". Install state 31 created
+ # one shared directory and then changed owner and mode of the whole shared
+ # folder recursively — on macOS /Users/Shared. This walks up to the first
+ # existing ancestor, creates the missing segments top down and sets group and
+ # mode on exactly those; a directory that existed is never changed, so no
+ # recursion is ever needed. $SUDO (empty for root) only for a segment whose
+ # parent the caller cannot write.
+ local dir="$1" group="$2" mode="$3"
+ if [ -z "$dir" ]; then
+   create.result 1 "private.this.dir.ensure requires <dir>"
+   error.log "$RESULT"; return $(result)
+ fi
+ if [ -d "$dir" ]; then
+   create.result 0 "exists"; return $(result)
+ fi
+ local probe="${dir%/}" missing=()
+ while [ -n "$probe" ] && [ ! -e "$probe" ] && [ ! -L "$probe" ]; do
+   missing=("$probe" "${missing[@]}")
+   case "$probe" in */*) probe="${probe%/*}" ;; *) probe=. ;; esac
+ done
+ [ -n "$probe" ] || probe=/
+ if [ ! -d "$probe" ]; then
+   create.result 1 "cannot create $dir: $probe is in the way and is no directory"
+   error.log "$RESULT"; return $(result)
+ fi
+ local seg parent sudo created=""
+ for seg in "${missing[@]}"; do
+   case "$seg" in */*) parent="${seg%/*}" ;; *) parent=. ;; esac
+   [ -n "$parent" ] || parent=/
+   sudo=""
+   [ -w "$parent" ] || sudo="$SUDO"
+   if ! $sudo mkdir "$seg"; then
+     create.result 1 "cannot create $seg${created:+ (created: $created)}"
+     error.log "$RESULT"; return $(result)
+   fi
+   created="${created:+$created }$seg"
+   if [ -n "$group" ] && ! $sudo chgrp "$group" "$seg"; then
+     create.result 1 "created $created, but cannot give $seg the group $group"
+     error.log "$RESULT"; return $(result)
+   fi
+   if [ -n "$mode" ] && ! $sudo chmod "$mode" "$seg"; then
+     create.result 1 "created $created, but cannot give $seg the mode $mode"
+     error.log "$RESULT"; return $(result)
+   fi
+ done
+ create.result 0 "$created"
+ return $(result)
+}
+
+
 ### new.method
 
 this.help() {
