@@ -27,6 +27,236 @@ private.os.release.get()     # <key> <?file:/etc/os-release> # echo one value of
 }
 
 
+private.os.platform.container.up()     # <platform> <image> <port> # start a fresh platform container from <image> on ssh <port>, open ssh to it, push the key, let test sudo, install oosh for the user test through ossh install (honours OSSH_INSTALL_BRANCH) and settle sshd and the ControlMaster; rc 1 (RESULT FAIL) when the image cannot be built #
+{
+ local platform="$1" imageTag="$2" sshPort="$3"
+ if [ -z "$platform" ] || [ -z "$imageTag" ] || [ -z "$sshPort" ]; then
+   create.result 1 "private.os.platform.container.up requires <platform> <image> <port>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ # PLATFORM_WORKSPACE comes from private.os.platform.parse, run by the caller
+ # (os.platform.test) in the same shell.
+
+  # Ensure sshpass is available for automated first-connection password
+  if ! command -v sshpass >/dev/null 2>&1; then
+    console.log "Installing sshpass for automated platform testing..."
+    oo cmd sshpass
+  fi
+
+  # Set control path so sshpass and ossh subprocesses share the same socket
+  : ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
+  export OSSH_CONTROL_PATH
+
+  console.log "Testing platform: $platform (image: $imageTag)"
+
+  # Auto-build if image doesn't exist
+  if ! docker image inspect "$imageTag" &>/dev/null; then
+    console.log "Image $imageTag not found — building from $PLATFORM_WORKSPACE..."
+    if ! odocker build "$PLATFORM_WORKSPACE"; then
+      error.log "Failed to build image for $platform"
+      create.result 1 "FAIL"
+      return 1
+    fi
+  fi
+
+  # Fresh container
+  # Docker's random name, as container and host name (odocker.run.sshd), so
+  # the install inside names the computer by it, not by the container's ID.
+  odocker reset "$imageTag" "$port"
+  sleep 2
+
+  # SSH setup
+  ossh config.create "$platform" "test@localhost:$sshPort"
+  ossh config.save.last
+  # Clean up any stale ControlMaster socket from a previous test run
+  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
+  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+
+  # Open ControlMaster with sshpass (first connection, no keys yet)
+  # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
+  SSHPASS=test sshpass -e ssh \
+    -o ControlMaster=yes \
+    -o ControlPath="$OSSH_CONTROL_PATH" \
+    -o ControlPersist=600 \
+    -o StrictHostKeyChecking=accept-new \
+    "$platform" true
+
+  # Push key — reuses ControlMaster socket, no password prompt
+  ossh key.push "$platform"
+
+  # Configure passwordless sudo for automated testing (container is ephemeral)
+  # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
+  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
+
+  # Install oosh. init/oosh's POSIX prelude handles its own prereqs
+  # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
+  # no separate `ossh prereqs.install <host>` pre-step is needed. See
+  # `private.push.init.oosh` in ossh which SCPs init/oosh and runs
+  # its self-install, and the git install + the bash install steps of
+  # Phase A in init/oosh.
+  ossh install "$platform" test
+
+  # The git install above may upgrade openssh-server in place (AlmaLinux 9.8
+  # shipped 9.9p1). sshd re-execs per connection, so the running pre-upgrade
+  # daemon refuses every FRESH connection until it re-execs the new binary.
+  # Re-exec it now so the ControlMaster refresh below — and all of Phase B —
+  # connect cleanly. See private.os.platform.sshd.reload.
+  private.os.platform.sshd.reload "$port"
+
+  # Refresh ControlMaster so new sessions pick up dev group membership
+  # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
+  ossh connection.close "$platform" 2>/dev/null
+  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+  SSHPASS=test sshpass -e ssh \
+    -o ControlMaster=yes \
+    -o ControlPath="$OSSH_CONTROL_PATH" \
+    -o ControlPersist=600 \
+    -o StrictHostKeyChecking=accept-new \
+    "$platform" true
+ return 0
+}
+
+
+private.os.platform.users.install()     # <platform> # Phase A in the platform container: create oosh-user with user create, bash-user with useradd/adduser, give both NOPASSWD sudo and install oosh for bash-user from the caller (ossh install honours OSSH_INSTALL_BRANCH); failures are logged, not fatal #
+{
+ local platform="$1"
+ if [ -z "$platform" ]; then
+   create.result 1 "private.os.platform.users.install requires <platform>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+
+  # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
+  # Covers every install path we support in one run:
+  #   test      — initial `ossh install <platform> test` (caller-side + user.oosh.install)
+  #   root      — sudo re-exec during the above state-machine install
+  #   oosh-user — `user create oosh-user password oosh-user` from test session
+  #               (oosh-native user creation; user.create calls user.oosh.install internally)
+  #   bash-user — raw `useradd` on remote, then `ossh install <platform> bash-user`
+  #               (caller-initiated install for a pre-existing account)
+
+  console.log "Phase A.2: creating oosh-user via 'user create' from test session..."
+  ossh exec.tty "$platform" "user create oosh-user password oosh-user" || {
+    error.log "Failed to create oosh-user on $platform"
+  }
+  # Give oosh-user NOPASSWD sudo. Append to /etc/sudoers directly (not
+  # sudoers.d) — matches the sudoers append for the test
+  # user above; sudoers.d isn't always included on minimal images (alma's
+  # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
+  ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
+
+  console.log "Phase A.3: creating bash-user via raw useradd/adduser..."
+  # Note: no `-G sudo` — that group only exists on Debian/Ubuntu (RHEL/Alma use
+  # `wheel`, Alpine has neither by default). The NOPASSWD sudoers entry below
+  # grants sudo access without group membership, so portability beats group hygiene.
+  # Try useradd first (Debian/RHEL/Alma), fall back to adduser -D (Alpine/busybox);
+  # without this fallback, Alpine fails with `sudo: useradd: command not found`.
+  #
+  # Each step is independently idempotent — earlier versions chained
+  # everything with `&&`, which short-circuits if any step returns
+  # non-zero. Important quirk: `command -v useradd` runs in the SSH
+  # session's PATH, which on non-interactive ssh excludes /usr/sbin
+  # — so the existence check ALWAYS failed on Debian, even though
+  # /usr/sbin/useradd is there. We probe via `sudo command -v`
+  # instead so sudo's `secure_path` (which DOES include /usr/sbin)
+  # resolves the binary. No `||` between the user-create branches and
+  # the chpasswd/sudoers grant — those run unconditionally afterwards
+  # so a user-already-exists path doesn't skip them.
+  ossh exec.tty "$platform" "
+    if id bash-user >/dev/null 2>&1; then
+      echo 'bash-user already exists — skipping useradd'
+    elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then
+      sudo useradd -m -s /bin/bash bash-user
+    elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then
+      sudo adduser -D -s /bin/bash bash-user
+    else
+      echo 'no useradd/adduser available' >&2; exit 127
+    fi
+    echo bash-user:bash-user | sudo chpasswd
+    sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers \
+      || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'
+  " || {
+    error.log "Failed to create bash-user on $platform"
+  }
+
+  console.log "Phase A.4: installing oosh for bash-user from caller..."
+  ossh install "$platform" bash-user || {
+    error.log "Failed to install oosh for bash-user on $platform"
+  }
+ return 0
+}
+
+
+private.os.platform.gate.run()     # <platform> <user:test|root|oosh-user|bash-user> # Phase B for ONE user in the platform container: run test.suite gate 1 through the transport that fits the user (ossh exec / sudo bash -lc / runuser or sudo -H -u), tee into /tmp/oosh-platform-test-<user>-<platform>.log; rc is the gate rc of that user #
+{
+ local platform="$1" user="$2"
+ if [ -z "$platform" ] || [ -z "$user" ]; then
+   create.result 1 "private.os.platform.gate.run requires <platform> <user>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ case "$user" in test|root|oosh-user|bash-user) ;; *)
+   create.result 1 "private.os.platform.gate.run: unknown <user> $user (test, root, oosh-user or bash-user)"
+   error.log "$RESULT"
+   return $(result) ;;
+ esac
+ local log="/tmp/oosh-platform-test-$user-$platform.log" prelude
+
+ # Each user runs `test.suite gate 1`: core AND platform.shared.configLayout.invariant
+ # (the config layout, no boot), one verdict. root, oosh-user and bash-user
+ # arrive through sudo/runuser, which run no .bashrc: the prelude stands their
+ # shell up from their own ~/config/user.env (ossh.remote.prelude.get).
+ if [ "$user" != test ]; then
+   type ossh.remote.prelude.get >/dev/null 2>&1 || { private.this.script.load ossh ossh.remote.prelude.get || return 1; }
+   prelude=$(ossh.remote.prelude.get)
+ fi
+
+ if [ "$user" = test ]; then
+   console.log "Running the gate (core + platform invariant) as user test..."
+ else
+   console.log "Running the gate (core + platform invariant) as $user..."
+ fi
+
+ if [ "$user" = test ]; then
+   ossh exec "$platform" "test.suite gate 1" 2>&1 | tee "$log"
+ elif [ "$user" = root ]; then
+   # root (via test+sudo, needs -tt for TTY)
+   # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
+   # user's home). Same find-chdir-back hazard the runuser cases below
+   # describe — except for root, the direct `find` calls work because
+   # root reads anything; the failure mode is subprocesses (e.g. man-db's
+   # postinst, which drops to user `man`) inheriting /home/test as cwd.
+   ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; $prelude test.suite gate 1'" 2>&1 | tee "$log"
+ else
+   # oosh-user / bash-user (via test+sudo+runuser; login-shell equivalent of `user login <user>`).
+   # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
+   # early-exit for non-interactive shells would otherwise skip the PATH / user.env
+   # setup and `test.suite: command not found` fires.
+   # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
+   # home, mode 700 owned by test). After `runuser -u <user>`, the new
+   # user can't read /home/test, so any `find` invocation in test.suite
+   # (e.g. state.machine.exists in state) emits hundreds of
+   # `find: Failed to restore initial working directory: /home/test:
+   # Permission denied` lines on stderr. cd'ing to the new user's own
+   # home keeps find happy.
+   # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
+   # (busybox doesn't ship it). Use a runtime detector that prefers
+   # runuser (less PAM friction) and falls back to `sudo -H -u`. Both
+   # give us "switch to <user>, reset HOME" semantics under the
+   # NOPASSWD sudoers entry installed in Phase A.
+   ossh exec.tty "$platform" "
+     if command -v runuser >/dev/null 2>&1; then
+       sudo runuser -u $user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
+     else
+       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
+     fi
+   " 2>&1 | tee "$log"
+ fi
+ return ${PIPESTATUS[0]}
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,82 +451,8 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
   sshPort=8022
 
-  # Ensure sshpass is available for automated first-connection password
-  if ! command -v sshpass >/dev/null 2>&1; then
-    console.log "Installing sshpass for automated platform testing..."
-    oo cmd sshpass
-  fi
-
-  # Set control path so sshpass and ossh subprocesses share the same socket
-  : ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
-  export OSSH_CONTROL_PATH
-
-  console.log "Testing platform: $platform (image: $imageTag)"
-
-  # Auto-build if image doesn't exist
-  if ! docker image inspect "$imageTag" &>/dev/null; then
-    console.log "Image $imageTag not found — building from $PLATFORM_WORKSPACE..."
-    if ! odocker build "$PLATFORM_WORKSPACE"; then
-      error.log "Failed to build image for $platform"
-      create.result 1 "FAIL"
-      return 1
-    fi
-  fi
-
-  # Fresh container
-  # Docker's random name, as container and host name (odocker.run.sshd), so
-  # the install inside names the computer by it, not by the container's ID.
-  odocker reset "$imageTag" "$sshPort"
-  sleep 2
-
-  # SSH setup
-  ossh config.create "$platform" "test@localhost:$sshPort"
-  ossh config.save.last
-  # Clean up any stale ControlMaster socket from a previous test run
-  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
-  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
-
-  # Open ControlMaster with sshpass (first connection, no keys yet)
-  # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
-  SSHPASS=test sshpass -e ssh \
-    -o ControlMaster=yes \
-    -o ControlPath="$OSSH_CONTROL_PATH" \
-    -o ControlPersist=600 \
-    -o StrictHostKeyChecking=accept-new \
-    "$platform" true
-
-  # Push key — reuses ControlMaster socket, no password prompt
-  ossh key.push "$platform"
-
-  # Configure passwordless sudo for automated testing (container is ephemeral)
-  # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
-  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
-
-  # Install oosh. init/oosh's POSIX prelude handles its own prereqs
-  # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
-  # no separate `ossh prereqs.install <host>` pre-step is needed. See
-  # `private.push.init.oosh` in ossh which SCPs init/oosh and runs
-  # its self-install, and the git install + the bash install steps of
-  # Phase A in init/oosh.
-  ossh install "$platform" test
-
-  # The git install above may upgrade openssh-server in place (AlmaLinux 9.8
-  # shipped 9.9p1). sshd re-execs per connection, so the running pre-upgrade
-  # daemon refuses every FRESH connection until it re-execs the new binary.
-  # Re-exec it now so the ControlMaster refresh below — and all of Phase B —
-  # connect cleanly. See private.os.platform.sshd.reload.
-  private.os.platform.sshd.reload "$sshPort"
-
-  # Refresh ControlMaster so new sessions pick up dev group membership
-  # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
-  ossh connection.close "$platform" 2>/dev/null
-  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
-  SSHPASS=test sshpass -e ssh \
-    -o ControlMaster=yes \
-    -o ControlPath="$OSSH_CONTROL_PATH" \
-    -o ControlPersist=600 \
-    -o StrictHostKeyChecking=accept-new \
-    "$platform" true
+  # Reset/build/start the container, ssh, key, sudoers and the install for `test`
+  private.os.platform.container.up "$platform" "$imageTag" "$sshPort" || return 1
 
   # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
   # Covers every install path we support in one run:
@@ -306,128 +462,35 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   #               (oosh-native user creation; user.create calls user.oosh.install internally)
   #   bash-user — raw `useradd` on remote, then `ossh install <platform> bash-user`
   #               (caller-initiated install for a pre-existing account)
-
-  console.log "Phase A.2: creating oosh-user via 'user create' from test session..."
-  ossh exec.tty "$platform" "user create oosh-user password oosh-user" || {
-    error.log "Failed to create oosh-user on $platform"
-  }
-  # Give oosh-user NOPASSWD sudo. Append to /etc/sudoers directly (not
-  # sudoers.d) — matches the sudoers append for the test
-  # user above; sudoers.d isn't always included on minimal images (alma's
-  # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
-  ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
-
-  console.log "Phase A.3: creating bash-user via raw useradd/adduser..."
-  # Note: no `-G sudo` — that group only exists on Debian/Ubuntu (RHEL/Alma use
-  # `wheel`, Alpine has neither by default). The NOPASSWD sudoers entry below
-  # grants sudo access without group membership, so portability beats group hygiene.
-  # Try useradd first (Debian/RHEL/Alma), fall back to adduser -D (Alpine/busybox);
-  # without this fallback, Alpine fails with `sudo: useradd: command not found`.
-  #
-  # Each step is independently idempotent — earlier versions chained
-  # everything with `&&`, which short-circuits if any step returns
-  # non-zero. Important quirk: `command -v useradd` runs in the SSH
-  # session's PATH, which on non-interactive ssh excludes /usr/sbin
-  # — so the existence check ALWAYS failed on Debian, even though
-  # /usr/sbin/useradd is there. We probe via `sudo command -v`
-  # instead so sudo's `secure_path` (which DOES include /usr/sbin)
-  # resolves the binary. No `||` between the user-create branches and
-  # the chpasswd/sudoers grant — those run unconditionally afterwards
-  # so a user-already-exists path doesn't skip them.
-  ossh exec.tty "$platform" "
-    if id bash-user >/dev/null 2>&1; then
-      echo 'bash-user already exists — skipping useradd'
-    elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then
-      sudo useradd -m -s /bin/bash bash-user
-    elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then
-      sudo adduser -D -s /bin/bash bash-user
-    else
-      echo 'no useradd/adduser available' >&2; exit 127
-    fi
-    echo bash-user:bash-user | sudo chpasswd
-    sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers \
-      || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'
-  " || {
-    error.log "Failed to create bash-user on $platform"
-  }
-
-  console.log "Phase A.4: installing oosh for bash-user from caller..."
-  ossh install "$platform" bash-user || {
-    error.log "Failed to install oosh for bash-user on $platform"
-  }
+  private.os.platform.users.install "$platform"
 
   # ─── PHASE B: run test.suite gate 1 (core + platform invariant) on all 4 users ─
   local rcTest=0 rcRoot=0 rcOoshUser=0 rcBashUser=0
   local testLog="" rootLog="" ooshUserLog="" bashUserLog=""
 
   if [ -z "$notests" ]; then
-    # Each user runs `test.suite gate 1`: core AND platform.shared.configLayout.invariant
-    # (the config layout, no boot), one verdict. root, oosh-user and bash-user
-    # arrive through sudo/runuser, which run no .bashrc: the prelude stands their
-    # shell up from their own ~/config/user.env (ossh.remote.prelude.get).
     private.this.script.load ossh ossh.remote.prelude.get || return 1
-    local prelude; prelude=$(ossh.remote.prelude.get)
 
-    # B.1 — test
-    console.log "Running the gate (core + platform invariant) as user test..."
     testLog="/tmp/oosh-platform-test-test-$platform.log"
-    ossh exec "$platform" "test.suite gate 1" 2>&1 | tee "$testLog"
-    rcTest=${PIPESTATUS[0]}
+    private.os.platform.gate.run "$platform" test
+    rcTest=$?
 
-    # B.2 — root (via test+sudo, needs -tt for TTY)
-    console.log "Running the gate (core + platform invariant) as root..."
-    # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
-    # user's home). Same find-chdir-back hazard the runuser cases below
-    # describe — except for root, the direct `find` calls work because
-    # root reads anything; the failure mode is subprocesses (e.g. man-db's
-    # postinst, which drops to user `man`) inheriting /home/test as cwd.
     rootLog="/tmp/oosh-platform-test-root-$platform.log"
-    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; $prelude test.suite gate 1'" 2>&1 | tee "$rootLog"
-    rcRoot=${PIPESTATUS[0]}
+    private.os.platform.gate.run "$platform" root
+    rcRoot=$?
 
     # Root's test.suite writes into sharedConfig (via /root/config symlink)
     # with root:root ownership, blocking the unprivileged users that come
-    # next. Repair group+perms + setgid so B.3 and B.4 can write.
+    # next. Repair group+perms + setgid so oosh-user and bash-user can write.
     private.os.platform.shared.config.repair "$platform"
 
-    # B.3 — oosh-user (via test+sudo+runuser; login-shell equivalent of `user login oosh-user`).
-    # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
-    # early-exit for non-interactive shells would otherwise skip the PATH / user.env
-    # setup and `test.suite: command not found` fires.
-    # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
-    # home, mode 700 owned by test). After `runuser -u oosh-user`, the new
-    # user can't read /home/test, so any `find` invocation in test.suite
-    # (e.g. state.machine.exists in state) emits hundreds of
-    # `find: Failed to restore initial working directory: /home/test:
-    # Permission denied` lines on stderr. cd'ing to the new user's own
-    # home keeps find happy.
-    console.log "Running the gate (core + platform invariant) as oosh-user..."
     ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
-    # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
-    # (busybox doesn't ship it). Use a runtime detector that prefers
-    # runuser (less PAM friction) and falls back to `sudo -H -u`. Both
-    # give us "switch to <user>, reset HOME" semantics under the
-    # NOPASSWD sudoers entry installed in Phase A.
-    ossh exec.tty "$platform" "
-      if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
-      else
-        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
-      fi
-    " 2>&1 | tee "$ooshUserLog"
-    rcOoshUser=${PIPESTATUS[0]}
+    private.os.platform.gate.run "$platform" oosh-user
+    rcOoshUser=$?
 
-    # B.4 — bash-user (same pattern; same cwd fix)
-    console.log "Running the gate (core + platform invariant) as bash-user..."
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
-    ossh exec.tty "$platform" "
-      if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
-      else
-        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
-      fi
-    " 2>&1 | tee "$bashUserLog"
-    rcBashUser=${PIPESTATUS[0]}
+    private.os.platform.gate.run "$platform" bash-user
+    rcBashUser=$?
   else
     console.log "Skipping tests (notests)"
   fi

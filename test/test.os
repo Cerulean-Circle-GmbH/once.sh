@@ -256,6 +256,52 @@ test.case $level "T-OS-RELEASE-GET: one value of an os-release file, quotes remo
 expect 0 "values with and without quotes; rc 1 for a missing key or file; the file is never run" \
   "the os-release reader lived in odocker, had no test and read only /etc/os-release"
 
+
+console.log "
+Test: private.os.platform.container.up
+===================================================================="
+
+test.case - "T-OS-CONTAINER-UP-ARGS: container.up refuses a call without platform" \
+   private.os.platform.container.up 
+expect 1 "private.os.platform.container.up requires <platform> <image> <port>"
+
+
+console.log "
+Test: private.os.platform.users.install
+===================================================================="
+
+test.case - "T-OS-USERS-INSTALL-ARGS: users.install refuses a call without platform" \
+   private.os.platform.users.install 
+expect 1 "private.os.platform.users.install requires <platform>"
+
+
+console.log "
+Test: private.os.platform.gate.run
+===================================================================="
+
+test.case - "T-OS-GATE-RUN-ARGS: gate.run refuses a call without platform" \
+   private.os.platform.gate.run 
+expect 1 "private.os.platform.gate.run requires <platform> <user>"
+
+# T-OS-PLATFORM-TEST-SPLIT: platform.test is orchestration over three reusable private methods
+test.os.platformSplit() {
+  local bad="" m
+  for m in private.os.platform.container.up private.os.platform.users.install private.os.platform.gate.run; do
+    type "$m" >/dev/null 2>&1 || bad="$bad missing:$m"
+  done
+  local body; body=$(declare -f os.platform.test)
+  for m in container.up users.install gate.run; do
+    printf '%s' "$body" | grep -q "private.os.platform.$m" || bad="$bad not-called:$m"
+  done
+  private.os.platform.gate.run p nobody >/dev/null 2>&1; [ $? = 1 ] || bad="$bad gate.run-accepts-unknown-user"
+  os.platform.test no_such_platform_xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-platform-not-refused"
+  [ -z "$bad" ] && create.result 0 "container.up, users.install and gate.run exist, platform.test calls them, an unknown platform and an unknown user are refused" || create.result 1 "split:$bad"
+  return $(result)
+}
+test.case $level "T-OS-PLATFORM-TEST-SPLIT: platform.test is built from container.up, users.install and gate.run" test.os.platformSplit
+expect 0 "container.up, users.install and gate.run exist, platform.test calls them, an unknown platform and an unknown user are refused" \
+  "the 250-line platform.test could not be reused by a scenario test"
+
 ### test.method
 
 test.suite.save.results
