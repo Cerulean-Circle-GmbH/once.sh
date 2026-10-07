@@ -845,6 +845,11 @@ test.os.healTestOrder() {
   local HOME="$fx" OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL; unset OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL
   local bad="" rc out got want hb p=heal_test_stub n names traps
   private.this.script.load ogit ogit.branch.get
+  # HOME is the fixture: its global git config must trust this tree, or git
+  # refuses a tree another user owns (the user test in a platform container,
+  # the tree root's) and os platform.heal.test stops at "detached HEAD". git
+  # checks the physical path: ~/oosh is a link.
+  ogit.safeDirectory.add "$(private.this.path.canonical "$OOSH_DIR")" >/dev/null 2>&1
   hb=$(ogit.branch.get "$OOSH_DIR")
   names=$(private.os.platform.heal.breakage.names.get)
   test.os.healTest.stubs.set
