@@ -736,7 +736,7 @@ test.os.healSecondRun() {
   [ "$rc" = 0 ] || bad="$bad same-rc=$rc [$RESULT]"
   # from the tree that carries the heal — root's ~/oosh may be the installed
   # older branch, which has no oo heal (rc 127 in the first container gate)
-  [ "$(sed -n 2p "$OS_T_REC")" = "user.run p root \"\$(dirname \"\$(readlink -f ~root/oosh)\")/dev.heal/oo\" heal dev.heal all $(private.os.platform.heal.log.get second-heal p)" ] || bad="$bad not-heal-all-as-root-from-the-branch=[$(sed -n 2p "$OS_T_REC")]"
+  [ "$(sed -n 2p "$OS_T_REC")" = "user.run p root \"\$(dirname \"\$(readlink -f ~root/oosh)\")/dev.heal/oo\" heal dev.heal all $(private.os.platform.heal.log.get second-heal p)" ] || bad="$bad not-heal-all-as-root-from-the-branch=[$(sed -n 2p "$OS_T_REC")]"   # portability-exception: the expected TEXT of a command run in a Linux platform container, not run here
   [ "$(sed -n 1p "$OS_T_REC")" = "snapshot p dev.heal" ] && [ "$(sed -n 3p "$OS_T_REC")" = "snapshot p dev.heal" ] || bad="$bad not-snapshot-heal-snapshot"
   OS_T_SNAP_AFTER="/b	9/9	1 1"
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
