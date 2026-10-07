@@ -413,7 +413,8 @@ this.config.path.validate() # <?treeRoot:$OOSH_DIR> # verify every CONFIG_PATH a
 }
 this.config.path.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
 
-private.this.symlink.with.backup() { # <linkPath> <target> <?ts> # ensure <linkPath> is a symlink to <target>; preserve any pre-existing real entry as <linkPath>.orig.<ts>, bumped with -<n> when taken and stamped by private.this.orig.stamp.get when no ts; never nests; idempotent; fail-loud on every step
+private.this.symlink.with.backup()     # <linkPath> <target> <?ts> # ensure <linkPath> is a symlink to <target>; keep a pre-existing real entry as <linkPath>.orig.<ts> (private.this.orig.stamp.free.get bumps a taken ts, private.this.orig.stamp.get stamps when no ts), never nested; a relink logs the old target; idempotent; fails loud on every step #
+{
   # Shared by state 31's private.oo.user.shared.symlinks.ensure (oo) and
   # config.init.user (config). Both want the same convergence: end with a
   # symlink at <linkPath> pointing to <target>, never silently overwrite a
@@ -422,14 +423,17 @@ private.this.symlink.with.backup() { # <linkPath> <target> <?ts> # ensure <linkP
   #
   # Behaviour:
   #   - <linkPath> is already a symlink to <target>     → no-op (return 0)
-  #   - <linkPath> is a stale symlink to something else → rm + relink
+  #   - <linkPath> is a stale symlink to something else → info.log the old target, rm + relink
   #   - <linkPath> is a real entry (dir/file)           → mv to <linkPath>.orig.<ts>, then link
   #   - <linkPath> is absent                            → link
   #
   # Never nests (T-THIS-SYMLINK-BACKUP-NEVER-NESTS): mv of a directory onto an
   # existing directory moves it INTO that directory — the D7 root cause, a
   # second real ~/config inside config.orig.<ts>. A taken <ts> is bumped with
-  # -<n>; without <ts> the stamp comes from private.this.orig.stamp.get.
+  # -<n> (private.this.orig.stamp.free.get); without <ts> the stamp comes from
+  # private.this.orig.stamp.get. Accepted limit: a directory created at
+  # <linkPath>.orig.<ts> between that probe and the mv still nests — there is no
+  # portable mv -T (BSD/macOS mv has none).
   #
   # Each step fails loud (no `2>/dev/null` suppression on the operations
   # we depend on for convergence). Caller checks the return code.
@@ -442,21 +446,23 @@ private.this.symlink.with.backup() { # <linkPath> <target> <?ts> # ensure <linkP
     return $(result)
   fi
   if [ -L "$linkPath" ]; then
-    [ "$(readlink "$linkPath")" = "$target" ] && return 0
+    local oldTarget
+    oldTarget=$(readlink "$linkPath")
+    [ "$oldTarget" = "$target" ] && return 0
+    # The user package reads this trace (T-THIS-SYMLINK-BACKUP-RELINK-LOGGED).
+    info.log "relinked $linkPath (was → $oldTarget)"
     if ! rm -f "$linkPath"; then
       create.result 1 "could not remove stale symlink $linkPath"
       error.log "$RESULT"; return $(result)
     fi
   elif [ -e "$linkPath" ]; then
-    local linkDir=. n=0 base
+    local linkDir=.
     case "$linkPath" in */*) linkDir="${linkPath%/*}" ;; esac
-    if [ -z "$ts" ]; then
+    if [ -n "$ts" ]; then
+      ts=$(private.this.orig.stamp.free.get "${linkDir:-/}" "$ts" "${linkPath##*/}")
+    else
       ts=$(private.this.orig.stamp.get "${linkDir:-/}" "${linkPath##*/}")
     fi
-    base="$ts"
-    while [ -e "$linkPath.orig.$ts" ] || [ -L "$linkPath.orig.$ts" ]; do
-      n=$((n + 1)); ts="$base-$n"
-    done
     if ! mv "$linkPath" "$linkPath.orig.$ts"; then
       create.result 1 "could not preserve $linkPath as $linkPath.orig.$ts"
       error.log "$RESULT"; return $(result)
@@ -1558,22 +1564,12 @@ private.this.orig.stamp.get()     # <dir> <names...> # echo a YYYYmmdd-HHMMSS st
  # private.user.orig.ts.get). A second run inside the same second must get a new stamp,
  # or a real entry is moved INTO the earlier backup
  # (private.this.symlink.with.backup, T-THIS-SYMLINK-BACKUP-NEVER-NESTS).
- # One stamp is free for every name, so names moved aside together share it.
- local dir="$1" base ts n=0 name taken
+ # The bump is private.this.orig.stamp.free.get, the one loop; this adds the clock.
+ local dir="$1"
  [ -n "$dir" ] && [ $# -gt 1 ] || return 1
  shift
  # date is the one clock source; the kernel has no time getter.
- base=$(date +%Y%m%d-%H%M%S)
- ts="$base"
- while :; do
-   taken=0
-   for name in "$@"; do
-     { [ -e "$dir/$name.orig.$ts" ] || [ -L "$dir/$name.orig.$ts" ]; } && taken=1
-   done
-   [ "$taken" = 0 ] && break
-   n=$((n + 1)); ts="$base-$n"
- done
- echo "$ts"
+ private.this.orig.stamp.free.get "$dir" "$(date +%Y%m%d-%H%M%S)" "$@"
 }
 
 
@@ -1588,15 +1584,32 @@ private.this.dir.ensure()     # <dir> <?group> <?mode> <?owner> # create only th
  # parent the caller cannot write, or whose <owner> is another user — a home
  # for another user (private.user.home.ensure) comes from here, not a raw chown.
  # Owner first, then group, then mode: a chown may clear the setgid bit.
+ # A <dir> with a . or .. segment is refused: the walk would create or change
+ # something other than what the path names.
  local dir="$1" group="$2" mode="$3" owner="$4"
  if [ -z "$dir" ]; then
    create.result 1 "private.this.dir.ensure requires <dir>"
    error.log "$RESULT"; return $(result)
  fi
+ case "/$dir/" in
+   */./*|*/../*)
+     create.result 1 "private.this.dir.ensure refuses $dir: a . or .. segment"
+     error.log "$RESULT"; return $(result) ;;
+ esac
+ # Repeated and trailing slashes are squeezed, so every segment is one name.
+ local twoSlashes=// oneSlash=/
+ while :; do
+   case "$dir" in *//*) dir="${dir//$twoSlashes/$oneSlash}" ;; *) break ;; esac
+ done
+ while [ "${#dir}" -gt 1 ] && [ "${dir%/}" != "$dir" ]; do dir="${dir%/}"; done
+ # Who the caller is, from the system: USER is unset under docker exec, su and
+ # cron, and is what the kernel itself derives from id -un (bootstrap of this).
+ local me
+ me=$(id -un 2>/dev/null)
  if [ -d "$dir" ]; then
    create.result 0 "exists"; return $(result)
  fi
- local probe="${dir%/}" missing=()
+ local probe="$dir" missing=()
  while [ -n "$probe" ] && [ ! -e "$probe" ] && [ ! -L "$probe" ]; do
    missing=("$probe" "${missing[@]}")
    case "$probe" in */*) probe="${probe%/*}" ;; *) probe=. ;; esac
@@ -1613,13 +1626,17 @@ private.this.dir.ensure()     # <dir> <?group> <?mode> <?owner> # create only th
    sudo=""
    [ -w "$parent" ] || sudo="$SUDO"
    if ! $sudo mkdir "$seg"; then
-     create.result 1 "cannot create $seg${created:+ (created: $created)}"
+     # Two callers racing: the other one made it — not ours, so left as it is.
+     [ -d "$seg" ] && continue
+     local why=""
+     [ -z "$sudo" ] && [ ! -w "$parent" ] && why=" (parent not writable, no SUDO)"
+     create.result 1 "cannot create $seg$why${created:+ (created: $created)}"
      error.log "$RESULT"; return $(result)
    fi
    created="${created:+$created }$seg"
    if [ -n "$owner" ]; then
      # Once the segment belongs to another user, its group and mode need $SUDO too.
-     [ "$owner" = "$USER" ] || sudo="$SUDO"
+     [ "$owner" = "$me" ] || sudo="$SUDO"
      if ! $sudo chown "$owner" "$seg"; then
        create.result 1 "created $created, but cannot give $seg the owner $owner"
        error.log "$RESULT"; return $(result)
@@ -1636,6 +1653,29 @@ private.this.dir.ensure()     # <dir> <?group> <?mode> <?owner> # create only th
  done
  create.result 0 "$created"
  return $(result)
+}
+
+
+private.this.orig.stamp.free.get()     # <dir> <base> <names...> # echo <base>, bumped with -<n> until <dir>/<name>.orig.<stamp> is free for every name; silent getter #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # The ONE bump loop of the .orig.<ts> backups: private.this.orig.stamp.get
+ # (a clock stamp) and private.this.symlink.with.backup (a given ts) both end
+ # here. One stamp is free for every name, so names moved aside together share
+ # it; a dangling symlink at a candidate counts as taken.
+ local dir="$1" base="$2" ts n=0 name taken
+ [ -n "$dir" ] && [ -n "$base" ] && [ $# -gt 2 ] || return 1
+ shift 2
+ ts="$base"
+ while :; do
+   taken=0
+   for name in "$@"; do
+     { [ -e "$dir/$name.orig.$ts" ] || [ -L "$dir/$name.orig.$ts" ]; } && taken=1
+   done
+   [ "$taken" = 0 ] && break
+   n=$((n + 1)); ts="$base-$n"
+ done
+ echo "$ts"
 }
 
 
