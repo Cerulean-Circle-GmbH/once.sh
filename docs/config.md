@@ -368,7 +368,8 @@ backup and in none of the three regenerated files is a loss, and then all three 
 go back (`REFUSING — the regenerated files lost: …`, rc 1). A variable that only moved
 files is no loss — an old user.env's `OOSH_DIR` now lives in `oosh.env` — and neither
 are PATH and OOSH_MODE (per-user session files), `OOSH_USER_CONFIG_PATH` (removed
-2026-10-01) and `OOSH_CONFIG_VERSION` (an old version stamp) (T-CONFIG-INIT-ENV-OLD-USER-ENV).
+2026-10-01), `OOSH_CONFIG_VERSION` (an old version stamp) and every name `config save` never
+persists (`private.config.variable.persisted.is`, the one list of § Excluded variables) (T-CONFIG-INIT-ENV-OLD-USER-ENV).
 
 ```bash
 ./config init.env                 # repair self's env files
