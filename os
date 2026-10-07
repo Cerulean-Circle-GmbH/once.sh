@@ -198,9 +198,9 @@ private.os.platform.gate.log.get()     # <user> <platform> # echo the log file p
 }
 
 
-private.os.platform.gate.run()     # <platform> <user> # Phase B for ONE user (test, root, oosh-user or bash-user) in the platform container: run test.suite gate 1 through the transport that fits the user (ossh exec / sudo bash -lc / runuser or sudo -H -u), tee into private.os.platform.gate.log.get <user> <platform>; rc is the gate rc of that user #
+private.os.platform.gate.run()     # <platform> <user> <?log> # Phase B for ONE user (test, root, oosh-user or bash-user) in the platform container: test.suite gate 1 through private.os.platform.user.run (the transport that fits the user), tee into <log> (default: private.os.platform.gate.log.get <user> <platform>); rc is the gate rc of that user #
 {
- local platform="$1" user="$2" log prelude rc
+ local platform="$1" user="$2" log="$3"
  if [ -z "$platform" ] || [ -z "$user" ]; then
    create.result 1 "private.os.platform.gate.run requires <platform> <user>"
    error.log "$RESULT"
@@ -211,57 +211,14 @@ private.os.platform.gate.run()     # <platform> <user> # Phase B for ONE user (t
    error.log "$RESULT"
    return $(result) ;;
  esac
- log=$(private.os.platform.gate.log.get "$user" "$platform")
+ [ -n "$log" ] || log=$(private.os.platform.gate.log.get "$user" "$platform")
 
  # Each user runs `test.suite gate 1`: core AND platform.shared.configLayout.invariant
- # (the config layout, no boot), one verdict. root, oosh-user and bash-user
- # arrive through sudo/runuser, which run no .bashrc: the prelude stands their
- # shell up from their own ~/config/user.env (ossh.remote.prelude.get).
- if [ "$user" != test ]; then
-   private.this.script.load ossh ossh.remote.prelude.get || { create.result 1 "ossh.remote.prelude.get could not be loaded"; return $(result); }
-   prelude=$(ossh.remote.prelude.get)
- fi
-
+ # (the config layout, no boot), one verdict. The transport per user, and why,
+ # is private.os.platform.user.run's (os platform.heal.test runs other commands through it).
  console.log "Running the gate (core + platform invariant) as $([ "$user" = test ] && echo "user test" || echo "$user")..."
-
- if [ "$user" = test ]; then
-   ossh exec "$platform" "test.suite gate 1" 2>&1 | tee "$log"
-   rc=${PIPESTATUS[0]}
- elif [ "$user" = root ]; then
-   # root (via test+sudo, needs -tt for TTY)
-   # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
-   # user's home). Same find-chdir-back hazard the runuser cases below
-   # describe — except for root, the direct `find` calls work because
-   # root reads anything; the failure mode is subprocesses (e.g. man-db's
-   # postinst, which drops to user `man`) inheriting /home/test as cwd.
-   ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; $prelude test.suite gate 1'" 2>&1 | tee "$log"
-   rc=${PIPESTATUS[0]}
- else
-   # oosh-user / bash-user (via test+sudo+runuser; login-shell equivalent of `user login <user>`).
-   # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
-   # early-exit for non-interactive shells would otherwise skip the PATH / user.env
-   # setup and `test.suite: command not found` fires.
-   # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
-   # home, mode 700 owned by test). After `runuser -u <user>`, the new
-   # user can't read /home/test, so any `find` invocation in test.suite
-   # (e.g. state.machine.exists in state) emits hundreds of
-   # `find: Failed to restore initial working directory: /home/test:
-   # Permission denied` lines on stderr. cd'ing to the new user's own
-   # home keeps find happy.
-   # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
-   # (busybox doesn't ship it). Use a runtime detector that prefers
-   # runuser (less PAM friction) and falls back to `sudo -H -u`. Both
-   # give us "switch to <user>, reset HOME" semantics under the
-   # NOPASSWD sudoers entry installed in Phase A.
-   ossh exec.tty "$platform" "
-     if command -v runuser >/dev/null 2>&1; then
-       sudo runuser -u $user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
-     else
-       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
-     fi
-   " 2>&1 | tee "$log"
-   rc=${PIPESTATUS[0]}
- fi
+ private.os.platform.user.run "$platform" "$user" "test.suite gate 1" "$log"
+ local rc=$?
  create.result "$rc" "the gate of $user on $platform ended with rc $rc (log: $log)"
  return $rc
 }
@@ -784,6 +741,223 @@ private.os.platform.ref.branch.drop()     # <branch> <?dir:$OOSH_DIR> # delete t
    error.log "$RESULT"
  fi
  return $(result)
+}
+
+
+private.os.platform.user.run()     # <platform> <user> <command> <log> # run <command> as <user> (test, root, oosh-user or bash-user) in the platform container through the transport that fits the user (ossh exec / sudo bash -lc / runuser or sudo -H -u), from the user's home with the prelude of ossh.remote.prelude.get, tee into <log>; rc is the rc of <command> #
+{
+ local platform="$1" user="$2" command="$3" log="$4" prelude="" rc
+ if [ -z "$platform" ] || [ -z "$user" ] || [ -z "$command" ] || [ -z "$log" ]; then
+   create.result 1 "private.os.platform.user.run requires <platform> <user> <command> <log>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ case "$user" in test|root|oosh-user|bash-user) ;; *)
+   create.result 1 "private.os.platform.user.run: unknown <user> $user (test, root, oosh-user or bash-user)"
+   error.log "$RESULT"
+   return $(result) ;;
+ esac
+ # <command> goes inside the single quotes of bash -lc / bash -c below.
+ case "$command" in *"'"*)
+   create.result 1 "private.os.platform.user.run: <command> must not hold a single quote: $command"
+   error.log "$RESULT"
+   return $(result) ;;
+ esac
+
+ # root, oosh-user and bash-user arrive through sudo/runuser, which run no
+ # .bashrc: the prelude stands their shell up from their own
+ # ~/config/user.env (ossh.remote.prelude.get).
+ if [ "$user" != test ]; then
+   private.this.script.load ossh ossh.remote.prelude.get || { create.result 1 "ossh.remote.prelude.get could not be loaded"; return $(result); }
+   prelude=$(ossh.remote.prelude.get)
+ fi
+
+ if [ "$user" = test ]; then
+   ossh exec "$platform" "$command" 2>&1 | tee "$log"
+   rc=${PIPESTATUS[0]}
+ elif [ "$user" = root ]; then
+   # root (via test+sudo, needs -tt for TTY)
+   # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
+   # user's home). Same find-chdir-back hazard the runuser cases below
+   # describe — except for root, the direct `find` calls work because
+   # root reads anything; the failure mode is subprocesses (e.g. man-db's
+   # postinst, which drops to user `man`) inheriting /home/test as cwd.
+   ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; $prelude $command'" 2>&1 | tee "$log"
+   rc=${PIPESTATUS[0]}
+ else
+   # oosh-user / bash-user (via test+sudo+runuser; login-shell equivalent of `user login <user>`).
+   # Explicit source + PATH export mirrors the root case above: bashrcTemplate's
+   # early-exit for non-interactive shells would otherwise skip the PATH / user.env
+   # setup and `test.suite: command not found` fires.
+   # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
+   # home, mode 700 owned by test). After `runuser -u <user>`, the new
+   # user can't read /home/test, so any `find` invocation in test.suite
+   # (e.g. state.machine.exists in state) emits hundreds of
+   # `find: Failed to restore initial working directory: /home/test:
+   # Permission denied` lines on stderr. cd'ing to the new user's own
+   # home keeps find happy.
+   # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
+   # (busybox doesn't ship it). Use a runtime detector that prefers
+   # runuser (less PAM friction) and falls back to `sudo -H -u`. Both
+   # give us "switch to <user>, reset HOME" semantics under the
+   # NOPASSWD sudoers entry installed in Phase A.
+   ossh exec.tty "$platform" "
+     if command -v runuser >/dev/null 2>&1; then
+       sudo runuser -u $user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude $command'
+     else
+       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude $command'
+     fi
+   " 2>&1 | tee "$log"
+   rc=${PIPESTATUS[0]}
+ fi
+ create.result "$rc" "$command as $user on $platform ended with rc $rc (log: $log)"
+ return $rc
+}
+
+
+private.os.platform.heal.log.get()     # <step> <platform> # echo the log file of a step of os platform.heal.test in <platform> (/tmp/oosh-heal-test-<step>-<platform>.log); <step> is a user (test, root, oosh-user, bash-user) or breakages, heal, pipe, idempotence-root, idempotence-bash-user, second-heal, foreign; silent getter #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # The sibling of private.os.platform.gate.log.get, one place for the names.
+ [ -n "$1" ] && [ -n "$2" ] || return 1
+ case "$1$2" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+ echo "/tmp/oosh-heal-test-$1-$2.log"
+}
+
+
+private.os.platform.heal.snapshot.get()     # <platform> <branch> # echo, as root in the platform container, a snapshot of what oo heal owns: test.platform.shared.idempotence.snapshot (sourced from <base>/<branch>) of the entries of <base>, of <base>/main and <base>/<branch> (not .git), the sharedConfig env files, the launcher, the retired drop-in, and in the homes of test, root, oosh-user, bash-user and developking: oosh, config, the .bashrc files, .gitconfig, *.orig.*, .config/oosh (no log files) and .once; plus the HEAD of main and <branch>; rc 1 when it cannot be read #
+{
+ # Echoes the snapshot lines only: called as $(...). The remote prints a
+ # begin line first, and only what follows it is kept — a host that prints
+ # noise on login (a .bashrc echoing under sshd) adds nothing to the
+ # snapshot. bash, not sh: the helpers of the idempotence invariant have
+ # dotted names. Log files are left out as the invariant leaves them out
+ # (log.live.out, *.log): every oosh run appends to them.
+ local platform="$1" branch="$2" preamble script out
+ if [ -z "$platform" ] || [ -z "$branch" ]; then
+   error.log "private.os.platform.heal.snapshot.get requires <platform> <branch>"
+   return 1
+ fi
+ preamble=$(private.os.platform.heal.remote.preamble.get "$branch") || { error.log "bad <branch> $branch"; return 1; }
+ script="$preamble
+$(cat <<'OOSH_HEAL_SNAPSHOT'
+TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1 . "$D/test/test.platform.shared.idempotence.invariant" || fail "no snapshot helpers in $D"
+set -- "$B" "$B/main/*" "$D/*" "$S/*.env" /usr/local/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot
+for u in test root oosh-user bash-user developking; do
+  h=$(home_of "$u"); [ -n "$h" ] || continue
+  set -- "$@" "$h/oosh" "$h/config" "$h/.bashrc" "$h/.bashrc*" "$h/.gitconfig" "$h/*.orig.*" "$h/.config/oosh" "$h/.once"
+done
+echo OOSH_HEAL_SNAPSHOT_BEGIN
+test.platform.shared.idempotence.snapshot "$@" | awk -F '\t' '$1 !~ /\/log\.live\.out$/ && $1 !~ /\.log$/'
+for d in "$B/main" "$D"; do printf 'HEAD of %s\t%s\t-\n' "$d" "$(rgit -C "$d" rev-parse HEAD 2>/dev/null || echo none)"; done
+OOSH_HEAL_SNAPSHOT
+)"
+ out=$(private.os.platform.root.script.run "$platform" bash "$script") || { error.log "no snapshot of $platform: $out"; return 1; }
+ printf '%s\n' "$out" | tr -d '\r' | sed -n '/^OOSH_HEAL_SNAPSHOT_BEGIN$/,$p' | sed '1d'
+}
+
+
+private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), oo heal <branch> all as root (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 and the snapshots are the same (test.platform.shared.idempotence.compare), else rc 1 with every difference printed #
+{
+ local platform="$1" branch="$2" log work rcHeal differences
+ if [ -z "$platform" ] || [ -z "$branch" ]; then
+   create.result 1 "private.os.platform.heal.second.run requires <platform> <branch>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ log=$(private.os.platform.heal.log.get second-heal "$platform")
+ work=$(private.this.temp.dir.get oosh-heal-second) || { create.result 1 "no temp dir"; error.log "$RESULT"; return $(result); }
+ if ! private.os.platform.heal.snapshot.get "$platform" "$branch" > "$work/before" || [ ! -s "$work/before" ]; then
+   rm -rf "$work"
+   create.result 1 "second heal on $platform: no snapshot before it"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ # A rewrite within the same second keeps the mtime (as the invariant waits).
+ sleep 1
+ console.log "second heal: oo heal $branch all as root on $platform — it must change nothing"
+ private.os.platform.user.run "$platform" root "oo heal $branch all" "$log"
+ rcHeal=$?
+ private.os.platform.heal.snapshot.get "$platform" "$branch" > "$work/after"
+ # The compare helper of the idempotence invariant, sourced alone (its POSIX
+ # helpers only) in a subshell: the file also sets globals of a test run
+ # (TEST_CATEGORY, TEST_SHARED_TIER_WRITER), which must not reach this shell.
+ if differences=$(TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
+       . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || { echo "no idempotence helpers in $OOSH_DIR/test"; exit 1; }
+       test.platform.shared.idempotence.compare "$work/before" "$work/after") && [ "$rcHeal" = 0 ]; then
+   create.result 0 "second heal on $platform: rc 0, nothing changed"
+ else
+   create.result 1 "second heal on $platform: rc $rcHeal${differences:+, it changed:
+$differences}"
+   error.log "$RESULT"
+   printf '%s\n' "$RESULT" >> "$log"
+ fi
+ rm -rf "$work"
+ return $(result)
+}
+
+
+private.os.platform.heal.foreign.check()     # <platform> # rc 0 when /opt/foreign in the platform container is as the breakage foreign.symlink recorded it: the same entries and file checksums (/opt/foreign.heal.sums) and nothing in it newer than /opt/foreign.heal.marker; prints every difference; rc 1 otherwise, also when nothing was recorded #
+{
+ local platform="$1" preamble script
+ if [ -z "$platform" ]; then
+   create.result 1 "private.os.platform.heal.foreign.check requires <platform>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ # The preamble for foreign_sums and say/fail; its branch plays no part here.
+ preamble=$(private.os.platform.heal.remote.preamble.get main)
+ script="N=foreign.check
+$preamble
+$(cat <<'OOSH_HEAL_FOREIGN'
+[ -f /opt/foreign.heal.sums ] && [ -f /opt/foreign.heal.marker ] || fail "nothing recorded — the breakage foreign.symlink was not applied"
+now=$(foreign_sums)
+rc=0
+if [ "$now" != "$(cat /opt/foreign.heal.sums)" ]; then
+  printf '%s\n' "$now" | awk 'NR == FNR { was[$0] = 1; next } !($0 in was) { print "foreign changed: now " $0 }' /opt/foreign.heal.sums -
+  printf '%s\n' "$now" | awk 'NR == FNR { now[$0] = 1; next } !($0 in now) { print "foreign changed: was " $0 }' - /opt/foreign.heal.sums
+  rc=1
+fi
+newer=$(find /opt/foreign -newer /opt/foreign.heal.marker)
+if [ -n "$newer" ]; then printf 'foreign written after the breakage: %s\n' $newer; rc=1; fi
+[ "$rc" = 0 ] && say "/opt/foreign is byte-identical, nothing in it is newer than its marker"
+exit "$rc"
+OOSH_HEAL_FOREIGN
+)"
+ private.os.platform.root.script.run "$platform" sh "$script"
+ local rc=$?
+ create.result "$rc" "foreign check on $platform: rc $rc"
+ return $rc
+}
+
+
+private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe form once, as the user test: this tree's init/oosh and a bundle of <branch> go to temp files on the platform (private.ossh.heal.push, private.ossh.heal.bundle.push), then cat <init> | env OOSH_REPO=<bundle> sh -s -- heal <branch> through ossh exec.tty, tee into the log of step pipe; the temp files are removed; rc of the heal #
+{
+ # ossh heal runs `sh <file> heal …` — the arm from a FILE. The curl form a
+ # user types reads the script from STDIN (`curl … | sh -s -- heal`), where
+ # stdin IS the script; this runs that form for real, once.
+ local platform="$1" branch="$2" log init bundle rc
+ if [ -z "$platform" ] || [ -z "$branch" ]; then
+   create.result 1 "private.os.platform.heal.pipe.run requires <platform> <branch>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ private.this.script.load ossh private.ossh.heal.push || return $(result)
+ log=$(private.os.platform.heal.log.get pipe "$platform")
+ private.ossh.heal.push "$platform" || return $(result)
+ init="$RESULT"
+ if ! private.ossh.heal.bundle.push "$platform" "$branch"; then
+   ossh exec "$platform" "rm -f '$init'"
+   return $(result)
+ fi
+ bundle="$RESULT"
+ console.log "pipe form: cat $init | sh -s -- heal $branch as test on $platform"
+ ossh exec.tty "$platform" "cat '$init' | env OOSH_REPO='$bundle' sh -s -- heal $branch" 2>&1 | tee "$log"
+ rc=${PIPESTATUS[0]}
+ ossh exec "$platform" "rm -f '$init' '$bundle'" \
+   || warn.log "pipe form: could not remove $init $bundle on $platform"
+ create.result "$rc" "pipe form heal on $platform: rc $rc (log: $log)"
+ return $rc
 }
 
 

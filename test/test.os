@@ -609,6 +609,161 @@ test.case $level "T-OS-REF-BRANCH: a sha travels as the temporary branch platfor
 expect 0 "a branch on origin as it is; a sha as platform-test/<sha> at that commit, dropped afterwards; nothing else deleted" \
   "the container clones a branch: git clone -b takes no sha"
 
+console.log "
+Test: os platform.heal.test — the heal run and its checks
+===================================================================="
+
+# T-OS-USER-RUN: one transport per user for any command — gate.run is that transport with
+# test.suite gate 1; a command that would break out of the single quotes is refused.
+test.os.userRun() {
+  local fx; fx=$(test.suite.fixture.make userrun)
+  local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
+  local bad="" rec rc
+  test.os.stubs.set
+  private.os.platform.user.run p test "oo heal dev all" "$fx/t.log" >/dev/null 2>&1 || bad="$bad test-rc"
+  private.os.platform.user.run p root "oo heal dev all" "$fx/r.log" >/dev/null 2>&1 || bad="$bad root-rc"
+  private.os.platform.user.run p bash-user "test.suite run platform.shared.idempotence.invariant 1" "$fx/b.log" >/dev/null 2>&1 || bad="$bad bash-user-rc"
+  rec=$(cat "$OS_T_REC")
+  case "$rec" in *"ossh exec p oo heal dev all"*) ;; *) bad="$bad test-transport" ;; esac
+  case "$rec" in *"ossh exec.tty p sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; "*"oo heal dev all'"*) ;; *) bad="$bad root-transport" ;; esac
+  case "$rec" in *"sudo runuser -u bash-user -- bash -c"*"test.suite run platform.shared.idempotence.invariant 1'"*) ;; *) bad="$bad bash-user-transport" ;; esac
+  [ -f "$fx/t.log" ] && [ -f "$fx/r.log" ] && [ -f "$fx/b.log" ] || bad="$bad no-logs"
+  private.os.platform.user.run p root "echo 'x'" "$fx/q.log" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad quote-accepted"
+  private.os.platform.user.run p nobody "true" "$fx/n.log" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-user-accepted"
+  private.os.platform.user.run p root "true" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad no-log-accepted"
+  # gate.run: test.suite gate 1 through user.run, into the default or the given log
+  : > "$OS_T_REC"
+  private.os.platform.user.run() { echo "user.run $*" >> "$OS_T_REC"; return 0; }
+  private.os.platform.gate.run p oosh-user >/dev/null 2>&1
+  private.os.platform.gate.run p root "$fx/g.log" >/dev/null 2>&1
+  grep -qxF "user.run p oosh-user test.suite gate 1 $(private.os.platform.gate.log.get oosh-user p)" "$OS_T_REC" || bad="$bad gate-default-log"
+  grep -qxF "user.run p root test.suite gate 1 $fx/g.log" "$OS_T_REC" || bad="$bad gate-given-log"
+  test.os.stubs.unset
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "test through ossh exec, root through sudo bash -lc, the others through runuser; gate.run is user.run with test.suite gate 1" || create.result 1 "user.run:$bad"
+  return $(result)
+}
+test.case $level "T-OS-USER-RUN: any command as test, root, oosh-user or bash-user, the transport of the gate" test.os.userRun
+expect 0 "test through ossh exec, root through sudo bash -lc, the others through runuser; gate.run is user.run with test.suite gate 1" \
+  "the heal test runs the idempotence invariant and oo heal through the gate's transport"
+
+# the getter is silent by contract (consumed as $(...)): the test reads its output
+test.os.healLogGet() {
+  local got bad=""
+  got=$(private.os.platform.heal.log.get second-heal ubuntu_24_04)
+  [ "$got" = /tmp/oosh-heal-test-second-heal-ubuntu_24_04.log ] || bad="$bad path=[$got]"
+  private.os.platform.heal.log.get root >/dev/null 2>&1 && bad="$bad missing-platform-accepted"
+  private.os.platform.heal.log.get '../x' p >/dev/null 2>&1 && bad="$bad slash-accepted"
+  [ -z "$bad" ] && create.result 0 "/tmp/oosh-heal-test-second-heal-ubuntu_24_04.log" || create.result 1 "heal.log.get:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-LOG-GET: the log of a step of the heal test" test.os.healLogGet
+expect 0 "/tmp/oosh-heal-test-second-heal-ubuntu_24_04.log" "one getter for the logs of os platform.heal.test"
+
+# T-OS-HEAL-REMOTE-SCRIPTS: the snapshot (bash, the invariant's helpers) and the foreign
+# check (sh) run as root; the snapshot keeps only what follows its begin line, without \r.
+test.os.healRemoteScripts() {
+  local fx; fx=$(test.suite.fixture.make healremote)
+  local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
+  local bad="" rec encoded got
+  test.os.stubs.set
+  ossh() { echo "ossh $*" >> "$OS_T_REC"; printf 'motd noise\nOOSH_HEAL_SNAPSHOT_BEGIN\r\n/a\t1/2\t3 4\r\n'; }
+  got=$(private.os.platform.heal.snapshot.get p dev.heal)
+  [ "$got" = "$(printf '/a\t1/2\t3 4')" ] || bad="$bad snapshot=[$got]"
+  rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
+  case "$rec" in *"| base64 -d | sudo bash -s"*) ;; *) bad="$bad snapshot-not-root-bash" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  got=$(printf '%s' "$encoded" | base64 -d)
+  printf '%s\n' "$got" | bash -n 2>/dev/null || bad="$bad snapshot-bash-n"
+  case "$got" in *"TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1"*"test.platform.shared.idempotence.snapshot"*) ;; *) bad="$bad snapshot-not-the-invariant-helper" ;; esac
+  private.os.platform.heal.snapshot.get p >/dev/null 2>&1 && bad="$bad snapshot-no-branch-accepted"
+  : > "$OS_T_REC"
+  ossh() { echo "ossh $*" >> "$OS_T_REC"; }
+  private.os.platform.heal.foreign.check p >/dev/null 2>&1 || bad="$bad foreign-rc"
+  rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
+  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad foreign-not-root-sh" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  got=$(printf '%s' "$encoded" | base64 -d)
+  printf '%s\n' "$got" | sh -n 2>/dev/null || bad="$bad foreign-sh-n"
+  case "$got" in *"/opt/foreign.heal.sums"*"-newer /opt/foreign.heal.marker"*) ;; *) bad="$bad foreign-not-sums-and-marker" ;; esac
+  private.os.platform.heal.foreign.check >/dev/null 2>&1 && bad="$bad foreign-no-platform-accepted"
+  test.os.stubs.unset
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "snapshot as root in bash with the invariant's helper, noise and \\r dropped; foreign check as root in sh against the recorded sums and marker" || create.result 1 "remote scripts:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-REMOTE-SCRIPTS: the snapshot and the foreign check run as root in the container" test.os.healRemoteScripts
+expect 0 "snapshot as root in bash with the invariant's helper, noise and \\r dropped; foreign check as root in sh against the recorded sums and marker" \
+  "the second heal and the foreign tree are judged inside the container"
+
+# T-OS-HEAL-SECOND-RUN: the second heal passes only with rc 0 AND the same snapshot before
+# and after; every difference is named.
+test.os.healSecondRun() {
+  local fx; fx=$(test.suite.fixture.make healsecond)
+  local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
+  local bad="" rc
+  test.os.stubs.set
+  OS_T_SNAP_N=0; OS_T_HEAL_RC=0; OS_T_SNAP_AFTER="/b	1/1	1 1"
+  private.os.platform.heal.snapshot.get() {
+    OS_T_SNAP_N=$((OS_T_SNAP_N + 1)); echo "snapshot $*" >> "$OS_T_REC"
+    if [ $((OS_T_SNAP_N % 2)) = 1 ]; then printf '/b\t1/1\t1 1\n'; else printf '%s\n' "$OS_T_SNAP_AFTER"; fi
+  }
+  private.os.platform.user.run() { echo "user.run $*" >> "$OS_T_REC"; return "$OS_T_HEAL_RC"; }
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] || bad="$bad same-rc=$rc [$RESULT]"
+  [ "$(sed -n 2p "$OS_T_REC")" = "user.run p root oo heal dev.heal all $(private.os.platform.heal.log.get second-heal p)" ] || bad="$bad not-heal-all-as-root"
+  [ "$(sed -n 1p "$OS_T_REC")" = "snapshot p dev.heal" ] && [ "$(sed -n 3p "$OS_T_REC")" = "snapshot p dev.heal" ] || bad="$bad not-snapshot-heal-snapshot"
+  OS_T_SNAP_AFTER="/b	9/9	1 1"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] || bad="$bad changed-rc=$rc"
+  case "$RESULT" in *"changed: /b"*) ;; *) bad="$bad changed-unnamed=[$RESULT]" ;; esac
+  OS_T_SNAP_AFTER="/b	1/1	2 2"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad rewritten-accepted"
+  OS_T_SNAP_AFTER="/b	1/1	1 1"; OS_T_HEAL_RC=1
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad heal-rc1-accepted"
+  [ -z "${TEST_SHARED_TIER_WRITER+x}" ] || bad="$bad invariant-globals-leaked"
+  rm -f "$(private.os.platform.heal.log.get second-heal p)"
+  test.os.stubs.unset
+  unset OS_T_SNAP_N OS_T_HEAL_RC OS_T_SNAP_AFTER
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "rc 0 and the same snapshot pass; a change, a rewrite or rc 1 fail and are named" || create.result 1 "second heal:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-SECOND-RUN: a second oo heal must end rc 0 and change nothing" test.os.healSecondRun
+expect 0 "rc 0 and the same snapshot pass; a change, a rewrite or rc 1 fail and are named" \
+  "the heal is idempotent or it is no heal"
+
+# T-OS-HEAL-PIPE-RUN: the pure pipe form — the init file and the bundle reach the host,
+# cat <init> | sh -s -- heal <branch> runs as test with OOSH_REPO=<bundle>, both are removed.
+test.os.healPipeRun() {
+  local fx; fx=$(test.suite.fixture.make healpipe)
+  local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
+  local bad="" rec rc
+  test.os.stubs.set
+  private.ossh.heal.push() { echo "heal.push $*" >> "$OS_T_REC"; create.result 0 /tmp/oosh-heal-init.AAA; }
+  private.ossh.heal.bundle.push() { echo "bundle.push $*" >> "$OS_T_REC"; create.result 0 /tmp/oosh-heal-bundle.BBB; }
+  private.os.platform.heal.pipe.run p dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] || bad="$bad rc=$rc"
+  rec=$(cat "$OS_T_REC")
+  case "$rec" in *"bundle.push p dev.heal"*) ;; *) bad="$bad no-bundle" ;; esac
+  case "$rec" in *"ossh exec.tty p cat '/tmp/oosh-heal-init.AAA' | env OOSH_REPO='/tmp/oosh-heal-bundle.BBB' sh -s -- heal dev.heal"*) ;; *) bad="$bad not-the-pipe-form" ;; esac
+  case "$rec" in *"ossh exec p rm -f '/tmp/oosh-heal-init.AAA' '/tmp/oosh-heal-bundle.BBB'"*) ;; *) bad="$bad not-removed" ;; esac
+  : > "$OS_T_REC"
+  private.ossh.heal.bundle.push() { create.result 1 "no bundle"; return 1; }
+  private.os.platform.heal.pipe.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad bundle-fail-rc"
+  grep -q "exec.tty" "$OS_T_REC" && bad="$bad ran-without-bundle"
+  grep -q "rm -f '/tmp/oosh-heal-init.AAA'" "$OS_T_REC" || bad="$bad init-left-behind"
+  rm -f "$(private.os.platform.heal.log.get pipe p)"
+  unset -f private.ossh.heal.push private.ossh.heal.bundle.push
+  test.os.stubs.unset
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "cat <init> | env OOSH_REPO=<bundle> sh -s -- heal <branch> as test, the temp files removed" || create.result 1 "pipe form:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-PIPE-RUN: the pure pipe form of the heal runs once as test" test.os.healPipeRun
+expect 0 "cat <init> | env OOSH_REPO=<bundle> sh -s -- heal <branch> as test, the temp files removed" \
+  "ossh heal runs the arm from a file; the curl form reads it from stdin"
+
 ### test.method
 
 test.suite.save.results
