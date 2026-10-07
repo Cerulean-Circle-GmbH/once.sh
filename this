@@ -427,13 +427,10 @@ private.this.symlink.with.backup()     # <linkPath> <target> <?ts> # ensure <lin
   #   - <linkPath> is a real entry (dir/file)           → mv to <linkPath>.orig.<ts>, then link
   #   - <linkPath> is absent                            → link
   #
-  # Never nests (T-THIS-SYMLINK-BACKUP-NEVER-NESTS): mv of a directory onto an
-  # existing directory moves it INTO that directory — the D7 root cause, a
-  # second real ~/config inside config.orig.<ts>. A taken <ts> is bumped with
-  # -<n> (private.this.orig.stamp.free.get); without <ts> the stamp comes from
-  # private.this.orig.stamp.get. Accepted limit: a directory created at
-  # <linkPath>.orig.<ts> between that probe and the mv still nests — there is no
-  # portable mv -T (BSD/macOS mv has none).
+  # Never nests (T-THIS-SYMLINK-BACKUP-NEVER-NESTS): the real entry is kept by
+  # private.this.entry.aside, which bumps a taken <ts> and stamps when there is
+  # none — D7 was a second real ~/config moved INTO config.orig.<ts>. Its
+  # accepted limit (a race between the probe and the mv) applies here too.
   #
   # Each step fails loud (no `2>/dev/null` suppression on the operations
   # we depend on for convergence). Caller checks the return code.
@@ -456,17 +453,8 @@ private.this.symlink.with.backup()     # <linkPath> <target> <?ts> # ensure <lin
       error.log "$RESULT"; return $(result)
     fi
   elif [ -e "$linkPath" ]; then
-    local linkDir=.
-    case "$linkPath" in */*) linkDir="${linkPath%/*}" ;; esac
-    if [ -n "$ts" ]; then
-      ts=$(private.this.orig.stamp.free.get "${linkDir:-/}" "$ts" "${linkPath##*/}")
-    else
-      ts=$(private.this.orig.stamp.get "${linkDir:-/}" "${linkPath##*/}")
-    fi
-    if ! mv "$linkPath" "$linkPath.orig.$ts"; then
-      create.result 1 "could not preserve $linkPath as $linkPath.orig.$ts"
-      error.log "$RESULT"; return $(result)
-    fi
+    # The one move-aside: stamped, bumped, never nested.
+    private.this.entry.aside "$linkPath" "$ts" >/dev/null || return $(result)
   fi
   if ! ln -s "$target" "$linkPath"; then
     create.result 1 "could not symlink $linkPath → $target"
@@ -476,16 +464,18 @@ private.this.symlink.with.backup()     # <linkPath> <target> <?ts> # ensure <lin
 }
 
 private.ensure.sharedTree() { # <dir> # ensure <dir> is group dev, recursively g+w; drop self-loops
-  # Used by `config init.shared` to bring a tampered sharedConfig tree back to
-  # the canonical install layout. Strict mirror of the install in state 31 of oo
-  # (chown -R developking:dev + chmod -R g+w on $CONFIG_PATH) plus a
-  # corruption-fix that removes any self-referential symlink left over from
-  # `cp -r ~/config sharedConfig` in state 31 of oo when ~/config was already a
-  # symlink at copy time.
+  # Brings an oosh-created tree to group dev and g+w: `config init.shared`
+  # gives it sharedConfig, private.this.folder.share gives it the clones
+  # (ogit.folder.finish) and the odocker workspaces. Plus a corruption-fix that
+  # removes a self-referential symlink left over from the old
+  # `cp -r ~/config sharedConfig` of install state 31.
+  # State 31 itself changes nothing recursively any more: it creates only the
+  # missing segments (private.oo.shared.dir.ensure → private.this.dir.ensure,
+  # group dev and mode 2775 on those) and never re-owns a directory that existed.
   #
-  # NOTE: install does NOT set SGID 2775 on these dirs — see commented-out
-  # chmod 2775 in state 31 of oo. Group ownership is preserved at write-time by every writer
-  # calling `private.ensure.groupWrite`. Don't add SGID here.
+  # NOTE: no SGID here — sharedConfig relies on every writer calling
+  # `private.ensure.groupWrite`; private.this.folder.share adds setgid for the
+  # folders it shares. Don't add SGID here.
   #
   # Elevation: only sudo when the caller doesn't own the target (i.e. the real
   # `sharedConfig/` dir typically owned developking:dev). Test fixtures and
@@ -519,8 +509,8 @@ private.ensure.sharedTree() { # <dir> # ensure <dir> is group dev, recursively g
       fi
     fi
   done
-  $_sudo chgrp -R dev "$dir" 2>/dev/null # recursive-exception: sharedConfig only — the shared config directory oosh created
-  $_sudo chmod -R g+w "$dir" 2>/dev/null # recursive-exception: sharedConfig only — the shared config directory oosh created
+  $_sudo chgrp -R dev "$dir" 2>/dev/null # recursive-exception: the oosh-created tree it is given: sharedConfig and the clones
+  $_sudo chmod -R g+w "$dir" 2>/dev/null # recursive-exception: the oosh-created tree it is given: sharedConfig and the clones
 }
 
 this.functionExists() {
@@ -1676,6 +1666,49 @@ private.this.orig.stamp.free.get()     # <dir> <base> <names...> # echo <base>, 
    n=$((n + 1)); ts="$base-$n"
  done
  echo "$ts"
+}
+
+
+private.this.entry.aside()     # <path> <?ts> # move a real file or directory to <path>.orig.<ts> (stamped and bumped through private.this.orig.stamp.free.get / orig.stamp.get when <ts> is empty or taken), remove a symlink; never nests, never deletes; RESULT = the new name or "removed link" / "nothing"; rc 1 on failure #
+{
+ # The one move-aside: private.this.symlink.with.backup, private.oo.entry.aside
+ # (deinstall) and the heal all keep a real entry this way. A real file or
+ # directory is only renamed to <path>.orig.<ts>, whole; a symlink is removed,
+ # its target untouched; nothing is ever deleted.
+ # Never nests (T-THIS-ENTRY-ASIDE): mv of a directory onto an existing
+ # directory moves it INTO that directory — the D7 root cause. A taken <ts> is
+ # bumped with -<n> (private.this.orig.stamp.free.get); without <ts> the stamp
+ # comes from private.this.orig.stamp.get. Accepted limit: a directory created
+ # at <path>.orig.<ts> between that probe and the mv still nests — there is no
+ # portable mv -T (BSD/macOS mv has none).
+ local path="$1" ts="$2" dir=.
+ if [ -z "$path" ]; then
+   create.result 1 "private.this.entry.aside requires <path>"
+   error.log "$RESULT"; return $(result)
+ fi
+ while [ "${#path}" -gt 1 ] && [ "${path%/}" != "$path" ]; do path="${path%/}"; done
+ if [ -L "$path" ]; then
+   if ! rm -f "$path"; then
+     create.result 1 "could not remove the symlink $path"
+     error.log "$RESULT"; return $(result)
+   fi
+   create.result 0 "removed link"; return $(result)
+ fi
+ if [ ! -e "$path" ]; then
+   create.result 0 "nothing"; return $(result)
+ fi
+ case "$path" in */*) dir="${path%/*}" ;; esac
+ if [ -n "$ts" ]; then
+   ts=$(private.this.orig.stamp.free.get "${dir:-/}" "$ts" "${path##*/}")
+ else
+   ts=$(private.this.orig.stamp.get "${dir:-/}" "${path##*/}")
+ fi
+ if [ -z "$ts" ] || ! mv "$path" "$path.orig.$ts"; then
+   create.result 1 "could not preserve $path as $path.orig.$ts"
+   error.log "$RESULT"; return $(result)
+ fi
+ create.result 0 "$path.orig.$ts"
+ return $(result)
 }
 
 
