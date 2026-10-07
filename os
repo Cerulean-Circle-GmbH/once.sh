@@ -961,6 +961,180 @@ private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe fo
 }
 
 
+os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install <oldRef> (a branch on origin, or a sha shipped as platform-test/<sha>) for test, root, oosh-user and bash-user in a fresh <platform> container, apply the named breakages (default: all), heal once as root through the curl form, then test.suite gate 1 per user, the idempotence invariant, a second heal that must change nothing, and the untouched-foreign check; PASS/FAIL line + create.result like platform.test; the words terminal (keep the container) and pipe (run the pure pipe form too) may stand among the breakages #
+{
+ # The proof the heal needs before it touches a real machine: an OLD install,
+ # broken the ways the real machines are broken, healed ONCE, then everything
+ # that checks an install. Built from the blocks of os platform.test
+ # (private.os.platform.parse, container.up, users.install, gate.run,
+ # shared.config.repair, cleanup). The heal is THIS tree: ossh heal with
+ # OOSH_HEAL_LOCAL=1 pushes this tree's init/oosh and a bundle of its branch.
+ # The first heal's rc 1 is no failure: it moves broken canonical folders
+ # aside and says so (private.oo.heal.code); rc 2 (cannot heal) or an ssh
+ # failure is. Docker port 8022, as os platform.test.
+ local platform="$1" oldRef="$2"
+ if [ -z "$platform" ] || [ -z "$oldRef" ]; then
+   create.result 1 "Usage: os platform.heal.test <platform> <oldRef> <?breakages...:all> — words terminal and pipe may stand among the breakages"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ shift 2
+ local word terminal="" pipe="" words=()
+ for word in "$@"; do
+   case "$word" in
+     terminal) terminal=yes ;;
+     pipe)     pipe=yes ;;
+     *)        words+=("$word") ;;
+   esac
+ done
+ private.os.platform.heal.breakage.list.get "${words[@]}" || return $(result)
+ local breakages="$RESULT"
+
+ private.os.platform.parse "$platform" || return $(result)
+ if [ "$PLATFORM_WORKSPACE" = native ]; then
+   create.result 1 "$platform is a native platform — the heal scenario needs a disposable Docker container"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ private.this.script.load ogit ogit.branch.get || return $(result)
+ local healBranch
+ healBranch=$(ogit.branch.get "$OOSH_DIR")
+ if [ -z "$healBranch" ]; then
+   create.result 1 "$OOSH_DIR is on a detached HEAD — the heal ships a bundle of a branch of this tree"
+   error.log "$RESULT"
+   return $(result)
+ fi
+
+ # The ref the container clones: a branch on origin, or platform-test/<sha>.
+ private.os.platform.ref.branch.ensure "$oldRef" || return $(result)
+ local branch="$RESULT"
+ # Era gate: an era-B ref (mode ssh) is refused with the eraB.* hint.
+ if ! private.os.platform.branch.gate "$branch"; then
+   local refusal="$RESULT"
+   private.os.platform.ref.branch.drop "$branch"
+   create.result 1 "$refusal"
+   return $(result)
+ fi
+
+ local imageTag sshPort=8022 rc step logs=""
+ imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
+ # The logs of every step, emptied first: a step that does not run this time
+ # (pipe) must not show the FAIL lines of an earlier run.
+ for step in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign; do
+   logs="$logs $(private.os.platform.heal.log.get "$step" "$platform")"
+ done
+ # shellcheck disable=SC2086 # the log paths have no spaces
+ rm -f $logs
+ if ! OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$platform" "$imageTag" "$sshPort"; then
+   private.os.platform.ref.branch.drop "$branch"
+   private.os.platform.cleanup "$sshPort"
+   printf "FAIL: heal %s %s (the container did not come up)\n" "$platform" "$oldRef"
+   create.result 1 "FAIL: heal $platform $oldRef — the container did not come up"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ OSSH_INSTALL_BRANCH="$branch" private.os.platform.users.install "$platform"
+
+ # ─── the breakages, in the order of private.os.platform.heal.breakage.names.get ─
+ local name rcBreak=0 breakLog healLog
+ breakLog=$(private.os.platform.heal.log.get breakages "$platform")
+ for name in $breakages; do
+   private.os.platform.heal.breakage.apply "$platform" "$name" "$healBranch" 2>&1 | tee -a "$breakLog"
+   [ "${PIPESTATUS[0]}" = 0 ] || rcBreak=1
+ done
+
+ # ─── ONE heal as root, the curl form over ssh (ossh heal → sh <init> heal <branch> all) ─
+ local rcHeal rcPipe=""
+ healLog=$(private.os.platform.heal.log.get heal "$platform")
+ OOSH_HEAL_LOCAL=1 ossh heal "$platform" all "$healBranch" 2>&1 | tee "$healLog"
+ rcHeal=${PIPESTATUS[0]}
+ # pipe: the pure pipe form as test, once (C2 runs it on the first platform)
+ if [ -n "$pipe" ]; then
+   private.os.platform.heal.pipe.run "$platform" "$healBranch"
+   rcPipe=$?
+ fi
+
+ # ─── test.suite gate 1 per user, as os platform.test runs it ─────────────
+ local rcTest rcRoot rcOoshUser rcBashUser
+ private.os.platform.gate.run "$platform" test "$(private.os.platform.heal.log.get test "$platform")"
+ rcTest=$?
+ private.os.platform.gate.run "$platform" root "$(private.os.platform.heal.log.get root "$platform")"
+ rcRoot=$?
+ # root's test.suite leaves root-owned files in sharedConfig (os.platform.test)
+ private.os.platform.shared.config.repair "$platform"
+ private.os.platform.gate.run "$platform" oosh-user "$(private.os.platform.heal.log.get oosh-user "$platform")"
+ rcOoshUser=$?
+ private.os.platform.gate.run "$platform" bash-user "$(private.os.platform.heal.log.get bash-user "$platform")"
+ rcBashUser=$?
+
+ # ─── the idempotence invariant as root and as bash-user ──────────────────
+ local rcIdem=0
+ private.os.platform.user.run "$platform" root "test.suite run platform.shared.idempotence.invariant 1" \
+   "$(private.os.platform.heal.log.get idempotence-root "$platform")" || rcIdem=1
+ private.os.platform.shared.config.repair "$platform"
+ private.os.platform.user.run "$platform" bash-user "test.suite run platform.shared.idempotence.invariant 1" \
+   "$(private.os.platform.heal.log.get idempotence-bash-user "$platform")" || rcIdem=1
+
+ # ─── a second heal that changes nothing, and the foreign tree untouched ──
+ local rcSecond rcForeign="skipped" foreignLog
+ private.os.platform.heal.second.run "$platform" "$healBranch"
+ rcSecond=$?
+ case " $breakages " in
+   *" foreign.symlink "*)
+     foreignLog=$(private.os.platform.heal.log.get foreign "$platform")
+     private.os.platform.heal.foreign.check "$platform" 2>&1 | tee "$foreignLog"
+     rcForeign=${PIPESTATUS[0]} ;;
+ esac
+
+ # ─── the verdict ──────────────────────────────────────────────────────────
+ local line="breakages=$rcBreak heal=$rcHeal${rcPipe:+ pipe=$rcPipe} test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign"
+ if [ "$rcBreak" = 0 ] && [ "$rcHeal" -le 1 ] && [ "${rcPipe:-0}" = 0 ] && [ "$rcTest" = 0 ] && [ "$rcRoot" = 0 ] \
+    && [ "$rcOoshUser" = 0 ] && [ "$rcBashUser" = 0 ] && [ "$rcIdem" = 0 ] && [ "$rcSecond" = 0 ] \
+    && { [ "$rcForeign" = 0 ] || [ "$rcForeign" = skipped ]; }; then
+   printf "PASS: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
+   important.log "PASS: heal $platform $oldRef ($line)"
+   create.result 0 "PASS"
+   # shellcheck disable=SC2086 # the log paths have no spaces
+   rm -f $logs
+   rc=0
+ else
+   printf "FAIL: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
+   error.log "FAIL: heal $platform $oldRef ($line)"
+   local l
+   for l in $logs; do
+     [ -s "$l" ] || continue
+     grep -qi "FAIL\|✗" "$l" 2>/dev/null || continue
+     error.log "--- first FAIL lines of $l ---"
+     grep -i -m 10 "FAIL\|✗" "$l"
+   done
+   create.result 1 "FAIL"
+   rc=1
+ fi
+
+ private.os.platform.ref.branch.drop "$branch"
+ # terminal: the container stays for a look inside (C2 debugging); else it goes.
+ if [ -n "$terminal" ]; then
+   console.log "terminal: the container of $platform stays on port $sshPort — enter it: ossh exec.tty $platform 'sudo -i'; remove it: docker rm -f \$(docker ps -q --filter publish=$sshPort)"
+ else
+   ossh connection.close "$platform" 2>/dev/null
+   private.os.platform.cleanup "$sshPort"
+ fi
+ create.result "$rc" "$([ "$rc" = 0 ] && echo PASS || echo FAIL)"
+ return $rc
+}
+os.platform.heal.test.completion.platform() {
+  private.os.platform.names
+}
+os.platform.heal.test.completion.oldRef() {
+  # the remote branches; a sha is typed
+  private.this.script.load ogit ogit.branch.list && ogit.branch.list remote
+}
+os.platform.heal.test.completion.breakages() {
+  echo all
+  private.os.platform.heal.breakage.names.get
+  echo terminal
+  echo pipe
+}
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────

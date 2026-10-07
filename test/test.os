@@ -764,6 +764,124 @@ test.case $level "T-OS-HEAL-PIPE-RUN: the pure pipe form of the heal runs once a
 expect 0 "cat <init> | env OOSH_REPO=<bundle> sh -s -- heal <branch> as test, the temp files removed" \
   "ossh heal runs the arm from a file; the curl form reads it from stdin"
 
+console.log "
+Test: os.platform.heal.test
+===================================================================="
+
+test.case - "T-OS-HEAL-TEST-ARGS: platform.heal.test refuses a call without <platform> <oldRef>" \
+   os.platform.heal.test ubuntu_24_04
+expect 1 "Usage: os platform.heal.test <platform> <oldRef> <?breakages...:all> — words terminal and pipe may stand among the breakages"
+
+# T-OS-HEAL-TEST-ORDER: the orchestration with every step stubbed (no docker, no ssh, no
+# push): parse → ref.branch.ensure → era gate → container.up (OSSH_INSTALL_BRANCH) →
+# users.install → breakages → heal → gates → idempotence → second heal → foreign →
+# result → ref.branch.drop → cleanup; a failing container.up stops with rc 1 and still
+# drops the temporary branch.
+test.os.healTest.stubs.set() {
+  test.os.stubs.set
+  OS_T_GATE=0
+  private.os.platform.parse()            { echo "parse $*" >> "$OS_T_REC"; PLATFORM_WORKSPACE=nakedUbuntu/24.04; return 0; }
+  private.os.platform.ref.branch.ensure() { echo "ensure $*" >> "$OS_T_REC"; create.result 0 "platform-test/$1"; }
+  private.os.platform.branch.gate()      { echo "gate $*" >> "$OS_T_REC"; create.result "$OS_T_GATE" "gate"; return "$OS_T_GATE"; }
+  private.os.platform.container.up()     { echo "container.up $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; return 0; }
+  private.os.platform.users.install()    { echo "users.install $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; return 0; }
+  private.os.platform.heal.breakage.apply() { echo "breakage $2 $3" >> "$OS_T_REC"; return 0; }
+  private.os.platform.heal.pipe.run()    { echo "pipe $*" >> "$OS_T_REC"; return 0; }
+  private.os.platform.gate.run()         { echo "gate.run $2" >> "$OS_T_REC"; return 0; }
+  private.os.platform.shared.config.repair() { echo "repair" >> "$OS_T_REC"; }
+  private.os.platform.user.run()         { echo "user.run $2 $3" >> "$OS_T_REC"; return 0; }
+  private.os.platform.heal.second.run()  { echo "second $*" >> "$OS_T_REC"; return 0; }
+  private.os.platform.heal.foreign.check() { echo "foreign $*" >> "$OS_T_REC"; return 0; }
+  private.os.platform.ref.branch.drop()  { echo "drop $*" >> "$OS_T_REC"; return 0; }
+  private.os.platform.cleanup()          { echo "cleanup $*" >> "$OS_T_REC"; }
+  ossh() { echo "ossh $* local=[${OOSH_HEAL_LOCAL-unset}]" >> "$OS_T_REC"; }
+}
+test.os.healTestOrder() {
+  local fx; fx=$(test.suite.fixture.make healorder)
+  local HOME="$fx" OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL; unset OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL
+  local bad="" rc out got want hb p=heal_test_stub n names
+  private.this.script.load ogit ogit.branch.get
+  hb=$(ogit.branch.get "$OOSH_DIR")
+  names=$(private.os.platform.heal.breakage.names.get)
+  test.os.healTest.stubs.set
+  out=$(os.platform.heal.test "$p" 26d15a4 2>&1); rc=$?
+  [ "$rc" = 0 ] || bad="$bad rc=$rc"
+  want="parse $p
+ensure 26d15a4
+gate platform-test/26d15a4
+container.up $p naked_ubuntu_24_04 8022 branch=[platform-test/26d15a4]
+users.install $p branch=[platform-test/26d15a4]"
+  for n in $names; do want="$want
+breakage $n $hb"; done
+  want="$want
+ossh heal $p all $hb local=[1]
+gate.run test
+gate.run root
+repair
+gate.run oosh-user
+gate.run bash-user
+user.run root test.suite run platform.shared.idempotence.invariant 1
+repair
+user.run bash-user test.suite run platform.shared.idempotence.invariant 1
+second $p $hb
+foreign $p
+drop platform-test/26d15a4
+ossh connection.close $p local=[unset]
+cleanup 8022"
+  got=$(cat "$OS_T_REC")
+  [ "$got" = "$want" ] || bad="$bad order:$(diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | grep '^[<>]' | head -3 | tr '\n' '|')"
+  case "$out" in *"PASS: heal $p 26d15a4 (breakages=0 heal=0 test=0 root=0 oosh-user=0 bash-user=0 idempotence=0 second-heal=0 foreign=0)"*) ;; *) bad="$bad no-pass-line" ;; esac
+  [ -z "${OSSH_INSTALL_BRANCH+x}" ] && [ -z "${OOSH_HEAL_LOCAL+x}" ] || bad="$bad env-leaked"
+  # a subset, pipe and terminal: only that breakage, the pipe form after the heal, no foreign check, the container stays
+  : > "$OS_T_REC"
+  os.platform.heal.test "$p" 26d15a4 dirty pipe terminal >/dev/null 2>&1 || bad="$bad subset-rc"
+  [ "$(grep -c '^breakage ' "$OS_T_REC")" = 1 ] && grep -qx "breakage dirty $hb" "$OS_T_REC" || bad="$bad subset-breakages"
+  [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:ossh heal ' | sed -n 2p | cut -d: -f2-)" = "pipe $p $hb" ] || bad="$bad pipe-not-after-heal"
+  grep -q '^foreign ' "$OS_T_REC" && bad="$bad foreign-without-breakage"
+  grep -q '^cleanup ' "$OS_T_REC" && bad="$bad terminal-cleaned-up"
+  grep -q '^drop platform-test/26d15a4' "$OS_T_REC" || bad="$bad terminal-no-drop"
+  # a failing container.up: rc 1, the temporary branch dropped, nothing installed
+  : > "$OS_T_REC"
+  private.os.platform.container.up() { echo "container.up" >> "$OS_T_REC"; create.result 1 "stubbed"; return 99; }
+  os.platform.heal.test "$p" 26d15a4 >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] || bad="$bad up-fail-rc=$rc"
+  grep -q '^users.install' "$OS_T_REC" && bad="$bad installed-after-fail"
+  grep -q '^drop platform-test/26d15a4' "$OS_T_REC" || bad="$bad up-fail-no-drop"
+  # the era gate refuses: dropped, no container
+  : > "$OS_T_REC"; OS_T_GATE=1
+  os.platform.heal.test "$p" b492b2e >/dev/null 2>&1; [ $? = 1 ] || bad="$bad era-rc"
+  grep -q '^container.up' "$OS_T_REC" && bad="$bad era-container"
+  grep -q '^drop platform-test/b492b2e' "$OS_T_REC" || bad="$bad era-no-drop"
+  # an unknown breakage: refused before anything starts
+  : > "$OS_T_REC"; OS_T_GATE=0
+  os.platform.heal.test "$p" 26d15a4 bogus >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-rc"
+  [ -s "$OS_T_REC" ] && bad="$bad unknown-started"
+  test.os.stubs.unset
+  for n in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign; do
+    rm -f "$(private.os.platform.heal.log.get "$n" "$p")"
+  done
+  unset OS_T_GATE
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "parse, ensure, gate, container.up, users.install, breakages, heal, gates, idempotence, second heal, foreign, drop, cleanup; a failing container.up still drops the branch" || create.result 1 "heal test order:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-TEST-ORDER: os platform.heal.test runs its steps in order and always drops its temporary branch" test.os.healTestOrder
+expect 0 "parse, ensure, gate, container.up, users.install, breakages, heal, gates, idempotence, second heal, foreign, drop, cleanup; a failing container.up still drops the branch" \
+  "the scenario test proves the heal before it touches a real machine"
+
+# T-OS-HEAL-TEST-COMPLETION: platforms, remote branches, and the breakage words with all, terminal and pipe
+test.os.healTestCompletion() {
+  local bad="" got
+  got=$(os.platform.heal.test.completion.platform); printf '%s\n' "$got" | grep -qx ubuntu_24_04 || bad="$bad platform"
+  got=$(os.platform.heal.test.completion.breakages)
+  for w in all terminal pipe eraB.config detached; do printf '%s\n' "$got" | grep -qxF "$w" || bad="$bad breakages:$w"; done
+  type os.platform.heal.test.completion.oldRef >/dev/null 2>&1 || bad="$bad no-oldRef"
+  [ -z "$bad" ] && create.result 0 "completion: platforms, remote branches, breakages" || create.result 1 "completion:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-TEST-COMPLETION: platform.heal.test completes its parameters with real candidates" test.os.healTestCompletion
+expect 0 "completion: platforms, remote branches, breakages" "every public parameter completes"
+
 ### test.method
 
 test.suite.save.results
