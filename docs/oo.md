@@ -623,8 +623,9 @@ loggers — `private.oo.heal.text.plain`, the one strip, also used for `config v
 which does not fail the heal. It says NOT CHECKED when the invariant file is not in the branch, and when
 another user's invariants would have to run without being root.
 
-**`all`** heals every user — root, `developking`, every user whose home holds `~/oosh` or `~/config`, and the
+**`all`** heals every user — root, `developking`, every person's account whose own home holds `~/oosh` or `~/config`, and the
 login user that invoked sudo (`OOSH_HEAL_LOGIN`; `private.oo.heal.users.list`) — and needs root: as a user, `oo heal <branch> all` stops with rc 2 and names `sudo -H oo heal <branch> all`.
+A person's account is the four rules of `private.user.account.heals.is`: root or a uid of at least `UID_MIN` (`/etc/login.defs`, else 1000; 501 on macOS — `private.user.uid.min.get`), a login shell that is not `nologin` or `false`, a home it owns (not `/`, `/nonexistent`, `/var/empty`) and `~/oosh` or `~/config` in it. A system account that sees one anyway — AlmaLinux's `operator` has uid 11, `/sbin/nologin` and root's home `/root` — is not healed; the diagnosis names it once: `[skip] operator: system account (uid 11, /sbin/nologin, home /root)`.
 A user who is already canonical keeps their branch under `all`, except the healer and the login that ran sudo (`OOSH_HEAL_LOGIN`): they move to `<branch>`, so the second heal finds `oo heal` from root's `~/oosh` (`private.oo.heal.user.keep.check`). When `config init.user` fails for a user, the heal shows its own reason (`config init.user <user> <dir> failed: <reason>`), never "run it to see why". Healing a named user other than yourself
 needs root too. `sudo -H oo heal <branch>` is also what is named when the system part needs root.
 
@@ -1107,7 +1108,7 @@ Internal functions (not for direct use):
 | `private.oo.heal.shell <?home> <?base> <?load>` | The shell step `oo update` and `oo heal` share (git trust, `.bashrc`, session files, retired drop-in, launcher, `~/.once`); `load no` skips what loads config or user |
 | `private.oo.heal.env <sharedConfig>` | Once: `config init.env` in a fresh process, then the queued imports of the kept `~/config` folders (`private.config.orig.import`), then `config validate required` in a fresh process |
 | `private.oo.heal.fresh.run <home> <command>` | Runs `<command>` in a fresh process of this user (`env -i`, `HOME=<home>`, `~/oosh` first on the system `PATH`); prints its output; rc of the command |
-| `private.oo.heal.users.list` | The users `oo heal all` heals, one per line; silent getter |
+| `private.oo.heal.users.list <?which:heal>` | The users `oo heal all` heals, one per line (`private.user.account.heals.is`); `skip`: one `[skip] <user>: <why>` line per account that sees `~/oosh` or `~/config` and is not healed; silent getter |
 | `private.oo.heal.verify <user> <home>` | Runs the four invariants as `<user>`: `PASS` / `FAIL` / `NOT CHECKED` lines |
 | `private.oo.heal.note <rc> <step> <text> <?kind:step>` | Adds one summary line and raises the heal's rc; `kind` `info` is a report only (legacy `ssh.*` folders, a non-bash login shell): it raises the rc but not the rc of the steps that decides state 99 |
 | `private.oo.heal.summary <?sharedConfig>` | Prints the summary, one line per step, and the rc; when the steps and verify are green (info notes aside) the install state goes to 99 in `<sharedConfig>` |
