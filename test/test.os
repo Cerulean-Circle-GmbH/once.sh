@@ -295,7 +295,7 @@ test.os.platformSplit() {
   done
   private.os.platform.gate.run p nobody >/dev/null 2>&1; [ $? = 1 ] || bad="$bad gate.run-accepts-unknown-user"
   os.platform.test no_such_platform_xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-platform-not-refused"
-  os.platform.test ubuntu_24_04 "" notests no-such-ref-xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-branch-not-refused"
+  private.os.platform.branch.gate no-such-ref-xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-branch-not-refused"
   type os.platform.test.completion.branch >/dev/null 2>&1 || bad="$bad no-branch-completion"
   [ -z "$bad" ] && create.result 0 "container.up, users.install and gate.run exist, platform.test calls them, an unknown platform and an unknown user are refused" || create.result 1 "split:$bad"
   return $(result)
@@ -333,6 +333,8 @@ test.os.branchEra() {
   case "$msg" in *eraB*platform.heal.test*) ;; *) bad="$bad old-msg-lacks-eraB" ;; esac
   private.os.platform.branch.gate "$new" "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad new-rc=$rc"
   private.os.platform.branch.gate HEAD "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad head-rc=$rc"
+  ogit.raw "$fx/repo" update-ref refs/remotes/origin/feat "$new"
+  private.os.platform.branch.gate feat "$fx/repo" >/dev/null 2>&1; rc=$?; [ $rc = 0 ] || bad="$bad remote-only-branch-rc=$rc"
   private.os.platform.branch.gate no/such-ref "$fx/repo" >/dev/null 2>&1; rc=$?; msg="$RESULT"
   [ $rc = 1 ] || bad="$bad missing-rc=$rc"
   case "$msg" in *no/such-ref*) ;; *) bad="$bad missing-msg=[$msg]" ;; esac
@@ -344,6 +346,76 @@ test.os.branchEra() {
 test.case $level "T-OS-PLATFORM-TEST-BRANCH-ERA: platform.test <branch> refuses refs older than the mode-root installer contract" test.os.branchEra
 expect 0 "an init/oosh without the mode root contract and a missing ref are refused with rc 1, a ref with it passes" \
   "refs before b8b90b82 use mode ssh and cannot be driven by the current ossh install"
+
+# T-OS-PLATFORM-TEST-STUBBED: the orchestration with every outside world stubbed (no docker, no ssh).
+# Stubs record their calls in $OS_T_REC; ossh install records OSSH_INSTALL_BRANCH as it sees it.
+test.os.stubs.set() {
+  OS_T_REC=$(test.suite.fixture.make osrec)/rec; : > "$OS_T_REC"
+  odocker()   { echo "odocker $*" >> "$OS_T_REC"; }
+  docker()    { echo "docker $*" >> "$OS_T_REC"; return 0; }
+  sshpass()   { echo "sshpass $*" >> "$OS_T_REC"; }
+  ssh()       { echo "ssh $*" >> "$OS_T_REC"; }
+  sleep()     { :; }
+  ossh()      { echo "ossh $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; }
+  private.os.platform.sshd.reload() { echo "sshd.reload $*" >> "$OS_T_REC"; }
+}
+test.os.stubs.unset() {
+  unset -f odocker docker sshpass ssh sleep ossh private.os.platform.sshd.reload
+  source "$OOSH_DIR/os"
+  rm -rf "$(dirname "$OS_T_REC")"; unset OS_T_REC
+}
+test.os.containerUp() {
+  local bad="" rec
+  test.os.stubs.set
+  private.os.platform.container.up p img 9022 >/dev/null 2>&1 || bad="$bad rc=$?"
+  rec=$(cat "$OS_T_REC")
+  case "$rec" in *"odocker reset img 9022"*) ;; *) bad="$bad reset-lacks-port" ;; esac
+  case "$rec" in *"sshd.reload 9022"*) ;; *) bad="$bad sshd.reload-lacks-port" ;; esac
+  case "$rec" in *"ossh install p test"*) ;; *) bad="$bad no-install-for-test" ;; esac
+  test.os.stubs.unset
+  [ -z "$bad" ] && create.result 0 "the ssh port given reaches odocker reset and sshd.reload, and test gets installed" || create.result 1 "container.up:$bad"
+  return $(result)
+}
+test.case $level "T-OS-CONTAINER-UP-PORT: container.up hands the port it was given to odocker reset and sshd.reload" test.os.containerUp
+expect 0 "the ssh port given reaches odocker reset and sshd.reload, and test gets installed" \
+  "container.up used an undefined \$port: sshd.reload did nothing"
+
+test.os.platformTestBranch() {
+  local bad="" rec rc
+  test.os.stubs.set
+  os.platform.test ubuntu_24_04 "" notests HEAD >/dev/null 2>&1; rc=$?
+  rec=$(cat "$OS_T_REC")
+  [ $rc = 0 ] || bad="$bad rc=$rc"
+  case "$rec" in *"ossh install ubuntu_24_04 test"*) ;; *) bad="$bad no-install-test" ;; esac
+  [ "$(printf '%s\n' "$rec" | grep '^ossh install' | grep -vc 'branch=\[HEAD\]')" = 0 ] || bad="$bad install-without-branch"
+  [ "$(printf '%s\n' "$rec" | grep -c '^ossh install')" = 2 ] || bad="$bad installs=$(printf '%s\n' "$rec" | grep -c '^ossh install')"
+  [ -z "${OSSH_INSTALL_BRANCH+x}" ] || bad="$bad branch-leaked-after"
+  # empty placeholders must not swallow the later parameters: notests skips every gate run
+  case "$rec" in *"test.suite gate"*) bad="$bad notests-ignored-gate-ran" ;; esac
+  : > "$OS_T_REC"
+  os.platform.test ubuntu_24_04 "" notests >/dev/null 2>&1
+  [ "$(grep '^ossh install' "$OS_T_REC" | grep -vc 'branch=\[unset\]')" = 0 ] || bad="$bad branch-set-without-param"
+  # a failing container.up ends platform.test with rc 1, whatever it returned; and no ossh install follows
+  : > "$OS_T_REC"
+  private.os.platform.container.up() { return 99; }
+  os.platform.test ubuntu_24_04 "" notests >/dev/null 2>&1; rc=$?
+  [ $rc = 1 ] || bad="$bad containerup-fail-rc=$rc"
+  # branch on macos is refused, the CI is not started
+  private.os.platform.test.ci() { echo "ci called" >> "$OS_T_REC"; }
+  os.platform.test macos "" "" HEAD >/dev/null 2>&1; rc=$?
+  [ $rc = 1 ] || bad="$bad macos-branch-rc=$rc"
+  grep -q "ci called" "$OS_T_REC" && bad="$bad macos-ci-started"
+  test.os.stubs.unset
+  source "$OOSH_DIR/os"
+  [ -z "$bad" ] && create.result 0 "OSSH_INSTALL_BRANCH is <branch> inside both ossh install calls and gone afterwards; empty placeholders keep notests; container.up failing gives rc 1; macos refuses a branch" || create.result 1 "platform.test stubbed:$bad"
+  return $(result)
+}
+test.case $level "T-OS-PLATFORM-TEST-BRANCH-ENV: OSSH_INSTALL_BRANCH lives for the two ossh install calls only; an empty placeholder no longer swallows notests" test.os.platformTestBranch
+expect 0 "OSSH_INSTALL_BRANCH is <branch> inside both ossh install calls and gone afterwards; empty placeholders keep notests; container.up failing gives rc 1; macos refuses a branch" \
+  "os platform.test p \"\" notests used to run the tests: an empty argument was not shifted"
+
+test.case $level "T-OS-GATE-LOG-GET: the gate log path of a user and platform" private.os.platform.gate.log.get root ubuntu_24_04
+expect 0 "*" "one getter for gate.run and platform.test"
 
 ### test.method
 
