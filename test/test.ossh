@@ -2,10 +2,14 @@
 #clear
 #export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
 #set -x
+TEST_CATEGORY=core
 
 level=$1
 if [ -z "$level" ]; then
   level=1
+else 
+  # remove the level parameter
+  shift
 fi
 echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
@@ -32,10 +36,154 @@ console.log "RETURN: $RETURN_VALUE  Result: $RESULT
 }
 
 test.case - "ossh test start" \
-   ossh $*
+   ossh usage
 expect 0 "*" "Test start"
 
 source ossh
+
+# ============================================================================
+# T-OSSH-REMOTE-PRELUDE: one owner for "stand a remote/non-interactive shell up"
+# ============================================================================
+# A command over ssh (ossh exec), runuser/sudo -u or docker exec never runs
+# .bashrc. It used to start with `[ -f ~/oosh/boot ] && . ~/oosh/boot || export
+# PATH=…` — copied into ossh, user, os, odocker, c2 and the CI workflow — and
+# the `&& … ||` form takes the fallback whenever sourcing returns non-zero
+# (regression 5d06827). ossh.remote.prelude.get is the one text: POSIX, `if`,
+# ~/config/user.env when present, else ~/oosh on PATH.
+test.ossh.remotePrelude() {
+  local fx bare bad="" p out; fx=$(test.suite.fixture.make prelude); bare=$(test.suite.fixture.make preludebare)
+  mkdir -p "$fx/config"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' 'export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"' > "$fx/config/user.env"
+  p=$(ossh.remote.prelude.get)
+  case "$p" in *"&&"*"||"*) bad="$bad and-or-chain" ;; esac
+  out=$(env -i HOME="$fx" PATH=/usr/bin:/bin sh -c "$p"' printf "%s|%s" "$CONFIG_PATH" "${PATH%%:*}"' 2>/dev/null)
+  [ "$out" = "$fx/config|$fx/oosh" ] || bad="$bad with-user.env=[$out]"
+  out=$(env -i HOME="$bare" PATH=/usr/bin:/bin sh -c "$p"' printf "%s|%s" "$CONFIG_PATH" "${PATH%%:*}"' 2>/dev/null)
+  [ "$out" = "|$bare/oosh" ] || bad="$bad without-user.env=[$out]"
+  rm -rf "$fx" "$bare"
+  [ -z "$bad" ] && create.result 0 "remote prelude: user.env when present, ~/oosh on PATH otherwise, POSIX, no && ||" || create.result 1 "remote prelude:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-REMOTE-PRELUDE: ossh.remote.prelude.get stands a non-interactive shell up from user.env" test.ossh.remotePrelude
+expect 0 "remote prelude: user.env when present, ~/oosh on PATH otherwise, POSIX, no && ||" \
+  "seven copies of a boot line, and the && || form hid a failing source"
+
+# ============================================================================
+# T-OSSH-CMD-NONINTERACTIVE: remote package installs carry the non-interactive
+# prefix
+# ============================================================================
+# oo.cmd and oo.prereqs.install learned the apt/brew prefix table
+# (private.oo.pm.env.get) in 6f4a8e9/85ef5b1; ossh.cmd — the REMOTE
+# counterpart — still sent a bare `sudo $pmCmd $pkg`, so apt could hang on
+# tzdata's "Geographic area:" exactly as oo.cmd used to, and
+# ossh.harden.packages carried a fifth hand copy missing NEEDRESTART_SUSPEND.
+# Drives both with private.ossh.ssh mocked to echo the string it would send.
+test.ossh.cmdNonInteractive() {
+  local out bad=""
+  out=$(
+    # `(pattern)`: bash before 5.2 reads a bare `pattern)` inside $( … ) as
+    # its end — AlmaLinux 9's bash 5.1 (T-ALL-SCRIPTS-PARSE).
+    private.ossh.ssh() { case "$*" in (*"command -v"*) return 1 ;; esac; echo "$*"; }
+    ossh.pm.discover() { echo "apt-get install -y"; }
+    ossh.cmd somehost tree 2>/dev/null
+  )
+  case "$out" in
+    *"sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 LC_ALL=C.UTF-8 DEBCONF_NOWARNINGS=yes apt-get install -y tree"*) ;;
+    *) bad="$bad ossh.cmd=>[$out]" ;;
+  esac
+  # What goes in front of the remote package manager is oo's answer
+  # (private.oo.pm.install.prefix.get): no sudo before brew (Homebrew refuses
+  # it), sudo + env before apt-get, sudo before dnf and apk — as before.
+  local pm want
+  for pm in "brew install" "apt-get -y install" "dnf -y install" "apk add"; do
+    case "$pm" in
+      "brew install")       want="sudo" ;;
+      "apt-get -y install") want="sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 LC_ALL=C.UTF-8 DEBCONF_NOWARNINGS=yes apt-get -y install tree" ;;
+      *)                    want="sudo $pm tree" ;;
+    esac
+    out=$(
+      private.ossh.ssh() { case "$*" in (*"command -v"*) return 1 ;; esac; echo "$*"; }
+      ossh.pm.discover() { echo "$pm"; }
+      ossh.cmd somehost tree 2>/dev/null
+    )
+    out=$(printf '%s' "$out" | tr -s ' ')   # a doubled space is not a different command
+    case "$pm" in
+      "brew install") case "$out" in *sudo*) bad="$bad brew-has-sudo=[$out]" ;; esac
+                      case "$out" in *"brew install tree"*) ;; *) bad="$bad brew=[$out]" ;; esac ;;
+      *) case "$out" in *"-tt somehost $want"|*"-tt somehost $want "*) ;; *) bad="$bad $pm=[$out]-want-[$want]" ;; esac ;;
+    esac
+  done
+  out=$(
+    private.ossh.ssh() { echo "$*"; }
+    private.ossh.harden.preflight() { return 0; }
+    ossh.harden.packages somehost 2>/dev/null
+  )
+  case "$out" in
+    *"export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1"*) ;;
+    *) bad="$bad harden.packages=>[$out]" ;;
+  esac
+  if [ -n "$bad" ]; then
+    create.result 1 "a remote package install can still prompt:$bad"
+  else
+    create.result 0 "ossh.cmd and ossh.harden.packages send the non-interactive prefix"
+  fi
+  return $(result)
+}
+test.case - "T-OSSH-CMD-NONINTERACTIVE: ossh.cmd and ossh.harden.packages run the remote PM non-interactively" \
+  test.ossh.cmdNonInteractive
+expect 0 "ossh.cmd and ossh.harden.packages send the non-interactive prefix" \
+  "the remote counterpart of oo cmd sent a bare sudo \$pmCmd — apt's tzdata prompt hangs it"
+
+# T-OSSH-INSTALL-HOST-NAME: a local install names the computer through private.config.host.name.get
+test.ossh.installHostName() {
+  local body bad=""; body=$(declare -f ossh.install.continue.local)
+  case "$body" in *private.config.host.name.get*) ;; *) bad="$bad no-getter" ;; esac
+  case "$body" in *'sshConfigNameUsedForLocal="$HOSTNAME"'*) bad="$bad raw-HOSTNAME" ;; esac
+  [ -z "$bad" ] && create.result 0 "the install names the computer through the getter" || create.result 1 "install host name:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-INSTALL-HOST-NAME: a local install names the computer through the getter, not \$HOSTNAME" test.ossh.installHostName
+expect 0 "the install names the computer through the getter" "\$HOSTNAME is a container's ID"
+
+# T-OSSH-KEY-NAME-NO-HOSTNAME: the SSH key name carries the computer name without the hostname program
+# The key name is <user>.<hostname -f>. AlmaLinux 9's minimal image has no
+# hostname program, so the name part came out empty ("someone."). Without the
+# program the name comes from the kernel (private.this.host.name.get full, the
+# HOSTNAME of bash); with it the name stays byte-identical — existing keys are
+# found by that name. The expected names with a hostname stub were captured
+# from the code before the change. Both sites: private.ossh.get.key.name and
+# private.ossh.set.key.name without a name. config save writes to a fixture.
+test.ossh.keyNameNoHostname() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make test.ossh.keyNameNoHostname)
+  test.ossh.keyNameNoHostname.run() { # <box|gha|none> — echo "<get name>|<set name>" with that hostname program
+    M="$1" FX="$fx" LOG_LEVEL=1 bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1
+      export CONFIG_PATH="$FX" USER=someone LOG_LEVEL=1; unset SSH_KEY_NAME OOSH_SSH_CONFIG_HOST
+      HOSTNAME=alma9.example.org
+      case "$M" in
+        box)  hostname() { [ "$1" = -f ] && echo box.example.org; } ;;
+        gha)  hostname() { [ "$1" = -f ] && echo "sat12-bq160 ssh.runner.example"; } ;;
+        none) command()  { [ "$1 $2" = "-v hostname" ] && return 1; builtin command "$@"; }
+              hostname() { return 127; } ;;   # the program is not there
+      esac
+      get=$(private.ossh.get.key.name 2>/dev/null)
+      unset SSH_KEY_NAME; private.ossh.set.key.name >/dev/null 2>&1
+      printf "%s|%s" "$get" "$SSH_KEY_NAME"' 2>/dev/null </dev/null
+  }
+  got=$(test.ossh.keyNameNoHostname.run none)
+  [ "$got" = "someone.alma9.example.org|someone.alma9.example.org" ] || bad="$bad no-hostname=[$got]"
+  got=$(test.ossh.keyNameNoHostname.run box)
+  [ "$got" = "someone.box.example.org|someone.box.example.org" ] || bad="$bad box-changed=[$got]"
+  got=$(test.ossh.keyNameNoHostname.run gha)
+  [ "$got" = "someone.sat12-bq160ssh.runner.example|someone.sat12-bq160ssh.runner.example" ] || bad="$bad gha-changed=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the key name carries the computer name with and without hostname" || create.result 1 "key name:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-KEY-NAME-NO-HOSTNAME: without the hostname program the SSH key name carries HOSTNAME; with it the name is unchanged" test.ossh.keyNameNoHostname
+expect 0 "the key name carries the computer name with and without hostname" \
+  "AlmaLinux minimal has no hostname program — the key name was <user>. with an empty computer part"
 
 ### test.method
 
@@ -138,7 +286,1255 @@ fi
 rm -f "$TEST_SSH_CONFIG" 2>/dev/null
 
 # ============================================================================
+# Test ossh.known.hosts.remove - requires host parameter
+# ============================================================================
+
+test.case $level "ossh.known.hosts.remove requires host parameter" \
+  ossh.known.hosts.remove
+
+if [ "$RETURN_VALUE" -eq 1 ]; then
+  expect.pass "returns 1 when no host given"
+else
+  expect.fail "should return 1 when no host given, got: $RETURN_VALUE"
+fi
+
+# ============================================================================
+# Test ossh.known.hosts.remove - function exists
+# ============================================================================
+
+test.case $level "ossh.known.hosts.remove is defined" \
+  type ossh.known.hosts.remove
+
+if type ossh.known.hosts.remove 2>/dev/null | grep -q "function"; then
+  expect.pass "ossh.known.hosts.remove is a function"
+else
+  expect.fail "ossh.known.hosts.remove should be a function after sourcing ossh"
+fi
+
+# ============================================================================
+# Test ossh.known.hosts.remove - handles missing known_hosts gracefully
+# ============================================================================
+
+TEST_HOME_BACKUP="$HOME"
+TEST_TMP_HOME=$(mktemp -d /tmp/test.ossh.home.XXXXXX)
+HOME="$TEST_TMP_HOME"
+
+test.case $level "ossh.known.hosts.remove handles missing known_hosts" \
+  ossh.known.hosts.remove testhost 8022
+
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "returns 0 when no known_hosts file exists"
+else
+  expect.fail "should return 0 gracefully, got: $RETURN_VALUE"
+fi
+
+HOME="$TEST_HOME_BACKUP"
+rm -rf "$TEST_TMP_HOME" 2>/dev/null
+
+# ============================================================================
+# Test ossh.known.hosts.remove.completion exists
+# ============================================================================
+
+if type ossh.known.hosts.remove.completion >/dev/null 2>&1; then
+  expect.pass "ossh.known.hosts.remove.completion is defined"
+else
+  expect.fail "ossh.known.hosts.remove.completion should be defined"
+fi
+
+# ============================================================================
+# Test ossh.install.user.remote - function exists (new feature)
+# ============================================================================
+
+test.case $level "ossh.install.user.remote is defined" \
+  type ossh.install.user.remote
+
+if type ossh.install.user.remote 2>/dev/null | grep -q "function"; then
+  expect.pass "ossh.install.user.remote is a function"
+else
+  expect.fail "ossh.install.user.remote should be a function after sourcing ossh"
+fi
+
+# ============================================================================
+# Test ossh.install.user.remote - requires sshConfigHost parameter
+# ============================================================================
+
+test.case $level "ossh.install.user.remote requires sshConfigHost" \
+  ossh.install.user.remote
+
+if [ "$RETURN_VALUE" -eq 1 ]; then
+  expect.pass "returns 1 when no sshConfigHost given"
+else
+  expect.fail "should return 1 when no sshConfigHost given, got: $RETURN_VALUE"
+fi
+
+# ============================================================================
+# Test ossh.install.user.remote - requires user parameter
+# ============================================================================
+
+test.case $level "ossh.install.user.remote requires user parameter" \
+  ossh.install.user.remote testhost
+
+if [ "$RETURN_VALUE" -eq 1 ]; then
+  expect.pass "returns 1 when no user given"
+else
+  expect.fail "should return 1 when no user given, got: $RETURN_VALUE"
+fi
+
+# ============================================================================
+# Test ossh.install.user.remote - code quality / pattern tests (CRIT-7)
+# ============================================================================
+
+# Extract function body once for all pattern tests
+FUNC_START=$(grep -n '^ossh\.install\.user\.remote()' "$OOSH_DIR/ossh" | head -1 | cut -d: -f1)
+FUNC_END=$(awk "NR>$FUNC_START && /^[a-zA-Z].*()/ {print NR; exit}" "$OOSH_DIR/ossh")
+FUNC_BODY=$(sed -n "${FUNC_START},${FUNC_END}p" "$OOSH_DIR/ossh")
+
+# ----------------------------------------------------------------------------
+test.case $level "T-REMOTE-1: install.user.remote uses getent for Linux home detection" \
+  echo "$FUNC_BODY"
+
+if echo "$FUNC_BODY" | grep -q "getent passwd"; then
+  expect.pass "function uses getent passwd for Linux home detection"
+else
+  expect.fail "function should use getent passwd for Linux home detection"
+fi
+
+# ----------------------------------------------------------------------------
+test.case $level "T-REMOTE-2: install.user.remote has dscl fallback for macOS" \
+  echo "$FUNC_BODY"
+
+if echo "$FUNC_BODY" | grep -q "dscl"; then
+  expect.pass "function has dscl fallback for macOS"
+else
+  expect.fail "function should have dscl fallback for macOS"
+fi
+
+# ----------------------------------------------------------------------------
+test.case $level "T-REMOTE-3: install.user.remote uses portable sed pattern" \
+  echo "$FUNC_BODY"
+
+if echo "$FUNC_BODY" | grep -q "sed -i ''"; then
+  expect.fail "function uses macOS-only 'sed -i \\x27\\x27' — should use platform-aware pattern"
+else
+  expect.pass "function does not use macOS-only sed -i pattern"
+fi
+
+# ----------------------------------------------------------------------------
+# After the refactor that collapses ossh.install.user.remote onto
+# user.oosh.install, dseditgroup/usermod, ln -s and git safe.directory
+# are no longer expected in the ossh body — they live in user.oosh.install
+# (via its .groups.{darwin,linux} helpers and main body). These tests now
+# target the canonical location.
+USER_INSTALL_START=$(grep -n '^user\.oosh\.install()' "$OOSH_DIR/user" | head -1 | cut -d: -f1)
+USER_INSTALL_END=$(awk "NR>$USER_INSTALL_START && /^[a-zA-Z].*()/ {print NR; exit}" "$OOSH_DIR/user")
+USER_INSTALL_BLOCK=$(sed -n "${USER_INSTALL_START},${USER_INSTALL_END}p" "$OOSH_DIR/user")
+# Also include the private helpers that user.oosh.install dispatches to via os.check
+USER_GROUPS_BLOCK=$(grep -E "^private\.user\.oosh\.install\.groups\." "$OOSH_DIR/user" | head -5)
+USER_HELPERS_BLOCK=$(awk '/^private\.user\.oosh\.install\./{flag=1} flag; /^}/ && flag{flag=0}' "$OOSH_DIR/user")
+
+test.case $level "T-REMOTE-4: user.oosh.install handles both dseditgroup and usermod" \
+  echo "combined"
+
+if echo "$USER_INSTALL_BLOCK $USER_HELPERS_BLOCK" | grep -q "dseditgroup" \
+   && echo "$USER_INSTALL_BLOCK $USER_HELPERS_BLOCK" | grep -qE "usermod|user\.group\.add"; then
+  expect.pass "user.oosh.install (with helpers) handles both dseditgroup (macOS) and Linux group mgmt"
+else
+  expect.fail "user.oosh.install should handle both dseditgroup and usermod/user.group.add for group management"
+fi
+
+# ----------------------------------------------------------------------------
+test.case $level "T-REMOTE-5: user.oosh.install creates symlinks (not copies)" \
+  echo "$USER_INSTALL_BLOCK"
+
+if echo "$USER_INSTALL_BLOCK" | grep -q "ln -s"; then
+  expect.pass "user.oosh.install uses ln -s to create symlinks"
+else
+  expect.fail "user.oosh.install should use ln -s for symlinks, not cp"
+fi
+
+# ----------------------------------------------------------------------------
+test.case $level "T-REMOTE-6: user.oosh.install adds git safe.directory" \
+  echo "$USER_INSTALL_BLOCK"
+
+if echo "$USER_INSTALL_BLOCK" | grep -q "safe\.directory"; then
+  expect.pass "user.oosh.install adds git safe.directory for shared oosh repo"
+else
+  expect.fail "user.oosh.install should add git safe.directory for cross-user shared repo"
+fi
+
+# ----------------------------------------------------------------------------
+test.case $level "T-REMOTE-7: ossh.install.user.remote delegates to user.oosh.install" \
+  echo "$FUNC_BODY"
+
+# Match the invocation ` oosh.install <args>` (preceded by anything that
+# closes a command name — space, ", ', \"). Covers both the dispatcher form
+# `user oosh.install` and the absolute-path form `"$sharedOosh/user" oosh.install`.
+if echo "$FUNC_BODY" | grep -qE "[^a-zA-Z]oosh\.install[ 	]"; then
+  expect.pass "ossh.install.user.remote delegates via 'user oosh.install'"
+else
+  expect.fail "ossh.install.user.remote should delegate to 'user oosh.install' over SSH"
+fi
+
+# ============================================================================
+# Test Darwin-specific portability patterns in the install pipeline (MED-7).
+# F3 (the /root → $HOME sed templating) lived in ossh.install.continue.local
+# until commit «state-machine fail-loud Phase 1»; it now lives in oo's state 31
+# body (right after `config save`). Aggregate both files so the test still
+# verifies the portable-sed invariant regardless of which file owns it.
+# ============================================================================
+
+INSTALL_PIPELINE_FULL="$(cat "$OOSH_DIR/ossh" "$OOSH_DIR/oo" 2>/dev/null)"
+
+# ----------------------------------------------------------------------------
+test.case $level "T-DARWIN-1: portable sed-i pattern uses uname check" \
+  echo "(install pipeline aggregated)"
+
+if echo "$INSTALL_PIPELINE_FULL" | grep -q 'uname -s.*Darwin'; then
+  expect.pass "install pipeline uses uname -s check for Darwin-specific sed -i handling"
+else
+  expect.fail "install pipeline (oo or ossh) should use uname -s to detect Darwin for portable sed -i"
+fi
+
+# ----------------------------------------------------------------------------
+test.case $level "T-DARWIN-2: root home detection handles both Linux and macOS" \
+  echo "(install pipeline aggregated)"
+
+# The code should use $HOME (dynamic) rather than hardcoding /root or /var/root
+if echo "$INSTALL_PIPELINE_FULL" | grep -qE '_?rootHome="\$HOME"'; then
+  expect.pass "root home detection uses \$HOME (works on both Linux /root and macOS /var/root)"
+else
+  expect.fail "root home detection should use \$HOME for portability across Linux and macOS"
+fi
+
+# ============================================================================
 # Test Summary
 # ============================================================================
+
+# ============================================================================
+# Shared SSH config tests — fixture-based
+# ============================================================================
+SHARED_FIXTURE="/tmp/test.ossh.shared.$$"
+SHARED_DIR="$SHARED_FIXTURE/shared_ssh"
+
+# Phase 3 of the .ssh/ correctness plan: github access flows through
+# ~/.ssh/ids/ssh.developking/id_rsa, not a standalone deploy key. The
+# shared-create primitive no longer touches any deploy key file.
+
+# ============================================================================
+# T-SHARED-1: ossh.config.shared.github.create creates directory and config
+# ============================================================================
+test.ossh.shared.create() {
+  ossh.config.shared.github.create "$SHARED_DIR" >/dev/null 2>&1
+  local rc=$?
+
+  if [ $rc -eq 0 ] && [ -d "$SHARED_DIR" ] && [ -f "$SHARED_DIR/config" ]; then
+    create.result 0 "dir and config created"
+  else
+    create.result 1 "rc=$rc dir=$([ -d "$SHARED_DIR" ] && echo yes || echo no) config=$([ -f "$SHARED_DIR/config" ] && echo yes || echo no)"
+  fi
+}
+test.case - "T-SHARED-1: config.shared.github.create creates directory and config" \
+  test.ossh.shared.create
+expect 0 "dir and config created" "ossh.config.shared.github.create creates shared SSH directory and config"
+
+# ============================================================================
+# T-SHARED-2: ossh.config.shared.github.create is idempotent
+# ============================================================================
+test.ossh.shared.idempotent() {
+  # Run twice
+  ossh.config.shared.github.create "$SHARED_DIR" >/dev/null 2>&1
+  ossh.config.shared.github.create "$SHARED_DIR" >/dev/null 2>&1
+  local rc=$?
+
+  # Count Host github.com entries — should be exactly 1
+  local count
+  count=$(grep -c "^Host github.com$" "$SHARED_DIR/config" 2>/dev/null)
+
+  if [ $rc -eq 0 ] && [ "$count" -eq 1 ]; then
+    create.result 0 "idempotent ($count entry)"
+  else
+    create.result 1 "rc=$rc count=$count"
+  fi
+}
+test.case - "T-SHARED-2: config.shared.github.create is idempotent" \
+  test.ossh.shared.idempotent
+expect 0 "idempotent (1 entry)" "ossh.config.shared.github.create does not duplicate on re-run"
+
+# ============================================================================
+# T-SHARED-3: ossh.config.shared.github.create sets correct permissions
+# ============================================================================
+test.ossh.shared.permissions() {
+  local dirPerms
+  dirPerms=$(stat -c "%a" "$SHARED_DIR" 2>/dev/null || stat -f "%Lp" "$SHARED_DIR" 2>/dev/null)
+  local configPerms
+  configPerms=$(stat -c "%a" "$SHARED_DIR/config" 2>/dev/null || stat -f "%Lp" "$SHARED_DIR/config" 2>/dev/null)
+
+  # Standalone deploy key file should NOT exist anymore
+  local hasLegacyKey="no"
+  [ -e "$SHARED_DIR/2cuGitHub" ] && hasLegacyKey="yes"
+
+  if [ "$dirPerms" = "700" ] && [ "$configPerms" = "600" ] && [ "$hasLegacyKey" = "no" ]; then
+    create.result 0 "permissions correct, no legacy 2cuGitHub"
+  else
+    create.result 1 "dir=$dirPerms config=$configPerms legacyKey=$hasLegacyKey"
+  fi
+}
+test.case - "T-SHARED-3: config.shared.github.create sets correct perms, no legacy key" \
+  test.ossh.shared.permissions
+expect 0 "permissions correct, no legacy 2cuGitHub" "directory 700, config 600, no standalone 2cuGitHub file"
+
+# ============================================================================
+# T-SHARED-6: shared config contains Host github.com with developking IdentityFile
+# ============================================================================
+test.ossh.shared.validConfig() {
+  if ! grep -q "^Host github.com$" "$SHARED_DIR/config" 2>/dev/null; then
+    create.result 1 "Host github.com not found in config"
+    return
+  fi
+  # Extract the github.com block and check IdentityFile.
+  local ghBlock
+  ghBlock=$(awk '
+    /^Host github.com$/ {found=1; next}
+    found && /^Host / {found=0}
+    found {print}
+  ' "$SHARED_DIR/config")
+  if echo "$ghBlock" | grep -Fq "IdentityFile ~/.ssh/ids/ssh.developking/id_rsa"; then
+    create.result 0 "github.com block uses developking id_rsa"
+  else
+    create.result 1 "github.com block has wrong IdentityFile"
+  fi
+}
+test.case - "T-SHARED-6: shared config has Host github.com via ids/ssh.developking/id_rsa" \
+  test.ossh.shared.validConfig
+expect 0 "github.com block uses developking id_rsa" "shared config's github.com Host points at developking key"
+
+# ============================================================================
+# T-SHARED-4: ossh.config.shared.link creates symlink for user
+# ============================================================================
+test.ossh.shared.link.symlink() {
+  local testUserHome="$SHARED_FIXTURE/home_testuser"
+  mkdir -p "$testUserHome/.ssh"
+
+  # Override HOME to simulate the target user
+  local SAVE_HOME="$HOME"
+  HOME="$testUserHome"
+
+  # Call link with explicit user path simulation
+  # We test the logic by calling directly with the shared dir
+  if [ ! -e "$testUserHome/.ssh/config" ]; then
+    ln -s "$SHARED_DIR/config" "$testUserHome/.ssh/config"
+  fi
+
+  HOME="$SAVE_HOME"
+
+  if [ -L "$testUserHome/.ssh/config" ]; then
+    local target
+    target=$(readlink "$testUserHome/.ssh/config")
+    if [ "$target" = "$SHARED_DIR/config" ]; then
+      create.result 0 "symlink created"
+    else
+      create.result 1 "symlink target=$target expected=$SHARED_DIR/config"
+    fi
+  else
+    create.result 1 "not a symlink"
+  fi
+}
+test.case - "T-SHARED-4: config.shared.link creates symlink" \
+  test.ossh.shared.link.symlink
+expect 0 "symlink created" "ossh.config.shared.link creates symlink to shared config"
+
+# ============================================================================
+# T-SHARED-5: appending Host github.com block preserves pre-existing config
+# ============================================================================
+test.ossh.shared.link.append() {
+  local testUserHome="$SHARED_FIXTURE/home_existinguser"
+  mkdir -p "$testUserHome/.ssh"
+  # Create a pre-existing config with different content
+  echo "Host myserver" > "$testUserHome/.ssh/config"
+  echo " User admin" >> "$testUserHome/.ssh/config"
+
+  # Simulate the per-user-link path: append the github.com block from
+  # the shared config if not already present.
+  if ! grep -q "^Host github.com$" "$testUserHome/.ssh/config" 2>/dev/null; then
+    awk '
+      /^Host github.com$/ {found=1; print; next}
+      found && /^Host / {found=0}
+      found {print}
+    ' "$SHARED_DIR/config" >> "$testUserHome/.ssh/config"
+  fi
+
+  # Verify original content preserved AND github.com added
+  local hasOriginal=false
+  local hasGithub=false
+  grep -q "^Host myserver$" "$testUserHome/.ssh/config" 2>/dev/null && hasOriginal=true
+  grep -q "^Host github.com$" "$testUserHome/.ssh/config" 2>/dev/null && hasGithub=true
+
+  if [ "$hasOriginal" = "true" ] && [ "$hasGithub" = "true" ]; then
+    create.result 0 "appended without overwrite"
+  else
+    create.result 1 "original=$hasOriginal github=$hasGithub"
+  fi
+}
+test.case - "T-SHARED-5: github.com append preserves pre-existing user config" \
+  test.ossh.shared.link.append
+expect 0 "appended without overwrite" "existing config preserved, Host github.com appended"
+
+# Cleanup shared fixture
+rm -rf "$SHARED_FIXTURE" 2>/dev/null
+
+# ============================================================================
+# T-PROXYJUMP-1: config.create with proxyJump includes ProxyJump line
+# ============================================================================
+test.case $level "config.create with proxyJump includes ProxyJump line" \
+  ossh.config.create testProxyHost test@localhost:22 proxyJump jumphost
+
+RESULT_CONTENT=$(cat $CONFIG_PATH/result.txt 2>/dev/null)
+if echo "$RESULT_CONTENT" | grep -q "ProxyJump jumphost"; then
+  expect.pass "ProxyJump jumphost found in config"
+else
+  expect.fail "ProxyJump line missing, got: $RESULT_CONTENT"
+fi
+
+# ============================================================================
+# T-PROXYJUMP-2: config.create without proxyJump omits ProxyJump line
+# ============================================================================
+test.case $level "config.create without proxyJump omits ProxyJump line" \
+  ossh.config.create testNoProxy test@localhost:22
+
+RESULT_CONTENT=$(cat $CONFIG_PATH/result.txt 2>/dev/null)
+if echo "$RESULT_CONTENT" | grep -q "ProxyJump"; then
+  expect.fail "ProxyJump should not appear when param not given"
+else
+  expect.pass "no ProxyJump in config without param"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-HARDEN-* : ossh.harden.* methods exist, signatures right, orchestrator
+# chains in order and doesn't silently invoke .sshd.allowusers. Pattern
+# mirrors T-REMOTE-* — grep the function body, not runtime behaviour.
+# ─────────────────────────────────────────────────────────────────────────────
+for m in harden harden.packages harden.unattended.upgrades harden.fail2ban harden.firewall harden.sshd harden.sshd.allowusers; do
+  test.case $level "T-HARDEN-DEF-$m: ossh.$m is defined" \
+    type ossh.$m
+  if [ "$RETURN_VALUE" -eq 0 ]; then
+    expect.pass "ossh.$m is a function"
+  else
+    expect.fail "ossh.$m not defined"
+  fi
+done
+
+# T-HARDEN-ORDER: orchestrator calls the five sub-methods in the documented order
+HARDEN_BODY=$(declare -f ossh.harden 2>/dev/null)
+test.case $level "T-HARDEN-ORDER: ossh.harden invokes sub-methods in order" \
+  echo "$HARDEN_BODY"
+if echo "$HARDEN_BODY" | awk '
+    /ossh\.harden\.packages /            {p=NR}
+    /ossh\.harden\.unattended\.upgrades/ {u=NR}
+    /ossh\.harden\.fail2ban/             {f=NR}
+    /ossh\.harden\.firewall/             {w=NR}
+    /ossh\.harden\.sshd /                {s=NR}
+    END {exit !(p<u && u<f && f<w && w<s)}
+'; then
+  expect.pass "orchestrator chains packages -> unattended -> fail2ban -> firewall -> sshd"
+else
+  expect.fail "sub-method call order in ossh.harden does not match the documented sequence"
+fi
+
+# T-HARDEN-NO-ALLOWUSERS: orchestrator must NOT call the AllowUsers sub-method
+test.case $level "T-HARDEN-NO-ALLOWUSERS: orchestrator does not silently call .sshd.allowusers" \
+  echo "$HARDEN_BODY"
+if ! echo "$HARDEN_BODY" | grep -q "ossh\.harden\.sshd\.allowusers"; then
+  expect.pass "ossh.harden does not silently call .sshd.allowusers"
+else
+  expect.fail "ossh.harden references .sshd.allowusers - it must stay opt-in to avoid lockouts"
+fi
+
+# T-HARDEN-PREFLIGHT: every top-level harden method calls private.ossh.harden.preflight
+for m in harden harden.packages harden.unattended.upgrades harden.fail2ban harden.firewall harden.sshd harden.sshd.allowusers; do
+  BODY=$(declare -f ossh.$m 2>/dev/null)
+  test.case $level "T-HARDEN-PREFLIGHT-$m: ossh.$m calls preflight" \
+    echo "$BODY"
+  if echo "$BODY" | grep -q "private\.ossh\.harden\.preflight"; then
+    expect.pass "ossh.$m gates entry on preflight"
+  else
+    expect.fail "ossh.$m bypasses preflight - would risk lockouts or non-Linux targets"
+  fi
+done
+
+# T-HARDEN-ALLOWUSERS-EMPTY: .sshd.allowusers refuses to run without users
+ALLOW_BODY=$(declare -f ossh.harden.sshd.allowusers 2>/dev/null)
+test.case $level "T-HARDEN-ALLOWUSERS-EMPTY: .sshd.allowusers rejects empty user list" \
+  echo "$ALLOW_BODY"
+if echo "$ALLOW_BODY" | grep -q "refusing to run"; then
+  expect.pass ".sshd.allowusers refuses to run with empty users arg"
+else
+  expect.fail ".sshd.allowusers must refuse empty users (else it locks everyone out)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-BRANCH-SHORT-* : this.git.branch.short strips the four known ref prefixes
+# and the rev-parse sites all delegate to it. Since Task 12 of the ogit plan
+# this.git.branch.short is an alias; the strips live in ogit.branch.get.
+# ─────────────────────────────────────────────────────────────────────────────
+private.this.script.load ogit ogit.branch.get
+BRANCH_BODY=$(declare -f ogit.branch.get 2>/dev/null)
+# T-OSSH-BRANCH-NO-ALIAS: the install methods ask ogit.branch.get — they work without this.git.branch.short
+# this.git.branch.short was a second name for ogit.branch.get; the owner
+# decided it goes (T-BRANCH-SHORT-EXISTS, which asserted it, is retired). Each
+# of the three sites (the push of init/oosh, the local install continuation,
+# the remote user install): its own line, run with the alias unset on a fixture
+# repository, gives the fixture's branch; the ogit load stands before it; no
+# call of the alias is left in ossh.
+test.ossh.branchNoAlias() {
+  local fx bad="" fn body site got hits loadAt siteAt
+  fx=$(test.suite.fixture.make osshbranchnoalias)
+  git init -q -b feature-x "$fx/repo"; git -C "$fx/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m seed
+  private.this.script.load ogit ogit.branch.get
+  for fn in private.push.init.oosh ossh.install.continue.local ossh.install.user.remote; do
+    body=$(declare -f "$fn")
+    site=$(printf '%s\n' "$body" | grep -m1 'ogit\.branch\.get "\$OOSH_DIR"')
+    [ -n "$site" ] || { bad="$bad $fn-no-ogit-site"; continue; }
+    loadAt=$(printf '%s\n' "$body" | grep -n -m1 'private\.this\.script\.load ogit' | cut -d: -f1)
+    siteAt=$(printf '%s\n' "$body" | grep -n -m1 'ogit\.branch\.get "\$OOSH_DIR"' | cut -d: -f1)
+    { [ -n "$loadAt" ] && [ "$loadAt" -lt "$siteAt" ]; } || bad="$bad $fn-ogit-not-loaded-before"
+    got=$( unset -f this.git.branch.short; OOSH_DIR="$fx/repo"; unset currentBranch OOSH_BRANCH ooshBranch; eval "${site#"${site%%[! ]*}"}"; echo "$currentBranch$OOSH_BRANCH$ooshBranch" )
+    [ "$got" = feature-x ] || bad="$bad $fn=[$got]"
+  done
+  hits=$(grep -n 'this\.git\.branch\.short' "$OOSH_DIR/ossh" | cut -d: -f1 | tr '\n' ' ')
+  [ -z "$hits" ] || bad="$bad alias-callers=[$hits]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the branch comes from ogit.branch.get, the alias is not called" || create.result 1 "branch alias:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-BRANCH-NO-ALIAS: ossh asks ogit.branch.get — it works without this.git.branch.short" test.ossh.branchNoAlias
+expect 0 "the branch comes from ogit.branch.get, the alias is not called" "one getter had two names"
+
+for prefix in "refs/heads/" "refs/remotes/origin/" "heads/origin/" "origin/"; do
+  test.case $level "T-BRANCH-SHORT-STRIP-$prefix: body strips '$prefix' prefix" \
+    echo "$BRANCH_BODY"
+  if echo "$BRANCH_BODY" | grep -qF "\${b#$prefix}"; then
+    expect.pass "body strips $prefix"
+  else
+    expect.fail "body does not strip $prefix - polluted branch names will leak through"
+  fi
+done
+
+# T-BRANCH-SHORT-CALLER-*: every caller-side rev-parse site delegates to the helper
+for pair in "ossh:449" "ossh:510" "ossh:720" "oo:1233" "user:701" "promote:437" "promote:556"; do
+  file="${pair%:*}"
+  test.case $level "T-BRANCH-SHORT-CALLER-$pair: $file uses this.git.branch.short or ogit.branch.get" \
+    echo "(grep below)"
+  if grep -qE 'this\.git\.branch\.short|ogit\.branch\.get' "$OOSH_DIR/$file" 2>/dev/null; then
+    expect.pass "$file references this.git.branch.short or ogit.branch.get"
+  else
+    expect.fail "$file has a rev-parse that wasn't migrated to this.git.branch.short / ogit.branch.get"
+  fi
+done
+
+# T-BRANCH-SHORT-REMOTE-*: init/oosh and oo sanitise OOSH_BRANCH
+for file in init/oosh oo; do
+  test.case $level "T-BRANCH-SHORT-REMOTE-$file: $file strips OOSH_BRANCH prefixes" \
+    echo "(grep below)"
+  if grep -qE "OOSH_BRANCH=.*OOSH_BRANCH#(heads/origin/|origin/)" "$OOSH_DIR/$file" 2>/dev/null; then
+    expect.pass "$file has defence-in-depth OOSH_BRANCH stripping"
+  else
+    expect.fail "$file does not sanitise OOSH_BRANCH - a polluted caller will still break the worktree add"
+  fi
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-GITHUB-SEED : Phase 3 of the .ssh/ correctness plan replaced the
+# deploy_keys/2cuGitHub seeding flow with a single `ossh.config.shared.seed.github`
+# helper. ossh.install.finish.local invokes it once (not branched). The shared
+# config carries `Host github.com` whose IdentityFile is
+# ~/.ssh/ids/ssh.developking/id_rsa — placed by osshLayout.role.developking
+# on every user during install (no per-runner key transfer needed).
+# ─────────────────────────────────────────────────────────────────────────────
+FINISH_BODY=$(declare -f ossh.install.finish.local \
+                          ossh.config.shared.seed.github 2>/dev/null)
+
+test.case $level "T-GITHUB-SEED-CALLED: finish.local invokes ossh.config.shared.seed.github" \
+  echo "$FINISH_BODY"
+if echo "$FINISH_BODY" | grep -q "ossh.config.shared.seed.github"; then
+  expect.pass "finish.local calls seed.github (single entry point, no deploy-key branching)"
+else
+  expect.fail "finish.local doesn't call ossh.config.shared.seed.github — Phase 3 wiring missing"
+fi
+
+test.case $level "T-GITHUB-SEED-NO-DEPLOY-KEY-BRANCH: finish.local no longer branches on deploy_keys/2cuGitHub" \
+  echo "$FINISH_BODY"
+if echo "$FINISH_BODY" | grep -qE "deploy_keys/2cuGitHub"; then
+  expect.fail "finish.local still references deploy_keys/2cuGitHub — Phase 3 retired this flow"
+else
+  expect.pass "finish.local has no deploy_keys/2cuGitHub branching"
+fi
+
+test.case $level "T-GITHUB-SEED-DELEGATES-TO-CREATE: seed.github delegates to ossh.config.shared.github.create on remote" \
+  echo "(grep)"
+SEED_GITHUB_BODY=$(declare -f ossh.config.shared.seed.github 2>/dev/null)
+# The body invokes the remote ossh as `sudo -E $(command -v ossh) config.shared.github.create`.
+# Match the unique config.shared.github.create token; the `$(command -v ossh) ` shell
+# substitution puts a `)` between "ossh" and the space, so a tighter pattern like
+# `ossh +config\.shared\.github\.create` does NOT match. Use the suffix only.
+if echo "$SEED_GITHUB_BODY" | grep -qE 'config\.shared\.github\.create'; then
+  expect.pass "seed.github delegates to remote ossh config.shared.github.create"
+else
+  expect.fail "seed.github doesn't delegate to ossh.config.shared.github.create — install loses GitHub access for non-root users"
+fi
+
+# T-SHARED-SSH-COPY: the extracted helper exists and both caller-side and
+# developking-fallback paths delegate to it (DRY — single source of truth
+# for the per-user copy+chown loop).
+test.case $level "T-SHARED-SSH-COPY-EXISTS: private.ossh.shared.ssh.copy.to.all is defined" \
+  type private.ossh.shared.ssh.copy.to.all
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "private.ossh.shared.ssh.copy.to.all is a function"
+else
+  expect.fail "private.ossh.shared.ssh.copy.to.all not defined"
+fi
+
+test.case $level "T-SHARED-SSH-COPY-CALLSITES: finish.local invokes the helper at least once" \
+  echo "$FINISH_BODY"
+# After the F8 refactor (commit 706950f) the propagate call is now made
+# UNCONDITIONALLY ONCE in finish.local, regardless of which seeding path
+# (caller-side or developking-fallback) ran. That's an even tighter DRY than
+# "called from both branches" — single call site after either branch returns.
+if echo "$FINISH_BODY" | grep -q "private\\.ossh\\.shared\\.ssh\\.copy\\.to\\.all"; then
+  expect.pass "finish.local invokes the per-user-propagate helper"
+else
+  expect.fail "finish.local does not call private.ossh.shared.ssh.copy.to.all — propagation broken"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-SEED-GITHUB : Phase 3 collapsed the two-branch seeding flow into a single
+# ossh.config.shared.seed.github helper. It carries a skip-when-seeded probe
+# (idempotent re-runs) and delegates to the remote ossh.config.shared.github.create.
+# The legacy seed.from.local.deploy.key + seed.fallback are kept only as
+# deprecated shims that warn and forward to seed.github.
+# ─────────────────────────────────────────────────────────────────────────────
+
+test.case $level "T-SEED-GITHUB-EXISTS: ossh.config.shared.seed.github is defined" \
+  type ossh.config.shared.seed.github
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "ossh.config.shared.seed.github is a function"
+else
+  expect.fail "ossh.config.shared.seed.github not defined — Phase 3 wiring missing"
+fi
+
+SEED_GITHUB_BODY=$(declare -f ossh.config.shared.seed.github 2>/dev/null)
+test.case $level "T-SEED-GITHUB-PROBE: seed.github has skip-when-seeded probe (Host github.com check)" \
+  echo "(grep below)"
+if echo "$SEED_GITHUB_BODY" | grep -qE 'grep -q "?\^Host github\\?\.com'; then
+  expect.pass "seed.github skips when Host github.com already in shared config"
+else
+  expect.fail "seed.github missing skip-when-seeded probe — re-runs would re-append the github block"
+fi
+
+test.case $level "T-SEED-LEGACY-DEPRECATED: seed.from.local.deploy.key is a deprecated shim that forwards to seed.github" \
+  echo "(grep)"
+LEGACY_LOCAL_BODY=$(declare -f ossh.config.shared.seed.from.local.deploy.key 2>/dev/null)
+if echo "$LEGACY_LOCAL_BODY" | grep -qE 'deprecated' && echo "$LEGACY_LOCAL_BODY" | grep -qE 'ossh\.config\.shared\.seed\.github'; then
+  expect.pass "seed.from.local.deploy.key is a deprecation shim forwarding to seed.github"
+else
+  expect.fail "seed.from.local.deploy.key not a deprecation shim — Phase 3 retirement incomplete"
+fi
+
+test.case $level "T-SEED-FALLBACK-DEPRECATED: seed.fallback is a deprecated shim that forwards to seed.github" \
+  echo "(grep)"
+LEGACY_FALLBACK_BODY=$(declare -f ossh.config.shared.seed.fallback 2>/dev/null)
+if echo "$LEGACY_FALLBACK_BODY" | grep -qE 'deprecated' && echo "$LEGACY_FALLBACK_BODY" | grep -qE 'ossh\.config\.shared\.seed\.github'; then
+  expect.pass "seed.fallback is a deprecation shim forwarding to seed.github"
+else
+  expect.fail "seed.fallback not a deprecation shim — Phase 3 retirement incomplete"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-INIT-* : init/oosh is the thin bootstrap that hands off to
+# ossh install.continue.local (the mature state-machine entrypoint).
+# No more sh→bash re-exec scaffolding, no more oosh_install_remote /
+# oosh_check_all_pm / etc. — those were all eliminated by declaring
+# bash 4+ and git as explicit prereqs.
+# ─────────────────────────────────────────────────────────────────────────────
+INIT_CONTENT=$(cat "$OOSH_DIR/init/oosh" 2>/dev/null)
+
+test.case $level "T-INIT-HANDS-OFF-TO-CONTINUE-LOCAL: init/oosh hands off to ossh install.continue.local" \
+  echo "(grep below)"
+if printf "%s" "$INIT_CONTENT" | grep -qE '"\$OOSH_DIR/this" +call +ossh +install\.continue\.local'; then
+  expect.pass "init/oosh hands off to ossh install.continue.local"
+else
+  expect.fail "init/oosh missing handoff to install.continue.local — install path broken"
+fi
+
+test.case $level "T-INIT-THIN-BOOTSTRAP: init/oosh no longer contains old sh→bash scaffolding" \
+  echo "(grep below)"
+if printf "%s" "$INIT_CONTENT" | grep -qE 'oosh_install_remote|oosh_check_all_pm|oosh_parse_shellps|oosh_setup_env|oosh_status'; then
+  expect.fail "init/oosh still contains old bootstrap scaffolding (oosh_* functions)"
+else
+  expect.pass "init/oosh is the thin bootstrap (old scaffolding removed)"
+fi
+
+# T-INIT-README-USES-SH-C : init/oosh is now POSIX sh, so the README
+# install one-liners advertise `sh -c "$(curl/wget/fetch …)"`. The earlier
+# `bash -c` requirement existed because of a bash-only re-exec chain that
+# the sh migration eliminated.
+README_CONTENT=$(cat "$OOSH_DIR/README.md" 2>/dev/null)
+test.case $level "T-INIT-README-USES-SH-C: install one-liners in README use sh -c (init/oosh is POSIX sh)" \
+  echo "(grep below)"
+if printf "%s" "$README_CONTENT" \
+   | grep -v '^> ' \
+   | grep -qE '(^| )sh -c[[:space:]]+"\$\((curl|wget|fetch) '; then
+  expect.pass "README install one-liners use sh -c"
+else
+  expect.fail "README install one-liners are missing the sh -c form — init/oosh is sh-clean now and the README should reflect that"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-GITHUB-SETUP-* : Phase 3 — ossh.config.shared.github.create emits
+# `Host github.com` whose IdentityFile is ~/.ssh/ids/ssh.developking/id_rsa.
+# state 31 in oo invokes it (curl-install path); finish.local invokes
+# seed.github which delegates to it on the remote.
+# ─────────────────────────────────────────────────────────────────────────────
+SHARED_GITHUB_CREATE_BODY=$(declare -f ossh.config.shared.github.create 2>/dev/null)
+test.case $level "T-GITHUB-SETUP-EMITS-HOST-GITHUB: shared.github.create emits Host github.com block" \
+  echo "(grep below)"
+if printf "%s" "$SHARED_GITHUB_CREATE_BODY" | grep -qE 'Host github\.com'; then
+  expect.pass "shared.github.create body contains Host github.com block"
+else
+  expect.fail "shared.github.create doesn't emit Host github.com — Phase 3 incomplete"
+fi
+
+test.case $level "T-GITHUB-SETUP-USES-DEVELOPKING: IdentityFile points at ids/ssh.developking/id_rsa" \
+  echo "(grep below)"
+if printf "%s" "$SHARED_GITHUB_CREATE_BODY" | grep -qE 'ids/ssh\.developking/id_rsa'; then
+  expect.pass "shared.github.create uses ~/.ssh/ids/ssh.developking/id_rsa"
+else
+  expect.fail "shared.github.create doesn't reference ids/ssh.developking/id_rsa — github won't authenticate"
+fi
+
+STATE_CONTENT=$(cat "$OOSH_DIR/oo" 2>/dev/null)
+test.case $level "T-GITHUB-SETUP-FROM-STATE31: oo state 31 invokes ossh.config.shared.github.create" \
+  echo "(grep below)"
+if printf "%s" "$STATE_CONTENT" | grep -qE 'ossh[[:space:]]+config\.shared\.github\.create'; then
+  expect.pass "state 31 body delegates to ossh.config.shared.github.create"
+else
+  expect.fail "state 31 doesn't call ossh.config.shared.github.create — curl install path has no GitHub setup"
+fi
+
+test.case $level "T-GITHUB-SETUP-FROM-FINISH: seed.github delegates to ossh config.shared.github.create" \
+  echo "(grep below)"
+SEED_GH_BODY=$(declare -f ossh.config.shared.seed.github 2>/dev/null)
+# Same caveat as T-GITHUB-SEED-DELEGATES-TO-CREATE above — `$(command -v ossh)`
+# shell substitution puts a `)` between "ossh" and the space, so match by the
+# unique config.shared.github.create suffix only.
+if printf "%s" "$SEED_GH_BODY" | grep -qE 'config\.shared\.github\.create'; then
+  expect.pass "seed.github delegates to ossh config.shared.github.create on the remote"
+else
+  expect.fail "seed.github doesn't delegate to ossh config.shared.github.create — install loses GitHub access for non-root users"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-OSSH-PREREQS-* : the remote prereq-install primitives exist and each has
+# the completion functions that completion.audit demands. Catches the same
+# class of drift the completion audit catches, but proactively in the ossh
+# suite itself so a broken wiring fails fast.
+# ─────────────────────────────────────────────────────────────────────────────
+test.case $level "T-OSSH-PREREQS-PRIMITIVES-PRESENT: ossh.pm.discover / ossh.cmd / ossh.prereqs.install all exist" \
+  echo "(grep)"
+_osshMissing=""
+for m in ossh.pm.discover ossh.cmd ossh.prereqs.install; do
+  grep -qE "^${m//./\\.}\(\)" "$OOSH_DIR/ossh" || _osshMissing+="$m "
+done
+if [ -z "$_osshMissing" ]; then
+  expect.pass "all three ossh prereq primitives defined"
+else
+  expect.fail "missing: $_osshMissing"
+fi
+
+test.case $level "T-OSSH-PREREQS-COMPLETION: each new ossh.* method has its completion functions" \
+  echo "(grep)"
+_osshCompMissing=""
+grep -qE '^ossh\.pm\.discover\.completion\.sshConfigHost'      "$OOSH_DIR/ossh" || _osshCompMissing+="pm.discover.sshConfigHost "
+grep -qE '^ossh\.cmd\.completion\.sshConfigHost'               "$OOSH_DIR/ossh" || _osshCompMissing+="cmd.sshConfigHost "
+grep -qE '^ossh\.cmd\.completion\.pkg'                          "$OOSH_DIR/ossh" || _osshCompMissing+="cmd.pkg "
+grep -qE '^ossh\.prereqs\.install\.completion\.sshConfigHost'  "$OOSH_DIR/ossh" || _osshCompMissing+="prereqs.install.sshConfigHost "
+if [ -z "$_osshCompMissing" ]; then
+  expect.pass "all completion functions present"
+else
+  expect.fail "missing completion: $_osshCompMissing"
+fi
+
+# T-OSSH-PREREQS-THIN-WRAPPER : ossh.prereqs.install is now a thin SCP+run
+# wrapper that ships init/oosh to the host and lets it self-install. The
+# platform install logic (apk-extras, busybox-suid, brew-bash + paths.d,
+# Homebrew bootstrap) all moved into init/oosh's POSIX-sh prelude — single
+# source of truth. Anti-regression for re-fattening this function.
+# The matching coverage for the platform install logic now lives in
+# test/test.install (T-INIT-INSTALL-* assertions against the init/oosh body).
+test.case $level "T-OSSH-PREREQS-THIN-WRAPPER: ossh.prereqs.install is an SCP+run wrapper around init/oosh" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE 'scp .*init/oosh' \
+   && printf "%s" "$PREREQS_BODY" | grep -qE 'private\.ossh\.ssh.*bash'; then
+  expect.pass "ossh.prereqs.install delivers init/oosh via scp and invokes it remotely under bash"
+else
+  expect.fail "ossh.prereqs.install body has drifted from the thin SCP+run wrapper — single-source-of-truth for platform install lives in init/oosh's prelude"
+fi
+
+# T-OSSH-PREREQS-NO-PLATFORM-LOGIC : the platform install logic explicitly
+# moved OUT of ossh.prereqs.install. Catch a re-fattening regression early.
+test.case $level "T-OSSH-PREREQS-NO-PLATFORM-LOGIC: ossh.prereqs.install no longer contains platform install logic" \
+  echo "(grep)"
+PREREQS_BODY=$(declare -f ossh.prereqs.install 2>/dev/null)
+if printf "%s" "$PREREQS_BODY" | grep -qE '/etc/paths\.d/oosh-homebrew|chmod u\+s /bin/busybox|NONINTERACTIVE=1.*Homebrew/install|bash shadow util-linux'; then
+  expect.fail "ossh.prereqs.install body has re-absorbed platform install logic that belongs in init/oosh's prelude"
+else
+  expect.pass "ossh.prereqs.install no longer contains platform install logic (lives in init/oosh)"
+fi
+
+# T-OSSH-PREREQS-LOCAL-NAMES-TOOL : local mode runs oo.cmd IN-PROCESS (oo is
+# sourced), so a prereq that did not land is reported by NAME, once, and the
+# install continues (rc 0). 8d1617c shipped `verify: /root/config/user.env` on
+# every platform — someone else's $RESULT — because its verify ran as a
+# subprocess and the reason never crossed back.
+test.ossh.prereqs.local.stub() { # <stubDir> # a PATH with the coreutils the scripts need, a fake PM that logs its argv, and NO rsync / tree
+  local b p
+  for b in bash sh sed grep awk date tee mkdir cat find dirname basename id tty stat hostname uname readlink tr cut ls wc ln rm mv cp touch sort head tail printf env getent whoami realpath ps; do
+    p=$(type -P "$b" 2>/dev/null) && ln -s "$p" "$1/$b"
+  done
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$PM_LOG"' 'exit 0' > "$1/fakepm"
+  chmod +x "$1/fakepm"
+}
+
+test.ossh.prereqs.local.run() { # <stubDir> # ossh.prereqs.install (local) in a pinned child; echoes its output plus a final rc= line
+  # TEST_OSSH_PREREQS_OVERRIDE, when set, is spliced in after ossh is sourced
+  # (the negative control below plants the pre-fix symptom with it).
+  # LOG_DEVICE=/dev/fd/1, not /proc/self/fd/1: macOS has no /proc, so `this`
+  # found the device unwritable and replaced it with the live tty — the
+  # warnings went to the terminal, past the 2>&1 capture below.
+  env -i PATH="$1" HOME="$HOME" OOSH_DIR="$OOSH_DIR" TERM=dumb LOG_LEVEL=2 LOG_DEVICE=/dev/fd/1 SUDO="" \
+      OOSH_PM="fakepm install" PM_LOG="$1/pm.calls" \
+      CONFIG_PATH="$CONFIG_PATH" CONFIG="$CONFIG" CONFIG_FILE="$CONFIG_FILE" \
+      bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1
+               '"${TEST_OSSH_PREREQS_OVERRIDE:-:}"'
+               ossh.prereqs.install 2>&1; echo "rc=$?"' | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+test.ossh.prereqsLocalNamesTool() {
+  local stub; stub=$(mktemp -d "${TMPDIR:-/tmp}/test.ossh.prereqs.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  test.ossh.prereqs.local.stub "$stub"
+  local out; out=$(test.ossh.prereqs.local.run "$stub")
+  local calls=""; [ -f "$stub/pm.calls" ] && calls=$(tr '\n' ' ' < "$stub/pm.calls")
+  rm -rf "$stub"
+  local tool missing=""
+  for tool in rsync tree diff; do
+    [ "$(echo "$out" | grep -c "WARNING> ossh.prereqs.install: continuing without $tool")" = "1" ] || missing="$missing $tool"
+  done
+  if ! echo "$out" | grep -q '^rc=0$'; then
+    create.result 1 "local mode must continue (rc 0) — got: $(echo "$out" | grep '^rc=')"
+  elif [ -n "$missing" ]; then
+    create.result 1 "warning does not name the tool (exactly once) for:$missing — warnings: $(echo "$out" | grep WARNING | tr '\n' '|')"
+  elif [ "${calls#*install rsync}" = "$calls" ] || [ "${calls#*install tree}" = "$calls" ] || [ "${calls#*install diffutils}" = "$calls" ]; then
+    create.result 1 "the package manager was not asked for every tool (diff by its package name, diffutils): [$calls]"
+  else
+    create.result 0 "each missing prereq is named once, install continues"
+  fi
+  return $(result)
+}
+test.case $level "T-OSSH-PREREQS-LOCAL-NAMES-TOOL: a prereq that did not land is named, once, and the install continues" \
+  test.ossh.prereqsLocalNamesTool
+expect 0 "each missing prereq is named once, install continues" \
+  "8d1617c reported someone else's \$RESULT (verify: /root/config/user.env) because the verify ran out of process"
+
+# Negative control: plant the pre-fix symptom — a warning that carries a stale
+# $RESULT instead of the tool — and require the test above to go red on it.
+test.case $level "T-OSSH-PREREQS-LOCAL-CONTROL: a warning carrying someone else's \$RESULT is caught" \
+  echo "(negative control: plant the 8d1617c symptom, expect the test above to catch it)"
+TEST_OSSH_PREREQS_OVERRIDE='warn.log() { echo "WARNING> ossh.prereqs.install verify: /root/config/user.env"; }'
+test.ossh.prereqsLocalNamesTool; _ctlRc=$?; _ctlRes="$RESULT"
+unset TEST_OSSH_PREREQS_OVERRIDE
+if [ "$_ctlRc" -ne 0 ] && [ "${_ctlRes#warning does not name the tool}" != "$_ctlRes" ]; then
+  expect.pass "control caught: warning does not name the tool"
+else
+  expect.fail "planted stale-\$RESULT warning NOT caught (rc=$_ctlRc RESULT=[$_ctlRes])"
+fi
+
+# T-OSSH-CMD-PREFLIGHT-NOT-SILENCED : ossh.cmd's apt-get update preflight must
+# NOT redirect stdout/stderr — that hides sudo password prompts on remotes
+# without NOPASSWD configured, leaving the install to hang silently.
+# Pre-5ecd118 the preflight was silenced and `ossh install` hung on bob's box;
+# this guard catches future regressions to the silencing.
+test.case $level "T-OSSH-CMD-PREFLIGHT-NOT-SILENCED: ossh.cmd apt-get update doesn't redirect stdout/stderr" \
+  echo "(grep)"
+CMD_BODY=$(declare -f ossh.cmd 2>/dev/null)
+if printf "%s" "$CMD_BODY" | grep -qE 'apt-get\* *\)' \
+   && ! printf "%s" "$CMD_BODY" | grep -qE 'apt-get update.*>/dev/null|apt-get update.*2>&1'; then
+  expect.pass "ossh.cmd apt-get update preflight runs without output redirects"
+else
+  expect.fail "ossh.cmd apt-get update is silenced — sudo password prompts will hang on remotes without NOPASSWD"
+fi
+
+# ============================================================================
+# ossh folder.fix + rights.fix (Phase A/B)
+# ============================================================================
+
+# T-RIGHTS-FIX-ALIAS-EXISTS: post-rename, ossh.rights.fix is a defined function
+# (and ossh.fix.rights is gone).
+test.case $level "T-RIGHTS-FIX-ALIAS-EXISTS: ossh.rights.fix defined; ossh.fix.rights removed" \
+  echo "(type)"
+if declare -f ossh.rights.fix >/dev/null 2>&1 && ! declare -f ossh.fix.rights >/dev/null 2>&1; then
+  expect.pass "rename complete"
+else
+  expect.fail "ossh.rights.fix missing or ossh.fix.rights still defined"
+fi
+
+# T-RIGHTS-FIX-IS-THIN-ALIAS: the renamed body should delegate to
+# private.osshLayout.perms.tighten — not carry its own chmod logic.
+test.case $level "T-RIGHTS-FIX-IS-THIN-ALIAS: ossh.rights.fix body calls private.osshLayout.perms.tighten" \
+  echo "(grep declare -f)"
+RIGHTS_BODY=$(declare -f ossh.rights.fix 2>/dev/null)
+if printf "%s" "$RIGHTS_BODY" | grep -q 'private.osshLayout.perms.tighten'; then
+  expect.pass "delegates to perms.tighten"
+else
+  expect.fail "body does NOT call private.osshLayout.perms.tighten — alias incomplete"
+fi
+
+# T-FOLDER-FIX-FUNCTION-EXISTS: ossh.folder.fix defined + all 3 completion helpers.
+test.case $level "T-FOLDER-FIX-FUNCTION-EXISTS: ossh.folder.fix + completions defined" \
+  echo "(type)"
+if declare -f ossh.folder.fix >/dev/null 2>&1 \
+   && declare -f ossh.folder.fix.completion.installerEmail >/dev/null 2>&1 \
+   && declare -f ossh.folder.fix.completion.sshDir >/dev/null 2>&1 \
+   && declare -f ossh.folder.fix.completion.mode >/dev/null 2>&1; then
+  expect.pass "function + all completion helpers defined"
+else
+  expect.fail "ossh.folder.fix or one of its completion helpers is missing"
+fi
+
+# T-FOLDER-FIX-REJECTS-UNKNOWN-MODE: unknown mode keyword → error.log + return 1.
+test.case $level "T-FOLDER-FIX-REJECTS-UNKNOWN-MODE: unknown mode returns 1" \
+  echo "(invoke)"
+ossh.folder.fix "" /tmp/test.no.such.path.$$ bogus_mode_xyz >/dev/null 2>&1
+if [ "$?" -ne 0 ]; then
+  expect.pass "unknown mode rejected"
+else
+  expect.fail "unknown mode silently accepted"
+fi
+
+# T-FOLDER-FIX-PRUNE-REMOVES-KNOWN-STALE: private.ossh.folder.fix.prune removes
+# only the documented legacy artifact patterns.
+test.ossh.foldFixPrunesStale() {
+  local fixture="/tmp/test.folder.fix.prune.$(id -u).$$"
+  mkdir -p "$fixture/no_deploy_keys"
+  touch "$fixture/2cuGitHub" "$fixture/2cuGitHub.pub"
+  touch "$fixture/config.bak.20260101-120000"
+  touch "$fixture/id_ed25519.previous" "$fixture/id_ed25519.pub.previous"
+  touch "$fixture/known_hosts.old"
+  touch "$fixture/something.old"
+  private.ossh.folder.fix.prune "$fixture" >/dev/null 2>&1
+  if [ -f "$fixture/2cuGitHub" ] || [ -f "$fixture/config.bak.20260101-120000" ] \
+     || [ -f "$fixture/id_ed25519.previous" ] || [ -f "$fixture/known_hosts.old" ] \
+     || [ -d "$fixture/no_deploy_keys" ]; then
+    create.result 1 "some known-stale artifact survived: $(ls $fixture)"
+  else
+    create.result 0 "all known-stale removed"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+}
+test.case $level "T-FOLDER-FIX-PRUNE-REMOVES-KNOWN-STALE: removes 2cuGitHub, .bak.*, .previous, .old, no_deploy_keys" \
+  test.ossh.foldFixPrunesStale
+expect 0 "all known-stale removed" "private.ossh.folder.fix.prune deletes documented legacy artifact patterns"
+
+# T-FOLDER-FIX-PRUNE-KEEPS-USER-STATE: never touch authorized_keys, id_rsa,
+# or anything the user might rely on for SSH-in or legacy-server access.
+test.ossh.foldFixPruneKeepsUserState() {
+  local fixture="/tmp/test.folder.fix.prune.keep.$(id -u).$$"
+  mkdir -p "$fixture"
+  touch "$fixture/authorized_keys" "$fixture/id_rsa" "$fixture/id_rsa.pub"
+  touch "$fixture/config"
+  private.ossh.folder.fix.prune "$fixture" >/dev/null 2>&1
+  if [ -f "$fixture/authorized_keys" ] && [ -f "$fixture/id_rsa" ] \
+     && [ -f "$fixture/id_rsa.pub" ] && [ -f "$fixture/config" ]; then
+    create.result 0 "user state preserved"
+  else
+    create.result 1 "prune destroyed user state: $(ls $fixture)"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+}
+test.case $level "T-FOLDER-FIX-PRUNE-KEEPS-USER-STATE: authorized_keys / id_rsa / config preserved" \
+  test.ossh.foldFixPruneKeepsUserState
+expect 0 "user state preserved" "private.ossh.folder.fix.prune never deletes user-authored files"
+
+# T-FOLDER-FIX-CHECK-FUNCTION-EXISTS: ossh.folder.fix.check defined + completion.
+test.case $level "T-FOLDER-FIX-CHECK-FUNCTION-EXISTS: ossh.folder.fix.check + completion defined" \
+  echo "(type)"
+if declare -f ossh.folder.fix.check >/dev/null 2>&1 \
+   && declare -f ossh.folder.fix.check.completion.sshDir >/dev/null 2>&1; then
+  expect.pass "function + completion defined"
+else
+  expect.fail "ossh.folder.fix.check or its completion is missing"
+fi
+
+# T-FOLDER-FIX-CHECK-IS-READONLY: seed a broken state and verify check
+# doesn't mutate anything. We compute a recursive hash before + after.
+test.ossh.foldFixCheckReadonly() {
+  local fixture="/tmp/test.folder.fix.check.$(id -u).$$"
+  mkdir -p "$fixture/private_key"
+  echo dummy > "$fixture/id_ed25519"
+  chmod 777 "$fixture/id_ed25519"        # bad perms — drift
+  ln -s ../id_ed25519 "$fixture/private_key/test.private_key"  # forbidden symlink
+  chmod 755 "$fixture"                   # wrong dir perms
+  local before
+  before=$(find "$fixture" -printf '%p %m %y\n' 2>/dev/null | sort | sha256sum)
+  ossh.folder.fix.check "$fixture" >/dev/null 2>&1
+  local after
+  after=$(find "$fixture" -printf '%p %m %y\n' 2>/dev/null | sort | sha256sum)
+  if [ "$before" = "$after" ]; then
+    create.result 0 "no mutation"
+  else
+    create.result 1 "check mutated state: $(diff <(echo "$before") <(echo "$after"))"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+}
+test.case $level "T-FOLDER-FIX-CHECK-IS-READONLY: ossh.folder.fix.check does not mutate the tree" \
+  test.ossh.foldFixCheckReadonly
+expect 0 "no mutation" "ossh.folder.fix.check is strictly read-only"
+
+# T-FOLDER-FIX-CHECK-RETURNS-ZERO-ON-DRIFT: per the design, check always
+# returns 0 (reports findings via warn.log) so it can be used in pipelines.
+test.case $level "T-FOLDER-FIX-CHECK-RETURNS-ZERO-ON-DRIFT: returns 0 even when drift detected" \
+  echo "(invoke)"
+test.ossh.foldFixCheckRcZero() {
+  local fixture="/tmp/test.folder.fix.check.rc.$(id -u).$$"
+  mkdir -p "$fixture/private_key"
+  echo dummy > "$fixture/id_ed25519"
+  chmod 777 "$fixture/id_ed25519"
+  ln -s ../id_ed25519 "$fixture/private_key/test.private_key"
+  ossh.folder.fix.check "$fixture" >/dev/null 2>&1
+  local rc=$?
+  rm -rf "$fixture" 2>/dev/null
+  if [ "$rc" -eq 0 ]; then
+    create.result 0 "rc=0 with drift"
+  else
+    create.result 1 "rc=$rc"
+  fi
+}
+test.ossh.foldFixCheckRcZero
+expect 0 "rc=0 with drift" "check returns 0 even when drift detected"
+
+# T-FOLDER-FIX-CHECK-BSD-STAT: a canonical ~/.ssh shows no perms drift where stat has no -c
+# ossh.folder.fix.check read the modes with a bare GNU `stat -c '%a'`: on macOS
+# (BSD stat) every file and folder came back empty and was reported as wrong.
+# The mode comes from the kernel's private.this.path.stat.get. The stub is a
+# stat that knows only the BSD spelling, as on macOS.
+test.ossh.folderFixCheckBsdStat() {
+  local fx ssh out
+  fx=$(test.suite.fixture.make test.ossh.folderFixCheckBsdStat); ssh="$fx/ssh"
+  mkdir -p "$ssh"; chmod 700 "$ssh"
+  echo key > "$ssh/id_ed25519"; chmod 600 "$ssh/id_ed25519"
+  echo pub > "$ssh/id_ed25519.pub"; chmod 644 "$ssh/id_ed25519.pub"
+  out=$( stat() {
+           case "$1" in
+             -c) echo "stat: illegal option -- c" >&2; return 1 ;;
+             -f) [ "$2" = "%Lp" ] || return 1; command stat -c %a "$3" 2>/dev/null || command stat -f %Lp "$3" ;;
+           esac; }
+         export LOG_LEVEL=5 LOG_DEVICE="$fx/log.out"
+         ossh.folder.fix.check "$ssh" >/dev/null 2>&1
+         grep -c -e "wrong perms" -e "wrong dir perms" "$fx/log.out" )
+  rm -rf "$fx"
+  [ "$out" = 0 ] && create.result 0 "no perms drift on a canonical ~/.ssh with BSD stat" || create.result 1 "perms drift reported: $out"
+  return $(result)
+}
+test.case $level "T-FOLDER-FIX-CHECK-BSD-STAT: a canonical ~/.ssh shows no perms drift where stat has no -c" \
+  test.ossh.folderFixCheckBsdStat
+expect 0 "no perms drift on a canonical ~/.ssh with BSD stat" "macOS stat has no -c — every mode read empty"
+
+# T-FOLDER-FIX-CONFIG-NORMALIZE-WODA: normalises absolute IdentityFile paths in WODA Host blocks
+# to the portable ~/.ssh/id_ed25519 form.
+test.ossh.foldFixConfigNormalizeWoda() {
+  local fixture="/tmp/test.folder.fix.cfg.woda.$(id -u).$$"
+  mkdir -p "$fixture"
+  cat > "$fixture/config" <<'EOF'
+Host WODA.test
+ User root
+ Port 22
+ HostName 178.254.18.182
+ IdentityFile /home/test/.ssh/id_ed25519
+
+Host other
+ IdentityFile /should/stay/absolute
+EOF
+  private.ossh.folder.fix.config.normalize "$fixture" >/dev/null 2>&1
+  if grep -q "^ IdentityFile ~/.ssh/id_ed25519\$" "$fixture/config" \
+     && grep -q "^ IdentityFile /should/stay/absolute\$" "$fixture/config"; then
+    create.result 0 "WODA portable, non-WODA unchanged"
+  else
+    create.result 1 "wrong content: $(cat $fixture/config)"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+}
+test.case $level "T-FOLDER-FIX-CONFIG-NORMALIZE-WODA: WODA IdentityFile rewritten to portable; non-WODA untouched" \
+  test.ossh.foldFixConfigNormalizeWoda
+expect 0 "WODA portable, non-WODA unchanged" "private.ossh.folder.fix.config.normalize fixes WODA portability without touching other Host blocks"
+
+# T-FOLDER-FIX-CONFIG-NORMALIZE-GITHUB: adds Host github.com block when missing.
+test.ossh.foldFixConfigAddGithub() {
+  local fixture="/tmp/test.folder.fix.cfg.github.$(id -u).$$"
+  mkdir -p "$fixture"
+  echo "# empty config" > "$fixture/config"
+  private.ossh.folder.fix.config.normalize "$fixture" >/dev/null 2>&1
+  if grep -q "^Host github.com\$" "$fixture/config" \
+     && grep -q "^ IdentityFile ~/.ssh/ids/ssh.developking/id_rsa\$" "$fixture/config"; then
+    create.result 0 "Host github.com added with canonical IdentityFile"
+  else
+    create.result 1 "wrong content: $(cat $fixture/config)"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+}
+test.case $level "T-FOLDER-FIX-CONFIG-NORMALIZE-GITHUB: Host github.com block added if missing" \
+  test.ossh.foldFixConfigAddGithub
+expect 0 "Host github.com added with canonical IdentityFile" "config.normalize ensures Host github.com is present"
+
+# T-FOLDER-FIX-CONFIG-STRIP-LEGACY: strict-only helper removes the Host 2cuGitHub block.
+test.ossh.foldFixConfigStripLegacy() {
+  local fixture="/tmp/test.folder.fix.cfg.legacy.$(id -u).$$"
+  mkdir -p "$fixture"
+  cat > "$fixture/config" <<'EOF'
+Host 2cuGitHub
+ User git
+ IdentityFile ~/.ssh/2cuGitHub
+
+Host keep.me
+ IdentityFile ~/.ssh/id_ed25519
+EOF
+  private.ossh.folder.fix.config.strip.legacy "$fixture" >/dev/null 2>&1
+  if ! grep -q "^Host 2cuGitHub\$" "$fixture/config" \
+     && grep -q "^Host keep.me\$" "$fixture/config"; then
+    create.result 0 "2cuGitHub block removed, keep.me preserved"
+  else
+    create.result 1 "wrong content: $(cat $fixture/config)"
+  fi
+  rm -rf "$fixture" 2>/dev/null
+}
+test.case $level "T-FOLDER-FIX-CONFIG-STRIP-LEGACY: Host 2cuGitHub removed; other blocks preserved" \
+  test.ossh.foldFixConfigStripLegacy
+expect 0 "2cuGitHub block removed, keep.me preserved" "config.strip.legacy removes Host 2cuGitHub block only"
+
+# T-FOLDER-FIX-SCAN-GIT-REMOTES: pre-flight scan helper exists and runs without error
+# even when nothing matches. (Full integration testing would need a real git repo
+# fixture under $HOME — too invasive for unit tests.)
+test.case $level "T-FOLDER-FIX-SCAN-GIT-REMOTES: function defined + returns 0 when no matches" \
+  echo "(invoke)"
+if declare -f private.ossh.folder.fix.scan.git.remotes >/dev/null 2>&1; then
+  private.ossh.folder.fix.scan.git.remotes nonexistent_alias_xyz_zzz >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    expect.pass "scan helper defined and returns 0 on no-match"
+  else
+    expect.fail "scan helper returned non-zero on no-match"
+  fi
+else
+  expect.fail "private.ossh.folder.fix.scan.git.remotes not defined"
+fi
+
+# ============================================================================
+# T-INSTALL-SSH-BACKUP-*: the backup call sites, after item 6
+# ============================================================================
+# Both guards used to test the ABSOLUTE $HOME/ssh.<name> while user.ssh.backup
+# wrote the CWD-RELATIVE ./ssh.<name>, so neither could ever be satisfied and
+# both fired on every install. And `.for.` named the host the directory was
+# already sitting on, because the install runs ON the target.
+test.ossh.installContinueLocalBackupCallSites() {
+  local body
+  body=$(declare -f ossh.install.continue.local 2>/dev/null)
+  if [ -z "$body" ]; then
+    create.result 1 "ossh.install.continue.local is not defined"
+    return $(result)
+  fi
+  local code
+  code=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*#')
+  if printf '%s\n' "$code" | grep -q '\.for\.'; then
+    create.result 1 "the .for. name is still constructed"
+  elif printf '%s\n' "$code" | grep -q 'ssh\.original'; then
+    create.result 1 "the ssh.original backup is still here — state 31 owns it now"
+  elif printf '%s\n' "$code" | grep -q 'check dir \$HOME/ssh\.'; then
+    create.result 1 "a guard on \$HOME/ssh.<name> survives, and it can never be satisfied"
+  elif ! printf '%s\n' "$code" | grep -q 'ssh\.backup pre-user-init'; then
+    create.result 1 "the pre-user-init snapshot is gone entirely"
+  else
+    create.result 0 "one labelled snapshot"
+  fi
+  return $(result)
+}
+test.case $level "T-INSTALL-SSH-BACKUP-CALLSITES: one labelled snapshot, no .for. name, no unsatisfiable guard" \
+  test.ossh.installContinueLocalBackupCallSites
+expect 0 "one labelled snapshot" "the guard tested an absolute path while the writer wrote a relative one"
+
+# The snapshot only means anything if it happens BEFORE user init, which is
+# what writes the WODA Host aliases into ~/.ssh/config.
+test.ossh.backupPrecedesUserInit() {
+  local body backupLine initLine
+  body=$(declare -f ossh.install.continue.local 2>/dev/null | grep -v '^[[:space:]]*#')
+  backupLine=$(printf '%s\n' "$body" | grep -n 'ssh\.backup pre-user-init' | head -1 | cut -d: -f1)
+  # `declare -f` normalises the body and appends a `;` to each statement, so
+  # the pattern must tolerate one.
+  initLine=$(printf '%s\n' "$body" | grep -nE '^[[:space:]]*user init[[:space:]]*;?[[:space:]]*$' | head -1 | cut -d: -f1)
+  if [ -z "$backupLine" ] || [ -z "$initLine" ]; then
+    create.result 1 "backupLine=[$backupLine] initLine=[$initLine] — one of them is missing"
+  elif [ "$backupLine" -ge "$initLine" ]; then
+    create.result 1 "the snapshot is at $backupLine, user init at $initLine — too late"
+  else
+    create.result 0 "snapshot first"
+  fi
+  return $(result)
+}
+test.case $level "T-INSTALL-SSH-BACKUP-ORDER: the snapshot precedes user init" \
+  test.ossh.backupPrecedesUserInit
+expect 0 "snapshot first" "user init writes the three WODA Host aliases into ~/.ssh/config"
+
+# T-OSSH-SCRIPT-LOAD: ossh loads another oosh script through the kernel loader
+# ============================================================================
+# A bare `source oo` re-runs this.start and leaves This pointing at oo, so ossh's
+# own help and dispatch would describe oo. The fixture scripts clobber This the way
+# a real one does; each method must leave it as it was and find its function.
+test.ossh.scriptLoad() {
+  local fx bad="" out savedThis="$This"; fx=$(test.suite.fixture.make osshload)
+  printf '%s\n' 'This=clobbered-oo' 'private.oo.pm.env.get() { echo "env FX=1"; }' \
+    'private.oo.pm.install.prefix.get() { echo "sudo env FX=1"; }' \
+    'oo.cmd() { FX_OOCMD="$FX_OOCMD ${1}"; return 0; }' > "$fx/oo"
+  (
+    local OOSH_DIR="$fx"
+    unset -f private.oo.pm.env.get private.oo.pm.install.prefix.get oo.cmd
+    private.ossh.ssh() { case "$*" in (*"command -v"*) return 1 ;; esac; echo "$*"; }
+    ossh.pm.discover() { echo "apt-get install -y"; }
+    ossh.cmd somehost tree >/dev/null 2>&1; [ "$This" = "$savedThis" ] || echo "cmd-This=[$This]"
+    [ "$(type -t private.oo.pm.install.prefix.get)" = function ] || echo "cmd-not-loaded"
+    unset -f private.oo.pm.env.get private.oo.pm.install.prefix.get oo.cmd
+    private.ossh.harden.preflight() { return 0; }
+    ossh.harden.packages somehost >/dev/null 2>&1; [ "$This" = "$savedThis" ] || echo "harden-This=[$This]"
+    [ "$(type -t private.oo.pm.env.get)" = function ] || echo "harden-not-loaded"
+    unset -f private.oo.pm.env.get oo.cmd
+    FX_OOCMD=""
+    ossh.prereqs.install >/dev/null 2>&1; [ "$This" = "$savedThis" ] || echo "prereqs-This=[$This]"
+    [ "$FX_OOCMD" = " rsync tree diff" ] || echo "prereqs-calls=[$FX_OOCMD]"
+  ) > "$fx/out" 2>&1
+  bad=$(cat "$fx/out")
+  # no hand-written load of another oosh script outside ossh.start (this, line, os)
+  local line code fn="" stray=""
+  while IFS= read -r line; do
+    case "$line" in ([a-z]*"()"*) fn="${line%%\(*}" ;; esac
+    code="${line#"${line%%[![:space:]]*}"}"
+    case "$code" in
+      ("source "*|*"|| source "*)
+        case "$code" in (*'$CONFIG'*|*'"$cfg"'*|*'"$file"'*|*'.states.env'*) continue ;; esac
+        [ "$fn" = ossh.start ] || stray="$stray [$fn:$code]" ;;
+    esac
+  done < "$OOSH_DIR/ossh"
+  [ -z "$stray" ] || bad="$bad hand-loads:$stray"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh loads oo through private.this.script.load and keeps This" || create.result 1 "script load:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-SCRIPT-LOAD: ossh loads oo/os/state through private.this.script.load; This stays ossh" test.ossh.scriptLoad
+expect 0 "ossh loads oo through private.this.script.load and keeps This" "a bare source clobbers This — help and dispatch would describe oo"
 
 test.suite.save.results

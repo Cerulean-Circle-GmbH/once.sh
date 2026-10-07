@@ -12,11 +12,13 @@ Every log function gates output with `if [ "$LOG_LEVEL" -gt N ]`. Higher levels 
 | 0 | Silent | — | None | Suppress all output |
 | 1 | Errors | `> 0` | `error.log`, `test.console.log`, `test.success.log`, `error.details.log` | CI / test runs |
 | 2 | Warnings | `> 1` | + `warn.log`, `important.log`, `problem.log` | Notice problems |
-| 3 | Console | `> 2` | + `console.log`, `success.log`, `silent.log` | **Default** — normal operation |
+| 3 | Console | `> 2` | + `console.log`, `success.log`, `silent.log` | **Default** — normal operation (see note) |
 | 4 | Info | `> 3` | + `info.log`, `stop.log` | See method dispatch internals |
 | 5 | Debug | `> 4` | + `debug.log` | Full debug messages |
 | 6 | Trace | `> 5` | + `set -x` PS4 tracing via `seq.puml.log()` | Bash execution trace |
 | 7 | Step | `> 6` | + `STEP_DEBUG=ON` interactive breakpoints | Interactive debugging |
+
+> **Note:** During installation, LOG_LEVEL defaults to 1 (errors only). The `LOG_INSTALL` system captures full-density logs to file regardless of LOG_LEVEL.
 
 ### Where the functions are defined
 
@@ -71,7 +73,7 @@ captures ALL env vars matching prefix "LOG" via: declare -p | grep LOG
 ~/config/log.env now contains LOG_LEVEL="5" (and test artifacts)
           │
           ▼
-~/config/user.env contains: source $CONFIG_PATH/log.env
+~/config/user.env chains it: . $CONFIG_PATH/log.env
           │
           ▼
 Every script: source this → this.init() → source "$CONFIG" → loads LOG_LEVEL=5
@@ -101,7 +103,7 @@ declare -- TEST_LOG_LIVE="/tmp/test.log.live.44933"       # test internal
 |----------|------|------|
 | `test/test.log:175` | `export LOG_LEVEL=5` | Needed to test `debug.log` — can leak via `config.save` |
 | `test/test.log:191` | `export LOG_LEVEL=4` | Same |
-| `test/test.debug:94` | `export LOG_LEVEL=5` | Needed to test `toggleDebug` — same leak risk |
+| `test/test.debug:94` | `export LOG_LEVEL=5` | Needed to test `debug.toggleDebug` — same leak risk |
 | `test/test.debug:272` | `export LOG_LEVEL=4` | Same |
 | `debug:31-32` | `if [ -z "$LOG_LEVEL" ]; then LOG_LEVEL=5` | Fallback if LOG_LEVEL is empty — silently elevates |
 

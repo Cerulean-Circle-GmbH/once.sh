@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+TEST_CATEGORY=platform
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# platform.shared.config.invariant — bisect oracle for the post-state-31
+# sharedConfig regression. Run inside the bash-user shell of
+# `os platform.test ubuntu_24_04 terminal` after install completes:
+#
+#   ./test.suite run platform.shared.config.invariant 1
+#
+# Asserts the multi-user install pipeline left the canonical layout intact:
+#   1. ~/config is a symlink resolving INTO sharedConfig.
+#   2. sharedConfig dir is owned developking:dev.
+#   3. dev group can write into sharedConfig (mode g+w).
+#   4. The current user can write+rm a file via ~/config (write-through-symlink).
+#   5. c2 dispatch (oo with an unknown method) does NOT emit "Permission denied"
+#      on ~/config/completion.result.txt or similar.
+#
+# Pass: install pipeline preserved the invariant.
+# Fail: a commit between testing and dev mutates sharedConfig — the bisect
+# stops at that commit.
+
+cfgLink="$HOME/config"
+
+# (1) symlink existence
+test.case $level "platform.shared.config: ~/config is a symlink" test -L "$cfgLink"
+if [ ! -L "$cfgLink" ]; then
+  expect.fail "$cfgLink is not a symlink"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "$cfgLink is a symlink"
+fi
+
+# Resolve target via OOSH primitive (handles GNU readlink + BSD fallback).
+resolved=$(private.this.path.canonical "$cfgLink")
+test.case $level "platform.shared.config: symlink resolves to a real dir" test -d "$resolved"
+if [ ! -d "$resolved" ]; then
+  expect.fail "symlink target $resolved is not a directory"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "resolved to: $resolved"
+fi
+
+# (2) ownership: developking:dev
+owner=$(stat -c '%U' "$resolved" 2>/dev/null) \
+  || owner=$(stat -f '%Su' "$resolved" 2>/dev/null)
+group=$(stat -c '%G' "$resolved" 2>/dev/null) \
+  || group=$(stat -f '%Sg' "$resolved" 2>/dev/null)
+
+test.case $level "platform.shared.config: owner is developking" true
+if [ "$owner" = "developking" ]; then
+  expect.pass "owner=$owner"
+else
+  expect.fail "owner=$owner (expected developking) on $resolved"
+fi
+
+test.case $level "platform.shared.config: group is dev" true
+if [ "$group" = "dev" ]; then
+  expect.pass "group=$group"
+else
+  expect.fail "group=$group (expected dev) on $resolved"
+fi
+
+# (3) mode: group-writable
+mode=$(stat -c '%a' "$resolved" 2>/dev/null) \
+  || mode=$(stat -f '%Lp' "$resolved" 2>/dev/null)
+# group-write bit is the middle digit's 2-bit (0775, 2775, 0770, etc — all OK)
+gwBit=$(( (10#${mode: -2:1}) & 2 ))
+test.case $level "platform.shared.config: mode g+w" true
+if [ "$gwBit" -eq 2 ]; then
+  expect.pass "mode=$mode (g+w set)"
+else
+  expect.fail "mode=$mode lacks g+w on $resolved"
+fi
+
+# (4) write-through-symlink works (no Permission denied)
+testFile="$cfgLink/_invariant_writetest.$$"
+errFile=$(mktemp)
+echo writetest > "$testFile" 2>"$errFile"
+rc=$?
+errMsg=$(cat "$errFile")
+rm -f "$errFile"
+
+test.case $level "platform.shared.config: write-through ~/config succeeds" true
+if [ "$rc" -eq 0 ] && [ -f "$testFile" ]; then
+  rm -f "$testFile"
+  expect.pass "wrote+removed $testFile as $USER (uid=$(id -u), groups=$(id -G | tr ' ' ','))"
+else
+  expect.fail "write to $testFile failed rc=$rc, stderr=${errMsg:-<empty>}"
+fi
+
+# (5) c2 dispatch does NOT emit Permission denied
+# Trigger c2 via an unknown oo method — c2 writes to $CONFIG_PATH/result.txt,
+# completion.result.txt, current.method.env, etc. If sharedConfig is wrong,
+# these writes fail with "Permission denied".
+c2Out=$(./oo __invariant_unknown_method__ 2>&1 | head -20)
+test.case $level "platform.shared.config: c2 dispatch — no Permission denied" true
+if echo "$c2Out" | grep -qE 'Permission denied' ; then
+  expect.fail "c2 dispatch emitted Permission denied: $(echo "$c2Out" | grep -m1 'Permission denied')"
+else
+  expect.pass "c2 dispatch ran without Permission denied"
+fi
+
+test.suite.save.results

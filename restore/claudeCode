@@ -1,0 +1,1486 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+#echo "starting: $0 <LOG_LEVEL=$1>"
+
+### new.method
+
+# ============================================================================
+# claudeCode - Claude Code wrapper for oosh
+# Makes Claude Code CLI flags easy to use with intuitive method names
+# ============================================================================
+
+# Path to claude binary - no need to have it in PATH
+CLAUDE_CMD="$HOME/.local/bin/claude"
+
+# Force 256-color mode unless terminal explicitly supports true color.
+# Apple Terminal.app cannot render 24-bit (true color) escape sequences,
+# which causes Claude Code output to appear black-and-white.
+# FORCE_COLOR=2 tells chalk/ink to use 256 colors instead.
+if [[ "${COLORTERM:-}" != "truecolor" && "${COLORTERM:-}" != "24bit" ]]; then
+    export FORCE_COLOR=2
+fi
+
+claudeCode.sessions() # # list all available sessions (interactive picker)
+{
+  "$CLAUDE_CMD" --resume
+}
+
+claudeCode.list() # <?--json> # list all Claude Code sessions on this host in tree format
+{
+  local CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+  local format="tree"
+
+  [ "$1" = "--json" ] && format="json"
+
+  if [ ! -d "$CLAUDE_PROJECTS_DIR" ]; then
+    echo "No Claude projects directory found: $CLAUDE_PROJECTS_DIR"
+    return 1
+  fi
+
+  if [ "$format" = "json" ]; then
+    claudeCode.list.json
+    return $?
+  fi
+
+  echo ""
+  echo "┌─────────────────────────────────────────────────────────────────────────────┐"
+  echo "│                        CLAUDE CODE SESSIONS                                 │"
+  echo "├─────────────────────────────────────────────────────────────────────────────┤"
+  echo "│ ID                                    Name                       Msgs  Modified    Branch │"
+  echo "└─────────────────────────────────────────────────────────────────────────────┘"
+  echo ""
+
+  local total_sessions=0
+  local total_projects=0
+
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*; do
+    [ ! -d "$project_dir" ] && continue
+
+    local project_name=$(basename "$project_dir")
+    local index_file="$project_dir/sessions-index.json"
+    local decoded_path=$(echo "$project_name" | sed 's/^-/\//' | sed 's/-/\//g')
+
+    ((total_projects++))
+
+    echo "📁 $decoded_path"
+
+    if [ -f "$index_file" ] && command -v jq &>/dev/null; then
+      local entries=$(jq -r '.entries | length' "$index_file" 2>/dev/null)
+
+      if [ "$entries" -gt 0 ] 2>/dev/null; then
+        local idx=0
+        jq -r '.entries[] | "\(.sessionId)|\(.customTitle // "")|\(.firstPrompt // "untitled")|\(.messageCount // 0)|\(.modified // "unknown")|\(.gitBranch // "-")"' "$index_file" 2>/dev/null | \
+        while IFS='|' read -r sid title prompt msgs modified branch; do
+          ((idx++))
+          ((total_sessions++))
+
+          # Use customTitle if set, otherwise show N/A
+          local display_name
+          if [ -n "$title" ]; then
+            display_name=$(echo "$title" | cut -c1-25)
+            [ ${#title} -gt 25 ] && display_name="${display_name}..."
+          else
+            display_name="N/A"
+          fi
+          local mod_date=$(echo "$modified" | cut -c1-10)
+
+          local prefix="├──"
+          [ "$idx" -eq "$entries" ] && prefix="└──"
+
+          printf "%s %-36s  %-28s  %3s  %s  %s\n" "$prefix" "$sid" "$display_name" "$msgs" "$mod_date" "$branch"
+        done
+      else
+        echo "└── (no sessions)"
+      fi
+    else
+      local jsonl_count=$(ls "$project_dir"/*.jsonl 2>/dev/null | wc -l)
+      if [ "$jsonl_count" -gt 0 ]; then
+        ls "$project_dir"/*.jsonl 2>/dev/null | while read f; do
+          local sid=$(basename "$f" .jsonl)
+          echo "├── ${sid:0:8}..."
+          ((total_sessions++))
+        done
+      else
+        echo "└── (no sessions)"
+      fi
+    fi
+    echo ""
+  done
+
+  echo "─────────────────────────────────────────────────────────────────────────────"
+  echo "Total: $total_projects projects"
+}
+
+claudeCode.list.named() # # list only sessions that have a custom name (set via /rename)
+{
+  local CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+  local total=0
+
+  echo ""
+  echo "┌─────────────────────────────────────────────────────────────────────────────┐"
+  echo "│                     NAMED CLAUDE CODE SESSIONS                              │"
+  echo "├─────────────────────────────────────────────────────────────────────────────┤"
+  echo "│ ID                                    Name                       Msgs  Modified │"
+  echo "└─────────────────────────────────────────────────────────────────────────────┘"
+  echo ""
+
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*; do
+    [ ! -d "$project_dir" ] && continue
+
+    local project_name=$(basename "$project_dir")
+    local index_file="$project_dir/sessions-index.json"
+    local decoded_path=$(echo "$project_name" | sed 's/^-/\//' | sed 's/-/\//g')
+
+    if [ -f "$index_file" ] && command -v jq &>/dev/null; then
+      local named_entries
+      named_entries=$(jq -r '.entries[] | select(.customTitle != null) | select(.customTitle != "") | [.sessionId, .customTitle, (.messageCount // 0 | tostring), (.modified // "?" | .[:10])] | join("|")' "$index_file" 2>/dev/null)
+
+      [ -z "$named_entries" ] && continue
+
+      echo "📁 $decoded_path"
+      echo "$named_entries" | while IFS='|' read -r sid title msgs mod_date; do
+        ((total++))
+        local short_title=$(echo "$title" | cut -c1-25)
+        [ ${#title} -gt 25 ] && short_title="${short_title}..."
+        printf "├── %-36s  %-28s  %3s  %s\n" "$sid" "$short_title" "$msgs" "$mod_date"
+      done
+      echo ""
+    fi
+  done
+
+  echo "─────────────────────────────────────────────────────────────────────────────"
+}
+
+claudeCode.list.json() # # output session list as JSON
+{
+  local CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+  echo "["
+  local first_project=true
+
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*; do
+    [ ! -d "$project_dir" ] && continue
+
+    local project_name=$(basename "$project_dir")
+    local decoded_path=$(echo "$project_name" | sed 's/^-/\//' | sed 's/-/\//g')
+    local index_file="$project_dir/sessions-index.json"
+
+    if [ -f "$index_file" ] && command -v jq &>/dev/null; then
+      jq -r --arg dir "$decoded_path" '.entries[] | {sessionId, firstPrompt, messageCount, modified, gitBranch, directory: $dir}' "$index_file" 2>/dev/null | \
+      while read -r line; do
+        [ "$first_project" = "false" ] && echo ","
+        first_project=false
+        echo "$line"
+      done
+    fi
+  done
+  echo "]"
+}
+
+claudeCode.join() # <session> # resume a specific session by name or ID
+{
+  local session="$1"
+  if [ -n "$session" ]; then
+    shift
+    "$CLAUDE_CMD" --resume "$session" "$@"
+  else
+    # No session specified, show picker
+    "$CLAUDE_CMD" --resume
+  fi
+}
+claudeCode.join.completion.session() {
+  local CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*; do
+    [ ! -d "$project_dir" ] && continue
+    local index_file="$project_dir/sessions-index.json"
+
+    if [ -f "$index_file" ] && command -v jq &>/dev/null; then
+      jq -r '.entries[].sessionId' "$index_file" 2>/dev/null
+    else
+      # Fallback: list .jsonl files
+      ls "$project_dir"/*.jsonl 2>/dev/null | xargs -I{} basename {} .jsonl
+    fi
+  done
+}
+
+claudeCode.continue() # # continue the most recent session without picker
+{
+  "$CLAUDE_CMD" --continue "$@"
+}
+
+claudeCode.c() # # shorthand for continue
+{
+  claudeCode.continue "$@"
+}
+
+claudeCode.new() # <?prompt> # start a fresh conversation with optional initial prompt
+{
+  if [ -n "$1" ]; then
+    "$CLAUDE_CMD" --print "$@"
+  else
+    "$CLAUDE_CMD"
+  fi
+}
+
+claudeCode.print() # <prompt> # non-interactive: print response and exit
+{
+  "$CLAUDE_CMD" --print "$@"
+}
+
+claudeCode.p() # <prompt> # shorthand for print
+{
+  claudeCode.print "$@"
+}
+
+claudeCode.dangerously() # <prompt> # skip all permission prompts (use with caution!)
+{
+  "$CLAUDE_CMD" --dangerously-skip-permissions "$@"
+}
+
+claudeCode.yolo() # <prompt> # alias for dangerously - skip permissions
+{
+  claudeCode.dangerously "$@"
+}
+
+claudeCode.verbose() # <?prompt> # run with verbose output
+{
+  "$CLAUDE_CMD" --verbose "$@"
+}
+
+claudeCode.model() # <model> <?prompt> # use specific model (sonnet, opus, haiku)
+{
+  local model="$1"
+  if [ -n "$model" ]; then
+    shift
+    "$CLAUDE_CMD" --model "$model" "$@"
+  else
+    error.log "usage: cc model <sonnet|opus|haiku> [prompt]"
+    return 1
+  fi
+}
+claudeCode.model.completion.model() {
+  echo "sonnet"
+  echo "opus"
+  echo "haiku"
+}
+
+claudeCode.model.list() # # list available model aliases
+{
+  echo "opus"
+  echo "sonnet"
+  echo "haiku"
+}
+claudeCode.model.list.completion() { :; }
+
+claudeCode.model.set() # <pane> <model> # switch model in running session via /model
+{
+  local pane="$1"
+  local model="$2"
+
+  [ -z "$pane" ] || [ -z "$model" ] && { error.log "Usage: claudeCode model.set <pane> <model>"; return 1; }
+
+  # Validate model alias
+  case "$model" in
+    opus|sonnet|haiku) ;;
+    *) error.log "Invalid model: $model (use opus, sonnet, haiku)"; return 1 ;;
+  esac
+
+  # Send /model command to the pane
+  "$OOSH_DIR/otmux" send.enter "$pane" "/model $model"
+  info.log "Sent /model $model to $pane"
+}
+claudeCode.model.set.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+claudeCode.model.set.completion.model() {
+  claudeCode.model.list
+}
+
+claudeCode.model.get() # <pane> # get current model from running session
+{
+  local pane="$1"
+  [ -z "$pane" ] && { error.log "Usage: claudeCode model.get <pane>"; return 1; }
+
+  # Capture TUI status bar — Claude Code shows model in status line
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$pane" 10)
+
+  # Parse model from status bar (format: "Model: opus" or similar)
+  local model
+  model=$(echo "$content" | grep -oiE '(opus|sonnet|haiku)' | head -1 | tr '[:upper:]' '[:lower:]')
+
+  if [ -n "$model" ]; then
+    RESULT="$model"
+    echo "$model"
+    return 0
+  fi
+
+  # Fallback: unknown (TUI may not show model)
+  RESULT="unknown"
+  echo "unknown"
+  return 1
+}
+claudeCode.model.get.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.opus() # <?prompt> # use opus model
+{
+  "$CLAUDE_CMD" --model opus "$@"
+}
+
+claudeCode.sonnet() # <?prompt> # use sonnet model
+{
+  "$CLAUDE_CMD" --model sonnet "$@"
+}
+
+claudeCode.haiku() # <?prompt> # use haiku model
+{
+  "$CLAUDE_CMD" --model haiku "$@"
+}
+
+claudeCode.chat() # <?prompt> # interactive chat mode (default)
+{
+  "$CLAUDE_CMD" "$@"
+}
+
+claudeCode.help() # # show claude help
+{
+  "$CLAUDE_CMD" --help
+}
+
+claudeCode.version() # # show claude version
+{
+  "$CLAUDE_CMD" --version
+}
+
+claudeCode.v() # # shorthand for version
+{
+  claudeCode.version
+}
+
+claudeCode.config() # # open claude settings/config
+{
+  "$CLAUDE_CMD" config
+}
+
+claudeCode.doctor() # # run claude doctor to check setup
+{
+  "$CLAUDE_CMD" doctor
+}
+
+claudeCode.mcp() # # manage MCP servers
+{
+  "$CLAUDE_CMD" mcp "$@"
+}
+
+claudeCode.tools.allowed() # <tools> # restrict to specific tools (comma-separated)
+{
+  local tools="$1"
+  if [ -n "$tools" ]; then
+    shift
+    "$CLAUDE_CMD" --allowedTools "$tools" "$@"
+  else
+    error.log "usage: cc allowedTools <tool1,tool2,...> [prompt]"
+    return 1
+  fi
+}
+
+claudeCode.tools.disallowed() # <tools> # block specific tools (comma-separated)
+{
+  local tools="$1"
+  if [ -n "$tools" ]; then
+    shift
+    "$CLAUDE_CMD" --disallowedTools "$tools" "$@"
+  else
+    error.log "usage: cc disallowedTools <tool1,tool2,...> [prompt]"
+    return 1
+  fi
+}
+
+claudeCode.turns.max() # <turns> <?prompt> # limit conversation turns
+{
+  local turns="$1"
+  if [ -n "$turns" ]; then
+    shift
+    "$CLAUDE_CMD" --max-turns "$turns" "$@"
+  else
+    error.log "usage: cc maxTurns <number> [prompt]"
+    return 1
+  fi
+}
+
+claudeCode.system.prompt() # <prompt> <?message> # set custom system prompt
+{
+  local sysprompt="$1"
+  if [ -n "$sysprompt" ]; then
+    shift
+    "$CLAUDE_CMD" --system-prompt "$sysprompt" "$@"
+  else
+    error.log "usage: cc systemPrompt <prompt> [message]"
+    return 1
+  fi
+}
+
+claudeCode.system.prompt.append() # <prompt> <?message> # append to system prompt
+{
+  local sysprompt="$1"
+  if [ -n "$sysprompt" ]; then
+    shift
+    "$CLAUDE_CMD" --append-system-prompt "$sysprompt" "$@"
+  else
+    error.log "usage: cc appendSystemPrompt <prompt> [message]"
+    return 1
+  fi
+}
+
+claudeCode.output() # <format> <?prompt> # set output format (text, json, stream-json)
+{
+  local format="$1"
+  if [ -n "$format" ]; then
+    shift
+    "$CLAUDE_CMD" --output-format "$format" "$@"
+  else
+    error.log "usage: cc output <text|json|stream-json> [prompt]"
+    return 1
+  fi
+}
+claudeCode.output.completion.format() {
+  echo "text"
+  echo "json"
+  echo "stream-json"
+}
+
+claudeCode.json() # <?prompt> # output as JSON
+{
+  "$CLAUDE_CMD" --output-format json "$@"
+}
+
+claudeCode.pipe() # # read from stdin (for piping)
+{
+  "$CLAUDE_CMD" -p "$@"
+}
+
+claudeCode.init() # <?path> # initialize claude in a directory
+{
+  if [ -n "$1" ]; then
+    "$CLAUDE_CMD" init "$1"
+  else
+    "$CLAUDE_CMD" init
+  fi
+}
+
+claudeCode.update() # # update claude code
+{
+  "$CLAUDE_CMD" update
+}
+
+claudeCode.login() # # login to claude
+{
+  "$CLAUDE_CMD" login
+}
+
+claudeCode.logout() # # logout from claude
+{
+  "$CLAUDE_CMD" logout
+}
+
+claudeCode.install() # # install claude code from web for linux
+{
+  local INSTALL_DIR="${HOME}/.local/bin"
+  local CONFIG_FILE="${CONFIG:-$HOME/config/user.env}"
+
+  # Check if already installed
+  if command -v claude &> /dev/null; then
+    info.log "Claude Code is already installed: $(which claude)"
+    "$CLAUDE_CMD" --version
+    echo ""
+    read -p "Reinstall/update anyway? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      info.log "Installation cancelled"
+      return 0
+    fi
+  fi
+
+  info.log "Installing Claude Code for Linux..."
+
+  # Check for curl
+  if ! command -v curl &> /dev/null; then
+    error.log "curl is required but not installed. Please install curl first."
+    return 1
+  fi
+
+  # Download and run the official installer
+  info.log "Downloading and running official installer..."
+  curl -fsSL https://claude.ai/install.sh | sh
+
+  if [ $? -ne 0 ]; then
+    error.log "Installation failed"
+    return 1
+  fi
+
+  # Check if ~/.local/bin is in PATH via config
+  if [ -f "$CONFIG_FILE" ]; then
+    if ! grep -q '\.local/bin' "$CONFIG_FILE"; then
+      info.log "Adding ~/.local/bin to PATH in config..."
+      # Read current PATH from config
+      local current_path=$(grep '^export PATH=' "$CONFIG_FILE" | head -1)
+      if [ -n "$current_path" ]; then
+        # Check if .local/bin is already in the PATH value
+        if ! echo "$current_path" | grep -q '\.local/bin'; then
+          # Append to existing PATH
+          sed -i 's|^export PATH="\(.*\)"$|export PATH="\1:'"$HOME"'/.local/bin"|' "$CONFIG_FILE"
+          info.log "Updated PATH in $CONFIG_FILE"
+        fi
+      else
+        # Add new PATH export
+        echo "export PATH=\"\$PATH:$HOME/.local/bin\"" >> "$CONFIG_FILE"
+        info.log "Added PATH to $CONFIG_FILE"
+      fi
+    else
+      info.log "~/.local/bin already in config PATH"
+    fi
+  else
+    warn.log "Config file not found at $CONFIG_FILE"
+    warn.log "Add ~/.local/bin to your PATH manually if needed"
+  fi
+
+  # Add to current session PATH if not present
+  if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+    export PATH="$PATH:$INSTALL_DIR"
+    info.log "Added $INSTALL_DIR to current session PATH"
+  fi
+
+  # Verify installation
+  if command -v claude &> /dev/null; then
+    success.log "Claude Code installed successfully!"
+    "$CLAUDE_CMD" --version
+    echo ""
+    info.log "Run 'claudeCode login' to authenticate"
+  else
+    error.log "Installation completed but 'claude' command not found"
+    error.log "You may need to restart your shell or add ~/.local/bin to PATH"
+    return 1
+  fi
+}
+
+claudeCode.uninstall() # # uninstall claude code
+{
+  local INSTALL_DIR="${HOME}/.local"
+  local CLAUDE_DIR="${INSTALL_DIR}/share/claude"
+  local CLAUDE_BIN="${INSTALL_DIR}/bin/claude"
+
+  if [ ! -f "$CLAUDE_BIN" ] && [ ! -d "$CLAUDE_DIR" ]; then
+    warn.log "Claude Code does not appear to be installed"
+    return 0
+  fi
+
+  echo "This will remove:"
+  [ -f "$CLAUDE_BIN" ] && echo "  - $CLAUDE_BIN"
+  [ -d "$CLAUDE_DIR" ] && echo "  - $CLAUDE_DIR"
+  echo ""
+  read -p "Are you sure you want to uninstall Claude Code? [y/N] " -n 1 -r
+  echo
+
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    info.log "Uninstall cancelled"
+    return 0
+  fi
+
+  info.log "Removing Claude Code..."
+
+  # Remove symlink/binary
+  if [ -f "$CLAUDE_BIN" ] || [ -L "$CLAUDE_BIN" ]; then
+    rm -f "$CLAUDE_BIN"
+    info.log "Removed $CLAUDE_BIN"
+  fi
+
+  # Remove installation directory
+  if [ -d "$CLAUDE_DIR" ]; then
+    rm -rf "$CLAUDE_DIR"
+    info.log "Removed $CLAUDE_DIR"
+  fi
+
+  success.log "Claude Code uninstalled successfully"
+  info.log "Note: ~/.claude config directory was preserved"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT SUPPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+claudeCode.process.find() # <pane_target> # find Claude Code PID running in a tmux pane
+{
+  local target="$1"
+  [ -z "$target" ] && return 1
+
+  local tty
+  tty=$(tmux display-message -t "$target" -p "#{pane_tty}" 2>/dev/null)
+  [ -z "$tty" ] && return 1
+  local tty_short="${tty#/dev/}"
+
+  # Search full command line (args) for 'claude' on this TTY.
+  # Using args instead of comm avoids truncation when Claude is installed
+  # at a long path like ~/.local/bin/claude.
+  local pid
+  pid=$(ps -eo pid,tty,args 2>/dev/null | awk -v t="$tty_short" '$2 == t' | grep -i 'claude' | awk '{print $1}' | head -1)
+  [ -n "$pid" ] && echo "$pid" && return 0
+  return 1
+}
+
+claudeCode.process.running() # <pane_target> # check if Claude Code is running in a tmux pane
+{
+  claudeCode.process.find "$1" > /dev/null 2>&1
+}
+
+claudeCode.session.id() # <pane_target> # get Claude Code session UUID for a tmux pane
+{
+  local target="$1"
+  [ -z "$target" ] && return 1
+
+  local claude_pid
+  claude_pid=$(claudeCode.process.find "$target")
+  [ -z "$claude_pid" ] && return 1
+
+  # Method 1: extract --resume <UUID> from command line
+  local sid
+  sid=$(ps -p "$claude_pid" -o args= 2>/dev/null | grep -oE '\-\-resume [0-9a-f-]{36}' | awk '{print $2}')
+  [ -n "$sid" ] && echo "$sid" && return 0
+
+  # Method 2: extract from lsof — Claude keeps ~/.claude/tasks/<sessionId>/ open
+  sid=$(lsof -p "$claude_pid" 2>/dev/null | grep '\.claude/tasks/' | head -1 | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+  [ -n "$sid" ] && echo "$sid" && return 0
+
+  # Method 3: match pane title to JSONL custom-title (e.g. pane "oosh-expert" → "oosh-expert@sonnet")
+  local pane_title
+  pane_title=$(tmux display-message -t "$target" -p "#{pane_title}" 2>/dev/null)
+
+  local cwd
+  cwd=$(lsof -p "$claude_pid" 2>/dev/null | awk '/cwd/ {print $NF}')
+
+  if [ -n "$pane_title" ] && [ -n "$cwd" ]; then
+    local project_path
+    project_path=$(echo "$cwd" | sed 's/[^a-zA-Z0-9]/-/g')
+    local projects_dir="$HOME/.claude/projects/$project_path"
+
+    if [ -d "$projects_dir" ]; then
+      for jsonl_file in "$projects_dir"/*.jsonl; do
+        [ -f "$jsonl_file" ] || continue
+        local ct
+        ct=$(grep '"custom-title"' "$jsonl_file" 2>/dev/null | tail -1 | jq -r '.customTitle // empty' 2>/dev/null)
+        ct="${ct%%$'\n'*}"
+        if [ -n "$ct" ] && [[ "$ct" == "${pane_title}@"* ]]; then
+          sid=$(basename "$jsonl_file" .jsonl)
+          echo "$sid"
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  # Method 4: find most recent session file for the project (fallback, unreliable for multi-agent)
+  [ -z "$cwd" ] && return 1
+
+  local project_path
+  project_path=$(echo "$cwd" | sed 's/[^a-zA-Z0-9]/-/g')
+
+  local projects_dir="$HOME/.claude/projects/$project_path"
+  [ -d "$projects_dir" ] || return 1
+
+  local newest_file
+  newest_file=$(ls -t "$projects_dir"/*.jsonl 2>/dev/null | head -1)
+  [ -z "$newest_file" ] && return 1
+
+  sid=$(basename "$newest_file" .jsonl)
+  [ -n "$sid" ] && echo "$sid" && return 0
+
+  return 1
+}
+claudeCode.session.id.completion.pane_target() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.session.name() # <sessionId> # get session name by UUID (customTitle from /rename, or firstPrompt)
+{
+  local sid="$1"
+  [ -z "$sid" ] && return 1
+
+  local CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+  local name=""
+
+  # Method 1: look up in sessions-index.json (customTitle preferred, firstPrompt fallback)
+  for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json; do
+    [ -f "$index_file" ] || continue
+    name=$(jq -r --arg sid "$sid" '
+      .entries[] | select(.sessionId == $sid) |
+      if .customTitle and .customTitle != "" then .customTitle
+      elif .firstPrompt and .firstPrompt != "" then .firstPrompt[0:40]
+      else empty end
+    ' "$index_file" 2>/dev/null)
+    [ -n "$name" ] && break
+  done
+
+  if [ -n "$name" ]; then
+    echo "$name"
+    return 0
+  fi
+
+  # Method 2: check JSONL for custom-title entry (from /rename, more current than index)
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+    local jsonl_file="${project_dir}${sid}.jsonl"
+    [ -f "$jsonl_file" ] || continue
+    name=$(grep '"custom-title"' "$jsonl_file" 2>/dev/null | tail -1 \
+      | jq -r '.customTitle // empty' 2>/dev/null \
+      | head -1)
+    # Clean up multi-line titles (from double /rename)
+    name="${name%%$'\n'*}"
+    [ -n "$name" ] && break
+  done
+
+  if [ -n "$name" ]; then
+    echo "$name"
+    return 0
+  fi
+
+  # Method 3: read firstPrompt directly from JSONL file (for sessions not yet in index)
+  for project_dir in "$CLAUDE_PROJECTS_DIR"/*/; do
+    local jsonl_file="${project_dir}${sid}.jsonl"
+    [ -f "$jsonl_file" ] || continue
+    name=$(head -20 "$jsonl_file" \
+      | jq -r 'select(.type == "user") | .message.content // empty' 2>/dev/null \
+      | sed 's/<[^>]*>//g; s/^[[:space:]]*//; /^$/d' \
+      | grep -vi '^caveat:' \
+      | grep -v '^/clear' \
+      | grep -vi '^clear$' \
+      | head -1)
+    [ -n "$name" ] && name="${name:0:40}" && break
+  done
+
+  if [ -n "$name" ]; then
+    echo "$name"
+    return 0
+  fi
+
+  return 1
+}
+claudeCode.session.name.completion.sessionId() {
+  claudeCode.join.completion.session
+}
+
+claudeCode.agent.start() # <?workdir:.> <?--model:sonnet> # start Claude Code with optional model
+{
+  local workdir="$(pwd)"
+  local model=""
+
+  # Parse arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --model) model="$2"; shift 2 ;;
+      *) workdir="$1"; shift ;;
+    esac
+  done
+
+  local cmd="$CLAUDE_CMD"
+  [ -n "$model" ] && cmd="$cmd --model $model"
+
+  if [ -n "$TMUX" ]; then
+    local current_pane
+    current_pane=$(tmux display-message -p '#{pane_id}')
+    "$OOSH_DIR/otmux" send "$current_pane" "cd '$workdir' && $cmd" Enter
+    info.log "Started Claude Code in current pane${model:+ with model $model}"
+  else
+    cd "$workdir" && eval "$cmd"
+  fi
+}
+
+claudeCode.session.save() # <?file:session/agent.context.md> # save current session context to file
+{
+  local file="${1:-session/agent.context.md}"
+  local dir
+  dir=$(dirname "$file")
+
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir"
+  fi
+
+  if [ ! -f "$file" ]; then
+    # Create template
+    cat > "$file" << 'TEMPLATE'
+# Agent Context State
+
+**Session**: unknown
+**Updated**: $(date -u +%Y-%m-%dT%H:%MZ)
+**Role**: unknown
+
+## Current Task
+(no task set)
+
+## Team Status
+| Pane | Agent | Role | Status |
+|------|-------|------|--------|
+
+## Recovery
+1. Read this file
+2. Read current task file
+3. Check agent panes with `tmux capture-pane`
+4. Resume work
+TEMPLATE
+    info.log "Created context template: $file"
+  else
+    # Update timestamp
+    if command -v sed &>/dev/null; then
+      local timestamp
+      timestamp=$(date -u +%Y-%m-%dT%H:%MZ)
+      sed -i '' "s/^\*\*Updated\*\*:.*/\*\*Updated\*\*: $timestamp/" "$file" 2>/dev/null
+      info.log "Updated timestamp in: $file"
+    fi
+  fi
+
+  success.log "Context file ready: $file"
+  RESULT="$file"
+}
+
+claudeCode.session.recover() # <?file:session/agent.context.md> # read and display recovery context
+{
+  local file="${1:-session/agent.context.md}"
+
+  if [ ! -f "$file" ]; then
+    error.log "Context file not found: $file"
+    echo "  Create one with: claudeCode session.save"
+    return 1
+  fi
+
+  echo "╔════════════════════════════════════════════════════════════╗"
+  echo "║              Session Recovery Context                      ║"
+  echo "╠════════════════════════════════════════════════════════════╣"
+  cat "$file"
+  echo ""
+  echo "╚════════════════════════════════════════════════════════════╝"
+
+  RESULT="$file"
+}
+
+claudeCode.session.recover.completion.file() {
+  ls session/*.md 2>/dev/null
+}
+
+claudeCode.status() # # show current claude status (no TUI launch)
+{
+  echo "Claude Code Status"
+  echo "=================="
+
+  # Version
+  local ver
+  ver=$("$CLAUDE_CMD" --version 2>/dev/null | head -1)
+  echo "  Version:  ${ver:-unknown}"
+
+  # Binary location
+  echo "  Binary:   $CLAUDE_CMD"
+
+  # HIVEMIND_ROLE if set
+  if [ -n "${HIVEMIND_ROLE:-}" ]; then
+    echo "  Role:     $HIVEMIND_ROLE"
+  fi
+
+  # Current pane's Claude process
+  if [ -n "$TMUX" ]; then
+    local pane_target
+    pane_target=$(tmux display-message -p "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null)
+    if [ -n "$pane_target" ]; then
+      local pid
+      pid=$(claudeCode.process.find "$pane_target" 2>/dev/null)
+      if [ -n "$pid" ]; then
+        echo "  PID:      $pid (pane $pane_target)"
+        local sid
+        sid=$(claudeCode.session.id "$pane_target" 2>/dev/null)
+        [ -n "$sid" ] && echo "  Session:  $sid"
+      else
+        echo "  Process:  not running in $pane_target"
+      fi
+    fi
+  fi
+
+  echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONTEXT MONITORING (peer observation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.claudeCode.context.parse() {
+  # Parse context percentage from captured pane content
+  # Claude Code TUI shows: "Context left until auto-compact: NN%"
+  local content="$1"
+  local pct
+
+  # Strip ANSI escape codes first
+  local clean
+  clean=$(echo "$content" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+
+  # Pattern 1: "Context left until auto-compact: NN%"
+  pct=$(echo "$clean" | grep -oE 'Context left until auto-compact: [0-9]+%' | grep -oE '[0-9]+' | head -1)
+  [ -n "$pct" ] && echo "$pct" && return 0
+
+  # Pattern 2: "context: NN%" or "Context: NN%"
+  pct=$(echo "$clean" | grep -oiE 'context:\s*[0-9]+%' | grep -oE '[0-9]+' | head -1)
+  [ -n "$pct" ] && echo "$pct" && return 0
+
+  # Pattern 3: Any line with "context" and a percentage nearby
+  pct=$(echo "$clean" | grep -iE 'context.*[0-9]+%' | grep -oE '[0-9]+' | head -1)
+  [ -n "$pct" ] && echo "$pct" && return 0
+
+  # Pattern 4: Look for percentage near bottom of pane (status bar area)
+  pct=$(echo "$clean" | tail -10 | grep -oE '[0-9]+%' | grep -oE '[0-9]+' | head -1)
+  [ -n "$pct" ] && echo "$pct" && return 0
+
+  # Debug: log what we captured if parsing fails
+  debug.log "context.parse failed. First 5 lines: $(echo "$clean" | head -5)"
+  debug.log "context.parse failed. Last 5 lines: $(echo "$clean" | tail -5)"
+
+  return 1
+}
+
+claudeCode.context.jsonl() # <?pane> # find .jsonl file for a pane (per-pane), or most recent if no pane
+{
+  local pane="$1"
+
+  # Per-pane resolution: pane → session UUID → JSONL file
+  if [ -n "$pane" ]; then
+    local sid
+    sid=$(claudeCode.session.id "$pane" 2>/dev/null)
+    if [ -n "$sid" ]; then
+      # Search all project dirs for this UUID
+      for project_dir in "$HOME/.claude/projects"/*/; do
+        local jsonl_file="${project_dir}${sid}.jsonl"
+        if [ -f "$jsonl_file" ]; then
+          echo "$jsonl_file"
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  # Fallback: most recently modified JSONL (for no-pane usage)
+  local project_dirs=(
+    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
+    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
+  )
+
+  local newest_file=""
+  local newest_time=0
+
+  for dir in "${project_dirs[@]}"; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r file; do
+      [ -f "$file" ] || continue
+      local mtime
+      mtime=$(stat -f %m "$file" 2>/dev/null) || continue
+      if [ "$mtime" -gt "$newest_time" ]; then
+        newest_time="$mtime"
+        newest_file="$file"
+      fi
+    done < <(find "$dir" -maxdepth 1 -name "*.jsonl" 2>/dev/null)
+  done
+
+  if [ -n "$newest_file" ]; then
+    echo "$newest_file"
+    return 0
+  fi
+
+  return 1
+}
+claudeCode.context.jsonl.completion() { :; }
+
+private.claudeCode.context.from.jsonl() {
+  # Read context percentage from JSONL token data
+  local jsonl_file="$1"
+  [ -f "$jsonl_file" ] || return 1
+
+  tail -50 "$jsonl_file" | python3 -c "
+import sys, json
+last_usage = None
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+        if d.get('type') == 'assistant':
+            usage = d.get('message', {}).get('usage', {})
+            if usage and 'input_tokens' in usage:
+                last_usage = usage
+    except: pass
+if last_usage:
+    input_t = last_usage['input_tokens']
+    cache_create = last_usage.get('cache_creation_input_tokens', 0)
+    cache_read = last_usage.get('cache_read_input_tokens', 0)
+    total = input_t + cache_create + cache_read
+    pct = round((total / 200000) * 100, 1)
+    remaining = round(100 - pct, 1)
+    print(f'{remaining}')
+else:
+    print('unknown')
+" 2>/dev/null
+}
+
+claudeCode.context.read() # <?pane> # read context % remaining from JSONL token data (falls back to TUI)
+{
+  local pane="$1"
+
+  # Guard: if pane specified, verify Claude is actually running there
+  if [ -n "$pane" ]; then
+    if ! claudeCode.process.running "$pane" 2>/dev/null; then
+      RESULT="no-claude"
+      echo "no-claude"
+      return 1
+    fi
+  fi
+
+  # Try JSONL first (most reliable) — pass pane for per-agent resolution
+  local jsonl_file
+  jsonl_file=$(claudeCode.context.jsonl "$pane")
+  if [ -n "$jsonl_file" ] && [ -f "$jsonl_file" ]; then
+    local pct
+    pct=$(private.claudeCode.context.from.jsonl "$jsonl_file")
+    if [ -n "$pct" ] && [ "$pct" != "unknown" ]; then
+      RESULT="$pct"
+      echo "$pct"
+      return 0
+    fi
+  fi
+
+  # Fall back to TUI scraping if pane specified
+  if [ -n "$pane" ]; then
+    claudeCode.context.read.tui "$pane"
+    return $?
+  fi
+
+  RESULT="unknown"
+  echo "unknown"
+  return 1
+}
+claudeCode.context.read.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.context.read.tui() # <pane> # read context percentage from Claude Code TUI status bar
+{
+  local pane="$1"
+  if [ -z "$pane" ]; then
+    error.log "Usage: claudeCode context.read.tui <pane>"
+    return 1
+  fi
+
+  # Capture FULL pane content — context info can be anywhere
+  local content
+  content=$(tmux capture-pane -t "$pane" -p -S -200 2>/dev/null)
+
+  # Also check visible area (bottom of pane where status bar lives)
+  local visible
+  visible=$(tmux capture-pane -t "$pane" -p 2>/dev/null)
+
+  # Try parsing full content first
+  local pct
+  pct=$(private.claudeCode.context.parse "$content")
+  if [ -n "$pct" ]; then
+    RESULT="$pct"
+    echo "$pct"
+    return 0
+  fi
+
+  # Try visible area (may have fresher status bar)
+  pct=$(private.claudeCode.context.parse "$visible")
+  if [ -n "$pct" ]; then
+    RESULT="$pct"
+    echo "$pct"
+    return 0
+  fi
+
+  RESULT="unknown"
+  echo "unknown"
+  return 1
+}
+claudeCode.context.read.tui.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.context.all() # # show context % for all active sessions
+{
+  local project_dirs=(
+    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
+    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
+  )
+
+  local now
+  now=$(date +%s)
+  local max_age=3600  # Only show sessions modified in last hour
+
+  for dir in "${project_dirs[@]}"; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r file; do
+      [ -f "$file" ] || continue
+      local mtime
+      mtime=$(stat -f %m "$file" 2>/dev/null) || continue
+      local age=$((now - mtime))
+      [ "$age" -gt "$max_age" ] && continue
+
+      local uuid
+      uuid=$(basename "$file" .jsonl)
+      local pct
+      pct=$(private.claudeCode.context.from.jsonl "$file")
+      local mins_ago=$((age / 60))
+      echo "${uuid:0:8}... ${pct}% (${mins_ago}m ago)"
+    done < <(find "$dir" -maxdepth 1 -name "*.jsonl" 2>/dev/null)
+  done
+}
+claudeCode.context.all.completion() { :; }
+
+claudeCode.context.velocity() # <?pane-or-file> # calculate context burn rate (tokens/hour); accepts pane target or JSONL file path
+{
+  local arg="$1"
+  local jsonl_file=""
+
+  # Determine if arg is a file path or a pane target
+  if [ -n "$arg" ] && [ -f "$arg" ]; then
+    jsonl_file="$arg"
+  elif [ -n "$arg" ]; then
+    # Treat as pane target — resolve to JSONL
+    jsonl_file=$(claudeCode.context.jsonl "$arg")
+  else
+    jsonl_file=$(claudeCode.context.jsonl)
+  fi
+
+  [ -z "$jsonl_file" ] || [ ! -f "$jsonl_file" ] && { echo "unknown"; return 1; }
+
+  # Use python3 to parse timestamps and token counts from assistant messages
+  python3 -c "
+import json, sys
+from datetime import datetime
+
+messages = []
+with open('$jsonl_file') as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+            if d.get('type') == 'assistant':
+                msg = d.get('message', {})
+                usage = msg.get('usage', {})
+                if usage and 'input_tokens' in usage:
+                    ts = d.get('timestamp', '')
+                    input_t = usage['input_tokens']
+                    cache_create = usage.get('cache_creation_input_tokens', 0)
+                    cache_read = usage.get('cache_read_input_tokens', 0)
+                    total = input_t + cache_create + cache_read
+                    messages.append({'ts': ts, 'tokens': total})
+        except:
+            pass
+
+if len(messages) < 2:
+    print('unknown')
+    sys.exit(0)
+
+first = messages[0]
+last = messages[-1]
+
+try:
+    t1 = datetime.fromisoformat(first['ts'].replace('Z', '+00:00'))
+    t2 = datetime.fromisoformat(last['ts'].replace('Z', '+00:00'))
+    hours = (t2 - t1).total_seconds() / 3600
+    if hours <= 0:
+        print('unknown')
+        sys.exit(0)
+
+    token_growth = last['tokens'] - first['tokens']
+    tokens_per_hour = token_growth / hours
+
+    # Predict time until 200k (compact threshold ~180k = 90%)
+    current = last['tokens']
+    max_tokens = 200000
+    threshold = int(max_tokens * 0.90)
+    remaining = threshold - current
+
+    if tokens_per_hour > 0 and remaining > 0:
+        hours_left = remaining / tokens_per_hour
+        mins_left = int(hours_left * 60)
+        print(f'{int(tokens_per_hour)} tokens/hr | {current} current | ~{mins_left}min until compact')
+    elif remaining <= 0:
+        print(f'{int(tokens_per_hour)} tokens/hr | {current} current | COMPACT NOW')
+    else:
+        print(f'{int(tokens_per_hour)} tokens/hr | {current} current')
+except Exception as e:
+    print('unknown')
+" 2>/dev/null
+
+  return 0
+}
+claudeCode.context.velocity.completion() { :; }
+
+claudeCode.context.dashboard() # # show velocity dashboard for all active sessions
+{
+  local project_dirs=(
+    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
+    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
+  )
+
+  echo "=== Context Velocity Dashboard ==="
+  echo "Session  | Usage | Rate    | Time Left"
+  echo "---------|-------|---------|----------"
+
+  local now
+  now=$(date +%s)
+
+  for dir in "${project_dirs[@]}"; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r latest; do
+      [ -f "$latest" ] || continue
+
+      # Only show recently modified (last hour)
+      local mtime
+      mtime=$(stat -f %m "$latest" 2>/dev/null) || continue
+      local age=$((now - mtime))
+      [ "$age" -gt 3600 ] && continue
+
+      local uuid
+      uuid=$(basename "$latest" .jsonl)
+      local short="${uuid:0:8}"
+
+      # Get velocity info
+      local info
+      info=$(JSONL_FILE="$latest" python3 -c "
+import json, sys, os
+from datetime import datetime
+
+jsonl_file = os.environ.get('JSONL_FILE', '')
+messages = []
+with open(jsonl_file) as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+            if d.get('type') == 'assistant':
+                usage = d.get('message', {}).get('usage', {})
+                if usage and 'input_tokens' in usage:
+                    total = usage['input_tokens'] + usage.get('cache_creation_input_tokens', 0) + usage.get('cache_read_input_tokens', 0)
+                    messages.append({'ts': d.get('timestamp', ''), 'tokens': total})
+        except: pass
+
+if len(messages) < 2:
+    print('- | - | -')
+    sys.exit(0)
+
+first, last = messages[0], messages[-1]
+try:
+    t1 = datetime.fromisoformat(first['ts'].replace('Z', '+00:00'))
+    t2 = datetime.fromisoformat(last['ts'].replace('Z', '+00:00'))
+    hours = (t2 - t1).total_seconds() / 3600
+    if hours <= 0:
+        print(f\"{round(last['tokens']/200000*100,1)}% | - | -\")
+        sys.exit(0)
+    rate = int((last['tokens'] - first['tokens']) / hours)
+    remaining = 180000 - last['tokens']
+    mins = int(remaining / rate * 60) if rate > 0 and remaining > 0 else 0
+    pct = round(last['tokens'] / 200000 * 100, 1)
+    status = 'COMPACT!' if remaining <= 0 else f'{mins}min'
+    print(f\"{pct}% | {rate}/hr | {status}\")
+except:
+    print('- | - | -')
+" 2>/dev/null)
+
+      echo "$short | $info"
+    done < <(find "$dir" -maxdepth 1 -name "*.jsonl" 2>/dev/null)
+  done
+}
+claudeCode.context.dashboard.completion() { :; }
+
+claudeCode.context.check() # <pane> # check context health: percentage, velocity, log, alert if low
+{
+  local pane="$1"
+
+  if [ -z "$pane" ]; then
+    error.log "Usage: claudeCode context.check <pane>"
+    return 1
+  fi
+
+  # 1. Get context percentage
+  local pct
+  pct=$(claudeCode.context.read "$pane" 2>/dev/null)
+  [ -z "$pct" ] && pct="unknown"
+
+  # 2. Get velocity
+  local velocity ttc
+  velocity=$(claudeCode.context.velocity "$pane" 2>/dev/null)
+  # Extract tokens/hr and time-to-compact
+  local tokens_hr
+  tokens_hr=$(echo "$velocity" | grep -oE '^[0-9]+ tokens/hr' || echo "-")
+  ttc=$(echo "$velocity" | grep -oE '~[0-9]+min' || echo "-")
+
+  # 3. Determine state
+  local state="ok"
+  if [ "$pct" = "unknown" ]; then
+    state="unknown"
+  elif [ "$pct" -le 10 ] 2>/dev/null; then
+    state="CRITICAL"
+  elif [ "$pct" -le 25 ] 2>/dev/null; then
+    state="LOW"
+  fi
+
+  # 4. Log to burn log
+  local workspace
+  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -n "$workspace" ]; then
+    local logfile="${workspace}/session/context-burn-log.md"
+    local ts
+    ts=$(date '+%H:%M')
+    if [ ! -f "$logfile" ]; then
+      echo "| Time | Pane | % | State | Velocity | TTC |" > "$logfile"
+      echo "|------|------|---|-------|----------|-----|" >> "$logfile"
+    fi
+    echo "| $ts | $pane | ${pct}% | $state | $tokens_hr | $ttc |" >> "$logfile"
+  fi
+
+  # 5. Alert if low
+  if [ "$state" = "LOW" ]; then
+    warn.log "$pane: ${pct}% context — alert peer"
+  elif [ "$state" = "CRITICAL" ]; then
+    warn.log "$pane: ${pct}% context — CRITICAL, triggering compact"
+    claudeCode.context.alert "$pane" 10
+  fi
+
+  # 6. Output summary
+  console.log "$pane: ${pct}% | $tokens_hr | $ttc | $state"
+  create.result 0 "$pct"
+  return $(result)
+}
+claudeCode.context.check.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.context.alert() # <pane> <?threshold:20> # alert if context below threshold; sends warning to pane
+{
+  local pane="$1"
+  local threshold="${2:-20}"
+
+  if [ -z "$pane" ]; then
+    error.log "Usage: claudeCode context.alert <pane> <?threshold>"
+    return 1
+  fi
+
+  claudeCode.context.read "$pane" > /dev/null
+  local pct="$RESULT"
+
+  # Can't alert if context is unknown
+  if [ "$pct" = "unknown" ]; then
+    debug.log "Cannot alert $pane — context unknown"
+    return 1
+  fi
+
+  if [ "$pct" -le "$threshold" ] 2>/dev/null; then
+    warn.log "Agent at $pane has ${pct}% context remaining"
+    "$OOSH_DIR/otmux" send.enter "$pane" "CONTEXT: ${pct}% — save state now"
+    return 0
+  fi
+
+  return 1
+}
+claudeCode.context.alert.completion.pane() {
+  tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
+}
+
+claudeCode.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  claudeCode - Claude Code wrapper for oosh
+  Makes cryptic --flags easy to remember!
+
+  Usage:
+  $this: command     Description
+  ─────────────────────────────────────────────────────
+  SESSION MANAGEMENT:
+      list          show session picker (--resume)
+      join <name>   resume specific session (--resume <name>)
+      continue      continue most recent session (--continue)
+      c             shorthand for continue
+      new           start fresh conversation
+
+  OUTPUT MODES:
+      print <msg>   non-interactive output (--print)
+      p <msg>       shorthand for print
+      json <msg>    output as JSON
+      pipe          read from stdin (-p)
+
+  MODELS:
+      opus <msg>    use opus model
+      sonnet <msg>  use sonnet model
+      haiku <msg>   use haiku model
+      model <m>     specify model (--model)
+
+  PERMISSIONS:
+      yolo <msg>    skip all prompts (--dangerously-skip-permissions)
+      dangerously   same as yolo
+
+  CONFIGURATION:
+      config        open settings
+      doctor        check setup
+      init          initialize directory
+      mcp           manage MCP servers
+
+  INSTALLATION:
+      install       install claude code from web for linux
+      uninstall     remove claude code installation
+      update        update claude code to latest version
+      login         authenticate with claude
+      logout        log out from claude
+
+  AGENT SUPPORT:
+      agent.start       start claude code in pane
+      session.save      save context to file
+      session.recover   read recovery context
+      process.find      find Claude PID for a tmux pane
+      process.running   check if Claude is running in pane
+      session.id        get session UUID for a tmux pane
+
+  CONTEXT MONITORING:
+      context.read <pane>     read context % from JSONL token data
+      context.check <pane>    full health check: %, velocity, log, alert
+      context.velocity <pane> token burn rate and time-to-compact
+      context.all             show context % for all active sessions
+      context.alert <pane>    alert if context below threshold (default 20%)
+
+  OTHER:
+      verbose       verbose output
+      maxTurns <n>  limit turns
+      help          show claude --help
+      v             show version
+  ─────────────────────────────────────────────────────
+
+  Examples:
+    $this list                    # pick a session to resume
+    $this continue                # continue last session
+    $this join my-feature         # resume 'my-feature' session
+    $this opus 'explain this'     # use opus model
+    $this print 'quick question'  # get answer and exit
+    $this yolo 'fix all tests'    # no permission prompts
+    $this session.save            # save agent context
+    $this session.recover         # read recovery context
+    cat file.py | $this pipe 'review this'
+  "
+}
+
+claudeCode.start()
+{
+  #echo "sourcing init"
+  source this
+
+  if [ -z "$1" ]; then
+    # No arguments - start interactive claude
+    "$CLAUDE_CMD"
+    return 0
+  fi
+
+  this.start "$@"
+}
+
+claudeCode.start "$@"

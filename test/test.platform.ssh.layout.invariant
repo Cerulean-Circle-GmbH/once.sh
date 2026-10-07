@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+TEST_CATEGORY=platform
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# platform.ssh.layout.invariant — asserts every user's ~/.ssh matches the
+# canonical OOSH layout that root gets at install time. Run inside any
+# platform.test container (test/oosh-user/bash-user shell):
+#
+#   cd ~/oosh && ./test.suite run platform.ssh.layout.invariant 1
+#
+# Canonical layout (per `sudo tree -L 3 /root/.ssh` on a fresh install):
+#
+#   ~/.ssh/
+#   ├── id_ed25519, id_ed25519.pub      (the user's keypair)
+#   ├── config, known_hosts             (ssh client config; config has Host github.com)
+#   ├── ids/                            (oosh "identity bag")
+#   │   ├── ssh.developking/            (github + LAN role; id_rsa is the
+#   │   │   │                            single source of truth for github
+#   │   │   │                            access — replaces legacy ~/.ssh/2cuGitHub)
+#   │   │   ├── id_rsa, id_rsa.pub
+#   │   │   ├── known_hosts
+#   │   │   └── private_key/, public_keys/   (real-file copies, mode 600/644)
+#   │   ├── ssh.<installer-id>/         (oosh installer role)
+#   │   └── ssh.outeruser/              (outer user role for proxy-jump)
+#   ├── private_key/<id>.private_key    (real file, byte-equal to id_ed25519)
+#   └── public_keys/<id>.public_key     (real file, byte-equal to id_ed25519.pub)
+#
+# Without this test, the gap that surfaced post-bisect (commit d9adb27
+# dropped osshLayout build for non-root users) could regress silently.
+# This test pins the invariant.
+
+sshDir="$HOME/.ssh"
+
+# (1) ~/.ssh exists, mode 700, owned by current user
+test.case $level "ssh.layout: ~/.ssh exists" test -d "$sshDir"
+if [ ! -d "$sshDir" ]; then
+  expect.fail "$sshDir missing"
+  test.suite.save.results
+  return 0 2>/dev/null || exit 0
+else
+  expect.pass "$sshDir present"
+fi
+
+owner=$(stat -c '%U' "$sshDir" 2>/dev/null) || owner=$(stat -f '%Su' "$sshDir" 2>/dev/null)
+mode=$(stat -c '%a' "$sshDir" 2>/dev/null) || mode=$(stat -f '%Lp' "$sshDir" 2>/dev/null)
+
+test.case $level "ssh.layout: owner=$USER" true
+if [ "$owner" = "$USER" ]; then
+  expect.pass "owner=$owner"
+else
+  expect.fail "owner=$owner expected $USER on $sshDir"
+fi
+
+test.case $level "ssh.layout: mode 700" true
+if [ "$mode" = "700" ]; then
+  expect.pass "mode=$mode"
+else
+  expect.fail "mode=$mode expected 700 on $sshDir (sshd StrictModes requires 700)"
+fi
+
+# (2) ids/ directory exists
+test.case $level "ssh.layout: ~/.ssh/ids/ exists" test -d "$sshDir/ids"
+if [ -d "$sshDir/ids" ]; then
+  expect.pass "$sshDir/ids/ present"
+else
+  expect.fail "$sshDir/ids/ missing — osshLayout build did not run for $USER"
+fi
+
+# (3) ids/ssh.developking/id_rsa exists (the deploy key)
+test.case $level "ssh.layout: ids/ssh.developking/id_rsa exists" \
+  test -f "$sshDir/ids/ssh.developking/id_rsa"
+if [ -f "$sshDir/ids/ssh.developking/id_rsa" ]; then
+  expect.pass "deploy key present"
+else
+  expect.fail "$sshDir/ids/ssh.developking/id_rsa missing"
+fi
+
+# (4) ids/ssh.developking/id_rsa.pub exists
+test.case $level "ssh.layout: ids/ssh.developking/id_rsa.pub exists" \
+  test -f "$sshDir/ids/ssh.developking/id_rsa.pub"
+if [ -f "$sshDir/ids/ssh.developking/id_rsa.pub" ]; then
+  expect.pass "deploy pubkey present"
+else
+  expect.fail "$sshDir/ids/ssh.developking/id_rsa.pub missing"
+fi
+
+# (5) ids/ has at least one installer-identity subdir (besides ssh.developking)
+installerCount=0
+if [ -d "$sshDir/ids" ]; then
+  for d in "$sshDir/ids"/ssh.*; do
+    [ -d "$d" ] || continue
+    [ "$(basename "$d")" = "ssh.developking" ] && continue
+    installerCount=$((installerCount + 1))
+  done
+fi
+test.case $level "ssh.layout: ids/ has installer identity besides ssh.developking" true
+if [ "$installerCount" -ge 1 ]; then
+  expect.pass "$installerCount additional identity dir(s) under ids/"
+else
+  expect.fail "ids/ has no installer identity (expected ssh.<installer> directory)"
+fi
+
+# (6) private_key/ contains at least one REAL FILE (not symlink) byte-equal to ../id_ed25519
+privateCopies=0
+if [ -d "$sshDir/private_key" ]; then
+  for f in "$sshDir/private_key"/*; do
+    [ -f "$f" ] || continue
+    [ -L "$f" ] && continue
+    if cmp -s "$f" "$sshDir/id_ed25519" 2>/dev/null \
+       || cmp -s "$f" "$sshDir/id_rsa" 2>/dev/null; then
+      privateCopies=$((privateCopies + 1))
+    fi
+  done
+fi
+test.case $level "ssh.layout: private_key/ has real-file copy of id_ed25519 (not symlink)" true
+if [ "$privateCopies" -ge 1 ]; then
+  expect.pass "$privateCopies real-file copy(ies) of private key"
+else
+  expect.fail "private_key/ has no real-file copy of ../id_ed25519 (symlinks no longer permitted — see osshLayout perms helper)"
+fi
+
+# (6b) every file under top-level private_key/ is a real file with mode 600
+test.case $level "ssh.layout: every file in private_key/ is real + mode 600" true
+badPriv=""
+if [ -d "$sshDir/private_key" ]; then
+  for f in "$sshDir/private_key"/*; do
+    [ -e "$f" ] || continue
+    if [ -L "$f" ]; then
+      badPriv="$badPriv [symlink:$f]"
+      continue
+    fi
+    fmode=$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null)
+    [ "$fmode" = "600" ] || badPriv="$badPriv [mode$fmode:$f]"
+  done
+fi
+if [ -z "$badPriv" ]; then
+  expect.pass "all files real, mode 600"
+else
+  expect.fail "violations:$badPriv"
+fi
+
+# (7) public_keys/ contains at least one REAL FILE (not symlink) byte-equal to ../id_ed25519.pub
+publicCopies=0
+if [ -d "$sshDir/public_keys" ]; then
+  for f in "$sshDir/public_keys"/*; do
+    [ -f "$f" ] || continue
+    [ -L "$f" ] && continue
+    if cmp -s "$f" "$sshDir/id_ed25519.pub" 2>/dev/null \
+       || cmp -s "$f" "$sshDir/id_rsa.pub" 2>/dev/null; then
+      publicCopies=$((publicCopies + 1))
+    fi
+  done
+fi
+test.case $level "ssh.layout: public_keys/ has real-file copy of id_ed25519.pub (not symlink)" true
+if [ "$publicCopies" -ge 1 ]; then
+  expect.pass "$publicCopies real-file copy(ies) of public key"
+else
+  expect.fail "public_keys/ has no real-file copy of ../id_ed25519.pub (symlinks no longer permitted)"
+fi
+
+# (7b) every file under top-level public_keys/ is a real file with mode 644
+test.case $level "ssh.layout: every file in public_keys/ is real + mode 644" true
+badPub=""
+if [ -d "$sshDir/public_keys" ]; then
+  for f in "$sshDir/public_keys"/*; do
+    [ -e "$f" ] || continue
+    if [ -L "$f" ]; then
+      badPub="$badPub [symlink:$f]"
+      continue
+    fi
+    fmode=$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null)
+    [ "$fmode" = "644" ] || badPub="$badPub [mode$fmode:$f]"
+  done
+fi
+if [ -z "$badPub" ]; then
+  expect.pass "all files real, mode 644"
+else
+  expect.fail "violations:$badPub"
+fi
+
+# (7c) ids/ tree: every ids/ssh.*/private_key/ and public_keys/ subdir is mode 700,
+#      every contained file is a real file (not a symlink) with the right perms
+test.case $level "ssh.layout: ids/ tree perms (700 dirs, 600 priv, 644 pub, no symlinks)" true
+badIds=""
+if [ -d "$sshDir/ids" ]; then
+  idsMode=$(stat -c '%a' "$sshDir/ids" 2>/dev/null || stat -f '%Lp' "$sshDir/ids" 2>/dev/null)
+  [ "$idsMode" = "700" ] || badIds="$badIds [ids/=mode$idsMode]"
+  for d in "$sshDir/ids"/ssh.*; do
+    [ -d "$d" ] || continue
+    dMode=$(stat -c '%a' "$d" 2>/dev/null || stat -f '%Lp' "$d" 2>/dev/null)
+    [ "$dMode" = "700" ] || badIds="$badIds [$d=mode$dMode]"
+    for sub in "$d/private_key" "$d/public_keys"; do
+      [ -d "$sub" ] || continue
+      sMode=$(stat -c '%a' "$sub" 2>/dev/null || stat -f '%Lp' "$sub" 2>/dev/null)
+      [ "$sMode" = "700" ] || badIds="$badIds [$sub=mode$sMode]"
+      for f in "$sub"/*; do
+        [ -e "$f" ] || continue
+        if [ -L "$f" ]; then
+          badIds="$badIds [symlink:$f]"
+          continue
+        fi
+        fmode=$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null)
+        case "$sub" in
+          */private_key) [ "$fmode" = "600" ] || badIds="$badIds [$f=mode$fmode want600]" ;;
+          */public_keys) [ "$fmode" = "644" ] || badIds="$badIds [$f=mode$fmode want644]" ;;
+        esac
+      done
+    done
+  done
+fi
+if [ -z "$badIds" ]; then
+  expect.pass "ids/ tree clean"
+else
+  expect.fail "violations:$badIds"
+fi
+
+# (8) Standalone ~/.ssh/2cuGitHub deploy key file should NOT exist anymore.
+#     Same key material lives at ids/ssh.developking/id_rsa (single source).
+test.case $level "ssh.layout: no standalone ~/.ssh/2cuGitHub" true
+if [ ! -e "$sshDir/2cuGitHub" ]; then
+  expect.pass "$sshDir/2cuGitHub absent (good — github access goes via ids/ssh.developking/id_rsa)"
+else
+  expect.fail "$sshDir/2cuGitHub still present — Phase 3 expected this to be removed"
+fi
+
+# (8b) Host github.com block in config (replaces the old Host 2cuGitHub block)
+test.case $level "ssh.layout: ~/.ssh/config has Host github.com block" true
+if [ -f "$sshDir/config" ] && grep -q "^Host github.com\$" "$sshDir/config"; then
+  expect.pass "Host github.com present"
+else
+  expect.fail "Host github.com missing from $sshDir/config — git@github.com clones will not resolve"
+fi
+
+# (9) Phase A.5 invariant: no IdentityFile in ~/.ssh/config may use a hardcoded
+#     /home/ or /Users/ path. Every IdentityFile must use a portable form
+#     (~/.ssh/...). Catches three concrete pre-Phase-A.5 regressions:
+#       - WODA Host blocks emitting /home/<user>/.ssh/id_ed25519 (Phase 1)
+#       - Runner self-config emitting /home/<runner>/.ssh/id_ed25519
+#         (Phase A.5 — runner-side path that doesn't exist on remote)
+#       - Any future drift back toward $HOME-expanded paths
+test.case $level "ssh.layout: no hardcoded /home/ or /Users/ in IdentityFile lines" true
+hardcoded=""
+if [ -f "$sshDir/config" ]; then
+  hardcoded=$(grep -nE "^[[:space:]]*IdentityFile[[:space:]]+(/home/|/Users/)" "$sshDir/config" || true)
+fi
+if [ -z "$hardcoded" ]; then
+  expect.pass "all IdentityFile lines use portable paths"
+else
+  expect.fail "found hardcoded paths in ~/.ssh/config: $hardcoded"
+fi
+
+test.suite.save.results

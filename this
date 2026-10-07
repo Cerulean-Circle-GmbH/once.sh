@@ -7,10 +7,24 @@ export PS4='\e[90m  ${BASH_SOURCE[0]##*/} -> ${BASH_SOURCE[1]##*/}: ${FUNCNAME[0
 if [ -n "$SH_OPT" ]; then set $SH_OPT; fi # force debug
 
 
+# Set group-writable umask for multi-user installs (detected by 'dev' group membership)
+if id -nG 2>/dev/null | grep -qw dev; then
+  umask 002
+fi
+
 if [ -z "$LOG_LEVEL" ]; then
   export LOG_LEVEL=3
-  export LOG_DEVICE=/dev/stdout
-  #export LOG_DEVICE=/dev/tty
+fi
+if [ -z "$LOG_DEVICE" ] || [ ! -w "$LOG_DEVICE" ] || { [ "$LOG_DEVICE" = "/dev/null" ] && [ -t 1 ]; }; then
+  if [ -t 1 ] && [ -w "$(tty 2>/dev/null)" ]; then
+    export LOG_DEVICE="$(tty)"
+  elif [ -w /proc/self/fd/1 ]; then
+    export LOG_DEVICE=/proc/self/fd/1
+  elif [ -w /dev/tty ]; then
+    export LOG_DEVICE=/dev/tty
+  else
+    export LOG_DEVICE=/dev/null
+  fi
 fi
 
 
@@ -23,28 +37,470 @@ if [ "$EXPECTED_RETURN_VALUE" -lt 1 ]; then
 fi
 
 
+# THE CLEAN BOOT: `env -i` wipes the environment — the boss's recovery route,
+# and what every `user login` does (`env -i su - <user>`) — and oosh constructs
+# it again. HOME is the one thing nothing else can supply: left unset,
+# CONFIG_PATH degrades to /config and OOSH_DIR to /oosh, and a `user login`
+# from an empty shell ran `config save` into /config. Derive it from the OS
+# IDENTITY, not the environment: bash's ~user expansion reads the password
+# database on macOS and Linux alike (the MacStudio `this`,
+# T-THIS-ENV-I-DERIVES-HOME). A shell with HOME set pays one test.
+if [ -z "$HOME" ]; then
+  derivedHome=$(eval echo ~"$(id -un 2>/dev/null)" 2>/dev/null)
+  # reject a failed expansion (a literal ~user when there is no passwd entry)
+  case "$derivedHome" in ''|'~'*) derivedHome="" ;; esac
+  [ -n "$derivedHome" ] && export HOME="$derivedHome"
+  unset derivedHome
+fi
+# OOSH_DIR is ALWAYS ~/oosh — a constant (docs/config.md § The anchor rule),
+# carried by oosh.env as "$HOME/oosh". This is only a fallback for contexts that
+# have not read user.env yet (a mid-install sub-shell): same literal value,
+# never a BASH_SOURCE/$0 walk, never a resolved physical path.
+# path-exception: the same fallback, one line down — without $OOSH_DIR on PATH
+# nothing in oosh resolves, and user.env has not been read in these contexts.
 if [ -z "$OOSH_DIR" ]; then
-  OOSH_DIR=$( cd "$(dirname ${BASH_SOURCE[0]})" ; pwd ) 
-  if [ "$OOSH_DIR" = "." ]; then
-    OOSH_DIR=$(pwd)
-  fi
-  if [ "$OOSH_DIR" = "$USERHOME/init" ]; then
-    OOSH_DIR="$USERHOME/oosh"
-  fi
+  OOSH_DIR="$HOME/oosh"
   PATH="$OOSH_DIR:$PATH"
 fi
 
+# Ensure $SUDO is set for ALL oosh contexts. bashrcTemplate exports it
+# for interactive shells, but ssh-with-command (e.g. ossh exec.tty) on
+# distros without Debian's SSH_SOURCE_BASHRC bash patch (Alpine/musl)
+# won't source bashrc — leaving privileged ops like user.create's
+# `$SUDO useradd` to run unprivileged and fail with "Permission
+# denied". Self-heal here so every oosh script invocation has a
+# reliable $SUDO contract regardless of shell-startup quirks.
+# Use ${SUDO+x} to distinguish unset from explicitly-empty (root sets
+# SUDO="" intentionally; we must not clobber that).
+if [ -z "${SUDO+x}" ]; then
+  if [ "$(id -u 2>/dev/null)" = "0" ]; then
+    export SUDO=""
+  else
+    export SUDO="sudo "
+  fi
+fi
+
+# Ensure $USER is set for ALL oosh contexts — the same contract as $SUDO.
+# Login sets USER; bash does NOT. `env -i bash` — and init/oosh's clean
+# re-exec — arrive here with it empty, and install state 13
+# (private.check.priviledges.checked) routes root vs user on
+# `[ "$USER" = root ]`: an empty USER sent a root install down the user lane.
+# Self-heal from the process identity, as $SUDO does above.
+if [ -z "$USER" ]; then
+  USER=$(id -un 2>/dev/null)
+  export USER
+fi
+
+private.log.install.append() # <prefix> <messageBody> # idempotent guarded append to $LOG_INSTALL: skip silently when LOG_INSTALL is unset OR not writable. <prefix> is the level tag (INFO/CONSOLE/SUCCESS/...); <messageBody> is the message body. Eliminates the 11-site copy-paste of `[ -n "$LOG_INSTALL" ] && [ -w "$LOG_INSTALL" ] && echo -e "..." >>"$LOG_INSTALL" 2>/dev/null` previously duplicated across log + this. Lives in `this` (not `log`) so info.log can reach it during early bootstrap before `log` is sourced. Output byte-identical to the prior pattern (BASH_SOURCE[1] = caller log function file, BASH_SOURCE[2] = user script, FUNCNAME[2] = user function, BASH_LINENO[1] = user line).
+{
+  [ -n "$LOG_INSTALL" ] && [ -w "$LOG_INSTALL" ] || return 0
+  echo -e "$1: ${BASH_SOURCE[1]##*/} -> ${BASH_SOURCE[2]##*/}: ${FUNCNAME[2]}:${BASH_LINENO[1]} > $2" >>"$LOG_INSTALL" 2>/dev/null
+}
+
+private.this.device.is.terminal()     # <device> # rc 0 when the log device is terminal-type (unset, stdout or fd1, stderr or fd2, the tty), written by a dup of fd2, never probed, never stdout; the ONE list info.log and log share #
+{
+ # A predicate: rc only. The ONE list of terminal-type devices (#41): they are
+ # written through a dup of fd2 and never probed by log.device — stdout among
+ # them, so nothing lands in a $() capture. Created by oo method.new and moved
+ # up here, above info.log: the kernel logs before log is loaded, and log's
+ # private.log.emit asks the same predicate — the list was spelled in both
+ # (T-LOG-TERMINAL-ONE-LIST). Plain case, bash 3.2 clean.
+ case "${1:-}" in
+   ""|/dev/stdout|/dev/stderr|/proc/self/fd/1|/dev/fd/1|/proc/self/fd/2|/dev/fd/2|/dev/tty) return 0 ;;
+ esac
+ return 1
+}
+
 info.log() {
+  private.log.install.append "INFO" "$*"
   if [ "$LOG_LEVEL" -gt "3" ]; then
-    echo -e "\e[90mINFO> $*\e[0m" >>$LOG_DEVICE ## normal
+    # The rule of log's private.log.emit — this is the kernel and runs before
+    # log is loaded: a terminal-type device is fd2 by dup (never a reopen,
+    # never fd1), a file is appended, an unwritable one falls back to fd2.
+    if private.this.device.is.terminal "${LOG_DEVICE:-}"; then
+      echo -e "\e[90mINFO> $*\e[0m" >&2
+    else
+      { echo -e "\e[90mINFO> $*\e[0m" >>"$LOG_DEVICE"; } 2>/dev/null || echo -e "\e[90mINFO> $*\e[0m" >&2
+    fi
   fi
 }
 
 this.isNumber() {
-  case $1 in
-  '' | *[!0-9]*) return 1 ;;
-  *) return 0 ;;
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+private.ensure.groupWrite() { # <file...> # ensure files are group-writable (multi-user installs)
+  local f
+  for f in "$@"; do
+    chmod g+w "$f" 2>/dev/null
+    # Fix group ownership if dev group exists (multi-user installs)
+    if getent group dev >/dev/null 2>&1; then
+      chgrp dev "$f" 2>/dev/null
+    fi
+  done
+}
+
+private.this.group.create() { # <groupName> <?gid> # cross-platform create a system group if it does not exist, with number <gid> when given. Idempotent — succeeds silently when the group is already there. Through $SUDO (empty for root). Uses the first that exists of groupadd (RHEL/Debian/most Linux), addgroup (Alpine/busybox-based images), dseditgroup (macOS), once — its failure is the answer; only when none exists a /etc/group append (never on macOS, never a number another group holds).
+  # Sibling to private.this.group.exists. Used by install state machine
+  # (state 31 step 1) to ensure the `dev` group exists before any
+  # user.group.add invocation, and by odocker for the group of the docker
+  # socket's number (T-THIS-GROUP-CREATE-GID). On Alma minimal `groupadd` is
+  # present; on Alpine 3.x only `addgroup` (busybox) is — neither image ships
+  # both; macOS has dseditgroup.
+  local name="$1" gid="$2" cmd cmdPath
+  if private.this.group.exists "$name"; then
+    return 0
+  fi
+  if [ -n "$gid" ] && ! this.isNumber "$gid"; then
+    error.log "private.this.group.create: group number '$gid' is not a number"
+    return 1
+  fi
+  # The FIRST tool that exists is used, once: its failure (a wrong sudo
+  # password, no rights) is the answer. Going on to the next one ran Debian's
+  # perl addgroup with busybox syntax — a second password prompt and a
+  # misparsed command (T-THIS-GROUP-CREATE-FAIL).
+  for cmd in groupadd addgroup dseditgroup; do
+    # path-exception: a lookup for this one command, PATH itself stays — Debian
+    # puts groupadd in /usr/sbin, which is not on a normal user's PATH.
+    cmdPath=$(PATH="$PATH:/usr/sbin:/sbin" command -v "$cmd" 2>/dev/null) || continue
+    # The one platform difference: how each program spells the number.
+    case "$cmd" in
+      dseditgroup) $SUDO "$cmdPath" -o create ${gid:+-i "$gid"} "$name" >/dev/null 2>&1 && return 0 ;;
+      *)           $SUDO "$cmdPath" ${gid:+-g "$gid"} "$name" >/dev/null 2>&1 && return 0 ;;
+    esac
+    error.log "private.this.group.create: $cmd could not create group '$name'${gid:+ with number $gid}"
+    return 1
+  done
+  # Last resort, only where no tool exists: <gid>, else the next free GID
+  # >=500, appended to the group file. Sufficient for OOSH's needs (just
+  # owning the group); login-shell group resolution will pick it up. No group
+  # file on macOS (private.this.group.file.get): Directory Services ignores it.
+  local groupFile holder
+  groupFile=$(private.this.group.file.get)
+  if [ -z "$groupFile" ]; then
+    error.log "private.this.group.create: cannot create group '$name' — no group tool, and no group file on this system"
+    return 1
+  fi
+  # A given number another group holds is never written a second time.
+  if [ -n "$gid" ]; then
+    holder=$(private.this.group.name.get "$gid")
+    [ -z "$holder" ] && holder=$(grep -E "^[^:]*:[^:]*:${gid}:" "$groupFile" 2>/dev/null | cut -d: -f1 | head -n 1)
+    if [ -n "$holder" ]; then
+      error.log "private.this.group.create: group number $gid is held by '$holder' — '$name' not created"
+      return 1
+    fi
+  fi
+  warn.log "private.this.group.create: neither groupadd, addgroup nor dseditgroup exists — appending to $groupFile"
+  if [ -w "$groupFile" ] || [ "$(id -u 2>/dev/null)" = "0" ]; then
+    local nextGid="${gid:-500}"
+    while [ -z "$gid" ] && grep -qE "^[^:]*:[^:]*:${nextGid}:" "$groupFile" 2>/dev/null; do
+      nextGid=$((nextGid + 1))
+    done
+    echo "$name:x:${nextGid}:" >> "$groupFile" 2>/dev/null && return 0
+  fi
+  error.log "private.this.group.create: cannot create group '$name' — no groupadd, addgroup or dseditgroup, cannot write $groupFile"
+  return 1
+}
+
+private.this.group.exists() { # <groupName> # cross-platform check if a system group exists (returns 0 if found)
+  # Kernel-level helper so any script can call it without depending on `os`
+  # or `user` being sourced. $OSTYPE is a bash builtin — available everywhere.
+  # macOS uses dscl (Directory Services); Linux uses getent (NSS) with a
+  # /etc/group fallback for minimal images that lack getent.
+  case "$OSTYPE" in
+    darwin*)
+      command -v dscl >/dev/null 2>&1 && dscl . -read /Groups/"$1" >/dev/null 2>&1
+      ;;
+    *)
+      if command -v getent >/dev/null 2>&1; then
+        getent group "$1" >/dev/null 2>&1
+      else
+        grep -qE "^${1}:" /etc/group 2>/dev/null
+      fi
+      ;;
   esac
+}
+
+private.this.path.canonical() { # <path> # echo canonical absolute path; portable across GNU readlink -f and BSD/macOS
+  # Tries GNU `readlink -f` first (Linux, macOS 12.3+) then falls back to
+  # `cd && pwd -P` for older BSD readlink that lacks -f. For non-existent
+  # paths echoes the input unchanged (matches readlink -f semantics on input
+  # that exists at the leaf level only).
+  local p="$1"
+  [ -z "$p" ] && return 1
+  local r
+  r=$(readlink -f "$p" 2>/dev/null)
+  if [ -n "$r" ]; then
+    printf '%s\n' "$r"
+    return 0
+  fi
+  if [ -d "$p" ]; then
+    r=$(cd "$p" 2>/dev/null && pwd -P) && [ -n "$r" ] && { printf '%s\n' "$r"; return 0; }
+  fi
+  if [ -L "$p" ]; then
+    local target
+    target=$(readlink "$p" 2>/dev/null)
+    case "$target" in
+      /*) r=$(cd "$target" 2>/dev/null && pwd -P) && [ -n "$r" ] && { printf '%s\n' "$r"; return 0; } ;;
+      *)  r=$(cd "$(dirname "$p")/$target" 2>/dev/null && pwd -P) && [ -n "$r" ] && { printf '%s\n' "$r"; return 0; } ;;
+    esac
+  fi
+  printf '%s\n' "$p"
+}
+
+private.this.host.name.get()     # <?form:full> # echo the host name of this computer: the hostname program when it exists, else the HOSTNAME of bash; form short is the name up to the first dot; nothing and rc 1 for an unknown form or no name #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # Created by oo method.new and moved up here: log's default LOG_NAME needs it,
+ # and `this` loads log (through debug, further down) before the kernel's
+ # later methods exist. AlmaLinux 9's minimal image has no `hostname` program —
+ # in a container the name fell back to "localhost"; bash always sets
+ # $HOSTNAME. The short form is cut here, not by `hostname -s`
+ # (T-THIS-HOST-NAME-GET, T-CONFIG-HOST-NAME-NO-HOSTNAME, T-LOG-NAME-NO-HOSTNAME).
+ local form="${1:-full}" name=""
+ case "$form" in full|short) ;; *) return 1 ;; esac
+ command -v hostname >/dev/null 2>&1 && name=$(hostname 2>/dev/null)
+ [ -n "$name" ] || name="${HOSTNAME:-}"
+ [ -n "$name" ] || return 1
+ [ "$form" = short ] && name="${name%%.*}"
+ echo "$name"
+}
+
+private.this.anchor.validate.one() # <anchor> <leaf> <treeRoot> # scan <treeRoot> for assignments of <anchor>; echo the verdict; rc 0 clean / 1 violations
+{
+  local anchor="$1" leaf="$2" treeRoot="$3"
+  # Without ogit there is no scan, and no scan must never read as OK
+  # (T-THIS-OGIT-LOAD-PROBE).
+  if ! private.this.script.load ogit ogit.repo.grep; then
+    error.log "this.anchor.validate: cannot load ogit.repo.grep from $OOSH_DIR/ogit"
+    echo "INVALID: $anchor in $treeRoot — not scanned, ogit could not be loaded"
+    return 1
+  fi
+  # ONE scan of the tracked tree (git grep = a single process, and it honours
+  # .gitignore). Excluded on purpose: docs/ (prose about the rule), test/
+  # (fixtures legitimately point an anchor at a fixture dir), .claude/ and
+  # *.md/*.json (tool config and documentation, not runnable oosh code).
+  # Marker slug is derived from the variable name, so each anchor gets its own:
+  # OOSH_DIR -> "# oosh-dir-exception:", CONFIG_PATH -> "# config-path-exception:".
+  # NOT `${anchor,,}`. That is bash 4+, and on macOS /bin/bash 3.2 it is a "bad
+  # substitution" — so `this anchor.validate` produced NO VERDICT AT ALL on any
+  # macOS shell that had not already been re-pathed to brew bash. A validator
+  # that silently declines to validate is worse than none. Found by the 2026-09-17
+  # macOS gate, same class as config.save's `${file^^}`; `${slug//_/-}` is bash
+  # 3.1 and stays.
+  local slug; slug=$(printf '%s' "$anchor" | tr '[:upper:]' '[:lower:]')
+  slug="${slug//_/-}"
+
+  # The grep, the comment skip and the markers are the kernel's one sweep.
+  local matches
+  matches=$(private.this.marker.sweep "(export[[:space:]]+${anchor}=|^[[:space:]]*${anchor}=|\\\$\\{${anchor}:=)" "$slug" "$treeRoot" \
+              ':!docs' ':!test' ':!.claude' ':!*.md' ':!*.json')
+
+  local conforming=0 exceptions=0 violations=0
+  local hit class match file lineNo content trimmed
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    class="${hit%% *}"
+    match="${hit#* }"
+    file="${match%%:*}"
+    content="${match#*:}"
+    lineNo="${content%%:*}"
+    content="${content#*:}"
+    trimmed="${content#"${content%%[![:space:]]*}"}"
+
+    # A line that only TALKS about the anchor is not an assignment.
+    [ "$class" = comment ] && continue
+
+    # Self-assignment (`X=$X`) is a no-op — it appears inside `config`'s and
+    # `test.suite`'s usage banners, where a marker comment would be PRINTED to
+    # the user. It cannot violate the rule, so it is not an assignment site.
+    case "$trimmed" in
+      "${anchor}=\$${anchor}" | "${anchor}=\"\$${anchor}\"") continue ;;
+    esac
+
+    # Sanctioned exception: marked on the line itself, in the few lines just
+    # above, or file-wide (private.this.marker.sweep).
+    if [ "$class" = marked ]; then
+      exceptions=$((exceptions + 1)); continue
+    fi
+
+    # Conforming: the constant, and nothing else. `"$HOME/<leaf>"` /
+    # `$HOME/<leaf>` / `~/<leaf>` (a BARE tilde expands; a quoted one does not).
+    # A `pwd -P`, a `readlink -f`, a BASH_SOURCE/$0 walk or any physical path
+    # is a violation.
+    if printf '%s' "$trimmed" \
+       | grep -qE "^(export[[:space:]]+)?${anchor}=(\"\\\$HOME/${leaf}\"|\\\$HOME/${leaf}|~/${leaf})[[:space:]]*\$"; then
+      conforming=$((conforming + 1)); continue
+    fi
+    if printf '%s' "$trimmed" \
+       | grep -qE "^:[[:space:]]+\\\$\\{${anchor}:=(\"\\\$HOME/${leaf}\"|\\\$HOME/${leaf}|~/${leaf})\\}[[:space:]]*\$"; then
+      conforming=$((conforming + 1)); continue
+    fi
+
+    error.log "this.anchor.validate: $file:$lineNo does not set $anchor to ~/$leaf: $trimmed"
+    violations=$((violations + 1))
+  done <<< "$matches"
+
+  if [ "$violations" -gt 0 ]; then
+    error.log "this.anchor.validate: $anchor — $violations violation(s); it is always \$HOME/$leaf (see ${YELLOW}docs/config.md${NORMAL} § The anchor rule). Resolve physical paths at point of use with private.this.path.canonical, or mark a genuine exception with '# ${slug}-exception: <reason>'"
+    echo "INVALID: $anchor in $treeRoot — $violations violation(s), $conforming conforming, $exceptions exception(s)"
+    return 1
+  fi
+  echo "OK: $anchor in $treeRoot — $conforming conforming, $exceptions exception(s), 0 violations"
+  return 0
+}
+
+this.anchor.validate() # <?anchor:all> <?treeRoot:$OOSH_DIR> # verify every assignment of a path anchor (all|OOSH_DIR|CONFIG_PATH) in the tree is its ~/… constant; rc 1 + report on any violation
+{
+  # THE RULE (docs/config.md § The anchor rule): the per-user path anchors are ALWAYS the symlink
+  # in the user's home — OOSH_DIR is ~/oosh, CONFIG_PATH is ~/config — written
+  # "$HOME/…" because a quoted tilde does not expand. They are therefore
+  # CONSTANTS: switching branches or re-pointing the shared tree moves only what
+  # the symlink points AT. Code that needs the PHYSICAL directory resolves it at
+  # point of use with private.this.path.canonical; it must never be baked in.
+  #
+  # Shaped like config.validate / context.validate: one tree scan per anchor, a
+  # verdict echoed to stdout (so it survives any LOG_LEVEL — the status-output
+  # idiom), create.result / return $(result).
+  local anchor="${1:-all}" treeRoot="${2:-$OOSH_DIR}"
+  if [ ! -d "$treeRoot" ]; then
+    error.log "this.anchor.validate: no such directory: $treeRoot"
+    echo "INVALID: no such directory: $treeRoot"
+    create.result 2 "no such directory: $treeRoot"
+    return $(result)
+  fi
+  # A sweep that reads nothing must not report OK (T-ANCHOR-VALIDATE-BLIND).
+  private.this.tree.tracked.check "$treeRoot" this.anchor.validate || return $(result)
+
+  local rc=0 verdicts=""
+  local pair name leaf
+  for pair in "OOSH_DIR:oosh" "CONFIG_PATH:config"; do
+    name="${pair%%:*}"
+    leaf="${pair##*:}"
+    [ "$anchor" = "all" ] || [ "$anchor" = "$name" ] || continue
+    verdicts="${verdicts}$(private.this.anchor.validate.one "$name" "$leaf" "$treeRoot")"$'\n'
+    [ $? -eq 0 ] || rc=1
+  done
+
+  if [ -z "$verdicts" ]; then
+    error.log "this.anchor.validate: unknown anchor '$anchor' — use all, OOSH_DIR or CONFIG_PATH"
+    echo "INVALID: unknown anchor: $anchor"
+    create.result 2 "unknown anchor: $anchor"
+    return $(result)
+  fi
+  printf '%s' "$verdicts"
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "$anchor: violations found"
+    return $(result)
+  fi
+  create.result 0 "$anchor: 0 violations"
+  return $(result)
+}
+this.anchor.validate.completion.anchor() { echo "all"; echo "OOSH_DIR"; echo "CONFIG_PATH"; }
+this.anchor.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
+
+this.oosh.dir.validate() # <?treeRoot:$OOSH_DIR> # verify every OOSH_DIR assignment in the tree is the constant ~/oosh; rc 1 + report on any violation
+{
+  this.anchor.validate OOSH_DIR "$1"
+  return $(result)
+}
+this.oosh.dir.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
+
+this.config.path.validate() # <?treeRoot:$OOSH_DIR> # verify every CONFIG_PATH assignment in the tree is the constant ~/config; rc 1 + report on any violation
+{
+  this.anchor.validate CONFIG_PATH "$1"
+  return $(result)
+}
+this.config.path.validate.completion.treeRoot() { echo "$OOSH_DIR"; }
+
+private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPath> is a symlink to <target>; preserve any pre-existing real entry as <linkPath>.orig.<ts>; idempotent; fail-loud on every step
+  # Shared by state 31's private.oo.user.shared.symlinks.ensure (oo) and
+  # config.init.user (config). Both want the same convergence: end with a
+  # symlink at <linkPath> pointing to <target>, never silently overwrite a
+  # real entry, never collide with a pre-existing .orig.<ts> (the macstudio
+  # `.initial` collision bug — see commit 4e1bd9f).
+  #
+  # Behaviour:
+  #   - <linkPath> is already a symlink to <target>     → no-op (return 0)
+  #   - <linkPath> is a stale symlink to something else → rm + relink
+  #   - <linkPath> is a real entry (dir/file)           → mv to <linkPath>.orig.<ts>, then link
+  #   - <linkPath> is absent                            → link
+  #
+  # Each step fails loud (no `2>/dev/null` suppression on the operations
+  # we depend on for convergence). Caller checks the return code.
+  local linkPath="$1"
+  local target="$2"
+  local ts="$3"
+  if [ -z "$linkPath" ] || [ -z "$target" ] || [ -z "$ts" ]; then
+    create.result 1 "private.this.symlink.with.backup requires <linkPath> <target> <ts>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  if [ -L "$linkPath" ]; then
+    [ "$(readlink "$linkPath")" = "$target" ] && return 0
+    if ! rm -f "$linkPath"; then
+      create.result 1 "could not remove stale symlink $linkPath"
+      error.log "$RESULT"; return $(result)
+    fi
+  elif [ -e "$linkPath" ]; then
+    if ! mv "$linkPath" "$linkPath.orig.$ts"; then
+      create.result 1 "could not preserve $linkPath as $linkPath.orig.$ts"
+      error.log "$RESULT"; return $(result)
+    fi
+  fi
+  if ! ln -s "$target" "$linkPath"; then
+    create.result 1 "could not symlink $linkPath → $target"
+    error.log "$RESULT"; return $(result)
+  fi
+  return 0
+}
+
+private.ensure.sharedTree() { # <dir> # ensure <dir> is group dev, recursively g+w; drop self-loops
+  # Used by `config init.shared` to bring a tampered sharedConfig tree back to
+  # the canonical install layout. Strict mirror of the install in state 31 of oo
+  # (chown -R developking:dev + chmod -R g+w on $CONFIG_PATH) plus a
+  # corruption-fix that removes any self-referential symlink left over from
+  # `cp -r ~/config sharedConfig` in state 31 of oo when ~/config was already a
+  # symlink at copy time.
+  #
+  # NOTE: install does NOT set SGID 2775 on these dirs — see commented-out
+  # chmod 2775 in state 31 of oo. Group ownership is preserved at write-time by every writer
+  # calling `private.ensure.groupWrite`. Don't add SGID here.
+  #
+  # Elevation: only sudo when the caller doesn't own the target (i.e. the real
+  # `sharedConfig/` dir typically owned developking:dev). Test fixtures and
+  # caller-owned dirs use the unprivileged path — important so the test-suite
+  # can run without an interactive sudo prompt.
+  local dir="$1"
+  if [ -z "$dir" ] || [ ! -e "$dir" ]; then
+    error.log "private.ensure.sharedTree: directory missing: ${RED}$dir${NORMAL}"
+    return 1
+  fi
+  if ! private.this.group.exists dev; then
+    warn.log "private.ensure.sharedTree: dev group not present — skipping (single-user install)"
+    return 0
+  fi
+  local _sudo=""
+  [ ! -O "$dir" ] && _sudo="$SUDO"
+
+  # Detect & drop the known self-referential symlink (sharedConfig/sharedConfig
+  # -> .../sharedConfig). Compare canonical paths so we only remove true
+  # self-loops, regardless of relative-vs-absolute link target.
+  local resolvedDir
+  resolvedDir=$(private.this.path.canonical "$dir")
+  local entry
+  for entry in "$dir"/*; do
+    if [ -L "$entry" ]; then
+      local resolvedEntry
+      resolvedEntry=$(private.this.path.canonical "$entry")
+      if [ -n "$resolvedEntry" ] && [ "$resolvedEntry" = "$resolvedDir" ]; then
+        important.log "private.ensure.sharedTree: removing self-referential symlink ${YELLOW}$entry${NORMAL}"
+        $_sudo rm -f "$entry"
+      fi
+    fi
+  done
+  $_sudo chgrp -R dev "$dir" 2>/dev/null
+  $_sudo chmod -R g+w "$dir" 2>/dev/null
 }
 
 this.functionExists() {
@@ -62,8 +518,74 @@ this.functionExists() {
   fi
 } 2>/dev/null
 
+this.function.partial() # <newName> <existingName> <firstArg> # define <newName>() as a wrapper that calls <existingName> with <firstArg> closured in front of any args. Replaces ad-hoc `source /dev/stdin <<HEREDOC` patterns for runtime delegate generation; sets RESULT to the signature of the new function
+{
+  local newName="$1"
+  local existingName="$2"
+  local firstArg="$3"
+
+  if [ -z "$newName" ] || [ -z "$existingName" ] || [ -z "$firstArg" ]; then
+    create.result 1 "this.function.partial requires <newName> <existingName> <firstArg>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
+  source /dev/stdin <<HEREDOC
+$newName() { $existingName "$firstArg" "\$@"; }
+HEREDOC
+
+  create.result 0 "defined $newName() => $existingName $firstArg \$@"
+  return $(result)
+}
+
+this.function.partial.completion.newName()      { c2 get.functions $OOSH_DIR/$1 2>/dev/null; }
+this.function.partial.completion.existingName() { c2 get.functions $OOSH_DIR/$1 2>/dev/null; }
+
+this.methodNotFound() { # <method> <caller> # reports unknown method with suggestions
+  local method=$1
+  local caller=$2
+  local scriptPath="$This"
+
+  error.log "Method '$method' not found in $caller"
+
+  # Extract available methods using c2 pattern (inlined, no c2 dependency)
+  if [ -n "$scriptPath" ] && [ -f "$scriptPath" ]; then
+    local suggestions=""
+    local allMethods
+    allMethods=$(grep -E "^${caller}\.[^ ]*\(\) " "$scriptPath" \
+      | sed 's/().*$//' \
+      | sed "s/^${caller}\.//" \
+      | grep -v '\.completion' \
+      | grep -v '^private' \
+      | sort)
+
+    # Find prefix/substring matches
+    local match
+    while IFS= read -r match; do
+      if [ -n "$match" ] && [[ "$match" == *"$method"* || "$method" == *"$match"* ]]; then
+        if [ -n "$suggestions" ]; then
+          suggestions="$suggestions, $match"
+        else
+          suggestions="$match"
+        fi
+      fi
+    done <<< "$allMethods"
+
+    if [ -n "$suggestions" ]; then
+      error.log "  Did you mean: $suggestions"
+    else
+      error.log "  Run '$caller usage' to see available methods"
+    fi
+  fi
+
+  return 127
+}
+
 if (this.functionExists this.load); then
   info.log "this was already sourced"
+  # A re-source never reaches this.init, but the user.env sourced since then
+  # may have added its PATH prepend again (T-THIS-PATH-NO-GROWTH).
+  private.this.path.dedup
   return 0
 fi
 
@@ -71,7 +593,7 @@ this.load() { # <aFunction> <aShellScript> # loads <aFunction> from a <aShellScr
   local aFunction=$1
   shift
   if [ -n "$1" ]; then
-    local fullQualifiedScript="$(which $1)"
+    local fullQualifiedScript="$(command -v $1)"
     local aShellScript=$(basename $1)
     shift
   else
@@ -125,27 +647,49 @@ if ! [ "$(type -t debug.v)" = "function" ]; then
 fi
 
 this.init() {
+  # The login PATH line is data and cannot guard itself — the user's own
+  # ~/.config/oosh/user.session.env (chained last by the shared user.env), or,
+  # before the switch, the shared user.env's `…:$PATH` prepend: every re-source
+  # (.bashrc, then a nested `source this`) would add the prepend again. Every
+  # `source this` passes here, so this is where PATH loses its repeats.
+  private.this.path.dedup
+  # Ensure CONFIG_PATH is set — needed by state machine and other file-based operations
+  : ${CONFIG_PATH:=$HOME/config}
+  export CONFIG_PATH
+  # The per-user (NON-shared) oosh dir is always $HOME/.config/oosh — the home of
+  # per-user/per-session state (log.session.env, log.live.out, oo's
+  # mode-env.bash / oo-func.bash). CONFIG_PATH usually symlinks to the shared
+  # sharedConfig; this one never does. No variable names it any more: it was
+  # a constant pretending to be a setting (removed 2026-10-01, T44).
   if [ -n "$CONFIG" ]; then
     info.log "inititlized"
     if [ -f "$CONFIG" ]; then
       if ! (this.isSourced); then
+        # Preserve current PATH and LOG_LIVE — config may contain stale
+        # values from a different user or install phase (e.g. root's PATH
+        # saved during install; a stale LOG_LIVE). PATH comes from the user's
+        # own ~/.config/oosh/user.session.env (chained by ~/config/user.env)
+        # and this.path.add; LOG_LIVE is re-anchored to the
+        # current user's $HOME/.config/oosh by log's top-level each shell
+        # — same anchor must hold across mid-session $CONFIG re-sources or
+        # console.log starts writing to another user's directory and hits
+        # "Permission denied".
+        # (Write-side complement: config.save keeps LOG_LIVE — and LOG_NAME,
+        # LOG_DEVICE — out of the shared log.env; they live only in each user's
+        # log.session.env. See private.config.variables.list.)
+        # path-exception: SAVE AND RESTORE across a mid-session `source "$CONFIG"`,
+        # not a write — the value put back is the one that was there.
+        local savedPath="$PATH" savedLogLive="$LOG_LIVE"
         source "$CONFIG"
+        export PATH="$savedPath"
+        [ -n "$savedLogLive" ] && export LOG_LIVE="$savedLogLive"
       fi
     fi
     return 0
   fi
   #set -x
-  #does not work on mac osx. readlink does not have option -f on mac
-  #local initStartPath=$(dirname $(readlink -f "${BASH_SOURCE[0]}"))
-  local initStartPath=$(dirname "${BASH_SOURCE[0]}")
   let shellLevel=$SHLVL-1
   let ooShellLevel=$SHLVL+2
-  #echo initStartPath $initStartPath
-
-  # if (loop list PATH find $initStartPath); then
-  #   loop list PATH rm $initStartPath
-  # fi
-  #export PATH=$initStartPath:$PATH
 
   #export PS1="[oosh $ONCE_SSH_CONFIG_HOST] $PS1"
   if ! [ "${0##*/}" = "config" ]; then
@@ -171,13 +715,29 @@ this.init() {
     #   hash -r
     #   echo "initialising config done: $CONFIG"
     # fi
+    # COLD START: no .bashrc ran (cron, `ssh host '~/oosh/oo …'`, sudo -u), so
+    # CONFIG is empty — and without boot, `this` is the one place that stands
+    # the shell up from ~/config/user.env and its chain (the MacStudio model).
+    # CONFIG is set only when the file exists: mid-install it may not yet.
+    # The process keeps the LOG_DEVICE and LOG_LIVE it derived above:
+    # log.session.env holds the LAST session's tty and would send this
+    # process's log lines to another terminal (T-THIS-COLD-START-KEEPS-LOG-DEVICE).
+    if [ -z "$CONFIG" ] && [ -f "$CONFIG_PATH/${CONFIG_FILE:-user.env}" ]; then
+      export CONFIG="$CONFIG_PATH/${CONFIG_FILE:-user.env}"
+    fi
     if [ -f "$CONFIG" ]; then
+      local savedLogDevice="$LOG_DEVICE" savedLogLive="$LOG_LIVE"
       source "$CONFIG"
+      [ -n "$savedLogDevice" ] && export LOG_DEVICE="$savedLogDevice"
+      [ -n "$savedLogLive" ] && export LOG_LIVE="$savedLogLive"
+      private.this.path.dedup
     fi
   fi
   if [ -z "$OOSH_PROMPT" ]; then
     export OOSH_STATUS="0: started in shell level: $shellLevel"
-    export OOSH_DIR="$initStartPath"
+    # No OOSH_DIR here: it is the constant ~/oosh, already set by oosh.env or by
+    # this scripts top-level fallback. Assigning $initStartPath (a dirname of
+    # BASH_SOURCE, often relative) violated the rule and overrode a good value.
     export OOSH_SHLVL=$ooShellLevel
     export OOSH_PROMPT="oosh "
     export ERROR_CODE_RECONFIG=117
@@ -238,7 +798,7 @@ result() {
   echo $RETURN_VALUE
 }
 
-result.save()
+result.save() # # write RESULT and its metadata to $CONFIG_PATH/result.env, for result.load to read back
 {
   export RESULT_RETURN_VALUE=$RETURN_VALUE
   export RESULT=$RESULT
@@ -248,9 +808,22 @@ result.save()
   export RESULT_CALL_STACK="${FUNCNAME[@]}"
   export RESULT_SOURCE_STACK="${BASH_SOURCE[@]##*/}"
   export RESULT_NEXT_ARGS="$*"
-  {
-    declare -px | grep "RESULT"
-  } >$CONFIG_PATH/result.env
+  # `declare -px` WITH THE EXPLICIT NAMES. The old body was
+  # `declare -px | grep "RESULT"` — a SUBSTRING match on the WHOLE LINE, so it
+  # harvested any exported variable whose NAME merely contained RESULT
+  # (test.suite exports TEST_SUITE_RESULT_PATH) and any whose VALUE did. That
+  # file is then SOURCED by result.load, so what it picks up is re-assigned in
+  # the caller's shell. config.save fixed exactly this class for itself — see
+  # its old ` ${name}[_=]` value match, pinned by test/test.config T28.
+  #
+  # A list, not a sweep: these seven names are exported three lines above, so
+  # the set is known exactly and no pattern can be more correct than naming it.
+  # The named form is also the one that behaves on bash 3.2 (measured) — see
+  # docs/research/2026-09-17-config-save-bash32.md, and result.into below,
+  # which has used the named form all along for the neighbouring reason.
+  declare -px RESULT RESULT_RETURN_VALUE RESULT_DATE RESULT_CALLER \
+              RESULT_CALL_STACK RESULT_SOURCE_STACK RESULT_NEXT_ARGS \
+    >$CONFIG_PATH/result.env 2>/dev/null
 }
 
 result.cat() { # # logs the $CONFIG_PATH/result.env file
@@ -272,7 +845,11 @@ result.load()
 
 result.into() { # <shellVarname> <?method> #
   export $1="$( cat - )"
-  echo "$1=${!1}" >$CONFIG_PATH/result.env
+  # `declare -px`, not `echo "$1=$value"`: the echo form wrote a BARE UNQUOTED
+  # assignment, so a value containing a space or a glob character corrupted on
+  # the next result.load — and PATH was its only ever caller. This is the same
+  # format result.save writes, so the two agree.
+  declare -px "$1" >$CONFIG_PATH/result.env
   # if [ -n "$2" ]; then
   #   "$@"
   # fi
@@ -411,8 +988,16 @@ this.call() # <aFunction> <?aShellScript> # loads <aFunction> from a <aShellScri
     #info.log "$aFunction does not exist!"
   fi
   if (this.functionExists $caller.$aFunction); then
-    debug.log "this.call: $caller.$aFunction $*"
-    $caller.$aFunction "$@"
+    # Prefer compound sub-method if it exists (e.g., oo.mode.stage over oo.mode)
+    if [ -n "$1" ] && (this.functionExists $caller.$aFunction.$1); then
+      local subMethod=$1
+      shift
+      debug.log "this.call: $caller.$aFunction.$subMethod $*"
+      $caller.$aFunction.$subMethod "$@"
+    else
+      debug.log "this.call: $caller.$aFunction $*"
+      $caller.$aFunction "$@"
+    fi
   else
     info.log "$caller.$aFunction does not exist!"
     local aShellScript=$aFunction
@@ -436,12 +1021,18 @@ this.call() # <aFunction> <?aShellScript> # loads <aFunction> from a <aShellScri
       if [ -z "$aFunction" ]; then
         aFunction=usage
       fi
-      important.log "this.load: $aFunction $aShellScript"
-      if (this.load $aFunction $aShellScript "$@"); then
-        debug.log "done this.call: $aShellScript.$aFunction $*"
-        #$aShellScript.$aFunction "$@"
+      # Guard: check if aShellScript is an actual script before trying this.load
+      if [ -n "$(command -v $aShellScript 2>/dev/null)" ]; then
+        important.log "this.load: $aFunction $aShellScript"
+        if (this.load $aFunction $aShellScript "$@"); then
+          debug.log "done this.call: $aShellScript.$aFunction $*"
+        else
+          problem.log "this.load failed to load $aShellScript from \"$aFunction\": $?"
+          return 127
+        fi
       else
-        problem.log "this.load faild to load $aShellScript from \"$aFunction\": $?"
+        # aShellScript is not a real script — it was an unknown method name
+        this.methodNotFound "$aShellScript" "$caller"
         return 127
       fi
     fi
@@ -450,55 +1041,48 @@ this.call() # <aFunction> <?aShellScript> # loads <aFunction> from a <aShellScri
 
 
 
-this.path.add() {
-
-  # if ! this.functionExists "line.add"; then
-  #   source line
-  # fi
-
-  #   echo $PATH \
-  # | line.split ":" \
-  # | line.quote \
-  # | line.remove "$1" \
-  # | line.add "$1" \
-  # | line.join ":" \
-  # | line.into PATH
-
+this.path.add() # <dir> # prepends dir to the PATH of this process, de-duping by whole segment; the login PATH itself is data in the per-user ~/.config/oosh/user.session.env
+{
+  # A BOOTSTRAP helper, not a PATH builder — the login PATH is data in the
+  # user's own ~/.config/oosh/user.session.env, chained last by the shared
+  # ~/config/user.env (docs/config.md § The PATH line). The executed-script branch
+  # at the bottom of this file uses it to get the oosh directories in front in
+  # contexts that have not read user.env.
+  #
+  # It carried NO signature comment, which made it invisible to
+  # test/test.completion.audit and to every usage table while
+  # docs/oosh-architecture.md listed it as a public method of `this`. By the
+  # Method Structure Standard that made it broken as it stood.
+  #
+  # RESULT is assigned directly rather than through create.result: this runs at
+  # file scope during bootstrap, before $CONFIG_PATH/result.env necessarily has
+  # a home to be written to.
   if ! this.functionExists "line.add"; then
-    export PATH="$OOSH_DIR:$PATH"
-    # Debug: info.log "PATH: $PATH"
+    # path-exception: bootstrap — `line` has to be reachable before the
+    # pipeline below can run, and user.env has not been read in this context.
+    case ":$PATH:" in
+      *":$OOSH_DIR:"*) : ;;
+      *) export PATH="$OOSH_DIR:$PATH" ;;
+    esac
     source $OOSH_DIR/line '' ''
-    #set -x
   fi
 
-  local currentPath=$1
-  if [ "$currentPath" = "." ]; then
-    [ "$(type -t info.log)" = "function" ] && info.log "fixing .     $OOSH_DIR    $1"
-    currentPath="\."
-    #set -x
-  fi
-
-    echo $PATH \
-  | line.split ":" \
-  | line.quote \
-  | line.remove "$currentPath" \
-  | line.prepend "$1" \
-  | line.join ":" \
-  | line.into PATH
-
-  
-  # source $CONFIG_PATH/result.env
-  # shift
-
+  # line.remove.exact, not line.remove. line.remove is `grep -v "$1"`, a
+  # SUBSTRING match — which is why this used to rewrite "." as "\." before the
+  # de-dupe pass: without that escape `grep -v .` deleted the ENTIRE PATH. A
+  # whole-line match needs no escaping, so the special case is gone with it.
+  # line.unquote, because line.split already returns QUOTED entries.
+  # path-exception: the bootstrap prepend itself — see the docstring above.
+  PATH="$( echo "$PATH" \
+         | line.split ":" \
+         | line.unquote \
+         | line.remove.exact "$1" \
+         | line.prepend "$1" \
+         | line.join ":" )"
+  export PATH
   RESULT=$PATH
-  # if (loop.list PATH find "$1" silent); then
-  #   debug.log "found $1 at $RESULT"
-  #   loop.list PATH rm $1 silent
-  #   debug.log "PATH=$1:$RESULT"
-  # fi
-
-  #export PATH="$1:$RESULT"
 }
+this.path.add.completion.dir() { compgen -d "$1"; }
 
 
 this.help.table() {
@@ -519,6 +1103,352 @@ this.help.table() {
   | grep "$1" \
   | line table '#' 
 }
+
+private.this.script.load()     # <script> <probeFn> # source $OOSH_DIR/<script> into this shell once, unless <probeFn> is already a function; This is saved and restored around the source; rc 0 when <probeFn> is a function afterwards #
+{
+ # A predicate (rc only, no create.result): it runs inside completion paths.
+ # Lazy, because <script> sources `this` and every consumer (oo, promote, …)
+ # may itself be merely sourced by the ooShim or a test. Not this.load: that
+ # one CALLS the method and overwrites This (see this.load). Sourcing re-runs
+ # this.start, which points This at the sourced file — restore it, or the
+ # caller's own dispatch/help would describe the wrong script.
+ [ "$(type -t "$2")" = function ] && return 0
+ local savedThis="$This"
+ [ -f "$OOSH_DIR/$1" ] && source "$OOSH_DIR/$1" >/dev/null 2>&1
+ This="$savedThis"
+ [ "$(type -t "$2")" = function ]
+}
+
+private.this.path.case.get()     # <path> # echo <path> in the file system canonical letter case (macOS: osascript POSIX path, trailing / dropped); echo <path> unchanged when osascript is absent or fails #
+{
+ # A getter consumed as $(...): no create.result. macOS HFS+/APFS is
+ # case-insensitive, but git's safe.directory is a string match:
+ # /Users/shared and /Users/Shared are one inode, two strings. Moved from the
+ # hand-copies in oo and user (their call sites move with
+ # the ogit plan, Tasks 17, 22 and 23).
+ local p="$1" r=""
+ [ -z "$p" ] && return 1
+ if command -v osascript >/dev/null 2>&1; then
+   r=$(osascript -e "POSIX path of (POSIX file \"$p\" as alias)" 2>/dev/null | sed 's:/$::')
+ fi
+ printf '%s\n' "${r:-$p}"
+}
+
+private.this.path.dedup()     #  # de-duplicate PATH in THIS shell by whole segment — first occurrence wins, order kept, empty segments (the CWD, CWE-426) dropped; runs once per source this; pure parameter expansion, no subshell #
+{
+ # The login PATH line is data and cannot guard itself — before the switch
+ # the shared user.env's `export PATH="$HOME/oosh:…:$PATH"`, after it the
+ # user's own ~/.config/oosh/user.session.env — so a shell that sources a prepend twice (bashrc + a nested `source this`,
+ # a re-login inside tmux) carries the prepend twice. this.init calls it on
+ # every `source this`; T-THIS-PATH-DEDUP drives it directly,
+ # T-THIS-PATH-NO-GROWTH through a whole cold start.
+ #
+ # Pure parameter expansion, no `read`/here-string: bash before 5.1 backs a
+ # here-string with a TMPDIR temp file, so that form did filesystem I/O on
+ # every single `source this` on macOS bash 3.2 and broke outright on a
+ # read-only or noexec /tmp during install. NO create.result: a mutator of the
+ # caller's PATH, run before `create.result` matters and never as $(...).
+ local newPath="" seen=":" rest="$PATH:" seg
+ while [ -n "$rest" ]; do
+   seg=${rest%%:*}; rest=${rest#*:}
+   # An EMPTY segment ("::", a leading or trailing colon) means the current
+   # directory — CWE-426, the same hole ticket T8 closed for a literal `.` in
+   # config.save's brew-bash line. Dropped here, never preserved. This does NOT
+   # shut the hole: a LITERAL `.` segment is a non-empty segment and survives
+   # de-duplication untouched, exactly as it did before.
+   if [ -n "$seg" ]; then
+     case "$seen" in *":$seg:"*) ;; *)
+       seen="$seen$seg:"
+       newPath="${newPath:+$newPath:}$seg" ;;
+     esac
+   fi
+ done
+ # path-exception: a REWRITE of the value already there, not a build — the
+ # segments put back are exactly the ones that came in, minus the repeats. A
+ # no-op when nothing changed, which is the common case.
+ [ "$newPath" = "$PATH" ] || export PATH="$newPath"
+ return 0
+}
+
+
+private.this.as.user.preamble.get()     # <username> <targetHome> <sharedOosh> # echo the bash -c preamble that stands the TARGET user's oosh environment up before a command runs as them: HOME/USER, no leaked anchors, this from the shared tree, its dirs first on PATH #
+{
+ # The one preamble behind every `private.as.user "$u" bash -c "…"` hop
+ # (config.init.user, user.oosh.install). runuser keeps the CALLER's
+ # environment, so without this the target inherits root's CONFIG/CONFIG_PATH/
+ # OOSH_DIR, and a string that sources "$OOSH_DIR/this" is expanded by the
+ # caller — /root/oosh/this, unreadable under a 0700 /root — so every source
+ # failed silently and the bashrc heal of another user never ran (T86's
+ # sibling, T-THIS-AS-USER-PREAMBLE).
+ #
+ # OOSH_MODE goes too: the target's branch is where THEIR ~/oosh points,
+ # never the caller's (T-THIS-AS-USER-PREAMBLE-NO-MODE).
+ # Unsetting the anchors is what lets `this` cold-start from the TARGET's
+ # ~/config/user.env (or fall back to their $HOME/oosh); sourcing `this` from
+ # <sharedOosh> is what makes that possible before their ~/oosh symlink exists;
+ # the explicit PATH prepend is why `user`/`ossh` resolve in that same window.
+ # NO create.result — a getter consumed as $(...), a subshell.
+ local username="$1" targetHome="$2" sharedOosh="$3"
+ printf '%s\n' \
+   "export HOME='$targetHome'" \
+   "export USER='$username'" \
+   "unset CONFIG CONFIG_PATH CONFIG_FILE OOSH_DIR OOSH_MODE" \
+   'cd "$HOME" 2>/dev/null' \
+   "source '$sharedOosh/this' >/dev/null 2>&1 || exit 1" \
+   "export PATH=\"$sharedOosh:$sharedOosh/ng:\$PATH\""  # path-exception: a string executed AS ANOTHER USER, before their user.env has been read
+ return 0
+}
+
+
+private.this.folder.entries.copy()     # <from> <to> # copy every entry of <from> (dotfiles included) into <to>, keeping relative paths — never <from>/. itself, whose own mode and owner would land on <to>; rc 1 names the entries that failed #
+{
+ # One definition, shared by ogit (private.ogit.folder.ignored.restore) and
+ # odocker (workspace.seed). Each ENTRY, dotfiles included — never
+ # `cp -Rp <from>/. <to>/`: that also copies <from>'s own mode/owner onto <to>
+ # (the host dev/ came out drwx------ root:root, 2026-09-25). Plain [ -d ]
+ # tests, not `check dir`: check sources this, and this is the kernel.
+ local from="$1" to="$2" entry failed=""
+ if [ ! -d "$from" ]; then create.result 1 "no such folder: $from"; return $(result); fi
+ if [ ! -d "$to" ]; then create.result 1 "no such folder: $to"; return $(result); fi
+ for entry in "$from"/* "$from"/.[!.]* "$from"/..?*; do
+   [ -e "$entry" ] || continue
+   cp -Rp "$entry" "$to/" || failed="$failed ${entry##*/}"
+ done
+ if [ -n "$failed" ]; then create.result 1 "entries not copied:$failed"; return $(result); fi
+ create.result 0 "copied the entries of $from into $to"
+ return $(result)
+}
+
+
+private.this.folder.share()     # <dir> # share <dir> with group dev: private.ensure.sharedTree (chgrp dev, g+w) plus setgid on every directory so new files inherit the group; rc 0 without a dev group; never chown #
+{
+ # One definition, shared by ogit (ogit.folder.finish) and odocker
+ # (workspace.seed). private.ensure.sharedTree deliberately sets no SGID —
+ # sharedConfig relies on its writers calling private.ensure.groupWrite — but a
+ # NEW folder under the shared tree needs setgid dirs so that files created
+ # later inherit group dev. Never chown (T-STATE-31-CHOWN-NOT-RECURSIVE).
+ local dir="$1"
+ if [ ! -d "$dir" ]; then create.result 1 "no such folder: $dir"; return $(result); fi
+ if ! private.this.group.exists dev; then create.result 0 "no dev group — $dir left as it is"; return $(result); fi
+ if ! private.ensure.sharedTree "$dir" >/dev/null 2>&1 || ! find "$dir" -type d -exec chmod g+s {} + 2>/dev/null; then
+   create.result 1 "could not share $dir with group dev"; return $(result)
+ fi
+ create.result 0 "$dir shared with group dev (g+w, setgid)"
+ return $(result)
+}
+
+
+private.this.group.name.get()     # <gid> # echo the name of the group with number <gid>: getent where present, else /etc/group, dscl on macOS; nothing when there is none #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # Sibling of private.this.group.exists, by number instead of name: the docker
+ # socket of a container carries the HOST's group number, and odocker asked a
+ # bare getent for it — macOS has none, a minimal image may have none
+ # (2026-10-06, T-THIS-GROUP-NAME-GET).
+ this.isNumber "$1" || return 1
+ case "$OSTYPE" in
+   darwin*)
+     dscl . -search /Groups PrimaryGroupID "$1" 2>/dev/null | awk 'NR == 1 { print $1 }' ;;
+   *)
+     if command -v getent >/dev/null 2>&1; then
+       getent group "$1" 2>/dev/null | cut -d: -f1
+     else
+       awk -F: -v gid="$1" '$3 == gid { print $1; exit }' /etc/group 2>/dev/null
+     fi ;;
+ esac
+}
+
+
+private.this.container.is()     # <?root:/> # rc 0 when this computer is a container: <root>/.dockerenv (Docker) or <root>/run/.containerenv (Podman) exists #
+{
+ # A predicate (rc only, no create.result), like private.this.group.exists.
+ # Nothing in oosh answered "am I a container": odocker installed a Docker
+ # engine in a platform container without the host's socket, where none can
+ # start (2026-10-06, T-THIS-CONTAINER-IS). <root> lets a test use a fixture.
+ local root="${1:-/}"
+ root="${root%/}"
+ [ -e "$root/.dockerenv" ] || [ -e "$root/run/.containerenv" ]
+}
+
+
+private.this.env.export.line.get()     # <variableName> <value> # echo ONE pure-data env line export variableName=value, the value quoted by bash declare -p so a quote, dollar or backslash reads back as given; nothing and rc 1 when it cannot be one line of pure data: an invalid name, a control character, a command substitution or backtick, an ANSI-C rendering #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT (config
+ # renders inside `{ … } >file`, where LOG_DEVICE can be fd1). The ONE rule for
+ # "how a value becomes a line of an env file, and which values are refused",
+ # in the kernel because both config (private.config.variable.export.line) and
+ # log (log.session.save) write env files and log must not load config.
+ # Bash quotes (`declare -p` of a local, the named form — the same on 3.2 and
+ # 5): a quote, $, backslash or backtick comes out escaped and reads back as
+ # given in bash and every POSIX sh (T77 in test.config). Refused, because no
+ # single line could hold it as data: a control character (the files are
+ # line-oriented; bash 5.1 writes it raw, 5.2 and 3.2 as $'…') and any $'…'
+ # rendering (a bashism dash reads literally). T-THIS-ENV-EXPORT-LINE.
+ # Refused as well: a command substitution `$(` or a backtick. Escaped they
+ # would be harmless, but config.validate rejects every line holding one, and
+ # env files are pure data with no exception in the validator — so the writer
+ # gives way (T-CONFIG-WRITER-VALIDATOR-AGREE).
+ local variableName="$1" value="$2" declaration
+ case "$variableName" in ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; esac
+ case "$value" in *[[:cntrl:]]*|*'$('*|*'`'*) return 1 ;; esac
+ declaration=$(declare -p value 2>/dev/null) || return 1
+ declaration="${declaration#declare -* value=}"
+ case "$declaration" in '"'*) ;; *) return 1 ;; esac
+ echo "export $variableName=$declaration"
+}
+
+
+private.this.file.same()     # <fileA> <fileB> # rc 0 when both files exist with identical bytes: cmp -s where it exists, else an od byte dump of each compared, which needs no extra package #
+{
+ # A predicate (rc only, no create.result), like private.this.container.is.
+ # cmp is diffutils, which AlmaLinux minimal does not ship: its rc 127 read as
+ # "differs", so a file was re-copied on every run and idempotence was lost
+ # silently (T-CONFIG-BASHRC-ALL-NO-CMP). The fallback is exact, not a
+ # checksum: od (coreutils, busybox, BSD) writes every byte as hex text, so a
+ # binary byte or a trailing newline is part of the compared text — $(cat)
+ # would drop trailing newlines. Sizes first: unequal files are told apart
+ # without reading them (T-THIS-FILE-SAME).
+ local a="$1" b="$2"
+ [ -f "$a" ] && [ -f "$b" ] || return 1
+ if command -v cmp >/dev/null 2>&1; then
+   cmp -s "$a" "$b"
+   return
+ fi
+ [ "$(wc -c < "$a")" -eq "$(wc -c < "$b")" ] || return 1
+ [ "$(od -An -v -tx1 "$a")" = "$(od -An -v -tx1 "$b")" ]
+}
+
+
+private.this.path.stat.get()     # <path> <field> # echo one stat field of the path itself, a symlink not followed: owner, group, uid, gid or mode (octal permission bits); GNU stat format first, else the BSD one, both from one table; nothing and rc 1 for a missing path or an unknown field #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # `stat -c <gnu> … || stat -f <bsd> …` was hand-written six times (config ×3,
+ # odocker ×2, user). The platform difference is DATA — the table below — and
+ # the try-GNU-then-BSD is written once: GNU and busybox know -c, macOS fails
+ # on it and knows -f. Neither follows a symlink by default, so a link is
+ # described itself (config.init.check asks about the ~/config link).
+ local path="$1" field="$2" gnu bsd value
+ [ -e "$path" ] || [ -L "$path" ] || return 1
+ case "$field" in
+   owner) gnu=%U bsd=%Su ;;
+   group) gnu=%G bsd=%Sg ;;
+   uid)   gnu=%u bsd=%u ;;
+   gid)   gnu=%g bsd=%g ;;
+   mode)  gnu=%a bsd=%Lp ;;
+   *)     return 1 ;;
+ esac
+ value=$(stat -c "$gnu" "$path" 2>/dev/null) || value=$(stat -f "$bsd" "$path" 2>/dev/null) || return 1
+ [ -n "$value" ] || return 1
+ echo "$value"
+}
+
+private.this.path.stat.get.completion.field() { echo owner; echo group; echo uid; echo gid; echo mode; }
+
+
+private.this.temp.dir.get()     # <?label:oosh> # echo the canonical path of a new private directory (mode 700) under TMPDIR, else /tmp, named after label; nothing and rc 1 when the label is not a plain name or none can be made #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT. The
+ # caller owns the directory and removes it. mktemp was called raw in c2,
+ # odocker and ossh; test.suite.fixture.make is the test-only twin. Canonical,
+ # because on macOS /tmp is /private/tmp and $TMPDIR ends in a slash — a path
+ # compared or resolved later must be the physical one (T-THIS-TEMP-DIR-GET).
+ # `mktemp -d <template>` is the one spelling GNU, busybox and BSD share.
+ local label="${1:-oosh}" base="${TMPDIR:-/tmp}" dir
+ case "$label" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+ base="${base%/}"
+ dir=$(mktemp -d "${base:-/tmp}/$label.XXXXXX" 2>/dev/null) || return 1
+ chmod 700 "$dir" 2>/dev/null || { rm -rf "$dir"; return 1; }
+ private.this.path.canonical "$dir"
+}
+
+
+private.this.tree.tracked.check()     # <treeRoot> <?caller:sweep> # rc 0 when the tracked files of treeRoot are visible; else an INVALID: verdict on stdout and rc 2 — a tree sweep that reads nothing must never report OK #
+{
+ # The one guard of the tree sweeps (path.validate, this.anchor.validate,
+ # ogit.caller.validate, test.suite.portability.validate). ogit.repo.grep
+ # discards stderr, so no repository, a repository with nothing tracked and the
+ # "dubious ownership" refusal (root in a container against an oosh-user tree)
+ # all come back empty — indistinguishable from a clean tree. A sweep proves it
+ # can see the files BEFORE it trusts that it found nothing in them
+ # (T-PATH-VALIDATE-BLIND, T-ANCHOR-VALIDATE-BLIND, T-PORTABILITY-BLIND,
+ # T-OGIT-ONLY-CALLER-REJECTS). The verdict goes to stdout, like the sweeps.
+ local treeRoot="$1" caller="${2:-sweep}"
+ if ! private.this.script.load ogit ogit.repo.files.list; then
+   error.log "$caller: cannot load ogit.repo.files.list from $OOSH_DIR/ogit"
+   echo "INVALID: $treeRoot — not scanned, ogit could not be loaded"
+   create.result 2 "ogit could not be loaded: $treeRoot not scanned"
+   return $(result)
+ fi
+ if [ -z "$(ogit.repo.files.list "$treeRoot" | head -1)" ]; then
+   error.log "$caller: no tracked file under $treeRoot is visible to git — no repository, nothing tracked, or ownership refused (ogit safeDirectory.ensure). A sweep that reads nothing reports OK, so this is a failure, not a pass."
+   echo "INVALID: cannot read $treeRoot through git — no tracked files visible"
+   create.result 2 "no tracked file visible under $treeRoot"
+   return $(result)
+ fi
+ create.result 0 "tracked files visible under $treeRoot"
+ return $(result)
+}
+
+
+private.this.marker.sweep()     # <pattern> <markerSlug> <treeRoot> <?excludes...> # echo one line per match of pattern in the tracked files of treeRoot: comment, marked or unmarked, a space, then file:line:content; marked is a comment markerSlug-exception: on the line or in the 5 lines above, or markerSlug-exception-file: in the file; callers run private.this.tree.tracked.check first #
+{
+ # The one sweep of the four tree validators — path.validate (path),
+ # this.anchor.validate (oosh-dir, config-path), ogit.caller.validate (ogit),
+ # test.suite.portability.validate (portability). It owns what they shared:
+ # the grep of the TRACKED tree (git grep is one process and sees
+ # tracked-but-gitignored files), the comment skip (a line that only TALKS
+ # about a construct is not a use of it) and the three marker rules. The
+ # marker is anchored to a COMMENT, so it counts only where a human wrote one —
+ # otherwise a validator, which names its own marker, would exempt itself. The
+ # window is the 5 lines above, because these sites often sit inside a heredoc
+ # or a `bash -c` string where the marker cannot go on the line.
+ # Each caller keeps its OWN rules and summary: what is conforming, the
+ # self-assignments, the portability advisories. A getter: stdout, no RESULT.
+ local pattern="$1" slug="$2" treeRoot="$3"
+ if [ $# -ge 3 ]; then shift 3; else set --; fi
+ private.this.script.load ogit ogit.repo.grep || return 2
+ local matches match file lineNo content trimmed windowFrom class
+ matches=$(ogit.repo.grep "$pattern" "$treeRoot" "$@")
+ while IFS= read -r match; do
+   [ -z "$match" ] && continue
+   file="${match%%:*}"
+   content="${match#*:}"
+   lineNo="${content%%:*}"
+   content="${content#*:}"
+   trimmed="${content#"${content%%[![:space:]]*}"}"
+   case "$trimmed" in '#'*) printf 'comment %s\n' "$match"; continue ;; esac
+   class=unmarked
+   if printf '%s' "$content" | grep -qE "#[[:space:]]*${slug}-exception:"; then
+     class=marked
+   elif grep -qE "^[[:space:]]*#[[:space:]]*${slug}-exception-file:" "$treeRoot/$file" 2>/dev/null; then
+     class=marked
+   elif [ "$lineNo" -gt 1 ]; then
+     windowFrom=$((lineNo - 5))
+     [ "$windowFrom" -lt 1 ] && windowFrom=1
+     sed -n "${windowFrom},$((lineNo - 1))p" "$treeRoot/$file" 2>/dev/null \
+       | grep -qE "#[[:space:]]*${slug}-exception:" && class=marked
+   fi
+   printf '%s %s\n' "$class" "$match"
+ done <<< "$matches"
+ return 0
+}
+
+
+private.this.group.file.get()     #  # echo the group file the last-resort append of private.this.group.create may write: /etc/group; nothing on macOS, where Directory Services ignores that file #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # The platform difference of the last resort, as a VALUE in one place: a
+ # line appended to /etc/group on macOS is ignored by Directory Services, so
+ # there is no file there and the append is not tried (T-THIS-GROUP-CREATE-FAIL).
+ # A test points private.this.group.create at a fixture through this getter.
+ case "$OSTYPE" in
+   darwin*) return 1 ;;
+ esac
+ echo /etc/group
+}
+
+
+### new.method
 
 this.help() {
   #echo $@
@@ -572,7 +1502,7 @@ this.isSourced() {
     create.result 0 "sourced because called by $callerFunction in $caller"
     ;;
   "this.start") #started depending on command [3]
-    if [ "${FUNCNAME[3]}" = "source" ]; then
+    if [ "${1:-${FUNCNAME[3]}}" = "source" ]; then
       create.result 0 "sourced because called by $callerFunction in $caller" >/dev/null
     else
       create.result 1 "started by ${FUNCNAME[4]} in ${BASH_SOURCE[4]##*/}" >/dev/null
@@ -603,7 +1533,7 @@ this.restart()
       important.log "found RETURN_VALUE=$RETURN_VALUE"
     fi
 
-    if [ "$1" = "again" ] || [ "$RETURN_VALUE" -eq "$ERROR_CODE_RECONFIG" ] ; then 
+    if [ "$1" = "again" ] || { [ -n "$ERROR_CODE_RECONFIG" ] && [ "$RETURN_VALUE" -eq "$ERROR_CODE_RECONFIG" ] 2>/dev/null; } ; then
       echo "
       restarting again $?
       "
@@ -617,10 +1547,10 @@ this.start() {
   local caller=${BASH_SOURCE[$len - 2]##*/}
   local callerFunction=${FUNCNAME[1]}
 
-  This=$(which $caller)
-  if (this.isSourced); then
+  This=$(command -v $caller)
+  if (this.isSourced "${FUNCNAME[2]}"); then
     info.log "is sourced"
-    export RESTULT
+    export RESULT
     return 0
   fi
 
@@ -633,7 +1563,7 @@ this.start() {
   fi
 
 
-  while [ -n $1 ]; do
+  while [ -n "$1" ]; do
     info.log "start 1: -$1-"
     case $1 in
     # call)
@@ -657,19 +1587,24 @@ this.start() {
       return $RETURN_VALUE
       ;;
     help*)
-      this.$1 $This "$@"
+      # Check for script-specific help first (e.g., hiveMind.help)
+      if (this.functionExists $caller.help); then
+        $caller.help "$@"
+      else
+        this.$1 $This "$@"
+      fi
       ;;
     localInstall)
       echo "local install mode"
       ;;
     restart)
       if [ -z "$BASH_FILE" ]; then
-        export BASH_FILE="$(which bash)"
+        export BASH_FILE="$(command -v bash)"
       fi
       echo "restarting $BASH_FILE: $RETURN_VALUE = $ERROR_CODE_RECONFIG"
 
 
-      if [ "$RETURN_VALUE" -eq "$ERROR_CODE_RECONFIG" ]; then
+      if [ -n "$ERROR_CODE_RECONFIG" ] && [ "$RETURN_VALUE" -eq "$ERROR_CODE_RECONFIG" ] 2>/dev/null; then
         export SHELL=$BASH_FILE
         $BASH_FILE #-x # force debug
         RETURN_VALUE=$?
@@ -679,9 +1614,15 @@ this.start() {
       fi
       ;;
     *)
-      debug.log "this.call to: $*"
-      this.call "$@"
-      RETURN_VALUE=$?
+      # Reject method names with dashes — OOSH uses dots (e.g., peer.compact not peer-compact)
+      if [[ "$1" == *-* ]]; then
+        error.log "Invalid method name '$1': use dots instead of dashes (e.g., ${1//-/.})"
+        RETURN_VALUE=1
+      else
+        debug.log "this.call to: $*"
+        this.call "$@"
+        RETURN_VALUE=$?
+      fi
     #  ;;
     esac
 
@@ -701,7 +1642,8 @@ this.start() {
 
   done
   debug.log "will stage"
-  this.call "$@"
+  # Only call if there are remaining arguments (prevents spurious "usage" error)
+  [ -n "$1" ] && this.call "$@"
 
   return $RETURN_VALUE
 }
@@ -721,9 +1663,32 @@ case "${0##*/}" in
   "init"|"oosh"|"log"|"this")
     #source $OOSH_DIR/loop
     #LOG_LEVEL=6
+    # Entering oosh (`this`, `log` started from any shell, an empty one
+    # included) writes only the user's OWN user.session.env — never the
+    # SHARED env files of every user (T-THIS-START-METHOD) — and BEFORE the
+    # directories below go on PATH: they serve this process only, and a save
+    # after them froze ~/oosh/init and ~/oosh/external into every later login
+    # PATH (T-THIS-START-SESSION-PATH). Not while `log` is still loading: log
+    # sources this before it defines console.log …, and the save
+    # needs the full log API.
+    if [ -n "$OOSH_CONFIG_NEEDS_SAVE" ] && this.functionExists console.log; then
+      case "${0##*/}" in
+        log|this)
+          unset OOSH_CONFIG_NEEDS_SAVE
+          source $OOSH_DIR/config
+          config.session.save >/dev/null
+        ;;
+      esac
+    fi
     this.path.add "$OOSH_DIR/external"
     this.path.add "$OOSH_DIR/init"
-    this.path.add "."
+    # `this.path.add "."` was here. CWE-426, untrusted search path: because each
+    # call PREPENDS, "." landed fourth — ahead of /usr/local/bin, /usr/bin and
+    # /bin — whenever `this`, `log`, `init` or `oosh` was EXECUTED, which
+    # includes the whole install run (init/oosh has $0 of "oosh"). The hijack
+    # was silent: oosh own tools still resolved from $OOSH_DIR while every
+    # git, curl, tar and sudo they shelled out to came from whatever directory
+    # the user last cd'd into. Root got the same treatment via $OOSH_DIR/su.
     this.path.add "$OOSH_DIR"
     this.path.add "$OOSH_DIR/ng"
 
@@ -733,8 +1698,12 @@ case "${0##*/}" in
 
     if [ -n "$OOSH_CONFIG_NEEDS_SAVE" ]; then
       unset OOSH_CONFIG_NEEDS_SAVE
-      source $OOSH_DIR/config 
-      config.save
+      # The install (init|oosh — `this` and `log` saved above) writes the
+      # whole config, with the PATH it runs on. Same log-API rule as above.
+      if this.functionExists console.log; then
+        source $OOSH_DIR/config
+        config.save
+      fi
     fi
   ;;
   "config"|"loop")
@@ -756,6 +1725,13 @@ if (this.isSourced); then
 
 else
   if [ -z "$STARTED" ]; then
+    if [ -n "$1" ] && [ "$1" != "localInstall" ]; then
+      # A method was asked for (`this anchor.validate`): run it and return its
+      # rc — no start banner on stdout, no interactive bash afterwards (that
+      # left the call hanging in a child shell, T-THIS-START-METHOD).
+      this.start "$@"
+      exit $?
+    fi
     echo "this was started as $0" 
 
 
@@ -773,13 +1749,9 @@ else
       ;;
     esac
 
-    if ! [ -f $OOSH_DIR/init/once ]; then
-      rm -r $OOSH_DIR/init
-      ln -s $OOSH_DIR/oosh/init
-    fi
-    config ci
+    config init
     if [ -z "$BASH_FILE" ]; then
-      export BASH_FILE="$(which bash)"
+      export BASH_FILE="$(command -v bash)"
       #   echo "BASH_FILE was not set"
       # else 
       #   echo "BASH_FILE is set to: $BASH_FILE"
@@ -787,7 +1759,7 @@ else
     echo running bash with following settings
     echo -------------------------------------
     echo  OOSH_DIR=$OOSH_DIR
-    echo      PATH=$PATH
+    echo      PATH=$PATH   # path-exception: a diagnostic banner, not an assignment
     echo BASH_FILE=$BASH_FILE
     echo    CONFIG=$CONFIG
     echo ARGUMENTS=$*
@@ -811,7 +1783,7 @@ else
         oo state
         # HACK needed to get the package manager right for the first time
         user get home
-        # crashed the state next otherwise 
+        # crashed the state next otherwise
 
 
 
@@ -828,8 +1800,9 @@ else
 
         "
     fi
-    export SHELL=$BASH_FILES
-    $BASH_FILE #-x # force debug
+    export SHELL="$BASH_FILE"
+    # -i: an interactive oosh bash even when stdin is not a terminal.
+    "$BASH_FILE" -i
     this.restart
 
 

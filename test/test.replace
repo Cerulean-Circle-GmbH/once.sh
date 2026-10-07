@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+# Tests for the `replace` transaction: whole-line substitution and the commit guard.
+#
+# `replace` edits scripts in place by writing <file>.new and swapping it in.
+# It is what `oo method.new` uses to splice a method into a live script, so a
+# defect here destroys source files. Two did.
+
+TEST_CATEGORY=core
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+REPLACE_FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/test.replace.XXXXXX")
+trap 'rm -rf "$REPLACE_FIXTURE" 2>/dev/null' EXIT
+
+# ============================================================================
+# T-REPLACE-LINE-EXACT — a whole-line match does not touch the same text
+#                        appearing as a SUBSTRING on another line
+# ============================================================================
+# `replace within` searches for a substring and `perl -pe` loops over every
+# line, so it rewrites the first match on EVERY line containing one. In `oo`
+# the marker text "### new.method" appears both as the real marker and inside
+# the tool's own string literal — running the tool against `oo` corrupted it.
+test.replace.lineExact() {
+  local f="$REPLACE_FIXTURE/exact.txt"
+  {
+    echo 'local marker="### new.method"   # the tool talking about the marker'
+    echo 'untouched middle line'
+    echo '### new.method'
+  } > "$f"
+
+  "$OOSH_DIR/replace" line "$f" "### new.method" by "INSERTED
+### new.method" >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 0 ] && { create.result 1 "replace line returned $rc"; return $(result); }
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1 || { create.result 1 "commit failed"; return $(result); }
+
+  local literal inserted
+  literal=$(grep -c 'local marker="### new.method"' "$f")
+  inserted=$(grep -c '^INSERTED$' "$f")
+  if [ "$literal" != "1" ]; then
+    create.result 1 "the substring occurrence was rewritten — the tool's own source line is gone"
+  elif [ "$inserted" != "1" ]; then
+    create.result 1 "the whole-line marker was not replaced (found $inserted insertions)"
+  else
+    create.result 0 "only the whole-line match is replaced"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-LINE-EXACT: a whole-line match leaves the same text elsewhere alone" \
+  test.replace.lineExact
+expect 0 "only the whole-line match is replaced" \
+  "replace within matches a substring on every line — that is how the tool corrupted oo's own source"
+
+# ============================================================================
+# T-REPLACE-LINE-REFUSES — ambiguity is an error, not a coin toss
+# ============================================================================
+test.replace.lineRefuses() {
+  local f="$REPLACE_FIXTURE/ambiguous.txt"
+  printf '%s\n' 'MARKER' 'middle' 'MARKER' > "$f"
+  local before; before=$(cat "$f")
+
+  "$OOSH_DIR/replace" line "$f" "MARKER" by "REPLACED" >/dev/null 2>&1
+  local rc=$?
+  local after; after=$(cat "$f")
+
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "two whole-line matches were accepted — one of them would be picked silently"
+  elif [ "$after" != "$before" ]; then
+    create.result 1 "the file was modified despite the refusal"
+  else
+    create.result 0 "an ambiguous marker is refused and nothing is written"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-LINE-REFUSES: two matching lines is an error, not a guess" \
+  test.replace.lineRefuses
+expect 0 "an ambiguous marker is refused and nothing is written" \
+  "a marker that is not unique means the caller's assumption about the file is already wrong"
+
+# ============================================================================
+# T-REPLACE-LINE-NO-PERL — the whole-line form must work where there is no perl
+# ============================================================================
+# Alpine ships no perl at all. `replace` has always used it, so `oo method.new`
+# simply could not run there — surfaced by the alpine platform gate on f386f87,
+# three tests red with "replace line returned 1". The whole-line form is the
+# one the method tool uses, so it is implemented in awk; the substring form
+# still needs perl and keeps its own card.
+test.replace.lineNoPerl() {
+  local shim="$REPLACE_FIXTURE/noperl" f="$REPLACE_FIXTURE/noperl.txt"
+  mkdir -p "$shim"
+  local b p
+  for b in bash sh awk grep sed cat rm mv cp chmod dirname basename printf ls; do
+    p=$(type -P "$b" 2>/dev/null) && ln -sf "$p" "$shim/$b"
+  done
+  printf '%s\n' 'keep' '### new.method' 'keep2' > "$f"
+
+  # A replacement carrying a backslash and a newline: awk -v would eat the
+  # backslash as an escape, which is why the implementation reads ENVIRON.
+  #
+  # $OOSH_DIR belongs on this PATH — `replace.start` does `source this`, which
+  # is resolved through PATH. Without it the whole point is lost: the script
+  # dies at 127 before it ever reaches awk. On a dev host the omission was
+  # invisible, because bash's `source` falls back to the working directory and
+  # the suite runs from $OOSH_DIR; on alpine, where the shell starts in $HOME,
+  # it failed — which is the second thing that platform run caught.
+  env -i PATH="$shim:$OOSH_DIR" HOME="$HOME" OOSH_DIR="$OOSH_DIR" LOG_LEVEL=1 \
+      CONFIG_PATH="$CONFIG_PATH" CONFIG="$CONFIG" CONFIG_FILE="$CONFIG_FILE" \
+      "$OOSH_DIR/replace" line "$f" "### new.method" by 'a\b
+### new.method' >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "replace line returned $rc without perl on PATH"
+    return $(result)
+  fi
+  local got; got=$(cat "$f.new" 2>/dev/null)
+  rm -f "$f.new"
+  if [ "${got#*'a\b'}" = "$got" ]; then
+    create.result 1 "the backslash in the replacement was eaten: [$got]"
+  elif [ "$(printf '%s\n' "$got" | grep -c '^### new.method$')" != "1" ]; then
+    create.result 1 "the marker was not re-emitted exactly once: [$got]"
+  else
+    create.result 0 "the whole-line form needs no perl"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-LINE-NO-PERL: whole-line insertion works on a host with no perl" \
+  test.replace.lineNoPerl
+expect 0 "the whole-line form needs no perl" \
+  "alpine ships no perl, so oo method.new could not run there at all"
+
+# ============================================================================
+# T-REPLACE-COMMIT-GUARD — committing with no working copy must not eat the file
+# ============================================================================
+# `replace commit` ran `mv "$FILE" "$FILE.bak"` unconditionally. With no
+# <file>.new the second mv failed and the script was left with NO file under
+# its own name. private.oo.new.method called commit whether or not any
+# substitution had matched, so it was one failed insertion away from deleting
+# the script it was editing.
+test.replace.commitGuard() {
+  local f="$REPLACE_FIXTURE/nowork.txt"
+  printf '%s\n' 'the original content' > "$f"
+  rm -f "$f.new" "$f.bak"
+
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1
+  local rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "commit reported success with no working copy to commit"
+  elif [ ! -f "$f" ]; then
+    create.result 1 "the file was DESTROYED — moved to .bak with nothing to put in its place"
+  elif [ "$(cat "$f")" != "the original content" ]; then
+    create.result 1 "the file survived but its content changed"
+  else
+    create.result 0 "commit refuses and the file is untouched"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-GUARD: committing with no working copy leaves the file intact" \
+  test.replace.commitGuard
+expect 0 "commit refuses and the file is untouched" \
+  "the unguarded version moved the original to .bak and left nothing behind — silent source loss"
+
+
+# ============================================================================
+# T-REPLACE-BLOCK — a whole function block, and exactly one of them
+# ============================================================================
+# A method is a BLOCK, not a line. `oo method.delete` removes one with this,
+# because deleting a function by hand is how its docstring, its completion
+# functions and its test case get orphaned.
+test.replace.blockDeletes() {
+  local f="$REPLACE_FIXTURE/block.sh"
+  {
+    echo 'before() {'
+    echo '  echo before'
+    echo '}'
+    echo ''
+    echo 'victim() {'
+    echo '  local brace="}"      # NOT the end of the block — whole-line match'
+    echo '  echo victim'
+    echo '}'
+    echo ''
+    echo 'after() {'
+    echo '  echo after'
+    echo '}'
+  } > "$f"
+
+  "$OOSH_DIR/replace" block "$f" "victim() {" "}" by "" >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 0 ] && { create.result 1 "replace block returned $rc"; return $(result); }
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1 || { create.result 1 "commit failed"; return $(result); }
+
+  if grep -q 'echo victim' "$f"; then
+    create.result 1 "the block survived — the inner \"}\" line ended it early"
+  elif ! grep -q '^before() {' "$f" || ! grep -q '^after() {' "$f"; then
+    create.result 1 "a neighbouring function was taken too: $(cat "$f")"
+  else
+    create.result 0 "block removed"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-BLOCK: a whole function is removed and its neighbours are left alone" \
+  test.replace.blockDeletes
+expect 0 "block removed" "the end pattern is a whole line, so a brace inside a string does not close the block"
+
+# The same contract replace line carries: refuse rather than guess.
+test.replace.blockRefusesAmbiguous() {
+  local f="$REPLACE_FIXTURE/block.ambiguous.sh"
+  printf '%s\n' 'victim() {' '  a' '}' '' 'victim() {' '  b' '}' > "$f"
+  "$OOSH_DIR/replace" block "$f" "victim() {" "}" by "" >/dev/null 2>&1
+  local rc=$?
+  "$OOSH_DIR/replace" cleanup "$f" >/dev/null 2>&1
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it picked one of two identical start lines instead of refusing"
+  else
+    create.result 0 "refused"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-BLOCK-AMBIGUOUS: two identical start lines are refused, not guessed" \
+  test.replace.blockRefusesAmbiguous
+expect 0 "refused" "exactly one match, or nothing — the same contract as replace line"
+
+# ============================================================================
+# T-REPLACE-COMMIT-REFUSES-SYMLINK — commit never swaps a symlink for a file
+# ============================================================================
+# commit does `chmod -x FILE; mv FILE FILE.bak; mv FILE.new FILE`. On a symlink
+# (top-level `c2 -> ng/c2`) chmod follows the link and strips the TARGET's exec
+# bit, the first mv moves the LINK aside, and the edit lands as a plain file
+# under the link's name — the link is gone and the real script never changed.
+test.replace.commitRefusesSymlink() {
+  local d="$REPLACE_FIXTURE/linked" bad="" rc
+  mkdir -p "$d/ng"
+  printf 'old\n' > "$d/ng/s"; chmod +x "$d/ng/s"; ln -s ng/s "$d/s"
+  "$OOSH_DIR/replace" line "$d/s" "old" by "new" >/dev/null 2>&1
+  "$OOSH_DIR/replace" commit "$d/s" >/dev/null 2>&1; rc=$?
+  "$OOSH_DIR/replace" cleanup "$d/s" >/dev/null 2>&1
+  [ "$rc" -ne 0 ] || bad="$bad commit-rc=0"
+  [ -L "$d/s" ] || bad="$bad link-replaced"
+  [ "$(cat "$d/ng/s")" = old ] || bad="$bad target-changed"
+  [ -x "$d/ng/s" ] || bad="$bad target-lost-exec"
+  [ -e "$d/s.bak" ] && bad="$bad bak-left"
+  [ -z "$bad" ] && create.result 0 "a symlink is refused; link, target and exec bit untouched" || create.result 1 "symlink:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-REFUSES-SYMLINK: commit refuses a symlink instead of replacing it with a file" \
+  test.replace.commitRefusesSymlink
+expect 0 "a symlink is refused; link, target and exec bit untouched" \
+  "oo method.new c2.x would otherwise turn the c2 -> ng/c2 link into a stale copy and strip ng/c2's exec bit"
+
+
+# ============================================================================
+# T-REPLACE-WORD — rename an identifier: every whole-word hit, idempotent
+# ============================================================================
+# `replace line` refuses a line that occurs twice, and `replace within` takes
+# only the FIRST substring on each line and re-matches its own output
+# (step → debug.step → debug.debug.step). Renaming a function needs every
+# whole-word occurrence, and a dotted or longer name is a different word.
+test.replace.wordRenames() {
+  local f="$REPLACE_FIXTURE/word.sh"
+  {
+    echo 'step() {'
+    echo '  step; step'
+    echo '  trap step DEBUG'
+    echo '  debug.step stepping step.x STEP my_step step2'
+    echo '}'
+  } > "$f"
+
+  "$OOSH_DIR/replace" word "$f" step by debug.step >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 0 ] && { create.result 1 "replace word returned $rc"; return $(result); }
+  "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1 || { create.result 1 "commit failed"; return $(result); }
+  "$OOSH_DIR/replace" cleanup "$f"
+
+  local want
+  want=$(printf '%s\n' 'debug.step() {' '  debug.step; debug.step' '  trap debug.step DEBUG' \
+         '  debug.step stepping step.x STEP my_step step2' '}')
+  if [ "$(cat "$f")" != "$want" ]; then
+    create.result 1 "got: $(cat "$f" | tr '\n' '|')"
+    return $(result)
+  fi
+  # A second run has nothing left to rename: rc 1, and the file is untouched.
+  "$OOSH_DIR/replace" word "$f" step by debug.step >/dev/null 2>&1
+  rc=$?
+  "$OOSH_DIR/replace" cleanup "$f"
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "a second run matched again — not idempotent"
+  elif [ "$(cat "$f")" != "$want" ]; then
+    create.result 1 "the second run changed the file"
+  else
+    create.result 0 "every whole word renamed, once"
+  fi
+  return $(result)
+}
+test.case $level "T-REPLACE-WORD: every whole-word occurrence is renamed; dotted and longer names are not; a rerun is a no-op" \
+  test.replace.wordRenames
+expect 0 "every whole word renamed, once" \
+  "replace line refuses repeated lines and replace within double-prefixes — renaming a function needs whole words"
+
+# ============================================================================
+# T-REPLACE-COMMIT-KEEPS-MODE — commit keeps the exec bit the original had
+# ============================================================================
+# `replace commit` did an unconditional `chmod +x`: seven docs/*.md came out
+# executable on 2026-09-28 (`replace word` renames in docs). A script must stay
+# executable, a doc or data file must not become one; rollback hands it back.
+test.replace.commitKeepsMode() {
+  local bad="" d="$REPLACE_FIXTURE/mode.md" s="$REPLACE_FIXTURE/mode.sh"
+  printf "old word\n" > "$d"; chmod 644 "$d"
+  printf "old word\n" > "$s"; chmod 755 "$s"
+  "$OOSH_DIR/replace" word "$d" old by new >/dev/null 2>&1 && "$OOSH_DIR/replace" commit "$d" >/dev/null 2>&1 || bad="$bad doc-commit"
+  [ -x "$d" ] && bad="$bad doc-became-executable"
+  [ -x "$d.bak" ] && bad="$bad doc-bak-executable"
+  "$OOSH_DIR/replace" word "$s" old by new >/dev/null 2>&1 && "$OOSH_DIR/replace" commit "$s" >/dev/null 2>&1 || bad="$bad script-commit"
+  [ -x "$s" ] || bad="$bad script-lost-exec"
+  [ -x "$s.bak" ] && bad="$bad script-bak-executable"
+  "$OOSH_DIR/replace" rollback "$s" >/dev/null 2>&1
+  [ -x "$s" ] || bad="$bad rollback-lost-exec"
+  [ "$(cat "$s")" = "old word" ] || bad="$bad rollback-content=[$(cat "$s")]"
+  "$OOSH_DIR/replace" rollback "$d" >/dev/null 2>&1
+  [ -x "$d" ] && bad="$bad rollback-doc-executable"
+  "$OOSH_DIR/replace" cleanup "$d"; "$OOSH_DIR/replace" cleanup "$s"
+  [ -z "$bad" ] && create.result 0 "commit and rollback keep the original exec bit" || create.result 1 "mode:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-KEEPS-MODE: commit and rollback keep the exec bit the original had; a doc never becomes executable" \
+  test.replace.commitKeepsMode
+expect 0 "commit and rollback keep the original exec bit" \
+  "an unconditional chmod +x made docs executable"
+
+# ============================================================================
+# T-REPLACE-CLEANUP-RC — cleanup returns 0 when there is nothing to clean
+# ============================================================================
+# `… && replace cleanup` chains (oo method.new) took rc 1 from the last
+# `[ -f … ] && rm …` when no .bak/.new existed.
+test.replace.cleanupRc() {
+  local f="$REPLACE_FIXTURE/nothing.txt" rc
+  printf "x\n" > "$f"
+  "$OOSH_DIR/replace" cleanup "$f"; rc=$?
+  [ "$rc" -eq 0 ] && create.result 0 "cleanup with nothing to clean is rc 0" || create.result 1 "rc=$rc"
+  return $(result)
+}
+test.case $level "T-REPLACE-CLEANUP-RC: replace cleanup is rc 0 when there is nothing to clean" \
+  test.replace.cleanupRc
+expect 0 "cleanup with nothing to clean is rc 0" "the chain … && replace cleanup broke on rc 1"
+
+# ============================================================================
+# T-REPLACE-ROLLBACK-KEEPS-ORIGINAL — rolling back an uncommitted edit keeps the file
+# ============================================================================
+# `replace line … by …` writes <file>.new; rollback before commit took the
+# `[ -f "$FILE.new" ]` branch and ran `rm "$FILE"` — the ORIGINAL was deleted
+# and the discarded preview <file>.new stayed behind.
+test.replace.rollbackKeepsOriginal() {
+  local f="$REPLACE_FIXTURE/rollback.txt" bad=""
+  printf "keep\nold\n" > "$f"
+  "$OOSH_DIR/replace" line "$f" "old" by "new" >/dev/null 2>&1
+  [ -f "$f.new" ] || bad="$bad no-preview"
+  "$OOSH_DIR/replace" rollback "$f" >/dev/null 2>&1
+  [ -f "$f" ] || bad="$bad original-deleted"
+  [ "$(cat "$f" 2>/dev/null)" = "$(printf 'keep\nold')" ] || bad="$bad original-changed"
+  [ -f "$f.new" ] && bad="$bad preview-left"
+  [ -z "$bad" ] && create.result 0 "rollback of an uncommitted edit keeps the original and drops the preview" || create.result 1 "rollback:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-ROLLBACK-KEEPS-ORIGINAL: rollback before commit keeps the original file" \
+  test.replace.rollbackKeepsOriginal
+expect 0 "rollback of an uncommitted edit keeps the original and drops the preview" \
+  "rollback ran rm on the original when only the preview .new existed"
+
+# ============================================================================
+# T-REPLACE-COMMIT-KEEPS-WHOLE-MODE — commit keeps the original's whole mode
+# ============================================================================
+# commit moved <file>.new over the file and put back only the exec bit: on the
+# shared tree the new file had the editor's umask (022), group-write was gone
+# and the next dev-group user could not edit the script. A 660 file must stay
+# 660 (no group-write lost, no world-read gained). ls, not stat -c: portable.
+test.replace.commitKeepsWholeMode() {
+  local f="$REPLACE_FIXTURE/shared.sh" bad=""
+  printf 'old\n' > "$f"; chmod 660 "$f"
+  ( umask 022; "$OOSH_DIR/replace" line "$f" old by new >/dev/null 2>&1 && "$OOSH_DIR/replace" commit "$f" >/dev/null 2>&1 ) || bad="$bad commit-rc"
+  [ "$(cat "$f")" = new ] || bad="$bad content=[$(cat "$f")]"
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-rw----" ] || bad="$bad mode=[$(ls -l "$f" | cut -c1-10)]"
+  [ "$(cat "$f.bak")" = old ] || bad="$bad bak=[$(cat "$f.bak" 2>/dev/null)]"
+  ( umask 022; "$OOSH_DIR/replace" rollback "$f" >/dev/null 2>&1 )
+  [ "$(cat "$f")" = old ] || bad="$bad rollback-content=[$(cat "$f")]"
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-rw----" ] || bad="$bad rollback-mode=[$(ls -l "$f" | cut -c1-10)]"
+  "$OOSH_DIR/replace" cleanup "$f"
+  [ -z "$bad" ] && create.result 0 "commit and rollback keep the whole mode of the original" || create.result 1 "whole mode:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-KEEPS-WHOLE-MODE: commit and rollback keep the whole mode of the original, whatever the umask" \
+  test.replace.commitKeepsWholeMode
+expect 0 "commit and rollback keep the whole mode of the original" \
+  "a 664 script came back 644 on the shared tree; the next dev-group user could not edit it"
+
+# ============================================================================
+# T-REPLACE-COMMIT-READ-ONLY — commit and rollback on a file without owner-write
+# ============================================================================
+# commit copied the original with cp -p (its mode) and THEN wrote the new
+# content into the copy: for a 0444 or 0555 file of a normal user that write
+# failed (EACCES) and commit refused where the old rename worked; rollback the
+# same. The mode is given AFTER the content is written.
+test.replace.commitReadOnly() {
+  local mode f bad="" want
+  for mode in 444 555; do
+    f="$REPLACE_FIXTURE/readonly.$mode"
+    printf 'old\n' > "$f"; chmod "$mode" "$f"; want=$(ls -l "$f" | cut -c1-10)
+    # </dev/null: a plain rm of a read-only .bak / .new ASKS on a terminal —
+    # the first run of this test waited at that prompt in the tmux pane.
+    "$OOSH_DIR/replace" line "$f" old by new </dev/null >/dev/null 2>&1 && "$OOSH_DIR/replace" commit "$f" </dev/null >/dev/null 2>&1 || bad="$bad $mode:commit-rc"
+    [ "$(cat "$f")" = new ] || bad="$bad $mode:content=[$(cat "$f")]"
+    [ "$(ls -l "$f" | cut -c1-10)" = "$want" ] || bad="$bad $mode:mode=[$(ls -l "$f" | cut -c1-10)]"
+    "$OOSH_DIR/replace" rollback "$f" </dev/null >/dev/null 2>&1 || bad="$bad $mode:rollback-rc"
+    [ "$(cat "$f")" = old ] || bad="$bad $mode:rollback-content=[$(cat "$f")]"
+    [ "$(ls -l "$f" | cut -c1-10)" = "$want" ] || bad="$bad $mode:rollback-mode=[$(ls -l "$f" | cut -c1-10)]"
+    [ -z "$(ls "$REPLACE_FIXTURE" | grep "readonly.$mode.new.")" ] || bad="$bad $mode:temp-left"
+    "$OOSH_DIR/replace" cleanup "$f" </dev/null
+    [ -e "$f.new" ] || [ -e "$f.bak" ] && bad="$bad $mode:cleanup-left-a-read-only-file"
+    chmod u+w "$f"
+  done
+  [ -z "$bad" ] && create.result 0 "a read-only file is committed and rolled back with its mode and exec bit" || create.result 1 "read-only:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-READ-ONLY: commit and rollback work on a 0444 and a 0555 file and keep their mode" \
+  test.replace.commitReadOnly
+expect 0 "a read-only file is committed and rolled back with its mode and exec bit" \
+  "cp -p gave the copy the original's read-only mode before the content was written into it"
+
+# ============================================================================
+# T-REPLACE-COMMIT-RUNNING-SCRIPT — a script that edits itself runs on unharmed
+# ============================================================================
+# bash reads a running script from its offset in the file it opened. Writing
+# the new content INTO that file (one way to keep the mode) shifts every byte
+# under the offset, and bash runs a fragment of the edited text next — oo
+# method.new oo.x edits oo while oo runs. commit keeps the old inode as .bak.
+test.replace.commitRunningScript() {
+  local s="$REPLACE_FIXTURE/running.sh" out
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# short'
+    echo '"$OOSH_DIR/replace" line "$0" "# short" by "# a much longer line that shifts every byte below it by well over forty characters" >/dev/null 2>&1 && "$OOSH_DIR/replace" commit "$0" >/dev/null 2>&1'
+    echo 'echo after-commit'
+  } > "$s"; chmod 755 "$s"
+  out=$(OOSH_DIR="$OOSH_DIR" bash "$s" 2>&1)
+  "$OOSH_DIR/replace" cleanup "$s"
+  [ "$out" = after-commit ] && grep -q 'much longer line' "$s" \
+    && create.result 0 "the running script edits itself and runs on" || create.result 1 "running script: out=[$out]"
+  return $(result)
+}
+test.case $level "T-REPLACE-COMMIT-RUNNING-SCRIPT: a running script that commits an edit of itself runs on with what it read" \
+  test.replace.commitRunningScript
+expect 0 "the running script edits itself and runs on" "bash reads on from its offset in the file it opened"
+
+# ============================================================================
+# T-REPLACE-ROLLBACK-NEEDS-BAK — rollback with nothing to roll back refuses
+# ============================================================================
+# With neither <file>.new nor <file>.bak, rollback moved the file to .new and
+# then failed to move a missing .bak back: nothing was left under its name.
+test.replace.rollbackNeedsBak() {
+  local f="$REPLACE_FIXTURE/nobak.txt" bad="" rc
+  printf 'mine\n' > "$f"; rm -f "$f.bak" "$f.new"
+  "$OOSH_DIR/replace" rollback "$f" >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || bad="$bad rc=0"
+  [ "$(cat "$f" 2>/dev/null)" = mine ] || bad="$bad file-lost"
+  [ -e "$f.new" ] && bad="$bad moved-to-new"
+  [ -z "$bad" ] && create.result 0 "rollback with no .bak refuses and leaves the file" || create.result 1 "no bak:$bad"
+  return $(result)
+}
+test.case $level "T-REPLACE-ROLLBACK-NEEDS-BAK: rollback with no .bak refuses instead of moving the file away" \
+  test.replace.rollbackNeedsBak
+expect 0 "rollback with no .bak refuses and leaves the file" "mv file file.new; mv file.bak file — and there was no .bak"
+
+# ============================================================================
+# T-REPLACE-WORD-COMPLETION-FILE — `replace word <Tab>` completes files
+# ============================================================================
+# replace.word.completion.file answered an empty line: <file> never completed.
+# In a subshell: sourcing replace runs its dispatcher.
+test.replace.wordCompletionFile() {
+  local d="$REPLACE_FIXTURE/complete" out
+  mkdir -p "$d"; : > "$d/wordfile.txt"
+  out=$( cd "$d" && private.this.script.load replace replace.word.completion.file && replace.word.completion.file word )
+  [ "$out" = wordfile.txt ] && create.result 0 "replace word completes <file>" || create.result 1 "word completion: [$out]"
+  return $(result)
+}
+test.case $level "T-REPLACE-WORD-COMPLETION-FILE: replace word <Tab> completes the file name" \
+  test.replace.wordCompletionFile
+expect 0 "replace word completes <file>" "the stub answered an empty line"
+
+
+console.log "
+Test: replace.lines
+===================================================================="
+
+test.replace.lines() { # # two identical whole lines are both replaced, the same text inside another line is not; no match is refused
+  local f="$REPLACE_FIXTURE/lines.txt" bad=""
+  printf 'X="${X:-dev}"\nexport X="${X:-dev}"\nkeep\nX="${X:-dev}"\n' > "$f"
+  replace lines "$f" 'X="${X:-dev}"' by 'X="${X:-testing}"' >/dev/null 2>&1 && replace commit "$f" >/dev/null 2>&1 || bad="$bad rc=[$RESULT]"
+  replace cleanup "$f"
+  [ "$(grep -c -x -F 'X="${X:-testing}"' "$f")" = 2 ] || bad="$bad replaced=[$(tr '\n' ' ' < "$f")]"
+  grep -q -x -F 'export X="${X:-dev}"' "$f" || bad="$bad substring-touched"
+  if replace lines "$f" 'nothing like this' by 'x' >/dev/null 2>&1; then bad="$bad no-match-accepted"; fi
+  [ -e "$f.new" ] && bad="$bad new-left"
+  replace cleanup "$f"
+  [ -z "$bad" ] && create.result 0 "lines replaced" || create.result 1 "replace lines:$bad"
+  return $(result)
+}
+test.case - "T-REPLACE-LINES: every identical whole line is replaced, none other" \
+   test.replace.lines
+expect 0 "lines replaced"
+
+
+console.log "
+Test: private.replace.copy.make
+===================================================================="
+
+test.replace.copyMake() { # # a 0555 original: the copy has the content and -r-xr-xr-x; a missing original is refused and leaves nothing
+  local d="$REPLACE_FIXTURE" bad="" rc res
+  private.this.script.load replace private.replace.copy.make
+  printf 'old\n' > "$d/copy.make.orig"; chmod 555 "$d/copy.make.orig"
+  printf 'new\n' > "$d/copy.make.content"
+  private.replace.copy.make "$d/copy.make.orig" "$d/copy.make.content" "$d/copy.make.next" >/dev/null 2>&1; rc=$? res="$RESULT"
+  [ "$(cat "$d/copy.make.next" 2>/dev/null)" = new ] || bad="$bad content"
+  [ "$(ls -l "$d/copy.make.next" | cut -c1-10)" = "-r-xr-xr-x" ] || bad="$bad mode=[$(ls -l "$d/copy.make.next" | cut -c1-10)]"
+  private.replace.copy.make "$d/no.such.file" "$d/copy.make.content" "$d/copy.make.none" >/dev/null 2>&1 && bad="$bad missing-original-accepted"
+  [ -e "$d/copy.make.none" ] && bad="$bad left-behind"
+  chmod u+w "$d/copy.make.orig" "$d/copy.make.next"
+  [ -z "$bad" ] || { create.result 1 "copy.make:$bad"; return $(result); }
+  create.result "$rc" "$res"
+  return $(result)
+}
+test.case - "T-REPLACE-COPY-MAKE: the copy carries the content and the mode of the original, also a read-only one" \
+   test.replace.copyMake
+expect 0 "copy.make.next written with the mode of copy.make.orig"
+
+### test.method
+
+test.suite.save.results

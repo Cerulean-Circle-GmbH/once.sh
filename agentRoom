@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+
+### new.method
+
+# ============================================================================
+# agentRoom - OOSH wrapper for agentrooms multi-agent framework
+# Real Claude Code instances with @mention routing
+# ============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+: ${AGENTROOM_DIR:=/var/dev/Workspaces/2cuGitHub/agentrooms}
+: ${AGENTROOM_BASE_PORT:=11080}
+: ${AGENTROOM_HOST:=0.0.0.0}
+: ${AGENTROOM_BACKEND_PORT:=11080}
+: ${AGENTROOM_CONFIG_DIR:=$HOME/.config/agentroom}
+: ${AGENTROOM_PID_DIR:=$AGENTROOM_CONFIG_DIR/pids}
+: ${AGENTROOM_LOG_DIR:=$AGENTROOM_CONFIG_DIR/logs}
+
+# Default agent roles
+AGENTROOM_DEFAULT_AGENTS=(
+  "orchestrator:Coordinates multi-agent tasks"
+  "coder:Implements features and fixes bugs"
+  "tester:Writes and runs tests"
+  "reviewer:Reviews code quality"
+  "researcher:Researches solutions and patterns"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+private.agentRoom.ensure.dirs() {
+  mkdir -p "$AGENTROOM_CONFIG_DIR" "$AGENTROOM_PID_DIR" "$AGENTROOM_LOG_DIR"
+}
+
+private.agentRoom.find.free.port() {
+  local startPort=${1:-$AGENTROOM_BASE_PORT}
+  local port=$startPort
+
+  while [ $port -lt 65535 ]; do
+    if ! ss -tuln 2>/dev/null | grep -q ":$port "; then
+      echo $port
+      return 0
+    fi
+    ((port++))
+  done
+
+  error.log "No free port found starting from $startPort"
+  return 1
+}
+
+private.agentRoom.get.agent.port() {
+  local agentId="$1"
+  local pidFile="$AGENTROOM_PID_DIR/${agentId}.pid"
+
+  if [ -f "$pidFile" ]; then
+    grep "^PORT=" "$pidFile" 2>/dev/null | cut -d= -f2
+  fi
+}
+
+private.agentRoom.get.agent.pid() {
+  local agentId="$1"
+  local pidFile="$AGENTROOM_PID_DIR/${agentId}.pid"
+
+  if [ -f "$pidFile" ]; then
+    grep "^PID=" "$pidFile" 2>/dev/null | cut -d= -f2
+  fi
+}
+
+private.agentRoom.is.running() {
+  local agentId="$1"
+  local pid=$(private.agentRoom.get.agent.pid "$agentId")
+
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+private.agentRoom.save.agent.info() {
+  local agentId="$1"
+  local port="$2"
+  local pid="$3"
+  local workdir="$4"
+  local role="$5"
+
+  cat > "$AGENTROOM_PID_DIR/${agentId}.pid" <<EOF
+AGENT_ID=$agentId
+PORT=$port
+PID=$pid
+WORKDIR=$workdir
+ROLE=$role
+STARTED=$(date -Iseconds)
+EOF
+}
+
+private.agentRoom.check.node() {
+  if ! command -v node &>/dev/null; then
+    error.log "Node.js not found. Install Node.js >= 20.0.0"
+    return 1
+  fi
+  local version=$(node -v | sed 's/v//' | cut -d. -f1)
+  if [ "$version" -lt 20 ]; then
+    error.log "Node.js >= 20.0.0 required. Current: $(node -v)"
+    return 1
+  fi
+  return 0
+}
+
+private.agentRoom.check.deps() {
+  if [ ! -d "$AGENTROOM_DIR/backend/node_modules" ]; then
+    info.log "Installing dependencies..."
+    (cd "$AGENTROOM_DIR/backend" && npm install)
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER COMPLETIONS (shared across all methods)
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.parameter.completion.agentId() {
+  agentRoom.list.ids
+}
+
+agentRoom.parameter.completion.workdir() {
+  compgen -d "$1"
+}
+
+agentRoom.parameter.completion.dir() {
+  compgen -d "$1"
+}
+
+agentRoom.parameter.completion.role() {
+  echo "orchestrator"
+  echo "coder"
+  echo "tester"
+  echo "reviewer"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALLATION & SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.install() # <?dir:/var/dev/Workspaces/2cuGitHub/agentrooms> # install agentrooms from github
+{
+  private.this.script.load ogit ogit.branch.get
+  local dir="${1:-$AGENTROOM_DIR}"
+
+  if [ -d "$dir" ]; then
+    info.log "Agentrooms already installed at $dir"
+    agentRoom.update
+    return 0
+  fi
+
+  info.log "Cloning agentrooms to $dir..."
+  # main is the upstream default branch (ls-remote --symref HEAD, 2026-09-24).
+  ogit.repo.clone https://github.com/baryhuang/claude-code-by-agents.git main "$dir"
+
+  if [ $? -eq 0 ]; then
+    success.log "Agentrooms installed at $dir"
+    agentRoom.setup
+  else
+    error.log "Failed to clone agentrooms"
+    return 1
+  fi
+}
+
+agentRoom.update() # # update agentrooms from github
+{
+  private.this.script.load ogit ogit.branch.get
+  if [ ! -d "$AGENTROOM_DIR" ]; then
+    error.log "Agentrooms not installed. Run: agentRoom install"
+    return 1
+  fi
+
+  info.log "Updating agentrooms..."
+  ogit.remote.pull "" "" "$AGENTROOM_DIR"
+  success.log "Agentrooms updated"
+}
+
+agentRoom.setup() # # setup agentrooms dependencies and config
+{
+  private.agentRoom.check.node || return 1
+  private.agentRoom.ensure.dirs
+
+  if [ ! -d "$AGENTROOM_DIR" ]; then
+    error.log "Agentrooms not installed. Run: agentRoom install"
+    return 1
+  fi
+
+  info.log "Setting up agentrooms..."
+
+  # Install backend dependencies
+  info.log "Installing backend dependencies..."
+  (cd "$AGENTROOM_DIR/backend" && npm install)
+
+  # Install frontend dependencies and build
+  info.log "Installing frontend dependencies..."
+  (cd "$AGENTROOM_DIR/frontend" && npm install)
+
+  info.log "Building frontend..."
+  (cd "$AGENTROOM_DIR/frontend" && npm run build)
+
+  # Copy frontend to backend static
+  info.log "Copying frontend to backend..."
+  (cd "$AGENTROOM_DIR/backend" && npm run build:static)
+
+  success.log "Agentrooms setup complete"
+  echo ""
+  echo "Start backend:  agentRoom backend.start"
+  echo "Start agent:    agentRoom agent.start <agentId> <?port> <?workdir>"
+  echo "List agents:    agentRoom list"
+}
+
+agentRoom.rebuild() # # rebuild frontend and copy to backend
+{
+  if [ ! -d "$AGENTROOM_DIR" ]; then
+    error.log "Agentrooms not installed. Run: agentRoom install"
+    return 1
+  fi
+
+  info.log "Rebuilding frontend..."
+  (cd "$AGENTROOM_DIR/frontend" && npm run build)
+
+  info.log "Copying frontend to backend..."
+  (cd "$AGENTROOM_DIR/backend" && npm run build:static)
+
+  success.log "Rebuild complete"
+  echo ""
+  echo "Restart backend: agentRoom backend.stop && agentRoom backend.start"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKEND MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.backend.start() # # start the main backend server on port 11080
+{
+  local port=$AGENTROOM_BACKEND_PORT
+
+  private.agentRoom.check.node || return 1
+  private.agentRoom.ensure.dirs
+
+  if private.agentRoom.is.running "backend"; then
+    local runningPort=$(private.agentRoom.get.agent.port "backend")
+    warn.log "Backend already running on port $runningPort"
+    return 0
+  fi
+
+  # Backend MUST be on port 11080 - kill anything using it
+  if ss -tuln 2>/dev/null | grep -q ":$port "; then
+    warn.log "Port $port busy, attempting to free it..."
+    local pid=$(ss -tulnp 2>/dev/null | grep ":$port " | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1)
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null
+      sleep 1
+    fi
+  fi
+
+  info.log "Starting backend on port $port..."
+
+  local logFile="$AGENTROOM_LOG_DIR/backend.log"
+
+  # Ensure dependencies installed
+  private.agentRoom.check.deps
+
+  # Start in background and capture PID
+  cd "$AGENTROOM_DIR/backend"
+  PORT="$port" nohup npm run dev > "$logFile" 2>&1 &
+  local pid=$!
+  cd - > /dev/null
+
+  # Wait for server to start
+  sleep 3
+
+  # Find the actual node process (child of npm)
+  local nodePid=$(pgrep -P "$pid" -f "node" 2>/dev/null | head -1)
+  [ -z "$nodePid" ] && nodePid=$pid
+
+  # Check if port is listening
+  if ss -tuln 2>/dev/null | grep -q ":$port "; then
+    private.agentRoom.save.agent.info "backend" "$port" "$nodePid" "$AGENTROOM_DIR" "backend"
+    success.log "Backend started on port $port (PID: $nodePid)"
+    echo "Health check: curl http://localhost:$port/api/health"
+  else
+    error.log "Backend failed to start. Check: $logFile"
+    cat "$logFile" | tail -10
+    return 1
+  fi
+}
+
+agentRoom.backend.stop() # # stop the backend server
+{
+  local pid=$(private.agentRoom.get.agent.pid "backend")
+
+  if [ -z "$pid" ]; then
+    info.log "Backend not running"
+    return 0
+  fi
+
+  info.log "Stopping backend (PID: $pid)..."
+  kill "$pid" 2>/dev/null
+  rm -f "$AGENTROOM_PID_DIR/backend.pid"
+  success.log "Backend stopped"
+}
+
+agentRoom.backend.status() # # show backend status
+{
+  if private.agentRoom.is.running "backend"; then
+    local port=$(private.agentRoom.get.agent.port "backend")
+    local pid=$(private.agentRoom.get.agent.pid "backend")
+    echo "Backend: running on port $port (PID: $pid)"
+    curl -s "http://localhost:$port/api/health" 2>/dev/null | jq . 2>/dev/null || echo "Health check failed"
+  else
+    echo "Backend: not running"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.agent.start() # <agentId> <?port> <?workdir> <?role> # start an agent instance
+{
+  local agentId="$1"
+  local port="$2"
+  local workdir="${3:-$(pwd)}"
+  local role="${4:-worker}"
+
+  if [ -z "$agentId" ]; then
+    error.log "Usage: agentRoom agent.start <agentId> <?port> <?workdir> <?role>"
+    return 1
+  fi
+
+  private.agentRoom.check.node || return 1
+  private.agentRoom.ensure.dirs
+
+  if private.agentRoom.is.running "$agentId"; then
+    local runningPort=$(private.agentRoom.get.agent.port "$agentId")
+    warn.log "Agent $agentId already running on port $runningPort"
+    return 0
+  fi
+
+  # Find free port
+  if [ -z "$port" ]; then
+    # Start from base port + 1 for agents (backend gets base port)
+    port=$(private.agentRoom.find.free.port $((AGENTROOM_BASE_PORT + 1)))
+  elif ss -tuln 2>/dev/null | grep -q ":$port "; then
+    port=$(private.agentRoom.find.free.port $port)
+    info.log "Port busy, using $port instead"
+  fi
+
+  info.log "Starting agent $agentId on port $port (workdir: $workdir)..."
+
+  local logFile="$AGENTROOM_LOG_DIR/${agentId}.log"
+
+  # Ensure dependencies installed
+  private.agentRoom.check.deps
+
+  # Start agent backend instance
+  (cd "$AGENTROOM_DIR/backend" && \
+    PORT="$port" \
+    AGENTROOM_WORKDIR="$workdir" \
+    AGENTROOM_AGENT_ID="$agentId" \
+    AGENTROOM_ROLE="$role" \
+    nohup npm run dev > "$logFile" 2>&1 &
+    echo $! > "$AGENTROOM_PID_DIR/${agentId}.tmp"
+  )
+
+  sleep 2
+
+  local pid=$(cat "$AGENTROOM_PID_DIR/${agentId}.tmp" 2>/dev/null)
+  rm -f "$AGENTROOM_PID_DIR/${agentId}.tmp"
+
+  if kill -0 "$pid" 2>/dev/null; then
+    private.agentRoom.save.agent.info "$agentId" "$port" "$pid" "$workdir" "$role"
+    success.log "Agent $agentId started on port $port (PID: $pid)"
+  else
+    error.log "Agent $agentId failed to start. Check: $logFile"
+    return 1
+  fi
+}
+
+agentRoom.agent.stop() # <agentId> # stop an agent instance
+{
+  local agentId="$1"
+
+  if [ -z "$agentId" ]; then
+    error.log "Usage: agentRoom agent.stop <agentId>"
+    return 1
+  fi
+
+  local pid=$(private.agentRoom.get.agent.pid "$agentId")
+
+  if [ -z "$pid" ]; then
+    info.log "Agent $agentId not running"
+    return 0
+  fi
+
+  info.log "Stopping agent $agentId (PID: $pid)..."
+  kill "$pid" 2>/dev/null
+  rm -f "$AGENTROOM_PID_DIR/${agentId}.pid"
+  success.log "Agent $agentId stopped"
+}
+
+agentRoom.agent.status() # <agentId> # show agent status
+{
+  local agentId="$1"
+
+  if [ -z "$agentId" ]; then
+    error.log "Usage: agentRoom agent.status <agentId>"
+    return 1
+  fi
+
+  if private.agentRoom.is.running "$agentId"; then
+    local port=$(private.agentRoom.get.agent.port "$agentId")
+    local pid=$(private.agentRoom.get.agent.pid "$agentId")
+    local workdir=$(grep "^WORKDIR=" "$AGENTROOM_PID_DIR/${agentId}.pid" 2>/dev/null | cut -d= -f2)
+    local role=$(grep "^ROLE=" "$AGENTROOM_PID_DIR/${agentId}.pid" 2>/dev/null | cut -d= -f2)
+
+    echo "Agent: $agentId"
+    echo "  Status:  running"
+    echo "  Port:    $port"
+    echo "  PID:     $pid"
+    echo "  Workdir: $workdir"
+    echo "  Role:    $role"
+    echo "  URL:     http://localhost:$port"
+  else
+    echo "Agent $agentId: not running"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LISTING & DISCOVERY
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.list() # # list all running agents
+{
+  private.agentRoom.ensure.dirs
+
+  echo "Agentroom Agents"
+  echo "────────────────────────────────────────────────────────────────"
+  printf "%-15s %-8s %-8s %-12s %s\n" "AGENT" "PORT" "PID" "ROLE" "WORKDIR"
+  echo "────────────────────────────────────────────────────────────────"
+
+  local count=0
+
+  for pidFile in "$AGENTROOM_PID_DIR"/*.pid; do
+    [ -f "$pidFile" ] || continue
+
+    local agentId=$(basename "$pidFile" .pid)
+    local port=$(grep "^PORT=" "$pidFile" 2>/dev/null | cut -d= -f2)
+    local pid=$(grep "^PID=" "$pidFile" 2>/dev/null | cut -d= -f2)
+    local role=$(grep "^ROLE=" "$pidFile" 2>/dev/null | cut -d= -f2)
+    local workdir=$(grep "^WORKDIR=" "$pidFile" 2>/dev/null | cut -d= -f2)
+
+    local status="stopped"
+    if kill -0 "$pid" 2>/dev/null; then
+      status="running"
+      ((count++))
+    else
+      # Clean up stale pid file
+      rm -f "$pidFile"
+      continue
+    fi
+
+    # Truncate workdir for display
+    local shortWorkdir="${workdir##*/}"
+
+    printf "%-15s %-8s %-8s %-12s %s\n" "$agentId" "$port" "$pid" "$role" "$shortWorkdir"
+  done
+
+  echo "────────────────────────────────────────────────────────────────"
+  echo "Total: $count running agents"
+}
+
+agentRoom.list.ids() # # list agent IDs only (for completion)
+{
+  for pidFile in "$AGENTROOM_PID_DIR"/*.pid; do
+    [ -f "$pidFile" ] || continue
+    local agentId=$(basename "$pidFile" .pid)
+    local pid=$(grep "^PID=" "$pidFile" 2>/dev/null | cut -d= -f2)
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "$agentId"
+    fi
+  done
+}
+
+agentRoom.list.ports() # # list all used ports
+{
+  for pidFile in "$AGENTROOM_PID_DIR"/*.pid; do
+    [ -f "$pidFile" ] || continue
+    local pid=$(grep "^PID=" "$pidFile" 2>/dev/null | cut -d= -f2)
+    if kill -0 "$pid" 2>/dev/null; then
+      grep "^PORT=" "$pidFile" 2>/dev/null | cut -d= -f2
+    fi
+  done
+}
+
+agentRoom.discover() # # discover all agents and their endpoints
+{
+  echo "{"
+  echo '  "agents": ['
+
+  local first=true
+  for pidFile in "$AGENTROOM_PID_DIR"/*.pid; do
+    [ -f "$pidFile" ] || continue
+
+    local agentId=$(basename "$pidFile" .pid)
+    local pid=$(grep "^PID=" "$pidFile" 2>/dev/null | cut -d= -f2)
+
+    if kill -0 "$pid" 2>/dev/null; then
+      local port=$(grep "^PORT=" "$pidFile" 2>/dev/null | cut -d= -f2)
+      local role=$(grep "^ROLE=" "$pidFile" 2>/dev/null | cut -d= -f2)
+      local workdir=$(grep "^WORKDIR=" "$pidFile" 2>/dev/null | cut -d= -f2)
+
+      [ "$first" = "true" ] || echo ","
+      first=false
+
+      cat <<EOF
+    {
+      "id": "$agentId",
+      "port": $port,
+      "url": "http://localhost:$port",
+      "role": "$role",
+      "workingDirectory": "$workdir"
+    }
+EOF
+    fi
+  done
+
+  echo ""
+  echo "  ]"
+  echo "}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BULK OPERATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.start.all() # <?roles:orchestrator,coder,tester,reviewer> # start multiple agents
+{
+  local roles="${1:-orchestrator,coder,tester,reviewer}"
+
+  info.log "Starting agents: $roles"
+
+  # Start backend first
+  agentRoom.backend.start
+
+  # Start each agent
+  IFS=',' read -ra role_array <<< "$roles"
+  for role in "${role_array[@]}"; do
+    agentRoom.agent.start "$role" "" "" "$role"
+    sleep 1
+  done
+
+  echo ""
+  agentRoom.list
+}
+
+agentRoom.stop.all() # # stop all agents and backend
+{
+  info.log "Stopping all agents..."
+
+  for pidFile in "$AGENTROOM_PID_DIR"/*.pid; do
+    [ -f "$pidFile" ] || continue
+    local agentId=$(basename "$pidFile" .pid)
+    agentRoom.agent.stop "$agentId"
+  done
+
+  success.log "All agents stopped"
+}
+
+agentRoom.restart.all() # # restart all agents
+{
+  agentRoom.stop.all
+  sleep 2
+  agentRoom.start.all
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMUNICATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.chat() # <agentId> <message> # send message to agent
+{
+  local agentId="$1"
+  shift
+  local message="$*"
+
+  if [ -z "$agentId" ] || [ -z "$message" ]; then
+    error.log "Usage: agentRoom chat <agentId> <message>"
+    return 1
+  fi
+
+  local port=$(private.agentRoom.get.agent.port "$agentId")
+
+  if [ -z "$port" ]; then
+    error.log "Agent $agentId not found"
+    return 1
+  fi
+
+  curl -s -X POST "http://localhost:$port/api/chat" \
+    -H "Content-Type: application/json" \
+    -d "{\"message\": \"$message\", \"requestId\": \"$(uuidgen 2>/dev/null || date +%s)\"}"
+}
+
+agentRoom.health() # <agentId> # check agent health
+{
+  local agentId="$1"
+
+  if [ -z "$agentId" ]; then
+    error.log "Usage: agentRoom health <agentId>"
+    return 1
+  fi
+
+  local port=$(private.agentRoom.get.agent.port "$agentId")
+
+  if [ -z "$port" ]; then
+    error.log "Agent $agentId not found"
+    return 1
+  fi
+
+  curl -s "http://localhost:$port/api/health" | jq . 2>/dev/null || echo "Health check failed"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.logs() # <agentId> <?lines:50> # show agent logs
+{
+  local agentId="$1"
+  local lines="${2:-50}"
+
+  if [ -z "$agentId" ]; then
+    error.log "Usage: agentRoom logs <agentId> <?lines>"
+    return 1
+  fi
+
+  local logFile="$AGENTROOM_LOG_DIR/${agentId}.log"
+
+  if [ -f "$logFile" ]; then
+    tail -n "$lines" "$logFile"
+  else
+    error.log "No logs found for $agentId"
+    return 1
+  fi
+}
+
+agentRoom.logs.follow() # <agentId> # follow agent logs
+{
+  local agentId="$1"
+
+  if [ -z "$agentId" ]; then
+    error.log "Usage: agentRoom logs.follow <agentId>"
+    return 1
+  fi
+
+  local logFile="$AGENTROOM_LOG_DIR/${agentId}.log"
+
+  if [ -f "$logFile" ]; then
+    tail -f "$logFile"
+  else
+    error.log "No logs found for $agentId"
+    return 1
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USAGE
+# ─────────────────────────────────────────────────────────────────────────────
+
+agentRoom.usage()
+{
+  local this=${0##*/}
+  echo "You started"
+  echo "$0
+
+  agentRoom - OOSH wrapper for agentrooms multi-agent framework
+  Real Claude Code instances with @mention routing
+
+  Usage:
+  $this command     Description
+  ─────────────────────────────────────────────────────
+  INSTALLATION:
+      install       install agentrooms from github
+      update        update agentrooms
+      setup         setup dependencies and config
+
+  BACKEND:
+      backend.start start the main backend server
+      backend.stop  stop the backend server
+      backend.status show backend status
+
+  AGENTS:
+      agent.start   start an agent instance
+      agent.stop    stop an agent instance
+      agent.status  show agent status
+
+  BULK:
+      start.all     start multiple agents
+      stop.all      stop all agents
+      restart.all   restart all agents
+
+  DISCOVERY:
+      list          list all running agents
+      list.ids      list agent IDs only
+      list.ports    list all used ports
+      discover      discover agents as JSON
+
+  COMMUNICATION:
+      chat          send message to agent
+      health        check agent health
+
+  LOGS:
+      logs          show agent logs
+      logs.follow   follow agent logs
+  ─────────────────────────────────────────────────────
+
+  Examples:
+    $this install                      # install agentrooms
+    $this backend.start                # start backend on 11080
+    $this agent.start coder 11081 .    # start coder agent
+    $this start.all                    # start default agents
+    $this list                         # list all agents
+    $this chat coder 'fix the bug'     # send message
+    $this discover                     # JSON discovery
+  "
+}
+
+agentRoom.start()
+{
+  source this
+
+  if [ -z "$1" ]; then
+    agentRoom.list
+    return 0
+  fi
+
+  this.start "$@"
+}
+
+agentRoom.start "$@"

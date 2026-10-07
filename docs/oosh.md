@@ -109,7 +109,7 @@ scriptname.start "$@"  # Bootstrap call
 |--------|---------|---------|
 | `config` | Configuration persistence | `config set VAR value` |
 | `log` | Logging with levels | `info.log "message"` |
-| `debug` | Step debugger | `source debug; setTrap` |
+| `debug` | Step debugger | `source debug; debug.setTrap` |
 | `state` | State machines | `state machine.create PDCA` |
 | `otmux` | tmux wrapper | `otmux split` |
 | `claudeFlow` | Claude Flow wrapper | `claudeFlow hive.status` |
@@ -136,8 +136,8 @@ debug.log "message"    # Level 5
 
 ```bash
 ./oo new myscript              # Create script from template
-./oo new.method myscript.foo   # Add method
-./oo new.test myscript         # Create test file
+./oo method.new myscript.foo   # Add method
+./oo test.new myscript         # Create test file
 ```
 
 ---

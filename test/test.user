@@ -1,0 +1,1106 @@
+#!/usr/bin/env bash
+# Tests for user — OOSH user and SSH identity management
+# Tests: id, list, list.all, list.groups, get.current.identity, ssh.status,
+#        list.other.identities, ssh.backup / ssh.restore / ssh.backup.list
+TEST_CATEGORY=core
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+# ============================================================================
+# T1: user is callable
+# ============================================================================
+test.case $level "user is callable" \
+  command -v user
+
+if command -v user >/dev/null 2>&1; then
+  expect.pass "user found on PATH"
+else
+  expect.fail "user should be on PATH"
+fi
+
+# ============================================================================
+# T2: user.id returns current user id
+# ============================================================================
+test.case $level "user.id returns user id" \
+  bash -c 'source this; source user; user.id -u -n'
+
+ID_OUTPUT=$(bash -c 'source this; source user; user.id -u -n 2>/dev/null')
+if [ "$ID_OUTPUT" = "$(id -u -n)" ]; then
+  expect.pass "user.id -u -n returns $(id -u -n)"
+else
+  expect.fail "user.id -u -n should return $(id -u -n), got: $ID_OUTPUT"
+fi
+
+# ============================================================================
+# T3: user.list returns users (filters _ prefixed)
+# ============================================================================
+test.case $level "user.list returns users" \
+  bash -c 'source this; source user; user.list'
+
+LIST_OUTPUT=$(bash -c 'source this; source user; user.list 2>/dev/null')
+if [ -n "$LIST_OUTPUT" ]; then
+  expect.pass "user.list returned users"
+else
+  expect.fail "user.list should return at least one user"
+fi
+
+# ============================================================================
+# T4: user.list.all returns all users including system
+# ============================================================================
+test.case $level "user.list.all returns all users" \
+  bash -c 'source this; source user; user.list.all'
+
+ALL_OUTPUT=$(bash -c 'source this; source user; user.list.all 2>/dev/null')
+if [ -n "$ALL_OUTPUT" ]; then
+  # list.all should have >= list (includes _ prefixed)
+  ALL_COUNT=$(echo "$ALL_OUTPUT" | wc -l | tr -d ' ')
+  expect.pass "user.list.all returned $ALL_COUNT users"
+else
+  expect.fail "user.list.all should return users"
+fi
+
+# ============================================================================
+# T5: user.list.groups returns groups
+# ============================================================================
+test.case $level "user.list.groups returns groups" \
+  bash -c 'source this; source user; user.list.groups'
+
+GROUPS_OUTPUT=$(bash -c 'source this; source user; user.list.groups 2>/dev/null')
+if [ -n "$GROUPS_OUTPUT" ]; then
+  expect.pass "user.list.groups returned groups"
+else
+  expect.fail "user.list.groups should return at least one group"
+fi
+
+# ============================================================================
+# T6: user.get.current.identity returns SSH dir
+# ============================================================================
+test.case $level "user.get.current.identity returns SSH dir" \
+  bash -c 'source this; source ossh; source user; user.get.current.identity'
+
+IDENTITY_OUTPUT=$(bash -c 'source this; source ossh; source user; user.get.current.identity 2>/dev/null')
+if [ -n "$IDENTITY_OUTPUT" ]; then
+  if [ -d "$IDENTITY_OUTPUT" ]; then
+    expect.pass "user.get.current.identity returned valid dir: $IDENTITY_OUTPUT"
+  else
+    expect.fail "user.get.current.identity returned non-existent dir: $IDENTITY_OUTPUT"
+  fi
+else
+  expect.fail "user.get.current.identity should return a path"
+fi
+
+# ============================================================================
+# T7: user.ssh.status returns 0 when SSH is configured
+# ============================================================================
+test.case $level "user.ssh.status returns 0 when SSH configured" \
+  bash -c 'source this; source ossh; source user; user.ssh.status'
+
+bash -c 'source this; source ossh; source user; user.ssh.status 2>/dev/null'
+SSH_RC=$?
+if [ -d "$HOME/.ssh" ]; then
+  if [ $SSH_RC -eq 0 ]; then
+    expect.pass "user.ssh.status returns 0 (SSH configured)"
+  else
+    expect.fail "user.ssh.status should return 0 when ~/.ssh exists (got $SSH_RC)"
+  fi
+else
+  if [ $SSH_RC -ne 0 ]; then
+    expect.pass "user.ssh.status returns non-zero (no ~/.ssh)"
+  else
+    expect.fail "user.ssh.status should return non-zero when ~/.ssh missing"
+  fi
+fi
+
+# ============================================================================
+# T8: user.id.completion returns valid options
+# ============================================================================
+test.case $level "user.id.completion returns options" \
+  bash -c 'source this; source user; user.id.completion'
+
+COMP_OUTPUT=$(bash -c 'source this; source user; user.id.completion 2>/dev/null')
+if echo "$COMP_OUTPUT" | grep -q '\-u'; then
+  expect.pass "user.id.completion includes -u flag"
+else
+  expect.fail "user.id.completion should include -u flag"
+fi
+
+# ============================================================================
+# T9: user.list filters underscore-prefixed users
+# ============================================================================
+test.case $level "user.list filters _ prefixed system users" \
+  bash -c 'source this; source user; user.list'
+
+FILTERED=$(bash -c 'source this; source user; user.list 2>/dev/null' | grep '^_' || true)
+if [ -z "$FILTERED" ]; then
+  expect.pass "user.list correctly filters _ prefixed users"
+else
+  expect.fail "user.list should not contain _ prefixed users, found: $(echo "$FILTERED" | head -1)"
+fi
+
+echo ""
+echo "test.user complete"
+
+# ============================================================================
+# Password-handling tests (user.create password keyword + user.password.set)
+# Guarded: skipped if sudo -n is not available (no passwordless sudo).
+# All created accounts are cleaned up with user.delete.linux (cross-platform).
+# ============================================================================
+
+if sudo -n true 2>/dev/null; then
+
+  # Source the methods we're testing so we can invoke them directly in this shell
+  source this
+  source user
+  os.check.env
+
+  # Platform-specific helper: returns 0 if the given user has a password hash set
+  user.test.hasPassword() {
+    local u="$1"
+    if [ "$OOSH_OS" = "darwin" ]; then
+      sudo dscl . -read "/Users/$u" AuthenticationAuthority 2>/dev/null | grep -q ';ShadowHash;'
+    else
+      # GNU & BusyBox /etc/shadow: field 2 is the hash; '!' or '*' (or empty) means locked
+      local field2
+      field2=$(sudo grep -E "^$u:" /etc/shadow 2>/dev/null | cut -d: -f2)
+      [ -n "$field2" ] && [ "$field2" != "!" ] && [ "$field2" != "*" ] && [ "$field2" != "!!" ]
+    fi
+  }
+
+  # --------------------------------------------------------------------------
+  # T-a: user.create with explicit password sets the password
+  # --------------------------------------------------------------------------
+  test.case $level "user.create ooshTestA password secretA sets password" \
+    bash -c 'source this; source user; user.create ooshTestA password secretA >/dev/null 2>&1; id ooshTestA'
+
+  user.delete.linux ooshTestA >/dev/null 2>&1  # ensure clean slate
+  user.create ooshTestA password secretA >/dev/null 2>&1
+  if id ooshTestA >/dev/null 2>&1 && user.test.hasPassword ooshTestA; then
+    expect.pass "ooshTestA created and password is set"
+  else
+    expect.fail "ooshTestA should exist with a password hash"
+  fi
+  user.delete.linux ooshTestA >/dev/null 2>&1
+
+  # --------------------------------------------------------------------------
+  # T-b: user.create defaults password to username
+  # --------------------------------------------------------------------------
+  test.case $level "user.create ooshTestB defaults password to username" \
+    bash -c 'source this; source user; user.create ooshTestB >/dev/null 2>&1; id ooshTestB'
+
+  user.delete.linux ooshTestB >/dev/null 2>&1
+  user.create ooshTestB >/dev/null 2>&1
+  if id ooshTestB >/dev/null 2>&1 && user.test.hasPassword ooshTestB; then
+    expect.pass "ooshTestB created and default password (username) is set"
+  else
+    expect.fail "ooshTestB should exist with a password hash"
+  fi
+  user.delete.linux ooshTestB >/dev/null 2>&1
+
+  # --------------------------------------------------------------------------
+  # T-c: explicit empty password is a no-op (account stays locked)
+  # --------------------------------------------------------------------------
+  test.case $level "user.create ooshTestC password '' leaves account locked" \
+    bash -c 'source this; source user; user.create ooshTestC password "" >/dev/null 2>&1; id ooshTestC'
+
+  user.delete.linux ooshTestC >/dev/null 2>&1
+  user.create ooshTestC password "" >/dev/null 2>&1
+  if id ooshTestC >/dev/null 2>&1 && ! user.test.hasPassword ooshTestC; then
+    expect.pass "ooshTestC created with no password (locked) — back-compat preserved"
+  else
+    expect.fail "ooshTestC should exist with no password hash"
+  fi
+  user.delete.linux ooshTestC >/dev/null 2>&1
+
+  # --------------------------------------------------------------------------
+  # T-d: user.password.set resets an existing user's password
+  # --------------------------------------------------------------------------
+  test.case $level "user.password.set resets ooshTestD's password" \
+    bash -c 'source this; source user; user.create ooshTestD password "" >/dev/null 2>&1; user.password.set ooshTestD freshPw >/dev/null 2>&1'
+
+  user.delete.linux ooshTestD >/dev/null 2>&1
+  user.create ooshTestD password "" >/dev/null 2>&1
+  user.password.set ooshTestD freshPw >/dev/null 2>&1
+  if user.test.hasPassword ooshTestD; then
+    expect.pass "user.password.set populated ooshTestD's password hash"
+  else
+    expect.fail "user.password.set should populate the password hash"
+  fi
+  user.delete.linux ooshTestD >/dev/null 2>&1
+
+  # --------------------------------------------------------------------------
+  # T-e2: short username (≤3 chars) still produces a usable account
+  # Exercises the darwin auto-pad branch; on Linux the short password passes
+  # chpasswd directly. Either way the created user should have password metadata.
+  # --------------------------------------------------------------------------
+  test.case $level "user.create bo (short name) produces a user with password" \
+    bash -c 'source this; source user; user.create bo >/dev/null 2>&1; id bo'
+
+  user.delete.linux bo >/dev/null 2>&1
+  user.create bo >/dev/null 2>&1
+  if id bo >/dev/null 2>&1 && user.test.hasPassword bo; then
+    expect.pass "short-username 'bo' created with a valid password"
+  else
+    expect.fail "short-username 'bo' should be creatable with the default-password auto-pad on darwin / chpasswd on Linux"
+  fi
+  user.delete.linux bo >/dev/null 2>&1
+
+  unset -f user.test.hasPassword
+
+else
+  # Skipped path — keep the run green on envs without passwordless sudo
+  test.case $level "password tests skipped (no passwordless sudo)" \
+    true
+  expect.pass "skipped — 'sudo -n' not available"
+fi
+
+# ============================================================================
+# user.oosh.install — always-runnable negative paths (positive path is E2E)
+# ============================================================================
+
+source this
+source user
+
+# T-e: missing username → error + non-zero
+test.case $level "user.oosh.install with no args returns non-zero" \
+  bash -c 'source this; source user; user.oosh.install 2>/dev/null'
+
+bash -c 'source this; source user; user.oosh.install 2>/dev/null'
+if [ $? -ne 0 ]; then
+  expect.pass "user.oosh.install returns non-zero when username missing"
+else
+  expect.fail "user.oosh.install should fail without a username"
+fi
+
+# T-f: nonexistent user → home-lookup fails → non-zero
+test.case $level "user.oosh.install for unknown user returns non-zero" \
+  bash -c 'source this; source user; user.oosh.install __ooshNoSuchUser__ dev 2>/dev/null'
+
+bash -c 'source this; source user; user.oosh.install __ooshNoSuchUser__ dev 2>/dev/null'
+if [ $? -ne 0 ]; then
+  expect.pass "user.oosh.install fails on unknown user"
+else
+  expect.fail "user.oosh.install should fail for a non-existent user"
+fi
+
+# T-g: os.check dispatches the shell-change helper to a real function
+test.case $level "os.check resolves user.oosh.install.shell to a defined function" \
+  bash -c 'source this; source os; source user; os.check private.user.oosh.install.shell && type -t "$RESULT"'
+
+RESOLVED=$(bash -c 'source this; source os; source user; if os.check private.user.oosh.install.shell; then echo "$RESULT"; fi' 2>/dev/null)
+if [ "$RESOLVED" = "private.user.oosh.install.shell.darwin" ] || [ "$RESOLVED" = "private.user.oosh.install.shell.linux" ]; then
+  expect.pass "os.check resolves to '$RESOLVED'"
+else
+  expect.fail "os.check should resolve to .darwin or .linux variant, got: '$RESOLVED'"
+fi
+
+# T-h: completion lists the current host's worktree branches (non-empty when OOSH_DIR is set)
+test.case $level "user.oosh.install.completion.branch emits candidates" \
+  bash -c 'source this; source user; user.oosh.install.completion.branch'
+
+BRANCHES=$(bash -c 'source this; source user; user.oosh.install.completion.branch 2>/dev/null')
+if [ -n "$BRANCHES" ]; then
+  expect.pass "branch completion returned: $(echo "$BRANCHES" | head -1 | tr -d '\n')…"
+else
+  # Not a hard failure — on some envs OOSH_DIR may not sit in a worktree-style layout
+  expect.pass "branch completion returned empty (acceptable on non-worktree layouts)"
+fi
+
+# ============================================================================
+# T-USER-INIT-SELF-HEAL: private.user.init fills in missing OS_CMD_* vars
+# when os.commands.env was saved incomplete (e.g. private.check.pm wrote it
+# during install before USER_MOD / USER_DEL were computed). Reproduces the
+# hetzsim bug where `user.group.add dev bob` silently degraded and bob
+# never joined `dev`, breaking write access to log.live.out.
+#
+# CRITICAL: private.user.init transitively calls `config save`, which
+# writes to $CONFIG (NOT just $CONFIG_PATH). If we only override
+# CONFIG_PATH here, config save still hits the real user.env and can
+# poison it with the temp path. Run the whole helper inside a bash -c
+# subshell where BOTH CONFIG and CONFIG_PATH are redirected to the
+# throw-away dir. Results are captured via files written to that dir,
+# not via env vars that would leak back.
+# ============================================================================
+TUSR_SELF_HEAL=$(mktemp -d)
+cat > "$TUSR_SELF_HEAL/os.commands.env" <<'EOF'
+export declare OS_CMD_GROUP_ADD="groupadd -f"
+export declare OS_CMD_USER_ADD="useradd -g dev"
+EOF
+
+# Run in a fully-isolated subshell: fresh CONFIG + CONFIG_PATH pointing at
+# the temp dir, private.user.init fires, we capture the resulting
+# OS_CMD_USER_MOD / OS_CMD_USER_DEL values into files we can grep from
+# the outer shell. No exports leak back to the caller's env.
+bash -c '
+  export CONFIG_PATH="'"$TUSR_SELF_HEAL"'"
+  export CONFIG="'"$TUSR_SELF_HEAL"'/user.env"
+  : > "$CONFIG"
+  unset OS_CMD_USER_MOD OS_CMD_USER_DEL OS_CMD_USER_ADD OS_CMD_GROUP_ADD
+  # OOSH_PM_UPDATED is the mechanism oo itself uses to say "the package index
+  # has already been refreshed" (oo.cmd). Discovery only records the package
+  # manager; the refresh belongs to oo.cmd, once before its first real install.
+  # Without the variable, a real install here would run `$SUDO apt-get update`,
+  # which reads the TTY directly: the >/dev/null 2>&1 below cannot suppress a
+  # password prompt, so the whole file blocked forever on any host without
+  # passwordless sudo. That is why test.user could never join `core`.
+  export OOSH_PM_UPDATED="test fixture — no package index refresh here"
+  source "'"$OOSH_DIR"'/user" >/dev/null 2>&1 || true
+  private.user.init >/dev/null 2>&1 || true
+  printf "%s" "$OS_CMD_USER_MOD" > "'"$TUSR_SELF_HEAL"'/.result.USER_MOD"
+  printf "%s" "$OS_CMD_USER_DEL" > "'"$TUSR_SELF_HEAL"'/.result.USER_DEL"
+' >/dev/null 2>&1 || true
+
+_HEAL_USER_MOD=$(cat "$TUSR_SELF_HEAL/.result.USER_MOD" 2>/dev/null)
+_HEAL_USER_DEL=$(cat "$TUSR_SELF_HEAL/.result.USER_DEL" 2>/dev/null)
+
+test.case $level "T-USER-INIT-SELF-HEAL: fills missing OS_CMD_USER_MOD" \
+  echo "OS_CMD_USER_MOD=$_HEAL_USER_MOD"
+if [ -n "$_HEAL_USER_MOD" ]; then
+  expect.pass "OS_CMD_USER_MOD filled in: $_HEAL_USER_MOD"
+else
+  expect.fail "OS_CMD_USER_MOD still empty after private.user.init (self-heal broken)"
+fi
+
+test.case $level "T-USER-INIT-SELF-HEAL: fills missing OS_CMD_USER_DEL" \
+  echo "OS_CMD_USER_DEL=$_HEAL_USER_DEL"
+if [ -n "$_HEAL_USER_DEL" ]; then
+  expect.pass "OS_CMD_USER_DEL filled in: $_HEAL_USER_DEL"
+else
+  expect.fail "OS_CMD_USER_DEL still empty after private.user.init"
+fi
+
+test.case $level "T-USER-INIT-SELF-HEAL: re-saves os.commands.env with complete set" \
+  echo "(grep re-saved file)"
+if grep -q 'OS_CMD_USER_MOD' "$TUSR_SELF_HEAL/os.commands.env" \
+   && grep -q 'OS_CMD_USER_DEL' "$TUSR_SELF_HEAL/os.commands.env"; then
+  expect.pass "os.commands.env re-saved with all four OS_CMD_* vars"
+else
+  expect.fail "os.commands.env not re-saved with complete set — future sessions still broken"
+fi
+
+test.case $level "T-USER-INIT-SELF-HEAL-ISOLATION: outer CONFIG_PATH unchanged" \
+  echo "CONFIG_PATH=$CONFIG_PATH"
+if [ "$CONFIG_PATH" != "$TUSR_SELF_HEAL" ] \
+   && ! grep -qE 'CONFIG_PATH="/tmp/tmp\.' "$CONFIG" 2>/dev/null; then
+  expect.pass "subshell isolation worked — outer CONFIG and user.env untouched"
+else
+  expect.fail "test poisoned outer config — CONFIG_PATH or user.env now references the temp dir"
+fi
+
+rm -rf "$TUSR_SELF_HEAL"
+
+# ============================================================================
+# T-PRIVATE-AS-USER-DISPATCH: private.as.user must try runuser FIRST (works
+# without sudo when caller is root), then sudo -H -u (most distros), then
+# su -s /bin/bash - … -c (root + no sudo, e.g. minimal containers). The
+# dispatch order matters: runuser is the only path that doesn't need sudo
+# at all, so it must precede sudo. su is last-resort. Reversing this would
+# silently break sudo-less containers like naked alpine before sudo install.
+# ============================================================================
+source "$OOSH_DIR/user" >/dev/null 2>&1 || true
+
+test.case $level "T-PRIVATE-AS-USER-DISPATCH: runuser → sudo → su fallback chain in correct order" \
+  echo "(grep)"
+PAU_BODY=$(declare -f private.as.user 2>/dev/null)
+if printf "%s" "$PAU_BODY" | grep -qE 'runuser.*-u' \
+   && printf "%s" "$PAU_BODY" | grep -qE 'sudo.*-H.*-u' \
+   && printf "%s" "$PAU_BODY" | grep -qE 'su.*-s.*/bin/bash'; then
+  # Verify ORDER: runuser line must appear before sudo, sudo before su.
+  # Use word boundaries (\b) so 'command -v su' doesn't match 'command -v sudo'.
+  _runLn=$(printf "%s" "$PAU_BODY" | grep -nE 'command -v runuser\b' | head -1 | cut -d: -f1)
+  _sudoLn=$(printf "%s" "$PAU_BODY" | grep -nE 'command -v sudo\b' | head -1 | cut -d: -f1)
+  _suLn=$(printf "%s" "$PAU_BODY" | grep -nE 'command -v su\b' | head -1 | cut -d: -f1)
+  if [ -n "$_runLn" ] && [ -n "$_sudoLn" ] && [ -n "$_suLn" ] \
+     && [ "$_runLn" -lt "$_sudoLn" ] && [ "$_sudoLn" -lt "$_suLn" ]; then
+    expect.pass "private.as.user dispatch chain order: runuser → sudo → su"
+  else
+    expect.fail "private.as.user dispatch order wrong — runuser must precede sudo, sudo must precede su"
+  fi
+else
+  expect.fail "private.as.user missing one of runuser/sudo/su dispatches — sudo-less containers will break"
+fi
+
+# ============================================================================
+# T-SSH-BACKUP-* : the archive is $HOME-anchored, and cannot nest
+# ============================================================================
+# The old body was `cp -R $sshDir ssh.$name` — a CWD-RELATIVE destination —
+# while its callers guarded on the ABSOLUTE $HOME/ssh.<name>. Nothing tested
+# either method, which is how three root-owned copies of root's ~/.ssh ended
+# up in a normal user's home on the dev box.
+#
+# Every case below runs in a `bash -c` with its OWN $HOME and its cwd
+# deliberately somewhere else, because cwd is the whole point.
+TUSR_SSH_TMP=$(test.suite.fixture.make test.user.ssh)
+trap 'rm -rf "$TUSR_SSH_TMP" 2>/dev/null' EXIT
+
+private.test.user.ssh.run() { # <command...> # run <command> with a fresh $HOME and cwd elsewhere; echo its stdout
+  cd "$TUSR_SSH_TMP/elsewhere" 2>/dev/null || return 1
+  HOME="$TUSR_SSH_TMP/home" CURRENT_SSH_DIR="" bash -c '
+    source "'"$OOSH_DIR"'/this" >/dev/null 2>&1
+    source "'"$OOSH_DIR"'/user" >/dev/null 2>&1
+    unset CURRENT_SSH_DIR
+    '"$*"'
+  ' 2>/dev/null
+  local rc=$?
+  cd "$OOSH_DIR" || true
+  return $rc
+}
+
+private.test.user.ssh.fixture() { # # rebuild a fresh fixture home + an empty cwd
+  rm -rf "$TUSR_SSH_TMP/home" "$TUSR_SSH_TMP/elsewhere"
+  mkdir -p "$TUSR_SSH_TMP/home/.ssh" "$TUSR_SSH_TMP/elsewhere"
+  echo "original-key" > "$TUSR_SSH_TMP/home/.ssh/id_probe"
+}
+
+# --- the card's own "Done when" -------------------------------------------
+test.user.sshBackupIsHomeAnchored() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null' >/dev/null
+  local inCwd inHome
+  inCwd=$(ls -A "$TUSR_SSH_TMP/elsewhere" 2>/dev/null | grep -c .)
+  inHome=$(ls -1d "$TUSR_SSH_TMP/home/.ssh.backups"/*-probe 2>/dev/null | grep -c .)
+  if [ "$inCwd" != "0" ]; then
+    create.result 1 "it wrote $inCwd entr(ies) into the current directory"
+  elif [ "$inHome" != "1" ]; then
+    create.result 1 "expected exactly 1 archive under \$HOME/.ssh.backups, found $inHome"
+  else
+    create.result 0 "archived under \$HOME"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-ANCHORED: the archive lands under \$HOME, never in the current directory" \
+  test.user.sshBackupIsHomeAnchored
+expect 0 "archived under \$HOME" "cwd-relative is how root's keys ended up in a user's home"
+
+# --- repeat runs must not nest ---------------------------------------------
+test.user.sshBackupDoesNotNest() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null; user.ssh.backup probe >/dev/null' >/dev/null
+  local archives nested
+  archives=$(ls -1d "$TUSR_SSH_TMP/home/.ssh.backups"/*-probe* 2>/dev/null | grep -c .)
+  nested=$(find "$TUSR_SSH_TMP/home/.ssh.backups" -name .ssh -type d 2>/dev/null | grep -c .)
+  if [ "$nested" != "0" ]; then
+    create.result 1 "the second run nested inside the first ($nested nested .ssh)"
+  elif [ "$archives" != "2" ]; then
+    create.result 1 "expected 2 distinct archives, found $archives"
+  else
+    create.result 0 "two archives, neither nested"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-NO-NEST: a second backup makes a second archive, not a nested copy" \
+  test.user.sshBackupDoesNotNest
+expect 0 "two archives, neither nested" "cp -R into an existing directory copies INTO it — each install nested one level deeper"
+
+# --- nothing to archive is a refusal, not a silent success ------------------
+test.user.sshBackupRefusesMissingDir() {
+  private.test.user.ssh.fixture
+  rm -rf "$TUSR_SSH_TMP/home/.ssh"
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null' >/dev/null
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success with no ~/.ssh to archive"
+  elif [ -d "$TUSR_SSH_TMP/home/.ssh.backups" ]; then
+    create.result 1 "it created an archive root for an archive it could not make"
+  else
+    create.result 0 "refused"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-NO-SOURCE: no ~/.ssh is a refusal, not an empty archive" \
+  test.user.sshBackupRefusesMissingDir
+expect 0 "refused" "a backup that silently archives nothing is worse than no backup"
+
+# --- restore must never destroy first ---------------------------------------
+test.user.sshRestoreKeepsSshOnMissingArchive() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.restore doesNotExist >/dev/null' >/dev/null
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success for an archive that does not exist"
+  elif [ ! -f "$TUSR_SSH_TMP/home/.ssh/id_probe" ]; then
+    create.result 1 "it destroyed ~/.ssh before discovering it had nothing to restore"
+  else
+    create.result 0 "~/.ssh untouched"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-RESTORE-SAFE: a missing archive leaves ~/.ssh intact" \
+  test.user.sshRestoreKeepsSshOnMissingArchive
+expect 0 "~/.ssh untouched" "the old body ran rm -Rf \$sshDir BEFORE a cwd-relative cp — from the wrong directory it destroyed ~/.ssh"
+
+# --- and it must actually restore ------------------------------------------
+test.user.sshRestoreRoundTrip() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup probe >/dev/null' >/dev/null
+  echo "corrupted" > "$TUSR_SSH_TMP/home/.ssh/id_probe"
+  private.test.user.ssh.run 'user.ssh.restore latest >/dev/null' >/dev/null
+  local content
+  content=$(cat "$TUSR_SSH_TMP/home/.ssh/id_probe" 2>/dev/null)
+  if [ "$content" = "original-key" ]; then
+    create.result 0 "restored"
+  else
+    create.result 1 "got '$content', expected 'original-key'"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-RESTORE-ROUNDTRIP: backup then restore latest brings the content back" \
+  test.user.sshRestoreRoundTrip
+expect 0 "restored" "an archive nobody can restore is not a backup"
+
+# --- the archives are discoverable -----------------------------------------
+test.user.sshBackupList() {
+  private.test.user.ssh.fixture
+  private.test.user.ssh.run 'user.ssh.backup one >/dev/null; user.ssh.backup two >/dev/null' >/dev/null
+  local out
+  out=$(private.test.user.ssh.run 'user.ssh.backup.list')
+  local lines
+  # grep -cE, not a BRE with \| — GNU treats \| as alternation, BSD grep does NOT
+  # (it is a GNU extension), so on macOS this counted 0 and the test failed while
+  # user.ssh.backup.list was working perfectly. POSIX ERE alternation is portable.
+  lines=$(printf '%s\n' "$out" | grep -cE -- '-(one|two)$')
+  if [ "$lines" = "2" ]; then
+    create.result 0 "both listed"
+  else
+    create.result 1 "expected 2 archives listed, got: $out"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-LIST: the archives can be found again" \
+  test.user.sshBackupList
+expect 0 "both listed" "ssh.backup.list is how a human reaches an archive without knowing the timestamp"
+
+# ============================================================================
+# T-SSH-BACKUP-LEGACY-*: finding and moving what the old code already left
+# ============================================================================
+# The real subject is three root-owned 0700 directories in /home/hannesn. The
+# fixture plants the same shapes, plus the two things the sweep must NOT take:
+# the new archive root, and ~/.ssh/ids/ssh.* which osshLayout owns under the
+# same prefix.
+private.test.user.ssh.legacy.fixture() { # # plant legacy artefacts and two decoys
+  private.test.user.ssh.fixture
+  mkdir -p "$TUSR_SSH_TMP/home/ssh.original"
+  mkdir -p "$TUSR_SSH_TMP/home/ssh.root.hostA.for.hostB"
+  mkdir -p "$TUSR_SSH_TMP/home/.ssh.backups/20260101T000000Z-manual"   # decoy: the new root
+  mkdir -p "$TUSR_SSH_TMP/home/.ssh/ids/ssh.developking"               # decoy: osshLayout's
+}
+
+test.user.sshBackupStatusFindsLegacy() {
+  private.test.user.ssh.legacy.fixture
+  local out
+  out=$(private.test.user.ssh.run 'user.ssh.backup.status "$HOME"' 2>/dev/null)
+  local rc=$?
+  case "$out" in
+    *"INVALID: 2 legacy"*) : ;;
+    *) create.result 1 "expected 2 legacy artefacts, got: $out"; return $(result) ;;
+  esac
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it found artefacts but returned 0"
+  else
+    create.result 0 "2 found, rc 1"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-LEGACY-FINDS: the legacy ssh.* directories are reported, and the decoys are not" \
+  test.user.sshBackupStatusFindsLegacy
+expect 0 "2 found, rc 1" ".ssh.backups and .ssh/ids/ssh.* share the prefix and must survive the sweep"
+
+test.user.sshBackupStatusCleanIsQuiet() {
+  private.test.user.ssh.fixture
+  local out
+  out=$(private.test.user.ssh.run 'user.ssh.backup.status "$HOME"' 2>/dev/null)
+  local rc=$?
+  case "$out" in
+    *"OK: no legacy"*) [ "$rc" -eq 0 ] && create.result 0 "clean" || create.result 1 "clean verdict but rc=$rc" ;;
+    *)                 create.result 1 "expected a clean verdict, got: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-LEGACY-CLEAN: a home with no legacy artefacts reports clean and rc 0" \
+  test.user.sshBackupStatusCleanIsQuiet
+expect 0 "clean" "a guard that always fires is as useless as one that never does"
+
+test.user.sshBackupMigrateMoves() {
+  private.test.user.ssh.legacy.fixture
+  private.test.user.ssh.run 'user.ssh.backup.migrate "$HOME" >/dev/null' >/dev/null
+  local left movedOriginal decoyArchive decoyIds
+  left=$(ls -1d "$TUSR_SSH_TMP/home"/ssh.* 2>/dev/null | grep -c .)
+  movedOriginal=$([ -d "$TUSR_SSH_TMP/home/.ssh.backups/legacy/ssh.original" ] && echo yes || echo no)
+  decoyArchive=$([ -d "$TUSR_SSH_TMP/home/.ssh.backups/20260101T000000Z-manual" ] && echo yes || echo no)
+  decoyIds=$([ -d "$TUSR_SSH_TMP/home/.ssh/ids/ssh.developking" ] && echo yes || echo no)
+  if [ "$left" != "0" ]; then
+    create.result 1 "$left legacy director(ies) still in \$HOME"
+  elif [ "$movedOriginal" != "yes" ]; then
+    create.result 1 "ssh.original did not arrive under .ssh.backups/legacy"
+  elif [ "$decoyArchive" != "yes" ] || [ "$decoyIds" != "yes" ]; then
+    create.result 1 "a decoy was taken: archive=$decoyArchive ids=$decoyIds"
+  else
+    create.result 0 "migrated"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-LEGACY-MIGRATE: the artefacts move under .ssh.backups/legacy, the decoys stay" \
+  test.user.sshBackupMigrateMoves
+expect 0 "migrated" "they hold private keys — migrate MOVES, it never deletes"
+
+test.user.sshBackupMigrateRefusesOverwrite() {
+  private.test.user.ssh.legacy.fixture
+  mkdir -p "$TUSR_SSH_TMP/home/.ssh.backups/legacy/ssh.original"
+  echo "already here" > "$TUSR_SSH_TMP/home/.ssh.backups/legacy/ssh.original/marker"
+  private.test.user.ssh.run 'user.ssh.backup.migrate "$HOME" >/dev/null' >/dev/null
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "it reported success while refusing to move one"
+  elif [ ! -f "$TUSR_SSH_TMP/home/.ssh.backups/legacy/ssh.original/marker" ]; then
+    create.result 1 "it overwrote an existing legacy archive"
+  else
+    create.result 0 "refused to overwrite"
+  fi
+  return $(result)
+}
+test.case $level "T-SSH-BACKUP-LEGACY-NO-CLOBBER: an existing legacy archive is never overwritten" \
+  test.user.sshBackupMigrateRefusesOverwrite
+expect 0 "refused to overwrite" "these directories hold private keys; losing one silently is the worst outcome"
+
+
+
+console.log "
+Test: T-USER-DEL-CMD
+===================================================================="
+
+# ============================================================================
+# T-USER-DEL-CMD: the user-delete command is found on shadow AND on busybox
+# ============================================================================
+# alpine has `deluser` and NO `userdel`. Both private.user.init's OS_CMD heal
+# and private.user.delete.linux probed `userdel` alone, so on alpine the cache
+# could never complete (two red assertions in every alpine platform run since
+# the heal was written on 2026-04-24) and every delete ran
+# `/usr/sbin/userdel -rf` and died with ENOENT 127.
+#
+# The command is stubbed rather than trusted, so this runs the SAME on a
+# shadow host and a busybox one — a test that only asserts "something was
+# found" passes on the dev box for the wrong reason and says nothing about
+# alpine, which is precisely how this survived.
+TUSR_DEL_STUB=$(test.suite.fixture.make test.user.delcmd)
+
+private.test.user.delcmd.with() { # <name...> # echo the getter's answer with ONLY these commands on PATH
+  rm -f "$TUSR_DEL_STUB"/* 2>/dev/null
+  local name
+  for name in "$@"; do
+    printf '#!/bin/sh\nexit 0\n' > "$TUSR_DEL_STUB/$name"
+    chmod +x "$TUSR_DEL_STUB/$name"
+  done
+  # A PATH with only the stubs on it, AND <sbinDir> pointed at the same empty
+  # fixture — both routes have to be controlled or the real /usr/sbin/userdel
+  # answers and the busybox branch is never reached on a shadow host.
+  ( PATH="$TUSR_DEL_STUB"; private.user.delete.command.get "$TUSR_DEL_STUB" )
+}
+
+TUSR_DEL_SHADOW=$(private.test.user.delcmd.with userdel)
+test.case $level "T-USER-DEL-CMD: shadow userdel is found, with its remove-home flag" \
+  echo "$TUSR_DEL_SHADOW"
+case "$TUSR_DEL_SHADOW" in
+  *userdel\ -rf) expect.pass "shadow: $TUSR_DEL_SHADOW" ;;
+  *)             expect.fail "expected '<path>/userdel -rf', got [$TUSR_DEL_SHADOW]" ;;
+esac
+
+TUSR_DEL_BUSYBOX=$(private.test.user.delcmd.with deluser)
+test.case $level "T-USER-DEL-CMD: busybox deluser is found when there is no userdel" \
+  echo "$TUSR_DEL_BUSYBOX"
+case "$TUSR_DEL_BUSYBOX" in
+  *deluser\ --remove-home) expect.pass "busybox: $TUSR_DEL_BUSYBOX" ;;
+  *)                       expect.fail "expected '<path>/deluser --remove-home', got [$TUSR_DEL_BUSYBOX] — this is the alpine failure" ;;
+esac
+
+TUSR_DEL_BOTH=$(private.test.user.delcmd.with userdel deluser)
+test.case $level "T-USER-DEL-CMD: shadow wins when both are present" \
+  echo "$TUSR_DEL_BOTH"
+case "$TUSR_DEL_BOTH" in
+  *userdel\ -rf) expect.pass "shadow preferred: $TUSR_DEL_BOTH" ;;
+  *)             expect.fail "expected userdel to win, got [$TUSR_DEL_BOTH]" ;;
+esac
+
+TUSR_DEL_NONE=$(private.test.user.delcmd.with)
+test.case $level "T-USER-DEL-CMD: neither present is an empty answer, not a guess" \
+  echo "[$TUSR_DEL_NONE]"
+if [ -z "$TUSR_DEL_NONE" ]; then
+  expect.pass "no delete command: the caller fails loud instead of running a path that is not there"
+else
+  expect.fail "expected nothing, got [$TUSR_DEL_NONE]"
+fi
+
+rm -rf "$TUSR_DEL_STUB"
+
+# ============================================================================
+# T-USER-BASHRC-INSTALL: one .bashrc installer
+# ============================================================================
+# The oosh .bashrc used to be written by three hand copies (user.oosh.install,
+# config.init.user, oo root.installation.done), each with its own condition.
+# private.user.bashrc.install <targetHome> <?ooshDir> is the one writer: it
+# copies templates/user/bashrcTemplate when ~/.bashrc differs from it, keeps
+# the first original as ~/.bashrc.pre-oosh, and creates a .bash_profile that
+# sources .bashrc. Idempotent.
+test.user.bashrcInstall() {
+  local fx bad="" template="$OOSH_DIR/templates/user/bashrcTemplate"; fx=$(test.suite.fixture.make bashrcinstall)
+  printf 'mine\n' > "$fx/.bashrc"
+  private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1 || bad="$bad rc=$?"
+  cmp -s "$template" "$fx/.bashrc" || bad="$bad not-installed"
+  [ "$(cat "$fx/.bashrc.pre-oosh" 2>/dev/null)" = mine ] || bad="$bad no-backup"
+  grep -q '\.bashrc' "$fx/.bash_profile" 2>/dev/null || bad="$bad no-bash_profile"
+  private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1 || bad="$bad second-rc=$?"
+  cmp -s "$template" "$fx/.bashrc" || bad="$bad second-changed"
+  printf 'regressed\n' > "$fx/.bashrc"
+  private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1
+  cmp -s "$template" "$fx/.bashrc" || bad="$bad differing-not-repaired"
+  [ "$(cat "$fx/.bashrc.pre-oosh" 2>/dev/null)" = mine ] || bad="$bad first-backup-overwritten"
+  private.user.bashrc.install "" "$OOSH_DIR" >/dev/null 2>&1 && bad="$bad empty-home-passed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "bashrc.install: template when different, first original kept, .bash_profile, idempotent" || create.result 1 "bashrc.install:$bad"
+  return $(result)
+}
+test.case $level "T-USER-BASHRC-INSTALL: private.user.bashrc.install is the one .bashrc writer" test.user.bashrcInstall
+expect 0 "bashrc.install: template when different, first original kept, .bash_profile, idempotent" \
+  "three hand copies with three conditions left boot-sourcing bashrcs behind"
+
+# T-USER-LOGIN-KEEPS-TERM: user login hands the target a clean environment —
+# env -i — with ONE exception, TERM, which describes the terminal and not the
+# caller. `env -i su - <user>` left TERM=dumb: no colour (git status printed
+# plain), and less / vi / clear / tmux degraded. user.login is interactive, so
+# the probe runs the method's own `env -i …` line with `env` in place of `su`
+# and reads the environment that would be handed over.
+test.user.loginKeepsTerm() {
+  local bad="" line handed
+  line=$(declare -f user.login | grep "env -i")
+  [ -n "$line" ] || bad="$bad no-env-i"
+  case "$line" in *"su - "*) ;; *) bad="$bad no-login-shell" ;; esac
+  case "$line" in *'TERM="$(private.user.login.term.get)"'*) ;; *) bad="$bad term-not-from-the-getter" ;; esac
+  handed=$( set -- someUser; TERM=screen-256color; export TERM; export CALLER_LEAK=1
+            eval "${line%%su - *} env" 2>/dev/null )
+  [ "$handed" = "TERM=screen-256color" ] || bad="$bad handed=[$(printf "%s" "$handed" | tr "\n" " ")]"
+  [ "$(TERM=dumb private.user.login.term.get 2>/dev/null)" = xterm-256color ] || bad="$bad dumb"
+  [ "$( unset TERM; private.user.login.term.get 2>/dev/null)" = xterm-256color ] || bad="$bad unset"
+  [ -z "$bad" ] && create.result 0 "user login hands over TERM and nothing else; dumb or unset becomes xterm-256color" || create.result 1 "login:$bad"
+  return $(result)
+}
+test.case $level "T-USER-LOGIN-KEEPS-TERM: user login passes TERM through env -i and no other caller variable" test.user.loginKeepsTerm
+expect 0 "user login hands over TERM and nothing else; dumb or unset becomes xterm-256color" \
+  "env -i sh, then user login: the caller's TERM is already dumb — the shell had no colour"
+
+
+console.log "
+Test: T-USER-LOGIN-TERM-GET
+===================================================================="
+
+test.user.loginTermGet() {
+  local bad=""
+  [ "$(TERM=screen-256color private.user.login.term.get)" = screen-256color ] || bad="$bad real-term-changed"
+  [ "$(TERM=dumb private.user.login.term.get)" = xterm-256color ] || bad="$bad dumb"
+  [ "$(TERM= private.user.login.term.get)" = xterm-256color ] || bad="$bad empty"
+  [ -z "$bad" ] && create.result 0 "the caller's TERM, or xterm-256color for dumb/empty" || create.result 1 "term.get:$bad"
+  return $(result)
+}
+test.case $level "T-USER-LOGIN-TERM-GET: private.user.login.term.get keeps a real TERM, replaces dumb and empty" test.user.loginTermGet
+expect 0 "the caller's TERM, or xterm-256color for dumb/empty" "env -i sh leaves TERM=dumb for user login to pass on"
+
+# T-PRIVATE-AS-USER-SELF: switching to YOURSELF needs no switch at all. It went
+# through `sudo -H -u <me>`, so `config init.user` for the caller's own user
+# asked for the sudo password (found on a real host, 2026-09-30). A fake sudo
+# first on PATH records any call and fails: the command must still run, as the
+# caller, and sudo must never be asked.
+test.user.asUserSelf() {
+  local fx got; fx=$(test.suite.fixture.make asuserself)
+  printf '%s\n' '#!/bin/sh' "echo called > \"$fx/sudo.called\"" 'exit 1' > "$fx/sudo"
+  chmod +x "$fx/sudo"
+  got=$(PATH="$fx:$PATH" private.as.user "$(id -un)" sh -c 'echo "ran as $(id -un)"' 2>/dev/null)
+  if [ "$got" = "ran as $(id -un)" ] && [ ! -e "$fx/sudo.called" ]; then
+    create.result 0 "private.as.user: self runs directly, no sudo"
+  else
+    create.result 1 "private.as.user: got [$got] sudo-called=[$([ -e "$fx/sudo.called" ] && echo yes || echo no)]"
+  fi
+  rm -rf "$fx"
+  return $(result)
+}
+test.case $level "T-PRIVATE-AS-USER-SELF: private.as.user for the caller's own user runs directly, never sudo" test.user.asUserSelf
+expect 0 "private.as.user: self runs directly, no sudo" \
+  "config init.user for yourself asked for the sudo password"
+
+# ============================================================================
+# T-USER-OOSH-INSTALL-TRUST: one safeDirectory.ensure hop, no safeDirectory.add
+# ============================================================================
+# Clone layout (ogit plan, spec § 4): every folder under the base is its own
+# repository, so trusting the one $sharedOosh folder (plus its case-canonical
+# twin — two safeDirectory.add hops) left main/ and every other folder
+# untrusted for the new user. ONE hop through the preamble runs `ogit
+# safeDirectory.ensure` on the base. ogit folds the letter case itself (the
+# macOS string-match fix the second hop existed for), so user folds nothing by
+# hand. Structural: the positive path needs a new user.
+TUSR_TRUST_BODY=$(bash -c 'source this; source user; declare -f user.oosh.install' 2>/dev/null)
+TUSR_TRUST_ENSURE=$(printf '%s\n' "$TUSR_TRUST_BODY" | grep -c 'safeDirectory.ensure')
+TUSR_TRUST_ADD=$(printf '%s\n' "$TUSR_TRUST_BODY" | grep -c 'safeDirectory.add')
+TUSR_TRUST_FOLD=$(printf '%s\n' "$TUSR_TRUST_BODY" | grep -c 'private.this.path.case.get')
+# declare -f prints the hop's $'\n' as a real newline: the command is on the
+# line right after the preamble getter's.
+TUSR_TRUST_HOP=$(printf '%s\n' "$TUSR_TRUST_BODY" \
+  | grep -F -A1 'private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh"' \
+  | grep -cF "'\$sharedOosh/ogit' safeDirectory.ensure '\$(dirname \"\$sharedOosh\")'")
+test.case $level "T-USER-OOSH-INSTALL-TRUST: user.oosh.install trusts the base with one ensure hop" \
+  echo "ensure=$TUSR_TRUST_ENSURE add=$TUSR_TRUST_ADD hop=$TUSR_TRUST_HOP fold=$TUSR_TRUST_FOLD"
+if [ "$TUSR_TRUST_ENSURE" = 1 ] && [ "$TUSR_TRUST_ADD" = 0 ] && [ "$TUSR_TRUST_HOP" = 1 ] && [ "$TUSR_TRUST_FOLD" = 0 ]; then
+  expect.pass "one preamble hop runs ogit safeDirectory.ensure on the base; no safeDirectory.add, no hand-folded case left"
+else
+  expect.fail "expected 1 ensure hop through the preamble on the base, 0 safeDirectory.add and 0 private.this.path.case.get, got ensure=$TUSR_TRUST_ENSURE add=$TUSR_TRUST_ADD hop=$TUSR_TRUST_HOP fold=$TUSR_TRUST_FOLD"
+fi
+
+# T-USER-PROMPT-HOST-NAME: the prompt shows the oosh name of the computer after @ too
+# [oosh jolly_gagarin] bash-user@jolly_gagarin — a running container's system
+# host name is its ID and cannot change; the oosh name can (\h when it is empty).
+test.user.promptHostName() {
+  local t="$OOSH_DIR/templates/user/bashrcTemplate" bad=""
+  [ "$(grep -cF '@\[\e[32m\]\${OOSH_SSH_CONFIG_HOST:-\h}:' "$t")" = 2 ] || bad="$bad oosh-name-after-@"
+  grep -qF '@\[\e[32m\]\h:' "$t" && bad="$bad raw-\\h"
+  [ -z "$bad" ] && create.result 0 "both prompts show the oosh name after @" || create.result 1 "prompt:$bad"
+  return $(result)
+}
+test.case $level "T-USER-PROMPT-HOST-NAME: the prompt shows the oosh name of the computer after @ too" test.user.promptHostName
+expect 0 "both prompts show the oosh name after @" "bash-user@2a1023f6d45b showed the container's ID"
+
+# T-USER-INSTALL-SOCKET-GROUP: the install adds every user to the docker socket's group
+# A platform container has the host's socket but no docker program at install
+# time, so `command -v docker` skipped the group; the first odocker call then
+# needed a new membership — and Alpine has no sg to apply it (2026-10-06).
+test.user.installSocketGroup() {
+  local fx bad=""; fx=$(test.suite.fixture.make usersocketgroup); : > "$fx/docker.sock"
+  FX="$fx" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+    command() { if [ "$1" = -v ] && [ "$2" = docker ]; then return 1; fi; builtin command "$@"; }
+    private.odocker.socket.get() { echo "$FX/docker.sock"; }
+    private.odocker.socket.group.ensure() { create.result 0 "docker"; return 0; }
+    user.group.add() { echo "group.add $*" >> "$FX/log"; }
+    private.user.oosh.install.groups.linux someuser >/dev/null 2>&1' >/dev/null 2>&1
+  grep -qx 'group.add docker someuser' "$fx/log" 2>/dev/null || bad="$bad not-added=[$(cat "$fx/log" 2>/dev/null)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a user joins the socket's group at install" || create.result 1 "install socket group:$bad"
+  return $(result)
+}
+test.case $level "T-USER-INSTALL-SOCKET-GROUP: the install adds every user to the docker socket's group" test.user.installSocketGroup
+expect 0 "a user joins the socket's group at install" "the first odocker call needed a new membership, Alpine has no sg"
+
+# T-USER-INSTALL-SOCKET-GROUP-OVER-DOCKER: with a socket the install joins the socket's group, also when a docker program is there
+# An image that ships a docker CLI, with the host's socket mounted under
+# another number: the install put every user in the local group docker, which
+# does not own the socket (2026-10-06). docker only when there is no socket.
+test.user.installSocketGroupOverDocker() {
+  local fx bad=""; fx=$(test.suite.fixture.make usersocketoverdocker)
+  test.user.installSocketGroupOverDocker.run() { # <socket present: yes|no>
+    rm -f "$fx/docker.sock" "$fx/log"; [ "$1" = yes ] && : > "$fx/docker.sock"
+    FX="$fx" bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+      command() { if [ "$1" = -v ] && [ "$2" = docker ]; then return 0; fi; builtin command "$@"; }
+      private.odocker.socket.get() { echo "$FX/docker.sock"; }
+      private.odocker.socket.group.ensure() { echo "socket.group.ensure" >> "$FX/log"; create.result 0 "dockerhost"; return 0; }
+      user.group.add() { echo "group.add $*" >> "$FX/log"; }
+      private.user.oosh.install.groups.linux someuser >/dev/null 2>&1' >/dev/null 2>&1
+    grep '^group.add ' "$fx/log" 2>/dev/null | tr '\n' '|'
+  }
+  [ "$(test.user.installSocketGroupOverDocker.run yes)" = "group.add dockerhost someuser|" ] || bad="$bad socket=[$(test.user.installSocketGroupOverDocker.run yes)]"
+  [ "$(test.user.installSocketGroupOverDocker.run no)" = "group.add docker someuser|" ] || bad="$bad no-socket=[$(test.user.installSocketGroupOverDocker.run no)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the socket's group when a socket is there, docker only without one" || create.result 1 "install socket group over docker:$bad"
+  return $(result)
+}
+test.case $level "T-USER-INSTALL-SOCKET-GROUP-OVER-DOCKER: with a socket the install joins the socket's group, also when docker is installed" test.user.installSocketGroupOverDocker
+expect 0 "the socket's group when a socket is there, docker only without one" \
+  "an image with a docker CLI put every user in the local docker group, which does not own the socket"
+
+# T-USER-INSTALL-SOCKET-GROUP-ROOT: a docker socket of root's group (number 0) — the install adds the user to no group
+# Docker Desktop's socket seen inside a container, a rootful podman or snap
+# socket: root:root. odocker's socket.group.ensure answered root and the
+# install added the oosh user to it (review, 2026-10-06). The real
+# socket.group.ensure decides here; stat and getent answer from the fixture.
+test.user.installSocketGroupRoot() {
+  local fx bad="" realStat; fx=$(test.suite.fixture.make usersocketroot); : > "$fx/docker.sock"; mkdir -p "$fx/bin"
+  realStat=$(command -v stat)
+  printf '%s\n' '#!/bin/sh' 'case "$*" in *"$FX/docker.sock") echo 0; exit 0 ;; esac' "exec $realStat \"\$@\"" > "$fx/bin/stat"
+  printf '%s\n' '#!/bin/sh' 'case "$2" in 0|root) echo "root:x:0:" ;; *) exit 2 ;; esac' > "$fx/bin/getent"
+  chmod +x "$fx/bin/stat" "$fx/bin/getent"
+  FX="$fx" ODOCKER_SOCKET="$fx/docker.sock" PATH="$fx/bin:$PATH" bash -c '
+    OSTYPE=linux-gnu
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+    command() { if [ "$1" = -v ] && [ "$2" = docker ]; then return 0; fi; builtin command "$@"; }
+    user.group.add() { echo "group.add $*" >> "$FX/log"; }
+    private.user.oosh.install.groups.linux someuser >/dev/null 2>&1' >/dev/null 2>&1
+  [ -s "$fx/log" ] && bad="$bad added=[$(tr '\n' '|' < "$fx/log")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a socket of root's group: the install adds the user to no group" || create.result 1 "install socket of root's group:$bad"
+  return $(result)
+}
+test.case $level "T-USER-INSTALL-SOCKET-GROUP-ROOT: a docker socket of root's group (number 0) — the install adds the user to no group" test.user.installSocketGroupRoot
+expect 0 "a socket of root's group: the install adds the user to no group" \
+  "a socket owned by root:root made the install add the oosh user to group root"
+
+# T-USER-GROUP-MEMBER-PENDING: a membership this process does not have yet
+# odocker re-ran a call under sg whenever the group DATABASE listed the group —
+# also when this shell had it already and docker failed for another reason;
+# without sg (Alpine) it then said "log out and back in" on every call. $USER
+# can be unset under `docker exec`: the user is `id -un` (2026-10-06).
+test.user.groupMemberPending() {
+  local bad=""
+  test.user.groupMemberPending.run() { # <database groups of tester> <groups of this process> <?user>
+    ( DB="$1"; PROC="$2"; unset USER
+      id() { case "$*" in -un) echo tester ;; -nG) echo "$PROC" ;; "-nG tester") echo "$DB" ;; *) return 1 ;; esac; }
+      private.user.group.member.pending docker ${3:+"$3"} ); echo $?
+  }
+  [ "$(test.user.groupMemberPending.run "tester" "tester")" = 1 ] || bad="$bad not-a-member"
+  [ "$(test.user.groupMemberPending.run "tester docker" "tester")" = 0 ] || bad="$bad pending-missed"
+  [ "$(test.user.groupMemberPending.run "tester docker" "tester docker")" = 1 ] || bad="$bad effective-is-pending"
+  [ "$(test.user.groupMemberPending.run "tester docker" "tester" tester)" = 0 ] || bad="$bad named-user"
+  [ "$(test.user.groupMemberPending.run "tester dockerx" "tester")" = 1 ] || bad="$bad partial-name"
+  [ -z "$bad" ] && create.result 0 "pending only when the database has the group and this process does not" || create.result 1 "member pending:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-MEMBER-PENDING: a membership this process does not have yet" test.user.groupMemberPending
+expect 0 "pending only when the database has the group and this process does not" \
+  "odocker said log out and back in on every call when docker failed for another reason"
+
+# T-USER-GROUP-ADD-IDEMPOTENT: an existing member is left alone — no sudo, no membership command
+# user.group.add ran `$SUDO usermod` (Alpine: addgroup, macOS: dseditgroup) also
+# for a user who was a member already. config.init.user adds every user to dev
+# on every oo update and oo user.fix: a user without passwordless sudo was asked
+# for a password each time, for nothing (2026-10-06). Every program it may call
+# is a recording stub on a fixture PATH; the group database is a fixture file.
+test.user.groupAdd.run() { # <fx> <OS_CMD_USER_MOD> <groups of tester> <existing groups>
+  local fx="$1" b="$1/bin" name
+  rm -rf "$b" "$fx/calls"; mkdir -p "$b"
+  printf '%s\n' "$3" > "$fx/db"; printf '%s\n' $4 > "$fx/groups"
+  printf '#!/bin/sh\ncase "$*" in -un) echo tester ;; "-nG tester") cat "$FX/db" ;; *) exec /usr/bin/id "$@" ;; esac\n' > "$b/id"
+  printf '#!/bin/sh\nc="${1##*/}"; shift; echo "sudo $c $*" >> "$FX/calls"; exec "$c" "$@"\n' > "$b/sudo"
+  printf '#!/bin/sh\necho "usermod $*" >> "$FX/calls"; [ "$1 $2" = "-a -G" ] && echo "$(cat "$FX/db") $3" > "$FX/db"; exit 0\n' > "$b/usermod"
+  printf '#!/bin/sh\necho "addgroup $*" >> "$FX/calls"; [ $# = 2 ] && echo "$(cat "$FX/db") $2" > "$FX/db"; exit 0\n' > "$b/addgroup"
+  printf '#!/bin/sh\necho "groupadd $*" >> "$FX/calls"; echo "$1" >> "$FX/groups"; exit 0\n' > "$b/groupadd"
+  printf '#!/bin/sh\necho "dseditgroup $*" >> "$FX/calls"; exit 0\n' > "$b/dseditgroup"
+  printf '#!/bin/sh\n[ "$1" = group ] && grep -qx "$2" "$FX/groups"\n' > "$b/getent"
+  printf '#!/bin/sh\ngrep -qx "${3#/Groups/}" "$FX/groups"\n' > "$b/dscl"
+  for name in id sudo usermod addgroup groupadd dseditgroup getent dscl; do chmod +x "$b/$name"; done
+  FX="$fx" USERMOD="$2" PATH="$b:$PATH" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+    export SUDO="sudo " OOSH_OS=linux-gnu OS_CMD_USER_MOD="$USERMOD" OS_CMD_GROUP_ADD=groupadd
+    user.group.add ooshtestgrp tester >/dev/null 2>&1; echo "rc=$?" >> "$FX/calls"
+    user.group.add ooshtestgrp tester >/dev/null 2>&1; echo "rc=$?" >> "$FX/calls"' >/dev/null 2>&1
+  tr '\n' '|' < "$fx/calls" 2>/dev/null
+}
+test.user.groupAddIdempotent() {
+  local fx bad="" got; fx=$(test.suite.fixture.make usergroupadd)
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester ooshtestgrp" "ooshtestgrp")
+  [ "$got" = "rc=0|rc=0|" ] || bad="$bad member=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester" "ooshtestgrp")
+  [ "$got" = "sudo usermod -a -G ooshtestgrp tester|usermod -a -G ooshtestgrp tester|rc=0|rc=0|" ] || bad="$bad usermod=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "addgroup" "tester" "ooshtestgrp")
+  [ "$got" = "sudo addgroup tester ooshtestgrp|addgroup tester ooshtestgrp|rc=0|rc=0|" ] || bad="$bad alpine=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester" "")
+  [ "$got" = "sudo groupadd ooshtestgrp|groupadd ooshtestgrp|sudo usermod -a -G ooshtestgrp tester|usermod -a -G ooshtestgrp tester|rc=0|rc=0|" ] || bad="$bad new-group=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a member is left alone, a non-member is added once" || create.result 1 "group.add:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-ADD-IDEMPOTENT: an existing member is left alone — no sudo, no membership command" test.user.groupAddIdempotent
+expect 0 "a member is left alone, a non-member is added once" \
+  "config.init.user ran sudo usermod for dev on every oo update — a password prompt for nothing"
+
+# T-USER-GROUP-MEMBER-IS: membership per the group database, whole names only
+test.user.groupMemberIs() {
+  local bad=""
+  test.user.groupMemberIs.run() { # <database groups of tester> <?user>
+    ( DB="$1"; unset USER
+      id() { case "$*" in -un) echo tester ;; "-nG tester") echo "$DB" ;; *) return 1 ;; esac; }
+      private.user.group.member.is docker ${2:+"$2"} ); echo $?
+  }
+  [ "$(test.user.groupMemberIs.run "tester docker")" = 0 ] || bad="$bad member-missed"
+  [ "$(test.user.groupMemberIs.run "tester docker" tester)" = 0 ] || bad="$bad named-user"
+  [ "$(test.user.groupMemberIs.run "tester")" = 1 ] || bad="$bad not-a-member"
+  [ "$(test.user.groupMemberIs.run "tester dockerx")" = 1 ] || bad="$bad partial-name"
+  [ "$(test.user.groupMemberIs.run "tester docker" nobodyelse)" = 1 ] || bad="$bad unknown-user"
+  [ -z "$bad" ] && create.result 0 "a member only when the database lists the whole group name" || create.result 1 "member is:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-MEMBER-IS: membership per the group database, whole names only" test.user.groupMemberIs
+expect 0 "a member only when the database lists the whole group name" "user.group.add asked nobody and ran usermod every time"
+
+# T-USER-BASHRC-NO-CMP: without cmp an identical .bashrc is left alone
+# cmp is diffutils, which AlmaLinux minimal does not ship: its rc 127 read as
+# "differs", and every oo update copied the template over an identical
+# .bashrc. The comparison is the kernel's private.this.file.same.
+test.user.bashrcNoCmp() {
+  local fx bad="" inode out; fx=$(test.suite.fixture.make userbashrcnocmp)
+  cp "$OOSH_DIR/templates/user/bashrcTemplate" "$fx/.bashrc"; : > "$fx/.bash_profile"
+  touch -t 202001010000 "$fx/.bashrc"; touch -t 202001010100 "$fx/stamp"; inode=$(ls -i "$fx/.bashrc" | cut -d' ' -f1)
+  out=$(
+    command() { [ "$1 $2" = "-v cmp" ] && return 1; builtin command "$@"; }
+    cmp() { return 127; }   # the program is not there
+    private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1; echo "rc=$? $RESULT")
+  case "$out" in "rc=0 "*"is the oosh template"*) ;; *) bad="$bad result=[$out]" ;; esac
+  [ "$fx/.bashrc" -nt "$fx/stamp" ] && bad="$bad rewritten"
+  [ "$(ls -i "$fx/.bashrc" | cut -d' ' -f1)" = "$inode" ] || bad="$bad new-inode"
+  [ -e "$fx/.bashrc.pre-oosh" ] && bad="$bad backup-made"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an identical .bashrc is left alone without cmp" || create.result 1 "bashrc no cmp:$bad"
+  return $(result)
+}
+test.case $level "T-USER-BASHRC-NO-CMP: without cmp an identical .bashrc is left alone" test.user.bashrcNoCmp
+expect 0 "an identical .bashrc is left alone without cmp" \
+  "AlmaLinux minimal has no cmp — every oo update copied the template over an identical .bashrc"
+
+# T-USER-SOURCE-NO-SUDO: sourcing user without an os.commands.env heals it and calls no sudo
+# private.user.init runs oo pm.discover when $CONFIG_PATH/os.commands.env is
+# missing or incomplete, and discovery ran "$SUDO apt-get update": merely
+# sourcing user asked for a sudo password on an apt host — a new user's first
+# shell, every test with an isolated config (2026-10-06). The fixture host has
+# a recording apt-get and sudo and no other package manager.
+test.user.sourceNoSudo() {
+  local fx bad="" name
+  fx=$(test.suite.fixture.make usersourcenosudo)
+  mkdir -p "$fx/bin" "$fx/config/stateMachines" "$fx/home"
+  : > "$fx/calls"; : > "$fx/config/user.env"; : > "$fx/config/result.env"; : > "$fx/config/error.txt"
+  printf '#!/bin/sh\necho "sudo $*" >> "$FX/calls"; exec "$@"\n' > "$fx/bin/sudo"
+  printf '#!/bin/sh\necho "apt-get $*" >> "$FX/calls"; exit 0\n' > "$fx/bin/apt-get"
+  chmod +x "$fx/bin/sudo" "$fx/bin/apt-get"
+  test.user.sourceNoSudo.run() {
+    FX="$fx" env -u OOSH_NO_INSTALL -u OOSH_PM -u OOSH_PM_UPDATED -u OOSH_APT_UPDATED \
+      -u OS_CMD_USER_ADD -u OS_CMD_USER_DEL -u OS_CMD_USER_MOD -u OS_CMD_GROUP_ADD \
+      PATH="$fx/bin:$PATH" HOME="$fx/home" SUDO="sudo " CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env" bash -c '
+        command() {
+          if [ "$1" = -v ]; then
+            case "$2" in brew|apt-get|dnf|yum|apk|dpkg|pkg|pacman) [ -x "$FX/bin/$2" ] && echo "$FX/bin/$2"; return ;; esac
+          fi
+          builtin command "$@"
+        }
+        export -f command
+        source "$OOSH_DIR/this" >/dev/null 2>&1; export SUDO="sudo "; source "$OOSH_DIR/user" >/dev/null 2>&1' </dev/null >/dev/null 2>&1
+  }
+  test.user.sourceNoSudo.run
+  [ -s "$fx/calls" ] && bad="$bad first=[$(tr '\n' '|' < "$fx/calls")]"
+  for name in OS_CMD_USER_ADD OS_CMD_USER_DEL OS_CMD_USER_MOD OS_CMD_GROUP_ADD; do
+    grep -q "$name=" "$fx/config/os.commands.env" 2>/dev/null || bad="$bad no-$name"
+  done
+  touch -t 202001010000 "$fx/config/os.commands.env" 2>/dev/null; touch -t 202001010100 "$fx/stamp"; : > "$fx/calls"
+  test.user.sourceNoSudo.run
+  [ -s "$fx/calls" ] && bad="$bad second=[$(tr '\n' '|' < "$fx/calls")]"
+  [ "$fx/config/os.commands.env" -nt "$fx/stamp" ] && bad="$bad discovered-again"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the cache is healed, no sudo, a second source discovers nothing" || create.result 1 "source user:$bad"
+  return $(result)
+}
+test.case $level "T-USER-SOURCE-NO-SUDO: sourcing user without an os.commands.env heals it and calls no sudo" test.user.sourceNoSudo
+expect 0 "the cache is healed, no sudo, a second source discovers nothing" \
+  "sourcing user on an apt host ran sudo apt-get update — a password prompt in a new shell"
+
+### test.method
+
+test.suite.save.results

@@ -2,6 +2,7 @@
 #clear
 #export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
 #set -x
+TEST_CATEGORY=core
 
 level=$1
 if [ -z "$level" ]; then
@@ -32,10 +33,279 @@ console.log "RETURN: $RETURN_VALUE  Result: $RESULT
 }
 
 test.case - "line test start" \
-   line $*
+   line usage
 expect 0 "*" "Test start"
 
 source line
 
+# ============================================================================
+# Regression: [args...] must be stripped from paramList (commit 58048e1)
+# Without the fix, this generates: declare: '[args...]=addDefaultValue': not a valid identifier
+# ============================================================================
+test.case $level "completion: [args...] stripped from paramList" \
+  echo "branch command [args...]" '|' line.parse.paramList.new
+
+# Feed a parameter list containing [args...] through the parser
+PARSE_OUTPUT=$(echo "branch command [args...]" | line.parse.paramList.new 2>&1)
+PARSE_RC=$?
+
+# Check no "not a valid identifier" error
+if echo "$PARSE_OUTPUT" | grep -q 'not a valid identifier'; then
+  expect.fail "paramList parser should not produce 'not a valid identifier' for [args...]"
+else
+  expect.pass "no invalid identifier error from [args...]"
+fi
+
+# Check that [args...] does not appear as a PARAM_ variable in the output
+if echo "$PARSE_OUTPUT" | grep -q 'PARAM_\['; then
+  expect.fail "paramList should strip [args...], not create PARAM_[args...]"
+else
+  expect.pass "[args...] stripped from paramList output"
+fi
+
+# Check that valid params (branch, command) are still parsed
+PARAM_COUNT=$(echo "$PARSE_OUTPUT" | grep -c 'PARAM_' || true)
+if [ "$PARAM_COUNT" -ge 1 ]; then
+  expect.pass "valid PARAM_ variables generated ($PARAM_COUNT found)"
+else
+  expect.fail "should generate at least 1 PARAM_ variable"
+fi
+
+# ============================================================================
+# T-FORMAT-1: line.format produces correct output with 3-arg format
+# ============================================================================
+test.case $level "line.format produces correct output with 3-arg format" \
+  echo "checking"
+
+FORMAT_TEST="[%s|%s|%s]"
+RESULT=$(printf "'a'\n'b'\n'c'\n" | line.format FORMAT_TEST 2>&1)
+if [ "$RESULT" = "[a|b|c]" ]; then
+  create.result 0 "correct"
+else
+  create.result 1 "got: $RESULT"
+fi
+expect 0 "correct" "line.format with 3-arg format produces [a|b|c]"
+unset FORMAT_TEST
+
+
+
+# ============================================================================
+# T-LINE-REMOVE-EXACT: whole-line, not substring
+# ============================================================================
+# The bug it exists for: line.remove and line.filter are `grep -v "$1"`, a
+# SUBSTRING match, so removing "/usr" also removed "/usr/bin".
+test.line.removeExactKeepsSubstrings() {
+  local out expected
+  out=$(printf '%s\n' /usr /usr/bin /usr/local/bin /home/x | line.remove.exact "/usr")
+  expected=$(printf '%s\n' /usr/bin /usr/local/bin /home/x)
+  if [ "$out" = "$expected" ]; then
+    create.result 0 "kept"
+  else
+    create.result 1 "got: $(printf '%s' "$out" | tr '\n' ' ')"
+  fi
+}
+test.case $level "line.remove.exact removes only the exact line, leaving substring matches alone" \
+  test.line.removeExactKeepsSubstrings
+expect 0 "kept" "line.remove.exact is whole-line; line.remove would have deleted /usr/bin too"
+
+# An empty argument must be a pass-through, not "remove every empty line".
+test.line.removeExactEmptyArgument() {
+  local out
+  out=$(printf '%s\n' a b | line.remove.exact "")
+  if [ "$out" = "$(printf '%s\n' a b)" ]; then
+    create.result 0 "passthrough"
+  else
+    create.result 1 "got: $(printf '%s' "$out" | tr '\n' ' ')"
+  fi
+}
+test.case $level "line.remove.exact with no argument passes every line through" \
+  test.line.removeExactEmptyArgument
+expect 0 "passthrough" "an empty <text> must not be read as 'the empty line'"
+
+# ============================================================================
+# The line formats: three plain ones are data in lineFormat.env, the two
+# colour ones (FORMAT_ENV, FORMAT_HELP) hold escape codes and live in memory
+# ============================================================================
+# The env writer refuses a value with a control character, so saving all five
+# printed two "is not saved" ERROR lines on every first init (a fresh install,
+# every isolated config, every c2 signature.validate), and a shell that found
+# the file sourced it and had NO colour formats: line.format FORMAT_ENV printed
+# nothing. Each case starts fresh shells (env -i) on a fixture HOME whose
+# config has no lineFormat.env yet; the log device is a file in the fixture.
+test.line.startFixture() { # <label> # echo a fixture HOME: oosh -> this tree, config/user.env with an empty chain, no lineFormat.env
+  local fx; fx=$(test.suite.fixture.make "$1") || return 1
+  ln -s "$(private.this.path.canonical "$OOSH_DIR")" "$fx/oosh"
+  mkdir -p "$fx/config" "$fx/.config/oosh"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' 'export CONFIG_FILE="user.env"' \
+    'export CONFIG="$HOME/config/user.env"' 'export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"' \
+    'export BASH_FILE="/usr/bin/bash"' '. $CONFIG_PATH/oosh.env' '. $CONFIG_PATH/log.env' > "$fx/config/user.env"
+  : > "$fx/config/oosh.env"
+  printf '%s\n' 'export LOG_LEVEL="1"' '. $HOME/.config/oosh/log.session.env' > "$fx/config/log.env"
+  : > "$fx/.config/oosh/log.session.env"
+  echo "$fx"
+}
+
+test.line.freshShell() { # <fixture> <logFile> <commands> # run commands in a new shell on the fixture HOME after sourcing line; its log lines go to logFile
+  local fx="$1" logFile="$2"
+  : > "$logFile"
+  env -i HOME="$fx" USER="$USER" PATH=/usr/bin:/bin LOG_DEVICE="$logFile" bash -c \
+    'source "$HOME/oosh/this" >/dev/null 2>&1; source "$HOME/oosh/line" >/dev/null 2>&1; '"$3" 2>/dev/null
+}
+
+# The bytes line.format FORMAT_ENV printed for "a b" before the colour formats
+# moved into memory (captured with the old code on the colour set line.init
+# writes): red key padded to 20, yellow "=", green value, colour reset.
+test.line.formatEnvExpected() {
+  printf '\033[31m%-20s \033[33m= \033[32m%s\033[0m\n' a b | od -c
+}
+
+# T-LINE-FORMAT-INIT-NO-ERROR: the first init on a config without lineFormat.env is silent
+test.line.formatInitNoError() {
+  local fx bad="" rc; fx=$(test.line.startFixture lineformatinit)
+  test.line.freshShell "$fx" "$fx/log.first" 'exit 0'; rc=$?
+  [ "$rc" -eq 0 ] || bad="$bad rc=$rc"
+  grep -q 'is not saved' "$fx/log.first" && bad="$bad $(grep -c 'is not saved' "$fx/log.first")-not-saved-lines"
+  grep -q '^ERROR>' "$fx/log.first" && bad="$bad error:[$(grep -m1 '^ERROR>' "$fx/log.first")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the first init writes lineFormat.env without an error line" || create.result 1 "first init:$bad"
+  return $(result)
+}
+test.case $level "T-LINE-FORMAT-INIT-NO-ERROR: initialising line on a config without lineFormat.env logs no error" \
+  test.line.formatInitNoError
+expect 0 "the first init writes lineFormat.env without an error line" \
+  "FORMAT_ENV and FORMAT_HELP hold escape codes — the writer refuses them, so line must not hand them to config save"
+
+# T-LINE-FORMAT-FILE-PLAIN: lineFormat.env holds exactly the three plain formats, pure data, written once
+test.line.formatFilePlain() {
+  local fx bad="" f inode out want; fx=$(test.line.startFixture lineformatfile); f="$fx/config/lineFormat.env"
+  test.line.freshShell "$fx" "$fx/log.first" 'exit 0'
+  want=$(printf '%s\n' \
+    'export FORMAT_DECLARE_LOCAL="declare -- PARAM_%s='"'"'%s'"'"'\\n"' \
+    'export FORMAT_PARSE_HELP="%s|%s|%s\\n"' \
+    'export FORMAT_PARSE_METHOD="declare -- METHOD='"'"'%s'"'"'|declare -- METHOD_PARAMETER='"'"'%s'"'"'|declare -- METHOD_DESCRIPTION='"'"'%s'"'"'\\n"')
+  [ "$(cat "$f" 2>/dev/null)" = "$want" ] || bad="$bad content=[$(tr '\n' '~' < "$f" 2>/dev/null)]"
+  config validate "$f" >/dev/null 2>&1 || bad="$bad not-pure-data"
+  # A second shell must leave the file alone: same bytes, same inode, same mtime.
+  touch -t 202001010000 "$f" "$fx/ref"; inode=$(ls -i "$f" | tr -s ' ' '\n' | grep -m1 .)
+  test.line.freshShell "$fx" "$fx/log.second" 'line.init'
+  [ "$(cat "$f" 2>/dev/null)" = "$want" ] || bad="$bad second-content"
+  [ -n "$inode" ] && [ "$(ls -i "$f" | tr -s ' ' '\n' | grep -m1 .)" = "$inode" ] || bad="$bad new-inode"
+  { [ "$f" -nt "$fx/ref" ] || [ "$fx/ref" -nt "$f" ]; } && bad="$bad rewritten"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "lineFormat.env holds the three plain formats, pure data, untouched by a second init" || create.result 1 "lineFormat.env:$bad"
+  return $(result)
+}
+test.case $level "T-LINE-FORMAT-FILE-PLAIN: lineFormat.env holds exactly the plain formats and a second init changes nothing" \
+  test.line.formatFilePlain
+expect 0 "lineFormat.env holds the three plain formats, pure data, untouched by a second init" \
+  "an env file is pure data; the colour formats are derived, never saved"
+
+# T-LINE-FORMAT-COLOUR-FRESH-SHELL: a shell that finds lineFormat.env still has the colour formats
+test.line.formatColourFreshShell() {
+  local fx bad="" out; fx=$(test.line.startFixture lineformatcolour)
+  test.line.freshShell "$fx" "$fx/log.first" 'exit 0'
+  out=$(test.line.freshShell "$fx" "$fx/log.second" \
+    '[ -n "$FORMAT_ENV" ] || echo "FORMAT_ENV-empty"; [ -n "$FORMAT_HELP" ] || echo "FORMAT_HELP-empty"; [ -n "$FORMAT_PARSE_HELP" ] || echo "FORMAT_PARSE_HELP-empty"')
+  [ -n "$out" ] && bad="$bad $(printf '%s' "$out" | tr '\n' ' ')"
+  out=$(test.line.freshShell "$fx" "$fx/log.third" 'echo "a b" | line.format FORMAT_ENV | od -c')
+  [ "$out" = "$(test.line.formatEnvExpected)" ] || bad="$bad FORMAT_ENV-printed=[$(printf '%s' "$out" | tr '\n' ' ')]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a shell that sources lineFormat.env has the colour formats and prints as before" || create.result 1 "fresh shell:$bad"
+  return $(result)
+}
+test.case $level "T-LINE-FORMAT-COLOUR-FRESH-SHELL: FORMAT_ENV and FORMAT_HELP are set in a shell that finds lineFormat.env" \
+  test.line.formatColourFreshShell
+expect 0 "a shell that sources lineFormat.env has the colour formats and prints as before" \
+  "the file never held the colour formats — only the shell that wrote it had them"
+
+# T-LINE-FORMAT-CUSTOM-KEPT: a plain format customised in the file wins, and line init keeps the file
+test.line.formatCustomKept() {
+  local fx bad="" f out custom; fx=$(test.line.startFixture lineformatcustom); f="$fx/config/lineFormat.env"
+  test.line.freshShell "$fx" "$fx/log.first" 'exit 0'
+  custom='export FORMAT_PARSE_HELP="%s#%s#%s\\n"'
+  { grep -v '^export FORMAT_PARSE_HELP=' "$f"; echo "$custom"; } > "$fx/edited" && cat "$fx/edited" > "$f"
+  out=$(test.line.freshShell "$fx" "$fx/log.second" 'printf "%s" "$FORMAT_PARSE_HELP"')
+  [ "$out" = '%s#%s#%s\n' ] || bad="$bad FORMAT_PARSE_HELP=[$out]"
+  env -i HOME="$fx" USER="$USER" PATH=/usr/bin:/bin LOG_DEVICE="$fx/log.third" "$fx/oosh/line" init >/dev/null 2>&1
+  grep -qxF "$custom" "$f" || bad="$bad custom-format-lost-by-line-init"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a customised plain format survives a new shell and line init" || create.result 1 "custom format:$bad"
+  return $(result)
+}
+test.case $level "T-LINE-FORMAT-CUSTOM-KEPT: a plain format edited in lineFormat.env survives a new shell and line init" \
+  test.line.formatCustomKept
+expect 0 "a customised plain format survives a new shell and line init" \
+  "line formats.edit is how a user customises the plain formats — the file wins"
+# private.line.format.save is tested through line.init above (T-LINE-FORMAT-INIT-NO-ERROR,
+# T-LINE-FORMAT-FILE-PLAIN): called here it would write this shell's CONFIG_PATH.
+
+# T-LINE-SETUP-COLOR-IDEMPOTENT: line.init leaves an unchanged setup.color.env alone
+# Every shell that sources line (each shell start, config init.user, oo user.fix,
+# oo update) rewrote the SHARED <config>/setup.color.env with the same text: a
+# write race between users and a second run that changed a file. Unchanged:
+# inode and mtime kept; a file that is not the built text is written again;
+# a read-only file that already holds the built text is no error.
+test.line.setupColorIdempotent() {
+  local fx bad="" f want before; fx=$(test.line.startFixture linesetupcolor); f="$fx/config/setup.color.env"
+  test.line.freshShell "$fx" "$fx/log.first" 'exit 0'
+  want=$(cat "$f" 2>/dev/null)
+  [ -n "$want" ] || bad="$bad not-written"
+  touch -t 200001010000 "$f"; before=$(ls -li "$f")
+  test.line.freshShell "$fx" "$fx/log.second" 'line.init'
+  [ "$(ls -li "$f")" = "$before" ] || bad="$bad unchanged-rewritten=[$before]->[$(ls -li "$f")]"
+  printf '%s\n' 'BOLD="${ESC}0;2m"' >> "$f"; touch -t 200001010000 "$f"; before=$(ls -li "$f")
+  test.line.freshShell "$fx" "$fx/log.third" 'exit 0'
+  [ "$(cat "$f")" = "$want" ] || bad="$bad changed-not-written=[$(tr '\n' '~' < "$f")]"
+  [ "$(ls -li "$f")" != "$before" ] || bad="$bad changed-mtime-kept"
+  chmod 444 "$f"
+  env -i HOME="$fx" USER="$USER" PATH=/usr/bin:/bin LOG_DEVICE="$fx/log.fourth" bash -c \
+    'source "$HOME/oosh/this" >/dev/null 2>&1; source "$HOME/oosh/line" >/dev/null' 2>"$fx/err.fourth"
+  chmod 644 "$f"
+  [ -s "$fx/err.fourth" ] && bad="$bad read-only-same-content-error=[$(head -1 "$fx/err.fourth")]"
+  grep -q -e '^ERROR>' -e '^WARN' "$fx/log.fourth" && bad="$bad read-only-same-content-logged=[$(grep -m1 -e '^ERROR>' -e '^WARN' "$fx/log.fourth")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an unchanged setup.color.env is not rewritten; a changed one is" || create.result 1 "setup.color.env:$bad"
+  return $(result)
+}
+test.case $level "T-LINE-SETUP-COLOR-IDEMPOTENT: line.init leaves an unchanged setup.color.env alone and writes a changed one" \
+  test.line.setupColorIdempotent
+expect 0 "an unchanged setup.color.env is not rewritten; a changed one is" \
+  "the shared setup.color.env was rewritten by every shell start of every user"
+
+# T-LINE-SETUP-COLOR-EARLY-LOAD: line loaded before log asks no logger that is not there
+# `this` sources line (this.path.add) before log has defined warn.log — a
+# standalone ./log is such a start. A config without its directory, and one
+# whose setup.color.env cannot be written (a read-only config directory; for
+# root, who writes anyway, a directory in place of the file), must not end in
+# "command not found".
+test.line.setupColorEarlyLoad() {
+  local fx bad="" err
+  fx=$(test.suite.fixture.make linesetupcolorearly); mkdir -p "$fx/.config/oosh"
+  env -i HOME="$fx" PATH=/usr/bin:/bin OOSH_DIR="$OOSH_DIR" TERM=dumb LOG_DEVICE="$fx/device.out" \
+    "$OOSH_DIR/log" device >/dev/null 2>"$fx/stderr"
+  err=$(grep 'command not found' "$fx/stderr")
+  [ -z "$err" ] || bad="$bad no-config-dir[$err]"
+  rm -rf "$fx"
+  fx=$(test.line.startFixture linesetupcolorro)
+  if [ "$(id -u)" = "0" ]; then
+    mkdir "$fx/config/setup.color.env"
+  else
+    chmod 555 "$fx/config"
+  fi
+  env -i HOME="$fx" PATH=/usr/bin:/bin OOSH_DIR="$OOSH_DIR" TERM=dumb LOG_DEVICE="$fx/device.out" \
+    "$OOSH_DIR/log" device >/dev/null 2>"$fx/stderr"
+  chmod 755 "$fx/config"
+  err=$(grep 'command not found' "$fx/stderr")
+  [ -z "$err" ] || bad="$bad unwritable[$err]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an early load of line on a missing or unwritable config calls no undefined logger" || create.result 1 "early load:$bad"
+  return $(result)
+}
+test.case $level "T-LINE-SETUP-COLOR-EARLY-LOAD: line loaded by a standalone ./log on a missing or unwritable config says no command not found" \
+  test.line.setupColorEarlyLoad
+expect 0 "an early load of line on a missing or unwritable config calls no undefined logger" \
+  "line.init called warn.log before log had defined it"
+
 ### test.method
 
+test.suite.save.results

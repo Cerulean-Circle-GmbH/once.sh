@@ -3,39 +3,260 @@
 #export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
 #set -x
 
+TEST_CATEGORY=core
+
 level=$1
 if [ -z "$level" ]; then
   level=1
+else 
+  # remove the level parameter
+  shift
 fi
-echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
 #echo "sourcing init"
 source this
 source test.suite
 
 log.level $level
+info.log "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
 
-competionArray=(once config list file ite)
+completionArray=(once config list file ite)
 source oo
 
-test.os() 
-{
-((TEST_COUNTER++))
-console.log "
-
-
-Test 0: os \"$*\"
-===================================================================="
-os.start "$@"
-console.log "RETURN: $RETURN_VALUE  Result: $RESULT 
-===================================================================="
-}
-
-test.case - "os test start" \
-   os $*
-expect 0 "*" "Test start"
+test.case $level "os info runs" \
+   os info
+expect 0 "*" "os info"
 
 source os
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: private.os.platform.load populates PLATFORM_* vars
+# ─────────────────────────────────────────────────────────────────────────────
+source $OOSH_DIR/os
+private.os.platform.load
+if [ -n "$PLATFORM_ubuntu_24_04" ]; then
+  expect.pass "platform.load populates PLATFORM_ubuntu_24_04"
+else
+  expect.fail "platform.load did not populate PLATFORM_ubuntu_24_04"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: private.os.platform.names returns known platforms
+# ─────────────────────────────────────────────────────────────────────────────
+_NAMES=$(private.os.platform.names)
+_FOUND_ALL=true
+for _P in ubuntu_24_04 debian_12 almalinux_9 alpine_3_19 macos; do
+  if ! echo "$_NAMES" | grep -q "$_P"; then
+    expect.fail "platform.names missing: $_P"
+    _FOUND_ALL=false
+  fi
+done
+if [ "$_FOUND_ALL" = true ]; then
+  expect.pass "platform.names includes all must-pass platforms"
+fi
+unset _NAMES _FOUND_ALL _P
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: private.os.platform.parse extracts fields correctly
+# ─────────────────────────────────────────────────────────────────────────────
+private.os.platform.parse ubuntu_24_04
+if [ "$PLATFORM_WORKSPACE" = "nakedUbuntu/24.04" ] && \
+   [ "$PLATFORM_BASE_IMAGE" = "ubuntu:24.04" ] && \
+   [ "$PLATFORM_PM" = "apt-get" ] && \
+   [ "$PLATFORM_TIER" = "must-pass" ]; then
+  expect.pass "parse ubuntu_24_04: all fields correct"
+else
+  expect.fail "parse ubuntu_24_04: ws=$PLATFORM_WORKSPACE img=$PLATFORM_BASE_IMAGE pm=$PLATFORM_PM tier=$PLATFORM_TIER"
+fi
+
+private.os.platform.parse alpine_3_19
+if [ "$PLATFORM_WORKSPACE" = "nakedAlpine/3.19" ] && \
+   [ "$PLATFORM_PM" = "apk" ] && \
+   [ "$PLATFORM_TIER" = "must-pass" ]; then
+  expect.pass "parse alpine_3_19: fields correct"
+else
+  expect.fail "parse alpine_3_19: ws=$PLATFORM_WORKSPACE pm=$PLATFORM_PM tier=$PLATFORM_TIER"
+fi
+
+private.os.platform.parse macos
+if [ "$PLATFORM_WORKSPACE" = "native" ] && \
+   [ "$PLATFORM_PM" = "brew" ] && \
+   [ "$PLATFORM_TIER" = "must-pass" ]; then
+  expect.pass "parse macos: fields correct"
+else
+  expect.fail "parse macos: ws=$PLATFORM_WORKSPACE pm=$PLATFORM_PM tier=$PLATFORM_TIER"
+fi
+
+private.os.platform.parse nonexistent_platform_xyz 2>/dev/null
+if [ $? -eq 1 ]; then
+  expect.pass "parse unknown platform returns error"
+else
+  expect.fail "parse unknown platform should return 1"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: private.os.platform.image.from.workspace matches odocker logic
+# ─────────────────────────────────────────────────────────────────────────────
+declare -A _WS_EXPECT=(
+  ["nakedUbuntu/24.04"]="naked_ubuntu_24_04"
+  ["nakedDebian/12"]="naked_debian_12"
+  ["nakedAlma/9.sshd"]="naked_alma_9_sshd"
+  ["nakedAlpine/3.19"]="naked_alpine_3_19"
+)
+for ws in "${!_WS_EXPECT[@]}"; do
+  RESULT=$(private.os.platform.image.from.workspace "$ws")
+  if [ "$RESULT" = "${_WS_EXPECT[$ws]}" ]; then
+    expect.pass "image from workspace $ws → $RESULT"
+  else
+    expect.fail "image from workspace $ws: expected ${_WS_EXPECT[$ws]}, got: $RESULT"
+  fi
+done
+unset _WS_EXPECT
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: os platform.list runs without error
+# ─────────────────────────────────────────────────────────────────────────────
+test.case $level "os platform.list runs" \
+  os platform.list
+if [ "$RETURN_VALUE" -eq 0 ]; then
+  expect.pass "os platform.list exits 0"
+else
+  expect.fail "os platform.list exits $RETURN_VALUE (expected 0)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: os platform.test without args returns error
+# ─────────────────────────────────────────────────────────────────────────────
+test.case $level "os platform.test requires parameter" \
+  os platform.test
+if [ "$RETURN_VALUE" -eq 1 ]; then
+  expect.pass "os platform.test without args exits 1"
+else
+  expect.fail "os platform.test without args exits $RETURN_VALUE (expected 1)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: private.os.platform.test.ci function is defined
+# ─────────────────────────────────────────────────────────────────────────────
+if type private.os.platform.test.ci >/dev/null 2>&1; then
+  expect.pass "private.os.platform.test.ci is defined"
+else
+  expect.fail "private.os.platform.test.ci should be defined"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: macos routes to CI (workspace=native), without triggering actual CI
+# ─────────────────────────────────────────────────────────────────────────────
+private.os.platform.parse macos
+if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+  expect.pass "macos routes to CI (workspace=native, not Docker)"
+else
+  expect.fail "macos should have workspace=native, got: $PLATFORM_WORKSPACE"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: missing gh CLI triggers auto-install attempt
+# ─────────────────────────────────────────────────────────────────────────────
+_AUTO_OUTPUT=$(
+  emptyDir=$(mktemp -d)
+  PATH="$emptyDir"
+  private.os.platform.test.ci macos 2>&1
+  rmdir "$emptyDir" 2>/dev/null
+)
+if echo "$_AUTO_OUTPUT" | grep -q "oo: command not found"; then
+  expect.pass "missing gh CLI triggers auto-install (oo cmd gh attempted)"
+else
+  expect.fail "missing gh CLI should trigger auto-install, got: $_AUTO_OUTPUT"
+fi
+unset _AUTO_OUTPUT
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: completion function exists
+# ─────────────────────────────────────────────────────────────────────────────
+if type os.platform.test.completion.platform >/dev/null 2>&1; then
+  expect.pass "os.platform.test.completion.platform is defined"
+else
+  expect.fail "os.platform.test.completion.platform should be defined"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: terminal completion function exists
+# ─────────────────────────────────────────────────────────────────────────────
+if type os.platform.test.completion.terminal >/dev/null 2>&1; then
+  expect.pass "os.platform.test.completion.terminal is defined"
+else
+  expect.fail "os.platform.test.completion.terminal should be defined"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: terminal completion returns "terminal"
+# ─────────────────────────────────────────────────────────────────────────────
+_TERMINAL_COMP=$(os.platform.test.completion.terminal)
+if echo "$_TERMINAL_COMP" | grep -q "terminal"; then
+  expect.pass "terminal completion suggests 'terminal'"
+else
+  expect.fail "terminal completion should suggest 'terminal', got: $_TERMINAL_COMP"
+fi
+unset _TERMINAL_COMP
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: os.platform.test signature includes terminal parameter
+# ─────────────────────────────────────────────────────────────────────────────
+_SIG=$(grep "^os.platform.test()" "$OOSH_DIR/os" 2>/dev/null)
+if echo "$_SIG" | grep -q "terminal"; then
+  expect.pass "os.platform.test signature includes terminal parameter"
+else
+  expect.fail "os.platform.test signature should include terminal parameter"
+fi
+unset _SIG
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T-OS-CHECK-ENV-LINUX-MUSL : os.check.env's case "$OSTYPE" must match linux*
+# (not narrowly linux-gnu*) so Alpine's linux-musl resolves to OOSH_OS=linux-gnu.
+# Without this, downstream methods using os.check.env silently skip the
+# alpine branch — symptom: "could not determine OS... please contribute".
+# Bug history: pre-b7d500d the pattern was linux-gnu* and alpine fell through.
+# ─────────────────────────────────────────────────────────────────────────────
+test.case $level "T-OS-CHECK-ENV-LINUX-MUSL: os.check.env recognises linux-musl as a linux variant" \
+  echo "(grep os for the case statement)"
+OS_CHECK_ENV_BODY=$(declare -f os.check.env 2>/dev/null)
+if printf "%s" "$OS_CHECK_ENV_BODY" | grep -qE 'linux\*\)' \
+   && ! printf "%s" "$OS_CHECK_ENV_BODY" | grep -qE 'linux-gnu\*\)'; then
+  expect.pass "os.check.env matches linux* (covers linux-gnu, linux-musl, future variants)"
+else
+  expect.fail "os.check.env still uses narrow linux-gnu* pattern — alpine's linux-musl will fall through to 'could not determine OS'"
+fi
+
+
+console.log "
+Test: private.os.release.get
+===================================================================="
+
+# T-OS-RELEASE-GET: one value of an os-release file, quotes removed, the file never run
+# Moved from odocker (private.odocker.os.release.get read only /etc/os-release
+# and had no test). <file> lets the test use a fixture.
+test.os.releaseGet() {
+  local fx bad="" got; fx=$(test.suite.fixture.make osrelease)
+  printf '%s\n' 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"' 'NAME="Debian GNU/Linux"' 'ID=debian' \
+    "VERSION_CODENAME='bookworm'" 'HOME_URL="https://www.debian.org/"' 'QUOTED="a \"b\" \$c"' 'EVIL=$(touch '"$fx"'/ran)' > "$fx/os-release"
+  got=$(private.os.release.get ID "$fx/os-release") || bad="$bad id-rc"
+  [ "$got" = debian ] || bad="$bad id=[$got]"
+  got=$(private.os.release.get PRETTY_NAME "$fx/os-release"); [ "$got" = "Debian GNU/Linux 12 (bookworm)" ] || bad="$bad double=[$got]"
+  got=$(private.os.release.get VERSION_CODENAME "$fx/os-release"); [ "$got" = bookworm ] || bad="$bad single=[$got]"
+  got=$(private.os.release.get QUOTED "$fx/os-release"); [ "$got" = 'a "b" $c' ] || bad="$bad escaped=[$got]"
+  private.os.release.get EVIL "$fx/os-release" >/dev/null; [ -e "$fx/ran" ] && bad="$bad file-was-run"
+  got=$(private.os.release.get NAME "$fx/os-release"); [ "$got" = "Debian GNU/Linux" ] || bad="$bad name=[$got]"
+  got=$(private.os.release.get VERSION_ID "$fx/os-release"); [ "$?" = 1 ] && [ -z "$got" ] || bad="$bad missing-key=[$? $got]"
+  got=$(private.os.release.get ID "$fx/none"); [ "$?" = 1 ] && [ -z "$got" ] || bad="$bad missing-file=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "values with and without quotes; rc 1 for a missing key or file; the file is never run" || create.result 1 "os release:$bad"
+  return $(result)
+}
+test.case $level "T-OS-RELEASE-GET: one value of an os-release file, quotes removed, the file never run" test.os.releaseGet
+expect 0 "values with and without quotes; rc 1 for a missing key or file; the file is never run" \
+  "the os-release reader lived in odocker, had no test and read only /etc/os-release"
+
 ### test.method
+
+test.suite.save.results
 

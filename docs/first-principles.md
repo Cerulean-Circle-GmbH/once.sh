@@ -45,7 +45,7 @@
 
 ## Command Creation System
 - **Automated Command Generation:** New commands/scripts are created using `oo.new`, which copies a template and sets up completion and usage documentation automatically.
-- **Method Addition:** `oo.new.method` interactively adds new methods to scripts, ensuring consistent structure and documentation.
+- **Method Addition:** `oo.method.new` interactively adds new methods to scripts, ensuring consistent structure and documentation.
 - **Templates:** All new scripts and methods are based on templates in `templates/code/`, enforcing best practices and DRY principles.
 - **Modularity:** Each command is a self-contained script, easily extended and tested.
 

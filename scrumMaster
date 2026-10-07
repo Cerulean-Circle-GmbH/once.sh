@@ -8,6 +8,28 @@
 # PDCA counters are stored in $CONFIG_PATH/stateMachines/<machine>.pdca.env
 # to survive across subprocess calls when state.check re-sources this script
 
+# ============================================================================
+# Measurement configuration (CMM4)
+# ============================================================================
+# Empty unless the caller set it; resolved lazily by private.scrumMaster.metrics.dir.get
+# (the repository root is a git question, and file scope must not call ogit).
+: ${SCRUMMASTER_METRICS_DIR:=}
+: ${SCRUMMASTER_CAPTURE_LINES:=30}
+
+private.scrumMaster.metrics.dir.get()     #  # echo the scrumMaster metrics dir: $SCRUMMASTER_METRICS_DIR when set, else the repository root of $PWD plus /session/metrics — resolved lazily, never at source time #
+{
+ # A getter consumed as $(...): stdout, no create.result. Lazy on purpose:
+ # file scope runs before `source this` has put the tree on PATH, so it must
+ # not call ogit — every reader of SCRUMMASTER_METRICS_DIR comes through here.
+ private.this.script.load ogit ogit.branch.get
+ if [ -n "$SCRUMMASTER_METRICS_DIR" ]; then
+   echo "$SCRUMMASTER_METRICS_DIR"
+ else
+   echo "$(ogit.repo.root.get)/session/metrics"
+ fi
+}
+
+
 ### new.method
 
 # Helper: Load PDCA counters from file
@@ -61,7 +83,7 @@ scrumMaster.pdca.start() # <?machineName:PDCA> <?errorCount:0> # creates and sta
   #   [12] = doing (D)
   #   [13] = checking (C)
   #   [14] = acting (A)
-  #   [15] = finished    # Terminal: Check passed
+  #   [15] = cycle.complete  # Terminal: Check passed (distinct from [99]=finished)
   #   [16] = error.max.iterations  # Error: too many iterations
   # Note: Acting loops back to Checking via private.check.acting returning 13
 
@@ -70,7 +92,7 @@ scrumMaster.pdca.start() # <?machineName:PDCA> <?errorCount:0> # creates and sta
   state.add doing                  silent
   state.add checking               silent
   state.add acting                 silent
-  state.add finished               silent
+  state.add cycle.complete         silent
   state.add error.max.iterations   silent
   state.add 99                     silent  # Transition to finished - closes the state sequence
 
@@ -80,7 +102,7 @@ scrumMaster.pdca.start() # <?machineName:PDCA> <?errorCount:0> # creates and sta
   # Move to first PDCA state (planning)
   state.next
 
-  success.log "PDCA cycle started: $machineName (errors=$errorCount, max_iterations=$PDCA_MAX_ITERATIONS)"
+  success.log "PDCA cycle started: $machineName (errors=$errorCount, maxIterations=$PDCA_MAX_ITERATIONS)"
   create.result 0 "PLANNING"
 }
 
@@ -176,7 +198,7 @@ scrumMaster.pdca.run() # <?machineName:PDCA> <?errorCount:0> # runs complete PDC
     local currentState=$(scrumMaster.pdca.state $machineName)
     console.log "Step $step: $currentState"
 
-    if [ "$currentState" = "FINISHED" ] || [ "$currentState" = "ERROR_MAX_ITERATIONS" ]; then
+    if [ "$currentState" = "CYCLE_COMPLETE" ] || [ "$currentState" = "FINISHED" ] || [ "$currentState" = "ERROR_MAX_ITERATIONS" ]; then
       break
     fi
 
@@ -232,7 +254,7 @@ private.check.checking() # <script> <stageTo> <stateFound> # C: Check phase - ve
   fi
 
   console.log "CHECK: No errors - success!"
-  create.result 0 15  # → [15]=finished
+  create.result 0 15  # → [15]=cycle.complete
   return $(result)
 }
 
@@ -265,14 +287,14 @@ private.check.acting() # <script> <stageTo> <stateFound> # A: Act phase - fix is
     return $(result)
   fi
 
-  # No more errors - proceed to finished
+  # No more errors - proceed to cycle.complete
   private.pdca.config.save PDCA
-  console.log "ACT: All errors fixed - proceeding to Finished"
-  create.result 0 15  # → [15]=finished
+  console.log "ACT: All errors fixed - proceeding to cycle.complete"
+  create.result 0 15  # → [15]=cycle.complete
   return $(result)
 }
 
-private.check.finished() # <script> <stageTo> <stateFound> # Terminal state - checks if really done or needs more C→A loops
+private.check.cycle.complete() # <script> <stageTo> <stateFound> # Terminal state - checks if really done or needs more C→A loops
 {
   local script=$1; shift
   local stageTo=$1; shift
@@ -299,7 +321,7 @@ private.check.finished() # <script> <stageTo> <stateFound> # Terminal state - ch
   fi
 
   success.log "PDCA cycle completed successfully!"
-  create.result 0 "finished"
+  create.result 0 "cycle complete"
   return $(result)
 }
 
@@ -314,6 +336,17 @@ private.check.error.max.iterations() # <script> <stageTo> <stateFound> # Error s
   return $(result)
 }
 
+private.check.finished() # <script> <stageTo> <stateFound> # Terminal [99]=finished - machine complete
+{
+  local script=$1; shift
+  local stageTo=$1; shift
+  local stateFound=$1; shift
+
+  success.log "State machine reached terminal state [99]=finished"
+  create.result 0 "finished"
+  return $(result)
+}
+
 private.check.next.custom.state() # <script> <stageTo> <stateFound> # Placeholder state - pass through
 {
   local script=$1; shift
@@ -324,26 +357,1462 @@ private.check.next.custom.state() # <script> <stageTo> <stateFound> # Placeholde
   return $(result)
 }
 
+# ============================================================================
+# Measurement — private parsing methods (CMM4)
+# ============================================================================
+
+private.scrumMaster.parse.normalize.k() # <value> # convert "4.6k" to 4600, pass through plain numbers
+{
+  local val="$1"
+  if echo "$val" | grep -q 'k$'; then
+    local num="${val%k}"
+    echo "$num" | awk '{printf "%d", $1 * 1000}'
+  else
+    echo "$val"
+  fi
+}
+
+private.scrumMaster.parse.tokens() # <paneContent> # extract token counts, sets METRIC_TOKENS_UP/DOWN/UP_RAW/DOWN_RAW
+{
+  local content="$1"
+
+  METRIC_TOKENS_UP_RAW=""
+  METRIC_TOKENS_DOWN_RAW=""
+  METRIC_TOKENS_UP=0
+  METRIC_TOKENS_DOWN=0
+
+  # Pattern: ↑ 20.3k tokens  or  ↑ 590 tokens
+  local upRaw
+  upRaw=$(echo "$content" | grep -o '↑ [0-9][0-9.]*k\{0,1\} tokens' | tail -1 | sed 's/↑ //;s/ tokens//')
+  if [ -n "$upRaw" ]; then
+    METRIC_TOKENS_UP_RAW="$upRaw"
+    METRIC_TOKENS_UP=$(private.scrumMaster.parse.normalize.k "$upRaw")
+  fi
+
+  # Pattern: ↓ 7.9k tokens  or  ↓ 590 tokens
+  local downRaw
+  downRaw=$(echo "$content" | grep -o '↓ [0-9][0-9.]*k\{0,1\} tokens' | tail -1 | sed 's/↓ //;s/ tokens//')
+  if [ -n "$downRaw" ]; then
+    METRIC_TOKENS_DOWN_RAW="$downRaw"
+    METRIC_TOKENS_DOWN=$(private.scrumMaster.parse.normalize.k "$downRaw")
+  fi
+}
+
+private.scrumMaster.parse.timing() # <paneContent> # extract timing info, sets METRIC_THINK_TIME_S/WALL_TIME/WALL_TIME_S/TOOL_USES
+{
+  local content="$1"
+
+  METRIC_THINK_TIME_S=0
+  METRIC_WALL_TIME=""
+  METRIC_WALL_TIME_S=0
+  METRIC_TOOL_USES=0
+
+  # Pattern: "thought for 33s" or "Thought for 33s"
+  local think
+  think=$(echo "$content" | grep -oE '[Tt]hought for [0-9]+s' | tail -1 | grep -oE '[0-9]+')
+  [ -n "$think" ] && METRIC_THINK_TIME_S="$think"
+
+  # Pattern: "(4m 9s" or "(1m 16s" — wall time in parentheses
+  local wall
+  wall=$(echo "$content" | grep -oE '\([0-9]+m [0-9]+s' | tail -1 | sed 's/(//')
+  if [ -n "$wall" ]; then
+    METRIC_WALL_TIME="$wall"
+    local mins secs
+    mins=$(echo "$wall" | grep -oE '^[0-9]+')
+    secs=$(echo "$wall" | grep -oE '[0-9]+s$' | tr -d 's')
+    METRIC_WALL_TIME_S=$(( mins * 60 + secs ))
+  fi
+
+  # Pattern: "14 tool uses" or "1 tool use"
+  local tools
+  tools=$(echo "$content" | grep -oE '[0-9]+ tool uses?' | tail -1 | grep -oE '[0-9]+')
+  [ -n "$tools" ] && METRIC_TOOL_USES="$tools"
+}
+
+private.scrumMaster.parse.state() # <paneContent> # detect activity state, sets METRIC_ACTIVITY/METRIC_STATE
+{
+  local content="$1"
+
+  METRIC_ACTIVITY="none"
+  METRIC_STATE="unknown"
+
+  # Check for completed verbs (past-tense spinner text)
+  if echo "$content" | grep -qiE '(Brewed|Churned|Cooked|Crisped|Baked|Distilled|Rendered|Forged|Sauteed) '; then
+    METRIC_ACTIVITY=$(echo "$content" | grep -oiE '(Brewed|Churned|Cooked|Crisped|Baked|Distilled|Rendered|Forged|Sauteed)' | tail -1)
+    METRIC_STATE="completed"
+    return 0
+  fi
+
+  # Check for active verbs (present-tense spinner text)
+  if echo "$content" | grep -qiE '(Composing|Musing|Thinking|Cascading|Incubating|Frosting|Kneading|Ideating|Seasoning|Noodling|Transmuting|Fluttering|Cerebrating|Orbiting|Running|Reading)'; then
+    METRIC_ACTIVITY=$(echo "$content" | grep -oiE '(Composing|Musing|Thinking|Cascading|Incubating|Frosting|Kneading|Ideating|Seasoning|Noodling|Transmuting|Fluttering|Cerebrating|Orbiting|Running|Reading)' | tail -1)
+    METRIC_STATE="active"
+    return 0
+  fi
+
+  # Check for permission prompt
+  if echo "$content" | grep -q 'Allow' && echo "$content" | grep -q 'Deny'; then
+    METRIC_ACTIVITY="permission-prompt"
+    METRIC_STATE="permission"
+    return 0
+  fi
+
+  # Check for idle prompt (> or ❯)
+  local lastLine
+  lastLine=$(echo "$content" | sed '/^[[:space:]]*$/d' | tail -1)
+  if echo "$lastLine" | grep -qE '^[[:space:]]*>[[:space:]]*$' || echo "$lastLine" | grep -q '^[[:space:]]*❯[[:space:]]*$'; then
+    METRIC_ACTIVITY="idle-prompt"
+    METRIC_STATE="idle"
+    return 0
+  fi
+
+  return 0
+}
+
+private.scrumMaster.resolve.pane() # <agentName> <?session> # resolve agent name to pane target
+{
+  local name="$1"
+  local session="${2:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+
+  if [ -z "$name" ]; then
+    error.log "Usage: private.scrumMaster.resolve.pane <agentName>"
+    return 1
+  fi
+
+  local target
+  target=$("$OOSH_DIR/hiveMind" resolve "$name" "$session" 2>/dev/null)
+  if [ -n "$target" ]; then
+    echo "$target"
+    return 0
+  fi
+
+  error.log "Cannot resolve agent '$name' to pane target"
+  return 1
+}
+
+private.scrumMaster.metrics.save() # <agentName> <target> # persist METRIC_ variables to session/metrics/
+{
+  local agent="$1"
+  local target="$2"
+  local metricsDir="$(private.scrumMaster.metrics.dir.get)"
+
+  [ ! -d "$metricsDir" ] && mkdir -p "$metricsDir"
+
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  local filename="${agent}.${timestamp}.scenario.env"
+
+  {
+    echo "METRIC_TARGET=\"${target}\""
+    echo "METRIC_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "METRIC_TOKENS_UP=\"${METRIC_TOKENS_UP:-0}\""
+    echo "METRIC_TOKENS_DOWN=\"${METRIC_TOKENS_DOWN:-0}\""
+    echo "METRIC_TOKENS_UP_RAW=\"${METRIC_TOKENS_UP_RAW:-}\""
+    echo "METRIC_TOKENS_DOWN_RAW=\"${METRIC_TOKENS_DOWN_RAW:-}\""
+    echo "METRIC_WALL_TIME=\"${METRIC_WALL_TIME:-}\""
+    echo "METRIC_WALL_TIME_S=\"${METRIC_WALL_TIME_S:-0}\""
+    echo "METRIC_THINK_TIME_S=\"${METRIC_THINK_TIME_S:-0}\""
+    echo "METRIC_TOOL_USES=\"${METRIC_TOOL_USES:-0}\""
+    echo "METRIC_ACTIVITY=\"${METRIC_ACTIVITY:-none}\""
+    echo "METRIC_STATE=\"${METRIC_STATE:-unknown}\""
+  } > "$metricsDir/$filename"
+
+  info.log "Metrics saved: $metricsDir/$filename"
+  echo "$metricsDir/$filename"
+}
+
+# ============================================================================
+# Measurement — public API (CMM4)
+# ============================================================================
+
+scrumMaster.pane.measure() # <agentName> <?session> # capture and parse metrics for one agent pane
+{ private.scrumMaster.measure.pane "$@"; }
+
+private.scrumMaster.measure.pane() # <agentName> <?session> # capture and parse metrics for one agent pane
+{
+  local agent="$1"
+  local session="${2:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+
+  if [ -z "$agent" ]; then
+    error.log "Usage: scrumMaster measure.pane <agentName>"
+    create.result 1 "missing agent name"
+    return $(result)
+  fi
+
+  local target
+  target=$(private.scrumMaster.resolve.pane "$agent" "$session")
+  if [ $? -ne 0 ]; then
+    create.result 1 "cannot resolve $agent"
+    return $(result)
+  fi
+
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}")
+
+  if [ -z "$content" ]; then
+    warn.log "Empty pane content for $agent ($target)"
+    create.result 1 "empty pane"
+    return $(result)
+  fi
+
+  private.scrumMaster.parse.tokens "$content"
+  private.scrumMaster.parse.timing "$content"
+  private.scrumMaster.parse.state "$content"
+
+  local savedFile
+  savedFile=$(private.scrumMaster.metrics.save "$agent" "$target")
+
+  echo "$agent ($target):"
+  echo "  tokens: up=${METRIC_TOKENS_UP:-0} down=${METRIC_TOKENS_DOWN:-0}"
+  echo "  timing: wall=${METRIC_WALL_TIME:-n/a} think=${METRIC_THINK_TIME_S:-0}s"
+  echo "  tools:  ${METRIC_TOOL_USES:-0}"
+  echo "  state:  ${METRIC_STATE:-unknown} (${METRIC_ACTIVITY:-none})"
+
+  create.result 0 "$savedFile"
+  return $(result)
+}
+
+scrumMaster.pane.measure.completion.agentName() # # agent names from hiveMind registry
+{
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] && cut -d'|' -f2 "$reg" 2>/dev/null
+}
+
+scrumMaster.pane.measure.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.team.measure() # <?session> # capture metrics for all agents in a session
+{ private.scrumMaster.measure.team "$@"; }
+
+private.scrumMaster.measure.team() # <?session> # capture metrics for all agents in a session
+{
+  local session="${1:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+  local registry="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+
+  if [ ! -f "$registry" ]; then
+    error.log "No hiveMind registry found"
+    create.result 1 "no registry"
+    return $(result)
+  fi
+
+  echo "═══════════════════════════════════════════════"
+  echo " Team Metrics — session: $session"
+  echo "═══════════════════════════════════════════════"
+
+  local count=0
+  while IFS='|' read -r target role; do
+    [ -z "$role" ] && continue
+    echo "───────────────────────────────────────────────"
+    private.scrumMaster.measure.pane "$role" "$session"
+    count=$((count + 1))
+  done < <(grep "^${session}:" "$registry" 2>/dev/null)
+
+  echo "═══════════════════════════════════════════════"
+  echo " Measured $count agents"
+  echo "═══════════════════════════════════════════════"
+
+  create.result 0 "$count agents measured"
+  return $(result)
+}
+
+scrumMaster.team.measure.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.cycle() # <?session> <?interval:0> # one measure+sweep+unblock cycle with optional sleep
+{
+  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+  local interval="${2:-0}"
+
+  [ "$interval" -gt 0 ] 2>/dev/null && sleep "$interval"
+
+  private.scrumMaster.measure.team "$session"
+  scrumMaster.subscription > /dev/null 2>&1
+  scrumMaster.dashboard "$session"
+  "$OOSH_DIR/hiveMind" sweep "$session"
+  "$OOSH_DIR/hiveMind" unblock all "$session"
+}
+scrumMaster.cycle.completion() { :; }
+
+scrumMaster.dashboard() # <?session> # generate team health dashboard to session/dashboard.md
+{
+  private.this.script.load ogit ogit.branch.get
+  local session="${1:-$(tmux display-message -p '#{session_name}' 2>/dev/null)}"
+  local registry="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+
+  # Workspace root via git (reliable, avoids symlink issues)
+  local workspace
+  workspace="$(ogit.repo.root.get)"
+  [ -z "$workspace" ] && { error.log "Cannot determine workspace root"; return 1; }
+  local dashboardFile="${workspace}/session/dashboard.md"
+  mkdir -p "${workspace}/session" 2>/dev/null
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  local localTime
+  localTime=$(date '+%Y-%m-%d %H:%M %Z')
+
+  # Git status
+  local gitBranch gitStatus gitCommit
+  gitBranch=$(ogit.branch.get "$workspace")
+  gitCommit=$(ogit.commit.log.show "" 1 oneline "$workspace")
+  if ogit.status.check "$workspace"; then
+    gitStatus="clean"
+  else
+    gitStatus="uncommitted changes"
+  fi
+
+  # Subscription (from cached metrics if available)
+  local velFive="-" velSeven="-"
+  local latestSub
+  latestSub=$(ls -t "${CONFIG_PATH:-$HOME/config}/metrics"/subscription.*.scenario.env 2>/dev/null | head -1)
+  if [ -n "$latestSub" ] && [ -f "$latestSub" ]; then
+    source "$latestSub"
+    velFive="${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}%"
+    velSeven="${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}%"
+  fi
+
+  # Task summary
+  local tasksDir="${workspace}/session/tasks"
+  local taskTotal=0 taskToday=0
+  if [ -d "$tasksDir" ]; then
+    taskTotal=$(ls -1 "$tasksDir"/*.task.md 2>/dev/null | wc -l | tr -d ' ')
+    local today
+    today=$(date '+%Y%m%d')
+    taskToday=$(ls -1 "$tasksDir"/${today}*.task.md 2>/dev/null | wc -l | tr -d ' ')
+  fi
+
+  # Write dashboard
+  {
+    echo "# Team Dashboard"
+    echo ""
+    echo "**Updated**: $timestamp ($localTime)"
+    echo "**Session**: $session"
+    echo ""
+    echo "## Git Status"
+    echo ""
+    echo "| Field | Value |"
+    echo "|-------|-------|"
+    echo "| Branch | \`$gitBranch\` |"
+    echo "| Status | $gitStatus |"
+    echo "| Last commit | \`$gitCommit\` |"
+    echo ""
+    echo "## Subscription"
+    echo ""
+    echo "| Metric | Value |"
+    echo "|--------|-------|"
+    echo "| 5-hour usage | $velFive |"
+    echo "| 7-day usage | $velSeven |"
+    echo ""
+    echo "## Tasks"
+    echo ""
+    echo "| Metric | Value |"
+    echo "|--------|-------|"
+    echo "| Total task files | $taskTotal |"
+    echo "| Today's tasks | $taskToday |"
+    echo ""
+    echo "## Team Status"
+    echo ""
+    echo "| Agent | Pane | Context | Velocity | State |"
+    echo "|-------|------|---------|----------|-------|"
+  } > "$dashboardFile"
+
+  # Per-agent rows
+  if [ -f "$registry" ]; then
+    while IFS='|' read -r target role; do
+      [ -z "$role" ] && continue
+      [[ "$target" != "$session:"* ]] && continue
+
+      local addr="${target#*:}"
+      local contextPct velocity state
+
+      # Per-pane context %
+      contextPct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+      [ -z "$contextPct" ] && contextPct="-"
+      [ "$contextPct" != "-" ] && [ "$contextPct" != "no-claude" ] && [ "$contextPct" != "unknown" ] && contextPct="${contextPct}%"
+
+      # Per-pane velocity
+      velocity=$("$OOSH_DIR/claudeCode" context.velocity "$target" 2>/dev/null)
+      local velocityShort
+      velocityShort=$(echo "$velocity" | grep -oE '^[0-9]+ tokens/hr' || echo "-")
+
+      # Activity state via pane capture + parse
+      local paneContent
+      paneContent=$("$OOSH_DIR/otmux" pane.capture "$target" 15 2>/dev/null)
+      private.scrumMaster.parse.state "$paneContent"
+      state="${METRIC_STATE:-unknown}"
+
+      echo "| $role | $addr | $contextPct | $velocityShort | $state |" >> "$dashboardFile"
+    done < "$registry"
+  fi
+
+  # Recent commits
+  {
+    echo ""
+    echo "## Recent Commits"
+    echo ""
+    echo "\`\`\`"
+    ogit.commit.log.show "" 5 oneline "$workspace"
+    echo "\`\`\`"
+    echo ""
+    echo "## Recovery"
+    echo ""
+    echo "After \`/compact\`, read:"
+    echo "1. This file (\`session/dashboard.md\`)"
+    echo "2. Your role's context file (\`session/agents/<role>.context.md\`)"
+    echo "3. Your SKILL.md (\`.claude/agents/<role>/SKILL.md\`)"
+    echo ""
+    echo "---"
+    echo "*Generated by \`scrumMaster dashboard\`*"
+  } >> "$dashboardFile"
+
+  console.log "Dashboard updated: $dashboardFile"
+  create.result 0 "$dashboardFile"
+  return $(result)
+}
+scrumMaster.dashboard.completion() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.subscription.json() # # get active subscription block data as JSON via ccusage
+{
+  local json
+  json=$(npx ccusage blocks --active --json 2>/dev/null)
+  if [ -z "$json" ] || [ "$json" = "{}" ]; then
+    error.log "ccusage returned no data"
+    return 1
+  fi
+  echo "$json"
+}
+scrumMaster.subscription.json.completion() { :; }
+
+scrumMaster.subscription() # # show subscription status with alert thresholds
+{
+  # --- Primary source: rate-limit-cache.json (written by Claude TUI, reflects real API headers) ---
+  local cacheFile="$HOME/.claude/rate-limit-cache.json"
+  local haveCache=false
+  local cachePct5h=0 cachePct7d=0 cacheReset5h=0 cacheReset7d=0 cacheTs=0
+
+  if [ -f "$cacheFile" ]; then
+    cachePct5h=$(jq -r '.session5h // 0' "$cacheFile" 2>/dev/null)
+    cachePct7d=$(jq -r '.weekly7d // 0' "$cacheFile" 2>/dev/null)
+    cacheReset5h=$(jq -r '.reset5h // 0' "$cacheFile" 2>/dev/null)
+    cacheReset7d=$(jq -r '.reset7d // 0' "$cacheFile" 2>/dev/null)
+    cacheTs=$(jq -r '.timestamp // 0' "$cacheFile" 2>/dev/null)
+    [ "$cacheReset5h" != "0" ] && [ "$cacheReset5h" != "null" ] && haveCache=true
+  fi
+
+  # Check cache freshness (stale if >10 min old)
+  local cacheAgeS=9999
+  if $haveCache; then
+    local nowMs=$(($(date +%s) * 1000))
+    cacheAgeS=$(( (nowMs - cacheTs) / 1000 ))
+  fi
+
+  # --- Secondary source: ccusage (for token counts, costs, models) ---
+  local json totalTokens=0 costUsd=0 burnRate=0 models=""
+  json=$(scrumMaster.subscription.json 2>/dev/null)
+  if [ -n "$json" ] && [ "$json" != "{}" ]; then
+    totalTokens=$(echo "$json" | jq -r '.blocks[0].totalTokens // 0' 2>/dev/null)
+    costUsd=$(echo "$json" | jq -r '.blocks[0].costUSD // 0' 2>/dev/null)
+    burnRate=$(echo "$json" | jq -r '.blocks[0].burnRate.tokensPerMinute // 0' 2>/dev/null)
+    models=$(echo "$json" | jq -r '.blocks[0].models | join(", ")' 2>/dev/null)
+  fi
+
+  if ! $haveCache && [ -z "$json" ]; then
+    error.log "No data sources available (neither rate-limit-cache.json nor ccusage)"
+    return 1
+  fi
+
+  # --- Compute times from rate-limit-cache (ground truth) ---
+  local nowEpoch resetEpoch remainingMin pctUsed blockStartEpoch
+  local resetLocal resetUtc startLocal startUtc
+  local isActive="true"
+  nowEpoch=$(date +%s)
+
+  if $haveCache; then
+    resetEpoch="$cacheReset5h"
+    remainingMin=$(( (resetEpoch - nowEpoch) / 60 ))
+    [ "$remainingMin" -lt 0 ] && remainingMin=0 && isActive="false"
+    pctUsed=$(echo "$cachePct5h" | awk '{printf "%d", $1 * 100}')
+    blockStartEpoch=$(( resetEpoch - (5 * 3600) ))
+    resetLocal=$(date -r "$resetEpoch" "+%H:%M %Z")
+    resetUtc=$(date -r "$resetEpoch" -u "+%H:%M UTC")
+    startLocal=$(date -r "$blockStartEpoch" "+%H:%M %Z")
+    startUtc=$(date -r "$blockStartEpoch" -u "+%H:%M UTC")
+  else
+    # Fallback: derive from ccusage (less accurate)
+    local ccEnd ccStart ccRemaining
+    ccEnd=$(echo "$json" | jq -r '.blocks[0].endTime // empty' 2>/dev/null)
+    ccStart=$(echo "$json" | jq -r '.blocks[0].startTime // empty' 2>/dev/null)
+    ccRemaining=$(echo "$json" | jq -r '.blocks[0].projection.remainingMinutes // 0' 2>/dev/null)
+    remainingMin="${ccRemaining}"
+    pctUsed=$(echo "$json" | jq -r '
+      .blocks[0] | if .projection.totalTokens > 0
+      then ((.totalTokens / .projection.totalTokens) * 100 | floor)
+      else 0 end' 2>/dev/null)
+    resetUtc=$(echo "$ccEnd" | grep -oE 'T[0-9]{2}:[0-9]{2}' | tr -d T)
+    resetUtc="${resetUtc} UTC (ccusage — may be inaccurate)"
+    startUtc=$(echo "$ccStart" | grep -oE 'T[0-9]{2}:[0-9]{2}' | tr -d T)
+    startUtc="${startUtc} UTC"
+    resetLocal="$resetUtc"
+    startLocal="$startUtc"
+  fi
+
+  # --- Alert level based on real percentage and remaining time ---
+  local alert="OK"
+  if [ "$remainingMin" -le 0 ] 2>/dev/null; then
+    alert="EXHAUSTED (block ended)"
+  elif [ "$remainingMin" -le 5 ] 2>/dev/null; then
+    alert="CRITICAL (${remainingMin} min left, ${pctUsed}% used)"
+  elif [ "$remainingMin" -le 15 ] 2>/dev/null; then
+    alert="WARNING (${remainingMin} min left, ${pctUsed}% used)"
+  elif [ "$pctUsed" -ge 90 ] 2>/dev/null; then
+    alert="WARNING (${pctUsed}% used, ${remainingMin} min left)"
+  fi
+
+  # Weekly quota check
+  local weeklyPct=0
+  if $haveCache; then
+    weeklyPct=$(echo "$cachePct7d" | awk '{printf "%d", $1 * 100}')
+    if [ "$weeklyPct" -ge 90 ] 2>/dev/null; then
+      alert="CRITICAL-WEEKLY (${weeklyPct}% of weekly quota)"
+    fi
+  fi
+
+  # Status label
+  local statusLabel="INACTIVE"
+  [ "$isActive" = "true" ] && statusLabel="ACTIVE"
+  local sourceLabel="rate-limit-cache"
+  $haveCache || sourceLabel="ccusage (fallback)"
+  local staleWarning=""
+  [ "$cacheAgeS" -gt 600 ] && staleWarning=" (stale: ${cacheAgeS}s ago)"
+
+  echo "Subscription Status:"
+  echo "  Block: ${startLocal} — ${resetLocal} ($statusLabel)"
+  echo "  Reset: ${resetUtc} / ${resetLocal}"
+  echo "  Used: ${pctUsed}% of 5h block / ${remainingMin} min remaining"
+  $haveCache && echo "  Weekly: ${weeklyPct}% of 7d quota (resets $(date -r "$cacheReset7d" "+%a %H:%M %Z"))"
+  echo "  Tokens: ${totalTokens} / burn ${burnRate%.*} tok/min"
+  local costFmt
+  costFmt=$(echo "$costUsd" | awk '{printf "%.2f", $1}')
+  echo "  Cost: \$${costFmt}"
+  [ -n "$models" ] && echo "  Models: ${models}"
+  echo "  Alert: ${alert}"
+  echo "  Source: ${sourceLabel}${staleWarning}"
+
+  # Save to metrics for dashboard pickup
+  local metricsDir="$(private.scrumMaster.metrics.dir.get)"
+  [ ! -d "$metricsDir" ] && mkdir -p "$metricsDir"
+  local tsLabel
+  tsLabel=$(date -u "+%Y%m%dT%H%M%SZ")
+  {
+    echo "export SUBSCRIPTION_ACTIVE=\"$isActive\""
+    echo "export SUBSCRIPTION_BLOCK_START=\"$startUtc\""
+    echo "export SUBSCRIPTION_BLOCK_END=\"$resetUtc\""
+    echo "export SUBSCRIPTION_TOKENS=\"$totalTokens\""
+    echo "export SUBSCRIPTION_COST_USD=\"$costUsd\""
+    echo "export SUBSCRIPTION_BURN_RATE=\"${burnRate%.*}\""
+    echo "export SUBSCRIPTION_REMAINING_MIN=\"$remainingMin\""
+    echo "export SUBSCRIPTION_PCT_USED=\"$pctUsed\""
+    echo "export SUBSCRIPTION_WEEKLY_PCT=\"$weeklyPct\""
+    echo "export SUBSCRIPTION_ALERT=\"$alert\""
+    echo "export SUBSCRIPTION_SOURCE=\"$sourceLabel\""
+    $haveCache && echo "export SUBSCRIPTION_RESET_EPOCH=\"$cacheReset5h\""
+    $haveCache && echo "export SUBSCRIPTION_RESET_LOCAL=\"$resetLocal\""
+  } > "$metricsDir/subscription.${tsLabel}.scenario.env"
+
+  # Also save to config metrics for dashboard
+  local configMetrics="${CONFIG_PATH:-$HOME/config}/metrics"
+  mkdir -p "$configMetrics" 2>/dev/null
+  cp "$metricsDir/subscription.${tsLabel}.scenario.env" "$configMetrics/subscription.${tsLabel}.scenario.env"
+
+  create.result 0 "$alert"
+  return $(result)
+}
+scrumMaster.subscription.completion() { :; }
+
+scrumMaster.velocity() # # show current velocity zone with actionable directive
+{
+  # Read rate-limit-cache.json (same source as subscription)
+  local cacheFile="$HOME/.claude/rate-limit-cache.json"
+  if [ ! -f "$cacheFile" ]; then
+    error.log "No rate-limit-cache.json — run scrumMaster subscription first"
+    create.result 1 "NO-DATA"
+    return 1
+  fi
+
+  local pct5h pct7d reset5h cacheTs
+  pct5h=$(jq -r '.session5h // 0' "$cacheFile" 2>/dev/null)
+  pct7d=$(jq -r '.weekly7d // 0' "$cacheFile" 2>/dev/null)
+  reset5h=$(jq -r '.reset5h // 0' "$cacheFile" 2>/dev/null)
+  cacheTs=$(jq -r '.timestamp // 0' "$cacheFile" 2>/dev/null)
+
+  if [ "$reset5h" = "0" ] || [ "$reset5h" = "null" ]; then
+    error.log "rate-limit-cache.json has no reset time"
+    create.result 1 "NO-DATA"
+    return 1
+  fi
+
+  # Compute remaining time
+  local nowEpoch remainingMin pctUsed weeklyPct
+  nowEpoch=$(date +%s)
+  remainingMin=$(( (reset5h - nowEpoch) / 60 ))
+  pctUsed=$(echo "$pct5h" | awk '{printf "%d", $1 * 100}')
+  weeklyPct=$(echo "$pct7d" | awk '{printf "%d", $1 * 100}')
+
+  # Check staleness (warn if >10 min old)
+  local nowMs=$((nowEpoch * 1000))
+  local cacheAgeS=$(( (nowMs - cacheTs) / 1000 ))
+  local stale=""
+  [ "$cacheAgeS" -gt 600 ] && stale=" (cache ${cacheAgeS}s old — may be stale)"
+
+  # Determine velocity zone
+  local zone directive
+  if [ "$remainingMin" -le 0 ]; then
+    zone="EXHAUSTED"
+    directive="Standing down. Next block in ~5-7 min. Run scrumMaster subscription to confirm."
+  elif [ "$remainingMin" -le 5 ]; then
+    zone="COMPACT"
+    directive="Compact in hierarchy order: SM -> orchestrator -> workers."
+  elif [ "$remainingMin" -le 15 ]; then
+    zone="SAVE"
+    directive="Trigger context saves. Prepare for compacts."
+  elif [ "$remainingMin" -le 30 ]; then
+    zone="WIND-DOWN"
+    directive="Agents commit current work NOW. No new assignments."
+  elif [ "$remainingMin" -le 60 ]; then
+    zone="STEADY"
+    directive="No new large tasks. Current work continues."
+  else
+    zone="FULL"
+    directive="Assign freely. No restrictions."
+  fi
+
+  # Weekly override
+  if [ "$weeklyPct" -ge 90 ] 2>/dev/null; then
+    if [ "$zone" = "FULL" ] || [ "$zone" = "STEADY" ]; then
+      zone="WIND-DOWN"
+      directive="Weekly quota ${weeklyPct}% — conserve. Agents commit current work."
+    fi
+  fi
+
+  local resetLocal
+  resetLocal=$(date -r "$reset5h" "+%H:%M %Z")
+
+  echo "Velocity: $zone (${pctUsed}% used, ${remainingMin} min remaining)${stale}"
+  echo "  -> $directive"
+  [ "$weeklyPct" -ge 80 ] 2>/dev/null && echo "  Weekly: ${weeklyPct}% (reset $(date -r "$(jq -r '.reset7d' "$cacheFile")" "+%a %H:%M %Z"))"
+  [ "$zone" != "EXHAUSTED" ] && echo "  Block resets: $resetLocal"
+
+  create.result 0 "$zone"
+  return 0
+}
+scrumMaster.velocity.completion() { :; }
+
+scrumMaster.context.measure() # <agentName> <?session> # show context health + token consumption for an agent
+{ private.scrumMaster.measure.context "$@"; }
+
+private.scrumMaster.measure.context() # <agentName> <?session> # show context health + token consumption for an agent
+{
+  local agent="$1"
+  local session="${2:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+
+  if [ -z "$agent" ]; then
+    error.log "Usage: scrumMaster measure.context <agentName>"
+    create.result 1 "missing agent name"
+    return $(result)
+  fi
+
+  local target
+  target=$(private.scrumMaster.resolve.pane "$agent" "$session")
+  if [ $? -ne 0 ]; then
+    create.result 1 "cannot resolve $agent"
+    return $(result)
+  fi
+
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-50}")
+
+  # Token consumption
+  private.scrumMaster.parse.tokens "$content"
+  local total=$(( ${METRIC_TOKENS_UP:-0} + ${METRIC_TOKENS_DOWN:-0} ))
+
+  # Context health (peer observation via TUI status bar)
+  local contextPct
+  contextPct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+  [ -z "$contextPct" ] && contextPct="above-threshold"
+
+  echo "$agent context:"
+  if [ "$contextPct" = "above-threshold" ]; then
+    echo "  context left:  healthy (above threshold)"
+  else
+    echo "  context left:  ${contextPct}%"
+  fi
+  echo "  input (down):  ${METRIC_TOKENS_DOWN:-0} tokens (${METRIC_TOKENS_DOWN_RAW:-0})"
+  echo "  output (up):   ${METRIC_TOKENS_UP:-0} tokens (${METRIC_TOKENS_UP_RAW:-0})"
+  echo "  total:         $total tokens"
+
+  # Burn rate: compare with previous reading
+  local metricsDir="$(private.scrumMaster.metrics.dir.get)"
+  local prevFile
+  prevFile=$(ls -1t "$metricsDir"/context.${agent}.*.env 2>/dev/null | head -1)
+  if [ -n "$prevFile" ] && [ "$contextPct" != "above-threshold" ]; then
+    local prevPct
+    prevPct=$(grep '^METRIC_CONTEXT_PCT=' "$prevFile" 2>/dev/null | cut -d'"' -f2)
+    if [ -n "$prevPct" ] && [ "$prevPct" != "above-threshold" ]; then
+      local delta=$(( prevPct - contextPct ))
+      if [ "$delta" -gt 0 ] 2>/dev/null; then
+        echo "  burn rate:     ${delta}% since last reading"
+      fi
+    fi
+  fi
+
+  # Persist reading
+  [ ! -d "$metricsDir" ] && mkdir -p "$metricsDir"
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  {
+    echo "METRIC_TYPE=\"context\""
+    echo "METRIC_TARGET=\"${target}\""
+    echo "METRIC_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "METRIC_CONTEXT_PCT=\"${contextPct}\""
+    echo "METRIC_TOKENS_UP=\"${METRIC_TOKENS_UP:-0}\""
+    echo "METRIC_TOKENS_DOWN=\"${METRIC_TOKENS_DOWN:-0}\""
+    echo "METRIC_TOKENS_TOTAL=\"${total}\""
+  } > "$metricsDir/context.${agent}.${timestamp}.scenario.env"
+
+  # Alert if low
+  if [ "$contextPct" != "above-threshold" ] && [ "$contextPct" -le 20 ] 2>/dev/null; then
+    warn.log "$agent context CRITICAL: ${contextPct}%"
+  fi
+
+  create.result 0 "$contextPct"
+  return $(result)
+}
+
+scrumMaster.context.measure.completion.agentName() # # agent names from hiveMind registry
+{
+  scrumMaster.pane.measure.completion.agentName
+}
+
+scrumMaster.context.measure.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.speed.measure() # <agentName> <?session> # show token rate for an agent
+{ private.scrumMaster.measure.speed "$@"; }
+
+private.scrumMaster.measure.speed() # <agentName> <?session> # show token rate for an agent
+{
+  local agent="$1"
+  local session="${2:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+
+  if [ -z "$agent" ]; then
+    error.log "Usage: scrumMaster measure.speed <agentName>"
+    create.result 1 "missing agent name"
+    return $(result)
+  fi
+
+  local target
+  target=$(private.scrumMaster.resolve.pane "$agent" "$session")
+  if [ $? -ne 0 ]; then
+    create.result 1 "cannot resolve $agent"
+    return $(result)
+  fi
+
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}")
+
+  private.scrumMaster.parse.tokens "$content"
+  private.scrumMaster.parse.timing "$content"
+
+  local rate="n/a"
+  if [ "${METRIC_WALL_TIME_S:-0}" -gt 0 ] && [ "${METRIC_TOKENS_UP:-0}" -gt 0 ]; then
+    rate=$(echo "${METRIC_TOKENS_UP} ${METRIC_WALL_TIME_S}" | awk '{printf "%.1f", $1 / $2}')
+  fi
+
+  echo "$agent token rate:"
+  echo "  output tokens: ${METRIC_TOKENS_UP:-0}"
+  echo "  wall time:     ${METRIC_WALL_TIME:-n/a} (${METRIC_WALL_TIME_S:-0}s)"
+  echo "  rate:          ${rate} tokens/sec"
+
+  create.result 0 "$rate"
+  return $(result)
+}
+
+scrumMaster.speed.measure.completion.agentName() # # agent names from hiveMind registry
+{
+  scrumMaster.pane.measure.completion.agentName
+}
+
+scrumMaster.speed.measure.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.subscription.measure() # <?session> # show overall subscription usage across all agents
+{ private.scrumMaster.measure.subscription "$@"; }
+
+private.scrumMaster.measure.subscription() # <?session> # show overall subscription usage across all agents
+{
+  local session="${1:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+  local registry="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+
+  if [ ! -f "$registry" ]; then
+    error.log "No hiveMind registry found"
+    create.result 1 "no registry"
+    return $(result)
+  fi
+
+  local totalUp=0
+  local totalDown=0
+  local agentCount=0
+
+  while IFS='|' read -r target role; do
+    [ -z "$role" ] && continue
+
+    local content
+    content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}" 2>/dev/null)
+    [ -z "$content" ] && continue
+
+    private.scrumMaster.parse.tokens "$content"
+
+    totalUp=$((totalUp + ${METRIC_TOKENS_UP:-0}))
+    totalDown=$((totalDown + ${METRIC_TOKENS_DOWN:-0}))
+    agentCount=$((agentCount + 1))
+  done < <(grep "^${session}:" "$registry" 2>/dev/null)
+
+  local total=$((totalUp + totalDown))
+
+  echo "Subscription Usage — session: $session"
+  echo "═══════════════════════════════════════════════"
+  echo "  agents measured: $agentCount"
+  echo "  total input:     $totalDown tokens"
+  echo "  total output:    $totalUp tokens"
+  echo "  combined:        $total tokens"
+  echo "═══════════════════════════════════════════════"
+
+  # Save subscription-level metric
+  local metricsDir="$(private.scrumMaster.metrics.dir.get)"
+  [ ! -d "$metricsDir" ] && mkdir -p "$metricsDir"
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  {
+    echo "METRIC_TYPE=\"subscription\""
+    echo "METRIC_SESSION=\"$session\""
+    echo "METRIC_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "METRIC_AGENT_COUNT=\"$agentCount\""
+    echo "METRIC_TOKENS_UP_TOTAL=\"$totalUp\""
+    echo "METRIC_TOKENS_DOWN_TOTAL=\"$totalDown\""
+    echo "METRIC_TOKENS_COMBINED=\"$total\""
+  } > "$metricsDir/subscription.${timestamp}.scenario.env"
+
+  create.result 0 "$total"
+  return $(result)
+}
+
+scrumMaster.subscription.measure.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+# ============================================================================
+# Measurement — OAuth API subscription metrics (CMM4, Task 29)
+# ============================================================================
+# The methods above (measure.pane, measure.team, etc.) scrape pane output for
+# per-agent activity metrics (tokens visible in TUI, timing, activity state).
+# The method below calls the Anthropic OAuth usage API for real subscription
+# utilization percentages — the actual rate-limit data.
+
+private.measure.subscription.api.auth() # # extract OAuth access token from macOS Keychain
+{
+  local rawCreds
+  rawCreds=$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$rawCreds" ]; then
+    error.log "Cannot access macOS Keychain for Claude Code credentials"
+    return 1
+  fi
+
+  local token expiresAt
+  if command -v python3 >/dev/null 2>&1; then
+    token=$(echo "$rawCreds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+    expiresAt=$(echo "$rawCreds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth'].get('expiresAt',''))" 2>/dev/null)
+  elif command -v jq >/dev/null 2>&1; then
+    token=$(echo "$rawCreds" | jq -r '.claudeAiOauth.accessToken' 2>/dev/null)
+    expiresAt=$(echo "$rawCreds" | jq -r '.claudeAiOauth.expiresAt // ""' 2>/dev/null)
+  else
+    error.log "Neither python3 nor jq available for JSON parsing"
+    return 1
+  fi
+
+  if [ -z "$token" ] || [ "$token" = "null" ]; then
+    error.log "Failed to extract OAuth token from Keychain credentials"
+    return 1
+  fi
+
+  # Check token expiry (expiresAt is epoch milliseconds)
+  if [ -n "$expiresAt" ] && command -v python3 >/dev/null 2>&1; then
+    local expired
+    expired=$(python3 -c "import time; print('yes' if time.time() > ${expiresAt}/1000 else 'no')" 2>/dev/null)
+    if [ "$expired" = "yes" ]; then
+      error.log "OAuth token expired — Claude Code will refresh it on next interaction"
+      return 1
+    fi
+  fi
+
+  echo "$token"
+  return 0
+}
+
+private.measure.subscription.api.parse() # <jsonResponse> # parse OAuth usage API response, sets SUBSCRIPTION_* variables
+{
+  local json="$1"
+  [ -z "$json" ] && return 1
+
+  SUBSCRIPTION_FIVE_HOUR_UTIL=""
+  SUBSCRIPTION_FIVE_HOUR_RESETS=""
+  SUBSCRIPTION_SEVEN_DAY_UTIL=""
+  SUBSCRIPTION_SEVEN_DAY_RESETS=""
+  SUBSCRIPTION_OPUS_UTIL=""
+  SUBSCRIPTION_OPUS_RESETS=""
+  SUBSCRIPTION_SONNET_UTIL=""
+  SUBSCRIPTION_SONNET_RESETS=""
+  SUBSCRIPTION_EXTRA_ENABLED="false"
+
+  local parsed
+  if command -v python3 >/dev/null 2>&1; then
+    parsed=$(echo "$json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    fh = d.get('five_hour') or {}
+    sd = d.get('seven_day') or {}
+    op = d.get('seven_day_opus') or {}
+    sn = d.get('seven_day_sonnet') or {}
+    ex = d.get('extra_usage') or {}
+    print(fh.get('utilization', '') if fh.get('utilization') is not None else '')
+    print(fh.get('resets_at', ''))
+    print(sd.get('utilization', '') if sd.get('utilization') is not None else '')
+    print(sd.get('resets_at', ''))
+    print(op.get('utilization', '') if isinstance(op, dict) and op.get('utilization') is not None else '')
+    print(op.get('resets_at', '') if isinstance(op, dict) else '')
+    print(sn.get('utilization', '') if isinstance(sn, dict) and sn.get('utilization') is not None else '')
+    print(sn.get('resets_at', '') if isinstance(sn, dict) else '')
+    print(str(ex.get('is_enabled', False)).lower())
+except Exception:
+    for _ in range(9): print('')
+" 2>/dev/null)
+  elif command -v jq >/dev/null 2>&1; then
+    parsed=$(echo "$json" | jq -r '
+      (.five_hour.utilization // ""),
+      (.five_hour.resets_at // ""),
+      (.seven_day.utilization // ""),
+      (.seven_day.resets_at // ""),
+      (if .seven_day_opus then (.seven_day_opus.utilization // "") else "" end),
+      (if .seven_day_opus then (.seven_day_opus.resets_at // "") else "" end),
+      (if .seven_day_sonnet then (.seven_day_sonnet.utilization // "") else "" end),
+      (if .seven_day_sonnet then (.seven_day_sonnet.resets_at // "") else "" end),
+      (.extra_usage.is_enabled // false)
+    ' 2>/dev/null)
+  else
+    error.log "Neither python3 nor jq available for JSON parsing"
+    return 1
+  fi
+
+  [ -z "$parsed" ] && return 1
+
+  local i=0
+  while IFS= read -r line; do
+    case $i in
+      0) SUBSCRIPTION_FIVE_HOUR_UTIL="$line" ;;
+      1) SUBSCRIPTION_FIVE_HOUR_RESETS="$line" ;;
+      2) SUBSCRIPTION_SEVEN_DAY_UTIL="$line" ;;
+      3) SUBSCRIPTION_SEVEN_DAY_RESETS="$line" ;;
+      4) SUBSCRIPTION_OPUS_UTIL="$line" ;;
+      5) SUBSCRIPTION_OPUS_RESETS="$line" ;;
+      6) SUBSCRIPTION_SONNET_UTIL="$line" ;;
+      7) SUBSCRIPTION_SONNET_RESETS="$line" ;;
+      8) SUBSCRIPTION_EXTRA_ENABLED="$line" ;;
+    esac
+    i=$((i + 1))
+  done <<< "$parsed"
+
+  return 0
+}
+
+scrumMaster.subscription.measure.api() # # real subscription utilization from Anthropic OAuth API
+{ private.scrumMaster.measure.subscription.api "$@"; }
+
+private.scrumMaster.measure.subscription.api() # # real subscription utilization from Anthropic OAuth API
+{
+  # Step 1: Authenticate via macOS Keychain
+  local token
+  token=$(private.measure.subscription.api.auth)
+  if [ $? -ne 0 ]; then
+    create.result 1 "auth failed"
+    return $(result)
+  fi
+
+  # Step 2: Call the OAuth usage API
+  local response
+  response=$(curl -s -f \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "Accept: application/json" \
+    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+
+  if [ $? -ne 0 ] || [ -z "$response" ]; then
+    error.log "OAuth usage API call failed"
+    create.result 1 "api call failed"
+    return $(result)
+  fi
+
+  # Step 3: Parse JSON response
+  private.measure.subscription.api.parse "$response"
+  if [ $? -ne 0 ]; then
+    error.log "Failed to parse API response"
+    create.result 1 "parse failed"
+    return $(result)
+  fi
+
+  # Step 4: Display results
+  echo "Subscription Utilization (OAuth API)"
+  echo "═══════════════════════════════════════════════"
+  echo "  5-hour window:   ${SUBSCRIPTION_FIVE_HOUR_UTIL:-n/a}%"
+  [ -n "$SUBSCRIPTION_FIVE_HOUR_RESETS" ] && \
+    echo "    resets at:     $SUBSCRIPTION_FIVE_HOUR_RESETS"
+  echo "  7-day window:    ${SUBSCRIPTION_SEVEN_DAY_UTIL:-n/a}%"
+  [ -n "$SUBSCRIPTION_SEVEN_DAY_RESETS" ] && \
+    echo "    resets at:     $SUBSCRIPTION_SEVEN_DAY_RESETS"
+  [ -n "$SUBSCRIPTION_OPUS_UTIL" ] && \
+    echo "  7-day opus:      ${SUBSCRIPTION_OPUS_UTIL}%"
+  [ -n "$SUBSCRIPTION_SONNET_UTIL" ] && \
+    echo "  7-day sonnet:    ${SUBSCRIPTION_SONNET_UTIL}%"
+  echo "  extra usage:     ${SUBSCRIPTION_EXTRA_ENABLED}"
+  echo "═══════════════════════════════════════════════"
+
+  # Step 5: Alert on high utilization
+  local fiveHourInt
+  fiveHourInt=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+
+  if [ "$fiveHourInt" -ge 90 ] 2>/dev/null; then
+    error.log "CRITICAL: 5-hour utilization at ${SUBSCRIPTION_FIVE_HOUR_UTIL}% — throttle all agents!"
+  elif [ "$fiveHourInt" -ge 80 ] 2>/dev/null; then
+    console.log "WARNING: 5-hour utilization at ${SUBSCRIPTION_FIVE_HOUR_UTIL}% — reduce activity"
+  fi
+
+  local sevenDayInt
+  sevenDayInt=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+
+  if [ "$sevenDayInt" -ge 90 ] 2>/dev/null; then
+    error.log "CRITICAL: 7-day utilization at ${SUBSCRIPTION_SEVEN_DAY_UTIL}% — stop non-essential work!"
+  elif [ "$sevenDayInt" -ge 80 ] 2>/dev/null; then
+    console.log "WARNING: 7-day utilization at ${SUBSCRIPTION_SEVEN_DAY_UTIL}% — reduce activity"
+  fi
+
+  # Step 6: Persist to ~/config/metrics/
+  local metricsDir="${CONFIG_PATH:-$HOME/config}/metrics"
+  [ ! -d "$metricsDir" ] && mkdir -p "$metricsDir"
+  local timestamp
+  timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
+  {
+    echo "METRIC_TYPE=\"subscription.api\""
+    echo "METRIC_TIMESTAMP=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
+    echo "SUBSCRIPTION_FIVE_HOUR_UTIL=\"${SUBSCRIPTION_FIVE_HOUR_UTIL:-}\""
+    echo "SUBSCRIPTION_FIVE_HOUR_RESETS=\"${SUBSCRIPTION_FIVE_HOUR_RESETS:-}\""
+    echo "SUBSCRIPTION_SEVEN_DAY_UTIL=\"${SUBSCRIPTION_SEVEN_DAY_UTIL:-}\""
+    echo "SUBSCRIPTION_SEVEN_DAY_RESETS=\"${SUBSCRIPTION_SEVEN_DAY_RESETS:-}\""
+    echo "SUBSCRIPTION_OPUS_UTIL=\"${SUBSCRIPTION_OPUS_UTIL:-}\""
+    echo "SUBSCRIPTION_SONNET_UTIL=\"${SUBSCRIPTION_SONNET_UTIL:-}\""
+    echo "SUBSCRIPTION_EXTRA_ENABLED=\"${SUBSCRIPTION_EXTRA_ENABLED:-false}\""
+  } > "$metricsDir/subscription.${timestamp}.scenario.env"
+  info.log "Metrics saved: $metricsDir/subscription.${timestamp}.scenario.env"
+
+  create.result 0 "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}"
+  return $(result)
+}
+
+scrumMaster.velocity.measure() # # velocity snapshot — subscription usage + task rate + burn assessment
+{ private.scrumMaster.measure.velocity "$@"; }
+
+private.scrumMaster.measure.velocity() # # velocity snapshot — subscription usage + task rate + burn assessment
+{
+  private.this.script.load ogit ogit.branch.get
+  # Get latest subscription data from stored metrics
+  local metricsDir="${CONFIG_PATH:-$HOME/config}/metrics"
+  local latestSub
+  latestSub=$(ls -t "$metricsDir"/subscription.*.scenario.env 2>/dev/null | head -1)
+
+  local fiveHourPct=0 sevenDayPct=0 dataSource="commits_only"
+  if [ -n "$latestSub" ]; then
+    source "$latestSub"
+    fiveHourPct=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+    sevenDayPct=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+    [ "$fiveHourPct" -gt 0 ] || [ "$sevenDayPct" -gt 0 ] && dataSource="api+commits"
+  fi
+
+  # Count today's completed tasks (commits on dev.claude today)
+  local tasksToday=0
+  if [ -d "$OOSH_DIR/.git" ]; then
+    # --since=midnight rides in the <range> slot: git log takes it the same way.
+    tasksToday=$(ogit.commit.log.show --since=midnight "" oneline "$OOSH_DIR" | wc -l | tr -d ' ')
+  fi
+
+  # Calculate burn rate via velocity.target
+  local burnRate
+  burnRate=$(private.scrumMaster.measure.velocity.target)
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+  # Token efficiency estimate based on tasks per 5-hour window
+  local tokensPerTask="low"
+  if [ "$tasksToday" -gt 0 ] && [ "$fiveHourPct" -gt 0 ]; then
+    local ratio=$(( fiveHourPct / tasksToday ))
+    if [ "$ratio" -gt 15 ]; then
+      tokensPerTask="high"
+    elif [ "$ratio" -gt 8 ]; then
+      tokensPerTask="medium"
+    fi
+  fi
+
+  # When no API data, burn rate is unknown — don't mislead
+  [ "$dataSource" = "commits_only" ] && burnRate="no_api_data"
+
+  # Output env-style
+  echo "VELOCITY_FIVE_HOUR_PCT=$fiveHourPct"
+  echo "VELOCITY_SEVEN_DAY_PCT=$sevenDayPct"
+  echo "VELOCITY_TASKS_TODAY=$tasksToday"
+  echo "VELOCITY_TOKENS_PER_TASK_EST=$tokensPerTask"
+  echo "VELOCITY_BURN_RATE=$burnRate"
+  echo "VELOCITY_DATA_SOURCE=$dataSource"
+  echo "VELOCITY_TIMESTAMP=$timestamp"
+
+  # Persist
+  local velDir="$(ogit.repo.root.get)/session/metrics"
+  [ ! -d "$velDir" ] && mkdir -p "$velDir"
+  local tsFile
+  tsFile=$(date -u "+%Y%m%dT%H%M%SZ")
+  {
+    echo "VELOCITY_FIVE_HOUR_PCT=$fiveHourPct"
+    echo "VELOCITY_SEVEN_DAY_PCT=$sevenDayPct"
+    echo "VELOCITY_TASKS_TODAY=$tasksToday"
+    echo "VELOCITY_TOKENS_PER_TASK_EST=$tokensPerTask"
+    echo "VELOCITY_BURN_RATE=$burnRate"
+    echo "VELOCITY_DATA_SOURCE=$dataSource"
+    echo "VELOCITY_TIMESTAMP=$timestamp"
+  } > "$velDir/velocity.${tsFile}.scenario.env"
+  info.log "Velocity saved: $velDir/velocity.${tsFile}.scenario.env"
+}
+
+scrumMaster.velocity.measure.completion() { :; }
+
+scrumMaster.velocity.measure.target() # # calculate burn rate — too_fast, on_target, or too_slow
+{ private.scrumMaster.measure.velocity.target "$@"; }
+
+private.scrumMaster.measure.velocity.target() # # calculate burn rate — too_fast, on_target, or too_slow
+{
+  # Use seven_day as primary metric (more stable than five_hour which resets)
+  local metricsDir="${CONFIG_PATH:-$HOME/config}/metrics"
+  local latestSub
+  latestSub=$(ls -t "$metricsDir"/subscription.*.scenario.env 2>/dev/null | head -1)
+
+  local sevenDayPct=0
+  if [ -n "$latestSub" ]; then
+    source "$latestSub"
+    sevenDayPct=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+  fi
+
+  # Ideal: 7-day limit spread over 7 days = ~14.3% per day
+  # Actual: sevenDayPct / days_elapsed_this_week
+  local dayOfWeek
+  dayOfWeek=$(date +%u)  # 1=Mon, 7=Sun
+  [ "$dayOfWeek" -eq 0 ] && dayOfWeek=7
+
+  # Expected usage at this point in the week
+  local expectedPct=$(( (dayOfWeek * 100) / 7 ))
+
+  # Velocity ratio: actual / expected (scaled by 100 for integer math)
+  if [ "$expectedPct" -gt 0 ]; then
+    local ratioX100=$(( (sevenDayPct * 100) / expectedPct ))
+    if [ "$ratioX100" -gt 120 ]; then
+      echo "too_fast"
+    elif [ "$ratioX100" -lt 80 ]; then
+      echo "too_slow"
+    else
+      echo "on_target"
+    fi
+  else
+    echo "on_target"
+  fi
+}
+scrumMaster.velocity.measure.target.completion() { :; }
+
+scrumMaster.evaluate.measure() # # single health check — subscription + velocity + verdict
+{ private.scrumMaster.measure.evaluate "$@"; }
+
+private.scrumMaster.measure.evaluate() # # single health check — subscription + velocity + verdict
+{
+  private.this.script.load ogit ogit.branch.get
+  # Step 1: Read cached subscription data (avoid API call per evaluation)
+  local metricsDir="${CONFIG_PATH:-$HOME/config}/metrics"
+  local latestSub
+  latestSub=$(ls -t "$metricsDir"/subscription.*.scenario.env 2>/dev/null | head -1)
+
+  local fiveHourPct=0 sevenDayPct=0
+  if [ -n "$latestSub" ]; then
+    source "$latestSub"
+    fiveHourPct=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+    sevenDayPct=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+  fi
+
+  # Step 2: Get burn rate
+  local burnRate
+  burnRate=$(private.scrumMaster.measure.velocity.target)
+
+  # Step 3: Evaluate thresholds — most severe first
+  local evalResult="on_target"
+  local alert="none"
+
+  if [ "$fiveHourPct" -ge 90 ] || [ "$sevenDayPct" -ge 90 ]; then
+    evalResult="stand_down_90"
+    alert="STAND_DOWN — utilization >= 90%"
+  elif [ "$fiveHourPct" -ge 80 ] || [ "$sevenDayPct" -ge 80 ]; then
+    evalResult="quota_80"
+    alert="QUOTA_80 — utilization >= 80%, reduce activity"
+  elif [ "$burnRate" = "too_fast" ]; then
+    evalResult="throttle"
+    alert="THROTTLE — burn rate too high"
+  elif [ "$burnRate" = "too_slow" ]; then
+    evalResult="increase"
+    alert="INCREASE — burn rate too low, capacity available"
+  fi
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+  # Step 4: Output env-style
+  echo "EVALUATE_RESULT=$evalResult"
+  echo "EVALUATE_FIVE_HOUR=$fiveHourPct"
+  echo "EVALUATE_SEVEN_DAY=$sevenDayPct"
+  echo "EVALUATE_BURN_RATE=$burnRate"
+  echo "EVALUATE_ALERT=$alert"
+  echo "EVALUATE_TIMESTAMP=$timestamp"
+
+  # Step 5: Append to alerts log if not on_target
+  if [ "$evalResult" != "on_target" ]; then
+    local alertsLog="$(ogit.repo.root.get)/session/metrics/alerts.log"
+    [ ! -d "$(dirname "$alertsLog")" ] && mkdir -p "$(dirname "$alertsLog")"
+    echo "$timestamp $evalResult $alert" >> "$alertsLog"
+  fi
+}
+scrumMaster.evaluate.measure.completion() { :; }
+
+# ============================================================================
+# CMM4 PDCA Health Check — full cycle (Task 40.5)
+# ============================================================================
+# Single command for SM: refresh API → velocity → evaluate → alert orchestrator
+# Run every 30 minutes as part of the feedback loop.
+
+scrumMaster.health.measure() # # full PDCA health check — refresh, evaluate, alert
+{ private.scrumMaster.measure.health "$@"; }
+
+private.scrumMaster.measure.health() # # full PDCA health check — refresh, evaluate, alert
+{
+  # Step 1: PLAN — refresh subscription data from API
+  local apiOk="yes"
+  private.scrumMaster.measure.subscription.api > /dev/null 2>&1 || apiOk="no"
+
+  # Step 2: DO — snapshot velocity
+  private.scrumMaster.measure.velocity > /dev/null 2>&1
+
+  # Step 3: CHECK — evaluate thresholds
+  local evalOutput
+  evalOutput=$(private.scrumMaster.measure.evaluate)
+
+  # Parse evaluation result
+  local evalResult="" evalAlert=""
+  evalResult=$(echo "$evalOutput" | grep '^EVALUATE_RESULT=' | cut -d= -f2)
+  evalAlert=$(echo "$evalOutput" | grep '^EVALUATE_ALERT=' | cut -d= -f2-)
+
+  # Step 4: ACT — send alert to orchestrator if deviation detected
+  if [ "$evalResult" != "on_target" ] && [ "$evalAlert" != "none" ]; then
+    "$OOSH_DIR/hiveMind" agent.send orchestrator "ALERT: $evalAlert" 2>/dev/null || \
+      warn.log "Could not send alert to orchestrator — hiveMind unavailable"
+    console.log "HEALTH: $evalAlert"
+  else
+    console.log "HEALTH: on_target — no action needed"
+  fi
+
+  # Output for caller (SM can parse or ignore)
+  echo "$evalOutput"
+  echo "HEALTH_API_REFRESH=$apiOk"
+  echo "HEALTH_ACTION=$([ "$evalResult" != "on_target" ] && echo "alerted" || echo "none")"
+}
+scrumMaster.health.measure.completion() { :; }
+
+# ============================================================================
+# Structured KPI Logging — per-cycle metrics (Task from PO)
+# ============================================================================
+# Logs: (1) tokens/hour per agent, (2) max tokens per model, (3) velocity,
+#       (4) time until compact prediction, (5) CMM4 velocity/wait per agent
+
+scrumMaster.metrics.cycle() # <?session> # log structured KPIs for all agents
+{
+  local session="${1:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+  local registry="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  local metricsDir="$(private.scrumMaster.metrics.dir.get)"
+  local kpiLog="$metricsDir/kpi.log"
+
+  [ ! -d "$metricsDir" ] && mkdir -p "$metricsDir"
+
+  local timestamp
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  local epoch
+  epoch=$(date +%s)
+
+  # Model max tokens (Claude limits)
+  local CLAUDE_OPUS_MAX=200000
+  local CLAUDE_SONNET_MAX=200000
+  local CLAUDE_HAIKU_MAX=200000
+
+  # Get subscription velocity (cached from API)
+  local velFive=0 velSeven=0 velBurn="unknown"
+  local latestSub="${CONFIG_PATH:-$HOME/config}/metrics"
+  latestSub=$(ls -t "$latestSub"/subscription.*.scenario.env 2>/dev/null | head -1)
+  if [ -n "$latestSub" ]; then
+    source "$latestSub"
+    velFive=$(echo "${SUBSCRIPTION_FIVE_HOUR_UTIL:-0}" | awk '{printf "%d", $1}')
+    velSeven=$(echo "${SUBSCRIPTION_SEVEN_DAY_UTIL:-0}" | awk '{printf "%d", $1}')
+  fi
+  velBurn=$(private.scrumMaster.measure.velocity.target 2>/dev/null)
+
+  # Start KPI entry
+  {
+    echo "───────────────────────────────────────────────"
+    echo "CYCLE_TIMESTAMP=$timestamp"
+    echo "SESSION=$session"
+    echo ""
+    echo "# Subscription Velocity"
+    echo "VELOCITY_FIVE_HOUR_PCT=$velFive"
+    echo "VELOCITY_SEVEN_DAY_PCT=$velSeven"
+    echo "VELOCITY_BURN_RATE=$velBurn"
+    echo "MODEL_OPUS_MAX_TOKENS=$CLAUDE_OPUS_MAX"
+    echo "MODEL_SONNET_MAX_TOKENS=$CLAUDE_SONNET_MAX"
+    echo ""
+    echo "# Per-Agent KPIs"
+  } >> "$kpiLog"
+
+  # Iterate all agents
+  if [ -f "$registry" ]; then
+    while IFS='|' read -r target role; do
+      [ -z "$role" ] && continue
+      [[ "$target" != "$session:"* ]] && continue
+
+      local content
+      content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}" 2>/dev/null)
+      [ -z "$content" ] && continue
+
+      # Parse metrics
+      private.scrumMaster.parse.tokens "$content"
+      private.scrumMaster.parse.timing "$content"
+      private.scrumMaster.parse.state "$content"
+
+      # Tokens per hour calculation
+      local tokensTotal=$(( ${METRIC_TOKENS_UP:-0} + ${METRIC_TOKENS_DOWN:-0} ))
+      local wallSecs=${METRIC_WALL_TIME_S:-0}
+      local tokensPerHour=0
+      if [ "$wallSecs" -gt 0 ]; then
+        tokensPerHour=$(echo "$tokensTotal $wallSecs" | awk '{printf "%d", ($1 / $2) * 3600}')
+      fi
+
+      # Context percentage (time until compact prediction)
+      local contextPct
+      contextPct=$("$OOSH_DIR/claudeCode" context.read "$target" 2>/dev/null)
+      [ -z "$contextPct" ] && contextPct="above-threshold"
+
+      # Time until compact prediction (rough estimate)
+      # Assume ~1% context per 30s of active work
+      local compactEta="n/a"
+      if [ "$contextPct" != "above-threshold" ] && [ "$contextPct" -gt 0 ] 2>/dev/null; then
+        if [ "${METRIC_STATE:-unknown}" = "active" ] && [ "$tokensPerHour" -gt 0 ]; then
+          # Estimate: remaining context / burn rate
+          local minsRemaining=$(( contextPct * 2 ))  # ~2 mins per percent at active rate
+          compactEta="${minsRemaining}m"
+        elif [ "$contextPct" -le 20 ]; then
+          compactEta="CRITICAL"
+        fi
+      fi
+
+      # CMM4 velocity/wait state
+      local cmm4State="idle"
+      case "${METRIC_STATE:-unknown}" in
+        active)     cmm4State="working" ;;
+        completed)  cmm4State="ready" ;;
+        permission) cmm4State="blocked" ;;
+        idle)       cmm4State="waiting" ;;
+      esac
+
+      {
+        echo ""
+        echo "[$role]"
+        echo "  target=$target"
+        echo "  tokens_up=${METRIC_TOKENS_UP:-0}"
+        echo "  tokens_down=${METRIC_TOKENS_DOWN:-0}"
+        echo "  tokensPerHour=$tokensPerHour"
+        echo "  wall_time=${METRIC_WALL_TIME:-n/a}"
+        echo "  think_time=${METRIC_THINK_TIME_S:-0}s"
+        echo "  contextPct=$contextPct"
+        echo "  compactEta=$compactEta"
+        echo "  cmm4State=$cmm4State"
+        echo "  activity=${METRIC_ACTIVITY:-none}"
+      } >> "$kpiLog"
+
+    done < "$registry"
+  fi
+
+  {
+    echo ""
+    echo "═══════════════════════════════════════════════"
+    echo ""
+  } >> "$kpiLog"
+
+  # Also output summary to console
+  echo "KPIs logged: $kpiLog"
+  echo "  velocity: ${velFive}% 5h, ${velSeven}% 7d, burn=$velBurn"
+
+  create.result 0 "$kpiLog"
+  return $(result)
+}
+scrumMaster.metrics.cycle.completion() { :; }
+
 scrumMaster.usage()
 {
   local this=${0##*/}
   echo "You started"
   echo "$0
 
-  scrumMaster - PDCA State Machine Manager
+  scrumMaster - PDCA State Machine Manager + CMM4 Measurement
 
-  Implements the CMM3-compliant PDCA cycle:
+  PDCA (CMM3):
   P → D → C → A → C → A → C → A ... → finished
-
-  After Check, you Act (fix). Then re-Check.
   Loop C→A until Check passes or max iterations.
+
+  MEASUREMENT (CMM4):
+  Extract metrics from agent panes — tokens, timing, activity state.
+  Persist to session/metrics/ for trend analysis.
 
   Usage:
   $this: command   Parameter and Description"
   this.help
   echo "
 
-  Examples
+  PDCA Examples:
     $this pdca.start              # Start new PDCA cycle
     $this pdca.start MYPDCA 3     # Start with 3 errors to fix
     $this pdca.state              # Show current state
@@ -352,7 +1821,36 @@ scrumMaster.usage()
     $this pdca.errors MYPDCA 5    # Set 5 errors
     $this pdca.run                # Run complete cycle
     $this pdca.reset              # Reset machine
+
+  Measurement Examples (agent activity — pane scraping):
+    $this pane.measure oosh-expert       # Metrics for one agent
+    $this team.measure                   # Metrics for all agents
+    $this context.measure oosh-expert    # Token consumption
+    $this speed.measure oosh-expert      # Token rate (tokens/sec)
+    $this subscription.measure           # Pane-scraped token totals
+
+  Subscription API (real utilization — OAuth):
+    $this subscription.measure.api       # Real utilization % from Anthropic API
+
+  CMM4 Feedback Loop (PDCA health check):
+    $this health.measure                 # Full cycle: API refresh + velocity + evaluate + alert
+    $this velocity.measure               # Velocity snapshot (burn rate + tasks)
+    $this velocity.measure.target        # Burn rate classification
+    $this evaluate.measure               # Threshold evaluation with alert logging
   "
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER COMPLETIONS (shared across all methods)
+# ─────────────────────────────────────────────────────────────────────────────
+
+scrumMaster.parameter.completion.machineName() {
+  source state 2>/dev/null
+  state.parameter.completion.machine "$@"
+}
+
+scrumMaster.parameter.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
 scrumMaster.start()

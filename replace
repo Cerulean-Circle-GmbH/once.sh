@@ -5,18 +5,254 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+replace.block()     # <file> <startLine> <endLine> # selects the whole block from <startLine> to <endLine> inclusive, exactly one of them; continue with `by <newText>` — `by ""` deletes it #
+{
+  # A SELECTOR, like replace.line and replace.within: it only records what to
+  # act on and hands the chain forward via RETURN. replace.by does the write
+  # and owns the result — which is why there is no create.result here.
+  #
+  # Both patterns are WHOLE LINES, matched literally (grep -x -F / awk ==),
+  # never regexes: the block this exists to remove is a shell function, whose
+  # first line contains (), $, quotes and often a docstring.
+  FILE="$1"
+  shift
+  SEARCH_EXPRESSION="$1"
+  shift
+  BLOCK_END_EXPRESSION="$1"
+  shift
+  REPLACE_ANCHOR="block"
+  export REPLACE_ANCHOR BLOCK_END_EXPRESSION
+  RETURN=$1
+}
 
-replace.by()
+
+replace.block.completion.file() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+replace.block.completion.startLine() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+replace.block.completion.endLine() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+replace.word()     # <file> <word> # every WHOLE-WORD occurrence of <word> on every line, not when part of a longer or dotted name (a rerun is a no-op); continue with `by <newText>` #
+{
+ # A SELECTOR, like replace.line and replace.block: it records what to act
+ # on and hands the chain forward via RETURN; replace.by does the write and
+ # owns the result. It exists to RENAME an identifier: `replace line`
+ # refuses a line that occurs twice, and `replace within` takes only the
+ # first substring on each line and re-matches its own output
+ # (step → debug.step → debug.debug.step).
+ FILE="$1"
+ shift
+ SEARCH_EXPRESSION="$1"
+ shift
+ REPLACE_ANCHOR="word"
+ export REPLACE_ANCHOR
+ RETURN=$1
+}
+
+
+replace.word.completion.file() {
+  # one candidate per line on stdout; $1 is the word being completed
+  compgen -f "$1"
+}
+replace.word.completion.word() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+replace.lines()     # <file> <exactLine> # every WHOLE line equal to <exactLine>, one or more of them (identical duplicates too); continue with `by <newText>` #
+{
+ # A SELECTOR, like replace.line: it records what to act on and hands the
+ # chain forward via RETURN; replace.by does the write and owns the result.
+ # `replace line` refuses a line that occurs twice — right for a marker, wrong
+ # for a value that must hold on EVERY such line (promote's OOSH_SELF_BRANCH
+ # default). Still whole lines only, matched literally; none is a refusal.
+ FILE="$1"
+ shift
+ SEARCH_EXPRESSION="$1"
+ shift
+ REPLACE_ANCHOR="lines"
+ export REPLACE_ANCHOR
+ RETURN=$1
+}
+
+
+replace.lines.completion.file() {
+  # one candidate per line on stdout; $1 is the word being completed
+  compgen -f "$1"
+}
+replace.lines.completion.exactLine() {
+  # one candidate per line on stdout; $1 is the word being completed
+  echo ""
+}
+private.replace.copy.make()     # <file> <content> <next> # write <content> into the new file <next> and give it the whole mode of <file> afterwards (kernel stat getter + chmod) and its group when the caller may; rc 1 and <next> removed when the copy or the mode fails #
+{
+ # The new file is written FIRST and given the mode AFTERWARDS: cp -p gave the
+ # copy the original's mode before the content went in, so a 0444 / 0555 file
+ # of a normal user refused the write (EACCES); and BusyBox cp -p, run by a
+ # dev-group member who does not own the file, printed "can't preserve
+ # ownership" on every commit. The mode comes from the kernel getter, the
+ # group through chgrp when the caller may — silent when not (best effort: the
+ # setgid directories of the shared tree hand new files the group anyway).
+ local file="$1" content="$2" next="$3" mode group
+ if [ -z "$file" ] || [ -z "$content" ] || [ -z "$next" ]; then
+   create.result 1 "private.replace.copy.make requires <file> <content> <next>"; return $(result)
+ fi
+ mode=$(private.this.path.stat.get "$file" mode)
+ group=$(private.this.path.stat.get "$file" group)
+ if [ -z "$mode" ] || ! cat "$content" > "$next" || ! chmod "$mode" "$next"; then
+   rm -f "$next"
+   create.result 1 "could not write $next with the content of $content and the mode of $file"; return $(result)
+ fi
+ [ -n "$group" ] && chgrp "$group" "$next" 2>/dev/null
+ create.result 0 "${next##*/} written with the mode of ${file##*/}"
+ return $(result)
+}
+
+
+### new.method
+
+
+replace.by() # <newText> # completes `replace within`, `line`, `block` or `word`; writes the transformed copy to <file>.new
 {
   REPLACE_EXPRESSION="$1"
   shift
-  if [[ $FILE == *.new ]]; then
-    awk -v place="$SEARCH_EXPRESSION" -v replace="$REPLACE_EXPRESSION" '{sub(place,replace); print}' $FILE > $FILE.new
-    replace commit "$FILE"
-    replace cleanup "$FILE"
-  else
-    awk -v place="$SEARCH_EXPRESSION" -v replace="$REPLACE_EXPRESSION" '{sub(place,replace); print}' $FILE > $FILE.new
+
+  # Use perl instead of awk — BSD awk cannot handle newlines in -v strings
+  # Export vars so perl can access them via %ENV
+  export SEARCH_EXPRESSION
+  export REPLACE_EXPRESSION
+
+  if [ "$REPLACE_ANCHOR" = "block" ]; then
+    # Whole BLOCK, from <startLine> to <endLine> inclusive, and exactly one of
+    # them. `by ""` deletes it; `by "<text>"` swaps the whole block for <text>.
+    # This is what `oo method.delete` removes a function with — a method is a
+    # block, not a line, and deleting it by hand is how docstrings and
+    # completion functions get orphaned.
+    local starts; starts=$(grep -c -x -F -- "$SEARCH_EXPRESSION" "$FILE" 2>/dev/null)
+    unset REPLACE_ANCHOR
+    if [ "${starts:-0}" != "1" ]; then
+      create.result 1 "replace block: start '$SEARCH_EXPRESSION' matches ${starts:-0} whole line(s) in $FILE — expected exactly 1, refusing"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    # Same reasoning as the line form: awk, not perl (Alpine ships no perl),
+    # and ENVIRON, not -v (awk processes escapes in a -v assignment).
+    export BLOCK_END_EXPRESSION
+    if ! awk 'BEGIN{s=ENVIRON["SEARCH_EXPRESSION"];e=ENVIRON["BLOCK_END_EXPRESSION"];r=ENVIRON["REPLACE_EXPRESSION"]}
+              !inBlock && !closed && $0==s {inBlock=1; next}
+              inBlock && $0==e {inBlock=0; closed=1; if (r != "") print r; next}
+              inBlock {next}
+              {print}
+              END{ if (inBlock) exit 3 }' "$FILE" > "$FILE.new"; then
+      create.result 1 "replace block: no '$BLOCK_END_EXPRESSION' line after '$SEARCH_EXPRESSION' in $FILE"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    create.result 0 "$FILE.new written" "$1"
+    return $(result)
   fi
+
+  if [ "$REPLACE_ANCHOR" = "word" ]; then
+    # Every WHOLE-WORD occurrence, on every line: a hit counts only when the
+    # characters around it are not [A-Za-z0-9_.] — so `debug.step`, `step.x`,
+    # `stepping` and `my_step` are other words, and a rerun matches nothing.
+    # awk with index(), not perl or a regex: Alpine ships no perl, and <word>
+    # is literal text that may contain dots. ENVIRON, not -v (escapes).
+    unset REPLACE_ANCHOR
+    if ! awk 'function isWord(c) { return c ~ /[A-Za-z0-9_.]/ }
+              BEGIN{s=ENVIRON["SEARCH_EXPRESSION"];r=ENVIRON["REPLACE_EXPRESSION"];n=0;len=length(s)}
+              {
+                out=""; rest=$0
+                while (len > 0 && (i=index(rest, s)) > 0) {
+                  before = (i > 1) ? substr(rest, i-1, 1) : substr(out, length(out), 1)
+                  after = substr(rest, i+len, 1)
+                  if (!isWord(before) && !isWord(after)) { out = out substr(rest, 1, i-1) r; n++ }
+                  else { out = out substr(rest, 1, i-1+len) }
+                  rest = substr(rest, i+len)
+                }
+                print out rest
+              }
+              END{ if (n == 0) exit 3 }' "$FILE" > "$FILE.new"; then
+      rm -f "$FILE.new"
+      create.result 1 "replace word: no whole-word '$SEARCH_EXPRESSION' in $FILE"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    create.result 0 "$FILE.new written" "$1"
+    return $(result)
+  fi
+
+  if [ "$REPLACE_ANCHOR" = "line" ] || [ "$REPLACE_ANCHOR" = "lines" ]; then
+    # Whole line, and exactly one of them. `replace within` matches a
+    # SUBSTRING, and `perl -pe` loops over every line, so it rewrites the
+    # first match on EVERY line that contains one. Running `oo method.new
+    # oo.something` used to corrupt oo's own source that way: the marker text
+    # "### new.method" appears both as the real marker and inside the tool's
+    # own string literal one line above it.
+    # `lines` (replace.lines): every equal whole line, one or more.
+    local matches anchor="$REPLACE_ANCHOR"; matches=$(grep -c -x -F -- "$SEARCH_EXPRESSION" "$FILE" 2>/dev/null)
+    unset REPLACE_ANCHOR
+    if [ "$anchor" = "lines" ] && [ "${matches:-0}" = "0" ]; then
+      create.result 1 "replace lines: '$SEARCH_EXPRESSION' matches no whole line in $FILE — refusing"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    if [ "$anchor" = "line" ] && [ "${matches:-0}" != "1" ]; then
+      create.result 1 "replace line: '$SEARCH_EXPRESSION' matches ${matches:-0} whole line(s) in $FILE — expected exactly 1, refusing"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    # awk, NOT perl. Alpine ships no perl at all, so `replace` — and therefore
+    # `oo method.new`, which is the whole point of the whole-line form — could
+    # not run there. Caught by the alpine platform gate on f386f87: three tests
+    # red with "replace line returned 1". busybox awk is enough for an
+    # equality test, and this is the path the method tool uses.
+    #
+    # ENVIRON, not `-v`: awk processes escape sequences in a -v assignment, so
+    # a backslash anywhere in the generated method body would be mangled.
+    if ! awk 'BEGIN{s=ENVIRON["SEARCH_EXPRESSION"];r=ENVIRON["REPLACE_EXPRESSION"]}
+              $0==s{print r; next}{print}' "$FILE" > "$FILE.new"; then
+      create.result 1 "replace line: could not write $FILE.new"
+      error.log "$RESULT"
+      return $(result)
+    fi
+    create.result 0 "$FILE.new written" "$1"
+    return $(result)
+  fi
+
+  # The substring form still needs perl for its literal \Q…\E match. That is a
+  # pre-existing dependency, unchanged here, and it is why `replace within`
+  # does not work on a host without perl — its own card.
+  if ! perl -pe 's/\Q$ENV{SEARCH_EXPRESSION}\E/$ENV{REPLACE_EXPRESSION}/' "$FILE" > "$FILE.new"; then
+    create.result 1 "replace by: could not write $FILE.new (perl absent? `replace within` requires it)"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  if [[ $FILE == *.new ]]; then
+    replace commit "$FILE" || return 1
+    replace cleanup "$FILE"
+  fi
+  # create.result's THIRD argument is the chaining marker. This used to be a
+  # bare `RETURN=$1` as the last statement, which pinned the exit status at 0 —
+  # the same defect oo.cmd carried until 8928c3e, and the reason a failed
+  # substitution could be followed by an unconditional `replace commit`.
+  create.result 0 "$FILE.new written" "$1"
+  return $(result)
+}
+
+replace.line() # <file> <exactLine> # like `replace within`, but the search must match a WHOLE line and exactly one of them; continue with `by <newText>`
+{
+  FILE="$1"
+  shift
+  SEARCH_EXPRESSION=$1
+  shift
+  REPLACE_ANCHOR="line"
+  export REPLACE_ANCHOR
   RETURN=$1
 }
 
@@ -49,45 +285,100 @@ replace.diff()
  diff "$FILE" "$FILE.new"
 }
 
-replace.commit()
+replace.commit() # <file> # swap the transformed copy in: <file> becomes <file>.bak, the content of <file>.new takes the name with the whole mode of the original
 {
   FILE="$1"
-  check file "$FILE.bak" exists call rm "$FILE.bak"
-  chmod -x "$FILE"
+  # REFUSE a symlink. The swap below would `chmod -x` the link's TARGET, move
+  # the LINK aside and put the edit down as a plain file under the link's name
+  # — top-level `c2 -> ng/c2` became a stale copy with ng/c2 no longer
+  # executable. Callers edit the target (private.this.path.canonical).
+  if [ -L "$FILE" ]; then
+    create.result 1 "replace commit: $FILE is a symlink — refusing; commit its target $(private.this.path.canonical "$FILE")"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  # REFUSE without the working copy. This used to run unconditionally: the
+  # first `mv` displaced the original to .bak, the second failed because
+  # .new was never written, and the script was left with NO file under its
+  # own name. private.oo.new.method calls this whether or not any
+  # substitution matched, so it was one failed `replace within` away from
+  # deleting the script it was editing.
+  if [ ! -f "$FILE.new" ]; then
+    create.result 1 "replace commit: $FILE.new does not exist — nothing to commit, refusing (committing anyway would leave $FILE with no file under its own name)"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  # Use standard bash test - works on case-insensitive APFS
+  # rm -f: the .bak of a read-only file is read-only, and a plain rm asks
+  # "remove write-protected file?" on a terminal (T-REPLACE-COMMIT-READ-ONLY).
+  [ -f "$FILE.bak" ] && rm -f "$FILE.bak"
+  # The WHOLE mode of the original stays (and its group; its owner as root):
+  # `mv <file>.new <file>` put the editor's umask under the name — on the
+  # shared tree a 664 script came back 644 and the next dev-group user could
+  # not edit it; only the exec bit was put back. A new file takes the new
+  # content, then the original's mode (private.replace.copy.make — written
+  # first, so a read-only original works too), then the name. Not written
+  # INTO the original: a running bash script (oo method.new oo.x edits oo)
+  # reads on from its offset in the file it opened, and must go on reading
+  # the old content — which mv keeps as the .bak.
+  # The .bak is made non-executable so completion never lists it as a command.
+  local next="$FILE.new.$$"
+  if ! private.replace.copy.make "$FILE" "$FILE.new" "$next" >/dev/null; then
+    create.result 1 "replace commit: $RESULT — $FILE is unchanged"
+    error.log "$RESULT"
+    return $(result)
+  fi
   mv "$FILE" "$FILE.bak"
-  mv "$FILE.new" "$FILE"
-  chmod +x "$FILE"
+  chmod -x "$FILE.bak" 2>/dev/null   # a .bak of a file another user owns keeps its mode
+  mv "$next" "$FILE"
+  rm -f "$FILE.new"
+  create.result 0 "$FILE committed, previous kept as $FILE.bak"
+  return $(result)
 }
 
-replace.rollback()
+replace.rollback() # <file> # undo: drop an uncommitted <file>.new, else write <file>.bak back into <file> (the committed edit is kept as <file>.new); refuses when there is neither
 {
   FILE="$1"
   if [ -f "$FILE.new" ]; then
-    rm "$FILE"
+    rm -f "$FILE.new"
+  elif [ ! -f "$FILE.bak" ]; then
+    # It used to move <file> to <file>.new and then fail to move a missing
+    # .bak back: nothing was left under the file's own name.
+    create.result 1 "replace rollback: neither $FILE.new nor $FILE.bak exists — nothing to roll back, $FILE is unchanged"
+    error.log "$RESULT"
+    return $(result)
   else
+    # As replace.commit: a new file takes the .bak content, then the whole
+    # mode of <file> (private.replace.copy.make), then the name; the committed
+    # edit is kept as <file>.new.
+    local next="$FILE.new.$$"
+    if ! private.replace.copy.make "$FILE" "$FILE.bak" "$next" >/dev/null; then
+      create.result 1 "replace rollback: $RESULT — $FILE is unchanged, the previous content is in $FILE.bak"
+      error.log "$RESULT"
+      return $(result)
+    fi
     mv "$FILE" "$FILE.new"
-    mv "$FILE.bak" "$FILE"
-    chmod +x "$FILE"
+    mv "$next" "$FILE"
+    rm -f "$FILE.bak"
   fi
-
+  create.result 0 "$FILE rolled back"
+  return $(result)
 }
 
 replace.cleanup()
 {
   if [ -n "$1" ]; then
-    if check file $1.bak exists
-    then
-      rm $1.bak
-    fi
-
-    if check file $OOSH_DIR/$1.new exists
-    then
-      rm $1.new
-    fi
+    # Use standard bash test - works on case-insensitive APFS
+    # -f: a read-only .bak / .new must not ask on a terminal
+    [ -f "$1.bak" ] && rm -f "$1.bak"
+    [ -f "$1.new" ] && rm -f "$1.new"
   else
-    rm $OOSH_DIR/*.bak
-    rm $OOSH_DIR/*.new
+    rm -f $OOSH_DIR/*.bak 2>/dev/null
+    rm -f $OOSH_DIR/*.new 2>/dev/null
   fi
+  # rc 0 always: the `[ -f … ] && rm …` above leaves 1 behind when there was
+  # nothing to clean, which broke every `… && replace cleanup` chain.
+  return 0
 }
 
 
@@ -108,17 +399,23 @@ $0
       rollback          filename
       diff              filename
 
-      by        <replace expression> 
+      by        <replace expression>
       by.file
-      within        <filename> <search expression>
+      within        <filename> <search expression>   substring, every line
+      line          <filename> <exact line>          whole line, exactly one match
+      block         <filename> <start line> <end line>   whole block, exactly one match; `by \"\"` deletes it
+      word          <filename> <word>                   every whole-word occurrence (rename an identifier)
 
       cleanup
 
-  
+
   Examples
     $this init
 
     replace within some.File.txt \"hello\" by \"servus\"
+    replace line   some.File.txt \"### new.method\" by \"inserted\"
+    replace block  some.File.txt \"victim() {\" \"}\" by \"\"        # delete a whole function
+    replace word   some.File.txt step by debug.step               # rename an identifier
     replace diff some.File.txt
     replace commit some.File.txt
 

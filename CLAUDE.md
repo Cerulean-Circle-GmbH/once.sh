@@ -41,9 +41,13 @@ These scripts wrap external tools with oosh method syntax for easier use:
 
 | Wrapper | Wraps | Common Methods |
 |---------|-------|----------------|
+| `oo` | OOSH framework lifecycle | `oo mode <branch>`, `oo update` (pulls + self-heals symlinks), `oo user.fix` (repair `~/config` + `~/oosh`), `oo checkout`, `oo stage testing/prod` |
 | `claudeCode` | Claude Code CLI | `claudeCode session`, `claudeCode resume` |
 | `claudeFlow` | Claude Flow orchestration | `claudeFlow tmux.init`, `claudeFlow list`, `claudeFlow swarm.status` |
 | `otmux` | tmux terminal multiplexer | `otmux new`, `otmux list`, `otmux attach` |
+| `ogit` | git | `ogit branch.get`, `ogit remote.pull`, `ogit safeDirectory.ensure`, `ogit caller.validate` |
+
+**Repair toolkit** — when something feels broken, see [docs/repair-toolkit.md](docs/repair-toolkit.md): `oo user.fix`, `config init.user`, `config init.shared`, `ossh rights.fix`, `ossh folder.fix`, `ogit layout.status` / `ogit safeDirectory.ensure`. The first two heal user-level `~/config` + `~/oosh` symlinks; `ogit layout.status` reports the branch folders (clone/worktree, shared, trusted) and `ogit safeDirectory.ensure` trusts them for you ("dubious ownership"); the others handle shared-config perms and SSH layout drift.
 
 **Usage pattern:**
 ```bash
@@ -78,7 +82,7 @@ These scripts wrap external tools with oosh method syntax for easier use:
 ./otmux splitV            # Split into upper/lower panes
 
 # Remote control via otmux send
-./otmux sendEnter mySession:0.1 './test.suite run c2 1'  # Run tests in pane 1
+./otmux send.enter mySession:0.1 './test.suite run c2 1'  # Run tests in pane 1
 ./otmux send mySession:0.1 'h' Enter                      # Send help command
 
 # Capture output (don't use | tail or 2>&1 - oosh has its own logging)
@@ -109,6 +113,10 @@ OOSH uses `test.suite` for all testing. Key points:
 # 3 = normal with test details
 # 5+ = debug mode (may trigger breakpoints)
 ```
+
+**Test categories:**
+- `TEST_CATEGORY=core` — fixture-based unit/integration tests; run by `./test.suite core 1`.
+- `TEST_CATEGORY=platform` — post-install invariant checks on real machines (e.g. `test.platform.shared.config.invariant`, `test.platform.shared.oosh.invariant`); run inside `os platform.test <p> terminal` via `./test.suite run <name> 1`. See `templates/code/newPlatformInvariantTest` for the skeleton.
 
 **Writing tests:**
 ```bash
@@ -144,7 +152,7 @@ The `c2` script (in `ng/c2`) provides Tab completion for oosh methods:
 ./c2 function.completion ./otmux config    # List config.* methods
 
 # Interactive completion testing via tmux
-./otmux sendEnter mySession:0.1 './c2 function.completion ./otmux config'
+./otmux send.enter mySession:0.1 './c2 function.completion ./otmux config'
 ```
 
 **Custom completion:** Define `scriptname.method.completion.parameter()` functions to provide custom completions for specific parameters.
@@ -154,7 +162,7 @@ The `c2` script (in `ng/c2`) provides Tab completion for oosh methods:
 ## OOSH Best Practices for Agents
 
 1. **Use otmux for all shell operations** - provides UTF-8, color support, and remote control
-2. **Run tests in tmux panes** - use `./otmux sendEnter` to execute, capture output with `tmux capture-pane`
+2. **Run tests in tmux panes** - use `./otmux send.enter` to execute, capture output with `tmux capture-pane`
 3. **Respect log levels** - use level 1 for clean output, higher for debugging
 4. **Source scripts with full paths** - use `$OOSH_DIR/path/to/script` not just `script`
 5. **Don't filter oosh output** - no `| tail`, `2>&1` - use `log.level` instead

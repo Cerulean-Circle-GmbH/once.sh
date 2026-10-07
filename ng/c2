@@ -7,9 +7,108 @@
 #This=$OOSH_DIR/ng/c2
 
 
+c2.signature.validate()     # <script> # does c2 parse every public signature of <script> as declared; one INVALID line per mismatch; rc 1 on any #
+{
+  # THE RULE: what the signature line declares between <…> is what c2 reads.
+  # c2 completes a parameter by its NAME, and it learns the names by running
+  # the docstring through line.unquote / FORMAT_PARSE_METHOD. An unpaired
+  # apostrophe (`<dir>'s`) makes that parse split the line in the wrong
+  # places, so c2 reads names that are not there (conflict.resolve -> `it`)
+  # and the method silently never completes. completion.audit cannot see it:
+  # it checks that completion functions EXIST, not that c2 ever reaches them.
+  #
+  # So the check uses c2's OWN parser (c2.function.parameter.get, the PARAM_
+  # extraction exactly as c2.completion.discover does it) — a second parser
+  # here would only prove that two parsers agree. Validator shape of
+  # path.validate: one INVALID line per finding, a verdict line, echoed to
+  # stdout so it survives any LOG_LEVEL; create.result / return $(result).
+  local script="$1"
+  if [ -z "$script" ]; then
+    echo "INVALID: no script given"
+    create.result 2 "usage: c2 signature.validate <script>"
+    return $(result)
+  fi
+  # Resolved like c2 resolves a class: a path, else the command, else the tree.
+  local scriptFile="$script"
+  [ -f "$scriptFile" ] || scriptFile=$(command -v "$script" 2>/dev/null)
+  [ -f "$scriptFile" ] || scriptFile="$OOSH_DIR/$script"
+  [ -f "$scriptFile" ] || scriptFile="$OOSH_DIR/ng/$script"
+  if [ ! -f "$scriptFile" ]; then
+    echo "INVALID: no such script: $script"
+    create.result 2 "no such script: $script"
+    return $(result)
+  fi
+  local name="${scriptFile##*/}"
+
+  # The parse needs the line.format templates c2.completion.discover ensures.
+  [ -f "$CONFIG_PATH/lineFormat.env" ] && source "$CONFIG_PATH/lineFormat.env"
+  [ -z "$FORMAT_PARSE_METHOD" ] && export FORMAT_PARSE_METHOD="declare -- METHOD='%s'|declare -- METHOD_PARAMETER='%s'|declare -- METHOD_DESCRIPTION='%s'\n"
+  [ -z "$FORMAT_DECLARE_LOCAL" ] && export FORMAT_DECLARE_LOCAL="declare -- PARAM_%s='%s'\n"
+
+  # c2's parse writes current.method.env and result.env into $CONFIG_PATH once
+  # per method — in the shared ~/config that is the file live Tab completion
+  # reads. The parse runs with CONFIG_PATH at a scratch dir of this run (set
+  # inside the subshell below, so no caller ever sees it) — the kernel's temp
+  # dir (T-C2-SIGNATURE-VALIDATE-KERNEL-TEMP).
+  local scratch
+  scratch=$(private.this.temp.dir.get c2.signature) || { echo "INVALID: no scratch dir"; create.result 2 "c2 signature.validate: no temp dir"; return $(result); }
+
+  local method sigLine section declared reads total=0 invalid=0
+  while IFS= read -r method; do
+    [ -z "$method" ] && continue
+    total=$((total + 1))
+
+    # Declared: the names between <…> in the parameter section (between the
+    # first and the second #), with ?, :default and a trailing ... dropped.
+    sigLine=$(grep -m1 "^${name//./\\.}\.${method//./\\.}()" "$scriptFile")
+    section="${sigLine#*#}"; section="${section%%#*}"
+    declared=""
+    while [[ "$section" =~ \<\??([A-Za-z_][A-Za-z0-9_.]*) ]]; do
+      declared="$declared ${BASH_REMATCH[1]%...}"
+      section="${section#*"${BASH_REMATCH[0]}"}"
+    done
+    declared="${declared# }"
+
+    # Read: c2's own parse, in a subshell — it sources current.method.env,
+    # which sets SCRIPT, CLASS, METHOD* and PARAM_* in the calling shell.
+    reads=$( CONFIG_PATH="$scratch"
+             c2.function.parameter.get "$scriptFile" "$method" >/dev/null 2>&1
+             cat "$CONFIG_PATH/current.method.env" 2>/dev/null \
+             | line.find "PARAM_" \
+             | line.replace "declare -- PARAM_" "" \
+             | line.replace "=.*$" \
+             | line.replace "^OPTIONAL_" \
+             | line.replace "\.\.\.$" \
+             | line.filter "^none$" )
+    reads=$(echo $reads)
+
+    if [ "$declared" != "$reads" ]; then
+      invalid=$((invalid + 1))
+      echo "INVALID: $name.$method: declares [$declared] c2 reads [$reads]"
+    fi
+  done < <(c2.function.completion "$scriptFile")
+  rm -rf "$scratch"
+
+  if [ "$invalid" -gt 0 ]; then
+    echo "INVALID: $name — $invalid of $total signatures do not parse"
+    create.result 1 "$name: $invalid of $total signatures do not parse"
+    return $(result)
+  fi
+  echo "OK: $name — $total signatures parse"
+  create.result 0 "$name: $total signatures parse"
+  return $(result)
+}
+
+c2.signature.validate.completion.script() {
+  # The method-scripts: the extensionless files in $OOSH_DIR, as
+  # oo.method.delete.completion.script lists them. NO create.result — a
+  # completion function (docs/completion-system.md).
+  ls -1 "$OOSH_DIR" 2>/dev/null | grep -vE "[.]"
+}
+
 ### new.method
 
-c2.get.functions() # <script> <?functionNameFilter> # lists all functions in a script without description
+private.c2.get.functions() # <script> <?functionNameFilter> # lists all functions in a script without description
 # functions are identified by someFunctionName( ) but mainly by the brackets ()
 # they are parsed till the next curley bracket
 # so that this detailed description is part of the grep
@@ -21,6 +120,12 @@ c2.get.functions() # <script> <?functionNameFilter> # lists all functions in a s
   else
     from="$This"
   fi
+  # Resolve to absolute path if not already (e.g. "state" → "/path/to/state")
+  if [ ! -f "$from" ]; then
+    local resolved
+    resolved=$(command -v "$from" 2>/dev/null)
+    [ -n "$resolved" ] && from="$resolved"
+  fi
 
   local name=$(basename $from)
 
@@ -30,7 +135,10 @@ c2.get.functions() # <script> <?functionNameFilter> # lists all functions in a s
 
 }
 
-c2.get.function.with.documentation() # <script> <?functionNameFilter> # lists all functions in a script with their documentation
+c2.functions.get() # <script> <?functionNameFilter> # lists all functions in a script without description
+{ private.c2.get.functions "$@"; }
+
+private.c2.get.function.with.documentation() # <script> <?functionNameFilter> # lists all functions in a script with their documentation
 # functions are identified by someFunctionName( ) but mainly by the brackets ()
 # they are parsed till the next curley bracket
 # so that this detailed description is part of the grep
@@ -56,8 +164,11 @@ c2.get.function.with.documentation() # <script> <?functionNameFilter> # lists al
   # | sort \
 }
 
+c2.function.get.with.documentation() # <script> <?functionNameFilter> # lists all functions in a script with their documentation
+{ private.c2.get.function.with.documentation "$@"; }
 
-c2.format.functions() # <script> <?functionNameFilter> # formats function output with colors (pipe usage: c2.get.functions | c2.format.functions)
+
+private.c2.format.functions() # <script> <?functionNameFilter> # formats function output with colors (pipe usage: c2.functions.get | c2.functions.format)
 {
   local from="$1"
   if [ -n "$1" ]; then
@@ -74,14 +185,17 @@ c2.format.functions() # <script> <?functionNameFilter> # formats function output
   | line.replace "^#" "${GREEN}#" \
   | line.replace "$name\." "${CYAN}${name}${NO_COLOR}\." \
   | line.replace "\([^ ]\)()" "\1${NO_COLOR}" \
-  | line.replace "<" "${YELLOW}<" \
-  | line.replace ">" ">${GREEN}" \
+  | sed "s/</${YELLOW}</g" \
+  | sed "s/>/>$(echo -n "${GREEN}")/g" \
   | line.replace "#" "${GREEN}#" \
   | line.filter "\.completion" \
   | line.filter "^private"
 }
 
-c2.get.formated.function.description() # <script> <?functionNameFilter> # gets formatted function description with colors for display
+c2.functions.format() # <script> <?functionNameFilter> # formats function output with colors (pipe usage: c2.functions.get | c2.functions.format)
+{ private.c2.format.functions "$@"; }
+
+private.c2.get.formated.function.description() # <script> <?functionNameFilter> # gets formatted function description with colors for display
 {
     local from="$1"
     if [ -n "$1" ]; then
@@ -99,14 +213,17 @@ c2.get.formated.function.description() # <script> <?functionNameFilter> # gets f
       shift
     fi
 
-      c2.get.function.with.documentation $from ${filter} \
-    | c2.format.functions $from ${filter} \
+      private.c2.get.function.with.documentation $from ${filter} \
+    | private.c2.format.functions $from ${filter} \
     | line.split "#" \
     | line.split "'" \
     | line.unquote \
     | line.filter "^[^ ]*$" \
     | line.replace "^" "${GREEN}"
 }
+
+c2.function.description.format() # <script> <?functionNameFilter> # gets formatted function description with colors for display
+{ private.c2.get.formated.function.description "$@"; }
 
 c2.function.completion() # <script> <?functionNameFilter> # returns list of method names for completion (filters out .completion and private methods)
 {
@@ -120,7 +237,7 @@ c2.function.completion() # <script> <?functionNameFilter> # returns list of meth
 
   local name=$(basename $from)
 
-  c2.get.functions "$from" "$@" \
+  private.c2.get.functions "$from" "$@" \
   | line.replace "\([^ ]\)().*$" "\1" \
   | line.replace "^$name\." \
   | line.replace " {" \
@@ -137,7 +254,7 @@ c2.test.absolutePathName() # <?path> # tests this.absolutePathName and displays 
   echo "${CYAN}${RESULT}"
 }
 
-c2.get.function.declaration() # <script> <method> # extracts function declaration and parameters, saves to current.method.env
+private.c2.get.function.declaration() # <script> <method> # extracts function declaration and parameters, saves to current.method.env
 {
   local from="$1"
   if [ -n "$1" ]; then
@@ -149,8 +266,13 @@ c2.get.function.declaration() # <script> <method> # extracts function declaratio
 
   local name=$(basename $from)
 
- c2.get.functions "$from" "$1" \
-  | grep "$1(" \
+  # BUG FIX: use class-qualified name to avoid substring matches.
+  # Without "$name.", method "tree" matched otmux.client.choose.tree (longer
+  # function names containing the method as suffix), and `sort` made
+  # client.choose.tree come first alphabetically. METHOD_PARAMETER ended up
+  # empty → no parameter completion ran for tree.
+ private.c2.get.functions "$from" "${name}.$1" \
+  | grep "^${name//./\\.}\.${1//./\\.}(" \
   | line.select 1 \
   | line.replace "\([^ ]\)()" "\1" \
   | line.replace " {" \
@@ -158,7 +280,8 @@ c2.get.function.declaration() # <script> <method> # extracts function declaratio
   | line.format FORMAT_PARSE_METHOD \
   | line.split "|" \
   | line.unquote \
-  | line.add "'" >$CONFIG_PATH/current.method.env
+  | line.replace "^declare -- METHOD_DESCRIPTION='\(.*\)" "declare -- METHOD_DESCRIPTION='\1'" >$CONFIG_PATH/current.method.env
+  private.ensure.groupWrite "$CONFIG_PATH/current.method.env"
 
   {
     echo declare -- SCRIPT="$from"
@@ -166,12 +289,15 @@ c2.get.function.declaration() # <script> <method> # extracts function declaratio
   } >>$CONFIG_PATH/current.method.env
 
   if [ "$LOG_LEVEL" -gt "4" ]; then
-    cat $CONFIG_PATH/current.method.env >>$LOG_DEVICE
+    private.log.emit "$(cat $CONFIG_PATH/current.method.env)"
   fi
 }
 
+c2.function.declaration.get() # <script> <method> # extracts function declaration and parameters, saves to current.method.env
+{ private.c2.get.function.declaration "$@"; }
 
-c2.get.function.parameter() # <script> <method> <?args> # extracts parameter definitions from function signature
+
+private.c2.get.function.parameter() # <script> <method> <?args> # extracts parameter definitions from function signature
 {
   local from="$1"
   if [ -n "$1" ]; then
@@ -183,12 +309,13 @@ c2.get.function.parameter() # <script> <method> <?args> # extracts parameter def
 
   local name=$(basename $from)
 
-  c2.get.function.declaration "$from" "$1"
+  private.c2.get.function.declaration "$from" "$1"
   shift
-  source $CONFIG_PATH/current.method.env
+  [ -f "$CONFIG_PATH/current.method.env" ] && source $CONFIG_PATH/current.method.env
 
   echo $METHOD_PARAMETER \
   | line.parse.paramList.new "$@" >$CONFIG_PATH/result.env
+  private.ensure.groupWrite "$CONFIG_PATH/result.env"
 
   # cat $CONFIG_PATH/result.env \
   # | line.count \
@@ -198,10 +325,13 @@ c2.get.function.parameter() # <script> <method> <?args> # extracts parameter def
   cat $CONFIG_PATH/result.env >>$CONFIG_PATH/current.method.env
 
   if [ "$LOG_LEVEL" -gt "4" ]; then
-    cat $CONFIG_PATH/result.env >>$LOG_DEVICE
+    private.log.emit "$(cat $CONFIG_PATH/result.env)"
   fi
 
 }
+
+c2.function.parameter.get() # <script> <method> <?args> # extracts parameter definitions from function signature
+{ private.c2.get.function.parameter "$@"; }
 
 
 c2.debug.parse.param() # # internal: debug helper for parsing parameters (pipe usage)
@@ -221,7 +351,7 @@ c2.completion.enable() # <cmd> # enables c2 completion on a command (must be sou
   else
     shift
   fi
-  complete  -o nospace -o bashdefault -o default -F "_oo_completion" "$cmd"
+  complete  -o nospace -o bashdefault -o default -F "private.oo.completion" "$cmd"
   RETURN="$1"
 }
 
@@ -238,6 +368,11 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
 # Discovers available completions based on script, method, and parameter position
 # Returns completion suggestions in $CONFIG_PATH/completion.result.txt
 {
+  # Ensure line.format FORMAT_* variables are available for method parsing
+  [ -f "$CONFIG_PATH/lineFormat.env" ] && source "$CONFIG_PATH/lineFormat.env"
+  [ -z "$FORMAT_PARSE_METHOD" ] && export FORMAT_PARSE_METHOD="declare -- METHOD='%s'|declare -- METHOD_PARAMETER='%s'|declare -- METHOD_DESCRIPTION='%s'\n"
+  [ -z "$FORMAT_DECLARE_LOCAL" ] && export FORMAT_DECLARE_LOCAL="declare -- PARAM_%s='%s'\n"
+
   local argc=$#    # nuber of arguments
   #printf "\n"
   #clear -x
@@ -268,9 +403,11 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
 
     if [ "$script" = "-" ]; then
       c2.completion >$CONFIG_PATH/completion.result.txt
+      private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
       debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
     else
       c2.completion | grep "^${script}" >$CONFIG_PATH/completion.result.txt
+      private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
       debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
     fi
 
@@ -290,7 +427,7 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
   fi
 
   local method="$1"
-  info.log "c2 ${YELLOW}<?script:$script> <?method:$method>${NO_COLOR} $*   ${RED}$argc $cur"
+  info.log "c2 ${YELLOW}<?script:$script> <?method:$method>${NO_COLOR} $*   ${RED}$argc $cur${NO_COLOR}"
   if [ -z "$completionResult" ]; then
     completionResult="$script"
   fi
@@ -307,9 +444,9 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
 
   if [ -n "$1" ]; then shift ; fi
 
-  info.log "c2 completion.discover ${YELLOW}<?script:$script> <?method:$method>${NO_COLOR} $*   ${RED}$argc $cur"
+  info.log "c2 completion.discover ${YELLOW}<?script:$script> <?method:$method>${NO_COLOR} $*   ${RED}$argc $cur${NO_COLOR}"
 
-  script=$( which $script )
+  script=$( command -v $script )
   class=$(basename $script)
 
   filter=""
@@ -326,14 +463,9 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
 
     info.log "finding functions in $script containing $method"
 
-    c2.get.functions $script ${filter} \
-    | c2.format.functions $script ${filter} \
-    | line.replace "\.$method" ".${RED}${method}${NO_COLOR}"
-    # c2.format.functions $script ${filter} \
-    #   | line.replace "\.$method" ".${RED}${method}${NO_COLOR}"
-
     #stat -L -c "%a %G %U" $CONFIG_PATH
     c2.function.completion $script ${filter} >$CONFIG_PATH/completion.result.txt
+    private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
     debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
 
 
@@ -343,7 +475,11 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
     info.log "got ${RED}${count}${NO_COLOR} suggestions"
     if [ $count -le 1 ]; then
           console.log ""
-          c2.get.formated.function.description $script ${filter}
+          private.c2.get.formated.function.description $script ${filter}
+    else
+          private.c2.get.functions $script ${filter} \
+          | private.c2.format.functions $script ${filter} \
+          | line.replace "\.$method" ".${RED}${method}${NO_COLOR}"
     fi
     if [ $word -le 1 ] || [ "$method" = "-" ]; then
       create.result 0 ${count}
@@ -352,10 +488,39 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
        info.log "$method" "$word"
     fi
 
-    # if [ $count -le 1 ]; then
-    #   return 0
-    # fi
+    # When word > 1, check if cur matches sub-methods (e.g., "i" → "install.init")
+    # before falling through to parameter completion
+    if [ -n "$cur" ] && [ "$cur" != "-" ]; then
+      local subMethodResult
+      subMethodResult=$(echo "$completionResult" | grep "^${method}\.${cur}")
+      if [ -n "$subMethodResult" ]; then
+        echo "$subMethodResult" | sed "s/^${method}\.//" > $CONFIG_PATH/completion.result.txt
+        private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
+        create.result 0 $(echo "$subMethodResult" | wc -l)
+        return 0
+      fi
+    fi
 
+    # When a sub-method is already fully typed (e.g., "oo mode stage [tab]"),
+    # resolve the compound method so parameter completion targets the sub-method
+    if [ -n "$1" ] && [ "$1" != "-" ]; then
+      local compoundMethod="${method}.$1"
+      if echo "$completionResult" | grep -q "^${compoundMethod}$"; then
+        method="$compoundMethod"
+        filter="$class.$method"
+        word=$((word - 1))
+        shift
+      fi
+    fi
+
+    # When word > 1 and method is an exact match but also a prefix of longer methods
+    # (e.g., "rm" matches both "rm" and "rmi"), narrow to the exact match
+    if [ $word -gt 1 ] && echo "$completionResult" | grep -q "^${method}$"; then
+      echo "$method" > $CONFIG_PATH/completion.result.txt
+      private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
+      count=1
+      completionResult="$method"
+    fi
 
     if private.call.custom.completion "$cur" "$class" "$method"; then return 0 ; fi
     #private.call.custom.completion "$cur" "$script" "$method"
@@ -363,9 +528,9 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
     # private.call.custom.completion
 
     debug.log "now checking for parameter"
-    c2.get.function.parameter "$script" "$method" "$@"
+    private.c2.get.function.parameter "$script" "$method" "$@"
 
-    source $CONFIG_PATH/current.method.env
+    [ -f "$CONFIG_PATH/current.method.env" ] && source $CONFIG_PATH/current.method.env
 
     info.log "...: $@"
     console.log "" #just new line and color reset
@@ -380,6 +545,7 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
        | line.find "PARAM_" \
        | line.replace "declare -- PARAM_" "" \
        | line.replace "=.*$" >$CONFIG_PATH/completion.parameter.txt
+    private.ensure.groupWrite "$CONFIG_PATH/completion.parameter.txt"
 
 
     parc=$(( $word - 2 ))
@@ -389,23 +555,23 @@ c2.completion.discover() # <numberOfWords> <currentWord> <script> <?method> <?re
     local currentParameter="${PARAMETER_COMPLETION[parc]}"
 
 
-    # MKT: This was put directly into tty. Why not by logging?
-    debug.log `cat $CONFIG_PATH/current.method.env \
-      | line.find "PARAM_" \
-      | line.replace "declare -- PARAM_" "${YELLOW}" \
-      | line.replace "${currentParameter}" "${CYAN}${currentParameter}${YELLOW}"`
-
-      # if [ -z "${currentParameter}" ]; then currentParameter="${PARAMETER_COMPLETION[parc-1]}"; fi
-      # console.log "current parameter ${currentParameter}"
-
-
+    # Show parameter names: current in cyan, others in yellow
+    if [ -n "$METHOD_PARAMETER" ]; then
+      local coloredParams="${YELLOW}${METHOD_PARAMETER}${NO_COLOR}"
+      if [ -n "$currentParameter" ]; then
+        coloredParams=$(echo "$coloredParams" | sed "s|${currentParameter}|${CYAN}${currentParameter}${YELLOW}|")
+      fi
+      console.log " $coloredParams"
+    fi
 
 
-    if private.call.custom.completion "$cur" "$script" "$method" "${currentParameter}"; then
+
+
+    if private.call.custom.completion "$cur" "$class" "$method" "${currentParameter}"; then
       create.result 0 ${count}
       return 0
     else
-      private.call.custom.completion "$cur" "$script" "parameter" "${currentParameter}"
+      private.call.custom.completion "$cur" "$class" "parameter" "${currentParameter}"
     fi
     debug.log "comp result: $? ${count}"
     #set +x
@@ -424,7 +590,7 @@ private.call.custom.completion() # <cur> <class> <method> <?parameter> # calls c
 
       local parameter="$4"
       #local isOptional=$( echo $parameter | line.replace "OPTIONAL_" "" | line.replace "=.*$" )
-      local isOptional=$( echo $parameter | line.replace "\?" "OPTIONAL_" | line.replace "=.*$" )
+      local isOptional=$( echo $parameter | line.replace "?" "OPTIONAL_" | line.replace "=.*$" )
       parameter=$( echo $parameter | line.replace "OPTIONAL_"  )
       parameter=".$parameter"
       parameterENV="PARAM_$4"
@@ -433,7 +599,7 @@ private.call.custom.completion() # <cur> <class> <method> <?parameter> # calls c
     info.log "private.call.custom.completion $parameter $parameterENV --- $@"
 
     # Very import to be local, else it overwrites from caller
-    local script="$(which $class)"
+    local script="$(command -v $class)"
     class=$(basename $script)
     if ! this.functionExists $class.start; then
       info.log "${GREEN}sourcing ${script}${NORMAL}"
@@ -442,23 +608,41 @@ private.call.custom.completion() # <cur> <class> <method> <?parameter> # calls c
 
     if this.functionExists $class.$method.completion$parameter; then
       $class.$method.completion$parameter "$cur" "$class" "$method" | grep "^$cur" >$CONFIG_PATH/completion.result.txt
-      debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
       RETURN_VALUE=$?
+      private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
+      debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
       return $RETURN_VALUE
     fi
 
     if this.functionExists $class.parameter.completion$parameter; then
       $class.parameter.completion$parameter "$cur" "$class" "$method" | grep "^$cur" >$CONFIG_PATH/completion.result.txt
-      debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
       RETURN_VALUE=$?
+      private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
+      debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
       return $RETURN_VALUE
     else
       debug.log "$class.$method.completion$parameter ${RED}does not exist${NO_COLOR}"
 
-      source $CONFIG_PATH/current.method.env
+      [ -f "$CONFIG_PATH/current.method.env" ] && source $CONFIG_PATH/current.method.env
       if [ -n "$4" ] && [ "$4" != "none" ]; then
         debug.log "$parameterENV=${!parameterENV}"
-        echo "${!parameterENV}" >$CONFIG_PATH/completion.result.txt
+        # Suppress the `addDefaultValue` placeholder. line.parse.param in
+        # the line script (and line.parse.param.new) uses the literal string "addDefaultValue" as
+        # the second column of `line.unify` so parameters declared without
+        # an explicit default still get a non-empty PARAM_<name>. When this
+        # fallback echoes that value, bash readline auto-inserts the
+        # literal "addDefaultValue" as the user's argument — observed for
+        # `oo checkout <Tab>` on a tart_sequoia VM where the real
+        # completion function (oo.checkout.completion.version) silently
+        # returns nothing because origin is unreachable. Empty result lets
+        # readline beep / show nothing instead of injecting nonsense.
+        local _paramVal="${!parameterENV}"
+        if [ "$_paramVal" = "addDefaultValue" ]; then
+          : >$CONFIG_PATH/completion.result.txt
+        else
+          echo "$_paramVal" >$CONFIG_PATH/completion.result.txt
+        fi
+        private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
         debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
         return 0
       fi
@@ -466,6 +650,7 @@ private.call.custom.completion() # <cur> <class> <method> <?parameter> # calls c
 
     #important.log "overwriting completion.result.txt"
     echo ";" >$CONFIG_PATH/completion.result.txt
+    private.ensure.groupWrite "$CONFIG_PATH/completion.result.txt"
     debug.log "c2:$LINENO completion.result.txt: -> `cat $CONFIG_PATH/completion.result.txt` <-"
     return 1
 }
@@ -565,7 +750,21 @@ c2.file.completion() # <prefix> # returns file paths matching prefix
   compgen -f "$1"
 }
 
+c2.parameter.completion.script() {
+  c2.completion
+}
 
+c2.parameter.completion.path() {
+  compgen -d "$1"
+}
+
+c2.parameter.completion.functionNameFilter() {
+  :
+}
+
+c2.parameter.completion.method() {
+  :
+}
 
 c2.usage() # # displays usage information for c2 completion system
 {
@@ -599,7 +798,16 @@ c2.init() # # initializes c2 completion system
 
 c2.install.linux() # # installs bash-completion package on Linux
 {
-  $SUDO apt install bash-completion
+  if [ -n "$OOSH_PM" ]; then
+    $SUDO $OOSH_PM bash-completion
+  elif command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get -y install bash-completion
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf -y install bash-completion
+  else
+    error.log "No supported package manager found. Install bash-completion manually."
+    return 1
+  fi
 }
 
 c2.status() # # displays completion status (interactive shell only)
@@ -619,9 +827,23 @@ c2.status() # # displays completion status (interactive shell only)
 c2.start() # <?args> # initializes c2 script and dispatches to requested method
 {
   #echo "sourcing init"
-  source $(dirname $0)/../this
-  source ~/config/user.env
-  source $(dirname $0)/../line
+  # Resolve symlink to get actual script location
+  local scriptPath="${BASH_SOURCE[0]}"
+  local scriptDir=$(cd "$(dirname "$scriptPath")" && pwd)
+  scriptPath="$scriptDir/$(basename "$scriptPath")"
+  if [ -L "$scriptPath" ]; then
+    # readlink may return relative path — resolve from symlink's directory
+    local linkTarget=$(readlink "$scriptPath")
+    case "$linkTarget" in
+      /*) scriptPath="$linkTarget" ;;
+      *)  scriptPath="$scriptDir/$linkTarget" ;;
+    esac
+    scriptDir=$(cd "$(dirname "$scriptPath")" && pwd)
+  fi
+
+  source "$scriptDir/../this"
+
+  source "$scriptDir/../line"
   #c2.init
 
 

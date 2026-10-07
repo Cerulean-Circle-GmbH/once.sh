@@ -1,33 +1,64 @@
 # once.sh
 Unified shell environment for UCP components and ONCE the Object Network Communication Environment
 
-## FOR THE LATEST VERSION of oosh please go to the:
-### [PROD Branch](https://github.com/Cerulean-Circle-GmbH/once.sh/tree/prod)
 
 This Repo consists of two main topics
-1. The oosh object oriented bash envitonment with completion, logging and debugging
+1. The oosh object oriented bash environment with completion, logging and debugging
 1. the once bash script to manage a ONCE installation into any environment
-1. 1. Supportetd envionments currently are
-    * Mac OS
-    * Ubuntu
-    * android termux App
-    * iOS iSH App
-    * RaspberryPI OS
+1. 1. Supported environments — see [Supported Platforms](docs/supported-platforms.md) for the full matrix
+
+Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branching Strategy](docs/branching.md) for details.
+
+## prereqs
+
+- **curl / wget / fetch** (only one, for the one-liner to fetch the installer)
+  — macOS: already present · Debian/Ubuntu: `apt-get install -y curl` · RHEL/Fedora: `dnf install -y curl` · Alpine: `apk add curl`
+- **bash 4+** — macOS: `brew install bash` · Debian/Ubuntu/RHEL: already present (Ubuntu 22/24 ships bash 5)
+- **git** — macOS: `xcode-select --install` · Debian/Ubuntu: `sudo apt install git` · RHEL/Fedora: `sudo dnf install git` · Alpine: `apk add git`
+
+> **Why curl/wget/fetch is listed first:** the install one-liner below (`sh -c "$(curl …)"`) relies on the shell's command-substitution to pull the installer from GitHub. If the fetcher is missing, the shell silently runs `sh -c ""` and nothing happens — you'll see *`sh: curl: command not found`* with no framed error. This is inherent to a one-liner and cannot be fixed without it ceasing to be one, so install a fetcher first (any one of curl / wget / fetch), then run it.
+>
+> The **`Install oosh.command` wrapper does check**: with no fetcher on PATH it names the three it accepts, prints the install command for your platform, and exits non-zero. It used to share the one-liner's failure mode and report `✓ Install complete.` having installed nothing.
+>
+> The installer itself checks **bash 4+** and **git** and prints a consolidated error with per-platform install hints if either is missing.
+
+## one-file install
+
+**One file, double-click (macOS) or `./` (Linux):**
+
+1. **[⬇ Download Install oosh.command](https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/Install%20oosh.command)** (right-click → Save Link As…)
+2. Run it:
+   - **macOS:** double-click in Finder.
+   - **Linux:** `chmod +x "Install oosh.command" && ./"Install oosh.command"`
+3. A terminal runs the install. Enter your sudo password when prompted.
+
+That's it — the `.command` file self-bootstraps: it fetches the bootstrap script from GitHub and runs it. No need to download the whole repo.
+
+> **First-run macOS prompt:** downloaded files carry Apple's quarantine flag. macOS will say "*Install oosh.command* cannot be opened because the developer cannot be verified." Right-click the file → **Open** → **Open** to confirm. After you approve it once, double-click works normally. Linux has no equivalent gate.
+
+> **Also works from a clone:** if you `git clone` the repo or download the ZIP, the same `Install oosh.command` in the repo root runs your local `init/oosh` instead of fetching from GitHub. Same UX either way.
 
 ## fast install - use it anywhere
 
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
-| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"`   |
-| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"` |
+| **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
+| **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
+
+`init/oosh` is a POSIX `sh` script, so `sh -c` works on every supported
+platform (dash on Debian, ash on Alpine, bash on macOS). `bash -c` also
+works if you prefer it.
+
+Substitute the `prod` segment of the URL with `dev` (or any branch name) to
+install from a non-default branch, e.g. `…/dev/init/oosh`.
 
 
 ### More detailed logging for debugging is available with these commands
 ```
-unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)" | tee install.log.txt
+unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" | tee install.log.txt
 
-> or if already available loacally
+> or if already available locally
 unbuffer env -i sh -x init/oosh | tee install.log.txt 
 
 > to view the file use 
@@ -44,7 +75,7 @@ in VSCODE use [use the ANSI Colors plugin](https://marketplace.visualstudio.com/
 
 ## manual install
 ```
-wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh ;
+wget https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh ;
 chmod 700 oosh
 ./oosh
 
@@ -58,13 +89,13 @@ cat oosh | sh -x
 ```
 sudo apt update
 sudo apt install curl
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 
 or as root
 
 apt update
 apt install curl
-sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/main/init/oosh)"
+sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 ```
 
 
