@@ -7,7 +7,7 @@
 | `dev` | Active development. All feature branches merge here. | Unstable |
 | `testing` | Testing / QA. Code promoted from `dev` after tests pass. | Semi-stable |
 | `prod` | Production-ready releases. Promoted from `testing` after platform install tests pass. | Stable |
-| `main` | Legacy. Not actively used — kept for historical reference. | Frozen |
+| `main` | GitHub's default branch — a mirror of `prod`. Since 2026-10-07 (v1.0.31) its content is prod's, its history is kept: in `<base>/main`, `ogit branch.adopt origin/prod "<message>" '' '' <base>/main`, then `ogit remote.push main no <base>/main`. Not part of `promote`. | Updated by hand after a prod release |
 
 ## Flow
 
