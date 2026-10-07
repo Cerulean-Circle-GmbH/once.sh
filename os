@@ -763,7 +763,7 @@ private.os.platform.ref.branch.drop()     # <branch> <?dir:$OOSH_DIR> # delete t
 }
 
 
-private.os.platform.user.run()     # <platform> <user> <command> <log> # run <command> as <user> (test, root, oosh-user or bash-user) in the platform container through the transport that fits the user (ossh exec / sudo bash -lc / runuser or sudo -H -u), from the user's home with the prelude of ossh.remote.prelude.get, tee into <log>; rc is the rc of <command> #
+private.os.platform.user.run()     # <platform> <user> <command> <log> # run <command> as <user> (test, root, oosh-user or bash-user) in the platform container through the transport that fits the user (ossh exec / sudo -H bash -lc / runuser with the HOME of the user or sudo -H -u), from the user's home with the prelude of ossh.remote.prelude.get, tee into <log>; rc is the rc of <command> #
 {
  local platform="$1" user="$2" command="$3" log="$4" prelude="" rc
  if [ -z "$platform" ] || [ -z "$user" ] || [ -z "$command" ] || [ -z "$log" ]; then
@@ -801,7 +801,10 @@ private.os.platform.user.run()     # <platform> <user> <command> <log> # run <co
    # describe — except for root, the direct `find` calls work because
    # root reads anything; the failure mode is subprocesses (e.g. man-db's
    # postinst, which drops to user `man`) inheriting /home/test as cwd.
-   ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; $prelude $command'" 2>&1 | tee "$log"
+   # -H: root's HOME, not the ssh user's (see below). No SUDO_* either: sudo
+   # names test as the one who typed it, and ogit.folder.finish in the gates'
+   # fixtures trusted them in the .gitconfig of test (second-heal=1).
+   ossh exec.tty "$platform" "sudo -H bash -lc 'cd /root 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command'" 2>&1 | tee "$log"
    rc=${PIPESTATUS[0]}
  else
    # oosh-user / bash-user (via test+sudo+runuser; login-shell equivalent of `user login <user>`).
@@ -820,11 +823,16 @@ private.os.platform.user.run()     # <platform> <user> <command> <log> # run <co
    # runuser (less PAM friction) and falls back to `sudo -H -u`. Both
    # give us "switch to <user>, reset HOME" semantics under the
    # NOPASSWD sudoers entry installed in Phase A.
+   # runuser keeps the caller's environment — HOME stayed /home/test, so
+   # `cd ~` landed there and the gates of oosh-user and bash-user wrote their
+   # fixtures' git trust into the .gitconfig of test (the second heal pruned
+   # it: second-heal=1). env HOME=~<user>, from passwd through the shell of
+   # test (eval: the tilde of a name is expanded at word start only).
    ossh exec.tty "$platform" "
      if command -v runuser >/dev/null 2>&1; then
-       sudo runuser -u $user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude $command'
+       sudo runuser -u $user -- env HOME=\"\$(eval echo ~$user)\" bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command'
      else
-       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude $command'
+       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command'
      fi
    " 2>&1 | tee "$log"
    rc=${PIPESTATUS[0]}

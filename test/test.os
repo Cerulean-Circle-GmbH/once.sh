@@ -647,8 +647,16 @@ test.os.userRun() {
   private.os.platform.user.run p bash-user "test.suite run platform.shared.idempotence.invariant 1" "$fx/b.log" >/dev/null 2>&1 || bad="$bad bash-user-rc"
   rec=$(cat "$OS_T_REC")
   case "$rec" in *"ossh exec p oo heal dev all"*) ;; *) bad="$bad test-transport" ;; esac
-  case "$rec" in *"ossh exec.tty p sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; "*"oo heal dev all'"*) ;; *) bad="$bad root-transport" ;; esac
-  case "$rec" in *"sudo runuser -u bash-user -- bash -c"*"test.suite run platform.shared.idempotence.invariant 1'"*) ;; *) bad="$bad bash-user-transport" ;; esac
+  # each user in THEIR home: runuser keeps the caller's HOME — the gates of
+  # oosh-user and bash-user wrote their fixtures' git trust into the
+  # .gitconfig of test, and the second heal pruned it (second-heal=1)
+  case "$rec" in *"ossh exec.tty p sudo -H bash -lc 'cd /root 2>/dev/null || cd /tmp; "*"oo heal dev all'"*) ;; *) bad="$bad root-transport" ;; esac
+  case "$rec" in *"sudo runuser -u bash-user -- env HOME=\"\$(eval echo ~bash-user)\" bash -c"*"test.suite run platform.shared.idempotence.invariant 1'"*) ;; *) bad="$bad bash-user-transport" ;; esac
+  case "$rec" in *"sudo -H -u bash-user bash -c"*) ;; *) bad="$bad bash-user-sudo-transport" ;; esac
+  # nobody acts for the ssh login: sudo's SUDO_USER=test made ogit.folder.finish
+  # in the gates' fixtures trust them in the .gitconfig of test
+  # (root, runuser and the sudo -H -u fallback: three lines)
+  [ "$(grep -c "cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; " "$OS_T_REC")" = 3 ] || bad="$bad sudo-user-kept"
   [ -f "$fx/t.log" ] && [ -f "$fx/r.log" ] && [ -f "$fx/b.log" ] || bad="$bad no-logs"
   private.os.platform.user.run p root "echo 'x'" "$fx/q.log" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad quote-accepted"
   private.os.platform.user.run p nobody "true" "$fx/n.log" >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-user-accepted"
