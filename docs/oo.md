@@ -510,7 +510,7 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
 
 - The target is the **standard dev model**: the canonical base (`<basehome>/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh`)
   with `main/` and `<branch>/` as clean clones of origin (healing to `main` also ensures `dev/`, so `oo mode` has a second folder), group `dev` with setgid, `developking` with a home,
-  the `sharedConfig`, the launcher `/usr/local/bin/this`, and `~/oosh` → `<base>/<branch>`, `~/config` →
+  the `sharedConfig`, the launcher `/usr/local/bin/this` (and, where the empty shell `env -i sh` has no `/usr/local/bin` on its PATH — BusyBox on Alpine — the link `/usr/bin/this` to it, `private.oo.launcher.link.get`), and `~/oosh` → `<base>/<branch>`, `~/config` →
   `sharedConfig` for each healed user. The canonical base is **built fresh** from origin, over HTTPS.
 - **Foreign folders are untouched and reported.** A `~/oosh` that points outside the base is relinked to the
   base; the folder it pointed to is left alone, its git state reported (`[left] … untouched`).
