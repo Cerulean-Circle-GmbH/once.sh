@@ -362,20 +362,19 @@ private.promote.merge.into.folder()     # <source> <target> # push <source>; in 
    return $(result)
  fi
  # Stash local changes of the target folder (e.g. .claude/settings.local.json)
- # so the merge is not blocked; popped on every way out below.
+ # so the merge is not blocked; popped on every way out below
+ # (private.promote.merge.finish). Staged changes count too: ogit.status.check
+ # looks at the index and the work tree — ogit.diff.check saw the work tree only.
  local stashed=no
- if ! ogit.diff.check "$dir"; then
+ if ! ogit.status.check "$dir"; then
    ogit.stash.push "promote: pre-merge stash" "$dir" >/dev/null && stashed=yes
  fi
  if ! ogit.remote.fetch no "$dir" >/dev/null; then
-   local reason="$RESULT"
-   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
-   create.result 1 "$reason"
+   private.promote.merge.finish 1 "$RESULT" "$stashed" "$dir"
    return $(result)
  fi
  if ! ogit.branch.fastForward "origin/$target" "$dir" >/dev/null; then
-   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
-   create.result 1 "$target in $dir has diverged from origin/$target — reconcile it by hand, then promote again"
+   private.promote.merge.finish 1 "$target in $dir has diverged from origin/$target — reconcile it by hand, then promote again" "$stashed" "$dir"
    return $(result)
  fi
  # asEmail/asName: the merge commit needs an identity — without it `git merge`
@@ -383,21 +382,86 @@ private.promote.merge.into.folder()     # <source> <target> # push <source>; in 
  # (alma containers, fresh CI runners).
  if ogit.branch.merge "origin/$source" oosh-promote@local "oosh promote" "$dir" >/dev/null; then
    # Rewrite init/oosh's OOSH_SELF_BRANCH default so /<branch>/init/oosh curl
-   # installs auto-select the matching folder (see init/oosh).
-   private.promote.rewrite.self.branch "$dir"
-   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
-   create.result 0 "Merged $source into $target (in $dir)"
+   # installs auto-select the matching folder (see init/oosh). A default that
+   # cannot be set stops the step: the merge is done, the stage is not ready.
+   if private.promote.rewrite.self.branch "$dir"; then
+     private.promote.merge.finish 0 "Merged $source into $target (in $dir)" "$stashed" "$dir"
+   else
+     private.promote.merge.finish 1 "Merged $source into $target (in $dir), but $RESULT — fix it there, then promote again" "$stashed" "$dir"
+   fi
  elif private.promote.try.resolve.self.branch.conflict "$dir" "$source"; then
    important.log "Auto-resolved OOSH_SELF_BRANCH drift in known files; merge completed"
-   private.promote.rewrite.self.branch "$dir"
-   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
-   create.result 0 "Merged $source into $target (auto-resolved OOSH_SELF_BRANCH drift, in $dir)"
+   if private.promote.rewrite.self.branch "$dir"; then
+     private.promote.merge.finish 0 "Merged $source into $target (auto-resolved OOSH_SELF_BRANCH drift, in $dir)" "$stashed" "$dir"
+   else
+     private.promote.merge.finish 1 "Merged $source into $target (auto-resolved OOSH_SELF_BRANCH drift, in $dir), but $RESULT — fix it there, then promote again" "$stashed" "$dir"
+   fi
  else
    error.log "Merge conflict — aborting"
    ogit.merge.abort "$dir" >/dev/null
-   [ "$stashed" = yes ] && ogit.stash.pop "$dir" >/dev/null
-   create.result 1 "Merge failed — resolve conflicts manually in $dir"
+   private.promote.merge.finish 1 "Merge failed — resolve conflicts manually in $dir" "$stashed" "$dir"
  fi
+ return $(result)
+}
+
+
+private.promote.merge.preview.show()     # <source> <target> # print the commits a merge of origin/<source> into <target> brings, from the folder that holds <source> (its fetched origin/<target>); says so when there are none #
+{
+ local source="$1" target="$2"
+ if [ -z "$source" ] || [ -z "$target" ]; then
+   create.result 1 "private.promote.merge.preview.show requires <source> <target>"; error.log "$RESULT"; return $(result)
+ fi
+ private.this.script.load ogit ogit.branch.get
+ # Clone layout: $OOSH_DIR is one stage's clone and holds only its own local
+ # branch — `<target>..<source>` there resolved to nothing and the y/N question
+ # came with an empty list. The folder of <source> holds both sides: the
+ # <source> commits (the merge step pushes them before it merges) and the
+ # fetched origin/<target> the merge fast-forwards to first. Where no folder
+ # holds <source> (worktree layout) the shared repository of $OOSH_DIR has it.
+ local dir range commits
+ dir=$(ogit.worktree.find "$source" "$OOSH_DIR")
+ dir="${dir:-$OOSH_DIR}"
+ ogit.remote.fetch no "$dir" >/dev/null || warn.log "promote: could not fetch in $dir — the preview uses its cached origin/$target"
+ if ogit.branch.check "origin/$target" "$dir"; then range="origin/$target..$source"
+ elif ogit.branch.check "$target" "$dir"; then range="$target..$source"
+ else
+   create.result 1 "no $target in $dir to compare $source with"
+   printf '%s\n' "  (cannot preview: $RESULT)"
+   return $(result)
+ fi
+ commits=$(ogit.commit.log.show "$range" "" oneline "$dir")
+ # Status idiom: the preview is what the y/N question asks about — plain
+ # stdout at every log level, never behind console.log.
+ if [ -n "$commits" ]; then printf '%s\n' "$commits"
+ else printf '%s\n' "  (nothing to merge: $target already has every commit of $source)"; fi
+ create.result 0 "previewed $range in $dir"
+ return $(result)
+}
+
+
+private.promote.merge.finish()     # <rc> <message> <stashed> <dir> # every way out of private.promote.merge.into.folder: pop the pre-merge stash of <dir> when <stashed> is yes, then RESULT <rc> <message>; a pop that fails (it conflicted: markers in the tree, the stash kept) warns, answers rc 1 and puts resolve-then-ogit stash.drop into RESULT #
+{
+ # The pop used to be `ogit.stash.pop … >/dev/null` on five paths: a pop that
+ # failed (the merge brought a change to the same lines) left the user's change
+ # in the stash and said "Merged". The rc of the merge stands either way.
+ #
+ # A pop fails because it CONFLICTS with what the merge brought: git writes
+ # conflict markers into the work tree and KEEPS the stash. Popping again after
+ # the resolve would re-apply the same change, so the follow-up is resolve,
+ # then DROP. And the step answers rc 1 even when the merge succeeded: the
+ # stage's tree holds conflict markers, so the state machine stops here, and a
+ # plain `promote` resumes at this step — the merge is then already up to date
+ # and the person's resolved change is stashed and popped around it again
+ # (T-PROMOTE-STASH-POP-FAILS).
+ local rc="$1" message="$2" stashed="$3" dir="$4" note=""
+ if [ "$stashed" = yes ] && ! ogit.stash.pop "$dir" >/dev/null; then
+   if [ "$rc" = 0 ]; then note=" — the merge is done, but your own changes in $dir conflict with it"
+   else note=" — your own changes in $dir could not be put back"; fi
+   note="$note: the pop left conflict markers in $dir and kept the changes in its stash. Resolve the conflicts in $dir, then run: ogit stash.drop $dir — and promote again"
+   warn.log "promote:${note# —}"
+   rc=1
+ fi
+ create.result "$rc" "$message$note"
  return $(result)
 }
 
@@ -681,7 +745,7 @@ private.check.confirmation.received() # <script> <stageTo> <stateFound> # confir
   fi
 
   important.log "Commits to be merged (dev → testing):"
-  ogit.commit.log.show testing..dev "" oneline "$OOSH_DIR"
+  private.promote.merge.preview.show dev testing
 
   echo
   local answer
@@ -694,7 +758,7 @@ private.check.confirmation.received() # <script> <stageTo> <stateFound> # confir
   return $(result)
 }
 
-private.promote.rewrite.self.branch() # <ooshDir> # rewrite OOSH_SELF_BRANCH defaults in init/oosh and Install oosh.command to the currently-checked-out branch and commit if changed
+private.promote.rewrite.self.branch() # <ooshDir> # rewrite EVERY OOSH_SELF_BRANCH default line in init/oosh and Install oosh.command to the currently-checked-out branch and commit if changed; rc 1 (RESULT names the files) when one keeps another default
 {
   private.this.script.load ogit ogit.branch.get
   local ooshDir="$1"
@@ -702,27 +766,56 @@ private.promote.rewrite.self.branch() # <ooshDir> # rewrite OOSH_SELF_BRANCH def
   branch=$(ogit.branch.get "$ooshDir")
   [ -z "$branch" ] && return 0
 
-  local sedFlag="-i"
-  [ "$(uname -s)" = "Darwin" ] && sedFlag="-i ''"
-
+  # replace edits the file the same way on every platform: no sed -i, and the
+  # path is an argument, not text for eval (a quote in it cannot break it).
   # Files that carry an OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-<branch>}"
-  # default line that must match the file's branch of origin.
+  # default line that must match the file's branch of origin. EVERY such line
+  # (the old sed rewrote them all): `replace lines` takes identical duplicates
+  # together, each distinct line once. A file that does not end up with the
+  # branch on every default line is a STOP, not a log line — the stage would
+  # ship with the wrong default (T-PROMOTE-SELF-BRANCH-EVERY-LINE / -STOPS).
   local targets=("init/oosh" "Install oosh.command")
-  local t
+  local pattern='^OOSH_SELF_BRANCH="\$\{OOSH_SELF_BRANCH:-[A-Za-z0-9_-]*\}"'
+  local t file current wanted failed=""
   for t in "${targets[@]}"; do
-    [ -f "$ooshDir/$t" ] || continue
-    eval sed $sedFlag "'s|^OOSH_SELF_BRANCH=\"\${OOSH_SELF_BRANCH:-[A-Za-z0-9_-]*}\"|OOSH_SELF_BRANCH=\"\${OOSH_SELF_BRANCH:-$branch}\"|' '$ooshDir/$t'"
+    file="$ooshDir/$t"
+    [ -f "$file" ] || continue
+    while IFS= read -r current; do
+      # what follows the default on the line (a comment, say) stays
+      wanted="OOSH_SELF_BRANCH=\"\${OOSH_SELF_BRANCH:-$branch}\"${current#*\}\"}"
+      [ "$current" = "$wanted" ] && continue
+      # loaded only when a line needs it; a load that fails leaves the line,
+      # and the check below names the file
+      private.this.script.load replace replace.lines || break
+      if replace.lines "$file" "$current" by && replace.by "$wanted" >/dev/null && replace.commit "$file" >/dev/null; then
+        replace.cleanup "$file"
+      else
+        replace.cleanup "$file"
+        break
+      fi
+    done < <(grep -E "$pattern" "$file" | sort -u)
+    # The check is the file itself: no default line may differ from the wanted one.
+    while IFS= read -r current; do
+      [ "$current" = "OOSH_SELF_BRANCH=\"\${OOSH_SELF_BRANCH:-$branch}\"${current#*\}\"}" ] || { failed="$failed $t"; break; }
+    done < <(grep -E "$pattern" "$file")
   done
+  if [ -n "$failed" ]; then
+    create.result 1 "the OOSH_SELF_BRANCH default could not be set to $branch in:$failed (in $ooshDir)"
+    error.log "promote: $RESULT"
+    return $(result)
+  fi
 
   if ! ogit.diff.check "$ooshDir" "${targets[@]}"; then
-    ogit.index.add all "$ooshDir" "${targets[@]}"
+    ogit.index.add all "$ooshDir" "${targets[@]}" >/dev/null || return $(result)
     # Pass committer identity inline so the commit succeeds even on
     # containers / CI runners without a global `git config user.email`
     # (e.g. test.promote's temp-dir rig). Uses a stable sentinel identity
     # so the git log shows this commit was machine-generated by promote.
     ogit.commit.create "chore(promote): set OOSH_SELF_BRANCH default to $branch" \
-        oosh-promote@local "oosh promote" "$ooshDir"
+        oosh-promote@local "oosh promote" "$ooshDir" >/dev/null || return $(result)
   fi
+  create.result 0 "OOSH_SELF_BRANCH default is $branch"
+  return $(result)
 }
 
 
@@ -896,7 +989,7 @@ private.check.confirmation.received.prod() # <script> <stageTo> <stateFound> # c
   fi
 
   important.log "Commits to be merged (testing → prod):"
-  ogit.commit.log.show prod..testing "" oneline "$OOSH_DIR"
+  private.promote.merge.preview.show testing prod
 
   echo
   local answer

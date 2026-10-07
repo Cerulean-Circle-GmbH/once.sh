@@ -12,13 +12,13 @@ else
   # remove the level parameter
   shift
 fi
-info.log "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 #echo "sourcing init"
 source this
 source test.suite
 
 log.level $level
+info.log "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 completionArray=(once config list file ite)
 source oo
@@ -650,6 +650,107 @@ test.promote.worktreeLayout() {
 test.case $level "T-PROMOTE-WORKTREE-LAYOUT: no testing folder is refused; prod merges in its own worktree" test.promote.worktreeLayout
 expect 0 "worktree layout: missing testing refused with the fix; prod merges in its worktree" "the pre-migration shape of a developer host"
 
+# The y/N question before a merge lists the commits it merges. In the clone
+# layout $OOSH_DIR (dev) holds only its own local branch: `testing..dev` there
+# resolved to nothing and the question came with an empty list.
+test.promote.previewListsCommits() {
+  local base fx bad="" out; base=$(test.promote.base pre); fx=$(dirname "$base")
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  private.this.script.load ogit ogit.branch.get
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  # the fixture's own empty config tier: no persisted PROMOTE_FORCE skips the question
+  local CONFIG_PATH="$fx/config"; mkdir -p "$CONFIG_PATH"
+  out=$(private.check.confirmation.received promote testing 15 </dev/null 2>/dev/null)
+  case "$out" in *"nothing to merge"*) ;; *) bad="$bad no-nothing-line=[$out]" ;; esac
+  printf 'previewed\n' >> "$base/dev/file"; git -C "$base/dev" -c user.email=t@t -c user.name=t commit -qam previewed
+  out=$(private.check.confirmation.received promote testing 15 </dev/null 2>/dev/null)
+  case "$out" in *previewed*) ;; *) bad="$bad testing-preview=[$out]" ;; esac
+  printf 'tested\n' >> "$base/testing/file"; git -C "$base/testing" -c user.email=t@t -c user.name=t commit -qam tested
+  out=$(private.check.confirmation.received.prod promote prod 30 </dev/null 2>/dev/null)
+  case "$out" in *tested*) ;; *) bad="$bad prod-preview=[$out]" ;; esac
+  case "$out" in *previewed*) bad="$bad prod-preview-lists-a-dev-only-commit" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the preview lists the commits each merge brings, or says there are none" || create.result 1 "promote:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-PREVIEW-LISTS-COMMITS: the y/N question before a merge to testing or prod lists the commits it merges" test.promote.previewListsCommits
+expect 0 "the preview lists the commits each merge brings, or says there are none" "clone layout: the refs live in the stage folders, not in \$OOSH_DIR"
+
+
+console.log "
+Test: private.promote.merge.preview.show
+===================================================================="
+
+test.case - "T-PROMOTE-PREVIEW-REQUIRES: no <source> <target> is refused" \
+   private.promote.merge.preview.show 
+expect 1 "private.promote.merge.preview.show requires <source> <target>"
+
+# The target folder's own changes are stashed around the merge. The decision
+# looked at unstaged changes only (ogit.diff.check): a STAGED-only change was
+# not stashed, and the fast-forward to origin/testing then refused with
+# "diverged". Here origin/testing moved on in x (last line), the testing
+# folder staged a change to x (first line) — both land; nothing diverged.
+test.promote.stashStaged() {
+  local base fx bad=""; base=$(test.promote.base sst); fx=$(dirname "$base")
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  private.this.script.load ogit ogit.branch.get
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  git -C "$base/main" checkout -q testing; printf 'a\nb\nc\nd\ne\nf\ng\n' > "$base/main/x"; git -C "$base/main" add x
+  git -C "$base/main" -c user.email=t@t -c user.name=t commit -qm x; git -C "$base/main" push -q origin testing
+  git -C "$base/testing" pull -q
+  printf 'a\nb\nc\nd\ne\nf\nG\n' > "$base/main/x"; git -C "$base/main" -c user.email=t@t -c user.name=t commit -qam G; git -C "$base/main" push -q origin testing
+  printf 'A\nb\nc\nd\ne\nf\ng\n' > "$base/testing/x"; git -C "$base/testing" add x
+  printf 'new\n' >> "$base/dev/file"; git -C "$base/dev" -c user.email=t@t -c user.name=t commit -qam new
+  private.check.merged.to.testing promote testing 16 >/dev/null 2>&1 || bad="$bad rc=[$RESULT]"
+  git -C "$base/testing" log --oneline | grep -q new || bad="$bad not-merged"
+  [ "$(head -1 "$base/testing/x")$(tail -1 "$base/testing/x")" = AG ] || bad="$bad staged-change-or-upstream-lost=[$(tr '\n' ' ' < "$base/testing/x")]"
+  [ -z "$(git -C "$base/testing" stash list)" ] || bad="$bad stash-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a staged-only change is stashed around the merge and comes back" || create.result 1 "promote:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-STASH-STAGED: a staged-only change in the target folder is stashed, not reported as diverged" test.promote.stashStaged
+expect 0 "a staged-only change is stashed around the merge and comes back" "ogit.diff.check saw unstaged changes only"
+
+# A pop that fails (the merge brought a change to the same line) writes
+# conflict markers into the work tree and KEEPS the stash. The step stops with
+# rc 1 — the merge itself is done, the folder needs the person — and the advice
+# is resolve, then DROP the stash: popping it again re-applies the same change.
+test.promote.stashPopFails() {
+  local base fx bad="" rc; base=$(test.promote.base spf); fx=$(dirname "$base")
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  private.this.script.load ogit ogit.branch.get
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  printf 'mine\n' > "$base/testing/file"
+  printf 'theirs\n' > "$base/dev/file"; git -C "$base/dev" -c user.email=t@t -c user.name=t commit -qam theirs
+  private.check.merged.to.testing promote testing 16 >/dev/null 2>&1
+  rc=$?
+  [ "$rc" = 1 ] || bad="$bad rc=$rc"
+  case "$RESULT" in *"$base/testing"*) ;; *) bad="$bad folder-unnamed=[$RESULT]" ;; esac
+  case "$RESULT" in *"Merged dev into testing"*) ;; *) bad="$bad merge-not-reported-done=[$RESULT]" ;; esac
+  case "$RESULT" in *"ogit stash.drop $base/testing"*) ;; *) bad="$bad no-drop-advice=[$RESULT]" ;; esac
+  case "$RESULT" in *"ogit stash.pop"*) bad="$bad pop-again-advised=[$RESULT]" ;; esac
+  git -C "$base/testing" log --oneline | grep -q theirs || bad="$bad not-merged"
+  [ -n "$(git -C "$base/testing" stash list)" ] || bad="$bad stash-gone"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a failed pop stops the step: merged, resolve, then drop the stash; the change stays in the stash" || create.result 1 "promote:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-STASH-POP-FAILS: a pre-merge stash that cannot be popped stops the step with resolve-then-drop advice" test.promote.stashPopFails
+expect 0 "a failed pop stops the step: merged, resolve, then drop the stash; the change stays in the stash" "a failed pop answered rc 0 and advised popping the stash again"
+
+
+console.log "
+Test: private.promote.merge.finish
+===================================================================="
+
+test.case - "T-PROMOTE-MERGE-FINISH: nothing stashed, RESULT is rc and message" \
+   private.promote.merge.finish 1 mergeFailed no /nonexistent
+expect 1 "mergeFailed"
+
 ### test.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1038,9 +1139,9 @@ unset _PROMOTE_PLATFORM_TEST_OUTCOME _rc _mustPass
 #
 # Combined with T-PROMOTE-15 ("failed check keeps state unchanged" — generic
 # state machine guarantee), T-PROMOTE-PLATFORM-1/2/3 (dispatch returns 0/1
-# from `os platform.test`), and the resume guard at promote:113-125, these
+# from `os platform.test`), and the resume guard in promote.testing.to.prod, these
 # invariants imply the user-visible resume cycle. End-to-end mocking is
-# avoided here because state.check at state:288 re-sources `promote` on
+# avoided here because state.check re-sources `promote` on
 # every state advancement (via $stateScript=promote), which would wipe any
 # in-shell override of `private.check.platform.test.dispatch`.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1078,7 +1179,7 @@ done
 _resumeCount=${#_resumeMustPass[@]}
 
 # T-PROMOTE-RESUME-1: PROMOTE has one state per must-pass platform.
-# Use state.find (the documented OOSH lookup, state:542) — it returns 0 and
+# Use state.find (the documented OOSH lookup) — it returns 0 and
 # echoes the state id when the name exists, returns 1 otherwise.
 test.case $level "T-PROMOTE-RESUME-1: one state per must-pass platform (per-platform granularity)" \
   echo "(state.find PROMOTE platform.test.<name> id, per platform)"
@@ -1099,7 +1200,7 @@ fi
 
 # T-PROMOTE-RESUME-2: each platform has its own check stub.
 # Use this.functionExists (the documented OOSH function-presence check —
-# oosh-architecture.md:356, this:366) instead of `type ... >/dev/null`.
+# docs/oosh-architecture.md, this.functionExists in this) instead of `type ... >/dev/null`.
 test.case $level "T-PROMOTE-RESUME-2: each platform has its own check function" \
   echo "(this.functionExists private.check.platform.test.<name>, per platform)"
 _missingStubs=""
@@ -1115,7 +1216,7 @@ else
 fi
 
 # T-PROMOTE-RESUME-3: every platform state is within the resume-guard range
-# at promote:119:  [ $state -ge 20 ] && [ $state -le $((PROMOTE_PROD_LAST_STATE + 1)) ]
+# in promote.testing.to.prod:  [ $state -ge 20 ] && [ $state -le $((PROMOTE_PROD_LAST_STATE + 1)) ]
 # Use state.find (capturing the id via subshell) instead of walking
 # PROMOTE_STATES directly.
 test.case $level "T-PROMOTE-RESUME-3: every platform state is within the resume-guard range" \
@@ -1138,11 +1239,11 @@ unset _resumeMustPass _resumeCount _platformStateCount _missingStates _missingSt
 unset _highestPlatformIdx _id _p
 
 # Restore the developer's PROMOTE machine again. The original restore at
-# the top of file (lines 442-460) ran *before* the RESUME tests above,
+# the top of file ran *before* the RESUME tests above,
 # which delete-and-recreate PROMOTE. Without this second restore, the
 # suite leaves PROMOTE in a freshly-initialised state (state ≤ 4 +
 # PROMOTE_PROD_LAST_STATE unset in PROMOTE.promote.env). A subsequent
-# `oo stage testing` then hits the resume guard at promote:119 with state
+# `oo stage testing` then hits the resume guard in promote.testing.to.prod with state
 # out of [20, _prodMax+1] range and re-initialises — silently losing any
 # in-progress prod-path promotion. Same backup vars (set at file top).
 state.machine.exists PROMOTE 2>/dev/null && state.machine.delete PROMOTE >/dev/null 2>&1
@@ -1377,5 +1478,105 @@ if type promote.testing.to.prod 2>/dev/null | grep -qE 'PROMOTE_FORCE=""'; then
 else
   expect.fail "promote.testing.to.prod must reset PROMOTE_FORCE=\"\" on a no-arg/reset run"
 fi
+
+# ============================================================================
+# T-PROMOTE-SELF-BRANCH-REPLACE: the rewrite goes through the replace verbs, not sed -i
+# ============================================================================
+# A path with a space and an apostrophe, a second run that changes nothing, and
+# uname answering Darwin with a recording sed: no `sed -i` on either platform.
+test.promote.selfBranchReplace() {
+  local fx bad="" dir real inodeA inodeB
+  fx=$(test.suite.fixture.make selfbranch); dir="$fx/it's here"
+  mkdir -p "$dir/init" "$fx/bin"
+  printf '#!/bin/sh\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\necho keep\n' > "$dir/init/oosh"
+  printf '#!/usr/bin/env bash\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\n' > "$dir/Install oosh.command"
+  real=$(command -v sed)
+  printf '#!/bin/sh\necho "$*" >> "%s/sed.calls"\nexec "%s" "$@"\n' "$fx" "$real" > "$fx/bin/sed"
+  printf '#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; else exec /usr/bin/uname "$@"; fi\n' > "$fx/bin/uname"
+  chmod +x "$fx/bin/sed" "$fx/bin/uname"
+  (
+    ogit.branch.get() { echo testing; }
+    ogit.diff.check() { return 0; }
+    PATH="$fx/bin:$PATH"
+    private.promote.rewrite.self.branch "$dir" >/dev/null 2>&1
+  )
+  grep -qx 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"' "$dir/init/oosh" || bad="$bad init-not-rewritten=[$(grep OOSH_SELF "$dir/init/oosh")]"
+  grep -qx 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"' "$dir/Install oosh.command" || bad="$bad command-not-rewritten"
+  grep -qx 'echo keep' "$dir/init/oosh" || bad="$bad other-line-lost"
+  [ -f "$fx/sed.calls" ] && grep -q -e '-i' "$fx/sed.calls" && bad="$bad sed-i-called(Darwin stub): $(cat "$fx/sed.calls")"
+  inodeA=$(ls -i "$dir/init/oosh")
+  (
+    ogit.branch.get() { echo testing; }
+    ogit.diff.check() { return 0; }
+    private.promote.rewrite.self.branch "$dir" >/dev/null 2>&1
+  )
+  inodeB=$(ls -i "$dir/init/oosh")
+  [ "$inodeA" = "$inodeB" ] || bad="$bad rewritten-again"
+  [ -z "$(ls "$dir/init" | grep -E '\.(bak|new)')" ] && [ -z "$(ls "$dir" | grep -E '\.(bak|new)')" ] || bad="$bad bak-or-new-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the default is rewritten through replace, once, on any platform" || create.result 1 "self branch rewrite:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-SELF-BRANCH-REPLACE: rewrite uses replace.line, survives a quote in the path, runs once, no sed -i" test.promote.selfBranchReplace
+expect 0 "the default is rewritten through replace, once, on any platform" "eval sed -i broke on an apostrophe and forked GNU/BSD flags"
+
+# ============================================================================
+# T-PROMOTE-SELF-BRANCH-EVERY-LINE / -STOPS: every default line is rewritten, a file that cannot be is a stop
+# ============================================================================
+# `replace line` needs exactly one whole-line match: two identical default
+# lines were refused, promote logged an error and went on — the stage shipped
+# with the wrong default. The old sed rewrote every matching line. A real repo
+# on branch testing (no stubbed ogit method).
+test.promote.selfBranchRepo() { # <dir> # a git repo on branch testing holding init/oosh with two identical default lines and Install oosh.command with two different ones
+  mkdir -p "$1/init"
+  printf '#!/bin/sh\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\necho keep\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\n' > "$1/init/oosh"
+  printf '#!/usr/bin/env bash\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-prod}" # second\n' > "$1/Install oosh.command"
+  git -C "$1" init -q -b testing
+  git -C "$1" add init/oosh "Install oosh.command"
+  git -C "$1" -c user.email=t@t -c user.name=t commit -q -m seed
+}
+test.promote.selfBranchEveryLine() {
+  local fx dir bad="" rc
+  fx=$(test.suite.fixture.make selfbranchevery); dir="$fx/repo"
+  test.promote.selfBranchRepo "$dir"
+  private.promote.rewrite.self.branch "$dir" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] || bad="$bad rc=$rc[$RESULT]"
+  [ "$(grep -c -x -F 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"' "$dir/init/oosh")" = 2 ] || bad="$bad init=[$(grep OOSH_SELF "$dir/init/oosh" | tr '\n' ' ')]"
+  grep -q -x -F 'echo keep' "$dir/init/oosh" || bad="$bad other-line-lost"
+  grep -q -x -F 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}"' "$dir/Install oosh.command" \
+    && grep -q -x -F 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-testing}" # second' "$dir/Install oosh.command" \
+    || bad="$bad command=[$(grep OOSH_SELF "$dir/Install oosh.command" | tr '\n' ' ')]"
+  [ -z "$(git -C "$dir" status --porcelain)" ] || bad="$bad not-committed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "every OOSH_SELF_BRANCH default line carries the branch" || create.result 1 "self branch:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-SELF-BRANCH-EVERY-LINE: two identical and two different default lines all get the branch" test.promote.selfBranchEveryLine
+expect 0 "every OOSH_SELF_BRANCH default line carries the branch" \
+  "replace line refused two identical lines and promote went on with the wrong default"
+
+# A file that cannot be brought to the wanted state (here: a symlink, which
+# replace commit refuses) stops the merge step with rc 1 — the merge is done,
+# RESULT names the file.
+test.promote.selfBranchStops() {
+  local base fx bad="" rc; base=$(test.promote.base sbs); fx=$(dirname "$base")
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$fx/origin.git" ] || { rm -rf "$fx"; create.result 1 "fixture origin is not the local bare repo"; return $(result); }
+  private.this.script.load ogit ogit.branch.get
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  local OOSH_DIR="$base/dev"; export OOSH_DIR
+  mkdir -p "$base/dev/init"
+  printf '#!/bin/sh\nOOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"\n' > "$base/dev/init/oosh.real"
+  ln -s oosh.real "$base/dev/init/oosh"
+  git -C "$base/dev" add init; git -C "$base/dev" -c user.email=t@t -c user.name=t commit -qm link
+  private.check.merged.to.testing promote testing 16 >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] || bad="$bad rc=$rc"
+  case "$RESULT" in *"Merged dev into testing"*"init/oosh"*) ;; *) bad="$bad result=[$RESULT]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a default that cannot be set stops the step" || create.result 1 "self branch:$bad"
+  return $(result)
+}
+test.case $level "T-PROMOTE-SELF-BRANCH-STOPS: a file whose default cannot be set stops the merge step" test.promote.selfBranchStops
+expect 0 "a default that cannot be set stops the step" \
+  "the rewrite logged an error and promote went on as Merged"
 
 test.suite.save.results

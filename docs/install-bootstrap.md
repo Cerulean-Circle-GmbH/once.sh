@@ -137,8 +137,9 @@ Still deliberately *not* carried: `BASH_FILE` and `SUDO` (recomputed, more corre
 fail confusingly rather than cleanly — and it drives an interactive credential prompt that an
 unattended installer cannot answer anyway).
 
-> Guarded by `test.install` **T-INIT-HOME-RECOVERY**, **T-HOME-RECOVERY-NSS** (a two-line `getent`
-> answer still recovers line 1's home — asserted by running *both* recovery blocks with a stub),
+> Guarded by `test.install` **T-INIT-HOME-RECOVERY**, **T-HOME-RECOVERY-NO-GETENT** (the home
+> comes from the shell's own `~user`, then `dscl`, then `/etc/passwd` — no `getent` at runtime;
+> asserted by running *both* recovery blocks with a stub `getent` that must never be asked),
 > **T-INIT-CLEAN-ENV** (re-exec present, guarded, names an interpreter, no `env -S`),
 > **T-INIT-CLEAN-ENV-CARRY** (`SUDO_USER`, `OOSH_REPO`, `USER` and `LOGNAME` actually cross),
 > **T-INIT-CLEAN-ENV-ABSENT** (an unset `GIT_SSH_COMMAND` reaches the child unset, a set one verbatim),

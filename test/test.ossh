@@ -81,14 +81,38 @@ expect 0 "remote prelude: user.env when present, ~/oosh on PATH otherwise, POSIX
 test.ossh.cmdNonInteractive() {
   local out bad=""
   out=$(
-    private.ossh.ssh() { case "$*" in *"command -v"*) return 1 ;; esac; echo "$*"; }
+    # `(pattern)`: bash before 5.2 reads a bare `pattern)` inside $( … ) as
+    # its end — AlmaLinux 9's bash 5.1 (T-ALL-SCRIPTS-PARSE).
+    private.ossh.ssh() { case "$*" in (*"command -v"*) return 1 ;; esac; echo "$*"; }
     ossh.pm.discover() { echo "apt-get install -y"; }
     ossh.cmd somehost tree 2>/dev/null
   )
   case "$out" in
-    *"sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 apt-get install -y tree"*) ;;
+    *"sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 LC_ALL=C.UTF-8 DEBCONF_NOWARNINGS=yes apt-get install -y tree"*) ;;
     *) bad="$bad ossh.cmd=>[$out]" ;;
   esac
+  # What goes in front of the remote package manager is oo's answer
+  # (private.oo.pm.install.prefix.get): no sudo before brew (Homebrew refuses
+  # it), sudo + env before apt-get, sudo before dnf and apk — as before.
+  local pm want
+  for pm in "brew install" "apt-get -y install" "dnf -y install" "apk add"; do
+    case "$pm" in
+      "brew install")       want="sudo" ;;
+      "apt-get -y install") want="sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 LC_ALL=C.UTF-8 DEBCONF_NOWARNINGS=yes apt-get -y install tree" ;;
+      *)                    want="sudo $pm tree" ;;
+    esac
+    out=$(
+      private.ossh.ssh() { case "$*" in (*"command -v"*) return 1 ;; esac; echo "$*"; }
+      ossh.pm.discover() { echo "$pm"; }
+      ossh.cmd somehost tree 2>/dev/null
+    )
+    out=$(printf '%s' "$out" | tr -s ' ')   # a doubled space is not a different command
+    case "$pm" in
+      "brew install") case "$out" in *sudo*) bad="$bad brew-has-sudo=[$out]" ;; esac
+                      case "$out" in *"brew install tree"*) ;; *) bad="$bad brew=[$out]" ;; esac ;;
+      *) case "$out" in *"-tt somehost $want"|*"-tt somehost $want "*) ;; *) bad="$bad $pm=[$out]-want-[$want]" ;; esac ;;
+    esac
+  done
   out=$(
     private.ossh.ssh() { echo "$*"; }
     private.ossh.harden.preflight() { return 0; }
@@ -109,6 +133,57 @@ test.case - "T-OSSH-CMD-NONINTERACTIVE: ossh.cmd and ossh.harden.packages run th
   test.ossh.cmdNonInteractive
 expect 0 "ossh.cmd and ossh.harden.packages send the non-interactive prefix" \
   "the remote counterpart of oo cmd sent a bare sudo \$pmCmd — apt's tzdata prompt hangs it"
+
+# T-OSSH-INSTALL-HOST-NAME: a local install names the computer through private.config.host.name.get
+test.ossh.installHostName() {
+  local body bad=""; body=$(declare -f ossh.install.continue.local)
+  case "$body" in *private.config.host.name.get*) ;; *) bad="$bad no-getter" ;; esac
+  case "$body" in *'sshConfigNameUsedForLocal="$HOSTNAME"'*) bad="$bad raw-HOSTNAME" ;; esac
+  [ -z "$bad" ] && create.result 0 "the install names the computer through the getter" || create.result 1 "install host name:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-INSTALL-HOST-NAME: a local install names the computer through the getter, not \$HOSTNAME" test.ossh.installHostName
+expect 0 "the install names the computer through the getter" "\$HOSTNAME is a container's ID"
+
+# T-OSSH-KEY-NAME-NO-HOSTNAME: the SSH key name carries the computer name without the hostname program
+# The key name is <user>.<hostname -f>. AlmaLinux 9's minimal image has no
+# hostname program, so the name part came out empty ("someone."). Without the
+# program the name comes from the kernel (private.this.host.name.get full, the
+# HOSTNAME of bash); with it the name stays byte-identical — existing keys are
+# found by that name. The expected names with a hostname stub were captured
+# from the code before the change. Both sites: private.ossh.get.key.name and
+# private.ossh.set.key.name without a name. config save writes to a fixture.
+test.ossh.keyNameNoHostname() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make test.ossh.keyNameNoHostname)
+  test.ossh.keyNameNoHostname.run() { # <box|gha|none> — echo "<get name>|<set name>" with that hostname program
+    M="$1" FX="$fx" LOG_LEVEL=1 bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1
+      export CONFIG_PATH="$FX" USER=someone LOG_LEVEL=1; unset SSH_KEY_NAME OOSH_SSH_CONFIG_HOST
+      HOSTNAME=alma9.example.org
+      case "$M" in
+        box)  hostname() { [ "$1" = -f ] && echo box.example.org; } ;;
+        gha)  hostname() { [ "$1" = -f ] && echo "sat12-bq160 ssh.runner.example"; } ;;
+        none) command()  { [ "$1 $2" = "-v hostname" ] && return 1; builtin command "$@"; }
+              hostname() { return 127; } ;;   # the program is not there
+      esac
+      get=$(private.ossh.get.key.name 2>/dev/null)
+      unset SSH_KEY_NAME; private.ossh.set.key.name >/dev/null 2>&1
+      printf "%s|%s" "$get" "$SSH_KEY_NAME"' 2>/dev/null </dev/null
+  }
+  got=$(test.ossh.keyNameNoHostname.run none)
+  [ "$got" = "someone.alma9.example.org|someone.alma9.example.org" ] || bad="$bad no-hostname=[$got]"
+  got=$(test.ossh.keyNameNoHostname.run box)
+  [ "$got" = "someone.box.example.org|someone.box.example.org" ] || bad="$bad box-changed=[$got]"
+  got=$(test.ossh.keyNameNoHostname.run gha)
+  [ "$got" = "someone.sat12-bq160ssh.runner.example|someone.sat12-bq160ssh.runner.example" ] || bad="$bad gha-changed=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the key name carries the computer name with and without hostname" || create.result 1 "key name:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-KEY-NAME-NO-HOSTNAME: without the hostname program the SSH key name carries HOSTNAME; with it the name is unchanged" test.ossh.keyNameNoHostname
+expect 0 "the key name carries the computer name with and without hostname" \
+  "AlmaLinux minimal has no hostname program — the key name was <user>. with an empty computer part"
 
 ### test.method
 
@@ -703,13 +778,36 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 private.this.script.load ogit ogit.branch.get
 BRANCH_BODY=$(declare -f ogit.branch.get 2>/dev/null)
-test.case $level "T-BRANCH-SHORT-EXISTS: this.git.branch.short is defined" \
-  type this.git.branch.short
-if [ "$RETURN_VALUE" -eq 0 ]; then
-  expect.pass "this.git.branch.short is a function"
-else
-  expect.fail "this.git.branch.short not defined"
-fi
+# T-OSSH-BRANCH-NO-ALIAS: the install methods ask ogit.branch.get — they work without this.git.branch.short
+# this.git.branch.short was a second name for ogit.branch.get; the owner
+# decided it goes (T-BRANCH-SHORT-EXISTS, which asserted it, is retired). Each
+# of the three sites (the push of init/oosh, the local install continuation,
+# the remote user install): its own line, run with the alias unset on a fixture
+# repository, gives the fixture's branch; the ogit load stands before it; no
+# call of the alias is left in ossh.
+test.ossh.branchNoAlias() {
+  local fx bad="" fn body site got hits loadAt siteAt
+  fx=$(test.suite.fixture.make osshbranchnoalias)
+  git init -q -b feature-x "$fx/repo"; git -C "$fx/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m seed
+  private.this.script.load ogit ogit.branch.get
+  for fn in private.push.init.oosh ossh.install.continue.local ossh.install.user.remote; do
+    body=$(declare -f "$fn")
+    site=$(printf '%s\n' "$body" | grep -m1 'ogit\.branch\.get "\$OOSH_DIR"')
+    [ -n "$site" ] || { bad="$bad $fn-no-ogit-site"; continue; }
+    loadAt=$(printf '%s\n' "$body" | grep -n -m1 'private\.this\.script\.load ogit' | cut -d: -f1)
+    siteAt=$(printf '%s\n' "$body" | grep -n -m1 'ogit\.branch\.get "\$OOSH_DIR"' | cut -d: -f1)
+    { [ -n "$loadAt" ] && [ "$loadAt" -lt "$siteAt" ]; } || bad="$bad $fn-ogit-not-loaded-before"
+    got=$( unset -f this.git.branch.short; OOSH_DIR="$fx/repo"; unset currentBranch OOSH_BRANCH ooshBranch; eval "${site#"${site%%[! ]*}"}"; echo "$currentBranch$OOSH_BRANCH$ooshBranch" )
+    [ "$got" = feature-x ] || bad="$bad $fn=[$got]"
+  done
+  hits=$(grep -n 'this\.git\.branch\.short' "$OOSH_DIR/ossh" | cut -d: -f1 | tr '\n' ' ')
+  [ -z "$hits" ] || bad="$bad alias-callers=[$hits]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the branch comes from ogit.branch.get, the alias is not called" || create.result 1 "branch alias:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-BRANCH-NO-ALIAS: ossh asks ogit.branch.get — it works without this.git.branch.short" test.ossh.branchNoAlias
+expect 0 "the branch comes from ogit.branch.get, the alias is not called" "one getter had two names"
 
 for prefix in "refs/heads/" "refs/remotes/origin/" "heads/origin/" "origin/"; do
   test.case $level "T-BRANCH-SHORT-STRIP-$prefix: body strips '$prefix' prefix" \
@@ -1224,6 +1322,33 @@ test.ossh.foldFixCheckRcZero() {
 test.ossh.foldFixCheckRcZero
 expect 0 "rc=0 with drift" "check returns 0 even when drift detected"
 
+# T-FOLDER-FIX-CHECK-BSD-STAT: a canonical ~/.ssh shows no perms drift where stat has no -c
+# ossh.folder.fix.check read the modes with a bare GNU `stat -c '%a'`: on macOS
+# (BSD stat) every file and folder came back empty and was reported as wrong.
+# The mode comes from the kernel's private.this.path.stat.get. The stub is a
+# stat that knows only the BSD spelling, as on macOS.
+test.ossh.folderFixCheckBsdStat() {
+  local fx ssh out
+  fx=$(test.suite.fixture.make test.ossh.folderFixCheckBsdStat); ssh="$fx/ssh"
+  mkdir -p "$ssh"; chmod 700 "$ssh"
+  echo key > "$ssh/id_ed25519"; chmod 600 "$ssh/id_ed25519"
+  echo pub > "$ssh/id_ed25519.pub"; chmod 644 "$ssh/id_ed25519.pub"
+  out=$( stat() {
+           case "$1" in
+             -c) echo "stat: illegal option -- c" >&2; return 1 ;;
+             -f) [ "$2" = "%Lp" ] || return 1; command stat -c %a "$3" 2>/dev/null || command stat -f %Lp "$3" ;;
+           esac; }
+         export LOG_LEVEL=5 LOG_DEVICE="$fx/log.out"
+         ossh.folder.fix.check "$ssh" >/dev/null 2>&1
+         grep -c -e "wrong perms" -e "wrong dir perms" "$fx/log.out" )
+  rm -rf "$fx"
+  [ "$out" = 0 ] && create.result 0 "no perms drift on a canonical ~/.ssh with BSD stat" || create.result 1 "perms drift reported: $out"
+  return $(result)
+}
+test.case $level "T-FOLDER-FIX-CHECK-BSD-STAT: a canonical ~/.ssh shows no perms drift where stat has no -c" \
+  test.ossh.folderFixCheckBsdStat
+expect 0 "no perms drift on a canonical ~/.ssh with BSD stat" "macOS stat has no -c — every mode read empty"
+
 # T-FOLDER-FIX-CONFIG-NORMALIZE-WODA: normalises absolute IdentityFile paths in WODA Host blocks
 # to the portable ~/.ssh/id_ed25519 form.
 test.ossh.foldFixConfigNormalizeWoda() {
@@ -1365,4 +1490,51 @@ test.ossh.backupPrecedesUserInit() {
 test.case $level "T-INSTALL-SSH-BACKUP-ORDER: the snapshot precedes user init" \
   test.ossh.backupPrecedesUserInit
 expect 0 "snapshot first" "user init writes the three WODA Host aliases into ~/.ssh/config"
+
+# T-OSSH-SCRIPT-LOAD: ossh loads another oosh script through the kernel loader
+# ============================================================================
+# A bare `source oo` re-runs this.start and leaves This pointing at oo, so ossh's
+# own help and dispatch would describe oo. The fixture scripts clobber This the way
+# a real one does; each method must leave it as it was and find its function.
+test.ossh.scriptLoad() {
+  local fx bad="" out savedThis="$This"; fx=$(test.suite.fixture.make osshload)
+  printf '%s\n' 'This=clobbered-oo' 'private.oo.pm.env.get() { echo "env FX=1"; }' \
+    'private.oo.pm.install.prefix.get() { echo "sudo env FX=1"; }' \
+    'oo.cmd() { FX_OOCMD="$FX_OOCMD ${1}"; return 0; }' > "$fx/oo"
+  (
+    local OOSH_DIR="$fx"
+    unset -f private.oo.pm.env.get private.oo.pm.install.prefix.get oo.cmd
+    private.ossh.ssh() { case "$*" in (*"command -v"*) return 1 ;; esac; echo "$*"; }
+    ossh.pm.discover() { echo "apt-get install -y"; }
+    ossh.cmd somehost tree >/dev/null 2>&1; [ "$This" = "$savedThis" ] || echo "cmd-This=[$This]"
+    [ "$(type -t private.oo.pm.install.prefix.get)" = function ] || echo "cmd-not-loaded"
+    unset -f private.oo.pm.env.get private.oo.pm.install.prefix.get oo.cmd
+    private.ossh.harden.preflight() { return 0; }
+    ossh.harden.packages somehost >/dev/null 2>&1; [ "$This" = "$savedThis" ] || echo "harden-This=[$This]"
+    [ "$(type -t private.oo.pm.env.get)" = function ] || echo "harden-not-loaded"
+    unset -f private.oo.pm.env.get oo.cmd
+    FX_OOCMD=""
+    ossh.prereqs.install >/dev/null 2>&1; [ "$This" = "$savedThis" ] || echo "prereqs-This=[$This]"
+    [ "$FX_OOCMD" = " rsync tree diff" ] || echo "prereqs-calls=[$FX_OOCMD]"
+  ) > "$fx/out" 2>&1
+  bad=$(cat "$fx/out")
+  # no hand-written load of another oosh script outside ossh.start (this, line, os)
+  local line code fn="" stray=""
+  while IFS= read -r line; do
+    case "$line" in ([a-z]*"()"*) fn="${line%%\(*}" ;; esac
+    code="${line#"${line%%[![:space:]]*}"}"
+    case "$code" in
+      ("source "*|*"|| source "*)
+        case "$code" in (*'$CONFIG'*|*'"$cfg"'*|*'"$file"'*|*'.states.env'*) continue ;; esac
+        [ "$fn" = ossh.start ] || stray="$stray [$fn:$code]" ;;
+    esac
+  done < "$OOSH_DIR/ossh"
+  [ -z "$stray" ] || bad="$bad hand-loads:$stray"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh loads oo through private.this.script.load and keeps This" || create.result 1 "script load:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-SCRIPT-LOAD: ossh loads oo/os/state through private.this.script.load; This stays ossh" test.ossh.scriptLoad
+expect 0 "ossh loads oo through private.this.script.load and keeps This" "a bare source clobbers This — help and dispatch would describe oo"
+
 test.suite.save.results

@@ -25,7 +25,9 @@ A raw git call is allowed only when it carries a comment-anchored marker:
 | `# ogit-exception: <reason>` | on the same line, or within the **5 lines above** it (calls inside a heredoc or a `bash -c` string cannot carry it on the line) | one sanctioned call |
 | `# ogit-exception-file: <reason>` | on its own comment line, anywhere in the file | a whole file that runs before oosh exists (`init/oosh`, `init/once`, `Install oosh.command`) |
 
-Excluded from the sweep: `ogit` itself, `docs/`, `test/`, `.claude/`, `old/`, `restore/`, `*.md`, `*.json`. Lines that are only comments never count. If git cannot list any tracked files (no repository, or a "dubious ownership" refusal) the validator reports `INVALID`, never a silent `OK`.
+A raw git call is any of four spellings: `git <subcommand>`; the binary by its path, `/usr/bin/git <subcommand>`; a lookup used as the command, `"$(command -v git)" <subcommand>` or `$(which git) <subcommand>`; and the assignment of the binary to a variable, `GIT=$(command -v git)`, `gitBin=/usr/bin/git` — the later call through `$GIT` cannot be seen, so the assignment is what counts. A presence check such as `[ -x "$(command -v git)" ]` is no call.
+
+Excluded from the sweep: `ogit` itself, `docs/`, `test/`, `.claude/`, `old/`, `restore/`, `*.md`, `*.json`. Lines that are only comments never count. If git cannot list any tracked files (no repository, nothing tracked, or a "dubious ownership" refusal) the validator reports `INVALID` with rc 2, never a silent `OK` — the kernel's `private.this.tree.tracked.check`, the guard all four tree validators share; the sweep itself is `private.this.marker.sweep` ([oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)).
 
 ### Conventions
 
@@ -33,7 +35,7 @@ Excluded from the sweep: `ogit` itself, `docs/`, `test/`, `.claude/`, `old/`, `r
 - **Skipping an optional positional:** pass an empty string — `ogit remote.push "" no "$dir"` pushes the tracking branch, without tags, in `$dir`.
 - **Getters vs mutators.**
   - *Getters* (`*.get`, `*.list`, `*.check`, `*.show`, `branch.find`, …) answer on stdout or by rc, never call `create.result`, and are silent (git stderr goes to `/dev/null`). That makes them safe inside tab completion and `$( … )`.
-  - *Mutators* (`branch.checkout`, `remote.pull`, `commit.create`, `safeDirectory.add`, …) call `create.result` and `return $(result)`. They run git through `private.ogit.git.run`, which keeps git's stderr; on failure `RESULT` is the ogit message followed by ` — git: <git's own error text>`, e.g. `could not check out feature/x in /home/…/dev — git: error: pathspec 'feature/x' did not match any file(s) known to git`.
+  - *Mutators* (`branch.checkout`, `remote.pull`, `commit.create`, `safeDirectory.add`, …) call `create.result` and `return $(result)`. They run git through `private.ogit.git.run`, which keeps git's stderr; on failure `RESULT` is the ogit message followed by ` — git: <git's own error text>`, e.g. `could not check out feature/x in /home/…/dev — git: error: pathspec 'feature/x' did not match any file(s) known to git`. In a shared repository (`core.sharedRepository` set) git runs with umask 002 — git does not apply the setting to every file it writes (FETCH_HEAD, COMMIT_EDITMSG, a checked-out work-tree file). `private.ogit.umask.get` makes that decision once; `commit.create` with the editor (which needs the terminal, so its output is not captured) applies the same umask.
   - A mutator that finds no git binary fails with rc 127 and ``ogit: git is not installed — run `oo cmd git` ``.
 - Some getters return their answer in `RESULT` rather than on stdout; the tables say so (`commit.count`, `branch.compare`).
 
@@ -60,8 +62,8 @@ The folder helpers the converters use are kernel methods, shared with other scri
 
 `ogit` follows [oosh-architecture.md § Completion Function Rules](oosh-architecture.md#completion-function-rules):
 
-- **Parameter completion** (`ogit.parameter.completion.<param>`) holds only the **domain types** shared by every method with that parameter name: `dir targetDir path base branch ref tag remote paths pathspecs asEmail`.
-- **Method completion** (`ogit.<method>.completion.<param>`) holds a method's own parameters (`from`, `to`, `a`, `b`, `range`, `startPoint`, `commit`, `treeRoot`), method-specific enumerations (`source`, `format`, `scope`, `side`, `tags`, `prune`, `pattern`, `key`, `file`) and specialisations (`worktree.delete <path>` offers only linked worktrees).
+- **Parameter completion** (`ogit.parameter.completion.<param>`) holds only the **domain types** shared by every method with that parameter name: `dir targetDir path base branch ref tag remote paths pathspecs asEmail`, and `startPoint commit from to a b range`, which answer like `ref`.
+- **Method completion** (`ogit.<method>.completion.<param>`) holds a method's own parameters (`treeRoot`) and method-specific enumerations (`source`, `format`, `scope`, `side`, `tags`, `prune`, `pattern`, `key`, `file`).
 - Both call private list getters, never each other. Docstrings carry no unpaired apostrophe; check with `./c2 signature.validate ogit`.
 
 ![ogit method tree](puml/ogit.tree/ogit.tree.drawio)
@@ -111,6 +113,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `repo.check` | `<?dir:$OOSH_DIR>` | rc 0 when `<dir>` is inside a git repository |
 | `repo.root.get` | `<?dir:$PWD>` | echo the toplevel of the repository containing `<dir>` |
 | `repo.share` | `<?dir:$OOSH_DIR>` | make the repository of `<dir>` group-writable: dev group + g+w (`private.ensure.sharedTree`), setgid on every .git dir, `core.sharedRepository group` |
+| `folder.finish` | `<folder>` | everything a new branch folder under the base needs: with a dev group `repo.share` (.git) and `private.this.folder.share` (the WORKING TREE: group dev, g+w, setgid dirs), then `safeDirectory.add`, and under sudo the trust entry of the person who typed the command; no ownership change. `oo checkout`, `oo mode`, `oo mode.setup` and install state 31 call it, so does `worktree.remove` / `worktree.restore` |
 | `repo.grep` | `<pattern> <?dir:$OOSH_DIR> <?pathspecs...>` | `git grep -nE <pattern>` over the tracked files of `<dir>` (the tree sweeps); variadic, so `<?dir>` precedes `<pathspecs>` |
 | `repo.files.list` | `<?dir:$OOSH_DIR>` | echo the tracked files of `<dir>`, one per line |
 
@@ -159,7 +162,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `index.add` | `<?scope:all> <?dir:$OOSH_DIR> <?paths...>` | stage: `all` (`-A`), `updated` (`-u`, tracked files only), or the given `<paths>`; variadic, so `<?dir>` precedes `<paths>` |
-| `index.remove` | `<path> <?dir:$OOSH_DIR>` | remove `<path>` from the index and the working tree of `<dir>` (`git rm`); rc 1 when `<path>` is not tracked |
+| `index.remove` | `<path> <?dir:$OOSH_DIR>` | remove `<path>` from the index and the working tree of `<dir>` (`git rm`); rc 1 when git refuses (not tracked, local changes) — `RESULT` carries git's reason |
 
 ### commit
 
@@ -203,6 +206,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `stash.push` | `<message> <?dir:$OOSH_DIR>` | stash the working tree of `<dir>` under `<message>` |
 | `stash.pop` | `<?dir:$OOSH_DIR>` | pop the top stash of `<dir>` |
 | `stash.top.get` | `<?dir:$OOSH_DIR>` | echo the message of `stash@{0}`, empty when the stack is empty |
+| `stash.drop` | `<?dir:$OOSH_DIR>` | drop the top stash of `<dir>`; rc 1 `no stash to drop in <dir>` on an empty stack. The follow-up to a `stash.pop` that conflicted: git wrote the markers into the work tree and kept the stash — after the resolve the change is in the tree, and popping again would re-apply it (T-OGIT-STASH-DROP) |
 
 ### config
 
@@ -217,9 +221,8 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `safeDirectory.list` | | echo the global `safe.directory` entries, one per line (honours `GIT_CONFIG_GLOBAL`) |
-| `safeDirectory.add` | `<path>` | add `<path>` to the global `safe.directory` list once (moved from `private.oo.safeDirectory.add`) |
-| `safeDirectory.clear` | | remove every global `safe.directory` entry |
-| `safeDirectory.prune` | | drop global `safe.directory` entries whose paths no longer exist (moved from `oo.safeDirectory.prune`) |
+| `safeDirectory.add` | `<path>` | add `<path>` to the global `safe.directory` list once, in the letter case of the file system: git matches the entry as a string, and macOS spells `/Users/Shared` where a caller may say `/Users/shared` — `private.this.path.case.get` folds it here, so `ensure`, the converters and every caller get the same spelling; `layout.status` compares the folded spelling for `trusted=` |
+| `safeDirectory.prune` | | drop global `safe.directory` entries whose paths no longer exist (moved from `oo.safeDirectory.prune`): in place, one `--unset-all` per stale value (anchored, regex-escaped — old git has no `--fixed-value`), so a kept entry is never absent; a second run changes nothing. There is no `safeDirectory.clear`: a one-word wipe of every entry is not a method |
 | `safeDirectory.ensure` | `<?base:$(oo.mode.base.get)>` | one global `safe.directory` entry per repository folder under `<base>`, for the calling user; idempotent |
 
 ### worktree
@@ -283,6 +286,7 @@ Their gates, checked for **every** folder (and `main/`) **before any folder is t
 - **unpushed** — `<folder> is N commit(s) ahead of its upstream — push it first`;
 - **detached** — `<folder> is detached — check a branch out first`;
 - `worktree.restore` only: **unpushed commits on a `main/` local branch** it would reset — `main/ has N unpushed commit(s) on its local <branch> branch, which restore would reset — push it or delete it in <base>/main first`.
+- `worktree.restore` only: **refs the clone owns** (`private.ogit.clone.gate`) — restore deletes the clone, and every ref in it goes too: a **stash** (`<folder> holds a stash (…) that restore would delete — pop or drop it…`), **another local branch** that its cached `origin/<branch>` lacks or is behind (`<folder> has N unpushed commit(s) on its local branch <b> — push it … or delete it first`), a **tag** that `main/` does not have. A linked worktree shares its refs with `main/`, so `worktree.remove` does not need this gate.
 
 **Ignored files are carried.** A folder's gitignored files (on a dev host e.g. `sessions/`) are copied before the folder is removed and copied into the new folder once it is finished. The copy is a **backup that is kept**: `$HOME/.oosh.backups/<UTC-stamp>-ogit-<folder>` — under `sudo` that is root's `$HOME`. Nothing deletes it; remove it yourself once you are satisfied.
 

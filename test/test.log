@@ -98,14 +98,15 @@ expect 0 "Shows LOG_LEVEL=3" "log.level shows current level"
 # ============================================================================
 # T3: Test log.device sets LOG_DEVICE
 # ============================================================================
-test.case - "T3: log.device sets LOG_DEVICE" \
-  log.device "$TEST_LOG_DEVICE"
-
-if [ "$LOG_DEVICE" = "$TEST_LOG_DEVICE" ]; then
-  create.result 0 "LOG_DEVICE set"
-else
-  create.result 1 "LOG_DEVICE=$LOG_DEVICE"
-fi
+# In a fixture home: log.device remembers the choice in log.session.env.
+test.log.deviceSets() {
+  local fx got; fx=$(test.suite.fixture.make test.log.deviceSets)
+  got=$( export HOME="$fx"; log.device "$TEST_LOG_DEVICE" >/dev/null 2>&1; printf '%s' "$LOG_DEVICE" )
+  rm -rf "$fx"
+  [ "$got" = "$TEST_LOG_DEVICE" ] && create.result 0 "LOG_DEVICE set" || create.result 1 "LOG_DEVICE=$got"
+  return $(result)
+}
+test.case - "T3: log.device sets LOG_DEVICE" test.log.deviceSets
 expect 0 "LOG_DEVICE set" "log.device sets LOG_DEVICE correctly"
 
 # ============================================================================
@@ -583,8 +584,8 @@ rm -f "$TEST_INSTALL_LOG2" 2>/dev/null
 # ============================================================================
 # `log level 7` calls `config.save log LOG`, persisting LOG_LEVEL=7 to
 # ~/config/log.env. T32's subprocess (LOG_LEVEL=1 ... log error ...) then
-# sources user.env → log.env in err.log:259-262, clobbering LOG_LEVEL=1
-# with the persisted 7. seq.puml.log:130-138 sees LOG_LEVEL>6 and exports
+# sources user.env → log.env in err.log (its CONFIG source block), clobbering LOG_LEVEL=1
+# with the persisted 7. seq.puml.log (its LOG_LEVEL>6 branch) sees LOG_LEVEL>6 and exports
 # STEP_DEBUG=ON; debug:step() reads stdin via `read -p` and hangs forever
 # when stdin is a tty (ssh -tt platform.test container). Snapshot/restore
 # log.env around T31 to prevent the leak.
@@ -899,21 +900,22 @@ export LOG_NAME=$SAVED_LOG_NAME
 expect 0 "get and set work" "log.name shows and sets LOG_NAME"
 
 # ============================================================================
-# T48: Test log.session.save writes the 3 vars and NOT system LOGNAME
+# T48: Test log.session.save writes LOG_NAME and LOG_LIVE and NOT system LOGNAME
 # ============================================================================
-test.case - "T48: log.session.save writes LOG_NAME/LOG_DEVICE/LOG_LIVE, no LOGNAME" \
+# LOG_DEVICE is written only when it is a file or another non-terminal device
+# (T-LOG-SESSION-DEVICE-TERMINAL); here it is whatever this run derived.
+test.case - "T48: log.session.save writes LOG_NAME/LOG_LIVE, no LOGNAME" \
   log.session.save
 
 SESSION_BODY=$(cat "$SESSION_ENV" 2>/dev/null)
 if echo "$SESSION_BODY" | grep -q "^export LOG_NAME=" \
-   && echo "$SESSION_BODY" | grep -q "^export LOG_DEVICE=" \
    && echo "$SESSION_BODY" | grep -q "^export LOG_LIVE=" \
    && ! echo "$SESSION_BODY" | grep -qE "^export LOGNAME="; then
-  create.result 0 "3 vars present, no LOGNAME"
+  create.result 0 "LOG_NAME and LOG_LIVE present, no LOGNAME"
 else
   create.result 1 "Body: $SESSION_BODY"
 fi
-expect 0 "3 vars present, no LOGNAME" "log.session.save persists the 3 LOG_ vars and never the system LOGNAME"
+expect 0 "LOG_NAME and LOG_LIVE present, no LOGNAME" "log.session.save persists the session LOG_ vars and never the system LOGNAME"
 
 # ============================================================================
 # T49: Test LOG_LIVE resolves under the per-user ~/.config/oosh (not shared ~/config)
@@ -1004,18 +1006,41 @@ Test: T-LOG-TERMINAL
 ===================================================================="
 
 # T-LOG-TERMINAL: one list of terminal-type devices — fd1/stdout, fd2/stderr,
-# the tty, unset — shared by private.log.emit and log.device.
+# the tty, unset — the kernel's, shared by private.log.emit and this's info.log.
 test.log.deviceIsTerminal() {
   local bad="" d
   for d in "" /dev/stdout /dev/stderr /proc/self/fd/1 /dev/fd/1 /proc/self/fd/2 /dev/fd/2 /dev/tty; do
-    private.log.device.is.terminal "$d" || bad="$bad [$d]-not-terminal"
+    private.this.device.is.terminal "$d" || bad="$bad [$d]-not-terminal"
   done
-  private.log.device.is.terminal "/tmp/some.log" && bad="$bad file-called-terminal"
+  private.this.device.is.terminal "/tmp/some.log" && bad="$bad file-called-terminal"
   [ -z "$bad" ] && create.result 0 "terminal-type devices recognised, a file is not" || create.result 1 "terminal:$bad"
   return $(result)
 }
-test.case - "T-LOG-TERMINAL: private.log.device.is.terminal knows every terminal-type device and no file" test.log.deviceIsTerminal
+test.case - "T-LOG-TERMINAL: private.this.device.is.terminal knows every terminal-type device and no file" test.log.deviceIsTerminal
 expect 0 "terminal-type devices recognised, a file is not" "one list for the emitter and log.device"
+
+# T-LOG-TERMINAL-ONE-LIST: this's info.log and log's emitter cannot disagree on what a terminal is
+# The list was spelled twice — in this (info.log, inlined because it runs before
+# log is loaded) and in log (as private.log.device.is.terminal, now private.this.device.is.terminal). Neither may spell
+# it now; both ask the kernel. Behaviour: a predicate that calls a FILE a
+# terminal sends both writers' lines to fd 2 instead of into that file.
+test.log.terminalOneList() {
+  local bad="" fn f="$TEST_LOG_DEVICE.onelist"
+  for fn in info.log private.log.emit; do
+    case "$(declare -f "$fn")" in *'/proc/self/fd/1'*|*'/dev/fd/2'*) bad="$bad $fn-spells-the-list" ;; esac
+    case "$(declare -f "$fn")" in *private.this.device.is.terminal*) ;; *) bad="$bad $fn-does-not-ask-the-kernel" ;; esac
+  done
+  : > "$f"
+  ( private.this.device.is.terminal() { return 0; }
+    LOG_DEVICE="$f" LOG_LEVEL=4
+    info.log "one-list-info" 2>/dev/null; private.log.emit "one-list-emit" 2>/dev/null )
+  [ -s "$f" ] && bad="$bad wrote-into-file=[$(tr '\n' '|' < "$f")]"
+  rm -f "$f"
+  [ -z "$bad" ] && create.result 0 "info.log and the emitter ask one kernel predicate" || create.result 1 "one list:$bad"
+  return $(result)
+}
+test.case - "T-LOG-TERMINAL-ONE-LIST: this's info.log and log's emitter share one terminal predicate" test.log.terminalOneList
+expect 0 "info.log and the emitter ask one kernel predicate" "the terminal list was spelled in this and in log"
 
 
 console.log "
@@ -1101,19 +1126,355 @@ test.case - "T-LOG-DEVICE-PROBE: private.log.device.probe falls back to /dev/std
 expect 0 "unopenable devices fall back to stderr; capture and file devices are kept, silently" "log device kept /dev/tty off-tty, and log.init still probed fd1"
 
 # T-LOG-DEVICE-ONE: exactly one log.device, and `log device <file>` sets it
-# without persisting or recursing into config save.
+# without recursing into config save (it remembers the choice in the user's own
+# log.session.env — T-LOG-SESSION-DEVICE-TERMINAL; a fixture home here).
 test.log.deviceOne() {
-  local bad="" n f="$TEST_LOG_DEVICE.one"
+  local bad="" n f="$TEST_LOG_DEVICE.one" fx; fx=$(test.suite.fixture.make test.log.deviceOne)
   n=$(grep -cE "^log\.device\(\)" "$OOSH_DIR/log"); [ "$n" = 1 ] || bad="$bad definitions=$n"
-  ( config() { echo "CONFIG-CALLED $*"; }; this.call() { echo "THIS-CALL $*"; }
+  ( export HOME="$fx"; config() { echo "CONFIG-CALLED $*"; }; this.call() { echo "THIS-CALL $*"; }
     log.device "$f" 2>/dev/null | grep -qE "CALLED|THIS-CALL" ) && bad="$bad recursed-into-config"
-  rm -f "$f"
+  rm -f "$f"; rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "one log.device; no config save recursion" || create.result 1 "one:$bad"
   return $(result)
 }
 test.case - "T-LOG-DEVICE-ONE: log.device is defined once and no longer recurses into config save" test.log.deviceOne
 expect 0 "one log.device; no config save recursion" "a second definition overrode the first on every source"
 
+
+console.log "
+Test: T-LOG-LIVE-FILE-SESSION
+===================================================================="
+
+# T-LOG-LIVE-FILE-SESSION: LOG_LIVE is a per-user session value (config save
+# excludes it), so `log live.file <x>` persists it to the user's own
+# log.session.env — like log.name — and leaves the SHARED log.env untouched:
+# same content, not rewritten (its old mtime stays older than a marker).
+test.log.liveFileSession() {
+  local bad="" fixture home shared before
+  fixture=$(test.suite.fixture.make test.log.liveFile) || { create.result 1 "no fixture"; return $(result); }
+  home="$fixture/home"; shared="$fixture/config"
+  mkdir -p "$home/.config/oosh" "$shared"
+  printf '%s\n' 'export LOG_LEVEL="1"' '. $HOME/.config/oosh/log.session.env' > "$shared/log.env"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' > "$shared/user.env"
+  touch -t 200001010000 "$shared/log.env"
+  touch -t 200001010001 "$fixture/marker"
+  before=$(cat "$shared/log.env")
+  ( export HOME="$home" CONFIG_PATH="$shared" CONFIG_FILE=user.env CONFIG="$shared/user.env"
+    log.live.file "$fixture/live.out" >/dev/null 2>&1 )
+  grep -qx "export LOG_LIVE=\"$fixture/live.out\"" "$home/.config/oosh/log.session.env" 2>/dev/null || bad="$bad session-not-saved=[$(cat "$home/.config/oosh/log.session.env" 2>/dev/null)]"
+  [ "$(cat "$shared/log.env")" = "$before" ] || bad="$bad shared-content-changed"
+  [ "$shared/log.env" -nt "$fixture/marker" ] && bad="$bad shared-rewritten"
+  rm -rf "$fixture"
+  [ -z "$bad" ] && create.result 0 "LOG_LIVE saved per user; shared log.env untouched" || create.result 1 "live.file:$bad"
+  return $(result)
+}
+test.case - "T-LOG-LIVE-FILE-SESSION: log.live.file saves LOG_LIVE to the per-user log.session.env and never rewrites the shared log.env" test.log.liveFileSession
+expect 0 "LOG_LIVE saved per user; shared log.env untouched" "log.live.file went through config save log LOG, which excludes LOG_LIVE"
+
+
+console.log "
+Test: T-LOG-SESSION-PURE-DATA
+===================================================================="
+
+# T-LOG-SESSION-PURE-DATA: log.session.env stays pure data whatever log name is given
+# log.session.save wrote `export LOG_NAME="$LOG_NAME"` with the raw value, and
+# the file is chained unguarded into every shell of the user: a name holding a
+# quote ran code at the next login. A quote, $ or backslash is written quoted
+# (it reads back as given, nothing runs); a value that cannot be one line of
+# pure data — a control character, a command substitution or a backtick — is
+# refused: rc 1, the file kept.
+test.log.sessionPureData() {
+  local fx bad="" f got rc before v
+  fx=$(test.suite.fixture.make test.log.sessionPureData); f="$fx/.config/oosh/log.session.env"
+  test.log.sessionPureData.run() { # <name> — log.name in a fixture home; echo its rc
+    # A file device, so the file holds three lines on every run: a terminal
+    # device is not written (T-LOG-SESSION-DEVICE-TERMINAL).
+    ( export HOME="$fx" LOG_DEVICE=/dev/null; log.name "$1" >/dev/null 2>&1 ); echo $?
+  }
+  for v in "a\"; touch $fx/pwned; \"\\ \$HOME" "a'\${HOME}' (b) \\\\c"; do
+    rc=$(test.log.sessionPureData.run "$v")
+    [ "$rc" = 0 ] || bad="$bad rc=$rc[$v]"
+    # the platform invariant's pattern: export lines only
+    grep -v -E '^[[:space:]]*($|#|export [A-Za-z_][A-Za-z0-9_]*=)' "$f" >/dev/null 2>&1 && bad="$bad not-export-lines[$v]"
+    [ "$(grep -c '' "$f" 2>/dev/null)" = 3 ] || bad="$bad not-three-lines[$v]"
+    got=$(HOME="$fx" sh -c ". \"$f\"; printf '%s' \"\$LOG_NAME\"" 2>/dev/null)
+    [ "$got" = "$v" ] || bad="$bad read-back=[$got]"
+  done
+  [ -e "$fx/pwned" ] && bad="$bad sourcing-ran-code"
+  before=$(cat "$f" 2>/dev/null)
+  # Refused: a control character, and a command substitution or backtick —
+  # config.validate rejects any line holding one (T-CONFIG-WRITER-VALIDATOR-AGREE).
+  for v in "a
+b" "a$(printf '\033')[31m" "a\`touch $fx/pwned\`" "a\$(touch $fx/pwned)"; do
+    rc=$(test.log.sessionPureData.run "$v")
+    [ "$rc" = 1 ] || bad="$bad refused-rc=$rc"
+    [ "$(cat "$f" 2>/dev/null)" = "$before" ] || bad="$bad file-changed"
+  done
+  HOME="$fx" sh -c ". \"$f\"" >/dev/null 2>&1
+  [ -e "$fx/pwned" ] && bad="$bad refused-value-ran-code"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "log.session.env stays pure data; a value that cannot be is refused" || create.result 1 "session pure data:$bad"
+  return $(result)
+}
+test.case - "T-LOG-SESSION-PURE-DATA: log.session.env stays pure data whatever log name is given" test.log.sessionPureData
+expect 0 "log.session.env stays pure data; a value that cannot be is refused" \
+  "a log name holding a quote ran code in every shell of the user"
+
+# T-LOG-NAME-NO-HOSTNAME: the default LOG_NAME without the hostname program is user@<short HOSTNAME>
+# AlmaLinux 9's minimal image has no `hostname`, so the default fell back to
+# user@localhost. bash always has $HOSTNAME. A clean start in a fixture home:
+# no saved LOG_NAME, no OOSH_SSH_CONFIG_HOST.
+test.log.nameNoHostname() {
+  local fx got; fx=$(test.suite.fixture.make test.log.nameNoHostname)
+  got=$(env -i HOME="$fx" PATH="$PATH" USER=someone LOG_LEVEL=1 TERM=dumb bash -c '
+    command()  { [ "$1 $2" = "-v hostname" ] && return 1; builtin command "$@"; }
+    hostname() { return 127; }   # the program is not there
+    HOSTNAME=web1.fritz.box
+    source "$0/log" >/dev/null 2>&1; printf "%s" "$LOG_NAME"' "$OOSH_DIR" 2>/dev/null </dev/null)
+  rm -rf "$fx"
+  [ "$got" = "someone@web1" ] && create.result 0 "LOG_NAME is user@short HOSTNAME without hostname" || create.result 1 "LOG_NAME=[$got]"
+  return $(result)
+}
+test.case - "T-LOG-NAME-NO-HOSTNAME: without the hostname program the default LOG_NAME is user@<short HOSTNAME>" test.log.nameNoHostname
+expect 0 "LOG_NAME is user@short HOSTNAME without hostname" "AlmaLinux minimal has no hostname — the log name said localhost"
+
+
+console.log "
+Test: T-LOG-SESSION-SAVE-IDEMPOTENT
+===================================================================="
+
+# T-LOG-SESSION-SAVE-IDEMPOTENT: log.session.save writes only what changed
+# Every interactive shell runs log.session.save (the .bashrc), and it rewrote
+# ~/.config/oosh/log.session.env each time: parallel terminals overwrote each
+# other and a second run of anything that starts a shell changed the file.
+# Unchanged values leave the file alone (inode and mtime); a changed value, or
+# a file whose text is not exactly the built one, is written.
+test.log.sessionSaveIdempotent() {
+  local fx f bad="" before after
+  fx=$(test.suite.fixture.make test.log.sessionSaveIdempotent); f="$fx/.config/oosh/log.session.env"
+  test.log.sessionSaveIdempotent.run() { # <logName> — log.session.save in the fixture home
+    ( export HOME="$fx" LOG_NAME="$1" LOG_DEVICE=/dev/null LOG_LIVE="$fx/live.out"; log.session.save >/dev/null 2>&1 )
+  }
+  test.log.sessionSaveIdempotent.run same@host
+  touch -t 200001010000 "$f"; before=$(ls -li "$f")
+  test.log.sessionSaveIdempotent.run same@host
+  after=$(ls -li "$f")
+  [ "$after" = "$before" ] || bad="$bad unchanged-rewritten=[$before]->[$after]"
+  printf '\n' >> "$f"; touch -t 200001010000 "$f"
+  test.log.sessionSaveIdempotent.run same@host
+  [ "$(grep -c '' "$f")" = 3 ] || bad="$bad extra-line-kept"
+  touch -t 200001010000 "$f"; before=$(ls -li "$f")
+  test.log.sessionSaveIdempotent.run other@host
+  grep -qx 'export LOG_NAME="other@host"' "$f" || bad="$bad changed-not-written=[$(cat "$f")]"
+  [ "$(ls -li "$f")" != "$before" ] || bad="$bad changed-mtime-kept"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an unchanged session file is not rewritten; a changed one is" || create.result 1 "session save:$bad"
+  return $(result)
+}
+test.case - "T-LOG-SESSION-SAVE-IDEMPOTENT: log.session.save leaves an unchanged log.session.env alone and writes a changed one" test.log.sessionSaveIdempotent
+expect 0 "an unchanged session file is not rewritten; a changed one is" \
+  "every new terminal rewrote log.session.env"
+
+
+console.log "
+Test: T-LOG-SESSION-DEVICE-TERMINAL
+===================================================================="
+
+# T-LOG-SESSION-DEVICE-TERMINAL: a terminal device is never saved, a chosen file is
+# Every terminal has its own device, and a new terminal derives its own anyway;
+# a process without a terminal that sources the chain inherited the last
+# terminal's /dev/pts/N and wrote its log lines there. log.session.save writes
+# LOG_DEVICE only for a file (or another non-terminal device) the user chose
+# with `log device <file>`; log.device saves that choice itself, and a save
+# from a terminal afterwards keeps it. What a real start reads back — a new
+# terminal, a process without one — is T-BASHRC-LOG-DEVICE-KEPT in test.config
+# (the probe that sourced the session file before log was no real start order).
+test.log.sessionDeviceTerminal() {
+  local fx f bad="" device
+  fx=$(test.suite.fixture.make test.log.sessionDeviceTerminal); f="$fx/.config/oosh/log.session.env"
+  test.log.sessionDeviceTerminal.save() { # <device> — log.session.save in the fixture home with LOG_DEVICE=<device>
+    ( export HOME="$fx" LOG_NAME=someone@host LOG_LIVE="$fx/live.out" LOG_DEVICE="$1"; log.session.save >/dev/null 2>&1 )
+  }
+  mkdir -p "$fx/.config/oosh"
+  for device in /dev/pts/7 /dev/tty1 /dev/tty /dev/stderr /proc/self/fd/1 ""; do
+    test.log.sessionDeviceTerminal.save "$device"
+    grep -q '^export LOG_DEVICE=' "$f" && bad="$bad terminal-saved[$device]"
+    grep -qx 'export LOG_NAME="someone@host"' "$f" || bad="$bad name-missing[$device]"
+    grep -qx "export LOG_LIVE=\"$fx/live.out\"" "$f" || bad="$bad live-missing[$device]"
+  done
+  ( export HOME="$fx" LOG_NAME=someone@host LOG_LIVE="$fx/live.out"; log.device "$fx/device.out" >/dev/null 2>&1 )
+  grep -qx "export LOG_DEVICE=\"$fx/device.out\"" "$f" || bad="$bad file-not-saved=[$(cat "$f" 2>/dev/null)]"
+  grep -qx 'export LOG_NAME="someone@host"' "$f" || bad="$bad name-missing[file]"
+  grep -qx "export LOG_LIVE=\"$fx/live.out\"" "$f" || bad="$bad live-missing[file]"
+  test.log.sessionDeviceTerminal.save /dev/pts/7
+  grep -qx "export LOG_DEVICE=\"$fx/device.out\"" "$f" || bad="$bad terminal-save-erased=[$(cat "$f" 2>/dev/null)]"
+  ( export HOME="$fx" LOG_NAME=someone@host LOG_LIVE="$fx/live.out"; log.device /dev/stderr >/dev/null 2>&1 )
+  grep -q '^export LOG_DEVICE=' "$f" && bad="$bad terminal-choice-kept-file"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a terminal device is not saved; a chosen file is" || create.result 1 "session device:$bad"
+  return $(result)
+}
+test.case - "T-LOG-SESSION-DEVICE-TERMINAL: log.session.save writes LOG_DEVICE only for a file, never for a terminal" test.log.sessionDeviceTerminal
+expect 0 "a terminal device is not saved; a chosen file is" \
+  "a process without a terminal inherited the last terminal from log.session.env"
+
+
+console.log "
+Test: T-LOG-SESSION-DEVICE-TWO-TERMINALS
+===================================================================="
+
+# T-LOG-SESSION-DEVICE-TWO-TERMINALS: two terminals of one user leave the file alone
+# Each .bashrc runs log.session.save; with /dev/pts/1 and /dev/pts/2 open the
+# file took turns between them. Now neither device is written: the second save
+# finds the same text and leaves the file alone (inode, mtime and bytes).
+test.log.sessionDeviceTwoTerminals() {
+  local fx f bad="" before after text
+  fx=$(test.suite.fixture.make test.log.sessionDeviceTwoTerminals); f="$fx/.config/oosh/log.session.env"
+  test.log.sessionDeviceTwoTerminals.save() { # <device> — log.session.save in the fixture home from the terminal <device>
+    ( export HOME="$fx" LOG_NAME=someone@host LOG_LIVE="$fx/live.out" LOG_DEVICE="$1"; log.session.save >/dev/null 2>&1 )
+  }
+  test.log.sessionDeviceTwoTerminals.save /dev/pts/1
+  touch -t 200001010000 "$f"; before=$(ls -li "$f"); text=$(cat "$f")
+  test.log.sessionDeviceTwoTerminals.save /dev/pts/2
+  after=$(ls -li "$f")
+  [ "$after" = "$before" ] || bad="$bad rewritten=[$before]->[$after]"
+  [ "$(cat "$f")" = "$text" ] || bad="$bad changed=[$(cat "$f")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the second terminal leaves the session file alone" || create.result 1 "two terminals:$bad"
+  return $(result)
+}
+test.case - "T-LOG-SESSION-DEVICE-TWO-TERMINALS: a save from a second terminal leaves log.session.env unchanged" test.log.sessionDeviceTwoTerminals
+expect 0 "the second terminal leaves the session file alone" \
+  "two terminals of one user took turns rewriting log.session.env"
+
+
+console.log "
+Test: T-LOG-STANDALONE-START
+===================================================================="
+
+# T-LOG-STANDALONE-START: ./log started on its own runs its file-scope block before `this`
+# The file-scope LOG_DEVICE block runs before log sources `this`, so it may not
+# ask a kernel method: 3f4e6ed made it call private.this.device.is.terminal
+# there, and every standalone `./log …` with a terminal printed "command not
+# found" and kept a stale device. Started from env -i in a fixture home with a
+# chosen file and with a stale pts: nothing on stderr says "command not found",
+# the file is kept, the pts is not. The test inherits this run's stdin — in a
+# terminal that is the branch the block takes for a live tty.
+test.log.standaloneStart() {
+  local fx bad="" err device
+  fx=$(test.suite.fixture.make test.log.standaloneStart); mkdir -p "$fx/.config/oosh"; : > "$fx/device.out"
+  test.log.standaloneStart.run() { # <device> — ./log device from env -i with LOG_DEVICE=<device>; stderr to $fx/stderr
+    env -i HOME="$fx" PATH=/usr/bin:/bin OOSH_DIR="$OOSH_DIR" LOG_LEVEL=3 TERM=dumb LOG_DEVICE="$1" \
+      "$OOSH_DIR/log" device >/dev/null 2>"$fx/stderr"
+  }
+  test.log.standaloneStart.run "$fx/device.out"
+  err=$(grep -E 'command not found' "$fx/stderr")
+  [ -z "$err" ] || bad="$bad file[$err]"
+  grep -qF "LOG_DEVICE=$fx/device.out" "$fx/device.out" 2>/dev/null || bad="$bad file-not-kept=[$(cat "$fx/device.out" 2>/dev/null)]"
+  test.log.standaloneStart.run /dev/pts/999
+  err=$(grep -E 'command not found' "$fx/stderr")
+  [ -z "$err" ] || bad="$bad pts[$err]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a standalone ./log starts clean and keeps a chosen file" || create.result 1 "standalone:$bad"
+  return $(result)
+}
+test.case - "T-LOG-STANDALONE-START: ./log started on its own asks no kernel method before it sources this" test.log.standaloneStart
+expect 0 "a standalone ./log starts clean and keeps a chosen file" \
+  "the file-scope LOG_DEVICE block called a kernel predicate before this was loaded"
+
+
+console.log "
+Test: private.log.device.is.session
+===================================================================="
+
+# T-LOG-DEVICE-IS-SESSION: the terminal devices log.session.save never writes
+# One rule for "a device of one terminal session": the kernel's terminal-type
+# list (private.this.device.is.terminal) and every /dev/pts/N or /dev/ttyN.
+# The file-scope block of log refreshes such a device to the live terminal
+# (minus the fd1/fd2 capture spellings), log.session.save never writes it.
+test.log.deviceIsSession() {
+  local bad="" device
+  for device in "" /dev/tty /dev/stdout /dev/stderr /proc/self/fd/1 /dev/fd/2 /dev/pts/0 /dev/pts/12 /dev/tty1 /dev/ttys003; do
+    private.log.device.is.session "$device" || bad="$bad not-session[$device]"
+  done
+  for device in /dev/null /tmp/log.out "$HOME/.config/oosh/log.out" /dev/ptsx; do
+    private.log.device.is.session "$device" && bad="$bad session[$device]"
+  done
+  [ -z "$bad" ] && create.result 0 "terminal devices are session devices, files are not" || create.result 1 "is.session:$bad"
+  return $(result)
+}
+test.case - "T-LOG-DEVICE-IS-SESSION: the terminal devices log.session.save never writes" test.log.deviceIsSession
+expect 0 "terminal devices are session devices, files are not" \
+  "a pts or ttyN was not one terminal device rule shared by log and log.session.save"
+
+
+console.log "
+Test: T-LOG-SESSION-SAVE-WRITE-FAIL
+===================================================================="
+
+# T-LOG-SESSION-SAVE-WRITE-FAIL: a session file that cannot be written is a failure
+# log.session.save discarded the rc of its write and answered 0, so `log name`
+# said "new LOG_NAME" and nothing was kept (a file left to root by a sudo
+# session, a full disk). A DIRECTORY in place of the file cannot be written by
+# root either: rc 1, RESULT names the file, and log.name answers the same rc.
+test.log.sessionSaveWriteFail() {
+  local fx f bad="" got
+  fx=$(test.suite.fixture.make test.log.sessionSaveWriteFail); f="$fx/.config/oosh/log.session.env"
+  mkdir -p "$f"
+  got=$( export HOME="$fx" LOG_NAME=someone@host LOG_DEVICE=/dev/null LOG_LIVE="$fx/live.out"
+         log.session.save >/dev/null 2>&1; echo "$?|$RESULT" )
+  [ "${got%%|*}" = 1 ] || bad="$bad save-rc=[${got%%|*}]"
+  case "${got#*|}" in *"$f"*) ;; *) bad="$bad result=[${got#*|}]" ;; esac
+  ( export HOME="$fx" LOG_DEVICE=/dev/null LOG_LIVE="$fx/live.out"; log.name other@host >/dev/null 2>&1 ) && bad="$bad log.name-rc-0"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a session file that cannot be written answers rc 1 naming it" || create.result 1 "session write fail:$bad"
+  return $(result)
+}
+test.case - "T-LOG-SESSION-SAVE-WRITE-FAIL: log.session.save answers rc 1 when log.session.env cannot be written" test.log.sessionSaveWriteFail
+expect 0 "a session file that cannot be written answers rc 1 naming it" \
+  "log name said success and nothing was kept"
+
+
+console.log "
+Test: private.log.session.write
+===================================================================="
+
+# T-LOG-SESSION-WRITE: with a terminal device, keep carries the saved file device over, forget drops it
+# The worker of log.session.save (keep) and log.device (forget). The saved
+# device is read back from the file and written again through the pure-data
+# rule: a saved terminal (an old file) is not carried, a line that is not pure
+# data is not carried, and nothing in the file runs when it is read twice.
+test.log.sessionWrite() {
+  local fx f bad=""; fx=$(test.suite.fixture.make test.log.sessionWrite); f="$fx/.config/oosh/log.session.env"
+  mkdir -p "$fx/.config/oosh"
+  test.log.sessionWrite.run() { # <device> <savedDevice> — the worker in the fixture home with LOG_DEVICE=<device>
+    ( export HOME="$fx" LOG_NAME=someone@host LOG_LIVE="$fx/live.out" LOG_DEVICE="$1"; private.log.session.write "$2" >/dev/null 2>&1 )
+  }
+  test.log.sessionWrite.line() { grep '^export LOG_DEVICE=' "$f" 2>/dev/null; }
+  printf '%s\n' "export LOG_DEVICE=\"$fx/chosen.log\"" > "$f"
+  test.log.sessionWrite.run /dev/pts/3 keep
+  [ "$(test.log.sessionWrite.line)" = "export LOG_DEVICE=\"$fx/chosen.log\"" ] || bad="$bad keep-lost=[$(test.log.sessionWrite.line)]"
+  grep -qx 'export LOG_NAME="someone@host"' "$f" || bad="$bad name-missing"
+  test.log.sessionWrite.run /dev/stderr forget
+  [ -z "$(test.log.sessionWrite.line)" ] || bad="$bad forget-kept=[$(test.log.sessionWrite.line)]"
+  test.log.sessionWrite.run /dev/pts/3 keep
+  [ -z "$(test.log.sessionWrite.line)" ] || bad="$bad none-made-up=[$(test.log.sessionWrite.line)]"
+  printf '%s\n' 'export LOG_DEVICE="/dev/pts/9"' > "$f"
+  test.log.sessionWrite.run /dev/pts/3 keep
+  [ -z "$(test.log.sessionWrite.line)" ] || bad="$bad old-terminal-carried=[$(test.log.sessionWrite.line)]"
+  printf '%s\n' "export LOG_DEVICE=\"$fx/a\$(touch $fx/pwned)b\"" > "$f"
+  test.log.sessionWrite.run /dev/pts/3 keep
+  [ -e "$fx/pwned" ] && bad="$bad read-ran-code"
+  case "$(test.log.sessionWrite.line)" in *'$('*) bad="$bad not-pure-carried" ;; esac
+  test.log.sessionWrite.run "$fx/other.log" keep
+  [ "$(test.log.sessionWrite.line)" = "export LOG_DEVICE=\"$fx/other.log\"" ] || bad="$bad file-not-written=[$(test.log.sessionWrite.line)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "keep carries the saved file device, forget drops it, a terminal is never written" || create.result 1 "session write:$bad"
+  return $(result)
+}
+test.case $level "T-LOG-SESSION-WRITE: a terminal keeps the chosen file device, an explicit terminal choice forgets it" test.log.sessionWrite
+expect 0 "keep carries the saved file device, forget drops it, a terminal is never written" \
+  "the next terminal's .bashrc erased the file device the user chose"
 
 ### test.method
 

@@ -224,7 +224,6 @@ config.init.shared() # # ensure sharedConfig dir is mode 2775 group dev; remove 
 
 config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of <username> match canonical install
 {
-  private.this.script.load ogit ogit.branch.get
   [ "$(type -t user.get)" = "function" ] || source "$OOSH_DIR/user" >/dev/null 2>&1
   local username="$1"
   if [ -n "$1" ]; then shift; fi
@@ -269,7 +268,8 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   fi
   if [ -z "$sharedOosh" ]; then
     local branch="$OOSH_MODE"
-    [ -z "$branch" ] && branch=$(this.git.branch.short "$OOSH_DIR" 2>/dev/null)
+    [ -z "$branch" ] && private.this.script.load ogit ogit.branch.get
+    [ -z "$branch" ] && branch=$(ogit.branch.get "$OOSH_DIR" 2>/dev/null)
     [ -z "$branch" ] && branch="dev"
     sharedOosh="$sharedOoshBase/$branch"
   fi
@@ -284,7 +284,7 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   #
   # Phase 1 — recreate (only if needed): dispatch through private.as.user so
   # newly-created symlinks inherit <user>:<user> ownership naturally. This is
-  # the same trick user.oosh.install uses at user:787-794 — and the reason
+  # the same trick user.oosh.install uses (its symlink hop) — and the reason
   # fresh installs produce hannesn:hannesn while a tampered install path can
   # leave hannesn:dev. Skip the dispatch entirely when both symlinks already
   # point at the canonical targets — avoids the runuser PAM-session overhead
@@ -307,7 +307,7 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   fi
   if [ "$_needsRecreate" = "1" ]; then
     # Delegate symlink convergence to the shared primitive
-    # private.this.symlink.with.backup (this:171). private.as.user runs
+    # private.this.symlink.with.backup (in this). private.as.user runs
     # the operations AS the target user, so the symlinks naturally inherit
     # <user>:<user> ownership — the canonical install layout.
     #
@@ -351,7 +351,12 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   # The shared log.env's OLD chain line becomes . $HOME/.config/oosh/…: oo
   # update and oo user.fix reach here, which is how an installed host leaves
   # it (T-CONFIG-LOG-CHAIN-MIGRATE).
-  private.config.log.chain.migrate "$sharedConfig"
+  # A migrate answers rc 2 + RESULT "cannot write <file>" for a failed write —
+  # warned, visible, and named in this method's own result — and rc 1 for a
+  # closed gate, which keeps its info line (T-CONFIG-INIT-USER-WRITE-FAIL).
+  local writeFailed="" migrateRc
+  private.config.log.chain.migrate "$sharedConfig" \
+    || { warn.log "config.init.user: $RESULT"; writeFailed="$writeFailed; $RESULT"; }
 
   # The forked user.env (boss, 2026-10-02): as root, every user linked to the
   # shared config first gets their own user.session.env (each in their own
@@ -359,15 +364,33 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
   # one (the gate). A non-root caller cannot look into the other homes, so the
   # switch waits for `sudo oo update` (T-CONFIG-USER-SESSION-MIGRATE).
   private.config.session.files.ensure.all "$sharedConfig" "$sharedOosh"
-  private.config.user.session.migrate "$sharedConfig" \
-    || info.log "config.init.user: the shared user.env keeps its PATH line until every user of it has ~/.config/oosh/user.session.env — run: sudo oo update"
+  # …and every one of them the oosh .bashrc this tree carries — one
+  # `sudo oo update` brings a new prompt to all (T-CONFIG-BASHRC-ALL).
+  private.config.bashrc.ensure.all "$sharedConfig" "$sharedOosh"
+  private.config.user.session.migrate "$sharedConfig"; migrateRc=$?
+  case "$migrateRc" in
+    0) ;;
+    1) info.log "config.init.user: the shared user.env keeps its PATH line until every user of it has ~/.config/oosh/user.session.env — run: sudo oo update" ;;
+    *) warn.log "config.init.user: $RESULT"; writeFailed="$writeFailed; $RESULT" ;;
+  esac
+  private.config.oosh.session.migrate "$sharedConfig"; migrateRc=$?
+  case "$migrateRc" in
+    0) ;;
+    1) info.log "config.init.user: the shared oosh.env chains oosh.session.env once every user of it has one — run: sudo oo update" ;;
+    *) warn.log "config.init.user: $RESULT"; writeFailed="$writeFailed; $RESULT" ;;
+  esac
 
   # Git trust of every folder under the base (clone layout, spec § 4): each
   # folder is its own repository with its own safe.directory entry, and
-  # `oo update` / `oo user.fix` reach here, which makes this the repair (T89).
-  # The CALLER — function form:
-  ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null \
-    || warn.log "config.init.user: could not ensure safe.directory — $RESULT"
+  # `oo update` / `oo user.fix` reach here, which makes this the repair (T-CONFIG-INIT-USER-CALLS).
+  # The CALLER — function form, loaded on demand (the probe is the function
+  # called; a failed load is said, not stepped over):
+  if private.this.script.load ogit ogit.safeDirectory.ensure; then
+    ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null \
+      || warn.log "config.init.user: could not ensure safe.directory — $RESULT"
+  else
+    warn.log "config.init.user: cannot load ogit.safeDirectory.ensure from $OOSH_DIR/ogit — safe.directory not ensured for $(id -un)"
+  fi
   # The TARGET — as them, so it lands in THEIR --global config: through the
   # as-user preamble (their HOME; runuser keeps the caller's) and ogit as a
   # command, the same hop user.oosh.install uses.
@@ -379,6 +402,10 @@ config.init.user() # <username:$USER> # ensure the ~/config + ~/oosh symlinks of
     user.group.add dev "$username" >/dev/null 2>&1
   fi
 
+  if [ -n "$writeFailed" ]; then
+    create.result 1 "config.init.user: $username aligned, but the shared config could not be written${writeFailed}"
+    return $(result)
+  fi
   success.log "config.init.user: ${GREEN}$username${NORMAL} aligned"
 }
 
@@ -401,12 +428,12 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
   # ~/config — owner, target, target's mode/group
   if [ -L "$targetHome/config" ]; then
     local cOwner cTarget tMode tGroup
-    cOwner=$(stat -c "%U:%G" "$targetHome/config" 2>/dev/null || stat -f "%Su:%Sg" "$targetHome/config" 2>/dev/null)
+    cOwner="$(private.this.path.stat.get "$targetHome/config" owner):$(private.this.path.stat.get "$targetHome/config" group)"
     cTarget=$(readlink "$targetHome/config")
     info.log "  ~/config: owner=$cOwner target=$cTarget"
     if [ -d "$cTarget" ]; then
-      tMode=$(stat -c "%a" "$cTarget" 2>/dev/null || stat -f "%Lp" "$cTarget" 2>/dev/null)
-      tGroup=$(stat -c "%G" "$cTarget" 2>/dev/null || stat -f "%Sg" "$cTarget" 2>/dev/null)
+      tMode=$(private.this.path.stat.get "$cTarget" mode)
+      tGroup=$(private.this.path.stat.get "$cTarget" group)
       info.log "  sharedConfig: mode=$tMode group=$tGroup"
       if [ "$tGroup" != "dev" ]; then
         warn.log "  sharedConfig group ${RED}$tGroup${NORMAL} drifted from canonical ${GREEN}dev${NORMAL} — run ${YELLOW}config init.shared${NORMAL}"
@@ -481,12 +508,12 @@ config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (
   # variables to three with oosh.env emptied.
   #
   # Derive here, in the REPAIR, and never in config.save: `oo pm.discover`
-  # reaches `config save` internally (oo:3045 → config's log.device HACK → a
+  # reaches `config save` internally (oo.pm.discover → config.save's former log.device HACK → a
   # recursive `config save log LOG`), and that cascade is what wrote a shared
   # config tier on macOS. The writer stays a pure persister.
   #
   # Per-variable emptiness guard, exactly as private.user.init's OS_CMD heal
-  # does it (user:1655-1699): a value that survived is NEVER overwritten by a
+  # does it: a value that survived is NEVER overwritten by a
   # derived one. The verdicts go to stdout — nothing captures config.init.env,
   # unlike config.save — so an operator running the advertised repair can see
   # what was reconstructed and what could not be.
@@ -562,14 +589,14 @@ config.init.user.completion.username()  { user.list; }
 config.init.check.completion.username() { user.list; }
 config.init.full.completion.username()  { user.list; }
 
-private.config.variables.list()     # <envPrefix> # echo one variable NAME per line for every set, scalar, persistable variable matching envPrefix #
+private.config.variables.list()     # <envPrefix> <?sessionSplit> # echo one variable NAME per line for every set, scalar, persistable variable matching envPrefix; sessionSplit yes or no is the layout a full save decided, empty reads it off user.env #
 {
   # NO create.result — a getter consumed as $(...), which runs in a subshell,
   # so RESULT could never reach the caller. Same reasoning as
   # private.config.required.variables.get and private.config.file.resolve.
   #
   # SILENT BY CONTRACT. The only caller runs inside `{ … } >$CONFIG`, and
-  # log:35 sets LOG_DEVICE=/proc/self/fd/1 — inside that block fd 1 IS the
+  # log's file-scope LOG_DEVICE block sets LOG_DEVICE=/proc/self/fd/1 — inside that block fd 1 IS the
   # generated env file. One debug.log here would be written into it.
   #
   # compgen -v, NOT `declare -p` with no names. On bash 3.2 the no-argument
@@ -579,12 +606,12 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
   # ~/config/oosh.env — docs/research/2026-09-17-config-save-bash32.md § 2.
   # `compgen -v` emits variable NAMES ONLY, on 3.2 and 5 alike (measured).
   #
-  # ${1%_}: `backup config.save global` passes BACKUP_ (backup:262). With the
+  # ${1%_}: `backup config.save global` passes BACKUP_ (backup.config.save). With the
   # underscore already there the prefix gate read `BACKUP_|BACKUP__*`, which
   # BACKUP_TARGET matches neither, so backup.env was always written empty.
-  local envPrefix="${1%_}"
+  local envPrefix="${1%_}" sessionSplit="$2"
   local variableName
-  # These two locals are themselves listed by `compgen -v`, exactly as they
+  # These locals are themselves listed by `compgen -v`, exactly as they
   # were by `declare -p`. camelCase cannot match an OOSH_/LOG_/CONFIG/OS_CMD_
   # prefix, so the harvest set is unchanged.
   # Read LINE BY LINE, never `for … in $(compgen -v)`. Unquoted command
@@ -653,18 +680,26 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
       # the save writes it back) in which nothing ever consults the checkout,
       # and it left private.oo.install.branch.get answering "prod" on a dev box
       # for weeks. The branch a host is ON is derived from the canonical
-      # ~/oosh; see private.oo.shared.base.get. That is T7.
+      # ~/oosh; see private.config.derive.oosh.mode. That is T7.
+      #
+      # ODOCKER_SG is odocker's marker for its one `sg` re-run (a runtime
+      # reading, kind 2): `config save odocker ODOCKER` inside that run must
+      # not store it (T-CONFIG-ODOCKER-SG-NOT-SAVED). ODOCKER_SOCKET is the
+      # test/override knob of private.odocker.socket.get: exported by one
+      # user, `odocker workspace.set` would have written it into the SHARED
+      # odocker.env for everyone (same test).
       #
       # Documented at docs/config.md § Excluded variables and pinned by
       # test/test.config T29 — change all three together.
-      *INSTALL*|OOSH_BRANCH|OOSH_SHLVL|OOSH_STATUS|OOSH_PROMPT|OOSH_CONFIG_NEEDS_SAVE|OOSH_CLEAN_ENV|OOSH_APT_UPDATED|OOSH_USER_CONFIG_PATH|LOG_NAME|LOG_DEVICE|LOG_LIVE|SUDO_*|_) continue ;;
+      *INSTALL*|OOSH_BRANCH|ODOCKER_SG|ODOCKER_SOCKET|OOSH_SHLVL|OOSH_STATUS|OOSH_PROMPT|OOSH_CONFIG_NEEDS_SAVE|OOSH_CLEAN_ENV|OOSH_APT_UPDATED|OOSH_USER_CONFIG_PATH|LOG_NAME|LOG_DEVICE|LOG_LIVE|SUDO_*|_) continue ;;
     esac
     # OOSH_MODE leaves the shared oosh.env only with the switch: until then the
     # shared user.env does not chain the user's own file, and other users'
     # shells still read their branch from here. A full config save decides the
-    # layout up front (_configSessionSplit); a named save reads it off user.env.
+    # layout up front and passes it as <sessionSplit>; a named save reads it
+    # off user.env.
     if [ "$variableName" = "OOSH_MODE" ]; then
-      case "${_configSessionSplit:-}" in
+      case "${sessionSplit:-}" in
         yes) continue ;;
         no)  ;;
         *)   private.config.session.split.is "$CONFIG_PATH" && continue ;;
@@ -674,7 +709,7 @@ private.config.variables.list()     # <envPrefix> # echo one variable NAME per l
   done
 }
 
-private.config.variable.export.line()     # <variableName> # echo ONE export line for a set scalar variable; rc 1 for unset, array, or a value bash renders with ANSI-C quoting #
+private.config.variable.export.line()     # <variableName> # echo ONE export line for a set scalar variable; rc 1 for unset, array, or a value that cannot be pure data (private.this.env.export.line.get: a control character, a command substitution or backtick, or ANSI-C quoting) #
 {
   # NO create.result — a getter consumed as $(...); it also runs in a loop and
   # would clobber the caller's RESULT on every iteration (config.save sets
@@ -685,7 +720,7 @@ private.config.variable.export.line()     # <variableName> # echo ONE export lin
   # `declare -p` WITH AN EXPLICIT NAME — measured correct on bash 3.2.57
   # (`declare -- FOO="bar"`, `declare -a A='([0]="x")'`), unlike the
   # no-argument form. Bash does the quoting, so we hand-roll no escaper: the
-  # same precedent, and the same reason, as result.into (this:719-728), whose
+  # same precedent, and the same reason, as result.into (in this), whose
   # comment records what a bare `echo "$1=$value"` did to values with spaces.
   declaration=$(declare -p "$variableName" 2>/dev/null) || return 1
   case "$declaration" in
@@ -695,7 +730,7 @@ private.config.variable.export.line()     # <variableName> # echo ONE export lin
   # Output-side shape gate: refuse anything that is not `NAME=…` rather than
   # guess. `declare -- X` — declared, never assigned — lands here.
   case "$assignment" in "${variableName}="*) ;; *) return 1 ;; esac
-  # TWO gates, and the first one is the one that matters.
+  # TWO gates (applied by the kernel, below), and the first one is the one that matters.
   #
   # (1) THE VALUE. These files are LINE-ORIENTED — config.validate and
   # test.platform.shared.config.env.invariant both read them one line at a time
@@ -724,42 +759,36 @@ private.config.variable.export.line()     # <variableName> # echo ONE export lin
     CONFIG)                echo 'export CONFIG="$HOME/config/user.env"'; return 0 ;;
     OOSH_DIR)              echo 'export OOSH_DIR="$HOME/oosh"'; return 0 ;;
   esac
-  local value="${!variableName}"
+  local value="${!variableName}" line
   # EVERY control character, not only newline and carriage return: a tab or an
-  # ESC is rendered $'…' by bash >= 5.2 and 3.2 (refused by gate 2) but as a
-  # plain double-quoted string with the raw character inside by bash 5.1 — so
-  # on AlmaLinux 9 the same value was WRITTEN that every other platform refused
-  # and reported (T116 red on bash 5.1.8, 2026-09-29). Judged by the value, the
-  # answer no longer depends on the bash that happens to run the save.
-  case "$value" in *[[:cntrl:]]*) return 1 ;; esac
-  # (2) THE RENDERING, still worth keeping: if bash reaches for $'…' for any
-  # other reason, that is a BASHISM, and dash/ash shells (/bin/sh logins, the
-  # remote prelude) source these files, reading $'…' literally (review-2026-09-09 § D1).
-  case "$assignment" in "${variableName}=\$'"*) return 1 ;; esac
-  # PREPEND `export`. The old code sed-patched a `declare -` prefix into it,
-  # which bash 3.2's no-argument form never prints — so on macOS the
-  # substitution silently did nothing and no generated env file has ever
-  # carried `export`.
+  # ESC is rendered $'…' by bash >= 5.2 and 3.2 but as a plain double-quoted
+  # string with the raw character inside by bash 5.1 — so on AlmaLinux 9 the
+  # same value was WRITTEN that every other platform refused and reported (T116
+  # red on bash 5.1.8, 2026-09-29). Judged by the value, the answer no longer
+  # depends on the bash that happens to run the save. (2) THE RENDERING: a
+  # $'…' is a BASHISM that dash/ash shells (/bin/sh logins, the remote prelude)
+  # read literally (review-2026-09-09 § D1). Both rules, and the quoting,
+  # are the kernel's private.this.env.export.line.get, which log.session.save uses too; it also
+  # PREPENDS `export` (the old sed-patch of a `declare -` prefix never matched
+  # bash 3.2's output, so no macOS env file carried `export`).
   # SHARED CONFIG. ~/config is one directory for every user of the host, so a
   # value under the SAVING user's home is not written as that user's absolute
   # path: it is written "$HOME/…", and each user's shell expands it to their
   # own home (T29, T-CONFIG-SAVE-PREFIX-OOSH). Only the prefix is rewritten —
-  # the rest keeps the quoting bash chose for it in `declare -p`.
+  # the rest keeps the quoting bash chose for it.
   if [ -n "$HOME" ] && [ "$HOME" != "/" ]; then
     case "$value" in
       "$HOME"|"$HOME"/*)
-        local rest="${value#"$HOME"}" restDeclaration
-        restDeclaration=$(declare -p rest 2>/dev/null)
-        restDeclaration="${restDeclaration#declare -* rest=}"
-        echo "export ${variableName}=\"\$HOME${restDeclaration#\"}"
+        line=$(private.this.env.export.line.get "$variableName" "${value#"$HOME"}") || return 1
+        echo "export ${variableName}=\"\$HOME${line#"export ${variableName}=\""}"
         return 0
         ;;
     esac
   fi
-  echo "export $assignment"
+  private.this.env.export.line.get "$variableName" "$value"
 }
 
-private.config.variables.export()     # <envPrefix> # echo the complete body of an env file: one export line per persistable variable matching envPrefix #
+private.config.variables.export()     # <envPrefix> <?sessionSplit> # echo the complete body of an env file: one export line per persistable variable matching envPrefix; sessionSplit as in private.config.variables.list #
 {
   # NO create.result — its stdout IS the file. SILENT BY CONTRACT.
   #
@@ -767,11 +796,20 @@ private.config.variables.export()     # <envPrefix> # echo the complete body of 
   # `declare -p | while read` harvesting loop is a 12-line inline block that
   # reads as private.config.vars.export <prefix>". Spelled with the full word
   # `variables` to match private.config.required.variables.get in this file.
-  local envPrefix="$1"
+  local envPrefix="$1" sessionSplit="$2"
   local variableName
   # Line by line, for the same reason as private.config.variables.list.
-  private.config.variables.list "$envPrefix" | while IFS= read -r variableName; do
-    private.config.variable.export.line "$variableName"
+  # A refused value is said, not dropped silently: error.log goes through
+  # private.log.emit, which never writes stdout — this file's body
+  # (T-CONFIG-WRITER-VALIDATOR-AGREE). The line is built first and written
+  # after, so a write that fails (a full disk) is not mistaken for a refusal.
+  local line
+  private.config.variables.list "$envPrefix" "$sessionSplit" | while IFS= read -r variableName; do
+    if line=$(private.config.variable.export.line "$variableName"); then
+      printf '%s\n' "$line"
+    else
+      error.log "config save: $variableName is not saved — its value cannot be one line of pure data (a control character, \$( or a backtick)"
+    fi
   done
 }
 
@@ -800,14 +838,14 @@ private.config.string.upper()     # <string> # echo string upper-cased, without 
 # calls create.result, the same exemption every other private.config.* getter
 # carries. They DERIVE ONLY: none assigns, none persists, none writes a file.
 # That separation is deliberate. `oo pm.discover` reaches `config save`
-# internally (oo:3045-3053 → config:740's log.device HACK → a recursive
+# internally (oo.pm.discover → config.save's former log.device HACK → a recursive
 # `config save log LOG`), so derivation belongs in the REPAIR and never in the
 # WRITER. See docs/research/2026-09-17-config-save-bash32.md § 2.
 
 private.config.derive.oosh.mode()     # # the branch $HOME/oosh actually points at, its canonical basename #
 {
   # The same two steps config.validate.required's drift check used inline
-  # (and oo:2631-2633 a third time). Now one accessor, so the check and the
+  # (and private.check.user.shared.dev.folder.linked in oo a third time). Now one accessor, so the check and the
   # repair cannot disagree about what "the branch this host is on" means.
   # private.this.path.canonical, not `readlink -f` — the latter is GNU-only.
   local ooshTarget
@@ -823,7 +861,7 @@ private.config.derive.oosh.os()     # # the OS family for this host, via os.chec
   # os.check.env owns the $OSTYPE mapping and already sets OOSH_OS only when it
   # is empty, so calling it is safe whether or not the value is known. `config`
   # does not source `os`; the on-demand guard is the established route here
-  # (config:215, config:235, oo:472).
+  # (the user guards of config.init.shared and config.init.user, the config guard of oo.user.fix).
   [ "$(type -t os.check.env)" = "function" ] || source "$OOSH_DIR/os" >/dev/null 2>&1
   [ "$(type -t os.check.env)" = "function" ] || return 1
   os.check.env >/dev/null 2>&1
@@ -838,11 +876,11 @@ private.config.derive.oosh.pm()     # # the package-manager install command for 
   # Second best: the binary survived even though the command did not.
   [ -n "$OOSH_PM_BIN" ] && { private.config.pm.command.get "$OOSH_PM_BIN"; return $?; }
 
-  # NOT `oo pm.discover`. That verb is not a detector — it runs the platform's
-  # package manager for real (`$SUDO apt-get update`, oo:3093-3104) and then
-  # `config save`, so calling it from here hung a test run on a sudo password
-  # prompt and would have re-entered the writer this card deliberately keeps
-  # pure. test.suite:895-905 records the same trap being sprung once before.
+  # NOT `oo pm.discover`. That verb is not a detector — it records what it
+  # finds with `config save` (it used to run `$SUDO apt-get update` as well;
+  # today the refresh is oo.cmd's, once, before its first real install), so
+  # calling it from here would re-enter the writer this card deliberately keeps
+  # pure. The SEED comment in test.suite.config.isolate records the same trap (a discovery asking for a sudo password) sprung once before.
   #
   # A DERIVER MUST HAVE NO SIDE EFFECTS. This is detection only: which package
   # manager exists, and what its install command is.
@@ -857,8 +895,8 @@ private.config.derive.oosh.pm()     # # the package-manager install command for 
 
 private.config.pm.command.get()     # <packageManagerBinary> # the install command for a package-manager binary #
 {
-  # THE THIRD COPY of this table — init/oosh:214-222 has it in POSIX sh for the
-  # bootstrap, and oo:3093-3101 has it as arguments to private.check.pm. A
+  # THE THIRD COPY of this table — oosh_pm_detect in init/oosh has it in POSIX sh for the
+  # bootstrap, and private.check.all.pm in oo has it as arguments to private.check.pm. A
   # fourth would be indefensible; even this one is only justified because the
   # other two are unreachable from here (init/oosh self-installs when sourced,
   # and oo's copy is fused to the installer that runs sudo). Carded: one
@@ -877,9 +915,9 @@ private.config.pm.command.get()     # <packageManagerBinary> # the install comma
 
 private.config.derive.bash.file()     # # the bash interpreter this host should use #
 {
-  # What config.save has always done inline (and this:1190, this:1322). On
+  # What config.save has always done inline (and this.start, twice). On
   # macOS `command -v bash` can answer /bin/bash 3.2 while brew bash 5 is the
-  # one the install chose, so an already-set value wins — user:696-700 picks
+  # one the install chose, so an already-set value wins — user.create picks
   # the interpreter and it is not this function's business to second-guess it.
   [ -n "$BASH_FILE" ] && { echo "$BASH_FILE"; return 0; }
   local found
@@ -890,7 +928,7 @@ private.config.derive.bash.file()     # # the bash interpreter this host should 
 
 private.config.derive.config.file()     # # the name of the config file a shell starts from #
 {
-  # A constant, and deliberately so: config.init (config:188) and config save both
+  # A constant, and deliberately so: config.init and config save both
   # hard-set it, and `config file reset` means "go back to user.env". It is a
   # row in the required table because a config without it is broken, not
   # because it is ever in doubt.
@@ -900,12 +938,12 @@ private.config.derive.config.file()     # # the name of the config file a shell 
 private.config.derive.log.level()     # # the default log level #
 {
   # An already-set level wins — a host that has chosen one keeps it. The
-  # fallback is 3, which is what this:16 and log:125 both actually use. The
+  # fallback is 3, which is what this (its file-scope default) and log.init both actually use. The
   # table used to say "defaults to 1" and no code anywhere agreed with it.
   [ -n "$LOG_LEVEL" ] && { echo "$LOG_LEVEL"; return 0; }
   echo "3"
 }
-private.config.session.file.ensure()     # <targetHome> # create log.session.env and user.session.env under <targetHome>/.config/oosh when missing, never overwrite them; the shared env files chain them unguarded, so every user must have both #
+private.config.session.file.ensure()     # <targetHome> # create log.session.env, user.session.env and oosh.session.env under <targetHome>/.config/oosh when missing, never overwrite them; the shared env files chain them unguarded, so every user must have all three #
 {
  # log.env's last line is `. $HOME/.config/oosh/log.session.env`, and user.env
  # chains user.session.env the same way, with no guard — env files are pure
@@ -914,7 +952,11 @@ private.config.session.file.ensure()     # <targetHome> # create log.session.env
  # init.user and the install call this. log.session.env's content (LOG_NAME/
  # LOG_DEVICE/LOG_LIVE of the last session) is log.session.save's, never ours;
  # user.session.env's is config.session.save's — in the user's OWN hop it is
- # written right away: their real PATH and the branch their ~/oosh points at.
+ # FIRST filled right away: their real PATH and the branch their ~/oosh points
+ # at. Only a first fill: an empty user.session.env or a missing
+ # oosh.session.env. An empty oosh.session.env is legal (no branch derivable),
+ # so it triggers nothing — else every ensure rewrote user.session.env
+ # (T-CONFIG-SESSION-WRITES-ONCE).
  local targetHome="$1"
  if [ -z "$targetHome" ]; then
    create.result 1 "private.config.session.file.ensure requires <targetHome>"; error.log "$RESULT"; return $(result)
@@ -922,14 +964,15 @@ private.config.session.file.ensure()     # <targetHome> # create log.session.env
  local sessionDir="$targetHome/.config/oosh"
  check dir "$sessionDir" not exists call mkdir -p "$sessionDir"
  check file "$sessionDir/log.session.env" not exists call touch "$sessionDir/log.session.env"
- if [ ! -s "$sessionDir/user.session.env" ] && [ "${targetHome%/}" = "${HOME%/}" ]; then
+ if { [ ! -s "$sessionDir/user.session.env" ] || [ ! -f "$sessionDir/oosh.session.env" ]; } && [ "${targetHome%/}" = "${HOME%/}" ]; then
    ( [ -n "$OOSH_MODE" ] || export OOSH_MODE="$(private.config.derive.oosh.mode)"
      config.session.save >/dev/null 2>&1 )
  fi
  # Not the caller's home: only created — nobody writes another user's file.
  check file "$sessionDir/user.session.env" not exists call touch "$sessionDir/user.session.env"
- if [ -f "$sessionDir/log.session.env" ] && [ -f "$sessionDir/user.session.env" ]; then
-   create.result 0 "$sessionDir/log.session.env and user.session.env present"
+ check file "$sessionDir/oosh.session.env" not exists call touch "$sessionDir/oosh.session.env"
+ if [ -f "$sessionDir/log.session.env" ] && [ -f "$sessionDir/user.session.env" ] && [ -f "$sessionDir/oosh.session.env" ]; then
+   create.result 0 "$sessionDir/log.session.env, user.session.env and oosh.session.env present"
  else
    create.result 1 "could not create the session files in $sessionDir"
  fi
@@ -983,25 +1026,25 @@ private.config.log.chain.migrate()     # <?configPath:$CONFIG_PATH> # rewrite lo
  # T44). A host's shared log.env still ends with the old line until it is
  # rewritten, and once oosh.env no longer exports the variable that line loads
  # `/log.session.env` — a plain sh stops there. config save (before it writes)
- # and config.init.user (oo update, oo user.fix) run this. Rewritten in place
- # (`>` keeps the shared file's owner, group and mode). No create.result: the
- # callers' RESULT must stand. T-CONFIG-LOG-CHAIN-MIGRATE.
- local configPath="${1:-$CONFIG_PATH}" f line out=""
+ # and config.init.user (oo update, oo user.fix) run this. In place (owner,
+ # group and mode kept): the new chain goes on as the LAST line — where log.env
+ # keeps it — then the old one leaves, so no moment is without a chain. The
+ # migrates share one answer: rc 2 + RESULT "cannot write <file>" when a file
+ # cannot be written, rc 1 only for a closed gate (this one has none) — so a
+ # caller warns about the one and keeps its gate message for the other.
+ # T-CONFIG-LOG-CHAIN-MIGRATE, T-CONFIG-MIGRATE-WRITE-FAIL.
+ local configPath="${1:-$CONFIG_PATH}" f
  local old='. $OOSH_USER_CONFIG_PATH/log.session.env'   # legacy-chain: the line being migrated away
  local new='. $HOME/.config/oosh/log.session.env'
  f="$configPath/log.env"
  [ -f "$f" ] || return 0
  grep -qxF "$old" "$f" 2>/dev/null || return 0
- while IFS= read -r line || [ -n "$line" ]; do
-   [ "$line" = "$old" ] && line="$new"
-   out="$out$line"$'\n'
- done < "$f"
- printf '%s' "$out" > "$f" 2>/dev/null
- return 0
+ private.config.env.line.append "$f" "$new" || return 2
+ private.config.env.lines.drop "$f" "$old" || return 2
 }
 
 
-private.config.path.segments.get()     # <?form:home> # echo the PATH of this shell made safe for a saved PATH line, colon-joined — ~/oosh and ~/oosh/ng first, a bash outside /bin and /usr/bin next, no empty, dot, relative or transient segment, each once; form home writes a segment under the home as $HOME/…, form absolute keeps real paths and also drops a segment holding a dollar, double quote, backslash or backtick, an active VIRTUAL_ENV or CONDA_PREFIX and a directory that is not searchable #
+private.config.path.segments.get()     # <?form:home> # echo the PATH of this shell made safe for a saved PATH line, colon-joined — ~/oosh and ~/oosh/ng first, a bash outside /bin and /usr/bin next, no empty, dot, relative or transient segment, no segment holding a dollar, double quote, backslash or backtick, each once; form home writes a segment under the home as $HOME/…, form absolute keeps real paths and also drops an active VIRTUAL_ENV or CONDA_PREFIX and a directory that is not searchable #
 {
  # NO create.result — a getter consumed as $(...) inside a `{ … } >file`
  # block: SILENT BY CONTRACT. One set of segment rules for both saved PATH
@@ -1035,6 +1078,10 @@ private.config.path.segments.get()     # <?form:home> # echo the PATH of this sh
  while [ -n "$rest" ]; do
    seg=${rest%%:*}; rest=${rest#*:}
    while [ "$seg" != "/" ] && [ "${seg%/}" != "$seg" ]; do seg=${seg%/}; done
+   # Both lines are executed by a shell, so a segment must be pure data in
+   # either form: one holding $ " \ or a backtick goes — checked on the raw
+   # segment, before the home form adds its own $HOME (T-CONFIG-PATH-LINE-NO-CODE).
+   case "$seg" in *'$'*|*'"'*|*'\'*|*'`'*) continue ;; esac
    for p in "$ooshPhys" "$ooshLink"; do
      if [ -n "$p" ] && { [ "$seg" = "$p" ] || [ "${seg#"$p"/}" != "$seg" ]; }; then
        seg="$home/oosh${seg#"$p"}"; break
@@ -1046,11 +1093,10 @@ private.config.path.segments.get()     # <?form:home> # echo the PATH of this sh
    esac
    if [ -n "$rootOnly" ] && { [ "$seg" = "$rootOnly" ] || [ "${seg#"$rootOnly"/}" != "$seg" ]; }; then continue; fi
    if [ "$form" = "absolute" ]; then
-     # The per-user line is written as it stands, so a segment must be pure
-     # data, and a polluted session must not be frozen into the user's PATH:
-     # an active virtualenv / conda env, a directory that does not exist or is
-     # not searchable (root's dirs seen from an as-user hop).
-     case "$seg" in *'$'*|*'"'*|*'\'*|*'`'*) continue ;; esac
+     # The per-user line is written as it stands, so a polluted session must
+     # not be frozen into the user's PATH: an active virtualenv / conda env, a
+     # directory that does not exist or is not searchable (root's dirs seen
+     # from an as-user hop).
      if [ -n "$VIRTUAL_ENV" ]; then case "$seg" in "$VIRTUAL_ENV"|"$VIRTUAL_ENV"/*) continue ;; esac; fi
      if [ -n "$CONDA_PREFIX" ]; then case "$seg" in "$CONDA_PREFIX"|"$CONDA_PREFIX"/*) continue ;; esac; fi
      [ -d "$seg" ] && [ -x "$seg" ] || continue
@@ -1089,13 +1135,17 @@ private.config.user.session.file.get()     # <?home:$HOME> # echo the path of th
 }
 
 
-config.session.save()     #  # write the own ~/.config/oosh/user.session.env of this user: the real absolute PATH and OOSH_MODE; refuses a HOME the caller does not own #
+config.session.save()     #  # write the own session files of this user under ~/.config/oosh: the real absolute PATH into user.session.env, OOSH_MODE into oosh.session.env; refuses a HOME the caller does not own #
 {
-  # The per-user half of the forked user.env (boss, 2026-10-02), the twin of
-  # log.session.save: each user's PATH (real directories, no $ —
-  # private.config.path.line.absolute.get) and OOSH_MODE (the branch THEIR
-  # ~/oosh points at) in their OWN file, so one user's save never reaches
-  # another user's shell.
+  # The per-user halves of the forked env files (boss, 2026-10-02), the twin
+  # of log.session.save, one file per family: the user's PATH (real
+  # directories, no $ — private.config.path.line.absolute.get) in
+  # user.session.env, which the shared user.env chains last; OOSH_MODE (the
+  # branch THEIR ~/oosh points at) in oosh.session.env, which the shared
+  # oosh.env chains last. One user's save never reaches another user's shell.
+  # Until the shared oosh.env chains oosh.session.env (the switch waits for
+  # every user's file), OOSH_MODE goes into user.session.env too, so no shell
+  # loses its branch in between.
   if [ -z "$HOME" ] || [ ! -O "$HOME" ]; then
     # sudo on macOS keeps the invoking user's HOME: root would leave a
     # root-owned file in somebody else's ~/.config/oosh.
@@ -1103,35 +1153,45 @@ config.session.save()     #  # write the own ~/.config/oosh/user.session.env of 
     create.result 1 "HOME ($HOME) is not owned by $(id -un)"
     return $(result)
   fi
-  local f mode="$OOSH_MODE"
+  local f o mode="$OOSH_MODE" f2
   f=$(private.config.user.session.file.get)
+  o=$(private.config.oosh.session.file.get)
   mkdir -p "${f%/*}" 2>/dev/null
   # A writer does not throw away what it held: no OOSH_MODE in this shell →
-  # the user's saved one, else the one a host still keeps in the shared
-  # oosh.env from before the split. Sourced in a subshell: both are pure data.
-  [ -z "$mode" ] && [ -f "$f" ] && mode=$( unset OOSH_MODE; . "$f" 2>/dev/null; echo "$OOSH_MODE" )
-  [ -z "$mode" ] && [ -f "$CONFIG_PATH/oosh.env" ] && mode=$( unset OOSH_MODE; . "$CONFIG_PATH/oosh.env" 2>/dev/null; echo "$OOSH_MODE" )
-  if ! { : >>"$f"; } 2>/dev/null; then
-    error.log "config.session.save: cannot write $f"
-    create.result 1 "cannot write $f"
-    return $(result)
-  fi
-  # Nothing inside the redirect may log: LOG_DEVICE can be fd1.
+  # the user's oosh.session.env, else their user.session.env, else the one a
+  # host still keeps in the shared oosh.env from before the split. Sourced in
+  # a subshell: all are pure data.
+  for f2 in "$o" "$f" "$CONFIG_PATH/oosh.env"; do
+    [ -n "$mode" ] && break
+    [ -f "$f2" ] && mode=$( unset OOSH_MODE; . "$f2" 2>/dev/null; echo "$OOSH_MODE" )
+  done
+  for f2 in "$f" "$o"; do
+    if ! { : >>"$f2"; } 2>/dev/null; then
+      error.log "config.session.save: cannot write $f2"
+      create.result 1 "cannot write $f2"
+      return $(result)
+    fi
+  done
+  # Nothing inside the redirects may log: LOG_DEVICE can be fd1.
   {
     private.config.path.line.absolute.get
-    [ -n "$mode" ] && echo "export OOSH_MODE=\"$mode\""
+    private.config.oosh.session.split.is "$CONFIG_PATH" || { [ -n "$mode" ] && echo "export OOSH_MODE=\"$mode\""; }
   } >"$f"
-  create.result 0 "$f"
+  {
+    [ -n "$mode" ] && echo "export OOSH_MODE=\"$mode\""
+  } >"$o"
+  create.result 0 "$f $o"
   return $(result)
 }
 config.session.save.completion() { :; }
 
 
-private.config.required.file.path()     # <file> # echo where a row of the required table lives: user.session.env is the per-user file of this user, every other file is under CONFIG_PATH #
+private.config.required.file.path.get()     # <file> # echo where a row of the required table lives: user.session.env and oosh.session.env are the per-user files of this user, every other file is under CONFIG_PATH #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
  case "$1" in
    user.session.env) private.config.user.session.file.get ;;
+   oosh.session.env) private.config.oosh.session.file.get ;;
    *)                echo "$CONFIG_PATH/$1" ;;
  esac
 }
@@ -1159,7 +1219,7 @@ private.config.session.split.is()     # <?configPath:$CONFIG_PATH> # rc 0 when t
 }
 
 
-private.config.session.chain.ready()     # <?configPath:$CONFIG_PATH> # rc 0 when every other user linked to this shared config has a filled user.session.env, so the shared user.env may chain it; rc 1 when one has none or a home cannot be looked into #
+private.config.session.chain.ready()     # <?configPath:$CONFIG_PATH> <?family:user> # rc 0 when every other user linked to this shared config has their <family>.session.env (user: filled), so the shared <family>.env may chain it; rc 1 when one has none or a home cannot be looked into #
 {
  # Silent predicate — the GATE of the split. The shared user.env chains
  # ~/.config/oosh/user.session.env unguarded (env files are pure data), and a
@@ -1167,20 +1227,22 @@ private.config.session.chain.ready()     # <?configPath:$CONFIG_PATH> # rc 0 whe
  # same sharedConfig has none would break their shell. A home the caller cannot
  # look into (0750 homes, a non-root caller) is NOT proven, so the switch waits
  # for root (sudo oo update → config.init.user). The caller's own file is
- # written by the save itself.
- local target h link
- target=$(private.this.path.canonical "${1:-$CONFIG_PATH}" 2>/dev/null)
- [ -n "$target" ] || return 1
- while IFS= read -r h; do
+ # written by the save itself. A shared config that cannot be resolved, or a
+ # home that cannot be looked into, makes private.config.linked.homes.get
+ # answer rc 1: the gate stays closed.
+ local homes h owner family="${2:-user}"
+ homes=$(private.config.linked.homes.get "${1:-$CONFIG_PATH}") || return 1
+ while read -r h owner; do
    [ -z "$h" ] && continue
    [ "${h%/}" = "${HOME%/}" ] && continue
-   [ -x "$h" ] || return 1
-   [ -L "$h/config" ] || continue
-   link=$(private.this.path.canonical "$h/config" 2>/dev/null)
-   [ "$link" = "$target" ] || continue
-   [ -s "$h/.config/oosh/user.session.env" ] || return 1
+   if [ "$family" = "user" ]; then
+     [ -s "$h/.config/oosh/user.session.env" ] || return 1
+   else
+     # oosh.session.env may be empty (no branch derivable): it must exist.
+     [ -f "$h/.config/oosh/$family.session.env" ] || return 1
+   fi
  done <<HOMES
-$(private.config.homes.list)
+$homes
 HOMES
  return 0
 }
@@ -1191,32 +1253,22 @@ private.config.user.session.migrate()     # <?configPath:$CONFIG_PATH> # switch 
  # The forked user.env (boss, 2026-10-02) for a host whose shared files were
  # written before the split. Each user's PATH and OOSH_MODE are in their own
  # user.session.env by then (private.config.session.files.ensure.all, the
- # gate checks it). Rewritten in place (`>` keeps the shared files' owner,
- # group and mode), as private.config.log.chain.migrate. No create.result:
- # the callers' RESULT must stand. T-CONFIG-USER-SESSION-MIGRATE.
- local configPath="${1:-$CONFIG_PATH}" f line out
+ # gate checks it). In place (owner, group and mode of the shared files
+ # kept), as private.config.log.chain.migrate: the chain goes on last first,
+ # then PATH leaves — a shell started in between still has a PATH. rc 1 when
+ # the gate is closed; rc 2 when a shared file cannot be written (RESULT
+ # "cannot write <file>"), as private.config.log.chain.migrate.
+ # T-CONFIG-USER-SESSION-MIGRATE, T-CONFIG-MIGRATE-WRITE-FAIL.
+ local configPath="${1:-$CONFIG_PATH}" f
  local chain='. $HOME/.config/oosh/user.session.env'
  f="$configPath/user.env"
  [ -f "$f" ] || return 0
  private.config.session.split.is "$configPath" && return 0
  private.config.session.chain.ready "$configPath" || return 1
- out=""
- while IFS= read -r line || [ -n "$line" ]; do
-   # path-exception: matches the line being moved out, not an assignment.
-   case "$line" in "export PATH="*|"PATH="*) continue ;; esac
-   out="$out$line"$'\n'
- done < "$f"
- printf '%s%s\n' "$out" "$chain" > "$f" 2>/dev/null
- f="$configPath/oosh.env"
- if [ -f "$f" ]; then
-   out=""
-   while IFS= read -r line || [ -n "$line" ]; do
-     case "$line" in "export OOSH_MODE="*|"OOSH_MODE="*) continue ;; esac
-     out="$out$line"$'\n'
-   done < "$f"
-   printf '%s' "$out" > "$f" 2>/dev/null
- fi
- return 0
+ private.config.env.line.append "$f" "$chain" || return 2
+ # path-exception: the prefixes of the line being moved out, not an assignment.
+ private.config.env.lines.drop "$f" "export PATH=" "PATH=" || return 2
+ private.config.env.lines.drop "$configPath/oosh.env" "export OOSH_MODE=" "OOSH_MODE=" || return 2
 }
 
 
@@ -1226,25 +1278,263 @@ private.config.session.files.ensure.all()     # <sharedConfig> <sharedOosh> # as
  # every user. Each user's file is written AS them (the shared preamble), so it
  # holds THEIR real PATH and THEIR branch. No create.result: config.init.user's
  # RESULT must stand.
- local sharedConfig="$1" sharedOosh="$2" target h link owner
+ local sharedConfig="$1" sharedOosh="$2" h owner
  [ "$(id -u)" = "0" ] || return 0
- target=$(private.this.path.canonical "$sharedConfig" 2>/dev/null)
- [ -n "$target" ] || return 0
- while IFS= read -r h; do
+ while read -r h owner; do
    [ -z "$h" ] && continue
-   [ -L "$h/config" ] || continue
-   link=$(private.this.path.canonical "$h/config" 2>/dev/null)
-   [ "$link" = "$target" ] || continue
-   [ -s "$h/.config/oosh/user.session.env" ] && continue
-   owner=$(stat -c %U "$h" 2>/dev/null || stat -f %Su "$h" 2>/dev/null)
-   [ -n "$owner" ] || continue
+   [ -s "$h/.config/oosh/user.session.env" ] && [ -f "$h/.config/oosh/oosh.session.env" ] && continue
    private.as.user "$owner" bash -c "$(private.this.as.user.preamble.get "$owner" "$h" "$sharedOosh")
      private.this.script.load config private.config.session.file.ensure || exit 1
      private.config.session.file.ensure \"$h\" >/dev/null" >/dev/null 2>&1
  done <<HOMES
-$(private.config.homes.list)
+$(private.config.linked.homes.get "$sharedConfig")
 HOMES
  return 0
+}
+
+
+private.config.oosh.session.file.get()     # <?home:$HOME> # echo the path of the per-user oosh.session.env under <home> #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ local home="${1:-$HOME}"
+ echo "${home%/}/.config/oosh/oosh.session.env"
+}
+
+
+private.config.oosh.session.split.is()     # <?configPath:$CONFIG_PATH> # rc 0 when the shared oosh.env already chains the per-user oosh.session.env #
+{
+ # Silent predicate, the twin of private.config.session.split.is.
+ grep -qxF '. $HOME/.config/oosh/oosh.session.env' "${1:-$CONFIG_PATH}/oosh.env" 2>/dev/null
+}
+
+
+private.config.oosh.session.migrate()     # <?configPath:$CONFIG_PATH> # chain the per-user oosh.session.env as the last line of the shared oosh.env, in place, OOSH_MODE out of it; only when every linked user has one; then OOSH_MODE leaves the user.session.env files the caller may write; idempotent, silent #
+{
+ # OOSH_MODE belongs to the oosh family (boss, 2026-10-02): the shared
+ # oosh.env chains each user's ~/.config/oosh/oosh.session.env, as log.env
+ # chains log.session.env. In place (owner, group and mode kept), only
+ # through the gate (a plain sh ends on a missing file): the chain goes on
+ # last first, then OOSH_MODE leaves. After the switch the transition copy of
+ # OOSH_MODE in user.session.env goes — root reaches every linked user's; a
+ # file the caller may not write is left to its owner. rc 1 when the gate is
+ # closed; rc 2 when a file cannot be written (RESULT "cannot write <file>"),
+ # as private.config.log.chain.migrate.
+ # T-CONFIG-OOSH-SESSION-MIGRATE, T-CONFIG-MIGRATE-WRITE-FAIL.
+ local configPath="${1:-$CONFIG_PATH}" f h owner rc=0
+ local chain='. $HOME/.config/oosh/oosh.session.env'
+ f="$configPath/oosh.env"
+ [ -f "$f" ] || return 0
+ if ! private.config.oosh.session.split.is "$configPath"; then
+   private.config.session.chain.ready "$configPath" oosh || return 1
+   private.config.env.line.append "$f" "$chain" || return 2
+   private.config.env.lines.drop "$f" "export OOSH_MODE=" "OOSH_MODE=" || return 2
+ fi
+ while read -r h owner; do
+   [ -z "$h" ] && continue
+   f="$h/.config/oosh/user.session.env"
+   [ -w "$f" ] || continue
+   private.config.env.lines.drop "$f" "export OOSH_MODE=" || rc=2
+ done <<HOMES
+$(private.config.linked.homes.get "$configPath")
+HOMES
+ return $rc
+}
+
+
+private.config.host.container.name.get()     #  # echo the Docker name of this container, read through the mounted docker socket; nothing outside a container or without access #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # A container's host name is the start of its ID; the container that owns
+ # that ID has the name. `container inspect` (not images), and the ID must
+ # start with this host name — a computer named like some container is no
+ # container.
+ local id line
+ command -v docker >/dev/null 2>&1 || return 1
+ id=$(private.this.host.name.get)
+ [ -n "$id" ] || return 1
+ line=$(docker container inspect -f '{{.Id}} {{.Name}}' "$id" 2>/dev/null) || return 1
+ case "${line%% *}" in "$id"*) ;; *) return 1 ;; esac
+ line="${line#* }"
+ [ -n "${line#/}" ] || return 1
+ echo "${line#/}"
+}
+
+
+private.config.host.name.get()     # <?name> # echo the name of this computer for oosh (prompt, logs, ssh): <name> when given, else a container's Docker name, the macOS LocalHostName, else the short host name #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # $HOSTNAME is a container's ID ([oosh 2a1023f6d45b], 2026-10-05) and on a Mac
+ # often carries the router's domain (.fritz.box).
+ if [ -n "$1" ]; then echo "$1"; return 0; fi
+ local name
+ name=$(private.config.host.container.name.get)
+ if [ -z "$name" ]; then
+   case "${OOSH_OS:-$(uname -s)}" in
+     darwin*|Darwin) name=$(scutil --get LocalHostName 2>/dev/null) ;;
+   esac
+ fi
+ [ -n "$name" ] || name=$(private.this.host.name.get short)
+ echo "${name:-localhost}"
+}
+
+
+private.config.host.name.refresh()     #  # correct the saved computer name (OOSH_SSH_CONFIG_HOST in oosh.env) when it was guessed and is wrong now — empty, a container ID, the raw host name, another container's name (a cloned image); a name chosen with config ssh.host.set is kept #
+{
+  # A chosen name is anything else: the alias `ossh install <alias>` gave, or
+  # what `config ssh.host.set` set — never overwritten.
+  local file="$CONFIG_PATH/oosh.env" saved name host stale=""
+  if [ ! -w "$file" ]; then
+    create.result 0 "not writable here: $file"; return $(result)
+  fi
+  saved=$(CONFIG="$file" config.get OOSH_SSH_CONFIG_HOST 2>/dev/null)
+  name=$(private.config.host.name.get)
+  if [ "$saved" = "$name" ]; then
+    create.result 0 "$name"; return $(result)
+  fi
+  host=$(private.this.host.name.get)
+  if [ -z "$saved" ] || [ "$saved" = "$host" ] || [ "$saved" = "${HOSTNAME:-}" ]; then
+    stale="guessed"
+  elif [[ "$saved" =~ ^[0-9a-f]{12}$ ]]; then
+    stale="a container ID"
+  elif command -v docker >/dev/null 2>&1 && docker container inspect -f '{{.Id}}' "$saved" >/dev/null 2>&1; then
+    stale="another container's name"
+  fi
+  if [ -z "$stale" ]; then
+    create.result 0 "kept: $saved"; return $(result)
+  fi
+  CONFIG="$file" config.set OOSH_SSH_CONFIG_HOST "$name"
+  export OOSH_SSH_CONFIG_HOST="$name"
+  info.log "computer name: ${saved:-<none>} ($stale) → $name"
+  create.result 0 "$name"
+  return $(result)
+}
+
+
+private.config.linked.homes.get()     # <sharedConfig> # echo "<home> <owner>" for every home whose ~/config links to <sharedConfig>, one per line; rc 1 when <sharedConfig> cannot be resolved or a home cannot be looked into #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT. The
+ # users of one shared config: whom root's hops in config.init.user serve
+ # (session files, .bashrc), whom the gate of the split asks
+ # (private.config.session.chain.ready) and whose user.session.env the oosh
+ # migrate cleans. The one place that decides "linked". A home the caller
+ # cannot search (0750 homes, a non-root caller) hides its link: it is left
+ # out and the rc says so — the gate treats that as not proven.
+ local target h link owner rc=0
+ target=$(private.this.path.canonical "$1" 2>/dev/null)
+ [ -n "$target" ] || return 1
+ while IFS= read -r h; do
+   [ -z "$h" ] && continue
+   if [ ! -x "$h" ]; then rc=1; continue; fi
+   [ -L "$h/config" ] || continue
+   link=$(private.this.path.canonical "$h/config" 2>/dev/null)
+   [ "$link" = "$target" ] || continue
+   owner=$(private.this.path.stat.get "$h" owner)
+   [ -n "$owner" ] && echo "$h $owner"
+ done <<HOMES
+$(private.config.homes.list)
+HOMES
+ return $rc
+}
+
+
+private.config.bashrc.ensure.all()     # <sharedConfig> <sharedOosh> # as root, give every user linked to <sharedConfig> the oosh .bashrc of the branch their own ~/oosh points at (<sharedOosh> for a user without one) when theirs differs, each in their own hop #
+{
+ # `oo update` renewed only the .bashrc of the user running it: a new prompt
+ # ([oosh jolly_gagarin] bash-user@jolly_gagarin, 2026-10-05) needed an
+ # `oo update` by every user. Root reaches them all, AS each user (their file
+ # stays theirs); private.user.bashrc.install is the one writer. No
+ # create.result: config.init.user's RESULT must stand.
+ # The template is that of THEIR branch — the canonical target of their own
+ # ~/oosh: root's branch for everyone made a user on testing ping-pong with
+ # their own next oo update (T-CONFIG-BASHRC-ALL-OWN-BRANCH).
+ local sharedConfig="$1" sharedOosh="$2" h owner userOosh
+ [ "$(id -u)" = "0" ] || return 0
+ while read -r h owner; do
+   [ -z "$h" ] && continue
+   userOosh=$(private.this.path.canonical "$h/oosh" 2>/dev/null)
+   [ -n "$userOosh" ] && [ -r "$userOosh/templates/user/bashrcTemplate" ] || userOosh="$sharedOosh"
+   private.this.file.same "$userOosh/templates/user/bashrcTemplate" "$h/.bashrc" && continue
+   private.as.user "$owner" bash -c "$(private.this.as.user.preamble.get "$owner" "$h" "$sharedOosh")
+     private.this.script.load user private.user.bashrc.install || exit 1
+     private.user.bashrc.install \"$h\" \"$userOosh\" >/dev/null" >/dev/null 2>&1
+ done <<HOMES
+$(private.config.linked.homes.get "$sharedConfig")
+HOMES
+ return 0
+}
+
+
+private.config.env.lines.drop()     # <file> <prefix> <?morePrefixes> # drop every line of the env <file> that starts with one of the prefixes, in place (owner, group and mode kept); an unchanged file is not rewritten; rc 1 and RESULT when the file cannot be written #
+{
+ # The one owner of "these lines leave a shared env file": the migrates of
+ # user.env, oosh.env, log.env and the users' user.session.env. Rewritten in
+ # place — `>` keeps the owner, group and mode of a file every dev-group user
+ # may write (replace commit puts a new file under the name: the writer
+ # becomes its owner). Nothing is written when no line matches. The write is
+ # checked: a caller not in group dev, or a full disk, is rc 1, never a
+ # silent success. Silent otherwise: no logging (LOG_DEVICE can be fd1).
+ local file="$1" line out="" prefix dropped=0
+ if [ -z "$file" ] || [ -z "$2" ]; then
+   create.result 1 "private.config.env.lines.drop requires <file> <prefix>"
+   return $(result)
+ fi
+ shift
+ if [ ! -f "$file" ]; then
+   create.result 0 "$file does not exist — nothing to drop"
+   return $(result)
+ fi
+ while IFS= read -r line || [ -n "$line" ]; do
+   for prefix in "$@"; do
+     case "$line" in "$prefix"*) dropped=$((dropped + 1)); continue 2 ;; esac
+   done
+   out="$out$line"$'\n'
+ done < "$file"
+ if [ "$dropped" = 0 ]; then
+   create.result 0 "$file unchanged"
+   return $(result)
+ fi
+ if ! { printf '%s' "$out" > "$file"; } 2>/dev/null; then
+   create.result 1 "cannot write $file — $dropped line(s) not dropped"
+   return $(result)
+ fi
+ create.result 0 "$file: $dropped line(s) dropped"
+ return $(result)
+}
+
+
+private.config.env.line.append()     # <file> <line> # append <line> to the env <file> unless the file already holds it as a whole line, in place (owner, group and mode kept); rc 1 and RESULT when the file cannot be written #
+{
+ # The twin of private.config.env.lines.drop: a chain line onto a shared env
+ # file, once. `>>` keeps owner, group and mode; the write is checked. Silent
+ # (LOG_DEVICE can be fd1).
+ local file="$1" line="$2"
+ if [ -z "$file" ] || [ -z "$line" ]; then
+   create.result 1 "private.config.env.line.append requires <file> <line>"
+   return $(result)
+ fi
+ if grep -qxF -- "$line" "$file" 2>/dev/null; then
+   create.result 0 "$file already holds the line"
+   return $(result)
+ fi
+ # A last line without its newline would swallow the appended one.
+ local lead=""
+ [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ] && lead=$'\n'
+ if ! { printf '%s%s\n' "$lead" "$line" >> "$file"; } 2>/dev/null; then
+   create.result 1 "cannot write $file — line not appended"
+   return $(result)
+ fi
+ create.result 0 "$file: line appended"
+ return $(result)
+}
+
+
+config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $CONFIG_PATH containing all env variables that match <ENV_PREFIX>
+# without parameters it inititlises the $CONFIG_PATH/user.env
+{
+ # The layout (sessionSplit, ooshSplit) is no parameter of the command — a
+ # person never types it. A full save decides it and hands it to its nested
+ # oosh save through private.config.save (T-CONFIG-SAVE-LAYOUT-ARGS).
+ private.config.save "$1" "$2"
 }
 
 
@@ -1283,8 +1573,7 @@ config.usage()
   #loop.list PATH print '---------------------: '
 }
 
-config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $CONFIG_PATH containing all env variables that match <ENV_PREFIX>
-# without parameters it inititlises the $CONFIG_PATH/user.env
+private.config.save()     # <?name> <?ENV_PREFIX> <?sessionSplit> <?ooshSplit> # the work of config.save; sessionSplit and ooshSplit (yes or no) are the layout a full save hands its nested oosh save, empty reads it off the files #
 {
   #set -x
   console.log "config.save (CONFIG=$CONFIG)"
@@ -1295,8 +1584,10 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   # the end of the no-arg branch).
   local configSaveRc=0
   # A host's OLD log.env chain line first: this save may drop the removed
-  # per-user dir variable from oosh.env (T-CONFIG-LOG-CHAIN-MIGRATE).
-  private.config.log.chain.migrate "$CONFIG_PATH"
+  # per-user dir variable from oosh.env (T-CONFIG-LOG-CHAIN-MIGRATE). A
+  # log.env that cannot be written is said, not stepped over
+  # (T-CONFIG-SAVE-MIGRATE-WRITE-FAIL); the save goes on.
+  private.config.log.chain.migrate "$CONFIG_PATH" || warn.log "config.save: $RESULT"
 
   local file=$1
   shift
@@ -1314,6 +1605,8 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   else
     shift
   fi
+  # The layout a full save decided (below), handed to its nested saves.
+  local sessionSplit="$1" ooshSplit="$2"
 
 
   if [ -n "$file" ]; then
@@ -1328,7 +1621,7 @@ config.save() # <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $
   #
   # `{ … } >$CONFIG` below TRUNCATES, and what it writes is whatever is in the
   # CURRENT ENVIRONMENT. So a shell missing a required variable rewrites the
-  # file without it. `oo mode <branch>` is the live example (oo:938-940): it
+  # file without it. `oo mode <branch>` is the live example (oo.mode): it
   # sets OOSH_MODE and immediately saves oosh.env from that shell — which has
   # OOSH_MODE and, because nothing re-derives OOSH_OS at shell init, no
   # OOSH_OS. The file loses it. That is the oscillation measured on the macOS
@@ -1362,6 +1655,11 @@ REQUIRED
   local chainNames=""
   [ -z "$file" ] && chainNames=$(private.config.chain.names.get "$CONFIG")
 
+  # A named oosh save keeps the oosh.session.env chain the file had — read
+  # before the harvest below truncates it.
+  local ooshChainHad=""
+  [ "$file" = oosh ] && private.config.oosh.session.split.is "$CONFIG_PATH" && ooshChainHad=yes
+
   RESULT=""
   # The harvest writes a NAMED file (`config save oosh`). Without a name the
   # no-argument branch below writes user.env itself — harvesting into it first
@@ -1380,11 +1678,21 @@ REQUIRED
       # into ~/config/oosh.env on every macOS install.
       # See docs/research/2026-09-17-config-save-bash32.md.
       #
-      # NOTHING inside this block may log. log:35 sets
+      # NOTHING inside this block may log. log's file-scope LOG_DEVICE block sets
       # LOG_DEVICE=/proc/self/fd/1, and inside this redirect fd 1 IS $CONFIG, so
       # a single debug.log would be written into the generated env file.
-      private.config.variables.export "$name"
+      private.config.variables.export "$name" "$sessionSplit"
     } >$CONFIG
+  fi
+  if [ "$file" = oosh ]; then
+    # oosh.env chains the user's own oosh.session.env (OOSH_MODE) as its LAST
+    # line, the twin of log.env below — once the shared config is switched:
+    # a full save decides it up front (<ooshSplit>), a named save keeps
+    # what the file had (T-CONFIG-OOSH-CHAIN-KEPT). Unguarded: every user has
+    # the file (private.config.session.file.ensure).
+    local ooshChain="${ooshSplit:-}"
+    [ -z "$ooshChain" ] && [ -n "$ooshChainHad" ] && ooshChain=yes
+    [ "$ooshChain" = "yes" ] && echo '. $HOME/.config/oosh/oosh.session.env' >> "$CONFIG"
   fi
   if [ "$file" = log ]; then
     # log.env chains the PER-USER session file as its LAST line, every time it
@@ -1422,26 +1730,29 @@ REQUIRED
     # switched stays switched; an old one switches only when every user linked
     # to it has their own user.session.env (the gate). Until then the shared
     # user.env keeps its PATH line and OOSH_MODE stays in oosh.env.
-    local _configSessionSplit=no
+    sessionSplit=no ooshSplit=no
     if private.config.session.split.is "$CONFIG_PATH" || private.config.session.chain.ready "$CONFIG_PATH"; then
-      _configSessionSplit=yes
+      sessionSplit=yes
+    fi
+    # The same for oosh.env's chain to the user's own oosh.session.env.
+    if private.config.oosh.session.split.is "$CONFIG_PATH" || private.config.session.chain.ready "$CONFIG_PATH" oosh; then
+      ooshSplit=yes
     fi
     {
       private.config.variable.export.line CONFIG_PATH
       private.config.variable.export.line CONFIG_FILE
       private.config.variable.export.line CONFIG
       # Before the switch only: the shared PATH line (private.config.path.line.get).
-      [ "$_configSessionSplit" = "yes" ] || private.config.path.line.get
+      [ "$sessionSplit" = "yes" ] || private.config.path.line.get
       private.config.variable.export.line BASH_FILE
     } >$CONFIG
 
-
-    ### HACK should be in log.init only. but is needed for ssh remote logging
-      log.device $LOG_DEVICE
-    ###
-
-
-    config.save oosh OOSH   # pure `export OOSH_*` lines
+    private.config.save oosh OOSH "$sessionSplit" "$ooshSplit"   # pure `export OOSH_*` lines
+    # The SAVING user's own session files (T-CONFIG-USER-SESSION-SPLIT): after
+    # oosh.env (whether it chains oosh.session.env decides where OOSH_MODE
+    # goes), before `config save log`, whose ensure then finds them filled — one
+    # write each per save (T-CONFIG-SESSION-WRITES-ONCE).
+    config.session.save >/dev/null
     config.save log LOG     # pure `export LOG_*` lines
     config.file user.env
     config.add oosh OOSH    # appends: source $CONFIG_PATH/oosh.env
@@ -1456,14 +1767,13 @@ REQUIRED
     # after every shared chain, so the personal values win. UNEXPANDED (single
     # quotes) so each user loads their OWN file; unguarded, like log.env's
     # chain: install and config init.user create it for every user
-    # (private.config.session.file.ensure). The SAVING user's file is written
-    # here too (T-CONFIG-USER-SESSION-SPLIT).
-    if [ "$_configSessionSplit" = "yes" ]; then
+    # (private.config.session.file.ensure). The SAVING user's file was written
+    # above, after oosh.env.
+    if [ "$sessionSplit" = "yes" ]; then
       echo '. $HOME/.config/oosh/user.session.env' >> "$CONFIG"
     else
       info.log "config.save: the shared user.env keeps its PATH line until every user of it has ~/.config/oosh/user.session.env — run: sudo oo update"
     fi
-    config.session.save >/dev/null
 
     # Guard: user.env may hold export/comment/blank + `source *.env` chaining
     # (composition, NOT logic); oosh.env / log.env must be pure. config.validate
@@ -1476,7 +1786,7 @@ REQUIRED
     # signal a warn.log inside a 1 MB install log at a level that was not
     # printing. A guard whose verdict is discarded is not a guard.
     #
-    # STDERR, not stdout, and the reason is load-bearing: user:1702-1708 records
+    # STDERR, not stdout, and the reason is load-bearing: private.user.init's cache write records
     # that `$(user get basehome)` CAPTURES this function's stdout, and a stray
     # line there once propagated a garbage IdentityFile into a generated
     # 2cuGitHub config block and failed the downstream git clone. stderr
@@ -1575,7 +1885,7 @@ private.config.required.variables.get() # # the variables a config must carry fo
   cat <<'REQUIRED'
 BASH_FILE user.env private.config.derive.bash.file
 CONFIG_FILE user.env private.config.derive.config.file
-OOSH_MODE user.session.env private.config.derive.oosh.mode
+OOSH_MODE oosh.session.env private.config.derive.oosh.mode
 OOSH_OS oosh.env private.config.derive.oosh.os
 OOSH_PM oosh.env private.config.derive.oosh.pm
 LOG_LEVEL log.env private.config.derive.log.level
@@ -1593,7 +1903,7 @@ config.validate.required() # # verify the persisted config carries every variabl
   local missing="" variable file rest
   while read -r variable file rest; do
     [ -z "$variable" ] && continue
-    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$(private.config.required.file.path "$file")" 2>/dev/null \
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${variable}=" "$(private.config.required.file.path.get "$file")" 2>/dev/null \
       || missing="$missing $variable"
   done <<REQUIRED
 $(private.config.required.variables.get)
@@ -1605,12 +1915,12 @@ REQUIRED
   local drift="" persistedMode actualMode
   # The user's own session file; a host from before the split still has it in
   # the shared oosh.env.
-  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$(private.config.required.file.path user.session.env)" 2>/dev/null \
+  persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$(private.config.required.file.path.get oosh.session.env)" "$(private.config.required.file.path.get user.session.env)" 2>/dev/null \
                   | cut -d= -f2- | tr -d '"')
   [ -z "$persistedMode" ] && persistedMode=$(grep -m1 -E "^[[:space:]]*(export[[:space:]]+)?OOSH_MODE=" "$CONFIG_PATH/oosh.env" 2>/dev/null \
                   | cut -d= -f2- | tr -d '"')
   # The SAME accessor the repair uses. This was two inline steps here and two
-  # more at oo:2631-2633; three answers to "which branch is this host on" could
+  # more in oo (private.check.user.shared.dev.folder.linked); three answers to "which branch is this host on" could
   # drift apart, and the drift check disagreeing with the repair is the one
   # disagreement that would be hardest to see.
   actualMode=$(private.config.derive.oosh.mode 2>/dev/null)

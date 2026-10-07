@@ -73,7 +73,7 @@ captures ALL env vars matching prefix "LOG" via: declare -p | grep LOG
 ~/config/log.env now contains LOG_LEVEL="5" (and test artifacts)
           │
           ▼
-~/config/user.env contains: source $CONFIG_PATH/log.env
+~/config/user.env chains it: . $CONFIG_PATH/log.env
           │
           ▼
 Every script: source this → this.init() → source "$CONFIG" → loads LOG_LEVEL=5

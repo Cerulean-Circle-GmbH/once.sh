@@ -213,6 +213,12 @@ test.suite.init() # # initializes test suite counters and environment
   : ${TEST_SUITE_CONFIG_ORIGIN:=${CONFIG_PATH:-$HOME/config}}
   export TEST_SUITE_CONFIG_ORIGIN
 
+  # A test run installs nothing on the machine it runs on: tests start real
+  # scripts, and odocker installed colima, docker and lima on a Mac VM DURING
+  # the tests (2026-10-06). Scripts that install what they miss honour it
+  # (T-SUITE-NO-INSTALL); a test of an install lifts it (env -u).
+  export OOSH_NO_INSTALL=1
+
   # Where this file's score goes. `:=` on an exported variable means the
   # runner's value wins in every child (test files are exec'd, not sourced), so
   # parent and child resolve the same handoff path by construction rather than
@@ -246,7 +252,7 @@ test.suite.init() # # initializes test suite counters and environment
   fi
 }
 
-test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
+test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder, or the test file at a path when test holds a slash
 {
   local command=$1
   shift
@@ -259,10 +265,16 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
     level=1
   fi
 
+  # A bare name is $OOSH_DIR/test/test.<name>; an argument holding a / is the
+  # path of a test file anywhere — the runner's own end-to-end tests run their
+  # probes from a fixture, not from the tracked test folder (T-SUITE-RUN-PATH).
+  local testFile="$OOSH_DIR/test/test.$command" testName="test.$command"
+  case "$command" in */*) testFile="$command"; testName="${command##*/}" ;; esac
+
   # Print test header
   echo ""
   echo -e "\e[1;36m╔════════════════════════════════════════════════════════════════════╗\e[0m"
-  echo -e "\e[1;36m║  RUNNING TEST: test.$command\e[0m"
+  echo -e "\e[1;36m║  RUNNING TEST: $testName\e[0m"
   echo -e "\e[1;36m╚════════════════════════════════════════════════════════════════════╝\e[0m"
   echo ""
 
@@ -276,19 +288,19 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
   private.test.suite.counters.reset
 
   if [ "$level" -gt 0 ]; then
-    important.log "starting test: $OOSH_DIR/test/test.$command -level:$level- -clear:$clear-"
-    $OOSH_DIR/test/test.$command $level $clear
+    important.log "starting test: $testFile -level:$level- -clear:$clear-"
+    "$testFile" $level $clear
   else
-    $OOSH_DIR/test/test.$command $level $clear >/dev/null
+    "$testFile" $level $clear >/dev/null
   fi
   private.test.suite.session.restore >/dev/null
 
-  local sharedWrites=0
-  if ! private.test.suite.shared.verify "test.$command"; then
+  local sharedWrites=0 noResults=0
+  if ! private.test.suite.shared.verify "$testName"; then
     local sharedReason="$RESULT"
-    local sharedWaiver; sharedWaiver=$(private.test.suite.shared.waiver.get "$OOSH_DIR/test/test.$command")
+    local sharedWaiver; sharedWaiver=$(private.test.suite.shared.waiver.get "$testFile")
     [ -z "$sharedWaiver" ] && sharedWrites=1
-    private.test.suite.shared.report "$sharedReason" "test.$command" "$sharedWaiver"
+    private.test.suite.shared.report "$sharedReason" "$testName" "$sharedWaiver"
   fi
 
   local resultsFile; resultsFile=$(private.test.suite.results.file.get)
@@ -299,19 +311,23 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder
     # so the comparison below became `[ "" -eq "" ]` → "integer expression
     # expected" on a clean box, or the previous file's numbers otherwise.
     private.test.suite.counters.reset
-    echo -e "\e[1;33m  ⚠ NO RESULTS: test.$command produced no score of its own — 0 / 0\e[0m"
+    noResults=1
+    echo -e "\e[1;33m  ⚠ NO RESULTS: $testName produced no score of its own — 0 / 0\e[0m"
   fi
 
   # Print results
   echo ""
   echo -e "\e[1;37m────────────────────────────────────────────────────────────────────\e[0m"
-  echo -e "  Completed: \e[1;37mtest.$command\e[0m"
+  echo -e "  Completed: \e[1;37m$testName\e[0m"
   echo -e "  Results:   \e[1;32m$TEST_SUITE_SUCCESS_COUNTER\e[0m / $TEST_SUITE_EXPECT_COUNTER assertions passed"
   echo -e "\e[1;37m────────────────────────────────────────────────────────────────────\e[0m"
 
   local rc=0
   if [ "$sharedWrites" -gt 0 ]; then
     echo -e "\e[1;31m  ✗ the shared config tier was written\e[0m"
+    rc=1
+  elif [ "$noResults" -gt 0 ]; then
+    echo -e "\e[1;31m  ✗ NO RESULTS: $testName ended before test.suite.save.results — a file that scores nothing fails\e[0m"
     rc=1
   elif [ "$TEST_SUITE_SUCCESS_COUNTER" -eq "$TEST_SUITE_EXPECT_COUNTER" ]; then
     echo -e "\e[1;32m  ✓ All tests successful\e[0m"
@@ -443,11 +459,14 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
       $file $level $clear >/dev/null
     fi
 
+    # The runner's own session files go back after EVERY file, as in
+    # test.suite.run — a platform file included (T-SUITE-SESSION-RESTORE-PLATFORM).
+    private.test.suite.session.restore >/dev/null
+
     # Did this file rewrite the site-wide tier? A platform test is exempt by
     # design — it asserts on the REAL installed machine, which is the whole
     # reason TEST_CATEGORY=platform exists.
     if [ "$fileCategory" != "platform" ]; then
-      private.test.suite.session.restore >/dev/null
       if ! private.test.suite.shared.verify "$filename"; then
         local sharedReason="$RESULT"
         local sharedWaiver; sharedWaiver=$(private.test.suite.shared.waiver.get "$file")
@@ -879,14 +898,14 @@ test.suite.config.isolate() # <?label:caller> # point the config anchors at a fr
   # SEED the fixture from the tier this file inherited, so READS still answer
   # what they answered before and only WRITES are diverted. An empty fixture is
   # not isolation, it is a different machine: test.config went looking for
-  # $OOSH_PM, found nothing, and reached oo.pm.discover — which runs a real
-  # `sudo apt-get update` and sat on a password prompt. Overwrites $CONFIG,
+  # $OOSH_PM, found nothing, and reached oo.pm.discover — which then ran a real
+  # `sudo apt-get update` (discovery only records now) and sat on a password prompt. Overwrites $CONFIG,
   # which is fine: user.env is the chain header, and the `: >` above exists
   # only to satisfy config.start's `-f` guard before this point.
   # EVERY .env, not just the three the guard fingerprints. Seeding only
   # user/oosh/log left test.config without os.commands.env, so sourcing `user`
-  # ran private.user.init's cache-miss branch → `oo pm.discover` → a real
-  # `sudo apt-get update`, sitting on a password prompt. The tier's other
+  # ran private.user.init's cache-miss branch → `oo pm.discover`, which then ran a real
+  # `sudo apt-get update` (discovery only records now), sitting on a password prompt. The tier's other
   # files — os.commands.env, the colour set, lineFormat.env, the hivemind
   # registries — are read by production code the same way.
   local seedFile
@@ -1092,10 +1111,12 @@ private.test.suite.verdict() # <sharedWrites> <noResults> <category> <expects> <
     create.result 1 "the shared config tier was written during this run"
     return $(result)
   fi
-  # core only: the twelve known score-less files are all extended, and giving
-  # them a score is content work, not runner work. See tests-that-cannot-fail.
-  if [ "$noResults" -gt 0 ] && [ "$category" = "core" ]; then
-    create.result 1 "a core test file produced no score of its own"
+  # core and platform: the twelve known score-less files are all extended,
+  # and giving them a score is content work, not runner work (see
+  # tests-that-cannot-fail) — so extended, and `all` with them, keep the
+  # warning. A platform invariant that died scored nothing and passed the gate.
+  if [ "$noResults" -gt 0 ] && { [ "$category" = "core" ] || [ "$category" = "platform" ]; }; then
+    create.result 1 "a $category test file produced no score of its own"
     return $(result)
   fi
   if [ "$expects" -eq 0 ]; then
@@ -1223,14 +1244,9 @@ test.suite.portability.validate()     # <?treeRoot:$OOSH_DIR/test> # verify test
   # shape `os platform.test` runs in). Both come back as an empty result, and an
   # empty result is indistinguishable from a clean tree: the gate would report
   # OK while having read nothing at all. Prove the sweep can see the files
-  # BEFORE trusting that it found no violations in them.
-  if [ -z "$(ogit.repo.files.list "$treeRoot" | head -1)" ]; then
-    # ogit-exception: printed text, not an invocation
-    error.log "test.suite.portability.validate: git cannot list tracked files under $treeRoot — no repository, or ownership refused. A sweep that reads nothing reports OK, so this is a failure, not a pass."
-    echo "INVALID: cannot read $treeRoot through git — no tracked files visible"
-    create.result 2 "git sees no tracked files under $treeRoot"
-    return $(result)
-  fi
+  # BEFORE trusting that it found no violations in them — the kernel's one
+  # guard, shared by the four tree sweeps (private.this.tree.tracked.check).
+  private.this.tree.tracked.check "$treeRoot" test.suite.portability.validate || return $(result)
 
   # Each rule is <ERE>@@<severity>@@<why>, severity `violation` or `advisory`.
   #
@@ -1263,14 +1279,17 @@ LOG_DEVICE=/proc/@@violation@@macOS has no /proc — in a fresh shell this finds
 (^|[|;&(`]|\$\()[[:space:]]*mktemp@@advisory@@raw mktemp; on macOS /tmp is a symlink to /private/tmp, so the literal never equals a path the code under test resolves — use test.suite.fixture.make'
 
   local violations=0 advisories=0 checked=0 exceptions=0 advisoryFiles=""
-  local rule pattern severity why rest matches match file lineNo content joined trimmed prevLine windowFrom
+  local rule pattern severity why rest matches hit class match file lineNo content joined windowFrom
   while IFS= read -r rule; do
     [ -z "$rule" ] && continue
     pattern="${rule%%@@*}"; rest="${rule#*@@}"; severity="${rest%%@@*}"
     why="${rest#*@@}"
-    matches=$(ogit.repo.grep "$pattern" "$treeRoot") || matches=""
-    while IFS= read -r match; do
-      [ -z "$match" ] && continue
+    # The grep, the comment skip and the markers are the kernel's one sweep.
+    matches=$(private.this.marker.sweep "$pattern" portability "$treeRoot") || matches=""
+    while IFS= read -r hit; do
+      [ -z "$hit" ] && continue
+      class="${hit%% *}"
+      match="${hit#* }"
       file="${match%%:*}"
       content="${match#*:}"
       lineNo="${content%%:*}"
@@ -1278,8 +1297,7 @@ LOG_DEVICE=/proc/@@violation@@macOS has no /proc — in a fresh shell this finds
       checked=$((checked + 1))
 
       # A line that only TALKS about a construct is not a use of it.
-      trimmed="${content#"${content%%[![:space:]]*}"}"
-      case "$trimmed" in '#'*) exceptions=$((exceptions + 1)); continue ;; esac
+      [ "$class" = comment ] && { exceptions=$((exceptions + 1)); continue; }
 
       # A GNU/BSD pair is normally written across a continued line:
       #   x=$(stat -c %U f 2>/dev/null \
@@ -1320,20 +1338,11 @@ LOG_DEVICE=/proc/@@violation@@macOS has no /proc — in a fresh shell this finds
                   fi ;;
       esac
 
-      # Sanctioned: on the line, or in the few lines just above it (these often
+      # Sanctioned: on the line, in the few lines just above it (these often
       # sit inside a heredoc or a quoted probe where the marker cannot go on the
-      # line itself). Anchored to a COMMENT so only a human-written marker
-      # counts — otherwise the rule table above would exempt this very function.
-      if printf '%s' "$content" | grep -qE '#[[:space:]]*portability-exception:'; then
-        exceptions=$((exceptions + 1)); continue
-      fi
-      prevLine=""
-      if [ "$lineNo" -gt 1 ]; then
-        windowFrom=$((lineNo - 5))
-        [ "$windowFrom" -lt 1 ] && windowFrom=1
-        prevLine=$(sed -n "${windowFrom},$((lineNo - 1))p" "$treeRoot/$file" 2>/dev/null)
-      fi
-      if printf '%s' "$prevLine" | grep -qE '#[[:space:]]*portability-exception:'; then
+      # line itself) or file-wide — anchored to a COMMENT, so the rule table
+      # above does not exempt this very function (private.this.marker.sweep).
+      if [ "$class" = marked ]; then
         exceptions=$((exceptions + 1)); continue
       fi
 
@@ -1400,7 +1409,8 @@ private.test.suite.session.snapshot()     #  # copy aside the per-user session f
   # .bashrc runs log.session.save (T-BASHRC-ENV-I-INTERACTIVE).
   local snap="$TEST_SUITE_RESULT_PATH/sharedTier" name own
   mkdir -p "$snap" 2>/dev/null
-  for name in user.session.env log.session.env; do
+  private.test.suite.session.files.get
+  for name in $RESULT; do
     own="$HOME/.config/oosh/$name"
     rm -f "$snap/$name.own" "$snap/$name.absent" 2>/dev/null
     if [ -f "$own" ]; then
@@ -1423,7 +1433,8 @@ private.test.suite.session.restore()     #  # put the per-user session files of 
     create.result 0 "no session snapshot pinned"
     return $(result)
   fi
-  for name in user.session.env log.session.env; do
+  private.test.suite.session.files.get
+  for name in $RESULT; do
     own="$HOME/.config/oosh/$name"
     if [ -f "$snap/$name.own" ]; then
       cmp -s "$snap/$name.own" "$own" || cp "$snap/$name.own" "$own" 2>/dev/null
@@ -1433,6 +1444,17 @@ private.test.suite.session.restore()     #  # put the per-user session files of 
   done
   create.result 0 "the session files in $HOME/.config/oosh as they were"
   return $(result)
+}
+
+
+private.test.suite.session.files.get()     #  # RESULT = the per-user session files under HOME/.config/oosh that the runner snapshots and restores — one list for both #
+{
+ # oosh.session.env holds the user's OOSH_MODE (config.session.save,
+ # private.config.session.file.ensure): a test that saves it with the real
+ # HOME rewrites the runner's own file, like user.session.env
+ # (T-SUITE-SESSION-RESTORE).
+ create.result 0 "user.session.env log.session.env oosh.session.env"
+ return $(result)
 }
 
 

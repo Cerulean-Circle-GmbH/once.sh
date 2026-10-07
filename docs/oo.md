@@ -120,6 +120,17 @@ oo test.new myscript
 
 Creates `test/test.myscript` from `templates/code/newScriptTest`.
 
+### oo.test.platform.new
+
+Creates a platform invariant test: a post-install check that runs on a real machine.
+
+```bash
+oo test.platform.new <scope> <aspect>
+oo test.platform.new shared layout
+```
+
+Creates `test/test.platform.<scope>.<aspect>.invariant` from `templates/code/newPlatformInvariantTest`, executable. `<scope>` and `<aspect>` are camelCase words (letters and digits only). It refuses to overwrite a file that exists. Replace the `INVARIANT` blocks in the new file, then run it with `./test.suite run platform.<scope>.<aspect>.invariant 1`. Tab completion offers `shared` for the scope, and `config`, `oosh`, `layout` for the aspect.
+
 ## Version Control
 
 ### oo.mode
@@ -181,7 +192,11 @@ then share and trust the new folder. Without a base both refuse with
 `no components base — run oo mode.setup`; there is no "clone beside `~/oosh`"
 mode any more. An existing folder is never cloned over: a clone on the right
 branch is kept, a linked worktree from an older install is left alone with a
-pointer to `ogit worktree.remove`, anything else refuses.
+pointer to `ogit worktree.remove`, anything else refuses. Install state 31
+builds `main/` and the branch folder with `private.oo.shared.tree.ensure`, on
+the same helper: a re-run keeps what is there and makes what is missing, so a
+half-made first run heals; the local copy of `~/oosh` runs only when `main/`
+could really not be cloned.
 
 **Trust is per folder.** git's `safe.directory` is per repository, so every
 folder under the base needs its own entry for every user who touches it
@@ -229,17 +244,30 @@ oo mode.setup                 # base defaults to the clone's parent directory
 oo mode.setup /var/dev/trees  # or name the base explicitly
 ```
 
-It copies the clone to `<base>/main`, verifies that copy is a real repository,
-removes the original, makes `<base>/<branch>` an independent clone of it (origin
-re-pointed at `main/`'s origin, group-shared), and **checks that
+It copies the clone to `<base>/main`, makes `<base>/<branch>` an independent
+clone of it (origin re-pointed at `main/`'s origin, group-shared), and only
+then removes the original — never before: a failed branch clone leaves the
+original, and `~/oosh` with it, as they were (T-SETUP-SAFE-SWAP). An original
+that already sits at `<base>/<branch>` is kept as that clone. It **checks that
 `oo.mode.base.get` can find the base with `OOSH_COMPONENTS_DIR` unset** before
 it touches `~/oosh`. If that check fails it stops with the layout built and the
 old symlink intact.
 
-It is a no-op when `<base>/main` already exists as a repository, and it refuses
-rather than guessing when `<base>/main` exists but is not one, when the source
-has no detectable branch, or when `~/oosh` is a real directory rather than a
-symlink.
+"Already set up" is a property of the layout, not of what is checked out
+(`private.oo.layout.folder.check`, T-SETUP-LAYOUT-EXISTS):
+
+| `~/oosh`'s folder | what `oo mode.setup` does |
+|---|---|
+| directly under a base whose `main/` is a repository (`.git` a directory or a file), and it is `main/`, carries the name of a branch `main/` knows, or its branch has its own folder beside it | nothing — rc 0 "already set up", whatever branch or detached HEAD is checked out, clones and linked worktrees alike |
+| a plain source tree (anywhere else) that fails ogit's gate — uncommitted change, no upstream, unpushed commit, a stash, another unpushed branch, a tag `main/` lacks (`private.oo.source.consume.gate` = `private.ogit.folder.gate` + `private.ogit.clone.gate`) | refuses with rc 7, RESULT names the folder and what would be lost; nothing is built, `~/oosh` unchanged (T-SETUP-SOURCE-GATE) |
+| a plain source tree that passes the gate | builds `main/` + `<branch>/`, removes the source last, re-points `~/oosh` |
+| … and the branch clone fails | rc 4; the source and `~/oosh` stay as they were, a re-run finishes the layout (T-SETUP-SAFE-SWAP) |
+
+The consume step itself never removes `main/`, the branch folder or any folder
+of the layout, and re-runs the gate right before it removes anything. It refuses
+rather than guessing when `<base>/main` exists but is not a repository, when the
+source has no detectable branch, or when `~/oosh` is a real directory rather
+than a symlink.
 
 The layout itself is built by `private.oo.shared.tree.from.local` — the same
 helper install state 31 uses, so there is one definition of "canonical".
@@ -327,9 +355,15 @@ leaves the rest orphaned, which is how `path` came to carry completion
 functions for verbs it no longer had.
 
 Built on `replace block`, so the `.bak`/`.new` transaction and the
-exactly-one-match refusal come for free. It handles the one-liner completion
-form (`x.completion.y() { echo a; }` has no closing brace *line*, so the block
-form alone would run past it).
+exactly-one-match refusal come for free. Where a definition ends is
+`private.oo.method.end.get`'s: a one-liner (`x.completion.y() { echo a; }`)
+ends on its own line, a signature with a one-line body (`x() # doc` then
+`{ …; }`) on that body line, a block on its first `}` line. "The first `}`
+line" alone ran a `{ …; }` body on into the next method and deleted it
+(`private.oo.safeDirectory.add` took `oo.remote.update`,
+T-METHOD-DELETE-ONE-LINE). When another definition or the `### new.method`
+marker comes before any end, the definition is left as it is and the tool
+says so — it never guesses.
 
 **It does not delete the test case.** A test case has no delimiters — a
 `test.case` line, a call and one or more `expect`s, freely interleaved with
@@ -342,6 +376,37 @@ A legacy `private.` helper whose name carries no script segment
 out of its reach; remove one of those with the command this is built on:
 `replace block <file> "<its first line>" "}" by ""`.
 
+### The `replace` verbs
+
+`oo method.new` and `oo method.delete` edit scripts through `replace`. It picks what to
+change, then `by <newText>` writes the result to `<file>.new`; `replace diff`,
+`replace commit` (the file becomes `<file>.bak`) and `replace rollback` finish the
+transaction. Both write the content into a NEW file first and give it the original's
+whole mode and group afterwards (`private.replace.copy.make`: the kernel getter
+`private.this.path.stat.get <file> mode` + `chmod`, `chgrp` when the caller may), then
+swap names — so a read-only 0444 / 0555 file commits too, a running script keeps
+reading the old inode (the `.bak`), and no `cp -p` (BusyBox: "can't preserve
+ownership") is involved (T-REPLACE-COMMIT-READ-ONLY). Every `rm` of a `.bak` / `.new`
+is `rm -f`: a read-only one must not ask on a terminal.
+
+| Verb | What it matches |
+|---|---|
+| `replace within <file> <text>` | a substring, on every line |
+| `replace line <file> <exactLine>` | a whole line, exactly one match, else it refuses |
+| `replace lines <file> <exactLine>` | every whole line equal to it, identical duplicates too; none is a refusal (T-REPLACE-LINES) |
+| `replace block <file> <startLine> <endLine>` | the block between two whole lines, inclusive; `by ""` deletes it |
+| `replace word <file> <word>` | every WHOLE-WORD occurrence on every line |
+
+`replace word` renames an identifier. A hit counts only when the characters around
+it are not letters, digits, `_` or `.`, so `debug.step`, `step.x`, `stepping` and
+`my_step` are other words. A rerun matches nothing, so it is safe to repeat. It
+refuses (rc 1) when the file has no whole-word match.
+
+```bash
+replace word some.File.txt step by debug.step   # step -> debug.step, once
+replace commit some.File.txt
+```
+
 ### The rest of the mode family
 
 Short, because each one does what its name says — but they were undocumented,
@@ -350,7 +415,7 @@ so `oo <TAB>` offered verbs with nothing behind them.
 | Verb | What it does |
 |---|---|
 | `oo mode.list` | the branch folders under the base, with each one's git status (for the layout itself: `ogit layout.status`) |
-| `oo branch.list <?source:all>` | branches from `worktrees`, local `git`, and/or `remote` — `all` merges them |
+| `oo branch.list <?source:all>` | the branch folders under the base plus local git branches (`local`), or remote ones (`remote`) — `all` (the default) merges them |
 | `oo mode.align` | checks the git branch out again to match the folder's directory name, for a tree that has drifted. `oo checkout` does the same repair for a branch it is asked to bring in |
 | `oo mode.stage <stage>` | promote a stage forward (`dev` → `testing` → `prod`). An alias of `oo stage`; the pipeline itself is [§ Promotion Commands](#promotion-commands-via-oo-wrappers) and lives in `promote` |
 | `oo prereqs.install` | install the install-time prereqs locally — `git`, `curl`, and `bash` 4+ when the running shell is older. Called by `init/oosh` through `ossh prereqs.install`; you rarely type it |
@@ -499,6 +564,13 @@ Detects and configures:
 | `pkg install` | FreeBSD |
 | `pacman -S` | Arch Linux |
 
+Discovery only **records**: it sets `OOSH_PM` (and the `OS_CMD_*` group/user
+commands it knows) and saves them — it runs no package manager and no `sudo`.
+It used to run `$SUDO apt-get update` on an apt host, and `private.user.init`
+discovers whenever `os.commands.env` is incomplete, so merely sourcing `user`
+asked for a sudo password (T-OO-PM-DISCOVER-RECORDS, T-USER-SOURCE-NO-SUDO).
+The package lists are refreshed by `oo cmd`, before its first real install.
+
 ### oo.cmd
 
 Ensures a command is installed, installing it if missing.
@@ -515,8 +587,22 @@ The two-argument form installs a package whose name differs from the command:
 oo cmd sshd openssh-server   # command is sshd, package is openssh-server
 ```
 
+A command that is already there costs one `command -v`: no package manager, not
+even its discovery. Under `OOSH_NO_INSTALL` (every test run) nothing is installed
+or refreshed. Otherwise `oo cmd` discovers the package manager if `OOSH_PM` is
+empty and, on apt, refreshes the package lists **once** before the first real
+install — a fresh apt image has empty lists (T-OO-CMD-REFRESH-ONCE). Once means
+`OOSH_APT_UPDATED`, which `init/oosh` exports after its own `apt-get update` and
+`oo cmd` exports after one **that worked** — a failed refresh is retried by the
+next `oo cmd` — so the `oo cmd` children of an install do not refresh again
+(`config save` never persists it). There is no other marker: the old
+`OOSH_PM_UPDATED` was set before the refresh ran and `config save` harvested it
+into the shared `oosh.env`, which made every later shell skip the refresh for
+good (T-OO-CMD-REFRESH-MARKER). dnf, yum, apk and brew get no refresh before an
+install; an explicit `oo cmd update` on dnf/yum runs `makecache` each time.
+
 Special cases:
-- `update` - Refreshes the package-manager cache (`apt-get update` / `dnf makecache` / `yum makecache`)
+- `update` - Refreshes the package-manager cache (`apt-get update` / `dnf makecache` / `yum makecache`), once per process chain as above
 - `errno` - Installs python3
 - `eamd`, `oosh`, `once` - Loads from the ONCE repository; fails naming `once` when it is not installed
 - `mkcert` - Delegates to `once.su.mkcert.install`; fails naming it when undefined
@@ -541,6 +627,17 @@ do it this way.
 
 **Chaining limit.** `<packageName>` is optional and positional, so `oo cmd X cmd Y` cannot chain —
 the second `cmd` is read as X's package name. Use one `oo cmd` per line.
+
+**A test run installs nothing.** Under `OOSH_NO_INSTALL` (test.suite exports it for every test
+file) a missing `<cmd>` is refused: rc 1, `$RESULT` `<cmd> missing — a test run installs nothing`,
+a warning, no package manager and no sudo. A present one is still rc 0. `oo.cmd` is the one door
+every install goes through, so it owns this rule (T-CMD-NO-INSTALL; see
+[test-suite.md](test-suite.md#a-test-run-installs-nothing)).
+
+**BusyBox wget** (alpine) is present but too limited, so `oo cmd wget` upgrades it to full wget —
+through the same refusal and the same package-manager check as any install: nothing under
+`OOSH_NO_INSTALL`, nothing when no package manager is known (never a bare `sudo wget`). The stub
+works, so both answer rc 0 with a warning (T-CMD-NO-INSTALL-BUSYBOX).
 
 ### oo.cmd.find
 
@@ -687,7 +784,7 @@ oo usage
 | `$OOSH_DIR` | Installation directory |
 | `$OOSH_MODE` | Current mode (dev/released) |
 | `$OOSH_PM` | Package manager command |
-| `$OOSH_PM_UPDATED` | Package manager update command |
+| `$OOSH_APT_UPDATED` | apt package lists refreshed in this process chain — exported only after a refresh that worked, never saved by `config save` |
 | `$OS_CMD_GROUP_ADD` | Command to add groups |
 | `$OS_CMD_USER_ADD` | Command to add users |
 
@@ -774,6 +871,10 @@ Internal functions (not for direct use):
 | `private.check.all.pm` | Tests all package managers |
 | `private.install.dev.configs` | Installs dev SSH configs |
 | `private.oo.cmd.verify` | Predicate: is `<cmd>` on PATH after an install attempt; reason (incl. the macOS installed-but-not-on-PATH diagnostic) in `$RESULT`, never logged by itself — the caller logs it once at its own severity |
+| `private.oo.method.end.get <file> <startLine>` | The line that closes the definition starting at `<startLine>`; empty when another definition or the marker comes first — `oo method.delete` refuses then |
+| `private.oo.path.sudo.get <path> <?mode>` | The one privilege rule: nothing when this user may write `<path>` (its nearest existing parent while it is not there) or is root (`$SUDO` empty); else `$SUDO`, or `sudo -n ` in mode `quiet`, which never asks for a password. `oo update`'s drop-in cleanup and launcher install use quiet (T-OO-PATH-SUDO-GET, T-OO-PRIVILEGE-QUIET) |
+| `private.oo.pm.install.prefix.get <?pmCmd>` | What goes in front of the package-manager command: the sudo decision — none for brew (Homebrew refuses root; root under sudo hops back to `$SUDO_USER`), none for root (`$SUDO` empty), else `$SUDO` — and the non-interactive env of `private.oo.pm.env.get`. `oo.cmd` and `oo.prereqs.install` both use it (T-OO-PM-INSTALL-PREFIX-GET) |
+| `private.oo.path.writable.is <path>` | Predicate: may this user write `<path>`, or its nearest existing parent — the probe behind `private.oo.path.sudo.get`, separate so a test can answer "cannot write" for root too |
 
 ## See Also
 

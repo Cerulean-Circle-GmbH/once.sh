@@ -5,6 +5,28 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+private.os.release.get()     # <key> <?file:/etc/os-release> # echo one value of the os-release <file> (ID, VERSION_CODENAME, PRETTY_NAME …) with its quotes removed, without running the file; rc 1 and nothing when the key or the file is missing #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT. Read
+ # line by line, never sourced: the file is data, and the caller's shell keeps
+ # its variables. Moved from odocker (T-OS-RELEASE-GET).
+ local key="$1" file="${2:-/etc/os-release}" name value
+ case "$key" in ""|*[!A-Za-z0-9_]*) return 1 ;; esac
+ [ -r "$file" ] || return 1
+ while IFS='=' read -r name value || [ -n "$name" ]; do
+   [ "$name" = "$key" ] || continue
+   case "$value" in
+     \"*\") value="${value#\"}"; value="${value%\"}"
+            value="${value//\\\"/\"}"; value="${value//\\\$/\$}"; value="${value//\\\`/\`}"; value="${value//\\\\/\\}" ;;
+     \'*\') value="${value#\'}"; value="${value%\'}" ;;
+   esac
+   printf '%s\n' "$value"
+   return 0
+ done < "$file"
+ return 1
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,6 +244,8 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   fi
 
   # Fresh container
+  # Docker's random name, as container and host name (odocker.run.sshd), so
+  # the install inside names the computer by it, not by the container's ID.
   odocker reset "$imageTag" "$sshPort"
   sleep 2
 
@@ -251,9 +275,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # Install oosh. init/oosh's POSIX prelude handles its own prereqs
   # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
   # no separate `ossh prereqs.install <host>` pre-step is needed. See
-  # `private.push.init.oosh` (ossh:433) which SCPs init/oosh and runs
-  # its self-install, and init/oosh:188 (git install) + 192-232
-  # (bash install).
+  # `private.push.init.oosh` in ossh which SCPs init/oosh and runs
+  # its self-install, and the git install + the bash install steps of
+  # Phase A in init/oosh.
   ossh install "$platform" test
 
   # The git install above may upgrade openssh-server in place (AlmaLinux 9.8
@@ -288,8 +312,8 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     error.log "Failed to create oosh-user on $platform"
   }
   # Give oosh-user NOPASSWD sudo. Append to /etc/sudoers directly (not
-  # sudoers.d) — matches the existing pattern at os:217 for the test
-  # user; sudoers.d isn't always included on minimal images (alma's
+  # sudoers.d) — matches the sudoers append for the test
+  # user above; sudoers.d isn't always included on minimal images (alma's
   # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
   ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
@@ -373,7 +397,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
     # home, mode 700 owned by test). After `runuser -u oosh-user`, the new
     # user can't read /home/test, so any `find` invocation in test.suite
-    # (e.g. state.machine.exists at state:865) emits hundreds of
+    # (e.g. state.machine.exists in state) emits hundreds of
     # `find: Failed to restore initial working directory: /home/test:
     # Permission denied` lines on stderr. cd'ing to the new user's own
     # home keeps find happy.
@@ -480,7 +504,7 @@ private.os.platform.shared.config.repair() # <platform> # reset sharedConfig gro
   fi
 
   # Resolve the sharedConfig path inside the container via root's
-  # ~/config symlink (set up by user.oosh.install per user:821).
+  # ~/config symlink (set up by user.oosh.install).
   # chgrp+chmod+setgid recover the dev-group-writable invariant; setgid
   # on dirs causes new files to inherit the dev group ownership, so
   # this doesn't have to run between every step — once after root is
@@ -582,10 +606,9 @@ os.platform.test.all() # # tests all must-pass platforms, reports summary
 
 os.info()  # <verbose:> # shows info abut the running os. add v to get more details
 {
-  if [ -f /etc/os-release ]; then
-    source /etc/os-release
-  fi
-  echo "              
+  local prettyName
+  prettyName=$(private.os.release.get PRETTY_NAME)
+  echo "
           shell level: $SHLVL
 
                 script: $0
@@ -596,7 +619,7 @@ os.info()  # <verbose:> # shows info abut the running os. add v to get more deta
                 type  : $HOSTTYPE
                 OS    : $OSTYPE
 
-                Name  : ${GREEN}$PRETTY_NAME${NORMAL}
+                Name  : ${GREEN}$prettyName${NORMAL}
 
        package manager: $OOSH_PM
     "
@@ -646,7 +669,7 @@ os.check.env() # #
       linux*)
         # Match linux-gnu (glibc), linux-musl (Alpine), and any future
         # variants. Tag as "linux-gnu" — the historical value, kept for
-        # downstream consumers; mirrors the broader pattern in oo:1504.
+        # downstream consumers; mirrors the linux* case in private.check.root.installation.done (oo).
         info.log "      Linux detected"
         export OOSH_OS="linux-gnu"
         ;;

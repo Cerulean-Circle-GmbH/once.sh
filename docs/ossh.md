@@ -193,7 +193,7 @@ What happens during install:
 1. Opens persistent SSH connection (password entered once)
 2. Transfers `init/oosh` bootstrap script
 3. Runs remote installer (installs bash 4+, git, etc.)
-4. Sets up worktree for current branch
+4. Sets up the clone for the current branch
 5. Copies deploy key for GitHub access (if available)
 6. Creates user account and symlinks
 7. Sets login shell to bash 4+
@@ -388,4 +388,4 @@ state machine + dated backup *is* the recovery mechanism.
 
 - [odocker](odocker.md) — Docker container management
 - [Architecture](oosh-architecture.md) — OOSH framework overview
-- [Branching](branching.md) — Branch and worktree management
+- [Branching](branching.md) — Branch and clone management

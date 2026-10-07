@@ -16,8 +16,8 @@ Since the clone layout ([oo.md § The clone layout](oo.md#the-clone-layout); ogi
 For each merge (`private.promote.merge.into.folder <source> <target>`):
 
 1. push `<source>` to origin (from `<source>`'s folder when one exists) — fails fast if origin has diverged;
-2. in `<base>/<target>`: stash local changes, `fetch`, fast-forward `<target>` to `origin/<target>` — a target that has **diverged** from origin is refused and left untouched;
-3. merge `origin/<source>` as the promote bot (`oosh-promote@local` / `oosh promote`), rewrite `OOSH_SELF_BRANCH` there (auto-resolving the known `OOSH_SELF_BRANCH` drift conflict, else abort), pop the stash.
+2. in `<base>/<target>`: stash local changes (staged or not — `ogit.status.check`), `fetch`, fast-forward `<target>` to `origin/<target>` — a target that has **diverged** from origin is refused and left untouched;
+3. merge `origin/<source>` as the promote bot (`oosh-promote@local` / `oosh promote`), rewrite `OOSH_SELF_BRANCH` there (auto-resolving the known `OOSH_SELF_BRANCH` drift conflict, else abort), pop the stash. The rewrite sets **every** `OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-…}"` default line of `init/oosh` and `Install oosh.command` (identical duplicates through `replace lines`); a file that keeps another default stops the step with rc 1 — `Merged … but the OOSH_SELF_BRANCH default could not be set to <branch> in: <file>` — instead of shipping it (T-PROMOTE-SELF-BRANCH-EVERY-LINE, -STOPS). Every way out — success, refusal or abort — pops it through `private.promote.merge.finish`; a pop that fails (the merge changed the same lines) leaves conflict markers in the folder and keeps the change in the stash: the step warns and answers **rc 1** — the merge itself is done and `RESULT` says so — so the state machine stops there, and `RESULT` ends with `Resolve the conflicts in <base>/<target>, then run: ogit stash.drop <base>/<target> — and promote again` (never `stash.pop` again: it would re-apply the same change). A plain `promote` then resumes at the merge step, which is already up to date and stashes and pops the resolved change around it (T-PROMOTE-STASH-POP-FAILS).
 
 `testing.tagged` / `prod.tagged` tag in that folder, `testing.pushed` / `prod.pushed` push the branch and tags from it.
 
@@ -110,7 +110,9 @@ The PROMOTE state machine has two promotion paths that share a common entry and 
 Testing path (dev → testing):
   [13] uncommitted.checked   ← Clean working tree required
   [14] test.suite.passed     ← test.suite core 1 must pass
-  [15] confirmation.received ← User confirms merge (diff stats shown)
+  [15] confirmation.received ← User confirms merge; the commits listed first come
+                               from dev's folder: dev against its fetched
+                               origin/testing ("nothing to merge" when none)
   [16] merged.to.testing     ← merge origin/dev into testing, in <base>/testing
   [17] testing.tagged        ← Tag: testing-YYYY-MM-DD (in <base>/testing)
   [18] testing.pushed        ← push testing + tags from <base>/testing
@@ -125,7 +127,9 @@ Prod path (testing → prod):
                                   failing platform stops the machine at
                                   that state; re-running `oo stage testing`
                                   re-runs only that platform.
-  [N+1] confirmation.received.prod ← User confirms merge testing → prod
+  [N+1] confirmation.received.prod ← User confirms merge testing → prod; the
+                                  commits listed come from <base>/testing
+                                  against its fetched origin/prod
   [N+2] merged.to.prod          ← merge origin/testing into prod, in
                                   <base>/prod (with auto-resolve for
                                   OOSH_SELF_BRANCH drift on init/oosh +

@@ -55,9 +55,9 @@ user.ssh.backup.status()     # <?home:$HOME> # reports legacy ssh.* backup direc
 private.user.path.owner.get() # <path> # the owning user of <path>, or "?" when it cannot be read; answers on stdout
 {
   # NO create.result — a getter consumed as $(...) runs in a subshell, so
-  # RESULT would never reach the caller. `stat` differs between GNU and BSD,
-  # so try both rather than dispatching on $OOSH_OS for one field.
-  stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null || echo "?"
+  # RESULT would never reach the caller. The GNU/BSD stat pair is the
+  # kernel's private.this.path.stat.get; the "?" is this getter's own.
+  private.this.path.stat.get "$1" owner || echo "?"
 }
 
 
@@ -178,7 +178,7 @@ private.user.bashrc.install()     # <targetHome> <?ooshDir:$OOSH_DIR> # install 
  if [ ! -f "$template" ]; then
    create.result 1 "private.user.bashrc.install: no template at $template"; error.log "$RESULT"; return $(result)
  fi
- if cmp -s "$template" "$targetHome/.bashrc"; then
+ if private.this.file.same "$template" "$targetHome/.bashrc"; then
    create.result 0 "$targetHome/.bashrc is the oosh template"
  else
    [ -f "$targetHome/.bashrc" ] && check file "$targetHome/.bashrc.pre-oosh" not exists call cp "$targetHome/.bashrc" "$targetHome/.bashrc.pre-oosh"
@@ -201,6 +201,36 @@ private.user.login.term.get()     #  # echo the TERM user login hands to the new
    ""|dumb) echo xterm-256color ;;
    *)       echo "$TERM" ;;
  esac
+}
+
+
+private.user.group.member.pending()     # <group> <?user> # rc 0 when <user> (default: id -un) is in <group> per the group database while this process does not have the group yet: a membership that counts from the next login or sg #
+{
+ # A predicate (rc only, no create.result). `id -nG <user>` reads the group
+ # database, `id -nG` the groups of this process: a membership in the first and
+ # not the second counts from the next login, or at once through sg. odocker
+ # asked only the database and re-ran every call under sg — also when docker
+ # failed for another reason (2026-10-06, T-USER-GROUP-MEMBER-PENDING). No
+ # $USER: under `docker exec` there may be none.
+ local group="$1" user="${2:-$(id -un 2>/dev/null)}"
+ [ -n "$group" ] && [ -n "$user" ] || return 1
+ private.user.group.member.is "$group" "$user" || return 1
+ case " $(id -nG 2>/dev/null) " in *" $group "*) return 1 ;; esac
+ return 0
+}
+
+
+private.user.group.member.is()     # <group> <?user> # rc 0 when <user> (default: id -un) is in <group> per the group database: the membership a new login gets #
+{
+ # A predicate (rc only, no create.result). `id -nG <user>` reads the group
+ # database on GNU, busybox (Alpine) and BSD (macOS) alike. user.group.add asks
+ # it first: an existing member needs no sudo and no usermod — config.init.user
+ # adds every user to dev on every oo update (T-USER-GROUP-ADD-IDEMPOTENT). No
+ # $USER: under `docker exec` there may be none.
+ local group="$1" user="${2:-$(id -un 2>/dev/null)}"
+ [ -n "$group" ] && [ -n "$user" ] || return 1
+ case " $(id -nG "$user" 2>/dev/null) " in *" $group "*) return 0 ;; esac
+ return 1
 }
 
 
@@ -481,8 +511,8 @@ user.init() # <?sshDir:~/.ssh> # creates a new SSH key pair for this user
   # **NOT using ossh.config.create**: it expects its third arg to be an
   # alias name (e.g. "developking" → expanded to ~/.ssh/ids/developking/
   # id_ed25519), not a literal IdentityFile path. Passing a literal path
-  # like "$sshDir/id_ed25519" triggers the path-construction fallback at
-  # ossh:315-323 — produces garbage like
+  # like "$sshDir/id_ed25519" triggers the path-construction fallback in
+  # ossh.config.create — produces garbage like
   # `IdentityFile /ids//root/.ssh/id_ed25519/id_ed25519`. Verified on Alma
   # post-install (commit f515903 introduced this bug; SSH silently fails to
   # resolve the WODA Host because the IdentityFile path is malformed).
@@ -763,7 +793,7 @@ user.create()  # <username> <?password> <?uid> <?gid> # creates a new user with 
     shift
   done
 
-  # Default password = username (matches ossh:725 convention; pass 'password ""' to opt out).
+  # Default password = username (matches the ossh install convention; pass 'password ""' to opt out).
   # macOS password policy rejects passwords < 4 chars with
   # "New account password error. (5402)" from sysadminctl, leaving the
   # user half-created. Pad short default passwords deterministically by
@@ -780,7 +810,7 @@ user.create()  # <username> <?password> <?uid> <?gid> # creates a new user with 
   if [ "$OOSH_OS" = "darwin" ]; then
     # macOS: sysadminctl sets the initial password at creation time.
     # Prefer brew bash 4+ over system /bin/bash (3.2) — oosh's init/oosh
-    # asserts bash 4+ at this:215-227, so creating a user with bash 3.2
+    # asserts bash 4+ (oosh_bash_ok), so creating a user with bash 3.2
     # makes their first oosh login fail. ossh.prereqs.install ensures
     # brew bash is present before this point in real-world flows.
     local _shell=/bin/bash
@@ -803,9 +833,9 @@ user.create()  # <username> <?password> <?uid> <?gid> # creates a new user with 
       # Deleting AuthenticationAuthority is the macOS analogue of the `!` that
       # useradd leaves in /etc/shadow: the account and its home stay, the
       # credential does not. Guarded on an empty password, so every caller that
-      # asks for a real one — `user create developking` (oo:2059, which defaults
+      # asks for a real one — `user create developking` (oo state 31, which defaults
       # to the username) and `user create oosh-user password oosh-user`
-      # (os:285) — reaches none of this.
+      # (os platform.test) — reaches none of this.
       if [ -z "$password" ]; then
         $SUDO dscl . -delete "/Users/$name" AuthenticationAuthority >/dev/null 2>&1
       fi
@@ -1024,7 +1054,10 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   local branch="$1"
   [ -n "$branch" ] && shift
   [ -z "$branch" ] && branch="$OOSH_MODE"
-  [ -z "$branch" ] && branch=$(this.git.branch.short "$OOSH_DIR")
+  if [ -z "$branch" ]; then
+    private.this.script.load ogit ogit.branch.get
+    branch=$(ogit.branch.get "$OOSH_DIR")
+  fi
   if [ -z "$branch" ]; then
     error.log "user.oosh.install: cannot determine current oosh branch"
     return 1
@@ -1046,14 +1079,14 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   sharedConfig="$baseDir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
   sharedOosh="$baseDir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/$branch"
 
-  # Single-shot existence check — do NOT poll here. user.create (user:576)
+  # Single-shot existence check — do NOT poll here. user.create
   # auto-invokes user.oosh.install for the newly-created user, and state
-  # 31's body (oo:1219) runs `user create developking` mid-body BEFORE it
-  # creates $sharedOosh (via `git worktree add` at oo:1337). Polling here
+  # 31's body (private.check.root.shared.dev.folder.created in oo) runs `user create developking` mid-body BEFORE it
+  # creates $sharedOosh (via the shared-tree step later in that body). Polling here
   # deadlocks that path: state 31 can't progress until user.create returns,
   # and user.create can't return until user.oosh.install gives up waiting
   # for state 31's own output. user.create soft-fails on our non-zero
-  # exit (see user:576 `|| warn.log`), so the proper-order call from
+  # exit (see the `|| warn.log` in user.create), so the proper-order call from
   # install.finish.local finishes the symlink setup after state 31 has
   # completed.
   if [ ! -d "$sharedOosh" ]; then
@@ -1120,13 +1153,12 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # Mark every folder under the shared base as safe for the new user (owned by
   # root/developking, read by them). Clone layout (spec § 4): each folder is
   # its own repository with its own safe.directory entry, so ogit
-  # safeDirectory.ensure walks the base. macOS HFS+ is case-insensitive but
-  # git's safe.directory is a string match — /Users/shared and /Users/Shared
-  # are the same inode but different strings — so the base is passed in the
-  # file system's own case (private.this.path.case.get); the folder names come
-  # from the file system. Run AS the user through the shared preamble, calling
+  # safeDirectory.ensure walks the base. git's safe.directory is a string match
+  # and macOS spells /Users/Shared where a caller may say /Users/shared — ogit
+  # safeDirectory.add stores every entry in the file system's own case, so
+  # nothing is folded here. Run AS the user through the shared preamble, calling
   # ogit as a command (their --global config; only missing entries are added).
-  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.ensure '$(private.this.path.case.get "$(dirname "$sharedOosh")")'" 2>/dev/null
+  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")'" 2>/dev/null
 
   # The oosh .bashrc and the per-user session files the shared env files
   # chain, through the one writers, AS the new user so all are <user>:<user>.
@@ -1152,19 +1184,19 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
 
   # Write the WODA Host aliases into the target user's ~/.ssh/config.
   # user.init is the canonical writer of WODA Host aliases for non-developking
-  # users (user:258-278 — append-if-missing per Host header). Without this
+  # users (append-if-missing per Host header). Without this
   # invocation here, test/oosh-user/bash-user only ever get the 2cuGitHub
   # alias propagated by private.ossh.shared.ssh.copy.to.all — never WODA.
   # test/test.ssh.config.woda fails for those users without this block.
   #
   # Why a $sharedOosh-rooted source instead of `bash -lc 'user init'`:
-  # bashrcTemplate (templates/user/bashrcTemplate:27-30) early-returns for
+  # bashrcTemplate (templates/user/bashrcTemplate) early-returns for
   # non-interactive shells before its PATH/OOSH setup, so `user` isn't on
   # PATH inside `bash -lc`. Sourcing `\$sharedOosh/this` directly bypasses
   # the early-return and gets oosh's dispatcher in scope.
   #
   # Why HOME/USER reset + CONFIG_* unset: private.as.user prefers
-  # `runuser -u <user> --` (user:711-712) which does NOT reset HOME — the
+  # `runuser -u <user> --` (private.as.user) which does NOT reset HOME — the
   # caller's env leaks through. Without the explicit reset, \$HOME stays
   # /root and \$CONFIG_PATH from a prior config.init resolves to /root/config
   # — c2's staging file lands in /root/config/result.txt and reads-back
@@ -1198,7 +1230,7 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # private_key/<id>-> ../id_ed25519 and public_keys/<id>->../id_ed25519.pub
   # symlinks. Without this, non-root users (test, oosh-user, bash-user in
   # os.platform.test) only get a bare keypair + 2cuGitHub — root has the
-  # full layout (osshLayout build is invoked for root at ossh:691, but the
+  # full layout (osshLayout build is invoked for root in ossh.install.continue.local, but the
   # per-user invocation was dropped by d9adb27 alongside band-aids).
   # test/test.platform.ssh.layout.invariant pins the invariant.
   #
@@ -1336,10 +1368,19 @@ private.user.oosh.install.groups.darwin() # <username> # macOS group memberships
   fi
 }
 
-private.user.oosh.install.groups.linux() # <username> # Linux group memberships (docker if available)
+private.user.oosh.install.groups.linux() # <username> # Linux group memberships: the group of a mounted docker socket, else docker when docker is installed
 {
   local username="$1"
-  if command -v docker >/dev/null 2>&1; then
+  # A platform container has the host's socket: its group now, so the first
+  # odocker call needs no new membership — Alpine has no sg to apply one
+  # (2026-10-06, T-USER-INSTALL-SOCKET-GROUP). The socket's group also when
+  # the image ships a docker program: the local docker group does not own the
+  # host's socket (T-USER-INSTALL-SOCKET-GROUP-OVER-DOCKER).
+  if private.this.script.load odocker private.odocker.socket.group.ensure \
+     && [ -e "$(private.odocker.socket.get)" ]; then
+    private.odocker.socket.group.ensure >/dev/null 2>&1 \
+      && user.group.add "$RESULT" "$username" 2>/dev/null
+  elif command -v docker >/dev/null 2>&1; then
     user.group.add docker "$username" 2>/dev/null
   fi
 }
@@ -1366,7 +1407,7 @@ private.user.delete.linux() { # <username> # removes the user and all its files
       return $(result)
     fi
     # Unquoted on purpose: the value carries its flag, exactly as
-    # OS_CMD_USER_MOD does where it is consumed the same way (user:1355).
+    # OS_CMD_USER_MOD does where it is consumed the same way (user.group.add).
     $SUDO $userDel "$username"
   fi
 }
@@ -1441,18 +1482,24 @@ user.group.add() # <groupName> <?toUsername> # adds <toUsername> to group <group
   fi 
 
   os.check.env
-  if private.user.check.group "$groupName"; then
+  # Idempotent: an existing group is not created again and an existing member
+  # is not added again — no $SUDO at all then. config.init.user runs this for
+  # dev on every oo update; a user without passwordless sudo was asked for a
+  # password each time, for nothing (T-USER-GROUP-ADD-IDEMPOTENT).
+  if private.this.group.exists "$groupName"; then
     info.log "groupName already exists: $groupName"
   else
-    if [ "$OOSH_OS" = "darwin" ]; then
-      $SUDO dseditgroup -o create -q "$groupName" 2>/dev/null
-    else
-      console.log "creating groupName: $OS_CMD_GROUP_ADD $groupName"
-      $SUDO $OS_CMD_GROUP_ADD $groupName
+    console.log "creating groupName: $groupName"
+    if ! private.this.group.create "$groupName"; then
+      create.result 1 "could not create group $groupName"
+      error.log "$RESULT"
+      return $(result)
     fi
   fi
 
-  if [ -n "$toUsername" ]; then
+  if [ -n "$toUsername" ] && private.user.group.member.is "$groupName" "$toUsername"; then
+    info.log "$toUsername is a member of $groupName already"
+  elif [ -n "$toUsername" ]; then
     if [ "$OOSH_OS" = "darwin" ]; then
       # macOS: use dseditgroup for group membership
       $SUDO dseditgroup -o edit -a "$toUsername" -t user "$groupName" 2>/dev/null
@@ -1462,7 +1509,11 @@ user.group.add() # <groupName> <?toUsername> # adds <toUsername> to group <group
     else
       $SUDO $OS_CMD_USER_MOD "$groupName" "$toUsername"
     fi
+    create.result $? "$toUsername added to $groupName"
+    return $(result)
   fi
+  create.result 0 "group $groupName is there${toUsername:+, $toUsername is a member}"
+  return $(result)
 }
 
 user.group.add.completion.groupName() {
@@ -1479,37 +1530,15 @@ user.group.check() # <groupName> # checks if a group exists
 
 private.user.check.group() # <groupName> # checks if a group exists
 {
-  os.check.env
-  if [ "$OOSH_OS" = "darwin" ]; then
-    # macOS: use dscl to check group existence
-    if dscl . -read /Groups/"$1" &>/dev/null; then
-      success.log "group exists: $1"
-      return 0
-    else
-      warn.log "group does ${RED}NOT${YELLOW} exist: ${RED}$1${NORMAL}"
-      return 1
-    fi
+  # The lookup is the kernel's private.this.group.exists (dscl on macOS,
+  # getent or /etc/group on Linux); this method adds the log lines. Its own
+  # dscl/compgen pair was a second copy of the same platform fork.
+  if private.this.group.exists "$1"; then
+    success.log "group exists: $1"
+    return 0
   fi
-  source line
-  local result=$( compgen -g "$1" | line.format "%s:" | line.find "$1:" | line.count )
-  if this.isNumber "$result"; then
-    if [ $result -eq 1 ];then
-      success.log "group exists: $1"
-      return 0
-    else
-      if [ $result -eq 0 ];then
-            warn.log  "group does ${RED}NOT${YELLOW} exist: ${RED}$1${NORMAL}"
-            compgen -g "$1"
-            return 1
-      fi
-      warn.log "multiple groups exist: $1"
-      compgen -g "$1"
-      return 0
-    fi
-  else
-    warn.log "reult: $result"
-    return 1
-  fi
+  warn.log "group does ${RED}NOT${YELLOW} exist: ${RED}$1${NORMAL}"
+  return 1
 }
 
 user.ssh.backup() # <?label:manual> <?sshDir:~/.ssh> # archives <sshDir> into $HOME/.ssh.backups/ under a UTC-timestamped name; never writes to the current directory
@@ -1566,7 +1595,7 @@ user.ssh.backup() # <?label:manual> <?sshDir:~/.ssh> # archives <sshDir> into $H
     n=$((n + 1))
   done
 
-  # `cp -R "$src/." "$dst/"` — the idiom osshLayout:220 already uses. Copying
+  # `cp -R "$src/." "$dst/"` — the idiom osshLayout already uses. Copying
   # the CONTENTS into a directory we created ourselves is what makes nesting
   # impossible even if the name ever did repeat.
   if ! mkdir -p "$archive" || ! cp -R "$sshDir/." "$archive/"; then
@@ -1745,10 +1774,10 @@ private.user.init() {
 
   # Load the cached OS_CMD_* vars if we have them. We source unconditionally
   # when the file exists, then self-heal below if any are missing — this
-  # survives an incomplete cache (e.g. private.check.pm at oo:~1848 saves
+  # survives an incomplete cache (e.g. private.check.pm in oo saves
   # os.commands.env during install before private.user.init has computed
   # OS_CMD_USER_MOD / OS_CMD_USER_DEL, leaving the cache with only 2 of 4
-  # vars; without the self-heal, user.group.add at user:1018 silently
+  # vars; without the self-heal, user.group.add silently
   # degraded to `sudo "" <group> <user>` → "bash: <group>: command not
   # found", and new users never joined the `dev` group).
   if [ -f $CONFIG_PATH/os.commands.env ]; then
@@ -1805,25 +1834,19 @@ private.user.init() {
     fi
     # Persist the complete set so future sessions hit a healthy cache.
     # Silence chatter twice:
-    #   (a) stdout via `>/dev/null 2>&1` — needed for $(user get basehome)
-    #       and similar captured contexts during state 31's
-    #       private.install.dev.configs; without it, config.save's
-    #       `echo "config.save (CONFIG=...)"` (config:496 IS plain
-    #       stdout, not log.*) would propagate a garbage IdentityFile
-    #       into the generated 2cuGitHub config block and fail the
-    #       downstream git clone.
+    #   (a) stdout and stderr via `>/dev/null 2>&1` — needed for $(user get
+    #       basehome) and similar captured contexts during state 31's
+    #       private.install.dev.configs: whatever `config save` or
+    #       `oo pm.discover` prints on a stream, the INVALID line config.save
+    #       writes to stderr among them, would land in the captured value.
     #   (b) log device — `console.log` / `important.log` write to
     #       $LOG_DEVICE (typically a tty), bypassing the `>/dev/null`
-    #       on the function call. Visible as "OOSH_PM: apk add",
-    #       "IMPORTANT> generating …user.env", "IMPORTANT> new
-    #       LOG_DEVICE=…", "IMPORTANT> this.load: save config" — the
-    #       full cascade from oo.pm.discover's internal `config save`
-    #       (no args) → config:601's `log.device $LOG_DEVICE` HACK →
-    #       recursive `this.call config save log LOG`.
-    #       Side-effect-free because config.save filters out
-    #       LOG_DEVICE from log.env persistence (config:547
-    #       `grep -v 'LOG_DEVICE='`), so the temporary /dev/null
-    #       swap doesn't leak into the saved env files.
+    #       on the function call. config.save logs "config.save (CONFIG=…)"
+    #       and "generating …" that way, and oo.pm.discover's own
+    #       `config save` (no args) does the same. (The log.device call that
+    #       once sat inside config.save, and its recursive save, are gone.)
+    #       The swap does not leak into the saved env files: LOG_DEVICE is on
+    #       config's never-persisted list (private.config.variables.list).
     local _origLogDevice="${LOG_DEVICE:-/dev/tty}"
     export LOG_DEVICE=/dev/null
     config save os.commands "OS_CMD" >/dev/null 2>&1
