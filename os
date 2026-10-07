@@ -5,6 +5,28 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+private.os.release.get()     # <key> <?file:/etc/os-release> # echo one value of the os-release <file> (ID, VERSION_CODENAME, PRETTY_NAME …) with its quotes removed, without running the file; rc 1 and nothing when the key or the file is missing #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT. Read
+ # line by line, never sourced: the file is data, and the caller's shell keeps
+ # its variables. Moved from odocker (T-OS-RELEASE-GET).
+ local key="$1" file="${2:-/etc/os-release}" name value
+ case "$key" in ""|*[!A-Za-z0-9_]*) return 1 ;; esac
+ [ -r "$file" ] || return 1
+ while IFS='=' read -r name value || [ -n "$name" ]; do
+   [ "$name" = "$key" ] || continue
+   case "$value" in
+     \"*\") value="${value#\"}"; value="${value%\"}"
+            value="${value//\\\"/\"}"; value="${value//\\\$/\$}"; value="${value//\\\`/\`}"; value="${value//\\\\/\\}" ;;
+     \'*\') value="${value#\'}"; value="${value%\'}" ;;
+   esac
+   printf '%s\n' "$value"
+   return 0
+ done < "$file"
+ return 1
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,6 +111,7 @@ private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd afte
 
 private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI workflow for native platform testing
 {
+  private.this.script.load ogit ogit.branch.get
   local platform="$1"
   local terminal="$2"
   local notests="$3"
@@ -104,8 +127,9 @@ private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI 
   fi
 
   local branch
-  branch=$(git -C "$OOSH_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  branch=$(ogit.branch.get "$OOSH_DIR")
   if [ -z "$branch" ]; then
+    # ogit-exception: printed text, not an invocation
     error.log "Could not determine current git branch"
     create.result 1 "FAIL"
     return 1
@@ -220,6 +244,8 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   fi
 
   # Fresh container
+  # Docker's random name, as container and host name (odocker.run.sshd), so
+  # the install inside names the computer by it, not by the container's ID.
   odocker reset "$imageTag" "$sshPort"
   sleep 2
 
@@ -249,9 +275,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # Install oosh. init/oosh's POSIX prelude handles its own prereqs
   # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
   # no separate `ossh prereqs.install <host>` pre-step is needed. See
-  # `private.push.init.oosh` (ossh:433) which SCPs init/oosh and runs
-  # its self-install, and init/oosh:188 (git install) + 192-232
-  # (bash install).
+  # `private.push.init.oosh` in ossh which SCPs init/oosh and runs
+  # its self-install, and the git install + the bash install steps of
+  # Phase A in init/oosh.
   ossh install "$platform" test
 
   # The git install above may upgrade openssh-server in place (AlmaLinux 9.8
@@ -286,8 +312,8 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     error.log "Failed to create oosh-user on $platform"
   }
   # Give oosh-user NOPASSWD sudo. Append to /etc/sudoers directly (not
-  # sudoers.d) — matches the existing pattern at os:217 for the test
-  # user; sudoers.d isn't always included on minimal images (alma's
+  # sudoers.d) — matches the sudoers append for the test
+  # user above; sudoers.d isn't always included on minimal images (alma's
   # default /etc/sudoers may lack `#includedir /etc/sudoers.d`).
   ossh exec "$platform" "sudo sh -c 'echo \"oosh-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
 
@@ -330,26 +356,33 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     error.log "Failed to install oosh for bash-user on $platform"
   }
 
-  # ─── PHASE B: run test.suite core 1 on all 4 users ─────────────────────
+  # ─── PHASE B: run test.suite gate 1 (core + platform invariant) on all 4 users ─
   local rcTest=0 rcRoot=0 rcOoshUser=0 rcBashUser=0
   local testLog="" rootLog="" ooshUserLog="" bashUserLog=""
 
   if [ -z "$notests" ]; then
+    # Each user runs `test.suite gate 1`: core AND platform.shared.configLayout.invariant
+    # (the config layout, no boot), one verdict. root, oosh-user and bash-user
+    # arrive through sudo/runuser, which run no .bashrc: the prelude stands their
+    # shell up from their own ~/config/user.env (ossh.remote.prelude.get).
+    private.this.script.load ossh ossh.remote.prelude.get || return 1
+    local prelude; prelude=$(ossh.remote.prelude.get)
+
     # B.1 — test
-    console.log "Running core tests as user test..."
+    console.log "Running the gate (core + platform invariant) as user test..."
     testLog="/tmp/oosh-platform-test-test-$platform.log"
-    ossh exec "$platform" "test.suite core 1" 2>&1 | tee "$testLog"
+    ossh exec "$platform" "test.suite gate 1" 2>&1 | tee "$testLog"
     rcTest=${PIPESTATUS[0]}
 
     # B.2 — root (via test+sudo, needs -tt for TTY)
-    console.log "Running core tests as root..."
+    console.log "Running the gate (core + platform invariant) as root..."
     # `cd ~` (root) first: ssh starts bash with cwd=/home/test (the ssh
     # user's home). Same find-chdir-back hazard the runuser cases below
     # describe — except for root, the direct `find` calls work because
     # root reads anything; the failure mode is subprocesses (e.g. man-db's
     # postinst, which drops to user `man`) inheriting /home/test as cwd.
     rootLog="/tmp/oosh-platform-test-root-$platform.log"
-    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; source /root/oosh/boot 2>/dev/null; test.suite core 1'" 2>&1 | tee "$rootLog"
+    ossh exec.tty "$platform" "sudo bash -lc 'cd /root 2>/dev/null || cd /tmp; $prelude test.suite gate 1'" 2>&1 | tee "$rootLog"
     rcRoot=${PIPESTATUS[0]}
 
     # Root's test.suite writes into sharedConfig (via /root/config symlink)
@@ -364,11 +397,11 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # `cd ~` first: ssh starts the bash with cwd=/home/test (the ssh user's
     # home, mode 700 owned by test). After `runuser -u oosh-user`, the new
     # user can't read /home/test, so any `find` invocation in test.suite
-    # (e.g. state.machine.exists at state:865) emits hundreds of
+    # (e.g. state.machine.exists in state) emits hundreds of
     # `find: Failed to restore initial working directory: /home/test:
     # Permission denied` lines on stderr. cd'ing to the new user's own
     # home keeps find happy.
-    console.log "Running core tests as oosh-user..."
+    console.log "Running the gate (core + platform invariant) as oosh-user..."
     ooshUserLog="/tmp/oosh-platform-test-oosh-user-$platform.log"
     # `runuser` is shadow-utils on Debian/RHEL/Alma but missing on Alpine
     # (busybox doesn't ship it). Use a runtime detector that prefers
@@ -377,21 +410,21 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # NOPASSWD sudoers entry installed in Phase A.
     ossh exec.tty "$platform" "
       if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo runuser -u oosh-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       else
-        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo -H -u oosh-user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       fi
     " 2>&1 | tee "$ooshUserLog"
     rcOoshUser=${PIPESTATUS[0]}
 
     # B.4 — bash-user (same pattern; same cwd fix)
-    console.log "Running core tests as bash-user..."
+    console.log "Running the gate (core + platform invariant) as bash-user..."
     bashUserLog="/tmp/oosh-platform-test-bash-user-$platform.log"
     ossh exec.tty "$platform" "
       if command -v runuser >/dev/null 2>&1; then
-        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo runuser -u bash-user -- bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       else
-        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; source ~/oosh/boot 2>/dev/null; test.suite core 1'
+        sudo -H -u bash-user bash -c 'cd ~ 2>/dev/null || cd /tmp; $prelude test.suite gate 1'
       fi
     " 2>&1 | tee "$bashUserLog"
     rcBashUser=${PIPESTATUS[0]}
@@ -471,7 +504,7 @@ private.os.platform.shared.config.repair() # <platform> # reset sharedConfig gro
   fi
 
   # Resolve the sharedConfig path inside the container via root's
-  # ~/config symlink (set up by user.oosh.install per user:821).
+  # ~/config symlink (set up by user.oosh.install).
   # chgrp+chmod+setgid recover the dev-group-writable invariant; setgid
   # on dirs causes new files to inherit the dev group ownership, so
   # this doesn't have to run between every step — once after root is
@@ -573,10 +606,9 @@ os.platform.test.all() # # tests all must-pass platforms, reports summary
 
 os.info()  # <verbose:> # shows info abut the running os. add v to get more details
 {
-  if [ -f /etc/os-release ]; then
-    source /etc/os-release
-  fi
-  echo "              
+  local prettyName
+  prettyName=$(private.os.release.get PRETTY_NAME)
+  echo "
           shell level: $SHLVL
 
                 script: $0
@@ -587,7 +619,7 @@ os.info()  # <verbose:> # shows info abut the running os. add v to get more deta
                 type  : $HOSTTYPE
                 OS    : $OSTYPE
 
-                Name  : ${GREEN}$PRETTY_NAME${NORMAL}
+                Name  : ${GREEN}$prettyName${NORMAL}
 
        package manager: $OOSH_PM
     "
@@ -637,7 +669,7 @@ os.check.env() # #
       linux*)
         # Match linux-gnu (glibc), linux-musl (Alpine), and any future
         # variants. Tag as "linux-gnu" — the historical value, kept for
-        # downstream consumers; mirrors the broader pattern in oo:1504.
+        # downstream consumers; mirrors the linux* case in private.check.root.installation.done (oo).
         info.log "      Linux detected"
         export OOSH_OS="linux-gnu"
         ;;

@@ -15,7 +15,7 @@ The oosh/once.sh project uses a comprehensive Bash-based test suite to ensure re
 - **Result Tracking:** Results are summarized for each test and the overall suite.
 
 ## Running Tests
-- **Single Test:** `test.suite run <command>` (e.g., `test.suite run mycmd`)
+- **Single Test:** `test.suite run <command>` (e.g., `test.suite run mycmd`). `./test.suite run <path/to/test.file> <level>` runs a test file from any folder: an argument containing `/` is the file itself, a bare name is `test/test.<name>`.
 - **All Tests:** `test.suite all`
 - **Output:** Test results are summarized, showing the number of successful and expected cases, and reporting any failures.
 
@@ -71,8 +71,8 @@ invariants on real machines. They run inside
 **A host-resource check belongs here, not in `core`.** If an assertion needs
 something the oosh install does not itself create — a checkout of another
 repository, a daemon, a tree under `/var` — it cannot pass on a fresh machine or
-inside a container, and `os platform.test` runs `test.suite core 1` four times
-per gate. Do not reach for a `[ -d … ] → expect.pass "skipped"` guard either:
+inside a container, and `os platform.test` runs `test.suite gate 1` four times
+(core included) per gate. Do not reach for a `[ -d … ] → expect.pass "skipped"` guard either:
 `expect.pass` bumps both counters and `expect.fail` only one, so **a skip is
 indistinguishable from a pass** and the assertion silently stops asserting
 everywhere it matters.
@@ -83,6 +83,21 @@ every container gate. They split into `T-WS-LIST` in `core` — which tests the
 enumerator against a fixture built with `odocker workspace.init` and passes
 anywhere — and `test/test.platform.odocker.workspaces.invariant`, which keeps
 the host-readiness question where it belongs.
+
+### `test.suite gate <level>`
+
+```bash
+./test.suite gate 1
+```
+
+The post-install gate. It runs `test.suite core <level>`, then
+`platform.shared.configLayout.invariant` at the same level (default level 1). Both
+halves always run, so a red core cannot hide what the platform invariant says about
+the install. rc 0 when both pass, rc 1 when either fails.
+
+Use it on an installed machine to ask "is this install sound?". `os platform.test`
+runs it for each of its four users (`test.suite gate 1`), so a platform invariant
+gates the run instead of only the core tests.
 
 ## The runner guards the shared config tier
 
@@ -179,6 +194,22 @@ config tier.
 **What `CONFIG_PATH` does not cover:** `~/.gitconfig` (use `GIT_CONFIG_GLOBAL`), and `log`'s
 `~/config/result.txt` / `error.txt`, which are hardcoded to `$HOME`.
 
+## A test run installs nothing
+
+`test.suite` exports `OOSH_NO_INSTALL=1` for every test file. Tests start real
+scripts (`odocker up`), and a script that installs what it misses did so
+during the tests — colima, docker and lima on a Mac VM (2026-10-06). The rule
+has one owner: `oo.cmd`, the door every install goes through. Under
+`OOSH_NO_INSTALL` a missing tool is refused there — rc 1, RESULT
+`<tool> missing — a test run installs nothing`, a warning, no package manager
+and no sudo (T-CMD-NO-INSTALL). A present tool is still rc 0. One script keeps
+a gate of its own because it changes more than packages: a started `odocker`
+also adds Docker's repository, starts the engine and joins the socket's group,
+so under `OOSH_NO_INSTALL` it skips its prerequisite step altogether
+(T-ODOCKER-START-NO-INSTALL). A test OF an install lifts the variable with
+`env -u OOSH_NO_INSTALL` and stubs the package manager and sudo
+(T-SUITE-NO-INSTALL, the T-CMD-* cases of test.oo).
+
 ## Every file scores itself
 
 `test.suite.save.results` at the end of a test file is **mandatory**, not decorative. Test files run
@@ -195,10 +226,13 @@ file — so it exists if and only if that file wrote it — and a file that prod
 If you see `⚠ NO RESULTS: test.<name> produced no score of its own`, that file is not being
 measured. Add `test.suite.save.results` as its last line.
 
-Since 2026-09-16 that warning **fails a `core` run**. All twenty-six `core` files score today, so
-the rule costs nothing now and exists to catch the regression. `extended` keeps the warning without
-failing, because twelve of its files have never scored and giving them one is content work, not
-runner work.
+Since 2026-09-16 that warning **fails a `core` run**, and since 2026-10-06 a `platform` run and a
+single `test.suite run <name>` too (`✗ NO RESULTS: test.<name> ended before test.suite.save.results`,
+rc 1): a platform invariant that died used to pass `test.suite gate`. Every `core` and `platform`
+file scores today, so the rule costs nothing now and exists to catch the regression. `extended`
+(and `test.suite all`, which runs it) keeps the warning without failing, because twelve of its files
+have never scored and giving them one is content work, not runner work
+(T-VERDICT, T-SUITE-NO-RESULTS-RUNNER).
 
 The whole pass/fail rule lives in one place, `private.test.suite.verdict`, so it can be tested. It
 used to be an if/elif chain in the tail of the runner that nothing could reach — which is how both

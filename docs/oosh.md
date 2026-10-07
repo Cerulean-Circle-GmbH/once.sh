@@ -109,7 +109,7 @@ scriptname.start "$@"  # Bootstrap call
 |--------|---------|---------|
 | `config` | Configuration persistence | `config set VAR value` |
 | `log` | Logging with levels | `info.log "message"` |
-| `debug` | Step debugger | `source debug; setTrap` |
+| `debug` | Step debugger | `source debug; debug.setTrap` |
 | `state` | State machines | `state machine.create PDCA` |
 | `otmux` | tmux wrapper | `otmux split` |
 | `claudeFlow` | Claude Flow wrapper | `claudeFlow hive.status` |

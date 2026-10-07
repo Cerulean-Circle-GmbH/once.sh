@@ -1,0 +1,1473 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+# Which suite this file belongs to: `core` runs in the standing bar
+# (`test.suite core 1`), `extended` only under `test.suite all`. A file with no
+# TEST_CATEGORY defaults to extended, so it never reaches the standing bar.
+TEST_CATEGORY=core
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else 
+  # remove the level parameter
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$1>"
+
+#echo "sourcing init"
+source this
+source test.suite
+
+log.level $level
+
+competionArray=(once config list file ite)
+source oo
+
+test.ogit() 
+{
+((TEST_COUNTER++))
+console.log "
+
+
+Test 0: ogit \"$*\"
+===================================================================="
+ogit.start "$@"
+console.log "RETURN: $RETURN_VALUE  Result: $RESULT 
+===================================================================="
+}
+
+# The template calls `ogit $*` — with no arguments that is the usage screen,
+# rc 1, which a core file cannot carry. binary.check proves the same thing
+# (the script starts and dispatches a method) with rc 0.
+test.case - "ogit test start" \
+  ogit binary.check
+expect 0 "*" "Test start"
+
+source ogit
+
+# ============================================================================
+# Fixture: a work clone with one commit on dev, tracking a bare origin.
+# Raw git is allowed in test/ (fixtures); everything under test goes through ogit.
+# ============================================================================
+test.ogit.fixture() { # <label> # echo <fx>; <fx>/work is the clone, <fx>/origin.git its origin
+  local fx; fx=$(test.suite.fixture.make "$1") || return 1
+  git init -q --bare -b dev "$fx/origin.git"
+  git init -q -b dev "$fx/work"
+  git -C "$fx/work" remote add origin "$fx/origin.git"
+  printf 'seed\n' > "$fx/work/file"
+  git -C "$fx/work" add file
+  # The seed is tick 0 of the clock test.ogit.commit advances, so every
+  # date-sorted answer (tag.list) is deterministic, whatever today's date is.
+  GIT_COMMITTER_DATE="@1700000000 +0000" GIT_AUTHOR_DATE="@1700000000 +0000" \
+    git -C "$fx/work" -c user.email=t@t -c user.name=t commit -q -m seed
+  git -C "$fx/work" push -q -u origin dev
+  echo "$fx"
+}
+
+test.ogit.gitconfig.isolate() { # <fx> # point the CALLER's locals HOME, XDG_CONFIG_HOME and GIT_CONFIG_GLOBAL into <fx>/home, export them and start an empty global config
+  # GIT_CONFIG_GLOBAL alone isolates only on git 2.32+; an older git ignores it
+  # and writes $HOME/.gitconfig, which git has always read
+  # (T-OGIT-SAFEDIR-REAL-GITCONFIG). The caller declares the three `local`
+  # first, so they come back on its return.
+  mkdir -p "$1/home"
+  HOME="$1/home"; XDG_CONFIG_HOME="$1/home/.config"; GIT_CONFIG_GLOBAL="$1/home/.gitconfig"
+  export HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL
+  : > "$GIT_CONFIG_GLOBAL"
+}
+
+test.ogit.commit() { # <work> <message> # one more commit on the fixture (raw git, fixture side); each commit is one minute later than the previous, so date-sorted answers are deterministic
+  TEST_OGIT_TICK=$(( ${TEST_OGIT_TICK:-0} + 1 ))
+  printf '%s\n' "$2" >> "$1/file"
+  git -C "$1" add file
+  GIT_COMMITTER_DATE="@$((1700000000 + TEST_OGIT_TICK * 60)) +0000" GIT_AUTHOR_DATE="@$((1700000000 + TEST_OGIT_TICK * 60)) +0000" \
+    git -C "$1" -c user.email=t@t -c user.name=t commit -q -m "$2"
+}
+
+# ============================================================================
+# PHASE 2 fixture: a base holding main + dev + prod (the host layout), either
+# as linked worktrees of main (shape worktree) or as independent clones
+# (shape clone). Raw git on the fixture side, as test.ogit.fixture.
+# ============================================================================
+test.ogit.base() { # <label> <?shape:worktree> # echo <base> holding main + dev + prod as linked worktrees (shape worktree) or as clones (shape clone), all tracking <base>/origin.git; each folder ignores ignored.txt
+  local fx; fx=$(test.suite.fixture.make "$1"); local base="$fx/Once.sh"; mkdir -p "$base"
+  git init -q --bare -b main "$fx/origin.git"
+  git init -q -b main "$base/main"; git -C "$base/main" remote add origin "$fx/origin.git"
+  printf 'seed\n' > "$base/main/file"; printf 'ignored.txt\n' > "$base/main/.gitignore"
+  git -C "$base/main" add file .gitignore
+  # tick 0 of test.ogit.commit's clock, as in test.ogit.fixture
+  GIT_COMMITTER_DATE="@1700000000 +0000" GIT_AUTHOR_DATE="@1700000000 +0000" \
+    git -C "$base/main" -c user.email=t@t -c user.name=t commit -q -m seed
+  git -C "$base/main" push -q -u origin main
+  local b; for b in dev prod; do
+    git -C "$base/main" branch -q "$b" main; git -C "$base/main" push -q origin "$b"
+    if [ "${2:-worktree}" = clone ]; then git clone -q -b "$b" "$fx/origin.git" "$base/$b"
+    else git -C "$base/main" worktree add -q "$base/$b" "$b" >/dev/null 2>&1; git -C "$base/$b" branch -q -u "origin/$b"; fi
+  done
+  echo "$base"
+}
+
+test.ogit.fixtureWorks() {
+  local fx; fx=$(test.ogit.fixture smoke)
+  local n; n=$(git -C "$fx/work" rev-list --count HEAD)
+  local up; up=$(git -C "$fx/work" rev-parse --abbrev-ref @{u})
+  rm -rf "$fx"
+  if [ "$n" = 1 ] && [ "$up" = "origin/dev" ]; then create.result 0 "fixture: one commit, tracking origin/dev"
+  else create.result 1 "fixture broken: commits=$n upstream=$up"; fi
+  return $(result)
+}
+test.case $level "T-OGIT-FIXTURE: the fixture clone tracks its bare origin" test.ogit.fixtureWorks
+expect 0 "fixture: one commit, tracking origin/dev" "every ogit case builds on this shape"
+
+
+console.log "
+Test: T-OGIT-HELPERS
+===================================================================="
+
+test.ogit.helpers() {
+  local bad="" out
+  ogit.binary.check || bad="$bad binary-present-rc"
+  ( PATH=/nonexistent; ogit.binary.check ) && bad="$bad binary-absent-passed"
+  private.ogit.require >/dev/null 2>&1 || bad="$bad require-present-rc"
+  out=$( PATH=/nonexistent; private.ogit.require >/dev/null 2>&1; echo "$?|$RESULT" )
+  case "$out" in "127|"*"oo cmd git"*) ;; *) bad="$bad require-absent=[$out]" ;; esac
+  private.ogit.identity t@t "oosh promote"
+  [ "${#OGIT_IDENTITY[@]}" = 6 ] && [ "${OGIT_IDENTITY[3]}" = "user.name=oosh promote" ] || bad="$bad identity=[${OGIT_IDENTITY[*]}]"
+  private.ogit.identity t@t
+  [ "${OGIT_IDENTITY[3]}" = "user.name=t@t" ] || bad="$bad identity-name-default"
+  private.ogit.identity
+  [ "${#OGIT_IDENTITY[@]}" = 0 ] || bad="$bad identity-not-empty"
+  [ -z "$bad" ] && create.result 0 "binary.check, require and identity behave" || create.result 1 "helpers:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-HELPERS: binary.check, private.ogit.require (rc 127 names oo cmd git), private.ogit.identity" test.ogit.helpers
+expect 0 "binary.check, require and identity behave" "every mutator starts with require; bot commits use identity"
+
+
+console.log "
+Test: ogit.repo.clone
+===================================================================="
+
+test.ogit.repo() {
+  local fx bad=""; fx=$(test.ogit.fixture repo)
+  ogit.repo.check "$fx/work" || bad="$bad check-repo-rc=$?"
+  ogit.repo.check "$fx" && bad="$bad check-nonrepo-passed"
+  [ "$(ogit.repo.root.get "$fx/work")" = "$fx/work" ] || bad="$bad root=$(ogit.repo.root.get "$fx/work")"
+  ogit.repo.clone "$fx/origin.git" dev "$fx/clone" >/dev/null 2>&1 || bad="$bad clone-rc=$?"
+  [ -d "$fx/clone/.git" ] && [ "$(git -C "$fx/clone" branch --show-current)" = dev ] || bad="$bad clone-shape"
+  ogit.repo.clone "$fx/origin.git" nosuch "$fx/clone2" >/dev/null 2>&1 && bad="$bad clone-bad-branch-passed"
+  [ -e "$fx/clone2" ] && bad="$bad clone-left-halfmade-dir"
+  # never clone over — and never delete — a folder this call did not create
+  mkdir -p "$fx/occupied"; printf 'keep\n' > "$fx/occupied/mine"
+  ogit.repo.clone "$fx/origin.git" dev "$fx/occupied" >/dev/null 2>&1 && bad="$bad clone-over-nonempty-passed"
+  [ "$(cat "$fx/occupied/mine" 2>/dev/null)" = keep ] || bad="$bad clone-destroyed-existing-dir"
+  [ "$(ogit.repo.files.list "$fx/work")" = file ] || bad="$bad files=$(ogit.repo.files.list "$fx/work")"
+  [ "$(ogit.repo.grep '^seed' "$fx/work")" = "file:1:seed" ] || bad="$bad grep=$(ogit.repo.grep '^seed' "$fx/work")"
+  ogit.repo.share "$fx/work" >/dev/null 2>&1 || bad="$bad share-rc=$?"
+  [ "$(git -C "$fx/work" config --get core.sharedRepository)" = group ] || bad="$bad share-config"
+  [ -g "$fx/work/.git/objects" ] || bad="$bad share-setgid"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "repo: clone, check, root.get, files.list, grep, share behave" || create.result 1 "repo:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-REPO: repo.clone/check/root.get/files.list/grep/share" test.ogit.repo
+expect 0 "repo: clone, check, root.get, files.list, grep, share behave" "the repo noun"
+
+
+console.log "
+Test: ogit.branch.get
+===================================================================="
+
+test.ogit.branch() {
+  local fx bad="" out; fx=$(test.ogit.fixture branch); local w="$fx/work"
+  [ "$(ogit.branch.get "$w")" = dev ] || bad="$bad get=$(ogit.branch.get "$w")"
+  git -C "$w" checkout -q -b heads/origin/testing 2>/dev/null
+  [ "$(ogit.branch.get "$w")" = testing ] || bad="$bad get-strips=$(ogit.branch.get "$w")"
+  git -C "$w" checkout -q dev; git -C "$w" branch -q -D heads/origin/testing
+  # detached: rev-parse --abbrev-ref answers the literal HEAD — the docstring promises empty
+  git -C "$w" checkout -q --detach
+  [ -z "$(ogit.branch.get "$w")" ] || bad="$bad get-detached=[$(ogit.branch.get "$w")]"
+  git -C "$w" checkout -q dev
+  git -C "$w" branch -q feature/x
+  out=$(ogit.branch.list local "$w" | tr '\n' ' ')
+  case "$out" in *"dev "*"feature/x "*|*"feature/x "*"dev "*) ;; *) bad="$bad list-local=[$out]" ;; esac
+  # A real clone has refs/remotes/origin/HEAD, whose short name is "origin" — never a branch.
+  git -C "$w" remote set-head origin dev
+  out=$(ogit.branch.list remote "$w" | tr '\n' ' ')
+  [ "$out" = "dev " ] || bad="$bad list-remote=[$out]"
+  out=$(ogit.branch.list all "$w" | grep -c .)
+  [ "$out" = 2 ] || bad="$bad list-all-count=$out"
+  ogit.branch.check dev "$w" || bad="$bad check-dev"
+  ogit.branch.check nosuch "$w" && bad="$bad check-nosuch-passed"
+  out=$(ogit.branch.find HEAD "$w" | tr '\n' ' ')
+  case "$out" in *dev*) ;; *) bad="$bad find=[$out]" ;; esac
+  ogit.branch.checkout feature/x "$w" >/dev/null 2>&1 && [ "$(git -C "$w" branch --show-current)" = feature/x ] || bad="$bad checkout"
+  ogit.branch.upstream.set origin/dev "$w" >/dev/null 2>&1 || bad="$bad upstream-rc=$?"
+  [ "$(git -C "$w" rev-parse --abbrev-ref '@{u}' 2>/dev/null)" = origin/dev ] || bad="$bad upstream"
+  ogit.branch.reset dev origin/dev "$w" >/dev/null 2>&1 && [ "$(git -C "$w" branch --show-current)" = dev ] || bad="$bad reset"
+  test.ogit.commit "$w" two
+  # a real verdict, not "non-empty": origin/dev lacks the one commit dev just got
+  ogit.branch.compare dev origin/dev "$w" >/dev/null
+  [ "$RESULT" = "1 commits behind dev" ] || bad="$bad compare=[$RESULT]"
+  ogit.branch.compare dev dev "$w" >/dev/null
+  [ "$RESULT" = "up to date with dev" ] || bad="$bad compare-same=[$RESULT]"
+  git -C "$w" checkout -q feature/x
+  ogit.branch.merge dev "t@t" "t t" "$w" >/dev/null 2>&1 || bad="$bad merge-rc=$?"
+  [ "$(git -C "$w" rev-parse feature/x)" = "$(git -C "$w" rev-parse dev)" ] || bad="$bad merge-ff"
+  git -C "$w" checkout -q dev; test.ogit.commit "$w" three; git -C "$w" checkout -q feature/x
+  ogit.branch.fastForward dev "$w" >/dev/null 2>&1 || bad="$bad ff-rc=$?"
+  [ "$(git -C "$w" rev-parse feature/x)" = "$(git -C "$w" rev-parse dev)" ] || bad="$bad ff-sha"
+  test.ogit.commit "$w" diverge; git -C "$w" checkout -q dev; test.ogit.commit "$w" other
+  ogit.branch.fastForward feature/x "$w" >/dev/null 2>&1 && bad="$bad ff-diverged-passed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "branch: get/list/check/find/checkout/upstream.set/reset/compare/merge behave" || create.result 1 "branch:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-BRANCH: the branch noun" test.ogit.branch
+expect 0 "branch: get/list/check/find/checkout/upstream.set/reset/compare/merge behave" "the branch noun"
+
+
+console.log "
+Test: ogit.branch.merge
+===================================================================="
+
+test.ogit.mergeConflict() {
+  local fx bad="" w; fx=$(test.ogit.fixture conflict); w="$fx/work"
+  git -C "$w" checkout -q -b other; printf 'theirs\n' > "$w/file"; git -C "$w" -c user.email=t@t -c user.name=t commit -qam theirs
+  git -C "$w" checkout -q dev; printf 'ours\n' > "$w/file"; git -C "$w" -c user.email=t@t -c user.name=t commit -qam ours
+  local base; base=$(ogit.merge.base.get dev other "$w")
+  [ "$base" = "$(git -C "$w" rev-parse dev~1)" ] || bad="$bad base=$base"
+  ogit.branch.merge other t@t t "$w" >/dev/null 2>&1 && bad="$bad conflicting-merge-passed"
+  [ "$(ogit.conflict.list "$w")" = file ] || bad="$bad list=$(ogit.conflict.list "$w")"
+  ogit.conflict.resolve file theirs "$w" >/dev/null 2>&1 || bad="$bad resolve-rc=$?"
+  [ "$(cat "$w/file")" = theirs ] || bad="$bad resolved-content"
+  [ -z "$(ogit.conflict.list "$w")" ] || bad="$bad still-conflicted"
+  ogit.merge.abort "$w" >/dev/null 2>&1 || bad="$bad abort-rc=$?"
+  [ "$(cat "$w/file")" = ours ] || bad="$bad abort-content"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "merge.base.get, conflict.list, conflict.resolve, merge.abort behave" || create.result 1 "merge/conflict:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-MERGE-CONFLICT: merge and conflict nouns" test.ogit.mergeConflict
+expect 0 "merge.base.get, conflict.list, conflict.resolve, merge.abort behave" "promote's conflict path"
+
+
+console.log "
+Test: ogit.remote.fetch
+===================================================================="
+
+test.ogit.remote() {
+  local fx bad="" w o; fx=$(test.ogit.fixture remote); w="$fx/work"; o="$fx/origin.git"
+  [ "$(ogit.remote.url.get origin "$w")" = "$o" ] || bad="$bad url=$(ogit.remote.url.get origin "$w")"
+  [ "$(ogit.remote.branch.list origin "$w")" = dev ] || bad="$bad branches=$(ogit.remote.branch.list origin "$w")"
+  test.ogit.commit "$w" two
+  ogit.remote.push dev no "$w" >/dev/null 2>&1 || bad="$bad push-rc=$?"
+  [ "$(git -C "$o" rev-parse dev)" = "$(git -C "$w" rev-parse dev)" ] || bad="$bad push-sha"
+  git -C "$w" tag v0.0.1
+  ogit.remote.push dev yes "$w" >/dev/null 2>&1 && git -C "$o" rev-parse -q --verify v0.0.1 >/dev/null || bad="$bad push-tags"
+  local c; c=$(test.suite.fixture.make remoteclone); git clone -q "$o" "$c/w" 2>/dev/null
+  test.ogit.commit "$c/w" three; git -C "$c/w" push -q origin dev
+  ogit.remote.fetch no "$w" >/dev/null 2>&1 || bad="$bad fetch-rc=$?"
+  [ "$(git -C "$w" rev-parse origin/dev)" = "$(git -C "$c/w" rev-parse dev)" ] || bad="$bad fetch-ref"
+  ogit.remote.pull "" "" "$w" >/dev/null 2>&1 || bad="$bad pull-rc=$?"
+  [ "$(git -C "$w" rev-parse dev)" = "$(git -C "$c/w" rev-parse dev)" ] || bad="$bad pull-sha"
+  ogit.remote.url.set "$fx/elsewhere.git" origin "$w" >/dev/null 2>&1 || bad="$bad url-set-rc"
+  [ "$(ogit.remote.url.get origin "$w")" = "$fx/elsewhere.git" ] || bad="$bad url-set"
+  rm -rf "$fx" "$c"
+  [ -z "$bad" ] && create.result 0 "remote: url.get/branch.list/fetch/pull/push behave" || create.result 1 "remote:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-REMOTE: the remote noun" test.ogit.remote
+expect 0 "remote: url.get/branch.list/fetch/pull/push behave" "the remote noun"
+
+
+console.log "
+Test: ogit.commit.create
+===================================================================="
+
+test.ogit.commitNoun() {
+  local fx bad="" w n; fx=$(test.ogit.fixture commit); w="$fx/work"
+  printf 'x\n' > "$w/new"; printf 'y\n' >> "$w/file"
+  ogit.index.add updated "$w" >/dev/null 2>&1 || bad="$bad add-updated-rc"
+  git -C "$w" diff --cached --name-only | grep -qx new && bad="$bad add-updated-took-new"
+  ogit.index.add all "$w" >/dev/null 2>&1; git -C "$w" diff --cached --name-only | grep -qx new || bad="$bad add-all-missed-new"
+  ogit.commit.create "two files" t@t t "$w" >/dev/null 2>&1 || bad="$bad commit-rc=$?"
+  [ "$(git -C "$w" log -1 --format=%an)" = t ] || bad="$bad commit-identity"
+  [ "$(git -C "$w" log -1 --format=%s)" = "two files" ] || bad="$bad commit-message"
+  ogit.commit.count origin/dev dev "$w" >/dev/null; [ "$RESULT" = 1 ] || bad="$bad count=$RESULT"
+  case "$(ogit.commit.show HEAD "$w")" in *"two files"*) ;; *) bad="$bad show" ;; esac
+  n=$(ogit.commit.log.show "" 1 oneline "$w" | grep -c .); [ "$n" = 1 ] || bad="$bad log-limit=$n"
+  case "$(ogit.commit.log.show origin/dev..dev "" oneline "$w")" in *"two files"*) ;; *) bad="$bad log-range" ;; esac
+  [ "$(ogit.commit.log.show "" 1 '%an' "$w")" = t ] || bad="$bad log-format"
+  # scope alone, no dir: the dir defaults to $OOSH_DIR and nothing named "all" is staged
+  printf 'z\n' > "$w/third"
+  ( OOSH_DIR="$w"; ogit.index.add all >/dev/null 2>&1 )
+  git -C "$w" diff --cached --name-only | grep -qx third || bad="$bad add-all-without-dir"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "index.add, commit.create/count/show/log.show behave" || create.result 1 "index/commit:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT: index and commit nouns" test.ogit.commitNoun
+expect 0 "index.add, commit.create/count/show/log.show behave" "index and commit nouns"
+
+# T-OGIT-COMMIT-COUNT-*: the four edges of ogit.commit.count that T-OGIT-COMMIT
+# (a count of 1) does not reach — carried over from the T-GIT-COUNT tests of the
+# removed this.git.commits.count. One fixture: dev is one commit ahead of origin/dev.
+TOCC_FIXTURE=$(test.ogit.fixture commitcount)
+test.ogit.commit "$TOCC_FIXTURE/work" ahead
+
+test.ogit.commitCountIdentical() { # # identical refs count 0
+  ogit.commit.count dev dev "$TOCC_FIXTURE/work" >/dev/null
+  [ "$RESULT" = 0 ] && create.result 0 "identical refs count 0" || create.result 1 "identical refs counted [$RESULT]"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT-COUNT-IDENTICAL: identical refs count 0" test.ogit.commitCountIdentical
+expect 0 "identical refs count 0" "a ref holds no commit it lacks"
+
+test.ogit.commitCountReverse() { # # the reverse direction counts 0
+  ogit.commit.count dev origin/dev "$TOCC_FIXTURE/work" >/dev/null
+  [ "$RESULT" = 0 ] && create.result 0 "the reverse direction counts 0" || create.result 1 "origin/dev not in dev counted [$RESULT]"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT-COUNT-REVERSE: the reverse direction counts 0" test.ogit.commitCountReverse
+expect 0 "the reverse direction counts 0" "origin/dev has nothing dev lacks"
+
+test.ogit.commitCountNoArguments() { # # missing arguments are rc 1
+  local rc bad=""
+  ogit.commit.count >/dev/null 2>&1; rc=$?; [ "$rc" = 1 ] || bad="$bad none-rc=$rc"
+  ogit.commit.count dev >/dev/null 2>&1; rc=$?; [ "$rc" = 1 ] || bad="$bad one-rc=$rc"
+  [ -z "$bad" ] && create.result 0 "missing arguments are rc 1" || create.result 1 "missing arguments:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT-COUNT-NO-ARGUMENTS: missing <from> or <to> is rc 1" test.ogit.commitCountNoArguments
+expect 0 "missing arguments are rc 1" "ogit.commit.count requires <from> <to>"
+
+test.ogit.commitCountMissingRef() { # # a ref that does not exist counts 0
+  local rc
+  ogit.commit.count dev nosuch "$TOCC_FIXTURE/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 0 ] && [ "$RESULT" = 0 ] && create.result 0 "a missing ref counts 0" || create.result 1 "a missing ref: rc=$rc RESULT=[$RESULT]"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT-COUNT-MISSING-REF: a ref that does not exist counts 0" test.ogit.commitCountMissingRef
+expect 0 "a missing ref counts 0" "refs may be absent on test rigs without remotes"
+
+rm -rf "$TOCC_FIXTURE"
+unset TOCC_FIXTURE
+
+
+console.log "
+Test: ogit.status.show
+===================================================================="
+
+test.ogit.status() {
+  local fx bad="" w; fx=$(test.ogit.fixture status); w="$fx/work"
+  ogit.status.check "$w" || bad="$bad clean-check-rc"
+  [ -z "$(ogit.status.show porcelain "$w")" ] || bad="$bad clean-porcelain"
+  case "$(ogit.status.show short "$w")" in "## dev...origin/dev"*) ;; *) bad="$bad short=[$(ogit.status.show short "$w")]" ;; esac
+  printf 'z\n' >> "$w/file"
+  ogit.status.check "$w" && bad="$bad dirty-check-passed"
+  ogit.diff.check "$w" && bad="$bad diff-check-passed"
+  ogit.diff.check "$w" README || bad="$bad diff-check-limited-to-untouched-path-reported-dirty"
+  [ "$(ogit.status.show porcelain "$w")" = " M file" ] || bad="$bad porcelain=[$(ogit.status.show porcelain "$w")]"
+  git -C "$w" -c user.email=t@t -c user.name=t commit -qam z
+  case "$(ogit.diff.show origin/dev dev stat "$w")" in *"file | 1 +"*) ;; *) bad="$bad diff-stat=[$(ogit.diff.show origin/dev dev stat "$w")]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "status.show/check and diff.check/show behave" || create.result 1 "status/diff:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-STATUS: status and diff nouns" test.ogit.status
+expect 0 "status.show/check and diff.check/show behave" "status and diff nouns"
+
+
+console.log "
+Test: ogit.tag.create
+===================================================================="
+
+test.ogit.tagStash() {
+  local fx bad="" w; fx=$(test.ogit.fixture tagstash); w="$fx/work"
+  ogit.tag.create v1.0.0 HEAD "$w" >/dev/null 2>&1 || bad="$bad create-rc"
+  test.ogit.commit "$w" two; ogit.tag.create v1.0.10 HEAD "$w" >/dev/null 2>&1
+  test.ogit.commit "$w" three; ogit.tag.create v1.0.9 HEAD "$w" >/dev/null 2>&1
+  ogit.tag.check v1.0.0 "$w" || bad="$bad check"
+  ogit.tag.check v9 "$w" && bad="$bad check-missing-passed"
+  [ "$(ogit.tag.latest.get 'v*' "$w")" = v1.0.10 ] || bad="$bad latest=$(ogit.tag.latest.get 'v*' "$w")"
+  [ "$(ogit.tag.list 'v*' "$w" | head -1)" = v1.0.9 ] || bad="$bad list-by-date=$(ogit.tag.list 'v*' "$w" | head -1)"
+  printf 'w\n' >> "$w/file"
+  ogit.stash.push "promote: pre-merge stash" "$w" >/dev/null 2>&1 || bad="$bad stash-push-rc"
+  ogit.status.check "$w" || bad="$bad stash-left-dirty"
+  [ "$(ogit.stash.top.get "$w")" = "On dev: promote: pre-merge stash" ] || bad="$bad top=[$(ogit.stash.top.get "$w")]"
+  ogit.stash.pop "$w" >/dev/null 2>&1 || bad="$bad stash-pop-rc"
+  ogit.status.check "$w" && bad="$bad pop-did-not-restore"
+  [ -z "$(ogit.stash.top.get "$w")" ] || bad="$bad top-after-pop"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "tag.create/check/latest.get/list and stash.push/pop/top.get behave" || create.result 1 "tag/stash:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-TAG-STASH: tag and stash nouns" test.ogit.tagStash
+expect 0 "tag.create/check/latest.get/list and stash.push/pop/top.get behave" "tag and stash nouns"
+
+
+console.log "
+Test: ogit.safeDirectory.add
+===================================================================="
+
+test.ogit.trust() {
+  local fx bad="" w; fx=$(test.ogit.fixture trust); w="$fx/work"
+  # local + export: the sandbox is this function's; the caller's value (or its absence) comes back on return
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  ogit.config.set user.email me@fx "$w" >/dev/null 2>&1 || bad="$bad set-rc"
+  [ "$(ogit.config.get user.email any "$w")" = me@fx ] || bad="$bad get=$(ogit.config.get user.email any "$w")"
+  [ "$(ogit.config.email.get "$w")" = me@fx ] || bad="$bad email"
+  git config --global user.email glob@fx
+  [ "$(ogit.config.get user.email any "$w")" = glob@fx ] || bad="$bad get-any-not-global-first"
+  [ "$(ogit.config.get user.email local "$w")" = me@fx ] || bad="$bad get-local=$(ogit.config.get user.email local "$w")"
+  git config --global --unset user.email
+  ogit.safeDirectory.add "$w" >/dev/null 2>&1; ogit.safeDirectory.add "$w" >/dev/null 2>&1
+  [ "$(ogit.safeDirectory.list | grep -cx "$w")" = 1 ] || bad="$bad add-not-idempotent"
+  mkdir -p "$fx/base/main/.git" "$fx/base/prod/.git" "$fx/base/notarepo" "$fx/base/.hidden/.git"
+  ln -s "$fx/base/main" "$fx/base/alias"
+  [ "$(private.ogit.base.folders.list "$fx/base" | tr '\n' ' ')" = "$fx/base/main $fx/base/prod " ] || bad="$bad folders=[$(private.ogit.base.folders.list "$fx/base" | tr '\n' ' ')]"
+  ogit.safeDirectory.ensure "$fx/base" >/dev/null 2>&1 || bad="$bad ensure-rc"
+  ogit.safeDirectory.list | grep -qx "$fx/base/main" || bad="$bad ensure-main"
+  ogit.safeDirectory.list | grep -qx "$fx/base/prod" || bad="$bad ensure-prod"
+  ogit.safeDirectory.list | grep -qx "$fx/base/notarepo" && bad="$bad ensure-took-nonrepo"
+  ogit.safeDirectory.list | grep -qE "^$fx/base/(alias|\.hidden)$" && bad="$bad ensure-took-symlink-or-dotdir"
+  ogit.safeDirectory.add "$fx/gone" >/dev/null 2>&1
+  ogit.safeDirectory.prune >/dev/null 2>&1
+  ogit.safeDirectory.list | grep -qx "$fx/gone" && bad="$bad prune-kept-missing"
+  ogit.safeDirectory.list | grep -qx "$w" || bad="$bad prune-dropped-existing"
+  [ "$(type -t ogit.safeDirectory.clear)" = function ] && bad="$bad public-clear-still-defined"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "config.get/set/email.get and safeDirectory.add/list/ensure/prune behave" || create.result 1 "trust:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-TRUST: config and safeDirectory nouns (sandboxed GIT_CONFIG_GLOBAL)" test.ogit.trust
+expect 0 "config.get/set/email.get and safeDirectory.add/list/ensure/prune behave" "config and safeDirectory nouns"
+
+# ============================================================================
+# T-SAFEDIR-PRUNE: ogit.safeDirectory.prune keeps real paths, drops stale
+# ----------------------------------------------------------------------------
+# Moved from test/test.oo with the method (Task 10; oo.safeDirectory.prune
+# now delegates here). Sandboxes via GIT_CONFIG_GLOBAL — must never touch the
+# real ~/.gitconfig (the lesson of the oo.mode.list leak this primitive
+# exists to clean up).
+# ============================================================================
+test.ogit.safeDirectory.prune() {
+  local sandbox realDir remaining
+  sandbox=$(test.suite.fixture.make safedirprune)
+  realDir=$(mktemp -d)
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$sandbox"
+
+  git config --global --add safe.directory "$realDir"
+  git config --global --add safe.directory "/tmp/oosh-test-fake-path.$$.a"
+  git config --global --add safe.directory "/tmp/oosh-test-fake-path.$$.b"
+
+  ogit.safeDirectory.prune >/dev/null 2>&1
+
+  remaining=$(git config --global --get-all safe.directory)
+  rm -rf "$sandbox"
+  rmdir "$realDir" 2>/dev/null
+
+  if [ "$remaining" = "$realDir" ]; then
+    create.result 0 "kept only real path"
+  else
+    create.result 1 "expected '$realDir', got: '$remaining'"
+  fi
+}
+test.case - "T-SAFEDIR-PRUNE: only real-path entries survive prune" \
+  test.ogit.safeDirectory.prune
+expect 0 "kept only real path" "prune keeps real paths, drops stale"
+
+# T-OGIT-SAFEDIR-PRUNE-IN-PLACE: prune emptied the whole list (safeDirectory.clear)
+# and re-added the kept entries one by one — an interrupt in between left the
+# user with no trust at all. private.ogit.git.run is the one door every config
+# write of prune goes through; the stub below lets each write through and then
+# looks at the config file, so an entry that stays must be present after EVERY
+# write — i.e. at every point an interrupt could land. Stale values that are a
+# regex of a kept one (a.b ~ aXb) or its prefix (kee ~ keep.d) take only
+# themselves. A second prune changes nothing; the public one-word wipe is gone.
+test.ogit.safeDirectoryPruneInPlace() {
+  local fx bad="" keep other absent="" before list
+  fx=$(test.suite.fixture.make pruneinplace)
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  keep="$fx/keep.d"; other="$fx/aXb"; mkdir -p "$keep" "$other"
+  git config --global --add safe.directory "$fx/gone"
+  git config --global --add safe.directory "$keep"
+  git config --global --add safe.directory "$fx/a.b"
+  git config --global --add safe.directory "$other"
+  git config --global --add safe.directory "$fx/kee"
+  eval "test.ogit.gitRunReal() $(declare -f private.ogit.git.run | tail -n +2)"
+  private.ogit.git.run() { test.ogit.gitRunReal "$@"; local rc=$?; ogit.safeDirectory.list | grep -qFx "$keep" || absent=yes; return $rc; }
+  ogit.safeDirectory.prune >/dev/null 2>&1 || bad="$bad prune-rc=[$RESULT]"
+  eval "private.ogit.git.run() $(declare -f test.ogit.gitRunReal | tail -n +2)"
+  [ -z "$absent" ] || bad="$bad kept-entry-was-absent-mid-prune"
+  list=$(ogit.safeDirectory.list | tr '\n' ' ')
+  [ "$list" = "$keep $other " ] || bad="$bad list=[$list]"
+  before=$(cat "$GIT_CONFIG_GLOBAL")
+  ogit.safeDirectory.prune >/dev/null 2>&1 || bad="$bad second-rc"
+  [ "$(cat "$GIT_CONFIG_GLOBAL")" = "$before" ] || bad="$bad second-run-changed-config"
+  [ "$(type -t ogit.safeDirectory.clear)" = function ] && bad="$bad public-clear-still-defined"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "prune removes only the stale entries, in place; a second run changes nothing" || create.result 1 "prune:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-SAFEDIR-PRUNE-IN-PLACE: prune never empties the list; a kept entry is present after every write" test.ogit.safeDirectoryPruneInPlace
+expect 0 "prune removes only the stale entries, in place; a second run changes nothing" "an interrupt between clear and re-add left no trust"
+
+# T-OGIT-SAFEDIR-CASE-FOLD: git's safe.directory is a string match, and macOS
+# spells /Users/Shared where code says /Users/shared. oo and user folded the
+# case by hand before ogit.safeDirectory.add; ensure, folder.finish and the
+# trusted= column of layout.status did not. ogit folds once, inside add and in
+# the layout.status comparison. private.this.path.case.get is the collaborator
+# (osascript on macOS, identity elsewhere): a stub that spells Once.sh as
+# ONCE.SH stands in for the file system's own case on this Linux host.
+test.ogit.safeDirectoryCaseFold() {
+  local base fx bad="" list
+  base=$(test.ogit.base casefold); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local folded="${base/Once.sh/ONCE.SH}"
+  eval "test.ogit.caseGetReal() $(declare -f private.this.path.case.get | tail -n +2)"
+  private.this.path.case.get() { [ -z "$1" ] && return 1; printf '%s\n' "${1/Once.sh/ONCE.SH}"; }
+  ogit.safeDirectory.add "$base/main" >/dev/null 2>&1; ogit.safeDirectory.add "$base/main" >/dev/null 2>&1
+  ogit.safeDirectory.ensure "$base" >/dev/null 2>&1 || bad="$bad ensure-rc"
+  list=$(ogit.safeDirectory.list | sort | tr '\n' ' ')
+  [ "$list" = "$folded/dev $folded/main $folded/prod " ] || bad="$bad stored=[$list]"
+  # only the folded entries, as oo's hand-folded adds write them: trusted=yes
+  : > "$GIT_CONFIG_GLOBAL"
+  for list in main dev prod; do git config --global --add safe.directory "$folded/$list"; done
+  case "$(ogit.layout.status "$base")" in *trusted=no*) bad="$bad layout-not-trusted=[$(ogit.layout.status "$base" | grep -c trusted=no)]" ;; esac
+  eval "private.this.path.case.get() $(declare -f test.ogit.caseGetReal | tail -n +2)"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "add and ensure store the folded spelling once; layout.status compares folded" || create.result 1 "case fold:$bad"
+  return $(result)
+}
+# T-OGIT-SAFEDIR-ENSURE-TWICE: ensure is idempotent — a second run over the
+# same base adds nothing and leaves the global config byte for byte.
+test.ogit.safeDirectoryEnsureTwice() {
+  local base fx bad="" before
+  base=$(test.ogit.base ensuretwice clone); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  ogit.safeDirectory.ensure "$base" >/dev/null 2>&1 || bad="$bad first-rc"
+  case "$RESULT" in *"(3 added)"*) ;; *) bad="$bad first=[$RESULT]" ;; esac
+  before=$(cat "$GIT_CONFIG_GLOBAL")
+  ogit.safeDirectory.ensure "$base" >/dev/null 2>&1 || bad="$bad second-rc"
+  case "$RESULT" in *"(0 added)"*) ;; *) bad="$bad second=[$RESULT]" ;; esac
+  [ "$(cat "$GIT_CONFIG_GLOBAL")" = "$before" ] || bad="$bad second-run-changed-config"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the second ensure adds nothing and changes nothing" || create.result 1 "ensure twice:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-SAFEDIR-ENSURE-TWICE: a second safeDirectory.ensure over the same base changes nothing" test.ogit.safeDirectoryEnsureTwice
+expect 0 "the second ensure adds nothing and changes nothing" "oo update and oo user.fix run it on every pass"
+
+# T-OGIT-COMPLETION-FROM: <from> (commit.count, branch.compare) completes the
+# refs, as its siblings <to>, <a>, <b> do.
+test.ogit.completionFrom() {
+  local fx w out; fx=$(test.ogit.fixture complfrom); w="$fx/work"
+  out=$(OOSH_DIR="$w"; ogit.parameter.completion.from "" 2>/dev/null)
+  rm -rf "$fx"
+  if printf '%s\n' "$out" | grep -qx dev; then create.result 0 "<from> completes the refs"; else create.result 1 "from completion: [$out]"; fi
+  return $(result)
+}
+test.case $level "T-OGIT-COMPLETION-FROM: ogit commit.count <Tab> completes <from> with the refs" test.ogit.completionFrom
+expect 0 "<from> completes the refs" "every other ref parameter completed; <from> had nothing"
+
+test.case $level "T-OGIT-SAFEDIR-CASE-FOLD: ogit folds the letter case of a safe.directory path itself (add, ensure, layout.status)" test.ogit.safeDirectoryCaseFold
+expect 0 "add and ensure store the folded spelling once; layout.status compares folded" "macOS: /Users/shared and /Users/Shared are one folder, two strings"
+
+# ============================================================================
+# T-SAFEDIR-ADD-IDEMPOTENT: ogit.safeDirectory.add deduplicates
+# ----------------------------------------------------------------------------
+# Moved from test/test.oo with the method (Task 10; the deleted private.oo.safeDirectory.add
+# delegated here). Regression for the duplicate-prod bug: install state 31
+# adds the resolved worktree and main paths on every (re)install. Calling it N
+# times with the same path must yield exactly one entry in the global config —
+# earlier versions used raw `git config --global --add` and accumulated
+# duplicates each install pass. Sandboxed via GIT_CONFIG_GLOBAL.
+# ============================================================================
+test.ogit.safeDirectory.add.idempotent() {
+  local sandbox realDir count
+  sandbox=$(test.suite.fixture.make safedirdedup)
+  realDir=$(mktemp -d)
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$sandbox"
+
+  ogit.safeDirectory.add "$realDir" >/dev/null 2>&1
+  ogit.safeDirectory.add "$realDir" >/dev/null 2>&1
+  ogit.safeDirectory.add "$realDir" >/dev/null 2>&1
+
+  count=$(git config --global --get-all safe.directory | wc -l)
+  rm -rf "$sandbox"
+  rmdir "$realDir" 2>/dev/null
+
+  if [ "$count" -eq 1 ]; then
+    create.result 0 "exactly one entry after 3 adds"
+  else
+    create.result 1 "expected 1 entry, got $count"
+  fi
+}
+test.case - "T-SAFEDIR-ADD-IDEMPOTENT: helper deduplicates same path" \
+  test.ogit.safeDirectory.add.idempotent
+expect 0 "exactly one entry after 3 adds" "ogit.safeDirectory.add must be idempotent"
+
+# ============================================================================
+# T-OGIT-SAFEDIR-REAL-GITCONFIG: the trust tests never write the tester's own ~/.gitconfig, on any git
+# ----------------------------------------------------------------------------
+# They isolated with GIT_CONFIG_GLOBAL alone, which git knows only since 2.32.
+# On an older git (oldest supported ~2.25) it is ignored: the tests added
+# fixture entries to the REAL ~/.gitconfig and safeDirectory.prune removed the
+# user's own entries for absent paths. Simulated here: a git on a fixture PATH
+# that drops GIT_CONFIG_GLOBAL before it runs the real one, and a "real home"
+# holding a COPY of the tester's ~/.gitconfig plus an entry for an absent path.
+# The tester's real file is only read. Each trust test runs in a subshell; the
+# copy must come out byte for byte.
+test.ogit.safeDirRealHome() {
+  local fx bad="" sum fn realGit
+  fx=$(test.suite.fixture.make safedirrealhome)
+  mkdir -p "$fx/realhome" "$fx/bin"
+  [ -f "$HOME/.gitconfig" ] && cat "$HOME/.gitconfig" > "$fx/realhome/.gitconfig"
+  printf '[safe]\n\tdirectory = %s\n' "$fx/the.users.own.absent.entry" >> "$fx/realhome/.gitconfig"
+  cat "$fx/realhome/.gitconfig" > "$fx/gitconfig.orig"
+  realGit=$(command -v git)
+  printf '#!/bin/sh\nunset GIT_CONFIG_GLOBAL\nexec "%s" "$@"\n' "$realGit" > "$fx/bin/git"; chmod +x "$fx/bin/git"
+  sum=$(cksum < "$fx/gitconfig.orig")
+  for fn in test.ogit.trust test.ogit.safeDirectory.prune test.ogit.safeDirectoryPruneInPlace \
+            test.ogit.safeDirectoryCaseFold test.ogit.safeDirectoryEnsureTwice test.ogit.safeDirectory.add.idempotent; do
+    ( HOME="$fx/realhome" PATH="$fx/bin:$PATH"; unset XDG_CONFIG_HOME; export HOME PATH; "$fn" >/dev/null 2>&1 )
+    if [ "$(cksum < "$fx/realhome/.gitconfig")" != "$sum" ]; then
+      bad="$bad $fn"; cat "$fx/gitconfig.orig" > "$fx/realhome/.gitconfig"
+    fi
+  done
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "no trust test writes the home .gitconfig, also on a git without GIT_CONFIG_GLOBAL" || create.result 1 "wrote the home .gitconfig:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-SAFEDIR-REAL-GITCONFIG: the trust tests never write the home ~/.gitconfig, also on a git older than 2.32" test.ogit.safeDirRealHome
+expect 0 "no trust test writes the home .gitconfig, also on a git without GIT_CONFIG_GLOBAL" \
+  "GIT_CONFIG_GLOBAL alone isolates only on git 2.32+; older git wrote — and pruned — the tester's ~/.gitconfig"
+
+
+console.log "
+Test: ogit.worktree.add
+===================================================================="
+
+test.ogit.worktree() {
+  local fx bad="" w; fx=$(test.ogit.fixture worktree); w="$fx/work"
+  git -C "$w" branch -q prod
+  ogit.worktree.add prod "$fx/prod" origin/dev "$w" >/dev/null 2>&1 || bad="$bad add-rc=$?"
+  [ -f "$fx/prod/.git" ] || bad="$bad add-shape"
+  ogit.worktree.list "$w" | grep -qx "worktree $fx/prod" || bad="$bad list"
+  [ "$(ogit.worktree.find prod "$w")" = "$fx/prod" ] || bad="$bad find=[$(ogit.worktree.find prod "$w")]"
+  [ -z "$(ogit.worktree.find nosuch "$w")" ] || bad="$bad find-nosuch"
+  [ "$(private.ogit.worktree.paths.get "$w" | tr '\n' ' ')" = "$fx/work $fx/prod " ] || bad="$bad paths=[$(private.ogit.worktree.paths.get "$w" | tr '\n' ' ')]"
+  # a folder name with a space: the porcelain parse must not split it
+  git -C "$w" branch -q spaced
+  ogit.worktree.add spaced "$fx/with space" origin/dev "$w" >/dev/null 2>&1
+  [ "$(ogit.worktree.find spaced "$w")" = "$fx/with space" ] || bad="$bad find-space=[$(ogit.worktree.find spaced "$w")]"
+  ogit.worktree.delete "$fx/with space" "$w" >/dev/null 2>&1
+  printf 'dirty\n' >> "$fx/prod/file"
+  ogit.worktree.delete "$fx/prod" "$w" >/dev/null 2>&1 && bad="$bad delete-dirty-passed"
+  git -C "$fx/prod" checkout -q -- file
+  ogit.worktree.delete "$fx/prod" "$w" >/dev/null 2>&1 || bad="$bad delete-rc=$?"
+  [ -e "$fx/prod" ] && bad="$bad delete-left-folder"
+  ogit.worktree.prune "$w" >/dev/null 2>&1; [ "$(ogit.worktree.list "$w" | grep -c '^worktree ')" = 1 ] || bad="$bad prune"
+  ogit.binary.check || bad="$bad binary"
+  [ "$(ogit.raw "$w" rev-parse --abbrev-ref HEAD)" = dev ] || bad="$bad raw"
+  rm -rf "$fx"
+  # worktree.find knows sibling clones: <base>/<branch> next to <base>/main, when it is on <branch>
+  local cb; cb=$(test.ogit.base wtfind clone)
+  [ "$(ogit.worktree.find prod "$cb/main")" = "$cb/prod" ] || bad="$bad find-clone=[$(ogit.worktree.find prod "$cb/main")]"
+  [ "$(ogit.worktree.find prod "$cb/dev")" = "$cb/prod" ] || bad="$bad find-clone-from-sibling"
+  [ -z "$(ogit.worktree.find nosuch "$cb/main")" ] || bad="$bad find-clone-nosuch"
+  git -C "$cb/prod" checkout -q -b other
+  [ -z "$(ogit.worktree.find prod "$cb/main")" ] || bad="$bad find-clone-wrong-branch"
+  rm -rf "$(dirname "$cb")"
+  [ -z "$bad" ] && create.result 0 "worktree.add/list/find/delete/prune, binary.check, raw behave" || create.result 1 "worktree:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-WORKTREE: worktree noun, binary.check, raw" test.ogit.worktree
+expect 0 "worktree.add/list/find/delete/prune, binary.check, raw behave" "worktree noun"
+
+
+console.log "
+Test: T-OGIT-INDEX-REMOVE
+===================================================================="
+
+test.ogit.indexRemove() {
+  local fx bad=""; fx=$(test.ogit.fixture remove); local w="$fx/work"
+  ogit.index.remove file "$w" >/dev/null 2>&1 || bad="$bad rc=$?"
+  [ -e "$w/file" ] && bad="$bad still-on-disk"
+  [ "$(git -C "$w" diff --cached --name-status)" = "$(printf 'D\tfile')" ] || bad="$bad deletion-not-staged"
+  ogit.index.remove nosuch "$w" >/dev/null 2>&1 && bad="$bad untracked-passed"
+  ogit.index.remove "" "$w" >/dev/null 2>&1 && bad="$bad empty-path-passed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "index.remove: tracked file removed and staged, an untracked path refused" || create.result 1 "index.remove:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-INDEX-REMOVE: ogit index.remove deletes a tracked file and stages the deletion" test.ogit.indexRemove
+expect 0 "index.remove: tracked file removed and staged, an untracked path refused" "Round 5 deletes boot and profile.d.oosh.sh through ogit"
+
+
+console.log "
+Test: T-OGIT-COMMIT-PICK
+===================================================================="
+
+test.ogit.pickSide() { # <work> # on branch side: one clean commit (new file other) and one that edits file; echo "<clean> <conflicting>"; back on dev (fixture side, raw git)
+  local w="$1" clean
+  git -C "$w" checkout -q -b side
+  printf 'picked\n' > "$w/other"; git -C "$w" add other
+  git -C "$w" -c user.email=t@t -c user.name=t commit -q -m "side: other"
+  clean=$(git -C "$w" rev-parse HEAD)
+  test.ogit.commit "$w" "side edit"
+  echo "$clean $(git -C "$w" rev-parse HEAD)"
+  git -C "$w" checkout -q dev
+}
+
+test.ogit.commitPick() {
+  local fx bad="" w clean conflicting; fx=$(test.ogit.fixture pick); w="$fx/work"
+  read -r clean conflicting <<< "$(test.ogit.pickSide "$w")"
+  ogit.commit.pick "$clean" t@t t "$w" >/dev/null 2>&1 || bad="$bad clean-rc=$?"
+  [ -f "$w/other" ] || bad="$bad not-picked"
+  git -C "$w" log -1 --format=%B | grep -q "cherry picked from commit $clean" || bad="$bad no-x-line"
+  test.ogit.commit "$w" "dev edit"
+  ogit.commit.pick "$conflicting" t@t t "$w" >/dev/null 2>&1 && bad="$bad conflict-passed"
+  case "$RESULT" in *file*) ;; *) bad="$bad result-without-file=[$RESULT]" ;; esac
+  [ "$(ogit.conflict.list "$w")" = file ] || bad="$bad pick-not-left-open"
+  ogit.commit.pick "" t@t t "$w" >/dev/null 2>&1 && bad="$bad empty-commit-passed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "commit.pick: picked with -x; a conflict is reported and left open" || create.result 1 "commit.pick:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT-PICK: ogit commit.pick carries a commit with -x and stops on a conflict" test.ogit.commitPick
+expect 0 "commit.pick: picked with -x; a conflict is reported and left open" "the carry-over of recovered work goes through ogit"
+
+
+console.log "
+Test: T-OGIT-COMMIT-PICK-CONTINUE
+===================================================================="
+
+test.ogit.commitPickContinue() {
+  local fx bad="" w clean conflicting; fx=$(test.ogit.fixture pickcontinue); w="$fx/work"
+  read -r clean conflicting <<< "$(test.ogit.pickSide "$w")"
+  test.ogit.commit "$w" "dev edit"
+  ogit.commit.pick "$conflicting" t@t t "$w" >/dev/null 2>&1
+  printf 'seed\nresolved\n' > "$w/file"; ogit.index.add all "$w" >/dev/null 2>&1
+  ogit.commit.pick.continue t@t t "$w" >/dev/null 2>&1 || bad="$bad rc=$?"
+  [ -z "$(ogit.conflict.list "$w")" ] || bad="$bad still-conflicted"
+  [ "$(git -C "$w" log -1 --format=%s)" = "side edit" ] || bad="$bad message=[$(git -C "$w" log -1 --format=%s)]"
+  git -C "$w" log -1 --format=%B | grep -q "cherry picked from commit $conflicting" || bad="$bad no-x-line"
+  [ -z "$(git -C "$w" status --porcelain)" ] || bad="$bad tree-not-clean"
+  ogit.commit.pick.continue t@t t "$w" >/dev/null 2>&1 && bad="$bad nothing-in-progress-passed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "commit.pick.continue: the resolved pick is committed with its message and -x line" || create.result 1 "commit.pick.continue:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT-PICK-CONTINUE: ogit commit.pick.continue commits a resolved pick" test.ogit.commitPickContinue
+expect 0 "commit.pick.continue: the resolved pick is committed with its message and -x line" "conflicts are resolved with replace, then continued through ogit"
+
+
+console.log "
+Test: T-OGIT-COMMIT-PICK-ABORT
+===================================================================="
+
+test.ogit.commitPickAbort() {
+  local fx bad="" w clean conflicting before; fx=$(test.ogit.fixture pickabort); w="$fx/work"
+  read -r clean conflicting <<< "$(test.ogit.pickSide "$w")"
+  test.ogit.commit "$w" "dev edit"
+  before=$(git -C "$w" rev-parse HEAD)
+  ogit.commit.pick "$conflicting" t@t t "$w" >/dev/null 2>&1
+  ogit.commit.pick.abort "$w" >/dev/null 2>&1 || bad="$bad rc=$?"
+  [ "$(git -C "$w" rev-parse HEAD)" = "$before" ] || bad="$bad head-moved"
+  [ -z "$(git -C "$w" status --porcelain)" ] || bad="$bad tree-not-clean"
+  ogit.commit.pick.abort "$w" >/dev/null 2>&1 && bad="$bad nothing-in-progress-passed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "commit.pick.abort: the tree is back to what it was before the pick" || create.result 1 "commit.pick.abort:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-COMMIT-PICK-ABORT: ogit commit.pick.abort puts the tree back" test.ogit.commitPickAbort
+expect 0 "commit.pick.abort: the tree is back to what it was before the pick" "a pick that should not have been made is undone through ogit"
+
+
+console.log "
+Test: T-OGIT-MUTATORS-SHARED
+===================================================================="
+
+# In a SHARED repository every mutator runs git with umask 002 (the reason
+# private.ogit.git.run exists): commit with the editor, commit.pick,
+# commit.pick.continue and commit.pick.abort called git directly, so a file
+# they wrote kept the caller's umask 022 and locked the other dev users out.
+# The checked files are ones git writes with the umask, not through
+# core.sharedRepository. ls -l, not stat -c: portable.
+test.ogit.mutatorsShared() {
+  local fx w g bad="" clean conflicting
+  fx=$(test.ogit.fixture mutshared); w="$fx/work"; g=$(private.ogit.gitdir "$w")
+  ogit.raw "$w" config core.sharedRepository group
+  read -r clean conflicting <<< "$(test.ogit.pickSide "$w")"
+  ( umask 022; ogit.commit.pick "$clean" t@t t "$w" >/dev/null 2>&1 ) || bad="$bad pick-rc"
+  [ "$(ls -l "$w/other" | cut -c6)" = w ] || bad="$bad pick-file=[$(ls -l "$w/other" | cut -c1-10)]"
+  test.ogit.commit "$w" "dev edit"
+  ( umask 022; ogit.commit.pick "$conflicting" t@t t "$w" >/dev/null 2>&1; ogit.commit.pick.abort "$w" >/dev/null 2>&1 ) || bad="$bad abort-rc"
+  [ "$(ls -l "$w/file" | cut -c6)" = w ] || bad="$bad abort-file=[$(ls -l "$w/file" | cut -c1-10)]"
+  ( umask 022; ogit.commit.pick "$conflicting" t@t t "$w" >/dev/null 2>&1 )
+  printf 'seed\nresolved\n' > "$w/file"; ogit.index.add all "$w" >/dev/null 2>&1; rm -f "$g/COMMIT_EDITMSG"
+  ( umask 022; ogit.commit.pick.continue t@t t "$w" >/dev/null 2>&1 ) || bad="$bad continue-rc"
+  [ "$(ls -l "$g/COMMIT_EDITMSG" | cut -c6)" = w ] || bad="$bad continue-editmsg=[$(ls -l "$g/COMMIT_EDITMSG" | cut -c1-10)]"
+  # the editor path: an editor that writes the message, no terminal needed
+  printf '#!/bin/sh\nprintf "edited\\n" > "$1"\n' > "$fx/editor"; chmod +x "$fx/editor"
+  printf 'more\n' >> "$w/file"; ogit.index.add all "$w" >/dev/null 2>&1; rm -f "$g/COMMIT_EDITMSG"
+  ( umask 022; GIT_EDITOR="$fx/editor" ogit.commit.create "" t@t t "$w" >/dev/null 2>&1 ) || bad="$bad editor-rc"
+  [ "$(git -C "$w" log -1 --format=%s)" = edited ] || bad="$bad editor-message=[$(git -C "$w" log -1 --format=%s)]"
+  [ "$(ls -l "$g/COMMIT_EDITMSG" | cut -c6)" = w ] || bad="$bad editor-editmsg=[$(ls -l "$g/COMMIT_EDITMSG" | cut -c1-10)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "pick, pick.continue, pick.abort and the editor commit write group-writable files in a shared repository" || create.result 1 "shared:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-MUTATORS-SHARED: the mutators that skipped private.ogit.git.run apply umask 002 in a shared repository" test.ogit.mutatorsShared
+expect 0 "pick, pick.continue, pick.abort and the editor commit write group-writable files in a shared repository" "a file written with umask 022 locks the other dev users out"
+
+
+console.log "
+Test: T-OGIT-MUTATORS-REASON
+===================================================================="
+
+# A failure RESULT carries git's own reason: index.remove said "not tracked"
+# for every failure, the picks named no reason at all.
+test.ogit.mutatorsReason() {
+  local fx w bad=""
+  fx=$(test.ogit.fixture mutreason); w="$fx/work"
+  printf 'staged\n' >> "$w/file"; git -C "$w" add file; printf 'unstaged\n' >> "$w/file"
+  ogit.index.remove file "$w" >/dev/null 2>&1 && bad="$bad remove-passed"
+  case "$RESULT" in *"not tracked"*) bad="$bad remove-says-not-tracked=[$RESULT]" ;; *"git: "*) ;; *) bad="$bad remove-no-reason=[$RESULT]" ;; esac
+  ogit.commit.pick nosuch t@t t "$w" >/dev/null 2>&1 && bad="$bad pick-passed"
+  case "$RESULT" in *"git: "*) ;; *) bad="$bad pick-no-reason=[$RESULT]" ;; esac
+  ogit.commit.pick.continue t@t t "$w" >/dev/null 2>&1 && bad="$bad continue-passed"
+  case "$RESULT" in *"git: "*) ;; *) bad="$bad continue-no-reason=[$RESULT]" ;; esac
+  ogit.commit.pick.abort "$w" >/dev/null 2>&1 && bad="$bad abort-passed"
+  case "$RESULT" in *"git: "*) ;; *) bad="$bad abort-no-reason=[$RESULT]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "index.remove, pick, pick.continue and pick.abort name git's reason" || create.result 1 "reason:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-MUTATORS-REASON: a failing index.remove or pick carries git's own reason in RESULT" test.ogit.mutatorsReason
+expect 0 "index.remove, pick, pick.continue and pick.abort name git's reason" "a fixed message hides why git refused"
+
+# T-OGIT-COMPLETION-BASE: `ogit worktree.remove <Tab>` listed the folders of the
+# current directory (compgen -d) — ~/Desktop, ~/.docker … — instead of the one
+# value <base> ever has: the components base. Empty word → the base; a typed
+# path → the base when it matches, plus folder completion.
+test.ogit.completionBase() {
+  local base bad="" out fx; base=$(test.ogit.base compbase); fx=$(dirname "$base")
+  local OOSH_COMPONENTS_DIR="$base"; export OOSH_COMPONENTS_DIR
+  out=$(cd "$fx" && ogit.parameter.completion.base "" ogit worktree.remove)
+  [ "$out" = "$base" ] || bad="$bad empty=[$(echo $out)]"
+  out=$(ogit.parameter.completion.base "$fx/Onc" ogit worktree.remove)
+  printf '%s\n' "$out" | grep -qx "$base" || bad="$bad prefix-missing-base=[$(echo $out)]"
+  out=$(ogit.parameter.completion.base "$fx/orig" ogit worktree.remove)
+  printf '%s\n' "$out" | grep -qx "$fx/origin.git" || bad="$bad no-dir-completion=[$(echo $out)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "<base> completes to the components base, and folders for a typed path" || create.result 1 "base completion:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-COMPLETION-BASE: <base> completes to the components base, not the folders of the current directory" test.ogit.completionBase
+expect 0 "<base> completes to the components base, and folders for a typed path" "ogit worktree.remove <Tab> listed ~/Desktop, ~/.docker …"
+
+
+console.log "
+Test: ogit.caller.validate
+===================================================================="
+
+# ============================================================================
+# T-OGIT-ONLY-CALLER: no raw `git` invocation outside ogit (ogit caller.validate)
+# ============================================================================
+test.ogit.onlyCaller() {
+  local out rc
+  out=$(ogit.caller.validate "$OOSH_DIR"); rc=$?
+  if [ "$rc" = 0 ]; then create.result 0 "ogit is the only git caller"
+  else create.result 1 "$out — the sites are listed by: LOG_LEVEL=1 ./ogit caller.validate"; fi
+  return $(result)
+}
+test.case $level "T-OGIT-ONLY-CALLER: no raw git invocation outside ogit (marked exceptions aside)" test.ogit.onlyCaller
+expect 0 "ogit is the only git caller" "D2 of the 2026-09-23 design"
+
+# ============================================================================
+# T-OGIT-ONLY-CALLER-REJECTS: ogit caller.validate must be able to fail.
+# ============================================================================
+# The validator must be able to fail: planted violations in one fixture tree,
+# only sanctioned exceptions in another, and a tree git cannot read at all.
+test.ogit.onlyCallerRejects() {
+  local bad="" out rc fx1 fx2 fx3
+  # Worst case, pinned: a user whose LOG_DEVICE is stdout gets the validator's
+  # error.log lines IN the captured output, ahead of the verdict (the platform
+  # test's `test` user did). Read the verdict line, never "the first line".
+  local LOG_DEVICE=/dev/stdout
+  fx1=$(test.suite.fixture.make plantbad); git init -q "$fx1"
+  printf '%s\n' '#!/usr/bin/env bash' 'x=$(git rev-parse HEAD)' > "$fx1/planted"
+  # a marker inside a STRING is not a comment, and an echo on the same line excuses nothing
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "ogit-exception: a string"; y=$(git log -1)' > "$fx1/fake"
+  # a marker six lines above is outside the 5-line window
+  printf '%s\n' '#!/usr/bin/env bash' '# ogit-exception: too far above' 'a=1' 'b=2' 'c=3' 'd=4' 'e=5' 'git status' > "$fx1/far"
+  git -C "$fx1" add planted fake far; git -C "$fx1" -c user.email=t@t -c user.name=t commit -q -m plant
+  out=$(ogit.caller.validate "$fx1"); rc=$?
+  out=$(printf '%s\n' "$out" | grep -E '^(OK|INVALID): ' | tail -1)   # the verdict line
+  [ "$rc" = 1 ] || bad="$bad planted-rc=$rc"
+  case "$out" in "INVALID: "*"3 violation(s), 0 exception(s)"*) ;; *) bad="$bad planted=[$out]" ;; esac
+
+  fx2=$(test.suite.fixture.make plantok); git init -q "$fx2"
+  # the marker three lines above counts (5-line window); the file marker counts anywhere
+  printf '%s\n' '#!/usr/bin/env bash' '# ogit-exception: fixture proves the 5-line window' 'a=1' 'b=2' 'y=$(git status)' > "$fx2/excused"
+  printf '%s\n' '#!/usr/bin/env bash' '# ogit-exception-file: fixture proves the file marker' 'git fetch origin' > "$fx2/filemarked"
+  git -C "$fx2" add excused filemarked; git -C "$fx2" -c user.email=t@t -c user.name=t commit -q -m excuse
+  out=$(ogit.caller.validate "$fx2"); rc=$?
+  out=$(printf '%s\n' "$out" | grep -E '^(OK|INVALID): ' | tail -1)
+  [ "$rc" = 0 ] || bad="$bad excused-rc=$rc"
+  case "$out" in "OK: "*"2 exception(s)"*) ;; *) bad="$bad excused=[$out]" ;; esac
+
+  # no repository: reading nothing must not report OK
+  fx3=$(test.suite.fixture.make plantnone); printf 'git status\n' > "$fx3/loose"
+  out=$(ogit.caller.validate "$fx3"); rc=$?
+  out=$(printf '%s\n' "$out" | grep -E '^(OK|INVALID): ' | tail -1)
+  [ "$rc" = 2 ] || bad="$bad unreadable-rc=$rc"
+  case "$out" in "INVALID: cannot read"*) ;; *) bad="$bad unreadable=[$out]" ;; esac
+
+  rm -rf "$fx1" "$fx2" "$fx3"
+  [ -z "$bad" ] && create.result 0 "caller.validate rejects planted calls, honours comment-anchored markers, refuses an unreadable tree" || create.result 1 "caller.validate:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-ONLY-CALLER-REJECTS: caller.validate catches planted raw git and honours ogit-exception" test.ogit.onlyCallerRejects
+expect 0 "caller.validate rejects planted calls, honours comment-anchored markers, refuses an unreadable tree" "a validator that cannot fail proves nothing"
+
+# ============================================================================
+# T-OGIT-ONLY-CALLER-SPELLINGS: the binary by its path, by a lookup, or held in
+# a variable is still a raw git call.
+# ============================================================================
+# The rule `git <subcommand>` alone could not see `/usr/bin/git pull`,
+# `"$(command -v git)" pull` or `GIT=$(command -v git); $GIT pull` — the
+# only-caller rule could be bypassed by spelling. A presence check is no call.
+test.ogit.onlyCallerSpellings() {
+  local bad="" out rc fx name line
+  fx=$(test.suite.fixture.make plantspellings); git init -q "$fx"
+  # One spelling per run: the planted file is the only one tracked, so its one
+  # violation can only be that line ($GIT pull and "$gitBin" fetch match nothing).
+  for name in absolute lookup variable variablePath; do
+    case "$name" in
+      absolute)     line='/usr/bin/git pull' ;;
+      lookup)       line='"$(command -v git)" pull --ff-only' ;;
+      variable)     line='GIT=$(command -v git); $GIT pull' ;;
+      variablePath) line='gitBin="/usr/local/bin/git"; "$gitBin" fetch' ;;
+    esac
+    git -C "$fx" rm -q --cached -r . >/dev/null 2>&1
+    printf '%s\n' '#!/usr/bin/env bash' "$line" > "$fx/$name"
+    git -C "$fx" add "$name"
+    out=$(ogit.caller.validate "$fx" 2>/dev/null); rc=$?
+    out=$(printf '%s\n' "$out" | grep -E '^(OK|INVALID): ' | tail -1)
+    case "$rc:$out" in "1:INVALID: "*"1 violation(s), 0 exception(s)"*) ;; *) bad="$bad $name-missed=[rc=$rc $out]" ;; esac
+  done
+  # a presence check, a quiet probe and a value naming git are no calls
+  git -C "$fx" rm -q --cached -r . >/dev/null 2>&1
+  printf '%s\n' '#!/usr/bin/env bash' '[ -x "$(command -v git)" ] || exit 1' 'command -v git >/dev/null 2>&1 && echo yes' \
+    'echo "--format=git"' > "$fx/presence"
+  git -C "$fx" add presence
+  out=$(ogit.caller.validate "$fx" 2>/dev/null); rc=$?
+  out=$(printf '%s\n' "$out" | grep -E '^(OK|INVALID): ' | tail -1)
+  case "$rc:$out" in "0:OK: "*"0 violations"*) ;; *) bad="$bad presence-reported=[rc=$rc $out]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a path, a lookup and a variable holding git are raw git calls" || create.result 1 "spellings:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-ONLY-CALLER-SPELLINGS: /usr/bin/git, \$(command -v git) and a variable holding git are raw git calls" test.ogit.onlyCallerSpellings
+expect 0 "a path, a lookup and a variable holding git are raw git calls" "the only-caller rule could be bypassed by spelling"
+
+
+console.log "
+Test: private.ogit.git.reason.get
+===================================================================="
+
+# T-OGIT-GIT-REASON: a mutator keeps git's own error text. Callers (install
+# state 31, promote) log RESULT; with git's stderr thrown away they logged
+# "could not check out X" and nothing about why. The contract: stdout passes
+# through, stderr is captured by private.ogit.git.run into OGIT_GIT_ERROR (one
+# line), and a failure RESULT is today's message + " — git: <that line>".
+test.ogit.gitReason() {
+  local fx bad="" w out rc; fx=$(test.ogit.fixture reason); w="$fx/work"
+
+  # the runner: stdout passes through; OGIT_GIT_ERROR lands in THIS shell, one line
+  out=$(private.ogit.git.run "$w" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$out" = dev ] || bad="$bad run-stdout=[$out]"
+  private.ogit.git.run "$w" checkout nosuch >/dev/null 2>"$fx/err"; rc=$?
+  [ "$rc" != 0 ] || bad="$bad run-rc"
+  case "$OGIT_GIT_ERROR" in *"did not match"*) ;; *) bad="$bad run-error=[$OGIT_GIT_ERROR]" ;; esac
+  [ -s "$fx/err" ] && bad="$bad run-leaked-stderr"
+  private.ogit.git.run "$w" rev-parse HEAD >/dev/null
+  [ -z "$OGIT_GIT_ERROR" ] || bad="$bad run-stale-error=[$OGIT_GIT_ERROR]"
+  OGIT_GIT_ERROR=""; [ -z "$(private.ogit.git.reason.get)" ] || bad="$bad reason-not-empty"
+  OGIT_GIT_ERROR="boom"; [ "$(private.ogit.git.reason.get)" = " — git: boom" ] || bad="$bad reason=[$(private.ogit.git.reason.get)]"
+
+  # a failing mutator: today's message stays the prefix, git's reason is appended
+  ogit.branch.checkout nosuch "$w" >/dev/null 2>"$fx/err"
+  case "$RESULT" in "could not check out nosuch in $w — git: "*"did not match"*) ;; *) bad="$bad checkout=[$RESULT]" ;; esac
+  case "$RESULT" in *"
+"*) bad="$bad checkout-multiline" ;; esac
+  [ -s "$fx/err" ] && bad="$bad checkout-leaked-stderr"
+  ogit.remote.url.set "$fx/nowhere" origin "$w" >/dev/null 2>&1
+  ogit.remote.fetch no "$w" >/dev/null 2>&1
+  case "$RESULT" in "fetch from origin failed in $w — git: "*nowhere*) ;; *) bad="$bad fetch=[$RESULT]" ;; esac
+  ogit.repo.clone "$fx/origin.git" nosuch "$fx/clone" >/dev/null 2>&1
+  case "$RESULT" in "clone of nosuch from $fx/origin.git failed — git: "*nosuch*) ;; *) bad="$bad clone=[$RESULT]" ;; esac
+  [ -e "$fx/clone" ] && bad="$bad clone-left-halfmade-dir"
+
+  # a succeeding mutator prints nothing on stderr and carries no reason
+  git -C "$w" branch -q other
+  ogit.branch.checkout other "$w" >/dev/null 2>"$fx/err" || bad="$bad checkout-ok-rc"
+  [ -s "$fx/err" ] && bad="$bad checkout-ok-stderr=[$(cat "$fx/err")]"
+  case "$RESULT" in *"— git:"*) bad="$bad checkout-ok-reason" ;; esac
+  ogit.tag.create v1 HEAD "$w" >/dev/null 2>"$fx/err" || bad="$bad tag-rc"
+  [ -s "$fx/err" ] && bad="$bad tag-stderr"
+  [ "$RESULT" = "tagged v1" ] || bad="$bad tag=[$RESULT]"
+
+  # stash still round-trips through the runner
+  printf 'w\n' >> "$w/file"
+  ogit.stash.push "reason test" "$w" >/dev/null 2>&1 || bad="$bad stash-push-rc"
+  ogit.status.check "$w" || bad="$bad stash-left-dirty"
+  ogit.stash.pop "$w" >/dev/null 2>&1 || bad="$bad stash-pop-rc"
+  ogit.status.check "$w" && bad="$bad pop-did-not-restore"
+  ogit.stash.pop "$w" >/dev/null 2>&1 && bad="$bad pop-empty-passed"
+  case "$RESULT" in "stash pop failed"*" — git: "*) ;; *) bad="$bad pop-empty=[$RESULT]" ;; esac
+
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "mutators keep the git error text in RESULT; stdout and success stay quiet" || create.result 1 "git-reason:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-GIT-REASON: a failing mutator appends the git stderr to RESULT; getters and successes unchanged" test.ogit.gitReason
+expect 0 "mutators keep the git error text in RESULT; stdout and success stay quiet" "callers log the real reason"
+
+
+console.log "
+Test: ogit.layout.status
+===================================================================="
+
+test.ogit.layoutStatus() {
+  local base bad="" out; base=$(test.ogit.base layoutwt)
+  out=$(ogit.layout.status "$base")
+  printf '%s\n' "$out" | grep -qE '^main[[:space:]]+clone' || bad="$bad main-line"
+  printf '%s\n' "$out" | grep -qE '^dev[[:space:]]+worktree[[:space:]]+dirty 0[[:space:]]+ahead 0[[:space:]]+behind 0' || bad="$bad dev-line=[$(printf '%s\n' "$out" | grep '^dev')]"
+  printf 'x\n' >> "$base/prod/file"; test.ogit.commit "$base/dev" local
+  out=$(ogit.layout.status "$base")
+  printf '%s\n' "$out" | grep -qE '^prod[[:space:]]+worktree[[:space:]]+dirty 1' || bad="$bad prod-dirty"
+  printf '%s\n' "$out" | grep -qE '^dev[[:space:]]+worktree[[:space:]]+dirty 0[[:space:]]+ahead 1' || bad="$bad dev-ahead"
+  ogit.layout.status "$base" >/dev/null || bad="$bad consistent-worktree-layout-rc=$?"
+  # a mixed layout: prod becomes a clone while dev is still a worktree
+  git -C "$base/prod" checkout -q -- file; git -C "$base/main" worktree remove "$base/prod"; git clone -q -b prod "$(dirname "$base")/origin.git" "$base/prod"
+  ogit.layout.status "$base" >/dev/null && bad="$bad mixed-layout-rc0"
+  rm -rf "$(dirname "$base")"
+  base=$(test.ogit.base layoutcl clone)
+  ogit.layout.status "$base" >/dev/null || bad="$bad clone-layout-rc=$?"
+  rm -rf "$(dirname "$base")"
+  [ -z "$bad" ] && create.result 0 "layout.status reports shape, dirty, ahead, behind per folder; rc 1 on a mixed layout" || create.result 1 "layout.status:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-LAYOUT-STATUS: per-folder shape and freshness, rc 1 when mixed" test.ogit.layoutStatus
+expect 0 "layout.status reports shape, dirty, ahead, behind per folder; rc 1 on a mixed layout" "the read-only view of the base"
+
+
+console.log "
+Test: ogit.worktree.remove
+===================================================================="
+
+test.ogit.worktreeRemove() {
+  local base bad="" fx; base=$(test.ogit.base wtrm); fx=$(dirname "$base")
+  # local + export: sandboxed global git config, and the carry's backups land in the fixture, not in the real $HOME
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  # an ignored file is not "dirty" to the gate — and must survive the conversion
+  printf 'mine\n' > "$base/dev/ignored.txt"
+  # refuse: dirty
+  printf 'x\n' >> "$base/dev/file"
+  ogit.worktree.remove "$base" >/dev/null 2>&1 && bad="$bad dirty-not-refused"
+  case "$RESULT" in *dev*) ;; *) bad="$bad dirty-not-named=[$RESULT]" ;; esac
+  [ -f "$base/dev/.git" ] || bad="$bad dirty-run-touched-dev"
+  git -C "$base/dev" checkout -q -- file
+  # refuse: unpushed
+  test.ogit.commit "$base/prod" local
+  ogit.worktree.remove "$base" >/dev/null 2>&1 && bad="$bad ahead-not-refused"
+  case "$RESULT" in *prod*) ;; *) bad="$bad ahead-not-named=[$RESULT]" ;; esac
+  git -C "$base/prod" push -q origin prod
+  # convert
+  ogit.worktree.remove "$base" >/dev/null 2>&1 || bad="$bad convert-rc=$?"
+  [ -d "$base/dev/.git" ] && [ -d "$base/prod/.git" ] || bad="$bad not-clones"
+  [ "$(git -C "$base/dev" branch --show-current)" = dev ] || bad="$bad dev-branch"
+  [ "$(git -C "$base/prod" rev-parse HEAD)" = "$(git -C "$fx/origin.git" rev-parse prod)" ] || bad="$bad prod-content"
+  [ "$(cat "$base/dev/ignored.txt" 2>/dev/null)" = mine ] || bad="$bad ignored-file-lost"
+  ls -d "$HOME/.oosh.backups/"*-ogit-dev >/dev/null 2>&1 || bad="$bad no-ignored-backup"
+  if private.this.group.exists dev; then
+    [ "$(git -C "$base/dev" config --get core.sharedRepository)" = group ] || bad="$bad shared"
+  fi
+  ogit.safeDirectory.list | grep -qFx "$base/dev" || bad="$bad trusted"
+  [ -z "$(git -C "$base/main" worktree list --porcelain | grep -c '^worktree ' | grep -vx 1)" ] || bad="$bad main-still-lists-worktrees"
+  ogit.worktree.remove "$base" >/dev/null 2>&1 || bad="$bad second-run-rc=$?"
+  ogit.layout.status "$base" >/dev/null || bad="$bad layout-not-consistent"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "refuses dirty and unpushed by name; converts clean worktrees to trusted, shared clones; carries ignored files; idempotent" || create.result 1 "worktree.remove:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-WORKTREE-REMOVE: worktrees become independent clones, safely" test.ogit.worktreeRemove
+expect 0 "refuses dirty and unpushed by name; converts clean worktrees to trusted, shared clones; carries ignored files; idempotent" "D1 + D4 of the design, § 2.1 ignored-file carry"
+
+# T-OGIT-WORKTREE-REMOVE-OFFLINE: the host migration (2026-09-25) ran
+# `sudo ogit worktree.remove`, which removed the dev worktree and then cloned
+# from the GitHub SSH URL AS ROOT — root has no GitHub key, the clone failed, and
+# dev/ was gone. The fixtures had a local bare origin, so they never needed
+# credentials. Now: clone from <base>/main (a worktree's branch IS a local branch
+# of main, and the gate proved it clean and pushed), point origin at main's URL,
+# and build the clone BESIDE the worktree first — a failed clone touches nothing.
+test.ogit.worktreeRemoveOffline() {
+  local base bad="" fx url; base=$(test.ogit.base wtrmoff); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  # origin becomes unreachable, as GitHub is for root without a key
+  url="$fx/unreachable/once.sh.git"
+  git -C "$base/main" remote set-url origin "$url"
+  # a clone that cannot be made must leave the worktree exactly as it was
+  mkdir -p "$base/.ogit-dev.new"; printf 'x\n' > "$base/.ogit-dev.new/in-the-way"
+  ogit.worktree.remove "$base" >/dev/null 2>&1 && bad="$bad blocked-clone-passed"
+  [ -f "$base/dev/.git" ] || bad="$bad blocked-clone-lost-worktree"
+  case "$RESULT" in *".ogit-dev.new"*) ;; *) bad="$bad blocked-not-named=[$RESULT]" ;; esac
+  rm -rf "$base/.ogit-dev.new"
+  # offline conversion
+  ogit.worktree.remove "$base" >/dev/null 2>&1 || bad="$bad offline-rc=[$RESULT]"
+  [ -d "$base/dev/.git" ] && [ -d "$base/prod/.git" ] || bad="$bad not-clones"
+  [ "$(git -C "$base/dev" branch --show-current)" = dev ] || bad="$bad dev-branch"
+  [ "$(git -C "$base/dev" rev-parse HEAD)" = "$(git -C "$fx/origin.git" rev-parse dev)" ] || bad="$bad dev-content"
+  [ "$(git -C "$base/dev" remote get-url origin)" = "$url" ] || bad="$bad origin=[$(git -C "$base/dev" remote get-url origin)]"
+  [ "$(git -C "$base/dev" rev-parse --abbrev-ref '@{u}' 2>/dev/null)" = origin/dev ] || bad="$bad no-upstream"
+  ls -d "$base"/.ogit-* >/dev/null 2>&1 && bad="$bad temp-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "converts without reaching origin; a clone that cannot be made leaves the worktree intact" || create.result 1 "worktree.remove offline:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-WORKTREE-REMOVE-OFFLINE: worktree.remove clones from main/, never needs origin credentials, never loses a folder" test.ogit.worktreeRemoveOffline
+expect 0 "converts without reaching origin; a clone that cannot be made leaves the worktree intact" "sudo on the real host: root has no GitHub key, and dev/ was deleted before the clone failed"
+
+
+console.log "
+Test: ogit.worktree.restore
+===================================================================="
+
+test.ogit.worktreeRestore() {
+  local base bad="" fx; base=$(test.ogit.base clrs clone); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  printf 'mine\n' > "$base/dev/ignored.txt"
+  test.ogit.commit "$base/dev" local
+  ogit.worktree.restore "$base" >/dev/null 2>&1 && bad="$bad ahead-not-refused"
+  case "$RESULT" in *dev*) ;; *) bad="$bad ahead-not-named" ;; esac
+  git -C "$base/dev" push -q origin dev
+  # main/ has its OWN local dev branch; `worktree add -B dev … origin/dev` resets it,
+  # so an unpushed commit there must be refused, named, and left untouched.
+  git -C "$base/main" checkout -q dev; test.ogit.commit "$base/main" mainonly; git -C "$base/main" checkout -q main
+  local mainDev; mainDev=$(git -C "$base/main" rev-parse dev)
+  ogit.worktree.restore "$base" >/dev/null 2>&1 && bad="$bad main-local-ahead-not-refused"
+  case "$RESULT" in *main*dev*) ;; *) bad="$bad main-local-ahead-not-named=[$RESULT]" ;; esac
+  [ "$(git -C "$base/main" rev-parse dev)" = "$mainDev" ] || bad="$bad main-local-dev-reset"
+  [ -d "$base/dev/.git" ] || bad="$bad refused-run-touched-dev"
+  git -C "$base/main" branch -q -f dev origin/dev
+  ogit.worktree.restore "$base" >/dev/null 2>&1 || bad="$bad restore-rc=$?"
+  [ -f "$base/dev/.git" ] && [ -f "$base/prod/.git" ] || bad="$bad not-worktrees"
+  [ "$(git -C "$base/dev" rev-parse HEAD)" = "$(git -C "$fx/origin.git" rev-parse dev)" ] || bad="$bad dev-content"
+  [ "$(git -C "$base/main" worktree list --porcelain | grep -c '^worktree ')" = 3 ] || bad="$bad main-lists"
+  [ "$(cat "$base/dev/ignored.txt" 2>/dev/null)" = mine ] || bad="$bad ignored-file-lost"
+  ogit.worktree.restore "$base" >/dev/null 2>&1 || bad="$bad second-run-rc"
+  # round trip — the ignored file survives both directions
+  ogit.worktree.remove "$base" >/dev/null 2>&1 || bad="$bad roundtrip-remove"
+  [ -d "$base/dev/.git" ] || bad="$bad roundtrip-shape"
+  [ "$(cat "$base/dev/ignored.txt" 2>/dev/null)" = mine ] || bad="$bad roundtrip-ignored-file-lost"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "clones become linked worktrees again, gated, idempotent, round-trippable, ignored files carried" || create.result 1 "worktree.restore:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-WORKTREE-RESTORE: the reverse conversion, and the round trip" test.ogit.worktreeRestore
+expect 0 "clones become linked worktrees again, gated, idempotent, round-trippable, ignored files carried" "reversibility is the promise"
+
+# T-OGIT-WORKTREE-RESTORE-OFFLINE: under sudo, root has no GitHub key; restore
+# fetched origin into main/ first and so could never run on a real host (found
+# on the 2026-09-25 host migration, runbook step 8). Each clone is imported into
+# main/ locally instead — the gate proved it clean and pushed.
+test.ogit.worktreeRestoreOffline() {
+  local base bad="" fx url d; base=$(test.ogit.base clrsoff clone); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  # a new commit on dev, pushed while origin was still reachable: main/ has NOT seen it
+  test.ogit.commit "$base/dev" newer; git -C "$base/dev" push -q origin dev
+  # now origin becomes unreachable for everyone, as GitHub is for root without a key
+  url="$fx/unreachable/once.sh.git"
+  for d in main dev prod; do git -C "$base/$d" remote set-url origin "$url"; done
+  ogit.worktree.restore "$base" >/dev/null 2>&1 || bad="$bad restore-rc=[$RESULT]"
+  [ -f "$base/dev/.git" ] && [ -f "$base/prod/.git" ] || bad="$bad not-worktrees"
+  [ "$(git -C "$base/dev" rev-parse HEAD)" = "$(git -C "$fx/origin.git" rev-parse dev)" ] || bad="$bad dev-not-at-pushed-commit"
+  [ "$(git -C "$base/dev" branch --show-current)" = dev ] || bad="$bad dev-branch"
+  # …and back again, still offline
+  ogit.worktree.remove "$base" >/dev/null 2>&1 || bad="$bad roundtrip-remove=[$RESULT]"
+  [ -d "$base/dev/.git" ] && [ -d "$base/prod/.git" ] || bad="$bad roundtrip-not-clones"
+  [ "$(git -C "$base/dev" rev-parse HEAD)" = "$(git -C "$fx/origin.git" rev-parse dev)" ] || bad="$bad roundtrip-dev-content"
+  ls -d "$base"/.ogit-* >/dev/null 2>&1 && bad="$bad temp-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "restore and the round trip need no reachable origin" || create.result 1 "worktree.restore offline:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-WORKTREE-RESTORE-OFFLINE: worktree.restore imports each clone into main/ locally — no origin credentials" test.ogit.worktreeRestoreOffline
+expect 0 "restore and the round trip need no reachable origin" "root has no GitHub key under sudo"
+
+# T-OGIT-WORKTREE-RESTORE-KEEPS-REFS: restore deletes each sibling clone, and a
+# clone owns its refs. The gate looked at the checked-out branch only, so a
+# stash, a second local branch ahead of origin or a tag main/ does not have
+# went with the folder.
+test.ogit.worktreeRestoreKeepsRefs() {
+  local base bad="" fx; base=$(test.ogit.base clrsrefs clone); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  printf 'stashed\n' >> "$base/dev/file"; git -C "$base/dev" stash -q
+  ogit.worktree.restore "$base" >/dev/null 2>&1 && bad="$bad stash-not-refused"
+  case "$RESULT" in *dev*stash*) ;; *) bad="$bad stash-not-named=[$RESULT]" ;; esac
+  [ -d "$base/dev/.git" ] && [ -n "$(git -C "$base/dev" stash list)" ] || bad="$bad stash-lost"
+  git -C "$base/dev" stash drop -q
+  git -C "$base/prod" checkout -q -b topic; test.ogit.commit "$base/prod" topiconly; git -C "$base/prod" checkout -q prod
+  ogit.worktree.restore "$base" >/dev/null 2>&1 && bad="$bad branch-not-refused"
+  case "$RESULT" in *prod*topic*) ;; *) bad="$bad branch-not-named=[$RESULT]" ;; esac
+  [ -d "$base/prod/.git" ] || bad="$bad branch-folder-lost"
+  git -C "$base/prod" branch -q -D topic
+  git -C "$base/dev" tag localonly
+  ogit.worktree.restore "$base" >/dev/null 2>&1 && bad="$bad tag-not-refused"
+  case "$RESULT" in *dev*localonly*) ;; *) bad="$bad tag-not-named=[$RESULT]" ;; esac
+  git -C "$base/dev" tag -d localonly >/dev/null
+  ogit.worktree.restore "$base" >/dev/null 2>&1 || bad="$bad clean-restore-rc=[$RESULT]"
+  [ -f "$base/dev/.git" ] && [ -f "$base/prod/.git" ] || bad="$bad not-worktrees"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a clone holding a stash, an unpushed branch or a tag main lacks is refused by name; a clean one is restored" || create.result 1 "worktree.restore refs:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-WORKTREE-RESTORE-KEEPS-REFS: worktree.restore refuses a clone whose own refs it would lose" test.ogit.worktreeRestoreKeepsRefs
+expect 0 "a clone holding a stash, an unpushed branch or a tag main lacks is refused by name; a clean one is restored" "a clone owns its refs; deleting the folder deletes them"
+
+# T-OGIT-SUDO-RERUN: `ogit worktree.remove` (no `sudo ./ogit`) must ask for sudo
+# by itself when the shared tree is not the caller's to change — sudo's PATH
+# has no ogit, so the user had to type `sudo ./ogit … "$base"` from ~/oosh.
+# A tree the caller owns (fixtures, a single-user host) runs directly.
+test.ogit.sudoRerun() {
+  local base bad="" fx self; base=$(test.ogit.base sudorerun); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  self=$(private.this.path.canonical "$OOSH_DIR/ogit")
+  ( SUDO="sudo "; private.ogit.root.check "$base" ) && bad="$bad own-tree-needs-root"
+  ( SUDO="";      private.ogit.root.check /usr )    && bad="$bad root-needs-root"
+  # A tree the caller does not own needs root — unless the caller IS root, who
+  # owns /usr: the platform test runs this suite as root too, and there no
+  # tree is foreign (red as root on almalinux_9, 2026-09-29).
+  if [ "$(id -u)" = "0" ]; then
+    ( SUDO="sudo "; private.ogit.root.check /usr )  && bad="$bad root-caller-needs-root"
+  else
+    ( SUDO="sudo "; private.ogit.root.check /usr )  || bad="$bad foreign-tree-no-root"
+  fi
+  # wiring: when root is needed, both converters hand over to sudo and change nothing themselves
+  local m
+  for m in worktree.remove worktree.restore; do
+    rm -f "$fx/sudo.call"
+    (
+      private.ogit.root.check() { return 0; }
+      sudo() { printf '%s\n' "$*" > "$fx/sudo.call"; return 0; }
+      "ogit.$m" "$base" >/dev/null 2>&1
+    ) || bad="$bad $m-rc"
+    [ "$(cat "$fx/sudo.call" 2>/dev/null)" = "$self $m $base" ] || bad="$bad $m-call=[$(cat "$fx/sudo.call" 2>/dev/null)]"
+  done
+  [ -f "$base/dev/.git" ] && [ -f "$base/prod/.git" ] || bad="$bad converted-without-sudo"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "own tree runs directly; a foreign tree re-runs the converter through sudo" || create.result 1 "sudo rerun:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-SUDO-RERUN: the converters ask for sudo themselves when the shared tree is not the caller's" test.ogit.sudoRerun
+expect 0 "own tree runs directly; a foreign tree re-runs the converter through sudo" "sudo's PATH has no ogit — users had to type sudo ./ogit … from ~/oosh"
+
+# T-OGIT-DELETED-CWD: the converters replace the folder the caller stands in
+# (the runbook runs them from ~/oosh = dev/). Plain `git` then dies with "Unable
+# to read current working directory": safeDirectory.list answered nothing and
+# safeDirectory.add failed mid-conversion (host round trip, 2026-09-25). Global
+# config and absolute clones do not need a working directory — they run at /.
+test.ogit.deletedCwd() {
+  local fx bad="" gone; fx=$(test.ogit.fixture deletedcwd)
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  gone="$fx/gone"; mkdir -p "$gone"
+  bad=$(
+    cd "$gone" && rmdir "$gone" || exit 0
+    b=""
+    ogit.safeDirectory.add "$fx/work" >/dev/null 2>&1 || b="$b add-rc"
+    ogit.safeDirectory.list | grep -qFx "$fx/work" || b="$b list-empty"
+    ogit.safeDirectory.add "$fx/work" >/dev/null 2>&1; [ "$(ogit.safeDirectory.list | grep -cFx "$fx/work")" = 1 ] || b="$b add-not-idempotent"
+    [ "$(ogit.config.get user.name "$fx/work")" = "" ] || true
+    ogit.repo.clone "$fx/origin.git" dev "$fx/clone" >/dev/null 2>&1 || b="$b clone-rc"
+    [ -d "$fx/clone/.git" ] || b="$b no-clone"
+    printf '%s' "$b"
+  )
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "global config and absolute clones work from a deleted working directory" || create.result 1 "deleted cwd:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-DELETED-CWD: safeDirectory.* and repo.clone survive a deleted working directory" test.ogit.deletedCwd
+expect 0 "global config and absolute clones work from a deleted working directory" "the runbook runs the converters from inside the folder they replace"
+
+# T-OGIT-CONVERTED-TREE-SHARED: a converted folder must be usable by every
+# dev-group user — group dev, group-writable, setgid dirs — the WORKING TREE too,
+# not only .git (the host's prod/ clone came out root:root, 2026-09-25).
+test.ogit.convertedTreeShared() {
+  private.this.group.exists dev || { create.result 0 "converted work trees are group dev, g+w, setgid"; return $(result); }
+  local base bad="" fx; base=$(test.ogit.base shtree); fx=$(dirname "$base")
+  local HOME XDG_CONFIG_HOME GIT_CONFIG_GLOBAL; test.ogit.gitconfig.isolate "$fx"
+  local HOME="$fx/home"; export HOME; mkdir -p "$HOME"
+  # an ignored file to carry: restoring it once copied the PRIVATE backup dir's
+  # own mode/owner (700, root under sudo) onto the folder — the host dev/ came
+  # out drwx------ root:root (round trip, 2026-09-25)
+  printf 'mine\n' > "$base/dev/ignored.txt"
+  ogit.worktree.remove "$base" >/dev/null 2>&1 || bad="$bad remove-rc"
+  [ "$(cat "$base/dev/ignored.txt" 2>/dev/null)" = mine ] || bad="$bad ignored-lost"
+  [ "$(stat -c %G "$base/dev" 2>/dev/null || stat -f %Sg "$base/dev")" = dev ] || bad="$bad folder-group"
+  case "$(ls -ld "$base/dev" | cut -c1-10)" in d???rws???) ;; *) bad="$bad folder-mode=[$(ls -ld "$base/dev" | cut -c1-10)]" ;; esac
+  [ "$(stat -c %G "$base/dev/file" 2>/dev/null || stat -f %Sg "$base/dev/file")" = dev ] || bad="$bad file-group"
+  case "$(ls -l "$base/dev/file" | cut -c1-10)" in -???rw????) ;; *) bad="$bad file-not-g+w" ;; esac
+  [ -g "$base/dev" ] || bad="$bad folder-not-setgid"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "converted work trees are group dev, g+w, setgid" || create.result 1 "converted tree:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-CONVERTED-TREE-SHARED: a converted folder's working tree is group dev, g+w, setgid" test.ogit.convertedTreeShared
+expect 0 "converted work trees are group dev, g+w, setgid" "every dev-group user must be able to update the checked-out files"
+
+
+# ============================================================================
+# T-OGIT-FETCHHEAD-SHARED: a fetch or pull in a SHARED repository leaves
+# FETCH_HEAD group-writable — and an unshared repository's stays private
+# ============================================================================
+# Found in the platform container (2026-10-01): in the shared dev.config clone
+# every file was group-writable except .git/FETCH_HEAD, which root's fetch at
+# install time had written -rw-r--r--. git applies core.sharedRepository to
+# what it creates through its shared-permission path, not to FETCH_HEAD, so no
+# other dev user could fetch or pull there again ("cannot open
+# '.git/FETCH_HEAD': Permission denied"). ls -l, not stat -c: portable.
+test.ogit.fetchHeadShared() {
+  local fx w bad="" fh
+  fx=$(test.ogit.fixture fetchhead); w="$fx/work"; fh="$(private.ogit.gitdir "$w")/FETCH_HEAD"
+  ogit.raw "$w" config core.sharedRepository group
+  ( umask 022; ogit.remote.fetch no "$w" >/dev/null 2>&1 ) || bad="$bad fetch-rc"
+  [ "$(ls -l "$fh" 2>/dev/null | cut -c6)" = w ] || bad="$bad fetch-not-group-writable=[$(ls -l "$fh" 2>/dev/null | cut -c1-10)]"
+  chmod 644 "$fh"
+  ( umask 022; ogit.remote.pull "" "" "$w" >/dev/null 2>&1 ) || bad="$bad pull-rc"
+  [ "$(ls -l "$fh" 2>/dev/null | cut -c6)" = w ] || bad="$bad pull-not-group-writable=[$(ls -l "$fh" 2>/dev/null | cut -c1-10)]"
+  rm -rf "$fx"
+  # not shared: the fix must never widen permissions nobody asked for
+  fx=$(test.ogit.fixture fetchheadprivate); w="$fx/work"; fh="$(private.ogit.gitdir "$w")/FETCH_HEAD"
+  ( umask 022; ogit.remote.fetch no "$w" >/dev/null 2>&1 ) || bad="$bad private-fetch-rc"
+  [ "$(ls -l "$fh" 2>/dev/null | cut -c6)" = - ] || bad="$bad private-widened=[$(ls -l "$fh" 2>/dev/null | cut -c1-10)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "shared: FETCH_HEAD group-writable after fetch and pull; unshared: left private" || create.result 1 "FETCH_HEAD:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-FETCHHEAD-SHARED: fetch/pull keep FETCH_HEAD group-writable in a shared repository only" test.ogit.fetchHeadShared
+expect 0 "shared: FETCH_HEAD group-writable after fetch and pull; unshared: left private" \
+  "root's fetch at install left FETCH_HEAD 644 in the shared clone; no other dev user could fetch there"
+
+console.log "
+Test: private.ogit.git.run
+===================================================================="
+
+# T-OGIT-SHARED-UMASK: git does not apply core.sharedRepository to every file
+# it writes — FETCH_HEAD came out -rw-r--r-- root:dev after root's install-time
+# pull in the shared dev/ clone (os platform.test ubuntu_24_04, 2026-09-25), and
+# every other dev-group user then failed `fetch` with "cannot open
+# .git/FETCH_HEAD: Permission denied". ogit runs git with umask 002 in a shared
+# repository, so whoever writes a file leaves it group-writable.
+test.ogit.sharedUmask() {
+  local fx w bad="" mode
+  fx=$(test.ogit.fixture sharedumask); w="$fx/work"
+  git -C "$w" config core.sharedRepository group
+  ( umask 022; ogit.remote.fetch no "$w" >/dev/null 2>&1 ) || bad="$bad shared-fetch-rc"
+  mode=$(ls -l "$w/.git/FETCH_HEAD" 2>/dev/null | cut -c1-10)
+  case "$mode" in -???rw????) ;; *) bad="$bad shared-FETCH_HEAD=[$mode]" ;; esac
+  # COMMIT_EDITMSG is the other file git writes with the caller's umask: after
+  # root committed in a shared folder, another dev user's commit there failed
+  # (found 2026-10-01 — FETCH_HEAD alone is also covered by fetchhead.share).
+  rm -f "$w/.git/COMMIT_EDITMSG"   # git rewrites an existing one in place, keeping its mode
+  ( umask 022; printf 'x\n' >> "$w/file"; ogit.index.add all "$w" >/dev/null 2>&1
+    ogit.commit.create "probe" t@t t "$w" >/dev/null 2>&1 ) || bad="$bad shared-commit-rc"
+  mode=$(ls -l "$w/.git/COMMIT_EDITMSG" 2>/dev/null | cut -c1-10)
+  case "$mode" in -???rw????) ;; *) bad="$bad shared-COMMIT_EDITMSG=[$mode]" ;; esac
+  git -C "$w" config --unset core.sharedRepository; rm -f "$w/.git/FETCH_HEAD"
+  ( umask 022; ogit.remote.fetch no "$w" >/dev/null 2>&1 )
+  mode=$(ls -l "$w/.git/FETCH_HEAD" 2>/dev/null | cut -c1-10)
+  case "$mode" in -rw-r--r--) ;; *) bad="$bad unshared-changed=[$mode]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a shared repository gets group-writable files from every ogit git call; others unchanged" || create.result 1 "shared umask:$bad"
+  return $(result)
+}
+test.case $level "T-OGIT-SHARED-UMASK: ogit writes group-writable files in a shared repository (FETCH_HEAD)" test.ogit.sharedUmask
+expect 0 "a shared repository gets group-writable files from every ogit git call; others unchanged" "another dev-group user must be able to fetch after root did"
+
+console.log "
+Test: private.ogit.umask.get
+===================================================================="
+
+test.ogit.umaskGet() {
+  local fx w bad=""; fx=$(test.ogit.fixture umaskget); w="$fx/work"
+  [ -z "$(private.ogit.umask.get "$w")" ] || bad="$bad unshared=[$(private.ogit.umask.get "$w")]"
+  ogit.raw "$w" config core.sharedRepository group
+  [ "$(private.ogit.umask.get "$w")" = 002 ] || bad="$bad group=[$(private.ogit.umask.get "$w")]"
+  ogit.raw "$w" config core.sharedRepository umask
+  [ -z "$(private.ogit.umask.get "$w")" ] || bad="$bad umask=[$(private.ogit.umask.get "$w")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "002 for a shared repository, nothing otherwise" || create.result 1 "umask.get:$bad"
+  return $(result)
+}
+test.case - "T-OGIT-UMASK-GET: 002 for a shared repository, nothing otherwise" \
+   test.ogit.umaskGet
+expect 0 "002 for a shared repository, nothing otherwise"
+
+
+console.log "
+Test: private.ogit.clone.gate
+===================================================================="
+
+test.case - "T-OGIT-CLONE-GATE-REQUIRES: no <folder> <mainDir> is refused" \
+   private.ogit.clone.gate 
+expect 1 "private.ogit.clone.gate requires <folder> <mainDir>"
+
+
+console.log "
+Test: ogit.stash.drop
+===================================================================="
+
+test.ogit.stashDrop() { # # a pop that conflicts keeps the stash; after the resolve, drop removes it and leaves the work tree as resolved; an empty stack is refused
+  local fx w bad="" rc res; fx=$(test.ogit.fixture stashdrop); w="$fx/work"
+  printf 'mine\n' > "$w/file"
+  ogit.stash.push "promote: pre-merge stash" "$w" >/dev/null 2>&1
+  printf 'theirs\n' > "$w/file"; test.ogit.commit "$w" theirs >/dev/null 2>&1
+  ogit.stash.pop "$w" >/dev/null 2>&1 && bad="$bad pop-did-not-conflict"
+  [ -n "$(ogit.stash.top.get "$w")" ] || bad="$bad conflict-lost-stash"
+  printf 'resolved\n' > "$w/file"; git -C "$w" add file
+  ogit.stash.drop "$w" >/dev/null 2>&1; rc=$? res="$RESULT"
+  [ -z "$(ogit.stash.top.get "$w")" ] || bad="$bad stash-left"
+  [ "$(cat "$w/file")" = resolved ] || bad="$bad work-tree-changed=[$(cat "$w/file")]"
+  ogit.stash.drop "$w" >/dev/null 2>&1 && bad="$bad empty-stack-dropped"
+  case "$RESULT" in (*"no stash to drop in $w"*) ;; (*) bad="$bad empty-result=[$RESULT]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] || { create.result 1 "stash.drop:$bad"; return $(result); }
+  create.result "$rc" "$res"
+  return $(result)
+}
+test.case - "T-OGIT-STASH-DROP: the top stash is dropped, the work tree is untouched" \
+   test.ogit.stashDrop
+expect 0 "stash dropped"
+
+### test.method
+
+# MANDATORY, and the last line of every test file. Without it the runner has no
+# score to read back and reports 0 / 0 — the assertions above run and count for
+# nothing. Twelve files in test/ were in exactly that state because this
+# template did not carry the line.
+test.suite.save.results
+

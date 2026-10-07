@@ -19,9 +19,9 @@ log.level $level
 # T1: user is callable
 # ============================================================================
 test.case $level "user is callable" \
-  which user
+  command -v user
 
-if which user &>/dev/null; then
+if command -v user >/dev/null 2>&1; then
   expect.pass "user found on PATH"
 else
   expect.fail "user should be on PATH"
@@ -345,9 +345,9 @@ bash -c '
   : > "$CONFIG"
   unset OS_CMD_USER_MOD OS_CMD_USER_DEL OS_CMD_USER_ADD OS_CMD_GROUP_ADD
   # OOSH_PM_UPDATED is the mechanism oo itself uses to say "the package index
-  # has already been refreshed" (oo:2961-2970). Without it, the incomplete
-  # cache this test DELIBERATELY plants sends private.user.init through
-  # `oo pm.discover` -> private.check.pm apt-get -> `$SUDO apt-get update`,
+  # has already been refreshed" (oo.cmd). Discovery only records the package
+  # manager; the refresh belongs to oo.cmd, once before its first real install.
+  # Without the variable, a real install here would run `$SUDO apt-get update`,
   # which reads the TTY directly: the >/dev/null 2>&1 below cannot suppress a
   # password prompt, so the whole file blocked forever on any host without
   # passwordless sudo. That is why test.user could never join `core`.
@@ -673,7 +673,7 @@ expect 0 "refused to overwrite" "these directories hold private keys; losing one
 
 
 console.log "
-Test 1 
+Test: T-USER-DEL-CMD
 ===================================================================="
 
 # ============================================================================
@@ -738,6 +738,368 @@ else
 fi
 
 rm -rf "$TUSR_DEL_STUB"
+
+# ============================================================================
+# T-USER-BASHRC-INSTALL: one .bashrc installer
+# ============================================================================
+# The oosh .bashrc used to be written by three hand copies (user.oosh.install,
+# config.init.user, oo root.installation.done), each with its own condition.
+# private.user.bashrc.install <targetHome> <?ooshDir> is the one writer: it
+# copies templates/user/bashrcTemplate when ~/.bashrc differs from it, keeps
+# the first original as ~/.bashrc.pre-oosh, and creates a .bash_profile that
+# sources .bashrc. Idempotent.
+test.user.bashrcInstall() {
+  local fx bad="" template="$OOSH_DIR/templates/user/bashrcTemplate"; fx=$(test.suite.fixture.make bashrcinstall)
+  printf 'mine\n' > "$fx/.bashrc"
+  private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1 || bad="$bad rc=$?"
+  cmp -s "$template" "$fx/.bashrc" || bad="$bad not-installed"
+  [ "$(cat "$fx/.bashrc.pre-oosh" 2>/dev/null)" = mine ] || bad="$bad no-backup"
+  grep -q '\.bashrc' "$fx/.bash_profile" 2>/dev/null || bad="$bad no-bash_profile"
+  private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1 || bad="$bad second-rc=$?"
+  cmp -s "$template" "$fx/.bashrc" || bad="$bad second-changed"
+  printf 'regressed\n' > "$fx/.bashrc"
+  private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1
+  cmp -s "$template" "$fx/.bashrc" || bad="$bad differing-not-repaired"
+  [ "$(cat "$fx/.bashrc.pre-oosh" 2>/dev/null)" = mine ] || bad="$bad first-backup-overwritten"
+  private.user.bashrc.install "" "$OOSH_DIR" >/dev/null 2>&1 && bad="$bad empty-home-passed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "bashrc.install: template when different, first original kept, .bash_profile, idempotent" || create.result 1 "bashrc.install:$bad"
+  return $(result)
+}
+test.case $level "T-USER-BASHRC-INSTALL: private.user.bashrc.install is the one .bashrc writer" test.user.bashrcInstall
+expect 0 "bashrc.install: template when different, first original kept, .bash_profile, idempotent" \
+  "three hand copies with three conditions left boot-sourcing bashrcs behind"
+
+# T-USER-LOGIN-KEEPS-TERM: user login hands the target a clean environment —
+# env -i — with ONE exception, TERM, which describes the terminal and not the
+# caller. `env -i su - <user>` left TERM=dumb: no colour (git status printed
+# plain), and less / vi / clear / tmux degraded. user.login is interactive, so
+# the probe runs the method's own `env -i …` line with `env` in place of `su`
+# and reads the environment that would be handed over.
+test.user.loginKeepsTerm() {
+  local bad="" line handed
+  line=$(declare -f user.login | grep "env -i")
+  [ -n "$line" ] || bad="$bad no-env-i"
+  case "$line" in *"su - "*) ;; *) bad="$bad no-login-shell" ;; esac
+  case "$line" in *'TERM="$(private.user.login.term.get)"'*) ;; *) bad="$bad term-not-from-the-getter" ;; esac
+  handed=$( set -- someUser; TERM=screen-256color; export TERM; export CALLER_LEAK=1
+            eval "${line%%su - *} env" 2>/dev/null )
+  [ "$handed" = "TERM=screen-256color" ] || bad="$bad handed=[$(printf "%s" "$handed" | tr "\n" " ")]"
+  [ "$(TERM=dumb private.user.login.term.get 2>/dev/null)" = xterm-256color ] || bad="$bad dumb"
+  [ "$( unset TERM; private.user.login.term.get 2>/dev/null)" = xterm-256color ] || bad="$bad unset"
+  [ -z "$bad" ] && create.result 0 "user login hands over TERM and nothing else; dumb or unset becomes xterm-256color" || create.result 1 "login:$bad"
+  return $(result)
+}
+test.case $level "T-USER-LOGIN-KEEPS-TERM: user login passes TERM through env -i and no other caller variable" test.user.loginKeepsTerm
+expect 0 "user login hands over TERM and nothing else; dumb or unset becomes xterm-256color" \
+  "env -i sh, then user login: the caller's TERM is already dumb — the shell had no colour"
+
+
+console.log "
+Test: T-USER-LOGIN-TERM-GET
+===================================================================="
+
+test.user.loginTermGet() {
+  local bad=""
+  [ "$(TERM=screen-256color private.user.login.term.get)" = screen-256color ] || bad="$bad real-term-changed"
+  [ "$(TERM=dumb private.user.login.term.get)" = xterm-256color ] || bad="$bad dumb"
+  [ "$(TERM= private.user.login.term.get)" = xterm-256color ] || bad="$bad empty"
+  [ -z "$bad" ] && create.result 0 "the caller's TERM, or xterm-256color for dumb/empty" || create.result 1 "term.get:$bad"
+  return $(result)
+}
+test.case $level "T-USER-LOGIN-TERM-GET: private.user.login.term.get keeps a real TERM, replaces dumb and empty" test.user.loginTermGet
+expect 0 "the caller's TERM, or xterm-256color for dumb/empty" "env -i sh leaves TERM=dumb for user login to pass on"
+
+# T-PRIVATE-AS-USER-SELF: switching to YOURSELF needs no switch at all. It went
+# through `sudo -H -u <me>`, so `config init.user` for the caller's own user
+# asked for the sudo password (found on a real host, 2026-09-30). A fake sudo
+# first on PATH records any call and fails: the command must still run, as the
+# caller, and sudo must never be asked.
+test.user.asUserSelf() {
+  local fx got; fx=$(test.suite.fixture.make asuserself)
+  printf '%s\n' '#!/bin/sh' "echo called > \"$fx/sudo.called\"" 'exit 1' > "$fx/sudo"
+  chmod +x "$fx/sudo"
+  got=$(PATH="$fx:$PATH" private.as.user "$(id -un)" sh -c 'echo "ran as $(id -un)"' 2>/dev/null)
+  if [ "$got" = "ran as $(id -un)" ] && [ ! -e "$fx/sudo.called" ]; then
+    create.result 0 "private.as.user: self runs directly, no sudo"
+  else
+    create.result 1 "private.as.user: got [$got] sudo-called=[$([ -e "$fx/sudo.called" ] && echo yes || echo no)]"
+  fi
+  rm -rf "$fx"
+  return $(result)
+}
+test.case $level "T-PRIVATE-AS-USER-SELF: private.as.user for the caller's own user runs directly, never sudo" test.user.asUserSelf
+expect 0 "private.as.user: self runs directly, no sudo" \
+  "config init.user for yourself asked for the sudo password"
+
+# ============================================================================
+# T-USER-OOSH-INSTALL-TRUST: one safeDirectory.ensure hop, no safeDirectory.add
+# ============================================================================
+# Clone layout (ogit plan, spec § 4): every folder under the base is its own
+# repository, so trusting the one $sharedOosh folder (plus its case-canonical
+# twin — two safeDirectory.add hops) left main/ and every other folder
+# untrusted for the new user. ONE hop through the preamble runs `ogit
+# safeDirectory.ensure` on the base. ogit folds the letter case itself (the
+# macOS string-match fix the second hop existed for), so user folds nothing by
+# hand. Structural: the positive path needs a new user.
+TUSR_TRUST_BODY=$(bash -c 'source this; source user; declare -f user.oosh.install' 2>/dev/null)
+TUSR_TRUST_ENSURE=$(printf '%s\n' "$TUSR_TRUST_BODY" | grep -c 'safeDirectory.ensure')
+TUSR_TRUST_ADD=$(printf '%s\n' "$TUSR_TRUST_BODY" | grep -c 'safeDirectory.add')
+TUSR_TRUST_FOLD=$(printf '%s\n' "$TUSR_TRUST_BODY" | grep -c 'private.this.path.case.get')
+# declare -f prints the hop's $'\n' as a real newline: the command is on the
+# line right after the preamble getter's.
+TUSR_TRUST_HOP=$(printf '%s\n' "$TUSR_TRUST_BODY" \
+  | grep -F -A1 'private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh"' \
+  | grep -cF "'\$sharedOosh/ogit' safeDirectory.ensure '\$(dirname \"\$sharedOosh\")'")
+test.case $level "T-USER-OOSH-INSTALL-TRUST: user.oosh.install trusts the base with one ensure hop" \
+  echo "ensure=$TUSR_TRUST_ENSURE add=$TUSR_TRUST_ADD hop=$TUSR_TRUST_HOP fold=$TUSR_TRUST_FOLD"
+if [ "$TUSR_TRUST_ENSURE" = 1 ] && [ "$TUSR_TRUST_ADD" = 0 ] && [ "$TUSR_TRUST_HOP" = 1 ] && [ "$TUSR_TRUST_FOLD" = 0 ]; then
+  expect.pass "one preamble hop runs ogit safeDirectory.ensure on the base; no safeDirectory.add, no hand-folded case left"
+else
+  expect.fail "expected 1 ensure hop through the preamble on the base, 0 safeDirectory.add and 0 private.this.path.case.get, got ensure=$TUSR_TRUST_ENSURE add=$TUSR_TRUST_ADD hop=$TUSR_TRUST_HOP fold=$TUSR_TRUST_FOLD"
+fi
+
+# T-USER-PROMPT-HOST-NAME: the prompt shows the oosh name of the computer after @ too
+# [oosh jolly_gagarin] bash-user@jolly_gagarin — a running container's system
+# host name is its ID and cannot change; the oosh name can (\h when it is empty).
+test.user.promptHostName() {
+  local t="$OOSH_DIR/templates/user/bashrcTemplate" bad=""
+  [ "$(grep -cF '@\[\e[32m\]\${OOSH_SSH_CONFIG_HOST:-\h}:' "$t")" = 2 ] || bad="$bad oosh-name-after-@"
+  grep -qF '@\[\e[32m\]\h:' "$t" && bad="$bad raw-\\h"
+  [ -z "$bad" ] && create.result 0 "both prompts show the oosh name after @" || create.result 1 "prompt:$bad"
+  return $(result)
+}
+test.case $level "T-USER-PROMPT-HOST-NAME: the prompt shows the oosh name of the computer after @ too" test.user.promptHostName
+expect 0 "both prompts show the oosh name after @" "bash-user@2a1023f6d45b showed the container's ID"
+
+# T-USER-INSTALL-SOCKET-GROUP: the install adds every user to the docker socket's group
+# A platform container has the host's socket but no docker program at install
+# time, so `command -v docker` skipped the group; the first odocker call then
+# needed a new membership — and Alpine has no sg to apply it (2026-10-06).
+test.user.installSocketGroup() {
+  local fx bad=""; fx=$(test.suite.fixture.make usersocketgroup); : > "$fx/docker.sock"
+  FX="$fx" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+    command() { if [ "$1" = -v ] && [ "$2" = docker ]; then return 1; fi; builtin command "$@"; }
+    private.odocker.socket.get() { echo "$FX/docker.sock"; }
+    private.odocker.socket.group.ensure() { create.result 0 "docker"; return 0; }
+    user.group.add() { echo "group.add $*" >> "$FX/log"; }
+    private.user.oosh.install.groups.linux someuser >/dev/null 2>&1' >/dev/null 2>&1
+  grep -qx 'group.add docker someuser' "$fx/log" 2>/dev/null || bad="$bad not-added=[$(cat "$fx/log" 2>/dev/null)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a user joins the socket's group at install" || create.result 1 "install socket group:$bad"
+  return $(result)
+}
+test.case $level "T-USER-INSTALL-SOCKET-GROUP: the install adds every user to the docker socket's group" test.user.installSocketGroup
+expect 0 "a user joins the socket's group at install" "the first odocker call needed a new membership, Alpine has no sg"
+
+# T-USER-INSTALL-SOCKET-GROUP-OVER-DOCKER: with a socket the install joins the socket's group, also when a docker program is there
+# An image that ships a docker CLI, with the host's socket mounted under
+# another number: the install put every user in the local group docker, which
+# does not own the socket (2026-10-06). docker only when there is no socket.
+test.user.installSocketGroupOverDocker() {
+  local fx bad=""; fx=$(test.suite.fixture.make usersocketoverdocker)
+  test.user.installSocketGroupOverDocker.run() { # <socket present: yes|no>
+    rm -f "$fx/docker.sock" "$fx/log"; [ "$1" = yes ] && : > "$fx/docker.sock"
+    FX="$fx" bash -c '
+      source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+      command() { if [ "$1" = -v ] && [ "$2" = docker ]; then return 0; fi; builtin command "$@"; }
+      private.odocker.socket.get() { echo "$FX/docker.sock"; }
+      private.odocker.socket.group.ensure() { echo "socket.group.ensure" >> "$FX/log"; create.result 0 "dockerhost"; return 0; }
+      user.group.add() { echo "group.add $*" >> "$FX/log"; }
+      private.user.oosh.install.groups.linux someuser >/dev/null 2>&1' >/dev/null 2>&1
+    grep '^group.add ' "$fx/log" 2>/dev/null | tr '\n' '|'
+  }
+  [ "$(test.user.installSocketGroupOverDocker.run yes)" = "group.add dockerhost someuser|" ] || bad="$bad socket=[$(test.user.installSocketGroupOverDocker.run yes)]"
+  [ "$(test.user.installSocketGroupOverDocker.run no)" = "group.add docker someuser|" ] || bad="$bad no-socket=[$(test.user.installSocketGroupOverDocker.run no)]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the socket's group when a socket is there, docker only without one" || create.result 1 "install socket group over docker:$bad"
+  return $(result)
+}
+test.case $level "T-USER-INSTALL-SOCKET-GROUP-OVER-DOCKER: with a socket the install joins the socket's group, also when docker is installed" test.user.installSocketGroupOverDocker
+expect 0 "the socket's group when a socket is there, docker only without one" \
+  "an image with a docker CLI put every user in the local docker group, which does not own the socket"
+
+# T-USER-INSTALL-SOCKET-GROUP-ROOT: a docker socket of root's group (number 0) — the install adds the user to no group
+# Docker Desktop's socket seen inside a container, a rootful podman or snap
+# socket: root:root. odocker's socket.group.ensure answered root and the
+# install added the oosh user to it (review, 2026-10-06). The real
+# socket.group.ensure decides here; stat and getent answer from the fixture.
+test.user.installSocketGroupRoot() {
+  local fx bad="" realStat; fx=$(test.suite.fixture.make usersocketroot); : > "$fx/docker.sock"; mkdir -p "$fx/bin"
+  realStat=$(command -v stat)
+  printf '%s\n' '#!/bin/sh' 'case "$*" in *"$FX/docker.sock") echo 0; exit 0 ;; esac' "exec $realStat \"\$@\"" > "$fx/bin/stat"
+  printf '%s\n' '#!/bin/sh' 'case "$2" in 0|root) echo "root:x:0:" ;; *) exit 2 ;; esac' > "$fx/bin/getent"
+  chmod +x "$fx/bin/stat" "$fx/bin/getent"
+  FX="$fx" ODOCKER_SOCKET="$fx/docker.sock" PATH="$fx/bin:$PATH" bash -c '
+    OSTYPE=linux-gnu
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+    command() { if [ "$1" = -v ] && [ "$2" = docker ]; then return 0; fi; builtin command "$@"; }
+    user.group.add() { echo "group.add $*" >> "$FX/log"; }
+    private.user.oosh.install.groups.linux someuser >/dev/null 2>&1' >/dev/null 2>&1
+  [ -s "$fx/log" ] && bad="$bad added=[$(tr '\n' '|' < "$fx/log")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a socket of root's group: the install adds the user to no group" || create.result 1 "install socket of root's group:$bad"
+  return $(result)
+}
+test.case $level "T-USER-INSTALL-SOCKET-GROUP-ROOT: a docker socket of root's group (number 0) — the install adds the user to no group" test.user.installSocketGroupRoot
+expect 0 "a socket of root's group: the install adds the user to no group" \
+  "a socket owned by root:root made the install add the oosh user to group root"
+
+# T-USER-GROUP-MEMBER-PENDING: a membership this process does not have yet
+# odocker re-ran a call under sg whenever the group DATABASE listed the group —
+# also when this shell had it already and docker failed for another reason;
+# without sg (Alpine) it then said "log out and back in" on every call. $USER
+# can be unset under `docker exec`: the user is `id -un` (2026-10-06).
+test.user.groupMemberPending() {
+  local bad=""
+  test.user.groupMemberPending.run() { # <database groups of tester> <groups of this process> <?user>
+    ( DB="$1"; PROC="$2"; unset USER
+      id() { case "$*" in -un) echo tester ;; -nG) echo "$PROC" ;; "-nG tester") echo "$DB" ;; *) return 1 ;; esac; }
+      private.user.group.member.pending docker ${3:+"$3"} ); echo $?
+  }
+  [ "$(test.user.groupMemberPending.run "tester" "tester")" = 1 ] || bad="$bad not-a-member"
+  [ "$(test.user.groupMemberPending.run "tester docker" "tester")" = 0 ] || bad="$bad pending-missed"
+  [ "$(test.user.groupMemberPending.run "tester docker" "tester docker")" = 1 ] || bad="$bad effective-is-pending"
+  [ "$(test.user.groupMemberPending.run "tester docker" "tester" tester)" = 0 ] || bad="$bad named-user"
+  [ "$(test.user.groupMemberPending.run "tester dockerx" "tester")" = 1 ] || bad="$bad partial-name"
+  [ -z "$bad" ] && create.result 0 "pending only when the database has the group and this process does not" || create.result 1 "member pending:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-MEMBER-PENDING: a membership this process does not have yet" test.user.groupMemberPending
+expect 0 "pending only when the database has the group and this process does not" \
+  "odocker said log out and back in on every call when docker failed for another reason"
+
+# T-USER-GROUP-ADD-IDEMPOTENT: an existing member is left alone — no sudo, no membership command
+# user.group.add ran `$SUDO usermod` (Alpine: addgroup, macOS: dseditgroup) also
+# for a user who was a member already. config.init.user adds every user to dev
+# on every oo update and oo user.fix: a user without passwordless sudo was asked
+# for a password each time, for nothing (2026-10-06). Every program it may call
+# is a recording stub on a fixture PATH; the group database is a fixture file.
+test.user.groupAdd.run() { # <fx> <OS_CMD_USER_MOD> <groups of tester> <existing groups>
+  local fx="$1" b="$1/bin" name
+  rm -rf "$b" "$fx/calls"; mkdir -p "$b"
+  printf '%s\n' "$3" > "$fx/db"; printf '%s\n' $4 > "$fx/groups"
+  printf '#!/bin/sh\ncase "$*" in -un) echo tester ;; "-nG tester") cat "$FX/db" ;; *) exec /usr/bin/id "$@" ;; esac\n' > "$b/id"
+  printf '#!/bin/sh\nc="${1##*/}"; shift; echo "sudo $c $*" >> "$FX/calls"; exec "$c" "$@"\n' > "$b/sudo"
+  printf '#!/bin/sh\necho "usermod $*" >> "$FX/calls"; [ "$1 $2" = "-a -G" ] && echo "$(cat "$FX/db") $3" > "$FX/db"; exit 0\n' > "$b/usermod"
+  printf '#!/bin/sh\necho "addgroup $*" >> "$FX/calls"; [ $# = 2 ] && echo "$(cat "$FX/db") $2" > "$FX/db"; exit 0\n' > "$b/addgroup"
+  printf '#!/bin/sh\necho "groupadd $*" >> "$FX/calls"; echo "$1" >> "$FX/groups"; exit 0\n' > "$b/groupadd"
+  printf '#!/bin/sh\necho "dseditgroup $*" >> "$FX/calls"; exit 0\n' > "$b/dseditgroup"
+  printf '#!/bin/sh\n[ "$1" = group ] && grep -qx "$2" "$FX/groups"\n' > "$b/getent"
+  printf '#!/bin/sh\ngrep -qx "${3#/Groups/}" "$FX/groups"\n' > "$b/dscl"
+  for name in id sudo usermod addgroup groupadd dseditgroup getent dscl; do chmod +x "$b/$name"; done
+  FX="$fx" USERMOD="$2" PATH="$b:$PATH" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/user" >/dev/null 2>&1
+    export SUDO="sudo " OOSH_OS=linux-gnu OS_CMD_USER_MOD="$USERMOD" OS_CMD_GROUP_ADD=groupadd
+    user.group.add ooshtestgrp tester >/dev/null 2>&1; echo "rc=$?" >> "$FX/calls"
+    user.group.add ooshtestgrp tester >/dev/null 2>&1; echo "rc=$?" >> "$FX/calls"' >/dev/null 2>&1
+  tr '\n' '|' < "$fx/calls" 2>/dev/null
+}
+test.user.groupAddIdempotent() {
+  local fx bad="" got; fx=$(test.suite.fixture.make usergroupadd)
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester ooshtestgrp" "ooshtestgrp")
+  [ "$got" = "rc=0|rc=0|" ] || bad="$bad member=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester" "ooshtestgrp")
+  [ "$got" = "sudo usermod -a -G ooshtestgrp tester|usermod -a -G ooshtestgrp tester|rc=0|rc=0|" ] || bad="$bad usermod=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "addgroup" "tester" "ooshtestgrp")
+  [ "$got" = "sudo addgroup tester ooshtestgrp|addgroup tester ooshtestgrp|rc=0|rc=0|" ] || bad="$bad alpine=[$got]"
+  got=$(test.user.groupAdd.run "$fx" "usermod -a -G" "tester" "")
+  [ "$got" = "sudo groupadd ooshtestgrp|groupadd ooshtestgrp|sudo usermod -a -G ooshtestgrp tester|usermod -a -G ooshtestgrp tester|rc=0|rc=0|" ] || bad="$bad new-group=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a member is left alone, a non-member is added once" || create.result 1 "group.add:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-ADD-IDEMPOTENT: an existing member is left alone — no sudo, no membership command" test.user.groupAddIdempotent
+expect 0 "a member is left alone, a non-member is added once" \
+  "config.init.user ran sudo usermod for dev on every oo update — a password prompt for nothing"
+
+# T-USER-GROUP-MEMBER-IS: membership per the group database, whole names only
+test.user.groupMemberIs() {
+  local bad=""
+  test.user.groupMemberIs.run() { # <database groups of tester> <?user>
+    ( DB="$1"; unset USER
+      id() { case "$*" in -un) echo tester ;; "-nG tester") echo "$DB" ;; *) return 1 ;; esac; }
+      private.user.group.member.is docker ${2:+"$2"} ); echo $?
+  }
+  [ "$(test.user.groupMemberIs.run "tester docker")" = 0 ] || bad="$bad member-missed"
+  [ "$(test.user.groupMemberIs.run "tester docker" tester)" = 0 ] || bad="$bad named-user"
+  [ "$(test.user.groupMemberIs.run "tester")" = 1 ] || bad="$bad not-a-member"
+  [ "$(test.user.groupMemberIs.run "tester dockerx")" = 1 ] || bad="$bad partial-name"
+  [ "$(test.user.groupMemberIs.run "tester docker" nobodyelse)" = 1 ] || bad="$bad unknown-user"
+  [ -z "$bad" ] && create.result 0 "a member only when the database lists the whole group name" || create.result 1 "member is:$bad"
+  return $(result)
+}
+test.case $level "T-USER-GROUP-MEMBER-IS: membership per the group database, whole names only" test.user.groupMemberIs
+expect 0 "a member only when the database lists the whole group name" "user.group.add asked nobody and ran usermod every time"
+
+# T-USER-BASHRC-NO-CMP: without cmp an identical .bashrc is left alone
+# cmp is diffutils, which AlmaLinux minimal does not ship: its rc 127 read as
+# "differs", and every oo update copied the template over an identical
+# .bashrc. The comparison is the kernel's private.this.file.same.
+test.user.bashrcNoCmp() {
+  local fx bad="" inode out; fx=$(test.suite.fixture.make userbashrcnocmp)
+  cp "$OOSH_DIR/templates/user/bashrcTemplate" "$fx/.bashrc"; : > "$fx/.bash_profile"
+  touch -t 202001010000 "$fx/.bashrc"; touch -t 202001010100 "$fx/stamp"; inode=$(ls -i "$fx/.bashrc" | cut -d' ' -f1)
+  out=$(
+    command() { [ "$1 $2" = "-v cmp" ] && return 1; builtin command "$@"; }
+    cmp() { return 127; }   # the program is not there
+    private.user.bashrc.install "$fx" "$OOSH_DIR" >/dev/null 2>&1; echo "rc=$? $RESULT")
+  case "$out" in "rc=0 "*"is the oosh template"*) ;; *) bad="$bad result=[$out]" ;; esac
+  [ "$fx/.bashrc" -nt "$fx/stamp" ] && bad="$bad rewritten"
+  [ "$(ls -i "$fx/.bashrc" | cut -d' ' -f1)" = "$inode" ] || bad="$bad new-inode"
+  [ -e "$fx/.bashrc.pre-oosh" ] && bad="$bad backup-made"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an identical .bashrc is left alone without cmp" || create.result 1 "bashrc no cmp:$bad"
+  return $(result)
+}
+test.case $level "T-USER-BASHRC-NO-CMP: without cmp an identical .bashrc is left alone" test.user.bashrcNoCmp
+expect 0 "an identical .bashrc is left alone without cmp" \
+  "AlmaLinux minimal has no cmp — every oo update copied the template over an identical .bashrc"
+
+# T-USER-SOURCE-NO-SUDO: sourcing user without an os.commands.env heals it and calls no sudo
+# private.user.init runs oo pm.discover when $CONFIG_PATH/os.commands.env is
+# missing or incomplete, and discovery ran "$SUDO apt-get update": merely
+# sourcing user asked for a sudo password on an apt host — a new user's first
+# shell, every test with an isolated config (2026-10-06). The fixture host has
+# a recording apt-get and sudo and no other package manager.
+test.user.sourceNoSudo() {
+  local fx bad="" name
+  fx=$(test.suite.fixture.make usersourcenosudo)
+  mkdir -p "$fx/bin" "$fx/config/stateMachines" "$fx/home"
+  : > "$fx/calls"; : > "$fx/config/user.env"; : > "$fx/config/result.env"; : > "$fx/config/error.txt"
+  printf '#!/bin/sh\necho "sudo $*" >> "$FX/calls"; exec "$@"\n' > "$fx/bin/sudo"
+  printf '#!/bin/sh\necho "apt-get $*" >> "$FX/calls"; exit 0\n' > "$fx/bin/apt-get"
+  chmod +x "$fx/bin/sudo" "$fx/bin/apt-get"
+  test.user.sourceNoSudo.run() {
+    FX="$fx" env -u OOSH_NO_INSTALL -u OOSH_PM -u OOSH_PM_UPDATED -u OOSH_APT_UPDATED \
+      -u OS_CMD_USER_ADD -u OS_CMD_USER_DEL -u OS_CMD_USER_MOD -u OS_CMD_GROUP_ADD \
+      PATH="$fx/bin:$PATH" HOME="$fx/home" SUDO="sudo " CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env" bash -c '
+        command() {
+          if [ "$1" = -v ]; then
+            case "$2" in brew|apt-get|dnf|yum|apk|dpkg|pkg|pacman) [ -x "$FX/bin/$2" ] && echo "$FX/bin/$2"; return ;; esac
+          fi
+          builtin command "$@"
+        }
+        export -f command
+        source "$OOSH_DIR/this" >/dev/null 2>&1; export SUDO="sudo "; source "$OOSH_DIR/user" >/dev/null 2>&1' </dev/null >/dev/null 2>&1
+  }
+  test.user.sourceNoSudo.run
+  [ -s "$fx/calls" ] && bad="$bad first=[$(tr '\n' '|' < "$fx/calls")]"
+  for name in OS_CMD_USER_ADD OS_CMD_USER_DEL OS_CMD_USER_MOD OS_CMD_GROUP_ADD; do
+    grep -q "$name=" "$fx/config/os.commands.env" 2>/dev/null || bad="$bad no-$name"
+  done
+  touch -t 202001010000 "$fx/config/os.commands.env" 2>/dev/null; touch -t 202001010100 "$fx/stamp"; : > "$fx/calls"
+  test.user.sourceNoSudo.run
+  [ -s "$fx/calls" ] && bad="$bad second=[$(tr '\n' '|' < "$fx/calls")]"
+  [ "$fx/config/os.commands.env" -nt "$fx/stamp" ] && bad="$bad discovered-again"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the cache is healed, no sudo, a second source discovers nothing" || create.result 1 "source user:$bad"
+  return $(result)
+}
+test.case $level "T-USER-SOURCE-NO-SUDO: sourcing user without an os.commands.env heals it and calls no sudo" test.user.sourceNoSudo
+expect 0 "the cache is healed, no sudo, a second source discovers nothing" \
+  "sourcing user on an apt host ran sudo apt-get update — a password prompt in a new shell"
 
 ### test.method
 

@@ -266,10 +266,24 @@ scriptname.start "$@"  # Entry point
 
 When a script like `myScript` boots, dependencies load in this order:
 
-An interactive login shell boots via `$OOSH_DIR/boot` (from `bashrcTemplate`),
-which sets the anchors (`OOSH_DIR`, `CONFIG_PATH`, `OOSH_USER_CONFIG_PATH`),
-sources the pure-data env chain, builds PATH, and loads `log` — see
-[boot.md](boot.md). A script invoked directly boots via `source this`:
+The boot order is **bash → this → log → debug → config → every other oosh
+command**, from any entry — an empty shell (`env -i sh`) included:
+
+- **`bash`** reads `~/.bashrc` (`bashrcTemplate`) even without `HOME` (`~` reads
+  the password database). An old bash — macOS `/bin/bash` 3.2 from the system
+  PATH — first hands over to the config's `BASH_FILE`; then `.bashrc` runs
+  `unset CONFIG; source ~/oosh/this`.
+- **`this`** from an empty shell is found on the system PATH:
+  `/usr/local/bin/this` (`templates/user/thisLauncher`, installed by the
+  install, `oo update`, `oo user.fix`) recovers `HOME` from the OS identity and
+  starts the caller's own `~/oosh/this`. `this <method>` runs the method and
+  returns; plain `this` enters an interactive oosh bash and writes only the
+  user's own `user.session.env`.
+- **`this`** itself derives `HOME` when it is missing, then reads
+  `~/config/user.env`: the shared anchors and chains, and last the user's own
+  `~/.config/oosh/user.session.env` with their real PATH — see
+  [config.md § The PATH line](config.md#the-path-line). A script invoked
+  directly starts the same way, via `source this`:
 
 ```
 1. myScript.start "$@"
@@ -277,12 +291,13 @@ sources the pure-data env chain, builds PATH, and loads `log` — see
 2. source this                    # OOSH kernel
    │
    ├─ this.init                   # Initialize environment
-   │   ├─ Sets OOSH_DIR, CONFIG_PATH, OOSH_USER_CONFIG_PATH
+   │   ├─ Sets OOSH_DIR, CONFIG_PATH
    │   └─ . $CONFIG               # Load user.env (pure data)
    │       ├─ . oosh.env          # OOSH configuration
-   │       └─ . log.env           # Log configuration
-   │           └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
-   │   (PATH is built by boot/this, NOT persisted in the env files)
+   │       ├─ . log.env           # Log configuration
+   │       │   └─ . log.session.env   # per-user LOG_NAME/DEVICE/LIVE
+   │       └─ . user.session.env  # per-user real PATH + OOSH_MODE (last)
+   │   (PATH is one data line there; this de-duplicates it)
    │
    └─ Defines: this.start, this.call, this.load, this.functionExists
    │
@@ -307,7 +322,7 @@ source $OOSH_DIR/debug
 # debug line 1: source $OOSH_DIR/log
 
 # log provides: info.log, error.log, debug.log, etc.
-# debug provides: step(), stackTrace(), setTrap(), etc.
+# debug provides: debug.step(), debug.stackTrace(), debug.setTrap(), etc.
 
 # Dependency chain:
 # myScript → debug → log → (log.env for colors/levels)
@@ -362,7 +377,41 @@ The file `this` is the OOSH kernel. It provides:
 | `this.functionExists` | Checks if a function is defined |
 | `this.isSourced` | Detects if script was sourced vs executed |
 | `this.init` | Initializes oosh environment |
-| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that never source `boot` — `boot` owns the PATH ([boot.md](boot.md)) |
+| `this.path.add` | Prepends a directory to **this process's** PATH, de-duping by whole segment. A bootstrap helper for contexts that have not read `~/config/user.env` — the login PATH is data there ([config.md § The PATH line](config.md#the-path-line)) |
+
+### Kernel helpers
+
+Private methods of `this` that own a platform difference or a repeated idiom, so
+no script hand-writes it. Use them instead of the raw command (one line each,
+from the method's own docstring; getters are consumed as `$(…)`, predicates
+answer by rc):
+
+| Method | What it does |
+|---|---|
+| `private.this.container.is <?root:/>` | rc 0 when this computer is a container: `<root>/.dockerenv` (Docker) or `<root>/run/.containerenv` (Podman) exists |
+| `private.this.group.create <group> <?gid>` | create a system group if it does not exist, with number `<gid>` when given; idempotent; through `$SUDO`; the first that exists of groupadd, addgroup, dseditgroup, once — its failure is the answer; only when none exists an append to the group file, never with a number another group holds |
+| `private.this.group.file.get` | echo the group file that last-resort append may write: `/etc/group`; nothing (rc 1) on macOS, where Directory Services ignores it |
+| `private.this.group.name.get <gid>` | echo the name of the group with number `<gid>`: getent where present, else `/etc/group`, dscl on macOS; nothing when there is none |
+| `private.this.path.stat.get <path> <owner\|group\|uid\|gid\|mode>` | echo one stat field of the path itself (a symlink not followed); GNU format first, else BSD, both from one table; nothing and rc 1 for a missing path or an unknown field |
+| `private.this.file.same <fileA> <fileB>` | rc 0 when both files exist with identical bytes: `cmp -s` where it exists, else an exact `od` byte dump of each (AlmaLinux minimal has no diffutils) |
+| `private.this.host.name.get <?form:full\|short>` | echo the host name: the `hostname` program when it exists, else bash's `$HOSTNAME`; `short` is up to the first dot |
+| `private.this.temp.dir.get <?label:oosh>` | echo the canonical path of a new private directory (mode 700) under `TMPDIR`, else `/tmp`; the caller removes it (tests use `test.suite.fixture.make`) |
+| `private.this.env.export.line.get <variableName> <value>` | echo one pure-data `export NAME="value"` line, quoted by bash; rc 1 for a control character, a `$(` or backtick (the validator rejects them), or a `$'…'` rendering — the rule `config save` and `log.session.save` share |
+| `private.this.device.is.terminal <device>` | rc 0 when a log device is terminal-type (unset, fd 1, fd 2, the tty) — the one list `info.log` and `log`'s emitter ask |
+| `private.this.path.canonical <path>` | echo the canonical absolute path; GNU `readlink -f` or the BSD fallback |
+| `private.this.path.case.get <path>` | echo the path in the file system's canonical letter case (macOS: osascript POSIX path, trailing `/` dropped); the path unchanged when osascript is absent or fails |
+| `private.this.script.load <script> <probeFn>` | source `$OOSH_DIR/<script>` into this shell once, unless `<probeFn>` is already a function; `this` is saved and restored around the source; rc 0 when `<probeFn>` is a function afterwards |
+| `private.this.folder.entries.copy <from> <to>` | copy every entry of `<from>` (dotfiles included) into `<to>`, keeping relative paths — never `<from>/.` itself, whose mode and owner would land on `<to>`; rc 1 names the entries that failed |
+| `private.this.folder.share <dir>` | share `<dir>` with group dev: `private.ensure.sharedTree` (chgrp dev, g+w) plus setgid on every directory so new files inherit the group; rc 0 without a dev group; never chown |
+| `private.this.symlink.with.backup <linkPath> <target> <ts>` | ensure `<linkPath>` is a symlink to `<target>`; a pre-existing real entry is kept as `<linkPath>.orig.<ts>`; idempotent; fails loud on every step |
+| `private.this.tree.tracked.check <treeRoot> <?caller:sweep>` | rc 0 when git lists tracked files under `<treeRoot>`; else an `INVALID:` verdict on stdout and rc 2 — the one guard of the four tree validators, so a sweep that reads nothing (no repository, nothing tracked, "dubious ownership") never reports OK |
+| `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate` and `test.suite.portability.validate`, which keep their own rules and summaries |
+
+`config` owns two more for its shared env files: `private.config.env.lines.drop <file> <prefix…>`
+(drop every line starting with a prefix, in place, owner/group/mode kept; an unchanged file is
+not rewritten; rc 1 when it cannot be written) and `private.config.env.line.append <file> <line>`
+(append the line unless it is already there, in place; rc 1 when it cannot be written) — see
+[config.md § Internal Functions](config.md#internal-functions).
 
 ### Method Dispatch Chain
 
@@ -410,6 +459,7 @@ this.call() {
 | `ossh` | SSH key/config management |
 | `state` | State machine for multi-step workflows |
 | `user` | User and SSH identity management |
+| `ogit` | The only git caller; [docs/ogit.md](ogit.md) |
 
 ---
 
@@ -419,7 +469,7 @@ this.call() {
 
 ```
 ~/config/
-├── user.env          # Main user configuration (PATH, exports)
+├── user.env          # Main user configuration (anchors, chain lines; no PATH)
 ├── oosh.env          # OOSH-specific variables
 ├── log.env           # Logging configuration
 ├── setup.color.env   # Terminal color definitions
@@ -430,29 +480,37 @@ this.call() {
 ### user.env Structure
 
 Env files are **pure data** now — only `export KEY="VALUE"` and `.`-chain lines,
-no logic. The per-user/volatile anchors (`OOSH_DIR`, `CONFIG`, `CONFIG_PATH`,
-`PATH`) are **not** persisted here; `$OOSH_DIR/boot` computes them fresh each
-shell (see [boot.md](boot.md)). `config.validate` enforces the no-logic rule.
+no logic. The anchors (`CONFIG_PATH`, `CONFIG`, `OOSH_DIR`) are written as the
+`"$HOME/…"` constants. The shared `user.env` holds no PATH: the user's real PATH
+and `OOSH_MODE` live in per-user files under `$HOME/.config/oosh`, chained as the
+last line of each shared file (`config session.save`). So the shared files are right
+for every user (see [config.md § The anchor rule](config.md#the-anchor-rule)).
+`config.validate` enforces the no-logic rule.
 
 ```bash
 # ~/config/user.env  — portable data + POSIX `.` source chain
-export BASH_FILE="/usr/local/bin/bash"
+export CONFIG_PATH="$HOME/config"
 export CONFIG_FILE="user.env"
+export CONFIG="$HOME/config/user.env"
+export BASH_FILE="/usr/local/bin/bash"
 
 . $CONFIG_PATH/oosh.env
 . $CONFIG_PATH/log.env
+. $HOME/.config/oosh/user.session.env   # per-user: the real absolute PATH
 ```
 
+`oosh.env` ends the same way, with `. $HOME/.config/oosh/oosh.session.env`
+(per-user `OOSH_MODE`, the branch the user's own `~/oosh` points at).
 `log.env` in turn chains the per-user session file:
 
 ```bash
 # ~/config/log.env  (shared)
 export LOG_LEVEL="1"
 export LOG_LEVEL_RESET="1"
-. $OOSH_USER_CONFIG_PATH/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
+. $HOME/.config/oosh/log.session.env   # per-user LOG_NAME/LOG_DEVICE/LOG_LIVE
 ```
 
-Note POSIX `.` (not the bash `source` builtin) so `boot` parses under dash/ash.
+Note POSIX `.` (not the bash `source` builtin) so dash/ash shells can source the chain.
 
 ---
 
@@ -506,7 +564,7 @@ See [docs/log.md](log.md) for complete documentation.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [boot.md](boot.md)) | `~/oosh` |
+| `OOSH_DIR` | Root oosh directory — **always** `~/oosh`, the symlink itself (see [config.md § The anchor rule](config.md#the-anchor-rule)) | `~/oosh` |
 | `CONFIG` | Path to user.env | `~/config/user.env` |
 | `CONFIG_PATH` | Config directory | `~/config` |
 | `LOG_LEVEL` | Logging verbosity (0-6) | `3` |
@@ -626,7 +684,7 @@ $OOSH_DIR/
 # Enable step debugging
 export STEP_DEBUG=ON
 source debug
-setTrap
+debug.setTrap
 
 # Check function existence
 type -t scriptname.method
@@ -698,7 +756,7 @@ Verified by `T-THIS-SUDO-SELF-HEAL` (test/test.oo).
 
 In multi-user installs (`~/config` is a shared symlink), the per-user log vars
 must never leak into the shared config. `LOG_LIVE` (and `LOG_NAME`/`LOG_DEVICE`)
-live in the **per-user** `$OOSH_USER_CONFIG_PATH/log.session.env` (default
+live in the **per-user** `$HOME/.config/oosh/log.session.env` (default
 `~/.config/oosh/log.session.env`), not in the shared `~/config/log.env`;
 `config.save` filters them out of the shared tier. See [Log System](log.md) and
 [config.md § two config tiers](config.md) for the read+write defenses.

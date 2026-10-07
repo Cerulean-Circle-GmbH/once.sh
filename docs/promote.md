@@ -9,6 +9,28 @@ The `promote` script implements a gated promotion pipeline (dev → testing → 
 - Uses the oosh `state` machine framework for resumable, step-by-step advancement
 - `oo` provides thin wrappers (`oo dev.to.testing`, `oo release`, etc.) that delegate to `promote`
 
+## Where the merge happens — each stage in its own folder
+
+Since the clone layout ([oo.md § The clone layout](oo.md#the-clone-layout); ogit plan, Task 24) every stage is its own folder under the components base: `<base>/dev`, `<base>/testing`, `<base>/prod`. `promote` merges, tags and pushes **inside the target stage's folder** (found with `ogit worktree.find <target>`, which also finds a linked worktree on hosts not yet migrated). The folder you work in (`$OOSH_DIR`, e.g. `dev`) is never checked out to another branch.
+
+For each merge (`private.promote.merge.into.folder <source> <target>`):
+
+1. push `<source>` to origin (from `<source>`'s folder when one exists) — fails fast if origin has diverged;
+2. in `<base>/<target>`: stash local changes (staged or not — `ogit.status.check`), `fetch`, fast-forward `<target>` to `origin/<target>` — a target that has **diverged** from origin is refused and left untouched;
+3. merge `origin/<source>` as the promote bot (`oosh-promote@local` / `oosh promote`), rewrite `OOSH_SELF_BRANCH` there (auto-resolving the known `OOSH_SELF_BRANCH` drift conflict, else abort), pop the stash. The rewrite sets **every** `OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-…}"` default line of `init/oosh` and `Install oosh.command` (identical duplicates through `replace lines`); a file that keeps another default stops the step with rc 1 — `Merged … but the OOSH_SELF_BRANCH default could not be set to <branch> in: <file>` — instead of shipping it (T-PROMOTE-SELF-BRANCH-EVERY-LINE, -STOPS). Every way out — success, refusal or abort — pops it through `private.promote.merge.finish`; a pop that fails (the merge changed the same lines) leaves conflict markers in the folder and keeps the change in the stash: the step warns and answers **rc 1** — the merge itself is done and `RESULT` says so — so the state machine stops there, and `RESULT` ends with `Resolve the conflicts in <base>/<target>, then run: ogit stash.drop <base>/<target> — and promote again` (never `stash.pop` again: it would re-apply the same change). A plain `promote` then resumes at the merge step, which is already up to date and stashes and pops the resolved change around it (T-PROMOTE-STASH-POP-FAILS).
+
+`testing.tagged` / `prod.tagged` tag in that folder, `testing.pushed` / `prod.pushed` push the branch and tags from it.
+
+**Prerequisite:** the target folder must exist. A host without one (e.g. no `testing/`) is refused at the merge state with
+
+```
+no folder holds branch testing — run: oo checkout testing
+```
+
+Run `oo checkout testing` once, then re-run `promote testing` — it resumes at the merge state.
+
+`promote status` reads each branch from its own folder (falling back to `$OOSH_DIR`); `promote branch.alignment <from> <to>` compares in `<to>`'s folder, where a clone knows `<from>` as `origin/<from>` (as of its last fetch).
+
 ## Quick Start
 
 ```bash
@@ -88,10 +110,12 @@ The PROMOTE state machine has two promotion paths that share a common entry and 
 Testing path (dev → testing):
   [13] uncommitted.checked   ← Clean working tree required
   [14] test.suite.passed     ← test.suite core 1 must pass
-  [15] confirmation.received ← User confirms merge (diff stats shown)
-  [16] merged.to.testing     ← git merge dev into testing
-  [17] testing.tagged        ← Tag: testing-YYYY-MM-DD
-  [18] testing.pushed        ← git push origin testing + tags
+  [15] confirmation.received ← User confirms merge; the commits listed first come
+                               from dev's folder: dev against its fetched
+                               origin/testing ("nothing to merge" when none)
+  [16] merged.to.testing     ← merge origin/dev into testing, in <base>/testing
+  [17] testing.tagged        ← Tag: testing-YYYY-MM-DD (in <base>/testing)
+  [18] testing.pushed        ← push testing + tags from <base>/testing
 
 Prod path (testing → prod):
   [20] prod.path.started        ← Pass-through entry to the prod path
@@ -103,12 +127,15 @@ Prod path (testing → prod):
                                   failing platform stops the machine at
                                   that state; re-running `oo stage testing`
                                   re-runs only that platform.
-  [N+1] confirmation.received.prod ← User confirms merge testing → prod
-  [N+2] merged.to.prod          ← git merge testing into prod (with
-                                  auto-resolve for OOSH_SELF_BRANCH drift
-                                  on init/oosh + Install oosh.command)
-  [N+3] prod.tagged             ← Tag: vX.Y.Z (auto-incremented semver)
-  [N+4] prod.pushed             ← git push origin prod + tags
+  [N+1] confirmation.received.prod ← User confirms merge testing → prod; the
+                                  commits listed come from <base>/testing
+                                  against its fetched origin/prod
+  [N+2] merged.to.prod          ← merge origin/testing into prod, in
+                                  <base>/prod (with auto-resolve for
+                                  OOSH_SELF_BRANCH drift on init/oosh +
+                                  Install oosh.command)
+  [N+3] prod.tagged             ← Tag: vX.Y.Z (auto-incremented semver, in <base>/prod)
+  [N+4] prod.pushed             ← push prod + tags from <base>/prod
 
 [99] finished
 ```

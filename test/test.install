@@ -159,6 +159,62 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────
+# T-INSTALL-NO-FETCHER: with no curl/wget/fetch and no sibling init/oosh, the
+# wrapper must fail LOUDLY. It used to run `sh -c "$(curl -fsSL "$url")"` —
+# command-substituting a MISSING curl yields "", `sh -c ""` exits 0, and the
+# wrapper printed "✓ Install complete." having installed nothing. Silence plus
+# a green tick is the worst failure mode an installer can have. Reproduced
+# 2026-09-21 on a naked ubuntu:24.04, which ships none of the three fetchers.
+# ─────────────────────────────────────────────────────────────────────────
+test.install.noFetcherFailsLoud() {
+  local d
+  d=$(mktemp -d "${TMPDIR:-/tmp}/test.install.nofetch.XXXXXX") \
+    || { create.result 1 "mktemp failed"; return $(result); }
+  cp "$OOSH_DIR/Install oosh.command" "$d/Install oosh.command" || {
+    rm -rf "$d"; create.result 1 "could not copy the wrapper"; return $(result); }
+  chmod +x "$d/Install oosh.command"
+
+  # A PATH holding the externals the wrapper needs and NO curl / wget / fetch.
+  # `dirname` is NOT optional: the wrapper opens with `cd "$(dirname "$0")"`,
+  # and without it that collapses to `cd ""`, which silently leaves the cwd
+  # alone — the run then finds the REPO's ./init/oosh and tests nothing.
+  mkdir -p "$d/bin"
+  local b p
+  for b in sh bash dirname mktemp rm cat wc; do
+    p=$(type -P "$b" 2>/dev/null) && ln -s "$p" "$d/bin/$b"
+  done
+
+  # cd into $d so there is no ./init/oosh sibling -> the fetch branch is taken.
+  # </dev/null feeds the trailing `read -r _` an EOF so this cannot hang the
+  # suite; that is also why the wrapper must end in `exit "$rc"` — without it
+  # the status would be read's, and this case would pass for the wrong reason.
+  local out rc
+  out=$(cd "$d" && env -i PATH="$d/bin" HOME="$HOME" TERM=dumb \
+          "$d/Install oosh.command" </dev/null 2>&1)
+  rc=$?
+  rm -rf "$d" 2>/dev/null
+
+  local flat
+  flat=$(printf '%s' "$out" | tr '\n' '|')
+  if [ "$rc" -eq 0 ]; then
+    create.result 1 "no fetcher on PATH, yet the wrapper exited 0: [$flat]"
+  elif [ "${out#*Install complete}" != "$out" ]; then
+    create.result 1 "printed '✓ Install complete' having installed nothing: [$flat]"
+  elif [ "${out#*No sibling init/oosh}" = "$out" ]; then
+    create.result 1 "never reached the fetch branch — dirname/cwd rig is wrong, not the wrapper: [$flat]"
+  elif [ "${out#*curl}" = "$out" ]; then
+    create.result 1 "failed without naming a fetcher to install: [$flat]"
+  else
+    create.result 0 "a missing fetcher is a named, non-zero failure"
+  fi
+  return $(result)
+}
+test.case $level "T-INSTALL-NO-FETCHER: no curl/wget/fetch is a loud failure, not a green tick" \
+  test.install.noFetcherFailsLoud
+expect 0 "a missing fetcher is a named, non-zero failure" \
+  "sh -c \"\$(curl …)\" with curl absent is sh -c \"\" — exit 0, nothing installed, ✓ printed"
+
+# ─────────────────────────────────────────────────────────────────────────
 # T-INIT-NO-OLD-SCAFFOLDING: dead-weight bootstrap functions are gone
 # ─────────────────────────────────────────────────────────────────────────
 test.case $level "T-INIT-NO-OLD-SCAFFOLDING: old bootstrap functions removed" \
@@ -209,7 +265,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 
 # T-INIT-INSTALL-PM-DETECT: PM detection covers brew + apt-get + dnf + yum +
-# apk + pacman + pkg, mirroring ossh.pm.discover (ossh:2128-2140).
+# apk + pacman + pkg, mirroring ossh.pm.discover.
 test.case $level "T-INIT-INSTALL-PM-DETECT: prelude PM detection covers all supported managers" \
   echo "(grep)"
 if grep -qE 'for _pm in brew apt-get dnf yum apk pacman pkg' "$INIT_SCRIPT"; then
@@ -220,7 +276,7 @@ fi
 
 # T-INIT-INSTALL-BREW-BOOTSTRAP: naked macOS images get Homebrew bootstrapped
 # non-interactively when no PM is detected, matching what ossh.prereqs.install
-# used to do at lines 2204-2224.
+# used to do.
 test.case $level "T-INIT-INSTALL-BREW-BOOTSTRAP: prelude bootstraps Homebrew on naked macOS" \
   echo "(grep)"
 if grep -qE 'NONINTERACTIVE=1.*Homebrew/install' "$INIT_SCRIPT" \
@@ -228,6 +284,29 @@ if grep -qE 'NONINTERACTIVE=1.*Homebrew/install' "$INIT_SCRIPT" \
   expect.pass "init/oosh prelude bootstraps Homebrew when no PM is detected on macOS"
 else
   expect.fail "init/oosh prelude missing Homebrew bootstrap — naked macOS images (no PM) will leave bash 4+ never landed"
+fi
+
+# T-INIT-BREW-INSTALL-NONINTERACTIVE: every package install in init/oosh runs
+# with its non-interactive prefix. Homebrew 6 asks "Do you want to proceed?
+# [y/n]" by default on a TTY when the plan has dependencies — `brew install
+# bash` on a virgin Sequoia VM waited on it forever. The bootstrap's
+# NONINTERACTIVE=1 does not reach `brew install`; HOMEBREW_NO_ASK=1 does. So
+# any executable line that invokes the PM (`$OOSH_PM …` or a literal
+# `brew install`) must carry either the per-PM `$_pmEnv` or HOMEBREW_NO_ASK.
+# Comments, messages (echo/die) and the PM table itself are not invocations.
+# The root -> `sudo -u $SUDO_USER` branch cannot be run on a Linux host, which
+# is why this is a structural check and test.oo's behavioural one is not.
+test.case $level "T-INIT-BREW-INSTALL-NONINTERACTIVE: no package-manager call in init/oosh can prompt" \
+  echo "(grep)"
+unguarded=$(grep -nE '\$OOSH_PM ["'"'"'$]|brew install' "$INIT_SCRIPT" \
+  | grep -vE '^[0-9]+:[[:space:]]*(#|echo |die )|OOSH_PM="brew install"' \
+  | grep -vE '_pmEnv|HOMEBREW_NO_ASK=1|oosh_pm_env')
+if ! grep -qE 'brew\*\).*HOMEBREW_NO_ASK=1' "$INIT_SCRIPT"; then
+  expect.fail "init/oosh has no brew arm setting HOMEBREW_NO_ASK=1 — a fresh macOS waits on brew's 'proceed? [y/n]'"
+elif [ -n "$unguarded" ]; then
+  expect.fail "package-manager calls without a non-interactive prefix: $(echo "$unguarded" | tr '\n' ' ')"
+else
+  expect.pass "every package-manager call in init/oosh is non-interactive (apt: DEBIAN_FRONTEND, brew: HOMEBREW_NO_ASK)"
 fi
 
 # T-INIT-INSTALL-BREW-PATHSD: brew bash install must wire /etc/paths.d/oosh-homebrew
@@ -244,8 +323,8 @@ fi
 # T-INIT-INSTALL-AUTO-PRELUDE: the POSIX prelude auto-installs git via $OOSH_PM.
 # Post-refactor (2026-05-08): bash-phase auto-install pass for git/sudo/curl was
 # REMOVED — Phase A's prelude `oosh_cmd_install git` is the single source of
-# truth (line 188), and runtime prereqs (rsync, tree) install via
-# `ossh prereqs.install` local mode at line ~436 instead. sudo and curl are
+# truth (Phase A of init/oosh), and runtime prereqs (rsync, tree) install via
+# `ossh prereqs.install` local mode in the post-clone prereqs block instead. sudo and curl are
 # chicken-and-egg in non-root flows; init/oosh dies fast if missing.
 test.case $level "T-INIT-INSTALL-AUTO-PRELUDE: Phase A prelude auto-installs git via PM" \
   echo "(grep)"
@@ -315,7 +394,7 @@ fi
 # run on the host. The runner user's effective process groups didn't
 # include `dev` (group adds only take effect on next login), so the
 # runner couldn't write to its own previously-written files anymore.
-# Root cause: `chown -R developking:dev "$CONFIG_PATH"` at oo:1852 was
+# Root cause: `chown -R developking:dev "$CONFIG_PATH"` in state 31 of oo was
 # too aggressive — it overrode ALL prior writers' file ownership. Fix:
 # chown only the top-level dir + setgid bit so new files inherit dev
 # group automatically. Existing files keep their writer's ownership.
@@ -347,10 +426,10 @@ unset OO_SCRIPT
 # Structural check: the recovery block exists and precedes the first $HOME use.
 test.install.homeRecovery() {
   local ok=1 recoverLn firstUseLn
-  grep -q 'getent passwd' "$INIT_SCRIPT" || ok=0
+  grep -q 'eval echo ~"$_oosh_user"' "$INIT_SCRIPT" || ok=0
   grep -q 'NFSHomeDirectory' "$INIT_SCRIPT" || ok=0
   grep -q '/etc/passwd' "$INIT_SCRIPT" || ok=0
-  recoverLn=$(grep -n 'getent passwd' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  recoverLn=$(grep -n '^# BEGIN homeRecovery$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
   firstUseLn=$(grep -n ': ${OOSH_DIR:=$HOME/oosh}' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
   [ -n "$recoverLn" ] && [ -n "$firstUseLn" ] && [ "$recoverLn" -lt "$firstUseLn" ] || ok=0
   if [ "$ok" = "1" ]; then
@@ -647,40 +726,40 @@ expect 0 "/opt/homebrew/bin is on the child's PATH" \
   "arm64 macOS root install hard-fails without it — brew is invisible and the bootstrap dies"
 
 # ============================================================================
-# T-HOME-RECOVERY-NSS: getent may return one line PER NSS SOURCE
+# T-HOME-RECOVERY-NO-GETENT: an empty shell finds HOME without getent
 # ============================================================================
-# `getent passwd <name>` prints one line per source that knows the user. On a
-# host where the user is in BOTH files and LDAP/SSSD it prints two. Without a
-# `head -1`, `cut -d: -f6` yields two lines, the result is non-empty so both
-# fallbacks are skipped, and `[ -d ]` on the two-line string is false — the
-# recovery REFUSES while holding a perfectly good home on line 1.
-# Asserted by EFFECT, not by grepping for `head -1`: both recovery blocks
-# (init/oosh and boot, between their BEGIN/END homeRecovery markers) run with
-# a stub getent that answers two lines, and must come out with line 1's home.
-test.install.homeRecoveryNssMultiline() {
-  local stub goodHome bad="" file out
-  stub=$(mktemp -d "${TMPDIR:-/tmp}/test.install.nss.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
-  goodHome="$stub/home"; mkdir -p "$goodHome"
-  printf '%s\n' '#!/bin/sh' "echo \"u:x:1:1::$goodHome:/bin/sh\"" 'echo "u:x:1:1::/nonexistent/second-source:/bin/sh"' > "$stub/getent"
+# Marcel (2026-10-06): no getent at runtime. The shell's own ~user expansion
+# reads the same user database (files, LDAP, … through the C library) and
+# gives ONE home — the two-line getent answer of files+LDAP hosts cannot
+# happen. Then dscl (macOS), then /etc/passwd. Asserted by EFFECT: the
+# recovery block of init/oosh and of the launcher runs in `env -i sh` with a
+# stub getent on PATH that answers a wrong home and logs every call; HOME must
+# be the runner's real home, and getent never asked.
+test.install.homeRecoveryNoGetent() {
+  local stub want bad="" file out
+  stub=$(mktemp -d "${TMPDIR:-/tmp}/test.install.nogetent.XXXXXX") || { create.result 1 "mktemp failed"; return 1; }
+  want=$(eval echo ~"$(id -un)")
+  printf '%s\n' '#!/bin/sh' "echo called >> $stub/getent.log" 'echo "u:x:1:1::/nonexistent/from-getent:/bin/sh"' > "$stub/getent"
   chmod +x "$stub/getent"
-  for file in "$INIT_SCRIPT" "$OOSH_DIR/boot"; do
+  for file in "$INIT_SCRIPT" "$OOSH_DIR/templates/user/thisLauncher"; do
     sed -n '/^# BEGIN homeRecovery$/,/^# END homeRecovery$/p' "$file" > "$stub/block"
     if [ ! -s "$stub/block" ]; then bad="$bad no-homeRecovery-markers:${file##*/}"; continue; fi
     out=$(cd /tmp && env -i PATH="$stub:/usr/bin:/bin" sh -c ". $stub/block; echo \"HOME=[\$HOME]\"" 2>/dev/null | tail -1)
-    [ "$out" = "HOME=[$goodHome]" ] || bad="$bad ${file##*/}=>$out"
+    [ "$out" = "HOME=[$want]" ] || bad="$bad ${file##*/}=>$out"
   done
+  [ -s "$stub/getent.log" ] && bad="$bad getent-asked:$(wc -l < "$stub/getent.log")x"
   rm -rf "$stub"
   if [ -z "$bad" ]; then
-    create.result 0 "two-line getent output recovers line 1's home in both blocks"
+    create.result 0 "init/oosh and the launcher find HOME from the user database without getent"
   else
-    create.result 1 "multi-source getent breaks recovery:$bad"
+    create.result 1 "home recovery:$bad"
   fi
   return $(result)
 }
-test.case $level "T-HOME-RECOVERY-NSS: a two-line getent answer still recovers \$HOME (init/oosh and boot)" \
-  test.install.homeRecoveryNssMultiline
-expect 0 "two-line getent output recovers line 1's home in both blocks" \
-  "files+LDAP hosts return two passwd lines; the recovery must take the first, not refuse"
+test.case $level "T-HOME-RECOVERY-NO-GETENT: an empty shell finds HOME without getent (init/oosh, launcher)" \
+  test.install.homeRecoveryNoGetent
+expect 0 "init/oosh and the launcher find HOME from the user database without getent" \
+  "no getent at runtime: the shell's ~user reads the same user database"
 
 # ============================================================================
 # T-INIT-CLEAN-ENV-PASSTHROUGH: the re-exec passes the caller's env to CHILDREN
@@ -746,5 +825,149 @@ test.case $level "T-INIT-CLEAN-ENV-PASSTHROUGH: TERM is carried, and defaults to
   test.install.cleanEnvTermDefault
 expect 0 "TERM carried when set, defaulted to dumb when not" \
   "an empty TERM is worse than an absent one — bash defaults unset to dumb, tput rejects empty"
+
+# ============================================================================
+# T-INIT-PM-ENV-AGREES: init/oosh's POSIX twin of the non-interactive prefix
+# table answers exactly what private.oo.pm.env.get answers
+# ============================================================================
+# init/oosh cannot call the bash getter (it runs from a curl one-liner before
+# oosh exists), so it carries a POSIX twin, oosh_pm_env. Two literal copies
+# of the table inside init/oosh (oosh_cmd_install's _pmEnv and the brew-bash
+# upgrade line) is how the brew arm was missed once already (6f4a8e9). One
+# function, extracted here and run for every PM the table knows.
+test.install.pmEnvAgrees() {
+  [ "$(type -t private.oo.pm.env.get)" = "function" ] || source "$OOSH_DIR/oo" >/dev/null 2>&1
+  local twin pm want got bad=""
+  twin=$(sed -n '/^oosh_pm_env() {/,/^}/p' "$INIT_SCRIPT")
+  [ -n "$twin" ] || { create.result 1 "init/oosh has no oosh_pm_env() — the prefix table is still inlined"; return $(result); }
+  for pm in "apt-get install -y" "dpkg -i" "brew install" "apk add" "dnf install -y" "pacman -S"; do
+    want=$(private.oo.pm.env.get "$pm")
+    got=$(sh -c "$twin; oosh_pm_env \"\$1\"" sh "$pm" 2>&1)
+    [ "$got" = "$want" ] || bad="$bad [$pm: twin='$got' getter='$want']"
+  done
+  if [ -n "$bad" ]; then
+    create.result 1 "the twins disagree:$bad"
+  else
+    create.result 0 "oosh_pm_env answers exactly what private.oo.pm.env.get answers"
+  fi
+  return $(result)
+}
+test.case $level "T-INIT-PM-ENV-AGREES: init/oosh's oosh_pm_env twin matches private.oo.pm.env.get for every PM" \
+  test.install.pmEnvAgrees
+expect 0 "oosh_pm_env answers exactly what private.oo.pm.env.get answers" \
+  "two literal copies of the table inside init/oosh is how the brew arm was missed before"
+
+# ============================================================================
+# T-INIT-HOME-LINK-NOT-MOVED: a re-run through the ~/oosh symlink never moves
+# the shared branch folder into $HOME
+# ============================================================================
+# init/oosh resolves OOSH_DIR physically when ../.git is a DIRECTORY. In the
+# clone layout (2026-09-23 design) the shared dev/ folder IS such a clone, so a
+# re-run via ~/oosh -> …/Once.sh/dev resolved OOSH_DIR to the shared path, saw
+# it differ from "$HOME/oosh", deleted the link and MOVED the shared dev/ into
+# /root/oosh (os platform.test ubuntu_24_04, once init at state 60; every later
+# user install then failed with "Once.sh/dev missing"). The worktree layout hid
+# it: dev/.git was a file. oosh_dir_is_home_link recognises the link's target.
+test.install.homeLinkNotMoved() {
+  local fx fn bad=""
+  fn=$(grep '^oosh_dir_is_home_link() {' "$INIT_SCRIPT")   # a one-liner: a sed range would run on into the installer
+  [ -n "$fn" ] || { create.result 1 "init/oosh has no oosh_dir_is_home_link() — a re-run moves the shared folder"; return $(result); }
+  fx=$(test.suite.fixture.make homelink)
+  mkdir -p "$fx/home" "$fx/shared/dev/.git" "$fx/elsewhere/.git"
+  ln -s "$fx/shared/dev" "$fx/home/oosh"
+  sh -c "$fn; oosh_dir_is_home_link \"\$1\" \"\$2\"" sh "$fx/shared/dev" "$fx/home" || bad="$bad link-target-not-recognised"
+  sh -c "$fn; oosh_dir_is_home_link \"\$1\" \"\$2\"" sh "$fx/elsewhere" "$fx/home" && bad="$bad other-dir-taken-for-link"
+  rm "$fx/home/oosh"; mkdir "$fx/home/oosh"
+  sh -c "$fn; oosh_dir_is_home_link \"\$1\" \"\$2\"" sh "$fx/shared/dev" "$fx/home" && bad="$bad real-dir-taken-for-link"
+  rm -rf "$fx"
+  # …and the guard runs BEFORE the move, so the move block never sees the link case.
+  local guard move
+  guard=$(grep -n 'oosh_dir_is_home_link "\$OOSH_DIR" "\$HOME" && OOSH_DIR="\$HOME/oosh"' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  move=$(grep -n 'mv "\$OOSH_DIR" "\$HOME/oosh"' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  { [ -n "$guard" ] && [ -n "$move" ] && [ "$guard" -lt "$move" ]; } || bad="$bad guard-not-before-move(guard=$guard move=$move)"
+  [ -z "$bad" ] && create.result 0 "a re-run through the ~/oosh link keeps the shared folder where it is" || create.result 1 "home link:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-HOME-LINK-NOT-MOVED: a re-run via the ~/oosh symlink never moves the shared branch folder" \
+  test.install.homeLinkNotMoved
+expect 0 "a re-run through the ~/oosh link keeps the shared folder where it is" \
+  "the clone layout made the shared dev/ look like a stray repo and init/oosh moved it into /root/oosh"
+
+# T-THIS-LAUNCHER-TEMPLATE: the launcher is plain POSIX sh and assigns no PATH or OOSH_DIR
+# /usr/local/bin/this runs from `env -i sh` — dash on Linux, the macOS sh — so
+# it must parse as POSIX sh; it recovers HOME with the same marked block as
+# init/oosh; and it builds nothing: no PATH=, no OOSH_DIR= (the PATH and anchor
+# rules hold for it as for every file).
+test.install.thisLauncherTemplate() {
+  local f="$OOSH_DIR/templates/user/thisLauncher" bad=""
+  [ -f "$f" ] || { create.result 1 "no launcher template"; return $(result); }
+  sh -n "$f" 2>/dev/null || bad="$bad not-posix-sh"
+  grep -qx '# BEGIN homeRecovery' "$f" && grep -qx '# END homeRecovery' "$f" || bad="$bad no-homeRecovery-markers"
+  grep -nE '(^|[^A-Za-z_])(PATH|OOSH_DIR)=' "$f" >/dev/null && bad="$bad assigns-PATH-or-OOSH_DIR"
+  [ -z "$bad" ] && create.result 0 "POSIX sh, the homeRecovery block, no PATH or OOSH_DIR" || create.result 1 "launcher:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-LAUNCHER-TEMPLATE: the launcher is POSIX sh with the homeRecovery block" test.install.thisLauncherTemplate
+expect 0 "POSIX sh, the homeRecovery block, no PATH or OOSH_DIR" "env -i sh runs it with dash or the macOS sh"
+
+# T-THIS-LAUNCHER-EXEC: the launcher starts the caller's own ~/oosh/this with every argument
+# A stub ~/oosh/this in a fixture home prints what it was given. The launcher
+# runs under `env -i` (no PATH but the system's) and must hand over HOME and
+# every argument; without ~/oosh it says so and returns 127.
+test.install.thisLauncherExec() {
+  local fx bad="" out rc; fx=$(test.suite.fixture.make thislauncher)
+  mkdir -p "$fx/home/oosh" "$fx/empty"
+  printf '%s\n' 'echo "RAN $HOME|$*"' > "$fx/home/oosh/this"
+  out=$(env -i HOME="$fx/home" PATH=/usr/bin:/bin sh "$OOSH_DIR/templates/user/thisLauncher" anchor.validate "two words" 2>/dev/null)
+  [ "$out" = "RAN $fx/home|anchor.validate two words" ] || bad="$bad got=[$out]"
+  env -i HOME="$fx/empty" PATH=/usr/bin:/bin sh "$OOSH_DIR/templates/user/thisLauncher" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 127 ] || bad="$bad no-oosh-rc=$rc"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the caller's own ~/oosh/this gets HOME and every argument" || create.result 1 "launcher run:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-LAUNCHER-EXEC: the launcher starts the caller's own ~/oosh/this with every argument" test.install.thisLauncherExec
+expect 0 "the caller's own ~/oosh/this gets HOME and every argument" "env -i sh, then this: sh: this: not found"
+
+# T-THIS-LAUNCHER-SOURCED: `source this` that finds the launcher loads ~/oosh/this — it does not replace the shell
+# `source this` with a bare name searches PATH. Where ~/oosh is not on it yet
+# (test.tilde's clean environment, an empty shell) bash found
+# /usr/local/bin/this, and its `exec` replaced the very script that sourced
+# it with a started `this` — the platform run hung in T69 behind an orphaned
+# `bash -i` (2026-10-02). Sourced, the launcher loads the real ~/oosh/this
+# into the caller and returns.
+test.install.thisLauncherSourced() {
+  local fx bad="" out; fx=$(test.suite.fixture.make thislaunchersourced)
+  mkdir -p "$fx/home/oosh" "$fx/bin"
+  printf '%s\n' 'LOADED="real this, args: $*"' > "$fx/home/oosh/this"
+  cp "$OOSH_DIR/templates/user/thisLauncher" "$fx/bin/this"
+  out=$(env -i HOME="$fx/home" PATH="$fx/bin:/usr/bin:/bin" bash -c 'source this a b; echo "AFTER [$LOADED]"' 2>&1)
+  [ "$out" = "AFTER [real this, args: a b]" ] || bad=" got=[$out]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "sourced, the launcher loads ~/oosh/this into the caller and returns" || create.result 1 "sourced launcher:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-LAUNCHER-SOURCED: source this finding the launcher loads ~/oosh/this, the caller keeps running" test.install.thisLauncherSourced
+expect 0 "sourced, the launcher loads ~/oosh/this into the caller and returns" \
+  "the launcher's exec replaced a script that ran source this — T69 hung the platform run"
+
+# T-NO-DOUBLED-LOG-CALL: no log call with its name doubled (infoinfo.log.log)
+# init/once called `infoinfo.log.log` — "command not found" every time a
+# check had to fix something (platform test, 2026-10-06). Every tracked script
+# of oosh is swept for a command <name>.log.log.
+test.install.noDoubledLogCall() {
+  local hits
+  hits=$(cd "$OOSH_DIR" && git grep -nE '^[[:space:]]*[a-z]+\.log\.log([[:space:]]|$)' -- . ':!sessions' ':!docs' ':!test' 2>/dev/null)
+  if [ -z "$hits" ]; then
+    create.result 0 "no doubled log call"
+  else
+    create.result 1 "doubled log call: $(echo "$hits" | cut -d: -f1,2 | tr '\n' ' ')"
+  fi
+  return $(result)
+}
+test.case $level "T-NO-DOUBLED-LOG-CALL: no log call with its name doubled (infoinfo.log.log)" test.install.noDoubledLogCall
+expect 0 "no doubled log call" "init/once called infoinfo.log.log — command not found"
+
+### test.method
 
 test.suite.save.results

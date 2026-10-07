@@ -1,16 +1,16 @@
 # The install bootstrap: `init/oosh` re-execs clean
 
 `init/oosh` is the installer — it runs before oosh exists, so it is POSIX `sh` and
-shares nothing with `boot` except one deliberately duplicated block (the `$HOME`
-recovery). This page documents its **clean-environment guarantee**: the `env -i`
+self-contained, including its `$HOME` recovery block (its twin in `boot` went with
+`boot`). This page documents its **clean-environment guarantee**: the `env -i`
 self-re-exec (the `cleanEnv` block), what is carried, what is seeded, and why.
-For `boot` itself see [boot.md](boot.md); for the design record see
+For how a shell starts once installed see [config.md § The PATH line](config.md#the-path-line); for the design record see
 [the clean-environment spec](superpowers/specs/2026-09-14-clean-environment-guarantee-design.md).
 
 
 ## The clean re-exec
 
-`boot` recovering `$HOME` makes `env -i sh` *survivable*. The guarantee that the installer runs in
+Recovering `$HOME` makes an `env -i` start *survivable*. The guarantee that the installer runs in
 a clean environment is a separate thing, and it used to come from a shebang:
 
 ```sh
@@ -137,8 +137,9 @@ Still deliberately *not* carried: `BASH_FILE` and `SUDO` (recomputed, more corre
 fail confusingly rather than cleanly — and it drives an interactive credential prompt that an
 unattended installer cannot answer anyway).
 
-> Guarded by `test.install` **T-INIT-HOME-RECOVERY**, **T-HOME-RECOVERY-NSS** (a two-line `getent`
-> answer still recovers line 1's home — asserted by running *both* recovery blocks with a stub),
+> Guarded by `test.install` **T-INIT-HOME-RECOVERY**, **T-HOME-RECOVERY-NO-GETENT** (the home
+> comes from the shell's own `~user`, then `dscl`, then `/etc/passwd` — no `getent` at runtime;
+> asserted by running *both* recovery blocks with a stub `getent` that must never be asked),
 > **T-INIT-CLEAN-ENV** (re-exec present, guarded, names an interpreter, no `env -S`),
 > **T-INIT-CLEAN-ENV-CARRY** (`SUDO_USER`, `OOSH_REPO`, `USER` and `LOGNAME` actually cross),
 > **T-INIT-CLEAN-ENV-ABSENT** (an unset `GIT_SSH_COMMAND` reaches the child unset, a set one verbatim),

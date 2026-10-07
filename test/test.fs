@@ -42,7 +42,7 @@ expect 0 "*" "Test start"
 
 
 console.log "
-Test 1 
+Test: fs.lnCreate
 ===================================================================="
 
 test.case - "Test if a ln is created"    fs.lnCreate /var/dev ~/ snetDev snetDev snet admin
