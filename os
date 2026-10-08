@@ -1164,7 +1164,7 @@ private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe fo
 }
 
 
-os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install <oldRef> (a branch on origin, or a sha shipped as platform-test-<sha>) for test, root, oosh-user and bash-user in a fresh <platform> container, apply the named breakages (default: all), heal once as root through the curl form, check what the heal left, then test.suite gate 1 per user, the idempotence invariant, a second heal that must change nothing, and the untouched-foreign check; after a PASS of all breakages the user.clone breakage as a second pass; PASS/FAIL line + create.result like platform.test, the logs in one folder kept on FAIL; the words terminal (keep the container) and pipe (run the pure pipe form too) may stand among the breakages #
+os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install <oldRef> (a branch on origin, or a sha shipped as platform-test-<sha>) for test, root, oosh-user and bash-user in a fresh <platform> container, apply the named breakages (default: all), heal once as root through the curl form, check what the heal left, then test.suite gate 1 per user, the idempotence invariant, a second heal that must change nothing, and the untouched-foreign check; after a PASS of all breakages the user.clone breakage as a second pass; PASS/FAIL line + create.result like platform.test, the logs in one folder kept on FAIL; the words terminal (keep the container), pipe (run the pure pipe form too) and compare (after the checks pass, a fresh install of the branch in a second container, diffed with the healed one) may stand among the breakages #
 {
  # The proof the heal needs before it touches a real machine: an OLD install,
  # broken the ways the real machines are broken, healed ONCE, then everything
@@ -1178,16 +1178,17 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  # rc 2 (cannot heal) or an ssh failure is. Docker port 8022, as os platform.test.
  local platform="$1" oldRef="$2"
  if [ -z "$platform" ] || [ -z "$oldRef" ]; then
-   create.result 1 "Usage: os platform.heal.test <platform> <oldRef> <?breakages...:all> — words terminal and pipe may stand among the breakages"
+   create.result 1 "Usage: os platform.heal.test <platform> <oldRef> <?breakages...:all> — words terminal, pipe and compare may stand among the breakages"
    error.log "$RESULT"
    return $(result)
  fi
  shift 2
- local word terminal="" pipe="" allWords="" words=()
+ local word terminal="" pipe="" compare="" allWords="" words=()
  for word in "$@"; do
    case "$word" in
      terminal) terminal=yes ;;
      pipe)     pipe=yes ;;
+     compare)  compare=yes ;;
      all)      allWords=yes; words+=("$word") ;;
      *)        words+=("$word") ;;
    esac
@@ -1240,10 +1241,12 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  # go on. The logs stay, named. `os platform.heal.test` is a process of its own
  # (this.start). On the normal paths the caller's own traps are back before the
  # return.
- local restoreTraps logDir=""
+ local restoreTraps logDir="" comparePort=""
+ # compare: its second container goes on an interrupt too
+ [ -n "$compare" ] && comparePort=$(private.os.platform.heal.compare.port.get)
  restoreTraps="trap - INT TERM HUP; $(trap -p INT TERM HUP)"
  # shellcheck disable=SC2064 # expanded now: the branch and the port of this run
- trap "private.os.platform.ref.branch.drop '$branch'; private.os.platform.cleanup '$sshPort'; [ -z \"\$OOSH_HEAL_TEST_LOGS\" ] || echo \"logs: \$OOSH_HEAL_TEST_LOGS\"; exit 130" INT TERM HUP
+ trap "private.os.platform.ref.branch.drop '$branch'; private.os.platform.cleanup '$sshPort';${comparePort:+ private.os.platform.cleanup '$comparePort';} [ -z \"\$OOSH_HEAL_TEST_LOGS\" ] || echo \"logs: \$OOSH_HEAL_TEST_LOGS\"; exit 130" INT TERM HUP
  # Era gate: an era-B ref (mode ssh) is refused with the eraB.* hint.
  if ! private.os.platform.branch.gate "$branch"; then
    local refusal="$RESULT"
@@ -1382,6 +1385,21 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  { [ "$rcForeign" = 0 ] || [ "$rcForeign" = skipped ]; } || failed="$failed foreign"
  [ "${rcUserClone:-0}" = 0 ] || failed="$failed user-clone"
 
+ # ─── compare: the healed machine against a fresh install of the branch ──
+ # After the checks pass and before the user.clone second pass, which
+ # rebuilds <base>/<branch>: what a heal leaves must be what an install of
+ # the same branch leaves (private.os.platform.heal.compare.run).
+ local rcCompare=""
+ if [ -n "$compare" ]; then
+   if [ -z "$failed" ]; then
+     private.os.platform.heal.compare.run "$platform" "$healBranch"
+     rcCompare=$?
+     [ "$rcCompare" = 0 ] || failed="$failed compare"
+   else
+     rcCompare=skipped
+   fi
+ fi
+
  # ─── user.clone as a second pass on a PASS of all breakages ──────────────
  # user.clone rebuilds <base>/<branch> and cannot stand with the folder arms,
  # so `all` leaves it out; on the healed machine it is the shape a user makes
@@ -1405,7 +1423,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
    [ "$rcUserClone" = 0 ] || failed="$failed user-clone"
  fi
 
- local line="heal=$rcHeal verify=$verifyFails not-checked=$notCheckedOther${rcPipe:+ pipe=$rcPipe} expect=$rcExpect test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign${rcUserClone:+ user-clone=$rcUserClone}"
+ local line="heal=$rcHeal verify=$verifyFails not-checked=$notCheckedOther${rcPipe:+ pipe=$rcPipe} expect=$rcExpect test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign${rcCompare:+ compare=$rcCompare}${rcUserClone:+ user-clone=$rcUserClone}"
  if [ -z "$failed" ]; then
    printf "PASS: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
    important.log "PASS: heal $platform $oldRef ($line)"
@@ -1451,6 +1469,7 @@ os.platform.heal.test.completion.breakages() {
   private.os.platform.heal.breakage.names.get
   echo terminal
   echo pipe
+  echo compare
 }
 private.os.platform.heal.expect.check.script.get()     # <branch> <breakages...> # echo the POSIX sh text that asserts, as root in a platform container, the post-heal shape of every heal (the origin of each canonical folder, the ssh setup of developking and root, the launcher, the ~/oosh and ~/config of the five users) and of each breakage that ran; every line says expect <block>: and a wrong shape FAILED, rc 1 on any; silent getter, rc 1 for a bad <branch> or an unknown breakage #
 {
@@ -1661,6 +1680,158 @@ private.os.platform.heal.reports.only.is()     # <log> # rc 0 when the rc line o
  local log="$1"
  [ -n "$log" ] && [ -f "$log" ] || return 1
  tr -d '\r' < "$log" | grep -q '^rc 1: .*; install state 99$'
+}
+
+
+private.os.platform.heal.compare.run()     # <platform> <branch> # a fresh install of <branch> in a second container, the snapshot of both, their diff; RESULT compare on <platform>: rc <rc> #
+{
+ # The one test that answers "does the heal give me dev": the healed machine
+ # of os platform.heal.test against a FRESH install of the same branch. A
+ # second container (port private.os.platform.heal.compare.port.get, ssh
+ # alias <platform>_fresh) comes up as the first did (container.up and
+ # users.install), with OSSH_INSTALL_LOCAL=1: this tree's init/oosh and a
+ # bundle of <branch>, so a branch that is not on origin installs too
+ # (install state 31 clones from the bundle and points the origins at the
+ # canonical SSH URL). Then the same snapshot in both
+ # (private.os.platform.heal.compare.snapshot.script.get), the alias of the
+ # second container read as <platform>, and their difference: any line
+ # fails. The logs go to the folder of the run (compare-install,
+ # compare-healed, compare-fresh, compare). The second container always goes.
+ local platform="$1" branch="$2"
+ if [ -z "$platform" ] || [ -z "$branch" ]; then
+   create.result 1 "private.os.platform.heal.compare.run requires <platform> <branch>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ local port alias script imageTag installLog healedLog freshLog log rc=0 differences
+ if ! script=$(private.os.platform.heal.compare.snapshot.script.get "$branch"); then
+   create.result 1 "private.os.platform.heal.compare.run: no snapshot for the branch '$branch'"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ private.os.platform.parse "$platform" || return $(result)
+ port=$(private.os.platform.heal.compare.port.get)
+ alias="${platform}_fresh"
+ imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
+ installLog=$(private.os.platform.heal.log.get compare-install "$platform")
+ healedLog=$(private.os.platform.heal.log.get compare-healed "$platform")
+ freshLog=$(private.os.platform.heal.log.get compare-fresh "$platform")
+ log=$(private.os.platform.heal.log.get compare "$platform")
+ console.log "compare: a fresh install of $branch from this tree on $alias (port $port), then the snapshot of both"
+ { OSSH_INSTALL_LOCAL=1 OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$alias" "$imageTag" "$port" \
+   && OSSH_INSTALL_LOCAL=1 OSSH_INSTALL_BRANCH="$branch" private.os.platform.users.install "$alias"; } 2>&1 | tee "$installLog"
+ if [ "${PIPESTATUS[0]}" != 0 ]; then
+   printf 'compare on %s: the fresh install on %s did not come up (log: %s)\n' "$platform" "$alias" "$installLog" | tee "$log"
+   rc=1
+ else
+   private.os.platform.root.script.run "$platform" sh "$script" 2>&1 | tr -d '\r' \
+     | sed -n '/^OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN$/,$p' | sed '1d' | LC_ALL=C sort -u > "$healedLog"
+   private.os.platform.root.script.run "$alias" sh "$script" 2>&1 | tr -d '\r' \
+     | sed -n '/^OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN$/,$p' | sed '1d' | sed "s#$alias#$platform#g" | LC_ALL=C sort -u > "$freshLog"
+   if [ ! -s "$healedLog" ] || [ ! -s "$freshLog" ]; then
+     printf 'compare on %s: no snapshot of %s\n' "$platform" "$([ -s "$healedLog" ] && echo "the fresh install" || echo "the healed machine")" | tee "$log"
+     rc=1
+   else
+     # raw: two sorted files, one line each side that differs
+     differences=$(diff "$healedLog" "$freshLog" | sed -n -e 's/^< /healed only: /p' -e 's/^> /fresh only:  /p')
+     if [ -n "$differences" ]; then
+       printf 'compare on %s: the heal and a fresh install of %s differ:\n%s\n' "$platform" "$branch" "$differences" | tee "$log"
+       rc=1
+     else
+       printf 'compare on %s: the heal gives what a fresh install of %s gives (%s lines)\n' "$platform" "$branch" "$(wc -l < "$freshLog" | tr -d ' ')" | tee "$log"
+     fi
+   fi
+ fi
+ ossh connection.close "$alias" 2>/dev/null
+ private.os.platform.cleanup "$port"
+ create.result "$rc" "compare on $platform: rc $rc"
+ [ "$rc" = 0 ] || error.log "$RESULT (log: $log)"
+ return $(result)
+}
+
+
+private.os.platform.heal.compare.snapshot.script.get()     # <branch> # echo the POSIX sh that prints, as root in a platform container, the compare snapshot of an install: owner, group, mode and content (link target, env names and values, cksum) of what the install and the heal own, the origin of each canonical folder, the safe.directory set, the shell and groups of each user and the ssh artefacts, the host name masked; silent getter, rc 1 for a bad <branch> #
+{
+ # NO create.result — a getter consumed as $(...) by
+ # private.os.platform.heal.compare.run and by its test, which points the
+ # data lines (B, S, HOST, USERS, SYSTEM, the passwd path) at a fixture.
+ # Raw POSIX sh for the reason of the arms: it reads an install, it does not
+ # run the oosh of it. One line per fact, <path or fact> TAB <owner:group
+ # mode or -> TAB <content>, sorted, the host name masked as <host>; a file
+ # of values (env, ssh config, .gitconfig, .once, the state machine files)
+ # is one line per value. Left out, as the idempotence invariant leaves them
+ # out: log files and result.env (rewritten by every oosh call). Left out by
+ # scope: <base>.aside and the *.orig.* entries — what the heal kept of the
+ # old install, which a fresh install never had. Key material generated per
+ # machine is named, not summed: only the deploy key of developking (a copy
+ # of the template) is compared by content.
+ local branch="$1" preamble
+ preamble=$(private.os.platform.heal.remote.preamble.get "$branch") || return 1
+ printf "N='compare.snapshot'\n%s\n" "$preamble"
+ cat <<'OOSH_HEAL_COMPARE_SNAPSHOT'
+HOST=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
+USERS='test root oosh-user bash-user developking'
+SYSTEM='/usr/local/bin/this /usr/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot'
+  attrs_of() { stat -c '%U:%G %a' "$1" 2>/dev/null || stat -f '%Su:%Sg %Lp' "$1"; } # kernel-exception: POSIX sh of the disposable-container snapshot, the stat -f twin is the fix # portability-exception: GNU stat with its BSD twin
+  volatile() { case "$1" in */result.env|*.log|*/log.live.out|*.orig.*) return 0 ;; esac; return 1; }
+  values() { grep -v '^[[:space:]]*#' "$2" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$' | LC_ALL=C sort | while IFS= read -r v; do printf '%s\t-\t%s\n' "$1" "$v"; done; }
+  entry() {
+    volatile "$1" && return 0
+    if [ -L "$1" ]; then printf '%s\t%s\t-> %s\n' "$1" "$(attrs_of "$1" | cut -d' ' -f1)" "$(readlink "$1")" # kernel-exception: POSIX sh of the disposable-container snapshot, the link text as written
+    elif [ -f "$1" ]; then
+      case "$1" in
+        *.env|*/stateMachines/*|*/.gitconfig|*/.once|*/.ssh/config) printf '%s\t%s\tvalues\n' "$1" "$(attrs_of "$1")"; values "$1" "$1" ;;
+        */.ssh/known_hosts) printf '%s\t%s\thosts\n' "$1" "$(attrs_of "$1")"; awk '{ print $1 }' "$1" | LC_ALL=C sort -u | while IFS= read -r v; do printf '%s\t-\t%s\n' "$1" "$v"; done ;;
+        */.ssh/*) case "$1" in "$DKH/.ssh/"*) printf '%s\t%s\t%s\n' "$1" "$(attrs_of "$1")" "$(cksum < "$1" | awk '{ print $1 "/" $2 }')" ;; *) printf '%s\t%s\tkey\n' "$1" "$(attrs_of "$1")" ;; esac ;;
+        *) printf '%s\t%s\t%s\n' "$1" "$(attrs_of "$1")" "$(cksum < "$1" | awk '{ print $1 "/" $2 }')" ;;
+      esac
+    elif [ -d "$1" ]; then printf '%s\t%s\tdir\n' "$1" "$(attrs_of "$1")"
+    elif [ -e "$1" ]; then printf '%s\t%s\tother\n' "$1" "$(attrs_of "$1")"
+    else printf '%s\tabsent\t-\n' "$1"
+    fi
+  }
+  level() { entry "$1"; if [ -d "$1" ] && [ ! -L "$1" ]; then for q in "$1"/* "$1"/.[!.]*; do { [ -e "$q" ] || [ -L "$q" ]; } && entry "$q"; done; fi; }
+  tree() { [ -d "$1" ] && [ ! -L "$1" ] || { entry "$1"; return 0; }; find "$1" -maxdepth "$2" | while IFS= read -r q; do entry "$q"; done; }
+DKH=$(home_of developking)
+echo OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN
+{
+level "$B"
+level "$B/main"
+level "$D"
+level "$S"
+level "$S/stateMachines"
+for p in $SYSTEM; do entry "$p"; done
+tree "$bh/shared/.ssh" 2
+for d in "$B"/*; do
+  [ -e "$d/.git" ] || continue
+  printf 'origin of %s\t-\t%s\n' "$d" "$(rgit -C "$d" config --get remote.origin.url)"
+  printf 'branch of %s\t-\t%s\n' "$d" "$(rgit -C "$d" symbolic-ref -q --short HEAD || echo detached)"
+  printf 'HEAD of %s\t-\t%s\n' "$d" "$(rgit -C "$d" rev-parse HEAD 2>/dev/null)"
+done
+rgit config --system --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do printf 'safe.directory of the system\t-\t%s\n' "$v"; done
+for u in $USERS; do
+  h=$(home_of "$u")
+  if [ -z "$h" ]; then printf 'user %s\tabsent\t-\n' "$u"; continue; fi
+  printf 'shell of %s\t-\t%s\n' "$u" "$(awk -F: -v u="$u" '$1 == u { print $7; exit }' /etc/passwd)"
+  printf 'groups of %s\t-\t%s\n' "$u" "$(id -nG "$u" 2>/dev/null | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ')" # kernel-exception: POSIX sh of the disposable-container snapshot
+  as_user "$u" git config --global --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do printf 'safe.directory of %s\t-\t%s\n' "$u" "$v"; done # ogit-exception: inside the platform container, as the user — the oosh there is the install under compare
+  entry "$h"
+  for n in oosh config init .bashrc .bash_profile .profile .gitconfig .once; do entry "$h/$n"; done
+  level "$h/.config/oosh"
+  tree "$h/.ssh" 3
+done
+} | if [ -n "$HOST" ]; then sed "s#$HOST#<host>#g"; else cat; fi | LC_ALL=C sort -u
+OOSH_HEAL_COMPARE_SNAPSHOT
+}
+
+
+private.os.platform.heal.compare.port.get()     #  # echo the ssh port of the second container of the compare step, 9022: offset 1000 from 8022, so none of its published ports meets those of the first container; silent getter #
+{
+ # NO create.result — a getter consumed as $(...). odocker publishes five
+ # ports per container at 8022 + offset; 8023 would publish 5002, which the
+ # first container (8022) publishes already. The one place for the number:
+ # compare.run and the interrupt trap of os platform.heal.test read it.
+ echo 9022
 }
 
 

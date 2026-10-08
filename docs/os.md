@@ -69,7 +69,7 @@ fi
 | `os platform.list` | | List all platforms with workspace, package manager, and tier |
 | `os platform.test` | `<platform> <?terminal> <?notests> <?branch>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests, `notests` to skip Phase B, `<branch>` (a branch on origin) to install an older ref first (see [Installing an older ref first](#installing-an-older-ref-first)). Arguments are positional: an empty placeholder keeps its place, so `os platform.test ubuntu_24_04 "" notests` runs without tests and without a terminal |
 | `os platform.test.all` | | Test all platforms, report summary. Exit 0 only if all must-pass platforms pass |
-| `os platform.heal.test` | `<platform> <oldRef> <?breakages...:all>` | Install an old ref, break it the ways real machines are broken, heal once, check everything (see [The heal scenario](#the-heal-scenario-os-platformhealtest)). `terminal` keeps the container, `pipe` runs the pure pipe form too |
+| `os platform.heal.test` | `<platform> <oldRef> <?breakages...:all>` | Install an old ref, break it the ways real machines are broken, heal once, check everything (see [The heal scenario](#the-heal-scenario-os-platformhealtest)). `terminal` keeps the container, `pipe` runs the pure pipe form too, `compare` diffs the healed machine with a fresh install of the branch |
 
 ### Platform test building blocks
 
@@ -88,6 +88,8 @@ fi
 
 `os platform.test <platform> "" "" <branch>` takes a **branch on origin** of this repo. `<branch>` is exported as `OSSH_INSTALL_BRANCH` to the two install steps only (`ossh install` of `test` in `container.up`, of `bash-user` in `users.install`; a prefix assignment, so it lives for that one call). `ossh install` honours it: it pushes **that ref's own `init/oosh`** and hands the remote installer that branch ([ossh.md § Remote Installation](ossh.md#remote-installation)). macOS refuses a `<branch>` (the CI workflow installs its own branch).
 
+Without `<branch>` the containers install the branch of this tree **from origin** — a branch that is not pushed, or is pushed behind the local one, is not what runs. `OSSH_INSTALL_LOCAL=1 os platform.test <platform>` installs this tree instead: the working-tree `init/oosh` and a bundle of the committed branch ([ossh.md § Installing this tree](ossh.md#installing-this-tree-ossh_install_local1)).
+
 Before anything starts, the era gate `private.os.platform.branch.gate <branch> <?dir>` reads `init/oosh` of the ref through `ogit.file.show` and refuses a ref whose installer lacks the `mode root` contract, i.e. older than commit `b8b90b82` (older refs use `mode ssh` and rsync, which the current `ossh install` cannot drive). It accepts only `origin/<branch>`: the container clones from origin, so a local-only branch, or a stale local branch of the same name, must not pass, and a commit sha cannot be cloned. The gate reads the remote-tracking ref of the local repo, which can be stale until the next fetch. A sha is the scenario test's job: `os platform.heal.test` pushes it as the temporary branch `platform-test-<sha>` first.
 
 ### The heal scenario (`os platform.heal.test`)
@@ -99,7 +101,7 @@ os platform.heal.test <platform> <oldRef> <?breakages...:all>
 The proof `oo heal` needs before it touches a real machine: an OLD install, broken the ways the real machines
 are broken, healed **once**, then everything that checks an install. `<platform>` is a Docker platform (a
 native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<breakages>` are the names below
-(default and `all`: every one). The words **`terminal`** (keep the container for a look inside) and **`pipe`**
+(default and `all`: every one). The words **`terminal`** (keep the container for a look inside), **`compare`** (step 11) and **`pipe`**
 (also run the pure pipe form once) may stand among the breakages. The heal under test is **this tree**:
 `OOSH_HEAL_LOCAL=1 ossh heal` ships this tree's `init/oosh` and a bundle of its branch
 ([ossh.md](ossh.md#healing-a-remote-host-ossh-heal)). Docker port 8022, as `platform.test`.
@@ -141,15 +143,16 @@ native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<brea
 10. The foreign check (`private.os.platform.heal.check <platform> foreign`, only when `foreign.symlink` ran): `/opt/foreign`
     has the same entries and checksums and nothing newer than the marker; git's stat cache `.git/index` is
     ignored (a `git status` refreshes it without changing a byte of the tree).
-11. **The user.clone second pass.** `user.clone` rebuilds `<base>/<branch>` and is left out of `all`. When the other
+11. **The compare step** (with the word `compare`, after every check above passed — else `compare=skipped`): `private.os.platform.heal.compare.run <platform> <branch>` installs the same branch **fresh** in a second container (port `private.os.platform.heal.compare.port.get`, 9022; ssh alias `<platform>_fresh`; `container.up` and `users.install` with `OSSH_INSTALL_LOCAL=1`, so the unpushed branch installs from this tree), prints the snapshot of `private.os.platform.heal.compare.snapshot.script.get <branch>` in both — owner, group, mode and content of what the install and the heal own (links, the values of env files, `.gitconfig`, `.once` and ssh config, checksums of files; generated ssh keys named, the deploy key summed), the origin, branch and HEAD of every folder of the base, the `safe.directory` set of the system and of each user, each user's shell and groups — with the host name and the alias masked, and leaves out what the idempotence invariant leaves out (log files, `result.env`) and what only a heal has (`<base>.aside`, `*.orig.*`); **any line that differs fails** (`compare=1`, the lines in the log step `compare`). The second container is always removed. It runs before the user.clone second pass, which rebuilds `<base>/<branch>`.
+12. **The user.clone second pass.** `user.clone` rebuilds `<base>/<branch>` and is left out of `all`. When the other
     steps all passed and `user.clone` was not named, the run applies it on the healed machine, runs the second-heal
     command once more and checks the clone (`private.os.platform.heal.check <platform> user.clone <branch>`); a failed
     arm, a heal that is not rc 0 or reports only, or a red check fails the run (`user-clone=1`). A run of named breakages has no second pass.
-12. The verdict line `PASS: heal <platform> <oldRef> (heal=<rc> verify=<n> not-checked=<n> [pipe=<rc>] expect=<rc> test=<rc>
-    root=<rc> oosh-user=<rc> bash-user=<rc> idempotence=<rc> second-heal=<rc> foreign=<rc|skipped> [user-clone=<rc>])` or `FAIL:` with
+13. The verdict line `PASS: heal <platform> <oldRef> (heal=<rc> verify=<n> not-checked=<n> [pipe=<rc>] expect=<rc> test=<rc>
+    root=<rc> oosh-user=<rc> bash-user=<rc> idempotence=<rc> second-heal=<rc> foreign=<rc|skipped> [compare=<rc|skipped>] [user-clone=<rc>])` or `FAIL:` with
     the first FAIL lines of the logs and the folder of the logs. PASS needs `heal` 0, or 1 as reports only (rc ≥ 2 and any other rc 1 fail),
     `verify=0` (the count of red verify lines), `not-checked=0` (the NOT CHECKED lines whose reason is not the re-login),
-    `pipe` and `user-clone` 0 when run, and 0 for every other field (`foreign` may be `skipped`). Then
+    `pipe`, `compare` and `user-clone` 0 when run, and 0 for every other field (`foreign` may be `skipped`). Then
     `private.os.platform.ref.branch.drop` deletes a `platform-test-*` branch on origin (as `refs/heads/<name>`, so a
     tag of the same name is left standing; any other branch is left alone) and, unless `terminal`, the container is
     removed. On PASS the folder of the logs is removed too. A breakage that fails ends the run before the heal with its own `FAIL` line.
@@ -227,7 +230,7 @@ inside the one script (`private.os.platform.heal.fixture.script.get`, `private.o
 **Logs.** The logs of a run are one folder, made by `private.this.temp.dir.get oosh-heal-test` under `TMPDIR` (else `/tmp`) and
 named in `OOSH_HEAL_TEST_LOGS`; `private.os.platform.heal.log.get <step> <platform>` is `oosh-heal-test-<step>-<platform>.log` in it
 for the steps `breakages`, `heal`, `expect`, `pipe`, `test`, `root`, `oosh-user`, `bash-user`, `idempotence-root`,
-`idempotence-bash-user`, `second-heal`, `foreign`, `user-clone-heal` and `user-clone`. The folder is removed on PASS; on a FAIL, a failed
+`idempotence-bash-user`, `second-heal`, `foreign`, `user-clone-heal`, `user-clone`, and with `compare` `compare-install`, `compare-healed`, `compare-fresh` and `compare`. The folder is removed on PASS; on a FAIL, a failed
 breakage, or Ctrl-C, SIGTERM or a hangup (the run ends 130, the branch dropped, the container removed) its path is printed (`logs: <folder>`).
 
 **The C2 preconditions.** The tree is clean and committed (see step 1), and `<healBranch>` — the branch of this
@@ -236,11 +239,10 @@ tree — exists on origin; else the idempotence invariant's `oo update` row is N
 **The C2 command lines** (inside the disposable containers only, never on a real host):
 
 ```bash
-os platform.heal.test ubuntu_24_04 26d15a4 all pipe     # the full scenario on the first platform, pipe form included
-os platform.heal.test ubuntu_24_04 51d7fb3              # all breakages, an older ref
-os platform.heal.test debian_12 51d7fb3
-os platform.heal.test almalinux_9 51d7fb3
-os platform.heal.test alpine_3_19 51d7fb3
+os platform.heal.test ubuntu_24_04 51d7fb3 all pipe compare  # the full scenario: pipe form and the fresh-install compare included
+os platform.heal.test debian_12 51d7fb3 all pipe compare
+os platform.heal.test almalinux_9 51d7fb3 all pipe compare
+os platform.heal.test alpine_3_19 51d7fb3 all pipe compare
 os platform.heal.test ubuntu_24_04 51d7fb3 all terminal  # keep the container: ossh exec.tty ubuntu_24_04 'sudo -i'
 ```
 
