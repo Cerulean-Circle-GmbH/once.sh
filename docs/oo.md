@@ -515,7 +515,7 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
   the `sharedConfig`, the launcher `/usr/local/bin/this` (and, where the empty shell `env -i sh` has no `/usr/local/bin` on its PATH — BusyBox on Alpine — the link `/usr/bin/this` to it, `private.oo.launcher.link.get`), and `~/oosh` → `<base>/<branch>`, `~/config` →
   `sharedConfig` for each healed user. The canonical base is **built fresh** from origin over SSH: the one origin of
   every canonical folder is `private.oo.repo.url.get` (`git@github.com:Cerulean-Circle-GmbH/once.sh.git`), the URL
-  install state 31 clones from too; an HTTPS, path or bundle origin of a canonical folder is re-pointed to it, and
+  install state 31 clones from too; an HTTPS, path or bundle origin of any clone of the base — `main/`, `<branch>/`, the folder of an old install, a converted worktree — is re-pointed to it (the layout invariant asks it of every folder), and
   `OOSH_REPO` is only ever the source of a clone. The curl form's own temporary clone stays HTTPS (it has no key).
 - **developking's SSH setup, as the install makes it.** Whenever the heal has root the system step builds it
   BEFORE the code step clones over SSH (`private.oo.heal.system.root`: directly as root; a user whose heal has root
