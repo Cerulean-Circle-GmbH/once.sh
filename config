@@ -286,10 +286,10 @@ config.init.user()     # <?username:$USER> <?sharedOosh> # ensure the ~/config +
   elif [ -d "$ooshPhysical" ] && [ "${ooshPhysical#$sharedOoshBase/}" != "$ooshPhysical" ]; then
     sharedOosh="$ooshPhysical"
   elif [ -L "$targetHome/oosh" ]; then
-    local _existing
-    _existing=$(readlink "$targetHome/oosh") # kernel-exception: pre-existing on dev, out of the heal scope
-    if [ -d "$_existing" ] && [ "${_existing#$sharedOoshBase/}" != "$_existing" ]; then
-      sharedOosh="$_existing"
+    local existingOosh
+    existingOosh=$(private.this.link.target.get "$targetHome/oosh")
+    if [ -d "$existingOosh" ] && [ "${existingOosh#$sharedOoshBase/}" != "$existingOosh" ]; then
+      sharedOosh="$existingOosh"
     fi
   fi
   if [ -z "$sharedOosh" ]; then
@@ -306,31 +306,32 @@ config.init.user()     # <?username:$USER> <?sharedOosh> # ensure the ~/config +
 
   important.log "config.init.user: aligning ${YELLOW}$username${NORMAL}'s ~/config and ~/oosh to canonical state"
 
-  # Symlink reconciliation in two phases.
-  #
-  # Phase 1 — recreate (only if needed): dispatch through private.as.user so
-  # newly-created symlinks inherit <user>:<user> ownership naturally. This is
-  # the same trick user.oosh.install uses (its symlink hop) — and the reason
+  # Symlink reconciliation: recreate only if needed, dispatched through
+  # private.as.user so the links are made BY <user> and are <user>:<user> —
+  # the trick user.oosh.install uses too (its symlink hop), and the reason
   # fresh installs produce hannesn:hannesn while a tampered install path can
-  # leave hannesn:dev. Skip the dispatch entirely when both symlinks already
-  # point at the canonical targets — avoids the runuser PAM-session overhead
-  # and an observed silent-failure mode under sudo when env is sanitised.
+  # leave hannesn:dev. The dispatch is skipped when both links already point at
+  # the canonical targets and belong to <user> — no runuser PAM-session
+  # overhead, no silent-failure mode under sudo when env is sanitised.
   #
-  # Phase 2 — force ownership: chown -h is run by THIS shell (not via
-  # private.as.user). When the caller is root (the typical sudo path) chown
-  # works for any target. When the caller is the target user, chown to their
-  # own primary group works without sudo. Other combinations are skipped
-  # quietly (e.g. sudoer alice repairing bob — the recreate path already
-  # gave bob:bob).
-  local _needsRecreate=0
-  # kernel-exception: pre-existing on dev, out of the heal scope
-  if [ ! -L "$targetHome/config" ] || [ "$(readlink "$targetHome/config")" != "$sharedConfig" ] \
-  || [ ! -L "$targetHome/oosh"   ] || [ "$(readlink "$targetHome/oosh")"   != "$sharedOosh"   ] \
-  || [ -d "$targetHome/config" -a ! -L "$targetHome/config" ] \
-  || [ -d "$targetHome/oosh"   -a ! -L "$targetHome/oosh"   ]; then
-    _needsRecreate=1
+  # A link of another owner (root made it, or it is hannesn:dev) is removed by
+  # this shell (private.this.entry.aside: a link is removed, its target left)
+  # when it may — root, or the user themself — and made again in the hop: no
+  # chown (T-CONFIG-INIT-USER-LINK-OWNER). A sudoer repairing another user
+  # leaves such a link as it is.
+  local needsRecreate=0 linkName
+  if [ "$(private.this.link.target.get "$targetHome/config")" != "$sharedConfig" ] \
+  || [ "$(private.this.link.target.get "$targetHome/oosh")" != "$sharedOosh" ]; then
+    needsRecreate=1
   fi
-  if [ "$_needsRecreate" = "1" ]; then
+  if [ "$(id -u)" = "0" ] || [ "$username" = "$USER" ]; then
+    for linkName in config oosh; do
+      [ -L "$targetHome/$linkName" ] || continue
+      [ "$(private.this.path.stat.get "$targetHome/$linkName" owner)" = "$username" ] && continue
+      private.this.entry.aside "$targetHome/$linkName" >/dev/null && needsRecreate=1
+    done
+  fi
+  if [ "$needsRecreate" = "1" ]; then
     # Delegate symlink convergence to the shared primitive
     # private.this.symlink.with.backup (in this). private.as.user runs
     # the operations AS the target user, so the symlinks naturally inherit
@@ -362,11 +363,26 @@ config.init.user()     # <?username:$USER> <?sharedOosh> # ensure the ~/config +
       return $(result)
     fi
   fi
-  # Phase 2 — force canonical owner on the symlinks. Only when this shell has
-  # the privilege to do so (root, or self).
-  if [ "$(id -u)" = "0" ] || [ "$username" = "$USER" ]; then
-    chown -h "$username:$username" "$targetHome/config" "$targetHome/oosh" 2>/dev/null || true # kernel-exception: pre-existing on dev, out of the heal scope
+
+  # Git trust of every folder under the base (clone layout, spec § 4): each
+  # folder is its own repository with its own safe.directory entry, and
+  # `oo update` / `oo user.fix` reach here, which makes this the repair (T-CONFIG-INIT-USER-CALLS).
+  # Before the .bashrc hop: its old-template check reads the git history of
+  # <sharedOosh> as the target (private.user.bashrc.old.template.is), which git
+  # refuses for a folder the target does not trust yet.
+  # The CALLER — function form, loaded on demand (the probe is the function
+  # called; a failed load is said, not stepped over):
+  if private.this.script.load ogit ogit.safeDirectory.ensure; then
+    ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null \
+      || warn.log "config.init.user: could not ensure safe.directory — $RESULT"
+  else
+    warn.log "config.init.user: cannot load ogit.safeDirectory.ensure from $OOSH_DIR/ogit — safe.directory not ensured for $(id -un)"
   fi
+  # The TARGET — as them, so it lands in THEIR --global config: through the
+  # as-user preamble (their HOME; runuser keeps the caller's) and ogit as a
+  # command, the same hop user.oosh.install uses.
+  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")' >/dev/null" 2>/dev/null \
+    || warn.log "config.init.user: could not ensure safe.directory for ${YELLOW}$username${NORMAL}"
 
   # The oosh .bashrc and the per-user session files the shared env files
   # chain UNGUARDED (log.session.env, user.session.env) — through the one
@@ -413,23 +429,6 @@ config.init.user()     # <?username:$USER> <?sharedOosh> # ensure the ~/config +
     *) warn.log "config.init.user: $RESULT"; writeFailed="$writeFailed; $RESULT" ;;
   esac
 
-  # Git trust of every folder under the base (clone layout, spec § 4): each
-  # folder is its own repository with its own safe.directory entry, and
-  # `oo update` / `oo user.fix` reach here, which makes this the repair (T-CONFIG-INIT-USER-CALLS).
-  # The CALLER — function form, loaded on demand (the probe is the function
-  # called; a failed load is said, not stepped over):
-  if private.this.script.load ogit ogit.safeDirectory.ensure; then
-    ogit.safeDirectory.ensure "$(dirname "$sharedOosh")" >/dev/null \
-      || warn.log "config.init.user: could not ensure safe.directory — $RESULT"
-  else
-    warn.log "config.init.user: cannot load ogit.safeDirectory.ensure from $OOSH_DIR/ogit — safe.directory not ensured for $(id -un)"
-  fi
-  # The TARGET — as them, so it lands in THEIR --global config: through the
-  # as-user preamble (their HOME; runuser keeps the caller's) and ogit as a
-  # command, the same hop user.oosh.install uses.
-  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' safeDirectory.ensure '$(dirname "$sharedOosh")' >/dev/null" 2>/dev/null \
-    || warn.log "config.init.user: could not ensure safe.directory for ${YELLOW}$username${NORMAL}"
-
   # Ensure dev group membership (idempotent; user.group.add no-ops if already a member).
   if private.user.check.group dev >/dev/null 2>&1; then
     user.group.add dev "$username" >/dev/null 2>&1
@@ -464,7 +463,7 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
   if [ -L "$targetHome/config" ]; then
     local cOwner cTarget tMode tGroup
     cOwner="$(private.this.path.stat.get "$targetHome/config" owner):$(private.this.path.stat.get "$targetHome/config" group)"
-    cTarget=$(readlink "$targetHome/config") # kernel-exception: pre-existing on dev, out of the heal scope
+    cTarget=$(private.this.link.target.get "$targetHome/config")
     info.log "  ~/config: owner=$cOwner target=$cTarget"
     if [ -d "$cTarget" ]; then
       tMode=$(private.this.path.stat.get "$cTarget" mode)
@@ -512,29 +511,40 @@ config.init.check() # <username:$USER> # diagnostics: report symlink state, dev-
 config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (mirrors install at oo:1456)
 {
   if [ -z "$OOSH_DIR" ]; then
-    error.log "config.init.env: \$OOSH_DIR is empty — re-source ${YELLOW}this${NORMAL} or rerun under ${YELLOW}sudo -E${NORMAL}"
-    return 1
+    create.result 1 "config.init.env: \$OOSH_DIR is empty — re-source this or rerun under sudo -E"
+    error.log "$RESULT"; return $(result)
   fi
   # CONFIG_PATH must point at the shared sharedConfig dir we want to write
   # into. Trust the calling context: bashrc/this set it to ~/config (the
   # symlink), which `config init.user` ensures points at sharedConfig.
   if [ -z "$CONFIG_PATH" ] || [ ! -d "$CONFIG_PATH" ]; then
-    error.log "config.init.env: \$CONFIG_PATH ${RED}$CONFIG_PATH${NORMAL} missing — run ${YELLOW}config init.user${NORMAL} first"
-    return 1
+    create.result 1 "config.init.env: \$CONFIG_PATH $CONFIG_PATH missing — run config init.user first"
+    error.log "$RESULT"; return $(result)
   fi
   # Back up ALL THREE, not just user.env. Only user.env was copied before, and
   # that is exactly how OOSH_PM was lost on the macOS VM: `config save oosh
   # OOSH` truncates oosh.env with `{ … } >$CONFIG` before anything can read the
   # surviving value out of it, so by the time the save fails there is nothing
   # left to restore from. The refuse-to-worsen guard below restores from these.
-  local _ts _envName
-  _ts=$(date +%Y%m%d-%H%M%S)
-  for _envName in user oosh log; do
-    [ -f "$CONFIG_PATH/$_envName.env" ] || continue
-    cp -p "$CONFIG_PATH/$_envName.env" "$CONFIG_PATH/$_envName.env.bak.$_ts" 2>/dev/null \
-      || warn.log "config.init.env: failed to back up $_envName.env (continuing)"
+  # They live in a private temp dir, not in the shared config every user
+  # sources: removed when nothing was lost, kept and named on a refusal (T39,
+  # T-CONFIG-INIT-ENV-REFUSAL-KEEPS-BACKUP).
+  local backupDir stamp envName
+  backupDir=$(private.this.temp.dir.get config.init.env)
+  if [ -z "$backupDir" ]; then
+    create.result 1 "config.init.env: no temp dir for the backups — nothing regenerated"
+    error.log "$RESULT"; return $(result)
+  fi
+  stamp=$(date +%Y%m%d-%H%M%S)
+  for envName in user oosh log; do
+    [ -f "$CONFIG_PATH/$envName.env" ] || continue
+    if ! cp -p "$CONFIG_PATH/$envName.env" "$backupDir/$envName.env.bak.$stamp" 2>/dev/null; then
+      rm -rf "$backupDir"
+      create.result 1 "config.init.env: could not back up $envName.env — nothing regenerated"
+      error.log "$RESULT"; return $(result)
+    fi
   done
-  important.log "config.init.env: backed up user/oosh/log .env → ${GREEN}*.env.bak.$_ts${NORMAL}"
+  important.log "config.init.env: backed up user/oosh/log .env → ${GREEN}$backupDir${NORMAL}"
 
   # WHAT WAS MISSING BEFORE THIS TICKET. config.save persists the ENVIRONMENT,
   # and the environment is populated FROM the config — a closed loop with no
@@ -552,23 +562,23 @@ config.init.env() # # regenerate user.env + oosh.env + log.env via config.save (
   # derived one. The verdicts go to stdout — nothing captures config.init.env,
   # unlike config.save — so an operator running the advertised repair can see
   # what was reconstructed and what could not be.
-  local _variable _file _deriver _derived _repaired="" _unrecoverable=""
-  while read -r _variable _file _deriver; do
-    [ -z "$_variable" ] && continue
-    [ -n "${!_variable}" ] && continue          # it survived; leave it alone
-    [ "$(type -t "$_deriver")" = "function" ] || { _unrecoverable="$_unrecoverable $_variable"; continue; }
-    _derived=$("$_deriver" 2>/dev/null)
-    if [ -n "$_derived" ]; then
-      export "$_variable=$_derived"
-      _repaired="$_repaired $_variable"
+  local variable file deriver derived repaired="" unrecoverable=""
+  while read -r variable file deriver; do
+    [ -z "$variable" ] && continue
+    [ -n "${!variable}" ] && continue          # it survived; leave it alone
+    [ "$(type -t "$deriver")" = "function" ] || { unrecoverable="$unrecoverable $variable"; continue; }
+    derived=$("$deriver" 2>/dev/null)
+    if [ -n "$derived" ]; then
+      export "$variable=$derived"
+      repaired="$repaired $variable"
     else
-      _unrecoverable="$_unrecoverable $_variable"
+      unrecoverable="$unrecoverable $variable"
     fi
   done <<REQUIRED
 $(private.config.required.variables.get)
 REQUIRED
-  [ -n "$_repaired" ]      && echo "config.init.env: re-derived:$_repaired"
-  [ -n "$_unrecoverable" ] && echo "config.init.env: could NOT derive:$_unrecoverable — the regenerated config will still be missing these"
+  [ -n "$repaired" ]      && echo "config.init.env: re-derived:$repaired"
+  [ -n "$unrecoverable" ] && echo "config.init.env: could NOT derive:$unrecoverable — the regenerated config will still be missing these"
 
   important.log "config.init.env: regenerating ${YELLOW}user.env${NORMAL} + ${YELLOW}oosh.env${NORMAL} + ${YELLOW}log.env${NORMAL} via ${YELLOW}config save${NORMAL} (mirrors install)"
   # `config save` (no args) cascades internally: writes user.env, then calls
@@ -577,36 +587,47 @@ REQUIRED
 
   # REFUSE TO WORSEN. The command `config validate required` advertises as the
   # repair must never again be able to make its own report worse — which is
-  # precisely what it did on the VM. A LOSS is judged by variable NAME across
-  # the three files: a variable exported in any backup and in NONE of the
-  # regenerated files. A per-file count called the migration a loss — the
-  # 26d15a4-era user.env held OOSH_DIR, which the model keeps in oosh.env, and
-  # the per-file 7 → 4 restored the old user.env (ubuntu_24_04 heal gate,
+  # precisely what it did on the VM. A LOSS is judged by variable NAME: a
+  # variable exported in a backup and in NONE of the env files the regenerated
+  # user.env chains (private.config.chain.names.get — odocker.env too, where
+  # an old user.env's ODOCKER_WORKSPACES lives now,
+  # T-CONFIG-INIT-ENV-MIGRATED-NAME), else every *.env of the config. A
+  # per-file count called the migration a loss (ubuntu_24_04 heal gate,
   # T-CONFIG-INIT-ENV-OLD-USER-ENV). On a loss all three backups go back.
-  # Not losses: PATH and OOSH_MODE moved to the per-user session files
-  # (T-CONFIG-USER-SESSION-INIT-ENV); the per-user dir variable was removed
-  # 2026-10-01 (docs/config.md, the dir is spelled $HOME/.config/oosh, T44)
-  # and the OOSH_CONFIG_VERSION stamp left with the revert to e6b454d; nor is
-  # a name config save never persists (private.config.variable.persisted.is).
-  local _envRc=0 _was="" _now="" _name _lost=""
-  for _envName in user oosh log; do
-    [ -f "$CONFIG_PATH/$_envName.env.bak.$_ts" ] && _was="$_was $(private.config.env.export.names.get "$CONFIG_PATH/$_envName.env.bak.$_ts" | tr '\n' ' ')"
-    _now="$_now $(private.config.env.export.names.get "$CONFIG_PATH/$_envName.env" | tr '\n' ' ')"
+  # Not losses: a retired name (private.config.variable.retired.is) and a name
+  # config save never persists (private.config.variable.persisted.is).
+  local was="" now="" name lost="" chained envFile
+  for envName in user oosh log; do
+    [ -f "$backupDir/$envName.env.bak.$stamp" ] && was="$was $(private.config.env.names.read "$backupDir/$envName.env.bak.$stamp" | tr '\n' ' ')"
   done
-  for _name in $_was; do
-    case "$_name" in PATH|OOSH_MODE|OOSH_USER_CONFIG_PATH|OOSH_CONFIG_VERSION) continue ;; esac   # legacy-chain: retired names of an old file, migrated away, never read
-    private.config.variable.persisted.is "$_name" || continue   # never written by config save, so never lost by it
-    case " $_now $_lost " in *" $_name "*) continue ;; esac
-    _lost="$_lost $_name"
-  done
-  if [ -n "$_lost" ]; then
-    echo "config.init.env: REFUSING — the regenerated files lost:$_lost; restoring the user/oosh/log backups *.env.bak.$_ts"
-    for _envName in user oosh log; do
-      [ -f "$CONFIG_PATH/$_envName.env.bak.$_ts" ] && cp -p "$CONFIG_PATH/$_envName.env.bak.$_ts" "$CONFIG_PATH/$_envName.env" 2>/dev/null
+  chained=$(private.config.chain.names.get "$CONFIG_PATH/user.env")
+  if [ -n "$chained" ]; then
+    for envName in user $chained; do
+      now="$now $(private.config.env.names.read "$CONFIG_PATH/$envName.env" | tr '\n' ' ')"
     done
-    _envRc=1
+  else
+    for envFile in "$CONFIG_PATH"/*.env; do
+      case "$envFile" in *.bak*) continue ;; esac
+      now="$now $(private.config.env.names.read "$envFile" | tr '\n' ' ')"
+    done
   fi
-  return $_envRc
+  for name in $was; do
+    private.config.variable.retired.is "$name" && continue    # moved to the per-user files, or retired
+    private.config.variable.persisted.is "$name" || continue   # never written by config save, so never lost by it
+    case " $now $lost " in *" $name "*) continue ;; esac
+    lost="$lost $name"
+  done
+  if [ -n "$lost" ]; then
+    for envName in user oosh log; do
+      [ -f "$backupDir/$envName.env.bak.$stamp" ] && cp -p "$backupDir/$envName.env.bak.$stamp" "$CONFIG_PATH/$envName.env" 2>/dev/null
+    done
+    echo "config.init.env: REFUSING — the regenerated files lost:$lost; restored user/oosh/log, backups kept in $backupDir"
+    create.result 1 "config.init.env: refused, the regenerated files lost:$lost — restored, backups kept in $backupDir"
+    return $(result)
+  fi
+  rm -rf "$backupDir"
+  create.result 0 "config.init.env: user.env, oosh.env and log.env regenerated"
+  return $(result)
 }
 
 config.init.full() # <username:$USER> # repair end-to-end: shared dir + user symlinks + env files + diagnostics
@@ -1034,7 +1055,7 @@ private.config.session.file.ensure()     # <targetHome> # create log.session.env
 }
 
 
-private.config.path.line.get()     #  # echo the PATH line of user.env: a snapshot of this shell's PATH made safe for a shared config — ~/oosh and ~/oosh/ng first, a bash outside /bin and /usr/bin next, every segment under $HOME written "$HOME/…", no empty, ".", relative or transient segment, each once, then :$PATH #
+private.config.path.line.get()     #  # echo the PATH line of user.env: a snapshot of the PATH of this shell made safe for a shared config — ~/oosh and ~/oosh/ng first, a bash outside /bin and /usr/bin next, every segment under $HOME written "$HOME/…", no empty, ".", relative or transient segment, each once, then :$PATH #
 {
  # NO create.result — its stdout IS the line, written inside config.save's
  # `{ … } >$CONFIG`: SILENT BY CONTRACT.
@@ -1050,7 +1071,7 @@ private.config.path.line.get()     #  # echo the PATH line of user.env: a snapsh
 }
 
 
-private.config.chain.names.get()     # <file:$CONFIG> # echo the name of every env file <file> chains with a '. $CONFIG_PATH/<name>.env' (or 'source …') line, in order, one per line; silent #
+private.config.chain.names.get()     # <file:$CONFIG> # echo the name of every env file <file> chains with a . $CONFIG_PATH/<name>.env line (or source …), in order, one per line; silent #
 {
   # NO create.result, NO logging — a getter consumed as $(...) by config.save,
   # which reads the chains BEFORE `>$CONFIG` truncates the file (the same
@@ -1074,7 +1095,7 @@ private.config.chain.names.get()     # <file:$CONFIG> # echo the name of every e
 }
 
 
-private.config.log.chain.migrate()     # <?configPath:$CONFIG_PATH> # rewrite log.env's old session chain line to . $HOME/.config/oosh/log.session.env, in place; idempotent, silent #
+private.config.log.chain.migrate()     # <?configPath:$CONFIG_PATH> # rewrite the old session chain line of log.env to . $HOME/.config/oosh/log.session.env, in place; idempotent, silent #
 {
  # The per-user dir variable was removed 2026-10-01 (always $HOME/.config/oosh,
  # T44). A host's shared log.env still ends with the old line until it is
@@ -1119,7 +1140,7 @@ private.config.path.segments.get()     # <?form:home> # echo the PATH of this sh
  # The link's OWN spelling of the folder too: on macOS the link and the
  # installer's PATH say /Users/shared/…, the canonical path /Users/Shared/…
  # (case-insensitive file system) — T-CONFIG-PATH-LINE-LINK-SPELLING.
- ooshLink=$(readlink "$home/oosh" 2>/dev/null); ooshLink="${ooshLink%/}" # kernel-exception: pre-existing on dev, out of the heal scope
+ ooshLink=$(private.this.link.target.get "$home/oosh"); ooshLink="${ooshLink%/}"
  case "$ooshLink" in /*) ;; *) ooshLink="" ;; esac
  [ "$ooshLink" = "$ooshPhys" ] && ooshLink=""
  local bashDir="${BASH_FILE%/*}"
@@ -1414,7 +1435,7 @@ private.config.host.container.name.get()     #  # echo the Docker name of this c
 }
 
 
-private.config.host.name.get()     # <?name> # echo the name of this computer for oosh (prompt, logs, ssh): <name> when given, else a container's Docker name, the macOS LocalHostName, else the short host name #
+private.config.host.name.get()     # <?name> # echo the name of this computer for oosh (prompt, logs, ssh): <name> when given, else the Docker name of a container, the macOS LocalHostName, else the short host name #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
  # $HOSTNAME is a container's ID ([oosh 2a1023f6d45b], 2026-10-05) and on a Mac
@@ -1432,7 +1453,7 @@ private.config.host.name.get()     # <?name> # echo the name of this computer fo
 }
 
 
-private.config.host.name.refresh()     #  # correct the saved computer name (OOSH_SSH_CONFIG_HOST in oosh.env) when it was guessed and is wrong now — empty, a container ID, the raw host name, another container's name (a cloned image); a name chosen with config ssh.host.set is kept #
+private.config.host.name.refresh()     #  # correct the saved computer name (OOSH_SSH_CONFIG_HOST in oosh.env) when it was guessed and is wrong now — empty, a container ID, the raw host name, the name of another container (a cloned image); a name chosen with config ssh.host.set is kept #
 {
   # A chosen name is anything else: the alias `ossh install <alias>` gave, or
   # what `config ssh.host.set` set — never overwritten.
@@ -1682,7 +1703,7 @@ NAMES
 }
 
 
-private.config.shared.oosh.base.get()     #  # echo the components base the branch folders sit in, the parent of developking's home + /shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh, in the file system letter case (private.this.path.case.get); the one base of config.init.user and its completion; nothing and rc 1 when developking has no home #
+private.config.shared.oosh.base.get()     #  # echo the components base the branch folders sit in, the parent of the home of developking + /shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh, in the file system letter case (private.this.path.case.get); the one base of config.init.user and its completion; nothing and rc 1 when developking has no home #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT; it
  # runs inside c2's completion subprocess too. The one base of
@@ -1803,7 +1824,7 @@ private.config.host.name.valid()     # <name> # rc 0 when <name> can be the comp
 }
 
 
-private.config.shared.config.get()     #  # echo the shared config directory, the parent of developking's home + /shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig, in the file system letter case (private.this.path.case.get), the sibling of private.config.shared.oosh.base.get; the one sharedConfig of config.init.shared, config.init.user and the heal; nothing and rc 1 when developking has no home #
+private.config.shared.config.get()     #  # echo the shared config directory, the parent of the home of developking + /shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig, in the file system letter case (private.this.path.case.get), the sibling of private.config.shared.oosh.base.get; the one sharedConfig of config.init.shared, config.init.user and the heal; nothing and rc 1 when developking has no home #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT. The
  # sibling of private.config.shared.oosh.base.get: a literal lowercase
@@ -1818,15 +1839,6 @@ private.config.shared.config.get()     #  # echo the shared config directory, th
 }
 
 
-private.config.env.export.names.get()     # <file> # echo the names of the variables <file> exports (export NAME=…, also export declare), one per line; nothing for a missing file; silent getter #
-{
- # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
- # The names, not the values: config.init.env's refuse-to-worsen asks whether
- # a variable survived somewhere in the three files, not where.
- local file="$1"
- [ -f "$file" ] || return 0
- sed -nE 's/^[[:space:]]*export[[:space:]]+(declare[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' "$file"
-}
 
 
 private.config.variable.persisted.is()     # <name> # rc 0 when config save persists the variable <name>; rc 1 for the never-persist names (installer state, run-time markers, per-process log settings, sudo); silent predicate #
@@ -1841,6 +1853,21 @@ private.config.variable.persisted.is()     # <name> # rc 0 when config save pers
    *INSTALL*|OOSH_BRANCH|ODOCKER_SG|ODOCKER_SOCKET|OOSH_SHLVL|OOSH_STATUS|OOSH_PROMPT|OOSH_CONFIG_NEEDS_SAVE|OOSH_CLEAN_ENV|OOSH_APT_UPDATED|OOSH_USER_CONFIG_PATH|LOG_NAME|LOG_DEVICE|LOG_LIVE|SUDO_*|_) return 1 ;;
  esac
  return 0
+}
+
+
+private.config.variable.retired.is()     # <name> # rc 0 for a name an old env file exported that the shared env files keep no more: PATH and OOSH_MODE (the per-user session files) and the two retired names; the init.env guard counts no loss of one; silent predicate #
+{
+ # NO output — a predicate, the sibling of private.config.variable.persisted.is:
+ # config.init.env compares an old file with the regenerated shared files, and
+ # these names left them on purpose. PATH and OOSH_MODE moved to the per-user
+ # user.session.env / oosh.session.env (T-CONFIG-USER-SESSION-INIT-ENV); the
+ # per-user dir variable was removed 2026-10-01 (T44) and the version stamp
+ # left with the revert to e6b454d (T-CONFIG-INIT-ENV-OLD-USER-ENV).
+ case "$1" in
+   PATH|OOSH_MODE|OOSH_USER_CONFIG_PATH|OOSH_CONFIG_VERSION) return 0 ;;   # legacy-chain: retired names of an old file, migrated away, never read
+ esac
+ return 1
 }
 
 
@@ -2106,12 +2133,12 @@ REQUIRED
     # a non-zero rc here is already more than any caller acts on today (audited
     # 2026-09-17 — nothing branches on it; private.check.pm is the only place it
     # could propagate and oo.pm.discover masks it with `RETURN=$1`).
-    local _envName _invalid=""
-    for _envName in user oosh log; do
-      config.validate "$_envName" >/dev/null 2>&1 || _invalid="$_invalid $_envName"
+    local envName invalidNames=""
+    for envName in user oosh log; do
+      config.validate "$envName" >/dev/null 2>&1 || invalidNames="$invalidNames $envName"
     done
-    if [ -n "$_invalid" ]; then
-      echo "INVALID: config.save wrote$_invalid with logic in it — run 'config validate <name>' to see why" >&2
+    if [ -n "$invalidNames" ]; then
+      echo "INVALID: config.save wrote$invalidNames with logic in it — run 'config validate <name>' to see why" >&2
       configSaveRc=1
     fi
     # if [ -x "$(command -v once)" ]; then
@@ -2264,12 +2291,12 @@ private.config.file.resolve() # # echo the effective file for the current $CONFI
   # the per-user tier (e.g. `log.session`) resolves THERE. Callers pass through
   # config.file.check first, which sets $CONFIG_FILE. Pure echo — no global
   # mutation, so `config list log.session` never leaves $CONFIG repointed.
-  local _shared="$CONFIG_PATH/$CONFIG_FILE"
-  local _peruser="$HOME/.config/oosh/$CONFIG_FILE"
-  if [ ! -f "$_shared" ] && [ -f "$_peruser" ]; then
-    echo "$_peruser"
+  local sharedFile="$CONFIG_PATH/$CONFIG_FILE"
+  local perUserFile="$HOME/.config/oosh/$CONFIG_FILE"
+  if [ ! -f "$sharedFile" ] && [ -f "$perUserFile" ]; then
+    echo "$perUserFile"
   else
-    echo "$_shared"
+    echo "$sharedFile"
   fi
 }
 
@@ -2280,10 +2307,10 @@ config.list() # <name:$CONFIG> # lists the content of the config with <name>
   # calls after save/clean) never leaves $CONFIG/$CONFIG_FILE repointed for the
   # rest of the shell — a later config.add/clean would otherwise write to / rm
   # the wrong file. Resolve the tier (shared, else per-user) for the view only.
-  local _savedConfig="$CONFIG" _savedFile="$CONFIG_FILE"
+  local savedConfig="$CONFIG" savedFile="$CONFIG_FILE"
   config.file.check $1
   cat "$(private.config.file.resolve)"
-  CONFIG="$_savedConfig"; CONFIG_FILE="$_savedFile"
+  CONFIG="$savedConfig"; CONFIG_FILE="$savedFile"
 }
 
 config.delete() # <name:$CONFIG> # deletes the config with <name>
@@ -2314,13 +2341,13 @@ config.edit() # <name:$CONFIG> # edits the config with <name> in vim
   # Tier-aware (shared, else per-user) so editing `log.session` opens the real
   # per-user file instead of creating a SHARED shadow that then masks it for
   # every user in `config list log.session`. Symmetry with list/delete.
-  local _f
+  local resolvedFile
   if config.file.check $1; then
-    _f="$(private.config.file.resolve)"
-    vim "$_f"
+    resolvedFile="$(private.config.file.resolve)"
+    vim "$resolvedFile"
   else
-    _f="$(private.config.file.resolve)"
-    vim "$_f"
+    resolvedFile="$(private.config.file.resolve)"
+    vim "$resolvedFile"
     exit $ERROR_CODE_RECONFIG
   fi
 }

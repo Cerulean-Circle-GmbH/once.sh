@@ -363,20 +363,24 @@ from `user.list`.
 
 #### `config.init.env`
 Regenerates `user.env`, `oosh.env`, and `log.env` by calling `config save`
-(no args) — the same flow the install uses at `oo:1456`. **Backs up
-`user.env` to `user.env.bak.<timestamp>` first** so any hand-edited
-customisations (custom non-`CONFIG_*` exports, hand-added source lines beyond
-what `config add` writes) are recoverable. Caller's shell must have `OOSH_DIR`
+(no args) — the same flow the install uses at `oo:1456`. **Backs up all three
+first, outside the config:** `<name>.env.bak.<timestamp>` in a private temp
+directory (`private.this.temp.dir.get config.init.env`, mode 700), never in the
+shared config every user sources; removed when the run lost nothing, kept and
+named in the refusal otherwise. Caller's shell must have `OOSH_DIR`
 and the relevant `OOSH_*`/`LOG_*` vars set — true for any normal `./config`
 invocation, but under `sudo` use `sudo -E` to preserve env.
 
-It backs up all three files and **refuses to worsen** them: a variable exported in a
-backup and in none of the three regenerated files is a loss, and then all three backups
-go back (`REFUSING — the regenerated files lost: …`, rc 1). A variable that only moved
-files is no loss — an old user.env's `OOSH_DIR` now lives in `oosh.env` — and neither
-are PATH and OOSH_MODE (per-user session files), `OOSH_USER_CONFIG_PATH` (removed
-2026-10-01), `OOSH_CONFIG_VERSION` (an old version stamp) and every name `config save` never
-persists (e.g. `OOSH_APT_UPDATED`, `OOSH_CLEAN_ENV`, which an older `oosh.env` carried) (`private.config.variable.persisted.is`, the one list of § Excluded variables) (T-CONFIG-INIT-ENV-OLD-USER-ENV).
+It **refuses to worsen** them: a variable exported in a backup and in none of the env files
+the regenerated `user.env` chains (`. $CONFIG_PATH/<name>.env`, read by
+`private.config.chain.names.get`; without a chain, every `*.env` of the config) is a loss, and
+then all three backups go back (`REFUSING — the regenerated files lost: …; restored user/oosh/log,
+backups kept in <dir>`, rc 1). A variable that only moved files is no loss — an old user.env's
+`OOSH_DIR` now lives in `oosh.env`, its `ODOCKER_WORKSPACES` in the chained `odocker.env`
+(T-CONFIG-INIT-ENV-MIGRATED-NAME) — and neither are the retired names
+(`private.config.variable.retired.is`: PATH and OOSH_MODE, now in the per-user session files,
+`OOSH_USER_CONFIG_PATH`, removed 2026-10-01, and the old `OOSH_CONFIG_VERSION` stamp) and every
+name `config save` never persists (e.g. `OOSH_APT_UPDATED`, `OOSH_CLEAN_ENV`, which an older `oosh.env` carried) (`private.config.variable.persisted.is`, the one list of § Excluded variables) (T-CONFIG-INIT-ENV-OLD-USER-ENV).
 
 ```bash
 ./config init.env                 # repair self's env files
@@ -727,8 +731,8 @@ These functions are used internally and generally not called directly:
 | `config.completion.*` | Tab completion helpers |
 | `private.config.variables.list` | `<envPrefix> <?sessionSplit>` → one persistable variable NAME per line (`compgen -v`, shape gates, exclusion list); `sessionSplit` (`yes`/`no`) is the layout a full `config save` decided and hands down (`private.config.save oosh OOSH <sessionSplit> <ooshSplit>`), empty reads it off `user.env` |
 | `private.config.save` | `<?name> <?ENV_PREFIX> <?sessionSplit> <?ooshSplit>` → the work of `config.save`; the public `config save <?name> <?ENV_PREFIX>` takes no layout — only a full save hands it to its nested oosh save |
-| `private.config.env.export.names.get` | `<file>` → the names of the variables the file exports (`export NAME=…`, also `export declare`), one per line; nothing for a missing file; silent getter. `config init.env`'s guard judges a loss by these names |
 | `private.config.variable.persisted.is` | `<name>` → rc 0 when `config save` persists the variable, rc 1 for the never-persist names (`*INSTALL*`, `OOSH_BRANCH`, `ODOCKER_*`, `OOSH_SHLVL`/`STATUS`/`PROMPT`/`CONFIG_NEEDS_SAVE`, `OOSH_CLEAN_ENV`, `OOSH_APT_UPDATED`, `OOSH_USER_CONFIG_PATH`, `LOG_NAME`/`DEVICE`/`LIVE`, `SUDO_*`); silent predicate; the one list `config save` and the init.env guard share |
+| `private.config.variable.retired.is` | `<name>` → rc 0 for a name an old env file exported that the shared env files keep no more (PATH, OOSH_MODE, `OOSH_USER_CONFIG_PATH`, `OOSH_CONFIG_VERSION`); silent predicate; the `config init.env` guard counts no loss of one |
 | `private.config.variable.export.line` | `<variableName>` → one `export NAME="value"` line; rc 1 for unset, array, or an ANSI-C-quoted value |
 | `private.config.variables.export` | `<envPrefix> <?sessionSplit>` → the whole body of a generated env file |
 | `private.config.string.upper` | `<string>` → upper-cased, without the bash-4 `${var^^}` operator |
@@ -741,7 +745,7 @@ These functions are used internally and generally not called directly:
 | `private.config.env.names.read` | `<file>` → the name of every variable an `export NAME=` or `declare -x NAME=` line assigns, once each, in order, read as data and never sourced; silent |
 | `private.config.host.name.valid` | `<name>` → rc 0 when `<name>` can be the computer name: letters, digits, `-` and `_`, starting with a letter or digit, no dot, at most 63 characters |
 | `private.config.shared.oosh.base.get` | the components base the branch folders sit in — the parent of developking's home + `/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh`, in the file system's letter case; the one base of `config init.user`'s `<sharedOosh>` check and of its completion; nothing and rc 1 when developking has no home; silent |
-| `private.config.shared.config.get` | the shared config directory — the parent of developking's home + `/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig`, in the file system's letter case, the sibling of `private.config.shared.oosh.base.get`; the one sharedConfig of `config init.shared`, `config init.user` and the heal (`private.oo.heal.path.get`); nothing and rc 1 when developking has no home; silent. A literal lowercase `shared` linked `~/config` as `/Users/shared/…` on macOS (`/Users/Shared`), so every run found the link wrong and relinked it |
+| `private.config.shared.config.get` | the shared config directory — the parent of developking's home + `/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig`, in the file system's letter case — the letter case of its longest existing prefix, so a path the install has not made yet still gets `/Users/Shared` on macOS (`private.this.path.case.get`, T-CONFIG-SHARED-PATH-CASE-MISSING-CHILD), as does the oosh base, the sibling of `private.config.shared.oosh.base.get`; the one sharedConfig of `config init.shared`, `config init.user` and the heal (`private.oo.heal.path.get`); nothing and rc 1 when developking has no home; silent. A literal lowercase `shared` linked `~/config` as `/Users/shared/…` on macOS (`/Users/Shared`), so every run found the link wrong and relinked it |
 | `private.config.orig.import` | `<origDir> <sharedConfig>` → carries an allow-listed few values from a kept-aside `~/config` into the shared config (see below) |
 
 **`private.config.orig.import`** is what `oo heal` calls (`private.oo.heal.env`) for each real `~/config` that
