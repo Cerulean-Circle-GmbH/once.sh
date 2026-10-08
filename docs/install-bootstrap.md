@@ -150,7 +150,9 @@ The seeded `PATH` above belongs to the clean re-exec. The pipe form (`curl … |
 clean re-exec — `$0` is `sh` — so it keeps the **caller's** `PATH`, which on a Mac account (an ssh login
 of a second user) may lack `/opt/homebrew/bin` and so `brew` and its bash 5. The `brewPath` block in Phase A,
 before the package-manager detection and the bash 4+ check, puts them there: on Darwin only, it prepends `/opt/homebrew/bin`, then
-`/usr/local/bin`, each only when the directory exists and is not already on `PATH`. Phase B's own
+`/usr/local/bin`, those of them that exist, unless `PATH` already starts with them. Homebrew goes first even
+when the caller's `PATH` holds it later — the old frozen `PATH` of era-B configs has it after `/bin`, where
+`/bin/bash` 3.2 wins; the later copy stays and is harmless. Phase B's own
 prepend is reduced to the directory of the `bash` already found. On macOS `sh` is itself bash 3.2: the
 file form re-execs under a bash 4+, the heal does not need to (see below).
 
