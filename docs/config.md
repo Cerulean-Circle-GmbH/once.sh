@@ -277,17 +277,21 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 |---|---|---|
 | `~/config` symlink | `<user>:<user>` (NOT `<user>:dev`) | symlink |
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
-| `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
-| files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
+| `~/config` target (`…/sharedConfig/`) and its directories | `developking:dev` (directories: per-creator) | `2775` — group `dev`, `g+w`, setgid |
+| files in `sharedConfig/` | per-creator | group `dev` (inherited through the setgid directory), `g+w` |
 | `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`: **every** `OOSH_*` variable, a value under the saving user's home written `"$HOME/…"` (the config is shared). Only `OOSH_BRANCH` is left out — install input, not state. |
 | `user.env` | **pure data** — the `CONFIG_*` anchors, `BASH_FILE`, then `. $CONFIG_PATH/oosh.env` and `. $CONFIG_PATH/log.env`, last `. $HOME/.config/oosh/user.session.env` | written by `config save` — what `.bashrc` and `source this` start a shell from (the MacStudio model); see *Saving Configuration* below. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
-mirror install state 31 (the `config save` call, then the group `dev` and
-`chmod -R g+w` steps on `$CONFIG_PATH`). They explicitly do **not** add
-SGID 2775 to the files — `private.ensure.sharedTree` sets group and `g+w` only;
-group ownership on writes is enforced by every writer calling
-`private.ensure.groupWrite`.
+mirror install state 31 (the `config save` call, then the group `dev`, `g+w` and
+setgid step on `$CONFIG_PATH`). Both share it through the kernel's one share
+primitive, `private.this.folder.share <dir> yes`: only the entries
+`private.this.share.pending.list` names (not group `dev`, not `g+w`, a directory
+without setgid) are handed to `chgrp` and `chmod` — never `-R` — so an entry
+another user owns that is already right is no error. The directories get setgid
+(2775), so a file root creates in the sharedConfig is group `dev`; the oosh
+writers keep calling `private.ensure.groupWrite` for `g+w`, and `oo heal`'s clean
+process writes with umask 002 ([oo.md](oo.md#ooheal)).
 
 State 31 creates the shared config once and never copies into an existing one — but on
 every run it carries the **installing state machine** (`stateMachines/` and
@@ -308,9 +312,12 @@ sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_
 ```
 
 #### `config.init.shared`
-Ensures the shared `sharedConfig/` directory has group `dev`, recursively
-`g+w`, and removes any self-referential symlink at
-`sharedConfig/sharedConfig`. Mirrors install at `oo:1462–1463`. Idempotent.
+Shares the `sharedConfig/` with group `dev`: its directories `2775` (group `dev`,
+`g+w`, setgid), its files group `dev` and `g+w` — only the entries not shared yet
+(`private.this.folder.share <sharedConfig> yes`); an entry still wrong afterwards
+that is not the caller's to change is named, rc 1. It removes any
+self-referential symlink at `sharedConfig/sharedConfig`
+(`private.this.selfLoop.remove`). The same calls as install state 31. Idempotent.
 
 ```bash
 ./config init.shared

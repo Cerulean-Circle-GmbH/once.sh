@@ -466,56 +466,6 @@ private.this.symlink.with.backup()     # <linkPath> <target> <?ts> # ensure <lin
   return $(result)
 }
 
-private.ensure.sharedTree() { # <dir> # ensure <dir> is group dev, recursively g+w; drop self-loops
-  # Brings an oosh-created tree to group dev and g+w: `config init.shared`
-  # gives it sharedConfig, private.this.folder.share gives it the clones
-  # (ogit.folder.finish) and the odocker workspaces. Plus a corruption-fix that
-  # removes a self-referential symlink left over from the old
-  # `cp -r ~/config sharedConfig` of install state 31.
-  # State 31 itself changes nothing recursively any more: it creates only the
-  # missing segments (private.oo.shared.dir.ensure → private.this.dir.ensure,
-  # group dev and mode 2775 on those) and never re-owns a directory that existed.
-  #
-  # NOTE: no SGID here — sharedConfig relies on every writer calling
-  # `private.ensure.groupWrite`; private.this.folder.share adds setgid for the
-  # folders it shares. Don't add SGID here.
-  #
-  # Elevation: only sudo when the caller doesn't own the target (i.e. the real
-  # `sharedConfig/` dir typically owned developking:dev). Test fixtures and
-  # caller-owned dirs use the unprivileged path — important so the test-suite
-  # can run without an interactive sudo prompt.
-  local dir="$1"
-  if [ -z "$dir" ] || [ ! -e "$dir" ]; then
-    error.log "private.ensure.sharedTree: directory missing: ${RED}$dir${NORMAL}"
-    return 1
-  fi
-  if ! private.this.group.exists dev; then
-    warn.log "private.ensure.sharedTree: dev group not present — skipping (single-user install)"
-    return 0
-  fi
-  local _sudo=""
-  [ ! -O "$dir" ] && _sudo="$SUDO"
-
-  # Detect & drop the known self-referential symlink (sharedConfig/sharedConfig
-  # -> .../sharedConfig). Compare canonical paths so we only remove true
-  # self-loops, regardless of relative-vs-absolute link target.
-  local resolvedDir
-  resolvedDir=$(private.this.path.canonical "$dir")
-  local entry
-  for entry in "$dir"/*; do
-    if [ -L "$entry" ]; then
-      local resolvedEntry
-      resolvedEntry=$(private.this.path.canonical "$entry")
-      if [ -n "$resolvedEntry" ] && [ "$resolvedEntry" = "$resolvedDir" ]; then
-        important.log "private.ensure.sharedTree: removing self-referential symlink ${YELLOW}$entry${NORMAL}"
-        $_sudo rm -f "$entry"
-      fi
-    fi
-  done
-  $_sudo chgrp -R dev "$dir" 2>/dev/null # recursive-exception: the oosh-created tree it is given: sharedConfig and the clones
-  $_sudo chmod -R g+w "$dir" 2>/dev/null # recursive-exception: the oosh-created tree it is given: sharedConfig and the clones
-}
-
 this.functionExists() {
 
   local startFunc="$1"
@@ -1238,35 +1188,49 @@ private.this.folder.entries.copy()     # <from> <to> # copy every entry of <from
 }
 
 
-private.this.folder.share()     # <dir> # share <dir> with group dev: private.ensure.sharedTree (chgrp dev, g+w) plus setgid on every directory so new files inherit the group; only what is not shared yet is touched (private.this.share.pending.list), so an entry another user owns that is right is no error; rc 1 naming the first entry that is wrong and not ours; rc 0 without a dev group; never chown #
+private.this.folder.share()     # <dir> <?setgid:yes> # share <dir> with group dev: chgrp dev and g+w on the entries private.this.share.pending.list names and on nothing else — never recursive — and setgid on its directories (setgid yes) so new files inherit the group; an entry another user owns that is right is no error; rc 1 naming the first entry still pending afterwards (wrong and not ours); rc 0 without a dev group; $SUDO when <dir> is not ours; never chown #
 {
- # One definition, shared by ogit (ogit.folder.finish) and odocker
- # (workspace.seed). private.ensure.sharedTree deliberately sets no SGID —
- # sharedConfig relies on its writers calling private.ensure.groupWrite — but a
- # NEW folder under the shared tree needs setgid dirs so that files created
- # later inherit group dev. Never chown (T-STATE-31-CHOWN-NOT-RECURSIVE).
- local dir="$1"
+ # The one share primitive: ogit.repo.share (.git), ogit.folder.finish (the
+ # work tree), config.init.shared and install state 31 (the sharedConfig),
+ # odocker workspace.seed. Never chown (T-STATE-31-CHOWN-NOT-RECURSIVE).
+ # Only what is pending is handed to chgrp and chmod: one pending entry used
+ # to run chgrp -R / chmod -R over the whole tree, failures silenced
+ # (T-THIS-FOLDER-SHARE-PENDING-ONLY), and chmod and chgrp fail on another
+ # owner's entry even when nothing would change — root's fast-forward left
+ # root-owned, right files in a user's clone (T-THIS-FOLDER-SHARE-NOT-OURS).
+ local dir="$1" setgid="${2:-yes}" pending entry sudoWord="" dirMode=g+w what="g+w"
+ local -a dirs=() files=()
  if [ ! -d "$dir" ]; then create.result 1 "no such folder: $dir"; return $(result); fi
+ case "$setgid" in
+   yes) dirMode=g+ws; what="g+w, setgid" ;;
+   no)  ;;
+   *)   create.result 1 "private.this.folder.share: <setgid> is yes or no, got '$setgid'"; return $(result) ;;
+ esac
  if ! private.this.group.exists dev; then create.result 0 "no dev group — $dir left as it is"; return $(result); fi
- # Only what is pending is touched, and the verdict is what is still pending
- # afterwards: root's fast-forward left root-owned files in a user's clone,
- # already group dev and g+w, and chgrp -R / chmod -R failed on them for the
- # user — "could not share the working tree" (T-THIS-FOLDER-SHARE-NOT-OURS).
- local pending
- pending=$(private.this.share.pending.list "$dir")
+ pending=$(private.this.share.pending.list "$dir" "$setgid")
  if [ -n "$pending" ]; then
-   # Their rc is not the verdict: an entry of another owner that is right fails them too.
-   private.ensure.sharedTree "$dir" >/dev/null 2>&1
-   find "$dir" -type d ! -perm -2000 -exec chmod g+s {} + 2>/dev/null
-   pending=$(private.this.share.pending.list "$dir")
+   # The sharedConfig is developking's: a user's `config init.shared` elevates, as before.
+   [ -O "$dir" ] || sudoWord="$SUDO"
+   while IFS= read -r entry; do
+     [ -n "$entry" ] || continue
+     if [ -d "$entry" ]; then dirs+=("$entry"); else files+=("$entry"); fi
+   done <<< "$pending"
+   # One chgrp and one chmod per batch of pending entries (xargs -0: any name,
+   # ARG_MAX). Their rc is not the verdict: an entry another user owns fails
+   # them, right or not — what is still pending afterwards is.
+   printf '%s\0' "${dirs[@]}" "${files[@]}" | xargs -0 $sudoWord chgrp dev 2>/dev/null
+   [ "${#files[@]}" -eq 0 ] || printf '%s\0' "${files[@]}" | xargs -0 $sudoWord chmod g+w 2>/dev/null
+   [ "${#dirs[@]}" -eq 0 ] || printf '%s\0' "${dirs[@]}" | xargs -0 $sudoWord chmod "$dirMode" 2>/dev/null
+   pending=$(private.this.share.pending.list "$dir" "$setgid")
  fi
  if [ -n "$pending" ]; then
-   create.result 1 "could not share $dir with group dev: $(echo "$pending" | grep -c .) entries are not group dev, group-writable and setgid, and not $(id -un)'s to change (first: $(echo "$pending" | head -n 1))"
+   create.result 1 "could not share $dir with group dev: $(echo "$pending" | grep -c .) entries are not group dev, group-writable$([ "$setgid" = yes ] && echo " and setgid"), and not $(id -un)'s to change (first: $(echo "$pending" | head -n 1))"
    return $(result)
  fi
- create.result 0 "$dir shared with group dev (g+w, setgid)"
+ create.result 0 "$dir shared with group dev ($what)"
  return $(result)
 }
+private.this.folder.share.completion.setgid() { echo yes; echo no; }
 
 
 private.this.group.name.get()     # <gid> # echo the name of the group with number <gid>: getent where present, else /etc/group, dscl on macOS; nothing when there is none #
@@ -1751,7 +1715,7 @@ private.this.entry.aside()     # <path> <?ts> <?asideDir:${path%/*}> # move a re
 }
 
 
-private.this.share.pending.list()     # <dir> # echo every entry under <dir> (itself included) that is not shared with group dev yet, one per line: not group dev or not group-writable (when a dev group exists), a directory without setgid; symlinks skipped; nothing when all is shared; silent getter #
+private.this.share.pending.list()     # <dir> <?setgid:yes> # echo every entry under <dir> (itself included) that is not shared with group dev yet, one per line: not group dev or not group-writable (when a dev group exists), a directory without setgid (setgid yes); symlinks skipped; nothing when all is shared; silent getter #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
  # What a share still has to change, so it touches nothing that is right:
@@ -1759,17 +1723,51 @@ private.this.share.pending.list()     # <dir> # echo every entry under <dir> (it
  # would change nothing — after root's heal fast-forwarded a user's clone, the
  # user's own repo.share and folder.share failed on every root-written entry
  # (T-THIS-SHARE-PENDING-LIST, T-THIS-FOLDER-SHARE-NOT-OURS,
- # T-OGIT-REPO-SHARE-NOT-OURS). One list for both: ogit.repo.share (.git) and
- # private.this.folder.share (the work tree).
+ # T-OGIT-REPO-SHARE-NOT-OURS). The list private.this.folder.share hands to
+ # chgrp and chmod, and nothing else (T-THIS-FOLDER-SHARE-PENDING-ONLY).
  # Octal -perm: 020 group write, 2000 setgid (BSD and GNU find alike).
- local dir="$1"
+ local dir="$1" setgid="${2:-yes}"
  [ -n "$dir" ] && [ -d "$dir" ] || return 0
  if private.this.group.exists dev; then
-   find "$dir" ! -type l \( ! -group dev -o ! -perm -020 -o \( -type d ! -perm -2000 \) \) -print 2>/dev/null
- else
+   if [ "$setgid" = no ]; then
+     find "$dir" ! -type l \( ! -group dev -o ! -perm -020 \) -print 2>/dev/null
+   else
+     find "$dir" ! -type l \( ! -group dev -o ! -perm -020 -o \( -type d ! -perm -2000 \) \) -print 2>/dev/null
+   fi
+ elif [ "$setgid" != no ]; then
    find "$dir" -type d ! -perm -2000 -print 2>/dev/null
  fi
 }
+private.this.share.pending.list.completion.setgid() { echo yes; echo no; }
+
+
+private.this.selfLoop.remove()     # <dir> # remove every symlink directly in <dir> that resolves to <dir> itself — the sharedConfig/sharedConfig an old install left; $SUDO when <dir> is not ours; RESULT names how many #
+{
+ # Moved out of the retired private.ensure.sharedTree: the old
+ # `cp -r ~/config sharedConfig` of install state 31 left a link back to the
+ # folder on tampered VMs. config.init.shared and state 31 call it. Canonical
+ # paths compared, so a relative link (`.`) is one too (T-THIS-SELFLOOP-REMOVE).
+ local dir="$1" resolvedDir entry resolvedEntry sudoWord="" removed=0
+ if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+   create.result 1 "private.this.selfLoop.remove requires an existing <dir>, got '$dir'"; return $(result)
+ fi
+ [ -O "$dir" ] || sudoWord="$SUDO"
+ resolvedDir=$(private.this.path.canonical "$dir")
+ for entry in "$dir"/*; do
+   [ -L "$entry" ] || continue
+   resolvedEntry=$(private.this.path.canonical "$entry")
+   [ -n "$resolvedEntry" ] && [ "$resolvedEntry" = "$resolvedDir" ] || continue
+   important.log "private.this.selfLoop.remove: removing self-referential symlink ${YELLOW}$entry${NORMAL}"
+   $sudoWord rm -f "$entry" && removed=$((removed + 1))
+ done
+ if [ "$removed" -gt 0 ]; then
+   create.result 0 "$removed self-loop(s) removed from $dir"
+ else
+   create.result 0 "no self-loop in $dir"
+ fi
+ return $(result)
+}
+private.this.selfLoop.remove.completion.dir() { compgen -d -- "$1"; }
 
 
 ### new.method
