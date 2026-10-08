@@ -510,7 +510,9 @@ test.os.healBreakageNames() {
   script=$(private.os.platform.heal.breakage.script.get user.clone dev.heal)
   case "$script" in *"-u test"*" clone -q"*) ;; *) bad="$bad user.clone-not-cloned-by-test" ;; esac
   case "$script" in *"/opt/user.clone.heal.rec"*) ;; *) bad="$bad user.clone-no-record" ;; esac
-  case "$script" in *"git -c safe.directory=\"\$src\" -c safe.directory=\"\$src/.git\" clone"*) ;; *) bad="$bad user.clone-source-and-its-git-dir-not-trusted" ;; esac
+  case "$script" in *'as_test git config --global --add safe.directory "$src" '*'as_test git config --global --add safe.directory "$src/.git" '*'as_test git clone -q "$src" "$D"'*) ;; *) bad="$bad user.clone-source-not-trusted-in-test-config" ;; esac
+  case "$script" in *'--unset-all safe.directory "^$src'*'--unset-all safe.directory "^$src/.git'*) ;; *) bad="$bad user.clone-trust-not-put-back" ;; esac
+  case "$script" in *"as_test git -c"*) bad="$bad user.clone-command-line-trust" ;; esac
   case "$script" in *'rm -rf "$D"'*'|| { rm -rf "$D"; fail'*) ;; *) bad="$bad user.clone-leaves-folder-on-failure" ;; esac
   # all is every name but user.clone: its folder is rebuilt, the other folder arms would break it again
   want=$(printf '%s\n' "$names" | grep -vxF user.clone | tr '\n' ' '); want="${want% }"

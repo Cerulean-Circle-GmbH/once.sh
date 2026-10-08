@@ -671,8 +671,20 @@ as_test() { if command -v runuser >/dev/null 2>&1; then runuser -u test -- env H
 g=$(stat -c %g "$B")
 mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || { rm -rf "$D"; fail "folder $D for test"; }
 # ogit-exception: the clone is made AS test, the way a user makes it with the old oo checkout; ogit would run as root.
-# The installed tree is not test's own (git: dubious ownership for test), so it is trusted on the command line for this one source and its .git (a local clone's upload-pack runs inside the .git dir).
-as_test git -c safe.directory="$src" -c safe.directory="$src/.git" clone -q "$src" "$D" || { rm -rf "$D"; fail "clone of $src into $D as test"; }
+# git ignores safe.directory from the command line for a local clone's upload-pack (it runs inside <src>/.git), so test's own
+# global config trusts the root-owned source for the clone and is put back right after.
+trust_drop() {
+  # ogit-exception: test's ~/.gitconfig, put back as it was
+  as_test git config --global --unset-all safe.directory "^$src\$" 2>/dev/null
+  as_test git config --global --unset-all safe.directory "^$src/.git\$" 2>/dev/null
+  return 0
+}
+# ogit-exception: test's ~/.gitconfig trusts the source for the clone
+as_test git config --global --add safe.directory "$src" || { rm -rf "$D"; fail "trust of $src for test"; }
+as_test git config --global --add safe.directory "$src/.git" || { trust_drop; rm -rf "$D"; fail "trust of $src/.git for test"; }
+# ogit-exception: the clone as test
+as_test git clone -q "$src" "$D" || { trust_drop; rm -rf "$D"; fail "clone of $src into $D as test"; }
+trust_drop
 as_test git -C "$D" checkout -q -B "$H" || { rm -rf "$D"; fail "branch $H in $D"; }
 as_test git -C "$D" remote set-url origin "$url" || { rm -rf "$D"; fail "origin of $D"; }
 [ -z "$(rgit -C "$D" status --porcelain)" ] || { rm -rf "$D"; fail "$D is not clean"; }
