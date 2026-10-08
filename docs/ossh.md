@@ -262,7 +262,7 @@ tree. It is **not** `ossh install`'s push, which writes `~/oosh` and skips a hos
 `/tmp`; `private.ossh.remote.file.put`, called by `private.ossh.heal.push`) — never to `~/oosh`, and with no state-99 or `~/oosh` skip. Its heal arm then
 clones `<branch>` fresh on the host and runs *that* tree's `oo heal`
 ([install-bootstrap.md § The heal arm](install-bootstrap.md#the-heal-arm)). Both temp files are removed
-the moment the heal returns, by the remote command itself, and again afterwards (best effort, `ssh -n`, also on an interrupt; the arm removes its own clone). They stay mode 600 unless a hop to another user needs them: `all` and a named user other than the login make them readable (`chmod 644`) first. The path that comes back must be the **clean last
+the moment the heal returns, by the remote command itself, and again afterwards (best effort, `ssh -n`, also on an interrupt; the arm removes its own clone). They stay mode 600 unless a hop to another user needs them: a named user other than the login makes them readable (`chmod 644`) first. Under `all` they stay 600: only the login that made them and root (its `sudo` re-exec; the code step cloning the bundle) read them — the user hops run from the heal's world-readable copy of its tree and clone nothing. The path that comes back must be the **clean last
 line** of the answer and the expected prefix plus name characters only (no slash): a host whose `.bashrc` prints noise never has that
 noise spliced into the next remote command (`private.ossh.heal.path.get`).
 
