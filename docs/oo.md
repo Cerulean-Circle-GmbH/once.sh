@@ -478,7 +478,7 @@ oo heal [<branch>] [all]      # <?branch> <?who:$USER> — a user name or all
 oo heal.status [<branch>] [all]   # read-only: what oo heal would do
 ```
 
-`oo heal.status` reads and never writes. For `developking`, a missing home (or user) is printed `[heal] developking: its home comes with the system step, then ~/oosh and ~/config are linked` — the system step makes it — while any other user without a home is `[left] <user>: no home known — not healed`. Each line it prints is `[ok]` (canonical), `[heal]` (`oo heal`
+`oo heal.status` reads and never writes. For `developking`, a missing home (or user) is printed `[heal] developking: its home comes with the system step, then ~/oosh and ~/config are linked` — the system step makes it — while any other user without a home is `[left] <user>: no home known — not healed`. Each line it prints is `[ok]` (canonical), `[heal]` (`oo heal` A canonical folder git refuses for the one who runs it (dubious ownership, e.g. root reading a clone another user made) is printed `[heal] <branch>: <dir> is owned by <owner> and not yet trusted for <me> — oo heal trusts the base's folders first and then judges it`, never as an aside prediction.
 changes it), `[left]` (`oo heal` reports it, you act) or `[keep]` (an old backup, kept). rc 1 when anything
 is not canonical, and `RESULT` names the command: `not canonical — run: oo heal <branch> <who>`.
 `<branch>` defaults to the branch of the tree running the heal, else `$OOSH_BRANCH`, else `dev`; `<who>`
@@ -529,7 +529,7 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
   converted with `ogit worktree.remove` when its gate lets it — after `private.ogit.worktree.upstream.ensure`: a worktree that
   tracks nothing gets `origin/<branch>` when origin has the branch, otherwise it is left with the gate's reason (`tracks no upstream`).
   The conversion of a shared base needs root: without it (a one-user heal, no working `sudo -n`) the worktrees are left with
-  `sudo -H ogit worktree.remove <base>`, never a password prompt. A folder that is no repository and not empty
+  `sudo -H $OOSH_DIR/ogit worktree.remove <base>` (the resolved tree path), never a password prompt. A folder that is no repository and not empty
   stops the heal (rc 2): move it away and run again.
 - **A real `~/config` is kept** as `~/config.orig.<ts>` and linked to the `sharedConfig`; an allow-listed few
   values are imported from it — `LOG_LEVEL` and the computer name `OOSH_SSH_CONFIG_HOST` — only into empty values;
@@ -578,7 +578,7 @@ when they exist, and on a `sharedConfig` the heal just made they exist only afte
 
 **The privilege rule.** `private.oo.heal.root.need <base> <branch>` is computed **first** and names what needs
 root: `group-dev`, `developking`, `developking-home`, `base`, `launcher`, `drop-in`, `worktrees`. Every need except `worktrees` stops a heal without root before any change (rc 2). `worktrees` alone does not: the code step
-leaves the conversion with `sudo -H ogit worktree.remove <base>`. Then
+leaves the conversion with `sudo -H $OOSH_DIR/ogit worktree.remove <base>` (the resolved tree path). Then
 `private.oo.heal.privilege.ensure <need>` decides **once**, before anything changes:
 
 - **Nothing needs root** (the need is empty — a user healing their own canonical account): sudo is **not asked
