@@ -192,7 +192,10 @@ pointer to `ogit worktree.remove`, anything else refuses. Install state 31
 builds `main/` and the branch folder with `private.oo.shared.tree.ensure`, on
 the same helper: a re-run keeps what is there and makes what is missing, so a
 half-made first run heals; the local copy of `~/oosh` runs only when `main/`
-could really not be cloned.
+could really not be cloned. Its source is `OOSH_REPO` when that is set (a fork, a path, the
+bundle of `OSSH_INSTALL_LOCAL=1`, [ossh.md](ossh.md#installing-this-tree-ossh_install_local1)), as
+`init/oosh` cloned `~/oosh` from it, else the canonical SSH URL (`private.oo.repo.url.get`); either way
+the origin of both folders is the canonical SSH URL (owner decision 1).
 
 **Trust is per folder.** git's `safe.directory` is per repository, so every
 folder under the base needs its own entry for every user who touches it

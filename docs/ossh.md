@@ -208,6 +208,10 @@ branch (`git clone -b`), so a value that is not a branch on origin — a commit 
 after **one fetch** (`private.ossh.origin.branch.check`; if the branch was pushed since, run
 `ogit remote.fetch`). A commit sha cannot be installed as it is: `os platform.heal.test` pushes it as the temporary branch `platform-test-<sha>` first. Unset, the install uses this tree's `init/oosh` and branch, as before.
 
+### Installing this tree (`OSSH_INSTALL_LOCAL=1`)
+
+The remote installer clones its branch from origin, so a branch that is not pushed — or is pushed behind the local one — cannot be what an install runs. **`OSSH_INSTALL_LOCAL=1`** installs this tree, as `OOSH_HEAL_LOCAL=1` heals from it: the **working-tree** `init/oosh` is pushed, no origin check is made, and a bundle of `main` and the **committed** local branch (`private.ossh.bundle.push <host> <branch> oosh-install-bundle`, the one bundle builder, which the heal uses too) goes to `/tmp/oosh-install-bundle.XXXXXX` on the host; the installer runs as `env OOSH_REPO='<bundle>' ./oosh mode root …`, and the bundle is removed when it returns. `init/oosh` carries `OOSH_REPO` through its clean re-exec and `sudo -E`, clones `~/oosh` from it, and install state 31 clones `main/` and `<branch>/` from it too, then points both origins at the canonical SSH URL (owner decision 1; [oo.md](oo.md)). A failed bundle stops the install before the installer runs. `os platform.heal.test … compare` installs its second container this way; `OSSH_INSTALL_LOCAL=1 os platform.test <platform>` runs the fresh-install test of this tree.
+
 ### Prereqs (`ossh prereqs.install`)
 
 If the remote is missing oosh's install-time tools, run `ossh prereqs.install <host>` first. It installs the package list appropriate to the remote's package manager (detected via `ossh pm.discover`):
@@ -273,7 +277,7 @@ noise spliced into the next remote command (`private.ossh.heal.path.get`).
 leading `-`; anything else is refused (rc 2, before a connection). A branch named `all` is refused too: the heal arm reads that word as every user.
 
 **`OOSH_HEAL_LOCAL=1`** heals from code that is not pushed. A bundle of `main` **and** the **local** `<branch>` of this tree
-(`ogit bundle.heads.create`; `main` is `origin/main` when this tree has it, else the local `main`) is written to
+(`private.ossh.bundle.push`, through `ogit bundle.heads.create`; `main` is `origin/main` when this tree has it, else the local `main`) is written to
 `/tmp/oosh-heal-bundle.XXXXXX` on the host and becomes `OOSH_REPO` there — the arm clones a bundle as it clones
 a URL, and the heal clones both `main/` and `<branch>/` from it. `<branch>` must be a local branch. Mind what is shipped:
 the bundle is the **committed** branch, but the `init/oosh` pushed beside it is the **working-tree** file.
