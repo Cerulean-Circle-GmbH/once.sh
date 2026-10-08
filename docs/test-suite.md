@@ -210,6 +210,8 @@ so under `OOSH_NO_INSTALL` it skips its prerequisite step altogether
 `env -u OOSH_NO_INSTALL` and stubs the package manager and sudo
 (T-SUITE-NO-INSTALL, the T-CMD-* cases of test.oo).
 
+The heal has the same guard: under `OOSH_NO_INSTALL` `oo heal` touches only a base under the temp directory (`$TMPDIR` else `/tmp`, a fixture) and refuses any other before its first step — rc 2, `a test run heals no real base — unset OOSH_NO_INSTALL to heal <base>` (`private.oo.heal.test.run.check`, T-OO-HEAL-TEST-RUN-CHECK).
+
 A test run also carries no `SUDO_USER`, `SUDO_UID`, `SUDO_GID` or `SUDO_COMMAND`: `test.suite` unsets them, because `ogit.folder.finish` trusts a fixture's folder for `$SUDO_USER` and a run under sudo would write dead `safe.directory` entries into the login user's real `~/.gitconfig` (T-TEST-SUITE-UNSETS-SUDO-ENV).
 
 ## Every file scores itself
