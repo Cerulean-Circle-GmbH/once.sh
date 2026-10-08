@@ -581,7 +581,9 @@ leaves the conversion with `sudo -H ogit worktree.remove <base>`. Then
   cached credential.
 - **Otherwise** (CI, `os platform.test`, a script, a pipe) only `sudo -n` is used, for `$SUDO` and for `sudo`
   itself in that process, so nothing can stop at a password prompt. When root is needed and unavailable the
-  heal ends with **rc 2 before any change**: `needs root (<what>) — run: sudo -H oo heal <branch>`.
+  heal ends with **rc 2 before any change**: `needs root (<what>) — run: sudo -H <tree>/oo heal <branch>` — the full
+  path of the tree the heal came from (`OOSH_HEAL_TREE`), because sudo's `secure_path` has no `~/oosh` and
+  `sudo -H oo …` is `sudo: oo: command not found`.
 - A user who needs no root part heals their own account without sudo. So the one prompt exists only when a step
   needs root, and then `oo heal` needs either a terminal for it or passwordless sudo.
 
@@ -591,7 +593,7 @@ that copy through `env -i`, so `oo heal` typed from a real `~/oosh` never moves 
 as-user hops can read it; the copy is removed afterwards. The process keeps only `HOME`, `USER`, `LOGNAME`,
 `TERM`, `LANG`, `LC_ALL`, `LOG_LEVEL`, `OOSH_REPO`, `SSH_AUTH_SOCK`, the six proxy variables (`http_proxy`,
 `https_proxy`, `no_proxy` and their upper-case twins), `OOSH_NO_INSTALL` and `OOSH_HEAL_NONINTERACTIVE`, and
-sets `OOSH_HEAL_CLEAN=1`, `OOSH_DIR=<the copy>` and `PATH` to the copy plus the system directories.
+sets `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_TREE=<the tree it came from>` (named in the sudo recoveries), `OOSH_DIR=<the copy>` and `PATH` to the copy plus the system directories.
 `SUDO_USER` is **dropped on purpose** (the user hop trusts the folders itself); the login that invoked sudo
 goes in as `OOSH_HEAL_LOGIN`, used by `all` only. `CONFIG` is set to a file that **does not exist** (`<tree>/.heal.noconfig`), so the cold
 start of `this` never sources an old `~/config/user.env` — the Mac's old one exported `PATH` with `.`,
@@ -624,10 +626,16 @@ which does not fail the heal. It says NOT CHECKED when the invariant file is not
 another user's invariants would have to run without being root.
 
 **`all`** heals every user — root, `developking`, every person's account whose own home holds `~/oosh` or `~/config`, and the
-login user that invoked sudo (`OOSH_HEAL_LOGIN`; `private.oo.heal.users.list`) — and needs root: as a user, `oo heal <branch> all` stops with rc 2 and names `sudo -H oo heal <branch> all`.
+login user that invoked sudo (`OOSH_HEAL_LOGIN`; `private.oo.heal.users.list`) — and needs root. As a user who may sudo, `oo heal all` (or `oo heal <branch> all`) **runs itself as root**: the one
+clean re-exec is started through `sudo -H` (`sudo -H env -i … <copy>/oo heal <branch> all`, `private.oo.heal.sudo.get`)
+with root's `HOME`, `USER` and `LOGNAME` and the user as `OOSH_HEAL_LOGIN`; with a terminal sudo asks for the password
+**once** (`sudo -v`, skipped when sudo needs none) and the whole heal runs as root, so `private.oo.heal.privilege.ensure`
+asks nothing more. Without a terminal (or with `OOSH_NO_INSTALL` / `OOSH_HEAL_NONINTERACTIVE`) only `sudo -n` is tried;
+when it gives no root the heal stops with **rc 2** before anything runs and names a command that works, with the
+full path of the tree: `sudo -H /home/<you>/…/<branch>/oo heal <branch> all` (sudo's `secure_path` has no `~/oosh`).
 A person's account is the four rules of `private.user.account.heals.is`: root or a uid of at least `UID_MIN` (`/etc/login.defs`, else 1000; 501 on macOS — `private.user.uid.min.get`), a login shell that is not `nologin` or `false`, a home it owns (not `/`, `/nonexistent`, `/var/empty`) and `~/oosh` or `~/config` in it. `oo heal all` is for people: system accounts are skipped, and `[skip]` lines show each one once. A system account that sees one anyway — AlmaLinux's `operator` has uid 11, `/sbin/nologin` and root's home `/root` — is not healed; the diagnosis names it once: `[skip] operator: system account (uid 11, /sbin/nologin, home /root)`.
 A user who is already canonical keeps their branch under `all`, except the healer and the login that ran sudo (`OOSH_HEAL_LOGIN`): they move to `<branch>`, so the second heal finds `oo heal` from root's `~/oosh` (`private.oo.heal.user.keep.check`). When `config init.user` fails for a user, the heal shows its own reason (`config init.user <user> <dir> failed: <reason>`), never "run it to see why". Healing a named user other than yourself
-needs root too. `sudo -H oo heal <branch>` is also what is named when the system part needs root.
+needs root too (it is refused with `sudo -H <tree>/oo heal <branch> <user>`, no sudo re-run). `sudo -H <tree>/oo heal <branch>` is also what is named when the system part needs root.
 
 **Worked example — a machine on an old branch.** The tree on this machine predates the heal, so the curl
 form fetches the heal from the branch itself:
