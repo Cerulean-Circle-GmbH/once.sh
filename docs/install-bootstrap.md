@@ -67,8 +67,7 @@ load-bearing and *wrongly* conclude Group 2 is removable.
 | `SUDO_USER` | assigned nowhere in the file. `sudo ./init/oosh` would otherwise lose the invoker, and the post-install `user oosh.install "$SUDO_USER"` silently never runs |
 | `OOSH_REPO` | assigned nowhere in the file. A fork or private-repo override would otherwise fall back to public GitHub with no error |
 | `USER`, `LOGNAME` | login sets them, **bash does not** — `env -i bash` arrives with both empty. Install state 13 (`private.check.priviledges.checked`) routes root vs user on `$USER`, so a root install with no later sudo hop was routed into the user lane. `this` now heals `USER` from `id -un` exactly as it heals `$SUDO`; the re-exec carries both for every non-oosh child |
-| `TMPDIR` | read by the heal arm (`${TMPDIR:-/tmp}`): the folder its fresh clone is made under. Carried only when the caller has one |
-| `OOSH_HEAL_NONINTERACTIVE`, `OOSH_NO_INSTALL` | read by `oo heal` (`private.oo.heal.privilege.ensure`): either one makes the heal non-interactive, so it never stops at a password prompt. The heal arm hands them on to the child `oo heal` (`env OOSH_HEAL_NONINTERACTIVE=1 …`) when set |
+| `OOSH_HEAL_NONINTERACTIVE`, `OOSH_NO_INSTALL` | either one makes a heal non-interactive: Phase A then uses `sudo -n` (see [The heal arm](#the-heal-arm)), and the child `oo heal`, which inherits them, never stops at a password prompt (`private.oo.heal.privilege.ensure`) |
 
 **Group 2 — pass-through.** `init/oosh` reads **none** of these. They are carried for the children.
 
@@ -127,17 +126,19 @@ point of the guarantee — carrying the caller's `PATH` would surrender it.
 
 Still deliberately *not* carried: `BASH_FILE` and `SUDO` (recomputed, more correctly, from scratch
 — Phase A may have just installed a newer bash that a stale `BASH_FILE` would shadow),
-`INSTALL_LOG`/`OOSH_APT_UPDATED` (set downstream of the re-exec, so nothing is lost), and
+`INSTALL_LOG`/`OOSH_APT_UPDATED` (set downstream of the re-exec, so nothing is lost),
 `GIT_ASKPASS` (it names a helper *binary*, which the seeded `PATH` may no longer resolve — it would
 fail confusingly rather than cleanly — and it drives an interactive credential prompt that an
-unattended installer cannot answer anyway).
+unattended installer cannot answer anyway), and `TMPDIR` (the heal clones under `/tmp`, see
+[The heal arm](#the-heal-arm)).
 
 > Guarded by `test.install` **T-INIT-HOME-RECOVERY**, **T-HOME-RECOVERY-NO-GETENT** (the home
 > comes from the shell's own `~user`, then `dscl`, then `/etc/passwd` — no `getent` at runtime;
 > asserted by running *both* recovery blocks with a stub `getent` that must never be asked),
 > **T-INIT-CLEAN-ENV** (re-exec present, guarded, names an interpreter, no `env -S`),
 > **T-INIT-CLEAN-ENV-CARRY** (`SUDO_USER`, `OOSH_REPO`, `USER` and `LOGNAME` actually cross),
-> **T-INIT-CLEAN-ENV-ABSENT** (an unset `GIT_SSH_COMMAND` reaches the child unset, a set one verbatim),
+> **T-INIT-CLEAN-ENV-ABSENT** (an unset `GIT_SSH_COMMAND` reaches the child unset, a set one verbatim;
+> the caller's `TMPDIR` never crosses),
 > **T-INIT-CLEAN-ENV-EXEC** (survives a mode-644 `$0`, keeps a deliberate bash, forwards `-x`),
 > **T-INIT-CLEAN-ENV-PATH** (`/opt/homebrew/bin` is on the child's `PATH`) and
 > **T-INIT-CLEAN-ENV-PASSTHROUGH** (`LOG_LEVEL` crosses; `TERM` defaults to `dumb`, not empty).
@@ -149,15 +150,18 @@ unattended installer cannot answer anyway).
 The seeded `PATH` above belongs to the clean re-exec. The pipe form (`curl … | sh -s -- …`) has no
 clean re-exec — `$0` is `sh` — so it keeps the **caller's** `PATH`, which on a Mac account (an ssh login
 of a second user) may lack `/opt/homebrew/bin` and so `brew` and its bash 5. The `brewPath` block in Phase A,
-before the package-manager detection and the bash 4+ check, puts them there: on Darwin only, it prepends `/opt/homebrew/bin`, then
-`/usr/local/bin`, those of them that exist, unless `PATH` already starts with them. Homebrew goes first even
-when the caller's `PATH` holds it later — the old frozen `PATH` of era-B configs has it after `/bin`, where
-`/bin/bash` 3.2 wins; the later copy stays and is harmless. Phase B's own
+before the package-manager detection and the bash 4+ check, puts it there: it prepends the **first** of
+`/opt/homebrew/bin` (Apple silicon) and `/usr/local/bin` (Intel) that holds an executable `brew` — the
+platform is that value, not a `uname` test, so a Linux host without Homebrew is left alone — **unless that
+directory already comes before `/bin`**. The rule is idempotent: the seeded `PATH` of the clean re-exec
+already has both before `/bin` and stays as it is, and a second or third pass adds nothing. The old frozen
+`PATH` of era-B configs has Homebrew after `/bin`, where `/bin/bash` 3.2 wins: there it goes first, and the
+later copy stays and is harmless. Phase B's own
 prepend is reduced to the directory of the `bash` already found. On macOS `sh` is itself bash 3.2: the
 file form re-execs under a bash 4+, the heal does not need to (see below).
 
-> Guarded by **T-INIT-PHASE-A-BREW-PATH**, which runs the extracted blocks under `sh` with `uname`
-> stubbed and asserts the resulting `PATH`.
+> Guarded by **T-INIT-PHASE-A-BREW-PATH**, which runs the extracted block under `sh` once and three
+> times, with the Homebrew directories moved into a fixture, and asserts the resulting `PATH`.
 
 ## The heal arm
 
@@ -167,24 +171,21 @@ for a computer where `~/oosh` is missing, old or broken.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh | sh -s -- heal [<branch>] [all]
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh)" sh heal
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/<branch>/init/oosh)" heal [<branch>] [all]
 ```
 
-**Never `sh -c "$(curl …)" heal`**: after the command string the first word is `$0`, so the script would
-start with *no* arguments and run an install. The extra `sh` makes `heal` the first argument. (In the pipe
-form `sh -s -- heal` the arguments are positional as usual.) On macOS `sh` is bash 3.2: the file form
-re-execs under a bash 4+, the heal does not need to.
+**`heal` as `$0`.** After the command string of `sh -c` the first word is `$0`, so `sh -c "$(curl …)" heal`
+starts the script with `$0 = heal` and no arguments. The `healArgs` block, right after `# END cleanEnv`, is the
+one line `[ "$0" != heal ] || set -- heal "$@"`: it puts `heal` back in front, so this form heals like the pipe
+form, the file form (`sh init/oosh heal`) and `sh -c "$(curl …)" sh heal`. From there on a heal is known by
+its first argument, `"$@"` stays intact for every re-exec, and **Phase A's step 4 never hands a heal over or
+pre-clones**: the arm is POSIX `sh`, and the child `oo heal` runs under the `bash` that `command -v bash` finds
+after `brewPath` (and Phase B's current-bash-dir prepend) has put the right directory first — so no temp
+directory is made to leak and a heal never turns into a plain install of `OOSH_SELF_BRANCH`. On macOS `sh` is
+bash 3.2: the file form of an install re-execs under a bash 4+, the heal does not need to.
 
-**The arguments are read before Phase A.** The `healArgs` block, right after `# END cleanEnv`, records
-`_heal`, `OOSH_BRANCH` and `_hw` (the user, or `all`) and leaves `"$@"` untouched, so every re-exec
-carries the arguments intact and Phase A's step 4 already knows it is a heal; the arm itself reads the
-recorded values. The block is a size-exception block too. **Step 4 never hands over or pre-clones for a
-heal**: the arm is POSIX `sh`, and the child `oo heal` runs under the `bash` that `command -v bash`
-finds after `brewPath` (and Phase B's current-bash-dir prepend) has put the right directory first, so
-no temp directory is made to leak, and a heal never turns into a plain install of `OOSH_SELF_BRANCH`.
-
-> Guarded by **T-INIT-HEAL-EARLY-PARSE**, **T-INIT-PIPE-HEAL-ARGS-SURVIVE** and
-> **T-INIT-REEXEC-KEEPS-ARGS**.
+> Guarded by **T-INIT-HEAL-FORMS** (one case per form), **T-INIT-HEAL-EARLY-PARSE**,
+> **T-INIT-PIPE-HEAL-ARGS-SURVIVE** and **T-INIT-REEXEC-KEEPS-ARGS**.
 
 **The launcher.** The tree the arm hands over to installs the launcher `/usr/local/bin/this` (`private.oo.install.launcher`); where the empty shell `env -i sh` has no `/usr/local/bin` on its PATH — BusyBox on Alpine — it also links `/usr/bin/this` to it (`private.oo.launcher.link.get`), so `this` is found there too.
 
@@ -195,43 +196,50 @@ reason.
 
 **The contract.**
 
-- **Arguments:** `all` means every user; any other word is the branch, with a leading `origin/` stripped. The
-  default branch is `OOSH_SELF_BRANCH`, so the one-liner of the prod branch heals to prod. An empty argument or
-  one starting with `-` is refused (`heal: bad argument`); `id -un` failing is refused too.
-- **A fresh temp clone.** `mktemp -d` makes `oosh-heal.XXXXXX` under `$TMPDIR` (else `/tmp`), mode `755`, and
-  `git clone -b <branch> $OOSH_REPO` (default: the public HTTPS URL) goes into `t` beneath it, reading
-  `/dev/null`; then `chmod -R go+rX` on it, so another user's hop can read it. For `all` the folder is
-  always under `/tmp`, because every user's hop must reach it. The clone is **never** `~/oosh`.
-- **No sudo in the arm — `all` included.** The arm runs `env OOSH_REPO=… bash <clone>/oo heal <branch> <who>`
-  as the caller. Root is the clone's decision, made **once**: its `oo heal` (`private.oo.heal.env.clean`) knows
-  the clone by its temp layout (`private.oo.heal.temp.tree.check`), makes no second copy, and for `all` as a
-  user starts its one clean process through `private.oo.heal.sudo.get` — `sudo -H` after one password prompt
-  with a terminal, `sudo -n -H` without one. When root cannot be had it ends with **rc 2 before anything
-  runs** and names the curl form run as root (`curl -fsSL <init/oosh> | sudo sh -s -- heal <branch> all`;
-  the clone itself is gone when the arm ends). The privilege rule is written once, in
+- **Arguments:** `all` means every user; any other word is the branch, with a leading `origin/` stripped, and
+  only one branch word is taken (`heal: one branch only`). The default branch is `OOSH_SELF_BRANCH`, so the
+  one-liner of the prod branch heals to prod. An empty argument or one starting with `-` is refused
+  (`heal: bad argument`). The arm passes `oo heal <branch>`, plus `all` when given; `<who>` is `oo heal`'s own
+  default, the calling user.
+- **A fresh temp clone, always under `/tmp`.** `mktemp -d /tmp/oosh-heal.XXXXXX`, mode `755`, and
+  `(umask 022; git clone -q -b <branch> $OOSH_REPO …)` (default: the public HTTPS URL) into `t` beneath it,
+  reading `/dev/null`; the umask makes the clone readable for another user's hop as it is written, no
+  recursive `chmod` after it. Never `$TMPDIR`: on macOS it lies under `/var`, which the clone's `oo heal` sees
+  as `/private/var` and would not know as its temp tree; `/tmp` and its `/private/tmp` are the two places
+  `private.oo.heal.temp.tree.check` knows. The clone is **never** `~/oosh`.
+- **No sudo in the arm — `all` included.** The arm runs `bash <clone>/oo heal <branch> [all]` as the caller,
+  with nothing added to its environment: `OOSH_REPO` and the non-interactive flags reach the child because
+  they are in it. Root is the clone's decision, made **once**: its `oo heal` (`private.oo.heal.env.clean`)
+  knows the clone by its temp layout (`private.oo.heal.temp.tree.check`), makes no second copy, and for `all`
+  as a user starts its one clean process through `private.oo.heal.sudo.get` — `sudo -H` after one password
+  prompt with a terminal, `sudo -n -H` without one. When root cannot be had it ends with **rc 2 before
+  anything runs** and names the curl form run as root (`curl -fsSL <init/oosh> | sudo sh -s -- heal <branch>
+  all`; the clone itself is gone when the arm ends). The privilege rule is written once, in
   [oo.md § The privilege rule](oo.md#ooheal). Guarded by **T-INIT-HEAL-ARM-HANDOVER-NO-SUDO** and
   **T-OO-HEAL-ARM-TREE-NO-COPY**.
+- **Phase A never prompts for a heal nobody watches.** When the first argument is `heal` and
+  `OOSH_HEAL_NONINTERACTIVE` or `OOSH_NO_INSTALL` is set, or there is no terminal, Phase A's `SUDO` is
+  `sudo -n`: its package-list refresh and package installs fail instead of waiting at a password prompt
+  (**T-INIT-PHASE-A-SUDO-NONINTERACTIVE**). An install keeps plain `sudo`.
 - **stdin.** In the pipe form stdin *is* the script, so the child must never read it: it reads `/dev/tty`
   when there is a terminal (so its `oo heal` can ask for the sudo password), else `/dev/null` — and then
   only `sudo -n` is tried (**T-INIT-HEAL-ARM-NO-TTY**).
-- **The non-interactive flags travel.** `OOSH_HEAL_NONINTERACTIVE` and `OOSH_NO_INSTALL` are handed to the
-  child with `env`, like `OOSH_REPO`; the clean process of `oo heal` keeps them.
 - **The child's rc is kept** (`exit "$_hr"`): 0 healed, 1 something is left for you, 2 cannot heal.
-- **One owner of the cleanup: the clean process.** A clone under `/tmp` (always for `all`) is removed by the
-  clean process itself when it exits (`private.oo.heal.copy.trap`, the same matcher) — as root under sudo, so
-  no second sudo is needed. The arm's `rm -rf` afterwards is only the **fallback**: for a run that never
-  reached the clean process (rc 2 before it) and for a one-user clone under a `$TMPDIR` outside `/tmp` (the
-  clean process runs under `env -i` without `TMPDIR`). It is tried as the user, then, for `all`, with
-  `sudo -n` — never a prompt; when neither works the arm says `remove <dir> yourself` and still exits with
-  the child's rc.
+- **One owner of the cleanup: the clean process.** The clone is removed by the clean process itself when it
+  exits (`private.oo.heal.copy.trap`, the same matcher) — as root under sudo, so no second sudo is needed.
+  The arm's `rm -rf` afterwards, as the user, is only the **fallback** for a run that never reached the clean
+  process (rc 2 before it); when it fails the arm says `remove <dir> yourself` and still exits with the
+  child's rc. It never calls sudo.
 
 The child is `oo heal` of the clone, which re-runs itself once in a clean process (`env -i`).
 
 **The size exception.** The cap on `init/oosh` stays 700 lines for everything else, but the heal arm is
-all-or-nothing and has to live in the one file the curl form fetches. Its block says why on the line after
-`# BEGIN healArm` (`# size-exception: …`) and **leaves the count**; a block without that reason line counts
-fully (`homeRecovery`, `cleanEnv` and `brokenTree` count). **T-INIT-SIZE-CAP** prints both numbers —
-now `init/oosh is 715 lines, 691 counted (cap 700; 24 lines in size-exception blocks)`. The count is the awk pass of `test.install.sizeCapCheck`: every `# BEGIN <name>` whose next line is a non-empty `# size-exception:` reason, through its `# END <name>`, markers included, leaves the 715 raw lines (`healArm` and `healArgs` are such blocks).
+all-or-nothing and has to live in the one file the curl form fetches. Only the blocks **named** in the
+exempt list of `test.install.sizeCapCheck` may leave the count — that list is `healArm` alone — and only
+when the line after `# BEGIN <name>` says why (`# size-exception: …`); the exempt lines together stay at or
+under a **ceiling of 15**. Every other block counts fully (`homeRecovery`, `cleanEnv`, `healArgs`, `brewPath`,
+`brokenTree`). **T-INIT-SIZE-CAP** prints the raw, the counted and the exempt lines; it fails over the cap or
+over the ceiling.
 
 ## The `brokenTree` check
 
@@ -248,3 +256,9 @@ does not end the installer under `set -e`; it is then no `ref: ` line and the tr
 the tree may belong to another user, and `git` would answer "dubious ownership",
 which must not be mistaken for a broken tree. A `.git` **file** (a linked
 worktree) is not a directory and passes.
+
+**A detached checkout is refused even when it is clean.** The check cannot tell a deliberate checkout of a
+commit from a tree a failed merge or rebase left behind, so it treats both as broken. That is the one limit
+of the rule: a tree checked out at a commit sha is not installed from — for example `macos-test.yml`
+dispatched with a sha as its `branch` input, where `actions/checkout` leaves a detached HEAD. Dispatch the
+workflow, and install, from a branch name.

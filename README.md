@@ -2,10 +2,11 @@
 Unified shell environment for UCP components and ONCE the Object Network Communication Environment
 
 
-This Repo consists of two main topics
+This Repo consists of two main topics:
 1. The oosh object oriented bash environment with completion, logging and debugging
 1. the once bash script to manage a ONCE installation into any environment
-1. 1. Supported environments — see [Supported Platforms](docs/supported-platforms.md) for the full matrix
+
+Supported environments: see [Supported Platforms](docs/supported-platforms.md) for the full matrix.
 
 Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branching Strategy](docs/branching.md) for details.
 
@@ -43,7 +44,7 @@ That's it — the `.command` file self-bootstraps: it fetches the bootstrap scri
 | Method    | Command                                                                                           |
 |:----------|:--------------------------------------------------------------------------------------------------|
 | **curl**  | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
-| **wget**  | `sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
+| **wget**  | `sh -c "$(wget -qO- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"`   |
 | **fetch** | `sh -c "$(fetch -o - https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"` |
 
 `init/oosh` is a POSIX `sh` script, so `sh -c` works on every supported
@@ -53,38 +54,9 @@ works if you prefer it.
 Substitute the `prod` segment of the URL with `dev` (or any branch name) to
 install from a non-default branch, e.g. `…/dev/init/oosh`.
 
-
-## heal - bring a computer to the standard dev model
-
-A machine whose oosh is old, half-installed or broken (a conflicted `~/oosh`, a real `~/config`, an old
-branch, `oo mode` finding nothing) is healed with one command. Like the installer, it is fetched from GitHub:
-
-| Method    | Command                                                                                           |
-|:----------|:--------------------------------------------------------------------------------------------------|
-| **curl**  | `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh \| sh -s -- heal [<branch>] [all]` |
-| **wget**  | `wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh \| sh -s -- heal [<branch>] [all]` |
-| **sh -c** | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" sh heal [<branch>] [all]` |
-
-> **The `sh` before `heal` in the `sh -c` form is required.** The first word after the command string is
-> `$0`, so `sh -c "$(curl …)" heal` starts the script with no arguments and runs an *install*, not a heal.
-
-The heal clones `<branch>` fresh into a temporary folder and runs *that* tree's `oo heal` — it never touches
-your `~/oosh`, so it works when `~/oosh` is the broken part. `<branch>` defaults to the branch of the URL
-(the `prod` one-liner heals to `prod`); `all` heals every user and always needs root: from a terminal it asks `sudo` for the password once, up front; without a terminal it needs root or passwordless sudo and stops with `2` before anything is cloned. A plain `heal` asks for sudo only when a step needs root (a user whose machine is already set up is never asked), and with `OOSH_HEAL_NONINTERACTIVE` set it uses `sudo -n` only and stops with `2` before any change when root is not available. It builds
-the standard dev model — group `dev`, `developking`, the shared base with `main/` and `<branch>/` as clean
-clones, the shared config, and `~/oosh` + `~/config` of each user — and prints what it found, what it changed
-and what is left for you. It also installs the launcher `/usr/local/bin/this`, so an empty shell (`env -i sh`) finds `this`; where that shell has no `/usr/local/bin` on its PATH (BusyBox on Alpine) the launcher gets a second name, the link `/usr/bin/this`. Nothing is deleted: a broken folder is moved to `<base>.aside/<name>.orig.<ts>`, a real
-`~/config` is kept as `config.orig.<ts>` (a few values are imported), and a folder it does not own is only reported.
-It ends with a check of four invariants and exits `0` (healed and verified), `1` (something is left for you) or
-`2` (it cannot heal); legacy `ssh.*` folders or a login shell other than bash (macOS zsh) are reported as `left` with rc `1` but do not stop the install state reaching 99. Afterwards open a new terminal, type `bash`, then `oo mode <branch>`.
-
-On a machine where oosh runs, the same thing is `oo heal [<branch>] [all]` (read-only first look: `oo heal.status`);
-for a remote host `ossh heal <host> [<user>|all] [<branch>]` (`ossh heal.pipe <host> [<branch>]` runs the pure pipe form there as the login user). See [docs/oo.md](docs/oo.md#ooheal) and
-[docs/repair-toolkit.md](docs/repair-toolkit.md).
-
 ### More detailed logging for debugging is available with these commands
 ```
-unbuffer env -i sh -xc "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" | tee install.log.txt
+unbuffer env -i sh -xc "$(wget -qO- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" | tee install.log.txt
 
 > or if already available locally
 unbuffer env -i sh -x init/oosh | tee install.log.txt 
@@ -100,6 +72,36 @@ sudo apt-get install expect
 
 ```
 in VSCODE use [use the ANSI Colors plugin](https://marketplace.visualstudio.com/items?itemName=iliazeus.vscode-ansi)
+
+
+## heal - bring a computer to the standard dev model
+
+A machine whose oosh is old, half-installed or broken (a conflicted `~/oosh`, a real `~/config`, an old
+branch, `oo mode` finding nothing) is healed with one command. Like the installer, it is fetched from GitHub:
+
+| Method    | Command                                                                                           |
+|:----------|:--------------------------------------------------------------------------------------------------|
+| **curl**  | `curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh \| sh -s -- heal [<branch>] [all]` |
+| **wget**  | `wget -qO- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh \| sh -s -- heal [<branch>] [all]` |
+| **sh -c** | `sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)" heal [<branch>] [all]` |
+
+In the `sh -c` form `heal` is `$0`, the first word after the command string; the installer takes it as
+its first argument, so `sh -c "$(curl …)" sh heal` works the same.
+
+The heal clones `<branch>` fresh into a temporary folder and runs *that* tree's `oo heal` — it never touches
+your `~/oosh`, so it works when `~/oosh` is the broken part. `<branch>` defaults to the branch of the URL
+(the `prod` one-liner heals to `prod`); `all` heals every user and always needs root: from a terminal it asks `sudo` for the password once, up front; without a terminal it needs root or passwordless sudo and stops with `2` before any change. A plain `heal` asks for sudo only when a step needs root (a user whose machine is already set up is never asked), and with `OOSH_HEAL_NONINTERACTIVE` set it uses `sudo -n` only and stops with `2` before any change when root is not available. It builds
+the standard dev model — group `dev`, `developking`, the shared base with `main/` and `<branch>/` as clean
+clones, the shared config, and `~/oosh` + `~/config` of each user — and prints what it found, what it changed
+and what is left for you. It also installs the launcher `/usr/local/bin/this`, so an empty shell (`env -i sh`) finds `this`; where that shell has no `/usr/local/bin` on its PATH (BusyBox on Alpine) the launcher gets a second name, the link `/usr/bin/this`. Nothing is deleted: a broken folder is moved to `<base>.aside/<name>.orig.<ts>`, a real
+`~/config` is kept as `config.orig.<ts>` (a few values are imported), and a folder it does not own is only reported.
+It ends with a check of four invariants and exits `0` (healed and verified), `1` (something is left for you) or
+`2` (it cannot heal); legacy `ssh.*` folders or a login shell other than bash (macOS zsh) are reported as `left` with rc `1` but do not stop the install state reaching 99. Afterwards open a new terminal, type `bash`, then `oo mode <branch>`.
+
+On a machine where oosh runs, the same thing is `oo heal [<branch>] [all]` (read-only first look: `oo heal.status`);
+for a remote host `ossh heal <host> [<user>|all] [<branch>]` (`ossh heal.pipe <host> [<branch>]` runs the pure pipe form there as the login user). See [docs/oo.md](docs/oo.md#ooheal) and
+[docs/repair-toolkit.md](docs/repair-toolkit.md).
+
 
 ## manual install
 ```
@@ -123,7 +125,7 @@ or as root
 
 apt update
 apt install curl
-sh -c "$(wget -O- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
+sh -c "$(wget -qO- https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.sh/prod/init/oosh)"
 ```
 
 
