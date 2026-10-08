@@ -598,7 +598,7 @@ follows it, and a heal asks for the sudo password **at most once**.
   (`OOSH_HEAL_ROOT=no`, T-OO-HEAL-NO-SUDO-WHEN-NOT-NEEDED); else sudo.get's answer (`OOSH_HEAL_ROOT=yes|no`).
   In a non-interactive run `$SUDO` is `sudo -n ` and `sudo` itself adds `-n` for the rest of the process.
   Every need except `worktrees` stops a heal without root before any change (rc 2); `worktrees` alone does
-  not: the code step leaves the conversion with `sudo -H $OOSH_DIR/ogit worktree.remove <base>` (the
+  not: the code step leaves the conversion with `sudo -H <tree>/ogit worktree.remove <base>` (`<tree>` = the tree the heal came from) (the
   resolved tree path).
 - **The rc 2 names a command that works**, with the full path of the tree the heal came from
   (`OOSH_HEAL_TREE`), because sudo's `secure_path` has no `~/oosh` and `sudo -H oo …` is
