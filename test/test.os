@@ -1821,6 +1821,8 @@ test.os.healCompareRun() {
     esac
   }
   private.os.platform.cleanup()        { echo "cleanup $*" >> "$OS_T_REC"; }
+  # a diff that prints what BusyBox diff (Alpine) prints — a unified diff, no < > lines: the comparison must not read it
+  diff() { printf '%s\n' '--- healed' '+++ fresh' '@@ -1,2 +1,3 @@' '+/b/y'; return 1; }
   # in this shell, not in $( ): its RESULT is asserted; the output goes to a file
   private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
   [ "$rc" = 0 ] || bad="$bad equal-rc=$rc=[$out]"
@@ -1855,6 +1857,7 @@ test.os.healCompareRun() {
   private.os.platform.heal.compare.run "$p" >/dev/null 2>&1 && bad="$bad no-branch-accepted"
   private.os.platform.heal.compare.run "$p" 'bad;branch' >/dev/null 2>&1 && bad="$bad bad-branch-accepted"
   [ -s "$OS_T_REC" ] && bad="$bad refusal-started"
+  unset -f diff
   test.os.stubs.unset
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "a local install of the branch on <platform>_fresh, one snapshot in each, equal passes, a difference fails named, always cleaned up" || create.result 1 "compare run:$bad"

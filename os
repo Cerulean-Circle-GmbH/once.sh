@@ -1733,8 +1733,10 @@ private.os.platform.heal.compare.run()     # <platform> <branch> # a fresh insta
      printf 'compare on %s: no snapshot of %s\n' "$platform" "$([ -s "$healedLog" ] && echo "the fresh install" || echo "the healed machine")" | tee "$log"
      rc=1
    else
-     # raw: two sorted files, one line each side that differs
-     differences=$(diff "$healedLog" "$freshLog" | sed -n -e 's/^< /healed only: /p' -e 's/^> /fresh only:  /p')
+     # the lines of each side the other lacks — a set difference in awk, not diff:
+     # BusyBox diff (Alpine) prints a unified diff and no < > lines (T-OS-HEAL-COMPARE-RUN)
+     differences=$(awk 'NR == FNR { fresh[$0] = 1; next } !($0 in fresh) { print "healed only: " $0 }' "$freshLog" "$healedLog"
+       awk 'NR == FNR { healed[$0] = 1; next } !($0 in healed) { print "fresh only:  " $0 }' "$healedLog" "$freshLog")
      if [ -n "$differences" ]; then
        printf 'compare on %s: the heal and a fresh install of %s differ:\n%s\n' "$platform" "$branch" "$differences" | tee "$log"
        rc=1
