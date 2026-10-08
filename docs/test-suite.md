@@ -331,7 +331,8 @@ nothing.
 `this kernel.validate [<treeRoot>]` finds every raw command that a kernel helper of `this`, `odocker`, `ossh` or `user`
 owns: `mkdir`, `chown`, `chgrp`, `chmod`, `ln -s`, `readlink`, `stat`, `mktemp`, `cmp`, `id -nG`, `getent`, `dscl`, `runuser`,
 `su -`, `docker`, `ssh`, `scp` and raw `sudo`, in command position, with quoted text and trailing comments blanked, so a
-word in a message or a regex is no call. The command list, the scripts each command is at home in and the excluded paths
+word in a message or a regex is no call; `command sudo` is a call, and a case label is none, though a call after it on
+the same line is. The command list, the scripts each command is at home in and the excluded paths
 are data at the top of the method. The kernel helpers themselves (`private.this.*`) are its home. Under `test/` a fixture
 is built raw on purpose, so there only the reading commands are swept, and `mktemp` stays with `portability.validate`.
 A line that must stay raw says `# kernel-exception: <why>` on the line or in the 5 lines above, or
@@ -339,8 +340,6 @@ A line that must stay raw says `# kernel-exception: <why>` on the line or in the
 line that a package of the heal review still has to convert, and files untouched by the heal are on its excluded list,
 which they leave once they are cleaned. Same verdict and return codes as the others. `T-KERNEL-TREE` in
 `test/test.test.suite` is the gate.
-
-nothing.
 
 Run the `this` validators **in a fresh shell**, so they come from the tree under test and not from a `this` the
 pane sourced at start-up:
