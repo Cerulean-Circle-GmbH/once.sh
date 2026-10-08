@@ -445,6 +445,8 @@ comment, with a reason:
 
 `this.anchor.validate` and `test.suite.portability.validate` are the other two users of the sweep.
 
+**Portability rule: a `{ case` inside `$( … )`.** `test.suite portability.validate` refuses a `{ case` whose patterns are bare inside a command substitution (`private.test.suite.case.comsub.is`): bash 5.1 (AlmaLinux 9) reads `$( … )` with a scanner that does not know `case` after `{`, so the `)` of the first bare pattern closes the substitution and the file dies with `syntax error near unexpected token ';;'`. Write every pattern as `(pattern)` or define the stub outside the substitution. See [test-suite.md](test-suite.md).
+
 `this.recursive.validate` exists because install state 31 once changed owner and
 mode of a whole shared folder (on macOS `/Users/Shared`). Change only what oosh
 created (`private.this.dir.ensure` creates segments, never recurses), or name the

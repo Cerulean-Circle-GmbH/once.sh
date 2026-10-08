@@ -369,7 +369,7 @@ go back (`REFUSING — the regenerated files lost: …`, rc 1). A variable that 
 files is no loss — an old user.env's `OOSH_DIR` now lives in `oosh.env` — and neither
 are PATH and OOSH_MODE (per-user session files), `OOSH_USER_CONFIG_PATH` (removed
 2026-10-01), `OOSH_CONFIG_VERSION` (an old version stamp) and every name `config save` never
-persists (`private.config.variable.persisted.is`, the one list of § Excluded variables) (T-CONFIG-INIT-ENV-OLD-USER-ENV).
+persists (e.g. `OOSH_APT_UPDATED`, `OOSH_CLEAN_ENV`, which an older `oosh.env` carried) (`private.config.variable.persisted.is`, the one list of § Excluded variables) (T-CONFIG-INIT-ENV-OLD-USER-ENV).
 
 ```bash
 ./config init.env                 # repair self's env files
@@ -720,6 +720,8 @@ These functions are used internally and generally not called directly:
 | `config.completion.*` | Tab completion helpers |
 | `private.config.variables.list` | `<envPrefix> <?sessionSplit>` → one persistable variable NAME per line (`compgen -v`, shape gates, exclusion list); `sessionSplit` (`yes`/`no`) is the layout a full `config save` decided and hands down (`private.config.save oosh OOSH <sessionSplit> <ooshSplit>`), empty reads it off `user.env` |
 | `private.config.save` | `<?name> <?ENV_PREFIX> <?sessionSplit> <?ooshSplit>` → the work of `config.save`; the public `config save <?name> <?ENV_PREFIX>` takes no layout — only a full save hands it to its nested oosh save |
+| `private.config.env.export.names.get` | `<file>` → the names of the variables the file exports (`export NAME=…`, also `export declare`), one per line; nothing for a missing file; silent getter. `config init.env`'s guard judges a loss by these names |
+| `private.config.variable.persisted.is` | `<name>` → rc 0 when `config save` persists the variable, rc 1 for the never-persist names (`*INSTALL*`, `OOSH_BRANCH`, `ODOCKER_*`, `OOSH_SHLVL`/`STATUS`/`PROMPT`/`CONFIG_NEEDS_SAVE`, `OOSH_CLEAN_ENV`, `OOSH_APT_UPDATED`, `OOSH_USER_CONFIG_PATH`, `LOG_NAME`/`DEVICE`/`LIVE`, `SUDO_*`); silent predicate; the one list `config save` and the init.env guard share |
 | `private.config.variable.export.line` | `<variableName>` → one `export NAME="value"` line; rc 1 for unset, array, or an ANSI-C-quoted value |
 | `private.config.variables.export` | `<envPrefix> <?sessionSplit>` → the whole body of a generated env file |
 | `private.config.string.upper` | `<string>` → upper-cased, without the bash-4 `${var^^}` operator |

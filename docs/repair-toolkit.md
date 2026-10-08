@@ -112,7 +112,8 @@ delete it. Everywhere the move-aside is the kernel's `private.this.entry.aside`
 | `oo mode <TAB>` empty | `oo user.fix` |
 | `config save` says the shared `user.env` keeps its PATH line until every user has `~/.config/oosh/user.session.env` | `sudo oo update` — as root it gives every linked user their file and switches the shared config ([config.md](config.md) § *The switch and its gate*) |
 | `. …/user.session.env: not found` / a plain `sh` stops at login | `oo user.fix` (as root: `oo user.fix <user>`) — creates and fills the user's own file |
-| `env -i sh`, then `this`: `this: not found` | `sudo oo update` — installs the launcher `/usr/local/bin/this` |
+| `env -i sh`, then `this`: `this: not found` | `sudo oo update` (or `oo heal`) — installs the launcher `/usr/local/bin/this`; where the empty shell has no `/usr/local/bin` on its PATH (BusyBox/Alpine) it also links `/usr/bin/this` (`private.oo.install.launcher`) |
+| my shell is an empty BusyBox `sh` and `this` is not found, though `/usr/local/bin/this` exists | `sudo oo update` — adds the `/usr/bin/this` link (`private.oo.launcher.link.get`); a real file of its own at `/usr/bin/this` is left and named |
 | `env -i sh`, then `bash`: `/config/oosh.env: No such file or directory` | `oo user.fix` — re-installs the `.bashrc` that loads `this` first |
 | `OOSH_DIR=/var/<user>/oosh` (private clone resolved) | `oo user.fix` |
 | `~/oosh` is a real directory not a symlink | `oo user.fix` |

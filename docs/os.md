@@ -173,7 +173,14 @@ shape is there. The container is disposable, so an arm may delete.
 
 **What a PASS still shows as `[left]`.** These are reports, not failures, and they stand on every heal (the second one too): root's legacy `ssh.*` folders (`ssh.backup.migrate` moves them; the heal never does), the old-format `user.env` values of a real `~/config` that are never carried over, foreign trees left untouched (`foreign.symlink`), and a canonical folder moved aside to `<base>.aside/<name>.orig.<ts>` for you to look at.
 
-**Results so far** (ubuntu_24_04, 2026-10-07): `dev eraB.config` PASS, `dev foreign.symlink` PASS, `51d7fb3 all pipe` PASS.
+**Results so far.** ubuntu_24_04, 2026-10-07: `dev eraB.config` PASS, `dev foreign.symlink` PASS, `51d7fb3 all pipe` PASS. After the Linux gates, 2026-10-08:
+
+| Platform | Ref | Result | What the gate taught |
+|---|---|---|---|
+| debian_12 | 51d7fb3 | PASS | bash 5.1 cannot parse a `{ case` with a bare pattern inside `$( … )`: `portability.validate` refuses it (`private.test.suite.case.comsub.is`) |
+| almalinux_9 | 51d7fb3 | PASS | `oo heal all` heals people only: the system account `operator` (uid 11, `/sbin/nologin`, home `/root`) is `[skip]`, not healed (`private.user.account.heals.is`) |
+| alpine_3_19 | 51d7fb3 | PASS | BusyBox's empty-shell PATH lacks `/usr/local/bin`: the launcher gets the link `/usr/bin/this` (`private.oo.launcher.link.get`); its `setsid` knows no `-w`, so the no-tty probe uses `setsid -w` only where it exists |
+| ubuntu_24_04 | 26d15a4 | PASS | `config init.env`'s guard judges a loss by variable name over user/oosh/log `.env` and skips the never-persist names (`private.config.variable.persisted.is`: `OOSH_APT_UPDATED`, `OOSH_CLEAN_ENV`); the heal's env note carries its reason |
 
 **The transport** (`private.os.platform.user.run`): `runuser` gets `env HOME=~<user>` (it keeps the caller's environment, so HOME would stay the ssh login's), root runs through `sudo -H`, and every command starts with `unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND` — `ogit.folder.finish` in the gates' fixtures trusts folders for `$SUDO_USER`, which filled the login's `.gitconfig`.
 

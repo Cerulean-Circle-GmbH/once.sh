@@ -167,6 +167,8 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.
 start with *no* arguments and run an install. The extra `sh` makes `heal` the first argument. (In the pipe
 form `sh -s -- heal` the arguments are positional as usual.)
 
+**The launcher.** The tree the arm hands over to installs the launcher `/usr/local/bin/this` (`private.oo.install.launcher`); where the empty shell `env -i sh` has no `/usr/local/bin` on its PATH — BusyBox on Alpine — it also links `/usr/bin/this` to it (`private.oo.launcher.link.get`), so `this` is found there too.
+
 **Position.** The arm sits after the `git` and bash 4+ checks and **before** the sudo check
 (`# BEGIN healArm` … `# END healArm`): healing one's own account needs no sudo, so a user on a machine without
 sudo can heal. Phase A's package-list refresh runs only when it must install `git` or bash, for the same

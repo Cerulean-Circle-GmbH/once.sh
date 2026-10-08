@@ -264,6 +264,8 @@ scans **test** code, not production code. Production portability is enforced by 
 on the platforms (the macOS and container gates); nothing ran the test harness anywhere new often
 enough to catch these.
 
+**A `{ case` inside `$( … )`.** `portability.validate` also refuses a `{ case` with a bare pattern inside a command substitution (`private.test.suite.case.comsub.is`, a silent predicate called per sweep hit). bash 5.1 (AlmaLinux 9's 5.1.8) cannot parse it: the `)` of the first bare pattern ends the `$( … )` and the file dies with `syntax error near unexpected token ';;'` — `test.oo` and `test.this` scored nothing on that gate. Write every pattern `(pattern)`, or define the stub outside the substitution. A `$(` left open into a single quote (`$(… bash -c '`) is quoted text, not a fault.
+
 `T-PORTABILITY-TREE` in `test/test.test.suite` is the gate, so a new offender fails `core` on the
 machine that introduces it rather than on someone's Mac a week later.
 
