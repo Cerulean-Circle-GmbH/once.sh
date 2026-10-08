@@ -1353,6 +1353,21 @@ test.case $level "T-IDEMPOTENCE-UNACCEPTED-GLOB: a rewrite is accepted only for 
 expect 0 "a same-content rewrite is accepted under the shared env files only; a re-cloned folder, a state file and a content change are unaccepted" \
   "E1: the second heal accepted every rewrite, a folder cloned again too"
 
+# T-IDEMPOTENCE-QUIET-GET: the fresh process of each row is quiet — OOSH_NO_INSTALL=1, it installs
+# nothing — except the oo heal row: under OOSH_NO_INSTALL the heal heals no real base (the test-run
+# guard, rc 2), so the invariant's oo heal row was NOT CHECKED on every platform (ubuntu, P6). That
+# row heals this machine on purpose, non-interactive through OOSH_HEAL_NONINTERACTIVE=1.
+test.os.idempotenceQuietGet() {
+  local bad="" got
+  got=$( TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1; . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant"
+         printf '%s|' "$(test.platform.shared.idempotence.quiet.get "$HOME/oosh/config" save)" "$(test.platform.shared.idempotence.quiet.get "$HOME/oosh/oo" heal)" "$(test.platform.shared.idempotence.quiet.get "$HOME/oosh/oo" heal.status)" )
+  [ "$got" = "OOSH_NO_INSTALL=1|OOSH_HEAL_NONINTERACTIVE=1|OOSH_NO_INSTALL=1|" ] || bad="$bad got=[$got]"
+  [ -z "$bad" ] && create.result 0 "OOSH_NO_INSTALL=1 for every row, OOSH_HEAL_NONINTERACTIVE=1 for oo heal" || create.result 1 "quiet get:$bad"
+  return $(result)
+}
+test.case $level "T-IDEMPOTENCE-QUIET-GET: the oo heal row of the idempotence invariant runs non-interactive, not under OOSH_NO_INSTALL" test.os.idempotenceQuietGet
+expect 0 "OOSH_NO_INSTALL=1 for every row, OOSH_HEAL_NONINTERACTIVE=1 for oo heal" "the test-run guard refused the invariant's oo heal on every real base"
+
 
 # T-OS-HEAL-EXPECT-CHECK: the post-heal check of the scenario, as root in sh. Its text runs here on
 # a fixture machine that is healed (a passwd of its own, a base, a sharedConfig, five homes, the
