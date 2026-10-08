@@ -514,16 +514,19 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
   every canonical folder is `private.oo.repo.url.get` (`git@github.com:Cerulean-Circle-GmbH/once.sh.git`), the URL
   install state 31 clones from too; an HTTPS, path or bundle origin of a canonical folder is re-pointed to it, and
   `OOSH_REPO` is only ever the source of a clone. The curl form's own temporary clone stays HTTPS (it has no key).
-- **developking's SSH setup, as the install makes it.** As root the system step builds it BEFORE the code step
-  clones over SSH, through the method install state 31 calls, `private.oo.shared.ssh.ensure <basehome>`: the
-  deploy key in `~developking/.ssh/` (`id_rsa`, from ``, else
+- **developking's SSH setup, as the install makes it.** Whenever the heal has root the system step builds it
+  BEFORE the code step clones over SSH (`private.oo.heal.system.root`: directly as root; a user whose heal has root
+  by sudo runs it in one clean root process through `sudo -n`), through the method install state 31 calls,
+  `private.oo.shared.ssh.ensure <basehome> <?idsHome> <?phase>` — phase `before` (state 31 runs it ahead of its
+  clone, the heal first) and phase `after` (state 31 behind its clone, the heal next): the
+  deploy key in `~developking/.ssh/` (`id_rsa`, from `$DEVELOPKING_SOURCE_SERVER`, else
   `templates/user/developking.ssh`), `Host github.com` in root's `~/.ssh/config`
   (`IdentityFile ~/.ssh/ids/ssh.developking/id_rsa`, `IdentitiesOnly yes`), developking's `.ssh` copied to
   `~/.ssh/ids/ssh.developking`, and `<basehome>/shared/.ssh` with its own `Host github.com` and `known_hosts`
   (`ossh config.shared.github.create`) — each only when missing, `~/.ssh` archived (`user ssh.backup pre-install`)
   before its first write. Root's `~/init` links to `~/oosh/init` (`private.oo.init.link.ensure`, a real one kept as
-  `init.orig.<ts>`). A user's own heal writes no other home: without root there is no SSH setup.
-- **Root's login shell is bash, as install state 32 sets it**: as root the system step calls
+  `init.orig.<ts>`). Without root there is no SSH setup.
+- **Root's login shell is bash, as install state 32 sets it**: whenever the heal has root the system step calls
   `private.user.login.shell.bash.ensure root`.
 - **Foreign folders are untouched and reported.** A `~/oosh` that points outside the base is relinked to the
   base; the folder it pointed to is left alone, its git state reported (`[left] … untouched`). A foreign tree git
@@ -584,7 +587,7 @@ removes the process's own copy (`private.oo.heal.copy.trap`) → a heal of other
 (rc 2) → the base's folders are **trusted** (`private.oo.heal.base.trust`) → `diagnose` (read-only, printed
 first — the same lines as `oo heal.status`) → the **privilege decision** (`private.oo.heal.root.need`, then
 `private.oo.heal.privilege.ensure`; § The privilege rule) → `system` (group `dev`, `developking` and its home, the base with group `dev` and
-setgid, the launcher, no retired drop-in, and as root developking's SSH setup, root's `~/init` and root's login shell) → `code` (`main/` and `<branch>/`, plus `dev/` when `<branch>` is
+setgid, the launcher, no retired drop-in, and whenever the heal has root developking's SSH setup, root's `~/init` and root's login shell) → `code` (`main/` and `<branch>/`, plus `dev/` when `<branch>` is
 `main`) → `config` (the `sharedConfig` is *made* when missing, then `config init.shared`; it is still empty) →
 `user(s)` (`config init.user <user> <base>/<branch>`, a real `~/config` kept aside and queued, then as that
 user only what `config init.user` does not: the session files with `OOSH_MODE`, `mode-env.bash`, no dead
@@ -598,7 +601,7 @@ install state 32 saves them, then — as root — the two root steps of `oo upda
 line per step: `healed`, `left`, `cannot`). A step that ends with rc 2 (root, `system`, `code`, `config`) goes
 straight to the summary. Each step starts with sudo's cached credential refreshed when the heal runs on one
 (`private.oo.heal.root.ticket.refresh`, `sudo -n -v`, never a prompt). `fresh.run` gives its process the heal's own
-`LOG_LEVEL`, `3` when there is none, so `config init.env` persists that level, never a level of its own. As root a
+`LOG_LEVEL`, `3` when there is none, so `config init.env` persists that level, never a level of its own. Whenever it has root a
 one-user heal heals `developking` and `root` too — linked and verified like the named user, each keeping a canonical
 branch of its own — so `developking` has its `~/oosh` and `~/config` links after any heal that had root; the
 curl form run as root (`curl … | sudo sh -s -- heal <branch>`) heals `all`. The `users: healed: <names>` note is
@@ -1168,7 +1171,8 @@ Internal functions (not for direct use):
 | `private.oo.dropin.present <?systemPath> <?profileDir>` | Predicate: the retired login drop-in is there — `<systemPath>/boot`, or a `<profileDir>/oosh.sh` that names the boot path or carries the managed mark; exactly what `private.oo.dropin.remove` removes, which asks it too |
 | `private.oo.heal.root.ticket.refresh` | Before each step of a heal that runs on a cached sudo credential (`OOSH_HEAL_ROOT=yes`, not root): `sudo -n -v`, never a prompt; rc 0 always |
 | `private.oo.heal.test.run.check <base>` | Predicate: this run may touch `<base>` — no test run (`OOSH_NO_INSTALL` unset), or a base under the temp directory (`$TMPDIR` else `/tmp`); `oo.heal` asks it before its first step |
-| `private.oo.shared.ssh.ensure <basehome> <?idsHome:$HOME>` | developking's SSH setup as install state 31 makes it, each piece only when missing: the deploy key in `~developking/.ssh` (the download from `$DEVELOPKING_SOURCE_SERVER`, else `templates/user/developking.ssh`, handed over to `developking:dev`), `Host github.com` in this user's `~/.ssh/config` (`private.install.dev.configs`), `<idsHome>/.ssh/ids/ssh.developking`, `<basehome>/shared/.ssh` (`ossh config.shared.github.create`); `~/.ssh` archived (`user ssh.backup pre-install`) before its first write; state 31 and the heal's system step (as root) call it |
+| `private.oo.heal.system.root <basehome>` | As root: the SSH setup (`private.oo.shared.ssh.ensure` before, then after), `~/init` (`private.oo.init.link.ensure`) and root's login shell (`private.user.login.shell.bash.ensure root`); `RESULT` names what was left |
+| `private.oo.shared.ssh.ensure <basehome> <?idsHome:$HOME> <?phase:all>` | developking's SSH setup as install state 31 makes it, each piece only when missing, in two phases that keep dev's order — `before` (deploy key, snapshot, Host github.com) ahead of state 31's clone, `after` (ids copy, shared .ssh) behind it: the deploy key in `~developking/.ssh` (the download from `$DEVELOPKING_SOURCE_SERVER`, else `templates/user/developking.ssh`, handed over to `developking:dev`), `Host github.com` in this user's `~/.ssh/config` (`private.install.dev.configs`), `<idsHome>/.ssh/ids/ssh.developking`, `<basehome>/shared/.ssh` (`ossh config.shared.github.create`); `~/.ssh` archived (`user ssh.backup pre-install`) before its first write; state 31 and the heal's system step (as root) call it |
 | `private.oo.init.link.ensure <?home:$HOME>` | `<home>/init` → `<home>/oosh/init` through `private.this.symlink.with.backup` (a real one kept as `init.orig.<ts>`), a link that is there kept; state 31 and the heal's system step (as root) call it |
 | `private.oo.heal.path.get <basehome> <which>` | `base` (the components base, `private.config.shared.oosh.base.get`) or `sharedConfig` (`private.config.shared.config.get`) under `<basehome>`, in the file system's letter case; before developking exists the fallback is `<basehome>/shared` through `private.this.path.case.get`; silent getter |
 | `private.oo.heal.root.check` | Predicate: this process may act as root — it is root, or `private.oo.heal.privilege.ensure` decided yes; rc 1 otherwise, never a decision of its own |
@@ -1181,7 +1185,7 @@ Internal functions (not for direct use):
 | `private.oo.heal.folder.gate <dir> <branch>` | What the heal does with a canonical folder: `missing`, `keep`, `fastforward`, `aside`, `worktree` or `occupied`; read-only, built on the same probes as the pull gate |
 | `private.oo.heal.folder.finish <dir>` | Finishes a folder the code step cloned or kept: root or its owner runs `ogit folder.finish`; anyone else only `ogit safeDirectory.add`, and a folder not shared with group `dev` is left with `ogit repo.share <dir>` (rc 1); rc 1 for a missing `<dir>` |
 | `private.oo.heal.folder.aside <dir>` | Moves a canonical folder, whole, to `<base>.aside/<name>.orig.<ts>` through `private.this.entry.aside`; never deletes; refuses the tree the heal runs from; `RESULT` = the new path |
-| `private.oo.heal.system <branch> <?who>` | The system part: group `dev`, `developking` and its home, the shared base, the launcher (quiet), no retired drop-in, and as root `private.oo.shared.ssh.ensure`, `private.oo.init.link.ensure` and `private.user.login.shell.bash.ensure root`; rc 2 naming `private.oo.heal.rerun.command.get` when root is needed and not there |
+| `private.oo.heal.system <branch> <?who>` | The system part: group `dev`, `developking` and its home, the shared base, the launcher (quiet), no retired drop-in, and whenever the heal has root `private.oo.heal.system.root` (directly as root, through `sudo -n` with root by sudo); rc 2 naming `private.oo.heal.rerun.command.get` when root is needed and not there |
 | `private.oo.heal.code <base> <branch>` | `main/` and `<branch>/` (and `dev/` when `<branch>` is `main`) as clean clones from `$OOSH_REPO` else `private.oo.repo.url.get`, every HTTPS, path or bundle origin re-pointed to that SSH URL; aside, fast-forward and worktree conversion (`ogit worktree.remove`, which sets a missing upstream itself); offline the tree running the heal is the source; rc 1 left for you, rc 2 no source |
 | `private.oo.heal.config <sharedConfig>` | Makes the `sharedConfig` when missing (owner `developking`; the env step fills it), then `config init.shared` — rc 1 quoting its own last lines when it reports a problem; rc 2 when it cannot be made |
 | `private.oo.heal.config.load <probeFn>` | Loads config through `private.this.script.load` unless `<probeFn>` is a function already and keeps the heal's CONFIG guard; rc 0 when `<probeFn>` is a function afterwards |
