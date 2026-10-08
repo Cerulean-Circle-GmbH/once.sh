@@ -117,34 +117,42 @@ native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<brea
    reaches GitHub through a test. The name is flat because the old install makes `<base>/<branch>` and `OOSH_MODE`
    of the branch name, which a slash would split. A trap on INT and TERM is set here: on Ctrl-C the temporary
    branch is dropped, the container removed and the run **exits 130**.
+   `<oldRef>` must not be the branch under test: an install of the heal's own branch would be healed by the same code and prove nothing (rc 1, "give an older ref").
 3. The era gate (`private.os.platform.branch.gate`) refuses a ref older than the `mode root` installer contract.
 4. `private.os.platform.container.up` with `OSSH_INSTALL_BRANCH` set, then `private.os.platform.users.install`:
    `test`, `root`, `oosh-user` and `bash-user` are installed at the OLD ref.
 5. The breakages, each as root in the container. A breakage that fails ends the run at once with `FAIL: heal … (breakage <name> failed — log: …)`, rc 1, before the heal: a shape that did not come about proves nothing.
-6. One heal: `OOSH_HEAL_LOCAL=1 ossh heal <platform> all <branch>`. Its rc 1 is no failure (it moves broken
-   canonical folders aside and says so, and reports info notes such as legacy `ssh.*` folders or a non-bash login
-   shell); rc 2 or an ssh failure is. The log of the heal is read: a `FAIL <invariant> <user>:` line of its own
-   verify **fails the run**; `NOT CHECKED` lines are only counted and shown as a warning. With `pipe`, the pure pipe
-   form runs once more as `test` through `ossh heal.pipe` (`private.os.platform.heal.pipe.run`; [ossh.md](ossh.md#healing-a-remote-host-ossh-heal)).
+6. One heal: `OOSH_HEAL_LOCAL=1 ossh heal <platform> all <branch>`. Its rc 1 is no failure when it is reports only
+   (it moves broken canonical folders aside and says so, and reports info notes such as legacy `ssh.*` folders or a
+   non-bash login shell): the rc line ends in `install state 99`, read by `private.os.platform.heal.reports.only.is`,
+   the same predicate the second heal uses. Any other rc 1, rc 2 or an ssh failure fails. The log of the heal is read:
+   a `FAIL <invariant> <user>:` line of its own verify **fails the run**, and so does a `NOT CHECKED` line unless its
+   reason is the re-login that group `dev` needs (`group dev takes effect after a re-login`, shown as a warning); the
+   count of the others is the `not-checked` field of the verdict.
+   **The expect check** runs right after it: `private.os.platform.heal.check <platform> expect <branch> <breakages>`,
+   see **The checks** below. With `pipe`, the pure pipe form runs once more as `test` through `ossh heal.pipe`
+   (`private.os.platform.heal.pipe.run`; [ossh.md](ossh.md#healing-a-remote-host-ossh-heal)).
 7. `private.os.platform.gate.run` four times (`test`, `root`, `oosh-user`, `bash-user`), with
    `private.os.platform.shared.config.repair` after root's run.
 8. The idempotence invariant (`test.suite run platform.shared.idempotence.invariant 1`) as root and as `bash-user`.
-9. The second heal (`private.os.platform.heal.second.run`): a snapshot of what `oo heal` owns, `<base>/<branch>/oo heal <branch> all`
-   as root (the base through root's `~/oosh`: the `oo` on root's PATH may be an older branch without `oo heal`), a snapshot again — rc 0, or rc 1 whose rc line ends in `install state 99` (reports only: `oo heal` writes it only when every step and verify is green, so a rc 1 with a step left still fails), and snapshots that differ in nothing but **same-content rewrites** (every
-   `oo heal` ends in `config init.env`, which writes the shared env files again). Those rewrites are reported as a
-   WARNING, exactly as the idempotence invariant accepts them: the comparison goes through the invariant's own
-   helpers (`test.platform.shared.idempotence.volatile.without`, which also leaves `result.env` out, and
-   `.compare` / `.unaccepted`). Any other difference fails and is printed.
+9. The second heal (`private.os.platform.heal.second.run`): a snapshot of what `oo heal` owns, the command of
+   `private.os.platform.heal.second.command.get <branch>` as root (`<base>/<branch>/oo heal <branch> all`, the base
+   through the `~/oosh` of root: the `oo` on the PATH of root may be an older branch without `oo heal`), a snapshot again — rc 0, or rc 1 reports only (the first heal's reading), and snapshots that differ in nothing but **same-content rewrites of the shared env files**. The snapshot holds the entries of `<base>`, `<base>/main` and `<base>/<branch>`, the `*.env` files of the sharedConfig, its `stateMachines/*` files by content only (the heal writes the machine file again on every green run, the same bytes), the number of entries of `<base>.aside` (a heal that moves a folder aside on every run adds one each time), the launcher and drop-in, and the homes of the five users. Every `oo heal` ends in `config init.env`, which writes the shared env files again; a rewrite of a `*.env` file of the sharedConfig or of `~/.config/oosh` is reported as a WARNING, exactly as the idempotence invariant accepts it, through the `<?pathGlob>` of `test.platform.shared.idempotence.unaccepted rewritten` (`*/sharedConfig/*.env|*/.config/oosh/*.env`). A rewrite of anything else, a folder cloned again among it, is a change. The comparison goes through the invariant's own helpers (`volatile.without`, which also leaves `result.env` out, `.compare` and `.unaccepted`). Any other difference fails and is printed.
 10. The foreign check (`private.os.platform.heal.check <platform> foreign`, only when `foreign.symlink` ran): `/opt/foreign`
     has the same entries and checksums and nothing newer than the marker; git's stat cache `.git/index` is
     ignored (a `git status` refreshes it without changing a byte of the tree).
-11. The verdict line `PASS: heal <platform> <oldRef> (breakages=<rc> heal=<rc> verify=<n> [pipe=<rc>] test=<rc>
+11. **The user.clone second pass.** `user.clone` rebuilds `<base>/<branch>` and is left out of `all`. When the other
+    steps all passed and `user.clone` was not named, the run applies it on the healed machine, runs the second-heal
+    command once more and checks the clone (`private.os.platform.heal.check <platform> user.clone <branch>`); a failed
+    arm, a heal that is not rc 0 or reports only, or a red check fails the run (`user-clone=1`). A run of named breakages has no second pass.
+12. The verdict line `PASS: heal <platform> <oldRef> (heal=<rc> verify=<n> not-checked=<n> [pipe=<rc>] expect=<rc> test=<rc>
     root=<rc> oosh-user=<rc> bash-user=<rc> idempotence=<rc> second-heal=<rc> foreign=<rc|skipped> [user-clone=<rc>])` or `FAIL:` with
-    the first FAIL lines of the logs. PASS needs `breakages=0`, `heal` 0 or 1 (rc ≥ 2 fails), `verify=0` (the count
-    of red verify lines), `pipe` and `user-clone` 0 when run, and 0 for every other field (`foreign` may be `skipped`). Then
+    the first FAIL lines of the logs and the folder of the logs. PASS needs `heal` 0, or 1 as reports only (rc ≥ 2 and any other rc 1 fail),
+    `verify=0` (the count of red verify lines), `not-checked=0` (the NOT CHECKED lines whose reason is not the re-login),
+    `pipe` and `user-clone` 0 when run, and 0 for every other field (`foreign` may be `skipped`). Then
     `private.os.platform.ref.branch.drop` deletes a `platform-test-*` branch on origin (as `refs/heads/<name>`, so a
     tag of the same name is left standing; any other branch is left alone) and, unless `terminal`, the container is
-    removed. On PASS the logs are removed too.
+    removed. On PASS the folder of the logs is removed too. A breakage that fails ends the run before the heal with its own `FAIL` line.
 
 **The breakages**, applied in this fixed order whatever order is typed
 (`private.os.platform.heal.breakage.names.get`). Each is an idempotent POSIX sh arm run as root
@@ -157,14 +165,27 @@ the same POSIX sh text, so no arm carries its own copy of these helpers:
 - `say` / `fail` — the arm's line, and its exit 1;
 - `rgit` — git with `safe.directory=*` and a test identity for this call only;
 - `home_of <user>` — the home from `/etc/passwd`;
-- `as_user <user> <cmd...>` — the transport of `private.os.platform.user.run` from inside the root script: `runuser` with the user's HOME, else `sudo -H -u` (busybox has no `runuser`);
+- `as_user <user> <cmd...>` — the transport of `private.os.platform.user.run` from inside the root script: `runuser` with the HOME of the user, else `sudo -H -u` (busybox has no `runuser`); its stdin is closed, so a command run as a user never reads the rest of the script;
+- `owner_of`, `gid_of`, `inode_of <path>` — GNU `stat`, else its BSD twin, the one place the arms read these;
 - `move_aside <path> <tag>` — a link is removed, anything else is moved to `<path>.before-<tag>`;
 - `installed`, `clone_installed <dir> <branch>`, `branch_dir_ensure` — the installed tree of `test`, a clone of it, the canonical folder `<base>/<branch>` as such a clone;
 - `foreign_sums` — the entries and checksums of `/opt/foreign` (its `.git/index` left out).
 
 **The checks** are script getters, `private.os.platform.heal.<name>.check.script.get <args...>`
-(`foreign`, `user.clone <branch>`), run by one runner, `private.os.platform.heal.check <platform> <name> <args...>`,
+(`expect <branch> <breakages...>`, `foreign`, `user.clone <branch>`), run by one runner, `private.os.platform.heal.check <platform> <name> <args...>`,
 as root through `private.os.platform.root.script.run`; its RESULT is `<name> check on <platform>: rc <rc>`.
+
+**The expect check** asserts what the heal left. Every line of its output is `expect <block>: …`, a wrong shape
+`expect <block>: FAILED — …`, rc 1 on any. The blocks of every heal:
+
+| Block | What it asserts |
+|---|---|
+| `origin` | the configured `remote.origin.url` (`git config --get`, not `get-url`, which a host `insteadOf` rewrites) of `<base>/main` and `<base>/<branch>` is `git@github.com:Cerulean-Circle-GmbH/once.sh.git` (`private.oo.repo.url.get`) |
+| `ssh` | `~developking/.ssh/id_rsa` owned by developking; root's `~/.ssh/config` with `Host github.com`, `IdentityFile ~/.ssh/ids/ssh.developking/id_rsa`, `IdentitiesOnly yes`; root's `~/.ssh/ids/ssh.developking/id_rsa`; `<basehome>/shared/.ssh/config` with `Host github.com` and `known_hosts` with github.com; `~/init` of root → `~/oosh/init`; root's login shell bash |
+| `launcher` | `/usr/local/bin/this`, and `/usr/bin/this` where an empty shell has no `/usr/local/bin` on its PATH (Alpine) |
+| `links` | `~/oosh` and `~/config` of test, root, oosh-user, bash-user and developking: `~/config` is the sharedConfig; test and root (the healer and the login that ran sudo) are on `<base>/<branch>`; every other user is on `<base>/<branch>` or on a tree that carries the model (`config.session.save`, the clean boot — `private.oo.heal.user.keep.check`'s rule, read as text), else the user kept a tree that predates the heal; a link outside the base fails |
+
+and the blocks of a breakage, only when that breakage ran: `eraB.config` (test's `config.orig.<ts>`, `OOSH_SSH_CONFIG_HOST` and `LOG_LEVEL` imported into the sharedConfig), `root.clone` (the real clone and config kept as `oosh.orig.<ts>` and `config.orig.<ts>`), `devhome.missing` (developking's home back, owned by developking), `boot.era` (oosh-user's `.bashrc` not of the boot era, no retired drop-in), `no.bashrc`, `safe.directory.stale` (no `/Users/Shared` entry in root's `.gitconfig`), `ssh.legacy` (the legacy folder reported and left), `state.30` (`SETUP_SERVER` at 99 in the sharedConfig), `worktree.layout` (`<base>/testing` no linked worktree), `aside` (for `diverged`, `markers.committed`, `merge.conflict`, `dirty`, `detached`: an entry `<base>.aside/<branch>.orig.<ts>` holds the arm's marker) and `folder` (after a folder breakage `<base>/<branch>` is a clean clone on the branch: no merge, no markers, no diverged history).
 
 | Name | What it does | Where |
 |---|---|---|
@@ -176,7 +197,7 @@ as root through `private.os.platform.root.script.run`; its RESULT is `<name> che
 | `no.bashrc` | `~/.bashrc` moved to `.bashrc.pre-oosh` | `root` |
 | `safe.directory.stale` | Dead `safe.directory` entries (`/Users/Shared/...`) in `.gitconfig` | `root` |
 | `ssh.legacy` | Legacy `ssh.original` and `ssh.<user>.<host>.for.<host>` folders | `root` |
-| `state.30` | The install state machine set back to `SETUP_SERVER` 30 | `root` |
+| `state.30` | The install state set back to `SETUP_SERVER` 30 in the sharedConfig: `stateMachines/SETUP_SERVER.states.env` (`SETUP_SERVER_STATE_ID=30`) and the cache `current.state.machine.env` (`state=30`) | system |
 | `launcher.missing` | `/usr/local/bin/this` removed | system |
 | `worktree.layout` | `<base>/testing` becomes a linked worktree at `origin/testing`, tracking it — the shape the old install left | base |
 | `missing.branch` | `<base>/<branch>` removed | base |
@@ -191,7 +212,7 @@ as root through `private.os.platform.root.script.run`; its RESULT is `<name> che
 
 **The transport** (`private.os.platform.user.run`): `runuser` gets `env HOME=~<user>` (it keeps the caller's environment, so HOME would stay the ssh login's), root runs through `sudo -H`, and every command starts with `unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND` — `ogit.folder.finish` in the gates' fixtures trusts folders for `$SUDO_USER`, which filled the login's `.gitconfig`.
 
-**Who moves** under `oo heal <branch> all` is [oo.md § oo.heal](oo.md#ooheal)'s rule (`all`): here `oosh-user`, `bash-user` and `developking` keep their installed branch, so a check of the scenario must not expect them on `<branch>`.
+**Who moves** under `oo heal <branch> all` is [oo.md § oo.heal](oo.md#ooheal)'s rule (`all`, `private.oo.heal.user.keep.check`): the healer (root) and the login that ran sudo (`test`) move to `<base>/<branch>`; `oosh-user`, `bash-user` and `developking` keep their canonical tree only when it carries the model (`config.session.save` and the clean boot), and the installed old ref does not, so they move too. The expect check asserts exactly that: a user outside `<base>/<branch>` must be on a tree that carries the model.
 
 The folder arms build on one another in this order: `missing.branch` clears `<base>/<branch>`; `diverged`
 clones it again from the installed tree and commits on it; `markers.committed` commits on it; `merge.conflict`
@@ -203,9 +224,11 @@ fails the run (`user-clone=1` in the verdict line, log step `user-clone`) when t
 owner changed or the HEAD is no fast-forward of the record. The fixture files travel as text
 inside the one script (`private.os.platform.heal.fixture.script.get`, `private.os.platform.root.script.run`).
 
-**Logs.** `private.os.platform.heal.log.get <step> <platform>` is `/tmp/oosh-heal-test-<step>-<platform>.log` for
-the steps `breakages`, `heal`, `pipe`, `test`, `root`, `oosh-user`, `bash-user`, `idempotence-root`,
-`idempotence-bash-user`, `second-heal`, `foreign` and `user-clone`. They are emptied at the start and removed on PASS.
+**Logs.** The logs of a run are one folder, made by `private.this.temp.dir.get oosh-heal-test` under `TMPDIR` (else `/tmp`) and
+named in `OOSH_HEAL_TEST_LOGS`; `private.os.platform.heal.log.get <step> <platform>` is `oosh-heal-test-<step>-<platform>.log` in it
+for the steps `breakages`, `heal`, `expect`, `pipe`, `test`, `root`, `oosh-user`, `bash-user`, `idempotence-root`,
+`idempotence-bash-user`, `second-heal`, `foreign`, `user-clone-heal` and `user-clone`. The folder is removed on PASS; on a FAIL, a failed
+breakage, or Ctrl-C, SIGTERM or a hangup (the run ends 130, the branch dropped, the container removed) its path is printed (`logs: <folder>`).
 
 **The C2 preconditions.** The tree is clean and committed (see step 1), and `<healBranch>` — the branch of this
 tree — exists on origin; else the idempotence invariant's `oo update` row is NOT CHECKED and `idempotence=1`.

@@ -51,7 +51,8 @@ private.os.platform.container.up()     # <platform> <image> <port> # start a fre
  console.log "Testing platform: $platform (image: $imageTag)"
 
  # Auto-build if image doesn't exist
- if ! docker image inspect "$imageTag" &>/dev/null; then # kernel-exception: pending P5
+ private.this.script.load odocker odocker.image.list
+ if ! odocker.image.list 2>/dev/null | awk -v t="$imageTag" 'NR > 1 && $1 == t { found = 1 } END { exit !found }'; then
   console.log "Image $imageTag not found — building from $PLATFORM_WORKSPACE..."
   if ! odocker build "$PLATFORM_WORKSPACE"; then
    error.log "Failed to build image for $platform"
@@ -70,7 +71,7 @@ private.os.platform.container.up()     # <platform> <image> <port> # start a fre
  ossh config.create "$platform" "test@localhost:$sshPort"
  ossh config.save.last
  # Clean up any stale ControlMaster socket from a previous test run
- ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null # kernel-exception: pending P5
+ ossh connection.close "$platform" >/dev/null 2>&1
  private.os.platform.socket.remove "$sshPort"
 
  # Open ControlMaster with sshpass (first connection, no keys yet)
@@ -167,15 +168,15 @@ private.os.platform.users.install()     # <platform> # Phase A in the platform c
  ossh exec.tty "$platform" "
   if id bash-user >/dev/null 2>&1; then
    echo 'bash-user already exists — skipping useradd'
-  elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then # kernel-exception: pending P5
-   sudo useradd -m -s /bin/bash bash-user # kernel-exception: pending P5
-  elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then # kernel-exception: pending P5
-   sudo adduser -D -s /bin/bash bash-user # kernel-exception: pending P5
+  elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then # kernel-exception: text run in the platform container over ssh, not a call of this host
+   sudo useradd -m -s /bin/bash bash-user # kernel-exception: text run in the platform container over ssh, not a call of this host
+  elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then # kernel-exception: text run in the platform container over ssh, not a call of this host
+   sudo adduser -D -s /bin/bash bash-user # kernel-exception: text run in the platform container over ssh, not a call of this host
   else
    echo 'no useradd/adduser available' >&2; exit 127
   fi
-  echo bash-user:bash-user | sudo chpasswd # kernel-exception: pending P5
-  sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers' # kernel-exception: pending P5
+  echo bash-user:bash-user | sudo chpasswd # kernel-exception: text run in the platform container over ssh, not a call of this host
+  sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers' # kernel-exception: text run in the platform container over ssh, not a call of this host
  " || {
   error.log "Failed to create bash-user on $platform"
  }
@@ -372,7 +373,7 @@ private.os.platform.heal.fixture.script.get()     # <fixture> <target> # echo PO
 }
 
 
-private.os.platform.heal.remote.preamble.get()     # <branch> # echo the POSIX sh preamble of every script os platform.heal.test runs as root in a container: H=<branch>, home_of from /etc/passwd, the base B, the sharedConfig S, the canonical folder D=B/H, rgit, say and fail, the installed tree and a clone of it, the foreign sums; silent getter, rc 1 for a missing or bad <branch> #
+private.os.platform.heal.remote.preamble.get()     # <branch> # echo the POSIX sh preamble of every script os platform.heal.test runs as root in a container: H=<branch>, home_of from /etc/passwd, the base B, the sharedConfig S, the canonical folder D=B/H, rgit, say and fail, as_user with stdin closed, owner_of, gid_of and inode_of, the installed tree and a clone of it, the foreign sums; silent getter, rc 1 for a missing or bad <branch> #
 {
  # NO create.result — a getter consumed as $(...). Raw POSIX sh ON PURPOSE:
  # these scripts reproduce and inspect what an OLD install left behind, and
@@ -394,7 +395,12 @@ rgit() { git -c safe.directory='*' -c user.email=heal-test@oosh.invalid -c user.
 home_of() { awk -F: -v u="$1" '$1 == u { print $6; exit }' /etc/passwd; }
 # as_user <user> <cmd...>: the transport of private.os.platform.user.run from inside this root
 # script — runuser with the HOME of <user>, else (busybox: no runuser) sudo -H -u
-as_user() { _au=$1; shift; if command -v runuser >/dev/null 2>&1; then runuser -u "$_au" -- env HOME="$(home_of "$_au")" "$@"; else sudo -H -u "$_au" "$@"; fi; } # kernel-exception: POSIX sh of the disposable-container arm
+# stdin is closed: a command run as a user must never read the rest of the script this root shell is reading
+as_user() { _au=$1; shift; if command -v runuser >/dev/null 2>&1; then runuser -u "$_au" -- env HOME="$(home_of "$_au")" "$@" </dev/null; else sudo -H -u "$_au" "$@" </dev/null; fi; } # kernel-exception: POSIX sh of the disposable-container arm
+# owner_of, gid_of, inode_of <path>: GNU stat first, else its BSD twin — the one place the arms read these
+  owner_of() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1"; } # kernel-exception: POSIX sh of the disposable-container arm, the stat -f twin is the fix # portability-exception: GNU stat with its BSD twin
+  gid_of() { stat -c %g "$1" 2>/dev/null || stat -f %g "$1"; } # kernel-exception: POSIX sh of the disposable-container arm, the stat -f twin is the fix # portability-exception: GNU stat with its BSD twin
+  inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; } # kernel-exception: POSIX sh of the disposable-container arm, the stat -f twin is the fix # portability-exception: GNU stat with its BSD twin
 # move_aside <path> <tag>: a link is removed, anything else there is moved to <path>.before-<tag>
 move_aside() { if [ -L "$1" ]; then rm -f "$1"; elif [ -e "$1" ]; then mv "$1" "$1.before-$2"; fi; }
 dh=$(home_of developking)
@@ -564,11 +570,24 @@ done
 OOSH_HEAL_ARM
      ;;
    state.30)
+     # the state of the install lives in the sharedConfig every ~/config links to: the machine file
+     # (stateMachines/SETUP_SERVER.states.env, SETUP_SERVER_STATE_ID=<n>) that the heal sets to 99 and
+     # oo state reads, and the cache of the current machine (current.state.machine.env, state=<n>)
      cat <<'OOSH_HEAL_ARM'
-r=$(home_of root); f="$r/config/current.state.machine.env"
-if grep -qx 'state=30' "$f" 2>/dev/null && grep -qx 'machine=SETUP_SERVER' "$f"; then say "already: $f is at SETUP_SERVER 30"
-elif [ -f "$f" ]; then sed -i -e 's/^machine=.*/machine=SETUP_SERVER/' -e 's/^state=.*/state=30/' "$f"; say "$f set to SETUP_SERVER 30"
-else mkdir -p "${f%/*}"; printf 'machine=SETUP_SERVER\nstate=30\n' > "$f"; say "$f written at SETUP_SERVER 30"; fi # kernel-exception: POSIX sh of the disposable-container arm
+m="$S/stateMachines/SETUP_SERVER.states.env"; c="$S/current.state.machine.env"
+if grep -qx 'SETUP_SERVER_STATE_ID=30' "$m" 2>/dev/null && grep -qx 'state=30' "$c" 2>/dev/null; then say "already: $m is at SETUP_SERVER 30"; exit 0; fi
+mkdir -p "${m%/*}" # kernel-exception: POSIX sh of the disposable-container arm
+if grep -q '^SETUP_SERVER_STATE_ID=' "$m" 2>/dev/null; then
+  sed -e 's/^SETUP_SERVER_STATE_ID=.*/SETUP_SERVER_STATE_ID=30/' "$m" > "$m.heal-test" && cat "$m.heal-test" > "$m" && rm -f "$m.heal-test" || fail "$m"
+else
+  printf 'SETUP_SERVER_STATE_ID=30\nSETUP_SERVER_CUSTOM_SCRIPT=oo\n' >> "$m" || fail "$m"
+fi
+if grep -q '^state=' "$c" 2>/dev/null; then
+  sed -e 's/^machine=.*/machine=SETUP_SERVER/' -e 's/^state=.*/state=30/' "$c" > "$c.heal-test" && cat "$c.heal-test" > "$c" && rm -f "$c.heal-test" || fail "$c"
+else
+  printf 'machine=SETUP_SERVER\nstate=30\n' > "$c" || fail "$c"
+fi
+say "$m set to SETUP_SERVER 30, the cache $c too"
 OOSH_HEAL_ARM
      ;;
    launcher.missing)
@@ -665,12 +684,12 @@ OOSH_HEAL_ARM
      cat <<'OOSH_HEAL_ARM'
 REC=/opt/user.clone.heal.rec
 t=$(home_of test); [ -n "$t" ] || fail "no user test"
-if [ -d "$D/.git" ] && [ "$(stat -c %U "$D")" = test ] && [ -f "$REC" ]; then say "already: $D is a clone of test"; exit 0; fi # kernel-exception: POSIX sh of the disposable-container arm
+if [ -d "$D/.git" ] && [ "$(owner_of "$D")" = test ] && [ -f "$REC" ]; then say "already: $D is a clone of test"; exit 0; fi
 src=$(installed) || fail "the user test has no installed ~/oosh to clone"
 url=$(rgit -C "$src" remote get-url origin) || fail "$src has no origin"
 [ -e "$D" ] || [ -L "$D" ] && rm -rf "$D"
 # the empty folder the way the base gives it to a member of dev: owner test, group of the base, setgid (not recursive: it is empty)
-g=$(stat -c %g "$B") # kernel-exception: POSIX sh of the disposable-container arm
+g=$(gid_of "$B")
 mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || { rm -rf "$D"; fail "folder $D for test"; } # kernel-exception: POSIX sh of the disposable-container arm
 # From the installed tree, not from origin's $url: a clone of $url holds origin's default HEAD and every branch
 # of origin as remote-tracking refs, not the installed tree's — another shape for the heal, and the network in the arm.
@@ -697,7 +716,7 @@ r=$(home_of root)
 # ogit-exception: root's ~/.gitconfig in the disposable container, the old oosh there has no ogit
 HOME="$r" git config --global --unset-all safe.directory "^$D\$" 2>/dev/null
 if HOME="$r" git config --global --get-all safe.directory 2>/dev/null | grep -qx '\*'; then say "WARNING: root trusts every folder (safe.directory *), the shape is not dubious to root"; fi
-printf '%s %s %s\n' "$(rgit -C "$D" rev-parse HEAD)" "$(stat -c %U "$D")" "$(stat -c %i "$D")" > "$REC" || fail "$REC" # kernel-exception: POSIX sh of the disposable-container arm
+printf '%s %s %s\n' "$(rgit -C "$D" rev-parse HEAD)" "$(owner_of "$D")" "$(inode_of "$D")" > "$REC" || fail "$REC"
 say "$D is a clean clone of $H owned by test, not trusted by root; recorded in $REC"
 OOSH_HEAL_ARM
      ;;
@@ -835,7 +854,7 @@ private.os.platform.ref.branch.drop()     # <branch> <?dir:$OOSH_DIR> # delete t
 }
 
 
-private.os.platform.user.run()     # <platform> <user> <command> <log> # run <command> as <user> (test, root, oosh-user or bash-user) in the platform container through the transport that fits the user (ossh exec / sudo -H bash -lc / runuser with the HOME of the user or sudo -H -u), from the user's home with the prelude of ossh.remote.prelude.get, tee into <log>; rc is the rc of <command> #
+private.os.platform.user.run()     # <platform> <user> <command> <log> # run <command> as <user> (test, root, oosh-user or bash-user) in the platform container through the transport that fits the user (ossh exec / sudo -H bash -lc / runuser with the HOME of the user or sudo -H -u), from the home of the user with the prelude of ossh.remote.prelude.get, tee into <log>; rc is the rc of <command> #
 {
  local platform="$1" user="$2" command="$3" log="$4" prelude="" rc
  if [ -z "$platform" ] || [ -z "$user" ] || [ -z "$command" ] || [ -z "$log" ]; then
@@ -902,9 +921,9 @@ private.os.platform.user.run()     # <platform> <user> <command> <log> # run <co
    # test (eval: the tilde of a name is expanded at word start only).
    ossh exec.tty "$platform" "
      if command -v runuser >/dev/null 2>&1; then
-       sudo runuser -u $user -- env HOME=\"\$(eval echo ~$user)\" bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command' # kernel-exception: pending P5
+       sudo runuser -u $user -- env HOME=\"\$(eval echo ~$user)\" bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command' # kernel-exception: text run in the platform container over ssh, not a call of this host
      else
-       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command' # kernel-exception: pending P5
+       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command' # kernel-exception: text run in the platform container over ssh, not a call of this host
      fi
    " 2>&1 | tee "$log"
    rc=${PIPESTATUS[0]}
@@ -914,17 +933,18 @@ private.os.platform.user.run()     # <platform> <user> <command> <log> # run <co
 }
 
 
-private.os.platform.heal.log.get()     # <step> <platform> # echo the log file of a step of os platform.heal.test in <platform> (/tmp/oosh-heal-test-<step>-<platform>.log); <step> is a user (test, root, oosh-user, bash-user) or breakages, heal, pipe, idempotence-root, idempotence-bash-user, second-heal, foreign, user-clone; silent getter #
+private.os.platform.heal.log.get()     # <step> <platform> # echo the log file of a step of os platform.heal.test in <platform>, oosh-heal-test-<step>-<platform>.log in the folder of the run (OOSH_HEAL_TEST_LOGS, made by private.this.temp.dir.get oosh-heal-test), else in TMPDIR; <step> is a user (test, root, oosh-user, bash-user) or breakages, heal, expect, pipe, idempotence-root, idempotence-bash-user, second-heal, foreign, user-clone-heal, user-clone; silent getter #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
  # The sibling of private.os.platform.gate.log.get, one place for the names.
  [ -n "$1" ] && [ -n "$2" ] || return 1
  case "$1$2" in *[!A-Za-z0-9._-]*) return 1 ;; esac
- echo "/tmp/oosh-heal-test-$1-$2.log"
+ local dir="${OOSH_HEAL_TEST_LOGS:-${TMPDIR:-/tmp}}"
+ echo "${dir%/}/oosh-heal-test-$1-$2.log"
 }
 
 
-private.os.platform.heal.snapshot.get()     # <platform> <branch> # echo, as root in the platform container, a snapshot of what oo heal owns: test.platform.shared.idempotence.snapshot (sourced from <base>/<branch>) of the entries of <base>, of <base>/main and <base>/<branch> (not .git), the sharedConfig env files, the launcher, the retired drop-in, and in the homes of test, root, oosh-user, bash-user and developking: oosh, config, the .bashrc files, .gitconfig, *.orig.*, .config/oosh (no log files) and .once; plus the HEAD of main and <branch>; rc 1 when it cannot be read #
+private.os.platform.heal.snapshot.get()     # <platform> <branch> # echo, as root in the platform container, a snapshot of what oo heal owns: test.platform.shared.idempotence.snapshot (sourced from <base>/<branch>) of the entries of <base>, of <base>/main and <base>/<branch> (not .git), the sharedConfig env files and its state machine files (by content), the number of entries of <base>.aside, the launcher, the retired drop-in, and in the homes of test, root, oosh-user, bash-user and developking: oosh, config, the .bashrc files, .gitconfig, *.orig.*, .config/oosh (no log files) and .once; plus the HEAD of main and <branch>; rc 1 when it cannot be read #
 {
  # Echoes the snapshot lines only: called as $(...). The remote prints a
  # begin line first, and only what follows it is kept — a host that prints
@@ -941,13 +961,16 @@ private.os.platform.heal.snapshot.get()     # <platform> <branch> # echo, as roo
  script="$preamble
 $(cat <<'OOSH_HEAL_SNAPSHOT'
 TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1 . "$D/test/test.platform.shared.idempotence.invariant" || fail "no snapshot helpers in $D"
-set -- "$B" "$B/main/*" "$D/*" "$S/*.env" /usr/local/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot
+set -- "$B" "$B/main/*" "$D/*" "$S/*.env" "$S/stateMachines/*" /usr/local/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot
 for u in test root oosh-user bash-user developking; do
   h=$(home_of "$u"); [ -n "$h" ] || continue
   set -- "$@" "$h/oosh" "$h/config" "$h/.bashrc" "$h/.bashrc*" "$h/.gitconfig" "$h/*.orig.*" "$h/.config/oosh" "$h/.once"
 done
 echo OOSH_HEAL_SNAPSHOT_BEGIN
-test.platform.shared.idempotence.snapshot "$@" | awk -F '\t' '$1 !~ /\/log\.live\.out$/ && $1 !~ /\.log$/'
+# the state machine files by content only: the heal writes the machine file again on every green run, the same bytes
+test.platform.shared.idempotence.snapshot "$@" | awk -F '\t' -v OFS='\t' '$1 !~ /\/log\.live\.out$/ && $1 !~ /\.log$/ { if ($1 ~ /\/stateMachines\//) $3 = "-"; print }'
+# the aside folder as a count: a heal that moves a folder aside on every run adds an entry each time (the name holds a time stamp)
+printf '%s\t%s entries\t-\n' "$B.aside" "$(ls -A "$B.aside" 2>/dev/null | wc -l | tr -d ' ')"
 for d in "$B/main" "$D"; do printf 'HEAD of %s\t%s\t-\n' "$d" "$(rgit -C "$d" rev-parse HEAD 2>/dev/null || echo none)"; done
 OOSH_HEAL_SNAPSHOT
 )"
@@ -956,7 +979,7 @@ OOSH_HEAL_SNAPSHOT
 }
 
 
-private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), <base>/<branch>/oo heal <branch> all as root (the base through root's ~/oosh — oo on root's PATH may be an older branch without oo heal) (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 (or rc 1 from reports only: its rc line names install state 99) and the snapshots differ in nothing but same-content rewrites (a WARNING, as the idempotence invariant accepts them; result.env left out through test.platform.shared.idempotence.volatile.without), else rc 1 with every other difference printed #
+private.os.platform.heal.second.run()     # <platform> <branch> # the second heal: a snapshot (private.os.platform.heal.snapshot.get), <base>/<branch>/oo heal <branch> all as root (the base through the ~/oosh of root, as the oo on the PATH of root may be an older branch without oo heal) (private.os.platform.user.run, log second-heal), a snapshot again; rc 0 when the heal ends with rc 0 (or rc 1 from reports only: its rc line names install state 99) and the snapshots differ in nothing but same-content rewrites of the shared env files (a WARNING, as the idempotence invariant accepts them; result.env left out through test.platform.shared.idempotence.volatile.without), else rc 1 with every other difference printed #
 {
  local platform="$1" branch="$2" log work rcHeal differences
  if [ -z "$platform" ] || [ -z "$branch" ]; then
@@ -979,14 +1002,13 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
  # the installed branch, which in this scenario is older and has no oo heal
  # (rc 127 in the first container gate).
  console.log "second heal: <base>/$branch/oo heal $branch all as root on $platform — it must change nothing"
- private.os.platform.user.run "$platform" root "\"\$(dirname \"\$(readlink -f ~root/oosh)\")/$branch/oo\" heal $branch all" "$log"
+ private.os.platform.user.run "$platform" root "$(private.os.platform.heal.second.command.get "$branch")" "$log"
  rcHeal=$?
- # rc 1 from reports only (legacy ssh.* folders, a zsh login — reported on
- # every heal, never changed: owner decision 9) is green: the heal writes
- # "install state 99" into its rc line only when every step and verify is
- # (private.oo.heal.summary). Gate 3b: ssh.legacy made every second heal rc 1.
+ # rc 1 from reports only is green, read as the first heal's is read
+ # (private.os.platform.heal.reports.only.is). Gate 3b: ssh.legacy made every
+ # second heal rc 1.
  local reports=""
- if [ "$rcHeal" = 1 ] && tr -d '\r' < "$log" 2>/dev/null | grep -q '^rc 1: .*; install state 99$'; then
+ if [ "$rcHeal" = 1 ] && private.os.platform.heal.reports.only.is "$log"; then
    rcHeal=0; reports=" (left: reports only, install state 99)"
  fi
  private.os.platform.heal.snapshot.get "$platform" "$branch" > "$work/after"
@@ -995,8 +1017,10 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
  # (TEST_CATEGORY, TEST_SHARED_TIER_WRITER), which must not reach this shell;
  # the subshell hands its two answers back as files of $work.
  # Its acceptance too: result.env out (volatile.without), and a same-content
- # rewrite is a WARNING, not a failure — every oo heal ends in config init.env,
- # which writes the shared env files again (the invariant's own oo heal row).
+ # rewrite of a shared env file is a WARNING, not a failure — every oo heal ends
+ # in config init.env, which writes those files again (the invariant's own oo
+ # heal row, the same two globs). A rewrite of anything else, a folder cloned
+ # again among it, is a change.
  local unaccepted
  ( TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
    if ! . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant"; then
@@ -1006,7 +1030,7 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
    test.platform.shared.idempotence.volatile.without < "$work/before" > "$work/before.kept"
    test.platform.shared.idempotence.volatile.without < "$work/after" > "$work/after.kept"
    test.platform.shared.idempotence.compare "$work/before.kept" "$work/after.kept" > "$work/differences"
-   grep . "$work/differences" | test.platform.shared.idempotence.unaccepted rewritten > "$work/unaccepted" )
+   grep . "$work/differences" | test.platform.shared.idempotence.unaccepted rewritten '*/sharedConfig/*.env|*/.config/oosh/*.env' > "$work/unaccepted" )
  differences=$(cat "$work/differences" 2>/dev/null)
  unaccepted=$(cat "$work/unaccepted" 2>/dev/null)
  if [ "$rcHeal" = 0 ] && [ -z "$unaccepted" ]; then
@@ -1072,7 +1096,7 @@ done
 if [ ! -d "$D/.git" ]; then
   echo "user.clone: $D is no repository any more"; rc=1
 else
-  owner=$(stat -c %U "$D") # kernel-exception: pending P5
+  owner=$(owner_of "$D")
   [ "$owner" = "$rec_owner" ] || { echo "user.clone: the owner of $D changed: $rec_owner -> $owner"; rc=1; }
   head=$(rgit -C "$D" rev-parse HEAD)
   if [ "$head" != "$rec_head" ]; then
@@ -1080,7 +1104,7 @@ else
     if rgit -C "$D" merge-base --is-ancestor "$rec_head" "$head" 2>/dev/null; then say "the heal fast-forwarded $D: $rec_head -> $head (expected)"
     else echo "user.clone: the HEAD of $D is no fast-forward of the record: $rec_head -> $head"; rc=1; fi
   fi
-  [ "$(stat -c %i "$D")" = "$rec_ino" ] || say "the inode of $D differs from the record (the folder was replaced)" # kernel-exception: pending P5
+  [ "$(inode_of "$D")" = "$rec_ino" ] || say "the inode of $D differs from the record (the folder was replaced)"
 fi
 [ "$rc" = 0 ] && say "$D is kept: owner $rec_owner, HEAD $head (recorded $rec_head; a fast-forward by the heal is expected), nothing aside"
 exit "$rc"
@@ -1088,10 +1112,11 @@ OOSH_HEAL_USER_CLONE_CHECK
 }
 
 
-private.os.platform.heal.check()     # <platform> <name> <?args...> # run the check <name> of os platform.heal.test (foreign, user.clone) as root in the platform container: the POSIX sh of private.os.platform.heal.<name>.check.script.get <args...> through private.os.platform.root.script.run; prints every difference; rc of the check, rc 1 for a missing <platform> or <name>, an unknown check or arguments its getter refuses #
+private.os.platform.heal.check()     # <platform> <name> <?args...> # run the check <name> of os platform.heal.test (expect, foreign, user.clone) as root in the platform container: the POSIX sh of private.os.platform.heal.<name>.check.script.get <args...> through private.os.platform.root.script.run; prints every difference; rc of the check, rc 1 for a missing <platform> or <name>, an unknown check or arguments its getter refuses #
 {
  # One runner for every check of the scenario; a check is its script getter
- # only (private.os.platform.heal.foreign.check.script.get,
+ # only (private.os.platform.heal.expect.check.script.get,
+ # private.os.platform.heal.foreign.check.script.get,
  # private.os.platform.heal.user.clone.check.script.get).
  local platform="$1" name="$2" getter script
  if [ -z "$platform" ] || [ -z "$name" ]; then
@@ -1103,7 +1128,7 @@ private.os.platform.heal.check()     # <platform> <name> <?args...> # run the ch
  getter="private.os.platform.heal.$name.check.script.get"
  case "$name" in *[!A-Za-z0-9.]*|.*|*.) getter="" ;; esac
  if [ -z "$getter" ] || ! declare -F "$getter" >/dev/null; then
-   create.result 1 "private.os.platform.heal.check: no check '$name' (foreign, user.clone)"
+   create.result 1 "private.os.platform.heal.check: no check '$name' (expect, foreign, user.clone)"
    error.log "$RESULT"
    return $(result)
  fi
@@ -1119,7 +1144,7 @@ private.os.platform.heal.check()     # <platform> <name> <?args...> # run the ch
 }
 
 
-private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe form once, as the user test: OOSH_HEAL_LOCAL=1 ossh heal.pipe <platform> <branch> (cat <init> | sh -s -- heal <branch> on the platform, this tree's init/oosh and a bundle of <branch> as OOSH_REPO, the temp files removed by ossh), tee into the log of step pipe without the \r of ssh -tt; rc of the heal #
+private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe form once, as the user test: OOSH_HEAL_LOCAL=1 ossh heal.pipe <platform> <branch> (cat <init> | sh -s -- heal <branch> on the platform, the init/oosh of this tree and a bundle of <branch> as OOSH_REPO, the temp files removed by ossh), tee into the log of step pipe without the \r of ssh -tt; rc of the heal #
 {
  # ossh heal runs `sh <file> heal …` — the arm from a FILE. The curl form a
  # user types reads the script from STDIN (`curl … | sh -s -- heal`), where
@@ -1139,7 +1164,7 @@ private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe fo
 }
 
 
-os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install <oldRef> (a branch on origin, or a sha shipped as platform-test-<sha>) for test, root, oosh-user and bash-user in a fresh <platform> container, apply the named breakages (default: all), heal once as root through the curl form, then test.suite gate 1 per user, the idempotence invariant, a second heal that must change nothing, and the untouched-foreign check; PASS/FAIL line + create.result like platform.test; the words terminal (keep the container) and pipe (run the pure pipe form too) may stand among the breakages #
+os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install <oldRef> (a branch on origin, or a sha shipped as platform-test-<sha>) for test, root, oosh-user and bash-user in a fresh <platform> container, apply the named breakages (default: all), heal once as root through the curl form, check what the heal left, then test.suite gate 1 per user, the idempotence invariant, a second heal that must change nothing, and the untouched-foreign check; after a PASS of all breakages the user.clone breakage as a second pass; PASS/FAIL line + create.result like platform.test, the logs in one folder kept on FAIL; the words terminal (keep the container) and pipe (run the pure pipe form too) may stand among the breakages #
 {
  # The proof the heal needs before it touches a real machine: an OLD install,
  # broken the ways the real machines are broken, healed ONCE, then everything
@@ -1147,9 +1172,10 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  # (private.os.platform.parse, container.up, users.install, gate.run,
  # shared.config.repair, cleanup). The heal is THIS tree: ossh heal with
  # OOSH_HEAL_LOCAL=1 pushes this tree's init/oosh and a bundle of its branch.
- # The first heal's rc 1 is no failure: it moves broken canonical folders
- # aside and says so (private.oo.heal.code); rc 2 (cannot heal) or an ssh
- # failure is. Docker port 8022, as os platform.test.
+ # The first heal's rc 1 is no failure when it is reports only (it moves broken
+ # canonical folders aside and says so): read exactly as the second heal's is,
+ # by its rc line (private.os.platform.heal.reports.only.is). Any other rc 1,
+ # rc 2 (cannot heal) or an ssh failure is. Docker port 8022, as os platform.test.
  local platform="$1" oldRef="$2"
  if [ -z "$platform" ] || [ -z "$oldRef" ]; then
    create.result 1 "Usage: os platform.heal.test <platform> <oldRef> <?breakages...:all> — words terminal and pipe may stand among the breakages"
@@ -1157,14 +1183,16 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
    return $(result)
  fi
  shift 2
- local word terminal="" pipe="" words=()
+ local word terminal="" pipe="" allWords="" words=()
  for word in "$@"; do
    case "$word" in
      terminal) terminal=yes ;;
      pipe)     pipe=yes ;;
+     all)      allWords=yes; words+=("$word") ;;
      *)        words+=("$word") ;;
    esac
  done
+ [ "${#words[@]}" = 0 ] && allWords=yes
  private.os.platform.heal.breakage.list.get "${words[@]}" || return $(result)
  local breakages="$RESULT"
 
@@ -1179,6 +1207,13 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  healBranch=$(ogit.branch.get "$OOSH_DIR")
  if [ -z "$healBranch" ]; then
    create.result 1 "$OOSH_DIR is on a detached HEAD — the heal ships a bundle of a branch of this tree"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ # The ref under test is the heal itself: an install of this very branch is
+ # healed by the same code, and nothing is proved. Give an older ref.
+ if [ "$oldRef" = "$healBranch" ]; then
+   create.result 1 "<oldRef> $oldRef is the branch under test — give an older ref (a branch on origin or a commit sha): the heal would be tested against itself"
    error.log "$RESULT"
    return $(result)
  fi
@@ -1199,15 +1234,16 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  local sshPort=8022
  private.os.platform.ref.branch.ensure "$oldRef" || return $(result)
  local branch="$RESULT"
- # Ctrl-C or SIGTERM from here on: the temporary branch leaves GitHub, the
- # container goes, and the run ENDS with 130 — exit, not return: a trap runs
- # in the innermost function (a step), whose return would let the run go on.
- # `os platform.heal.test` is a process of its own (this.start). On the
- # normal paths the caller's own traps are back before the return.
- local restoreTraps
- restoreTraps="trap - INT TERM; $(trap -p INT TERM)"
+ # Ctrl-C, SIGTERM or a hangup from here on: the temporary branch leaves
+ # GitHub, the container goes, and the run ENDS with 130 — exit, not return: a
+ # trap runs in the innermost function (a step), whose return would let the run
+ # go on. The logs stay, named. `os platform.heal.test` is a process of its own
+ # (this.start). On the normal paths the caller's own traps are back before the
+ # return.
+ local restoreTraps logDir=""
+ restoreTraps="trap - INT TERM HUP; $(trap -p INT TERM HUP)"
  # shellcheck disable=SC2064 # expanded now: the branch and the port of this run
- trap "private.os.platform.ref.branch.drop '$branch'; private.os.platform.cleanup '$sshPort'; exit 130" INT TERM
+ trap "private.os.platform.ref.branch.drop '$branch'; private.os.platform.cleanup '$sshPort'; [ -z \"\$OOSH_HEAL_TEST_LOGS\" ] || echo \"logs: \$OOSH_HEAL_TEST_LOGS\"; exit 130" INT TERM HUP
  # Era gate: an era-B ref (mode ssh) is refused with the eraB.* hint.
  if ! private.os.platform.branch.gate "$branch"; then
    local refusal="$RESULT"
@@ -1217,19 +1253,25 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
    return $(result)
  fi
 
- local imageTag rc step logs=""
+ # The logs of every step of this run: one folder (OOSH_HEAL_TEST_LOGS, read
+ # by private.os.platform.heal.log.get), gone on PASS, named on FAIL.
+ logDir=$(private.this.temp.dir.get oosh-heal-test)
+ if [ -z "$logDir" ]; then
+   private.os.platform.ref.branch.drop "$branch"
+   eval "$restoreTraps"
+   create.result 1 "no temporary directory for the logs of the run"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ local -x OOSH_HEAL_TEST_LOGS="$logDir"
+
+ local imageTag rc
  imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
- # The logs of every step, emptied first: a step that does not run this time
- # (pipe) must not show the FAIL lines of an earlier run.
- for step in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign user-clone; do
-   logs="$logs $(private.os.platform.heal.log.get "$step" "$platform")"
- done
- # shellcheck disable=SC2086 # the log paths have no spaces
- rm -f $logs
  if ! OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$platform" "$imageTag" "$sshPort"; then
    private.os.platform.ref.branch.drop "$branch"
    private.os.platform.cleanup "$sshPort"
    eval "$restoreTraps"
+   rm -rf "$logDir"
    printf "FAIL: heal %s %s (the container did not come up)\n" "$platform" "$oldRef"
    create.result 1 "FAIL: heal $platform $oldRef — the container did not come up"
    error.log "$RESULT"
@@ -1238,13 +1280,12 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  OSSH_INSTALL_BRANCH="$branch" private.os.platform.users.install "$platform"
 
  # ─── the breakages, in the order of private.os.platform.heal.breakage.names.get ─
- local name rcBreak=0 breakLog healLog
+ local name breakLog healLog
  breakLog=$(private.os.platform.heal.log.get breakages "$platform")
  for name in $breakages; do
    private.os.platform.heal.breakage.apply "$platform" "$name" "$healBranch" 2>&1 | tee -a "$breakLog"
    if [ "${PIPESTATUS[0]}" != 0 ]; then
      # A shape that did not come about is no test of the heal: end the run here, before it.
-     rcBreak=1
      printf "FAIL: heal %s %s (breakage %s failed — log: %s)\n" "$platform" "$oldRef" "$name" "$breakLog"
      error.log "FAIL: heal $platform $oldRef (breakage $name failed — log: $breakLog)"
      private.os.platform.ref.branch.drop "$branch"
@@ -1255,23 +1296,32 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
        ossh connection.close "$platform" 2>/dev/null
        private.os.platform.cleanup "$sshPort"
      fi
+     printf "logs: %s\n" "$logDir"
      create.result 1 "FAIL"
      return 1
    fi
  done
 
  # ─── ONE heal as root, the curl form over ssh (ossh heal → sh <init> heal <branch> all) ─
- local rcHeal rcPipe=""
+ local rcHeal healOk="" rcPipe="" rcExpect failed=""
  healLog=$(private.os.platform.heal.log.get heal "$platform")
  OOSH_HEAL_LOCAL=1 ossh heal "$platform" all "$healBranch" 2>&1 | tee "$healLog"
  rcHeal=${PIPESTATUS[0]}
- # rc 1 is accepted (folders moved aside), so the heal's own verify must be
- # read: a "FAIL <invariant> <user>:" line of private.oo.heal.verify fails the
- # run (the per-user gate covers core and configLayout only); NOT CHECKED is shown.
- local verifyFails notChecked
+ # rc 0 is healed; rc 1 is no failure when it is reports only (its rc line
+ # ends in install state 99), as the second heal reads it. The heal's own
+ # verify is read too: a "FAIL <invariant> <user>:" line fails the run (the
+ # per-user gate covers core and configLayout only); a NOT CHECKED fails it
+ # as well, unless the reason is the re-login group dev needs.
+ if [ "$rcHeal" = 0 ] || { [ "$rcHeal" = 1 ] && private.os.platform.heal.reports.only.is "$healLog"; }; then healOk=yes; fi
+ local verifyFails notChecked notCheckedOther
  verifyFails=$(tr -d '\r' < "$healLog" | grep -cE 'FAIL [A-Za-z0-9._-]+ [A-Za-z0-9._-]+:')
  notChecked=$(tr -d '\r' < "$healLog" | grep -cE 'NOT CHECKED [A-Za-z0-9._-]+ [A-Za-z0-9._-]+:')
- [ "$notChecked" -gt 0 ] && warn.log "the heal's verify left $notChecked invariant(s) NOT CHECKED (see $healLog)"
+ notCheckedOther=$(tr -d '\r' < "$healLog" | grep -E 'NOT CHECKED [A-Za-z0-9._-]+ [A-Za-z0-9._-]+:' | grep -vcF 'group dev takes effect after a re-login')
+ [ "$notChecked" -gt "$notCheckedOther" ] && warn.log "the heal's verify left $((notChecked - notCheckedOther)) invariant(s) NOT CHECKED for the re-login group dev needs (see $healLog)"
+
+ # ─── what the heal left, right after it: the shape of each breakage that ran ─
+ private.os.platform.heal.check "$platform" expect "$healBranch" $breakages 2>&1 | tee "$(private.os.platform.heal.log.get expect "$platform")"
+ rcExpect=${PIPESTATUS[0]}
  # pipe: the pure pipe form as test, once (C2 runs it on the first platform)
  if [ -n "$pipe" ]; then
    private.os.platform.heal.pipe.run "$platform" "$healBranch"
@@ -1310,34 +1360,69 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
      rcForeign=${PIPESTATUS[0]} ;;
  esac
  # user.clone: the healthy clone a user made must still be there, as it was
+ userCloneLog=$(private.os.platform.heal.log.get user-clone "$platform")
  case " $breakages " in
    *" user.clone "*)
-     userCloneLog=$(private.os.platform.heal.log.get user-clone "$platform")
      private.os.platform.heal.check "$platform" user.clone "$healBranch" 2>&1 | tee "$userCloneLog"
      rcUserClone=${PIPESTATUS[0]} ;;
  esac
 
  # ─── the verdict ──────────────────────────────────────────────────────────
- local line="breakages=$rcBreak heal=$rcHeal verify=$verifyFails${rcPipe:+ pipe=$rcPipe} test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign${rcUserClone:+ user-clone=$rcUserClone}"
- if [ "$rcBreak" = 0 ] && [ "$rcHeal" -le 1 ] && [ "$verifyFails" = 0 ] && [ "${rcPipe:-0}" = 0 ] && [ "$rcTest" = 0 ] && [ "$rcRoot" = 0 ] \
-    && [ "$rcOoshUser" = 0 ] && [ "$rcBashUser" = 0 ] && [ "$rcIdem" = 0 ] && [ "$rcSecond" = 0 ] \
-    && { [ "$rcForeign" = 0 ] || [ "$rcForeign" = skipped ]; } && [ "${rcUserClone:-0}" = 0 ]; then
+ [ -n "$healOk" ] || failed="$failed heal"
+ [ "$verifyFails" = 0 ] || failed="$failed verify"
+ [ "$notCheckedOther" = 0 ] || failed="$failed not-checked"
+ [ "$rcExpect" = 0 ] || failed="$failed expect"
+ [ "${rcPipe:-0}" = 0 ] || failed="$failed pipe"
+ [ "$rcTest" = 0 ] || failed="$failed test"
+ [ "$rcRoot" = 0 ] || failed="$failed root"
+ [ "$rcOoshUser" = 0 ] || failed="$failed oosh-user"
+ [ "$rcBashUser" = 0 ] || failed="$failed bash-user"
+ [ "$rcIdem" = 0 ] || failed="$failed idempotence"
+ [ "$rcSecond" = 0 ] || failed="$failed second-heal"
+ { [ "$rcForeign" = 0 ] || [ "$rcForeign" = skipped ]; } || failed="$failed foreign"
+ [ "${rcUserClone:-0}" = 0 ] || failed="$failed user-clone"
+
+ # ─── user.clone as a second pass on a PASS of all breakages ──────────────
+ # user.clone rebuilds <base>/<branch> and cannot stand with the folder arms,
+ # so `all` leaves it out; on the healed machine it is the shape a user makes
+ # with oo checkout, and one more heal, the second command, must keep it.
+ case " $breakages " in *" user.clone "*) allWords="" ;; esac
+ if [ -z "$failed" ] && [ -n "$allWords" ]; then
+   console.log "second pass: user.clone on the healed $platform — one more heal must keep the clone a user made"
+   rcUserClone=0
+   private.os.platform.heal.breakage.apply "$platform" user.clone "$healBranch" 2>&1 | tee -a "$breakLog"
+   [ "${PIPESTATUS[0]}" = 0 ] || rcUserClone=1
+   if [ "$rcUserClone" = 0 ]; then
+     local cloneHealLog rcCloneHeal
+     cloneHealLog=$(private.os.platform.heal.log.get user-clone-heal "$platform")
+     private.os.platform.user.run "$platform" root "$(private.os.platform.heal.second.command.get "$healBranch")" "$cloneHealLog"
+     rcCloneHeal=$?
+     if [ "$rcCloneHeal" = 1 ] && private.os.platform.heal.reports.only.is "$cloneHealLog"; then rcCloneHeal=0; fi
+     [ "$rcCloneHeal" = 0 ] || rcUserClone=1
+     private.os.platform.heal.check "$platform" user.clone "$healBranch" 2>&1 | tee "$userCloneLog"
+     [ "${PIPESTATUS[0]}" = 0 ] || rcUserClone=1
+   fi
+   [ "$rcUserClone" = 0 ] || failed="$failed user-clone"
+ fi
+
+ local line="heal=$rcHeal verify=$verifyFails not-checked=$notCheckedOther${rcPipe:+ pipe=$rcPipe} expect=$rcExpect test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign${rcUserClone:+ user-clone=$rcUserClone}"
+ if [ -z "$failed" ]; then
    printf "PASS: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
    important.log "PASS: heal $platform $oldRef ($line)"
    create.result 0 "PASS"
-   # shellcheck disable=SC2086 # the log paths have no spaces
-   rm -f $logs
+   rm -rf "$logDir"
    rc=0
  else
    printf "FAIL: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
-   error.log "FAIL: heal $platform $oldRef ($line)"
+   error.log "FAIL: heal $platform $oldRef ($line) — failed:$failed"
    local l
-   for l in $logs; do
+   for l in "$logDir"/*.log; do
      [ -s "$l" ] || continue
      grep -qi "FAIL\|✗" "$l" 2>/dev/null || continue
      error.log "--- first FAIL lines of $l ---"
      grep -i -m 10 "FAIL\|✗" "$l"
    done
+   printf "logs: %s\n" "$logDir"
    create.result 1 "FAIL"
    rc=1
  fi
@@ -1346,7 +1431,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  eval "$restoreTraps"
  # terminal: the container stays for a look inside (C2 debugging); else it goes.
  if [ -n "$terminal" ]; then
-   console.log "terminal: the container of $platform stays on port $sshPort — enter it: ossh exec.tty $platform 'sudo -i'; remove it: docker rm -f \$(docker ps -q --filter publish=$sshPort)"
+   console.log "terminal: the container of $platform stays on port $sshPort — enter it: ossh exec.tty $platform 'sudo -i'; end it: odocker ps shows it, odocker stop and odocker container.remove take its name"
  else
    ossh connection.close "$platform" 2>/dev/null
    private.os.platform.cleanup "$sshPort"
@@ -1367,6 +1452,218 @@ os.platform.heal.test.completion.breakages() {
   echo terminal
   echo pipe
 }
+private.os.platform.heal.expect.check.script.get()     # <branch> <breakages...> # echo the POSIX sh text that asserts, as root in a platform container, the post-heal shape of every heal (the origin of each canonical folder, the ssh setup of developking and root, the launcher, the ~/oosh and ~/config of the five users) and of each breakage that ran; every line says expect <block>: and a wrong shape FAILED, rc 1 on any; silent getter, rc 1 for a bad <branch> or an unknown breakage #
+{
+ # NO create.result — a getter consumed as $(...) by private.os.platform.heal.check.
+ # Raw POSIX sh for the same reason as the arms: it runs in the container as root
+ # and must not depend on the oosh there. What the machine is pointed at is
+ # data at the top (B and S come with the preamble): the developking name, the
+ # launcher and its second name, the retired boot path and drop-in — a test
+ # points them at a fixture. The expected origin is the SSH URL of
+ # private.oo.repo.url.get (owner decision 1), read as the CONFIGURED url
+ # (git config --get): a host-level url.insteadOf rewrites what get-url says.
+ # Who moves under oo heal <branch> all (private.oo.heal.user.keep.check): the
+ # healer and the login that ran sudo, here root and test, move to
+ # <base>/<branch>; any other user keeps a canonical tree only when it carries
+ # the model (config.session.save and the clean boot, read as text), else moves
+ # too — so a user outside <base>/<branch> must be on a tree that carries it.
+ local branch="$1" preamble name url ran=" "
+ shift
+ preamble=$(private.os.platform.heal.remote.preamble.get "$branch") || return 1
+ for name in "$@"; do
+   private.os.platform.heal.breakage.names.get | grep -qxF -- "$name" || return 1
+   ran="$ran$name "
+ done
+ private.this.script.load oo private.oo.repo.url.get || return 1
+ url=$(private.oo.repo.url.get)
+ [ -n "$url" ] || return 1
+ printf "N='expect'\nRAN='%s'\nURL='%s'\n" "$ran" "$url"
+ printf "DK='developking'\nLAUNCHER='/usr/local/bin/this'\nLAUNCHER2='/usr/bin/this'\nBOOT='/etc/oosh/boot'\nDROPIN='/etc/profile.d/oosh.sh'\n"
+ printf '%s\n' "$preamble"
+ cat <<'OOSH_HEAL_EXPECT'
+rc=0
+  ok()  { echo "expect $N: $*"; }
+  bad() { echo "expect $N: FAILED — $*"; rc=1; }
+  ran() { case "$RAN" in *" $1 "*) return 0 ;; esac; return 1; }
+  canon() { readlink -f "$1" 2>/dev/null; } # kernel-exception: POSIX sh of the disposable-container arm
+  link_of() { readlink "$1" 2>/dev/null; } # kernel-exception: POSIX sh of the disposable-container arm
+# env_value <file> <name>: the last export NAME= of an env file, quotes off, read as data
+  env_value() { sed -n "s/^export \(declare -x \)\{0,1\}$2=//p" "$1" 2>/dev/null | tail -1 | tr -d "\"'"; }
+# keeps_model <tree>: the tree carries the model of the heal, read as text as private.oo.heal.user.keep.check reads it
+  keeps_model() { grep -q '^config\.session\.save()' "$1/config" 2>/dev/null && grep -q '^[[:space:]]*derivedHome=' "$1/this" 2>/dev/null; }
+rh=$(home_of root)
+
+# ── the origin of every canonical folder is the SSH URL ──
+N=origin
+folders="$B/main $D"
+[ "$H" = main ] && folders="$B/main $B/dev"
+for f in $folders; do
+  o=$(rgit -C "$f" config --get remote.origin.url 2>/dev/null)
+  if [ "$o" = "$URL" ]; then ok "$f -> $o"; else bad "$f has the origin '${o:-none}', not $URL"; fi
+done
+
+# ── the ssh setup of developking, root and the shared home ──
+N=ssh
+f="$dh/.ssh/id_rsa"
+if [ -f "$f" ] && [ "$(owner_of "$f")" = "$DK" ]; then ok "$f is the deploy key of $DK"; else bad "no deploy key $f owned by $DK"; fi
+f="$rh/.ssh/config"
+if grep -Eq '^[[:space:]]*Host[[:space:]]+github\.com' "$f" 2>/dev/null \
+   && grep -Eq '^[[:space:]]*IdentityFile[[:space:]]+~/\.ssh/ids/ssh\.developking/id_rsa' "$f" \
+   && grep -Eq '^[[:space:]]*IdentitiesOnly[[:space:]]+yes' "$f"; then
+  ok "$f has Host github.com with the key of $DK"
+else
+  bad "$f lacks Host github.com with IdentityFile ~/.ssh/ids/ssh.developking/id_rsa and IdentitiesOnly yes"
+fi
+f="$rh/.ssh/ids/ssh.developking/id_rsa"
+if [ -f "$f" ]; then ok "$f"; else bad "no $f"; fi
+f="$bh/shared/.ssh/config"
+if grep -Eq '^[[:space:]]*Host[[:space:]]+github\.com' "$f" 2>/dev/null; then ok "$f has Host github.com"; else bad "$f lacks Host github.com"; fi
+f="$bh/shared/.ssh/known_hosts"
+if grep -q 'github\.com' "$f" 2>/dev/null; then ok "$f knows github.com"; else bad "$f does not know github.com"; fi
+if [ "$(link_of "$rh/init")" = "$rh/oosh/init" ]; then ok "$rh/init -> $rh/oosh/init"; else bad "$rh/init is not a link to $rh/oosh/init (it is '$(link_of "$rh/init")')"; fi
+sh=$(awk -F: '$1 == "root" { print $7; exit }' /etc/passwd)
+case "$sh" in */bash) ok "the login shell of root is $sh" ;; *) bad "the login shell of root is '$sh', not bash" ;; esac
+
+# ── the launcher ──
+N=launcher
+if [ -x "$LAUNCHER" ]; then ok "$LAUNCHER"; else bad "no launcher $LAUNCHER"; fi
+ep=$(cd / && env -i sh -c 'printf "%s" "$PATH"' 2>/dev/null)
+case ":$ep:" in
+  *":${LAUNCHER%/*}:"*) ok "${LAUNCHER%/*} is on the PATH of an empty shell" ;;
+  *) if [ -e "$LAUNCHER2" ]; then ok "$LAUNCHER2, as the empty shell has no ${LAUNCHER%/*}"; else bad "the empty shell has no ${LAUNCHER%/*} on its PATH ($ep) and there is no $LAUNCHER2"; fi ;;
+esac
+
+# ── ~/oosh and ~/config of every user ──
+N=links
+Bc=$(canon "$B"); Dc=$(canon "$D"); Sc=$(canon "$S")
+for u in test root oosh-user bash-user developking; do
+  h=$(home_of "$u")
+  if [ -z "$h" ]; then bad "$u is not in /etc/passwd"; continue; fi
+  t=$(canon "$h/oosh")
+  case "$u" in
+    test|root)
+      if [ "$t" = "$Dc" ]; then ok "$u: ~/oosh -> $D (the healer and the login move to the branch)"; else bad "$u: ~/oosh -> ${t:-none}, not $D"; fi ;;
+    *)
+      case "$t" in
+        "$Dc") ok "$u: ~/oosh -> $D" ;;
+        "$Bc"/*)
+          if keeps_model "$t"; then ok "$u keeps $t, a tree that carries the model"
+          else bad "$u: ~/oosh -> $t, a tree that predates the heal (no config.session.save or no clean boot) — it moves to $D"; fi ;;
+        *) bad "$u: ~/oosh -> '${t:-none}', outside the base $B" ;;
+      esac ;;
+  esac
+  c=$(canon "$h/config")
+  if [ "$c" = "$Sc" ]; then ok "$u: ~/config -> the sharedConfig"; else bad "$u: ~/config -> '${c:-none}', not the sharedConfig $S"; fi
+done
+
+# ── the breakages that ran ──
+if ran eraB.config; then
+  N=eraB.config
+  h=$(home_of test)
+  set -- "$h"/config.orig.*
+  if [ -e "$1" ]; then ok "the real config is kept as $1"; else bad "no $h/config.orig.<ts>: the real ~/config was not kept aside"; fi
+  if [ -n "$(env_value "$S/oosh.env" OOSH_SSH_CONFIG_HOST)" ]; then ok "OOSH_SSH_CONFIG_HOST is imported"; else bad "OOSH_SSH_CONFIG_HOST is empty in $S/oosh.env: the computer name was not imported"; fi
+  if [ -n "$(env_value "$S/log.env" LOG_LEVEL)" ]; then ok "LOG_LEVEL is imported"; else bad "LOG_LEVEL is empty in $S/log.env: the level was not imported"; fi
+fi
+if ran root.clone; then
+  N=root.clone
+  set -- "$rh"/oosh.orig.*
+  if [ -e "${2:-/nonexistent}" ]; then ok "the real clone is kept next to the arm's copy: $*"; else bad "only ${1:-no} oosh.orig.<ts> entry in $rh: the real clone was not kept aside"; fi
+  set -- "$rh"/config.orig.*
+  if [ -e "$1" ]; then ok "the real config is kept as $1"; else bad "no $rh/config.orig.<ts>: the real ~/config was not kept aside"; fi
+fi
+if ran devhome.missing; then
+  N=devhome.missing
+  if [ -d "$dh" ] && [ "$(owner_of "$dh")" = "$DK" ]; then ok "$dh is back, owned by $DK"; else bad "$dh is missing or not owned by $DK"; fi
+fi
+if ran boot.era; then
+  N=boot.era
+  u=$(home_of oosh-user)
+  if [ -f "$u/.bashrc" ] && ! grep -q 'oosh/boot' "$u/.bashrc"; then ok "$u/.bashrc is not of the boot era"; else bad "$u/.bashrc is missing or still of the boot era"; fi
+  if [ ! -e "$BOOT" ] && [ ! -L "$BOOT" ] && ! grep -q 'root\.boot\.path\.installed' "$DROPIN" 2>/dev/null; then ok "the retired login drop-in is gone"; else bad "the retired login drop-in ($BOOT, $DROPIN) is still there"; fi
+fi
+if ran no.bashrc; then
+  N=no.bashrc
+  if [ -f "$rh/.bashrc" ]; then ok "$rh/.bashrc is back"; else bad "no $rh/.bashrc"; fi
+fi
+if ran safe.directory.stale; then
+  N=safe.directory.stale
+  if rgit config --file "$rh/.gitconfig" --get-all safe.directory 2>/dev/null | grep -q '^/Users/Shared'; then bad "$rh/.gitconfig still trusts a /Users/Shared folder"; else ok "no dead safe.directory entry in $rh/.gitconfig"; fi
+fi
+if ran ssh.legacy; then
+  N=ssh.legacy
+  if [ -d "$rh/ssh.original" ]; then ok "$rh/ssh.original is reported and left"; else bad "$rh/ssh.original is gone: the heal never moves the legacy ssh folders"; fi
+fi
+if ran state.30; then
+  N=state.30
+  st=$(sed -n 's/^\(export \)\{0,1\}SETUP_SERVER_STATE_ID=//p' "$S/stateMachines/SETUP_SERVER.states.env" 2>/dev/null | tail -1)
+  if [ "$st" = 99 ]; then ok "SETUP_SERVER is at 99 in the sharedConfig"; else bad "SETUP_SERVER is at '${st:-none}' in $S, not 99"; fi
+fi
+if ran worktree.layout; then
+  N=worktree.layout
+  if [ -f "$B/testing/.git" ]; then bad "$B/testing is still a linked worktree"; else ok "$B/testing is no linked worktree any more"; fi
+fi
+  m_diverged() { rgit -C "$1" rev-parse -q --verify refs/heal-test/diverged >/dev/null 2>&1; }
+  m_markers()  { rgit -C "$1" grep -q -e '^>>>>>>> ' HEAD -- this log oo config 2>/dev/null; }
+  m_merge()    { [ -f "$1/.git/MERGE_HEAD" ]; }
+  m_dirty()    { grep -qx '# heal test: an uncommitted change' "$1/os" 2>/dev/null; }
+  m_detached() { ! rgit -C "$1" symbolic-ref -q HEAD >/dev/null 2>&1; }
+# aside_has <function>: an entry <base>.aside/<branch>.orig.<ts> holds the shape
+  aside_has() { for a in "$B.aside/$H".orig.*; do [ -e "$a" ] && "$@" "$a" && return 0; done; return 1; }
+N=aside
+for k in diverged markers.committed merge.conflict dirty detached; do
+  ran "$k" || continue
+  case "$k" in diverged) fn=m_diverged ;; markers.committed) fn=m_markers ;; merge.conflict) fn=m_merge ;; dirty) fn=m_dirty ;; detached) fn=m_detached ;; esac
+  if aside_has "$fn"; then ok "an entry of $B.aside holds the $k shape of $H"; else bad "no $B.aside/$H.orig.<ts> entry holds the $k shape: the broken folder was not moved aside"; fi
+done
+if ran missing.branch || ran diverged || ran markers.committed || ran merge.conflict || ran dirty || ran detached; then
+  N=folder
+  r0=$rc
+  if [ ! -d "$D/.git" ]; then
+    bad "$D is no clone"
+  else
+    [ -z "$(rgit -C "$D" status --porcelain 2>/dev/null)" ] || bad "$D has uncommitted changes"
+    rgit -C "$D" symbolic-ref -q HEAD >/dev/null 2>&1 || bad "$D is on a detached HEAD"
+    [ ! -f "$D/.git/MERGE_HEAD" ] || bad "a merge is in progress in $D"
+    m_diverged "$D" && bad "$D still has the diverged history"
+    m_markers "$D" && bad "conflict markers are committed in $D"
+  fi
+  [ "$rc" = "$r0" ] && ok "$D is a clean clone on $H"
+fi
+
+N=expect
+[ "$rc" = 0 ] && ok "every shape the heal leaves is there"
+exit "$rc"
+OOSH_HEAL_EXPECT
+}
+
+
+private.os.platform.heal.second.command.get()     # <branch> # echo the command line of the second heal, run as root in the container from the tree that carries the heal, <base>/<branch>/oo heal <branch> all; the one text the runner and its test read; silent getter, rc 1 for a bad <branch> #
+{
+ # NO create.result — a getter consumed as $(...). From the tree that carries
+ # the heal, <base>/<branch>, named through the ~/oosh of root (a link into
+ # the base after the first heal): the oo on the PATH of root is the installed
+ # branch, which in this scenario is older and has no oo heal (rc 127 in the
+ # first container gate). No single quote: private.os.platform.user.run puts
+ # the command inside single quotes.
+ local branch="$1"
+ case "$branch" in ""|-*|*[!A-Za-z0-9._/@+-]*) return 1 ;; esac
+ printf '"$(dirname "$(readlink -f ~root/oosh)")/%s/oo" heal %s all\n' "$branch" "$branch"
+}
+
+
+private.os.platform.heal.reports.only.is()     # <log> # rc 0 when the rc line of a heal in the log <log> says rc 1 with install state 99, reports only and no step left; the one reading of the first and the second heal; silent predicate #
+{
+ # A predicate (rc only, no create.result). rc 1 from reports only (legacy
+ # ssh.* folders, a zsh login, a folder moved aside — reported on every heal,
+ # owner decision 9) is green: the heal writes "install state 99" into its rc
+ # line only when every step and verify is (private.oo.heal.summary).
+ local log="$1"
+ [ -n "$log" ] && [ -f "$log" ] || return 1
+ tr -d '\r' < "$log" | grep -q '^rc 1: .*; install state 99$'
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1406,21 +1703,21 @@ private.os.platform.image.from.workspace() { # <workspace> # converts workspace 
   echo "$1" | sed 's/\([a-z]\)\([A-Z]\)/\1_\2/g' | tr '[:upper:]/' '[:lower:]_' | tr '.' '_'
 }
 
-private.os.platform.container.id() { # <port> # id of the running platform-test container publishing <port> (empty if none)
-  docker ps -q --filter "publish=$1" 2>/dev/null | head -1 # kernel-exception: pending P5, pre-existing, plan item
+private.os.platform.container.id() { # <port> # id of the platform-test container, running or stopped, that publishes <port> on its host, from odocker container.list (empty if none)
+  # The list names every container with its published ports, host port first
+  # (8022->22/tcp): the id is its first column, the port an exact start of a field.
+  private.this.script.load odocker odocker.container.list
+  odocker.container.list 2>/dev/null | awk -v p="$1" 'NR > 1 { for (i = 2; i <= NF; i++) if ($i ~ ("^" p "->")) { print $1; exit } }'
 }
 
-private.os.platform.cleanup() { # <port> # stops and removes Docker container on given port
+private.os.platform.cleanup() { # <port> # stops and removes the container on the given port through odocker; silent when there is none
   local port="$1"
   local containerId
   containerId=$(private.os.platform.container.id "$port")
   if [ -n "$containerId" ]; then
-    docker stop "$containerId" 2>/dev/null # kernel-exception: pending P5, pre-existing, plan item
-    docker rm "$containerId" 2>/dev/null # kernel-exception: pending P5, pre-existing, plan item
-  fi
-  containerId=$(docker ps -aq --filter "publish=$port" 2>/dev/null) # kernel-exception: pending P5, pre-existing, plan item
-  if [ -n "$containerId" ]; then
-    docker rm "$containerId" 2>/dev/null # kernel-exception: pending P5, pre-existing, plan item
+    private.this.script.load odocker odocker.stop
+    odocker.stop "$containerId" >/dev/null 2>&1
+    odocker.container.remove "$containerId" >/dev/null 2>&1
   fi
 }
 
@@ -1635,9 +1932,9 @@ os.platform.test()     # <platform> <?terminal> <?notests> <?branch> # tests oos
   # Same runuser-vs-sudo portability dance as the test invocations above.
   ossh exec.tty "$platform" "
    if command -v runuser >/dev/null 2>&1; then
-    sudo runuser -u bash-user -- bash -l # kernel-exception: pending P5
+    sudo runuser -u bash-user -- bash -l # kernel-exception: text run in the platform container over ssh, not a call of this host
    else
-    sudo -H -u bash-user bash -l # kernel-exception: pending P5
+    sudo -H -u bash-user bash -l # kernel-exception: text run in the platform container over ssh, not a call of this host
    fi
   "
  fi
@@ -1694,7 +1991,7 @@ os.platform.test.completion.notests() {
   echo "notests"
 }
 
-private.os.platform.shared.config.repair() # <platform> # reset sharedConfig group+perms in <platform>'s container so subsequent unprivileged users can write after root's test.suite left root-owned files there
+private.os.platform.shared.config.repair() # <platform> # reset sharedConfig group+perms in the container of <platform> so subsequent unprivileged users can write after the test.suite of root left root-owned files there
 {
   local platform=$1
   if [ -z "$platform" ]; then

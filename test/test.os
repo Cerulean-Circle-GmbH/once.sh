@@ -600,7 +600,7 @@ test.os.healFixtureScript() {
   diff -r "$OOSH_DIR/test/fixtures/heal/eraB.config" "$fx/config" >/dev/null 2>&1 || bad="$bad folder-differs"
   script=$(private.os.platform.heal.fixture.script.get boot.era/bashrc '$t/bashrc') || bad="$bad file-rc"
   ( t="$fx"; export t; printf '%s\n' "$script" | sh ) || bad="$bad file-run"
-  cmp -s "$OOSH_DIR/test/fixtures/heal/boot.era/bashrc" "$fx/bashrc" || bad="$bad file-differs" # kernel-exception: pending P5
+  private.this.file.same "$OOSH_DIR/test/fixtures/heal/boot.era/bashrc" "$fx/bashrc" || bad="$bad file-differs"
   private.os.platform.heal.fixture.script.get no.such.fixture "$fx/x" >/dev/null && bad="$bad missing-fixture-accepted"
   private.os.platform.heal.fixture.script.get eraB.config >/dev/null && bad="$bad no-target-accepted"
   rm -rf "$fx"
@@ -748,15 +748,18 @@ expect 0 "test through ossh exec, root through sudo bash -lc, the others through
 # the getter is silent by contract (consumed as $(...)): the test reads its output
 test.os.healLogGet() {
   local got bad=""
-  got=$(private.os.platform.heal.log.get second-heal ubuntu_24_04)
-  [ "$got" = /tmp/oosh-heal-test-second-heal-ubuntu_24_04.log ] || bad="$bad path=[$got]"
+  got=$(OOSH_HEAL_TEST_LOGS= TMPDIR=/t private.os.platform.heal.log.get second-heal ubuntu_24_04)
+  [ "$got" = /t/oosh-heal-test-second-heal-ubuntu_24_04.log ] || bad="$bad path=[$got]"
+  # one folder per run (private.this.temp.dir.get oosh-heal-test): the steps' logs are in it
+  got=$(OOSH_HEAL_TEST_LOGS=/run/one TMPDIR=/t private.os.platform.heal.log.get expect ubuntu_24_04)
+  [ "$got" = /run/one/oosh-heal-test-expect-ubuntu_24_04.log ] || bad="$bad run-folder=[$got]"
   private.os.platform.heal.log.get root >/dev/null 2>&1 && bad="$bad missing-platform-accepted"
   private.os.platform.heal.log.get '../x' p >/dev/null 2>&1 && bad="$bad slash-accepted"
-  [ -z "$bad" ] && create.result 0 "/tmp/oosh-heal-test-second-heal-ubuntu_24_04.log" || create.result 1 "heal.log.get:$bad"
+  [ -z "$bad" ] && create.result 0 "the log of a step is in the folder of the run, else in TMPDIR" || create.result 1 "heal.log.get:$bad"
   return $(result)
 }
 test.case $level "T-OS-HEAL-LOG-GET: the log of a step of the heal test" test.os.healLogGet
-expect 0 "/tmp/oosh-heal-test-second-heal-ubuntu_24_04.log" "one getter for the logs of os platform.heal.test"
+expect 0 "the log of a step is in the folder of the run, else in TMPDIR" "one getter for the logs of os platform.heal.test"
 
 # T-OS-HEAL-REMOTE-SCRIPTS: the snapshot (bash, the invariant's helpers) and the foreign
 # check (sh) run as root; the snapshot keeps only what follows its begin line, without \r.
@@ -795,6 +798,14 @@ test.os.healRemoteScripts() {
   case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad user-clone-not-root-sh" ;; esac
   encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
   [ "$(printf '%s' "$encoded" | base64 -d)" = "$(private.os.platform.heal.user.clone.check.script.get dev.heal)" ] || bad="$bad user-clone-not-its-getter"
+  # and so is the expect check: its text, as root in sh, with the branch and the breakages that ran
+  : > "$OS_T_REC"
+  private.os.platform.heal.check p expect dev.heal dirty detached >/dev/null 2>&1 || bad="$bad expect-rc"
+  case "$RESULT" in "expect check on p: rc 0") ;; *) bad="$bad expect-result=[$RESULT]" ;; esac
+  rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
+  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad expect-not-root-sh" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  [ "$(printf '%s' "$encoded" | base64 -d)" = "$(private.os.platform.heal.expect.check.script.get dev.heal dirty detached)" ] || bad="$bad expect-not-its-getter"
   # an unknown check, a bad name or a bad argument of the getter never reaches ossh
   : > "$OS_T_REC"
   private.os.platform.heal.check p no.such >/dev/null 2>&1 && bad="$bad unknown-check-accepted"
@@ -817,35 +828,47 @@ test.os.healSecondRun() {
   local HOME="$fx" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
   local bad="" rc
   test.os.stubs.set
-  OS_T_SNAP_N=0; OS_T_HEAL_RC=0; OS_T_SNAP_AFTER="/b	1/1	1 1"
+  OS_T_SNAP_N=0; OS_T_HEAL_RC=0; OS_T_SNAP_AFTER="/b	1/1	1 1
+/s/sharedConfig/log.env	7/7	1 1"
   private.os.platform.heal.snapshot.get() {
     OS_T_SNAP_N=$((OS_T_SNAP_N + 1)); echo "snapshot $*" >> "$OS_T_REC"
-    if [ $((OS_T_SNAP_N % 2)) = 1 ]; then printf '/b\t1/1\t1 1\n'; else printf '%s\n' "$OS_T_SNAP_AFTER"; fi
+    if [ $((OS_T_SNAP_N % 2)) = 1 ]; then printf '/b\t1/1\t1 1\n/s/sharedConfig/log.env\t7/7\t1 1\n'; else printf '%s\n' "$OS_T_SNAP_AFTER"; fi
   }
   private.os.platform.user.run() { echo "user.run $*" >> "$OS_T_REC"; return "$OS_T_HEAL_RC"; }
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
   [ "$rc" = 0 ] || bad="$bad same-rc=$rc [$RESULT]"
   # from the tree that carries the heal — root's ~/oosh may be the installed
   # older branch, which has no oo heal (rc 127 in the first container gate)
-  [ "$(sed -n 2p "$OS_T_REC")" = "user.run p root \"\$(dirname \"\$(readlink -f ~root/oosh)\")/dev.heal/oo\" heal dev.heal all $(private.os.platform.heal.log.get second-heal p)" ] || bad="$bad not-heal-all-as-root-from-the-branch=[$(sed -n 2p "$OS_T_REC")]"   # portability-exception: the expected TEXT of a command run in a Linux platform container, not run here
+  [ "$(sed -n 2p "$OS_T_REC")" = "user.run p root $(private.os.platform.heal.second.command.get dev.heal) $(private.os.platform.heal.log.get second-heal p)" ] || bad="$bad not-heal-all-as-root-from-the-branch=[$(sed -n 2p "$OS_T_REC")]"
   [ "$(sed -n 1p "$OS_T_REC")" = "snapshot p dev.heal" ] && [ "$(sed -n 3p "$OS_T_REC")" = "snapshot p dev.heal" ] || bad="$bad not-snapshot-heal-snapshot"
-  OS_T_SNAP_AFTER="/b	9/9	1 1"
+  OS_T_SNAP_AFTER="/b	9/9	1 1
+/s/sharedConfig/log.env	7/7	1 1"
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
   [ "$rc" = 1 ] || bad="$bad changed-rc=$rc"
   case "$RESULT" in *"changed: /b"*) ;; *) bad="$bad changed-unnamed=[$RESULT]" ;; esac
-  # a same-content rewrite is accepted as the idempotence invariant accepts it: a WARNING
-  OS_T_SNAP_AFTER="/b	1/1	2 2"
+  # a same-content rewrite of a shared env file is accepted as the idempotence invariant accepts it: a WARNING
+  OS_T_SNAP_AFTER="/b	1/1	1 1
+/s/sharedConfig/log.env	7/7	2 2"
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
   [ "$rc" = 0 ] || bad="$bad rewritten-rc=$rc"
-  case "$RESULT" in *WARNING*"rewritten: /b"*) ;; *) bad="$bad rewritten-no-warning=[$RESULT]" ;; esac
+  case "$RESULT" in *WARNING*"rewritten: /s/sharedConfig/log.env"*) ;; *) bad="$bad rewritten-no-warning=[$RESULT]" ;; esac
+  # any other rewrite, a folder cloned again among them, is a change: the heal must not do it twice
+  OS_T_SNAP_AFTER="/b	1/1	2 2
+/s/sharedConfig/log.env	7/7	1 1"
+  private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] || bad="$bad recloned-folder-accepted-rc=$rc"
+  case "$RESULT" in *"rewritten: /b"*) ;; *) bad="$bad recloned-folder-unnamed=[$RESULT]" ;; esac
   # result.env (result save, on every this.call) is left out in one place, the invariant's
   OS_T_SNAP_AFTER="/b	1/1	1 1
+/s/sharedConfig/log.env	7/7	1 1
 /s/result.env	5/5	9 9"
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 0 ] || bad="$bad result-env-counted"
   OS_T_SNAP_AFTER="/b	1/1	1 1
+/s/sharedConfig/log.env	7/7	1 1
 /c	1/1	1 1"
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad added-accepted"
-  OS_T_SNAP_AFTER="/b	1/1	1 1"; OS_T_HEAL_RC=1
+  OS_T_SNAP_AFTER="/b	1/1	1 1
+/s/sharedConfig/log.env	7/7	1 1"; OS_T_HEAL_RC=1
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad heal-rc1-accepted"
   [ -z "${TEST_SHARED_TIER_WRITER+x}" ] || bad="$bad invariant-globals-leaked"
   # the idempotence invariant's helpers are sourced once, in one subshell
@@ -950,10 +973,11 @@ test.os.healTest.stubs.set() {
   private.os.platform.heal.pipe.run()    { echo "pipe $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.gate.run()         { echo "gate.run $2" >> "$OS_T_REC"; return 0; }
   private.os.platform.shared.config.repair() { echo "repair" >> "$OS_T_REC"; }
-  private.os.platform.user.run()         { echo "user.run $2 $3" >> "$OS_T_REC"; return 0; }
+  private.os.platform.user.run()         { echo "user.run $2 $3" >> "$OS_T_REC"; case "$3" in *" heal "*" all") return "${OS_T_USER_RUN_RC:-0}" ;; esac; return 0; }
   private.os.platform.heal.second.run()  { echo "second $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.heal.check() {
     case "$2" in
+      expect)     echo "expect $1 ${*:3}" >> "$OS_T_REC"; return "${OS_T_EXPECT_RC:-0}" ;;
       foreign)    echo "foreign $1" >> "$OS_T_REC"; return 0 ;;
       user.clone) echo "user-clone $1 $3" >> "$OS_T_REC"; return "${OS_T_USERCLONE_RC:-0}" ;;
     esac
@@ -971,8 +995,9 @@ test.os.healTest.stubs.set() {
 }
 test.os.healTestOrder() {
   local fx; fx=$(test.suite.fixture.make healorder)
-  local HOME="$fx" OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL; unset OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL
-  local bad="" rc out got want hb p=heal_test_stub n names traps
+  local HOME="$fx" OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL TMPDIR="$fx/tmp"; unset OSSH_INSTALL_BRANCH OOSH_HEAL_LOCAL
+  mkdir -p "$TMPDIR"
+  local bad="" rc out got want hb p=heal_test_stub n names traps second reports
   private.this.script.load ogit ogit.branch.get
   # HOME is the fixture: its global git config must trust this tree, or git
   # refuses a tree another user owns (the user test in a platform container,
@@ -981,8 +1006,10 @@ test.os.healTestOrder() {
   ogit.safeDirectory.add "$(private.this.path.canonical "$OOSH_DIR")" >/dev/null 2>&1
   hb=$(ogit.branch.get "$OOSH_DIR")
   names=$(private.os.platform.heal.breakage.names.get)
+  second=$(private.os.platform.heal.second.command.get "$hb")
+  reports="rc 1: something is left for you — the lines marked left above; install state 99"
   test.os.healTest.stubs.set
-  traps=$(trap -p INT TERM)
+  traps=$(trap -p INT TERM HUP)
   out=$(os.platform.heal.test "$p" 26d15a4 2>&1); rc=$?
   [ "$rc" = 0 ] || bad="$bad rc=$rc"
   want="parse $p
@@ -996,6 +1023,7 @@ breakage $n $hb"
   done
   want="$want
 ossh heal $p all $hb local=[1]
+expect $p $hb $(printf '%s\n' "$names" | grep -vxF user.clone | tr '\n' ' ' | sed 's/ $//')
 gate.run test
 gate.run root
 repair
@@ -1006,34 +1034,54 @@ repair
 user.run bash-user test.suite run platform.shared.idempotence.invariant 1
 second $p $hb
 foreign $p
+breakage user.clone $hb
+user.run root $second
+user-clone $p $hb
 drop platform-test-26d15a4
 ossh connection.close $p local=[unset]
 cleanup 8022"
   got=$(cat "$OS_T_REC")
   [ "$got" = "$want" ] || bad="$bad order:$(diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") | grep '^[<>]' | head -3 | tr '\n' '|')"
-  case "$out" in *"PASS: heal $p 26d15a4 (breakages=0 heal=0 verify=0 test=0 root=0 oosh-user=0 bash-user=0 idempotence=0 second-heal=0 foreign=0)"*) ;; *) bad="$bad no-pass-line" ;; esac
+  case "$out" in *"PASS: heal $p 26d15a4 (heal=0 verify=0 not-checked=0 expect=0 test=0 root=0 oosh-user=0 bash-user=0 idempotence=0 second-heal=0 foreign=0 user-clone=0)"*) ;; *) bad="$bad no-pass-line=[$out]" ;; esac
+  case "$out" in *breakages=*) bad="$bad breakages-field-back" ;; esac
   [ -z "${OSSH_INSTALL_BRANCH+x}" ] && [ -z "${OOSH_HEAL_LOCAL+x}" ] || bad="$bad env-leaked"
+  # the logs of the run are one folder under the temp dir: gone on PASS, never written in the repository
+  [ "$(ls -A "$TMPDIR" | grep -c '^oosh-heal-test\.')" = 0 ] || bad="$bad logs-left-on-pass=[$(ls -A "$TMPDIR")]"
   os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1
-  [ "$(trap -p INT TERM)" = "$traps" ] || bad="$bad traps-not-restored"
-  # a subset, pipe and terminal: only that breakage, the pipe form after the heal, no foreign check, the container stays
+  [ "$(trap -p INT TERM HUP)" = "$traps" ] || bad="$bad traps-not-restored"
+  # a subset, pipe and terminal: only that breakage, the expect check, then the pipe form, no foreign check, no second pass, the container stays
   : > "$OS_T_REC"
   os.platform.heal.test "$p" 26d15a4 dirty pipe terminal >/dev/null 2>&1 || bad="$bad subset-rc"
   [ "$(grep -c '^breakage ' "$OS_T_REC")" = 1 ] && grep -qx "breakage dirty $hb" "$OS_T_REC" || bad="$bad subset-breakages"
-  [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:ossh heal ' | sed -n 2p | cut -d: -f2-)" = "pipe $p $hb" ] || bad="$bad pipe-not-after-heal"
+  [ "$(grep -n '' "$OS_T_REC" | grep -A2 '^[0-9]*:ossh heal ' | sed -n 2p | cut -d: -f2-)" = "expect $p $hb dirty" ] || bad="$bad expect-not-after-heal"
+  [ "$(grep -n '' "$OS_T_REC" | grep -A2 '^[0-9]*:ossh heal ' | sed -n 3p | cut -d: -f2-)" = "pipe $p $hb" ] || bad="$bad pipe-not-after-expect"
   grep -q '^foreign ' "$OS_T_REC" && bad="$bad foreign-without-breakage"
   grep -q '^user-clone ' "$OS_T_REC" && bad="$bad user-clone-without-breakage"
   grep -q '^cleanup ' "$OS_T_REC" && bad="$bad terminal-cleaned-up"
   grep -q '^drop platform-test-26d15a4' "$OS_T_REC" || bad="$bad terminal-no-drop"
-  # user.clone: its check runs after the second heal, its rc is the user-clone field, a red check fails the run
+  # user.clone typed: its check runs after the second heal, its rc is the user-clone field, a red check fails the run, and there is no second pass
   : > "$OS_T_REC"
   out=$(os.platform.heal.test "$p" 26d15a4 user.clone 2>&1) || bad="$bad user-clone-rc"
   [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:second ' | sed -n 2p | cut -d: -f2-)" = "user-clone $p $hb" ] || bad="$bad user-clone-not-after-second"
+  [ "$(grep -c '^breakage user.clone' "$OS_T_REC")" = 1 ] || bad="$bad user-clone-second-pass-after-typed"
   case "$out" in *"foreign=skipped user-clone=0)"*) ;; *) bad="$bad user-clone-field" ;; esac
   OS_T_USERCLONE_RC=1
   out=$(os.platform.heal.test "$p" 26d15a4 user.clone 2>&1) && bad="$bad user-clone-red-passed"
   case "$out" in *"FAIL: heal $p 26d15a4 ("*"user-clone=1)"*) ;; *) bad="$bad user-clone-fail-line" ;; esac
+  # the second pass of a full run: a red check of it fails the run, a heal that ends rc 2 too, a rc 1 with reports only does not
+  : > "$OS_T_REC"
+  out=$(os.platform.heal.test "$p" 26d15a4 2>&1) && bad="$bad second-pass-red-passed"
+  case "$out" in *"FAIL: heal $p 26d15a4 ("*"user-clone=1)"*) ;; *) bad="$bad second-pass-fail-line" ;; esac
   unset OS_T_USERCLONE_RC
-  # a failed breakage ends the run before the heal: rc 1, no heal, the branch dropped, the container removed
+  OS_T_USER_RUN_RC=2
+  out=$(os.platform.heal.test "$p" 26d15a4 2>&1) && bad="$bad second-pass-heal-rc2-passed"
+  unset OS_T_USER_RUN_RC
+  # a subset ends without the second pass
+  : > "$OS_T_REC"
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 || bad="$bad subset-fail"
+  grep -q '^breakage user.clone' "$OS_T_REC" && bad="$bad second-pass-on-a-subset"
+  # a failed breakage ends the run before the heal: rc 1, no heal, the branch dropped, the container removed, the logs kept and named
+  rm -rf "${TMPDIR:?}"/oosh-heal-test.*
   : > "$OS_T_REC"
   private.os.platform.heal.breakage.apply() { echo "breakage $2 $3" >> "$OS_T_REC"; [ "$2" != dirty ]; }
   out=$(os.platform.heal.test "$p" 26d15a4 dirty detached 2>&1); rc=$?
@@ -1042,68 +1090,94 @@ cleanup 8022"
   grep -q '^breakage detached' "$OS_T_REC" && bad="$bad breakages-went-on"
   grep -q '^drop platform-test-26d15a4' "$OS_T_REC" && grep -q '^cleanup 8022' "$OS_T_REC" || bad="$bad breakage-fail-no-drop-or-cleanup"
   case "$out" in *"FAIL: heal $p 26d15a4 (breakage dirty failed"*) ;; *) bad="$bad breakage-fail-line=[$out]" ;; esac
+  [ "$(ls -A "$TMPDIR" | grep -c '^oosh-heal-test\.')" = 1 ] || bad="$bad breakage-fail-logs-not-kept"
+  case "$out" in *"$TMPDIR/oosh-heal-test."*) ;; *) bad="$bad breakage-fail-logs-not-named=[$out]" ;; esac
+  rm -rf "${TMPDIR:?}"/oosh-heal-test.*
   private.os.platform.heal.breakage.apply() { echo "breakage $2 $3" >> "$OS_T_REC"; return 0; }
-  # a failing container.up: rc 1, the temporary branch dropped, nothing installed
+  # a failing container.up: rc 1, the temporary branch dropped, nothing installed, no logs folder left
   : > "$OS_T_REC"
   private.os.platform.container.up() { echo "container.up" >> "$OS_T_REC"; create.result 1 "stubbed"; return 99; }
   os.platform.heal.test "$p" 26d15a4 >/dev/null 2>&1; rc=$?
   [ "$rc" = 1 ] || bad="$bad up-fail-rc=$rc"
   grep -q '^users.install' "$OS_T_REC" && bad="$bad installed-after-fail"
   grep -q '^drop platform-test-26d15a4' "$OS_T_REC" || bad="$bad up-fail-no-drop"
+  [ "$(ls -A "$TMPDIR" | grep -c '^oosh-heal-test\.')" = 0 ] || bad="$bad up-fail-logs-folder-left"
   private.os.platform.container.up()     { echo "container.up $* branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; return 0; }
   # the era gate refuses: dropped, no container
   : > "$OS_T_REC"; OS_T_GATE=1
   os.platform.heal.test "$p" b492b2e >/dev/null 2>&1; [ $? = 1 ] || bad="$bad era-rc"
   grep -q '^container.up' "$OS_T_REC" && bad="$bad era-container"
   grep -q '^drop platform-test-b492b2e' "$OS_T_REC" || bad="$bad era-no-drop"
+  [ "$(ls -A "$TMPDIR" | grep -c '^oosh-heal-test\.')" = 0 ] || bad="$bad era-logs-folder-left"
   # an unknown breakage: refused before anything starts
   : > "$OS_T_REC"; OS_T_GATE=0
   os.platform.heal.test "$p" 26d15a4 bogus >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-rc"
   [ -s "$OS_T_REC" ] && bad="$bad unknown-started"
-  # the heal's rc 1 (folders moved aside, left for the user) passes; rc 2 fails
-  OS_T_HEAL_RC=1
-  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) || bad="$bad heal-rc1-failed"
-  case "$out" in *"PASS: heal $p 26d15a4 (breakages=0 heal=1 verify=0"*) ;; *) bad="$bad heal-rc1-line" ;; esac
+  # the ref under test is the branch under test: the heal would be tested against itself
+  : > "$OS_T_REC"
+  out=$(os.platform.heal.test "$p" "$hb" 2>&1); rc=$?
+  [ "$rc" = 1 ] || bad="$bad same-ref-rc=$rc"
+  grep -qE '^(ensure|container\.up|users\.install)' "$OS_T_REC" && bad="$bad same-ref-started"
+  case "$out" in *"older ref"*) ;; *) bad="$bad same-ref-unnamed=[$out]" ;; esac
+  # the heal's rc 1 passes when it is reports only (install state 99), as in the second heal; any other rc 1, rc 2 fail
+  OS_T_HEAL_RC=1; OS_T_HEAL_OUT=$(printf '%s\r' "$reports")
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) || bad="$bad heal-rc1-reports-failed"
+  case "$out" in *"PASS: heal $p 26d15a4 (heal=1 verify=0 not-checked=0 expect=0 "*) ;; *) bad="$bad heal-rc1-line=[$out]" ;; esac
+  OS_T_HEAL_OUT="rc 1: something is left for you — the lines marked left above"
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 && bad="$bad heal-rc1-step-left-passed"
+  OS_T_HEAL_OUT=""
+  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 && bad="$bad heal-rc1-silent-passed"
   OS_T_HEAL_RC=2
   os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 && bad="$bad heal-rc2-passed"
-  # a red verify of the heal fails the run, NOT CHECKED does not
+  # a red verify of the heal fails the run; a NOT CHECKED fails it too unless the reason is the re-login of group dev
   OS_T_HEAL_RC=0; OS_T_HEAL_OUT=$(printf '  PASS layout root\r\n  FAIL boot root: run oo heal\r\n  NOT CHECKED oosh bash-user: no sudo\r')
   out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) && bad="$bad verify-fail-passed"
-  case "$out" in *"FAIL: heal $p 26d15a4 (breakages=0 heal=0 verify=1 "*) ;; *) bad="$bad verify-line" ;; esac
-  OS_T_HEAL_OUT=$(printf '  NOT CHECKED oosh bash-user: no sudo\r')
-  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 || bad="$bad not-checked-failed"
+  case "$out" in *"FAIL: heal $p 26d15a4 (heal=0 verify=1 not-checked=1 "*) ;; *) bad="$bad verify-line=[$out]" ;; esac
+  OS_T_HEAL_OUT=$(printf '  NOT CHECKED oosh bash-user: only root runs another user invariants\r')
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) && bad="$bad not-checked-passed"
+  case "$out" in *"not-checked=1 "*) ;; *) bad="$bad not-checked-line=[$out]" ;; esac
+  OS_T_HEAL_OUT=$(printf '  NOT CHECKED oosh bash-user: group dev takes effect after a re-login (rc 1)\r')
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) || bad="$bad relogin-failed"
+  case "$out" in *"not-checked=0 "*) ;; *) bad="$bad relogin-counted=[$out]" ;; esac
   OS_T_HEAL_OUT=""
-  # a failing step after the heal: FAIL, the branch dropped, the container removed
+  # the expect check red fails the run, named in the line
+  OS_T_EXPECT_RC=1
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) && bad="$bad expect-red-passed"
+  case "$out" in *"FAIL: heal $p 26d15a4 ("*" expect=1 "*) ;; *) bad="$bad expect-fail-line=[$out]" ;; esac
+  unset OS_T_EXPECT_RC
+  # a failing step after the heal: FAIL, the branch dropped, the container removed, the logs kept and named
   : > "$OS_T_REC"
   private.os.platform.gate.run() { echo "gate.run $2" >> "$OS_T_REC"; [ "$2" != root ]; }
-  os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 && bad="$bad gate-fail-passed"
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) && bad="$bad gate-fail-passed"
   grep -q '^drop platform-test-26d15a4' "$OS_T_REC" && grep -q '^cleanup 8022' "$OS_T_REC" || bad="$bad gate-fail-no-drop-or-cleanup"
+  case "$out" in *"logs: $TMPDIR/oosh-heal-test."*) ;; *) bad="$bad gate-fail-logs-not-named=[$out]" ;; esac
+  rm -rf "${TMPDIR:?}"/oosh-heal-test.*
   private.os.platform.gate.run() { echo "gate.run $2" >> "$OS_T_REC"; return 0; }
   # a dirty tree: the committed branch would ship, not what is tested — refused before the push
   : > "$OS_T_REC"; OS_T_DIRTY=1
   os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1; [ $? = 1 ] || bad="$bad dirty-accepted"
   grep -q '^ensure' "$OS_T_REC" && bad="$bad dirty-pushed"
   OS_T_DIRTY=0
-  # Ctrl-C after the push: the trap drops the temporary branch and removes the container
-  : > "$OS_T_REC"
-  private.os.platform.users.install() { echo "users.install" >> "$OS_T_REC"; kill -INT "$BASHPID"; }
-  ( os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 ); rc=$?
-  [ "$rc" = 130 ] || bad="$bad int-rc=$rc"
-  grep -q '^drop platform-test-26d15a4' "$OS_T_REC" && grep -q '^cleanup 8022' "$OS_T_REC" || bad="$bad int-no-drop-or-cleanup"
-  grep -q '^breakage ' "$OS_T_REC" && bad="$bad int-went-on"
+  # Ctrl-C, SIGTERM and a hangup after the push: the trap drops the temporary branch and removes the container, the run ends 130
+  for n in INT TERM HUP; do
+    : > "$OS_T_REC"
+    eval "private.os.platform.users.install() { echo \"users.install\" >> \"\$OS_T_REC\"; kill -$n \"\$BASHPID\"; }"
+    ( os.platform.heal.test "$p" 26d15a4 dirty >/dev/null 2>&1 ); rc=$?
+    [ "$rc" = 130 ] || bad="$bad $n-rc=$rc"
+    grep -q '^drop platform-test-26d15a4' "$OS_T_REC" && grep -q '^cleanup 8022' "$OS_T_REC" || bad="$bad $n-no-drop-or-cleanup"
+    grep -q '^breakage ' "$OS_T_REC" && bad="$bad $n-went-on"
+  done
+  rm -rf "${TMPDIR:?}"/oosh-heal-test.*
   test.os.stubs.unset
   unset -f ogit.status.check
   unset OS_T_HEAL_RC OS_T_HEAL_OUT OS_T_DIRTY
-  for n in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign user-clone; do
-    rm -f "$(private.os.platform.heal.log.get "$n" "$p")"
-  done
   unset OS_T_GATE
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "parse, ensure, gate, container.up, users.install, breakages, heal, gates, idempotence, second heal, foreign, drop, cleanup; a failing container.up still drops the branch" || create.result 1 "heal test order:$bad"
+  [ -z "$bad" ] && create.result 0 "parse, ensure, gate, container.up, users.install, breakages, heal, expect, gates, idempotence, second heal, foreign, the user.clone second pass, drop, cleanup; a failing container.up still drops the branch" || create.result 1 "heal test order:$bad"
   return $(result)
 }
 test.case $level "T-OS-HEAL-TEST-ORDER: os platform.heal.test runs its steps in order and always drops its temporary branch" test.os.healTestOrder
-expect 0 "parse, ensure, gate, container.up, users.install, breakages, heal, gates, idempotence, second heal, foreign, drop, cleanup; a failing container.up still drops the branch" \
+expect 0 "parse, ensure, gate, container.up, users.install, breakages, heal, expect, gates, idempotence, second heal, foreign, the user.clone second pass, drop, cleanup; a failing container.up still drops the branch" \
   "the scenario test proves the heal before it touches a real machine"
 
 # T-OS-HEAL-TEST-COMPLETION: platforms, remote branches, and the breakage words with all, terminal and pipe
@@ -1215,6 +1289,377 @@ test.os.healUserCloneCheck() {
 test.case $level "T-OS-HEAL-USER-CLONE-CHECK: the user.clone check fails on an aside entry or an owner change and passes on an untouched clone" test.os.healUserCloneCheck
 expect 0 "the kept clone passes; an aside entry of the branch, another owner, a divergent HEAD and a missing folder fail; a fast-forward passes" \
   "bug of 2026-10-08: as root git's dubious ownership made the heal move a healthy user clone aside"
+
+# T-IDEMPOTENCE-UNACCEPTED-GLOB: a rewrite of the same content is accepted only under the shared
+# env files (the glob), never for a folder that was cloned again (new inode and mtime, same
+# "content") nor for a state file; a content change is unaccepted whatever its path.
+test.os.idempotenceUnacceptedGlob() {
+  local fx bad="" out glob='/x/S/*.env|/x/h/.config/oosh/*.env'
+  fx=$(test.suite.fixture.make idemglob)
+  printf '/x/S/log.env\tabc\t1 100\n/x/S/oosh.env\tabd\t2 100\n/x/S/stateMachines/A.states.env\tdef\t3 100\n/x/h/.config/oosh/oosh.env\tg\t4 100\n/x/B/dev.heal\tpresent\t10 100\n/x/B/dev.heal/f\t1/1\t11 100\n' > "$fx/before"
+  printf '/x/S/log.env\tabc\t1 200\n/x/S/oosh.env\tchanged\t2 200\n/x/S/stateMachines/A.states.env\tdef\t3 200\n/x/h/.config/oosh/oosh.env\tg\t4 200\n/x/B/dev.heal\tpresent\t20 200\n/x/B/dev.heal/f\t1/1\t21 200\n' > "$fx/after"
+  out=$( TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
+    . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || exit 9
+    test.platform.shared.idempotence.compare "$fx/before" "$fx/after" | test.platform.shared.idempotence.unaccepted rewritten "$glob" )
+  case "$out" in *"rewritten: /x/B/dev.heal ("*) ;; *) bad="$bad recloned-folder-accepted=[$out]" ;; esac
+  case "$out" in *"rewritten: /x/B/dev.heal/f ("*) ;; *) bad="$bad file-of-recloned-accepted" ;; esac
+  case "$out" in *"rewritten: /x/S/stateMachines/A.states.env ("*) ;; *) bad="$bad state-file-accepted" ;; esac
+  case "$out" in *"changed: /x/S/oosh.env ("*) ;; *) bad="$bad content-change-accepted" ;; esac
+  case "$out" in *"rewritten: /x/S/log.env"*|*"rewritten: /x/h/.config/oosh/oosh.env"*) bad="$bad env-rewrite-unaccepted=[$out]" ;; esac
+  [ "$(printf '%s\n' "$out" | grep -c .)" = 4 ] || bad="$bad count=$(printf '%s\n' "$out" | grep -c .)"
+  # no glob: every rewrite is accepted (config save); a dash accepts nothing
+  out=$( TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
+    . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || exit 9
+    test.platform.shared.idempotence.compare "$fx/before" "$fx/after" | test.platform.shared.idempotence.unaccepted rewritten )
+  [ "$(printf '%s\n' "$out" | grep -c .)" = 1 ] && case "$out" in "changed: /x/S/oosh.env ("*) ;; *) false ;; esac || bad="$bad no-glob=[$out]"
+  out=$( TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
+    . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || exit 9
+    test.platform.shared.idempotence.compare "$fx/before" "$fx/after" | test.platform.shared.idempotence.unaccepted - )
+  [ "$(printf '%s\n' "$out" | grep -c .)" = 6 ] || bad="$bad dash-count=$(printf '%s\n' "$out" | grep -c .)"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a same-content rewrite is accepted under the shared env files only; a re-cloned folder, a state file and a content change are unaccepted" || create.result 1 "unaccepted glob:$bad"
+  return $(result)
+}
+test.case $level "T-IDEMPOTENCE-UNACCEPTED-GLOB: a rewrite is accepted only for the paths of the glob" test.os.idempotenceUnacceptedGlob
+expect 0 "a same-content rewrite is accepted under the shared env files only; a re-cloned folder, a state file and a content change are unaccepted" \
+  "E1: the second heal accepted every rewrite, a folder cloned again too"
+
+
+# T-OS-HEAL-EXPECT-CHECK: the post-heal check of the scenario, as root in sh. Its text runs here on
+# a fixture machine that is healed (a passwd of its own, a base, a sharedConfig, five homes, the
+# ssh setup, the launcher, a clone of the branch, the aside entry of every folder breakage); the
+# lines of the script naming the machine (passwd, B, S, DK, LAUNCHER, LAUNCHER2, BOOT, DROPIN) are
+# pointed at the fixture, and the run is refused unless each replacement took. Then one thing at
+# a time is broken and the check must name it.
+test.os.healExpectFixture() { # <dir> # build the healed fixture machine under <dir>
+  local fx="$1" url=git@github.com:Cerulean-Circle-GmbH/once.sh.git u d
+  local B="$fx/base/Once.sh" S="$fx/sc" D="$fx/base/Once.sh/dev.heal"
+  local g=(git -c user.email=t@t -c user.name=t -c commit.gpgsign=false)
+  mkdir -p "$B" "$S/stateMachines" "$fx/home/shared/.ssh" "$fx/bin"
+  : > "$fx/passwd"
+  for u in root test oosh-user bash-user developking; do
+    mkdir -p "$fx/home/$u"
+    printf '%s:x:1:1::%s/home/%s:/bin/bash\n' "$u" "$fx" "$u" >> "$fx/passwd"
+  done
+  for d in main dev.heal kept old; do
+    "${g[@]}" init -q -b "$d" "$B/$d"
+    "${g[@]}" -C "$B/$d" remote add origin "$url"
+    case "$d" in
+      old) printf 'seed\n' > "$B/$d/file" ;;
+      *)   printf 'config.session.save() { :; }\n' > "$B/$d/config"; printf '  derivedHome=x\n' > "$B/$d/this" ;;
+    esac
+    "${g[@]}" -C "$B/$d" add . && "${g[@]}" -C "$B/$d" commit -q -m seed
+  done
+  mkdir -p "$B/testing/.git"
+  for u in root test oosh-user bash-user developking; do
+    ln -s "$D" "$fx/home/$u/oosh"; ln -s "$S" "$fx/home/$u/config"
+  done
+  # eraB.config, root.clone, devhome.missing, no.bashrc, ssh.legacy
+  mkdir -p "$fx/home/test/config.orig.20261008-120000" "$fx/home/root/config.orig.20261008-120000" \
+           "$fx/home/root/oosh.orig.20260910-093000" "$fx/home/root/oosh.orig.20261008-120000" "$fx/home/root/ssh.original"
+  printf 'export OOSH_SSH_CONFIG_HOST="mac"\n' > "$S/oosh.env"
+  printf 'export LOG_LEVEL="3"\n' > "$S/log.env"
+  : > "$fx/home/root/.bashrc"; : > "$fx/home/root/.gitconfig"; printf "# oosh\n" > "$fx/home/oosh-user/.bashrc"
+  # the ssh setup of decision 4
+  mkdir -p "$fx/home/developking/.ssh" "$fx/home/root/.ssh/ids/ssh.developking"
+  : > "$fx/home/developking/.ssh/id_rsa"; : > "$fx/home/root/.ssh/ids/ssh.developking/id_rsa"
+  printf 'Host github.com\n  IdentityFile ~/.ssh/ids/ssh.developking/id_rsa\n  IdentitiesOnly yes\n' > "$fx/home/root/.ssh/config"
+  printf 'Host github.com\n  IdentityFile ~/.ssh/id_rsa\n' > "$fx/home/shared/.ssh/config"
+  printf 'github.com ssh-ed25519 AAAA\n' > "$fx/home/shared/.ssh/known_hosts"
+  ln -s "$fx/home/root/oosh/init" "$fx/home/root/init"
+  printf '#!/bin/sh\n' > "$fx/bin/this"; chmod 755 "$fx/bin/this"; ln -s "$fx/bin/this" "$fx/bin/this2"
+  printf 'SETUP_SERVER_STATE_ID=99\nSETUP_SERVER_CUSTOM_SCRIPT=oo\n' > "$S/stateMachines/SETUP_SERVER.states.env"
+  # the aside entry the heal made of the broken folder: every marker of the folder arms
+  d="$B.aside/dev.heal.orig.20261008-120000"
+  "${g[@]}" init -q -b dev.heal "$d"
+  printf 'x\n' > "$d/os"; printf '<<<<<<< HEAD\n>>>>>>> origin/dev\n' > "$d/this"
+  "${g[@]}" -C "$d" add . && "${g[@]}" -C "$d" commit -q -m 'conflict markers committed'
+  printf '# heal test: an uncommitted change\n' >> "$d/os"
+  printf 'ours\n' > "$d/heal.conflict.txt"
+  "${g[@]}" -C "$d" update-ref refs/heal-test/diverged HEAD
+  "${g[@]}" -C "$d" rev-parse HEAD > "$d/.git/MERGE_HEAD"
+  "${g[@]}" -C "$d" update-ref --no-deref HEAD "$("${g[@]}" -C "$d" rev-parse HEAD)"
+}
+test.os.healExpectScript() { # <dir> <breakages...> # the expect check of dev.heal pointed at the fixture <dir>
+  local fx="$1"; shift
+  private.os.platform.heal.expect.check.script.get dev.heal "$@" | sed \
+    -e "s#/etc/passwd#$fx/passwd#g" -e "s#^B=.*#B='$fx/base/Once.sh'#" -e "s#^S=.*#S='$fx/sc'#" \
+    -e "s#^DK=.*#DK='$(id -un)'#" -e "s#^LAUNCHER=.*#LAUNCHER='$fx/bin/this'#" -e "s#^LAUNCHER2=.*#LAUNCHER2='$fx/bin/this2'#" \
+    -e "s#^BOOT=.*#BOOT='$fx/etc/oosh/boot'#" -e "s#^DROPIN=.*#DROPIN='$fx/etc/profile.d/oosh.sh'#"
+}
+test.os.healExpectBroken() { # <fx> <block> <label> # run the check on the fixture, it must end rc 1 naming <block>; echo the fault for the caller
+  local fx="$1" block="$2" label="$3" out rc
+  out=$(test.os.healExpectScript "$fx" $(private.os.platform.heal.breakage.names.get | grep -vxF user.clone) | sh 2>&1); rc=$?
+  [ "$rc" = 1 ] || { echo " $label-rc=$rc"; return 0; }
+  case "$out" in *"expect $block: FAILED"*) ;; *) echo " $label-unnamed=[$out]" ;; esac
+  return 0
+}
+test.os.healExpectCheck() {
+  local fx bad="" names script out rc n B S D g
+  fx=$(test.suite.fixture.make healexpect)
+  B="$fx/base/Once.sh"; S="$fx/sc"; D="$B/dev.heal"
+  g=(git -c user.email=t@t -c user.name=t -c commit.gpgsign=false)
+  test.os.healExpectFixture "$fx"
+  names=$(private.os.platform.heal.breakage.names.get | grep -vxF user.clone | tr '\n' ' ')
+  # shellcheck disable=SC2086 # the names are words
+  script=$(test.os.healExpectScript "$fx" $names)
+  for n in B S DK LAUNCHER LAUNCHER2 BOOT DROPIN; do
+    [ "$(printf '%s\n' "$script" | grep -c "^$n='")" = 1 ] || bad="$bad not-pointed:$n"
+  done
+  printf '%s\n' "$script" | grep -q "$fx/passwd" || bad="$bad passwd-not-pointed"
+  printf '%s\n' "$script" | sh -n 2>/dev/null || bad="$bad sh-n"
+  if command -v dash >/dev/null 2>&1; then printf '%s\n' "$script" | dash -n 2>/dev/null || bad="$bad dash-n"; fi
+  case "$script" in *"git@github.com:Cerulean-Circle-GmbH/once.sh.git"*) ;; *) bad="$bad no-ssh-origin" ;; esac
+  case "$script" in *"config --get remote.origin.url"*) ;; *) bad="$bad origin-not-the-configured-url" ;; esac
+  # the healed machine passes, and says nothing failed
+  out=$(printf '%s\n' "$script" | sh 2>&1); rc=$?
+  [ "$rc" = 0 ] || bad="$bad healed-red=[$out]"
+  case "$out" in *FAILED*) bad="$bad healed-says-failed" ;; esac
+  # one thing broken at a time: the check names it (the line says: expect <block>: FAILED)
+  "${g[@]}" -C "$D" remote set-url origin https://github.com/Cerulean-Circle-GmbH/once.sh.git
+  bad="$bad$(test.os.healExpectBroken "$fx" origin https-origin)"
+  "${g[@]}" -C "$D" remote set-url origin git@github.com:Cerulean-Circle-GmbH/once.sh.git
+  mv "$fx/home/root/.ssh/config" "$fx/home/root/.ssh/config.x"; bad="$bad$(test.os.healExpectBroken "$fx" ssh no-root-ssh-config)"; mv "$fx/home/root/.ssh/config.x" "$fx/home/root/.ssh/config"
+  rm "$fx/home/shared/.ssh/known_hosts"; bad="$bad$(test.os.healExpectBroken "$fx" ssh no-shared-known-hosts)"; printf 'github.com x\n' > "$fx/home/shared/.ssh/known_hosts"
+  rm "$fx/home/root/init"; bad="$bad$(test.os.healExpectBroken "$fx" ssh no-init-link)"; ln -s "$fx/home/root/oosh/init" "$fx/home/root/init"
+  rm "$fx/home/developking/.ssh/id_rsa"; bad="$bad$(test.os.healExpectBroken "$fx" ssh no-deploy-key)"; : > "$fx/home/developking/.ssh/id_rsa"
+  mv "$fx/bin/this" "$fx/bin/this.x"; bad="$bad$(test.os.healExpectBroken "$fx" launcher no-launcher)"; mv "$fx/bin/this.x" "$fx/bin/this"
+  rm "$fx/bin/this2"; bad="$bad$(test.os.healExpectBroken "$fx" launcher no-second-launcher-name)"; ln -s "$fx/bin/this" "$fx/bin/this2"
+  # who moves: the healer and the login always to the branch; the others to the branch unless their tree carries the model
+  rm "$fx/home/test/oosh"; ln -s "$B/kept" "$fx/home/test/oosh"; bad="$bad$(test.os.healExpectBroken "$fx" links test-not-on-branch)"
+  rm "$fx/home/test/oosh"; ln -s "$D" "$fx/home/test/oosh"
+  rm "$fx/home/oosh-user/oosh"; ln -s "$B/old" "$fx/home/oosh-user/oosh"; bad="$bad$(test.os.healExpectBroken "$fx" links kept-a-tree-that-predates-the-heal)"
+  rm "$fx/home/oosh-user/oosh"; ln -s "$B/kept" "$fx/home/oosh-user/oosh"
+  out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad kept-a-tree-that-carries-the-model-red=[$out]"
+  rm "$fx/home/oosh-user/oosh"; ln -s "$D" "$fx/home/oosh-user/oosh"
+  rm "$fx/home/bash-user/oosh"; ln -s /opt/foreign/OOSH/x "$fx/home/bash-user/oosh"; bad="$bad$(test.os.healExpectBroken "$fx" links foreign-link-kept)"
+  rm "$fx/home/bash-user/oosh"; ln -s "$D" "$fx/home/bash-user/oosh"
+  rm "$fx/home/developking/config"; bad="$bad$(test.os.healExpectBroken "$fx" links developking-no-config)"; ln -s "$S" "$fx/home/developking/config"
+  # the per-breakage blocks
+  printf 'SETUP_SERVER_STATE_ID=30\n' > "$S/stateMachines/SETUP_SERVER.states.env"; bad="$bad$(test.os.healExpectBroken "$fx" state.30 state-30-left)"
+  printf 'SETUP_SERVER_STATE_ID=99\n' > "$S/stateMachines/SETUP_SERVER.states.env"
+  mv "$B.aside" "$B.aside.x"; bad="$bad$(test.os.healExpectBroken "$fx" aside no-aside-entry)"; mv "$B.aside.x" "$B.aside"
+  rmdir "$fx/home/test/config.orig.20261008-120000"; bad="$bad$(test.os.healExpectBroken "$fx" eraB.config no-config-orig)"; mkdir "$fx/home/test/config.orig.20261008-120000"
+  : > "$S/oosh.env"; bad="$bad$(test.os.healExpectBroken "$fx" eraB.config host-not-imported)"; printf 'export OOSH_SSH_CONFIG_HOST="mac"\n' > "$S/oosh.env"
+  rmdir "$fx/home/root/oosh.orig.20261008-120000"; bad="$bad$(test.os.healExpectBroken "$fx" root.clone real-clone-not-kept)"; mkdir "$fx/home/root/oosh.orig.20261008-120000"
+  printf 'x\n' >> "$D/this"; bad="$bad$(test.os.healExpectBroken "$fx" folder dirty-folder-left)"; "${g[@]}" -C "$D" checkout -q -- this
+  rmdir "$B/testing/.git"; : > "$B/testing/.git"; bad="$bad$(test.os.healExpectBroken "$fx" worktree.layout worktree-left)"; rm "$B/testing/.git"; mkdir "$B/testing/.git"
+  mkdir -p "$fx/etc/oosh"; ln -s "$D/boot" "$fx/etc/oosh/boot"; bad="$bad$(test.os.healExpectBroken "$fx" boot.era drop-in-left)"; rm "$fx/etc/oosh/boot"
+  printf '[safe]\n\tdirectory = /Users/Shared/EAMD.ucp/x\n' > "$fx/home/root/.gitconfig"; bad="$bad$(test.os.healExpectBroken "$fx" safe.directory.stale stale-safe-directory)"; : > "$fx/home/root/.gitconfig"
+  # a breakage that did not run is not asserted
+  printf 'SETUP_SERVER_STATE_ID=30\n' > "$S/stateMachines/SETUP_SERVER.states.env"
+  out=$(test.os.healExpectScript "$fx" dirty | sh 2>&1) || bad="$bad unrun-breakage-asserted=[$out]"
+  out=$(test.os.healExpectScript "$fx" | sh 2>&1) || bad="$bad no-breakage-red=[$out]"
+  # the aside entry of a folder breakage
+  out=$(test.os.healExpectScript "$fx" merge.conflict | sh 2>&1) || bad="$bad aside-with-markers-red=[$out]"
+  rm -f "$B.aside/dev.heal.orig.20261008-120000/.git/MERGE_HEAD"
+  out=$(test.os.healExpectScript "$fx" merge.conflict | sh 2>&1) && bad="$bad merge-marker-missing-passed"
+  # refusals: no branch, a dash, an unknown breakage
+  private.os.platform.heal.expect.check.script.get >/dev/null 2>&1 && bad="$bad no-branch-accepted"
+  private.os.platform.heal.expect.check.script.get -x dirty >/dev/null 2>&1 && bad="$bad dash-branch-accepted"
+  private.os.platform.heal.expect.check.script.get dev.heal bogus >/dev/null 2>&1 && bad="$bad unknown-breakage-accepted"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the healed fixture passes; the origin, the ssh setup, the launcher, the links, the state and the markers of each breakage are named when broken; a breakage that did not run is not asserted" || create.result 1 "expect check:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-EXPECT-CHECK: the post-heal check names what is not the shape the heal leaves" test.os.healExpectCheck
+expect 0 "the healed fixture passes; the origin, the ssh setup, the launcher, the links, the state and the markers of each breakage are named when broken; a breakage that did not run is not asserted" \
+  "E2: the scenario checked that the heal ran, not what it left"
+
+# T-OS-HEAL-SNAPSHOT-ADDITIONS: the snapshot of the second heal also holds the number of entries of
+# <base>.aside (a heal that moves a folder aside every run shows) and the state machine files of the
+# sharedConfig by content (the heal writes the machine file again on every green run, the same
+# bytes). The snapshot script is the one the runner sends; it runs here as root would, on a fixture
+# machine: the passwd, B and S lines pointed at the fixture, a copy of the invariant in <base>/<branch>.
+test.os.healSnapshotAdditions() {
+  local fx bad="" script encoded out B S
+  fx=$(test.suite.fixture.make healsnap)
+  local HOME="$fx/home/test" OSSH_INSTALL_BRANCH; unset OSSH_INSTALL_BRANCH
+  B="$fx/base/Once.sh"; S="$fx/sc"
+  test.os.healExpectFixture "$fx"
+  mkdir -p "$B/dev.heal/test" "$S/stateMachines" "$B.aside/b.orig.1"
+  cp "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" "$B/dev.heal/test/"
+  test.os.stubs.set
+  ossh() { echo "ossh $*" >> "$OS_T_REC"; }
+  private.os.platform.heal.snapshot.get p dev.heal >/dev/null 2>&1
+  encoded=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1 | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  script=$(printf '%s' "$encoded" | base64 -d | sed -e "s#/etc/passwd#$fx/passwd#g" -e "s#^B=.*#B='$B'#" -e "s#^S=.*#S='$S'#")
+  test.os.stubs.unset
+  [ "$(printf '%s\n' "$script" | grep -c "^B='$B'$")" = 1 ] || bad="$bad base-not-pointed"
+  out=$(printf '%s\n' "$script" | bash 2>&1)
+  case "$out" in *"$(printf '%s\t2 entries\t-' "$B.aside")"*) ;; *) bad="$bad aside-count-missing" ;; esac
+  case "$out" in *"$(printf '%s\t' "$S/stateMachines/SETUP_SERVER.states.env")"*) ;; *) bad="$bad state-file-missing" ;; esac
+  printf '%s\n' "$out" | grep -F "$S/stateMachines/SETUP_SERVER.states.env" | awk -F '\t' '$3 != "-" { f = 1 } END { exit f }' || bad="$bad state-file-stamped"
+  printf '%s\n' "$out" | grep -F "$S/log.env" | awk -F '\t' '$3 == "-" { f = 1 } END { exit f }' || bad="$bad env-file-not-stamped"
+  rmdir "$B.aside/b.orig.1"
+  out=$(printf '%s\n' "$script" | bash 2>&1)
+  case "$out" in *"$(printf '%s\t1 entries\t-' "$B.aside")"*) ;; *) bad="$bad aside-count-not-counting" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the snapshot holds the entry count of the aside folder and the state files by content" || create.result 1 "snapshot additions:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-SNAPSHOT-ADDITIONS: the snapshot counts the aside entries and holds the state machine files" test.os.healSnapshotAdditions
+expect 0 "the snapshot holds the entry count of the aside folder and the state files by content" \
+  "E1: a heal that moves a folder aside on every run, or loses its state, passed the second heal"
+
+# T-OS-HEAL-BREAKAGE-STATE30: the state.30 arm writes the state file of the sharedConfig (the one
+# the heal sets to 99 and oo state reads), and the cache of the current machine there; a second run
+# says already; with no machine file it writes one.
+test.os.healBreakageState30() {
+  local fx bad="" script out S f
+  fx=$(test.suite.fixture.make healstate30)
+  S="$fx/sc"; mkdir -p "$S/stateMachines"
+  f="$S/stateMachines/SETUP_SERVER.states.env"
+  printf 'SETUP_SERVER_STATES=([1]="a" [2]="b")\nSETUP_SERVER_STATE_ID=99\nSETUP_SERVER_CUSTOM_SCRIPT=oo\n' > "$f"
+  printf 'machine=SETUP_SERVER\nstateID=SETUP_SERVER_STATE_ID\nstate=99\nstateScript=oo\n' > "$S/current.state.machine.env"
+  script=$(private.os.platform.heal.breakage.script.get state.30 dev.heal | sed -e "s#/etc/passwd#$fx/passwd#g" -e "s#^S=.*#S='$S'#")
+  [ "$(printf '%s\n' "$script" | grep -c "^S='$S'$")" = 1 ] || bad="$bad sharedconfig-not-pointed"
+  : > "$fx/passwd"
+  out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad rc=[$out]"
+  grep -qx 'SETUP_SERVER_STATE_ID=30' "$f" || bad="$bad state-id-not-30=[$(cat "$f")]"
+  grep -q 'SETUP_SERVER_STATES=(\[1\]="a" \[2\]="b")' "$f" || bad="$bad states-lost"
+  grep -qx 'SETUP_SERVER_CUSTOM_SCRIPT=oo' "$f" || bad="$bad script-lost"
+  grep -qx 'state=30' "$S/current.state.machine.env" || bad="$bad cache-not-30"
+  grep -qx 'machine=SETUP_SERVER' "$S/current.state.machine.env" || bad="$bad cache-machine-lost"
+  [ ! -e "$fx/home" ] || bad="$bad wrote-a-home-config"
+  out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad second-rc"
+  case "$out" in *already*) ;; *) bad="$bad second-not-already=[$out]" ;; esac
+  rm -f "$f" "$S/current.state.machine.env"
+  out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad missing-rc=[$out]"
+  grep -qx 'SETUP_SERVER_STATE_ID=30' "$f" 2>/dev/null || bad="$bad missing-not-written"
+  grep -qx 'state=30' "$S/current.state.machine.env" 2>/dev/null || bad="$bad missing-cache-not-written"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "SETUP_SERVER 30 in the machine file and the cache of the sharedConfig, kept states, a second run says already" || create.result 1 "state.30 arm:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-BREAKAGE-STATE30: the state.30 arm sets the state of the sharedConfig, not a copy in a home" test.os.healBreakageState30
+expect 0 "SETUP_SERVER 30 in the machine file and the cache of the sharedConfig, kept states, a second run says already" \
+  "E3: the arm wrote root's ~/config, the heal reads the sharedConfig: the scenario never started from state 30"
+
+# T-OS-HEAL-SECOND-COMMAND-GET: the second heal is one text, run from the tree that carries the heal
+# (root's ~/oosh may be an older branch without oo heal): the dirname of root's ~/oosh, the branch
+# folder, oo heal <branch> all. Run here with a stub readlink and a recording oo.
+test.os.healSecondCommandGet() {
+  local fx bad="" cmd out
+  fx=$(test.suite.fixture.make healcommand)
+  mkdir -p "$fx/bin" "$fx/base/old" "$fx/base/dev.heal"
+  printf '#!/bin/sh\necho "%s"\n' "$fx/base/old" > "$fx/bin/readlink"; chmod 755 "$fx/bin/readlink"
+  printf '#!/bin/sh\necho "oo $*"\n' > "$fx/base/dev.heal/oo"; chmod 755 "$fx/base/dev.heal/oo"
+  cmd=$(private.os.platform.heal.second.command.get dev.heal) || bad="$bad rc"
+  out=$(PATH="$fx/bin:$PATH" sh -c "$cmd" 2>&1)
+  [ "$out" = "oo heal dev.heal all" ] || bad="$bad runs=[$out]"
+  case "$cmd" in *"'"*) bad="$bad single-quote" ;; esac
+  printf '%s\n' "$cmd" | sh -n 2>/dev/null || bad="$bad sh-n"
+  private.os.platform.heal.second.command.get >/dev/null 2>&1 && bad="$bad no-branch-accepted"
+  private.os.platform.heal.second.command.get -x >/dev/null 2>&1 && bad="$bad dash-accepted"
+  private.os.platform.heal.second.command.get 'a b' >/dev/null 2>&1 && bad="$bad space-accepted"
+  private.os.platform.heal.second.command.get "a'b" >/dev/null 2>&1 && bad="$bad quote-accepted"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the second heal runs <base>/<branch>/oo heal <branch> all from the dirname of root's ~/oosh; a bad branch is refused" || create.result 1 "second command:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-SECOND-COMMAND-GET: the command of the second heal is one text" test.os.healSecondCommandGet
+expect 0 "the second heal runs <base>/<branch>/oo heal <branch> all from the dirname of root's ~/oosh; a bad branch is refused" \
+  "item 5: the text was written in the runner and again in its test"
+
+# T-OS-HEAL-REPORTS-ONLY-IS: a heal that ends rc 1 with only reports says so in its rc line, "install
+# state 99"; the first heal and the second read it through this one predicate.
+test.os.healReportsOnlyIs() {
+  local fx bad="" log
+  fx=$(test.suite.fixture.make healreports); log="$fx/h.log"
+  printf 'oo heal — summary\r\nrc 1: something is left for you — the lines marked left above; install state 99\r\n' > "$log"
+  private.os.platform.heal.reports.only.is "$log" || bad="$bad reports-not-seen"
+  printf 'rc 1: something is left for you — the lines marked left above\n' > "$log"
+  private.os.platform.heal.reports.only.is "$log" && bad="$bad step-left-accepted"
+  printf 'rc 2: cannot heal — no root; install state 99\n' > "$log"
+  private.os.platform.heal.reports.only.is "$log" && bad="$bad rc2-accepted"
+  printf 'rc 0: healed — every invariant PASS or NOT CHECKED, install state 99; oo mode <branch> works\n' > "$log"
+  private.os.platform.heal.reports.only.is "$log" && bad="$bad rc0-accepted"
+  : > "$log"
+  private.os.platform.heal.reports.only.is "$log" && bad="$bad empty-accepted"
+  private.os.platform.heal.reports.only.is "$fx/none.log" && bad="$bad missing-accepted"
+  private.os.platform.heal.reports.only.is >/dev/null 2>&1 && bad="$bad no-log-accepted"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "only a rc 1 line ending in install state 99 is reports only" || create.result 1 "reports only:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-REPORTS-ONLY-IS: a rc 1 line ending in install state 99 is reports only" test.os.healReportsOnlyIs
+expect 0 "only a rc 1 line ending in install state 99 is reports only" \
+  "E3: the first heal took any rc 1, the second only the rc line"
+
+# T-OS-HEAL-ARM-TWINS: the preamble reads the owner, the group and the inode of a path in one place
+# with the GNU stat and its BSD twin; its as_user closes stdin, so a command run as a user never
+# eats the rest of the script the root shell is reading.
+test.os.healArmTwins() {
+  local fx bad="" preamble out
+  fx=$(test.suite.fixture.make healtwins)
+  : > "$fx/f"
+  preamble=$(private.os.platform.heal.remote.preamble.get dev.heal)
+  out=$(printf '%s\n%s\n' "$preamble" "owner_of '$fx/f'; gid_of '$fx/f'; inode_of '$fx/f'" | sh 2>&1)
+  [ "$out" = "$(id -un)
+$(id -g)
+$(ls -di "$fx/f" | awk '{ print $1 }')" ] || bad="$bad twins=[$out]"
+  out=$(printf 'LEAK\n' | sh -c "$preamble
+PATH=/nonexistent; runuser() { echo \"runuser \$*\"; cat; }; PATH=/usr/bin:/bin; as_user root echo hi" 2>&1)
+  case "$out" in *LEAK*) bad="$bad as_user-reads-stdin" ;; esac
+  out=$(printf 'LEAK\n' | sh -c "$preamble
+sudo() { echo \"sudo \$*\"; cat; }; command() { return 1; }; as_user root echo hi" 2>&1)
+  case "$out" in *LEAK*) bad="$bad as_user-sudo-reads-stdin" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "owner_of, gid_of and inode_of agree with ls and id; as_user does not read stdin" || create.result 1 "arm twins:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-ARM-TWINS: owner_of, gid_of, inode_of and an as_user that leaves stdin alone" test.os.healArmTwins
+expect 0 "owner_of, gid_of and inode_of agree with ls and id; as_user does not read stdin" \
+  "item 5: a command run as a user inside the root script read the script itself"
+
+# T-OS-CLEANUP-ODOCKER: the container on a port is found and removed through odocker only: the list
+# of odocker.container.list names it by its published port, odocker.stop and odocker.container.remove
+# end it; no docker call of os.
+test.os.cleanupOdocker() {
+  local fx bad="" rec id
+  fx=$(test.suite.fixture.make oscleanup)
+  OS_T_REC="$fx/rec"; : > "$OS_T_REC"
+  odocker.container.list() {
+    printf 'CONTAINER ID  NAMES  IMAGE  STATUS  PORTS\n'
+    printf 'aaa111  other  img  Up 2 minutes  9022->22/tcp\n'
+    printf 'bbb222  quirky_name  img  Up 2 minutes  8022->22/tcp  8080->80/tcp\n'
+    printf 'ccc333  gone  img  Exited (0) 3 minutes ago  8023->22/tcp\n'
+  }
+  odocker.stop() { echo "stop $*" >> "$OS_T_REC"; }
+  odocker.container.remove() { echo "remove $*" >> "$OS_T_REC"; }
+  docker() { echo "docker $*" >> "$OS_T_REC"; }
+  id=$(private.os.platform.container.id 8022)
+  [ "$id" = bbb222 ] || bad="$bad id=[$id]"
+  [ -z "$(private.os.platform.container.id 8080)" ] && bad="$bad second-port-missed"
+  [ -z "$(private.os.platform.container.id 80)" ] || bad="$bad container-port-matched"
+  [ -z "$(private.os.platform.container.id 802)" ] || bad="$bad prefix-matched"
+  private.os.platform.cleanup 8022
+  [ "$(cat "$OS_T_REC")" = "stop bbb222
+remove bbb222" ] || bad="$bad cleanup=[$(cat "$OS_T_REC")]"
+  : > "$OS_T_REC"
+  private.os.platform.cleanup 9999
+  [ -s "$OS_T_REC" ] && bad="$bad nothing-to-clean-called=[$(cat "$OS_T_REC")]"
+  unset -f odocker.container.list odocker.stop odocker.container.remove docker
+  unset OS_T_REC
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the container of a port is found in the odocker list and ended with odocker stop and container.remove" || create.result 1 "cleanup:$bad"
+  return $(result)
+}
+test.case $level "T-OS-CLEANUP-ODOCKER: cleanup ends the container of a port through odocker only" test.os.cleanupOdocker
+expect 0 "the container of a port is found in the odocker list and ended with odocker stop and container.remove" \
+  "item 5: os called docker stop and docker rm itself"
+
+# T-OS-DOCSTRING-NO-APOSTROPHE: no docstring of os (public or private) holds an apostrophe; c2
+# splits the line at it.
+test.os.docstringNoApostrophe() {
+  local hits
+  hits=$(grep -nE "^[A-Za-z0-9_.]+\(\)[[:space:]]+#.*'" "$OOSH_DIR/os" | cut -d: -f1 | tr '\n' ' ')
+  [ -z "$hits" ] && create.result 0 "no apostrophe in a docstring of os" || create.result 1 "apostrophe in the docstring at line $hits"
+  return $(result)
+}
+test.case $level "T-OS-DOCSTRING-NO-APOSTROPHE: no apostrophe in a docstring of os" test.os.docstringNoApostrophe
+expect 0 "no apostrophe in a docstring of os" "c2 parses the signature line and splits it at an apostrophe"
 
 ### test.method
 
