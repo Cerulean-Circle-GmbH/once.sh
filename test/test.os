@@ -1143,10 +1143,11 @@ cleanup 8022"
   [ -s "$OS_T_REC" ] && bad="$bad unknown-started"
   # the ref under test is the branch under test: the heal would be tested against itself
   : > "$OS_T_REC"
-  out=$(os.platform.heal.test "$p" "$hb" 2>&1); rc=$?
+  # in this shell: the refusal is its RESULT (error.log reaches stdout only at some log devices — not as root in a container)
+  os.platform.heal.test "$p" "$hb" > "$fx/same-ref.out" 2>&1; rc=$?
   [ "$rc" = 1 ] || bad="$bad same-ref-rc=$rc"
   grep -qE '^(ensure|container\.up|users\.install)' "$OS_T_REC" && bad="$bad same-ref-started"
-  case "$out" in *"older ref"*) ;; *) bad="$bad same-ref-unnamed=[$out]" ;; esac
+  case "$RESULT" in *"older ref"*) ;; *) bad="$bad same-ref-unnamed=[$RESULT]" ;; esac
   # the heal's rc 1 passes when it is reports only (install state 99), as in the second heal; any other rc 1, rc 2 fail
   OS_T_HEAL_RC=1; OS_T_HEAL_OUT=$(printf '%s\r' "$reports")
   out=$(os.platform.heal.test "$p" 26d15a4 dirty 2>&1) || bad="$bad heal-rc1-reports-failed"
@@ -1820,7 +1821,8 @@ test.os.healCompareRun() {
     esac
   }
   private.os.platform.cleanup()        { echo "cleanup $*" >> "$OS_T_REC"; }
-  out=$(private.os.platform.heal.compare.run "$p" dev.heal 2>&1); rc=$?
+  # in this shell, not in $( ): its RESULT is asserted; the output goes to a file
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
   [ "$rc" = 0 ] || bad="$bad equal-rc=$rc=[$out]"
   grep -qx "container.up ${p}_fresh naked_ubuntu_24_04 9022 local=\[1\] branch=\[dev.heal\]" "$OS_T_REC" || bad="$bad up=[$(grep container.up "$OS_T_REC")]"
   grep -qx "users.install ${p}_fresh local=\[1\] branch=\[dev.heal\]" "$OS_T_REC" || bad="$bad users=[$(grep users.install "$OS_T_REC")]"
@@ -1833,9 +1835,10 @@ test.os.healCompareRun() {
   [ -z "${OSSH_INSTALL_LOCAL+x}" ] || bad="$bad env-leaked"
   # a line only the fresh install has: rc 1, the line named in the output and the log
   : > "$OS_T_REC"; OS_T_FRESH_EXTRA=$(printf '/b/y\troot:dev 2775\tdir')
-  out=$(private.os.platform.heal.compare.run "$p" dev.heal 2>&1); rc=$?
+  # in this shell, not in $( ): its RESULT is asserted; the output goes to a file
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
   [ "$rc" = 1 ] || bad="$bad differ-rc=$rc"
-  [ "$RESULT" = "compare on $p: rc 1" ] || case "$out" in *"compare on $p: rc 1"*) ;; *) bad="$bad differ-result" ;; esac
+  [ "$RESULT" = "compare on $p: rc 1" ] || bad="$bad differ-result=[$RESULT]"
   case "$out" in *"fresh only:  /b/y"*) ;; *) bad="$bad differ-unnamed=[$out]" ;; esac
   grep -q 'fresh only:  /b/y' "$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare-$p.log" || bad="$bad differ-not-logged"
   [ "$(tail -1 "$OS_T_REC")" = "cleanup 9022" ] || bad="$bad differ-no-cleanup"
