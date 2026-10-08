@@ -175,9 +175,7 @@ private.os.platform.users.install()     # <platform> # Phase A in the platform c
    echo 'no useradd/adduser available' >&2; exit 127
   fi
   echo bash-user:bash-user | sudo chpasswd # kernel-exception: pending P5
-  # kernel-exception: pending P5
-  sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers \
-   || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers' # kernel-exception: pending P5
+  sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers' # kernel-exception: pending P5
  " || {
   error.log "Failed to create bash-user on $platform"
  }
