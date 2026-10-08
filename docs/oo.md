@@ -513,7 +513,14 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
   the `sharedConfig`, the launcher `/usr/local/bin/this` (and, where the empty shell `env -i sh` has no `/usr/local/bin` on its PATH — BusyBox on Alpine — the link `/usr/bin/this` to it, `private.oo.launcher.link.get`), and `~/oosh` → `<base>/<branch>`, `~/config` →
   `sharedConfig` for each healed user. The canonical base is **built fresh** from origin, over HTTPS.
 - **Foreign folders are untouched and reported.** A `~/oosh` that points outside the base is relinked to the
-  base; the folder it pointed to is left alone, its git state reported (`[left] … untouched`).
+  base; the folder it pointed to is left alone, its git state reported (`[left] … untouched`). A foreign tree git
+  refuses to read for the healer (another owner, git's `safe.directory`) is never trusted and never called "not a
+  repository": `[left] <user> tree <dir>: foreign tree, left untouched (not probed: owned by <owner>, …)`.
+- **The base's folders are trusted before they are judged.** Before the diagnosis and again before the code step,
+  the heal trusts every branch folder under the base for the user it runs as (`private.oo.heal.base.trust` →
+  `ogit.safeDirectory.ensure <base>`, git's `safe.directory`; root's `~/.gitconfig` under `all`), so a clean clone
+  another user made (`oo checkout` as that user) is kept or fast-forwarded — as root it used to read "not a
+  repository" and was moved aside.
 - **A broken canonical folder is moved, never deleted.** A `main/` or `<branch>/` with a merge in progress,
   committed conflict markers, uncommitted changes, a detached HEAD, a diverged history, another branch
   checked out, or a symlink is moved whole to `<base>.aside/<name>.orig.<ts>` (a sibling of the base, never taken
@@ -1104,6 +1111,8 @@ Internal functions (not for direct use):
 | `private.oo.heal.root.need <base> <branch>` | What of the heal needs root, space-separated (`group-dev developking developking-home base launcher drop-in worktrees`); silent getter; `worktrees` alone does not stop a one-user heal |
 | `private.oo.heal.system.diagnose <base> <branch>` | Read-only lines of the system part (`[ok]`/`[heal]`/`[left]`); rc 1 when anything is not canonical |
 | `private.oo.heal.user.diagnose <user> <home> <base> <branch>` | Read-only lines of one home: `~/oosh` (canonical, foreign, worktree, plain-clone, plain-dir, none), `~/config`, old env formats, `.bashrc`, `~/.once`, legacy `ssh.*` folders, dead `safe.directory` entries, `mode-env.bash`, self-links, old backups |
+| `private.oo.heal.base.trust <base>` | Trusts every branch folder under `<base>` for the user the heal runs as (`ogit.safeDirectory.ensure`), so the gate judges a clone another user made as a repository; nothing when `<base>` does not exist |
+| `private.oo.heal.sudo.get <who>` | The sudo words the clean re-exec starts with: nothing as root or for one user; `sudo -H` after one `sudo -v` with a terminal, `sudo -n -H` without; rc 2 when no root; plain bash, silent getter |
 | `private.oo.heal.folder.gate <dir> <branch>` | What the heal does with a canonical folder: `missing`, `keep`, `fastforward`, `aside`, `worktree` or `occupied`; read-only, built on the same probes as the pull gate |
 | `private.oo.heal.folder.finish <dir>` | Finishes a folder the code step cloned or kept: root or its owner runs `ogit folder.finish`; anyone else only `ogit safeDirectory.add`, and a folder not shared with group `dev` is left with `ogit repo.share <dir>` (rc 1); rc 1 for a missing `<dir>` |
 | `private.oo.heal.folder.aside <dir>` | Moves a canonical folder, whole, to `<base>.aside/<name>.orig.<ts>` through `private.this.entry.aside`; never deletes; refuses the tree the heal runs from; `RESULT` = the new path |
