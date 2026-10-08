@@ -671,8 +671,8 @@ as_test() { if command -v runuser >/dev/null 2>&1; then runuser -u test -- env H
 g=$(stat -c %g "$B")
 mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || { rm -rf "$D"; fail "folder $D for test"; }
 # ogit-exception: the clone is made AS test, the way a user makes it with the old oo checkout; ogit would run as root.
-# The installed tree is not test's own (git: dubious ownership for test), so it is trusted on the command line for this one source.
-as_test git -c safe.directory="$src" clone -q "$src" "$D" || { rm -rf "$D"; fail "clone of $src into $D as test"; }
+# The installed tree is not test's own (git: dubious ownership for test), so it is trusted on the command line for this one source and its .git (a local clone's upload-pack runs inside the .git dir).
+as_test git -c safe.directory="$src" -c safe.directory="$src/.git" clone -q "$src" "$D" || { rm -rf "$D"; fail "clone of $src into $D as test"; }
 as_test git -C "$D" checkout -q -B "$H" || { rm -rf "$D"; fail "branch $H in $D"; }
 as_test git -C "$D" remote set-url origin "$url" || { rm -rf "$D"; fail "origin of $D"; }
 [ -z "$(rgit -C "$D" status --porcelain)" ] || { rm -rf "$D"; fail "$D is not clean"; }
