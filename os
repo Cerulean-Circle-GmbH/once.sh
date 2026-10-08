@@ -393,6 +393,11 @@ fail() { echo "breakage $N: FAILED — $*" >&2; exit 1; }
 # ogit-exception: inside the platform container, as root — the oosh there is the old ref under test; safe.directory for this call only
 rgit() { git -c safe.directory='*' -c user.email=heal-test@oosh.invalid -c user.name='oosh heal test' -c commit.gpgsign=false "$@"; }
 home_of() { awk -F: -v u="$1" '$1 == u { print $6; exit }' /etc/passwd; }
+# as_user <user> <cmd...>: the transport of private.os.platform.user.run from inside this root
+# script — runuser with the HOME of <user>, else (busybox: no runuser) sudo -H -u
+as_user() { _au=$1; shift; if command -v runuser >/dev/null 2>&1; then runuser -u "$_au" -- env HOME="$(home_of "$_au")" "$@"; else sudo -H -u "$_au" "$@"; fi; }
+# move_aside <path> <tag>: a link is removed, anything else there is moved to <path>.before-<tag>
+move_aside() { if [ -L "$1" ]; then rm -f "$1"; elif [ -e "$1" ]; then mv "$1" "$1.before-$2"; fi; }
 dh=$(home_of developking)
 bh=/home
 [ -n "$dh" ] && bh=${dh%/*}
@@ -437,7 +442,7 @@ private.os.platform.heal.breakage.script.get()     # <name> <branch> # echo the 
 h=$(home_of test); [ -n "$h" ] || fail "no user test"
 c="$h/config"
 if [ -d "$c" ] && [ ! -L "$c" ] && grep -q 'OOSH_MODE="mcdonges.latest"' "$c/user.env" 2>/dev/null; then say "already: $c is the era-B config"; exit 0; fi
-if [ -L "$c" ]; then rm -f "$c"; elif [ -e "$c" ]; then mv "$c" "$c.before-eraB"; fi
+move_aside "$c" eraB
 OOSH_HEAL_ARM
      private.os.platform.heal.fixture.script.get eraB.config '$c' || return 1
      cat <<'OOSH_HEAL_ARM'
@@ -453,7 +458,7 @@ r=$(home_of root); [ -n "$r" ] || fail "no root in /etc/passwd"
 if [ -d "$r/oosh/.git" ] && [ ! -L "$r/oosh" ]; then
   say "already: $r/oosh is a real clone"
 else
-  if [ -L "$r/oosh" ]; then rm -f "$r/oosh"; elif [ -e "$r/oosh" ]; then mv "$r/oosh" "$r/oosh.before-private-clone"; fi
+  move_aside "$r/oosh" private-clone
   clone_installed "$r/oosh" dev
   say "$r/oosh is a real clone of $(installed) on branch dev"
 fi
@@ -475,7 +480,7 @@ else echo 'export OOSH_MODE="oosh"' >> "$f"; say "OOSH_MODE=oosh added to $f"; f
 OOSH_HEAL_ARM
      ;;
    foreign.symlink)
-     # bash-user's ~/oosh -> a clone outside the base; its sums and a marker are recorded for private.os.platform.heal.foreign.check
+     # bash-user's ~/oosh -> a clone outside the base; its sums and a marker are recorded for private.os.platform.heal.foreign.check.script.get
      cat <<'OOSH_HEAL_ARM'
 u=$(home_of bash-user); [ -n "$u" ] || fail "no bash-user"
 f=/opt/foreign/OOSH/x
@@ -483,7 +488,7 @@ if [ -e "$f/.git" ]; then say "already: $f is a clone"; else clone_installed "$f
 if [ "$(readlink "$u/oosh" 2>/dev/null)" = "$f" ]; then
   say "already: $u/oosh -> $f"
 else
-  if [ -L "$u/oosh" ]; then rm -f "$u/oosh"; elif [ -e "$u/oosh" ]; then mv "$u/oosh" "$u/oosh.before-foreign"; fi
+  move_aside "$u/oosh" foreign
   ln -s "$f" "$u/oosh" && chown -h bash-user "$u/oosh" || fail "link $u/oosh"
   say "$u/oosh -> $f"
 fi
@@ -657,36 +662,36 @@ OOSH_HEAL_ARM
      # what a user makes on a healthy machine with the old `oo checkout <branch>`: <base>/<branch> a clean clone of the
      # branch, owned by test (group of the base, setgid), root has not trusted it (no safe.directory entry).
      # The heal must keep it. Not a folder arm to combine with the others: it rebuilds the folder (see the order comment of
-     # private.os.platform.heal.breakage.names.get). Record: HEAD, owner, inode, for private.os.platform.heal.user.clone.check.
+     # private.os.platform.heal.breakage.names.get). Record: HEAD, owner, inode, for private.os.platform.heal.user.clone.check.script.get.
      cat <<'OOSH_HEAL_ARM'
 REC=/opt/user.clone.heal.rec
 t=$(home_of test); [ -n "$t" ] || fail "no user test"
 if [ -d "$D/.git" ] && [ "$(stat -c %U "$D")" = test ] && [ -f "$REC" ]; then say "already: $D is a clone of test"; exit 0; fi
 src=$(installed) || fail "the user test has no installed ~/oosh to clone"
 url=$(rgit -C "$src" remote get-url origin) || fail "$src has no origin"
-# The user-run transport of private.os.platform.user.run for test, from inside root's script: runuser, else sudo -H -u.
-as_test() { if command -v runuser >/dev/null 2>&1; then runuser -u test -- env HOME="$t" "$@"; else sudo -H -u test "$@"; fi; }
 [ -e "$D" ] || [ -L "$D" ] && rm -rf "$D"
 # the empty folder the way the base gives it to a member of dev: owner test, group of the base, setgid (not recursive: it is empty)
 g=$(stat -c %g "$B")
 mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || { rm -rf "$D"; fail "folder $D for test"; }
+# From the installed tree, not from origin's $url: a clone of $url holds origin's default HEAD and every branch
+# of origin as remote-tracking refs, not the installed tree's — another shape for the heal, and the network in the arm.
 # ogit-exception: the clone is made AS test, the way a user makes it with the old oo checkout; ogit would run as root.
 # git ignores safe.directory from the command line for a local clone's upload-pack (it runs inside <src>/.git), so test's own
 # global config trusts the root-owned source for the clone and is put back right after.
 trust_drop() {
   # ogit-exception: test's ~/.gitconfig, put back as it was
-  as_test git config --global --unset-all safe.directory "^$src\$" 2>/dev/null
-  as_test git config --global --unset-all safe.directory "^$src/.git\$" 2>/dev/null
+  as_user test git config --global --unset-all safe.directory "^$src\$" 2>/dev/null
+  as_user test git config --global --unset-all safe.directory "^$src/.git\$" 2>/dev/null
   return 0
 }
 # ogit-exception: test's ~/.gitconfig trusts the source for the clone
-as_test git config --global --add safe.directory "$src" || { rm -rf "$D"; fail "trust of $src for test"; }
-as_test git config --global --add safe.directory "$src/.git" || { trust_drop; rm -rf "$D"; fail "trust of $src/.git for test"; }
+as_user test git config --global --add safe.directory "$src" || { rm -rf "$D"; fail "trust of $src for test"; }
+as_user test git config --global --add safe.directory "$src/.git" || { trust_drop; rm -rf "$D"; fail "trust of $src/.git for test"; }
 # ogit-exception: the clone as test
-as_test git clone -q "$src" "$D" || { trust_drop; rm -rf "$D"; fail "clone of $src into $D as test"; }
+as_user test git clone -q "$src" "$D" || { trust_drop; rm -rf "$D"; fail "clone of $src into $D as test"; }
 trust_drop
-as_test git -C "$D" checkout -q -B "$H" || { rm -rf "$D"; fail "branch $H in $D"; }
-as_test git -C "$D" remote set-url origin "$url" || { rm -rf "$D"; fail "origin of $D"; }
+as_user test git -C "$D" checkout -q -B "$H" || { rm -rf "$D"; fail "branch $H in $D"; }
+as_user test git -C "$D" remote set-url origin "$url" || { rm -rf "$D"; fail "origin of $D"; }
 [ -z "$(rgit -C "$D" status --porcelain)" ] || { rm -rf "$D"; fail "$D is not clean"; }
 # not trusted by root: no safe.directory entry for the folder in root's ~/.gitconfig
 r=$(home_of root)
@@ -986,21 +991,25 @@ private.os.platform.heal.second.run()     # <platform> <branch> # the second hea
    rcHeal=0; reports=" (left: reports only, install state 99)"
  fi
  private.os.platform.heal.snapshot.get "$platform" "$branch" > "$work/after"
- # The helpers of the idempotence invariant, sourced alone (its POSIX helpers
- # only) in a subshell: the file also sets globals of a test run
- # (TEST_CATEGORY, TEST_SHARED_TIER_WRITER), which must not reach this shell.
+ # The helpers of the idempotence invariant, sourced once, alone (its POSIX
+ # helpers only), in one subshell: the file also sets globals of a test run
+ # (TEST_CATEGORY, TEST_SHARED_TIER_WRITER), which must not reach this shell;
+ # the subshell hands its two answers back as files of $work.
  # Its acceptance too: result.env out (volatile.without), and a same-content
  # rewrite is a WARNING, not a failure — every oo heal ends in config init.env,
  # which writes the shared env files again (the invariant's own oo heal row).
  local unaccepted
- differences=$(TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
-   . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || { echo "no idempotence helpers in $OOSH_DIR/test"; exit 1; }
+ ( TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
+   if ! . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant"; then
+     echo "no idempotence helpers in $OOSH_DIR/test" | tee "$work/differences" > "$work/unaccepted"
+     exit 1
+   fi
    test.platform.shared.idempotence.volatile.without < "$work/before" > "$work/before.kept"
    test.platform.shared.idempotence.volatile.without < "$work/after" > "$work/after.kept"
-   test.platform.shared.idempotence.compare "$work/before.kept" "$work/after.kept")
- unaccepted=$(TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1
-   . "$OOSH_DIR/test/test.platform.shared.idempotence.invariant" || exit 1
-   printf '%s\n' "$differences" | grep . | test.platform.shared.idempotence.unaccepted rewritten)
+   test.platform.shared.idempotence.compare "$work/before.kept" "$work/after.kept" > "$work/differences"
+   grep . "$work/differences" | test.platform.shared.idempotence.unaccepted rewritten > "$work/unaccepted" )
+ differences=$(cat "$work/differences" 2>/dev/null)
+ unaccepted=$(cat "$work/unaccepted" 2>/dev/null)
  if [ "$rcHeal" = 0 ] && [ -z "$unaccepted" ]; then
    if [ -n "$differences" ]; then
      create.result 0 "second heal on $platform: rc 0$reports, no content change — WARNING, same-content rewrites (accepted as the idempotence invariant accepts them):
@@ -1021,19 +1030,14 @@ $unaccepted}"
 }
 
 
-private.os.platform.heal.foreign.check()     # <platform> # rc 0 when /opt/foreign in the platform container is as the breakage foreign.symlink recorded it: the same entries and file checksums (/opt/foreign.heal.sums) and nothing in it newer than /opt/foreign.heal.marker; prints every difference; rc 1 otherwise, also when nothing was recorded #
+private.os.platform.heal.foreign.check.script.get()     #  # echo the POSIX sh that checks, as root in a platform container, that /opt/foreign is as the breakage foreign.symlink recorded it: the same entries and file checksums (/opt/foreign.heal.sums) and nothing in it newer than /opt/foreign.heal.marker; prints every difference, rc 1 on any or when nothing was recorded; silent getter #
 {
- local platform="$1" preamble script
- if [ -z "$platform" ]; then
-   create.result 1 "private.os.platform.heal.foreign.check requires <platform>"
-   error.log "$RESULT"
-   return $(result)
- fi
+ # NO create.result — a getter consumed as $(...) by private.os.platform.heal.check.
  # The preamble for foreign_sums and say/fail; its branch plays no part here.
- preamble=$(private.os.platform.heal.remote.preamble.get main)
- script="N=foreign.check
-$preamble
-$(cat <<'OOSH_HEAL_FOREIGN'
+ local preamble
+ preamble=$(private.os.platform.heal.remote.preamble.get main) || return 1
+ printf "N='foreign.check'\n%s\n" "$preamble"
+ cat <<'OOSH_HEAL_FOREIGN'
 [ -f /opt/foreign.heal.sums ] && [ -f /opt/foreign.heal.marker ] || fail "nothing recorded — the breakage foreign.symlink was not applied"
 now=$(foreign_sums)
 rc=0
@@ -1047,18 +1051,13 @@ if [ -n "$newer" ]; then printf 'foreign written after the breakage: %s\n' $newe
 [ "$rc" = 0 ] && say "/opt/foreign is byte-identical, nothing in it is newer than its marker"
 exit "$rc"
 OOSH_HEAL_FOREIGN
-)"
- private.os.platform.root.script.run "$platform" sh "$script"
- local rc=$?
- create.result "$rc" "foreign check on $platform: rc $rc"
- return $rc
 }
 
 
 private.os.platform.heal.user.clone.check.script.get()     # <branch> # echo the POSIX sh that checks, as root in a platform container, that the clone the breakage user.clone made is kept: <base>/<branch> is there with the owner and the HEAD recorded in /opt/user.clone.heal.rec and no <base>.aside/<branch>.orig.* entry exists (a fast-forward of the HEAD is expected); prints every difference, rc 1 on any; silent getter, rc 1 for a bad <branch> #
 {
  # NO create.result — a getter consumed as $(...) by
- # private.os.platform.heal.user.clone.check and by its test, which points B
+ # private.os.platform.heal.check and by its test, which points B
  # and REC at a fixture. Raw POSIX sh for the same reason as the arms.
  local branch="$1" preamble
  preamble=$(private.os.platform.heal.remote.preamble.get "$branch") || return 1
@@ -1090,22 +1089,33 @@ OOSH_HEAL_USER_CLONE_CHECK
 }
 
 
-private.os.platform.heal.user.clone.check()     # <platform> <branch> # rc 0 when the clone the breakage user.clone made in the platform container is kept by the heal: <base>/<branch> with the recorded owner and HEAD and no <base>.aside/<branch>.orig.* entry (private.os.platform.heal.user.clone.check.script.get through private.os.platform.root.script.run); prints every difference; rc 1 otherwise, also when nothing was recorded #
+private.os.platform.heal.check()     # <platform> <name> <?args...> # run the check <name> of os platform.heal.test (foreign, user.clone) as root in the platform container: the POSIX sh of private.os.platform.heal.<name>.check.script.get <args...> through private.os.platform.root.script.run; prints every difference; rc of the check, rc 1 for a missing <platform> or <name>, an unknown check or arguments its getter refuses #
 {
- local platform="$1" branch="$2" script
- if [ -z "$platform" ] || [ -z "$branch" ]; then
-   create.result 1 "private.os.platform.heal.user.clone.check requires <platform> <branch>"
+ # One runner for every check of the scenario; a check is its script getter
+ # only (private.os.platform.heal.foreign.check.script.get,
+ # private.os.platform.heal.user.clone.check.script.get).
+ local platform="$1" name="$2" getter script
+ if [ -z "$platform" ] || [ -z "$name" ]; then
+   create.result 1 "private.os.platform.heal.check requires <platform> <name>"
    error.log "$RESULT"
    return $(result)
  fi
- if ! script=$(private.os.platform.heal.user.clone.check.script.get "$branch"); then
-   create.result 1 "private.os.platform.heal.user.clone.check: bad <branch> $branch"
+ shift 2
+ getter="private.os.platform.heal.$name.check.script.get"
+ case "$name" in *[!A-Za-z0-9.]*|.*|*.) getter="" ;; esac
+ if [ -z "$getter" ] || ! declare -F "$getter" >/dev/null; then
+   create.result 1 "private.os.platform.heal.check: no check '$name' (foreign, user.clone)"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ if ! script=$("$getter" "$@"); then
+   create.result 1 "private.os.platform.heal.check: the $name check refuses its arguments: $*"
    error.log "$RESULT"
    return $(result)
  fi
  private.os.platform.root.script.run "$platform" sh "$script"
  local rc=$?
- create.result "$rc" "user.clone check on $platform: rc $rc"
+ create.result "$rc" "$name check on $platform: rc $rc"
  return $rc
 }
 
@@ -1297,14 +1307,14 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  case " $breakages " in
    *" foreign.symlink "*)
      foreignLog=$(private.os.platform.heal.log.get foreign "$platform")
-     private.os.platform.heal.foreign.check "$platform" 2>&1 | tee "$foreignLog"
+     private.os.platform.heal.check "$platform" foreign 2>&1 | tee "$foreignLog"
      rcForeign=${PIPESTATUS[0]} ;;
  esac
  # user.clone: the healthy clone a user made must still be there, as it was
  case " $breakages " in
    *" user.clone "*)
      userCloneLog=$(private.os.platform.heal.log.get user-clone "$platform")
-     private.os.platform.heal.user.clone.check "$platform" "$healBranch" 2>&1 | tee "$userCloneLog"
+     private.os.platform.heal.check "$platform" user.clone "$healBranch" 2>&1 | tee "$userCloneLog"
      rcUserClone=${PIPESTATUS[0]} ;;
  esac
 

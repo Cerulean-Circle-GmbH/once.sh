@@ -508,12 +508,19 @@ test.os.healBreakageNames() {
   # user.clone is the last name (it rebuilds <base>/<branch> and cannot stand with the other folder arms)
   [ "$(printf '%s\n' "$names" | tail -n 1)" = user.clone ] || bad="$bad user.clone-not-last"
   script=$(private.os.platform.heal.breakage.script.get user.clone dev.heal)
-  case "$script" in *"-u test"*" clone -q"*) ;; *) bad="$bad user.clone-not-cloned-by-test" ;; esac
+  case "$script" in *'as_user test git clone -q'*) ;; *) bad="$bad user.clone-not-cloned-by-test" ;; esac
   case "$script" in *"/opt/user.clone.heal.rec"*) ;; *) bad="$bad user.clone-no-record" ;; esac
-  case "$script" in *'as_test git config --global --add safe.directory "$src" '*'as_test git config --global --add safe.directory "$src/.git" '*'as_test git clone -q "$src" "$D"'*) ;; *) bad="$bad user.clone-source-not-trusted-in-test-config" ;; esac
+  case "$script" in *'as_user test git config --global --add safe.directory "$src" '*'as_user test git config --global --add safe.directory "$src/.git" '*'as_user test git clone -q "$src" "$D"'*) ;; *) bad="$bad user.clone-source-not-trusted-in-test-config" ;; esac
   case "$script" in *'--unset-all safe.directory "^$src'*'--unset-all safe.directory "^$src/.git'*) ;; *) bad="$bad user.clone-trust-not-put-back" ;; esac
-  case "$script" in *"as_test git -c"*) bad="$bad user.clone-command-line-trust" ;; esac
+  case "$script" in *"as_user test git -c"*) bad="$bad user.clone-command-line-trust" ;; esac
   case "$script" in *'rm -rf "$D"'*'|| { rm -rf "$D"; fail'*) ;; *) bad="$bad user.clone-leaves-folder-on-failure" ;; esac
+  # one transport and one move-aside, both of the preamble: no arm has its own
+  case "$script" in *"as_test"*|*"runuser -u test"*|*"sudo -H -u test"*) bad="$bad user.clone-own-transport" ;; esac
+  for n in eraB.config:'move_aside "$c" eraB' root.clone:'move_aside "$r/oosh" private-clone' foreign.symlink:'move_aside "$u/oosh" foreign'; do
+    script=$(private.os.platform.heal.breakage.script.get "${n%%:*}" dev.heal)
+    case "$script" in *"${n#*:}"*) ;; *) bad="$bad no-move-aside:${n%%:*}" ;; esac
+    case "${script#*"$preamble"}" in *".before-"*) bad="$bad own-move-aside:${n%%:*}" ;; esac
+  done
   # all is every name but user.clone: its folder is rebuilt, the other folder arms would break it again
   want=$(printf '%s\n' "$names" | grep -vxF user.clone | tr '\n' ' '); want="${want% }"
   private.os.platform.heal.breakage.list.get >/dev/null 2>&1; [ "$RESULT" = "$want" ] || bad="$bad default=[$RESULT]"
@@ -534,6 +541,37 @@ test.os.healBreakageNames() {
 test.case $level "T-OS-HEAL-BREAKAGE-NAMES: every breakage maps to an arm, all expands to the full list, an unknown name is refused" test.os.healBreakageNames
 expect 0 "18 breakages, each its own POSIX sh arm; all is every one but user.clone in the order of application; unknown names refused" \
   "the scenario test needs the real machines' shapes, each reproducible on its own"
+
+# T-OS-HEAL-PRELUDE-HELPERS: the helpers every arm gets from the preamble, run under sh on a
+# fixture. as_user <user> <cmd...>: runuser with the HOME of <user> from /etc/passwd where
+# runuser exists, else sudo -H -u (the transport of private.os.platform.user.run, from inside a
+# root script); stubs print the call. move_aside <path> <tag>: a link is removed, an entry is
+# moved to <path>.before-<tag>, nothing there is left alone.
+test.os.healPreludeHelpers() {
+  local fx bad="" preamble out
+  fx=$(test.suite.fixture.make healprelude)
+  mkdir -p "$fx/bin"; ln -s "$(command -v awk)" "$fx/bin/awk"
+  preamble=$(private.os.platform.heal.remote.preamble.get dev.heal) || bad="$bad no-preamble"
+  out=$(printf '%s\n%s\n' "$preamble" 'runuser() { echo "runuser $*"; }; PATH="'"$fx/bin"'"; as_user root echo hi' | sh 2>&1)
+  [ "$out" = "runuser -u root -- env HOME=$(awk -F: '$1 == "root" { print $6; exit }' /etc/passwd) echo hi" ] || bad="$bad runuser=[$out]"
+  out=$(printf '%s\n%s\n' "$preamble" 'sudo() { echo "sudo $*"; }; PATH="'"$fx/bin"'"; as_user root echo hi' | sh 2>&1)
+  [ "$out" = "sudo -H -u root echo hi" ] || bad="$bad sudo=[$out]"
+  mkdir -p "$fx/d" "$fx/t"; : > "$fx/t/kept"; ln -s "$fx/t" "$fx/l"
+  out=$(printf '%s\n%s\n' "$preamble" "move_aside '$fx/l' x && move_aside '$fx/d' x && move_aside '$fx/none' x && echo ok" | sh 2>&1)
+  [ "$out" = ok ] || bad="$bad move-aside-rc=[$out]"
+  [ -e "$fx/l" ] || [ -L "$fx/l" ] && bad="$bad link-left"
+  [ -f "$fx/t/kept" ] || bad="$bad link-target-touched"
+  [ -d "$fx/d.before-x" ] && [ ! -e "$fx/d" ] || bad="$bad entry-not-moved"
+  [ -e "$fx/none.before-x" ] && bad="$bad nothing-moved"
+  printf '%s\n' "$preamble" | sh -n 2>/dev/null || bad="$bad sh-n"
+  if command -v dash >/dev/null 2>&1; then printf '%s\n' "$preamble" | dash -n 2>/dev/null || bad="$bad dash-n"; fi
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "as_user through runuser with the user's HOME, else sudo -H -u; move_aside removes a link and moves an entry to .before-<tag>" || create.result 1 "prelude helpers:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-PRELUDE-HELPERS: the arm prelude's as_user and move_aside, run under sh with stubs" test.os.healPreludeHelpers
+expect 0 "as_user through runuser with the user's HOME, else sudo -H -u; move_aside removes a link and moves an entry to .before-<tag>" \
+  "one transport and one move-aside for every breakage arm"
 
 # T-OS-HEAL-FIXTURE-SCRIPT: a fixture folder or file travels as quoted here-documents and
 # arrives byte for byte — $HOME, backticks and quotes in it are not expanded.
@@ -722,7 +760,7 @@ test.os.healRemoteScripts() {
   private.os.platform.heal.snapshot.get p >/dev/null 2>&1 && bad="$bad snapshot-no-branch-accepted"
   : > "$OS_T_REC"
   ossh() { echo "ossh $*" >> "$OS_T_REC"; }
-  private.os.platform.heal.foreign.check p >/dev/null 2>&1 || bad="$bad foreign-rc"
+  private.os.platform.heal.check p foreign >/dev/null 2>&1 || bad="$bad foreign-rc"
   rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
   case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad foreign-not-root-sh" ;; esac
   encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
@@ -730,7 +768,22 @@ test.os.healRemoteScripts() {
   printf '%s\n' "$got" | sh -n 2>/dev/null || bad="$bad foreign-sh-n"
   case "$got" in *"/opt/foreign.heal.sums"*"-newer /opt/foreign.heal.marker"*) ;; *) bad="$bad foreign-not-sums-and-marker" ;; esac
   case "$got" in *"-newer /opt/foreign.heal.marker ! -path '*/.git/index' ! -path '*/.git'"*) ;; *) bad="$bad foreign-newer-counts-git-cache" ;; esac
-  private.os.platform.heal.foreign.check >/dev/null 2>&1 && bad="$bad foreign-no-platform-accepted"
+  private.os.platform.heal.check >/dev/null 2>&1 && bad="$bad check-no-platform-accepted"
+  private.os.platform.heal.check p >/dev/null 2>&1 && bad="$bad check-no-name-accepted"
+  # one runner for every check: the user.clone check is its script getter's text, as root in sh
+  : > "$OS_T_REC"
+  private.os.platform.heal.check p user.clone dev.heal >/dev/null 2>&1 || bad="$bad user-clone-rc"
+  case "$RESULT" in "user.clone check on p: rc 0") ;; *) bad="$bad user-clone-result=[$RESULT]" ;; esac
+  rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
+  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad user-clone-not-root-sh" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  [ "$(printf '%s' "$encoded" | base64 -d)" = "$(private.os.platform.heal.user.clone.check.script.get dev.heal)" ] || bad="$bad user-clone-not-its-getter"
+  # an unknown check, a bad name or a bad argument of the getter never reaches ossh
+  : > "$OS_T_REC"
+  private.os.platform.heal.check p no.such >/dev/null 2>&1 && bad="$bad unknown-check-accepted"
+  private.os.platform.heal.check p 'user.clone;x' >/dev/null 2>&1 && bad="$bad bad-name-accepted"
+  private.os.platform.heal.check p user.clone -x >/dev/null 2>&1 && bad="$bad bad-branch-accepted"
+  grep -q '^ossh ' "$OS_T_REC" && bad="$bad refused-check-reached-ossh"
   test.os.stubs.unset
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "snapshot as root in bash with the invariant's helper, noise and \\r dropped; foreign check as root in sh against the recorded sums and marker" || create.result 1 "remote scripts:$bad"
@@ -778,6 +831,8 @@ test.os.healSecondRun() {
   OS_T_SNAP_AFTER="/b	1/1	1 1"; OS_T_HEAL_RC=1
   private.os.platform.heal.second.run p dev.heal >/dev/null 2>&1; [ $? = 1 ] || bad="$bad heal-rc1-accepted"
   [ -z "${TEST_SHARED_TIER_WRITER+x}" ] || bad="$bad invariant-globals-leaked"
+  # the idempotence invariant's helpers are sourced once, in one subshell
+  [ "$(declare -f private.os.platform.heal.second.run | grep -c '\. "$OOSH_DIR/test/test.platform.shared.idempotence.invariant"')" = 1 ] || bad="$bad invariant-sourced-more-than-once"
   rm -f "$(private.os.platform.heal.log.get second-heal p)"
   test.os.stubs.unset
   unset OS_T_SNAP_N OS_T_HEAL_RC OS_T_SNAP_AFTER
@@ -880,8 +935,13 @@ test.os.healTest.stubs.set() {
   private.os.platform.shared.config.repair() { echo "repair" >> "$OS_T_REC"; }
   private.os.platform.user.run()         { echo "user.run $2 $3" >> "$OS_T_REC"; return 0; }
   private.os.platform.heal.second.run()  { echo "second $*" >> "$OS_T_REC"; return 0; }
-  private.os.platform.heal.foreign.check() { echo "foreign $*" >> "$OS_T_REC"; return 0; }
-  private.os.platform.heal.user.clone.check() { echo "user-clone $*" >> "$OS_T_REC"; return "${OS_T_USERCLONE_RC:-0}"; }
+  private.os.platform.heal.check() {
+    case "$2" in
+      foreign)    echo "foreign $1" >> "$OS_T_REC"; return 0 ;;
+      user.clone) echo "user-clone $1 $3" >> "$OS_T_REC"; return "${OS_T_USERCLONE_RC:-0}" ;;
+    esac
+    return 9
+  }
   private.os.platform.ref.branch.drop()  { echo "drop $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.cleanup()          { echo "cleanup $*" >> "$OS_T_REC"; }
   ogit.status.check()                    { return "${OS_T_DIRTY:-0}"; }

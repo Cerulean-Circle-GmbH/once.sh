@@ -135,13 +135,13 @@ native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<brea
    WARNING, exactly as the idempotence invariant accepts them: the comparison goes through the invariant's own
    helpers (`test.platform.shared.idempotence.volatile.without`, which also leaves `result.env` out, and
    `.compare` / `.unaccepted`). Any other difference fails and is printed.
-10. The foreign check (`private.os.platform.heal.foreign.check`, only when `foreign.symlink` ran): `/opt/foreign`
+10. The foreign check (`private.os.platform.heal.check <platform> foreign`, only when `foreign.symlink` ran): `/opt/foreign`
     has the same entries and checksums and nothing newer than the marker; git's stat cache `.git/index` is
     ignored (a `git status` refreshes it without changing a byte of the tree).
 11. The verdict line `PASS: heal <platform> <oldRef> (breakages=<rc> heal=<rc> verify=<n> [pipe=<rc>] test=<rc>
-    root=<rc> oosh-user=<rc> bash-user=<rc> idempotence=<rc> second-heal=<rc> foreign=<rc|skipped>)` or `FAIL:` with
+    root=<rc> oosh-user=<rc> bash-user=<rc> idempotence=<rc> second-heal=<rc> foreign=<rc|skipped> [user-clone=<rc>])` or `FAIL:` with
     the first FAIL lines of the logs. PASS needs `breakages=0`, `heal` 0 or 1 (rc ≥ 2 fails), `verify=0` (the count
-    of red verify lines), `pipe` 0 when run, and 0 for every other field (`foreign` may be `skipped`). Then
+    of red verify lines), `pipe` and `user-clone` 0 when run, and 0 for every other field (`foreign` may be `skipped`). Then
     `private.os.platform.ref.branch.drop` deletes a `platform-test-*` branch on origin (as `refs/heads/<name>`, so a
     tag of the same name is left standing; any other branch is left alone) and, unless `terminal`, the container is
     removed. On PASS the logs are removed too.
@@ -150,6 +150,21 @@ native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<brea
 (`private.os.platform.heal.breakage.names.get`). Each is an idempotent POSIX sh arm run as root
 (`private.os.platform.heal.breakage.script.get`): it looks first, says `already` and changes nothing when its
 shape is there. The container is disposable, so an arm may delete.
+
+**The arm prelude** (`private.os.platform.heal.remote.preamble.get`): every arm, check and snapshot starts with
+the same POSIX sh text, so no arm carries its own copy of these helpers:
+
+- `say` / `fail` — the arm's line, and its exit 1;
+- `rgit` — git with `safe.directory=*` and a test identity for this call only;
+- `home_of <user>` — the home from `/etc/passwd`;
+- `as_user <user> <cmd...>` — the transport of `private.os.platform.user.run` from inside the root script: `runuser` with the user's HOME, else `sudo -H -u` (busybox has no `runuser`);
+- `move_aside <path> <tag>` — a link is removed, anything else is moved to `<path>.before-<tag>`;
+- `installed`, `clone_installed <dir> <branch>`, `branch_dir_ensure` — the installed tree of `test`, a clone of it, the canonical folder `<base>/<branch>` as such a clone;
+- `foreign_sums` — the entries and checksums of `/opt/foreign` (its `.git/index` left out).
+
+**The checks** are script getters, `private.os.platform.heal.<name>.check.script.get <args...>`
+(`foreign`, `user.clone <branch>`), run by one runner, `private.os.platform.heal.check <platform> <name> <args...>`,
+as root through `private.os.platform.root.script.run`; its RESULT is `<name> check on <platform>: rc <rc>`.
 
 | Name | What it does | Where |
 |---|---|---|
@@ -174,15 +189,6 @@ shape is there. The container is disposable, so an arm may delete.
 
 **What a PASS still shows as `[left]`.** These are reports, not failures, and they stand on every heal (the second one too): root's legacy `ssh.*` folders (`ssh.backup.migrate` moves them; the heal never does), the old-format `user.env` values of a real `~/config` that are never carried over, foreign trees left untouched (`foreign.symlink`), and a canonical folder moved aside to `<base>.aside/<name>.orig.<ts>` for you to look at.
 
-**Results so far.** ubuntu_24_04, 2026-10-07: `dev eraB.config` PASS, `dev foreign.symlink` PASS, `51d7fb3 all pipe` PASS. After the Linux gates, 2026-10-08:
-
-| Platform | Ref | Result | What the gate taught |
-|---|---|---|---|
-| debian_12 | 51d7fb3 | PASS | bash 5.1 cannot parse a `{ case` with a bare pattern inside `$( … )`: `portability.validate` refuses it (`private.test.suite.case.comsub.is`) |
-| almalinux_9 | 51d7fb3 | PASS | `oo heal all` heals people only: the system account `operator` (uid 11, `/sbin/nologin`, home `/root`) is `[skip]`, not healed (`private.user.account.heals.is`) |
-| alpine_3_19 | 51d7fb3 | PASS | BusyBox's empty-shell PATH lacks `/usr/local/bin`: the launcher gets the link `/usr/bin/this` (`private.oo.launcher.link.get`); its `setsid` knows no `-w`, so the no-tty probe uses `setsid -w` only where it exists |
-| ubuntu_24_04 | 26d15a4 | PASS | `config init.env`'s guard judges a loss by variable name over user/oosh/log `.env` and skips the never-persist names (`private.config.variable.persisted.is`: `OOSH_APT_UPDATED`, `OOSH_CLEAN_ENV`); the heal's env note carries its reason |
-
 **The transport** (`private.os.platform.user.run`): `runuser` gets `env HOME=~<user>` (it keeps the caller's environment, so HOME would stay the ssh login's), root runs through `sudo -H`, and every command starts with `unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND` — `ogit.folder.finish` in the gates' fixtures trusts folders for `$SUDO_USER`, which filled the login's `.gitconfig`.
 
 **Who moves.** Under `oo heal <branch> all` only the healer and the login that ran sudo move to `<branch>` (`private.oo.heal.user.keep.check`); `oosh-user`, `bash-user` and `developking` keep their installed branch, so a check of the scenario must not expect them on `<branch>`.
@@ -192,7 +198,7 @@ clones it again from the installed tree and commits on it; `markers.committed` c
 leaves a merge in progress; `dirty` changes a file the merge does not touch. `user.clone` stands apart: it rebuilds
 the folder as a healthy clone owned by `test`, so it comes last, is **left out of `all`** (name it to run it) and
 is refused together with `missing.branch`, `diverged`, `markers.committed`, `merge.conflict`, `dirty` or `detached`
-(`private.os.platform.heal.breakage.list.get`). After the second heal `private.os.platform.heal.user.clone.check`
+(`private.os.platform.heal.breakage.list.get`). After the second heal `private.os.platform.heal.check <platform> user.clone <branch>`
 fails the run (`user-clone=1` in the verdict line, log step `user-clone`) when that clone was moved aside or its
 owner changed or the HEAD is no fast-forward of the record. The fixture files travel as text
 inside the one script (`private.os.platform.heal.fixture.script.get`, `private.os.platform.root.script.run`).
