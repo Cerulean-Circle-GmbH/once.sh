@@ -212,22 +212,29 @@ reason.
   `git clone -b <branch> $OOSH_REPO` (default: the public HTTPS URL) goes into `t` beneath it, reading
   `/dev/null`; then `chmod -R go+rX` on it, so another user's hop can read it. For `all` the folder is
   always under `/tmp`, because every user's hop must reach it. The clone is **never** `~/oosh`.
-- **`OOSH_REPO` is handed over with `env`** (`env OOSH_REPO=… bash <clone>/oo heal …`), because `sudo` resets
-  the environment and a plain assignment would be lost.
-- **`all` runs under `sudo -H`** when the caller is not root; with no `sudo` installed the arm dies naming
-  it (`'all' heals every user as root — run it as root, or install sudo`).
-- **No terminal, no prompt.** When `/dev/tty` cannot be opened (a script, CI, a container exec without `-t`),
-  `heal all` needs root or **passwordless sudo**: the arm tests `sudo -n true` and, if it fails, ends with
-  **rc 2 before anything is cloned** (`heal all needs root — run as root or with passwordless sudo`); otherwise
-  the child runs under `sudo -n -H`. With a terminal the plain `sudo -H` may ask once.
+- **No sudo in the arm — `all` included.** The arm runs `env OOSH_REPO=… bash <clone>/oo heal <branch> <who>`
+  as the caller. Root is the clone's decision, made **once**: its `oo heal` (`private.oo.heal.env.clean`) knows
+  the clone by its temp layout (`private.oo.heal.temp.tree.check`), makes no second copy, and for `all` as a
+  user starts its one clean process through `private.oo.heal.sudo.get` — `sudo -H` after one password prompt
+  with a terminal, `sudo -n -H` without one. When root cannot be had it ends with **rc 2 before anything
+  runs** and names the curl form run as root (`curl -fsSL <init/oosh> | sudo sh -s -- heal <branch> all`;
+  the clone itself is gone when the arm ends). The privilege rule is written once, in
+  [oo.md § The privilege rule](oo.md). Before, the arm repeated that decision itself (`sudo -n true || sudo -v`,
+  then `sudo -H bash <clone>/oo heal …`). Guarded by **T-INIT-HEAL-ARM-HANDOVER-NO-SUDO** and
+  **T-OO-HEAL-ARM-TREE-NO-COPY**.
 - **stdin.** In the pipe form stdin *is* the script, so the child must never read it: it reads `/dev/tty`
-  when there is a terminal (so it can ask for the sudo password), else `/dev/null`.
+  when there is a terminal (so its `oo heal` can ask for the sudo password), else `/dev/null` — and then
+  only `sudo -n` is tried (**T-INIT-HEAL-ARM-NO-TTY**).
 - **The non-interactive flags travel.** `OOSH_HEAL_NONINTERACTIVE` and `OOSH_NO_INSTALL` are handed to the
-  child with `env`, like `OOSH_REPO`, so they survive `sudo`'s environment reset.
+  child with `env`, like `OOSH_REPO`; the clean process of `oo heal` keeps them.
 - **The child's rc is kept** (`exit "$_hr"`): 0 healed, 1 something is left for you, 2 cannot heal.
-- **The cleanup never prompts.** The sudo timestamp may have expired during the heal, so the temp clone is removed
-  with `sudo -n rm -rf` when the heal ran under sudo, else as the user; when neither works the arm says
-  `remove <dir> yourself` and still exits with the child's rc.
+- **One owner of the cleanup: the clean process.** A clone under `/tmp` (always for `all`) is removed by the
+  clean process itself when it exits (`private.oo.heal.copy.trap`, the same matcher) — as root under sudo, so
+  no second sudo is needed. The arm's `rm -rf` afterwards is only the **fallback**: for a run that never
+  reached the clean process (rc 2 before it) and for a one-user clone under a `$TMPDIR` outside `/tmp` (the
+  clean process runs under `env -i` without `TMPDIR`). It is tried as the user, then, for `all`, with
+  `sudo -n` — never a prompt; when neither works the arm says `remove <dir> yourself` and still exits with
+  the child's rc.
 
 The child is `oo heal` of the clone, which re-runs itself once in a clean process (`env -i`).
 
@@ -235,7 +242,7 @@ The child is `oo heal` of the clone, which re-runs itself once in a clean proces
 all-or-nothing and has to live in the one file the curl form fetches. Its block says why on the line after
 `# BEGIN healArm` (`# size-exception: …`) and **leaves the count**; a block without that reason line counts
 fully (`homeRecovery`, `cleanEnv` and `brokenTree` count). **T-INIT-SIZE-CAP** prints both numbers —
-now `init/oosh is 720 lines, 691 counted (cap 700; 29 lines in size-exception blocks)`. The count is the awk pass of `test.install.sizeCapCheck`: every `# BEGIN <name>` whose next line is a non-empty `# size-exception:` reason, through its `# END <name>`, markers included, leaves the 720 raw lines (`healArm` and `healArgs` are such blocks).
+now `init/oosh is 715 lines, 691 counted (cap 700; 24 lines in size-exception blocks)`. The count is the awk pass of `test.install.sizeCapCheck`: every `# BEGIN <name>` whose next line is a non-empty `# size-exception:` reason, through its `# END <name>`, markers included, leaves the 715 raw lines (`healArm` and `healArgs` are such blocks).
 
 ## The `brokenTree` check
 
