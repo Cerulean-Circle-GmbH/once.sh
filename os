@@ -1760,7 +1760,10 @@ private.os.platform.heal.compare.snapshot.script.get()     # <branch> # echo the
  # run the oosh of it. One line per fact, <path or fact> TAB <owner:group
  # mode or -> TAB <content>, sorted, the host name masked as <host>; a file
  # of values (env, ssh config, .gitconfig, .once, the state machine files)
- # is one line per value. Left out, as the idempotence invariant leaves them
+ # is one line per value. The base is read as an install makes it: the base
+ # itself, main/ and <branch>/ — another folder there is what a user or an
+ # old install kept, no install shape.
+ # Left out, as the idempotence invariant leaves them
  # out: log files and result.env (rewritten by every oosh call). Left out by
  # scope: <base>.aside and the *.orig.* entries — what the heal kept of the
  # old install, which a fresh install never had. Key material generated per
@@ -1796,14 +1799,14 @@ SYSTEM='/usr/local/bin/this /usr/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot'
 DKH=$(home_of developking)
 echo OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN
 {
-level "$B"
+entry "$B"
 level "$B/main"
 level "$D"
 level "$S"
 level "$S/stateMachines"
 for p in $SYSTEM; do entry "$p"; done
 tree "$bh/shared/.ssh" 2
-for d in "$B"/*; do
+for d in "$B/main" "$D"; do
   [ -e "$d/.git" ] || continue
   printf 'origin of %s\t-\t%s\n' "$d" "$(rgit -C "$d" config --get remote.origin.url)"
   printf 'branch of %s\t-\t%s\n' "$d" "$(rgit -C "$d" symbolic-ref -q --short HEAD || echo detached)"

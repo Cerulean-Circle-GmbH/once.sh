@@ -1396,6 +1396,7 @@ test.os.healExpectFixture() { # <dir> # build the healed fixture machine under <
   printf 'github.com ssh-ed25519 AAAA\n' > "$fx/home/shared/.ssh/known_hosts"
   ln -s "$fx/home/root/oosh/init" "$fx/home/root/init"
   printf '#!/bin/sh\n' > "$fx/bin/this"; chmod 755 "$fx/bin/this"; ln -s "$fx/bin/this" "$fx/bin/this2"
+  "${g[@]}" init -q -b old "$B/platform-test-old"   # a folder an old install or a user kept: no install shape
   printf 'SETUP_SERVER_STATE_ID=99\nSETUP_SERVER_CUSTOM_SCRIPT=oo\n' > "$S/stateMachines/SETUP_SERVER.states.env"
   # the aside entry the heal made of the broken folder: every marker of the folder arms
   d="$B.aside/dev.heal.orig.20261008-120000"
@@ -1783,6 +1784,7 @@ test.os.healCompareSnapshot() {
   case "$out" in *fixturehost*) bad="$bad host-not-masked" ;; esac
   case "$out" in *result.env*|*install.log*|*.orig.*|*"a comment"*) bad="$bad volatile-kept" ;; esac
   case "$out" in *secret*) bad="$bad key-material" ;; esac
+  case "$out" in *platform-test-old*) bad="$bad kept-folder-listed" ;; esac
   [ "$(printf '%s\n' "$out" | grep -c 'known_hosts	-	github.com$')" = 1 ] || bad="$bad known-hosts-not-one-host"
   [ "$out" = "$(printf '%s\n' "$out" | LC_ALL=C sort -u)" ] || bad="$bad not-sorted"
   # a bad branch is refused
