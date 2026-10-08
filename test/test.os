@@ -1641,6 +1641,25 @@ test.case $level "T-OS-HEAL-ARM-TWINS: owner_of, gid_of, inode_of and an as_user
 expect 0 "owner_of, gid_of and inode_of agree with ls and id; as_user does not read stdin" \
   "item 5: a command run as a user inside the root script read the script itself"
 
+# T-OS-HEAL-HOME-OF-DSCL: home_of reads /etc/passwd, else the directory service — macOS keeps its
+# users in dscl, so the arms the macOS workflow runs find test and developking (and the base under
+# the home of developking) there; one text on every platform, a fallback on a missing value, no fork.
+test.os.healHomeOfDscl() {
+  local bad="" preamble out
+  preamble=$(private.os.platform.heal.remote.preamble.get dev.heal)
+  out=$(printf '%s\n%s\n' "$preamble" 'dscl() { [ "$3" = /Users/macuser ] && [ "$4" = NFSHomeDirectory ] && echo "NFSHomeDirectory: /Users/macuser"; }; home_of macuser' | sh 2>&1)
+  [ "$out" = /Users/macuser ] || bad="$bad dscl=[$out]"
+  out=$(printf '%s\n%s\n' "$preamble" 'dscl() { echo "NFSHomeDirectory: /wrong"; }; home_of root' | sh 2>&1)
+  [ "$out" = "$(awk -F: '$1 == "root" { print $6; exit }' /etc/passwd)" ] || bad="$bad passwd-first=[$out]"
+  out=$(printf '%s\n%s\n' "$preamble" 'dscl() { return 1; }; home_of nosuchuser.heal' | sh 2>&1)
+  [ -z "$out" ] || bad="$bad missing-user=[$out]"
+  [ -z "$bad" ] && create.result 0 "passwd first, the directory service for a user passwd does not hold, nothing for no user" || create.result 1 "home_of:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-HOME-OF-DSCL: the arm prelude finds a user in the directory service when passwd does not hold it" test.os.healHomeOfDscl
+expect 0 "passwd first, the directory service for a user passwd does not hold, nothing for no user" \
+  "macOS keeps its users in dscl: the arms of the macOS workflow found no home and no base"
+
 # T-OS-CLEANUP-ODOCKER: the container on a port is found and removed through odocker only: the list
 # of odocker.container.list names it by its published port, odocker.stop and odocker.container.remove
 # end it; no docker call of os.

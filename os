@@ -392,7 +392,8 @@ say()  { echo "breakage $N: $*"; }
 fail() { echo "breakage $N: FAILED — $*" >&2; exit 1; }
 # ogit-exception: inside the platform container, as root — the oosh there is the old ref under test; safe.directory for this call only
 rgit() { git -c safe.directory='*' -c user.email=heal-test@oosh.invalid -c user.name='oosh heal test' -c commit.gpgsign=false "$@"; }
-home_of() { awk -F: -v u="$1" '$1 == u { print $6; exit }' /etc/passwd; }
+# home_of: /etc/passwd, else the directory service (macOS keeps its users in dscl, not in /etc/passwd) — a value, the same text on every platform
+home_of() { _ho=$(awk -F: -v u="$1" '$1 == u { print $6; exit }' /etc/passwd); [ -n "$_ho" ] || _ho=$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{ print $2 }'); echo "$_ho"; } # kernel-exception: POSIX sh of the disposable-container arm, dscl is the macOS directory read
 # as_user <user> <cmd...>: the transport of private.os.platform.user.run from inside this root
 # script — runuser with the HOME of <user>, else (busybox: no runuser) sudo -H -u
 # stdin is closed: a command run as a user must never read the rest of the script this root shell is reading
@@ -480,7 +481,7 @@ else
 fi
 f="$r/config/oosh.session.env"
 if grep -qx 'export OOSH_MODE="oosh"' "$f" 2>/dev/null; then say "already: OOSH_MODE=oosh in $f"
-elif grep -q '^export OOSH_MODE=' "$f" 2>/dev/null; then sed -i 's/^export OOSH_MODE=.*/export OOSH_MODE="oosh"/' "$f"; say "OOSH_MODE=oosh in $f"
+elif grep -q '^export OOSH_MODE=' "$f" 2>/dev/null; then sed 's/^export OOSH_MODE=.*/export OOSH_MODE="oosh"/' "$f" > "$f.heal" && cat "$f.heal" > "$f" && rm -f "$f.heal"; say "OOSH_MODE=oosh in $f"
 else echo 'export OOSH_MODE="oosh"' >> "$f"; say "OOSH_MODE=oosh added to $f"; fi
 OOSH_HEAL_ARM
      ;;
