@@ -411,8 +411,8 @@ answer by rc):
 | `private.this.orig.stamp.get <dir> <names...>` | echo a `YYYYmmdd-HHMMSS` stamp for which `<dir>/<name>.orig.<stamp>` is free for every name, bumped with `-<n>` when taken; silent getter, rc 1 on missing arguments — the one stamp behind every "keep it as `<name>.orig.<ts>`" |
 | `private.this.orig.stamp.free.get <dir> <base> <names...>` | echo `<base>`, bumped with `-<n>` until `<dir>/<name>.orig.<stamp>` is free for every name (a dangling symlink counts as taken); silent getter — the one bump loop both the stamp getter and `symlink.with.backup` end in |
 | `private.this.dir.ensure <dir> <?group> <?mode> <?owner>` | create only the missing path segments of `<dir>`, from the first existing ancestor down, and give only those segments the owner, then the group, then the mode; a directory that existed is never touched, so no recursion is needed; `$SUDO` only where the parent is not writable or the owner is another user, and also for the group when the caller is not in it (a user just added to `dev` is not before the next login); refuses a `.` or `..` segment; RESULT = the created segments, or `exists`; rc 1 when it cannot create |
-| `private.this.tree.tracked.check <treeRoot> <?caller:sweep>` | rc 0 when git lists tracked files under `<treeRoot>`; else an `INVALID:` verdict on stdout and rc 2 — the one guard of the four tree validators, so a sweep that reads nothing (no repository, nothing tracked, "dubious ownership") never reports OK |
-| `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate`, `test.suite.portability.validate` and `this.recursive.validate`, which keep their own rules and summaries |
+| `private.this.tree.tracked.check <treeRoot> <?caller:sweep>` | rc 0 when git lists tracked files under `<treeRoot>`; else an `INVALID:` verdict on stdout and rc 2 — the one guard of the tree validators, so a sweep that reads nothing (no repository, nothing tracked, "dubious ownership") never reports OK |
+| `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate`, `test.suite.portability.validate`, `this.recursive.validate` and `this.kernel.validate`, which keep their own rules and summaries |
 
 `config` owns two more for its shared env files: `private.config.env.lines.drop <file> <prefix…>`
 (drop every line starting with a prefix, in place, owner/group/mode kept; an unchanged file is
@@ -436,7 +436,7 @@ each with a test; the callers hop as the target user with `private.as.user`):
 
 ### Tree validators and their exception markers
 
-Five validators sweep the tracked files through `private.this.marker.sweep` and
+Six validators sweep the tracked files through `private.this.marker.sweep` and
 echo an `OK:` or `INVALID:` verdict. A line that must break a rule says so in a
 comment, with a reason:
 
@@ -445,6 +445,7 @@ comment, with a reason:
 | `path.validate` | no PATH writer outside the sanctioned ones | `# path-exception: <why>` |
 | `ogit.caller.validate` | no raw `git` call; use `ogit` | `# ogit-exception: <why>` |
 | `this.recursive.validate` | every recursive `chown`/`chgrp`/`chmod` declares itself | `# recursive-exception: <why>` on the **same line** |
+| `this.kernel.validate` | no raw `mkdir`, `chown`, `chgrp`, `chmod`, `ln -s`, `readlink`, `stat`, `mktemp`, `cmp`, `id -nG`, `getent`, `dscl`, `runuser`, `su -`, `docker`, `ssh`, `scp`, `sudo` outside the kernel helpers (`private.this.*`) and the script that wraps the command (`odocker`, `ossh`, `user`); under `test/` only the reading commands | `# kernel-exception: <why>` (line or 5 above), `# kernel-exception-file: <why>` |
 
 `this.anchor.validate` and `test.suite.portability.validate` are the other two users of the sweep.
 
@@ -460,7 +461,7 @@ same line even inside a heredoc or a `bash -c` string; a call through a variable
 position, so the word `chmod` in an argument followed by an R flag matches too.
 
 Run the `this` validators **sourced, in a fresh shell**:
-`bash -c 'source ~/oosh/this; this.recursive.validate'` (likewise `this.anchor.validate all`). A shell that sourced an
+`bash -c 'source ~/oosh/this; this.recursive.validate'` (likewise `this.anchor.validate all` and `this.kernel.validate`). A shell that sourced an
 older `this` at start-up lacks the newer functions, and the bare `this <method>` command prints nothing for
 them — a known limitation.
 

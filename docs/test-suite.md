@@ -320,7 +320,7 @@ reports the code under test as broken. The full probe table is in
 ## The `this` tree validators
 
 Beside `test.suite portability.validate`, `this` carries the sweeps that every package runs before it reports
-done: `this path.validate`, `this anchor.validate all`, `ogit caller.validate` and `this recursive.validate`
+done: `this path.validate`, `this anchor.validate all`, `ogit caller.validate`, `this recursive.validate` and `this kernel.validate`
 (all through `private.this.marker.sweep`, see [oosh-architecture.md § Tree validators](oosh-architecture.md#tree-validators-and-their-exception-markers)).
 
 `this recursive.validate [<treeRoot>]` finds every recursive `chown`, `chgrp` or `chmod` in the tracked tree and
@@ -328,11 +328,25 @@ wants the reason on the **same line**: `# recursive-exception: <why>`. A marker 
 one does not count. It echoes an `OK:` or `INVALID:` verdict, rc 1 on a violation and rc 2 when the sweep read
 nothing.
 
+`this kernel.validate [<treeRoot>]` finds every raw command that a kernel helper of `this`, `odocker`, `ossh` or `user`
+owns: `mkdir`, `chown`, `chgrp`, `chmod`, `ln -s`, `readlink`, `stat`, `mktemp`, `cmp`, `id -nG`, `getent`, `dscl`, `runuser`,
+`su -`, `docker`, `ssh`, `scp` and raw `sudo`, in command position, with quoted text and trailing comments blanked, so a
+word in a message or a regex is no call. The command list, the scripts each command is at home in and the excluded paths
+are data at the top of the method. The kernel helpers themselves (`private.this.*`) are its home. Under `test/` a fixture
+is built raw on purpose, so there only the reading commands are swept, and `mktemp` stays with `portability.validate`.
+A line that must stay raw says `# kernel-exception: <why>` on the line or in the 5 lines above, or
+`# kernel-exception-file: <why>` once in the file (`init/oosh`, POSIX sh before oosh exists). `pending P<x>` marks a
+line that a package of the heal review still has to convert, and files untouched by the heal are on its excluded list,
+which they leave once they are cleaned. Same verdict and return codes as the others. `T-KERNEL-TREE` in
+`test/test.test.suite` is the gate.
+
+nothing.
+
 Run the `this` validators **in a fresh shell**, so they come from the tree under test and not from a `this` the
 pane sourced at start-up:
 
 ```bash
-bash -c 'source ./this; this.recursive.validate; this.anchor.validate all'
+bash -c 'source ./this; this.recursive.validate; this.anchor.validate all; this.kernel.validate'
 ```
 
 The bare `this <method>` command prints nothing for them.

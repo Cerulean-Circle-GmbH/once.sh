@@ -600,7 +600,7 @@ test.os.healFixtureScript() {
   diff -r "$OOSH_DIR/test/fixtures/heal/eraB.config" "$fx/config" >/dev/null 2>&1 || bad="$bad folder-differs"
   script=$(private.os.platform.heal.fixture.script.get boot.era/bashrc '$t/bashrc') || bad="$bad file-rc"
   ( t="$fx"; export t; printf '%s\n' "$script" | sh ) || bad="$bad file-run"
-  cmp -s "$OOSH_DIR/test/fixtures/heal/boot.era/bashrc" "$fx/bashrc" || bad="$bad file-differs"
+  cmp -s "$OOSH_DIR/test/fixtures/heal/boot.era/bashrc" "$fx/bashrc" || bad="$bad file-differs" # kernel-exception: pending P5
   private.os.platform.heal.fixture.script.get no.such.fixture "$fx/x" >/dev/null && bad="$bad missing-fixture-accepted"
   private.os.platform.heal.fixture.script.get eraB.config >/dev/null && bad="$bad no-target-accepted"
   rm -rf "$fx"

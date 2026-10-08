@@ -51,7 +51,7 @@ private.os.platform.container.up()     # <platform> <image> <port> # start a fre
  console.log "Testing platform: $platform (image: $imageTag)"
 
  # Auto-build if image doesn't exist
- if ! docker image inspect "$imageTag" &>/dev/null; then
+ if ! docker image inspect "$imageTag" &>/dev/null; then # kernel-exception: pending P5
   console.log "Image $imageTag not found — building from $PLATFORM_WORKSPACE..."
   if ! odocker build "$PLATFORM_WORKSPACE"; then
    error.log "Failed to build image for $platform"
@@ -70,7 +70,7 @@ private.os.platform.container.up()     # <platform> <image> <port> # start a fre
  ossh config.create "$platform" "test@localhost:$sshPort"
  ossh config.save.last
  # Clean up any stale ControlMaster socket from a previous test run
- ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
+ ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null # kernel-exception: pending P5
  private.os.platform.socket.remove "$sshPort"
 
  # Open ControlMaster with sshpass (first connection, no keys yet)
@@ -167,16 +167,17 @@ private.os.platform.users.install()     # <platform> # Phase A in the platform c
  ossh exec.tty "$platform" "
   if id bash-user >/dev/null 2>&1; then
    echo 'bash-user already exists — skipping useradd'
-  elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then
-   sudo useradd -m -s /bin/bash bash-user
-  elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then
-   sudo adduser -D -s /bin/bash bash-user
+  elif sudo sh -c 'command -v useradd' >/dev/null 2>&1; then # kernel-exception: pending P5
+   sudo useradd -m -s /bin/bash bash-user # kernel-exception: pending P5
+  elif sudo sh -c 'command -v adduser' >/dev/null 2>&1; then # kernel-exception: pending P5
+   sudo adduser -D -s /bin/bash bash-user # kernel-exception: pending P5
   else
    echo 'no useradd/adduser available' >&2; exit 127
   fi
-  echo bash-user:bash-user | sudo chpasswd
+  echo bash-user:bash-user | sudo chpasswd # kernel-exception: pending P5
+  # kernel-exception: pending P5
   sudo grep -qE '^bash-user[[:space:]]+ALL=' /etc/sudoers \
-   || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'
+   || sudo sh -c 'echo \"bash-user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers' # kernel-exception: pending P5
  " || {
   error.log "Failed to create bash-user on $platform"
  }
@@ -395,7 +396,7 @@ rgit() { git -c safe.directory='*' -c user.email=heal-test@oosh.invalid -c user.
 home_of() { awk -F: -v u="$1" '$1 == u { print $6; exit }' /etc/passwd; }
 # as_user <user> <cmd...>: the transport of private.os.platform.user.run from inside this root
 # script — runuser with the HOME of <user>, else (busybox: no runuser) sudo -H -u
-as_user() { _au=$1; shift; if command -v runuser >/dev/null 2>&1; then runuser -u "$_au" -- env HOME="$(home_of "$_au")" "$@"; else sudo -H -u "$_au" "$@"; fi; }
+as_user() { _au=$1; shift; if command -v runuser >/dev/null 2>&1; then runuser -u "$_au" -- env HOME="$(home_of "$_au")" "$@"; else sudo -H -u "$_au" "$@"; fi; } # kernel-exception: POSIX sh of the disposable-container arm
 # move_aside <path> <tag>: a link is removed, anything else there is moved to <path>.before-<tag>
 move_aside() { if [ -L "$1" ]; then rm -f "$1"; elif [ -e "$1" ]; then mv "$1" "$1.before-$2"; fi; }
 dh=$(home_of developking)
@@ -404,11 +405,11 @@ bh=/home
 B="$bh/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh"
 S="$bh/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
 D="$B/$H"
-installed() { t=$(readlink -f "$(home_of test)/oosh" 2>/dev/null); [ -n "$t" ] && [ -e "$t/.git" ] && echo "$t"; }
+installed() { t=$(readlink -f "$(home_of test)/oosh" 2>/dev/null); [ -n "$t" ] && [ -e "$t/.git" ] && echo "$t"; } # kernel-exception: POSIX sh of the disposable-container arm
 clone_installed() {
   src=$(installed) || fail "the user test has no installed ~/oosh to clone"
   url=$(rgit -C "$src" remote get-url origin) || fail "$src has no origin"
-  mkdir -p "${1%/*}"
+  mkdir -p "${1%/*}" # kernel-exception: POSIX sh of the disposable-container arm
   rgit clone -q "$src" "$1" || fail "clone of $src into $1"
   rgit -C "$1" checkout -q -B "$2" || fail "branch $2 in $1"
   rgit -C "$1" remote set-url origin "$url" || fail "origin of $1"
@@ -447,7 +448,7 @@ OOSH_HEAL_ARM
      private.os.platform.heal.fixture.script.get eraB.config '$c' || return 1
      cat <<'OOSH_HEAL_ARM'
 sed -i -e "s#/Users/donges#$h#g" -e 's#/var/folders/sanitised/T/#/tmp/#' -e 's#USER="donges"#USER="test"#' "$c/user.env" "$c/oosh.env"
-chown -R test "$c" # recursive-exception: the era-B config this arm just wrote, in a disposable container
+chown -R test "$c" # recursive-exception: the era-B config this arm just wrote, in a disposable container # kernel-exception: POSIX sh of the disposable-container arm
 say "$c is a real folder with the era-B files of the MacStudio, /Users/donges rewritten to $h"
 OOSH_HEAL_ARM
      ;;
@@ -465,13 +466,13 @@ fi
 o="$r/oosh.orig.20260910-093000"
 if [ -e "$o" ]; then say "already: $o"; else cp -a "$r/oosh" "$o" || fail "copy to $o"; say "$o copied from $r/oosh"; fi
 if [ -L "$r/config" ]; then
-  t=$(readlink -f "$r/config"); rm -f "$r/config"
+  t=$(readlink -f "$r/config"); rm -f "$r/config" # kernel-exception: POSIX sh of the disposable-container arm
   cp -a "$t" "$r/config" || fail "copy of $t"
   say "$r/config is a real copy of $t"
 elif [ -d "$r/config" ]; then
   say "already: $r/config is a real folder"
 else
-  mkdir -p "$r/config"; say "$r/config made"
+  mkdir -p "$r/config"; say "$r/config made" # kernel-exception: POSIX sh of the disposable-container arm
 fi
 f="$r/config/oosh.session.env"
 if grep -qx 'export OOSH_MODE="oosh"' "$f" 2>/dev/null; then say "already: OOSH_MODE=oosh in $f"
@@ -485,11 +486,11 @@ OOSH_HEAL_ARM
 u=$(home_of bash-user); [ -n "$u" ] || fail "no bash-user"
 f=/opt/foreign/OOSH/x
 if [ -e "$f/.git" ]; then say "already: $f is a clone"; else clone_installed "$f" dev; say "$f is a real clone of $(installed)"; fi
-if [ "$(readlink "$u/oosh" 2>/dev/null)" = "$f" ]; then
+if [ "$(readlink "$u/oosh" 2>/dev/null)" = "$f" ]; then # kernel-exception: POSIX sh of the disposable-container arm
   say "already: $u/oosh -> $f"
 else
   move_aside "$u/oosh" foreign
-  ln -s "$f" "$u/oosh" && chown -h bash-user "$u/oosh" || fail "link $u/oosh"
+  ln -s "$f" "$u/oosh" && chown -h bash-user "$u/oosh" || fail "link $u/oosh" # kernel-exception: POSIX sh of the disposable-container arm
   say "$u/oosh -> $f"
 fi
 if [ -f /opt/foreign.heal.sums ]; then
@@ -520,22 +521,22 @@ else
 OOSH_HEAL_ARM
      private.os.platform.heal.fixture.script.get boot.era/bashrc '$u/.bashrc' || return 1
      cat <<'OOSH_HEAL_ARM'
-  chown oosh-user "$u/.bashrc"
+  chown oosh-user "$u/.bashrc" # kernel-exception: POSIX sh of the disposable-container arm
   say "$u/.bashrc is the boot-era template"
 fi
 if grep -q 'root.boot.path.installed' /etc/profile.d/oosh.sh 2>/dev/null; then
   say "already: /etc/profile.d/oosh.sh is the T9 drop-in"
 else
-  mkdir -p /etc/profile.d
+  mkdir -p /etc/profile.d # kernel-exception: POSIX sh of the disposable-container arm
 OOSH_HEAL_ARM
      private.os.platform.heal.fixture.script.get boot.era/profile.d.oosh.sh /etc/profile.d/oosh.sh || return 1
      cat <<'OOSH_HEAL_ARM'
   # the T9 writer substituted the system path into the template: the drop-in is live
   sed -i 's#@SYSTEM_PATH@#/etc/oosh#g' /etc/profile.d/oosh.sh
-  chmod 644 /etc/profile.d/oosh.sh
+  chmod 644 /etc/profile.d/oosh.sh # kernel-exception: POSIX sh of the disposable-container arm
   say "/etc/profile.d/oosh.sh is the T9 drop-in"
 fi
-if [ -L /etc/oosh/boot ]; then say "already: /etc/oosh/boot"; else mkdir -p /etc/oosh && ln -sfn "$D/boot" /etc/oosh/boot || fail "/etc/oosh/boot"; say "/etc/oosh/boot -> $D/boot"; fi
+if [ -L /etc/oosh/boot ]; then say "already: /etc/oosh/boot"; else mkdir -p /etc/oosh && ln -sfn "$D/boot" /etc/oosh/boot || fail "/etc/oosh/boot"; say "/etc/oosh/boot -> $D/boot"; fi # kernel-exception: POSIX sh of the disposable-container arm
 OOSH_HEAL_ARM
      ;;
    no.bashrc)
@@ -560,7 +561,7 @@ OOSH_HEAL_ARM
      cat <<'OOSH_HEAL_ARM'
 r=$(home_of root)
 for d in "$r/ssh.original" "$r/ssh.root.oncedev.for.oncedev"; do
-  if [ -d "$d" ]; then say "already: $d"; else mkdir -p "$d" && chmod 700 "$d" && : > "$d/known_hosts" || fail "$d"; say "$d made"; fi
+  if [ -d "$d" ]; then say "already: $d"; else mkdir -p "$d" && chmod 700 "$d" && : > "$d/known_hosts" || fail "$d"; say "$d made"; fi # kernel-exception: POSIX sh of the disposable-container arm
 done
 OOSH_HEAL_ARM
      ;;
@@ -569,7 +570,7 @@ OOSH_HEAL_ARM
 r=$(home_of root); f="$r/config/current.state.machine.env"
 if grep -qx 'state=30' "$f" 2>/dev/null && grep -qx 'machine=SETUP_SERVER' "$f"; then say "already: $f is at SETUP_SERVER 30"
 elif [ -f "$f" ]; then sed -i -e 's/^machine=.*/machine=SETUP_SERVER/' -e 's/^state=.*/state=30/' "$f"; say "$f set to SETUP_SERVER 30"
-else mkdir -p "${f%/*}"; printf 'machine=SETUP_SERVER\nstate=30\n' > "$f"; say "$f written at SETUP_SERVER 30"; fi
+else mkdir -p "${f%/*}"; printf 'machine=SETUP_SERVER\nstate=30\n' > "$f"; say "$f written at SETUP_SERVER 30"; fi # kernel-exception: POSIX sh of the disposable-container arm
 OOSH_HEAL_ARM
      ;;
    launcher.missing)
@@ -652,7 +653,7 @@ OOSH_HEAL_ARM
 branch_dir_ensure
 # one user lives in the broken tree, as on the Mac: oosh-user's ~/oosh -> <base>/<branch>
 u=$(home_of oosh-user)
-if [ -n "$u" ] && [ "$(readlink "$u/oosh" 2>/dev/null)" != "$D" ]; then ln -sfn "$D" "$u/oosh" && chown -h oosh-user "$u/oosh"; say "$u/oosh -> $D"; fi
+if [ -n "$u" ] && [ "$(readlink "$u/oosh" 2>/dev/null)" != "$D" ]; then ln -sfn "$D" "$u/oosh" && chown -h oosh-user "$u/oosh"; say "$u/oosh -> $D"; fi # kernel-exception: POSIX sh of the disposable-container arm
 if ! rgit -C "$D" symbolic-ref -q HEAD >/dev/null; then say "already: $D is on a detached HEAD"; exit 0; fi
 rgit -C "$D" update-ref --no-deref HEAD "$(rgit -C "$D" rev-parse HEAD)" || fail "detach"
 say "$D is on a detached HEAD"
@@ -666,13 +667,13 @@ OOSH_HEAL_ARM
      cat <<'OOSH_HEAL_ARM'
 REC=/opt/user.clone.heal.rec
 t=$(home_of test); [ -n "$t" ] || fail "no user test"
-if [ -d "$D/.git" ] && [ "$(stat -c %U "$D")" = test ] && [ -f "$REC" ]; then say "already: $D is a clone of test"; exit 0; fi
+if [ -d "$D/.git" ] && [ "$(stat -c %U "$D")" = test ] && [ -f "$REC" ]; then say "already: $D is a clone of test"; exit 0; fi # kernel-exception: POSIX sh of the disposable-container arm
 src=$(installed) || fail "the user test has no installed ~/oosh to clone"
 url=$(rgit -C "$src" remote get-url origin) || fail "$src has no origin"
 [ -e "$D" ] || [ -L "$D" ] && rm -rf "$D"
 # the empty folder the way the base gives it to a member of dev: owner test, group of the base, setgid (not recursive: it is empty)
-g=$(stat -c %g "$B")
-mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || { rm -rf "$D"; fail "folder $D for test"; }
+g=$(stat -c %g "$B") # kernel-exception: POSIX sh of the disposable-container arm
+mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || { rm -rf "$D"; fail "folder $D for test"; } # kernel-exception: POSIX sh of the disposable-container arm
 # From the installed tree, not from origin's $url: a clone of $url holds origin's default HEAD and every branch
 # of origin as remote-tracking refs, not the installed tree's — another shape for the heal, and the network in the arm.
 # ogit-exception: the clone is made AS test, the way a user makes it with the old oo checkout; ogit would run as root.
@@ -698,7 +699,7 @@ r=$(home_of root)
 # ogit-exception: root's ~/.gitconfig in the disposable container, the old oosh there has no ogit
 HOME="$r" git config --global --unset-all safe.directory "^$D\$" 2>/dev/null
 if HOME="$r" git config --global --get-all safe.directory 2>/dev/null | grep -qx '\*'; then say "WARNING: root trusts every folder (safe.directory *), the shape is not dubious to root"; fi
-printf '%s %s %s\n' "$(rgit -C "$D" rev-parse HEAD)" "$(stat -c %U "$D")" "$(stat -c %i "$D")" > "$REC" || fail "$REC"
+printf '%s %s %s\n' "$(rgit -C "$D" rev-parse HEAD)" "$(stat -c %U "$D")" "$(stat -c %i "$D")" > "$REC" || fail "$REC" # kernel-exception: POSIX sh of the disposable-container arm
 say "$D is a clean clone of $H owned by test, not trusted by root; recorded in $REC"
 OOSH_HEAL_ARM
      ;;
@@ -903,9 +904,9 @@ private.os.platform.user.run()     # <platform> <user> <command> <log> # run <co
    # test (eval: the tilde of a name is expanded at word start only).
    ossh exec.tty "$platform" "
      if command -v runuser >/dev/null 2>&1; then
-       sudo runuser -u $user -- env HOME=\"\$(eval echo ~$user)\" bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command'
+       sudo runuser -u $user -- env HOME=\"\$(eval echo ~$user)\" bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command' # kernel-exception: pending P5
      else
-       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command'
+       sudo -H -u $user bash -c 'cd ~ 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command' # kernel-exception: pending P5
      fi
    " 2>&1 | tee "$log"
    rc=${PIPESTATUS[0]}
@@ -1073,7 +1074,7 @@ done
 if [ ! -d "$D/.git" ]; then
   echo "user.clone: $D is no repository any more"; rc=1
 else
-  owner=$(stat -c %U "$D")
+  owner=$(stat -c %U "$D") # kernel-exception: pending P5
   [ "$owner" = "$rec_owner" ] || { echo "user.clone: the owner of $D changed: $rec_owner -> $owner"; rc=1; }
   head=$(rgit -C "$D" rev-parse HEAD)
   if [ "$head" != "$rec_head" ]; then
@@ -1081,7 +1082,7 @@ else
     if rgit -C "$D" merge-base --is-ancestor "$rec_head" "$head" 2>/dev/null; then say "the heal fast-forwarded $D: $rec_head -> $head (expected)"
     else echo "user.clone: the HEAD of $D is no fast-forward of the record: $rec_head -> $head"; rc=1; fi
   fi
-  [ "$(stat -c %i "$D")" = "$rec_ino" ] || say "the inode of $D differs from the record (the folder was replaced)"
+  [ "$(stat -c %i "$D")" = "$rec_ino" ] || say "the inode of $D differs from the record (the folder was replaced)" # kernel-exception: pending P5
 fi
 [ "$rc" = 0 ] && say "$D is kept: owner $rec_owner, HEAD $head (recorded $rec_head; a fast-forward by the heal is expected), nothing aside"
 exit "$rc"
@@ -1408,7 +1409,7 @@ private.os.platform.image.from.workspace() { # <workspace> # converts workspace 
 }
 
 private.os.platform.container.id() { # <port> # id of the running platform-test container publishing <port> (empty if none)
-  docker ps -q --filter "publish=$1" 2>/dev/null | head -1
+  docker ps -q --filter "publish=$1" 2>/dev/null | head -1 # kernel-exception: pending P5, pre-existing, plan item
 }
 
 private.os.platform.cleanup() { # <port> # stops and removes Docker container on given port
@@ -1416,12 +1417,12 @@ private.os.platform.cleanup() { # <port> # stops and removes Docker container on
   local containerId
   containerId=$(private.os.platform.container.id "$port")
   if [ -n "$containerId" ]; then
-    docker stop "$containerId" 2>/dev/null
-    docker rm "$containerId" 2>/dev/null
+    docker stop "$containerId" 2>/dev/null # kernel-exception: pending P5, pre-existing, plan item
+    docker rm "$containerId" 2>/dev/null # kernel-exception: pending P5, pre-existing, plan item
   fi
-  containerId=$(docker ps -aq --filter "publish=$port" 2>/dev/null)
+  containerId=$(docker ps -aq --filter "publish=$port" 2>/dev/null) # kernel-exception: pending P5, pre-existing, plan item
   if [ -n "$containerId" ]; then
-    docker rm "$containerId" 2>/dev/null
+    docker rm "$containerId" 2>/dev/null # kernel-exception: pending P5, pre-existing, plan item
   fi
 }
 
@@ -1636,9 +1637,9 @@ os.platform.test()     # <platform> <?terminal> <?notests> <?branch> # tests oos
   # Same runuser-vs-sudo portability dance as the test invocations above.
   ossh exec.tty "$platform" "
    if command -v runuser >/dev/null 2>&1; then
-    sudo runuser -u bash-user -- bash -l
+    sudo runuser -u bash-user -- bash -l # kernel-exception: pending P5
    else
-    sudo -H -u bash-user bash -l
+    sudo -H -u bash-user bash -l # kernel-exception: pending P5
    fi
   "
  fi
@@ -1711,10 +1712,10 @@ private.os.platform.shared.config.repair() # <platform> # reset sharedConfig gro
   # this doesn't have to run between every step — once after root is
   # enough.
   ossh exec.tty "$platform" "sudo bash -c '
-    shared=\$(readlink -f /root/config 2>/dev/null)
+    shared=\$(readlink -f /root/config 2>/dev/null) # kernel-exception: POSIX sh of the disposable-container arm
     if [ -n \"\$shared\" ] && [ -d \"\$shared\" ]; then
-      chgrp -R dev \"\$shared\" 2>/dev/null # recursive-exception: ephemeral platform container, the shared tree it created
-      chmod -R g+rw \"\$shared\" 2>/dev/null # recursive-exception: ephemeral platform container, the shared tree it created
+      chgrp -R dev \"\$shared\" 2>/dev/null # recursive-exception: ephemeral platform container, the shared tree it created # kernel-exception: POSIX sh of the disposable-container arm
+      chmod -R g+rw \"\$shared\" 2>/dev/null # recursive-exception: ephemeral platform container, the shared tree it created # kernel-exception: POSIX sh of the disposable-container arm
       find \"\$shared\" -type d -exec chmod g+s {} + 2>/dev/null
     fi
   '"
