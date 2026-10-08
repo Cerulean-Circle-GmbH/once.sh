@@ -255,11 +255,11 @@ tree. It is **not** `ossh install`'s push, which writes `~/oosh` and skips a hos
 
 **What is pushed where.** This tree's `init/oosh` is written to a fresh
 `/tmp/oosh-heal-init.XXXXXX` on the host (`mktemp` there: a new name, never a file someone else placed in
-`/tmp`; `private.ossh.heal.push`) — never to `~/oosh`, and with no state-99 or `~/oosh` skip. Its heal arm then
+`/tmp`; `private.ossh.remote.file.put`, called by `private.ossh.heal.push`) — never to `~/oosh`, and with no state-99 or `~/oosh` skip. Its heal arm then
 clones `<branch>` fresh on the host and runs *that* tree's `oo heal`
 ([install-bootstrap.md § The heal arm](install-bootstrap.md#the-heal-arm)). Both temp files are removed
-afterwards (best effort; the arm removes its own clone). The path that comes back must be the **clean last
-line** of the answer and a name of the expected prefix: a host whose `.bashrc` prints noise never has that
+the moment the heal returns, by the remote command itself, and again afterwards (best effort, `ssh -n`, also on an interrupt; the arm removes its own clone). They stay mode 600 unless a hop to another user needs them: `all` and a named user other than the login make them readable (`chmod 644`) first. The path that comes back must be the **clean last
+line** of the answer and the expected prefix plus name characters only (no slash): a host whose `.bashrc` prints noise never has that
 noise spliced into the next remote command (`private.ossh.heal.path.get`).
 
 **`<user>` or `all`.**
@@ -270,7 +270,7 @@ noise spliced into the next remote command (`private.ossh.heal.path.get`).
 | one user | the arm runs **as that user**: directly when that is the login, else `sudo -H -u <user>` (the temp files are made readable first) |
 
 `<user>` and `<branch>` are put into a remote command line, so only name characters are accepted and no
-leading `-`; anything else is refused (rc 2, before a connection).
+leading `-`; anything else is refused (rc 2, before a connection). A branch named `all` is refused too: the heal arm reads that word as every user.
 
 **`OOSH_HEAL_LOCAL=1`** heals from code that is not pushed. A bundle of `main` **and** the **local** `<branch>` of this tree
 (`ogit bundle.heads.create`; `main` is `origin/main` when this tree has it, else the local `main`) is written to
@@ -293,7 +293,7 @@ sudo and no `<user>` argument. With `OOSH_HEAL_LOCAL=1` the bundle is the `OOSH_
 here too, so a caller that captures the output must `tr -d '\r'`. `os platform.heal.test … pipe` calls it
 (`private.os.platform.heal.pipe.run`) instead of a private method of `ossh`.
 
-**One flow.** `ossh heal` and `ossh heal.pipe` are both `private.ossh.heal.run <form:arm|pipe> <host> <user> <branch>`:
+**One flow.** `ossh heal` and `ossh heal.pipe` are both `private.ossh.heal.run <form:arm> <host> <user> <branch>`:
 it checks host, user and branch, pushes `init/oosh` (and with `OOSH_HEAL_LOCAL=1` the bundle), runs the arm or the
 pipe form and removes the temp files. Anything that could not be pushed answers rc 2 — in the return code and in
 `RESULT` alike (the message of the failed push).
@@ -369,10 +369,10 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh install` | Install oosh on remote host |
 | `ossh heal` | Heal oosh on a remote host: `<sshConfigHost> <?user:all> <?branch>`; rc is the remote `oo heal`'s |
 | `ossh heal.pipe` | The pure pipe form on a remote host: `<sshConfigHost> <?branch>`; as the login user, no sudo; rc is the remote `oo heal`'s |
-| `private.ossh.heal.run` | `<form:arm\|pipe> <host> <user> <branch>` — the one flow of `ossh heal` and `ossh heal.pipe`; rc 2 when nothing could be sent |
+| `private.ossh.heal.run` | `<form:arm> <host> <user> <branch>` (form arm or pipe) — the one flow of `ossh heal` and `ossh heal.pipe`; rc 2 when nothing could be sent |
 | `private.ossh.heal.pipe.command.get` | `<initFile> <branch> <?bundle>` — the remote command of the pure pipe form; silent getter |
-| `private.ossh.heal.push` | `<host>` — writes this tree's `init/oosh` to a fresh `/tmp/oosh-heal-init.XXXXXX` on the host; `RESULT` = the remote path |
-| `private.ossh.heal.bundle.push` | `<host> <branch>` — writes a bundle of `main` and the local branch to `/tmp/oosh-heal-bundle.XXXXXX` (`OOSH_HEAL_LOCAL=1`) |
+| `private.ossh.heal.push` | `<host> <?branch>` — writes this tree's `init/oosh` to a fresh `/tmp/oosh-heal-init.XXXXXX` on the host and, with `<branch>`, a bundle of `main` and that local branch to `/tmp/oosh-heal-bundle.XXXXXX` (`OOSH_HEAL_LOCAL=1`), both through `private.ossh.remote.file.put`; `RESULT` = the init path, then a space and the bundle path |
+| `private.ossh.remote.file.put` | `<sshConfigHost> <prefix>` — copies stdin to a new `mktemp` file `/tmp/<prefix>.XXXXXX` on the host; `RESULT` = the remote path, rc 1 on failure (a half-written file is removed) |
 | `private.ossh.heal.command.get` | `<initFile> <branch> <user> <?bundle>` — the remote command that runs the heal arm; silent getter |
 | `private.ossh.heal.path.get` | `<prefix>` — the last line of stdin when it is `<prefix>` plus name characters only; silent getter |
 | `private.ossh.origin.branch.check` | `<branch>` — rc 0 when `origin/<branch>` resolves; on a miss one fetch, then again; silent |

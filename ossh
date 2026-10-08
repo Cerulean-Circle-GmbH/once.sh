@@ -63,24 +63,21 @@ private.ossh.install.branch.get()     #  # echo the branch ossh install hands th
 }
 
 
-private.ossh.install.installer.get()     #  # echo the init/oosh ossh install pushes: the one of the ref $OSSH_INSTALL_BRANCH (ogit.file.show; origin/<branch> first, <branch> when only that resolves) when set, else the file of this tree; silent getter, rc 1 when it cannot be read #
+private.ossh.install.installer.get()     #  # echo the init/oosh ossh install pushes: the one of origin/$OSSH_INSTALL_BRANCH (ogit.file.show) when set, else the file of this tree, streamed; silent getter, rc 1 when it cannot be read #
 {
  # NO create.result — a getter consumed as $(...); its text is piped to the host.
  # An old ref installs with ITS OWN installer: the installer contract changes
  # between refs (private.os.platform.branch.gate), and this tree's bootstrap
- # would drive the old tree. origin/<branch> FIRST: the host clones from
- # origin, and a stale local <branch> would push an installer that does not
- # match the tree it installs; <branch> only when origin/<branch> does not resolve.
+ # would drive the old tree. Always origin/<branch>: the host clones from
+ # origin, and a local <branch> may differ from what it clones — ossh.install
+ # has already refused a value that is no branch on origin.
  if [ -z "$OSSH_INSTALL_BRANCH" ]; then
    # raw: worktree bytes, no method reads a file
    cat "$OOSH_DIR/init/oosh" 2>/dev/null
    return
  fi
  private.this.script.load ogit ogit.file.show || return 1
- private.this.script.load ogit ogit.branch.check || return 1
- local ref="origin/$OSSH_INSTALL_BRANCH"
- ogit.branch.check "$ref" "$OOSH_DIR" || ref="$OSSH_INSTALL_BRANCH"
- ogit.file.show "$ref" init/oosh "$OOSH_DIR" 2>/dev/null
+ ogit.file.show "origin/$OSSH_INSTALL_BRANCH" init/oosh "$OOSH_DIR" 2>/dev/null
 }
 
 
@@ -111,115 +108,110 @@ ossh.heal.completion.branch() {
   # local and cached origin branches: origin ones clone from origin, local ones ship with OOSH_HEAL_LOCAL=1
   private.this.script.load ogit ogit.branch.list && ogit.branch.list all "$OOSH_DIR"
 }
-private.ossh.heal.push()     # <host> # open the connection to <host> and write the init/oosh of this tree to a fresh /tmp/oosh-heal-init.XXXXXX there through the one ssh runner — never ~/oosh, no state-99 or ~/oosh skip; RESULT = the remote path, rc 1 when it fails #
+private.ossh.heal.push()     # <host> <?branch> # open the connection to <host> and write the init/oosh of this tree, and with <branch> a bundle of main and that local branch, to fresh /tmp files there through private.ossh.remote.file.put — never ~/oosh, no state-99 or ~/oosh skip; RESULT = the remote init path, then a space and the bundle path when one was written; rc 1 when it fails and nothing is left behind #
 {
  # NO state-99 or ~/oosh short-circuit and never ~/oosh (private.push.init.oosh
- # does both — wrong for a heal). mktemp on the host: a fresh name, never a
- # file someone else placed in /tmp. One runner call writes and names it.
- local host="$1"
+ # does both — wrong for a heal). The bundle is how unpushed code is healed on
+ # a container: the heal arm's `git clone -b <branch> $OOSH_REPO` clones a
+ # bundle as it clones a URL, and the heal clones main too (the base always has
+ # main/) — so the bundle carries BOTH heads. A per-branch clone has no local
+ # main: main is origin/main first (what the host would clone), the local main
+ # only without it; <branch> must be a LOCAL branch (the unpushed code).
+ # ogit.bundle.heads.create names the heads and writes a local file first, so a
+ # failed bundle is seen before anything is sent.
+ local host="$1" branch="$2" initFile bundle="" tmp
  if [ -z "$host" ]; then
    create.result 1 "private.ossh.heal.push requires <host>"
    error.log "$RESULT"
    return $(result)
  fi
  ossh.connection.open "$host" || { create.result 1 "no connection to $host"; error.log "$RESULT"; return $(result); }
- # The path is the clean last line of the answer (private.ossh.heal.path.get).
- # A failed cat after mktemp, or an answer that is no clean path, leaves the
- # remote temp file behind — best effort, it is in /tmp.
- local remote
- if remote=$(private.ossh.ssh "$host" 'f=$(mktemp /tmp/oosh-heal-init.XXXXXX) && cat > "$f" && echo "$f"' < "$OOSH_DIR/init/oosh" \
-     | private.ossh.heal.path.get /tmp/oosh-heal-init.); then
-   create.result 0 "$remote"
- else
-   create.result 1 "could not write init/oosh to a temp file on $host"
-   error.log "$RESULT"
+ if [ -n "$branch" ]; then
+   private.this.script.load ogit ogit.branch.check || return $(result)
+   private.this.script.load ogit ogit.bundle.heads.create || return $(result)
+   if ! ogit.branch.check "refs/heads/$branch" "$OOSH_DIR"; then
+     create.result 1 "no local branch $branch in $OOSH_DIR to bundle"
+     error.log "$RESULT"
+     return $(result)
+   fi
+   local -a heads=("main=main")
+   [ "$branch" = main ] || {
+     ogit.branch.check origin/main "$OOSH_DIR" && heads=("main=origin/main")
+     heads+=("$branch=$branch")
+   }
+   tmp=$(private.this.temp.dir.get ossh.heal) || { create.result 1 "no temporary directory for the bundle"; error.log "$RESULT"; return $(result); }
+   if ! ogit.bundle.heads.create "$tmp/heal.bundle" "$OOSH_DIR" "${heads[@]}" >/dev/null; then
+     create.result 1 "no bundle of $branch to send to $host — $RESULT"
+     rm -rf "$tmp" 2>/dev/null
+     error.log "$RESULT"
+     return $(result)
+   fi
  fi
+ private.ossh.remote.file.put "$host" oosh-heal-init < "$OOSH_DIR/init/oosh" \
+   || { create.result 1 "could not write init/oosh to a temp file on $host"; [ -n "$tmp" ] && rm -rf "$tmp" 2>/dev/null; error.log "$RESULT"; return $(result); }
+ initFile="$RESULT"
+ if [ -n "$branch" ]; then
+   if private.ossh.remote.file.put "$host" oosh-heal-bundle < "$tmp/heal.bundle"; then
+     bundle="$RESULT"
+   else
+     create.result 1 "could not write a bundle of $branch to $host"
+     private.ossh.ssh -n "$host" "rm -f '$initFile'" >/dev/null 2>&1
+     rm -rf "$tmp" 2>/dev/null
+     error.log "$RESULT"
+     return $(result)
+   fi
+   rm -rf "$tmp" 2>/dev/null
+ fi
+ create.result 0 "$initFile${bundle:+ $bundle}"
  return $(result)
 }
 
 
-private.ossh.heal.bundle.push()     # <host> <branch> # write a bundle (ogit.bundle.heads.create) of main (origin/main first) and the local <branch> of this tree to a fresh /tmp/oosh-heal-bundle.XXXXXX on <host> through the one ssh runner (OOSH_HEAL_LOCAL=1: unpushed code); RESULT = the remote path, rc 1 when it fails #
-{
- # How unpushed code is healed on a container: the heal arm's
- # `git clone -b <branch> $OOSH_REPO` clones a bundle as it clones a URL, and
- # the heal clones main too (the base always has main/) — so the bundle carries
- # BOTH heads. A per-branch clone has no local main: main is origin/main first
- # (what the host would clone), the local main only without it; <branch> must be
- # a LOCAL branch (the unpushed code). ogit.bundle.heads.create names the heads.
- local host="$1" branch="$2"
- if [ -z "$host" ] || [ -z "$branch" ]; then
-   create.result 1 "private.ossh.heal.bundle.push requires <host> <branch>"
-   error.log "$RESULT"
-   return $(result)
- fi
- private.this.script.load ogit ogit.branch.check || return $(result)
- private.this.script.load ogit ogit.bundle.heads.create || return $(result)
- if ! ogit.branch.check "refs/heads/$branch" "$OOSH_DIR"; then
-   create.result 1 "no local branch $branch in $OOSH_DIR to bundle"
-   error.log "$RESULT"
-   return $(result)
- fi
- local -a heads=("main=main")
- [ "$branch" = main ] || {
-   ogit.branch.check origin/main "$OOSH_DIR" && heads=("main=origin/main")
-   heads+=("$branch=$branch")
- }
- local remote
- remote=$(set -o pipefail; ogit.bundle.heads.create - "$OOSH_DIR" "${heads[@]}" \
-   | private.ossh.ssh "$host" 'f=$(mktemp /tmp/oosh-heal-bundle.XXXXXX) && cat > "$f" && echo "$f"' \
-   | private.ossh.heal.path.get /tmp/oosh-heal-bundle.)
- local rc=$?
- [ -z "$remote" ] && rc=1
- # a clean path of a failed bundle: the half-written file goes
- [ "$rc" != 0 ] && [ -n "$remote" ] && private.ossh.ssh "$host" "rm -f '$remote'" >/dev/null 2>&1
- if [ "$rc" = 0 ]; then
-   create.result 0 "$remote"
- else
-   create.result 1 "could not write a bundle of $branch to $host"
-   error.log "$RESULT"
- fi
- return $(result)
-}
 
 
-private.ossh.heal.command.get()     # <initFile> <branch> <user> <?bundle> # echo the remote command that runs the heal arm of <initFile> for <branch>: all → sh <initFile> heal <branch> all; one user → as that user (sudo -H -u when the login is someone else, the arm reads any word but all as the branch); env OOSH_REPO=<bundle> when given; silent getter #
+private.ossh.heal.command.get()     # <initFile> <branch> <user> <?bundle> # echo the remote command that runs the heal arm of <initFile> for <branch>: all → sh <initFile> heal <branch> all; one user → as that user (sudo -H -u when the login is someone else, the arm reads any word but all as the branch); env OOSH_REPO=<bundle> when given; the files are made readable (chmod 644) only on a path that hops to another user, and removed as soon as the heal returns; silent getter #
 {
  # NO create.result — a getter consumed as $(...), the text runs on the host.
  # The heal arm takes `heal [<branch>] [all]` and heals the login user or, with
  # all, every user (sudo -H when the login is not root); any other word is read
  # as the branch. One other user is therefore healed by running the arm AS that
  # user: sudo -H -u, the temp files readable for it. With all the files are
- # readable too: root's heal hops to other users, who read them. env, not a
- # VAR= prefix: sudo's env_reset strips the prefix. The paths are quoted; the
- # user and branch are name characters only (ossh.heal checks them).
+ # readable too: root's heal hops to other users, who read them. The login
+ # user's own run needs no mode change: the files stay 600. The files are
+ # removed in the same command, as soon as the heal returns, so they are never
+ # left readable when the connection drops afterwards. env, not a VAR= prefix:
+ # sudo's env_reset strips the prefix. The paths are quoted; the user and
+ # branch are name characters only (ossh.heal checks them).
  local initFile="$1" branch="$2" user="$3" bundle="$4"
  [ -n "$initFile" ] && [ -n "$branch" ] && [ -n "$user" ] || return 1
  local files="'$initFile'${bundle:+ '$bundle'}"
  local run="sh '$initFile' heal $branch"
  [ -n "$bundle" ] && run="env OOSH_REPO='$bundle' $run"
+ local after="; rc=\$?; rm -f $files; exit \$rc"
  if [ "$user" = all ]; then
-   echo "chmod 644 $files && $run all"
+   echo "chmod 644 $files && $run all$after"
    return 0
  fi
- echo "if [ \"\$(id -un)\" = $user ]; then $run; else chmod 644 $files && sudo -H -u $user $run; fi"
+ echo "if [ \"\$(id -un)\" = $user ]; then $run; else chmod 644 $files && sudo -H -u $user $run; fi$after"
 }
 
 
-private.ossh.heal.path.get()     # <prefix> # read the stdout of a remote command on stdin and echo its last line when that is <prefix> followed by name characters only (A-Z a-z 0-9 . _ / -); nothing and rc 1 otherwise — dotfile noise never becomes a path; silent getter #
+private.ossh.heal.path.get()     # <prefix> # read the stdout of a remote command on stdin and echo its last line when that is <prefix> followed by name characters only (A-Z a-z 0-9 . _ -, no slash); nothing and rc 1 otherwise — dotfile noise never becomes a path; silent getter #
 {
  # NO create.result — a getter consumed as $(...). A broken host prints dotfile
  # noise (a .bashrc echoing under sshd) around what the remote command echoes:
  # only the LAST line counts, and only when it is <prefix> plus name characters,
- # so nothing else is ever spliced into a later remote command.
- local prefix="$1" last
+ # so nothing else is ever spliced into a later remote command. The prefix is
+ # a directory and a name stem (/tmp/oosh-heal-init.); what follows it names a
+ # file in that directory, so a slash after it is no path.
+ local prefix="$1" last rest
  [ -n "$prefix" ] || return 1
  # raw: no line method keeps only the last line; \r from a tty-allocating host
  last=$(tr -d '\r' | tail -n 1)
- case "$last" in
-   "$prefix"*[!A-Za-z0-9._/-]*) return 1 ;;
-   "$prefix"?*) printf '%s' "$last" ;;
-   *) return 1 ;;
- esac
+ case "$last" in "$prefix"?*) ;; *) return 1 ;; esac
+ rest="${last#"$prefix"}"
+ case "$rest" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+ printf '%s' "$last"
 }
 
 
@@ -252,7 +244,7 @@ ossh.heal.pipe.completion.sshConfigHost() {
 ossh.heal.pipe.completion.branch() {
   ossh.heal.completion.branch "$@"
 }
-private.ossh.heal.run()     # <form:arm|pipe> <host> <user> <branch> # the one heal flow of ossh.heal and ossh.heal.pipe: check host, user and branch, push init/oosh (and with OOSH_HEAL_LOCAL=1 the bundle) to temp files, run the arm or the pipe form with ssh -tt, remove the temp files; rc = the remote rc, 2 when nothing could be sent #
+private.ossh.heal.run()     # <form:arm> <host> <user> <branch> # the one heal flow of ossh.heal and ossh.heal.pipe (form arm or pipe): check host, user and branch (a branch named all is refused: the arm reads that word as the user), push init/oosh (and with OOSH_HEAL_LOCAL=1 the bundle) to temp files, run the arm or the pipe form with ssh -tt, remove the temp files, also when interrupted; rc = the remote rc, 2 when nothing could be sent #
 {
  # arm: `sh <f> heal <branch> [all]` as <user> (private.ossh.heal.command.get);
  # pipe: `cat <f> | sh -s -- heal <branch>` as the login user, <user> unused
@@ -287,6 +279,13 @@ private.ossh.heal.run()     # <form:arm|pipe> <host> <user> <branch> # the one h
      error.log "$RESULT"
      return $(result) ;;
  esac
+ case "${branch#origin/}" in
+   all)
+     # the heal arm reads the word all as the user, never as a branch
+     create.result 2 "ossh heal: a branch named all cannot be healed — the heal arm reads that word as every user"
+     error.log "$RESULT"
+     return $(result) ;;
+ esac
  case "$branch" in
    ''|-*|*[!A-Za-z0-9._/@+-]*)
      create.result 2 "ossh heal: '$branch' is no branch name"
@@ -297,19 +296,15 @@ private.ossh.heal.run()     # <form:arm|pipe> <host> <user> <branch> # the one h
    warn.log "ossh heal: $branch is not on origin (fetched once) — the clone on $host may fail; OOSH_HEAL_LOCAL=1 ships it as a bundle"
  fi
 
- if ! private.ossh.heal.push "$host"; then
+ # the one push: init/oosh, and with OOSH_HEAL_LOCAL=1 the bundle of <branch>
+ local pushBranch=""
+ [ "$OOSH_HEAL_LOCAL" = 1 ] && pushBranch="${branch#origin/}"
+ if ! private.ossh.heal.push "$host" "$pushBranch"; then
    create.result 2 "$RESULT"
    return $(result)
  fi
- local initFile="$RESULT" bundle=""
- if [ "$OOSH_HEAL_LOCAL" = 1 ]; then
-   if ! private.ossh.heal.bundle.push "$host" "${branch#origin/}"; then
-     create.result 2 "$RESULT"
-     private.ossh.ssh "$host" "rm -f '$initFile'" >/dev/null 2>&1
-     return $(result)
-   fi
-   bundle="$RESULT"
- fi
+ local initFile="${RESULT%% *}" bundle=""
+ case "$RESULT" in *" "*) bundle="${RESULT#* }" ;; esac
 
  local command
  if [ "$form" = pipe ]; then
@@ -318,11 +313,17 @@ private.ossh.heal.run()     # <form:arm|pipe> <host> <user> <branch> # the one h
    command=$(private.ossh.heal.command.get "$initFile" "${branch#origin/}" "$user" "$bundle")
  fi
  important.log "ossh heal ($form): $host — heal ${branch#origin/} for $user${bundle:+ from the local bundle}"
- local rc=0
+ local rc=0 files="'$initFile'${bundle:+ '$bundle'}" prevTrap
+ # An interrupt leaves the temp files on the host (the bundle holds unpushed
+ # code): the trap removes them, then the run goes on to its own cleanup.
+ prevTrap=$(trap -p INT)
+ trap 'private.ossh.ssh -n "$host" "rm -f $files" >/dev/null 2>&1' INT
  private.ossh.ssh -tt "$host" "$command" || rc=$?
- # Best effort: the heal arm removes its own clone; these two are ours.
- private.ossh.ssh "$host" "rm -f '$initFile'${bundle:+ '$bundle'}" >/dev/null 2>&1 \
+ # Best effort, -n: the cleanup must not read the terminal. The heal arm removes
+ # its own clone; these files are ours (the arm form also removes them itself).
+ private.ossh.ssh -n "$host" "rm -f $files" >/dev/null 2>&1 \
    || warn.log "ossh heal: could not remove $initFile${bundle:+ $bundle} on $host"
+ if [ -n "$prevTrap" ]; then eval "$prevTrap"; else trap - INT; fi
  create.result "$rc" "ossh heal on $host: rc $rc"
  return $(result)
 }
@@ -337,6 +338,39 @@ private.ossh.heal.pipe.command.get()     # <initFile> <branch> <?bundle> # echo 
  local initFile="$1" branch="$2" bundle="$3"
  [ -n "$initFile" ] && [ -n "$branch" ] || return 1
  echo "cat '$initFile' | ${bundle:+env OOSH_REPO='$bundle' }sh -s -- heal $branch"
+}
+
+
+private.ossh.remote.file.put()     # <sshConfigHost> <prefix> # copy stdin to a new mktemp file <prefix>.XXXXXX in /tmp of the host; RESULT the remote path; rc 1 on failure; heal.push uses it for the init file and the bundle #
+{
+ # stdin IS the file. mktemp on the host: a fresh name, never a file someone
+ # else placed in /tmp. The path is the clean last line of the answer
+ # (private.ossh.heal.path.get): a broken host prints dotfile noise around it.
+ # The prefix goes into a remote command line: name characters only.
+ local host="$1" prefix="$2" remote rc=0
+ if [ -z "$host" ] || [ "${host#-}" != "$host" ]; then
+   create.result 1 "private.ossh.remote.file.put requires <sshConfigHost> (no leading -): [$host]"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ case "$prefix" in
+   ''|-*|*[!A-Za-z0-9._-]*)
+     create.result 1 "private.ossh.remote.file.put: [$prefix] is no file name prefix"
+     error.log "$RESULT"
+     return $(result) ;;
+ esac
+ remote=$(set -o pipefail; private.ossh.ssh "$host" 'f=$(mktemp /tmp/'"$prefix"'.XXXXXX) && cat > "$f" && echo "$f"' \
+   | private.ossh.heal.path.get "/tmp/$prefix.") || rc=1
+ [ -z "$remote" ] && rc=1
+ # a clean path of a failed copy: the half-written file goes
+ [ "$rc" != 0 ] && [ -n "$remote" ] && private.ossh.ssh -n "$host" "rm -f '$remote'" >/dev/null 2>&1
+ if [ "$rc" = 0 ]; then
+   create.result 0 "$remote"
+ else
+   create.result 1 "could not write /tmp/$prefix.* on $host"
+   error.log "$RESULT"
+ fi
+ return $(result)
 }
 
 
