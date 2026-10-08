@@ -486,27 +486,29 @@ private.user.login.shell.bash.path.get.darwin()     # <username> # echo the bash
 }
 
 
-private.user.ssh.file.put()     # <username> <file> <?umask:077> # write stdin into <file> AS <username>, a file there before removed first and the new one created under <umask>, so it is theirs from the start and never chowned; rc 1 when it cannot #
+
+
+private.user.ssh.tree.handover()     # <username> <targetHome> # hand the whole ~/.ssh of <targetHome> over to <username> and their login group, recursively, as dev did after the shared-file copy and the osshLayout build; nothing when there is no ~/.ssh; rc 1 when the chown fails #
 {
- # The way a root-readable file reaches a user without a chown afterwards:
- # the caller reads it (`$SUDO cat … |`), the user writes it, so owner and
- # login group are theirs and the mode comes from <umask>. A file already there
- # is removed first, as the user — the folder is theirs — so an old one that
- # root left keeps neither its owner nor its mode (user.oosh.install: the
- # shared ~/.ssh files and the staged identities, T-USER-SSH-FILE-PUT).
- local username="$1" file="$2" umaskValue="${3:-077}"
- if [ -z "$username" ] || [ -z "$file" ]; then
-   create.result 1 "private.user.ssh.file.put requires <username> <file>"
+ # dev's hand-over, in one place: after the shared-file copy and after the
+ # root-run osshLayout build, the whole ~/.ssh goes to <user> and their login
+ # group (`chown <user>:` — a platform.test container has "test" with gid 0
+ # and no group "test"). Mandate 1 keeps dev's behaviour: what was there
+ # before — a root-owned ids/ of an earlier run, developking's template tree —
+ # is handed over too (T-USER-OOSH-INSTALL-SSH-HANDOVER). chown -R follows no
+ # link inside: ids/ holds real-file copies (test.osshLayout).
+ local username="$1" targetHome="$2"
+ if [ -z "$username" ] || [ -z "$targetHome" ]; then
+   create.result 1 "private.user.ssh.tree.handover requires <username> <targetHome>"
    return $(result)
  fi
- case "$umaskValue" in
-   [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
-   *) create.result 1 "private.user.ssh.file.put: <umask> $umaskValue is no octal umask"; return $(result) ;;
- esac
- if private.as.user "$username" sh -c 'umask "$1" && rm -f "$2" && cat > "$2"' sh "$umaskValue" "$file" 2>/dev/null; then
-   create.result 0 "$file written as $username"
+ if [ ! -d "$targetHome/.ssh" ]; then
+   create.result 0 "no ~/.ssh under $targetHome"; return $(result)
+ fi
+ if $SUDO chown -R "$username:" "$targetHome/.ssh" 2>/dev/null; then # recursive-exception: the user's own .ssh tree, handed over as on dev # kernel-exception: hand-over of a pre-existing tree to its user, dev behaviour
+   create.result 0 "$targetHome/.ssh handed over to $username"
  else
-   create.result 1 "cannot write $file as $username"
+   create.result 1 "could not hand $targetHome/.ssh over to $username"
  fi
  return $(result)
 }
@@ -1418,23 +1420,26 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # Copy shared SSH dotfiles (user-owned, correct perms).
   # ~/.ssh itself must be 700 and owned by the target user — sshd's
   # StrictModes (default on) refuses authorized_keys under group-writable
-  # or wrong-owner .ssh directories. The tree is made right the first time,
-  # never chowned afterwards: private.this.dir.ensure creates a missing ~/.ssh
-  # as <user>, their login group (`id -gn` — a platform.test container has
-  # "test" with gid 0 and no group "test"), 700; the files are read by the
-  # caller (the shared .ssh is not the user's to read) and written BY the user
-  # with their mode (private.user.ssh.file.put).
-  local sharedSsh="$baseDir/shared/.ssh" userGroup sshFile
+  # or wrong-owner .ssh directories. Running via $SUDO means the default
+  # umask can be 002 (group-writable), so we tighten perms explicitly.
+  # A missing ~/.ssh is created through private.this.dir.ensure (the user,
+  # their login group, 700); then the whole tree is handed over, as on dev
+  # (private.user.ssh.tree.handover).
+  local sharedSsh="$baseDir/shared/.ssh" userGroup
   userGroup=$(id -gn "$username" 2>/dev/null)
   if $SUDO test -f "$sharedSsh/config"; then
     private.this.dir.ensure "$targetHome/.ssh" "$userGroup" 700 "$username" >/dev/null \
       || warn.log "user.oosh.install: $RESULT"
-    $SUDO cat "$sharedSsh/config" | private.user.ssh.file.put "$username" "$targetHome/.ssh/config" 077 \
-      || warn.log "user.oosh.install: could not write $targetHome/.ssh/config as $username"
-    if $SUDO test -f "$sharedSsh/known_hosts"; then
-      $SUDO cat "$sharedSsh/known_hosts" | private.user.ssh.file.put "$username" "$targetHome/.ssh/known_hosts" 022 \
-        || warn.log "user.oosh.install: could not write $targetHome/.ssh/known_hosts as $username"
-    fi
+    $SUDO bash -c "
+      for f in config known_hosts; do
+        [ -f '$sharedSsh/'\"\$f\" ] && cp '$sharedSsh/'\"\$f\" '$targetHome/.ssh/' 2>/dev/null
+      done
+      chmod 700 '$targetHome/.ssh' # kernel-exception: pre-existing on dev, out of the heal scope
+      [ -f '$targetHome/.ssh/config' ]      && chmod 600 '$targetHome/.ssh/config' # kernel-exception: pre-existing on dev, out of the heal scope
+      [ -f '$targetHome/.ssh/known_hosts' ] && chmod 644 '$targetHome/.ssh/known_hosts' # kernel-exception: pre-existing on dev, out of the heal scope
+    " 2>/dev/null
+    private.user.ssh.tree.handover "$username" "$targetHome" >/dev/null \
+      || warn.log "user.oosh.install: $RESULT"
   fi
 
   # Mark every folder under the shared base as safe for the new user (owned by
@@ -1502,30 +1507,31 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # per-user invocation was dropped by d9adb27 alongside band-aids).
   # test/test.platform.ssh.layout.invariant pins the invariant.
   #
-  # The build runs AS the user, so every entry it makes is theirs from the
-  # start: it ran under $SUDO and a recursive chown handed the tree over
-  # afterwards. The staged identities (ossh install puts them into
-  # ${OSSH_STAGE_DIR:-/tmp} as oosh.installer.* / oosh.outer.*, readable by the
-  # caller only) are written into a stage directory the user owns, inside their
-  # ~/.ssh, and removed after the build. ~/.ssh itself comes from
-  # private.this.dir.ensure (owner, login group, 700) when it is missing.
-  local ownerEmail stageDir stagedFile
+  # $SUDO bash -c so writes succeed even when the caller can't write into
+  # the target user's $HOME (e.g. test creating oosh-user via the platform
+  # test pipeline). osshLayout creates files as root because it runs under
+  # $SUDO, then the entire .ssh tree is handed over to the target user
+  # (private.user.ssh.tree.handover). Safe because Phase 2 of the .ssh/
+  # correctness plan replaced all symlinks under ids/ with real-file copies
+  # (verified by test.osshLayout's no-symlink assertions and
+  # test.platform.ssh.layout.invariant). Without the hand-over, ~/.ssh/ids/ is
+  # owned by root with mode 700 and the user can't even read their own
+  # developking key for github auth. A missing ~/.ssh is created first through
+  # private.this.dir.ensure.
+  local ownerEmail
   ownerEmail=$(private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")"$'\n'"'$sharedOosh/ogit' config.email.get" 2>/dev/null) || true
   [ -z "$ownerEmail" ] && ownerEmail="${username}@$(private.this.host.name.get)"
   private.this.dir.ensure "$targetHome/.ssh" "$userGroup" 700 "$username" >/dev/null \
     || warn.log "user.oosh.install: $RESULT"
-  stageDir="$targetHome/.ssh/.oosh.stage"
-  private.this.dir.ensure "$stageDir" "$userGroup" 700 "$username" >/dev/null \
-    || warn.log "user.oosh.install: $RESULT"
-  for stagedFile in "${OSSH_STAGE_DIR:-/tmp}"/oosh.installer.* "${OSSH_STAGE_DIR:-/tmp}"/oosh.outer.*; do
-    $SUDO test -f "$stagedFile" || continue
-    $SUDO cat "$stagedFile" | private.user.ssh.file.put "$username" "$stageDir/${stagedFile##*/}" 077 \
-      || warn.log "user.oosh.install: could not stage ${stagedFile##*/} for $username"
-  done
-  private.as.user "$username" bash -c "$(private.this.as.user.preamble.get "$username" "$targetHome" "$sharedOosh")
-    OSSH_STAGE_DIR='$stageDir' USER_EMAIL='$ownerEmail' '$sharedOosh/osshLayout' build '' '' '$targetHome/.ssh'
+  # oosh-dir-exception: installs ANOTHER user before their ~/oosh symlink exists
+  # path-exception: same string, same reason — no user.env has been read there.
+  $SUDO bash -c "
+    export OOSH_DIR='$sharedOosh'
+    export PATH=\"\$OOSH_DIR:\$PATH\"
+    USER_EMAIL='$ownerEmail' '$sharedOosh/osshLayout' build '' '' '$targetHome/.ssh'
   " || warn.log "osshLayout build for '$username' did not complete cleanly — ~/.ssh/ids/ may be incomplete"
-  private.as.user "$username" rm -rf "$stageDir"
+  private.user.ssh.tree.handover "$username" "$targetHome" >/dev/null \
+    || warn.log "user.oosh.install: $RESULT"
 
   # The login shell: bash, through the one method state 32 and the heal call
   # (owner decision 3); the SSH/docker group memberships, dispatched via os.check.
