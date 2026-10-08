@@ -1114,6 +1114,8 @@ test.install.healArmProbe() # <fixture> <sh-args…> # runs the extracted healAr
     echo 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"'
     echo ': ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}'
     echo 'die() { echo "oosh install: $*" >&2; exit 1; }'
+    # the arm reads what the early parse (healArgs, before Phase A) recorded
+    sed -n '/^# BEGIN healArgs$/,/^# END healArgs$/p' "$INIT_SCRIPT"
     echo 'set -e'
     sed -n '/^# BEGIN healArm$/,/^# END healArm$/p' "$INIT_SCRIPT"
     echo 'echo FELL-THROUGH'
@@ -1443,5 +1445,136 @@ test.case $level "T-INIT-REFUSES-BROKEN-HOME-OOSH: an unreadable .git/HEAD is re
   test.install.brokenTreeUnreadableHead
 expect 0 "an unreadable HEAD is refused, not a shell abort" \
   "read -r _bh < HEAD under set -e killed the installer with 'cannot open'"
+
+# T-INIT-HEAL-EARLY-PARSE: the heal's arguments are parsed BEFORE Phase A (the
+# healArgs block), so Phase A's bash hand-over already knows the heal and its
+# branch; the arm reads the recorded values and parses nothing again. The
+# block runs standalone under POSIX sh; the script's own arguments stay intact.
+test.install.healArgsProbe() # <sh-args…> # runs the extracted healArgs block as `sh probe <args>`, echoes "BR=[…] WHO=[…] HEAL=[…] ARGS=[…] RC=<rc>"
+{
+  local fx out rc
+  fx=$(test.suite.fixture.make healargsprobe) || return 1
+  {
+    echo '#!/usr/bin/env sh'
+    echo 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"'
+    echo ': ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}'
+    echo 'die() { echo "oosh install: $*" >&2; exit 1; }'
+    sed -n '/^# BEGIN healArgs$/,/^# END healArgs$/p' "$INIT_SCRIPT"
+    echo 'echo "BR=[$OOSH_BRANCH] WHO=[${_hw-}] HEAL=[${_heal-}] ARGS=[$*]"'
+  } > "$fx/probe"
+  if ! grep -q '^# BEGIN healArgs$' "$fx/probe"; then rm -rf "$fx"; echo "NO-BLOCK RC=99"; return 0; fi
+  out="$(env -u OOSH_BRANCH -u OOSH_SELF_BRANCH sh "$fx/probe" "$@" 2>&1)"; rc=$?
+  rm -rf "$fx"
+  echo "$out RC=$rc"
+}
+
+test.install.healEarlyParse() {
+  local out bad="" me args phaseA arm
+  me=$(id -un)
+  out=$(test.install.healArgsProbe heal dev.heal all)
+  [ "$out" = "BR=[dev.heal] WHO=[all] HEAL=[1] ARGS=[heal dev.heal all] RC=0" ] || bad="$bad heal-dev.heal-all=[$out]"
+  out=$(test.install.healArgsProbe heal origin/prod)
+  [ "$out" = "BR=[prod] WHO=[$me] HEAL=[1] ARGS=[heal origin/prod] RC=0" ] || bad="$bad heal-origin/prod=[$out]"
+  out=$(test.install.healArgsProbe heal)
+  [ "$out" = "BR=[dev] WHO=[$me] HEAL=[1] ARGS=[heal] RC=0" ] || bad="$bad heal=[$out]"
+  out=$(test.install.healArgsProbe)
+  [ "$out" = "BR=[dev] WHO=[] HEAL=[] ARGS=[] RC=0" ] || bad="$bad no-args=[$out]"
+  out=$(test.install.healArgsProbe mode root host _ prod 3)
+  [ "$out" = "BR=[dev] WHO=[] HEAL=[] ARGS=[mode root host _ prod 3] RC=0" ] || bad="$bad mode-root=[$out]"
+  out=$(test.install.healArgsProbe heal -x)
+  case "$out" in *"heal: bad argument '-x'"*"RC=1") ;; *) bad="$bad bad-arg=[$out]" ;; esac
+  # placement: after the clean re-exec, before Phase A; the arm parses nothing itself
+  args=$(grep -n '^# BEGIN healArgs$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  phaseA=$(grep -n '^# Phase A — self-install' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  { [ -n "$args" ] && [ -n "$phaseA" ] && [ "$args" -lt "$phaseA" ]; } || bad="$bad placement(args=$args phaseA=$phaseA)"
+  arm=$(sed -n '/^# BEGIN healArm$/,/^# END healArm$/p' "$INIT_SCRIPT" | grep -v '^#')
+  case "$arm" in *'for _ha'*|*'id -un'*) bad="$bad arm-parses-again" ;; esac
+  [ -z "$bad" ] && create.result 0 "heal <branch> <who> is recorded before Phase A and the arguments stay intact" || create.result 1 "heal early parse:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-HEAL-EARLY-PARSE: the heal's branch and who are parsed before Phase A, the arguments stay intact" \
+  test.install.healEarlyParse
+expect 0 "heal <branch> <who> is recorded before Phase A and the arguments stay intact" \
+  "the arm parsed its branch after Phase A's bash hand-over had already pre-cloned the self branch"
+
+# T-INIT-PIPE-HEAL-ARGS-SURVIVE: on macOS the pipe form (`curl … | sh -s -- heal
+# dev.heal all`, sh = bash 3.2) reached Phase A step 4, which pre-cloned the SELF
+# branch (dev, no heal arm) and re-ran ITS installer: a plain install instead of
+# a heal. The healArgs block and step 4 run standalone under sh with oosh_bash_ok
+# false, the brew prefix and /etc/paths.d moved into the fixture, and stub git
+# and bash that record what they got. A heal never hands over and never
+# pre-clones (the arm is POSIX sh; Phase B puts brew bash first on PATH for its
+# child); any other run hands over with every argument.
+test.install.step4Probe() # <fixture> <pipe|file> <sh-args…> # runs healArgs + Phase A step 4 as sh, echoes "<output> GIT=[…] RC=<rc>"
+{
+  local fx="$1" form="$2" out rc; shift 2
+  rm -rf "$fx/tmp" "$fx/git.log" "$fx/pathsd"; mkdir -p "$fx/tmp" "$fx/hb" "$fx/bin" "$fx/pathsd"
+  printf '%s\n' '#!/bin/sh' 'echo "BASH-EXEC [$*]"' > "$fx/hb/bash"
+  printf '%s\n' '#!/bin/sh' "echo \"\$*\" >> '$fx/git.log'" 'eval "d=\${$#}"; mkdir -p "$d/init" && : > "$d/init/oosh"' > "$fx/bin/git"
+  chmod 755 "$fx/hb/bash" "$fx/bin/git"
+  {
+    echo '#!/usr/bin/env sh'
+    echo 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"'
+    echo ': ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}'
+    echo 'die() { echo "oosh install: $*" >&2; exit 1; }'
+    echo 'oosh_bash_ok() { return 1; }'
+    echo 'oosh_pm_env() { :; }'
+    echo 'OOSH_PM_BIN=brew; OOSH_PM="brew install"; SUDO=""'
+    sed -n '/^# BEGIN healArgs$/,/^# END healArgs$/p' "$INIT_SCRIPT"
+    awk '/^# ─── 4\. Install bash 4\+/{f=1} f{print; if (/^fi$/) exit}' "$INIT_SCRIPT" \
+      | sed -e "s#/opt/homebrew/bin#$fx/hb#g" -e "s#/usr/local/bin#$fx/nolocal#g" -e "s#/etc/paths.d#$fx/pathsd#g"
+    echo 'echo "FELL-THROUGH BR=[$OOSH_BRANCH] WHO=[${_hw-}] HEAL=[${_heal-}]"'
+  } > "$fx/probe"
+  if [ "$form" = pipe ]; then
+    out="$(cat "$fx/probe" | env -u OOSH_BRANCH -u OOSH_SELF_BRANCH -u OOSH_REPO TMPDIR="$fx/tmp" PATH="$fx/bin:$PATH" sh -s -- "$@" 2>&1)"; rc=$?
+  else
+    out="$(env -u OOSH_BRANCH -u OOSH_SELF_BRANCH -u OOSH_REPO TMPDIR="$fx/tmp" PATH="$fx/bin:$PATH" sh "$fx/probe" "$@" 2>&1 </dev/null)"; rc=$?
+  fi
+  echo "$out GIT=[$(cat "$fx/git.log" 2>/dev/null)] RC=$rc"
+}
+
+test.install.pipeHealArgsSurvive() {
+  local fx out bad="" me left
+  me=$(id -un)
+  fx=$(test.suite.fixture.make step4probe) || return 1
+  # the macOS report: the heal falls through to the arm with its branch — no clone, no hand-over
+  out=$(test.install.step4Probe "$fx" pipe heal dev.heal all)
+  case "$out" in *"FELL-THROUGH BR=[dev.heal] WHO=[all] HEAL=[1] GIT=[] RC=0") ;; *) bad="$bad pipe-heal=[$out]" ;; esac
+  case "$out" in *BASH-EXEC*) bad="$bad pipe-heal-handed-over" ;; esac
+  left=$(find "$fx/tmp" -mindepth 1 -maxdepth 1); [ -z "$left" ] || bad="$bad pipe-heal-temp-left=[$left]"
+  out=$(test.install.step4Probe "$fx" pipe heal)
+  case "$out" in *"FELL-THROUGH BR=[dev] WHO=[$me] HEAL=[1] GIT=[] RC=0") ;; *) bad="$bad pipe-heal-self=[$out]" ;; esac
+  out=$(test.install.step4Probe "$fx" file heal prod)
+  case "$out" in *"FELL-THROUGH BR=[prod] WHO=[$me] HEAL=[1] GIT=[] RC=0") ;; *) bad="$bad file-heal=[$out]" ;; esac
+  # an install still hands over to the new bash, with every argument
+  out=$(test.install.step4Probe "$fx" pipe mode root host _ prod 3)
+  case "$out" in *"BASH-EXEC [$fx/tmp/"*"/once.sh/init/oosh mode root host _ prod 3]"*"GIT=[clone -b dev "*) ;; *) bad="$bad pipe-install=[$out]" ;; esac
+  case "$out" in *FELL-THROUGH*) bad="$bad pipe-install-not-handed-over" ;; esac
+  out=$(test.install.step4Probe "$fx" file mode root host _ prod 3)
+  case "$out" in *"BASH-EXEC [$fx/probe mode root host _ prod 3] GIT=[] RC=0") ;; *) bad="$bad file-install=[$out]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a heal reaches the arm with its branch and no pre-clone; an install hands over with every argument" || create.result 1 "step 4:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-PIPE-HEAL-ARGS-SURVIVE: curl … | sh -s -- heal <branch> [all] under bash 3.2 reaches the arm, not a plain install of dev" \
+  test.install.pipeHealArgsSurvive
+expect 0 "a heal reaches the arm with its branch and no pre-clone; an install hands over with every argument" \
+  "the macOS VM pre-cloned dev and ran a plain install instead of healing dev.heal"
+
+# T-INIT-REEXEC-KEEPS-ARGS: every re-exec of the installer passes the
+# caller's arguments on ("$@"), so `heal <branch> [all]` survives each one.
+# Continuation lines are joined; the one exec without "$@" is the final
+# hand-off to the login shell (`exec "${BASH_FILE:-bash}" -l`), not a re-exec.
+test.install.reexecKeepsArgs() {
+  local lines
+  lines=$(awk '{ if (/^[ \t]*#/) next; l = l $0; if (l ~ /\\$/) { sub(/\\$/, "", l); next } print l; l = "" }' "$INIT_SCRIPT" \
+    | grep -E '(^|[;&|{ ])exec ' | grep -v '"\$@"' | grep -vF 'exec "${BASH_FILE:-bash}" -l')
+  [ -z "$lines" ] && create.result 0 "every re-exec of init/oosh passes the arguments on" || create.result 1 "re-exec without \"\$@\": [$lines]"
+  return $(result)
+}
+test.case $level "T-INIT-REEXEC-KEEPS-ARGS: every exec of init/oosh carries \"\$@\" (the login hand-off excepted)" \
+  test.install.reexecKeepsArgs
+expect 0 "every re-exec of init/oosh passes the arguments on" \
+  "a re-exec that drops the arguments turns heal <branch> [all] into a plain install"
 
 test.suite.save.results
