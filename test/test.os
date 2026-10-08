@@ -1115,17 +1115,28 @@ test.os.healUserCloneCheck() {
     # HEAD moved
     printf '%s %s %s\n' "0000000000000000000000000000000000000000" "$me" "1" > "$fx/rec"
     printf '%s\n' "$script" | sh >/dev/null 2>&1 && bad="$bad head-moved-passed"
+    # the heal's fast-forward: the recorded HEAD is an ancestor of the new one — kept
+    git -C "$B/dev.heal" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m ahead
+    printf '%s %s %s\n' "$head" "$me" "1" > "$fx/rec"
+    out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad fast-forward-red=[$out]"
+    case "$out" in *"fast-forward"*) ;; *) bad="$bad fast-forward-unsaid=[$out]" ;; esac
+    # a rewritten history: the recorded HEAD is on a branch the new HEAD does not contain
+    git -C "$B/dev.heal" -c user.email=t@t -c user.name=t -c commit.gpgsign=false checkout -q -b other "$head"
+    git -C "$B/dev.heal" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m side
+    printf '%s %s %s\n' "$(git -C "$B/dev.heal" rev-parse HEAD)" "$me" "1" > "$fx/rec"
+    git -C "$B/dev.heal" checkout -q dev.heal
+    printf '%s\n' "$script" | sh >/dev/null 2>&1 && bad="$bad divergent-passed"
     # the folder gone
     printf '%s %s %s\n' "$head" "$me" "1" > "$fx/rec"
     mv "$B/dev.heal" "$fx/gone"
     printf '%s\n' "$script" | sh >/dev/null 2>&1 && bad="$bad folder-gone-passed"
   fi
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "the kept clone passes; an aside entry of the branch, another owner, another HEAD and a missing folder fail" || create.result 1 "user.clone check:$bad"
+  [ -z "$bad" ] && create.result 0 "the kept clone passes; an aside entry of the branch, another owner, a divergent HEAD and a missing folder fail; a fast-forward passes" || create.result 1 "user.clone check:$bad"
   return $(result)
 }
 test.case $level "T-OS-HEAL-USER-CLONE-CHECK: the user.clone check fails on an aside entry or an owner change and passes on an untouched clone" test.os.healUserCloneCheck
-expect 0 "the kept clone passes; an aside entry of the branch, another owner, another HEAD and a missing folder fail" \
+expect 0 "the kept clone passes; an aside entry of the branch, another owner, a divergent HEAD and a missing folder fail; a fast-forward passes" \
   "bug of 2026-10-08: as root git's dubious ownership made the heal move a healthy user clone aside"
 
 ### test.method

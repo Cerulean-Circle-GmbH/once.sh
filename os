@@ -1055,7 +1055,7 @@ OOSH_HEAL_FOREIGN
 }
 
 
-private.os.platform.heal.user.clone.check.script.get()     # <branch> # echo the POSIX sh that checks, as root in a platform container, that the clone the breakage user.clone made is kept: <base>/<branch> is there with the owner and the HEAD recorded in /opt/user.clone.heal.rec and no <base>.aside/<branch>.orig.* entry exists; prints every difference, rc 1 on any; silent getter, rc 1 for a bad <branch> #
+private.os.platform.heal.user.clone.check.script.get()     # <branch> # echo the POSIX sh that checks, as root in a platform container, that the clone the breakage user.clone made is kept: <base>/<branch> is there with the owner and the HEAD recorded in /opt/user.clone.heal.rec and no <base>.aside/<branch>.orig.* entry exists (a fast-forward of the HEAD is expected); prints every difference, rc 1 on any; silent getter, rc 1 for a bad <branch> #
 {
  # NO create.result — a getter consumed as $(...) by
  # private.os.platform.heal.user.clone.check and by its test, which points B
@@ -1077,10 +1077,14 @@ else
   owner=$(stat -c %U "$D")
   [ "$owner" = "$rec_owner" ] || { echo "user.clone: the owner of $D changed: $rec_owner -> $owner"; rc=1; }
   head=$(rgit -C "$D" rev-parse HEAD)
-  [ "$head" = "$rec_head" ] || { echo "user.clone: the HEAD of $D changed: $rec_head -> $head"; rc=1; }
+  if [ "$head" != "$rec_head" ]; then
+    # the heal fast-forwards a clean clone that is behind origin: a child of the recorded HEAD is expected
+    if rgit -C "$D" merge-base --is-ancestor "$rec_head" "$head" 2>/dev/null; then say "the heal fast-forwarded $D: $rec_head -> $head (expected)"
+    else echo "user.clone: the HEAD of $D is no fast-forward of the record: $rec_head -> $head"; rc=1; fi
+  fi
   [ "$(stat -c %i "$D")" = "$rec_ino" ] || say "the inode of $D differs from the record (the folder was replaced)"
 fi
-[ "$rc" = 0 ] && say "$D is kept: owner $rec_owner, HEAD $rec_head, nothing aside"
+[ "$rc" = 0 ] && say "$D is kept: owner $rec_owner, HEAD $head (recorded $rec_head; a fast-forward by the heal is expected), nothing aside"
 exit "$rc"
 OOSH_HEAL_USER_CLONE_CHECK
 }

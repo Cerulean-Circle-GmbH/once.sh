@@ -170,7 +170,7 @@ shape is there. The container is disposable, so an arm may delete.
 | `merge.conflict` | A half-done merge: `MERGE_HEAD` set, markers in `heal.conflict.txt` | `<base>/<branch>` |
 | `dirty` | An uncommitted change in `os` | `<base>/<branch>` |
 | `detached` | `HEAD` detached (through `update-ref`, last: a merge in progress refuses a checkout); `oosh-user`'s `~/oosh` is pointed at the broken folder, as the Mac's one user lives in it | `<base>/<branch>`, `oosh-user` |
-| `user.clone` | `<base>/<branch>` rebuilt as a **healthy** clean clone of the branch, owned by `test` (group of the base, setgid, cloned as `test` from the installed tree), not trusted by root (no `safe.directory` entry); HEAD, owner and inode are recorded in `/opt/user.clone.heal.rec` — the shape `oo checkout <branch>` leaves. The heal must **keep** it: the check fails the run on a `<base>.aside/<branch>.orig.*` entry, a changed owner or HEAD, or a missing folder | `<base>/<branch>`, `test` |
+| `user.clone` | `<base>/<branch>` rebuilt as a **healthy** clean clone of the branch, owned by `test` (group of the base, setgid, cloned as `test` from the installed tree), not trusted by root (no `safe.directory` entry); HEAD, owner and inode are recorded in `/opt/user.clone.heal.rec` — the shape `oo checkout <branch>` leaves. The heal must **keep** it (kept, fast-forwarded: a HEAD that is a child of the recorded one is expected): the check fails the run on a `<base>.aside/<branch>.orig.*` entry, a changed owner, a HEAD that is no fast-forward of the record, or a missing folder | `<base>/<branch>`, `test` |
 
 **What a PASS still shows as `[left]`.** These are reports, not failures, and they stand on every heal (the second one too): root's legacy `ssh.*` folders (`ssh.backup.migrate` moves them; the heal never does), the old-format `user.env` values of a real `~/config` that are never carried over, foreign trees left untouched (`foreign.symlink`), and a canonical folder moved aside to `<base>.aside/<name>.orig.<ts>` for you to look at.
 
@@ -194,7 +194,7 @@ the folder as a healthy clone owned by `test`, so it comes last, is **left out o
 is refused together with `missing.branch`, `diverged`, `markers.committed`, `merge.conflict`, `dirty` or `detached`
 (`private.os.platform.heal.breakage.list.get`). After the second heal `private.os.platform.heal.user.clone.check`
 fails the run (`user-clone=1` in the verdict line, log step `user-clone`) when that clone was moved aside or its
-owner or HEAD changed. The fixture files travel as text
+owner changed or the HEAD is no fast-forward of the record. The fixture files travel as text
 inside the one script (`private.os.platform.heal.fixture.script.get`, `private.os.platform.root.script.run`).
 
 **Logs.** `private.os.platform.heal.log.get <step> <platform>` is `/tmp/oosh-heal-test-<step>-<platform>.log` for
