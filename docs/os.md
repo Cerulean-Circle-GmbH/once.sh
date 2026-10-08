@@ -191,7 +191,7 @@ as root through `private.os.platform.root.script.run`; its RESULT is `<name> che
 
 **The transport** (`private.os.platform.user.run`): `runuser` gets `env HOME=~<user>` (it keeps the caller's environment, so HOME would stay the ssh login's), root runs through `sudo -H`, and every command starts with `unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND` — `ogit.folder.finish` in the gates' fixtures trusts folders for `$SUDO_USER`, which filled the login's `.gitconfig`.
 
-**Who moves.** Under `oo heal <branch> all` only the healer and the login that ran sudo move to `<branch>` (`private.oo.heal.user.keep.check`); `oosh-user`, `bash-user` and `developking` keep their installed branch, so a check of the scenario must not expect them on `<branch>`.
+**Who moves** under `oo heal <branch> all` is [oo.md § oo.heal](oo.md#ooheal)'s rule (`all`): here `oosh-user`, `bash-user` and `developking` keep their installed branch, so a check of the scenario must not expect them on `<branch>`.
 
 The folder arms build on one another in this order: `missing.branch` clears `<base>/<branch>`; `diverged`
 clones it again from the installed tree and commits on it; `markers.committed` commits on it; `merge.conflict`

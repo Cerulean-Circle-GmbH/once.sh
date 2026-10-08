@@ -12,14 +12,8 @@ drag-and-drop, and the **heal** (`curl … | sh -s -- heal`, see [The heal arm](
 ## The clean re-exec
 
 Recovering `$HOME` makes an `env -i` start *survivable*. The guarantee that the installer runs in
-a clean environment is a separate thing, and it used to come from a shebang:
-
-```sh
-#!/usr/bin/env -iS HOME=${HOME} sh     # 2024-04-07 (8c277f4) … 2026-03-09 (075b4a3)
-```
-
-`075b4a3` removed it for Alpine — BusyBox `env` has no `-S` — and nothing replaced it. `init/oosh`
-now re-establishes it itself, immediately after the branch default:
+a clean environment is a separate thing. It cannot come from a shebang (`#!/usr/bin/env -iS …`):
+BusyBox `env` (Alpine) has no `-S`. `init/oosh` establishes it itself, immediately after the branch default:
 
 ```sh
 if [ -z "$OOSH_CLEAN_ENV" ] && [ -f "$0" ] && [ -r "$0" ]; then
@@ -50,10 +44,7 @@ there is nothing to re-exec, so that path skips. `OOSH_CLEAN_ENV` makes it fire 
 wipes `OOSH_SELF_BRANCH`, which is not carried, so re-execing any earlier silently resolves the
 branch to `dev` and discards a caller's override.
 
-**Anything the installer reads but never sets must be named in the carry list.** `init/oosh` was
-rewritten three times (`b8b90b8`, `b427809`, `0594657`) during the two years the guarantee was
-absent, so no part of the current file had ever run under `env -i`; two variables had grown a
-dependency on inheritance:
+**Anything the installer reads but never sets must be named in the carry list.**
 
 The guarantee is therefore **not "empty"**. It is *deterministic for oosh, pass-through for the
 tools oosh calls*. `env -i` strips not only what `init/oosh` itself reads, but the environment
@@ -71,7 +62,7 @@ load-bearing and *wrongly* conclude Group 2 is removable.
 |---|---|
 | `HOME` | every anchor hangs off it |
 | `OOSH_CLEAN_ENV` | the once-only sentinel; without it the re-exec loops |
-| `OOSH_BRANCH` | the caller's branch choice — `57f0984` fixed exactly this loss |
+| `OOSH_BRANCH` | the caller's branch choice |
 | `OOSH_NO_AUTORUN` | sourcing/test guard |
 | `SUDO_USER` | assigned nowhere in the file. `sudo ./init/oosh` would otherwise lose the invoker, and the post-install `user oosh.install "$SUDO_USER"` silently never runs |
 | `OOSH_REPO` | assigned nowhere in the file. A fork or private-repo override would otherwise fall back to public GitHub with no error |
@@ -98,8 +89,8 @@ empty explicitly; an empty proxy variable reads as "no proxy".
 
 **Only set variables are carried.** `env -i VAR= cmd` does not leave `VAR` absent — it *sets*
 it to the empty string, and empty is not unset: git runs a set-but-empty `GIT_SSH_COMMAND` as
-the command `''` ("error: cannot run : No such file or directory"), which made install state 31's
-ssh clone fail silently on every install through the re-exec. Each variable is therefore
+the command `''` ("error: cannot run : No such file or directory"), and install state 31's ssh clone
+fails silently. Each variable is therefore
 tested with `${VAR+set}` and appended only when the caller has it; POSIX `sh` has no arrays,
 so the `env` argument list is assembled in `"$@"`. Pinned by **T-INIT-CLEAN-ENV-ABSENT**.
 
@@ -120,11 +111,11 @@ On an Apple-Silicon Mac that *already* has Homebrew this is fatal and does not r
 `curl` → as root that aborts with *"Don't run this as root!"* → `die "Homebrew bootstrap failed"`.
 The `eval "$(/opt/homebrew/bin/brew shellenv)"` that would have rescued `PATH` sits **inside that
 same failure branch**, after the installer has already run, so it is never reached. Nothing in the
-re-exec discovers brew; the Homebrew prepend now lives in Phase A's `brewPath` block (see below),
+re-exec discovers brew; the Homebrew prepend lives in Phase A's `brewPath` block (see below),
 and Phase B keeps only the current-bash-dir prepend. Intel Macs escape only because their brew lives
 in `/usr/local/bin`.
 
-So `PATH` is now **seeded to a fixed, known-good list** rather than carried:
+So `PATH` is **seeded to a fixed, known-good list** rather than carried:
 
 ```sh
 PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -156,16 +147,15 @@ unattended installer cannot answer anyway).
 ## The Homebrew `PATH` prepend (`brewPath`)
 
 The seeded `PATH` above belongs to the clean re-exec. The pipe form (`curl … | sh -s -- …`) has no
-clean re-exec — `$0` is `sh` — so it keeps the **caller's** `PATH`, and a Mac account without
-`/opt/homebrew/bin` on it (an ssh login of a second user) found neither `brew` nor its bash 5: it saw only
-`/bin/bash` 3.2 and died "bash 4+ missing". The `brewPath` block in Phase A, before the package-manager
-detection and the bash 4+ check, fixes that: on Darwin only, it prepends `/opt/homebrew/bin`, then
+clean re-exec — `$0` is `sh` — so it keeps the **caller's** `PATH`, which on a Mac account (an ssh login
+of a second user) may lack `/opt/homebrew/bin` and so `brew` and its bash 5. The `brewPath` block in Phase A,
+before the package-manager detection and the bash 4+ check, puts them there: on Darwin only, it prepends `/opt/homebrew/bin`, then
 `/usr/local/bin`, each only when the directory exists and is not already on `PATH`. Phase B's own
 prepend is reduced to the directory of the `bash` already found. On macOS `sh` is itself bash 3.2: the
 file form re-execs under a bash 4+, the heal does not need to (see below).
 
-> Guarded by **T-INIT-PHASE-A-BREW-PATH**, which runs the extracted block under `sh` with `uname`
-> stubbed (it replaces the grep **T-INIT-BASH-PATH-PREPEND**).
+> Guarded by **T-INIT-PHASE-A-BREW-PATH**, which runs the extracted blocks under `sh` with `uname`
+> stubbed and asserts the resulting `PATH`.
 
 ## The heal arm
 
@@ -189,9 +179,7 @@ carries the arguments intact and Phase A's step 4 already knows it is a heal; th
 recorded values. The block is a size-exception block too. **Step 4 never hands over or pre-clones for a
 heal**: the arm is POSIX `sh`, and the child `oo heal` runs under the `bash` that `command -v bash`
 finds after `brewPath` (and Phase B's current-bash-dir prepend) has put the right directory first, so
-no temp directory is made to leak. Before, on macOS the pipe form's bash 3.2 hand-over pre-cloned
-`OOSH_SELF_BRANCH` (`dev`, whose installer has no heal arm) and re-ran it without the arguments: the
-machine got a plain install instead of a heal.
+no temp directory is made to leak, and a heal never turns into a plain install of `OOSH_SELF_BRANCH`.
 
 > Guarded by **T-INIT-HEAL-EARLY-PARSE**, **T-INIT-PIPE-HEAL-ARGS-SURVIVE** and
 > **T-INIT-REEXEC-KEEPS-ARGS**.
@@ -219,8 +207,7 @@ reason.
   with a terminal, `sudo -n -H` without one. When root cannot be had it ends with **rc 2 before anything
   runs** and names the curl form run as root (`curl -fsSL <init/oosh> | sudo sh -s -- heal <branch> all`;
   the clone itself is gone when the arm ends). The privilege rule is written once, in
-  [oo.md § The privilege rule](oo.md). Before, the arm repeated that decision itself (`sudo -n true || sudo -v`,
-  then `sudo -H bash <clone>/oo heal …`). Guarded by **T-INIT-HEAL-ARM-HANDOVER-NO-SUDO** and
+  [oo.md § The privilege rule](oo.md#ooheal). Guarded by **T-INIT-HEAL-ARM-HANDOVER-NO-SUDO** and
   **T-OO-HEAL-ARM-TREE-NO-COPY**.
 - **stdin.** In the pipe form stdin *is* the script, so the child must never read it: it reads `/dev/tty`
   when there is a terminal (so its `oo heal` can ask for the sudo password), else `/dev/null` — and then

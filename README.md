@@ -18,7 +18,7 @@ Code flows through a gated pipeline: `dev` → `stage` → `prod`. See [Branchin
 
 > **Why curl/wget/fetch is listed first:** the install one-liner below (`sh -c "$(curl …)"`) relies on the shell's command-substitution to pull the installer from GitHub. If the fetcher is missing, the shell silently runs `sh -c ""` and nothing happens — you'll see *`sh: curl: command not found`* with no framed error. This is inherent to a one-liner and cannot be fixed without it ceasing to be one, so install a fetcher first (any one of curl / wget / fetch), then run it.
 >
-> The **`Install oosh.command` wrapper does check**: with no fetcher on PATH it names the three it accepts, prints the install command for your platform, and exits non-zero. It used to share the one-liner's failure mode and report `✓ Install complete.` having installed nothing.
+> The **`Install oosh.command` wrapper does check**: with no fetcher on PATH it names the three it accepts, prints the install command for your platform, and exits non-zero — it never reports `✓ Install complete.` having installed nothing.
 >
 > The installer itself checks **bash 4+** and **git** and prints a consolidated error with per-platform install hints if either is missing.
 
@@ -70,7 +70,7 @@ branch, `oo mode` finding nothing) is healed with one command. Like the installe
 
 The heal clones `<branch>` fresh into a temporary folder and runs *that* tree's `oo heal` — it never touches
 your `~/oosh`, so it works when `~/oosh` is the broken part. `<branch>` defaults to the branch of the URL
-(the `prod` one-liner heals to `prod`); `all` heals every user and needs root: `heal all` always needs root: from a terminal it asks `sudo` for the password once, up front; without a terminal it needs root or passwordless sudo and stops with `2` before anything is cloned. A plain `heal` asks for sudo only when a step needs root (a user whose machine is already set up is never asked), and with `OOSH_HEAL_NONINTERACTIVE` set it uses `sudo -n` only and stops with `2` before any change when root is not available. It builds
+(the `prod` one-liner heals to `prod`); `all` heals every user and always needs root: from a terminal it asks `sudo` for the password once, up front; without a terminal it needs root or passwordless sudo and stops with `2` before anything is cloned. A plain `heal` asks for sudo only when a step needs root (a user whose machine is already set up is never asked), and with `OOSH_HEAL_NONINTERACTIVE` set it uses `sudo -n` only and stops with `2` before any change when root is not available. It builds
 the standard dev model — group `dev`, `developking`, the shared base with `main/` and `<branch>/` as clean
 clones, the shared config, and `~/oosh` + `~/config` of each user — and prints what it found, what it changed
 and what is left for you. It also installs the launcher `/usr/local/bin/this`, so an empty shell (`env -i sh`) finds `this`; where that shell has no `/usr/local/bin` on its PATH (BusyBox on Alpine) the launcher gets a second name, the link `/usr/bin/this`. Nothing is deleted: a broken folder is moved to `<base>.aside/<name>.orig.<ts>`, a real
