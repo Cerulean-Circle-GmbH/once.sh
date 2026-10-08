@@ -1205,16 +1205,26 @@ expect 0 "heal clones <branch> fresh, runs its oo heal <branch> <who>, removes t
 
 # T-INIT-HEAL-ARM-STDIN: in the pipe form the script IS stdin — neither the
 # clone nor the child may read it (the child gets /dev/tty or /dev/null); a
-# clone failure says so, fails, and leaves nothing in TMPDIR.
+# clone failure says so, fails, and leaves nothing in TMPDIR. A git first on
+# PATH reads one line of its stdin on `clone` and records it before it hands
+# over to the real git: a clone that inherited the pipe reads script text.
 test.install.healArmStdin() {
-  local fx out bad="" tmpLeft
+  local fx out bad="" tmpLeft realGit
   fx=$(test.install.healArmFixture healarmstdin)
+  realGit=$(command -v git)
+  printf '%s\n' '#!/bin/sh' \
+    'if [ "$1" = clone ]; then _l=""; IFS= read -r _l || true; echo "GIT [$*] STDIN=[$_l]" >> "'"$fx/git.log"'"; fi' \
+    "exec '$realGit' \"\$@\"" > "$fx/bin/git"
+  chmod 755 "$fx/bin/git"
   out=$(test.install.healArmProbe "$fx" pipe heal)
   case "$out" in *"STUB args=[heal dev "*) ;; *) bad="$bad pipe=[$out]" ;; esac
   case "$out" in *PADDING-MARKER*) bad="$bad child-read-the-script" ;; esac
   case "$out" in *"stdin=[tty] first=[]"*|*"stdin=[notty] first=[]"*) ;; *) bad="$bad stdin=[$out]" ;; esac
   case "$out" in *"RC=3") ;; *) bad="$bad pipe-rc=[$out]" ;; esac
-  sed -n '/^# BEGIN healArm$/,/^# END healArm$/p' "$INIT_SCRIPT" | grep -v '^#' | grep 'git clone' | grep -q '</dev/null' || bad="$bad clone-reads-stdin"
+  case "$(cat "$fx/git.log" 2>/dev/null)" in
+    "GIT [clone -q -b dev $fx/origin.git $fx/tmp/oosh-heal."*"/t] STDIN=[]") ;;
+    *) bad="$bad clone-stdin=[$(cat "$fx/git.log" 2>/dev/null)]" ;;
+  esac
   out=$(test.install.healArmProbe "$fx" heal nosuchbranch)
   case "$out" in *"heal: clone of nosuchbranch failed"*"RC=1") ;; *) bad="$bad bad-branch=[$out]" ;; esac
   tmpLeft=$(find "$fx/tmp" -mindepth 1 -maxdepth 1 -name 'oosh-heal.*')
@@ -1228,13 +1238,35 @@ test.case $level "T-INIT-HEAL-ARM-STDIN: curl … | sh -s -- heal: the script on
 expect 0 "the piped script is never read by the clone or the child; a failed clone is loud and leaves no temp dir" \
   "in the pipe form a child that inherits stdin swallows the rest of the installer"
 
+# The part of init/oosh from Phase B's prereq checks (git, bash 4+) through the
+# installer's "sudo missing" check, extracted in the file's own order and run
+# under sh after the healArgs block, with oosh_bash_ok answering <bashOk> and
+# PATH the fixture's bin only (no sudo unless the fixture put one there).
+test.install.prereqRegionProbe() # <fixture> <bashOk:yes|no> <sh-args…> # runs init/oosh from the prereq checks to the sudo check, echoes "<output> RC=<rc>"
+{
+  local fx="$1" bashOk="$2" out rc; shift 2
+  {
+    echo '#!/usr/bin/env sh'
+    echo 'OOSH_SELF_BRANCH="${OOSH_SELF_BRANCH:-dev}"'
+    echo ': ${OOSH_BRANCH:=$OOSH_SELF_BRANCH}'
+    echo 'die() { echo "oosh install: $*" >&2; exit 1; }'
+    sed -n '/^# BEGIN healArgs$/,/^# END healArgs$/p' "$INIT_SCRIPT"
+    echo "MODE=\"\"; oosh_bash_ok() { [ $bashOk = yes ]; }"
+    echo 'set -e'
+    awk '/^# ─── Prereqs \(essentials only\)/{f=1} /^# ─── Non-root → sudo re-exec/{exit} f{print}' "$INIT_SCRIPT"
+    echo 'echo PAST-THE-SUDO-CHECK'
+  } > "$fx/region"
+  out="$(umask 077; env -u OOSH_BRANCH -u OOSH_SELF_BRANCH -u OOSH_DIR -u CONFIG HOME="$fx/home" TMPDIR="$fx/tmp" PATH="$fx/bin" OOSH_REPO="$fx/origin.git" "$(command -v sh)" "$fx/region" "$@" 2>&1 </dev/null)"; rc=$?
+  echo "$out RC=$rc"
+}
+
 # T-INIT-HEAL-ARM-NO-SUDO: the arm needs no sudo — it runs before the
 # installer's "sudo missing" check and hands `heal` and `heal all` to the
 # clone's oo heal, which decides root itself (rc 2 without it:
 # T-OO-HEAL-ARM-TREE-NO-COPY). PATH holds only the tools the arm and the stub
 # use, sudo not among them.
 test.install.healArmNoSudo() {
-  local fx out bad="" c tmpLeft arm bashCheck sudoCheck
+  local fx out bad="" c tmpLeft
   fx=$(test.install.healArmFixture healarmnosudo)
   rm -f "$fx/bin/sudo"
   for c in sh bash env git mktemp chmod rm id ls cut cat; do ln -s "$(command -v "$c")" "$fx/bin/$c"; done
@@ -1246,15 +1278,23 @@ test.install.healArmNoSudo() {
   rm -f "$fx/bin/id"; printf '%s\n' '#!/bin/sh' '[ "$1" = -un ] && exit 1' "exec $(command -v id) \"\$@\"" > "$fx/bin/id"; chmod 755 "$fx/bin/id"
   out=$(HEAL_PROBE_PATH="$fx/bin" test.install.healArmProbe "$fx" heal)
   case "$out" in *"heal: this uid has no user name (id -un)"*"RC=1") ;; *) bad="$bad no-name=[$out]" ;; esac
+  # …and in init/oosh's own order (Phase B's prereq checks, the arm, the sudo
+  # check, run as one piece): a heal reaches the clone without sudo on PATH, a
+  # missing bash 4+ stops it before the clone, an install stops at the sudo check
+  rm -f "$fx/bin/id"; ln -s "$(command -v id)" "$fx/bin/id"
+  out=$(test.install.prereqRegionProbe "$fx" yes heal)
+  case "$out" in *"STUB args=[heal dev $(id -un)]"*"RC=3") ;; *) bad="$bad region-heal=[$out]" ;; esac
+  out=$(test.install.prereqRegionProbe "$fx" no heal)
+  case "$out" in *STUB*) bad="$bad region-heal-before-bash-check=[$out]" ;; *"bash 4+ missing"*"RC=1") ;; *) bad="$bad region-no-bash=[$out]" ;; esac
+  out=$(test.install.prereqRegionProbe "$fx" yes)
+  if [ "$(id -u)" -ne 0 ]; then
+    case "$out" in *"sudo missing for non-root install"*"RC=1") ;; *) bad="$bad region-install=[$out]" ;; esac
+  else
+    case "$out" in *"PAST-THE-SUDO-CHECK RC=0") ;; *) bad="$bad region-install-root=[$out]" ;; esac
+  fi
   tmpLeft=$(find "$fx/tmp" -mindepth 1 -maxdepth 1 -name 'oosh-heal.*')
   [ -z "$tmpLeft" ] || bad="$bad temp-left=[$tmpLeft]"
   rm -rf "$fx"
-  # …and in init/oosh the arm sits after the bash check, before the sudo check
-  arm=$(grep -n '^# BEGIN healArm$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
-  bashCheck=$(grep -n '^if ! oosh_bash_ok; then$' "$INIT_SCRIPT" | tail -1 | cut -d: -f1)
-  sudoCheck=$(grep -n 'die "sudo missing for non-root install' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
-  { [ -n "$arm" ] && [ -n "$bashCheck" ] && [ -n "$sudoCheck" ] && [ "$bashCheck" -lt "$arm" ] && [ "$arm" -lt "$sudoCheck" ]; } \
-    || bad="$bad placement(bash=$bashCheck arm=$arm sudo=$sudoCheck)"
   [ -z "$bad" ] && create.result 0 "heal and heal all reach the clone's oo heal without sudo" || create.result 1 "heal no sudo:$bad"
   return $(result)
 }
@@ -1465,8 +1505,24 @@ test.install.healArgsProbe() # <sh-args…> # runs the extracted healArgs block 
   echo "$out RC=$rc"
 }
 
+# What Phase A sees: init/oosh from its first line up to the Phase A header, run
+# under sh (no re-exec: OOSH_CLEAN_ENV is set), then a line that stands for
+# Phase A and prints the recorded heal.
+test.install.phaseAViewProbe() # <sh-args…> # runs init/oosh up to Phase A, echoes "PHASE-A HEAL=[…] BR=[…] WHO=[…] ARGS=[…] RC=<rc>"
+{
+  local fx out rc
+  fx=$(test.suite.fixture.make phaseaview) || return 1
+  {
+    awk '/^# Phase A — self-install/{exit} {print}' "$INIT_SCRIPT"
+    echo 'echo "PHASE-A HEAL=[${_heal-}] BR=[$OOSH_BRANCH] WHO=[${_hw-}] ARGS=[$*]"'
+  } > "$fx/probe"
+  out="$(env -u OOSH_BRANCH -u OOSH_SELF_BRANCH -u OOSH_NO_AUTORUN -u BASH_SOURCE HOME="$fx" OOSH_CLEAN_ENV=1 "$(command -v sh)" "$fx/probe" "$@" 2>&1 </dev/null)"; rc=$?
+  rm -rf "$fx"
+  echo "$out RC=$rc"
+}
+
 test.install.healEarlyParse() {
-  local out bad="" me args phaseA arm
+  local out bad="" me arm
   me=$(id -un)
   out=$(test.install.healArgsProbe heal dev.heal all)
   [ "$out" = "BR=[dev.heal] WHO=[all] HEAL=[1] ARGS=[heal dev.heal all] RC=0" ] || bad="$bad heal-dev.heal-all=[$out]"
@@ -1480,10 +1536,12 @@ test.install.healEarlyParse() {
   [ "$out" = "BR=[dev] WHO=[] HEAL=[] ARGS=[mode root host _ prod 3] RC=0" ] || bad="$bad mode-root=[$out]"
   out=$(test.install.healArgsProbe heal -x)
   case "$out" in *"heal: bad argument '-x'"*"RC=1") ;; *) bad="$bad bad-arg=[$out]" ;; esac
-  # placement: after the clean re-exec, before Phase A; the arm parses nothing itself
-  args=$(grep -n '^# BEGIN healArgs$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
-  phaseA=$(grep -n '^# Phase A — self-install' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
-  { [ -n "$args" ] && [ -n "$phaseA" ] && [ "$args" -lt "$phaseA" ]; } || bad="$bad placement(args=$args phaseA=$phaseA)"
+  # Phase A already sees the recorded heal, with the arguments intact
+  out=$(test.install.phaseAViewProbe heal dev.heal all)
+  [ "$out" = "PHASE-A HEAL=[1] BR=[dev.heal] WHO=[all] ARGS=[heal dev.heal all] RC=0" ] || bad="$bad phase-a-view=[$out]"
+  out=$(test.install.phaseAViewProbe mode root host _ prod 3)
+  [ "$out" = "PHASE-A HEAL=[] BR=[dev] WHO=[] ARGS=[mode root host _ prod 3] RC=0" ] || bad="$bad phase-a-install=[$out]"
+  # the arm parses nothing itself
   arm=$(sed -n '/^# BEGIN healArm$/,/^# END healArm$/p' "$INIT_SCRIPT" | grep -v '^#')
   case "$arm" in *'for _ha'*|*'id -un'*) bad="$bad arm-parses-again" ;; esac
   [ -z "$bad" ] && create.result 0 "heal <branch> <who> is recorded before Phase A and the arguments stay intact" || create.result 1 "heal early parse:$bad"
@@ -1606,8 +1664,34 @@ test.install.brewPathProbe() # <fixture> <Darwin|Linux> <hb|ul|both|none> <?path
   echo "$out"
 }
 
+# The order of effects: init/oosh from the brewPath block through step 1 (pm
+# detection), then Phase B's current-bash-dir prepend, in the file's order and
+# with the same fixture dirs; oosh_pm_detect is a stub that prints the PATH it
+# runs under and whether bash 4+ is found there.
+test.install.brewOrderProbe() # <fixture> <Darwin|Linux> # echoes "PM-DETECT PATH=[…] BASH-OK=<rc> END PATH=[…]"
+{
+  local fx="$1" os="$2" sub
+  rm -rf "$fx/hb" "$fx/ul" "$fx/stub"; mkdir -p "$fx/stub" "$fx/hb" "$fx/ul"
+  printf '%s\n' '#!/bin/sh' "echo $os" > "$fx/stub/uname"
+  printf '%s\n' '#!/bin/sh' 'echo "GNU bash, version 3.2.57(1)-release"' > "$fx/stub/bash"
+  printf '%s\n' '#!/bin/sh' 'echo "GNU bash, version 5.3.3(1)-release"' > "$fx/hb/bash"
+  chmod 755 "$fx/stub/uname" "$fx/stub/bash" "$fx/hb/bash"
+  sub=(-e "s#/opt/homebrew/bin#$fx/hb#g" -e "s#/usr/local/bin#$fx/ul#g")
+  {
+    echo '#!/usr/bin/env sh'
+    echo 'die() { echo "oosh install: $*" >&2; exit 1; }'
+    awk '/^oosh_bash_ok\(\) \{/{f=1} f{print; if (/^}$/) exit}' "$INIT_SCRIPT"
+    echo 'oosh_pm_detect() { if oosh_bash_ok; then _pb=0; else _pb=1; fi; echo "PM-DETECT PATH=[$PATH] BASH-OK=$_pb"; return 0; }'
+    awk '/^# BEGIN brewPath$/{f=1} /^# ─── 2\./{exit} /^# Phase B/{exit} f{print} f && /^if ! oosh_pm_detect; then$/{g=1} g && /^fi$/{exit}' "$INIT_SCRIPT" | sed "${sub[@]}"
+    awk '/^# Phase B — POSIX/{f=1} /^# ─── Arg parsing/{exit} f{print}' "$INIT_SCRIPT" | sed "${sub[@]}"
+    echo 'echo "END PATH=[$PATH]"'
+  } > "$fx/orderprobe"
+  env PATH="$fx/stub:/usr/bin:/bin" sh "$fx/orderprobe" 2>&1 | tr '\n' ' ' | sed 's/ $//'
+  echo
+}
+
 test.install.phaseABrewPath() {
-  local fx out bad="" s brew pm phaseB
+  local fx out bad="" s
   fx=$(test.suite.fixture.make brewpathprobe) || return 1
   s="$fx/stub:/usr/bin:/bin"
   out=$(test.install.brewPathProbe "$fx" Darwin hb)
@@ -1622,13 +1706,13 @@ test.install.phaseABrewPath() {
   [ "$out" = "PATH=[$fx/ul:$fx/stub:$fx/hb:/usr/bin:/bin] BEFORE=1 AFTER=1" ] || bad="$bad darwin-present=[$out]"
   out=$(test.install.brewPathProbe "$fx" Linux both)
   [ "$out" = "PATH=[$s] BEFORE=1 AFTER=1" ] || bad="$bad linux=[$out]"
+  # pm detection already runs with Homebrew first and finds its bash 4+; Phase B
+  # adds no second Homebrew dir; on Linux PATH stays as it was
+  out=$(test.install.brewOrderProbe "$fx" Darwin)
+  [ "$out" = "PM-DETECT PATH=[$fx/hb:$fx/ul:$s] BASH-OK=0 END PATH=[$fx/hb:$fx/ul:$s]" ] || bad="$bad order-darwin=[$out]"
+  out=$(test.install.brewOrderProbe "$fx" Linux)
+  [ "$out" = "PM-DETECT PATH=[$s] BASH-OK=1 END PATH=[$s]" ] || bad="$bad order-linux=[$out]"
   rm -rf "$fx"
-  # placement: after the clean re-exec, before pm detection; Phase B prepends no brew dir of its own
-  brew=$(grep -n '^# BEGIN brewPath$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
-  pm=$(grep -n '^if ! oosh_pm_detect; then$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
-  { [ -n "$brew" ] && [ -n "$pm" ] && [ "$brew" -lt "$pm" ]; } || bad="$bad placement(brewPath=$brew pmDetect=$pm)"
-  phaseB=$(sed -n '/^# Phase B — POSIX/,$p' "$INIT_SCRIPT" | grep -v '^[ \t]*#' | grep -c '/opt/homebrew/bin')
-  [ "$phaseB" = 0 ] || bad="$bad phaseB-second-list($phaseB)"
   [ -z "$bad" ] && create.result 0 "on a Mac Homebrew's bin dirs lead PATH before pm detection and the bash 4 check" || create.result 1 "brew path:$bad"
   return $(result)
 }

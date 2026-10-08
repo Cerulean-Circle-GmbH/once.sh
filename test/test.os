@@ -283,16 +283,33 @@ test.case - "T-OS-GATE-RUN-ARGS: gate.run refuses a call without platform" \
    private.os.platform.gate.run 
 expect 1 "private.os.platform.gate.run requires <platform> <user>"
 
-# T-OS-PLATFORM-TEST-SPLIT: platform.test is orchestration over three reusable private methods
+# T-OS-PLATFORM-TEST-SPLIT: platform.test is orchestration over three reusable private methods.
+# With the three stubbed to record their arguments (and ossh, docker, the cleanup and the
+# shared config repair silent), os platform.test calls container.up with the image and the port, then
+# users.install, then gate.run for the four users in their order.
 test.os.platformSplit() {
-  local bad="" m
+  local bad="" m rec fx
   for m in private.os.platform.container.up private.os.platform.users.install private.os.platform.gate.run; do
     type "$m" >/dev/null 2>&1 || bad="$bad missing:$m"
   done
-  local body; body=$(declare -f os.platform.test)
-  for m in container.up users.install gate.run; do
-    printf '%s' "$body" | grep -q "private.os.platform.$m" || bad="$bad not-called:$m"
-  done
+  fx=$(test.suite.fixture.make ossplit)
+  (
+    HOME="$fx"; OS_T_REC="$fx/rec"; unset OSSH_INSTALL_BRANCH OSSH_CONTROL_PATH
+    odocker() { :; }; docker() { :; }; ossh() { :; }; ssh() { :; }; sleep() { :; }
+    private.os.platform.container.up()        { echo "container.up $*" >> "$OS_T_REC"; create.result 0 up; }
+    private.os.platform.users.install()       { echo "users.install $*" >> "$OS_T_REC"; }
+    private.os.platform.gate.run()            { echo "gate.run $*" >> "$OS_T_REC"; return 0; }
+    private.os.platform.shared.config.repair() { :; }
+    private.os.platform.cleanup()             { :; }
+    os.platform.test ubuntu_24_04 >/dev/null 2>&1
+    grep -E '^(container.up|users.install|gate.run) ' "$OS_T_REC" > "$fx/calls"
+  )
+  rec=$(tr '\n' '|' < "$fx/calls" 2>/dev/null)
+  case "$rec" in
+    "container.up ubuntu_24_04 "*" 8022|users.install ubuntu_24_04|gate.run ubuntu_24_04 test|gate.run ubuntu_24_04 root|gate.run ubuntu_24_04 oosh-user|gate.run ubuntu_24_04 bash-user|") ;;
+    *) bad="$bad calls=[$rec]" ;;
+  esac
+  rm -rf "$fx"
   private.os.platform.gate.run p nobody >/dev/null 2>&1; [ $? = 1 ] || bad="$bad gate.run-accepts-unknown-user"
   os.platform.test no_such_platform_xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-platform-not-refused"
   private.os.platform.branch.gate no-such-ref-xyz >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-branch-not-refused"
