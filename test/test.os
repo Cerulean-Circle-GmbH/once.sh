@@ -985,6 +985,7 @@ test.os.healTest.stubs.set() {
   }
   private.os.platform.ref.branch.drop()  { echo "drop $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.heal.compare.run() { echo "compare $*" >> "$OS_T_REC"; return "${OS_T_COMPARE_RC:-0}"; }
+  private.os.platform.heal.compare.snapshot.take() { echo "compare.snapshot $*" >> "$OS_T_REC"; printf '/x\t-\ty\n'; }
   private.os.platform.cleanup()          { echo "cleanup $*" >> "$OS_T_REC"; }
   ogit.status.check()                    { return "${OS_T_DIRTY:-0}"; }
   ossh() {
@@ -1087,6 +1088,7 @@ cleanup 8022"
   out=$(os.platform.heal.test "$p" 26d15a4 compare 2>&1) || bad="$bad compare-rc=[$out]"
   grep -qx "compare $p $hb" "$OS_T_REC" || bad="$bad compare-not-called"
   [ "$(grep -n '' "$OS_T_REC" | grep -B1 '^[0-9]*:compare ' | sed -n 1p | cut -d: -f2-)" = "foreign $p" ] || bad="$bad compare-not-after-checks"
+  [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:expect ' | sed -n 2p | cut -d: -f2-)" = "compare.snapshot $p $hb" ] || bad="$bad healed-snapshot-not-after-expect"
   [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:compare ' | sed -n 2p | cut -d: -f2-)" = "breakage user.clone $hb" ] || bad="$bad compare-not-before-second-pass"
   case "$out" in *"foreign=0 compare=0 user-clone=0)"*) ;; *) bad="$bad compare-field=[$out]" ;; esac
   : > "$OS_T_REC"; OS_T_COMPARE_RC=1
@@ -1412,7 +1414,6 @@ test.os.healExpectFixture() { # <dir> # build the healed fixture machine under <
   printf 'github.com ssh-ed25519 AAAA\n' > "$fx/home/shared/.ssh/known_hosts"
   ln -s "$fx/home/root/oosh/init" "$fx/home/root/init"
   printf '#!/bin/sh\n' > "$fx/bin/this"; chmod 755 "$fx/bin/this"; ln -s "$fx/bin/this" "$fx/bin/this2"
-  "${g[@]}" init -q -b old "$B/platform-test-old"   # a folder an old install or a user kept: no install shape
   printf 'SETUP_SERVER_STATE_ID=99\nSETUP_SERVER_CUSTOM_SCRIPT=oo\n' > "$S/stateMachines/SETUP_SERVER.states.env"
   # the aside entry the heal made of the broken folder: every marker of the folder arms
   d="$B.aside/dev.heal.orig.20261008-120000"
@@ -1769,13 +1770,15 @@ test.os.healCompareSnapshot() {
   printf 'RESULT=x\n' > "$S/result.env"; printf 'log\n' > "$S/install.log"
   printf 'SETUP_SERVER_STATE_ID=99\n' > "$S/stateMachines/SETUP_SERVER.states.env"
   ln -s "$B/dev.heal" "$fx/home/alice/oosh"; mkdir "$fx/home/alice/oosh.orig.20261008-120000"
-  printf '[safe]\n\tdirectory = %s\n' "$B/dev.heal" > "$fx/home/alice/.gitconfig"
+  printf '[safe]\n\tdirectory = %s\n\tdirectory = %s\n' "$B/dev.heal" "$B/platform-test-old" > "$fx/home/alice/.gitconfig"
+  printf 'appended by the logger\n' > "$S/result.txt"
   printf 'Host github.com\n  IdentitiesOnly yes\n' > "$fx/home/alice/.ssh/config"
   printf 'secret\n' > "$fx/home/alice/.ssh/ids/ssh.x/id_ed25519"
   printf 'github.com ssh-ed25519 AAAA\ngithub.com ssh-rsa BBBB\n' > "$fx/home/alice/.ssh/known_hosts"
   printf 'deploy\n' > "$fx/home/developking/.ssh/id_rsa"; chmod 600 "$fx/home/developking/.ssh/id_rsa" "$fx/home/alice/.ssh/ids/ssh.x/id_ed25519"
   printf 'generated\n' > "$fx/home/developking/.ssh/id_ed25519"; chmod 600 "$fx/home/developking/.ssh/id_ed25519"   # a key the install generates per machine
   printf '#!/bin/sh\n' > "$fx/bin/this"; chmod 755 "$fx/bin/this"
+  "${g[@]}" init -q -b old "$B/platform-test-old"   # a folder an old install or a user kept: no install shape
   script=$(test.os.healCompareSnapshot.script "$fx")
   printf '%s\n' "$script" | sh -n 2>/dev/null || bad="$bad sh-n"
   if command -v dash >/dev/null 2>&1; then printf '%s\n' "$script" | dash -n 2>/dev/null || bad="$bad dash-n"; fi
@@ -1803,6 +1806,7 @@ test.os.healCompareSnapshot() {
   case "$out" in *result.env*|*install.log*|*.orig.*|*"a comment"*) bad="$bad volatile-kept" ;; esac
   case "$out" in *secret*) bad="$bad key-material" ;; esac
   case "$out" in *platform-test-old*) bad="$bad kept-folder-listed" ;; esac
+  case "$out" in *result.txt*) bad="$bad logger-file-listed" ;; esac
   [ "$(printf '%s\n' "$out" | grep -c 'known_hosts	-	github.com$')" = 1 ] || bad="$bad known-hosts-not-one-host"
   [ "$out" = "$(printf '%s\n' "$out" | LC_ALL=C sort -u)" ] || bad="$bad not-sorted"
   # a bad branch is refused
@@ -1867,6 +1871,11 @@ test.os.healCompareRun() {
   grep -q '^users.install' "$OS_T_REC" && bad="$bad up-fail-users"
   [ "$(tail -1 "$OS_T_REC")" = "cleanup 9022" ] || bad="$bad up-fail-no-cleanup"
   unset OS_T_UP_RC
+  # the healed snapshot os platform.heal.test took right after the heal is the one compared: not read again
+  : > "$OS_T_REC"; printf '/b/x\troot:dev 2775\tdir\n' > "$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare-healed-$p.log"
+  private.os.platform.heal.compare.run "$p" dev.heal >/dev/null 2>&1
+  grep -qx "snapshot $p sh" "$OS_T_REC" && bad="$bad healed-read-again"
+  grep -qx "snapshot ${p}_fresh sh" "$OS_T_REC" || bad="$bad fresh-not-read"
   # refusals before anything starts
   : > "$OS_T_REC"
   private.os.platform.heal.compare.run "$p" >/dev/null 2>&1 && bad="$bad no-branch-accepted"
@@ -1881,6 +1890,26 @@ test.os.healCompareRun() {
 test.case $level "T-OS-HEAL-COMPARE-RUN: a fresh install of the branch in a second container, the same snapshot in both, any difference fails" test.os.healCompareRun
 expect 0 "a local install of the branch on <platform>_fresh, one snapshot in each, equal passes, a difference fails named, always cleaned up" \
   "the heal was never compared with a fresh install of the same branch"
+
+
+# T-OS-HEAL-COMPARE-SNAPSHOT-TAKE: one reading of both sides — the lines after the begin marker of the
+# snapshot script, run as root, without the carriage returns of ssh and the noise of a dotfile before
+# the marker, sorted; nothing and rc 1 when nothing came back or <platform> <branch> is missing.
+test.os.healCompareSnapshotTake() {
+  local bad="" got
+  got=$( private.os.platform.root.script.run() { [ "$2" = sh ] || return 9; printf 'Welcome\r\nOOSH_HEAL_COMPARE_SNAPSHOT_BEGIN\r\n/b\tx\r\n/a\ty\r\n/a\ty\r\n'; }
+         private.os.platform.heal.compare.snapshot.take p dev.heal; echo "rc=$?" )
+  [ "$got" = "$(printf '/a\ty\n/b\tx\nrc=0')" ] || bad="$bad lines=[$(printf '%s' "$got" | tr '\n\t' '|~')]"
+  got=$( private.os.platform.root.script.run() { echo Welcome; }
+         private.os.platform.heal.compare.snapshot.take p dev.heal; echo "rc=$?" )
+  [ "$got" = rc=1 ] || bad="$bad empty=[$got]"
+  private.os.platform.heal.compare.snapshot.take p >/dev/null 2>&1 && bad="$bad no-branch-accepted"
+  [ -z "$bad" ] && create.result 0 "the lines after the marker, sorted, no carriage return, no noise; rc 1 for nothing" || create.result 1 "snapshot take:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-COMPARE-SNAPSHOT-TAKE: the snapshot lines after the marker, sorted, noise and carriage returns out" test.os.healCompareSnapshotTake
+expect 0 "the lines after the marker, sorted, no carriage return, no noise; rc 1 for nothing" \
+  "the healed side was read after the gates had written into it"
 
 ### test.method
 

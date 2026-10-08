@@ -1326,6 +1326,10 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  # ─── what the heal left, right after it: the shape of each breakage that ran ─
  private.os.platform.heal.check "$platform" expect "$healBranch" $breakages 2>&1 | tee "$(private.os.platform.heal.log.get expect "$platform")"
  rcExpect=${PIPESTATUS[0]}
+ # compare: the healed machine as the heal left it, before the gates, the idempotence
+ # invariant and the second heal write into it (logger files, session values,
+ # trust entries) — the fresh install is read right after its install as well
+ [ -n "$compare" ] && private.os.platform.heal.compare.snapshot.take "$platform" "$healBranch" > "$(private.os.platform.heal.log.get compare-healed "$platform")"
  # pipe: the pure pipe form as test, once (C2 runs it on the first platform)
  if [ -n "$pipe" ]; then
    private.os.platform.heal.pipe.run "$platform" "$healBranch"
@@ -1725,10 +1729,10 @@ private.os.platform.heal.compare.run()     # <platform> <branch> # a fresh insta
    printf 'compare on %s: the fresh install on %s did not come up (log: %s)\n' "$platform" "$alias" "$installLog" | tee "$log"
    rc=1
  else
-   private.os.platform.root.script.run "$platform" sh "$script" 2>&1 | tr -d '\r' \
-     | sed -n '/^OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN$/,$p' | sed '1d' | LC_ALL=C sort -u > "$healedLog"
-   private.os.platform.root.script.run "$alias" sh "$script" 2>&1 | tr -d '\r' \
-     | sed -n '/^OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN$/,$p' | sed '1d' | sed "s#$alias#$platform#g" | LC_ALL=C sort -u > "$freshLog"
+   # the healed machine as the heal left it: os platform.heal.test takes it right after the heal,
+   # before the gates write into it; taken here only when it is not there
+   [ -s "$healedLog" ] || private.os.platform.heal.compare.snapshot.take "$platform" "$branch" > "$healedLog"
+   private.os.platform.heal.compare.snapshot.take "$alias" "$branch" | sed "s#$alias#$platform#g" | LC_ALL=C sort -u > "$freshLog"
    if [ ! -s "$healedLog" ] || [ ! -s "$freshLog" ]; then
      printf 'compare on %s: no snapshot of %s\n' "$platform" "$([ -s "$healedLog" ] && echo "the fresh install" || echo "the healed machine")" | tee "$log"
      rc=1
@@ -1780,8 +1784,10 @@ HOST=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
 USERS='test root oosh-user bash-user developking'
 SYSTEM='/usr/local/bin/this /usr/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot'
   attrs_of() { stat -c '%U:%G %a' "$1" 2>/dev/null || stat -f '%Su:%Sg %Lp' "$1"; } # kernel-exception: POSIX sh of the disposable-container snapshot, the stat -f twin is the fix # portability-exception: GNU stat with its BSD twin
-  volatile() { case "$1" in */result.env|*.log|*/log.live.out|*.orig.*) return 0 ;; esac; return 1; }
-  values() { grep -v '^[[:space:]]*#' "$2" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$' | LC_ALL=C sort | while IFS= read -r v; do printf '%s\t-\t%s\n' "$1" "$v"; done; }
+  volatile() { case "$1" in */result.env|*.log|*/log.live.out|*/result.txt|*/error.txt|*.orig.*) return 0 ;; esac; return 1; }
+  # a trust entry of a folder of the base outside main/ and <branch>/ is out of scope, as the folder is
+  inscope() { case "$1" in *"$B"/*) case "$1" in *"$B/main"|*"$B/$H") return 0 ;; esac; return 1 ;; esac; return 0; }
+  values() { grep -v '^[[:space:]]*#' "$2" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$' | LC_ALL=C sort | while IFS= read -r v; do inscope "$v" || continue; printf '%s\t-\t%s\n' "$1" "$v"; done; }
   entry() {
     volatile "$1" && return 0
     if [ -L "$1" ]; then printf '%s\t%s\t-> %s\n' "$1" "$(attrs_of "$1" | cut -d' ' -f1)" "$(readlink "$1")" # kernel-exception: POSIX sh of the disposable-container snapshot, the link text as written
@@ -1816,13 +1822,13 @@ for d in "$B/main" "$D"; do
   printf 'branch of %s\t-\t%s\n' "$d" "$(rgit -C "$d" symbolic-ref -q --short HEAD || echo detached)"
   printf 'HEAD of %s\t-\t%s\n' "$d" "$(rgit -C "$d" rev-parse HEAD 2>/dev/null)"
 done
-rgit config --system --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do printf 'safe.directory of the system\t-\t%s\n' "$v"; done
+rgit config --system --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do inscope "$v" || continue; printf 'safe.directory of the system\t-\t%s\n' "$v"; done
 for u in $USERS; do
   h=$(home_of "$u")
   if [ -z "$h" ]; then printf 'user %s\tabsent\t-\n' "$u"; continue; fi
   printf 'shell of %s\t-\t%s\n' "$u" "$(awk -F: -v u="$u" '$1 == u { print $7; exit }' /etc/passwd)"
   printf 'groups of %s\t-\t%s\n' "$u" "$(id -nG "$u" 2>/dev/null | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ')" # kernel-exception: POSIX sh of the disposable-container snapshot
-  as_user "$u" git config --global --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do printf 'safe.directory of %s\t-\t%s\n' "$u" "$v"; done # ogit-exception: inside the platform container, as the user — the oosh there is the install under compare
+  as_user "$u" git config --global --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do inscope "$v" || continue; printf 'safe.directory of %s\t-\t%s\n' "$u" "$v"; done # ogit-exception: inside the platform container, as the user — the oosh there is the install under compare
   entry "$h"
   for n in oosh config init .bashrc .bash_profile .profile .gitconfig .once; do entry "$h/$n"; done
   level "$h/.config/oosh"
@@ -1840,6 +1846,21 @@ private.os.platform.heal.compare.port.get()     #  # echo the ssh port of the se
  # first container (8022) publishes already. The one place for the number:
  # compare.run and the interrupt trap of os platform.heal.test read it.
  echo 9022
+}
+
+
+private.os.platform.heal.compare.snapshot.take()     # <platform> <branch> # echo the compare snapshot of the platform container, as root through private.os.platform.root.script.run: the lines after the begin marker of private.os.platform.heal.compare.snapshot.script.get, carriage returns out, sorted; nothing and rc 1 when it cannot be read #
+{
+ # NO create.result — a getter consumed as $(...) by os platform.heal.test
+ # (the healed machine, right after the heal) and private.os.platform.heal.compare.run
+ # (the fresh install, right after it): one reading of both sides.
+ local platform="$1" branch="$2" script out
+ [ -n "$platform" ] && [ -n "$branch" ] || return 1
+ script=$(private.os.platform.heal.compare.snapshot.script.get "$branch") || return 1
+ out=$(private.os.platform.root.script.run "$platform" sh "$script" 2>&1 | tr -d '\r' \
+   | sed -n '/^OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN$/,$p' | sed '1d' | LC_ALL=C sort -u)
+ [ -n "$out" ] || return 1
+ printf '%s\n' "$out"
 }
 
 
