@@ -163,24 +163,8 @@ else
   expect.fail "$RESULT"
 fi
 
-# ─────────────────────────────────────────────────────────────────────────
-# T-INIT-BASH-PATH-PREPEND: init/oosh prepends brew bash dir to PATH
-# ─────────────────────────────────────────────────────────────────────────
-# init/oosh runs under sh, so it doesn't re-exec under bash. But the
-# framework (ossh, oo, state, this) downstream needs bash 4+. macOS ssh
-# non-login non-interactive sessions get PATH=/usr/bin:/bin:/usr/sbin:/sbin
-# from launchd; /etc/paths.d/* is only consulted by login shells. So
-# init/oosh prepends /opt/homebrew/bin (or /usr/local/bin) to PATH if it
-# contains bash, ensuring downstream `#!/usr/bin/env bash` shebangs
-# resolve to bash 4+.
-test.case $level "T-INIT-BASH-PATH-PREPEND: init/oosh prepends brew bash dir to PATH for downstream consumers" \
-  echo "(grep)"
-if grep -qE '_bashCandidate in /opt/homebrew/bin /usr/local/bin' "$INIT_SCRIPT" \
-   && grep -qE 'export PATH="\$_bashCandidate:\$PATH"' "$INIT_SCRIPT"; then
-  expect.pass "init/oosh prepends brew bash dir to PATH"
-else
-  expect.fail "init/oosh missing brew-bash PATH-prepend — bash-3.2 ssh sessions on macOS will not find bash 4+ for downstream framework"
-fi
+# T-INIT-BASH-PATH-PREPEND (a grep for Phase B's _bashCandidate loop) is replaced by
+# T-INIT-PHASE-A-BREW-PATH below: the brewPath block now prepends Homebrew's bin dirs before Phase A.
 
 # ─────────────────────────────────────────────────────────────────────────
 # T-INIT-SUDO-CURL-PIPE: sudo re-exec pre-clones when $0 isn't a real file
@@ -1576,5 +1560,68 @@ test.case $level "T-INIT-REEXEC-KEEPS-ARGS: every exec of init/oosh carries \"\$
   test.install.reexecKeepsArgs
 expect 0 "every re-exec of init/oosh passes the arguments on" \
   "a re-exec that drops the arguments turns heal <branch> [all] into a plain install"
+
+# T-INIT-PHASE-A-BREW-PATH: on the macOS VM an ssh login of `admin` whose PATH
+# lacked /opt/homebrew/bin ran `curl … | sh -s -- heal dev.heal all` (no clean
+# re-exec in the pipe form, so its own PATH) and died "bash 4+ missing": Phase A
+# never looked under Homebrew, and Phase B's prepend came after the bash check.
+# The brewPath block runs standalone under sh with `uname` stubbed, the brew dirs
+# moved into the fixture and a bash 3.2 stub first on PATH: on Darwin every
+# existing brew dir goes first (Apple silicon, then Intel) and oosh_bash_ok
+# passes; Linux, an absent dir and a dir already on PATH leave PATH alone.
+test.install.brewPathProbe() # <fixture> <Darwin|Linux> <hb|ul|both|none> <?pathBefore> # runs the extracted brewPath block, echoes "PATH=[…] BEFORE=<rc> AFTER=<rc>"
+{
+  local fx="$1" os="$2" dirs="$3" pathBefore out
+  rm -rf "$fx/hb" "$fx/ul" "$fx/stub"; mkdir -p "$fx/stub"
+  pathBefore="${4:-$fx/stub:/usr/bin:/bin}"
+  case "$dirs" in hb|both) mkdir -p "$fx/hb" ;; esac
+  case "$dirs" in ul|both) mkdir -p "$fx/ul" ;; esac
+  printf '%s\n' '#!/bin/sh' "echo $os" > "$fx/stub/uname"
+  printf '%s\n' '#!/bin/sh' 'echo "GNU bash, version 3.2.57(1)-release"' > "$fx/stub/bash"
+  [ -d "$fx/hb" ] && printf '%s\n' '#!/bin/sh' 'echo "GNU bash, version 5.3.3(1)-release"' > "$fx/hb/bash" && chmod 755 "$fx/hb/bash"
+  chmod 755 "$fx/stub/uname" "$fx/stub/bash"
+  {
+    echo '#!/usr/bin/env sh'
+    awk '/^oosh_bash_ok\(\) \{/{f=1} f{print; if (/^}$/) exit}' "$INIT_SCRIPT"
+    echo 'oosh_bash_ok; _b=$?'
+    sed -n '/^# BEGIN brewPath$/,/^# END brewPath$/p' "$INIT_SCRIPT" \
+      | sed -e "s#/opt/homebrew/bin#$fx/hb#g" -e "s#/usr/local/bin#$fx/ul#g"
+    echo 'oosh_bash_ok; echo "PATH=[$PATH] BEFORE=$_b AFTER=$?"'
+  } > "$fx/probe"
+  if ! grep -q '^# BEGIN brewPath$' "$fx/probe"; then echo "NO-BLOCK RC=99"; return 0; fi
+  out="$(env PATH="$pathBefore" sh "$fx/probe" 2>&1)"
+  echo "$out"
+}
+
+test.install.phaseABrewPath() {
+  local fx out bad="" s brew pm phaseB
+  fx=$(test.suite.fixture.make brewpathprobe) || return 1
+  s="$fx/stub:/usr/bin:/bin"
+  out=$(test.install.brewPathProbe "$fx" Darwin hb)
+  [ "$out" = "PATH=[$fx/hb:$s] BEFORE=1 AFTER=0" ] || bad="$bad darwin-silicon=[$out]"
+  out=$(test.install.brewPathProbe "$fx" Darwin both)
+  [ "$out" = "PATH=[$fx/hb:$fx/ul:$s] BEFORE=1 AFTER=0" ] || bad="$bad darwin-both=[$out]"
+  out=$(test.install.brewPathProbe "$fx" Darwin ul)
+  [ "$out" = "PATH=[$fx/ul:$s] BEFORE=1 AFTER=1" ] || bad="$bad darwin-intel=[$out]"
+  out=$(test.install.brewPathProbe "$fx" Darwin none)
+  [ "$out" = "PATH=[$s] BEFORE=1 AFTER=1" ] || bad="$bad darwin-absent=[$out]"
+  out=$(test.install.brewPathProbe "$fx" Darwin both "$fx/stub:$fx/hb:/usr/bin:/bin")
+  [ "$out" = "PATH=[$fx/ul:$fx/stub:$fx/hb:/usr/bin:/bin] BEFORE=1 AFTER=1" ] || bad="$bad darwin-present=[$out]"
+  out=$(test.install.brewPathProbe "$fx" Linux both)
+  [ "$out" = "PATH=[$s] BEFORE=1 AFTER=1" ] || bad="$bad linux=[$out]"
+  rm -rf "$fx"
+  # placement: after the clean re-exec, before pm detection; Phase B prepends no brew dir of its own
+  brew=$(grep -n '^# BEGIN brewPath$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  pm=$(grep -n '^if ! oosh_pm_detect; then$' "$INIT_SCRIPT" | head -1 | cut -d: -f1)
+  { [ -n "$brew" ] && [ -n "$pm" ] && [ "$brew" -lt "$pm" ]; } || bad="$bad placement(brewPath=$brew pmDetect=$pm)"
+  phaseB=$(sed -n '/^# Phase B — POSIX/,$p' "$INIT_SCRIPT" | grep -v '^[ \t]*#' | grep -c '/opt/homebrew/bin')
+  [ "$phaseB" = 0 ] || bad="$bad phaseB-second-list($phaseB)"
+  [ -z "$bad" ] && create.result 0 "on a Mac Homebrew's bin dirs lead PATH before pm detection and the bash 4 check" || create.result 1 "brew path:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-PHASE-A-BREW-PATH: on Darwin Phase A puts every existing Homebrew bin dir first on PATH before it looks for brew and bash 4" \
+  test.install.phaseABrewPath
+expect 0 "on a Mac Homebrew's bin dirs lead PATH before pm detection and the bash 4 check" \
+  "the macOS VM's admin had no /opt/homebrew/bin on PATH and the heal died 'bash 4+ missing'"
 
 test.suite.save.results
