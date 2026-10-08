@@ -614,6 +614,16 @@ into a real one before it was kept aside. Every step names the folders it writes
 never the process's `CONFIG_PATH`. A copy under `$TMPDIR` is recognised as the heal's own tree too. The bash that runs the heal is the bash the process was started with
 (`$BASH`), not the system's 3.2 on macOS.
 
+**One umask for the shared places.** The clean process sets `umask 002` once (`oo.heal`, after the re-exec, so
+sudo's own umask does not override it): what root writes into the shared places — the base's clones, the env
+files, the loggers' `result.txt` / `error.txt`, the state machine in the sharedConfig — is group-writable the
+first time (root's umask is 022 and sudo ORs 022 in; on the macOS VM every other user of group dev got
+`Permission denied` on the shared `error.txt`). No finish pass normalises it afterwards. A **home** is never
+written with it: a `--global` git write (root's `~/.gitconfig`, `safe.directory`) runs with umask 022
+(`private.ogit.git.run`), and every as-user hop starts with `umask 022` (`private.this.as.user.preamble.get`),
+after which the target's own `this` applies their policy — sshd's StrictModes and a person's dotfiles.
+`verify`'s processes keep the 002: what they write is the sharedConfig's loggers.
+
 **Return codes.** `0` healed and every invariant PASS or NOT CHECKED; `1` something is left for you (the lines
 marked `left` — a folder moved aside, the info notes above — or a FAIL from verify); `2` cannot heal (the line marked `cannot` — no root, no source for the clones,
 a folder in the way).
