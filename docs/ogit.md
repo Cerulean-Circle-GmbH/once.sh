@@ -136,6 +136,8 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `file.show` | `<ref> <path> <?dir:$OOSH_DIR>` | echo the content of `<path>` at `<ref>` in `<dir>` (`cat-file blob`, so a directory is refused, not listed); rc 1 and nothing when the ref or the path does not exist, or the path is a directory; git's reason reaches RESULT. `<ref>` completes through the shared `ogit.parameter.completion.ref`; `<path>` completes from the tracked files of the current tree |
+| `file.history.blobs.get` | `<path> <?count:200> <?dir:$OOSH_DIR>` | echo the blob ids `<path>` had in the last `<count>` commits of `<dir>` that changed it, newest first, one per line, from one `git log --raw`; a deletion is no blob and is skipped; nothing and rc 1 on a tree git refuses, a bad count or no path; a getter, no RESULT |
+| `file.hash.get` | `<file>` | echo the git blob id of a working file (`git hash-object`); nothing and rc 1 when `<file>` is no regular file; a getter, no RESULT |
 
 ### branch
 
