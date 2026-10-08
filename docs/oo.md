@@ -478,9 +478,11 @@ oo heal [<branch>] [all]      # <?branch> <?who:$USER> — a user name or all
 oo heal.status [<branch>] [all]   # read-only: what oo heal would do
 ```
 
-`oo heal.status` reads and never writes. For `developking`, a missing home (or user) is printed `[heal] developking: its home comes with the system step, then ~/oosh and ~/config are linked` — the system step makes it — while any other user without a home is `[left] <user>: no home known — not healed`. Each line it prints is `[ok]` (canonical), `[heal]` (`oo heal` A canonical folder git refuses for the one who runs it (dubious ownership, e.g. root reading a clone another user made) is printed `[heal] <branch>: <dir> is owned by <owner> and not yet trusted for <me> — oo heal trusts the base's folders first and then judges it`, never as an aside prediction.
-changes it), `[left]` (`oo heal` reports it, you act) or `[keep]` (an old backup, kept). rc 1 when anything
-is not canonical, and `RESULT` names the command: `not canonical — run: oo heal <branch> <who>`.
+`oo heal.status` reads and never writes. For `developking`, a missing home (or user) is printed `[heal] developking: its home comes with the system step, then ~/oosh and ~/config are linked` — the system step makes it — while any other user without a home is `[left] <user>: no home known — not healed`. Each line it prints is `[ok]` (canonical), `[heal]` (`oo heal` changes it), `[left]` (`oo heal` reports it, you act)
+or `[keep]` (an old backup, kept). A canonical folder git refuses for the one who runs it (dubious ownership, e.g.
+root reading a clone another user made) is printed
+`[heal] <branch>: <dir> is owned by <owner> and not yet trusted for <me> — oo heal trusts the base's folders first and then judges it`,
+never as an aside prediction. rc 1 when anything is not canonical, and `RESULT` names the command: `not canonical — run: oo heal <branch> <who>`.
 `<branch>` defaults to the branch of the tree running the heal, else `$OOSH_BRANCH`, else `dev`. The tree
 running the heal is its temporary copy, which belongs to the user the heal runs as (`cp -R`, no `-p`), so git
 reads it even when another user owns the tree it was started from — root's bare `oo heal` from test's clone
