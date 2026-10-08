@@ -1758,6 +1758,7 @@ test.os.healCompareSnapshot() {
   printf 'secret\n' > "$fx/home/alice/.ssh/ids/ssh.x/id_ed25519"
   printf 'github.com ssh-ed25519 AAAA\ngithub.com ssh-rsa BBBB\n' > "$fx/home/alice/.ssh/known_hosts"
   printf 'deploy\n' > "$fx/home/developking/.ssh/id_rsa"; chmod 600 "$fx/home/developking/.ssh/id_rsa" "$fx/home/alice/.ssh/ids/ssh.x/id_ed25519"
+  printf 'generated\n' > "$fx/home/developking/.ssh/id_ed25519"; chmod 600 "$fx/home/developking/.ssh/id_ed25519"   # a key the install generates per machine
   printf '#!/bin/sh\n' > "$fx/bin/this"; chmod 755 "$fx/bin/this"
   script=$(test.os.healCompareSnapshot.script "$fx")
   printf '%s\n' "$script" | sh -n 2>/dev/null || bad="$bad sh-n"
@@ -1778,6 +1779,7 @@ test.os.healCompareSnapshot() {
     "$fx/home/alice/.ssh/ids/ssh.x/id_ed25519	$me:$(id -gn) 600	key" \
     "$fx/home/alice/.ssh/known_hosts	-	github.com" \
     "$fx/home/developking/.ssh/id_rsa	$me:$(id -gn) 600	$(cksum < "$fx/home/developking/.ssh/id_rsa" | awk '{ print $1 "/" $2 }')" \
+    "$fx/home/developking/.ssh/id_ed25519	$me:$(id -gn) 600	key" \
     "$fx/bin/this	$me:$(id -gn) 755	$(cksum < "$fx/bin/this" | awk '{ print $1 "/" $2 }')"; do
     printf '%s\n' "$out" | grep -qxF "$want" || bad="$bad missing=[$want]"
   done

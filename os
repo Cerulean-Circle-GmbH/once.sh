@@ -1767,8 +1767,9 @@ private.os.platform.heal.compare.snapshot.script.get()     # <branch> # echo the
  # out: log files and result.env (rewritten by every oosh call). Left out by
  # scope: <base>.aside and the *.orig.* entries — what the heal kept of the
  # old install, which a fresh install never had. Key material generated per
- # machine is named, not summed: only the deploy key of developking (a copy
- # of the template) is compared by content.
+ # machine is named, not summed: only the deploy key of developking and its
+ # ids/ssh.developking copies (the template) are compared by content; a
+ # known_hosts file is its set of host names.
  local branch="$1" preamble
  preamble=$(private.os.platform.heal.remote.preamble.get "$branch") || return 1
  printf "N='compare.snapshot'\n%s\n" "$preamble"
@@ -1785,8 +1786,9 @@ SYSTEM='/usr/local/bin/this /usr/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot'
     elif [ -f "$1" ]; then
       case "$1" in
         *.env|*/stateMachines/*|*/.gitconfig|*/.once|*/.ssh/config) printf '%s\t%s\tvalues\n' "$1" "$(attrs_of "$1")"; values "$1" "$1" ;;
-        */.ssh/known_hosts) printf '%s\t%s\thosts\n' "$1" "$(attrs_of "$1")"; awk '{ print $1 }' "$1" | LC_ALL=C sort -u | while IFS= read -r v; do printf '%s\t-\t%s\n' "$1" "$v"; done ;;
-        */.ssh/*) case "$1" in "$DKH/.ssh/"*) printf '%s\t%s\t%s\n' "$1" "$(attrs_of "$1")" "$(cksum < "$1" | awk '{ print $1 "/" $2 }')" ;; *) printf '%s\t%s\tkey\n' "$1" "$(attrs_of "$1")" ;; esac ;;
+        */.ssh/known_hosts|*/.ssh/*/known_hosts|*/.ssh/git_known_hosts) printf '%s\t%s\thosts\n' "$1" "$(attrs_of "$1")"; awk '{ print $1 }' "$1" | LC_ALL=C sort -u | while IFS= read -r v; do printf '%s\t-\t%s\n' "$1" "$v"; done ;;
+        "$DKH/.ssh/id_rsa"|"$DKH/.ssh/id_rsa.pub"|*/.ssh/ids/ssh.developking/id_rsa|*/.ssh/ids/ssh.developking/id_rsa.pub) printf '%s\t%s\t%s\n' "$1" "$(attrs_of "$1")" "$(cksum < "$1" | awk '{ print $1 "/" $2 }')" ;;
+        */.ssh/*) printf '%s\t%s\tkey\n' "$1" "$(attrs_of "$1")" ;;
         *) printf '%s\t%s\t%s\n' "$1" "$(attrs_of "$1")" "$(cksum < "$1" | awk '{ print $1 "/" $2 }')" ;;
       esac
     elif [ -d "$1" ]; then printf '%s\t%s\tdir\n' "$1" "$(attrs_of "$1")"
