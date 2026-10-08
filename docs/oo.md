@@ -625,9 +625,12 @@ first time (root's umask is 022 and sudo ORs 022 in; on the macOS VM every other
 `Permission denied` on the shared `error.txt`). No finish pass normalises it afterwards. The heal's umask never
 leaks into a home: a `--global` git write (root's `~/.gitconfig`, `safe.directory`) runs with umask 022
 (`private.ogit.git.run`), and every as-user hop starts with `umask 022` (`private.this.as.user.preamble.get`),
-after which the hop's own `source this` applies this's policy — members of dev get this's own 002 there, as in
-their login shells (root and every healed user are members), anyone else keeps 022 (sshd's StrictModes, a
-person's dotfiles). `verify`'s hop starts with an explicit `umask 002`: it writes the sharedConfig's loggers on
+after which the hop's own `source this` applies this's policy (`private.this.umask.apply`) — 002 for a member of
+dev and for a user whose `~/config` is the group-dev sharedConfig, as in their login shells (root and every healed
+user), anyone else keeps 022 (sshd's StrictModes, a person's dotfiles). The config's group counts, not only the
+process's groups: a root heal's process started before its own system step created group dev, and root's hop runs
+in that process's credentials — on the macOS VM it wrote the sharedConfig's colour files, `result.txt` and
+`error.txt` 644 and every user failed the configLayout invariant. `verify`'s hop starts with an explicit `umask 002`: it writes the sharedConfig's loggers on
 purpose, and `sudo -H -u` (macOS) ORs 022 in for a user whose process is not in dev yet.
 
 **Return codes.** `0` healed and every invariant PASS or NOT CHECKED; `1` something is left for you (the lines
