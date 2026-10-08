@@ -602,7 +602,9 @@ leaves the conversion with `sudo -H $OOSH_DIR/ogit worktree.remove <base>` (the 
 **The clean re-exec, from a copy.** Every form ends in **one clean process** (`private.oo.heal.env.clean`):
 `oo heal` copies its own tree to a world-readable `/tmp/oosh-heal.*/t` (the layout of the curl form) and runs
 that copy through `env -i`, so `oo heal` typed from a real `~/oosh` never moves the tree it runs from and the
-as-user hops can read it; the copy is removed afterwards. The process keeps only `HOME`, `USER`, `LOGNAME`,
+as-user hops can read it; the clean process removes its own copy when it exits (`private.oo.heal.copy.trap`, an
+`EXIT` trap that keeps the heal's rc) — under sudo the copy is root's, and a `sudo -n rm` afterwards failed once the
+timestamp had expired during a long heal. The process keeps only `HOME`, `USER`, `LOGNAME`,
 `TERM`, `LANG`, `LC_ALL`, `LOG_LEVEL`, `OOSH_REPO`, `SSH_AUTH_SOCK`, the six proxy variables (`http_proxy`,
 `https_proxy`, `no_proxy` and their upper-case twins), `OOSH_NO_INSTALL` and `OOSH_HEAL_NONINTERACTIVE`, and
 sets `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_TREE=<the tree it came from>` (named in the sudo recoveries), `OOSH_DIR=<the copy>` and `PATH` to the copy plus the system directories.
@@ -620,11 +622,13 @@ never the process's `CONFIG_PATH`. A copy under `$TMPDIR` is recognised as the h
 sudo's own umask does not override it): what root writes into the shared places — the base's clones, the env
 files, the loggers' `result.txt` / `error.txt`, the state machine in the sharedConfig — is group-writable the
 first time (root's umask is 022 and sudo ORs 022 in; on the macOS VM every other user of group dev got
-`Permission denied` on the shared `error.txt`). No finish pass normalises it afterwards. A **home** is never
-written with it: a `--global` git write (root's `~/.gitconfig`, `safe.directory`) runs with umask 022
+`Permission denied` on the shared `error.txt`). No finish pass normalises it afterwards. The heal's umask never
+leaks into a home: a `--global` git write (root's `~/.gitconfig`, `safe.directory`) runs with umask 022
 (`private.ogit.git.run`), and every as-user hop starts with `umask 022` (`private.this.as.user.preamble.get`),
-after which the target's own `this` applies their policy — sshd's StrictModes and a person's dotfiles.
-`verify`'s processes keep the 002: what they write is the sharedConfig's loggers.
+after which the hop's own `source this` applies this's policy — members of dev get this's own 002 there, as in
+their login shells (root and every healed user are members), anyone else keeps 022 (sshd's StrictModes, a
+person's dotfiles). `verify`'s hop starts with an explicit `umask 002`: it writes the sharedConfig's loggers on
+purpose, and `sudo -H -u` (macOS) ORs 022 in for a user whose process is not in dev yet.
 
 **Return codes.** `0` healed and every invariant PASS or NOT CHECKED; `1` something is left for you (the lines
 marked `left` — a folder moved aside, the info notes above — or a FAIL from verify); `2` cannot heal (the line marked `cannot` — no root, no source for the clones,
@@ -1116,7 +1120,8 @@ Internal functions (not for direct use):
 | `private.oo.method.end.get <file> <startLine>` | The line that closes the definition starting at `<startLine>`; empty when another definition or the marker comes first — `oo method.delete` refuses then |
 | `private.oo.path.sudo.get <path> <?mode>` | The one privilege rule: nothing when this user may write `<path>` (its nearest existing parent while it is not there) or is root (`$SUDO` empty); else `$SUDO`, or `sudo -n ` in mode `quiet`, which never asks for a password. `oo update`'s drop-in cleanup and launcher install use quiet (T-OO-PATH-SUDO-GET, T-OO-PRIVILEGE-QUIET) |
 | `private.oo.pm.install.prefix.get <?pmCmd>` | What goes in front of the package-manager command: the sudo decision — none for brew (Homebrew refuses root; root under sudo hops back to `$SUDO_USER`), none for root (`$SUDO` empty), else `$SUDO` — and the non-interactive env of `private.oo.pm.env.get`. `oo.cmd` and `oo.prereqs.install` both use it (T-OO-PM-INSTALL-PREFIX-GET) |
-| `private.oo.heal.env.clean <?branch> <?who> <?tree>` | Runs `oo heal` again in one clean process from a world-readable copy of `<tree>` under `/tmp/oosh-heal.*`, owned by the user that process runs as (`env -i`, the carried list above, `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_LOGIN`, `CONFIG` naming a file that is not there, `CONFIG_PATH` a scratch folder `<copy>/.heal.config`); the copy goes afterwards; plain bash, called before `this` is loaded |
+| `private.oo.heal.env.clean <?branch> <?who> <?tree>` | Runs `oo heal` again in one clean process from a world-readable copy of `<tree>` under `/tmp/oosh-heal.*`, owned by the user that process runs as (`env -i`, the carried list above, `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_LOGIN`, `CONFIG` naming a file that is not there, `CONFIG_PATH` a scratch folder `<copy>/.heal.config`); that process removes its copy on exit; plain bash, called before `this` is loaded |
+| `private.oo.heal.copy.trap` | In the clean process (`OOSH_HEAL_CLEAN=1`) whose `OOSH_DIR` is `<copy>/t`, `<copy>` a `/tmp/oosh-heal.*` folder: removes `<copy>` on `EXIT`, the rc kept; nothing anywhere else; called by `oo.heal` |
 | `private.oo.heal.path.system.get` | The system `PATH` of a clean process (`/usr/local`, `/usr`, `/` `bin` and `sbin`; Homebrew's `/opt/homebrew` on macOS); silent getter |
 | `private.oo.heal.branch.get` | The branch `oo heal` heals to by default: the branch of the tree running it (the clean step's copy, the runner's own), else `$OOSH_BRANCH`, else `dev`; silent getter |
 | `private.oo.heal.basehome.get` | The folder the homes live in: the parent of `developking`'s home, else `/Users` (macOS) or `/home`; silent getter |
