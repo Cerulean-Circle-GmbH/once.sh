@@ -119,9 +119,10 @@ On an Apple-Silicon Mac that *already* has Homebrew this is fatal and does not r
 `oosh_pm_detect` finds no package manager → the Darwin branch runs the full Homebrew installer over
 `curl` → as root that aborts with *"Don't run this as root!"* → `die "Homebrew bootstrap failed"`.
 The `eval "$(/opt/homebrew/bin/brew shellenv)"` that would have rescued `PATH` sits **inside that
-same failure branch**, after the installer has already run, so it is never reached. The two
-`case ":$PATH:" in` blocks only *prepend* to whatever the shell defaulted to; neither discovers
-brew. Intel Macs escape only because their brew lives in `/usr/local/bin`.
+same failure branch**, after the installer has already run, so it is never reached. Nothing in the
+re-exec discovers brew; the Homebrew prepend now lives in Phase A's `brewPath` block (see below),
+and Phase B keeps only the current-bash-dir prepend. Intel Macs escape only because their brew lives
+in `/usr/local/bin`.
 
 So `PATH` is now **seeded to a fixed, known-good list** rather than carried:
 
@@ -152,6 +153,20 @@ unattended installer cannot answer anyway).
 > The probe deliberately runs at `mktemp`'s mode 600 — the one permission the real
 > `ossh.prereqs.install` call site grants, and no more.
 
+## The Homebrew `PATH` prepend (`brewPath`)
+
+The seeded `PATH` above belongs to the clean re-exec. The pipe form (`curl … | sh -s -- …`) has no
+clean re-exec — `$0` is `sh` — so it keeps the **caller's** `PATH`, and a Mac account without
+`/opt/homebrew/bin` on it (an ssh login of a second user) found neither `brew` nor its bash 5: it saw only
+`/bin/bash` 3.2 and died "bash 4+ missing". The `brewPath` block in Phase A, before the package-manager
+detection and the bash 4+ check, fixes that: on Darwin only, it prepends `/opt/homebrew/bin`, then
+`/usr/local/bin`, each only when the directory exists and is not already on `PATH`. Phase B's own
+prepend is reduced to the directory of the `bash` already found. On macOS `sh` is itself bash 3.2: the
+file form re-execs under a bash 4+, the heal does not need to (see below).
+
+> Guarded by **T-INIT-PHASE-A-BREW-PATH**, which runs the extracted block under `sh` with `uname`
+> stubbed (it replaces the grep **T-INIT-BASH-PATH-PREPEND**).
+
 ## The heal arm
 
 `init/oosh heal [<branch>] [all]` is the installer's fourth delivery path: it does not install, it hands
@@ -165,7 +180,21 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/Cerulean-Circle-GmbH/once.
 
 **Never `sh -c "$(curl …)" heal`**: after the command string the first word is `$0`, so the script would
 start with *no* arguments and run an install. The extra `sh` makes `heal` the first argument. (In the pipe
-form `sh -s -- heal` the arguments are positional as usual.)
+form `sh -s -- heal` the arguments are positional as usual.) On macOS `sh` is bash 3.2: the file form
+re-execs under a bash 4+, the heal does not need to.
+
+**The arguments are read before Phase A.** The `healArgs` block, right after `# END cleanEnv`, records
+`_heal`, `OOSH_BRANCH` and `_hw` (the user, or `all`) and leaves `"$@"` untouched, so every re-exec
+carries the arguments intact and Phase A's step 4 already knows it is a heal; the arm itself reads the
+recorded values. The block is a size-exception block too. **Step 4 never hands over or pre-clones for a
+heal**: the arm is POSIX `sh`, and the child `oo heal` runs under the `bash` that `command -v bash`
+finds after `brewPath` (and Phase B's current-bash-dir prepend) has put the right directory first, so
+no temp directory is made to leak. Before, on macOS the pipe form's bash 3.2 hand-over pre-cloned
+`OOSH_SELF_BRANCH` (`dev`, whose installer has no heal arm) and re-ran it without the arguments: the
+machine got a plain install instead of a heal.
+
+> Guarded by **T-INIT-HEAL-EARLY-PARSE**, **T-INIT-PIPE-HEAL-ARGS-SURVIVE** and
+> **T-INIT-REEXEC-KEEPS-ARGS**.
 
 **The launcher.** The tree the arm hands over to installs the launcher `/usr/local/bin/this` (`private.oo.install.launcher`); where the empty shell `env -i sh` has no `/usr/local/bin` on its PATH — BusyBox on Alpine — it also links `/usr/bin/this` to it (`private.oo.launcher.link.get`), so `this` is found there too.
 
@@ -206,7 +235,7 @@ The child is `oo heal` of the clone, which re-runs itself once in a clean proces
 all-or-nothing and has to live in the one file the curl form fetches. Its block says why on the line after
 `# BEGIN healArm` (`# size-exception: …`) and **leaves the count**; a block without that reason line counts
 fully (`homeRecovery`, `cleanEnv` and `brokenTree` count). **T-INIT-SIZE-CAP** prints both numbers —
-now `init/oosh is 720 lines, 696 counted (cap 700; 24 lines in size-exception blocks)`.
+now `init/oosh is 720 lines, 691 counted (cap 700; 29 lines in size-exception blocks)`. The count is the awk pass of `test.install.sizeCapCheck`: every `# BEGIN <name>` whose next line is a non-empty `# size-exception:` reason, through its `# END <name>`, markers included, leaves the 720 raw lines (`healArm` and `healArgs` are such blocks).
 
 ## The `brokenTree` check
 

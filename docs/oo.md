@@ -609,7 +609,7 @@ a folder in the way).
 **The summary lines.** One line per step. The ones to know: `users: healed: <names>`;
 `<user> is in group dev now — log out and in once (group dev)` (a note at rc 0, none for root; the group takes
 effect after the next login, and `verify` marks an invariant that fails only for that reason NOT CHECKED, never
-FAIL);
+FAIL; `verify` runs the **heal tree's** platform invariants as each user, not those of whatever branch the user's `~/oosh` pointed to before, so an old branch without those tests is still verified);
 `developking created (admin, password = developking — state 31 precedent)` when the heal had to create
 `developking`; the legacy `ssh.*` backup folders as `[left]` with `user ssh.backup.migrate`; and a login shell other than bash
 as `[left]` with the way into bash (both info notes, see above). Path or
