@@ -481,10 +481,10 @@ oo heal.status [<branch>] [all]   # read-only: what oo heal would do
 `oo heal.status` reads and never writes. For `developking`, a missing home (or user) is printed `[heal] developking: its home comes with the system step, then ~/oosh and ~/config are linked` — the system step makes it — while any other user without a home is `[left] <user>: no home known — not healed`. Each line it prints is `[ok]` (canonical), `[heal]` (`oo heal` A canonical folder git refuses for the one who runs it (dubious ownership, e.g. root reading a clone another user made) is printed `[heal] <branch>: <dir> is owned by <owner> and not yet trusted for <me> — oo heal trusts the base's folders first and then judges it`, never as an aside prediction.
 changes it), `[left]` (`oo heal` reports it, you act) or `[keep]` (an old backup, kept). rc 1 when anything
 is not canonical, and `RESULT` names the command: `not canonical — run: oo heal <branch> <who>`.
-`<branch>` defaults to the branch of the tree running the heal, else `$OOSH_BRANCH`, else `dev`. A tree another
-user owns is read too: git refuses it until `safe.directory` names it, so its HEAD file names the branch
-(`private.ogit.head.branch.get`) — root's bare `oo heal` from test's clone went to `dev` before; only a
-detached tree falls back. `<who>`
+`<branch>` defaults to the branch of the tree running the heal, else `$OOSH_BRANCH`, else `dev`. The tree
+running the heal is its temporary copy, which belongs to the user the heal runs as (`cp -R`, no `-p`), so git
+reads it even when another user owns the tree it was started from — root's bare `oo heal` from test's clone
+went to `dev` while the copy kept test as its owner. `<who>`
 defaults to the calling user, and `oo heal all` (a first argument of `all`) means every user.
 
 **Three entry forms, one heal.** All end in `oo heal` of a tree:
@@ -519,7 +519,7 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
   base; the folder it pointed to is left alone, its git state reported (`[left] … untouched`). A foreign tree git
   refuses to read for the healer (another owner, git's `safe.directory`) is never trusted and never called "not a
   repository": `[left] <user> tree <dir>: foreign tree, left untouched (not probed: owned by <owner>, …)`.
-- **The base's folders are trusted before they are judged.** Before the diagnosis and again before the code step,
+- **The base's folders are trusted before they are judged.** Once, before the diagnosis (which judges them already),
   the heal trusts every branch folder under the base for the user it runs as (`private.oo.heal.base.trust` →
   `ogit.safeDirectory.ensure <base>`, git's `safe.directory`; root's `~/.gitconfig` under `all`), so a clean clone
   another user made (`oo checkout` as that user) is kept or fast-forwarded — as root it used to read "not a
@@ -1104,9 +1104,9 @@ Internal functions (not for direct use):
 | `private.oo.method.end.get <file> <startLine>` | The line that closes the definition starting at `<startLine>`; empty when another definition or the marker comes first — `oo method.delete` refuses then |
 | `private.oo.path.sudo.get <path> <?mode>` | The one privilege rule: nothing when this user may write `<path>` (its nearest existing parent while it is not there) or is root (`$SUDO` empty); else `$SUDO`, or `sudo -n ` in mode `quiet`, which never asks for a password. `oo update`'s drop-in cleanup and launcher install use quiet (T-OO-PATH-SUDO-GET, T-OO-PRIVILEGE-QUIET) |
 | `private.oo.pm.install.prefix.get <?pmCmd>` | What goes in front of the package-manager command: the sudo decision — none for brew (Homebrew refuses root; root under sudo hops back to `$SUDO_USER`), none for root (`$SUDO` empty), else `$SUDO` — and the non-interactive env of `private.oo.pm.env.get`. `oo.cmd` and `oo.prereqs.install` both use it (T-OO-PM-INSTALL-PREFIX-GET) |
-| `private.oo.heal.env.clean <?branch> <?who> <?tree>` | Runs `oo heal` again in one clean process from a world-readable copy of `<tree>` under `/tmp/oosh-heal.*` (`env -i`, the carried list above, `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_LOGIN`, `CONFIG` naming a file that is not there, `CONFIG_PATH` a scratch folder `<copy>/.heal.config`); the copy goes afterwards; plain bash, called before `this` is loaded |
+| `private.oo.heal.env.clean <?branch> <?who> <?tree>` | Runs `oo heal` again in one clean process from a world-readable copy of `<tree>` under `/tmp/oosh-heal.*`, owned by the user that process runs as (`env -i`, the carried list above, `OOSH_HEAL_CLEAN=1`, `OOSH_HEAL_LOGIN`, `CONFIG` naming a file that is not there, `CONFIG_PATH` a scratch folder `<copy>/.heal.config`); the copy goes afterwards; plain bash, called before `this` is loaded |
 | `private.oo.heal.path.system.get` | The system `PATH` of a clean process (`/usr/local`, `/usr`, `/` `bin` and `sbin`; Homebrew's `/opt/homebrew` on macOS); silent getter |
-| `private.oo.heal.branch.get` | The branch `oo heal` heals to by default: the branch of the tree running it (its HEAD file read as text when the tree is another user's and not trusted yet — `private.ogit.head.branch.get`), else `$OOSH_BRANCH`, else `dev`; silent getter |
+| `private.oo.heal.branch.get` | The branch `oo heal` heals to by default: the branch of the tree running it (the clean step's copy, the runner's own), else `$OOSH_BRANCH`, else `dev`; silent getter |
 | `private.oo.heal.basehome.get` | The folder the homes live in: the parent of `developking`'s home, else `/Users` (macOS) or `/home`; silent getter |
 | `private.oo.heal.path.get <basehome> <which>` | `base` (the components base, `private.config.shared.oosh.base.get`) or `sharedConfig` (`private.config.shared.config.get`) under `<basehome>`, in the file system's letter case; before developking exists the fallback is `<basehome>/shared` through `private.this.path.case.get`; silent getter |
 | `private.oo.heal.root.check` | Predicate: this process may act as root — decided once by `private.oo.heal.privilege.ensure` |

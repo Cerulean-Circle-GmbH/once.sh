@@ -143,7 +143,6 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | Method | Parameters | Description |
 |--------|-----------|-------------|
 | `branch.get` | `<?dir:$OOSH_DIR>` | echo the current branch of `<dir>`, sanitised (`refs/heads/`, `refs/remotes/origin/`, `heads/origin/`, `origin/` stripped); empty when detached or not a repo |
-| `private.ogit.head.branch.get` | `<?dir:$OOSH_DIR>` | echo the branch the HEAD file of `<dir>` names, sanitised as `branch.get`; read as text, no git process — so a repository git refuses for its owner (dubious ownership) is read too, and nothing of an untrusted repository's config runs; empty when detached or not the top of a repository. `oo heal`'s default branch falls back to it |
 | `branch.list` | `<?source:local> <?dir:$OOSH_DIR>` | echo branch names one per line: `local`, `remote` (cached origin/* refs, offline) or `all` |
 | `branch.check` | `<ref> <?dir:$OOSH_DIR>` | rc 0 when `<ref>` resolves in `<dir>` — the one existence check (`ossh`, `os platform.test` and `oo update` ask it); pass `origin/<name>` for a branch that exists only on origin, `refs/remotes/origin/<name>` to be exact |
 | `branch.find` | `<commit> <?dir:$OOSH_DIR>` | echo every branch (local and remote) containing `<commit>` |
