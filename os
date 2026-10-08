@@ -1588,7 +1588,7 @@ fi
 if ran root.clone; then
   N=root.clone
   set -- "$rh"/oosh.orig.*
-  if [ -e "${2:-/nonexistent}" ]; then ok "the real clone is kept next to the arm's copy: $*"; else bad "only ${1:-no} oosh.orig.<ts> entry in $rh: the real clone was not kept aside"; fi
+  if [ "$#" -ge 2 ] && [ -e "$2" ]; then ok "the real clone is kept next to the arm's copy: $*"; else bad "only ${1:-no} oosh.orig.<ts> entry in $rh: the real clone was not kept aside"; fi
   set -- "$rh"/config.orig.*
   if [ -e "$1" ]; then ok "the real config is kept as $1"; else bad "no $rh/config.orig.<ts>: the real ~/config was not kept aside"; fi
 fi
