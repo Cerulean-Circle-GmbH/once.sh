@@ -477,10 +477,10 @@ test.os.healBreakageNames() {
   names=$(private.os.platform.heal.breakage.names.get)
   for n in merge.conflict markers.committed dirty detached diverged eraB.config root.clone \
            foreign.symlink missing.branch devhome.missing boot.era no.bashrc worktree.layout \
-           safe.directory.stale ssh.legacy state.30 launcher.missing; do
+           safe.directory.stale ssh.legacy state.30 launcher.missing user.clone; do
     printf '%s\n' "$names" | grep -qxF "$n" || bad="$bad not-named:$n"
   done
-  [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" = 17 ] || bad="$bad count=$(printf '%s\n' "$names" | wc -l)"
+  [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" = 18 ] || bad="$bad count=$(printf '%s\n' "$names" | wc -l)"
   # no breakage name starts with private.: the prefix is reserved for helpers (T-PRIVATE-CALLS-DEFINED)
   printf '%s\n' "$names" | grep -q '^private\.' && bad="$bad private-prefix"
   preamble=$(private.os.platform.heal.remote.preamble.get dev.heal) || bad="$bad no-preamble"
@@ -505,21 +505,30 @@ test.os.healBreakageNames() {
   case "$script" in *"! -path '*/.git/index'"*) ;; *) bad="$bad foreign-index-in-sums" ;; esac
   private.os.platform.heal.breakage.script.get no.such.breakage dev.heal >/dev/null 2>&1 && bad="$bad unknown-has-arm"
   private.os.platform.heal.breakage.script.get dirty -x >/dev/null 2>&1 && bad="$bad dash-branch-accepted"
-  want=$(printf '%s\n' "$names" | tr '\n' ' '); want="${want% }"
+  # user.clone is the last name (it rebuilds <base>/<branch> and cannot stand with the other folder arms)
+  [ "$(printf '%s\n' "$names" | tail -n 1)" = user.clone ] || bad="$bad user.clone-not-last"
+  script=$(private.os.platform.heal.breakage.script.get user.clone dev.heal)
+  case "$script" in *"-u test"*"git clone"*) ;; *) bad="$bad user.clone-not-cloned-by-test" ;; esac
+  case "$script" in *"/opt/user.clone.heal.rec"*) ;; *) bad="$bad user.clone-no-record" ;; esac
+  # all is every name but user.clone: its folder is rebuilt, the other folder arms would break it again
+  want=$(printf '%s\n' "$names" | grep -vxF user.clone | tr '\n' ' '); want="${want% }"
   private.os.platform.heal.breakage.list.get >/dev/null 2>&1; [ "$RESULT" = "$want" ] || bad="$bad default=[$RESULT]"
   private.os.platform.heal.breakage.list.get all >/dev/null 2>&1; [ "$RESULT" = "$want" ] || bad="$bad all=[$RESULT]"
   private.os.platform.heal.breakage.list.get detached eraB.config detached >/dev/null 2>&1
   [ "$RESULT" = "eraB.config detached" ] || bad="$bad order=[$RESULT]"
+  private.os.platform.heal.breakage.list.get detached user.clone eraB.config >/dev/null 2>&1 && bad="$bad user.clone-with-detached-accepted"
+  case "$RESULT" in *user.clone*detached*|*detached*user.clone*) ;; *) bad="$bad user.clone-conflict-unnamed=[$RESULT]" ;; esac
+  private.os.platform.heal.breakage.list.get user.clone eraB.config >/dev/null 2>&1; [ "$RESULT" = "eraB.config user.clone" ] || bad="$bad user.clone-order=[$RESULT]"
   private.os.platform.heal.breakage.list.get eraB.config bogus >/dev/null 2>&1; [ $? = 1 ] || bad="$bad unknown-accepted"
   case "$RESULT" in *bogus*) ;; *) bad="$bad unknown-unnamed=[$RESULT]" ;; esac
   for n in '*' 'dirt?' 'state.[3]0' ''; do
     private.os.platform.heal.breakage.list.get "$n" >/dev/null 2>&1 && bad="$bad pattern-accepted:[$n]"
   done
-  [ -z "$bad" ] && create.result 0 "17 breakages, each its own POSIX sh arm; all is every one in the order of application; unknown names refused" || create.result 1 "breakage names:$bad"
+  [ -z "$bad" ] && create.result 0 "18 breakages, each its own POSIX sh arm; all is every one but user.clone in the order of application; unknown names refused" || create.result 1 "breakage names:$bad"
   return $(result)
 }
 test.case $level "T-OS-HEAL-BREAKAGE-NAMES: every breakage maps to an arm, all expands to the full list, an unknown name is refused" test.os.healBreakageNames
-expect 0 "17 breakages, each its own POSIX sh arm; all is every one in the order of application; unknown names refused" \
+expect 0 "18 breakages, each its own POSIX sh arm; all is every one but user.clone in the order of application; unknown names refused" \
   "the scenario test needs the real machines' shapes, each reproducible on its own"
 
 # T-OS-HEAL-FIXTURE-SCRIPT: a fixture folder or file travels as quoted here-documents and
@@ -868,6 +877,7 @@ test.os.healTest.stubs.set() {
   private.os.platform.user.run()         { echo "user.run $2 $3" >> "$OS_T_REC"; return 0; }
   private.os.platform.heal.second.run()  { echo "second $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.heal.foreign.check() { echo "foreign $*" >> "$OS_T_REC"; return 0; }
+  private.os.platform.heal.user.clone.check() { echo "user-clone $*" >> "$OS_T_REC"; return "${OS_T_USERCLONE_RC:-0}"; }
   private.os.platform.ref.branch.drop()  { echo "drop $*" >> "$OS_T_REC"; return 0; }
   private.os.platform.cleanup()          { echo "cleanup $*" >> "$OS_T_REC"; }
   ogit.status.check()                    { return "${OS_T_DIRTY:-0}"; }
@@ -899,8 +909,10 @@ ensure 26d15a4
 gate platform-test-26d15a4
 container.up $p naked_ubuntu_24_04 8022 branch=[platform-test-26d15a4]
 users.install $p branch=[platform-test-26d15a4]"
-  for n in $names; do want="$want
-breakage $n $hb"; done
+  for n in $names; do
+    [ "$n" = user.clone ] || want="$want
+breakage $n $hb"
+  done
   want="$want
 ossh heal $p all $hb local=[1]
 gate.run test
@@ -928,8 +940,18 @@ cleanup 8022"
   [ "$(grep -c '^breakage ' "$OS_T_REC")" = 1 ] && grep -qx "breakage dirty $hb" "$OS_T_REC" || bad="$bad subset-breakages"
   [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:ossh heal ' | sed -n 2p | cut -d: -f2-)" = "pipe $p $hb" ] || bad="$bad pipe-not-after-heal"
   grep -q '^foreign ' "$OS_T_REC" && bad="$bad foreign-without-breakage"
+  grep -q '^user-clone ' "$OS_T_REC" && bad="$bad user-clone-without-breakage"
   grep -q '^cleanup ' "$OS_T_REC" && bad="$bad terminal-cleaned-up"
   grep -q '^drop platform-test-26d15a4' "$OS_T_REC" || bad="$bad terminal-no-drop"
+  # user.clone: its check runs after the second heal, its rc is the user-clone field, a red check fails the run
+  : > "$OS_T_REC"
+  out=$(os.platform.heal.test "$p" 26d15a4 user.clone 2>&1) || bad="$bad user-clone-rc"
+  [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:second ' | sed -n 2p | cut -d: -f2-)" = "user-clone $p $hb" ] || bad="$bad user-clone-not-after-second"
+  case "$out" in *"foreign=skipped user-clone=0)"*) ;; *) bad="$bad user-clone-field" ;; esac
+  OS_T_USERCLONE_RC=1
+  out=$(os.platform.heal.test "$p" 26d15a4 user.clone 2>&1) && bad="$bad user-clone-red-passed"
+  case "$out" in *"FAIL: heal $p 26d15a4 ("*"user-clone=1)"*) ;; *) bad="$bad user-clone-fail-line" ;; esac
+  unset OS_T_USERCLONE_RC
   # a failing container.up: rc 1, the temporary branch dropped, nothing installed
   : > "$OS_T_REC"
   private.os.platform.container.up() { echo "container.up" >> "$OS_T_REC"; create.result 1 "stubbed"; return 99; }
@@ -981,7 +1003,7 @@ cleanup 8022"
   test.os.stubs.unset
   unset -f ogit.status.check
   unset OS_T_HEAL_RC OS_T_HEAL_OUT OS_T_DIRTY
-  for n in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign; do
+  for n in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign user-clone; do
     rm -f "$(private.os.platform.heal.log.get "$n" "$p")"
   done
   unset OS_T_GATE
@@ -998,7 +1020,7 @@ test.os.healTestCompletion() {
   local bad="" got
   got=$(os.platform.heal.test.completion.platform); printf '%s\n' "$got" | grep -qx ubuntu_24_04 || bad="$bad platform"
   got=$(os.platform.heal.test.completion.breakages)
-  for w in all terminal pipe eraB.config detached; do printf '%s\n' "$got" | grep -qxF "$w" || bad="$bad breakages:$w"; done
+  for w in all terminal pipe eraB.config detached user.clone; do printf '%s\n' "$got" | grep -qxF "$w" || bad="$bad breakages:$w"; done
   type os.platform.heal.test.completion.oldRef >/dev/null 2>&1 || bad="$bad no-oldRef"
   [ -z "$bad" ] && create.result 0 "completion: platforms, remote branches, breakages" || create.result 1 "completion:$bad"
   return $(result)
@@ -1041,6 +1063,56 @@ test.os.healBreakageWorktreeTracks() {
 test.case $level "T-OS-HEAL-BREAKAGE-WORKTREE-TRACKS: the worktree.layout arm makes testing a worktree tracking origin/testing, as the old install did" test.os.healBreakageWorktreeTracks
 expect 0 "testing a linked worktree at origin/testing, tracking it; a second run says already" \
   "gate 3: a worktree without upstream is not the old layout, and the heal rightly refused it"
+
+# T-OS-HEAL-USER-CLONE-CHECK: the check of the user.clone breakage, on fixture folders (no
+# container). A healthy clone a user made must still be there after the heal: the same owner and
+# the same HEAD as recorded, and no <base>.aside/<branch>.orig.* entry. The script is the check's
+# own text with B and the record file pointed at the fixture.
+test.os.healUserCloneCheck() {
+  local fx bad="" B script me head out
+  fx=$(test.suite.fixture.make healuserclone); B="$fx/Once.sh"
+  me=$(id -un)
+  git init -q -b dev.heal "$B/dev.heal"
+  git -C "$B/dev.heal" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m seed
+  head=$(git -C "$B/dev.heal" rev-parse HEAD)
+  script=$(private.os.platform.heal.user.clone.check.script.get dev.heal | sed -e "s#^B=.*#B='$B'#" -e "s#^REC=.*#REC='$fx/rec'#")
+  if [ "$(printf '%s\n' "$script" | grep -c '^B=')" != 1 ] || [ "$(printf '%s\n' "$script" | grep -c '^REC=')" != 1 ]; then
+    bad="$bad base-or-record-not-replaced"
+  else
+    printf '%s\n' "$script" | sh -n 2>/dev/null || bad="$bad sh-n"
+    # nothing recorded: red
+    printf '%s\n' "$script" | sh >/dev/null 2>&1 && bad="$bad nothing-recorded-passed"
+    # untouched: same owner, same HEAD, no aside entry
+    printf '%s %s %s\n' "$head" "$me" "$(ls -di "$B/dev.heal" | awk '{print $1}')" > "$fx/rec"
+    out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad untouched-red=[$out]"
+    # moved aside: an entry of the branch in <base>.aside
+    mkdir -p "$B.aside/dev.heal.orig.20261008-120000"
+    out=$(printf '%s\n' "$script" | sh 2>&1) && bad="$bad aside-passed"
+    case "$out" in *dev.heal.orig.20261008-120000*) ;; *) bad="$bad aside-unnamed=[$out]" ;; esac
+    rm -rf "$B.aside"
+    # an entry of another branch is no entry of this one
+    mkdir -p "$B.aside/other.orig.20261008-120000"
+    printf '%s\n' "$script" | sh >/dev/null 2>&1 || bad="$bad other-aside-red"
+    rm -rf "$B.aside"
+    # the owner changed (the record names another owner than the folder has now)
+    printf '%s %s %s\n' "$head" "nobody-heal-test" "1" > "$fx/rec"
+    out=$(printf '%s\n' "$script" | sh 2>&1) && bad="$bad owner-changed-passed"
+    case "$out" in *owner*) ;; *) bad="$bad owner-unnamed=[$out]" ;; esac
+    # HEAD moved
+    printf '%s %s %s\n' "0000000000000000000000000000000000000000" "$me" "1" > "$fx/rec"
+    printf '%s\n' "$script" | sh >/dev/null 2>&1 && bad="$bad head-moved-passed"
+    # the folder gone
+    printf '%s %s %s\n' "$head" "$me" "1" > "$fx/rec"
+    mv "$B/dev.heal" "$fx/gone"
+    printf '%s\n' "$script" | sh >/dev/null 2>&1 && bad="$bad folder-gone-passed"
+  fi
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the kept clone passes; an aside entry of the branch, another owner, another HEAD and a missing folder fail" || create.result 1 "user.clone check:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-USER-CLONE-CHECK: the user.clone check fails on an aside entry or an owner change and passes on an untouched clone" test.os.healUserCloneCheck
+expect 0 "the kept clone passes; an aside entry of the branch, another owner, another HEAD and a missing folder fail" \
+  "bug of 2026-10-08: as root git's dubious ownership made the heal move a healthy user clone aside"
 
 ### test.method
 

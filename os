@@ -292,21 +292,28 @@ private.os.platform.heal.breakage.names.get()     #  # echo the breakage names o
  # progress, which refuses any further commit; dirty changes a file the merge
  # does not touch; detached comes last, through update-ref, because a merge
  # in progress refuses a checkout. worktree.layout breaks <base>/testing, a
- # folder of its own: one folder holds one shape of a worktree.
+ # folder of its own: one folder holds one shape of a worktree. user.clone
+ # comes last and stands alone: it rebuilds <base>/<branch> as a clean clone
+ # owned by test, so it would wipe what the folder arms before it made, and
+ # the folder arms after it would break the healthy clone it stands for;
+ # private.os.platform.heal.breakage.list.get leaves it out of all and
+ # refuses it together with another folder arm.
  printf '%s\n' eraB.config root.clone foreign.symlink devhome.missing boot.era no.bashrc \
    safe.directory.stale ssh.legacy state.30 launcher.missing worktree.layout \
-   missing.branch diverged markers.committed merge.conflict dirty detached
+   missing.branch diverged markers.committed merge.conflict dirty detached user.clone
 }
 
 
 private.os.platform.heal.breakage.list.get()     # <?names...:all> # RESULT = the breakages to apply, space-separated, in the order of private.os.platform.heal.breakage.names.get: all, or no name, is every one; rc 1 naming the first unknown name #
 {
- local names word wanted=" " list=""
+ local names word name wanted=" " list="" folderArm
  names=$(private.os.platform.heal.breakage.names.get | tr '\n' ' ')
  [ $# -gt 0 ] || set -- all
  for word in "$@"; do
    if [ "$word" = all ]; then
-     wanted=" $names"
+     # all: every name but user.clone, which stands alone (see names.get)
+     wanted=" "
+     for name in $names; do [ "$name" = user.clone ] || wanted="$wanted$name "; done
      continue
    fi
    # A name is letters, digits and dots: a glob character never reaches the case pattern below.
@@ -321,6 +328,17 @@ private.os.platform.heal.breakage.list.get()     # <?names...:all> # RESULT = th
  for word in $names; do
    case "$wanted" in *" $word "*) list="$list $word" ;; esac
  done
+ # user.clone rebuilds <base>/<branch>: it cannot share a run with the other arms on that folder
+ case " $list " in
+   *" user.clone "*)
+     for folderArm in missing.branch diverged markers.committed merge.conflict dirty detached; do
+       case " $list " in *" $folderArm "*)
+         create.result 1 "breakage user.clone cannot be combined with $folderArm: both break the folder <base>/<branch>"
+         error.log "$RESULT"
+         return $(result) ;;
+       esac
+     done ;;
+ esac
  create.result 0 "${list# }"
  return $(result)
 }
@@ -635,6 +653,37 @@ rgit -C "$D" update-ref --no-deref HEAD "$(rgit -C "$D" rev-parse HEAD)" || fail
 say "$D is on a detached HEAD"
 OOSH_HEAL_ARM
      ;;
+   user.clone)
+     # what a user makes on a healthy machine with the old `oo checkout <branch>`: <base>/<branch> a clean clone of the
+     # branch, owned by test (group of the base, setgid), root has not trusted it (no safe.directory entry).
+     # The heal must keep it. Not a folder arm to combine with the others: it rebuilds the folder (see the order comment of
+     # private.os.platform.heal.breakage.names.get). Record: HEAD, owner, inode, for private.os.platform.heal.user.clone.check.
+     cat <<'OOSH_HEAL_ARM'
+REC=/opt/user.clone.heal.rec
+t=$(home_of test); [ -n "$t" ] || fail "no user test"
+if [ -d "$D/.git" ] && [ "$(stat -c %U "$D")" = test ] && [ -f "$REC" ]; then say "already: $D is a clone of test"; exit 0; fi
+src=$(installed) || fail "the user test has no installed ~/oosh to clone"
+url=$(rgit -C "$src" remote get-url origin) || fail "$src has no origin"
+# The user-run transport of private.os.platform.user.run for test, from inside root's script: runuser, else sudo -H -u.
+as_test() { if command -v runuser >/dev/null 2>&1; then runuser -u test -- env HOME="$t" "$@"; else sudo -H -u test "$@"; fi; }
+[ -e "$D" ] || [ -L "$D" ] && rm -rf "$D"
+# the empty folder the way the base gives it to a member of dev: owner test, group of the base, setgid (not recursive: it is empty)
+g=$(stat -c %g "$B")
+mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || fail "folder $D for test"
+# ogit-exception: the clone is made AS test, the way a user makes it with the old oo checkout; ogit would run as root
+as_test git clone -q "$src" "$D" || fail "clone of $src into $D as test"
+as_test git -C "$D" checkout -q -B "$H" || fail "branch $H in $D"
+as_test git -C "$D" remote set-url origin "$url" || fail "origin of $D"
+[ -z "$(rgit -C "$D" status --porcelain)" ] || fail "$D is not clean"
+# not trusted by root: no safe.directory entry for the folder in root's ~/.gitconfig
+r=$(home_of root)
+# ogit-exception: root's ~/.gitconfig in the disposable container, the old oosh there has no ogit
+HOME="$r" git config --global --unset-all safe.directory "^$D\$" 2>/dev/null
+if HOME="$r" git config --global --get-all safe.directory 2>/dev/null | grep -qx '\*'; then say "WARNING: root trusts every folder (safe.directory *), the shape is not dubious to root"; fi
+printf '%s %s %s\n' "$(rgit -C "$D" rev-parse HEAD)" "$(stat -c %U "$D")" "$(stat -c %i "$D")" > "$REC" || fail "$REC"
+say "$D is a clean clone of $H owned by test, not trusted by root; recorded in $REC"
+OOSH_HEAL_ARM
+     ;;
  esac
 }
 
@@ -848,7 +897,7 @@ private.os.platform.user.run()     # <platform> <user> <command> <log> # run <co
 }
 
 
-private.os.platform.heal.log.get()     # <step> <platform> # echo the log file of a step of os platform.heal.test in <platform> (/tmp/oosh-heal-test-<step>-<platform>.log); <step> is a user (test, root, oosh-user, bash-user) or breakages, heal, pipe, idempotence-root, idempotence-bash-user, second-heal, foreign; silent getter #
+private.os.platform.heal.log.get()     # <step> <platform> # echo the log file of a step of os platform.heal.test in <platform> (/tmp/oosh-heal-test-<step>-<platform>.log); <step> is a user (test, root, oosh-user, bash-user) or breakages, heal, pipe, idempotence-root, idempotence-bash-user, second-heal, foreign, user-clone; silent getter #
 {
  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
  # The sibling of private.os.platform.gate.log.get, one place for the names.
@@ -993,6 +1042,57 @@ OOSH_HEAL_FOREIGN
 }
 
 
+private.os.platform.heal.user.clone.check.script.get()     # <branch> # echo the POSIX sh that checks, as root in a platform container, that the clone the breakage user.clone made is kept: <base>/<branch> is there with the owner and the HEAD recorded in /opt/user.clone.heal.rec and no <base>.aside/<branch>.orig.* entry exists; prints every difference, rc 1 on any; silent getter, rc 1 for a bad <branch> #
+{
+ # NO create.result — a getter consumed as $(...) by
+ # private.os.platform.heal.user.clone.check and by its test, which points B
+ # and REC at a fixture. Raw POSIX sh for the same reason as the arms.
+ local branch="$1" preamble
+ preamble=$(private.os.platform.heal.remote.preamble.get "$branch") || return 1
+ printf "N='user.clone.check'\n%s\n" "$preamble"
+ cat <<'OOSH_HEAL_USER_CLONE_CHECK'
+REC=/opt/user.clone.heal.rec
+[ -f "$REC" ] || fail "nothing recorded — the breakage user.clone was not applied"
+read -r rec_head rec_owner rec_ino < "$REC"
+rc=0
+for a in "$B.aside/${D##*/}".orig.*; do
+  [ -e "$a" ] && { echo "user.clone: the heal moved the clone aside: $a"; rc=1; }
+done
+if [ ! -d "$D/.git" ]; then
+  echo "user.clone: $D is no repository any more"; rc=1
+else
+  owner=$(stat -c %U "$D")
+  [ "$owner" = "$rec_owner" ] || { echo "user.clone: the owner of $D changed: $rec_owner -> $owner"; rc=1; }
+  head=$(rgit -C "$D" rev-parse HEAD)
+  [ "$head" = "$rec_head" ] || { echo "user.clone: the HEAD of $D changed: $rec_head -> $head"; rc=1; }
+  [ "$(stat -c %i "$D")" = "$rec_ino" ] || say "the inode of $D differs from the record (the folder was replaced)"
+fi
+[ "$rc" = 0 ] && say "$D is kept: owner $rec_owner, HEAD $rec_head, nothing aside"
+exit "$rc"
+OOSH_HEAL_USER_CLONE_CHECK
+}
+
+
+private.os.platform.heal.user.clone.check()     # <platform> <branch> # rc 0 when the clone the breakage user.clone made in the platform container is kept by the heal: <base>/<branch> with the recorded owner and HEAD and no <base>.aside/<branch>.orig.* entry (private.os.platform.heal.user.clone.check.script.get through private.os.platform.root.script.run); prints every difference; rc 1 otherwise, also when nothing was recorded #
+{
+ local platform="$1" branch="$2" script
+ if [ -z "$platform" ] || [ -z "$branch" ]; then
+   create.result 1 "private.os.platform.heal.user.clone.check requires <platform> <branch>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ if ! script=$(private.os.platform.heal.user.clone.check.script.get "$branch"); then
+   create.result 1 "private.os.platform.heal.user.clone.check: bad <branch> $branch"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ private.os.platform.root.script.run "$platform" sh "$script"
+ local rc=$?
+ create.result "$rc" "user.clone check on $platform: rc $rc"
+ return $rc
+}
+
+
 private.os.platform.heal.pipe.run()     # <platform> <branch> # the pure pipe form once, as the user test: OOSH_HEAL_LOCAL=1 ossh heal.pipe <platform> <branch> (cat <init> | sh -s -- heal <branch> on the platform, this tree's init/oosh and a bundle of <branch> as OOSH_REPO, the temp files removed by ossh), tee into the log of step pipe without the \r of ssh -tt; rc of the heal #
 {
  # ossh heal runs `sh <file> heal …` — the arm from a FILE. The curl form a
@@ -1095,7 +1195,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
  # The logs of every step, emptied first: a step that does not run this time
  # (pipe) must not show the FAIL lines of an earlier run.
- for step in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign; do
+ for step in breakages heal pipe test root oosh-user bash-user idempotence-root idempotence-bash-user second-heal foreign user-clone; do
    logs="$logs $(private.os.platform.heal.log.get "$step" "$platform")"
  done
  # shellcheck disable=SC2086 # the log paths have no spaces
@@ -1159,7 +1259,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
    "$(private.os.platform.heal.log.get idempotence-bash-user "$platform")" || rcIdem=1
 
  # ─── a second heal that changes nothing, and the foreign tree untouched ──
- local rcSecond rcForeign="skipped" foreignLog
+ local rcSecond rcForeign="skipped" foreignLog rcUserClone="" userCloneLog
  private.os.platform.heal.second.run "$platform" "$healBranch"
  rcSecond=$?
  case " $breakages " in
@@ -1168,12 +1268,19 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
      private.os.platform.heal.foreign.check "$platform" 2>&1 | tee "$foreignLog"
      rcForeign=${PIPESTATUS[0]} ;;
  esac
+ # user.clone: the healthy clone a user made must still be there, as it was
+ case " $breakages " in
+   *" user.clone "*)
+     userCloneLog=$(private.os.platform.heal.log.get user-clone "$platform")
+     private.os.platform.heal.user.clone.check "$platform" "$healBranch" 2>&1 | tee "$userCloneLog"
+     rcUserClone=${PIPESTATUS[0]} ;;
+ esac
 
  # ─── the verdict ──────────────────────────────────────────────────────────
- local line="breakages=$rcBreak heal=$rcHeal verify=$verifyFails${rcPipe:+ pipe=$rcPipe} test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign"
+ local line="breakages=$rcBreak heal=$rcHeal verify=$verifyFails${rcPipe:+ pipe=$rcPipe} test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign${rcUserClone:+ user-clone=$rcUserClone}"
  if [ "$rcBreak" = 0 ] && [ "$rcHeal" -le 1 ] && [ "$verifyFails" = 0 ] && [ "${rcPipe:-0}" = 0 ] && [ "$rcTest" = 0 ] && [ "$rcRoot" = 0 ] \
     && [ "$rcOoshUser" = 0 ] && [ "$rcBashUser" = 0 ] && [ "$rcIdem" = 0 ] && [ "$rcSecond" = 0 ] \
-    && { [ "$rcForeign" = 0 ] || [ "$rcForeign" = skipped ]; }; then
+    && { [ "$rcForeign" = 0 ] || [ "$rcForeign" = skipped ]; } && [ "${rcUserClone:-0}" = 0 ]; then
    printf "PASS: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
    important.log "PASS: heal $platform $oldRef ($line)"
    create.result 0 "PASS"

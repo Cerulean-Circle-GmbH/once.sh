@@ -170,6 +170,7 @@ shape is there. The container is disposable, so an arm may delete.
 | `merge.conflict` | A half-done merge: `MERGE_HEAD` set, markers in `heal.conflict.txt` | `<base>/<branch>` |
 | `dirty` | An uncommitted change in `os` | `<base>/<branch>` |
 | `detached` | `HEAD` detached (through `update-ref`, last: a merge in progress refuses a checkout); `oosh-user`'s `~/oosh` is pointed at the broken folder, as the Mac's one user lives in it | `<base>/<branch>`, `oosh-user` |
+| `user.clone` | `<base>/<branch>` rebuilt as a **healthy** clean clone of the branch, owned by `test` (group of the base, setgid, cloned as `test` from the installed tree), not trusted by root (no `safe.directory` entry); HEAD, owner and inode are recorded in `/opt/user.clone.heal.rec` — the shape `oo checkout <branch>` leaves. The heal must **keep** it: the check fails the run on a `<base>.aside/<branch>.orig.*` entry, a changed owner or HEAD, or a missing folder | `<base>/<branch>`, `test` |
 
 **What a PASS still shows as `[left]`.** These are reports, not failures, and they stand on every heal (the second one too): root's legacy `ssh.*` folders (`ssh.backup.migrate` moves them; the heal never does), the old-format `user.env` values of a real `~/config` that are never carried over, foreign trees left untouched (`foreign.symlink`), and a canonical folder moved aside to `<base>.aside/<name>.orig.<ts>` for you to look at.
 
@@ -188,12 +189,17 @@ shape is there. The container is disposable, so an arm may delete.
 
 The folder arms build on one another in this order: `missing.branch` clears `<base>/<branch>`; `diverged`
 clones it again from the installed tree and commits on it; `markers.committed` commits on it; `merge.conflict`
-leaves a merge in progress; `dirty` changes a file the merge does not touch. The fixture files travel as text
+leaves a merge in progress; `dirty` changes a file the merge does not touch. `user.clone` stands apart: it rebuilds
+the folder as a healthy clone owned by `test`, so it comes last, is **left out of `all`** (name it to run it) and
+is refused together with `missing.branch`, `diverged`, `markers.committed`, `merge.conflict`, `dirty` or `detached`
+(`private.os.platform.heal.breakage.list.get`). After the second heal `private.os.platform.heal.user.clone.check`
+fails the run (`user-clone=1` in the verdict line, log step `user-clone`) when that clone was moved aside or its
+owner or HEAD changed. The fixture files travel as text
 inside the one script (`private.os.platform.heal.fixture.script.get`, `private.os.platform.root.script.run`).
 
 **Logs.** `private.os.platform.heal.log.get <step> <platform>` is `/tmp/oosh-heal-test-<step>-<platform>.log` for
 the steps `breakages`, `heal`, `pipe`, `test`, `root`, `oosh-user`, `bash-user`, `idempotence-root`,
-`idempotence-bash-user`, `second-heal` and `foreign`. They are emptied at the start and removed on PASS.
+`idempotence-bash-user`, `second-heal`, `foreign` and `user-clone`. They are emptied at the start and removed on PASS.
 
 **The C2 preconditions.** The tree is clean and committed (see step 1), and `<healBranch>` — the branch of this
 tree — exists on origin; else the idempotence invariant's `oo update` row is NOT CHECKED and `idempotence=1`.
