@@ -279,7 +279,7 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
 | `~/config` target (`…/sharedConfig/`) and its directories | `developking:dev` (directories: per-creator) | `2775` — group `dev`, `g+w`, setgid |
 | files in `sharedConfig/` | per-creator | group `dev` (inherited through the setgid directory), `g+w` |
-| `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`: **every** `OOSH_*` variable, a value under the saving user's home written `"$HOME/…"` (the config is shared). Only `OOSH_BRANCH` is left out — install input, not state. |
+| `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`: **every** `OOSH_*` variable, a value under the saving user's home written `"$HOME/…"` (the config is shared). Only `OOSH_BRANCH` and `OOSH_REPO` are left out — install input, not state. |
 | `user.env` | **pure data** — the `CONFIG_*` anchors, `BASH_FILE`, then `. $CONFIG_PATH/oosh.env` and `. $CONFIG_PATH/log.env`, last `. $HOME/.config/oosh/user.session.env` | written by `config save` — what `.bashrc` and `source this` start a shell from (the MacStudio model); see *Saving Configuration* below. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
@@ -464,6 +464,7 @@ export OOSH_MODE="dev"
 | `ODOCKER_SG` | **Runtime marker** of odocker's one `sg` re-run (the socket group a shell does not know yet). T-CONFIG-ODOCKER-SG-NOT-SAVED |
 | `ODOCKER_SOCKET` | **Test/override knob** of `private.odocker.socket.get`. One user's export must not reach the shared `odocker.env` through `odocker workspace.set`. T-CONFIG-ODOCKER-SG-NOT-SAVED |
 | `OOSH_BRANCH` | Install **input** — the branch the operator asked for. State that must be **derived, never remembered**: persisting it closed a loop (`oosh.env` seeds a shell → the shell saves → the value is written back) in which nothing consults the checkout, and left `private.oo.install.branch.get` answering `prod` on a `dev` box. **T7.** The branch a host is **on** is `OOSH_MODE`, derived from the canonical `~/oosh`. |
+| `OOSH_REPO` | Install **input** — the **source** of the install's clones (a fork, a path, the bundle `ossh install` ships with `OSSH_INSTALL_LOCAL=1`, removed when the install returns). The origin of every folder is the canonical SSH URL whatever the source (owner decision 1), so a persisted value is at best a stale path: a fresh local install wrote the removed bundle path into `oosh.env`. |
 
 The list is the `case` in `private.config.variables.list` (`config`); `test/test.config` T29 pins it by value. Change all three together.
 
