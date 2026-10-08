@@ -120,7 +120,7 @@ native one is refused); `<oldRef>` is a branch on origin or a commit sha; `<brea
 3. The era gate (`private.os.platform.branch.gate`) refuses a ref older than the `mode root` installer contract.
 4. `private.os.platform.container.up` with `OSSH_INSTALL_BRANCH` set, then `private.os.platform.users.install`:
    `test`, `root`, `oosh-user` and `bash-user` are installed at the OLD ref.
-5. The breakages, each as root in the container.
+5. The breakages, each as root in the container. A breakage that fails ends the run at once with `FAIL: heal … (breakage <name> failed — log: …)`, rc 1, before the heal: a shape that did not come about proves nothing.
 6. One heal: `OOSH_HEAL_LOCAL=1 ossh heal <platform> all <branch>`. Its rc 1 is no failure (it moves broken
    canonical folders aside and says so, and reports info notes such as legacy `ssh.*` folders or a non-bash login
    shell); rc 2 or an ssh failure is. The log of the heal is read: a `FAIL <invariant> <user>:` line of its own

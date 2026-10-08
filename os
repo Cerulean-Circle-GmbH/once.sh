@@ -669,12 +669,13 @@ as_test() { if command -v runuser >/dev/null 2>&1; then runuser -u test -- env H
 [ -e "$D" ] || [ -L "$D" ] && rm -rf "$D"
 # the empty folder the way the base gives it to a member of dev: owner test, group of the base, setgid (not recursive: it is empty)
 g=$(stat -c %g "$B")
-mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || fail "folder $D for test"
-# ogit-exception: the clone is made AS test, the way a user makes it with the old oo checkout; ogit would run as root
-as_test git clone -q "$src" "$D" || fail "clone of $src into $D as test"
-as_test git -C "$D" checkout -q -B "$H" || fail "branch $H in $D"
-as_test git -C "$D" remote set-url origin "$url" || fail "origin of $D"
-[ -z "$(rgit -C "$D" status --porcelain)" ] || fail "$D is not clean"
+mkdir "$D" && chown "test:$g" "$D" && chmod 2775 "$D" || { rm -rf "$D"; fail "folder $D for test"; }
+# ogit-exception: the clone is made AS test, the way a user makes it with the old oo checkout; ogit would run as root.
+# The installed tree is not test's own (git: dubious ownership for test), so it is trusted on the command line for this one source.
+as_test git -c safe.directory="$src" clone -q "$src" "$D" || { rm -rf "$D"; fail "clone of $src into $D as test"; }
+as_test git -C "$D" checkout -q -B "$H" || { rm -rf "$D"; fail "branch $H in $D"; }
+as_test git -C "$D" remote set-url origin "$url" || { rm -rf "$D"; fail "origin of $D"; }
+[ -z "$(rgit -C "$D" status --porcelain)" ] || { rm -rf "$D"; fail "$D is not clean"; }
 # not trusted by root: no safe.directory entry for the folder in root's ~/.gitconfig
 r=$(home_of root)
 # ogit-exception: root's ~/.gitconfig in the disposable container, the old oosh there has no ogit
@@ -1216,7 +1217,22 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  breakLog=$(private.os.platform.heal.log.get breakages "$platform")
  for name in $breakages; do
    private.os.platform.heal.breakage.apply "$platform" "$name" "$healBranch" 2>&1 | tee -a "$breakLog"
-   [ "${PIPESTATUS[0]}" = 0 ] || rcBreak=1
+   if [ "${PIPESTATUS[0]}" != 0 ]; then
+     # A shape that did not come about is no test of the heal: end the run here, before it.
+     rcBreak=1
+     printf "FAIL: heal %s %s (breakage %s failed — log: %s)\n" "$platform" "$oldRef" "$name" "$breakLog"
+     error.log "FAIL: heal $platform $oldRef (breakage $name failed — log: $breakLog)"
+     private.os.platform.ref.branch.drop "$branch"
+     eval "$restoreTraps"
+     if [ -n "$terminal" ]; then
+       console.log "terminal: the container of $platform stays on port $sshPort"
+     else
+       ossh connection.close "$platform" 2>/dev/null
+       private.os.platform.cleanup "$sshPort"
+     fi
+     create.result 1 "FAIL"
+     return 1
+   fi
  done
 
  # ─── ONE heal as root, the curl form over ssh (ossh heal → sh <init> heal <branch> all) ─

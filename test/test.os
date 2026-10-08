@@ -508,8 +508,10 @@ test.os.healBreakageNames() {
   # user.clone is the last name (it rebuilds <base>/<branch> and cannot stand with the other folder arms)
   [ "$(printf '%s\n' "$names" | tail -n 1)" = user.clone ] || bad="$bad user.clone-not-last"
   script=$(private.os.platform.heal.breakage.script.get user.clone dev.heal)
-  case "$script" in *"-u test"*"git clone"*) ;; *) bad="$bad user.clone-not-cloned-by-test" ;; esac
+  case "$script" in *"-u test"*" clone -q"*) ;; *) bad="$bad user.clone-not-cloned-by-test" ;; esac
   case "$script" in *"/opt/user.clone.heal.rec"*) ;; *) bad="$bad user.clone-no-record" ;; esac
+  case "$script" in *"git -c safe.directory=\"\$src\" clone"*) ;; *) bad="$bad user.clone-source-not-trusted" ;; esac
+  case "$script" in *'rm -rf "$D"'*'|| { rm -rf "$D"; fail'*) ;; *) bad="$bad user.clone-leaves-folder-on-failure" ;; esac
   # all is every name but user.clone: its folder is rebuilt, the other folder arms would break it again
   want=$(printf '%s\n' "$names" | grep -vxF user.clone | tr '\n' ' '); want="${want% }"
   private.os.platform.heal.breakage.list.get >/dev/null 2>&1; [ "$RESULT" = "$want" ] || bad="$bad default=[$RESULT]"
@@ -952,6 +954,16 @@ cleanup 8022"
   out=$(os.platform.heal.test "$p" 26d15a4 user.clone 2>&1) && bad="$bad user-clone-red-passed"
   case "$out" in *"FAIL: heal $p 26d15a4 ("*"user-clone=1)"*) ;; *) bad="$bad user-clone-fail-line" ;; esac
   unset OS_T_USERCLONE_RC
+  # a failed breakage ends the run before the heal: rc 1, no heal, the branch dropped, the container removed
+  : > "$OS_T_REC"
+  private.os.platform.heal.breakage.apply() { echo "breakage $2 $3" >> "$OS_T_REC"; [ "$2" != dirty ]; }
+  out=$(os.platform.heal.test "$p" 26d15a4 dirty detached 2>&1); rc=$?
+  [ "$rc" = 1 ] || bad="$bad breakage-fail-rc=$rc"
+  grep -q '^ossh heal ' "$OS_T_REC" && bad="$bad heal-after-failed-breakage"
+  grep -q '^breakage detached' "$OS_T_REC" && bad="$bad breakages-went-on"
+  grep -q '^drop platform-test-26d15a4' "$OS_T_REC" && grep -q '^cleanup 8022' "$OS_T_REC" || bad="$bad breakage-fail-no-drop-or-cleanup"
+  case "$out" in *"FAIL: heal $p 26d15a4 (breakage dirty failed"*) ;; *) bad="$bad breakage-fail-line=[$out]" ;; esac
+  private.os.platform.heal.breakage.apply() { echo "breakage $2 $3" >> "$OS_T_REC"; return 0; }
   # a failing container.up: rc 1, the temporary branch dropped, nothing installed
   : > "$OS_T_REC"
   private.os.platform.container.up() { echo "container.up" >> "$OS_T_REC"; create.result 1 "stubbed"; return 99; }
