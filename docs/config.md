@@ -599,7 +599,7 @@ Deletes a config file.
 ### Adding Configs
 
 #### `config.add <name>`
-Adds a config file as a source in user.env.
+Adds a config file as a source in user.env. The per-user session chain `. $HOME/.config/oosh/user.session.env` stays the last line: the new line goes in before it, in place (T-CONFIG-ADD-CHAIN-LAST).
 
 ```bash
 ./config add oosh
