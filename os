@@ -1948,7 +1948,8 @@ private.os.platform.heal.compare.known.get()     #  # echo the differences of a 
  # path-exception: a glob of a snapshot line below, data; no PATH is set
  printf '%s\n' \
    "*/.config/oosh/user.session.env${t}-${t}export PATH=* || the install writes the PATH of the installing process into a user's user.session.env (the dirs of root, the ~/oosh of another user) — a dev bug, a separate topic" \
-   "*/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh${t}*${t}dir || the base keeps the owner the old install gave it: private.this.dir.ensure never changes a directory that exists (the D1 lesson)"
+   "*/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh${t}*${t}dir || the base keeps the owner the old install gave it: private.this.dir.ensure never changes a directory that exists (the D1 lesson)" \
+   "shell of *${t}-${t}*/bash || the login shell the old install set, the bash on PATH (/usr/bin/bash where /bin/bash is the system one): the heal never changes a shell that is a bash (owner ruling P6 round 1, 6; private.user.login.shell.bash.ensure)"
 }
 
 

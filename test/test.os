@@ -1989,7 +1989,8 @@ expect 0 "the lines after the marker, sorted, no carriage return, no noise; rc 1
 # T-OS-HEAL-COMPARE-KNOWN-GET: the known differences of a heal and a fresh install — each a pattern of
 # the snapshot line and a reason; the PATH the install writes into ANY user's user.session.env (root's
 # dirs, another user's ~/oosh: alma, alpine, debian P6) and the owner of the base the old install made
-# match; a change of a user.session.env PATH elsewhere in the file, or any other line, does not.
+# match, and a login shell that is a bash (ruling 6 keeps it); a change of a user.session.env PATH elsewhere, a
+# shell that is no bash, or any other line, does not.
 test.os.healCompareKnownGet() {
   local bad="" known line pattern reason t m
   t=$(printf '\t'); known=$(private.os.platform.heal.compare.known.get)
@@ -2007,20 +2008,21 @@ test.os.healCompareKnownGet() {
   }
   for m in "/root/.config/oosh/user.session.env${t}-${t}export PATH=\"/root/oosh:/root/oosh/su:/bin\"" \
            "/home/oosh-user/.config/oosh/user.session.env${t}-${t}export PATH=\"/home/oosh-user/oosh:/home/test/oosh:/bin\"" \
-           "/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh${t}root:dev 2775${t}dir"; do
+           "/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh${t}root:dev 2775${t}dir" \
+           "shell of root${t}-${t}/usr/bin/bash" "shell of test${t}-${t}/bin/bash"; do
     test.os.healCompareKnown.match "$m" >/dev/null || bad="$bad not-known=[$m]"
   done
   for m in "/home/test/.config/oosh/oosh.session.env${t}-${t}export OOSH_MODE=\"dev\"" \
            "/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/dev.heal${t}root:dev 2775${t}dir" \
-           "/home/test/.gitconfig${t}test:test 664${t}values"; do
+           "/home/test/.gitconfig${t}test:test 664${t}values" "shell of test${t}-${t}/bin/sh"; do
     test.os.healCompareKnown.match "$m" >/dev/null && bad="$bad known-too-wide=[$m]"
   done
   unset -f test.os.healCompareKnown.match
-  [ -z "$bad" ] && create.result 0 "each a pattern and a reason; the installer PATH of any user session file and the owner of the base, nothing more" || create.result 1 "known differences:$bad"
+  [ -z "$bad" ] && create.result 0 "each a pattern and a reason; the installer PATH of any user session file, the owner of the base and a bash login shell, nothing more" || create.result 1 "known differences:$bad"
   return $(result)
 }
 test.case $level "T-OS-HEAL-COMPARE-KNOWN-GET: every known difference has a pattern and a reason, and they match no more than they name" test.os.healCompareKnownGet
-expect 0 "each a pattern and a reason; the installer PATH of any user session file and the owner of the base, nothing more" \
+expect 0 "each a pattern and a reason; the installer PATH of any user session file, the owner of the base and a bash login shell, nothing more" \
   "the compare had no place for a difference that is a dev bug of the install"
 
 
