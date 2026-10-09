@@ -724,6 +724,8 @@ r=$(home_of root)
 HOME="$r" git config --global --unset-all safe.directory "^$D\$" 2>/dev/null
 if HOME="$r" git config --global --get-all safe.directory 2>/dev/null | grep -qx '\*'; then say "WARNING: root trusts every folder (safe.directory *), the shape is not dubious to root"; fi
 printf '%s %s %s\n' "$(rgit -C "$D" rev-parse HEAD)" "$(owner_of "$D")" "$(inode_of "$D")" > "$REC" || fail "$REC"
+# the aside entries there before the heal under test: the check names only a new one
+ls -A "$B.aside" 2>/dev/null > "$REC.aside"
 [ -z "$copy" ] || rm -rf "$copy"
 say "$D is a clean clone of $H owned by test, not trusted by root; recorded in $REC"
 OOSH_HEAL_ARM
@@ -1098,8 +1100,12 @@ REC=/opt/user.clone.heal.rec
 [ -f "$REC" ] || fail "nothing recorded — the breakage user.clone was not applied"
 read -r rec_head rec_owner rec_ino < "$REC"
 rc=0
+# an aside entry the arm found there already (<REC>.aside: the first heal of the scenario moved the
+# broken folder aside before the second pass) is no move of the clone
 for a in "$B.aside/${D##*/}".orig.*; do
-  [ -e "$a" ] && { echo "user.clone: the heal moved the clone aside: $a"; rc=1; }
+  [ -e "$a" ] || continue
+  grep -qxF "${a##*/}" "$REC.aside" 2>/dev/null && continue
+  echo "user.clone: the heal moved the clone aside: $a"; rc=1
 done
 if [ ! -d "$D/.git" ]; then
   echo "user.clone: $D is no repository any more"; rc=1

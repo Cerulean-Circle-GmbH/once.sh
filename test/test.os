@@ -1286,6 +1286,15 @@ test.os.healUserCloneCheck() {
     out=$(printf '%s\n' "$script" | sh 2>&1) && bad="$bad aside-passed"
     case "$out" in *dev.heal.orig.20261008-120000*) ;; *) bad="$bad aside-unnamed=[$out]" ;; esac
     rm -rf "$B.aside"
+    # an entry that was there before the arm (the first heal of the scenario moved the broken folder aside;
+    # the arm records the aside folder in <REC>.aside) is no move of the clone — the second pass, alma P6
+    mkdir -p "$B.aside/dev.heal.orig.20261008-110000"; printf 'dev.heal.orig.20261008-110000\n' > "$fx/rec.aside"
+    out=$(printf '%s\n' "$script" | sh 2>&1) || bad="$bad earlier-aside-red=[$out]"
+    mkdir -p "$B.aside/dev.heal.orig.20261008-130000"
+    out=$(printf '%s\n' "$script" | sh 2>&1) && bad="$bad new-aside-beside-earlier-passed"
+    case "$out" in *dev.heal.orig.20261008-130000*) ;; *) bad="$bad new-aside-unnamed=[$out]" ;; esac
+    case "$out" in *dev.heal.orig.20261008-110000*) bad="$bad earlier-aside-named" ;; esac
+    rm -rf "$B.aside" "$fx/rec.aside"
     # an entry of another branch is no entry of this one
     mkdir -p "$B.aside/other.orig.20261008-120000"
     printf '%s\n' "$script" | sh >/dev/null 2>&1 || bad="$bad other-aside-red"
@@ -1683,6 +1692,7 @@ test.os.healBreakageUserCloneHealed() {
   [ "$rc" = 0 ] || bad="$bad rc=$rc=[$(printf '%s' "$out" | tail -2 | tr '\n' '|')]"
   [ -d "$B/dev.heal/.git" ] && [ -f "$B/dev.heal/f" ] || bad="$bad no-clone"
   [ -s "$fx/rec" ] || bad="$bad no-record"
+  [ -e "$fx/rec.aside" ] || bad="$bad no-aside-record"
   [ -z "$(ls -d "$B".user-clone-src* 2>/dev/null)" ] || bad="$bad source-copy-left"
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "on a healed machine the folder is the source, taken aside first, removed after" || create.result 1 "user.clone healed:$bad"
