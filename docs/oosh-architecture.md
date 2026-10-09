@@ -450,7 +450,7 @@ this.call() {
 | `this` | Core runtime, `this.start()` dispatches commands to methods |
 | `oo` | Framework lifecycle, `oo new`, `oo update`, `oo release` |
 | `config` | Configuration persistence to `~/config/user.env` |
-| `path` | PATH reporting and session-local edits (`path list`, `path env`, `path prepend`, `path remove`) plus `path validate`, the PATH-writer sweep. There is no `path add` |
+| `path` | PATH reporting and session-local edits (`path list`, `path env`, `path append`/`prepend`/`remove`, aliases `add`/`push`/`put`/`rm`), the saved login PATH (`path save`, `path saved`, `path edit`, `path load` — a front for `config session.save` and `~/.config/oosh/user.session.env`) and `path validate`, the PATH-writer sweep |
 | `log` | Logging with levels 1-7 (`console.log`, `info.log`, `error.log`) |
 | `debug` | Step debugger, stack traces, trap handlers |
 | `line` | Pipe-friendly text processing (`line.split`, `line.join`, `line.filter`) |

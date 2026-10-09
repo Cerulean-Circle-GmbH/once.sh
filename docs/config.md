@@ -197,6 +197,10 @@ which a login PATH never carries; T-THIS-START-SESSION-PATH).
 read it. It cannot guard itself, so `this` drops repeated segments on every
 `source this` (`private.this.path.dedup`, T-THIS-PATH-NO-GROWTH).
 
+**`path save` is the user front for that file.** `path save` runs `config session.save` for this shell's PATH (so the same segment filter applies) and lists the result; `path saved` lists what a new login gets; `path edit` opens the saved list, one directory per line, in `$EDITOR` and saves it through the same filter. `path load` sets the PATH of the calling shell from the saved file — only when `path` is sourced (`source path; path load`); as a command it changes nothing and says so. `path load <file>` reads an old `~/paths` (one directory per line, from `test/mcdonges.latest`): `source path; path load ~/paths; path save` migrates it once. `path add` / `push` / `put` / `rm` are aliases of `append` / `prepend` / `remove` and stay session-only; follow them with `path save` to keep the change.
+
+**Limitation.** `config session.save` also runs on `oo mode`, on `config save` and on the first `this` or `log` of an empty shell, and each writes the PATH of *its own* shell. A shell opened *before* a `path save` therefore writes its older PATH back over the save. Shells opened after the save carry it, so for them this is harmless; `path save` prints a line about it (T-PATH-SAVE-*, T-PATH-LOAD-*, T-PATH-EDIT-ROUNDTRIP).
+
 Before a shared config is switched (*The switch and its gate*, below), the
 shared `user.env` still carries the old shared line written by
 `private.config.path.line.get` — every segment under the saver's home as
@@ -241,7 +245,7 @@ line itself.
 | remote / sudo string | `ossh`, `user` ×2, `hiveMind` ×3, `this` (as-user preamble) | executed on another host or as another user, where no `user.env` has been read |
 | sourced before `user.env` | `ossh.start`, `this` (file scope, `this.path.add`, `private.this.path.dedup`) | colon-anchored or a rewrite of the value already there |
 | repair, not build | `oo.mode` ×2, `this.init` | rewriting a branch name already in PATH, or saving and restoring PATH across a mid-session `source "$CONFIG"` |
-| session scope | `oo` (brew, `ONCE_LOAD_DIR`), `claudeCode`, `path.append`/`prepend`/`remove` | deliberately affects only the running shell |
+| session scope | `oo` (brew, `ONCE_LOAD_DIR`), `claudeCode`, `path.append`/`prepend`/`remove`, `path.load`, and `path.edit`'s subshell (its list goes through `config.session.save`) | deliberately affects only the running shell |
 | diagnostics | `debug`'s `p`, banners, `path.env` | they print `PATH=`, they do not set it |
 
 Enforced by **`path validate [<treeRoot>]`** — the same sweep as the anchors (plus
