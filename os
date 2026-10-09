@@ -688,6 +688,12 @@ t=$(home_of test); [ -n "$t" ] || fail "no user test"
 if [ -d "$D/.git" ] && [ "$(owner_of "$D")" = test ] && [ -f "$REC" ]; then say "already: $D is a clone of test"; exit 0; fi
 src=$(installed) || fail "the user test has no installed ~/oosh to clone"
 url=$(rgit -C "$src" remote get-url origin) || fail "$src has no origin"
+# On the healed machine (the second pass of os platform.heal.test) the installed tree of test IS <base>/<branch>:
+# the folder goes aside as the source of the clone first, and goes once the clone stands (T-OS-HEAL-BREAKAGE-USER-CLONE-HEALED).
+copy=""
+if [ "$(readlink -f "$src")" = "$(readlink -f "$D" 2>/dev/null)" ]; then # kernel-exception: POSIX sh of the disposable-container arm
+  copy="$B.user-clone-src"; rm -rf "$copy"; mv "$D" "$copy" || fail "$D aside as the source of the clone"; src="$copy"
+fi
 [ -e "$D" ] || [ -L "$D" ] && rm -rf "$D"
 # the empty folder the way the base gives it to a member of dev: owner test, group of the base, setgid (not recursive: it is empty)
 g=$(gid_of "$B")
@@ -718,6 +724,7 @@ r=$(home_of root)
 HOME="$r" git config --global --unset-all safe.directory "^$D\$" 2>/dev/null
 if HOME="$r" git config --global --get-all safe.directory 2>/dev/null | grep -qx '\*'; then say "WARNING: root trusts every folder (safe.directory *), the shape is not dubious to root"; fi
 printf '%s %s %s\n' "$(rgit -C "$D" rev-parse HEAD)" "$(owner_of "$D")" "$(inode_of "$D")" > "$REC" || fail "$REC"
+[ -z "$copy" ] || rm -rf "$copy"
 say "$D is a clean clone of $H owned by test, not trusted by root; recorded in $REC"
 OOSH_HEAL_ARM
      ;;

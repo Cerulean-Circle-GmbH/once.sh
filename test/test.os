@@ -1659,6 +1659,38 @@ test.case $level "T-OS-HEAL-ARM-TWINS: owner_of, gid_of, inode_of and an as_user
 expect 0 "owner_of, gid_of and inode_of agree with ls and id; as_user does not read stdin" \
   "item 5: a command run as a user inside the root script read the script itself"
 
+# T-OS-HEAL-BREAKAGE-USER-CLONE-HEALED: the user.clone arm on a healed machine — the second pass of
+# os platform.heal.test runs it after the heal, when test's ~/oosh IS <base>/<branch>. The arm removed
+# that folder and then cloned from it: "clone of <D> into <D> as test" (ubuntu, P6). It takes the
+# folder aside as the source first and removes it after. Run under sh on a fixture: passwd, base,
+# record path pointed at it, as_user runs as the caller, chown and the root config stand in.
+test.os.healBreakageUserCloneHealed() {
+  local fx bad="" script out B g
+  fx=$(test.suite.fixture.make healuserclone); B="$fx/base/Once.sh"
+  g=(git -c user.email=t@t -c user.name=t -c commit.gpgsign=false)
+  mkdir -p "$B" "$fx/home/test" "$fx/home/root" "$fx/bin"
+  printf 'test:x:1:1::%s:/bin/sh\nroot:x:0:0::%s:/bin/sh\n' "$fx/home/test" "$fx/home/root" > "$fx/passwd"
+  "${g[@]}" init -q -b dev.heal "$B/dev.heal"; printf 'x\n' > "$B/dev.heal/f"
+  "${g[@]}" -C "$B/dev.heal" add f; "${g[@]}" -C "$B/dev.heal" commit -q -m one
+  "${g[@]}" -C "$B/dev.heal" remote add origin git@github.com:Cerulean-Circle-GmbH/once.sh.git
+  ln -s "$B/dev.heal" "$fx/home/test/oosh"
+  printf '#!/bin/sh\nexit 0\n' > "$fx/bin/chown"; chmod 755 "$fx/bin/chown"
+  script=$(private.os.platform.heal.breakage.script.get user.clone dev.heal | sed \
+    -e "s#/etc/passwd#$fx/passwd#g" -e "s#^B=.*#B='$B'#" -e "s#^REC=.*#REC='$fx/rec'#" \
+    -e "s#^as_user() {.*#as_user() { _au=\$1; shift; \"\$@\" </dev/null; }#" \
+    -e "s#^  owner_of() {.*#  owner_of() { echo test; }#")
+  out=$(printf '%s\n' "$script" | PATH="$fx/bin:$PATH" HOME="$fx/home/root" sh 2>&1); local rc=$?
+  [ "$rc" = 0 ] || bad="$bad rc=$rc=[$(printf '%s' "$out" | tail -2 | tr '\n' '|')]"
+  [ -d "$B/dev.heal/.git" ] && [ -f "$B/dev.heal/f" ] || bad="$bad no-clone"
+  [ -s "$fx/rec" ] || bad="$bad no-record"
+  [ -z "$(ls -d "$B".user-clone-src* 2>/dev/null)" ] || bad="$bad source-copy-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "on a healed machine the folder is the source, taken aside first, removed after" || create.result 1 "user.clone healed:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-BREAKAGE-USER-CLONE-HEALED: the user.clone arm rebuilds <base>/<branch> from itself on a healed machine" test.os.healBreakageUserCloneHealed
+expect 0 "on a healed machine the folder is the source, taken aside first, removed after" "the second pass removed the folder and then cloned from it"
+
 # T-OS-HEAL-HOME-OF-DSCL: home_of reads /etc/passwd, else the directory service — macOS keeps its
 # users in dscl, so the arms the macOS workflow runs find test and developking (and the base under
 # the home of developking) there; one text on every platform, a fallback on a missing value, no fork.
