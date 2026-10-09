@@ -75,7 +75,7 @@ else
 fi
 
 # ============================================================================
-# Test path.append  (there are no `add` / `push` aliases — there never were)
+# Test path.append
 # ============================================================================
 
 reset_path
@@ -191,19 +191,22 @@ expect 0 "neighbour kept" "line.filter matched a substring, so the de-dupe pass 
 # Nothing here may persist: the login PATH is data in ~/config/user.env, and these methods
 # are session-local. The docstrings used to claim "and saves config".
 test.path.mutatorsPersistNothing() {
-  local saved="$PATH" before after
-  before=$(cat "$CONFIG" 2>/dev/null | wc -l)
-  path.prepend "/tmp/oosh-test-path-persistence" >/dev/null 2>&1
-  after=$(cat "$CONFIG" 2>/dev/null | wc -l)
+  local saved="$PATH" before after session verb
+  session=$(private.config.user.session.file.get)
+  before=$(cat "$CONFIG" "$session" 2>/dev/null | cksum)
+  for verb in prepend append remove put push add rm; do
+    path.$verb "/tmp/oosh-test-path-persistence" >/dev/null 2>&1
+  done
+  after=$(cat "$CONFIG" "$session" 2>/dev/null | cksum)
   export PATH="$saved"
-  if [ "$before" != "$after" ] || grep -q "oosh-test-path-persistence" "$CONFIG" 2>/dev/null; then
-    create.result 1 "path.prepend wrote to $CONFIG"
+  if [ "$before" != "$after" ] || grep -q "oosh-test-path-persistence" "$CONFIG" "$session" 2>/dev/null; then
+    create.result 1 "a path mutator wrote to $CONFIG or $session"
   else
     create.result 0 "nothing written"
   fi
   return $(result)
 }
-test.case $level "path.prepend - writes nothing to the config tier" \
+test.case $level "path mutators (and their aliases) - write nothing to the config tier or the session file" \
   test.path.mutatorsPersistNothing
 expect 0 "nothing written" "private.update.config ran a no-arg config save from a child process — the login PATH is data in ~/config/user.env"
 
@@ -262,12 +265,13 @@ fi
 # — the second disjunct is satisfied by almost any outcome, so it could not
 # fail. What matters is that the text no longer advertises verbs that do not
 # exist: `add`, `push`, `put` and `rm` all reach this.methodNotFound, and the
-# table is rendered by this.help from the docstrings now.
+# table is rendered by this.help from the docstrings now (add, push, put and rm
+# are real aliases again, so they are no longer ghosts).
 test.path.usageAdvertisesOnlyRealVerbs() {
   local out
   out=$(path.usage 2>/dev/null)
   local ghost
-  for ghost in "  add" "  push" "  put" "  rm" " status " " file.global" " file.user"; do
+  for ghost in " status " " file.global" " file.user"; do
     case "$out" in *"$ghost"*) create.result 1 "usage still advertises '$ghost'"; return $(result) ;; esac
   done
   case "$out" in
@@ -523,6 +527,179 @@ test.case $level "T-PATH-ONCE-HIBERNATE-NO-PATH: once.hibernate does not freeze 
   test.path.onceHibernateNoPath
 expect 0 "ONCE writes no PATH into ~/.once" \
   "the .bashrc sources ~/.once last — its frozen PATH overwrote the user's own"
+
+# ============================================================================
+# path save / saved / load / edit / aliases
+# ============================================================================
+# HARD RULE: nothing here may touch the real ~/.config/oosh or ~/config. Every
+# case that saves or loads runs in a SUBSHELL whose HOME and CONFIG_PATH are a
+# fixture (test.config T-CONFIG-USER-SESSION-SAVE is the pattern), and the
+# fixture is removed at the end of the case.
+test.path.fixture.make() { # <label> # echo a fixture HOME: oosh -> this tree, a user.env that chains user.session.env last, bin1 and bin2 directories
+  local fx tree; fx=$(test.suite.fixture.make "$1") || return 1
+  tree=$(private.this.path.canonical "$OOSH_DIR")
+  ln -s "$tree" "$fx/oosh"
+  git config --file "$fx/.gitconfig" --add safe.directory "$tree"
+  mkdir -p "$fx/config" "$fx/.config/oosh" "$fx/bin1" "$fx/bin2"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' 'export CONFIG_FILE="user.env"' \
+    'export CONFIG="$HOME/config/user.env"' 'export PATH="$HOME/oosh:$HOME/oosh/ng:$PATH"' \
+    'export BASH_FILE="/usr/bin/bash"' '. $CONFIG_PATH/oosh.env' '. $CONFIG_PATH/log.env' \
+    '. $HOME/.config/oosh/user.session.env' > "$fx/config/user.env"
+  printf '%s\n' 'export OOSH_PROBE="from-oosh.env"' > "$fx/config/oosh.env"
+  printf '%s\n' 'export LOG_LEVEL="1"' '. $HOME/.config/oosh/log.session.env' > "$fx/config/log.env"
+  : > "$fx/.config/oosh/log.session.env"
+  : > "$fx/.config/oosh/user.session.env"
+  echo "$fx"
+}
+
+test.path.fixture.saved() { # <fx> # echo the saved PATH of the fixture home, read as data
+  ( . "$1/.config/oosh/user.session.env"; echo "$PATH" )
+}
+
+# T-PATH-SAVE-WRITES-SESSION: path save puts this shell's PATH, as real directories, into the user's own file
+test.path.saveWritesSession() {
+  local fx bad="" got; fx=$(test.path.fixture.make pathsave)
+  ( export HOME="$fx" CONFIG_PATH="$fx/config" OOSH_MODE="feature/x" PATH="$fx/oosh:$fx/bin1:$fx/bin2:/usr/bin:/bin"
+    path.save >/dev/null 2>&1 ) || bad="$bad rc=$?"
+  got=$(test.path.fixture.saved "$fx")
+  [ "$got" = "$fx/oosh:$fx/oosh/ng:$fx/bin1:$fx/bin2:/usr/bin:/bin" ] || bad="$bad saved=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "path save wrote the real PATH into user.session.env" || create.result 1 "path save:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-SAVE-WRITES-SESSION: path save writes this PATH into the user's user.session.env" test.path.saveWritesSession
+expect 0 "path save wrote the real PATH into user.session.env" "path save is the user's front for config.session.save"
+
+# T-PATH-SAVE-FILTERS: the segment filter of config.session.save decides what is written
+test.path.saveFilters() {
+  local fx bad="" got; fx=$(test.path.fixture.make pathsavefilter)
+  ( export HOME="$fx" CONFIG_PATH="$fx/config" OOSH_MODE="feature/x" PATH="$fx/oosh:.:rel/dir:/tmp/oosh-no-such-dir:$fx/missing:$fx/bin1:/usr/bin:/bin"
+    path.save >/dev/null 2>&1 )
+  got=$(test.path.fixture.saved "$fx")
+  [ "$got" = "$fx/oosh:$fx/oosh/ng:$fx/bin1:/usr/bin:/bin" ] || bad="$bad saved=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "dot, relative, /tmp and missing directories are not saved" || create.result 1 "filter:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-SAVE-FILTERS: ., relative, /tmp and missing directories are not saved" test.path.saveFilters
+expect 0 "dot, relative, /tmp and missing directories are not saved" "a polluted shell must not be frozen into the login PATH"
+
+# T-PATH-SAVED-LISTS: path saved lists the saved PATH, one directory per line, and writes nothing
+test.path.savedLists() {
+  local fx bad="" got want before after; fx=$(test.path.fixture.make pathsaved)
+  printf '%s\n' "export PATH=\"$fx/bin1:$fx/bin2:/usr/bin\"" > "$fx/.config/oosh/user.session.env"
+  before=$(cksum < "$fx/.config/oosh/user.session.env")
+  got=$( export HOME="$fx" CONFIG_PATH="$fx/config" PATH="$fx/oosh:/usr/bin:/bin"; path.saved 2>/dev/null )
+  want="$fx/bin1
+$fx/bin2
+/usr/bin"
+  [ "$got" = "$want" ] || bad="$bad listed=[$(printf '%s' "$got" | tr '\n' '|')]"
+  after=$(cksum < "$fx/.config/oosh/user.session.env")
+  [ "$before" = "$after" ] || bad="$bad file-changed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the saved PATH is listed one directory per line" || create.result 1 "saved:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-SAVED-LISTS: path saved lists the saved PATH one directory per line" test.path.savedLists
+expect 0 "the saved PATH is listed one directory per line" "path saved is read-only"
+
+# T-PATH-LOAD-SOURCED: sourced, path load sets this shell's PATH from the saved file, without duplicates
+test.path.loadSourced() {
+  local fx bad="" got dup; fx=$(test.path.fixture.make pathload)
+  printf '%s\n' "export PATH=\"$fx/bin1:$fx/bin2:/usr/bin:$fx/bin1:/bin\"" > "$fx/.config/oosh/user.session.env"
+  got=$( export HOME="$fx" CONFIG_PATH="$fx/config" PATH="$fx/oosh:/usr/bin:/bin"; path.load >/dev/null 2>&1; echo "$PATH" )
+  [ "$got" = "$fx/bin1:$fx/bin2:/usr/bin:/bin" ] || bad="$bad PATH=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "path load set PATH from the saved file, de-duplicated" || create.result 1 "load:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-LOAD-SOURCED: sourced, path load sets PATH from the saved file and de-duplicates" test.path.loadSourced
+expect 0 "path load set PATH from the saved file, de-duplicated" "a sourced function can change the calling shell"
+
+# T-PATH-LOAD-COMMAND-NOOP: as a command, path load changes nothing and says what to do
+test.path.loadCommandNoop() {
+  local fx bad="" out rc; fx=$(test.path.fixture.make pathloadcmd)
+  printf '%s\n' "export PATH=\"$fx/bin1:/usr/bin:/bin\"" > "$fx/.config/oosh/user.session.env"
+  out=$(env -i HOME="$fx" USER="$USER" PATH="/usr/bin:/bin" "$BASH" -c '"$HOME/oosh/path" load; rc=$?; printf "\nRC %s PATH %s\n" "$rc" "$PATH"' 2>/dev/null)
+  case "$out" in *"open a new shell"*) ;; *) bad="$bad no-hint=[$out]" ;; esac
+  case "$out" in *"source path; path load"*) ;; *) bad="$bad no-source-hint" ;; esac
+  case "$out" in *"RC 0 PATH /usr/bin:/bin"*) ;; *) bad="$bad rc-or-path=[$out]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "as a command path load changes nothing and points to a new shell" || create.result 1 "noop:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-LOAD-COMMAND-NOOP: as a command, path load changes nothing and says to open a new shell" test.path.loadCommandNoop
+expect 0 "as a command path load changes nothing and points to a new shell" "a command cannot change its parent shell"
+
+# T-PATH-LOAD-OLD-PATHS-FILE: an old ~/paths (one directory per line) loads, and path save then keeps it
+test.path.loadOldPathsFile() {
+  local fx bad="" got; fx=$(test.path.fixture.make pathloadold)
+  printf '%s\n' "$fx/bin2" "" "$fx/bin1" "/usr/bin" "/bin" > "$fx/paths"
+  got=$( export HOME="$fx" CONFIG_PATH="$fx/config" OOSH_MODE="feature/x" PATH="$fx/oosh:/usr/bin:/bin"
+         path.load "$fx/paths" >/dev/null 2>&1; echo "$PATH"; path.save >/dev/null 2>&1 )
+  [ "$(printf '%s' "$got" | head -1)" = "$fx/bin2:$fx/bin1:/usr/bin:/bin" ] || bad="$bad loaded=[$got]"
+  got=$(test.path.fixture.saved "$fx")
+  [ "$got" = "$fx/oosh:$fx/oosh/ng:$fx/bin2:$fx/bin1:/usr/bin:/bin" ] || bad="$bad saved=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "an old paths file loads and saves" || create.result 1 "old paths:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-LOAD-OLD-PATHS-FILE: path load <file> reads an old ~/paths and path save keeps it" test.path.loadOldPathsFile
+expect 0 "an old paths file loads and saves" "the one-time migration for test/mcdonges.latest users"
+
+# T-PATH-EDIT-ROUNDTRIP: path edit saves the edited list; a bad line never reaches the file
+test.path.editRoundtrip() {
+  local fx bad="" got ed; fx=$(test.path.fixture.make pathedit)
+  ed="$fx/editor"
+  # the "editor": drop /bin, add bin2 and a directory that does not exist
+  printf '%s\n' '#!/bin/sh' "sed -i.bak -e '/^\\/bin\$/d' \"\$1\"" "printf '%s\\n' '$fx/bin2' '$fx/nope' >> \"\$1\"" > "$ed"
+  chmod +x "$ed"
+  printf '%s\n' "export PATH=\"$fx/oosh:$fx/bin1:/usr/bin:/bin\"" > "$fx/.config/oosh/user.session.env"
+  ( export HOME="$fx" CONFIG_PATH="$fx/config" OOSH_MODE="feature/x" PATH="$fx/oosh:/usr/bin:/bin" EDITOR="$ed"
+    path.edit >/dev/null 2>&1 ) || bad="$bad rc=$?"
+  got=$(test.path.fixture.saved "$fx")
+  [ "$got" = "$fx/oosh:$fx/oosh/ng:$fx/bin1:/usr/bin:$fx/bin2" ] || bad="$bad saved=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the edited list was saved through the filter" || create.result 1 "edit:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-EDIT-ROUNDTRIP: path edit saves the edited list, the filter drops a missing directory" test.path.editRoundtrip
+expect 0 "the edited list was saved through the filter" "no hand-written line reaches the env file"
+
+# T-PATH-ALIASES: add/push append, put prepends, rm removes
+test.path.aliases() {
+  local fx bad="" saved="$PATH"; fx=$(test.path.fixture.make pathaliases)
+  path.add "$fx/bin1" >/dev/null 2>&1;  [[ "$PATH" == *":$fx/bin1" ]] || bad="$bad add"
+  path.push "$fx/bin2" >/dev/null 2>&1; [[ "$PATH" == *":$fx/bin2" ]] || bad="$bad push"
+  path.put "$fx/bin1" >/dev/null 2>&1;  [[ "$PATH" == "$fx/bin1:"* ]] || bad="$bad put"
+  path.rm "$fx/bin1" >/dev/null 2>&1;   [[ "$PATH" != *"$fx/bin1"* ]] || bad="$bad rm"
+  export PATH="$saved"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the aliases reach append, prepend and remove" || create.result 1 "aliases:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-ALIASES: add and push append, put prepends, rm removes" test.path.aliases
+expect 0 "the aliases reach append, prepend and remove" "the verbs people know from test/mcdonges.latest"
+
+# T-PATH-SAVE-SURVIVES-LOGIN: a saved PATH is in the next shell, which reads only the files
+test.path.saveSurvivesLogin() {
+  local fx bad="" out; fx=$(test.path.fixture.make pathlogin)
+  mkdir -p "$fx/extra"
+  ( export HOME="$fx" CONFIG_PATH="$fx/config" OOSH_MODE="feature/x" PATH="$fx/oosh:/usr/bin:/bin"
+    path.append "$fx/extra" >/dev/null 2>&1; path.save >/dev/null 2>&1 )
+  # An interactive bash from the .bashrc template in the fixture home; the
+  # question comes as input, as a person types it (see T-BASHRC-LOG-ONCE).
+  out=$(cd / && printf '%s\n' 'printf "\nRESULT %s\n" "$PATH"' 'exit' \
+    | env -i HOME="$fx" PATH="/usr/bin:/bin" "$BASH" --rcfile "$OOSH_DIR/templates/user/bashrcTemplate" -i 2>/dev/null \
+    | sed -n 's/^RESULT //p')
+  case ":$out:" in *":$fx/extra:"*) ;; *) bad="$bad PATH=[$out]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the next shell carries the saved directory" || create.result 1 "login:$bad"
+  return $(result)
+}
+test.case $level "T-PATH-SAVE-SURVIVES-LOGIN: a new interactive shell has the directory path save wrote" test.path.saveSurvivesLogin
+expect 0 "the next shell carries the saved directory" "this is what the user wants from path save"
+
 
 ### test.method
 
