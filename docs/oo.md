@@ -581,8 +581,8 @@ The curl form runs `init/oosh`'s heal arm, which clones `<branch>` fresh into a 
 - **Never automatic.** The heal runs only when invoked — never at shell start (the May-8 rule).
 - **A test run heals no real base.** Under `OOSH_NO_INSTALL` (every test run) the heal refuses any base outside the temp directory before its first step, rc 2 (`private.oo.heal.test.run.check`, [test-suite.md § A test run installs nothing](test-suite.md#a-test-run-installs-nothing)).
 - **`oo mode` is not called.** The heal leaves `~/oosh` on `<base>/<branch>` and writes `OOSH_MODE=<branch>` into the
-  user's session files and `~/.config/oosh/mode-env.bash` (`private.oo.mode.env.write`, the file `oo mode`
-  writes too), so `oo mode <branch>` afterwards says "already current".
+  user's session files; it writes no `~/.config/oosh/mode-env.bash` (an install writes none; a left one is removed),
+  and `oo mode <branch>` afterwards says "already current" — it decides from the `~/oosh` link.
 
 **Order.** `oo heal` first re-runs itself as **one clean process** (`private.oo.heal.env.clean`, § The clean
 re-exec below); every step runs in that process, each once: `umask 002` (§ One umask) and the `EXIT` trap that
@@ -593,7 +593,7 @@ first — the same lines as `oo heal.status`) → the **privilege decision** (`p
 setgid, the launcher, no retired drop-in, and whenever the heal has root developking's SSH setup, root's `~/init` and root's login shell) → `code` (`main/` and `<branch>/`, plus `dev/` when `<branch>` is
 `main`) → `config` (the `sharedConfig` is *made* when missing, then `config init.shared`; it is still empty) →
 `user(s)` (`config init.user <user> <base>/<branch>`, a real `~/config` kept aside and queued, then as that
-user only what `config init.user` does not: the session files with `OOSH_MODE`, `mode-env.bash`, no dead
+user only what `config init.user` does not: the session files with `OOSH_MODE`, no `mode-env.bash`, no dead
 `safe.directory` entry and no frozen `PATH` in `~/.once` — `private.oo.heal.shell <home> <base> no no`; the trust,
 the `.bashrc` and the session files are `config init.user`'s, the launcher and the drop-in the system step's) →
 `env` (`private.oo.heal.env`, once, in fresh processes: `config init.env` **fills** the `sharedConfig`, THEN the
@@ -1193,7 +1193,7 @@ Internal functions (not for direct use):
 | `private.oo.heal.config <sharedConfig>` | Makes the `sharedConfig` when missing (owner `developking`; the env step fills it), then `config init.shared` — rc 1 quoting its own last lines when it reports a problem; rc 2 when it cannot be made |
 | `private.oo.heal.config.load <probeFn>` | Loads config through `private.this.script.load` unless `<probeFn>` is a function already and keeps the heal's CONFIG guard; rc 0 when `<probeFn>` is a function afterwards |
 | `private.oo.heal.config.guard` | In the clean process, points `CONFIG` at the missing file again after loading config moved it to `~/config/user.env`; nothing outside the heal |
-| `private.oo.heal.user <user> <base> <branch> <sharedConfig> <?keep>` | Heals one user: `config init.user` (rc 1 with its own reason when it fails), the import from a kept `~/config`, then as the user only what `config init.user` does not — the session files with `OOSH_MODE`, `mode-env.bash`, `private.oo.heal.shell <home> <base> no no` — in a hop that root starts with umask 002 (`private.this.as.user.preamble.get … 002`); a failed hop is left with its own last lines; removes old self-links |
+| `private.oo.heal.user <user> <base> <branch> <sharedConfig> <?keep>` | Heals one user: `config init.user` (rc 1 with its own reason when it fails), the import from a kept `~/config`, then as the user only what `config init.user` does not — the session files with `OOSH_MODE`, no `mode-env.bash`, `private.oo.heal.shell <home> <base> no no` — in a hop that root starts with umask 002 (`private.this.as.user.preamble.get … 002`); a failed hop is left with its own last lines; removes old self-links |
 | `private.oo.heal.user.keep.check <user> <tree>` | The one keep predicate of `oo heal all`: rc 0 `<user>` keeps their canonical `~/oosh` on `<tree>`; rc 1 the person moves (the healer, the login that ran sudo); rc 2 the tree moves (it predates the heal — no `config.session.save` or no clean boot `derivedHome`, read as text — or is not there); `RESULT` is the reason. Used by `private.oo.heal.user.diagnose` and `private.oo.heal.user` |
 | `private.oo.heal.shell <?home> <?base> <?load:yes> <?system:yes>` | The shell step `oo update` and `oo heal` share (git trust, `.bashrc`, session files, retired drop-in, launcher, `~/.once`); `load no` skips what loads config or user, `system no` the drop-in and the launcher (the heal's system step makes them) |
 | `private.oo.heal.env <sharedConfig>` | Once: `config init.env` in a fresh process (its own reason travels with the note: the last three `REFUSING` / `could NOT derive` / `ERROR` lines, T-OO-HEAL-ENV-INIT-REASON), then the queued imports of the kept `~/config` folders (`private.config.orig.import`), then `LOG_LEVEL` / `LOG_LEVEL_RESET` `3` where empty, then as root `private.odocker.workspaces.install` and `private.config.host.name.refresh` on the `sharedConfig`, then `config validate required` in a fresh process |
@@ -1211,7 +1211,7 @@ Internal functions (not for direct use):
 | `private.oo.update.pull <?dir>` | The pull through the gate: fetch (HTTPS fallback) and fast-forward, never a merge |
 | `private.oo.update.markers.get <?dir>` | `file:line` of committed conflicts (a file holding all three marker kinds); silent getter |
 | `private.oo.answer.get <prompt> <?device>` | Writes the prompt to the terminal and echoes the one line typed there; nothing and rc 1 on end of input; silent getter (`oo deinstall`'s question) |
-| `private.oo.mode.env.write <branch> <?oldBranch>` | Writes `~/.config/oosh/mode-env.bash` (`hash -r`, `OOSH_MODE`, and a PATH repair only when `<oldBranch>` differs); `oo mode` and the heal both call it |
+| `private.oo.mode.env.write <branch> <?oldBranch>` | Writes `~/.config/oosh/mode-env.bash` (`hash -r`, `OOSH_MODE`, and a PATH repair only when `<oldBranch>` differs); `oo mode` calls it; the heal does not (it removes a left one) |
 | `private.oo.shared.base.ensure <basehome> <?owner>` | Creates the shared base directories install state 31 needs; the state and the heal call it |
 | `private.oo.shared.base.share <base>` | Gives the base group `dev` and setgid (only when a `dev` group exists; the base only, never recursive) |
 | `private.oo.shared.dir.ensure <dir> <?owner>` | Creates the missing segments with the dev-group policy (group `dev`, mode 2775 when a `dev` group exists); an existing directory is never changed |
