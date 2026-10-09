@@ -984,7 +984,7 @@ test.os.healTest.stubs.set() {
     return 9
   }
   private.os.platform.ref.branch.drop()  { echo "drop $*" >> "$OS_T_REC"; return 0; }
-  private.os.platform.heal.compare.run() { echo "compare $*" >> "$OS_T_REC"; return "${OS_T_COMPARE_RC:-0}"; }
+  private.os.platform.heal.compare.run() { echo "compare $*" >> "$OS_T_REC"; [ -n "${compareKept+x}" ] && compareKept=2; return "${OS_T_COMPARE_RC:-0}"; }
   private.os.platform.heal.compare.snapshot.take() { echo "compare.snapshot $*" >> "$OS_T_REC"; printf '/x\t-\ty\n'; }
   private.os.platform.cleanup()          { echo "cleanup $*" >> "$OS_T_REC"; }
   ogit.status.check()                    { return "${OS_T_DIRTY:-0}"; }
@@ -1090,10 +1090,10 @@ cleanup 8022"
   [ "$(grep -n '' "$OS_T_REC" | grep -B1 '^[0-9]*:compare ' | sed -n 1p | cut -d: -f2-)" = "foreign $p" ] || bad="$bad compare-not-after-checks"
   [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:expect ' | sed -n 2p | cut -d: -f2-)" = "compare.snapshot $p $hb" ] || bad="$bad healed-snapshot-not-after-expect"
   [ "$(grep -n '' "$OS_T_REC" | grep -A1 '^[0-9]*:compare ' | sed -n 2p | cut -d: -f2-)" = "breakage user.clone $hb" ] || bad="$bad compare-not-before-second-pass"
-  case "$out" in *"foreign=0 compare=0 user-clone=0)"*) ;; *) bad="$bad compare-field=[$out]" ;; esac
+  case "$out" in *"foreign=0 compare=0 kept=2 user-clone=0)"*) ;; *) bad="$bad compare-field=[$out]" ;; esac
   : > "$OS_T_REC"; OS_T_COMPARE_RC=1
   out=$(os.platform.heal.test "$p" 26d15a4 compare 2>&1) && bad="$bad compare-red-passed"
-  case "$out" in *"FAIL: heal $p 26d15a4 ("*"compare=1)"*) ;; *) bad="$bad compare-fail-line=[$out]" ;; esac
+  case "$out" in *"FAIL: heal $p 26d15a4 ("*"compare=1 kept=2)"*) ;; *) bad="$bad compare-fail-line=[$out]" ;; esac
   grep -q '^breakage user.clone' "$OS_T_REC" && bad="$bad second-pass-after-red-compare"
   unset OS_T_COMPARE_RC
   : > "$OS_T_REC"; OS_T_EXPECT_RC=1
@@ -1808,7 +1808,8 @@ test.os.healCompareSnapshot() {
   "${g[@]}" init -q -b dev.heal "$B/dev.heal"; "${g[@]}" -C "$B/dev.heal" commit -q --allow-empty -m one
   "${g[@]}" -C "$B/dev.heal" remote add origin git@github.com:Cerulean-Circle-GmbH/once.sh.git
   printf 'x\n' > "$B/dev.heal/oo"; chmod 640 "$B/dev.heal/oo"
-  printf 'export OOSH_SSH_CONFIG_HOST="fixturehost"\n# a comment\n\nexport LOG_LEVEL="3"\n' > "$S/oosh.env"
+  # a baked base path in a value (the review, A): a value line naming $B/dev.heal is a value like any other and shows
+  printf 'export OOSH_SSH_CONFIG_HOST="fixturehost"\n# a comment\n\nexport LOG_LEVEL="3"\nexport PATH="%s/dev.heal:/usr/bin"\nexport OOSH_X="%s/platform-test-old"\n' "$B" "$B" > "$S/oosh.env"
   printf 'RESULT=x\n' > "$S/result.env"; printf 'log\n' > "$S/install.log"
   printf 'SETUP_SERVER_STATE_ID=99\n' > "$S/stateMachines/SETUP_SERVER.states.env"
   ln -s "$B/dev.heal" "$fx/home/alice/oosh"; mkdir "$fx/home/alice/oosh.orig.20261008-120000"
@@ -1831,6 +1832,12 @@ test.os.healCompareSnapshot() {
     "$fx/home/alice/oosh	$me:$(id -gn)	-> $B/dev.heal" \
     "$S/oosh.env	-	export OOSH_SSH_CONFIG_HOST=\"<host>\"" \
     "$S/oosh.env	-	export LOG_LEVEL=\"3\"" \
+    "$S/oosh.env	-	export PATH=\"$B/dev.heal:/usr/bin\"" \
+    "$S/oosh.env	-	export OOSH_X=\"$B/platform-test-old\"" \
+    "kept by the heal	-	$fx/home/alice/oosh.orig.20261008-120000" \
+    "kept by the heal	-	$B/platform-test-old" \
+    "kept by the heal	-	$fx/home/alice/.gitconfig: directory = $B/platform-test-old" \
+    "kept by the heal	-	safe.directory of alice: $B/platform-test-old" \
     "$S/stateMachines/SETUP_SERVER.states.env	-	SETUP_SERVER_STATE_ID=99" \
     "origin of $B/dev.heal	-	git@github.com:Cerulean-Circle-GmbH/once.sh.git" \
     "branch of $B/dev.heal	-	dev.heal" \
@@ -1845,20 +1852,21 @@ test.os.healCompareSnapshot() {
     printf '%s\n' "$out" | grep -qxF "$want" || bad="$bad missing=[$want]"
   done
   case "$out" in *fixturehost*) bad="$bad host-not-masked" ;; esac
-  case "$out" in *result.env*|*install.log*|*.orig.*|*"a comment"*) bad="$bad volatile-kept" ;; esac
+  case "$out" in *result.env*|*install.log*|*"a comment"*) bad="$bad volatile-listed" ;; esac
+  printf '%s\n' "$out" | grep -v '^kept by the heal' | grep -q '\.orig\.' && bad="$bad orig-not-a-kept-line"
   case "$out" in *secret*) bad="$bad key-material" ;; esac
-  case "$out" in *platform-test-old*) bad="$bad kept-folder-listed" ;; esac
+  printf '%s\n' "$out" | grep -v '^kept by the heal' | grep -v 'OOSH_X=' | grep -q platform-test-old && bad="$bad kept-folder-not-a-kept-line"
   case "$out" in *result.txt*) bad="$bad logger-file-listed" ;; esac
   [ "$(printf '%s\n' "$out" | grep -c 'known_hosts	-	github.com$')" = 1 ] || bad="$bad known-hosts-not-one-host"
   [ "$out" = "$(printf '%s\n' "$out" | LC_ALL=C sort -u)" ] || bad="$bad not-sorted"
   # a bad branch is refused
   private.os.platform.heal.compare.snapshot.script.get 'bad;branch' >/dev/null 2>&1 && bad="$bad bad-branch-accepted"
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "owner, mode, links, env values, origins, safe.directory and ssh named; host masked; logs, result.env and kept copies out" || create.result 1 "compare snapshot:$bad"
+  [ -z "$bad" ] && create.result 0 "owner, mode, links, env values, origins, safe.directory and ssh named; host masked; logs and result.env out, what the heal keeps as kept lines" || create.result 1 "compare snapshot:$bad"
   return $(result)
 }
 test.case $level "T-OS-HEAL-COMPARE-SNAPSHOT: the compare snapshot of a fixture machine names owner, mode, links, env values, origins, safe.directory and ssh, and masks the host name" test.os.healCompareSnapshot
-expect 0 "owner, mode, links, env values, origins, safe.directory and ssh named; host masked; logs, result.env and kept copies out" \
+expect 0 "owner, mode, links, env values, origins, safe.directory and ssh named; host masked; logs and result.env out, what the heal keeps as kept lines" \
   "the heal was never compared with a fresh install of the same branch"
 
 # T-OS-HEAL-COMPARE-RUN: the second container comes up with OSSH_INSTALL_LOCAL=1 and the branch
@@ -1866,10 +1874,11 @@ expect 0 "owner, mode, links, env values, origins, safe.directory and ssh named;
 # alias of the second reads as <platform>; equal snapshots pass, any line that differs fails and is
 # named in the log; a second container that does not come up fails; the second container always goes.
 test.os.healCompareRun() {
-  local fx bad="" out rc p=heal_cmp_stub snap
+  local fx bad="" out rc p=heal_cmp_stub snap L head
   fx=$(test.suite.fixture.make healcomparerun)
-  local OOSH_HEAL_TEST_LOGS="$fx/logs"; mkdir -p "$OOSH_HEAL_TEST_LOGS"
+  local OOSH_HEAL_TEST_LOGS="$fx/logs"; mkdir -p "$OOSH_HEAL_TEST_LOGS"; L="$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare"
   test.os.stubs.set
+  # the healed side holds one entry the heal kept (the owner's rule: moved aside, never deleted)
   snap="$(printf 'noise from a dotfile\nOOSH_HEAL_COMPARE_SNAPSHOT_BEGIN\n/b/x\troot:dev 2775\tdir\n/s/oosh.env\t-\texport OOSH_SSH_CONFIG_HOST=\"PLATFORM\"\n')"
   private.os.platform.parse()          { echo "parse $*" >> "$OS_T_REC"; PLATFORM_WORKSPACE=nakedUbuntu/24.04; return 0; }
   private.os.platform.container.up()   { echo "container.up $* local=[${OSSH_INSTALL_LOCAL-unset}] branch=[${OSSH_INSTALL_BRANCH-unset}]" >> "$OS_T_REC"; return "${OS_T_UP_RC:-0}"; }
@@ -1877,60 +1886,83 @@ test.os.healCompareRun() {
   private.os.platform.root.script.run() {
     echo "snapshot $1 $2" >> "$OS_T_REC"
     case "$1" in
-      "$p")       printf '%s\n' "${snap//PLATFORM/$p}" ;;
+      "$p")         printf '%s\n' "${snap//PLATFORM/$p}" 'kept by the heal	-	/b.aside/dev.heal.orig.1' ;;
       "${p}_fresh") printf '%s\r\n' "${snap//PLATFORM/${p}_fresh}" ${OS_T_FRESH_EXTRA:+"$OS_T_FRESH_EXTRA"} ;;
     esac
   }
   private.os.platform.cleanup()        { echo "cleanup $*" >> "$OS_T_REC"; }
-  # a diff that prints what BusyBox diff (Alpine) prints — a unified diff, no < > lines: the comparison must not read it
-  diff() { printf '%s\n' '--- healed' '+++ fresh' '@@ -1,2 +1,3 @@' '+/b/y'; return 1; }
-  # in this shell, not in $( ): its RESULT is asserted; the output goes to a file
+  # equal, but for what the heal kept: rc 0, the kept entry shown and counted (kept=1)
   private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
   [ "$rc" = 0 ] || bad="$bad equal-rc=$rc=[$out]"
+  [ "$RESULT" = "compare on $p: rc 0, kept=1" ] || bad="$bad equal-result=[$RESULT]"
   grep -qx "container.up ${p}_fresh naked_ubuntu_24_04 9022 local=\[1\] branch=\[dev.heal\]" "$OS_T_REC" || bad="$bad up=[$(grep container.up "$OS_T_REC")]"
   grep -qx "users.install ${p}_fresh local=\[1\] branch=\[dev.heal\]" "$OS_T_REC" || bad="$bad users=[$(grep users.install "$OS_T_REC")]"
   grep -qx "snapshot $p sh" "$OS_T_REC" && grep -qx "snapshot ${p}_fresh sh" "$OS_T_REC" || bad="$bad snapshots"
   [ "$(tail -1 "$OS_T_REC")" = "cleanup 9022" ] || bad="$bad no-cleanup-last=[$(tail -1 "$OS_T_REC")]"
   grep -q "^ossh connection.close ${p}_fresh" "$OS_T_REC" || bad="$bad no-close"
-  case "$out" in *"the heal gives what a fresh install of dev.heal gives (2 lines)"*) ;; *) bad="$bad equal-line=[$out]" ;; esac
-  [ -s "$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare-healed-$p.log" ] && [ -s "$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare-fresh-$p.log" ] || bad="$bad snapshot-logs"
-  grep -q noise "$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare-healed-$p.log" && bad="$bad noise-kept"
+  case "$out" in *"kept by the heal: /b.aside/dev.heal.orig.1"*) ;; *) bad="$bad kept-not-shown=[$out]" ;; esac
+  case "$out" in *"the heal gives what a fresh install of dev.heal gives (2 lines, kept=1, known=0)"*) ;; *) bad="$bad equal-line=[$out]" ;; esac
+  [ -s "$L-healed-$p.log" ] && [ -s "$L-fresh-$p.log" ] || bad="$bad snapshot-logs"
+  grep -q noise "$L-healed-$p.log" && bad="$bad noise-kept"
   [ -z "${OSSH_INSTALL_LOCAL+x}" ] || bad="$bad env-leaked"
-  # a line only the fresh install has: rc 1, the line named in the output and the log
+  # a line only the fresh install has: rc 1, named in the output and the log; the healed snapshot is not read again
   : > "$OS_T_REC"; OS_T_FRESH_EXTRA=$(printf '/b/y\troot:dev 2775\tdir')
-  # in this shell, not in $( ): its RESULT is asserted; the output goes to a file
   private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
   [ "$rc" = 1 ] || bad="$bad differ-rc=$rc"
-  [ "$RESULT" = "compare on $p: rc 1" ] || bad="$bad differ-result=[$RESULT]"
+  [ "$RESULT" = "compare on $p: rc 1, kept=1" ] || bad="$bad differ-result=[$RESULT]"
   case "$out" in *"fresh only:  /b/y"*) ;; *) bad="$bad differ-unnamed=[$out]" ;; esac
-  grep -q 'fresh only:  /b/y' "$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare-$p.log" || bad="$bad differ-not-logged"
+  grep -q 'fresh only:  /b/y' "$L-$p.log" || bad="$bad differ-not-logged"
+  grep -qx "snapshot $p sh" "$OS_T_REC" && bad="$bad healed-read-again"
   [ "$(tail -1 "$OS_T_REC")" = "cleanup 9022" ] || bad="$bad differ-no-cleanup"
+  # a known difference (private.os.platform.heal.compare.known.get): a WARN line, no failure
+  OS_T_FRESH_EXTRA=$(printf '/home/t/.config/oosh/user.session.env\t-\texport PATH="/root/oosh/su:/usr/bin"')
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
+  [ "$rc" = 0 ] || bad="$bad known-rc=$rc=[$out]"
+  case "$out" in *"WARN compare: known: fresh only:  /home/t/.config/oosh/user.session.env"*"PATH of the installing process"*) ;; *) bad="$bad known-not-warned=[$out]" ;; esac
+  case "$out" in *"kept=1, known=1)"*) ;; *) bad="$bad known-not-counted" ;; esac
   unset OS_T_FRESH_EXTRA
+  # a line only the healed machine has: rc 1, named
+  printf '/b/x\troot:dev 2775\tdir\n/b/z\troot:dev 2775\tdir\n/s/oosh.env\t-\texport OOSH_SSH_CONFIG_HOST="%s"\n' "$p" > "$L-healed-$p.log"
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
+  [ "$rc" = 1 ] || bad="$bad healed-only-rc=$rc"
+  case "$out" in *"healed only: /b/z"*) ;; *) bad="$bad healed-only-unnamed=[$out]" ;; esac
+  # the healed snapshot right after the heal failed (an empty file): rc 1, never read again
+  : > "$L-healed-$p.log"; : > "$OS_T_REC"
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1 && bad="$bad empty-healed-passed"
+  grep -qx "snapshot $p sh" "$OS_T_REC" && bad="$bad empty-healed-read-again"
+  case "$(cat "$fx/out")" in *"no snapshot of the healed machine right after the heal"*) ;; *) bad="$bad empty-healed-unnamed" ;; esac
+  # the branch moved since the heal: refused before the second container; the same commit passes the pin
+  private.this.script.load ogit ogit.merge.base.get; head=$(ogit.merge.base.get dev.heal dev.heal "$OOSH_DIR" 2>/dev/null)
+  printf 'HEAD of /b/dev.heal\t-\t0000000000000000000000000000000000000000\n' > "$L-healed-$p.log"; : > "$OS_T_REC"
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1 && bad="$bad moved-passed"
+  grep -q '^container.up' "$OS_T_REC" && bad="$bad moved-container"
+  case "$(cat "$fx/out")" in *"dev.heal moved since the heal"*) ;; *) bad="$bad moved-unnamed=[$(cat "$fx/out")]" ;; esac
+  if [ -n "$head" ]; then
+    printf 'HEAD of /b/dev.heal\t-\t%s\n' "$head" > "$L-healed-$p.log"; : > "$OS_T_REC"
+    private.os.platform.heal.compare.run "$p" dev.heal >/dev/null 2>&1
+    grep -q '^container.up' "$OS_T_REC" || bad="$bad same-commit-refused"
+  else
+    bad="$bad NOT CHECKED: no dev.heal in $OOSH_DIR"
+  fi
   # the second container does not come up: rc 1, no snapshot, cleaned up
-  : > "$OS_T_REC"; OS_T_UP_RC=1
+  rm -f "$L-healed-$p.log"; : > "$OS_T_REC"; OS_T_UP_RC=1
   private.os.platform.heal.compare.run "$p" dev.heal >/dev/null 2>&1 && bad="$bad up-fail-passed"
   grep -q '^snapshot' "$OS_T_REC" && bad="$bad up-fail-snapshot"
   grep -q '^users.install' "$OS_T_REC" && bad="$bad up-fail-users"
   [ "$(tail -1 "$OS_T_REC")" = "cleanup 9022" ] || bad="$bad up-fail-no-cleanup"
   unset OS_T_UP_RC
-  # the healed snapshot os platform.heal.test took right after the heal is the one compared: not read again
-  : > "$OS_T_REC"; printf '/b/x\troot:dev 2775\tdir\n' > "$OOSH_HEAL_TEST_LOGS/oosh-heal-test-compare-healed-$p.log"
-  private.os.platform.heal.compare.run "$p" dev.heal >/dev/null 2>&1
-  grep -qx "snapshot $p sh" "$OS_T_REC" && bad="$bad healed-read-again"
-  grep -qx "snapshot ${p}_fresh sh" "$OS_T_REC" || bad="$bad fresh-not-read"
   # refusals before anything starts
   : > "$OS_T_REC"
   private.os.platform.heal.compare.run "$p" >/dev/null 2>&1 && bad="$bad no-branch-accepted"
   private.os.platform.heal.compare.run "$p" 'bad;branch' >/dev/null 2>&1 && bad="$bad bad-branch-accepted"
   [ -s "$OS_T_REC" ] && bad="$bad refusal-started"
-  unset -f diff
   test.os.stubs.unset
   rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "a local install of the branch on <platform>_fresh, one snapshot in each, equal passes, a difference fails named, always cleaned up" || create.result 1 "compare run:$bad"
+  [ -z "$bad" ] && create.result 0 "a local install of the branch on <platform>_fresh, one snapshot in each; kept entries shown and counted, known differences warn, any other line fails named; a moved branch and an empty healed snapshot fail; always cleaned up" || create.result 1 "compare run:$bad"
   return $(result)
 }
 test.case $level "T-OS-HEAL-COMPARE-RUN: a fresh install of the branch in a second container, the same snapshot in both, any difference fails" test.os.healCompareRun
-expect 0 "a local install of the branch on <platform>_fresh, one snapshot in each, equal passes, a difference fails named, always cleaned up" \
+expect 0 "a local install of the branch on <platform>_fresh, one snapshot in each; kept entries shown and counted, known differences warn, any other line fails named; a moved branch and an empty healed snapshot fail; always cleaned up" \
   "the heal was never compared with a fresh install of the same branch"
 
 
@@ -1952,6 +1984,44 @@ test.os.healCompareSnapshotTake() {
 test.case $level "T-OS-HEAL-COMPARE-SNAPSHOT-TAKE: the snapshot lines after the marker, sorted, noise and carriage returns out" test.os.healCompareSnapshotTake
 expect 0 "the lines after the marker, sorted, no carriage return, no noise; rc 1 for nothing" \
   "the healed side was read after the gates had written into it"
+
+
+# T-OS-HEAL-COMPARE-KNOWN-GET: the known differences of a heal and a fresh install — each a pattern of
+# the snapshot line and a reason; the PATH the install writes into ANY user's user.session.env (root's
+# dirs, another user's ~/oosh: alma, alpine, debian P6) and the owner of the base the old install made
+# match; a change of a user.session.env PATH elsewhere in the file, or any other line, does not.
+test.os.healCompareKnownGet() {
+  local bad="" known line pattern reason t m
+  t=$(printf '\t'); known=$(private.os.platform.heal.compare.known.get)
+  while IFS= read -r line; do
+    case "$line" in *" || "*) ;; *) bad="$bad no-reason=[$line]" ;; esac
+    reason=${line#* || }; [ -n "$reason" ] || bad="$bad empty-reason"
+  done <<< "$known"
+  test.os.healCompareKnown.match() { # <snapshot line> # echo the reason of the first pattern it matches
+    local l="$1" p
+    while IFS= read -r p; do
+      # shellcheck disable=SC2254 # a glob on purpose
+      case "$l" in ${p%% || *}) echo "${p#* || }"; return 0 ;; esac
+    done <<< "$known"
+    return 1
+  }
+  for m in "/root/.config/oosh/user.session.env${t}-${t}export PATH=\"/root/oosh:/root/oosh/su:/bin\"" \
+           "/home/oosh-user/.config/oosh/user.session.env${t}-${t}export PATH=\"/home/oosh-user/oosh:/home/test/oosh:/bin\"" \
+           "/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh${t}root:dev 2775${t}dir"; do
+    test.os.healCompareKnown.match "$m" >/dev/null || bad="$bad not-known=[$m]"
+  done
+  for m in "/home/test/.config/oosh/oosh.session.env${t}-${t}export OOSH_MODE=\"dev\"" \
+           "/home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/dev.heal${t}root:dev 2775${t}dir" \
+           "/home/test/.gitconfig${t}test:test 664${t}values"; do
+    test.os.healCompareKnown.match "$m" >/dev/null && bad="$bad known-too-wide=[$m]"
+  done
+  unset -f test.os.healCompareKnown.match
+  [ -z "$bad" ] && create.result 0 "each a pattern and a reason; the installer PATH of any user session file and the owner of the base, nothing more" || create.result 1 "known differences:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-COMPARE-KNOWN-GET: every known difference has a pattern and a reason, and they match no more than they name" test.os.healCompareKnownGet
+expect 0 "each a pattern and a reason; the installer PATH of any user session file and the owner of the base, nothing more" \
+  "the compare had no place for a difference that is a dev bug of the install"
 
 ### test.method
 

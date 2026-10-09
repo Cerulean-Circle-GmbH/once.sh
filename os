@@ -1407,7 +1407,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
  # After the checks pass and before the user.clone second pass, which
  # rebuilds <base>/<branch>: what a heal leaves must be what an install of
  # the same branch leaves (private.os.platform.heal.compare.run).
- local rcCompare=""
+ local rcCompare="" compareKept=""
  if [ -n "$compare" ]; then
    if [ -z "$failed" ]; then
      private.os.platform.heal.compare.run "$platform" "$healBranch"
@@ -1441,7 +1441,7 @@ os.platform.heal.test()     # <platform> <oldRef> <?breakages...:all> # install 
    [ "$rcUserClone" = 0 ] || failed="$failed user-clone"
  fi
 
- local line="heal=$rcHeal verify=$verifyFails not-checked=$notCheckedOther${rcPipe:+ pipe=$rcPipe} expect=$rcExpect test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign${rcCompare:+ compare=$rcCompare}${rcUserClone:+ user-clone=$rcUserClone}"
+ local line="heal=$rcHeal verify=$verifyFails not-checked=$notCheckedOther${rcPipe:+ pipe=$rcPipe} expect=$rcExpect test=$rcTest root=$rcRoot oosh-user=$rcOoshUser bash-user=$rcBashUser idempotence=$rcIdem second-heal=$rcSecond foreign=$rcForeign${rcCompare:+ compare=$rcCompare}${compareKept:+ kept=$compareKept}${rcUserClone:+ user-clone=$rcUserClone}"
  if [ -z "$failed" ]; then
    printf "PASS: heal %s %s (%s)\n" "$platform" "$oldRef" "$line"
    important.log "PASS: heal $platform $oldRef ($line)"
@@ -1721,7 +1721,7 @@ private.os.platform.heal.compare.run()     # <platform> <branch> # a fresh insta
    error.log "$RESULT"
    return $(result)
  fi
- local port alias script imageTag installLog healedLog freshLog log rc=0 differences
+ local port alias script imageTag installLog healedLog freshLog log rc=0 differences kept=0
  if ! script=$(private.os.platform.heal.compare.snapshot.script.get "$branch"); then
    create.result 1 "private.os.platform.heal.compare.run: no snapshot for the branch '$branch'"
    error.log "$RESULT"
@@ -1735,6 +1735,23 @@ private.os.platform.heal.compare.run()     # <platform> <branch> # a fresh insta
  healedLog=$(private.os.platform.heal.log.get compare-healed "$platform")
  freshLog=$(private.os.platform.heal.log.get compare-fresh "$platform")
  log=$(private.os.platform.heal.log.get compare "$platform")
+ # The commit the heal shipped is the commit installed fresh: the healed
+ # snapshot names it (HEAD of <base>/<branch>); a branch that moved since the
+ # heal would compare two commits (debian P6: 02219399 against 8f5d3812), so
+ # the run stops before the second container (T-OS-HEAL-COMPARE-RUN).
+ local tab healedHead
+ tab=$(printf '\t')
+ if [ -s "$healedLog" ]; then
+   healedHead=$(awk -F '\t' -v b="/$branch" '$1 ~ /^HEAD of / && substr($1, length($1) - length(b) + 1) == b { print $3; exit }' "$healedLog")
+   # the commit of <branch> now: the merge base of the branch with itself (ogit.merge.base.get)
+   private.this.script.load ogit ogit.merge.base.get
+   if [ -n "$healedHead" ] && [ "$(ogit.merge.base.get "$branch" "$branch" "$OOSH_DIR" 2>/dev/null)" != "$healedHead" ]; then
+     printf 'compare on %s: %s moved since the heal (the heal shipped %s) — commit nothing while a run runs\n' "$platform" "$branch" "$healedHead" | tee "$log"
+     create.result 1 "compare on $platform: rc 1 — $branch moved since the heal"
+     error.log "$RESULT"
+     return $(result)
+   fi
+ fi
  console.log "compare: a fresh install of $branch from this tree on $alias (port $port), then the snapshot of both"
  { OSSH_INSTALL_LOCAL=1 OSSH_INSTALL_BRANCH="$branch" private.os.platform.container.up "$alias" "$imageTag" "$port" \
    && OSSH_INSTALL_LOCAL=1 OSSH_INSTALL_BRANCH="$branch" private.os.platform.users.install "$alias"; } 2>&1 | tee "$installLog"
@@ -1742,29 +1759,57 @@ private.os.platform.heal.compare.run()     # <platform> <branch> # a fresh insta
    printf 'compare on %s: the fresh install on %s did not come up (log: %s)\n' "$platform" "$alias" "$installLog" | tee "$log"
    rc=1
  else
-   # the healed machine as the heal left it: os platform.heal.test takes it right after the heal,
-   # before the gates write into it; taken here only when it is not there
-   [ -s "$healedLog" ] || private.os.platform.heal.compare.snapshot.take "$platform" "$branch" > "$healedLog"
+   # The healed machine as the heal left it: os platform.heal.test takes it right
+   # after the heal, before the gates write into it. Read here only when that
+   # step did not run; a snapshot that failed there (an empty file) fails — it
+   # is never read again after the gates.
+   [ -e "$healedLog" ] || private.os.platform.heal.compare.snapshot.take "$platform" "$branch" > "$healedLog"
    private.os.platform.heal.compare.snapshot.take "$alias" "$branch" | sed "s#$alias#$platform#g" | LC_ALL=C sort -u > "$freshLog"
    if [ ! -s "$healedLog" ] || [ ! -s "$freshLog" ]; then
-     printf 'compare on %s: no snapshot of %s\n' "$platform" "$([ -s "$healedLog" ] && echo "the fresh install" || echo "the healed machine")" | tee "$log"
+     printf 'compare on %s: no snapshot of %s\n' "$platform" "$([ -s "$healedLog" ] && echo "the fresh install" || echo "the healed machine right after the heal")" | tee "$log"
      rc=1
    else
+     # What the heal keeps by the owner's rule (moved aside, never deleted) is
+     # shown and counted, never a failure; the comparison is of the rest.
+     local keptLines known line payload pattern reason matched failing="" warned=""
+     keptLines=$(grep "^kept by the heal${tab}" "$healedLog" | cut -f3)
+     kept=$(printf '%s\n' "$keptLines" | grep -c .)
      # the lines of each side the other lacks — a set difference in awk, not diff:
      # BusyBox diff (Alpine) prints a unified diff and no < > lines (T-OS-HEAL-COMPARE-RUN)
-     differences=$(awk 'NR == FNR { fresh[$0] = 1; next } !($0 in fresh) { print "healed only: " $0 }' "$freshLog" "$healedLog"
-       awk 'NR == FNR { healed[$0] = 1; next } !($0 in healed) { print "fresh only:  " $0 }' "$healedLog" "$freshLog")
-     if [ -n "$differences" ]; then
-       printf 'compare on %s: the heal and a fresh install of %s differ:\n%s\n' "$platform" "$branch" "$differences" | tee "$log"
-       rc=1
-     else
-       printf 'compare on %s: the heal gives what a fresh install of %s gives (%s lines)\n' "$platform" "$branch" "$(wc -l < "$freshLog" | tr -d ' ')" | tee "$log"
-     fi
+     differences=$(awk -v k="kept by the heal${tab}" 'NR == FNR { fresh[$0] = 1; next } index($0, k) != 1 && !($0 in fresh) { print "healed only: " $0 }' "$freshLog" "$healedLog"
+       awk -v k="kept by the heal${tab}" 'NR == FNR { healed[$0] = 1; next } index($0, k) != 1 && !($0 in healed) { print "fresh only:  " $0 }' "$healedLog" "$freshLog")
+     # The known differences warn and do not fail (private.os.platform.heal.compare.known.get)
+     known=$(private.os.platform.heal.compare.known.get)
+     while IFS= read -r line; do
+       [ -n "$line" ] || continue
+       payload=${line#healed only: }; payload=${payload#fresh only:  }
+       matched=""
+       while IFS= read -r pattern; do
+         reason=${pattern#* || }; pattern=${pattern%% || *}
+         # shellcheck disable=SC2254 # a glob on purpose
+         case "$payload" in $pattern) matched="$reason"; break ;; esac
+       done <<< "$known"
+       if [ -n "$matched" ]; then warned="$warned"$'\n'"WARN compare: known: $line — $matched"
+       else failing="$failing"$'\n'"$line"; fi
+     done <<< "$differences"
+     {
+       [ -z "$keptLines" ] || printf '%s\n' "$keptLines" | sed 's/^/kept by the heal: /'
+       [ -z "$warned" ] || printf '%s\n' "${warned#?}"
+       if [ -n "$failing" ]; then
+         printf 'compare on %s: the heal and a fresh install of %s differ:\n%s\n' "$platform" "$branch" "${failing#?}"
+       else
+         printf 'compare on %s: the heal gives what a fresh install of %s gives (%s lines, kept=%s, known=%s)\n' "$platform" "$branch" "$(wc -l < "$freshLog" | tr -d ' ')" "$kept" "$(printf '%s' "$warned" | grep -c .)"
+       fi
+     } | tee "$log"
+     [ -z "$warned" ] || warn.log "compare on $platform: $(printf '%s' "$warned" | grep -c .) known difference(s) — see $log"
+     [ -z "$failing" ] || rc=1
    fi
  fi
  ossh connection.close "$alias" 2>/dev/null
  private.os.platform.cleanup "$port"
- create.result "$rc" "compare on $platform: rc $rc"
+ # the kept count reaches the verdict line of os platform.heal.test (its compareKept)
+ [ -n "${compareKept+x}" ] && compareKept=$kept
+ create.result "$rc" "compare on $platform: rc $rc, kept=$kept"
  [ "$rc" = 0 ] || error.log "$RESULT (log: $log)"
  return $(result)
 }
@@ -1780,12 +1825,13 @@ private.os.platform.heal.compare.snapshot.script.get()     # <branch> # echo the
  # mode or -> TAB <content>, sorted, the host name masked as <host>; a file
  # of values (env, ssh config, .gitconfig, .once, the state machine files)
  # is one line per value. The base is read as an install makes it: the base
- # itself, main/ and <branch>/ — another folder there is what a user or an
- # old install kept, no install shape.
- # Left out, as the idempotence invariant leaves them
- # out: log files and result.env (rewritten by every oosh call). Left out by
- # scope: <base>.aside and the *.orig.* entries — what the heal kept of the
- # old install, which a fresh install never had. Key material generated per
+ # itself, main/ and <branch>/. What the heal keeps by the owner's rule (moved
+ # aside, never deleted) is a "kept by the heal" line: <base>.aside entries,
+ # *.orig.* copies, another folder of the base, a trust entry (safe.directory,
+ # a .gitconfig directory = line) naming one — the compare shows and counts
+ # them and never fails on them. Left out, as the idempotence invariant leaves
+ # them out: log files and result.env (rewritten by every oosh call). Key
+ # material generated per
  # machine is named, not summed: only the deploy key of developking and its
  # ids/ssh.developking copies (the template) are compared by content; a
  # known_hosts file is its set of host names.
@@ -1797,12 +1843,16 @@ HOST=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
 USERS='test root oosh-user bash-user developking'
 SYSTEM='/usr/local/bin/this /usr/bin/this /etc/profile.d/oosh.sh /etc/oosh/boot'
   attrs_of() { stat -c '%U:%G %a' "$1" 2>/dev/null || stat -f '%Su:%Sg %Lp' "$1"; } # kernel-exception: POSIX sh of the disposable-container snapshot, the stat -f twin is the fix # portability-exception: GNU stat with its BSD twin
-  volatile() { case "$1" in */result.env|*.log|*/log.live.out|*/result.txt|*/error.txt|*.orig.*) return 0 ;; esac; return 1; }
-  # a trust entry of a folder of the base outside main/ and <branch>/ is out of scope, as the folder is
-  inscope() { case "$1" in *"$B"/*) case "$1" in *"$B/main"|*"$B/$H") return 0 ;; esac; return 1 ;; esac; return 0; }
-  values() { grep -v '^[[:space:]]*#' "$2" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$' | LC_ALL=C sort | while IFS= read -r v; do inscope "$v" || continue; printf '%s\t-\t%s\n' "$1" "$v"; done; }
+  volatile() { case "$1" in */result.env|*.log|*/log.live.out|*/result.txt|*/error.txt) return 0 ;; esac; return 1; }
+  # What the heal keeps by the owner's rule (moved aside, never deleted): the entries of <base>.aside, the
+  # *.orig.* copies, a folder of the base other than main/ and <branch>/ and a trust entry naming one —
+  # visible as kept lines, which the compare counts and never fails on.
+  kept() { printf 'kept by the heal\t-\t%s\n' "$1"; }
+  outofscope() { case "$1" in "$B"/*) [ "$1" = "$B/main" ] || [ "$1" = "$B/$H" ] || return 0 ;; esac; return 1; }
+  values() { grep -v '^[[:space:]]*#' "$2" 2>/dev/null | sed 's/^[[:space:]]*//' | grep -v '^$' | LC_ALL=C sort | while IFS= read -r v; do case "$v" in 'directory = '*) outofscope "${v#directory = }" && { kept "$1: $v"; continue; } ;; esac; printf '%s\t-\t%s\n' "$1" "$v"; done; }
   entry() {
     volatile "$1" && return 0
+    case "$1" in *.orig.*) kept "$1"; return 0 ;; esac
     if [ -L "$1" ]; then printf '%s\t%s\t-> %s\n' "$1" "$(attrs_of "$1" | cut -d' ' -f1)" "$(readlink "$1")" # kernel-exception: POSIX sh of the disposable-container snapshot, the link text as written
     elif [ -f "$1" ]; then
       case "$1" in
@@ -1823,6 +1873,8 @@ DKH=$(home_of developking)
 echo OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN
 {
 entry "$B"
+for a in "$B.aside"/*; do { [ -e "$a" ] || [ -L "$a" ]; } && kept "$a"; done
+for d in "$B"/*; do [ -d "$d" ] || continue; case "$d" in "$B/main"|"$D") ;; *) kept "$d" ;; esac; done
 level "$B/main"
 level "$D"
 level "$S"
@@ -1835,14 +1887,15 @@ for d in "$B/main" "$D"; do
   printf 'branch of %s\t-\t%s\n' "$d" "$(rgit -C "$d" symbolic-ref -q --short HEAD || echo detached)"
   printf 'HEAD of %s\t-\t%s\n' "$d" "$(rgit -C "$d" rev-parse HEAD 2>/dev/null)"
 done
-rgit config --system --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do inscope "$v" || continue; printf 'safe.directory of the system\t-\t%s\n' "$v"; done
+rgit config --system --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do outofscope "$v" && { kept "safe.directory of the system: $v"; continue; }; printf 'safe.directory of the system\t-\t%s\n' "$v"; done
 for u in $USERS; do
   h=$(home_of "$u")
   if [ -z "$h" ]; then printf 'user %s\tabsent\t-\n' "$u"; continue; fi
   printf 'shell of %s\t-\t%s\n' "$u" "$(awk -F: -v u="$u" '$1 == u { print $7; exit }' /etc/passwd)"
   printf 'groups of %s\t-\t%s\n' "$u" "$(id -nG "$u" 2>/dev/null | tr ' ' '\n' | LC_ALL=C sort | tr '\n' ' ')" # kernel-exception: POSIX sh of the disposable-container snapshot
-  as_user "$u" git config --global --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do inscope "$v" || continue; printf 'safe.directory of %s\t-\t%s\n' "$u" "$v"; done # ogit-exception: inside the platform container, as the user — the oosh there is the install under compare
+  as_user "$u" git config --global --get-all safe.directory 2>/dev/null | LC_ALL=C sort | while IFS= read -r v; do outofscope "$v" && { kept "safe.directory of $u: $v"; continue; }; printf 'safe.directory of %s\t-\t%s\n' "$u" "$v"; done # ogit-exception: inside the platform container, as the user — the oosh there is the install under compare
   entry "$h"
+  for o in "$h"/*.orig.* "$h"/.[!.]*.orig.*; do { [ -e "$o" ] || [ -L "$o" ]; } && kept "$o"; done
   for n in oosh config init .bashrc .bash_profile .profile .gitconfig .once; do entry "$h/$n"; done
   level "$h/.config/oosh"
   tree "$h/.ssh" 3
@@ -1874,6 +1927,24 @@ private.os.platform.heal.compare.snapshot.take()     # <platform> <branch> # ech
    | sed -n '/^OOSH_HEAL_COMPARE_SNAPSHOT_BEGIN$/,$p' | sed '1d' | LC_ALL=C sort -u)
  [ -n "$out" ] || return 1
  printf '%s\n' "$out"
+}
+
+
+private.os.platform.heal.compare.known.get()     #  # echo the differences of a heal and a fresh install the compare warns about and does not fail on, one per line: a pattern of the snapshot line TAB the reason and where it is followed up; silent getter #
+{
+ # NO create.result — a getter consumed as $(...) by
+ # private.os.platform.heal.compare.run. One line per known difference:
+ # <pattern> || <reason>. The pattern is a shell glob of the snapshot line
+ # (path TAB owner:group mode TAB content); its TABs are real ones, so " || "
+ # is the separator. A matching line of the comparison prints as
+ # "WARN compare: known: …" and does not fail; every other line fails. An
+ # entry names where it is followed up — the list is short on purpose (owner
+ # ruling P6 round 1).
+ local t
+ t=$(printf '\t')
+ printf '%s\n' \
+   "*/.config/oosh/user.session.env${t}-${t}export PATH=* || the install writes the PATH of the installing process into a user's user.session.env (the dirs of root, the ~/oosh of another user) — a dev bug, a separate topic" \
+   "*/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh${t}*${t}dir || the base keeps the owner the old install gave it: private.this.dir.ensure never changes a directory that exists (the D1 lesson)"
 }
 
 
