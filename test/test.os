@@ -622,8 +622,8 @@ test.os.healBreakageApply() {
   private.os.platform.heal.breakage.apply p dirty dev.heal >/dev/null 2>&1; rc=$?
   [ "$rc" = 0 ] || bad="$bad rc=$rc"
   rec=$(grep '^ossh exec p ' "$OS_T_REC")
-  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad not-root-sh=[$rec]" ;; esac
-  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d | sudo sh -s.*/\1/p')
+  case "$rec" in *"b=sh; "*"| base64 \$d | sudo \$b -s"*) ;; *) bad="$bad not-root-sh=[$rec]" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p .*echo \([A-Za-z0-9+\/=]*\) | base64 \$d.*/\1/p')
   want=$(private.os.platform.heal.breakage.script.get dirty dev.heal)
   [ -n "$encoded" ] && [ "$(printf '%s' "$encoded" | base64 -d)" = "$want" ] || bad="$bad script-differs"
   : > "$OS_T_REC"
@@ -718,7 +718,7 @@ test.os.userRun() {
   # each user in THEIR home: runuser keeps the caller's HOME — the gates of
   # oosh-user and bash-user wrote their fixtures' git trust into the
   # .gitconfig of test, and the second heal pruned it (second-heal=1)
-  case "$rec" in *"ossh exec.tty p sudo -H bash -lc 'cd /root 2>/dev/null || cd /tmp; "*"oo heal dev all'"*) ;; *) bad="$bad root-transport" ;; esac
+  case "$rec" in *"ossh exec.tty p b=bash; "*"sudo -H \$b -lc 'cd /root 2>/dev/null || cd /tmp; "*"oo heal dev all'"*) ;; *) bad="$bad root-transport" ;; esac
   case "$rec" in *"sudo runuser -u bash-user -- env HOME=\"\$(eval echo ~bash-user)\" bash -c"*"test.suite run platform.shared.idempotence.invariant 1'"*) ;; *) bad="$bad bash-user-transport" ;; esac
   case "$rec" in *"sudo -H -u bash-user bash -c"*) ;; *) bad="$bad bash-user-sudo-transport" ;; esac
   # nobody acts for the ssh login: sudo's SUDO_USER=test made ogit.folder.finish
@@ -772,8 +772,8 @@ test.os.healRemoteScripts() {
   got=$(private.os.platform.heal.snapshot.get p dev.heal)
   [ "$got" = "$(printf '/a\t1/2\t3 4')" ] || bad="$bad snapshot=[$got]"
   rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
-  case "$rec" in *"| base64 -d | sudo bash -s"*) ;; *) bad="$bad snapshot-not-root-bash" ;; esac
-  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  case "$rec" in *"b=bash; "*"| base64 \$d | sudo \$b -s"*) ;; *) bad="$bad snapshot-not-root-bash" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p .*echo \([A-Za-z0-9+\/=]*\) | base64 \$d.*/\1/p')
   got=$(printf '%s' "$encoded" | base64 -d)
   printf '%s\n' "$got" | bash -n 2>/dev/null || bad="$bad snapshot-bash-n"
   case "$got" in *"TEST_PLATFORM_IDEMPOTENCE_HELPERS_ONLY=1"*"test.platform.shared.idempotence.snapshot"*) ;; *) bad="$bad snapshot-not-the-invariant-helper" ;; esac
@@ -782,8 +782,8 @@ test.os.healRemoteScripts() {
   ossh() { echo "ossh $*" >> "$OS_T_REC"; }
   private.os.platform.heal.check p foreign >/dev/null 2>&1 || bad="$bad foreign-rc"
   rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
-  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad foreign-not-root-sh" ;; esac
-  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  case "$rec" in *"b=sh; "*"| base64 \$d | sudo \$b -s"*) ;; *) bad="$bad foreign-not-root-sh" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p .*echo \([A-Za-z0-9+\/=]*\) | base64 \$d.*/\1/p')
   got=$(printf '%s' "$encoded" | base64 -d)
   printf '%s\n' "$got" | sh -n 2>/dev/null || bad="$bad foreign-sh-n"
   case "$got" in *"/opt/foreign.heal.sums"*"-newer /opt/foreign.heal.marker"*) ;; *) bad="$bad foreign-not-sums-and-marker" ;; esac
@@ -795,16 +795,16 @@ test.os.healRemoteScripts() {
   private.os.platform.heal.check p user.clone dev.heal >/dev/null 2>&1 || bad="$bad user-clone-rc"
   case "$RESULT" in "user.clone check on p: rc 0") ;; *) bad="$bad user-clone-result=[$RESULT]" ;; esac
   rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
-  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad user-clone-not-root-sh" ;; esac
-  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  case "$rec" in *"b=sh; "*"| base64 \$d | sudo \$b -s"*) ;; *) bad="$bad user-clone-not-root-sh" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p .*echo \([A-Za-z0-9+\/=]*\) | base64 \$d.*/\1/p')
   [ "$(printf '%s' "$encoded" | base64 -d)" = "$(private.os.platform.heal.user.clone.check.script.get dev.heal)" ] || bad="$bad user-clone-not-its-getter"
   # and so is the expect check: its text, as root in sh, with the branch and the breakages that ran
   : > "$OS_T_REC"
   private.os.platform.heal.check p expect dev.heal dirty detached >/dev/null 2>&1 || bad="$bad expect-rc"
   case "$RESULT" in "expect check on p: rc 0") ;; *) bad="$bad expect-result=[$RESULT]" ;; esac
   rec=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1)
-  case "$rec" in *"| base64 -d | sudo sh -s"*) ;; *) bad="$bad expect-not-root-sh" ;; esac
-  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  case "$rec" in *"b=sh; "*"| base64 \$d | sudo \$b -s"*) ;; *) bad="$bad expect-not-root-sh" ;; esac
+  encoded=$(printf '%s\n' "$rec" | sed -n 's/^ossh exec p .*echo \([A-Za-z0-9+\/=]*\) | base64 \$d.*/\1/p')
   [ "$(printf '%s' "$encoded" | base64 -d)" = "$(private.os.platform.heal.expect.check.script.get dev.heal dirty detached)" ] || bad="$bad expect-not-its-getter"
   # an unknown check, a bad name or a bad argument of the getter never reaches ossh
   : > "$OS_T_REC"
@@ -1537,7 +1537,7 @@ test.os.healSnapshotAdditions() {
   test.os.stubs.set
   ossh() { echo "ossh $*" >> "$OS_T_REC"; }
   private.os.platform.heal.snapshot.get p dev.heal >/dev/null 2>&1
-  encoded=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1 | sed -n 's/^ossh exec p echo \([A-Za-z0-9+\/=]*\) | base64 -d.*/\1/p')
+  encoded=$(grep '^ossh exec p ' "$OS_T_REC" | tail -1 | sed -n 's/^ossh exec p .*echo \([A-Za-z0-9+\/=]*\) | base64 \$d.*/\1/p')
   script=$(printf '%s' "$encoded" | base64 -d | sed -e "s#/etc/passwd#$fx/passwd#g" -e "s#^B=.*#B='$B'#" -e "s#^S=.*#S='$S'#")
   test.os.stubs.unset
   [ "$(printf '%s\n' "$script" | grep -c "^B='$B'$")" = 1 ] || bad="$bad base-not-pointed"
@@ -2022,6 +2022,34 @@ test.os.healCompareKnownGet() {
 test.case $level "T-OS-HEAL-COMPARE-KNOWN-GET: every known difference has a pattern and a reason, and they match no more than they name" test.os.healCompareKnownGet
 expect 0 "each a pattern and a reason; the installer PATH of any user session file and the owner of the base, nothing more" \
   "the compare had no place for a difference that is a dev bug of the install"
+
+
+console.log "
+Test: the public heal methods a CI step calls
+===================================================================="
+
+# T-OS-HEAL-PUBLIC-METHODS: os platform.heal.arm.get, .second.run and .reports.only.is are the public
+# faces of the scenario's private arm getter, second heal and predicate — the macOS workflow calls
+# them (the review of P6, L: no CLI call of a private method). Same text, same rc, the arguments passed on.
+test.os.healPublicMethods() {
+  local fx bad="" got rc
+  fx=$(test.suite.fixture.make healpublic)
+  [ "$(os.platform.heal.arm.get launcher.missing dev.heal)" = "$(private.os.platform.heal.breakage.script.get launcher.missing dev.heal)" ] || bad="$bad arm-text"
+  os.platform.heal.arm.get bogus dev.heal >/dev/null 2>&1 && bad="$bad unknown-arm-rc0"
+  os.platform.heal.arm.get >/dev/null 2>&1 && bad="$bad no-name-rc0"
+  got=$( private.os.platform.heal.second.run() { echo "second $*"; return 3; }; os.platform.heal.second.run macos dev.heal; echo "rc=$?" )
+  [ "$got" = "$(printf 'second macos dev.heal\nrc=3')" ] || bad="$bad second=[$got]"
+  os.platform.heal.second.run macos >/dev/null 2>&1 && bad="$bad second-no-branch-rc0"
+  printf 'rc 1: something is left for you — the lines marked left above; install state 99\n' > "$fx/reports"
+  printf 'rc 1: something is left for you — the lines marked left above\n' > "$fx/left"
+  os.platform.heal.reports.only.is "$fx/reports" || bad="$bad reports-not-reports"
+  os.platform.heal.reports.only.is "$fx/left" && bad="$bad left-reports"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the arm text, the second heal and the predicate of the scenario, public" || create.result 1 "public heal methods:$bad"
+  return $(result)
+}
+test.case $level "T-OS-HEAL-PUBLIC-METHODS: the public heal methods answer as the private ones they stand for" test.os.healPublicMethods
+expect 0 "the arm text, the second heal and the predicate of the scenario, public" "the macOS workflow called private methods of os"
 
 ### test.method
 

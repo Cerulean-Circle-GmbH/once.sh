@@ -750,9 +750,12 @@ private.os.platform.root.script.run()     # <platform> <shell> <script> # run th
    sh|bash) ;;
    *) create.result 1 "private.os.platform.root.script.run: <shell> is sh or bash, not $shell"; error.log "$RESULT"; return $(result) ;;
  esac
- # raw: an encoding, no oosh method; one line, the remote base64 -d reads it
+ # raw: an encoding, no oosh method; one line the remote decodes. Two values of the
+ # target, probed there (the review of P6, D): the decoder flag (-d, an older macOS
+ # knows only -D) and, for bash, the Homebrew bash where it is (sudo resolves
+ # /bin/bash 3.2 on macOS, Phase B.2 of the macOS workflow names it too).
  encoded=$(printf '%s\n' "$script" | base64 | tr -d '\n')
- ossh exec "$platform" "echo $encoded | base64 -d | sudo $shell -s"
+ ossh exec "$platform" "d=-d; echo | base64 -d >/dev/null 2>&1 || d=-D; b=$shell; [ \"\$b\" = bash ] && [ -x /opt/homebrew/bin/bash ] && b=/opt/homebrew/bin/bash; echo $encoded | base64 \$d | sudo \$b -s"
  local rc=$?
  create.result "$rc" "the script ran as root on $platform with rc $rc"
  return $rc
@@ -905,7 +908,7 @@ private.os.platform.user.run()     # <platform> <user> <command> <log> # run <co
    # -H: root's HOME, not the ssh user's (see below). No SUDO_* either: sudo
    # names test as the one who typed it, and ogit.folder.finish in the gates'
    # fixtures trusted them in the .gitconfig of test (second-heal=1).
-   ossh exec.tty "$platform" "sudo -H bash -lc 'cd /root 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command'" 2>&1 | tee "$log"
+   ossh exec.tty "$platform" "b=bash; [ -x /opt/homebrew/bin/bash ] && b=/opt/homebrew/bin/bash; sudo -H \$b -lc 'cd /root 2>/dev/null || cd /tmp; unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; $prelude $command'" 2>&1 | tee "$log"
    rc=${PIPESTATUS[0]}
  else
    # oosh-user / bash-user (via test+sudo+runuser; login-shell equivalent of `user login <user>`).
@@ -1948,6 +1951,58 @@ private.os.platform.heal.compare.known.get()     #  # echo the differences of a 
 }
 
 
+os.platform.heal.arm.get()     # <name> <?branch> # echo the POSIX sh of the breakage arm <name> as os platform.heal.test runs it as root (private.os.platform.heal.breakage.script.get); <branch> names the canonical folder, default the branch of this tree; rc 1 for an unknown name #
+{
+ # The public face of the arm getter for a CI step (.github/workflows/macos-test.yml
+ # writes the arms to files with it): one text for the Linux containers and macOS.
+ local name="$1" branch="$2"
+ if [ -z "$name" ]; then
+   create.result 1 "Usage: os platform.heal.arm.get <name> <?branch> — one of: $(private.os.platform.heal.breakage.names.get | tr '\n' ' ')"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ if [ -z "$branch" ]; then
+   private.this.script.load ogit ogit.branch.get || return 1
+   branch=$(ogit.branch.get "$OOSH_DIR")
+ fi
+ private.os.platform.heal.breakage.script.get "$name" "$branch" || { create.result 1 "unknown breakage $name or no branch $branch"; error.log "$RESULT"; return $(result); }
+}
+
+
+os.platform.heal.arm.get.completion.name() {
+  private.os.platform.heal.breakage.names.get
+}
+os.platform.heal.arm.get.completion.branch() {
+  private.this.script.load ogit ogit.branch.list && ogit.branch.list all "$OOSH_DIR"
+}
+os.platform.heal.second.run()     # <platform> <branch> # the second heal of the scenario on <platform>: a snapshot, <base>/<branch>/oo heal <branch> all as root, a snapshot again; rc 0 when nothing but same-content rewrites of the shared env files changed (private.os.platform.heal.second.run) #
+{
+ # The public face of the second heal for a CI step: the one text the scenario runs.
+ if [ -z "$1" ] || [ -z "$2" ]; then
+   create.result 1 "os.platform.heal.second.run requires <platform> <branch>"
+   error.log "$RESULT"
+   return $(result)
+ fi
+ private.os.platform.heal.second.run "$1" "$2"
+}
+
+
+os.platform.heal.second.run.completion.platform() {
+  private.os.platform.names
+}
+os.platform.heal.second.run.completion.branch() {
+  private.this.script.load ogit ogit.branch.list && ogit.branch.list all "$OOSH_DIR"
+}
+os.platform.heal.reports.only.is()     # <log> # rc 0 when the rc line of a heal in <log> is rc 1 with install state 99, reports only (private.os.platform.heal.reports.only.is) #
+{
+ # The public face of the predicate for a CI step: rc only.
+ private.os.platform.heal.reports.only.is "$1"
+}
+
+
+os.platform.heal.reports.only.is.completion.log() {
+  compgen -f -- "$1"
+}
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
