@@ -217,7 +217,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 |--------|-----------|-------------|
 | `diff.check` | `<?dir:$OOSH_DIR> <?paths...>` | rc 0 when `<paths>` (default: everything) have no unstaged changes; variadic, so `<?dir>` comes first |
 | `diff.show` | `<a> <b> <?format:stat> <?dir:$OOSH_DIR>` | diff between `<a>` and `<b>` (three-dot); format `stat` or `full` |
-| `diff.files.list` | `<?from:dev> <?to:HEAD> <?dir:$OOSH_DIR>` | the paths changed between `<from>` and `<to>` (three-dot, so since the merge-base), one per line, deleted files left out; nothing and rc 1 on a ref git does not know. `test.suite changed` reads it |
+| `diff.files.list` | `<?from:dev> <?to:HEAD> <?dir:$OOSH_DIR> <?only:changed>` | the paths changed between `<from>` and `<to>` (three-dot, so since the merge-base), one per line, deleted files left out; nothing and rc 1 on a ref git does not know; `to` may be `worktree` (the merge-base against the working tree, untracked files not ignored included); `only` deleted lists just the deleted paths; rc 1 on an unknown ref, rc 2 when git fails otherwise. `test.suite changed` reads it |
 
 ### tag
 
