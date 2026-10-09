@@ -1792,6 +1792,19 @@ private.os.platform.heal.compare.run()     # <platform> <branch> # a fresh insta
          # shellcheck disable=SC2254 # a glob on purpose
          case "$payload" in $pattern) matched="$reason"; break ;; esac
        done <<< "$known"
+       # a mode entry (pattern "mode:<path glob>") matches only when the other side has the same path,
+       # owner:group and content and the mode alone differs — an owner or content difference still fails
+       if [ -z "$matched" ]; then
+         while IFS= read -r pattern; do
+           case "$pattern" in mode:*) ;; *) continue ;; esac
+           reason=${pattern#* || }; pattern=${pattern%% || *}; pattern=${pattern#mode:}
+           # shellcheck disable=SC2254 # a glob on purpose
+           case "${payload%%"$tab"*}" in $pattern) ;; *) continue ;; esac
+           if awk -F "$tab" -v p="${payload%%"$tab"*}" -v f2="$(printf '%s' "$payload" | cut -f2)" -v c="$(printf '%s' "$payload" | cut -f3)" \
+             'BEGIN { split(f2, w, " ") } $1 == p && $3 == c { split($2, a, " "); if (a[1] == w[1] && a[2] != w[2]) found = 1 } END { exit !found }' \
+             "$([ "${line#healed only: }" != "$line" ] && echo "$freshLog" || echo "$healedLog")"; then matched="$reason"; break; fi
+         done <<< "$known"
+       fi
        if [ -n "$matched" ]; then warned="$warned"$'\n'"WARN compare: known: $line — $matched"
        else failing="$failing"$'\n'"$line"; fi
      done <<< "$differences"
@@ -1942,13 +1955,22 @@ private.os.platform.heal.compare.known.get()     #  # echo the differences of a 
  # is the separator. A matching line of the comparison prints as
  # "WARN compare: known: …" and does not fail; every other line fails. An
  # entry names where it is followed up — the list is short on purpose (owner
- # ruling P6 round 1).
- local t
+ # ruling P6 round 1). A pattern "mode:<path glob>" is a mode-only entry: it
+ # matches a line of that path only when the other side has the same path,
+ # owner:group and content, so the mode alone differs.
+ local t modes
  t=$(printf '\t')
+ modes="modes of home files the old install wrote: the heal never changes the mode of an existing file, and the fresh install itself writes 664 in an ssh session and 644 through a hop — install consistency is a follow-up"
  # path-exception: a glob of a snapshot line below, data; no PATH is set
  printf '%s\n' \
    "*/.config/oosh/user.session.env${t}-${t}export PATH=* || the install writes the PATH of the installing process into a user's user.session.env (the dirs of root, the ~/oosh of another user) — a dev bug, a separate topic" \
    "*/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh${t}*${t}dir || the base keeps the owner the old install gave it: private.this.dir.ensure never changes a directory that exists (the D1 lesson)" \
+   "mode:*/.bash_profile || $modes" \
+   "mode:*/.config/oosh || $modes" \
+   "mode:*/.config/oosh/log.session.env || $modes" \
+   "mode:*/.config/oosh/oosh.session.env || $modes" \
+   "mode:*/.config/oosh/user.session.env || $modes" \
+   "mode:*/.gitconfig || $modes" \
    "shell of *${t}-${t}*/bash || the login shell the old install set, the bash on PATH (/usr/bin/bash where /bin/bash is the system one): the heal never changes a shell that is a bash (owner ruling P6 round 1, 6; private.user.login.shell.bash.ensure)"
 }
 

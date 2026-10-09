@@ -1921,6 +1921,19 @@ test.os.healCompareRun() {
   case "$out" in *"WARN compare: known: fresh only:  /home/t/.config/oosh/user.session.env"*"PATH of the installing process"*) ;; *) bad="$bad known-not-warned=[$out]" ;; esac
   case "$out" in *"kept=1, known=1)"*) ;; *) bad="$bad known-not-counted" ;; esac
   unset OS_T_FRESH_EXTRA
+  # the mode of a home file the old install wrote: a mode-only difference warns (rc 0), an owner or content difference on the same path still fails
+  printf '/home/t/.bash_profile\tt:t 664\t1/2\n/home/t/.config/oosh\tt:t 775\tdir\n/home/t/.gitconfig\tt:t 664\tvalues' >> "$L-healed-$p.log"
+  OS_T_FRESH_EXTRA=$(printf '/home/t/.bash_profile\tt:t 644\t1/2\r\n/home/t/.config/oosh\tt:t 755\tdir\r\n/home/t/.gitconfig\tt:t 644\tvalues')
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
+  [ "$rc" = 0 ] || bad="$bad mode-rc=$rc=[$out]"
+  case "$out" in *"WARN compare: known: healed only: /home/t/.bash_profile"*"modes of home files the old install wrote"*) ;; *) bad="$bad mode-not-warned=[$out]" ;; esac
+  case "$out" in *"kept=1, known=6)"*) ;; *) bad="$bad mode-not-counted=[$out]" ;; esac
+  OS_T_FRESH_EXTRA=$(printf '/home/t/.bash_profile\tt:t 644\t9/9\r\n/home/t/.config/oosh\tu:u 755\tdir\r\n/home/t/.gitconfig\tt:t 644\tvalues')
+  private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
+  [ "$rc" = 1 ] || bad="$bad mode-content-owner-rc=$rc"
+  case "$out" in *"differ:"*"/home/t/.bash_profile"*"/home/t/.config/oosh"*) ;; *) bad="$bad mode-content-owner-unnamed=[$out]" ;; esac
+  case "$out" in *"WARN compare: known: healed only: /home/t/.gitconfig"*) ;; *) bad="$bad mode-gitconfig-lost=[$out]" ;; esac
+  unset OS_T_FRESH_EXTRA
   # a line only the healed machine has: rc 1, named
   printf '/b/x\troot:dev 2775\tdir\n/b/z\troot:dev 2775\tdir\n/s/oosh.env\t-\texport OOSH_SSH_CONFIG_HOST="%s"\n' "$p" > "$L-healed-$p.log"
   private.os.platform.heal.compare.run "$p" dev.heal > "$fx/out" 2>&1; rc=$?; out=$(cat "$fx/out")
