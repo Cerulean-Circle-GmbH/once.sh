@@ -90,6 +90,8 @@ echo -e "\e[1;35m  ┌───────────────────�
 echo -e "\e[1;35m  │ INTENTIONAL FAILURE BELOW - THIS VERIFIES COUNTER LOGIC        │\e[0m"
 echo -e "\e[1;35m  └─────────────────────────────────────────────────────────────────┘\e[0m"
 
+# the file declares what it plants: the runner counts exactly this many failures as expected
+test.suite.expect.failures 1
 expect.fail "INTENTIONAL: This failure tests that failures are counted correctly"
 
 # Verify expect.fail only incremented EXPECT, not SUCCESS
@@ -530,12 +532,12 @@ expect 0 "a declared writer is reported and restored, but does not fail the run"
 # that always passed or always failed cannot satisfy it.
 test.test.suite.verdictRule() {
   local row want got fails=""
-  # sharedWrites noResults category expects passed metaFailures | wantRc
+  # sharedWrites noResults category expects passed expectedFailures unmetDeclarations | wantRc
   while read -r row; do
     [ -z "$row" ] && continue
     want="${row##*|}"; want="${want// /}"
     set -- ${row%%|*}
-    private.test.suite.verdict "$1" "$2" "$3" "$4" "$5" "$6" >/dev/null 2>&1
+    private.test.suite.verdict "$1" "$2" "$3" "$4" "$5" "$6" "$7" >/dev/null 2>&1
     got=$?
     [ "$got" != "$want" ] && fails="$fails [${row%%|*}-> $got want $want]"
   done <<'ROWS'
@@ -543,6 +545,10 @@ test.test.suite.verdictRule() {
 0 0 core 10 9 1     | 0
 0 0 core 10 9 -     | 1
 0 0 core 10 8 1     | 1
+0 0 core 10 10 1    | 1
+0 0 core 10 8 2     | 0
+0 0 core 10 7 2     | 1
+0 0 core 10 9 1 1   | 1
 0 0 core 0 0 -      | 1
 0 1 core 10 10 -    | 1
 0 1 extended 10 10 -| 0
@@ -561,6 +567,70 @@ test.case $level "T-VERDICT: a written tier fails any run; a score-less file fai
   test.test.suite.verdictRule
 expect 0 "the verdict rule holds on every row" \
   "these two causes never reached the return code, so CI stayed green through both"
+
+# T-SUITE-EXPECT-FAILURES: a file that plants failures declares them, and the tally subtracts exactly those
+# test.suite.expect.failures <n> is recorded into the handoff as TEST_EXPECTED_FAILURES; the runner counts a
+# declared failure as expected, so a green run ends at Failed: 0 with the planted failure still named. The
+# verdict is the declared number, not a file name: a failure nobody declared is red, and so is a declaration
+# the file did not keep. The filtered runner reads $OOSH_DIR/test, so it runs in a subshell over a fixture
+# folder holding the one probe, whose planted and declared numbers are the two arguments.
+test.test.suite.expectFailures.probe() { # <fix> <planted> <declared|-> # write the probe test.expectProbe into the fixture test folder
+  local fix="$1" planted="$2" declared="$3" i
+  {
+    printf '%s\n' '#!/usr/bin/env bash' 'TEST_CATEGORY=core' "export OOSH_DIR=\"$OOSH_DIR\"" 'source this' 'source test.suite'
+    [ "$declared" != "-" ] && printf '%s\n' "test.suite.expect.failures $declared"
+    printf '%s\n' 'expect.pass "the probe passes once"'
+    for ((i = 0; i < planted; i++)); do printf '%s\n' 'expect.fail "PLANTED: the probe fails on purpose"'; done
+    printf '%s\n' 'test.suite.save.results'
+  } > "$fix/oosh/test/test.expectProbe"
+  chmod +x "$fix/oosh/test/test.expectProbe"
+}
+test.test.suite.expectFailures.run() { # <planted> <declared|-> # run the filtered core runner over the probe; echoes "rc|summary text without colors"
+  local fix; fix=$(test.suite.fixture.make test.test.suite.expectfailures)
+  test.test.suite.shared.fixture "$fix"
+  mkdir -p "$fix/run" "$fix/home/.config/oosh" "$fix/oosh/test"
+  test.test.suite.expectFailures.probe "$fix" "$1" "$2"
+  local out rc
+  out=$( ( export HOME="$fix/home" CONFIG_PATH="$fix" CONFIG_FILE=user.env CONFIG="$fix/user.env" \
+             TEST_SUITE_CONFIG_ORIGIN="$fix" TEST_SUITE_RESULT_PATH="$fix/run" OOSH_DIR="$fix/oosh"
+      unset TEST_SUITE_SESSION_SNAPSHOT
+      private.test.suite.run.filtered 1 "" core 2>&1; echo "rc=$?" ) | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' '~')
+  rm -rf "$fix"
+  echo "$out"
+}
+test.test.suite.expectFailures() {
+  local bad="" out
+  out=$(test.test.suite.expectFailures.run 1 1)
+  case "$out" in *"rc=0"*) ;; *) bad="$bad planted-declared-rc=[$out]" ;; esac
+  case "$out" in *"Failed:      0~"*) ;; *) bad="$bad planted-declared-not-zero" ;; esac
+  case "$out" in *"Expected failures: 1 (planted by test.expectProbe)"*) ;; *) bad="$bad planted-declared-not-named" ;; esac
+  out=$(test.test.suite.expectFailures.run 1 -)
+  case "$out" in *"rc=1"*"Failed:      1~"*|*"Failed:      1~"*"rc=1"*) ;; *) bad="$bad undeclared-not-red=[$out]" ;; esac
+  out=$(test.test.suite.expectFailures.run 0 1)
+  case "$out" in *"rc=1"*) ;; *) bad="$bad unkept-rc=[$out]" ;; esac
+  case "$out" in *"declared an expected failure"*) ;; *) bad="$bad unkept-reason=[$out]" ;; esac
+  out=$(test.test.suite.expectFailures.run 2 1)
+  case "$out" in *"rc=1"*) ;; *) bad="$bad two-planted-one-declared-rc=[$out]" ;; esac
+  out=$(test.test.suite.expectFailures.run 0 -)
+  case "$out" in *"Failed:      0~"*"rc=0"*) ;; *) bad="$bad plain-green=[$out]" ;; esac
+  case "$out" in *"Expected failures"*) bad="$bad plain-shows-expected" ;; esac
+  [ -z "$bad" ] && create.result 0 "a declared failure is expected, an undeclared or an unkept one is red" || create.result 1 "expect.failures:$bad"
+  return $(result)
+}
+test.case $level "T-SUITE-EXPECT-FAILURES: a planted failure is declared, counted as expected, and the total of a green run is 0" test.test.suite.expectFailures
+expect 0 "a declared failure is expected, an undeclared or an unkept one is red" "every green core run ended Failed: 1 because of the planted failure"
+
+test.test.suite.expectFailuresMethod() {
+  local bad="" rc
+  ( test.suite.expect.failures 2 >/dev/null; [ "$TEST_EXPECTED_FAILURES" = 2 ] ) || bad="$bad not-recorded"
+  ( test.suite.expect.failures two >/dev/null 2>&1 ); rc=$?
+  [ "$rc" != 0 ] || bad="$bad word-accepted"
+  ( test.suite.expect.failures 3 >/dev/null; private.test.suite.counters.reset >/dev/null; [ "$TEST_EXPECTED_FAILURES" = 0 ] ) || bad="$bad not-reset"
+  [ -z "$bad" ] && create.result 0 "the declaration is recorded, a non-number is refused, the reset clears it" || create.result 1 "method:$bad"
+  return $(result)
+}
+test.case $level "T-SUITE-EXPECT-FAILURES-METHOD: test.suite.expect.failures records a number and refuses a word" test.test.suite.expectFailuresMethod
+expect 0 "the declaration is recorded, a non-number is refused, the reset clears it" "a word was recorded as a failure count"
 
 # ============================================================================
 # Final verification
@@ -1234,7 +1304,7 @@ test.test.suite.changed.commit() { # <fx> <path...> # change the paths and commi
 test.test.suite.changed.run() { # <fx> <since> <category> <level> # run test.suite.changed on the fixture with a recording runner; echoes "rc|RESULT|ran"
   local fx="$1"; shift
   ( OOSH_DIR="$fx/repo"; export OOSH_DIR
-    test.suite.run() { echo "$1 $2" >> "$fx/ran"; if [ "$1" = test.suite ]; then [ -n "$SIGNAL" ] && echo "NO RESULTS: $1"; TEST_SUITE_EXPECT_COUNTER=41; TEST_SUITE_SUCCESS_COUNTER=${META_PASSED:-40}; return 1; fi; [ "$1" = beta ] && [ -n "$FAIL_BETA" ] && return 1; return 0; }
+    test.suite.run() { echo "$1 $2" >> "$fx/ran"; if [ "$1" = test.suite ]; then [ -n "$SIGNAL" ] && echo "NO RESULTS: $1"; [ -n "$SIGNAL$META_FAIL" ] && return 1; return 0; fi; [ "$1" = beta ] && [ -n "$FAIL_BETA" ] && return 1; return 0; }
     test.suite.changed "$@" >/dev/null; rc=$?
     echo "$rc|$RESULT|$(tr '\n' ',' < "$fx/ran" 2>/dev/null)" )
 }
@@ -1264,11 +1334,11 @@ test.test.suite.changed() {
   case "$out" in *"beta"*"failed"*|*"failed"*"beta"*) ;; *) bad="$bad failing-not-named=[$out]" ;; esac
   [ "${out##*|}" = "alpha 1,beta 1,install 1,c2 1," ] || bad="$bad failing-ran=[${out##*|}]"
   rm -f "$fx/ran"
-  # the meta-test: its one intentional failure is a pass, a second failure is not
+  # test.suite itself: the runner scores its declared failure as a pass (rc 0), so changed adds no exemption by name; a runner fail is a fail
   test.test.suite.changed.commit "$fx" test.suite
   out=$(test.test.suite.changed.run "$fx" HEAD~1 core 1); rm -f "$fx/ran"
   case "$out" in 0\|*) ;; *) bad="$bad meta-rc=[$out]" ;; esac
-  out=$(META_PASSED=39 test.test.suite.changed.run "$fx" HEAD~1 core 1); rm -f "$fx/ran"
+  out=$(META_FAIL=1 test.test.suite.changed.run "$fx" HEAD~1 core 1); rm -f "$fx/ran"
   case "$out" in 1\|*"failed: test.suite"*) ;; *) bad="$bad meta-two-rc=[$out]" ;; esac
   out=$(SIGNAL=1 test.test.suite.changed.run "$fx" HEAD~1 core 1); rm -f "$fx/ran"
   case "$out" in 1\|*"failed: test.suite"*) ;; *) bad="$bad meta-noscore-rc=[$out]" ;; esac
@@ -1316,6 +1386,15 @@ test.test.suite.changedTestGet() {
 }
 test.case $level "T-SUITE-CHANGED-MAP: a changed path maps to its test file or to nothing" test.test.suite.changedTestGet
 expect 0 "every kind of path maps to its test file or to nothing" "a doc or a template was read as a script"
+
+
+console.log "
+Test: test.suite.expect.failures
+===================================================================="
+
+test.case - "a file declares the failures it plants" \
+   test.suite.expect.failures 1
+expect 0 "this file plants 1 failure(s) on purpose"
 
 ### test.method
 

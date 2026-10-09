@@ -117,7 +117,8 @@ private.test.suite.counters.reset() # # zero the exported per-file counters betw
   TEST_SUITE_TEST_COUNTER=0
   TEST_SUITE_EXPECT_COUNTER=0
   TEST_SUITE_SUCCESS_COUNTER=0
-  export TEST_SUITE_TEST_COUNTER TEST_SUITE_EXPECT_COUNTER TEST_SUITE_SUCCESS_COUNTER
+  TEST_EXPECTED_FAILURES=0
+  export TEST_SUITE_TEST_COUNTER TEST_SUITE_EXPECT_COUNTER TEST_SUITE_SUCCESS_COUNTER TEST_EXPECTED_FAILURES
   create.result 0 "per-file counters reset"
   return $(result)
 }
@@ -146,6 +147,7 @@ test.suite.save.results() # # writes the counters of this file to the handoff th
     echo "export TEST_SUITE_TEST_COUNTER=\"${TEST_SUITE_TEST_COUNTER:-0}\""
     echo "export TEST_SUITE_EXPECT_COUNTER=\"${TEST_SUITE_EXPECT_COUNTER:-0}\""
     echo "export TEST_SUITE_SUCCESS_COUNTER=\"${TEST_SUITE_SUCCESS_COUNTER:-0}\""
+    echo "export TEST_EXPECTED_FAILURES=\"${TEST_EXPECTED_FAILURES:-0}\""
   } > "$resultsFile"
 
   # Print final summary
@@ -157,6 +159,9 @@ test.suite.summary() # # prints test summary with pass/fail counts
   local total=${TEST_SUITE_EXPECT_COUNTER:-0}
   local passed=${TEST_SUITE_SUCCESS_COUNTER:-0}
   local failed=$((total - passed))
+  local planted=${TEST_EXPECTED_FAILURES:-0}
+  [ "$planted" -gt "$failed" ] && planted=$failed
+  failed=$((failed - planted))
 
   echo ""
   echo -e "\e[1;37m════════════════════════════════════════════════════════════════════\e[0m"
@@ -171,9 +176,10 @@ test.suite.summary() # # prints test summary with pass/fail counts
   else
     echo -e "  Failed:      \e[1;32m0\e[0m"
   fi
+  [ "$planted" -gt 0 ] && echo -e "  Expected failures: $planted (declared by this file)"
   echo ""
 
-  if [ "$passed" -eq "$total" ] && [ "$total" -gt 0 ]; then
+  if [ "$((passed + planted))" -eq "$total" ] && [ "$total" -gt 0 ]; then
     echo -e "  \e[1;32m✓ ALL TESTS PASSED\e[0m"
   elif [ "$total" -eq 0 ]; then
     echo -e "  \e[1;33m⚠ NO TESTS RUN\e[0m"
@@ -335,8 +341,13 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder, or t
   elif [ "$noResults" -gt 0 ]; then
     echo -e "\e[1;31m  ✗ NO RESULTS: $testName ended before test.suite.save.results — a file that scores nothing fails\e[0m"
     rc=1
-  elif [ "$TEST_SUITE_SUCCESS_COUNTER" -eq "$TEST_SUITE_EXPECT_COUNTER" ]; then
-    echo -e "\e[1;32m  ✓ All tests successful\e[0m"
+  elif [ "$((TEST_SUITE_EXPECT_COUNTER - TEST_SUITE_SUCCESS_COUNTER))" -eq "${TEST_EXPECTED_FAILURES:-0}" ]; then
+    # the failures a file declares (test.suite.expect.failures) are the ones it planted; no more, no fewer
+    if [ "${TEST_EXPECTED_FAILURES:-0}" -gt 0 ]; then
+      echo -e "\e[1;32m  ✓ All tests successful ($TEST_EXPECTED_FAILURES expected failure(s), planted on purpose)\e[0m"
+    else
+      echo -e "\e[1;32m  ✓ All tests successful\e[0m"
+    fi
   else
     echo -e "\e[1;31m  ✗ Some tests failed\e[0m"
     rc=1
@@ -408,9 +419,9 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
     ((TOTAL_FILES++))
   done
 
-  # Track intentional failures from meta-test (test.test.suite)
-  local -i META_TEST_FAILURES=0
-  local META_TEST_RAN=0
+  # Failures a file plants on purpose and declares (test.suite.expect.failures)
+  local -i EXPECTED_TOTAL=0 EXPECTED_UNMET=0
+  local EXPECTED_FILES=""
 
   # Print suite header
   local headerLabel="ALL TESTS"
@@ -488,13 +499,14 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
     fi
 
     # Load per-file results saved by test.suite.save.results in the subprocess
-    local FILE_TESTS=0 FILE_EXPECTS=0 FILE_SUCCESS=0
+    local FILE_TESTS=0 FILE_EXPECTS=0 FILE_SUCCESS=0 FILE_DECLARED=0
     local resultsFile; resultsFile=$(private.test.suite.results.file.get)
     if check file "$resultsFile" exists; then
       source "$resultsFile"
       FILE_TESTS=${TEST_SUITE_TEST_COUNTER:-0}
       FILE_EXPECTS=${TEST_SUITE_EXPECT_COUNTER:-0}
       FILE_SUCCESS=${TEST_SUITE_SUCCESS_COUNTER:-0}
+      FILE_DECLARED=${TEST_EXPECTED_FAILURES:-0}
     else
       ((NO_RESULT_COUNT++))
       NO_RESULT_FILES="$NO_RESULT_FILES $filename"
@@ -506,11 +518,15 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
     private.test.suite.counters.reset
     local FILE_FAILED=$((FILE_EXPECTS - FILE_SUCCESS))
 
-    # Track meta-test (test.test.suite) failures separately
-    # This test has 1 INTENTIONAL failure to verify counter logic works
-    if [ "$filename" = "test.test.suite" ]; then
-      META_TEST_RAN=1
-      META_TEST_FAILURES=$FILE_FAILED
+    # A file that plants failures declares them in the handoff. A declaration the
+    # file did not keep (fewer failures than declared) is unmet and fails the run.
+    if [ "$FILE_DECLARED" -gt 0 ]; then
+      if [ "$FILE_FAILED" -ge "$FILE_DECLARED" ]; then
+        ((EXPECTED_TOTAL += FILE_DECLARED))
+        EXPECTED_FILES="$EXPECTED_FILES $filename"
+      else
+        ((EXPECTED_UNMET++))
+      fi
     fi
 
     # Accumulate cumulative counters from per-file results
@@ -528,8 +544,8 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
         echo -e "  \e[1;32m✓ PASS\e[0m"
       elif [ "$FILE_EXPECTS" -eq 0 ]; then
         echo -e "  \e[1;33m⚠ NO ASSERTIONS\e[0m"
-      elif [ "$filename" = "test.test.suite" ] && [ "$FILE_FAILED" -eq 1 ]; then
-        echo -e "  \e[1;32m✓ PASS (1 intentional failure - meta-test working correctly)\e[0m"
+      elif [ "$FILE_DECLARED" -gt 0 ] && [ "$FILE_FAILED" -eq "$FILE_DECLARED" ]; then
+        echo -e "  \e[1;32m✓ PASS ($FILE_DECLARED failure(s) planted and declared)\e[0m"
       else
         echo -e "  \e[1;31m✗ FAIL ($FILE_FAILED failed)\e[0m"
       fi
@@ -540,11 +556,10 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   # Print final overall summary (always shown)
   local TOTAL_FAILED=$((CUMULATIVE_EXPECT_COUNTER - CUMULATIVE_SUCCESS_COUNTER))
 
-  # Check if the ONLY failure is the intentional one from test.test.suite
-  local ONLY_INTENTIONAL_FAILURE=0
-  if [ "$META_TEST_RAN" -eq 1 ] && [ "$META_TEST_FAILURES" -eq 1 ] && [ "$TOTAL_FAILED" -eq 1 ]; then
-    ONLY_INTENTIONAL_FAILURE=1
-  fi
+  # The failures files plant and declare are not counted: a green run ends at 0
+  local EXPECTED_SHOWN=$EXPECTED_TOTAL
+  [ "$EXPECTED_SHOWN" -gt "$TOTAL_FAILED" ] && EXPECTED_SHOWN=$TOTAL_FAILED
+  TOTAL_FAILED=$((TOTAL_FAILED - EXPECTED_SHOWN))
 
   echo ""
   echo -e "\e[1;35m╔════════════════════════════════════════════════════════════════════╗\e[0m"
@@ -555,12 +570,13 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   echo -e "  Test Cases:  \e[1;37m$CUMULATIVE_TEST_COUNTER\e[0m"
   echo -e "  Assertions:  \e[1;37m$CUMULATIVE_EXPECT_COUNTER\e[0m"
   echo -e "  Passed:      \e[1;32m$CUMULATIVE_SUCCESS_COUNTER\e[0m"
-  if [ "$ONLY_INTENTIONAL_FAILURE" -eq 1 ]; then
-    echo -e "  Failed:      \e[1;32m1 (intentional meta-test)\e[0m"
-  elif [ "$TOTAL_FAILED" -gt 0 ]; then
+  if [ "$TOTAL_FAILED" -gt 0 ]; then
     echo -e "  Failed:      \e[1;31m$TOTAL_FAILED\e[0m"
   else
     echo -e "  Failed:      \e[1;32m0\e[0m"
+  fi
+  if [ "$EXPECTED_TOTAL" -gt 0 ]; then
+    echo -e "  Expected failures: $EXPECTED_TOTAL (planted by$EXPECTED_FILES)"
   fi
   if [ "$NO_RESULT_COUNT" -gt 0 ]; then
     echo -e "  \e[1;33mNo results:  $NO_RESULT_COUNT file(s) never called test.suite.save.results:\e[0m$NO_RESULT_FILES"
@@ -579,9 +595,7 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
     [ "$(id -u)" = "0" ] && ghaWho="Root"
     local ghaFailed="$TOTAL_FAILED"
     local ghaStatus="✅ ALL TESTS PASSED"
-    if [ "$ONLY_INTENTIONAL_FAILURE" -eq 1 ]; then
-      ghaStatus="✅ ALL TESTS PASSED (1 intentional meta-test)"
-    elif [ "$TOTAL_FAILED" -gt 0 ]; then
+    if [ "$TOTAL_FAILED" -gt 0 ]; then
       ghaStatus="❌ $TOTAL_FAILED TESTS FAILED"
     fi
     {
@@ -602,11 +616,7 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
 
   # Write fail count for workflow-level summary
   if [ -n "$GITHUB_OUTPUT" ]; then
-    if [ "$ONLY_INTENTIONAL_FAILURE" -eq 1 ]; then
-      echo "failed=0" >> "$GITHUB_OUTPUT"
-    else
-      echo "failed=$TOTAL_FAILED" >> "$GITHUB_OUTPUT"
-    fi
+    echo "failed=$TOTAL_FAILED" >> "$GITHUB_OUTPUT"
   fi
 
   # One rule, one place, testable — see private.test.suite.verdict. The chain
@@ -616,15 +626,8 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   local rc=0
   if private.test.suite.verdict \
        "$SHARED_WRITE_COUNT" "$NO_RESULT_COUNT" "$categoryFilter" \
-       "$CUMULATIVE_EXPECT_COUNTER" "$CUMULATIVE_SUCCESS_COUNTER" "$META_TEST_FAILURES"; then
-    if [ "$ONLY_INTENTIONAL_FAILURE" -eq 1 ]; then
-      echo -e "  \e[1;32m╔══════════════════════════════════════════════════════════════════╗\e[0m"
-      echo -e "  \e[1;32m║  ✓ ALL TESTS PASSED                                              ║\e[0m"
-      echo -e "  \e[1;32m║    (1 intentional failure in test.test.suite verifies counters)  ║\e[0m"
-      echo -e "  \e[1;32m╚══════════════════════════════════════════════════════════════════╝\e[0m"
-    else
-      echo -e "  \e[1;32m✓ ALL TESTS PASSED\e[0m"
-    fi
+       "$CUMULATIVE_EXPECT_COUNTER" "$CUMULATIVE_SUCCESS_COUNTER" "$EXPECTED_TOTAL" "$EXPECTED_UNMET"; then
+    echo -e "  \e[1;32m✓ ALL TESTS PASSED\e[0m"
   else
     echo -e "  \e[1;31m✗ $RESULT\e[0m"
     rc=1
@@ -1101,7 +1104,7 @@ private.test.suite.shared.restore() # # put the snapshotted config tier back, by
   return $(result)
 }
 
-private.test.suite.verdict() # <sharedWrites> <noResults> <category> <expects> <passed> <?metaFailures:-> # the suite's pass/fail rule as one decision; rc 0 pass, rc 1 fail, $RESULT is the reason
+private.test.suite.verdict() # <sharedWrites> <noResults> <category> <expects> <passed> <?expected:0> <?unmet:0> # the suite's pass/fail rule as one decision; rc 0 pass, rc 1 fail, $RESULT is the reason
 {
   # Extracted from the tail of private.test.suite.run.filtered, where it was a
   # twenty-line if/elif chain no test could reach — which is how two failure
@@ -1110,7 +1113,8 @@ private.test.suite.verdict() # <sharedWrites> <noResults> <category> <expects> <
   # code (macos-test.yml Test Summary; os.platform.test's four rcs), so a
   # cause that does not reach it does not exist.
   local sharedWrites="${1:-0}" noResults="${2:-0}" category="$3"
-  local expects="${4:-0}" passed="${5:-0}" metaFailures="$6"
+  local expects="${4:-0}" passed="${5:-0}" expected="${6:--}" unmet="${7:-0}"
+  case "$expected" in ''|-|*[!0-9]*) expected=0 ;; esac
   local failed=$((expects - passed))
 
   if [ "$sharedWrites" -gt 0 ]; then
@@ -1129,16 +1133,22 @@ private.test.suite.verdict() # <sharedWrites> <noResults> <category> <expects> <
     create.result 1 "no tests run"
     return $(result)
   fi
-  if [ "$failed" -eq 0 ]; then
-    create.result 0 "all tests passed"
+  # A file that plants failures declares them (test.suite.expect.failures): the
+  # rule is the declared number, not a file name. A declaration it did not keep
+  # is as red as a failure it did not declare.
+  if [ "$unmet" -gt 0 ]; then
+    create.result 1 "$unmet file(s) declared an expected failure they did not plant"
     return $(result)
   fi
-  # The meta-test asserts one failure on purpose, to prove the counters count.
-  if [ "$failed" -eq 1 ] && [ "$metaFailures" = "1" ]; then
-    create.result 0 "all tests passed (1 intentional meta-test failure)"
+  if [ "$failed" -eq "$expected" ]; then
+    if [ "$expected" -gt 0 ]; then
+      create.result 0 "all tests passed ($expected expected failure(s), planted on purpose)"
+    else
+      create.result 0 "all tests passed"
+    fi
     return $(result)
   fi
-  create.result 1 "$failed assertion(s) failed"
+  create.result 1 "$failed assertion(s) failed, $expected expected"
   return $(result)
 }
 
@@ -1565,17 +1575,7 @@ test.suite.changed()     # <?since:dev> <?category:core> <?level:1> # runs exact
    ran="$ran ${testName#test.}"
    test.suite.run "${testName#test.}" "$level" > "$runDir/out"; runRc=$?
    cat "$runDir/out"
-   if [ "$runRc" -ne 0 ]; then
-     # the runner scores test.test.suite with its one INTENTIONAL failure as a pass, but never a file that
-     # wrote the shared tier or scored nothing: those two signals fail it whatever the counters say
-     if [ "$testName" = "test.test.suite" ] \
-        && ! grep -q -e "the shared config tier was written" -e "NO RESULTS" "$runDir/out" \
-        && private.test.suite.verdict 0 0 "$fileCategory" "${TEST_SUITE_EXPECT_COUNTER:-0}" "${TEST_SUITE_SUCCESS_COUNTER:-0}" 1; then
-       :
-     else
-       failed="$failed ${testName#test.}"
-     fi
-   fi
+   if [ "$runRc" -ne 0 ]; then failed="$failed ${testName#test.}"; fi
  done <<< "$changed"
  rm -rf "$runDir"
 
@@ -1628,6 +1628,24 @@ private.test.suite.changed.test.get()     # <path> # echo the test file name (te
  return $(result)
 }
 
+test.suite.expect.failures()     # <expected:0> # declares how many failures this test file plants on purpose, recorded into the handoff as TEST_EXPECTED_FAILURES
+{
+ local expected="$1"
+ case "$expected" in
+   ''|*[!0-9]*) create.result 1 "expected failures must be a whole number, not [$expected]"; error.log "$RESULT"; return $(result) ;;
+ esac
+ TEST_EXPECTED_FAILURES=$((10#$expected))
+ export TEST_EXPECTED_FAILURES
+ create.result 0 "this file plants $TEST_EXPECTED_FAILURES failure(s) on purpose"
+ return $(result)
+}
+
+test.suite.expect.failures.completion.expected() {
+  # a planted failure is a small number; one candidate per line on stdout
+  echo "0"
+  echo "1"
+  echo "2"
+}
 ### new.method
 
 test.suite.init "$@"

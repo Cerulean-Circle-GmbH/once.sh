@@ -17,7 +17,7 @@ The oosh/once.sh project uses a comprehensive Bash-based test suite to ensure re
 ## Running Tests
 - **Single Test:** `test.suite run <command>` (e.g., `test.suite run mycmd`). `./test.suite run <path/to/test.file> <level>` runs a test file from any folder: an argument containing `/` is the file itself, a bare name is `test/test.<name>`.
 - **All Tests:** `test.suite all`
-- **Only what changed:** `test.suite changed <?since:dev> <?category:core> <?level:1>` runs exactly the test files of the scripts changed since a ref (a commit, branch or ref, default `dev`; the paths come from `ogit diff.files.list since worktree`: the merge-base with `since` against the working tree, so committed, uncommitted and untracked work is all seen, deleted files left out), each through `test.suite run` so the verdict and the `test.suite.save.results` handoff are the runner's own. A changed script `s` (top level, or `ng/s`) runs `test/test.s`, a changed `test/test.s` runs itself, `init/oosh` runs `test/test.install`, each file once; docs, templates and data map to nothing. A test file that does not exist is reported in `$RESULT`, not failed. A platform invariant (`TEST_CATEGORY=platform`) is left out and named unless `category` is `platform`, which runs only those. A number in the `category` place is the level (`test.suite changed dev 1`). Paths that map to no test file are counted as `unmapped: n`; a deleted script or test whose counterpart remains gets one `note:`. `test.test.suite` keeps the runner's one-intentional-failure pass unless the file wrote the shared tier or scored nothing. A failing file does not stop the rest; rc 1 names the failed files, rc 0 with "no test file to run" when no changed script has a test. This is the per-package test run; the full `core` runs once before a commit and at the merge gate.
+- **Only what changed:** `test.suite changed <?since:dev> <?category:core> <?level:1>` runs exactly the test files of the scripts changed since a ref (a commit, branch or ref, default `dev`; the paths come from `ogit diff.files.list since worktree`: the merge-base with `since` against the working tree, so committed, uncommitted and untracked work is all seen, deleted files left out), each through `test.suite run` so the verdict and the `test.suite.save.results` handoff are the runner's own. A changed script `s` (top level, or `ng/s`) runs `test/test.s`, a changed `test/test.s` runs itself, `init/oosh` runs `test/test.install`, each file once; docs, templates and data map to nothing. A test file that does not exist is reported in `$RESULT`, not failed. A platform invariant (`TEST_CATEGORY=platform`) is left out and named unless `category` is `platform`, which runs only those. A number in the `category` place is the level (`test.suite changed dev 1`). Paths that map to no test file are counted as `unmapped: n`; a deleted script or test whose counterpart remains gets one `note:`. A failing file does not stop the rest; rc 1 names the failed files, rc 0 with "no test file to run" when no changed script has a test. This is the per-package test run; the full `core` runs once before a commit and at the merge gate.
 - **Output:** Test results are summarized, showing the number of successful and expected cases, and reporting any failures.
 
 ## Example Test Script
@@ -238,6 +238,17 @@ file scores today, so the rule costs nothing now and exists to catch the regress
 (and `test.suite all`, which runs it) keeps the warning without failing, because twelve of its files
 have never scored and giving them one is content work, not runner work
 (T-VERDICT, T-SUITE-NO-RESULTS-RUNNER).
+
+**A file that plants a failure declares it.** `test/test.test.suite` fails once on purpose to prove
+the counters count. That is data, not a special case by file name: the file calls
+`test.suite.expect.failures <n>` before the failures it plants, and `test.suite.save.results` records
+it in the handoff as `TEST_EXPECTED_FAILURES=<n>` (zeroed between files with the other counters). The
+verdict is green when the failures equal the declared number and red otherwise, so an undeclared
+failure is red and so is a declaration the file did not keep (`declared an expected failure they did
+not plant`). The final summary prints `Failed: <failed - expected>`, so a green run ends `Failed: 0`,
+and one line `Expected failures: <n> (planted by <file>)` keeps the planted failure visible. A single
+`test.suite run` and `test.suite changed` use the same rule, with no exemption for any file
+(T-SUITE-EXPECT-FAILURES).
 
 The whole pass/fail rule lives in one place, `private.test.suite.verdict`, so it can be tested. It
 used to be an if/elif chain in the tail of the runner that nothing could reach — which is how both
