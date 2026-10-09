@@ -21,7 +21,7 @@
 #          or odocker workspace.seed <from>   (creates it and copies <from> in)
 : ${ODOCKER_WORKSPACES:=$(config get ODOCKER_WORKSPACES 2>/dev/null)}
 
-odocker.workspace.init()     # <?path:$(oo mode.base.get)/../DockerWorkspaces> # create the Docker workspaces directory if it is absent, then set it; idempotent #
+odocker.workspace.init()     # <?path:$(oo mode.base.get)/../DockerWorkspaces> # create the Docker workspaces directory if it is absent, share it with group dev, then set it for every user of this host (shared $CONFIG_PATH/odocker.env); idempotent #
 {
   # The verb that is allowed to CREATE. `workspace.set` deliberately rejects a
   # missing directory (below) so a typo cannot silently persist a path that is
@@ -52,9 +52,11 @@ odocker.workspace.init()     # <?path:$(oo mode.base.get)/../DockerWorkspaces> #
   # which is what makes this method safe to re-run. Its status IS checked: an
   # unwritable parent has to fail here, loudly, rather than fall through to
   # workspace.set and be reported as "Directory not found".
-  if ! mkdir -p "$path" 2>/dev/null; then
-    error.log "odocker.workspace.init: cannot create $path — is its parent writable?"
-    create.result 1 "cannot create $path" "$1"
+  local mkdirErr
+  if ! mkdirErr=$(mkdir -p "$path" 2>&1); then
+    mkdirErr="${mkdirErr##*: }"
+    error.log "odocker.workspace.init: cannot create $path: $mkdirErr"
+    create.result 1 "cannot create $path: $mkdirErr" "$1"
     return $(result)
   fi
 
@@ -67,6 +69,10 @@ odocker.workspace.init()     # <?path:$(oo mode.base.get)/../DockerWorkspaces> #
     create.result "$rc" "created $path but could not set it" "$1"
     return $(result)
   fi
+  # The root is for every user of the host: share it with group dev here, once,
+  # for every caller (install, seed, a bare init). A failure is a warning — the
+  # root exists and is set.
+  private.this.folder.share "$ODOCKER_WORKSPACES" >/dev/null || warn.log "odocker.workspace.init: $RESULT"
   create.result 0 "workspace directory set to: $ODOCKER_WORKSPACES" "$1"
   return $(result)
 }
@@ -133,6 +139,8 @@ odocker.workspace.seed()     # <from> <?path:$(oo mode.base.get)/../DockerWorksp
    create.result 1 "could not seed $path: $RESULT"
    return $(result)
  fi
+ # init shared the still empty root; the copy came after it, so share again —
+ # the copied entries need group dev too.
  private.this.folder.share "$path" >/dev/null || warn.log "odocker.workspace.seed: $RESULT"
  success.log "Docker workspaces root: $path (seeded from $from)"
  create.result 0 "seeded $path from $from" "$1"
@@ -269,6 +277,14 @@ private.odocker.socket.access.ensure()     # <?socket:/var/run/docker.sock> # ma
 }
 
 
+private.odocker.env.chained()     #  # rc 0 when $CONFIG_PATH/user.env chains odocker.env with the exact line config add writes (the dot form, or the legacy source form); a comment or another file that merely mentions odocker.env does not count #
+{
+ # A predicate (rc only, no create.result). Whole-line match: a grep for the
+ # bare name also matched a comment, and the chain was then never written.
+ grep -qxF -e '. $CONFIG_PATH/odocker.env' -e 'source $CONFIG_PATH/odocker.env' "$CONFIG_PATH/user.env" 2>/dev/null
+}
+
+
 private.odocker.workspaces.install()     # <?path> # give this host its Docker workspaces root and the shared odocker.env that names it: keep an existing value, else create <path> (default beside the Once.sh base), share it with group dev and set it; idempotent #
 {
  # Every install writes odocker.env (2026-10-05): only `odocker workspace.set`
@@ -278,12 +294,11 @@ private.odocker.workspaces.install()     # <?path> # give this host its Docker w
  # own failure is the answer (T-ODOCKER-WORKSPACES-INSTALL).
  local path="$1"
  if [ -z "$path" ] && grep -q '^export ODOCKER_WORKSPACES=' "$CONFIG_PATH/odocker.env" 2>/dev/null; then
-   grep -q 'odocker\.env' "$CONFIG_PATH/user.env" 2>/dev/null || config add odocker
+   private.odocker.env.chained || config add odocker
    create.result 0 "kept: $CONFIG_PATH/odocker.env"
    return $(result)
  fi
  odocker.workspace.init "$path" >/dev/null || return $(result)
- private.this.folder.share "$ODOCKER_WORKSPACES" >/dev/null || warn.log "$RESULT"
  create.result 0 "$ODOCKER_WORKSPACES"
  return $(result)
 }
@@ -910,7 +925,7 @@ odocker.workspace.get() # <?path:$ODOCKER_WORKSPACES> # report the Docker worksp
 }
 odocker.workspace.get.completion.path() { compgen -d "$1"; }
 
-odocker.workspace.set() # <?path:$(oo mode.base.get)/../DockerWorkspaces> # set Docker workspaces directory (persists to $CONFIG_PATH/odocker.env)
+odocker.workspace.set() # <?path:$(oo mode.base.get)/../DockerWorkspaces> # set Docker workspaces directory for every user of this host (shared $CONFIG_PATH/odocker.env, persisted there)
 {
   local path="$1"
   # No arg → fall back to the default beside the Once.sh components base
@@ -919,13 +934,15 @@ odocker.workspace.set() # <?path:$(oo mode.base.get)/../DockerWorkspaces> # set 
   if [ -z "$path" ]; then
     if ! path=$(private.odocker.workspaces.default.get); then
       error.log "odocker.workspace.set: no Once.sh components base (oo mode.base.get) — give the path explicitly"
-      return 1
+      create.result 4 "no default path"
+      return $(result)
     fi
     info.log "No path given — using default: $path"
   fi
   if [ ! -d "$path" ]; then
     error.log "Directory not found: $path"
-    return 1
+    create.result 1 "Directory not found: $path"
+    return $(result)
   fi
 
   # Canonicalize: a relative path (e.g. "./workspaces") would otherwise be
@@ -933,6 +950,15 @@ odocker.workspace.set() # <?path:$(oo mode.base.get)/../DockerWorkspaces> # set 
   # Uses the oosh primitive — see this.absolutePath in this.
   this.absolutePath "$path"
   path="$RESULT"
+
+  # $CONFIG_PATH is the SHARED config: a different root replaces it for every
+  # user of this host. The old value is read from the file in a subshell (pure
+  # data), not from the env var, which may already be exported.
+  local old
+  old=$( unset ODOCKER_WORKSPACES; . "$CONFIG_PATH/odocker.env" 2>/dev/null; echo "$ODOCKER_WORKSPACES" )
+  if [ -n "$old" ] && [ "$old" != "$path" ]; then
+    warn.log "odocker.workspace.set: replacing the Docker workspaces root for every user of this host: $old → $path"
+  fi
 
   export ODOCKER_WORKSPACES="$path"
 
@@ -959,11 +985,11 @@ odocker.workspace.set() # <?path:$(oo mode.base.get)/../DockerWorkspaces> # set 
     create.result 1 "could not save $CONFIG_PATH/odocker.env (config save odocker ODOCKER)"; error.log "$RESULT"
     return $(result)
   fi
-  if ! grep -q "odocker\.env" "$CONFIG_PATH/user.env" 2>/dev/null && ! config add odocker; then
+  if ! private.odocker.env.chained && ! config add odocker; then
     create.result 1 "saved $CONFIG_PATH/odocker.env, but could not chain it in user.env (config add odocker)"; error.log "$RESULT"
     return $(result)
   fi
-  config unset ODOCKER_WORKSPACES
+  config unset ODOCKER_WORKSPACES || warn.log "odocker.workspace.set: could not remove the legacy ODOCKER_WORKSPACES from user.env (config unset)"
 
   success.log "Workspace directory set to: $path"
   info.log   "  persisted in: \$CONFIG_PATH/odocker.env"
