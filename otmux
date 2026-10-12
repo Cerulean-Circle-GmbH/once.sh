@@ -1746,22 +1746,18 @@ otmux.send.key.completion.key() {
   echo "Enter"
 }
 
-otmux.composer.state() # <pane> # semantic composer input state: empty | ghost | staged — the dim-ESC[2m ghost-suggestion test lives INSIDE otmux; the caller gets the STATE, never raw ANSI (radical-OOP)
+private.otmux.composer.read() # <target> # INTERNAL (target already resolved): echo "<state>\t<text>" — state=empty|ghost|staged, text=clean staged glyphs (empty for empty/ghost). The DRY source for composer.state AND the send composer-guard.
 {
-  local target=$(private.resolve.target "$1")
-  if ! private.otmux.target.isPane "$target"; then
-    error.log "otmux.composer.state: invalid pane target '$target'"
-    return 1
-  fi
+  local target="$1"
   # Capture WITH escapes (-e) so the dim (ESC[2m) ghost suggestion is visible to
-  # THIS method only. The caller never parses ANSI — it receives the semantic state.
+  # THIS method only. Callers receive the semantic state (+clean text), never raw ANSI.
   local cap
   cap=$($TMUX_CMD capture-pane -e -p -t "$target" 2>/dev/null)
   # Composer input line = the LAST line carrying the ❯ prompt marker (the live composer
   # sits at the bottom; a ❯ in scrollback above is ignored).
   local promptLine
   promptLine=$(printf '%s\n' "$cap" | grep -F '❯' | tail -1)
-  [ -z "$promptLine" ] && { echo empty; return 0; }
+  [ -z "$promptLine" ] && { printf 'empty\t\n'; return 0; }
   # Input body = everything after the ❯ marker (still carrying escapes).
   local body="${promptLine#*❯}"
   local esc; esc=$(printf '\033')
@@ -1777,14 +1773,24 @@ otmux.composer.state() # <pane> # semantic composer input state: empty | ghost |
   glyphs=$(printf '%s' "$body" | sed -E "s/${esc}\[[0-9;]*m//g")
   glyphs="${glyphs#"${glyphs%%[![:space:]]*}"}"
   glyphs="${glyphs%"${glyphs##*[![:space:]]}"}"
-  [ -z "$glyphs" ] && { echo empty; return 0; }
+  [ -z "$glyphs" ] && { printf 'empty\t\n'; return 0; }
   # Non-empty: a dim (ESC[2m) run leading the input = a GHOST suggestion; plain text = STAGED.
   local lead="${body#"${body%%[![:space:]]*}"}"
   case "$lead" in
-    "${esc}[2m"*) echo ghost ;;
-    *) echo staged ;;
+    "${esc}[2m"*) printf 'ghost\t\n' ;;
+    *) printf 'staged\t%s\n' "$glyphs" ;;
   esac
   return 0
+}
+
+otmux.composer.state() # <pane> # semantic composer input state: empty | ghost | staged — the dim-ESC[2m ghost-suggestion test lives INSIDE otmux; the caller gets the STATE, never raw ANSI (radical-OOP)
+{
+  local target=$(private.resolve.target "$1")
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.composer.state: invalid pane target '$target'"
+    return 1
+  fi
+  private.otmux.composer.read "$target" | cut -f1
 }
 otmux.composer.state.completion.pane() { private.complete.panes; }
 
@@ -2011,35 +2017,30 @@ otmux.send() # <target> <text...> # smart send: auto-detects keys, /commands, te
   private.otmux.send.smart "$target" "$*"
 }
 
-private.otmux.send.smart() # <target> <text> # internal: accept-edits, prefix, verified send
+private.otmux.composer.clear() # <target> # clear accept-edits mode + input line (BLIND C-u). CALLER must already have guarded staged text (see send.smart). No-op for non-Claude panes.
+{
+  local target="$1"
+  private.otmux.pane.isClaudeCode "$target" || return 0
+  # Step 1a: Detect accept-edits mode and clear it (Claude Code panes only)
+  local capture
+  capture=$($TMUX_CMD capture-pane -t "$target" -p -S -5 2>/dev/null)
+  if echo "$capture" | grep -q '⏵⏵ accept'; then
+    info.log "Accept-edits detected on $target — clearing"
+    $TMUX_CMD send-keys -t "$target" Enter
+    sleep 0.5
+    $TMUX_CMD send-keys -t "$target" BTab
+    sleep 0.3
+    $TMUX_CMD send-keys -t "$target" BTab
+    sleep 0.5
+  fi
+  # Step 1b: Clear input line
+  $TMUX_CMD send-keys -t "$target" C-u
+}
+
+private.otmux.send.deliver() # <target> <text> # internal: add sender prefix (Claude targets, skip /commands), verified send, Enter-retry fallback
 {
   local target="$1"
   local text="$2"
-
-  # Tron P0 defense-in-depth: never send a prefix-only message (caller-side
-  # empty payload should be rejected at otmux.send, but smart can be entered
-  # directly from internal paths — guard here too via shared this.isEmpty).
-  if this.isEmpty "$text"; then
-    debug.log "send.smart: empty/whitespace-only text — silent no-op (target=$target)"
-    return 0
-  fi
-
-  # Step 1: Detect accept-edits mode and clear it (Claude Code panes only)
-  if private.otmux.pane.isClaudeCode "$target"; then
-    local capture
-    capture=$($TMUX_CMD capture-pane -t "$target" -p -S -5 2>/dev/null)
-    if echo "$capture" | grep -q '⏵⏵ accept'; then
-      info.log "Accept-edits detected on $target — clearing"
-      $TMUX_CMD send-keys -t "$target" Enter
-      sleep 0.5
-      $TMUX_CMD send-keys -t "$target" BTab
-      sleep 0.3
-      $TMUX_CMD send-keys -t "$target" BTab
-      sleep 0.5
-    fi
-    # Clear input line
-    $TMUX_CMD send-keys -t "$target" C-u
-  fi
 
   # Step 2: Add sender prefix (Claude Code targets only, skip /commands)
   if private.otmux.pane.isClaudeCode "$target" && [[ "$text" != /* ]]; then
@@ -2070,6 +2071,57 @@ private.otmux.send.smart() # <target> <text> # internal: accept-edits, prefix, v
 
   warn.log "send: message may have been consumed by $target — verify manually"
   return 0
+}
+
+private.otmux.send.smart() # <target> <text> # internal: COMPOSER-GUARD (refuse on staged), clear, prefix, verified send
+{
+  local target="$1"
+  local text="$2"
+
+  # Tron P0 defense-in-depth: never send a prefix-only message (caller-side
+  # empty payload should be rejected at otmux.send, but smart can be entered
+  # directly from internal paths — guard here too via shared this.isEmpty).
+  if this.isEmpty "$text"; then
+    debug.log "send.smart: empty/whitespace-only text — silent no-op (target=$target)"
+    return 0
+  fi
+
+  # COMPOSER GUARD (architect 19e0b959 / T-SEND-COMPOSER-GUARD): the blind C-u that clears
+  # the input line DESTROYS an agent's staged (typed-but-unsubmitted) composer text. Consult
+  # the semantic composer.state FIRST and REFUSE on staged — never destroy in-progress input.
+  # empty|ghost carry no real input -> safe to clear. send.clobber overrides intentionally.
+  if private.otmux.pane.isClaudeCode "$target"; then
+    local cstate ctext
+    IFS=$'\t' read -r cstate ctext < <(private.otmux.composer.read "$target")
+    if [ "$cstate" = "staged" ]; then
+      error.log "otmux.send: REFUSING $target — composer has STAGED text: '$ctext' — a blind C-u would destroy it. Use 'otmux send.clobber $target ...' to overwrite intentionally."
+      return 1
+    fi
+  fi
+
+  # Safe (empty|ghost|non-Claude): clear accept-edits + input line, then deliver.
+  private.otmux.composer.clear "$target"
+  private.otmux.send.deliver "$target" "$text"
+}
+
+otmux.send.clobber() # <target> <text...> # OVERRIDE send: force-clears the composer (blind C-u) even over STAGED text, then sends. Normal `otmux send` REFUSES on staged (T-SEND-COMPOSER-GUARD) — use this ONLY when overwriting is intended.
+{
+  local target=$(private.resolve.target "$1")
+  shift
+  if [ -z "$target" ]; then
+    error.log "usage: otmux send.clobber <target> <text...>"
+    return 1
+  fi
+  if this.isEmpty "$*"; then
+    debug.log "otmux.send.clobber: empty/whitespace-only payload — silent no-op (target=$target)"
+    return 0
+  fi
+  if ! private.otmux.target.isPane "$target"; then
+    error.log "otmux.send.clobber: invalid pane target '$target' — refusing to send"
+    return 1
+  fi
+  private.otmux.composer.clear "$target"
+  private.otmux.send.deliver "$target" "$*"
 }
 
 
