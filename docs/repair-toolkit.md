@@ -15,7 +15,7 @@ listed here run only when invoked.
 |---|---|---|
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
-| [`config init.shared`](config.md) | `sharedConfig` + `shared/dev` owned `root:dev` (top level), group `dev`, `g+w` | After cross-user perm drift, "Permission denied" on shared config writes, a `developking:dev` install |
+| [`config init.shared`](config.md) | `sharedConfig` owned `root:dev` (top level), group `dev`, recursively `g+w`; `shared/dev` top level only: `root:dev`, `g+ws` | After cross-user perm drift, "Permission denied" on shared config writes, a `developking:dev` install |
 | [`oo update`](oo.md#the-retired-login-drop-in) | removes the retired `/etc/oosh/boot` link and `/etc/profile.d/oosh.sh` drop-in (boot is gone; a shell starts from `~/config/user.env`) | A host installed before boot was removed still has them. May ask for the sudo password once |
 | [`ossh rights.fix`](ossh.md) | `~/.ssh` file modes (600 private, 644 public, 700 dirs) | After SSH client complains about world-readable keys |
 | [`ossh folder.fix [strict]`](ossh.md) | `~/.ssh` tree layout (WODA Host blocks, IdentityFile paths, GitHub Host) | After `ssh: Bad configuration option`, missing `2cuGitHub` alias, drag-in legacy artifacts |

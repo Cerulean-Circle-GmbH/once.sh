@@ -285,7 +285,7 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 | `~/config` symlink | `<user>:<user>` (NOT `<user>:dev`) | symlink |
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
 | `~/config` target (`…/sharedConfig/`) | `root:dev` (top level only; developking is an ordinary user) | `g+w`, SGID on the top level (state 31 `chmod g+s`) |
-| `<base>/shared/dev/` | `root:dev` | `g+w` |
+| `<base>/shared/dev/` | `root:dev` (top level only — `Workspaces/` holds every user's clones) | `g+w`, SGID on the top level |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
 | `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`: **every** `OOSH_*` variable, a value under the saving user's home written `"$HOME/…"` (the config is shared). Only `OOSH_BRANCH` is left out — install input, not state. |
 | `user.env` | **pure data** — the `CONFIG_*` anchors, `BASH_FILE`, then `. $CONFIG_PATH/oosh.env` and `. $CONFIG_PATH/log.env`, last `. $HOME/.config/oosh/user.session.env` | written by `config save` — what `.bashrc` and `source this` start a shell from (the MacStudio model); see *Saving Configuration* below. |
@@ -312,15 +312,19 @@ sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_
 #### `config.init.shared`
 Finds the shared tree under `user get basehome root` (never through
 developking's home; a missing tree is rc 1, "shared tree missing at
-<base>/shared — run ossh install"). Ensures `sharedConfig/` and
-`<base>/shared/dev/` (when present) are owned `root:dev` at the top level
-(not recursive — files keep their writers), have group `dev`, recursively
-`g+w`, and removes any self-referential symlink at
-`sharedConfig/sharedConfig`. This is how a machine installed with
-`developking:dev` is repaired — developking is an ordinary user. The owner
-step uses sudo only when the caller is not root and the owner is wrong, and
-never in a test run (`OOSH_NO_INSTALL`); when it cannot, the method answers
-rc 1 and says `run: sudo config init.shared`. Idempotent.
+<base>/shared — run ossh install"). Ensures `sharedConfig/` is owned
+`root:dev` at the top level (not recursive — files keep their writers), has
+group `dev`, recursively `g+w`, and removes any self-referential symlink at
+`sharedConfig/sharedConfig`. `<base>/shared/dev/` (when present) is touched at
+its **top level only** — owner `root`, group `dev`, `g+ws`
+(`private.this.shared.top.ensure`); its `Workspaces/` hold every user's clones,
+which keep their own group and mode. Each of those steps runs only when it
+drifted, so on a repaired machine `shared/dev` needs no sudo. This is how a
+machine installed with `developking:dev` is repaired — developking is an
+ordinary user. The owner step uses sudo only when the caller is not root and
+the owner is wrong, and never in a test run (`OOSH_NO_INSTALL`); when it
+cannot, the method answers rc 1 and says `run: sudo config init.shared`.
+Idempotent.
 
 ```bash
 sudo config init.shared
