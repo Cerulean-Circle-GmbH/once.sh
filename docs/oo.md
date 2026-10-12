@@ -434,7 +434,8 @@ re-run out of band (e.g. a curl one-liner from the README) and
 clobbered the symlinks — `oo mode <TAB>` would otherwise show
 nothing. The heal is idempotent (no-op when symlinks are already
 canonical) and silenced during the pre-install bootstrap when
-`developking` doesn't yet exist. See
+the shared tree (`<base>/shared/EAMD.ucp`, base = `user get basehome root`)
+doesn't yet exist. See
 [Repair toolkit](repair-toolkit.md) for the full primitive set.
 
 ### oo.user.fix
