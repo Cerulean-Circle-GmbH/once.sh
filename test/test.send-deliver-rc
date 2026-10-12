@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# T-SEND-DELIVER-RC — RED-FIRST gate for #2 send.deliver OTR-1-rc honesty (expert request, PO greenlit).
+# BUG: private.otmux.send.deliver Step-4 (otmux:2103-2116) fires an extra Enter then RETURNS 0 even
+# when otmux.send.verified returned rc1 — MASKING a genuine non-submission (re-introduces #2's
+# false-rc0 via the deliver path). FIX (expert): propagate send.verified's rc; drop the redundant
+# Step-4 mask (OTR-1 send.verified ALREADY does bounded re-submit for claude panes).
+# ORACLE (deployed contract): SUBMITTED <=> composer.state != 'staged'. A WEDGED composer (Enter
+# never submits — a paste-chip that survives even OTR-1's bounded re-submit) => send.verified rc1
+# => otmux send / send.deliver MUST surface rc!=0, NOT a masked rc0.
+# SCENARIOS (expert): (a) wedged claude pane -> otmux send rc!=0 [RED: Step-4 masks->0];
+#   (b) normal submitted send -> rc0 unchanged; (c) non-claude delivery preserved (anchor).
+# FIXTURE: node Claude-TUI mock (reuses #1/#2 approach) + WEDGE=1 (Enter -> paste-chip, never submits).
+# Pane launched `exec -a claude node` so isClaudeCode=true and the claude OTR-1 path runs.
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level> (RED-FIRST — Step-4 false-rc0 mask must fail)"
+source this
+source test.suite
+source otmux >/dev/null 2>&1
+log.level $level
+export LOG_DEVICE=/dev/null
+HAVE_TMUX=0; [ -n "$TMUX" ] && HAVE_TMUX=1
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+submitted(){ case "$1" in staged) return 1;; *) return 0;; esac; }   # ORACLE: staged = NOT submitted
+
+FX_PREFIX="fxdrc_"
+GEN="${OOSH_DIR}/test/gen/t-send-deliver-rc"; MOCK="$GEN/mock.js"
+# Scratch-law: PRE-RUN sweep-by-prefix (EXIT trap skips SIGKILL) so fixtures never accumulate.
+sweep(){ tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${FX_PREFIX}" \
+           | while IFS= read -r s; do tmux kill-session -t "$s" 2>/dev/null; done; rm -rf "$GEN"; }
+trap sweep EXIT
+sweep
+
+if [ "$HAVE_TMUX" -ne 1 ] || ! command -v node >/dev/null 2>&1; then
+  test.case $level "T-SEND-DELIVER-RC (skipped — no tmux/node)" echo skip; expect.pass "skipped"
+  test.suite.save.results; return 0 2>/dev/null || exit 0
+fi
+
+mkdir -p "$GEN"
+cat > "$MOCK" <<'JS'
+let buf='', chip=false; const WEDGE=process.env.WEDGE==='1';
+process.stdin.setRawMode&&process.stdin.setRawMode(true); process.stdin.resume();
+function render(status){
+  process.stdout.write('\x1b[2J\x1b[H');
+  if(chip) process.stdout.write('❯ [Pasted text #1 +12 lines]\npaste again to expand\n');
+  else process.stdout.write('❯ '+buf+'\n');
+  if(status) process.stdout.write(status+'\n');
+}
+process.stdin.on('data',d=>{ const s=d.toString();
+  for(const ch of s){
+    if(ch==='\x15'){ buf=''; chip=false; }                       // C-u clear
+    else if(ch==='\r'||ch==='\n'){
+      if(WEDGE){ chip=true; render(''); }                        // WEDGE: Enter NEVER submits -> staged chip
+      else if(!chip && buf.length>=600){ chip=true; render(''); }// long 1st Enter -> chip
+      else { buf=''; chip=false; render('esc to interrupt'); }   // short / 2nd Enter -> submit
+    } else buf+=ch;
+  }
+  if(!/[\r\n]/.test(s)) render('');
+});
+render('');
+JS
+
+plant(){ local s="${FX_PREFIX}$1" wedge="$2"; tmux kill-session -t "$s" 2>/dev/null
+  tmux new-session -d -s "$s" -x 160 -y 14 2>/dev/null || { echo ""; return 1; }
+  # exec -a claude => argv0=claude => isClaudeCode true => the claude OTR-1 send path runs.
+  # WEDGE passed INLINE (set-environment would only affect future procs, not this exec).
+  tmux send-keys -t "$s" "WEDGE=${wedge:-0} exec -a claude node '$MOCK'" Enter
+  sleep 1.4; echo "${s}:0.0"; }
+state(){ otmux composer.state "$1" 2>/dev/null; }
+
+# PRECOND — the mock pane is claude-classified and starts with an empty composer.
+P=$(plant pre 0); pcs=$(state "$P")
+icc=no; private.otmux.pane.isClaudeCode "$P" 2>/dev/null && icc=yes
+test.case $level "PRECOND: mock pane isClaudeCode + composer empty at rest" echo "icc=$icc state=$pcs"
+{ [ "$icc" = yes ] && [ "$pcs" = empty ]; } && ok "isClaudeCode=$icc, composer empty" || no "precond: isClaudeCode=$icc composer=$pcs (fixture not claude-classified → OTR-1 path won't run)"
+
+echo; echo "===== ORACLE: a WEDGED composer => send.verified rc1 + stays staged ====="
+W=$(plant ora 1); otmux send.verified "$W" "oracle wedge order" >/dev/null 2>&1; vrc=$?; ws=$(state "$W")
+test.case $level "ORACLE: wedged composer -> send.verified rc1 AND composer stays staged (genuine non-submit)" echo "vrc=$vrc state=$ws"
+{ [ "$vrc" -ne 0 ] && ! submitted "$ws"; } && ok "send.verified honest rc1 + staged (ground truth: NOT submitted)" \
+  || no "oracle precond off: send.verified rc=$vrc state=$ws (need rc1+staged to gate the deliver mask)"
+
+echo; echo "===== (a) RED: otmux send on a WEDGED claude pane MUST return rc!=0 (not Step-4-masked 0) ====="
+A=$(plant a 1); otmux send "$A" "wedge via otmux send" >/dev/null 2>&1; arc=$?; as=$(state "$A")
+test.case $level "(a) otmux send -> rc!=0 when composer stays staged (honest non-submission)" echo "arc=$arc state=$as"
+if [ "$arc" -ne 0 ] && ! submitted "$as"; then
+  ok "HONEST: otmux send rc=$arc while staged ($as) — rc propagated"
+else
+  no "MASKED (RED): otmux send rc=$arc but composer is '$as' (staged=not-submitted) — Step-4 false-rc0 mask"
+fi
+
+echo; echo "===== (b) ANCHOR: normal send submits -> rc0 unchanged ====="
+B=$(plant b 0); otmux send "$B" "normal short order" >/dev/null 2>&1; brc=$?; bs=$(state "$B")
+test.case $level "(b) normal send -> rc0 + submitted (composer not staged)" echo "brc=$brc state=$bs"
+{ [ "$brc" -eq 0 ] && submitted "$bs"; } && ok "rc0 + submitted ($bs)" || no "(b) regressed: rc=$brc state=$bs"
+
+echo; echo "===== (c) ANCHOR: non-claude delivery preserved ====="
+C="${FX_PREFIX}c"; tmux kill-session -t "$C" 2>/dev/null; tmux new-session -d -s "$C" -x 160 -y 14 2>/dev/null
+tmux send-keys -t "$C" "PS1='oosh > '" Enter; sleep 0.5
+CMARK="deliverrc_$$_marker"
+otmux send "${C}:0.0" "echo $CMARK" >/dev/null 2>&1; crc=$?
+sleep 0.5; cvis=$(otmux pane.capture "${C}:0.0" 10 2>/dev/null | grep -c "$CMARK")
+tmux kill-session -t "$C" 2>/dev/null
+test.case $level "(c) non-claude send delivers the text (behavior preserved)" echo "crc=$crc vis=$cvis"
+{ [ "${cvis:-0}" -ge 1 ]; } && ok "non-claude delivery preserved (text visible, rc=$crc)" || no "(c) non-claude delivery changed: vis=$cvis rc=$crc"
+
+echo
+echo "=================================================================="
+echo "  T-SEND-DELIVER-RC  PASS=$pass FAIL=$fail"
+echo "  RED-FIRST: (a) must FAIL on current deployed (Step-4 masks send.verified rc1 -> rc0)."
+echo "  Expert FIX = propagate send.verified rc + drop Step-4 extra-Enter mask -> (a) GREEN."
+echo "=================================================================="
+test.suite.save.results
