@@ -434,7 +434,7 @@ re-run out of band (e.g. a curl one-liner from the README) and
 clobbered the symlinks — `oo mode <TAB>` would otherwise show
 nothing. The heal is idempotent (no-op when symlinks are already
 canonical) and silenced during the pre-install bootstrap when
-the shared tree (`<base>/shared/EAMD.ucp`, base = `user get basehome root`)
+the shared tree (`<base>/shared/EAMD.ucp`, base = `user get basehome root`, the system base: `$OOSH_USERS_BASEHOME`, `/Users` on macOS, `/home` else)
 doesn't yet exist. See
 [Repair toolkit](repair-toolkit.md) for the full primitive set.
 
@@ -445,7 +445,7 @@ canonical shared tree. Thin alias for [`config init.user`](config.md).
 
 ```bash
 oo user.fix              # repair this user (= $USER)
-oo user.fix developking  # repair another user (requires root)
+oo user.fix alice        # repair another user (requires root)
 ```
 
 Handles real-dir → symlink conversion (preserves originals as
@@ -707,7 +707,7 @@ States include:
 | 20 | user.rights.only | User-only installation |
 | 21-24 | user.* | User installation steps |
 | 30 | root.rights | Root installation |
-| 31 | root.shared.dev.folder.created | Shared tree, developking, dev repo |
+| 31 | root.shared.dev.folder.created | Shared tree (`root:dev`; base = `user get basehome root`), developking (ordinary user, via `user create`), dev repo |
 | 32 | root.dev.keys.installed | Deploy keys |
 | 33 | root.installation.done | root bashrc + login shell |
 | 34 | root.boot.path.installed | removes the retired login drop-in (see [The retired login drop-in](#the-retired-login-drop-in)) |
