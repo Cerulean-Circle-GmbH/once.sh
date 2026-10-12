@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# T-SEND-SUBMIT-OTR1 — RED-FIRST gate for the send SUBMISSION-verify + send.submit fix
+# (architect f5911d54 + d75b3f72; bug 9fd85fbc). Scenario-first: FAILS on current deployed /root/oosh.
+#
+# BUG: otmux.send.verified (~1876-1878) returns rc0 on "pane changed -> text likely processed" =
+# verifies APPEARANCE, not SUBMISSION -> FALSE-POSITIVE when a msg appears but sits UNSUBMITTED
+# (paste-chip / BUG10): a capture shows the text, the order never arrives.
+#
+# ORACLE (expert): SUBMITTED  <=>  otmux.composer.state == empty  (composer cleared after the turn).
+# ARCHITECT RULING: send.raw stays PURE; UPGRADE send.verified to verify SUBMISSION + bounded
+# re-Enter retry (rc!=0 if it can't submit — never a false rc0); add submit-only verb send.submit
+# (== a bare send.tui Enter: NO C-u pre-clear, NO Escape); reject a parallel send verb / flag-on-raw.
+#
+# SCENARIOS (expert recipe a-d):
+#  (a) OTR-1: after send.verified the composer ends EMPTY (submitted); a msg that appears-but-stays-
+#      staged must drive bounded re-Enter then rc!=0 — NEVER a false rc0 while still staged.   [RED now]
+#  (b) send.submit EXISTS (type -t=function), submit-only (no C-u, no Escape in body).          [RED now]
+#  (c) RETRAIN: send.raw stage 'foo' (no submit) + send.submit -> 'foo' submitted (empty).      [RED now]
+#  (d) send.raw stays PURE (no submission/chip logic added).                                    [anchor]
+#
+# FIXTURE: node Claude-TUI mock (reuses the #1 node composer-state approach). A short input + Enter
+# submits (composer.state->empty); a LONG single-burst (>=600c) + Enter collapses to an UNSUBMITTED
+# paste chip (composer.state stays 'staged') — this is the ONLY way to reproduce "appears but staged"
+# (a plain readline always submits on Enter, so it can't exhibit the false-positive). send.submit ==
+# bare send.tui Enter. pane_current_command=node => isClaudeCode true.
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level> (RED-FIRST — (a) false-positive + (b)/(c) absent must fail)"
+source this
+source test.suite
+source otmux >/dev/null 2>&1
+log.level $level
+HAVE_TMUX=0; [ -n "$TMUX" ] && HAVE_TMUX=1
+
+GEN="${OOSH_DIR}/test/gen/t-send-submit-otr1"; MOCK="${GEN}/mock.js"   # scratch-law: component, fixed name
+FX_PREFIX="fxo_"
+sweep_fixtures(){ tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${FX_PREFIX}" \
+  | while IFS= read -r s; do tmux kill-session -t "$s" 2>/dev/null; done; }
+trap sweep_fixtures EXIT
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+
+sweep_fixtures                       # PRE-RUN sweep (survives SIGKILL)
+mkdir -p "$GEN" 2>/dev/null
+
+if [ "$HAVE_TMUX" -ne 1 ] || ! command -v node >/dev/null 2>&1; then
+  test.case $level "T-SEND-SUBMIT-OTR1 (skipped — no tmux/node)" echo skip; expect.pass "skipped"
+  test.suite.save.results; return 0 2>/dev/null || exit 0
+fi
+
+cat > "$MOCK" <<'JS'
+let buf='', chip=false;
+process.stdin.setRawMode&&process.stdin.setRawMode(true); process.stdin.resume();
+function render(status){
+  process.stdout.write('\x1b[2J\x1b[H');
+  process.stdout.write('❯ '+(chip?'[Pasted text #1 +12 lines]':buf)+'\n');
+  if(chip) process.stdout.write('paste again to expand\n');
+  if(status) process.stdout.write(status+'\n');
+}
+process.stdin.on('data',d=>{ const s=d.toString();
+  for(const ch of s){
+    if(ch==='\x15'){ buf=''; chip=false; }                       // C-u clears
+    else if(ch==='\r'||ch==='\n'){
+      if(!chip && buf.length>=600){ chip=true; render(''); }     // long 1st Enter -> chip (NOT submitted)
+      else { buf=''; chip=false; render('esc to interrupt'); }   // short / 2nd Enter -> submit (empty)
+    } else buf+=ch;
+  }
+  if(!/[\r\n]/.test(s)) render('');
+});
+render('');
+JS
+
+plant(){ local s="${FX_PREFIX}$1"; tmux kill-session -t "$s" 2>/dev/null
+  tmux new-session -d -s "$s" -x 160 -y 14 2>/dev/null || { echo ""; return 1; }
+  tmux send-keys -t "$s" "node '$MOCK'" Enter; sleep 1.3; echo "${s}:0.0"; }
+state(){ otmux composer.state "$1" 2>/dev/null; }
+
+echo; echo "===== PRECOND: isClaudeCode node fixture, composer.state oracle live ====="
+P=$(plant pre); cmd=$(tmux display-message -t "$P" -p '#{pane_current_command}' 2>/dev/null)
+test.case $level "PRECOND: node pane + composer.state empty at rest" echo "$cmd/$(state "$P")"
+{ [ "$cmd" = node ] && [ "$(state "$P")" = empty ]; } && ok "isClaudeCode node, composer empty" || no "precond bad: cmd=$cmd state=$(state "$P")"
+
+echo; echo "===== (a) OTR-1 SUBMISSION — composer ends EMPTY; no false rc0 while staged [RED now] ====="
+# a1 short (anchor): submits
+P=$(plant a1); otmux send.verified "$P" "short order foo" >/dev/null 2>&1; a1rc=$?; a1s=$(state "$P")
+test.case $level "a1: short send.verified -> composer EMPTY (submitted)" echo "rc=$a1rc st=$a1s"
+[ "$a1s" = empty ] && ok "short submitted (composer empty)" || no "short not submitted: state=$a1s"
+# a2 long: the false-positive — appears but stays staged; current rc0 => RED
+P=$(plant a2); LONG=$(printf 'X%.0s' $(seq 1 800))
+otmux send.verified "$P" "$LONG" >/dev/null 2>&1; a2rc=$?; a2s=$(state "$P")
+echo "  long: rc=$a2rc composer.state=$a2s"
+test.case $level "a2-SUBMIT: long send.verified -> composer EMPTY (bounded re-Enter submitted it)" echo "$a2s"
+[ "$a2s" = empty ] && ok "long submitted" || no "long STAYED '$a2s' (paste chip, never submitted) — RED"
+test.case $level "a2-NO-FALSE-POS: NOT(rc0 while still staged)" echo "rc=$a2rc st=$a2s"
+{ [ "$a2rc" -eq 0 ] && [ "$a2s" != empty ]; } && no "FALSE-POSITIVE (RED): rc0 while composer still '$a2s' — appearance passed as submission" \
+  || ok "no false rc0 (rc=$a2rc, state=$a2s)"
+
+echo; echo "===== (b) send.submit EXISTS + submit-only (no C-u, no Escape) [RED now] ====="
+has=$(type -t otmux.send.submit 2>/dev/null)
+test.case $level "b-EXISTS: otmux.send.submit is a function" echo "$has"
+[ "$has" = function ] && ok "send.submit defined" || no "send.submit ABSENT (RED — new verb not implemented)"
+if [ "$has" = function ]; then
+  body=$(sed -n '/^otmux.send.submit()/,/^}/p' "$OOSH_DIR/otmux")
+  test.case $level "b-PURE: send.submit body has NO C-u and NO Escape (submit-only)" echo checking
+  echo "$body" | grep -qiE 'C-u|Escape|BTab' && no "send.submit does destructive pre-clear (C-u/Escape) — not submit-only" \
+    || ok "send.submit is submit-only (bare Enter, no C-u/Escape)"
+else
+  test.case $level "b-PURE: (skipped — send.submit absent)" echo skip; no "send.submit absent → cannot be submit-only (RED)"
+fi
+
+echo; echo "===== (c) RETRAIN: send.raw stage 'foo' (no submit) + send.submit -> submitted [RED now] ====="
+P=$(plant c)
+otmux send.raw "$P" "foo" >/dev/null 2>&1; sleep 0.4; cPre=$(state "$P")
+otmux send.submit "$P" >/dev/null 2>&1; cRC=$?; sleep 0.4; cPost=$(state "$P")
+echo "  staged=$cPre  send.submit.rc=$cRC  post=$cPost"
+test.case $level "c-STAGE: send.raw 'foo' leaves it staged" echo "$cPre"
+[ "$cPre" = staged ] && ok "send.raw staged 'foo' (pure, no submit)" || no "send.raw did not leave staged: $cPre"
+test.case $level "c-SUBMIT: send.submit submits the staged text (composer empties)" echo "$cPost"
+[ "$cPost" = empty ] && ok "send.submit submitted the staged text" || no "send.submit did not submit (post=$cPost) — RED (verb absent/broken)"
+
+echo; echo "===== (d) send.raw stays PURE (no submission/chip logic) [invariant anchor] ====="
+RAW=$(sed -n '/^otmux.send.raw()/,/^}/p' "$OOSH_DIR/otmux")
+test.case $level "d: send.raw body has no submission-verify/chip-retry" echo checking
+echo "$RAW" | grep -qiE 'paste again|chip|composer.state|re-?enter|submit' \
+  && no "send.raw gained submission logic — violates pure-raw ruling" \
+  || ok "send.raw stays pure-raw"
+
+echo
+echo "=================================================================="
+echo "  T-SEND-SUBMIT-OTR1  PASS=$pass FAIL=$fail  (RED-first: a2 + b + c must be RED on current code)"
+echo "=================================================================="
+sweep_fixtures
+test.suite.save.results
