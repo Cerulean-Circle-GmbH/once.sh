@@ -1027,13 +1027,53 @@ claudeCode.stop.completion.pane() {
 #   unknown — no pane, no Claude, no JSONL match
 # ─────────────────────────────────────────────────────────────────────────────
 
-private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customTitle>" — single non-invasive source of truth
+private.claudeCode.session.jsonl.scan() # # ONE-pass over ~/.claude/projects/*/*.jsonl -> "uuid|lastTitle|cwd|mtime" per file. The shared scan that BOTH session.discover (per-pane) and session.discover.all (batch) rank against -> agree-by-construction (architect d354bf63). Expensive step done ONCE for a batch.
+{
+  local f uuid lastTitle cwd m
+  for f in "$HOME/.claude/projects"/*/*.jsonl; do
+    [ -f "$f" ] || continue
+    # Last customTitle = the session's CURRENT identity (JSONLs accumulate one per /rename;
+    # only the final one is current).
+    lastTitle=$(grep -o '"customTitle":"[^"]*"' "$f" 2>/dev/null | tail -1 | sed 's/.*":"//;s/"$//')
+    [ -z "$lastTitle" ] && continue
+    uuid=$(basename "$f" .jsonl)
+    # cwd disambiguator — first line usually carries "cwd":"/path"
+    cwd=$(head -1 "$f" 2>/dev/null | grep -o '"cwd":"[^"]*"' | head -1 | sed 's/.*":"//;s/"$//')
+    m=$(stat -c %Y "$f" 2>/dev/null); [ -z "$m" ] && m=$(stat -f %m "$f" 2>/dev/null)
+    [ -z "$m" ] && continue
+    printf '%s|%s|%s|%s\n' "$uuid" "$lastTitle" "$cwd" "$m"
+  done
+}
+
+private.claudeCode.session.rank() # <cleanTitle> <paneCwd> # read scan table on STDIN -> "bestUuid|bestMtime". Ranks ROLE-match (strip @host) -> cwd-match -> mtime, SAME order/precedence as the legacy per-pane loop. Empty cleanTitle or no match -> "|0" + rc1.
+{
+  local cleanTitle="$1" paneCwd="$2"
+  local bestUuid="" bestMtime=0 bestCwdMatch=0
+  local uuid lastTitle cwd m cwdMatch
+  [ -z "$cleanTitle" ] && { printf '|0\n'; return 1; }
+  while IFS='|' read -r uuid lastTitle cwd m; do
+    [ -z "$lastTitle" ] && continue
+    # Correlate on ROLE (identity), not the @host-qualified title — @host is a LOCATION
+    # qualifier (role-strip is a SUPERSET of exact match).
+    [ "${lastTitle%%@*}" = "${cleanTitle%%@*}" ] || continue
+    cwdMatch=0
+    [ -n "$paneCwd" ] && [ "$cwd" = "$paneCwd" ] && cwdMatch=1
+    [ -z "$m" ] && continue
+    # Rank: cwd-match first, then mtime (ties keep first-seen = scan/glob order, as before).
+    if [ "$cwdMatch" -gt "$bestCwdMatch" ] || { [ "$cwdMatch" -eq "$bestCwdMatch" ] && [ "$m" -gt "$bestMtime" ]; }; then
+      bestCwdMatch="$cwdMatch"
+      bestMtime="$m"
+      bestUuid="$uuid"
+    fi
+  done
+  printf '%s|%s\n' "$bestUuid" "$bestMtime"
+  [ -n "$bestUuid" ] && return 0 || return 1
+}
+
+private.claudeCode.session.resolve() # <pane> (scan table on STDIN) # SHARED per-pane resolve -> "<uuid>|<state>|<cleanTitle>". Called by BOTH session.discover and session.discover.all so batch == per-pane BY CONSTRUCTION (not by assertion).
 {
   local pane="$1"
-  [ -z "$pane" ] && return 1
-
-  # Pane must exist
-  otmux pane.get "$pane" '#{pane_id}' >/dev/null 2>&1 || { echo "||unknown"; return 1; }
+  local table; table=$(cat)
 
   # Strip spinner/accept-edits markers from pane title
   local title
@@ -1054,42 +1094,10 @@ private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customT
   local pid
   pid=$(claudeCode.process.find "$pane" 2>/dev/null)
 
-  # Find newest JSONL whose LATEST customTitle matches current pane title.
-  # Using the last customTitle (not any occurrence) is critical: JSONLs accumulate
-  # a new custom-title entry on every /rename, so a file may contain many historical
-  # titles. Only the final one reflects the session's current identity.
-  local bestUuid="" bestMtime=0 bestCwdMatch=0
-  local f uuid lastTitle cwdMatch m
-  if [ -n "$cleanTitle" ]; then
-    for f in "$HOME/.claude/projects"/*/*.jsonl; do
-      [ -f "$f" ] || continue
-      # Extract the last customTitle in this JSONL
-      lastTitle=$(grep -o '"customTitle":"[^"]*"' "$f" 2>/dev/null | tail -1 | sed 's/.*":"//;s/"$//')
-      [ -z "$lastTitle" ] && continue
-      # Correlate on ROLE (identity), not the full @host-qualified title. /rename
-      # may have stamped @<sshConfigHost> (e.g. ARON@WODA.prod) while the live pane
-      # title carries @<hostname-s> (ARON@v60211). @host is a LOCATION qualifier,
-      # not identity — an exact-title compare fails on that skew and forces the S2
-      # cache fallback below (defeats cache-immunity → breaks reconcile/I2b). Match
-      # the role portion; cwd + mtime rank the survivors. Role-strip is a SUPERSET
-      # of exact match (identical titles still match after stripping @host).
-      [ "${lastTitle%%@*}" = "${cleanTitle%%@*}" ] || continue
-      uuid=$(basename "$f" .jsonl)
-      # cwd disambiguator — first line usually has "cwd":"/path"
-      cwdMatch=0
-      if [ -n "$paneCwd" ] && head -1 "$f" 2>/dev/null | grep -q "\"cwd\":\"${paneCwd}\""; then
-        cwdMatch=1
-      fi
-      m=$(stat -c %Y "$f" 2>/dev/null); [ -z "$m" ] && m=$(stat -f %m "$f" 2>/dev/null)
-      [ -z "$m" ] && continue
-      # Rank: cwd-match first, then mtime
-      if [ "$cwdMatch" -gt "$bestCwdMatch" ] || { [ "$cwdMatch" -eq "$bestCwdMatch" ] && [ "$m" -gt "$bestMtime" ]; }; then
-        bestCwdMatch="$cwdMatch"
-        bestMtime="$m"
-        bestUuid="$uuid"
-      fi
-    done
-  fi
+  # Rank the shared scan: ROLE-match -> cwd -> mtime (the one ranking primitive).
+  local best bestUuid bestMtime
+  best=$(printf '%s\n' "$table" | private.claudeCode.session.rank "$cleanTitle" "$paneCwd")
+  bestUuid="${best%%|*}"; bestMtime="${best#*|}"
 
   # Classify
   local state="unknown"
@@ -1120,6 +1128,33 @@ private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customT
   echo "${bestUuid}|${state}|${cleanTitle}"
   [ -n "$bestUuid" ] && return 0 || return 1
 }
+
+private.claudeCode.session.discover() # <pane> # prints "<uuid>|<state>|<customTitle>" — single non-invasive source of truth. Now = one jsonl.scan piped through the shared resolve (BYTE-IDENTICAL to the legacy inline loop; same rank + classify + cache-fallback).
+{
+  local pane="$1"
+  [ -z "$pane" ] && return 1
+
+  # Pane must exist
+  otmux pane.get "$pane" '#{pane_id}' >/dev/null 2>&1 || { echo "||unknown"; return 1; }
+
+  private.claudeCode.session.jsonl.scan | private.claudeCode.session.resolve "$pane"
+}
+
+claudeCode.session.discover.all() # # BATCH resolve ALL tmux panes in ONE jsonl scan (pulse-perf, architect d354bf63). Emits "<pane>|<uuid>|<state>|<cleanTitle>" per resolvable pane. SAME ranking/classify as per-pane session.discover (both via session.resolve) -> batch == per-pane, incl fork/dup-uuid and dup-title (collision orthogonal: agreement still holds). Scan runs ONCE for the whole fleet instead of per-pane.
+{
+  local table
+  table=$(private.claudeCode.session.jsonl.scan)
+  local pane out
+  for pane in $(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null); do
+    out=$(printf '%s\n' "$table" | private.claudeCode.session.resolve "$pane") || continue
+    # Skip panes that did not resolve to a uuid (empty first field)
+    case "$out" in
+      "|"*) continue ;;
+    esac
+    printf '%s|%s\n' "$pane" "$out"
+  done
+}
+claudeCode.session.discover.all.completion.pane() { :; }
 
 claudeCode.session.current() # <pane> # print current session UUID (non-invasive); rc=1 when unresolvable
 {
