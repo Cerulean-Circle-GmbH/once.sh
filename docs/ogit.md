@@ -178,6 +178,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `commit.pick` | `<commit> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | cherry-pick `<commit>` onto the current branch of `<dir>` with `-x`; on a conflict rc 1, the pick stays in progress and RESULT names the conflicted paths |
 | `commit.pick.continue` | `<?asEmail> <?asName> <?dir:$OOSH_DIR>` | finish the pick in progress in `<dir>` after its conflicts are resolved and staged; keeps the picked message; `<asEmail>`/`<asName>` give a bot identity |
 | `commit.pick.abort` | `<?dir:$OOSH_DIR>` | abort the pick in progress in `<dir>`; the tree is back to what it was before the pick |
+| `commit.revert` | `<commit> <?mode:index> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | undo `<commit>` with the opposite change, history kept; mode `index` stages it (finish with `commit.create`), mode `commit` commits it as "Revert ..."; on a conflict rc 1, the revert stays in progress and RESULT names the conflicted paths |
 
 ### status
 
