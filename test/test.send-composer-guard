@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# T-SEND-COMPOSER-GUARD — RED-FIRST gate for the otmux.send composer-destruction fix
+# (PO-gated, architect 19e0b959). Scenario-first: FAILS on current deployed /root/oosh and
+# DEFINES the acceptance; expert codes to it; re-gate DEPLOYED-green after PO ff.
+#
+# BUG: private.otmux.send.smart Step 1 fires a BLIND `send-keys C-u` (otmux ~2044) for ANY
+# isClaudeCode pane → WIPES a staged composer. Fix must consult the deployed otmux.composer.state
+# (empty|ghost|staged) and REFUSE on staged (never blind-C-u), while still delivering on empty/ghost.
+#
+# SCENARIOS (expert recipe a-d):
+#  (a) STAGED  + otmux.send   → REFUSE (rc!=0) + staged text PRESERVED + error NAMES the staged text
+#  (b) EMPTY   + otmux.send   → delivers normally (rc0)
+#  (c) STAGED  + send.clobber → intentionally clears + sends (override verb; rc0)
+#  (d) GHOST   + otmux.send   → treated as safe/empty → delivers (rc0, NOT refused)
+# send.raw stays pure (C-u-free) — NOT gated here as changed.
+#
+# FIXTURE: a `node` readline with a "❯ " prompt — pane_current_command=node (isClaudeCode TRUE,
+# triggers the C-u path) AND renders "❯ <text>" so composer.state detects staged, AND the text is
+# in an editable readline so C-u actually WIPES it (verified: staged→C-u→empty). Ghost = node writing
+# a dim ESC[2m suggestion after ❯ (composer.state→ghost, verified).
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level> (RED-FIRST — current code MUST fail (a) and (c))"
+source this
+source test.suite
+source otmux >/dev/null 2>&1
+log.level $level
+
+HAVE_TMUX=0; [ -n "$TMUX" ] && HAVE_TMUX=1
+command -v node >/dev/null 2>&1 || { echo "node required for the isClaudeCode fixture"; }
+
+# SCRATCH-LOCATION LAW (TRON e53e4043): scratch under the component, FIXED name (never /tmp, never $$).
+GEN="${OOSH_DIR}/test/gen/t-send-composer-guard"
+SENDLOG="${GEN}/send.log"
+
+FX_PREFIX="fxg_"
+sweep_fixtures() {   # idempotent kill-by-prefix — survives a SIGKILL/timeout (EXIT trap does not)
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${FX_PREFIX}" \
+    | while IFS= read -r s; do tmux kill-session -t "$s" 2>/dev/null; done
+}
+NODE_RL='const rl=require("readline").createInterface({input:process.stdin,output:process.stdout,prompt:"❯ "});rl.prompt();rl.on("line",()=>rl.prompt());'
+NODE_GHOST='process.stdout.write("❯ \x1b[2mghost suggestion\x1b[0m");setInterval(()=>{},1e9);'
+
+plant_node() {   # <tag> <mode staged|empty|ghost> <?stagedText> → echoes pane target
+  local tag="$1" mode="$2" txt="$3"
+  local s="${FX_PREFIX}${tag}"
+  tmux kill-session -t "$s" 2>/dev/null
+  tmux new-session -d -s "$s" -x 120 -y 12 2>/dev/null || { echo ""; return 1; }
+  if [ "$mode" = "ghost" ]; then
+    tmux send-keys -t "$s" "node -e '$NODE_GHOST'" Enter
+  else
+    tmux send-keys -t "$s" "node -e '$NODE_RL'" Enter
+  fi
+  sleep 1.3
+  [ "$mode" = "staged" ] && { tmux send-keys -t "$s" "$txt"; sleep 0.4; }   # stage, NO Enter
+  echo "${s}:0.0"
+}
+cleanup() { sweep_fixtures; }
+trap cleanup EXIT
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+
+# PRE-RUN sweep (orphans never accumulate) + fixed-name scratch dir.
+sweep_fixtures
+mkdir -p "$GEN" 2>/dev/null
+
+if [ "$HAVE_TMUX" -ne 1 ]; then
+  test.case $level "T-SEND-COMPOSER-GUARD (skipped — no tmux)" echo skip; expect.pass "skipped"
+  test.suite.save.results; return 0 2>/dev/null || exit 0
+fi
+
+STAGED_MARK="STAGED_TEXT_c0ffee"
+
+echo; echo "===== (a) STAGED + otmux.send → MUST REFUSE + PRESERVE + NAME (current: RED) ====="
+P=$(plant_node a staged "$STAGED_MARK")
+pre=$(otmux composer.state "$P" 2>/dev/null)
+: > "$SENDLOG"
+LOG_DEVICE="$SENDLOG" otmux send "$P" "DELIVER_X" >/dev/null 2>&1; aRC=$?
+postState=$(otmux composer.state "$P" 2>/dev/null)
+nameHit=$(grep -c "$STAGED_MARK" "$SENDLOG" 2>/dev/null)
+echo "  pre=$pre  send.rc=$aRC  post=$postState  errNamesStaged=$nameHit"
+test.case $level "a-PRECOND: fixture composer is staged" echo "$pre"
+[ "$pre" = staged ] && ok "fixture staged (isClaudeCode node ❯)" || no "fixture not staged: '$pre'"
+test.case $level "a-REFUSE: otmux.send on STAGED returns rc!=0" echo "$aRC"
+[ "$aRC" -ne 0 ] && ok "refused (rc=$aRC)" || no "did NOT refuse (rc=0) — blind-send on staged (RED)"
+test.case $level "a-PRESERVE: staged text SURVIVES the send" echo "$postState"
+[ "$postState" = staged ] && ok "staged preserved" || no "staged WIPED (post='$postState') — C-u destroyed composer (RED)"
+test.case $level "a-NAME: error names the staged text" echo "$nameHit"
+[ "${nameHit:-0}" -ge 1 ] && ok "error names the preserved staged text" || no "no error naming the staged text (RED)"
+
+echo; echo "===== (b) EMPTY + otmux.send → delivers (rc0) [anchor] ====="
+P=$(plant_node b empty)
+pre=$(otmux composer.state "$P" 2>/dev/null)
+LOG_DEVICE="$SENDLOG" otmux send "$P" "DELIVER_Y" >/dev/null 2>&1; bRC=$?
+echo "  pre=$pre  send.rc=$bRC"
+test.case $level "b-DELIVER: empty composer → otmux.send rc0" echo "$bRC"
+{ [ "$pre" = empty ] && [ "$bRC" -eq 0 ]; } && ok "empty→delivered (rc0)" || no "empty-send rc=$bRC (pre=$pre)"
+
+echo; echo "===== (c) send.clobber + STAGED → intentionally clears + sends (override verb; current: RED) ====="
+P=$(plant_node c staged "$STAGED_MARK")
+has=$(type -t otmux.send.clobber 2>/dev/null)
+LOG_DEVICE="$SENDLOG" otmux send.clobber "$P" "DELIVER_Z" >/dev/null 2>&1; cRC=$?
+echo "  send.clobber defined='$has'  rc=$cRC"
+test.case $level "c-OVERRIDE: send.clobber exists AND clears+sends on staged (rc0)" echo "$cRC"
+{ [ "$has" = function ] && [ "$cRC" -eq 0 ]; } && ok "send.clobber overrode the guard + delivered" \
+  || no "send.clobber missing/failed (defined='$has' rc=$cRC) — override verb not implemented (RED)"
+
+echo; echo "===== (d) GHOST + otmux.send → treated safe → delivers (rc0, NOT refused) [anchor] ====="
+P=$(plant_node d ghost)
+pre=$(otmux composer.state "$P" 2>/dev/null)
+LOG_DEVICE="$SENDLOG" otmux send "$P" "DELIVER_G" >/dev/null 2>&1; dRC=$?
+echo "  pre=$pre  send.rc=$dRC"
+test.case $level "d-SAFE: ghost composer → otmux.send delivers (rc0), not refused" echo "$dRC"
+{ [ "$pre" = ghost ] && [ "$dRC" -eq 0 ]; } && ok "ghost treated safe → delivered (guard must NOT over-refuse)" \
+  || no "ghost-send rc=$dRC (pre=$pre) — ghost mis-handled"
+
+echo
+echo "=================================================================="
+echo "  T-SEND-COMPOSER-GUARD  PASS=$pass FAIL=$fail  (RED-first: (a)+(c) MUST be RED on current code)"
+echo "=================================================================="
+sweep_fixtures
+test.suite.save.results
