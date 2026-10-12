@@ -455,23 +455,36 @@ private.this.symlink.with.backup() { # <linkPath> <target> <ts> # ensure <linkPa
   return 0
 }
 
-private.ensure.sharedTree() { # <dir> # ensure <dir> is group dev, recursively g+w; drop self-loops
-  # Used by `config init.shared` to bring a tampered sharedConfig tree back to
-  # the canonical install layout. Strict mirror of the install in state 31 of oo
-  # (chown -R developking:dev + chmod -R g+w on $CONFIG_PATH) plus a
-  # corruption-fix that removes any self-referential symlink left over from
-  # `cp -r ~/config sharedConfig` in state 31 of oo when ~/config was already a
-  # symlink at copy time.
+private.ensure.sharedTree() { # <dir> <?owner> # ensure <dir> is group dev, recursively g+w; drop self-loops; with <owner>, the top level of <dir> is owned by <owner> (not recursive)
+  # Used by `config init.shared` to bring a tampered sharedConfig tree (and
+  # <base>/shared/dev) back to the canonical install layout. Mirror of the
+  # install in state 31 of oo (chown root:dev, non-recursive, + chmod g+s +
+  # chmod -R g+w on $CONFIG_PATH) plus a corruption-fix that removes any
+  # self-referential symlink left over from `cp -r ~/config sharedConfig` in
+  # state 31 of oo when ~/config was already a symlink at copy time.
   #
-  # NOTE: install does NOT set SGID 2775 on these dirs — see commented-out
-  # chmod 2775 in state 31 of oo. Group ownership is preserved at write-time by every writer
-  # calling `private.ensure.groupWrite`. Don't add SGID here.
+  # SGID: state 31 DOES set it on the top level of $CONFIG_PATH (chmod g+s) so
+  # new files there inherit group dev. This helper does not add SGID — nothing
+  # else here needs it: sharedConfig's writers keep the group by calling
+  # `private.ensure.groupWrite`, and private.this.folder.share adds setgid
+  # itself for the folders it shares.
   #
-  # Elevation: only sudo when the caller doesn't own the target (i.e. the real
-  # `sharedConfig/` dir typically owned developking:dev). Test fixtures and
-  # caller-owned dirs use the unprivileged path — important so the test-suite
-  # can run without an interactive sudo prompt.
-  local dir="$1"
+  # <owner> is OPT-IN. config.init.shared passes root: the shared folders are
+  # root:dev, and a machine installed with developking:dev (developking is an
+  # ordinary user) is repaired here (T-CONFIG-SHARED-TREE-OWNER). Called
+  # without it — private.this.folder.share, ogit.repo.share — the owner is never
+  # touched: those folders belong to the user who shares them. Only the top
+  # level changes owner; the files keep their writers
+  # (T-STATE-31-CHOWN-NOT-RECURSIVE). Without a dev group nothing is touched,
+  # the owner neither — root alone would lock a single-user install out.
+  #
+  # Elevation: chgrp/chmod use sudo only when the caller doesn't own the target
+  # (the real shared folders are root:dev). The owner step runs LAST, so a
+  # caller-owned dir is still the caller's for chgrp/chmod; it is
+  # private.this.path.owner.set, which calls nothing when the owner is already
+  # right and never escalates in a test run (OOSH_NO_INSTALL). Test fixtures
+  # and caller-owned dirs therefore never need an interactive sudo prompt.
+  local dir="$1" owner="$2"
   if [ -z "$dir" ] || [ ! -e "$dir" ]; then
     error.log "private.ensure.sharedTree: directory missing: ${RED}$dir${NORMAL}"
     return 1
@@ -501,6 +514,13 @@ private.ensure.sharedTree() { # <dir> # ensure <dir> is group dev, recursively g
   done
   $_sudo chgrp -R dev "$dir" 2>/dev/null
   $_sudo chmod -R g+w "$dir" 2>/dev/null
+  local _rc=$?
+  [ -n "$owner" ] || return $_rc
+  if ! private.this.path.owner.set "$dir" "$owner"; then
+    warn.log "private.ensure.sharedTree: $RESULT"
+    return 1
+  fi
+  return $_rc
 }
 
 this.functionExists() {
@@ -1343,6 +1363,40 @@ private.this.path.stat.get()     # <path> <field> # echo one stat field of the p
 }
 
 private.this.path.stat.get.completion.field() { echo owner; echo group; echo uid; echo gid; echo mode; }
+
+
+private.this.path.owner.set()     # <path> <owner> # make <owner> the owner of <path> itself, not recursive: nothing when it already is; root chowns directly, anyone else through $SUDO, never under OOSH_NO_INSTALL; rc 1 + RESULT when it cannot #
+{
+ # The shared folders are root:dev — developking is an ordinary user — and
+ # `config init.shared` repairs a machine installed with developking:dev
+ # through private.ensure.sharedTree, which calls this (T-THIS-PATH-OWNER-SET).
+ # Not recursive on purpose: the files keep their writers as owners
+ # (T-STATE-31-CHOWN-NOT-RECURSIVE).
+ # Elevation, in order: an owner already right is no call at all, so a repaired
+ # machine and a fixture the caller owns never reach sudo; root needs none; any
+ # other caller goes through $SUDO — except in a test run (OOSH_NO_INSTALL,
+ # exported by test.suite): a test escalates nothing, so a forgotten stub is a
+ # failure with a reason, never a password prompt or a real owner change.
+ local path="$1" owner="$2" current
+ if [ ! -e "$path" ]; then create.result 1 "no such path: $path"; return $(result); fi
+ if [ -z "$owner" ]; then create.result 1 "no owner given for $path"; return $(result); fi
+ current=$(private.this.path.stat.get "$path" owner)
+ if [ "$current" = "$owner" ]; then create.result 0 "$path is owned by $owner"; return $(result); fi
+ local _sudo=""
+ if [ "$(id -u)" != 0 ]; then
+   if [ -n "$OOSH_NO_INSTALL" ]; then
+     create.result 1 "$path is owned by $current, not $owner — that needs sudo, and a test run escalates nothing"
+     return $(result)
+   fi
+   _sudo="$SUDO"
+ fi
+ if ! $_sudo chown "$owner" "$path"; then
+   create.result 1 "could not make $owner the owner of $path"
+   return $(result)
+ fi
+ create.result 0 "$path is owned by $owner"
+ return $(result)
+}
 
 
 private.this.temp.dir.get()     # <?label:oosh> # echo the canonical path of a new private directory (mode 700) under TMPDIR, else /tmp, named after label; nothing and rc 1 when the label is not a plain name or none can be made #

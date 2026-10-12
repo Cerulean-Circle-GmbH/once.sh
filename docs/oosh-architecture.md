@@ -393,6 +393,7 @@ answer by rc):
 | `private.this.group.file.get` | echo the group file that last-resort append may write: `/etc/group`; nothing (rc 1) on macOS, where Directory Services ignores it |
 | `private.this.group.name.get <gid>` | echo the name of the group with number `<gid>`: getent where present, else `/etc/group`, dscl on macOS; nothing when there is none |
 | `private.this.path.stat.get <path> <owner\|group\|uid\|gid\|mode>` | echo one stat field of the path itself (a symlink not followed); GNU format first, else BSD, both from one table; nothing and rc 1 for a missing path or an unknown field |
+| `private.this.path.owner.set <path> <owner>` | make `<owner>` the owner of the path itself (not recursive): nothing when it already is; root chowns directly, anyone else through `$SUDO`, never under `OOSH_NO_INSTALL`; rc 1 + RESULT when it cannot |
 | `private.this.file.same <fileA> <fileB>` | rc 0 when both files exist with identical bytes: `cmp -s` where it exists, else an exact `od` byte dump of each (AlmaLinux minimal has no diffutils) |
 | `private.this.host.name.get <?form:full\|short>` | echo the host name: the `hostname` program when it exists, else bash's `$HOSTNAME`; `short` is up to the first dot |
 | `private.this.temp.dir.get <?label:oosh>` | echo the canonical path of a new private directory (mode 700) under `TMPDIR`, else `/tmp`; the caller removes it (tests use `test.suite.fixture.make`) |
