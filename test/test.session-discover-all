@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# T-SESSION-DISCOVER-ALL — RED-FIRST gate for #3 pulse-perf + (b) disambig
+# (architect d354bf63). Scenario-first: FAILS on current deployed /root/oosh, DEFINES acceptance.
+#
+# CURRENT: pulse resolve_jsonl (scrumMaster:638) is called PER-PANE @726 = N framework-loads (slow).
+# FIX: a shared one-pass private.claudeCode.session.jsonl.scan (uuid|lastTitle|cwd|mtime) + session.rank,
+# used by BOTH per-pane session.discover (claudeCode:1030) AND a NEW session.discover.all
+# (agree-by-construction). (b) disambig is FOLDED IN as PARITY+SCOPE: batch MUST agree with per-pane
+# even in dup-uuid(fork)/dup-title cases — gate AGREEMENT, not "never collides" (collision is orthogonal).
+#
+# SCENARIOS (expert recipe 1-4):
+#  (1) PARITY   : session.discover.all uuid for EVERY live pane == claudeCode session.current <pane>
+#                 (INCLUDING any rewound/fork dup-uuid pane) = batch == per-pane.            [RED: absent]
+#  (2) PERF     : session.discover.all resolves ALL panes in ONE pass / < 15s.                [RED: absent]
+#  (3) BYTE-ID  : existing per-pane session.current output UNCHANGED + stable.                [anchor]
+#  (4) SCOPE    : batch==per-pane EVEN with same-title/dup-uuid panes — gate agreement.       [RED: absent]
+# Current code RED on session.discover.all ABSENT + perf.
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level> (RED-FIRST — session.discover.all ABSENT must fail)"
+source this
+source test.suite
+source claudeCode >/dev/null 2>&1
+log.level $level
+HAVE_TMUX=0; [ -n "$TMUX" ] && HAVE_TMUX=1
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+
+TEAM="${DISCOVER_TEST_TEAM:-ooshTeam}"
+
+echo; echo "===== (0) EXISTS: session.discover.all is implemented [RED now] ====="
+HAS=$(type -t claudeCode.session.discover.all 2>/dev/null)
+[ -z "$HAS" ] && HAS=$(type -t private.claudeCode.session.discover.all 2>/dev/null)
+test.case $level "0-EXISTS: session.discover.all is a function" echo "$HAS"
+[ "$HAS" = function ] && ok "session.discover.all defined" || no "session.discover.all ABSENT (RED — new batch verb not implemented)"
+
+echo; echo "===== shared one-pass scanner (fix target) present? [RED now] ====="
+SCAN=$(grep -cE 'session.jsonl.scan|session.rank' "$OOSH_DIR/claudeCode")
+test.case $level "0-SCAN: private.claudeCode.session.jsonl.scan + session.rank exist" echo "$SCAN"
+[ "$SCAN" -gt 0 ] && ok "shared one-pass scanner present" || no "no shared scanner (RED — per-pane N-load path still the only one)"
+
+# Enumerate LIVE Claude panes on TEAM (session.current returns a uuid) — the parity oracle set.
+LIVE_PANES=""
+if [ "$HAVE_TMUX" -eq 1 ]; then
+  for addr in $(tmux list-panes -t "$TEAM" -F '#{window_index}.#{pane_index}' 2>/dev/null); do
+    u=$(claudeCode session.current "${TEAM}:${addr}" 2>/dev/null)
+    [ -n "$u" ] && [ "$u" != "unknown" ] && LIVE_PANES="$LIVE_PANES ${TEAM}:${addr}=${u}"
+  done
+fi
+echo "  live Claude panes on $TEAM: ${LIVE_PANES:-<none>}"
+
+echo; echo "===== (1)+(4) PARITY/SCOPE: batch discover.all == per-pane session.current, all live panes ====="
+test.case $level "1-PARITY: session.discover.all agrees with session.current for every live pane" echo "checking"
+if [ "$HAS" != function ]; then
+  no "cannot gate PARITY — session.discover.all ABSENT (RED; post-fix: batch must equal per-pane incl dup-uuid/dup-title)"
+else
+  BATCH=$(claudeCode session.discover.all 2>/dev/null)   # expect lines: <pane>|<uuid>|...
+  mism=""
+  for pu in $LIVE_PANES; do
+    p="${pu%=*}"; u="${pu#*=}"
+    bu=$(printf '%s\n' "$BATCH" | awk -F'|' -v p="$p" '$1==p{print $2; exit}')
+    [ "$bu" != "$u" ] && mism="$mism $p[batch='$bu' vs per-pane='$u']"
+  done
+  [ -z "$mism" ] && ok "batch==per-pane for all ${LIVE_PANES:+live} panes (disambig agree-by-construction)" \
+    || no "PARITY MISMATCH:$mism"
+fi
+# SCOPE visibility (no silent cap): report any same-UUID (fork) / same-title collisions in the live set.
+DUP=$(printf '%s\n' $LIVE_PANES | sed 's/.*=//' | sort | uniq -d | tr '\n' ' ')
+echo "  SCOPE: dup-UUID collisions in live set: ${DUP:-none present this run (parity still gated for any that appear)}"
+
+echo; echo "===== (2) PERF: session.discover.all resolves the fleet in ONE pass / <15s [RED now] ====="
+test.case $level "2-PERF: session.discover.all completes < 15s (one framework-load)" echo "checking"
+if [ "$HAS" != function ]; then
+  no "cannot gate PERF — session.discover.all ABSENT (RED; post-fix: one-pass <15s vs per-pane N-load loop)"
+else
+  t0=$SECONDS; claudeCode session.discover.all >/dev/null 2>&1; dt=$((SECONDS - t0))
+  echo "  discover.all elapsed=${dt}s"
+  [ "$dt" -lt 15 ] && ok "discover.all < 15s (${dt}s)" || no "discover.all too slow: ${dt}s"
+fi
+
+echo; echo "===== (3) BYTE-IDENTICAL: per-pane session.current UNCHANGED + stable [anchor] ====="
+SELF="${TEAM}:0.4"
+u1=$(claudeCode session.current "$SELF" 2>/dev/null); u2=$(claudeCode session.current "$SELF" 2>/dev/null)
+test.case $level "3-STABLE: session.current <self> non-empty + identical across calls" echo "$u1/$u2"
+{ [ -n "$u1" ] && [ "$u1" = "$u2" ]; } && ok "per-pane session.current stable ($u1)" || no "session.current unstable: '$u1' vs '$u2'"
+# Full byte-identical regression lives in test.session-id-fresh (run alongside; must stay green post-fix).
+test.case $level "3-REGRESSION-PRESENT: test.session-id-fresh exists as the byte-identical guard" echo "checking"
+[ -f "$OOSH_DIR/test/test.session-id-fresh" ] && ok "test.session-id-fresh present (run as the unchanged-output regression)" \
+  || no "test.session-id-fresh missing — no byte-identical regression"
+
+echo
+echo "=================================================================="
+echo "  T-SESSION-DISCOVER-ALL  PASS=$pass FAIL=$fail  (RED-first: EXISTS/SCAN/PARITY/PERF must be RED on current)"
+echo "=================================================================="
+test.suite.save.results
