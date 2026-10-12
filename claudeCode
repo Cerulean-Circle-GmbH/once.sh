@@ -1070,7 +1070,36 @@ private.claudeCode.session.rank() # <cleanTitle> <paneCwd> # read scan table on 
   [ -n "$bestUuid" ] && return 0 || return 1
 }
 
-private.claudeCode.session.resolve() # <pane> (scan table on STDIN) # SHARED per-pane resolve -> "<uuid>|<state>|<cleanTitle>". Called by BOTH session.discover and session.discover.all so batch == per-pane BY CONSTRUCTION (not by assertion).
+private.claudeCode.session.cmdline.uuid() # <pane> # CMDLINE GROUND-TRUTH (interim-lift): the --resume/--session-id uuid of the claude proc in <pane>'s pane_pid subtree. Immune to the title/cwd collapse of two same-title panes. Empty+rc1 if none (a FRESH claude with no resume arg, or a non-claude pane). Mirrors the gate's truth_uuid (BFS the subtree, match *claude*--resume*|*claude*--session-id*).
+{
+  local pane="$1" root
+  root=$(otmux pane.get "$pane" '#{pane_pid}' 2>/dev/null)
+  root=$(printf '%s' "$root" | tr -d '[:space:]')
+  [ -z "$root" ] && return 1
+  local psAll; psAll=$(ps -eo pid=,ppid=,args= 2>/dev/null)   # FRESH each call (panes spawn mid-run)
+  local frontier="$root" next line pid rest pp args uuid _i
+  for _i in 1 2 3 4 5 6 7 8; do
+    next=""
+    while IFS= read -r line; do
+      pid=${line%% *}; rest=${line#* }; pp=${rest%% *}
+      case " $frontier " in
+        *" $pp "*)
+          args=$(printf '%s' "$line" | cut -d' ' -f3-)
+          case "$args" in
+            *claude*--resume*|*claude*--session-id*)
+              uuid=$(printf '%s' "$args" | grep -oE -- '--(resume|session-id)[ =][0-9a-f-]{36}' | head -1 | grep -oE '[0-9a-f-]{36}')
+              [ -n "$uuid" ] && { echo "$uuid"; return 0; } ;;
+          esac
+          next="$next $pid" ;;
+      esac
+    done <<< "$psAll"
+    frontier="$next"
+    [ -z "$frontier" ] && break
+  done
+  return 1
+}
+
+private.claudeCode.session.resolve() # <pane> (scan table on STDIN) # SHARED per-pane resolve -> "<uuid>|<state>|<cleanTitle>". Called by BOTH session.discover and session.discover.all. TOP-TIER = cmdline ground-truth (--resume/--session-id) which DISAMBIGUATES two same-title+same-cwd panes (title/cwd rank cannot); a live-but-fresh claude -> UNIDENTIFIED (never title-collapse). Falls to the jsonl rank only for panes with NO live claude proc.
 {
   local pane="$1"
   local table; table=$(cat)
@@ -1093,6 +1122,31 @@ private.claudeCode.session.resolve() # <pane> (scan table on STDIN) # SHARED per
   # Claude process check
   local pid
   pid=$(claudeCode.process.find "$pane" 2>/dev/null)
+
+  # ── CMDLINE GROUND-TRUTH (interim-lift, oopPO) ─ a live claude proc's --resume/--session-id uuid
+  # IS the pane's identity, immune to the title/cwd collapse of two same-title panes. Resumed pane ->
+  # its cmdline uuid (authoritative). Fresh claude (no resume/session-id arg) -> UNIDENTIFIED (never
+  # mis-attribute to another same-title session). Non-claude panes (pid empty) fall to the jsonl rank.
+  if [ -n "$pid" ]; then
+    local cmdlineUuid
+    cmdlineUuid=$(private.claudeCode.session.cmdline.uuid "$pane")
+    if [ -n "$cmdlineUuid" ]; then
+      # Authoritative. State from the uuid's OWN jsonl mtime -> byte-identical classify for a
+      # resumed pane (cmdline uuid == the jsonl that would have ranked best when NOT colliding).
+      local cjl cm cstate="live" nowC
+      cjl=$(ls -1 "$HOME/.claude/projects"/*/"${cmdlineUuid}.jsonl" 2>/dev/null | head -1)
+      if [ -n "$cjl" ]; then
+        cm=$(stat -c %Y "$cjl" 2>/dev/null); [ -z "$cm" ] && cm=$(stat -f %m "$cjl" 2>/dev/null)
+        nowC=$(date +%s)
+        [ -n "$cm" ] && [ "$((nowC - cm))" -ge 120 ] && cstate="stable"
+      fi
+      echo "${cmdlineUuid}|${cstate}|${cleanTitle}"
+      return 0
+    fi
+    # Live claude but NO --resume/--session-id = FRESH -> UNIDENTIFIED (do NOT title-collapse).
+    echo "|unidentified|${cleanTitle}"
+    return 1
+  fi
 
   # Rank the shared scan: ROLE-match -> cwd -> mtime (the one ranking primitive).
   local best bestUuid bestMtime
