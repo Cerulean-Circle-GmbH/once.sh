@@ -318,16 +318,24 @@ group `dev`, recursively `g+w`, and removes any self-referential symlink at
 `sharedConfig/sharedConfig`. `<base>/shared/dev/` (when present) is touched at
 its **top level only** — owner `root`, group `dev`, `g+ws`
 (`private.this.shared.top.ensure`); its `Workspaces/` hold every user's clones,
-which keep their own group and mode. Each of those steps runs only when it
+which keep their own group and mode. The same holds for the `Once.sh/` base of
+the branch folders (`<base>/shared/EAMD.ucp/Components/…/Once.sh`): top level
+only, each branch folder keeps its owner. Each of those steps runs only when it
 drifted, so on a repaired machine `shared/dev` needs no sudo. This is how a
 machine installed with `developking:dev` is repaired — developking is an
 ordinary user. The owner step uses sudo only when the caller is not root and
 the owner is wrong, and never in a test run (`OOSH_NO_INSTALL`); when it
-cannot, the method answers rc 1 and says `run: sudo config init.shared`.
+cannot, the method answers rc 1 and says `run: sudo -i <root home>/oosh/config
+init.shared` — root's own `config` by its path, so everything it loads comes
+from root's own `~/oosh`, one branch. Plain `sudo config` finds nothing on Linux
+(sudo's `secure_path` has no `~/oosh`); and a `config` started from another
+folder loads root's `this`, from whatever branch root is on (Mac Studio,
+2026-10-13). When root's oosh is not on the branch you need, switch it first:
+`sudo -i ~root/oosh/oo mode <branch>`.
 Idempotent.
 
 ```bash
-sudo config init.shared
+sudo -i ~root/oosh/config init.shared
 ```
 
 #### `config.init.user [<username>]`
