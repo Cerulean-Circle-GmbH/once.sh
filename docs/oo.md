@@ -202,7 +202,8 @@ could really not be cloned.
 folder under the base needs its own entry for every user who touches it
 (otherwise `fatal: detected dubious ownership`). `ogit safeDirectory.ensure
 <?base>` adds them for the calling user; `oo update`, `oo user.fix` /
-`config init.user` and `user.oosh.install` run it for you; install state 31
+`config init.user` and `user.oosh.install` run it for you, and `oo mode
+<branch>` trusts the folder it switches to; install state 31
 trusts every folder for root, shares each one, and sets group `dev` + setgid on
 the base.
 
