@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# T-SESSION-RESOLVE-DRIFT — RED-FIRST gate for #3 fork-drift (architect 34f4001f; expert fix branch
+# oosh-expert/session-resolve-drift @3336994c). Scenario-first: FAILS on deployed, DEFINES acceptance.
+#
+# BUG: private.claudeCode.session.resolve (claudeCode:1106) SHORT-CIRCUITS on the cmdline --resume
+# uuid for ANY live-claude pane and NEVER reaches the jsonl rank. A FORKED agent keeps --resume=LAUNCH
+# in argv but writes a NEWER session jsonl (same customTitle+cwd) → resolve returns the STALE LAUNCH,
+# not the CURRENT fork (this is the ~40pt pulse-staleness the SM caught — a hidden wall).
+# FIX: cmdline anchors identity AND rank the scan; a DIFFERENT+NEWER rank-winner → current(fork);
+# cmdline-newest → keep (cmdline-disambig 20/0 preserved); mtime-only.
+#
+# ★ ORACLE (independent of THIS failure mode — the CMDLINE is the bug, so the oracle MUST NOT read it;
+# my /proc-cmdline oracle from the 20/0 gate is CONFOUNDED here, same-shape as ps-parse was): the
+# NEWEST-mtime jsonl matching the pane's role-title+cwd = what the agent is WRITING NOW. Read straight
+# off the filesystem (stat mtime), NOT via the resolver's cmdline path NOR its session.rank.
+#
+# SCENARIOS (expert): (drift) forked pane resolves CURRENT not LAUNCH [RED deployed];
+#   (disambig) cmdline-is-newest resumed pane kept [no-regress, green]; (byte-id) normal resumed unchanged.
+# SCOPE-OUT: clone+fork combo (orthogonal F49).
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level> (RED-FIRST — cmdline short-circuit pins LAUNCH must fail)"
+source this
+source test.suite
+source claudeCode >/dev/null 2>&1
+log.level $level
+export LOG_DEVICE=/dev/null
+HAVE_TMUX=0; [ -n "$TMUX" ] && HAVE_TMUX=1
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+
+FX_PREFIX="fxdrift_"
+SEED_PROJ="$HOME/.claude/projects/-test-seed-resolvedrift"
+GEN="${OOSH_DIR}/test/gen/t-resolve-drift"
+LAUNCH="aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"   # stale launch uuid (old mtime)
+FORK="bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"      # current fork uuid (newer mtime)
+SOLO="cccccccc-3333-4333-8333-cccccccccccc"      # byte-id anchor (single jsonl)
+TITLE="driftrole@WODA.prod"
+
+# Scratch-law: PRE-RUN sweep-by-prefix (EXIT trap skips SIGKILL) — fixtures never accumulate.
+sweep(){ tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${FX_PREFIX}" \
+           | while IFS= read -r s; do tmux kill-session -t "$s" 2>/dev/null; done; rm -rf "$SEED_PROJ" "$GEN"; }
+trap sweep EXIT
+sweep
+
+if [ "$HAVE_TMUX" -ne 1 ]; then
+  test.case $level "T-SESSION-RESOLVE-DRIFT (skipped — no tmux)" echo skip; expect.pass "skipped"
+  test.suite.save.results; return 0 2>/dev/null || exit 0
+fi
+
+mkdir -p "$SEED_PROJ" "$GEN/bin" "$GEN/cwd"
+RC=$(cd "$GEN/cwd" && pwd -P)
+# stand-in 'claude' — live proc holding a --resume arg in its real argv (cmdline ground-truth source).
+printf '#!/bin/sh\nwhile :; do sleep 86400; done\n' > "$GEN/bin/claude"; chmod +x "$GEN/bin/claude"
+# Seed jsonls: scan reads cwd + customTitle from content; mtime from the file.
+seed_jsonl(){ printf '{"cwd":"%s","type":"x"}\n{"type":"assistant","customTitle":"%s"}\n' "$RC" "$TITLE" > "$SEED_PROJ/$1.jsonl"; }
+seed_jsonl "$LAUNCH"; seed_jsonl "$FORK"
+touch -t 202001010000 "$SEED_PROJ/$LAUNCH.jsonl"   # LAUNCH = OLD
+touch "$SEED_PROJ/$FORK.jsonl"                      # FORK = NEWEST (now)
+
+# ★ INDEPENDENT ORACLE: newest-mtime jsonl matching role-title+cwd (reads mtime off disk; NO cmdline).
+oracle_current(){ local best="" bestM=0 f m base
+  for f in "$SEED_PROJ"/*.jsonl; do
+    [ -f "$f" ] || continue
+    grep -qF "\"customTitle\":\"$TITLE\"" "$f" || continue
+    grep -qF "\"cwd\":\"$RC\"" "$f" || continue
+    m=$(stat -c %Y "$f" 2>/dev/null); [ -z "$m" ] && m=$(stat -f %m "$f" 2>/dev/null)
+    if [ "${m:-0}" -gt "$bestM" ]; then bestM="$m"; base=$(basename "$f" .jsonl); best="$base"; fi
+  done; printf '%s' "$best"; }
+
+# ── DRIFT fixture: a forked pane — argv --resume=LAUNCH (stale) while FORK jsonl is newer (same title+cwd)
+D="${FX_PREFIX}drift"; tmux new-session -d -s "$D" -x 140 -y 12 -c "$RC" 2>/dev/null
+tmux send-keys -t "$D" "'$GEN/bin/claude' --resume $LAUNCH --model x" Enter
+tmux select-pane -t "$D" -T "$TITLE" 2>/dev/null; sleep 1.4
+DP="${D}:0.0"
+
+echo; echo "===== ORACLE independence (newest-mtime jsonl, NOT cmdline) ====="
+ORC=$(oracle_current)
+test.case $level "ORACLE: live-mtime winner = FORK (independent of the --resume cmdline)" echo "$ORC"
+[ "$ORC" = "$FORK" ] && ok "oracle picks FORK (newest mtime, title+cwd match) — not the LAUNCH argv" || no "oracle off: got '$ORC' (expected $FORK)"
+
+echo; echo "===== (drift) RED: forked pane must resolve CURRENT(fork), not the stale LAUNCH ====="
+CUR=$(claudeCode session.current "$DP" 2>/dev/null)
+CLI=$(private.claudeCode.session.cmdline.uuid "$DP" 2>/dev/null)
+echo "  cmdline(argv)=$CLI | session.current=$CUR | oracle(live-mtime)=$ORC"
+test.case $level "drift: cmdline ground-truth is the LAUNCH argv (precond)" echo "$CLI"
+[ "$CLI" = "$LAUNCH" ] && ok "argv --resume = LAUNCH ($LAUNCH)" || no "precond: cmdline=$CLI (need LAUNCH — fixture not claude-classified?)"
+test.case $level "drift-RESOLVE: session.current == oracle (FORK), NOT the stale LAUNCH" echo "$CUR vs $ORC"
+if [ "$CUR" = "$ORC" ] && [ "$CUR" = "$FORK" ]; then
+  ok "forked pane resolves CURRENT fork ($CUR) = oracle"
+else
+  no "DRIFT (RED): session.current=$CUR (LAUNCH=$LAUNCH) != oracle/current FORK=$ORC — cmdline short-circuit pinned the STALE launch jsonl"
+fi
+
+echo; echo "===== (disambig) NO-REGRESS: cmdline-is-newest resumed pane -> KEEP cmdline (20/0 invariant) ====="
+# A normal resumed pane: its --resume uuid IS the newest jsonl → resolve keeps it (NOT drift).
+# Make LAUNCH the newest by touching it after FORK, point a pane's argv at it.
+touch "$SEED_PROJ/$LAUNCH.jsonl"   # now LAUNCH newest
+N="${FX_PREFIX}keep"; tmux new-session -d -s "$N" -x 140 -y 12 -c "$RC" 2>/dev/null
+tmux send-keys -t "$N" "'$GEN/bin/claude' --resume $LAUNCH --model x" Enter
+tmux select-pane -t "$N" -T "$TITLE" 2>/dev/null; sleep 1.4
+NCUR=$(claudeCode session.current "${N}:0.0" 2>/dev/null); NORC=$(oracle_current)
+echo "  cmdline-newest case: session.current=$NCUR oracle=$NORC (both expect $LAUNCH)"
+test.case $level "disambig-preserved: cmdline-is-newest resumed pane keeps cmdline uuid" echo "$NCUR"
+{ [ "$NCUR" = "$LAUNCH" ] && [ "$NORC" = "$LAUNCH" ]; } && ok "kept cmdline (newest) = $LAUNCH (no drift, 20/0 invariant holds)" \
+  || no "disambig regressed: session.current=$NCUR oracle=$NORC (expected $LAUNCH)"
+
+echo; echo "===== (byte-id) ANCHOR: lone resumed pane (single jsonl) resolves to its uuid, unchanged ====="
+# lone identity: a DISTINCT title so it never collides with the drift TITLE
+printf '{"cwd":"%s","type":"x"}\n{"type":"assistant","customTitle":"solorole@WODA.prod"}\n' "$RC" > "$SEED_PROJ/$SOLO.jsonl"
+S="${FX_PREFIX}solo"; tmux new-session -d -s "$S" -x 140 -y 12 -c "$RC" 2>/dev/null
+tmux send-keys -t "$S" "'$GEN/bin/claude' --resume $SOLO --model x" Enter
+tmux select-pane -t "$S" -T "solorole@WODA.prod" 2>/dev/null; sleep 1.4
+SCUR=$(claudeCode session.current "${S}:0.0" 2>/dev/null)
+test.case $level "byte-id: lone resumed pane -> its own uuid (unchanged)" echo "$SCUR"
+[ "$SCUR" = "$SOLO" ] && ok "lone resumed resolves to $SOLO (unchanged)" || no "byte-id regressed: $SCUR (expected $SOLO)"
+
+echo
+echo "=================================================================="
+echo "  T-SESSION-RESOLVE-DRIFT  PASS=$pass FAIL=$fail"
+echo "  RED-FIRST: drift-RESOLVE must FAIL on deployed (short-circuit pins LAUNCH). Fix (rank + prefer"
+echo "  different+newer) -> drift GREEN; disambig/byte-id held. Then PO gates pulse==panel on a REAL fork."
+echo "=================================================================="
+test.suite.save.results
