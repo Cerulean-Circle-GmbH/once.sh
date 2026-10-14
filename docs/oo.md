@@ -316,6 +316,26 @@ checks the branch out again to realign them, which is what `oo mode` assumes.
 chained and its status trusted. On a failed clone `ogit repo.clone` removes
 the half-made directory it created, and never one it did not.
 
+### oo.checkout.remove
+
+The reverse of `oo checkout`: remove the branch folder of `<version>` from
+this machine. The branch on GitHub stays — `oo checkout <version>` brings it
+back.
+
+```bash
+oo checkout.remove dev.headless      # → <base>/dev.headless removed
+```
+
+It removes only when nothing is lost — the same gates `ogit worktree.remove`
+uses before it deletes a folder: clean, pushed to its upstream
+(`private.ogit.folder.gate`), no stash, local branch or tag of its own
+(`private.ogit.clone.gate`). It never removes `dev`, `main` or the folder
+`~/oosh` points at (switch first: `oo mode dev`). The folder's
+`safe.directory` entry goes too (`ogit safeDirectory.prune`). The folder name is
+derived as in `oo checkout` (`private.oo.checkout.dir.get`). A branch on GitHub
+is deleted by `ogit branch.remote.delete` ([ogit.md § branch](ogit.md#branch))
+(T-CHECKOUT-REMOVE).
+
 ### oo.use
 
 Run one command from another branch **without switching**.
