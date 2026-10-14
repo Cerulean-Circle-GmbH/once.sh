@@ -157,9 +157,9 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `remote.url.get` | `<?remote:origin> <?dir:$OOSH_DIR>` | echo the URL of `<remote>`, empty when there is none |
 | `remote.branch.list` | `<?remote:origin> <?dir:$OOSH_DIR>` | echo the branches `<remote>` has right now (`ls-remote` — needs the network); empty when unreachable |
 | `remote.url.set` | `<url> <?remote:origin> <?dir:$OOSH_DIR>` | point `<remote>` of `<dir>` at `<url>` |
-| `remote.fetch` | `<?prune:no> <?dir:$OOSH_DIR>` | fetch origin into `<dir>`; `prune=yes` drops deleted remote branches |
+| `remote.fetch` | `<?prune:no> <?dir:$OOSH_DIR> <?tags:no>` | fetch origin into `<dir>`; `prune=yes` drops deleted remote branches; `tags=yes` brings every tag of origin — a plain fetch brings only the tags on a fetched branch (T-OGIT-REMOTE-FETCH-TAGS) |
 | `remote.pull` | `<?url> <?branch> <?dir:$OOSH_DIR>` | pull into `<dir>`; with `<url> <branch>` pull that branch from that URL instead of the tracking remote (the https fallback of `oo.update`) |
-| `remote.push` | `<?branch> <?tags:no> <?dir:$OOSH_DIR>` | push `<branch>` (default: the tracking branch) to origin; `tags=yes` pushes tags too |
+| `remote.push` | `<?branch> <?tags:no> <?dir:$OOSH_DIR>` | push `<branch>` (default: the tracking branch) to origin; `tags=yes` pushes tags too; a refused push is rc 1 and logs why (T-OGIT-REMOTE-PUSH-REPORTS). `<dir>` defaults to `~/oosh` — name the branch folder to push from another |
 
 ### index
 

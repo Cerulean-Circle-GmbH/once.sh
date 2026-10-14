@@ -332,7 +332,7 @@ uses before it deletes a folder: clean, pushed to its upstream
 (`private.ogit.clone.gate`). It never removes `dev`, `main` or the folder
 `~/oosh` points at (switch first: `oo mode dev`). The folder's
 `safe.directory` entry goes too (`ogit safeDirectory.prune`). The folder name is
-derived as in `oo checkout` (`private.oo.checkout.dir.get`). A branch on GitHub
+derived as in `oo checkout` (`private.oo.checkout.dir.get`). A tag the folder has and `main/` lacks blocks it, also when it is on GitHub: `ogit remote.fetch no <base>/main yes` brings every tag of origin into `main/`. A branch on GitHub
 is deleted by `ogit branch.remote.delete` ([ogit.md § branch](ogit.md#branch))
 (T-CHECKOUT-REMOVE).
 
