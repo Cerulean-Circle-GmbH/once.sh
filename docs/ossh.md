@@ -58,6 +58,19 @@ ossh config.save.last
 ossh list
 ```
 
+### Deleting a Config
+
+```bash
+# Remove the Host block of myvm from ~/.ssh/config (or from <file>)
+ossh config.delete myvm
+ossh config.delete myvm ~/some/other/ssh.config
+```
+
+The block is what `ossh config.get` shows: from `Host <name>` to the next empty
+line. The other blocks, the file's mode and its empty lines stay, so a later
+`ossh config.save.last` still appends a separate block. A host that is not
+there answers rc 2 "not found" (T-OSSH-CONFIG-DELETE).
+
 ### Generated Config Format
 
 ```
