@@ -47,13 +47,36 @@ sudo -i ~root/oosh/su/setup samba.password alice
 | `npm` | `<?user>` | npm of nvm's node only; rc 1 "no npm for <user> — run: setup nodejs" when it is missing. Never the package manager (on Ubuntu that pulls in the system nodejs 18) |
 | `headless` | `<?user>` | Linux: `vncserver`, `startxfce4`, `xfwm4`, `xfce4-panel`, `xfce4-terminal`, `dbus-launch` through `oo cmd`; the service stays off. macOS: Screen Sharing on |
 | `vnc.password` | `<user>` | `vncpasswd` as `<user>`, `session=xfce` in `~/.vnc/config`, the first free display in `/etc/tigervnc/vncserver.users`, `systemctl enable --now vncserver@:<n>` (port 5900+n). macOS: nothing to set |
-| `samba.support` | `<?user>` | Linux: `smbd`, `smbclient`, `avahi-daemon` through `oo cmd`, smbd/nmbd switched off again (Debian starts them), `/etc/avahi/services/smb.service`. macOS: File Sharing (SMB) on |
+| `samba.support` | `<?user>` | Linux: `smbd`, `smbclient`, `avahi-daemon` through `oo cmd`, smbd/nmbd switched off again (Debian starts them), `/etc/avahi/services/smb.service` from `templates/setup/avahi.smb.service`. macOS: File Sharing (SMB) on |
 | `samba.password` | `<user>` | `smbpasswd -a <user>`, `systemctl enable --now smbd avahi-daemon`. macOS: the System Settings step |
 
 Package names per package manager come from `private.setup.package.get`, the
 one table (apt `tigervnc-standalone-server`, dnf `tigervnc-server`,
 `samba-client`, `avahi`, …). `share samba.install` and
 `disk install.samba.support` call `setup samba.support`.
+
+## The oosh methods it stands on
+
+`su/setup` calls no system tool raw that oosh has a method for
+(T-SETUP-OOSH-ONLY pins it):
+
+| Need | oosh method |
+|------|-------------|
+| install a package | `oo cmd <cmd> <package>` (`private.setup.package.get` names the package) |
+| Docker | `odocker prereqs.install`, `private.odocker.engine.supported` |
+| run something as a user | `private.as.user` (user) |
+| a user's home | `user get home <user>` |
+| macOS or Linux | `os check private.setup.<method>` → `.darwin` / `.linux` |
+| a service on or off | `os service.on` / `os service.off` (os) |
+| systemd or not, a container or not | `private.os.systemd.is`, `private.this.container.is` |
+| a temp folder, a download | `private.this.temp.dir.get`, `private.this.url.download` |
+| a line in a file, once | `private.this.file.line.ensure` |
+| a file owner | `private.this.path.owner.set` |
+| the Avahi SMB announcement | the template `templates/setup/avahi.smb.service`, copied when `private.this.file.same` says it differs |
+| the members of dev | `private.this.group.members.get` |
+
+Every `<user>` parameter completes from `user list`
+(`setup.<method>.completion.user`), the nvm version from `SETUP_NVM_VERSION`.
 
 ## In the install
 
@@ -72,7 +95,9 @@ Node + npm: `private.user.oosh.install.node`. VNC and Samba stay on demand
 ## Tests
 
 `test/test.setup` (core) runs every method in a child with stand-ins for
-`oo.cmd`, `odocker.prereqs.install`, `curl`, `sudo`, `systemctl`, `launchctl`,
-`vncpasswd` and `smbpasswd`, which log their arguments. Under
+`oo.cmd`, `odocker.prereqs.install`, `private.as.user`, `curl`, `systemctl`,
+`launchctl`, `vncpasswd` and `smbpasswd`, which log their arguments; `user` and
+`os` are sourced first so the stand-ins replace their methods, and `os.check`
+reads the pinned `OSTYPE`. Under
 `OOSH_NO_INSTALL` (every test run) each method answers rc 0 and touches
 nothing. `T-OO-STATE-50` in `test/test.oo` pins the state hook.

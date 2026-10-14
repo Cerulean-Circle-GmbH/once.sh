@@ -715,7 +715,7 @@ These functions are used internally and generally not called directly:
 | `private.config.required.variables.get` | the required-variable table, as data |
 | `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
 | `private.config.env.lines.drop` | `<file> <prefix…>` → drops every line starting with a prefix, in place (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
-| `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written |
+| `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written. Calls `private.this.file.line.ensure`, the one definition |
 
 `config` also leans on the kernel's helpers (full list:
 [oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)):

@@ -27,6 +27,78 @@ private.os.release.get()     # <key> <?file:/etc/os-release> # echo one value of
 }
 
 
+private.os.systemd.is()     # <?root:/> # rc 0 when systemd runs this computer: its run directory <root>/run/systemd/system is there and systemctl is on PATH; a container has none #
+{
+ # A predicate (rc only, no create.result), like private.this.container.is.
+ # Moved from su/setup, which needs it before it installs a service
+ # (T-OS-SYSTEMD-IS). <root> lets a test use a fixture.
+ local root="${1:-/}"
+ root="${root%/}"
+ [ -d "$root/run/systemd/system" ] && command -v systemctl >/dev/null 2>&1
+}
+
+
+os.service.on()     # <service> # switch the system service <service> on, now and at boot: systemd, else OpenRC, else SysV service on Linux; on macOS the system launch daemon <service> (a label like com.apple.smbd); rc 1 naming it when it cannot #
+{
+ # The one service switch (T-OS-SERVICE). su/setup called systemctl and
+ # launchctl raw; odocker's engine start and ossh's fail2ban carry the same
+ # Linux fallback chain inline.
+ local service="$1"
+ if [ -z "$service" ]; then
+   create.result 1 "os.service.on: <service> required"; error.log "$RESULT"; return $(result)
+ fi
+ if os.check private.os.service.on && $RESULT "$service"; then
+   create.result 0 "$service is on"
+ else
+   create.result 1 "$service could not be switched on"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+private.os.service.on.linux()     # <service> # systemctl enable --now, else rc-update add + rc-service start, else service start #
+{
+ $SUDO systemctl enable --now "$1" >/dev/null 2>&1 \
+   || { $SUDO rc-update add "$1" default >/dev/null 2>&1 && $SUDO rc-service "$1" start >/dev/null 2>&1; } \
+   || $SUDO service "$1" start >/dev/null 2>&1
+}
+
+private.os.service.on.darwin()     # <label> # launchctl enable system/<label>, then bootstrap its LaunchDaemons plist; a daemon already loaded is on #
+{
+ $SUDO launchctl enable "system/$1" >/dev/null 2>&1
+ # bootstrap refuses a daemon that is already loaded: then it is on.
+ $SUDO launchctl bootstrap system "/System/Library/LaunchDaemons/$1.plist" >/dev/null 2>&1 \
+   || $SUDO launchctl print "system/$1" >/dev/null 2>&1
+}
+
+
+os.service.off()     # <service> # switch the system service <service> off, now and at boot: systemd, else OpenRC, else SysV service on Linux; the system launch daemon <service> on macOS; rc 1 naming it when it cannot #
+{
+ local service="$1"
+ if [ -z "$service" ]; then
+   create.result 1 "os.service.off: <service> required"; error.log "$RESULT"; return $(result)
+ fi
+ if os.check private.os.service.off && $RESULT "$service"; then
+   create.result 0 "$service is off"
+ else
+   create.result 1 "$service could not be switched off"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+private.os.service.off.linux()     # <service> # systemctl disable --now, else rc-service stop + rc-update del, else service stop #
+{
+ $SUDO systemctl disable --now "$1" >/dev/null 2>&1 \
+   || { $SUDO rc-service "$1" stop >/dev/null 2>&1 && $SUDO rc-update del "$1" default >/dev/null 2>&1; } \
+   || $SUDO service "$1" stop >/dev/null 2>&1
+}
+
+private.os.service.off.darwin()     # <label> # launchctl bootout system/<label>, then disable it; a daemon not loaded is off #
+{
+ $SUDO launchctl bootout "system/$1" >/dev/null 2>&1
+ $SUDO launchctl disable "system/$1" >/dev/null 2>&1
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────

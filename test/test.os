@@ -256,6 +256,58 @@ test.case $level "T-OS-RELEASE-GET: one value of an os-release file, quotes remo
 expect 0 "values with and without quotes; rc 1 for a missing key or file; the file is never run" \
   "the os-release reader lived in odocker, had no test and read only /etc/os-release"
 
+# T-OS-SERVICE: os service.on / service.off — one way to switch a system service on (now and at boot) or off
+# Linux: systemd, else OpenRC, else SysV `service` (odocker's engine start
+# style); macOS: the system launch daemon <label>. su/setup called systemctl
+# and launchctl raw (2026-10-14). Stand-ins on PATH log their arguments.
+test.os.service() {
+  local fx bad="" got; fx=$(test.suite.fixture.make osservice); mkdir -p "$fx/bin"
+  local c; for c in systemctl rc-update rc-service service launchctl; do
+    printf '%s\n' '#!/bin/sh' 'echo "${0##*/} $*" >> "$FX/log"' 'case " $T_FAIL " in *" ${0##*/} "*) exit 1 ;; esac' 'exit 0' > "$fx/bin/$c"
+  done
+  chmod +x "$fx/bin/"*
+  test.os.service.run() { # <OSTYPE> <T_FAIL> <method> <name>
+    : > "$fx/log"
+    got=$(export FX="$fx" PATH="$fx/bin:$PATH" T_FAIL="$2"; OSTYPE="$1"; SUDO=""; "$3" "$4" >/dev/null 2>&1; echo "$?|$RESULT")
+    echo "$got|$(tr '\n' ';' < "$fx/log")"
+  }
+  got=$(test.os.service.run linux-gnu "" os.service.on smbd)
+  case "$got" in "0|smbd is on|systemctl enable --now smbd;") ;; *) bad="$bad systemd=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "systemctl" os.service.on smbd)
+  case "$got" in "0|smbd is on|systemctl enable --now smbd;rc-update add smbd default;rc-service smbd start;") ;; *) bad="$bad openrc=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "systemctl rc-update rc-service" os.service.on smbd)
+  case "$got" in "0|smbd is on|"*"service smbd start;") ;; *) bad="$bad sysv=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "systemctl rc-update rc-service service" os.service.on smbd)
+  case "$got" in "1|smbd could not be switched on|"*) ;; *) bad="$bad none=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "" os.service.off smbd)
+  case "$got" in "0|smbd is off|systemctl disable --now smbd;") ;; *) bad="$bad off=[$got]" ;; esac
+  got=$(test.os.service.run darwin23 "" os.service.on com.apple.smbd)
+  case "$got" in "0|com.apple.smbd is on|launchctl enable system/com.apple.smbd;launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.smbd.plist;") ;; *) bad="$bad mac=[$got]" ;; esac
+  got=$(test.os.service.run darwin23 "" os.service.off com.apple.smbd)
+  case "$got" in "0|com.apple.smbd is off|launchctl bootout system/com.apple.smbd;launchctl disable system/com.apple.smbd;") ;; *) bad="$bad mac-off=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "" os.service.on "")
+  case "$got" in "1|"*"<service> required"*"|") ;; *) bad="$bad no-name=[$got]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "systemd, OpenRC or SysV on Linux, launchd on macOS; rc 1 naming the service when none works" || create.result 1 "os service:$bad"
+  return $(result)
+}
+test.case $level "T-OS-SERVICE: os service.on / service.off switch a system service on (now and at boot) or off" test.os.service
+expect 0 "systemd, OpenRC or SysV on Linux, launchd on macOS; rc 1 naming the service when none works" \
+  "su/setup called systemctl and launchctl raw; oosh had no service method"
+
+# T-OS-SYSTEMD-IS: rc 0 only when systemd runs this computer (a container has none)
+test.os.systemdIs() {
+  local fx bad=""; fx=$(test.suite.fixture.make ossystemd); mkdir -p "$fx/bin" "$fx/run/systemd/system"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$fx/bin/systemctl"; chmod +x "$fx/bin/systemctl"
+  ( PATH="$fx/bin:$PATH"; private.os.systemd.is "$fx" ) || bad="$bad running-rc1"
+  ( PATH="$fx/bin:$PATH"; private.os.systemd.is "$fx/nowhere" ) && bad="$bad no-run-dir-rc0"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "systemd only when its run directory is there" || create.result 1 "systemd is:$bad"
+  return $(result)
+}
+test.case $level "T-OS-SYSTEMD-IS: rc 0 only when systemd runs this computer" test.os.systemdIs
+expect 0 "systemd only when its run directory is there" "su/setup had its own systemd check"
+
 ### test.method
 
 test.suite.save.results

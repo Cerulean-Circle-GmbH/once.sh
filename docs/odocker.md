@@ -297,7 +297,7 @@ the socket's group. It takes one of two paths:
       It uses the container's `ID` and `VERSION_CODENAME` (its `/etc/os-release`,
       read with `private.os.release.get`) and the container's `dpkg`
       architecture, never the host's.
-    - The download is the same too, `private.odocker.docker.repo.download <url> <file>`.
+    - The download is the same too, `private.odocker.docker.repo.download <url> <file>`, which calls `private.this.url.download` (the one checked download).
       It runs on the host, because a naked image may have no curl. The file
       (and the container's os-release) lie in one private directory from the
       kernel's `private.this.temp.dir.get`, removed on every exit path.
