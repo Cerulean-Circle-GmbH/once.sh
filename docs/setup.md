@@ -28,7 +28,8 @@ sudo -i ~root/oosh/su/setup samba.password alice
    `setup samba.password <user>` ask for the password and switch them on.
 5. **Node.js through nvm.** The official installer is pinned to
    `SETUP_NVM_VERSION`, Node is the current LTS by default, and it goes to the
-   one who ran sudo and to root. npm comes with it.
+   one who ran sudo, to root and to every member of group `dev`, each in its own
+   home (bash-user had none in the first container run). npm comes with it.
 6. netatalk (AFP) is gone: macOS speaks SMB. Avahi stays, so the Finder sees
    the Samba share.
 
@@ -36,7 +37,7 @@ sudo -i ~root/oosh/su/setup samba.password alice
 
 | Method | Parameters | What it does |
 |--------|------------|--------------|
-| `all` | `<?user:$SUDO_USER>` | docker, nodejs + npm for `<user>` and the caller, headless, samba.support. Prints a summary; RESULT `headless setup: N ok, M skipped, K failed (names)`; always rc 0 |
+| `all` | `<?user:$SUDO_USER>` | docker, nodejs + npm for `<user>`, the caller and every member of `dev` (`private.this.group.members.get`), headless, samba.support. Prints a summary; RESULT `headless setup: N ok, M skipped, K failed (names)`; always rc 0 |
 | `docker` | `<?user>` | `odocker prereqs.install <user>`: the engine on a computer, the client in a container, `<user>` in the socket's group |
 | `nvm` | `<?user> <?version:v0.40.3>` | nvm's official installer, downloaded to `/tmp`, run as `<user>` with `PROFILE=/dev/null` (the login already loads nvm); nothing when `~<user>/.nvm/nvm.sh` is there |
 | `nodejs` | `<?version:--lts> <?user>` | `setup nvm`, then `nvm install <version>` as `<user>`; rc 1 when `node -v` does not answer |
