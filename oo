@@ -241,8 +241,8 @@ oo.commit() # <?mode:force> # commits latest changes to the oosh environment and
     # stages top-level deletions, and -A would. Same pathspecs, same git add.
     ogit.index.add all "$OOSH_DIR" *
     ogit.commit.create "" "" "" "$OOSH_DIR"
-    # ogit.remote.push keeps git's stderr quiet; say why it was refused.
-    ogit.remote.push "" no "$OOSH_DIR" || error.log "$RESULT"
+    # ogit.remote.push says itself why it was refused (T-OGIT-REMOTE-PUSH-REPORTS).
+    ogit.remote.push "" no "$OOSH_DIR"
   else
     error.log "not on the dev branch"
     console.log "switch branch with
@@ -331,16 +331,15 @@ oo.update() # # updates oosh environment and pulls latest changes from github.
 private.oo.update.heal.symlinks() # # heal current user's ~/config + ~/oosh symlinks via config.init.user; idempotent
 {
   private.this.script.load config config.init.user || return 0
-  # Skip silently when developking doesn't exist yet — this is the
+  # Skip silently when the shared tree doesn't exist yet — this is the
   # pre-install state (oo update fires very early in
-  # ossh.install.continue.local, BEFORE state 31 creates
-  # developking + the shared tree). The state machine will link
-  # everything correctly when it gets there; healing post-install
-  # drift is the heal's job, not pre-install bootstrap.
+  # ossh.install.continue.local, BEFORE state 31 creates the shared tree).
+  # The state machine will link everything correctly when it gets there;
+  # healing post-install drift is the heal's job, not pre-install bootstrap.
+  # The tree is found under the system's users' base, never through
+  # developking's home (T-OO-SHARED-TREE-NO-DEVELOPKING).
   if private.this.script.load user user.get; then
-    local _devHome
-    _devHome=$(user.get home developking 2>/dev/null)
-    [ -z "$_devHome" ] && return 0
+    [ -d "$(user.get basehome root 2>/dev/null)/shared/EAMD.ucp" ] || return 0
   fi
   config.init.user "$USER" >/dev/null \
     || warn.log "oo update: \`config init.user $USER\` reported an issue — run \`oo user.fix\` for details"
@@ -658,6 +657,16 @@ oo.mode() # <?branch> # switch oosh to a branch folder under the base (cloned wh
       fi
     fi
     return 0
+  fi
+
+  # Trust, the one place: the branch folder may belong to another user (group
+  # dev), or someone else pointed this user's ~/oosh at it; git refuses it
+  # ("dubious ownership") until the calling user's safe.directory names it —
+  # developking after `oo mode dev` on the Mac Studio, 2026-10-13. Covers the
+  # early stop and a switch to an existing folder; a folder cloned below is
+  # trusted by ogit.folder.finish. Local and idempotent.
+  if [ -n "$componentsBase" ] && [ -d "$componentsBase/$branch" ]; then
+    ogit.safeDirectory.add "$componentsBase/$branch" >/dev/null || warn.log "oo mode: could not trust $componentsBase/$branch — $RESULT"
   fi
 
   # Same-branch fast-path: if the requested branch matches the currently
@@ -1069,6 +1078,17 @@ oo.mode.completion.branch() {
   private.oo.completion.worktree.branches
 }
 
+private.oo.checkout.dir.get() # <version> # echo the folder name of <version> under the components base: a leading test/, feature/ or bugfix/ stripped, the other slashes as dots
+{
+  # NO create.result — a getter consumed as $(...). The one derivation of
+  # oo checkout and oo checkout.remove (T-CHECKOUT-2, T-CHECKOUT-REMOVE).
+  local dirName="$1"
+  dirName="${dirName#test/}"
+  dirName="${dirName#feature/}"
+  dirName="${dirName#bugfix/}"
+  echo "$dirName" | tr '/' '.'
+}
+
 oo.checkout() # <version> # clone a remote branch as its own folder under the components base (prefix stripped, slashes as dots); an existing folder is aligned, never pulled
 {
   private.this.script.load ogit ogit.branch.get
@@ -1080,12 +1100,8 @@ oo.checkout() # <version> # clone a remote branch as its own folder under the co
     return $(result)
   fi
 
-  # Derive directory name: strip prefixes, convert slashes to dots
-  local dirName="$version"
-  dirName="${dirName#test/}"
-  dirName="${dirName#feature/}"
-  dirName="${dirName#bugfix/}"
-  dirName=$(echo "$dirName" | tr '/' '.')
+  local dirName
+  dirName=$(private.oo.checkout.dir.get "$version")
 
   # ONE layout (2026-09-23 design): every branch is its own clone under the
   # components base. No base means no layout to add to — fail loud with the
@@ -1182,6 +1198,51 @@ oo.checkout.completion.version() {
   else
     ogit.branch.list remote "$oosh"
   fi
+}
+
+oo.checkout.remove() # <version> # remove the branch folder of <version> under the components base — the reverse of oo checkout — only when nothing is lost (clean, pushed, no ref of its own); never dev, main or the folder ~/oosh points at; its safe.directory entry goes too, the branch on origin stays
+{
+  # oosh could clone a branch folder, not remove one: the user wanted only dev
+  # and main left (2026-10-14, T-CHECKOUT-REMOVE). "Nothing is lost" is
+  # ogit's own measure: private.ogit.folder.gate (clean, pushed) and
+  # private.ogit.clone.gate (no stash, branch or tag of its own) — the gates
+  # ogit worktree.remove / restore use before they delete a folder.
+  private.this.script.load ogit private.ogit.folder.gate
+  local version="$1" dirName base target current
+  if [ -z "$version" ]; then
+    create.result 1 "Usage: oo checkout.remove <version>"; error.log "$RESULT"; return $(result)
+  fi
+  dirName=$(private.oo.checkout.dir.get "$version")
+  case "$dirName" in
+    dev|main)
+      create.result 1 "$dirName stays — only branch folders besides dev and main are removed"; error.log "$RESULT"; return $(result) ;;
+  esac
+  base=$(oo.mode.base.get 2>/dev/null)
+  if [ -z "$base" ] || [ ! -d "$base" ]; then
+    create.result 1 "no components base — run oo mode.setup"; error.log "$RESULT"; return $(result)
+  fi
+  target="$base/$dirName"
+  if [ ! -d "$target" ]; then
+    create.result 0 "no folder $dirName under $base — nothing to remove"; return $(result)
+  fi
+  current=$(private.this.path.canonical "${OOSH_DIR:-$HOME/oosh}" 2>/dev/null)
+  if [ "$current" = "$(private.this.path.canonical "$target")" ]; then
+    create.result 1 "$dirName is the folder ~/oosh points at — switch first: oo mode dev"; error.log "$RESULT"; return $(result)
+  fi
+  private.ogit.folder.gate "$target" || { error.log "$RESULT"; return $(result); }
+  private.ogit.clone.gate "$target" "$base/main" || { error.log "$RESULT"; return $(result); }
+  if ! rm -rf "$target" 2>/dev/null || [ -e "$target" ]; then
+    create.result 1 "could not remove $target — it belongs to $(private.this.path.stat.get "$target" owner); run it as that user or with sudo"; error.log "$RESULT"; return $(result)
+  fi
+  ogit.safeDirectory.prune >/dev/null || warn.log "oo checkout.remove: $RESULT"
+  success.log "Removed $target — the branch stays on origin (oo checkout $version brings it back)"
+  create.result 0 "$target removed"
+  return $(result)
+}
+
+oo.checkout.remove.completion.version() {
+  local base; base=$(oo.mode.base.get 2>/dev/null) || return 0
+  ls "$base" 2>/dev/null | grep -vx 'dev\|main'
 }
 
 oo.use() # <branch> <command> # run a command from a specific branch without switching
@@ -1751,7 +1812,10 @@ private.check.root.shared.dev.folder.created() {
   
   if [ ! "$USER" = "root" ]; then
     # Non-root user: check if shared infrastructure was already created by root
-    local dir="$( user get basehome $USER )"
+    # Root made the tree under the system's users' base — the lookup of the
+    # root branch below, not the parent of this user's own home
+    # (T-STATE31-NONROOT-BASEHOME-ROOT).
+    local dir="$( user get basehome root )"
     console.log "dir=$dir"
 
     if [ -d "$dir/shared/EAMD.ucp" ]; then
@@ -1779,14 +1843,14 @@ private.check.root.shared.dev.folder.created() {
   # last-resort /etc/group append. Idempotent — no-op when group exists.
   private.this.group.create dev
 
-  # Create developking and put them in the dev group. user.create
-  # auto-invokes user.oosh.install, which (after f515903 + 4069475) gives
+  # Create developking. user.create puts them in the dev group (it exists by
+  # now, see above — T-STATE31-DEV-GROUP-ONCE) and auto-invokes
+  # user.oosh.install, which (after f515903 + 4069475) gives
   # developking the same OOSH experience as any other user — bashrc with
   # completion, ~/oosh + ~/config symlinks, ed25519 keypair, WODA aliases.
   local devHome="$( user get home developking )"
   if [ -z "$devHome" ]; then
     user create developking
-    user group.add dev developking
     devHome="$( user get home developking )"
   fi
   if [ -z "$devHome" ] || [ ! -d "$devHome" ]; then
@@ -1797,7 +1861,9 @@ private.check.root.shared.dev.folder.created() {
   # echo  "absolutePath of \"$devHome\..\"..."
   # this.absolutePath "$devHome/.."
   # debug.log "absolutePath of \"$devHome\..\": $RESULT"
-  local dir="$( user get basehome developking )"
+  # The shared tree's base is the system's users' base — not the parent of
+  # developking's home: developking is an ordinary user.
+  local dir="$( user get basehome root )"
   console.log "dir=$dir"
   
   #return 2
@@ -1830,7 +1896,10 @@ private.check.root.shared.dev.folder.created() {
     $SUDO user group.add dev $USER
     #cp -r $HOME/oosh "$dir/shared/dev/."
 
-    $SUDO chown -R developking:dev "$dir/shared/dev/"
+    # root:dev, not developking:dev — developking is an ordinary user and owns
+    # no shared folder (T-STATE-31-CHOWN-ROOT; `config init.shared` repairs older
+    # machines).
+    $SUDO chown -R root:dev "$dir/shared/dev/"
     #find "$dir/shared/dev/oosh" -type d -print0 | xargs -0 chmod 2775
     #find "$dir/shared/dev/oosh" -type f -print0 | xargs -0 chmod +grwx
 
@@ -2008,6 +2077,15 @@ EOF
     chown -h $paramerUser:dev "$currentConfig"
     chown -R $paramerUser:dev "$dir/shared"
     chmod -R g+w "$dir/shared"
+    # The chown above re-owns shared/dev to the installed user after step 2's
+    # root:dev. Its top level ends root:dev g+ws — the helper config
+    # init.shared repairs with (T-STATE-31-SHARED-DEV-END); sharedConfig gets
+    # root:dev further down.
+    if ! private.this.shared.top.ensure "$dir/shared/dev" root; then
+      error.log "state 31 [5/5: dev.repo.cloned]: $RESULT"
+      create.result 1 "state 31 step 5/5 failed: $dir/shared/dev is not root:dev g+ws"
+      return $(result)
+    fi
 
     # Always link ROOT's config AND oosh to the shared tree. State 31
     # runs as root regardless of which paramerUser is being set up —
@@ -2039,7 +2117,7 @@ EOF
     # folder.finish: .git and working tree), not on main/.git only. Shared mode is
     # what keeps root's git ops (`git pull` on re-install, init/oosh) from
     # writing FETCH_HEAD/ORIG_HEAD/objects as root:root 644 and locking the
-    # dev group out. safe.directory: the tree is developking:dev, so without
+    # dev group out. safe.directory: the tree is not root's (group dev), so without
     # an entry per folder root hits dubious-ownership on `oo mode <folder>`.
     # The BASE gets group dev + setgid (a live host had root:dev WITHOUT
     # setgid), so a folder added later by oo checkout / oo mode inherits the
@@ -2136,12 +2214,13 @@ EOF
     fi
 
 
-    # sharedConfig ownership: re-chown the TOP-LEVEL dir to developking:dev
-    # (the dev-group canonical layout wants sharedConfig owned by developking,
-    # not the installing user). NOT recursive: existing files keep their
-    # writer's ownership (all group=dev via the setgid bit below), and new
-    # files written by any dev-group user inherit group=dev — that's the
-    # canonical Unix shared-dir model.
+    # sharedConfig ownership: re-chown the TOP-LEVEL dir to root:dev (the
+    # dev-group canonical layout: owned by root, not by the installing user and
+    # not by developking — an ordinary user that owns no shared folder;
+    # `config init.shared` repairs older machines). NOT recursive: existing
+    # files keep their writer's ownership (all group=dev via the setgid bit
+    # below), and new files written by any dev-group user inherit group=dev —
+    # that's the canonical Unix shared-dir model.
     #
     # The previous `chown -R developking:dev` was too aggressive: when
     # `ossh install <host> <user>` re-runs state 31 on a host where some
@@ -2156,7 +2235,7 @@ EOF
     # denied` blocked bash-user's install — runner-written files from
     # bootstrap got re-chowned to developking:dev by state 31 during
     # Phase A.1b's `ossh install macos test`.
-    chown developking:dev "$CONFIG_PATH"
+    chown root:dev "$CONFIG_PATH"
     chmod g+s "$CONFIG_PATH"
     chmod -R g+w "$CONFIG_PATH"
 
@@ -2301,14 +2380,16 @@ private.check.root.boot.path.installed() # # state 34 — remove the retired log
 }
 
 private.check.user.shared.dev.folder.linked() {
-  local devHome="$( user get home developking )"
-  if [ -z "$devHome" ]; then
-    error.log "user developking does not yet exist"
+  # The shared tree lives under the system's users' base, never found through
+  # developking's home (T-OO-SHARED-TREE-NO-DEVELOPKING).
+  private.this.script.load user user.get || return 2
+  local dir
+  dir=$(user.get basehome root)
+  if [ ! -d "$dir/shared/EAMD.ucp" ]; then
+    error.log "shared tree missing at $dir/shared — run ${YELLOW}ossh install${NORMAL}"
     return 2
   fi
-  this.absolutePath "$devHome/.."
-  info.log "absolutePath of \"$devHome\..\": $RESULT"
-  local dir="$RESULT"
+  info.log "shared tree base: $dir"
 
     export CONFIG="$dir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig/user.env"
     export CONFIG_FILE="user.env"
@@ -2345,6 +2426,17 @@ private.check.user.state.machine.synced.with.root() {
 }
 
 private.check.headless.setup.started() {
+  # State 50 (2026-10-14): every computer gets su/setup's set — docker, node +
+  # npm, headless (VNC / Screen Sharing), samba support (docs/setup.md). The
+  # state machine's own arguments are not for setup all. A failure there is a
+  # warning, never a stop: rc 0, and a RESULT that is never a bare number
+  # (state.next would jump to it) — T-OO-STATE-50.
+  if private.this.script.load su/setup setup.all; then
+    setup.all
+  else
+    create.result 1 "su/setup not found in $OOSH_DIR — headless setup skipped"; warn.log "$RESULT"
+  fi
+  create.result 0 "state 50: $RESULT"
   return 0
 }
 

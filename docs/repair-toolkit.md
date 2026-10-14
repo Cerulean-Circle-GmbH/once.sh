@@ -15,13 +15,13 @@ listed here run only when invoked.
 |---|---|---|
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
 | [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
-| [`config init.shared`](config.md) | `sharedConfig` dir mode 2775 + group `dev` | After cross-user perm drift, "Permission denied" on shared config writes |
+| [`config init.shared`](config.md) | `sharedConfig` owned `root:dev` (top level), group `dev`, recursively `g+w`; `shared/dev` and the `Once.sh` base top level only: `root:dev`, `g+ws` | After cross-user perm drift, "Permission denied" on shared config writes, a `developking:dev` install |
 | [`oo update`](oo.md#the-retired-login-drop-in) | removes the retired `/etc/oosh/boot` link and `/etc/profile.d/oosh.sh` drop-in (boot is gone; a shell starts from `~/config/user.env`) | A host installed before boot was removed still has them. May ask for the sudo password once |
 | [`ossh rights.fix`](ossh.md) | `~/.ssh` file modes (600 private, 644 public, 700 dirs) | After SSH client complains about world-readable keys |
 | [`ossh folder.fix [strict]`](ossh.md) | `~/.ssh` tree layout (WODA Host blocks, IdentityFile paths, GitHub Host) | After `ssh: Bad configuration option`, missing `2cuGitHub` alias, drag-in legacy artifacts |
 | [`oo safeDirectory.prune`](oo.md#oosafedirectoryprune) | Stale entries in `git config --global safe.directory` | After many test runs or repeated installs bloated `~/.gitconfig`; symptom: Cursor / VS Code Source Control panel + branch picker empty |
 | [`ogit layout.status [base]`](ogit.md#layout) | Read-only report: one line per branch folder under the components base — `clone`/`worktree`, dirty/ahead/behind, `shared=` `setgid=` `trusted=` | First stop for any branch-folder trouble; rc 1 on a mixed layout. No privilege needed |
-| [`ogit safeDirectory.ensure [base]`](ogit.md#safedirectory) | One `safe.directory` entry per branch folder, for the calling user | `fatal: detected dubious ownership`; `layout.status` shows `trusted=no`. `oo update` and `oo user.fix` run it for you |
+| [`ogit safeDirectory.ensure [base]`](ogit.md#safedirectory) | One `safe.directory` entry per branch folder, for the calling user | `fatal: detected dubious ownership`; `layout.status` shows `trusted=no`. `oo update` and `oo user.fix` run it for you; `oo mode <branch>` trusts that branch folder, also when it is already current |
 | [`ogit repo.share <dir>`](ogit.md#repo) | One folder's `.git`: group `dev` + g+w, setgid, `core.sharedRepository=group` | `layout.status` shows `shared=no` or `setgid=no`; another dev user gets "Permission denied" writing objects. `sudo` when you do not own the folder |
 | [`ogit worktree.remove [base]`](ogit.md#migrating-a-host-from-worktrees-to-clones) | Converts every linked worktree under the base into an independent clone (gated; ignored files carried, backup kept in `~/.oosh.backups/`) | A host installed before the clone layout (`layout.status` shows `worktree` lines); a half-finished conversion. `ogit worktree.restore` is the reverse |
 | `user ssh.backup.status` | Legacy `$HOME/ssh.*` backup directories | A root-owned `ssh.original` or `ssh.<user>.<host>.for.<host>` in your home. Reports only, works unprivileged, rc 1 when it finds any |
@@ -88,7 +88,7 @@ explicitly when something drifts.
 | `~/oosh` is a real directory not a symlink | `oo user.fix` |
 | `~/config` not a symlink | `oo user.fix` |
 | `Permission denied` writing to `~/config/*.env` | `config init.shared` |
-| `sharedConfig` owned by `root:root` or mode `0775` | `config init.shared` |
+| `sharedConfig` owned by `developking` or `root:root`, or mode `0775` | `sudo -i ~root/oosh/config init.shared` (root's own oosh; plain `sudo config` is not found on Linux) |
 | `/etc/profile.d/oosh.sh` or `/etc/oosh/boot` still present (boot was removed) | `oo update` |
 | A shell without `.bashrc` (cron, `ssh host cmd`) has no oosh | `. ~/config/user.env` — or `source ~/oosh/this`, which reads it itself |
 | `Permissions … are too open` from ssh client | `ossh rights.fix` |

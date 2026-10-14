@@ -58,6 +58,19 @@ ossh config.save.last
 ossh list
 ```
 
+### Deleting a Config
+
+```bash
+# Remove the Host block of myvm from ~/.ssh/config (or from <file>)
+ossh config.delete myvm
+ossh config.delete myvm ~/some/other/ssh.config
+```
+
+The block is what `ossh config.get` shows: from `Host <name>` to the next empty
+line. The other blocks, the file's mode and its empty lines stay, so a later
+`ossh config.save.last` still appends a separate block. A host that is not
+there answers rc 2 "not found" (T-OSSH-CONFIG-DELETE).
+
 ### Generated Config Format
 
 ```
@@ -226,7 +239,7 @@ The remote install runs over ssh+sh (no bash on remote required), so this works 
 
 1. **Caller-supplied (wins when present).** If the caller has `~/.ssh/deploy_keys/2cuGitHub` locally, that exact key is transferred to `/home/shared/.ssh/2cuGitHub` on the remote. Use this when you rotate the deploy key on your laptop and want the new one pushed.
 
-2. **Fallback via `developking` (default).** If the caller doesn't have a local `deploy_keys/2cuGitHub`, `ossh.install.finish.local` seeds `/home/shared/.ssh/2cuGitHub` from `~developking/.ssh/id_rsa` — which was downloaded during state 31 from the oosh templates server (`test.wo-da.de`) or the local `templates/user/developking.ssh/` fallback. This is why "the connection happens automatically through developing": `developking` is always there, always has the key.
+2. **Fallback via the `developking` key (default).** If the caller doesn't have a local `deploy_keys/2cuGitHub`, GitHub access uses `~/.ssh/ids/ssh.developking/id_rsa`, which `osshLayout.role.developking` places for every user; the shared config is written by `ossh.config.shared.github.create`. The key itself was downloaded during state 31 from the oosh templates server (`test.wo-da.de`) or the local `templates/user/developking.ssh/` fallback. `developking` is an ordinary user (it owns none of the shared folders) and is also the remote account in `Host WODA.dev`; nothing reads the key from `~developking/.ssh` any more.
 
 Either way, `user.oosh.install` then copies `/home/shared/.ssh/`'s `2cuGitHub` + `config` (with the `Host 2cuGitHub` block) + `known_hosts` into every new user's own `~/.ssh/`, so `git clone 2cuGitHub:…`, `oo update`, and `oo checkout` just work for every oosh user.
 

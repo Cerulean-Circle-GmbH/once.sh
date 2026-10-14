@@ -355,20 +355,25 @@ ogit.remote.url.set()     # <url> <?remote:origin> <?dir:$OOSH_DIR> # point <rem
 }
 
 
-ogit.remote.fetch()     # <?prune:no> <?dir:$OOSH_DIR> # fetch origin into <dir>; prune=yes drops deleted remote branches #
+ogit.remote.fetch()     # <?prune:no> <?dir:$OOSH_DIR> <?tags:no> # fetch origin into <dir>; prune=yes drops deleted remote branches; tags=yes brings every tag of origin, also those on no branch #
 {
+ # tags last: every caller passes <dir> second (T-OGIT-REMOTE-FETCH-TAGS —
+ # main/ lacked the old stage-* tags, a plain fetch brings only the tags on a
+ # fetched branch).
  private.ogit.require || return $(result)
  local dir="${2:-${OOSH_DIR:-.}}"
- local prune=""
+ local prune="" tags=""
  [ "$1" = yes ] && prune="--prune"
+ [ "$3" = yes ] && tags="--tags"
  local rc
- private.ogit.git.run "$dir" fetch $prune origin; rc=$?
+ private.ogit.git.run "$dir" fetch $prune $tags origin; rc=$?
  private.ogit.fetchhead.share "$dir"   # T-OGIT-FETCHHEAD-SHARED
  if [ "$rc" = 0 ]; then create.result 0 "fetched origin into $dir"
  else create.result 1 "fetch from origin failed in $dir$(private.ogit.git.reason.get)"; fi
  return $(result)
 }
 ogit.remote.fetch.completion.prune() { echo no; echo yes; }
+ogit.remote.fetch.completion.tags() { echo no; echo yes; }
 
 
 ogit.remote.pull()     # <?url> <?branch> <?dir:$OOSH_DIR> # pull into <dir>; with <url> <branch> pull that branch from that URL instead of the tracking remote (the https fallback of oo.update) #
@@ -399,10 +404,49 @@ ogit.remote.push()     # <?branch> <?tags:no> <?dir:$OOSH_DIR> # push <branch> (
    create.result 0 "pushed ${branch:-tracking branch}${tags:+ with tags}"
  else
    create.result 1 "push of ${branch:-tracking branch} rejected — pull/resolve first$(private.ogit.git.reason.get)"
+   # Said, not only returned: on the Mac Studio a push from the wrong folder
+   # printed nothing and looked done (T-OGIT-REMOTE-PUSH-REPORTS).
+   error.log "$RESULT"
  fi
  return $(result)
 }
 ogit.remote.push.completion.tags()   { echo no; echo yes; }
+
+
+ogit.branch.remote.delete()     # <branch> <?mode:merged> <?dir:$OOSH_DIR> # delete <branch> on origin; never main, dev, testing or prod; mode merged only when every commit of it is in origin/dev, mode force also when not #
+{
+ # ogit could push a branch, not delete one: the user wanted only dev and
+ # main left (2026-10-14, T-OGIT-BRANCH-REMOTE-DELETE). The stages are the
+ # promote pipeline's and never go. Measured on the cached origin/* refs of
+ # <dir>: fetch first for a current answer.
+ private.ogit.require || return $(result)
+ local branch="$1" mode="${2:-merged}" dir="${3:-${OOSH_DIR:-.}}" n
+ if [ -z "$branch" ]; then
+   create.result 1 "ogit.branch.remote.delete: <branch> required"; error.log "$RESULT"; return $(result)
+ fi
+ case "$branch" in
+   main|dev|testing|prod|HEAD)
+     create.result 1 "$branch is a stage of the promote pipeline — it is never deleted"; error.log "$RESULT"; return $(result) ;;
+ esac
+ if ! ogit.branch.check "refs/remotes/origin/$branch" "$dir"; then
+   create.result 1 "origin has no branch $branch (fetch first: ogit remote.fetch \"\" $dir)"; error.log "$RESULT"; return $(result)
+ fi
+ if [ "$mode" != force ]; then
+   ogit.commit.count origin/dev "origin/$branch" "$dir" >/dev/null; n="$RESULT"
+   if [ "${n:-0}" != 0 ]; then
+     create.result 1 "origin/$branch has $n commit(s) that origin/dev does not — merge them, or drop them on purpose with mode force"; error.log "$RESULT"; return $(result)
+   fi
+ fi
+ if private.ogit.git.run "$dir" push origin --delete "$branch"; then
+   create.result 0 "deleted origin/$branch"
+ else
+   create.result 1 "could not delete origin/$branch$(private.ogit.git.reason.get)"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+ogit.branch.remote.delete.completion.branch() { ogit.branch.list remote 2>/dev/null | grep -vx 'main\|dev\|testing\|prod'; }
+ogit.branch.remote.delete.completion.mode() { echo merged; echo force; }
 
 
 ogit.index.add()     # <?scope:all> <?dir:$OOSH_DIR> <?paths...> # stage: all (-A), updated (-u, tracked files only), or the given <paths>; variadic, so <?dir> precedes <paths> #
@@ -824,6 +868,35 @@ ogit.commit.pick.abort()     # <?dir:$OOSH_DIR> # abort the pick in progress in 
 }
 
 
+ogit.commit.revert()     # <commit> <?mode:index> <?asEmail> <?asName> <?dir:$OOSH_DIR> # undo <commit> with the opposite change, history kept; mode index stages it (finish with ogit commit.create), mode commit commits it as "Revert ..."; on a conflict rc 1, the revert stays in progress and RESULT names the conflicted paths #
+{
+ private.ogit.require || return $(result)
+ local commit="$1"
+ local mode="${2:-index}"
+ local dir="${5:-${OOSH_DIR:-.}}"
+ if [ -z "$commit" ]; then
+   create.result 1 "ogit commit.revert requires <commit>"; error.log "$RESULT"; return $(result)
+ fi
+ local how
+ case "$mode" in
+   index)  how="--no-commit" ;;
+   commit) how="--no-edit" ;;
+   *) create.result 1 "ogit commit.revert: unknown mode '$mode' (index or commit)"; error.log "$RESULT"; return $(result) ;;
+ esac
+ private.ogit.identity "$3" "$4"
+ if private.ogit.git.run "$dir" "${OGIT_IDENTITY[@]}" revert $how "$commit" >/dev/null; then
+   create.result 0 "reverted $commit ($mode)"
+ else
+   # Left in progress on purpose, as commit.pick: resolve with replace, stage
+   # with ogit index.add, then commit with ogit commit.create.
+   local conflicts; conflicts=$(ogit.conflict.list "$dir" | tr '\n' ' ')
+   create.result 1 "revert of $commit stopped; conflicts: ${conflicts:-none, see ogit status.show}$(private.ogit.git.reason.get)"
+ fi
+ return $(result)
+}
+ogit.commit.revert.completion.mode() { echo index; echo commit; }
+
+
 ogit.caller.validate()     # <?treeRoot:$OOSH_DIR> # verify ogit is the only caller of the git binary in the tracked tree: every other raw git call carries a comment-anchored ogit-exception marker; echo an OK:/INVALID: verdict; rc 1 on any violation #
 {
   # THE RULE (D2 of docs/superpowers/specs/2026-09-23-ogit-clones-per-branch-design.md):
@@ -1058,7 +1131,10 @@ ogit.folder.finish()     # <folder> # after a clone/worktree lands under the bas
  # Under sudo the entry above is ROOT's; the person who typed the command needs
  # one too. Through the as-user preamble (private.this.as.user.preamble.get in this), and with the PHYSICAL
  # shared tree: root's $OOSH_DIR is /root/oosh, unreadable to that user.
- if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ]; then
+ # Only as root ($SUDO empty): `sudo -iu <user>` leaves SUDO_USER set in a
+ # user's shell, and the hop asked that user for a password
+ # (T-OGIT-FOLDER-FINISH-SUDO-USER-ROOT-ONLY).
+ if [ -z "$SUDO" ] && [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ]; then
    local sharedOosh
    sharedOosh=$(private.this.path.canonical "$OOSH_DIR")
    if private.this.script.load user private.as.user; then
@@ -1308,7 +1384,7 @@ private.ogit.clone.gate()     # <folder> <mainDir> # rc 0 when deleting the clon
  while IFS= read -r t; do
    [ -z "$t" ] && continue
    if ! ogit.tag.check "$t" "$main"; then
-     create.result 1 "$name has a tag $t that ${main##*/}/ does not — push it (ogit remote.push \"\" yes $d) and fetch it into $main (ogit remote.fetch no $main), or delete it first"; return $(result)
+     create.result 1 "$name has a tag $t that ${main##*/}/ does not — push it (ogit remote.push \"\" yes $d) and fetch it into $main (ogit remote.fetch no $main yes), or delete it first"; return $(result)
    fi
  done < <(ogit.tag.list "" "$d")
  create.result 0 "$name holds no ref of its own"

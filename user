@@ -668,12 +668,37 @@ private.get.basehome.darwin() # <username> #
     username=$USER
   fi
 
+  # root's home (/root, /var/root) is not under the users' base, so root asks
+  # the system for it. It used to answer the parent of developking's home —
+  # developking is an ordinary user, and nothing finds the shared tree through
+  # it (T-USER-BASEHOME-ROOT).
   if [ "$username" = "root" ]; then
-      username="developking"
-  fi 
-  
+    private.user.basehome.system.get
+    return
+  fi
+
   this.absolutePath "$(user.get home $username)/.."
   echo $RESULT
+}
+
+private.user.basehome.system.get() # # echo the base directory of the users' homes on this system: $OOSH_USERS_BASEHOME when set, else /Users on macOS, /home everywhere else
+{
+  # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+  # The ONE source of the system base: `user get basehome root` answers it, and
+  # ossh's private.ossh.users.basehome delegates here.
+  # Why not `dirname "$HOME"`: it is NOT portable for the base. On Linux root's
+  # $HOME is /root → dirname=/; on macOS root's $HOME is /var/root →
+  # dirname=/var, and code that builds /var/shared/... silently misses
+  # /Users/shared — the seeding bug reproduced on macstudio installs. $OSTYPE
+  # is a bash builtin: correct and cheap (T-USER-BASEHOME-OVERRIDE).
+  if [ -n "$OOSH_USERS_BASEHOME" ]; then
+    printf '%s\n' "$OOSH_USERS_BASEHOME"
+    return 0
+  fi
+  case "$OSTYPE" in
+    darwin*) printf '/Users\n' ;;
+    *)       printf '/home\n' ;;
+  esac
 }
 
 private.get.home.linux() # <username> # 
@@ -894,7 +919,7 @@ user.create()  # <username> <?password> <?uid> <?gid> # creates a new user with 
   # Auto-install oosh for the new user from the creator's current branch.
   # Soft-fail: if the shared infrastructure isn't there (e.g. pre-root-install)
   # the user account is still created; the symlinking step just gets skipped.
-  user.oosh.install "$name" || warn.log "user.oosh.install skipped for '$name' — see errors above"
+  user.oosh.install "$name" || warn.log "user.oosh.install skipped for '$name' — see messages above"
 
   RETURN=$1
 }
@@ -997,7 +1022,7 @@ user.password.set.completion.password() { :; }
 # newly-created user inherits the creator's current oosh branch automatically.
 #
 # Requires the system-level (root) install to have completed already — i.e.
-# developking and the shared/ tree must exist. When that's not the case the
+# the shared/ tree under `user get basehome root` must exist. When it is not, the
 # method soft-fails and user.create continues (the user account is still
 # created, just without the oosh symlinks).
 # ---------------------------------------------------------------------------
@@ -1063,19 +1088,24 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
     return 1
   fi
 
-  local targetHome devHome baseDir sharedConfig sharedOosh
+  local targetHome baseDir sharedConfig sharedOosh
   targetHome=$(user.get home "$username")
-  devHome=$(user.get home developking)
   if [ -z "$targetHome" ]; then
     error.log "user.oosh.install: cannot resolve home for '$username'"
     return 1
   fi
-  if [ -z "$devHome" ]; then
-    error.log "user.oosh.install: 'developking' user not found — run 'ossh install' (root) first"
+
+  # The shared tree lives under the system's users' base — never found through
+  # developking's home: developking is an ordinary user
+  # (T-USER-OOSH-INSTALL-NO-DEVELOPKING). No tree is an info, not an error:
+  # state 31 step 1's `user create developking` reaches this on every fresh
+  # install, before the tree exists, and step 5 retries it — the same quiet
+  # single-shot skip as the missing branch folder below. rc 1 all the same.
+  baseDir=$(user.get basehome root)
+  if [ ! -d "$baseDir/shared/EAMD.ucp" ]; then
+    info.log "user.oosh.install: shared tree missing at $baseDir/shared — skipping '$username' (run ${YELLOW}ossh install${NORMAL}; retried once the shared tree exists)"
     return 1
   fi
-
-  baseDir=$(dirname "$devHome")
   sharedConfig="$baseDir/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig"
   sharedOosh="$baseDir/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/$branch"
 
@@ -1151,7 +1181,7 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   " 2>/dev/null
 
   # Mark every folder under the shared base as safe for the new user (owned by
-  # root/developking, read by them). Clone layout (spec § 4): each folder is
+  # root or the user who cloned it, read by them). Clone layout (spec § 4): each folder is
   # its own repository with its own safe.directory entry, so ogit
   # safeDirectory.ensure walks the base. git's safe.directory is a string match
   # and macOS spells /Users/Shared where a caller may say /Users/shared — ogit
@@ -1173,7 +1203,7 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   " || error.log "user.oosh.install: could not install the .bashrc / session files for ${RED}$username${NORMAL}"
 
   # Ensure the user is in the shared-folder 'dev' group — the sharedConfig
-  # tree is drwxrwsr-x developking:dev, so anything oosh writes there
+  # tree is drwxrwsr-x root:dev, so anything oosh writes there
   # (log.live.out, state files, etc.) needs dev-group write access.
   # user.create adds this already; this second call is idempotent and covers
   # users who came in via ossh.install.user.remote without user.create
@@ -1264,6 +1294,9 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
     $RESULT "$username"
   fi
 
+  # nvm + node + npm in the user's own home (su/setup; T-USER-INSTALL-NODE)
+  private.user.oosh.install.node "$username"
+
   # Defensive sweep: a symlink inside $sharedOosh whose name matches a sibling
   # worktree (or this worktree itself) turns `git log <branch>` into
   # "ambiguous argument: both revision and filename" because git treats the
@@ -1351,6 +1384,21 @@ private.user.oosh.install.shell.linux() # <username> <targetHome> # ensures bash
       $SUDO sed -i "s|^$username:\(.*\):[^:]*\$|$username:\1:$bashPath|" /etc/passwd
     fi
   fi
+}
+
+private.user.oosh.install.node() # <username> # give <username> nvm + node + npm (su/setup nodejs / npm); a failure is a warning, never a failed install; rc 0 #
+{
+ # Install state 50 runs once, at the machine install: a user who gets oosh
+ # later (user create, ossh install <host> <user>) had no node (platform
+ # container, 2026-10-14). Every user passes through user.oosh.install.
+ local username="$1"
+ if ! private.this.script.load su/setup setup.nodejs; then
+   warn.log "user.oosh.install: su/setup not found in $OOSH_DIR — no node for '$username' (run: setup nodejs \"\" $username)"
+   return 0
+ fi
+ setup.nodejs "" "$username" || warn.log "user.oosh.install: no node for '$username' — $RESULT (run: setup nodejs \"\" $username)"
+ setup.npm "$username" || warn.log "user.oosh.install: no npm for '$username' — $RESULT"
+ return 0
 }
 
 private.user.oosh.install.groups.darwin() # <username> # macOS group memberships needed for SSH login and docker

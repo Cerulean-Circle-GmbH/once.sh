@@ -27,6 +27,78 @@ private.os.release.get()     # <key> <?file:/etc/os-release> # echo one value of
 }
 
 
+private.os.systemd.is()     # <?root:/> # rc 0 when systemd runs this computer: its run directory <root>/run/systemd/system is there and systemctl is on PATH; a container has none #
+{
+ # A predicate (rc only, no create.result), like private.this.container.is.
+ # Moved from su/setup, which needs it before it installs a service
+ # (T-OS-SYSTEMD-IS). <root> lets a test use a fixture.
+ local root="${1:-/}"
+ root="${root%/}"
+ [ -d "$root/run/systemd/system" ] && command -v systemctl >/dev/null 2>&1
+}
+
+
+os.service.on()     # <service> # switch the system service <service> on, now and at boot: systemd, else OpenRC, else SysV service on Linux; on macOS the system launch daemon <service> (a label like com.apple.smbd); rc 1 naming it when it cannot #
+{
+ # The one service switch (T-OS-SERVICE). su/setup called systemctl and
+ # launchctl raw; odocker's engine start and ossh's fail2ban carry the same
+ # Linux fallback chain inline.
+ local service="$1"
+ if [ -z "$service" ]; then
+   create.result 1 "os.service.on: <service> required"; error.log "$RESULT"; return $(result)
+ fi
+ if os.check private.os.service.on && $RESULT "$service"; then
+   create.result 0 "$service is on"
+ else
+   create.result 1 "$service could not be switched on"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+private.os.service.on.linux()     # <service> # systemctl enable --now, else rc-update add + rc-service start, else service start #
+{
+ $SUDO systemctl enable --now "$1" >/dev/null 2>&1 \
+   || { $SUDO rc-update add "$1" default >/dev/null 2>&1 && $SUDO rc-service "$1" start >/dev/null 2>&1; } \
+   || $SUDO service "$1" start >/dev/null 2>&1
+}
+
+private.os.service.on.darwin()     # <label> # launchctl enable system/<label>, then bootstrap its LaunchDaemons plist; a daemon already loaded is on #
+{
+ $SUDO launchctl enable "system/$1" >/dev/null 2>&1
+ # bootstrap refuses a daemon that is already loaded: then it is on.
+ $SUDO launchctl bootstrap system "/System/Library/LaunchDaemons/$1.plist" >/dev/null 2>&1 \
+   || $SUDO launchctl print "system/$1" >/dev/null 2>&1
+}
+
+
+os.service.off()     # <service> # switch the system service <service> off, now and at boot: systemd, else OpenRC, else SysV service on Linux; the system launch daemon <service> on macOS; rc 1 naming it when it cannot #
+{
+ local service="$1"
+ if [ -z "$service" ]; then
+   create.result 1 "os.service.off: <service> required"; error.log "$RESULT"; return $(result)
+ fi
+ if os.check private.os.service.off && $RESULT "$service"; then
+   create.result 0 "$service is off"
+ else
+   create.result 1 "$service could not be switched off"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+private.os.service.off.linux()     # <service> # systemctl disable --now, else rc-service stop + rc-update del, else service stop #
+{
+ $SUDO systemctl disable --now "$1" >/dev/null 2>&1 \
+   || { $SUDO rc-service "$1" stop >/dev/null 2>&1 && $SUDO rc-update del "$1" default >/dev/null 2>&1; } \
+   || $SUDO service "$1" stop >/dev/null 2>&1
+}
+
+private.os.service.off.darwin()     # <label> # launchctl bootout system/<label>, then disable it; a daemon not loaded is off #
+{
+ $SUDO launchctl bootout "system/$1" >/dev/null 2>&1
+ $SUDO launchctl disable "system/$1" >/dev/null 2>&1
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,6 +251,60 @@ private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI 
 # ─────────────────────────────────────────────────────────────────────────────
 # PLATFORM TESTING
 # ─────────────────────────────────────────────────────────────────────────────
+
+private.os.platform.image.exists() # <imageTag> # rc 0 when the image <imageTag> is on this host
+{
+  # A predicate (rc only, no create.result), like private.this.container.is.
+  docker image inspect "$1" >/dev/null 2>&1
+}
+
+private.os.shell.files.list() # <dir> # echo the tracked files of <dir> whose first line is a #! naming sh or bash, one per line, relative to <dir>
+{
+  # NO create.result — a getter consumed as $(...).
+  local f line
+  while IFS= read -r f; do
+    [ -f "$1/$f" ] || continue
+    IFS= read -r line < "$1/$f" || continue
+    case "$line" in ('#!'*sh*) printf '%s\n' "$f" ;; esac
+  done < <(ogit.repo.files.list "$1")
+}
+
+os.platform.parse.check() # <?platform:almalinux_9> <?dir:$OOSH_DIR> # bash -n every tracked shell file of <dir> with the bash of the image of <platform> — almalinux_9 has the oldest bash oosh runs on (5.1); rc 1 naming each file that does not parse
+{
+  # test.oo did not even load on almalinux_9: bash 5.1 reads a case pattern
+  # without its "(" inside $( ( … ) ) as a syntax error, Ubuntu's and macOS's
+  # bash 5.2 do not — only a promotion's platform test found it (2026-10-14,
+  # T-OS-PLATFORM-PARSE-CHECK). The tree goes into a throwaway container of
+  # the image as a tar on stdin (odocker image.command); nothing is installed.
+  local platform="${1:-almalinux_9}" dir="${2:-$OOSH_DIR}" imageTag files n out version failed
+  if ! private.os.platform.parse "$platform"; then
+    create.result 1 "unknown platform $platform — os platform.list names them"; error.log "$RESULT"; return $(result)
+  fi
+  if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+    create.result 1 "$platform is native — it has no image to check with"; error.log "$RESULT"; return $(result)
+  fi
+  imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
+  if ! private.os.platform.image.exists "$imageTag"; then
+    create.result 1 "no image $imageTag on this host — os platform.test $platform builds it"; error.log "$RESULT"; return $(result)
+  fi
+  private.this.script.load ogit ogit.repo.files.list || { create.result 1 "ogit not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+  private.this.script.load odocker odocker.image.command || { create.result 1 "odocker not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+  files=$(private.os.shell.files.list "$dir")
+  n=$(printf '%s\n' "$files" | grep -c .)
+  out=$( (cd "$dir" && printf '%s\n' "$files" | tar -cf - -T -) \
+    | odocker.image.command "$imageTag" 'd=$(mktemp -d) && cd "$d" && tar -xf - && bash --version | head -1 && find . -type f | sort | while read -r f; do bash -n "$f" 2>&1 | head -1; done' )
+  version=$(printf '%s\n' "$out" | head -1)
+  failed=$(printf '%s\n' "$out" | tail -n +2 | sed -n 's|^\./\([^:]*\): line .*|\1|p' | sort -u)
+  if [ -n "$failed" ]; then
+    printf '%s\n' "$out" | tail -n +2 | while IFS= read -r line; do [ -n "$line" ] && error.log "$line"; done
+    create.result 1 "$(printf '%s\n' "$failed" | grep -c .) of $n shell files do not parse with $version: $(echo $failed)"
+  else
+    create.result 0 "$n shell files parse with $version"
+  fi
+  return $(result)
+}
+
+os.platform.parse.check.completion.platform() { private.os.platform.load; private.os.platform.names; }
 
 os.platform.list() # # lists all platforms with tier info
 {
