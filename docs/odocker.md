@@ -382,6 +382,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 |--------|-----------|-------------|
 | `exec <container>` | container name, optional shell (default: bash) | Shell into running container (interactive `-it`) |
 | `exec.command <container> <command...>` | container name, command to run | Run a non-interactive command inside a running container (no TTY); for scripts/state machines |
+| `image.command <image> <command...>` | image, command to run | Run one command in a throwaway container of `<image>` (removed afterwards), stdin passed in, rc the command's; `os platform.parse.check` streams a tree in this way (T-ODOCKER-IMAGE-COMMAND) |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
 

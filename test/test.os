@@ -308,6 +308,44 @@ test.os.systemdIs() {
 test.case $level "T-OS-SYSTEMD-IS: rc 0 only when systemd runs this computer" test.os.systemdIs
 expect 0 "systemd only when its run directory is there" "su/setup had its own systemd check"
 
+# T-OS-PLATFORM-PARSE-CHECK: os platform.parse.check — bash -n of every tracked shell file with the bash of a platform image
+# test.oo did not even load on almalinux_9 (bash 5.1: a case pattern without
+# its "(" inside $( ( … ) )), only Ubuntu's and macOS's bash 5.2 had read it —
+# found by a promotion's platform test (2026-10-14). The check runs on this
+# host in the platform's image; here odocker.image.command runs the command
+# locally, the logic is what is tested. A tree: a good script, one that does
+# not parse, a file that is no script.
+test.os.platformParseCheck() {
+  local fx bad="" got; fx=$(test.suite.fixture.make osparsecheck); mkdir -p "$fx/tree/test"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo ok' > "$fx/tree/good"
+  printf '%s\n' '#!/bin/bash' 'if then' > "$fx/tree/test/test.bad"
+  printf '%s\n' '# notes' 'if then' > "$fx/tree/notes.md"
+  git -C "$fx/tree" init -q; git -C "$fx/tree" add -A
+  test.os.platformParseCheck.run() { # <platform>
+    : > "$fx/log"
+    ( FX="$fx"
+      odocker.image.command() { echo "image $1" >> "$FX/log"; sh -c "$2"; }
+      private.os.platform.image.exists() { [ "$1" = naked_alma_9_sshd ]; }
+      os.platform.parse.check "$1" "$fx/tree" >/dev/null 2>&1; echo "$?|$RESULT" )
+  }
+  got=$(test.os.platformParseCheck.run almalinux_9)
+  case "$got" in "1|1 of 2 shell files do not parse with "*": test/test.bad") ;; *) bad="$bad bad-tree=[$got]" ;; esac
+  grep -q "^image naked_alma_9_sshd$" "$fx/log" || bad="$bad image=[$(cat "$fx/log")]"
+  rm "$fx/tree/test/test.bad"; git -C "$fx/tree" add -A
+  got=$(test.os.platformParseCheck.run almalinux_9)
+  case "$got" in "0|1 shell files parse with "*) ;; *) bad="$bad good-tree=[$got]" ;; esac
+  got=$(test.os.platformParseCheck.run debian_12)
+  case "$got" in "1|"*"no image naked_debian_12"*) ;; *) bad="$bad no-image=[$got]" ;; esac
+  got=$(test.os.platformParseCheck.run macos)
+  case "$got" in "1|"*"native"*) ;; *) bad="$bad native=[$got]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the shell files of a tree parsed with the bash of a platform image; the ones that do not are named" || create.result 1 "parse check:$bad"
+  return $(result)
+}
+test.case $level "T-OS-PLATFORM-PARSE-CHECK: bash -n of every tracked shell file with the bash of a platform image" test.os.platformParseCheck
+expect 0 "the shell files of a tree parsed with the bash of a platform image; the ones that do not are named" \
+  "test.oo did not load on almalinux_9 (bash 5.1) — only a promotion's platform test found it"
+
 ### test.method
 
 test.suite.save.results
