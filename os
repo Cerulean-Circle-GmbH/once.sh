@@ -252,6 +252,60 @@ private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI 
 # PLATFORM TESTING
 # ─────────────────────────────────────────────────────────────────────────────
 
+private.os.platform.image.exists() # <imageTag> # rc 0 when the image <imageTag> is on this host
+{
+  # A predicate (rc only, no create.result), like private.this.container.is.
+  docker image inspect "$1" >/dev/null 2>&1
+}
+
+private.os.shell.files.list() # <dir> # echo the tracked files of <dir> whose first line is a #! naming sh or bash, one per line, relative to <dir>
+{
+  # NO create.result — a getter consumed as $(...).
+  local f line
+  while IFS= read -r f; do
+    [ -f "$1/$f" ] || continue
+    IFS= read -r line < "$1/$f" || continue
+    case "$line" in ('#!'*sh*) printf '%s\n' "$f" ;; esac
+  done < <(ogit.repo.files.list "$1")
+}
+
+os.platform.parse.check() # <?platform:almalinux_9> <?dir:$OOSH_DIR> # bash -n every tracked shell file of <dir> with the bash of the image of <platform> — almalinux_9 has the oldest bash oosh runs on (5.1); rc 1 naming each file that does not parse
+{
+  # test.oo did not even load on almalinux_9: bash 5.1 reads a case pattern
+  # without its "(" inside $( ( … ) ) as a syntax error, Ubuntu's and macOS's
+  # bash 5.2 do not — only a promotion's platform test found it (2026-10-14,
+  # T-OS-PLATFORM-PARSE-CHECK). The tree goes into a throwaway container of
+  # the image as a tar on stdin (odocker image.command); nothing is installed.
+  local platform="${1:-almalinux_9}" dir="${2:-$OOSH_DIR}" imageTag files n out version failed
+  if ! private.os.platform.parse "$platform"; then
+    create.result 1 "unknown platform $platform — os platform.list names them"; error.log "$RESULT"; return $(result)
+  fi
+  if [ "$PLATFORM_WORKSPACE" = "native" ]; then
+    create.result 1 "$platform is native — it has no image to check with"; error.log "$RESULT"; return $(result)
+  fi
+  imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
+  if ! private.os.platform.image.exists "$imageTag"; then
+    create.result 1 "no image $imageTag on this host — os platform.test $platform builds it"; error.log "$RESULT"; return $(result)
+  fi
+  private.this.script.load ogit ogit.repo.files.list || { create.result 1 "ogit not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+  private.this.script.load odocker odocker.image.command || { create.result 1 "odocker not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+  files=$(private.os.shell.files.list "$dir")
+  n=$(printf '%s\n' "$files" | grep -c .)
+  out=$( (cd "$dir" && printf '%s\n' "$files" | tar -cf - -T -) \
+    | odocker.image.command "$imageTag" 'd=$(mktemp -d) && cd "$d" && tar -xf - && bash --version | head -1 && find . -type f | sort | while read -r f; do bash -n "$f" 2>&1 | head -1; done' )
+  version=$(printf '%s\n' "$out" | head -1)
+  failed=$(printf '%s\n' "$out" | tail -n +2 | sed -n 's|^\./\([^:]*\): line .*|\1|p' | sort -u)
+  if [ -n "$failed" ]; then
+    printf '%s\n' "$out" | tail -n +2 | while IFS= read -r line; do [ -n "$line" ] && error.log "$line"; done
+    create.result 1 "$(printf '%s\n' "$failed" | grep -c .) of $n shell files do not parse with $version: $(echo $failed)"
+  else
+    create.result 0 "$n shell files parse with $version"
+  fi
+  return $(result)
+}
+
+os.platform.parse.check.completion.platform() { private.os.platform.load; private.os.platform.names; }
+
 os.platform.list() # # lists all platforms with tier info
 {
   private.os.platform.load

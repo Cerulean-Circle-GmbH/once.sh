@@ -33,6 +33,8 @@ sudo -i ~root/oosh/su/setup samba.password alice
    (used by `user create` and `ossh install <host> <user>`) runs `setup nodejs`
    and `setup npm` for that user (`private.user.oosh.install.node`). A failure
    there is a warning, never a failed install. npm comes with it.
+   `.bashrc` loads nvm and then puts `~/oosh` back in front of nvm's node on PATH
+   (`this.path.add`, T-BASHRC-NVM-NOT-FIRST): oosh stays first, node is there.
 . **Samba shares each user's own home folder, and only that** (`[homes]`,
    `valid users = %S`, new files 0700), from `templates/setup/samba.homes.conf`
    — copied to `/etc/samba/oosh.homes.conf` and included by one line in
