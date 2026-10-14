@@ -41,7 +41,7 @@ sudo -i ~root/oosh/su/setup samba.password alice
 | Method | Parameters | What it does |
 |--------|------------|--------------|
 | `all` | `<?user:$SUDO_USER>` | docker, nodejs + npm for `<user>`, the caller and every member of `dev` (`private.this.group.members.get`), headless, samba.support. Prints a summary; RESULT `headless setup: N ok, M skipped, K failed (names)`; always rc 0 |
-| `docker` | `<?user>` | `odocker prereqs.install <user>`: the engine on a computer, the client in a container, `<user>` in the socket's group |
+| `docker` | `<?user>` | `odocker prereqs.install <user>`: the engine on a computer, the client in a container, `<user>` in the socket's group. *Skipped* where no Docker can run: no socket and no engine possible (a Mac VM without virtualization, a container started without the socket) |
 | `nvm` | `<?user> <?version:v0.40.3>` | nvm's official installer, downloaded to `/tmp`, run as `<user>` with `PROFILE=/dev/null` (the login already loads nvm); nothing when `~<user>/.nvm/nvm.sh` is there — asked as `<user>`, since the caller may not see into that home |
 | `nodejs` | `<?version:--lts> <?user>` | `setup nvm`, then `nvm install <version>` as `<user>`; rc 1 when `node -v` does not answer |
 | `npm` | `<?user>` | npm of nvm's node only; rc 1 "no npm for <user> — run: setup nodejs" when it is missing. Never the package manager (on Ubuntu that pulls in the system nodejs 18) |
