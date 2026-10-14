@@ -46,7 +46,7 @@ sudo -i ~root/oosh/su/setup samba.password alice
 | `nodejs` | `<?version:--lts> <?user>` | `setup nvm`, then `nvm install <version>` as `<user>`; rc 1 when `node -v` does not answer |
 | `npm` | `<?user>` | npm of nvm's node only; rc 1 "no npm for <user> — run: setup nodejs" when it is missing. Never the package manager (on Ubuntu that pulls in the system nodejs 18) |
 | `headless` | `<?user>` | Linux: `vncserver`, `startxfce4`, `xfwm4`, `xfce4-panel`, `xfce4-terminal`, `dbus-launch` through `oo cmd`; the service stays off. macOS: Screen Sharing on |
-| `vnc.password` | `<user>` | `vncpasswd` as `<user>`, `session=xfce` in `~/.vnc/config`, the first free display in `/etc/tigervnc/vncserver.users`, `systemctl enable --now vncserver@:<n>` (port 5900+n). macOS: nothing to set |
+| `vnc.password` | `<user>` | `vncpasswd` as `<user>`, `session=xfce` in `~/.vnc/config`, the first free display in `/etc/tigervnc/vncserver.users`, `os service.on <unit>@:<n>` (port 5900+n) — the unit is the package's: `tigervncserver` on Debian/Ubuntu, `vncserver` on Fedora/RHEL (`private.setup.vnc.unit.get`). macOS: nothing to set |
 | `samba.support` | `<?user>` | Linux: `smbd`, `smbclient`, `avahi-daemon` through `oo cmd`, smbd/nmbd switched off again (Debian starts them), `/etc/avahi/services/smb.service` from `templates/setup/avahi.smb.service`. macOS: File Sharing (SMB) on |
 | `samba.password` | `<user>` | `smbpasswd -a <user>`, `systemctl enable --now smbd avahi-daemon`. macOS: the System Settings step |
 
