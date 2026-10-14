@@ -33,8 +33,15 @@ sudo -i ~root/oosh/su/setup samba.password alice
    (used by `user create` and `ossh install <host> <user>`) runs `setup nodejs`
    and `setup npm` for that user (`private.user.oosh.install.node`). A failure
    there is a warning, never a failed install. npm comes with it.
-6. netatalk (AFP) is gone: macOS speaks SMB. Avahi stays, so the Finder sees
-   the Samba share.
+. **Samba shares each user's own home folder, and only that** (`[homes]`,
+   `valid users = %S`, new files 0700), from `templates/setup/samba.homes.conf`
+   — copied to `/etc/samba/oosh.homes.conf` and included by one line in
+   `smb.conf`, which otherwise stays as the distribution ships it.
+8. **VNC listens on this computer only** (TigerVNC's default). From another
+   computer through an SSH tunnel: `ssh -L 5901:localhost:5901 <host>`, then a
+   VNC viewer on `localhost:5901` — the VNC password is weak (8 characters
+   count) and the connection is not encrypted. `setup vnc.password` prints the
+   line.
 
 ## Methods
 
@@ -46,8 +53,8 @@ sudo -i ~root/oosh/su/setup samba.password alice
 | `nodejs` | `<?version:--lts> <?user>` | `setup nvm`, then `nvm install <version>` as `<user>`; rc 1 when `node -v` does not answer |
 | `npm` | `<?user>` | npm of nvm's node only; rc 1 "no npm for <user> — run: setup nodejs" when it is missing. Never the package manager (on Ubuntu that pulls in the system nodejs 18) |
 | `headless` | `<?user>` | Linux: `vncserver`, `startxfce4`, `xfwm4`, `xfce4-panel`, `xfce4-terminal`, `dbus-launch` through `oo cmd`; the service stays off. macOS: Screen Sharing on |
-| `vnc.password` | `<user>` | `vncpasswd` as `<user>`, `session=xfce` in `~/.vnc/config`, the first free display in `/etc/tigervnc/vncserver.users`, `os service.on <unit>@:<n>` (port 5900+n) — the unit is the package's: `tigervncserver` on Debian/Ubuntu, `vncserver` on Fedora/RHEL (`private.setup.vnc.unit.get`). macOS: nothing to set |
-| `samba.support` | `<?user>` | Linux: `smbd`, `smbclient`, `avahi-daemon` through `oo cmd`, smbd/nmbd switched off again (Debian starts them), `/etc/avahi/services/smb.service` from `templates/setup/avahi.smb.service`. macOS: File Sharing (SMB) on |
+| `vnc.password` | `<user>` | `vncpasswd` as `<user>`, `session=xfce` in `~/.vnc/config`, the first free display in `/etc/tigervnc/vncserver.users`, `os service.on <unit>@:<n>` (port 5900+n), local only — RESULT names the `ssh -L` tunnel (decision 8); the unit is the package's: `tigervncserver` on Debian/Ubuntu, `vncserver` on Fedora/RHEL (`private.setup.vnc.unit.get`). macOS: nothing to set |
+| `samba.support` | `<?user>` | Linux: `smbd`, `smbclient`, `avahi-daemon` through `oo cmd`, smbd/nmbd switched off again (Debian starts them), `/etc/avahi/services/smb.service` from `templates/setup/avahi.smb.service`, and `[homes]` (decision 7) via `/etc/samba/oosh.homes.conf` + one `include` line in `smb.conf`. macOS: File Sharing (SMB) on |
 | `samba.password` | `<user>` | `smbpasswd -a <user>`, `systemctl enable --now smbd avahi-daemon`. macOS: the System Settings step |
 
 Package names per package manager come from `private.setup.package.get`, the
@@ -72,7 +79,7 @@ one table (apt `tigervnc-standalone-server`, dnf `tigervnc-server`,
 | a temp folder, a download | `private.this.temp.dir.get`, `private.this.url.download` |
 | a line in a file, once | `private.this.file.line.ensure` |
 | a file owner | `private.this.path.owner.set` |
-| the Avahi SMB announcement | the template `templates/setup/avahi.smb.service`, copied when `private.this.file.same` says it differs |
+| the Avahi SMB announcement, the `[homes]` share | the templates `templates/setup/avahi.smb.service` and `samba.homes.conf`, copied by `private.setup.template.install` when `private.this.file.same` says they differ |
 | the members of dev | `private.this.group.members.get` |
 
 Every `<user>` parameter completes from `user list`
