@@ -29,7 +29,10 @@ sudo -i ~root/oosh/su/setup samba.password alice
 5. **Node.js through nvm.** The official installer is pinned to
    `SETUP_NVM_VERSION`, Node is the current LTS by default, and it goes to the
    one who ran sudo, to root and to every member of group `dev`, each in its own
-   home (bash-user had none in the first container run). npm comes with it.
+   home. **Every user who gets oosh later gets it too**: `user oosh.install`
+   (used by `user create` and `ossh install <host> <user>`) runs `setup nodejs`
+   and `setup npm` for that user (`private.user.oosh.install.node`). A failure
+   there is a warning, never a failed install. npm comes with it.
 6. netatalk (AFP) is gone: macOS speaks SMB. Avahi stays, so the Finder sees
    the Samba share.
 
@@ -60,6 +63,11 @@ which is never a bare number (a numeric RESULT would make `state.next` jump to
 that state). State 51 (`headless.setup.finished`) does nothing. Each state check
 runs in its own `state` process, so the summary and the next steps are printed
 by `setup all` itself.
+
+A user added after the install gets the per-user part through
+`user oosh.install`. Docker: its groups step puts the user in the docker group.
+Node + npm: `private.user.oosh.install.node`. VNC and Samba stay on demand
+(`vnc.password` / `samba.password`).
 
 ## Tests
 
