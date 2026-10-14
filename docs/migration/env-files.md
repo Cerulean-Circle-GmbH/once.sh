@@ -326,7 +326,7 @@ The older branches were never targets for these fixes — they pre-date the **sh
 
 **Why is `OOSH_BRANCH=prod` saved at all?** Because `oo mode <name>` deliberately calls `config save oosh OOSH` to persist which release line the user is on. It's not a leak; the filter intentionally allows it. Filtering only removes per-machine absolutes, not per-user choices.
 
-**What about pre-fix damaged installs?** Any install done before 2026-05-08 may have `sharedConfig` as `<user>:root 0775` instead of `developking:dev 2775`. Recovery is `config init.shared` (or the manual `chown -R developking:dev <path>; chmod -R g+w <path>` from the body of `03fe62b`'s commit message).
+**What about pre-fix damaged installs?** Any install done before 2026-05-08 may have `sharedConfig` as `<user>:root 0775` instead of `root:dev 2775`. Recovery is `sudo config init.shared` (owner `root:dev`; it also repairs old `developking:dev` installs, touching only what drifted).
 
 **Why is the repair `config init.*` explicit rather than automatic?** The May 8 saga proved that auto-repair on every shell startup (the deleted block in `03fe62b`) is fragile and clobbers shared state under sudo chains. The repair primitives now run only when called.
 

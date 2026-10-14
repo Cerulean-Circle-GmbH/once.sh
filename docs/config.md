@@ -192,10 +192,17 @@ export PATH="/home/me/oosh:/home/me/oosh/ng:/opt/homebrew/bin:/home/me/.local/bi
 The PATH is frozen per user until the next save: a directory the system adds
 later reaches the shell after `config session.save` (starting `this` or `log` saves
 too — before it puts the session-only `~/oosh/init` and `~/oosh/external` on PATH,
-which a login PATH never carries; T-THIS-START-SESSION-PATH).
+which a login PATH never carries; T-THIS-START-SESSION-PATH). The filter drops
+both whoever saves, so an as-user hop from a process that has them — the install
+run's `user oosh.install developking` — cannot freeze them into the target's file
+either (T-CONFIG-USER-SESSION-PATH-NO-SESSION-DIRS, T-THIS-AS-USER-PREAMBLE-SESSION-PATH).
 `.bashrc`, `source this` and the remote prelude (`ossh.remote.prelude.get`) all
 read it. It cannot guard itself, so `this` drops repeated segments on every
 `source this` (`private.this.path.dedup`, T-THIS-PATH-NO-GROWTH).
+
+**`path save` is the user front for that file.** `path save` runs `config session.save` for this shell's PATH (so the same segment filter applies) and lists the result; `path saved` lists what a new login gets; `path edit` opens the saved list, one directory per line, in `$EDITOR` and saves it through the same filter. `path load` sets the PATH of the calling shell from the saved file — only when `path` is sourced and by its dotted name (`source path; path.load` — `path load` would run the script again, as a child); as a command it changes nothing and says so. `path load <file>` reads an old `~/paths` (one directory per line, from `test/mcdonges.latest`): `source path; path.load ~/paths; path save` migrates it once. `path add` and `push` are aliases of `append`, `put` of `prepend`, `rm` of `remove` and stay session-only; follow them with `path save` to keep the change. Covered by `test.path` T-PATH-SAVE-*, T-PATH-SAVED-LISTS, T-PATH-LOAD-* and T-PATH-EDIT-*.
+
+**Limitation.** `config session.save` also runs on `oo mode`, on `config save` and on the first `this` or `log` of an empty shell, and each writes the PATH of *its own* shell. A shell opened *before* a `path save` therefore writes its older PATH back over the save. Shells opened after the save carry it, so for them this is harmless; `path save` prints a line about it.
 
 Before a shared config is switched (*The switch and its gate*, below), the
 shared `user.env` still carries the old shared line written by
@@ -241,7 +248,7 @@ line itself.
 | remote / sudo string | `ossh`, `user` ×2, `hiveMind` ×3, `this` (as-user preamble) | executed on another host or as another user, where no `user.env` has been read |
 | sourced before `user.env` | `ossh.start`, `this` (file scope, `this.path.add`, `private.this.path.dedup`) | colon-anchored or a rewrite of the value already there |
 | repair, not build | `oo.mode` ×2, `this.init` | rewriting a branch name already in PATH, or saving and restoring PATH across a mid-session `source "$CONFIG"` |
-| session scope | `oo` (brew, `ONCE_LOAD_DIR`), `claudeCode`, `path.append`/`prepend`/`remove` | deliberately affects only the running shell |
+| session scope | `oo` (brew, `ONCE_LOAD_DIR`), `claudeCode`, `path.append`/`prepend`/`remove`, `path.load`, and `path.edit`'s subshell (its list goes through `config.session.save`) | deliberately affects only the running shell |
 | diagnostics | `debug`'s `p`, banners, `path.env` | they print `PATH=`, they do not set it |
 
 Enforced by **`path validate [<treeRoot>]`** — the same sweep as the anchors (plus
@@ -277,16 +284,18 @@ Canonical state (what `init/oosh` produces and what these methods enforce):
 |---|---|---|
 | `~/config` symlink | `<user>:<user>` (NOT `<user>:dev`) | symlink |
 | `~/oosh` symlink   | `<user>:<user>` | symlink |
-| `~/config` target (`…/sharedConfig/`) | `developking:dev` | dir-default + `g+w` (no SGID) |
+| `~/config` target (`…/sharedConfig/`) | `root:dev` (top level only; developking is an ordinary user) | `g+w`, SGID on the top level (state 31 `chmod g+s`) |
+| `<base>/shared/dev/` | `root:dev` (top level only — `Workspaces/` holds every user's clones) | `g+w`, SGID on the top level |
 | files in `sharedConfig/` | per-creator | group `dev`, `g+w` |
 | `oosh.env` | **pure data** — only `export OOSH_*="…"` lines; no self-anchor | written by `config save oosh OOSH`: **every** `OOSH_*` variable, a value under the saving user's home written `"$HOME/…"` (the config is shared). Only `OOSH_BRANCH` is left out — install input, not state. |
 | `user.env` | **pure data** — the `CONFIG_*` anchors, `BASH_FILE`, then `. $CONFIG_PATH/oosh.env` and `. $CONFIG_PATH/log.env`, last `. $HOME/.config/oosh/user.session.env` | written by `config save` — what `.bashrc` and `source this` start a shell from (the MacStudio model); see *Saving Configuration* below. |
 
 The four `config init.*` repair methods plus `init.full` (which composes them)
-mirror install state 31 (the `config save` call, then the group `dev` and
-`chmod -R g+w` steps on `$CONFIG_PATH`). They explicitly do **not** add
-SGID 2775 to the files — `private.ensure.sharedTree` sets group and `g+w` only;
-group ownership on writes is enforced by every writer calling
+mirror install state 31 (the `config save` call, then the `root:dev` owner of
+the top level, the group `dev` and `chmod -R g+w` steps on `$CONFIG_PATH`).
+They explicitly do **not** add SGID 2775 to the files —
+`private.ensure.sharedTree` sets the top-level owner (only when asked), group
+and `g+w`; group ownership on writes is enforced by every writer calling
 `private.ensure.groupWrite`.
 
 #### `config.init.full [<username>]`
@@ -301,12 +310,32 @@ sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_
 ```
 
 #### `config.init.shared`
-Ensures the shared `sharedConfig/` directory has group `dev`, recursively
-`g+w`, and removes any self-referential symlink at
-`sharedConfig/sharedConfig`. Mirrors install at `oo:1462–1463`. Idempotent.
+Finds the shared tree under `user get basehome root` (never through
+developking's home; a missing tree is rc 1, "shared tree missing at
+<base>/shared — run ossh install"). Ensures `sharedConfig/` is owned
+`root:dev` at the top level (not recursive — files keep their writers), has
+group `dev`, recursively `g+w`, and removes any self-referential symlink at
+`sharedConfig/sharedConfig`. `<base>/shared/dev/` (when present) is touched at
+its **top level only** — owner `root`, group `dev`, `g+ws`
+(`private.this.shared.top.ensure`); its `Workspaces/` hold every user's clones,
+which keep their own group and mode. The same holds for the `Once.sh/` base of
+the branch folders (`<base>/shared/EAMD.ucp/Components/…/Once.sh`): top level
+only, each branch folder keeps its owner. Each of those steps runs only when it
+drifted, so on a repaired machine `shared/dev` needs no sudo. This is how a
+machine installed with `developking:dev` is repaired — developking is an
+ordinary user. The owner step uses sudo only when the caller is not root and
+the owner is wrong, and never in a test run (`OOSH_NO_INSTALL`); when it
+cannot, the method answers rc 1 and says `run: sudo -i <root home>/oosh/config
+init.shared` — root's own `config` by its path, so everything it loads comes
+from root's own `~/oosh`, one branch. Plain `sudo config` finds nothing on Linux
+(sudo's `secure_path` has no `~/oosh`); and a `config` started from another
+folder loads root's `this`, from whatever branch root is on (Mac Studio,
+2026-10-13). When root's oosh is not on the branch you need, switch it first:
+`sudo -i ~root/oosh/oo mode <branch>`.
+Idempotent.
 
 ```bash
-./config init.shared
+sudo -i ~root/oosh/config init.shared
 ```
 
 #### `config.init.user [<username>]`
@@ -686,7 +715,7 @@ These functions are used internally and generally not called directly:
 | `private.config.required.variables.get` | the required-variable table, as data |
 | `private.config.file.resolve` | the effective file for the current `$CONFIG_FILE` |
 | `private.config.env.lines.drop` | `<file> <prefix…>` → drops every line starting with a prefix, in place (owner, group, mode kept); an unchanged file is not rewritten; rc 1 + `RESULT` when the file cannot be written |
-| `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written |
+| `private.config.env.line.append` | `<file> <line>` → appends the line unless it is already there, in place; rc 1 + `RESULT` when the file cannot be written. Calls `private.this.file.line.ensure`, the one definition |
 
 `config` also leans on the kernel's helpers (full list:
 [oosh-architecture.md § Kernel helpers](oosh-architecture.md#kernel-helpers)):

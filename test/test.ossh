@@ -222,6 +222,38 @@ else
   expect.fail "HostName should be 'testhost', got: $HOSTNAME_LINE"
 fi
 
+# T-OSSH-CONFIG-CREATE-ID-PORTABLE: a key under $HOME is written as ~/…, which
+# ssh expands itself. os platform.test wrote `IdentityFile /home/hannesn/.ssh/
+# id_ed25519` into ~/.ssh/config, and test.platform.ssh.layout.invariant
+# failed on the hardcoded path (2026-10-12).
+test.case $level "T-OSSH-CONFIG-CREATE-ID-PORTABLE: the default IdentityFile is written as ~/..., never as \$HOME" \
+  ossh.config.create test@testhost
+
+ID_LINE=$(grep "IdentityFile " "$CONFIG_PATH/result.txt" 2>/dev/null | head -1)
+case "$ID_LINE" in
+  *"IdentityFile ~/.ssh/"*) expect.pass "IdentityFile is portable: $ID_LINE" ;;
+  *)                        expect.fail "IdentityFile should start with ~/.ssh/, got: $ID_LINE" ;;
+esac
+
+# T-OSSH-FOLDER-FIX-ID-PORTABLE: folder.fix's config pass heals what
+# config.create wrote before T-OSSH-CONFIG-CREATE-ID-PORTABLE — config.save.last
+# never replaces a block, so the absolute line stayed in every Host block, not
+# only the WODA ones. A key outside the home stays as it is.
+test.ossh.folderFixIdPortable() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make folderfixidportable); mkdir -p "$fx/.ssh"
+  printf '%s\n' "Host ubuntu_24_04" " IdentityFile $fx/.ssh/id_ed25519" "" \
+    "Host other" " IdentityFile /opt/keys/id_rsa" "" "Host github.com" " IdentityFile ~/.ssh/ids/ssh.developking/id_rsa" > "$fx/.ssh/config"
+  private.ossh.folder.fix.config.normalize "$fx/.ssh" >/dev/null 2>&1 || bad="$bad rc=$?"
+  got=$(grep 'IdentityFile' "$fx/.ssh/config" | tr -s ' ' | tr '\n' '|')
+  [ "$got" = " IdentityFile ~/.ssh/id_ed25519| IdentityFile /opt/keys/id_rsa| IdentityFile ~/.ssh/ids/ssh.developking/id_rsa|" ] || bad="$bad config=[${got//$fx/FX}]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a key under the home becomes ~/..., others stay" || create.result 1 "folder.fix id:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-FOLDER-FIX-ID-PORTABLE: folder.fix writes every IdentityFile under the home as ~/..." test.ossh.folderFixIdPortable
+expect 0 "a key under the home becomes ~/..., others stay" "an absolute IdentityFile outside the WODA blocks stayed and failed ssh.layout"
+
 # ============================================================================
 # Test private.config.create sets RESULT via create.result (bug fix #4)
 # ============================================================================
@@ -678,6 +710,46 @@ test.ossh.shared.link.append() {
 test.case - "T-SHARED-5: github.com append preserves pre-existing user config" \
   test.ossh.shared.link.append
 expect 0 "appended without overwrite" "existing config preserved, Host github.com appended"
+
+# ============================================================================
+# T-OSSH-USERS-BASEHOME-UNLOADED: no base, no /shared/.ssh
+# ============================================================================
+# private.ossh.users.basehome asks `user.get basehome root`. When user cannot
+# be loaded it answers nothing and rc 1, and the shared-config methods that
+# default to <base>/shared/.ssh stop with rc 1 instead of building /shared/.ssh.
+# Every file step is a recording stub: nothing real is touched.
+test.ossh.basehomeUnloaded() {
+  local fx bad="" got m
+  fx=$(test.suite.fixture.make osshbasehomeunloaded)
+  got=$( (
+    unset -f user.get
+    private.this.script.load() { return 1; }
+    private.ossh.users.basehome; echo "rc $?"
+  ) 2>/dev/null )
+  [ "$got" = "rc 1" ] || bad="$bad delegate=[$got]"
+  for m in ossh.config.shared.github.create ossh.config.shared.link; do
+    : > "$fx/calls"
+    got=$( (
+      private.ossh.users.basehome() { return 1; }
+      for f in mkdir chmod chown cp rm cat awk ssh-keyscan ossh.config.create ossh.config.save.last; do
+        eval "$f() { echo \"$f \$*\" >> \"$fx/calls\"; }"
+      done
+      ossh.config.get() { return 1; }
+      export LOG_LEVEL=2 LOG_DEVICE=/dev/stderr LOG_LIVE= LOG_INSTALL=
+      if [ "$m" = ossh.config.shared.link ]; then $m alice >/dev/null; else $m >/dev/null; fi
+      echo "rc $?" >&2
+    ) 2>&1 )
+    case "$got" in *"rc 1") ;; *) bad="$bad $m-rc=[$(printf '%s\n' "$got" | tail -n 1)]" ;; esac
+    case "$got" in *"users' base"*) ;; *) bad="$bad $m-no-message" ;; esac
+    [ -s "$fx/calls" ] && bad="$bad $m-touched=[$(tr '\n' ' ' < "$fx/calls")]"
+  done
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "no base: rc 1, nothing built under /shared" || create.result 1 "basehome unloaded:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-USERS-BASEHOME-UNLOADED: without the users' base the shared-config methods stop" \
+  test.ossh.basehomeUnloaded
+expect 0 "no base: rc 1, nothing built under /shared" "a failed user load built /shared/.ssh"
 
 # Cleanup shared fixture
 rm -rf "$SHARED_FIXTURE" 2>/dev/null
@@ -1199,6 +1271,74 @@ else
   expect.fail "body does NOT call private.osshLayout.perms.tighten — alias incomplete"
 fi
 
+# T-RIGHTS-FIX-RUNS: `ossh rights.fix` typed as a command loads osshLayout
+# itself. This file sources osshLayout, so the alias tests above passed while
+# the command died with "private.osshLayout.perms.tighten: command not found"
+# (rc 127) on a host whose ~/.ssh/ids had mode 775 (2026-10-12).
+test.ossh.rightsFixRuns() {
+  local fx bad="" d
+  fx=$(test.suite.fixture.make rightsfixruns)
+  mkdir -p "$fx/.ssh/ids/ssh.someone/private_key" "$fx/.ssh/ids/ssh.someone/public_keys"
+  chmod 775 "$fx/.ssh/ids/ssh.someone" "$fx/.ssh/ids/ssh.someone/private_key" "$fx/.ssh/ids/ssh.someone/public_keys"
+  env OOSH_NO_INSTALL=1 "$BASH" "$OOSH_DIR/ossh" rights.fix "$fx/.ssh" >/dev/null 2>&1 || bad="$bad rc=$?"
+  for d in "$fx/.ssh/ids/ssh.someone" "$fx/.ssh/ids/ssh.someone/private_key" "$fx/.ssh/ids/ssh.someone/public_keys"; do
+    [ "$(stat -c %a "$d" 2>/dev/null || stat -f %Lp "$d")" = 700 ] || bad="$bad ${d#$fx/}=$(stat -c %a "$d" 2>/dev/null || stat -f %Lp "$d")"
+  done
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh rights.fix as a command tightens ~/.ssh/ids to 700" || create.result 1 "rights.fix:$bad"
+  return $(result)
+}
+test.case $level "T-RIGHTS-FIX-RUNS: ossh rights.fix typed as a command loads osshLayout and tightens the modes" test.ossh.rightsFixRuns
+expect 0 "ossh rights.fix as a command tightens ~/.ssh/ids to 700" "ossh rights.fix died: private.osshLayout.perms.tighten: command not found"
+
+# T-FOLDER-FIX-WRITES-WODA: `ossh folder.fix` typed as a command loads user for
+# user.init. ossh does not source user: folder.fix warned "user.init returned
+# non-zero; WODA blocks may not be present" for root and developking, and a
+# config without WODA blocks never got them (2026-10-12). HOME, the working
+# directory and the staging directory are the fixture, so nothing outside it
+# is read or written: a platform container stages the installer key in /tmp
+# for another user, and developking's build stopped on it (2026-10-13).
+test.ossh.folderFixWritesWoda() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make folderfixwoda); mkdir -p "$fx/.ssh" "$fx/stage"
+  out=$(cd "$fx" && env OOSH_NO_INSTALL=1 HOME="$fx" OSSH_STAGE_DIR="$fx/stage" "$BASH" "$OOSH_DIR/ossh" folder.fix "$fx/.ssh" t@example.com 2>&1)
+  case "$out" in *"user.init returned non-zero"*) bad="$bad user.init-failed" ;; esac
+  grep -q "^Host WODA.test\$" "$fx/.ssh/config" 2>/dev/null || bad="$bad no-WODA.test"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh folder.fix as a command runs user.init and writes the WODA blocks" || create.result 1 "folder.fix woda:$bad"
+  return $(result)
+}
+test.case $level "T-FOLDER-FIX-WRITES-WODA: ossh folder.fix typed as a command loads user and writes the WODA blocks" test.ossh.folderFixWritesWoda
+expect 0 "ossh folder.fix as a command runs user.init and writes the WODA blocks" "folder.fix: user.init returned non-zero; WODA blocks may not be present"
+
+# T-OSSHLAYOUT-OUTERUSER-NO-SELF-COPY: with no installer known (root and
+# developking under folder.fix: nothing staged, no ids/ssh.<email>) build
+# passed ids/ itself as the outer user's source, and every run copied ids/
+# into ids/ssh.outeruser one level deeper — private keys included
+# (2026-10-12). build skips the outer user then; role.outeruser refuses a
+# source that holds its own target.
+test.ossh.osshLayoutOuteruserNoSelfCopy() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make outerusernoself); mkdir -p "$fx/.ssh/ids/ssh.developking"; : > "$fx/.ssh/ids/ssh.developking/id_rsa"
+  out=$(FX="$fx" "$BASH" -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/osshLayout" >/dev/null 2>&1
+    osshLayout.role.owner()       { create.result 0 "owner"; }
+    osshLayout.role.developking() { create.result 0 "developking"; }
+    osshLayout.role.installer()   { create.result 0 ""; }
+    private.osshLayout.staged.has.pubkey() { return 1; }
+    private.osshLayout.perms.tighten()     { :; }
+    osshLayout.build "" "" "$FX/.ssh" >/dev/null 2>&1; echo "build rc=$?"
+    osshLayout.role.outeruser "$FX/.ssh/ids/" "$FX/.ssh" >/dev/null 2>&1; echo "outeruser rc=$?"' 2>/dev/null)
+  case "$out" in *"build rc=0"*) ;; *) bad="$bad build=[$out]" ;; esac
+  case "$out" in *"outeruser rc=0"*) bad="$bad self-source-accepted" ;; esac
+  [ -e "$fx/.ssh/ids/ssh.outeruser/ssh.developking" ] && bad="$bad ids-copied-into-outeruser"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "no installer: no outer user, ids/ never copied into itself" || create.result 1 "outeruser:$bad"
+  return $(result)
+}
+test.case $level "T-OSSHLAYOUT-OUTERUSER-NO-SELF-COPY: without an installer ids/ is never copied into ids/ssh.outeruser" test.ossh.osshLayoutOuteruserNoSelfCopy
+expect 0 "no installer: no outer user, ids/ never copied into itself" "every folder.fix nested ids/ one level deeper into ids/ssh.outeruser"
+
 # T-FOLDER-FIX-FUNCTION-EXISTS: ossh.folder.fix defined + all 3 completion helpers.
 test.case $level "T-FOLDER-FIX-FUNCTION-EXISTS: ossh.folder.fix + completions defined" \
   echo "(type)"
@@ -1214,8 +1354,15 @@ fi
 # T-FOLDER-FIX-REJECTS-UNKNOWN-MODE: unknown mode keyword → error.log + return 1.
 test.case $level "T-FOLDER-FIX-REJECTS-UNKNOWN-MODE: unknown mode returns 1" \
   echo "(invoke)"
-ossh.folder.fix "" /tmp/test.no.such.path.$$ bogus_mode_xyz >/dev/null 2>&1
-if [ "$?" -ne 0 ]; then
+# In a fixture directory: before 2026-10-12 the bogus word was taken as a
+# relative sshDir, and once ossh loaded osshLayout a whole layout (a new key
+# included) was built in the current directory — the branch tree.
+FOLDER_FIX_FX=$(test.suite.fixture.make folderfixmode)
+( cd "$FOLDER_FIX_FX" && ossh.folder.fix "" /tmp/test.no.such.path.$$ bogus_mode_xyz >/dev/null 2>&1 )
+FOLDER_FIX_RC=$?
+FOLDER_FIX_LEFT=$(ls -A "$FOLDER_FIX_FX"; ls -d /tmp/test.no.such.path.$$ 2>/dev/null)
+rm -rf "$FOLDER_FIX_FX" /tmp/test.no.such.path.$$
+if [ "$FOLDER_FIX_RC" -ne 0 ] && [ -z "$FOLDER_FIX_LEFT" ]; then
   expect.pass "unknown mode rejected"
 else
   expect.fail "unknown mode silently accepted"
@@ -1536,5 +1683,32 @@ test.ossh.scriptLoad() {
 }
 test.case $level "T-OSSH-SCRIPT-LOAD: ossh loads oo/os/state through private.this.script.load; This stays ossh" test.ossh.scriptLoad
 expect 0 "ossh loads oo through private.this.script.load and keeps This" "a bare source clobbers This — help and dispatch would describe oo"
+
+# T-OSSH-CONFIG-DELETE: ossh config.delete removes one Host block — the twin of config.create
+# The block is what ossh.config.get shows: from "Host <name>" to the next empty
+# line. The other blocks and the file's mode stay; a second delete answers
+# "not found". ossh had create, get, push, pull — no delete: the tart_ubuntu
+# entry of the headless check (2026-10-14) would have been hand-edited.
+test.ossh.configDelete() {
+  local fx bad="" f got; fx=$(test.suite.fixture.make osshconfigdelete); f="$fx/config"
+  printf '%s\n' 'Host first' ' User a' ' HostName 10.0.0.1' '' 'Host tart_ubuntu' ' User admin' ' HostName 192.168.64.6' ' ProxyJump macstudio' '' 'Host tart_ubuntu_old' ' User x' '' 'Host last' ' User b' > "$f"
+  chmod 600 "$f"
+  got=$(ossh.config.delete tart_ubuntu "$f" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "0|config tart_ubuntu deleted from $f" ] || bad="$bad rc=[$got]"
+  [ "$(tr '\n' '|' < "$f")" = "Host first| User a| HostName 10.0.0.1||Host tart_ubuntu_old| User x||Host last| User b|" ] || bad="$bad content=[$(tr '\n' '|' < "$f")]"
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-------" ] || bad="$bad mode=$(ls -l "$f" | cut -c1-10)"
+  got=$(ossh.config.delete tart_ubuntu "$f" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "2|config tart_ubuntu not found in $f" ] || bad="$bad again=[$got]"
+  got=$(ossh.config.delete last "$f" >/dev/null 2>&1; echo "$?")
+  [ "$got" = 0 ] && [ "$(tail -1 "$f")" = "" ] && ! grep -q "Host last" "$f" || bad="$bad last-block=[$(tr '\n' '|' < "$f")]"
+  got=$(ossh.config.delete >/dev/null 2>&1; echo "$?")
+  [ "$got" = 1 ] || bad="$bad no-host-rc=$got"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "one Host block removed in place, the others and the mode kept; a second delete is not found" || create.result 1 "config delete:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONFIG-DELETE: ossh config.delete removes one Host block, the others stay" test.ossh.configDelete
+expect 0 "one Host block removed in place, the others and the mode kept; a second delete is not found" \
+  "ossh had no delete for a config entry; it would be hand-edited"
 
 test.suite.save.results

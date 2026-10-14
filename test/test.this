@@ -897,6 +897,31 @@ test.case $level "T-THIS-AS-USER-PREAMBLE-NO-MODE: the caller's OOSH_MODE does n
   test.this.asUserPreambleNoMode
 expect 0 "the caller's OOSH_MODE is dropped" "root's branch would become the new user's branch"
 
+# T-THIS-AS-USER-PREAMBLE-SESSION-PATH: the caller's session-only oosh dirs never reach the target's saved PATH
+# The install process (init/oosh, $0 "oosh") has the shared tree's init and
+# external on PATH. State 31 step 5's `user oosh.install developking` runs
+# inside it: the preamble keeps the caller's PATH, the save maps the shared
+# tree's physical name onto ~/oosh — developking's user.session.env got
+# ~/oosh/init and ~/oosh/external, no other user's did (fresh container, 2026-10-12).
+test.this.asUserPreambleSessionPath() {
+  local shared home line bad=""
+  shared=$(private.this.path.canonical "$OOSH_DIR")
+  home=$(test.suite.fixture.make asUserPreambleSessionPath); ln -s "$shared" "$home/oosh"
+  PATH="$shared/init:$shared/external:/usr/bin:/bin" bash -c "$(private.this.as.user.preamble.get "$USER" "$home" "$shared")
+private.this.script.load config private.config.session.file.ensure || exit 1
+private.config.session.file.ensure \"$home\" >/dev/null" >/dev/null 2>&1
+  line=$(grep '^export PATH=' "$home/.config/oosh/user.session.env" 2>/dev/null)
+  [ -n "$line" ] || bad="$bad no-PATH-line"
+  case "$line:" in *"/oosh/init:"*|*"/oosh/init\":"*) bad="$bad init-saved" ;; esac
+  case "$line:" in *"/oosh/external:"*|*"/oosh/external\":"*) bad="$bad external-saved" ;; esac
+  rm -rf "$home"
+  [ -z "$bad" ] && create.result 0 "the target's saved PATH has no ~/oosh/init or ~/oosh/external" || create.result 1 "as-user save:$bad [$line]"
+  return $(result)
+}
+test.case $level "T-THIS-AS-USER-PREAMBLE-SESSION-PATH: the caller's session-only oosh dirs never reach the target's saved PATH" \
+  test.this.asUserPreambleSessionPath
+expect 0 "the target's saved PATH has no ~/oosh/init or ~/oosh/external" "the install process's PATH was frozen into developking's login PATH"
+
 # T-THIS-START-METHOD: `this <method>` runs the method and returns — no bash, no banner, no shared save
 # Starting `this` with a method used to run it, then print the start banner to
 # stdout and enter an interactive bash — `./this anchor.validate` hung in a
@@ -1007,6 +1032,34 @@ test.this.groupNameGet() {
 test.case $level "T-THIS-GROUP-NAME-GET: the name of the group with a number — getent, else /etc/group, dscl on macOS" test.this.groupNameGet
 expect 0 "the group of a number by getent, /etc/group or dscl; nothing when there is none" \
   "odocker asked a bare getent for the socket's group — macOS has none"
+
+# T-THIS-GROUP-MEMBERS-GET: the members of a group, one per line — getent, else /etc/group, dscl on macOS
+# setup all gives node to every member of dev (2026-10-14): nothing in oosh
+# listed a group's members.
+test.this.groupMembersGet() {
+  local fx bad="" got; fx=$(test.suite.fixture.make thisgroupmembers); test.this.groupStubs "$fx"
+  printf '%s\n' 'dev:x:501:alice,bob' 'empty:x:502:' > "$fx/group"
+  printf '%s\n' '#!/bin/sh' '[ "$3" = /Groups/dev ] && echo "GroupMembership: alice bob"' > "$fx/bin/dscl"; chmod +x "$fx/bin/dscl"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=linux-gnu; private.this.group.members.get dev | tr '\n' ' ')
+  [ "$got" = "alice bob " ] || bad="$bad getent=[$got]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=linux-gnu; private.this.group.members.get empty)
+  [ -z "$got" ] || bad="$bad empty=[$got]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=linux-gnu; private.this.group.members.get nosuch)
+  [ -z "$got" ] || bad="$bad none=[$got]"
+  # No getent: <groupFile> itself, read only.
+  got=$(OSTYPE=linux-gnu; command() { [ "$1 $2" = "-v getent" ] && return 1; builtin command "$@"; }; private.this.group.members.get dev "$fx/group" | tr '\n' ' ')
+  [ "$got" = "alice bob " ] || bad="$bad file=[$got]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=darwin23; private.this.group.members.get dev | tr '\n' ' ')
+  [ "$got" = "alice bob " ] || bad="$bad dscl=[$got]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; OSTYPE=darwin23; private.this.group.members.get nosuch)
+  [ -z "$got" ] || bad="$bad dscl-none=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the members of a group by getent, the group file or dscl; nothing when there are none" || create.result 1 "group members:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-GROUP-MEMBERS-GET: the members of a group, one per line — getent, else /etc/group, dscl on macOS" test.this.groupMembersGet
+expect 0 "the members of a group by getent, the group file or dscl; nothing when there are none" \
+  "setup all could not give node to every member of dev: nothing listed them"
 
 # T-THIS-GROUP-CREATE-GID: a group is created with a given number — groupadd, addgroup or dseditgroup, through $SUDO, once
 # The socket of a container carries the HOST's group number; odocker created
@@ -1220,6 +1273,129 @@ expect 0 "stat fields on GNU and BSD" "the GNU/BSD stat pair was hand-written si
 
 
 console.log "
+Test: private.this.path.owner.set
+===================================================================="
+
+# T-THIS-PATH-OWNER-SET: the owner of one path, elevated only when it must be
+# The shared folders become root:dev (developking is an ordinary user), and
+# `config init.shared` repairs older machines through this. chown, sudo and
+# id are stubs: nothing real changes owner. An owner already right is no call
+# at all; root chowns directly; anyone else through $SUDO — but never under
+# OOSH_NO_INSTALL: a test run escalates nothing, a forgotten stub must not
+# prompt for a password.
+test.this.pathOwnerSet() {
+  local fx bad="" f me got err; fx=$(test.suite.fixture.make thispathowner); f="$fx/dir"; mkdir "$f"; me=$(id -un)
+  ln -s "$f" "$fx/link"
+  # The owner asked for differs from the fixture's, whoever runs the suite.
+  local who=root; [ "$me" = root ] && who=nobody
+  test.this.pathOwnerSet.run() { # <asRoot:0|1> <noInstall:0|1> <chownRc> <path> <owner> — echo the calls, then "rc <n>|<RESULT>"
+    : > "$fx/calls"
+    (
+      # Who runs the suite does not matter: asRoot 0 is uid 1000, under root too.
+      if [ "$1" = 1 ]; then
+        id() { [ "$1" = -u ] && echo 0 || command id "$@"; }
+      else
+        id() { [ "$1" = -u ] && echo 1000 || command id "$@"; }
+      fi
+      [ "$2" = 1 ] && export OOSH_NO_INSTALL=1 || unset OOSH_NO_INSTALL
+      chownRc="$3"; SUDO="sudo "
+      chown() { echo "chown $*" >> "$fx/calls"; return "$chownRc"; }
+      sudo()  { echo "sudo $*"  >> "$fx/calls"; return "$chownRc"; }
+      private.this.path.owner.set "$4" "$5" >/dev/null 2>&1; echo "rc $?|$RESULT" >> "$fx/calls"
+    )
+    sed "s|$fx|FX|g" "$fx/calls" | tr '\n' ' '
+  }
+  got=$(test.this.pathOwnerSet.run 0 1 0 "$f" "$me")
+  case "$got" in "rc 0|"*) ;; *) bad="$bad already-mine=[$got]" ;; esac
+  got=$(test.this.pathOwnerSet.run 0 1 0 "$f" "$who")
+  case "$got" in "rc 1|"*"a test run escalates nothing"*) ;; *) bad="$bad no-install=[$got]" ;; esac
+  got=$(test.this.pathOwnerSet.run 0 0 0 "$f" "$who")
+  case "$got" in "sudo chown $who FX/dir rc 0|"*) ;; *) bad="$bad sudo=[$got]" ;; esac
+  got=$(test.this.pathOwnerSet.run 1 1 0 "$f" "$who")
+  case "$got" in "chown $who FX/dir rc 0|"*) ;; *) bad="$bad as-root=[$got]" ;; esac
+  got=$(test.this.pathOwnerSet.run 1 1 1 "$f" "$who")
+  case "$got" in "chown $who FX/dir rc 1|could not make $who the owner of FX/dir"*) ;; *) bad="$bad chown-fails=[$got]" ;; esac
+  got=$(test.this.pathOwnerSet.run 1 1 0 "$fx/missing" "$who")
+  case "$got" in "rc 1|no such path: FX/missing"*) ;; *) bad="$bad missing=[$got]" ;; esac
+  # A symlink is resolved first: stat and chown both act on the folder it
+  # names — stat alone describes the link, while chown follows it.
+  got=$(test.this.pathOwnerSet.run 1 1 0 "$fx/link" "$who")
+  case "$got" in "chown $who FX/dir rc 0|"*) ;; *) bad="$bad symlink=[$got]" ;; esac
+  # chown's own complaint stays quiet; the RESULT names the failure.
+  err=$( (
+    id() { [ "$1" = -u ] && echo 0 || command id "$@"; }
+    chown() { echo "chown: stub refuses" >&2; return 1; }
+    private.this.path.owner.set "$f" "$who" >/dev/null; echo "rc $?|$RESULT"
+  ) 2>&1 )
+  case "$err" in *"stub refuses"*) bad="$bad chown-stderr-leaks" ;; esac
+  case "$err" in *"rc 1|could not make $who the owner of $f"*) ;; *) bad="$bad no-result=[$err]" ;; esac
+  [ "$(private.this.path.stat.get "$f" owner)" = "$me" ] || bad="$bad real-owner-changed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "owner set once, elevated only when it must be, never in a test run" || create.result 1 "path owner:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-PATH-OWNER-SET: the owner of one path, through sudo only when the caller is not root and not a test run" test.this.pathOwnerSet
+expect 0 "owner set once, elevated only when it must be, never in a test run" \
+  "the shared folders could not be given to root:dev"
+
+
+console.log "
+Test: private.this.shared.top.ensure
+===================================================================="
+
+# T-THIS-SHARED-TOP-ENSURE: <base>/shared/dev is root:dev g+ws at its top level
+# only — every user's Workspaces clones below it keep their group and mode.
+# Each step runs only when it is not already so: a repaired machine calls
+# nothing, so it needs no sudo. chgrp, chmod and the owner step are recording
+# stubs, and the group and mode stat answers come from the case; setgid is the
+# fixture's own bit. Nothing real changes owner or group. The mode comes last:
+# macOS clears setgid when the owner or the group changes — the Mac Studio's
+# Once.sh ended root:dev without it (2026-10-13).
+test.this.sharedTopEnsure() {
+  local fx bad="" f got; fx=$(test.suite.fixture.make thissharedtop); f="$fx/dev"; mkdir -p "$f/Workspaces"
+  ln -s "$f" "$fx/link"
+  test.this.sharedTopEnsure.run() { # <devGroup:0|1> <group> <mode> <chgrpRc> <dir> <?owner> — echo the calls, then "rc <n>|<RESULT>"
+    : > "$fx/calls"
+    (
+      [ "$1" = 1 ] && private.this.group.exists() { return 0; } || private.this.group.exists() { return 1; }
+      G="$2" M="$3" chgrpRc="$4"; shift 4
+      private.this.path.stat.get() { case "$2" in group) echo "$G" ;; mode) echo "$M" ;; *) return 1 ;; esac; }
+      chgrp() { echo "chgrp $*" >> "$fx/calls"; return "$chgrpRc"; }
+      chmod() { echo "chmod $*" >> "$fx/calls"; }
+      private.this.path.owner.set() { echo "owner.set $*" >> "$fx/calls"; create.result 0 "owned"; }
+      private.this.shared.top.ensure "$@" >/dev/null 2>&1; echo "rc $?|$RESULT" >> "$fx/calls"
+    )
+    sed "s|$fx|FX|g" "$fx/calls" | tr '\n' ' '
+  }
+  command chmod g-s "$f"
+  got=$(test.this.sharedTopEnsure.run 1 users 755 0 "$f" root)
+  case "$got" in "owner.set FX/dev root chgrp dev FX/dev chmod g+ws FX/dev rc 0|"*) ;; *) bad="$bad drifted=[$got]" ;; esac
+  got=$(test.this.sharedTopEnsure.run 1 users 755 0 "$fx/link" root)
+  case "$got" in "owner.set FX/dev root chgrp dev FX/dev chmod g+ws FX/dev rc 0|"*) ;; *) bad="$bad symlink=[$got]" ;; esac
+  got=$(test.this.sharedTopEnsure.run 1 dev 775 0 "$f")
+  case "$got" in "chmod g+ws FX/dev rc 0|"*) ;; *) bad="$bad no-setgid=[$got]" ;; esac
+  got=$(test.this.sharedTopEnsure.run 1 users 755 1 "$f" root)
+  case "$got" in "owner.set FX/dev root chgrp dev FX/dev rc 1|could not give FX/dev to group dev"*) ;; *) bad="$bad chgrp-fails=[$got]" ;; esac
+  if command chmod g+s "$f" 2>/dev/null && [ -g "$f" ]; then
+    got=$(test.this.sharedTopEnsure.run 1 dev 2775 0 "$f")
+    case "$got" in "rc 0|"*) ;; *) bad="$bad repaired-calls=[$got]" ;; esac
+    got=$(test.this.sharedTopEnsure.run 1 dev 2755 0 "$f")
+    case "$got" in "chmod g+ws FX/dev rc 0|"*) ;; *) bad="$bad no-g+w=[$got]" ;; esac
+  fi
+  got=$(test.this.sharedTopEnsure.run 0 users 755 0 "$f" root)
+  case "$got" in "rc 0|"*) ;; *) bad="$bad no-dev-group=[$got]" ;; esac
+  got=$(test.this.sharedTopEnsure.run 1 users 755 0 "$fx/missing" root)
+  case "$got" in "rc 1|no such folder: FX/missing"*) ;; *) bad="$bad missing=[$got]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the top level only, and only what drifted" || create.result 1 "shared top:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-SHARED-TOP-ENSURE: a shared folder's top level is group dev, g+ws and its owner — each step only when it drifted" test.this.sharedTopEnsure
+expect 0 "the top level only, and only what drifted" \
+  "shared/dev was normalised recursively, or a repaired machine still needed sudo"
+
+
+console.log "
 Test: private.this.device.is.terminal
 ===================================================================="
 
@@ -1265,6 +1441,72 @@ test.this.tempDirGet() {
 }
 test.case $level "T-THIS-TEMP-DIR-GET: a new private temp dir, canonical, in TMPDIR" test.this.tempDirGet
 expect 0 "a new private canonical temp dir" "c2, odocker and ossh called mktemp raw"
+
+# T-THIS-URL-DOWNLOAD: a url to a file, complete and non-empty, or rc 1 naming why and no file
+# odocker had the one checked download (an empty key broke apt), private to
+# itself; su/setup called curl raw for the nvm installer (2026-10-14).
+test.this.urlDownload() {
+  local fx bad="" got; fx=$(test.suite.fixture.make thisurldownload); mkdir -p "$fx/bin"
+  printf '%s\n' '#!/bin/sh' 'echo "curl $*" >> "$FX/log"' 'case "$*" in *ok.sh*) echo "#!/bin/sh" ;; *empty*) : ;; *) exit 22 ;; esac' > "$fx/bin/curl"; chmod +x "$fx/bin/curl"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; private.this.url.download https://example.org/ok.sh "$fx/a" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/a" ] && [ "$(cat "$fx/a")" = "#!/bin/sh" ] || bad="$bad ok=[$got]"
+  grep -q -- "-fsSL https://example.org/ok.sh" "$fx/log" || bad="$bad curl-args=[$(tr '\n' '|' < "$fx/log")]"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; private.this.url.download https://example.org/missing "$fx/b" >/dev/null 2>&1; echo "$?|$RESULT")
+  case "$got" in "1|could not download https://example.org/missing") ;; *) bad="$bad fails=[$got]" ;; esac
+  [ -e "$fx/b" ] && bad="$bad fails-left-file"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; private.this.url.download https://example.org/empty "$fx/c" >/dev/null 2>&1; echo "$?|$RESULT")
+  case "$got" in "1|the download of https://example.org/empty is empty") ;; *) bad="$bad empty=[$got]" ;; esac
+  [ -e "$fx/c" ] && bad="$bad empty-left-file"
+  got=$(private.this.url.download https://example.org/ok.sh >/dev/null 2>&1; echo "$?")
+  [ "$got" = 1 ] || bad="$bad no-file-rc=$got"
+  # No curl yet (a bare container, state 31, 2026-10-14): oo cmd curl first —
+  # the one place that knows a download needs curl; never asked when curl is
+  # there, and a failing oo cmd (a test run) is rc 1 naming it, no download.
+  : > "$fx/log"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; create.result 0 "curl installed"; }
+        private.this.url.download https://example.org/ok.sh "$fx/d" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/d" ] && ! grep -q "^oo.cmd" "$fx/log" || bad="$bad present-asked-oo-cmd=[$got|$(tr '\n' '|' < "$fx/log")]"
+  : > "$fx/log"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; create.result 0 "curl installed"; }
+        command() { [ "$1 $2" = "-v curl" ] && [ ! -s "$FX/log" ] && return 1; builtin command "$@"; }
+        private.this.url.download https://example.org/ok.sh "$fx/e" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/e" ] && [ "$(tr '\n' '|' < "$fx/log")" = "oo.cmd curl|curl -fsSL https://example.org/ok.sh|" ] || bad="$bad missing=[$got|$(tr '\n' '|' < "$fx/log")]"
+  : > "$fx/log"
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; create.result 1 "curl missing — a test run installs nothing"; return 1; }
+        command() { [ "$1 $2" = "-v curl" ] && return 1; builtin command "$@"; }
+        private.this.url.download https://example.org/ok.sh "$fx/f" >/dev/null 2>&1; echo "$?|$RESULT")
+  case "$got" in "1|no curl to download https://example.org/ok.sh: curl missing"*) ;; *) bad="$bad no-curl=[$got]" ;; esac
+  [ "$(tr '\n' '|' < "$fx/log")" = "oo.cmd curl|" ] && [ ! -e "$fx/f" ] || bad="$bad no-curl-downloaded=[$(tr '\n' '|' < "$fx/log")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "complete downloads only; rc 1 naming why and no file left" || create.result 1 "url download:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-URL-DOWNLOAD: a url to a file, complete and non-empty, or rc 1 naming why and no file" test.this.urlDownload
+expect 0 "complete downloads only; rc 1 naming why and no file left" "su/setup called curl raw; the checked download was private to odocker"
+
+# T-THIS-FILE-LINE-ENSURE: a line onto a file once, in place, honestly
+# config had it for env files only (private.config.env.line.append); su/setup
+# needs it for /etc/tigervnc/vncserver.users and ~/.vnc/config (2026-10-14).
+test.this.fileLineEnsure() {
+  local fx bad="" f; fx=$(test.suite.fixture.make thisfileline); f="$fx/users"
+  printf '%s' '# comment' > "$f"; chmod 664 "$f"
+  private.this.file.line.ensure "$f" ":1=alice" >/dev/null 2>&1 || bad="$bad rc=$?"
+  [ "$(cat "$f")" = "# comment
+:1=alice" ] || bad="$bad content=[$(tr '\n' '|' < "$f")]"
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-rw-r--" ] || bad="$bad mode-changed"
+  touch -t 200001010000 "$f"; touch -t 200001010001 "$fx/marker"
+  private.this.file.line.ensure "$f" ":1=alice" >/dev/null 2>&1 || bad="$bad second-rc=$?"
+  [ "$f" -nt "$fx/marker" ] && bad="$bad present-line-rewritten"
+  private.this.file.line.ensure "$fx/new" "session=xfce" >/dev/null 2>&1 || bad="$bad new-rc=$?"
+  [ "$(cat "$fx/new" 2>/dev/null)" = "session=xfce" ] || bad="$bad new-file=[$(cat "$fx/new" 2>/dev/null)]"
+  private.this.file.line.ensure "$fx/missing.dir/x" "a" >/dev/null 2>&1 && bad="$bad unwritable-rc0"
+  private.this.file.line.ensure "$f" >/dev/null 2>&1 && bad="$bad no-line-rc0"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the line appended once, in place; rc 1 when it cannot be" || create.result 1 "file line:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-FILE-LINE-ENSURE: a line onto a file once, in place, honestly" test.this.fileLineEnsure
+expect 0 "the line appended once, in place; rc 1 when it cannot be" "su/setup appended to vncserver.users with grep and tee"
 
 
 console.log "

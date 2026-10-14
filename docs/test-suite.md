@@ -90,10 +90,17 @@ the host-readiness question where it belongs.
 ./test.suite gate 1
 ```
 
-The post-install gate. It runs `test.suite core <level>`, then
-`platform.shared.configLayout.invariant` at the same level (default level 1). Both
-halves always run, so a red core cannot hide what the platform invariant says about
-the install. rc 0 when both pass, rc 1 when either fails.
+The post-install gate. It runs `test.suite core <level>`, then the platform checks
+`platform.shared.configLayout.invariant` and `platform.ssh.config.woda.portable` at
+the same level (default level 1). All of them always run, so a red core cannot hide
+what the platform checks say about the install. rc 0 when all pass, rc 1 when one
+fails.
+
+`platform.ssh.config.woda.portable` was a core test until 2026-10-14. It reads the
+real `~/.ssh/config` of the machine, so a developer box whose WODA lines point at
+its own key on purpose failed core, and with it `promote`. A check of a real
+machine is a platform check; the gate keeps it running on every freshly installed
+one.
 
 Use it on an installed machine to ask "is this install sound?". `os platform.test`
 runs it for each of its four users (`test.suite gate 1`), so a platform invariant
