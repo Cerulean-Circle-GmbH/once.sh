@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+#clear
+#export PS4='\e[90m+${LINENO} in ${#BASH_SOURCE[@]}>${FUNCNAME[0]}:${BASH_SOURCE[@]##*/} \e[0m'
+#set -x
+
+# Tests for su/setup — what install state 50 (headless.setup.started) runs:
+# docker, nvm, nodejs, npm, headless (VNC / Screen Sharing), samba support,
+# their password steps, and setup.all. Nothing here installs: every method
+# runs in a child with stand-ins for oo.cmd, odocker, curl, sudo, systemctl,
+# launchctl, vncpasswd and smbpasswd that log their arguments to $FX/log.
+TEST_CATEGORY=core
+
+level=$1
+if [ -z "$level" ]; then
+  level=1
+else
+  # remove the level parameter
+  shift
+fi
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+
+source this
+source test.suite
+
+log.level $level
+
+TEST_SETUP_FX=$(test.suite.fixture.make setup)
+
+test.setup.run() { # <code> <?env assignments…> # run <code> in a child with su/setup sourced and the stand-ins; echo the log as one line, then "rc=<rc> <RESULT>"
+  # T_OS / T_PM pin the platform, T_CT=yes is a container, T_SYSTEMD=no has
+  # none, T_UID / T_ME who runs, T_FAIL="name …" makes those stand-ins fail,
+  # T_REAL_ASUSER=yes keeps the real private.setup.as.user.
+  local code="$1"; shift
+  rm -rf "$TEST_SETUP_FX/home" "$TEST_SETUP_FX/etc"; mkdir -p "$TEST_SETUP_FX/home" "$TEST_SETUP_FX/etc"
+  : > "$TEST_SETUP_FX/log"
+  env -u OOSH_NO_INSTALL -u SUDO_USER FX="$TEST_SETUP_FX" OOSH_DIR="$OOSH_DIR" \
+    OOSH_OS=linux-gnu OOSH_PM="apt-get -y install" SETUP_ETC_DIR="$TEST_SETUP_FX/etc" "$@" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/su/setup" >/dev/null 2>&1
+    SUDO=""   # root in the install; the stand-ins log what would need it
+    t.log() { echo "$*" >> "$FX/log"; }
+    t.rc() { case " $T_FAIL " in *" $1 "*) return 1 ;; esac; return 0; }
+    oo.cmd() { t.log "oo.cmd $*"; t.rc "oo.cmd:$1" || { create.result 1 "installing for $1 failed"; return 1; }; create.result 0 "$1 installed"; return 0; }
+    odocker.prereqs.install() { t.log "odocker.prereqs.install $*"; t.rc odocker || { create.result 1 "docker missing"; return 1; }; create.result 0 "odocker prerequisites here"; return 0; }
+    curl() { t.log "curl $*"; t.rc curl || return 22; local o=""; while [ -n "$1" ]; do [ "$1" = -o ] && o="$2"; shift; done; [ -n "$o" ] && echo "# nvm installer" > "$o"; return 0; }
+    sudo() { t.log "sudo $*"; t.rc sudo; }
+    systemctl() { t.log "systemctl $*"; t.rc systemctl; }
+    launchctl() { t.log "launchctl $*"; t.rc launchctl; }
+    vncpasswd() { t.log "vncpasswd $*"; t.rc vncpasswd; }
+    smbpasswd() { t.log "smbpasswd $*"; t.rc smbpasswd; }
+    private.this.container.is() { [ "$T_CT" = yes ]; }
+    private.setup.systemd.is() { [ "${T_SYSTEMD:-yes}" = yes ]; }
+    private.setup.home.get() { echo "$FX/home/$1"; }
+    id() { case "$*" in -u) echo "${T_UID:-0}" ;; -un) echo "${T_ME:-root}" ;; *) command id "$@" ;; esac; }
+    if [ "$T_REAL_ASUSER" != yes ]; then
+      private.setup.as.user() { # the run as <user>: logged; nvm.sh appears when the installer ran, node/npm answer a version
+        local u="$1"; shift; t.log "as $u: $*"; t.rc "as:$u" || return 1
+        case "$*" in *PROFILE=/dev/null*) mkdir -p "$FX/home/$u/.nvm"; : > "$FX/home/$u/.nvm/nvm.sh" ;;
+                     *"node -v"*) t.rc node -v || return 1; echo v22.0.0 ;;
+                     *"npm -v"*) t.rc npm -v || return 1; echo 10.0.0 ;; esac
+        return 0
+      }
+    fi
+    '"$code"'
+    echo "rc=$? $RESULT"' </dev/null 2>/dev/null | tail -1 > "$TEST_SETUP_FX/out"
+  echo "log=$(tr '\n' '|' < "$TEST_SETUP_FX/log")"
+  cat "$TEST_SETUP_FX/out"
+}
+
+test.setup.expect() { # <label> <output> <pattern> # append "<label>=[output]" to the caller's $bad unless <output> matches the case pattern
+  # shellcheck disable=SC2254
+  case "$2" in $3) ;; *) bad="$bad $1=[$(echo "$2" | tr '\n' ' ')]" ;; esac
+}
+
+# --- T-SETUP-NO-INSTALL -----------------------------------------------------
+# A test run sets OOSH_NO_INSTALL: every public method answers rc 0 and touches
+# nothing — no stand-in is called at all.
+test.setup.noInstall() {
+  local bad="" m out
+  for m in "setup.docker alice" "setup.nvm alice" "setup.nodejs --lts alice" "setup.npm alice" \
+           "setup.headless alice" "setup.vnc.password alice" "setup.samba.support alice" \
+           "setup.samba.password alice" "setup.all alice"; do
+    out=$(test.setup.run "$m >/dev/null 2>&1" OOSH_NO_INSTALL=1)
+    test.setup.expect "${m%% *}" "$out" "log=
+rc=0 OOSH_NO_INSTALL is set: nothing installed*"
+  done
+  [ -z "$bad" ] && create.result 0 "nothing installed under OOSH_NO_INSTALL" || create.result 1 "no-install:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-NO-INSTALL: every setup method installs nothing in a test run" test.setup.noInstall
+expect 0 "nothing installed under OOSH_NO_INSTALL" "a test run installed packages through su/setup"
+
+# --- T-SETUP-AS-USER --------------------------------------------------------
+# The one way to run something as <user>: root goes through sudo -u <user> -H,
+# the user itself runs it directly, anyone else is refused.
+test.setup.asUser() {
+  local bad="" out
+  out=$(test.setup.run 'private.setup.as.user alice node -v >/dev/null 2>&1' T_REAL_ASUSER=yes)
+  test.setup.expect root "$out" "log=sudo -u alice -H node -v|
+rc=0*"
+  out=$(test.setup.run 'node() { t.log "node $*"; }; private.setup.as.user alice node -v >/dev/null 2>&1' T_REAL_ASUSER=yes T_UID=1000 T_ME=alice)
+  test.setup.expect self "$out" "log=node -v|
+rc=0*"
+  out=$(test.setup.run 'private.setup.as.user bob node -v >/dev/null 2>&1' T_REAL_ASUSER=yes T_UID=1000 T_ME=alice)
+  test.setup.expect other "$out" "log=
+rc=1*"
+  [ -z "$bad" ] && create.result 0 "root via sudo -u -H, the user directly, others refused" || create.result 1 "as.user:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-AS-USER: private.setup.as.user runs as the user through sudo only when root" test.setup.asUser
+expect 0 "root via sudo -u -H, the user directly, others refused" "a run as another user went wrong"
+
+# --- T-SETUP-DOCKER ---------------------------------------------------------
+# setup docker IS odocker prereqs.install for the user (the one Docker table);
+# the old body asked oo cmd for a command named docker-ce.
+test.setup.docker() {
+  local bad="" out
+  out=$(test.setup.run 'setup.docker >/dev/null 2>&1' SUDO_USER=alice)
+  test.setup.expect sudoUser "$out" "log=odocker.prereqs.install alice|
+rc=0 odocker prerequisites here"
+  out=$(test.setup.run 'setup.docker bob >/dev/null 2>&1' T_FAIL=odocker)
+  test.setup.expect fails "$out" "log=odocker.prereqs.install bob|
+rc=1 docker missing"
+  [ -z "$bad" ] && create.result 0 "setup docker delegates to odocker prereqs.install" || create.result 1 "docker:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-DOCKER: setup docker delegates to odocker prereqs.install for the user" test.setup.docker
+expect 0 "setup docker delegates to odocker prereqs.install" "setup docker installed Docker on its own"
+
+# --- T-SETUP-NVM ------------------------------------------------------------
+# The pinned official installer, downloaded to a temp file (never into the
+# repository), run as the user with PROFILE=/dev/null (the login already loads
+# nvm); a second run does nothing.
+test.setup.nvm() {
+  local bad="" out
+  out=$(test.setup.run 'setup.nvm alice >/dev/null 2>&1; setup.nvm alice >/dev/null 2>&1')
+  test.setup.expect install "$out" "log=curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v*/install.sh -o *|as alice: env PROFILE=/dev/null bash *|
+rc=0 nvm already there for alice"
+  case "$out" in *"-o $OOSH_DIR"*|*"/su/install"*) bad="$bad inRepo=[$out]" ;; esac
+  out=$(test.setup.run 'setup.nvm alice v0.39.7 >/dev/null 2>&1')
+  test.setup.expect version "$out" "log=curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh *"
+  out=$(test.setup.run 'setup.nvm alice >/dev/null 2>&1' T_FAIL=curl)
+  test.setup.expect download "$out" "log=curl *|
+rc=1 nvm download failed*"
+  out=$(test.setup.run 'setup.nvm >/dev/null 2>&1')
+  test.setup.expect root "$out" "log=curl *|as root: *|
+rc=0 nvm * for root"
+  [ -z "$bad" ] && create.result 0 "pinned nvm installer, temp file, as the user, once" || create.result 1 "nvm:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-NVM: setup nvm runs the pinned installer as the user, once" test.setup.nvm
+expect 0 "pinned nvm installer, temp file, as the user, once" "nvm was installed from an unpinned or repository path"
+
+# --- T-SETUP-NODEJS ---------------------------------------------------------
+test.setup.nodejs() {
+  local bad="" out
+  out=$(test.setup.run 'setup.nodejs "" alice >/dev/null 2>&1')
+  test.setup.expect lts "$out" "log=curl *|as alice: env PROFILE=/dev/null *|as alice: bash -c * _ --lts|as alice: bash -c *node -v*|
+rc=0 node v22.0.0 for alice"
+  out=$(test.setup.run 'setup.nodejs 20 alice >/dev/null 2>&1')
+  test.setup.expect version "$out" "*|as alice: bash -c * _ 20|*"
+  out=$(test.setup.run 'setup.nodejs "" alice >/dev/null 2>&1' T_FAIL="node")
+  test.setup.expect fails "$out" "*
+rc=1 node install failed for alice*"
+  [ -z "$bad" ] && create.result 0 "nvm, then node (LTS by default) as the user, verified" || create.result 1 "nodejs:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-NODEJS: setup nodejs installs node through nvm as the user and verifies it" test.setup.nodejs
+expect 0 "nvm, then node (LTS by default) as the user, verified" "node was not installed for the user"
+
+# --- T-SETUP-NPM ------------------------------------------------------------
+# npm comes with nvm's node; only without it the package manager is asked —
+# on Homebrew npm is part of the node formula.
+test.setup.npm() {
+  local bad="" out
+  out=$(test.setup.run 'setup.npm alice >/dev/null 2>&1')
+  test.setup.expect present "$out" "log=as alice: bash -c *npm -v*|
+rc=0 npm 10.0.0 for alice"
+  out=$(test.setup.run 'setup.npm alice >/dev/null 2>&1' T_FAIL=npm)
+  test.setup.expect apt "$out" "log=as alice: *|oo.cmd npm|
+rc=0 npm installed"
+  out=$(test.setup.run 'setup.npm alice >/dev/null 2>&1' T_FAIL=npm OOSH_OS=darwin OOSH_PM="brew install")
+  test.setup.expect brew "$out" "log=as alice: *|oo.cmd npm node|
+rc=0*"
+  [ -z "$bad" ] && create.result 0 "npm from nvm's node, else oo cmd (node on brew)" || create.result 1 "npm:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-NPM: setup npm takes npm from nvm's node, else the package manager" test.setup.npm
+expect 0 "npm from nvm's node, else oo cmd (node on brew)" "npm was not found or not installed"
+
+# --- T-SETUP-HEADLESS -------------------------------------------------------
+# Linux: TigerVNC + a small Xfce through oo cmd, the service stays OFF (no
+# password yet); a container or no systemd skips. macOS: Screen Sharing on.
+test.setup.headless() {
+  local bad="" out
+  out=$(test.setup.run 'setup.headless alice >/dev/null 2>&1')
+  test.setup.expect apt "$out" "log=oo.cmd vncserver tigervnc-standalone-server|oo.cmd startxfce4 xfce4-session|oo.cmd xfwm4 xfwm4|oo.cmd xfce4-panel xfce4-panel|oo.cmd xfce4-terminal xfce4-terminal|oo.cmd dbus-launch dbus-x11|
+rc=0 TigerVNC and Xfce installed; off until: sudo -i ~root/oosh/su/setup vnc.password alice"
+  out=$(test.setup.run 'setup.headless alice >/dev/null 2>&1' OOSH_PM="dnf -y install")
+  test.setup.expect dnf "$out" "log=oo.cmd vncserver tigervnc-server|*oo.cmd dbus-launch dbus-x11|
+rc=0*"
+  out=$(test.setup.run 'setup.headless alice >/dev/null 2>&1' T_CT=yes)
+  test.setup.expect container "$out" "log=
+rc=0 skipped: *container*"
+  out=$(test.setup.run 'setup.headless alice >/dev/null 2>&1' T_SYSTEMD=no)
+  test.setup.expect noSystemd "$out" "log=
+rc=0 skipped: *systemd*"
+  out=$(test.setup.run 'setup.headless alice >/dev/null 2>&1' T_FAIL=oo.cmd:vncserver)
+  test.setup.expect fails "$out" "*
+rc=1 *vncserver*"
+  out=$(test.setup.run 'setup.headless alice >/dev/null 2>&1' OOSH_OS=darwin OOSH_PM="brew install")
+  test.setup.expect mac "$out" "log=launchctl enable system/com.apple.screensharing|launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist|
+rc=0 Screen Sharing on*System Settings*"
+  test.setup.expect noStart "$(test.setup.run 'setup.headless alice >/dev/null 2>&1')" "log=oo.cmd*"
+  [ -z "$bad" ] && create.result 0 "TigerVNC + Xfce, off; skipped in a container or without systemd; Screen Sharing on macOS" || create.result 1 "headless:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-HEADLESS: setup headless installs TigerVNC + Xfce (off), skips containers, switches on Screen Sharing on macOS" test.setup.headless
+expect 0 "TigerVNC + Xfce, off; skipped in a container or without systemd; Screen Sharing on macOS" \
+  "setup headless piped a remote gist into sh"
+
+# --- T-SETUP-VNC-PASSWORD ---------------------------------------------------
+test.setup.vncPassword() {
+  local bad="" out
+  out=$(test.setup.run 'setup.vnc.password alice >/dev/null 2>&1; setup.vnc.password alice >/dev/null 2>&1; cat "$SETUP_ETC_DIR/tigervnc/vncserver.users" >> "$FX/log"')
+  test.setup.expect linux "$out" "log=as alice: vncpasswd|as alice: sh -c *session=xfce*|systemctl enable --now vncserver@:1|as alice: vncpasswd|as alice: sh -c *|systemctl enable --now vncserver@:1|:1=alice|
+rc=0 VNC on for alice at display :1*"
+  out=$(test.setup.run 'setup.vnc.password >/dev/null 2>&1')
+  test.setup.expect noUser "$out" "log=
+rc=1 *user*"
+  out=$(test.setup.run 'setup.vnc.password alice >/dev/null 2>&1' T_FAIL=as:alice)
+  test.setup.expect noPassword "$out" "log=as alice: vncpasswd|
+rc=1*"
+  out=$(test.setup.run 'setup.vnc.password alice >/dev/null 2>&1' OOSH_OS=darwin)
+  test.setup.expect mac "$out" "log=
+rc=0 *macOS*password*"
+  [ -z "$bad" ] && create.result 0 "vncpasswd as the user, Xfce session, display :1 once, service on" || create.result 1 "vnc.password:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-VNC-PASSWORD: setup vnc.password sets the password as the user and switches VNC on" test.setup.vncPassword
+expect 0 "vncpasswd as the user, Xfce session, display :1 once, service on" "VNC came on without a password"
+
+# --- T-SETUP-SAMBA ----------------------------------------------------------
+test.setup.samba() {
+  local bad="" out
+  out=$(test.setup.run 'setup.samba.support alice >/dev/null 2>&1; cat "$SETUP_ETC_DIR/avahi/services/smb.service" >> "$FX/log"')
+  test.setup.expect apt "$out" "log=oo.cmd smbd samba|oo.cmd smbclient smbclient|oo.cmd avahi-daemon avahi-daemon|systemctl disable --now smbd|systemctl disable --now nmbd|*<type>_smb._tcp</type>*
+rc=0 Samba and Avahi installed; off until: sudo -i ~root/oosh/su/setup samba.password alice"
+  out=$(test.setup.run 'setup.samba.support alice >/dev/null 2>&1' OOSH_PM="dnf -y install")
+  test.setup.expect dnf "$out" "log=oo.cmd smbd samba|oo.cmd smbclient samba-client|oo.cmd avahi-daemon avahi|*"
+  out=$(test.setup.run 'setup.samba.support alice >/dev/null 2>&1' T_CT=yes)
+  test.setup.expect container "$out" "log=
+rc=0 skipped: *container*"
+  out=$(test.setup.run 'setup.samba.support alice >/dev/null 2>&1' OOSH_OS=darwin OOSH_PM="brew install")
+  test.setup.expect mac "$out" "log=launchctl enable system/com.apple.smbd|launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.smbd.plist|
+rc=0 File Sharing (SMB) on*System Settings*"
+  out=$(test.setup.run 'setup.samba.password alice >/dev/null 2>&1')
+  test.setup.expect password "$out" "log=smbpasswd -a alice|systemctl enable --now smbd avahi-daemon|
+rc=0 Samba on for alice*"
+  out=$(test.setup.run 'setup.samba.password alice >/dev/null 2>&1' T_FAIL=smbpasswd)
+  test.setup.expect noPassword "$out" "log=smbpasswd -a alice|
+rc=1*"
+  [ -z "$bad" ] && create.result 0 "Samba + Avahi, off until samba.password; File Sharing on macOS" || create.result 1 "samba:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-SAMBA: setup samba.support installs Samba + Avahi (off), samba.password switches it on" test.setup.samba
+expect 0 "Samba + Avahi, off until samba.password; File Sharing on macOS" "smbpasswd prompted during the install"
+
+# --- T-SETUP-ALL ------------------------------------------------------------
+# What state 50 runs: every step in order, node for the user and root; a
+# failing step is a warning, never a stop (rc 0), and is named.
+test.setup.all() {
+  local bad="" out stubs
+  stubs='for s in docker nodejs npm headless samba.support; do eval "setup.$s() { t.log \"$s \$*\"; t.rc $s || { create.result 1 \"$s broke\"; return 1; }; create.result 0 \"$s fine\"; return 0; }"; done'
+  out=$(test.setup.run "$stubs; setup.all >/dev/null 2>&1" SUDO_USER=alice)
+  test.setup.expect order "$out" "log=docker alice|nodejs  alice|nodejs  root|npm alice|npm root|headless alice|samba.support alice|
+rc=0 headless setup: 7 ok, 0 skipped, 0 failed"
+  out=$(test.setup.run "$stubs; setup.all >/dev/null 2>&1" SUDO_USER=alice T_FAIL=headless)
+  test.setup.expect fails "$out" "*samba.support alice|
+rc=0 headless setup: 6 ok, 0 skipped, 1 failed (headless)"
+  out=$(test.setup.run "$stubs; setup.all >/dev/null 2>&1")
+  test.setup.expect rootOnly "$out" "log=docker |nodejs  root|npm root|headless |samba.support |
+rc=0 *"
+  [ -z "$bad" ] && create.result 0 "every step in order, node for the user and root, a failure never stops it" || create.result 1 "all:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-ALL: setup all runs every step, and a failing step does not stop the install" test.setup.all
+expect 0 "every step in order, node for the user and root, a failure never stops it" "one broken download stopped the whole install"
+
+# --- T-SETUP-CALLERS --------------------------------------------------------
+# share samba.install and disk install.samba.support called `install
+# samba.support` — /usr/bin/install, no oosh method at all. They are setup
+# samba.support.
+test.setup.callers() {
+  local bad="" s out
+  for s in "share share.samba.install" "disk disk.install.samba.support"; do
+    out=$(test.setup.run "source \"\$OOSH_DIR/${s%% *}\" >/dev/null 2>&1; setup.samba.support() { t.log \"setup.samba.support \$*\"; create.result 0 ok; }; ${s#* } >/dev/null 2>&1")
+    test.setup.expect "${s%% *}" "$out" "log=setup.samba.support |
+rc=0 ok"
+  done
+  [ -z "$bad" ] && create.result 0 "share and disk call setup samba.support" || create.result 1 "callers:$bad"
+  return $(result)
+}
+test.case $level "T-SETUP-CALLERS: share and disk install Samba through setup samba.support" test.setup.callers
+expect 0 "share and disk call setup samba.support" "share and disk ran /usr/bin/install samba.support"
+
+rm -rf "$TEST_SETUP_FX"
+
+# MANDATORY, and the last line of every test file.
+test.suite.save.results

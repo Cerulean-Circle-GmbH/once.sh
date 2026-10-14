@@ -5,75 +5,315 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+# What install state 50 (headless.setup.started) runs on every computer:
+# setup all = docker, nodejs + npm (nvm), headless (VNC / Screen Sharing) and
+# samba support. Nothing asks for a password during the install: VNC and Samba
+# stay off until vnc.password / samba.password (docs/setup.md). Every method
+# installs nothing under OOSH_NO_INSTALL (a test run); packages go through
+# oo cmd, Docker through odocker prereqs.install (test/test.setup).
+
+# The nvm release the installer is pinned to: never an unpinned script.
+SETUP_NVM_VERSION="v0.40.3"
+
 ### new.method
 
-setup.headless() # # sets up everything needed for headless operation
+private.setup.gate()     #  # rc 0 with RESULT when OOSH_NO_INSTALL is set — a test run installs nothing; rc 1 otherwise #
 {
-  ossh status
-  sh -c "$(wget -O- https://gist.githubusercontent.com/vietanhdev/c2cb96eb6cf5b9232a04dfbe8bdaba2f/raw/164c8f9f7eccbcacaa44b14ddb4225d283e6a3c7/install_realvnc_server.sh)"
-
-  # on pixel i used tigervnc
-
+ [ -n "$OOSH_NO_INSTALL" ] || return 1
+ create.result 0 "OOSH_NO_INSTALL is set: nothing installed"
 }
 
-setup.docker() # # sets up everything needed for headless operation
+private.setup.user.get()     # <?user> # echo <user>, else the one who ran sudo (never root), else nothing #
 {
-  oo cmd docker-ce
-  oo cmd docker-ce-cli
-  oo cmd containerd.io
-  oo cmd docker-compose-plugin
-  user group.add docker $USER
-
+ # NO create.result — a getter consumed as $(...).
+ if [ -n "$1" ]; then echo "$1"
+ elif [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then echo "$SUDO_USER"
+ fi
 }
 
-setup.nvm() # <?version> # Installs node.js via nvm
+private.setup.as.user()     # <user> <command> <?args…> # run <command> as <user>: directly when that is who runs, through sudo -u <user> -H as root; rc 1 for anyone else #
 {
-  setup.nodejs "$*"
+ local user="$1"; shift
+ if [ "$user" = "$(id -un)" ]; then
+   "$@"
+ elif [ "$(id -u)" = "0" ]; then
+   sudo -u "$user" -H "$@"
+ else
+   create.result 1 "cannot run as $user: only root or $user can"; error.log "$RESULT"
+   return 1
+ fi
 }
 
-setup.nodejs() # <?version> # Installs node.js via nvm
+private.setup.home.get()     # <user> # echo the home directory of <user> #
 {
-  #set -x
-  local version="$1"
-  if [ -z "$1" ]; then
-    version="node"
-  else
-    #cd /root
-    # curl -sL "https://raw.githubusercontent.com/nvm-sh/nvm/$version/install.sh" -o install_nvm.sh
-    # chmod +x install_nvm.sh
-    # bash install_nvm.sh
-    shift
-  fi
-
-    oo cmd curl
-    #curl https://raw.githubusercontent.com/creationix/nvm/master/install.sh | bash
-    curl -sL "https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh" -o ~/oosh/su/install_nvm.sh
-    chmod +x ~/oosh/su/install_nvm.sh
-    bash -x ~/oosh/su/install_nvm.sh
-    source ~/.bashrc
-    export NVM_DIR="~/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
-    [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
-    nvm install "$version"
-  # $NVM_DIR/nvm ls
-  rm install_nvm.sh
+ private.this.script.load user user.get || return 1
+ user.get home "$1"
 }
 
-setup.npm() # # Installs npm package manager via oo cmd
+private.setup.systemd.is()     #  # rc 0 when systemd runs this computer (the VNC and Samba services need it) #
 {
-  oo cmd npm
+ [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
 }
 
-setup.status.headless() {
-  systemctl status vncserver-virtuald.service
-  systemctl status vncserver-x11-serviced.service
+private.setup.mac.is()     #  # rc 0 on macOS #
+{
+ case "${OOSH_OS:-$(uname -s)}" in darwin*|Darwin) return 0 ;; esac
+ return 1
 }
 
-setup.headless.enable() {
-  systemctl start vncserver-virtuald.service
-  systemctl start vncserver-x11-serviced.servicep
-  systemctl enable vncserver-virtuald.service
-  systemctl enable vncserver-x11-serviced.service
+private.setup.pm.ensure()     #  # load oo cmd and discover the package manager when OOSH_PM is still empty #
+{
+ private.this.script.load oo oo.cmd || return 1
+ [ -n "$OOSH_PM" ] || oo.pm.discover >/dev/null 2>&1
+}
+
+private.setup.package.get()     # <cmd> # echo the package that provides <cmd> for the package manager in OOSH_PM; <cmd> itself when it is the same #
+{
+ # NO create.result — a getter consumed as $(...). The one table of su/setup,
+ # like private.odocker.prereq.package.get for odocker.
+ case "$1:${OOSH_PM%% *}" in
+   vncserver:dnf|vncserver:yum)       echo "tigervnc-server" ;;
+   vncserver:*)                       echo "tigervnc-standalone-server" ;;
+   startxfce4:*)                      echo "xfce4-session" ;;
+   dbus-launch:*)                     echo "dbus-x11" ;;
+   smbd:*)                            echo "samba" ;;
+   smbclient:dnf|smbclient:yum)       echo "samba-client" ;;
+   avahi-daemon:dnf|avahi-daemon:yum) echo "avahi" ;;
+   *)                                 echo "$1" ;;
+ esac
+}
+
+private.setup.cmds.install()     # <cmd> <?cmd…> # oo cmd every <cmd> with its package; rc 1 at the first that fails, naming it #
+{
+ local cmd
+ for cmd in "$@"; do
+   oo.cmd "$cmd" "$(private.setup.package.get "$cmd")" || { create.result 1 "$cmd: $RESULT"; return 1; }
+ done
+ create.result 0 "installed: $*"
+}
+
+private.setup.launchd.on()     # <label> # macOS: enable and load the system launch daemon <label> (com.apple.screensharing, com.apple.smbd); rc 0 when it is loaded #
+{
+ $SUDO launchctl enable "system/$1" >/dev/null 2>&1
+ # bootstrap refuses a daemon that is already loaded: then it is on.
+ $SUDO launchctl bootstrap system "/System/Library/LaunchDaemons/$1.plist" >/dev/null 2>&1 \
+   || $SUDO launchctl print "system/$1" >/dev/null 2>&1
+}
+
+setup.docker()     # <?user:$SUDO_USER> # Docker here (engine on a computer, client in a container) and <user> in the group of its socket — odocker prereqs.install #
+{
+ private.setup.gate && return $(result)
+ local user; user=$(private.setup.user.get "$1")
+ [ -n "$1" ] && shift
+ private.this.script.load odocker odocker.prereqs.install || { create.result 1 "odocker not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+ odocker.prereqs.install $user
+ return $(result)
+}
+
+setup.nvm()     # <?user:$SUDO_USER> <?version:v0.40.3> # install nvm for <user> from its official installer, pinned to <version>; nothing when it is there #
+{
+ private.setup.gate && return $(result)
+ local user version="${2:-$SETUP_NVM_VERSION}" home tmp
+ user=$(private.setup.user.get "$1"); [ -n "$user" ] || user=$(id -un)
+ home=$(private.setup.home.get "$user")
+ if [ -f "$home/.nvm/nvm.sh" ]; then
+   create.result 0 "nvm already there for $user"; return $(result)
+ fi
+ # A temp file in /tmp, never the repository; readable by <user> (root's own
+ # TMPDIR on macOS is private). PROFILE=/dev/null: the login already loads nvm
+ # (templates/user/bashrcTemplate).
+ tmp=$(mktemp /tmp/setup.nvm.XXXXXX) || { create.result 1 "nvm: no temp file"; return $(result); }
+ if ! curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/$version/install.sh" -o "$tmp"; then
+   rm -f "$tmp"
+   create.result 1 "nvm download failed ($version)"; error.log "$RESULT"; return $(result)
+ fi
+ chmod 644 "$tmp"
+ private.setup.as.user "$user" env PROFILE=/dev/null bash "$tmp"
+ rm -f "$tmp"
+ if [ -f "$home/.nvm/nvm.sh" ]; then
+   create.result 0 "nvm $version for $user"
+ else
+   create.result 1 "nvm install failed for $user ($version)"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+setup.nodejs()     # <?version:--lts> <?user:$SUDO_USER> # install node <version> through nvm for <user> and make sure it runs #
+{
+ private.setup.gate && return $(result)
+ local version="${1:---lts}" user v
+ user=$(private.setup.user.get "$2"); [ -n "$user" ] || user=$(id -un)
+ setup.nvm "$user" || return $(result)
+ private.setup.as.user "$user" bash -c '. "$HOME/.nvm/nvm.sh" && nvm install "$1"' _ "$version"
+ v=$(private.setup.as.user "$user" bash -c '. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 && node -v' 2>/dev/null)
+ if [ -n "$v" ]; then
+   create.result 0 "node $v for $user"
+ else
+   create.result 1 "node install failed for $user ($version)"; error.log "$RESULT"
+ fi
+ return $(result)
+}
+
+setup.npm()     # <?user:$SUDO_USER> # make sure <user> has npm: the one of nvm's node, else from the package manager #
+{
+ private.setup.gate && return $(result)
+ local user v
+ user=$(private.setup.user.get "$1"); [ -n "$user" ] || user=$(id -un)
+ v=$(private.setup.as.user "$user" bash -c '. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1; npm -v' 2>/dev/null)
+ if [ -n "$v" ]; then
+   create.result 0 "npm $v for $user"; return $(result)
+ fi
+ private.setup.pm.ensure
+ # Homebrew ships npm inside the node formula.
+ case "${OOSH_PM%% *}" in
+   brew) oo.cmd npm node ;;
+   *)    oo.cmd npm ;;
+ esac
+ return $(result)
+}
+
+setup.headless()     # <?user:$SUDO_USER> # remote desktop: TigerVNC + a small Xfce on Linux (off until vnc.password), Screen Sharing on macOS; skipped in a container or without systemd #
+{
+ private.setup.gate && return $(result)
+ local user; user=$(private.setup.user.get "$1")
+ if private.setup.mac.is; then
+   if private.setup.launchd.on com.apple.screensharing; then
+     create.result 0 "Screen Sharing on — log in with the macOS account; allow remote control once in System Settings › General › Sharing › Screen Sharing"
+   else
+     create.result 1 "Screen Sharing could not be switched on (needs root)"; error.log "$RESULT"
+   fi
+   return $(result)
+ fi
+ if private.this.container.is; then
+   create.result 0 "skipped: no VNC in a container"; info.log "$RESULT"; return $(result)
+ fi
+ if ! private.setup.systemd.is; then
+   create.result 0 "skipped: no systemd here to run the VNC service"; info.log "$RESULT"; return $(result)
+ fi
+ private.setup.pm.ensure
+ private.setup.cmds.install vncserver startxfce4 xfwm4 xfce4-panel xfce4-terminal dbus-launch || { error.log "$RESULT"; return $(result); }
+ create.result 0 "TigerVNC and Xfce installed; off until: sudo -i ~root/oosh/su/setup vnc.password ${user:-<user>}"
+ return $(result)
+}
+
+setup.vnc.password()     # <user> # ask <user>'s VNC password, give <user> an Xfce session on a display of its own and switch the VNC service on #
+{
+ private.setup.gate && return $(result)
+ local user="$1" users display
+ if [ -z "$user" ]; then
+   create.result 1 "setup.vnc.password: <user> required"; error.log "$RESULT"; return $(result)
+ fi
+ if private.setup.mac.is; then
+   create.result 0 "macOS Screen Sharing uses the macOS account password of $user: nothing to set"; return $(result)
+ fi
+ private.setup.as.user "$user" vncpasswd || { create.result 1 "no VNC password set for $user"; error.log "$RESULT"; return $(result); }
+ private.setup.as.user "$user" sh -c 'mkdir -p "$HOME/.vnc" && { grep -qx "session=xfce" "$HOME/.vnc/config" 2>/dev/null || echo "session=xfce" >> "$HOME/.vnc/config"; }'
+ # One display per user in TigerVNC's systemd map; the first free one.
+ users="${SETUP_ETC_DIR:-/etc}/tigervnc/vncserver.users"
+ display=$(sed -n "s/^:\([0-9]*\)=$user\$/\1/p" "$users" 2>/dev/null | head -1)
+ if [ -z "$display" ]; then
+   display=1
+   while grep -q "^:$display=" "$users" 2>/dev/null; do display=$((display + 1)); done
+   $SUDO mkdir -p "${users%/*}"
+   echo ":$display=$user" | $SUDO tee -a "$users" >/dev/null
+ fi
+ if ! $SUDO systemctl enable --now "vncserver@:$display"; then
+   create.result 1 "vncserver@:$display did not start"; error.log "$RESULT"; return $(result)
+ fi
+ create.result 0 "VNC on for $user at display :$display (port $((5900 + display)))"
+ return $(result)
+}
+
+setup.samba.support()     # <?user:$SUDO_USER> # file sharing: Samba + Avahi on Linux (off until samba.password), File Sharing (SMB) on macOS; skipped in a container or without systemd #
+{
+ private.setup.gate && return $(result)
+ local user service
+ user=$(private.setup.user.get "$1")
+ if private.setup.mac.is; then
+   if private.setup.launchd.on com.apple.smbd; then
+     create.result 0 "File Sharing (SMB) on — choose the folders and turn on SMB for ${user:-the user} in System Settings › General › Sharing › File Sharing › Options"
+   else
+     create.result 1 "File Sharing could not be switched on (needs root)"; error.log "$RESULT"
+   fi
+   return $(result)
+ fi
+ if private.this.container.is; then
+   create.result 0 "skipped: no Samba in a container"; info.log "$RESULT"; return $(result)
+ fi
+ if ! private.setup.systemd.is; then
+   create.result 0 "skipped: no systemd here to run Samba"; info.log "$RESULT"; return $(result)
+ fi
+ private.setup.pm.ensure
+ private.setup.cmds.install smbd smbclient avahi-daemon || { error.log "$RESULT"; return $(result); }
+ # Debian starts smbd on install; it stays off until a user has a password.
+ $SUDO systemctl disable --now smbd >/dev/null 2>&1
+ $SUDO systemctl disable --now nmbd >/dev/null 2>&1
+ # Avahi announces the share, so Macs see it in the Finder.
+ service="${SETUP_ETC_DIR:-/etc}/avahi/services/smb.service"
+ if [ ! -f "$service" ]; then
+   $SUDO mkdir -p "${service%/*}"
+   printf '%s\n' '<?xml version="1.0" standalone='"'"'no'"'"'?>' \
+     '<!DOCTYPE service-group SYSTEM "avahi-service.dtd">' \
+     '<service-group>' '  <name replace-wildcards="yes">%h</name>' \
+     '  <service>' '    <type>_smb._tcp</type>' '    <port>445</port>' '  </service>' \
+     '</service-group>' | $SUDO tee "$service" >/dev/null
+ fi
+ create.result 0 "Samba and Avahi installed; off until: sudo -i ~root/oosh/su/setup samba.password ${user:-<user>}"
+ return $(result)
+}
+
+setup.samba.password()     # <user> # ask <user>'s Samba password and switch Samba and Avahi on #
+{
+ private.setup.gate && return $(result)
+ local user="$1"
+ if [ -z "$user" ]; then
+   create.result 1 "setup.samba.password: <user> required"; error.log "$RESULT"; return $(result)
+ fi
+ if private.setup.mac.is; then
+   create.result 0 "macOS: turn on SMB for $user in System Settings › General › Sharing › File Sharing › Options (it asks for the password there)"
+   return $(result)
+ fi
+ $SUDO smbpasswd -a "$user" || { create.result 1 "no Samba password set for $user"; error.log "$RESULT"; return $(result); }
+ if ! $SUDO systemctl enable --now smbd avahi-daemon; then
+   create.result 1 "smbd or avahi-daemon did not start"; error.log "$RESULT"; return $(result)
+ fi
+ create.result 0 "Samba on for $user"
+ return $(result)
+}
+
+private.setup.all.step()     # <name> <method> <?args…> # one step of setup.all: count it ok, skipped or failed and add its line to SETUP_SUMMARY; a failure is a warning, never a stop #
+{
+ local name="$1"; shift
+ if "$@"; then
+   case "$RESULT" in
+     skipped:*) SETUP_SKIPPED=$((SETUP_SKIPPED + 1)) ;;
+     *)         SETUP_OK=$((SETUP_OK + 1)) ;;
+   esac
+ else
+   SETUP_FAILED=$((SETUP_FAILED + 1)); SETUP_FAILED_NAMES="${SETUP_FAILED_NAMES:+$SETUP_FAILED_NAMES }$name"
+   warn.log "setup $name: $RESULT"
+ fi
+ SETUP_SUMMARY="${SETUP_SUMMARY}  $name: $RESULT"$'\n'
+ return 0
+}
+
+setup.all()     # <?user:$SUDO_USER> # everything install state 50 runs: docker, nodejs + npm for <user> and this user, headless, samba support; a failing step is a warning, never a stop #
+{
+ private.setup.gate && return $(result)
+ local user me u nodeUsers
+ user=$(private.setup.user.get "$1")
+ me=$(id -un)
+ nodeUsers="$user"; [ "$me" != "$user" ] && nodeUsers="${nodeUsers:+$nodeUsers }$me"
+ SETUP_OK=0; SETUP_SKIPPED=0; SETUP_FAILED=0; SETUP_FAILED_NAMES=""; SETUP_SUMMARY=""
+ private.setup.all.step docker setup.docker "$user"
+ for u in $nodeUsers; do private.setup.all.step nodejs setup.nodejs "" "$u"; done
+ for u in $nodeUsers; do private.setup.all.step npm setup.npm "$u"; done
+ private.setup.all.step headless setup.headless "$user"
+ private.setup.all.step samba.support setup.samba.support "$user"
+ important.log "headless setup:
+${SETUP_SUMMARY%$'\n'}"
+ create.result 0 "headless setup: $SETUP_OK ok, $SETUP_SKIPPED skipped, $SETUP_FAILED failed${SETUP_FAILED_NAMES:+ ($SETUP_FAILED_NAMES)}"
+ return $(result)
 }
 
 setup.pacstall() {
@@ -92,82 +332,21 @@ setup.chromium() # # sets up everything needed for headless operation
   oo cmd chromium-browser
 }
 
-setup.samba.support() # #
-{
-  important.log "Needs to be run as ROOT"
-  oo cmd samba 
-  oo cmd samba-common-bin
-  oo cmd smbclient
-
-  oo cmd netatalk
-
-  important.log "Please set a samba password..."
-  smbpasswd -a
-
-  systemctl restart smbd
-
-  #vim /etc/samba/smb.conf
-    # [pishare]
-    # path = /media/pi/shared
-    # writeable=Yes
-    # create mask=0777
-    # directory mask=0777
-    # public=no
-
-  #vim /etc/nsswitch.conf
-  #vim /etc/avahi/services/rfb.service
-      # <?xml version="1.0" standalone='no'?>
-      # <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-      # <service-group>
-      #   <name replace-wildcards="yes">%h</name>
-      #   <service>
-      #     <type>_rfb._tcp</type>
-      #     <port>5900</port>
-      #   </service>
-      # </service-group>  
-
-  #vim /etc/avahi/services/smb.service
-      # <?xml version="1.0" standalone='no'?>
-      # <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-      # <service-group>
-      #   <name replace-wildcards="yes">%h</name>
-      #   <service>
-      #     <type>_smb._tcp</type>
-      #     <port>445</port>
-      #   </service>
-      #   <service>
-      #     <type>_device-info._tcp</type>
-      #     <port>0</port>
-      #     <txt-record>model=Xserve</txt-record>
-      #   </service>
-      # </service-group>
-
-  ## xxx service avahi-daemon start
-  ## xxx service netatalk start
-  systemctl enable avahi-daemon
-  systemctl enable netatalk
-
-  systemctl restart smbd
-  systemctl restart avahi-daemon
-  systemctl restart netatalk
-
-  important.log "Please Reboot before you continue...."
-}
-
 setup.usage()
 {
   local this=${0##*/}
-  echo "You started" 
+  echo "You started"
   echo "$0
 
   Usage:
   $this: command   Parameter and Description"
   this.help
   echo "
-  
+
   Examples
-    $this v
-    $this init
+    $this all
+    $this vnc.password <user>
+    $this samba.password <user>
     ----------
   "
 }
@@ -186,4 +365,3 @@ setup.start()
 }
 
 setup.start "$@"
-

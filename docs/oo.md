@@ -712,7 +712,10 @@ States include:
 | 32 | root.dev.keys.installed | Deploy keys |
 | 33 | root.installation.done | root bashrc + login shell |
 | 34 | root.boot.path.installed | removes the retired login drop-in (see [The retired login drop-in](#the-retired-login-drop-in)) |
-| 40+ | shared/headless/once | Advanced setup stages |
+| 40-41 | user.* | Users linked to the shared tree |
+| 50 | headless.setup.started | `su/setup all`: Docker, Node.js + npm, VNC / Screen Sharing, Samba / File Sharing; a failure is a warning, never a stop ([setup.md](setup.md)) |
+| 51 | headless.setup.finished | Nothing (the summary is printed by `setup all`) |
+| 60-61 | once.setup.* | `once init` when `once` is installed |
 
 ## Promotion Pipeline
 
