@@ -162,6 +162,31 @@ ossh key.push myhost
 ossh config.push myhost
 ```
 
+### Who may log in: `public_keys/` and `authorized_keys`
+
+`~/.ssh/public_keys/` is the list; `~/.ssh/authorized_keys` is built from it
+by `user authorized.keys.update` — the one rebuild, which `ossh key.push` runs
+on the target. Revoking a key moves its file to `~/.ssh/deactive.public_keys/`
+and rebuilds.
+
+A key that is only in `authorized_keys` — put there by the hoster, by hand, or
+before oosh was installed — gets a file `public_keys/adopted.<comment>.public_key`
+first, so the rebuild keeps it. A revoked key (file in `deactive.public_keys/`)
+stays out. Keys are compared by the key itself, not by file name. Before
+2026-10-15 the rebuild deleted such keys: on POL.dev the first `ossh key.push`
+after the install removed the Mac Studio's RSA key, and root's login asked for
+a password again (T-USER-AUTHORIZED-KEYS-ADOPT).
+
+Where ossh writes a target's `authorized_keys` itself — `ossh install <host> <user>`,
+and `key.push` to an oosh without `authorized.keys.update` — it only adds the
+pushed key (`private.ossh.authorized.key.append.get`, T-OSSH-AUTHORIZED-KEY-APPEND).
+
+`key.push` without a key name pushes this computer's own key (the one in
+`~/.ssh/private_key/`). The Host entry must log in with that key —
+`ossh config.create` writes `IdentityFile ~/.ssh/id_ed25519`; an older
+hand-written entry may name another key (`id_rsa`), and then needs
+`ossh key.push <host> <file in public_keys/>`.
+
 ## Repairing a Broken `~/.ssh`
 
 A fresh OOSH install lays down a canonical `~/.ssh` tree via `osshLayout build` (idempotent roles for owner, developking, installer, outeruser, closed by `private.osshLayout.perms.tighten`). On older machines that were installed before the Phase 2 layout work, the tree may have drifted — forbidden symlinks where real files are required, wrong perms (775/777 on private keys), legacy artifacts from earlier OOSH versions.

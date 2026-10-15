@@ -751,7 +751,10 @@ See [Promotion Pipeline (promote)](promote.md) for full documentation.
 oo dev.to.testing         # Promote dev → testing (gated by tests)
 oo dev.to.testing reset   # Restart promotion from scratch
 oo dev.to.testing yes     # Skip confirmations (PROMOTE_FORCE)
+oo dev.to.testing notests # Promote without running the tests (one run)
 oo testing.to.prod        # Promote testing → prod
+oo testing.to.prod notests # The same without the core and platform tests
+oo stage dev notests      # oo stage takes the same words (reset|yes|skip|notests)
 oo promote.status         # Show pipeline state and branch diffs
 oo promote.report         # Show promotion history from git tags
 ```
