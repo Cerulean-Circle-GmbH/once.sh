@@ -297,7 +297,7 @@ the socket's group. It takes one of two paths:
       It uses the container's `ID` and `VERSION_CODENAME` (its `/etc/os-release`,
       read with `private.os.release.get`) and the container's `dpkg`
       architecture, never the host's.
-    - The download is the same too, `private.odocker.docker.repo.download <url> <file>`.
+    - The download is the same too, `private.odocker.docker.repo.download <url> <file>`, which calls `private.this.url.download` (the one checked download).
       It runs on the host, because a naked image may have no curl. The file
       (and the container's os-release) lie in one private directory from the
       kernel's `private.this.temp.dir.get`, removed on every exit path.
@@ -382,6 +382,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 |--------|-----------|-------------|
 | `exec <container>` | container name, optional shell (default: bash) | Shell into running container (interactive `-it`) |
 | `exec.command <container> <command...>` | container name, command to run | Run a non-interactive command inside a running container (no TTY); for scripts/state machines |
+| `image.command <image> <command...>` | image, command to run | Run one command in a throwaway container of `<image>` (removed afterwards), stdin passed in, rc the command's; `os platform.parse.check` streams a tree in this way (T-ODOCKER-IMAGE-COMMAND) |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
 

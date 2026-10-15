@@ -293,23 +293,19 @@ ossh.id.create() # <idName> <?sshDir:~/.ssh> # creates a new ed25519 ssh key pai
 
 private.ossh.users.basehome() # # canonical base directory for system user homes on this OS — '/Users' on macOS, '/home' on Linux. Override via $OOSH_USERS_BASEHOME.
 {
-  # Why this exists: `dirname "$HOME"` is NOT portable for finding the
-  # system's user-home base. On Linux root's $HOME is /root → dirname=/ →
-  # the historical fallback `[ basehome = / ] && basehome=/home` patches
-  # that. On macOS root's $HOME is /var/root → dirname=/var, the / fallback
-  # doesn't fire, and code that builds /var/developking/... or /var/shared/...
-  # silently misses developking (in /Users/developking) and never creates
-  # /Users/shared/.ssh — which is exactly the seeding bug reproduced on
-  # macstudio installs. Using $OSTYPE (a bash builtin, no dependencies) is
-  # both correct and cheap.
-  if [ -n "$OOSH_USERS_BASEHOME" ]; then
-    printf '%s\n' "$OOSH_USERS_BASEHOME"
-    return 0
-  fi
-  case "$OSTYPE" in
-    darwin*) printf '/Users\n' ;;
-    *)       printf '/home\n' ;;
-  esac
+  # The rule has ONE source, user's private.user.basehome.system.get, reached as
+  # `user.get basehome root` (T-OSSH-USERS-BASEHOME-DELEGATES); why it is not
+  # `dirname "$HOME"` is written there. This name stays for its callers in this
+  # file. The inline copies in ossh.install.user.remote and
+  # private.ossh.shared.ssh.copy.to.all run on another host and cannot call it.
+  # Nothing and rc 1 when user cannot be loaded or answers no base, so a
+  # caller never builds /shared/... (T-OSSH-USERS-BASEHOME-UNLOADED). The load
+  # sources user once: it is a no-op while user.get is a function.
+  private.this.script.load user user.get || return 1
+  local base
+  base=$(user.get basehome root)
+  [ -n "$base" ] || return 1
+  printf '%s\n' "$base"
 }
 
 ossh.config.create() # <?sshConfigName> <?url> <?idOrProxyJump> <?identitiesOnly> <?proxyJump> # creates a ssh config; <sshConfigName> may be user@host. Single user@host arg auto-parses. Two args: alias user@host. Trailing keyword identitiesOnly adds an IdentitiesOnly yes line. Trailing proxyJump {jumpHostName} adds a ProxyJump line.
@@ -395,6 +391,10 @@ ossh.config.create() # <?sshConfigName> <?url> <?idOrProxyJump> <?identitiesOnly
       id="$RESULT/ids/$idName/id_ed25519"
     fi
   fi
+  # A key under $HOME goes into the config as ~/…, which ssh expands for each
+  # user — an absolute /home/<user> path is what
+  # test.platform.ssh.layout.invariant rejects (T-OSSH-CONFIG-CREATE-ID-PORTABLE).
+  [ -n "$HOME" ] && [ "${id#"$HOME"/}" != "$id" ] && id="~/${id#"$HOME"/}"
 
   ossh.config.parse.url "$url"
 
@@ -1063,6 +1063,9 @@ ossh.update.authorized_keys() # <?sshDir:~/.ssh> # updates authorized_keys from 
 
 ossh.rights.fix() # <?sshDir:~/.ssh> # canonical perms on sshDir (alias for private.osshLayout.perms.tighten)
 {
+  # osshLayout is not sourced by ossh: typed as a command, the call died with
+  # rc 127 (T-RIGHTS-FIX-RUNS).
+  private.this.script.load osshLayout private.osshLayout.perms.tighten || { create.result 1 "ossh rights.fix: osshLayout not loadable from $OOSH_DIR"; error.log "$RESULT"; return $(result); }
   private.get.sshDir "$1"
   if [ -n "$1" ]; then shift; fi
   private.osshLayout.perms.tighten "$RESULT"
@@ -1073,17 +1076,26 @@ ossh.folder.fix() # <?installerEmail> <?sshDir:~/.ssh> <?mode:conservative> # co
 {
   # Arg parsing — classify by content (any order, any subset):
   #   *@*                 → installerEmail
-  #   conservative|strict → mode
-  #   anything else       → sshDir
+  #   */*                 → sshDir (a path: ~/.ssh, /home/x/.ssh)
+  #   anything else       → mode — an unknown one is refused below. As
+  #                         "anything else → sshDir", a mistyped mode became
+  #                         a relative folder and got a whole layout built in
+  #                         the current directory (T-FOLDER-FIX-REJECTS-UNKNOWN-MODE).
   # Empty positional slots are ignored (so `ossh folder.fix "" path strict`
   # also works).
+  # osshLayout.build and the perms helper live in osshLayout, which ossh does
+  # not source (T-RIGHTS-FIX-RUNS).
+  private.this.script.load osshLayout osshLayout.build || { create.result 1 "ossh folder.fix: osshLayout not loadable from $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+  # user.init (the WODA blocks) lives in user, which ossh does not source either
+  # (T-FOLDER-FIX-WRITES-WODA).
+  private.this.script.load user user.init || { create.result 1 "ossh folder.fix: user not loadable from $OOSH_DIR"; error.log "$RESULT"; return $(result); }
   local installerEmail="" sshDir="" mode=""
   while [ $# -gt 0 ]; do
     case "$1" in
       "")                  : ;;
-      conservative|strict) mode="$1" ;;
       *@*)                 installerEmail="$1" ;;
-      *)                   sshDir="$1" ;;
+      */*)                 sshDir="$1" ;;
+      *)                   mode="$1" ;;
     esac
     shift
   done
@@ -1151,13 +1163,20 @@ private.ossh.folder.fix.config.normalize() # <sshDir> # ensure ~/.ssh/config has
   # commit 9a5af58, the canonical form is the literal "~/.ssh/id_ed25519"
   # so SSH expands ~ per-user at read-time. user.init appends-if-missing
   # so it doesn't touch already-present blocks; this pass fixes them.
+  # Every other block: a key under the home of <sshDir> becomes ~/… too —
+  # config.create wrote $HOME paths before T-OSSH-CONFIG-CREATE-ID-PORTABLE and
+  # config.save.last never replaces a block (T-OSSH-FOLDER-FIX-ID-PORTABLE).
+  local home=""
+  [ "${sshDir##*/}" = ".ssh" ] && home="${sshDir%/.ssh}"
   local tmp="$cfg.tmp.$$"
-  awk '
+  awk -v home="$home" '
     /^Host WODA\.(test|dev\.root|dev)$/ { in_woda = 1 }
     /^Host / && !/^Host WODA\.(test|dev\.root|dev)$/ { in_woda = 0 }
     {
       if (in_woda && $1 == "IdentityFile" && $2 != "~/.ssh/id_ed25519") {
         print " IdentityFile ~/.ssh/id_ed25519"
+      } else if (home != "" && $1 == "IdentityFile" && index($2, home "/") == 1) {
+        print " IdentityFile ~/" substr($2, length(home) + 2)
       } else {
         print
       }
@@ -1451,8 +1470,39 @@ ossh.config.get() # <sshConfigHost> <?file:~/.ssh/config> <?sshDir:~/.ssh>  # ou
   fi
 
 
-  #awk "/Host $host$/,/^$/" $file 
-  #grep -A "5" "Host $host$" .ssh/config 
+  #awk "/Host $host$/,/^$/" $file
+  #grep -A "5" "Host $host$" .ssh/config
+  return $(result)
+}
+
+ossh.config.delete.completion() {
+  ossh.parameter.completion.sshConfigHost "$@"
+}
+
+ossh.config.delete() # <sshConfigHost> <?file:~/.ssh/config> # removes the Host block of <sshConfigHost> — what ossh config.get shows, from "Host <sshConfigHost>" to the next empty line — in place; the other blocks and the mode of the file stay; rc 2 when there is none
+{
+  # The twin of ossh.config.create: the tart_ubuntu entry of the headless
+  # check (2026-10-14) would have been hand-edited (T-OSSH-CONFIG-DELETE).
+  # Written back with `cat >`, which keeps owner and mode (600 for ssh).
+  local host="$1" file="$2" kept
+  if [ -z "$host" ]; then
+    create.result 1 "ossh.config.delete: <sshConfigHost> required"; error.log "$RESULT"; return $(result)
+  fi
+  if [ -z "$file" ]; then
+    private.get.sshDir
+    file="$RESULT/config"
+  fi
+  if ! grep -qx "Host $host" "$file" 2>/dev/null; then
+    create.result 2 "config $host not found in $file"; warn.log "$RESULT"; return $(result)
+  fi
+  # The trailing x keeps the last empty lines: $(…) would drop them, and the
+  # next config.save.last block would run into the one before it.
+  kept=$(awk -v h="Host $host" '$0 == h { skip = 1; next } skip && /^$/ { skip = 0; next } !skip' "$file"; echo x)
+  kept="${kept%x}"
+  if ! { printf '%s' "$kept" > "$file"; } 2>/dev/null; then
+    create.result 1 "cannot write $file — config $host not deleted"; error.log "$RESULT"; return $(result)
+  fi
+  create.result 0 "config $host deleted from $file"
   return $(result)
 }
 
@@ -1745,9 +1795,15 @@ ossh.config.save.last() {  # <?file> # appends the config to file
 
 ossh.config.shared.github.create() # <?sharedDir> # create shared SSH config + Host github.com alias whose IdentityFile is ~/.ssh/ids/ssh.developking/id_rsa (placed by osshLayout.role.developking on every user). Idempotent.
 {
-  local basehome
-  basehome="$(private.ossh.users.basehome)"
-  local sharedDir="${1:-$basehome/shared/.ssh}"
+  local sharedDir="$1" basehome
+  if [ -z "$sharedDir" ]; then
+    if ! basehome=$(private.ossh.users.basehome); then
+      error.log "ossh.config.shared.github.create: no users' base (user could not be loaded or answered none) — pass <sharedDir>"
+      create.result 1 "no users' base for the shared SSH config"
+      return $(result)
+    fi
+    sharedDir="$basehome/shared/.ssh"
+  fi
 
   mkdir -p "$sharedDir"
   chmod 700 "$sharedDir"
@@ -1801,9 +1857,15 @@ ossh.config.shared.create.completion.deployKeySrc() {
 ossh.config.shared.link() # <?user> <?sharedDir> # link user SSH config to shared config
 {
   local targetUser="${1:-$(whoami)}"
-  local basehome
-  basehome="$(private.ossh.users.basehome)"
-  local sharedDir="${2:-$basehome/shared/.ssh}"
+  local sharedDir="$2" basehome
+  if [ -z "$sharedDir" ]; then
+    if ! basehome=$(private.ossh.users.basehome); then
+      error.log "ossh.config.shared.link: no users' base (user could not be loaded or answered none) — pass <sharedDir>"
+      create.result 1 "no users' base for the shared SSH config"
+      return $(result)
+    fi
+    sharedDir="$basehome/shared/.ssh"
+  fi
   local userHome
   userHome=$(eval echo ~"$targetUser")
 
@@ -2162,7 +2224,7 @@ private.ossh.push.config() # <toHost> <?sshConfigName> # appends a Host block to
   # ~/config from creation).
   #
   # `chown -h` is critical — on Linux, ~/config is a SYMLINK to sharedConfig
-  # (mode developking:dev). Without -h, chown FOLLOWS the symlink and
+  # (root:dev). Without -h, chown FOLLOWS the symlink and
   # clobbers sharedConfig's ownership to the SSH-install user — and on
   # `os platform.test ubuntu_24_04` where test's primary group is gid=0,
   # `chown $(id -un):` (trailing colon = primary group) sets sharedConfig

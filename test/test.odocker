@@ -971,6 +971,113 @@ test.case $level "T-WS-SET-SAVE-FAILS: a save that fails is rc 1 from workspace.
 expect 0 "set, init and the install answer rc 1 when odocker.env cannot be saved" \
   "oo update reported success without an odocker.env and repeated the init on every run"
 
+# T-WS-INIT-SHARES: init shares the root with group dev itself — once per install
+# The share used to live in the install and in seed, so a bare `odocker
+# workspace.init` left a root other users could not write. The share is stubbed:
+# the test records what was asked, it changes no group or mode.
+test.odocker.workspaceInitShares() {
+  local fx out; fx=$(test.suite.fixture.make odockerwsinitshare); [ -n "$fx" ] || { create.result 1 "no fixture"; return $(result); }
+  mkdir -p "$fx/config" "$fx/home"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' > "$fx/config/user.env"
+  out=$( export HOME="$fx/home" CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env"; unset ODOCKER_WORKSPACES
+    private.this.folder.share() { echo "$1" >> "$fx/shared"; create.result 0 "stub"; return $(result); }
+    odocker.workspace.init "$fx/ws" >/dev/null 2>&1; printf 'init=%s ' "$(cat "$fx/shared" 2>/dev/null | tr '\n' ',')"
+    rm -f "$fx/shared"
+    private.odocker.workspaces.install "$fx/ws2" >/dev/null 2>&1; printf 'install=%s' "$(cat "$fx/shared" 2>/dev/null | tr '\n' ',')" ) 2>/dev/null
+  rm -rf "$fx"
+  [ "$out" = "init=$fx/ws, install=$fx/ws2," ] && create.result 0 "init shares its root, the install shares it once" || create.result 1 "shared: $out"
+  return $(result)
+}
+test.case $level "T-WS-INIT-SHARES: workspace.init shares the root with group dev, the install does not share twice" \
+  test.odocker.workspaceInitShares
+expect 0 "init shares its root, the install shares it once" "a bare init left a root the other users of the host could not write"
+
+# T-WS-INIT-SHARE-OWN-ONLY: a root of somebody else is set, never shared
+# On a root the caller does not own, the share is a sudo chgrp -R over every
+# workspace: a re-run of init by another user of the host asked for a password
+# only to set the path. The owner is stood in for, the share is stubbed.
+test.odocker.workspaceInitShareOwnOnly() {
+  local fx out; fx=$(test.suite.fixture.make odockerwsinitown); [ -n "$fx" ] || { create.result 1 "no fixture"; return $(result); }
+  mkdir -p "$fx/config" "$fx/home" "$fx/ws"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' > "$fx/config/user.env"
+  out=$( export HOME="$fx/home" CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env"; unset ODOCKER_WORKSPACES
+    private.odocker.workspaces.mine() { return 1; }
+    private.this.folder.share() { echo "$1" >> "$fx/shared"; create.result 0 "stub"; return $(result); }
+    odocker.workspace.init "$fx/ws" >/dev/null 2>&1; rc=$?
+    printf 'rc=%s set=%s shared=%s' "$rc" "$ODOCKER_WORKSPACES" "$(cat "$fx/shared" 2>/dev/null)" ) 2>/dev/null
+  rm -rf "$fx"
+  [ "$out" = "rc=0 set=$fx/ws shared=" ] && create.result 0 "somebody else's root is set, not shared" || create.result 1 "got: $out"
+  return $(result)
+}
+test.case $level "T-WS-INIT-SHARE-OWN-ONLY: workspace.init sets a root it does not own and leaves its group and modes alone" \
+  test.odocker.workspaceInitShareOwnOnly
+expect 0 "somebody else's root is set, not shared" "a re-run of init by another user asked for sudo to chgrp every workspace"
+
+# T-WS-CHAIN-EXACT: a comment that mentions odocker.env is no chain
+# grep -q odocker.env matched any mention, so a user.env that only talked about
+# the file never chained it and the root was lost at the next login.
+test.odocker.workspaceChainExact() {
+  local fx bad="" ws; fx=$(test.suite.fixture.make odockerwschain); [ -n "$fx" ] || { create.result 1 "no fixture"; return $(result); }
+  mkdir -p "$fx/config" "$fx/home" "$fx/ws" "$fx/ws2"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' '# odocker.env is chained below, one day' > "$fx/config/user.env"
+  ( export HOME="$fx/home" CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env"; unset ODOCKER_WORKSPACES
+    odocker.workspace.set "$fx/ws" >/dev/null 2>&1 ) >/dev/null 2>&1
+  grep -qxF '. $CONFIG_PATH/odocker.env' "$fx/config/user.env" || bad="$bad set-not-chained"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' '# odocker.env is chained below, one day' > "$fx/config/user.env"
+  ( export HOME="$fx/home" CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env"; unset ODOCKER_WORKSPACES
+    private.odocker.workspaces.install >/dev/null 2>&1 ) >/dev/null 2>&1
+  grep -qxF '. $CONFIG_PATH/odocker.env' "$fx/config/user.env" || bad="$bad install-not-chained"
+  [ "$(grep -cxF '. $CONFIG_PATH/odocker.env' "$fx/config/user.env")" -le 1 ] || bad="$bad doubled"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the chain is written although a comment mentions odocker.env" || create.result 1 "chain:$bad"
+  return $(result)
+}
+test.case $level "T-WS-CHAIN-EXACT: a comment mentioning odocker.env does not count as the chain" \
+  test.odocker.workspaceChainExact
+expect 0 "the chain is written although a comment mentions odocker.env" "only the line config add writes is a chain"
+
+# T-WS-SET-REPLACE-WARNS: replacing the shared root warns, the same root does not
+# $CONFIG_PATH is the config of every user of the host. warn.log writes to
+# LOG_DEVICE, which a redirect cannot capture: it is stubbed to a file.
+test.odocker.workspaceSetReplaceWarns() {
+  local fx out; fx=$(test.suite.fixture.make odockerwsreplace); [ -n "$fx" ] || { create.result 1 "no fixture"; return $(result); }
+  mkdir -p "$fx/config" "$fx/home" "$fx/ws1" "$fx/ws2"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' > "$fx/config/user.env"
+  out=$( export HOME="$fx/home" CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env"; unset ODOCKER_WORKSPACES
+    : > "$fx/warn"; warn.log() { echo "$*" >> "$fx/warn"; }
+    odocker.workspace.set "$fx/ws1" >/dev/null 2>&1; printf 'first=%s ' "$(grep -c 'for every user of this host' "$fx/warn" 2>/dev/null)"
+    odocker.workspace.set "$fx/ws1" >/dev/null 2>&1; printf 'same=%s ' "$(grep -c 'for every user of this host' "$fx/warn" 2>/dev/null)"
+    odocker.workspace.set "$fx/ws2" >/dev/null 2>&1; printf 'other=%s text=%s' "$(grep -c 'for every user of this host' "$fx/warn" 2>/dev/null)" \
+      "$(grep 'for every user of this host' "$fx/warn" 2>/dev/null | sed 's/.*host: //')" ) 2>/dev/null
+  rm -rf "$fx"
+  [ "$out" = "first=0 same=0 other=1 text=$fx/ws1 → $fx/ws2" ] && create.result 0 "only a different root warns, with old and new" || create.result 1 "warnings: $out"
+  return $(result)
+}
+test.case $level "T-WS-SET-REPLACE-WARNS: replacing the shared workspaces root warns, the same root does not" \
+  test.odocker.workspaceSetReplaceWarns
+expect 0 "only a different root warns, with old and new" "one user changing the root changes it for every user of the host"
+
+# T-WS-RESULTS: the failures say why, and carry a RESULT
+# workspace.set returned a bare 1 (no RESULT) for a missing directory and for no
+# default; init hid mkdir's reason behind 2>/dev/null.
+test.odocker.workspaceResults() {
+  local fx out; fx=$(test.suite.fixture.make odockerwsresults); [ -n "$fx" ] || { create.result 1 "no fixture"; return $(result); }
+  mkdir -p "$fx/config" "$fx/home"
+  printf '%s\n' 'export CONFIG_PATH="$HOME/config"' > "$fx/config/user.env"
+  out=$( export HOME="$fx/home" CONFIG_PATH="$fx/config" CONFIG_FILE=user.env CONFIG="$fx/config/user.env"; unset ODOCKER_WORKSPACES
+    odocker.workspace.set "$fx/nosuch" >/dev/null 2>&1; printf 'set=%s[%s] ' "$?" "$RESULT"
+    odocker.workspace.init "/proc/odocker-test-nope/deeper" >/dev/null 2>&1; printf 'init=%s[%s]' "$?" "$RESULT" ) 2>/dev/null
+  rm -rf "$fx"
+  case "$out" in
+    "set=1[Directory not found: $fx/nosuch] init=1[cannot create /proc/odocker-test-nope/deeper: "*"]") create.result 0 "set and init failures carry their reason" ;;
+    *) create.result 1 "results: $out" ;;
+  esac
+  return $(result)
+}
+test.case $level "T-WS-RESULTS: workspace.set and workspace.init failures carry the reason in RESULT" \
+  test.odocker.workspaceResults
+expect 0 "set and init failures carry their reason" "a bare rc 1 and a hidden mkdir error left the caller guessing"
+
 export ODOCKER_WORKSPACES="$_WS_INIT_SAVED"
 rm -rf "$_WS_INIT_TMP"
 unset _WS_INIT_TMP _WS_INIT_SAVED
@@ -1613,15 +1720,23 @@ expect 0 "the client, no engine; RESULT names the missing socket and the docker 
 test.odocker.prereqNoEngine() {
   local fx bad="" log rc; fx=$(test.suite.fixture.make odockernoengine); log="$fx/pm.log"; mkdir -p "$fx/bin"; : > "$log"
   printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$PM_LOG"' > "$fx/bin/brew"; chmod +x "$fx/bin/brew"
+  # A stand-in sudo: the real one would ask the runner for a password.
+  printf '%s\n' '#!/bin/sh' 'echo "sudo $*" >> "$PM_LOG"; exit 1' > "$fx/bin/sudo"; chmod +x "$fx/bin/sudo"
   # Lifted: under OOSH_NO_INSTALL "nothing installed" would pass for the wrong reason.
+  # column is there: on a machine without it the real install ran, and
+  # developking was asked for a sudo password (2026-10-12).
   env -u OOSH_NO_INSTALL PATH="$fx/bin:$PATH" SUDO="" OOSH_PM="brew install" PM_LOG="$log" FX="$fx" bash -c '
-    command() { if [ "$1" = -v ] && [ "$2" = docker ]; then return 1; fi; builtin command "$@"; }
+    command() {
+      if [ "$1" = -v ] && [ "$2" = docker ]; then return 1; fi
+      if [ "$1" = -v ] && [ "$2" = column ]; then return 0; fi
+      builtin command "$@"; }
     source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
     private.odocker.socket.get() { echo "$FX/no.sock"; }
     private.odocker.engine.supported() { create.result 1 "this Mac cannot run a VM"; return 1; }
     private.this.container.is() { return 1; }
     private.odocker.prereqs.ensure >/dev/null 2>&1; echo "rc=$? result=$RESULT"' > "$fx/out" 2>/dev/null
   grep -qE 'colima|docker' "$log" && bad="$bad installed=[$(tr '\n' '|' < "$log")]"
+  grep -q '^sudo ' "$log" && bad="$bad sudo=[$(grep '^sudo ' "$log" | tr '\n' '|')]"
   grep -q '^rc=1 ' "$fx/out" || bad="$bad rc=[$(cat "$fx/out")]"
   grep -q 'cannot run a VM' "$fx/out" || bad="$bad no-reason=[$(cat "$fx/out")]"
   rm -rf "$fx"
@@ -2253,6 +2368,29 @@ test.odocker.passwdUsersGet() {
 }
 test.case $level "T-ODOCKER-PASSWD-USERS-GET: the accounts of people from a passwd file, not root, system accounts or nobody" test.odocker.passwdUsersGet
 expect 0 "alice and bob, not root, daemon or nobody" "the accounts were read from /etc/passwd inside odocker.prereqs.install only"
+
+# T-ODOCKER-IMAGE-COMMAND: odocker image.command runs one command in a throwaway container of an image, stdin passed in
+# os platform.parse.check runs bash -n with the bash of a platform image
+# (2026-10-14); odocker could run an interactive container or exec in a
+# running one, not one command in an image, gone afterwards. A docker stand-in
+# on PATH logs its arguments and passes its stdin through.
+test.odocker.imageCommand() {
+  local fx bad="" got; fx=$(test.suite.fixture.make odockerimagecommand); mkdir -p "$fx/bin"
+  printf '%s\n' '#!/bin/sh' 'echo "docker $*" >> "$FX/log"' 'cat' 'exit ${T_RC:-0}' > "$fx/bin/docker"; chmod +x "$fx/bin/docker"
+  got=$(echo payload | FX="$fx" PATH="$fx/bin:$PATH" odocker.image.command naked_alma_9_sshd:latest 'bash -n /t/x' 2>/dev/null; echo "rc=$?")
+  [ "$got" = "payload
+rc=0" ] || bad="$bad out=[$(echo "$got" | tr '\n' '|')]"
+  [ "$(cat "$fx/log")" = "docker run --rm -i --entrypoint sh naked_alma_9_sshd:latest -c bash -n /t/x" ] || bad="$bad args=[$(cat "$fx/log")]"
+  got=$(echo x | FX="$fx" T_RC=3 PATH="$fx/bin:$PATH" odocker.image.command img 'false' >/dev/null 2>&1; echo "$?")
+  [ "$got" = 3 ] || bad="$bad rc-not-passed=$got"
+  got=$(odocker.image.command img >/dev/null 2>&1; echo "$?")
+  [ "$got" = 1 ] || bad="$bad no-command-rc=$got"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "one command in a throwaway container, stdin in, its rc out" || create.result 1 "image.command:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-IMAGE-COMMAND: one command in a throwaway container of an image, stdin passed in" test.odocker.imageCommand
+expect 0 "one command in a throwaway container, stdin in, its rc out" "odocker could not run one command in an image"
 
 ### test.method
 

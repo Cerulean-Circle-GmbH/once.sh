@@ -256,6 +256,96 @@ test.case $level "T-OS-RELEASE-GET: one value of an os-release file, quotes remo
 expect 0 "values with and without quotes; rc 1 for a missing key or file; the file is never run" \
   "the os-release reader lived in odocker, had no test and read only /etc/os-release"
 
+# T-OS-SERVICE: os service.on / service.off — one way to switch a system service on (now and at boot) or off
+# Linux: systemd, else OpenRC, else SysV `service` (odocker's engine start
+# style); macOS: the system launch daemon <label>. su/setup called systemctl
+# and launchctl raw (2026-10-14). Stand-ins on PATH log their arguments.
+test.os.service() {
+  local fx bad="" got; fx=$(test.suite.fixture.make osservice); mkdir -p "$fx/bin"
+  local c; for c in systemctl rc-update rc-service service launchctl; do
+    printf '%s\n' '#!/bin/sh' 'echo "${0##*/} $*" >> "$FX/log"' 'case " $T_FAIL " in *" ${0##*/} "*) exit 1 ;; esac' 'exit 0' > "$fx/bin/$c"
+  done
+  chmod +x "$fx/bin/"*
+  test.os.service.run() { # <OSTYPE> <T_FAIL> <method> <name>
+    : > "$fx/log"
+    got=$(export FX="$fx" PATH="$fx/bin:$PATH" T_FAIL="$2"; OSTYPE="$1"; SUDO=""; "$3" "$4" >/dev/null 2>&1; echo "$?|$RESULT")
+    echo "$got|$(tr '\n' ';' < "$fx/log")"
+  }
+  got=$(test.os.service.run linux-gnu "" os.service.on smbd)
+  case "$got" in "0|smbd is on|systemctl enable --now smbd;") ;; *) bad="$bad systemd=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "systemctl" os.service.on smbd)
+  case "$got" in "0|smbd is on|systemctl enable --now smbd;rc-update add smbd default;rc-service smbd start;") ;; *) bad="$bad openrc=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "systemctl rc-update rc-service" os.service.on smbd)
+  case "$got" in "0|smbd is on|"*"service smbd start;") ;; *) bad="$bad sysv=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "systemctl rc-update rc-service service" os.service.on smbd)
+  case "$got" in "1|smbd could not be switched on|"*) ;; *) bad="$bad none=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "" os.service.off smbd)
+  case "$got" in "0|smbd is off|systemctl disable --now smbd;") ;; *) bad="$bad off=[$got]" ;; esac
+  got=$(test.os.service.run darwin23 "" os.service.on com.apple.smbd)
+  case "$got" in "0|com.apple.smbd is on|launchctl enable system/com.apple.smbd;launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.smbd.plist;") ;; *) bad="$bad mac=[$got]" ;; esac
+  got=$(test.os.service.run darwin23 "" os.service.off com.apple.smbd)
+  case "$got" in "0|com.apple.smbd is off|launchctl bootout system/com.apple.smbd;launchctl disable system/com.apple.smbd;") ;; *) bad="$bad mac-off=[$got]" ;; esac
+  got=$(test.os.service.run linux-gnu "" os.service.on "")
+  case "$got" in "1|"*"<service> required"*"|") ;; *) bad="$bad no-name=[$got]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "systemd, OpenRC or SysV on Linux, launchd on macOS; rc 1 naming the service when none works" || create.result 1 "os service:$bad"
+  return $(result)
+}
+test.case $level "T-OS-SERVICE: os service.on / service.off switch a system service on (now and at boot) or off" test.os.service
+expect 0 "systemd, OpenRC or SysV on Linux, launchd on macOS; rc 1 naming the service when none works" \
+  "su/setup called systemctl and launchctl raw; oosh had no service method"
+
+# T-OS-SYSTEMD-IS: rc 0 only when systemd runs this computer (a container has none)
+test.os.systemdIs() {
+  local fx bad=""; fx=$(test.suite.fixture.make ossystemd); mkdir -p "$fx/bin" "$fx/run/systemd/system"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$fx/bin/systemctl"; chmod +x "$fx/bin/systemctl"
+  ( PATH="$fx/bin:$PATH"; private.os.systemd.is "$fx" ) || bad="$bad running-rc1"
+  ( PATH="$fx/bin:$PATH"; private.os.systemd.is "$fx/nowhere" ) && bad="$bad no-run-dir-rc0"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "systemd only when its run directory is there" || create.result 1 "systemd is:$bad"
+  return $(result)
+}
+test.case $level "T-OS-SYSTEMD-IS: rc 0 only when systemd runs this computer" test.os.systemdIs
+expect 0 "systemd only when its run directory is there" "su/setup had its own systemd check"
+
+# T-OS-PLATFORM-PARSE-CHECK: os platform.parse.check — bash -n of every tracked shell file with the bash of a platform image
+# test.oo did not even load on almalinux_9 (bash 5.1: a case pattern without
+# its "(" inside $( ( … ) )), only Ubuntu's and macOS's bash 5.2 had read it —
+# found by a promotion's platform test (2026-10-14). The check runs on this
+# host in the platform's image; here odocker.image.command runs the command
+# locally, the logic is what is tested. A tree: a good script, one that does
+# not parse, a file that is no script.
+test.os.platformParseCheck() {
+  local fx bad="" got; fx=$(test.suite.fixture.make osparsecheck); mkdir -p "$fx/tree/test"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo ok' > "$fx/tree/good"
+  printf '%s\n' '#!/bin/bash' 'if then' > "$fx/tree/test/test.bad"
+  printf '%s\n' '# notes' 'if then' > "$fx/tree/notes.md"
+  git -C "$fx/tree" init -q; git -C "$fx/tree" add -A
+  test.os.platformParseCheck.run() { # <platform>
+    : > "$fx/log"
+    ( FX="$fx"
+      odocker.image.command() { echo "image $1" >> "$FX/log"; sh -c "$2"; }
+      private.os.platform.image.exists() { [ "$1" = naked_alma_9_sshd ]; }
+      os.platform.parse.check "$1" "$fx/tree" >/dev/null 2>&1; echo "$?|$RESULT" )
+  }
+  got=$(test.os.platformParseCheck.run almalinux_9)
+  case "$got" in "1|1 of 2 shell files do not parse with "*": test/test.bad") ;; *) bad="$bad bad-tree=[$got]" ;; esac
+  grep -q "^image naked_alma_9_sshd$" "$fx/log" || bad="$bad image=[$(cat "$fx/log")]"
+  rm "$fx/tree/test/test.bad"; git -C "$fx/tree" add -A
+  got=$(test.os.platformParseCheck.run almalinux_9)
+  case "$got" in "0|1 shell files parse with "*) ;; *) bad="$bad good-tree=[$got]" ;; esac
+  got=$(test.os.platformParseCheck.run debian_12)
+  case "$got" in "1|"*"no image naked_debian_12"*) ;; *) bad="$bad no-image=[$got]" ;; esac
+  got=$(test.os.platformParseCheck.run macos)
+  case "$got" in "1|"*"native"*) ;; *) bad="$bad native=[$got]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the shell files of a tree parsed with the bash of a platform image; the ones that do not are named" || create.result 1 "parse check:$bad"
+  return $(result)
+}
+test.case $level "T-OS-PLATFORM-PARSE-CHECK: bash -n of every tracked shell file with the bash of a platform image" test.os.platformParseCheck
+expect 0 "the shell files of a tree parsed with the bash of a platform image; the ones that do not are named" \
+  "test.oo did not load on almalinux_9 (bash 5.1) — only a promotion's platform test found it"
+
 ### test.method
 
 test.suite.save.results

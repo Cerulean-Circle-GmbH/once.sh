@@ -202,7 +202,8 @@ could really not be cloned.
 folder under the base needs its own entry for every user who touches it
 (otherwise `fatal: detected dubious ownership`). `ogit safeDirectory.ensure
 <?base>` adds them for the calling user; `oo update`, `oo user.fix` /
-`config init.user` and `user.oosh.install` run it for you; install state 31
+`config init.user` and `user.oosh.install` run it for you, and `oo mode
+<branch>` trusts that branch folder (also when already current); install state 31
 trusts every folder for root, shares each one, and sets group `dev` + setgid on
 the base.
 
@@ -314,6 +315,26 @@ checks the branch out again to realign them, which is what `oo mode` assumes.
 `create.result` on every branch and `return $(result)` at the end, so it can be
 chained and its status trusted. On a failed clone `ogit repo.clone` removes
 the half-made directory it created, and never one it did not.
+
+### oo.checkout.remove
+
+The reverse of `oo checkout`: remove the branch folder of `<version>` from
+this machine. The branch on GitHub stays — `oo checkout <version>` brings it
+back.
+
+```bash
+oo checkout.remove dev.headless      # → <base>/dev.headless removed
+```
+
+It removes only when nothing is lost — the same gates `ogit worktree.remove`
+uses before it deletes a folder: clean, pushed to its upstream
+(`private.ogit.folder.gate`), no stash, local branch or tag of its own
+(`private.ogit.clone.gate`). It never removes `dev`, `main` or the folder
+`~/oosh` points at (switch first: `oo mode dev`). The folder's
+`safe.directory` entry goes too (`ogit safeDirectory.prune`). The folder name is
+derived as in `oo checkout` (`private.oo.checkout.dir.get`). A tag the folder has and `main/` lacks blocks it, also when it is on GitHub: `ogit remote.fetch no <base>/main yes` brings every tag of origin into `main/`. A branch on GitHub
+is deleted by `ogit branch.remote.delete` ([ogit.md § branch](ogit.md#branch))
+(T-CHECKOUT-REMOVE).
 
 ### oo.use
 
@@ -434,7 +455,8 @@ re-run out of band (e.g. a curl one-liner from the README) and
 clobbered the symlinks — `oo mode <TAB>` would otherwise show
 nothing. The heal is idempotent (no-op when symlinks are already
 canonical) and silenced during the pre-install bootstrap when
-`developking` doesn't yet exist. See
+the shared tree (`<base>/shared/EAMD.ucp`, base = `user get basehome root`, the system base: `$OOSH_USERS_BASEHOME`, `/Users` on macOS, `/home` else)
+doesn't yet exist. See
 [Repair toolkit](repair-toolkit.md) for the full primitive set.
 
 ### oo.user.fix
@@ -444,7 +466,7 @@ canonical shared tree. Thin alias for [`config init.user`](config.md).
 
 ```bash
 oo user.fix              # repair this user (= $USER)
-oo user.fix developking  # repair another user (requires root)
+oo user.fix alice        # repair another user (requires root)
 ```
 
 Handles real-dir → symlink conversion (preserves originals as
@@ -706,11 +728,14 @@ States include:
 | 20 | user.rights.only | User-only installation |
 | 21-24 | user.* | User installation steps |
 | 30 | root.rights | Root installation |
-| 31 | root.shared.dev.folder.created | Shared tree, developking, dev repo |
+| 31 | root.shared.dev.folder.created | Shared tree (`root:dev`; base = `user get basehome root`), developking (ordinary user, via `user create`), dev repo |
 | 32 | root.dev.keys.installed | Deploy keys |
 | 33 | root.installation.done | root bashrc + login shell |
 | 34 | root.boot.path.installed | removes the retired login drop-in (see [The retired login drop-in](#the-retired-login-drop-in)) |
-| 40+ | shared/headless/once | Advanced setup stages |
+| 40-41 | user.* | Users linked to the shared tree |
+| 50 | headless.setup.started | `su/setup all`: Docker, Node.js + npm, VNC / Screen Sharing, Samba / File Sharing; a failure is a warning, never a stop ([setup.md](setup.md)) |
+| 51 | headless.setup.finished | Nothing (the summary is printed by `setup all`) |
+| 60-61 | once.setup.* | `once init` when `once` is installed |
 
 ## Promotion Pipeline
 

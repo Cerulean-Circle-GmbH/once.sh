@@ -132,6 +132,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `branch.fastForward` | `<ref> <?dir:$OOSH_DIR>` | fast-forward the current branch of `<dir>` to `<ref>`; rc 1 (nothing changed) when it has diverged |
 | `branch.merge` | `<ref> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | merge `<ref>` into the current branch of `<dir>` (`--no-edit`); with `<asEmail>`/`<asName>` the merge commit carries that identity and no gpg signing |
 | `branch.adopt` | `<ref> <?message> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | make the current branch of `<dir>` a merge of itself and `<ref>` whose content is exactly the tree of `<ref>` (`commit-tree`, then `branch.fastForward`); refuses a dirty tree and a ref that does not resolve; nothing to do when the branch already contains `<ref>` |
+| `branch.remote.delete` | `<branch> <?mode:merged> <?dir:$OOSH_DIR>` | delete `<branch>` on origin; never `main`, `dev`, `testing` or `prod` (the stages of the promote pipeline); mode `merged` (default) only when every commit of it is in `origin/dev`, mode `force` also when not — work dropped on purpose. Measured on the cached `origin/*` refs: fetch first (T-OGIT-BRANCH-REMOTE-DELETE) |
 
 `branch.adopt` exists for a promotion after tree-reset rollbacks (30 Sep 2026: prod and testing each got a commit whose tree is an older one): their merge base is still the regression both left, so a 3-way merge conflicts everywhere although the intent — the target becomes the content of the source — is plain; adopt records that intent as one merge commit, with the full history and no force push.
 
@@ -156,9 +157,9 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `remote.url.get` | `<?remote:origin> <?dir:$OOSH_DIR>` | echo the URL of `<remote>`, empty when there is none |
 | `remote.branch.list` | `<?remote:origin> <?dir:$OOSH_DIR>` | echo the branches `<remote>` has right now (`ls-remote` — needs the network); empty when unreachable |
 | `remote.url.set` | `<url> <?remote:origin> <?dir:$OOSH_DIR>` | point `<remote>` of `<dir>` at `<url>` |
-| `remote.fetch` | `<?prune:no> <?dir:$OOSH_DIR>` | fetch origin into `<dir>`; `prune=yes` drops deleted remote branches |
+| `remote.fetch` | `<?prune:no> <?dir:$OOSH_DIR> <?tags:no>` | fetch origin into `<dir>`; `prune=yes` drops deleted remote branches; `tags=yes` brings every tag of origin — a plain fetch brings only the tags on a fetched branch (T-OGIT-REMOTE-FETCH-TAGS) |
 | `remote.pull` | `<?url> <?branch> <?dir:$OOSH_DIR>` | pull into `<dir>`; with `<url> <branch>` pull that branch from that URL instead of the tracking remote (the https fallback of `oo.update`) |
-| `remote.push` | `<?branch> <?tags:no> <?dir:$OOSH_DIR>` | push `<branch>` (default: the tracking branch) to origin; `tags=yes` pushes tags too |
+| `remote.push` | `<?branch> <?tags:no> <?dir:$OOSH_DIR>` | push `<branch>` (default: the tracking branch) to origin; `tags=yes` pushes tags too; a refused push is rc 1 and logs why (T-OGIT-REMOTE-PUSH-REPORTS). `<dir>` defaults to `~/oosh` — name the branch folder to push from another |
 
 ### index
 
@@ -178,6 +179,7 @@ Parameters are copied from the signatures in `ogit`; `<?name:default>` is option
 | `commit.pick` | `<commit> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | cherry-pick `<commit>` onto the current branch of `<dir>` with `-x`; on a conflict rc 1, the pick stays in progress and RESULT names the conflicted paths |
 | `commit.pick.continue` | `<?asEmail> <?asName> <?dir:$OOSH_DIR>` | finish the pick in progress in `<dir>` after its conflicts are resolved and staged; keeps the picked message; `<asEmail>`/`<asName>` give a bot identity |
 | `commit.pick.abort` | `<?dir:$OOSH_DIR>` | abort the pick in progress in `<dir>`; the tree is back to what it was before the pick |
+| `commit.revert` | `<commit> <?mode:index> <?asEmail> <?asName> <?dir:$OOSH_DIR>` | undo `<commit>` with the opposite change, history kept; mode `index` stages it (finish with `commit.create`), mode `commit` commits it as "Revert ..."; on a conflict rc 1, the revert stays in progress and RESULT names the conflicted paths |
 
 ### status
 

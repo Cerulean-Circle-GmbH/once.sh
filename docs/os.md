@@ -34,6 +34,9 @@ os platform.test.all
 | `os check` | `<method>` | Detect OS and append `.darwin` or `.linux` to method name. Returns result with resolved method |
 | `os check.env` | | Set `$OOSH_OS` environment variable based on detected OS type |
 | `private.os.release.get` | `<key> <?file:/etc/os-release>` | Echo one value of an os-release file (`ID`, `VERSION_CODENAME`, `PRETTY_NAME` …), its quotes removed; rc 1 and nothing for a missing key or file. Read line by line, never sourced. `os info` and odocker's `private.odocker.docker.repo.add` (through `private.this.script.load os private.os.release.get`) use it; `<file>` lets a test use a fixture (T-OS-RELEASE-GET) |
+| `os service.on` | `<service>` | Switch a system service on, now and at boot: `systemctl enable --now`, else OpenRC (`rc-update add` + `rc-service start`), else SysV `service start` on Linux; on macOS the system launch daemon `<service>` (a label such as `com.apple.smbd`): `launchctl enable` + `bootstrap`, an already loaded daemon counts as on. Through `$SUDO`; rc 1 naming the service when nothing works (T-OS-SERVICE) |
+| `os service.off` | `<service>` | The reverse: `systemctl disable --now`, else `rc-service stop` + `rc-update del`, else `service stop`; macOS `launchctl bootout` + `disable` (T-OS-SERVICE) |
+| `private.os.systemd.is` | `<?root:/>` | rc 0 when systemd runs this computer: `<root>/run/systemd/system` is there and `systemctl` is on PATH; a container has none (T-OS-SYSTEMD-IS) |
 
 ### os.check Pattern
 
@@ -69,6 +72,7 @@ fi
 | `os platform.list` | | List all platforms with workspace, package manager, and tier |
 | `os platform.test` | `<platform> <?terminal>` | Test oosh installation on a single platform. Pass `terminal` to open interactive session after tests |
 | `os platform.test.all` | | Test all platforms, report summary. Exit 0 only if all must-pass platforms pass |
+| `os platform.parse.check` | `<?platform:almalinux_9> <?dir:$OOSH_DIR>` | `bash -n` every tracked shell file of `<dir>` (first line a `#!…sh`) with the bash of the image of `<platform>`, in a throwaway container (`odocker image.command`); almalinux_9 has the oldest bash oosh runs on (5.1). rc 1 naming each file that does not parse — `test/test.oo` did not load on almalinux_9 (a `case` pattern without its `(` inside `$( ( … ) )`), only a promotion's platform test found it (T-OS-PLATFORM-PARSE-CHECK). Needs the image on this host (`os platform.test <platform>` builds it) |
 
 ### Platform Test Flow (Docker platforms)
 
