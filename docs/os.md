@@ -89,9 +89,9 @@ For each Docker-testable platform, `os platform.test` runs fully automated (no i
 
 1. `odocker reset <image>` — fresh container with SSH access
 2. `ossh config.create` / `ossh config.save.last` — SSH config setup (`User=test` convention)
-3. Clean stale ControlMaster socket from any previous run
+3. Clean stale ControlMaster socket from any previous run: `ossh connection.close`, then remove the socket `private.ossh.control.path.resolved.get` names (`$OSSH_CONTROL_PATH` with `%C` expanded by `ssh -G`; T-OSSH-CONTROL-PATH-RESOLVED-GET)
 4. `sshpass` opens a ControlMaster connection (password via `$SSHPASS` env var, runs `true` to avoid background fork race)
-5. `ossh push.key` — pushes SSH key, reusing the ControlMaster socket (no password prompt)
+5. `ossh key.push` — pushes SSH key, reusing the ControlMaster socket (no password prompt)
 6. Configure `NOPASSWD` sudo for `test` on the ephemeral container
 7. `ossh prereqs.install <platform>` — installs `curl + git` on the remote (and additionally `bash + shadow + util-linux` on apk hosts like alpine, where the base image ships only busybox + ash)
 8. **Phase A — installs:**

@@ -1623,6 +1623,135 @@ test.case $level "T-THIS-GROUP-CREATE-FAIL: the first group tool that exists is 
 expect 0 "the first tool once; a held number is refused by name; no append on macOS" \
   "a failed groupadd was followed by Debian's addgroup with busybox syntax"
 
+
+console.log "
+Test: private.this.folder.ensure
+===================================================================="
+
+# T-THIS-FOLDER-ENSURE: a missing folder is made, an existing one kept, a blocked one refused by name
+# ossh key.pull wrote `[ -d "$dir" ] || mkdir -p "$dir"` unchecked — a file in
+# the way or a read-only parent went unnoticed until the write after it failed
+# (conformance audit 2026-10-16). Silent: LOG_DEVICE can be fd1.
+test.this.folderEnsure() {
+  local fx bad="" got; fx=$(test.suite.fixture.make thisfolderensure)
+  got=$(private.this.folder.ensure "$fx/a/b/c" > "$fx/out" 2>/dev/null; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/a/b/c made" ] && [ -d "$fx/a/b/c" ] || bad="$bad missing=[$got]"
+  [ -s "$fx/out" ] && bad="$bad stdout=[$(cat "$fx/out")]"
+  got=$(private.this.folder.ensure "$fx/a/b" > "$fx/out" 2>/dev/null; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/a/b exists" ] || bad="$bad existing=[$got]"
+  [ -s "$fx/out" ] && bad="$bad existing-stdout=[$(cat "$fx/out")]"
+  echo data > "$fx/file"
+  got=$(private.this.folder.ensure "$fx/file" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot make $fx/file: $fx/file is in the way and not a folder" ] || bad="$bad file-itself=[$got]"
+  got=$(private.this.folder.ensure "$fx/file/sub/x" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot make $fx/file/sub/x: $fx/file is in the way and not a folder" ] || bad="$bad file-in-way=[$got]"
+  [ "$(cat "$fx/file")" = data ] || bad="$bad file-touched"
+  # root writes into a mode-500 folder anyway: the permission case needs a normal user.
+  if [ "$(id -u)" != 0 ]; then
+    mkdir "$fx/ro"; chmod 500 "$fx/ro"
+    got=$(private.this.folder.ensure "$fx/ro/x/y" >/dev/null 2>&1; echo "$?|$RESULT")
+    [ "$got" = "1|cannot make $fx/ro/x/y: no permission to write in $fx/ro" ] || bad="$bad no-permission=[$got]"
+    chmod 700 "$fx/ro"
+  fi
+  got=$(private.this.folder.ensure >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|private.this.folder.ensure requires <dir>" ] || bad="$bad no-dir=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a missing folder made, an existing one kept, a blocked one refused by name" || create.result 1 "folder ensure:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-FOLDER-ENSURE: a missing folder is made, an existing one kept, a blocked one refused by name" test.this.folderEnsure
+expect 0 "a missing folder made, an existing one kept, a blocked one refused by name" "ossh key.pull ran mkdir -p unchecked"
+
+
+console.log "
+Test: private.this.file.write
+===================================================================="
+
+# T-THIS-FILE-WRITE: a file replaced whole, checked, its mode kept, no .new left
+# ossh key.pull wrote authorized_keys with an unchecked `printf > file`: a full
+# disk or a read-only folder left a truncated file and rc 0 (conformance audit
+# 2026-10-16). The new content goes to <file>.new first and is moved over the
+# old one, so a reader (sshd) sees the old file or the new one, never half.
+test.this.fileWrite() {
+  local fx bad="" got f; fx=$(test.suite.fixture.make thisfilewrite); f="$fx/keys"
+  printf '%s\n' old1 old2 old3 > "$f"; chmod 640 "$f"
+  got=$(private.this.file.write "$f" "new1
+new2" > "$fx/out" 2>/dev/null; echo "$?|$RESULT")
+  [ "$got" = "0|$f written" ] || bad="$bad rc=[$got]"
+  [ "$(cat "$f")" = "new1
+new2" ] || bad="$bad content=[$(tr '\n' '|' < "$f")]"
+  [ "$(tail -c 1 "$f" | od -An -c | tr -d ' ')" = '\n' ] || bad="$bad no-trailing-newline"
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-r-----" ] || bad="$bad mode=[$(ls -l "$f" | cut -c1-10)]"
+  [ -e "$f.new" ] && bad="$bad new-left"
+  [ -s "$fx/out" ] && bad="$bad stdout=[$(cat "$fx/out")]"
+  # A missing file is made.
+  got=$(private.this.file.write "$fx/fresh" "line" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/fresh written" ] && [ "$(cat "$fx/fresh" 2>/dev/null)" = line ] || bad="$bad fresh=[$got]"
+  # A new file is the owner's alone, whatever the umask: the .new got the
+  # umask's mode, so under umask 002 a new authorized_keys was group-writable
+  # (664) until a caller's chmod (fresh review 2026-10-16).
+  got=$( umask 002; private.this.file.write "$fx/fresh002" "line" >/dev/null 2>&1; echo "$?" )
+  [ "$got" = 0 ] && [ "$(ls -l "$fx/fresh002" | cut -c1-10)" = "-rw-------" ] || bad="$bad fresh-umask=[$got $(ls -l "$fx/fresh002" 2>/dev/null | cut -c1-10)]"
+  # A symlink is written through: the link stays, the file it names gets the content.
+  ln -s "$f" "$fx/link"
+  got=$(private.this.file.write "$fx/link" "via link" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ -L "$fx/link" ] && [ "$(cat "$f")" = "via link" ] || bad="$bad link=[$got]"
+  # A missing folder: rc 1 naming it, nothing made.
+  got=$(private.this.file.write "$fx/missing.dir/x" "a" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot write $fx/missing.dir/x: no folder $fx/missing.dir" ] || bad="$bad missing-dir=[$got]"
+  [ -e "$fx/missing.dir" ] && bad="$bad missing-dir-made"
+  # A folder in the place of the file.
+  mkdir "$fx/adir"
+  got=$(private.this.file.write "$fx/adir" "a" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot write $fx/adir: it is a folder" ] || bad="$bad is-dir=[$got]"
+  # A read-only folder (root writes there anyway): rc 1, old content kept, no .new.
+  if [ "$(id -u)" != 0 ]; then
+    mkdir "$fx/ro"; echo keep > "$fx/ro/f"; chmod 500 "$fx/ro"
+    got=$(private.this.file.write "$fx/ro/f" "lost" >/dev/null 2>&1; echo "$?|$RESULT")
+    [ "$got" = "1|cannot write $fx/ro/f: no permission to write in $fx/ro" ] || bad="$bad ro=[$got]"
+    [ "$(cat "$fx/ro/f")" = keep ] || bad="$bad ro-content-changed"
+    [ -e "$fx/ro/f.new" ] && bad="$bad ro-new-left"
+    chmod 700 "$fx/ro"
+  fi
+  # The write itself fails (a full disk): rc 1, old content kept, no .new.
+  got=$(printf() { return 1; }; private.this.file.write "$f" "lost" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot write $f: the write of $f.new failed" ] || bad="$bad write-fails=[$got]"
+  [ "$(cat "$f")" = "via link" ] || bad="$bad write-fails-content=[$(cat "$f")]"
+  [ -e "$f.new" ] && bad="$bad write-fails-new-left"
+  got=$(private.this.file.write >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|private.this.file.write requires <file> <content>" ] || bad="$bad no-file=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the file replaced whole through <file>.new, mode kept; rc 1 naming why and no .new left" || create.result 1 "file write:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-FILE-WRITE: a file replaced whole, checked, its mode kept, no .new left" test.this.fileWrite
+expect 0 "the file replaced whole through <file>.new, mode kept; rc 1 naming why and no .new left" "ossh key.pull wrote authorized_keys with an unchecked printf >"
+
+
+console.log "
+Test: private.this.user.name.get
+===================================================================="
+
+# T-THIS-USER-NAME-GET: the user name from id -un, else $USER, else nothing
+# `id -un` reads the OS identity on GNU, busybox and BSD alike; $USER may be
+# unset (docker exec) or stale (sudo -E); whoami is one more program for the
+# same answer. ossh install.key.authorize used $(whoami) (conformance audit 2026-10-16).
+test.this.userNameGet() {
+  local bad="" got
+  got=$(private.this.user.name.get) || bad="$bad rc=$?"
+  [ "$got" = "$(id -un)" ] || bad="$bad id=[$got]"
+  got=$(id() { return 1; }; USER=bob private.this.user.name.get) || bad="$bad fallback-rc=$?"
+  [ "$got" = bob ] || bad="$bad fallback=[$got]"
+  got=$(id() { :; }; USER=bob private.this.user.name.get)
+  [ "$got" = bob ] || bad="$bad empty-id=[$got]"
+  got=$(id() { return 1; }; unset USER; private.this.user.name.get; echo "|$?")
+  [ "$got" = "|1" ] || bad="$bad none=[$got]"
+  [ -z "$bad" ] && create.result 0 "id -un, else USER, else nothing and rc 1" || create.result 1 "user name:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-USER-NAME-GET: the user name from id -un, else USER, else nothing" test.this.userNameGet
+expect 0 "id -un, else USER, else nothing and rc 1" "ossh install.key.authorize used whoami"
+
 ### test.method
 
 test.suite.save.results

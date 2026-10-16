@@ -7,7 +7,9 @@
 
 private.ossh.control.path.get()     #  # echo the ControlMaster socket path for connection reuse: ${TMPDIR:-/tmp}/ossh-%C when it fits a Unix socket, else /tmp/ossh-%C, else ~/.ssh/ossh-%C #
 {
- # NO create.result — a getter consumed at file scope as $(...).
+ # NO create.result — a getter consumed as $(...): by ossh.start and by
+ # os.platform.test, each as the default of OSSH_CONTROL_PATH
+ # (T-OSSH-CONTROL-PATH-IN-START).
  # %C (hash of %l%h%p%r, OpenSSH 6.7+) is 40 characters; ssh binds the master
  # at <path>.<16 random chars> first, and a Unix socket path is at most 103
  # characters on macOS (107 on Linux). macOS's TMPDIR (/var/folders/t7/…/T/,
@@ -24,9 +26,6 @@ private.ossh.control.path.get()     #  # echo the ControlMaster socket path for 
  done
  echo "/tmp/ossh-%C"
 }
-
-# SSH ControlMaster socket path for connection reuse (single password entry).
-: ${OSSH_CONTROL_PATH:="$(private.ossh.control.path.get)"}
 
 ossh.remote.prelude.get()     #  # echo the command prefix that stands a non-interactive shell up (ssh command, runuser/sudo -u, docker exec): ~/config/user.env when present, else ~/oosh on PATH; POSIX, expanded by the target shell #
 {
@@ -65,16 +64,121 @@ private.ossh.host.fqdn.get()     #  # echo the fully qualified name of this comp
 }
 
 
+private.ossh.connection.error.get()     # <errFile> # echo ssh's reason from the stderr it wrote to <errFile>: the last line that is not a "Warning: Permanently added" notice; nothing when there is none #
+{
+ # NO create.result — a getter consumed as $(...): SILENT BY CONTRACT.
+ # connection.open read the reason twice with the same grep | tail, once per
+ # attempt (T-OSSH-CONNECTION-ERROR-GET). accept-new adds the host key and
+ # says so on stderr: that line is no reason, the failure comes after it.
+ local errFile="$1"
+ [ -f "$errFile" ] || return 0
+ line.filter '^Warning: Permanently added' < "$errFile" | tail -1
+}
+
+
+private.ossh.connection.error.network.is()     # <reason> # rc 0 when ssh's <reason> is a network error worth a retry with -4 (Broken pipe, a reset, no route, an empty reason); rc 1 for a refused login, a host key, a too long socket path or too many keys tried #
+{
+ # A predicate (rc only, no create.result). The -4 retry only helps a network
+ # that fails on IPv6 (Termux/Android: Broken pipe). A refused login or host
+ # key would only ask the password a second time (T-OSSH-CONNECTION-OPEN-FAIL);
+ # "too long" is the socket path (T-OSSH-CONTROL-PATH-SHORT), which -4 does not
+ # change. The list lives here, so it is read in one place
+ # (T-OSSH-CONNECTION-ERROR-NETWORK-IS).
+ case "$1" in
+   *"Permission denied"*|*"Host key verification failed"*|*"too long"*|*"Too many authentication failures"*) return 1 ;;
+ esac
+ return 0
+}
+
+
+private.ossh.master.start()     # <host> <errFile> <?ipv4> # start the ControlMaster to <host> in the background, persisting 10 minutes; ssh's stderr goes to <errFile>; ipv4 adds -4; rc 0 + RESULT when it runs, rc 1 + RESULT when ssh fails #
+{
+ # The one ssh call connection.open made twice, once with -4
+ # (T-OSSH-MASTER-START). stderr to a file, not $(...): the master behind -f
+ # keeps the pipe open for 10 minutes. Silent: connection.open logs.
+ local host="$1" errFile="${2:-/dev/null}" ipv4=""
+ if [ -z "$host" ]; then
+   create.result 1 "private.ossh.master.start requires <host>"
+   return $(result)
+ fi
+ [ "$3" = ipv4 ] && ipv4="-4"
+ if ssh $ipv4 -o ControlMaster=yes \
+     -o ControlPath="$OSSH_CONTROL_PATH" \
+     -o ControlPersist=600 \
+     -o StrictHostKeyChecking=accept-new \
+     -N -f "$host" 2>"$errFile"; then
+   create.result 0 "master to $host started${ipv4:+ (IPv4)}"
+ else
+   create.result 1 "master to $host failed${ipv4:+ (IPv4)}"
+ fi
+ return $(result)
+}
+
+
+private.ossh.remote.public.key.put()     # <host> <localFile> <keyFileName> # copy <localFile> to <host>:~/.ssh/public_keys/<keyFileName> (folder made when missing, a file of that name replaced; ~/.ssh made 700, a new file 600); rc 0 + RESULT when it is there, rc 1 + RESULT when the file is missing or the copy fails #
+{
+ # install.key.authorize and key.push each carried the same remote
+ # "mkdir -p … && cat > …", and key.push ignored its rc (T-OSSH-REMOTE-PUBLIC-KEY-PUT).
+ # Over ssh cat, not rsync: the target may have no rsync. The name is
+ # single-quoted for the remote shell — a legacy name with a space stays one
+ # word — and a ' in it is dropped, as private.ossh.authorized.key.append.get
+ # does, so it cannot end the quote. Silent: the caller logs $RESULT.
+ # umask 077 and chmod 700 ~/.ssh in the remote text: it ran under the
+ # target's umask, and with pam_umask 002 a new ~/.ssh was 775 — sshd's
+ # StrictModes then ignores every key in it (T-OSSH-REMOTE-PUBLIC-KEY-PUT-MODES).
+ local host="$1" localFile="$2" keyFileName="${3//\'/}"
+ if [ -z "$host" ] || [ -z "$keyFileName" ]; then
+   create.result 1 "private.ossh.remote.public.key.put requires <host> <localFile> <keyFileName>"
+   return $(result)
+ fi
+ if [ ! -f "$localFile" ]; then
+   create.result 1 "no key file $localFile to copy to $host"
+   return $(result)
+ fi
+ if private.ossh.ssh "$host" "umask 077; mkdir -p ~/.ssh/public_keys && chmod 700 ~/.ssh && cat > ~/.ssh/public_keys/'$keyFileName'" < "$localFile"; then
+   create.result 0 "$keyFileName copied to $host:~/.ssh/public_keys/"
+ else
+   create.result 1 "could not copy $keyFileName to $host"
+ fi
+ return $(result)
+}
+
+
+private.ossh.control.path.resolved.get()     # <host> # echo the ControlMaster socket path ssh uses for <host> — $OSSH_CONTROL_PATH with %C expanded, asked from ssh -G (no connection); nothing and rc 1 without a <host> or when ssh gives no expanded path #
+{
+ # NO create.result — a getter consumed as $(...).
+ # os.platform.test removed "/tmp/ossh-test@localhost:<port>" as a stale
+ # socket — a name from before %C, so it never existed (fresh review
+ # 2026-10-16, T-OSSH-CONTROL-PATH-RESOLVED-GET). Only ssh knows the %C hash
+ # (of %l%h%p%r, from the Host entry); `ssh -G` prints the configuration it
+ # would use, %C expanded, and connects to nothing. An answer that still has
+ # a % (an ssh that does not expand it), or "none", is no path.
+ local host="$1" path
+ [ -n "$host" ] || return 1
+ path=$(ssh -G -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null | awk '$1 == "controlpath" { print $2; exit }')
+ case "$path" in
+   (""|none|*%*) return 1 ;;
+ esac
+ echo "$path"
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONNECTION MANAGEMENT (SSH ControlMaster)
 # ─────────────────────────────────────────────────────────────────────────────
 
-ossh.connection.open() # <host> # open persistent SSH connection (enter password once)
+ossh.connection.open()     # <host> # open persistent SSH connection (enter password once) #
 {
   local host="$1"
-  [ -z "$host" ] && { error.log "Usage: ossh connection.open <host>"; return 1; }
+  if [ -z "$host" ]; then
+    # A RESULT of its own: callers `|| return $(result)`, and a stale rc 0
+    # would let them go on.
+    create.result 1 "Usage: ossh connection.open <host>"
+    error.log "$RESULT"
+    return $(result)
+  fi
 
   # Check if connection already open
   if ssh -O check -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null; then
@@ -86,58 +190,55 @@ ossh.connection.open() # <host> # open persistent SSH connection (enter password
   # Open master connection in background, persist for 10 min.
   # Try default (IPv4+IPv6) first; if it fails (Broken pipe on IPv6 is
   # common on Termux/Android), retry with -4 to force IPv4.
-  # ssh's stderr goes to a file, not /dev/null: a failure says why. Not $(...):
-  # the master behind -f keeps the pipe open for 10 minutes.
-  local errFile reason
-  errFile=$(mktemp "${TMPDIR:-/tmp}/ossh.open.XXXXXX") || errFile=/dev/null
-  if ssh -o ControlMaster=yes \
-      -o ControlPath="$OSSH_CONTROL_PATH" \
-      -o ControlPersist=600 \
-      -o StrictHostKeyChecking=accept-new \
-      -N -f "$host" 2>"$errFile"; then
-    [ "$errFile" = /dev/null ] || rm -f "$errFile"
+  # ssh's stderr goes to a file in a private temp dir (the kernel's
+  # private.this.temp.dir.get, no raw mktemp), so a failure says why; the one
+  # rm -rf below removes it on every way out (T-OSSH-CONNECTION-OPEN-FAIL).
+  local tempDir errFile=/dev/null reason=""
+  tempDir=$(private.this.temp.dir.get ossh.connection.open) && errFile="$tempDir/ssh.err"
+  if private.ossh.master.start "$host" "$errFile"; then
     create.result 0 "Connection to $host established (reusable for 10 min)"
-    success.log "$RESULT"
-    return $(result)
-  fi
-  reason=$(grep -v '^Warning: Permanently added' "$errFile" 2>/dev/null | tail -1)
-
-  # Retry IPv4-only (avoids Broken pipe on IPv6-first platforms) — only after a
-  # network error: a refused login or host key would only ask the password
-  # again (T-OSSH-CONNECTION-OPEN-FAIL).
-  case "$reason" in
-    *"Permission denied"*|*"Host key verification failed"*|*"too long"*|*"Too many authentication failures"*) ;;
-    *)
+  else
+    reason=$(private.ossh.connection.error.get "$errFile")
+    # Retry IPv4-only (avoids Broken pipe on IPv6-first platforms) — only after
+    # a network error: a refused login or host key would only ask the password
+    # again (T-OSSH-CONNECTION-OPEN-FAIL).
+    if private.ossh.connection.error.network.is "$reason"; then
       info.log "Retrying $host with IPv4 only (-4)..."
-      if ssh -4 -o ControlMaster=yes \
-          -o ControlPath="$OSSH_CONTROL_PATH" \
-          -o ControlPersist=600 \
-          -o StrictHostKeyChecking=accept-new \
-          -N -f "$host" 2>"$errFile"; then
-        [ "$errFile" = /dev/null ] || rm -f "$errFile"
+      if private.ossh.master.start "$host" "$errFile" ipv4; then
         create.result 0 "Connection to $host established via IPv4 (reusable for 10 min)"
-        success.log "$RESULT"
-        return $(result)
+      else
+        reason=$(private.ossh.connection.error.get "$errFile")
+        create.result 1 "Failed to connect to $host: ${reason:-ssh gave no reason}"
       fi
-      reason=$(grep -v '^Warning: Permanently added' "$errFile" 2>/dev/null | tail -1)
-      ;;
-  esac
-
-  [ "$errFile" = /dev/null ] || rm -f "$errFile"
-  create.result 1 "Failed to connect to $host: ${reason:-ssh gave no reason}"
-  error.log "$RESULT"
+    else
+      create.result 1 "Failed to connect to $host: ${reason:-ssh gave no reason}"
+    fi
+  fi
+  # rm -rf and the logs leave RESULT and its rc as they are.
+  [ -n "$tempDir" ] && rm -rf "$tempDir"
+  if [ "$(result)" = 0 ]; then success.log "$RESULT"; else error.log "$RESULT"; fi
   return $(result)
 }
 ossh.connection.open.completion.host() {
   ossh.config.get.completion "$@"
 }
 
-ossh.connection.close() # <host> # close the persistent SSH connection
+ossh.connection.close()     # <host> # close the persistent SSH connection; rc 1 + RESULT without a <host> #
 {
   local host="$1"
-  [ -z "$host" ] && { error.log "Usage: ossh connection.close <host>"; return 1; }
+  if [ -z "$host" ]; then
+    # A RESULT of its own, like connection.open: a bare `return 1` left the
+    # RESULT of whatever ran before (T-OSSH-CONNECTION-CLOSE-NO-HOST).
+    create.result 1 "Usage: ossh connection.close <host>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  # rc 0 also when no master was open (ssh -O exit then fails): either way
+  # there is no connection to <host> afterwards.
   ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null
-  info.log "Connection to $host closed"
+  create.result 0 "Connection to $host closed"
+  info.log "$RESULT"
+  return $(result)
 }
 ossh.connection.close.completion.host() {
   ossh.config.get.completion "$@"
@@ -531,7 +632,7 @@ ossh.install() # <sshConfigHost> <?user> <?logLevel> # installs oosh on <sshConf
     shift
   fi
 
-  ossh.config.parse $sshConfigHost private.push.init.oosh
+  ossh.config.parse $sshConfigHost private.ossh.oosh.init.push
   return $?
 }
 
@@ -539,23 +640,28 @@ private.ossh.install.key.authorize()     # <sshConfigHost> <keyFile> <keyFileNam
 {
  # The installer's key reached root only at the end of a full install
  # (continue.local), and a second install skipped it (pol-dev review @1:05:34,
- # T-OSSH-INSTALL-PUSHES-KEY). A runner without ~/.ssh/private_key/ gives its
- # ~/.ssh/id_*.pub, as key.pull reads a host without oosh keys.
- local host="$1" keyFile="$2" keyFileName="$3" k
+ # T-OSSH-INSTALL-PUSHES-KEY). A runner without ~/.ssh/private_key/ gives the
+ # .pub of the key private.detect.ssh.key finds in its sshDir (CURRENT_SSH_DIR,
+ # else ~/.ssh — private.get.sshDir), named like key.pull names such a key:
+ # <owner>.<type>.public_key, the owner here <user>.<this computer> as in an
+ # oosh key name — a second user of the runner gets a file of its own
+ # (T-OSSH-INSTALL-KEY-FALLBACK).
+ local host="$1" keyFile="$2" keyFileName="$3" sshDir
  if [ ! -f "$keyFile" ]; then
-   for k in id_ed25519 id_ecdsa id_rsa; do
-     [ -f "$HOME/.ssh/$k.pub" ] || continue
-     keyFile="$HOME/.ssh/$k.pub"; keyFileName="$(whoami).$k.public_key"
-     break
-   done
+   private.get.sshDir
+   sshDir="$RESULT"
+   if private.detect.ssh.key "$sshDir" && [ -f "$RESULT.pub" ]; then
+     keyFile="$RESULT.pub"
+     keyFileName="$(private.this.user.name.get).$(private.ossh.host.fqdn.get).${RESULT##*/}.public_key"
+   fi
  fi
  if [ ! -f "$keyFile" ]; then
    create.result 0 "no public key on this computer — $host keeps asking the password"
    warn.log "$RESULT"
    return $(result)
  fi
- private.ossh.ssh "$host" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/'$keyFileName'" < "$keyFile" || {
-   create.result 1 "could not copy $keyFileName to $host"; error.log "$RESULT"; return $(result)
+ private.ossh.remote.public.key.put "$host" "$keyFile" "$keyFileName" || {
+   error.log "$RESULT"; return $(result)
  }
  private.ossh.authorized.key.append.get "$keyFileName" | private.ossh.ssh "$host" "sh" || {
    create.result 1 "could not add $keyFileName to $host's authorized_keys"; error.log "$RESULT"; return $(result)
@@ -572,18 +678,22 @@ private.ossh.install.key.authorize()     # <sshConfigHost> <keyFile> <keyFileNam
  return $(result)
 }
 
-private.push.init.oosh() {
-
+private.ossh.oosh.init.push()     #  # push oosh to $sshConfigHost and install it there as root (init/oosh over ssh), then finish here — the callback ossh.install gives ossh.config.parse, which sets $sshConfigHost; ossh.install sets $OSSH_INSTALL_TARGET_USER and $OSSH_INSTALL_LOG_LEVEL; the installer's key is authorized first, an oosh already there is only finished; rc 0 + RESULT when installed and finished, rc 1 + RESULT and error.log when a step fails #
+{
+  # Named object.verb since 2026-10-16 (was private.push.init.oosh,
+  # T-OSSH-RENAMES-OBJECT-VERB). A RESULT on every path: it returned a bare 1
+  # when init/oosh could not be copied or the installer failed, and `$?` after
+  # finish.local (T-OSSH-OOSH-INIT-PUSH-RESULT).
   private.get.sshDir
   local file="$RESULT/public_keys/$( private.ossh.get.file.name ).public_key"
   local keyFileName="$( private.ossh.get.file.name ).public_key"
+  local installed="" currentBranch remoteRc
   info.log "file=$file"
 
-  # Open persistent connection (password entered once)
-  ossh.connection.open "$sshConfigHost" || {
-    error.log "Failed to open SSH connection to $sshConfigHost"
-    return 1
-  }
+  # Open persistent connection (password entered once). connection.open
+  # logs ssh's reason itself — a second error.log here said it twice
+  # (T-OSSH-CONNECTION-OPEN-FAIL).
+  ossh.connection.open "$sshConfigHost" || return $(result)
 
   # The installer's key first — before the early exits below, so a second
   # install authorizes it too, and every later step could log in without the
@@ -593,61 +703,73 @@ private.push.init.oosh() {
   # Skip bootstrap if oosh is already installed (state machine at [99])
   # Use bash explicitly (Alpine default shell is ash which doesn't support source/declare)
   if private.ossh.ssh "$sshConfigHost" "bash -c 'source ~/config/current.state.machine.env 2>/dev/null && [ \"\$state\" = \"99\" ]'" 2>/dev/null; then
-    important.log "oosh already installed on $sshConfigHost (state [99]) — skipping bootstrap"
-    ossh.install.finish.local "$sshConfigHost" "$OSSH_INSTALL_TARGET_USER"
-    return $?
-  fi
-
+    installed="state [99]"
   # Skip bootstrap if oosh directory already exists (installed but state machine didn't reach [99])
-  if private.ossh.ssh "$sshConfigHost" "[ -d ~/oosh ]" 2>/dev/null; then
-    important.log "oosh already installed on $sshConfigHost (~/oosh exists) — skipping bootstrap"
-    ossh.install.finish.local "$sshConfigHost" "$OSSH_INSTALL_TARGET_USER"
-    return $?
+  elif private.ossh.ssh "$sshConfigHost" "[ -d ~/oosh ]" 2>/dev/null; then
+    installed="~/oosh exists"
   fi
 
-  # Transfer init/oosh via ssh cat (no rsync needed on remote)
-  info.log "Transferring init/oosh to $sshConfigHost via SSH..."
-  private.ossh.ssh "$sshConfigHost" "cat > ~/oosh && chmod +x ~/oosh" < "$OOSH_DIR/init/oosh" || {
-    error.log "Failed to transfer init/oosh to $sshConfigHost"
-    return 1
-  }
+  if [ -n "$installed" ]; then
+    important.log "oosh already installed on $sshConfigHost ($installed) — skipping bootstrap"
+  else
+    # Transfer init/oosh via ssh cat (no rsync needed on remote)
+    info.log "Transferring init/oosh to $sshConfigHost via SSH..."
+    private.ossh.ssh "$sshConfigHost" "cat > ~/oosh && chmod +x ~/oosh" < "$OOSH_DIR/init/oosh" || {
+      create.result 1 "could not transfer init/oosh to $sshConfigHost"
+      error.log "$RESULT"
+      return $(result)
+    }
 
-  # Stage installer + outer identity (email + keypair) to /tmp on the remote so
-  # osshLayout build can populate ids/ssh.<installer-id>/ and ids/ssh.outeruser/
-  # with the runner's identity rather than the container user's. In test mode
-  # the runner is both installer and outer, so the same bytes go to both file
-  # sets. ProxyJump (future) will diverge runner-side; the consumer never collapses.
-  private.ossh.identity.stage "$sshConfigHost" || {
-    warn.log "Failed to stage installer identity on $sshConfigHost — osshLayout will fall back to whoami@hostname"
-  }
+    # Stage installer + outer identity (email + keypair) to /tmp on the remote so
+    # osshLayout build can populate ids/ssh.<installer-id>/ and ids/ssh.outeruser/
+    # with the runner's identity rather than the container user's. In test mode
+    # the runner is both installer and outer, so the same bytes go to both file
+    # sets. ProxyJump (future) will diverge runner-side; the consumer never collapses.
+    private.ossh.identity.stage "$sshConfigHost" || {
+      warn.log "Failed to stage installer identity on $sshConfigHost — osshLayout will fall back to whoami@hostname"
+    }
 
-  success.log "Successfully transferred init files to $sshConfigHost"
+    success.log "Successfully transferred init files to $sshConfigHost"
 
-  # Run remote installer — always installs to root
-  # Pass current git branch as argument (not env var — init/oosh shebang uses env -i which wipes environment)
-  local currentBranch
-  private.this.script.load ogit ogit.branch.get
-  currentBranch=$(ogit.branch.get "$OOSH_DIR")
-  info.log "Running remote oosh installer (root mode, branch: $currentBranch)..."
-  # Use '_' placeholder for empty OOSH_SSH_CONFIG_HOST — empty args get lost across SSH + shebang chain
-  private.ossh.ssh -tt "$sshConfigHost" "./oosh mode root $sshConfigHost ${OOSH_SSH_CONFIG_HOST:-_} $currentBranch ${OSSH_INSTALL_LOG_LEVEL:-1}"
-  local remoteRc=$?
+    # Run remote installer — always installs to root
+    # Pass current git branch as argument (not env var — init/oosh shebang uses env -i which wipes environment)
+    private.this.script.load ogit ogit.branch.get
+    currentBranch=$(ogit.branch.get "$OOSH_DIR")
+    info.log "Running remote oosh installer (root mode, branch: $currentBranch)..."
+    # Use '_' placeholder for empty OOSH_SSH_CONFIG_HOST — empty args get lost across SSH + shebang chain
+    private.ossh.ssh -tt "$sshConfigHost" "./oosh mode root $sshConfigHost ${OOSH_SSH_CONFIG_HOST:-_} $currentBranch ${OSSH_INSTALL_LOG_LEVEL:-1}"
+    remoteRc=$?
+    if [ "$remoteRc" -ne 0 ]; then
+      create.result 1 "the oosh installer on $sshConfigHost failed (rc $remoteRc)"
+      error.log "$RESULT"
+      return $(result)
+    fi
 
-  if [ $remoteRc -ne 0 ]; then
-    error.log "Remote installation failed (exit code: $remoteRc)"
-    return 1
+    important.log "Remote installation done"
+
+    # Hardcoded /root paths in shared config are fixed during root install phase
+    # (see ossh.install.continue.local) — no need to fix remotely here
+
+    source $CONFIG
+    config list
   fi
 
-  important.log "Remote installation done"
-
-  # Hardcoded /root paths in shared config are fixed during root install phase
-  # (see ossh.install.continue.local) — no need to fix remotely here
-
-  source $CONFIG
-  config list
-
-  ossh.install.finish.local $sshConfigHost "$OSSH_INSTALL_TARGET_USER"
-
+  if ossh.install.finish.local "$sshConfigHost" "$OSSH_INSTALL_TARGET_USER"; then
+    if [ -n "$installed" ]; then
+      create.result 0 "oosh already on $sshConfigHost ($installed) and finished here"
+    else
+      create.result 0 "oosh installed on $sshConfigHost and finished here"
+    fi
+    success.log "$RESULT"
+  else
+    if [ -n "$installed" ]; then
+      create.result 1 "oosh already on $sshConfigHost ($installed), but ossh.install.finish.local failed"
+    else
+      create.result 1 "oosh installed on $sshConfigHost, but ossh.install.finish.local failed"
+    fi
+    error.log "$RESULT"
+  fi
+  return $(result)
 }
 
 private.ossh.identity.stage() # <toHost> # stage runner email + id_ed25519 keypair to /tmp/oosh.{installer,outer}.* on <toHost>
@@ -728,10 +850,10 @@ private.ossh.identity.stage.outer.proxyJump() # <toHost> <jumpHost> # stage oute
   local outerEmail
   # ogit-exception: jump host may have no oosh — ogit when it is there, raw git otherwise
   outerEmail=$(ossh.exec "$jumpHost" "command -v ogit >/dev/null 2>&1 && ogit config.email.get || git config --global user.email 2>/dev/null || git config user.email 2>/dev/null" 2>/dev/null \
-                | sed -E 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | awk 'NF{print; exit}')
+                | line.strip.color | tr -d '\r' | awk 'NF{print; exit}')
   if [ -z "$outerEmail" ]; then
     outerEmail=$(ossh.exec "$jumpHost" "printf '%s@%s\n' \"\$(whoami)\" \"\$(hostname)\"" 2>/dev/null \
-                  | sed -E 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | awk 'NF{print; exit}')
+                  | line.strip.color | tr -d '\r' | awk 'NF{print; exit}')
   fi
   if [ -z "$outerEmail" ]; then
     error.log "ProxyJump outer staging: could not resolve email on $jumpHost"
@@ -770,7 +892,7 @@ private.ossh.identity.stage.outer.proxyJump() # <toHost> <jumpHost> # stage oute
 ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal> # continues a local install after init/oosh has cloned and handed off
 # The two parameter names read backwards against what the callers pass, and
 # both callers pass the SAME shape — this runs ON the machine being installed:
-#   arg 1 is THIS host's own ssh alias  ($sshConfigHost from private.push.init.oosh, or the
+#   arg 1 is THIS host's own ssh alias  ($sshConfigHost from private.ossh.oosh.init.push, or the
 #          local `hostname -s` of the local_name line in init/oosh)
 #   arg 2 is the alias of whoever STARTED the install (the runner's
 #          $OOSH_SSH_CONFIG_HOST, or empty on a local install)
@@ -926,7 +1048,7 @@ ossh.install.finish.local() # # finishes local oosh installation
     shift
   fi
 
-  private.ossh.push.config $sshConfigHost || {
+  private.ossh.config.push $sshConfigHost || {
     warn.log "Failed to push config to $sshConfigHost — continuing"
   }
 
@@ -942,7 +1064,7 @@ ossh.install.finish.local() # # finishes local oosh installation
   # The host's own key, authorized here. It asked for `ossh get.key.name`
   # (key.get.name since 2fe51334) and got nothing; key.pull resolves the
   # name itself, without the log lines a remote error.log leaves on stdout.
-  private.ossh.pull.key "$sshConfigHost" || {
+  private.ossh.key.pull "$sshConfigHost" || {
     warn.log "Failed to pull key from $sshConfigHost — continuing"
   }
 
@@ -1094,11 +1216,13 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
   success.log "oosh setup complete for user '$targetUser' on $sshConfigHost"
 }
 
-ossh.update.authorized_keys() # <?sshDir:~/.ssh> # updates authorized_keys from public_keys dir — user authorized.keys.update, the one rebuild
+ossh.authorized.keys.update()     # <?sshDir:~/.ssh> # rebuilds <sshDir>/authorized_keys from public_keys/ — user authorized.keys.update, the one rebuild; rc 1 + RESULT when no ssh is set up there or the rebuild fails, authorized_keys then left as it was #
 {
   # Was a second copy of the rebuild; user's keeps keys that only lived in
   # authorized_keys (T-USER-AUTHORIZED-KEYS-ADOPT, T-OSSH-AUTHORIZED-KEY-APPEND).
-  private.this.script.load user user.authorized.keys.update || { create.result 1 "ossh update.authorized_keys: user not loadable from $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+  # Named object.verb since 2026-10-16 (was ossh.update.authorized_keys,
+  # T-OSSH-RENAMES-OBJECT-VERB).
+  private.this.script.load user user.authorized.keys.update || { create.result 1 "user not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
   user.authorized.keys.update "$@"
 }
 
@@ -2227,25 +2351,31 @@ ossh.service.status.darwin() {
 
 ossh.config.push() # <toHost> <sshConfigName> # adds the config <configName> to the configs on host <toHost>
 {
-  private.ossh.push.config "$@"
+  private.ossh.config.push "$@"
 }
 
-private.ossh.push.config() # <toHost> <?sshConfigName> # appends a Host block to <toHost>:~/.ssh/config. With <sshConfigName>: pushes that named local config. Without: NO-OP — the legacy "push runner's self-config to remote" behaviour was useless in every supported deployment (back-call from remote to runner doesn't work in platform.test containers — Docker NAT — and doesn't work in real ProxyJump — jump host's privkey isn't on the remote). Removed in Phase A.6.
+private.ossh.config.push()     # <toHost> <?sshConfigName> # append the local Host block <sshConfigName> to <toHost>:~/.ssh/config; without <sshConfigName> nothing is pushed (rc 0 + RESULT); rc 1 + RESULT and error.log when <toHost> is missing, the connection fails or a copy step fails #
 {
-
-
-  local toHost="$1"
+  # Named object.verb since 2026-10-16 (was private.ossh.push.config,
+  # T-OSSH-RENAMES-OBJECT-VERB); a RESULT on every path, it returned a bare 1
+  # and the rc of its last rm (T-OSSH-PUSH-PULL-RESULT).
+  # Without <sshConfigName>: NO-OP — the legacy "push runner's self-config to
+  # remote" behaviour was useless in every supported deployment (back-call
+  # from remote to runner doesn't work in platform.test containers — Docker
+  # NAT — and doesn't work in real ProxyJump — jump host's privkey isn't on
+  # the remote). Removed in Phase A.6.
+  local toHost="$1" configName tmpFile
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no toHost was specified"
-    return 1
+    create.result 1 "no toHost was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
-  local configName="$1"
+  configName="$1"
   if [ -n "$1" ]; then
     shift
-    private.ossh.get.config $configName >$CONFIG_PATH/tmp.ssh.config.$configName
   else
     # No configName given — historical "push runner's self-config" path.
     # Always skip: nothing in OOSH's deployment topologies actually uses
@@ -2253,12 +2383,16 @@ private.ossh.push.config() # <toHost> <?sshConfigName> # appends a Host block to
     # block was either broken (hardcoded runner-side IdentityFile pre-A.5)
     # or unreachable (Docker NAT in platform.test) or unauthenticated
     # (no jump host privkey in real ProxyJump). See Phase A.6 commit msg.
-    info.log "private.ossh.push.config: no configName given — skipping runner self-config push (no supported deployment uses back-call from remote)"
-    return 0
+    create.result 0 "private.ossh.config.push: no configName given — skipping runner self-config push (no supported deployment uses back-call from remote)"
+    info.log "$RESULT"
+    return $(result)
   fi
 
-
   ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
+  # The block goes through a file in $CONFIG_PATH, removed on every way out;
+  # it was removed as ~/config/…, another folder when CONFIG_PATH is not ~/config.
+  tmpFile="$CONFIG_PATH/tmp.ssh.config.$configName"
+  private.ossh.get.config $configName >"$tmpFile"
   # Ensure ~/config exists and is owned by the SSH-install user before rsync.
   # On macOS the install path can leave admin's ~/config root:wheel-owned
   # (root sudo'd into admin's home during install), causing rsync's atomic
@@ -2279,12 +2413,19 @@ private.ossh.push.config() # <toHost> <?sshConfigName> # appends a Host block to
   # the path is a symlink, and is a harmless no-op on real dirs (POSIX +
   # GNU + BSD compatible). Bisect confirmed root cause; see commit msg.
   private.ossh.ssh "$toHost" "mkdir -p config; sudo chown -h \$(id -un): config 2>/dev/null || true" 2>/dev/null
-  private.ossh.rsync "$CONFIG_PATH/tmp.ssh.config.$configName" "$toHost:config/tmp.ssh.config.$configName"
-  private.ossh.ssh "$toHost" "cat config/tmp.ssh.config.$configName >>.ssh/config; rm ~/config/tmp.ssh.config.$configName"
-  rm ~/config/tmp.ssh.config.$configName
+  if private.ossh.rsync "$tmpFile" "$toHost:config/tmp.ssh.config.$configName" \
+     && private.ossh.ssh "$toHost" "cat config/tmp.ssh.config.$configName >>.ssh/config && rm ~/config/tmp.ssh.config.$configName"; then
+    create.result 0 "$configName appended to $toHost:~/.ssh/config"
+    success.log "$RESULT"
+  else
+    create.result 1 "could not append $configName to $toHost:~/.ssh/config"
+    error.log "$RESULT"
+  fi
+  rm -f "$tmpFile"
+  return $(result)
 }
 
-private.ossh.push.config.completion() {
+private.ossh.config.push.completion() {
   ossh.config.get.completion "$@"
 }
 
@@ -2293,40 +2434,56 @@ ossh.config.push.completion() {
   ossh.config.get.completion "$@"
 }
 
-private.ossh.push.key() #  <toHost> <?keyName> <?sshDir:~/.ssh> # adds your key to host <toHost> optional you can specify another <?keyName> from <sshDir>/public_keys/
+private.ossh.key.push()     # <toHost> <?keyName> <?sshDir:~/.ssh> # add your key <sshDir>/public_keys/<?keyName> (default: the key of <sshDir>) to <toHost>: copied to its public_keys/, then its authorized_keys rebuilt by its oosh, or the key only added where it has none; rc 0 + RESULT saying which, rc 1 + RESULT when the connection, the copy or both ways of authorizing fail #
 {
   local toHost="$1"
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no toHost was specified"
-    return 1
+    create.result 1 "no toHost was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
+  # An empty <?keyName> still holds its place: key.push <host> "" <sshDir>,
+  # as key.pull. The default key is the one of THAT sshDir, so it is named
+  # after the sshDir is known — it was named from the default sshDir first,
+  # and `[ -n "$1" ] && shift` then took the <sshDir> as missing
+  # (T-OSSH-REMOTE-PUBLIC-KEY-PUT).
   local keyName="$1"
-  if [ -n "$1" ]; then
-    shift
-  else
-    keyName="$( private.ossh.get.file.name ).public_key"
-  fi
+  [ $# -gt 0 ] && shift
 
   private.get.sshDir "$1"
   [ -n "$1" ] && shift
   local sshDir="$RESULT"
+  [ -n "$keyName" ] || keyName="$( private.ossh.get.file.name "$sshDir" ).public_key"
 
   # Quote keyName everywhere — defensive against legacy filenames
   # that may have spaces (pre-sanitization at private.ossh.set.key.name).
-  echo "$sshDir/public_keys/$keyName" "$toHost:.ssh/public_keys/$keyName"
+  info.log "$sshDir/public_keys/$keyName -> $toHost:.ssh/public_keys/$keyName"
   ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
-  # Transfer key via ssh cat (no rsync needed on remote). Single-quote
-  # the remote redirect target so a keyName with literal whitespace
-  # doesn't get token-split by the remote shell.
-  private.ossh.ssh "$toHost" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/'$keyName'" < "$sshDir/public_keys/$keyName"
+  # The key file first — no rebuild on <toHost> without it: the copy's rc
+  # was ignored, and a missing file still ran the rebuild there
+  # (T-OSSH-REMOTE-PUBLIC-KEY-PUT).
+  private.ossh.remote.public.key.put "$toHost" "$sshDir/public_keys/$keyName" "$keyName" || {
+    error.log "$RESULT"; return $(result)
+  }
   # An oosh on <toHost> without authorized.keys.update: the key is only added.
   # `command -v user` first: a host without oosh printed "user: command not
-  # found" on every push (T-OSSH-KEY-PUSH-BARE-QUIET).
-  ossh.exec $toHost "command -v user >/dev/null 2>&1 && user authorized.keys.update" || \
-    private.ossh.authorized.key.append.get "$keyName" | private.ossh.ssh "$toHost" "sh"
+  # found" on every push (T-OSSH-KEY-PUSH-BARE-QUIET). One RESULT per way out:
+  # the push ended with the pipeline's rc, and a failed fallback said nothing
+  # (T-OSSH-REMOTE-PUBLIC-KEY-PUT).
+  if ossh.exec "$toHost" "command -v user >/dev/null 2>&1 && user authorized.keys.update"; then
+    create.result 0 "$keyName authorized on $toHost (rebuild)"
+    success.log "$RESULT"
+  elif private.ossh.authorized.key.append.get "$keyName" | private.ossh.ssh "$toHost" "sh"; then
+    create.result 0 "$keyName added to $toHost's authorized_keys"
+    success.log "$RESULT"
+  else
+    create.result 1 "could not authorize $keyName on $toHost"
+    error.log "$RESULT"
+  fi
+  return $(result)
 }
 
 private.ossh.authorized.key.append.get()     # <keyFileName> # echo the POSIX commands that add ~/.ssh/public_keys/<keyFileName> to ~/.ssh/authorized_keys of the shell that runs them — only when it is not there; no other key is touched #
@@ -2348,10 +2505,14 @@ chmod 600 "\$a"
 EOF
 }
 
-ossh.key.push() # <toHost> <?keyName> <?sshDir:~/.ssh> # adds your key to host <toHost> optional you can specify another <?keyName> from <sshDir>/public_keys/
+ossh.key.push()     # <toHost> <?keyName> <?sshDir:~/.ssh> # adds your key to host <toHost> optional you can specify another <?keyName> from <sshDir>/public_keys/ #
 {
-  private.ossh.push.key "$@";
+  private.ossh.key.push "$@";
 }
+# No ossh.key.push.completion: c2 completes per parameter — <toHost> and
+# <sshDir> from ossh.parameter.completion.*, <keyName> from this computer's
+# public_keys/ (ossh.parameter.completion.keyName). The whole-method form
+# answered every position with hosts. Same as key.pull.
 
 private.ossh.get.key.name() # # creates a good key name fot this user and host
 {
@@ -2417,36 +2578,47 @@ ossh.key.set.name() # <?sshKeyName> # sets the key name to sshKeyName and saves 
 # }
 
 
-private.ossh.push.dir() # <toHost> <dir> # adds the config <configName> to the configs on host <toHost>
+private.ossh.dir.push()     # <toHost> <dir> # copy the local <dir> into the home of <toHost> (rsync, scp where there is none); rc 0 + RESULT when it is there, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #
 {
-
+  # Named object.verb since 2026-10-16 (was private.ossh.push.dir,
+  # T-OSSH-RENAMES-OBJECT-VERB); a RESULT on every path, it returned a bare 1
+  # and the copy's rc (T-OSSH-PUSH-PULL-RESULT).
   local toHost="$1"
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no toHost was specified"
-    return 1
+    create.result 1 "no toHost was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
   local dir="$1"
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no dir was specified"
-    return 1
+    create.result 1 "no dir was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
   ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
-  private.ossh.rsync "$dir" "$toHost:."
+  if private.ossh.rsync "$dir" "$toHost:."; then
+    create.result 0 "$dir copied to $toHost"
+    success.log "$RESULT"
+  else
+    create.result 1 "could not copy $dir to $toHost"
+    error.log "$RESULT"
+  fi
+  return $(result)
 }
 
-ossh.dir.push() # <toHost> <dir> # adds the config <configName> to the configs on host <toHost>
+ossh.dir.push()     # <toHost> <dir> # copies the local <dir> into the home of <toHost> #
 {
-  private.ossh.push.dir "$@";
+  private.ossh.dir.push "$@";
 }
 
 
-private.ossh.push.dir.completion() {
+private.ossh.dir.push.completion() {
   ossh.config.get.completion "$@"
 }
 
@@ -2454,14 +2626,6 @@ ossh.dir.push.completion() {
   ossh.config.get.completion "$@"
 }
 
-private.ossh.push.key.completion() {
-  #ls $HOME/.ssh/public_keys/$1*
-    ossh.config.get.completion "$@"
-}
-
-ossh.key.push.completion() {
-  ossh.config.get.completion "$@"
-}
 
 ossh.known.hosts.remove() # <host> <?port> # removes SSH host key for <host>:<?port> from known_hosts
 {
@@ -2496,66 +2660,92 @@ ossh.known.hosts.remove.completion() {
   ossh.config.get.completion "$@"
 }
 
-private.ossh.pull.dir() # <fromHost> <dir> # gets te directory <dir> <fromHost> into the CURRENT LOCAL dirrectory
+private.ossh.dir.pull()     # <fromHost> <dir> # copy <dir> from the home of <fromHost> into the current local folder; rc 0 + RESULT when it is here, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #
 {
-
-  local toHost="$1"
+  # Named object.verb since 2026-10-16 (was private.ossh.pull.dir,
+  # T-OSSH-RENAMES-OBJECT-VERB); a RESULT on every path, it returned a bare 1
+  # and the copy's rc (T-OSSH-PUSH-PULL-RESULT).
+  local fromHost="$1"
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no toHost was specified"
-    return 1
+    create.result 1 "no fromHost was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
   local dir="$1"
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no dir was specified"
-    return 1
+    create.result 1 "no dir was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
-  important.log "copying from $toHost:$dir"
-  ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
-  private.ossh.rsync.pull "$toHost:$dir" "."
-  #ssh $toHost "user authorized.keys.update"
+  important.log "copying from $fromHost:$dir"
+  ossh.connection.open "$fromHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
+  if private.ossh.rsync.pull "$fromHost:$dir" "."; then
+    create.result 0 "$fromHost:$dir copied here"
+    success.log "$RESULT"
+  else
+    create.result 1 "could not copy $fromHost:$dir here"
+    error.log "$RESULT"
+  fi
+  return $(result)
 }
 
-ossh.dir.pull() # <fromHost> <dir> # gets te directory <dir> <fromHost> into the CURRENT LOCAL dirrectory
+ossh.dir.pull()     # <fromHost> <dir> # copies <dir> from the home of <fromHost> into the current local folder #
 {
-  private.ossh.pull.dir "$@";
+  private.ossh.dir.pull "$@";
 }
 
-private.ossh.remote.key.file.name.get() # <fromHost> # echo the key file name oosh uses on <fromHost> (file.get.name, id.file.get on an older oosh); nothing when it has none #
+private.ossh.remote.key.file.name.get()     # <fromHost> # echo the name of <fromHost>'s own oosh key: a ~/.ssh/private_key/<name>.private_key there that has its public_keys/<name>.public_key (the last one when there are several); nothing and rc 1 when it has none or the answer is no plain file name #
 {
-  # NO create.result — a getter consumed as $(...). A remote error.log can
-  # land on stdout next to the name: colours and \r go, the last line is the
-  # answer, and a line with a space or a log marker is no name.
-  local fromHost="$1" method name
-  for method in file.get.name id.file.get; do
-    name=$( ossh.exec "$fromHost" "ossh $method" 2>/dev/null | sed 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | tail -1 )
-    case "$name" in
-      (""|*[[:space:]]*|*ERROR*|*WARN*) continue ;;
-    esac
-    echo "$name"
-    return 0
-  done
-  return 1
+  # NO create.result — a getter consumed as $(...).
+  # It asked the host `ossh file.get.name` (`ossh id.file.get` on an older
+  # oosh): with no private_key/ there, that made a key name and ran
+  # `config save ssh.info` ON THE HOST — a read that wrote (fresh review
+  # 2026-10-16). Both methods are `ls ~/.ssh/private_key/` minus
+  # .private_key, so a POSIX listing gives the same answer, writes nothing and
+  # needs no oosh on the host (T-OSSH-REMOTE-KEY-FILE-NAME-GET). Only a name
+  # with its public key file counts: that file is what key.pull fetches.
+  # The answer is remote data: colours and \r go, the last line is the
+  # answer, and a name with a space, a / or a ' is no name — it would leave
+  # public_keys/ or end the remote quote.
+  local fromHost="$1" name
+  [ -n "$fromHost" ] || return 1
+  name=$( private.ossh.ssh "$fromHost" 'for f in ~/.ssh/private_key/*.private_key; do n="${f##*/}"; n="${n%.private_key}"; [ -f ~/.ssh/public_keys/"$n".public_key ] && echo "$n"; done' 2>/dev/null | line.strip.color | tr -d '\r' | tail -1 )
+  case "$name" in
+    (""|.|..|*[[:space:]]*|*/*|*\'*) return 1 ;;
+  esac
+  echo "$name"
 }
 
-private.ossh.pull.key() # <fromHost> <?keyName> <?sshDir:~/.ssh> # gets the key <?keyName> (default: the key of <fromHost>) from <fromHost>:.ssh/public_keys/ into <sshDir>/public_keys/ and authorizes it — key.push the other way around
+private.ossh.key.pull()     # <fromHost> <?remoteKeyName> <?sshDir:~/.ssh> # get the key public_keys/<?remoteKeyName> (default: the key of <fromHost>) from <fromHost>:~/.ssh/ into the LOCAL <sshDir>/public_keys/ and authorize it here — key.push the other way around; rc 1 + RESULT when the name is no file name, there is no key or it cannot be saved #
 {
   local fromHost="$1"
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no fromHost was specified"
-    return 1
+    create.result 1 "no fromHost was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
-  # An empty <?keyName> still holds its place: key.pull <host> "" <sshDir>.
-  local keyName="$1"
+  # An empty <?remoteKeyName> still holds its place: key.pull <host> "" <sshDir>.
+  # A ' is dropped, as key.push does: it would end the remote quote. A name
+  # with a / is refused before the host is asked — it would read and write
+  # outside public_keys/ (T-OSSH-KEY-PULL).
+  local keyName="${1//\'/}"
   [ $# -gt 0 ] && shift
+  case "$keyName" in
+    (*/*|.|..)
+      create.result 1 "key.pull: $keyName is no file name in public_keys/"
+      error.log "$RESULT"
+      return $(result)
+      ;;
+  esac
 
   private.get.sshDir "$1"
   [ -n "$1" ] && shift
@@ -2565,8 +2755,10 @@ private.ossh.pull.key() # <fromHost> <?keyName> <?sshDir:~/.ssh> # gets the key 
 
   # The file key.push would send from <fromHost>: public_keys/<keyName>,
   # by default the host's own key file. A host without oosh keys (Termux,
-  # cb040d55) only has ~/.ssh/id_*.pub — kept as <fromHost>.<type>.public_key.
-  local remoteFile="" localName="" key="" name
+  # cb040d55) only has ~/.ssh/id_*.pub — kept as <fromHost>.<type>.public_key,
+  # the <owner>.<type>.public_key scheme install.key.authorize names its
+  # fallback key by too (T-OSSH-INSTALL-KEY-FALLBACK).
+  local remoteFile="" localName="" key="" name file
   if [ -n "$keyName" ]; then
     remoteFile="public_keys/'$keyName'"; localName="$keyName"
   else
@@ -2578,37 +2770,68 @@ private.ossh.pull.key() # <fromHost> <?keyName> <?sshDir:~/.ssh> # gets the key 
   # Single-quoted like key.push: a keyName with a space stays one word remotely.
   [ -n "$remoteFile" ] && key="$( private.ossh.ssh "$fromHost" "cat ~/.ssh/$remoteFile" 2>/dev/null )"
   if [ -z "$key" ] && [ -z "$keyName" ]; then
-    name="$( private.ossh.ssh "$fromHost" "for k in id_ed25519 id_ecdsa id_rsa id_dsa; do [ -f ~/.ssh/\$k.pub ] && echo \$k && break; done" 2>/dev/null )"
+    name="$( private.ossh.ssh "$fromHost" "for k in id_ed25519 id_ecdsa id_rsa id_dsa; do [ -f ~/.ssh/\$k.pub ] && echo \$k && break; done" 2>/dev/null | tr -d '\r' )"
+    # Remote data: only one of the four names asked for is one.
+    case "$name" in (id_ed25519|id_ecdsa|id_rsa|id_dsa) ;; (*) name="" ;; esac
     if [ -n "$name" ]; then
       localName="$fromHost.$name.public_key"
       key="$( private.ossh.ssh "$fromHost" "cat ~/.ssh/'$name.pub'" 2>/dev/null )"
     fi
   fi
-  case "$key" in
-    (ssh-*|ecdsa-*|sk-*) ;;
-    (*)
-      create.result 1 "key.pull: no public key ${keyName:+$keyName }found on $fromHost"
+  # A key is what user's rebuild reads as one: private.user.authorized.key.get
+  # finds "<type> <key>" in it — the one definition, not a second case list.
+  private.this.script.load user private.user.authorized.key.get || {
+    create.result 1 "user not found in $OOSH_DIR"; error.log "$RESULT"; return $(result)
+  }
+  if [ -z "$( private.user.authorized.key.get "$key" )" ]; then
+    create.result 1 "key.pull: no public key ${keyName:+$keyName }found on $fromHost"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  # Every source of the local name ends here, <fromHost> included: one /
+  # and the file would land outside public_keys/.
+  case "$localName" in
+    (*/*|.|..)
+      create.result 1 "key.pull: $localName is no file name in public_keys/"
       error.log "$RESULT"
       return $(result)
       ;;
   esac
 
-  [ -d "$sshDir/public_keys" ] || mkdir -p "$sshDir/public_keys"
-  printf '%s\n' "$key" > "$sshDir/public_keys/$localName"
-  important.log "key.pull: $fromHost -> $sshDir/public_keys/$localName"
-  ossh.update.authorized_keys "$sshDir"
+  # Both checked: a file in the way or a full disk said nothing and the
+  # rebuild went on without the key (T-THIS-FOLDER-ENSURE, T-THIS-FILE-WRITE).
+  file="$sshDir/public_keys/$localName"
+  private.this.folder.ensure "$sshDir/public_keys" || { error.log "$RESULT"; return $(result); }
+  private.this.file.write "$file" "$key" || { error.log "$RESULT"; return $(result); }
+  important.log "key.pull: $fromHost -> $file"
+
+  # key.pull's own result, not the rebuild's: the rebuild is rc 1 when this
+  # computer has no ssh set up (no private key in <sshDir>,
+  # T-USER-AUTHORIZED-KEYS-UPDATE-RC) — the key is saved all the same, and the
+  # next rebuild authorizes it (T-OSSH-KEY-PULL-RESULT).
+  if ossh.authorized.keys.update "$sshDir"; then
+    create.result 0 "key.pull: $fromHost's key saved as $file and authorized"
+    success.log "$RESULT"
+  else
+    create.result 0 "key.pull: $fromHost's key saved as $file, but not authorized yet: $RESULT"
+    warn.log "$RESULT"
+  fi
+  return $(result)
 }
 
-ossh.key.pull() # <fromHost> <?keyName> <?sshDir:~/.ssh> # gets the key of <fromHost> or <?keyName> from its <sshDir>/public_keys/ and authorizes it here — key.push the other way around
+ossh.key.pull()     # <fromHost> <?remoteKeyName> <?sshDir:~/.ssh> # gets the key of <fromHost> (or public_keys/<?remoteKeyName> there) from <fromHost>:~/.ssh/ into the LOCAL <sshDir>/public_keys/ and authorizes it here — key.push the other way around #
 {
-  private.ossh.pull.key "$@";
+  private.ossh.key.pull "$@";
 }
 
-ossh.key.pull.completion() {
-  ossh.config.get.completion "$@"
-}
-
-ossh.key.pull.completion.sshDir() { ossh.parameter.completion.sshDir "$@"; }
+# c2 completes per parameter: <fromHost> and <sshDir> from
+# ossh.parameter.completion.*. <remoteKeyName> is a file on <fromHost>, not
+# here, and has no completion on purpose: a remote listing would ask the
+# password on Tab. It was <keyName> with an empty
+# ossh.key.pull.completion.keyName — c2 takes an empty answer as "none" and
+# asks the shared ossh.parameter.completion.keyName next, which listed this
+# computer's keys (T-OSSH-KEY-COMPLETION). The whole-method form answered
+# every position with hosts. Same as key.push.
 
 private.ossh.pull.config() # <fromHost> <sshConfigName> <?file> # pulls a config from remote and seves it
 {
@@ -2679,42 +2902,58 @@ private.ossh.pull.id() # <fromHost> <?file> <?sshDir> # pulls the .ssh dir from 
   fi
 
   cd $sshDir/ids
-  private.ossh.pull.dir $fromHost ".ssh"
+  private.ossh.dir.pull $fromHost ".ssh"
   mv .ssh ssh.$id
 }
 
 ossh.id.pull() # <fromHost> <?file> <?sshDir> # pulls the .ssh dir from host to sshDir/ids and renames it
 { private.ossh.pull.id "$@"; }
 
-private.ossh.push.id() # <toHost> <id> <?sshDir> # pushes the <id> <toHost>
+private.ossh.id.push()     # <toHost> <id> <?sshDir:~/.ssh> # copy the identity <sshDir>/ids/<id> to <toHost>:~/.ssh/ids/; rc 0 + RESULT when it is there, rc 1 + RESULT and error.log when an argument or the id is missing, the connection or the copy fails #
 {
-  local toHost="$1"
+  # Named object.verb since 2026-10-16 (was private.ossh.push.id,
+  # T-OSSH-RENAMES-OBJECT-VERB); a RESULT on every path, it returned a bare 1
+  # and the copy's rc, and a missing id went to rsync (T-OSSH-PUSH-PULL-RESULT).
+  local toHost="$1" idName sshDir idDir
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no toHost was specified"
-    return 1
+    create.result 1 "no toHost was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
 
   if [ -z "$1" ]; then
-    error.log "no id was specified"
-    return 1
-  else
-    idName="$1"
-    shift
+    create.result 1 "no id was specified"
+    error.log "$RESULT"
+    return $(result)
   fi
+  idName="$1"
+  shift
 
   private.get.sshDir "$1"
   [ -n "$1" ] && shift
-  local sshDir="$RESULT"
-  local idDir="$sshDir/ids/$idName"
+  sshDir="$RESULT"
+  idDir="$sshDir/ids/$idName"
+  if [ ! -d "$idDir" ]; then
+    create.result 1 "no id $idName in $sshDir/ids"
+    error.log "$RESULT"
+    return $(result)
+  fi
 
   ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
-  private.ossh.rsync "$idDir" "$toHost:~/.ssh/ids/"
+  if private.ossh.rsync "$idDir" "$toHost:~/.ssh/ids/"; then
+    create.result 0 "$idName copied to $toHost:~/.ssh/ids/"
+    success.log "$RESULT"
+  else
+    create.result 1 "could not copy $idName to $toHost:~/.ssh/ids/"
+    error.log "$RESULT"
+  fi
+  return $(result)
 }
 
-ossh.id.push() # <toHost> <id> <?sshDir> # pushes the <id> <toHost>
-{ private.ossh.push.id "$@"; }
+ossh.id.push()     # <toHost> <id> <?sshDir:~/.ssh> # copies the identity <sshDir>/ids/<id> to <toHost>:~/.ssh/ids/ #
+{ private.ossh.id.push "$@"; }
 
 private.ossh.get.server.port() {
   if [ -f /etc/ssh/sshd_config ]; then
@@ -2928,7 +3167,7 @@ ossh.prereqs.install() # <?sshConfigHost> # install post-clone prereqs via oo cm
   # that already call `ossh prereqs.install <host>` keep working.
 
   # Deprecation notice: `ossh install <host>` does the same bootstrap
-  # (private.push.init.oosh) AND sets up the target user via
+  # (private.ossh.oosh.init.push) AND sets up the target user via
   # ossh.install.finish.local. Calling prereqs.install + install
   # back-to-back ships init/oosh twice. Prefer `ossh install <host>`
   # going forward; this entry point remains for back-compat.
@@ -3825,6 +4064,12 @@ ossh.start()
     CONFIG=$HOME/config/user.env
     [ -f "$CONFIG" ] && source $CONFIG
   fi
+  # SSH ControlMaster socket path for connection reuse (single password
+  # entry). A default like the ones above, not a file-scope statement: ossh
+  # is only definitions plus ossh.start. Every script that sources ossh (user,
+  # os, myId, config, the tests) runs ossh.start, so it still gets the path;
+  # `:=` keeps a path an outer ossh or os exported (T-OSSH-CONTROL-PATH-SHORT).
+  : ${OSSH_CONTROL_PATH:="$(private.ossh.control.path.get)"}
   source this
   source line
   source os

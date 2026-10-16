@@ -197,7 +197,7 @@ odocker reset naked_ubuntu_24_04
 # Then use ossh to install oosh into the container
 ossh config.create mycontainer test@localhost:8022
 ossh config.save.last
-ossh push.key mycontainer
+ossh key.push mycontainer
 ossh install mycontainer test
 ossh login mycontainer
 ```
@@ -382,6 +382,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 |--------|-----------|-------------|
 | `exec <container>` | container name, optional shell (default: bash) | Shell into running container (interactive `-it`) |
 | `exec.command <container> <command...>` | container name, command to run | Run a non-interactive command inside a running container (no TTY); for scripts/state machines |
+| `container.ip.get <container>` | container name | Echo the IP address of a running container on its first network (a container from `odocker run` publishes no port — reach its sshd here); rc 1 when it has none (T-ODOCKER-CONTAINER-IP-GET) |
 | `image.command <image> <command...>` | image, command to run | Run one command in a throwaway container of `<image>` (removed afterwards), stdin passed in, rc the command's; `os platform.parse.check` streams a tree in this way (T-ODOCKER-IMAGE-COMMAND) |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
@@ -460,7 +461,7 @@ odocker reset naked_ubuntu_24_04
 # 3. Configure SSH access via ossh
 ossh config.create ubuntu24 test@localhost:8022
 ossh config.save.last
-ossh push.key ubuntu24
+ossh key.push ubuntu24
 
 # 4. Install oosh remotely
 ossh install ubuntu24 test

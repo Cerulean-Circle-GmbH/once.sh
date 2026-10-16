@@ -193,6 +193,13 @@ odocker.do.thing()            # vague verb
 3. **Output**: one completion candidate per line to stdout
 4. **No-param methods**: use empty completion `script.method.completion() { :; }`
 5. **Private methods**: no completion needed (not user-facing)
+6. **"Offer nothing" is a name, not an empty function**: c2 takes an empty
+   answer from `script.method.completion.param()` as "no completion" and asks
+   the shared `script.parameter.completion.param()` next. A parameter that must
+   offer nothing gets a name no shared completion carries, and goes on the
+   free-text list of `test/test.completion.audit` — `ossh key.pull`'s
+   `<?remoteKeyName>`; with `<?keyName>` and `{ :; }` Tab listed this
+   computer's keys (T-OSSH-KEY-COMPLETION)
 
 ```bash
 # Method with two completable params — two completion functions
@@ -399,6 +406,9 @@ answer by rc):
 | `private.this.temp.dir.get <?label:oosh>` | echo the canonical path of a new private directory (mode 700) under `TMPDIR`, else `/tmp`; the caller removes it (tests use `test.suite.fixture.make`) |
 | `private.this.url.download <url> <file>` | download `<url>` to `<file>`, curl through `oo cmd` when it is missing: rc 0 and RESULT the file; rc 1 naming why when there is no curl, curl fails or the download is empty, and no file left. The one checked download, and the one place that knows a download needs curl — odocker's `private.odocker.docker.repo.download` and su/setup's nvm installer call it (T-THIS-URL-DOWNLOAD) |
 | `private.this.file.line.ensure <file> <line>` | append `<line>` unless the file already holds it as a whole line, in place (owner, group and mode kept; a missing file is made); rc 1 + RESULT when it cannot be written. config's `private.config.env.line.append` and su/setup call it (T-THIS-FILE-LINE-ENSURE) |
+| `private.this.file.write <file> <content>` | replace the whole content by `<content>` and a newline, ATOMICALLY: written to `<file>.new` in the same folder under `umask 077` (nobody else can write it before the move), given the old file's mode (and group when the caller may) — a NEW file stays 600, owner only (under umask 002 a new `authorized_keys` was briefly 664) —, then `mv`'d over it — a reader sees the old file or the new one, never half; the writer owns it afterwards (for another user's file use `file.line.ensure`, in place); a symlink is written through; rc 1 + RESULT when the folder is missing or unwritable or the write fails, and no `.new` left (T-THIS-FILE-WRITE) |
+| `private.this.folder.ensure <dir>` | make `<dir>` with its parents when it is missing; rc 0 + RESULT when it exists or was made; rc 1 + RESULT naming why it cannot be (the part of the path that is a file in the way, or the folder without write permission); nothing on stdout (T-THIS-FOLDER-ENSURE) |
+| `private.this.user.name.get` | echo the name of the user running this: `id -un`, else `$USER` (unset under `docker exec`), else nothing and rc 1 — the one spelling, instead of `whoami` or a bare `$USER` (T-THIS-USER-NAME-GET) |
 | `private.this.env.export.line.get <variableName> <value>` | echo one pure-data `export NAME="value"` line, quoted by bash; rc 1 for a control character, a `$(` or backtick (the validator rejects them), or a `$'…'` rendering — the rule `config save` and `log.session.save` share |
 | `private.this.device.is.terminal <device>` | rc 0 when a log device is terminal-type (unset, fd 1, fd 2, the tty) — the one list `info.log` and `log`'s emitter ask |
 | `private.this.path.canonical <path>` | echo the canonical absolute path; GNU `readlink -f` or the BSD fallback |

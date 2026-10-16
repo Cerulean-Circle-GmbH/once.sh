@@ -185,6 +185,53 @@ test.case $level "T-OSSH-KEY-NAME-NO-HOSTNAME: without the hostname program the 
 expect 0 "the key name carries the computer name with and without hostname" \
   "AlmaLinux minimal has no hostname program — the key name was <user>. with an empty computer part"
 
+
+console.log "
+Test: private.ossh.control.path.resolved.get
+===================================================================="
+
+# T-OSSH-CONTROL-PATH-RESOLVED-GET: the socket a host's master really uses, from ssh itself
+# os platform.test removed "/tmp/ossh-test@localhost:<port>" before it opened
+# a master and after the install: a name from before %C, so it never existed
+# and a stale socket stayed (fresh review 2026-10-16). The real name is
+# $OSSH_CONTROL_PATH with %C expanded, and only ssh knows the hash — `ssh -G`
+# prints it without connecting. ssh is a stub here that answers -G like
+# OpenSSH and logs a REAL line for anything else; scp and rsync are backstops.
+test.ossh.controlPathResolvedGet() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make osshcpresolved)
+  test.ossh.controlPathResolvedGet.run() { # <controlPathLine> <host...> # the getter with ssh -G answering "controlpath <controlPathLine>"; echo its output, then |rc #
+    ( FX_CP="$1"; shift; OSSH_CONTROL_PATH="$fx/ossh-%C"
+      ssh() {
+        echo "ssh $*" >> "$fx/calls"
+        case "$1" in (-G) printf '%s\n' "user test" "controlpath $FX_CP" "port 8022"; return 0 ;; esac
+        echo "REAL ssh $*" >> "$fx/real"; return 255
+      }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      private.ossh.control.path.resolved.get "$@" 2>/dev/null; echo "|$?" )
+  }
+  got=$(test.ossh.controlPathResolvedGet.run "$fx/ossh-254783dc" lab); [ "$got" = "$fx/ossh-254783dc
+|0" ] || bad="$bad resolved=[$(echo "$got" | tr '\n' ' ')]"
+  grep -qxF -- "ssh -G -o ControlPath=$fx/ossh-%C lab" "$fx/calls" || bad="$bad call=[$(tr '\n' '|' < "$fx/calls")]"
+  got=$(test.ossh.controlPathResolvedGet.run "$fx/ossh-%C" lab); [ "$got" = "|1" ] || bad="$bad unexpanded=[$(echo "$got" | tr '\n' ' ')]"
+  got=$(test.ossh.controlPathResolvedGet.run "none" lab); [ "$got" = "|1" ] || bad="$bad none=[$(echo "$got" | tr '\n' ' ')]"
+  : > "$fx/calls"
+  got=$(test.ossh.controlPathResolvedGet.run "$fx/x"); [ "$got" = "|1" ] && [ ! -s "$fx/calls" ] || bad="$bad noHost=[$(echo "$got" | tr '\n' ' ')]"
+  unset -f test.ossh.controlPathResolvedGet.run
+  # os removes that socket, not the pre-%C name, and closes through ossh
+  grep -n 'ossh-test@localhost' "$OOSH_DIR/os" | grep -v '^[0-9]*:[[:space:]]*#' | grep -q . && bad="$bad osOldName"
+  grep -n 'ssh -O exit' "$OOSH_DIR/os" | grep -v '^[0-9]*:[[:space:]]*#' | grep -q . && bad="$bad osRawExit"
+  [ "$(grep -c 'private\.ossh\.control\.path\.resolved\.get' "$OOSH_DIR/os")" -ge 2 ] || bad="$bad osNotResolved"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the resolved socket path comes from ssh -G" || create.result 1 "resolved control path:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONTROL-PATH-RESOLVED-GET: the socket a host's master uses, %C expanded by ssh -G; os removes that one" test.ossh.controlPathResolvedGet
+expect 0 "the resolved socket path comes from ssh -G" \
+  "os removed /tmp/ossh-test@localhost:<port>, a name from before %C that never existed"
+
 ### test.method
 
 # ============================================================================
@@ -862,7 +909,7 @@ test.ossh.branchNoAlias() {
   fx=$(test.suite.fixture.make osshbranchnoalias)
   git init -q -b feature-x "$fx/repo"; git -C "$fx/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m seed
   private.this.script.load ogit ogit.branch.get
-  for fn in private.push.init.oosh ossh.install.continue.local ossh.install.user.remote; do
+  for fn in private.ossh.oosh.init.push ossh.install.continue.local ossh.install.user.remote; do
     body=$(declare -f "$fn")
     site=$(printf '%s\n' "$body" | grep -m1 'ogit\.branch\.get "\$OOSH_DIR"')
     [ -n "$site" ] || { bad="$bad $fn-no-ogit-site"; continue; }
@@ -1360,7 +1407,10 @@ test.case $level "T-FOLDER-FIX-REJECTS-UNKNOWN-MODE: unknown mode returns 1" \
 FOLDER_FIX_FX=$(test.suite.fixture.make folderfixmode)
 ( cd "$FOLDER_FIX_FX" && ossh.folder.fix "" /tmp/test.no.such.path.$$ bogus_mode_xyz >/dev/null 2>&1 )
 FOLDER_FIX_RC=$?
-FOLDER_FIX_LEFT=$(ls -A "$FOLDER_FIX_FX"; ls -d /tmp/test.no.such.path.$$ 2>/dev/null)
+# The bogus sshDir must not exist afterwards; asked with a test, not `ls -d`:
+# ls of a missing path is rc 2, and the ERR trap (debug.onError) logged that
+# expected outcome as "EXIT 2 Misuse of shell builtins" on every run.
+FOLDER_FIX_LEFT=$(ls -A "$FOLDER_FIX_FX"; [ ! -e /tmp/test.no.such.path.$$ ] || echo /tmp/test.no.such.path.$$)
 rm -rf "$FOLDER_FIX_FX" /tmp/test.no.such.path.$$
 if [ "$FOLDER_FIX_RC" -ne 0 ] && [ -z "$FOLDER_FIX_LEFT" ]; then
   expect.pass "unknown mode rejected"
@@ -1718,6 +1768,8 @@ expect 0 "one Host block removed in place, the others and the mode kept; a secon
 # public_keys/ was gone (POL.dev, 2026-10-15). The snippet runs in the target's
 # POSIX shell — here sh with a fixture HOME. ossh's own rebuild is user's
 # (one rebuild, which adopts such keys first: T-USER-AUTHORIZED-KEYS-ADOPT).
+# The child bash runs that source ossh have HOME and CURRENT_SSH_DIR in the
+# fixture too: sourcing runs ossh.start, which reads the home's config.
 test.ossh.authorizedKeyAppend() {
   local fx bad="" snippet ak
   fx=$(test.suite.fixture.make osshauthkey)
@@ -1725,14 +1777,14 @@ test.ossh.authorizedKeyAppend() {
   printf '%s' "ssh-rsa AAAAOLD hoster@provider" > "$fx/.ssh/authorized_keys"   # no newline at the end
   echo "ssh-ed25519 AAAANEW donges@MacStudio" > "$fx/.ssh/public_keys/ssh.new.public_key"
   echo "ssh-ed25519 AAAAOTHER someone@else" > "$fx/.ssh/public_keys/ssh.other.public_key"
-  snippet=$(bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1; private.ossh.authorized.key.append.get ssh.new.public_key' 2>/dev/null)
+  snippet=$(HOME="$fx" CURRENT_SSH_DIR="$fx/.ssh" bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1; private.ossh.authorized.key.append.get ssh.new.public_key' 2>/dev/null)
   HOME="$fx" sh -c "$snippet" 2>/dev/null; HOME="$fx" sh -c "$snippet" 2>/dev/null
   ak=$(cat "$fx/.ssh/authorized_keys")
   [ "$ak" = "ssh-rsa AAAAOLD hoster@provider
 ssh-ed25519 AAAANEW donges@MacStudio" ] || bad="$bad authorized_keys=[$(echo "$ak" | tr '\n' '|')]"
   [ "$(stat -c %a "$fx/.ssh/authorized_keys" 2>/dev/null || stat -f %Lp "$fx/.ssh/authorized_keys")" = 600 ] || bad="$bad mode"
   grep -n 'cat ~/.ssh/public_keys/\* >' "$OOSH_DIR/ossh" | grep -v '^[0-9]*:[[:space:]]*#' | grep -q . && bad="$bad rebuildLeft"
-  bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1; type ossh.update.authorized_keys' 2>/dev/null \
+  HOME="$fx" CURRENT_SSH_DIR="$fx/.ssh" bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1; type ossh.authorized.keys.update' 2>/dev/null \
     | grep -q 'user.authorized.keys.update' || bad="$bad ownRebuild"
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "ossh only adds the pushed key; its rebuild is user's" || create.result 1 "append:$bad"
@@ -1743,28 +1795,41 @@ expect 0 "ossh only adds the pushed key; its rebuild is user's" \
   "POL.dev: cat public_keys/* > authorized_keys deleted the keys without a file"
 
 # T-OSSH-KEY-PULL: ossh key.pull is key.push the other way around —
-# <fromHost> <?keyName> <?sshDir>; host:.ssh/public_keys/<keyName> lands as
-# <sshDir>/public_keys/<keyName> and the local authorized_keys is rebuilt.
+# <fromHost> <?remoteKeyName> <?sshDir>; host:.ssh/public_keys/<name> lands as
+# <sshDir>/public_keys/<name> and the local authorized_keys is rebuilt.
 # It asked the host for `ossh id.file.get` (file.get.name on dev since
 # 2fe51334, so the default never resolved), pulled ~/.ssh/<name>.pub instead
 # of the oosh public_keys/ file and left it as <name>.public_key.pulled.
 # A host without oosh keys (Termux, cb040d55) still gives its ~/.ssh/id_*.pub.
-# Every remote step is stubbed: private.ossh.ssh answers from FX_* and logs.
+# The host's own key name is a listing of its private_key/ now, not
+# `ossh file.get.name`, which wrote `config save ssh.info` on a host without
+# one (fresh review 2026-10-16) — no call may ask the host's oosh. Names are
+# remote data or typed: a ' is dropped as key.push does, a name with a / or
+# a probe answer that is no key type is refused, so nothing lands outside
+# public_keys/ (same review).
+# Every remote step is stubbed: private.ossh.ssh answers from FX_* and logs;
+# ssh, scp and rsync are backstops — HOME does not isolate a real ssh (it reads
+# the passwd home), so a step past private.ossh.ssh is a REAL line in <fx>/real.
 test.ossh.keyPull() {
   local fx bad="" rc
   fx=$(test.suite.fixture.make osshkeypull)
   mkdir -p "$fx/.ssh/public_keys"
-  private.test.ossh.keyPull.run() { # <FX_NAME> <FX_OLDNAME> <FX_STD> <FX_HAS> <args...>
+  test.ossh.keyPull.run() { # <FX_NAME> <FX_STD> <FX_HAS> <args...> # ossh key.pull <args...> in a subshell against a stubbed host: FX_NAME answers the private_key/ listing, FX_STD the ~/.ssh/id_* probe, FX_HAS is the file it has; calls go to <fx>/calls #
     # HOME and CURRENT_SSH_DIR are the fixture: a lost <sshDir> never reaches ~/.ssh.
-    ( FX_NAME="$1" FX_OLDNAME="$2" FX_STD="$3" FX_HAS="$4"; shift 4
+    ( FX_NAME="$1" FX_STD="$2" FX_HAS="$3"; shift 3
       HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"
+      # user first: key.pull loads it to read the key, and user sources ossh
+      # at its end — loaded after the stubs below it would put the real ones back.
+      private.this.script.load user private.user.authorized.key.get >/dev/null 2>&1
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
       ossh.connection.open() { :; }
-      ossh.update.authorized_keys() { echo "update $*" >> "$fx/calls"; }
+      ossh.authorized.keys.update() { echo "update $*" >> "$fx/calls"; }
       private.ossh.ssh() {
         echo "ssh $*" >> "$fx/calls"
         case "$*" in
-          (*"ossh file.get.name"*) echo "$FX_NAME" ;;
-          (*"ossh id.file.get"*)   echo "$FX_OLDNAME" ;;
+          (*"private_key/"*) echo "$FX_NAME" ;;
           (*"id_ed25519 id_ecdsa"*) echo "$FX_STD" ;;
           (*"cat ~/.ssh/'$FX_HAS'"|*"cat ~/.ssh/public_keys/'${FX_HAS#public_keys/}'") echo "ssh-ed25519 AAAAPULLED donges@MacStudio" ;;
           (*) return 1 ;;
@@ -1773,38 +1838,158 @@ test.ossh.keyPull() {
       ossh.key.pull "$@" >/dev/null 2>&1
     )
   }
-  # explicit keyName, the name key.push takes
+  # explicit name, the name key.push takes
   : > "$fx/calls"
-  private.test.ossh.keyPull.run "" "" "" "public_keys/ssh.donges.public_key" mac ssh.donges.public_key "$fx/.ssh"; rc=$?
+  test.ossh.keyPull.run "" "" "public_keys/ssh.donges.public_key" mac ssh.donges.public_key "$fx/.ssh"; rc=$?
   [ "$rc" = 0 ] && [ "$(cat "$fx/.ssh/public_keys/ssh.donges.public_key" 2>/dev/null)" = "ssh-ed25519 AAAAPULLED donges@MacStudio" ] \
     || bad="$bad explicit=rc$rc[$(tr '\n' '|' < "$fx/calls")]"
   grep -qx "update $fx/.ssh" "$fx/calls" || bad="$bad explicit-noUpdate"
-  # default: the host's own key file name (file.get.name, or id.file.get on an older oosh)
-  for old in "" ssh.old; do
-    rm -f "$fx/.ssh/public_keys/"*; : > "$fx/calls"
-    if [ -z "$old" ]; then private.test.ossh.keyPull.run ssh.bar "" "" "public_keys/ssh.bar.public_key" mac "" "$fx/.ssh"
-    else private.test.ossh.keyPull.run "" ssh.bar "" "public_keys/ssh.bar.public_key" mac "" "$fx/.ssh"; fi
-    [ -s "$fx/.ssh/public_keys/ssh.bar.public_key" ] || bad="$bad default${old:+-old}=[$(ls "$fx/.ssh/public_keys")]"
-  done
+  # a ' in the name is dropped, as key.push does
+  rm -f "$fx/.ssh/public_keys/"*; : > "$fx/calls"
+  test.ossh.keyPull.run "" "" "public_keys/its.public_key" mac "it's.public_key" "$fx/.ssh"
+  [ -s "$fx/.ssh/public_keys/its.public_key" ] || bad="$bad quote=[$(ls "$fx/.ssh/public_keys" | tr '\n' ' ')]"
+  # a name with a / is refused before the host is asked: nothing outside public_keys/
+  rm -f "$fx/.ssh/public_keys/"*; : > "$fx/calls"
+  test.ossh.keyPull.run "" "" "public_keys/../evil.public_key" mac "../evil.public_key" "$fx/.ssh"; rc=$?
+  [ "$rc" != 0 ] && [ ! -e "$fx/.ssh/evil.public_key" ] && ! grep -q '^update' "$fx/calls" || bad="$bad slash=rc$rc[$(ls "$fx/.ssh" | tr '\n' ' ')]"
+  grep -q '^ssh ' "$fx/calls" && bad="$bad slashAsked"
+  # default: the host's own key name, from a listing of its private_key/
+  rm -f "$fx/.ssh/public_keys/"*; : > "$fx/calls"
+  test.ossh.keyPull.run ssh.bar "" "public_keys/ssh.bar.public_key" mac "" "$fx/.ssh"
+  [ -s "$fx/.ssh/public_keys/ssh.bar.public_key" ] || bad="$bad default=[$(ls "$fx/.ssh/public_keys")]"
+  grep -qE 'ossh (file\.get\.name|id\.file\.get)' "$fx/calls" && bad="$bad askedOosh=[$(grep -E 'ossh (file|id)' "$fx/calls" | head -1)]"
+  # a remote name with a / is no name; neither is a probe answer that is no key type
+  rm -f "$fx/.ssh/public_keys/"*; : > "$fx/calls"
+  test.ossh.keyPull.run "../../x" "../x" "../x.pub" mac "" "$fx/.ssh"; rc=$?
+  [ "$rc" != 0 ] && [ -z "$(find "$fx" -name 'x.public_key' -o -name '*.x.public_key' | head -1)" ] || bad="$bad remoteSlash=rc$rc[$(find "$fx" -name '*x.public_key')]"
   # a host without oosh keys: ~/.ssh/id_ed25519.pub, named after the host
   rm -f "$fx/.ssh/public_keys/"*; : > "$fx/calls"
-  private.test.ossh.keyPull.run "" "" id_ed25519 "id_ed25519.pub" phone "" "$fx/.ssh"
+  test.ossh.keyPull.run "" id_ed25519 "id_ed25519.pub" phone "" "$fx/.ssh"
   [ -s "$fx/.ssh/public_keys/phone.id_ed25519.public_key" ] || bad="$bad std=[$(ls "$fx/.ssh/public_keys")]"
   # nothing on the host: an error, no file, no rebuild
   rm -f "$fx/.ssh/public_keys/"*; : > "$fx/calls"
-  private.test.ossh.keyPull.run "" "" "" "none" mac "" "$fx/.ssh"; rc=$?
+  test.ossh.keyPull.run "" "" "none" mac "" "$fx/.ssh"; rc=$?
   [ "$rc" != 0 ] && [ -z "$(ls "$fx/.ssh/public_keys")" ] && ! grep -q '^update' "$fx/calls" \
     || bad="$bad empty=rc$rc[$(ls "$fx/.ssh/public_keys")]"
-  private.test.ossh.keyPull.run "" "" "" "" >/dev/null 2>&1 && bad="$bad noHost-rc0"
-  ls -R "$fx/.ssh" | grep -q '\.pulled' && bad="$bad pulledLeft"
-  unset -f private.test.ossh.keyPull.run
+  test.ossh.keyPull.run "" "" "" >/dev/null 2>&1 && bad="$bad noHost-rc0"
+  [ -n "$(find "$fx/.ssh" -name '*.pulled')" ] && bad="$bad pulledLeft"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  unset -f test.ossh.keyPull.run
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "key.pull is key.push the other way around" || create.result 1 "key.pull:$bad"
   return $(result)
 }
-test.case $level "T-OSSH-KEY-PULL: ossh key.pull gets a host's public key into public_keys/ and authorizes it" test.ossh.keyPull
+test.case $level "T-OSSH-KEY-PULL: ossh key.pull gets a host's public key into public_keys/ and authorizes it; names stay in public_keys/" test.ossh.keyPull
 expect 0 "key.pull is key.push the other way around" \
   "key.pull pulled ~/.ssh/<name>.pub as .pulled, asked for a method dev renamed, and never authorized it"
+
+# T-OSSH-REMOTE-KEY-FILE-NAME-GET: the host's key name is read, not made
+# private.ossh.remote.key.file.name.get asked the host `ossh file.get.name`
+# (`ossh id.file.get` on an older oosh); with no private_key/ there, that
+# reached private.ossh.set.key.name and `config save ssh.info` ON THE HOST
+# (fresh review 2026-10-16). Both are `ls ~/.ssh/private_key/` minus
+# .private_key, so a POSIX listing gives the same answer, writes nothing and
+# needs no oosh. The listing runs here as the host would run it: sh under
+# env -i with a fixture HOME; any text that is not the listing is an
+# UNEXPECTED line. Only a name that has its public key file counts; the
+# answer is data: a name with a / or a space is no name. ssh, scp, rsync are
+# backstops.
+test.ossh.remoteKeyFileNameGet() {
+  local fx bad="" got before
+  fx=$(test.suite.fixture.make osshremotename)
+  mkdir -p "$fx/host/.ssh/private_key" "$fx/host/.ssh/public_keys" "$fx/bare/.ssh"
+  : > "$fx/host/.ssh/private_key/ssh.bar.private_key"
+  echo "ssh-ed25519 AAAABAR bar@host" > "$fx/host/.ssh/public_keys/ssh.bar.public_key"
+  : > "$fx/host/.ssh/private_key/zz.orphan.private_key"   # no public key file: not the answer
+  before=$(cd "$fx" && find host bare | sort)
+  test.ossh.remoteKeyFileNameGet.run() { # <hostHome|=answer> # the getter against lab, the listing run in sh with HOME=<hostHome>, or answered by <answer> when it starts with = #
+    ( FX_HOST="$1"
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      ossh.exec() { echo "UNEXPECTED ossh.exec $*" >> "$fx/real"; return 1; }
+      private.ossh.ssh() {
+        case "$2" in
+          (*"ossh "*) echo "UNEXPECTED $*" >> "$fx/real"; return 1 ;;
+          (*"/.ssh/private_key/"*)
+            case "$FX_HOST" in (=*) echo "${FX_HOST#=}" ;; (*) env -i HOME="$FX_HOST" PATH="/usr/bin:/bin" sh -c "$2" ;; esac ;;
+          (*) echo "UNEXPECTED $*" >> "$fx/real"; return 1 ;;
+        esac
+      }
+      private.ossh.remote.key.file.name.get lab 2>/dev/null; echo "|$?" )
+  }
+  got=$(test.ossh.remoteKeyFileNameGet.run "$fx/host"); [ "$got" = "ssh.bar
+|0" ] || bad="$bad host=[$(echo "$got" | tr '\n' ' ')]"
+  got=$(test.ossh.remoteKeyFileNameGet.run "$fx/bare"); [ "$got" = "|1" ] || bad="$bad bare=[$(echo "$got" | tr '\n' ' ')]"
+  got=$(test.ossh.remoteKeyFileNameGet.run "=../../x"); [ "$got" = "|1" ] || bad="$bad slash=[$(echo "$got" | tr '\n' ' ')]"
+  got=$(test.ossh.remoteKeyFileNameGet.run "=ERROR> ossh: command not found"); [ "$got" = "|1" ] || bad="$bad space=[$(echo "$got" | tr '\n' ' ')]"
+  unset -f test.ossh.remoteKeyFileNameGet.run
+  [ "$(cd "$fx" && find host bare | sort)" = "$before" ] || bad="$bad wrote=[$(cd "$fx" && find host bare | sort | tr '\n' ' ')]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the host's key name is a listing of its private_key/; nothing written there" || create.result 1 "remote key name:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-REMOTE-KEY-FILE-NAME-GET: the host's key name comes from a listing, not from ossh file.get.name" test.ossh.remoteKeyFileNameGet
+expect 0 "the host's key name is a listing of its private_key/; nothing written there" \
+  "ossh file.get.name ran config save ssh.info on a host without private_key/"
+
+# T-OSSH-KEY-PULL-RESULT: key.pull's rc is key.pull's, its key check user's, its writes checked
+# key.pull ended with the rc of the local rebuild — rc 1 whenever this computer
+# has no private key (T-USER-AUTHORIZED-KEYS-UPDATE-RC), though the key was
+# saved; it checked a key with its own `case ssh-*|ecdsa-*|sk-*`; it wrote with
+# an unchecked `[ -d ] || mkdir -p` and `printf >`, so a file in the way of
+# public_keys/ still ran the rebuild; "no fromHost" had no RESULT. user is
+# sourced FIRST in the subshell: key.pull loads it lazily, and that load would
+# re-source ossh over the stubs. private.ossh.ssh answers FX_KEY;
+# ossh.authorized.keys.update is a stub answering FX_REBUILD; connection.open a
+# stub; ssh, scp, rsync backstops. HOME and CURRENT_SSH_DIR are the fixture.
+test.ossh.keyPullResult() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshpullres)
+  mkdir -p "$fx/.ssh/public_keys" "$fx/blocked"
+  : > "$fx/blocked/public_keys"
+  test.ossh.keyPullResult.run() { # <key> <rebuildRc> <args...> # ossh key.pull <args...> in a subshell, the host answering <key>, the rebuild <rebuildRc>; echo the calls, then rc and RESULT #
+    ( FX_KEY="$1" FX_REBUILD="$2"; shift 2
+      HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"
+      # user first, with HOME already the fixture: key.pull loads it to read
+      # the key, and user sources ossh at its end — loaded after the stubs
+      # below it would put the real ones back (as in T-OSSH-KEY-PULL).
+      private.this.script.load user private.user.authorized.key.get >/dev/null 2>&1
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      ossh.connection.open() { create.result 0 open; }
+      ossh.authorized.keys.update() { echo "update $*" >> "$fx/calls"; create.result "$FX_REBUILD" "rebuild $FX_REBUILD"; return $(result); }
+      private.ossh.ssh() { case "$*" in (*"cat ~/.ssh/public_keys/'k.public_key'"*) echo "$FX_KEY" ;; (*) return 1 ;; esac; }
+      create.result 0 stale
+      ossh.key.pull "$@" </dev/null >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" >> "$fx/calls" )
+    cat "$fx/calls"; rm -f "$fx/calls"
+  }
+  out=$(test.ossh.keyPullResult.run "ssh-ed25519 AAAAPULL a@b" 1 lab k.public_key)
+  echo "$out" | grep -q '^rc=0 .*not authorized yet' || bad="$bad noSsh=[$(echo "$out" | tail -1)]"
+  [ "$(cat "$fx/.ssh/public_keys/k.public_key" 2>/dev/null)" = "ssh-ed25519 AAAAPULL a@b" ] || bad="$bad notSaved"
+  out=$(test.ossh.keyPullResult.run "ssh-ed25519 AAAAPULL a@b" 0 lab k.public_key)
+  echo "$out" | grep -q '^rc=0 .*and authorized$' || bad="$bad authorized=[$(echo "$out" | tail -1)]"
+  out=$(test.ossh.keyPullResult.run 'from="10.0.0.1" ssh-ed25519 AAAAOPT a@b' 0 lab k.public_key)
+  echo "$out" | grep -q '^rc=0 ' || bad="$bad withOptions=[$(echo "$out" | tail -1)]"
+  out=$(test.ossh.keyPullResult.run "ERROR> ossh: command not found" 0 lab k.public_key)
+  echo "$out" | grep -q '^rc=1 .*no public key' || bad="$bad notAKey=[$(echo "$out" | tail -1)]"
+  echo "$out" | grep -q '^update' && bad="$bad notAKeyRebuilt"
+  out=$(test.ossh.keyPullResult.run "ssh-ed25519 AAAAPULL a@b" 0 lab k.public_key "$fx/blocked")
+  echo "$out" | grep -q '^rc=1 .*in the way' || bad="$bad blocked=[$(echo "$out" | tail -1)]"
+  echo "$out" | grep -q '^update' && bad="$bad blockedRebuilt"
+  out=$(test.ossh.keyPullResult.run "" 0)
+  echo "$out" | grep -q '^rc=1 RESULT=no fromHost was specified$' || bad="$bad noHost=[$(echo "$out" | tail -1)]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  unset -f test.ossh.keyPullResult.run
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "key.pull reports its own result; a key is what user reads as one; its writes are checked" || create.result 1 "key.pull result:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-KEY-PULL-RESULT: key.pull's rc is its own, its key check user's, its writes checked" test.ossh.keyPullResult
+expect 0 "key.pull reports its own result; a key is what user reads as one; its writes are checked" \
+  "key.pull returned the rebuild's rc 1 though the key was saved; a file in the way still ran the rebuild"
 
 # T-OSSH-CONTROL-PATH-SHORT: the ControlMaster socket path fits a Unix socket
 # ssh binds the master at <ControlPath>.<16 random chars> first; on macOS a
@@ -1813,25 +1998,32 @@ expect 0 "key.pull is key.push the other way around" \
 # every time, and every step of key.push asked the password again — five
 # prompts and "Failed to connect", the key still landed (pol-dev review
 # 2026-10-15 @46:08; reproduced with a 49-character TMPDIR, 2026-10-16).
-# user and os carried a copy of their own; ossh's getter is the one answer.
+# user and os carried a copy of their own; ossh's getter is the one answer:
+# user has none, os takes the getter's. HOME is the fixture in every call —
+# the getter's last choice is ~/.ssh.
 test.ossh.controlPathShort() {
   local fx bad="" long p
   fx=$(test.suite.fixture.make osshcp)
   long="$fx/$(printf 'x%.0s' $(seq 1 60))"; mkdir -p "$long"
-  private.test.ossh.controlPath.len() { local s="${1//%C/$(printf '%040d' 0)}"; echo $(( ${#s} + 17 )); }
+  test.ossh.controlPathShort.len() { # <controlPath> # echo the length of the socket path ssh binds first: %C as its 40 characters, plus ".<16 random>" #
+    local s="${1//%C/$(printf '%040d' 0)}"
+    echo $(( ${#s} + 17 ))
+  }
   # a long TMPDIR (macOS-like): not used, the path still fits
-  p=$(TMPDIR="$long" private.ossh.control.path.get)
+  p=$(HOME="$fx" TMPDIR="$long" private.ossh.control.path.get)
   case "$p" in "$long"*) bad="$bad longUsed=[$p]" ;; esac
-  [ "$(private.test.ossh.controlPath.len "$p")" -lt 104 ] || bad="$bad longTooLong=[$p]"
+  [ "$(test.ossh.controlPathShort.len "$p")" -lt 104 ] || bad="$bad longTooLong=[$p]"
   # a short, writable TMPDIR (Termux has no /tmp): used
-  p=$(TMPDIR="$fx" private.ossh.control.path.get)
+  p=$(HOME="$fx" TMPDIR="$fx" private.ossh.control.path.get)
   [ "$p" = "$fx/ossh-%C" ] || bad="$bad short=[$p]"
   # a TMPDIR that is not there: /tmp
-  p=$(TMPDIR="$fx/none" private.ossh.control.path.get)
+  p=$(HOME="$fx" TMPDIR="$fx/none" private.ossh.control.path.get)
   [ "$p" = "/tmp/ossh-%C" ] || bad="$bad missing=[$p]"
-  # one definition: user carries no ControlPath of its own
-  grep -nE '^[^#]*OSSH_CONTROL_PATH:=' "$OOSH_DIR/user" | grep -q . && bad="$bad userCopy"
-  unset -f private.test.ossh.controlPath.len
+  # one definition: user carries no ControlPath of its own, os takes ossh's getter
+  grep -qE '^[^#]*OSSH_CONTROL_PATH:=' "$OOSH_DIR/user" && bad="$bad userCopy"
+  grep -E '^[^#]*OSSH_CONTROL_PATH:=' "$OOSH_DIR/os" | grep -qv 'private\.ossh\.control\.path\.get' && bad="$bad osCopy"
+  grep -qE '^[^#]*OSSH_CONTROL_PATH:=.*private\.ossh\.control\.path\.get' "$OOSH_DIR/os" || bad="$bad osNotOssh"
+  unset -f test.ossh.controlPathShort.len
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "the ControlPath fits a Unix socket" || create.result 1 "control path:$bad"
   return $(result)
@@ -1840,17 +2032,47 @@ test.case $level "T-OSSH-CONTROL-PATH-SHORT: the ControlMaster socket path fits 
 expect 0 "the ControlPath fits a Unix socket" \
   "macOS TMPDIR made the socket path 112 characters: connection.open failed, key.push asked five times"
 
-# T-OSSH-CONNECTION-OPEN-FAIL: a failed connection says why and stops key.push
+# T-OSSH-CONTROL-PATH-IN-START: OSSH_CONTROL_PATH is a default in ossh.start, not a file-scope line
+# ossh was definitions plus one `: ${OSSH_CONTROL_PATH:=…}` at file scope. It
+# is set in ossh.start now, with the other defaults; every script that sources
+# ossh runs ossh.start, so a fresh child bash that sources it still has the
+# path, and a path already set (os exports one) stays. The child bash has
+# HOME and CURRENT_SSH_DIR in the fixture: ossh.start reads the home's config
+# and the getter's last choice is ~/.ssh.
+test.ossh.controlPathInStart() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make osshcpstart)
+  grep -qE '^: \$\{OSSH_CONTROL_PATH' "$OOSH_DIR/ossh" && bad="$bad fileScope"
+  type ossh.start | grep -q 'OSSH_CONTROL_PATH:=' || bad="$bad notInStart"
+  got=$(env -u OSSH_CONTROL_PATH TMPDIR="$fx" HOME="$fx" CURRENT_SSH_DIR="$fx/.ssh" bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1; echo "$OSSH_CONTROL_PATH"' </dev/null 2>/dev/null)
+  [ "$got" = "$fx/ossh-%C" ] || bad="$bad sourced=[$got]"
+  got=$(OSSH_CONTROL_PATH="$fx/given-%C" HOME="$fx" CURRENT_SSH_DIR="$fx/.ssh" bash -c 'source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1; echo "$OSSH_CONTROL_PATH"' </dev/null 2>/dev/null)
+  [ "$got" = "$fx/given-%C" ] || bad="$bad given=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh.start sets the ControlPath default; a given one stays" || create.result 1 "control path start:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONTROL-PATH-IN-START: the ControlPath default is set in ossh.start" test.ossh.controlPathInStart
+expect 0 "ossh.start sets the ControlPath default; a given one stays" \
+  "a file-scope statement in ossh"
+
+# T-OSSH-CONNECTION-OPEN-FAIL: a failed connection says why and stops key.push and key.pull
 # connection.open sent ssh's stderr to /dev/null and retried with -4 whatever
 # the reason: a wrong password asked again, "Failed to connect" said nothing,
 # and key.push went on — every later step a new password prompt. Now ssh's
 # reason is in RESULT, -4 only follows a network error, and key.push and
-# key.pull stop. `ssh` and private.ossh.ssh are stubs; nothing leaves the host.
+# key.pull stop. `ssh` and private.ossh.ssh are stubs; scp, rsync and config
+# are backstops (REAL lines). HOME and CURRENT_SSH_DIR are the fixture, with a
+# key in private_key/: key.push names its key from there, and an empty one
+# would make it save a new key name — `config save ssh.info`, the shared tier.
 test.ossh.connectionOpenFail() {
   local fx bad="" out
   fx=$(test.suite.fixture.make osshopen)
-  private.test.ossh.open.run() { # <reason> <what> # run <what> with ssh failing for <reason>; echo the calls, rc and RESULT
-    ( FX_REASON="$1"; shift; TMPDIR="$fx"
+  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key" "$fx/tmp"
+  echo "ssh-ed25519 AAAAOPEN me@runner" > "$fx/.ssh/public_keys/ssh.runner.public_key"
+  echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
+  test.ossh.connectionOpenFail.run() { # <reason> <what...> # run <what...> in a subshell with ssh failing for <reason> (auth|net); echo the calls, then rc and RESULT #
+    ( FX_REASON="$1"; shift; TMPDIR="$fx/tmp"; HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"
       ssh() {
         echo "ssh $*" >> "$fx/calls"
         case "$*" in (*"-O check"*) return 255 ;; esac
@@ -1860,28 +2082,182 @@ test.ossh.connectionOpenFail() {
           (net:*) echo "Connection to localhost closed by remote host: Broken pipe" >&2; return 255 ;;
         esac
       }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      config() { echo "REAL config $*" >> "$fx/real"; return 1; }
       private.ossh.ssh() { echo "private.ossh.ssh $*" >> "$fx/calls"; }
       ossh.exec() { echo "ossh.exec $*" >> "$fx/calls"; }
+      ossh.authorized.keys.update() { echo "update $*" >> "$fx/calls"; }
       "$@" >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" >> "$fx/calls" )
     cat "$fx/calls"; rm -f "$fx/calls"
   }
-  out=$(private.test.ossh.open.run auth ossh.connection.open lab)
+  out=$(test.ossh.connectionOpenFail.run auth ossh.connection.open lab)
   echo "$out" | grep -q 'rc=1 .*Permission denied' || bad="$bad authReason=[$(echo "$out" | tail -1)]"
   echo "$out" | grep -q 'ssh -4 ' && bad="$bad authRetried"
-  out=$(private.test.ossh.open.run net ossh.connection.open lab)
+  out=$(test.ossh.connectionOpenFail.run net ossh.connection.open lab)
   echo "$out" | grep -q 'ssh -4 ' && echo "$out" | grep -q '^rc=0' || bad="$bad netNoRetry=[$(echo "$out" | tr '\n' '|')]"
-  out=$(private.test.ossh.open.run auth ossh.key.push lab)
+  out=$(test.ossh.connectionOpenFail.run auth ossh.key.push lab)
   echo "$out" | grep -qE '^(private\.ossh\.ssh|ossh\.exec) ' && bad="$bad pushWentOn=[$(echo "$out" | tr '\n' '|')]"
   echo "$out" | grep -q '^rc=1' || bad="$bad pushRc=[$(echo "$out" | tail -1)]"
-  ls "$fx" | grep -q . && bad="$bad tmpLeft=[$(ls "$fx" | tr '\n' ' ')]"
-  unset -f private.test.ossh.open.run
+  out=$(test.ossh.connectionOpenFail.run auth ossh.key.pull lab)
+  echo "$out" | grep -qE '^(private\.ossh\.ssh|ossh\.exec|update) ' && bad="$bad pullWentOn=[$(echo "$out" | tr '\n' '|')]"
+  echo "$out" | grep -q '^rc=1' || bad="$bad pullRc=[$(echo "$out" | tail -1)]"
+  [ -n "$(ls "$fx/tmp")" ] && bad="$bad tmpLeft=[$(ls "$fx/tmp" | tr '\n' ' ')]"
+  [ "$(ls "$fx/.ssh/public_keys")" = "ssh.runner.public_key" ] || bad="$bad sshDirChanged=[$(ls "$fx/.ssh/public_keys" | tr '\n' ' ')]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  unset -f test.ossh.connectionOpenFail.run
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "a failed connection says why and stops" || create.result 1 "connection.open:$bad"
   return $(result)
 }
-test.case $level "T-OSSH-CONNECTION-OPEN-FAIL: a failed connection says why, retries -4 only on a network error, and stops key.push" test.ossh.connectionOpenFail
+test.case $level "T-OSSH-CONNECTION-OPEN-FAIL: a failed connection says why, retries -4 only on a network error, and stops key.push and key.pull" test.ossh.connectionOpenFail
 expect 0 "a failed connection says why and stops" \
   "ssh's reason went to /dev/null and key.push asked the password at every step"
+
+# T-OSSH-CONNECTION-ERROR-GET: ssh's reason is one getter, not a grep | tail per attempt
+# connection.open read the reason after each of its two attempts with the
+# same `grep -v '^Warning: Permanently added' | tail -1`. The getter is that
+# once: the last line of ssh's stderr that is no accept-new notice, nothing for
+# an empty or missing file. Fixture files only — nothing runs.
+test.ossh.connectionErrorGet() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make osshconnerr)
+  printf '%s\n' "Warning: Permanently added 'lab' (ED25519) to the list of known hosts." \
+    "root@lab: Permission denied (publickey,password)." \
+    "Warning: Permanently added '10.0.0.2' (ED25519) to the list of known hosts." > "$fx/err"
+  got=$(private.ossh.connection.error.get "$fx/err")
+  [ "$got" = "root@lab: Permission denied (publickey,password)." ] || bad="$bad last=[$got]"
+  printf '%s\n' "Warning: Permanently added 'lab' (ED25519) to the list of known hosts." > "$fx/onlyWarning"
+  got=$(private.ossh.connection.error.get "$fx/onlyWarning"); [ -z "$got" ] || bad="$bad onlyWarning=[$got]"
+  : > "$fx/empty"
+  got=$(private.ossh.connection.error.get "$fx/empty"); [ -z "$got" ] || bad="$bad empty=[$got]"
+  got=$(private.ossh.connection.error.get "$fx/none"); [ -z "$got" ] || bad="$bad missing=[$got]"
+  grep -q "grep -v '^Warning: Permanently added'" "$OOSH_DIR/ossh" && bad="$bad copyLeft"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ssh's reason is the last line that is no accept-new notice" || create.result 1 "error.get:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONNECTION-ERROR-GET: private.ossh.connection.error.get reads ssh's reason once" test.ossh.connectionErrorGet
+expect 0 "ssh's reason is the last line that is no accept-new notice" \
+  "connection.open carried the same grep | tail twice"
+
+# T-OSSH-CONNECTION-ERROR-NETWORK-IS: which reasons get the -4 retry, in one place
+# The list was inline in connection.open. A refused login, a host key, a too
+# long socket path or too many keys tried is no network error — -4 would only
+# ask the password again (T-OSSH-CONNECTION-OPEN-FAIL); a broken pipe, a reset
+# or no reason at all is one. A predicate on strings — nothing runs.
+test.ossh.connectionErrorNetworkIs() {
+  local bad="" reason
+  for reason in "Connection to lab closed by remote host: Broken pipe" "Connection reset by peer" \
+      "ssh: connect to host lab port 22: No route to host" ""; do
+    private.ossh.connection.error.network.is "$reason" || bad="$bad notNetwork=[$reason]"
+  done
+  for reason in "root@lab: Permission denied (publickey,password)." "Host key verification failed." \
+      "unix_listener: path \"/var/folders/x/ossh-abc\" too long for Unix domain socket" \
+      "Received disconnect from lab: Too many authentication failures"; do
+    private.ossh.connection.error.network.is "$reason" && bad="$bad network=[$reason]"
+  done
+  [ -z "$bad" ] && create.result 0 "only a network error gets the -4 retry" || create.result 1 "network.is:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONNECTION-ERROR-NETWORK-IS: only a network error is retried with -4" test.ossh.connectionErrorNetworkIs
+expect 0 "only a network error gets the -4 retry" \
+  "the reason list lived inline in connection.open"
+
+# T-OSSH-MASTER-START: the ControlMaster ssh call, once
+# connection.open spelled the same ssh -o ControlMaster=yes … -N -f twice, the
+# second time with -4. `ssh` is a stub in a subshell that logs its arguments and
+# writes a reason to stderr; nothing real is reached (scp, rsync backstops).
+test.ossh.masterStart() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshmaster)
+  out=$( FX_RC=0
+    ssh() { echo "ssh $*" >> "$fx/calls"; echo "Broken pipe" >&2; return $FX_RC; }
+    scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+    private.ossh.master.start lab "$fx/err"; echo "rc=$? RESULT=$RESULT"
+    private.ossh.master.start lab "$fx/err" ipv4; echo "rc=$? RESULT=$RESULT"
+    FX_RC=255; private.ossh.master.start lab "$fx/err"; echo "rc=$? RESULT=$RESULT"
+    private.ossh.master.start; echo "rc=$? RESULT=$RESULT" )
+  echo "$out" | sed -n 1p | grep -q '^rc=0 ' || bad="$bad okRc=[$(echo "$out" | sed -n 1p)]"
+  echo "$out" | sed -n 2p | grep -q '^rc=0 .*IPv4' || bad="$bad ipv4Rc=[$(echo "$out" | sed -n 2p)]"
+  echo "$out" | sed -n 3p | grep -q '^rc=1 ' || bad="$bad failRc=[$(echo "$out" | sed -n 3p)]"
+  echo "$out" | sed -n 4p | grep -q '^rc=1 .*requires <host>' || bad="$bad noHost=[$(echo "$out" | sed -n 4p)]"
+  [ "$(grep -c '' "$fx/calls" 2>/dev/null)" = 3 ] || bad="$bad calls=[$(tr '\n' '|' < "$fx/calls")]"
+  sed -n 1p "$fx/calls" | grep -q -- '^ssh -o ControlMaster=yes .*ControlPersist=600 .*-N -f lab$' || bad="$bad args"
+  sed -n 2p "$fx/calls" | grep -q -- '^ssh -4 -o ControlMaster=yes' || bad="$bad no-4"
+  [ "$(cat "$fx/err")" = "Broken pipe" ] || bad="$bad stderr=[$(cat "$fx/err")]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "one ssh call starts the master, -4 on request" || create.result 1 "master.start:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-MASTER-START: private.ossh.master.start is the one ControlMaster ssh call" test.ossh.masterStart
+expect 0 "one ssh call starts the master, -4 on request" \
+  "connection.open spelled the master ssh twice"
+
+# T-OSSH-CONNECTION-OPEN-TEMP: connection.open's stderr file lives in the kernel's temp dir
+# It made its file with a raw mktemp and removed it at three exits. Now
+# private.this.temp.dir.get ossh.connection.open makes a private dir and one
+# rm -rf removes it on every way out. Without a host it is rc 1 with a RESULT
+# of its own: callers `|| return $(result)`, and a stale rc 0 let them go on.
+# ssh is a stub; the temp dir getter is wrapped to log its label.
+test.ossh.connectionOpenTemp() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshopentemp)
+  mkdir -p "$fx/tmp"
+  out=$( TMPDIR="$fx/tmp"; HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"
+    ssh() { case "$*" in (*"-O check"*) return 255 ;; esac; echo "root@lab: Permission denied" >&2; return 255; }
+    scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+    # The kernel getter saved under a test name, so the wrapper below can log
+    # the label and call it; both live only in this $( ) subshell — nothing
+    # to unset.
+    eval "test.ossh.connectionOpenTemp.dir.get() # <label> # private.this.temp.dir.get under a test name, for the wrapper below #
+$(declare -f private.this.temp.dir.get | tail -n +2)"
+    private.this.temp.dir.get() { echo "$1" >> "$fx/labels"; test.ossh.connectionOpenTemp.dir.get "$@"; }
+    ossh.connection.open lab >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT"
+    create.result 0 stale; ossh.connection.open >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" )
+  echo "$out" | sed -n 1p | grep -q '^rc=1 .*Permission denied' || bad="$bad reason=[$(echo "$out" | sed -n 1p)]"
+  echo "$out" | sed -n 2p | grep -q '^rc=1 .*Usage' || bad="$bad noHost=[$(echo "$out" | sed -n 2p)]"
+  grep -qx ossh.connection.open "$fx/labels" 2>/dev/null || bad="$bad noKernelTemp"
+  [ -n "$(ls "$fx/tmp")" ] && bad="$bad tmpLeft=[$(ls "$fx/tmp" | tr '\n' ' ')]"
+  grep -n 'mktemp' "$OOSH_DIR/ossh" | grep -v '^[0-9]*:[[:space:]]*#' | grep -q . && bad="$bad rawMktemp"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "connection.open keeps ssh's reason in the kernel's temp dir and removes it" || create.result 1 "open temp:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONNECTION-OPEN-TEMP: connection.open uses private.this.temp.dir.get; no host is rc 1" test.ossh.connectionOpenTemp
+expect 0 "connection.open keeps ssh's reason in the kernel's temp dir and removes it" \
+  "a raw mktemp in ossh; connection.open without a host left a stale rc 0"
+
+# T-OSSH-CONNECTION-CLOSE-NO-HOST: connection.close says its result like connection.open
+# Without a host it logged "Usage: …" and returned a bare 1 — the RESULT was
+# whatever ran before (T-OSSH-CONNECTION-OPEN-TEMP gave connection.open the
+# house form); with a host it ended with info.log's rc and no RESULT. Now
+# create.result 1 + error.log without a host, create.result 0 when ssh -O exit
+# was asked. ssh is a stub in a $( ) subshell that logs its arguments; scp and
+# rsync are backstops.
+test.ossh.connectionCloseNoHost() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshclose)
+  out=$( ssh() { echo "ssh $*" >> "$fx/calls"; return 0; }
+    scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+    create.result 0 stale; ossh.connection.close >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT"
+    create.result 0 stale; ossh.connection.close lab >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" )
+  echo "$out" | sed -n 1p | grep -q '^rc=1 RESULT=Usage: ossh connection.close <host>$' || bad="$bad noHost=[$(echo "$out" | sed -n 1p)]"
+  echo "$out" | sed -n 2p | grep -q '^rc=0 RESULT=Connection to lab closed$' || bad="$bad closed=[$(echo "$out" | sed -n 2p)]"
+  [ "$(grep -c '' "$fx/calls" 2>/dev/null)" = 1 ] && grep -q -- '^ssh -O exit .*lab$' "$fx/calls" || bad="$bad calls=[$(tr '\n' '|' < "$fx/calls" 2>/dev/null)]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "connection.close says its result; no host is rc 1 with a usage RESULT" || create.result 1 "close:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONNECTION-CLOSE-NO-HOST: connection.close without a host is create.result 1 + error.log, like connection.open" test.ossh.connectionCloseNoHost
+expect 0 "connection.close says its result; no host is rc 1 with a usage RESULT" \
+  "connection.close returned a bare 1 and left the stale RESULT"
 
 # T-OSSH-INSTALL-PUSHES-KEY: ossh install authorizes the installer's key first
 # The installer's key reached root's authorized_keys only at the very end of
@@ -1889,14 +2265,19 @@ expect 0 "a failed connection says why and stops" \
 # skipped even the copy into public_keys/ (pol-dev review @1:05:34: "ossh
 # install should push the key automatically"). It is now added — only added,
 # no other key touched — right after the connection opens, before any early
-# exit. private.ossh.ssh, connection.open and finish.local are stubs.
+# exit. private.ossh.ssh, connection.open and finish.local are stubs; so are
+# the steps after the early exit (identity.stage, ogit.branch.get, config, and
+# CONFIG names no file); ssh, scp and rsync are backstops (REAL lines).
 test.ossh.installPushesKey() {
-  local fx bad="" out
+  local fx bad="" out copyLine finishLine
   fx=$(test.suite.fixture.make osshinstkey)
   mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key"
   echo "ssh-ed25519 AAAAINSTALLER me@runner" > "$fx/.ssh/public_keys/ssh.runner.public_key"
   echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
-  ( HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"; sshConfigHost=lab; OSSH_INSTALL_TARGET_USER=""
+  ( HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"; CONFIG="$fx/none.env"; sshConfigHost=lab; OSSH_INSTALL_TARGET_USER=""
+    ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+    scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
     ossh.connection.open() { echo "open $*" >> "$fx/calls"; return 0; }
     private.ossh.ssh() {
       local stdin=""; [ -t 0 ] || stdin=$(cat | head -c 400 | tr '\n' ' ')
@@ -1904,13 +2285,19 @@ test.ossh.installPushesKey() {
       return 0   # every probe answers yes: state 99, the early exit
     }
     ossh.install.finish.local() { echo "finish $*" >> "$fx/calls"; }
-    private.push.init.oosh >/dev/null 2>&1 </dev/null )
+    private.ossh.identity.stage() { echo "identity.stage $*" >> "$fx/calls"; }
+    ogit.branch.get() { echo "ogit.branch.get $*" >> "$fx/calls"; }
+    config() { echo "config $*" >> "$fx/calls"; }
+    private.ossh.oosh.init.push >/dev/null 2>&1 </dev/null )
   out=$(cat "$fx/calls" 2>/dev/null)
   echo "$out" | grep -q "cat > ~/.ssh/public_keys/'ssh.runner.public_key'.*AAAAINSTALLER" || bad="$bad noCopy"
   echo "$out" | grep -qE "^ssh lab sh <<\[.*grep -qxF" || bad="$bad noAppend"
   echo "$out" | grep -q -- "-oBatchMode=yes" || bad="$bad noCheck"
   # all of it before the early exit to finish.local
-  [ "$(echo "$out" | grep -nE "public_keys/'ssh.runner|^finish " | head -1 | cut -d: -f2 | cut -c1-6)" != "finish" ] || bad="$bad afterExit"
+  copyLine=$(echo "$out" | grep -n "public_keys/'ssh.runner" | head -1 | cut -d: -f1)
+  finishLine=$(echo "$out" | grep -n '^finish ' | head -1 | cut -d: -f1)
+  [ -n "$copyLine" ] && [ -n "$finishLine" ] && [ "$copyLine" -lt "$finishLine" ] || bad="$bad afterExit"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "ossh install authorizes the installer's key first" || create.result 1 "install key:$bad [$(echo "$out" | tr '\n' '|' | cut -c1-300)]"
   return $(result)
@@ -1919,25 +2306,472 @@ test.case $level "T-OSSH-INSTALL-PUSHES-KEY: ossh install authorizes the install
 expect 0 "ossh install authorizes the installer's key first" \
   "the installer's key reached root only at the end of a full install; a second install skipped it"
 
+# T-OSSH-REMOTE-PUBLIC-KEY-PUT: one remote copy of a key file, and key.push stops when it fails
+# install.key.authorize and key.push each carried the same remote
+# "mkdir -p ~/.ssh/public_keys && cat > …"; key.push ignored its rc and went on
+# to rebuild the target's authorized_keys without the key. key.push then ended
+# with `ossh.exec … || append | ssh`: no RESULT on success, and a failed
+# fallback was never logged (fresh review 2026-10-16) — now one RESULT per
+# outcome: rebuilt, added, or rc 1 "could not authorize". An empty "" keyName
+# dropped the <sshDir> after it, and the default key was named before the
+# <sshDir> was known (same review). private.ossh.ssh is a stub (FX_COPY
+# decides the copy's rc, FX_APPEND the add-only fallback's); connection.open
+# and ossh.exec are stubs (FX_REBUILD decides the remote rebuild's rc); ssh,
+# scp, rsync are backstops. HOME and CURRENT_SSH_DIR are the fixture, with a
+# key in private_key/ so key.push names its key from there; <fx>/other is a
+# second sshDir with a key of its own.
+test.ossh.remotePublicKeyPut() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshkeyput)
+  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key" "$fx/other/public_keys" "$fx/other/private_key"
+  echo "ssh-ed25519 AAAAPUT me@runner" > "$fx/.ssh/public_keys/ssh.runner.public_key"
+  echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
+  echo "ssh-ed25519 AAAAOTHER me@other" > "$fx/other/public_keys/ssh.other.public_key"
+  echo "private" > "$fx/other/private_key/ssh.other.private_key"
+  test.ossh.remotePublicKeyPut.run() { # <copyRc> <rebuildRc> <appendRc> <what...> # run <what...> in a subshell, the remote copy answering <copyRc>, the remote rebuild <rebuildRc>, the add-only fallback <appendRc>; echo the calls, then rc and RESULT #
+    ( FX_COPY="$1" FX_REBUILD="$2" FX_APPEND="$3"; shift 3; HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      ossh.connection.open() { create.result 0 open; }
+      ossh.exec() { echo "ossh.exec $*" >> "$fx/calls"; return "$FX_REBUILD"; }
+      private.ossh.ssh() {
+        local stdin=""; [ -t 0 ] || stdin=$(cat | tr '\n' ' ')
+        echo "private.ossh.ssh $* <<[$stdin]" >> "$fx/calls"
+        case "$*" in
+          (*"cat > ~/.ssh/public_keys/"*) return "$FX_COPY" ;;
+          ("lab sh") return "$FX_APPEND" ;;
+        esac
+        return 0
+      }
+      "$@" </dev/null >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" >> "$fx/calls" )
+    cat "$fx/calls"; rm -f "$fx/calls"
+  }
+  out=$(test.ossh.remotePublicKeyPut.run 0 0 0 private.ossh.remote.public.key.put lab "$fx/.ssh/public_keys/ssh.runner.public_key" "it's.public_key")
+  echo "$out" | grep -qF "cat > ~/.ssh/public_keys/'its.public_key' <<[ssh-ed25519 AAAAPUT me@runner" || bad="$bad copy=[$(echo "$out" | tr '\n' '|')]"
+  echo "$out" | grep -q '^rc=0 ' || bad="$bad copyRc"
+  out=$(test.ossh.remotePublicKeyPut.run 0 0 0 private.ossh.remote.public.key.put lab "$fx/none" x.public_key)
+  echo "$out" | grep -q '^private.ossh.ssh' && bad="$bad missingCopied"
+  echo "$out" | grep -q '^rc=1 .*no key file' || bad="$bad missingRc=[$(echo "$out" | tail -1)]"
+  out=$(test.ossh.remotePublicKeyPut.run 1 0 0 ossh.key.push lab)
+  echo "$out" | grep -q '^ossh.exec' && bad="$bad pushWentOn=[$(echo "$out" | tr '\n' '|')]"
+  echo "$out" | grep -q '^private.ossh.ssh lab sh ' && bad="$bad pushAppended"
+  echo "$out" | grep -q '^rc=1 .*could not copy' || bad="$bad pushRc=[$(echo "$out" | tail -1)]"
+  # the three outcomes, each with its RESULT
+  out=$(test.ossh.remotePublicKeyPut.run 0 0 0 ossh.key.push lab)
+  echo "$out" | grep -q '^ossh.exec lab ' || bad="$bad pushNoRebuild=[$(echo "$out" | tr '\n' '|')]"
+  echo "$out" | grep -q '^private.ossh.ssh lab sh ' && bad="$bad rebuiltAndAppended"
+  echo "$out" | grep -qx "rc=0 RESULT=ssh.runner.public_key authorized on lab (rebuild)" || bad="$bad rebuilt=[$(echo "$out" | tail -1)]"
+  out=$(test.ossh.remotePublicKeyPut.run 0 1 0 ossh.key.push lab)
+  echo "$out" | grep -qx "rc=0 RESULT=ssh.runner.public_key added to lab's authorized_keys" || bad="$bad added=[$(echo "$out" | tail -1)]"
+  out=$(test.ossh.remotePublicKeyPut.run 0 1 1 ossh.key.push lab)
+  echo "$out" | grep -qx "rc=1 RESULT=could not authorize ssh.runner.public_key on lab" || bad="$bad notAuthorized=[$(echo "$out" | tail -1)]"
+  # an empty "" keyName keeps its place: the key of the <sshDir> after it
+  out=$(test.ossh.remotePublicKeyPut.run 0 0 0 ossh.key.push lab "" "$fx/other")
+  echo "$out" | grep -qF "cat > ~/.ssh/public_keys/'ssh.other.public_key' <<[ssh-ed25519 AAAAOTHER me@other" || bad="$bad sshDirLost=[$(echo "$out" | head -1)]"
+  [ "$(grep -c 'mkdir -p ~/.ssh/public_keys && chmod 700 ~/.ssh && cat >' "$OOSH_DIR/ossh")" = 1 ] || bad="$bad copies=$(grep -c 'mkdir -p ~/.ssh/public_keys && chmod 700 ~/.ssh && cat >' "$OOSH_DIR/ossh")"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  unset -f test.ossh.remotePublicKeyPut.run
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "one remote key copy; key.push stops when it fails" || create.result 1 "key put:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-REMOTE-PUBLIC-KEY-PUT: private.ossh.remote.public.key.put copies a key file; key.push stops when it fails, says its result, keeps <sshDir> after an empty keyName" test.ossh.remotePublicKeyPut
+expect 0 "one remote key copy; key.push stops when it fails" \
+  "key.push ignored the copy's rc and rebuilt the target's authorized_keys without the key"
+
+# T-OSSH-REMOTE-PUBLIC-KEY-PUT-MODES: the remote ~/.ssh is 700 and the key file 600, whatever the remote umask
+# The remote "mkdir -p ~/.ssh/public_keys && cat > …" ran under the target's
+# umask: with pam_umask 002 a new ~/.ssh was 775, and sshd's StrictModes then
+# ignores every key in it — the push "worked" and the login still asked the
+# password (fresh review 2026-10-16). The remote text runs here as the target
+# would run it: sh under env -i, umask 002, a fixture HOME — once without a
+# ~/.ssh, once with a 775 one. Only that one text is run: any other command
+# private.ossh.ssh gets is an UNEXPECTED line. ssh, scp, rsync are backstops.
+test.ossh.remotePublicKeyPutModes() {
+  local fx bad="" home mode
+  fx=$(test.suite.fixture.make osshkeyputmode)
+  echo "ssh-ed25519 AAAAMODE me@runner" > "$fx/key.public_key"
+  mkdir -p "$fx/old/.ssh"; chmod 775 "$fx/old/.ssh"; mkdir -p "$fx/new"
+  test.ossh.remotePublicKeyPutModes.mode() { # <path> # echo the octal mode of <path> (GNU or BSD stat) #
+    stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+  }
+  for home in new old; do
+    ( FX_HOME="$fx/$home"
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      private.ossh.ssh() {
+        case "$2" in
+          (*"public_keys/'m.public_key'") ( umask 002; env -i HOME="$FX_HOME" PATH="/usr/bin:/bin" sh -c "$2" ) ;;
+          (*) echo "UNEXPECTED $*" >> "$fx/real"; return 1 ;;
+        esac
+      }
+      private.ossh.remote.public.key.put lab "$fx/key.public_key" m.public_key >/dev/null 2>&1 )
+    [ "$(cat "$fx/$home/.ssh/public_keys/m.public_key" 2>/dev/null)" = "ssh-ed25519 AAAAMODE me@runner" ] || bad="$bad $home:noKey"
+    mode=$(test.ossh.remotePublicKeyPutModes.mode "$fx/$home/.ssh"); [ "$mode" = 700 ] || bad="$bad $home:ssh=$mode"
+    mode=$(test.ossh.remotePublicKeyPutModes.mode "$fx/$home/.ssh/public_keys/m.public_key"); [ "$mode" = 600 ] || bad="$bad $home:key=$mode"
+  done
+  mode=$(test.ossh.remotePublicKeyPutModes.mode "$fx/new/.ssh/public_keys"); [ "$mode" = 700 ] || bad="$bad new:public_keys=$mode"
+  unset -f test.ossh.remotePublicKeyPutModes.mode
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the remote ~/.ssh is 700 and the key 600 under any umask" || create.result 1 "put modes:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-REMOTE-PUBLIC-KEY-PUT-MODES: the remote ~/.ssh is 700 and the key file 600 under umask 002" test.ossh.remotePublicKeyPutModes
+expect 0 "the remote ~/.ssh is 700 and the key 600 under any umask" \
+  "pam_umask 002 made a new ~/.ssh 775: sshd's StrictModes ignored the pushed key"
+
+# T-OSSH-INSTALL-KEY-FALLBACK: a runner without oosh keys gives the key of its sshDir
+# install.key.authorize looked for ~/.ssh/id_*.pub with $HOME hardcoded (a
+# CURRENT_SSH_DIR was ignored), repeated private.detect.ssh.key's list, and
+# named the file $(whoami).<type>.public_key — two users of one runner, or a
+# runner and a jump host, collided. Now the sshDir is private.get.sshDir's, the
+# key private.detect.ssh.key's, the user private.this.user.name.get's, and the
+# name <user>.<this computer>.<type>.public_key (key.pull: <host>.<type>).
+# private.ossh.ssh is a stub; whoami, ssh, scp, rsync are backstops.
+test.ossh.installKeyFallback() {
+  local fx bad="" out want
+  fx=$(test.suite.fixture.make osshinstfb)
+  mkdir -p "$fx/.ssh" "$fx/other"
+  echo "decoy" > "$fx/.ssh/id_ed25519"; echo "ssh-ed25519 AAAADECOY decoy" > "$fx/.ssh/id_ed25519.pub"
+  echo "private" > "$fx/other/id_ecdsa"; echo "ecdsa-sha2-nistp256 AAAAOTHER me@runner" > "$fx/other/id_ecdsa.pub"
+  want="$(private.this.user.name.get).$(private.ossh.host.fqdn.get).id_ecdsa.public_key"
+  ( HOME="$fx"; CURRENT_SSH_DIR="$fx/other"
+    ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+    scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+    whoami() { echo "REAL whoami" >> "$fx/real"; echo nobody; }
+    private.ossh.ssh() { local stdin=""; [ -t 0 ] || stdin=$(cat | head -c 200 | tr '\n' ' '); echo "ssh $* <<[$stdin]" >> "$fx/calls"; return 0; }
+    private.ossh.install.key.authorize lab "$fx/other/public_keys/none.public_key" none.public_key </dev/null >/dev/null 2>&1
+    echo "rc=$? RESULT=$RESULT" >> "$fx/calls" )
+  out=$(cat "$fx/calls" 2>/dev/null)
+  echo "$out" | grep -qF "cat > ~/.ssh/public_keys/'$want' <<[ecdsa-sha2-nistp256 AAAAOTHER" || bad="$bad copy=[$(echo "$out" | head -1)]"
+  echo "$out" | grep -q AAAADECOY && bad="$bad homeSshUsed"
+  echo "$out" | grep -q "^rc=0 .*$want" || bad="$bad rc=[$(echo "$out" | tail -1)]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the fallback key is the sshDir's, named <user>.<computer>.<type>.public_key" || create.result 1 "fallback:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-INSTALL-KEY-FALLBACK: install.key.authorize falls back to the sshDir's key, named like key.pull names one" test.ossh.installKeyFallback
+expect 0 "the fallback key is the sshDir's, named <user>.<computer>.<type>.public_key" \
+  "the fallback read \$HOME/.ssh and named the key \$(whoami).<type>.public_key"
+
+# T-OSSH-PUSH-INIT-ONE-ERROR: a failed connection is logged once, by connection.open
+# private.ossh.oosh.init.push added "Failed to open SSH connection to …" after
+# connection.open had logged ssh's reason, and returned 1 instead of the
+# RESULT's rc. connection.open is a stub that fails like the real one;
+# error.log counts; private.ossh.ssh, ssh, scp, rsync are backstops.
+test.ossh.pushInitOneError() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshinitone)
+  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key"
+  echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
+  ( HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"; sshConfigHost=lab
+    ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+    scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+    private.ossh.ssh() { echo "REAL private.ossh.ssh $*" >> "$fx/real"; return 255; }
+    error.log() { echo "error $*" >> "$fx/calls"; }
+    ossh.connection.open() { create.result 1 "Failed to connect to $1: Permission denied"; error.log "$RESULT"; return $(result); }
+    private.ossh.oosh.init.push </dev/null >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" >> "$fx/calls" )
+  out=$(cat "$fx/calls" 2>/dev/null)
+  [ "$(echo "$out" | grep -c '^error ')" = 1 ] || bad="$bad errors=[$(echo "$out" | grep '^error ' | tr '\n' '|')]"
+  echo "$out" | grep -q '^rc=1 RESULT=Failed to connect to lab: Permission denied$' || bad="$bad rc=[$(echo "$out" | tail -1)]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh install logs a failed connection once" || create.result 1 "init one error:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-PUSH-INIT-ONE-ERROR: ossh install logs a failed connection once and keeps its RESULT" test.ossh.pushInitOneError
+expect 0 "ossh install logs a failed connection once" \
+  "push.init.oosh logged its own error after connection.open's"
+
+# T-OSSH-OOSH-INIT-PUSH-RESULT: ossh install's remote half says its result on every path
+# private.ossh.oosh.init.push (was private.push.init.oosh) returned a bare 1
+# when init/oosh could not be copied or the remote installer failed, and
+# `return $?` after finish.local — the RESULT was whatever ran before (fresh
+# review 2026-10-16). Now create.result on every path, error.log on each
+# failure. Every remote step is a stub answering by its text (FX_STATE the
+# state-99 probe, FX_DIR the ~/oosh probe, FX_COPY the copy of init/oosh,
+# FX_REMOTE the remote installer); connection.open, install.key.authorize,
+# identity.stage, ogit.branch.get, config and finish.local (FX_FINISH) are
+# stubs, CONFIG an empty fixture file; ssh, scp, rsync are backstops.
+test.ossh.ooshInitPushResult() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshinitres)
+  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key"
+  echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
+  : > "$fx/user.env"
+  test.ossh.ooshInitPushResult.run() { # <state> <dir> <copy> <remote> <finish> # private.ossh.oosh.init.push against lab, each remote step answering its rc; echo the calls, then rc and RESULT #
+    ( FX_STATE="$1" FX_DIR="$2" FX_COPY="$3" FX_REMOTE="$4" FX_FINISH="$5"
+      HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"; CONFIG="$fx/user.env"; sshConfigHost=lab; OSSH_INSTALL_TARGET_USER=""
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      error.log() { echo "error $*" >> "$fx/calls"; }
+      ossh.connection.open() { create.result 0 open; }
+      private.ossh.install.key.authorize() { create.result 0 authorized; }
+      private.ossh.identity.stage() { :; }
+      ogit.branch.get() { echo dev; }
+      config() { :; }
+      ossh.install.finish.local() { echo "finish $*" >> "$fx/calls"; return "$FX_FINISH"; }
+      private.ossh.ssh() {
+        [ -t 0 ] || cat >/dev/null
+        case "$*" in
+          (*"current.state.machine.env"*) return "$FX_STATE" ;;
+          (*"[ -d ~/oosh ]"*) return "$FX_DIR" ;;
+          (*"cat > ~/oosh"*) echo "copy" >> "$fx/calls"; return "$FX_COPY" ;;
+          (*"./oosh mode root"*) echo "installer" >> "$fx/calls"; return "$FX_REMOTE" ;;
+        esac
+        echo "UNEXPECTED private.ossh.ssh $*" >> "$fx/real"; return 1
+      }
+      create.result 0 stale
+      private.ossh.oosh.init.push </dev/null >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" >> "$fx/calls" )
+    cat "$fx/calls"; rm -f "$fx/calls"
+  }
+  out=$(test.ossh.ooshInitPushResult.run 1 1 1 0 0)
+  echo "$out" | grep -qx 'rc=1 RESULT=could not transfer init/oosh to lab' || bad="$bad copy=[$(echo "$out" | tail -1)]"
+  [ "$(echo "$out" | grep -c '^error ')" = 1 ] || bad="$bad copyErrors=[$(echo "$out" | grep -c '^error ')]"
+  echo "$out" | grep -qE '^(installer|finish)' && bad="$bad copyWentOn"
+  out=$(test.ossh.ooshInitPushResult.run 1 1 0 3 0)
+  echo "$out" | grep -qx 'rc=1 RESULT=the oosh installer on lab failed (rc 3)' || bad="$bad remote=[$(echo "$out" | tail -1)]"
+  [ "$(echo "$out" | grep -c '^error ')" = 1 ] || bad="$bad remoteErrors=[$(echo "$out" | grep -c '^error ')]"
+  echo "$out" | grep -q '^finish' && bad="$bad remoteFinished"
+  out=$(test.ossh.ooshInitPushResult.run 1 1 0 0 0)
+  echo "$out" | grep -q '^finish lab' && echo "$out" | grep -qx 'rc=0 RESULT=oosh installed on lab and finished here' || bad="$bad installed=[$(echo "$out" | tr '\n' '|')]"
+  out=$(test.ossh.ooshInitPushResult.run 1 1 0 0 1)
+  echo "$out" | grep -qx 'rc=1 RESULT=oosh installed on lab, but ossh.install.finish.local failed' || bad="$bad finishFails=[$(echo "$out" | tail -1)]"
+  out=$(test.ossh.ooshInitPushResult.run 0 1 1 1 0)
+  echo "$out" | grep -qE '^(copy|installer)' && bad="$bad state99Installed"
+  echo "$out" | grep -qx 'rc=0 RESULT=oosh already on lab (state \[99\]) and finished here' || bad="$bad state99=[$(echo "$out" | tail -1)]"
+  out=$(test.ossh.ooshInitPushResult.run 1 0 1 1 0)
+  echo "$out" | grep -qx 'rc=0 RESULT=oosh already on lab (~/oosh exists) and finished here' || bad="$bad dir=[$(echo "$out" | tail -1)]"
+  grep -q '^private\.ossh\.oosh\.init\.push()     # ' "$OOSH_DIR/ossh" || bad="$bad header"
+  unset -f test.ossh.ooshInitPushResult.run
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh install's remote half says its result on every path" || create.result 1 "init push:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-OOSH-INIT-PUSH-RESULT: private.ossh.oosh.init.push has a RESULT and an error.log on every path" test.ossh.ooshInitPushResult
+expect 0 "ossh install's remote half says its result on every path" \
+  "push.init.oosh returned a bare 1 and \$? after finish.local, with a stale RESULT"
+
+# T-OSSH-PUSH-PULL-RESULT: config.push, dir.push, dir.pull and id.push say their result
+# The four verb-first helpers (was private.ossh.push.config, push.dir,
+# pull.dir, push.id) ended with a bare `return 1` on a missing argument and
+# with the rc of their last copy, no RESULT (fresh review 2026-10-16). Now
+# rc 1 + RESULT + error.log for a missing argument or a failed copy, rc 0 +
+# RESULT when it is done. connection.open, private.ossh.rsync (FX_COPY),
+# private.ossh.rsync.pull (FX_COPY), private.ossh.get.config and
+# private.ossh.ssh are stubs; HOME, CURRENT_SSH_DIR and CONFIG_PATH are the
+# fixture; ssh, scp, rsync are backstops.
+test.ossh.pushPullResult() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make osshpushpull)
+  mkdir -p "$fx/.ssh/ids/ssh.me" "$fx/config"
+  test.ossh.pushPullResult.run() { # <copyRc> <what...> # run <what...> in a subshell, every copy answering <copyRc>; echo rc|RESULT #
+    ( FX_COPY="$1"; shift; HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"; CONFIG_PATH="$fx/config"
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      ossh.connection.open() { create.result 0 open; }
+      private.ossh.rsync() { return "$FX_COPY"; }
+      private.ossh.rsync.pull() { return "$FX_COPY"; }
+      private.ossh.get.config() { echo "Host $1"; }
+      private.ossh.ssh() { return "$FX_COPY"; }
+      create.result 0 stale
+      "$@" </dev/null >/dev/null 2>&1; echo "$?|$RESULT" )
+  }
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.config.push); [ "$got" = "1|no toHost was specified" ] || bad="$bad configNoHost=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.config.push lab); [ "${got%%|*}" = 0 ] && [ "${got#*|}" != stale ] || bad="$bad configNoName=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.config.push lab lab2); [ "$got" = "0|lab2 appended to lab:~/.ssh/config" ] || bad="$bad config=[$got]"
+  got=$(test.ossh.pushPullResult.run 1 private.ossh.config.push lab lab2); [ "$got" = "1|could not append lab2 to lab:~/.ssh/config" ] || bad="$bad configFails=[$got]"
+  [ -e "$fx/config/tmp.ssh.config.lab2" ] && bad="$bad configTmpLeft"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.dir.push); [ "$got" = "1|no toHost was specified" ] || bad="$bad dirPushNoHost=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.dir.push lab); [ "$got" = "1|no dir was specified" ] || bad="$bad dirPushNoDir=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.dir.push lab "$fx/config"); [ "$got" = "0|$fx/config copied to lab" ] || bad="$bad dirPush=[$got]"
+  got=$(test.ossh.pushPullResult.run 1 private.ossh.dir.push lab "$fx/config"); [ "$got" = "1|could not copy $fx/config to lab" ] || bad="$bad dirPushFails=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.dir.pull); [ "$got" = "1|no fromHost was specified" ] || bad="$bad dirPullNoHost=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.dir.pull lab); [ "$got" = "1|no dir was specified" ] || bad="$bad dirPullNoDir=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.dir.pull lab .ssh); [ "$got" = "0|lab:.ssh copied here" ] || bad="$bad dirPull=[$got]"
+  got=$(test.ossh.pushPullResult.run 1 private.ossh.dir.pull lab .ssh); [ "$got" = "1|could not copy lab:.ssh here" ] || bad="$bad dirPullFails=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.id.push); [ "$got" = "1|no toHost was specified" ] || bad="$bad idNoHost=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.id.push lab); [ "$got" = "1|no id was specified" ] || bad="$bad idNoId=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.id.push lab ssh.none); [ "$got" = "1|no id ssh.none in $fx/.ssh/ids" ] || bad="$bad idMissing=[$got]"
+  got=$(test.ossh.pushPullResult.run 0 private.ossh.id.push lab ssh.me); [ "$got" = "0|ssh.me copied to lab:~/.ssh/ids/" ] || bad="$bad id=[$got]"
+  got=$(test.ossh.pushPullResult.run 1 private.ossh.id.push lab ssh.me); [ "$got" = "1|could not copy ssh.me to lab:~/.ssh/ids/" ] || bad="$bad idFails=[$got]"
+  unset -f test.ossh.pushPullResult.run
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "config.push, dir.push, dir.pull and id.push say their result" || create.result 1 "push/pull:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-PUSH-PULL-RESULT: config.push, dir.push, dir.pull and id.push have a RESULT on every path" test.ossh.pushPullResult
+expect 0 "config.push, dir.push, dir.pull and id.push say their result" \
+  "the verb-first helpers returned a bare 1 and the rc of their last copy, with a stale RESULT"
+
+# T-OSSH-KEY-COMPLETION: key.push and key.pull complete per parameter
+# Both had a whole-method completion, which c2 asks first and which then
+# answers every position with hosts; key.pull's .sshDir copy was never asked.
+# Per parameter: <toHost>/<fromHost>/<sshDir> from ossh.parameter.completion.*,
+# key.push's <keyName> from this computer's public_keys/, key.pull's
+# <remoteKeyName> nothing — a file on the other host (a listing would ask the
+# password).
+# Asked the way Tab asks, through c2's own lookup (c2.completion.discover):
+# key.pull's `ossh.key.pull.completion.keyName() { :; }` answered nothing, c2
+# took the empty answer as "no completion" and went on to the shared
+# ossh.parameter.completion.keyName — this computer's keys after all (fresh
+# review 2026-10-16). key.pull's parameter is <?remoteKeyName> now, a name
+# no shared completion carries. The child bash has HOME, CURRENT_SSH_DIR and
+# CONFIG_PATH (c2 writes its parse state there) in the fixture; one local key
+# file shows which lookup answered; ssh, scp, rsync are backstops.
+test.ossh.keyCompletion() {
+  local fx bad="" fn out
+  fx=$(test.suite.fixture.make osshkeycomp)
+  mkdir -p "$fx/.ssh/public_keys" "$fx/config"
+  echo "ssh-ed25519 AAAALOCAL me@here" > "$fx/.ssh/public_keys/local.marker.public_key"
+  [ -f "$CONFIG_PATH/lineFormat.env" ] && cp "$CONFIG_PATH/lineFormat.env" "$fx/config/"
+  : > "$fx/config/user.env"
+  for fn in ossh.key.push.completion ossh.key.pull.completion ossh.key.pull.completion.sshDir \
+      ossh.key.pull.completion.keyName ossh.key.pull.completion.remoteKeyName ossh.parameter.completion.remoteKeyName \
+      private.ossh.key.push.completion private.ossh.push.key.completion; do
+    [ -n "$(type -t "$fn")" ] && bad="$bad $fn"
+  done
+  for fn in toHost fromHost sshDir keyName; do
+    [ "$(type -t "ossh.parameter.completion.$fn")" = function ] || bad="$bad noShared.$fn"
+  done
+  out=$(HOME="$fx" CURRENT_SSH_DIR="$fx/.ssh" CONFIG_PATH="$fx/config" CONFIG="$fx/config/user.env" FX="$fx" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1
+    set --; source "$OOSH_DIR/ng/c2" >/dev/null 2>&1
+    ssh() { echo "REAL ssh $*" >> "$FX/real"; return 255; }; scp() { echo "REAL scp $*" >> "$FX/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$FX/real"; return 255; }
+    for m in key.push key.pull; do
+      : > "$CONFIG_PATH/completion.result.txt"
+      c2.completion.discover 3 "" ossh "$m" lab "" >/dev/null 2>&1
+      echo "$m=[$(tr "\n" " " < "$CONFIG_PATH/completion.result.txt")]"
+    done' </dev/null 2>/dev/null)
+  echo "$out" | grep -q '^key.push=\[.*local.marker.public_key' || bad="$bad pushKeyName=[$(echo "$out" | grep '^key.push')]"
+  echo "$out" | grep -q '^key.pull=.*local.marker' && bad="$bad pullListsLocal=[$(echo "$out" | grep '^key.pull')]"
+  echo "$out" | grep -q '^key.pull=' || bad="$bad pullNotAsked"
+  grep -q '^ossh\.key\.pull() *# <fromHost> <?remoteKeyName>' "$OOSH_DIR/ossh" || bad="$bad pullHeader"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "key.push and key.pull complete per parameter" || create.result 1 "key completion:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-KEY-COMPLETION: key.push and key.pull complete per parameter through c2; key.pull's remoteKeyName offers nothing" test.ossh.keyCompletion
+expect 0 "key.push and key.pull complete per parameter" \
+  "a whole-method completion answered every parameter with hosts; key.pull's empty keyName completion fell through to the local keys"
+
+# T-OSSH-RENAMES-OBJECT-VERB: the verb-first names are gone, everywhere
+# Since 2026-10-16 private.ossh.key.push, private.ossh.key.pull, ossh.authorized.keys.update (was private.ossh.push.key, private.ossh.pull.key, ossh.update.authorized_keys)
+# — object.verb. No alias: no caller outside the tree. A line that names an
+# old name as history says "(was …)" and is not counted; in code the old names
+# are built from parts. restore/ (an archive), docs/puml (diagrams of the
+# past), sessions/ and .git are left out. The docs also named a command that
+# never existed (was `ossh push.key`, now `ossh key.push`). user's rebuild
+# followed the same day, private.user.authorized.keys.rebuild
+# (was private.user.update.authorized_keys) — user is not sourced here, so
+# its definitions are read from the file. The second wave the same day (user
+# decision after the fresh review): private.ossh.config.push,
+# private.ossh.dir.push, private.ossh.dir.pull, private.ossh.id.push and
+# private.ossh.oosh.init.push
+# (was private.ossh.push.config, private.ossh.push.dir, private.ossh.pull.dir)
+# (was private.ossh.push.id, private.push.init.oosh) — with their private
+# .completion copies.
+test.ossh.renamesObjectVerb() {
+  local bad="" old new pattern hits
+  for old in "private.ossh.""push.key" "private.ossh.""pull.key" "ossh.update.""authorized_keys" \
+      "private.ossh.""push.config" "private.ossh.""push.config.completion" "private.ossh.""push.dir" \
+      "private.ossh.""push.dir.completion" "private.ossh.""pull.dir" "private.ossh.""push.id" "private.push.""init.oosh"; do
+    [ -n "$(type -t "$old")" ] && bad="$bad defined:$old"
+  done
+  for new in private.ossh.key.push private.ossh.key.pull ossh.authorized.keys.update \
+      private.ossh.config.push private.ossh.dir.push private.ossh.dir.pull private.ossh.id.push private.ossh.oosh.init.push; do
+    [ "$(type -t "$new")" = function ] || bad="$bad missing:$new"
+  done
+  grep -q "^private\.user\.""update\.authorized_keys()" "$OOSH_DIR/user" && bad="$bad defined:private.user.""update.authorized_keys"
+  grep -q '^private\.user\.authorized\.keys\.rebuild()' "$OOSH_DIR/user" || bad="$bad missing:private.user.authorized.keys.rebuild"
+  pattern='private\.ossh\.(push\.key|pull\.key)([^.A-Za-z0-9_]|$)|private\.ossh\.(push\.config|push\.dir|pull\.dir|push\.id)([^A-Za-z0-9_]|$)|private\.push\.init\.oosh|ossh[. ]update\.authorized_keys|ossh push\.key|private\.user\.update\.authorized_keys'
+  hits=$(grep -rnE "$pattern" "$OOSH_DIR" --exclude-dir=.git --exclude-dir=restore --exclude-dir=puml --exclude-dir=sessions 2>/dev/null \
+    | grep -vF '(was ' | cut -d: -f1,2 | tr '\n' ' ')
+  [ -n "$hits" ] && bad="$bad left=[$hits]"
+  [ -z "$bad" ] && create.result 0 "the object.verb names everywhere" || create.result 1 "renames:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-RENAMES-OBJECT-VERB: key.push, key.pull, authorized.keys.update, user's rebuild and the push/pull helpers carry object.verb names everywhere" test.ossh.renamesObjectVerb
+expect 0 "the object.verb names everywhere" \
+  "verb-first names left (was private.ossh.push.key, private.ossh.pull.key, ossh.update.authorized_keys, private.user.update.authorized_keys)"
+
+# T-OSSH-COLOR-STRIP: colours are stripped by line.strip.color, not by a sed copy
+# remote.key.file.name.get and identity.stage.outer.proxyJump each spelled
+# sed 's/\x1b\[[0-9;]*[mK]//g'. line.strip.color is the one definition.
+test.ossh.colorStrip() {
+  local bad="" got
+  grep -n 'x1b\\\[' "$OOSH_DIR/ossh" | grep -v '^[0-9]*:[[:space:]]*#' | grep -q . && bad="$bad sedCopy=[$(grep -n 'x1b\\\[' "$OOSH_DIR/ossh" | cut -d: -f1 | tr '\n' ' ')]"
+  got=$(printf '\033[1;31mssh.bar\033[0m\n' | line.strip.color)
+  [ "$got" = ssh.bar ] || bad="$bad strip=[$got]"
+  [ -z "$bad" ] && create.result 0 "ossh strips colours with line.strip.color" || create.result 1 "color strip:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-COLOR-STRIP: ossh strips colours with line.strip.color" test.ossh.colorStrip
+expect 0 "ossh strips colours with line.strip.color" \
+  "three sed copies of the colour strip in ossh"
+
+# T-OSSH-LOAD-FAILURE-FORM: a failed lazy load of ossh says why
+# os and user loaded ossh with `private.this.script.load ossh … || return 1`:
+# rc 1, no RESULT, no log. The house form is create.result 1 "ossh not found in
+# $OOSH_DIR" + error.log (os ~:290). A guard over the source.
+test.ossh.loadFailureForm() {
+  local bad="" f
+  for f in os user; do
+    grep -nE 'private\.this\.script\.load [a-zA-Z.]+ [^ ]+ \|\| return 1$' "$OOSH_DIR/$f" | grep -q . \
+      && bad="$bad $f:[$(grep -nE 'private\.this\.script\.load [a-zA-Z.]+ [^ ]+ \|\| return 1$' "$OOSH_DIR/$f" | cut -d: -f1 | tr '\n' ' ')]"
+  done
+  [ -z "$bad" ] && create.result 0 "a failed load of ossh says why" || create.result 1 "load form:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-LOAD-FAILURE-FORM: os and user say why a lazy load of ossh failed" test.ossh.loadFailureForm
+expect 0 "a failed load of ossh says why" \
+  "private.this.script.load ossh … || return 1 left no RESULT"
+
 # T-OSSH-KEY-PUSH-BARE-QUIET: key.push to a host without oosh prints no error
 # key.push ran `user authorized.keys.update` on the target; a bare server has
 # no `user`, so every push printed "bash: line 1: user: command not found"
 # before the add-only fallback did the work — read as "key push is broken"
 # (pol-dev review @46:08). It asks for `user` first; the fallback stays.
+# The command key.push sends through ossh.exec (stubbed) is run as the bare
+# host would: sh under env -i, a fixture HOME and a PATH without `user` — it
+# must say nothing and fail, so the fallback takes over. ssh, scp and rsync
+# are backstops (REAL lines).
 test.ossh.keyPushBareQuiet() {
-  local fx bad="" out
+  local fx bad="" out rc
   fx=$(test.suite.fixture.make osshbare)
-  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key"
+  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key" "$fx/bare"
   echo "ssh-ed25519 AAAABARE me@runner" > "$fx/.ssh/public_keys/ssh.runner.public_key"
   echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
   ( HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"
+    ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+    scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
     ossh.connection.open() { return 0; }
     private.ossh.ssh() { cat >/dev/null; echo "ssh $*" >> "$fx/calls"; }
-    ossh.exec() { echo "exec $*" >> "$fx/calls"; return 1; }
+    ossh.exec() { echo "exec $*" >> "$fx/calls"; shift; printf '%s' "$(ossh.remote.prelude.get) $*" > "$fx/cmd"; return 1; }
     ossh.key.push lab >/dev/null 2>&1 </dev/null )
   out=$(cat "$fx/calls" 2>/dev/null)
-  echo "$out" | grep -q '^exec lab command -v user .*&& user authorized.keys.update' || bad="$bad unguarded=[$(echo "$out" | grep '^exec' | tr '\n' '|')]"
+  if [ -s "$fx/cmd" ]; then
+    env -i HOME="$fx" PATH="$fx/bare" "$(command -v sh)" -c "$(cat "$fx/cmd")" >/dev/null 2>"$fx/err"; rc=$?
+    [ -s "$fx/err" ] && bad="$bad stderr=[$(tr '\n' '|' < "$fx/err")]"
+    [ "$rc" != 0 ] || bad="$bad bareRc0"
+  else
+    bad="$bad noExec"
+  fi
   echo "$out" | grep -q '^ssh lab sh' || bad="$bad noFallback"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "key.push to a host without oosh prints no error" || create.result 1 "bare push:$bad"
   return $(result)

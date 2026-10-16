@@ -236,10 +236,6 @@ private.user.group.member.is()     # <group> <?user> # rc 0 when <user> (default
 
 ### new.method
 
-# SSH ControlMaster socket path: ossh's (private.ossh.control.path.get), set
-# when user sources ossh at its end — a copy here had drifted from it
-# (T-OSSH-CONTROL-PATH-SHORT).
-
 user.id.completion() {
   echo "-u -n" 
   echo "-g"
@@ -364,7 +360,7 @@ user.ssh.rootkey.push() {
   # ossh.remote.prelude.get stands the remote root shell up (user.env, or ~/oosh
   # on PATH mid-install). Check the ssh rc — a silent failure here means the key
   # is pushed but never authorised.
-  private.this.script.load ossh ossh.remote.prelude.get || return 1
+  private.this.script.load ossh ossh.remote.prelude.get || { create.result 1 "ossh not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
   ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" "$(ossh.remote.prelude.get) user authorized.keys.update"
   local _rc=$?
   [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.push: authorize failed on $sshConfigName (ssh rc=$_rc) — key may be pushed but NOT authorised"
@@ -387,7 +383,7 @@ user.ssh.rootkey.file.push() {
     rsync -avz --mkpath -e "ssh -o ControlPath=$OSSH_CONTROL_PATH" "$sshPublicKeyFile" "$sshConfigName:/root/.ssh/public_keys/"
     # (the prelude falls back to ~/oosh on PATH when user.env is missing)
     # the remote prelude + rc check (see user.ssh.rootkey.push)
-    private.this.script.load ossh ossh.remote.prelude.get || return 1
+    private.this.script.load ossh ossh.remote.prelude.get || { create.result 1 "ossh not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
     ssh -o ControlPath="$OSSH_CONTROL_PATH" "$sshConfigName" "$(ossh.remote.prelude.get) user authorized.keys.update"
     local _rc=$?
     [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.file.push: authorize failed on $sshConfigName (ssh rc=$_rc) — key may be pushed but NOT authorised"
@@ -413,7 +409,7 @@ user.ssh.rootkey.file.revoke() {
     shift
     # the remote prelude + rc check (see user.ssh.rootkey.push)
     # (the prelude falls back to ~/oosh on PATH when user.env is missing)
-    private.this.script.load ossh ossh.remote.prelude.get || return 1
+    private.this.script.load ossh ossh.remote.prelude.get || { create.result 1 "ossh not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
     ssh -o ControlPath="$OSSH_CONTROL_PATH" $sshConfigName "$(ossh.remote.prelude.get) mv  /root/.ssh/public_keys/$(basename $sshPublicKeyFile)  /root/.ssh/deactive.public_keys/$(basename $sshPublicKeyFile);    user authorized.keys.update"
     local _rc=$?
     [ "$_rc" -ne 0 ] && error.log "user.ssh.rootkey.file.revoke: revoke/authorize failed on $sshConfigName (ssh rc=$_rc)"
@@ -576,8 +572,8 @@ user.ssh.create.folders() { # <?sshDir:~/.ssh> # creates public_keys and private
 }
 
 
-user.authorized.keys.update() # <?sshDir:~/.ssh> # updates all keys in <sshDir>/public_keys as authorized
-{ private.user.update.authorized_keys "$@"; }
+user.authorized.keys.update()     # <?sshDir:~/.ssh> # updates all keys in <sshDir>/public_keys as authorized: authorized_keys rebuilt from them in one atomic swap; rc 1 + RESULT when no ssh is set up in <sshDir> (no private key) or the rebuild fails — authorized_keys is then left as it was #
+{ private.user.authorized.keys.rebuild "$@"; }
 
 private.user.authorized.key.get()     # <line> # echo "<type> <key>" of one authorized_keys line — the options before it and the comment after it left out; nothing for a comment or an empty line #
 {
@@ -586,7 +582,7 @@ private.user.authorized.key.get()     # <line> # echo "<type> <key>" of one auth
  printf '%s\n' "$1" | awk '!/^[[:space:]]*(#|$)/ { for (i = 1; i < NF; i++) if ($i ~ /^(ssh-|ecdsa-|sk-)/) { print $i, $(i+1); exit } }'
 }
 
-private.user.authorized.keys.adopt()     # <sshDir> # give every key that is only in <sshDir>/authorized_keys a file in public_keys/ (adopted.<comment>.public_key) so the rebuild keeps it; a key with a file in deactive.public_keys/ (revoked) stays out #
+private.user.authorized.keys.adopt()     # <sshDir> # give every key that is only in <sshDir>/authorized_keys a file in public_keys/ (adopted.<comment>.public_key) so the rebuild keeps it; a key with a file in deactive.public_keys/ (revoked) stays out; rc 0 + RESULT with the count, rc 1 + RESULT when public_keys/ or a key file in it cannot be written #
 {
  # public_keys/ is the list authorized_keys is built from; revoking moves a
  # file to deactive.public_keys/. A key the hoster or a person put straight
@@ -597,9 +593,18 @@ private.user.authorized.keys.adopt()     # <sshDir> # give every key that is onl
  if [ ! -f "$sshDir/authorized_keys" ]; then
    create.result 0 "no authorized_keys in $sshDir"; return $(result)
  fi
- mkdir -p "$sshDir/public_keys"
- known=$(cat "$sshDir/public_keys/"* "$sshDir/deactive.public_keys/"* 2>/dev/null \
-   | while IFS= read -r line; do private.user.authorized.key.get "$line"; done)
+ # Both writes checked: an unwritable public_keys/ dropped the adopted key in
+ # silence, and the rebuild then swapped in an authorized_keys WITHOUT it —
+ # the POL.dev lockout again (fresh review 2026-10-16). rc 1 here stops the
+ # rebuild, authorized_keys stays as it is (T-USER-AUTHORIZED-KEYS-ADOPT).
+ private.this.folder.ensure "$sshDir/public_keys" || return $(result)
+ # File by file, the last line read without its newline too: a key file
+ # without one was glued to the next file or lost, so the key counted as
+ # unknown and was adopted a second time (T-USER-AUTHORIZED-KEYS-ADOPT-NO-NEWLINE).
+ known=$(for file in "$sshDir/public_keys/"* "$sshDir/deactive.public_keys/"*; do
+   [ -f "$file" ] || continue
+   while IFS= read -r line || [ -n "$line" ]; do private.user.authorized.key.get "$line"; done 2>/dev/null < "$file"
+ done)
  while IFS= read -r line || [ -n "$line" ]; do
    key=$(private.user.authorized.key.get "$line")
    [ -n "$key" ] || continue
@@ -607,7 +612,7 @@ private.user.authorized.keys.adopt()     # <sshDir> # give every key that is onl
    comment=$(printf '%s' "${line#*"$key"}" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//; s/_*$//')
    name="adopted.${comment:-key}"; file="$name"; i=1
    while [ -e "$sshDir/public_keys/$file.public_key" ]; do i=$((i + 1)); file="$name.$i"; done
-   printf '%s\n' "$line" > "$sshDir/public_keys/$file.public_key"
+   private.this.file.write "$sshDir/public_keys/$file.public_key" "$line" || return $(result)
    known="$known
 $key"
    count=$((count + 1))
@@ -617,15 +622,17 @@ $key"
  return $(result)
 }
 
-private.user.update.authorized_keys() # <?sshDir:~/.ssh> # updates all keys in <sshDir>/public_keys as authorized
+private.user.authorized.keys.rebuild()     # <?sshDir:~/.ssh> # rebuilds <sshDir>/authorized_keys from <sshDir>/public_keys/, keys only in authorized_keys adopted first; rc 0 + RESULT when rebuilt, rc 1 + RESULT when no ssh is set up in <sshDir> or a step fails — authorized_keys is then left as it was #
 {
+  # Named object.verb since 2026-10-16
+  # (was private.user.update.authorized_keys, T-OSSH-RENAMES-OBJECT-VERB).
 
   private.user.get.sshDir "$1"
 
   if [ -n "$1" ]; then
     shift
   fi
-  local sshDir="$RESULT"
+  local sshDir="$RESULT" file key content=""
 
   # user.ssh.status takes <?log> <?sshDir>: the old "" as first argument was
   # taken as "no sshDir" and the check looked at ~/.ssh, not at $sshDir.
@@ -633,15 +640,37 @@ private.user.update.authorized_keys() # <?sshDir:~/.ssh> # updates all keys in <
   # (T-USER-AUTHORIZED-KEYS-UPDATE-RC).
   if ! user.ssh.status "$sshDir"; then
     create.result 1 "no ssh set up in $sshDir — authorized_keys left as it is"
+    info.log "$RESULT"
     return $(result)
   fi
   info.log "updating $sshDir/authorized_keys"
-  private.user.authorized.keys.adopt "$sshDir"
-  rm -f $sshDir/authorized_keys
-  cat $sshDir/public_keys/* >>$sshDir/authorized_keys
+  private.user.authorized.keys.adopt "$sshDir" || { error.log "$RESULT"; return $(result); }
 
-  chmod 700 $sshDir
-  chmod 600 $sshDir/authorized_keys
+  # The new content first, then one atomic swap (private.this.file.write:
+  # <file>.new, then mv). It was `rm -f authorized_keys` + `cat public_keys/* >>`:
+  # between the two, and for good when the cat failed, the user had no
+  # authorized_keys and sshd let nobody in by key; a key file without its last
+  # newline was glued to the next key (T-USER-AUTHORIZED-KEYS-REBUILD-ATOMIC).
+  # Each file ends its own line. No .bak is left in ~/.ssh — the old file is
+  # replaced only once the new one is complete; a failed write leaves the old
+  # one and no .new. A symlinked authorized_keys is written through.
+  for file in "$sshDir/public_keys/"*; do
+    [ -f "$file" ] || continue
+    key=$(cat "$file" 2>/dev/null) || {
+      create.result 1 "cannot read $file — authorized_keys left as it is"
+      error.log "$RESULT"
+      return $(result)
+    }
+    [ -n "$key" ] && content="$content$key"$'\n'
+  done
+
+  chmod 700 "$sshDir"
+  private.this.file.write "$sshDir/authorized_keys" "${content%$'\n'}" || {
+    create.result 1 "$RESULT — authorized_keys left as it is"
+    error.log "$RESULT"
+    return $(result)
+  }
+  chmod 600 "$sshDir/authorized_keys"
   if private.detect.ssh.key "$sshDir"; then
     chmod 600 "$RESULT"
   fi
@@ -1281,7 +1310,7 @@ user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a loca
   # fail with Permission denied for the target user.
   #
   # IMPORTANT — does NOT damage sharedConfig (post-c10def5): the chown -h
-  # in private.ossh.push.config preserves sharedConfig ownership; this
+  # in private.ossh.config.push preserves sharedConfig ownership; this
   # `user init` only writes to \$sshDir/config (~/.ssh/config), not to
   # ~/config. c2 dispatch may write through ~/config to sharedConfig but
   # only as the target user via dev-group writes (mode g+w preserved).
@@ -1955,6 +1984,9 @@ user.start()
 {
   #echo "sourcing init"
   source this
+  # SSH ControlMaster socket path: ossh's (private.ossh.control.path.get), set
+  # by ossh.start when user sources ossh here — a copy in user had drifted
+  # from it (T-OSSH-CONTROL-PATH-SHORT).
   source ossh
   source os
   private.user.init

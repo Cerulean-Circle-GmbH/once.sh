@@ -166,6 +166,68 @@ runner now gives each run a private `mktemp -d` and exports it as `TEST_SUITE_RE
 caller that pins that variable itself is never overridden — that is how the meta-test drives a
 nested runner.
 
+## The runner guards your real ~/.ssh
+
+The same guard, for the folder `HOME=<fixture>` cannot protect. On 2026-10-16 a test run rebuilt
+the **real** `~/.ssh/authorized_keys` of the user running the suite from `~/.ssh/public_keys/` —
+a real `user authorized.keys.update` against the real folder — and the run stayed green. Nobody
+could name the file afterwards.
+
+Which folder: the **passwd home's** `.ssh` of the user running the suite
+(`private.test.suite.ssh.origin.get` — bash's `~user` expansion, which reads the password database
+on Linux and macOS; `$HOME` only when there is no passwd entry). Not `$HOME/.ssh`: `ssh` reads the
+passwd home whatever `HOME` says, so a test with a fixture `HOME` still writes the real folder
+through it. The runner pins it once, before the first file, as `TEST_SUITE_SSH_ORIGIN` (exported, so
+children and a nested runner watch the same folder; a caller that pins it itself — the meta-test,
+at a fixture — is never overridden).
+
+Before the first file the runner fingerprints **every regular file and symlink** in the folder:
+`authorized_keys`, `config`, `known_hosts`, `id_*`, and everything under `public_keys/`,
+`private_key/` and `ids/` — one line per path with its mode, content checksum and size. A path that
+appears or disappears is a different fingerprint, so a **created** file is caught (the incident
+created one). Sockets — an ossh ControlMaster may live here — are not files and are left out. Unlike
+the shared tier the mode is stamped: the runner owns its `~/.ssh`, so a mode can be put back, and a
+re-moded key is damage (ssh refuses it).
+
+It then copies aside, into this run's private `mktemp -d` (`$TEST_SUITE_RESULT_PATH/realSsh`, mode
+700, removed with the run's directory), every folder and every **non-secret** file —
+`authorized_keys`, `config`, `known_hosts*`, `*.pub`, `public_keys/*` and the like. **Private keys
+are fingerprinted but never copied**, because a killed run leaves that directory in `/tmp`. The rule
+(`private.test.suite.ssh.secret.is`, at any depth): a file under a `private_key/` folder, a file
+named `id_*` that does not end in `.pub`, and a `*.private_key` file. Symlinks are copied as links,
+never as the file they point to.
+
+After **every** `core` and `extended` file it compares, and reports:
+
+```
+  ✗ REAL ~/.ssh WRITTEN: test.myscript changed ~/.ssh: authorized_keys (created)
+    real ~/.ssh: /home/me/.ssh
+    fix: in test.myscript set HOME and CURRENT_SSH_DIR to a fixture (test.suite.fixture.make) before the 'source' of the script under test,
+         and add ssh/scp/rsync backstop stubs — HOME alone does not redirect ssh, it reads the passwd home
+    ~/.ssh has been restored from this run's snapshot (private keys excepted)
+```
+
+Each path is named with what happened to it: `(created)`, `(changed)` or `(removed)`. **The whole
+run fails**, in every category, and the summary lists the files on a `Real ~/.ssh:` line. There is
+no waiver: nothing a test needs can only be had from the real keys. Then `~/.ssh` is put back from
+the snapshot — a created path is removed (so a stray `authorized_keys` is never left, nor
+re-created), a changed or removed file is copied back with its mode. A **private key** that was
+created, changed or removed is not touched — there is no copy to restore from — and the report
+adds one line per key for you:
+
+```
+    restore by hand: /home/me/.ssh/private_key/my.private_key
+```
+
+The snapshot is taken afresh at every runner start, so a baseline you corrected by hand between
+runs is the one restored to.
+
+`TEST_CATEGORY=platform` files are exempt, as for the shared tier — in `test.suite run <name>` too.
+
+Tests: `T-REAL-SSH-*` in `test/test.test.suite` (detect, restore, end to end through the runner,
+platform exemption, origin, stamp, which paths are secret) and the `sshWrites` rows of `T-VERDICT`. All of them point the
+guard at a fixture home; none touches the real folder.
+
 ## Isolating a test from the shared config
 
 `~/config` (`$CONFIG_PATH`) is normally a **site-wide `sharedConfig`** that every user sources at

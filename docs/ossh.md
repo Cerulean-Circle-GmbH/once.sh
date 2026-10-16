@@ -178,25 +178,93 @@ first, so the rebuild keeps it. A revoked key (file in `deactive.public_keys/`)
 stays out. Keys are compared by the key itself, not by file name. Before
 2026-10-15 the rebuild deleted such keys: on POL.dev the first `ossh key.push`
 after the install removed the Mac Studio's RSA key, and root's login asked for
-a password again (T-USER-AUTHORIZED-KEYS-ADOPT).
+a password again (T-USER-AUTHORIZED-KEYS-ADOPT). The adopt's writes are
+checked (`private.this.folder.ensure`, `private.this.file.write`): when
+`public_keys/` or a key file in it cannot be written, the rebuild stops with
+rc 1 and `authorized_keys` stays byte for byte — until 2026-10-16 the key was
+dropped in silence and the rebuild swapped in an `authorized_keys` without it,
+the same lockout. An adopted file, like every new file the kernel's write
+makes, is 600.
+
+The rebuild writes the new `authorized_keys` completely first and then swaps
+it in (`authorized_keys.new`, then a rename — `private.this.file.write`); each
+key file ends its own line. Until 2026-10-16 it deleted the file and then
+appended `public_keys/*`: in between, and for good when a step failed, the user
+had no `authorized_keys` at all (T-USER-AUTHORIZED-KEYS-REBUILD-ATOMIC). No
+`.bak` is left in `~/.ssh`; a failed write leaves the old file and no `.new`.
+`~/.ssh` stays 700, `authorized_keys` 600.
+
+`ossh authorized.keys.update <?sshDir>` (was `ossh update.authorized_keys`
+until 2026-10-16) is the same rebuild through ossh. Both return:
+
+| rc | RESULT | authorized_keys |
+|----|--------|-----------------|
+| 0 | `authorized_keys of <sshDir> rebuilt from public_keys/` | the new one |
+| 1 | `no ssh set up in <sshDir> — authorized_keys left as it is` (no private key there) | untouched |
+| 1 | `cannot read <file> …` / `cannot write …` — `… left as it is` | untouched |
 
 Where ossh writes a target's `authorized_keys` itself — `ossh install <host> <user>`,
 and `key.push` to an oosh without `authorized.keys.update` — it only adds the
 pushed key (`private.ossh.authorized.key.append.get`, T-OSSH-AUTHORIZED-KEY-APPEND).
 
-`key.push` without a key name pushes this computer's own key (the one in
-`~/.ssh/private_key/`). The Host entry must log in with that key —
+`key.push <toHost> <?keyName> <?sshDir>` without a key name pushes the own key
+of `<sshDir>` (the one in its `private_key/`); an empty `""` key name keeps its
+place, so `ossh key.push <host> "" <sshDir>` pushes that sshDir's key — before
+2026-10-16 the `""` swallowed the `<sshDir>` and the key was named from the
+default sshDir. The Host entry must log in with that key —
 `ossh config.create` writes `IdentityFile ~/.ssh/id_ed25519`; an older
 hand-written entry may name another key (`id_rsa`), and then needs
-`ossh key.push <host> <file in public_keys/>`.
+`ossh key.push <host> <file in public_keys/>`. key.push says how it ended:
 
-`key.pull <fromHost> <?keyName> <?sshDir>` is `key.push` the other way around:
-it gets `<fromHost>:~/.ssh/public_keys/<keyName>` (by default the host's own
-key file, `ossh file.get.name` there) into `<sshDir>/public_keys/<keyName>` and
-runs the local rebuild. A host without oosh keys (Termux) gives its
+| rc | RESULT |
+|----|--------|
+| 0 | `<keyName> authorized on <toHost> (rebuild)` — the host's oosh rebuilt its `authorized_keys` |
+| 0 | `<keyName> added to <toHost>'s authorized_keys` — no oosh there (or no ssh set up), the key was only added |
+| 1 | `could not authorize <keyName> on <toHost>` — both ways failed (error.log) |
+| 1 | the RESULT of `connection.open` or of the key copy, when that fails first |
+
+(T-OSSH-REMOTE-PUBLIC-KEY-PUT; before 2026-10-16 the push ended with the rc of
+the fallback pipeline, no RESULT, and a failed fallback said nothing.)
+
+`key.pull <fromHost> <?remoteKeyName> <?sshDir>` is `key.push` the other way around:
+it gets `<fromHost>:~/.ssh/public_keys/<remoteKeyName>` (by default the host's own
+key file) into `<sshDir>/public_keys/<remoteKeyName>` and runs the local
+rebuild. The host's own key is the `~/.ssh/private_key/<name>.private_key`
+there that has its `public_keys/<name>.public_key`, read with a POSIX listing
+(`private.ossh.remote.key.file.name.get`) that writes nothing and needs no oosh
+on the host. Until 2026-10-16 it asked the host `ossh file.get.name` (on an
+older oosh `ossh id.file.get`), which on a host without `private_key/` made a
+key name and ran `config save ssh.info` THERE (T-OSSH-REMOTE-KEY-FILE-NAME-GET).
+A host without oosh keys (Termux) gives its
 `~/.ssh/id_*.pub`, kept as `<fromHost>.<type>.public_key`. Before 2026-10-16 it
 asked for a method dev had renamed, pulled `~/.ssh/<name>.pub` as
 `<name>.public_key.pulled` and never ran the rebuild (T-OSSH-KEY-PULL).
+Names stay in `public_keys/`: a `'` in `<remoteKeyName>` is dropped (as
+key.push does), a name with a `/` (or `.`/`..`) is refused with rc 1 before
+the host is asked, and a remote answer with a `/`, a space or a `'` is no name
+— a name like `../x` would have read and written outside `public_keys/`.
+`..` inside a name (`user..public_key`, a key from before the hostname fix)
+stays allowed: without a `/` it cannot leave the folder.
+`<sshDir>` is the LOCAL folder the key lands in; on `<fromHost>` it is always
+`~/.ssh/public_keys/`. key.pull is rc 1 when it finds no key (what
+`private.user.authorized.key.get` reads as one) or cannot save it; a key saved
+while this computer has no ssh set up is rc 0 with a warning — the rebuild
+said no, the next one authorizes it.
+
+A key without an oosh key file is named `<owner>.<type>.public_key` both ways:
+key.pull uses the Host name (`phone.id_ed25519.public_key`), `ossh install`
+this computer's oosh key name `<user>.<host>` (`hannesn.mybox.id_ed25519.public_key`;
+before 2026-10-16 `<user>.<type>.public_key`, so a key installed earlier may
+have a second file, and the key stands twice in `authorized_keys` — sshd takes that).
+
+Tab on `key.push` / `key.pull` completes per parameter: hosts, and for
+`key.push` this computer's `public_keys/` (`<keyName>`); `key.pull`'s
+`<remoteKeyName>` is a file on the other host and offers nothing — a listing
+would ask the password on Tab. It was `<keyName>` with an empty
+`ossh.key.pull.completion.keyName`: c2 takes an empty answer as "no
+completion" and asks `ossh.parameter.completion.keyName` next, so Tab listed
+this computer's keys after all (T-OSSH-KEY-COMPLETION). `remoteKeyName` is
+on the free-text list of `test/test.completion.audit`.
 
 ### First contact with only a password
 
@@ -208,14 +276,74 @@ macOS (49 characters) made it too long: `connection.open` always failed,
 `ossh key.push` asked the password five times and said "Failed to connect",
 and the key still landed (T-OSSH-CONTROL-PATH-SHORT).
 
+The socket a host's master really uses is `$OSSH_CONTROL_PATH` with `%C`
+expanded — a hash only ssh knows. `private.ossh.control.path.resolved.get
+<host>` asks `ssh -G` (which prints the configuration and connects to
+nothing) and echoes it; nothing and rc 1 without a host, or when ssh answers
+`none` or a path that still has a `%`. `os platform.test` closes a stale
+master with `ossh connection.close` and then removes that socket; until
+2026-10-16 it removed `/tmp/ossh-test@localhost:<port>`, a name from before
+`%C` that never existed (T-OSSH-CONTROL-PATH-RESOLVED-GET).
+
 A failed connection now says ssh's reason (e.g. `Permission denied`) and stops
-`key.push` / `key.pull` / `push.*` / `pull.*`; `-4` is retried only after a
-network error (T-OSSH-CONNECTION-OPEN-FAIL).
+`key.push` / `key.pull` / `config.push` / `dir.push` / `dir.pull` / `id.push`
+and `ossh install`; `-4` is retried only after a
+network error (T-OSSH-CONNECTION-OPEN-FAIL). The reason is
+`private.ossh.connection.error.get` (the last line of ssh's stderr that is no
+"Warning: Permanently added"); which reasons count as a network error is
+`private.ossh.connection.error.network.is`; both attempts are
+`private.ossh.master.start`. ssh's stderr lives in a private temp dir
+(`private.this.temp.dir.get`) that is removed on every way out.
+
+**A client that cannot multiplex stops here too.** These steps need the
+ControlMaster; until 471b0e01 (2026-10-16) a failed `connection.open` was ignored and
+every step opened its own connection. On a client without ControlMaster
+support — native Win32 OpenSSH (Windows' `ssh.exe`) has none — that "worked"
+with one password prompt per step; now the step stops after the failed
+`connection.open` with its RESULT. Use an ssh that multiplexes (WSL, Git for
+Windows' / MSYS2's OpenSSH, Cygwin) or push the key once by hand
+(`ssh-copy-id`), so the master is not needed for a password.
+
+`key.push` and `ossh install` copy the key file with
+`private.ossh.remote.public.key.put`; when that copy fails, `key.push` stops
+with rc 1 instead of rebuilding the target's `authorized_keys` without it
+(T-OSSH-REMOTE-PUBLIC-KEY-PUT). The copy runs `umask 077`, makes
+`~/.ssh/public_keys` and sets `~/.ssh` to 700 on the target: under the
+target's own umask (pam_umask 002) a new `~/.ssh` was 775, and sshd's
+StrictModes then ignores every key in it — the push "worked" and the login
+still asked the password (T-OSSH-REMOTE-PUBLIC-KEY-PUT-MODES). A new key file
+there is 600.
 
 `ossh install <host>` adds the installer's key to the host's `public_keys/` and
 `authorized_keys` right after the connection opens — only added — and checks a
 key login; when that fails, a warning names the Host entry's IdentityFile
-(T-OSSH-INSTALL-PUSHES-KEY).
+(T-OSSH-INSTALL-PUSHES-KEY). Its remote half, `private.ossh.oosh.init.push`
+(was `private.push.init.oosh` until 2026-10-16), says its result on every
+path (T-OSSH-OOSH-INIT-PUSH-RESULT):
+
+| rc | RESULT |
+|----|--------|
+| 0 | `oosh installed on <host> and finished here` |
+| 0 | `oosh already on <host> (state [99] \| ~/oosh exists) and finished here` — the bootstrap is skipped |
+| 1 | `could not transfer init/oosh to <host>` |
+| 1 | `the oosh installer on <host> failed (rc <n>)` |
+| 1 | `oosh installed on <host>, but ossh.install.finish.local failed` (or `oosh already on …, but …`) |
+| 1 | the RESULT of `connection.open` or of the installer's key, when that fails first |
+
+The copy helpers say theirs too (T-OSSH-PUSH-PULL-RESULT), each rc 1 + RESULT
++ error.log for a missing argument, a failed connection or a failed copy:
+`private.ossh.config.push <toHost> <?sshConfigName>` (`<name> appended to
+<toHost>:~/.ssh/config`; without a name nothing is pushed, rc 0),
+`private.ossh.dir.push <toHost> <dir>` (`<dir> copied to <toHost>`),
+`private.ossh.dir.pull <fromHost> <dir>` (`<fromHost>:<dir> copied here`) and
+`private.ossh.id.push <toHost> <id> <?sshDir>` (`<id> copied to
+<toHost>:~/.ssh/ids/`; a missing `<sshDir>/ids/<id>` is rc 1 before any
+copy). Until 2026-10-16 they had verb-first names
+(was `private.ossh.push.config`, `private.ossh.push.dir`)
+(was `private.ossh.pull.dir`, `private.ossh.push.id`)
+(T-OSSH-RENAMES-OBJECT-VERB) and ended with a bare `return 1` or the copy's
+rc; the public `ossh config.push` / `dir.push` / `dir.pull` / `id.push` keep
+their names.
 
 `user authorized.keys.update` returns 1 when the user has no ssh set up (no
 private key in the sshDir), so `key.push`'s add-only fallback takes over
@@ -371,7 +499,8 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh install` | Install oosh on remote host |
 | `ossh login` | Interactive SSH login |
 | `ossh key.push` | Push SSH key to remote host |
-| `ossh key.pull` | Pull a remote host's SSH key here and authorize it |
+| `ossh key.pull` | Pull a remote host's SSH key here and authorize it (`<fromHost> <?remoteKeyName> <?sshDir>`) |
+| `ossh authorized.keys.update` | Rebuild authorized_keys from public_keys/ (atomic; rc 1 when no ssh is set up) |
 | `ossh id.create` | Create new SSH key pair |
 | `ossh list` | List configured hosts |
 | `ossh list.ids` | List available key identities |

@@ -355,7 +355,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
 
   # Set control path so sshpass and ossh subprocesses share the same socket —
   # ossh's answer, one that fits a Unix socket (T-OSSH-CONTROL-PATH-SHORT)
-  private.this.script.load ossh private.ossh.control.path.get || return 1
+  private.this.script.load ossh private.ossh.control.path.get || { create.result 1 "ossh not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
   : ${OSSH_CONTROL_PATH:="$(private.ossh.control.path.get)"}
   export OSSH_CONTROL_PATH
 
@@ -380,9 +380,14 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # SSH setup
   ossh config.create "$platform" "test@localhost:$sshPort"
   ossh config.save.last
-  # Clean up any stale ControlMaster socket from a previous test run
-  ssh -O exit -o ControlPath="$OSSH_CONTROL_PATH" "$platform" 2>/dev/null
-  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+  # Clean up any stale ControlMaster socket from a previous test run: close
+  # the master, then remove the socket a dead one left. Its name is
+  # $OSSH_CONTROL_PATH with %C expanded, which only ssh knows — it was
+  # "/tmp/ossh-test@localhost:$sshPort", a name from before %C that never
+  # existed (T-OSSH-CONTROL-PATH-RESOLVED-GET).
+  local socket
+  ossh connection.close "$platform" >/dev/null 2>&1
+  socket=$(private.ossh.control.path.resolved.get "$platform") && rm -f "$socket"
 
   # Open ControlMaster with sshpass (first connection, no keys yet)
   # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
@@ -403,7 +408,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # Install oosh. init/oosh's POSIX prelude handles its own prereqs
   # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
   # no separate `ossh prereqs.install <host>` pre-step is needed. See
-  # `private.push.init.oosh` in ossh which SCPs init/oosh and runs
+  # `private.ossh.oosh.init.push` in ossh which SCPs init/oosh and runs
   # its self-install, and the git install + the bash install steps of
   # Phase A in init/oosh.
   ossh install "$platform" test
@@ -418,7 +423,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # Refresh ControlMaster so new sessions pick up dev group membership
   # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
   ossh connection.close "$platform" 2>/dev/null
-  rm -f "/tmp/ossh-test@localhost:$sshPort" 2>/dev/null
+  socket=$(private.ossh.control.path.resolved.get "$platform") && rm -f "$socket"
   SSHPASS=test sshpass -e ssh \
     -o ControlMaster=yes \
     -o ControlPath="$OSSH_CONTROL_PATH" \
@@ -493,7 +498,7 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     # (the config layout, no boot), one verdict. root, oosh-user and bash-user
     # arrive through sudo/runuser, which run no .bashrc: the prelude stands their
     # shell up from their own ~/config/user.env (ossh.remote.prelude.get).
-    private.this.script.load ossh ossh.remote.prelude.get || return 1
+    private.this.script.load ossh ossh.remote.prelude.get || { create.result 1 "ossh not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
     local prelude; prelude=$(ossh.remote.prelude.get)
 
     # B.1 — test
