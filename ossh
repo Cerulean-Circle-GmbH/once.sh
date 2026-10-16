@@ -867,23 +867,12 @@ ossh.install.finish.local() # # finishes local oosh installation
   ossh.config.shared.seed.github "$sshConfigHost"
   private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
 
-  local remoteKeyName
-  # Strip ANSI escape sequences that leak into stdout when the remote's
-  # `ossh get.key.name` emits an error.log line alongside the actual name.
-  # Without this, a message like `\e[31mERROR> …\e[0m` ends up IN the
-  # captured $remoteKeyName and then as the filename passed to rsync —
-  # producing "link_stat \"/root/.ssh/public_keys/\\#033[31mERROR>.public_key\" failed".
-  remoteKeyName=$( ossh.exec $sshConfigHost "ossh get.key.name" 2>/dev/null | sed 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | tail -1 )
-  # Validate: a clean key name is a single token — no spaces, no "ERROR"/"WARN"
-  # markers. If what we got looks like a log message, treat as "no name".
-  if [ -z "$remoteKeyName" ] || echo "$remoteKeyName" | grep -qE "ERROR|WARN|[[:space:]]"; then
-    warn.log "Could not resolve remote key name from $sshConfigHost${remoteKeyName:+ (got: '$remoteKeyName')} — skipping key pull"
-  else
-    private.ossh.pull.key $sshConfigHost $remoteKeyName || {
-      warn.log "Failed to pull key from $sshConfigHost — continuing"
-    }
-    ossh.update.authorized_keys
-  fi
+  # The host's own key, authorized here. It asked for `ossh get.key.name`
+  # (key.get.name since 2fe51334) and got nothing; key.pull resolves the
+  # name itself, without the log lines a remote error.log leaves on stdout.
+  private.ossh.pull.key "$sshConfigHost" || {
+    warn.log "Failed to pull key from $sshConfigHost — continuing"
+  }
 
   # If a target user was specified, set up oosh for that user
   if [ -n "$targetUser" ]; then
@@ -2463,48 +2452,89 @@ ossh.dir.pull() # <fromHost> <dir> # gets te directory <dir> <fromHost> into the
   private.ossh.pull.dir "$@";
 }
 
-private.ossh.pull.key() # <fromHost> <dir> # gets te directory <dir> <fromHost> into the CURRENT LOCAL dirrectory
+private.ossh.remote.key.file.name.get() # <fromHost> # echo the key file name oosh uses on <fromHost> (file.get.name, id.file.get on an older oosh); nothing when it has none #
 {
+  # NO create.result — a getter consumed as $(...). A remote error.log can
+  # land on stdout next to the name: colours and \r go, the last line is the
+  # answer, and a line with a space or a log marker is no name.
+  local fromHost="$1" method name
+  for method in file.get.name id.file.get; do
+    name=$( ossh.exec "$fromHost" "ossh $method" 2>/dev/null | sed 's/\x1b\[[0-9;]*[mK]//g' | tr -d '\r' | tail -1 )
+    case "$name" in
+      (""|*[[:space:]]*|*ERROR*|*WARN*) continue ;;
+    esac
+    echo "$name"
+    return 0
+  done
+  return 1
+}
 
-  local toHost="$1"
+private.ossh.pull.key() # <fromHost> <?keyName> <?sshDir:~/.ssh> # gets the key <?keyName> (default: the key of <fromHost>) from <fromHost>:.ssh/public_keys/ into <sshDir>/public_keys/ and authorizes it — key.push the other way around
+{
+  local fromHost="$1"
   if [ -n "$1" ]; then
     shift
   else
-    error.log "no toHost was specified"
+    error.log "no fromHost was specified"
     return 1
   fi
 
+  # An empty <?keyName> still holds its place: key.pull <host> "" <sshDir>.
   local keyName="$1"
-  if [ -n "$1" ]; then
-    shift
-  fi
+  [ $# -gt 0 ] && shift
 
-  ossh.connection.open "$toHost"
+  private.get.sshDir "$1"
+  [ -n "$1" ] && shift
+  local sshDir="$RESULT"
 
-  # Resolve keyName: explicit arg → remote ossh id.file.get → remote key auto-detect
-  if [ -z "$keyName" ]; then
-    keyName=$(ossh exec "$toHost" "ossh id.file.get" 2>/dev/null)
-  fi
-  if [ -z "$keyName" ]; then
-    # Fallback: detect key type directly on remote's ~/.ssh
-    keyName=$(ossh exec "$toHost" "for k in id_ed25519 id_ecdsa id_rsa id_dsa; do [ -f ~/.ssh/\$k.pub ] && echo \$k && break; done" 2>/dev/null)
-  fi
-  if [ -z "$keyName" ]; then
-    error.log "key.pull: cannot determine key name on $toHost (no key found in remote ~/.ssh)"
-    return 1
-  fi
-  info.log "key.pull: using keyName='$keyName' from $toHost"
+  ossh.connection.open "$fromHost"
 
-  private.get.sshDir
-  local localDir="$RESULT/public_keys"
-  [ -d "$localDir" ] || mkdir -p "$localDir"
-  private.ossh.rsync.pull "$toHost:.ssh/$keyName.pub" "$localDir/$keyName.public_key.pulled"
+  # The file key.push would send from <fromHost>: public_keys/<keyName>,
+  # by default the host's own key file. A host without oosh keys (Termux,
+  # cb040d55) only has ~/.ssh/id_*.pub — kept as <fromHost>.<type>.public_key.
+  local remoteFile="" localName="" key="" name
+  if [ -n "$keyName" ]; then
+    remoteFile="public_keys/'$keyName'"; localName="$keyName"
+  else
+    name="$( private.ossh.remote.key.file.name.get "$fromHost" )"
+    if [ -n "$name" ]; then
+      remoteFile="public_keys/'$name.public_key'"; localName="$name.public_key"
+    fi
+  fi
+  # Single-quoted like key.push: a keyName with a space stays one word remotely.
+  [ -n "$remoteFile" ] && key="$( private.ossh.ssh "$fromHost" "cat ~/.ssh/$remoteFile" 2>/dev/null )"
+  if [ -z "$key" ] && [ -z "$keyName" ]; then
+    name="$( private.ossh.ssh "$fromHost" "for k in id_ed25519 id_ecdsa id_rsa id_dsa; do [ -f ~/.ssh/\$k.pub ] && echo \$k && break; done" 2>/dev/null )"
+    if [ -n "$name" ]; then
+      localName="$fromHost.$name.public_key"
+      key="$( private.ossh.ssh "$fromHost" "cat ~/.ssh/'$name.pub'" 2>/dev/null )"
+    fi
+  fi
+  case "$key" in
+    (ssh-*|ecdsa-*|sk-*) ;;
+    (*)
+      create.result 1 "key.pull: no public key ${keyName:+$keyName }found on $fromHost"
+      error.log "$RESULT"
+      return $(result)
+      ;;
+  esac
+
+  [ -d "$sshDir/public_keys" ] || mkdir -p "$sshDir/public_keys"
+  printf '%s\n' "$key" > "$sshDir/public_keys/$localName"
+  important.log "key.pull: $fromHost -> $sshDir/public_keys/$localName"
+  ossh.update.authorized_keys "$sshDir"
 }
 
-ossh.key.pull() # <fromHost> <dir> # gets te directory <dir> <fromHost> into the CURRENT LOCAL dirrectory
+ossh.key.pull() # <fromHost> <?keyName> <?sshDir:~/.ssh> # gets the key of <fromHost> or <?keyName> from its <sshDir>/public_keys/ and authorizes it here — key.push the other way around
 {
   private.ossh.pull.key "$@";
 }
+
+ossh.key.pull.completion() {
+  ossh.config.get.completion "$@"
+}
+
+ossh.key.pull.completion.sshDir() { ossh.parameter.completion.sshDir "$@"; }
 
 private.ossh.pull.config() # <fromHost> <sshConfigName> <?file> # pulls a config from remote and seves it
 {

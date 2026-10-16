@@ -158,6 +158,9 @@ ossh list.ids
 # Push a key to a remote host
 ossh key.push myhost
 
+# Pull a remote host's key here and let it log in to this computer
+ossh key.pull myhost
+
 # Push SSH config to a remote host
 ossh config.push myhost
 ```
@@ -186,6 +189,14 @@ pushed key (`private.ossh.authorized.key.append.get`, T-OSSH-AUTHORIZED-KEY-APPE
 `ossh config.create` writes `IdentityFile ~/.ssh/id_ed25519`; an older
 hand-written entry may name another key (`id_rsa`), and then needs
 `ossh key.push <host> <file in public_keys/>`.
+
+`key.pull <fromHost> <?keyName> <?sshDir>` is `key.push` the other way around:
+it gets `<fromHost>:~/.ssh/public_keys/<keyName>` (by default the host's own
+key file, `ossh file.get.name` there) into `<sshDir>/public_keys/<keyName>` and
+runs the local rebuild. A host without oosh keys (Termux) gives its
+`~/.ssh/id_*.pub`, kept as `<fromHost>.<type>.public_key`. Before 2026-10-16 it
+asked for a method dev had renamed, pulled `~/.ssh/<name>.pub` as
+`<name>.public_key.pulled` and never ran the rebuild (T-OSSH-KEY-PULL).
 
 ## Repairing a Broken `~/.ssh`
 
@@ -335,6 +346,7 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh install` | Install oosh on remote host |
 | `ossh login` | Interactive SSH login |
 | `ossh key.push` | Push SSH key to remote host |
+| `ossh key.pull` | Pull a remote host's SSH key here and authorize it |
 | `ossh id.create` | Create new SSH key pair |
 | `ossh list` | List configured hosts |
 | `ossh list.ids` | List available key identities |
