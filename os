@@ -353,8 +353,10 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
     oo cmd sshpass
   fi
 
-  # Set control path so sshpass and ossh subprocesses share the same socket
-  : ${OSSH_CONTROL_PATH:="/tmp/ossh-%r@%h:%p"}
+  # Set control path so sshpass and ossh subprocesses share the same socket —
+  # ossh's answer, one that fits a Unix socket (T-OSSH-CONTROL-PATH-SHORT)
+  private.this.script.load ossh private.ossh.control.path.get || return 1
+  : ${OSSH_CONTROL_PATH:="$(private.ossh.control.path.get)"}
   export OSSH_CONTROL_PATH
 
   console.log "Testing platform: $platform (image: $imageTag)"

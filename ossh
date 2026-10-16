@@ -5,11 +5,28 @@
 
 #echo "starting: $0 <LOG_LEVEL=$1>"
 
+private.ossh.control.path.get()     #  # echo the ControlMaster socket path for connection reuse: ${TMPDIR:-/tmp}/ossh-%C when it fits a Unix socket, else /tmp/ossh-%C, else ~/.ssh/ossh-%C #
+{
+ # NO create.result — a getter consumed at file scope as $(...).
+ # %C (hash of %l%h%p%r, OpenSSH 6.7+) is 40 characters; ssh binds the master
+ # at <path>.<16 random chars> first, and a Unix socket path is at most 103
+ # characters on macOS (107 on Linux). macOS's TMPDIR (/var/folders/t7/…/T/,
+ # 49 characters) made it 112: connection.open failed every time and every
+ # step asked the password again (pol-dev review 2026-10-15,
+ # T-OSSH-CONTROL-PATH-SHORT). TMPDIR stays first — Termux has no /tmp.
+ local dir
+ for dir in "${TMPDIR:-/tmp}" /tmp "$HOME/.ssh"; do
+   dir="${dir%/}"
+   [ -d "$dir" ] && [ -w "$dir" ] || continue
+   [ $(( ${#dir} + 6 + 40 + 17 )) -le 103 ] || continue   # "/ossh-" + %C + ".<16 random>"
+   echo "$dir/ossh-%C"
+   return 0
+ done
+ echo "/tmp/ossh-%C"
+}
+
 # SSH ControlMaster socket path for connection reuse (single password entry).
-# Use %C (hash of %l%h%p%r, OpenSSH 6.7+) to keep path short — Unix domain
-# sockets have a ~104 char limit. Long hostnames (e.g. macstudio.fritz.box)
-# with the old %r@%h:%p template exceeded this on Termux/Android.
-: ${OSSH_CONTROL_PATH:="${TMPDIR:-/tmp}/ossh-%C"}
+: ${OSSH_CONTROL_PATH:="$(private.ossh.control.path.get)"}
 
 ossh.remote.prelude.get()     #  # echo the command prefix that stands a non-interactive shell up (ssh command, runuser/sudo -u, docker exec): ~/config/user.env when present, else ~/oosh on PATH; POSIX, expanded by the target shell #
 {
@@ -61,35 +78,55 @@ ossh.connection.open() # <host> # open persistent SSH connection (enter password
 
   # Check if connection already open
   if ssh -O check -o ControlPath="$OSSH_CONTROL_PATH" "$host" 2>/dev/null; then
-    info.log "Connection to $host already open"
-    return 0
+    create.result 0 "Connection to $host already open"
+    info.log "$RESULT"
+    return $(result)
   fi
 
   # Open master connection in background, persist for 10 min.
   # Try default (IPv4+IPv6) first; if it fails (Broken pipe on IPv6 is
   # common on Termux/Android), retry with -4 to force IPv4.
+  # ssh's stderr goes to a file, not /dev/null: a failure says why. Not $(...):
+  # the master behind -f keeps the pipe open for 10 minutes.
+  local errFile reason
+  errFile=$(mktemp "${TMPDIR:-/tmp}/ossh.open.XXXXXX") || errFile=/dev/null
   if ssh -o ControlMaster=yes \
       -o ControlPath="$OSSH_CONTROL_PATH" \
       -o ControlPersist=600 \
       -o StrictHostKeyChecking=accept-new \
-      -N -f "$host" 2>/dev/null; then
-    success.log "Connection to $host established (reusable for 10 min)"
-    return 0
+      -N -f "$host" 2>"$errFile"; then
+    [ "$errFile" = /dev/null ] || rm -f "$errFile"
+    create.result 0 "Connection to $host established (reusable for 10 min)"
+    success.log "$RESULT"
+    return $(result)
   fi
+  reason=$(grep -v '^Warning: Permanently added' "$errFile" 2>/dev/null | tail -1)
 
-  # Retry IPv4-only (avoids Broken pipe on IPv6-first platforms)
-  info.log "Retrying $host with IPv4 only (-4)..."
-  if ssh -4 -o ControlMaster=yes \
-      -o ControlPath="$OSSH_CONTROL_PATH" \
-      -o ControlPersist=600 \
-      -o StrictHostKeyChecking=accept-new \
-      -N -f "$host" 2>/dev/null; then
-    success.log "Connection to $host established via IPv4 (reusable for 10 min)"
-    return 0
-  fi
+  # Retry IPv4-only (avoids Broken pipe on IPv6-first platforms) — only after a
+  # network error: a refused login or host key would only ask the password
+  # again (T-OSSH-CONNECTION-OPEN-FAIL).
+  case "$reason" in
+    *"Permission denied"*|*"Host key verification failed"*|*"too long"*|*"Too many authentication failures"*) ;;
+    *)
+      info.log "Retrying $host with IPv4 only (-4)..."
+      if ssh -4 -o ControlMaster=yes \
+          -o ControlPath="$OSSH_CONTROL_PATH" \
+          -o ControlPersist=600 \
+          -o StrictHostKeyChecking=accept-new \
+          -N -f "$host" 2>"$errFile"; then
+        [ "$errFile" = /dev/null ] || rm -f "$errFile"
+        create.result 0 "Connection to $host established via IPv4 (reusable for 10 min)"
+        success.log "$RESULT"
+        return $(result)
+      fi
+      reason=$(grep -v '^Warning: Permanently added' "$errFile" 2>/dev/null | tail -1)
+      ;;
+  esac
 
-  error.log "Failed to connect to $host (tried default + IPv4)"
-  return 1
+  [ "$errFile" = /dev/null ] || rm -f "$errFile"
+  create.result 1 "Failed to connect to $host: ${reason:-ssh gave no reason}"
+  error.log "$RESULT"
+  return $(result)
 }
 ossh.connection.open.completion.host() {
   ossh.config.get.completion "$@"
@@ -498,6 +535,43 @@ ossh.install() # <sshConfigHost> <?user> <?logLevel> # installs oosh on <sshConf
   return $?
 }
 
+private.ossh.install.key.authorize()     # <sshConfigHost> <keyFile> <keyFileName> # add this computer's public key to <sshConfigHost>'s public_keys/ and authorized_keys — only added, no other key touched — then check that it logs in with a key #
+{
+ # The installer's key reached root only at the end of a full install
+ # (continue.local), and a second install skipped it (pol-dev review @1:05:34,
+ # T-OSSH-INSTALL-PUSHES-KEY). A runner without ~/.ssh/private_key/ gives its
+ # ~/.ssh/id_*.pub, as key.pull reads a host without oosh keys.
+ local host="$1" keyFile="$2" keyFileName="$3" k
+ if [ ! -f "$keyFile" ]; then
+   for k in id_ed25519 id_ecdsa id_rsa; do
+     [ -f "$HOME/.ssh/$k.pub" ] || continue
+     keyFile="$HOME/.ssh/$k.pub"; keyFileName="$(whoami).$k.public_key"
+     break
+   done
+ fi
+ if [ ! -f "$keyFile" ]; then
+   create.result 0 "no public key on this computer — $host keeps asking the password"
+   warn.log "$RESULT"
+   return $(result)
+ fi
+ private.ossh.ssh "$host" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/'$keyFileName'" < "$keyFile" || {
+   create.result 1 "could not copy $keyFileName to $host"; error.log "$RESULT"; return $(result)
+ }
+ private.ossh.authorized.key.append.get "$keyFileName" | private.ossh.ssh "$host" "sh" || {
+   create.result 1 "could not add $keyFileName to $host's authorized_keys"; error.log "$RESULT"; return $(result)
+ }
+ # A key login of its own, past the master: the Host entry may name another
+ # key than the one pushed (POL.dev: IdentityFile id_rsa, pushed id_ed25519).
+ if private.ossh.ssh -oBatchMode=yes -oControlPath=none "$host" true 2>/dev/null; then
+   create.result 0 "$keyFileName authorized on $host — it logs in with the key"
+   success.log "$RESULT"
+ else
+   create.result 0 "$keyFileName added on $host, but the key login fails — does the Host entry's IdentityFile name this key? (ossh config.get $host)"
+   warn.log "$RESULT"
+ fi
+ return $(result)
+}
+
 private.push.init.oosh() {
 
   private.get.sshDir
@@ -510,6 +584,11 @@ private.push.init.oosh() {
     error.log "Failed to open SSH connection to $sshConfigHost"
     return 1
   }
+
+  # The installer's key first — before the early exits below, so a second
+  # install authorizes it too, and every later step could log in without the
+  # password (T-OSSH-INSTALL-PUSHES-KEY).
+  private.ossh.install.key.authorize "$sshConfigHost" "$file" "$keyFileName" || return $(result)
 
   # Skip bootstrap if oosh is already installed (state machine at [99])
   # Use bash explicitly (Alpine default shell is ash which doesn't support source/declare)
@@ -530,13 +609,6 @@ private.push.init.oosh() {
   info.log "Transferring init/oosh to $sshConfigHost via SSH..."
   private.ossh.ssh "$sshConfigHost" "cat > ~/oosh && chmod +x ~/oosh" < "$OOSH_DIR/init/oosh" || {
     error.log "Failed to transfer init/oosh to $sshConfigHost"
-    return 1
-  }
-
-  # Transfer public key via ssh cat
-  info.log "Transferring public key to $sshConfigHost..."
-  private.ossh.ssh "$sshConfigHost" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/$keyFileName" < "$file" || {
-    error.log "Failed to transfer public key to $sshConfigHost"
     return 1
   }
 
@@ -2186,7 +2258,7 @@ private.ossh.push.config() # <toHost> <?sshConfigName> # appends a Host block to
   fi
 
 
-  ossh.connection.open "$toHost"
+  ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
   # Ensure ~/config exists and is owned by the SSH-install user before rsync.
   # On macOS the install path can leave admin's ~/config root:wheel-owned
   # (root sudo'd into admin's home during install), causing rsync's atomic
@@ -2245,13 +2317,15 @@ private.ossh.push.key() #  <toHost> <?keyName> <?sshDir:~/.ssh> # adds your key 
   # Quote keyName everywhere — defensive against legacy filenames
   # that may have spaces (pre-sanitization at private.ossh.set.key.name).
   echo "$sshDir/public_keys/$keyName" "$toHost:.ssh/public_keys/$keyName"
-  ossh.connection.open "$toHost"
+  ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
   # Transfer key via ssh cat (no rsync needed on remote). Single-quote
   # the remote redirect target so a keyName with literal whitespace
   # doesn't get token-split by the remote shell.
   private.ossh.ssh "$toHost" "mkdir -p ~/.ssh/public_keys && cat > ~/.ssh/public_keys/'$keyName'" < "$sshDir/public_keys/$keyName"
   # An oosh on <toHost> without authorized.keys.update: the key is only added.
-  ossh.exec $toHost "user authorized.keys.update" || \
+  # `command -v user` first: a host without oosh printed "user: command not
+  # found" on every push (T-OSSH-KEY-PUSH-BARE-QUIET).
+  ossh.exec $toHost "command -v user >/dev/null 2>&1 && user authorized.keys.update" || \
     private.ossh.authorized.key.append.get "$keyName" | private.ossh.ssh "$toHost" "sh"
 }
 
@@ -2362,7 +2436,7 @@ private.ossh.push.dir() # <toHost> <dir> # adds the config <configName> to the c
     return 1
   fi
 
-  ossh.connection.open "$toHost"
+  ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
   private.ossh.rsync "$dir" "$toHost:."
 }
 
@@ -2442,7 +2516,7 @@ private.ossh.pull.dir() # <fromHost> <dir> # gets te directory <dir> <fromHost> 
   fi
 
   important.log "copying from $toHost:$dir"
-  ossh.connection.open "$toHost"
+  ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
   private.ossh.rsync.pull "$toHost:$dir" "."
   #ssh $toHost "user authorized.keys.update"
 }
@@ -2487,7 +2561,7 @@ private.ossh.pull.key() # <fromHost> <?keyName> <?sshDir:~/.ssh> # gets the key 
   [ -n "$1" ] && shift
   local sshDir="$RESULT"
 
-  ossh.connection.open "$fromHost"
+  ossh.connection.open "$fromHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
 
   # The file key.push would send from <fromHost>: public_keys/<keyName>,
   # by default the host's own key file. A host without oosh keys (Termux,
@@ -2635,7 +2709,7 @@ private.ossh.push.id() # <toHost> <id> <?sshDir> # pushes the <id> <toHost>
   local sshDir="$RESULT"
   local idDir="$sshDir/ids/$idName"
 
-  ossh.connection.open "$toHost"
+  ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
   private.ossh.rsync "$idDir" "$toHost:~/.ssh/ids/"
 }
 

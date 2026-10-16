@@ -1806,4 +1806,144 @@ test.case $level "T-OSSH-KEY-PULL: ossh key.pull gets a host's public key into p
 expect 0 "key.pull is key.push the other way around" \
   "key.pull pulled ~/.ssh/<name>.pub as .pulled, asked for a method dev renamed, and never authorized it"
 
+# T-OSSH-CONTROL-PATH-SHORT: the ControlMaster socket path fits a Unix socket
+# ssh binds the master at <ControlPath>.<16 random chars> first; on macOS a
+# socket path is at most 103 characters. ${TMPDIR:-/tmp}/ossh-%C with macOS's
+# TMPDIR (/var/folders/t7/…/T/, 49 characters) gave 112: connection.open failed
+# every time, and every step of key.push asked the password again — five
+# prompts and "Failed to connect", the key still landed (pol-dev review
+# 2026-10-15 @46:08; reproduced with a 49-character TMPDIR, 2026-10-16).
+# user and os carried a copy of their own; ossh's getter is the one answer.
+test.ossh.controlPathShort() {
+  local fx bad="" long p
+  fx=$(test.suite.fixture.make osshcp)
+  long="$fx/$(printf 'x%.0s' $(seq 1 60))"; mkdir -p "$long"
+  private.test.ossh.controlPath.len() { local s="${1//%C/$(printf '%040d' 0)}"; echo $(( ${#s} + 17 )); }
+  # a long TMPDIR (macOS-like): not used, the path still fits
+  p=$(TMPDIR="$long" private.ossh.control.path.get)
+  case "$p" in "$long"*) bad="$bad longUsed=[$p]" ;; esac
+  [ "$(private.test.ossh.controlPath.len "$p")" -lt 104 ] || bad="$bad longTooLong=[$p]"
+  # a short, writable TMPDIR (Termux has no /tmp): used
+  p=$(TMPDIR="$fx" private.ossh.control.path.get)
+  [ "$p" = "$fx/ossh-%C" ] || bad="$bad short=[$p]"
+  # a TMPDIR that is not there: /tmp
+  p=$(TMPDIR="$fx/none" private.ossh.control.path.get)
+  [ "$p" = "/tmp/ossh-%C" ] || bad="$bad missing=[$p]"
+  # one definition: user carries no ControlPath of its own
+  grep -nE '^[^#]*OSSH_CONTROL_PATH:=' "$OOSH_DIR/user" | grep -q . && bad="$bad userCopy"
+  unset -f private.test.ossh.controlPath.len
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the ControlPath fits a Unix socket" || create.result 1 "control path:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONTROL-PATH-SHORT: the ControlMaster socket path fits a Unix socket (macOS)" test.ossh.controlPathShort
+expect 0 "the ControlPath fits a Unix socket" \
+  "macOS TMPDIR made the socket path 112 characters: connection.open failed, key.push asked five times"
+
+# T-OSSH-CONNECTION-OPEN-FAIL: a failed connection says why and stops key.push
+# connection.open sent ssh's stderr to /dev/null and retried with -4 whatever
+# the reason: a wrong password asked again, "Failed to connect" said nothing,
+# and key.push went on — every later step a new password prompt. Now ssh's
+# reason is in RESULT, -4 only follows a network error, and key.push and
+# key.pull stop. `ssh` and private.ossh.ssh are stubs; nothing leaves the host.
+test.ossh.connectionOpenFail() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshopen)
+  private.test.ossh.open.run() { # <reason> <what> # run <what> with ssh failing for <reason>; echo the calls, rc and RESULT
+    ( FX_REASON="$1"; shift; TMPDIR="$fx"
+      ssh() {
+        echo "ssh $*" >> "$fx/calls"
+        case "$*" in (*"-O check"*) return 255 ;; esac
+        case "$FX_REASON:$*" in
+          (auth:*) echo "root@localhost: Permission denied (publickey,password)." >&2; return 255 ;;
+          (net:"-4 "*) return 0 ;;
+          (net:*) echo "Connection to localhost closed by remote host: Broken pipe" >&2; return 255 ;;
+        esac
+      }
+      private.ossh.ssh() { echo "private.ossh.ssh $*" >> "$fx/calls"; }
+      ossh.exec() { echo "ossh.exec $*" >> "$fx/calls"; }
+      "$@" >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" >> "$fx/calls" )
+    cat "$fx/calls"; rm -f "$fx/calls"
+  }
+  out=$(private.test.ossh.open.run auth ossh.connection.open lab)
+  echo "$out" | grep -q 'rc=1 .*Permission denied' || bad="$bad authReason=[$(echo "$out" | tail -1)]"
+  echo "$out" | grep -q 'ssh -4 ' && bad="$bad authRetried"
+  out=$(private.test.ossh.open.run net ossh.connection.open lab)
+  echo "$out" | grep -q 'ssh -4 ' && echo "$out" | grep -q '^rc=0' || bad="$bad netNoRetry=[$(echo "$out" | tr '\n' '|')]"
+  out=$(private.test.ossh.open.run auth ossh.key.push lab)
+  echo "$out" | grep -qE '^(private\.ossh\.ssh|ossh\.exec) ' && bad="$bad pushWentOn=[$(echo "$out" | tr '\n' '|')]"
+  echo "$out" | grep -q '^rc=1' || bad="$bad pushRc=[$(echo "$out" | tail -1)]"
+  ls "$fx" | grep -q . && bad="$bad tmpLeft=[$(ls "$fx" | tr '\n' ' ')]"
+  unset -f private.test.ossh.open.run
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a failed connection says why and stops" || create.result 1 "connection.open:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONNECTION-OPEN-FAIL: a failed connection says why, retries -4 only on a network error, and stops key.push" test.ossh.connectionOpenFail
+expect 0 "a failed connection says why and stops" \
+  "ssh's reason went to /dev/null and key.push asked the password at every step"
+
+# T-OSSH-INSTALL-PUSHES-KEY: ossh install authorizes the installer's key first
+# The installer's key reached root's authorized_keys only at the very end of
+# the remote state machine, and a second install (state 99 or ~/oosh there)
+# skipped even the copy into public_keys/ (pol-dev review @1:05:34: "ossh
+# install should push the key automatically"). It is now added — only added,
+# no other key touched — right after the connection opens, before any early
+# exit. private.ossh.ssh, connection.open and finish.local are stubs.
+test.ossh.installPushesKey() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshinstkey)
+  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key"
+  echo "ssh-ed25519 AAAAINSTALLER me@runner" > "$fx/.ssh/public_keys/ssh.runner.public_key"
+  echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
+  ( HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"; sshConfigHost=lab; OSSH_INSTALL_TARGET_USER=""
+    ossh.connection.open() { echo "open $*" >> "$fx/calls"; return 0; }
+    private.ossh.ssh() {
+      local stdin=""; [ -t 0 ] || stdin=$(cat | head -c 400 | tr '\n' ' ')
+      echo "ssh $* <<[$stdin]" >> "$fx/calls"
+      return 0   # every probe answers yes: state 99, the early exit
+    }
+    ossh.install.finish.local() { echo "finish $*" >> "$fx/calls"; }
+    private.push.init.oosh >/dev/null 2>&1 </dev/null )
+  out=$(cat "$fx/calls" 2>/dev/null)
+  echo "$out" | grep -q "cat > ~/.ssh/public_keys/'ssh.runner.public_key'.*AAAAINSTALLER" || bad="$bad noCopy"
+  echo "$out" | grep -qE "^ssh lab sh <<\[.*grep -qxF" || bad="$bad noAppend"
+  echo "$out" | grep -q -- "-oBatchMode=yes" || bad="$bad noCheck"
+  # all of it before the early exit to finish.local
+  [ "$(echo "$out" | grep -nE "public_keys/'ssh.runner|^finish " | head -1 | cut -d: -f2 | cut -c1-6)" != "finish" ] || bad="$bad afterExit"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "ossh install authorizes the installer's key first" || create.result 1 "install key:$bad [$(echo "$out" | tr '\n' '|' | cut -c1-300)]"
+  return $(result)
+}
+test.case $level "T-OSSH-INSTALL-PUSHES-KEY: ossh install authorizes the installer's key first, a second install too" test.ossh.installPushesKey
+expect 0 "ossh install authorizes the installer's key first" \
+  "the installer's key reached root only at the end of a full install; a second install skipped it"
+
+# T-OSSH-KEY-PUSH-BARE-QUIET: key.push to a host without oosh prints no error
+# key.push ran `user authorized.keys.update` on the target; a bare server has
+# no `user`, so every push printed "bash: line 1: user: command not found"
+# before the add-only fallback did the work — read as "key push is broken"
+# (pol-dev review @46:08). It asks for `user` first; the fallback stays.
+test.ossh.keyPushBareQuiet() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshbare)
+  mkdir -p "$fx/.ssh/public_keys" "$fx/.ssh/private_key"
+  echo "ssh-ed25519 AAAABARE me@runner" > "$fx/.ssh/public_keys/ssh.runner.public_key"
+  echo "private" > "$fx/.ssh/private_key/ssh.runner.private_key"
+  ( HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"
+    ossh.connection.open() { return 0; }
+    private.ossh.ssh() { cat >/dev/null; echo "ssh $*" >> "$fx/calls"; }
+    ossh.exec() { echo "exec $*" >> "$fx/calls"; return 1; }
+    ossh.key.push lab >/dev/null 2>&1 </dev/null )
+  out=$(cat "$fx/calls" 2>/dev/null)
+  echo "$out" | grep -q '^exec lab command -v user .*&& user authorized.keys.update' || bad="$bad unguarded=[$(echo "$out" | grep '^exec' | tr '\n' '|')]"
+  echo "$out" | grep -q '^ssh lab sh' || bad="$bad noFallback"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "key.push to a host without oosh prints no error" || create.result 1 "bare push:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-KEY-PUSH-BARE-QUIET: key.push to a host without oosh prints no 'user: command not found'" test.ossh.keyPushBareQuiet
+expect 0 "key.push to a host without oosh prints no error" \
+  "every push to a bare server printed user: command not found — read as a broken push"
+
 test.suite.save.results

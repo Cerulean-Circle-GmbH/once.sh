@@ -198,6 +198,31 @@ runs the local rebuild. A host without oosh keys (Termux) gives its
 asked for a method dev had renamed, pulled `~/.ssh/<name>.pub` as
 `<name>.public_key.pulled` and never ran the rebuild (T-OSSH-KEY-PULL).
 
+### First contact with only a password
+
+`ossh connection.open` opens one shared connection; the password is asked
+once. Its socket path (`private.ossh.control.path.get`) is
+`${TMPDIR:-/tmp}/ossh-%C` only when that fits a Unix socket, else
+`/tmp/ossh-%C`, else `~/.ssh/ossh-%C`. Before 2026-10-16 the long TMPDIR of
+macOS (49 characters) made it too long: `connection.open` always failed,
+`ossh key.push` asked the password five times and said "Failed to connect",
+and the key still landed (T-OSSH-CONTROL-PATH-SHORT).
+
+A failed connection now says ssh's reason (e.g. `Permission denied`) and stops
+`key.push` / `key.pull` / `push.*` / `pull.*`; `-4` is retried only after a
+network error (T-OSSH-CONNECTION-OPEN-FAIL).
+
+`ossh install <host>` adds the installer's key to the host's `public_keys/` and
+`authorized_keys` right after the connection opens — only added — and checks a
+key login; when that fails, a warning names the Host entry's IdentityFile
+(T-OSSH-INSTALL-PUSHES-KEY).
+
+`user authorized.keys.update` returns 1 when the user has no ssh set up (no
+private key in the sshDir), so `key.push`'s add-only fallback takes over
+(T-USER-AUTHORIZED-KEYS-UPDATE-RC). On a host without oosh, `key.push` asks
+for `user` first and goes straight to that fallback — no "user: command not
+found" any more (T-OSSH-KEY-PUSH-BARE-QUIET).
+
 ## Repairing a Broken `~/.ssh`
 
 A fresh OOSH install lays down a canonical `~/.ssh` tree via `osshLayout build` (idempotent roles for owner, developking, installer, outeruser, closed by `private.osshLayout.perms.tighten`). On older machines that were installed before the Phase 2 layout work, the tree may have drifted — forbidden symlinks where real files are required, wrong perms (775/777 on private keys), legacy artifacts from earlier OOSH versions.
