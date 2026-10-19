@@ -58,6 +58,24 @@ ossh config.save.last
 ossh list
 ```
 
+`config.create` writes its block to its own file (`private.ossh.config.last.file.get`,
+`$CONFIG_PATH/ssh.config.last`) and, as before, a copy to `$CONFIG_PATH/result.txt` for
+`config.show.last`. `config.save.last` appends **only** that block:
+
+- it checks it is one Host block (the first line `Host <name>`, no second `Host`, every other
+  line an indented `<Keyword> <value>`), else rc 1 "… is no single Host block — not appended"
+- a Host the file already has: rc 1 "already exists — not appending duplicate", as before
+- no last block: rc 1 "ossh config.create first"
+- an existing file is written in place after the checks (owner and mode stay — also the shared
+  config of `config.shared.github.create`); a new file is made 600
+- rc 0 + RESULT `appended <name> to <file>` (T-OSSH-CONFIG-SAVE-LAST)
+
+Until 2026-10-19 it appended the whole `result.txt`, a scratch file: with live logging
+(`LOG_LIVE`, on by default) `console.log`, `success.log` and `error.log` tee into it, and
+`ossh config.get` overwrites it. A log line between create and save landed in `~/.ssh/config`, ssh
+then refused the whole file ("Bad configuration option") and every login of that user failed
+(review meeting 2026-10-15).
+
 ### Deleting a Config
 
 ```bash
@@ -227,8 +245,8 @@ ossh key.push myhost
 # Pull a remote host's key here and let it log in to this computer
 ossh key.pull myhost
 
-# Push SSH config to a remote host
-ossh config.push myhost
+# Put the Host block demo into a remote host's SSH config (replaced there, or added)
+ossh config.push myhost demo
 
 # Pull a Host block from a remote host's SSH config
 ossh config.pull myhost demo
@@ -404,8 +422,9 @@ path (T-OSSH-OOSH-INIT-PUSH-RESULT):
 
 The copy helpers say theirs too (T-OSSH-PUSH-PULL-RESULT), each rc 1 + RESULT
 + error.log for a missing argument, a failed connection or a failed copy:
-`private.ossh.config.push <toHost> <?sshConfigName>` (`<name> appended to
-<toHost>:~/.ssh/config`; without a name nothing is pushed, rc 0),
+`private.ossh.config.push <toHost> <?sshConfigName>` (`<name> added to` /
+`<name> replaced in <toHost>:~/.ssh/config`; without a name nothing is pushed, rc 0 —
+see "Pushing a Config" below),
 `private.ossh.dir.push <toHost> <dir>` (`<dir> copied to <toHost>`),
 `private.ossh.dir.pull <fromHost> <dir>` (`<fromHost>:<dir> copied here`) and
 `private.ossh.id.push <toHost> <id> <?sshDir>` (`<id> copied to
@@ -416,6 +435,27 @@ copy). Until 2026-10-16 they had verb-first names
 (T-OSSH-RENAMES-OBJECT-VERB) and ended with a bare `return 1` or the copy's
 rc; the public `ossh config.push` / `dir.push` / `dir.pull` / `id.push` keep
 their names.
+
+### Pushing a Config
+
+`ossh config.push <toHost> <sshConfigName>` puts the local Host block into `~/.ssh/config` on
+`<toHost>` in one ssh call, the block on stdin; the host runs POSIX commands from
+`private.ossh.config.block.put.get` — no rsync and no oosh needed there:
+
+| On the host | Then | RESULT |
+|---|---|---|
+| no block of that name | appended after an empty line (a new `~/.ssh` 700, a new config 600) | `<name> added to <host>:~/.ssh/config` |
+| one or more blocks of that name | the first replaced **in place** (a `Host *` before it keeps deciding), the others dropped | `<name> replaced in <host>:~/.ssh/config` |
+
+The file is written back with `>`, so its owner and mode stay. Refused with rc 1 before the
+host is asked: a name that is no Host name (only letters, digits, `.`, `_`, `@`, `-`) and a
+name that is not in the local config. A failed host is rc 1 `could not put <name> into …`
+(T-OSSH-CONFIG-BLOCK-PUT, T-OSSH-CONFIG-PUSH).
+
+Until 2026-10-19 it copied a temp file with rsync into the host's `~/config` (after a
+`sudo chown -h` there) and appended it with `>>`: a second push gave a second block, ssh reads
+only the first, so a block changed with `config.set` had no effect there; an unknown name
+answered rc 0 "appended" and added an empty line; a bare host without rsync failed (lab cplab).
 
 `user authorized.keys.update` returns 1 when the user has no ssh set up (no
 private key in the sshDir), so `key.push`'s add-only fallback takes over
@@ -564,8 +604,8 @@ The shared config lives in the platform-appropriate shared home directory — `/
 |--------|-------------|
 | `ossh config.create` | Create SSH config entry |
 | `ossh config.show.last` | Show last generated config |
-| `ossh config.save.last` | Save last config to ~/.ssh/config |
-| `ossh config.push` | Push SSH config to remote host |
+| `ossh config.save.last` | Append the block of the last config.create to ~/.ssh/config (checked) |
+| `ossh config.push` | Put a Host block into a remote host's ~/.ssh/config (replaced or added) |
 | `ossh config.pull` | Copy a Host block from a remote host's ~/.ssh/config here |
 | `ossh config.delete` | Remove a Host block from ~/.ssh/config |
 | `ossh config.set` | Set one of seven fields (port, user, …) of a Host block |

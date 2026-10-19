@@ -421,6 +421,64 @@ private.ossh.config.identitiesOnly.set()     # <configItem> <value> # set the Id
 { private.ossh.config.field.set "$1" identitiesOnly "$2"; }
 private.ossh.config.identitiesOnly.set.completion.value() { echo yes; echo no; }
 
+private.ossh.config.block.put.get()     # <sshConfigName> # echo the POSIX commands that put the Host block <sshConfigName> read from their stdin into ~/.ssh/config of the shell that runs them — the first block of that name replaced in place, further copies dropped, else appended — and that echo added or replaced; no oosh needed there #
+{
+ # NO create.result — a getter; its output is the command text config.push
+ # sends (T-OSSH-CONFIG-BLOCK-PUT). config.push appended with >>: a second
+ # push gave a second block, and ssh reads only the first, so a changed block
+ # had no effect (lab cplab, 2026-10-19). Replaced IN PLACE, not moved to the
+ # end: a Host * before it decides which value counts. Further copies go with
+ # their empty line. POSIX sh and awk (ENVIRON), so a host without oosh takes
+ # it; written back with cat >, so owner and mode stay (as ossh.config.delete),
+ # under umask 077 a new ~/.ssh is 700 and a new config 600 (as
+ # private.ossh.remote.public.key.put). A ' in the name is dropped, as
+ # private.ossh.authorized.key.append.get does — it would end the quote.
+ local sshConfigName="${1//\'/}"
+ [ -n "$sshConfigName" ] || return 1
+ printf "H='%s'; export H\n" "$sshConfigName"
+ cat <<'EOF'
+umask 077
+mkdir -p ~/.ssh && chmod 700 ~/.ssh || exit 1
+f=~/.ssh/config
+[ -f "$f" ] || : > "$f" || exit 1
+B="$(cat)"; export B
+how=added
+awk '$1 == "Host" && $2 == ENVIRON["H"] && NF == 2 { found = 1 } END { exit !found }' "$f" && how=replaced
+awk '
+  $1 == "Host" {
+    inOld = 0; drop = 0
+    if ($2 == ENVIRON["H"] && NF == 2) {
+      if (!done) { print ENVIRON["B"]; done = 1; inOld = 1 } else { drop = 1 }
+      next
+    }
+  }
+  drop && /^[ \t]*$/ { drop = 0; next }
+  drop { next }
+  inOld && /^[ \t]*$/ { inOld = 0; print; last = $0; next }
+  inOld { next }
+  { print; last = $0 }
+  END {
+    if (!done) {
+      if (NR > 0 && last !~ /^[ \t]*$/) print ""
+      print ENVIRON["B"]
+    }
+  }
+' "$f" > "$f.new" || { rm -f "$f.new"; exit 1; }
+cat "$f.new" > "$f" || { rm -f "$f.new"; exit 1; }
+rm -f "$f.new"
+echo "$how"
+EOF
+}
+
+private.ossh.config.last.file.get()     #  # echo the file ossh config.create writes its Host block to and ossh config.save.last reads it from — its own file, no logger writes there #
+{
+ # NO create.result — a getter consumed as $(...). result.txt is a scratch
+ # file the live log tees into and ossh.config.get overwrites; save.last
+ # appended it whole, log lines included (T-OSSH-CONFIG-SAVE-LAST).
+ echo "$CONFIG_PATH/ssh.config.last"
+}
+
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2018,6 +2076,11 @@ ossh.config.parse() # <sshConfigHost>  <?method:private.config.create> # parses 
 }
 
 private.config.create() {
+  # The block goes to its own file, the one config.save.last reads: result.txt
+  # is a scratch file the live log tees into and ossh.config.get overwrites
+  # (T-OSSH-CONFIG-SAVE-LAST). result.txt keeps a copy for config.show.last
+  # and whoever else reads it.
+  local last; last="$(private.ossh.config.last.file.get)"
   {
     echo ""
     echo "Host $sshConfigHost"
@@ -2028,7 +2091,8 @@ private.config.create() {
     [ -n "$identitiesOnly" ] && echo " IdentitiesOnly yes"
     [ -n "$proxyJump" ] && echo " ProxyJump $proxyJump"
     echo ""
-  } >$CONFIG_PATH/result.txt
+  } >"$last"
+  cat "$last" >$CONFIG_PATH/result.txt
   ossh.config.show.last
   create.result 0 "$sshConfigHost"
 }
@@ -2192,25 +2256,68 @@ ossh.config.show.last() {
   cat $CONFIG_PATH/result.txt
 }
 
-ossh.config.save.last() {  # <?file> # appends the config to file
-  local file="$1"
-  if [ -n "$1" ]; then
-    file="$1"
-    shift
-  else
+ossh.config.save.last()     # <?file:~/.ssh/config> # append the Host block of the last ossh config.create to <file> — read from its own file, checked to be one Host block, <file> written whole with its mode kept — rc 1 + RESULT when there is none, it is damaged or <file> has that Host already #
+{
+  # It appended the WHOLE $CONFIG_PATH/result.txt: with live logging the
+  # loggers tee into it, so a log line between create and save landed in
+  # ~/.ssh/config — ssh then refuses the whole file ("Bad configuration
+  # option") and every login of that user fails (meeting item 6,
+  # T-OSSH-CONFIG-SAVE-LAST). Now only config.create's own file, and only
+  # when it is one Host block.
+  local file="$1" last hostEntry block content
+  if [ -z "$file" ]; then
     private.get.sshDir
     file="$RESULT/config"
   fi
-
-  # Check for duplicate Host entry before appending
-  local hostEntry=$(grep "^Host " "$CONFIG_PATH/result.txt" 2>/dev/null | head -1 | sed 's/^Host //')
-  if [ -n "$hostEntry" ] && grep -q "^Host ${hostEntry}$" "$file" 2>/dev/null; then
-    warn.log "Host '$hostEntry' already exists in $file — not appending duplicate"
-    return 1
+  last="$(private.ossh.config.last.file.get)"
+  if [ ! -s "$last" ]; then
+    create.result 1 "config.save.last: no last config in $last — ossh config.create first"
+    error.log "$RESULT"
+    return $(result)
   fi
-
-  cat $CONFIG_PATH/result.txt >>$file
-  important.log "appended last config to $file"
+  # One block: the first line that is not empty is "Host <name>", no second
+  # Host line, every other line an indented "<Keyword> <value>" or empty.
+  hostEntry="$( awk '
+    NF == 0 { next }
+    !seen { seen = 1; if ($1 == "Host" && NF == 2) print $2; else bad = 1; next }
+    $1 == "Host" || $0 !~ /^[ \t]+[A-Za-z]+[ \t]+[^ \t]/ { bad = 1 }
+    END { exit bad }
+  ' "$last" )" || hostEntry=""
+  if [ -z "$hostEntry" ]; then
+    create.result 1 "config.save.last: $last is no single Host block — not appended"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  # The Host compared as a string, as config.set does.
+  if HOST="$hostEntry" awk '$1 == "Host" && $2 == ENVIRON["HOST"] && NF == 2 { found = 1 } END { exit !found }' "$file" 2>/dev/null; then
+    create.result 1 "Host '$hostEntry' already exists in $file — not appending duplicate"
+    warn.log "$RESULT"
+    return $(result)
+  fi
+  # One empty line between the blocks. An existing file is written in place
+  # with > after every check: owner and mode stay, as ossh.config.delete does
+  # — the shared config (ossh.config.shared.github.create) belongs to its
+  # owner, and a rename would hand it to the writer. A new file goes through
+  # private.this.file.write: 600, owner only.
+  block="$( awk 'NF' "$last" )"
+  content=""
+  [ -s "$file" ] && content="$(cat "$file")"$'\n\n'
+  if [ -e "$file" ]; then
+    if ! { printf '%s\n' "$content$block" > "$file"; } 2>/dev/null; then
+      create.result 1 "config.save.last: cannot write $file"
+      error.log "$RESULT"
+      return $(result)
+    fi
+  else
+    case "$file" in (*/*) private.this.folder.ensure "${file%/*}" || { error.log "$RESULT"; return $(result); } ;; esac
+    if ! private.this.file.write "$file" "$content$block"; then
+      error.log "$RESULT"
+      return $(result)
+    fi
+  fi
+  create.result 0 "appended $hostEntry to $file"
+  important.log "$RESULT"
+  return $(result)
 }
 
 ossh.config.shared.github.create() # <?sharedDir> # create shared SSH config + Host github.com alias whose IdentityFile is ~/.ssh/ids/ssh.developking/id_rsa (placed by osshLayout.role.developking on every user). Idempotent.
@@ -2600,12 +2707,12 @@ ossh.service.status.darwin() {
   fi
 }
 
-ossh.config.push() # <toHost> <sshConfigName> # adds the config <configName> to the configs on host <toHost>
+ossh.config.push()     # <toHost> <?sshConfigName> # puts the local Host block <sshConfigName> into ~/.ssh/config on <toHost> — replaced where it is, or added — one ssh call, no rsync or oosh needed there #
 {
   private.ossh.config.push "$@"
 }
 
-private.ossh.config.push()     # <toHost> <?sshConfigName> # append the local Host block <sshConfigName> to <toHost>:~/.ssh/config; without <sshConfigName> nothing is pushed (rc 0 + RESULT); rc 1 + RESULT and error.log when <toHost> is missing, the connection fails or a copy step fails #
+private.ossh.config.push()     # <toHost> <?sshConfigName> # put the local Host block <sshConfigName> into <toHost>:~/.ssh/config — the first block of that name replaced in place, further copies dropped, else added — rc 0 + RESULT added or replaced; without <sshConfigName> nothing is pushed (rc 0 + RESULT); rc 1 + RESULT and error.log when <toHost> is missing, the name is no Host here, the connection or the host fails #
 {
   # Named object.verb since 2026-10-16 (was private.ossh.push.config,
   # T-OSSH-RENAMES-OBJECT-VERB); a RESULT on every path, it returned a bare 1
@@ -2615,7 +2722,7 @@ private.ossh.config.push()     # <toHost> <?sshConfigName> # append the local Ho
   # from remote to runner doesn't work in platform.test containers — Docker
   # NAT — and doesn't work in real ProxyJump — jump host's privkey isn't on
   # the remote). Removed in Phase A.6.
-  local toHost="$1" configName tmpFile
+  local toHost="$1" configName file block how
   if [ -n "$1" ]; then
     shift
   else
@@ -2639,40 +2746,46 @@ private.ossh.config.push()     # <toHost> <?sshConfigName> # append the local Ho
     return $(result)
   fi
 
+  # The name goes into the remote command: only what a Host alias is made
+  # of, checked before the host is asked (T-OSSH-CONFIG-PUSH).
+  case "$configName" in
+    (*[!A-Za-z0-9._@-]*|.|..)
+      create.result 1 "config.push: $configName is no Host name"
+      error.log "$RESULT"
+      return $(result)
+      ;;
+  esac
+  # The block is read here first: an unknown name answered rc 0 "appended"
+  # and added an empty line there (lab cplab, 2026-10-19). Only the lines from
+  # "Host <name>" to the empty line, as config.pull keeps them; a . is a dot.
+  private.get.sshDir
+  file="$RESULT/config"
+  block="$( LOG_DEVICE=/dev/null ossh.config.get "$configName" "$file" 2>/dev/null | line.find "^Host ${configName//./\\.}$" "^$" )"
+  if [ -z "$block" ]; then
+    create.result 1 "config.push: $configName is not in $file"
+    error.log "$RESULT"
+    return $(result)
+  fi
+
   ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
-  # The block goes through a file in $CONFIG_PATH, removed on every way out;
-  # it was removed as ~/config/…, another folder when CONFIG_PATH is not ~/config.
-  tmpFile="$CONFIG_PATH/tmp.ssh.config.$configName"
-  ossh.config.get $configName >"$tmpFile"
-  # Ensure ~/config exists and is owned by the SSH-install user before rsync.
-  # On macOS the install path can leave admin's ~/config root:wheel-owned
-  # (root sudo'd into admin's home during install), causing rsync's atomic
-  # `mkstempat .tmp.ssh.config..XXX` to fail with Permission denied. The
-  # mkdir -p is a no-op when the dir exists; the sudo chown re-claims
-  # ownership for the SSH user. `|| true` keeps the function moving if sudo
-  # isn't installed (no-op on Linux containers where install user owns
-  # ~/config from creation).
-  #
-  # `chown -h` is critical — on Linux, ~/config is a SYMLINK to sharedConfig
-  # (root:dev). Without -h, chown FOLLOWS the symlink and
-  # clobbers sharedConfig's ownership to the SSH-install user — and on
-  # `os platform.test ubuntu_24_04` where test's primary group is gid=0,
-  # `chown $(id -un):` (trailing colon = primary group) sets sharedConfig
-  # to test:root → other dev-group users (oosh-user, bash-user) lose
-  # write access through their own ~/config symlinks, c2 completion fails
-  # with "Permission denied". `chown -h` operates on the link itself when
-  # the path is a symlink, and is a harmless no-op on real dirs (POSIX +
-  # GNU + BSD compatible). Bisect confirmed root cause; see commit msg.
-  private.ossh.ssh "$toHost" "mkdir -p config; sudo chown -h \$(id -un): config 2>/dev/null || true" 2>/dev/null
-  if private.ossh.rsync "$tmpFile" "$toHost:config/tmp.ssh.config.$configName" \
-     && private.ossh.ssh "$toHost" "cat config/tmp.ssh.config.$configName >>.ssh/config && rm ~/config/tmp.ssh.config.$configName"; then
-    create.result 0 "$configName appended to $toHost:~/.ssh/config"
+  # One ssh call, the block on stdin, the host's own commands put it in
+  # place (private.ossh.config.block.put.get): replaced where it is or added,
+  # never a second copy. It was a temp file in ~/config, a sudo chown -h of
+  # the remote ~/config (macOS installs left it root-owned) and rsync, then
+  # cat >> — rsync is missing on a bare host, and >> appended a second block
+  # that ssh never reads (T-OSSH-CONFIG-PUSH).
+  # The answer is the last line: a login banner or rc file of the host may print before it.
+  how="$( private.ossh.ssh "$toHost" "$(private.ossh.config.block.put.get "$configName")" <<< "$block" | tail -n 1 )"
+  case "$how" in
+    (added)    create.result 0 "$configName added to $toHost:~/.ssh/config" ;;
+    (replaced) create.result 0 "$configName replaced in $toHost:~/.ssh/config" ;;
+    (*)        create.result 1 "could not put $configName into $toHost:~/.ssh/config" ;;
+  esac
+  if [ "$(result)" = 0 ]; then
     success.log "$RESULT"
   else
-    create.result 1 "could not append $configName to $toHost:~/.ssh/config"
     error.log "$RESULT"
   fi
-  rm -f "$tmpFile"
   return $(result)
 }
 
@@ -3430,7 +3543,8 @@ ossh.prereqs.install() # <?sshConfigHost> # install post-clone prereqs via oo cm
   if [ -z "$host" ]; then
     # Local mode — install runtime prereqs via oo cmd.
     important.log "ossh.prereqs.install (local): installing post-clone prereqs via oo cmd"
-    # rsync — needed by private.ossh.rsync for the runner→remote config push.
+    # rsync — needed by private.ossh.rsync for dir.push / dir.pull / id.push
+    #         (config.push goes over ssh cat since 2026-10-19).
     #         Pre-installed on Debian/RHEL/Alma; missing on Alpine busybox.
     # tree  — used by user.ssh.status, ossh.status and the state-31 dumps.
     #
