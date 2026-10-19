@@ -71,6 +71,34 @@ line. The other blocks, the file's mode and its empty lines stay, so a later
 `ossh config.save.last` still appends a separate block. A host that is not
 there answers rc 2 "not found" (T-OSSH-CONFIG-DELETE).
 
+### Pulling a Config from another Host
+
+```bash
+# Copy the Host block demo of myhost's ~/.ssh/config into ~/.ssh/config (or into <file>)
+ossh config.pull myhost demo
+ossh config.pull myhost demo ~/some/other/ssh.config
+
+# Without a name: the Host names myhost has
+ossh config.pull myhost
+```
+
+`config.push` the other way around. The block is what `ossh config.get` shows
+on `myhost`: from `Host <name>` to the next empty line; it is added after an
+empty line, and the file is written whole (atomic, its mode kept, a new one
+600). A Host the file already has stays as it is — rc 0 "already in <file>";
+`ossh config.delete <name>` first to replace it. rc 1 + RESULT when the name
+is no Host name (only letters, digits, `.`, `_`, `@`, `-`; checked before the
+host is asked), when `myhost` has no such block, or when the file cannot be
+written (T-OSSH-CONFIG-PULL). `<remoteConfigName>` has no Tab completion: the
+names are on the other host (T-OSSH-CONFIG-PULL-COMPLETION).
+
+The block is `myhost`'s: an `IdentityFile` or `ProxyJump` in it names a key
+file or a Host of that computer — check them here (`ossh config.get <name>`).
+
+Until 2026-10-19 it asked the host for a command that no longer exists
+(was `ossh get.config`) and appended the answer, nothing or an error line,
+with rc 0.
+
 ### Generated Config Format
 
 ```
@@ -163,6 +191,9 @@ ossh key.pull myhost
 
 # Push SSH config to a remote host
 ossh config.push myhost
+
+# Pull a Host block from a remote host's SSH config
+ossh config.pull myhost demo
 ```
 
 ### Who may log in: `public_keys/` and `authorized_keys`
@@ -494,6 +525,8 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh config.show.last` | Show last generated config |
 | `ossh config.save.last` | Save last config to ~/.ssh/config |
 | `ossh config.push` | Push SSH config to remote host |
+| `ossh config.pull` | Copy a Host block from a remote host's ~/.ssh/config here |
+| `ossh config.delete` | Remove a Host block from ~/.ssh/config |
 | `ossh config.shared.create` | Create shared SSH config |
 | `ossh config.shared.link` | Link user to shared config |
 | `ossh install` | Install oosh on remote host |

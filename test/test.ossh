@@ -1761,6 +1761,131 @@ test.case $level "T-OSSH-CONFIG-DELETE: ossh config.delete removes one Host bloc
 expect 0 "one Host block removed in place, the others and the mode kept; a second delete is not found" \
   "ossh had no delete for a config entry; it would be hand-edited"
 
+# T-OSSH-CONFIG-PULL: ossh config.pull brings one Host block from a host, once
+# config.pull asked the host for a command that no longer exists
+# (was `ossh get.config <name>`, the verb-first name of config.get; this.call
+# does not fall back to private.ossh.<name>), so nothing or an error line was appended with
+# `>>`, rc 0 and no RESULT (review meeting 2026-10-15). Now: the name is
+# checked before the host is asked; a Host already here is left as it is
+# (no second block); only the lines from "Host <name>" to the empty line are
+# kept (a host without a terminal logs to stdout); the file is rewritten
+# atomically (mode kept, a new one 600). private.ossh.ssh plays the host:
+# the block only for `ossh config.get '<name>'`, an error for anything else.
+# HOME, CURRENT_SSH_DIR and CONFIG_PATH are the fixture; ssh, scp and rsync
+# are backstops — a step past private.ossh.ssh is a REAL line in <fx>/real.
+test.ossh.configPull() {
+  local fx bad="" f got name
+  fx=$(test.suite.fixture.make osshconfigpull); f="$fx/.ssh/config"
+  mkdir -p "$fx/.ssh" "$fx/config"; chmod 700 "$fx/.ssh"
+  test.ossh.configPull.run() { # <args...> # ossh config.pull <args...> in a subshell against a stubbed host; calls go to <fx>/calls; echo rc|RESULT #
+    ( HOME="$fx"; CURRENT_SSH_DIR="$fx/.ssh"; CONFIG_PATH="$fx/config"
+      ssh() { echo "REAL ssh $*" >> "$fx/real"; return 255; }
+      scp() { echo "REAL scp $*" >> "$fx/real"; return 255; }
+      rsync() { echo "REAL rsync $*" >> "$fx/real"; return 255; }
+      # the old code ran `ossh exec`, a new ossh process none of these stubs reach
+      ossh() { echo "REAL ossh $*" >> "$fx/real"; return 1; }
+      ossh.connection.open() { create.result 0 open; }
+      private.ossh.ssh() {
+        echo "ssh $*" >> "$fx/calls"
+        case "$*" in
+          (*"ossh config.get 'demoPull'"*) printf '%s\n' "INFO> remote noise" "" "Host demoPull" " User root" " HostName 10.0.0.9" "" "SUCCESS> config demoPull found" ;;
+          (*"ossh config.get 'demo.x'"*) printf '%s\n' "" "Host demoAx" " User z" "" ;;
+          (*"ossh config.get '"*) echo ""; return 2 ;;
+          (*"ossh config.list"*) printf '%s\n' "Host demoPull" " User root" ;;
+          (*) echo "ossh.get.config does not exist!"; return 1 ;;
+        esac
+      }
+      create.result 0 stale
+      ossh.config.pull "$@" </dev/null >/dev/null 2>&1; echo "$?|$RESULT" )
+  }
+  printf '%s\n' 'Host first' ' User a' > "$f"; chmod 600 "$f"
+  : > "$fx/calls"
+  got=$(test.ossh.configPull.run lab demoPull "$f")
+  [ "$got" = "0|demoPull pulled from lab into $f" ] || bad="$bad pull=[$got]"
+  [ "$(tr '\n' '|' < "$f")" = "Host first| User a||Host demoPull| User root| HostName 10.0.0.9|" ] || bad="$bad content=[$(tr '\n' '|' < "$f")]"
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-------" ] || bad="$bad mode=$(ls -l "$f" | cut -c1-10)"
+  grep -q "LOG_DEVICE=/dev/null ossh config.get 'demoPull'" "$fx/calls" || bad="$bad asked=[$(tr '\n' '|' < "$fx/calls")]"
+  # a second pull leaves the Host as it is — no second block, the host not asked
+  cp "$f" "$fx/before"; : > "$fx/calls"
+  got=$(test.ossh.configPull.run lab demoPull "$f")
+  [ "$got" = "0|demoPull is already in $f — ossh config.delete demoPull first to replace it" ] || bad="$bad again=[$got]"
+  cmp -s "$f" "$fx/before" || bad="$bad againChanged"
+  [ -s "$fx/calls" ] && bad="$bad againAsked"
+  # the host has no such Host: an error, the file as it was
+  got=$(test.ossh.configPull.run lab ghost "$f")
+  [ "$got" = "1|ghost not found on lab" ] || bad="$bad ghost=[$got]"
+  cmp -s "$f" "$fx/before" || bad="$bad ghostChanged"
+  # a . in the name is a dot: demo.x is not the Host demoAx the host answers with
+  got=$(test.ossh.configPull.run lab demo.x "$f")
+  [ "$got" = "1|demo.x not found on lab" ] && cmp -s "$f" "$fx/before" || bad="$bad dot=[$got]"
+  # a name that is no Host name is refused before the host is asked
+  for name in "it's" "a b" "../x"; do
+    : > "$fx/calls"
+    got=$(test.ossh.configPull.run lab "$name" "$f")
+    [ "${got%%|*}" = 1 ] && [ ! -s "$fx/calls" ] || bad="$bad name[$name]=[$got]"
+  done
+  cmp -s "$f" "$fx/before" || bad="$bad nameChanged"
+  # no name: the host's names are listed, rc 1
+  : > "$fx/calls"
+  got=$(test.ossh.configPull.run lab)
+  [ "$got" = "1|no remoteConfigName was specified" ] && grep -q "ossh config.list" "$fx/calls" || bad="$bad noName=[$got]"
+  got=$(test.ossh.configPull.run)
+  [ "$got" = "1|no fromHost was specified" ] || bad="$bad noHost=[$got]"
+  # no config here yet: the default file is made, owner only
+  rm -f "$f"
+  got=$(test.ossh.configPull.run lab demoPull)
+  [ "$got" = "0|demoPull pulled from lab into $f" ] || bad="$bad new=[$got]"
+  [ "$(tr '\n' '|' < "$f" 2>/dev/null)" = "Host demoPull| User root| HostName 10.0.0.9|" ] || bad="$bad newContent=[$(tr '\n' '|' < "$f" 2>/dev/null)]"
+  [ "$(ls -l "$f" 2>/dev/null | cut -c1-10)" = "-rw-------" ] || bad="$bad newMode=$(ls -l "$f" 2>/dev/null | cut -c1-10)"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  unset -f test.ossh.configPull.run
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "config.pull brings one Host block, once, and says so" || create.result 1 "config pull:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONFIG-PULL: ossh config.pull brings one Host block from a host, never twice, with rc and RESULT" test.ossh.configPull
+expect 0 "config.pull brings one Host block, once, and says so" \
+  "config.pull asked the host for a command that no longer exists and appended its answer with rc 0"
+
+# T-OSSH-CONFIG-PULL-COMPLETION: config.pull completes per parameter
+# <fromHost> from this computer's ~/.ssh/config; <remoteConfigName> nothing —
+# a Host on the other computer (was <sshConfigName>, which listed the Hosts
+# HERE, as key.pull's keyName listed the local keys). Asked the way Tab asks,
+# through c2.completion.discover, as in T-OSSH-KEY-COMPLETION; the child bash
+# has HOME, CURRENT_SSH_DIR and CONFIG_PATH in the fixture; one local Host
+# shows which lookup answered; ssh, scp, rsync are backstops.
+test.ossh.configPullCompletion() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make osshconfigpullcomp)
+  mkdir -p "$fx/.ssh" "$fx/config"
+  printf '%s\n' 'Host local.marker' ' User a' > "$fx/.ssh/config"
+  [ -f "$CONFIG_PATH/lineFormat.env" ] && cp "$CONFIG_PATH/lineFormat.env" "$fx/config/"
+  : > "$fx/config/user.env"
+  [ -n "$(type -t ossh.parameter.completion.remoteConfigName)" ] && bad="$bad sharedRemoteConfigName"
+  out=$(HOME="$fx" CURRENT_SSH_DIR="$fx/.ssh" CONFIG_PATH="$fx/config" CONFIG="$fx/config/user.env" FX="$fx" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/ossh" >/dev/null 2>&1
+    set --; source "$OOSH_DIR/ng/c2" >/dev/null 2>&1
+    ssh() { echo "REAL ssh $*" >> "$FX/real"; return 255; }; scp() { echo "REAL scp $*" >> "$FX/real"; return 255; }
+    rsync() { echo "REAL rsync $*" >> "$FX/real"; return 255; }
+    : > "$CONFIG_PATH/completion.result.txt"
+    c2.completion.discover 2 "" ossh config.pull "" >/dev/null 2>&1
+    echo "fromHost=[$(tr "\n" " " < "$CONFIG_PATH/completion.result.txt")]"
+    : > "$CONFIG_PATH/completion.result.txt"
+    c2.completion.discover 3 "" ossh config.pull lab "" >/dev/null 2>&1
+    echo "remoteConfigName=[$(tr "\n" " " < "$CONFIG_PATH/completion.result.txt")]"' </dev/null 2>/dev/null)
+  echo "$out" | grep -q '^fromHost=\[.*local.marker' || bad="$bad fromHost=[$(echo "$out" | grep '^fromHost')]"
+  echo "$out" | grep -q '^remoteConfigName=.*local.marker' && bad="$bad remoteListsLocal=[$(echo "$out" | grep '^remoteConfigName')]"
+  echo "$out" | grep -q '^remoteConfigName=' || bad="$bad remoteNotAsked"
+  grep -q '^ossh\.config\.pull() *# <fromHost> <remoteConfigName>' "$OOSH_DIR/ossh" || bad="$bad header"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "config.pull completes per parameter" || create.result 1 "config.pull completion:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-CONFIG-PULL-COMPLETION: config.pull completes per parameter through c2; remoteConfigName offers nothing" test.ossh.configPullCompletion
+expect 0 "config.pull completes per parameter" \
+  "config.pull's <sshConfigName> listed the Hosts of this computer for a name on the other one"
+
 # T-OSSH-AUTHORIZED-KEY-APPEND: where ossh writes a target's authorized_keys
 # itself (install <host> <user>, and key.push to an oosh without
 # authorized.keys.update) it only ADDS the pushed key. It was
@@ -2566,7 +2691,7 @@ expect 0 "ossh install's remote half says its result on every path" \
 # with the rc of their last copy, no RESULT (fresh review 2026-10-16). Now
 # rc 1 + RESULT + error.log for a missing argument or a failed copy, rc 0 +
 # RESULT when it is done. connection.open, private.ossh.rsync (FX_COPY),
-# private.ossh.rsync.pull (FX_COPY), private.ossh.get.config and
+# private.ossh.rsync.pull (FX_COPY), ossh.config.get and
 # private.ossh.ssh are stubs; HOME, CURRENT_SSH_DIR and CONFIG_PATH are the
 # fixture; ssh, scp, rsync are backstops.
 test.ossh.pushPullResult() {
@@ -2581,7 +2706,7 @@ test.ossh.pushPullResult() {
       ossh.connection.open() { create.result 0 open; }
       private.ossh.rsync() { return "$FX_COPY"; }
       private.ossh.rsync.pull() { return "$FX_COPY"; }
-      private.ossh.get.config() { echo "Host $1"; }
+      ossh.config.get() { echo "Host $1"; }
       private.ossh.ssh() { return "$FX_COPY"; }
       create.result 0 stale
       "$@" </dev/null >/dev/null 2>&1; echo "$?|$RESULT" )
@@ -2682,21 +2807,27 @@ expect 0 "key.push and key.pull complete per parameter" \
 # private.ossh.oosh.init.push
 # (was private.ossh.push.config, private.ossh.push.dir, private.ossh.pull.dir)
 # (was private.ossh.push.id, private.push.init.oosh) — with their private
-# .completion copies.
+# .completion copies. 2026-10-19: private.ossh.config.pull
+# (was private.ossh.pull.config); the wrapper "same as config.get" is gone,
+# its caller calls ossh.config.get (was private.ossh.get.config and its
+# .completion), and nothing asks for that command any more — there is no
+# such command (was `ossh get.config` in config.pull and in init/once's once.repo.init).
 test.ossh.renamesObjectVerb() {
   local bad="" old new pattern hits
   for old in "private.ossh.""push.key" "private.ossh.""pull.key" "ossh.update.""authorized_keys" \
       "private.ossh.""push.config" "private.ossh.""push.config.completion" "private.ossh.""push.dir" \
-      "private.ossh.""push.dir.completion" "private.ossh.""pull.dir" "private.ossh.""push.id" "private.push.""init.oosh"; do
+      "private.ossh.""push.dir.completion" "private.ossh.""pull.dir" "private.ossh.""push.id" "private.push.""init.oosh" \
+      "private.ossh.""pull.config" "private.ossh.""get.config" "private.ossh.""get.config.completion"; do
     [ -n "$(type -t "$old")" ] && bad="$bad defined:$old"
   done
   for new in private.ossh.key.push private.ossh.key.pull ossh.authorized.keys.update \
-      private.ossh.config.push private.ossh.dir.push private.ossh.dir.pull private.ossh.id.push private.ossh.oosh.init.push; do
+      private.ossh.config.push private.ossh.dir.push private.ossh.dir.pull private.ossh.id.push private.ossh.oosh.init.push \
+      private.ossh.config.pull; do
     [ "$(type -t "$new")" = function ] || bad="$bad missing:$new"
   done
   grep -q "^private\.user\.""update\.authorized_keys()" "$OOSH_DIR/user" && bad="$bad defined:private.user.""update.authorized_keys"
   grep -q '^private\.user\.authorized\.keys\.rebuild()' "$OOSH_DIR/user" || bad="$bad missing:private.user.authorized.keys.rebuild"
-  pattern='private\.ossh\.(push\.key|pull\.key)([^.A-Za-z0-9_]|$)|private\.ossh\.(push\.config|push\.dir|pull\.dir|push\.id)([^A-Za-z0-9_]|$)|private\.push\.init\.oosh|ossh[. ]update\.authorized_keys|ossh push\.key|private\.user\.update\.authorized_keys'
+  pattern='private\.ossh\.(push\.key|pull\.key)([^.A-Za-z0-9_]|$)|private\.ossh\.(push\.config|push\.dir|pull\.dir|push\.id|pull\.config|get\.config)([^A-Za-z0-9_]|$)|private\.push\.init\.oosh|ossh[. ]update\.authorized_keys|ossh push\.key|ossh get\.config|private\.user\.update\.authorized_keys'
   hits=$(grep -rnE "$pattern" "$OOSH_DIR" --exclude-dir=.git --exclude-dir=restore --exclude-dir=puml --exclude-dir=sessions 2>/dev/null \
     | grep -vF '(was ' | cut -d: -f1,2 | tr '\n' ' ')
   [ -n "$hits" ] && bad="$bad left=[$hits]"
