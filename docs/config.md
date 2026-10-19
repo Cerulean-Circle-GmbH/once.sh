@@ -167,9 +167,11 @@ oosh names the computer for the prompt, the logs and ssh (`private.config.host.n
 | A bare computer | The short host name (`private.this.host.name.get short`: the `hostname` program, else bash's `$HOSTNAME` — AlmaLinux minimal has no `hostname`; T-CONFIG-HOST-NAME-NO-HOSTNAME). |
 | None found | `localhost` |
 
-A container started by odocker without a name gets Docker's own random name as its name and host name, so the install knows it from the start (`private.odocker.container.name.new`, see [odocker.md](odocker.md)).
+A container started by odocker without a name gets Docker's own random name as its name (`private.odocker.container.name.new`, see [odocker.md](odocker.md)); its host name stays the container ID. The prompt shows the oosh name in `[]` and the system host name after `@` — in a container its ID, as `odocker status` pairs them: `[oosh adoring_perlman] bash-user@bbefafb7d5e3`.
 
-`oo update` calls `private.config.host.name.refresh`. It corrects the saved name when it was only guessed and is wrong now: empty, the raw host name, a container ID, or the name of another container (a cloned image). A name you chose — `config ssh.host.set`, or the alias given to `ossh install` — is kept.
+`ossh install` lets the remote name itself: it sends `_` for the name, not the caller's own `OOSH_SSH_CONFIG_HOST` — until 2026-10-19 the remote took the installing computer's name as its own (T-OSSH-INSTALL-REMOTE-NAMES-ITSELF).
+
+`oo update` calls `private.config.host.name.refresh`. It corrects the saved name when it was only guessed and is wrong now: empty, the raw host name, a container ID, or the name of another container (a cloned image). A name you chose with `config ssh.host.set` is kept.
 
 ## The PATH line
 
