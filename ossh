@@ -479,6 +479,126 @@ private.ossh.config.last.file.get()     #  # echo the file ossh config.create wr
 }
 
 
+private.ossh.system.config.file.get()     #  # echo the system-wide ssh client file every user reads, holding the Host github.com block — OSSH_SYSTEM_SSH_CONFIG overrides #
+{
+ # NO create.result — a getter consumed as $(...). OpenSSH reads
+ # ssh_config.d for every user (Include /etc/ssh/ssh_config.d/*.conf on Linux,
+ # /etc/ssh/ssh_config.d/* on macOS — checked 2026-10-19); .conf for Linux.
+ echo "${OSSH_SYSTEM_SSH_CONFIG:-/etc/ssh/ssh_config.d/oosh-github.conf}"
+}
+
+private.ossh.system.known.hosts.get()     #  # echo the system-wide known_hosts file every user reads — OSSH_SYSTEM_KNOWN_HOSTS overrides #
+{
+ # NO create.result — a getter consumed as $(...). GlobalKnownHostsFile of
+ # OpenSSH; macOS has none until oosh writes it.
+ echo "${OSSH_SYSTEM_KNOWN_HOSTS:-/etc/ssh/ssh_known_hosts}"
+}
+
+private.ossh.user.homes.get()     #  # echo every home on this host whose ~/.ssh oosh may have written to — the homes under the users base without shared, then the home of root; rc 1 without a users base #
+{
+ # NO create.result — a getter consumed as $(...). shared is the shared tree
+ # (/home/shared, /Users/Shared on macOS), not a user.
+ local basehome home
+ basehome=$(private.ossh.users.basehome) || return 1
+ for home in "$basehome"/*; do
+   [ -d "$home" ] || continue
+   case "${home##*/}" in (shared|Shared) continue ;; esac
+   echo "$home"
+ done
+ eval echo ~root
+}
+
+private.ossh.github.block.is.oosh()     # <block> # rc 0 when <block> is a Host github.com block as oosh writes it — only HostName github.com, User git, Port 22, IdentitiesOnly yes and IdentityFile ~/.ssh/ids/ssh.developking/id_rsa; any other line makes it the own block of the user #
+{
+ # The forms oosh wrote over time: config.create (state 31, the template),
+ # the heredoc fallback of state 31 and the one of folder.fix (no
+ # IdentitiesOnly). Keywords in any case and order; a comment or any other
+ # keyword or value is the user's own and stays.
+ printf '%s\n' "$1" | awk '
+   NF == 0 { next }
+   { k = tolower($1); v = $2 }
+   k == "host" && v == "github.com" && NF == 2 { host = 1; next }
+   NF != 2 { other = 1; next }
+   k == "hostname" && v == "github.com" { next }
+   k == "user" && v == "git" { next }
+   k == "port" && v == "22" { next }
+   k == "identitiesonly" && tolower(v) == "yes" { next }
+   k == "identityfile" && v == "~/.ssh/ids/ssh.developking/id_rsa" { id = 1; next }
+   { other = 1 }
+   END { exit !(host && id && !other) }'
+}
+
+private.ossh.github.copy.remove()     # <sshDir> <knownHosts> # remove from <sshDir> what oosh copied there for GitHub — the Host github.com block of oosh in config, the lines of <knownHosts> in known_hosts — in place, owner and mode kept; rc 0 when something was removed #
+{
+ # A block in ~/.ssh/config wins over the system file, and an old host key in
+ # ~/.ssh/known_hosts makes ssh refuse GitHub after a key rotation — so the
+ # copies go once the system files hold them. Written with > in place, as
+ # ossh.config.delete does: the file stays the user's, with its mode.
+ local sshDir="$1" knownHosts="$2" block kept removed=1
+ if [ -z "$sshDir" ] || [ -z "$knownHosts" ]; then
+   create.result 1 "private.ossh.github.copy.remove requires <sshDir> <knownHosts>"
+   return $(result)
+ fi
+ if [ -f "$sshDir/config" ]; then
+   block="$(LOG_DEVICE=/dev/null ossh.config.get github.com "$sshDir/config" 2>/dev/null)"
+   if [ -n "$block" ] && private.ossh.github.block.is.oosh "$block" \
+      && LOG_DEVICE=/dev/null ossh.config.delete github.com "$sshDir/config" >/dev/null 2>&1; then
+     removed=0
+   fi
+ fi
+ if [ -f "$sshDir/known_hosts" ] && [ -s "$knownHosts" ]; then
+   # The lines of the system file, and the comments ssh-keyscan wrote along
+   # with them on some systems (Alma 9: "# github.com:22 SSH-2.0-…"). Only
+   # non-empty lines are dropped, so kept differs exactly when one was.
+   kept="$(awk 'NR == FNR { if (NF) k[$0] = 1; next } !($0 in k) && !/^# github\.com:22 /' "$knownHosts" "$sshDir/known_hosts")"
+   if [ "$kept" != "$(cat "$sshDir/known_hosts")" ]; then
+     if [ -n "$kept" ]; then printf '%s\n' "$kept" > "$sshDir/known_hosts"; else : > "$sshDir/known_hosts"; fi
+     removed=0
+   fi
+ fi
+ create.result 0 "$sshDir"
+ return $removed
+}
+
+private.ossh.github.copies.remove()     # <knownHosts> # private.ossh.github.copy.remove for the ~/.ssh of every home; echo the folders that changed #
+{
+ local knownHosts="$1" homes home
+ homes="$(private.ossh.user.homes.get)" || return 0
+ while IFS= read -r home; do
+   [ -d "$home/.ssh" ] || continue
+   private.ossh.github.copy.remove "$home/.ssh" "$knownHosts" && printf ' %s' "$home/.ssh"
+ done <<< "$homes"
+ return 0
+}
+
+private.ossh.shared.ssh.legacy.remove()     # <?legacyDir:<basehome>/shared/.ssh> # remove the old template folder <legacyDir> when it holds only config and known_hosts, else keep it with a warning; echo it when removed #
+{
+ # Since 1b5c427e (2026-04-01) ossh install wrote a root-only template here
+ # and copied it into every home; until 6e09d74f (2026-05-11) it also held the
+ # deploy key 2cuGitHub. Anything but config and known_hosts is for a human
+ # to look at, so the folder then stays as it is.
+ local dir="$1" basehome entry extra=""
+ if [ -z "$dir" ]; then
+   basehome=$(private.ossh.users.basehome) || return 0
+   dir="$basehome/shared/.ssh"
+ fi
+ [ -d "$dir" ] || return 0
+ for entry in "$dir"/* "$dir"/.[!.]*; do
+   [ -e "$entry" ] || [ -L "$entry" ] || continue
+   case "${entry##*/}" in (config|known_hosts) ;; (*) extra="$extra ${entry##*/}" ;; esac
+ done
+ if [ -n "$extra" ]; then
+   warn.log "kept $dir: it holds more than config and known_hosts:$extra — check and remove it by hand"
+   return 0
+ fi
+ if rm -f "$dir/config" "$dir/known_hosts" && rmdir "$dir"; then
+   printf ' %s' "$dir"
+ else
+   warn.log "could not remove $dir"
+ fi
+ return 0
+}
+
 ### new.method
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -750,8 +870,8 @@ private.ossh.users.basehome() # # canonical base directory for system user homes
   # The rule has ONE source, user's private.user.basehome.system.get, reached as
   # `user.get basehome root` (T-OSSH-USERS-BASEHOME-DELEGATES); why it is not
   # `dirname "$HOME"` is written there. This name stays for its callers in this
-  # file. The inline copies in ossh.install.user.remote and
-  # private.ossh.shared.ssh.copy.to.all run on another host and cannot call it.
+  # file. The inline copy in ossh.install.user.remote runs on another host and
+  # cannot call it.
   # Nothing and rc 1 when user cannot be loaded or answers no base, so a
   # caller never builds /shared/... (T-OSSH-USERS-BASEHOME-UNLOADED). The load
   # sources user once: it is a no-op while user.get is a function.
@@ -1316,22 +1436,19 @@ ossh.install.continue.local() # <remoteSshConfigName> <sshConfigNameUsedForLocal
   fi
 
   # github.com + WODA Host aliases are now owned upstream:
-  #   - github.com: state 31's `private.install.dev.configs` (oo) +
-  #                 ossh.config.shared.github.create (this file)
+  #   - github.com: state 31 step 4 (oo) calls ossh.config.shared.github.create
+  #                 (this file), the system files of OpenSSH for every user
   #   - WODA.{test,dev.root,dev}: user.init
-  # user.init was rewritten in commit f515903 to be append-if-missing
-  # (was a destructive `} >$sshDir/config` heredoc), so state 31's
-  # github.com block now survives user.init instead of being wiped.
   # The defensive re-adds that lived here (F1/F2 from the audit at
   # docs/research/state-machine-fixup-audit.md) are no longer needed.
 
   # F3 + F4 (audit rows in docs/research/state-machine-fixup-audit.md) used
   # to live here. F3 sed-rewrote /root paths in shared config; F4 was a
-  # defensive re-seed of /<basehome>/shared/.ssh/. Both are now owned by
-  # state 31 (its body in oo) — F3's templating runs right after the `config save`
-  # in that body, F4's seed is the now-fail-loud `ossh config.shared.create`
-  # at the bottom of state 31's body. State machine owns it; if it fails,
-  # state 31 halts and the install does not progress here.
+  # defensive re-seed of the GitHub setup. Both are now owned by state 31
+  # (its body in oo) — F3's templating runs right after the `config save` in
+  # that body, F4's is the fail-loud `ossh config.shared.github.create` in step
+  # 4. State machine owns it; if it fails, state 31 halts and the install does
+  # not progress here.
 
   # Clear install-only logging — LOG_INSTALL must not persist into user sessions
   # (it would be saved to log.env by config.save and cause Permission denied errors)
@@ -1368,14 +1485,12 @@ ossh.install.finish.local() # # finishes local oosh installation
     warn.log "Failed to push config to $sshConfigHost — continuing"
   }
 
-  # Runner-side shared-SSH seeding + propagation. seed.github is idempotent
-  # (skip-when-seeded probe at start) and replaces the historical pre-Phase-3
-  # branching that read the runner's local ~/.ssh/deploy_keys/2cuGitHub.
-  # Github access now flows through ~/.ssh/ids/ssh.developking/id_rsa
-  # placed by osshLayout.role.developking on every user — no per-runner key
-  # transfer needed. The propagation helper is idempotent (append-if-missing).
+  # GitHub for every user of the host: seed.github is idempotent (skip-when-
+  # seeded probe at start) and writes the system files of OpenSSH there, which
+  # every user reads — nothing is copied into the homes anymore. Github access
+  # flows through ~/.ssh/ids/ssh.developking/id_rsa placed by
+  # osshLayout.role.developking on every user — no per-runner key transfer.
   ossh.config.shared.seed.github "$sshConfigHost"
-  private.ossh.shared.ssh.copy.to.all "$sshConfigHost"
 
   # The host's own key, authorized here. It asked for `ossh get.key.name`
   # (key.get.name since 2fe51334) and got nothing; key.pull resolves the
@@ -1606,7 +1721,7 @@ ossh.folder.fix() # <?installerEmail> <?sshDir:~/.ssh> <?mode:conservative> # co
   # Phase 2 — WODA Host blocks. user.init appends-if-missing.
   user.init "$sshDir" >/dev/null 2>&1 || warn.log "user.init returned non-zero; WODA blocks may not be present"
 
-  # Phase 2b — normalise ~/.ssh/config (WODA portability + Host github.com). Always runs.
+  # Phase 2b — normalise ~/.ssh/config (WODA portability; github.com is in the system file). Always runs.
   private.ossh.folder.fix.config.normalize "$sshDir" || warn.log "config.normalize had errors"
 
   # Phase 3 — strict-mode pruning (opt-in). Also removes the legacy Host 2cuGitHub block.
@@ -1638,7 +1753,7 @@ private.ossh.folder.fix.prune() # <sshDir> # remove known-stale legacy artifacts
   rm -rf "$sshDir"/ssh-copy-id.* 2>/dev/null
 }
 
-private.ossh.folder.fix.config.normalize() # <sshDir> # ensure ~/.ssh/config has portable WODA paths + Host github.com block (conservative repairs to user-facing contract from test.ssh.config.invariant)
+private.ossh.folder.fix.config.normalize() # <sshDir> # ensure ~/.ssh/config has portable WODA paths, report a system file without Host github.com (conservative repairs to user-facing contract from test.ssh.config.invariant)
 {
   local sshDir="$1"
   local cfg="$sshDir/config"
@@ -1668,18 +1783,11 @@ private.ossh.folder.fix.config.normalize() # <sshDir> # ensure ~/.ssh/config has
     }
   ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
 
-  # Add Host github.com block if missing. Canonical form per
-  # test.ssh.config.invariant: IdentityFile points at
-  # ~/.ssh/ids/ssh.developking/id_rsa (single source of truth).
-  if ! grep -q "^Host github.com\$" "$cfg" 2>/dev/null; then
-    cat >>"$cfg" <<EOF
-
-Host github.com
- User git
- Port 22
- HostName github.com
- IdentityFile ~/.ssh/ids/ssh.developking/id_rsa
-EOF
+  # Host github.com is not a line of ~/.ssh/config anymore: every user reads it
+  # from the system file of OpenSSH. folder.fix runs as the user, who cannot
+  # write there, so it only says when that file lacks the block.
+  if ! LOG_DEVICE=/dev/null ossh.config.get github.com "$(private.ossh.system.config.file.get)" >/dev/null 2>&1; then
+    warn.log "no Host github.com in $(private.ossh.system.config.file.get) — as root: ossh config.shared.github.create"
   fi
   chmod 600 "$cfg"
 }
@@ -2320,59 +2428,65 @@ ossh.config.save.last()     # <?file:~/.ssh/config> # append the Host block of t
   return $(result)
 }
 
-ossh.config.shared.github.create() # <?sharedDir> # create shared SSH config + Host github.com alias whose IdentityFile is ~/.ssh/ids/ssh.developking/id_rsa (placed by osshLayout.role.developking on every user). Idempotent.
+ossh.config.shared.github.create() # <?configFile> <?knownHosts> # set GitHub up for every user of this host — the Host github.com block (IdentityFile ~/.ssh/ids/ssh.developking/id_rsa) in the ssh_config.d of OpenSSH, its host key in ssh_known_hosts, both 644 — then remove the old template folder under the users base and the copies it left in the homes. Idempotent; runs as root
 {
-  local sharedDir="$1" basehome
-  if [ -z "$sharedDir" ]; then
-    if ! basehome=$(private.ossh.users.basehome); then
-      error.log "ossh.config.shared.github.create: no users' base (user could not be loaded or answered none) — pass <sharedDir>"
-      create.result 1 "no users' base for the shared SSH config"
+  # OpenSSH reads both files for every user, so nothing is copied into a home
+  # (checked 2026-10-19: Debian 12, Alma 9.8, Alpine 3.19/3.23, Ubuntu 24.04,
+  # macOS 15/26). IdentityFile keeps the literal `~`: ssh expands it for the
+  # user who runs it, and every user has ids/ssh.developking/id_rsa from
+  # osshLayout.role.developking. `identitiesOnly` adds IdentitiesOnly yes so
+  # the agent does not offer the wrong key first.
+  local file="${1:-$(private.ossh.system.config.file.get)}"
+  local knownHosts="${2:-$(private.ossh.system.known.hosts.get)}"
+  local keys removed
+
+  if ! LOG_DEVICE=/dev/null ossh.config.get github.com "$file" >/dev/null 2>&1; then
+    if ! private.this.folder.ensure "${file%/*}"; then
+      error.log "$RESULT"
       return $(result)
     fi
-    sharedDir="$basehome/shared/.ssh"
+    ossh.config.create github.com git@github.com:22 "~/.ssh/ids/ssh.developking/id_rsa" identitiesOnly >/dev/null
+    if ! ossh.config.save.last "$file" >/dev/null; then
+      create.result 1 "could not write Host github.com to $file: $RESULT"
+      error.log "$RESULT"
+      return $(result)
+    fi
   fi
+  chmod 644 "$file"
 
-  mkdir -p "$sharedDir"
-  chmod 700 "$sharedDir"
-
-  # Emit the Host github.com block via the canonical primitive. IdentityFile
-  # uses literal `~` so SSH expands per-user at read time — every user
-  # (root, developking, bash-user, oosh-user, test, ...) reads the same
-  # shared config and finds their own ids/ssh.developking/id_rsa (placed by
-  # osshLayout.role.developking on every user during install). The
-  # `identitiesOnly` keyword (added Phase A.8) appends `IdentitiesOnly yes`
-  # so ssh-agent doesn't race ahead and present the wrong key first.
-  if ! ossh.config.get github.com "$sharedDir/config" >/dev/null 2>&1; then
-    ossh.config.create github.com git@github.com:22 "~/.ssh/ids/ssh.developking/id_rsa" identitiesOnly
-    ossh.config.save.last "$sharedDir/config"
-    chmod 600 "$sharedDir/config"
-    success.log "Created Host github.com block in $sharedDir/config (IdentityFile ~/.ssh/ids/ssh.developking/id_rsa)"
-  else
-    info.log "Host github.com already exists in $sharedDir/config"
+  # The host key comes from ssh-keyscan at run time, so a rotation by GitHub
+  # is picked up by the next install; it is never baked into a template.
+  if ! grep -q '^github\.com ' "$knownHosts" 2>/dev/null; then
+    keys="$(ssh-keyscan github.com 2>/dev/null | grep '^github\.com ')"
+    if [ -z "$keys" ] || ! { printf '%s\n' "$keys" >> "$knownHosts"; } 2>/dev/null; then
+      create.result 1 "could not add the host key of github.com to $knownHosts"
+      error.log "$RESULT"
+      return $(result)
+    fi
   fi
+  chmod 644 "$knownHosts"
 
-  # Pre-populate known_hosts. Runtime ssh-keyscan stays robust against
-  # GitHub host-key rotation; do not bake into a template.
-  if [ ! -f "$sharedDir/known_hosts" ] || ! grep -q "github.com" "$sharedDir/known_hosts" 2>/dev/null; then
-    ssh-keyscan github.com >> "$sharedDir/known_hosts" 2>/dev/null
-    chmod 600 "$sharedDir/known_hosts"
-    success.log "Added github.com to $sharedDir/known_hosts"
-  fi
-
-  create.result 0 "$sharedDir"
+  removed="$(private.ossh.shared.ssh.legacy.remove)$(private.ossh.github.copies.remove "$knownHosts")"
+  create.result 0 "github.com for all users: $file, $knownHosts${removed:+; removed:$removed}"
+  success.log "$RESULT"
   return $(result)
 }
-ossh.config.shared.github.create.completion.sharedDir() {
-  compgen -d "$1"
+ossh.config.shared.github.create.completion.configFile() {
+  compgen -f "$1"
+}
+ossh.config.shared.github.create.completion.knownHosts() {
+  compgen -f "$1"
 }
 
 # Deprecated shim — old name kept so any state still calling
 # `ossh config.shared.create` does not break. Emits a warn.log for
 # visibility. Drop after the next release once all callers are migrated.
-ossh.config.shared.create() # <?sharedDir> <?deployKeySrc:ignored> # DEPRECATED: use ossh.config.shared.github.create
+ossh.config.shared.create() # <?sharedDir:ignored> <?deployKeySrc:ignored> # DEPRECATED: use ossh.config.shared.github.create
 {
-  warn.log "ossh.config.shared.create is deprecated; use ossh.config.shared.github.create. The deployKeySrc arg is ignored — github access now flows through ~/.ssh/ids/ssh.developking/id_rsa (placed by osshLayout.role.developking)."
-  ossh.config.shared.github.create "$1"
+  # Both args are ignored: a <sharedDir> named the old template folder, and
+  # config.shared.github.create now writes the system files of OpenSSH.
+  warn.log "ossh.config.shared.create is deprecated; use ossh.config.shared.github.create. Its args are ignored — github access is set up in the system files of OpenSSH for every user."
+  ossh.config.shared.github.create
 }
 ossh.config.shared.create.completion.sharedDir() {
   compgen -d "$1"
@@ -2381,78 +2495,10 @@ ossh.config.shared.create.completion.deployKeySrc() {
   compgen -f "$1"
 }
 
-ossh.config.shared.link() # <?user> <?sharedDir> # link user SSH config to shared config
+
+ossh.config.shared.seed.github() # <sshConfigHost> # set GitHub up for every user on <sshConfigHost> — the remote ossh config.shared.github.create, as root. Skipped when the system file there has Host github.com and the old template folder is gone
 {
-  local targetUser="${1:-$(whoami)}"
-  local sharedDir="$2" basehome
-  if [ -z "$sharedDir" ]; then
-    if ! basehome=$(private.ossh.users.basehome); then
-      error.log "ossh.config.shared.link: no users' base (user could not be loaded or answered none) — pass <sharedDir>"
-      create.result 1 "no users' base for the shared SSH config"
-      return $(result)
-    fi
-    sharedDir="$basehome/shared/.ssh"
-  fi
-  local userHome
-  userHome=$(eval echo ~"$targetUser")
-
-  local userSshDir="$userHome/.ssh"
-  mkdir -p "$userSshDir"
-
-  # Copy or append config (SSH requires config owned by user, not symlinked).
-  # Detection key is now `Host github.com` (the post-Phase-3 alias) rather
-  # than the legacy `Host 2cuGitHub`. Phase A.8: use ossh.config.get (the
-  # canonical detection primitive) instead of inline grep.
-  if ! ossh.config.get github.com "$userSshDir/config" >/dev/null 2>&1; then
-    if [ -L "$userSshDir/config" ]; then
-      rm -f "$userSshDir/config"
-    fi
-    if [ ! -f "$userSshDir/config" ]; then
-      cp "$sharedDir/config" "$userSshDir/config"
-      success.log "Copied shared config to $userSshDir/config"
-    else
-      # Config exists — append github.com block from shared. Use the shared
-      # config as source-of-truth: extract its github.com block verbatim.
-      awk '
-        /^Host github.com$/ {found=1; print; next}
-        found && /^Host / {found=0}
-        found {print}
-      ' "$sharedDir/config" >> "$userSshDir/config"
-      success.log "Appended Host github.com to $userSshDir/config"
-    fi
-    chown "$targetUser" "$userSshDir/config" 2>/dev/null
-    chmod 600 "$userSshDir/config"
-  else
-    info.log "Host github.com already exists in $userSshDir/config"
-  fi
-
-  # Copy or append known_hosts
-  if [ ! -f "$userSshDir/known_hosts" ] || [ -L "$userSshDir/known_hosts" ]; then
-    rm -f "$userSshDir/known_hosts" 2>/dev/null
-    cp "$sharedDir/known_hosts" "$userSshDir/known_hosts" 2>/dev/null
-    chown "$targetUser" "$userSshDir/known_hosts" 2>/dev/null
-    chmod 644 "$userSshDir/known_hosts"
-    success.log "Copied known_hosts to $userSshDir/known_hosts"
-  elif ! grep -q "github.com" "$userSshDir/known_hosts" 2>/dev/null; then
-    cat "$sharedDir/known_hosts" >> "$userSshDir/known_hosts"
-    success.log "Appended github.com to $userSshDir/known_hosts"
-  fi
-
-  create.result 0 "$targetUser linked"
-  return $(result)
-}
-ossh.config.shared.link.completion.user() {
-  echo "dev"
-  echo "test"
-  echo "root"
-}
-ossh.config.shared.link.completion.sharedDir() {
-  compgen -d "$1"
-}
-
-ossh.config.shared.seed.github() # <sshConfigHost> # seed {basehome}/shared/.ssh/{config,known_hosts} on <sshConfigHost> with the Host github.com block whose IdentityFile is ~/.ssh/ids/ssh.developking/id_rsa. Idempotent skip-when-seeded probe at start.
-{
-  local sshConfigHost="$1"
+  local sshConfigHost="$1" systemConfig
   if [ -z "$sshConfigHost" ]; then
     error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
     return 1
@@ -2461,22 +2507,22 @@ ossh.config.shared.seed.github() # <sshConfigHost> # seed {basehome}/shared/.ssh
   # Skip-when-already-seeded probe. NOTE (Phase A.8): grep is intentional
   # here — this expression runs in a remote bash via ossh.exec where OOSH
   # functions like ossh.config.get aren't reliably importable across the
-  # shell layers (sudo + ssh + bash -c). Local sites in the same file use
-  # ossh.config.get; this remote-side site stays as grep.
-  if ossh.exec "$sshConfigHost" 'case "$OSTYPE" in darwin*) b=/Users ;; *) b=/home ;; esac; grep -q "^Host github.com$" "$b/shared/.ssh/config" 2>/dev/null' 2>/dev/null; then
-    info.log "Shared .ssh already has Host github.com on $sshConfigHost — skipping seed"
+  # shell layers (sudo + ssh + bash -c). While <basehome>/shared/.ssh is
+  # still there, the remote create has a cleanup to do, so it runs.
+  systemConfig="$(private.ossh.system.config.file.get)"
+  if ossh.exec "$sshConfigHost" 'case "$OSTYPE" in darwin*) b=/Users ;; *) b=/home ;; esac; grep -q "^Host github.com$" "'"$systemConfig"'" 2>/dev/null && [ ! -d "$b/shared/.ssh" ]' 2>/dev/null; then
+    info.log "$sshConfigHost already has Host github.com in $systemConfig — skipping seed"
     return 0
   fi
 
-  # Delegate to remote `ossh config.shared.github.create`. Same plumbing as
-  # the legacy seed.fallback used (sudo + absolute path so we don't lose PATH
-  # on macOS sudoers env_reset, and so the install user — possibly not yet
-  # in the new NSS group cache — can still write to /<basehome>/shared/.ssh).
+  # Delegate to remote `ossh config.shared.github.create`. sudo + absolute
+  # path so we don't lose PATH on macOS sudoers env_reset; root writes /etc/ssh
+  # and cleans up the homes.
   if ossh.exec "$sshConfigHost" 'sudo -E $(command -v ossh) config.shared.github.create'; then
     return 0
   fi
 
-  warn.log "Could not seed shared .ssh github block on $sshConfigHost — non-root users will lack GitHub Host alias"
+  warn.log "Could not set GitHub up for every user on $sshConfigHost — users will lack the Host github.com alias"
   return 1
 }
 ossh.config.shared.seed.github.completion.sshConfigHost() {
@@ -2505,71 +2551,6 @@ ossh.config.shared.seed.fallback.completion.sshConfigHost() {
   ossh.parameter.completion.sshConfigHost "$@"
 }
 
-private.ossh.shared.ssh.copy.to.all() # <sshConfigHost> # on <sshConfigHost>, append /home/shared/.ssh/{config,known_hosts} into every existing user's ~/.ssh/ with owner=user (login group), perms 700/600/644. Append-if-missing on Host github.com (idempotent). The standalone deploy key is no longer copied — github access uses ~/.ssh/ids/ssh.developking/id_rsa from osshLayout.role.developking.
-{
-  local sshConfigHost="$1"
-  if [ -z "$sshConfigHost" ]; then
-    error.log "no ${YELLOW}sshConfigHost${NORMAL} was specified"
-    return 1
-  fi
-
-  # One SSH roundtrip, sudo-wrapped remote bash. Files in /home/shared/.ssh/
-  # are assumed to already exist (seeded by either the caller's deploy_keys
-  # push or the developking fallback). If the shared key is missing, exit
-  # quietly — this method is idempotent/no-op in that case.
-  #
-  # `chown $u:` (trailing colon, no group) sets the group to the user's
-  # login group whatever it's named. Robust against platform.test containers
-  # where `test` has gid=0 and no `test` group exists; explicit `$u:$u`
-  # would error with "invalid group".
-  # sudo'd context: $HOME on the remote becomes root's home (/var/root on
-  # macOS) — dirname /var/root = /var which is wrong. Use $OSTYPE (bash
-  # builtin, available everywhere) to pick /Users vs /home directly.
-  # Same logic as private.ossh.users.basehome; inlined here because the
-  # sudo'd remote bash doesn't source ossh.
-  # Append-if-missing semantics for ~/.ssh/config and ~/.ssh/known_hosts:
-  # cp would destructively overwrite, wiping any Host aliases the user
-  # already wrote (e.g. WODA Host blocks from user.init, custom entries,
-  # etc.). The shared config carries `Host github.com` whose IdentityFile
-  # is ~/.ssh/ids/ssh.developking/id_rsa — placed by
-  # osshLayout.role.developking on every user during install, so no
-  # standalone deploy-key file needs to be propagated.
-  private.ossh.ssh "$sshConfigHost" "sudo bash -c '
-    case \"\$OSTYPE\" in darwin*) basehome=/Users ;; *) basehome=/home ;; esac
-    sharedSsh=\"\$basehome/shared/.ssh\"
-    [ -f \"\$sharedSsh/config\" ] || exit 0
-
-    propagate() {
-      local h=\"\$1\" owner=\"\$2\"
-      mkdir -p \"\$h/.ssh\"
-      # config: append Host github.com block only if not already present.
-      # Phase A.8: grep is intentional here — this runs in a sudo'd remote
-      # bash subshell (private.ossh.ssh + sudo bash -c) where ossh.config.get
-      # isn't reliably importable. Local sites use ossh.config.get.
-      if ! grep -q \"^Host github.com\$\" \"\$h/.ssh/config\" 2>/dev/null; then
-        cat \"\$sharedSsh/config\" >> \"\$h/.ssh/config\"
-      fi
-      # known_hosts: append github.com line if not present (idempotent)
-      if [ -f \"\$sharedSsh/known_hosts\" ] && ! grep -q github.com \"\$h/.ssh/known_hosts\" 2>/dev/null; then
-        cat \"\$sharedSsh/known_hosts\" >> \"\$h/.ssh/known_hosts\"
-      fi
-      chown \"\$owner:\" \"\$h/.ssh/config\" \"\$h/.ssh/known_hosts\" 2>/dev/null
-      chmod 700 \"\$h/.ssh\"
-      [ -f \"\$h/.ssh/config\" ] && chmod 600 \"\$h/.ssh/config\"
-      [ -f \"\$h/.ssh/known_hosts\" ] && chmod 644 \"\$h/.ssh/known_hosts\"
-    }
-
-    for u in \$(ls \"\$basehome\" 2>/dev/null | grep -v shared); do
-      h=\"\$basehome/\$u\"
-      [ -d \"\$h\" ] || continue
-      propagate \"\$h\" \"\$u\"
-    done
-    rootHome=\$(eval echo ~root)
-    if [ -d \"\$rootHome\" ]; then
-      propagate \"\$rootHome\" root
-    fi
-  '" 2>/dev/null
-}
 
 ossh.config.edit() # <?file> # opens the config file in an editor
 {
