@@ -19,6 +19,21 @@ The oosh/once.sh project features a dynamic Bash completion system, primarily im
 - Custom completions for advanced scenarios.
 - Debugging and troubleshooting completion issues.
 
+### A completion that depends on an earlier word
+
+A completion function is called as `<script>.<method>.completion.<param> "$cur" "$class" "$method"`:
+`$2` is the class name (`ossh`), not an earlier word. Before it asks, c2 parses the words typed so
+far into `PARAM_<name>` (an optional one into `PARAM_OPTIONAL_<name>`), so the function reads the
+earlier parameter by name. `ossh config.set <configItem> <field> <value>` completes `<value>` from
+`$PARAM_field` (T-OSSH-CONFIG-SET-COMPLETION):
+
+```bash
+ossh.config.set.completion.value() {
+  local field="$PARAM_field"   # e.g. port → 22 443 2222 8022
+  ...
+}
+```
+
 ## Interactive Completion Testing via tmux
 
 The completion system can be tested interactively using `otmux` to remote control a bash shell via tmux. This approach tests the actual user experience of Tab completion.

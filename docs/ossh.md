@@ -99,6 +99,44 @@ Until 2026-10-19 it asked the host for a command that no longer exists
 (was `ossh get.config`) and appended the answer, nothing or an error line,
 with rc 0.
 
+### Changing one Field of a Host
+
+```bash
+ossh config.set myhost port 2222          # replace the Port line of Host myhost
+ossh config.set myhost proxyJump bastion  # no ProxyJump yet: added below the Host line
+ossh config.field.get myhost port         # 2222
+```
+
+Marcel's design (test/mcdonges.latest, March 2026), rebuilt on dev on 2026-10-19. Seven fields;
+Tab completes the Host, the field and then what that field takes:
+
+| `<field>` | ssh keyword | `<value>` checked | Tab offers |
+|---|---|---|---|
+| `identityFile` | IdentityFile | one line | `~/.ssh/ids/*/id_*` and `~/.ssh/id_*` (no `.pub`) |
+| `user` | User | one line | git root deploy ubuntu |
+| `port` | Port | 1 to 65535 | 22 443 2222 8022 |
+| `hostName` | HostName | one line | — |
+| `proxyJump` | ProxyJump | one line | the Hosts |
+| `forwardAgent` | ForwardAgent | yes or no | yes no |
+| `identitiesOnly` | IdentitiesOnly | yes or no | yes no |
+
+The block is what `ossh config.get` shows: from `Host <name>` to the empty line or the next
+`Host`; the Host is compared as a string (`s.cond` is not `second`). An existing line of the
+keyword — whatever its case in the file — is replaced and keeps its indent (RESULT
+`<Keyword> <value> set in Host <name> (replaced)`); without one the line goes right below the
+Host line (`(added)`). The file is written whole with `private.this.file.write`: atomic, its
+mode and group kept, a trailing empty line kept. An unknown Host or field, a missing argument or
+a value the field does not take is rc 1 + RESULT, and the file stays byte for byte
+(T-OSSH-CONFIG-SET). `config.field.get` echoes only the value; rc 1 when the Host, the field or
+its line is not there (T-OSSH-CONFIG-FIELD-GET).
+
+Each field has its own `private.ossh.config.<field>.get|set` (the setter carries the value
+completion); `ossh config.set` dispatches to them. Changed against Marcel's version: the
+`.tmp` + `mv` write (it gave a new `~/.ssh/config` the umask mode — 664 under umask 002, which
+ssh refuses), the unchecked values, the Host used as a pattern, and the value completion, which
+read the field from `$2` (the class name; it is `$PARAM_field` —
+[completion-system.md](completion-system.md)) (T-OSSH-CONFIG-SET-COMPLETION).
+
 ### Generated Config Format
 
 ```
@@ -194,6 +232,9 @@ ossh config.push myhost
 
 # Pull a Host block from a remote host's SSH config
 ossh config.pull myhost demo
+
+# Change one field of a Host block
+ossh config.set myhost port 2222
 ```
 
 ### Who may log in: `public_keys/` and `authorized_keys`
@@ -527,6 +568,8 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh config.push` | Push SSH config to remote host |
 | `ossh config.pull` | Copy a Host block from a remote host's ~/.ssh/config here |
 | `ossh config.delete` | Remove a Host block from ~/.ssh/config |
+| `ossh config.set` | Set one of seven fields (port, user, …) of a Host block |
+| `ossh config.field.get` | Echo one field of a Host block |
 | `ossh config.shared.create` | Create shared SSH config |
 | `ossh config.shared.link` | Link user to shared config |
 | `ossh install` | Install oosh on remote host |
