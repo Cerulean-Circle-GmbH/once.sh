@@ -162,5 +162,7 @@ re-execs as root with `sudo -H` and moves the clone to `/root/oosh`. Until 2026-
 | state 31 cloned from GitHub before root had the developking key, so the SSH clone always failed and only the rescue copy stood in — with an `ERROR> clone of main … failed` line on every install | step 4 places the key for root (`private.oo.developking.key.place`) before the clone (T-STATE31-KEY-BEFORE-CLONE, T-OO-DEVELOPKING-KEY-PLACE) |
 | `ossh install.continue.local` ignored the rc of `oo state`, ended "done successful", and `init/oosh` set up the invoker on a broken install | a stuck state machine gives rc 1 with a RESULT that names it (T-OSSH-CONTINUE-LOCAL-STATE-FAIL) |
 
-A finished non-root install ends with "✓ oosh installed for root AND <user>" and asks to log in again, for the new
-`dev` group; only a root install starts the oosh shell itself.
+Every kind of install now ends in an oosh shell: a root install starts `bash -l`, a non-root one
+`sudo -i -u "$SUDO_USER" bash -l` — any invoker, with the new `dev` group and bash even for a zsh user
+(T-INIT-INVOKER-OOSH-SHELL). Not over the remote `ossh install` handoff (`MODE=root`) or without a terminal;
+there the "log out and log back in" message stays.
