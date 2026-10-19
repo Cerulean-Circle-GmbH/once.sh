@@ -163,11 +163,15 @@ server on `:8080`, which serves `/var/dev/EAMD.ucp`). Over ossh the tree comes a
 (`private.odocker.workspaces.fetch.ssh`, a key login checked first with BatchMode — no password
 prompt, no rsync or oosh needed there); over HTTPS with `wget -r -l inf -np -nH --cut-dirs=…
 -R "index.html*"` (`…fetch.url`, wget installed through `oo cmd wget`), the listing pages left out.
-Either way it lands in a temp folder first: a failed fetch is rc 1 and creates no root.
+Every route lands in a temp folder first — a local `<from>` is copied there, it is only read — so a
+failed fetch is rc 1 and creates no root. **`.backup.env` files are taken out there and never
+copied or compared**: they are the server's backup settings (`BACKUP_TARGET=root@WODA.prod:…`), and
+oosh's `backup` run in the local tree would read them (user decision 2026-10-19). A local
+`.backup.env` in the root stays as it is.
 
 The two routes do not give the same tree (lab 2026-10-19): over ossh it is the exact copy — 142
 files and the 10 symlinks (`minimalLinux/eamd -> /var/dev/…` and the like, dangling on any other
-host), the dotfiles (`.env`, `.backup.env`) included. Over HTTPS the web server follows the
+host), the dotfiles (`.env`) included — except `.backup.env`. Over HTTPS the web server follows the
 symlinks and hands out copies of their targets, does not list dotfiles, and leaves out a link
 whose target it does not serve (`minimalLinux/debug.self.sh`): 148 files, no symlinks. Symlinks
 are kept as symlinks and compared by their target (`private.odocker.workspaces.entry.same`;
