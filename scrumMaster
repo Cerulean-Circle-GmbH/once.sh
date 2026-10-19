@@ -589,9 +589,10 @@ scrumMaster.team.capture.completion.session() # # tmux session names
   tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
-scrumMaster.pulse() # <?session> # HONEST REAL-TIME team status — team.sweep OUTPUT format, but EVERY value measured LIVE at call time (never a recorded/stale reading). context% = token-math on the pane's live session JSONL; state = fresh bottom-area capture (drawer!=idle, wall/on-prompt distinct); kind = claude anywhere in the subtree. Self-contained — survives a broken/mid-refactor hiveMind.
+scrumMaster.pulse() # <?session> # DEPRECATED — use 'scrumMaster swipe' (pure-bash hiveMind-free drop-in; pulse KEPT as the parity oracle, zero-break). HONEST REAL-TIME team status — team.sweep OUTPUT format, but EVERY value measured LIVE at call time (never a recorded/stale reading). context% = token-math on the pane's live session JSONL; state = fresh bottom-area capture (drawer!=idle, wall/on-prompt distinct); kind = claude anywhere in the subtree. Self-contained — survives a broken/mid-refactor hiveMind.
 {
   local session="${1:-}"
+  echo "scrumMaster.pulse is DEPRECATED → use 'scrumMaster swipe' (pure-bash, hiveMind-free drop-in)" >&2
   python3 - "$session" <<'SM_PULSE_PY'
 import os, sys, json, subprocess, glob
 PROJD = os.path.expanduser("~/.claude/projects")
@@ -769,6 +770,169 @@ def main():
 main()
 SM_PULSE_PY
   create.result 0 "pulse"
+  return $(result)
+}
+
+private.scrumMaster.swipe.subtree() # <pane_pid> <?ps_snapshot> # echo "<kind> <shell_count>" : kind=agent|shell (claude anywhere in subtree), shell_count=bash-leaf descendants. Pure bash (ps + awk DFS), mirrors pulse children()/claude_proc. A caller-supplied ps snapshot (taken ONCE at swipe entry, before per-pane subshell churn) keeps the self-pane bash-count stable + matching pulse.
+{
+  local root="$1" snap="$2"
+  { if [ -n "$snap" ]; then printf '%s\n' "$snap"; else ps -eo pid,ppid,args 2>/dev/null; fi; } | awk -v root="$root" '
+    NR>1 {
+      pid=$1; ppid=$2; a=$0; sub(/^ *[0-9]+ +[0-9]+ +/,"",a)
+      kids[ppid]=kids[ppid] " " pid; argv[pid]=a
+    }
+    END {
+      n=0; stack[n++]=root; isagent=0; shcount=0
+      while (n>0) {
+        cur=stack[--n]; m=split(kids[cur], ch, " ")
+        for (i=1;i<=m;i++) {
+          c=ch[i]; if (c=="" || seen[c]) continue; seen[c]=1
+          a=argv[c]; split(a, w, " "); a0=w[1]
+          if (a0 ~ /bash$/) shcount++
+          if (a ~ /claude/ && a0 !~ /claudeCode/ && (a ~ /\/claude/ || a ~ /^claude/ || a ~ / claude / || a ~ /--resume/)) isagent=1
+          stack[n++]=c
+        }
+      }
+      print (isagent?"agent":"shell"), shcount
+    }'
+}
+
+private.scrumMaster.swipe.ctx() # <jsonl> <denomK> # echo "used|pct|denomK" | "lag" | "" — the ONLY python3 (JSON-parse + token-sum helper, mirrors pulse ctx_from_jsonl). Bash re-validates before render.
+{
+  local jsonl="$1" denomK="$2"
+  [ -f "$jsonl" ] || return 0
+  python3 -c '
+import sys, json
+path = sys.argv[1]; denom_k = int(sys.argv[2])
+used = 0; pending = 0
+try:
+    with open(path) as fh:
+        for line in fh:
+            if "\"input_tokens\"" in line:
+                try:
+                    d = json.loads(line)
+                    if d.get("type") == "assistant":
+                        u = d.get("message", {}).get("usage", {})
+                        if u and "input_tokens" in u:
+                            t = u["input_tokens"] + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                            if t > 0:
+                                used = t; pending = 0; continue
+                except Exception: pass
+            if ("\"type\":\"user\"" in line or "\"type\":\"attachment\"" in line or "\"type\":\"tool_result\"" in line or "\"type\":\"tool_use\"" in line
+                or "\"type\": \"user\"" in line or "\"type\": \"attachment\"" in line or "\"type\": \"tool_result\"" in line or "\"type\": \"tool_use\"" in line):
+                pending += 1
+except Exception: sys.exit(0)
+if used == 0: sys.exit(0)
+if pending > 8: print("lag"); sys.exit(0)
+print("%d|%d|%d" % (used, round(used * 100 / (denom_k * 1000)), denom_k))
+' "$jsonl" "$denomK" 2>/dev/null
+}
+
+private.scrumMaster.swipe.classify() # <capture-text> # echo STATE from the last-6-line chrome ONLY (mirrors pulse classify; never the message body).
+{
+  local cap="$1"
+  local tail; tail=$(printf '%s\n' "$cap" | tail -6)
+  local low; low=$(printf '%s' "$tail" | tr 'A-Z' 'a-z')
+  local idle_bar=0
+  case "$low" in *"auto mode on"*) idle_bar=1;; esac
+  case "$tail" in *"⏵⏵"*) idle_bar=1;; esac
+  case "$low" in *"esc to interrupt"*|*"esc to int"*) echo ACTIVE; return;; esac
+  case "$low" in *"context left until auto-compact"*|*"context limit reached"*|*"compact or /clear to continue"*) echo ON-WALL; return;; esac
+  if [ "$idle_bar" -eq 0 ]; then
+    case "$tail" in *"❯ 1."*) echo OPEN-DRAWER; return;; esac
+    case "$low" in *"1. yes"*|*"2. no"*|*"do you want to proceed"*) echo OPEN-DRAWER; return;; esac
+    case "$low" in *select*) case "$tail" in *"❯"*) echo OPEN-DRAWER; return;; esac;; esac
+  fi
+  [ "$idle_bar" -eq 1 ] && { echo IDLE; return; }
+  local rstrip="${tail%"${tail##*[![:space:]]}"}"
+  case "$rstrip" in *"❯") echo ON-PROMPT; return;; esac
+  echo IDLE
+}
+
+private.scrumMaster.swipe.role() # <sess> <idx> <title> # role from hivemind.roles.env DATA-FILE (registry-first; survives a broken hiveMind SCRIPT), else title's last word, else '?'. NOT a hiveMind-script call.
+{
+  local sess="$1" idx="$2" title="$3"
+  local reg="$HOME/config/hivemind.roles.env" r=""
+  [ -f "$reg" ] && r=$(grep "^${sess}:${idx}|" "$reg" 2>/dev/null | head -1 | cut -d'|' -f2)
+  if [ -n "$r" ]; then echo "$r"; return; fi
+  local t; t=$(printf '%s' "$title" | sed -e 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  if [ -n "$t" ]; then echo "${t##* }"; else echo "?"; fi
+}
+
+private.scrumMaster.swipe.jsonl() # <pane> <uuid-from-map> # echo jsonl path | "" . FAST=uuid from the discover.all map; FALLBACK=per-pane session.current/id (identical result).
+{
+  local pane="$1" uuid="$2" projd="$HOME/.claude/projects" hit=""
+  if [ -n "$uuid" ] && [ "${#uuid}" -gt 8 ]; then
+    hit=$(ls "$projd"/*/"${uuid}.jsonl" 2>/dev/null | head -1); [ -n "$hit" ] && { echo "$hit"; return; }
+  fi
+  local getter sid
+  for getter in session.current session.id; do
+    sid=$("$OOSH_DIR/claudeCode" "$getter" "$pane" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$sid" ] && [ "${#sid}" -gt 8 ]; then
+      hit=$(ls "$projd"/*/"${sid}.jsonl" 2>/dev/null | head -1); [ -n "$hit" ] && { echo "$hit"; return; }
+    fi
+  done
+}
+
+scrumMaster.swipe() # <?session> # PURE-BASH hiveMind-free drop-in for pulse: HONEST REAL-TIME team status, byte-identical output. Deps: tmux + claudeCode (session.discover.all) + bash + python3-JSON-helper(swipe.ctx) ONLY. NO hiveMind script calls.
+{
+  local session="${1:-}"
+  local CYAN=$'\033[96m' DIM=$'\033[90m' RST=$'\033[0m'
+  local PSS; PSS=$(ps -eo pid,ppid,args 2>/dev/null)   # ONE snapshot BEFORE per-pane subshell churn -> stable self-pane bash-count (parity with pulse)
+  local dmap; dmap=$("$OOSH_DIR/claudeCode" session.discover.all 2>/dev/null)
+  local sessions
+  if [ -n "$session" ]; then sessions="$session"; else sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); fi
+  local mdir; mdir=$(private.scrumMaster.rewind.markdir)
+  local sess
+  for sess in $sessions; do
+    local rows="" nagents=0 nshells=0 pl
+    while IFS= read -r pl; do
+      [ -z "$pl" ] && continue
+      local idx ppid cmd title
+      IFS='|' read -r idx ppid cmd title <<< "$pl"
+      [ -z "$idx" ] && continue
+      local st kind shct
+      st=$(private.scrumMaster.swipe.subtree "$ppid" "$PSS"); kind=${st%% *}; shct=${st##* }
+      if [ "$kind" != agent ]; then
+        rows="${rows}$(printf '  %-5s %s%-22s shell%s' "$idx" "$DIM" "shell" "$RST")"$'\n'
+        nshells=$((nshells+1)); continue
+      fi
+      nagents=$((nagents+1))
+      local role; role=$(private.scrumMaster.swipe.role "$sess" "$idx" "$title")
+      local cap; cap=$(tmux capture-pane -t "${sess}:${idx}" -p 2>/dev/null | tail -15)
+      local state; state=$(private.scrumMaster.swipe.classify "$cap")
+      local uuid; uuid=$(printf '%s\n' "$dmap" | awk -F'|' -v p="${sess}:${idx}" '$1==p{print $2; exit}')
+      local jl; jl=$(private.scrumMaster.swipe.jsonl "${sess}:${idx}" "$uuid")
+      local ctx=""; [ -n "$jl" ] && ctx=$(private.scrumMaster.swipe.ctx "$jl" 1000)
+      local lagging=0; [ "$ctx" = lag ] && lagging=1
+      local pct=""
+      [ "$lagging" -eq 0 ] && [ -n "$ctx" ] && pct=$(printf '%s' "$ctx" | cut -d'|' -f2)
+      if [ "$state" = ON-WALL ] && [ "$lagging" -eq 0 ] && { [ -z "$ctx" ] || [ "${pct:-0}" -lt 98 ]; }; then state=IDLE; fi
+      local mname; mname=$(private.scrumMaster.rewind.markname "${sess}:${idx}")
+      [ -n "$mdir" ] && [ -f "$mdir/$mname" ] && state=DURING-REWIND
+      local sc
+      case "$state" in
+        ACTIVE) sc=$'\033[92m';; IDLE) sc=$'\033[90m';; ON-PROMPT) sc=$'\033[96m';;
+        OPEN-DRAWER) sc=$'\033[93m';; ON-WALL) sc=$'\033[91m';; DURING-REWIND) sc=$'\033[95m';; *) sc="";;
+      esac
+      local ctxs
+      if [ "$lagging" -eq 1 ]; then
+        ctxs="${DIM}?ctx-lag(reboot)${RST}"
+      elif [ -n "$ctx" ]; then
+        local used dk cc mark
+        used=$(printf '%s' "$ctx" | cut -d'|' -f1); dk=$(printf '%s' "$ctx" | cut -d'|' -f3)
+        if [ "$pct" -ge 90 ]; then cc=$'\033[91m'; elif [ "$pct" -ge 80 ]; then cc=$'\033[93m'; else cc=$'\033[32m'; fi
+        mark=" "; [ "$pct" -ge 80 ] && mark="⚠"
+        ctxs=$(printf '%s%s%s%% (%sk/%sk)%s' "$cc" "$mark" "$pct" "$((used/1000))" "$dk" "$RST")
+      else
+        ctxs="${DIM}?ctx-no-jsonl${RST}"
+      fi
+      rows="${rows}$(printf '  %-5s %-22s %s%-12s%s %ssh:%s%s %s' "$idx" "$role" "$sc" "$state" "$RST" "$DIM" "$shct" "$RST" "$ctxs")"$'\n'
+    done <<< "$(tmux list-panes -s -t "$sess" -F '#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_title}' 2>/dev/null)"
+    printf '%sTEAM %s%s  %s%s agents · %s shells%s\n' "$CYAN" "$sess" "$RST" "$DIM" "$nagents" "$nshells" "$RST"
+    [ -n "$rows" ] && printf '%s' "$rows"
+  done
+  create.result 0 "swipe"
   return $(result)
 }
 
