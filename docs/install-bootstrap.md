@@ -149,3 +149,20 @@ unattended installer cannot answer anyway).
 > The probe deliberately runs at `mktemp`'s mode 600 — the one permission the real
 > `ossh.prereqs.install` call site grants, and no more.
 
+
+## A non-root install: who owns `~/oosh`, the key before the clone, a failing rc
+
+Run as a non-root user (`sh -c "$(curl …)"` as `test`), the installer clones into a `mktemp` folder of that user,
+re-execs as root with `sudo -H` and moves the clone to `/root/oosh`. Until 2026-10-19 that install never finished
+(on testing too; as root it worked), through three faults in a chain:
+
+| Fault | Now |
+|---|---|
+| `mv` keeps the owner: root's `~/oosh` belonged to the invoker, the rescue copy of state 31 (`cp -a ~/oosh main`) kept that, and root's git refused `main/` as "dubious ownership" | after the move `init/oosh` chowns `~/oosh` to the user running it (T-INIT-ROOT-OWNS-OOSH) |
+| state 31 cloned from GitHub before root had the developking key, so the SSH clone always failed and only the rescue copy stood in — with an `ERROR> clone of main … failed` line on every install | step 4 places the key for root (`private.oo.developking.key.place`) before the clone (T-STATE31-KEY-BEFORE-CLONE, T-OO-DEVELOPKING-KEY-PLACE) |
+| `ossh install.continue.local` ignored the rc of `oo state`, ended "done successful", and `init/oosh` set up the invoker on a broken install | a stuck state machine gives rc 1 with a RESULT that names it (T-OSSH-CONTINUE-LOCAL-STATE-FAIL) |
+
+Every kind of install now ends in an oosh shell: a root install starts `bash -l`, a non-root one
+`sudo -i -u "$SUDO_USER" bash -l` — any invoker, with the new `dev` group and bash even for a zsh user
+(T-INIT-INVOKER-OOSH-SHELL). Not over the remote `ossh install` handoff (`MODE=root`) or without a terminal;
+there the "log out and log back in" message stays.

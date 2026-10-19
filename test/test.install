@@ -1172,6 +1172,88 @@ test.case $level "T-DEINSTALL-USER-DELETE: init/deinstall.oosh deletes developki
   test.install.deinstallUserDelete
 expect 0 "deinstall deletes developking through user linux.delete when it exists" "user delete.linux is no method, and || true hid it"
 
+# T-INIT-ROOT-OWNS-OOSH: the clone moved to $HOME/oosh belongs to the user who runs the install
+# As a non-root user the installer clones into a mktemp folder of that user,
+# re-execs as root with sudo -H and mv's the clone to /root/oosh — mv keeps
+# the owner, so root's ~/oosh belonged to the invoker. State 31's rescue copy
+# (cp -a ~/oosh main) kept that owner, and root's git refused main/ ("dubious
+# ownership"): the install as `test` never finished (2026-10-19, also on
+# testing). The move block is run in sh with a fixture HOME; chown records.
+test.install.rootOwnsOosh() {
+  local fx bad="" block out
+  fx=$(test.suite.fixture.make initrootownsoosh)
+  block=$(sed -n '/^# ─── Move repo to \$HOME\/oosh/,/^unset _canon/p' "$INIT_SCRIPT")
+  [ -n "$block" ] || bad="$bad noBlock"
+  mkdir -p "$fx/home" "$fx/tmp/once.sh/init"; echo "echo reexec" > "$fx/tmp/once.sh/init/oosh"
+  out=$(cd "$fx" && HOME="$fx/home" OOSH_DIR="$fx/tmp/once.sh" sh -c '
+    die() { echo "die $*"; exit 1; }
+    oosh_dir_is_home_link() { return 1; }
+    chown() { echo "chown $*"; }
+    '"$block" 2>&1)
+  [ -d "$fx/home/oosh/init" ] || bad="$bad notMoved"
+  printf '%s\n' "$out" | grep -qx "chown -R $(id -u):$(id -g) $fx/home/oosh" || bad="$bad noChown=[${out//$fx/FX}]"
+  case "$out" in *"chown"*"reexec"*) ;; *) bad="$bad order=[${out//$fx/FX}]" ;; esac
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the moved clone is chowned to the running user before the re-exec" || create.result 1 "root owns oosh:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-ROOT-OWNS-OOSH: init/oosh gives the moved ~/oosh to the user who runs it" test.install.rootOwnsOosh
+expect 0 "the moved clone is chowned to the running user before the re-exec" \
+  "root's ~/oosh belonged to the invoker, and the rescue copy of state 31 was refused by git"
+
+# T-INIT-INVOKER-OOSH-SHELL: a non-root install ends in an oosh shell of the invoker
+# Only a root install started the oosh shell; as `test` it ended with "log out
+# and log back in" (the new dev group). The user (2026-10-19): every kind of
+# install drops into the oosh shell. `sudo -i -u` reads the groups afresh and
+# names bash, so any invoker works, a zsh user on macOS too. Structural: an
+# exec into a login shell cannot be caught in a pipe; the container run shows
+# it.
+test.install.invokerOoshShell() {
+  local block bad="" success
+  block=$(sed -n '/^# ─── Install oosh for the invoking user/,/^# Auto-activate the oosh shell/p' "$INIT_SCRIPT")
+  success=$(printf '%s\n' "$block" | sed -n '/oosh\.install "\$SUDO_USER"; then/,/^  else$/p')
+  printf '%s\n' "$success" | grep -q 'exec sudo -i -u "\$SUDO_USER" "\${BASH_FILE:-bash}" -l' || bad="$bad noExec"
+  printf '%s\n' "$success" | grep -q '\[ -z "\$MODE" \] && \[ -t 1 \]' || bad="$bad noGuard"
+  printf '%s\n' "$success" | grep -q 'unset OOSH_DIR OOSH_MODE' || bad="$bad noUnset"
+  # root's .bash_profile is ensured before the exec ends the script
+  [ "$(grep -n '\[ ! -f ~/.bash_profile \]' "$INIT_SCRIPT" | head -1 | cut -d: -f1)" -lt \
+    "$(grep -n '^# ─── Install oosh for the invoking user' "$INIT_SCRIPT" | cut -d: -f1)" ] 2>/dev/null || bad="$bad profileAfter"
+  [ -z "$bad" ] && create.result 0 "the invoker gets an oosh login shell after its install" || create.result 1 "invoker shell:$bad"
+  return $(result)
+}
+test.case $level "T-INIT-INVOKER-OOSH-SHELL: a non-root install drops the invoker into an oosh login shell" test.install.invokerOoshShell
+expect 0 "the invoker gets an oosh login shell after its install" \
+  "a non-root install ended with log out and log back in instead of an oosh shell"
+
+# T-INIT-SUDO-KEEPS-MODE: the sudo re-exec of a non-root `ossh install` keeps `mode root <host> …`
+# ossh install runs `./oosh mode root <host> <config|_> <branch> <logLevel>`.
+# The arg parsing shifts them away, so as a non-root Host user the
+# `exec sudo … "$0" "$@"` re-exec got none: root ran with MODE empty, the host
+# named by `hostname`, no log level — and T-INIT-INVOKER-OOSH-SHELL's oosh
+# shell started inside the remote install (platform.test, 2026-10-19). The
+# block from the arg parsing to the re-exec runs in sh with a fake sudo.
+test.install.sudoKeepsMode() {
+  local fx bad="" block out
+  fx=$(test.suite.fixture.make initsudokeepsmode); mkdir -p "$fx/bin"
+  printf '#!/bin/sh\necho "SUDO $*"\n' > "$fx/bin/sudo"; chmod +x "$fx/bin/sudo"; : > "$fx/oosh"
+  block=$(sed -n '/^# ─── Arg parsing/,/^  exec sudo -H -E sh "\$0" "\$@"$/p' "$INIT_SCRIPT"); block="$block"$'\n'"fi"
+  [ -n "$block" ] || bad="$bad noBlock"
+  out=$(PATH="$fx/bin:$PATH" sh -c 'die() { echo "die $*"; exit 1; }; oosh_bash_ok() { return 0; }
+    '"$block" "$fx/oosh" mode root myhost _ mybranch 3 2>&1)
+  printf '%s\n' "$out" | grep -qx "SUDO -H -E sh $fx/oosh mode root myhost _ mybranch 3" || bad="$bad modeLost=[${out//$fx/FX}]"
+  out=$(PATH="$fx/bin:$PATH" sh -c 'die() { echo "die $*"; exit 1; }; oosh_bash_ok() { return 0; }
+    '"$block" "$fx/oosh" 2>&1)
+  printf '%s\n' "$out" | grep -qx "SUDO -H -E sh $fx/oosh" || bad="$bad curlArgs=[${out//$fx/FX}]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the sudo re-exec passes mode root and its args on" || create.result 1 "sudo keeps mode:$bad"
+  return $(result)
+}
+if [ "$(id -u)" -ne 0 ]; then
+  test.case $level "T-INIT-SUDO-KEEPS-MODE: the sudo re-exec of ossh install keeps mode root and its arguments" test.install.sudoKeepsMode
+  expect 0 "the sudo re-exec passes mode root and its args on" \
+    "root ran without mode root: an oosh shell started inside the remote install"
+fi
+
 ### test.method
 
 test.suite.save.results

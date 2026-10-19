@@ -372,8 +372,9 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   fi
 
   # Fresh container
-  # Docker's random name, as container and host name (odocker.run.sshd), so
-  # the install inside names the computer by it, not by the container's ID.
+  # Docker's random name (odocker.run.sshd); the host name stays the ID. The
+  # install inside reads the name through the mounted socket:
+  # [oosh <name>] <user>@<ID>, as odocker status pairs them.
   odocker reset "$imageTag" "$sshPort"
   sleep 2
 

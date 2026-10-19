@@ -435,12 +435,14 @@ The Docker socket gives the container root-level access to the host's Docker dae
 A container `run`, `run.sshd` or `create` starts **without a name** keeps
 Docker's **random name** — but odocker learns it before the container starts:
 an empty `docker create` lets Docker pick it, the entry is removed again, and
-the container starts with that name — passed as the **host name** too, like
-every given name. So the container knows its name from the first second, and
-the oosh install inside names the computer by it
-(`[oosh xenodochial_brown] bash-user@xenodochial_brown`), not by its ID. A container
-started by plain `docker run` learns its name once odocker has installed the
-docker program there (T-ODOCKER-CONTAINER-NAME-NEW, -UNNAMED-GETS-NAME,
+the container starts with that name. Only `--name` is given: the **host name stays
+the container ID**, and the oosh install inside reads the name through the mounted
+socket. The prompt pairs them as `odocker status` does — the name in `[]`, the ID
+after `@`: `[oosh xenodochial_brown] bash-user@bbefafb7d5e3` (2026-10-19,
+T-ODOCKER-RUN-NO-HOSTNAME, T-USER-PROMPT-HOST-NAME; until then `--hostname` gave
+the name twice). A container started by plain `docker run` learns its name once
+odocker has installed the docker program there; without a socket it shows its ID
+in both places (T-ODOCKER-CONTAINER-NAME-NEW, -UNNAMED-GETS-NAME,
 -START-NAME-REFRESH).
 | `clone <container>` | container name, optional `<?portOrOffset:0>`, optional `docker` | Clone a container with its filesystem state onto different ports |
 | `install <container>` | container name | Install Docker CLI inside a running container (requires Docker socket mount): `odocker prereqs.install` there when it has oosh |
@@ -492,7 +494,7 @@ Workspaces in DockerWorkspaces follow camelCase directory naming. The image tag 
 
 ## Container Names
 
-A container started without `--name` gets Docker's random name as its name and host name (`private.odocker.container.name.new`). How oosh uses it as the computer's name: [config.md § The computer's name](config.md#the-computers-name).
+A container started without `--name` gets Docker's random name as its name (`private.odocker.container.name.new`); its host name stays the ID. How oosh uses it as the computer's name: [config.md § The computer's name](config.md#the-computers-name).
 
 ## Typical Workflow: Platform Install Test
 
