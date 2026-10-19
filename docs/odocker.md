@@ -125,7 +125,8 @@ image, `os:212-220`) will say so.
 That is expected, not a defect: seed the root from an existing tree, point oosh at a checkout, or start an empty root.
 
 ```bash
-odocker workspace.seed /path/to/old/DockerWorkspaces           # create beside Once.sh, copy the old tree in, share, set
+odocker workspace.seed                                         # fetch the tree from WODA.test (ossh), else test.wo-da.de (wget)
+odocker workspace.seed /path/to/old/DockerWorkspaces           # or from a local tree (also: a Host, a URL)
 odocker workspace.set /path/to/EAMD.ucp/.../DockerWorkspaces   # existing tree
 odocker workspace.init /path/to/new/DockerWorkspaces           # create, then set
 ```
@@ -142,9 +143,49 @@ else runs `odocker workspace.init` and shares the root with group dev; a failing
 
 `workspace.set` **refuses** a directory that is not there; `workspace.init`
 creates it first, which is the difference between the two verbs. `workspace.seed`
-creates it too and copies an existing root in (`private.this.folder.entries.copy`),
-then shares it with group dev (`private.this.folder.share`) — only into a root that
-holds no workspace yet, so a rerun never overwrites; the source is only read.
+creates it too, fills it and shares it with group dev (`private.this.folder.share`).
+
+### `odocker workspace.seed <?from> <?path>`
+
+Fills the root (default: `DockerWorkspaces` beside the Once.sh base — `/home/shared/…` on Linux,
+`/Users/shared/…` on macOS) with the whole Docker workspaces tree, as `ls` shows it on the server:
+the image families, `WODA/`, `old/`, `plantuml/`, `structr/` and the READMEs. Where from:
+
+| `<from>` | Source |
+|---|---|
+| — (none) | the Host **WODA.test** over ossh (`private.odocker.workspaces.source.host.get`, `ODOCKER_SEED_HOST`) — its `…/DockerWorkspaces` in the EAMD.ucp checkout (`…source.path.get`, `ODOCKER_SEED_PATH`); when that Host is missing or allows no key login: **`https://test.wo-da.de/EAMD.ucp/…/DockerWorkspaces`** with wget (`…source.url.get`, `ODOCKER_SEED_URL`) |
+| a Host of `~/.ssh/config` | that Host, the same path, no fallback |
+| `http(s)://…` | that URL with wget, no fallback |
+| a folder | that local tree, only read; rc 2 when it is missing, rc 3 without a Dockerfile |
+
+The URL is a public directory listing of the very folder on WODA.test (nginx `/EAMD.ucp/` → the ONCE
+server on `:8080`, which serves `/var/dev/EAMD.ucp`). Over ossh the tree comes as one `tar` stream
+(`private.odocker.workspaces.fetch.ssh`, a key login checked first with BatchMode — no password
+prompt, no rsync or oosh needed there); over HTTPS with `wget -r -l inf -np -nH --cut-dirs=…
+-R "index.html*"` (`…fetch.url`, wget installed through `oo cmd wget`), the listing pages left out.
+Either way it lands in a temp folder first: a failed fetch is rc 1 and creates no root.
+
+The two routes do not give the same tree (lab 2026-10-19): over ossh it is the exact copy — 142
+files and the 10 symlinks (`minimalLinux/eamd -> /var/dev/…` and the like, dangling on any other
+host), the dotfiles (`.env`, `.backup.env`) included. Over HTTPS the web server follows the
+symlinks and hands out copies of their targets, does not list dotfiles, and leaves out a link
+whose target it does not serve (`minimalLinux/debug.self.sh`): 148 files, no symlinks. Symlinks
+are kept as symlinks and compared by their target (`private.odocker.workspaces.entry.same`;
+`private.this.folder.entries.copy` copies a dangling one since 2026-10-19).
+
+Then `private.odocker.workspaces.merge` fills the root unit by unit — a unit is a top-level file
+(`README.txt`) or a second-level entry (`nakedUbuntu/24.04`, `WODA/2.0.0`) with all below it:
+
+| Here | Then |
+|---|---|
+| missing | copied in — **added** |
+| every file of the source unit the same | nothing — **unchanged** |
+| different | `Overwrite <unit> (differs from <source>)? [y/N]` on the terminal; `y` copies the source files over the local ones (files only here stay) — **overwritten**, else **kept**; without a terminal always kept |
+| only here (e.g. `nakedUbuntu/26.04.root`) | never touched |
+
+RESULT: `seeded <root> from <source>: N added, M overwritten, K kept, U unchanged — kept (differ):
+…` (T-WS-SEED, T-WS-SEED-SOURCES, T-WS-SEED-MERGE). Until 2026-10-19 `<from>` had to be a local folder
+and a root that held any workspace was never written to.
 
 To check a machine is ready to build platform images:
 
@@ -342,7 +383,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 |--------|-----------|-------------|
 | `workspace.get <?path>` | directory path (optional) | With no argument: show the current Docker workspaces directory, where it is persisted, **and whether it is usable** — rc 1 when it is not. With a path: report whether **that** path would be a usable root. A reporter only; it never sets, persists or creates |
 | `workspace.init <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | **Create** the directory if it is absent, then hand over to `workspace.set`. Idempotent. The verb to use on a fresh host, where `workspace.set` would refuse because the directory is not there yet |
-| `workspace.seed <from> <?path>` | an existing workspaces root; directory path (optional — the same default) | **Create** the root (via `workspace.init`), copy `<from>` in when the root holds no workspace yet, share it with group dev, set it. Refuses a `<from>` without Dockerfiles (rc 3). Idempotent; never overwrites; `<from>` is only read |
+| `workspace.seed <?from> <?path>` | a folder, an ossh Host or a URL (optional — default WODA.test, else test.wo-da.de); directory path (optional — the same default) | **Create** the root (via `workspace.init`), add what is missing from the source, ask before overwriting a differing unit, share it with group dev, set it. Refuses a local `<from>` that is missing (rc 2) or without Dockerfiles (rc 3); rc 1 when nothing could be fetched. See [workspace.seed](#odocker-workspaceseed-from-path) |
 | `workspace.set <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to that default |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
 
