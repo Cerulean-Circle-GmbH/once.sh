@@ -66,8 +66,7 @@ ossh list
   line an indented `<Keyword> <value>`), else rc 1 "… is no single Host block — not appended"
 - a Host the file already has: rc 1 "already exists — not appending duplicate", as before
 - no last block: rc 1 "ossh config.create first"
-- an existing file is written in place after the checks (owner and mode stay — also the shared
-  config of `config.shared.github.create`); a new file is made 600
+- an existing file is written in place after the checks (owner and mode stay); a new file is made 600
 - rc 0 + RESULT `appended <name> to <file>` (T-OSSH-CONFIG-SAVE-LAST)
 
 Until 2026-10-19 it appended the whole `result.txt`, a scratch file: with live logging
@@ -534,17 +533,14 @@ The macOS extras are required because Apple's `/bin/bash` is 3.2 (their last GPL
 
 The remote install runs over ssh+sh (no bash on remote required), so this works on a fresh naked alpine box where bash doesn't yet exist, and on a stock macOS where only the system 3.2 bash is present.
 
-### Deploy Key (GitHub access)
+### GitHub access
 
-`ossh install` ensures every user on the target ends up with a working `2cuGitHub` SSH alias for cloning from `Cerulean-Circle-GmbH`. The deploy key reaches the shared `.ssh/` via one of two paths:
+`ossh install` gives every user on the target a working `github.com` SSH alias for cloning from `Cerulean-Circle-GmbH` (`git clone git@github.com:…`, `oo update`, `oo checkout`). Two pieces:
 
-1. **Caller-supplied (wins when present).** If the caller has `~/.ssh/deploy_keys/2cuGitHub` locally, that exact key is transferred to `/home/shared/.ssh/2cuGitHub` on the remote. Use this when you rotate the deploy key on your laptop and want the new one pushed.
+1. **The key.** `~/.ssh/ids/ssh.developking/id_rsa`, which `osshLayout.role.developking` places for every user. It was downloaded during state 31 from the oosh templates server (`test.wo-da.de`) or the local `templates/user/developking.ssh/` fallback. `developking` is an ordinary user (it owns none of the shared folders) and is also the remote account in `Host WODA.dev`; nothing reads the key from `~developking/.ssh` any more.
+2. **The alias and GitHub's host key**, once for the whole host — see [GitHub for every user](#github-for-every-user). State 31 sets them up before its first clone; `ossh install` runs the same on the target (`ossh config.shared.seed.github`).
 
-2. **Fallback via the `developking` key (default).** If the caller doesn't have a local `deploy_keys/2cuGitHub`, GitHub access uses `~/.ssh/ids/ssh.developking/id_rsa`, which `osshLayout.role.developking` places for every user; the shared config is written by `ossh.config.shared.github.create`. The key itself was downloaded during state 31 from the oosh templates server (`test.wo-da.de`) or the local `templates/user/developking.ssh/` fallback. `developking` is an ordinary user (it owns none of the shared folders) and is also the remote account in `Host WODA.dev`; nothing reads the key from `~developking/.ssh` any more.
-
-Either way, `user.oosh.install` then copies `/home/shared/.ssh/`'s `2cuGitHub` + `config` (with the `Host 2cuGitHub` block) + `known_hosts` into every new user's own `~/.ssh/`, so `git clone 2cuGitHub:…`, `oo update`, and `oo checkout` just work for every oosh user.
-
-If both paths fail (test.wo-da.de unreachable AND no local templates AND no caller-side deploy key), install still succeeds — only the GitHub-access setup is skipped. A `warn.log` line flags this.
+If the key could not be downloaded (test.wo-da.de unreachable AND no local templates), install still succeeds — only the GitHub access is missing. A `warn.log` line flags this.
 
 ## Hardening
 
@@ -584,19 +580,30 @@ which refuses to proceed if:
 - **No NOPASSWD sudoers drop-in.** One-liner if you need it: `echo "<user> ALL=(ALL) NOPASSWD:ALL" | ssh <host> sudo tee /etc/sudoers.d/<user>-nopasswd`.
 - **No `AllowUsers` in the orchestrator.** Dangerous default; opt-in via `.sshd.allowusers`.
 
-## Shared SSH Config
-
-For multi-user environments (containers, shared servers):
+## GitHub for every user
 
 ```bash
-# Create shared SSH config with GitHub deploy key
-ossh config.shared.create
-
-# Link a user's SSH config to the shared config
-ossh config.shared.link username
+sudo ossh config.shared.github.create     # as root; idempotent
 ```
 
-The shared config lives in the platform-appropriate shared home directory — `/home/shared/.ssh/` on Linux, `/Users/shared/.ssh/` on macOS. Paths are detected automatically using `dirname "$HOME"`.
+OpenSSH reads two system files for **every** user, so oosh writes GitHub there once instead of into each home:
+
+| File | Content | Mode |
+|---|---|---|
+| `/etc/ssh/ssh_config.d/oosh-github.conf` | `Host github.com` — `User git`, `Port 22`, `HostName github.com`, `IdentityFile ~/.ssh/ids/ssh.developking/id_rsa`, `IdentitiesOnly yes` | 644 |
+| `/etc/ssh/ssh_known_hosts` | GitHub's host key lines from `ssh-keyscan github.com` (missing lines added) | 644 |
+
+- `~` in `IdentityFile` is expanded by ssh for the user who runs it, so each user uses their own copy of the developking key.
+- The `.conf` ending is needed on Linux (`Include /etc/ssh/ssh_config.d/*.conf`); macOS reads every file there (`Include /etc/ssh/ssh_config.d/*`). Checked 2026-10-19 on Debian 12, Alma 9.8, Alpine 3.19 and 3.23, Ubuntu 24.04, macOS 15 and 26.
+- The host key is public. Having it system-wide means no user is ever asked "Are you sure you want to continue connecting?" for github.com, so a fake GitHub is refused straight away. Access needs the private key, which stays in each user's own `~/.ssh`.
+- `ossh config.get github.com` and `ssh -G github.com` show the result; the invariant tests (`ssh.config.invariant`, `ssh.config.woda`, `platform.ssh.layout.invariant`) check `ssh -G`.
+
+**Clean-up of the old layout.** From 2026-04-01 (1b5c427e) to 2026-10-19, oosh kept a root-only template in `<basehome>/shared/.ssh` (`/home/shared/.ssh`, `/Users/shared/.ssh`) and copied its block and host key into every user's `~/.ssh/config` and `known_hosts`. `config.shared.github.create` now removes:
+
+- `<basehome>/shared/.ssh`, but only when it holds nothing but `config` and `known_hosts`. Anything else (e.g. an old `2cuGitHub` deploy key, there until 2026-05-11) keeps the folder as it is, with a warning — a human decides.
+- in every home (the users base without `shared`, plus root's home): the `Host github.com` block when it has only the fields oosh writes (`private.ossh.github.block.is.oosh`), and the `known_hosts` lines that are also in `/etc/ssh/ssh_known_hosts`. Files are written in place, owner and mode stay. A block or key the user wrote stays. Reason: a user's own config wins over the system file, and an old host key there would block ssh after a GitHub key rotation.
+
+`RESULT` names the two files and what was removed. `ossh folder.fix` (runs as the user) no longer adds the block to `~/.ssh/config`; it warns when the system file lacks it.
 
 ## Method Reference
 
@@ -610,8 +617,7 @@ The shared config lives in the platform-appropriate shared home directory — `/
 | `ossh config.delete` | Remove a Host block from ~/.ssh/config |
 | `ossh config.set` | Set one of seven fields (port, user, …) of a Host block |
 | `ossh config.field.get` | Echo one field of a Host block |
-| `ossh config.shared.create` | Create shared SSH config |
-| `ossh config.shared.link` | Link user to shared config |
+| `ossh config.shared.github.create` | GitHub for every user: `/etc/ssh/ssh_config.d/oosh-github.conf` + `/etc/ssh/ssh_known_hosts`; removes the old `<basehome>/shared/.ssh` and its copies |
 | `ossh install` | Install oosh on remote host |
 | `ossh login` | Interactive SSH login |
 | `ossh key.push` | Push SSH key to remote host |

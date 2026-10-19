@@ -595,6 +595,276 @@ test.case $level "T-OSSH-CONFIG-SAVE-LAST: config.save.last appends the block of
 expect 0 "save.last appends exactly the block config.create made, checked, mode kept" \
   "save.last appended the shared result.txt: log lines in ~/.ssh/config, and ssh refused the file"
 
+
+# ============================================================================
+# GitHub for every user through /etc/ssh — no <basehome>/shared/.ssh
+# ============================================================================
+# Since 1b5c427e (2026-04-01) a root-only template <basehome>/shared/.ssh held
+# the Host github.com block and the host key of GitHub, and oosh copied both
+# into every home. It looked like the home of a user "shared" (asked about by
+# the boss, 2026-10-19), and the copies drift. OpenSSH reads its own folder for
+# every user: ssh_config.d/*.conf and ssh_known_hosts (checked 2026-10-19 on
+# Debian 12, Alma 9.8, Alpine 3.19/3.23, Ubuntu 24.04 and macOS 15/26).
+# config.shared.github.create writes there and removes the template and the
+# copies — only what oosh put there. HOME, CONFIG_PATH, the two system files and
+# the homes are the fixture; ssh-keyscan is a stub; ssh/scp/rsync record.
+test.ossh.sharedGithub.run() { # <fx> <what...> # run <what...> in a subshell against the fixture <fx>; echo rc|RESULT #
+  local fx="$1"; shift
+  ( HOME="$fx"; CONFIG_PATH="$fx/config"; CURRENT_SSH_DIR="$fx/.ssh"; LOG_LIVE=; LOG_LEVEL=2; LOG_DEVICE=/dev/null
+    export OSSH_SYSTEM_SSH_CONFIG="$fx/etc/ssh/ssh_config.d/oosh-github.conf" OSSH_SYSTEM_KNOWN_HOSTS="$fx/etc/ssh/ssh_known_hosts"
+    ssh-keyscan() { [ -e "$fx/nokeys" ] || printf '%s\n' "github.com ssh-ed25519 AAAATESTKEY" "github.com ssh-rsa AAAATESTRSA"; }
+    for f in ssh scp rsync; do eval "$f() { echo \"REAL $f \$*\" >> \"$fx/real\"; return 255; }"; done
+    private.ossh.users.basehome() { echo "$fx/home"; }
+    private.ossh.user.homes.get() { local h; for h in "$fx/home"/*; do [ "${h##*/}" = shared ] || echo "$h"; done; echo "$fx/root"; }
+    create.result 0 stale
+    "$@" </dev/null >/dev/null 2>&1; echo "$?|$RESULT" )
+}
+test.ossh.sharedGithub.fixture() { # <name> # a fresh fixture with config, home and root; echo its path #
+  local fx; fx=$(test.suite.fixture.make "$1")
+  mkdir -p "$fx/config" "$fx/.ssh" "$fx/home" "$fx/root"; echo "$fx"
+}
+
+# T-OSSH-SHARED-GITHUB-CREATE: the block and the host key in the system files
+test.ossh.sharedGithubCreate() {
+  local fx bad="" got conf kh
+  fx=$(test.ossh.sharedGithub.fixture osshsharedgithubcreate)
+  conf="$fx/etc/ssh/ssh_config.d/oosh-github.conf"; kh="$fx/etc/ssh/ssh_known_hosts"
+  got=$(test.ossh.sharedGithub.run "$fx" ossh.config.shared.github.create)
+  case "$got" in "0|github.com for all users: $conf, $kh"*) ;; *) bad="$bad rc=[${got//$fx/FX}]" ;; esac
+  [ "$(awk 'NF' "$conf" 2>/dev/null | tr -s ' ' | tr '\n' '|')" = "Host github.com| User git| Port 22| HostName github.com| IdentityFile ~/.ssh/ids/ssh.developking/id_rsa| IdentitiesOnly yes|" ] \
+    || bad="$bad block=[$(tr '\n' '|' < "$conf" 2>/dev/null)]"
+  [ "$(ls -l "$conf" 2>/dev/null | cut -c1-10)" = "-rw-r--r--" ] || bad="$bad confMode=$(ls -l "$conf" 2>/dev/null | cut -c1-10)"
+  [ "$(tr '\n' '|' < "$kh" 2>/dev/null)" = "github.com ssh-ed25519 AAAATESTKEY|github.com ssh-rsa AAAATESTRSA|" ] || bad="$bad keys=[$(tr '\n' '|' < "$kh" 2>/dev/null)]"
+  [ "$(ls -l "$kh" 2>/dev/null | cut -c1-10)" = "-rw-r--r--" ] || bad="$bad khMode=$(ls -l "$kh" 2>/dev/null | cut -c1-10)"
+  [ -e "$fx/home/shared" ] && bad="$bad sharedMade"
+  # again: one block, no second key line
+  got=$(test.ossh.sharedGithub.run "$fx" ossh.config.shared.github.create)
+  [ "${got%%|*}" = 0 ] && [ "$(grep -c '^Host github.com$' "$conf")" = 1 ] && [ "$(grep -c . "$kh")" = 2 ] || bad="$bad again=[${got//$fx/FX}]"
+  # a known_hosts with other hosts keeps them; GitHub is added
+  rm -f "$kh"; printf '%s\n' "other.host ssh-ed25519 AAAAOTHER" > "$kh"
+  got=$(test.ossh.sharedGithub.run "$fx" ossh.config.shared.github.create)
+  [ "$(tr '\n' '|' < "$kh")" = "other.host ssh-ed25519 AAAAOTHER|github.com ssh-ed25519 AAAATESTKEY|github.com ssh-rsa AAAATESTRSA|" ] || bad="$bad other=[$(tr '\n' '|' < "$kh")]"
+  # no host key to be had: rc 1
+  rm -f "$kh"; : > "$fx/nokeys"
+  got=$(test.ossh.sharedGithub.run "$fx" ossh.config.shared.github.create)
+  [ "${got%%|*}" = 1 ] || bad="$bad noKeys=[${got//$fx/FX}]"
+  [ -s "$fx/real" ] && bad="$bad real=[$(tr '\n' '|' < "$fx/real")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the block and the host key in the system files, 644, once" || create.result 1 "shared github create:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-SHARED-GITHUB-CREATE: config.shared.github.create writes ssh_config.d and ssh_known_hosts for every user" test.ossh.sharedGithubCreate
+expect 0 "the block and the host key in the system files, 644, once" \
+  "GitHub for every user still went through a template folder that looks like the home of a user"
+
+# T-OSSH-SHARED-LEGACY: the old template folder goes, unless it holds more
+test.ossh.sharedLegacy() {
+  local fx bad="" got
+  fx=$(test.ossh.sharedGithub.fixture osshsharedlegacy)
+  mkdir -p "$fx/home/shared/.ssh" "$fx/home/shared/EAMD.ucp"
+  printf '%s\n' "Host github.com" " User git" > "$fx/home/shared/.ssh/config"; : > "$fx/home/shared/.ssh/known_hosts"
+  got=$(test.ossh.sharedGithub.run "$fx" ossh.config.shared.github.create)
+  [ "${got%%|*}" = 0 ] || bad="$bad rc=[${got//$fx/FX}]"
+  case "$got" in *"removed: $fx/home/shared/.ssh"*) ;; *) bad="$bad notNamed=[${got//$fx/FX}]" ;; esac
+  [ -e "$fx/home/shared/.ssh" ] && bad="$bad stayed"
+  [ -d "$fx/home/shared/EAMD.ucp" ] || bad="$bad sharedTouched"
+  # an old deploy key or anything else: the folder stays as it is
+  mkdir -p "$fx/home/shared/.ssh"; : > "$fx/home/shared/.ssh/config"; : > "$fx/home/shared/.ssh/2cuGitHub"
+  got=$(test.ossh.sharedGithub.run "$fx" ossh.config.shared.github.create)
+  [ "${got%%|*}" = 0 ] || bad="$bad extraRc=[${got//$fx/FX}]"
+  [ "$(ls "$fx/home/shared/.ssh" | tr '\n' ' ')" = "2cuGitHub config " ] || bad="$bad extra=[$(ls "$fx/home/shared/.ssh" 2>/dev/null | tr '\n' ' ')]"
+  # no folder: nothing to do
+  rm -rf "$fx/home/shared/.ssh"
+  got=$(test.ossh.sharedGithub.run "$fx" private.ossh.shared.ssh.legacy.remove)
+  [ "${got%%|*}" = 0 ] && [ ! -e "$fx/home/shared/.ssh" ] || bad="$bad none=[${got//$fx/FX}]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the template goes; with other files it stays" || create.result 1 "shared legacy:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-SHARED-LEGACY: <basehome>/shared/.ssh is removed when it holds only config and known_hosts" test.ossh.sharedLegacy
+expect 0 "the template goes; with other files it stays" \
+  "the old template stayed, or a folder with a key in it was removed"
+
+# T-OSSH-GITHUB-BLOCK-IS-OOSH: which github.com blocks oosh wrote
+test.ossh.githubBlockIsOosh() {
+  local bad="" b i
+  local id=" IdentityFile ~/.ssh/ids/ssh.developking/id_rsa"
+  local ours=(
+    $'Host github.com\n User git\n Port 22\n HostName github.com\n'"$id"$'\n IdentitiesOnly yes'
+    $'Host github.com\n User git\n Port 22\n HostName github.com\n'"$id"
+    $'\nHost github.com\n HostName github.com\n User git\n Port 22\n'"$id"$'\n IdentitiesOnly yes\n'
+    $'Host github.com\n\tuser git\n\tidentityfile ~/.ssh/ids/ssh.developking/id_rsa'
+  )
+  local own=(
+    $'Host github.com\n User git\n IdentityFile ~/.ssh/my_key'
+    $'Host github.com\n User git\n'"$id"$'\n ProxyJump jump'
+    $'Host github.com\n # mine\n User git\n'"$id"
+    $'Host github.com\n User git'
+    $'Host github.com other\n User git\n'"$id"
+    $'Host github.company\n User git\n'"$id"
+    ''
+  )
+  for i in "${!ours[@]}"; do private.ossh.github.block.is.oosh "${ours[$i]}" || bad="$bad ours$i"; done
+  for i in "${!own[@]}"; do private.ossh.github.block.is.oosh "${own[$i]}" && bad="$bad own$i"; done
+  [ -z "$bad" ] && create.result 0 "only the blocks oosh writes count as oosh" || create.result 1 "block is oosh:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-GITHUB-BLOCK-IS-OOSH: a github.com block counts as oosh only with the fields oosh writes" test.ossh.githubBlockIsOosh
+expect 0 "only the blocks oosh writes count as oosh" "a block the user wrote would be removed"
+
+# T-OSSH-SHARED-COPIES: the copies in every home go, the own blocks stay
+test.ossh.sharedCopies() {
+  local fx bad="" got
+  fx=$(test.ossh.sharedGithub.fixture osshsharedcopies)
+  mkdir -p "$fx/home/alice/.ssh" "$fx/home/bob/.ssh" "$fx/home/carol" "$fx/root/.ssh"
+  printf '%s\n' "Host myserver" " User admin" "" "Host github.com" " User git" " Port 22" " HostName github.com" \
+    " IdentityFile ~/.ssh/ids/ssh.developking/id_rsa" " IdentitiesOnly yes" "" "Host after" " User b" > "$fx/home/alice/.ssh/config"
+  chmod 640 "$fx/home/alice/.ssh/config"
+  printf '%s\n' "other.host ssh-ed25519 AAAAOTHER" "# github.com:22 SSH-2.0-babeld" "github.com ssh-ed25519 AAAATESTKEY" "# other comment" "github.com ssh-rsa AAAATESTRSA" > "$fx/home/alice/.ssh/known_hosts"
+  printf '%s\n' "Host github.com" " User git" " IdentityFile ~/.ssh/bob_key" > "$fx/home/bob/.ssh/config"
+  printf '%s\n' "github.com ssh-ed25519 AAAAOLDKEY" > "$fx/home/bob/.ssh/known_hosts"
+  printf '%s\n' "" "Host github.com" " User git" " Port 22" " HostName github.com" " IdentityFile ~/.ssh/ids/ssh.developking/id_rsa" > "$fx/root/.ssh/config"
+  got=$(test.ossh.sharedGithub.run "$fx" ossh.config.shared.github.create)
+  [ "${got%%|*}" = 0 ] || bad="$bad rc=[${got//$fx/FX}]"
+  case "$got" in *"$fx/home/alice/.ssh"*"$fx/root/.ssh"*) ;; *) bad="$bad notNamed=[${got//$fx/FX}]" ;; esac
+  case "$got" in *"$fx/home/bob/"*) bad="$bad bobNamed" ;; esac
+  grep -q '^Host github.com$' "$fx/home/alice/.ssh/config" && bad="$bad aliceBlock"
+  [ "$(grep -cE '^Host (myserver|after)$' "$fx/home/alice/.ssh/config")" = 2 ] || bad="$bad aliceOthers=[$(tr '\n' '|' < "$fx/home/alice/.ssh/config")]"
+  [ "$(ls -l "$fx/home/alice/.ssh/config" | cut -c1-10)" = "-rw-r-----" ] || bad="$bad aliceMode"
+  [ "$(tr '\n' '|' < "$fx/home/alice/.ssh/known_hosts")" = "other.host ssh-ed25519 AAAAOTHER|# other comment|" ] || bad="$bad aliceKeys=[$(tr '\n' '|' < "$fx/home/alice/.ssh/known_hosts")]"
+  grep -q 'bob_key' "$fx/home/bob/.ssh/config" || bad="$bad bobBlock"
+  grep -q 'AAAAOLDKEY' "$fx/home/bob/.ssh/known_hosts" || bad="$bad bobKeys"
+  grep -q '^Host github.com$' "$fx/root/.ssh/config" && bad="$bad rootBlock"
+  [ -e "$fx/home/carol/.ssh" ] && bad="$bad carolMade"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the copies of oosh go, the own blocks and keys stay" || create.result 1 "shared copies:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-SHARED-COPIES: the github.com copies in every home are removed, the own ones stay" test.ossh.sharedCopies
+expect 0 "the copies of oosh go, the own blocks and keys stay" \
+  "an old copy in a home wins over the system file, and an old host key there blocks ssh after a rotation"
+
+# T-OSSH-USER-HOMES-GET: the homes under the users base without shared, then the home of root
+test.ossh.userHomesGet() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make osshuserhomesget)
+  mkdir -p "$fx/alice" "$fx/bob" "$fx/shared" "$fx/Shared"; : > "$fx/afile"
+  got=$( ( private.ossh.users.basehome() { echo "$fx"; }; private.ossh.user.homes.get ) 2>/dev/null | tr '\n' '|')
+  [ "$got" = "$fx/alice|$fx/bob|$(eval echo ~root)|" ] || bad="$bad homes=[${got//$fx/FX}]"
+  got=$( ( private.ossh.users.basehome() { return 1; }; private.ossh.user.homes.get; echo "rc $?" ) 2>/dev/null | tr '\n' '|')
+  [ "$got" = "rc 1|" ] || bad="$bad noBase=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the homes, without shared, then root" || create.result 1 "user homes:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-USER-HOMES-GET: user.homes.get lists the homes without shared, then the home of root" test.ossh.userHomesGet
+expect 0 "the homes, without shared, then root" "the cleanup walked shared or missed a home"
+
+# T-OSSH-SHARED-SSH-GONE: nothing builds or copies <basehome>/shared/.ssh anymore
+test.ossh.sharedSshGone() {
+  local bad="" f m
+  for m in private.ossh.shared.ssh.copy.to.all ossh.config.shared.link; do
+    declare -F "$m" >/dev/null && bad="$bad $m-defined"
+  done
+  declare -f ossh.install.finish.local | grep -q 'copy\.to\.all' && bad="$bad finishCopies"
+  # outside its remover and the probe of seed.github (it skips only once the
+  # folder is gone), no code line names the template folder
+  local uses
+  uses=$(for f in ossh oo user init/oosh; do
+    awk -v f="$f" '
+      /^[A-Za-z_.]+\(\)/ { fn = $1; sub(/\(\).*/, "", fn) }
+      /^[[:space:]]*#/ { next }
+      /shared\/\.ssh|sharedSsh/ && fn != "private.ossh.shared.ssh.legacy.remove" && fn != "ossh.config.shared.seed.github" { print f ":" NR }
+    ' "$OOSH_DIR/$f"
+  done)
+  [ -n "$uses" ] && bad="$bad uses=[$(printf '%s' "$uses" | tr '\n' ' ')]"
+  [ -z "$bad" ] && create.result 0 "no template folder, no copies" || create.result 1 "shared ssh gone:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-SHARED-SSH-GONE: copy.to.all and config.shared.link are gone, no code names <basehome>/shared/.ssh" test.ossh.sharedSshGone
+expect 0 "no template folder, no copies" "the template folder or its copies came back"
+
+# T-OO-STATE31-GITHUB-SYSTEM: state 31 sets GitHub up for every user before the first clone
+test.ossh.state31GithubSystem() {
+  local bad="" step4 create clone
+  step4=$(awk '/state 31 \[4\/5/ { on = 1 } /state 31 \[5\/5/ { on = 0 } on' "$OOSH_DIR/oo")
+  printf '%s\n' "$step4" | grep -q 'ossh config\.shared\.github\.create' || bad="$bad noCreate"
+  printf '%s\n' "$step4" | grep -q 'private\.install\.dev\.configs' && bad="$bad devConfigs"
+  printf '%s\n' "$step4" | grep -q 'cat >>"\$HOME/\.ssh/config"' && bad="$bad heredoc"
+  create=$(grep -n 'ossh config\.shared\.github\.create' "$OOSH_DIR/oo" | grep -v '^[0-9]*:[[:space:]]*#' | head -n 1 | cut -d: -f1)
+  clone=$(grep -n 'private\.oo\.shared\.tree\.ensure git@github\.com' "$OOSH_DIR/oo" | head -n 1 | cut -d: -f1)
+  [ -n "$create" ] && [ -n "$clone" ] && [ "$create" -lt "$clone" ] || bad="$bad order=$create/$clone"
+  [ "$(grep 'ossh config\.shared\.github\.create' "$OOSH_DIR/oo" | grep -cv '^[[:space:]]*#')" = 1 ] || bad="$bad twice"
+  [ -z "$bad" ] && create.result 0 "state 31 step 4 writes the system files before the clone" || create.result 1 "state 31:$bad"
+  return $(result)
+}
+test.case $level "T-OO-STATE31-GITHUB-SYSTEM: state 31 sets GitHub up in /etc/ssh before it clones, once" test.ossh.state31GithubSystem
+expect 0 "state 31 step 4 writes the system files before the clone" \
+  "state 31 still wrote the block into the config of root and the template folder"
+
+# T-OSSH-FOLDER-FIX-NO-GITHUB-COPY: folder.fix no longer adds the block to ~/.ssh/config
+test.ossh.folderFixNoGithubCopy() {
+  local fx bad=""
+  fx=$(test.ossh.sharedGithub.fixture folderfixnogithub)
+  printf '%s\n' "Host myserver" " User admin" > "$fx/.ssh/config"
+  test.ossh.sharedGithub.run "$fx" private.ossh.folder.fix.config.normalize "$fx/.ssh" >/dev/null
+  grep -q '^Host github.com$' "$fx/.ssh/config" && bad="$bad added"
+  [ "$(tr '\n' '|' < "$fx/.ssh/config")" = "Host myserver| User admin|" ] || bad="$bad config=[$(tr '\n' '|' < "$fx/.ssh/config")]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "folder.fix leaves github.com to the system file" || create.result 1 "folder.fix github:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-FOLDER-FIX-NO-GITHUB-COPY: folder.fix adds no github.com block to ~/.ssh/config" test.ossh.folderFixNoGithubCopy
+expect 0 "folder.fix leaves github.com to the system file" "folder.fix wrote the copy the cleanup removes"
+
+# T-OSSH-SYSTEM-FILES-GET: the two system files, each with its override
+test.ossh.systemFilesGet() {
+  local bad="" got
+  got=$( (unset OSSH_SYSTEM_SSH_CONFIG OSSH_SYSTEM_KNOWN_HOSTS; private.ossh.system.config.file.get; private.ossh.system.known.hosts.get) | tr '\n' '|')
+  [ "$got" = "/etc/ssh/ssh_config.d/oosh-github.conf|/etc/ssh/ssh_known_hosts|" ] || bad="$bad default=[$got]"
+  got=$( (OSSH_SYSTEM_SSH_CONFIG=/x/c OSSH_SYSTEM_KNOWN_HOSTS=/x/k; private.ossh.system.config.file.get; private.ossh.system.known.hosts.get) | tr '\n' '|')
+  [ "$got" = "/x/c|/x/k|" ] || bad="$bad override=[$got]"
+  [ -z "$bad" ] && create.result 0 "ssh_config.d/oosh-github.conf and ssh_known_hosts" || create.result 1 "system files:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-SYSTEM-FILES-GET: the system config file and known_hosts, each with an override" test.ossh.systemFilesGet
+expect 0 "ssh_config.d/oosh-github.conf and ssh_known_hosts" "the system files moved"
+
+# T-OSSH-USERS-BASEHOME-UNLOADED: no base, nothing under /shared
+# private.ossh.users.basehome asks `user.get basehome root`. When user cannot
+# be loaded it answers nothing and rc 1; the cleanup that walks <base> then
+# does nothing at all instead of looking under /shared or /. Every file step
+# is a recording stub: nothing real is touched.
+test.ossh.basehomeUnloaded() {
+  local fx bad="" got m
+  fx=$(test.suite.fixture.make osshbasehomeunloaded)
+  got=$( (
+    unset -f user.get
+    private.this.script.load() { return 1; }
+    private.ossh.users.basehome; echo "rc $?"
+  ) 2>/dev/null )
+  [ "$got" = "rc 1" ] || bad="$bad delegate=[$got]"
+  for m in private.ossh.shared.ssh.legacy.remove private.ossh.github.copies.remove; do
+    : > "$fx/calls"
+    got=$( (
+      private.ossh.users.basehome() { return 1; }
+      for f in mkdir chmod chown cp rm rmdir cat ossh.config.delete private.ossh.github.copy.remove; do
+        eval "$f() { echo \"$f \$*\" >> \"$fx/calls\"; }"
+      done
+      export LOG_LEVEL=2 LOG_DEVICE=/dev/null LOG_LIVE= LOG_INSTALL=
+      $m "$fx/none" >/dev/null; echo "rc $?"
+    ) 2>/dev/null )
+    [ "$got" = "rc 0" ] || bad="$bad $m-rc=[$got]"
+    [ -s "$fx/calls" ] && bad="$bad $m-touched=[$(tr '\n' ' ' < "$fx/calls")]"
+  done
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "no base: nothing walked, nothing under /shared" || create.result 1 "basehome unloaded:$bad"
+  return $(result)
+}
+test.case $level "T-OSSH-USERS-BASEHOME-UNLOADED: without the users base the cleanup touches nothing" \
+  test.ossh.basehomeUnloaded
+expect 0 "no base: nothing walked, nothing under /shared" "a failed user load walked / or /shared"
+
 ### test.method
 
 # ============================================================================
@@ -952,217 +1222,6 @@ fi
 # Test Summary
 # ============================================================================
 
-# ============================================================================
-# Shared SSH config tests — fixture-based
-# ============================================================================
-SHARED_FIXTURE="/tmp/test.ossh.shared.$$"
-SHARED_DIR="$SHARED_FIXTURE/shared_ssh"
-
-# Phase 3 of the .ssh/ correctness plan: github access flows through
-# ~/.ssh/ids/ssh.developking/id_rsa, not a standalone deploy key. The
-# shared-create primitive no longer touches any deploy key file.
-
-# ============================================================================
-# T-SHARED-1: ossh.config.shared.github.create creates directory and config
-# ============================================================================
-test.ossh.shared.create() {
-  ossh.config.shared.github.create "$SHARED_DIR" >/dev/null 2>&1
-  local rc=$?
-
-  if [ $rc -eq 0 ] && [ -d "$SHARED_DIR" ] && [ -f "$SHARED_DIR/config" ]; then
-    create.result 0 "dir and config created"
-  else
-    create.result 1 "rc=$rc dir=$([ -d "$SHARED_DIR" ] && echo yes || echo no) config=$([ -f "$SHARED_DIR/config" ] && echo yes || echo no)"
-  fi
-}
-test.case - "T-SHARED-1: config.shared.github.create creates directory and config" \
-  test.ossh.shared.create
-expect 0 "dir and config created" "ossh.config.shared.github.create creates shared SSH directory and config"
-
-# ============================================================================
-# T-SHARED-2: ossh.config.shared.github.create is idempotent
-# ============================================================================
-test.ossh.shared.idempotent() {
-  # Run twice
-  ossh.config.shared.github.create "$SHARED_DIR" >/dev/null 2>&1
-  ossh.config.shared.github.create "$SHARED_DIR" >/dev/null 2>&1
-  local rc=$?
-
-  # Count Host github.com entries — should be exactly 1
-  local count
-  count=$(grep -c "^Host github.com$" "$SHARED_DIR/config" 2>/dev/null)
-
-  if [ $rc -eq 0 ] && [ "$count" -eq 1 ]; then
-    create.result 0 "idempotent ($count entry)"
-  else
-    create.result 1 "rc=$rc count=$count"
-  fi
-}
-test.case - "T-SHARED-2: config.shared.github.create is idempotent" \
-  test.ossh.shared.idempotent
-expect 0 "idempotent (1 entry)" "ossh.config.shared.github.create does not duplicate on re-run"
-
-# ============================================================================
-# T-SHARED-3: ossh.config.shared.github.create sets correct permissions
-# ============================================================================
-test.ossh.shared.permissions() {
-  local dirPerms
-  dirPerms=$(stat -c "%a" "$SHARED_DIR" 2>/dev/null || stat -f "%Lp" "$SHARED_DIR" 2>/dev/null)
-  local configPerms
-  configPerms=$(stat -c "%a" "$SHARED_DIR/config" 2>/dev/null || stat -f "%Lp" "$SHARED_DIR/config" 2>/dev/null)
-
-  # Standalone deploy key file should NOT exist anymore
-  local hasLegacyKey="no"
-  [ -e "$SHARED_DIR/2cuGitHub" ] && hasLegacyKey="yes"
-
-  if [ "$dirPerms" = "700" ] && [ "$configPerms" = "600" ] && [ "$hasLegacyKey" = "no" ]; then
-    create.result 0 "permissions correct, no legacy 2cuGitHub"
-  else
-    create.result 1 "dir=$dirPerms config=$configPerms legacyKey=$hasLegacyKey"
-  fi
-}
-test.case - "T-SHARED-3: config.shared.github.create sets correct perms, no legacy key" \
-  test.ossh.shared.permissions
-expect 0 "permissions correct, no legacy 2cuGitHub" "directory 700, config 600, no standalone 2cuGitHub file"
-
-# ============================================================================
-# T-SHARED-6: shared config contains Host github.com with developking IdentityFile
-# ============================================================================
-test.ossh.shared.validConfig() {
-  if ! grep -q "^Host github.com$" "$SHARED_DIR/config" 2>/dev/null; then
-    create.result 1 "Host github.com not found in config"
-    return
-  fi
-  # Extract the github.com block and check IdentityFile.
-  local ghBlock
-  ghBlock=$(awk '
-    /^Host github.com$/ {found=1; next}
-    found && /^Host / {found=0}
-    found {print}
-  ' "$SHARED_DIR/config")
-  if echo "$ghBlock" | grep -Fq "IdentityFile ~/.ssh/ids/ssh.developking/id_rsa"; then
-    create.result 0 "github.com block uses developking id_rsa"
-  else
-    create.result 1 "github.com block has wrong IdentityFile"
-  fi
-}
-test.case - "T-SHARED-6: shared config has Host github.com via ids/ssh.developking/id_rsa" \
-  test.ossh.shared.validConfig
-expect 0 "github.com block uses developking id_rsa" "shared config's github.com Host points at developking key"
-
-# ============================================================================
-# T-SHARED-4: ossh.config.shared.link creates symlink for user
-# ============================================================================
-test.ossh.shared.link.symlink() {
-  local testUserHome="$SHARED_FIXTURE/home_testuser"
-  mkdir -p "$testUserHome/.ssh"
-
-  # Override HOME to simulate the target user
-  local SAVE_HOME="$HOME"
-  HOME="$testUserHome"
-
-  # Call link with explicit user path simulation
-  # We test the logic by calling directly with the shared dir
-  if [ ! -e "$testUserHome/.ssh/config" ]; then
-    ln -s "$SHARED_DIR/config" "$testUserHome/.ssh/config"
-  fi
-
-  HOME="$SAVE_HOME"
-
-  if [ -L "$testUserHome/.ssh/config" ]; then
-    local target
-    target=$(readlink "$testUserHome/.ssh/config")
-    if [ "$target" = "$SHARED_DIR/config" ]; then
-      create.result 0 "symlink created"
-    else
-      create.result 1 "symlink target=$target expected=$SHARED_DIR/config"
-    fi
-  else
-    create.result 1 "not a symlink"
-  fi
-}
-test.case - "T-SHARED-4: config.shared.link creates symlink" \
-  test.ossh.shared.link.symlink
-expect 0 "symlink created" "ossh.config.shared.link creates symlink to shared config"
-
-# ============================================================================
-# T-SHARED-5: appending Host github.com block preserves pre-existing config
-# ============================================================================
-test.ossh.shared.link.append() {
-  local testUserHome="$SHARED_FIXTURE/home_existinguser"
-  mkdir -p "$testUserHome/.ssh"
-  # Create a pre-existing config with different content
-  echo "Host myserver" > "$testUserHome/.ssh/config"
-  echo " User admin" >> "$testUserHome/.ssh/config"
-
-  # Simulate the per-user-link path: append the github.com block from
-  # the shared config if not already present.
-  if ! grep -q "^Host github.com$" "$testUserHome/.ssh/config" 2>/dev/null; then
-    awk '
-      /^Host github.com$/ {found=1; print; next}
-      found && /^Host / {found=0}
-      found {print}
-    ' "$SHARED_DIR/config" >> "$testUserHome/.ssh/config"
-  fi
-
-  # Verify original content preserved AND github.com added
-  local hasOriginal=false
-  local hasGithub=false
-  grep -q "^Host myserver$" "$testUserHome/.ssh/config" 2>/dev/null && hasOriginal=true
-  grep -q "^Host github.com$" "$testUserHome/.ssh/config" 2>/dev/null && hasGithub=true
-
-  if [ "$hasOriginal" = "true" ] && [ "$hasGithub" = "true" ]; then
-    create.result 0 "appended without overwrite"
-  else
-    create.result 1 "original=$hasOriginal github=$hasGithub"
-  fi
-}
-test.case - "T-SHARED-5: github.com append preserves pre-existing user config" \
-  test.ossh.shared.link.append
-expect 0 "appended without overwrite" "existing config preserved, Host github.com appended"
-
-# ============================================================================
-# T-OSSH-USERS-BASEHOME-UNLOADED: no base, no /shared/.ssh
-# ============================================================================
-# private.ossh.users.basehome asks `user.get basehome root`. When user cannot
-# be loaded it answers nothing and rc 1, and the shared-config methods that
-# default to <base>/shared/.ssh stop with rc 1 instead of building /shared/.ssh.
-# Every file step is a recording stub: nothing real is touched.
-test.ossh.basehomeUnloaded() {
-  local fx bad="" got m
-  fx=$(test.suite.fixture.make osshbasehomeunloaded)
-  got=$( (
-    unset -f user.get
-    private.this.script.load() { return 1; }
-    private.ossh.users.basehome; echo "rc $?"
-  ) 2>/dev/null )
-  [ "$got" = "rc 1" ] || bad="$bad delegate=[$got]"
-  for m in ossh.config.shared.github.create ossh.config.shared.link; do
-    : > "$fx/calls"
-    got=$( (
-      private.ossh.users.basehome() { return 1; }
-      for f in mkdir chmod chown cp rm cat awk ssh-keyscan ossh.config.create ossh.config.save.last; do
-        eval "$f() { echo \"$f \$*\" >> \"$fx/calls\"; }"
-      done
-      ossh.config.get() { return 1; }
-      export LOG_LEVEL=2 LOG_DEVICE=/dev/stderr LOG_LIVE= LOG_INSTALL=
-      if [ "$m" = ossh.config.shared.link ]; then $m alice >/dev/null; else $m >/dev/null; fi
-      echo "rc $?" >&2
-    ) 2>&1 )
-    case "$got" in *"rc 1") ;; *) bad="$bad $m-rc=[$(printf '%s\n' "$got" | tail -n 1)]" ;; esac
-    case "$got" in *"users' base"*) ;; *) bad="$bad $m-no-message" ;; esac
-    [ -s "$fx/calls" ] && bad="$bad $m-touched=[$(tr '\n' ' ' < "$fx/calls")]"
-  done
-  rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "no base: rc 1, nothing built under /shared" || create.result 1 "basehome unloaded:$bad"
-  return $(result)
-}
-test.case $level "T-OSSH-USERS-BASEHOME-UNLOADED: without the users' base the shared-config methods stop" \
-  test.ossh.basehomeUnloaded
-expect 0 "no base: rc 1, nothing built under /shared" "a failed user load built /shared/.ssh"
-
-# Cleanup shared fixture
-rm -rf "$SHARED_FIXTURE" 2>/dev/null
 
 # ============================================================================
 # T-PROXYJUMP-1: config.create with proxyJump includes ProxyJump line
@@ -1364,29 +1423,6 @@ else
   expect.fail "seed.github doesn't delegate to ossh.config.shared.github.create — install loses GitHub access for non-root users"
 fi
 
-# T-SHARED-SSH-COPY: the extracted helper exists and both caller-side and
-# developking-fallback paths delegate to it (DRY — single source of truth
-# for the per-user copy+chown loop).
-test.case $level "T-SHARED-SSH-COPY-EXISTS: private.ossh.shared.ssh.copy.to.all is defined" \
-  type private.ossh.shared.ssh.copy.to.all
-if [ "$RETURN_VALUE" -eq 0 ]; then
-  expect.pass "private.ossh.shared.ssh.copy.to.all is a function"
-else
-  expect.fail "private.ossh.shared.ssh.copy.to.all not defined"
-fi
-
-test.case $level "T-SHARED-SSH-COPY-CALLSITES: finish.local invokes the helper at least once" \
-  echo "$FINISH_BODY"
-# After the F8 refactor (commit 706950f) the propagate call is now made
-# UNCONDITIONALLY ONCE in finish.local, regardless of which seeding path
-# (caller-side or developking-fallback) ran. That's an even tighter DRY than
-# "called from both branches" — single call site after either branch returns.
-if echo "$FINISH_BODY" | grep -q "private\\.ossh\\.shared\\.ssh\\.copy\\.to\\.all"; then
-  expect.pass "finish.local invokes the per-user-propagate helper"
-else
-  expect.fail "finish.local does not call private.ossh.shared.ssh.copy.to.all — propagation broken"
-fi
-
 # ─────────────────────────────────────────────────────────────────────────────
 # T-SEED-GITHUB : Phase 3 collapsed the two-branch seeding flow into a single
 # ossh.config.shared.seed.github helper. It carries a skip-when-seeded probe
@@ -1404,12 +1440,16 @@ else
 fi
 
 SEED_GITHUB_BODY=$(declare -f ossh.config.shared.seed.github 2>/dev/null)
-test.case $level "T-SEED-GITHUB-PROBE: seed.github has skip-when-seeded probe (Host github.com check)" \
+# The probe looks at the system file, and skips only when the old template
+# folder is gone too — else the remote create still has to clean up.
+test.case $level "T-SEED-GITHUB-PROBE: seed.github skips when the system file has Host github.com and no template folder is left" \
   echo "(grep below)"
-if echo "$SEED_GITHUB_BODY" | grep -qE 'grep -q "?\^Host github\\?\.com'; then
-  expect.pass "seed.github skips when Host github.com already in shared config"
+if echo "$SEED_GITHUB_BODY" | grep -qE 'grep -q "?\^Host github\\?\.com' \
+   && echo "$SEED_GITHUB_BODY" | grep -q 'private\.ossh\.system\.config\.file\.get' \
+   && echo "$SEED_GITHUB_BODY" | grep -q '! -d .*/shared/\.ssh'; then
+  expect.pass "seed.github skips when the system file is seeded and the template is gone"
 else
-  expect.fail "seed.github missing skip-when-seeded probe — re-runs would re-append the github block"
+  expect.fail "seed.github probe still looks at the template folder, or skips the cleanup"
 fi
 
 test.case $level "T-SEED-LEGACY-DEPRECATED: seed.from.local.deploy.key is a deprecated shim that forwards to seed.github" \
@@ -1936,24 +1976,6 @@ EOF
 test.case $level "T-FOLDER-FIX-CONFIG-NORMALIZE-WODA: WODA IdentityFile rewritten to portable; non-WODA untouched" \
   test.ossh.foldFixConfigNormalizeWoda
 expect 0 "WODA portable, non-WODA unchanged" "private.ossh.folder.fix.config.normalize fixes WODA portability without touching other Host blocks"
-
-# T-FOLDER-FIX-CONFIG-NORMALIZE-GITHUB: adds Host github.com block when missing.
-test.ossh.foldFixConfigAddGithub() {
-  local fixture="/tmp/test.folder.fix.cfg.github.$(id -u).$$"
-  mkdir -p "$fixture"
-  echo "# empty config" > "$fixture/config"
-  private.ossh.folder.fix.config.normalize "$fixture" >/dev/null 2>&1
-  if grep -q "^Host github.com\$" "$fixture/config" \
-     && grep -q "^ IdentityFile ~/.ssh/ids/ssh.developking/id_rsa\$" "$fixture/config"; then
-    create.result 0 "Host github.com added with canonical IdentityFile"
-  else
-    create.result 1 "wrong content: $(cat $fixture/config)"
-  fi
-  rm -rf "$fixture" 2>/dev/null
-}
-test.case $level "T-FOLDER-FIX-CONFIG-NORMALIZE-GITHUB: Host github.com block added if missing" \
-  test.ossh.foldFixConfigAddGithub
-expect 0 "Host github.com added with canonical IdentityFile" "config.normalize ensures Host github.com is present"
 
 # T-FOLDER-FIX-CONFIG-STRIP-LEGACY: strict-only helper removes the Host 2cuGitHub block.
 test.ossh.foldFixConfigStripLegacy() {
