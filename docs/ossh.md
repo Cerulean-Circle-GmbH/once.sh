@@ -113,7 +113,7 @@ The block is `myhost`'s: an `IdentityFile` or `ProxyJump` in it names a key
 file or a Host of that computer — check them here (`ossh config.get <name>`).
 
 Until 2026-10-19 it asked the host for a command that no longer exists
-(was `ossh get.config`) and appended the answer, nothing or an error line,
+and appended the answer, nothing or an error line,
 with rc 0.
 
 ### Changing one Field of a Host
@@ -283,8 +283,8 @@ had no `authorized_keys` at all (T-USER-AUTHORIZED-KEYS-REBUILD-ATOMIC). No
 `.bak` is left in `~/.ssh`; a failed write leaves the old file and no `.new`.
 `~/.ssh` stays 700, `authorized_keys` 600.
 
-`ossh authorized.keys.update <?sshDir>` (was `ossh update.authorized_keys`
-until 2026-10-16) is the same rebuild through ossh. Both return:
+`ossh authorized.keys.update <?sshDir>`
+is the same rebuild through ossh. Both return:
 
 | rc | RESULT | authorized_keys |
 |----|--------|-----------------|
@@ -406,8 +406,8 @@ there is 600.
 `ossh install <host>` adds the installer's key to the host's `public_keys/` and
 `authorized_keys` right after the connection opens — only added — and checks a
 key login; when that fails, a warning names the Host entry's IdentityFile
-(T-OSSH-INSTALL-PUSHES-KEY). Its remote half, `private.ossh.oosh.init.push`
-(was `private.push.init.oosh` until 2026-10-16), says its result on every
+(T-OSSH-INSTALL-PUSHES-KEY). Its remote half, `private.ossh.oosh.init.push`,
+says its result on every
 path (T-OSSH-OOSH-INIT-PUSH-RESULT):
 
 | rc | RESULT |
@@ -429,8 +429,6 @@ see "Pushing a Config" below),
 `private.ossh.id.push <toHost> <id> <?sshDir>` (`<id> copied to
 <toHost>:~/.ssh/ids/`; a missing `<sshDir>/ids/<id>` is rc 1 before any
 copy). Until 2026-10-16 they had verb-first names
-(was `private.ossh.push.config`, `private.ossh.push.dir`)
-(was `private.ossh.pull.dir`, `private.ossh.push.id`)
 (T-OSSH-RENAMES-OBJECT-VERB) and ended with a bare `return 1` or the copy's
 rc; the public `ossh config.push` / `dir.push` / `dir.pull` / `id.push` keep
 their names.
