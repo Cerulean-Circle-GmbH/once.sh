@@ -115,18 +115,33 @@ private.ossh.master.start()     # <host> <errFile> <?ipv4> # start the ControlMa
 }
 
 
-private.ossh.remote.public.key.put()     # <host> <localFile> <keyFileName> # copy <localFile> to <host>:~/.ssh/public_keys/<keyFileName> (folder made when missing, a file of that name replaced; ~/.ssh made 700, a new file 600); rc 0 + RESULT when it is there, rc 1 + RESULT when the file is missing or the copy fails #
+private.ossh.public.key.put.text.get()     # <keyFileName> # echo the POSIX text that writes stdin to ~/.ssh/public_keys/<keyFileName> of whoever runs it: ~/.ssh and public_keys/ 700, the key 644 under any umask; no single quote in it; nothing and rc 1 for an empty name or one with a / #
+{
+ # NO create.result — a getter consumed as $(...).
+ # The one text for a pushed public key: remote.public.key.put sends it as
+ # the login user, ossh.install.user.remote wraps it in `sudo -u <user> sh -c
+ # '…'` — which is why it holds no single quote. umask 077 + chmod 700: with
+ # pam_umask 002 a new ~/.ssh was 775 and sshd's StrictModes ignored every key
+ # in it (T-OSSH-REMOTE-PUBLIC-KEY-PUT-MODES). chmod 644 on the key: the
+ # layout's rule (7b) — a tee under umask 002 left 664, a file already there
+ # keeps its mode through `cat >` (T-OSSH-INSTALL-USER-REMOTE-KEY-MODE).
+ # The name sits in double quotes (a legacy name with a space stays one
+ # word); ' " $ ` \ are dropped so it cannot end the quote or expand.
+ local name="$1"
+ name="${name//\'/}"; name="${name//\"/}"; name="${name//\$/}"; name="${name//\`/}"; name="${name//\\/}"
+ case "$name" in (""|*/*) return 1 ;; esac
+ printf '%s\n' "umask 077; mkdir -p ~/.ssh/public_keys && chmod 700 ~/.ssh ~/.ssh/public_keys && cat > ~/.ssh/public_keys/\"$name\" && chmod 644 ~/.ssh/public_keys/\"$name\""
+}
+
+
+private.ossh.remote.public.key.put()     # <host> <localFile> <keyFileName> # copy <localFile> to <host>:~/.ssh/public_keys/<keyFileName> (folder made when missing, a file of that name replaced; ~/.ssh and public_keys/ 700, the key 644); rc 0 + RESULT when it is there, rc 1 + RESULT when the file is missing or the copy fails #
 {
  # install.key.authorize and key.push each carried the same remote
  # "mkdir -p … && cat > …", and key.push ignored its rc (T-OSSH-REMOTE-PUBLIC-KEY-PUT).
- # Over ssh cat, not rsync: the target may have no rsync. The name is
- # single-quoted for the remote shell — a legacy name with a space stays one
- # word — and a ' in it is dropped, as private.ossh.authorized.key.append.get
- # does, so it cannot end the quote. Silent: the caller logs $RESULT.
- # umask 077 and chmod 700 ~/.ssh in the remote text: it ran under the
- # target's umask, and with pam_umask 002 a new ~/.ssh was 775 — sshd's
- # StrictModes then ignores every key in it (T-OSSH-REMOTE-PUBLIC-KEY-PUT-MODES).
- local host="$1" localFile="$2" keyFileName="${3//\'/}"
+ # Over ssh cat, not rsync: the target may have no rsync. The remote text is
+ # private.ossh.public.key.put.text.get's — modes and name quoting live there.
+ # Silent: the caller logs $RESULT.
+ local host="$1" localFile="$2" keyFileName="$3" text
  if [ -z "$host" ] || [ -z "$keyFileName" ]; then
    create.result 1 "private.ossh.remote.public.key.put requires <host> <localFile> <keyFileName>"
    return $(result)
@@ -135,7 +150,11 @@ private.ossh.remote.public.key.put()     # <host> <localFile> <keyFileName> # co
    create.result 1 "no key file $localFile to copy to $host"
    return $(result)
  fi
- if private.ossh.ssh "$host" "umask 077; mkdir -p ~/.ssh/public_keys && chmod 700 ~/.ssh && cat > ~/.ssh/public_keys/'$keyFileName'" < "$localFile"; then
+ if ! text=$(private.ossh.public.key.put.text.get "$keyFileName"); then
+   create.result 1 "no usable key file name: $keyFileName"
+   return $(result)
+ fi
+ if private.ossh.ssh "$host" "$text" < "$localFile"; then
    create.result 0 "$keyFileName copied to $host:~/.ssh/public_keys/"
  else
    create.result 1 "could not copy $keyFileName to $host"
@@ -1652,10 +1671,12 @@ ossh.install.user.remote() # <sshConfigHost> <user> # sets up oosh for <user> on
   # 5. Push the CALLER's public key into the TARGET's authorized_keys so
   #    the caller can SSH in directly as the target user afterwards.
   #    Remote-specific — no local analogue.
-  local keyFile="$HOME/.ssh/public_keys/$( private.ossh.get.file.name ).public_key"
-  if [ -f "$keyFile" ]; then
-    private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' mkdir -p $targetHome/.ssh/public_keys"
-    private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' tee $targetHome/.ssh/public_keys/$(basename $keyFile) >/dev/null" < "$keyFile"
+  #    The one put text, run as the target: a `tee` under sudo's pam_umask
+  #    002 left the key 664 after the layout's perms pass, and the layout
+  #    invariant failed for bash-user (T-OSSH-INSTALL-USER-REMOTE-KEY-MODE).
+  local keyFile="$HOME/.ssh/public_keys/$( private.ossh.get.file.name ).public_key" putText
+  if [ -f "$keyFile" ] && putText=$(private.ossh.public.key.put.text.get "$(basename "$keyFile")"); then
+    private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' sh -c '$putText'" < "$keyFile"
     private.ossh.authorized.key.append.get "$(basename $keyFile)" \
       | private.ossh.ssh "$sshConfigHost" "sudo -H -u '$targetUser' sh"
     success.log "Pushed public key to $targetUser's authorized_keys"
@@ -1939,7 +1960,24 @@ private.ossh.get.file.name() # # gets the actual file name (instead of the best 
   shift
 
 
-  local sshKeyName="$(ls $sshDir/private_key/ | sed 's/\.private_key//')"
+  # ONE name: private_key/ keeps the user's other keys (c7eb3087), and `ls`
+  # gave them all, one per line — key.push and ossh install built a broken
+  # file name from that (T-OSSH-GET-FILE-NAME-ONE). The key in use is the one
+  # private.detect.ssh.key finds; its copy with a public_keys/ partner names
+  # it. One file alone is that one, as before.
+  local sshKeyName="" f n inUse="" files
+  private.detect.ssh.key "$sshDir" >/dev/null 2>&1 && inUse="$RESULT"
+  if [ -n "$inUse" ]; then
+    for f in "$sshDir"/private_key/*.private_key; do
+      [ -f "$f" ] || continue
+      n="${f##*/}"; n="${n%.private_key}"
+      cmp -s "$f" "$inUse" && [ -f "$sshDir/public_keys/$n.public_key" ] && sshKeyName="$n"
+    done
+  fi
+  if [ -z "$sshKeyName" ]; then
+    files=$(ls "$sshDir/private_key/" 2>/dev/null | sed 's/\.private_key$//')
+    [ "$(printf '%s\n' "$files" | grep -c .)" = 1 ] && sshKeyName="$files"
+  fi
   if [ -z "$sshKeyName" ]; then
     error.log "get.file.name: file not found..."
     important.log "recovering by generating key.name for file"
