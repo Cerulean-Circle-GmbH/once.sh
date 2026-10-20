@@ -322,6 +322,8 @@ The **script name is the root object** — `odocker` acts on `container`, `image
 an object CHAIN ending in a verb: **`object.object.verb`**. The object column shows the full chain.
 The **verb is identified semantically** (a real action word), not by position; OOSH's normalized form puts
 the **verb last** (e.g. `authorized.keys.update`), so segments before it are the object, after it `more.words`.
+An **adverbial modifier** directly before the verb belongs to the verb, not the object —
+`otmux.window.aggressive.resize` is object `otmux.window` + verb `aggressive.resize`.
 An **empty verb** means the name carries **no action at all** — the chain never reaches a verb
 (an `object.verb` naming gap, listed in [verb-audit.md](verb-audit.md)).
 
@@ -329,7 +331,9 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |---|---|---|---|---|---|
 | **=== public ===** | | | | | |
 | `hiveMind` | `attach` |  | `# # attach to hivemind tmux session` | `hiveMind.attach` ✅ | `hiveMind.attach` ✅ |
+|  | `auto.commit` |  | `# <?message> # auto-commit uncommitted changes if any exist` |  | `hiveMind.auto.commit` |
 |  | `broadcast` |  | `# <message> # send message to all agents` | `hiveMind.broadcast` | `hiveMind.broadcast` |
+|  | `cold.recover` |  | `# <?session> # cold-start recovery: reconcile registry with live infrastructure, nudge agents` |  | `hiveMind.cold.recover` |
 |  | `delegate` |  | `# <name> <description> <?from:PO> # write task file and send file-read nudge to agent` | `hiveMind.delegate` | `hiveMind.delegate` |
 |  | `detach` |  | `# # detach from current session` | `hiveMind.detach` ✅ | `hiveMind.detach` ✅ |
 |  | `discover` |  | `# # discover all agents as JSON` | `hiveMind.discover` ✅ | `hiveMind.discover` ✅ |
@@ -379,9 +383,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `hiveMind.agent.state` | `clear` |  | `# <role> # clear operator override state for an agent` | `hiveMind.agent.state.clear` |  |
 |  | `get` |  | `# <role> # get operator override state for an agent (empty if none)` | `hiveMind.agent.state.get` |  |
 |  | `set` |  | `# <role> <STATE> # set operator override state for an agent` | `hiveMind.agent.state.set` |  |
-| `hiveMind.auto` | `commit` |  | `# <?message> # auto-commit uncommitted changes if any exist` |  | `hiveMind.auto.commit` |
 | `hiveMind.claude` |  |  | `# <agentId> <?prompt> # interact with agent via Claude Code` | `hiveMind.claude` | `hiveMind.claude` |
-| `hiveMind.cold` | `recover` |  | `# <?session> # cold-start recovery: reconcile registry with live infrastructure, nudge agents` |  | `hiveMind.cold.recover` |
 | `hiveMind.consistency` | `audit` |  | `# <?session> # cross-compare all identity sources and show mismatches` | `hiveMind.consistency.audit` | `hiveMind.consistency.audit` |
 |  |  | `table` | `# <?session> # LEGACY per-pane table view (Sprint 0 — kept for diagnostics)` | `hiveMind.consistency.audit.table` |  |
 |  | `fix` |  | `# <?session> # auto-repair identity mismatches from live truth` | `hiveMind.consistency.fix` | `hiveMind.consistency.fix` |

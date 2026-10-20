@@ -319,6 +319,8 @@ The **script name is the root object** — `odocker` acts on `container`, `image
 an object CHAIN ending in a verb: **`object.object.verb`**. The object column shows the full chain.
 The **verb is identified semantically** (a real action word), not by position; OOSH's normalized form puts
 the **verb last** (e.g. `authorized.keys.update`), so segments before it are the object, after it `more.words`.
+An **adverbial modifier** directly before the verb belongs to the verb, not the object —
+`otmux.window.aggressive.resize` is object `otmux.window` + verb `aggressive.resize`.
 An **empty verb** means the name carries **no action at all** — the chain never reaches a verb
 (an `object.verb` naming gap, listed in [verb-audit.md](verb-audit.md)).
 

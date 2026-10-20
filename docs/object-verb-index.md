@@ -8,7 +8,7 @@ An **empty verb** = the method name carries no action (see [verb-audit.md](verb-
 Objects come from two places: the **method name chain**, and **noun parameters** (a `<param>` is a thing a verb acts on, so it is an object too — 370 of them). The links are the usage sites either way.
 Each method links to its script's matrix. Indexes: [methods-index.md](methods-index.md) · [parameter.md](parameter.md).
 
-**911 objects** · **3359 object/verb pairs** · **6609 methods**
+**906 objects** · **3360 object/verb pairs** · **6603 methods**
 
 | object | verb | methods |
 |---|---|---|
@@ -128,7 +128,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `agents` | `discover` | [`hiveMind.protected.agents.discover`](hivemind.md) |
 | `agents` | `init` | [`hiveMind.init`](hivemind.md) |
 | `agentsDir` |  | [`private.osemvec.agentsDir`](osemvec.md) |
-| `aggressive` | `resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `alert` |  | [`claudeCode.context.alert`](claudeCode.md) · [`scrumMaster.velocity.alert`](scrumMaster.md) |
 | `alias` |  | [`2c.alias`](2c.md) · [`c2.alias`](c2.md) · [`mycmd.tab.alias`](mycmd.md) |
 | `alias` | `collect` | [`osx.alias.collect.all.here`](osx.md) |
@@ -201,7 +200,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `authorized` | `rebuild` | [`private.user.authorized.keys.rebuild`](user.md) |
 | `authorized` | `update` | [`ossh.authorized.keys.update`](ossh.md) · [`user.authorized.keys.update`](user.md) |
 | `authorized_keys` | `update` | [`ossh.authorized_keys.update`](ossh.md) |
-| `auto` | `commit` | [`hiveMind.auto.commit`](hivemind.md) |
 | `automount` |  | [`disk.automount`](disk.md) |
 | `automount` | `create` | [`disk.automount.create.config`](disk.md) |
 | `b` | `get` | [`ogit.merge.base.get`](ogit.md) |
@@ -212,10 +210,11 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `backup` | `capture` | [`backup.log.capture.mode`](backup.md) · [`private.backup.log.capture.mode`](backup.md) |
 | `backup` | `complete` | [`private.complete.folders`](backup.md) |
 | `backup` | `create` | [`backup.config.create`](backup.md) |
-| `backup` | `diff` | [`backup.diff`](backup.md) · [`backup.full.diff`](backup.md) · [`backup.list.last.diff.result`](backup.md) |
+| `backup` | `diff` | [`backup.diff`](backup.md) · [`backup.list.last.diff.result`](backup.md) |
 | `backup` | `disable` | [`backup.config.disable`](backup.md) |
 | `backup` | `discover` | [`backup.config.discover`](backup.md) |
 | `backup` | `enable` | [`backup.config.enable`](backup.md) |
+| `backup` | `full.diff` | [`backup.full.diff`](backup.md) |
 | `backup` | `get` | [`backup.backupPath.get`](backup.md) · [`backup.get.backupPath`](backup.md) · [`backup.get.relative.path`](backup.md) · [`backup.path.get.relative`](backup.md) · [`private.backup.get.backupPath`](backup.md) · [`private.backup.get.relative.path`](backup.md) |
 | `backup` | `help` | [`backup.strategy.help`](backup.md) |
 | `backup` | `inspect` | [`backup.inspect`](backup.md) |
@@ -475,7 +474,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `cmd1` |  | [`otmux.if`](otmux.md) |
 | `cmd2` |  | [`otmux.if`](otmux.md) |
 | `cmds` | `install` | [`private.setup.cmds.install`](setup.md) |
-| `cold` | `recover` | [`hiveMind.cold.recover`](hivemind.md) |
 | `command` |  | [`c2.buildin.commands`](c2.md) · [`claudeFlow.i`](claudeFlow.md) · [`claudeFlow.interactive`](claudeFlow.md) · [`claudeFlow.json`](claudeFlow.md) · [`claudeFlow.quiet`](claudeFlow.md) · [`claudeFlow.table`](claudeFlow.md) · [`claudeFlow.tmux.pane`](claudeFlow.md) · [`claudeFlow.verbose`](claudeFlow.md) · [`debug.onError`](debug.md) · [`odocker.image.command`](odocker.md) · [`otmux.256color`](otmux.md) · [`otmux.config`](otmux.md) · [`otmux.control`](otmux.md) · [`otmux.nw`](otmux.md) · [`otmux.socket`](otmux.md) · [`otmux.utf8`](otmux.md) · [`otmux.verbose`](otmux.md) · [`private.as.user`](user.md) · [`private.ossh.ssh`](ossh.md) · [`private.otmux.socketPath`](otmux.md) |
 | `command` | `bind` | [`otmux.bind`](otmux.md) · [`otmux.key.bind`](otmux.md) |
 | `command` | `confirm` | [`otmux.confirm`](otmux.md) · [`otmux.send.confirm`](otmux.md) |
@@ -603,7 +601,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `content` | `write` | [`private.this.file.write`](this.md) |
 | `context` |  | [`claudeCode.context.alert`](claudeCode.md) · [`claudeCode.context.all`](claudeCode.md) · [`claudeCode.context.dashboard`](claudeCode.md) · [`claudeCode.context.jsonl`](claudeCode.md) · [`claudeCode.context.self`](claudeCode.md) · [`claudeCode.context.velocity`](claudeCode.md) · [`claudeCode.context.velocity.byJsonl`](claudeCode.md) · [`claudeCode.context.velocity.byPane`](claudeCode.md) · [`context.lifecycle.status`](context.md) · [`context.schema`](context.md) · [`hiveMind.agent.context.status`](hivemind.md) · [`hiveMind.team.context.status`](hivemind.md) · [`osemvec.context`](osemvec.md) · [`private.claudeCode.context.from.jsonl`](claudeCode.md) · [`private.claudeCode.context.jsonl.lag`](claudeCode.md) · [`private.context.role.to.machine`](context.md) · [`private.hiveMind.context.age`](hivemind.md) · [`private.hiveMind.context.denom.for.target`](hivemind.md) · [`private.hiveMind.context.from.jsonl.reading`](hivemind.md) · [`private.hiveMind.context.key`](hivemind.md) · [`private.hiveMind.context.live.jsonl`](hivemind.md) |
 | `context` | `check` | [`claudeCode.context.check`](claudeCode.md) |
-| `context` | `compact` | [`context.lifecycle.pre.compact`](context.md) |
 | `context` | `ensure` | [`private.hiveMind.context.ensure.dir`](hivemind.md) |
 | `context` | `gather` | [`hiveMind.context.gather`](hivemind.md) · [`hiveMind.context.gather.all`](hivemind.md) · [`hiveMind.context.gather.quiet`](hivemind.md) |
 | `context` | `get` | [`hiveMind.context.get`](hivemind.md) · [`private.hiveMind.context.get`](hivemind.md) |
@@ -611,6 +608,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `context` | `list` | [`private.context.role.list`](context.md) |
 | `context` | `measure` | [`scrumMaster.context.measure`](scrumMaster.md) |
 | `context` | `parse` | [`private.claudeCode.context.parse`](claudeCode.md) · [`private.hiveMind.context.parse`](hivemind.md) |
+| `context` | `pre.compact` | [`context.lifecycle.pre.compact`](context.md) |
 | `context` | `read` | [`claudeCode.context.read`](claudeCode.md) · [`claudeCode.context.read.tui`](claudeCode.md) · [`private.claudeCode.context.read.tui`](claudeCode.md) · [`scrumMaster.context.read`](scrumMaster.md) |
 | `context` | `record` | [`hiveMind.context.record`](hivemind.md) |
 | `context` | `recover` | [`context.lifecycle.recover`](context.md) · [`context.recover`](context.md) |
@@ -713,12 +711,13 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `dir` | `count` | [`ogit.commit.count`](ogit.md) |
 | `dir` | `create` | [`ogit.commit.create`](ogit.md) · [`ogit.tag.create`](ogit.md) |
 | `dir` | `delete` | [`ogit.branch.remote.delete`](ogit.md) · [`ogit.worktree.delete`](ogit.md) |
-| `dir` | `diff` | [`backup.diff`](backup.md) · [`backup.full.diff`](backup.md) |
+| `dir` | `diff` | [`backup.diff`](backup.md) |
 | `dir` | `drop` | [`ogit.stash.drop`](ogit.md) |
 | `dir` | `ensure` | [`private.ensure.sharedTree`](this.md) · [`private.this.folder.ensure`](this.md) · [`private.this.shared.top.ensure`](this.md) |
 | `dir` | `fetch` | [`ogit.remote.fetch`](ogit.md) |
 | `dir` | `find` | [`ogit.branch.find`](ogit.md) · [`ogit.worktree.find`](ogit.md) |
 | `dir` | `finish` | [`private.promote.merge.finish`](promote.md) |
+| `dir` | `full.diff` | [`backup.full.diff`](backup.md) |
 | `dir` | `get` | [`backup.backupPath.get`](backup.md) · [`backup.get.backupPath`](backup.md) · [`ogit.branch.get`](ogit.md) · [`ogit.config.email.get`](ogit.md) · [`ogit.config.get`](ogit.md) · [`ogit.merge.base.get`](ogit.md) · [`ogit.remote.url.get`](ogit.md) · [`ogit.repo.root.get`](ogit.md) · [`ogit.stash.top.get`](ogit.md) · [`ogit.tag.latest.get`](ogit.md) · [`private.backup.get.backupPath`](backup.md) · [`private.ogit.umask.get`](ogit.md) · [`private.ogit.worktree.paths.get`](ogit.md) · [`private.oo.checkout.dir.get`](oo.md) · [`private.scrumMaster.metrics.dir.get`](scrumMaster.md) · [`private.this.temp.dir.get`](this.md) |
 | `dir` | `grep` | [`ogit.repo.grep`](ogit.md) |
 | `dir` | `import` | [`private.ogit.branch.import`](ogit.md) |
@@ -918,13 +917,12 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `folders` | `delete` | [`ossh.key.folders.delete`](ossh.md) |
 | `folders` | `list` | [`private.ogit.base.folders.list`](ogit.md) |
 | `for` |  | [`private.claudeCode.max.tokens.for.jsonl`](claudeCode.md) · [`private.hiveMind.context.denom.for.target`](hivemind.md) · [`private.hiveMind.pane.for.agent`](hivemind.md) |
-| `force` | `update` | [`line.format.force.update`](line.md) |
 | `forked` |  | [`private.hiveMind.handler.agent.forked.forks`](hivemind.md) · [`private.hiveMind.handler.agent.forked.registry`](hivemind.md) · [`private.hiveMind.handler.agent.forked.sessions`](hivemind.md) |
 | `forks` |  | [`private.hiveMind.handler.agent.forked.forks`](hivemind.md) |
 | `form` | `get` | [`private.config.path.segments.get`](config.md) · [`private.this.host.name.get`](this.md) |
+| `format` | `force.update` | [`line.format.force.update`](line.md) |
 | `format` | `init` | [`private.line.format.init`](line.md) |
 | `format` | `save` | [`private.line.format.save`](line.md) |
-| `format` | `update` | [`line.format.force.update`](line.md) |
 | `formats` | `edit` | [`line.formats.edit`](line.md) |
 | `forwardAgent` | `get` | [`private.ossh.config.forwardAgent.get`](ossh.md) |
 | `forwardAgent` | `set` | [`private.ossh.config.forwardAgent.set`](ossh.md) |
@@ -945,7 +943,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `fromPath` | `source` | [`backup.source`](backup.md) |
 | `fromTitle` |  | [`private.hiveMind.role.fromTitle`](hivemind.md) |
 | `full` |  | [`hiveMind.cycle.full`](hivemind.md) · [`status.scope.full`](status.md) · [`this.scope.full`](this.md) |
-| `full` | `diff` | [`backup.full.diff`](backup.md) |
 | `fullScreenName` |  | [`private.tronMonitor.fullScreenName`](tronMonitor.md) |
 | `function` |  | [`this.caller.function`](this.md) · [`this.function.partial`](this.md) |
 | `function` | `find` | [`line.function.find`](line.md) |
@@ -1030,12 +1027,14 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `hiveMind` | `approve` | [`hiveMind.agent.approve`](hivemind.md) · [`hiveMind.monitor.approve`](hivemind.md) |
 | `hiveMind` | `attach` | [`hiveMind.attach`](hivemind.md) |
 | `hiveMind` | `audit` | [`hiveMind.consistency.audit`](hivemind.md) · [`hiveMind.consistency.audit.table`](hivemind.md) · [`hiveMind.team.audit`](hivemind.md) |
+| `hiveMind` | `auto.commit` | [`hiveMind.auto.commit`](hivemind.md) |
 | `hiveMind` | `bootstrap` | [`hiveMind.agent.bootstrap`](hivemind.md) |
 | `hiveMind` | `broadcast` | [`hiveMind.broadcast`](hivemind.md) |
 | `hiveMind` | `check` | [`private.hiveMind.reconcile.check.i1`](hivemind.md) · [`private.hiveMind.reconcile.check.i10`](hivemind.md) · [`private.hiveMind.reconcile.check.i2`](hivemind.md) · [`private.hiveMind.reconcile.check.i3`](hivemind.md) · [`private.hiveMind.reconcile.check.i4`](hivemind.md) · [`private.hiveMind.reconcile.check.i5`](hivemind.md) · [`private.hiveMind.reconcile.check.i6`](hivemind.md) · [`private.hiveMind.reconcile.check.i7`](hivemind.md) · [`private.hiveMind.reconcile.check.i8`](hivemind.md) · [`private.hiveMind.reconcile.check.i9`](hivemind.md) · [`private.hiveMind.snapshot.version.check`](hivemind.md) |
 | `hiveMind` | `classify` | [`private.hiveMind.shell.classify`](hivemind.md) |
 | `hiveMind` | `clear` | [`hiveMind.agent.queue.clear`](hivemind.md) · [`hiveMind.agent.state.clear`](hivemind.md) · [`hiveMind.team.state.clear`](hivemind.md) · [`private.hiveMind.state.clear`](hivemind.md) |
-| `hiveMind` | `commit` | [`hiveMind.auto.commit`](hivemind.md) · [`hiveMind.git.commit`](hivemind.md) |
+| `hiveMind` | `cold.recover` | [`hiveMind.cold.recover`](hivemind.md) |
+| `hiveMind` | `commit` | [`hiveMind.git.commit`](hivemind.md) |
 | `hiveMind` | `compact` | [`hiveMind.peer.compact`](hivemind.md) |
 | `hiveMind` | `complete` | [`private.hiveMind.roles.complete`](hivemind.md) · [`private.hiveMind.teams.complete`](hivemind.md) |
 | `hiveMind` | `count` | [`private.hiveMind.pane.count`](hivemind.md) |
@@ -1088,7 +1087,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `hiveMind` | `reap` | [`hiveMind.shell.reap`](hivemind.md) · [`hiveMind.shell.reap.dry`](hivemind.md) · [`private.hiveMind.shell.reap.impl`](hivemind.md) |
 | `hiveMind` | `reconcile` | [`hiveMind.consistency.reconcile`](hivemind.md) |
 | `hiveMind` | `record` | [`hiveMind.context.record`](hivemind.md) |
-| `hiveMind` | `recover` | [`hiveMind.cold.recover`](hivemind.md) · [`hiveMind.team.recover`](hivemind.md) |
+| `hiveMind` | `recover` | [`hiveMind.team.recover`](hivemind.md) |
 | `hiveMind` | `refresh` | [`hiveMind.ctx.refresh`](hivemind.md) · [`hiveMind.ctx.refresh.dry`](hivemind.md) · [`hiveMind.registry.refresh`](hivemind.md) · [`private.hiveMind.ctx.refresh.impl`](hivemind.md) |
 | `hiveMind` | `register` | [`hiveMind.protected.events.register`](hivemind.md) · [`hiveMind.team.register`](hivemind.md) · [`private.hiveMind.events.register`](hivemind.md) |
 | `hiveMind` | `reject` | [`hiveMind.agent.reject`](hivemind.md) |
@@ -1303,8 +1302,8 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `level` | `run` | [`private.test.suite.run.filtered`](test.suite.md) |
 | `levelno` |  | [`log.level`](log.md) |
 | `lifecycle` |  | [`context.lifecycle.status`](context.md) · [`odocker.lifecycle`](odocker.md) |
-| `lifecycle` | `compact` | [`context.lifecycle.pre.compact`](context.md) |
 | `lifecycle` | `init` | [`context.lifecycle.init`](context.md) |
+| `lifecycle` | `pre.compact` | [`context.lifecycle.pre.compact`](context.md) |
 | `lifecycle` | `recover` | [`context.lifecycle.recover`](context.md) |
 | `lifecycle` | `save` | [`context.lifecycle.save`](context.md) |
 | `limit` | `show` | [`ogit.commit.log.show`](ogit.md) |
@@ -1320,6 +1319,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `line` | `ensure` | [`private.this.file.line.ensure`](this.md) |
 | `line` | `filter` | [`line.filter`](line.md) · [`line.filter.comment.shell`](line.md) · [`line.filter.emptyLines`](line.md) |
 | `line` | `find` | [`line.find`](line.md) · [`line.find.function`](line.md) · [`line.function.find`](line.md) |
+| `line` | `force.update` | [`line.format.force.update`](line.md) |
 | `line` | `format` | [`line.format`](line.md) · [`line.format.env`](line.md) |
 | `line` | `get` | [`line.get.parameter`](line.md) · [`line.parameter.get`](line.md) · [`private.config.path.line.absolute.get`](config.md) · [`private.config.path.line.get`](config.md) · [`private.this.env.export.line.get`](this.md) · [`private.user.authorized.key.get`](user.md) |
 | `line` | `init` | [`line.init`](line.md) · [`private.line.format.init`](line.md) |
@@ -1337,7 +1337,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `line` | `trim` | [`line.trim`](line.md) · [`line.trim.leading`](line.md) · [`line.trim.quoted`](line.md) · [`line.trim.quoted.leading`](line.md) · [`line.trim.quoted.trailing`](line.md) · [`line.trim.trailing`](line.md) |
 | `line` | `unify` | [`line.unify`](line.md) · [`private.line.unify.each`](line.md) · [`private.unify.one`](line.md) |
 | `line` | `unquote` | [`line.unquote`](line.md) |
-| `line` | `update` | [`line.format.force.update`](line.md) |
 | `line` | `use` | [`line.use`](line.md) |
 | `lineNumber` | `remove` | [`line.remove`](line.md) |
 | `lineNumber` | `select` | [`line.select`](line.md) |
@@ -1463,8 +1462,9 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `message` |  | [`agentRoom.chat`](agentRoom.md) · [`check.message`](check.md) · [`otmux.msg`](otmux.md) |
 | `message` | `adopt` | [`ogit.branch.adopt`](ogit.md) |
 | `message` | `append` | [`claudeCode.system.prompt.append`](claudeCode.md) |
+| `message` | `auto.commit` | [`hiveMind.auto.commit`](hivemind.md) |
 | `message` | `broadcast` | [`claudeFlow.hive.broadcast`](claudeFlow.md) · [`hiveMind.broadcast`](hivemind.md) |
-| `message` | `commit` | [`hiveMind.auto.commit`](hivemind.md) · [`hiveMind.git.commit`](hivemind.md) |
+| `message` | `commit` | [`hiveMind.git.commit`](hivemind.md) |
 | `message` | `create` | [`ogit.commit.create`](ogit.md) |
 | `message` | `delegate` | [`hiveMind.task.delegate`](hivemind.md) |
 | `message` | `display` | [`otmux.display`](otmux.md) · [`otmux.send.display`](otmux.md) |
@@ -1890,6 +1890,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `otest` | `testNames` | [`private.testNames`](otest.md) · [`private.testNames.camel`](otest.md) |
 | `otest` | `updateGolden` | [`otest.updateGolden`](otest.md) |
 | `otmux` |  | [`otmux.256color`](otmux.md) · [`otmux.a`](otmux.md) · [`otmux.buffers`](otmux.md) · [`otmux.clients`](otmux.md) · [`otmux.clock`](otmux.md) · [`otmux.commands`](otmux.md) · [`otmux.composer.state`](otmux.md) · [`otmux.config`](otmux.md) · [`otmux.control`](otmux.md) · [`otmux.current`](otmux.md) · [`otmux.d`](otmux.md) · [`otmux.dp`](otmux.md) · [`otmux.if`](otmux.md) · [`otmux.info`](otmux.md) · [`otmux.keys`](otmux.md) · [`otmux.kp`](otmux.md) · [`otmux.kw`](otmux.md) · [`otmux.last`](otmux.md) · [`otmux.layout`](otmux.md) · [`otmux.layout.even.h`](otmux.md) · [`otmux.layout.even.v`](otmux.md) · [`otmux.layout.main.h`](otmux.md) · [`otmux.layout.main.v`](otmux.md) · [`otmux.layout.tiled`](otmux.md) · [`otmux.left`](otmux.md) · [`otmux.lsb`](otmux.md) · [`otmux.lsc`](otmux.md) · [`otmux.lscm`](otmux.md) · [`otmux.lsk`](otmux.md) · [`otmux.lsp`](otmux.md) · [`otmux.lsw`](otmux.md) · [`otmux.menu`](otmux.md) · [`otmux.msg`](otmux.md) · [`otmux.nw`](otmux.md) · [`otmux.pane.history`](otmux.md) · [`otmux.pane.last`](otmux.md) · [`otmux.pane.left`](otmux.md) · [`otmux.pane.right`](otmux.md) · [`otmux.pane.self`](otmux.md) · [`otmux.pane.size`](otmux.md) · [`otmux.pane.title`](otmux.md) · [`otmux.panes`](otmux.md) · [`otmux.right`](otmux.md) · [`otmux.rp`](otmux.md) · [`otmux.rw`](otmux.md) · [`otmux.server.info`](otmux.md) · [`otmux.session.details`](otmux.md) · [`otmux.session.last`](otmux.md) · [`otmux.sessions`](otmux.md) · [`otmux.size.status`](otmux.md) · [`otmux.socket`](otmux.md) · [`otmux.sp`](otmux.md) · [`otmux.status`](otmux.md) · [`otmux.sw`](otmux.md) · [`otmux.tiled`](otmux.md) · [`otmux.tree`](otmux.md) · [`otmux.tree.detailed`](otmux.md) · [`otmux.utf8`](otmux.md) · [`otmux.v`](otmux.md) · [`otmux.verbose`](otmux.md) · [`otmux.version`](otmux.md) · [`otmux.window.last`](otmux.md) · [`otmux.window.size`](otmux.md) · [`otmux.window.size.status`](otmux.md) · [`otmux.windows`](otmux.md) · [`otmux.z`](otmux.md) · [`private.default.config`](otmux.md) · [`private.otmux.configPath`](otmux.md) · [`private.otmux.evenH`](otmux.md) · [`private.otmux.evenV`](otmux.md) · [`private.otmux.lastPane`](otmux.md) · [`private.otmux.lastWindow`](otmux.md) · [`private.otmux.mainH`](otmux.md) · [`private.otmux.mainV`](otmux.md) · [`private.otmux.notifyHiveMind.shifted`](otmux.md) · [`private.otmux.self.session`](otmux.md) · [`private.otmux.sessionFromPane`](otmux.md) · [`private.otmux.size.currentSession`](otmux.md) · [`private.otmux.socketPath`](otmux.md) |
+| `otmux` | `aggressive.resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `otmux` | `apply` | [`otmux.window.size.floor.apply`](otmux.md) · [`private.otmux.setup.clipboard.apply`](otmux.md) |
 | `otmux` | `attach` | [`otmux.attach`](otmux.md) · [`otmux.attach.readonly`](otmux.md) · [`otmux.session.attach`](otmux.md) |
 | `otmux` | `bind` | [`otmux.bind`](otmux.md) · [`otmux.key.bind`](otmux.md) |
@@ -1966,7 +1967,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `otmux` | `rename` | [`otmux.rename`](otmux.md) · [`otmux.session.rename`](otmux.md) · [`otmux.window.rename`](otmux.md) |
 | `otmux` | `renameWindow` | [`private.otmux.renameWindow`](otmux.md) |
 | `otmux` | `reset` | [`otmux.config.reset`](otmux.md) |
-| `otmux` | `resize` | [`otmux.pane.resize`](otmux.md) · [`otmux.window.aggressive.resize`](otmux.md) |
+| `otmux` | `resize` | [`otmux.pane.resize`](otmux.md) |
 | `otmux` | `resizePane` | [`private.otmux.resizePane`](otmux.md) |
 | `otmux` | `resolve` | [`private.otmux.pane.resolve`](otmux.md) · [`private.resolve.target`](otmux.md) |
 | `otmux` | `respawn` | [`otmux.pane.respawn`](otmux.md) · [`otmux.window.respawn`](otmux.md) |
@@ -2215,7 +2216,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `portability` | `validate` | [`test.suite.portability.validate`](test.suite.md) |
 | `ports` |  | [`private.odocker.container.ports`](odocker.md) |
 | `position` | `pathadd` | [`private.pathadd`](path.md) |
-| `pre` | `compact` | [`context.lifecycle.pre.compact`](context.md) |
 | `preForkFiles` | `push` | [`private.hiveMind.push.captureForkedUUID`](hivemind.md) |
 | `preamble` | `get` | [`private.this.as.user.preamble.get`](this.md) |
 | `prefix` | `append` | [`private.log.install.append`](this.md) |
@@ -2536,6 +2536,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `session` | `capture` | [`scrumMaster.pane.capture`](scrumMaster.md) · [`scrumMaster.team.capture`](scrumMaster.md) |
 | `session` | `check` | [`scrumMaster.speed.check`](scrumMaster.md) |
 | `session` | `clear` | [`hiveMind.team.state.clear`](hivemind.md) |
+| `session` | `cold.recover` | [`hiveMind.cold.recover`](hivemind.md) |
 | `session` | `collect` | [`scrumMaster.metrics.collect`](scrumMaster.md) |
 | `session` | `compact` | [`hiveMind.peer.compact`](hivemind.md) |
 | `session` | `delete` | [`claudeFlow.session.delete`](claudeFlow.md) · [`otmux.layout.delete`](otmux.md) |
@@ -2570,7 +2571,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `session` | `probe` | [`claudeCode.session.probe`](claudeCode.md) · [`claudeCode.session.probe.fromCapture`](claudeCode.md) · [`hiveMind.agent.session.probe`](hivemind.md) |
 | `session` | `read` | [`scrumMaster.context.read`](scrumMaster.md) |
 | `session` | `reconcile` | [`hiveMind.consistency.reconcile`](hivemind.md) |
-| `session` | `recover` | [`claudeCode.session.recover`](claudeCode.md) · [`hiveMind.cold.recover`](hivemind.md) · [`hiveMind.team.recover`](hivemind.md) |
+| `session` | `recover` | [`claudeCode.session.recover`](claudeCode.md) · [`hiveMind.team.recover`](hivemind.md) |
 | `session` | `refresh` | [`hiveMind.ctx.refresh`](hivemind.md) · [`hiveMind.ctx.refresh.dry`](hivemind.md) · [`hiveMind.registry.refresh`](hivemind.md) · [`private.hiveMind.ctx.refresh.impl`](hivemind.md) |
 | `session` | `register` | [`hiveMind.team.register`](hivemind.md) |
 | `session` | `remove` | [`hiveMind.team.remove`](hivemind.md) · [`private.otmux.size.lock.remove`](otmux.md) |
@@ -2900,6 +2901,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `tags` | `fetch` | [`ogit.remote.fetch`](ogit.md) |
 | `tags` | `push` | [`ogit.remote.push`](ogit.md) |
 | `target` |  | [`backup.target`](backup.md) · [`hiveMind.handoff`](hivemind.md) · [`otmux.layout`](otmux.md) · [`otmux.pane.history`](otmux.md) · [`otmux.pane.title`](otmux.md) · [`otmux.tiled`](otmux.md) · [`private.hiveMind.context.denom.for.target`](hivemind.md) · [`private.scrumMaster.velocity.target`](scrumMaster.md) · [`scrumMaster.velocity.target`](scrumMaster.md) |
+| `target` | `aggressive.resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `target` | `attach` | [`otmux.attach`](otmux.md) · [`otmux.attach.readonly`](otmux.md) · [`otmux.session.attach`](otmux.md) |
 | `target` | `backup` | [`private.this.symlink.with.backup`](this.md) |
 | `target` | `capture` | [`otmux.pane.capture`](otmux.md) · [`otmux.pane.capture.full`](otmux.md) · [`otmux.pane.capture.visible`](otmux.md) |
@@ -2921,7 +2923,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `target` | `move` | [`otmux.window.move`](otmux.md) |
 | `target` | `moveWindow` | [`private.otmux.moveWindow`](otmux.md) |
 | `target` | `rename` | [`otmux.window.rename`](otmux.md) |
-| `target` | `resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `target` | `save` | [`private.scrumMaster.metrics.save`](scrumMaster.md) |
 | `target` | `select` | [`otmux.pane.select`](otmux.md) · [`otmux.window.select`](otmux.md) |
 | `target` | `selectPane` | [`private.otmux.selectPane`](otmux.md) |
@@ -3232,13 +3233,13 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `valid` |  | [`private.hiveMind.snapshot.row.valid`](hivemind.md) |
 | `validConfigBlock` |  | [`private.ossh.validConfigBlock`](ossh.md) |
 | `value` |  | [`line.value`](line.md) · [`otmux.window.size`](otmux.md) |
+| `value` | `aggressive.resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `value` | `assign` | [`line.assign`](line.md) |
 | `value` | `del` | [`private.hiveMind.env.del`](hivemind.md) |
 | `value` | `get` | [`private.this.env.export.line.get`](this.md) |
 | `value` | `new` | [`line.parse.param.new`](line.md) |
 | `value` | `normalize` | [`private.scrumMaster.parse.normalize.k`](scrumMaster.md) |
 | `value` | `parse` | [`line.parse.param`](line.md) |
-| `value` | `resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `value` | `set` | [`config.set`](config.md) · [`ogit.config.set`](ogit.md) · [`ossh.config.set`](ossh.md) · [`otmux.config.set`](otmux.md) · [`otmux.config.set.global`](otmux.md) · [`otmux.config.set.window`](otmux.md) · [`otmux.env.set`](otmux.md) · [`otmux.set`](otmux.md) · [`private.hiveMind.env.set`](hivemind.md) · [`private.ossh.config.field.set`](ossh.md) · [`private.ossh.config.forwardAgent.set`](ossh.md) · [`private.ossh.config.hostName.set`](ossh.md) · [`private.ossh.config.identitiesOnly.set`](ossh.md) · [`private.ossh.config.identityFile.set`](ossh.md) · [`private.ossh.config.port.set`](ossh.md) · [`private.ossh.config.proxyJump.set`](ossh.md) · [`private.ossh.config.user.set`](ossh.md) |
 | `value` | `setEnv` | [`private.otmux.setEnv`](otmux.md) |
 | `value` | `setGlobal` | [`private.otmux.setGlobal`](otmux.md) |
@@ -3309,6 +3310,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `width` | `lock` | [`otmux.size.lock`](otmux.md) · [`otmux.window.size.lock`](otmux.md) |
 | `width` | `set` | [`otmux.pane.size.set`](otmux.md) · [`private.otmux.size.lock.set`](otmux.md) |
 | `window` |  | [`otmux.kw`](otmux.md) · [`otmux.sw`](otmux.md) · [`otmux.window.last`](otmux.md) · [`otmux.window.size`](otmux.md) · [`otmux.window.size.status`](otmux.md) |
+| `window` | `aggressive.resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `window` | `apply` | [`otmux.window.size.floor.apply`](otmux.md) |
 | `window` | `find` | [`otmux.window.find`](otmux.md) |
 | `window` | `format` | [`otmux.window.list.format`](otmux.md) |
@@ -3325,7 +3327,6 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `window` | `next` | [`otmux.window.next`](otmux.md) |
 | `window` | `prev` | [`otmux.window.prev`](otmux.md) |
 | `window` | `rename` | [`otmux.window.rename`](otmux.md) |
-| `window` | `resize` | [`otmux.window.aggressive.resize`](otmux.md) |
 | `window` | `respawn` | [`otmux.window.respawn`](otmux.md) |
 | `window` | `rotate` | [`otmux.window.rotate`](otmux.md) |
 | `window` | `select` | [`otmux.window.select`](otmux.md) |
