@@ -523,6 +523,10 @@ The only gap: `docs/oo.md` jumps from `oo.mode` straight to `oo.update`.
 > § 4b, "Recorded decisions": `$OOSH_DIR` is the `~/oosh` symlink, so `oo mode <branch>` changes
 > which branch's host configs are visible; and the resolved machine values live in
 > `$CONFIG_PATH/stateMachines/`, not beside the `.conf`. No code change, as the card says.
+>
+> **Reversed 2026-10-20:** `ossh certificates.update` / `certificates.status`, their test and
+> `etc/` are removed. `test/mcdonges.latest` never had them; certificates are renewed with
+> `once update.certificates` (init/once), as on that branch.
 
 **Card:** `/root/oosh/etc/ossh/hosts/WODA.test/certificates.update.conf`
 
