@@ -254,7 +254,7 @@ line itself.
 | diagnostics | `debug`'s `p`, banners, `path.env` | they print `PATH=`, they do not set it |
 
 Enforced by **`path validate [<treeRoot>]`** — the same sweep as the anchors (plus
-`old/` and `restore/` excluded), rc 1 on any violation. Covered by `test.path`
+`old/` excluded), rc 1 on any violation. Covered by `test.path`
 `T-PATH-VALIDATE-*`, including T-PATH-VALIDATE-NO-OWNER (a file named `boot` is no
 exception any more).
 
