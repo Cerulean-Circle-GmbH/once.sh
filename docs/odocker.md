@@ -191,6 +191,38 @@ RESULT: `seeded <root> from <source>: N added, M overwritten, K kept, U unchange
 …` (T-WS-SEED, T-WS-SEED-SOURCES, T-WS-SEED-MERGE). Until 2026-10-19 `<from>` had to be a local folder
 and a root that held any workspace was never written to.
 
+### `odocker workspace.push <?toHost> <?path>`
+
+The twin of `seed`: brings the workspaces of **this** computer to the source every `seed` reads —
+by default WODA.test (`…source.host.get`), into the same folder (`…source.path.get`). Until
+2026-10-21 oosh could only fetch, so a changed Dockerfile (the naked images with
+`--no-install-recommends`, no Python) never reached WODA.test.
+
+```bash
+odocker workspace.push                 # this computer's DockerWorkspaces → WODA.test
+odocker workspace.push WODA.test /path/to/DockerWorkspaces
+```
+
+The Host tree is fetched first, as `seed` fetches it (only read, into a temp folder), and every
+unit here is compared with it — the same units as `seed`:
+
+| On the Host | Then |
+|---|---|
+| missing | sent — **added** |
+| every file of the unit here the same | nothing — **unchanged**, not sent |
+| different | the `diff` of each differing file, then `Overwrite WODA.test:<unit> (differs from the one here)? [y/N]`; `y` sends it — **overwritten**, else **kept**; without a terminal always kept |
+| only on the Host | never touched — push removes nothing |
+
+**Never sent:** `.claude/`, `.backup.env`, `*.bak` and the whole `old/` family
+(`private.odocker.workspaces.push.filter`). What goes, goes as one `tar` over one ssh call; on the
+Host it is unpacked without the owners of this computer and given the owner of the Host root
+(`donges:dev` on WODA.test), the units and their family folders only. It does **not** commit: on
+WODA.test the files land in the EAMD.ucp checkout (`test/WODA245`) as changes, and `seed` reads them
+from there at once. rc 1 when the Host is no Host here, allows no key login or the copy fails —
+nothing is sent; rc 3 when `<path>` holds no Dockerfile workspace. RESULT: `pushed to
+<host>:<path>: N added, M overwritten, K kept, U unchanged`, or `nothing to push to …`
+(T-WS-PUSH-ONLY-DIFFERENCES, T-WS-PUSH-ASKS, T-WS-PUSH-SKIPS, T-WS-PUSH-NO-HOST).
+
 To check a machine is ready to build platform images:
 
 ```bash
@@ -430,6 +462,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | `workspace.get <?path>` | directory path (optional) | With no argument: show the current Docker workspaces directory, where it is persisted, **and whether it is usable** — rc 1 when it is not. With a path: report whether **that** path would be a usable root. A reporter only; it never sets, persists or creates |
 | `workspace.init <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | **Create** the directory if it is absent, then hand over to `workspace.set`. Idempotent. The verb to use on a fresh host, where `workspace.set` would refuse because the directory is not there yet |
 | `workspace.seed <?from> <?path>` | a folder, an ossh Host or a URL (optional — default WODA.test, else test.wo-da.de); directory path (optional — the same default) | **Create** the root (via `workspace.init`), add what is missing from the source, ask before overwriting a differing unit, share it with group dev, set it. Refuses a local `<from>` that is missing (rc 2) or without Dockerfiles (rc 3); rc 1 when nothing could be fetched. See [workspace.seed](#odocker-workspaceseed-from-path) |
+| `workspace.push <?toHost> <?path>` | an ossh Host (optional — default WODA.test); the local root (optional — default `$ODOCKER_WORKSPACES`) | **Push** this computer's workspaces to the source `seed` reads: a missing unit added, a differing one only after a yes (its diff shown), nothing removed; `.claude`, `.backup.env`, `*.bak`, `old/` never sent. See [workspace.push](#odocker-workspacepush-tohost-path) |
 | `workspace.set <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to that default |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
 
