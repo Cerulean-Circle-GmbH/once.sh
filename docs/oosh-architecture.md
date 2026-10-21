@@ -64,9 +64,12 @@ myScript.run() # <agent_name> # BANNED: use agentName
 myScript.find() # <3letterCode> # CRASH: cannot start with number
 ```
 
-#### Completion Functions: `script.method.completion.paramName`
+#### Completion Functions: `script.parameter.completion.paramName` or `script.method.completion.paramName`
 
-Must exactly match the parameter name from the method signature.
+The class-level `script.parameter.completion.paramName` serves the parameter in every method of
+the script; a method that needs other candidates gets its own `script.method.completion.paramName`,
+which c2 asks first (docs/completion-system.md § Where c2 looks). Either way the name must exactly
+match the parameter name from the method signature.
 
 ```bash
 # CORRECT — paramName matches in signature and completion function
@@ -100,7 +103,7 @@ local image-name                        # bash syntax error
 | Public method | `script.methodName()` | `odocker.file.find()` |
 | Private method | `private.script.methodName()` | `private.odocker.resolve.image()` |
 | Parameter | `<camelCase>` | `<containerOrImage>` |
-| Completion | `script.method.completion.paramName()` | `odocker.file.find.completion.containerOrImage()` |
+| Completion | `script.parameter.completion.paramName()`, or `script.method.completion.paramName()` for one method | `oo.parameter.completion.username()`, `odocker.file.find.completion.containerOrImage()` |
 | Local variable | `camelCase` | `local imageName` |
 | Environment var | `UPPER_SNAKE` (bash convention) | `ODOCKER_WORKSPACES` |
 
@@ -188,8 +191,10 @@ odocker.do.thing()            # vague verb
 
 #### Completion Function Rules
 
-1. **One completion function per completable parameter**
-2. **Name must exactly match**: `script.method.completion.paramName()`
+1. **One completion function per completable parameter**, defined once per script
+   (test.completion.audit, T-AUDIT-COMPLETION-ONCE: bash keeps the last of two)
+2. **Name must exactly match**: `script.parameter.completion.paramName()` (class-level) or
+   `script.method.completion.paramName()` (one method; asked first)
 3. **Output**: one completion candidate per line to stdout
 4. **No-param methods**: use empty completion `script.method.completion() { :; }`
 5. **Private methods**: no completion needed (not user-facing)

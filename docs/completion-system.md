@@ -19,9 +19,27 @@ The oosh/once.sh project features a dynamic Bash completion system, primarily im
 - Custom completions for advanced scenarios.
 - Debugging and troubleshooting completion issues.
 
+### Where c2 looks for a parameter's completion
+
+For `<param>` of `<script> <method>`, c2 (`ng/c2` `private.call.custom.completion`) asks, in this order:
+
+1. `<script>.<method>.completion.<param>`: method-specific, for a method whose `<param>` needs other
+   candidates than the rest of the script;
+2. `<script>.parameter.completion.<param>`: class-level, for a parameter that means the same in every
+   method of the script (`oo.parameter.completion.username`, `ossh.parameter.completion.sshConfigHost`);
+3. the default value of the signature (`<?id:123>`), otherwise nothing.
+
+The class-level form is the usual one: one function per parameter name instead of one per method
+(Marcel, 2026-10-20). An empty answer from 1. falls through to 2. The order is pinned by
+T-C2-PARAM-COMPLETION-ORDER. A completion is defined **once** per script, and never calls itself
+with its own input; `test/test.completion.audit` checks both (T-AUDIT-COMPLETION-ONCE,
+T-AUDIT-COMPLETION-NO-SELF-CALL). Tests ask for a completion with `test.suite.completion.exists` /
+`test.suite.completion.get`, which accept both forms (T-SUITE-COMPLETION-EXISTS).
+
 ### A completion that depends on an earlier word
 
-A completion function is called as `<script>.<method>.completion.<param> "$cur" "$class" "$method"`:
+A completion function is called as `<script>.<method>.completion.<param> "$cur" "$class" "$method"`
+(the class-level one the same way):
 `$2` is the class name (`ossh`), not an earlier word. Before it asks, c2 parses the words typed so
 far into `PARAM_<name>` (an optional one into `PARAM_OPTIONAL_<name>`), so the function reads the
 earlier parameter by name. `ossh config.set <configItem> <field> <value>` completes `<value>` from

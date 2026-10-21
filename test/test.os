@@ -173,25 +173,27 @@ unset _AUTO_OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: completion function exists
 # ─────────────────────────────────────────────────────────────────────────────
-if type os.platform.test.completion.platform >/dev/null 2>&1; then
-  expect.pass "os.platform.test.completion.platform is defined"
+# either form c2 asks (T-SUITE-COMPLETION-EXISTS)
+if test.suite.completion.exists os platform.test platform >/dev/null; then
+  expect.pass "a completion for platform of os platform.test is defined"
 else
-  expect.fail "os.platform.test.completion.platform should be defined"
+  expect.fail "a completion for platform of os platform.test should be defined"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: terminal completion function exists
 # ─────────────────────────────────────────────────────────────────────────────
-if type os.platform.test.completion.terminal >/dev/null 2>&1; then
-  expect.pass "os.platform.test.completion.terminal is defined"
+# either form c2 asks (T-SUITE-COMPLETION-EXISTS)
+if test.suite.completion.exists os platform.test terminal >/dev/null; then
+  expect.pass "a completion for terminal of os platform.test is defined"
 else
-  expect.fail "os.platform.test.completion.terminal should be defined"
+  expect.fail "a completion for terminal of os platform.test should be defined"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test: terminal completion returns "terminal"
 # ─────────────────────────────────────────────────────────────────────────────
-_TERMINAL_COMP=$(os.platform.test.completion.terminal)
+_TERMINAL_COMP=$(test.suite.completion.get os platform.test terminal "")  # either form c2 asks (T-SUITE-COMPLETION-EXISTS)
 if echo "$_TERMINAL_COMP" | grep -q "terminal"; then
   expect.pass "terminal completion suggests 'terminal'"
 else

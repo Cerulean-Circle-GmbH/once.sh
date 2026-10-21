@@ -155,7 +155,7 @@ The `c2` script (in `ng/c2`) provides Tab completion for oosh methods:
 ./otmux send.enter mySession:0.1 './c2 function.completion ./otmux config'
 ```
 
-**Custom completion:** Define `scriptname.method.completion.parameter()` functions to provide custom completions for specific parameters.
+**Custom completion:** Define `scriptname.parameter.completion.parameter()` for a parameter that means the same in every method of the script (the class-level form), or `scriptname.method.completion.parameter()` where one method needs something different. c2 asks the method-specific one first, then the class-level one. In tests, check a completion with `test.suite.completion.exists` / `.get` (they accept both forms), never by one spelling.
 
 ---
 
