@@ -2616,12 +2616,14 @@ expect 0 "missing units added, a differing one only after a yes, local ones unto
 # sshpass, run.sshd — no container is started, no ~/.ssh is touched.
 test.odocker.containerSsh.run() { # <fx> <what...> # run <what...> with the stubs of <fx>; echo the calls, then rc and RESULT #
   local fx="$1"; shift
-  ( FX="$fx"
+  ( FX="$fx"; export HOME="$fx/home"; mkdir -p "$HOME/.ssh"
     docker() {
       echo "docker $*" >> "$FX/calls"
       case "$*" in
         "image inspect -f"*) case "$*" in *nosshd*) echo '{"80/tcp":{}}' ;; *) echo '{"22/tcp":{}}' ;; esac ;;
-        "ps -a --filter publish="*) [ -f "$FX/busy" ] && cat "$FX/busy" ;;
+        "ps -a --filter publish="*)
+          # FX_BUSY_PORT: only that port is taken; unset: every port is
+          if [ -f "$FX/busy" ] && { [ -z "$FX_BUSY_PORT" ] || [ "${4#publish=}" = "$FX_BUSY_PORT" ]; }; then cat "$FX/busy"; fi ;;
         create*) echo cid0 ;;
         "container inspect -f {{.Name}} cid0") echo /random_name ;;
       esac
@@ -2631,7 +2633,7 @@ test.odocker.containerSsh.run() { # <fx> <what...> # run <what...> with the stub
     sshpass() { echo "sshpass $*" >> "$FX/calls"; local n; n=$(($(cat "$FX/tries" 2>/dev/null || echo 0) + 1)); echo "$n" > "$FX/tries"; [ "$n" -ge "${FX_SSH_UP_AT:-1}" ]; }
     sleep() { :; }
     oo() { echo "oo $*" >> "$FX/calls"; }
-    odocker.run.sshd() { echo "run.sshd $*" >> "$FX/calls"; return 0; }
+    odocker.run.sshd() { echo "run.sshd $*" >> "$FX/calls"; return "${FX_RUN_RC:-0}"; }
     private.this.script.load() { return 0; }
     private.ossh.control.path.get() { echo "$FX/cm-%C"; }
     private.ossh.control.path.resolved.get() { echo "$FX/cm-resolved"; }
@@ -2644,7 +2646,7 @@ test.odocker.containerSshStart() {
   fx=$(test.suite.fixture.make odockercontainerssh)
   out=$(test.odocker.containerSsh.run "$fx" odocker.container.ssh.start naked_ubuntu_24_04 boxone 3)
   order=$(printf '%s\n' "$out" | sed -n 's/^\(run.sshd\|ossh [a-z.]*\|sshpass\|rc=[0-9]\).*/\1/p' | tr '\n' ' ')
-  [ "$order" = "run.sshd ossh config.delete ossh known.hosts.remove ossh config.create ossh config.save.last ossh connection.close sshpass ossh key.push rc=0 " ] || bad="$bad order=[$order]"
+  [ "$order" = "run.sshd ossh known.hosts.remove ossh config.create ossh config.save.last ossh connection.close sshpass ossh key.push rc=0 " ] || bad="$bad order=[$order]"
   printf '%s\n' "$out" | grep -qx 'run.sshd naked_ubuntu_24_04 boxone 3' || bad="$bad run=[$(printf '%s\n' "$out" | grep '^run.sshd')]"
   printf '%s\n' "$out" | grep -qx 'ossh config.create boxone test@localhost:8025' || bad="$bad create=[$(printf '%s\n' "$out" | grep 'config.create')]"
   printf '%s\n' "$out" | grep '^sshpass' | grep -q 'StrictHostKeyChecking=accept-new' || bad="$bad master"
@@ -2656,6 +2658,11 @@ test.odocker.containerSshStart() {
   printf '%s\n' "$out" | grep -q '^rc=1 .*no sshd' || bad="$bad noSshd=[$(printf '%s\n' "$out" | tail -1)]"
   out=$(FX_OSSH_RC=1 test.odocker.containerSsh.run "$fx" odocker.container.ssh.start naked_ubuntu_24_04 boxone)
   printf '%s\n' "$out" | grep -q '^rc=1 .*config.create' || bad="$bad stepNamed=[$(printf '%s\n' "$out" | tail -1)]"
+  # A start that fails leaves no half container: docker had created boxtwo
+  # before its network failed (2026-10-21) — removed again, no Host written.
+  out=$(FX_RUN_RC=125 test.odocker.containerSsh.run "$fx" odocker.container.ssh.start naked_ubuntu_24_04 boxone)
+  printf '%s\n' "$out" | sed -n '/^run.sshd/,$p' | grep -qx 'docker rm -f boxone' || bad="$bad halfLeft"
+  printf '%s\n' "$out" | grep -q '^ossh config' && bad="$bad hostAfterFail"
   rm -rf "${fx:?}"
   [ -z "$bad" ] && create.result 0 "container, Host, first login and key in this order" || create.result 1 "ssh.start:$bad"
   return $(result)
@@ -2675,7 +2682,12 @@ test.odocker.containerSshStartPortBusy() {
   out=$(test.odocker.containerSsh.run "$fx" odocker.container.ssh.start naked_ubuntu_24_04 boxone 3)
   printf '%s\n' "$out" | grep -qE '^(run.sshd|ossh config)' && bad="$bad wentOn"
   printf '%s\n' "$out" | grep -q '^rc=1 .*8025.*other_box' || bad="$bad refuse=[$(printf '%s\n' "$out" | tail -1)]"
-  echo boxone > "$fx/busy"
+  # Not only the ssh port: run.sshd publishes six (2026-10-21, boxone at
+  # offset 3 and boxtwo at offset 4 both wanted 5005 — docker refused late).
+  out=$(FX_BUSY_PORT=5005 test.odocker.containerSsh.run "$fx" odocker.container.ssh.start naked_ubuntu_24_04 boxtwo 4)
+  printf '%s\n' "$out" | grep -q '^run.sshd' && bad="$bad otherPortWentOn"
+  printf '%s\n' "$out" | grep -q '^rc=1 .*5005.*other_box' || bad="$bad otherPort=[$(printf '%s\n' "$out" | tail -1)]"
+  echo boxone > "$fx/busy"; mkdir -p "$fx/home/.ssh"; printf "Host boxone\n Port 8025\n" > "$fx/home/.ssh/config"
   out=$(test.odocker.containerSsh.run "$fx" odocker.container.ssh.start naked_ubuntu_24_04 boxone 3)
   printf '%s\n' "$out" | grep -qx 'docker rm -f boxone' || bad="$bad notReplaced"
   printf '%s\n' "$out" | grep -qx 'ossh config.delete boxone' || bad="$bad hostNotReplaced"

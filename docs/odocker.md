@@ -241,11 +241,11 @@ odocker reset naked_ubuntu_24_04
 
 # A container with ssh, ready to use, in one command: started, the Host
 # <name> in ~/.ssh/config (test@localhost:8022+offset), your key pushed
-odocker container.ssh.start naked_ubuntu_24_04 boxone 3
+odocker container.ssh.start naked_ubuntu_24_04 boxone 10
 ossh login boxone                      # no password
 
 # … and with oosh installed for test, in one command
-odocker container.oosh.install naked_debian_12 boxtwo 4
+odocker container.oosh.install naked_debian_12 boxtwo 20
 ossh login boxtwo                      # lands in [oosh boxtwo] test@<id>
 
 # The same steps by hand
@@ -262,7 +262,8 @@ ossh login mycontainer
 `odocker container.oosh.install` (same parameters) do the steps above in one go:
 
 1. the image must start sshd (it exposes `22/tcp`); Tab after `<image>` offers only such images;
-2. the ssh port is `8022+offset` — a port **another** container uses is refused (odocker reset would
+2. the ssh port is `8022+offset`, and five more ports move with it (8080, 8443, 5001, 5002, 5005) — offsets
+   10 apart never overlap; a port **another** container uses is refused (odocker reset would
    remove it); the same `<name>` again replaces that container and its Host block;
 3. the container starts (`run.sshd`), the old Host `<name>` and the old host key of the port go, the
    new Host is created and saved (`ossh config.create` + `config.save.last`);
