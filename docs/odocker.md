@@ -284,6 +284,11 @@ the Host `<name>` and the host key of its port — but only when that Host point
 (`HostName localhost`, `Port` = its ssh port). A Host of the same name that points elsewhere, e.g. a server, is
 kept, and so is the Host of a container that could not be removed.
 
+A container that went another way (a plain `docker rm`, the platform test's cleanup, a docker restart) leaves its
+Host behind. `odocker container.ssh.prune` removes those: every Host pointing at `localhost:<port>` (not 22) where no
+container publishes `<port>` and none has its name, with its host key. Every other Host stays, and when docker does
+not answer nothing is removed.
+
 ## Port Mapping
 
 Commands `run.sshd`, `up`, and `reset` accept an optional `<?portOrOffset:0>` parameter that controls host port mappings. It accepts **either** a port offset or an SSH port number:
