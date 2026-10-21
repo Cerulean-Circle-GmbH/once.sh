@@ -87,13 +87,18 @@ For each Docker-testable platform, `os platform.test` runs fully automated (no i
 
 **Flow:**
 
-1. `odocker reset <image>` — fresh container with SSH access
-2. `ossh config.create` / `ossh config.save.last` — SSH config setup (`User=test` convention)
-3. Clean stale ControlMaster socket from any previous run: `ossh connection.close`, then remove the socket `private.ossh.control.path.resolved.get` names (`$OSSH_CONTROL_PATH` with `%C` expanded by `ssh -G`; T-OSSH-CONTROL-PATH-RESOLVED-GET)
-4. `sshpass` opens a ControlMaster connection (password via `$SSHPASS` env var, runs `true` to avoid background fork race)
-5. `ossh key.push` — pushes SSH key, reusing the ControlMaster socket (no password prompt)
-6. Configure `NOPASSWD` sudo for `test` on the ephemeral container
-7. `ossh prereqs.install <platform>` — installs `curl + git` on the remote (and additionally `bash + shadow + util-linux` on apk hosts like alpine, where the base image ships only busybox + ash)
+1. `odocker reset <image>` — fresh container with SSH access on port 8022
+2. Steps 2–6 are odocker's building blocks, shared with `odocker container.oosh.install`
+   (T-OS-PLATFORM-TEST-USES-CONTAINER-BLOCKS): `private.odocker.container.ssh.config` — `ossh config.create`
+   / `ossh config.save.last` (`User=test` convention), the old Host and host key removed first
+3. `private.odocker.container.ssh.master` — closes a stale ControlMaster, removes its socket
+   (`private.ossh.control.path.resolved.get`, T-OSSH-CONTROL-PATH-RESOLVED-GET), then `sshpass` opens a new one
+   (password via `$SSHPASS`, `true` to avoid the background fork race), retried until sshd answers
+4. `ossh key.push` — pushes the SSH key, reusing the ControlMaster socket (no password prompt)
+5. `private.odocker.container.sudo.nopasswd` — `NOPASSWD` sudo for `test` on the ephemeral container
+6. `ossh install <platform> test` — init/oosh installs its own prereqs (git via the detected PM, bash 4+ on
+   macOS); then `private.odocker.container.sshd.reload` re-execs sshd and the master is reopened for the new groups
+7. (no separate `ossh prereqs.install` step any more)
 8. **Phase A — installs:**
    - `ossh install <platform> test` — root + test initial install
    - `ossh exec <platform> "user create oosh-user password oosh-user"` — creates oosh-user

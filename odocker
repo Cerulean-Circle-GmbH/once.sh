@@ -1763,6 +1763,209 @@ odocker.reset() # <image> <?portOrOffset:0> <?docker> <?name> # stop container, 
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# A CONTAINER WITH SSH, READY TO USE
+# ─────────────────────────────────────────────────────────────────────────────
+# By hand it was five commands, plus ossh install (docs/odocker.md Quick
+# start). The steps are os platform.test's (sshpass for the first login, a
+# NOPASSWD sudo rule for the install), as building blocks both use
+# (T-ODOCKER-CONTAINER-SSH-*, T-OS-PLATFORM-TEST-USES-CONTAINER-BLOCKS).
+
+private.odocker.image.sshd.is()     # <image> # rc 0 when <image> exposes 22/tcp, i.e. it starts sshd #
+{
+  docker image inspect -f '{{json .Config.ExposedPorts}}' "$1" 2>/dev/null | grep -q '"22/tcp"'
+}
+
+private.odocker.image.list.sshd()     #  # echo the local images that start sshd (expose 22/tcp), one per line #
+{
+  # NO create.result — a getter consumed as $(...) and by Tab.
+  local image
+  private.odocker.image.list | while IFS= read -r image; do
+    private.odocker.image.sshd.is "$image" && echo "$image"
+  done
+}
+
+private.odocker.port.user.get()     # <port> # echo the name of the container (running or stopped) that publishes <port>; nothing when none #
+{
+  # NO create.result — a getter consumed as $(...).
+  docker ps -a --filter "publish=$1" --format '{{.Names}}' 2>/dev/null | head -1
+}
+
+private.odocker.container.ssh.config()     # <name> <user> <port> # make <name> the Host for <user>@localhost:<port> in ~/.ssh/config — an older <name> block and the old host key of the port go first; rc 1 + RESULT naming the step that failed #
+{
+  local name="$1" user="$2" port="$3"
+  if [ -z "$name" ] || [ -z "$user" ] || [ -z "$port" ]; then
+    create.result 1 "private.odocker.container.ssh.config requires <name> <user> <port>"
+    return $(result)
+  fi
+  # A recreated container has a new host key, and config.save.last refuses a
+  # Host that is already there: both go first (config.delete rc 2 = was none).
+  ossh config.delete "$name" >/dev/null 2>&1
+  ossh known.hosts.remove localhost "$port" >/dev/null 2>&1
+  if ! ossh config.create "$name" "$user@localhost:$port" >/dev/null 2>&1; then
+    create.result 1 "ossh config.create $name $user@localhost:$port failed"
+    return $(result)
+  fi
+  if ! ossh config.save.last >/dev/null 2>&1; then
+    create.result 1 "ossh config.save.last failed for $name"
+    return $(result)
+  fi
+  create.result 0 "$name"
+  return $(result)
+}
+
+private.odocker.container.ssh.master()     # <name> <password> <?tries:10> # open the ssh ControlMaster to Host <name> with <password> (sshpass), retrying until sshd answers — ossh then asks no password; rc 1 + RESULT when it never answers #
+{
+  # sshd needs a moment after the container is Up; a fixed sleep failed a
+  # slow one (T-ODOCKER-CONTAINER-SSH-START-WAITS). `true` instead of -N -f:
+  # sshpass and a backgrounded ssh race (os platform.test).
+  local name="$1" password="$2" tries="${3:-10}" i socket
+  if [ -z "$name" ] || [ -z "$password" ]; then
+    create.result 1 "private.odocker.container.ssh.master requires <name> <password>"
+    return $(result)
+  fi
+  command -v sshpass >/dev/null 2>&1 || oo cmd sshpass >/dev/null 2>&1
+  if ! command -v sshpass >/dev/null 2>&1; then
+    create.result 1 "sshpass is missing — install it with: oo cmd sshpass"
+    return $(result)
+  fi
+  private.this.script.load ossh private.ossh.control.path.get || { create.result 1 "ossh not found in $OOSH_DIR"; return $(result); }
+  : ${OSSH_CONTROL_PATH:="$(private.ossh.control.path.get)"}
+  export OSSH_CONTROL_PATH
+  ossh connection.close "$name" >/dev/null 2>&1
+  socket=$(private.ossh.control.path.resolved.get "$name") && rm -f "$socket"
+  for i in $(seq 1 "$tries"); do
+    if SSHPASS="$password" sshpass -e ssh -o ControlMaster=yes -o ControlPath="$OSSH_CONTROL_PATH" \
+         -o ControlPersist=600 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$name" true >/dev/null 2>&1; then
+      create.result 0 "$name"
+      return $(result)
+    fi
+    sleep 2
+  done
+  create.result 1 "no ssh login to $name after $tries tries — is sshd up, is the password right?"
+  return $(result)
+}
+
+private.odocker.container.sudo.nopasswd()     # <name> <user> <password> # let <user> run sudo without a password in the container behind Host <name> — the install's sudo would ask; root needs none; rc 1 + RESULT when it cannot be set #
+{
+  local name="$1" user="$2" password="$3"
+  if [ -z "$name" ] || [ -z "$user" ]; then
+    create.result 1 "private.odocker.container.sudo.nopasswd requires <name> <user> <password>"
+    return $(result)
+  fi
+  if [ "$user" = root ]; then
+    create.result 0 "root needs no sudo rule"
+    return $(result)
+  fi
+  # Appended, so it is the last rule: it must win over %wheel on Alpine.
+  if ! ossh exec "$name" "echo '$password' | sudo -S sh -c 'echo \"$user ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'" >/dev/null 2>&1; then
+    create.result 1 "could not give $user sudo without a password on $name"
+    return $(result)
+  fi
+  create.result 0 "$user may sudo without a password on $name"
+  return $(result)
+}
+
+private.odocker.container.sshd.reload()     # <port> # re-exec the sshd of the container publishing <port> after an in-place openssh upgrade during the install; nothing when no container publishes it #
+{
+  # The in-container git install (init/oosh's prereq step, `dnf -y install
+  # git`) can upgrade openssh-server in place: AlmaLinux 9.8 shipped 9.9p1
+  # while the image bakes in 8.7p1. sshd re-execs /usr/sbin/sshd for every new
+  # connection, so once the binary on disk no longer matches the running
+  # master, every FRESH connection dies pre-banner. Re-exec it via docker, not
+  # ssh — ssh is what is broken. SIGHUP keeps the listener up. (Moved here
+  # from os platform.test, which uses it through private.os.platform.sshd.reload.)
+  local containerId
+  containerId=$(docker ps -q --filter "publish=$1" 2>/dev/null | head -1)
+  [ -z "$containerId" ] && return 0
+  console.log "Re-exec sshd on $containerId (pick up any in-place openssh upgrade)"
+  odocker.exec.command "$containerId" '
+    pid=$(cat /run/sshd.pid 2>/dev/null || cat /var/run/sshd.pid 2>/dev/null)
+    [ -z "$pid" ] && pid=$(pidof sshd 2>/dev/null)
+    [ -n "$pid" ] && kill -HUP $pid
+  ' 2>/dev/null
+  sleep 1
+}
+
+odocker.container.ssh.start()     # <image> <?name> <?portOrOffset:0> <?user:test> <?password:test> # start a container of <image> with sshd and make it the Host <name> in ~/.ssh/config (<user>@localhost:8022+offset) with your key pushed — then ossh login <name>, ossh install <name> or odocker enter <name>; an older container and Host of <name> are replaced, a port another container uses is refused #
+{
+  local image="$1" name="$2" offset port user="${4:-test}" password="${5:-test}" busy
+  if [ -z "$image" ]; then
+    create.result 1 "usage: odocker container.ssh.start <image> <?name> <?portOrOffset:0> <?user:test> <?password:test>"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  if ! private.odocker.image.sshd.is "$image"; then
+    create.result 1 "image $image has no sshd (22/tcp) — images that have one: $(private.odocker.image.list.sshd | tr '\n' ' ')"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  offset=$(private.odocker.port.offset "$3")
+  port=$((8022 + offset))
+  [ -n "$name" ] || name=$(private.odocker.container.name.new "$image")
+  if [ -z "$name" ]; then
+    create.result 1 "could not name a new container of $image"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  # Unlike odocker reset, nothing else is removed: another container on the
+  # port is named and left alone. The same <name> again is this one — replaced
+  # (T-ODOCKER-CONTAINER-SSH-START-PORT-BUSY).
+  busy=$(private.odocker.port.user.get "$port")
+  if [ -n "$busy" ] && [ "$busy" != "$name" ]; then
+    create.result 1 "port $port is used by container $busy — choose another <portOrOffset>, or remove it: odocker rm $busy"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  docker rm -f "$name" >/dev/null 2>&1
+  if ! odocker.run.sshd "$image" "$name" "$offset" >/dev/null; then
+    create.result 1 "could not start a container of $image as $name"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  private.odocker.container.ssh.config "$name" "$user" "$port" || { error.log "$RESULT"; return $(result); }
+  private.odocker.container.ssh.master "$name" "$password" || { error.log "$RESULT"; return $(result); }
+  if ! ossh key.push "$name" >/dev/null 2>&1; then
+    create.result 1 "ossh key.push $name failed"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  success.log "$name is ready: ssh -p $port $user@localhost — now ossh login $name, ossh install $name or odocker enter $name"
+  create.result 0 "$name"
+  return $(result)
+}
+
+odocker.container.ssh.start.completion.image() {
+  # Only images that start sshd; the class-level image completion lists all.
+  private.odocker.image.list.sshd
+}
+
+odocker.container.oosh.install()     # <image> <?name> <?portOrOffset:0> <?user:test> <?password:test> # odocker container.ssh.start, then oosh for <user>: sudo without a password for it, ossh install <name> <user>, sshd re-exec — ossh login <name> lands in the oosh shell #
+{
+  local offset port user="${4:-test}" password="${5:-test}" name
+  odocker.container.ssh.start "$@" || return $(result)
+  name="$RESULT"
+  offset=$(private.odocker.port.offset "$3")
+  port=$((8022 + offset))
+  private.odocker.container.sudo.nopasswd "$name" "$user" "$password" || { error.log "$RESULT"; return $(result); }
+  if ! ossh install "$name" "$user"; then
+    create.result 1 "ossh install $name $user failed — see above"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  private.odocker.container.sshd.reload "$port"
+  # The master was opened before the install added <user> to dev: the next
+  # login gets the new groups only on a fresh connection.
+  ossh connection.close "$name" >/dev/null 2>&1
+  success.log "oosh is installed on $name — ossh login $name"
+  create.result 0 "$name"
+  return $(result)
+}
+
+odocker.container.oosh.install.completion.image() {
+  private.odocker.image.list.sshd
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CONTAINER OPERATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2546,6 +2749,12 @@ odocker.parameter.completion.service() {
 
 odocker.parameter.completion.docker() {
   echo "docker"
+}
+
+odocker.parameter.completion.user() {
+  # the users the naked images log in with (container.ssh.start, container.oosh.install)
+  echo test
+  echo root
 }
 
 odocker.start()

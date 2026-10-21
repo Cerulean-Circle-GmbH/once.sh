@@ -239,13 +239,41 @@ odocker run.sshd naked_ubuntu_24_04 second_container 9022
 # Reset: stop old container, clear SSH key, start fresh
 odocker reset naked_ubuntu_24_04
 
-# Then use ossh to install oosh into the container
+# A container with ssh, ready to use, in one command: started, the Host
+# <name> in ~/.ssh/config (test@localhost:8022+offset), your key pushed
+odocker container.ssh.start naked_ubuntu_24_04 boxone 3
+ossh login boxone                      # no password
+
+# … and with oosh installed for test, in one command
+odocker container.oosh.install naked_debian_12 boxtwo 4
+ossh login boxtwo                      # lands in [oosh boxtwo] test@<id>
+
+# The same steps by hand
 ossh config.create mycontainer test@localhost:8022
 ossh config.save.last
 ossh key.push mycontainer
 ossh install mycontainer test
 ossh login mycontainer
 ```
+
+### A container with ssh, ready to use
+
+`odocker container.ssh.start <image> <?name> <?portOrOffset:0> <?user:test> <?password:test>` and
+`odocker container.oosh.install` (same parameters) do the steps above in one go:
+
+1. the image must start sshd (it exposes `22/tcp`); Tab after `<image>` offers only such images;
+2. the ssh port is `8022+offset` — a port **another** container uses is refused (odocker reset would
+   remove it); the same `<name>` again replaces that container and its Host block;
+3. the container starts (`run.sshd`), the old Host `<name>` and the old host key of the port go, the
+   new Host is created and saved (`ossh config.create` + `config.save.last`);
+4. the first login uses `<password>` once (sshpass, retried until sshd answers), your key is pushed
+   (`ossh key.push`) — from then on no password;
+5. `container.oosh.install` adds: sudo without a password for `<user>` (root needs none), `ossh install
+   <name> <user>`, sshd re-exec after an in-place openssh upgrade, a fresh connection for the new groups.
+
+Without `<name>` the container gets Docker's random name, and the Host the same one. The naked images
+log in as `test`/`test`; `naked_ubuntu_26_04_root` only as `root root`. `os platform.test` uses the same
+building blocks (`private.odocker.container.*`).
 
 ## Port Mapping
 

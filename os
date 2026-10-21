@@ -155,30 +155,8 @@ private.os.platform.cleanup() { # <port> # stops and removes Docker container on
   fi
 }
 
-private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd after an in-place openssh upgrade during install
-  # The in-container git install (init/oosh's prereq step, `dnf -y install git`)
-  # can upgrade openssh-server *in place*: AlmaLinux 9.8 shipped openssh
-  # 9.9p1-7.el9_8, while the test image still bakes in 8.7p1, so dnf swaps
-  # /usr/sbin/sshd out from under the running daemon. AlmaLinux sshd re-execs
-  # /usr/sbin/sshd for every new connection, so once the on-disk binary no
-  # longer matches the running master, every FRESH connection dies pre-banner
-  # ("kex_exchange_identification: Connection closed by remote host"). Already
-  # established connections survive — which is why the install itself finishes
-  # but Phase B (fresh connections, after the ControlMaster is dropped) fails on
-  # all users. We own the container and SSH itself is what's broken, so re-exec
-  # sshd via odocker (docker), not ssh. SIGHUP makes sshd re-exec the (new)
-  # binary while keeping the listener up. No-op when no container publishes the
-  # port (e.g. native runs).
-  local containerId
-  containerId=$(private.os.platform.container.id "$1")
-  [ -z "$containerId" ] && return 0
-  console.log "Re-exec sshd on $containerId (pick up any in-place openssh upgrade)"
-  odocker exec.command "$containerId" '
-    pid=$(cat /run/sshd.pid 2>/dev/null || cat /var/run/sshd.pid 2>/dev/null)
-    [ -z "$pid" ] && pid=$(pidof sshd 2>/dev/null)
-    [ -n "$pid" ] && kill -HUP $pid
-  ' 2>/dev/null
-  sleep 1
+private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd after an in-place openssh upgrade during install — private.odocker.container.sshd.reload
+  private.this.script.load odocker private.odocker.container.sshd.reload && private.odocker.container.sshd.reload "$@"
 }
 
 private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI workflow for native platform testing
@@ -347,18 +325,6 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   imageTag=$(private.os.platform.image.from.workspace "$PLATFORM_WORKSPACE")
   sshPort=8022
 
-  # Ensure sshpass is available for automated first-connection password
-  if ! command -v sshpass >/dev/null 2>&1; then
-    console.log "Installing sshpass for automated platform testing..."
-    oo cmd sshpass
-  fi
-
-  # Set control path so sshpass and ossh subprocesses share the same socket —
-  # ossh's answer, one that fits a Unix socket (T-OSSH-CONTROL-PATH-SHORT)
-  private.this.script.load ossh private.ossh.control.path.get || { create.result 1 "ossh not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
-  : ${OSSH_CONTROL_PATH:="$(private.ossh.control.path.get)"}
-  export OSSH_CONTROL_PATH
-
   console.log "Testing platform: $platform (image: $imageTag)"
 
   # Auto-build if image doesn't exist
@@ -376,35 +342,20 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   # install inside reads the name through the mounted socket:
   # [oosh <name>] <user>@<ID>, as odocker status pairs them.
   odocker reset "$imageTag" "$sshPort"
-  sleep 2
-
-  # SSH setup
-  ossh config.create "$platform" "test@localhost:$sshPort"
-  ossh config.save.last
-  # Clean up any stale ControlMaster socket from a previous test run: close
-  # the master, then remove the socket a dead one left. Its name is
-  # $OSSH_CONTROL_PATH with %C expanded, which only ssh knows — it was
-  # "/tmp/ossh-test@localhost:$sshPort", a name from before %C that never
-  # existed (T-OSSH-CONTROL-PATH-RESOLVED-GET).
-  local socket
-  ossh connection.close "$platform" >/dev/null 2>&1
-  socket=$(private.ossh.control.path.resolved.get "$platform") && rm -f "$socket"
-
-  # Open ControlMaster with sshpass (first connection, no keys yet)
-  # Run 'true' instead of -N -f to avoid sshpass/ssh background fork race condition
-  SSHPASS=test sshpass -e ssh \
-    -o ControlMaster=yes \
-    -o ControlPath="$OSSH_CONTROL_PATH" \
-    -o ControlPersist=600 \
-    -o StrictHostKeyChecking=accept-new \
-    "$platform" true
+  # The Host, the first login, the key, the sudo rule, the install and the
+  # sshd re-exec are odocker container.oosh.install's building blocks — one
+  # copy for both (T-OS-PLATFORM-TEST-USES-CONTAINER-BLOCKS). Here on the fixed
+  # port 8022 that odocker reset cleared above, as the user test. The master
+  # also exports OSSH_CONTROL_PATH, which Phase B's ossh calls share.
+  private.this.script.load odocker private.odocker.container.ssh.config || { create.result 1 "odocker not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
+  private.odocker.container.ssh.config "$platform" test "$sshPort" || error.log "$RESULT"
+  private.odocker.container.ssh.master "$platform" test || error.log "$RESULT"
 
   # Push key — reuses ControlMaster socket, no password prompt
   ossh key.push "$platform"
 
-  # Configure passwordless sudo for automated testing (container is ephemeral)
-  # Append to /etc/sudoers (must be last rule to override %wheel on Alpine)
-  ossh exec "$platform" "echo 'test' | sudo -S sh -c 'echo \"test ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'"
+  # Passwordless sudo for test (the container is ephemeral)
+  private.odocker.container.sudo.nopasswd "$platform" test test || error.log "$RESULT"
 
   # Install oosh. init/oosh's POSIX prelude handles its own prereqs
   # (git via the detected PM, bash 4+ on macOS, /etc/paths.d wiring) —
@@ -415,22 +366,13 @@ os.platform.test() # <platform> <?terminal> <?notests> # tests oosh installation
   ossh install "$platform" test
 
   # The git install above may upgrade openssh-server in place (AlmaLinux 9.8
-  # shipped 9.9p1). sshd re-execs per connection, so the running pre-upgrade
-  # daemon refuses every FRESH connection until it re-execs the new binary.
-  # Re-exec it now so the ControlMaster refresh below — and all of Phase B —
-  # connect cleanly. See private.os.platform.sshd.reload.
-  private.os.platform.sshd.reload "$sshPort"
+  # shipped 9.9p1): re-exec sshd so the master refresh below — and all of
+  # Phase B — connect cleanly (private.odocker.container.sshd.reload).
+  private.odocker.container.sshd.reload "$sshPort"
 
   # Refresh ControlMaster so new sessions pick up dev group membership
   # (usermod -aG dev runs during install, but ControlMaster keeps old groups)
-  ossh connection.close "$platform" 2>/dev/null
-  socket=$(private.ossh.control.path.resolved.get "$platform") && rm -f "$socket"
-  SSHPASS=test sshpass -e ssh \
-    -o ControlMaster=yes \
-    -o ControlPath="$OSSH_CONTROL_PATH" \
-    -o ControlPersist=600 \
-    -o StrictHostKeyChecking=accept-new \
-    "$platform" true
+  private.odocker.container.ssh.master "$platform" test || error.log "$RESULT"
 
   # ─── PHASE A: install all 4 users (no tests yet) ────────────────────────
   # Covers every install path we support in one run:

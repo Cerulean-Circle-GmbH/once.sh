@@ -348,6 +348,26 @@ test.case $level "T-OS-PLATFORM-PARSE-CHECK: bash -n of every tracked shell file
 expect 0 "the shell files of a tree parsed with the bash of a platform image; the ones that do not are named" \
   "test.oo did not load on almalinux_9 (bash 5.1) — only a promotion's platform test found it"
 
+
+# T-OS-PLATFORM-TEST-USES-CONTAINER-BLOCKS: os platform.test and odocker container.oosh.install share one chain
+# The Host, the first login with sshpass, the sudo rule and the sshd re-exec
+# were written out in os platform.test; odocker container.oosh.install needs
+# the same steps. Both use the private.odocker.container.* building blocks —
+# os keeps no sshpass line of its own.
+test.os.platformTestUsesContainerBlocks() {
+  local body bad="" b
+  body=$(declare -f os.platform.test)
+  for b in private.odocker.container.ssh.config private.odocker.container.ssh.master \
+           private.odocker.container.sudo.nopasswd private.odocker.container.sshd.reload; do
+    case "$body" in *"$b"*) ;; *) bad="$bad missing:$b" ;; esac
+  done
+  case "$body" in *"sshpass -e"*) bad="$bad ownSshpass" ;; esac
+  [ -z "$bad" ] && create.result 0 "one chain, in odocker" || create.result 1 "platform.test:$bad"
+  return $(result)
+}
+test.case $level "T-OS-PLATFORM-TEST-USES-CONTAINER-BLOCKS: os platform.test uses odocker's container building blocks" test.os.platformTestUsesContainerBlocks
+expect 0 "one chain, in odocker" "the container chain was written twice, in os and in odocker"
+
 ### test.method
 
 test.suite.save.results
