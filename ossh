@@ -2865,17 +2865,24 @@ private.ossh.key.push()     # <toHost> <?keyName> <?sshDir:~/.ssh> # add your ke
 
   private.get.sshDir "$1"
   [ -n "$1" ] && shift
-  local sshDir="$RESULT"
+  local sshDir="$RESULT" keyFile="" identity
+  # Without <keyName> the key the Host entry logs in with: the own key went
+  # instead, and a Host with another IdentityFile (Mac Studio container,
+  # tart VM, 2026-10-21) kept asking the password (T-OSSH-KEY-PUSH-IDENTITY).
+  if [ -z "$keyName" ] && identity="$(private.ossh.key.push.identity.get "$toHost" "$sshDir")"; then
+    keyFile="${identity%%	*}"; keyName="${identity#*	}"
+  fi
   [ -n "$keyName" ] || keyName="$( private.ossh.get.file.name "$sshDir" ).public_key"
+  [ -n "$keyFile" ] || keyFile="$sshDir/public_keys/$keyName"
 
   # Quote keyName everywhere — defensive against legacy filenames
   # that may have spaces (pre-sanitization at private.ossh.set.key.name).
-  info.log "$sshDir/public_keys/$keyName -> $toHost:.ssh/public_keys/$keyName"
+  info.log "$keyFile -> $toHost:.ssh/public_keys/$keyName"
   ossh.connection.open "$toHost" || return $(result)   # no master: every step would ask the password again (T-OSSH-CONNECTION-OPEN-FAIL)
   # The key file first — no rebuild on <toHost> without it: the copy's rc
   # was ignored, and a missing file still ran the rebuild there
   # (T-OSSH-REMOTE-PUBLIC-KEY-PUT).
-  private.ossh.remote.public.key.put "$toHost" "$sshDir/public_keys/$keyName" "$keyName" || {
+  private.ossh.remote.public.key.put "$toHost" "$keyFile" "$keyName" || {
     error.log "$RESULT"; return $(result)
   }
   # An oosh on <toHost> without authorized.keys.update: the key is only added.
@@ -2883,17 +2890,48 @@ private.ossh.key.push()     # <toHost> <?keyName> <?sshDir:~/.ssh> # add your ke
   # found" on every push (T-OSSH-KEY-PUSH-BARE-QUIET). One RESULT per way out:
   # the push ended with the pipeline's rc, and a failed fallback said nothing
   # (T-OSSH-REMOTE-PUBLIC-KEY-PUT).
+  local how
   if ossh.exec "$toHost" "command -v user >/dev/null 2>&1 && user authorized.keys.update"; then
-    create.result 0 "$keyName authorized on $toHost (rebuild)"
-    success.log "$RESULT"
+    how="$keyName authorized on $toHost (rebuild)"
   elif private.ossh.authorized.key.append.get "$keyName" | private.ossh.ssh "$toHost" "sh"; then
-    create.result 0 "$keyName added to $toHost's authorized_keys"
-    success.log "$RESULT"
+    how="$keyName added to $toHost's authorized_keys"
   else
     create.result 1 "could not authorize $keyName on $toHost"
     error.log "$RESULT"
+    return $(result)
+  fi
+  # Authorized is not logged in: key.push said SUCCESS while every login
+  # still asked the password. A key login without the master says which
+  # (as private.ossh.install.key.authorize checks it).
+  if private.ossh.ssh -oBatchMode=yes -oControlPath=none "$toHost" true 2>/dev/null; then
+    create.result 0 "$how"
+    success.log "$RESULT"
+  else
+    create.result 0 "$how — but the key login to $toHost fails: does its IdentityFile name this key? (ossh config.get $toHost)"
+    warn.log "$RESULT"
   fi
   return $(result)
+}
+
+private.ossh.key.push.identity.get()     # <toHost> <sshDir> # echo "<pubFile><TAB><keyName>" for the key Host <toHost> logs in with — the .pub of its IdentityFile, named like the public_keys/ file that holds the same key, else <own name>.<file>.public_key — nothing and rc 1 when the Host names no IdentityFile or it has no .pub #
+{
+ # NO create.result — a getter consumed as $(...) (T-OSSH-KEY-PUSH-IDENTITY).
+ # A path with ssh's %-tokens is not one file: left to the own key.
+ local toHost="$1" sshDir="$2" id pub body f
+ id="$(private.ossh.config.identityFile.get "$toHost")" || return 1
+ case "$id" in (*%*|"") return 1 ;; esac
+ id="${id/#\~/$HOME}"
+ pub="$id.pub"
+ [ -f "$pub" ] || return 1
+ body="$(awk '{print $2; exit}' "$pub")"
+ [ -n "$body" ] || return 1
+ for f in "$sshDir"/public_keys/*.public_key; do
+   [ -f "$f" ] || continue
+   [ "$(awk '{print $2; exit}' "$f")" = "$body" ] || continue
+   printf '%s\t%s\n' "$pub" "${f##*/}"
+   return 0
+ done
+ printf '%s\t%s\n' "$pub" "$(private.ossh.get.file.name "$sshDir").${id##*/}.public_key"
 }
 
 private.ossh.authorized.key.append.get()     # <keyFileName> # echo the POSIX commands that add ~/.ssh/public_keys/<keyFileName> to ~/.ssh/authorized_keys of the shell that runs them — only when it is not there; no other key is touched #
