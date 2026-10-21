@@ -191,7 +191,7 @@ RESULT: `seeded <root> from <source>: N added, M overwritten, K kept, U unchange
 …` (T-WS-SEED, T-WS-SEED-SOURCES, T-WS-SEED-MERGE). Until 2026-10-19 `<from>` had to be a local folder
 and a root that held any workspace was never written to.
 
-### `odocker workspace.push <?toHost> <?path>`
+### `odocker workspace.push <?toHost> <?image> <?path>`
 
 The twin of `seed`: brings the workspaces of **this** computer to the source every `seed` reads —
 by default WODA.test (`…source.host.get`), into the same folder (`…source.path.get`). Until
@@ -200,8 +200,16 @@ by default WODA.test (`…source.host.get`), into the same folder (`…source.pa
 
 ```bash
 odocker workspace.push                 # this computer's DockerWorkspaces → WODA.test
-odocker workspace.push WODA.test /path/to/DockerWorkspaces
+odocker workspace.push WODA.test nakedUbuntu/24.04 # only this image (also: naked_ubuntu_24_04)
+odocker workspace.push WODA.test nakedUbuntu        # the whole family, all its versions
+odocker workspace.push WODA.test all /path/to/DockerWorkspaces
 ```
+
+`<image>` (default `all`) limits the push to one image: its folder (`nakedUbuntu/24.04`), its image
+name (`naked_ubuntu_24_04`, the tag rule odocker builds with) or a whole family (`nakedUbuntu`); Tab
+offers all three. Only those units are compared and asked about. An image that is not in the
+root, one outside it (`../…`) or one of `old/` is refused with rc 2 before anything is fetched
+(T-WS-PUSH-IMAGE); RESULT then says `… for nakedUbuntu/24.04: …`.
 
 The Host tree is fetched first, as `seed` fetches it (only read, into a temp folder), and every
 unit here is compared with it — the same units as `seed`:
@@ -462,7 +470,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | `workspace.get <?path>` | directory path (optional) | With no argument: show the current Docker workspaces directory, where it is persisted, **and whether it is usable** — rc 1 when it is not. With a path: report whether **that** path would be a usable root. A reporter only; it never sets, persists or creates |
 | `workspace.init <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | **Create** the directory if it is absent, then hand over to `workspace.set`. Idempotent. The verb to use on a fresh host, where `workspace.set` would refuse because the directory is not there yet |
 | `workspace.seed <?from> <?path>` | a folder, an ossh Host or a URL (optional — default WODA.test, else test.wo-da.de); directory path (optional — the same default) | **Create** the root (via `workspace.init`), add what is missing from the source, ask before overwriting a differing unit, share it with group dev, set it. Refuses a local `<from>` that is missing (rc 2) or without Dockerfiles (rc 3); rc 1 when nothing could be fetched. See [workspace.seed](#odocker-workspaceseed-from-path) |
-| `workspace.push <?toHost> <?path>` | an ossh Host (optional — default WODA.test); the local root (optional — default `$ODOCKER_WORKSPACES`) | **Push** this computer's workspaces to the source `seed` reads: a missing unit added, a differing one only after a yes (its diff shown), nothing removed; `.claude`, `.backup.env`, `*.bak`, `old/` never sent. See [workspace.push](#odocker-workspacepush-tohost-path) |
+| `workspace.push <?toHost> <?image> <?path>` | an ossh Host (optional — default WODA.test); an image folder, image name or family (optional — default all); the local root (optional — default `$ODOCKER_WORKSPACES`) | **Push** this computer's workspaces to the source `seed` reads: a missing unit added, a differing one only after a yes (its diff shown), nothing removed; `.claude`, `.backup.env`, `*.bak`, `old/` never sent. See [workspace.push](#odocker-workspacepush-tohost-image-path) |
 | `workspace.set <?path>` | directory path (optional — defaults to `DockerWorkspaces` beside the Once.sh base) | Set workspace dir — canonicalised to absolute and persisted in `$CONFIG_PATH/odocker.env` (registered via `config add`). Calling with no args resets to that default |
 | `workspace.list` | | List all Dockerfile workspaces and their build status |
 
