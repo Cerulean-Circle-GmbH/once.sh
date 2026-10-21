@@ -1790,6 +1790,31 @@ private.odocker.port.user.get()     # <port> # echo the name of the container (r
   docker ps -a --filter "publish=$1" --format '{{.Names}}' 2>/dev/null | head -1
 }
 
+private.odocker.image.user.get()     # <image> <?user> # echo the user to log into <image> with: <user> when the image has it, else test when it has test, else root; nothing and rc 1 when a given <user> is not in the image #
+{
+  # NO create.result — a getter consumed as $(...). naked_ubuntu_26_04_root
+  # has only root: with test/test the first login failed ten times and a
+  # wrong Host stayed (T-ODOCKER-CONTAINER-SSH-START-USER). The image is asked
+  # once per user, without starting sshd.
+  local image="$1" user="$2"
+  private.odocker.image.user.has() { docker run --rm --entrypoint /bin/sh "$1" -c "id -u $2" >/dev/null 2>&1; }
+  if [ -n "$user" ]; then
+    private.odocker.image.user.has "$image" "$user" || return 1
+    echo "$user"
+  elif private.odocker.image.user.has "$image" test; then
+    echo test
+  else
+    echo root
+  fi
+}
+
+private.odocker.container.ssh.undo()     # <name> # remove the container <name> and its Host block again — a start that cannot log in leaves no half result #
+{
+  docker rm -f "$1" >/dev/null 2>&1
+  ossh config.delete "$1" >/dev/null 2>&1
+  return 0
+}
+
 private.odocker.ports.get()     # <offset> # echo the host ports odocker run.sshd publishes for <offset>, ssh first, one per line #
 {
   # NO create.result — a getter consumed as $(...). The same six as
@@ -1898,11 +1923,11 @@ private.odocker.container.sshd.reload()     # <port> # re-exec the sshd of the c
   sleep 1
 }
 
-odocker.container.ssh.start()     # <image> <?name> <?portOrOffset:0> <?user:test> <?password:test> # start a container of <image> with sshd and make it the Host <name> in ~/.ssh/config (<user>@localhost:8022+offset) with your key pushed — then ossh login <name>, ossh install <name> or odocker enter <name>; an older container and Host of <name> are replaced, a port another container uses is refused #
+odocker.container.ssh.start()     # <image> <?name> <?portOrOffset:0> <?user> <?password> # start a container of <image> with sshd and make it the Host <name> in ~/.ssh/config (<user>@localhost:8022+offset; without <user> the image's test, else root; the password defaults to the user) with your key pushed — then ossh login <name>, ossh install <name> or odocker enter <name>; an older container and Host of <name> are replaced, a port another container uses is refused #
 {
-  local image="$1" name="$2" offset port user="${4:-test}" password="${5:-test}" busy
+  local image="$1" name="$2" offset port user password busy
   if [ -z "$image" ]; then
-    create.result 1 "usage: odocker container.ssh.start <image> <?name> <?portOrOffset:0> <?user:test> <?password:test>"
+    create.result 1 "usage: odocker container.ssh.start <image> <?name> <?portOrOffset:0> <?user> <?password>"
     error.log "$RESULT"
     return $(result)
   fi
@@ -1911,6 +1936,13 @@ odocker.container.ssh.start()     # <image> <?name> <?portOrOffset:0> <?user:tes
     error.log "$RESULT"
     return $(result)
   fi
+  # The user the image has, before anything starts (T-ODOCKER-CONTAINER-SSH-START-USER).
+  if ! user=$(private.odocker.image.user.get "$image" "$4"); then
+    create.result 1 "image $image has no user $4 — without <user> it logs in as $(private.odocker.image.user.get "$image"), e.g.: odocker container.ssh.start $image ${2:-<name>} ${3:-0} $(private.odocker.image.user.get "$image")"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  password="${5:-$user}"
   offset=$(private.odocker.port.offset "$3")
   port=$((8022 + offset))
   [ -n "$name" ] || name=$(private.odocker.container.name.new "$image")
@@ -1939,8 +1971,10 @@ odocker.container.ssh.start()     # <image> <?name> <?portOrOffset:0> <?user:tes
     error.log "$RESULT"
     return $(result)
   fi
-  private.odocker.container.ssh.config "$name" "$user" "$port" || { error.log "$RESULT"; return $(result); }
-  private.odocker.container.ssh.master "$name" "$password" || { error.log "$RESULT"; return $(result); }
+  # From here on a failure removes the container and the Host again: no half
+  # result (happy_gould, 2026-10-21).
+  private.odocker.container.ssh.config "$name" "$user" "$port" || { error.log "$RESULT"; private.odocker.container.ssh.undo "$name"; return 1; }
+  private.odocker.container.ssh.master "$name" "$password" || { error.log "$RESULT"; private.odocker.container.ssh.undo "$name"; return 1; }
   if ! ossh key.push "$name" >/dev/null 2>&1; then
     create.result 1 "ossh key.push $name failed"
     error.log "$RESULT"
@@ -1956,11 +1990,14 @@ odocker.container.ssh.start.completion.image() {
   private.odocker.image.list.sshd
 }
 
-odocker.container.oosh.install()     # <image> <?name> <?portOrOffset:0> <?user:test> <?password:test> # odocker container.ssh.start, then oosh for <user>: sudo without a password for it, ossh install <name> <user>, sshd re-exec — ossh login <name> lands in the oosh shell #
+odocker.container.oosh.install()     # <image> <?name> <?portOrOffset:0> <?user> <?password> # odocker container.ssh.start (the same user and password rule), then oosh for <user>: sudo without a password for it, ossh install <name> <user>, sshd re-exec — ossh login <name> lands in the oosh shell #
 {
-  local offset port user="${4:-test}" password="${5:-test}" name
+  local offset port user password name
   odocker.container.ssh.start "$@" || return $(result)
   name="$RESULT"
+  # the user container.ssh.start logged in with (it checked it)
+  user=$(private.odocker.image.user.get "$1" "$4") || user="$4"
+  password="${5:-$user}"
   offset=$(private.odocker.port.offset "$3")
   port=$((8022 + offset))
   private.odocker.container.sudo.nopasswd "$name" "$user" "$password" || { error.log "$RESULT"; return $(result); }

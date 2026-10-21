@@ -258,7 +258,7 @@ ossh login mycontainer
 
 ### A container with ssh, ready to use
 
-`odocker container.ssh.start <image> <?name> <?portOrOffset:0> <?user:test> <?password:test>` and
+`odocker container.ssh.start <image> <?name> <?portOrOffset:0> <?user> <?password>` and
 `odocker container.oosh.install` (same parameters) do the steps above in one go:
 
 1. the image must start sshd (it exposes `22/tcp`); Tab after `<image>` offers only such images;
@@ -272,9 +272,12 @@ ossh login mycontainer
 5. `container.oosh.install` adds: sudo without a password for `<user>` (root needs none), `ossh install
    <name> <user>`, sshd re-exec after an in-place openssh upgrade, a fresh connection for the new groups.
 
-Without `<name>` the container gets Docker's random name, and the Host the same one. The naked images
-log in as `test`/`test`; `naked_ubuntu_26_04_root` only as `root root`. `os platform.test` uses the same
-building blocks (`private.odocker.container.*`).
+Without `<name>` the container gets Docker's random name, and the Host the same one. Without `<user>`
+the command asks the image: `test` when it has that user, else `root`; the password defaults to the user
+name — `test`/`test` for the naked images, `root`/`root` for `naked_ubuntu_26_04_root`. A given `<user>`
+the image does not have is refused before anything starts, and a first login that fails removes the
+container and the new Host again. `os platform.test` uses the same building blocks
+(`private.odocker.container.*`).
 
 ## Port Mapping
 
