@@ -1815,6 +1815,45 @@ private.odocker.container.ssh.undo()     # <name> # remove the container <name> 
   return 0
 }
 
+private.odocker.container.ssh.port.get()     # <container> # echo the host port the ssh port 22 of <container> is published on; nothing when it has none #
+{
+  # NO create.result — a getter consumed as $(...). Read BEFORE the container
+  # goes: docker port answers only while it exists.
+  docker port "$1" 22/tcp 2>/dev/null | head -1 | sed 's/.*://'
+}
+
+private.odocker.container.ssh.host.is()     # <name> <port> # rc 0 when the Host <name> in ~/.ssh/config points at this computer on <port> (HostName localhost or 127.0.0.1, Port <port>) — the entry odocker container.ssh.start writes #
+{
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  awk -v h="Host $1" -v p="$2" '
+    $0 == h { inb = 1; next }
+    inb && /^Host / { inb = 0 }
+    inb && /^[[:space:]]*$/ { inb = 0 }
+    inb && tolower($1) == "hostname" && ($2 == "localhost" || $2 == "127.0.0.1") { isLocal = 1 }
+    inb && tolower($1) == "port" && $2 == p { port = 1 }
+    END { exit !(isLocal && port) }
+  ' "$HOME/.ssh/config" 2>/dev/null
+}
+
+private.odocker.container.ssh.forget()     # <container> <port> # remove the Host <container> and the host key of localhost:<port> that odocker container.ssh.start made — only when that Host points at localhost:<port>; a Host of that name pointing elsewhere is kept #
+{
+  # container.remove and prune left a Host behind for every container
+  # (T-ODOCKER-CONTAINER-REMOVE-FORGETS-HOST); a Host named like the
+  # container but pointing elsewhere is somebody's server
+  # (T-ODOCKER-CONTAINER-REMOVE-KEEPS-OTHER-HOST).
+  local name="$1" port="$2"
+  [ -n "$name" ] && [ -n "$port" ] || return 0
+  if ! private.odocker.container.ssh.host.is "$name" "$port"; then
+    grep -qx "Host $name" "$HOME/.ssh/config" 2>/dev/null \
+      && console.log "Host $name in ~/.ssh/config does not point at localhost:$port — kept"
+    return 0
+  fi
+  ossh config.delete "$name" >/dev/null 2>&1
+  ossh known.hosts.remove localhost "$port" >/dev/null 2>&1
+  console.log "Host $name removed from ~/.ssh/config"
+  return 0
+}
+
 private.odocker.ports.get()     # <offset> # echo the host ports odocker run.sshd publishes for <offset>, ssh first, one per line #
 {
   # NO create.result — a getter consumed as $(...). The same six as
@@ -2116,18 +2155,23 @@ odocker.log.completion.container() {
   private.odocker.container.list.all
 }
 
-odocker.container.remove() # <container> # remove a stopped container
+odocker.container.remove() # <container> # remove a stopped container, and the ssh Host odocker container.ssh.start made for it
 {
-  local container="$1"
+  local container="$1" sshPort
   if [ -z "$container" ]; then
     echo "Usage: odocker container.remove <container>"
     return 1
   fi
 
+  # The ssh port while the container still exists; its Host goes only after
+  # the rm worked (T-ODOCKER-CONTAINER-REMOVE-RUNNING-KEEPS-HOST).
+  sshPort=$(private.odocker.container.ssh.port.get "$container")
+  [ -n "$sshPort" ] && ossh connection.close "$container" >/dev/null 2>&1
   docker rm "$container"
   local rc=$?
   if [ $rc -eq 0 ]; then
     success.log "Container $container removed"
+    private.odocker.container.ssh.forget "$container" "$sshPort"
   else
     error.log "Failed to remove $container (running? use odocker stop first)"
   fi
@@ -2668,14 +2712,18 @@ odocker.prune() # <container> # remove a stopped container and its image
   fi
 
   # Selective prune: remove container and its image
-  local image
+  local image sshPort
   image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+  sshPort=$(private.odocker.container.ssh.port.get "$container")
+  [ -n "$sshPort" ] && ossh connection.close "$container" >/dev/null 2>&1
 
   # Remove the container
   docker rm -f "$container" 2>/dev/null
   local rc=$?
   if [ $rc -eq 0 ]; then
     success.log "Container $container removed"
+    # and the ssh Host container.ssh.start made for it (T-ODOCKER-PRUNE-FORGETS-HOST)
+    private.odocker.container.ssh.forget "$container" "$sshPort"
   else
     error.log "Failed to remove container: $container"
     return $rc

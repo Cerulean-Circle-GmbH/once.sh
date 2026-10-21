@@ -2629,6 +2629,10 @@ test.odocker.containerSsh.run() { # <fx> <what...> # run <what...> with the stub
         # the user probe: an image named *_root* knows only root
         "run --rm --entrypoint /bin/sh "*)
           case "$*" in *_root*) case "$*" in *"id -u root"*) return 0 ;; *) return 1 ;; esac ;; esac ;;
+        # container.remove / prune: the published ssh port, a plain rm that may fail
+        "port "*" 22/tcp") echo "0.0.0.0:${FX_SSH_PORT:-8032}" ;;
+        "rm "[!-]*) return "${FX_RM_RC:-0}" ;;
+        "inspect --format {{.Config.Image}} "*) echo some_image ;;
       esac
       return 0
     }
@@ -2790,6 +2794,79 @@ test.odocker.imageListSshd() {
 }
 test.case $level "T-ODOCKER-IMAGE-LIST-SSHD: container.ssh.start and container.oosh.install complete <image> with images that start sshd" test.odocker.imageListSshd
 expect 0 "only images with sshd" "Tab offered images with no sshd, where the new command can only fail"
+
+
+# T-ODOCKER-CONTAINER-REMOVE-*: removing a container forgets the ssh Host container.ssh.start made for it
+# container.remove only ran docker rm: every container.ssh.start left a Host
+# behind, and ~/.ssh/config kept growing (the user, 2026-10-21). Only OUR
+# entry goes — Host <container> pointing at localhost:<its ssh port>, read
+# before the rm; a Host of that name pointing elsewhere is someone's server.
+test.odocker.containerRemove.config() { # <fx> <hostName> <port> # write a ~/.ssh/config with Host boxone → <hostName>:<port> into the fixture home #
+  mkdir -p "$1/home/.ssh"
+  printf 'Host other\n HostName example.org\n\nHost boxone\n User test\n Port %s\n HostName %s\n\n' "$3" "$2" > "$1/home/.ssh/config"
+}
+test.odocker.containerRemoveForgetsHost() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make odockerrmforgets)
+  test.odocker.containerRemove.config "$fx" localhost 8032
+  out=$(test.odocker.containerSsh.run "$fx" odocker.container.remove boxone)
+  printf '%s\n' "$out" | grep -qx 'docker rm boxone' || bad="$bad noRm"
+  printf '%s\n' "$out" | grep -qx 'ossh connection.close boxone' || bad="$bad noClose"
+  printf '%s\n' "$out" | grep -qx 'ossh config.delete boxone' || bad="$bad hostKept"
+  printf '%s\n' "$out" | grep -qx 'ossh known.hosts.remove localhost 8032' || bad="$bad keyKept"
+  printf '%s\n' "$out" | sed -n '/^docker rm boxone/,$p' | grep -q '^ossh config.delete' || bad="$bad deletedBeforeRm"
+  printf '%s\n' "$out" | grep -q '^rc=0 ' || bad="$bad rc=[$(printf '%s\n' "$out" | tail -1)]"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "the container and its Host are gone" || create.result 1 "remove:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-CONTAINER-REMOVE-FORGETS-HOST: odocker container.remove also removes the Host container.ssh.start made" test.odocker.containerRemoveForgetsHost
+expect 0 "the container and its Host are gone" "~/.ssh/config kept a Host for every removed container"
+
+test.odocker.containerRemoveKeepsOtherHost() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make odockerrmkeeps)
+  test.odocker.containerRemove.config "$fx" server.example.com 22
+  out=$(test.odocker.containerSsh.run "$fx" odocker.container.remove boxone)
+  printf '%s\n' "$out" | grep -q '^ossh config.delete' && bad="$bad deletedForeign"
+  printf '%s\n' "$out" | grep -q '^ossh known.hosts.remove' && bad="$bad keyForeign"
+  test.odocker.containerRemove.config "$fx" localhost 9999
+  out=$(test.odocker.containerSsh.run "$fx" odocker.container.remove boxone)
+  printf '%s\n' "$out" | grep -q '^ossh config.delete' && bad="$bad deletedOtherPort"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "a Host pointing elsewhere stays" || create.result 1 "keep:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-CONTAINER-REMOVE-KEEPS-OTHER-HOST: a Host of the same name that points elsewhere is kept" test.odocker.containerRemoveKeepsOtherHost
+expect 0 "a Host pointing elsewhere stays" "removing a container deleted a server Host of the same name"
+
+test.odocker.containerRemoveRunningKeepsHost() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make odockerrmrunning)
+  test.odocker.containerRemove.config "$fx" localhost 8032
+  out=$(FX_RM_RC=1 test.odocker.containerSsh.run "$fx" odocker.container.remove boxone)
+  printf '%s\n' "$out" | grep -qE '^ossh (config.delete|known.hosts.remove)' && bad="$bad forgotWhileRunning"
+  printf '%s\n' "$out" | grep -q '^rc=1 ' || bad="$bad rc=[$(printf '%s\n' "$out" | tail -1)]"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "a container that stays keeps its Host" || create.result 1 "running:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-CONTAINER-REMOVE-RUNNING-KEEPS-HOST: when docker rm fails (still running) the Host stays" test.odocker.containerRemoveRunningKeepsHost
+expect 0 "a container that stays keeps its Host" "the Host of a still running container was deleted"
+
+test.odocker.pruneForgetsHost() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make odockerpruneforgets)
+  test.odocker.containerRemove.config "$fx" localhost 8032
+  out=$(test.odocker.containerSsh.run "$fx" odocker.prune boxone)
+  printf '%s\n' "$out" | grep -qx 'ossh config.delete boxone' || bad="$bad hostKept"
+  printf '%s\n' "$out" | grep -qx 'ossh known.hosts.remove localhost 8032' || bad="$bad keyKept"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "prune forgets the Host too" || create.result 1 "prune:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-PRUNE-FORGETS-HOST: odocker prune also removes the Host container.ssh.start made" test.odocker.pruneForgetsHost
+expect 0 "prune forgets the Host too" "odocker prune left the Host of the removed container"
 
 ### test.method
 

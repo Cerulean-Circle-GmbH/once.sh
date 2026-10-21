@@ -279,6 +279,11 @@ the image does not have is refused before anything starts, and a first login tha
 container and the new Host again. `os platform.test` uses the same building blocks
 (`private.odocker.container.*`).
 
+**Removing.** `odocker container.remove <name>` (after `odocker stop <name>`) and `odocker prune <name>` also remove
+the Host `<name>` and the host key of its port — but only when that Host points at this container
+(`HostName localhost`, `Port` = its ssh port). A Host of the same name that points elsewhere, e.g. a server, is
+kept, and so is the Host of a container that could not be removed.
+
 ## Port Mapping
 
 Commands `run.sshd`, `up`, and `reset` accept an optional `<?portOrOffset:0>` parameter that controls host port mappings. It accepts **either** a port offset or an SSH port number:
