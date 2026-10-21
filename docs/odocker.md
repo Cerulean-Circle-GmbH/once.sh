@@ -232,7 +232,7 @@ unit here is compared with it — the same units as `seed`:
 **Never sent:** `.claude/`, `.backup.env`, `*.bak` and the whole `old/` family
 (`private.odocker.workspaces.push.filter`). What goes, goes as one `tar` over one ssh call; on the
 Host it is unpacked without the owners of this computer and given the owner of the Host root
-(`donges:dev` on WODA.test), the units and their family folders only. It does **not** commit: on
+(`donges:dev` on WODA.test), the units and their family folders only — as root owner and group; a login that is not root cannot give files away, so it sets the group only (a fresh root is `root:dev`) and a family folder only when it is its own. A Host whose root is still empty (freshly installed) gets every image (T-WS-PUSH-EMPTY-HOST). It does **not** commit: on
 WODA.test the files land in the EAMD.ucp checkout (`test/WODA245`) as changes, and `seed` reads them
 from there at once. rc 1 when the Host is no Host here, allows no key login or the copy fails —
 nothing is sent; rc 3 when `<path>` holds no Dockerfile workspace. RESULT: `pushed to
