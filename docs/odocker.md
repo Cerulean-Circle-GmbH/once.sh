@@ -153,7 +153,7 @@ the image families, `WODA/`, `old/`, `plantuml/`, `structr/` and the READMEs. Wh
 
 | `<from>` | Source |
 |---|---|
-| — (none) | the Host **WODA.test** over ossh (`private.odocker.workspaces.source.host.get`, `ODOCKER_SEED_HOST`) — its `…/DockerWorkspaces` in the EAMD.ucp checkout (`…source.path.get`, `ODOCKER_SEED_PATH`); when that Host is missing or allows no key login: **`https://test.wo-da.de/EAMD.ucp/…/DockerWorkspaces`** with wget (`…source.url.get`, `ODOCKER_SEED_URL`) |
+| — (none) | the Host **WODA.test** over ossh (`private.odocker.workspaces.source.host.get`, `ODOCKER_SEED_HOST`) — the root the Host names itself (`…host.path.get`: its own `odocker workspace.get`, else the old layout `/var/dev/EAMD.ucp/…/DockerWorkspaces` where that exists — WODA.test today); when that Host is missing or allows no key login: **`https://test.wo-da.de/EAMD.ucp/…/DockerWorkspaces`** with wget (`…source.url.get`, `ODOCKER_SEED_URL`) |
 | a Host of `~/.ssh/config` | that Host, the same path, no fallback |
 | `http(s)://…` | that URL with wget, no fallback |
 | a folder | that local tree, only read; rc 2 when it is missing, rc 3 without a Dockerfile |
@@ -194,7 +194,7 @@ and a root that held any workspace was never written to.
 ### `odocker workspace.push <?toHost> <?image> <?path>`
 
 The twin of `seed`: brings the workspaces of **this** computer to the source every `seed` reads —
-by default WODA.test (`…source.host.get`), into the same folder (`…source.path.get`). Until
+by default WODA.test (`…source.host.get`), into the root the Host names itself (`…host.path.get`, see below). Until
 2026-10-21 oosh could only fetch, so a changed Dockerfile (the naked images with
 `--no-install-recommends`, no Python) never reached WODA.test.
 
@@ -210,6 +210,14 @@ name (`naked_ubuntu_24_04`, the tag rule odocker builds with) or a whole family 
 offers all three. Only those units are compared and asked about. An image that is not in the
 root, one outside it (`../…`) or one of `old/` is refused with rc 2 before anything is fetched
 (T-WS-PUSH-IMAGE); RESULT then says `… for nakedUbuntu/24.04: …`.
+
+**Where on the Host** (push and seed alike, `private.odocker.workspaces.host.path.get`, user
+2026-10-21): the Host names its root itself — one ssh call runs its own `~/oosh/odocker
+workspace.get` (`/home/shared/…` on Linux, `/Users/shared/…` on macOS, or what `workspace.set` made
+it). Only when that gives no folder there — no oosh, an old one, or a broken odocker — the old
+layout `/var/dev/EAMD.ucp/…/DockerWorkspaces` is taken, and only where it exists (WODA.test today,
+`…legacy.path.get`). Otherwise rc 1: "<host> names no Docker workspaces root", nothing is copied.
+The former override `ODOCKER_SEED_PATH` is gone (T-WS-HOST-PATH).
 
 The Host tree is fetched first, as `seed` fetches it (only read, into a temp folder), and every
 unit here is compared with it — the same units as `seed`:
@@ -730,6 +738,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `odocker.workspaces.merge.answer` | `get` |  | `# <unit> <source> # echo y or n — the answer on the terminal to Overwrite <unit> (differs from <source>)? [y/N] — n without a terminal or for any other answer #` |  | `private.odocker.workspaces.merge.answer.get` |
 | `odocker.workspaces.mine` |  |  | `# <dir> # rc 0 when the caller may share <dir> without sudo: it owns <dir>, or it is root #` |  | `private.odocker.workspaces.mine` |
 | `odocker.workspaces.source.host` | `get` |  | `#  # echo the ossh Host workspace.seed fetches from first — ODOCKER_SEED_HOST, else WODA.test #` |  | `private.odocker.workspaces.source.host.get` |
-| `odocker.workspaces.source.path` | `get` |  | `#  # echo the folder on that Host that holds the Docker workspaces — ODOCKER_SEED_PATH, else /var/dev/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces #` |  | `private.odocker.workspaces.source.path.get` |
+| `odocker.workspaces.legacy.path` | `get` |  | `#  # echo the folder of the OLD layout, where a Host without a usable odocker keeps its Docker workspaces — WODA.test today #` |  | `private.odocker.workspaces.legacy.path.get` |
+| `odocker.workspaces.host.path` | `get` |  | `# <host> # echo the Docker workspaces root of <host> as the Host itself names it — its own odocker workspace.get, else the old layout where that folder exists there — nothing and rc 1 when it names none #` |  | `private.odocker.workspaces.host.path.get` |
 | `odocker.workspaces.source.url` | `get` |  | `#  # echo the URL workspace.seed downloads from when the Host cannot be used — ODOCKER_SEED_URL, else https://test.wo-da.de/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/DockerWorkspaces #` |  | `private.odocker.workspaces.source.url.get` |
 <!-- END generated: oosh method matrix -->
