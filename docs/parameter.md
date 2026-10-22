@@ -119,7 +119,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 |  | `claudeCode.path` | [`claudeCode.init`](claudeCode.md) · [`private.claudeCode.projectHash`](claudeCode.md) |
 |  | `claudeFlow.path` | [`claudeFlow.init`](claudeFlow.md) |
 |  | `log.path` | [`log.install.init`](log.md) |
-|  | `odocker.path` | [`odocker.workspace.get`](odocker.md) · [`odocker.workspace.init`](odocker.md) · [`odocker.workspace.seed`](odocker.md) · [`odocker.workspace.set`](odocker.md) · [`private.odocker.workspaces.install`](odocker.md) |
+|  | `odocker.path` | [`odocker.workspace.get`](odocker.md) · [`odocker.workspace.init`](odocker.md) · [`odocker.workspace.seed`](odocker.md) · [`odocker.workspace.set`](odocker.md) · [`odocker.workspace.install`](odocker.md) |
 |  | `ogit.path` | [`ogit.index.remove`](ogit.md) · [`ogit.safeDirectory.add`](ogit.md) · [`ogit.worktree.delete`](ogit.md) |
 |  | `oo.path` | [`oo.install`](oo.md) · [`oo.mode.base.set`](oo.md) · [`private.oo.path.sudo.get`](oo.md) · [`private.oo.path.writable.is`](oo.md) |
 |  | `otmux.path` | [`private.otmux.socketPath`](otmux.md) |

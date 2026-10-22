@@ -117,7 +117,7 @@ returns nothing. The workspaces tree lives in **EAMD.ucp**
 (`donges/eamd.ucp.git`) — a different repository. **Every install creates the
 root** — `DockerWorkspaces` beside the Once.sh components, shared with group
 `dev` — and the shared `$CONFIG_PATH/odocker.env` that names it, chained from
-`user.env` (`private.odocker.workspaces.install`; `oo update` as root heals an
+`user.env` (`odocker.workspace.install`; `oo update` as root heals an
 older host; an existing value is kept). But the root starts **empty**: `odocker
 build` / `odocker workspace.list` / `os platform.test` (when it has to build an
 image, `os:212-220`) will say so.
@@ -493,7 +493,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 > save's: when `odocker.env` does not hold the value afterwards (read back — the
 > save itself answers 0 when it cannot write the file) or the chain line in
 > `user.env` cannot be added, `workspace.set` answers rc 1, and so do
-> `workspace.init` and the install's `private.odocker.workspaces.install`
+> `workspace.init` and the install's `odocker.workspace.install`
 > (T-WS-SET-SAVE-FAILS).
 
 ### Build
@@ -756,7 +756,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `odocker.workspace` | `list` |  |  | `private.odocker.workspace.list` ✅ | `private.odocker.workspace.list` ✅ |
 | `odocker.workspaces` | `fetch` | `ssh` | `# <host> <stage> # copy the Docker workspaces folder of <host> into the empty folder <stage> with tar over one ssh call — rc 1 + RESULT when <host> is no Host here, allows no key login or the copy fails #` |  | `private.odocker.workspaces.fetch.ssh` |
 |  |  | `url` | `# <url> <stage> # download the Docker workspaces tree under <url> into the empty folder <stage> with wget, the listing pages left out — rc 1 + RESULT when wget is missing or the download gives no Dockerfile #` |  | `private.odocker.workspaces.fetch.url` |
-|  | `install` |  | `# <?path> # give this host its Docker workspaces root and the shared odocker.env that names it: keep an existing value, else create <path> (default beside the Once.sh base), share it with group dev and set it; idempotent #` |  | `private.odocker.workspaces.install` |
+|  | `install` |  | `# <?path> # give this host its Docker workspaces root and the shared odocker.env that names it: keep an existing value, else create <path> (default beside the Once.sh base), share it with group dev and set it; idempotent #` |  | `odocker.workspace.install` |
 |  | `merge` |  | `# <stage> <root> <?source> # put every unit of <stage> — a top-level file or a second-level entry — into <root>: a missing one copied, an identical one left, a differing one overwritten only after a yes on the terminal, an entry only in <root> untouched — RESULT counts added, overwritten, kept and unchanged #` |  | `private.odocker.workspaces.merge` |
 | `odocker.workspaces.default` | `get` |  | `#  # the Docker workspaces root beside the Once.sh components base: <parent of oo mode.base.get>/DockerWorkspaces, else beside the Once.sh folder that holds ~/oosh; rc 1 when neither is detectable #` |  | `private.odocker.workspaces.default.get` |
 | `odocker.workspaces.entry.same` |  |  | `# <sourceEntry> <localEntry> # rc 0 when <localEntry> is the same as <sourceEntry> — a symlink by its target, a file by its bytes — rc 1 when it differs or is missing #` |  | `private.odocker.workspaces.entry.same` |
