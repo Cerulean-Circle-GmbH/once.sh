@@ -336,7 +336,7 @@ the host is asked, and a remote answer with a `/`, a space or a `'` is no name
 stays allowed: without a `/` it cannot leave the folder.
 `<sshDir>` is the LOCAL folder the key lands in; on `<fromHost>` it is always
 `~/.ssh/public_keys/`. key.pull is rc 1 when it finds no key (what
-`private.user.authorized.key.get` reads as one) or cannot save it; a key saved
+`private.ossh.public.key.get` reads as one) or cannot save it; a key saved
 while this computer has no ssh set up is rc 0 with a warning — the rebuild
 said no, the next one authorizes it.
 
