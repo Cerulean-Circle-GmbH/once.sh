@@ -1,5 +1,8 @@
 # Config System Documentation
 
+> **Moved 2026-10-22:** the user repair (`oo user.init`, `oo user.check`, `oo shared.init`, `oo user.repair`) lived in `config` as `config init.user`, `init.check`, `init.shared`, `init.full`. It needs `user`, which made `config` and `user` load each other; in `oo` it may. The old `config init.*` commands still work: they are thin wrappers that run the `oo` command (T-OO-USER-INIT-MOVED).
+
+
 The `config` script provides persistent environment configuration management for oosh, storing variables in `~/config/` directory.
 
 ## Overview
@@ -64,7 +67,7 @@ The two tiers are linked by a source chain, exactly like `user.env` chains
 so each user loads their OWN file — no leak). So `config list log` shows the
 session file nested under it, and — because the chain is sourced at shell init —
 the saved per-user `LOG_NAME` (and the rest) are actually **loaded** each login,
-not just recorded. `config save log` and `config init.user` create the session file (`private.config.session.file.ensure`),
+not just recorded. `config save log` and `oo user.init` create the session file (`private.config.session.file.ensure`),
 so the chain line needs no guard and a first-ever shell has no missing-source error. See
 [Log System Documentation](log.md) for the per-user log vars.
 
@@ -83,7 +86,7 @@ branch **their** `~/oosh` points at — so `config list oosh` shows it nested, a
 | `user.env` | `. $HOME/.config/oosh/user.session.env` | `PATH` |
 | `oosh.env` | `. $HOME/.config/oosh/oosh.session.env` | `OOSH_MODE` |
 | `log.env` | `. $HOME/.config/oosh/log.session.env` | `LOG_NAME`, `LOG_LIVE`, `LOG_DEVICE` (only a file chosen with `log device <file>`, kept until `log device <terminal>`) | `config session.save` writes it; `config save` writes the saving
-user's; `config init.user` and the install create it for every user, filled in
+user's; `oo user.init` and the install create it for every user, filled in
 their own hop (`private.config.session.file.ensure`). The ensure creates and
 **first**-fills only — an empty `user.session.env` or a missing `oosh.session.env`;
 an empty `oosh.session.env` is legal (no branch derivable) and is left alone. One
@@ -131,7 +134,7 @@ portable `private.this.path.canonical` — never bake the resolution into the an
 |---|---|
 | install state 31 `ln -s … oosh` | linking `$OOSH_DIR` itself would create `~/oosh -> ~/oosh` |
 | install state 31 `OOSH_MODE` | the branch name is `basename` of the branch folder, not of the symlink |
-| `config.init.user` | decides "are we under the shared tree?" with a string-prefix test |
+| `oo.user.init` | decides "are we under the shared tree?" with a string-prefix test |
 | `promote` | `ogit worktree.find` answers with the physical folder of a stage |
 | `oo.mode.base.get` | strategies 3/4 do `dirname`/`basename` — `dirname ~/oosh` is just `$HOME` |
 
@@ -143,7 +146,7 @@ variable name lower-cased with `_` → `-`: `oosh-dir-exception`, `config-path-e
 |---|---|---|
 | `OOSH_DIR` | `oo.use` | runs one command from another branch without switching — a scoped child-process override |
 | `OOSH_DIR` | `ossh` remote invoke | a string executed on a remote host whose `~/oosh` does not exist yet |
-| `OOSH_DIR` | `user.oosh.install`, `config.init.user` hops | run as **another user** before their `~/oosh` exists; they source the shared tree |
+| `OOSH_DIR` | `user.oosh.install`, `oo.user.init` hops | run as **another user** before their `~/oosh` exists; they source the shared tree |
 | `OOSH_DIR` | `init/oosh` (file-wide) | the installer runs before `~/oosh` exists |
 | both | `private.config.variable.export.line` | writes the constants as data into the env files |
 | `CONFIG_PATH` | `config file <path>` | its job is to point the session at an arbitrary config file |
@@ -300,18 +303,18 @@ They explicitly do **not** add SGID 2775 to the files —
 and `g+w`; group ownership on writes is enforced by every writer calling
 `private.ensure.groupWrite`.
 
-#### `config.init.full [<username>]`
-Repair end-to-end: runs `config.init.shared`, then `config.init.user`, then
-`config.init.env` (only for self / root), then `config.init.check`. Defaults to
+#### `oo.user.repair [<username>]`
+Repair end-to-end: runs `oo.shared.init`, then `oo.user.init`, then
+`config.init.env` (only for self / root), then `oo.user.check`. Defaults to
 the calling user. Idempotent.
 
 ```bash
-./config init.full           # repair self
-sudo -E ./config init.full root  # repair root (sudo -E preserves OOSH_DIR/OOSH_MODE for the env-regen step)
-./config init.full bob       # repair bob (sudoer caller); env-regen skipped for bob
+./oo user.repair           # repair self
+sudo -E ./oo user.repair root  # repair root (sudo -E preserves OOSH_DIR/OOSH_MODE for the env-regen step)
+./oo user.repair bob       # repair bob (sudoer caller); env-regen skipped for bob
 ```
 
-#### `config.init.shared`
+#### `oo.shared.init`
 Finds the shared tree under `user get basehome root` (never through
 developking's home; a missing tree is rc 1, "shared tree missing at
 <base>/shared — run ossh install"). Ensures `sharedConfig/` is owned
@@ -337,10 +340,10 @@ folder loads root's `this`, from whatever branch root is on (Mac Studio,
 Idempotent.
 
 ```bash
-sudo -i ~root/oosh/config init.shared
+sudo -i ~root/oosh/oo shared.init
 ```
 
-#### `config.init.user [<username>]`
+#### `oo.user.init [<username>]`
 Ensures `<user>`'s `~/config` and `~/oosh` symlinks point at the canonical
 shared targets and are owned `<user>:<user>`. Pre-existing real `~/config` /
 `~/oosh` directories are renamed to `~/config.orig.<timestamp>` (data
@@ -349,8 +352,8 @@ OOSH section is missing from `~/.bashrc` (with a one-shot `~/.bashrc.pre-oosh`
 backup). Adds `<user>` to group `dev` if not already a member.
 
 ```bash
-./config init.user           # self
-./config init.user bob       # bob (caller must be root or sudoer)
+./oo user.init           # self
+./oo user.init bob       # bob (caller must be root or sudoer)
 ```
 
 #### `config.init.env`
@@ -371,7 +374,7 @@ If you tampered with `oosh.env` or `user.env`, this is the canonical fix.
 After running, `./test.suite run config 1`'s T30/T31 (self-anchor checks)
 will pass.
 
-#### `config.init.check [<username>]`
+#### `oo.user.check [<username>]`
 Diagnostic only — never modifies anything, always returns `0`. Reports the
 `~/config` symlink owner, the `sharedConfig/` group, presence of any
 self-referential symlink, and warns if the user is in `/etc/group`'s `dev`
@@ -379,7 +382,7 @@ membership but the *running shell's* active group set doesn't include it (the
 classic post-install "log out fully and log back in" condition).
 
 ```bash
-./config init.check
+./oo user.check
 ```
 
 ### Saving Configuration
@@ -427,7 +430,7 @@ export OOSH_MODE="dev"
 
 **The shared config and `$HOME`.** The `~/config` symlink points at a location shared by every user of the host (`…sharedConfig/`). So a value under the **saving** user's home is never written as that user's absolute path: `private.config.variable.export.line` writes it as `"$HOME/…"` (only the prefix — the rest keeps bash's `declare -p` quoting), and every reader expands it to their own home. `OOSH_DIR="$HOME/oosh"` and `CONFIG_PATH="$HOME/config"` are therefore correct for everyone. (The per-user directory is always `$HOME/.config/oosh`, spelled out where it is chained.) Pinned by `test/test.config` T29 and T-CONFIG-SAVE-PREFIX-OOSH.
 
-**Per-user session values.** `LOG_NAME`, `LOG_DEVICE` and `LOG_LIVE` are **not** saved in the shared `log.env`: a new user would inherit the saver's values. They live only in each user's private `$HOME/.config/oosh/log.session.env` (written by `log.session.save`, see [log.md](log.md)), which `log.env` chains last. Every user has that file: `config init.user` and the install create it with `private.config.session.file.ensure`.
+**Per-user session values.** `LOG_NAME`, `LOG_DEVICE` and `LOG_LIVE` are **not** saved in the shared `log.env`: a new user would inherit the saver's values. They live only in each user's private `$HOME/.config/oosh/log.session.env` (written by `log.session.save`, see [log.md](log.md)), which `log.env` chains last. Every user has that file: `oo user.init` and the install create it with `private.config.session.file.ensure`.
 
 **`config save` typed at the prompt.** `config` then runs as a **child process**: it does not re-read `user.env`, so it saves what the shell **exported**. `test/test.config` T-CONFIG-CMD-SAVE-* run the real executable under `env -i` to pin exactly that.
 
@@ -461,8 +464,8 @@ unguarded, and a plain `sh` ends on `.` of a missing file.
   old shared layout — the shared PATH line, `OOSH_MODE` in `oosh.env` — and the
   saver's own file (T-CONFIG-USER-SESSION-SAVE-GATED).
 - **`sudo oo update`** (or `oo user.fix` as root) is how a multi-user host
-  switches: `config init.user` gives every linked user their files, each in their
-  own hop (`private.config.session.files.ensure.all`), then
+  switches: `oo user.init` gives every linked user their files, each in their
+  own hop (`private.oo.session.files.ensure.all`), then
   `private.config.user.session.migrate` switches the shared files in place —
   owner, group and mode kept, idempotent (T-CONFIG-USER-SESSION-MIGRATE) —
   and `private.config.oosh.session.migrate` gives `oosh.env` its chain to
@@ -498,7 +501,7 @@ INCOMPLETE: /home/you/config — OOSH_MODE=released but ~/oosh is on dev
   repair with: config init.env
 ```
 
-`config.init.check` runs the same report but **swallows the rc** — it is documented as
+`oo.user.check` runs the same report but **swallows the rc** — it is documented as
 never failing its caller. Branch on `config validate required` instead.
 
 **Why this was needed.** `config.init` created a directory and three variables, so on a
@@ -724,7 +727,7 @@ These functions are used internally and generally not called directly:
 `private.this.env.export.line.get` renders every value `private.config.variable.export.line`
 writes, `private.this.host.name.get` names the computer, `private.this.file.same` decides
 whether a user's `.bashrc` differs from their branch's template, and
-`private.this.path.stat.get` reads owners, groups and modes (`config init.check`,
+`private.this.path.stat.get` reads owners, groups and modes (`oo user.check`,
 `private.config.linked.homes.get`). The others listed there — `private.this.container.is`,
 `private.this.group.create`, `private.this.group.name.get`, `private.this.temp.dir.get` —
 serve odocker, os and c2.
@@ -734,7 +737,7 @@ The last two are how the migrates (`private.config.log.chain.migrate`,
 shared env files: the chain line goes on first, then the old lines leave, and a failed
 write is never a silent success. The migrates answer in one convention: **rc 2** + `RESULT`
 `cannot write <file>` for a write that failed, **rc 1** only for a closed gate
-(T-CONFIG-MIGRATE-WRITE-FAIL). `config init.user` warns the `RESULT` of a failed write
+(T-CONFIG-MIGRATE-WRITE-FAIL). `oo user.init` warns the `RESULT` of a failed write
 (visible at the default log level), keeps its info line with `run: sudo oo update` for a
 closed gate, and answers rc 1 with a result that names what could not be written
 (T-CONFIG-INIT-USER-WRITE-FAIL); `config save` warns too and goes on
@@ -840,9 +843,9 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  | `get` |  | `# <envVariable>  # gets an environment variable from the user.env` | `config.get` | `config.get` |
 |  | `init` |  | `# # inititalizes the $CONFIG environment if $CONFIG is empty` | `config.init` | `config.init` |
 |  |  | `env` | `# # regenerate user.env + oosh.env + log.env via config.save (mirrors install at oo:1456)` |  | `config.init.env` |
-|  |  | `full` | `# <username:$USER> # repair end-to-end: shared dir + user symlinks + env files + diagnostics` |  | `config.init.full` |
-|  |  | `shared` | `# # ensure sharedConfig is root:dev (top level), group dev, recursively g+w, and the top level of <base>/shared/dev and of the Once.sh base root:dev g+ws; remove self-loops; idempotent` |  | `config.init.shared` |
-|  |  | `user` | `# <username:$USER> # ensure the ~/config + ~/oosh symlinks of <username> match canonical install` |  | `config.init.user` |
+|  |  | `full` | `# <username:$USER> # repair end-to-end: shared dir + user symlinks + env files + diagnostics` |  | `oo.user.repair` |
+|  |  | `shared` | `# # ensure sharedConfig is root:dev (top level), group dev, recursively g+w, and the top level of <base>/shared/dev and of the Once.sh base root:dev g+ws; remove self-loops; idempotent` |  | `oo.shared.init` |
+|  |  | `user` | `# <username:$USER> # ensure the ~/config + ~/oosh symlinks of <username> match canonical install` |  | `oo.user.init` |
 |  | `list` |  | `# <name:$CONFIG> # lists the content of the config with <name>` | `config.list` | `config.list` |
 |  | `save` |  | `# <?name> <?ENV_PREFIX> # creates an "<name>.env" config file in $CONFIG_PATH containing all env variables that match <ENV_PREFIX>` | `config.save` | `config.save` |
 |  | `set` |  | `# <envVariable> <value> # adds or sets an environment variable to the user.env` | `config.set` | `config.set` |
@@ -854,7 +857,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `config.file` |  |  | `# <configfile> # sets the default config file to <configfile> if it exists` | `config.file` ✅ | `config.file` ✅ |
 |  | `check` |  | `# <name:$CONFIG> # sets the default config file to <name> if it exists` | `config.file.check` | `config.file.check` |
 | `config.info` | `log` |  | `# # logs the config when on LOG_LEVEL info or higher` | `config.info.log` ✅ | `config.info.log` ✅ |
-| `config.init` | `check` |  | `# <username:$USER> # diagnostics: report symlink state, dev-group health (no fixes)` |  | `config.init.check` |
+| `config.init` | `check` |  | `# <username:$USER> # diagnostics: report symlink state, dev-group health (no fixes)` |  | `oo.user.check` |
 | `config.location` |  |  | `# <configfile> # sets the default config location to <configfile> if it exists` | `config.location` | `config.location` |
 | `config.session` | `save` |  | `#  # write the own session files of this user under ~/.config/oosh: the real absolute PATH into user.session.env, OOSH_MODE into oosh.session.env; refuses a HOME the caller does not own #` |  | `config.session.save` |
 | `config.ssh.host` | `set` |  | `# <sshConfigName> # configures the PROMPT and the name of this host for ssh config` | `config.ssh.host.set` ✅ | `config.ssh.host.set` ✅ |
@@ -866,7 +869,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  |  | `oosh.os` | `# # the OS family for this host, via os.check.env #` |  | `private.config.derive.oosh.os` |
 |  |  | `oosh.pm` | `# # the package-manager install command for this host #` |  | `private.config.derive.oosh.pm` |
 |  | `save` |  | `# <?name> <?ENV_PREFIX> <?sessionSplit> <?ooshSplit> # the work of config.save; sessionSplit and ooshSplit (yes or no) are the layout a full save hands its nested oosh save, empty reads it off the files #` |  | `private.config.save` |
-| `config.bashrc` | `ensure` | `all` | `# <sharedConfig> <sharedOosh> # as root, give every user linked to <sharedConfig> the oosh .bashrc of the branch their own ~/oosh points at (<sharedOosh> for a user without one) when theirs differs, each in their own hop #` |  | `private.config.bashrc.ensure.all` |
+| `config.bashrc` | `ensure` | `all` | `# <sharedConfig> <sharedOosh> # as root, give every user linked to <sharedConfig> the oosh .bashrc of the branch their own ~/oosh points at (<sharedOosh> for a user without one) when theirs differs, each in their own hop #` |  | `private.oo.bashrc.ensure.all` |
 | `config.chain.names` | `get` |  | `# <file:$CONFIG> # echo the name of every env file <file> chains with a '. $CONFIG_PATH/<name>.env' (or 'source …') line, in order, one per line; silent #` |  | `private.config.chain.names.get` |
 | `config.derive` | `log` | `level` | `# # the default log level #` |  | `private.config.derive.log.level` |
 | `config.env.line` | `append` |  | `# <file> <line> # append <line> to the env <file> unless the file already holds it as a whole line, in place (owner, group and mode kept); rc 1 and RESULT when the file cannot be written #` |  | `private.config.env.line.append` |
@@ -889,7 +892,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `config.required.variables` | `get` |  | `# # the variables a config must carry for a branch version: "<variable> <file> <deriverFunction>", one per line` |  | `private.config.required.variables.get` |
 | `config.session.chain.ready` |  |  | `# <?configPath:$CONFIG_PATH> <?family:user> # rc 0 when every other user linked to this shared config has their <family>.session.env (user: filled), so the shared <family>.env may chain it; rc 1 when one has none or a home cannot be looked into #` |  | `private.config.session.chain.ready` |
 | `config.session.file` | `ensure` |  | `# <targetHome> # create log.session.env, user.session.env and oosh.session.env under <targetHome>/.config/oosh when missing, never overwrite them; the shared env files chain them unguarded, so every user must have all three #` |  | `private.config.session.file.ensure` |
-| `config.session.files` | `ensure` | `all` | `# <sharedConfig> <sharedOosh> # as root, give every user linked to <sharedConfig> who has no filled user.session.env their session files, each in their own hop #` |  | `private.config.session.files.ensure.all` |
+| `config.session.files` | `ensure` | `all` | `# <sharedConfig> <sharedOosh> # as root, give every user linked to <sharedConfig> who has no filled user.session.env their session files, each in their own hop #` |  | `private.oo.session.files.ensure.all` |
 | `config.session.split` | `is` |  | `# <?configPath:$CONFIG_PATH> # rc 0 when the shared user.env already chains the per-user user.session.env #` |  | `private.config.session.split.is` |
 | `config.string.upper` |  |  | `# <string> # echo string upper-cased, without the bash-4 parameter expansion operator #` |  | `private.config.string.upper` |
 | `config.user.session` | `migrate` |  | `# <?configPath:$CONFIG_PATH> # switch a shared config to the forked user.env in place: PATH out of user.env, OOSH_MODE out of oosh.env, the per-user user.session.env chained last; only when every linked user has one; idempotent, silent #` |  | `private.config.user.session.migrate` |

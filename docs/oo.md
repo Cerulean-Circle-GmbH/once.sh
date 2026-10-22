@@ -202,7 +202,7 @@ could really not be cloned.
 folder under the base needs its own entry for every user who touches it
 (otherwise `fatal: detected dubious ownership`). `ogit safeDirectory.ensure
 <?base>` adds them for the calling user; `oo update`, `oo user.fix` /
-`config init.user` and `user.oosh.install` run it for you, and `oo mode
+`oo user.init` and `user.oosh.install` run it for you, and `oo mode
 <branch>` trusts that branch folder (also when already current); install state 31
 trusts every folder for root, shares each one, and sets group `dev` + setgid on
 the base.
@@ -449,7 +449,7 @@ oo update
 ```
 
 After a successful `git pull`, `oo update` delegates to
-`config init.user $USER` to re-apply the canonical `~/config` +
+`oo user.init $USER` to re-apply the canonical `~/config` +
 `~/oosh` symlinks. This catches the case where `init/oosh` has been
 re-run out of band (e.g. a curl one-liner from the README) and
 clobbered the symlinks — `oo mode <TAB>` would otherwise show
@@ -462,7 +462,7 @@ doesn't yet exist. See
 ### oo.user.fix
 
 Repair the current user's `~/config` + `~/oosh` symlinks to the
-canonical shared tree. Thin alias for [`config init.user`](config.md).
+canonical shared tree. Thin alias for [`oo user.init`](config.md).
 
 ```bash
 oo user.fix              # repair this user (= $USER)
@@ -1030,6 +1030,6 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `oo.shared.tree` | `ensure` |  | `# <url> <base> <branch> # ensure <base>/main is a clone of main (from <url>, else a local copy of ~/oosh) and <base>/<branch> a clone of <branch> beside it; an existing clone is kept, so a re-run heals a half-made first run #` |  | `private.oo.shared.tree.ensure` |
 | `oo.shared.tree.from.local` |  |  | `# <sourceDir> <branchName> <?consumeSource:no> # produce the canonical 'main/ + <branchName>/' clone layout in $(pwd) from a local clone: <branchName>/ is an independent clone of main/ (origin re-pointed at main/'s origin, group-shared). Idempotent — skips when main/ and <branchName>/ exist; a main/ alone gets its branch folder. With <consumeSource> = yes the source is removed last, once main/ and <branchName>/ stand — never when it IS the branch folder (kept as the clone); what 'oo mode.setup' needs. Used by state-31's fallback path when the GitHub SSH clone fails so the resulting layout matches what a successful network clone would have produced (oo.mode.base.get strategy 4 then succeeds and 'oo mode <branch>' works).` |  | `private.oo.shared.tree.from.local` |
 | `oo.tmp` | `cleanup` | `testing` | `# # clean test BE CAREFULL removes oosh and SSH KEYS completly from the system` | `private.oo.tmp.cleanup.testing` |  |
-| `oo.update` | `heal` | `symlinks` | `# # heal current user's ~/config + ~/oosh symlinks via config.init.user; idempotent` |  | `private.oo.update.heal.symlinks` |
+| `oo.update` | `heal` | `symlinks` | `# # heal current user's ~/config + ~/oosh symlinks via oo.user.init; idempotent` |  | `private.oo.update.heal.symlinks` |
 | `oo.user.shared.symlinks` | `ensure` |  | `# <userHome> <sharedConfigPath> <onceShBase> <ooshBranch> # ensure $userHome/config and $userHome/oosh are symlinks to the shared tree; idempotent; preserves originals as .orig.<ts>` |  | `private.oo.user.shared.symlinks.ensure` |
 <!-- END generated: oosh method matrix -->
