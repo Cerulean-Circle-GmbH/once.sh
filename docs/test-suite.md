@@ -64,14 +64,14 @@ Tests with `TEST_CATEGORY=platform` (e.g.
 `test.platform.shared.config.invariant`,
 `test.platform.shared.oosh.invariant`) verify post-install
 invariants on real machines. They run inside
-`os platform.test <platform> terminal` containers via
+`platform test <platform> terminal` containers via
 `./test.suite run <name> 1`. See
 `templates/code/newPlatformInvariantTest` for the skeleton.
 
 **A host-resource check belongs here, not in `core`.** If an assertion needs
 something the oosh install does not itself create — a checkout of another
 repository, a daemon, a tree under `/var` — it cannot pass on a fresh machine or
-inside a container, and `os platform.test` runs `test.suite gate 1` four times
+inside a container, and `platform test` runs `test.suite gate 1` four times
 (core included) per gate. Do not reach for a `[ -d … ] → expect.pass "skipped"` guard either:
 `expect.pass` bumps both counters and `expect.fail` only one, so **a skip is
 indistinguishable from a pass** and the assertion silently stops asserting
@@ -102,7 +102,7 @@ its own key on purpose failed core, and with it `promote`. A check of a real
 machine is a platform check; the gate keeps it running on every freshly installed
 one.
 
-Use it on an installed machine to ask "is this install sound?". `os platform.test`
+Use it on an installed machine to ask "is this install sound?". `platform test`
 runs it for each of its four users (`test.suite gate 1`), so a platform invariant
 gates the run instead of only the core tests.
 
@@ -306,7 +306,7 @@ have never scored and giving them one is content work, not runner work
 The whole pass/fail rule lives in one place, `private.test.suite.verdict`, so it can be tested. It
 used to be an if/elif chain in the tail of the runner that nothing could reach — which is how both
 of these causes came to be printed on screen and then dropped before the return code that the macOS
-workflow and `os platform.test` actually gate on.
+workflow and `platform test` actually gate on.
 
 ## The test tree is itself checked for portability
 

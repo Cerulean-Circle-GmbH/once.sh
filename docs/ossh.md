@@ -369,7 +369,7 @@ The socket a host's master really uses is `$OSSH_CONTROL_PATH` with `%C`
 expanded — a hash only ssh knows. `private.ossh.control.path.resolved.get
 <host>` asks `ssh -G` (which prints the configuration and connects to
 nothing) and echoes it; nothing and rc 1 without a host, or when ssh answers
-`none` or a path that still has a `%`. `os platform.test` closes a stale
+`none` or a path that still has a `%`. `platform test` closes a stale
 master with `ossh connection.close` and then removes that socket; until
 2026-10-16 it removed `/tmp/ossh-test@localhost:<port>`, a name from before
 `%C` that never existed (T-OSSH-CONTROL-PATH-RESOLVED-GET).
@@ -522,7 +522,7 @@ If the remote is missing oosh's install-time tools, run `ossh prereqs.install <h
 The Alpine extras are required because alpine's base image ships only busybox + ash:
 - `bash` — oosh's `#!/usr/bin/env bash` shebangs
 - `shadow` — `useradd`/`chpasswd` (busybox `adduser` differs in flags)
-- `util-linux` — `runuser`, used by `os platform.test` for user-switching
+- `util-linux` — `runuser`, used by `platform test` for user-switching
 - `chmod u+s /bin/busybox` — naked alpine ships busybox at mode 0755; the suid bit is needed for non-root `su -` (so `user login <user>` works from a regular user's shell). Real alpine deployments typically ship busybox suid by default. The same chmod also fires from `init/oosh` after its sudo re-exec, so curl/drag-and-drop install paths get the heal too.
 
 The macOS extras are required because Apple's `/bin/bash` is 3.2 (their last GPLv2 release) but oosh requires bash 4+:

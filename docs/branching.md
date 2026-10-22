@@ -46,7 +46,7 @@ Run `oo stage dev` (or `promote dev.to.testing`):
 
 Run `oo stage testing` (or `promote testing.to.prod`):
 
-1. `os platform.test.all` passes (all must-pass platforms)
+1. `platform test.all` passes (all must-pass platforms)
 2. User confirms merge
 3. Merge `testing` into `prod` in `<base>/prod`
 4. Tag the `prod` branch with semver (e.g., `v1.0.0`)

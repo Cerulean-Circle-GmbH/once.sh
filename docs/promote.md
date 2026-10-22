@@ -103,7 +103,7 @@ The Branch Status block is always shown, regardless of LOG_LEVEL — it's the co
 - `reset` — Delete and reinitialize the PROMOTE state machine (fresh start)
 - `yes` — Set `PROMOTE_FORCE=yes` to skip interactive confirmations
 - `skip` — Skip the current pending check and advance to the next state (also sets `PROMOTE_FORCE=yes`)
-- `notests` — Pass over every test step of this run: `test.suite core 1` and each `os platform.test <platform>` answer `skipped (notests): …` and the run goes on. Merge, `OOSH_SELF_BRANCH` rewrite, tags, push and the y/N question stay. Like `yes` and `skip` it holds for **one run** (`PROMOTE_NOTESTS` in `PROMOTE.promote.env`, cleared by the next run without it). Run it again to resume a stopped run without tests. The words of a run are set in one place, `private.promote.argument.apply`; the test steps ask `private.promote.notests.gate` (T-PROMOTE-NOTESTS). The word is exported: the checks run in a child of the run (`promote` → `state next` → `test.suite core 1`), which sees it; a process outside the run does not, whatever `PROMOTE.promote.env` still holds.
+- `notests` — Pass over every test step of this run: `test.suite core 1` and each `platform test <platform>` answer `skipped (notests): …` and the run goes on. Merge, `OOSH_SELF_BRANCH` rewrite, tags, push and the y/N question stay. Like `yes` and `skip` it holds for **one run** (`PROMOTE_NOTESTS` in `PROMOTE.promote.env`, cleared by the next run without it). Run it again to resume a stopped run without tests. The words of a run are set in one place, `private.promote.argument.apply`; the test steps ask `private.promote.notests.gate` (T-PROMOTE-NOTESTS). The word is exported: the checks run in a child of the run (`promote` → `state next` → `test.suite core 1`), which sees it; a process outside the run does not, whatever `PROMOTE.promote.env` still holds.
 
 ## State Machine
 
@@ -129,7 +129,7 @@ Prod path (testing → prod):
   [22] test.suite.passed.prod   ← test.suite core 1 must pass
   [23..N] platform.test.<name>  ← One state per must-pass platform from
                                   defaults/platforms.env (data-driven via
-                                  private.os.platform.names + .parse). A
+                                  private.platform.names + .parse). A
                                   failing platform stops the machine at
                                   that state; re-running `oo stage testing`
                                   re-runs only that platform.
@@ -188,7 +188,7 @@ It also sets `PROMOTE_FORCE=yes` to auto-confirm remaining prompts.
 |-----------|------|---------|
 | dev → testing | Core test suite | `test.suite core 1` |
 | dev → testing | Clean working tree | `git status --porcelain` |
-| testing → prod | Platform install tests | `os platform.test.all` |
+| testing → prod | Platform install tests | `platform test.all` |
 
 ## Configuration
 

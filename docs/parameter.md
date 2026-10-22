@@ -19,7 +19,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 |  | `backup.dir` | [`backup.backupPath.get`](backup.md) · [`backup.diff`](backup.md) · [`backup.full.diff`](backup.md) · [`backup.get.backupPath`](backup.md) · [`backup.normalize.all`](backup.md) · [`backup.normalize.scan`](backup.md) · [`backup.run`](backup.md) · [`backup.run.mv`](backup.md) · [`backup.sync.and.remove`](backup.md) · [`backup.verify.sync`](backup.md) · [`private.backup.get.backupPath`](backup.md) · [`private.backup.resolve.paths`](backup.md) |
 |  | `odocker.dir` | [`private.odocker.workspaces.mine`](odocker.md) |
 |  | `ogit.dir` | [`ogit.branch.adopt`](ogit.md) · [`ogit.branch.check`](ogit.md) · [`ogit.branch.checkout`](ogit.md) · [`ogit.branch.compare`](ogit.md) · [`ogit.branch.fastForward`](ogit.md) · [`ogit.branch.find`](ogit.md) · [`ogit.branch.get`](ogit.md) · [`ogit.branch.list`](ogit.md) · [`ogit.branch.merge`](ogit.md) · [`ogit.branch.remote.delete`](ogit.md) · [`ogit.branch.reset`](ogit.md) · [`ogit.branch.upstream.set`](ogit.md) · [`ogit.commit.count`](ogit.md) · [`ogit.commit.create`](ogit.md) · [`ogit.commit.log.show`](ogit.md) · [`ogit.commit.pick`](ogit.md) · [`ogit.commit.pick.abort`](ogit.md) · [`ogit.commit.pick.continue`](ogit.md) · [`ogit.commit.revert`](ogit.md) · [`ogit.commit.show`](ogit.md) · [`ogit.config.email.get`](ogit.md) · [`ogit.config.get`](ogit.md) · [`ogit.config.set`](ogit.md) · [`ogit.conflict.list`](ogit.md) · [`ogit.conflict.resolve`](ogit.md) · [`ogit.diff.check`](ogit.md) · [`ogit.diff.show`](ogit.md) · [`ogit.index.add`](ogit.md) · [`ogit.index.remove`](ogit.md) · [`ogit.merge.abort`](ogit.md) · [`ogit.merge.base.get`](ogit.md) · [`ogit.raw`](ogit.md) · [`ogit.remote.branch.list`](ogit.md) · [`ogit.remote.fetch`](ogit.md) · [`ogit.remote.pull`](ogit.md) · [`ogit.remote.push`](ogit.md) · [`ogit.remote.url.get`](ogit.md) · [`ogit.remote.url.set`](ogit.md) · [`ogit.repo.check`](ogit.md) · [`ogit.repo.files.list`](ogit.md) · [`ogit.repo.grep`](ogit.md) · [`ogit.repo.root.get`](ogit.md) · [`ogit.repo.share`](ogit.md) · [`ogit.stash.drop`](ogit.md) · [`ogit.stash.pop`](ogit.md) · [`ogit.stash.push`](ogit.md) · [`ogit.stash.top.get`](ogit.md) · [`ogit.status.check`](ogit.md) · [`ogit.status.show`](ogit.md) · [`ogit.tag.check`](ogit.md) · [`ogit.tag.create`](ogit.md) · [`ogit.tag.latest.get`](ogit.md) · [`ogit.tag.list`](ogit.md) · [`ogit.worktree.add`](ogit.md) · [`ogit.worktree.delete`](ogit.md) · [`ogit.worktree.find`](ogit.md) · [`ogit.worktree.list`](ogit.md) · [`ogit.worktree.prune`](ogit.md) · [`private.ogit.branch.import`](ogit.md) · [`private.ogit.fetchhead.share`](ogit.md) · [`private.ogit.git.run`](ogit.md) · [`private.ogit.gitdir`](ogit.md) · [`private.ogit.umask.get`](ogit.md) · [`private.ogit.worktree.paths.get`](ogit.md) |
-|  | `os.dir` | [`os.platform.parse.check`](os.md) · [`private.os.shell.files.list`](os.md) |
+|  | `os.dir` | [`platform.parse.check`](os.md) · [`private.os.shell.files.list`](os.md) |
 |  | `ossh.dir` | [`ossh.dir.pull`](ossh.md) · [`ossh.dir.push`](ossh.md) · [`ossh.pull.dir`](ossh.md) · [`ossh.push.dir`](ossh.md) · [`private.ossh.dir.pull`](ossh.md) · [`private.ossh.dir.push`](ossh.md) |
 |  | `path.dir` | [`path.add`](path.md) · [`path.append`](path.md) · [`path.prepend`](path.md) · [`path.push`](path.md) · [`path.put`](path.md) · [`path.remove`](path.md) · [`path.rm`](path.md) · [`private.pathadd`](path.md) · [`private.pathrm`](path.md) |
 |  | `promote.dir` | [`private.promote.merge.finish`](promote.md) |
@@ -307,8 +307,8 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 |  | `otmux.newName` | [`otmux.rename`](otmux.md) · [`otmux.rw`](otmux.md) |
 |  | `this.newName` | [`this.function.partial`](this.md) |
 | `paneTarget` | `hiveMind.paneTarget` | [`private.hiveMind.liveUuid`](hivemind.md) · [`private.hiveMind.monitor.switch`](hivemind.md) · [`private.hiveMind.pane.kind`](hivemind.md) · [`private.hiveMind.pane.model`](hivemind.md) · [`private.hiveMind.wait.for.claude`](hivemind.md) |
-| `platform` | `os.platform` | [`os.platform.parse.check`](os.md) · [`os.platform.test`](os.md) · [`private.os.platform.parse`](os.md) · [`private.os.platform.shared.config.repair`](os.md) · [`private.os.platform.test.ci`](os.md) |
-| `port` | `os.port` | [`private.os.platform.cleanup`](os.md) · [`private.os.platform.container.id`](os.md) · [`private.os.platform.sshd.reload`](os.md) |
+| `platform` | `os.platform` | [`platform.parse.check`](os.md) · [`platform.test`](os.md) · [`private.platform.parse`](os.md) · [`private.platform.shared.config.repair`](os.md) · [`private.platform.test.ci`](os.md) |
+| `port` | `os.port` | [`private.platform.cleanup`](os.md) · [`private.platform.container.id`](os.md) · [`private.platform.sshd.reload`](os.md) |
 |  | `osemvec.port` | [`osemvec.serve`](osemvec.md) |
 |  | `ossh.port` | [`ossh.known.hosts.remove`](ossh.md) |
 | `src` | `ossh.src` | [`ossh.scp`](ossh.md) · [`private.ossh.rsync`](ossh.md) · [`private.ossh.rsync.pull`](ossh.md) |
@@ -431,7 +431,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 | `webkit` | `otest.webkit` | [`otest.here`](otest.md) · [`otest.run`](otest.md) · [`otest.updateGolden`](otest.md) |
 | `weblocFile` | `webitem.weblocFile` | [`webitem.webloc2json`](webitem.md) · [`webitem.webloc2url`](webitem.md) · [`webitem.webloc2xml`](webitem.md) |
 | `workspace` | `odocker.workspace` | [`odocker.build`](odocker.md) · [`odocker.rebuild`](odocker.md) |
-|  | `os.workspace` | [`private.os.platform.image.from.workspace`](os.md) |
+|  | `os.workspace` | [`private.platform.image.from.workspace`](os.md) |
 | `a` | `ogit.a` | [`ogit.diff.show`](ogit.md) · [`ogit.merge.base.get`](ogit.md) |
 | `aFunction` | `this.aFunction` | [`this.call`](this.md) · [`this.load`](this.md) |
 | `agents` | `hiveMind.agents` | [`hiveMind.init`](hivemind.md) |
@@ -484,7 +484,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 |  | `osx.mathExpression` | [`osx.spotlight.by.size`](osx.md) |
 | `newFileName` | `webitem.newFileName` | [`webitem.create`](webitem.md) · [`webitem.webloc2url`](webitem.md) |
 | `newStateName` | `state.newStateName` | [`state.add`](state.md) · [`state.rename`](state.md) |
-| `notests` | `os.notests` | [`os.platform.test`](os.md) · [`private.os.platform.test.ci`](os.md) |
+| `notests` | `os.notests` | [`platform.test`](os.md) · [`private.platform.test.ci`](os.md) |
 | `ooshDir` | `promote.ooshDir` | [`private.promote.rewrite.self.branch`](promote.md) |
 |  | `user.ooshDir` | [`private.user.bashrc.install`](user.md) |
 | `paths` | `ogit.paths` | [`ogit.diff.check`](ogit.md) · [`ogit.index.add`](ogit.md) |
@@ -515,7 +515,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 | `task` | `claudeFlow.task` | [`claudeFlow.tmux.spawn`](claudeFlow.md) |
 |  | `osemvec.task` | [`osemvec.context`](osemvec.md) |
 | `taskFile` | `hiveMind.taskFile` | [`hiveMind.task.delegate`](hivemind.md) · [`private.hiveMind.task.transfer`](hivemind.md) |
-| `terminal` | `os.terminal` | [`os.platform.test`](os.md) · [`private.os.platform.test.ci`](os.md) |
+| `terminal` | `os.terminal` | [`platform.test`](os.md) · [`private.platform.test.ci`](os.md) |
 | `testName` | `otest.testName` | [`otest.run`](otest.md) · [`otest.updateGolden`](otest.md) |
 | `threshold` | `claudeCode.threshold` | [`claudeCode.context.alert`](claudeCode.md) |
 |  | `scrumMaster.threshold` | [`scrumMaster.velocity.alert`](scrumMaster.md) |
@@ -590,7 +590,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 | `hostAlias` | `ossh.hostAlias` | [`private.ossh.folder.fix.scan.git.remotes`](ossh.md) |
 | `identitiesOnly` | `ossh.identitiesOnly` | [`ossh.config.create`](ossh.md) |
 | `idOrProxyJump` | `ossh.idOrProxyJump` | [`ossh.config.create`](ossh.md) |
-| `imageTag` | `os.imageTag` | [`private.os.platform.image.exists`](os.md) |
+| `imageTag` | `os.imageTag` | [`private.platform.image.exists`](os.md) |
 | `installerKeypairSrc` | `osshLayout.installerKeypairSrc` | [`osshLayout.build`](osshLayout.md) |
 | `iteratorFunction` | `state.iteratorFunction` | [`private.loop.states`](state.md) |
 | `job` | `c2.job` | [`c2.jobs`](c2.md) |

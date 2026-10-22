@@ -116,7 +116,7 @@ OOSH uses `test.suite` for all testing. Key points:
 
 **Test categories:**
 - `TEST_CATEGORY=core` — fixture-based unit/integration tests; run by `./test.suite core 1`.
-- `TEST_CATEGORY=platform` — post-install invariant checks on real machines (e.g. `test.platform.shared.config.invariant`, `test.platform.shared.oosh.invariant`); run inside `os platform.test <p> terminal` via `./test.suite run <name> 1`. See `templates/code/newPlatformInvariantTest` for the skeleton.
+- `TEST_CATEGORY=platform` — post-install invariant checks on real machines (e.g. `test.platform.shared.config.invariant`, `test.platform.shared.oosh.invariant`); run inside `platform test <p> terminal` via `./test.suite run <name> 1`. See `templates/code/newPlatformInvariantTest` for the skeleton.
 
 **Writing tests:**
 ```bash

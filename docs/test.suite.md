@@ -28,7 +28,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `test.suite.core` |  |  | `# <?logLevel:1> # runs core infrastructure tests` |  | `test.suite.core` |
 | `test.suite.extended` |  |  | `# <?logLevel:1> # runs extended feature tests` |  | `test.suite.extended` |
 | `test.suite.fixture` | `make` |  | `# <?label:caller> # a fresh temp directory, CANONICALISED so a resolved path compares equal on macOS too; echoes the directory` |  | `test.suite.fixture.make` |
-| `test.suite.gate` |  |  | `# <?logLevel:1> # the post-install gate os platform.test runs per user: core, then the platform checks platform.shared.configLayout.invariant and platform.ssh.config.woda.portable; rc 1 when one fails #` |  | `test.suite.gate` |
+| `test.suite.gate` |  |  | `# <?logLevel:1> # the post-install gate platform test runs per user: core, then the platform checks platform.shared.configLayout.invariant and platform.ssh.config.woda.portable; rc 1 when one fails #` |  | `test.suite.gate` |
 | `test.suite.level` |  |  |  | `test.suite.level` ✅ | `test.suite.level` ✅ |
 | `test.suite.portability` | `validate` |  | `# <?treeRoot:$OOSH_DIR/test> # verify test-harness code makes no GNU-only or Linux-only assumption; rc 1 and a report on any violation #` |  | `test.suite.portability.validate` |
 | `test.suite.summary` |  |  | `# # prints test summary with pass/fail counts` | `test.suite.summary` | `test.suite.summary` |

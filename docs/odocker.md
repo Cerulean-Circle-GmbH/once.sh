@@ -119,7 +119,7 @@ root** — `DockerWorkspaces` beside the Once.sh components, shared with group
 `dev` — and the shared `$CONFIG_PATH/odocker.env` that names it, chained from
 `user.env` (`odocker.workspace.install`; `oo update` as root heals an
 older host; an existing value is kept). But the root starts **empty**: `odocker
-build` / `odocker workspace.list` / `os platform.test` (when it has to build an
+build` / `odocker workspace.list` / `platform test` (when it has to build an
 image, `os:212-220`) will say so.
 
 That is expected, not a defect: seed the root from an existing tree, point oosh at a checkout, or start an empty root.
@@ -324,7 +324,7 @@ Without `<name>` the container gets Docker's random name, and the Host the same 
 the command asks the image: `test` when it has that user, else `root`; the password defaults to the user
 name — `test`/`test` for the naked images, `root`/`root` for `naked_ubuntu_26_04_root`. A given `<user>`
 the image does not have is refused before anything starts, and a first login that fails removes the
-container and the new Host again. `os platform.test` uses the same building blocks
+container and the new Host again. `platform test` uses the same building blocks
 (`private.odocker.container.*`).
 
 **Removing.** `odocker container.remove <name>` (after `odocker stop <name>`) and `odocker prune <name>` also remove
@@ -519,7 +519,7 @@ The Docker socket gives the container root-level access to the host's Docker dae
 | `exec <container>` | container name, optional shell (default: bash) | Shell into running container (interactive `-it`) |
 | `exec.command <container> <command...>` | container name, command to run | Run a non-interactive command inside a running container (no TTY); for scripts/state machines |
 | `container.ip.get <container>` | container name | Echo the IP address of a running container on its first network (a container from `odocker run` publishes no port — reach its sshd here); rc 1 when it has none (T-ODOCKER-CONTAINER-IP-GET) |
-| `image.command <image> <command...>` | image, command to run | Run one command in a throwaway container of `<image>` (removed afterwards), stdin passed in, rc the command's; `os platform.parse.check` streams a tree in this way (T-ODOCKER-IMAGE-COMMAND) |
+| `image.command <image> <command...>` | image, command to run | Run one command in a throwaway container of `<image>` (removed afterwards), stdin passed in, rc the command's; `platform parse.check` streams a tree in this way (T-ODOCKER-IMAGE-COMMAND) |
 | `enter <container>` | container name, optional shell (default: bash) | Enter a running container (alias for exec) |
 | `create <image>` | image name, optional container name | Create container without starting |
 
@@ -641,7 +641,7 @@ macOS allows no password dialog, so a build that needs its base image failed:
 (the Mac Studio, `odocker build nakedUbuntu/26.04.root`, 2026-10-22). Linux has no keychain.
 
 Every odocker call that reaches the registry goes through `private.odocker.docker.registry`: `build` (and
-`build.all`, `rebuild`, `os platform.test`), the compose `up`, and the pull of a missing image that `run`,
+`build.all`, `rebuild`, `platform test`), the compose `up`, and the pull of a missing image that `run`,
 `run.sshd`, `image.command` and `container.create` do first (`private.odocker.image.local.ensure` — `odocker run`
 is interactive, its own output cannot be read). On macOS, and only after that error:
 
