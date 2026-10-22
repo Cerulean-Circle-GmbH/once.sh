@@ -139,7 +139,7 @@ Prod path (testing → prod):
   [N+2] merged.to.prod          ← merge origin/testing into prod, in
                                   <base>/prod (with auto-resolve for
                                   OOSH_SELF_BRANCH drift on init/oosh +
-                                  Install oosh.command)
+                                  os.specific/macos/Install oosh.command)
   [N+3] prod.tagged             ← Tag: vX.Y.Z (auto-incremented semver, in <base>/prod)
   [N+4] prod.pushed             ← push prod + tags from <base>/prod
 
@@ -271,7 +271,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `promote.notests.gate` |  |  | `# <what> # rc 0 with RESULT "skipped (notests): <what>" when this run was started with notests — the test step runs nothing; rc 1 otherwise #` |  | `private.promote.notests.gate` |
 | `promote.platform.stubs` | `source` |  |  |  | `private.promote.platform.stubs.source` |
 | `promote.push` | `source` | `branch` |  |  | `private.promote.push.source.branch` |
-| `promote.rewrite.self.branch` |  |  | `# <ooshDir> # rewrite EVERY OOSH_SELF_BRANCH default line in init/oosh and Install oosh.command to the currently-checked-out branch and commit if changed; rc 1 (RESULT names the files) when one keeps another default` |  | `private.promote.rewrite.self.branch` |
+| `promote.rewrite.self.branch` |  |  | `# <ooshDir> # rewrite EVERY OOSH_SELF_BRANCH default line in init/oosh and os.specific/macos/Install oosh.command to the currently-checked-out branch and commit if changed; rc 1 (RESULT names the files) when one keeps another default` |  | `private.promote.rewrite.self.branch` |
 | `promote.state.machine` | `init` |  |  |  | `private.promote.state.machine.init` |
 | `promote.try` | `resolve` | `self.branch.conflict` |  |  | `private.promote.try.resolve.self.branch.conflict` |
 <!-- END generated: oosh method matrix -->

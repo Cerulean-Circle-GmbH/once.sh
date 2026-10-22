@@ -5,8 +5,9 @@
 #   1. Downloaded standalone (single file in ~/Downloads or wherever).
 #      No sibling init/oosh exists → we curl-pipe the one-liner instead.
 #
-#   2. Inside a clone / extracted ZIP (init/oosh sits next to us).
-#      Run the local ./init/oosh directly.
+#   2. Inside a clone / extracted ZIP: this file is os.specific/macos/ in it
+#      (moved out of the repo root, 2026-10-22) — run the clone's init/oosh,
+#      two levels up, from the clone root as before.
 #
 # Double-click in Finder → Terminal.app opens, runs the install, keeps
 # the window open via `read` so the user sees success/failure.
@@ -42,8 +43,8 @@ oosh_fetch() { # <url> <destFile> # 0 on a real download, 127 when no fetcher ex
   fi
 }
 
-if [ -x ./init/oosh ]; then
-  ./init/oosh
+if [ -x ../../init/oosh ]; then
+  ( cd ../.. && ./init/oosh )
   rc=$?
 else
   printf 'No sibling init/oosh — fetching from GitHub branch %s ...\n\n' "$OOSH_SELF_BRANCH"
