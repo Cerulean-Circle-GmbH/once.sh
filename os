@@ -161,7 +161,6 @@ private.os.platform.sshd.reload() { # <port> # re-exec the container's sshd afte
 
 private.os.platform.test.ci() # <platform> <?terminal> <?notests> # triggers CI workflow for native platform testing
 {
-  private.this.script.load ogit ogit.branch.get
   local platform="$1"
   local terminal="$2"
   local notests="$3"
@@ -265,7 +264,6 @@ os.platform.parse.check() # <?platform:almalinux_9> <?dir:$OOSH_DIR> # bash -n e
   if ! private.os.platform.image.exists "$imageTag"; then
     create.result 1 "no image $imageTag on this host — os platform.test $platform builds it"; error.log "$RESULT"; return $(result)
   fi
-  private.this.script.load ogit ogit.repo.files.list || { create.result 1 "ogit not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
   private.this.script.load odocker odocker.image.command || { create.result 1 "odocker not found in $OOSH_DIR"; error.log "$RESULT"; return $(result); }
   files=$(private.os.shell.files.list "$dir")
   n=$(printf '%s\n' "$files" | grep -c .)
@@ -817,6 +815,8 @@ os.start()
 {
   #echo "sourcing init"
   source this
+  # ogit sourced once here, not loaded per method (the boss, 2026-10-22)
+  source ogit
 
   # if [ -z "$1" ]; then
   #   status.discover "$@"
