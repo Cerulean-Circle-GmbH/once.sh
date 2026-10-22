@@ -1725,6 +1725,89 @@ odocker.build.completion.workspace() {
   private.odocker.workspace.list
 }
 
+private.odocker.terminal.is()     #  # rc 0 when a person can answer here — stdin is a terminal #
+{
+  # A predicate (rc only): only then may security unlock-keychain ask the
+  # password (T-ODOCKER-KEYCHAIN-UNLOCK replaces it).
+  [ -t 0 ]
+}
+
+private.odocker.docker.config.keyless()     # <dir> # make <dir> a docker config that never asks the macOS keychain: the real config.json with credsStore "" and an empty Docker Hub entry in auths, and links to its contexts, cli-plugins and buildx #
+{
+  # Proven on the Mac Studio over ssh (2026-10-22): without a credsStore, or
+  # with an empty one, Docker Desktop's CLI still asked the keychain; with an
+  # empty https://index.docker.io/v1/ entry in auths as well it pulled
+  # anonymously — Docker Hub and ghcr.io alike (T-ODOCKER-KEYCHAIN-AVOID).
+  local dir="$1" src="${DOCKER_CONFIG:-$HOME/.docker}" d context
+  mkdir -p "$dir" || return 1
+  if [ -f "$src/config.json" ] && command -v jq >/dev/null 2>&1; then
+    jq '.credsStore = "" | del(.credHelpers) | .auths = ((.auths // {}) | .["https://index.docker.io/v1/"] = (.["https://index.docker.io/v1/"] // {}))' \
+      "$src/config.json" > "$dir/config.json" 2>/dev/null || return 1
+  else
+    context=$(sed -n 's/.*"currentContext"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$src/config.json" 2>/dev/null | head -1)
+    printf '{\n  "auths": {\n    "https://index.docker.io/v1/": {}\n  },\n  "credsStore": "",\n  "currentContext": "%s"\n}\n' "${context:-default}" > "$dir/config.json" || return 1
+  fi
+  for d in contexts cli-plugins buildx; do
+    [ -e "$src/$d" ] && ln -s "$src/$d" "$dir/$d"
+  done
+  return 0
+}
+
+private.odocker.docker.registry()     # <docker args...> # run docker <args> — on macOS a call the locked keychain refused (an ssh session) runs again with a docker config without the keychain, and when that still lacks credentials, after security unlock-keychain on a terminal; rc of the last call, RESULT on a refusal #
+{
+  # Docker Desktop asks the login keychain on every registry access, which an
+  # ssh session cannot unlock: odocker build nakedUbuntu/26.04.root failed on
+  # the Mac Studio (2026-10-22). User decision: act only after that error —
+  # first without the keychain (public images, no password), only a private
+  # image needs the unlock, typed by the user. The output is shown as always
+  # and read afterwards (T-ODOCKER-KEYCHAIN-AVOID, -UNLOCK, -ONLY-MAC).
+  # Off macOS nothing is read: docker keeps its terminal (the build progress
+  # display) exactly as before.
+  local temp rc keychain="$HOME/Library/Keychains/login.keychain-db"
+  case "${OOSH_OS:-$(uname -s)}" in (darwin*|Darwin) ;; (*) docker "$@"; return ;; esac
+  if ! temp="$(private.this.temp.dir.get dockerregistry)"; then
+    docker "$@"
+    return
+  fi
+  { docker "$@" 2>&1 1>&3 3>&- | tee "$temp/first.log" >&2; } 3>&1
+  rc=${PIPESTATUS[0]}
+  if [ "$rc" -eq 0 ] || ! grep -qE 'keychain cannot be accessed|error getting credentials' "$temp/first.log"; then
+    rm -rf "$temp"
+    return "$rc"
+  fi
+  important.log "the macOS keychain is locked (ssh session) — again without it, as for public images"
+  if private.odocker.docker.config.keyless "$temp/config"; then
+    { DOCKER_CONFIG="$temp/config" docker "$@" 2>&1 1>&3 3>&- | tee "$temp/second.log" >&2; } 3>&1
+    rc=${PIPESTATUS[0]}
+    if [ "$rc" -eq 0 ] || ! grep -qiE 'pull access denied|unauthorized|authentication required|requested access to the resource is denied|keychain cannot be accessed' "$temp/second.log"; then
+      rm -rf "$temp"
+      return "$rc"
+    fi
+  fi
+  rm -rf "$temp"
+  if ! private.odocker.terminal.is; then
+    create.result 1 "docker needs your credentials from the locked macOS keychain — run: security unlock-keychain ~/Library/Keychains/login.keychain-db, then again"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  important.log "this image needs your credentials: unlocking the macOS keychain — type your Mac password"
+  if ! security unlock-keychain "$keychain"; then
+    create.result 1 "the macOS keychain was not unlocked — docker could not log in"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  docker "$@"
+}
+
+private.odocker.image.local.ensure()     # <image> # rc 0 when <image> is here — pulled through private.odocker.docker.registry when it is not; a local image is never pulled #
+{
+  # odocker run is interactive (-it bash): its output cannot be read for the
+  # keychain text, so a missing image comes first, through the helper
+  # (T-ODOCKER-IMAGE-LOCAL-ENSURE).
+  docker image inspect "$1" >/dev/null 2>&1 && return 0
+  private.odocker.docker.registry pull "$1"
+}
+
 odocker.build() # <workspace> # build image from DockerWorkspaces directory
 {
   local workspace="$1"
@@ -1748,7 +1831,7 @@ odocker.build() # <workspace> # build image from DockerWorkspaces directory
   dockerfilePath=$(cd "$workspaceDir" && pwd -P)/Dockerfile
 
   console.log "Building image: $imageTag from $workspaceDir"
-  docker build \
+  private.odocker.docker.registry build \
     --label "dockerfile.path=$dockerfilePath" \
     --label "dockerfile.dir=$(dirname "$dockerfilePath")" \
     -t "$imageTag" "$workspaceDir"
@@ -1774,6 +1857,9 @@ odocker.run() # <image> <?name> <?docker> # run container from image
   shift 2>/dev/null
   local dockerOpt=$(private.odocker.docker.socket.opt)
 
+  # A missing image first, through the keychain-aware helper: name.new below
+  # already creates a container of it (T-ODOCKER-IMAGE-LOCAL-ENSURE).
+  private.odocker.image.local.ensure "$image" || return $?
   # Unnamed: odocker names it. Only --name: the host name stays the ID, the
   # name reaches the container through the socket (T-ODOCKER-RUN-NO-HOSTNAME).
   [ -n "$name" ] || name=$(private.odocker.container.name.new "$image")
@@ -1808,6 +1894,9 @@ odocker.run.sshd() # <image> <?name> <?portOrOffset:0> <?docker> # run container
     return 1
   fi
 
+  # A missing image first, through the keychain-aware helper: name.new below
+  # already creates a container of it (T-ODOCKER-IMAGE-LOCAL-ENSURE).
+  private.odocker.image.local.ensure "$image" || return $?
   # Unnamed: odocker names it. Only --name: the host name stays the ID, the
   # name reaches the container through the socket (T-ODOCKER-RUN-NO-HOSTNAME).
   [ -n "$name" ] || name=$(private.odocker.container.name.new "$image")
@@ -2365,6 +2454,7 @@ odocker.image.command() # <image> <command...> # run one command in a throwaway 
     return 1
   fi
   shift
+  private.odocker.image.local.ensure "$image" </dev/null >&2 || return $?
   docker run --rm -i --entrypoint sh "$image" -c "$*"
 }
 odocker.exec.command.completion.container() {
@@ -2455,6 +2545,9 @@ odocker.create() # <image> <?name> # # @DEPRECATED container.create: create cont
   shift
   local name="$1"
 
+  # A missing image first, through the keychain-aware helper: name.new below
+  # already creates a container of it (T-ODOCKER-IMAGE-LOCAL-ENSURE).
+  private.odocker.image.local.ensure "$image" || return $?
   # Unnamed: odocker names it. Only --name: the host name stays the ID, the
   # name reaches the container through the socket (T-ODOCKER-RUN-NO-HOSTNAME).
   [ -n "$name" ] || name=$(private.odocker.container.name.new "$image")
@@ -2785,7 +2878,7 @@ odocker.up() # <container> <?portOrOffset:0> <?docker> # start a container, run 
     composeFile=$(private.odocker.compose.file.find)
     if [ $? -eq 0 ]; then
       console.log "Starting compose service: $container"
-      docker compose -f "$composeFile" up -d "$container"
+      private.odocker.docker.registry compose -f "$composeFile" up -d "$container"
     else
       error.log "Not found as container, image, or compose service: $container"
       return 1

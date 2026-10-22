@@ -2403,10 +2403,12 @@ expect 0 "alice and bob, not root, daemon or nobody" "the accounts were read fro
 # os platform.parse.check runs bash -n with the bash of a platform image
 # (2026-10-14); odocker could run an interactive container or exec in a
 # running one, not one command in an image, gone afterwards. A docker stand-in
-# on PATH logs its arguments and passes its stdin through.
+# on PATH logs its arguments and passes its stdin through. The image is here:
+# it answers the local check (`docker image inspect`, T-ODOCKER-IMAGE-LOCAL-ENSURE)
+# without a log line, so no pull comes first.
 test.odocker.imageCommand() {
   local fx bad="" got; fx=$(test.suite.fixture.make odockerimagecommand); mkdir -p "$fx/bin"
-  printf '%s\n' '#!/bin/sh' 'echo "docker $*" >> "$FX/log"' 'cat' 'exit ${T_RC:-0}' > "$fx/bin/docker"; chmod +x "$fx/bin/docker"
+  printf '%s\n' '#!/bin/sh' '[ "$1 $2" = "image inspect" ] && exit 0' 'echo "docker $*" >> "$FX/log"' 'cat' 'exit ${T_RC:-0}' > "$fx/bin/docker"; chmod +x "$fx/bin/docker"
   got=$(echo payload | FX="$fx" PATH="$fx/bin:$PATH" odocker.image.command naked_alma_9_sshd:latest 'bash -n /t/x' 2>/dev/null; echo "rc=$?")
   [ "$got" = "payload
 rc=0" ] || bad="$bad out=[$(echo "$got" | tr '\n' '|')]"
@@ -3184,6 +3186,131 @@ test.odocker.containerSshPrune() {
 test.case $level "T-ODOCKER-CONTAINER-SSH-PRUNE: odocker container.ssh.prune removes the Hosts of containers that are gone, and nothing else" test.odocker.containerSshPrune
 expect 0 "only the Hosts of gone containers go" \
   "removed containers left their Hosts in ~/.ssh/config, and the list only grew"
+
+# T-ODOCKER-KEYCHAIN-*: on macOS over ssh a locked keychain does not stop a registry call
+# Docker Desktop's config has "credsStore": "desktop": every registry access
+# asks the login keychain, which an ssh session cannot unlock — odocker build
+# nakedUbuntu/26.04.root on the Mac Studio failed with "keychain cannot be
+# accessed" (2026-10-22). User decision: avoid it first — the same call again
+# with a docker config of odocker's own, credsStore "" and an empty Docker Hub
+# entry in auths (proven on the Mac: anonymous pulls, Docker Hub and ghcr.io;
+# an empty credsStore alone still asked the keychain) — and only when that
+# still fails for credentials (a private image) security unlock-keychain on a
+# terminal, then the call once more. Linux, or another failure: one call.
+# docker and security are recording stubs; FX_* decide their answers.
+test.odocker.keychain.run() { # <fx> <what...> # run <what...> with docker/security stubs; echo the calls, then rc and RESULT #
+  local fx="$1"; shift
+  ( FX="$fx"; export DOCKER_CONFIG="$fx/docker" TMPDIR="$fx/tmp"
+    docker() {
+      local n; n=$(($(cat "$FX/n" 2>/dev/null || echo 0) + 1)); echo "$n" > "$FX/n"
+      echo "docker[$n] DOCKER_CONFIG=${DOCKER_CONFIG#$FX/} $*" >> "$FX/calls"
+      [ "$DOCKER_CONFIG" != "$FX/docker" ] && cp "$DOCKER_CONFIG/config.json" "$FX/seen.json" 2>/dev/null && ls "$DOCKER_CONFIG" > "$FX/seen.ls"
+      case "$1 $2" in ("image inspect") [ -n "$FX_LOCAL" ]; return ;; esac
+      case "$(eval echo "\${FX_ANSWER_$n:-ok}")" in
+        (keychain) echo 'ERROR: error getting credentials - err: exit status 1, out: `keychain cannot be accessed because the current session does not allow user interaction.`' >&2; return 1 ;;
+        (denied) echo 'ERROR: pull access denied for private/image, repository does not exist or may require authorization' >&2; return 1 ;;
+        (other) echo 'ERROR: no space left on device' >&2; return 1 ;;
+        (*) echo "built"; return 0 ;;
+      esac
+    }
+    security() { echo "security $*" >> "$FX/calls"; return "${FX_UNLOCK_RC:-0}"; }
+    private.odocker.terminal.is() { [ -n "$FX_TTY" ]; }
+    "$@" </dev/null >/dev/null 2>&1; echo "rc=$? RESULT=$RESULT" >> "$FX/calls" )
+  cat "$fx/calls"; rm -f "$fx/calls" "$fx/n"
+}
+test.odocker.keychain.fixture() { # <fx> # a Docker Desktop config like the Mac: credsStore desktop, a context, plugins, buildx #
+  mkdir -p "$1/docker/contexts/meta" "$1/docker/cli-plugins" "$1/docker/buildx" "$1/tmp"
+  printf '%s\n' '{' '  "auths": {},' '  "credsStore": "desktop",' '  "currentContext": "desktop-linux"' '}' > "$1/docker/config.json"
+}
+
+test.odocker.keychainAvoid() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make odockerkcavoid); test.odocker.keychain.fixture "$fx"
+  out=$(OOSH_OS=darwin FX_ANSWER_1=keychain test.odocker.keychain.run "$fx" private.odocker.docker.registry build -t img "$fx/ws")
+  [ "$(printf '%s\n' "$out" | grep -c '^docker\[')" = 2 ] || bad="$bad calls=[$(printf '%s\n' "$out" | tr '\n' '|')]"
+  printf '%s\n' "$out" | grep -q '^docker\[1\] DOCKER_CONFIG=docker build -t img' || bad="$bad firstNotNormal"
+  printf '%s\n' "$out" | grep '^docker\[2\]' | grep -q 'DOCKER_CONFIG=tmp/.* build -t img' || bad="$bad secondNotOwnConfig=[$(printf '%s\n' "$out" | grep '^docker\[2\]')]"
+  grep -q '"credsStore": ""' "$fx/seen.json" 2>/dev/null || bad="$bad credsStore=[$(tr -d '\n ' < "$fx/seen.json" 2>/dev/null)]"
+  grep -q '"https://index.docker.io/v1/": {}' "$fx/seen.json" 2>/dev/null || bad="$bad noHubEntry"
+  grep -q '"currentContext": "desktop-linux"' "$fx/seen.json" 2>/dev/null || bad="$bad contextLost"
+  [ "$(tr '\n' ' ' < "$fx/seen.ls" 2>/dev/null)" = "buildx cli-plugins config.json contexts " ] || bad="$bad dir=[$(tr '\n' ' ' < "$fx/seen.ls" 2>/dev/null)]"
+  printf '%s\n' "$out" | grep -q '^security' && bad="$bad unlockedAnyway"
+  printf '%s\n' "$out" | grep -q '^rc=0 ' || bad="$bad rc=[$(printf '%s\n' "$out" | tail -1)]"
+  [ -n "$(ls -A "$fx/tmp")" ] && bad="$bad tempLeft=[$(ls -A "$fx/tmp" | tr '\n' ' ')]"
+  grep -q '"credsStore": "desktop"' "$fx/docker/config.json" || bad="$bad realConfigChanged"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "again without the keychain, no password" || create.result 1 "keychain avoid:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-KEYCHAIN-AVOID: on macOS a call the locked keychain refused runs again with a docker config without the keychain" test.odocker.keychainAvoid
+expect 0 "again without the keychain, no password" \
+  "odocker build on the Mac over ssh failed: the locked keychain refused even public images"
+
+test.odocker.keychainUnlock() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make odockerkcunlock); test.odocker.keychain.fixture "$fx"
+  # a private image: without the keychain "pull access denied" — on a terminal unlock, then the normal config
+  out=$(OOSH_OS=darwin FX_ANSWER_1=keychain FX_ANSWER_2=denied FX_TTY=1 test.odocker.keychain.run "$fx" private.odocker.docker.registry pull private/image)
+  printf '%s\n' "$out" | grep -qx 'security unlock-keychain '"$fx"'/home/Library/Keychains/login.keychain-db' \
+    || printf '%s\n' "$out" | grep -q '^security unlock-keychain .*/Library/Keychains/login.keychain-db$' || bad="$bad noUnlock=[$(printf '%s\n' "$out" | tr '\n' '|')]"
+  printf '%s\n' "$out" | grep -q '^docker\[3\] DOCKER_CONFIG=docker pull private/image' || bad="$bad noThird"
+  printf '%s\n' "$out" | sed -n '/^security/,$p' | grep -q '^docker\[3\]' || bad="$bad unlockNotBefore"
+  printf '%s\n' "$out" | grep -q '^rc=0 ' || bad="$bad rc=[$(printf '%s\n' "$out" | tail -1)]"
+  # no terminal: no unlock, rc 1, RESULT names the command
+  out=$(OOSH_OS=darwin FX_ANSWER_1=keychain FX_ANSWER_2=denied test.odocker.keychain.run "$fx" private.odocker.docker.registry pull private/image)
+  printf '%s\n' "$out" | grep -q '^security' && bad="$bad unlockWithoutTerminal"
+  [ "$(printf '%s\n' "$out" | grep -c '^docker\[')" = 2 ] || bad="$bad noTtyCalls"
+  printf '%s\n' "$out" | tail -1 | grep -q '^rc=1 .*security unlock-keychain ~/Library/Keychains/login.keychain-db' || bad="$bad noTtyResult=[$(printf '%s\n' "$out" | tail -1)]"
+  [ -n "$(ls -A "$fx/tmp")" ] && bad="$bad tempLeft"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "a private image: unlock on a terminal, else the command named" || create.result 1 "keychain unlock:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-KEYCHAIN-UNLOCK: a private image still refused: security unlock-keychain on a terminal, then once more" test.odocker.keychainUnlock
+expect 0 "a private image: unlock on a terminal, else the command named" \
+  "without the keychain a private image cannot be pulled, and nothing said how to unlock it"
+
+test.odocker.keychainOnlyMac() {
+  local fx bad="" out
+  fx=$(test.suite.fixture.make odockerkconly); test.odocker.keychain.fixture "$fx"
+  out=$(OOSH_OS=linux-gnu FX_ANSWER_1=keychain test.odocker.keychain.run "$fx" private.odocker.docker.registry build -t img .)
+  [ "$(printf '%s\n' "$out" | grep -c '^docker\[')" = 1 ] && printf '%s\n' "$out" | grep -q '^rc=1 ' || bad="$bad linux=[$(printf '%s\n' "$out" | tr '\n' '|')]"
+  out=$(OOSH_OS=darwin FX_ANSWER_1=other test.odocker.keychain.run "$fx" private.odocker.docker.registry build -t img .)
+  [ "$(printf '%s\n' "$out" | grep -c '^docker\[')" = 1 ] && printf '%s\n' "$out" | grep -q '^rc=1 ' || bad="$bad otherError=[$(printf '%s\n' "$out" | tr '\n' '|')]"
+  out=$(OOSH_OS=darwin test.odocker.keychain.run "$fx" private.odocker.docker.registry build -t img .)
+  [ "$(printf '%s\n' "$out" | grep -c '^docker\[')" = 1 ] && printf '%s\n' "$out" | grep -q '^rc=0 ' || bad="$bad ok=[$(printf '%s\n' "$out" | tr '\n' '|')]"
+  printf '%s\n' "$out" | grep -q '^security' && bad="$bad unlocked"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "one call off macOS or for another error" || create.result 1 "keychain only mac:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-KEYCHAIN-ONLY-MAC: Linux, success or another error: exactly one docker call" test.odocker.keychainOnlyMac
+expect 0 "one call off macOS or for another error" "a failure that is not the keychain was retried"
+
+# T-ODOCKER-IMAGE-LOCAL-ENSURE: the entries that start an image pull it through the helper first, only when it is missing
+# odocker run is interactive (-it bash): its output cannot be read for the
+# keychain text, so a missing image is pulled first through
+# private.odocker.docker.registry — before private.odocker.container.name.new,
+# whose docker create already needs it. A local image is never pulled; build
+# and the compose up go through the helper themselves.
+test.odocker.imageLocalEnsure() {
+  local fx bad="" out what
+  fx=$(test.suite.fixture.make odockerimgensure); test.odocker.keychain.fixture "$fx"
+  for what in "odocker.run img1" "odocker.run.sshd img1 boxk 0" "odocker.image.command img1 true" "odocker.container.create img1 boxk"; do
+    out=$(test.odocker.keychain.run "$fx" $what)
+    printf '%s\n' "$out" | grep -q '^docker\[2\] .* pull img1$' || bad="$bad ${what%% *}NoPull=[$(printf '%s\n' "$out" | head -3 | tr '\n' '|')]"
+    out=$(FX_LOCAL=1 test.odocker.keychain.run "$fx" $what)
+    printf '%s\n' "$out" | grep -q ' pull ' && bad="$bad ${what%% *}PulledLocal"
+  done
+  grep -A40 '^odocker.build()' "$OOSH_DIR/odocker" | grep -q 'private.odocker.docker.registry build' || bad="$bad buildNotThroughHelper"
+  grep -q 'private.odocker.docker.registry compose -f "$composeFile" up -d' "$OOSH_DIR/odocker" || bad="$bad composeNotThroughHelper"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "a missing image is pulled through the helper, a local one never" || create.result 1 "image ensure:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-IMAGE-LOCAL-ENSURE: run, run.sshd, image.command and container.create pull a missing image through the helper" test.odocker.imageLocalEnsure
+expect 0 "a missing image is pulled through the helper, a local one never" \
+  "a run of an image that was not local reached the registry without the keychain fallback"
 
 ### test.method
 

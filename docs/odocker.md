@@ -632,6 +632,31 @@ If you are listed in `getent` but your group is missing from `id -nG`, the membe
 
 4. If `stat` shows the group `root` (`wheel`, number 0), odocker adds nobody to it and says so: on the host, give the socket a docker group of its own (`groupadd docker; chgrp docker /var/run/docker.sock`, or the daemon's `group` setting) — never put users in the group of root.
 
+### macOS over ssh — "keychain cannot be accessed"
+
+Docker Desktop's `~/.docker/config.json` has `"credsStore": "desktop"`: every registry access asks the macOS
+login keychain, even for a public image. In an ssh session (`ossh login macstudio`) the keychain is locked and
+macOS allows no password dialog, so a build that needs its base image failed:
+`error getting credentials … keychain cannot be accessed because the current session does not allow user interaction`
+(the Mac Studio, `odocker build nakedUbuntu/26.04.root`, 2026-10-22). Linux has no keychain.
+
+Every odocker call that reaches the registry goes through `private.odocker.docker.registry`: `build` (and
+`build.all`, `rebuild`, `os platform.test`), the compose `up`, and the pull of a missing image that `run`,
+`run.sshd`, `image.command` and `container.create` do first (`private.odocker.image.local.ensure` — `odocker run`
+is interactive, its own output cannot be read). On macOS, and only after that error:
+
+1. **Without the keychain, no password:** the same call again with a docker config of its own
+   (`private.odocker.docker.config.keyless`): the real `config.json` with `"credsStore": ""` and an empty
+   `https://index.docker.io/v1/` entry in `auths`, links to `contexts`, `cli-plugins` and `buildx`. Public images
+   then pull anonymously — Docker Hub and ghcr.io alike (proven on the Mac; an empty `credsStore` alone still asked
+   the keychain). The real `~/.docker/config.json` is never changed.
+2. **Only a private image** still lacking credentials: on a terminal odocker runs
+   `security unlock-keychain ~/Library/Keychains/login.keychain-db` — you type your Mac password — and the call once
+   more. Without a terminal it stops with rc 1 and names that command.
+
+Off macOS, after success or after any other error the call runs once, as before; Docker keeps its terminal there
+(T-ODOCKER-KEYCHAIN-AVOID, -UNLOCK, -ONLY-MAC, T-ODOCKER-IMAGE-LOCAL-ENSURE).
+
 ## See Also
 
 - [Supported Platforms](supported-platforms.md)
