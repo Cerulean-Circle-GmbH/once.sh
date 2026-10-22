@@ -21,7 +21,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  | `help` |  |  | `this.help` ✅ | `this.help` ✅ |
 |  |  | `table` |  | `this.help.table` ✅ | `this.help.table` ✅ |
 |  | `init` |  |  | `this.init` | `this.init` |
-|  | `isEmpty` |  |  | `this.isEmpty` |  |
+|  | `isEmpty` |  |  | `this.isEmpty` ✅ | `this.isEmpty` ✅  |
 |  | `isNumber` |  |  | `this.isNumber` ✅ | `this.isNumber` ✅ |
 |  | `isPaneTarget` |  |  | `this.isPaneTarget` |  |
 |  | `isPipeSafe` |  |  | `this.isPipeSafe` |  |
