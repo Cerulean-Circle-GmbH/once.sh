@@ -188,48 +188,22 @@ os.check() { # <method> # is true if an OS was detected. LOG LEVEL 4 to see outp
   return $(result)
 }
 
-os.check.env() # #
+os.check.env() # # set OOSH_OS (the OS family) when it is empty — from the kernel getter private.this.os.family.get #
 {
-
+  # The $OSTYPE mapping moved down into the base (this), where config needs it
+  # without loading os (the blueprint oosh.drawio, 2026-10-23).
   if [ -z "$OOSH_OS" ]; then
-
-    case "$OSTYPE" in
-      darwin*)
-        info.log "      Mac OS detected"
-        export OOSH_OS="darwin"
-        ;;
-      linux*)
-        # Match linux-gnu (glibc), linux-musl (Alpine), and any future
-        # variants. Tag as "linux-gnu" — the historical value, kept for
-        # downstream consumers; mirrors the linux* case in private.check.root.installation.done (oo).
-        info.log "      Linux detected"
-        export OOSH_OS="linux-gnu"
-        ;;
-      cygwin)
-        info.log "      cygwin detected"
-        export OOSH_OS="cygwin"
-        ;;
-      msys)
-        info.log "      msys detected"
-        export OOSH_OS="msys"
-        ;;
-      win32)
-        info.log "      win32 detected"
-        export OOSH_OS="win32"
-        ;;
-      freebsd)
-        info.log "      freebsd detected"
-        export OOSH_OS="freebsd"
-        ;;
-      *)
-        important.log "  could not determine OS... please contribute to os.check"
-        return 1
-      ;;
-    esac
+    local family
+    if ! family=$(private.this.os.family.get); then
+      important.log "  could not determine OS... please contribute to private.this.os.family.get"
+      return 1
+    fi
+    info.log "      $family detected"
+    export OOSH_OS="$family"
   fi
   return 0
-
 }
+
 
 
 os.usage()

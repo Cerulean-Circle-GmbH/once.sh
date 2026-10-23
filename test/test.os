@@ -36,11 +36,13 @@ source $OOSH_DIR/os
 # alpine branch — symptom: "could not determine OS... please contribute".
 # Bug history: pre-b7d500d the pattern was linux-gnu* and alpine fell through.
 # ─────────────────────────────────────────────────────────────────────────────
+# Since 2026-10-23 the mapping is the kernel getter private.this.os.family.get
+# (config needs it without os — the blueprint oosh.drawio); os.check.env uses it.
 test.case $level "T-OS-CHECK-ENV-LINUX-MUSL: os.check.env recognises linux-musl as a linux variant" \
-  echo "(grep os for the case statement)"
+  echo "(the kernel getter answers, os.check.env asks it)"
 OS_CHECK_ENV_BODY=$(declare -f os.check.env 2>/dev/null)
-if printf "%s" "$OS_CHECK_ENV_BODY" | grep -qE 'linux\*\)' \
-   && ! printf "%s" "$OS_CHECK_ENV_BODY" | grep -qE 'linux-gnu\*\)'; then
+if [ "$(private.this.os.family.get linux-musl)" = linux-gnu ] && [ "$(private.this.os.family.get linux-gnu)" = linux-gnu ] \
+   && printf "%s" "$OS_CHECK_ENV_BODY" | grep -q 'private.this.os.family.get'; then
   expect.pass "os.check.env matches linux* (covers linux-gnu, linux-musl, future variants)"
 else
   expect.fail "os.check.env still uses narrow linux-gnu* pattern — alpine's linux-musl will fall through to 'could not determine OS'"
