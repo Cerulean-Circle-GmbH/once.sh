@@ -21,14 +21,14 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  | `help` |  |  | `this.help` ✅ | `this.help` ✅ |
 |  |  | `table` |  | `this.help.table` ✅ | `this.help.table` ✅ |
 |  | `init` |  |  | `this.init` | `this.init` |
-|  | `isEmpty` |  |  | `this.isEmpty` |  |
+|  | `isEmpty` |  |  | `this.isEmpty` ✅ | `this.isEmpty` ✅  |
 |  | `isNumber` |  |  | `this.isNumber` ✅ | `this.isNumber` ✅ |
-|  | `isPaneTarget` |  |  | `this.isPaneTarget` |  |
-|  | `isPipeSafe` |  |  | `this.isPipeSafe` |  |
-|  | `isRoleName` |  |  | `this.isRoleName` |  |
-|  | `isSessionName` |  |  | `this.isSessionName` |  |
+|  | `isPaneTarget` |  |  | `# this.isPaneTarget` |  |
+|  | `isPipeSafe` |  |  | `# this.isPipeSafe` |  |
+|  | `isRoleName` |  |  | `# this.isRoleName` |  |
+|  | `isSessionName` |  |  | `# this.isSessionName` |  |
 |  | `isSourced` |  |  | `this.isSourced` | `this.isSourced` |
-|  | `isUuid` |  |  | `this.isUuid` |  |
+|  | `isUuid` |  |  | `# this.isUuid` |  |
 |  | `load` |  | `# <aFunction> <aShellScript> # loads <aFunction> from a <aShellScript>` | `this.load` | `this.load` |
 |  | `restart` |  |  | `this.restart` ✅ | `this.restart` ✅ |
 | `this.absolutePath` |  |  | `# <?path:"."> <?option:"pipe"> echos the absolut path if started else it just puts it into $RESTULT` | `this.absolutePath` ✅ | `this.absolutePath` ✅ |
