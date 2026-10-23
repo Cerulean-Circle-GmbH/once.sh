@@ -41,18 +41,24 @@ Excluded from the sweep: `ogit` itself, `docs/`, `test/`, `.claude/`, `old/`, `*
 
 ### Using ogit from another script
 
-Inside a method of another script, load ogit lazily as the **first line** of the method, then call `ogit.*` as functions:
+ogit is a low script: it sources only `this`. A script that uses it **sources it once in its `start()`**, then calls `ogit.*` as functions — or **calls it as a command** (`ogit branch.get`). The boss (2026-10-22): "correct is source ogit in init() or just call ogit branch.get"; the lazy loader `private.this.script.load` is gone.
 
 ```bash
+my.start()
+{
+  source this
+  source ogit
+  this.start "$@"
+}
+
 my.method() # <?dir:$OOSH_DIR> # … #
 {
- private.this.script.load ogit ogit.branch.get
  local branch; branch=$(ogit.branch.get "$1")
  …
 }
 ```
 
-`private.this.script.load` sources `$OOSH_DIR/ogit` once (only when `ogit.branch.get` is not yet a function) and restores `This` afterwards. Never `source ogit` at file scope.
+`this` itself is sourced by ogit, so it calls `ogit` only as a command. Never `source ogit` inside a method — sourcing re-runs `this.start` and points `This` at ogit.
 
 Where functions do not travel — `bash -c` strings, `private.as.user` hops, remote command strings — use the **command form**: `"$OOSH_DIR/ogit" <method> <params…>`.
 
