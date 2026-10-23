@@ -76,7 +76,20 @@ all, and every one in the tree was hand-written. Private methods also get **no c
 they are never dispatched from the command line, and `test/test.completion.audit` skips `private*`
 for the same reason.
 
-Five prompts, in order, all asked **before** any file is touched:
+Everything is **checked first**, before the first question; any failure refuses with nothing changed:
+
+| Check | rc |
+|---|---|
+| no `<script>.<method>` in the name | 2 |
+| the script is missing, or its `### new.method` line is not there exactly once | 3 |
+| `test/test.<script>` is missing, or its `### test.method` line is not there exactly once — a method comes with its test (`oo test.new <script>` makes the file) | 4 |
+| `<script>.<method>()` is already defined — `oo method.delete` removes it | 5 |
+
+Until 2026-10-23 the method was written first and the test second: a missing test file or marker left a
+method without its test, and a second run of the same name wrote a second definition (bash silently
+uses the last one) and said "created".
+
+Then five prompts, in order, all asked **before** any file is touched:
 
 | Prompt | Lands in |
 |---|---|
@@ -99,6 +112,10 @@ information from docstrings. Generating a row there would put the description in
 them drift. Until 2026-09-16 the tool tried, looking for a dash pattern the script template does not
 contain, and mangled the Examples block into `mymethod------` while dropping the description
 entirely.
+
+**Method and test are one transaction.** Both transformed copies are written first; only then is either
+committed, and if the test file cannot be committed the script is put back. Either both change or
+neither does (T-METHOD-NEW-ALL-OR-NOTHING).
 
 **Insertion is a whole-line, exactly-one-match transaction** (`replace line`, not `replace within`).
 The `### new.method` and `### test.method` markers must each appear exactly once as a line of their
