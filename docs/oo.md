@@ -80,8 +80,8 @@ Everything is **checked first**, before the first question; any failure refuses 
 
 | Check | rc |
 |---|---|
-| no `<script>.<method>` in the name | 2 |
-| the script is missing, or its `### new.method` line is not there exactly once | 3 |
+| no `<script>.<method>` in the name — `oo method.new mytestfile` adds nothing; a new script is `oo new mytestfile` | 2 |
+| the script is missing (create it first: `oo new <script>`), is a folder (`test.x` — `test` is the folder of the test files), or its `### new.method` line is not there exactly once | 3 |
 | `test/test.<script>` is missing, or its `### test.method` line is not there exactly once — a method comes with its test (`oo test.new <script>` makes the file) | 4 |
 | `<script>.<method>()` is already defined — `oo method.delete` removes it | 5 |
 
