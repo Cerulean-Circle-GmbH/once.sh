@@ -95,10 +95,12 @@ private.test.suite.results.clear() # # remove the handoff file, so the next file
   # private.test.suite.counters.reset.
   local resultsFile; resultsFile=$(private.test.suite.results.file.get)
   rm -f "$resultsFile" 2>/dev/null
+  # The guard's list of refused real-config writes is per file as well.
+  rm -f "$TEST_SUITE_RESULT_PATH/real.config.refused" 2>/dev/null
   if [ -e "$resultsFile" ]; then
     # $CONFIG_PATH is a SHARED sharedConfig (2775, group dev). Another user's
     # file is unlinkable unless the DIRECTORY lost its group-write bit — the
-    # state private.os.platform.shared.config.repair exists to fix. Silent
+    # state private.platform.shared.config.repair exists to fix. Silent
     # failure here silently restores the inheritance bug, so: loud, and via
     # bare echo so the instruction survives any LOG_DEVICE.
     create.result 1 "cannot remove $resultsFile — every score from here on would be inherited"
@@ -219,6 +221,22 @@ test.suite.init() # # initializes test suite counters and environment
   # (T-SUITE-NO-INSTALL); a test of an install lifts it (env -u).
   export OOSH_NO_INSTALL=1
 
+  # The real configuration of the user running the tests — no test may write
+  # it. 2026-10-20 a test let `user` overwrite the real ~/config/user.env and
+  # PATH broke for the whole machine; the runner's restore came only after the
+  # file. Named once, canonical, from the passwd home (not $HOME, which a
+  # fixture sets), with `:=` so a nested runner keeps the outer value; every
+  # config writer asks private.this.config.write.guard
+  # (T-TEST-SUITE-REAL-CONFIG-EXPORTED). A platform test's `env -i` drops
+  # them on purpose: it checks the real machine.
+  if [ -z "$TEST_SUITE_REAL_CONFIG" ]; then
+    local realHome
+    realHome=$(private.this.home.real.get) || realHome="$HOME"
+    TEST_SUITE_REAL_CONFIG=$(private.this.path.canonical "$realHome/config")
+    TEST_SUITE_REAL_SESSION=$(private.this.path.canonical "$realHome/.config/oosh")
+  fi
+  export TEST_SUITE_REAL_CONFIG TEST_SUITE_REAL_SESSION
+
   # Where this file's score goes. `:=` on an exported variable means the
   # runner's value wins in every child (test files are exec'd, not sourced), so
   # parent and child resolve the same handoff path by construction rather than
@@ -280,6 +298,7 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder, or t
 
   private.test.suite.results.dir.open >/dev/null
   private.test.suite.shared.snapshot >/dev/null
+  private.test.suite.ssh.snapshot >/dev/null
   private.test.suite.session.snapshot >/dev/null
 
   # Same pre-clear as the filtered runner: after this line the handoff exists
@@ -301,6 +320,18 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder, or t
     local sharedWaiver; sharedWaiver=$(private.test.suite.shared.waiver.get "$testFile")
     [ -z "$sharedWaiver" ] && sharedWrites=1
     private.test.suite.shared.report "$sharedReason" "$testName" "$sharedWaiver"
+  fi
+  if ! private.test.suite.real.config.verify "$testName"; then
+    sharedWrites=1
+    echo -e "\e[1;31m  ✗ REAL CONFIG: $RESULT — give the test its own HOME, CONFIG_PATH and CONFIG\e[0m" >&2
+  fi
+  # The runner user's real ~/.ssh, as in the filtered runner — a platform file
+  # is exempt, it looks at the real machine (T-REAL-SSH-RUNNER-RESTORE).
+  local sshWrites=0
+  private.test.suite.category "$testFile"
+  if [ "$RESULT" != "platform" ] && ! private.test.suite.ssh.verify "$testName"; then
+    sshWrites=1
+    private.test.suite.ssh.report "$RESULT" "$testName"
   fi
 
   local resultsFile; resultsFile=$(private.test.suite.results.file.get)
@@ -325,6 +356,9 @@ test.suite.run() # <test> <?logLevel:1> # runs a test from the test folder, or t
   local rc=0
   if [ "$sharedWrites" -gt 0 ]; then
     echo -e "\e[1;31m  ✗ the shared config tier was written\e[0m"
+    rc=1
+  elif [ "$sshWrites" -gt 0 ]; then
+    echo -e "\e[1;31m  ✗ the real ~/.ssh was written\e[0m"
     rc=1
   elif [ "$noResults" -gt 0 ]; then
     echo -e "\e[1;31m  ✗ NO RESULTS: $testName ended before test.suite.save.results — a file that scores nothing fails\e[0m"
@@ -386,9 +420,14 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   # so the number is visible and has to come down.
   local -i SHARED_WAIVED_COUNT=0
   local SHARED_WAIVED_FILES=""
+  # Files caught writing the runner user's real ~/.ssh (T-REAL-SSH-RUNNER).
+  # No waiver: nothing a test needs can only be had from the real keys.
+  local -i SSH_WRITE_COUNT=0
+  local SSH_WRITE_FILES=""
 
   private.test.suite.results.dir.open >/dev/null
   private.test.suite.shared.snapshot >/dev/null
+  private.test.suite.ssh.snapshot >/dev/null
   private.test.suite.session.snapshot >/dev/null
 
   # Count total files matching filter
@@ -479,6 +518,18 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
         fi
         private.test.suite.shared.report "$sharedReason" "$filename" "$sharedWaiver"
       fi
+      if ! private.test.suite.real.config.verify "$filename"; then
+        ((SHARED_WRITE_COUNT++))
+        SHARED_WRITE_FILES="$SHARED_WRITE_FILES $filename"
+        echo -e "\e[1;31m  ✗ REAL CONFIG: $RESULT — give the test its own HOME, CONFIG_PATH and CONFIG\e[0m" >&2
+      fi
+      # Same exemption, same rule, for the runner user's real ~/.ssh: the
+      # 2026-10-16 authorized_keys rebuild ran inside a green core run.
+      if ! private.test.suite.ssh.verify "$filename"; then
+        ((SSH_WRITE_COUNT++))
+        SSH_WRITE_FILES="$SSH_WRITE_FILES $filename"
+        private.test.suite.ssh.report "$RESULT" "$filename"
+      fi
     fi
 
     # Load per-file results saved by test.suite.save.results in the subprocess
@@ -565,6 +616,9 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   if [ "$SHARED_WAIVED_COUNT" -gt 0 ]; then
     echo -e "  \e[1;33mShared tier: $SHARED_WAIVED_COUNT known writer(s), waived and restored:\e[0m$SHARED_WAIVED_FILES"
   fi
+  if [ "$SSH_WRITE_COUNT" -gt 0 ]; then
+    echo -e "  \e[1;31mReal ~/.ssh: $SSH_WRITE_COUNT file(s) wrote $TEST_SUITE_SSH_ORIGIN:\e[0m$SSH_WRITE_FILES"
+  fi
   echo ""
 
   # GitHub Actions Job Summary (only when running in GHA)
@@ -610,7 +664,8 @@ private.test.suite.run.filtered() # <level> <clear> <?category> # runs tests mat
   local rc=0
   if private.test.suite.verdict \
        "$SHARED_WRITE_COUNT" "$NO_RESULT_COUNT" "$categoryFilter" \
-       "$CUMULATIVE_EXPECT_COUNTER" "$CUMULATIVE_SUCCESS_COUNTER" "$META_TEST_FAILURES"; then
+       "$CUMULATIVE_EXPECT_COUNTER" "$CUMULATIVE_SUCCESS_COUNTER" "$META_TEST_FAILURES" \
+       "$SSH_WRITE_COUNT"; then
     if [ "$ONLY_INTENTIONAL_FAILURE" -eq 1 ]; then
       echo -e "  \e[1;32m╔══════════════════════════════════════════════════════════════════╗\e[0m"
       echo -e "  \e[1;32m║  ✓ ALL TESTS PASSED                                              ║\e[0m"
@@ -813,6 +868,39 @@ expect.fail() # <?message> # simple fail assertion with optional message
 
 
 
+
+test.suite.completion.exists()     # <script> <method> <param> # rc 0 + RESULT naming it when c2 has a completion for <param> of <script> <method>: <script>.<method>.completion.<param> or else the class-level <script>.parameter.completion.<param>; rc 1 + RESULT naming both otherwise #
+{
+  # A test that only asks "does <param> complete" must accept both forms c2
+  # looks up (ng/c2 private.call.custom.completion: method-specific first,
+  # then class-level). Pinning one form broke tests when Marcel moved
+  # completions to the class level (36e1305d, 2026-10-20;
+  # T-SUITE-COMPLETION-EXISTS).
+  local s="$1" m="$2" p="$3"
+  if [ -z "$s" ] || [ -z "$m" ] || [ -z "$p" ]; then
+    create.result 1 "test.suite.completion.exists requires <script> <method> <param>"
+    return $(result)
+  fi
+  if [ "$(type -t "$s.$m.completion.$p")" = function ]; then
+    create.result 0 "$s.$m.completion.$p"
+  elif [ "$(type -t "$s.parameter.completion.$p")" = function ]; then
+    create.result 0 "$s.parameter.completion.$p"
+  else
+    create.result 1 "no completion for $s $m <$p>: neither $s.$m.completion.$p nor $s.parameter.completion.$p"
+  fi
+  return $(result)
+}
+
+test.suite.completion.get()     # <script> <method> <param> <?cur> # echo what c2 would offer for <param> of <script> <method>: the completion test.suite.completion.exists finds, called as c2 calls it ("<cur>" "<script>" "<method>"); rc 1 and nothing when there is none #
+{
+  # NO create.result on success — consumed as $(...). The twin of
+  # completion.exists for tests that check the candidates, so they do not
+  # call one spelling of the function by name (T-SUITE-COMPLETION-EXISTS).
+  local s="$1" m="$2" p="$3" cur="$4" fn
+  test.suite.completion.exists "$s" "$m" "$p" >/dev/null || return 1
+  fn="$RESULT"
+  "$fn" "$cur" "$s" "$m"
+}
 
 test.suite.fixture.make() # <?label:caller> # a fresh temp directory, CANONICALISED so a resolved path compares equal on macOS too; echoes the directory
 {
@@ -1065,6 +1153,22 @@ private.test.suite.shared.verify() # <testFile> # rc 1 and $RESULT naming which 
   return $(result)
 }
 
+private.test.suite.real.config.verify()     # <testFile> # rc 1 + RESULT naming the real config files <testFile> tried to write — private.this.config.write.guard refused them; rc 0 when it tried none; runner-only, call it after every child #
+{
+  # The guard stops the write; this makes the attempt a red file, as a shared
+  # tier write is, so a test that forgot its fixture is named, not hidden
+  # (T-TEST-SUITE-REAL-CONFIG-EXPORTED).
+  local testFile="${1:-an unnamed test file}" mark="$TEST_SUITE_RESULT_PATH/real.config.refused" files
+  if [ ! -s "$mark" ]; then
+    create.result 0 "no write to the real config tried"
+    return $(result)
+  fi
+  files=$(sort -u "$mark" | tr '\n' ' ')
+  rm -f "$mark" 2>/dev/null
+  create.result 1 "$testFile tried to write the real config: $files"
+  return $(result)
+}
+
 private.test.suite.shared.restore() # # put the snapshotted config tier back, byte for byte; runner-only, call it after private.test.suite.shared.verify reports a write
 {
   # Not suppression: the run has already been failed by the caller. The tier is
@@ -1096,20 +1200,26 @@ private.test.suite.shared.restore() # # put the snapshotted config tier back, by
   return $(result)
 }
 
-private.test.suite.verdict() # <sharedWrites> <noResults> <category> <expects> <passed> <?metaFailures:-> # the suite's pass/fail rule as one decision; rc 0 pass, rc 1 fail, $RESULT is the reason
+private.test.suite.verdict()     # <sharedWrites> <noResults> <category> <expects> <passed> <?metaFailures:-> <?sshWrites:0> # the suite's pass/fail rule as one decision; rc 0 pass, rc 1 fail, $RESULT is the reason #
 {
   # Extracted from the tail of private.test.suite.run.filtered, where it was a
   # twenty-line if/elif chain no test could reach — which is how two failure
   # causes came to be displayed and then dropped on the floor before the
-  # return code. The macOS workflow and `os platform.test` gate on that return
-  # code (macos-test.yml Test Summary; os.platform.test's four rcs), so a
+  # return code. The macOS workflow and `platform test` gate on that return
+  # code (macos-test.yml Test Summary; platform.test's four rcs), so a
   # cause that does not reach it does not exist.
   local sharedWrites="${1:-0}" noResults="${2:-0}" category="$3"
-  local expects="${4:-0}" passed="${5:-0}" metaFailures="$6"
+  local expects="${4:-0}" passed="${5:-0}" metaFailures="$6" sshWrites="${7:-0}"
   local failed=$((expects - passed))
 
   if [ "$sharedWrites" -gt 0 ]; then
     create.result 1 "the shared config tier was written during this run"
+    return $(result)
+  fi
+  # Last parameter so every older caller keeps its meaning; any category, no
+  # waiver — the runner user's own keys (T-REAL-SSH-VERDICT rows in T-VERDICT).
+  if [ "$sshWrites" -gt 0 ]; then
+    create.result 1 "the real ~/.ssh was written during this run"
     return $(result)
   fi
   # core and platform: the twelve known score-less files are all extended,
@@ -1205,7 +1315,6 @@ $0
 
 test.suite.portability.validate()     # <?treeRoot:$OOSH_DIR/test> # verify test-harness code makes no GNU-only or Linux-only assumption; rc 1 and a report on any violation #
 {
-  private.this.script.load ogit ogit.branch.get
   # THE RULE: a test may not assume GNU coreutils or a Linux filesystem. When it
   # does, it does not fail honestly — it reports the CODE UNDER TEST as broken
   # while that code is fine, with a confident and specific message that sends
@@ -1242,7 +1351,7 @@ test.suite.portability.validate()     # <?treeRoot:$OOSH_DIR/test> # verify test
   # tarball with no repository, or the "detected dubious ownership" refusal that
   # fires whenever the checkout is owned by a different user than the one
   # running (root in a container against an oosh-user tree, which is exactly the
-  # shape `os platform.test` runs in). Both come back as an empty result, and an
+  # shape `platform test` runs in). Both come back as an empty result, and an
   # empty result is indistinguishable from a clean tree: the gate would report
   # OK while having read nothing at all. Prove the sweep can see the files
   # BEFORE trusting that it found no violations in them — the kernel's one
@@ -1272,6 +1381,8 @@ test.suite.portability.validate()     # <?treeRoot:$OOSH_DIR/test> # verify test
 readlink -f@@violation@@readlink -f is absent on BSD before macOS 12.3 (it works on Sequoia, measured); use private.this.path.canonical, which carries the fallback
 script -qec @@violation@@script does not guarantee which shell runs the command; run it as: bash <file>
 (^|[^A-Za-z])grep -P@@violation@@grep -P is GNU-only; use grep -E
+(^|[^A-Za-z.-])sed [^|@]*\\\|@@violation@@GNU-only backslash-pipe alternation in a sed BRE; BSD sed has none — use sed -E with (a|b)
+wc -l\)" !?= [0-9]@@violation@@BSD wc -l pads the count with spaces ("       1" is not "1"); compare it with -eq
 stat -c@@violation@@stat -c is GNU-only; pair it with a stat -f fallback
 date -d @@violation@@date -d is GNU-only; BSD date uses -v/-j
 (^|[|;&(]|\$\()[[:space:]]*sed -i [[:alnum:]]@@violation@@sed -i needs an explicit suffix on BSD; write a temp file and mv, or use replace
@@ -1330,6 +1441,13 @@ LOG_DEVICE=/proc/@@violation@@macOS has no /proc — in a fresh shell this finds
         'grep'*) if printf '%s' "$content" | grep -qE 'grep [^|]*-[A-Za-z]*E'; then
                    exceptions=$((exceptions + 1)); continue
                  fi ;;
+        # sed -E (or -r): the same as grep -E — \| is a literal pipe there.
+        # \| right after the opening quote is the POSIX address delimiter
+        # (sed '\|re|d'), not an alternation (test.path's editor).
+        *'sed [^|@]'*) if printf '%s' "$content" | grep -qE 'sed [^|]*-[A-Za-z]*[Er]'; then
+                   exceptions=$((exceptions + 1)); continue
+                 fi
+                 case "$content" in *"'\\|"*|*"'\\\\|"*) exceptions=$((exceptions + 1)); continue ;; esac ;;
         'script -qec '*) case "$content" in *'bash '*|*'sh '*) exceptions=$((exceptions + 1)); continue ;; esac ;;
         'stat -c') case "$joined" in *'stat -f'*) exceptions=$((exceptions + 1)); continue ;; esac ;;
         'date -d '*) case "$joined" in *'date -r'*|*'date -v'*|*'date -j'*) exceptions=$((exceptions + 1)); continue ;; esac ;;
@@ -1380,9 +1498,9 @@ $(printf '%s' "$advisoryFiles" | sort | uniq -c | sort -rn)"
 test.suite.portability.validate.completion.treeRoot() { echo "$OOSH_DIR/test"; }
 
 
-test.suite.gate()     # <?logLevel:1> # the post-install gate os platform.test runs per user: core, then the platform checks platform.shared.configLayout.invariant and platform.ssh.config.woda.portable; rc 1 when one fails #
+test.suite.gate()     # <?logLevel:1> # the post-install gate platform test runs per user: core, then the platform checks platform.shared.configLayout.invariant and platform.ssh.config.woda.portable; rc 1 when one fails #
 {
- # os platform.test ran only `test.suite core 1` per user, so a platform
+ # platform test ran only `test.suite core 1` per user, so a platform
  # invariant never gated a run. Both halves always run — a red core must not
  # hide what the platform invariant says about the install.
  # platform.ssh.config.woda.portable: a core test until 2026-10-14 — it reads
@@ -1460,6 +1578,257 @@ private.test.suite.session.files.get()     #  # RESULT = the per-user session fi
  # (T-SUITE-SESSION-RESTORE).
  create.result 0 "user.session.env log.session.env oosh.session.env"
  return $(result)
+}
+
+
+private.test.suite.ssh.origin.get()     #  # the runner user's REAL ssh folder: the passwd home's .ssh, not $HOME's — ssh reads the passwd home; answers on stdout #
+{
+  # NO create.result — a getter consumed as $(...), same subshell reasoning as
+  # private.test.suite.results.file.get.
+  #
+  # The passwd home, not $HOME: ssh, and anything that resolves ~user, reads
+  # the password database whatever HOME says, so a test that sets HOME to a
+  # fixture still writes the real folder through them (RULES SAFETY). bash's
+  # ~user expansion reads that database on Linux and macOS alike — the same
+  # derivation `this` uses for an `env -i` boot. $HOME only when there is no
+  # passwd entry (T-REAL-SSH-ORIGIN).
+  local home; home=$(private.this.home.real.get) || home="$HOME"
+  echo "$home/.ssh"
+}
+
+
+private.test.suite.ssh.mode.get()     # <path> # the permission bits of <path> as octal digits (GNU stat, else BSD stat); answers on stdout #
+{
+  # NO create.result — a getter consumed as $(...).
+  # GNU first, BSD second — the shape test/test.osshLayout uses (T-REAL-SSH-STAMP).
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+
+private.test.suite.ssh.stamp.get()     # <sshDir> # fingerprint of every file and symlink under <sshDir>: one line per path, mode plus content checksum and size; answers on stdout #
+{
+  # NO create.result — a getter consumed as $(...).
+  #
+  # The WHOLE folder, not a list of names: the 2026-10-16 incident CREATED
+  # authorized_keys, and a key rebuild can as well rewrite id_*, public_keys/,
+  # private_key/ or ids/. A path that appears is a new line, one that goes is a
+  # missing line, so presence is part of the stamp. Regular files and
+  # symlinks only — an ossh ControlMaster socket may live here
+  # (private.ossh.control.path.get's last fallback) and is not a write.
+  #
+  # Mode IS stamped, unlike the shared tier's content-only stamp: the runner
+  # owns its ~/.ssh, so restore can put a mode back, and a re-moded private key
+  # is damage (ssh refuses it). mtime is not: a byte-identical rewrite changes
+  # nothing ssh reads. Tab-separated: <relative path> TAB <mode> <cksum size>.
+  local dir="$1" path
+  [ -d "$dir" ] || return 0
+  while IFS= read -r path; do
+    printf '%s\t%s %s\n' "${path#"$dir"/}" "$(private.test.suite.ssh.mode.get "$path")" "$(cksum < "$path" 2>/dev/null)"
+  done < <(find "$dir" \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort)
+}
+
+
+private.test.suite.ssh.snapshot()     #  # pin the real ~/.ssh of the user running the suite, fingerprint all of it and copy aside its non-secret files, so a test file that writes it can be named and the damage undone; runner-only #
+{
+  # The shared tier's guard, for the one folder HOME=<fixture> cannot protect:
+  # on 2026-10-16 a test run rebuilt the real ~/.ssh/authorized_keys from
+  # ~/.ssh/public_keys/ and stayed green (T-REAL-SSH-DETECTS). Pinned here,
+  # before the first file, and exported, so every child and a nested runner
+  # watch the same folder; a caller that pins TEST_SUITE_SSH_ORIGIN itself
+  # (the meta-test, at a fixture) is never overridden.
+  : ${TEST_SUITE_SSH_ORIGIN:=$(private.test.suite.ssh.origin.get)}
+  export TEST_SUITE_SSH_ORIGIN
+  # Re-taken on every runner start, so a baseline that changed between runs
+  # (a stray file removed by hand) is never "restored" back.
+  # Unpinned until the copy succeeded: a nested runner inherits its parent's
+  # exported pins, and a failed copy must not leave it verifying against those.
+  unset TEST_SUITE_SSH_SNAPSHOT TEST_SUITE_SSH_STAMP
+  local snap="$TEST_SUITE_RESULT_PATH/realSsh"
+  rm -rf "${snap:?}" 2>/dev/null
+  if ! mkdir -p -m 700 "$snap" 2>/dev/null; then
+    create.result 1 "cannot create $snap — the real ~/.ssh would be unguarded for this whole run"
+    echo -e "\e[1;31m  ✗ test.suite: $RESULT\e[0m" >&2
+    return $(result)
+  fi
+  # Every folder (to know which ones a test created) and every NON-SECRET file
+  # or link, with its mode. A private key is fingerprinted but never copied: a
+  # killed run leaves this folder in /tmp (T-REAL-SSH-RESTORES). Such a key,
+  # if a test changes it, is reported for the user to restore by hand.
+  # An absent ~/.ssh is a legitimate baseline: an empty snapshot.
+  local path rel rc=0
+  if [ -d "$TEST_SUITE_SSH_ORIGIN" ]; then
+    while IFS= read -r path; do
+      mkdir -p "$snap/${path#"$TEST_SUITE_SSH_ORIGIN"/}" 2>/dev/null || rc=1
+    done < <(find "$TEST_SUITE_SSH_ORIGIN" -mindepth 1 -type d 2>/dev/null)
+    while IFS= read -r path; do
+      rel="${path#"$TEST_SUITE_SSH_ORIGIN"/}"
+      [ ! -L "$path" ] && private.test.suite.ssh.secret.is "$rel" && continue
+      cp -Pp "$path" "$snap/$rel" 2>/dev/null || rc=1
+    done < <(find "$TEST_SUITE_SSH_ORIGIN" -mindepth 1 \( -type f -o -type l \) 2>/dev/null)
+  fi
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "cannot copy $TEST_SUITE_SSH_ORIGIN to $snap — the real ~/.ssh would be unguarded for this whole run"
+    echo -e "\e[1;31m  ✗ test.suite: $RESULT\e[0m" >&2
+    return $(result)
+  fi
+  TEST_SUITE_SSH_SNAPSHOT="$snap"
+  TEST_SUITE_SSH_STAMP=$(private.test.suite.ssh.stamp.get "$TEST_SUITE_SSH_ORIGIN")
+  export TEST_SUITE_SSH_SNAPSHOT TEST_SUITE_SSH_STAMP
+  create.result 0 "snapshotted $TEST_SUITE_SSH_ORIGIN to $snap, private keys fingerprinted only"
+  return $(result)
+}
+
+
+private.test.suite.ssh.verify()     # <testFile> # rc 1 and $RESULT naming every path <testFile> created, changed or removed in the real ~/.ssh; runner-only, call it after every core and extended child #
+{
+  local testFile="${1:-an unnamed test file}"
+  if [ -z "$TEST_SUITE_SSH_SNAPSHOT" ]; then
+    # No snapshot pinned, no claim — as private.test.suite.shared.verify.
+    create.result 0 "no ssh snapshot pinned"
+    return $(result)
+  fi
+  local nowStamp; nowStamp=$(private.test.suite.ssh.stamp.get "$TEST_SUITE_SSH_ORIGIN")
+  if [ "$nowStamp" = "$TEST_SUITE_SSH_STAMP" ]; then
+    create.result 0 "real ~/.ssh untouched"
+    return $(result)
+  fi
+  # Name each path and what happened to it (T-REAL-SSH-DETECTS). awk with an
+  # exact first-field match on the tab-separated stamp — a grep would read the
+  # dots in a key name as wildcards.
+  local changed="" key before after
+  while IFS= read -r key; do
+    before=$(printf '%s\n' "$TEST_SUITE_SSH_STAMP" | awk -F'\t' -v k="$key" '$1==k {print $2}')
+    after=$(printf '%s\n' "$nowStamp" | awk -F'\t' -v k="$key" '$1==k {print $2}')
+    if [ -z "$before" ]; then
+      changed="$changed $key (created)"
+    elif [ -z "$after" ]; then
+      changed="$changed $key (removed)"
+    elif [ "$before" != "$after" ]; then
+      changed="$changed $key (changed)"
+    fi
+  done < <(printf '%s\n%s\n' "$TEST_SUITE_SSH_STAMP" "$nowStamp" | cut -f1 | grep -v '^$' | LC_ALL=C sort -u)
+  create.result 1 "$testFile changed ~/.ssh:$changed"
+  return $(result)
+}
+
+
+private.test.suite.ssh.restore()     #  # put the real ~/.ssh back as snapshotted: a created path removed, a changed or removed file copied back with its mode — private keys excepted, they were never copied; runner-only, call it after private.test.suite.ssh.verify reports a write #
+{
+  # Not suppression — the caller has already failed the run. This is the
+  # runner user's own keys and trust; leaving one test file's damage in place
+  # (an authorized_keys nobody wanted) is what happened on 2026-10-16
+  # (T-REAL-SSH-RESTORES). A private key is not in the snapshot, so it is
+  # neither removed nor put back here: private.test.suite.ssh.report names it
+  # for the user (private.test.suite.ssh.secrets.changed.get).
+  local snap="$TEST_SUITE_SSH_SNAPSHOT" origin="$TEST_SUITE_SSH_ORIGIN"
+  if [ -z "$snap" ] || [ ! -d "$snap" ] || [ -z "$origin" ]; then
+    create.result 1 "no ssh snapshot to restore from"
+    return $(result)
+  fi
+  local path rel f keep rc=0
+  # 1. what the snapshot never had goes — files and links first, then folders,
+  #    deepest first, only under origin. A private key is left alone: it was
+  #    never copied, so its absence from the snapshot says nothing.
+  if [ -d "$origin" ]; then
+    while IFS= read -r path; do
+      rel="${path#"$origin"/}"
+      { [ -e "$snap/$rel" ] || [ -L "$snap/$rel" ]; } && continue
+      [ ! -L "$path" ] && private.test.suite.ssh.secret.is "$rel" && continue
+      rm -f "${path:?}" 2>/dev/null || rc=1
+    done < <(find "$origin" -mindepth 1 \( -type f -o -type l \) 2>/dev/null)
+    while IFS= read -r path; do
+      rel="${path#"$origin"/}"
+      [ -d "$snap/$rel" ] && continue
+      # a created folder that still holds a private key stays — the key is the user's
+      keep=""
+      while IFS= read -r f; do
+        private.test.suite.ssh.secret.is "${f#"$origin"/}" && keep=1
+      done < <(find "$path" -type f 2>/dev/null)
+      [ -n "$keep" ] && continue
+      rm -rf "${path:?}" 2>/dev/null || rc=1
+    done < <(find "$origin" -mindepth 1 -depth -type d 2>/dev/null)
+  fi
+  # 2. every snapshotted file that differs comes back with its mode. rm first:
+  #    cp onto a symlink would write through it.
+  while IFS= read -r path; do
+    rel="${path#"$snap"/}"
+    if [ ! -L "$path" ] && [ ! -L "$origin/$rel" ] && cmp -s "$path" "$origin/$rel" \
+       && [ "$(private.test.suite.ssh.mode.get "$path")" = "$(private.test.suite.ssh.mode.get "$origin/$rel")" ]; then
+      continue
+    fi
+    mkdir -p "$(dirname "$origin/$rel")" 2>/dev/null
+    rm -f "${origin:?}/${rel:?}" 2>/dev/null
+    cp -Pp "$path" "$origin/$rel" 2>/dev/null || rc=1
+  done < <(find "$snap" -mindepth 1 \( -type f -o -type l \) 2>/dev/null)
+  if [ "$rc" -ne 0 ]; then
+    create.result 1 "could not put $origin back — it is left as the test file wrote it"
+    return $(result)
+  fi
+  create.result 0 "$origin restored"
+  return $(result)
+}
+
+
+private.test.suite.ssh.report()     # <reason> <testFile> # print the real-~/.ssh verdict with how to fix the test file, put ~/.ssh back, and name each private key the user must restore by hand; runner-only #
+{
+  # Bare echo, not error.log — the shared tier's doctrine: it must survive a
+  # non-tty CI run and any LOG_DEVICE (T-REAL-SSH-RUNNER).
+  echo -e "\e[1;31m  ✗ REAL ~/.ssh WRITTEN: $1\e[0m" >&2
+  echo -e "\e[1;31m    real ~/.ssh: $TEST_SUITE_SSH_ORIGIN\e[0m" >&2
+  echo -e "\e[1;31m    fix: in ${2} set HOME and CURRENT_SSH_DIR to a fixture (test.suite.fixture.make) before the 'source' of the script under test,\e[0m" >&2
+  echo -e "\e[1;31m         and add ssh/scp/rsync backstop stubs — HOME alone does not redirect ssh, it reads the passwd home\e[0m" >&2
+  if private.test.suite.ssh.restore; then
+    echo -e "\e[1;33m    ~/.ssh has been restored from this run's snapshot (private keys excepted)\e[0m" >&2
+  else
+    echo -e "\e[1;31m    COULD NOT RESTORE: $RESULT\e[0m" >&2
+  fi
+  # A private key was never copied (T-REAL-SSH-RUNNER-RESTORE), so only the
+  # user can put it back — from their own backup.
+  local secret
+  while IFS= read -r secret; do
+    [ -n "$secret" ] && echo -e "\e[1;31m    restore by hand: $secret\e[0m" >&2
+  done < <(private.test.suite.ssh.secrets.changed.get)
+  create.result 0 "reported"
+  return $(result)
+}
+
+
+private.test.suite.ssh.secret.is()     # <relPath> # rc 0 when <relPath> (relative to ~/.ssh) names a private key the guard must never copy: private_key/*, id_* without .pub, *.private_key — at any depth #
+{
+  # The oosh ~/.ssh layout keeps private keys in three shapes: id_<type> (the
+  # owner's, and ids/ssh.<id>/id_<type>), any file under a private_key/
+  # folder, and <name>.private_key. Everything else — *.pub, public_keys/,
+  # authorized_keys, config, known_hosts* — is public and may be copied
+  # (T-REAL-SSH-SECRET).
+  local rel="$1" name="${1##*/}"
+  case "/$rel" in
+    */private_key/*) create.result 0 "secret: $rel"; return $(result) ;;
+  esac
+  case "$name" in
+    *.pub) create.result 1 "public: $rel" ;;
+    id_*|*.private_key) create.result 0 "secret: $rel" ;;
+    *) create.result 1 "public: $rel" ;;
+  esac
+  return $(result)
+}
+
+
+private.test.suite.ssh.secrets.changed.get()     #  # the absolute paths of the private keys in the real ~/.ssh that differ from the snapshot (created, changed or removed) — the ones only the user can put back; answers on stdout #
+{
+  # NO create.result — a getter consumed by a read loop.
+  # From the two fingerprints, not from the snapshot: a private key has a
+  # stamp line but no copy (T-REAL-SSH-RESTORES).
+  [ -n "$TEST_SUITE_SSH_STAMP" ] || return 0
+  local nowStamp key before after
+  nowStamp=$(private.test.suite.ssh.stamp.get "$TEST_SUITE_SSH_ORIGIN")
+  while IFS= read -r key; do
+    private.test.suite.ssh.secret.is "$key" || continue
+    [ -L "$TEST_SUITE_SSH_ORIGIN/$key" ] && continue
+    before=$(printf '%s\n' "$TEST_SUITE_SSH_STAMP" | awk -F'\t' -v k="$key" '$1==k {print $2}')
+    after=$(printf '%s\n' "$nowStamp" | awk -F'\t' -v k="$key" '$1==k {print $2}')
+    [ "$before" != "$after" ] && echo "$TEST_SUITE_SSH_ORIGIN/$key"
+  done < <(printf '%s\n%s\n' "$TEST_SUITE_SSH_STAMP" "$nowStamp" | cut -f1 | grep -v '^$' | LC_ALL=C sort -u)
+  return 0
 }
 
 

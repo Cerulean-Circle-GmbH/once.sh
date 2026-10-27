@@ -246,7 +246,7 @@ Uses `odocker reset` + `ossh install` workflow — treats containers like remote
     1. `odocker reset <image>` — fresh container with SSH
     2. `ossh config.create <platform> test@localhost:8022` — configure SSH
     3. `ossh config.save.last` — persist SSH config
-    4. `ossh push.key <platform>` — push SSH key
+    4. `ossh key.push <platform>` — push SSH key
     5. `ossh install <platform> test` — install oosh via SSH
     6. `ossh exec <platform> "test.suite all 1"` — run tests remotely
     7. Capture results, cleanup container via `private.os.platform.cleanup`

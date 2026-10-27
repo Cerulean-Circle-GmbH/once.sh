@@ -197,6 +197,58 @@ else
   expect.fail "canonical owner copy missing after prune"
 fi
 
+# T-OSSHLAYOUT-OWNER-KEEPS-OTHER-KEYS: role.owner only adds to private_key/, never drops another key
+# 2026-10-09, Marcel's Mac Studio: ~/.ssh had id_rsa and its copy
+# private_key/donges.mcdonges.fritz.box.private_key. role.owner generated
+# id_ed25519, copied it in as ssh.<owner>.private_key and deleted every other
+# file in private_key/ unchecked — his key copy was gone (back from the backup
+# by hand, 2026-10-19). Only a byte-identical copy of id_ed25519 may go.
+test.osshLayout.ownerKeepsOtherKeys() {
+  local fx="$TEST_OSSHLAYOUT_TMP/owner-keeps" bad=""
+  mkdir -p "$fx/private_key" "$fx/public_keys"
+  ssh-keygen -t ed25519 -f "$fx/id_rsa" -N '' -q -C "other.key"
+  cp "$fx/id_rsa" "$fx/private_key/donges.mcdonges.fritz.box.private_key"
+  cp "$fx/id_rsa" "$fx/id_rsa.before"
+  ( export USER_EMAIL="keep.user@example.com"; osshLayout.role.owner "$fx" >/dev/null 2>&1 )
+  cmp -s "$fx/id_rsa" "$fx/private_key/donges.mcdonges.fritz.box.private_key" || bad="$bad otherKeyGone"
+  cmp -s "$fx/id_rsa" "$fx/id_rsa.before" || bad="$bad idRsaChanged"
+  [ -f "$fx/id_ed25519" ] || bad="$bad noEd25519"
+  cmp -s "$fx/id_ed25519" "$fx/private_key/ssh.keep.user.example.com.private_key" || bad="$bad noOwnerCopy"
+  [ -z "$bad" ] && create.result 0 "another key in private_key/ stays" || create.result 1 "private_key:$bad"
+  return $(result)
+}
+test.case $level "T-OSSHLAYOUT-OWNER-KEEPS-OTHER-KEYS: role.owner keeps a different key in private_key/ and only adds its own" \
+  test.osshLayout.ownerKeepsOtherKeys
+expect 0 "another key in private_key/ stays" \
+  "role.owner deleted a key it did not write (Marcel's Mac Studio, 2026-10-09)"
+
+# T-OSSHLAYOUT-OWNER-NAME-COLLISION: a different key under the owner's file name is kept aside, not overwritten
+# role.owner did rm -f + cp on private_key/ssh.<owner>.private_key whatever it
+# held. A different key there is moved to ssh.<owner>.private_key.kept.<UTC>
+# (a real file, 600) before the owner copy is written.
+test.osshLayout.ownerNameCollision() {
+  local fx="$TEST_OSSHLAYOUT_TMP/owner-collision" bad="" kept
+  mkdir -p "$fx/private_key" "$fx/public_keys"
+  ssh-keygen -t ed25519 -f "$fx/id_ed25519" -N '' -q
+  ssh-keygen -t ed25519 -f "$fx/other" -N '' -q
+  cp "$fx/other" "$fx/private_key/ssh.clash.user.example.com.private_key"
+  ( export USER_EMAIL="clash.user@example.com"; osshLayout.role.owner "$fx" >/dev/null 2>&1 )
+  cmp -s "$fx/id_ed25519" "$fx/private_key/ssh.clash.user.example.com.private_key" || bad="$bad noOwnerCopy"
+  kept=$(ls "$fx/private_key/" | grep '^ssh\.clash\.user\.example\.com\.private_key\.kept\.' | head -1)
+  if [ -z "$kept" ]; then
+    bad="$bad notKept"
+  else
+    cmp -s "$fx/other" "$fx/private_key/$kept" || bad="$bad keptDiffers"
+    [ "$(stat -c %a "$fx/private_key/$kept" 2>/dev/null || stat -f %Lp "$fx/private_key/$kept")" = 600 ] || bad="$bad keptNot600"
+  fi
+  [ -z "$bad" ] && create.result 0 "the other key is kept aside" || create.result 1 "collision:$bad"
+  return $(result)
+}
+test.case $level "T-OSSHLAYOUT-OWNER-NAME-COLLISION: a different key under the owner's name is kept as .kept.<UTC>" \
+  test.osshLayout.ownerNameCollision
+expect 0 "the other key is kept aside" \
+  "role.owner overwrote a different key that had its file name"
+
 # ============================================================================
 # Test osshLayout.role.developking - template deployment
 # ============================================================================
@@ -307,7 +359,7 @@ expect 2 "*" "missing keypair returns 2"
 # ============================================================================
 
 # Use the installer dst from the previous test as the source for outeruser
-# (this mirrors the os platform.test scenario where outer == installer)
+# (this mirrors the platform test scenario where outer == installer)
 TEST_OUTER_DST="$TEST_OSSHLAYOUT_TMP/outer-fresh"
 test.case $level "role.outeruser mirrors a formatted source into ids/ssh.outeruser/" \
   osshLayout.role.outeruser "$INSTALLER_DST_DIR" "$TEST_OUTER_DST"
@@ -414,7 +466,7 @@ else
 fi
 
 # ============================================================================
-# Test staged identity (the os.platform.test / ProxyJump production path).
+# Test staged identity (the platform.test / ProxyJump production path).
 # Builds drive role.installer + role.outeruser from $OSSH_STAGE_DIR/oosh.<role>.*
 # files placed by ossh.install (private.ossh.identity.stage) before init/oosh.
 # ============================================================================
@@ -651,3 +703,21 @@ done
 
 ### test.method
 
+
+# T-OSSHLAYOUT-PERMS-TIGHTEN-PUBLIC: osshLayout perms.tighten — ossh rights.fix runs it as a command
+# (2026-10-22, the boss: no private.this.script.load); the modes it sets are the private one's.
+test.osshLayout.permsTightenPublic() {
+  local fx bad="" m
+  fx=$(test.suite.fixture.make osshlayoutpermspublic); mkdir -p "$fx/.ssh/ids/ssh.a/private_key"
+  : > "$fx/.ssh/ids/ssh.a/private_key/id_rsa"; chmod 775 "$fx/.ssh/ids/ssh.a" "$fx/.ssh/ids/ssh.a/private_key"; chmod 666 "$fx/.ssh/ids/ssh.a/private_key/id_rsa"
+  osshLayout.perms.tighten "$fx/.ssh" >/dev/null 2>&1 || bad="$bad rc=$?"
+  m=$(stat -c %a "$fx/.ssh/ids/ssh.a" 2>/dev/null || stat -f %Lp "$fx/.ssh/ids/ssh.a"); [ "$m" = 700 ] || bad="$bad dir=$m"
+  m=$(stat -c %a "$fx/.ssh/ids/ssh.a/private_key/id_rsa" 2>/dev/null || stat -f %Lp "$fx/.ssh/ids/ssh.a/private_key/id_rsa"); [ "$m" = 600 ] || bad="$bad key=$m"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "osshLayout perms.tighten sets 700 dirs and 600 private keys" || create.result 1 "perms public:$bad"
+  return $(result)
+}
+test.case $level "T-OSSHLAYOUT-PERMS-TIGHTEN-PUBLIC: osshLayout perms.tighten sets the canonical modes" test.osshLayout.permsTightenPublic
+expect 0 "osshLayout perms.tighten sets 700 dirs and 600 private keys" "ossh rights.fix could only reach the private helper by loading osshLayout"
+
+test.suite.save.results

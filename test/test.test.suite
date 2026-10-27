@@ -12,6 +12,7 @@ echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 source this
 source test.suite
+source $OOSH_DIR/ogit   # once, not loaded per test (the boss, 2026-10-22)
 
 log.level $level
 
@@ -483,24 +484,232 @@ expect 0 "a declared writer is reported and restored, but does not fail the run"
   "two core files cannot be isolated until T7 — the gate must stay meaningful without lying about them"
 
 # ============================================================================
+# T-REAL-SSH-* — the RUNNER guards the runner user's real ~/.ssh, for every file
+# ============================================================================
+# Incident 2026-10-16 12:46:31: during a run of test.ossh / test.user and the
+# red harnesses, something rebuilt the REAL ~/.ssh/authorized_keys of the user
+# running the suite from ~/.ssh/public_keys/ (mode 600) — a real
+# `user authorized.keys.update` against the real ~/.ssh. Nobody saw it: the run
+# stayed green and the culprit could not be found by reading. HOME=<fixture>
+# does not isolate everything (ssh reads the passwd home, a helper may use a
+# hardcoded ~), so the runner fingerprints the real ~/.ssh around EVERY core and
+# extended child, exactly as it does the shared config tier, names the
+# offender, fails the run and puts ~/.ssh back. Every test below points the
+# guard at a FIXTURE home via TEST_SUITE_SSH_ORIGIN — never the real ~/.ssh.
+
+test.test.suite.realSsh.fixture() { # <home> # a simulated ~/.ssh under <home>: config, known_hosts, a key pair on top, a key in each list folder, no authorized_keys; every private key holds the word PRIVATE
+  local ssh="$1/.ssh"
+  mkdir -p "$ssh/public_keys" "$ssh/private_key" "$ssh/ids/ssh.x"
+  printf 'Host fixture\n  User fixture\n' > "$ssh/config"
+  printf 'fixture.host ssh-ed25519 AAAAfixture\n' > "$ssh/known_hosts"
+  printf 'ssh-ed25519 AAAAfixturekey fixture\n' > "$ssh/public_keys/a.public_key"
+  printf 'PRIVATE fixture\n' > "$ssh/private_key/a.private_key"
+  printf 'PRIVATE id\n' > "$ssh/ids/ssh.x/id_ed25519"
+  printf 'PRIVATE top\n' > "$ssh/id_ed25519"
+  printf 'ssh-ed25519 AAAAtop top\n' > "$ssh/id_ed25519.pub"
+  chmod 640 "$ssh/public_keys/a.public_key"
+  chmod 600 "$ssh/private_key/a.private_key" "$ssh/ids/ssh.x/id_ed25519" "$ssh/config" "$ssh/known_hosts" "$ssh/id_ed25519" "$ssh/id_ed25519.pub"
+}
+
+# --- T-REAL-SSH-DETECTS -----------------------------------------------------
+# What the incident did (authorized_keys CREATED) and the other three shapes of
+# damage: a changed file, a file that appears in a list folder, a removed file,
+# and a mode change on a private key (ssh refuses a group-readable key).
+test.test.suite.realSshDetects() {
+  local fx out rc bad=""
+  fx=$(test.suite.fixture.make test.test.suite.realssh.detects)
+  test.test.suite.realSsh.fixture "$fx/home"
+  mkdir -p "$fx/run"
+  # A subshell: the pins below must not leak into THIS file's own guard.
+  out=$(
+    export TEST_SUITE_SSH_ORIGIN="$fx/home/.ssh" TEST_SUITE_RESULT_PATH="$fx/run"
+    private.test.suite.ssh.snapshot >/dev/null 2>&1 || { echo "SNAPSHOT-FAILED"; exit 1; }
+    private.test.suite.ssh.verify probeFile >/dev/null 2>&1 || { echo "CLEAN-REPORTED-DIRTY: $RESULT"; exit 1; }
+    cat "$fx/home/.ssh/public_keys/a.public_key" > "$fx/home/.ssh/authorized_keys"
+    printf 'other.host ssh-ed25519 AAAAother\n' >> "$fx/home/.ssh/known_hosts"
+    printf 'ssh-ed25519 AAAAnew new\n' > "$fx/home/.ssh/ids/ssh.x/new.public_key"
+    rm -f "$fx/home/.ssh/private_key/a.private_key"
+    chmod 644 "$fx/home/.ssh/ids/ssh.x/id_ed25519"
+    private.test.suite.ssh.verify probeFile >/dev/null 2>&1 && { echo "WRITE-NOT-DETECTED"; exit 1; }
+    echo "$RESULT"
+  ); rc=$?
+  rm -rf "$fx"
+  [ "$rc" = 0 ] || bad="$bad rc=$rc[$out]"
+  case "$out" in *probeFile*) ;; *) bad="$bad offender-not-named" ;; esac
+  case "$out" in *"authorized_keys (created)"*) ;; *) bad="$bad created-missed" ;; esac
+  case "$out" in *"known_hosts (changed)"*) ;; *) bad="$bad changed-missed" ;; esac
+  case "$out" in *"ids/ssh.x/new.public_key (created)"*) ;; *) bad="$bad listed-file-missed" ;; esac
+  case "$out" in *"private_key/a.private_key (removed)"*) ;; *) bad="$bad removed-missed" ;; esac
+  case "$out" in *"ids/ssh.x/id_ed25519 (changed)"*) ;; *) bad="$bad mode-missed" ;; esac
+  case "$out" in *" config ("*) bad="$bad untouched-named" ;; esac
+  [ -z "$bad" ] && create.result 0 "every write to ~/.ssh is caught and named, with the offender" || create.result 1 "detects:$bad"
+  return $(result)
+}
+test.case $level "T-REAL-SSH-DETECTS: a created, changed, removed or re-moded file in ~/.ssh is caught and named" \
+  test.test.suite.realSshDetects
+expect 0 "every write to ~/.ssh is caught and named, with the offender" \
+  "a real authorized_keys rebuild ran during a test run on 2026-10-16 and nothing noticed"
+
+# --- T-REAL-SSH-RESTORES ----------------------------------------------------
+# The guard puts ~/.ssh back: a CREATED file is removed (the guard must never
+# leave — or re-create — an authorized_keys that was not there), a changed or
+# removed file comes back byte for byte WITH its mode, a created folder goes.
+# PRIVATE KEYS are never copied: a killed run would leave them in /tmp. So no
+# copy of a fixture private key may exist anywhere under the run folder (found
+# by content), and a changed private key is reported — still dirty after the
+# restore — with "restore by hand: <path>", not put back.
+test.test.suite.realSshRestores() {
+  local fx out rc bad="" ssh
+  fx=$(test.suite.fixture.make test.test.suite.realssh.restores)
+  test.test.suite.realSsh.fixture "$fx/home"
+  ssh="$fx/home/.ssh"
+  mkdir -p "$fx/run"
+  cp -p "$ssh/known_hosts" "$fx/known_hosts.orig"
+  out=$(
+    export TEST_SUITE_SSH_ORIGIN="$ssh" TEST_SUITE_RESULT_PATH="$fx/run"
+    private.test.suite.ssh.snapshot >/dev/null 2>&1 || { echo "SNAPSHOT-FAILED"; exit 1; }
+    grep -rlF "PRIVATE" "$fx/run" 2>/dev/null | sed 's/^/SECRET-COPIED:/'
+    cat "$ssh/public_keys/a.public_key" > "$ssh/authorized_keys"
+    printf 'rewritten\n' > "$ssh/known_hosts"
+    rm -f "$ssh/public_keys/a.public_key"
+    mkdir -p "$ssh/ids/ssh.new" && printf 'k.pub\n' > "$ssh/ids/ssh.new/id_ed25519.pub"
+    chmod 644 "$ssh/id_ed25519.pub"
+    private.test.suite.ssh.restore >/dev/null 2>&1 || { echo "RESTORE-FAILED: $RESULT"; exit 1; }
+    private.test.suite.ssh.verify probeFile >/dev/null 2>&1 || { echo "STILL-DIRTY: $RESULT"; exit 1; }
+    # now a secret: changed, reported, by hand, not restored
+    printf 'PRIVATE changed\n' > "$ssh/private_key/a.private_key"
+    private.test.suite.ssh.verify probeFile >/dev/null 2>&1 && { echo "SECRET-CHANGE-MISSED"; exit 1; }
+    private.test.suite.ssh.report "$RESULT" probeFile 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+    private.test.suite.ssh.verify probeFile >/dev/null 2>&1 && echo "SECRET-RESTORED"
+    echo "restored"
+  ); rc=$?
+  [ "$rc" = 0 ] || bad="$bad rc=$rc[$out]"
+  case "$out" in *SECRET-COPIED*) bad="$bad private-key-copied[$(echo "$out" | grep SECRET-COPIED | tr '\n' ' ')]" ;; esac
+  case "$out" in *SECRET-RESTORED*) bad="$bad secret-restored" ;; esac
+  case "$out" in *"private_key/a.private_key (changed)"*) ;; *) bad="$bad secret-not-reported" ;; esac
+  case "$out" in *"restore by hand: $ssh/private_key/a.private_key"*) ;; *) bad="$bad no-by-hand-note" ;; esac
+  [ "$(cat "$ssh/private_key/a.private_key" 2>/dev/null)" = "PRIVATE changed" ] || bad="$bad secret-touched"
+  [ -e "$ssh/authorized_keys" ] && bad="$bad created-file-left"
+  cmp -s "$fx/known_hosts.orig" "$ssh/known_hosts" || bad="$bad known_hosts-not-byte-identical"
+  [ "$(private.test.suite.ssh.mode.get "$ssh/public_keys/a.public_key")" = 640 ] || bad="$bad removed-file-not-back-with-mode"
+  [ "$(private.test.suite.ssh.mode.get "$ssh/id_ed25519.pub")" = 600 ] || bad="$bad mode-not-restored"
+  [ -e "$ssh/ids/ssh.new" ] && bad="$bad created-folder-left"
+  [ -f "$ssh/ids/ssh.x/id_ed25519" ] && [ -f "$ssh/id_ed25519" ] || bad="$bad uncopied-secret-removed"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "~/.ssh is put back as it was, modes included; private keys are never copied, only reported" || create.result 1 "restores:$bad"
+  return $(result)
+}
+test.case $level "T-REAL-SSH-RESTORES: the snapshot undoes the damage — created removed, changed and removed put back with their mode; private keys by hand" \
+  test.test.suite.realSshRestores
+expect 0 "~/.ssh is put back as it was, modes included; private keys are never copied, only reported" \
+  "one bad test file must not leave the runner user's own ssh keys and trust changed — nor its private keys in /tmp"
+
+# --- T-REAL-SSH-RUNNER ------------------------------------------------------
+# End to end, through the real runner: a probe file that does what the
+# incident did (creates authorized_keys) is reported, fails the run, and its
+# file is gone afterwards. The probe writes the FIXTURE home's .ssh, which the
+# nested runner is told is "the real one" through TEST_SUITE_SSH_ORIGIN.
+test.test.suite.realSshRunner.probe() { # <probeFile> <category> <shell line> # write a one-assertion probe test file that runs <shell line>
+  printf '%s\n' '#!/usr/bin/env bash' "TEST_CATEGORY=$2" 'source this' 'source test.suite' \
+    "$3" 'expect.pass "the probe asserted something"' 'test.suite.save.results' > "$1"
+  chmod +x "$1"
+}
+test.test.suite.realSshRunner.run() { # <fixture> <probeFile> # run <probeFile> through a nested runner whose shared tier, session files and real ~/.ssh are all inside <fixture>; echoes the colour-stripped output, rc is the runner's
+  local out rc
+  out=$(env HOME="$1/home" CONFIG_PATH="$1" CONFIG_FILE=user.env CONFIG="$1/user.env" \
+      TEST_SUITE_CONFIG_ORIGIN="$1" TEST_SUITE_RESULT_PATH="$1/run" \
+      TEST_SUITE_SSH_ORIGIN="$1/home/.ssh" PROBE_SSH="$1/home/.ssh" \
+      "$OOSH_DIR/test.suite" run "$2" 1 2>&1); rc=$?
+  printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g'
+  return $rc
+}
+test.test.suite.realSshRunner() {
+  local fx probe out rc bad=""
+  fx=$(test.suite.fixture.make test.test.suite.realssh.runner)
+  probe="$fx/test.realSshProbe"
+  test.test.suite.shared.fixture "$fx"
+  test.test.suite.realSsh.fixture "$fx/home"
+  mkdir -p "$fx/run" "$fx/home/.config/oosh"
+  test.test.suite.realSshRunner.probe "$probe" core \
+    'cat "$PROBE_SSH/public_keys/a.public_key" > "$PROBE_SSH/authorized_keys"; chmod 600 "$PROBE_SSH/authorized_keys"'
+  out=$(test.test.suite.realSshRunner.run "$fx" "$probe"); rc=$?
+  [ "$rc" != 0 ] || bad="$bad stayed-green"
+  case "$out" in *"REAL ~/.ssh WRITTEN: test.realSshProbe changed ~/.ssh: authorized_keys (created)"*) ;; *) bad="$bad not-reported" ;; esac
+  case "$out" in *"CURRENT_SSH_DIR"*) ;; *) bad="$bad no-fix-hint" ;; esac
+  [ -e "$fx/home/.ssh/authorized_keys" ] && bad="$bad created-file-left"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the runner names the file that created authorized_keys, fails, and removes it" || create.result 1 "runner:$bad"
+  return $(result)
+}
+
+# --- T-REAL-SSH-RUNNER-RESTORE / -PLATFORM -----------------------------------
+# A probe that CHANGES known_hosts is restored byte for byte; a platform probe
+# is exempt (it asserts on the real machine), as for the shared tier.
+test.test.suite.realSshRunnerRestore() {
+  local fx probe out rc bad=""
+  fx=$(test.suite.fixture.make test.test.suite.realssh.runnerrestore)
+  probe="$fx/test.realSshKnownHosts"
+  test.test.suite.shared.fixture "$fx"
+  test.test.suite.realSsh.fixture "$fx/home"
+  mkdir -p "$fx/run" "$fx/home/.config/oosh"
+  cp -p "$fx/home/.ssh/known_hosts" "$fx/known_hosts.orig"
+  test.test.suite.realSshRunner.probe "$probe" core \
+    'printf "probe.host ssh-ed25519 AAAAprobe\n" >> "$PROBE_SSH/known_hosts"'
+  out=$(test.test.suite.realSshRunner.run "$fx" "$probe"); rc=$?
+  [ "$rc" != 0 ] || bad="$bad stayed-green"
+  case "$out" in *"REAL ~/.ssh WRITTEN: test.realSshKnownHosts changed ~/.ssh: known_hosts (changed)"*) ;; *) bad="$bad not-reported" ;; esac
+  cmp -s "$fx/known_hosts.orig" "$fx/home/.ssh/known_hosts" || bad="$bad not-byte-identical"
+  # a changed private key: reported, fails, left for the user — and no copy of
+  # any private key in the run folder (found by content), even after the run
+  probe="$fx/test.realSshSecret"
+  test.test.suite.realSshRunner.probe "$probe" core \
+    'printf "PRIVATE probe\n" > "$PROBE_SSH/private_key/a.private_key"'
+  out=$(test.test.suite.realSshRunner.run "$fx" "$probe"); rc=$?
+  [ "$rc" != 0 ] || bad="$bad secret-stayed-green"
+  case "$out" in *"test.realSshSecret changed ~/.ssh: private_key/a.private_key (changed)"*) ;; *) bad="$bad secret-not-reported" ;; esac
+  case "$out" in *"restore by hand: $fx/home/.ssh/private_key/a.private_key"*) ;; *) bad="$bad no-by-hand-note" ;; esac
+  grep -rqF "PRIVATE" "$fx/run" 2>/dev/null && bad="$bad private-key-copied"
+  # the platform exemption, through the same runner
+  probe="$fx/test.realSshPlatform"
+  test.test.suite.realSshRunner.probe "$probe" platform \
+    'printf "platform.host ssh-ed25519 AAAAp\n" >> "$PROBE_SSH/known_hosts"'
+  out=$(test.test.suite.realSshRunner.run "$fx" "$probe"); rc=$?
+  [ "$rc" = 0 ] || bad="$bad platform-failed=$rc"
+  case "$out" in *"REAL ~/.ssh WRITTEN"*) bad="$bad platform-reported" ;; esac
+  rm -rf "$fx"
+  unset -f test.test.suite.realSshRunner.probe test.test.suite.realSshRunner.run 2>/dev/null
+  [ -z "$bad" ] && create.result 0 "a changed known_hosts is restored byte for byte; a changed private key is reported by hand, never copied; a platform file is exempt" || create.result 1 "runner restore:$bad"
+  return $(result)
+}
+test.case $level "T-REAL-SSH-RUNNER: end to end, the runner catches a file that creates the real authorized_keys" \
+  test.test.suite.realSshRunner
+expect 0 "the runner names the file that created authorized_keys, fails, and removes it" \
+  "the incident of 2026-10-16: an authorized_keys rebuild against the real ~/.ssh stayed green"
+test.case $level "T-REAL-SSH-RUNNER-RESTORE: a changed known_hosts comes back byte for byte; a private key is never copied; platform files are exempt" \
+  test.test.suite.realSshRunnerRestore
+expect 0 "a changed known_hosts is restored byte for byte; a changed private key is reported by hand, never copied; a platform file is exempt" \
+  "the guard must undo the damage, and must not fail the tests that exist to look at the real machine"
+
+# ============================================================================
 # T-VERDICT — the suite's pass/fail rule, as one testable decision
 # ============================================================================
 # The rule used to be a 20-line if/elif chain in the tail of
 # private.test.suite.run.filtered that nothing could reach. Extracted so the
 # two new failure causes — a written shared tier, and a core file that scored
 # nothing — can be proven to reach the return code, which is what the macOS
-# workflow and os platform.test gate on.
+# workflow and platform test gate on.
 #
 # The table is its own control: it contains both rc 0 and rc 1 rows, so a rule
 # that always passed or always failed cannot satisfy it.
 test.test.suite.verdictRule() {
   local row want got fails=""
-  # sharedWrites noResults category expects passed metaFailures | wantRc
+  # sharedWrites noResults category expects passed metaFailures <?sshWrites> | wantRc
+  # (T-REAL-SSH-VERDICT: the last four rows — a written real ~/.ssh fails any category)
   while read -r row; do
     [ -z "$row" ] && continue
     want="${row##*|}"; want="${want// /}"
     set -- ${row%%|*}
-    private.test.suite.verdict "$1" "$2" "$3" "$4" "$5" "$6" >/dev/null 2>&1
+    private.test.suite.verdict "$1" "$2" "$3" "$4" "$5" "$6" "$7" >/dev/null 2>&1
     got=$?
     [ "$got" != "$want" ] && fails="$fails [${row%%|*}-> $got want $want]"
   done <<'ROWS'
@@ -514,6 +723,10 @@ test.test.suite.verdictRule() {
 0 1 platform 10 10 -| 1
 1 0 core 10 10 -    | 1
 1 0 extended 10 10 -| 1
+0 0 core 10 10 - 0  | 0
+0 0 core 10 10 - 1  | 1
+0 0 extended 10 10 - 1 | 1
+0 0 core 10 9 1 1   | 1
 ROWS
   if [ -n "$fails" ]; then
     create.result 1 "verdict rule wrong for:$fails"
@@ -522,7 +735,7 @@ ROWS
   fi
   return $(result)
 }
-test.case $level "T-VERDICT: a written tier fails any run; a score-less file fails core and platform" \
+test.case $level "T-VERDICT: a written tier or a written real ~/.ssh fails any run; a score-less file fails core and platform" \
   test.test.suite.verdictRule
 expect 0 "the verdict rule holds on every row" \
   "these two causes never reached the return code, so CI stayed green through both"
@@ -650,6 +863,46 @@ test.case $level "T-PORTABILITY-GREP-E: grep -E with an escaped literal pipe is 
 expect 0 "grep -E accepted" "the rule is about the BRE, not about the characters"
 
 # ----------------------------------------------------------------------------
+# T-PORTABILITY-SED-WC: sed's BRE \| and a string-compared wc -l are violations
+# too; sed -E and wc -l compared with -eq are not. Both passed the sweep and
+# failed only on macOS (core on the tart VM, 2026-10-21): a call-order filter
+# `sed -n 's/^\(a\|b\).*/\1/p'` found nothing there (BSD sed has no \|), and
+# `[ "$(… | wc -l)" = 1 ]` saw "       1" (BSD wc pads the count).
+# ----------------------------------------------------------------------------
+test.test.suite.portabilitySedWc() {
+  local out bad=""
+  # portability-exception: the offending constructs below are the FIXTURE —
+  # planted in a throwaway repo to prove the sweep can fail.
+  private.test.suite.portability.clear
+  out=$(private.test.suite.portability.plant sedBre '#!/usr/bin/env bash' \
+        "order=\$(printf '%s\\n' \"\$out\" | sed -n 's/^\\(run\\|ossh\\).*/\\1/p')")
+  case "$out" in *"INVALID:"*"1 violation"*) ;; *) bad="$bad sedBre=[$out]" ;; esac
+  private.test.suite.portability.clear
+  out=$(private.test.suite.portability.plant sedEre '#!/usr/bin/env bash' \
+        "order=\$(printf '%s\\n' \"\$out\" | sed -nE 's/^(run|ossh).*/\\1/p')")
+  case "$out" in *"OK:"*"0 violations"*) ;; *) bad="$bad sedEre=[$out]" ;; esac
+  # \| right after the quote is the POSIX address delimiter (\cREGEXc), portable — test.path's editor
+  private.test.suite.portability.clear
+  out=$(private.test.suite.portability.plant sedDelimiter '#!/usr/bin/env bash' \
+        "sed -i.bak -e '\\|/bin1\$|d' \"\$1\"")
+  case "$out" in *"OK:"*"0 violations"*) ;; *) bad="$bad sedDelimiter=[$out]" ;; esac
+  private.test.suite.portability.clear
+  out=$(private.test.suite.portability.plant wcString '#!/usr/bin/env bash' \
+        "[ \"\$(ls \"\$dir\" | wc -l)\" = 3 ] || bad=x")
+  case "$out" in *"INVALID:"*"1 violation"*) ;; *) bad="$bad wcString=[$out]" ;; esac
+  private.test.suite.portability.clear
+  out=$(private.test.suite.portability.plant wcNumber '#!/usr/bin/env bash' \
+        "[ \"\$(ls \"\$dir\" | wc -l)\" -eq 3 ] || bad=x")
+  case "$out" in *"OK:"*"0 violations"*) ;; *) bad="$bad wcNumber=[$out]" ;; esac
+  [ -z "$bad" ] && create.result 0 "sed BRE alternation and string-compared wc -l rejected" || create.result 1 "sed/wc:$bad"
+  return $(result)
+}
+test.case $level "T-PORTABILITY-SED-WC: sed's BRE \\| and a wc -l compared as a string are violations; sed -E and -eq are not" \
+  test.test.suite.portabilitySedWc
+expect 0 "sed BRE alternation and string-compared wc -l rejected" \
+  "two constructs passed the sweep and failed only on macOS"
+
+# ----------------------------------------------------------------------------
 # T-PORTABILITY-MARKER: a deliberate one can be declared, on the line or in the
 # few lines above it — the same affordance path.validate gives.
 # ----------------------------------------------------------------------------
@@ -762,7 +1015,7 @@ private.test.suite.portability.clear
 # `git grep` sees tracked files only, and returns empty both for a clean tree
 # and for a tree it cannot read at all — an unpacked tarball, or the "dubious
 # ownership" refusal that fires when root sweeps an oosh-user checkout, which
-# is the shape `os platform.test` runs in. Silence is not a pass.
+# is the shape `platform test` runs in. Silence is not a pass.
 # ----------------------------------------------------------------------------
 test.test.suite.portabilityRefusesBlind() {
   local blind out rc
@@ -814,7 +1067,7 @@ rm -rf "$PORT_FIXTURE"
 # ============================================================================
 # T-TEST-SUITE-GATE: core AND the post-install platform invariants, one verdict
 # ============================================================================
-# os platform.test ran only `test.suite core 1` per user, so a platform
+# platform test ran only `test.suite core 1` per user, so a platform
 # invariant (the config layout, no boot) never gated anything. test.suite gate
 # runs core and platform.shared.configLayout.invariant and fails when either
 # fails. Composition is judged with both halves stubbed.
@@ -837,7 +1090,7 @@ test.test.suite.gate() {
 }
 test.case $level "T-TEST-SUITE-GATE: test.suite gate runs core and the platform invariant, one verdict" test.test.suite.gate
 expect 0 "gate: core then the platform invariants; rc 1 when one fails" \
-  "os platform.test ran core only, so no platform invariant ever gated a run"
+  "platform test ran core only, so no platform invariant ever gated a run"
 
 # ----------------------------------------------------------------------------
 # T-SUITE-SESSION-RESTORE: the runner puts its user's own user.session.env back
@@ -968,7 +1221,6 @@ expect 0 "OOSH_NO_INSTALL=1 in every test file" "a test run installed colima, do
 # nothing — "NO RESULTS", no line named (2026-10-06). `bash -n` names it.
 test.test.suite.allScriptsParse() {
   local f bad="" checked=0
-  private.this.script.load ogit ogit.repo.files.list
   while IFS= read -r f; do
     [ -f "$OOSH_DIR/$f" ] || continue
     case "$f" in *.md|*.puml|*.drawio|*.png|*.json|*.env|sessions/*) continue ;; esac
@@ -998,7 +1250,6 @@ expect 0 "every script parses with bash $BASH_VERSION" "a file that does not par
 test.test.suite.allScriptsParseBlind() {
   local blind out; blind=$(test.suite.fixture.make test.test.suite.parse.blind)
   : > "$blind/untracked"
-  private.this.script.load ogit ogit.repo.files.list
   out=$( OOSH_DIR="$blind" test.test.suite.allScriptsParse >/dev/null 2>&1; echo "rc=$? $RESULT" )
   rm -rf "$blind"
   case "$out" in
@@ -1071,6 +1322,138 @@ Test: private.test.suite.session.files.get
 test.case - "T-SUITE-SESSION-FILES: the runner guards the user, log and oosh session files" \
    private.test.suite.session.files.get 
 expect 0 "user.session.env log.session.env oosh.session.env"
+
+
+# T-REAL-SSH-ORIGIN: the guard watches the passwd home's .ssh, not $HOME's
+# ssh reads the passwd home whatever HOME says, and so did the 2026-10-16
+# rebuild — a guard that followed HOME would watch a fixture while the real
+# folder was written. Called with HOME pointing at a fixture.
+test.test.suite.realSshOrigin() {
+  local fx got want bad=""
+  fx=$(test.suite.fixture.make test.test.suite.realssh.origin)
+  want="$(eval echo ~"$(id -un)")/.ssh"
+  got=$(HOME="$fx"; private.test.suite.ssh.origin.get)
+  rm -rf "$fx"
+  [ "$got" = "$want" ] || bad="$bad got=[$got] want=[$want]"
+  [ -z "$bad" ] && create.result 0 "the origin is the passwd home's .ssh, whatever HOME says" || create.result 1 "origin:$bad"
+  return $(result)
+}
+test.case $level "T-REAL-SSH-ORIGIN: the origin is the passwd home even under a fixture HOME" test.test.suite.realSshOrigin
+expect 0 "the origin is the passwd home's .ssh, whatever HOME says" "a guard that follows HOME watches the fixture while ssh writes the real folder"
+
+# T-REAL-SSH-STAMP: one line per path — relative name, mode, checksum and size
+# Mode is part of it (unlike the shared tier's content-only stamp): the runner
+# owns its ~/.ssh, so a mode CAN be put back, and a group-readable key is
+# damage — ssh refuses it. A socket (an ossh ControlMaster) is not a file and
+# is left out.
+test.test.suite.realSshStamp() {
+  local fx out bad=""
+  fx=$(test.suite.fixture.make test.test.suite.realssh.stamp)
+  test.test.suite.realSsh.fixture "$fx/home"
+  out=$(private.test.suite.ssh.stamp.get "$fx/home/.ssh")
+  [ "$(private.test.suite.ssh.mode.get "$fx/home/.ssh/public_keys/a.public_key")" = 640 ] || bad="$bad mode.get"
+  rm -rf "$fx"
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 7 ] || bad="$bad lines=[$out]"
+  case "$out" in *"public_keys/a.public_key	640 "*) ;; *) bad="$bad no-mode-line" ;; esac
+  case "$out" in *"$fx"*) bad="$bad absolute-path" ;; esac
+  [ -z "$bad" ] && create.result 0 "one relative line per file, with mode and checksum" || create.result 1 "stamp:$bad"
+  return $(result)
+}
+test.case $level "T-REAL-SSH-STAMP: one line per path with mode and checksum" test.test.suite.realSshStamp
+expect 0 "one relative line per file, with mode and checksum" "the fingerprint must see a created file and a changed mode"
+
+# private.test.suite.ssh.snapshot / .verify / .restore / .report are proven by
+# T-REAL-SSH-DETECTS, -RESTORES, -RUNNER and -RUNNER-RESTORE above, always
+# against a fixture origin. Never call them bare here: this file runs under
+# the runner, whose exported TEST_SUITE_SSH_* point at the REAL ~/.ssh.
+
+
+# T-REAL-SSH-SECRET: which paths under ~/.ssh are private keys
+# The guard copies ~/.ssh aside to restore it; a killed run leaves that copy in
+# /tmp, so a private key must never be in it. The table is its own control:
+# both secret (rc 0) and public (rc 1) rows.
+test.test.suite.realSshSecret() {
+  local row want got fails=""
+  while read -r row; do
+    [ -z "$row" ] && continue
+    want="${row##*|}"; want="${want// /}"; row="${row%%|*}"; row="${row// /}"
+    private.test.suite.ssh.secret.is "$row" >/dev/null 2>&1; got=$?
+    [ "$got" != "$want" ] && fails="$fails [$row -> $got want $want]"
+  done <<'ROWS'
+id_ed25519                                      | 0
+id_rsa                                          | 0
+private_key/a.private_key                       | 0
+ids/ssh.x/id_ed25519                            | 0
+ids/ssh.x/private_key/k.private_key             | 0
+ids/ssh.x/ssh.developking/private_key/dk        | 0
+id_ed25519.pub                                  | 1
+ids/ssh.x/id_ed25519.pub                        | 1
+public_keys/a.public_key                        | 1
+authorized_keys                                 | 1
+config                                          | 1
+known_hosts                                     | 1
+known_hosts.old                                 | 1
+ids/ssh.developking/known_hosts                 | 1
+ROWS
+  [ -z "$fails" ] && create.result 0 "private keys are told from everything else" || create.result 1 "secret rule wrong for:$fails"
+  return $(result)
+}
+test.case $level "T-REAL-SSH-SECRET: which paths under ~/.ssh are private keys" test.test.suite.realSshSecret
+expect 0 "private keys are told from everything else" "a killed run would leave a copied private key in /tmp"
+# private.test.suite.ssh.secrets.changed.get is proven by T-REAL-SSH-RESTORES
+# and T-REAL-SSH-RUNNER-RESTORE (the "restore by hand" note), against a fixture.
+
+
+# T-TEST-SUITE-REAL-CONFIG-EXPORTED: a run names the real config folders for every child
+# test.suite.init exports the canonical real ~/config and ~/.config/oosh of
+# the user running the tests — from the passwd home, so a child that sets
+# HOME to a fixture still knows them — and keeps a value it inherits (a nested
+# runner). The runner turns a refused write into a red file:
+# private.test.suite.real.config.verify names it and clears the list.
+test.test.suite.realConfigExported() {
+  local fx bad="" real got
+  real=$(private.this.path.canonical "$(eval echo ~"$(id -un)")/config")
+  [ "$TEST_SUITE_REAL_CONFIG" = "$real" ] || bad="$bad config=[$TEST_SUITE_REAL_CONFIG]"
+  [ -n "$TEST_SUITE_REAL_SESSION" ] || bad="$bad noSession"
+  got=$(env TEST_SUITE_REAL_CONFIG=/outer bash -c 'echo "$TEST_SUITE_REAL_CONFIG"'); [ "$got" = /outer ] || bad="$bad notInherited"
+  got=$( ( export HOME=/tmp; bash -c 'echo "$TEST_SUITE_REAL_CONFIG"' ) ); [ "$got" = "$real" ] || bad="$bad homeChanged=[$got]"
+  fx=$(test.suite.fixture.make suiterealconfig)
+  ( TEST_SUITE_RESULT_PATH="$fx"; echo "$fx/a.env" > "$fx/real.config.refused"
+    private.test.suite.real.config.verify t.x >/dev/null; echo "$?|$RESULT" > "$fx/out"
+    private.test.suite.real.config.verify t.x >/dev/null; echo "$?" >> "$fx/out" )
+  [ "$(head -1 "$fx/out")" = "1|t.x tried to write the real config: $fx/a.env " ] || bad="$bad verify=[$(head -1 "$fx/out")]"
+  [ "$(sed -n 2p "$fx/out")" = 0 ] || bad="$bad notCleared"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "the real folders are named for every child" || create.result 1 "real config:$bad"
+  return $(result)
+}
+test.case $level "T-TEST-SUITE-REAL-CONFIG-EXPORTED: test.suite names the real ~/config and ~/.config/oosh for every child, and a refused write turns the file red" test.test.suite.realConfigExported
+expect 0 "the real folders are named for every child" \
+  "a test overwrote the real user.env and nothing in the run said so"
+
+
+# T-SUITE-COMPLETION-EXISTS: a test asks for "a completion of <p>", whichever form c2 finds
+# test.suite.completion.exists / .get accept the method-specific
+# <s>.<m>.completion.<p> and the class-level <s>.parameter.completion.<p>, in
+# c2's order, so a test does not break when a completion moves to the class
+# level (Marcel, 36e1305d, 2026-10-20).
+test.test.suite.completionExists() {
+  local bad="" got
+  ( tsCe.a.completion.x() { echo specific; }; tsCe.parameter.completion.x() { echo class; }
+    tsCe.parameter.completion.y() { echo "class:$1:$2:$3"; }
+    test.suite.completion.exists tsCe a x >/dev/null; echo "ax=$?:$RESULT"
+    test.suite.completion.exists tsCe b x >/dev/null; echo "bx=$?:$RESULT"
+    test.suite.completion.exists tsCe a z >/dev/null; echo "az=$?"
+    echo "getAx=$(test.suite.completion.get tsCe a x)"
+    echo "getBy=$(test.suite.completion.get tsCe b y cu)"
+    test.suite.completion.get tsCe b z >/dev/null; echo "getBz=$?" ) > "${TMPDIR:-/tmp}/tsce.$$" 2>/dev/null
+  got=$(tr '\n' ' ' < "${TMPDIR:-/tmp}/tsce.$$"); rm -f "${TMPDIR:-/tmp}/tsce.$$"
+  [ "$got" = "ax=0:tsCe.a.completion.x bx=0:tsCe.parameter.completion.x az=1 getAx=specific getBy=class:cu:tsCe:b getBz=1 " ] || bad=" [$got]"
+  [ -z "$bad" ] && create.result 0 "both forms, in c2's order" || create.result 1 "completion.exists:$bad"
+  return $(result)
+}
+test.case $level "T-SUITE-COMPLETION-EXISTS: test.suite.completion.exists/.get accept both completion forms, in c2's order" test.test.suite.completionExists
+expect 0 "both forms, in c2's order" "a test pinned one spelling and broke when the completion moved to the class level"
 
 ### test.method
 

@@ -11,6 +11,7 @@ echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
 
 source this
 source test.suite
+source $OOSH_DIR/ogit   # once, not loaded per test (the boss, 2026-10-22)
 
 log.level $level
 
@@ -202,7 +203,7 @@ test.case $level "T-HEREDOC-LOCKDOWN: source /dev/stdin only in dev/this (this.f
 # the directory filter to the start of the relative path. Two earlier
 # attempts had portability issues:
 #   - `grep -v '/test/'` (substring): false-matched `/home/test/` when the
-#     test ran as user `test` inside `os platform.test`.
+#     test ran as user `test` inside `platform test`.
 #   - `grep --exclude-dir=test`: GNU extension, busybox grep (Alpine
 #     default) doesn't support it and silently let the test/ directory
 #     through the filter.
@@ -236,7 +237,7 @@ unset _HEREDOC_HITS _HEREDOC_EXPECTED
 # Single canonical "make <linkPath> a symlink to <target>; preserve any
 # pre-existing real entry as <linkPath>.orig.<ts>" primitive. Both
 # `private.oo.user.shared.symlinks.ensure` (oo, state 31) and
-# `config.init.user` (config) delegate to this — see the primitive's
+# `oo.user.init` (config) delegate to this — see the primitive's
 # docstring of private.this.symlink.with.backup for the full contract.
 #
 # Four cases × one arg-validation:
@@ -555,28 +556,62 @@ test.case - "T-RESULT-SAVE-NAMES: result.env carries the named RESULT variables,
 expect 0 "only the named RESULT variables are written" \
   "result.load SOURCES this file — a substring sweep re-assigns whatever it swept"
 
-console.log "
-Test: T-THIS-SCRIPT-LOAD
-===================================================================="
-
-test.this.scriptLoad() {
-  local fx bad="" savedThis="$This"; fx=$(test.suite.fixture.make scriptload)
-  # The fixture script clobbers This at file scope, as this.start does when a real script is sourced.
-  printf '%s\n' 'This=clobbered' 'fx.probe() { echo probed; }' > "$fx/fxScript"
-  local OOSH_DIR="$fx"
-  private.this.script.load fxScript fx.probe || bad="$bad rc=$?"
-  [ "$(type -t fx.probe)" = function ] || bad="$bad not-loaded"
-  [ "$This" = "$savedThis" ] || bad="$bad This-clobbered=[$This]"
-  printf '%s\n' 'fx.probe() { echo reloaded; }' > "$fx/fxScript"
-  private.this.script.load fxScript fx.probe || bad="$bad second-rc=$?"
-  [ "$(fx.probe)" = probed ] || bad="$bad sourced-twice"
-  private.this.script.load nosuch nosuch.probe && bad="$bad missing-script-passed"
-  unset -f fx.probe; rm -rf "$fx"
-  [ -z "$bad" ] && create.result 0 "script.load sources once, keeps This, rc 1 when the probe stays undefined" || create.result 1 "script.load:$bad"
+# T-THIS-CALL-OWN-METHOD-FIRST: `<script> <method>` runs the script's own method, not a same-named function
+# this.call asked for a bare function `<method>` before `<script>.<method>`:
+# once oo sourced user, `oo user.init hannesn` ran user.init — new ssh keys in
+# ./hannesn — instead of oo.user.init (2026-10-22; user decision: the
+# dispatcher asks the script first). A fixture script with both fxs.greet and
+# a bare greet, started as a command; a method only the bare function has
+# still runs; an unknown one is still "not found".
+test.this.callOwnMethodFirst() {
+  local fx bad="" got
+  fx=$(test.suite.fixture.make thiscallown)
+  printf '%s\n' '#!/usr/bin/env bash' 'source this' \
+    'greet() { echo "bare greet $*"; }' 'fxs.greet() { echo "own greet $*"; }' 'onlybare() { echo "bare only $*"; }' \
+    'fxs.start() { source this; this.start "$@"; }' 'fxs.start "$@"' > "$fx/fxs"
+  chmod +x "$fx/fxs"
+  got=$(cd "$fx" && PATH="$fx:$OOSH_DIR:$PATH" LOG_LEVEL=1 ./fxs greet alice </dev/null 2>/dev/null)
+  [ "$got" = "own greet alice" ] || bad="$bad greet=[$got]"
+  got=$(cd "$fx" && PATH="$fx:$OOSH_DIR:$PATH" LOG_LEVEL=1 ./fxs onlybare bob </dev/null 2>/dev/null)
+  [ "$got" = "bare only bob" ] || bad="$bad onlybare=[$got]"
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "the script's own method answers first" || create.result 1 "this.call:$bad"
   return $(result)
 }
-test.case $level "T-THIS-SCRIPT-LOAD: private.this.script.load sources a script once and keeps This" test.this.scriptLoad
-expect 0 "script.load sources once, keeps This, rc 1 when the probe stays undefined" "the one lazy loader every ogit consumer uses"
+test.case $level "T-THIS-CALL-OWN-METHOD-FIRST: <script> <method> runs <script>.<method> before a same-named function" test.this.callOwnMethodFirst
+expect 0 "the script's own method answers first" \
+  "oo user.init ran user.init (new ssh keys) instead of oo.user.init"
+
+# T-THIS-SCRIPT-LOAD-GONE: no script loads another one lazily — source in start(), or the command
+# The boss (2026-10-22): `private.this.script.load ogit ogit.branch.get` "and
+# all similar places are wrong; correct is source ogit in init() or just call
+# ogit branch.get". Marcel's pattern (test/mcdonges.latest): <script>.start()
+# sources the lower scripts, upward calls are commands, a method that needs
+# another script's functions sources it there. Neither the loader nor its
+# hand copies `[ "$(type -t f)" = function ] || source "$OOSH_DIR/x"` stay — in
+# the tracked scripts or tests. The patterns are put together from parts, so
+# this file does not match itself.
+test.this.scriptLoadGone() {
+  local loader hand hits
+  loader="private.this.script"; loader="$loader.load "
+  hand='\[ "\$\(type -t [a-zA-Z._]+\)" = "?function"? \] \|\| '; hand="${hand}source"
+  hits=$( cd "$OOSH_DIR" && git ls-files 2>/dev/null \
+    | grep -vE '^(docs/|sessions/|templates/agents/|\.claude/|\.superpowers/)|\.md$' \
+    | while IFS= read -r f; do [ -f "$f" ] && grep -nE -e "$loader" -e "$hand" "$f" /dev/null 2>/dev/null; done \
+    | grep -vE ':[0-9]+:[[:space:]]*#' )
+  # and the loader itself is gone from the kernel
+  declare -F "${loader% }" >/dev/null && hits="${hits:+$hits
+}this: ${loader% } is still defined"
+  if [ -z "$hits" ]; then
+    create.result 0 "no lazy script loader and no hand copy left"
+  else
+    create.result 1 "$(printf '%s\n' "$hits" | wc -l | tr -d ' ') left: $(printf '%s\n' "$hits" | head -5 | cut -c1-90 | tr '\n' '|')"
+  fi
+  return $(result)
+}
+test.case $level "T-THIS-SCRIPT-LOAD-GONE: no lazy script loader (the kernel one is gone) and no type -t … || source copy in scripts or tests" test.this.scriptLoadGone
+expect 0 "no lazy script loader and no hand copy left" \
+  "the boss: a script sources its dependencies in start() or calls them as commands, never a lazy loader"
 
 
 console.log "
@@ -735,7 +770,7 @@ expect 0 "an env -i start derives HOME and stands the shell up" \
 # ============================================================================
 # T-THIS-AS-USER-PREAMBLE: the preamble anchors on the TARGET home, not the caller
 # ============================================================================
-# config.init.user and user.oosh.install both hop into `private.as.user … bash -c`
+# oo.user.init and user.oosh.install both hop into `private.as.user … bash -c`
 # to work as another user. runuser keeps the caller's environment, so root's
 # CONFIG/CONFIG_PATH/OOSH_DIR leaked through, and the string used to source
 # "$OOSH_DIR/this" — expanded by the CALLER, i.e. /root/oosh/this, which the
@@ -779,7 +814,7 @@ echo \"[\$HOME|\$USER|\$OOSH_DIR|\$CONFIG_PATH|\$CONFIG|\${PATH%%:*}]\"" 2>&1 | 
 test.case $level "T-THIS-AS-USER-PREAMBLE: the preamble anchors on the target home, not the caller" \
   test.this.asUserPreamble
 expect 0 "the inner shell anchors on the target home and finds the shared tree first" \
-  "config.init.user used to make the target source the CALLER's \$OOSH_DIR/this — unreadable under /root"
+  "oo.user.init used to make the target source the CALLER's \$OOSH_DIR/this — unreadable under /root"
 
 
 # ============================================================================
@@ -812,7 +847,6 @@ test.this.privateCallsUndefined() { # <treeRoot> # echo "<file> <name>" for ever
   done
 }
 test.this.privateCallsDefined() {
-  [ "$(type -t ogit.repo.files.list)" = function ] || private.this.script.load ogit ogit.branch.get
   local fx bad="" out
   # planted: one undefined call, one defined, one os.check family — only the first is reported
   fx=$(test.suite.fixture.make privcalls); ogit.raw "$fx" init -q
@@ -839,12 +873,17 @@ test.this.folderEntriesCopy() {
   local bad="" fx; fx=$(test.suite.fixture.make entriesCopy)
   mkdir -p "$fx/from/sub" "$fx/to"; chmod 2775 "$fx/to"
   printf 'a\n' > "$fx/from/a.txt"; printf 'd\n' > "$fx/from/.dot"; printf 's\n' > "$fx/from/sub/s.txt"
+  # a dangling symlink is an entry too (the Docker workspaces tree has ten,
+  # pointing at the server's EAMD.ucp): it was skipped by the -e test
+  ln -s /nonexistent/eamd "$fx/from/eamd"; ln -s /nowhere "$fx/from/sub/link"
   chmod 700 "$fx/from"                      # the SOURCE dir's own mode must not land on <to>
   local modeBefore; modeBefore=$(ls -ld "$fx/to" | cut -c1-10)
   private.this.folder.entries.copy "$fx/from" "$fx/to" >/dev/null || bad="$bad rc=$?"
   [ "$(cat "$fx/to/a.txt" 2>/dev/null)" = a ]     || bad="$bad file"
   [ "$(cat "$fx/to/.dot" 2>/dev/null)" = d ]      || bad="$bad dotfile"
   [ "$(cat "$fx/to/sub/s.txt" 2>/dev/null)" = s ] || bad="$bad subdir"
+  [ "$(readlink "$fx/to/eamd" 2>/dev/null)" = /nonexistent/eamd ] || bad="$bad danglingSymlink"
+  [ "$(readlink "$fx/to/sub/link" 2>/dev/null)" = /nowhere ] || bad="$bad danglingSymlinkInSub"
   [ -e "$fx/to/from" ] && bad="$bad nested"
   [ "$(ls -ld "$fx/to" | cut -c1-10)" = "$modeBefore" ] || bad="$bad to-mode=[$(ls -ld "$fx/to" | cut -c1-10)]"
   private.this.folder.entries.copy "$fx/nosuch" "$fx/to" >/dev/null 2>&1 && bad="$bad missing-from-passed"
@@ -908,7 +947,7 @@ test.this.asUserPreambleSessionPath() {
   shared=$(private.this.path.canonical "$OOSH_DIR")
   home=$(test.suite.fixture.make asUserPreambleSessionPath); ln -s "$shared" "$home/oosh"
   PATH="$shared/init:$shared/external:/usr/bin:/bin" bash -c "$(private.this.as.user.preamble.get "$USER" "$home" "$shared")
-private.this.script.load config private.config.session.file.ensure || exit 1
+source '$shared/config' >/dev/null 2>&1 || exit 1
 private.config.session.file.ensure \"$home\" >/dev/null" >/dev/null 2>&1
   line=$(grep '^export PATH=' "$home/.config/oosh/user.session.env" 2>/dev/null)
   [ -n "$line" ] || bad="$bad no-PATH-line"
@@ -1117,10 +1156,13 @@ expect 0 ".dockerenv or run/.containerenv makes a container, nothing else" \
 # with ogit not loadable the validator called a missing ogit.repo.grep, saw no
 # match and said OK — a validator that silently declines to validate.
 # (this.git.commits.count, the other prober, was removed 2026-10-06.)
+# Since 2026-10-22 this reaches ogit as a command (this is sourced by ogit; the
+# boss: no private.this.script.load) — "not loadable" is no ogit on the PATH.
 test.this.ogitLoadProbe() {
   local fx bad="" out rc
   fx=$(test.suite.fixture.make ogitloadprobe)
   out=$( for f in $(compgen -A function ogit.); do unset -f "$f"; done
+         PATH=/usr/bin:/bin; hash -r
          OOSH_DIR="$fx" private.this.anchor.validate.one OOSH_DIR oosh "$OOSH_DIR" 2>/dev/null ); rc=$?
   [ "$rc" = 1 ] || bad="$bad validate-rc=$rc"
   case "$out" in OK:*) bad="$bad validate-said-OK" ;; esac
@@ -1278,7 +1320,7 @@ Test: private.this.path.owner.set
 
 # T-THIS-PATH-OWNER-SET: the owner of one path, elevated only when it must be
 # The shared folders become root:dev (developking is an ordinary user), and
-# `config init.shared` repairs older machines through this. chown, sudo and
+# `oo shared.init` repairs older machines through this. chown, sudo and
 # id are stubs: nothing real changes owner. An owner already right is no call
 # at all; root chowns directly; anyone else through $SUDO — but never under
 # OOSH_NO_INSTALL: a test run escalates nothing, a forgotten stub must not
@@ -1462,20 +1504,21 @@ test.this.urlDownload() {
   # No curl yet (a bare container, state 31, 2026-10-14): oo cmd curl first —
   # the one place that knows a download needs curl; never asked when curl is
   # there, and a failing oo cmd (a test run) is rc 1 naming it, no download.
+  # oo is a command for the kernel since 2026-10-22: the stand-in is oo().
   : > "$fx/log"
-  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; create.result 0 "curl installed"; }
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo() { [ "$1" = cmd ] || return 1; shift; echo "oo.cmd $*" >> "$FX/log"; }
         private.this.url.download https://example.org/ok.sh "$fx/d" >/dev/null 2>&1; echo "$?|$RESULT")
   [ "$got" = "0|$fx/d" ] && ! grep -q "^oo.cmd" "$fx/log" || bad="$bad present-asked-oo-cmd=[$got|$(tr '\n' '|' < "$fx/log")]"
   : > "$fx/log"
-  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; create.result 0 "curl installed"; }
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo() { [ "$1" = cmd ] || return 1; shift; echo "oo.cmd $*" >> "$FX/log"; }
         command() { [ "$1 $2" = "-v curl" ] && [ ! -s "$FX/log" ] && return 1; builtin command "$@"; }
         private.this.url.download https://example.org/ok.sh "$fx/e" >/dev/null 2>&1; echo "$?|$RESULT")
   [ "$got" = "0|$fx/e" ] && [ "$(tr '\n' '|' < "$fx/log")" = "oo.cmd curl|curl -fsSL https://example.org/ok.sh|" ] || bad="$bad missing=[$got|$(tr '\n' '|' < "$fx/log")]"
   : > "$fx/log"
-  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo.cmd() { echo "oo.cmd $*" >> "$FX/log"; create.result 1 "curl missing — a test run installs nothing"; return 1; }
+  got=$(export FX="$fx" PATH="$fx/bin:$PATH"; oo() { [ "$1" = cmd ] || return 1; shift; echo "oo.cmd $*" >> "$FX/log"; return 1; }
         command() { [ "$1 $2" = "-v curl" ] && return 1; builtin command "$@"; }
         private.this.url.download https://example.org/ok.sh "$fx/f" >/dev/null 2>&1; echo "$?|$RESULT")
-  case "$got" in "1|no curl to download https://example.org/ok.sh: curl missing"*) ;; *) bad="$bad no-curl=[$got]" ;; esac
+  case "$got" in "1|no curl to download https://example.org/ok.sh: oo cmd could not install it") ;; *) bad="$bad no-curl=[$got]" ;; esac
   [ "$(tr '\n' '|' < "$fx/log")" = "oo.cmd curl|" ] && [ ! -e "$fx/f" ] || bad="$bad no-curl-downloaded=[$(tr '\n' '|' < "$fx/log")]"
   rm -rf "$fx"
   [ -z "$bad" ] && create.result 0 "complete downloads only; rc 1 naming why and no file left" || create.result 1 "url download:$bad"
@@ -1623,6 +1666,202 @@ test.case $level "T-THIS-GROUP-CREATE-FAIL: the first group tool that exists is 
 expect 0 "the first tool once; a held number is refused by name; no append on macOS" \
   "a failed groupadd was followed by Debian's addgroup with busybox syntax"
 
+
+console.log "
+Test: private.this.folder.ensure
+===================================================================="
+
+# T-THIS-FOLDER-ENSURE: a missing folder is made, an existing one kept, a blocked one refused by name
+# ossh key.pull wrote `[ -d "$dir" ] || mkdir -p "$dir"` unchecked — a file in
+# the way or a read-only parent went unnoticed until the write after it failed
+# (conformance audit 2026-10-16). Silent: LOG_DEVICE can be fd1.
+test.this.folderEnsure() {
+  local fx bad="" got; fx=$(test.suite.fixture.make thisfolderensure)
+  got=$(private.this.folder.ensure "$fx/a/b/c" > "$fx/out" 2>/dev/null; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/a/b/c made" ] && [ -d "$fx/a/b/c" ] || bad="$bad missing=[$got]"
+  [ -s "$fx/out" ] && bad="$bad stdout=[$(cat "$fx/out")]"
+  got=$(private.this.folder.ensure "$fx/a/b" > "$fx/out" 2>/dev/null; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/a/b exists" ] || bad="$bad existing=[$got]"
+  [ -s "$fx/out" ] && bad="$bad existing-stdout=[$(cat "$fx/out")]"
+  echo data > "$fx/file"
+  got=$(private.this.folder.ensure "$fx/file" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot make $fx/file: $fx/file is in the way and not a folder" ] || bad="$bad file-itself=[$got]"
+  got=$(private.this.folder.ensure "$fx/file/sub/x" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot make $fx/file/sub/x: $fx/file is in the way and not a folder" ] || bad="$bad file-in-way=[$got]"
+  [ "$(cat "$fx/file")" = data ] || bad="$bad file-touched"
+  # root writes into a mode-500 folder anyway: the permission case needs a normal user.
+  if [ "$(id -u)" != 0 ]; then
+    mkdir "$fx/ro"; chmod 500 "$fx/ro"
+    got=$(private.this.folder.ensure "$fx/ro/x/y" >/dev/null 2>&1; echo "$?|$RESULT")
+    [ "$got" = "1|cannot make $fx/ro/x/y: no permission to write in $fx/ro" ] || bad="$bad no-permission=[$got]"
+    chmod 700 "$fx/ro"
+  fi
+  got=$(private.this.folder.ensure >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|private.this.folder.ensure requires <dir>" ] || bad="$bad no-dir=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "a missing folder made, an existing one kept, a blocked one refused by name" || create.result 1 "folder ensure:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-FOLDER-ENSURE: a missing folder is made, an existing one kept, a blocked one refused by name" test.this.folderEnsure
+expect 0 "a missing folder made, an existing one kept, a blocked one refused by name" "ossh key.pull ran mkdir -p unchecked"
+
+
+console.log "
+Test: private.this.file.write
+===================================================================="
+
+# T-THIS-FILE-WRITE: a file replaced whole, checked, its mode kept, no .new left
+# ossh key.pull wrote authorized_keys with an unchecked `printf > file`: a full
+# disk or a read-only folder left a truncated file and rc 0 (conformance audit
+# 2026-10-16). The new content goes to <file>.new first and is moved over the
+# old one, so a reader (sshd) sees the old file or the new one, never half.
+test.this.fileWrite() {
+  local fx bad="" got f; fx=$(test.suite.fixture.make thisfilewrite); f="$fx/keys"
+  printf '%s\n' old1 old2 old3 > "$f"; chmod 640 "$f"
+  got=$(private.this.file.write "$f" "new1
+new2" > "$fx/out" 2>/dev/null; echo "$?|$RESULT")
+  [ "$got" = "0|$f written" ] || bad="$bad rc=[$got]"
+  [ "$(cat "$f")" = "new1
+new2" ] || bad="$bad content=[$(tr '\n' '|' < "$f")]"
+  [ "$(tail -c 1 "$f" | od -An -c | tr -d ' ')" = '\n' ] || bad="$bad no-trailing-newline"
+  [ "$(ls -l "$f" | cut -c1-10)" = "-rw-r-----" ] || bad="$bad mode=[$(ls -l "$f" | cut -c1-10)]"
+  [ -e "$f.new" ] && bad="$bad new-left"
+  [ -s "$fx/out" ] && bad="$bad stdout=[$(cat "$fx/out")]"
+  # A missing file is made.
+  got=$(private.this.file.write "$fx/fresh" "line" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "0|$fx/fresh written" ] && [ "$(cat "$fx/fresh" 2>/dev/null)" = line ] || bad="$bad fresh=[$got]"
+  # A new file is the owner's alone, whatever the umask: the .new got the
+  # umask's mode, so under umask 002 a new authorized_keys was group-writable
+  # (664) until a caller's chmod (fresh review 2026-10-16).
+  got=$( umask 002; private.this.file.write "$fx/fresh002" "line" >/dev/null 2>&1; echo "$?" )
+  [ "$got" = 0 ] && [ "$(ls -l "$fx/fresh002" | cut -c1-10)" = "-rw-------" ] || bad="$bad fresh-umask=[$got $(ls -l "$fx/fresh002" 2>/dev/null | cut -c1-10)]"
+  # A symlink is written through: the link stays, the file it names gets the content.
+  ln -s "$f" "$fx/link"
+  got=$(private.this.file.write "$fx/link" "via link" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ -L "$fx/link" ] && [ "$(cat "$f")" = "via link" ] || bad="$bad link=[$got]"
+  # A missing folder: rc 1 naming it, nothing made.
+  got=$(private.this.file.write "$fx/missing.dir/x" "a" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot write $fx/missing.dir/x: no folder $fx/missing.dir" ] || bad="$bad missing-dir=[$got]"
+  [ -e "$fx/missing.dir" ] && bad="$bad missing-dir-made"
+  # A folder in the place of the file.
+  mkdir "$fx/adir"
+  got=$(private.this.file.write "$fx/adir" "a" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot write $fx/adir: it is a folder" ] || bad="$bad is-dir=[$got]"
+  # A read-only folder (root writes there anyway): rc 1, old content kept, no .new.
+  if [ "$(id -u)" != 0 ]; then
+    mkdir "$fx/ro"; echo keep > "$fx/ro/f"; chmod 500 "$fx/ro"
+    got=$(private.this.file.write "$fx/ro/f" "lost" >/dev/null 2>&1; echo "$?|$RESULT")
+    [ "$got" = "1|cannot write $fx/ro/f: no permission to write in $fx/ro" ] || bad="$bad ro=[$got]"
+    [ "$(cat "$fx/ro/f")" = keep ] || bad="$bad ro-content-changed"
+    [ -e "$fx/ro/f.new" ] && bad="$bad ro-new-left"
+    chmod 700 "$fx/ro"
+  fi
+  # The write itself fails (a full disk): rc 1, old content kept, no .new.
+  got=$(printf() { return 1; }; private.this.file.write "$f" "lost" >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|cannot write $f: the write of $f.new failed" ] || bad="$bad write-fails=[$got]"
+  [ "$(cat "$f")" = "via link" ] || bad="$bad write-fails-content=[$(cat "$f")]"
+  [ -e "$f.new" ] && bad="$bad write-fails-new-left"
+  got=$(private.this.file.write >/dev/null 2>&1; echo "$?|$RESULT")
+  [ "$got" = "1|private.this.file.write requires <file> <content>" ] || bad="$bad no-file=[$got]"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "the file replaced whole through <file>.new, mode kept; rc 1 naming why and no .new left" || create.result 1 "file write:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-FILE-WRITE: a file replaced whole, checked, its mode kept, no .new left" test.this.fileWrite
+expect 0 "the file replaced whole through <file>.new, mode kept; rc 1 naming why and no .new left" "ossh key.pull wrote authorized_keys with an unchecked printf >"
+
+
+console.log "
+Test: private.this.user.name.get
+===================================================================="
+
+# T-THIS-USER-NAME-GET: the user name from id -un, else $USER, else nothing
+# `id -un` reads the OS identity on GNU, busybox and BSD alike; $USER may be
+# unset (docker exec) or stale (sudo -E); whoami is one more program for the
+# same answer. ossh install.key.authorize used $(whoami) (conformance audit 2026-10-16).
+test.this.userNameGet() {
+  local bad="" got
+  got=$(private.this.user.name.get) || bad="$bad rc=$?"
+  [ "$got" = "$(id -un)" ] || bad="$bad id=[$got]"
+  got=$(id() { return 1; }; USER=bob private.this.user.name.get) || bad="$bad fallback-rc=$?"
+  [ "$got" = bob ] || bad="$bad fallback=[$got]"
+  got=$(id() { :; }; USER=bob private.this.user.name.get)
+  [ "$got" = bob ] || bad="$bad empty-id=[$got]"
+  got=$(id() { return 1; }; unset USER; private.this.user.name.get; echo "|$?")
+  [ "$got" = "|1" ] || bad="$bad none=[$got]"
+  [ -z "$bad" ] && create.result 0 "id -un, else USER, else nothing and rc 1" || create.result 1 "user name:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-USER-NAME-GET: the user name from id -un, else USER, else nothing" test.this.userNameGet
+expect 0 "id -un, else USER, else nothing and rc 1" "ossh install.key.authorize used whoami"
+
+
+# T-THIS-CONFIG-WRITE-GUARD: a test run never writes the real ~/config or ~/.config/oosh
+# 2026-10-20 a test let `user` overwrite the real ~/config/user.env and PATH
+# broke for the whole machine. private.this.config.write.guard is asked by
+# every config writer: rc 1 for a file in one of the two real folders named by
+# test.suite (canonical — a symlink to them counts), the attempt listed for the
+# runner; rc 0 for anything else, and always when no run names them.
+test.this.configWriteGuard() {
+  local fx bad="" rc
+  fx=$(test.suite.fixture.make thiswriteguard)
+  mkdir -p "$fx/real/config" "$fx/real/session" "$fx/other" "$fx/res"
+  ln -s "$fx/real/config" "$fx/link"
+  test.this.configWriteGuard.rc() { # <file> <?unset> # rc of the guard for <file> with the fixture's real folders, or none when <unset> #
+    ( TEST_SUITE_RESULT_PATH="$fx/res"
+      if [ -n "$2" ]; then unset TEST_SUITE_REAL_CONFIG TEST_SUITE_REAL_SESSION
+      else TEST_SUITE_REAL_CONFIG="$fx/real/config"; TEST_SUITE_REAL_SESSION="$fx/real/session"; fi
+      private.this.config.write.guard "$1" 2>/dev/null; echo "$?|$RESULT" )
+  }
+  rc=$(test.this.configWriteGuard.rc "$fx/real/config/user.env");      case "$rc" in "1|test run: refusing to write the real $fx/real/config/user.env") ;; *) bad="$bad real=[$rc]" ;; esac
+  rc=$(test.this.configWriteGuard.rc "$fx/real/session/user.session.env"); case "$rc" in 1\|*) ;; *) bad="$bad session=[$rc]" ;; esac
+  rc=$(test.this.configWriteGuard.rc "$fx/link/user.env");             case "$rc" in 1\|*) ;; *) bad="$bad link=[$rc]" ;; esac
+  rc=$(test.this.configWriteGuard.rc "$fx/other/user.env");            case "$rc" in 0\|*) ;; *) bad="$bad fixture=[$rc]" ;; esac
+  rc=$(test.this.configWriteGuard.rc "$fx/real/config/user.env" unset); case "$rc" in 0\|*) ;; *) bad="$bad noRun=[$rc]" ;; esac
+  [ "$(grep -c . "$fx/res/real.config.refused" 2>/dev/null)" = 3 ] || bad="$bad listed=[$(tr '\n' '|' < "$fx/res/real.config.refused" 2>/dev/null)]"
+  unset -f test.this.configWriteGuard.rc
+  rm -rf "${fx:?}"
+  [ -z "$bad" ] && create.result 0 "only the real folders are refused" || create.result 1 "write guard:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-CONFIG-WRITE-GUARD: during a test run the real ~/config and ~/.config/oosh are refused, a fixture is not" test.this.configWriteGuard
+expect 0 "only the real folders are refused" \
+  "a test overwrote the real ~/config/user.env and PATH broke for the machine"
+
+
+# T-THIS-HOME-REAL-GET: the passwd home, whatever $HOME says
+# The one derivation behind this's env -i boot, test.suite's real ~/.ssh and
+# its real ~/config: it was spelled out three times. A fixture HOME and an
+# unset HOME give the same answer.
+test.this.homeRealGet() {
+  local bad="" want got
+  want=$(eval echo ~"$(id -un)")
+  got=$(private.this.home.real.get);                  [ "$got" = "$want" ] || bad="$bad plain=[$got]"
+  got=$( HOME=/tmp/not.my.home private.this.home.real.get ); [ "$got" = "$want" ] || bad="$bad fixtureHome=[$got]"
+  got=$( unset HOME; private.this.home.real.get );     [ "$got" = "$want" ] || bad="$bad noHome=[$got]"
+  [ -z "$bad" ] && create.result 0 "the passwd home" || create.result 1 "home.real:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-HOME-REAL-GET: private.this.home.real.get gives the passwd home, also with a fixture HOME or none" test.this.homeRealGet
+expect 0 "the passwd home" "three copies of the passwd-home lookup"
+
 ### test.method
+
+# T-THIS-OS-FAMILY-GET: the one $OSTYPE mapping, in the base
+# config (part of the boot) needs the OS family without loading os (the
+# blueprint oosh.drawio, 2026-10-23); os.check.env asks the same getter.
+test.this.osFamilyGet() {
+  local bad="" pair
+  for pair in darwin23:darwin linux-gnu:linux-gnu linux-musl:linux-gnu cygwin:cygwin msys:msys win32:win32 freebsd:freebsd; do
+    [ "$(private.this.os.family.get "${pair%%:*}")" = "${pair#*:}" ] || bad="$bad ${pair%%:*}=[$(private.this.os.family.get "${pair%%:*}")]"
+  done
+  private.this.os.family.get solaris2 >/dev/null && bad="$bad unknown-rc0"
+  [ -n "$(private.this.os.family.get solaris2)" ] && bad="$bad unknown-echo"
+  [ -n "$(private.this.os.family.get)" ] || bad="$bad this-computer-empty"
+  [ -z "$bad" ] && create.result 0 "every known OSTYPE gives its family; an unknown one rc 1 and nothing" || create.result 1 "os family:$bad"
+  return $(result)
+}
+test.case $level "T-THIS-OS-FAMILY-GET: the OSTYPE mapping lives in the kernel" test.this.osFamilyGet
+expect 0 "every known OSTYPE gives its family; an unknown one rc 1 and nothing" "config loaded os only for the OSTYPE mapping"
 
 test.suite.save.results

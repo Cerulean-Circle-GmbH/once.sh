@@ -64,9 +64,12 @@ myScript.run() # <agent_name> # BANNED: use agentName
 myScript.find() # <3letterCode> # CRASH: cannot start with number
 ```
 
-#### Completion Functions: `script.method.completion.paramName`
+#### Completion Functions: `script.parameter.completion.paramName` or `script.method.completion.paramName`
 
-Must exactly match the parameter name from the method signature.
+The class-level `script.parameter.completion.paramName` serves the parameter in every method of
+the script; a method that needs other candidates gets its own `script.method.completion.paramName`,
+which c2 asks first (docs/completion-system.md § Where c2 looks). Either way the name must exactly
+match the parameter name from the method signature.
 
 ```bash
 # CORRECT — paramName matches in signature and completion function
@@ -100,7 +103,7 @@ local image-name                        # bash syntax error
 | Public method | `script.methodName()` | `odocker.file.find()` |
 | Private method | `private.script.methodName()` | `private.odocker.resolve.image()` |
 | Parameter | `<camelCase>` | `<containerOrImage>` |
-| Completion | `script.method.completion.paramName()` | `odocker.file.find.completion.containerOrImage()` |
+| Completion | `script.parameter.completion.paramName()`, or `script.method.completion.paramName()` for one method | `oo.parameter.completion.username()`, `odocker.file.find.completion.containerOrImage()` |
 | Local variable | `camelCase` | `local imageName` |
 | Environment var | `UPPER_SNAKE` (bash convention) | `ODOCKER_WORKSPACES` |
 
@@ -188,11 +191,20 @@ odocker.do.thing()            # vague verb
 
 #### Completion Function Rules
 
-1. **One completion function per completable parameter**
-2. **Name must exactly match**: `script.method.completion.paramName()`
+1. **One completion function per completable parameter**, defined once per script
+   (test.completion.audit, T-AUDIT-COMPLETION-ONCE: bash keeps the last of two)
+2. **Name must exactly match**: `script.parameter.completion.paramName()` (class-level) or
+   `script.method.completion.paramName()` (one method; asked first)
 3. **Output**: one completion candidate per line to stdout
 4. **No-param methods**: use empty completion `script.method.completion() { :; }`
 5. **Private methods**: no completion needed (not user-facing)
+6. **"Offer nothing" is a name, not an empty function**: c2 takes an empty
+   answer from `script.method.completion.param()` as "no completion" and asks
+   the shared `script.parameter.completion.param()` next. A parameter that must
+   offer nothing gets a name no shared completion carries, and goes on the
+   free-text list of `test/test.completion.audit` — `ossh key.pull`'s
+   `<?remoteKeyName>`; with `<?keyName>` and `{ :; }` Tab listed this
+   computer's keys (T-OSSH-KEY-COMPLETION)
 
 ```bash
 # Method with two completable params — two completion functions
@@ -399,16 +411,20 @@ answer by rc):
 | `private.this.temp.dir.get <?label:oosh>` | echo the canonical path of a new private directory (mode 700) under `TMPDIR`, else `/tmp`; the caller removes it (tests use `test.suite.fixture.make`) |
 | `private.this.url.download <url> <file>` | download `<url>` to `<file>`, curl through `oo cmd` when it is missing: rc 0 and RESULT the file; rc 1 naming why when there is no curl, curl fails or the download is empty, and no file left. The one checked download, and the one place that knows a download needs curl — odocker's `private.odocker.docker.repo.download` and su/setup's nvm installer call it (T-THIS-URL-DOWNLOAD) |
 | `private.this.file.line.ensure <file> <line>` | append `<line>` unless the file already holds it as a whole line, in place (owner, group and mode kept; a missing file is made); rc 1 + RESULT when it cannot be written. config's `private.config.env.line.append` and su/setup call it (T-THIS-FILE-LINE-ENSURE) |
+| `private.this.file.write <file> <content>` | replace the whole content by `<content>` and a newline, ATOMICALLY: written to `<file>.new` in the same folder under `umask 077` (nobody else can write it before the move), given the old file's mode (and group when the caller may) — a NEW file stays 600, owner only (under umask 002 a new `authorized_keys` was briefly 664) —, then `mv`'d over it — a reader sees the old file or the new one, never half; the writer owns it afterwards (for another user's file use `file.line.ensure`, in place); a symlink is written through; rc 1 + RESULT when the folder is missing or unwritable or the write fails, and no `.new` left (T-THIS-FILE-WRITE) |
+| `private.this.folder.ensure <dir>` | make `<dir>` with its parents when it is missing; rc 0 + RESULT when it exists or was made; rc 1 + RESULT naming why it cannot be (the part of the path that is a file in the way, or the folder without write permission); nothing on stdout (T-THIS-FOLDER-ENSURE) |
+| `private.this.user.name.get` | echo the name of the user running this: `id -un`, else `$USER` (unset under `docker exec`), else nothing and rc 1 — the one spelling, instead of `whoami` or a bare `$USER` (T-THIS-USER-NAME-GET) |
 | `private.this.env.export.line.get <variableName> <value>` | echo one pure-data `export NAME="value"` line, quoted by bash; rc 1 for a control character, a `$(` or backtick (the validator rejects them), or a `$'…'` rendering — the rule `config save` and `log.session.save` share |
 | `private.this.device.is.terminal <device>` | rc 0 when a log device is terminal-type (unset, fd 1, fd 2, the tty) — the one list `info.log` and `log`'s emitter ask |
 | `private.this.path.canonical <path>` | echo the canonical absolute path; GNU `readlink -f` or the BSD fallback |
 | `private.this.path.case.get <path>` | echo the path in the file system's canonical letter case (macOS: osascript POSIX path, trailing `/` dropped); the path unchanged when osascript is absent or fails |
-| `private.this.script.load <script> <probeFn>` | source `$OOSH_DIR/<script>` into this shell once, unless `<probeFn>` is already a function; `this` is saved and restored around the source; rc 0 when `<probeFn>` is a function afterwards |
 | `private.this.folder.entries.copy <from> <to>` | copy every entry of `<from>` (dotfiles included) into `<to>`, keeping relative paths — never `<from>/.` itself, whose mode and owner would land on `<to>`; rc 1 names the entries that failed |
 | `private.this.folder.share <dir>` | share `<dir>` with group dev: `private.ensure.sharedTree` (chgrp dev, g+w) plus setgid on every directory so new files inherit the group; rc 0 without a dev group; never chown |
 | `private.this.symlink.with.backup <linkPath> <target> <ts>` | ensure `<linkPath>` is a symlink to `<target>`; a pre-existing real entry is kept as `<linkPath>.orig.<ts>`; idempotent; fails loud on every step |
 | `private.this.tree.tracked.check <treeRoot> <?caller:sweep>` | rc 0 when git lists tracked files under `<treeRoot>`; else an `INVALID:` verdict on stdout and rc 2 — the one guard of the four tree validators, so a sweep that reads nothing (no repository, nothing tracked, "dubious ownership") never reports OK |
 | `private.this.marker.sweep <pattern> <markerSlug> <treeRoot> <?excludes…>` | echo one line per match in the tracked files, classified `comment`, `marked` (a comment `# <slug>-exception:` on the line or in the 5 lines above, or `# <slug>-exception-file:` in the file) or `unmarked`, then `file:line:content` — the one sweep of `path.validate`, `this.anchor.validate`, `ogit.caller.validate` and `test.suite.portability.validate`, which keep their own rules and summaries |
+
+**Loading another script** (the boss, 2026-10-22; Marcel's pattern in `test/mcdonges.latest`): a script **sources the lower scripts it uses in its `start()`** (`source ogit`, `source os` …), **calls a higher script as a command** (`oo cmd …`, `user get …`), and moves a method that sits too high or too low to the script it belongs to. No script loads another lazily inside a method — the kernel loader `private.this.script.load` is gone (T-THIS-SCRIPT-LOAD-GONE). A loop of command calls at start time is not stopped by the "already sourced" check: each command is a new, empty process (the 5133-process incident of 2026-10-22) — so a start() never runs a command of a script that sources it back.
 
 `config` owns two more for its shared env files: `private.config.env.lines.drop <file> <prefix…>`
 (drop every line starting with a prefix, in place, owner/group/mode kept; an unchanged file is

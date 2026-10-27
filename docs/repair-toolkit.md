@@ -1,5 +1,8 @@
 # Repair toolkit
 
+> **Moved 2026-10-22:** the user repair (`oo user.init`, `oo user.check`, `oo shared.init`, `oo user.repair`) lived in `config` as `config init.user`, `init.check`, `init.shared`, `init.full`. It needs `user`, which made `config` and `user` load each other; in `oo` it may. The old `config init.*` commands still work: they are thin wrappers that run the `oo` command (T-OO-USER-INIT-MOVED).
+
+
 OOSH ships explicit, idempotent repair primitives for the
 post-install drift modes most likely to bite: user symlinks, shared
 config perms, SSH rights and SSH layout. Each primitive has a
@@ -14,8 +17,8 @@ listed here run only when invoked.
 | Primitive | Scope | When to use |
 |---|---|---|
 | [`oo user.fix [user]`](oo.md#oouserfix) | `~/config` + `~/oosh` symlinks for one user | After init/oosh re-run, `oo mode <TAB>` empty, `OOSH_DIR` resolves to a private clone |
-| [`config init.user [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
-| [`config init.shared`](config.md) | `sharedConfig` owned `root:dev` (top level), group `dev`, recursively `g+w`; `shared/dev` and the `Once.sh` base top level only: `root:dev`, `g+ws` | After cross-user perm drift, "Permission denied" on shared config writes, a `developking:dev` install |
+| [`oo user.init [user]`](config.md) | Same as above (canonical underlying call) | Same; preferred when scripting (explicit naming) |
+| [`oo shared.init`](config.md) | `sharedConfig` owned `root:dev` (top level), group `dev`, recursively `g+w`; `shared/dev` and the `Once.sh` base top level only: `root:dev`, `g+ws` | After cross-user perm drift, "Permission denied" on shared config writes, a `developking:dev` install |
 | [`oo update`](oo.md#the-retired-login-drop-in) | removes the retired `/etc/oosh/boot` link and `/etc/profile.d/oosh.sh` drop-in (boot is gone; a shell starts from `~/config/user.env`) | A host installed before boot was removed still has them. May ask for the sudo password once |
 | [`ossh rights.fix`](ossh.md) | `~/.ssh` file modes (600 private, 644 public, 700 dirs) | After SSH client complains about world-readable keys |
 | [`ossh folder.fix [strict]`](ossh.md) | `~/.ssh` tree layout (WODA Host blocks, IdentityFile paths, GitHub Host) | After `ssh: Bad configuration option`, missing `2cuGitHub` alias, drag-in legacy artifacts |
@@ -38,7 +41,7 @@ listed here run only when invoked.
   │                       │                                    │
   │       ┌───────────────▼───────────────┐                    │
   │       │  oo user.fix                  │                    │
-  │       │  = config init.user           │                    │
+  │       │  = oo user.init           │                    │
   │       │  (idempotent)                 │                    │
   │       └───────────────────────────────┘                    │
   │                                                            │
@@ -48,7 +51,7 @@ listed here run only when invoked.
   │                         └────────────────────────┘         │
   │                                                            │
   │       ┌───────────────────────────────┐                    │
-  │       │  config init.shared           │                    │
+  │       │  oo shared.init           │                    │
   │       │  → sharedConfig perms 2775    │                    │
   │       │    group dev                  │                    │
   │       └───────────────────────────────┘                    │
@@ -61,7 +64,7 @@ The repair primitives are *not* run from shell startup, but two
 explicit user actions invoke them silently as part of their flow:
 
 - **`oo update`** (every successful `git pull`) calls
-  `config init.user $USER` to re-apply symlinks. Idempotent and
+  `oo user.init $USER` to re-apply symlinks. Idempotent and
   silent when nothing's drifted. This covers the common case
   where init/oosh was re-run out of band — see
   [`oo.md` § `oo.update`](oo.md#ooupdate). It also runs
@@ -87,8 +90,8 @@ explicitly when something drifts.
 | `OOSH_DIR=/var/<user>/oosh` (private clone resolved) | `oo user.fix` |
 | `~/oosh` is a real directory not a symlink | `oo user.fix` |
 | `~/config` not a symlink | `oo user.fix` |
-| `Permission denied` writing to `~/config/*.env` | `config init.shared` |
-| `sharedConfig` owned by `developking` or `root:root`, or mode `0775` | `sudo -i ~root/oosh/config init.shared` (root's own oosh; plain `sudo config` is not found on Linux) |
+| `Permission denied` writing to `~/config/*.env` | `oo shared.init` |
+| `sharedConfig` owned by `developking` or `root:root`, or mode `0775` | `sudo -i ~root/oosh/oo shared.init` (root's own oosh; plain `sudo config` is not found on Linux) |
 | `/etc/profile.d/oosh.sh` or `/etc/oosh/boot` still present (boot was removed) | `oo update` |
 | A shell without `.bashrc` (cron, `ssh host cmd`) has no oosh | `. ~/config/user.env` — or `source ~/oosh/this`, which reads it itself |
 | `Permissions … are too open` from ssh client | `ossh rights.fix` |
@@ -110,7 +113,7 @@ There is no `boot` any more, and no host-wide login drop-in. `.bashrc` sources
 `source ~/oosh/this` or — for commands over ssh, `runuser`/`sudo -u` and
 `docker exec` — through `ossh.remote.prelude.get`. If an oosh command is not found,
 check the layout with `./test.suite run platform.shared.configLayout.invariant 1`;
-`config save` and `config init.user` repair it. See
+`config save` and `oo user.init` repair it. See
 [config.md § The PATH line](config.md#the-path-line).
 
 ## Verification: am I healed?
