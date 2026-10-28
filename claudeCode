@@ -1670,21 +1670,8 @@ private.claudeCode.max.tokens.for.jsonl() # <jsonlFile> # detect per-session con
   fi
 
   # 2. Observed-max auto-detect — any usage exceeding default means it's 1M
-  local observed_max
-  observed_max=$(tail -200 "$jsonlFile" 2>/dev/null | python3 -c "
-import sys, json
-m = 0
-for line in sys.stdin:
-    try:
-        d = json.loads(line)
-        if d.get('type') == 'assistant':
-            u = d.get('message', {}).get('usage', {})
-            if u and 'input_tokens' in u:
-                t = u['input_tokens'] + u.get('cache_creation_input_tokens', 0) + u.get('cache_read_input_tokens', 0)
-                if t > m: m = t
-    except: pass
-print(m)
-" 2>/dev/null)
+  local observed_max   # max total over the last 200 lines via the shared P1 reader (empty = none = old 0)
+  observed_max=$(tail -200 "$jsonlFile" 2>/dev/null | claudeCode.jsonl.usage - max 2>/dev/null)
   if [ -n "$observed_max" ] && [ "$observed_max" -gt "$CLAUDE_MAX_TOKENS_DEFAULT" ] 2>/dev/null; then
     echo "$CLAUDE_MAX_TOKENS_1M"
     return 0
@@ -1765,12 +1752,10 @@ private.claudeCode.context.jsonl.lag() { # <jsonlFile> # 'lag' when a big un-rec
   # (attachment/tool_use dominate; plain user is a minority). NOT the metadata types (custom-title / mode /
   # permission-mode / last-prompt / file-history) which are churn, not context. tail window is generous;
   # a window bigger than it has NO assistant-usage to reset on → counts high → lag.
-  local n
-  n=$(tail -400 "$jsonlFile" | awk '
-    /"type":[ ]*"assistant"/ && /"input_tokens"/ { c=0; next }
-    /"type":[ ]*"user"/ || /"type":[ ]*"attachment"/ || /"type":[ ]*"tool_result"/ || /"type":[ ]*"tool_use"/ { c++ }
-    END { print c+0 }')
-  if [ "${n:-0}" -gt 8 ]; then echo lag; else echo fresh; fi
+  # Via the shared P1 reader (no-python §1 + §5a R1): the window resets ONLY on a total>0 usage record — a
+  # zero-total stub is not a recorded turn (the old private awk reset on ANY assistant input_tokens line, so a
+  # trailing stub hid a real reboot window = false 'fresh'; golden context.from.jsonl/16).
+  tail -400 "$jsonlFile" | claudeCode.jsonl.usage - lag
 }
 
 private.claudeCode.context.from.jsonl() {
@@ -1803,34 +1788,18 @@ private.claudeCode.context.from.jsonl() {
   local maxTokens
   maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$jsonlFile")
 
-  tail -50 "$jsonlFile" | MAX_TOKENS="$maxTokens" python3 -c "
-import sys, json, os
-max_tokens = int(os.environ.get('MAX_TOKENS') or os.environ.get('CLAUDE_MAX_TOKENS_DEFAULT') or 200000)
-last_usage = None
-for line in sys.stdin:
-    try:
-        d = json.loads(line)
-        if d.get('type') == 'assistant':
-            usage = d.get('message', {}).get('usage', {})
-            if usage and 'input_tokens' in usage:
-                last_usage = usage
-    except: pass
-if last_usage:
-    # Total context = input_tokens + cache_creation + cache_read
-    # input_tokens: non-cached prompt portion (often just 1 with full caching)
-    # cache_creation: new tokens being written to cache this turn
-    # cache_read: previously cached tokens read from cache
-    # Together = full prompt sent to model = context window usage
-    input_t = last_usage['input_tokens']
-    cache_create = last_usage.get('cache_creation_input_tokens', 0)
-    cache_read = last_usage.get('cache_read_input_tokens', 0)
-    total = input_t + cache_create + cache_read
-    pct = round((total / max_tokens) * 100, 1)
-    remaining = round(100 - pct, 1)
-    print(f'{remaining}')
-else:
-    print('unknown')
-" 2>/dev/null
+  # Total context = input + cache_creation + cache_read of the LAST total>0 usage record in the last 50 lines
+  # (shared P1 reader). R1 FIX: the replaced python took the last record even at total 0 -> '100.0' remaining
+  # (false-SAFE: an agent near the wall looked empty); a zero stub is now skipped.
+  local total
+  total=$(tail -50 "$jsonlFile" | claudeCode.jsonl.usage - last 2>/dev/null)
+  [ -z "$total" ] && { echo "unknown"; return 0; }
+  # R4: mirror the python's DOUBLE rounding exactly — pct = round(total/max*100, 1), then
+  # remaining = round(100 - pct, 1). %.1f = correctly-rounded half-even on the exact double, as python round().
+  awk -v t="$total" -v m="${maxTokens:-${CLAUDE_MAX_TOKENS_DEFAULT:-200000}}" 'BEGIN {
+    if (m !~ /^[0-9]+$/ || m == 0) exit 1
+    pct = sprintf("%.1f", (t / m) * 100) + 0
+    printf "%.1f\n", 100 - pct }' 2>/dev/null
 }
 
 claudeCode.context.self() # # read own context % via otmux pane.self — rc=1 if not in tmux
