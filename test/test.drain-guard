@@ -11,7 +11,9 @@
 #   D5 failed dispatch->entry stays at head, D6 multi-line round trip, D7 remote-control >60s->held, D8 shell refused.
 WT="$(cd "${1:-$(dirname "${BASH_SOURCE[0]}")/..}" && pwd -P)"; [ -x "$WT/hiveMind" ] || { echo "no hiveMind in $WT"; exit 2; }
 SC="$WT/test/gen/t-drain-guard"; mkdir -p "$SC"
-D="$SC/dgrun.$$"; rm -rf "$D"; SBX="$D/home"; QD="$D/queue"
+# Queue dir = the DEFAULT location under the sandbox config: deployed team.destroyed ignores
+# HIVEMIND_QUEUE_DIR and uses $CONFIG_PATH/hivemind.queue — same dir for both trees = a fair differential.
+D="$SC/dgrun.$$"; rm -rf "$D"; SBX="$D/home"; QD="$SBX/config/hivemind.queue"
 mkdir -p "$SBX/config" "$QD"; : > "$SBX/config/result.txt"; : > "$SBX/config/error.txt"
 # HOST-SAFETY: a FRESH config has no OOSH_PM, and the OOSH debug trap's 'oo cmd errno moreutils' then runs
 # oo.pm.discover -> 'sudo apt-get update' on EVERY non-zero return (measured: 2 updates on the first run, no
@@ -36,10 +38,11 @@ title "$P" '✳ fxdg-alpha@WODA.prod'; title "$SH" 'v60211.1blu.de'
 # run bash code against the tree under test, with the mocks, in an isolated subshell
 q(){ env -i HOME="$SBX" CONFIG_PATH="$SBX/config" HIVEMIND_QUEUE_DIR="$QD" HIVEMIND_REGISTRY="$SBX/config/hivemind.roles.env" \
        PATH="$WT:/usr/bin:/bin" OOSH_DIR="$WT" TMUX="$TMUX" TERM="${TERM:-xterm}" LOG_DEVICE="$LOG" LOG_FILE="$LOG" \
-       MOCK_RC="${MOCK_RC:-0}" INFORM_LOG="$IL" RAW_LOG="$RL" bash --norc --noprofile -c '
+       MOCK_RC="${MOCK_RC:-0}" MOCK_DETECT="${MOCK_DETECT:-idle}" INFORM_LOG="$IL" RAW_LOG="$RL" bash --norc --noprofile -c '
   source "$OOSH_DIR/hiveMind" >/dev/null 2>&1
   private.hiveMind.agent.inform(){ printf "%s\t%s\n" "$1" "$(printf "%s" "$2" | base64 -w0)" >> "$INFORM_LOG"; return "$MOCK_RC"; }
   private.hiveMind.agent.route(){ echo inform; }
+  private.hiveMind.sweep.detect(){ echo "${MOCK_DETECT:-idle}|none|info"; }   # pane state for agent.unblock.pane (T1)
   otmux(){ if [ "$1" = send.raw ]; then shift; echo "$*" >> "$RAW_LOG"; return 0; fi; command otmux "$@"; }
   eval "$1"' _ "$1"; }
 QF(){ q 'private.hiveMind.agent.queue.path "'"$1"'"'; }
@@ -113,6 +116,55 @@ echo; echo "--- D7b anchor: FRESH remote-control (10s) IS dispatched (TTL is not
 reset; enq "$P" "remote-control:F12" ""; age 10; MOCK_RC=0 drain "$P"
 echo "  raw-keys=$(cnt "$RL") [$(cat "$RL")] held=$(held | grep -c .)"
 { [ "$(cnt "$RL")" -eq 1 ] && [ -z "$(held)" ]; } && ok "D7b fresh remote-control dispatched once" || no "D7b raw=$(cnt "$RL")"
+
+md5(){ [ -e "$1" ] && md5sum "$1" 2>/dev/null | cut -c1-16 || echo absent; }
+
+echo; echo "--- T1 de4dd093 TRIGGER: agent.unblock.pane on an IDLE pane auto-drains the queue ---"
+reset; enq "$P" inform "T1-msg"; MOCK_DETECT=idle MOCK_RC=0 q 'private.hiveMind.agent.unblock.pane "'"$P"'" t1' >/dev/null 2>&1
+T1T=$(head -1 "$IL" | cut -f2 | base64 -d 2>/dev/null)
+echo "  informs=$(ninf) text='$T1T' queue-left=$(nq)"
+{ [ "$(ninf)" -eq 1 ] && [ "$T1T" = T1-msg ] && [ "$(nq)" -eq 0 ]; } && ok "T1 idle unblock drained the entry (dispatched once, dequeued)" \
+  || no "T1 auto-drain did NOT run from agent.unblock.pane (informs=$(ninf), queue-left=$(nq))"
+echo; echo "--- T1b anchor: a NON-idle pane (active) is NOT drained ---"
+reset; enq "$P" inform "T1b-msg"; MOCK_DETECT=active MOCK_RC=0 q 'private.hiveMind.agent.unblock.pane "'"$P"'" t1b' >/dev/null 2>&1
+echo "  informs=$(ninf) queue-left=$(nq)"
+{ [ "$(ninf)" -eq 0 ] && [ "$(nq)" -eq 1 ]; } && ok "T1b active pane: nothing dispatched, entry kept" || no "T1b drained/dispatched on an ACTIVE pane"
+
+echo; echo "--- K1 agent.killed PARKS entries unchanged to .held (epoch|reason|entry); source removed after append ---"
+reset; enq "$P" inform "K1-a"; enq "$P" inform "K1-b"; QFP=$(QF "$P"); cp "$QFP" "$D/k1.orig" 2>/dev/null
+q 'private.hiveMind.handler.agent.killed.queue "'"$P"'"' >/dev/null 2>&1
+HD=$(held); KEEP=$(printf '%s\n' "$HD" | cut -d'|' -f3- )
+REAS=$(printf '%s\n' "$HD" | cut -d'|' -f2 | sort -u)
+echo "  source=$( [ -e "$QFP" ] && echo present || echo removed ) held-lines=$(printf '%s' "$HD" | grep -c .) reason=[$REAS]"
+{ [ ! -e "$QFP" ] && [ "$(printf '%s' "$HD" | grep -c .)" -eq 2 ] && [ "$KEEP" = "$(cat "$D/k1.orig")" ] \
+  && [ "$REAS" = "agent.killed $P" ] && printf '%s\n' "$HD" | cut -d'|' -f1 | grep -qxE '[0-9]+'; } \
+  && ok "K1 both entries parked byte-unchanged with epoch|agent.killed <pane>, source removed" \
+  || no "K1 killed-agent queue $( [ -z "$HD" ] && echo 'DELETED (nothing parked)' || echo 'parked wrongly')"
+echo; echo "--- K2 unwritable .held -> park rc1 + source KEPT byte-identical ---"
+reset; enq "$P" inform "K2-x"; QFP=$(QF "$P"); mkdir -p "$QFP.held"; M0=$(md5 "$QFP")
+PO=$(q 'private.hiveMind.queue.park "'"$QFP"'" k2-test; echo "prc=$?"' 2>&1); PRC=$(echo "$PO" | grep -oE 'prc=[0-9]+' | cut -d= -f2)
+q 'private.hiveMind.handler.agent.killed.queue "'"$P"'"; echo "hrc=$?"' > "$D/k2.h" 2>&1; HRC=$(grep -oE 'hrc=[0-9]+' "$D/k2.h" | cut -d= -f2)
+M1=$(md5 "$QFP"); WARNK=$(cat "$LOG" "$D/k2.h" 2>/dev/null | grep -c 'cannot write')
+echo "  park rc=${PRC:-?} handler rc=${HRC:-?} source md5 before=$M0 after=$M1 warn=$WARNK"
+{ [ "${PRC:-0}" = 1 ] && [ "$M0" = "$M1" ] && [ "$M0" != absent ] && [ "$WARNK" -ge 1 ]; } \
+  && ok "K2 unwritable .held: park rc1 + 'cannot write' warning, source KEPT identical (handler rc=$HRC by design)" \
+  || no "K2 park rc=${PRC:-?} source $( [ "$M1" = absent ] && echo DELETED || echo "md5 $M0->$M1" ) warn=$WARNK"
+rm -rf "$QFP.held"
+
+echo; echo "--- TD1 team.destroyed PARKS the session's queue files (old '<session>:*' glob never matched) ---"
+reset; S2="${S}_b"; enq "$P" inform "TD-p0"
+F01="$QD/${S}_0_1.queue"; FB="$QD/${S2}_0_0.queue"
+printf 'v2|%s|inform|fxdg-alpha|%s\n' "$(date +%s)" "$(printf 'TD-p1' | base64 -w0)" > "$F01"
+printf 'v2|%s|inform|fxdg-other|%s\n' "$(date +%s)" "$(printf 'TD-other-session' | base64 -w0)" > "$FB"
+MB0=$(md5 "$FB"); F00=$(QF "$P")
+q 'private.hiveMind.handler.team.destroyed.queue "'"$S"'"' >/dev/null 2>&1
+echo "  ${S}_0_0: $( [ -e "$F00" ] && echo present || echo parked ) held=$(cnt "$F00.held")  ${S}_0_1: $( [ -e "$F01" ] && echo present || echo parked ) held=$(cnt "$F01.held")"
+{ [ ! -e "$F00" ] && [ ! -e "$F01" ] && [ "$(cnt "$F00.held")" -eq 1 ] && [ "$(cnt "$F01.held")" -eq 1 ] \
+  && grep -q "|team.destroyed $S|" "$F00.held"; } && ok "TD1 both $S pane queues parked with reason team.destroyed" \
+  || no "TD1 team.destroyed did NOT park the session's queues (files left in place, no .held)"
+echo; echo "--- TD2 anchor: destroying '$S' must NOT sweep session '$S2' (prefix guard) ---"
+echo "  ${S2}_0_0 md5 before=$MB0 after=$(md5 "$FB") held=$(cnt "$FB.held")"
+{ [ "$MB0" = "$(md5 "$FB")" ] && [ "$(cnt "$FB.held")" -eq 0 ]; } && ok "TD2 '$S2' queue untouched" || no "TD2 '$S2' queue swept by destroying '$S'"
 
 LIVE_AFTER=$(lsha); echo; echo "  live queue sha before=$LIVE_BEFORE after=$LIVE_AFTER"
 { [ "$LIVE_BEFORE" = "$LIVE_AFTER" ] && [ "$LIVE_BEFORE" != absent ]; } && ok "SAFE live hivemind.queue untouched" || no "SAFE live queue changed/absent"
