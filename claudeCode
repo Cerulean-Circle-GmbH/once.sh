@@ -1681,7 +1681,7 @@ private.claudeCode.max.tokens.for.jsonl() # <jsonlFile> # detect per-session con
   echo "$CLAUDE_MAX_TOKENS_DEFAULT"
 }
 
-claudeCode.jsonl.usage() # <jsonl|-> <mode:last|max|first|lag|firstlast|all> # assistant USAGE from a Claude session JSONL in ONE pass, pure awk ('first' stops at the first total>0 record) (no-python design §1 P1). '-' = stdin (callers keep their own tail window). Empty when no data.
+claudeCode.jsonl.usage() # <jsonl|-> <mode:last|max|first|lag|firstlast|all|velocity> # assistant USAGE from a Claude session JSONL in ONE pass, pure awk ('first' stops at the first total>0 record) (no-python design §1 P1). '-' = stdin (callers keep their own tail window). Empty when no data.
 {
   # P1 RULES (design no-python-in-oosh §1 + §5a R1) — the ONE implementation; every former python copy calls this:
   #  - a record COUNTS iff the line has an UNESCAPED "type":"assistant" AND an unescaped "usage":{ whose
@@ -1694,7 +1694,7 @@ claudeCode.jsonl.usage() # <jsonl|-> <mode:last|max|first|lag|firstlast|all> # a
   #    "type":"user|attachment|tool_result|tool_use" (both spacings) — the python's exact test, on purpose.
   local src="$1" mode="${2:-last}"
   # stdout is DATA (callers capture it) — diagnostics go to stderr (error.log prints to stdout).
-  case "$mode" in last|max|first|lag|firstlast|all) ;; *) error.log "jsonl.usage: unknown mode '$mode' (last|max|first|lag|firstlast|all)" >&2; return 1 ;; esac
+  case "$mode" in last|max|first|lag|firstlast|all|velocity) ;; *) error.log "jsonl.usage: unknown mode '$mode' (last|max|first|lag|firstlast|all|velocity)" >&2; return 1 ;; esac
   [ "$src" = "-" ] && src="/dev/stdin"
   [ -n "$1" ] && [ -r "$src" ] || return 0
   # PERF (measured on the biggest real session, 616MB): naive regex version 38s vs python 3s. Now: LC_ALL=C
@@ -1724,7 +1724,7 @@ claudeCode.jsonl.usage() # <jsonl|-> <mode:last|max|first|lag|firstlast|all> # a
         if (sub(/^[ ]*:[ ]*[{]/, "", u) && at(u, "input_tokens")) {   # [{] not \{ : POSIX ERE ({ = interval op)
           t = num(u, "input_tokens") + num(u, "cache_creation_input_tokens") + num(u, "cache_read_input_tokens")
           if (t > 0) {
-            last = t; pending = 0; if (t > max) max = t
+            last = t; pending = 0; count++; if (t > max) max = t
             lastTs = ts($0); if (first == "") { first = t; firstTs = lastTs; if (mode == "first") { print t; done = 1; exit } }
             next
           }
@@ -1740,6 +1740,7 @@ claudeCode.jsonl.usage() # <jsonl|-> <mode:last|max|first|lag|firstlast|all> # a
       if (mode == "last")      print last
       else if (mode == "max")  print max
       else if (mode == "firstlast") print firstTs "|" first "|" lastTs "|" last
+      else if (mode == "velocity")  print count "|" firstTs "|" first "|" lastTs "|" last   # count = total>0 records (velocity needs >= 2)
       else                     print last "|" max "|" pending + 0 "|" firstTs "|" first "|" lastTs
     }' "$src"
 }
@@ -2046,62 +2047,34 @@ private.claudeCode.velocity.calculate() # <jsonlFile> # parse velocity from json
   local maxTokens
   maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$jsonlFile")
 
-  MAX_TOKENS="$maxTokens" python3 -c "
-import json, sys, os
-from datetime import datetime
-
-max_tokens = int(os.environ.get('MAX_TOKENS') or os.environ.get('CLAUDE_MAX_TOKENS_DEFAULT') or 200000)
-
-messages = []
-with open('$jsonlFile') as f:
-    for line in f:
-        try:
-            d = json.loads(line)
-            if d.get('type') == 'assistant':
-                msg = d.get('message', {})
-                usage = msg.get('usage', {})
-                if usage and 'input_tokens' in usage:
-                    ts = d.get('timestamp', '')
-                    total = usage['input_tokens'] + usage.get('cache_creation_input_tokens', 0) + usage.get('cache_read_input_tokens', 0)
-                    messages.append({'ts': ts, 'tokens': total})
-        except:
-            pass
-
-if len(messages) < 2:
-    print('unknown')
-    sys.exit(0)
-
-first = messages[0]
-last = messages[-1]
-
-try:
-    t1 = datetime.fromisoformat(first['ts'].replace('Z', '+00:00'))
-    t2 = datetime.fromisoformat(last['ts'].replace('Z', '+00:00'))
-    hours = (t2 - t1).total_seconds() / 3600
-    if hours <= 0:
-        print('unknown')
-        sys.exit(0)
-
-    token_growth = last['tokens'] - first['tokens']
-    tokens_per_hour = token_growth / hours
-
-    current = last['tokens']
-    threshold = int(max_tokens * int(os.environ.get('CLAUDE_COMPACT_THRESHOLD_PCT') or 90) / 100)
-    remaining = threshold - current
-
-    if tokens_per_hour > 0 and remaining > 0:
-        hours_left = remaining / tokens_per_hour
-        mins_left = int(hours_left * 60)
-        print(f'{int(tokens_per_hour)} tokens/hr | {current} current | ~{mins_left}min until compact')
-    elif remaining <= 0:
-        print(f'{int(tokens_per_hour)} tokens/hr | {current} current | COMPACT NOW')
-    else:
-        print(f'{int(tokens_per_hour)} tokens/hr | {current} current')
-except Exception as e:
-    print('unknown')
-" 2>/dev/null
-
+  # first/last total>0 records + count via the ONE shared P1 reader (R1); timestamps via P3 + exact
+  # microseconds (python's timedelta.total_seconds() precision — the rate depends on sub-second ts).
+  local v cnt fts first lts last u1 u2
+  v=$(claudeCode.jsonl.usage "$jsonlFile" velocity)
+  IFS='|' read -r cnt fts first lts last <<< "$v"
+  [ "${cnt:-0}" -ge 2 ] 2>/dev/null || { echo "unknown"; return 0; }
+  u1=$(private.claudeCode.ts.micros "$fts") && u2=$(private.claudeCode.ts.micros "$lts") || { echo "unknown"; return 0; }
+  awk -v us="$(( u2 - u1 ))" -v f="$first" -v l="$last" \
+      -v mt="${maxTokens:-${CLAUDE_MAX_TOKENS_DEFAULT:-200000}}" -v pct="${CLAUDE_COMPACT_THRESHOLD_PCT:-90}" 'BEGIN {
+    hours = (us / 1000000) / 3600
+    if (hours <= 0) { print "unknown"; exit }
+    tph = (l - f) / hours
+    rem = int(mt * pct / 100) - l
+    if (tph > 0 && rem > 0)  print int(tph) " tokens/hr | " l " current | ~" int(rem / tph * 60) "min until compact"
+    else if (rem <= 0)       print int(tph) " tokens/hr | " l " current | COMPACT NOW"
+    else                     print int(tph) " tokens/hr | " l " current"
+  }'
   return 0
+}
+
+private.claudeCode.ts.micros() # <iso8601> # integer MICROseconds since epoch (python fromisoformat precision: fraction kept, truncated to 6 digits) via P3; rc1 when unparseable
+{
+  local e frac=""
+  e=$("$OOSH_DIR/line" iso.epoch "$1" 2>/dev/null)
+  [[ "$e" =~ ^[0-9]+$ ]] || return 1
+  [[ "$1" =~ T[0-9:]+\.([0-9]+) ]] && frac="${BASH_REMATCH[1]:0:6}"
+  while [ "${#frac}" -lt 6 ]; do frac="${frac}0"; done
+  echo $(( e * 1000000 + 10#$frac ))
 }
 
 claudeCode.context.dashboard() # # show velocity dashboard for all active sessions
@@ -2136,48 +2109,23 @@ claudeCode.context.dashboard() # # show velocity dashboard for all active sessio
       # Get velocity info (per-session max_tokens aware)
       local maxTokens
       maxTokens=$(private.claudeCode.max.tokens.for.jsonl "$latest")
-      local info
-      info=$(JSONL_FILE="$latest" MAX_TOKENS="$maxTokens" python3 -c "
-import json, sys, os
-from datetime import datetime
-
-jsonl_file = os.environ.get('JSONL_FILE', '')
-max_tokens = int(os.environ.get('MAX_TOKENS') or os.environ.get('CLAUDE_MAX_TOKENS_DEFAULT') or 200000)
-threshold = int(max_tokens * int(os.environ.get('CLAUDE_COMPACT_THRESHOLD_PCT') or 90) / 100)
-
-messages = []
-with open(jsonl_file) as f:
-    for line in f:
-        try:
-            d = json.loads(line)
-            if d.get('type') == 'assistant':
-                usage = d.get('message', {}).get('usage', {})
-                if usage and 'input_tokens' in usage:
-                    total = usage['input_tokens'] + usage.get('cache_creation_input_tokens', 0) + usage.get('cache_read_input_tokens', 0)
-                    messages.append({'ts': d.get('timestamp', ''), 'tokens': total})
-        except: pass
-
-if len(messages) < 2:
-    print('- | - | -')
-    sys.exit(0)
-
-first, last = messages[0], messages[-1]
-try:
-    t1 = datetime.fromisoformat(first['ts'].replace('Z', '+00:00'))
-    t2 = datetime.fromisoformat(last['ts'].replace('Z', '+00:00'))
-    hours = (t2 - t1).total_seconds() / 3600
-    if hours <= 0:
-        print(f\"{round(last['tokens']/max_tokens*100,1)}% | - | -\")
-        sys.exit(0)
-    rate = int((last['tokens'] - first['tokens']) / hours)
-    remaining = threshold - last['tokens']
-    mins = int(remaining / rate * 60) if rate > 0 and remaining > 0 else 0
-    pct = round(last['tokens'] / max_tokens * 100, 1)
-    status = 'COMPACT!' if remaining <= 0 else f'{mins}min'
-    print(f\"{pct}% | {rate}/hr | {status}\")
-except:
-    print('- | - | -')
-" 2>/dev/null)
+      local info v cnt fts first lts last u1 u2
+      v=$(claudeCode.jsonl.usage "$latest" velocity)              # ONE shared P1 reader (R1)
+      IFS='|' read -r cnt fts first lts last <<< "$v"
+      if ! [ "${cnt:-0}" -ge 2 ] 2>/dev/null; then
+        info='- | - | -'
+      elif u1=$(private.claudeCode.ts.micros "$fts") && u2=$(private.claudeCode.ts.micros "$lts"); then
+        info=$(awk -v us="$(( u2 - u1 ))" -v f="$first" -v l="$last" \
+            -v mt="${maxTokens:-${CLAUDE_MAX_TOKENS_DEFAULT:-200000}}" -v pct="${CLAUDE_COMPACT_THRESHOLD_PCT:-90}" 'BEGIN {
+          hours = (us / 1000000) / 3600; p = l / mt * 100
+          if (hours <= 0) { printf "%.1f%% | - | -\n", p; exit }
+          rate = int((l - f) / hours); rem = int(mt * pct / 100) - l
+          mins = (rate > 0 && rem > 0) ? int(rem / rate * 60) : 0
+          printf "%.1f%% | %d/hr | %s\n", p, rate, (rem <= 0) ? "COMPACT!" : mins "min"
+        }')
+      else
+        info='- | - | -'
+      fi
 
       echo "$short | $info"
     done < <(find "$dir" -maxdepth 1 -name "*.jsonl" 2>/dev/null)
