@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# T-CLAUDECODE-VALIDATORS — RED-FIRST for the boundary validators of 6 claudeCode methods.
+# BUG (measured): b745e766 commented out this.isUuid / this.isPaneTarget / this.isRoleName in `this`
+#   (otmux got private.is* copies, claudeCode did not) -> `if ! this.isUuid ...` = command-not-found
+#   -> EVERY input is rejected: join.byID, join.byPane, fork, fork.byPane, fork.to, stop.
+# CONTRACT (black box — independent of HOW the fix restores the validators):
+#   VALID input  -> passes the validator and reaches the action stage (no 'invalid', no 'command not found')
+#   JUNK  input  -> rc!=0 + 'invalid' message + the action stage is NEVER reached
+# SAFETY: the action stage is STUBBED inside a subshell — $CLAUDE_CMD, resolvers, process.find, and
+#   $OOSH_DIR (so `$OOSH_DIR/hiveMind agent.fork.best` hits a stub). Nothing joins, forks or kills.
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level> (RED-FIRST — validators undefined must fail)"
+source this
+source test.suite
+log.level $level
+export LOG_DEVICE=/dev/null
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+
+GEN="${OOSH_DIR}/test/gen/t-claudecode-validators"
+sweep(){ rm -rf "$GEN"; }
+trap sweep EXIT
+sweep                                   # pre-run sweep (an EXIT trap does not fire on SIGKILL)
+mkdir -p "$GEN/stubdir"
+CC_UNDER_TEST=$(command -v claudeCode)
+# Stubs for the action stage: each writes REACHED and does nothing else.
+for s in hiveMind otmux; do
+  printf '#!/bin/sh\necho "REACHED %s $*" >> "%s/marker"\necho "✳ fxrl-derived@WODA.prod"\n' "$s" "$GEN" > "$GEN/stubdir/$s"
+  chmod +x "$GEN/stubdir/$s"
+done
+printf '#!/bin/sh\necho "REACHED claude $*" >> "%s/marker"\n' "$GEN" > "$GEN/stubdir/claude"; chmod +x "$GEN/stubdir/claude"
+
+# run <method> <args...> -> sets RC, OUT (stdout+stderr+error.log), REACHED (0/1)
+run(){
+  rm -f "$GEN/marker" "$GEN/log"
+  OUT=$( (
+    export LOG_DEVICE="$GEN/log"
+    source "$CC_UNDER_TEST" >/dev/null 2>&1
+    CLAUDE_CMD="$GEN/stubdir/claude"; OOSH_DIR="$GEN/stubdir"
+    private.claudeCode.resolve.byPane(){ echo "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"; }
+    private.claudeCode.resolve.projectDir(){ :; }
+    claudeCode.process.find(){ echo "REACHED process.find $*" >> "$GEN/marker"; }
+    "claudeCode.$1" "${@:2}"
+  ) 2>&1 ); RC=$?
+  [ -f "$GEN/log" ] && OUT="${OUT}$(cat "$GEN/log")"
+  REACHED=0; [ -s "$GEN/marker" ] && REACHED=1
+}
+
+UUID_OK="aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
+accept(){ # <method> <label> <args...>
+  local m="$1" label="$2"; shift 2; run "$m" "$@"
+  local cnf=0; echo "$OUT" | grep -q 'command not found' && cnf=1
+  local inv=0; echo "$OUT" | grep -qi 'invalid' && inv=1
+  test.case $level "VALID  $m $label -> accepted, action reached" echo "rc=$RC reached=$REACHED invalid=$inv cnf=$cnf"
+  { [ "$REACHED" -eq 1 ] && [ "$inv" -eq 0 ] && [ "$cnf" -eq 0 ] && [ "$RC" -eq 0 ]; } && ok "$m accepted '$label'" \
+    || no "RED: $m REJECTED valid '$label' (reached=$REACHED invalid=$inv command-not-found=$cnf): $(echo "$OUT" | grep -iE 'invalid|not found' | head -1)"
+}
+reject(){ # <method> <label> <args...>
+  local m="$1" label="$2"; shift 2; run "$m" "$@"
+  local inv=0; echo "$OUT" | grep -qiE 'invalid|usage' && inv=1   # empty arg -> 'usage:' guard
+  test.case $level "JUNK   $m $label -> rejected before action" echo "rc=$RC reached=$REACHED invalid=$inv"
+  { [ "$RC" -ne 0 ] && [ "$REACHED" -eq 0 ] && [ "$inv" -eq 1 ]; } && ok "$m rejected '$label'" \
+    || no "$m let junk '$label' through (rc=$RC reached=$REACHED invalid=$inv)"
+}
+
+echo; echo "===== join.byID / fork — UUID boundary ====="
+for m in join.byID fork; do
+  # (no UPPERCASE arm: the pre-b745e766 kernel validator was lowercase-only and Claude session
+  #  uuids are lowercase — the contract is "restore the validator", not a new case rule.)
+  accept "$m" "canonical uuid"     "$UUID_OK"
+  reject "$m" "'not-a-uuid'"       "not-a-uuid"
+  reject "$m" "empty"              ""
+  reject "$m" "short uuid"         "aaaaaaaa-1111-4222-8333-bbbb"
+  reject "$m" "injection"          "${UUID_OK};touch $GEN/pwned"
+done
+
+echo; echo "===== join.byPane / fork.byPane / stop — pane boundary ====="
+# VALID-FORMAT but NONEXISTENT panes only — never a real pane address, least of all for stop.
+for m in join.byPane fork.byPane stop; do
+  accept "$m" "session:win.pane" "nosuchsess:9.9"
+  accept "$m" "raw %N id"        "%99999"
+  reject "$m" "empty"            ""
+  reject "$m" "'foo'"            "foo"
+  reject "$m" "no pane index"    "ooshTeam:0"
+  reject "$m" "injection"        'ooshTeam:0.1;touch x'
+done
+
+echo; echo "===== fork.to — pane + role boundary ====="
+accept fork.to "pane + role"            "nosuchsess:9.9" "fxrl-role"
+accept fork.to "pane only (role derived from title)" "%99999"
+reject fork.to "junk pane"              "foo" "fxrl-role"
+reject fork.to "junk role"              "nosuchsess:9.9" 'bad role;x'
+
+echo; echo "===== the injection never executed ====="
+test.case $level "no injection side effect" echo "$( [ -e "$GEN/pwned" ] && echo PWNED || echo clean )"
+[ ! -e "$GEN/pwned" ] && [ ! -e x ] && ok "no injected command ran" || no "INJECTION RAN"
+
+echo
+echo "=================================================================="
+echo "  T-CLAUDECODE-VALIDATORS  PASS=$pass FAIL=$fail"
+echo "  RED-FIRST until the 6 methods accept valid input again (validators defined)."
+echo "=================================================================="
+sweep
+test.suite.save.results
