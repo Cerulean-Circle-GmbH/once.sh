@@ -695,13 +695,41 @@ def ctx_from_jsonl(path, denom_k):
     if pending > 8: return "lag"
     return used, round(used * 100 / (denom_k * 1000)), denom_k
 
+_BAR_ESC = re.compile(r"·[ \t]*esc([ \t]|…|$)")
+_WORKING = re.compile(r"^(·|✢|✳|✶|✻|✽|\*)[ \t]+[A-Z][a-z]+…[ \t]+\(([0-9]+h[ \t]+)?([0-9]+m[ \t]+)?[0-9]+s")
+
+def is_active(cap):
+    # Rule 4 (design stale-role-labels §Rule 4) — WORKING survives a narrow pane. Mirrors
+    # private.scrumMaster.swipe.classify.active exactly (ASCII space/tab only, both copies).
+    lines = cap.splitlines()
+    tail = lines[-6:]
+    low = "\n".join(tail).lower()
+    if "esc to interrupt" in low or "esc to int" in low:            # signal 1
+        return True
+    bars = [l for l in tail if "⏵⏵" in l or "auto mode" in l]       # signal 2: truncated bar
+    if bars and _BAR_ESC.search(bars[-1]):
+        return True
+    p = next((i for i in range(len(lines) - 1, -1, -1) if re.match(r"^[ \t]*❯", lines[i])), -1)
+    if p < 1 or not re.match(r"^[ \t]*─", lines[p - 1]):           # signal 3: anchored working line
+        return False
+    s = p - 1
+    for j in range(s - 1, max(s - 9, -1), -1):                      # at most 8 lines up
+        ln = lines[j]
+        if not ln.strip(" \t"):
+            continue
+        if ln[:1] in (" ", "\t") or ln.startswith(("⎿", "✔")):
+            continue
+        return bool(_WORKING.match(ln))
+    return False
+
 def classify(cap):
     # ONLY the live chrome (last ~6 lines) — never the message body above, or an agent
     # discussing "do you want" / "/compact" false-trips it (the ARON/agent-trainer bug).
+    # The one exception is Rule 4 signal 3, which reads above the tail ONLY through the input-box anchor.
     tail = "\n".join(cap.splitlines()[-6:])
     low = tail.lower()
     idle_bar = ("auto mode on" in low) or ("⏵⏵" in tail)   # the parked status bar
-    if "esc to interrupt" in low or "esc to int" in low:
+    if is_active(cap):
         return "ACTIVE"
     if "context left until auto-compact" in low or "context limit reached" in low or "compact or /clear to continue" in low:
         return "ON-WALL"   # caller double-gates with JSONL pct>=98
@@ -835,7 +863,41 @@ print("%d|%d|%d" % (used, round(used * 100 / (denom_k * 1000)), denom_k))
 ' "$jsonl" "$denomK" 2>/dev/null
 }
 
-private.scrumMaster.swipe.classify() # <capture-text> # echo STATE from the last-6-line chrome ONLY (mirrors pulse classify; never the message body).
+private.scrumMaster.swipe.classify.active() # <capture-text> # rc0 if the agent is WORKING — Rule 4 (design stale-role-labels §Rule 4): survives a narrow pane. Mirrors pulse is_active() exactly.
+{
+  local cap="$1"
+  local tail; tail=$(printf '%s\n' "$cap" | tail -6)
+  local low; low=$(printf '%s' "$tail" | tr 'A-Z' 'a-z')
+  # Signal 1: the full or shortened 'esc to interrupt' anywhere in the 6-line chrome.
+  case "$low" in *"esc to interrupt"*|*"esc to int"*) return 0;; esac
+  # Signal 2: the status-bar line (last tail line with ⏵⏵ / auto mode) carries a '· esc' segment —
+  # a TRUNCATED bar ('· esc …') still shows it; the idle bar has no esc at all.
+  local bar; bar=$(printf '%s\n' "$tail" | grep -E '⏵⏵|auto mode' | tail -1)
+  local reBar='·[ 	]*esc([ 	]|…|$)'
+  [[ "$bar" =~ $reBar ]] && return 0
+  # Signal 3: the working line, ANCHORED to the input box. Find the ❯ line, require the ─ separator
+  # directly above it, then walk UP at most 8 lines skipping only trailer chrome (blank, indented
+  # continuation incl ⎿ Tip / ✔ notice); the FIRST real line must have the working-line shape.
+  local -a L; local n=0 line
+  while IFS= read -r line; do L[n]="$line"; n=$((n + 1)); done <<< "$cap"
+  local i p=-1 rePrompt='^[ 	]*❯' reSep='^[ 	]*─'
+  for ((i = n - 1; i >= 0; i--)); do [[ "${L[i]}" =~ $rePrompt ]] && { p=$i; break; }; done
+  [ "$p" -ge 1 ] || return 1
+  local s=$((p - 1))
+  [[ "${L[s]}" =~ $reSep ]] || return 1
+  local reWork='^(·|✢|✳|✶|✻|✽|\*)[ 	]+[A-Z][a-z]+…[ 	]+\(([0-9]+h[ 	]+)?([0-9]+m[ 	]+)?[0-9]+s'
+  local j ln
+  for ((j = s - 1; j >= 0 && j >= s - 8; j--)); do
+    ln="${L[j]}"
+    [ -z "${ln//[ 	]/}" ] && continue          # blank
+    case "$ln" in " "*|"	"*|"⎿"*|"✔"*) continue;; esac   # indented continuation / Tip / notice
+    [[ "$ln" =~ $reWork ]] && return 0
+    return 1                                     # first real line is not a working line -> stop
+  done
+  return 1
+}
+
+private.scrumMaster.swipe.classify() # <capture-text> # echo STATE from the last-6-line chrome ONLY (mirrors pulse classify; never the message body). ACTIVE also via the Rule-4 anchored signals.
 {
   local cap="$1"
   local tail; tail=$(printf '%s\n' "$cap" | tail -6)
@@ -843,7 +905,7 @@ private.scrumMaster.swipe.classify() # <capture-text> # echo STATE from the last
   local idle_bar=0
   case "$low" in *"auto mode on"*) idle_bar=1;; esac
   case "$tail" in *"⏵⏵"*) idle_bar=1;; esac
-  case "$low" in *"esc to interrupt"*|*"esc to int"*) echo ACTIVE; return;; esac
+  private.scrumMaster.swipe.classify.active "$cap" && { echo ACTIVE; return; }
   case "$low" in *"context left until auto-compact"*|*"context limit reached"*|*"compact or /clear to continue"*) echo ON-WALL; return;; esac
   if [ "$idle_bar" -eq 0 ]; then
     case "$tail" in *"❯ 1."*) echo OPEN-DRAWER; return;; esac
