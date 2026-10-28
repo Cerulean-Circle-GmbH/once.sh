@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# T-CREDS-EXPIRY — item 5: gate expert no-python step 1 @18e51a7c (private.scrumMaster.creds.expired).
+# Usage: test/test.creds-expiry [<tree>]  (default = the repo this file lives in; differential: pass CONTROL / CANDIDATE)
+#  E2 spec-table parity: creds.expired <ms> <now> == the OLD python expression, recorded here from python itself
+#     (time.time() replaced by the injected now; a python error = '' = treated as NOT expired, as the old code did)
+#  E3 the python3-gate fix: host WITH jq, WITHOUT python3, EXPIRED token -> auth must REFUSE (old code skipped the
+#     check and handed the expired token out). jq is not installed on this host -> a minimal jq TEST DOUBLE answers
+#     auth's two queries from the fixture (jq is design-allowed). python-less PATH = /usr/bin + /bin minus python*.
+#  E3b anchor: python3 PRESENT + expired -> refused on both trees.   E4: valid token, no python3 -> token returned.
+# SECRETS: sandbox HOME with a FAKE credentials file; the real ~/.claude/.credentials.json is never read.
+# HOST-SAFE: sandbox config seeds OOSH_PM=false (fresh config -> debug trap -> sudo apt-get update otherwise).
+WT="$(cd "${1:-$(dirname "${BASH_SOURCE[0]}")/..}" && pwd -P)"; SC="$WT/test/gen/t-creds-expiry"; mkdir -p "$SC"
+D="$SC/ceRun.$$"; rm -rf "$D"; SBX="$D/home"; mkdir -p "$SBX/config" "$SBX/.claude" "$D/nopy" "$D/fakejq"
+: > "$SBX/config/result.txt"; : > "$SBX/config/error.txt"
+printf 'export OOSH_PM="false"\nexport OOSH_PM_UPDATED="seeded-by-test"\n' > "$SBX/config/user.env"
+trap 'rm -rf "$D"' EXIT
+echo "=== tree: $WT @ $(git -C "$WT" rev-parse --short HEAD) $(git -C "$WT" diff --quiet HEAD && echo clean || echo "+ local: $(git -C "$WT" diff --name-only HEAD | tr '\n' ' ')")"
+hostm(){ stat -c '%Y' /var/lib/apt/lists /var/lib/dpkg/status 2>/dev/null | tr '\n' ' '; }; HOST_BEFORE=$(hostm)
+pass=0; fail=0; ok(){ echo "  PASS $1"; pass=$((pass+1)); }; no(){ echo "  FAIL $1"; fail=$((fail+1)); }
+
+# python-less PATH
+for d in /usr/bin /bin; do for f in "$d"/*; do b=${f##*/}; case "$b" in python*) continue;; esac; [ -e "$D/nopy/$b" ] || ln -s "$f" "$D/nopy/$b" 2>/dev/null; done; done
+cat > "$D/fakejq/jq" <<'EOF'
+#!/bin/sh
+# jq TEST DOUBLE: answers only auth's two queries (-r .claudeAiOauth.accessToken | .claudeAiOauth.expiresAt // "")
+in=$(cat); q="$2"
+case "$q" in
+  *accessToken*) printf '%s\n' "$in" | sed -n 's/.*"accessToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ;;
+  *expiresAt*)   v=$(printf '%s\n' "$in" | sed -n 's/.*"expiresAt"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' | tr -d ' "'); printf '%s\n' "$v" ;;
+  *) exit 5 ;;
+esac
+EOF
+chmod +x "$D/fakejq/jq"
+[ -z "$(PATH="$D/nopy" command -v python3)" ] && ok "INSTRUMENT python3 absent from the no-python PATH" || no "INSTRUMENT python3 still on no-python PATH"
+
+# run a scrumMaster private fn from the tree, in a subshell, with a chosen PATH
+sm(){ local P="$1"; shift; env -i HOME="$SBX" CONFIG_PATH="$SBX/config" PATH="$WT:$P" OOSH_DIR="$WT" LOG_DEVICE="$D/log" LOG_FILE="$D/log" \
+       bash --norc --noprofile -c 'source "$OOSH_DIR/scrumMaster" >/dev/null 2>&1; "$@"' _ "$@"; }
+creds(){ printf '{"claudeAiOauth":{"accessToken":"FAKE-TOK-TEST","expiresAt":%s,"scopes":["x"]}}\n' "$1" > "$SBX/.claude/.credentials.json"; }
+
+echo; echo "--- E2 spec-table parity: creds.expired vs the OLD python expression (recorded now, from python) ---"
+DEF=$(sm "/usr/bin:/bin" type -t private.scrumMaster.creds.expired 2>/dev/null)
+if [ "$DEF" != function ]; then
+  no "E2 private.scrumMaster.creds.expired NOT DEFINED in this tree (expiry still inline python)"
+else
+  NOW0=1700000000; BAD=""; N=0
+  while read -r ms now; do
+    [ -z "$ms" ] && continue; N=$((N+1))
+    old=$(python3 -c "print('yes' if ${now} > ${ms}/1000 else 'no')" 2>/dev/null); [ "$old" = yes ] || old=no
+    new=$(sm "/usr/bin:/bin" private.scrumMaster.creds.expired "$ms" "$now" 2>/dev/null)
+    [ "$new" = "$old" ] || BAD="$BAD [$ms@$now py=$old new=$new]"
+  done <<EOF
+1700000000000 1700000001
+1700000000000 1699999999
+1700000000000 1700000000
+1700000000500 1700000000
+1700000000500 1700000001
+1.7e12 1700000001
+1.7E12 1699999999
+1.7e+12 1700000001
+1700000000000.9 1700000000
+0 1
+-5 1
+99999999999999999999 1700000000
+1e400 1700000000
+None 1700000000
+abc 1700000000
+1700000000000abc 1700000001
+EOF
+  [ -z "$BAD" ] && ok "E2 $N/$N rows == old python verdict (ints, sci-notation, decimals, boundary-equal, huge, inf, None/garbage)" \
+                || no "E2 parity broken:$BAD"
+fi
+
+echo; echo "--- E3 FIX: jq present, python3 ABSENT, EXPIRED token -> auth must REFUSE ---"
+creds 1000000000000                                     # 2001-09-09 = long expired
+: > "$D/log"; OUT=$(sm "$D/fakejq:$D/nopy" private.scrumMaster.subscription.auth 2>&1); RC=$?
+LOGE=$(grep -i 'expired' "$D/log" "$SBX/config/error.txt" 2>/dev/null | head -1)
+echo "  rc=$RC stdout-has-token=$(echo "$OUT" | grep -c FAKE-TOK-TEST) expiry-msg=$( [ -n "$LOGE" ] && echo y || echo n)"
+{ [ "$RC" -ne 0 ] && ! echo "$OUT" | grep -q FAKE-TOK-TEST; } && ok "E3 expired token REFUSED without python3 (rc=$RC, token not handed out)" \
+  || no "E3 EXPIRED token HANDED OUT without python3 (rc=$RC) — expiry check skipped"
+
+echo; echo "--- E3b anchor: python3 PRESENT, expired -> refused ---"
+OUT=$(sm "/usr/bin:/bin" private.scrumMaster.subscription.auth 2>&1); RC=$?
+{ [ "$RC" -ne 0 ] && ! echo "$OUT" | grep -q FAKE-TOK-TEST; } && ok "E3b expired refused with python3 (rc=$RC)" || no "E3b expired token handed out WITH python3 (rc=$RC)"
+
+echo; echo "--- E4 valid token (exp = now+1h), python3 ABSENT -> token returned ---"
+creds "$(( ($(date +%s) + 3600) * 1000 ))"
+OUT=$(sm "$D/fakejq:$D/nopy" private.scrumMaster.subscription.auth 2>&1); RC=$?
+{ [ "$RC" -eq 0 ] && echo "$OUT" | grep -qx FAKE-TOK-TEST; } && ok "E4 valid token returned without python3" || no "E4 valid token NOT returned (rc=$RC out=$(echo "$OUT" | tail -1 | cut -c1-60))"
+
+echo; echo "--- E5 expiresAt = null (python printed None) -> NOT expired (old behaviour kept) ---"
+creds null
+OUT=$(sm "/usr/bin:/bin" private.scrumMaster.subscription.auth 2>&1); RC=$?
+{ [ "$RC" -eq 0 ] && echo "$OUT" | grep -qx FAKE-TOK-TEST; } && ok "E5 null expiry -> token returned (no invented expiry)" || no "E5 null expiry refused (rc=$RC)"
+
+HOST_AFTER=$(hostm); [ "$HOST_BEFORE" = "$HOST_AFTER" ] && ok "HOST-SAFE no apt/dpkg change" || no "HOST SIDE EFFECT"
+echo; echo "=== T-CREDS-EXPIRY: PASS=$pass FAIL=$fail ==="
+exit "$fail"
