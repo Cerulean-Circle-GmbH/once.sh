@@ -7545,21 +7545,8 @@ private.hiveMind.context.live.jsonl() { # <pane> # echo path to the live NON-ZER
   [ -z "$target" ] && return 1
   local projd="$HOME/.claude/projects" dir f
 
-  # true iff file has ≥1 assistant record whose TOTAL (input+cache_create+cache_read) > 0.
-  local hasNonZero='
-import sys, json
-with open(sys.argv[1]) as fh:
-    for line in fh:
-        if "\"input_tokens\"" not in line: continue
-        try:
-            d=json.loads(line)
-            if d.get("type")=="assistant":
-                u=d.get("message",{}).get("usage",{})
-                if u and "input_tokens" in u:
-                    if u["input_tokens"]+u.get("cache_creation_input_tokens",0)+u.get("cache_read_input_tokens",0) > 0:
-                        print("1"); break
-        except: pass
-'
+  # "has NON-ZERO usage" = the shared reader's 'first' mode (stops at the first total>0 record, as the
+  # replaced python broke on the first non-zero line — no whole-file scan of a big session).
   local cand
   for cand in \
     "$("$OOSH_DIR/claudeCode" session.current "$target" 2>/dev/null)" \
@@ -7567,43 +7554,25 @@ with open(sys.argv[1]) as fh:
     [ -z "$cand" ] && continue
     for dir in "$projd"/*/; do
       f="${dir}${cand}.jsonl"
-      if [ -f "$f" ] && [ -n "$(python3 -c "$hasNonZero" "$f" 2>/dev/null)" ]; then
+      if [ -f "$f" ] && [ -n "$("$OOSH_DIR/claudeCode" jsonl.usage "$f" first 2>/dev/null)" ]; then
         echo "$f"; return 0
       fi
     done
   done
 
-  # 3. Fallback — agentName match, newest-mtime file that has NON-ZERO usage.
+  # 3. Fallback — agentName match, newest-mtime file that has NON-ZERO usage. Same rule as the replaced
+  #    python: grep order, non-zero files only, SUB-SECOND mtime (it compared float getmtime), strict >
+  #    (first file wins a tie).
   local role
   role=$(private.hiveMind.registry.get "$target" 2>/dev/null)
   if [ -n "$role" ]; then
-    local best
-    best=$(grep -lF "\"agentName\":\"${role}@" "$projd"/*/*.jsonl 2>/dev/null \
-      | python3 -c "
-import sys, json, os
-best=None; best_ts=-1.0
-for path in sys.stdin:
-    path=path.strip()
-    if not path: continue
-    nz=False
-    try:
-        with open(path) as fh:
-            for line in fh:
-                if '\"input_tokens\"' not in line: continue
-                try:
-                    d=json.loads(line)
-                    if d.get('type')=='assistant':
-                        u=d.get('message',{}).get('usage',{})
-                        if u and 'input_tokens' in u:
-                            if u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0) > 0:
-                                nz=True; break
-                except: pass
-        if nz:
-            m=os.path.getmtime(path)
-            if m>best_ts: best_ts=m; best=path
-    except: pass
-if best: print(best)
-" 2>/dev/null)
+    local best="" bestTs="" p m
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      [ -n "$("$OOSH_DIR/claudeCode" jsonl.usage "$p" first 2>/dev/null)" ] || continue
+      m=$(stat -c %.9Y "$p" 2>/dev/null) || m=$(stat -f %Fm "$p" 2>/dev/null) || continue
+      if [ -z "$bestTs" ] || awk -v a="$m" -v b="$bestTs" 'BEGIN { exit !(a > b) }'; then bestTs="$m"; best="$p"; fi
+    done < <(grep -lF "\"agentName\":\"${role}@" "$projd"/*/*.jsonl 2>/dev/null)
     [ -n "$best" ] && { echo "$best"; return 0; }
   fi
   return 1
@@ -7651,22 +7620,8 @@ private.hiveMind.context.denom.for.target() { # <pane> # echo 1000 or 200
   local jsonl
   jsonl=$(private.hiveMind.context.live.jsonl "$target" 2>/dev/null)
   if [ -n "$jsonl" ]; then
-    local obs
-    obs=$(python3 -c "
-import sys, json
-m=0
-with open(sys.argv[1]) as fh:
-    for line in fh:
-        try:
-            d=json.loads(line)
-            if d.get('type')=='assistant':
-                u=d.get('message',{}).get('usage',{})
-                if u and 'input_tokens' in u:
-                    t=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
-                    if t>m: m=t
-        except: pass
-print(m)
-" "$jsonl" 2>/dev/null)
+    local obs   # whole-file max total via the shared reader (empty = no non-zero record = old python's 0)
+    obs=$("$OOSH_DIR/claudeCode" jsonl.usage "$jsonl" max 2>/dev/null)
     if [ -n "$obs" ] && [ "$obs" -gt 200000 ] 2>/dev/null; then
       echo "1000"; return 0
     fi
@@ -7729,32 +7684,17 @@ private.hiveMind.context.from.jsonl.reading() { # <pane> # echo used_k|pct|denom
   # with usage.input_tokens=0); picking the LAST record regardless of value yields a
   # transient 0k FALSE-LOW that masks the cliff — worse than '— never'. Only a NON-ZERO
   # record reflects real context occupancy.
-  local out
-  out=$(DENOM_K="$denomK" python3 -c "
-import sys, json, os
-denomK=int(os.environ.get('DENOM_K','200'))
-last_nonzero=None
-with open(sys.argv[1]) as fh:
-    for line in fh:
-        if '\"input_tokens\"' not in line: continue
-        try:
-            d=json.loads(line)
-            if d.get('type')=='assistant':
-                u=d.get('message',{}).get('usage',{})
-                if u and 'input_tokens' in u:
-                    tot=u['input_tokens']+u.get('cache_creation_input_tokens',0)+u.get('cache_read_input_tokens',0)
-                    if tot>0: last_nonzero=tot     # skip zero-total streaming/stub records
-        except: pass
-if not last_nonzero or last_nonzero<=0:
-    sys.exit(1)                                    # 0-GUARD: no real reading → fail-loud
-denom=denomK*1000
-usedK=round(last_nonzero/1000)
-pct=round(last_nonzero/denom*100)
-if usedK<=0 or pct<=0:
-    sys.exit(1)                                    # VALUE-SANITY: a live agent is never 0k/0%
-if pct>100: pct=100                                # clamp (over-window = compacting imminent)
-print('%d|%d|%d' % (usedK,pct,denomK))
-" "$jsonl" 2>/dev/null)
+  local lastNz out
+  lastNz=$("$OOSH_DIR/claudeCode" jsonl.usage "$jsonl" last 2>/dev/null)   # last total>0 record (R1)
+  [ -z "$lastNz" ] && return 1                                               # 0-GUARD: no real reading → fail-loud
+  # Same arithmetic + order as the replaced python: usedK = round(t/1000), pct = round(t/(denomK*1000)*100),
+  # %.0f = round-half-even on the same IEEE double python round() used. VALUE-SANITY (never 0k/0%) + clamp.
+  out=$(awk -v t="$lastNz" -v dk="$denomK" 'BEGIN {
+    if (dk !~ /^[0-9]+$/ || dk == 0) exit 1
+    u = sprintf("%.0f", t / 1000) + 0; p = sprintf("%.0f", t / (dk * 1000) * 100) + 0
+    if (u <= 0 || p <= 0) exit 1
+    if (p > 100) p = 100                                                     # over-window = compacting imminent
+    printf "%d|%d|%d\n", u, p, dk }' 2>/dev/null)
   # 0-GUARD (belt + suspenders, in bash): reject empty OR a 0k/0% reading — never store it.
   [ -z "$out" ] && return 1
   local uK pP dD
