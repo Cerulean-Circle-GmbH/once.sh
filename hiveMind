@@ -2374,7 +2374,14 @@ hiveMind.agent.send() # <agentName> <message> # context-aware send: idle→INFOR
       ;&
     queue)
       # I1.4 — persist to queue file; drain happens via agent.unblock idle hook.
-      private.hiveMind.agent.queue.enqueue "$target" "inform" "$message"
+      # The enqueue REFUSES when the recipient can't be proven (pane title is not an agent's
+      # role@host — e.g. a stale name now pointing at a shell) or the queue is full. Report
+      # that as a failure: a silent "queued, rc0" here is how messages drained into a bash prompt.
+      if ! private.hiveMind.agent.queue.enqueue "$target" "inform" "$message"; then
+        error.log "NOT QUEUED: $name ($target) — refused (see the queue error above); nothing will be delivered"
+        create.result 1 "not-queued $name (route=$route)"
+        return 1
+      fi
       local pos
       pos=$(private.hiveMind.agent.queue.depth "$target")
       # Operator-visible (console.log = level 3, default). The previous
@@ -8751,27 +8758,49 @@ private.hiveMind.agent.queue.path() { # <pane> # path to queue file for a pane (
   echo "${HIVEMIND_QUEUE_DIR}/${safe}.queue"
 }
 
-private.hiveMind.agent.queue.enqueue() { # <pane> <intent> <text> # append message; enforce depth bound
-  # Format: <epoch>|<intent>|<text>
-  # Atomic: append (>> is atomic for short writes per POSIX). Depth bound
-  # rotates by dropping oldest after append (warn on drop).
+private.hiveMind.agent.queue.b64enc() { # <text> # single-line base64 (portable: GNU wraps at 76 without -w0, macOS has no -w)
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
+private.hiveMind.agent.queue.b64dec() { # <b64> # decode (portable: GNU/new macOS -d, old macOS -D)
+  printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null
+}
+
+private.hiveMind.agent.queue.recipient() { # <pane> # bare role from the pane's LIVE title (otmux's one role@host parse); empty if not an agent title
+  # FAIL CLOSED: accept the answer only if it is exactly ONE valid role-name token. An otmux
+  # without the pane.role verb (or any log noise on stdout) must yield '' -> enqueue refused,
+  # never a garbage recipient with '|' or newlines that would corrupt the v2 queue format.
+  local r
+  r=$(otmux pane.role "$1" 2>/dev/null)
+  [[ "$r" != *$'\n'* ]] && private.hiveMind.isRoleName "$r" && echo "$r"
+  return 0
+}
+
+private.hiveMind.agent.queue.enqueue() { # <pane> <intent> <text> # append a v2 entry; REFUSE (rc1) if the recipient is unprovable or the queue is full
+  # Format v2 (architect 3d49723bb): v2|<epoch>|<intent>|<recipient-role>|<base64(text)>
+  #   recipient-role = the pane's LIVE title role at enqueue time, so the drain can prove
+  #   the message still goes to the agent it was written for (panes move; addresses lie).
+  #   base64 keeps multi-line text on ONE line (the v1 format split it into epoch-less lines).
+  # Never drops: a full queue refuses the NEW message loudly instead of deleting the oldest.
   local pane="$1" intent="$2"
   shift 2
   local text="$*"
   [ -z "$pane" ] || [ -z "$intent" ] && return 1
+  local role
+  role=$(private.hiveMind.agent.queue.recipient "$pane")
+  if [ -z "$role" ]; then
+    error.log "queue ${pane}: REFUSING to enqueue — pane title is not an agent (role@host); a queued message could later drain into a shell"
+    return 1
+  fi
   local f
   f=$(private.hiveMind.agent.queue.path "$pane")
   mkdir -p "$(dirname "$f")" 2>/dev/null
-  echo "$(date +%s)|${intent}|${text}" >> "$f"
-
-  # Depth bound — drop oldest if over limit
   local depth
-  depth=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
-  if [ "${depth:-0}" -gt "$HIVEMIND_QUEUE_MAX_DEPTH" ]; then
-    local over=$((depth - HIVEMIND_QUEUE_MAX_DEPTH))
-    warn.log "queue ${pane}: depth ${depth} > max ${HIVEMIND_QUEUE_MAX_DEPTH}; dropping ${over} oldest"
-    tail -n "$HIVEMIND_QUEUE_MAX_DEPTH" "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
+  depth=$(private.hiveMind.agent.queue.depth "$pane")
+  if [ "${depth:-0}" -ge "$HIVEMIND_QUEUE_MAX_DEPTH" ]; then
+    error.log "queue ${pane}: REFUSING new message — depth ${depth} >= max ${HIVEMIND_QUEUE_MAX_DEPTH} (nothing dropped)"
+    return 1
   fi
+  printf 'v2|%s|%s|%s|%s\n' "$(date +%s)" "$intent" "$role" "$(private.hiveMind.agent.queue.b64enc "$text")" >> "$f"
 }
 
 private.hiveMind.agent.queue.depth() { # <pane> # number of pending messages
@@ -8810,12 +8839,15 @@ hiveMind.agent.queue.list() # <agent|pane> # show pending messages with age (Epi
   fi
   local now
   now=$(date +%s)
-  local epoch intent text age idx=0
-  printf "  %-4s %-8s %-12s %s\n" "#" "AGE" "INTENT" "MESSAGE"
-  while IFS='|' read -r epoch intent text; do
+  local line ver epoch intent role rest age idx=0
+  printf "  %-4s %-8s %-12s %-18s %s\n" "#" "AGE" "INTENT" "RECIPIENT" "MESSAGE"
+  while IFS= read -r line; do
     idx=$((idx + 1))
-    age=$((now - epoch))
-    printf "  %-4s %-8s %-12s %s\n" "$idx" "${age}s" "$intent" "$text"
+    if [[ "$line" == v2\|* ]]; then IFS='|' read -r ver epoch intent role rest <<< "$line"
+    else IFS='|' read -r epoch intent rest <<< "$line"; role="<legacy>"; fi
+    [[ "$epoch" =~ ^[0-9]+$ ]] && age="$((now - epoch))s" || age="?"
+    printf "  %-4s %-8s %-12s %-18s %s\n" "$idx" "$age" "$intent" "$role" \
+      "$(private.hiveMind.agent.queue.entry.text "$line" | head -c 200 | tr '\n' ' ')"
   done < "$f"
 }
 hiveMind.agent.queue.list.completion.agentName() { private.hiveMind.roles.complete; }
@@ -8832,13 +8864,37 @@ hiveMind.agent.queue.clear() # <agent|pane> # cancel all pending queued messages
 }
 hiveMind.agent.queue.clear.completion.agentName() { private.hiveMind.roles.complete; }
 
-hiveMind.agent.queue.drain() # <agent|pane> # FIFO drain pending messages (re-checks state per message) (Epic I I1.4)
+private.hiveMind.agent.queue.shift() { # <file> # remove the first line of a queue file (atomic rewrite)
+  tail -n +2 "$1" > "${1}.tmp" 2>/dev/null && mv "${1}.tmp" "$1"
+}
+
+private.hiveMind.agent.queue.hold() { # <file> <reason> # move the HEAD entry, unchanged, to <file>.held with a reason — never delivered, never deleted
+  local f="$1" reason="$2" first
+  first=$(head -1 "$f")
+  printf '%s|%s|%s\n' "$(date +%s)" "$reason" "$first" >> "${f}.held"
+  private.hiveMind.agent.queue.shift "$f"
+}
+
+private.hiveMind.agent.queue.dispatch() { # <pane> <intent> <text> # deliver one message; rc = delivery rc (0 = delivered)
+  local pane="$1" intent="$2" text="$3"
+  case "$intent" in
+    inform)           private.hiveMind.agent.inform "$pane" "$text" ;;
+    remote-control:*) otmux send.raw "$pane" "${intent#remote-control:}" ;;
+    *)                error.log "queue $pane: unknown intent '$intent'"; return 1 ;;
+  esac
+}
+
+hiveMind.agent.queue.drain() # <agent|pane> # FIFO drain with the staleness guard: deliver only a provably-current entry; otherwise HOLD (never deliver, never delete) (Epic I I1.4 + architect 3d49723bb)
 {
-  # Drain semantics:
-  #   • FIFO order (oldest first)
-  #   • Re-check state per-message — if agent re-enters busy mid-drain, stop
-  #   • Drop messages older than HIVEMIND_QUEUE_MAX_AGE_SEC (warn each)
-  #   • Atomic per-message: read line, dispatch, rewrite file without that line
+  # Per entry, oldest first. DELIVER only if ALL hold:
+  #   (a) v2 entry with a recipient role   (b) recipient == the pane's LIVE title role NOW
+  #   (c) age <= TTL (HIVEMIND_QUEUE_MAX_AGE_SEC; remote-control:* 60s)   (d) route is inform
+  # Otherwise:
+  #   - (a)/(b)/(c) fail -> HOLD to <file>.held with a reason; continue with the next entry.
+  #     Legacy v1 entries are always held (their recipient cannot be proven).
+  #   - (d) fails (pane busy) -> STOP, entry stays at the head (transient, retry next idle).
+  #   - dispatch rc != 0 -> STOP, entry stays at the head (§8: dequeue ONLY on rc0).
+  # Held entries come back only through the explicit operator verb agent.queue.release.
   local target
   target=$(private.hiveMind.agent.queue.resolve "$1") || {
     error.log "agent.queue.drain: cannot resolve '$1'"; return 1; }
@@ -8846,64 +8902,105 @@ hiveMind.agent.queue.drain() # <agent|pane> # FIFO drain pending messages (re-ch
   f=$(private.hiveMind.agent.queue.path "$target")
   [ -f "$f" ] && [ -s "$f" ] || { info.log "queue $target: nothing to drain"; return 0; }
 
-  local now drained=0 dropped_age=0 stopped_at=""
+  local now delivered=0 held=0 stopped_at="" live
   now=$(date +%s)
+  live=$(private.hiveMind.agent.queue.recipient "$target")
 
   while [ -s "$f" ]; do
-    # Read first line
-    local first
+    local first ver epoch intent role b64 text ttl
     first=$(head -1 "$f")
-    [ -z "$first" ] && { tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"; continue; }
+    [ -z "$first" ] && { private.hiveMind.agent.queue.shift "$f"; continue; }
 
-    local epoch intent text
-    IFS='|' read -r epoch intent text <<< "$first"
-
-    # Age check
-    if [ $((now - epoch)) -gt "$HIVEMIND_QUEUE_MAX_AGE_SEC" ]; then
-      warn.log "queue $target: dropping stale message (age=$((now - epoch))s, intent=$intent)"
-      tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
-      dropped_age=$((dropped_age + 1))
-      continue
+    if [[ "$first" != v2\|* ]]; then
+      private.hiveMind.agent.queue.hold "$f" "legacy-no-recipient"; held=$((held + 1)); continue
+    fi
+    IFS='|' read -r ver epoch intent role b64 <<< "$first"
+    if ! [[ "$epoch" =~ ^[0-9]+$ ]] || [ -z "$intent" ] || [ -z "$role" ]; then
+      private.hiveMind.agent.queue.hold "$f" "unparsable"; held=$((held + 1)); continue
+    fi
+    ttl="$HIVEMIND_QUEUE_MAX_AGE_SEC"; [[ "$intent" == remote-control:* ]] && ttl=60
+    if [ $((now - epoch)) -gt "$ttl" ]; then
+      private.hiveMind.agent.queue.hold "$f" "expired age=$((now - epoch))s ttl=${ttl}s"; held=$((held + 1)); continue
+    fi
+    if [ "$role" != "$live" ]; then
+      private.hiveMind.agent.queue.hold "$f" "recipient-mismatch: entry=$role live=${live:-<not an agent>}"; held=$((held + 1)); continue
     fi
 
-    # Re-check state — bail if agent re-entered busy
     local route
     route=$(private.hiveMind.agent.route "$target")
     if [ "$route" != "inform" ]; then
-      stopped_at="state went $route mid-drain"
-      break
+      stopped_at="pane is $route — entry kept at the head"; break
     fi
-
-    # Dispatch per intent
-    case "$intent" in
-      inform)
-        private.hiveMind.agent.inform "$target" "$text" 2>/dev/null
-        ;;
-      remote-control:*)
-        local key="${intent#remote-control:}"
-        otmux send.raw "$target" "$key" 2>/dev/null
-        ;;
-      *)
-        warn.log "queue $target: unknown intent '$intent', dropping"
-        ;;
-    esac
-
-    # Remove first line on success
-    tail -n +2 "$f" > "${f}.tmp" 2>/dev/null && mv "${f}.tmp" "$f"
-    drained=$((drained + 1))
+    text=$(private.hiveMind.agent.queue.b64dec "$b64")
+    if ! private.hiveMind.agent.queue.dispatch "$target" "$intent" "$text"; then
+      stopped_at="dispatch failed — entry kept at the head"; break
+    fi
+    private.hiveMind.agent.queue.shift "$f"
+    delivered=$((delivered + 1))
     sleep 0.2
   done
 
-  # Clean empty file
   [ -f "$f" ] && [ ! -s "$f" ] && rm -f "$f"
-
-  if [ -n "$stopped_at" ]; then
-    info.log "queue $target: drained $drained, dropped $dropped_age stale; stopped — $stopped_at"
-  else
-    info.log "queue $target: drained $drained, dropped $dropped_age stale"
-  fi
+  local msg="queue $target: delivered $delivered, held $held"
+  [ "$held" -gt 0 ] && msg="$msg (see: hiveMind agent.queue.held $target)"
+  [ -n "$stopped_at" ] && msg="$msg; stopped — $stopped_at"
+  if [ "$held" -gt 0 ]; then warn.log "$msg"; else info.log "$msg"; fi
 }
 hiveMind.agent.queue.drain.completion.agentName() { private.hiveMind.roles.complete; }
+
+private.hiveMind.agent.queue.entry.text() { # <original-line> # message text of a v2 (base64) or legacy v1 entry, for display/release
+  local line="$1" ver epoch intent role b64
+  if [[ "$line" == v2\|* ]]; then
+    IFS='|' read -r ver epoch intent role b64 <<< "$line"
+    private.hiveMind.agent.queue.b64dec "$b64"
+  else
+    printf '%s' "${line#*|*|}"
+  fi
+}
+
+hiveMind.agent.queue.held() # <agent|pane> # list HELD queue entries (refused by the drain guard) with reason — read these before any release
+{
+  local target
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.held: cannot resolve '$1'"; return 1; }
+  local h
+  h="$(private.hiveMind.agent.queue.path "$target").held"
+  [ -s "$h" ] || { info.log "queue $target: nothing held"; return 0; }
+  local idx=0 heldAt reason line
+  while IFS='|' read -r heldAt reason line; do
+    idx=$((idx + 1))
+    printf '  #%s  held %s  reason: %s\n      %s\n' "$idx" "$(date -d @"$heldAt" '+%F %T' 2>/dev/null || echo "$heldAt")" "$reason" \
+      "$(private.hiveMind.agent.queue.entry.text "$line" | head -c 300 | tr '\n' ' ')"
+  done < "$h"
+}
+hiveMind.agent.queue.held.completion.agentName() { private.hiveMind.roles.complete; }
+
+hiveMind.agent.queue.release() # <agent|pane> <n> # OPERATOR verb: deliver held entry #n to the pane NOW (you vouch for the recipient); removed from .held only on rc0
+{
+  local target n="$2"
+  target=$(private.hiveMind.agent.queue.resolve "$1") || {
+    error.log "agent.queue.release: cannot resolve '$1'"; return 1; }
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] || { error.log "usage: hiveMind agent.queue.release <agent|pane> <n>  (n from agent.queue.held)"; return 1; }
+  local h
+  h="$(private.hiveMind.agent.queue.path "$target").held"
+  local entry
+  entry=$(sed -n "${n}p" "$h" 2>/dev/null)
+  [ -n "$entry" ] || { error.log "agent.queue.release: no held entry #$n for $target"; return 1; }
+  local line="${entry#*|*|}" intent ver epoch rest
+  if [[ "$line" == v2\|* ]]; then IFS='|' read -r ver epoch intent rest <<< "$line"
+  else IFS='|' read -r epoch intent rest <<< "$line"; fi
+  [ -z "$intent" ] && intent="inform"
+  local route
+  route=$(private.hiveMind.agent.route "$target")
+  [ "$route" = "inform" ] || { error.log "agent.queue.release: $target is $route — not idle; nothing sent, entry stays held"; return 1; }
+  if ! private.hiveMind.agent.queue.dispatch "$target" "$intent" "$(private.hiveMind.agent.queue.entry.text "$line")"; then
+    error.log "agent.queue.release: delivery to $target failed; entry stays held"; return 1
+  fi
+  awk -v n="$n" 'NR!=n' "$h" > "${h}.tmp" && mv "${h}.tmp" "$h"   # portable (sed -i differs on macOS)
+  [ -s "$h" ] || rm -f "$h"
+  console.log "queue $target: released held entry #$n (delivered)"
+}
+hiveMind.agent.queue.release.completion.agentName() { private.hiveMind.roles.complete; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SWEEP & UNBLOCK
