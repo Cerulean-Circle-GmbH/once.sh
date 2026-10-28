@@ -92,6 +92,31 @@ private.claudeCode.projectHash() { # <path> # encode workspace path to project d
   echo "$1" | sed 's/[\/._]/-/g'
 }
 
+private.claudeCode.projectDirs() { # <all|cwd> # Claude project dirs, one per line, existing only (design §5e): all = every $HOME/.claude/projects/*/ ; cwd = the caller's $PWD project only
+  local d
+  case "${1:-all}" in
+    all) for d in "$HOME/.claude/projects"/*/; do [ -d "$d" ] && echo "${d%/}"; done ;;
+    cwd) d="$HOME/.claude/projects/$(private.claudeCode.projectHash "$PWD")"; [ -d "$d" ] && echo "$d" ;;
+    *)   return 1 ;;
+  esac
+  return 0
+}
+
+private.claudeCode.jsonl.forSession() { # <sessionUuid> # that session's JSONL in ANY project (a uuid is unique, so widening cannot change the selection); rc1 if none
+  local sid="$1" d
+  [[ "$sid" =~ ^[0-9A-Za-z-]+$ ]] || return 1      # an id, never a path
+  while IFS= read -r d; do
+    [ -f "$d/$sid.jsonl" ] && { echo "$d/$sid.jsonl"; return 0; }
+  done < <(private.claudeCode.projectDirs all)
+  return 1
+}
+
+private.claudeCode.project.label() { # <projectDir> # short label for multi-project listings: the dir name without the leading '-', last 24 chars
+  local n="${1##*/}"; n="${n#-}"
+  [ "${#n}" -gt 24 ] && n="…${n: -23}"
+  echo "$n"
+}
+
 private.claudeCode.decode.projectHash() { # <hash> # decode project dir hash to path: -Users-Shared → /Users/Shared
   echo "$1" | sed 's/^-/\//' | sed 's/-/\//g'
 }
@@ -1597,30 +1622,29 @@ private.claudeCode.context.parse() {
   return 1
 }
 
-claudeCode.context.jsonl() # <?pane> # find .jsonl file for a pane (per-pane), or most recent if no pane
+claudeCode.context.jsonl() # <?pane> # the session JSONL of <pane>; no pane = YOUR own pane (otmux pane.self), else best-effort newest session in your CURRENT DIRECTORY's project only — on a multi-agent box all agents share one cwd project, so without tmux this can be a PEER's session; never searches other projects; rc1 when nothing qualifies
 {
-  local pane="$1"
+  local pane="$1" sid f
 
-  # Per-pane resolution: pane -> session UUID -> JSONL file
+  # Per-pane resolution: pane -> session UUID -> JSONL file (any project: a uuid is unique)
   if [ -n "$pane" ]; then
-    local sid
     sid=$(claudeCode.session.id "$pane" 2>/dev/null)
-    if [ -n "$sid" ]; then
-      for projectDir in "$HOME/.claude/projects"/*/; do
-        local jsonlFile="${projectDir}${sid}.jsonl"
-        if [ -f "$jsonlFile" ]; then
-          echo "$jsonlFile"
-          return 0
-        fi
-      done
+    [ -n "$sid" ] && f=$(private.claudeCode.jsonl.forSession "$sid") && { echo "$f"; return 0; }
+  else
+    # (1) no pane given -> MY own pane via the PID-walk resolver -> exact uuid (design §5e)
+    local myPane
+    myPane=$(otmux pane.self target 2>/dev/null)
+    if [ -n "$myPane" ]; then
+      sid=$(claudeCode.session.id "$myPane" 2>/dev/null)
+      [ -n "$sid" ] && f=$(private.claudeCode.jsonl.forSession "$sid") && { echo "$f"; return 0; }
     fi
   fi
 
-  # Fallback: most recently modified JSONL (for no-pane usage)
-  local projectDirs=(
-    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
-    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
-  )
+  # (2) best-effort: newest JSONL in the CALLER'S cwd project ONLY — a SELECTION, so it is deliberately NOT
+  # widened to all projects (newest-across-projects = another project's/agent's session). (3) no cwd
+  # project -> empty, rc1 (fail loud, never guess across projects).
+  local projectDirs=() d
+  while IFS= read -r d; do projectDirs+=("$d"); done < <(private.claudeCode.projectDirs cwd)
 
   local newestFile=""
   local newestTime=0
@@ -1949,12 +1973,12 @@ private.claudeCode.context.read.tui.completion.pane() {
   private.claudeCode.complete.panes
 }
 
-claudeCode.context.all() # # show context % for all active sessions
+claudeCode.context.all() # # show context % for all sessions active in the last hour, every project (prefixed with a project label)
 {
-  local projectDirs=(
-    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
-    "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
-  )
+  # ENUMERATION (design §5e): every project — listing cannot pick a wrong session; the label keeps
+  # multi-project output unambiguous.
+  local projectDirs=() d
+  while IFS= read -r d; do projectDirs+=("$d"); done < <(private.claudeCode.projectDirs all)
 
   local now
   now=$(date +%s)
@@ -1974,8 +1998,8 @@ claudeCode.context.all() # # show context % for all active sessions
       local pct
       pct=$(private.claudeCode.context.from.jsonl "$file")
       local minsAgo=$((age / 60))
-      echo "${uuid:0:8}... ${pct}% (${minsAgo}m ago)"
-    done < <(find "$dir" -maxdepth 1 -name "*.jsonl" 2>/dev/null)
+      echo "[$(private.claudeCode.project.label "$dir")] ${uuid:0:8}... ${pct}% (${minsAgo}m ago)"
+    done < <(find "$dir" -maxdepth 1 -name "*.jsonl" 2>/dev/null | sort)
   done
 }
 claudeCode.context.all.completion() { :; }
@@ -1984,7 +2008,7 @@ claudeCode.context.velocity() # <?paneOrJsonl> # calculate context burn rate —
 {
   local arg="$1"
   if [ -z "$arg" ]; then
-    # No args: use global newest jsonl
+    # No args: YOUR own session (own pane first, else your cwd project's newest — see context.jsonl)
     local jsonlFile
     jsonlFile=$(claudeCode.context.jsonl)
     [ -z "$jsonlFile" ] || [ ! -f "$jsonlFile" ] && { echo "unknown"; return 1; }
@@ -2006,18 +2030,9 @@ claudeCode.context.velocity.byPane() # <pane> # calculate velocity by resolving 
   local sid
   sid=$(claudeCode.session.id "$pane" 2>/dev/null)
   if [ -n "$sid" ]; then
-    local projectDirs=(
-      "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude-components-OOSH-dev-claude"
-      "$HOME/.claude/projects/-Users-Shared-Workspaces-AI-Claude"
-    )
-    local jsonlFile=""
-    for dir in "${projectDirs[@]}"; do
-      if [ -f "$dir/$sid.jsonl" ]; then
-        jsonlFile="$dir/$sid.jsonl"
-        break
-      fi
-    done
-    [ -z "$jsonlFile" ] && { echo "unknown"; return 1; }
+    local jsonlFile
+    # LOOKUP by uuid (design §5e): any project — a uuid is unique, so the selection cannot change
+    jsonlFile=$(private.claudeCode.jsonl.forSession "$sid") || { echo "unknown"; return 1; }
     private.claudeCode.velocity.calculate "$jsonlFile"
   else
     echo "unknown"
@@ -2088,14 +2103,14 @@ private.claudeCode.file.mtime() # <file> # mtime epoch seconds, portable: GNU `s
 
 claudeCode.context.dashboard() # # show velocity dashboard for all active sessions
 {
-  # Every Claude project dir under $HOME/.claude/projects (was: two hard-coded macOS -Users-Shared paths,
-  # so the dashboard showed nothing on any other host/workspace). HOME-derived = fixture-drivable.
+  # ENUMERATION (design §5e): every project dir under $HOME/.claude/projects (was: two hard-coded macOS
+  # -Users-Shared paths, so the dashboard showed nothing on any other host/workspace) + a Project column.
   local projectDirs=() d
-  for d in "$HOME/.claude/projects"/*/; do [ -d "$d" ] && projectDirs+=("${d%/}"); done
+  while IFS= read -r d; do projectDirs+=("$d"); done < <(private.claudeCode.projectDirs all)
 
   echo "=== Context Velocity Dashboard ==="
-  echo "Session  | Usage | Rate    | Time Left"
-  echo "---------|-------|---------|----------"
+  echo "Project | Session  | Usage | Rate    | Time Left"
+  echo "--------|----------|-------|---------|----------"
 
   local now
   now=$(date +%s)
@@ -2136,7 +2151,7 @@ claudeCode.context.dashboard() # # show velocity dashboard for all active sessio
         info='- | - | -'
       fi
 
-      echo "$short | $info"
+      echo "$(private.claudeCode.project.label "$dir") | $short | $info"
     done < <(find "$dir" -maxdepth 1 -name "*.jsonl" 2>/dev/null | sort)
   done
 }
