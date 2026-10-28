@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# T-DRAIN-GUARD — item 4, gate for the queue DRAIN GUARD (architect 3d49723bb; expert 86341c2f + e94ed866 + de4dd093).
+# Usage: test/test.drain-guard [<tree>]  (default = the repo this file lives in; differential: pass CONTROL / CANDIDATE)
+# Drives each tree's OWN enqueue/drain in a sourced subshell with two MOCKS:
+#   private.hiveMind.agent.inform -> logs (pane, base64 text) and returns $MOCK_RC (the dispatch under test)
+#   private.hiveMind.agent.route  -> 'inform'   (pane-state routing is not under test here)
+#   otmux() function shadow       -> logs 'send.raw' (remote-control keystrokes) — everything else -> real otmux
+# Fixtures: a sandbox tmux session with planted pane TITLES (pane.role is title-only). Sandbox HOME/CONFIG_PATH/
+# HIVEMIND_QUEUE_DIR; the LIVE /root/config/hivemind.queue is hashed before/after and never touched.
+# Acceptance (3d49723bb): D1 mismatch->held, D2 legacy->held, D3 expired->held-not-deleted, D4 match->exactly once,
+#   D5 failed dispatch->entry stays at head, D6 multi-line round trip, D7 remote-control >60s->held, D8 shell refused.
+WT="$(cd "${1:-$(dirname "${BASH_SOURCE[0]}")/..}" && pwd -P)"; [ -x "$WT/hiveMind" ] || { echo "no hiveMind in $WT"; exit 2; }
+SC="$WT/test/gen/t-drain-guard"; mkdir -p "$SC"
+D="$SC/dgrun.$$"; rm -rf "$D"; SBX="$D/home"; QD="$D/queue"
+mkdir -p "$SBX/config" "$QD"; : > "$SBX/config/result.txt"; : > "$SBX/config/error.txt"
+# HOST-SAFETY: a FRESH config has no OOSH_PM, and the OOSH debug trap's 'oo cmd errno moreutils' then runs
+# oo.pm.discover -> 'sudo apt-get update' on EVERY non-zero return (measured: 2 updates on the first run, no
+# install). Seed a HARMLESS package manager so discovery never runs and any reached install fails safe.
+printf 'export OOSH_PM="false"\nexport OOSH_PM_UPDATED="seeded-by-test"\n' > "$SBX/config/user.env"
+IL="$D/inform.log"; RL="$D/raw.log"; LOG="$D/oosh.log"
+echo "=== tree: $WT @ $(git -C "$WT" rev-parse --short HEAD) $(git -C "$WT" diff --quiet HEAD && echo clean || echo "+ local: $(git -C "$WT" diff --name-only HEAD | tr '\n' ' ')")"
+
+LIVEQ="/home/shared/EAMD.ucp/Scenarios/localhost/EAM/1_infrastructure/Once.sh/sharedConfig/hivemind.queue"
+lsha(){ (cd "$LIVEQ" 2>/dev/null && find . -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum | cut -c1-16) || echo absent; }
+LIVE_BEFORE=$(lsha)
+hostm(){ stat -c '%Y' /var/lib/apt/lists /var/lib/dpkg/status 2>/dev/null | tr '\n' ' '; }
+HOST_BEFORE=$(hostm)
+
+PFX="fxdg_"; S="${PFX}q"; P="${S}:0.0"; SH="${S}:0.1"
+sweep(){ tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^$PFX" | while IFS= read -r s; do tmux kill-session -t "$s" 2>/dev/null; done; }
+sweep; trap 'sweep; rm -rf "$D"' EXIT
+tmux new-session -d -s "$S" -x 120 -y 20 2>/dev/null; tmux split-window -t "$S" -v 2>/dev/null
+title(){ tmux select-pane -t "$1" -T "$2" 2>/dev/null; }
+title "$P" '✳ fxdg-alpha@WODA.prod'; title "$SH" 'v60211.1blu.de'
+
+# run bash code against the tree under test, with the mocks, in an isolated subshell
+q(){ env -i HOME="$SBX" CONFIG_PATH="$SBX/config" HIVEMIND_QUEUE_DIR="$QD" HIVEMIND_REGISTRY="$SBX/config/hivemind.roles.env" \
+       PATH="$WT:/usr/bin:/bin" OOSH_DIR="$WT" TMUX="$TMUX" TERM="${TERM:-xterm}" LOG_DEVICE="$LOG" LOG_FILE="$LOG" \
+       MOCK_RC="${MOCK_RC:-0}" INFORM_LOG="$IL" RAW_LOG="$RL" bash --norc --noprofile -c '
+  source "$OOSH_DIR/hiveMind" >/dev/null 2>&1
+  private.hiveMind.agent.inform(){ printf "%s\t%s\n" "$1" "$(printf "%s" "$2" | base64 -w0)" >> "$INFORM_LOG"; return "$MOCK_RC"; }
+  private.hiveMind.agent.route(){ echo inform; }
+  otmux(){ if [ "$1" = send.raw ]; then shift; echo "$*" >> "$RAW_LOG"; return 0; fi; command otmux "$@"; }
+  eval "$1"' _ "$1"; }
+QF(){ q 'private.hiveMind.agent.queue.path "'"$1"'"'; }
+reset(){ rm -rf "$QD"; mkdir -p "$QD"; : > "$IL"; : > "$RL"; : > "$LOG"; title "$P" '✳ fxdg-alpha@WODA.prod'; }
+enq(){ q 'private.hiveMind.agent.queue.enqueue "'"$1"'" "'"$2"'" "$(printf "%b" "'"$3"'")"'; }
+drain(){ q 'hiveMind.agent.queue.drain "'"$1"'"' >/dev/null 2>&1; }
+# age the HEAD entry by N seconds, in the tree's own format (v2: field 2; v1: field 1)
+age(){ local f; f=$(QF "$P"); awk -v n="$1" -F'|' 'BEGIN{OFS="|"} NR==1{ if ($1=="v2") $2=$2-n; else $1=$1-n } {print}' "$f" > "$f.t" && mv "$f.t" "$f"; }
+# count non-empty lines; grep -c prints 0 AND exits 1 on an empty file, so never '|| echo 0' (gave "0\n0")
+cnt(){ local n; n=$(grep -c . "$1" 2>/dev/null); echo "${n:-0}"; }
+ninf(){ cnt "$IL"; }
+nq(){ cnt "$(QF "$P")"; }
+held(){ local f; f=$(QF "$P"); cat "$f.held" 2>/dev/null; }
+
+pass=0; fail=0; ok(){ echo "  PASS $1"; pass=$((pass+1)); }; no(){ echo "  FAIL $1"; fail=$((fail+1)); }
+
+QPATH=$(QF "$P"); echo "  queue file for $P: $QPATH"
+case "$QPATH" in "$QD"/*) ok "SANDBOX queue path is under the test dir (live queue untouched)";; *) no "SANDBOX LEAK: queue path $QPATH not under $QD — ABORT"; exit 3;; esac
+RB=$(tmux display-message -t "$P" -p '#{pane_title}'); [ "$RB" = '✳ fxdg-alpha@WODA.prod' ] && ok "FIXTURE title planted" || no "FIXTURE title='$RB'"
+
+echo; echo "--- D8 enqueue to a SHELL-titled pane is refused ---"
+reset; enq "$SH" inform "D8-shell"; RC=$?
+F8=$(QF "$SH"); N8=$(cnt "$F8")
+echo "  rc=$RC entries-written=$N8"
+{ [ "$RC" -ne 0 ] && [ "$N8" -eq 0 ]; } && ok "D8 refused rc=$RC, nothing written" || no "D8 rc=$RC, $N8 entr(y/ies) queued for a SHELL pane"
+
+echo; echo "--- D4 matching fresh entry -> dispatched EXACTLY once, then dequeued ---"
+reset; enq "$P" inform "D4-msg"; MOCK_RC=0 drain "$P"
+T4=$(head -1 "$IL" | cut -f2 | base64 -d 2>/dev/null)
+echo "  informs=$(ninf) text='$T4' queue-left=$(nq) held=$(held | grep -c .)"
+{ [ "$(ninf)" -eq 1 ] && [ "$T4" = "D4-msg" ] && [ "$(nq)" -eq 0 ] && [ -z "$(held)" ]; } \
+  && ok "D4 delivered once with exact text, dequeued, nothing held" || no "D4 informs=$(ninf) text='$T4' left=$(nq)"
+
+echo; echo "--- D1 recipient changed (pane retitled) -> HELD, nothing dispatched ---"
+reset; enq "$P" inform "D1-msg"; title "$P" '✳ fxdg-beta@WODA.prod'; MOCK_RC=0 drain "$P"
+echo "  informs=$(ninf) held=[$(held | cut -d'|' -f2 | tr '\n' ' ')]"
+{ [ "$(ninf)" -eq 0 ] && held | grep -q 'recipient-mismatch'; } \
+  && ok "D1 mismatch held (recipient-mismatch), 0 dispatched" || no "D1 dispatched $(ninf)x to the NEW occupant (misroute) / not held"
+
+echo; echo "--- D2 legacy v1 entry -> HELD ---"
+reset; mkdir -p "$(dirname "$QPATH")"; printf '%s|inform|D2-legacy\n' "$(date +%s)" > "$QPATH"; MOCK_RC=0 drain "$P"
+echo "  informs=$(ninf) held=[$(held | cut -d'|' -f2 | tr '\n' ' ')]"
+{ [ "$(ninf)" -eq 0 ] && held | grep -q 'legacy'; } && ok "D2 legacy held, 0 dispatched" || no "D2 legacy dispatched $(ninf)x / not held"
+
+echo; echo "--- D3 expired entry -> HELD, NOT deleted ---"
+reset; enq "$P" inform "D3-old"; age 4000; MOCK_RC=0 drain "$P"
+echo "  informs=$(ninf) queue-left=$(nq) held=[$(held | cut -d'|' -f2 | tr '\n' ' ')]"
+{ [ "$(ninf)" -eq 0 ] && held | grep -q 'expired'; } && ok "D3 expired held (kept), 0 dispatched" \
+  || no "D3 expired entry $( [ -z "$(held)" ] && [ "$(nq)" -eq 0 ] && echo DELETED || echo 'not held') (informs=$(ninf))"
+
+echo; echo "--- D5 dispatch FAILS -> entry stays at the HEAD (dequeue only on rc0) ---"
+reset; enq "$P" inform "D5-fail"; MOCK_RC=1 drain "$P"
+echo "  informs-attempted=$(ninf) queue-left=$(nq) held=$(held | grep -c .)"
+{ [ "$(ninf)" -eq 1 ] && [ "$(nq)" -eq 1 ] && [ -z "$(held)" ]; } \
+  && ok "D5 attempted once, entry kept at head, not held" || no "D5 left=$(nq) (want 1) attempted=$(ninf) — failed dispatch LOST the entry"
+
+echo; echo "--- D6 multi-line text survives the round trip ---"
+reset; enq "$P" inform 'D6 line1\nD6 line2'; MOCK_RC=0 drain "$P"
+T6=$(head -1 "$IL" | cut -f2 | base64 -d 2>/dev/null)
+echo "  informs=$(ninf) text=[$(printf '%s' "$T6" | tr '\n' '~')]"
+{ [ "$(ninf)" -eq 1 ] && [ "$T6" = "$(printf 'D6 line1\nD6 line2')" ]; } \
+  && ok "D6 both lines delivered in ONE dispatch" || no "D6 informs=$(ninf) text=[$(printf '%s' "$T6" | tr '\n' '~')]"
+
+echo; echo "--- D7 remote-control older than 60s -> HELD, no keystroke ---"
+reset; enq "$P" "remote-control:F12" ""; age 120; MOCK_RC=0 drain "$P"
+echo "  raw-keys=$(cnt "$RL") held=[$(held | cut -d'|' -f2 | tr '\n' ' ')]"
+{ [ "$(cnt "$RL")" -eq 0 ] && held | grep -q 'expired'; } && ok "D7 120s remote-control held, 0 keystrokes" \
+  || no "D7 replayed $(cnt "$RL") raw keystroke(s) from a 120s-old entry"
+
+echo; echo "--- D7b anchor: FRESH remote-control (10s) IS dispatched (TTL is not a blanket refusal) ---"
+reset; enq "$P" "remote-control:F12" ""; age 10; MOCK_RC=0 drain "$P"
+echo "  raw-keys=$(cnt "$RL") [$(cat "$RL")] held=$(held | grep -c .)"
+{ [ "$(cnt "$RL")" -eq 1 ] && [ -z "$(held)" ]; } && ok "D7b fresh remote-control dispatched once" || no "D7b raw=$(cnt "$RL")"
+
+LIVE_AFTER=$(lsha); echo; echo "  live queue sha before=$LIVE_BEFORE after=$LIVE_AFTER"
+{ [ "$LIVE_BEFORE" = "$LIVE_AFTER" ] && [ "$LIVE_BEFORE" != absent ]; } && ok "SAFE live hivemind.queue untouched" || no "SAFE live queue changed/absent"
+HOST_AFTER=$(hostm); echo "  host apt-lists/dpkg mtimes before=[$HOST_BEFORE] after=[$HOST_AFTER]"
+[ "$HOST_BEFORE" = "$HOST_AFTER" ] && ok "HOST-SAFE no apt-get update / dpkg change during the run" \
+  || no "HOST SIDE EFFECT: apt lists or dpkg status changed during the test run"
+echo; echo "=== T-DRAIN-GUARD: PASS=$pass FAIL=$fail ==="
+exit "$fail"
