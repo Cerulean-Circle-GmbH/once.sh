@@ -589,226 +589,7 @@ scrumMaster.team.capture.completion.session() # # tmux session names
   tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
-scrumMaster.pulse() # <?session> # DEPRECATED — use 'scrumMaster swipe' (pure-bash hiveMind-free drop-in; pulse KEPT as the parity oracle, zero-break). HONEST REAL-TIME team status — team.sweep OUTPUT format, but EVERY value measured LIVE at call time (never a recorded/stale reading). context% = token-math on the pane's live session JSONL; state = fresh bottom-area capture (drawer!=idle, wall/on-prompt distinct); kind = claude anywhere in the subtree. Self-contained — survives a broken/mid-refactor hiveMind.
-{
-  local session="${1:-}"
-  echo "scrumMaster.pulse is DEPRECATED → use 'scrumMaster swipe' (pure-bash, hiveMind-free drop-in)" >&2
-  python3 - "$session" <<'SM_PULSE_PY'
-import os, sys, json, subprocess, glob, re
-PROJD = os.path.expanduser("~/.claude/projects")
-OOSH = os.environ.get("OOSH_DIR", "/root/oosh")
-CYAN = "\033[96m"; DIM = "\033[90m"; RST = "\033[0m"
-REWIND_DIR = os.path.join(os.environ.get("CONFIG_PATH", os.path.expanduser("~/config")), "scrumMaster.rewind.active")
-
-def _mark_name(pane):
-    return "".join(c if c.isalnum() else "_" for c in pane)
-
-def rewind_marked(pane):
-    # DECLARED (not guessed): the rewind DRIVER sets/unsets this marker via
-    # scrumMaster rewind.mark/unmark — reliable, survives menu changes.
-    try: return os.path.isfile(os.path.join(REWIND_DIR, _mark_name(pane)))
-    except Exception: return False
-STATE_COLOR = {"ACTIVE": "\033[92m", "IDLE": "\033[90m", "ON-PROMPT": "\033[96m", "OPEN-DRAWER": "\033[93m", "ON-WALL": "\033[91m", "DURING-REWIND": "\033[95m"}
-
-def sh(*a):
-    try: return subprocess.run(a, capture_output=True, text=True, timeout=10).stdout
-    except Exception: return ""
-
-def children(pid):
-    out = sh("ps", "-eo", "pid,ppid,args"); tree = {}
-    for line in out.splitlines()[1:]:
-        p = line.split(None, 2)
-        if len(p) < 2: continue
-        try: tree.setdefault(int(p[1]), []).append((int(p[0]), p[2] if len(p) > 2 else ""))
-        except ValueError: pass
-    seen, stack, out2 = set(), [pid], []
-    while stack:
-        cur = stack.pop()
-        for cpid, args in tree.get(cur, []):
-            if cpid in seen: continue
-            seen.add(cpid); out2.append((cpid, args)); stack.append(cpid)
-    return out2
-
-def claude_proc(pane_pid):
-    for cpid, args in children(pane_pid):
-        if "claude" in args and "claudeCode" not in args.split(" ")[0]:
-            if "/claude" in args or args.startswith("claude") or " claude " in args or "--resume" in args:
-                return cpid, args
-    return None, ""
-
-def discover_all_map():
-    # pulse-perf (architect d354bf63): ONE claudeCode framework-load resolves EVERY pane's session
-    # in a single jsonl scan, vs a per-pane session.current call = N framework-loads. Returns
-    # {pane: uuid}. Same ranking as per-pane session.current (batch == per-pane by construction),
-    # so the resolved uuid is IDENTICAL — this is a pure perf repoint, not a behavior change.
-    m = {}
-    for line in sh(f"{OOSH}/claudeCode", "session.discover.all").splitlines():
-        f = line.split("|")
-        if len(f) >= 2 and f[0] and f[1]:
-            m[f[0]] = f[1]
-    return m
-
-def resolve_jsonl(pane, dmap=None):
-    # accurate pane->session: claudeCode reports the pane's CURRENT session uuid (survives
-    # fork/rewind); that <uuid>.jsonl is THE file. Trustworthy value = our token-math below.
-    # FAST PATH: the batch discover.all map (ONE framework-load for the whole fleet). FALLBACK:
-    # per-pane session.current/id if the pane is absent from the batch (robustness; identical result).
-    sid = (dmap or {}).get(pane, "")
-    if sid and len(sid) > 8:
-        hits = glob.glob(os.path.join(PROJD, "*", sid + ".jsonl"))
-        if hits: return hits[0]
-    for getter in ("session.current", "session.id"):
-        sid = sh(f"{OOSH}/claudeCode", getter, pane).strip()
-        if sid and len(sid) > 8:
-            hits = glob.glob(os.path.join(PROJD, "*", sid + ".jsonl"))
-            if hits: return hits[0]
-    return None
-
-def ctx_from_jsonl(path, denom_k):
-    used = 0
-    pending = 0   # content-bearing entries since the last assistant-usage (rewind-safety content-lag guard)
-    try:
-        with open(path) as fh:
-            for line in fh:
-                if '"input_tokens"' in line:
-                    try:
-                        d = json.loads(line)
-                        if d.get("type") == "assistant":
-                            u = d.get("message", {}).get("usage", {})
-                            if u and "input_tokens" in u:
-                                t = u["input_tokens"] + u.get("cache_creation_input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                                if t > 0:
-                                    used = t
-                                    pending = 0   # a recorded turn resets the un-recorded window
-                                    continue
-                    except Exception: pass
-                # content-bearing entries inflate the un-recorded window (mid-reboot: context.md/learnings/reads).
-                # attachment/tool_use dominate a real reboot — user/tool_result-only would be BLIND (per a317633).
-                if ('"type":"user"' in line or '"type":"attachment"' in line or '"type":"tool_result"' in line or '"type":"tool_use"' in line
-                    or '"type": "user"' in line or '"type": "attachment"' in line or '"type": "tool_result"' in line or '"type": "tool_use"' in line):
-                    pending += 1
-    except Exception: return None
-    if used == 0: return None
-    # Content-lag guard (mirror claudeCode a317633): a big un-recorded window (>8 content-bearing entries)
-    # after the last assistant-usage means 'used' is a stale LOWER-BOUND (mid-reboot) → SIGNAL lag, not a
-    # false-LOW number that would mislead the walling direction. 'lag' is distinct from the tuple AND None.
-    if pending > 8: return "lag"
-    return used, round(used * 100 / (denom_k * 1000)), denom_k
-
-_BAR_ESC = re.compile(r"·[ \t]*esc([ \t]|…|$)")
-_WORKING = re.compile(r"^(·|✢|✳|✶|✻|✽|\*)[ \t]+[A-Z][a-z]+…[ \t]+\(([0-9]+h[ \t]+)?([0-9]+m[ \t]+)?[0-9]+s")
-
-def is_active(cap):
-    # Rule 4 (design stale-role-labels §Rule 4) — WORKING survives a narrow pane. Mirrors
-    # private.scrumMaster.swipe.classify.active exactly (ASCII space/tab only, both copies).
-    lines = cap.splitlines()
-    tail = lines[-6:]
-    low = "\n".join(tail).lower()
-    if "esc to interrupt" in low or "esc to int" in low:            # signal 1
-        return True
-    bars = [l for l in tail if "⏵⏵" in l or "auto mode" in l]       # signal 2: truncated bar
-    if bars and _BAR_ESC.search(bars[-1]):
-        return True
-    p = next((i for i in range(len(lines) - 1, -1, -1) if re.match(r"^[ \t]*❯", lines[i])), -1)
-    if p < 1 or not re.match(r"^[ \t]*─", lines[p - 1]):           # signal 3: anchored working line
-        return False
-    s = p - 1
-    for j in range(s - 1, max(s - 9, -1), -1):                      # at most 8 lines up
-        ln = lines[j]
-        if not ln.strip(" \t"):
-            continue
-        if ln[:1] in (" ", "\t") or ln.startswith(("⎿", "✔")):
-            continue
-        return bool(_WORKING.match(ln))
-    return False
-
-def classify(cap):
-    # ONLY the live chrome (last ~6 lines) — never the message body above, or an agent
-    # discussing "do you want" / "/compact" false-trips it (the ARON/agent-trainer bug).
-    # The one exception is Rule 4 signal 3, which reads above the tail ONLY through the input-box anchor.
-    tail = "\n".join(cap.splitlines()[-6:])
-    low = tail.lower()
-    idle_bar = ("auto mode on" in low) or ("⏵⏵" in tail)   # the parked status bar
-    if is_active(cap):
-        return "ACTIVE"
-    if "context left until auto-compact" in low or "context limit reached" in low or "compact or /clear to continue" in low:
-        return "ON-WALL"   # caller double-gates with JSONL pct>=98
-    if not idle_bar and ("❯ 1." in tail or "1. yes" in low or "2. no" in low or "do you want to proceed" in low or ("select" in low and "❯" in tail)):
-        return "OPEN-DRAWER"   # a real dialog occupies the input chrome (no idle bar showing)
-    if idle_bar:
-        return "IDLE"
-    if tail.rstrip().endswith("❯"):
-        return "ON-PROMPT"
-    return "IDLE"
-
-def role_from_title(title):
-    # Same rule as private.scrumMaster.swipe.role.parse: strip the leading glyph run, take the
-    # first token, accept only role@host, return the bare role ('' otherwise).
-    t = re.sub(r"^[^A-Za-z0-9]+", "", title or "")
-    t = t.split()[0] if t.split() else ""
-    return t.split("@")[0] if re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*@[A-Za-z0-9._-]+", t) else ""
-
-def registry_role(sess, idx):
-    try:
-        with open(os.path.expanduser("~/config/hivemind.roles.env")) as fh:
-            for line in fh:
-                f = line.strip().split("|")
-                if len(f) >= 2 and f[0] == f"{sess}:{idx}": return f[1]
-    except Exception: pass
-    return None
-
-def main():
-    filt = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else ""
-    dmap = discover_all_map()   # ONE framework-load resolves every pane's uuid (pulse-perf); passed to resolve_jsonl
-    sessions = [filt] if filt else [s for s in sh("tmux","list-sessions","-F","#{session_name}").splitlines() if s]
-    for sess in sessions:
-        rows, nagents, nshells = [], 0, 0
-        for pl in sh("tmux","list-panes","-s","-t",sess,"-F","#{window_index}.#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_title}").splitlines():
-            parts = pl.split("|")
-            if len(parts) < 3: continue
-            idx, ppid = parts[0], parts[1]
-            title = parts[3] if len(parts) > 3 else ""
-            try: ppid_i = int(ppid)
-            except ValueError: continue
-            cpid, _ = claude_proc(ppid_i)
-            sh_ct = sum(1 for _, a in children(ppid_i) if a.split(" ")[0].endswith("bash"))
-            if not cpid:
-                rows.append(f"  {idx:<5} {DIM}{'shell':<22} shell{RST}"); nshells += 1; continue
-            nagents += 1
-            role = role_from_title(title) or registry_role(sess, idx) or "?"
-            cap = "\n".join(sh("tmux","capture-pane","-t",f"{sess}:{idx}","-p").splitlines()[-15:])
-            state = classify(cap)
-            jl = resolve_jsonl(f"{sess}:{idx}", dmap)
-            ctx = ctx_from_jsonl(jl, 1000) if jl else None
-            lagging = (ctx == "lag")   # content-lag sentinel: JSONL is a stale LOWER-BOUND mid-reboot
-            # ON-WALL double-gate: a wall banner + a RELIABLE pct<98 is stale → IDLE. A LAGGING ctx is NOT
-            # reliable (false-LOW) and must NEVER downgrade a VISIBLE wall (oopPO: a ~67%-used rebooting agent
-            # reads false-low). 'not lagging' short-circuits BEFORE ctx[1] so 'lag' is never indexed (py3 str<int raises).
-            if state == "ON-WALL" and not lagging and (ctx is None or ctx[1] < 98):
-                state = "IDLE"   # double-gate: a wall banner without pct>=98 is stale, not the wall
-            if rewind_marked(f"{sess}:{idx}"):
-                state = "DURING-REWIND"   # DECLARED by the driver — overrides capture (hands-off window)
-            sc = STATE_COLOR.get(state, "")
-            if lagging:
-                ctxs = f"{DIM}?ctx-lag(reboot){RST}"   # defer the pct — JSONL lags the live context mid-reboot
-            elif ctx:
-                used, pct, dk = ctx
-                cc = "\033[91m" if pct >= 90 else ("\033[93m" if pct >= 80 else "\033[32m")
-                mark = "⚠" if pct >= 80 else " "
-                ctxs = f"{cc}{mark}{pct}% ({used//1000}k/{dk}k){RST}"
-            else:
-                ctxs = f"{DIM}?ctx-no-jsonl{RST}"
-            rows.append(f"  {idx:<5} {role:<22} {sc}{state:<12}{RST} {DIM}sh:{sh_ct}{RST} {ctxs}")
-        print(f"{CYAN}TEAM {sess}{RST}  {DIM}{nagents} agents · {nshells} shells{RST}")
-        for r in rows: print(r)
-
-main()
-SM_PULSE_PY
-  create.result 0 "pulse"
-  return $(result)
-}
-
-private.scrumMaster.swipe.subtree() # <pane_pid> <?ps_snapshot> # echo "<kind> <shell_count>" : kind=agent|shell (claude anywhere in subtree), shell_count=bash-leaf descendants. Pure bash (ps + awk DFS), mirrors pulse children()/claude_proc. A caller-supplied ps snapshot (taken ONCE at swipe entry, before per-pane subshell churn) keeps the self-pane bash-count stable + matching pulse.
+private.scrumMaster.swipe.subtree() # <pane_pid> <?ps_snapshot> # echo "<kind> <shell_count>" : kind=agent|shell (claude anywhere in subtree), shell_count=bash-leaf descendants. Pure bash (ps + awk DFS). A caller-supplied ps snapshot (taken ONCE at swipe entry, before per-pane subshell churn) keeps the self-pane bash-count stable.
 {
   local root="$1" snap="$2"
   { if [ -n "$snap" ]; then printf '%s\n' "$snap"; else ps -eo pid,ppid,args 2>/dev/null; fi; } | awk -v root="$root" '
@@ -832,7 +613,7 @@ private.scrumMaster.swipe.subtree() # <pane_pid> <?ps_snapshot> # echo "<kind> <
     }'
 }
 
-private.scrumMaster.swipe.ctx() # <jsonl> <denomK> # echo "used|pct|denomK" | "lag" | "" — the ONLY python3 (JSON-parse + token-sum helper, mirrors pulse ctx_from_jsonl). Bash re-validates before render.
+private.scrumMaster.swipe.ctx() # <jsonl> <denomK> # echo "used|pct|denomK" | "lag" | "" — the ONLY python3 (JSON-parse + token-sum helper). Bash re-validates before render.
 {
   local jsonl="$1" denomK="$2"
   [ -f "$jsonl" ] || return 0
@@ -863,7 +644,7 @@ print("%d|%d|%d" % (used, round(used * 100 / (denom_k * 1000)), denom_k))
 ' "$jsonl" "$denomK" 2>/dev/null
 }
 
-private.scrumMaster.swipe.classify.active() # <capture-text> # rc0 if the agent is WORKING — Rule 4 (design stale-role-labels §Rule 4): survives a narrow pane. Mirrors pulse is_active() exactly.
+private.scrumMaster.swipe.classify.active() # <capture-text> # rc0 if the agent is WORKING — Rule 4 (design stale-role-labels §Rule 4): survives a narrow pane.
 {
   local cap="$1"
   local tail; tail=$(printf '%s\n' "$cap" | tail -6)
@@ -897,7 +678,7 @@ private.scrumMaster.swipe.classify.active() # <capture-text> # rc0 if the agent 
   return 1
 }
 
-private.scrumMaster.swipe.classify() # <capture-text> # echo STATE from the last-6-line chrome ONLY (mirrors pulse classify; never the message body). ACTIVE also via the Rule-4 anchored signals.
+private.scrumMaster.swipe.classify() # <capture-text> # echo STATE from the last-6-line chrome ONLY (never the message body). ACTIVE also via the Rule-4 anchored signals.
 {
   local cap="$1"
   local tail; tail=$(printf '%s\n' "$cap" | tail -6)
@@ -918,7 +699,7 @@ private.scrumMaster.swipe.classify() # <capture-text> # echo STATE from the last
   echo IDLE
 }
 
-private.scrumMaster.swipe.role.parse() # <title> # bare role from a 'role@host' pane title ('' if the title is not that shape). Own copy on purpose (SM-monitor decoupling) — kept identical to pulse's role_from_title and otmux's private.otmux.pane.role.parse by the shared fixture table in test.swipe-role-live (cell 9).
+private.scrumMaster.swipe.role.parse() # <title> # bare role from a 'role@host' pane title ('' if the title is not that shape). Own copy on purpose (SM-monitor decoupling) — kept identical to otmux's private.otmux.pane.role.parse by the shared fixture table in test.swipe-role-live (cell 9).
 {
   local t="$1"
   t="${t#"${t%%[A-Za-z0-9]*}"}"        # strip the leading glyph run (✳, braille spinner, ⏵⏵, whitespace)
@@ -952,11 +733,11 @@ private.scrumMaster.swipe.jsonl() # <pane> <uuid-from-map> # echo jsonl path | "
   done
 }
 
-scrumMaster.swipe() # <?session> # PURE-BASH hiveMind-free drop-in for pulse: HONEST REAL-TIME team status, byte-identical output. Deps: tmux + claudeCode (session.discover.all) + bash + python3-JSON-helper(swipe.ctx) ONLY. NO hiveMind script calls.
+scrumMaster.swipe() # <?session> # PURE-BASH hiveMind-free team monitor (the Python pulse it replaced was removed 2026-10-28, TRON): HONEST REAL-TIME team status in the team.sweep output format. Deps: tmux + claudeCode (session.discover.all) + bash + python3-JSON-helper(swipe.ctx) ONLY. NO hiveMind script calls.
 {
   local session="${1:-}"
   local CYAN=$'\033[96m' DIM=$'\033[90m' RST=$'\033[0m'
-  local PSS; PSS=$(ps -eo pid,ppid,args 2>/dev/null)   # ONE snapshot BEFORE per-pane subshell churn -> stable self-pane bash-count (parity with pulse)
+  local PSS; PSS=$(ps -eo pid,ppid,args 2>/dev/null)   # ONE snapshot BEFORE per-pane subshell churn -> stable self-pane bash-count
   local dmap; dmap=$("$OOSH_DIR/claudeCode" session.discover.all 2>/dev/null)
   local sessions
   if [ -n "$session" ]; then sessions="$session"; else sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); fi
@@ -1014,22 +795,17 @@ scrumMaster.swipe() # <?session> # PURE-BASH hiveMind-free drop-in for pulse: HO
   return $(result)
 }
 
-scrumMaster.pulse.completion.session() # # tmux session names
-{
-  tmux list-sessions -F "#{session_name}" 2>/dev/null
-}
-
 private.scrumMaster.rewind.markdir() # # path to the declared during-rewind marker dir
 {
   echo "${CONFIG_PATH:-$HOME/config}/scrumMaster.rewind.active"
 }
 
-private.scrumMaster.rewind.markname() # <pane> # sanitized marker filename for a pane (MUST match pulse _mark_name)
+private.scrumMaster.rewind.markname() # <pane> # sanitized marker filename for a pane — THE one naming rule (rewind.mark/unmark/list and swipe all use it)
 {
   printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_'
 }
 
-scrumMaster.rewind.mark() # <target-pane> # DECLARE a pane is DURING-REWIND — the rewind DRIVER sets this BEFORE opening the picker; pulse then shows DURING-REWIND (reliable/declared, never guessed). UNMARK after the 2-phase rewind's REREAD completes.
+scrumMaster.rewind.mark() # <target-pane> # DECLARE a pane is DURING-REWIND — the rewind DRIVER sets this BEFORE opening the picker; swipe then shows DURING-REWIND (reliable/declared, never guessed). UNMARK after the 2-phase rewind's REREAD completes.
 {
   local target="$1"
   if [ -z "$target" ]; then
@@ -1041,7 +817,7 @@ scrumMaster.rewind.mark() # <target-pane> # DECLARE a pane is DURING-REWIND — 
   local f="$dir/$(private.scrumMaster.rewind.markname "$target")"
   local when; when=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   printf 'pane=%s\ndriver=%s\nsince=%s\n' "$target" "${HIVEMIND_ROLE:-$(otmux current 2>/dev/null)}" "$when" > "$f"
-  success.log "rewind.mark: $target = DURING-REWIND (since $when) — pulse will show it; UNMARK after REREAD"
+  success.log "rewind.mark: $target = DURING-REWIND (since $when) — swipe will show it; UNMARK after REREAD"
   create.result 0 "$f"; return $(result)
 }
 
