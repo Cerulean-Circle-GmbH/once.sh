@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# T-STATIC-DEFINED-FUNCTIONS — fleet-wide STATIC gate (PO ask 2026-10-28). Scan the HAZARD, not the
+# callers: for every OOSH script, every CALLED this.X / private.X / <script>.X must have a LIVE
+# (uncommented) definition in that script's LOAD PATH = transitive closure of {script, this} + the
+# OOSH scripts they `source`. RED on any call to an undefined function. Run it on every change.
+# Would have caught b745e766 (kernel this.is* commented out, callers missed): falsifier differential
+#   b745e766^ -> claudeCode clean, hiveMind validator calls defined;  b745e766 -> claudeCode 7, hiveMind +45.
+# CALL = a token in COMMAND POSITION (what bash executes). NOT calls: comments, strings/usage text,
+#   python -c / heredoc bodies, CLI method args (`claudeCode context.read`), by-name args (`os.check x.y`),
+#   `bash -c "source x; x.f"` (another shell, its own load path), $var.method, paths, "name: msg".
+# DISCLOSED BLIND SPOT: by-name / dynamic dispatch (`os.check x.y`, `private.check.$x`, "$fn") is not
+#   checked — a static scan cannot know the runtime name. Pure bash + awk.
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level>"
+source this
+source test.suite
+log.level $level
+export LOG_DEVICE=/dev/null
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+GEN="${OOSH_DIR}/test/gen/t-static-defined-functions"
+sweep(){ rm -rf "$GEN"; }
+trap sweep EXIT
+sweep
+scan(){ ( # <root> [script...]
+  root="${1:?root}"; shift
+  cd "$root" || exit 2
+  SCRIPTS=$(for f in *; do [ -f "$f" ] && [ -x "$f" ] && grep -qE '^[[:space:]]*source[[:space:]]+this([[:space:]]|$)|this\.start' "$f" 2>/dev/null && echo "$f"; done)
+  [ -f this ] && SCRIPTS=$(printf '%s\nthis\n' "$SCRIPTS" | sort -u)
+  TARGETS="${*:-$SCRIPTS}"
+  
+  # code view: drop full-line comments, trailing ' # ...' comments, heredoc bodies, python -c "..." bodies
+  code_view(){ awk '
+    # q = quote state carried across lines: "" (none) | "s" (inside \047...\047) | "d" (inside "...").
+    # A line that STARTS inside a string is string body (usage text, python -c bodies) -> blanked.
+    function scanq(s, q,   i,c,esc){ esc=0
+      for (i=1;i<=length(s);i++){ c=substr(s,i,1)
+        if (q=="s") { if (c=="\047") q=""; continue }
+        if (esc) { esc=0; continue }
+        if (c=="\\") { esc=1; continue }
+        if (q=="d") { if (c=="\"") q=""; continue }
+        if (c=="#" && (i==1 || substr(s,i-1,1) ~ /[[:space:]]/)) break    # comment: rest of line inert
+        if (c=="\047") q="s"; else if (c=="\"") q="d" }
+      return q }
+    BEGIN{hd=""; q=""}
+    hd!="" { t=$0; sub(/^[\t]+/,"",t); if (t==hd) hd=""; print ""; next }
+    q!=""  { q=scanq($0,q); print ""; next }
+    { line=$0
+      if (line ~ /^[[:space:]]*#/) { print ""; next }
+      q=scanq(line,"")
+      sub(/[[:space:]]#[[:space:]].*$/,"",line)
+      if (match(line,/<<-?[[:space:]]*["\047]?[A-Za-z_][A-Za-z0-9_]*["\047]?/)) {
+        tag=substr(line,RSTART,RLENGTH); sub(/^<<-?[[:space:]]*/,"",tag); gsub(/["\047]/,"",tag); hd=tag; q="" }
+      print line }' "$1"; }
+  
+  # sourced OOSH deps of one file (uncommented `source X` / `. X`, X basename resolving to a script)
+  deps(){ code_view "$1" | grep -oE '(^|[;&|[:space:]])(source|\.)[[:space:]]+[^[:space:];|&]+' \
+            | awk '{print $NF}' | sed -E 's/^["\047]//; s/["\047]$//; s#.*/##' \
+            | while read -r d; do printf '%s\n' "$SCRIPTS" | grep -qx -- "$d" && echo "$d"; done; }
+  closure(){ local todo="$1 this" seen="" s
+    while [ -n "$todo" ]; do set -- $todo; s=$1; shift; todo="$*"
+      case " $seen " in *" $s "*) continue;; esac; seen="$seen $s"
+      [ -f "$s" ] && todo="$todo $(deps "$s" | tr '\n' ' ')"; done; echo "$seen"; }
+  defs(){ for f in "$@"; do grep -hE '^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\(\)' "$f" 2>/dev/null \
+            | sed -E 's/^[[:space:]]*(function[[:space:]]+)?//; s/[[:space:]]*\(\).*//'; done | sort -u; }
+  
+  ALT=$(printf '%s\n' this private $SCRIPTS | sort -u | sed 's/\./[.]/g' | paste -sd'|')
+  for s in $TARGETS; do
+    [ -f "$s" ] || continue
+    D=$(defs $(closure "$s"))
+    # A CALL = a token in COMMAND POSITION (what bash would execute): line start, or after ; | & ( { ! `
+    # or a compound keyword. Strings, messages, CLI method args (`claudeCode context.read`) and by-name
+    # args (`os.check x.y`) are NOT command position. Blind spot (disclosed): by-name/dynamic dispatch.
+    code_view "$s" | awk -v alt="$ALT" -v S="$s" '
+      # in-string? -> a token inside \047..\047 is never a call; inside "..." only within a $( ) opened
+      # INSIDE that string (bash -c "source x; x.f" runs in ANOTHER shell with its own load path).
+      function instr(pre,   i,c,q,esc,dqo){ q=""; esc=0; dqo=0
+        for (i=1;i<=length(pre);i++){ c=substr(pre,i,1)
+          if (q=="s") { if (c=="\047") q=""; continue }
+          if (esc) { esc=0; continue }
+          if (c=="\\") { esc=1; continue }
+          if (q=="d") { if (c=="\"") q=""; continue }
+          if (c=="\047") q="s"; else if (c=="\"") { q="d"; dqo=i } }
+        if (q=="s") return 1
+        if (q=="d") return (index(substr(pre,dqo), "$(")==0)
+        return 0 }
+      function cmdpos(pre,   p) { p=pre; sub(/[[:space:]]+$/,"",p)
+        if (p=="") return 1
+        if (p ~ /[;|&({!`]$/) return 1
+        if (p ~ /(^|[^A-Za-z0-9_.-])(if|then|do|else|elif|while|until|time|exec)$/) return 1
+        return 0 }
+      { if ($0 ~ /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\(\)/) next
+        line=$0; pos=0
+        re="(" alt ")[.][A-Za-z0-9_.]*[A-Za-z0-9_]"
+        while (match(substr(line,pos+1), re)) {
+          st=pos+RSTART; tok=substr(line,st,RLENGTH); pos=st+RLENGTH-1
+          before=(st>1)?substr(line,st-1,1):""; after=substr(line,st+RLENGTH,1)
+          if (before ~ /[A-Za-z0-9_.$\/{@:-]/) continue          # part of a longer word / var / path
+          if (after=="/" || after=="=" || after==":") continue  # path, assignment, "name: message"
+          if (after=="." || after=="$") continue                # dynamic suffix: private.check.$x (by-name, blind spot)
+          if (instr(substr(line,1,st-1))) continue
+          if (!cmdpos(substr(line,1,st-1))) continue
+          if (tok ~ /[.](env|md|sh|txt|json|jsonl|log|yml|yaml|pid|lock|queue|out|html|js|ts|py|conf|bak|tmp)$/) continue
+          print S "|" tok "|" NR } }' \
+    | while IFS='|' read -r sc tok ln; do printf '%s\n' "$D" | grep -qxF -- "$tok" || echo "$sc|$tok|$ln"; done
+  done
+) }
+
+echo; echo "===== SYNTHETIC (always runnable) — the instrument flags EXACTLY the real classes ====="
+FX="$GEN/fx"; mkdir -p "$FX"
+cat > "$FX/this" <<'EOF'
+#!/usr/bin/env bash
+this.ok() { :; }
+# this.gone() {
+#   :
+# }
+this.start(){ :; }
+EOF
+cat > "$FX/beta" <<'EOF'
+#!/usr/bin/env bash
+source this
+private.beta.helper() { :; }
+private.beta.helper2() { :; }
+EOF
+cat > "$FX/os" <<'EOF'
+#!/usr/bin/env bash
+source this
+os.check() { :; }
+EOF
+cat > "$FX/alpha" <<'EOF'
+#!/usr/bin/env bash
+source this
+source os                                   # os.check is then in alpha's load path (by-name line below)
+alpha.run() # # exercises every call/non-call class
+{
+  this.ok                                   # defined in kernel -> clean
+  this.gone "x"                             # FLAG: definition is commented out
+  alpha.missing                             # FLAG: defined nowhere
+  private.beta.helper                       # FLAG: beta not sourced -> not in alpha's load path
+  if ! this.ok; then :; fi
+  echo "use alpha.inmessage here"           # string -> not a call
+  error.log "alpha.colon: message"          # message -> not a call
+  beta alpha.cliarg                         # CLI method arg -> not a call
+  os.check alpha.byname                     # by-name arg -> not checked (blind spot)
+  private.check.$x                          # dynamic -> not checked (blind spot)
+  $this.usage                               # variable -> not a call
+  bash -c "source beta; private.beta.helper2"   # other shell, sources beta -> not this load path
+  x=$(this.ok)
+  python3 -c "
+import os
+print(os.path.join('a','b'))
+"
+  echo "
+    alpha.usagelisted     shown in usage text
+  "
+  cat <<'DOC'
+alpha.inheredoc
+DOC
+}
+alpha.start(){ this.start; }
+EOF
+cat > "$FX/gamma" <<'EOF'
+#!/usr/bin/env bash
+source this
+source beta
+gamma.run() { private.beta.helper; }      # beta sourced -> clean
+EOF
+chmod +x "$FX"/*
+GOT=$(scan "$FX" | cut -d'|' -f1,2 | sort -u | tr '\n' ' ')
+WANT="alpha|alpha.missing alpha|private.beta.helper alpha|this.gone "
+test.case $level "SYNTH: flagged set == {this.gone, alpha.missing, private.beta.helper} exactly" echo "$GOT"
+[ "$GOT" = "$WANT" ] && ok "instrument flags exactly the 3 real classes, 0 false positives" \
+  || no "INSTRUMENT WRONG (fix the gate, not the product): got '${GOT}' want '${WANT}'"
+
+echo; echo "===== FLEET — every OOSH script in \$OOSH_DIR ($OOSH_DIR) ====="
+FINDINGS=$(scan "$OOSH_DIR")
+SCRIPTS=$( (cd "$OOSH_DIR"; for f in *; do [ -f "$f" ] && [ -x "$f" ] && grep -qE '^[[:space:]]*source[[:space:]]+this([[:space:]]|$)|this\.start' "$f" 2>/dev/null && echo "$f"; done; echo this) | sort -u)
+TOTAL=0
+for s in $SCRIPTS; do
+  mine=$(printf '%s\n' "$FINDINGS" | awk -F'|' -v s="$s" '$1==s')
+  n=$(printf '%s' "$mine" | grep -c .); TOTAL=$((TOTAL+n))
+  test.case $level "DEFINED $s: 0 calls to undefined functions" echo "undefined=$n"
+  if [ "$n" -eq 0 ]; then ok "$s clean"
+  else no "RED $s: $n undefined call(s): $(printf '%s\n' "$mine" | awk -F'|' '{c[$2]++; l[$2]=l[$2] (l[$2]?",":"") $3} END{for(k in c) printf "%s x%d (L%s); ", k, c[k], l[k]}')"; fi
+done
+
+echo
+echo "=================================================================="
+echo "  T-STATIC-DEFINED-FUNCTIONS  PASS=$pass FAIL=$fail   undefined-calls=$TOTAL"
+echo "  RED on any call to an undefined function in the load path. Run on every change."
+echo "=================================================================="
+sweep
+test.suite.save.results
