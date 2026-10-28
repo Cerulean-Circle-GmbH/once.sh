@@ -1710,20 +1710,32 @@ claudeCode.jsonl.usage() # <jsonl|-> <mode:last|max|lag|firstlast|all> # assista
   case "$mode" in last|max|lag|firstlast|all) ;; *) error.log "jsonl.usage: unknown mode '$mode' (last|max|lag|firstlast|all)" >&2; return 1 ;; esac
   [ "$src" = "-" ] && src="/dev/stdin"
   [ -n "$1" ] && [ -r "$src" ] || return 0
-  awk -v mode="$mode" '
-    function key(s, k,   r) {   # first UNESCAPED "k":N in s, else 0
-      if (!match(s, "(^|[^\\\\])\"" k "\"[ ]*:[ ]*[0-9]+")) return 0
-      r = substr(s, RSTART, RLENGTH); sub(/.*:[ ]*/, "", r); return r + 0
+  # PERF (measured on the biggest real session, 616MB): naive regex version 38s vs python 3s. Now: LC_ALL=C
+  # (byte matching — every pattern is ASCII; UTF-8 multibyte matching on long lines dominated), index()
+  # for exact keys, static DFA-friendly regexes only. WHY index() is exact: a JSON key is a quote, the
+  # name, a quote, then ':' — the ESCAPED form inside a string is \"name\": whose closing quote is always
+  # preceded by a backslash, so the literal "name": can NEVER occur inside quoted content.
+  LC_ALL=C awk -v mode="$mode" '
+    function at(s, k,   p) {          # position of the first "k" key in s (0 = none); "k": or "k" :
+      p = index(s, "\"" k "\":"); if (p) return p
+      return index(s, "\"" k "\" :")
     }
-    function ts(s,   r) {
-      if (!match(s, /(^|[^\\])"timestamp"[ ]*:[ ]*"[^"]*"/)) return ""
-      r = substr(s, RSTART, RLENGTH); sub(/^.*:[ ]*"/, "", r); sub(/"$/, "", r); return r
+    function num(s, k,   p, r) {      # numeric value of the first "k" key in s (missing = 0)
+      p = at(s, k); if (!p) return 0
+      r = substr(s, p + length(k) + 2); sub(/^[ ]*:[ ]*/, "", r)
+      return match(r, /^[0-9]+/) ? substr(r, 1, RLENGTH) + 0 : 0
+    }
+    function ts(s,   p, r) {          # value of the first "timestamp" key, "" if none
+      p = at(s, "timestamp"); if (!p) return ""
+      r = substr(s, p + 11); if (!sub(/^[ ]*:[ ]*"/, "", r)) return ""
+      p = index(r, "\""); return p ? substr(r, 1, p - 1) : ""
     }
     {
-      if ($0 ~ /(^|[^\\])"type"[ ]*:[ ]*"assistant"/ && match($0, /(^|[^\\])"usage"[ ]*:[ ]*[{]/)) {   # [{] not \{ : POSIX ERE ({ = interval op)
-        u = substr($0, RSTART + RLENGTH)
-        if (u ~ /(^|[^\\])"input_tokens"[ ]*:[ ]*[0-9]/) {
-          t = key(u, "input_tokens") + key(u, "cache_creation_input_tokens") + key(u, "cache_read_input_tokens")
+      # usage record: literal "input_tokens" (= the python gate) + type assistant + a "usage" object.
+      if (index($0, "\"input_tokens\"") && (index($0, "\"type\":\"assistant\"") || index($0, "\"type\": \"assistant\"") || $0 ~ /"type"[ ]*:[ ]*"assistant"/) && (p = at($0, "usage"))) {
+        u = substr($0, p + 7)
+        if (sub(/^[ ]*:[ ]*[{]/, "", u) && at(u, "input_tokens")) {   # [{] not \{ : POSIX ERE ({ = interval op)
+          t = num(u, "input_tokens") + num(u, "cache_creation_input_tokens") + num(u, "cache_read_input_tokens")
           if (t > 0) {
             last = t; pending = 0; if (t > max) max = t
             lastTs = ts($0); if (first == "") { first = t; firstTs = lastTs }
@@ -1731,8 +1743,8 @@ claudeCode.jsonl.usage() # <jsonl|-> <mode:last|max|lag|firstlast|all> # assista
           }
         }
       }
-      if (index($0, "\"type\":\"user\"") || index($0, "\"type\":\"attachment\"") || index($0, "\"type\":\"tool_result\"") || index($0, "\"type\":\"tool_use\"") \
-       || index($0, "\"type\": \"user\"") || index($0, "\"type\": \"attachment\"") || index($0, "\"type\": \"tool_result\"") || index($0, "\"type\": \"tool_use\"")) pending++
+      # content window: the python 8 substrings exactly = "type":"X" or "type": "X" (zero or ONE space).
+      if ($0 ~ /"type": ?"(user|attachment|tool_result|tool_use)"/) pending++
     }
     END {
       if (mode == "lag")       { print (pending > 8) ? "lag" : "fresh"; exit }
