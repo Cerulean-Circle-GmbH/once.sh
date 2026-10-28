@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# T-SWIPE-ROLE-LIVE — RED-FIRST acceptance for design 8ddcd6f65
+# (session/tasks/stale-role-labels-after-pane-move.design.md, cells 1-9). Tron bug 2026-10-28:
+# after the pane move, swipe/pulse labels, send-by-name and the sender prefix all follow the STALE
+# registry (pre-move layout keyed session:idx) instead of the LIVE pane title.
+#   Rule 1  swipe+pulse role = live title (role@host parse) > registry > '?'
+#   Rule 2  hiveMind.resolve = live title first; refuse a stale row pointing at a shell; write-through
+#   Rule 3  otmux sender prefix = OWN live title > registry > NO prefix
+# ISOLATION: every swipe/pulse/hiveMind/otmux call runs with a SANDBOX HOME + CONFIG_PATH +
+# HIVEMIND_REGISTRY — the live ~/config/hivemind.roles.env is never read-for-write (sha256 checked).
+# Fixture roles are fxrl-* (unique), so Rule 2's live-title scan cannot match a real agent.
+
+level=$1; [ -z "$level" ] && level=1
+echo "starting: ${BASH_SOURCE[@]##*/} <LOG_LEVEL=$level> (RED-FIRST — registry-first must fail)"
+source this
+source test.suite
+log.level $level
+export LOG_DEVICE=/dev/null
+
+pass=0; fail=0
+ok(){ expect.pass "$1"; pass=$((pass+1)); }
+no(){ expect.fail "$1"; fail=$((fail+1)); }
+
+FX_PREFIX="fxswrl_"; FIX="${FX_PREFIX}fix"; TBL="${FX_PREFIX}tbl"; SND="${FX_PREFIX}snd"
+GEN="${OOSH_DIR}/test/gen/t-swipe-role-live"; SBX="$GEN/home"; REG="$SBX/config/hivemind.roles.env"
+LIVE_REG="$HOME/config/hivemind.roles.env"
+sha(){ [ -f "$1" ] && sha256sum "$1" | cut -d' ' -f1 || echo absent; }
+LIVE_SHA_BEFORE=$(sha "$LIVE_REG")
+# Run anything under the sandbox config (registry, queues, state never touch the live ~/config).
+sbx(){ HOME="$SBX" CONFIG_PATH="$SBX/config" HIVEMIND_REGISTRY="$REG" "$@"; }
+
+# PRE-RUN sweep by prefix (an EXIT trap does not fire on SIGKILL/timeout).
+sweep(){ tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${FX_PREFIX}" \
+           | while IFS= read -r s; do tmux kill-session -t "$s" 2>/dev/null; done; rm -rf "$GEN"; }
+trap sweep EXIT
+sweep
+mkdir -p "$GEN/bin" "$GEN/cwd" "$SBX/config" "$SBX/.claude/projects"
+: > "$SBX/config/result.txt"; : > "$SBX/config/error.txt"
+
+# ── the shifted registry (mirrors the measured 10-28 table: every slot names its pre-move role,
+#    and the tester's stale row points at a SHELL) ─────────────────────────────────────────────
+seed_reg(){ cat > "$REG" <<EOF
+${FIX}:0.0|fxrl-po|1782659134
+${FIX}:0.1|fxrl-architect|1782659134
+${FIX}:0.2|fxrl-expert|1782659134
+${FIX}:0.3|fxrl-reg|1782659134
+${FIX}:0.4|fxrl-blank|1782659134
+${FIX}:0.7|fxrl-tester|1782659134
+${SND}:0.0|fxrl-stale|1782659134
+${SND}:0.1|fxrl-regsender|1782659134
+EOF
+}
+seed_reg
+
+# FIX layout: title (truth) / expected label.   0.7 = SHELL with a hostname title.
+declare -A TITLE WANT
+TITLE[0.0]='✳ fxrl-architect@WODA.prod';      WANT[0.0]='fxrl-architect'  # cell1: title beats stale reg
+TITLE[0.1]='⠐ fxrl-expert@WODA.prod';         WANT[0.1]='fxrl-expert'     # cell1: braille spinner
+TITLE[0.2]='✳ fxrl-tester@WODA.prod';         WANT[0.2]='fxrl-tester'     # cell1 + cell5 resolve target
+TITLE[0.3]='Claude Code';                     WANT[0.3]='fxrl-reg'        # cell2: non role@host -> registry
+TITLE[0.4]='';                                WANT[0.4]='fxrl-blank'      # cell2: empty -> registry
+TITLE[0.5]='⏵⏵ fxrl-kappa@my.host.example';  WANT[0.5]='fxrl-kappa'      # cell1: ⏵⏵ + dotted @host, no row
+TITLE[0.6]='Claude Code';                     WANT[0.6]='?'               # cell2: no title-role, no row -> ?
+TITLE[0.7]='v60211.1blu.de';                  WANT[0.7]='shell'           # cell3: shell never labelled
+AGENTS="0.0 0.1 0.2 0.3 0.4 0.5 0.6"
+
+# cell 9 shared parse table: title -> bare role ('' = not a role@host title)
+TBL_TITLES=('✳ oosh-architect@WODA.prod' '⠐ oosh-expert@WODA.prod' '⏵⏵ oosh-tester@WODA.prod'
+            'Claude Code' 'v60211.1blu.de' '✳ robbin-po@v60211.1blu.de' '')
+TBL_WANT=('oosh-architect' 'oosh-expert' 'oosh-tester' '' '' 'robbin-po' '')
+
+# ═════ UNIT (always runnable): the two parse copies, against the ONE shared table (cell 9) ═════
+echo; echo "===== cell 9 UNIT — otmux parse fn vs swipe copy, shared title table ====="
+otmux_parse(){ ( sbx bash -c 'source otmux >/dev/null 2>&1; type -t private.otmux.pane.role.parse >/dev/null || { echo "<UNDEFINED>"; exit; }; private.otmux.pane.role.parse "$1"' _ "$1" ) 2>/dev/null; }
+swipe_parse(){ local r; r=$( ( HOME="$SBX"; source scrumMaster >/dev/null 2>&1; private.scrumMaster.swipe.role "${FX_PREFIX}norow" 9.9 "$1" ) 2>/dev/null ); [ "$r" = '?' ] && r=''; echo "$r"; }
+for i in "${!TBL_TITLES[@]}"; do
+  t="${TBL_TITLES[$i]}"; w="${TBL_WANT[$i]}"; a=$(otmux_parse "$t"); b=$(swipe_parse "$t")
+  test.case $level "T9.$i '${t}' -> '${w}' (otmux='${a}' swipe='${b}')" echo "$a|$b"
+  if [ "$a" = "$w" ] && [ "$b" = "$w" ]; then ok "both copies -> '${w}'"
+  else no "RED: want '${w}', otmux parse='${a}', swipe copy='${b}'"; fi
+done
+
+echo; echo "===== cells 1/2 UNIT — private.scrumMaster.swipe.role with the shifted registry ====="
+for idx in 0.0 0.1 0.2 0.3 0.4 0.5 0.6; do
+  got=$( ( HOME="$SBX"; source scrumMaster >/dev/null 2>&1; private.scrumMaster.swipe.role "$FIX" "$idx" "${TITLE[$idx]}" ) 2>/dev/null )
+  test.case $level "U ${idx}: '${TITLE[$idx]}' -> '${WANT[$idx]}'" echo "$got"
+  [ "$got" = "${WANT[$idx]}" ] && ok "swipe.role ${idx} '${got}'" || no "RED: swipe.role ${idx} = '${got}', want '${WANT[$idx]}'"
+done
+
+if [ -z "$TMUX" ]; then
+  test.case $level "INTEGRATION cells 1-6,8 (skipped — no tmux)" echo skip; expect.pass "skipped"
+else
+# ═════ FROZEN FIXTURES ═════════════════════════════════════════════════════════════════════
+RC=$(cd "$GEN/cwd" && pwd -P)
+cat > "$GEN/bin/claude" <<'SH'
+#!/bin/sh
+printf '%s\n' '──────────' '❯ ' '──────────' '  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents'
+while :; do sleep 86400; done
+SH
+chmod +x "$GEN/bin/claude"
+mksess(){ # <sess> <npanes> <height>
+  tmux new-session -d -s "$1" -x 120 -y "$3" -c "$RC" 2>/dev/null
+  local i; for ((i=1;i<$2;i++)); do tmux split-window -t "$1" -v -c "$RC" 2>/dev/null; tmux select-layout -t "$1" even-vertical 2>/dev/null; done
+}
+mksess "$FIX" 8 72; mksess "$TBL" "${#TBL_TITLES[@]}" 64; mksess "$SND" 3 30
+for idx in $AGENTS; do tmux send-keys -t "${FIX}:${idx}" "'$GEN/bin/claude' --model x" Enter 2>/dev/null; done
+for i in "${!TBL_TITLES[@]}"; do tmux send-keys -t "${TBL}:0.$i" "'$GEN/bin/claude' --model x" Enter 2>/dev/null; done
+for p in 0.0 0.1 0.2; do tmux send-keys -t "${SND}:$p" "PS1='oosh > '" Enter 2>/dev/null; done
+tmux send-keys -t "${FIX}:0.7" "PS1='oosh > '" Enter 2>/dev/null
+sleep 1.4
+for idx in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7; do tmux select-pane -t "${FIX}:${idx}" -T "${TITLE[$idx]}" 2>/dev/null; done
+for i in "${!TBL_TITLES[@]}"; do tmux select-pane -t "${TBL}:0.$i" -T "${TBL_TITLES[$i]}" 2>/dev/null; done
+tmux select-pane -t "${SND}:0.0" -T '✳ fxrl-architect@WODA.prod' 2>/dev/null
+tmux select-pane -t "${SND}:0.1" -T 'Claude Code' 2>/dev/null
+tmux select-pane -t "${SND}:0.2" -T 'Claude Code' 2>/dev/null
+sleep 0.3
+
+# Instrument check: titles must read back exactly, else every label arm is confounded.
+BAD=""
+chk(){ local rb; rb=$(tmux display-message -p -t "$1" '#{pane_title}' 2>/dev/null); [ "$rb" = "$2" ] || BAD="${BAD} $1[want='$2' got='$rb']"; }
+for idx in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7; do chk "${FIX}:${idx}" "${TITLE[$idx]}"; done
+for i in "${!TBL_TITLES[@]}"; do chk "${TBL}:0.$i" "${TBL_TITLES[$i]}"; done
+test.case $level "FIXTURE: every planted title reads back exactly" echo "${BAD:-ok}"
+[ -z "$BAD" ] && ok "titles planted exactly" || no "FIXTURE CONFOUND (fix the test, not the product):${BAD}"
+
+render(){ # <cmd> <sess> -> raw + .plain
+  sbx scrumMaster "$1" "$2" 2>/dev/null > "$GEN/$1.$2"; sed 's/\x1b\[[0-9;]*m//g' "$GEN/$1.$2" > "$GEN/$1.$2.plain"; }
+for c in pulse swipe; do render "$c" "$FIX"; render "$c" "$TBL"; done
+echo "  swipe ${FIX}:"; sed 's/^/    /' "$GEN/swipe.$FIX.plain"
+rowrole(){ awk -v a="$2" '$1==a{print $2; exit}' "$1"; }
+
+echo; echo "===== cells 1/2/3 — swipe AND pulse print the LIVE-title role per row ====="
+for c in swipe pulse; do
+  for idx in 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7; do
+    got=$(rowrole "$GEN/$c.$FIX.plain" "$idx")
+    test.case $level "C1-3 $c ${idx}: '${TITLE[$idx]}' -> '${WANT[$idx]}'" echo "$got"
+    [ "$got" = "${WANT[$idx]}" ] && ok "$c ${idx} '${got}'" || no "RED: $c ${idx} shows '${got:-<no row>}', want '${WANT[$idx]}'"
+  done
+done
+test.case $level "C3 shell guard: the shell row never carries a role" echo "$(grep -E '^  0\.7 ' "$GEN/swipe.$FIX.plain")"
+! grep -E '^  0\.7 ' "$GEN/swipe.$FIX.plain" "$GEN/pulse.$FIX.plain" | grep -q 'fxrl-' \
+  && ok "0.7 (hostname-titled shell) unlabelled in swipe+pulse" || no "RED: shell row labelled with a role"
+
+echo; echo "===== cell 9 — pulse copy agrees with the shared table (via the table fixture) ====="
+for i in "${!TBL_TITLES[@]}"; do
+  w="${TBL_WANT[$i]}"; [ -z "$w" ] && w='?'
+  ps=$(rowrole "$GEN/pulse.$TBL.plain" "0.$i"); sw=$(rowrole "$GEN/swipe.$TBL.plain" "0.$i")
+  test.case $level "T9P.$i '${TBL_TITLES[$i]}' -> '${w}' (pulse='${ps}' swipe='${sw}')" echo "$ps|$sw"
+  [ "$ps" = "$w" ] && [ "$sw" = "$w" ] && ok "pulse==swipe=='${w}'" || no "RED: want '${w}', pulse='${ps}', swipe='${sw}'"
+done
+
+echo; echo "===== cell 4 — PARITY: pulse == swipe byte-identical on both fixtures + test.swipe-parity green ====="
+for s in "$FIX" "$TBL"; do
+  test.case $level "PARITY ${s}: pulse == swipe byte-for-byte" echo diff
+  diff -q "$GEN/pulse.$s" "$GEN/swipe.$s" >/dev/null 2>&1 && [ -s "$GEN/swipe.$s" ] \
+    && ok "pulse == swipe on ${s}" || no "PARITY broken on ${s}: $(diff "$GEN/pulse.$s.plain" "$GEN/swipe.$s.plain" 2>&1 | head -4 | tr '\n' '~')"
+done
+PAR=$(bash "$OOSH_DIR/test/test.swipe-parity" 1 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'PASS=[0-9]+ FAIL=[0-9]+' | tail -1)
+test.case $level "test.swipe-parity stays green" echo "$PAR"
+echo "$PAR" | grep -q 'FAIL=0' && ok "test.swipe-parity $PAR" || no "test.swipe-parity not green: '${PAR:-no result}'"
+
+echo; echo "===== cell 5 — send-by-name: resolve follows the LIVE title; refuses a stale row on a shell ====="
+seed_reg
+RES=$(sbx hiveMind resolve fxrl-tester 2>/dev/null | tail -1 | tr -d '[:space:]')
+test.case $level "C5a resolve fxrl-tester -> ${FIX}:0.2 (live title), not the stale shell ${FIX}:0.7" echo "$RES"
+[ "$RES" = "${FIX}:0.2" ] && ok "resolved to live-title pane" || no "RED: resolve -> '${RES:-<none>}' (stale registry), want ${FIX}:0.2"
+# refuse: remove the live title -> only the stale row (pointing at a SHELL) remains
+seed_reg; tmux select-pane -t "${FIX}:0.2" -T 'Claude Code' 2>/dev/null
+CANARY="FXRL-CANARY-$$"
+SOUT=$(sbx timeout 40 hiveMind send fxrl-tester "$CANARY" 2>&1); SRC=$?
+printf '%s\n' "$SOUT" > "$GEN/c5b.send.out"
+echo "  hiveMind send (rc=$SRC) said:"; printf '%s\n' "$SOUT" | sed 's/\x1b\[[0-9;]*m//g' | grep -v '^[[:space:]]*$' | sed -n '1,6p' | sed 's/^/    /'
+sleep 1.5
+# FULL history (-S -): a canary that ran in the shell and scrolled off a short pane must still count.
+TYPED=$(tmux capture-pane -p -S - -t "${FIX}:0.7" 2>/dev/null | grep -c "$CANARY")
+# A swallowed message may sit in a send queue and DRAIN into the shell later = the live misroute.
+QFILES=$(grep -rlF "$CANARY" "$SBX" 2>/dev/null | grep -vF "$GEN/c5b.send.out")
+QUEUED=$(printf '%s' "$QFILES" | grep -c .)
+[ -n "$QFILES" ] && echo "  canary found queued in: $(printf '%s\n' "$QFILES" | sed "s|$SBX/||" | tr '\n' ' ')"
+LOUD=0; echo "$SOUT" | grep -qiE 'stale|refus' && LOUD=1
+test.case $level "C5b stale row on a shell: send by name refuses loudly, delivers NOTHING" echo "rc=$SRC typed=$TYPED queued-files=$QUEUED loud=$LOUD"
+{ [ "$TYPED" -eq 0 ] && [ "$QUEUED" -eq 0 ] && [ "$SRC" -ne 0 ] && [ "$LOUD" -eq 1 ]; } \
+  && ok "refused loudly (rc=$SRC), nothing typed, nothing queued" \
+  || no "RED: rc=$SRC loud=$LOUD — typed-into-shell=$TYPED, queued-for-later=$QUEUED (want rc!=0 + 'stale/refusing' + 0 typed + 0 queued)"
+tmux send-keys -t "${FIX}:0.7" C-u 2>/dev/null
+tmux select-pane -t "${FIX}:0.2" -T "${TITLE[0.2]}" 2>/dev/null
+
+echo; echo "===== cell 6 — write-through: one resolve rewrites ONLY the drifted row ====="
+seed_reg; cp "$REG" "$GEN/reg.before"
+sbx hiveMind resolve fxrl-expert >/dev/null 2>&1
+ROW=$(grep "^${FIX}:0.1|" "$REG" | cut -d'|' -f2)
+OTHER=$(diff <(grep -vE "^${FIX}:0\.(1|7)\|" "$GEN/reg.before" | cut -d'|' -f1,2) <(grep -vE "^${FIX}:0\.(1|7)\|" "$REG" | cut -d'|' -f1,2) | grep -c '^[<>]')
+test.case $level "C6 after resolve fxrl-expert: row ${FIX}:0.1 = fxrl-expert, unrelated rows unchanged" echo "row=$ROW other-diff=$OTHER"
+{ [ "$ROW" = fxrl-expert ] && [ "$OTHER" -eq 0 ]; } && ok "drifted row healed, nothing else touched" \
+  || no "RED: row ${FIX}:0.1='${ROW}' (want fxrl-expert), unrelated-row diff lines=${OTHER}"
+
+echo; echo "===== cell 8 — sender prefix from OWN live title (pane part via PID walk) ====="
+seed_reg
+pfx(){ # <pane> <tag> <extra-env> : run the prefix fn INSIDE that pane, so the PID walk resolves to it
+  rm -f "$GEN/pfx.$2"
+  tmux send-keys -t "$1" "$3 HOME='$SBX' CONFIG_PATH='$SBX/config' HIVEMIND_REGISTRY='$REG' bash -c 'source otmux >/dev/null 2>&1; d=\$(type -t private.otmux.send.prefix); printf \"%s|%s\" \"\$d\" \"\$(private.otmux.send.prefix)\"' > '$GEN/pfx.$2' 2>/dev/null; clear" Enter 2>/dev/null
+  local n; for n in 1 2 3 4 5 6 7 8 9 10; do [ -s "$GEN/pfx.$2" ] && break; sleep 0.5; done
+  cat "$GEN/pfx.$2" 2>/dev/null
+}
+p8(){ # <case> <pane> <want-prefix> <tag> <extra-env>
+  local r; r=$(pfx "$2" "$4" "$5"); local def="${r%%|*}" got="${r#*|}"
+  test.case $level "C8 $1: prefix == '$3'" echo "def=$def got='$got'"
+  if [ "$def" != function ]; then no "INSTRUMENT: private.otmux.send.prefix not defined in the pane (def='$def') — not a verdict"
+  elif [ "$got" = "$3" ]; then ok "prefix '$got'"
+  else no "RED: prefix '$got', want '$3'"; fi
+}
+p8 "title role beats stale registry"       "${SND}:0.0" "[@fxrl-architect ${SND}:0.0] " a ""
+p8 "TMUX_PANE poisoned (%999) — pane part" "${SND}:0.0" "[@fxrl-architect ${SND}:0.0] " b "TMUX_PANE=%999"
+p8 "non role@host title -> registry role"  "${SND}:0.1" "[@fxrl-regsender ${SND}:0.1] " c ""
+p8 "neither -> NO prefix (never a wrong one)" "${SND}:0.2" "" d ""
+fi
+
+echo; echo "===== cell 7 — hiveMind-free: zero hiveMind invocations in the swipe methods ====="
+SM_UNDER_TEST=$(command -v scrumMaster 2>/dev/null)
+SWIPE_BODY=$(sed -n '/^\(private\.\)\?scrumMaster\.swipe/,/^}/p' "$SM_UNDER_TEST" 2>/dev/null)
+HM=$(printf '%s\n' "$SWIPE_BODY" | sed 's/#.*//' | grep -cE '(^|[;|&]|\$\()[[:space:]]*hiveMind([[:space:].]|$)')
+test.case $level "C7 swipe methods present AND 0 hiveMind invocations" echo "lines=$(printf '%s\n' "$SWIPE_BODY" | grep -c .) hm=$HM"
+{ [ -n "$SWIPE_BODY" ] && [ "$HM" -eq 0 ]; } && ok "swipe hiveMind-free" || no "RED: swipe absent or $HM hiveMind invocation(s)"
+
+echo; echo "===== ISOLATION — the LIVE roles.env was never touched ====="
+LIVE_SHA_AFTER=$(sha "$LIVE_REG")
+test.case $level "ISOLATION: live hivemind.roles.env sha256 unchanged" echo "${LIVE_SHA_BEFORE:0:12}..${LIVE_SHA_AFTER:0:12}"
+[ "$LIVE_SHA_BEFORE" = "$LIVE_SHA_AFTER" ] && ok "live registry untouched" || no "LIVE REGISTRY MUTATED by the test"
+
+echo
+echo "=================================================================="
+echo "  T-SWIPE-ROLE-LIVE  PASS=$pass FAIL=$fail"
+echo "  RED-FIRST until Rules 1-3 of design 8ddcd6f65 land (swipe+pulse, resolve, prefix)."
+echo "=================================================================="
+sweep
+test.suite.save.results
