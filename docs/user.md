@@ -28,7 +28,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  |  | `groups` |  | `user.list.groups` ✅ | `user.list.groups` ✅ |
 |  |  | `other.identities` | `# <?sshDir:~/.ssh> # lists identities in <sshDir>/ids` | `user.list.other.identities` | `user.list.other.identities` |
 |  | `login` |  | `# <userName> # switch to userName via login shell — cd to target home and reset env; only TERM is kept #` | `user.login` | `user.login` |
-|  | `update` | `authorized_keys` | `# <?sshDir:~/.ssh> # updates all keys in <sshDir>/public_keys as authorized` | `user.update.authorized_keys` |  |
+|  | `update` | `authorized_keys` | `# <?sshDir:~/.ssh> # updates all keys in <sshDir>/public_keys as authorized` | `user.authorized.keys.update` |  |
 | `user.authorized.keys` | `update` |  | `# <?sshDir:~/.ssh> # updates all keys in <sshDir>/public_keys as authorized: authorized_keys rebuilt from them in one atomic swap; rc 1 + RESULT when no ssh is set up in <sshDir> (no private key) or the rebuild fails — authorized_keys is then left as it was #` |  | `user.authorized.keys.update` |
 | `user.group` | `add` |  | `# <groupName> <?toUsername> # adds <toUsername> to group <groupName> if both exist` | `user.group.add` | `user.group.add` |
 |  | `check` |  | `# <groupName> # checks if a group exists` | `user.group.check` | `user.group.check` |

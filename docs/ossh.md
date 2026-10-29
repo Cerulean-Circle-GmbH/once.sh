@@ -687,7 +687,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  | `show` |  | `# <sshConfigHost> # show SSH config for a host` | `ossh.show` | `ossh.show` |
 |  | `test` |  |  | `ossh.test` | `ossh.test` |
 | `ossh.authorized.keys` | `update` |  | `# <?sshDir:~/.ssh> # rebuilds <sshDir>/authorized_keys from public_keys/ — user authorized.keys.update, the one rebuild; rc 1 + RESULT when no ssh is set up there or the rebuild fails, authorized_keys then left as it was #` |  | `ossh.authorized.keys.update` |
-| `ossh.authorized_keys` | `update` |  | `# <?sshDir:~/.ssh> # updates authorized_keys from public_keys dir` | `ossh.authorized_keys.update` |  |
+| `ossh.authorized_keys` | `update` |  | `# <?sshDir:~/.ssh> # updates authorized_keys from public_keys dir` | `ossh.authorized.keys.update` |  |
 | `ossh.certificates` | `update` |  | `# <sshConfigHost> <?reset> # rotate TLS cert + restore workspace on <sshConfigHost>; state-machine backed, resume by re-running; reset, yes or dryRun` |  | `ossh.certificates.update` |
 | `ossh.certificates.status` |  |  | `# <sshConfigHost> # show CERT_UPDATE machine state for <sshConfigHost>` |  | `ossh.certificates.status` |
 | `ossh.cmd` |  |  | `# <sshConfigHost> <pkg> # install pkg on the remote host if missing — remote counterpart of oo cmd` |  | `ossh.cmd` |
@@ -770,7 +770,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  |  | `ssh.key.type` | `# <sshDir> # like private.detect.ssh.key but RESULT is just the key type name (e.g. id_ed25519)` | `private.detect.ssh.key.type` ✅ | `private.detect.ssh.key.type` ✅ |
 |  | `dispatch` |  | `# <verb> <object> <args...> # find and call ossh.<object>.<verb>` | `private.ossh.dispatch` |  |
 |  |  | `objects` | `# <verb> # list all objects that have .<verb> methods` | `private.ossh.dispatch.objects` |  |
-|  | `get` | `config` | `# <sshConfigHost> <?file:~/.ssh/config> # DEPRECATED — use ossh config.get` | `private.ossh.get.config` |  |
+|  | `get` | `config` | `# <sshConfigHost> <?file:~/.ssh/config> # DEPRECATED — use ossh config.get` | `ossh.config.get` |  |
 |  |  | `current.key.file.name` | `# # gets the actual file name (instead of the best key name from get.key.name )` |  | `private.ossh.get.current.key.file.name` |
 |  |  | `file.name` | `# # gets the actual file name (instead of the best key name from get.key.name )` |  | `private.ossh.get.file.name` |
 |  |  | `key.name` | `# # creates a good key name fot this user and host` |  | `private.ossh.get.key.name` |
@@ -849,7 +849,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `ossh.key` | `pull` |  | `# <fromHost> <?remoteKeyName> <?sshDir:~/.ssh> # get the key public_keys/<?remoteKeyName> (default: the key of <fromHost>) from <fromHost>:~/.ssh/ into the LOCAL <sshDir>/public_keys/ and authorize it here — key.push the other way around; rc 1 + RESULT when the name is no file name, there is no key or it cannot be saved #` |  | `private.ossh.key.pull` |
 |  | `push` |  | `# <toHost> <?keyName> <?sshDir:~/.ssh> # add your key <sshDir>/public_keys/<?keyName> (default: the key of <sshDir>) to <toHost>: copied to its public_keys/, then its authorized_keys rebuilt by its oosh, or the key only added where it has none; rc 0 + RESULT saying which, rc 1 + RESULT when the connection, the copy or both ways of authorizing fail #` |  | `private.ossh.key.push` |
 | `ossh.oosh.init` | `push` |  | `#  # push oosh to $sshConfigHost and install it there as root (init/oosh over ssh), then finish here — the callback ossh.install gives ossh.config.parse, which sets $sshConfigHost; ossh.install sets $OSSH_INSTALL_TARGET_USER and $OSSH_INSTALL_LOG_LEVEL; the installer's key is authorized first, an oosh already there is only finished; rc 0 + RESULT when installed and finished, rc 1 + RESULT and error.log when a step fails #` |  | `private.ossh.oosh.init.push` |
-| `ossh.push` | `init` | `oosh` |  | `private.push.init.oosh` |  |
+| `ossh.push` | `init` | `oosh` |  | `private.ossh.oosh.init.push` |  |
 | `ossh.remote.key.file.name` | `get` |  | `# <fromHost> # echo the name of <fromHost>'s own oosh key: a ~/.ssh/private_key/<name>.private_key there that has its public_keys/<name>.public_key (the last one when there are several); nothing and rc 1 when it has none or the answer is no plain file name #` |  | `private.ossh.remote.key.file.name.get` |
 | `ossh.remote.public.key` | `put` |  | `# <host> <localFile> <keyFileName> # copy <localFile> to <host>:~/.ssh/public_keys/<keyFileName> (folder made when missing, a file of that name replaced; ~/.ssh made 700, a new file 600); rc 0 + RESULT when it is there, rc 1 + RESULT when the file is missing or the copy fails #` |  | `private.ossh.remote.public.key.put` |
 | `ossh.rsync` | `pull` |  | `# <src> <dest> # rsync pull with ControlMaster; falls back to scp if rsync unavailable` | `private.ossh.rsync.pull` | `private.ossh.rsync.pull` |

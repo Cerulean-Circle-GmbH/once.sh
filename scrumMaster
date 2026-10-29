@@ -11,7 +11,19 @@
 # ============================================================================
 # Measurement configuration (CMM4)
 # ============================================================================
-: ${SCRUMMASTER_METRICS_DIR:=$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics}
+: ${SCRUMMASTER_METRICS_DIR:=}
+
+private.scrumMaster.metrics.dir.get()     #  # echo the scrumMaster metrics dir: $SCRUMMASTER_METRICS_DIR when set, else the repository root of $PWD plus /session/metrics — resolved lazily, never at source time #
+{
+ # A getter consumed as $(...): stdout, no create.result. Lazy on purpose:
+ # file scope runs before `source this` has put the tree on PATH, so it must
+ # not call ogit.
+ if [ -n "$SCRUMMASTER_METRICS_DIR" ]; then
+   echo "$SCRUMMASTER_METRICS_DIR"
+ else
+   echo "$(ogit.repo.root.get)/session/metrics"
+ fi
+}
 : ${SCRUMMASTER_CAPTURE_LINES:=30}
 
 ### new.method
@@ -467,7 +479,8 @@ private.scrumMaster.metrics.save() # <agent_name> <target> # persist METRIC_ var
 {
   local agent="$1"
   local target="$2"
-  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics}"
+  local metrics_dir
+  metrics_dir=$(private.scrumMaster.metrics.dir.get)
 
   [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
 
@@ -589,7 +602,113 @@ scrumMaster.team.capture.completion.session() # # tmux session names
   tmux list-sessions -F "#{session_name}" 2>/dev/null
 }
 
-scrumMaster.pulse() # <?session> # DEPRECATED — use 'scrumMaster swipe' (pure-bash hiveMind-free drop-in; pulse KEPT as the parity oracle, zero-break). HONEST REAL-TIME team status — team.sweep OUTPUT format, but EVERY value measured LIVE at call time (never a recorded/stale reading). context% = token-math on the pane's live session JSONL; state = fresh bottom-area capture (drawer!=idle, wall/on-prompt distinct); kind = claude anywhere in the subtree. Self-contained — survives a broken/mid-refactor hiveMind.
+scrumMaster.pane.measure() # <agentName> <?session> # capture and parse metrics for one agent pane
+{ private.scrumMaster.measure.pane "$@"; }
+
+private.scrumMaster.measure.pane() # <agentName> <?session> # capture and parse metrics for one agent pane
+{
+  local agent="$1"
+  local session="${2:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+
+  if [ -z "$agent" ]; then
+    error.log "Usage: scrumMaster measure.pane <agentName>"
+    create.result 1 "missing agent name"
+    return $(result)
+  fi
+
+  local target
+  target=$(private.scrumMaster.resolve.pane "$agent" "$session")
+  if [ $? -ne 0 ]; then
+    create.result 1 "cannot resolve $agent"
+    return $(result)
+  fi
+
+  local content
+  content=$("$OOSH_DIR/otmux" pane.capture "$target" "${SCRUMMASTER_CAPTURE_LINES:-30}")
+
+  if [ -z "$content" ]; then
+    warn.log "Empty pane content for $agent ($target)"
+    create.result 1 "empty pane"
+    return $(result)
+  fi
+
+  private.scrumMaster.parse.tokens "$content"
+  private.scrumMaster.parse.timing "$content"
+  private.scrumMaster.parse.state "$content"
+
+  local savedFile
+  savedFile=$(private.scrumMaster.metrics.save "$agent" "$target")
+
+  echo "$agent ($target):"
+  echo "  tokens: up=${METRIC_TOKENS_UP:-0} down=${METRIC_TOKENS_DOWN:-0}"
+  echo "  timing: wall=${METRIC_WALL_TIME:-n/a} think=${METRIC_THINK_TIME_S:-0}s"
+  echo "  tools:  ${METRIC_TOOL_USES:-0}"
+  echo "  state:  ${METRIC_STATE:-unknown} (${METRIC_ACTIVITY:-none})"
+
+  create.result 0 "$savedFile"
+  return $(result)
+}
+
+scrumMaster.pane.measure.completion.agentName() # # agent names from the hiveMind registry
+{
+  local reg="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+  [ -f "$reg" ] && cut -d'|' -f2 "$reg" 2>/dev/null
+}
+
+scrumMaster.pane.measure.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.team.measure() # <?session> # capture metrics for all agents in a session
+{ private.scrumMaster.measure.team "$@"; }
+
+private.scrumMaster.measure.team() # <?session> # capture metrics for all agents in a session
+{
+  local session="${1:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
+  local registry="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
+
+  if [ ! -f "$registry" ]; then
+    error.log "No hiveMind registry found"
+    create.result 1 "no registry"
+    return $(result)
+  fi
+
+  echo "═══════════════════════════════════════════════"
+  echo " Team Metrics — session: $session"
+  echo "═══════════════════════════════════════════════"
+
+  local count=0
+  while IFS='|' read -r target role _stamp; do
+    [ -z "$role" ] && continue
+    echo "───────────────────────────────────────────────"
+    private.scrumMaster.measure.pane "$role" "$session"
+    count=$((count + 1))
+  done < <(grep "^${session}:" "$registry" 2>/dev/null)
+
+  echo "═══════════════════════════════════════════════"
+  echo " Measured $count agents"
+  echo "═══════════════════════════════════════════════"
+
+  create.result 0 "$count agents measured"
+  return $(result)
+}
+
+scrumMaster.team.measure.completion.session() # # tmux session names
+{
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.parameter.completion.machineName() {
+  source state 2>/dev/null
+  state.parameter.completion.machine "$@"
+}
+
+scrumMaster.parameter.completion.session() {
+  tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+scrumMaster.pulse() # <?session> # DEPRECATED — use scrumMaster swipe (pure-bash hiveMind-free drop-in; pulse KEPT as the parity oracle, zero-break). HONEST REAL-TIME team status — team.sweep OUTPUT format, but EVERY value measured LIVE at call time (never a recorded/stale reading). context% = token-math on the panes live session JSONL; state = fresh bottom-area capture (drawer!=idle, wall/on-prompt distinct); kind = claude anywhere in the subtree. Self-contained — survives a broken/mid-refactor hiveMind.
 {
   local session="${1:-}"
   echo "scrumMaster.pulse is DEPRECATED → use 'scrumMaster swipe' (pure-bash, hiveMind-free drop-in)" >&2
@@ -951,7 +1070,7 @@ private.scrumMaster.rewind.markname() # <pane> # sanitized marker filename for a
   printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_'
 }
 
-scrumMaster.rewind.mark() # <target-pane> # DECLARE a pane is DURING-REWIND — the rewind DRIVER sets this BEFORE opening the picker; pulse then shows DURING-REWIND (reliable/declared, never guessed). UNMARK after the 2-phase rewind's REREAD completes.
+scrumMaster.rewind.mark() # <target-pane> # DECLARE a pane is DURING-REWIND — the rewind DRIVER sets this BEFORE opening the picker; pulse then shows DURING-REWIND (reliable/declared, never guessed). UNMARK after the REREAD of the 2-phase rewind completes.
 {
   local target="$1"
   if [ -z "$target" ]; then
@@ -972,7 +1091,7 @@ scrumMaster.rewind.mark.completion.target() # # pane targets
   tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null
 }
 
-scrumMaster.rewind.unmark() # <target-pane> # CLEAR the DURING-REWIND declaration — the driver unsets AFTER the 2-phase rewind's REREAD completes (idempotent: no error if not marked)
+scrumMaster.rewind.unmark() # <target-pane> # CLEAR the DURING-REWIND declaration — the driver unsets AFTER the REREAD of the 2-phase rewind completes (idempotent: no error if not marked)
 {
   local target="$1"
   if [ -z "$target" ]; then
@@ -1092,7 +1211,7 @@ scrumMaster.dashboard() # <?session> # generate team health dashboard to session
 
   # Workspace root via git (reliable, avoids symlink issues)
   local workspace
-  workspace="$(git rev-parse --show-toplevel 2>/dev/null)"
+  workspace="$(ogit repo.root.get 2>/dev/null)"
   [ -z "$workspace" ] && { error.log "Cannot determine workspace root"; return 1; }
   local dashboard_file="${workspace}/session/dashboard.md"
   mkdir -p "${workspace}/session" 2>/dev/null
@@ -1104,9 +1223,9 @@ scrumMaster.dashboard() # <?session> # generate team health dashboard to session
 
   # Git status
   local git_branch git_status git_commit
-  git_branch=$(git -C "$workspace" branch --show-current 2>/dev/null)
-  git_commit=$(git -C "$workspace" log -1 --oneline 2>/dev/null)
-  if git -C "$workspace" diff --quiet 2>/dev/null && git -C "$workspace" diff --cached --quiet 2>/dev/null; then
+  git_branch=$(ogit branch.get "$workspace" 2>/dev/null)
+  git_commit=$(ogit commit.log.show HEAD 1 oneline "$workspace" 2>/dev/null)
+  if ogit status.check "$workspace" 2>/dev/null; then
     git_status="clean"
   else
     git_status="uncommitted changes"
@@ -1202,7 +1321,7 @@ scrumMaster.dashboard() # <?session> # generate team health dashboard to session
     echo "## Recent Commits"
     echo ""
     echo "\`\`\`"
-    git -C "$workspace" log --oneline -5 2>/dev/null
+    ogit commit.log.show HEAD 5 oneline "$workspace" 2>/dev/null
     echo "\`\`\`"
     echo ""
     echo "## Recovery"
@@ -1354,7 +1473,7 @@ private.scrumMaster.subscription() # # show subscription status with alert thres
   echo "  Source: ${source_label}${stale_warning}"
 
   # Save to metrics for dashboard pickup
-  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics}"
+  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(ogit repo.root.get 2>/dev/null)/session/metrics}"
   [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
   local ts_label
   ts_label=$(date -u "+%Y%m%dT%H%M%SZ")
@@ -1382,7 +1501,6 @@ private.scrumMaster.subscription() # # show subscription status with alert thres
   create.result 0 "$alert"
   return $(result)
 }
-scrumMaster.subscription.completion() { :; }
 
 scrumMaster.velocity() # # show current velocity zone with actionable directive
 {
@@ -1503,7 +1621,7 @@ scrumMaster.context.read() # <agent_name> <?session> # show context health + tok
   echo "  total:         $total tokens"
 
   # Burn rate: compare with previous reading
-  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics}"
+  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(ogit repo.root.get 2>/dev/null)/session/metrics}"
   local prev_file
   prev_file=$(ls -1t "$metrics_dir"/context.${agent}.*.env 2>/dev/null | head -1)
   if [ -n "$prev_file" ] && [ "$context_pct" != "above-threshold" ]; then
@@ -1638,7 +1756,7 @@ scrumMaster.subscription.scan() # <?session> # show overall subscription usage a
   echo "═══════════════════════════════════════════════"
 
   # Save subscription-level metric
-  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics}"
+  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(ogit repo.root.get 2>/dev/null)/session/metrics}"
   [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"
   local timestamp
   timestamp=$(date -u "+%Y%m%dT%H%M%SZ")
@@ -1904,7 +2022,7 @@ scrumMaster.velocity.check() # # velocity snapshot — subscription usage + task
   # Count today's completed tasks (commits on dev.claude today)
   local tasks_today=0
   if [ -d "$OOSH_DIR/.git" ]; then
-    tasks_today=$(git -C "$OOSH_DIR" log --oneline --since="midnight" 2>/dev/null | wc -l | tr -d ' ')
+    tasks_today=$(git -C "$OOSH_DIR" log --oneline --since="midnight" 2>/dev/null | wc -l | tr -d ' ')  # ogit-exception: date-filtered log is not in ogit.commit.log.show
   fi
 
   # Calculate burn rate via velocity.target
@@ -1938,7 +2056,7 @@ scrumMaster.velocity.check() # # velocity snapshot — subscription usage + task
   echo "VELOCITY_TIMESTAMP=$timestamp"
 
   # Persist
-  local vel_dir="$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics"
+  local vel_dir="$(ogit repo.root.get 2>/dev/null)/session/metrics"
   [ ! -d "$vel_dir" ] && mkdir -p "$vel_dir"
   local ts_file
   ts_file=$(date -u "+%Y%m%dT%H%M%SZ")
@@ -1994,7 +2112,6 @@ private.scrumMaster.velocity.target() # # calculate burn rate — too_fast, on_t
   fi
 }
 # completion stub kept for backward compat
-scrumMaster.velocity.target.completion() { :; }
 
 # DEPRECATED — use scrumMaster.evaluate
 private.scrumMaster.health.evaluate() # # single health check — subscription + velocity + verdict
@@ -2046,12 +2163,11 @@ private.scrumMaster.health.evaluate() # # single health check — subscription +
 
   # Step 5: Append to alerts log if not on_target
   if [ "$eval_result" != "on_target" ]; then
-    local alerts_log="$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics/alerts.log"
+    local alerts_log="$(ogit repo.root.get 2>/dev/null)/session/metrics/alerts.log"
     [ ! -d "$(dirname "$alerts_log")" ] && mkdir -p "$(dirname "$alerts_log")"
     echo "$timestamp $eval_result $alert" >> "$alerts_log"
   fi
 }
-scrumMaster.health.evaluate.completion() { :; }
 
 # ============================================================================
 # CMM4 PDCA Health Check — full cycle (Task 40.5)
@@ -2092,7 +2208,6 @@ private.scrumMaster.health.check() # # full PDCA health check — refresh, evalu
   echo "HEALTH_API_REFRESH=$api_ok"
   echo "HEALTH_ACTION=$([ "$eval_result" != "on_target" ] && echo "alerted" || echo "none")"
 }
-scrumMaster.health.check.completion() { :; }
 
 # ============================================================================
 # Structured KPI Logging — per-cycle metrics (Task from PO)
@@ -2104,7 +2219,7 @@ scrumMaster.metrics.collect() # <?session> # log structured KPIs for all agents
 {
   local session="${1:-$(cat "$HOME/config/hivemind.active.team" 2>/dev/null || echo projectTeam)}"
   local registry="${HIVEMIND_REGISTRY:-${CONFIG_PATH:-$HOME/config}/hivemind.roles.env}"
-  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)/session/metrics}"
+  local metrics_dir="${SCRUMMASTER_METRICS_DIR:-$(ogit repo.root.get 2>/dev/null)/session/metrics}"
   local kpi_log="$metrics_dir/kpi.log"
 
   [ ! -d "$metrics_dir" ] && mkdir -p "$metrics_dir"

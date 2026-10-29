@@ -199,7 +199,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `authorized` | `get` | [`private.ossh.authorized.key.append.get`](ossh.md) · [`private.user.authorized.key.get`](user.md) |
 | `authorized` | `rebuild` | [`private.user.authorized.keys.rebuild`](user.md) |
 | `authorized` | `update` | [`ossh.authorized.keys.update`](ossh.md) · [`user.authorized.keys.update`](user.md) |
-| `authorized_keys` | `update` | [`ossh.authorized_keys.update`](ossh.md) |
+| `authorized_keys` | `update` | [`ossh.authorized.keys.update`](ossh.md) |
 | `automount` |  | [`disk.automount`](disk.md) |
 | `automount` | `create` | [`disk.automount.create.config`](disk.md) |
 | `b` | `get` | [`ogit.merge.base.get`](ogit.md) |
@@ -854,7 +854,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `file` | `ensure` | [`private.config.session.file.ensure`](config.md) · [`private.ensure.groupWrite`](this.md) · [`private.this.file.line.ensure`](this.md) |
 | `file` | `export` | [`claudeFlow.memory.export`](claudeFlow.md) |
 | `file` | `find` | [`odocker.file.find`](odocker.md) · [`private.odocker.compose.file.find`](odocker.md) |
-| `file` | `get` | [`ossh.config.get`](ossh.md) · [`ossh.file.get.name`](ossh.md) · [`ossh.id.file.get`](ossh.md) · [`private.config.chain.names.get`](config.md) · [`private.config.oosh.session.file.get`](config.md) · [`private.config.required.file.path.get`](config.md) · [`private.config.user.session.file.get`](config.md) · [`private.oo.method.end.get`](oo.md) · [`private.os.release.get`](os.md) · [`private.ossh.config.field.get`](ossh.md) · [`private.ossh.config.last.file.get`](ossh.md) · [`private.ossh.get.config`](ossh.md) · [`private.ossh.remote.key.file.name.get`](ossh.md) · [`private.ossh.system.config.file.get`](ossh.md) · [`private.test.suite.results.file.get`](test.suite.md) · [`private.test.suite.shared.waiver.get`](test.suite.md) · [`private.this.group.file.get`](this.md) |
+| `file` | `get` | [`ossh.config.get`](ossh.md) · [`ossh.file.get.name`](ossh.md) · [`ossh.id.file.get`](ossh.md) · [`private.config.chain.names.get`](config.md) · [`private.config.oosh.session.file.get`](config.md) · [`private.config.required.file.path.get`](config.md) · [`private.config.user.session.file.get`](config.md) · [`private.oo.method.end.get`](oo.md) · [`private.os.release.get`](os.md) · [`private.ossh.config.field.get`](ossh.md) · [`private.ossh.config.last.file.get`](ossh.md) · [`ossh.config.get`](ossh.md) · [`private.ossh.remote.key.file.name.get`](ossh.md) · [`private.ossh.system.config.file.get`](ossh.md) · [`private.test.suite.results.file.get`](test.suite.md) · [`private.test.suite.shared.waiver.get`](test.suite.md) · [`private.this.group.file.get`](this.md) |
 | `file` | `import` | [`claudeFlow.memory.import`](claudeFlow.md) · [`claudeFlow.session.import`](claudeFlow.md) |
 | `file` | `list` | [`backup.file.list.notBackedUp`](backup.md) · [`backup.file.list.onlyInBackup`](backup.md) · [`backup.file.list.onlyInSource`](backup.md) · [`backup.file.list.onlyInTarget`](backup.md) · [`backup.file.list.same`](backup.md) · [`ossh.config.list`](ossh.md) · [`osx.file.metadata.list`](osx.md) · [`private.backup.file.list.notBackedUp`](backup.md) · [`private.backup.file.list.onlyInBackup`](backup.md) · [`private.backup.file.list.onlyInSource`](backup.md) · [`private.backup.file.list.onlyInTarget`](backup.md) · [`private.backup.file.list.same`](backup.md) |
 | `file` | `load` | [`otmux.buffer.load`](otmux.md) · [`path.load`](path.md) |
@@ -1821,9 +1821,9 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `ossh` | `exec` | [`ossh.exec`](ossh.md) · [`ossh.exec.tty`](ossh.md) |
 | `ossh` | `finish` | [`ossh.install.finish.local`](ossh.md) |
 | `ossh` | `fix` | [`ossh.folder.fix`](ossh.md) · [`ossh.permission.fix`](ossh.md) · [`ossh.rights.fix`](ossh.md) |
-| `ossh` | `get` | [`ossh.config.field.get`](ossh.md) · [`ossh.config.get`](ossh.md) · [`ossh.file.get.name`](ossh.md) · [`ossh.get`](ossh.md) · [`ossh.get.public.id`](ossh.md) · [`ossh.id.file.get`](ossh.md) · [`ossh.id.public.get`](ossh.md) · [`ossh.key.get.name`](ossh.md) · [`ossh.key.name.get`](ossh.md) · [`ossh.publicId.get`](ossh.md) · [`ossh.remote.prelude.get`](ossh.md) · [`ossh.server.get.ip`](ossh.md) · [`ossh.server.get.ip.darwin`](ossh.md) · [`ossh.server.get.ip.linux`](ossh.md) · [`ossh.server.get.port`](ossh.md) · [`ossh.server.ip.get`](ossh.md) · [`ossh.server.ip.get.darwin`](ossh.md) · [`ossh.server.ip.get.linux`](ossh.md) · [`ossh.server.port.get`](ossh.md) · [`ossh.ssh.parameter.get`](ossh.md) · [`ossh.url.get`](ossh.md) · [`private.get.sshDir`](ossh.md) · [`private.ossh.authorized.key.append.get`](ossh.md) · [`private.ossh.config.block.put.get`](ossh.md) · [`private.ossh.config.field.get`](ossh.md) · [`private.ossh.config.field.keyword.get`](ossh.md) · [`private.ossh.config.forwardAgent.get`](ossh.md) · [`private.ossh.config.hostName.get`](ossh.md) · [`private.ossh.config.identitiesOnly.get`](ossh.md) · [`private.ossh.config.identityFile.get`](ossh.md) · [`private.ossh.config.last.file.get`](ossh.md) · [`private.ossh.config.port.get`](ossh.md) · [`private.ossh.config.proxyJump.get`](ossh.md) · [`private.ossh.config.user.get`](ossh.md) · [`private.ossh.connection.error.get`](ossh.md) · [`private.ossh.control.path.get`](ossh.md) · [`private.ossh.control.path.resolved.get`](ossh.md) · [`private.ossh.get.config`](ossh.md) · [`private.ossh.get.current.key.file.name`](ossh.md) · [`private.ossh.get.file.name`](ossh.md) · [`private.ossh.get.key.name`](ossh.md) · [`private.ossh.get.public.id`](ossh.md) · [`private.ossh.get.server.ip`](ossh.md) · [`private.ossh.get.server.port`](ossh.md) · [`private.ossh.get.server.port.wrapper`](ossh.md) · [`private.ossh.get.ssh.parameter`](ossh.md) · [`private.ossh.get.url`](ossh.md) · [`private.ossh.host.fqdn.get`](ossh.md) · [`private.ossh.remote.key.file.name.get`](ossh.md) · [`private.ossh.system.config.file.get`](ossh.md) · [`private.ossh.system.known.hosts.get`](ossh.md) · [`private.ossh.user.homes.get`](ossh.md) |
+| `ossh` | `get` | [`ossh.config.field.get`](ossh.md) · [`ossh.config.get`](ossh.md) · [`ossh.file.get.name`](ossh.md) · [`ossh.get`](ossh.md) · [`ossh.get.public.id`](ossh.md) · [`ossh.id.file.get`](ossh.md) · [`ossh.id.public.get`](ossh.md) · [`ossh.key.get.name`](ossh.md) · [`ossh.key.name.get`](ossh.md) · [`ossh.publicId.get`](ossh.md) · [`ossh.remote.prelude.get`](ossh.md) · [`ossh.server.get.ip`](ossh.md) · [`ossh.server.get.ip.darwin`](ossh.md) · [`ossh.server.get.ip.linux`](ossh.md) · [`ossh.server.get.port`](ossh.md) · [`ossh.server.ip.get`](ossh.md) · [`ossh.server.ip.get.darwin`](ossh.md) · [`ossh.server.ip.get.linux`](ossh.md) · [`ossh.server.port.get`](ossh.md) · [`ossh.ssh.parameter.get`](ossh.md) · [`ossh.url.get`](ossh.md) · [`private.get.sshDir`](ossh.md) · [`private.ossh.authorized.key.append.get`](ossh.md) · [`private.ossh.config.block.put.get`](ossh.md) · [`private.ossh.config.field.get`](ossh.md) · [`private.ossh.config.field.keyword.get`](ossh.md) · [`private.ossh.config.forwardAgent.get`](ossh.md) · [`private.ossh.config.hostName.get`](ossh.md) · [`private.ossh.config.identitiesOnly.get`](ossh.md) · [`private.ossh.config.identityFile.get`](ossh.md) · [`private.ossh.config.last.file.get`](ossh.md) · [`private.ossh.config.port.get`](ossh.md) · [`private.ossh.config.proxyJump.get`](ossh.md) · [`private.ossh.config.user.get`](ossh.md) · [`private.ossh.connection.error.get`](ossh.md) · [`private.ossh.control.path.get`](ossh.md) · [`private.ossh.control.path.resolved.get`](ossh.md) · [`ossh.config.get`](ossh.md) · [`private.ossh.get.current.key.file.name`](ossh.md) · [`private.ossh.get.file.name`](ossh.md) · [`private.ossh.get.key.name`](ossh.md) · [`private.ossh.get.public.id`](ossh.md) · [`private.ossh.get.server.ip`](ossh.md) · [`private.ossh.get.server.port`](ossh.md) · [`private.ossh.get.server.port.wrapper`](ossh.md) · [`private.ossh.get.ssh.parameter`](ossh.md) · [`private.ossh.get.url`](ossh.md) · [`private.ossh.host.fqdn.get`](ossh.md) · [`private.ossh.remote.key.file.name.get`](ossh.md) · [`private.ossh.system.config.file.get`](ossh.md) · [`private.ossh.system.known.hosts.get`](ossh.md) · [`private.ossh.user.homes.get`](ossh.md) |
 | `ossh` | `harden` | [`ossh.harden`](ossh.md) · [`ossh.harden.fail2ban`](ossh.md) · [`ossh.harden.firewall`](ossh.md) · [`ossh.harden.packages`](ossh.md) · [`ossh.harden.sshd`](ossh.md) · [`ossh.harden.sshd.allowusers`](ossh.md) · [`ossh.harden.unattended.upgrades`](ossh.md) · [`private.ossh.harden.preflight`](ossh.md) |
-| `ossh` | `init` | [`private.certificates.update.state.machine.init`](ossh.md) · [`private.push.init.oosh`](ossh.md) |
+| `ossh` | `init` | [`private.certificates.update.state.machine.init`](ossh.md) · [`private.ossh.oosh.init.push`](ossh.md) |
 | `ossh` | `install` | [`ossh.create.and.install`](ossh.md) · [`ossh.install`](ossh.md) · [`ossh.install.user.remote`](ossh.md) · [`ossh.prereqs.install`](ossh.md) · [`private.ossh.install.key.authorize`](ossh.md) |
 | `ossh` | `is` | [`private.ossh.connection.error.network.is`](ossh.md) · [`private.ossh.github.block.is.oosh`](ossh.md) |
 | `ossh` | `isInstalled` | [`ossh.isInstalled`](ossh.md) |
@@ -1856,7 +1856,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `ossh` | `stop` | [`private.check.certificates.update.stop.certbot`](ossh.md) · [`private.check.certificates.update.stop.structr`](ossh.md) |
 | `ossh` | `strip` | [`private.ossh.folder.fix.config.strip.legacy`](ossh.md) |
 | `ossh` | `test` | [`ossh.test`](ossh.md) |
-| `ossh` | `update` | [`ossh.authorized.keys.update`](ossh.md) · [`ossh.authorized_keys.update`](ossh.md) · [`ossh.certificates.update`](ossh.md) · [`private.certificates.update.config.persist`](ossh.md) · [`private.certificates.update.machine.name`](ossh.md) · [`private.check.certificates.update.archive.workspace`](ossh.md) |
+| `ossh` | `update` | [`ossh.authorized.keys.update`](ossh.md) · [`ossh.authorized.keys.update`](ossh.md) · [`ossh.certificates.update`](ossh.md) · [`private.certificates.update.config.persist`](ossh.md) · [`private.certificates.update.machine.name`](ossh.md) · [`private.check.certificates.update.archive.workspace`](ossh.md) |
 | `ossh` | `verify` | [`private.check.certificates.update.verify.https`](ossh.md) |
 | `ossh` | `write` | [`private.ossh.config.deploy.write`](ossh.md) |
 | `osshLayout` |  | [`osshLayout.id.from.email`](osshLayout.md) · [`osshLayout.role.developking`](osshLayout.md) · [`osshLayout.role.installer`](osshLayout.md) · [`osshLayout.role.outeruser`](osshLayout.md) · [`osshLayout.role.owner`](osshLayout.md) · [`private.osshLayout.owner.email`](osshLayout.md) · [`private.osshLayout.staged.dir`](osshLayout.md) · [`private.osshLayout.staged.email`](osshLayout.md) |
@@ -2280,7 +2280,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `public` | `put` | [`private.ossh.remote.public.key.put`](ossh.md) |
 | `publicId` | `get` | [`ossh.publicId.get`](ossh.md) |
 | `pulse` |  | [`scrumMaster.pulse`](scrumMaster.md) |
-| `push` | `init` | [`private.push.init.oosh`](ossh.md) |
+| `push` | `init` | [`private.ossh.oosh.init.push`](ossh.md) |
 | `push` | `source` | [`private.promote.push.source.branch`](promote.md) |
 | `put` | `get` | [`private.ossh.config.block.put.get`](ossh.md) |
 | `pyenv` |  | [`private.opy.pyenv`](opy.md) |
@@ -2727,7 +2727,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `sshConfigHost` | `delete` | [`ossh.config.delete`](ossh.md) |
 | `sshConfigHost` | `deploy` | [`ossh.config.shared.seed.from.local.deploy.key`](ossh.md) |
 | `sshConfigHost` | `discover` | [`ossh.pm.discover`](ossh.md) |
-| `sshConfigHost` | `get` | [`ossh.config.get`](ossh.md) · [`ossh.ssh.parameter.get`](ossh.md) · [`ossh.url.get`](ossh.md) · [`private.ossh.get.config`](ossh.md) · [`private.ossh.get.ssh.parameter`](ossh.md) · [`private.ossh.get.url`](ossh.md) |
+| `sshConfigHost` | `get` | [`ossh.config.get`](ossh.md) · [`ossh.ssh.parameter.get`](ossh.md) · [`ossh.url.get`](ossh.md) · [`ossh.config.get`](ossh.md) · [`private.ossh.get.ssh.parameter`](ossh.md) · [`private.ossh.get.url`](ossh.md) |
 | `sshConfigHost` | `harden` | [`ossh.harden`](ossh.md) · [`ossh.harden.fail2ban`](ossh.md) · [`ossh.harden.firewall`](ossh.md) · [`ossh.harden.packages`](ossh.md) · [`ossh.harden.sshd`](ossh.md) · [`ossh.harden.sshd.allowusers`](ossh.md) · [`ossh.harden.unattended.upgrades`](ossh.md) · [`private.ossh.harden.preflight`](ossh.md) |
 | `sshConfigHost` | `install` | [`ossh.create.and.install`](ossh.md) · [`ossh.install`](ossh.md) · [`ossh.install.user.remote`](ossh.md) · [`ossh.prereqs.install`](ossh.md) · [`private.ossh.install.key.authorize`](ossh.md) |
 | `sshConfigHost` | `log` | [`ossh.install.log`](ossh.md) |
@@ -2767,7 +2767,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `sshDir` | `restore` | [`user.ssh.restore`](user.md) |
 | `sshDir` | `strip` | [`private.ossh.folder.fix.config.strip.legacy`](ossh.md) |
 | `sshDir` | `tighten` | [`private.osshLayout.perms.tighten`](osshLayout.md) |
-| `sshDir` | `update` | [`ossh.authorized.keys.update`](ossh.md) · [`ossh.authorized_keys.update`](ossh.md) · [`user.authorized.keys.update`](user.md) · [`user.update.authorized_keys`](user.md) |
+| `sshDir` | `update` | [`ossh.authorized.keys.update`](ossh.md) · [`ossh.authorized.keys.update`](ossh.md) · [`user.authorized.keys.update`](user.md) · [`user.authorized.keys.update`](user.md) |
 | `sshFlags` |  | [`private.ossh.ssh`](ossh.md) |
 | `sshHost` | `delegate` | [`hiveMind.task.delegate`](hivemind.md) |
 | `sshHost` | `migrate` | [`hiveMind.team.migrate`](hivemind.md) |
@@ -3210,7 +3210,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `user` | `run` | [`private.setup.nvm.run`](setup.md) |
 | `user` | `save` | [`path.file.user.save`](path.md) |
 | `user` | `set` | [`path.file.user.set`](path.md) · [`private.ossh.config.user.set`](ossh.md) · [`user.password.set`](user.md) · [`user.password.set.darwin`](user.md) · [`user.password.set.linux`](user.md) · [`user.ssh.set.key.name`](user.md) |
-| `user` | `update` | [`user.authorized.keys.update`](user.md) · [`user.update.authorized_keys`](user.md) |
+| `user` | `update` | [`user.authorized.keys.update`](user.md) · [`user.authorized.keys.update`](user.md) |
 | `userHome` | `ensure` | [`private.oo.user.shared.symlinks.ensure`](oo.md) |
 | `userName` | `login` | [`user.login`](user.md) |
 | `username` |  | [`c2.user`](c2.md) · [`private.as.user`](user.md) |
