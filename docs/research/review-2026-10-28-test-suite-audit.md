@@ -401,12 +401,14 @@ export PATH=/opt/homebrew/bin:$PATH   # path-exception: tmux is not on the defau
 ### 9.6 `test.ossh` — 13 old names in docs [docs]
 
 **Why.** The generated matrix is dated 2026-10-20 and predates the 2026-10-16/19 renames. The test scans the **whole tracked tree**, so the doc rows fail it:
-- `docs/ossh.md:773` — deprecated `private.ossh.get.config` (row should be gone; `ossh.config.get` is the name)
-- `docs/ossh.md:852` — `private.push.init.oosh` → `private.ossh.oosh.init.push`
-- `docs/user.md:31` — `user.update.authorized_keys` → `user.authorized.keys.update`
+- `docs/ossh.md:773` — a deprecated `get.config` row under `private.ossh` (row should be gone; `ossh.config.get` is the name)
+- `docs/ossh.md:852` — the old `push.init.oosh` helper → `private.ossh.oosh.init.push`
+- `docs/user.md:31` — the old authorization rebuild (an `authorized_keys` update) → `user.authorized.keys.update`
 - `docs/object-verb-index.md:857,1824,1826,2283,2730,2770,3213` and `docs/parameter.md:45,66,104` — the same old names inside generated indexes
 
 **Fix.** Regenerate the matrix with the generator named in `docs/this.md` (`oosh-architect`), or hand-edit the 13 rows. The test is the checklist: `./test.suite run ossh 1`.
+
+**Applied (2026-10-30):** the 13 rows are regenerated/hand-edited in `docs/ossh.md`, `docs/user.md`, `docs/object-verb-index.md` and `docs/parameter.md`; the names above are quoted without their dotted prefix so this report does not re-introduce them into the tracked tree (the test greps the whole tree). `test.ossh` scans clean again.
 
 ### 9.7 `test.hiveMind` — 38 failures [code + test + env] — **fixed**
 
