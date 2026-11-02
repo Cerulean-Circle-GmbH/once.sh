@@ -200,19 +200,32 @@ adopted keys.
   red-first: without the patch the test reports `adoptedMode=…:-rw-------`; with it,
   `test.user` is 69/69.
 - **F2:** not fixed — it needs `osshLayout.role.installer` with an installer identity.
-- **F6, config:** all three WODA aliases now log in as `developking` with the developking
-  identity — `User developking`, `IdentityFile ~/.ssh/ids/ssh.developking/id_rsa` +
-  `IdentitiesOnly yes` — applied with `./ossh config.set` (backups `~/.ssh/config.bak-*`, mode
-  still 600). `mcstudio` and `shaan` untouched. Auth is still denied everywhere: the key is not
-  authorized on `178.254.18.182`, and `cerulean.it` still times out (F4).
+- **F6, config:** `WODA.test` and `WODA.dev` log in as `developking` with
+  `IdentityFile ~/.ssh/ids/ssh.developking/id_rsa`; `WODA.dev.root` keeps `User root` and the
+  user's own `~/.ssh/id_ed25519`. All three carry `IdentitiesOnly yes`, applied with
+  `./ossh config.set` (backups `~/.ssh/config.bak-*`, mode 600). The `mcstudio` Host and the
+  `shaan` Host alias in root's config are untouched. Auth is still denied everywhere: the key is
+  not authorized on `178.254.18.182`, and `cerulean.it` still times out (F4).
 - **F6, test:** `test/test.ssh.config.woda` now checks each expected line **inside its Host
-  block** (awk block extraction) and expects `User developking` for `WODA.test`,
-  `WODA.dev.root` and `WODA.dev`. The old tree-wide `grep -Fq` let one block satisfy another's
+  block** (awk block extraction): `User developking` for `WODA.test` and `WODA.dev`, `User root`
+  for `WODA.dev.root`. The old tree-wide `grep -Fq` let one block satisfy another's
   requirement — it is what let the WODA.test change pass silently on 2026-11-02. Verified
   red → green and with a mutated fixture (`WODA.test` without its `User` line is reported even
   though the other blocks have it).
-  Because `WODA.dev.root` is now developking too, its name no longer describes the login;
-  renaming the alias is a separate decision.
+- **F6, other users:** the same WODA settings (then `User root` + `~/.ssh/id_ed25519` for
+  `WODA.dev.root`) were applied to `developking` and `shaan`
+  (`CURRENT_SSH_DIR=/home/<u>/.ssh ./ossh config.set …`, then `chown <u>:<u>` + 600 because
+  `private.this.file.write` replaces the file). Their extra Hosts (`ubuntu_24_04`,
+  `alpine_3_19`) are untouched. `ssh -G` resolves as expected for both, and
+  `test.suite run ssh.config.woda` is 3/3 as root, developking and shaan. Backups: one
+  `~/.ssh/config.bak-*` (and `/home/<u>/.ssh/config.bak-*`) per change.
+- **F6, platform test:** `test/platform.ssh.config.woda.portable` required exactly
+  `IdentityFile ~/.ssh/id_ed25519` for every WODA host, which contradicted its own contract
+  ("the portable `~/.ssh` form"). It now accepts any `~/.ssh/...` path and still rejects
+  `/home/<user>/...`; 5/5 as root, developking and shaan.
+- **F6, generator:** not yet changed — `user:379-410` still writes `User root` +
+  `~/.ssh/id_ed25519` for new users/installs (append-if-missing, so it does not migrate
+  existing files either).
 - **F3, attempted:** `ssh-copy-id -i ~/.ssh/ids/ssh.developking/id_rsa.pub root@178.254.18.182`
   cannot complete — the host rejects both keys we hold (`root@ubuntu2404` and the developking
   RSA) and offers `publickey,password`; this environment has no ssh-agent, no stored credential
