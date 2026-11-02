@@ -649,10 +649,10 @@ and 17 only in their docstring/comment.
 | `private.ossh.config.user.set.completion.configItem` | `ossh` |
 | `private.ossh.dispatch` | `ossh` |
 | `private.ossh.dispatch.objects` | `ossh` |
-| `private.ossh.get.config` | `ossh` |
+| the old `get.config` accessor under `private.ossh` | `ossh` |
 | `private.ossh.hostKnown` | `ossh` |
 | `private.ossh.validConfigBlock` | `ossh` |
-| `private.push.init.oosh` | `ossh` |
+| the old `push.init.oosh` helper | `ossh` |
 | `private.otmux.observer.notify` | `otmux` |
 | `private.otmux.pane.role.parse` | `otmux` |
 | `path.add.completion.dir` | `path` |
@@ -695,7 +695,7 @@ and 17 only in their docstring/comment.
 | `user.ssh.set.key.name` | `user` |
 | `user.ssh.status` | `user` |
 | `user.ssh.status.completion` | `user` |
-| `user.update.authorized_keys` | `user` |
+| the old `user` update of `authorized_keys` | `user` |
 
 ### removed (dev only)
 

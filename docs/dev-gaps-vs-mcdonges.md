@@ -95,7 +95,7 @@ Typical pairs (full tables in `docs/method-differences-dev-vs-mcdonges.md` and
 | `private.odocker.ensure.socket.access` | `private.odocker.socket.access.ensure` |
 | `debug.step` under its old name `step` | `debug.step` |
 | `ossh.authorized_keys.update` | `ossh.authorized.keys.update` (dev delegates to `user authorized.keys.update`) |
-| `user.update.authorized_keys` | `ossh.authorized.keys.update` |
+| the old `user` rebuild of `authorized_keys` | `ossh.authorized.keys.update` |
 | `user.ssh.rootkey.*` | `ossh.key.push` / `ossh.key.revoke` / `private.ossh.remote.public.key.put` |
 | `backup.source`, `backup.target` | `backup.from`, `backup.to` (mcdonges just adds aliases) |
 
@@ -153,7 +153,7 @@ The no-python migration is **ahead on mcdonges but not finished there either** (
 - `ossh get/set` and `ossh.scp`: unused on `mcdonges` as well.
 - `config.folder.create` / `config.path.create`: deprecated on `mcdonges`; `dev`'s
   `test/test.config:2650` asserts they are gone on purpose.
-- `user.ssh.rootkey.*`, `user.update.authorized_keys`, `ossh.authorized_keys.update`: moved or
+- `user.ssh.rootkey.*`, the old `user` update of `authorized_keys`, `ossh.authorized_keys.update`: moved or
   de-duplicated on `dev` (`ossh.key.*`, `ossh.authorized.keys.update`, `user authorized.keys.update`).
 - `step`: renamed `debug.step` on `dev`.
 - `ossh.harden`, `ossh.config.shared.*`, `ossh.folder.fix`, `ossh.cmd/prereqs`, `ossh.key.revoke`,

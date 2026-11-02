@@ -40,7 +40,7 @@ behaviour** — but dev also carries ~100 methods of real feature work that mcdo
 | Filesystem completions (`*.completion.dir`, `*.completion.sshDir`) | 6 | `01c868f5` — 2026-03-31 |
 | `config.pull` validation helpers `private.ossh.hostKnown`, `private.ossh.validConfigBlock` | 2 | `15012c42` — 2026-07-15 |
 | `private.ossh.config.deploy.write` (config.create appends the Host block to `~/.ssh/config`) | 1 | `c3a905bc` — 2026-08-29 |
-| Legacy 2022 helpers that dev deleted (`ossh.push.*`, `ossh.pull.*`, `ossh.scp`, `private.push.init.oosh`, …) | 15 | pre-history |
+| Legacy 2022 helpers that dev deleted (`ossh.push.*`, `ossh.pull.*`, `ossh.scp`, the old `push.init.oosh` helper, …) | 15 | pre-history |
 
 **dev-only (129), by feature** (buckets sum to 129):
 
@@ -84,7 +84,7 @@ mcdonges also keeps **thin verb-first aliases** that dev deleted outright:
 | `ossh.push.config`, `ossh.pull.config` | `ossh.config.push` / `ossh.config.pull` |
 | `ossh.push.dir`, `ossh.pull.dir` | `ossh.dir.push` / `ossh.dir.pull` |
 | `ossh.push.id`, `ossh.pull.id` | `ossh.id.push` / `ossh.id.pull` |
-| `private.push.init.oosh` | remote installer (dev renamed it `private.ossh.oosh.init.push`) |
+| the old `push.init.oosh` helper | remote installer (dev renamed it `private.ossh.oosh.init.push`) |
 
 All of them are marked `DEPRECATED — use …` in their own docstring; dev deleted the wrappers
 instead of keeping both names. `ossh.scp` is the exception: it is a real method (ControlMaster
@@ -108,8 +108,8 @@ different implementations.
 |---|---:|---|
 | Config | 41 | dev: field keyword validation, `create.result`/`RESULT` contract, per-field get/set split; mcdonges: a simpler `type -t` setter dispatch |
 | Connection / exec | 10 | dev routes through `private.ossh.ssh` + `ossh.remote.prelude.get`; mcdonges calls raw `ssh` and `source config/user.env` |
-| Key / id | 5 | dev pushes the Host's `IdentityFile` key, verifies the login, enforces 644; mcdonges rsyncs a named key and runs `user update.authorized_keys` |
-| Install | 5 | dev: `install → config.parse → private.ossh.oosh.init.push`, log level, target user; mcdonges: one-shot `private.push.init.oosh` |
+| Key / id | 5 | dev pushes the Host's `IdentityFile` key, verifies the login, enforces 644; mcdonges rsyncs a named key and runs the `authorized_keys` update on `user` |
+| Install | 5 | dev: `install → config.parse → private.ossh.oosh.init.push`, log level, target user; mcdonges: the one-shot `push.init.oosh` helper |
 | Dir/id transfer | 5 | shared `private.ossh.rsync` refactor on both sides, different argument handling |
 | List/status/usage/other | 12 | new verbs in `--help`, status detail, `ossh.test`, `ossh.url.get` |
 
@@ -136,7 +136,7 @@ fields on error.
 creates the folders itself and copies the key pair, with a comment saying why.
 
 **`ossh.key.push`** — mcdonges is a 26-line inline push (rsync + remote
-`user update.authorized_keys`, no login check). dev is a 9-line wrapper over
+the `authorized_keys` update on `user`, no login check). dev is a 9-line wrapper over
 `private.ossh.key.push`, which pushes the key the Host entry actually logs in with and then
 verifies the login.
 
@@ -145,7 +145,7 @@ verifies the login.
 | Call | dev | mcdonges |
 |---|:--:|:--:|
 | `ossh key.push` / `key.pull` | Y | Y |
-| `ossh push.key` / `pull.key` (legacy) | – | Y |
+| `ossh` `push.key` / `pull.key` (legacy) | – | Y |
 | `ossh key.revoke` | Y | – |
 | `ossh authorized.keys.update` | Y | – |
 | `ossh authorized_keys.update` | – | Y |
@@ -181,7 +181,7 @@ verifies the login.
 - **Port the mcdonges tests forward too**: `test/test.ossh` on mcdonges has no
   `T-OSSH-RENAMES-OBJECT-VERB` guard, which is why legacy names still live there. dev's guard
   (and the core suite) is what keeps the rename from drifting back.
-- If a script of yours still calls `ossh push.key`, `ossh pull.*`, `ossh server.ip.get`,
+- If a script of yours still calls `ossh` `push.key`, `ossh` `pull.*`, `ossh server.ip.get`,
   `ossh authorized_keys.update` or `ossh get …`, it works on mcdonges and breaks on dev —
   that is the only class of breakage hiding in this diff.
 
