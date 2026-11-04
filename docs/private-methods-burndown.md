@@ -62,7 +62,7 @@ mention in a comment or doc):
 | `private.hiveMind.pane.model` | `hiveMind:3435` | model flag from a running claude's ps args |
 | `private.hiveMind.workers.legacy` | `hiveMind:2019` | worker list via agentRoom / pane titles |
 | `private.oo.dev.to.testing` | `oo:787` | promote dev to testing, gated by core tests |
-| `private.ossh.dir.push.completion` | `ossh:3097` | old whole-method completion |
+| `private.ossh.dir.push.completion` | deleted 2026-11-04 | old whole-method completion |
 | `private.ossh.get.current.key.file.name` | `ossh:1943` | predecessor of `private.ossh.get.file.name` |
 | `private.ossh.get.server.port.wrapper` | `ossh:2413` | two-line wrapper |
 | `private.otmux.capturePane` | `otmux:560` | camelCase predecessor of `otmux.pane.capture` |
@@ -73,6 +73,10 @@ mention in a comment or doc):
 | `private.otmux.swapPane` | `otmux:480` | swap two panes |
 | `private.platform.sshd.reload` | `platform:67` | sshd re-exec (odocker has its own copy) |
 | `private.scrumMaster.subscription` | `scrumMaster:1360` | pre-`subscription.api.*` monolith |
+
+2026-11-04: the `private.ossh.*.push.completion` pair was deleted (`config.push.completion`
+was missing from this list; both were byte-identical duplicates of their public wrappers). The
+dead list therefore has 19 rows of the original 21, and `ossh` is at 80 private methods.
 | `private.scrumMaster.subscription.api.legacy` | `scrumMaster:1918` | the same, self-described legacy |
 | `private.testNames` | `otest:709` | thin python-discovery shim (only `.camel` is used) |
 

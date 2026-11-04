@@ -4,6 +4,8 @@ Generated 2026-11-02. Companion to `docs/method-differences-dev-vs-mcdonges.md`.
 
 > **Update 2026-11-04:** `private.ossh.key.push` / `private.ossh.key.pull` were collapsed into
 > the public methods; the rows below still describe the 2026-11-02 tree.
+> **Update 2026-11-04 (2):** `private.ossh.config.push.completion` and
+> `private.ossh.dir.push.completion` were deleted (no caller, byte-identical to the public ones).
 Everything is measured on the two branch tips: `dev` = `7ab831d9`, `mcdonges.latest` = `760552c7`.
 
 ## 1. Size and vintage

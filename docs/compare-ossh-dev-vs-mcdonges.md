@@ -9,6 +9,10 @@ Generated 2026-11-03 from the two branch tips (`dev` = `7ab831d9`, `mcdonges.lat
 > below describe the 2026-11-03 snapshot.
 > **Update 2026-11-04 (2):** `private.ossh.key.push` and `private.ossh.key.pull` were collapsed
 > into the public methods; the private rows in the one-sided lists are historical.
+> **Update 2026-11-04 (3):** `private.ossh.config.push.completion` and
+> `private.ossh.dir.push.completion` were deleted — they had no caller and duplicated the public
+> `ossh.*.push.completion` bodies byte for byte. This moves `dev` closer to `mcdonges`, which never
+> had the private copies.
 
 Companion: `docs/ossh-differences-dev-vs-mcdonges.md` (history, rename map, size analysis).
 

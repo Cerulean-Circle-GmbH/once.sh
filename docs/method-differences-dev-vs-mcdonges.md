@@ -2,6 +2,11 @@
 
 Generated 2026-11-02 from the two branch tips `7ab831d9` (dev) and `760552c7` (mcdonges.latest).
 
+> **Update 2026-11-04:** `private.ossh.key.push` / `private.ossh.key.pull` were collapsed into the
+> public methods, and `private.ossh.config.push.completion` / `private.ossh.dir.push.completion`
+> were deleted as unused duplicates of the public helpers. The rows below describe the 2026-11-02
+> tree; the private `ossh` rows in the one-sided lists are historical.
+
 A *method* here is a top-level bash function: a line starting at column 1 with
 `name()` or `function name`. Its block runs from that line to the line before the next
 definition, so the docstring and any `test.case` / `expect` wiring directly below it count as
