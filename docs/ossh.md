@@ -244,6 +244,9 @@ ossh key.push myhost
 # Pull a remote host's key here and let it log in to this computer
 ossh key.pull myhost
 
+# Revoke a key on a remote host: move it to deactive.public_keys/ and rebuild
+ossh key.revoke myhost old.public_key
+
 # Put the Host block demo into a remote host's SSH config (replaced there, or added)
 ossh config.push myhost demo
 
@@ -620,6 +623,7 @@ OpenSSH reads two system files for **every** user, so oosh writes GitHub there o
 | `ossh login` | Interactive SSH login |
 | `ossh key.push` | Push SSH key to remote host |
 | `ossh key.pull` | Pull a remote host's SSH key here and authorize it (`<fromHost> <?remoteKeyName> <?sshDir>`) |
+| `ossh key.revoke` | Revoke a key on a remote host: move it to `deactive.public_keys/` and rebuild (`<fromHost> <remoteKeyName>`) |
 | `ossh authorized.keys.update` | Rebuild authorized_keys from public_keys/ (atomic; rc 1 when no ssh is set up) |
 | `ossh id.create` | Create new SSH key pair |
 | `ossh list` | List configured hosts |
@@ -731,6 +735,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `ossh.key` | `get` | `name` | `# # creates a good key name fot this user and host` |  | `ossh.key.get.name` |
 |  | `pull` |  | `# <fromHost> <?remoteKeyName> <?sshDir:~/.ssh> # gets the key of <fromHost> (or public_keys/<?remoteKeyName> there) from <fromHost>:~/.ssh/ into the LOCAL <sshDir>/public_keys/ and authorizes it here — key.push the other way around #` | `ossh.key.pull` | `ossh.key.pull` |
 |  | `push` |  | `# <toHost> <?keyName> <?sshDir:~/.ssh> # adds your key to host <toHost> optional you can specify another <?keyName> from <sshDir>/public_keys/ #` | `ossh.key.push` | `ossh.key.push` |
+|  | `revoke` |  | `# <fromHost> <remoteKeyName> # take the key public_keys/<remoteKeyName> away on <fromHost>: moved to its deactive.public_keys/, then its authorized_keys rebuilt by its oosh, so the key no longer logs in; rc 0 + RESULT, rc 1 + RESULT when an argument is missing, <remoteKeyName> has a slash or a quote, the connection fails, the key is not there or <fromHost> has no oosh #` |  | `ossh.key.revoke` |
 |  | `set` | `name` | `# <?sshKeyName> # sets the key name to sshKeyName and saves it in $CONFIG_PATH/ssh.info.env` |  | `ossh.key.set.name` |
 | `ossh.key.folder` | `create` |  | `# <?sshDir:~/.ssh> # if the .ssh folder was not created with ossh it fixes its structure` | `ossh.key.folder.create` |  |
 |  | `delete` |  | `# <?sshDir:~/.ssh> # cleans the .ssh folder to a standard layout....may cause data loss!` | `ossh.key.folder.delete` |  |
