@@ -746,15 +746,11 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `ossh.publicId` | `get` |  | `# <?id> <?sshDir:~/.ssh> # prints the public key of <id> to the console` |  | `ossh.publicId.get` |
 | `ossh.remote.prelude` | `get` |  | `#  # echo the command prefix that stands a non-interactive shell up (ssh command, runuser/sudo -u, docker exec): ~/config/user.env when present, else ~/oosh on PATH; POSIX, expanded by the target shell #` |  | `ossh.remote.prelude.get` |
 | `ossh.rights` | `fix` |  | `# <?sshDir:~/.ssh> # canonical perms on sshDir (alias for private.osshLayout.perms.tighten)` |  | `ossh.rights.fix` |
-| `ossh.server` | `get` | `ip` |  |  | `ossh.server.get.ip` |
-|  |  | `ip.darwin` |  |  | `ossh.server.get.ip.darwin` |
-|  |  | `ip.linux` |  |  | `ossh.server.get.ip.linux` |
-|  |  | `port` |  |  | `ossh.server.get.port` |
 | `ossh.server.config` | `edit` |  |  | `ossh.server.config.edit` ✅ | `ossh.server.config.edit` ✅ |
-| `ossh.server.ip` | `get` |  |  | `ossh.server.ip.get` |  |
-|  |  | `darwin` |  | `ossh.server.ip.get.darwin` |  |
-|  |  | `linux` |  | `ossh.server.ip.get.linux` |  |
-| `ossh.server.port` | `get` |  | `# # get SSH server port from sshd_config` | `ossh.server.port.get` |  |
+| `ossh.server.ip` | `get` |  |  | `ossh.server.ip.get` | `ossh.server.ip.get` |
+|  |  | `darwin` |  | `ossh.server.ip.get.darwin` | `ossh.server.ip.get.darwin` |
+|  |  | `linux` |  | `ossh.server.ip.get.linux` | `ossh.server.ip.get.linux` |
+| `ossh.server.port` | `get` |  | `# # get SSH server port from sshd_config` | `ossh.server.port.get` | `ossh.server.port.get` |
 | `ossh.service.status.darwin` |  |  |  | `ossh.service.status.darwin` ✅ | `ossh.service.status.darwin` ✅ |
 | `ossh.service.status.linux` |  |  |  | `ossh.service.status.linux` ✅ | `ossh.service.status.linux` ✅ |
 | `ossh.service.status.unknown` |  |  |  | `ossh.service.status.unknown` ✅ | `ossh.service.status.unknown` ✅ |
