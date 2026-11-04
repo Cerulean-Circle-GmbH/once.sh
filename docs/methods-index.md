@@ -11,7 +11,7 @@ Cross-indexes: [object-verb-index.md](object-verb-index.md) · [parameter.md](pa
 |---|---|--:|--:|--:|--:|--:|--:|--:|
 | `otmux` | [otmux.md](otmux.md) | 226 | 93 | 319 | 48 | 55 | 216 | 165 |
 | `hiveMind` | [hivemind.md](hivemind.md) | 158 | 135 | 293 | 174 | 19 | 100 | 33 |
-| `ossh` | [ossh.md](ossh.md) | 105 | 97 | 202 | 33 | 101 | 68 | 16 |
+| `ossh` | [ossh.md](ossh.md) | 105 | 95 | 200 | 33 | 99 | 68 | 16 |
 | `claudeFlow` | [claudeFlow.md](claudeFlow.md) | 127 | 0 | 127 | 0 | 0 | 127 | 112 |
 | `oo` | [oo.md](oo.md) | 43 | 55 | 98 | 6 | 47 | 45 | 19 |
 | `claudeCode` | [claudeCode.md](claudeCode.md) | 73 | 15 | 88 | 17 | 8 | 63 | 39 |

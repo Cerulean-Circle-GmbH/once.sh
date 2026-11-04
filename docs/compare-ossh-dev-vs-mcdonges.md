@@ -7,6 +7,8 @@ Generated 2026-11-03 from the two branch tips (`dev` = `7ab831d9`, `mcdonges.lat
 > **Update 2026-11-04:** `dev` renamed `ossh.server.get.ip*` and `ossh.server.get.port` to
 > `ossh.server.ip.get*` / `ossh.server.port.get`, matching this page's mcdonges column. The rows
 > below describe the 2026-11-03 snapshot.
+> **Update 2026-11-04 (2):** `private.ossh.key.push` and `private.ossh.key.pull` were collapsed
+> into the public methods; the private rows in the one-sided lists are historical.
 
 Companion: `docs/ossh-differences-dev-vs-mcdonges.md` (history, rename map, size analysis).
 
