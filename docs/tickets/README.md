@@ -20,7 +20,7 @@ verification) so it can be pasted into an issue tracker as is.
 | [T12](T12-user-branch-divergence.md) | `user`: authorized-keys model and key API diverged | finding | P1 | open |
 | [T13](T13-dev-gaps.md) | Tools and gates `dev` never had (opy/osemvec/tronMonitor/claudeFlow, no-python, myId) | finding | P2 | open |
 | [T14](T14-flaky-odocker-engine-wait.md) | `T-ODOCKER-ENGINE-START-WAIT` is flaky under `core` | test bug | P3 | observed |
-| [T15](T15-collapse-private-twins.md) | Collapse the public/private method twins (2 pairs done, 6 left) | refactor | P3 | **in progress** `abe94542`, `ca008c60` |
+| [T15](T15-collapse-private-twins.md) | Collapse the public/private method twins (5 of 10 resolved, 4 collapses + 1 keep left) | refactor | P3 | **in progress** `abe94542`, `ca008c60`, `da01a047` |
 
 ## Not tickets
 

@@ -1,8 +1,11 @@
-# T15 — Collapse the public/private method twins (key.push / key.pull done)
+# T15 — Collapse the public/private method twins (5 of 10 resolved)
+
+<!-- ossh-rename-history: allowed — this ticket quotes retired names on purpose -->
 
 - **Type:** refactor · **Priority:** P3 · **Area:** `ossh` (the same pattern exists in other scripts)
-- **State:** `key.push`/`key.pull` collapsed (`abe94542`), the two unused `.completion` twins
-  deleted (`ca008c60`) — both 2026-11-04; 6 pairs remain
+- **State:** `key.push`/`key.pull` collapsed (`abe94542`) and the two unused `.completion` twins
+  deleted (`ca008c60`) on 2026-11-04; `config.pull` collapsed 2026-11-05 (`da01a047`). 4
+  collapses and 1 keep remain.
 - **Found by:** "why do we have `ossh.key.pull` and `private.ossh.key.pull` for the same thing?"
 
 ## The pattern
@@ -93,7 +96,7 @@ references that are only the rename guard's `for new in …` list.
 |---|---|---:|---|
 | `private.ossh.config.push.completion` | none | none | **unused** — delete |
 | `private.ossh.dir.push.completion` | none | none | **unused** — delete |
-| `private.ossh.config.pull` | none | none (only the guard list, `test.ossh:3434`) | **unused** — guard pins the name; collapse + drop from guard |
+| `private.ossh.config.pull` | none | none (only the guard list) | ~~**unused** — collapse + drop from guard~~ **done 2026-11-05** |
 | `private.ossh.dir.push` | none | 4 (`test.ossh:3336-3339`) | **test-only** — collapse + repoint tests |
 | `private.ossh.id.push` | none | 5 (`test.ossh:3344-3348`) | **test-only** — collapse + repoint tests |
 | `private.ossh.dir.pull` | 1 (`private.ossh.pull.id`, `ossh:3436`) | 4 (`test.ossh:3340-3343`) | **production + test** — collapse + repoint both |
@@ -142,10 +145,34 @@ twice. dev has no duplicate definitions. That is recorded in T11.
 Verification: `bash -n ossh`, `type -t` for both public names, `test.ossh` 155/155,
 `docs/methods-index.md` ossh 95→93 private / 200→198 rows / 99→97 only-dev / 2344→2342 total.
 
+## Done 2026-11-05: `config.pull`
+
+`private.ossh.config.pull` (82 lines) moved into `ossh.config.pull`; the private block is gone
+(commit `da01a047`).
+The public docstring kept its wording and took the private one's `rc 1 + RESULT` clause.
+
+Changes that went with it:
+
+| Where | Change |
+|---|---|
+| `test.ossh` | dropped `private.ossh.config.pull` from the guard's `for new in …` list; comment records the collapse |
+| `docs/ossh.md` | private row removed, public row carries the merged docstring |
+| `docs/parameter.md`, `docs/object-verb-index.md` | the private binding is gone |
+| `docs/methods-index.md` | ossh 93→92 private, 198→197 rows, 97→96 only-dev, 2342→2341 total |
+
+Nothing called it: no production caller, no test invocation. The guard was the only thing keeping
+the name alive. Verified with `bash -n`, `./ossh config.pull` (no args → "no fromHost was
+specified"; `bad name` → "is no Host name") and `test.ossh` 155/155.
+
+This also fixes a latent guard failure introduced when the tickets were committed: T15 quoted
+`private.ossh.push.config.completion` without the `ossh-rename-history: allowed` marker, so
+`T-OSSH-RENAMES-OBJECT-VERB` reported `left=[docs/tickets/T15-collapse-private-twins.md:132]`.
+The marker is now in T15's first lines.
+
 ## Order of work
 
 1. ~~**Now, no caller changes:** delete the two `.completion` twins.~~ **Done** — `ca008c60`.
-2. **Next, no caller changes:** collapse `config.pull` (drop it from the guard list) — still no caller.
+2. ~~**Next, no caller changes:** collapse `config.pull` (drop it from the guard list).~~ **Done.**
 3. **Separate change:** collapse `dir.push`, `id.push`, `dir.pull`, `config.push` — each needs its
    test fixture (`test.ossh:3331-3348`) and, for the last two, the internal caller repointed.
 
