@@ -1,11 +1,11 @@
-# T15 — Collapse the public/private method twins (5 of 10 resolved)
+# T15 — Collapse the public/private method twins (7 of 10 resolved)
 
 <!-- ossh-rename-history: allowed — this ticket quotes retired names on purpose -->
 
 - **Type:** refactor · **Priority:** P3 · **Area:** `ossh` (the same pattern exists in other scripts)
 - **State:** `key.push`/`key.pull` collapsed (`abe94542`) and the two unused `.completion` twins
-  deleted (`ca008c60`) on 2026-11-04; `config.pull` collapsed 2026-11-05 (`da01a047`). 4
-  collapses and 1 keep remain.
+  deleted (`ca008c60`) on 2026-11-04; `config.pull` (`da01a047`), `dir.push` and `id.push`
+  (`d76c8c69`) collapsed 2026-11-05. 2 collapses and 1 keep remain.
 - **Found by:** "why do we have `ossh.key.pull` and `private.ossh.key.pull` for the same thing?"
 
 ## The pattern
@@ -97,8 +97,8 @@ references that are only the rename guard's `for new in …` list.
 | `private.ossh.config.push.completion` | none | none | **unused** — delete |
 | `private.ossh.dir.push.completion` | none | none | **unused** — delete |
 | `private.ossh.config.pull` | none | none (only the guard list) | ~~**unused** — collapse + drop from guard~~ **done 2026-11-05** |
-| `private.ossh.dir.push` | none | 4 (`test.ossh:3336-3339`) | **test-only** — collapse + repoint tests |
-| `private.ossh.id.push` | none | 5 (`test.ossh:3344-3348`) | **test-only** — collapse + repoint tests |
+| `private.ossh.dir.push` | none | 4 (`test.ossh:3336-3339`) | ~~**test-only** — collapse + repoint tests~~ **done 2026-11-05** |
+| `private.ossh.id.push` | none | 5 (`test.ossh:3344-3348`) | ~~**test-only** — collapse + repoint tests~~ **done 2026-11-05** |
 | `private.ossh.dir.pull` | 1 (`private.ossh.pull.id`, `ossh:3436`) | 4 (`test.ossh:3340-3343`) | **production + test** — collapse + repoint both |
 | `private.ossh.config.push` | 1 (`create.and.install`, `ossh:1518`) | 11 (`test.ossh:497-521`, `3331-3334`) | **production + test** — collapse + repoint both |
 | `private.ossh.config.field.get` | 8 (`ossh:323,394,409,415,421,426,432,438`) | 1 (`test.ossh:332`) | **keep** — not a wrapper |
@@ -169,12 +169,38 @@ This also fixes a latent guard failure introduced when the tickets were committe
 `T-OSSH-RENAMES-OBJECT-VERB` reported `left=[docs/tickets/T15-collapse-private-twins.md:132]`.
 The marker is now in T15's first lines.
 
+## Done 2026-11-05 (2): `dir.push` and `id.push`
+
+Both were pure wrappers. The bodies moved into the public methods (commit
+`d76c8c69`); the docstrings took the private `rc 0 + RESULT / rc 1 + RESULT and error.log`
+clauses.
+
+The only work beyond the move was the nine test invocations:
+
+```
+test.ossh:3336-3339   private.ossh.dir.push  → ossh.dir.push
+test.ossh:3344-3348   private.ossh.id.push   → ossh.id.push
+```
+
+Same arguments, same expected RESULT strings — the bodies are unchanged, so the fixtures
+prove the public methods now behave exactly as the private ones did.
+
+Guard, docs and counts went with `config.pull`: `for new in …` lost both names, the prose in
+`docs/ossh.md` (§ "The copy helpers say theirs too") now names the public methods, the private
+rows are gone, and `docs/methods-index.md` is at 90 private / 195 rows / 94 only-dev / 2 339
+total.
+
+Verified: `bash -n`; `./ossh dir.push` and `./ossh id.push` argument paths print the expected
+errors; `type -t` shows the public functions and no private ones; `test.ossh` 155/155.
+
 ## Order of work
 
 1. ~~**Now, no caller changes:** delete the two `.completion` twins.~~ **Done** — `ca008c60`.
 2. ~~**Next, no caller changes:** collapse `config.pull` (drop it from the guard list).~~ **Done.**
-3. **Separate change:** collapse `dir.push`, `id.push`, `dir.pull`, `config.push` — each needs its
-   test fixture (`test.ossh:3331-3348`) and, for the last two, the internal caller repointed.
+3. ~~**Separate change:** collapse `dir.push`, `id.push`~~ **Done** — `d76c8c69`.
+4. **Next:** collapse `dir.pull` and `config.push` — each needs its test fixture
+   (`test.ossh:3340-3343`, `497-521`, `3331-3334`) and its internal caller repointed
+   (`private.ossh.pull.id`, `create.and.install`).
 
 ## Acceptance
 
