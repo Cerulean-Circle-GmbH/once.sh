@@ -63,7 +63,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 |  | `oo.file` | [`private.oo.method.end.get`](oo.md) |
 |  | `os.file` | [`private.os.release.get`](os.md) |
 |  | `osemvec.file` | [`osemvec.register`](osemvec.md) |
-|  | `ossh.file` | [`ossh.config.delete`](ossh.md) · [`ossh.config.edit`](ossh.md) · [`ossh.config.get`](ossh.md) · [`ossh.config.list`](ossh.md) · [`ossh.config.pull`](ossh.md) · [`ossh.config.save.last`](ossh.md) · [`ossh.id.pull`](ossh.md) · [`ossh.pull.config`](ossh.md) · [`ossh.pull.id`](ossh.md) · [`private.ossh.config.field.get`](ossh.md) · [`private.ossh.config.field.set`](ossh.md) · [`private.ossh.config.pull`](ossh.md) · [`ossh.config.get`](ossh.md) · [`private.ossh.pull.id`](ossh.md) · [`private.ossh.validConfigBlock`](ossh.md) |
+|  | `ossh.file` | [`ossh.config.delete`](ossh.md) · [`ossh.config.edit`](ossh.md) · [`ossh.config.get`](ossh.md) · [`ossh.config.list`](ossh.md) · [`ossh.config.pull`](ossh.md) · [`ossh.config.save.last`](ossh.md) · [`ossh.id.pull`](ossh.md) · [`ossh.pull.config`](ossh.md) · [`ossh.pull.id`](ossh.md) · [`private.ossh.config.field.get`](ossh.md) · [`private.ossh.config.field.set`](ossh.md) · [`ossh.config.get`](ossh.md) · [`private.ossh.pull.id`](ossh.md) · [`private.ossh.validConfigBlock`](ossh.md) |
 |  | `otmux.file` | [`otmux.buffer.load`](otmux.md) · [`otmux.buffer.save`](otmux.md) · [`otmux.config`](otmux.md) · [`otmux.config.source`](otmux.md) · [`otmux.source`](otmux.md) · [`private.otmux.loadBuffer`](otmux.md) · [`private.otmux.saveBuffer`](otmux.md) |
 |  | `path.file` | [`path.file.custom`](path.md) · [`path.load`](path.md) |
 |  | `replace.file` | [`private.replace.copy.make`](replace.md) · [`replace.block`](replace.md) · [`replace.commit`](replace.md) · [`replace.line`](replace.md) · [`replace.lines`](replace.md) · [`replace.rollback`](replace.md) · [`replace.word`](replace.md) |
@@ -195,7 +195,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 | `configPath` | `backup.configPath` | [`backup.config.disable`](backup.md) · [`backup.config.enable`](backup.md) · [`backup.config.register`](backup.md) · [`backup.config.repair`](backup.md) · [`backup.config.unregister`](backup.md) · [`private.backup.repair.config`](backup.md) |
 |  | `config.configPath` | [`private.config.log.chain.migrate`](config.md) · [`private.config.oosh.session.migrate`](config.md) · [`private.config.oosh.session.split.is`](config.md) · [`private.config.session.chain.ready`](config.md) · [`private.config.session.split.is`](config.md) · [`private.config.user.session.migrate`](config.md) |
 |  | `test.suite.configPath` | [`private.test.suite.config.stamp.get`](test.suite.md) |
-| `fromHost` | `ossh.fromHost` | [`ossh.config.pull`](ossh.md) · [`ossh.dir.pull`](ossh.md) · [`ossh.id.pull`](ossh.md) · [`ossh.key.pull`](ossh.md) · [`ossh.key.revoke`](ossh.md) · [`ossh.pull.config`](ossh.md) · [`ossh.pull.dir`](ossh.md) · [`ossh.pull.id`](ossh.md) · [`ossh.pull.key`](ossh.md) · [`private.ossh.config.pull`](ossh.md) · [`private.ossh.dir.pull`](ossh.md) · [`private.ossh.pull.id`](ossh.md) · [`private.ossh.remote.key.file.name.get`](ossh.md) |
+| `fromHost` | `ossh.fromHost` | [`ossh.config.pull`](ossh.md) · [`ossh.dir.pull`](ossh.md) · [`ossh.id.pull`](ossh.md) · [`ossh.key.pull`](ossh.md) · [`ossh.key.revoke`](ossh.md) · [`ossh.pull.config`](ossh.md) · [`ossh.pull.dir`](ossh.md) · [`ossh.pull.id`](ossh.md) · [`ossh.pull.key`](ossh.md) · [`private.ossh.dir.pull`](ossh.md) · [`private.ossh.pull.id`](ossh.md) · [`private.ossh.remote.key.file.name.get`](ossh.md) |
 | `key` | `claudeFlow.key` | [`claudeFlow.memory.delete`](claudeFlow.md) · [`claudeFlow.memory.get`](claudeFlow.md) · [`claudeFlow.memory.rm`](claudeFlow.md) |
 |  | `hiveMind.key` | [`private.hiveMind.env.del`](hivemind.md) · [`private.hiveMind.env.set`](hivemind.md) |
 |  | `ogit.key` | [`ogit.config.get`](ogit.md) · [`ogit.config.set`](ogit.md) |
@@ -495,7 +495,7 @@ Indexes: [methods-index.md](methods-index.md) · [object-verb-index.md](object-v
 |  | `this.prefix` | [`private.log.install.append`](this.md) |
 | `psSnap` | `hiveMind.psSnap` | [`private.hiveMind.shell.descendants`](hivemind.md) · [`private.hiveMind.sweep.bgshells`](hivemind.md) |
 | `rcfile` | `opy.rcfile` | [`opy.shell.install`](opy.md) · [`private.opy.installBashrc`](opy.md) |
-| `remoteConfigName` | `ossh.remoteConfigName` | [`ossh.config.pull`](ossh.md) · [`private.ossh.config.pull`](ossh.md) |
+| `remoteConfigName` | `ossh.remoteConfigName` | [`ossh.config.pull`](ossh.md) |
 | `remoteKeyName` | `ossh.remoteKeyName` | [`ossh.key.pull`](ossh.md) · [`ossh.key.revoke`](ossh.md) |
 | `roles` | `agentRoom.roles` | [`agentRoom.start.all`](agentRoom.md) |
 |  | `hiveMind.roles` | [`hiveMind.team.setup`](hivemind.md) |
