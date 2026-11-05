@@ -1,11 +1,13 @@
-# T15 — Collapse the public/private method twins (7 of 10 resolved)
+# T15 — Collapse the public/private method twins (ossh done: 10 of 10)
 
 <!-- ossh-rename-history: allowed — this ticket quotes retired names on purpose -->
 
 - **Type:** refactor · **Priority:** P3 · **Area:** `ossh` (the same pattern exists in other scripts)
-- **State:** `key.push`/`key.pull` collapsed (`abe94542`) and the two unused `.completion` twins
-  deleted (`ca008c60`) on 2026-11-04; `config.pull` (`da01a047`), `dir.push` and `id.push`
-  (`d76c8c69`) collapsed 2026-11-05. 2 collapses and 1 keep remain.
+- **State:** **`ossh` done** — 9 twins collapsed/deleted, `config.field.get` kept with a
+  comment. `key.push`/`key.pull` (`abe94542`) and the two unused `.completion` twins
+  (`ca008c60`) on 2026-11-04; `config.pull` (`da01a047`), `dir.push`/`id.push` (`d76c8c69`),
+  `dir.pull`/`config.push` (`96e5584d`) and the keep note (`b2be95f9`) on 2026-11-05.
+  36 twins in other scripts are inventoried below but not started.
 - **Found by:** "why do we have `ossh.key.pull` and `private.ossh.key.pull` for the same thing?"
 
 ## The pattern
@@ -99,9 +101,9 @@ references that are only the rename guard's `for new in …` list.
 | `private.ossh.config.pull` | none | none (only the guard list) | ~~**unused** — collapse + drop from guard~~ **done 2026-11-05** |
 | `private.ossh.dir.push` | none | 4 (`test.ossh:3336-3339`) | ~~**test-only** — collapse + repoint tests~~ **done 2026-11-05** |
 | `private.ossh.id.push` | none | 5 (`test.ossh:3344-3348`) | ~~**test-only** — collapse + repoint tests~~ **done 2026-11-05** |
-| `private.ossh.dir.pull` | 1 (`private.ossh.pull.id`, `ossh:3436`) | 4 (`test.ossh:3340-3343`) | **production + test** — collapse + repoint both |
-| `private.ossh.config.push` | 1 (`create.and.install`, `ossh:1518`) | 11 (`test.ossh:497-521`, `3331-3334`) | **production + test** — collapse + repoint both |
-| `private.ossh.config.field.get` | 8 (`ossh:323,394,409,415,421,426,432,438`) | 1 (`test.ossh:332`) | **keep** — not a wrapper |
+| `private.ossh.dir.pull` | 1 (`private.ossh.pull.id`) | 4 (`test.ossh:3340-3343`) | ~~**production + test**~~ **done 2026-11-05** |
+| `private.ossh.config.push` | 1 (`create.and.install`) | 11 (`test.ossh:497-521`, `3331-3334`) | ~~**production + test**~~ **done 2026-11-05** |
+| `private.ossh.config.field.get` | 8 (`ossh:323,394,409,415,421,426,432,438`) | 1 (`test.ossh:332`) | **keep** — not a wrapper; comment added `b2be95f9` |
 
 Notes:
 
@@ -193,14 +195,37 @@ total.
 Verified: `bash -n`; `./ossh dir.push` and `./ossh id.push` argument paths print the expected
 errors; `type -t` shows the public functions and no private ones; `test.ossh` 155/155.
 
+## Done 2026-11-05 (3): `dir.pull`, `config.push`, and the keep note
+
+The last two twins were the "production + test" ones, so the move also repointed their callers:
+
+| Caller | Was | Now |
+|---|---|---|
+| `ossh.install.finish.local` | `private.ossh.config.push $sshConfigName` | `ossh.config.push $sshConfigName` |
+| `private.ossh.pull.id` | `private.ossh.dir.pull $fromHost ".ssh"` | `ossh.dir.pull $fromHost ".ssh"` |
+| tests `497-521`, `3331-3334` | `private.ossh.config.push` | `ossh.config.push` |
+| tests `3340-3343` | `private.ossh.dir.pull` | `ossh.dir.pull` |
+
+The bodies moved into the public methods, the docstrings took the private `rc 0 + RESULT` /
+`rc 1 + RESULT and error.log` clauses, and the no-configName skip message inside `config.push`
+now names `ossh.config.push` instead of the private one. The guard's `for new in …` list is down
+to `private.ossh.oosh.init.push` — the last name in it that is not a collapsed twin.
+
+`config.field.get` got the opposite treatment: a four-line comment above its body records that it
+is the low-level getter (no RESULT, consumed as `$(...)` by the per-field accessors and
+`ossh.config.set`), not a wrapper — and that mcdonges has the same public/private split.
+
+Final ossh numbers: 10 twins originally, 9 resolved (2 collapsed, 2 deleted as duplicates, 5
+collapsed with caller updates), 1 kept by design. `docs/methods-index.md` is at 88 private /
+193 rows / 92 only-dev / 2 337 total. `test.ossh` 155/155.
+
 ## Order of work
 
 1. ~~**Now, no caller changes:** delete the two `.completion` twins.~~ **Done** — `ca008c60`.
 2. ~~**Next, no caller changes:** collapse `config.pull` (drop it from the guard list).~~ **Done.**
 3. ~~**Separate change:** collapse `dir.push`, `id.push`~~ **Done** — `d76c8c69`.
-4. **Next:** collapse `dir.pull` and `config.push` — each needs its test fixture
-   (`test.ossh:3340-3343`, `497-521`, `3331-3334`) and its internal caller repointed
-   (`private.ossh.pull.id`, `create.and.install`).
+4. ~~**Next:** collapse `dir.pull` and `config.push`.~~ **Done** — `96e5584d`;
+   `config.field.get` kept with a comment in `b2be95f9`.
 
 ## Acceptance
 
