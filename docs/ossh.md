@@ -424,11 +424,11 @@ path (T-OSSH-OOSH-INIT-PUSH-RESULT):
 
 The copy helpers say theirs too (T-OSSH-PUSH-PULL-RESULT), each rc 1 + RESULT
 + error.log for a missing argument, a failed connection or a failed copy:
-`private.ossh.config.push <toHost> <?sshConfigName>` (`<name> added to` /
+`ossh.config.push <toHost> <?sshConfigName>` (`<name> added to` /
 `<name> replaced in <toHost>:~/.ssh/config`; without a name nothing is pushed, rc 0 —
 see "Pushing a Config" below),
 `ossh.dir.push <toHost> <dir>` (`<dir> copied to <toHost>`),
-`private.ossh.dir.pull <fromHost> <dir>` (`<fromHost>:<dir> copied here`) and
+`ossh.dir.pull <fromHost> <dir>` (`<fromHost>:<dir> copied here`) and
 `ossh.id.push <toHost> <id> <?sshDir>` (`<id> copied to
 <toHost>:~/.ssh/ids/`; a missing `<sshDir>/ids/<id>` is rc 1 before any
 copy). Until 2026-10-16 they had verb-first names
@@ -703,7 +703,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  | `parse` |  | `# <sshConfigHost>  <?method:private.config.create> # parses the config and shows config values. Then calls optional <method> that has acces to the paresed values` | `ossh.config.parse` | `ossh.config.parse` |
 |  |  | `url` | `# <url>  <?method> # parses the url and shows config values. Then calls optional method that has acces to the paresed values` | `ossh.config.parse.url` | `ossh.config.parse.url` |
 |  | `pull` |  | `# <fromHost> <remoteConfigName> <?file:~/.ssh/config> # copies the Host block <remoteConfigName> from ~/.ssh/config on <fromHost> into <file> (config.push the other way around) — a Host already there stays as it is; rc 1 + RESULT when the name is no Host name, <fromHost> has no such block or <file> cannot be written #` | `ossh.config.pull` | `ossh.config.pull` |
-|  | `push` |  | `# <toHost> <?sshConfigName> # puts the local Host block <sshConfigName> into ~/.ssh/config on <toHost> — replaced where it is, or added — one ssh call, no rsync or oosh needed there #` | `ossh.config.push` | `ossh.config.push` |
+|  | `push` |  | `# <toHost> <?sshConfigName> # puts the local Host block <sshConfigName> into <toHost>:~/.ssh/config — the first block of that name replaced in place, further copies dropped, else added — one ssh call, no rsync or oosh needed there; without <sshConfigName> nothing is pushed (rc 0 + RESULT); rc 0 + RESULT added or replaced; rc 1 + RESULT and error.log when <toHost> is missing, the name is no Host here, the connection or the host fails #` | `ossh.config.push` | `ossh.config.push` |
 |  | `save` | `last` | `# <?file:~/.ssh/config> # append the Host block of the last ossh config.create to <file> — read from its own file, checked to be one Host block, <file> written whole with its mode kept — rc 1 + RESULT when there is none, it is damaged or <file> has that Host already #` | `ossh.config.save.last` | `ossh.config.save.last` |
 |  | `set` |  | `# <configItem> <field> <value> # set <field> (identityFile user port hostName proxyJump forwardAgent identitiesOnly) of the Host block <configItem> in ~/.ssh/config to <value> — the line is replaced, or added below the Host line — rc 1 + RESULT for an unknown Host or field or a value the field does not take #` | `ossh.config.set` | `ossh.config.set` |
 |  | `show` | `last` |  | `ossh.config.show.last` ✅ | `ossh.config.show.last` ✅ |
@@ -717,7 +717,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  | `open` |  | `# <host> # open persistent SSH connection (enter password once) #` | `ossh.connection.open` | `ossh.connection.open` |
 | `ossh.connection.status` |  |  | `# <host> # check if persistent connection is open` | `ossh.connection.status` ✅ | `ossh.connection.status` ✅ |
 | `ossh.create.and` | `install` |  | `#  <sshConfigHost> <url> # creates a config <sshConfigName> for <url> and pushes the oosh there` |  | `ossh.create.and.install` |
-| `ossh.dir` | `pull` |  | `# <fromHost> <dir> # copies <dir> from the home of <fromHost> into the current local folder #` | `ossh.dir.pull` | `ossh.dir.pull` |
+| `ossh.dir` | `pull` |  | `# <fromHost> <dir> # copies <dir> from the home of <fromHost> into the current local folder; rc 0 + RESULT when it is here, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #` | `ossh.dir.pull` | `ossh.dir.pull` |
 |  | `push` |  | `# <toHost> <dir> # copies the local <dir> into the home of <toHost> (rsync, scp where there is none); rc 0 + RESULT when it is there, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #` | `ossh.dir.push` | `ossh.dir.push` |
 | `ossh.file` | `get` | `name` | `# # gets the actual file name (instead of the best key name from get.key.name )` |  | `ossh.file.get.name` |
 | `ossh.folder` | `fix` |  | `# <?installerEmail> <?sshDir:~/.ssh> <?mode:conservative> # converge ~/.ssh to canonical state; mode=conservative\|strict` |  | `ossh.folder.fix` |
@@ -806,7 +806,6 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 |  | `verify` | `https` | `# <script> <stageTo> <stateFound> # local: HTTPS reachable + cert expiry within minimum days` |  | `private.check.certificates.update.verify.https` |
 | `ossh.config` | `complete` | `hosts` |  | `private.ossh.config.complete.hosts` |  |
 |  | `create` |  |  | `private.config.create` | `private.config.create` |
-|  | `push` |  | `# <toHost> <?sshConfigName> # put the local Host block <sshConfigName> into <toHost>:~/.ssh/config — the first block of that name replaced in place, further copies dropped, else added — rc 0 + RESULT added or replaced; without <sshConfigName> nothing is pushed (rc 0 + RESULT); rc 1 + RESULT and error.log when <toHost> is missing, the name is no Host here, the connection or the host fails #` |  | `private.ossh.config.push` |
 | `ossh.config.block.put` | `get` |  | `# <sshConfigName> # echo the POSIX commands that put the Host block <sshConfigName> read from their stdin into ~/.ssh/config of the shell that runs them — the first block of that name replaced in place, further copies dropped, else appended — and that echo added or replaced; no oosh needed there #` |  | `private.ossh.config.block.put.get` |
 | `ossh.config.deploy` | `write` |  | `# writer callback for ossh.config.create — APPENDS the resolved Host block to the ssh config (previously only written to result.txt scratch → the config-wiring gap). Idempotent; preserves existing Host entries.` | `private.ossh.config.deploy.write` |  |
 | `ossh.config.field` | `get` |  | `# <configItem> <field> <?file:~/.ssh/config> # echo the value of the ssh keyword of <field> in the Host block <configItem> of <file> — nothing and rc 1 when there is none #` | `private.ossh.config.field.get` | `private.ossh.config.field.get` |
@@ -831,7 +830,6 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `ossh.connection.error.network` | `is` |  | `# <reason> # rc 0 when ssh's <reason> is a network error worth a retry with -4 (Broken pipe, a reset, no route, an empty reason); rc 1 for a refused login, a host key, a too long socket path or too many keys tried #` |  | `private.ossh.connection.error.network.is` |
 | `ossh.control.path` | `get` |  | `#  # echo the ControlMaster socket path for connection reuse: ${TMPDIR:-/tmp}/ossh-%C when it fits a Unix socket, else /tmp/ossh-%C, else ~/.ssh/ossh-%C #` |  | `private.ossh.control.path.get` |
 | `ossh.control.path.resolved` | `get` |  | `# <host> # echo the ControlMaster socket path ssh uses for <host> — $OSSH_CONTROL_PATH with %C expanded, asked from ssh -G (no connection); nothing and rc 1 without a <host> or when ssh gives no expanded path #` |  | `private.ossh.control.path.resolved.get` |
-| `ossh.dir` | `pull` |  | `# <fromHost> <dir> # copy <dir> from the home of <fromHost> into the current local folder; rc 0 + RESULT when it is here, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #` |  | `private.ossh.dir.pull` |
 | `ossh.folder.fix` | `prune` |  | `# <sshDir> # remove known-stale legacy artifacts (strict-mode only). NEVER touches authorized_keys, id_rsa, or anything the user might rely on.` |  | `private.ossh.folder.fix.prune` |
 |  | `scan` | `git.remotes` | `# <hostAlias> # scan git repos under $HOME for remotes that reference <hostAlias>: and warn the user to update them` |  | `private.ossh.folder.fix.scan.git.remotes` |
 | `ossh.folder.fix.config` | `normalize` |  | `# <sshDir> # ensure ~/.ssh/config has portable WODA paths, report a system file without Host github.com (conservative repairs to user-facing contract from test.ssh.config.invariant)` |  | `private.ossh.folder.fix.config.normalize` |
