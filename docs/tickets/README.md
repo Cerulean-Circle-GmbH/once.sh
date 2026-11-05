@@ -21,6 +21,7 @@ verification) so it can be pasted into an issue tracker as is.
 | [T13](T13-dev-gaps.md) | Tools and gates `dev` never had (opy/osemvec/tronMonitor/claudeFlow, no-python, myId) | finding | P2 | open |
 | [T14](T14-flaky-odocker-engine-wait.md) | `T-ODOCKER-ENGINE-START-WAIT` is flaky under `core` | test bug | P3 | observed |
 | [T15](T15-collapse-private-twins.md) | Collapse the public/private method twins (ossh done; 36 twins elsewhere inventoried) | refactor | P3 | **ossh done** `abe94542`…`b2be95f9` |
+| [T16](T16-rsync-mkdir-tilde.md) | `private.ossh.rsync` creates `./~` instead of `~/.ssh/ids` | bug | P2 | **fixed** `90a4647b` |
 
 ## Not tickets
 
