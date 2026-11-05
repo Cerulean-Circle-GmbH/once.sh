@@ -427,9 +427,9 @@ The copy helpers say theirs too (T-OSSH-PUSH-PULL-RESULT), each rc 1 + RESULT
 `private.ossh.config.push <toHost> <?sshConfigName>` (`<name> added to` /
 `<name> replaced in <toHost>:~/.ssh/config`; without a name nothing is pushed, rc 0 —
 see "Pushing a Config" below),
-`private.ossh.dir.push <toHost> <dir>` (`<dir> copied to <toHost>`),
+`ossh.dir.push <toHost> <dir>` (`<dir> copied to <toHost>`),
 `private.ossh.dir.pull <fromHost> <dir>` (`<fromHost>:<dir> copied here`) and
-`private.ossh.id.push <toHost> <id> <?sshDir>` (`<id> copied to
+`ossh.id.push <toHost> <id> <?sshDir>` (`<id> copied to
 <toHost>:~/.ssh/ids/`; a missing `<sshDir>/ids/<id>` is rc 1 before any
 copy). Until 2026-10-16 they had verb-first names
 (T-OSSH-RENAMES-OBJECT-VERB) and ended with a bare `return 1` or the copy's
@@ -718,7 +718,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `ossh.connection.status` |  |  | `# <host> # check if persistent connection is open` | `ossh.connection.status` ✅ | `ossh.connection.status` ✅ |
 | `ossh.create.and` | `install` |  | `#  <sshConfigHost> <url> # creates a config <sshConfigName> for <url> and pushes the oosh there` |  | `ossh.create.and.install` |
 | `ossh.dir` | `pull` |  | `# <fromHost> <dir> # copies <dir> from the home of <fromHost> into the current local folder #` | `ossh.dir.pull` | `ossh.dir.pull` |
-|  | `push` |  | `# <toHost> <dir> # copies the local <dir> into the home of <toHost> #` | `ossh.dir.push` | `ossh.dir.push` |
+|  | `push` |  | `# <toHost> <dir> # copies the local <dir> into the home of <toHost> (rsync, scp where there is none); rc 0 + RESULT when it is there, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #` | `ossh.dir.push` | `ossh.dir.push` |
 | `ossh.file` | `get` | `name` | `# # gets the actual file name (instead of the best key name from get.key.name )` |  | `ossh.file.get.name` |
 | `ossh.folder` | `fix` |  | `# <?installerEmail> <?sshDir:~/.ssh> <?mode:conservative> # converge ~/.ssh to canonical state; mode=conservative\|strict` |  | `ossh.folder.fix` |
 | `ossh.folder.fix` | `check` |  | `# <?sshDir:~/.ssh> # report drift from canonical state (read-only, never mutates; returns 0 even when drift found)` |  | `ossh.folder.fix.check` |
@@ -832,7 +832,6 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `ossh.control.path` | `get` |  | `#  # echo the ControlMaster socket path for connection reuse: ${TMPDIR:-/tmp}/ossh-%C when it fits a Unix socket, else /tmp/ossh-%C, else ~/.ssh/ossh-%C #` |  | `private.ossh.control.path.get` |
 | `ossh.control.path.resolved` | `get` |  | `# <host> # echo the ControlMaster socket path ssh uses for <host> — $OSSH_CONTROL_PATH with %C expanded, asked from ssh -G (no connection); nothing and rc 1 without a <host> or when ssh gives no expanded path #` |  | `private.ossh.control.path.resolved.get` |
 | `ossh.dir` | `pull` |  | `# <fromHost> <dir> # copy <dir> from the home of <fromHost> into the current local folder; rc 0 + RESULT when it is here, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #` |  | `private.ossh.dir.pull` |
-|  | `push` |  | `# <toHost> <dir> # copy the local <dir> into the home of <toHost> (rsync, scp where there is none); rc 0 + RESULT when it is there, rc 1 + RESULT and error.log when an argument is missing, the connection or the copy fails #` |  | `private.ossh.dir.push` |
 | `ossh.folder.fix` | `prune` |  | `# <sshDir> # remove known-stale legacy artifacts (strict-mode only). NEVER touches authorized_keys, id_rsa, or anything the user might rely on.` |  | `private.ossh.folder.fix.prune` |
 |  | `scan` | `git.remotes` | `# <hostAlias> # scan git repos under $HOME for remotes that reference <hostAlias>: and warn the user to update them` |  | `private.ossh.folder.fix.scan.git.remotes` |
 | `ossh.folder.fix.config` | `normalize` |  | `# <sshDir> # ensure ~/.ssh/config has portable WODA paths, report a system file without Host github.com (conservative repairs to user-facing contract from test.ssh.config.invariant)` |  | `private.ossh.folder.fix.config.normalize` |
@@ -842,7 +841,7 @@ An **empty verb** means the name carries **no action at all** — the chain neve
 | `ossh.github.copy` | `remove` |  | `# <sshDir> <knownHosts> # remove from <sshDir> what oosh copied there for GitHub — the Host github.com block of oosh in config, the lines of <knownHosts> in known_hosts — in place, owner and mode kept; rc 0 when something was removed #` |  | `private.ossh.github.copy.remove` |
 | `ossh.host.fqdn` | `get` |  | `#  # echo the fully qualified name of this computer for SSH key names: hostname -f when the hostname program exists, else the full HOSTNAME from the kernel; only the characters A-Z a-z 0-9 . _ - #` |  | `private.ossh.host.fqdn.get` |
 | `ossh.hostKnown` |  |  | `# <host> # 0 if <host> is a Host entry in the local ssh config` | `private.ossh.hostKnown` |  |
-| `ossh.id` | `push` |  | `# <toHost> <id> <?sshDir:~/.ssh> # copy the identity <sshDir>/ids/<id> to <toHost>:~/.ssh/ids/; rc 0 + RESULT when it is there, rc 1 + RESULT and error.log when an argument or the id is missing, the connection or the copy fails #` |  | `private.ossh.id.push` |
+| `ossh.id` | `push` |  | `# <toHost> <id> <?sshDir:~/.ssh> # copies the identity <sshDir>/ids/<id> to <toHost>:~/.ssh/ids/; rc 0 + RESULT when it is there, rc 1 + RESULT and error.log when an argument or the id is missing, the connection or the copy fails #` | `ossh.id.push` | `ossh.id.push` |
 | `ossh.identity` | `stage` |  | `# <toHost> # stage runner email + id_ed25519 keypair to /tmp/oosh.{installer,outer}.* on <toHost>` |  | `private.ossh.identity.stage` |
 |  |  | `outer.fromRunner` | `# <toHost> <email> <privKey> <pubKey> # stage outer with the runner's full keypair (test-mode collapse)` |  | `private.ossh.identity.stage.outer.fromRunner` |
 |  |  | `outer.proxyJump` | `# <toHost> <jumpHost> # stage outer with the jump host's email + pubkey (no private — we don't have it)` |  | `private.ossh.identity.stage.outer.proxyJump` |

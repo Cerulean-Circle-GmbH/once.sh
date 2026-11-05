@@ -733,7 +733,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `dir` | `prepend` | [`path.prepend`](path.md) |
 | `dir` | `prune` | [`ogit.worktree.prune`](ogit.md) |
 | `dir` | `pull` | [`ogit.remote.pull`](ogit.md) · [`ossh.dir.pull`](ossh.md) · [`ossh.pull.dir`](ossh.md) · [`private.ossh.dir.pull`](ossh.md) |
-| `dir` | `push` | [`ogit.remote.push`](ogit.md) · [`ogit.stash.push`](ogit.md) · [`ossh.dir.push`](ossh.md) · [`ossh.push.dir`](ossh.md) · [`path.push`](path.md) · [`private.ossh.dir.push`](ossh.md) |
+| `dir` | `push` | [`ogit.remote.push`](ogit.md) · [`ogit.stash.push`](ogit.md) · [`ossh.dir.push`](ossh.md) · [`ossh.push.dir`](ossh.md) · [`path.push`](path.md) |
 | `dir` | `put` | [`path.put`](path.md) |
 | `dir` | `remove` | [`backup.sync.and.remove`](backup.md) · [`ogit.index.remove`](ogit.md) · [`path.remove`](path.md) |
 | `dir` | `reset` | [`ogit.branch.reset`](ogit.md) |
@@ -1153,7 +1153,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `id` | `get` | [`ossh.get.public.id`](ossh.md) · [`ossh.id.file.get`](ossh.md) · [`ossh.id.public.get`](ossh.md) · [`ossh.publicId.get`](ossh.md) · [`private.ossh.get.public.id`](ossh.md) |
 | `id` | `list` | [`myId.list`](myId.md) · [`ossh.list.ids`](ossh.md) |
 | `id` | `pull` | [`ossh.id.pull`](ossh.md) |
-| `id` | `push` | [`ossh.id.push`](ossh.md) · [`ossh.push.id`](ossh.md) · [`private.ossh.id.push`](ossh.md) |
+| `id` | `push` | [`ossh.id.push`](ossh.md) · [`ossh.push.id`](ossh.md) |
 | `idName` | `create` | [`myId.key.deploy.create`](myId.md) · [`ossh.id.create`](ossh.md) · [`ossh.id.create.fromKey`](ossh.md) |
 | `idName` | `deploy` | [`myId.create.github.deploy.key`](myId.md) |
 | `idOrProxyJump` | `create` | [`ossh.config.create`](ossh.md) |
@@ -1837,7 +1837,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `ossh` | `parse` | [`ossh.config.parse`](ossh.md) · [`ossh.config.parse.url`](ossh.md) |
 | `ossh` | `prune` | [`private.ossh.folder.fix.prune`](ossh.md) |
 | `ossh` | `pull` | [`ossh.config.pull`](ossh.md) · [`ossh.dir.pull`](ossh.md) · [`ossh.id.pull`](ossh.md) · [`ossh.key.pull`](ossh.md) · [`ossh.pull.config`](ossh.md) · [`ossh.pull.dir`](ossh.md) · [`ossh.pull.id`](ossh.md) · [`ossh.pull.key`](ossh.md) · [`private.ossh.dir.pull`](ossh.md) · [`private.ossh.pull.id`](ossh.md) · [`private.ossh.rsync.pull`](ossh.md) |
-| `ossh` | `push` | [`ossh.config.push`](ossh.md) · [`ossh.dir.push`](ossh.md) · [`ossh.id.push`](ossh.md) · [`ossh.key.push`](ossh.md) · [`ossh.push.config`](ossh.md) · [`ossh.push.dir`](ossh.md) · [`ossh.push.id`](ossh.md) · [`ossh.push.key`](ossh.md) · [`private.ossh.config.push`](ossh.md) · [`private.ossh.dir.push`](ossh.md) · [`private.ossh.id.push`](ossh.md) · [`private.ossh.oosh.init.push`](ossh.md) |
+| `ossh` | `push` | [`ossh.config.push`](ossh.md) · [`ossh.dir.push`](ossh.md) · [`ossh.id.push`](ossh.md) · [`ossh.key.push`](ossh.md) · [`ossh.push.config`](ossh.md) · [`ossh.push.dir`](ossh.md) · [`ossh.push.id`](ossh.md) · [`ossh.push.key`](ossh.md) · [`private.ossh.config.push`](ossh.md) · [`private.ossh.oosh.init.push`](ossh.md) |
 | `ossh` | `put` | [`private.ossh.remote.public.key.put`](ossh.md) |
 | `ossh` | `read` | [`private.certificates.update.config.read`](ossh.md) |
 | `ossh` | `remove` | [`ossh.known.hosts.remove`](ossh.md) · [`private.ossh.github.copies.remove`](ossh.md) · [`private.ossh.github.copy.remove`](ossh.md) · [`private.ossh.shared.ssh.legacy.remove`](ossh.md) |
@@ -2761,7 +2761,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `sshDir` | `normalize` | [`private.ossh.folder.fix.config.normalize`](ossh.md) |
 | `sshDir` | `prune` | [`private.ossh.folder.fix.prune`](ossh.md) |
 | `sshDir` | `pull` | [`ossh.id.pull`](ossh.md) · [`ossh.key.pull`](ossh.md) · [`ossh.pull.id`](ossh.md) · [`private.ossh.pull.id`](ossh.md) |
-| `sshDir` | `push` | [`ossh.id.push`](ossh.md) · [`ossh.key.push`](ossh.md) · [`ossh.push.id`](ossh.md) · [`ossh.push.key`](ossh.md) · [`private.ossh.id.push`](ossh.md) |
+| `sshDir` | `push` | [`ossh.id.push`](ossh.md) · [`ossh.key.push`](ossh.md) · [`ossh.push.id`](ossh.md) · [`ossh.push.key`](ossh.md) |
 | `sshDir` | `rebuild` | [`private.user.authorized.keys.rebuild`](user.md) |
 | `sshDir` | `remove` | [`private.ossh.github.copy.remove`](ossh.md) |
 | `sshDir` | `restore` | [`user.ssh.restore`](user.md) |
@@ -3101,7 +3101,7 @@ Each method links to its script's matrix. Indexes: [methods-index.md](methods-in
 | `to` | `link` | [`osx.alias.to.link`](osx.md) |
 | `toHost` |  | [`ossh.tunnel`](ossh.md) |
 | `toHost` | `exec` | [`ossh.exec`](ossh.md) · [`ossh.exec.tty`](ossh.md) |
-| `toHost` | `push` | [`ossh.config.push`](ossh.md) · [`ossh.dir.push`](ossh.md) · [`ossh.id.push`](ossh.md) · [`ossh.key.push`](ossh.md) · [`ossh.push.config`](ossh.md) · [`ossh.push.dir`](ossh.md) · [`ossh.push.id`](ossh.md) · [`ossh.push.key`](ossh.md) · [`private.ossh.config.push`](ossh.md) · [`private.ossh.dir.push`](ossh.md) · [`private.ossh.id.push`](ossh.md) |
+| `toHost` | `push` | [`ossh.config.push`](ossh.md) · [`ossh.dir.push`](ossh.md) · [`ossh.id.push`](ossh.md) · [`ossh.key.push`](ossh.md) · [`ossh.push.config`](ossh.md) · [`ossh.push.dir`](ossh.md) · [`ossh.push.id`](ossh.md) · [`ossh.push.key`](ossh.md) · [`private.ossh.config.push`](ossh.md) |
 | `toHost` | `stage` | [`private.ossh.identity.stage`](ossh.md) · [`private.ossh.identity.stage.outer.fromRunner`](ossh.md) · [`private.ossh.identity.stage.outer.proxyJump`](ossh.md) |
 | `toPane` |  | [`hiveMind.protected.pane.moved`](hivemind.md) |
 | `toPath` |  | [`backup.target`](backup.md) · [`backup.to`](backup.md) |
