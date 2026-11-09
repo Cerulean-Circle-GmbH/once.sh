@@ -1,14 +1,12 @@
-# `lamp` Implementation Plan
+# `lamp` Implementation Plan — Docker or native, by OS
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a `lamp` component that installs and drives a web stack — Nginx+php-fpm or Apache+mod_php, MariaDB, PHP 8.5, Let's Encrypt — with the web server chosen at install.
+**Goal:** One `lamp` component that detects the OS and installs the web stack natively or with Docker, with the same commands either way.
 
-**Architecture:** A new oosh script `./lamp` with `script.object.verb` methods (`stack.*`, `site.*`, `db.*`, `cert.*`). Templates (Dockerfiles, compose, php.ini) are versioned in `templates/lamp/` and seeded into `$ODOCKER_WORKSPACES/LAMP/1.0.0/` on install; runtime state lives in `$CONFIG_PATH/lamp`. Docker is driven through `docker compose` with `odocker` for the availability check.
+**Architecture:** A single `./lamp` script. `private.lamp.os.*` detects family/init/package manager; `private.lamp.backend.*` chooses and dispatches; `private.lamp.docker.*` and `private.lamp.native.*` implement the same contract (`install`, `up`, `down`, `status`, `log`, `remove`); `site.add`, `db.create`, `cert.*` are shared and call one backend-specific hook each.
 
-> **Spec refinement (recorded here and applied to the spec):** `DockerWorkspaces` is not under git, so the templates cannot be versioned there. They live in `templates/lamp/` (repo) and `stack.install` copies them to `$ODOCKER_WORKSPACES/LAMP/1.0.0/` when absent — the installed copy still lives in `DockerWorkspaces`, and local edits there survive.
-
-**Tech Stack:** bash, `docker compose` (v2), `php:8.5-apache`, `php:8.5-fpm`, `nginx:1.27-alpine`, `mariadb:latest`, `certbot/certbot`.
+**Tech Stack:** bash; apt-get + Sury, dnf + Remi, apk, brew; systemd, OpenRC, launchd; nginx/Apache, PHP 8.5, MariaDB, certbot; Docker + compose as the alternative backend.
 
 ---
 
@@ -16,44 +14,42 @@
 
 | File | Responsibility |
 |---|---|
-| `lamp` | the component: usage, start, helpers, public methods |
-| `test/test.lamp` | all tests, `TEST_CATEGORY=core`, Docker stubbed |
-| `templates/lamp/common/php/php.ini` | PHP defaults (timezone, memory, upload) |
-| `templates/lamp/common/php/required-extensions` | the list `stack.install` verifies |
-| `templates/lamp/common/db/01-charset.sql` | DB charset/collation at first start |
-| `templates/lamp/common/certbot/renew-loop.sh` | 12 h renew loop |
-| `templates/lamp/nginx/Dockerfile` | `php:8.5-fpm` + intl/gd/imagick/pdo_mysql/mysqli/opcache |
-| `templates/lamp/nginx/docker-compose.yml` | web (nginx) + app (fpm) + db + certbot |
-| `templates/lamp/nginx/conf.d/default.conf` | catch-all with `try_files` |
-| `templates/lamp/apache/Dockerfile` | `php:8.5-apache` + same extensions + `a2enmod rewrite` |
-| `templates/lamp/apache/docker-compose.yml` | app (apache, ports) + db + certbot |
-| `templates/lamp/apache/vhost.conf` | default vhost with `AllowOverride All` |
-| `docs/lamp.md` | method matrix |
-| `docs/methods-index.md` | one `lamp` row |
-| `docs/object-verb-index.md`, `docs/parameter.md` | cross-index rows |
+| `lamp` | the component: usage, start, OS/backend detection, dispatch, shared commands |
+| `test/test.lamp` | tests, `TEST_CATEGORY=core`, package managers/services/Docker stubbed |
+| `templates/lamp/common/php/php.ini` | PHP defaults |
+| `templates/lamp/common/php/required-extensions` | the extension contract |
+| `templates/lamp/common/db/01-charset.sql` | DB charset |
+| `templates/lamp/common/certbot/renew-loop.sh` | Docker renew loop |
+| `templates/lamp/docker/{nginx,apache}/…` | Dockerfiles + compose + vhosts |
+| `templates/lamp/vhost/{nginx,apache}.conf` | vhost templates for both backends |
+| `docs/lamp.md` | commands, platforms, backends |
 
 ---
 
-### Task 1: Scaffold the component and the test harness
+### Task 1: Scaffold, usage, OS detection
 
 **Files:**
-- Create: `lamp` (from `./oo new lamp`)
-- Create: `test/test.lamp` (from the same command)
+- Create: `lamp`, `test/test.lamp` (`./oo new lamp`)
+- Test: `test/test.lamp`
 
-- [ ] **Step 1: Generate the component**
+- [ ] **Step 1: Generate**
 
-Run:
 ```bash
-cd /home/shared/EAMD.ucp/Components/com/ceruleanCircle/EAM/1_infrastructure/Once.sh/dev
 ./oo new lamp
 ```
-Expected: `created oo script lamp`, `created test script test.lamp`, and two executable files.
 
-- [ ] **Step 2: Make `lamp.start` load `odocker`**
+- [ ] **Step 2: `lamp.start` sources this + odocker, usage names the tool**
 
-In `lamp`, replace the generated `lamp.start` with:
+In `lamp`:
 
 ```bash
+lamp.usage()
+{
+  local this=${0##*/}
+  echo "$this: install a web stack — nginx or apache, MariaDB, PHP 8.5, certbot — with Docker or natively"
+  this.help
+}
+
 lamp.start()
 {
   source this
@@ -62,134 +58,207 @@ lamp.start()
 }
 ```
 
-- [ ] **Step 3: Write the failing usage test**
+- [ ] **Step 3: Write the failing detection test**
 
-In `test/test.lamp`, replace the generated `test.case - "lamp test start"` block and its `expect` with:
-
-```bash
-test.case - "lamp test start" \
-   lamp usage
-expect 0 "*" "Test start"
-
-source this
-source test.suite
-source "$OOSH_DIR/odocker"
-source lamp
-```
-
-Then, immediately above the final `test.suite.save.results`, add:
+In `test/test.lamp`, after `source lamp`, and before `test.suite.save.results`:
 
 ```bash
-test.lamp.usage() {
-  local got bad=""
-  got=$(lamp.usage 2>&1)
-  case "$got" in
-    *"web stack"*) : ;;
-    *) bad="$bad usage=[$got]" ;;
-  esac
-  [ -z "$bad" ] && create.result 0 "usage names the web stack" || create.result 1 "usage:$bad"
+test.lamp.osFamily() {
+  local fx got bad=""
+  fx=$(test.suite.fixture.make lampostest)
+  printf 'ID=ubuntu\n'    > "$fx/ubuntu"
+  printf 'ID=debian\n'    > "$fx/debian"
+  printf 'ID=almalinux\n' > "$fx/alma"
+  printf 'ID=rocky\n'     > "$fx/rocky"
+  printf 'ID=alpine\n'    > "$fx/alpine"
+  printf 'ID=arch\n'      > "$fx/arch"
+
+  got=$(uname() { echo Linux; }; private.lamp.os.family "$fx/ubuntu")
+  [ "$got" = $'debian\tsystemd\tapt-get' ] || bad="$bad ubuntu=[$got]"
+  got=$(uname() { echo Linux; }; private.lamp.os.family "$fx/debian")
+  [ "$got" = $'debian\tsystemd\tapt-get' ] || bad="$bad debian=[$got]"
+  got=$(uname() { echo Linux; }; private.lamp.os.family "$fx/alma")
+  [ "$got" = $'rhel\tsystemd\tdnf' ] || bad="$bad alma=[$got]"
+  got=$(uname() { echo Linux; }; private.lamp.os.family "$fx/rocky")
+  [ "$got" = $'rhel\tsystemd\tdnf' ] || bad="$bad rocky=[$got]"
+  got=$(uname() { echo Linux; }; private.lamp.os.family "$fx/alpine")
+  [ "$got" = $'alpine\topenrc\tapk' ] || bad="$bad alpine=[$got]"
+  got=$(uname() { echo Linux; }; private.lamp.os.family "$fx/arch" 2>/dev/null)
+  case "$got" in unsupported*arch*) : ;; *) bad="$bad arch=[$got]" ;; esac
+  got=$(uname() { echo Darwin; }; private.lamp.os.family "$fx/ubuntu")
+  [ "$got" = $'macos\tlaunchd\tbrew' ] || bad="$bad macos=[$got]"
+
+  [ -z "$bad" ] && create.result 0 "os families detected" || create.result 1 "os:$bad"
   return $(result)
 }
 
-test.case $level "T-LAMP-USAGE: usage names the web stack" test.lamp.usage
-expect 0 "usage names the web stack" "lamp usage says what it installs"
+test.case $level "T-LAMP-OS: family, init and package manager are detected" test.lamp.osFamily
+expect 0 "os families detected" "ubuntu, debian, alma, rocky, alpine, macos, unsupported"
 ```
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [ ] **Step 4: Run it — expect FAIL**
 
-Run: `./test.suite run lamp 1`
-Expected: FAIL — the generated usage says `newScript`, not `web stack`.
+`./test.suite run lamp 1` → `private.lamp.os.family: command not found`.
 
-- [ ] **Step 5: Implement usage**
+- [ ] **Step 5: Implement detection**
 
-Replace the generated `lamp.usage` with:
+Above `lamp.start "$@"`:
 
 ```bash
-lamp.usage()
+private.lamp.os.family() # <?osRelease:/etc/os-release> # echo "<family>\t<init>\t<pkg>"; unsupported goes to stderr and rc 1
 {
-  local this=${0##*/}
-  echo "$this: install and drive a web stack — nginx or apache + MariaDB + PHP + Let's Encrypt"
-  this.help
+  local osRelease="${1:-/etc/os-release}" id="" kernel
+  kernel="$(uname -s 2>/dev/null)"
+  if [ "$kernel" = Darwin ]; then
+    printf 'macos\tlaunchd\tbrew\n'
+    return 0
+  fi
+  if [ ! -f "$osRelease" ]; then
+    echo "unsupported: no $osRelease"
+    return 1
+  fi
+  id="$( . "$osRelease" 2>/dev/null; printf '%s' "${ID:-}" )"
+  case "$id" in
+    debian|ubuntu)                     printf 'debian\tsystemd\tapt-get\n' ;;
+    almalinux|rocky|rhel|centos|fedora) printf 'rhel\tsystemd\tdnf\n' ;;
+    alpine)                            printf 'alpine\topenrc\tapk\n' ;;
+    *)
+      echo "unsupported OS ${id:-unknown} — supported: debian/ubuntu, rhel family, alpine, macos"
+      return 1
+      ;;
+  esac
+  return 0
 }
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
+- [ ] **Step 6: Run it — expect PASS**
 
-Run: `./test.suite run lamp 1`
-Expected: `Passed: 2  Failed: 0` (start + usage).
+`./test.suite run lamp 1` → 2 passed (start + OS).
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add lamp test/test.lamp
-git commit -m "feat(lamp): scaffold the web-stack component and its test"
+git commit -m "feat(lamp): scaffold and OS detection (debian, rhel, alpine, macos)"
 ```
 
 ---
 
-### Task 2: Versioned templates and their assertions
+### Task 2: Backend choice, state and dispatch
 
-**Files:**
-- Create: `templates/lamp/common/php/php.ini`
-- Create: `templates/lamp/common/php/required-extensions`
-- Create: `templates/lamp/common/db/01-charset.sql`
-- Create: `templates/lamp/common/certbot/renew-loop.sh`
-- Create: `templates/lamp/nginx/Dockerfile`
-- Create: `templates/lamp/nginx/docker-compose.yml`
-- Create: `templates/lamp/nginx/conf.d/default.conf`
-- Create: `templates/lamp/apache/Dockerfile`
-- Create: `templates/lamp/apache/docker-compose.yml`
-- Create: `templates/lamp/apache/vhost.conf`
-- Test: `test/test.lamp`
+**Files:** `lamp`, `test/test.lamp`
 
-- [ ] **Step 1: Write the failing template test**
-
-Above `test.suite.save.results`, add:
+- [ ] **Step 1: Failing test**
 
 ```bash
-test.lamp.templates() {
-  local dir="$OOSH_DIR/templates/lamp" bad="" f
-  for f in common/php/php.ini common/php/required-extensions common/db/01-charset.sql \
-           common/certbot/renew-loop.sh nginx/Dockerfile nginx/docker-compose.yml \
-           nginx/conf.d/default.conf apache/Dockerfile apache/docker-compose.yml \
-           apache/vhost.conf; do
-    [ -f "$dir/$f" ] || bad="$bad missing:$f"
-  done
-  grep -qx 'intl' "$dir/common/php/required-extensions" || bad="$bad req:intl"
-  grep -qx 'mbstring' "$dir/common/php/required-extensions" || bad="$bad req:mbstring"
-  grep -qx 'gd' "$dir/common/php/required-extensions" || bad="$bad req:gd"
-  grep -qx 'imagick' "$dir/common/php/required-extensions" || bad="$bad req:imagick"
-  grep -qx 'simplexml' "$dir/common/php/required-extensions" || bad="$bad req:simplexml"
-  grep -qx 'curl' "$dir/common/php/required-extensions" || bad="$bad req:curl"
-  grep -qx 'json' "$dir/common/php/required-extensions" || bad="$bad req:json"
-  grep -qx 'pdo_mysql' "$dir/common/php/required-extensions" || bad="$bad req:pdo_mysql"
-  grep -qx 'mysqli' "$dir/common/php/required-extensions" || bad="$bad req:mysqli"
-  grep -q '^FROM php:8.5-apache' "$dir/apache/Dockerfile" || bad="$bad apache:from"
-  grep -q 'a2enmod rewrite' "$dir/apache/Dockerfile" || bad="$bad apache:rewrite"
-  grep -q 'docker-php-ext-install.*intl gd pdo_mysql mysqli' "$dir/apache/Dockerfile" || bad="$bad apache:ext"
-  grep -q 'pecl install imagick' "$dir/apache/Dockerfile" || bad="$bad apache:imagick"
-  grep -q '^FROM php:8.5-fpm' "$dir/nginx/Dockerfile" || bad="$bad nginx:from"
-  grep -q 'image: nginx:1.27-alpine' "$dir/nginx/docker-compose.yml" || bad="$bad nginx:web"
-  grep -q 'image: mariadb:latest' "$dir/nginx/docker-compose.yml" || bad="$bad nginx:db"
-  grep -q 'image: mariadb:latest' "$dir/apache/docker-compose.yml" || bad="$bad apache:db"
-  grep -q 'try_files \$uri \$uri/ /index.php?\$query_string;' "$dir/nginx/conf.d/default.conf" || bad="$bad nginx:tryfiles"
-  grep -q 'AllowOverride All' "$dir/apache/vhost.conf" || bad="$bad apache:override"
-  [ -z "$bad" ] && create.result 0 "lamp templates carry the two stacks" || create.result 1 "templates:$bad"
+test.lamp.backend() {
+  local got bad=""
+  got=$(private.lamp.backend.choose docker)
+  [ "$got" = docker ] || bad="$bad explicitDocker=[$got]"
+  got=$(private.lamp.backend.choose native)
+  [ "$got" = native ] || bad="$bad explicitNative=[$got]"
+  got=$(LAMP_BACKEND=native private.lamp.backend.choose prompt)
+  [ "$got" = native ] || bad="$bad env=[$got]"
+  got=$(LAMP_BACKEND=docker private.lamp.backend.choose "")
+  [ "$got" = docker ] || bad="$bad env2=[$got]"
+  got=$(LAMP_BACKEND=bogus private.lamp.backend.choose "")
+  [ -z "$got" ] || bad="$bad bogus=[$got]"
+  [ -z "$bad" ] && create.result 0 "backend selection works" || create.result 1 "backend:$bad"
   return $(result)
 }
 
-test.case $level "T-LAMP-TEMPLATES: both stacks and every required extension are in the templates" test.lamp.templates
-expect 0 "lamp templates carry the two stacks" "nginx and apache variants, extensions asserted as text"
+test.case $level "T-LAMP-BACKEND: explicit, env and default selection" test.lamp.backend
+expect 0 "backend selection works" "docker, native, LAMP_BACKEND and an invalid value"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run — FAIL** (`command not found`).
 
-Run: `./test.suite run lamp 1`
-Expected: FAIL with `missing:common/php/php.ini …`.
+- [ ] **Step 3: Implement**
 
-- [ ] **Step 3: Create the common templates**
+```bash
+private.lamp.docker.usable() # # rc 0 when the daemon and compose work
+{
+  if this.functionExists odocker.support.check; then
+    odocker.support.check >/dev/null 2>&1 || return 1
+  fi
+  docker compose version >/dev/null 2>&1
+}
 
-`templates/lamp/common/php/required-extensions`:
+private.lamp.backend.choose() # <?backend:prompt> # echo docker or native; asks on a TTY
+{
+  local choice="$1" fallback
+  case "$choice" in docker|native) echo "$choice"; return 0 ;; esac
+  if [ -n "${LAMP_BACKEND:-}" ]; then
+    case "$LAMP_BACKEND" in
+      docker|native) echo "$LAMP_BACKEND"; return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  if private.lamp.docker.usable; then fallback=docker; else fallback=native; fi
+  if [ -t 0 ]; then
+    read -r -p "backend [docker|native] ($fallback): " choice
+    [ -n "$choice" ] || choice="$fallback"
+  else
+    choice="$fallback"
+  fi
+  case "$choice" in
+    docker|native) echo "$choice" ;;
+    *) return 1 ;;
+  esac
+}
+```
+
+- [ ] **Step 4: Run — PASS.**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lamp test/test.lamp
+git commit -m "feat(lamp): backend selection with TTY prompt and LAMP_BACKEND override"
+```
+
+---
+
+### Task 3: Docker backend (templates + install + lifecycle)
+
+**Files:**
+- Create: `templates/lamp/common/{php/php.ini,php/required-extensions,db/01-charset.sql,certbot/renew-loop.sh}`
+- Create: `templates/lamp/docker/{nginx,apache}/{Dockerfile,docker-compose.yml}`
+- Create: `templates/lamp/vhost/{nginx,apache}.conf`
+- Modify: `lamp`, `test/test.lamp`
+
+- [ ] **Step 1: Failing template test**
+
+```bash
+test.lamp.templates() {
+  local d="$OOSH_DIR/templates/lamp" bad="" f
+  for f in common/php/php.ini common/php/required-extensions common/db/01-charset.sql \
+           common/certbot/renew-loop.sh docker/nginx/Dockerfile docker/nginx/docker-compose.yml \
+           docker/apache/Dockerfile docker/apache/docker-compose.yml vhost/nginx.conf vhost/apache.conf; do
+    [ -f "$d/$f" ] || bad="$bad missing:$f"
+  done
+  grep -q '^FROM php:8.5-apache' "$d/docker/apache/Dockerfile" || bad="$bad apache:from"
+  grep -q 'a2enmod rewrite' "$d/docker/apache/Dockerfile" || bad="$bad apache:rewrite"
+  grep -q 'docker-php-ext-install.*intl gd pdo_mysql mysqli' "$d/docker/apache/Dockerfile" || bad="$bad apache:ext"
+  grep -q 'pecl install imagick' "$d/docker/apache/Dockerfile" || bad="$bad apache:imagick"
+  grep -q '^FROM php:8.5-fpm' "$d/docker/nginx/Dockerfile" || bad="$bad nginx:from"
+  grep -q 'image: nginx:1.27-alpine' "$d/docker/nginx/docker-compose.yml" || bad="$bad nginx:web"
+  grep -q 'image: mariadb:latest' "$d/docker/apache/docker-compose.yml" || bad="$bad apache:db"
+  grep -q 'try_files \$uri \$uri/ /index.php?\$query_string;' "$d/vhost/nginx.conf" || bad="$bad nginx:tryfiles"
+  grep -q 'AllowOverride All' "$d/vhost/apache.conf" || bad="$bad apache:override"
+  [ -z "$bad" ] && create.result 0 "templates carry both backends" || create.result 1 "templates:$bad"
+  return $(result)
+}
+test.case $level "T-LAMP-TEMPLATES: docker files, vhosts and the extension list exist" test.lamp.templates
+expect 0 "templates carry both backends" "Dockerfiles, compose, vhosts, extension contract"
+```
+
+- [ ] **Step 2: Run — FAIL.**
+
+- [ ] **Step 3: Create the templates**
+
+`common/php/required-extensions`:
+
 ```
 intl
 mbstring
@@ -202,7 +271,8 @@ pdo_mysql
 mysqli
 ```
 
-`templates/lamp/common/php/php.ini`:
+`common/php/php.ini`:
+
 ```ini
 date.timezone = UTC
 memory_limit = 256M
@@ -212,12 +282,14 @@ max_execution_time = 60
 expose_php = Off
 ```
 
-`templates/lamp/common/db/01-charset.sql`:
+`common/db/01-charset.sql`:
+
 ```sql
 ALTER DATABASE lamp CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 ```
 
-`templates/lamp/common/certbot/renew-loop.sh`:
+`common/certbot/renew-loop.sh`:
+
 ```sh
 #!/bin/sh
 trap exit TERM
@@ -227,12 +299,10 @@ while :; do
 done
 ```
 
-- [ ] **Step 4: Create the Nginx variant**
+`docker/nginx/Dockerfile`:
 
-`templates/lamp/nginx/Dockerfile`:
 ```dockerfile
 FROM php:8.5-fpm
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libicu-dev libpng-dev libjpeg62-turbo-dev libfreetype6-dev libmagickwand-dev \
  && docker-php-ext-configure gd --with-freetype --with-jpeg \
@@ -241,82 +311,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/* /tmp/pear
 ```
 
-`templates/lamp/nginx/docker-compose.yml`:
-```yaml
-name: lamp
-services:
-  web:
-    image: nginx:1.27-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - "${LAMP_HOME}/conf.d:/etc/nginx/conf.d:ro"
-      - "${LAMP_HOME}/www:/var/www/html:ro"
-      - "${LAMP_HOME}/certs/conf:/etc/letsencrypt:ro"
-      - "${LAMP_HOME}/certs/www:/var/www/certbot:ro"
-    depends_on:
-      - app
-  app:
-    build:
-      context: .
-    restart: unless-stopped
-    environment:
-      MARIADB_HOST: db
-      MARIADB_DATABASE: lamp
-    volumes:
-      - "${LAMP_HOME}/www:/var/www/html"
-      - "${LAMP_HOME}/php.ini:/usr/local/etc/php/conf.d/99-lamp.ini:ro"
-    depends_on:
-      db:
-        condition: service_healthy
-  db:
-    image: mariadb:latest
-    restart: unless-stopped
-    env_file:
-      - "${LAMP_HOME}/stack.env"
-    volumes:
-      - "${LAMP_HOME}/db:/var/lib/mysql"
-      - "${LAMP_HOME}/../lamp/../lamp/db-init:/docker-entrypoint-initdb.d:ro"
-    healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
-  certbot:
-    image: certbot/certbot
-    restart: unless-stopped
-    volumes:
-      - "${LAMP_HOME}/certs/conf:/etc/letsencrypt"
-      - "${LAMP_HOME}/certs/www:/var/www/certbot"
-      - "${LAMP_HOME}/certbot:/renew-loop.sh:ro"
-    entrypoint: ["/bin/sh", "/renew-loop.sh"]
-```
+`docker/apache/Dockerfile`:
 
-`templates/lamp/nginx/conf.d/default.conf`:
-```nginx
-server {
-    listen 80 default_server;
-    server_name _;
-    root /var/www/html;
-    index index.php index.html;
-    location /.well-known/acme-challenge/ { root /var/www/certbot; }
-    location / { try_files $uri $uri/ /index.php?$query_string; }
-    location ~ \.php$ {
-        include fastcgi_params;
-        fastcgi_pass app:9000;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-    }
-}
-```
-
-- [ ] **Step 5: Create the Apache variant**
-
-`templates/lamp/apache/Dockerfile`:
 ```dockerfile
 FROM php:8.5-apache
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libicu-dev libpng-dev libjpeg62-turbo-dev libfreetype6-dev libmagickwand-dev \
  && docker-php-ext-configure gd --with-freetype --with-jpeg \
@@ -326,41 +324,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/* /tmp/pear
 ```
 
-`templates/lamp/apache/docker-compose.yml`:
+`docker/nginx/docker-compose.yml`:
+
 ```yaml
 name: lamp
 services:
-  app:
-    build:
-      context: .
+  web:
+    image: nginx:1.27-alpine
     restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      MARIADB_HOST: db
-      MARIADB_DATABASE: lamp
+    ports: ["80:80", "443:443"]
     volumes:
-      - "${LAMP_HOME}/www:/var/www/html"
-      - "${LAMP_HOME}/conf.d:/etc/apache2/sites-enabled:ro"
+      - "${LAMP_HOME}/conf.d:/etc/nginx/conf.d:ro"
+      - "${LAMP_HOME}/www:/var/www/html:ro"
       - "${LAMP_HOME}/certs/conf:/etc/letsencrypt:ro"
       - "${LAMP_HOME}/certs/www:/var/www/certbot:ro"
+    depends_on: [app]
+  app:
+    build: { context: . }
+    restart: unless-stopped
+    environment: { MARIADB_HOST: db, MARIADB_DATABASE: lamp }
+    volumes:
+      - "${LAMP_HOME}/www:/var/www/html"
       - "${LAMP_HOME}/php.ini:/usr/local/etc/php/conf.d/99-lamp.ini:ro"
     depends_on:
-      db:
-        condition: service_healthy
+      db: { condition: service_healthy }
   db:
     image: mariadb:latest
     restart: unless-stopped
-    env_file:
-      - "${LAMP_HOME}/stack.env"
+    env_file: ["${LAMP_HOME}/stack.env"]
     volumes:
       - "${LAMP_HOME}/db:/var/lib/mysql"
       - "${LAMP_HOME}/db-init:/docker-entrypoint-initdb.d:ro"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 5s
-      timeout: 5s
       retries: 30
   certbot:
     image: certbot/certbot
@@ -372,12 +369,70 @@ services:
     entrypoint: ["/bin/sh", "/renew-loop.sh"]
 ```
 
-`templates/lamp/apache/vhost.conf`:
+`docker/apache/docker-compose.yml`:
+
+```yaml
+name: lamp
+services:
+  app:
+    build: { context: . }
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment: { MARIADB_HOST: db, MARIADB_DATABASE: lamp }
+    volumes:
+      - "${LAMP_HOME}/www:/var/www/html"
+      - "${LAMP_HOME}/conf.d:/etc/apache2/sites-enabled:ro"
+      - "${LAMP_HOME}/certs/conf:/etc/letsencrypt:ro"
+      - "${LAMP_HOME}/certs/www:/var/www/certbot:ro"
+      - "${LAMP_HOME}/php.ini:/usr/local/etc/php/conf.d/99-lamp.ini:ro"
+    depends_on:
+      db: { condition: service_healthy }
+  db:
+    image: mariadb:latest
+    restart: unless-stopped
+    env_file: ["${LAMP_HOME}/stack.env"]
+    volumes:
+      - "${LAMP_HOME}/db:/var/lib/mysql"
+      - "${LAMP_HOME}/db-init:/docker-entrypoint-initdb.d:ro"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      retries: 30
+  certbot:
+    image: certbot/certbot
+    restart: unless-stopped
+    volumes:
+      - "${LAMP_HOME}/certs/conf:/etc/letsencrypt"
+      - "${LAMP_HOME}/certs/www:/var/www/certbot"
+      - "${LAMP_HOME}/certbot:/renew-loop.sh:ro"
+    entrypoint: ["/bin/sh", "/renew-loop.sh"]
+```
+
+`vhost/nginx.conf` (placeholders `@DOMAIN@`, `@DOCROOT@`, `@CERT@` replaced by `site.add`):
+
+```nginx
+server {
+    listen 80;
+    server_name @DOMAIN@;
+    root @DOCROOT@;
+    index index.php index.html;
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { try_files $uri $uri/ /index.php?$query_string; }
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass @PHP@;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+}
+```
+
+`vhost/apache.conf`:
+
 ```apache
 <VirtualHost *:80>
-    ServerName _
-    DocumentRoot /var/www/html
-    <Directory /var/www/html>
+    ServerName @DOMAIN@
+    DocumentRoot @DOCROOT@
+    <Directory @DOCROOT@>
         AllowOverride All
         Require all granted
     </Directory>
@@ -388,289 +443,107 @@ services:
 </VirtualHost>
 ```
 
-- [ ] **Step 6: Fix the Nginx `db-init` volume line**
-
-The line copied in Step 4 is deliberately wrong to make you check it. Replace:
-
-```yaml
-      - "${LAMP_HOME}/../lamp/../lamp/db-init:/docker-entrypoint-initdb.d:ro"
-```
-
-with:
-
-```yaml
-      - "${LAMP_HOME}/db-init:/docker-entrypoint-initdb.d:ro"
-```
-
-- [ ] **Step 7: Run the test to verify it passes**
-
-Run: `./test.suite run lamp 1`
-Expected: `Passed: 3  Failed: 0`.
-
-- [ ] **Step 8: Commit**
+- [ ] **Step 4: Failing install test (Docker path)**
 
 ```bash
-git add templates/lamp test/test.lamp
-git commit -m "feat(lamp): versioned nginx and apache templates with the required extensions"
-```
+test.lamp.dockerInstall() {
+  local fx got bad=""
+  fx=$(test.suite.fixture.make lampdocker)
+  mkdir -p "$fx/home" "$fx/config" "$fx/ws"
+  cp -a "$OOSH_DIR/templates/lamp/." "$fx/ws/" 2>/dev/null || true
+  : > "$fx/calls"
 
----
-
-### Task 3: helpers, state and `stack.install`
-
-**Files:**
-- Modify: `lamp` (insert before the final `lamp.start "$@"`)
-- Test: `test/test.lamp`
-
-- [ ] **Step 1: Write the failing tests**
-
-Above `test.suite.save.results` in `test/test.lamp`, add the fixture and helpers:
-
-```bash
-test.lamp.fixture() { # # echo a fixture root seeded from the templates
-  local fx
-  fx=$(test.suite.fixture.make lamptest)
-  mkdir -p "$fx/home" "$fx/config" "$fx/ws/LAMP/1.0.0"
-  cp -a "$OOSH_DIR/templates/lamp/." "$fx/ws/LAMP/1.0.0/"
-  echo "$fx"
-}
-
-test.lamp.run() { # <fx> <command...> # echo rc|RESULT, docker stubbed, calls in <fx>/calls
-  local fx="$1"; shift
-  ( HOME="$fx/home"; CONFIG_PATH="$fx/config"; ODOCKER_WORKSPACES="$fx/ws"
-    mkdir -p "$HOME" "$CONFIG_PATH"
+  got=$( ( HOME="$fx/home"; CONFIG_PATH="$fx/config"; ODOCKER_WORKSPACES="$fx/ws"; LAMP_BACKEND=docker
     docker() {
       printf '%s\n' "$*" >> "$fx/calls"
       case "$*" in
-        *"exec -T app php -m"*) cat "$fx/ws/LAMP/1.0.0/common/php/required-extensions" ;;
+        *"exec -T app php -m"*) cat "$OOSH_DIR/templates/lamp/common/php/required-extensions" ;;
         *"exec -T app php -r"*) echo 8.5.12 ;;
-        *"mariadb --version"*) echo "mariadb  Ver 15.1 Distrib 13.0.2-MariaDB, for debian-linux-gnu" ;;
-        *"compose ps"*) echo "lamp-app-1 running" ;;
+        *"mariadb --version"*) echo "mariadb  Ver 15.1 Distrib 13.0.2-MariaDB" ;;
         *) return 0 ;;
       esac
     }
     odocker.support.check() { return 0; }
-    "$@" >/dev/null 2>&1
-    printf '%s|%s' "$?" "$RESULT" )
-}
-```
-
-Then the tests:
-
-```bash
-test.lamp.install() {
-  local fx got bad=""
-  fx=$(test.lamp.fixture); : > "$fx/calls"
-
-  got=$(test.lamp.run "$fx" lamp.stack.install)
-  [ "$got" = "1|no web server was specified (nginx or apache)" ] || bad="$bad noServer=[$got]"
-
-  got=$(test.lamp.run "$fx" lamp.stack.install lighttpd)
-  [ "$got" = "1|lighttpd is no web server — nginx or apache" ] || bad="$bad badServer=[$got]"
-
-  got=$(test.lamp.run "$fx" lamp.stack.install nginx)
-  [ "$got" = "0|installed nginx (php 8.5.12, mariadb 13.0.2)" ] || bad="$bad nginx=[$got]"
-  grep -qx 'LAMP_WEBSERVER=nginx' "$fx/config/lamp/stack.env" || bad="$bad env"
-  [ "$(stat -c %a "$fx/config/lamp/stack.env")" = 600 ] || bad="$bad mode"
-  grep -q ' compose .*build' "$fx/calls" || bad="$bad build"
-  grep -q ' compose .*up -d --wait' "$fx/calls" || bad="$bad up"
-
-  got=$(test.lamp.run "$fx" lamp.stack.install nginx)
-  [ "$got" = "0|already installed (nginx)" ] || bad="$bad again=[$got]"
-
-  got=$(test.lamp.run "$fx" lamp.stack.install apache)
-  [ "$got" = "0|switched nginx → apache" ] || bad="$bad switch=[$got]"
-  grep -qx 'LAMP_WEBSERVER=apache' "$fx/config/lamp/stack.env" || bad="$bad env2"
-
-  [ -z "$bad" ] && create.result 0 "install validates and switches" || create.result 1 "install:$bad"
+    lamp.stack.install nginx 8.5 latest docker >/dev/null 2>&1
+    printf '%s|%s' "$?" "$RESULT" ) )
+  [ "$got" = "0|installed docker nginx (php 8.5.12, mariadb 13.0.2)" ] || bad="$bad install=[$got]"
+  grep -qx 'LAMP_BACKEND=docker' "$fx/config/lamp/stack.env" || bad="$bad backend"
+  grep -q '^compose .*up -d --wait' "$fx/calls" || bad="$bad up"
+  [ -z "$bad" ] && create.result 0 "docker install works" || create.result 1 "docker:$bad"
   return $(result)
 }
-
-test.case $level "T-LAMP-INSTALL: install validates the server, writes state and switches variants" test.lamp.install
-expect 0 "install validates and switches" "nginx, apache and the invalid paths"
+test.case $level "T-LAMP-DOCKER: install records the backend and starts compose" test.lamp.dockerInstall
+expect 0 "docker install works" "state, build/up and the extension check"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
-
-Run: `./test.suite run lamp 1`
-Expected: FAIL — `lamp.stack.install` is not defined.
-
-- [ ] **Step 3: Insert the helpers into `lamp`**
-
-Immediately above the final `lamp.start "$@"` line, add:
+- [ ] **Step 5: Implement state, compose and install**
 
 ```bash
-private.lamp.home() # # echo the runtime root, $CONFIG_PATH/lamp
-{
-  echo "${CONFIG_PATH:-$HOME/config}/lamp"
+private.lamp.home() { echo "${CONFIG_PATH:-$HOME/config}/lamp"; }
+private.lamp.env.get() { local f; f="$(private.lamp.home)/stack.env"; [ -f "$f" ] || return 1; ( . "$f"; eval "printf '%s' \"\${$1-}\"" ); }
+private.lamp.installed() { [ -f "$(private.lamp.home)/stack.env" ]; }
+private.lamp.webserver() { private.lamp.env.get LAMP_WEBSERVER; }
+private.lamp.backend() { private.lamp.env.get LAMP_BACKEND; }
+
+private.lamp.require.installed() {
+  private.lamp.installed && return 0
+  create.result 1 "no stack installed — run: lamp stack.install nginx"
+  error.log "$RESULT"; return $(result)
 }
 
-private.lamp.env.get() # <key> # echo one value of <home>/stack.env
-{
-  local key="$1" file
-  file="$(private.lamp.home)/stack.env"
-  [ -f "$file" ] || return 1
-  ( . "$file"; eval "printf '%s' \"\${$key-}\"" )
-}
+private.lamp.password.new() { LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24; }
 
-private.lamp.installed() # # rc 0 when a stack is installed
-{
-  [ -f "$(private.lamp.home)/stack.env" ]
-}
-
-private.lamp.webserver() # # echo the installed web server
-{
-  private.lamp.env.get LAMP_WEBSERVER
-}
-
-private.lamp.template.dir() # <webserver> # echo the workspace template of <webserver>
-{
-  local root="${ODOCKER_WORKSPACES:-}"
-  [ -n "$root" ] || return 1
-  echo "$root/LAMP/1.0.0/$1"
-}
-
-private.lamp.compose() # <args...> # docker compose for the lamp project
-{
+private.lamp.compose() {
   local home template
   home="$(private.lamp.home)"
-  template="$(private.lamp.template.dir "$(private.lamp.webserver)")" || return 1
+  template="$ODOCKER_WORKSPACES/lamp/docker/$(private.lamp.webserver)"
   docker compose --env-file "$home/stack.env" -f "$template/docker-compose.yml" -p lamp "$@"
 }
 
-private.lamp.docker.check() # # rc 0 when docker can work here
-{
-  if this.functionExists odocker.support.check; then
-    odocker.support.check && return 0
-  elif docker info >/dev/null 2>&1; then
-    return 0
-  fi
-  create.result 1 "docker is not usable here — run: odocker prereqs.install"
-  return $(result)
-}
-
-private.lamp.password.new() # # echo a 24-character password
-{
-  LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
-}
-
-private.lamp.require.installed() # # rc 0 when installed, else RESULT + rc 1
-{
-  private.lamp.installed && return 0
-  create.result 1 "no stack installed — run: lamp stack.install nginx|apache"
-  error.log "$RESULT"
-  return $(result)
-}
-
-private.lamp.seed() # <webserver> # copy the templates into the workspace when absent
-{
-  local root="${ODOCKER_WORKSPACES:-}" target
-  [ -n "$root" ] || { create.result 1 "ODOCKER_WORKSPACES is not set — run: odocker workspace.set"; return $(result); }
-  target="$root/LAMP/1.0.0"
-  if [ ! -d "$target/$1" ]; then
-    mkdir -p "$target" || { create.result 1 "cannot create $target"; return $(result); }
-    cp -a "$OOSH_DIR/templates/lamp/." "$target/" || { create.result 1 "cannot seed $target"; return $(result); }
-  fi
-  create.result 0 "$target/$1"
-  return $(result)
-}
-
-private.lamp.extensions.check() # # rc 0 when php loads every required extension
-{
-  local required="$ODOCKER_WORKSPACES/LAMP/1.0.0/common/php/required-extensions" loaded missing="" name
-  [ -f "$required" ] || { create.result 1 "no $required"; return $(result); }
-  loaded="$(private.lamp.compose exec -T app php -m 2>/dev/null)" || {
-    create.result 1 "cannot ask php for its extensions"; return $(result); }
+private.lamp.extensions.check() {
+  local required="$OOSH_DIR/templates/lamp/common/php/required-extensions" loaded missing="" name
+  case "$(private.lamp.backend)" in
+    docker) loaded="$(private.lamp.compose exec -T app php -m 2>/dev/null)" ;;
+    *)      loaded="$(php -m 2>/dev/null)" ;;
+  esac
+  [ -n "$loaded" ] || { create.result 1 "cannot ask php for its extensions"; return $(result); }
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     printf '%s\n' "$loaded" | grep -qxF "$name" || missing="$missing $name"
   done < "$required"
-  if [ -n "$missing" ]; then
-    create.result 1 "php is missing:$missing"
-    return $(result)
-  fi
-  create.result 0 "php has every required extension"
+  [ -z "$missing" ] && create.result 0 "php has every required extension" || create.result 1 "php is missing:$missing"
   return $(result)
 }
 
-private.lamp.render.all() # # re-render every site in <home>/sites
+lamp.stack.install()     # <webserver> <?php:8.5> <?mariadb:latest> <?backend:prompt> # install the stack natively or with Docker # lamp stack.install nginx
 {
-  local home domain docroot
-  home="$(private.lamp.home)"
-  [ -f "$home/sites" ] || return 0
-  while IFS=$'\t' read -r domain docroot; do
-    [ -n "$domain" ] || continue
-    private.lamp.vhost.render "$domain" "$docroot" > "$home/conf.d/$domain.conf" || return $(result)
-  done < "$home/sites"
-}
-```
+  local webserver="$1" php="${2:-8.5}" mariadb="${3:-latest}" wantBackend="${4:-prompt}"
+  local family init pkg backend home previous="" same="no"
 
-`private.lamp.vhost.render` is added in Task 5; until then `render.all` is unused and never called (install calls it only when switching, which Task 3's tests do not exercise). That is deliberate: Task 5 will add the renderer and its test.
+  [ -n "$webserver" ] || { create.result 1 "no web server was specified (nginx or apache)"; error.log "$RESULT"; return $(result); }
+  case "$webserver" in nginx|apache) ;; *) create.result 1 "$webserver is no web server — nginx or apache"; error.log "$RESULT"; return $(result) ;; esac
 
-- [ ] **Step 4: Insert `lamp.stack.install`**
+  family="$(private.lamp.os.family)" || { create.result 1 "unsupported operating system"; error.log "$RESULT"; return $(result); }
+  init="${family#*$'\t'}"; init="${init%%$'\t'*}"
+  pkg="${family##*$'\t'}"; family="${family%%$'\t'*}"
 
-Above `lamp.start "$@"`, after the helpers, add:
-
-```bash
-lamp.stack.install()     # <nginx|apache> <?php:8.5> <?mariadb:latest> # install or switch the web stack — nginx+php-fpm or apache+mod_php, MariaDB, PHP 8.5; the web server is chosen here and stored # lamp stack.install nginx
-{
-  local webserver="$1" php="${2:-8.5}" mariadb="${3:-latest}" home root template previous="" same="no" phpResolved mariadbResolved seed
-
-  if [ -z "$webserver" ]; then
-    if [ -t 0 ]; then
-      read -r -p "web server [nginx]: " webserver </dev/tty || webserver=""
-      [ -n "$webserver" ] || webserver=nginx
-    else
-      create.result 1 "no web server was specified (nginx or apache)"
-      error.log "$RESULT"
-      return $(result)
-    fi
-  fi
-  case "$webserver" in
-    nginx|apache) ;;
-    *)
-      create.result 1 "$webserver is no web server — nginx or apache"
-      error.log "$RESULT"
-      return $(result)
-      ;;
-  esac
-
-  private.lamp.docker.check || { error.log "$RESULT"; return $(result); }
-
-  seed="$(private.lamp.seed "$webserver")" || { error.log "$RESULT"; return $(result); }
-  root="${ODOCKER_WORKSPACES:-}"
-  template="$(private.lamp.template.dir "$webserver")"
-  [ -d "$template" ] || {
-    create.result 1 "no template at $template"; error.log "$RESULT"; return $(result); }
+  backend="$(private.lamp.backend.choose "$wantBackend")" || { create.result 1 "no backend chosen — docker or native"; error.log "$RESULT"; return $(result); }
 
   home="$(private.lamp.home)"
-  if private.lamp.installed; then
-    previous="$(private.lamp.webserver)"
-    [ "$previous" = "$webserver" ] && same="yes"
-  fi
+  previous="$(private.lamp.env.get LAMP_BACKEND)/$(private.lamp.env.get LAMP_WEBSERVER)"
+  [ "$previous" = "$backend/$webserver" ] && same="yes"
 
-  if [ "$same" = yes ] &&
-     [ "$(private.lamp.env.get LAMP_PHP)" = "$php" ] &&
-     [ "$(private.lamp.env.get LAMP_MARIADB)" = "$mariadb" ]; then
-    create.result 0 "already installed ($webserver)"
-    success.log "$RESULT"
-    return $(result)
-  fi
-
-  mkdir -p "$home"/{www,conf.d,certs/conf,certs/www,db,logs,db-init} || {
-    create.result 1 "cannot create $home"; error.log "$RESULT"; return $(result); }
-  chmod 700 "$home" 2>/dev/null
+  mkdir -p "$home"/{www,conf.d,certs/conf,certs/www,db,logs,db-init} || { create.result 1 "cannot create $home"; error.log "$RESULT"; return $(result); }
   cp -f "$OOSH_DIR/templates/lamp/common/php/php.ini" "$home/php.ini"
   cp -f "$OOSH_DIR/templates/lamp/common/db/01-charset.sql" "$home/db-init/"
-  cp -f "$OOSH_DIR/templates/lamp/common/certbot/renew-loop.sh" "$home/certbot"
-  chmod +x "$home/certbot"
 
-  local rootPass
-  rootPass="$(private.lamp.env.get MARIADB_ROOT_PASSWORD)"
-  [ -n "$rootPass" ] || rootPass="$(private.lamp.password.new)"
-
+  local rootPass; rootPass="$(private.lamp.env.get MARIADB_ROOT_PASSWORD)"; [ -n "$rootPass" ] || rootPass="$(private.lamp.password.new)"
   cat > "$home/stack.env" <<EOF
 LAMP_HOME=$home
+LAMP_BACKEND=$backend
+LAMP_OS_FAMILY=$family
+LAMP_INIT=$init
+LAMP_PKG=$pkg
 LAMP_WEBSERVER=$webserver
 LAMP_PHP=$php
 LAMP_MARIADB=$mariadb
@@ -681,613 +554,638 @@ MARIADB_DATABASE=lamp
 EOF
   chmod 600 "$home/stack.env"
 
-  if [ "$same" = no ] && [ -n "$previous" ]; then
-    private.lamp.compose down --remove-orphans >/dev/null 2>&1
-    private.lamp.render.all || { error.log "$RESULT"; return $(result); }
-  fi
-
-  private.lamp.compose build || {
-    create.result 1 "docker compose build failed"; error.log "$RESULT"; return $(result); }
-  private.lamp.compose up -d --wait || {
-    create.result 1 "docker compose up failed"; error.log "$RESULT"; return $(result); }
-
-  phpResolved="$(private.lamp.compose exec -T app php -r 'echo PHP_VERSION;' 2>/dev/null)"
-  mariadbResolved="$(private.lamp.compose exec -T db sh -c 'mariadb --version' 2>/dev/null |
-    sed 's/.*\([0-9][0-9.]*\)-MariaDB.*/\1/')"
-  sed -i "s/^LAMP_PHP_RESOLVED=.*/LAMP_PHP_RESOLVED=$phpResolved/" "$home/stack.env"
-  sed -i "s/^LAMP_MARIADB_RESOLVED=.*/LAMP_MARIADB_RESOLVED=$mariadbResolved/" "$home/stack.env"
+  case "$backend" in
+    docker) private.lamp.docker.install "$webserver" || { error.log "$RESULT"; return $(result); } ;;
+    native) private.lamp.native.install "$family" "$pkg" "$webserver" "$php" "$mariadb" || { error.log "$RESULT"; return $(result); } ;;
+  esac
 
   private.lamp.extensions.check || { error.log "$RESULT"; return $(result); }
+  private.lamp.render.all || { error.log "$RESULT"; return $(result); }
 
-  if [ -z "$previous" ]; then
-    create.result 0 "installed $webserver (php $phpResolved, mariadb $mariadbResolved)"
-  elif [ "$same" = no ]; then
-    create.result 0 "switched $previous → $webserver"
+  if [ -z "$(private.lamp.env.get LAMP_PHP_RESOLVED)" ]; then
+    case "$backend" in
+      docker) : ;;
+      *)
+        sed -i "s/^LAMP_PHP_RESOLVED=.*/LAMP_PHP_RESOLVED=$(php -r 'echo PHP_VERSION;' 2>/dev/null)/" "$home/stack.env"
+        sed -i "s/^LAMP_MARIADB_RESOLVED=.*/LAMP_MARIADB_RESOLVED=$(mariadb --version 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /-MariaDB/) {sub(/-MariaDB.*/,"",$i); print $i; exit}}')/" "$home/stack.env"
+        ;;
+    esac
+  fi
+
+  if [ "$same" = no ] && [ -n "$(private.lamp.env.get LAMP_WEBSERVER)" ] && [ -n "$previous" ] && [ "${previous%%/*}" != "$backend" ]; then
+    create.result 0 "switched to $backend $webserver"
   else
-    create.result 0 "$webserver reinstalled (php $phpResolved, mariadb $mariadbResolved)"
+    create.result 0 "installed $backend $webserver (php $(private.lamp.env.get LAMP_PHP_RESOLVED), mariadb $(private.lamp.env.get LAMP_MARIADB_RESOLVED))"
   fi
   success.log "$RESULT"
   return $(result)
 }
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
-
-Run: `./test.suite run lamp 1`
-Expected: `Passed: 4  Failed: 0`.
-
-- [ ] **Step 6: Commit**
+`private.lamp.docker.install`:
 
 ```bash
-git add lamp test/test.lamp
-git commit -m "feat(lamp): install/switch the stack with recorded state and extension check"
+private.lamp.docker.install() # <webserver> # seed, build, up, record versions
+{
+  local webserver="$1" target="$ODOCKER_WORKSPACES/lamp" home
+  home="$(private.lamp.home)"
+  if [ ! -d "$target/docker/$webserver" ]; then
+    mkdir -p "$target" || { create.result 1 "cannot create $target"; return $(result); }
+    cp -a "$OOSH_DIR/templates/lamp/." "$target/" || { create.result 1 "cannot seed $target"; return $(result); }
+  fi
+  cp -f "$home/php.ini" "$home/php.ini"
+  private.lamp.compose down --remove-orphans >/dev/null 2>&1
+  private.lamp.compose build || { create.result 1 "docker compose build failed"; return $(result); }
+  private.lamp.compose up -d --wait || { create.result 1 "docker compose up failed"; return $(result); }
+  sed -i "s/^LAMP_PHP_RESOLVED=.*/LAMP_PHP_RESOLVED=$(private.lamp.compose exec -T app php -r 'echo PHP_VERSION;' 2>/dev/null)/" "$home/stack.env"
+  sed -i "s/^LAMP_MARIADB_RESOLVED=.*/LAMP_MARIADB_RESOLVED=$(private.lamp.compose exec -T db sh -c 'mariadb --version' 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /-MariaDB/) {sub(/-MariaDB.*/,"",$i); print $i; exit}}')/" "$home/stack.env"
+  create.result 0 "$webserver"
+  return $(result)
+}
+```
+
+- [ ] **Step 6: Run — PASS** for templates and Docker install (the native path still fails its own task).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add templates/lamp lamp test/test.lamp
+git commit -m "feat(lamp): docker backend — templates, compose and install"
 ```
 
 ---
 
-### Task 4: `stack.up`, `down`, `status`, `log`, `remove`
+### Task 4: Native package plan and install
 
-**Files:**
-- Modify: `lamp`
-- Test: `test/test.lamp`
+**Files:** `lamp`, `test/test.lamp`
 
-- [ ] **Step 1: Write the failing test**
-
-Above `test.suite.save.results`, add:
+- [ ] **Step 1: Failing package-plan test**
 
 ```bash
-test.lamp.stack() {
-  local fx got bad=""
-  fx=$(test.lamp.fixture); : > "$fx/calls"
-  test.lamp.run "$fx" lamp.stack.install nginx >/dev/null
-
-  got=$(test.lamp.run "$fx" lamp.stack.up)
-  [ "$got" = "0|stack is up" ] || bad="$bad up=[$got]"
-  grep -q ' compose .*up -d --wait' "$fx/calls" || bad="$bad upCall"
-
-  got=$(test.lamp.run "$fx" lamp.stack.down)
-  [ "$got" = "0|stack is down" ] || bad="$bad down=[$got]"
-
-  got=$(test.lamp.run "$fx" lamp.stack.status)
-  case "$got" in
-    0'|web server : nginx'*) : ;;
-    *) bad="$bad status=[$got]" ;;
-  esac
-
-  got=$(test.lamp.run "$fx" lamp.stack.log)
-  [ "$got" = "0|logs" ] || bad="$bad log=[$got]"
-
-  got=$(test.lamp.run "$fx" lamp.stack.status)
-  got=$(test.lamp.run "$fx" lamp.stack.remove)
-  [ "$got" = "0|stack removed (data kept)" ] || bad="$bad remove=[$got]"
-  [ -f "$fx/config/lamp/stack.env" ] && bad="$bad envAfterRemove"
-
-  [ -z "$bad" ] && create.result 0 "stack lifecycle works" || create.result 1 "stack:$bad"
+test.lamp.nativePlan() {
+  local got bad=""
+  got=$(private.lamp.native.packages debian nginx 8.5)
+  case "$got" in *"php8.5-fpm"*"nginx"*"mariadb-server"*"certbot"*) : ;; *) bad="$bad debian=[$got]" ;; esac
+  got=$(private.lamp.native.packages rhel apache 8.5)
+  case "$got" in *"httpd"*"php85-php"*"mariadb-server"*) : ;; *) bad="$bad rhel=[$got]" ;; esac
+  got=$(private.lamp.native.packages alpine nginx 8.5)
+  case "$got" in *"nginx"*"php-fpm"*"mariadb"*"certbot"*) : ;; *) bad="$bad alpine=[$got]" ;; esac
+  got=$(private.lamp.native.packages macos nginx 8.5)
+  case "$got" in *"nginx"*"php"*"mariadb"*"certbot"*) : ;; *) bad="$bad macos=[$got]" ;; esac
+  [ -z "$bad" ] && create.result 0 "package plans per family" || create.result 1 "plan:$bad"
   return $(result)
 }
-
-test.case $level "T-LAMP-STACK: up, down, status, log and remove" test.lamp.stack
-expect 0 "stack lifecycle works" "each lifecycle command and the state it leaves"
+test.case $level "T-LAMP-NATIVE-PLAN: every family gets its packages" test.lamp.nativePlan
+expect 0 "package plans per family" "debian, rhel, alpine, macos"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run — FAIL.**
 
-Run: `./test.suite run lamp 1`
-Expected: FAIL — `lamp.stack.up` is not defined.
-
-- [ ] **Step 3: Implement the lifecycle methods**
-
-Above `lamp.start "$@"`, add:
+- [ ] **Step 3: Implement the package plan and service helper**
 
 ```bash
-lamp.stack.up()     # # start the installed stack and wait for it # lamp stack.up
+private.lamp.native.packages() # <family> <webserver> <php> # echo the package list, space separated
 {
-  private.lamp.require.installed || return $(result)
-  private.lamp.compose up -d --wait || {
-    create.result 1 "docker compose up failed"; error.log "$RESULT"; return $(result); }
-  create.result 0 "stack is up"
-  success.log "$RESULT"
+  local family="$1" ws="$2" php="$3"
+  case "$family" in
+    debian)
+      if [ "$ws" = apache ]; then printf 'apache2 libapache2-mod-php%s php%s php%s-cli php%s-fpm php%s-intl php%s-gd php%s-imagick php%s-mbstring php%s-curl php%s-xml php%s-mysql php%s-opcache mariadb-server certbot python3-certbot-apache' "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php"
+      else printf 'nginx php%s-fpm php%s-cli php%s-intl php%s-gd php%s-imagick php%s-mbstring php%s-curl php%s-xml php%s-mysql php%s-opcache mariadb-server certbot python3-certbot-nginx' "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php" "$php"
+      fi ;;
+    rhel)
+      if [ "$ws" = apache ]; then printf 'httpd php85-php php85-php-cli php85-php-fpm php85-php-intl php85-php-gd php85-php-pecl-imagick php85-php-mbstring php85-php-xml php85-php-mysqlnd php85-php-opcache mariadb-server certbot python3-certbot-apache'
+      else printf 'nginx php85-php-fpm php85-php-cli php85-php-intl php85-php-gd php85-php-pecl-imagick php85-php-mbstring php85-php-xml php85-php-mysqlnd php85-php-opcache mariadb-server certbot python3-certbot-nginx'
+      fi ;;
+    alpine)
+      printf 'nginx php php-fpm php-intl php-gd php-pecl-imagick php-mbstring php-curl php-xml php-mysqli php-pdo_mysql php-opcache mariadb mariadb-client certbot' ;;
+    macos)
+      printf 'nginx php mariadb certbot' ;;
+    *) create.result 1 "unsupported family $family"; return $(result) ;;
+  esac
+  create.result 0 "$family"
   return $(result)
 }
 
-lamp.stack.down()     # # stop the installed stack, keeping its data # lamp stack.down
+private.lamp.native.sudo() # <command...> # run a privileged step, or fail with the exact command
 {
-  private.lamp.require.installed || return $(result)
-  private.lamp.compose down || {
-    create.result 1 "docker compose down failed"; error.log "$RESULT"; return $(result); }
-  create.result 0 "stack is down"
-  success.log "$RESULT"
+  if [ "$(id -u)" = 0 ]; then "$@"; return $?; fi
+  if sudo -n true 2>/dev/null || sudo -v 2>/dev/null; then sudo "$@"; return $?; fi
+  create.result 1 "sudo is required — run: sudo $*"
   return $(result)
 }
 
-lamp.stack.status()     # # print the installed stack: server, versions, containers, extensions, certificates # lamp stack.status
+private.lamp.native.service() # <family> <name> <start|stop|reload|enable> # manage one service
 {
+  local family="$1" name="$2" action="$3"
+  case "$family" in
+    debian|rhel)
+      case "$action" in
+        start)  private.lamp.native.sudo systemctl start "$name" ;;
+        stop)   private.lamp.native.sudo systemctl stop "$name" ;;
+        reload) private.lamp.native.sudo systemctl reload "$name" ;;
+        enable) private.lamp.native.sudo systemctl enable "$name" ;;
+      esac ;;
+    alpine)
+      case "$action" in
+        start)  private.lamp.native.sudo rc-service "$name" start ;;
+        stop)   private.lamp.native.sudo rc-service "$name" stop ;;
+        reload) private.lamp.native.sudo rc-service "$name" reload ;;
+        enable) private.lamp.native.sudo rc-update add "$name" default ;;
+      esac ;;
+    macos)
+      case "$action" in
+        start|enable) brew services start "$name" ;;
+        stop)         brew services stop "$name" ;;
+        reload)       brew services restart "$name" ;;
+      esac ;;
+  esac
+}
+
+private.lamp.native.install() # <family> <pkg> <webserver> <php> <mariadb> # install packages and start services
+{
+  local family="$1" pkg="$2" ws="$3" php="$4" mariadb="$5" list name
+  private.lamp.native.repo.add "$family" "$php" || { error.log "$RESULT"; return $(result); }
+  list="$(private.lamp.native.packages "$family" "$ws" "$php")"
+  case "$pkg" in
+    apt-get) private.lamp.native.sudo apt-get update && private.lamp.native.sudo apt-get install -y $list ;;
+    dnf)     private.lamp.native.sudo dnf install -y $list ;;
+    apk)     private.lamp.native.sudo apk add --no-cache $list ;;
+    brew)    brew install $list ;;
+    *)       create.result 1 "no package manager $pkg"; return $(result) ;;
+  esac || { create.result 1 "package install failed"; return $(result); }
+
+  case "$ws" in
+    nginx) name=nginx ;;
+    apache) case "$family" in debian) name=apache2 ;; *) name=httpd ;; esac ;;
+  esac
+  private.lamp.native.service "$family" "$name" enable
+  private.lamp.native.service "$family" "$name" start
+  private.lamp.native.service "$family" mariadb enable
+  private.lamp.native.service "$family" mariadb start
+  create.result 0 "$pkg"
+  return $(result)
+}
+
+private.lamp.native.repo.add() # <family> <php> # add Sury/Remi (or nothing where the distro has the version)
+{
+  local family="$1" php="$2"
+  case "$family" in
+    debian)
+      [ -f /etc/apt/sources.list.d/sury-php.list ] && return 0
+      private.lamp.native.sudo install -d /usr/share/keyrings
+      curl -fsSL https://packages.sury.org/php/apt.gpg | private.lamp.native.sudo tee /usr/share/keyrings/sury-php.gpg >/dev/null
+      echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ $( . /etc/os-release; echo "$VERSION_CODENAME" ) main" | private.lamp.native.sudo tee /etc/apt/sources.list.d/sury-php.list >/dev/null
+      private.lamp.native.sudo apt-get update ;;
+    rhel)
+      rpm -q remi-release >/dev/null 2>&1 && return 0
+      private.lamp.native.sudo dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-$(rpm -E %rhel).rpm" || return $?
+      private.lamp.native.sudo dnf module reset -y php ;;
+    alpine|macos) : ;;
+  esac
+  create.result 0 "$family"
+  return $(result)
+}
+```
+
+- [ ] **Step 4: Run — PASS** for the plan; the install test is Task 5.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lamp test/test.lamp
+git commit -m "feat(lamp): native package and service maps for four OS families"
+```
+
+---
+
+### Task 5: Native lifecycle and status
+
+**Files:** `lamp`, `test/test.lamp`
+
+- [ ] **Step 1: Failing test (stubbed package manager + services)**
+
+```bash
+test.lamp.nativeInstall() {
+  local fx got bad=""
+  fx=$(test.suite.fixture.make lampnative); mkdir -p "$fx/home" "$fx/config" "$fx/ws"; : > "$fx/calls"
+  got=$( ( HOME="$fx/home"; CONFIG_PATH="$fx/config"; LAMP_BACKEND=native
+    sudo() { printf 'sudo %s\n' "$*" >> "$fx/calls"; "$@"; }
+    systemctl() { printf 'systemctl %s\n' "$*" >> "$fx/calls"; }
+    apt-get() { printf 'apt-get %s\n' "$*" >> "$fx/calls"; }
+    curl() { :; }
+    php() { if [ "$1" = -m ]; then cat "$OOSH_DIR/templates/lamp/common/php/required-extensions"; else echo 8.5.12; fi; }
+    mariadb() { echo "mariadb  Ver 15.1 Distrib 13.0.2-MariaDB"; }
+    uname() { echo Linux; }
+    lamp.stack.install nginx 8.5 latest native >/dev/null 2>&1
+    printf '%s|%s' "$?" "$RESULT" ) )
+  [ "$got" = "0|installed native nginx (php 8.5.12, mariadb 13.0.2)" ] || bad="$bad install=[$got]"
+  grep -qx 'LAMP_BACKEND=native' "$fx/config/lamp/stack.env" || bad="$bad backend"
+  grep -q 'apt-get install' "$fx/calls" || bad="$bad apt"
+  grep -q 'systemctl start nginx' "$fx/calls" || bad="$bad start"
+  [ -z "$bad" ] && create.result 0 "native install runs the plan" || create.result 1 "native:$bad"
+  return $(result)
+}
+test.case $level "T-LAMP-NATIVE: install runs the package and service plan" test.lamp.nativeInstall
+expect 0 "native install runs the plan" "apt-get, systemctl and the recorded backend"
+```
+
+- [ ] **Step 2: Run — FAIL** (no native install yet).
+
+- [ ] **Step 3: Implement `up/down/status/log/remove` with a backend switch**
+
+```bash
+private.lamp.native.services() # # echo "<web> <php> <db>" for the installed backend
+{
+  local ws family; ws="$(private.lamp.webserver)"; family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+  case "$ws" in
+    nginx) ws=nginx ;;
+    apache) case "$family" in debian) ws=apache2 ;; *) ws=httpd ;; esac ;;
+  esac
+  case "$family" in
+    debian) echo "$ws php8.5-fpm mariadb" ;;
+    rhel)   echo "$ws php-fpm mariadb" ;;
+    alpine) echo "$ws php-fpm mariadb" ;;
+    macos)  echo "$ws none mariadb" ;;
+  esac
+}
+
+lamp.stack.up() {
   private.lamp.require.installed || return $(result)
-  local home domain
-  home="$(private.lamp.home)"
+  case "$(private.lamp.backend)" in
+    docker) private.lamp.compose up -d --wait || { create.result 1 "docker compose up failed"; error.log "$RESULT"; return $(result); } ;;
+    native)
+      local family; family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+      local svc; for svc in $(private.lamp.native.services); do [ "$svc" = none ] || private.lamp.native.service "$family" "$svc" start; done ;;
+  esac
+  create.result 0 "stack is up"; success.log "$RESULT"; return $(result)
+}
+
+lamp.stack.down() {
+  private.lamp.require.installed || return $(result)
+  case "$(private.lamp.backend)" in
+    docker) private.lamp.compose down || { create.result 1 "docker compose down failed"; return $(result); } ;;
+    native)
+      local family; family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+      local svc; for svc in $(private.lamp.native.services); do [ "$svc" = none ] || private.lamp.native.service "$family" "$svc" stop; done ;;
+  esac
+  create.result 0 "stack is down"; success.log "$RESULT"; return $(result)
+}
+
+lamp.stack.status() {
+  private.lamp.require.installed || return $(result)
+  local home; home="$(private.lamp.home)"
+  echo "backend    : $(private.lamp.backend)"
+  echo "os         : $(private.lamp.env.get LAMP_OS_FAMILY) ($(private.lamp.env.get LAMP_INIT), $(private.lamp.env.get LAMP_PKG))"
   echo "web server : $(private.lamp.webserver)"
   echo "php        : $(private.lamp.env.get LAMP_PHP) ($(private.lamp.env.get LAMP_PHP_RESOLVED))"
   echo "mariadb    : $(private.lamp.env.get LAMP_MARIADB) ($(private.lamp.env.get LAMP_MARIADB_RESOLVED))"
-  echo "home       : $home"
-  echo "containers :"
-  private.lamp.compose ps 2>/dev/null | sed 's/^/  /'
-  echo "extensions :"
-  private.lamp.extensions.check >/dev/null 2>&1 &&
-    echo "  ok" || echo "  $(printf '%s' "$RESULT")"
-  echo "sites      :"
-  if [ -f "$home/sites" ]; then
-    while IFS=$'\t' read -r domain _; do [ -n "$domain" ] && echo "  $domain"; done < "$home/sites"
-  fi
-  create.result 0 "web server : $(private.lamp.webserver)"
+  case "$(private.lamp.backend)" in
+    docker) private.lamp.compose ps 2>/dev/null | sed 's/^/  /' ;;
+    native)
+      local family; family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+      case "$family" in
+        debian|rhel) systemctl is-active $(private.lamp.native.services) 2>/dev/null | sed 's/^/  /' ;;
+        alpine) for svc in $(private.lamp.native.services); do printf '  %s: %s\n' "$svc" "$(rc-service "$svc" status 2>&1 | head -1)"; done ;;
+        macos) brew services list 2>/dev/null | sed 's/^/  /' ;;
+      esac ;;
+  esac
+  private.lamp.extensions.check >/dev/null 2>&1 && echo "extensions : ok" || echo "extensions : $RESULT"
+  create.result 0 "backend : $(private.lamp.backend)"
   return $(result)
 }
 
-lamp.stack.log()     # <?lines:50> # show the stack's logs # lamp stack.log 100
-{
+lamp.stack.log() {
   private.lamp.require.installed || return $(result)
-  local lines="${1:-50}"
-  private.lamp.compose logs --tail "$lines" 2>/dev/null
-  create.result 0 "logs"
-  return $(result)
+  local lines="${1:-50}" family svc
+  case "$(private.lamp.backend)" in
+    docker) private.lamp.compose logs --tail "$lines" 2>/dev/null ;;
+    native)
+      family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+      for svc in $(private.lamp.native.services); do
+        [ "$svc" = none ] && continue
+        case "$family" in
+          debian|rhel) journalctl -u "$svc" -n "$lines" --no-pager 2>/dev/null ;;
+          alpine) tail -n "$lines" /var/log/messages 2>/dev/null ;;
+          macos) tail -n "$lines" "$(brew --prefix)/var/log/$svc.log" 2>/dev/null ;;
+        esac
+      done ;;
+  esac
+  create.result 0 "logs"; return $(result)
 }
 
-lamp.stack.remove()     # <?purge:no> # remove the stack's containers; purge also deletes the runtime data # lamp stack.remove purge
-{
+lamp.stack.remove() {
   private.lamp.require.installed || return $(result)
-  local purge="${1:-no}" home
-  home="$(private.lamp.home)"
-  private.lamp.compose down --remove-orphans || {
-    create.result 1 "docker compose down failed"; error.log "$RESULT"; return $(result); }
+  local purge="${1:-no}" home backend family
+  home="$(private.lamp.home)"; backend="$(private.lamp.backend)"; family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+  case "$backend" in
+    docker) private.lamp.compose down --remove-orphans ;;
+    native) for svc in $(private.lamp.native.services); do [ "$svc" = none ] || private.lamp.native.service "$family" "$svc" stop; done ;;
+  esac
   if [ "$purge" = purge ]; then
-    rm -rf "$home" || {
-      create.result 1 "cannot remove $home"; error.log "$RESULT"; return $(result); }
+    case "$backend" in
+      native) case "$family" in debian|rhel) private.lamp.native.sudo apt-get remove -y nginx apache2 httpd mariadb-server certbot 2>/dev/null ;; esac ;;
+    esac
+    rm -rf "$home"
     create.result 0 "stack removed (data deleted)"
   else
     create.result 0 "stack removed (data kept)"
   fi
-  success.log "$RESULT"
-  return $(result)
+  success.log "$RESULT"; return $(result)
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `./test.suite run lamp 1`
-Expected: `Passed: 5  Failed: 0`.
+- [ ] **Step 4: Run — PASS.**
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lamp test/test.lamp
-git commit -m "feat(lamp): stack up, down, status, log and remove"
+git commit -m "feat(lamp): native lifecycle, status, logs and removal"
 ```
 
 ---
 
-### Task 5: `site.add` and the two vhost renderers
+### Task 6: `site.add` for both backends
 
-**Files:**
-- Modify: `lamp`
-- Test: `test/test.lamp`
+**Files:** `lamp`, `test/test.lamp`
 
-- [ ] **Step 1: Write the failing test**
-
-Above `test.suite.save.results`, add:
+- [ ] **Step 1: Failing test**
 
 ```bash
 test.lamp.site() {
   local fx got bad="" vhost
-  fx=$(test.lamp.fixture); : > "$fx/calls"
-  test.lamp.run "$fx" lamp.stack.install nginx >/dev/null
-
-  got=$(test.lamp.run "$fx" lamp.site.add example.org public)
-  [ "$got" = "0|site example.org added ($fx/config/lamp/www/public)" ] || bad="$bad add=[$got]"
+  fx=$(test.suite.fixture.make lampsite); mkdir -p "$fx/home" "$fx/config"; : > "$fx/calls"
+  # docker install first (stubbed as in Task 3)
+  ( HOME="$fx/home"; CONFIG_PATH="$fx/config"; LAMP_BACKEND=docker
+    docker() { printf '%s\n' "$*" >> "$fx/calls"; case "$*" in *"php -m"*) cat "$OOSH_DIR/templates/lamp/common/php/required-extensions" ;; *"php -r"*) echo 8.5.12 ;; *"mariadb --version"*) echo "mariadb 13.0.2-MariaDB" ;; *) : ;; esac; }
+    odocker.support.check() { return 0; }
+    lamp.stack.install nginx 8.5 latest docker ) >/dev/null 2>&1
+  got=$( ( HOME="$fx/home"; CONFIG_PATH="$fx/config"; LAMP_BACKEND=docker
+    docker() { :; }; lamp.site.add example.org public 2>/dev/null; printf '%s|%s' "$?" "$RESULT" ) )
   vhost="$fx/config/lamp/conf.d/example.org.conf"
-  grep -q 'try_files \$uri \$uri/ /index.php?\$query_string;' "$vhost" || bad="$bad nginxTry"
-  grep -q 'server_name example.org;' "$vhost" || bad="$bad nginxName"
-  grep -qx $'example.org\t'"$fx/config/lamp/www/public" "$fx/config/lamp/sites" || bad="$bad registry"
-  grep -q 'nginx -s reload' "$fx/calls" || bad="$bad reload"
-
-  got=$(test.lamp.run "$fx" lamp.site.add example.org public)
-  [ "$got" = "0|site example.org unchanged" ] || bad="$bad again=[$got]"
-
-  got=$(test.lamp.run "$fx" lamp.site.add 'bad domain' public)
-  [ "$got" = "1|bad domain is no domain name" ] || bad="$bad domain=[$got]"
-
-  got=$(test.lamp.run "$fx" lamp.stack.install apache)
-  [ "$got" = "0|switched nginx → apache" ] || bad="$bad switch=[$got]"
-  grep -q 'AllowOverride All' "$vhost" || bad="$bad apacheVhost"
-
-  [ -z "$bad" ] && create.result 0 "sites render for both stacks" || create.result 1 "site:$bad"
+  [ -f "$vhost" ] || bad="$bad nofile"
+  grep -q 'try_files \$uri \$uri/ /index.php?\$query_string;' "$vhost" || bad="$bad tryfiles"
+  grep -q 'server_name example.org;' "$vhost" || bad="$bad name"
+  [ -z "$bad" ] && create.result 0 "site.add renders a vhost" || create.result 1 "site:$bad"
   return $(result)
 }
-
-test.case $level "T-LAMP-SITE: site.add renders nginx and apache vhosts and survives a switch" test.lamp.site
-expect 0 "sites render for both stacks" "try_files, AllowOverride All and the sites registry"
+test.case $level "T-LAMP-SITE: site.add renders the vhost for the backend" test.lamp.site
+expect 0 "site.add renders a vhost" "nginx try_files and the domain"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run — FAIL.**
 
-Run: `./test.suite run lamp 1`
-Expected: FAIL — `lamp.site.add` is not defined.
-
-- [ ] **Step 3: Implement the renderers and `site.add`**
-
-Above `lamp.start "$@"`, add:
+- [ ] **Step 3: Implement rendering + installation**
 
 ```bash
-private.lamp.vhost.nginx() # <domain> <docroot> <cert:yes|no> # echo an nginx server block
+private.lamp.vhost.render() # <domain> <docroot> # echo the vhost of the installed web server
 {
-  cat <<EOF
-server {
-    listen 80;
-    server_name $1;
-    root $2;
-    index index.php index.html;
-    location /.well-known/acme-challenge/ { root /var/www/certbot; }
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
-    location ~ \.php\$ {
-        include fastcgi_params;
-        fastcgi_pass app:9000;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-}
-EOF
-  if [ "$3" = yes ]; then
-    cat <<EOF
-server {
-    listen 443 ssl;
-    server_name $1;
-    root $2;
-    index index.php index.html;
-    ssl_certificate /etc/letsencrypt/live/$1/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$1/privkey.pem;
-    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
-    location ~ \.php\$ {
-        include fastcgi_params;
-        fastcgi_pass app:9000;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-    }
-}
-EOF
-  fi
-}
-
-private.lamp.vhost.apache() # <domain> <docroot> <cert:yes|no> # echo an apache vhost
-{
-  cat <<EOF
-<VirtualHost *:80>
-    ServerName $1
-    DocumentRoot $2
-    <Directory $2>
-        AllowOverride All
-        Require all granted
-    </Directory>
-    Alias /.well-known/acme-challenge/ /var/www/certbot/.well-known/acme-challenge/
-    <Directory /var/www/certbot/.well-known/acme-challenge/>
-        Require all granted
-    </Directory>
-</VirtualHost>
-EOF
-  if [ "$3" = yes ]; then
-    cat <<EOF
-<VirtualHost *:443>
-    ServerName $1
-    DocumentRoot $2
-    SSLEngine on
-    SSLCertificateFile /etc/letsencrypt/live/$1/fullchain.pem
-    SSLCertificateKeyFile /etc/letsencrypt/live/$1/privkey.pem
-    <Directory $2>
-        AllowOverride All
-        Require all granted
-    </Directory>
-</VirtualHost>
-EOF
-  fi
-}
-
-private.lamp.vhost.render() # <domain> <docroot> # echo the vhost of the installed server
-{
-  local domain="$1" docroot="$2" home cert=no
+  local domain="$1" docroot="$2" home php
   home="$(private.lamp.home)"
   [ -d "$docroot" ] || docroot="$home/www/$docroot"
-  [ -f "$home/certs/conf/live/$domain/fullchain.pem" ] && cert=yes
-  case "$(private.lamp.webserver)" in
-    nginx)  private.lamp.vhost.nginx "$domain" "$docroot" "$cert" ;;
-    apache) private.lamp.vhost.apache "$domain" "$docroot" "$cert" ;;
-    *) create.result 1 "no web server installed"; return $(result) ;;
-  esac
+  # macOS cannot bind <1024 without root: the native backend uses 8080/8443 there.
+  local ports=""
+  if [ "$(private.lamp.env.get LAMP_OS_FAMILY)" = macos ]; then ports=macos; fi
+
+  if [ "$(private.lamp.webserver)" = nginx ]; then
+    case "$(private.lamp.backend)" in
+      docker) php='app:9000' ;;
+      *) case "$(private.lamp.env.get LAMP_OS_FAMILY)" in
+           debian) php='unix:/run/php/php8.5-fpm.sock' ;;
+           rhel)   php='unix:/run/php-fpm/www.sock' ;;
+           alpine) php='127.0.0.1:9000' ;;
+           macos)  php='127.0.0.1:9000' ;;
+         esac ;;
+    esac
+    sed -e "s|@DOMAIN@|$domain|g" -e "s|@DOCROOT@|$docroot|g" -e "s|@PHP@|$php|g" \
+        "$OOSH_DIR/templates/lamp/vhost/nginx.conf" |
+      { if [ "$ports" = macos ]; then
+          sed -e 's/listen 80;/listen 8080;/' -e 's/listen 443 ssl;/listen 8443 ssl;/'
+        else cat; fi; }
+  else
+    sed -e "s|@DOMAIN@|$domain|g" -e "s|@DOCROOT@|$docroot|g" \
+        "$OOSH_DIR/templates/lamp/vhost/apache.conf" |
+      { if [ "$ports" = macos ]; then sed -e 's/\*:80/*:8080/' -e 's/\*:443/*:8443/'; else cat; fi; }
+  fi
   create.result 0 "$domain"
   return $(result)
 }
 
-private.lamp.reload() # # reload the installed web server
+private.lamp.vhost.install() # <domain> <file> # install the rendered vhost into the family path
 {
-  case "$(private.lamp.webserver)" in
-    nginx)  private.lamp.compose exec -T web nginx -s reload ;;
-    apache) private.lamp.compose exec -T app apachectl -k graceful ;;
-    *) return 1 ;;
+  local domain="$1" file="$2" family
+  family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+  case "$(private.lamp.backend)" in
+    docker) : ;;
+    *)
+      case "$family:$(private.lamp.webserver)" in
+        debian:nginx)  private.lamp.native.sudo cp "$file" "/etc/nginx/sites-available/$domain.conf"; private.lamp.native.sudo ln -sf "/etc/nginx/sites-available/$domain.conf" "/etc/nginx/sites-enabled/$domain.conf" ;;
+        debian:apache) private.lamp.native.sudo cp "$file" "/etc/apache2/sites-available/$domain.conf"; private.lamp.native.sudo a2ensite "$domain.conf" ;;
+        rhel:nginx)    private.lamp.native.sudo cp "$file" "/etc/nginx/conf.d/$domain.conf" ;;
+        rhel:apache)   private.lamp.native.sudo cp "$file" "/etc/httpd/conf.d/$domain.conf" ;;
+        alpine:nginx)  private.lamp.native.sudo cp "$file" "/etc/nginx/http.d/$domain.conf" ;;
+        alpine:apache) private.lamp.native.sudo cp "$file" "/etc/apache2/conf.d/$domain.conf" ;;
+        macos:nginx)   private.lamp.native.sudo cp "$file" "$(brew --prefix)/etc/nginx/servers/$domain.conf" ;;
+        macos:apache)  private.lamp.native.sudo cp "$file" "$(brew --prefix)/etc/httpd/extra/$domain.conf" ;;
+      esac ;;
   esac
-}
-
-private.lamp.site.docroot() # <domain> # echo the docroot of <domain>
-{
-  local home; home="$(private.lamp.home)"
-  [ -f "$home/sites" ] || return 1
-  awk -F '\t' -v d="$1" '$1 == d { print $2; exit }' "$home/sites"
-}
-
-lamp.site.add()     # <domain> <docroot> # add a site: an absolute docroot, or a name under <home>/www/; reloads the web server # lamp site.add example.org public
-{
-  local domain="$1" docroot="$2" home file tmp before=""
-  if [ -z "$domain" ] || [ -z "$docroot" ]; then
-    create.result 1 "usage: lamp site.add <domain> <docroot>"
-    error.log "$RESULT"
-    return $(result)
-  fi
-  case "$domain" in
-    *[!A-Za-z0-9.-]*|.*|*..*)
-      create.result 1 "$domain is no domain name"
-      error.log "$RESULT"
-      return $(result)
-      ;;
-  esac
-  private.lamp.require.installed || return $(result)
-
-  home="$(private.lamp.home)"
-  case "$docroot" in
-    /*) ;;
-    *) docroot="$home/www/$docroot" ;;
-  esac
-  mkdir -p "$docroot" || {
-    create.result 1 "cannot create $docroot"; error.log "$RESULT"; return $(result); }
-
-  file="$home/conf.d/$domain.conf"
-  tmp="$home/conf.d/.$domain.conf.new"
-  private.lamp.vhost.render "$domain" "$docroot" > "$tmp" || {
-    rm -f "$tmp"; error.log "$RESULT"; return $(result); }
-
-  if [ -f "$file" ]; then
-    if cmp -s "$tmp" "$file"; then
-      rm -f "$tmp"
-      create.result 0 "site $domain unchanged"
-      success.log "$RESULT"
-      return $(result)
-    fi
-    rm -f "$tmp"
-    create.result 1 "$file exists with different content"
-    error.log "$RESULT"
-    return $(result)
-  fi
-
-  mv "$tmp" "$file"
-  grep -qxF "$domain"$'\t'"$docroot" "$home/sites" 2>/dev/null ||
-    printf '%s\t%s\n' "$domain" "$docroot" >> "$home/sites"
-  private.lamp.reload || {
-    create.result 1 "cannot reload the web server"; error.log "$RESULT"; return $(result); }
-  create.result 0 "site $domain added ($docroot)"
-  success.log "$RESULT"
+  create.result 0 "$file"
   return $(result)
+}
+
+lamp.site.add()     # <domain> <docroot> # add a site and reload the web server # lamp site.add example.org public
+{
+  local domain="$1" docroot="$2" home file tmp
+  [ -n "$domain" ] && [ -n "$docroot" ] || { create.result 1 "usage: lamp site.add <domain> <docroot>"; error.log "$RESULT"; return $(result); }
+  case "$domain" in *[!A-Za-z0-9.-]*|.*|*..*) create.result 1 "$domain is no domain name"; error.log "$RESULT"; return $(result) ;; esac
+  private.lamp.require.installed || return $(result)
+  home="$(private.lamp.home)"
+  case "$docroot" in /*) ;; *) docroot="$home/www/$docroot" ;; esac
+  mkdir -p "$docroot" || { create.result 1 "cannot create $docroot"; error.log "$RESULT"; return $(result); }
+  file="$home/conf.d/$domain.conf"; tmp="$file.new"
+  private.lamp.vhost.render "$domain" "$docroot" > "$tmp" || { rm -f "$tmp"; error.log "$RESULT"; return $(result); }
+  if [ -f "$file" ] && ! cmp -s "$tmp" "$file"; then
+    rm -f "$tmp"; create.result 1 "$file exists with different content"; error.log "$RESULT"; return $(result)
+  fi
+  mv "$tmp" "$file"
+  private.lamp.vhost.install "$domain" "$file" || { error.log "$RESULT"; return $(result); }
+  grep -qxF "$domain"$'\t'"$docroot" "$home/sites" 2>/dev/null || printf '%s\t%s\n' "$domain" "$docroot" >> "$home/sites"
+  private.lamp.reload || { create.result 1 "cannot reload the web server"; error.log "$RESULT"; return $(result); }
+  create.result 0 "site $domain added ($docroot)"; success.log "$RESULT"; return $(result)
+}
+
+private.lamp.reload() {
+  local family
+  case "$(private.lamp.backend)" in
+    docker) case "$(private.lamp.webserver)" in nginx) private.lamp.compose exec -T web nginx -s reload ;; apache) private.lamp.compose exec -T app apachectl -k graceful ;; esac ;;
+    native)
+      family="$(private.lamp.env.get LAMP_OS_FAMILY)"
+      case "$(private.lamp.webserver)" in nginx) private.lamp.native.service "$family" nginx reload ;; apache) case "$family" in debian) private.lamp.native.service "$family" apache2 reload ;; macos) private.lamp.native.service "$family" httpd reload ;; *) private.lamp.native.service "$family" httpd reload ;; esac ;; esac ;;
+  esac
+}
+
+private.lamp.render.all() {
+  local home domain docroot
+  home="$(private.lamp.home)"; [ -f "$home/sites" ] || return 0
+  while IFS=$'\t' read -r domain docroot; do
+    [ -n "$domain" ] || continue
+    private.lamp.vhost.render "$domain" "$docroot" > "$home/conf.d/$domain.conf" || return $(result)
+    private.lamp.vhost.install "$domain" "$home/conf.d/$domain.conf" >/dev/null 2>&1
+  done < "$home/sites"
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `./test.suite run lamp 1`
-Expected: `Passed: 6  Failed: 0`.
+- [ ] **Step 4: Run — PASS.**
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lamp test/test.lamp
-git commit -m "feat(lamp): site.add and the nginx/apache vhost renderers"
+git commit -m "feat(lamp): site.add for docker and native backends"
 ```
 
 ---
 
-### Task 6: `db.create`
+### Task 7: `db.create` for both backends
 
-**Files:**
-- Modify: `lamp`
-- Test: `test/test.lamp`
+**Files:** `lamp`, `test/test.lamp`
 
-- [ ] **Step 1: Write the failing test**
-
-Above `test.suite.save.results`, add:
+- [ ] **Step 1: Failing test (native path)**
 
 ```bash
 test.lamp.db() {
-  local fx got bad="" pw
-  fx=$(test.lamp.fixture); : > "$fx/calls"
-  test.lamp.run "$fx" lamp.stack.install nginx >/dev/null
-
-  got=$(test.lamp.run "$fx" lamp.db.create 'bad-name')
-  [ "$got" = "1|bad-name is no database name" ] || bad="$bad name=[$got]"
-
-  pw=$( ( HOME="$fx/home"; CONFIG_PATH="$fx/config"; ODOCKER_WORKSPACES="$fx/ws"
-          docker() {
-            case "$*" in
-              *"SHOW DATABASES"*) : ;;
-              *) : ;;
-            esac
-            return 0
-          }
-          odocker.support.check() { return 0; }
-          lamp.db.create blog ) 2>/dev/null )
-  [ "${#pw}" = 24 ] || bad="$bad pw=[$pw]"
-  grep -qx $'blog\tblog\t'"$pw" "$fx/config/lamp/db.credentials" || bad="$bad creds"
-  [ "$(stat -c %a "$fx/config/lamp/db.credentials")" = 600 ] || bad="$bad credMode"
-
-  [ -z "$bad" ] && create.result 0 "db.create makes a database and a credential record" || create.result 1 "db:$bad"
+  local fx got bad=""
+  fx=$(test.suite.fixture.make lampdb); mkdir -p "$fx/home" "$fx/config/lamp"; : > "$fx/calls"
+  cat > "$fx/config/lamp/stack.env" <<EOF
+LAMP_BACKEND=native
+LAMP_OS_FAMILY=debian
+LAMP_WEBSERVER=nginx
+LAMP_PHP=8.5
+LAMP_MARIADB=latest
+MARIADB_ROOT_PASSWORD=x
+EOF
+  got=$( ( HOME="$fx/home"; CONFIG_PATH="$fx/config"
+    sudo() { printf 'sudo %s\n' "$*" >> "$fx/calls"; "$@"; }
+    mariadb() { printf 'mariadb %s\n' "$*" >> "$fx/calls"; if [ "$1" = -N ]; then :; fi; }
+    lamp.db.create blog 2>/dev/null ) )
+  [ "${#got}" = 24 ] || bad="$bad pw=[$got]"
+  grep -q 'mariadb' "$fx/calls" || bad="$bad mariadb"
+  [ -z "$bad" ] && create.result 0 "db.create uses the host mariadb" || create.result 1 "db:$bad"
   return $(result)
 }
-
-test.case $level "T-LAMP-DB: db.create validates, generates a password and records it" test.lamp.db
-expect 0 "db.create makes a database and a credential record" "name validation, 24-char password, 600 credentials"
+test.case $level "T-LAMP-DB: db.create uses the backend's mariadb" test.lamp.db
+expect 0 "db.create uses the host mariadb" "sudo mariadb, 24-char password"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run — FAIL.**
 
-Run: `./test.suite run lamp 1`
-Expected: FAIL — `lamp.db.create` is not defined.
-
-- [ ] **Step 3: Implement `lamp.db.create`**
-
-Above `lamp.start "$@"`, add:
+- [ ] **Step 3: Implement the split**
 
 ```bash
-lamp.db.create()     # <name> <?user> # create a database and its user; the password is printed once and kept in db.credentials # lamp db.create blog
+private.lamp.db.exec() # # run sql from stdin as root
+{
+  case "$(private.lamp.backend)" in
+    docker) private.lamp.compose exec -T db sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"' ;;
+    native) private.lamp.native.sudo mariadb -uroot ;;
+  esac
+}
+
+lamp.db.create()     # <name> <?user> # create a database and its user; password printed once # lamp db.create blog
 {
   local name="$1" user="${2:-$1}" home password exists
-  if [ -z "$name" ]; then
-    create.result 1 "usage: lamp db.create <name> <?user>"
-    error.log "$RESULT"
-    return $(result)
-  fi
-  case "$name" in
-    *[!A-Za-z0-9_]*)
-      create.result 1 "$name is no database name"
-      error.log "$RESULT"
-      return $(result)
-      ;;
-  esac
+  [ -n "$name" ] || { create.result 1 "usage: lamp db.create <name> <?user>"; error.log "$RESULT"; return $(result); }
+  case "$name" in *[!A-Za-z0-9_]*) create.result 1 "$name is no database name"; error.log "$RESULT"; return $(result) ;; esac
+  case "$user" in *[!A-Za-z0-9_]*) create.result 1 "$user is no database user"; error.log "$RESULT"; return $(result) ;; esac
   private.lamp.require.installed || return $(result)
   home="$(private.lamp.home)"
-
-  exists="$(printf "SHOW DATABASES LIKE '%s';\n" "$name" |
-    private.lamp.compose exec -T db sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N' 2>/dev/null)"
-  if [ -n "$exists" ]; then
-    create.result 1 "database $name already exists"
-    error.log "$RESULT"
-    return $(result)
-  fi
-
+  exists="$(printf "SHOW DATABASES LIKE '%s';\n" "$name" | private.lamp.db.exec 2>/dev/null)"
+  [ -z "$exists" ] || { create.result 1 "database $name already exists"; error.log "$RESULT"; return $(result); }
   password="$(private.lamp.password.new)"
-  private.lamp.compose exec -T db sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"' <<SQL || {
-CREATE DATABASE \`$name\`;
-CREATE USER '$user'@'%' IDENTIFIED BY '$password';
-GRANT ALL ON \`$name\`.* TO '$user'@'%';
-SQL
-    create.result 1 "could not create $name"; error.log "$RESULT"; return $(result); }
-
+  {
+    printf 'CREATE DATABASE `%s`;\n' "$name"
+    printf "CREATE USER '%s'@'%%' IDENTIFIED BY '%s';\n" "$user" "$password"
+    printf "GRANT ALL ON \`%s\`.* TO '%s'@'%%';\n" "$name" "$user"
+  } | private.lamp.db.exec || { create.result 1 "could not create $name"; error.log "$RESULT"; return $(result); }
   printf '%s\t%s\t%s\n' "$name" "$user" "$password" >> "$home/db.credentials"
   chmod 600 "$home/db.credentials"
   echo "$password"
-  create.result 0 "database $name created for $user (password on stdout)"
-  success.log "$RESULT"
-  return $(result)
+  create.result 0 "database $name created for $user (password on stdout)"; success.log "$RESULT"; return $(result)
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `./test.suite run lamp 1`
-Expected: `Passed: 7  Failed: 0`.
+- [ ] **Step 4: Run — PASS.**
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lamp test/test.lamp
-git commit -m "feat(lamp): db.create with generated credentials"
+git commit -m "feat(lamp): db.create on docker or the host mariadb"
 ```
 
 ---
 
-### Task 7: `cert.issue`, `cert.renew`, `cert.status`
+### Task 8: `cert.*` for both backends
 
-**Files:**
-- Modify: `lamp`
-- Test: `test/test.lamp`
+**Files:** `lamp`, `test/test.lamp`
 
-- [ ] **Step 1: Write the failing test**
-
-Above `test.suite.save.results`, add:
+- [ ] **Step 1: Failing test**
 
 ```bash
 test.lamp.cert() {
   local fx got bad=""
-  fx=$(test.lamp.fixture); : > "$fx/calls"
-  test.lamp.run "$fx" lamp.stack.install nginx >/dev/null
-
-  got=$(test.lamp.run "$fx" lamp.cert.issue example.org me@example.org)
-  [ "$got" = "1|no site example.org — lamp site.add example.org <docroot> first" ] || bad="$bad noSite=[$got]"
-
-  test.lamp.run "$fx" lamp.site.add example.org public >/dev/null
-  mkdir -p "$fx/config/lamp/certs/conf/live/example.org"
+  fx=$(test.suite.fixture.make lampcert); mkdir -p "$fx/home" "$fx/config/lamp/conf.d" "$fx/config/lamp/certs/conf/live/example.org"
+  printf 'LAMP_BACKEND=native\nLAMP_OS_FAMILY=debian\nLAMP_WEBSERVER=nginx\n' > "$fx/config/lamp/stack.env"
+  : > "$fx/config/lamp/conf.d/example.org.conf"
   : > "$fx/config/lamp/certs/conf/live/example.org/fullchain.pem"
-  : > "$fx/config/lamp/certs/conf/live/example.org/privkey.pem"
-
-  got=$(test.lamp.run "$fx" lamp.cert.issue example.org me@example.org)
+  : > "$fx/calls"
+  got=$( ( HOME="$fx/home"; CONFIG_PATH="$fx/config"
+    sudo() { printf 'sudo %s\n' "$*" >> "$fx/calls"; "$@"; }
+    certbot() { printf 'certbot %s\n' "$*" >> "$fx/calls"; }
+    lamp.cert.issue example.org me@example.org 2>/dev/null; printf '%s|%s' "$?" "$RESULT" ) )
   [ "$got" = "0|certificate issued for example.org" ] || bad="$bad issue=[$got]"
-  grep -q 'certbot certonly --webroot' "$fx/calls" || bad="$bad certbotCall"
-  grep -q 'listen 443 ssl;' "$fx/config/lamp/conf.d/example.org.conf" || bad="$bad tlsVhost"
-
-  got=$(test.lamp.run "$fx" lamp.cert.renew)
-  [ "$got" = "0|certificates renewed" ] || bad="$bad renew=[$got]"
-  grep -q 'certbot renew' "$fx/calls" || bad="$bad renewCall"
-
-  [ -z "$bad" ] && create.result 0 "certificates issue and renew" || create.result 1 "cert:$bad"
+  grep -q 'certbot certonly' "$fx/calls" || bad="$bad certbot"
+  [ -z "$bad" ] && create.result 0 "cert.issue uses host certbot" || create.result 1 "cert:$bad"
   return $(result)
 }
-
-test.case $level "T-LAMP-CERT: cert.issue needs a site and rewrites the vhost with 443" test.lamp.cert
-expect 0 "certificates issue and renew" "site check, certbot call and the 443 block"
+test.case $level "T-LAMP-CERT: cert.issue uses the backend's certbot" test.lamp.cert
+expect 0 "cert.issue uses host certbot" "sudo certbot and the recorded result"
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run — FAIL.**
 
-Run: `./test.suite run lamp 1`
-Expected: FAIL — `lamp.cert.issue` is not defined.
-
-- [ ] **Step 3: Implement the certificate methods**
-
-Above `lamp.start "$@"`, add:
+- [ ] **Step 3: Implement**
 
 ```bash
-lamp.cert.issue()     # <domain> <email> # issue a Let's Encrypt certificate for an existing site and reload # lamp cert.issue example.org me@example.org
+private.lamp.cert.run() # <args...> # run certbot in the backend
 {
-  local domain="$1" email="$2" home docroot
-  if [ -z "$domain" ] || [ -z "$email" ]; then
-    create.result 1 "usage: lamp cert.issue <domain> <email>"
-    error.log "$RESULT"
-    return $(result)
-  fi
+  case "$(private.lamp.backend)" in
+    docker) private.lamp.compose run --rm --entrypoint certbot certbot "$@" ;;
+    native) private.lamp.native.sudo certbot "$@" ;;
+  esac
+}
+
+lamp.cert.issue()     # <domain> <email> # issue a certificate for an existing site # lamp cert.issue example.org me@example.org
+{
+  local domain="$1" email="$2" home
+  [ -n "$domain" ] && [ -n "$email" ] || { create.result 1 "usage: lamp cert.issue <domain> <email>"; error.log "$RESULT"; return $(result); }
   private.lamp.require.installed || return $(result)
   home="$(private.lamp.home)"
-  [ -f "$home/conf.d/$domain.conf" ] || {
-    create.result 1 "no site $domain — lamp site.add $domain <docroot> first"
-    error.log "$RESULT"
-    return $(result)
-  }
-
-  private.lamp.compose run --rm --entrypoint certbot certbot \
-    certonly --webroot -w /var/www/certbot -d "$domain" --email "$email" \
-    --agree-tos --no-eff-email || {
-    create.result 1 "certbot could not issue $domain"; error.log "$RESULT"; return $(result); }
-
-  docroot="$(private.lamp.site.docroot "$domain")"
-  private.lamp.vhost.render "$domain" "$docroot" > "$home/conf.d/$domain.conf"
+  [ -f "$home/conf.d/$domain.conf" ] || { create.result 1 "no site $domain — lamp site.add $domain <docroot> first"; error.log "$RESULT"; return $(result); }
+  case "$(private.lamp.backend)" in
+    docker)
+      private.lamp.compose run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot -d "$domain" --email "$email" --agree-tos --no-eff-email || { create.result 1 "certbot could not issue $domain"; error.log "$RESULT"; return $(result); } ;;
+    native)
+      private.lamp.native.sudo certbot certonly --webroot -w "$home/certs/www" -d "$domain" --email "$email" --agree-tos --no-eff-email || { create.result 1 "certbot could not issue $domain"; error.log "$RESULT"; return $(result); } ;;
+  esac
   private.lamp.reload || { error.log "$RESULT"; return $(result); }
-  create.result 0 "certificate issued for $domain"
-  success.log "$RESULT"
-  return $(result)
+  create.result 0 "certificate issued for $domain"; success.log "$RESULT"; return $(result)
 }
 
-lamp.cert.renew()     # # renew every certificate once and reload when one changed # lamp cert.renew
-{
-  private.lamp.require.installed || return $(result)
-  private.lamp.compose run --rm --entrypoint certbot certbot renew --webroot -w /var/www/certbot || {
-    create.result 1 "certbot renew failed"; error.log "$RESULT"; return $(result); }
-  private.lamp.reload || { error.log "$RESULT"; return $(result); }
-  create.result 0 "certificates renewed"
-  success.log "$RESULT"
-  return $(result)
-}
+lamp.cert.renew() { private.lamp.require.installed || return $(result); case "$(private.lamp.backend)" in docker) private.lamp.compose run --rm --entrypoint certbot certbot renew --webroot -w /var/www/certbot ;; native) private.lamp.native.sudo certbot renew --webroot -w "$(private.lamp.home)/certs/www" ;; esac || { create.result 1 "certbot renew failed"; return $(result); }; private.lamp.reload; create.result 0 "certificates renewed"; return $(result); }
 
-lamp.cert.status()     # # print the expiry of every site certificate # lamp cert.status
-{
+lamp.cert.status() {
   private.lamp.require.installed || return $(result)
-  local home domain cert line
+  local home cert domain line
   home="$(private.lamp.home)"
   for cert in "$home"/certs/conf/live/*/fullchain.pem; do
     [ -f "$cert" ] || continue
@@ -1295,140 +1193,69 @@ lamp.cert.status()     # # print the expiry of every site certificate # lamp cer
     line="$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | sed 's/^notAfter=//')"
     echo "$domain expires $line"
   done
-  create.result 0 "certificate status printed"
-  return $(result)
+  create.result 0 "certificate status printed"; return $(result)
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
-
-Run: `./test.suite run lamp 1`
-Expected: `Passed: 8  Failed: 0`.
+- [ ] **Step 4: Run — PASS.**
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lamp test/test.lamp
-git commit -m "feat(lamp): cert.issue, cert.renew and cert.status"
+git commit -m "feat(lamp): cert.issue/renew/status on either backend"
 ```
 
 ---
 
-### Task 8: Completion, docs, indexes, full suite
+### Task 9: Completion, docs, indexes, full suite
 
-**Files:**
-- Modify: `lamp` (completion hooks)
-- Create: `docs/lamp.md`
-- Modify: `docs/methods-index.md`, `docs/object-verb-index.md`, `docs/parameter.md`
-- Test: `test/test.lamp`
+**Files:** `lamp`, `docs/lamp.md`, `docs/methods-index.md`, `docs/object-verb-index.md`, `docs/parameter.md`, `test/test.lamp`
 
-- [ ] **Step 1: Add the completion hooks**
-
-Above `lamp.start "$@"`, add:
+- [ ] **Step 1: Completion hooks**
 
 ```bash
-lamp.stack.install.completion.webserver() { printf 'nginx\napache\n'; }
-lamp.cert.issue.completion.domain() {
-  local home; home="$(private.lamp.home)"
-  [ -d "$home/conf.d" ] && ls "$home/conf.d" 2>/dev/null | sed 's/\.conf$//'
-}
-lamp.site.add.completion.docroot() { compgen -d "$(private.lamp.home)/www/" 2>/dev/null; }
+lamp.parameter.completion.backend() { printf 'docker\nnative\n'; }
+lamp.parameter.completion.webserver() { printf 'nginx\napache\n'; }
+lamp.parameter.completion.purge() { printf 'no\npurge\n'; }
+lamp.parameter.completion.domain() { local h; h="$(private.lamp.home)"; [ -d "$h/conf.d" ] && ls "$h/conf.d" 2>/dev/null | sed 's/\.conf$//'; }
+lamp.parameter.completion.docroot() { compgen -d "$(private.lamp.home)/www/" 2>/dev/null; }
 ```
 
-- [ ] **Step 2: Write `docs/lamp.md`**
+- [ ] **Step 2: `docs/lamp.md`**
 
-```markdown
-# `lamp` — web stack over Docker
+Cover: commands; the backend table (`docker` vs `native`); the platform matrix (debian/rhel/alpine/macos, package manager, init, vhost paths); PHP 8.5 sources; extension contract; state; macOS 8080/8443; completion.
 
-`lamp` installs and drives one stack per host: **nginx + php-fpm** or **apache + mod_php**, with
-MariaDB, PHP 8.5 and Let's Encrypt. The web server is chosen at install and stored in
-`$CONFIG_PATH/lamp/stack.env`.
+- [ ] **Step 3: Indexes**
 
-## Commands
-
-| command | what it does |
-|---|---|
-| `lamp stack.install <nginx\|apache> <?php:8.5> <?mariadb:latest>` | build and start the stack; asks once when the server is omitted on a TTY |
-| `lamp stack.up` / `.down` | start / stop, data kept |
-| `lamp stack.status` | server, resolved versions, containers, extensions, sites |
-| `lamp stack.log <?lines:50>` | compose logs |
-| `lamp stack.remove <?purge:no>` | remove containers; `purge` also deletes `$CONFIG_PATH/lamp` |
-| `lamp site.add <domain> <docroot>` | vhost for the installed server, reload |
-| `lamp db.create <name> <?user>` | database + user; password printed once, kept in `db.credentials` |
-| `lamp cert.issue <domain> <email>` | Let's Encrypt for an existing site |
-| `lamp cert.renew` | one-shot renew |
-| `lamp cert.status` | certificate expiry per site |
-
-## State
-
-```
-$CONFIG_PATH/lamp/
-├── stack.env       600  selected server, versions, DB root password
-├── sites                domain<TAB>docroot, source of truth for vhosts
-├── conf.d/              rendered vhosts
-├── www/                 docroots
-├── certs/{conf,www}     Let's Encrypt state and the ACME webroot
-├── db/                  MariaDB data
-└── db.credentials  600  name, user, password per created database
-```
-
-Templates live in `templates/lamp/` and are copied to
-`$ODOCKER_WORKSPACES/LAMP/1.0.0/` on first install; local edits there survive a reinstall.
-
-## Extensions
-
-The images add `intl gd imagick pdo_mysql mysqli opcache`; the official PHP base already has
-`mbstring json curl simplexml`. `stack.install` checks `php -m` against
-`common/php/required-extensions` and fails naming anything missing. Apache enables
-`mod_rewrite`; nginx uses `try_files $uri $uri/ /index.php?$query_string;`.
-```
-
-- [ ] **Step 3: Add the index rows**
-
-`docs/methods-index.md` — insert after the `ossh` row:
-
-```markdown
-| `lamp` | [lamp.md](lamp.md) | <public> | <private> | <rows> | 0 | <rows> | 0 | 0 |
-```
-
-Take the three numbers from the greps below — do not guess them:
+`docs/methods-index.md`: add the `lamp` row with the counts from:
 
 ```bash
-grep -cE '^(private\.)?lamp\.[A-Za-z0-9_.]*\(\)' lamp
+grep -cE '^lamp\.[A-Za-z0-9_.]*\(\)' lamp
 grep -cE '^private\.lamp\.' lamp
-grep -cE '^(private\.)?lamp\.' lamp
 ```
 
-The row's column order is `script | doc | public | private | rows | only mcd | only dev | both | identical`.
+and update the totals.
 
-`docs/object-verb-index.md` — add the pairs after the `ossh` block:
+`docs/object-verb-index.md`: rows for `lamp`, `stack`, `site`, `db`, `cert`, `backend`, `os`, `native`, `docker`, `vhost`.
 
-```markdown
-| `lamp` | `cert` | [`lamp.cert.issue`](lamp.md) · [`lamp.cert.renew`](lamp.md) · [`lamp.cert.status`](lamp.md) |
-| `lamp` | `db` | [`lamp.db.create`](lamp.md) |
-| `lamp` | `site` | [`lamp.site.add`](lamp.md) |
-| `lamp` | `stack` | [`lamp.stack.down`](lamp.md) · [`lamp.stack.install`](lamp.md) · [`lamp.stack.log`](lamp.md) · [`lamp.stack.remove`](lamp.md) · [`lamp.stack.status`](lamp.md) · [`lamp.stack.up`](lamp.md) |
-```
+`docs/parameter.md`: rows for `webserver`, `php`, `mariadb`, `backend`, `domain`, `docroot`, `name`, `user`, `email`, `lines`, `purge`.
 
-`docs/parameter.md` — add one row per parameter that appears in a `lamp` docstring, in the file's
-existing order (`| parameter | lamp.<parameter> | methods… |`): `webserver` → `lamp.stack.install`;
-`domain` → `lamp.cert.issue`, `lamp.site.add`; `docroot` → `lamp.site.add`; `name` →
-`lamp.db.create`; `email` → `lamp.cert.issue`; `lines` → `lamp.stack.log`; `purge` →
-`lamp.stack.remove`; `user` → `lamp.db.create`; `php` / `mariadb` → `lamp.stack.install`.
-
-- [ ] **Step 4: Run the whole suite**
+- [ ] **Step 4: Full verification**
 
 ```bash
 ./test.suite run lamp 1
 ./test.suite run ossh 1
+./test.suite core 1
 ```
-Expected: `lamp` 8 passed / 0 failed; `ossh` 156/156 (no regression).
+
+Expected: `lamp` all green; `ossh` 156/156; `core` all green plus the intentional meta-test.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lamp test/test.lamp docs/lamp.md docs/methods-index.md docs/object-verb-index.md docs/parameter.md
-git commit -m "docs(lamp): completion, method matrix and cross-indexes"
+git commit -m "docs(lamp): commands, platforms and backends"
 ```
 
 ---
@@ -1437,35 +1264,35 @@ git commit -m "docs(lamp): completion, method matrix and cross-indexes"
 
 **Spec coverage**
 
-| Spec item | Task |
+| spec section | task |
 |---|---|
-| `stack.install` with argument + TTY prompt | 3 |
-| idempotent install, variant switch | 3 |
-| `stack.up/down/status/log/remove` | 4 |
-| `site.add`, nginx `try_files`, apache `AllowOverride`, 443 when cert exists | 5 |
-| `db.create`, password once, credentials 600 | 6 |
-| `cert.issue/renew/status` | 7 |
-| Dockerfiles, extensions, `a2enmod rewrite` | 2 |
-| extension verification via `php -m` | 3 |
-| runtime state under `$CONFIG_PATH/lamp` | 3, 6, 7 |
-| version/digest recording | 3 |
-| docs and indexes | 8 |
-| Docker-free tests | 3–7 |
+| §1 detection | 1 |
+| §2 backend choice | 2 |
+| §3 package plan | 4 |
+| §4 extension contract | 3 (docker), 4–5 (native) |
+| §5 state | 3 |
+| §6 vhost destinations | 6 |
+| §7 command behaviour | 3, 5, 6, 7, 8 |
+| §8 privileges | 4 |
+| §9 macOS ports | 6 (`private.lamp.vhost.render` rewrites 80/443 to 8080/8443 for macos) |
+| §10 errors | each task's failure paths |
+| §11 testing | all tasks |
+| §12 docs | 9 |
 
-**Placeholder scan:** no `TBD`/`TODO`; every code step contains the code.
+**macOS ports:** `private.lamp.vhost.render` (Task 6) rewrites `80/443` to `8080/8443` when the
+family is `macos`; `stack.status` prints the base URL so the ports are not a surprise.
 
-**Type consistency:** `private.lamp.home`, `private.lamp.compose`, `private.lamp.vhost.render`,
-`private.lamp.reload`, `private.lamp.site.docroot` are defined once and used with the same
-signatures in later tasks. `lamp.stack.install` returns the RESULT strings asserted in Task 3.
+**Placeholder scan:** no `TBD`/`TODO`; each step has code.
 
-**Known deviation from the spec:** templates are versioned in `templates/lamp/` and seeded into
-`$ODOCKER_WORKSPACES/LAMP/1.0.0/` (recorded at the top of this plan and applied to the spec).
+**Type consistency:** `private.lamp.backend`, `private.lamp.webserver`, `private.lamp.native.service`,
+`private.lamp.vhost.render`, `private.lamp.db.exec`, `private.lamp.cert.run` keep one signature
+across tasks.
 
 ## Execution handoff
 
-Plan saved to `docs/superpowers/plans/2026-11-09-lamp-stack.md`. Two execution options:
+Plan saved to `docs/superpowers/plans/2026-11-09-lamp-stack.md`. Two options:
 
-1. **Subagent-driven (recommended)** — one fresh subagent per task, review between tasks.
-2. **Inline execution** — run the tasks in this session with checkpoints.
+1. **Subagent-driven (recommended)** — one fresh subagent per task.
+2. **Inline with checkpoints** — run here, stop for review after each task.
 
 Which approach?
