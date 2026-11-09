@@ -135,6 +135,10 @@ rebuild `conf.d/` without guessing from the old vhost syntax.
 
 ## Images
 
+The source of truth is **`templates/lamp/` in the repository** (`DockerWorkspaces` is not under
+git): `stack.install` copies it to `$ODOCKER_WORKSPACES/LAMP/1.0.0/` when that directory is absent,
+and leaves it alone when it exists, so local edits survive. The installed layout is:
+
 ```
 DockerWorkspaces/LAMP/1.0.0/
 ├── common/
