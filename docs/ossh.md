@@ -370,7 +370,8 @@ Copies root's `~/.ssh` (`/root/.ssh`; `/var/root/.ssh` on macOS) into the
 `/Users` on macOS, skipping `shared`, nothing else. Files of the same name are
 replaced; each user's other files stay. `~/.ssh` becomes 700, private keys,
 `config` and `authorized_keys` 600, `*.pub` and `known_hosts` 644, and the copy
-belongs to the user.
+belongs to the user. Files are copied byte for byte: an absolute
+`/root/.ssh/...` path in a copied `config` stays absolute.
 
 **This copies private keys.** Every normal user can then authenticate as root
 to everything root's keys reach; the method logs that warning. It needs root
