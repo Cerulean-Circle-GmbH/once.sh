@@ -5,16 +5,17 @@
 
 ## Goal
 
-One command copies the whole `/root/.ssh/` directory into the `~/.ssh` of every
-normal user — on this machine or on a remote Host entry.
+One command copies root's whole `.ssh` directory into the `~/.ssh` of every
+normal user — on this machine or on a remote Host entry. Root's home is
+`/root` on Linux and `/var/root` on macOS, so the source is `~root/.ssh`.
 
 ```bash
 ossh ssh.replicate            # this machine
 ossh ssh.replicate myhost     # that host, through the Host block
 ```
 
-The source is always `/root/.ssh` on the machine doing the work. There is no
-user list and no source argument.
+The source is always root's `.ssh` (`~root/.ssh`) on the machine doing the
+work. There is no user list and no source argument.
 
 ## Non-goals
 
@@ -47,10 +48,12 @@ because it is the source. This mirrors `private.ossh.user.homes.get`.
 4. **Continue on failure.** One unwritable home does not stop the rest. Each
    account produces `ok <user>` or `FAILED <user>: <reason>`.
 5. **Result.**
-   - rc 0: `replicated /root/.ssh to <n> users on <machine> (including private keys)`
+   - rc 0: `replicated root's .ssh to <n> users on <machine> (including private keys)`
    - rc 1: the same summary naming the failed accounts, or the
      connection/privilege/source error
-6. **Source missing.** No `/root/.ssh` means rc 1 with a RESULT; nothing is
+   - rc 1: `no normal users found on <machine> — nothing copied` when the
+     users base holds no account
+6. **Source missing.** No `~root/.ssh` means rc 1 with a RESULT; nothing is
    written.
 
 ## Safety
