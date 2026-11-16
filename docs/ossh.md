@@ -358,6 +358,25 @@ completion" and asks `ossh.parameter.completion.keyName` next, so Tab listed
 this computer's keys after all (T-OSSH-KEY-COMPLETION). `remoteKeyName` is
 on the free-text list of `test/test.completion.audit`.
 
+### Copying root's `.ssh` to every user
+
+```bash
+ossh ssh.replicate            # this machine
+ossh ssh.replicate myhost     # that host
+```
+
+Copies root's `~/.ssh` (`/root/.ssh`; `/var/root/.ssh` on macOS) into the
+`~/.ssh` of every normal user — every real home under `/home` on Linux or
+`/Users` on macOS, skipping `shared`, nothing else. Files of the same name are
+replaced; each user's other files stay. `~/.ssh` becomes 700, private keys,
+`config` and `authorized_keys` 600, `*.pub` and `known_hosts` 644, and the copy
+belongs to the user.
+
+**This copies private keys.** Every normal user can then authenticate as root
+to everything root's keys reach; the method logs that warning. It needs root
+or passwordless sudo on a remote host (sudo may prompt locally). One failing
+account does not stop the others; rc 1 names the failures.
+
 ### First contact with only a password
 
 `ossh connection.open` opens one shared connection; the password is asked
@@ -624,6 +643,7 @@ OpenSSH reads two system files for **every** user, so oosh writes GitHub there o
 | `ossh key.push` | Push SSH key to remote host |
 | `ossh key.pull` | Pull a remote host's SSH key here and authorize it (`<fromHost> <?remoteKeyName> <?sshDir>`) |
 | `ossh key.revoke` | Revoke a key on a remote host: move it to `deactive.public_keys/` and rebuild (`<fromHost> <remoteKeyName>`) |
+| `ossh ssh.replicate` | Copy root's whole `~/.ssh` to every normal user (private keys included) |
 | `ossh authorized.keys.update` | Rebuild authorized_keys from public_keys/ (atomic; rc 1 when no ssh is set up) |
 | `ossh id.create` | Create new SSH key pair |
 | `ossh list` | List configured hosts |
