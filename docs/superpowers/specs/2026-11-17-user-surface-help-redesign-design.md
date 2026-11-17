@@ -46,7 +46,7 @@ space-separated compounds (`user list all` → `user.list.all`).
 |---|---|---|
 | Account | `user create <username> <?password> <?uid> <?gid>` | unchanged |
 | Account | `user delete <username>` | `user linux.delete` |
-| Account | `user password.set <username> <password>` | unchanged |
+| Account | `user password.set <username> <password>` | unchanged public API; the two OS bodies merge into it |
 | Account | `user login <userName>` | unchanged |
 | Account | `user as <username> <command...>` | unchanged |
 | Account | `user oosh.install <username> <?branch:$OOSH_MODE>` | unchanged |
@@ -67,25 +67,33 @@ space-separated compounds (`user list all` → `user.list.all`).
 | SSH | `user ssh.backup <?label:manual> <?sshDir:~/.ssh>` | unchanged |
 | SSH | `user ssh.backup.list` | unchanged |
 | SSH | `user ssh.restore <?archive:latest> <?sshDir:~/.ssh>` | unchanged |
+| SSH | `user authorized.keys.update <?sshDir:~/.ssh>` | unchanged (already `object.verb`; `ossh authorized.keys.update` delegates to it) |
 | Legacy | `user ssh.backup.legacy.status <?home:$HOME>` | `user ssh.backup.status` |
 | Legacy | `user ssh.backup.legacy.migrate <?home:$HOME>` | `user ssh.backup.migrate` |
 | Hidden | `user start`, `user usage`, `private.*`, `*.completion.*` | — |
 
 ### Rules
 
-- **OS variants are private.**
+- **OS implementation sits behind the public method, split only where it earns its keep.**
 
-  | Public | OS implementation | Dispatch |
+  | Public | Implementation | Dispatch |
   |---|---|---|
   | `user.delete` | `private.user.delete.linux` (unchanged name/body) | `os.check private.user.delete` |
-  | `user.password.set` | `private.user.password.set.darwin` / `.linux` (renamed from `user.*`) | `os.check private.user.password.set` |
+  | `user.password.set` | none — merged into the public body | `case "$OSTYPE"` inside `user.password.set` |
 
-  `private.user.delete.linux` keeps its current guards; the password bodies do not change. On an OS
-  without an implementation the dispatcher reports that the method is not supported on that OS and
-  returns 1.
+  `password.set` is **merged**, not made private: both OS bodies are one line and stable, so a suffix
+  (public or private) would add names without adding behaviour. The merge also deletes the four
+  duplicate per-OS completion hooks.
+
+  `delete` keeps the facade + private body: the body is ~70 lines of guards and a darwin sibling is
+  plausible, so `os.check` makes adding one a new function rather than an edit to a long `case`.
+
+  On an OS without a branch, both report that the method is not supported on that OS and return 1.
 - **`user ssh.*` is not a resurrection of the removed aliases.** `ssh.init` is the WODA-aware
   initialiser; `ssh.identity.*` selects identities; `ssh.backup`/`ssh.restore` archive and restore.
   Nothing here delegates to `ossh` key commands.
+- **Already-normalized names stay put.** `user authorized.keys.update` is already `object.verb` and
+  `ossh.authorized.keys.update` delegates to it, so it keeps its name and is tagged `@group:ssh`.
 - **`user id` and `user info` stay no-verb on purpose.** `id` is a thin mirror of POSIX `id` and its
   `-u -n` options; renaming it would obscure what it wraps. The help description says so.
 - **Parameter names stay stable** where a class-level completion already exists (`sshDir`, `sshId`,
@@ -152,6 +160,10 @@ Every renamed method reuses an existing class-level completion because parameter
 `sshDir`, `sshId`, `username`, `groupName`, `group`, `property`. No new `.completion.` helper is
 required, including for `user delete` (`user.parameter.completion.username` already covers it).
 
+The `password.set` merge deletes `user.password.set.darwin.completion.username/password` and
+`user.password.set.linux.completion.username/password`; they were exact duplicates of
+`user.password.set.completion.username/password`.
+
 ## 5. `user.usage`
 
 `user.usage` becomes a one-line synopsis plus `this.help`; the hardcoded block is deleted. That
@@ -182,7 +194,8 @@ current gaps, and the new test fails if a visible method is missing one.
 
 | File | Change |
 |---|---|
-| `user` | rename the definitions and their `.completion.` helpers; make OS variants private; add tags; replace `user.usage`; add `user.help.group.order` |
+| `user` | rename the definitions and their `.completion.` helpers; merge `password.set` into one public body; keep `delete` as facade + private OS body; delete the four per-OS password completion hooks; add tags; replace `user.usage`; add `user.help.group.order` |
+| `user` (internal refs) | `user.parameter.completion.sshId` → `user ssh.identity.list`; `user.group.add.completion.groupName` → `user group.list`; usage/error strings naming `user.ssh.backup.status`/`.migrate` and `user.group.list` |
 | `this` | `this.help`: drop `@hidden`, extract/strip `@group`, grouped rendering, order function, flat filter path |
 | `ng/c2` | `private.c2.get.functions`: filter `@hidden` |
 | `init/deinstall.oosh:3` | `user linux.delete developking` → `user delete developking` |
@@ -205,7 +218,9 @@ New or updated assertions:
    `user usage`, and every one has a non-empty description.
 6. **`user` surface:** `user delete`, `user group.list`, `user group.member.list`,
    `user ssh.identity.*`, `user ssh.backup.legacy.*` behave as their predecessors did.
-7. **Regression:** `test/test.install` deinstall check passes against `user delete`.
+7. **`password.set` merge:** the public method runs the darwin/linux branch for `$OSTYPE`, rejects a
+   missing username, still treats an empty password as a no-op, and reports an unsupported OS.
+8. **Regression:** `test/test.install` deinstall check passes against `user delete`.
 
 ## 8. Docs and templates
 
@@ -221,6 +236,7 @@ New or updated assertions:
 | Tags on the signature line | Only location that survives `this.help`'s `^#` filter and `line.table '#'` |
 | Grouping only for the unfiltered listing | Keeps `user help <word>` behaviour and code path unchanged |
 | Extend `this.help`, not a `user` manifest | One renderer, no drift, every future method gets grouping for free |
+| Merge `password.set`, split `delete` | Short stable bodies collapse to one `case`; the long guarded delete body stays behind `os.check` so an OS sibling is a new function, not a `case` edit |
 | `ssh.identity.*` rather than `identity.*` | Keeps the object chain explicit; `identity` alone is ambiguous on a multi-user host |
 | Keep `user id` / `user info` | They mirror system nouns; the verb audit flags them, help explains them |
 | Leave `this.help.table` alone | No callers; out of scope for this change |
