@@ -204,6 +204,22 @@ os.check.env() # # set OOSH_OS (the OS family) when it is empty — from the ker
   return 0
 }
 
+os.container.is()     # <?root:/> # reports whether this computer is a container — "inside a container (docker)", "inside a container (podman)" or "not a container"; rc 0 inside, rc 1 outside #
+{
+  # The detector is the kernel's private.this.container.get: odocker and
+  # su/setup need it before os is loaded, and those calls must not gain a
+  # dependency on os. This method adds the readable answer, so a bare
+  # `os container.is` never returns in silence.
+  local runtime
+  if runtime=$(private.this.container.get "$@"); then
+    echo "inside a container ($runtime)"
+    return 0
+  fi
+  echo "not a container"
+  return 1
+}
+os.container.is.completion.root() { echo "/"; }
+
 
 
 os.usage()

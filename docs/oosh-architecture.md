@@ -400,6 +400,7 @@ answer by rc):
 
 | Method | What it does |
 |---|---|
+| `private.this.container.get <?root:/>` | echo the runtime this computer is a container of — `docker` or `podman`; nothing and rc 1 when it is not a container |
 | `private.this.container.is <?root:/>` | rc 0 when this computer is a container: `<root>/.dockerenv` (Docker) or `<root>/run/.containerenv` (Podman) exists |
 | `private.this.group.create <group> <?gid>` | create a system group if it does not exist, with number `<gid>` when given; idempotent; through `$SUDO`; the first that exists of groupadd, addgroup, dseditgroup, once — its failure is the answer; only when none exists an append to the group file, never with a number another group holds |
 | `private.this.group.file.get` | echo the group file that last-resort append may write: `/etc/group`; nothing (rc 1) on macOS, where Directory Services ignores it |

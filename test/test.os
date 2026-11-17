@@ -129,6 +129,30 @@ test.os.systemdIs() {
 test.case $level "T-OS-SYSTEMD-IS: rc 0 only when systemd runs this computer" test.os.systemdIs
 expect 0 "systemd only when its run directory is there" "su/setup had its own systemd check"
 
+# T-OS-CONTAINER-IS: os.container.is names the runtime or says "not a container"
+# The detector stays private.this.container.get — odocker and su/setup call it
+# before os is loaded. os answers the public/CLI question in words, and keeps
+# the rc that scripts test (0 inside, 1 outside).
+test.os.containerIs() {
+  local fx bad="" got rc
+  fx=$(test.suite.fixture.make oscontainer); mkdir -p "$fx/bare" "$fx/docker" "$fx/podman/run"
+  : > "$fx/docker/.dockerenv"; : > "$fx/podman/run/.containerenv"
+
+  got=$(os.container.is "$fx/docker"); rc=$?
+  [ "$got" = "inside a container (docker)" ] && [ "$rc" = 0 ] || bad="$bad docker=[$got rc=$rc]"
+  got=$(os.container.is "$fx/podman/"); rc=$?
+  [ "$got" = "inside a container (podman)" ] && [ "$rc" = 0 ] || bad="$bad podman=[$got rc=$rc]"
+  got=$(os.container.is "$fx/bare"); rc=$?
+  [ "$got" = "not a container" ] && [ "$rc" = 1 ] || bad="$bad bare=[$got rc=$rc]"
+
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "docker and podman are named, a bare root says not a container" || create.result 1 "container:$bad"
+  return $(result)
+}
+test.case $level "T-OS-CONTAINER-IS: os.container.is names the runtime or says not a container" test.os.containerIs
+expect 0 "docker and podman are named, a bare root says not a container" \
+  "a bare os container.is returned in silence"
+
 # T-OS-PLATFORM-MOVED: the platform tests live in the platform script; os keeps wrappers
 # The boss (2026-10-22): no private.this.script.load. os.platform.* made the low
 # script os load odocker and ossh; they moved up into platform (option 3, as
