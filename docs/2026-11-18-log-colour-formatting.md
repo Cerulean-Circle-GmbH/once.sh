@@ -1,6 +1,6 @@
 # Fix: log output loses its formatting (colours and bold level labels)
 
-**Status:** implemented on `dev` (working tree), tests added and green.
+**Status:** implemented and committed on `dev`; tests added and green.
 **Date:** 2026-11-18
 **Scope:** `log` (colour loading, `log.init.colors`), `line` (`line.init`'s derived colour files), `test/test.log`, `test/test.line`, `docs/log.md`.
 **Triggered by:** "Log output sometimes loses its formatting (including the log level display) — identify the cause."
