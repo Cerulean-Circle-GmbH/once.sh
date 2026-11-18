@@ -405,8 +405,13 @@ Then append to `test/test.user`:
 # ============================================================================
 # T-USER-DELETE: public delete exists, dispatches, and keeps the guards
 # ============================================================================
+private.test.user.deleteNoName() { bash -c 'source this; source user; user.delete'; }
+private.test.user.deleteRoot()   { bash -c 'source this; source user; user.delete root'; }
+private.test.user.passwordEmpty(){ bash -c 'source this; source user; user.password.set nobody ""'; }
+private.test.user.passwordOs()   { bash -c 'source this; source user; OSTYPE=plan9 user.password.set nobody secret'; }
+
 test.case $level "user.delete rejects a missing username" \
-  bash -c 'source this; source user; user.delete'
+  private.test.user.deleteNoName
 
 if [ "$RETURN_VALUE" -eq 1 ]; then
   expect.pass "user.delete with no name returns 1"
@@ -415,7 +420,7 @@ else
 fi
 
 test.case $level "user.delete refuses root" \
-  bash -c 'source this; source user; user.delete root'
+  private.test.user.deleteRoot
 
 if [ "$RETURN_VALUE" -eq 1 ]; then
   expect.pass "user.delete root returns 1"
@@ -433,7 +438,7 @@ fi
 # T-USER-PASSWORD-MERGE: one public body, empty password is a no-op
 # ============================================================================
 test.case $level "user.password.set with an empty password is a no-op" \
-  bash -c 'source this; source user; user.password.set nobody ""'
+  private.test.user.passwordEmpty
 
 if [ "$RETURN_VALUE" -eq 0 ]; then
   expect.pass "empty password returns 0 without touching the account"
@@ -442,7 +447,7 @@ else
 fi
 
 test.case $level "user.password.set rejects an unsupported OS" \
-  bash -c 'source this; source user; OSTYPE=plan9 user.password.set nobody secret'
+  private.test.user.passwordOs
 
 if [ "$RETURN_VALUE" -eq 1 ]; then
   expect.pass "unsupported OS returns 1"
