@@ -392,7 +392,14 @@ git commit -m "feat(c2): hide @hidden methods from completion"
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `test/test.user`:
+First update the existing cleanup calls in `test/test.user` (before appending the new test, so the
+new `grep '^user\.linux\.delete()'` assertion below is not rewritten):
+
+```bash
+sed -i 's/user\.linux\.delete/user.delete/g' test/test.user
+```
+
+Then append to `test/test.user`:
 
 ```bash
 # ============================================================================
@@ -450,12 +457,6 @@ for m in user.password.set.darwin user.password.set.linux; do
     expect.pass "$m is gone"
   fi
 done
-```
-
-Update the existing cleanup calls in `test/test.user` with:
-
-```bash
-sed -i 's/user\.linux\.delete/user.delete/g' test/test.user
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
