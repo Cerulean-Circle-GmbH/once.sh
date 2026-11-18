@@ -10,6 +10,21 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-17-user-surface-help-redesign-design.md`
 
+**Completed:** 2026-11-18 on `dev`, implementation commits `f01bab33..aeece0c9`.
+
+| Suite | Result |
+|---|---|
+| `test.this` | 80/80 |
+| `test.c2` | 32/32 |
+| `test.user` | 88/88 |
+| `test.install` | 51/51 |
+| `test.completion.audit` | 7/7 |
+
+Deviations from the written steps: return-code assertions use private test functions because
+`test.case` re-splits `bash -c '…'`; the `password.set` description avoids an apostrophe because
+`line.quote` breaks on one; `ossh.ssh.replicate` lost two apostrophes so the tree-wide `c2`
+signature check passes.
+
 ---
 
 ## File structure
@@ -34,7 +49,7 @@
 - Modify: `this` (replace `this.help`, add two private helpers immediately above it, around lines 1844–1874)
 - Test: `test/test.this` (append after the existing T5 block near line 78)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test/test.this`:
 
@@ -81,13 +96,13 @@ else
 fi
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `./test.suite run this 1`
 
 Expected: FAIL — the `secret method` assertion fails because the current `this.help` does not filter `@hidden`, and `private.this.help.render` does not exist.
 
-- [ ] **Step 3: Add the renderer helpers and rewrite `this.help`**
+- [x] **Step 3: Add the renderer helpers and rewrite `this.help`**
 
 In `this`, replace the existing `this.help()` body with the code below, and insert the two helpers immediately above `this.help()`:
 
@@ -146,13 +161,13 @@ this.help() {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `./test.suite run this 1`
 
 Expected: PASS — untagged fixture prints, hidden method and tag are absent from both full and filtered output.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add this test/test.this
@@ -167,7 +182,7 @@ git commit -m "feat(this): tag-aware help renderer with hidden filter"
 - Modify: `this` (add `groups.get`, `group.order.get`; extend `this.help`)
 - Test: `test/test.this`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test/test.this`:
 
@@ -220,13 +235,13 @@ else
 fi
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `./test.suite run this 1`
 
 Expected: FAIL — no `one`/`two` headers are printed, because grouping is not implemented.
 
-- [ ] **Step 3: Add grouping helpers and the grouped branch**
+- [x] **Step 3: Add grouping helpers and the grouped branch**
 
 Insert these two helpers above `this.help()` in `this`:
 
@@ -300,13 +315,13 @@ this.help() {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `./test.suite run this 1`
 
 Expected: PASS — headers are `one`, `two`, `three`, `other`; tags and hidden methods are absent; filtered output stays flat.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add this test/test.this
@@ -321,7 +336,7 @@ git commit -m "feat(this): grouped help with script-defined order"
 - Modify: `ng/c2` (`private.c2.get.functions`, around line 237)
 - Test: `test/test.c2`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test/test.c2`:
 
@@ -350,13 +365,13 @@ else
 fi
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `./test.suite run c2 1`
 
 Expected: FAIL — `secret` is listed because `private.c2.get.functions` does not filter `@hidden`.
 
-- [ ] **Step 3: Add the filter**
+- [x] **Step 3: Add the filter**
 
 In `ng/c2`, in `private.c2.get.functions`, add one filter after `line.filter "^{"`:
 
@@ -367,13 +382,13 @@ In `ng/c2`, in `private.c2.get.functions`, add one filter after `line.filter "^{
   | line.filter "@hidden"
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `./test.suite run c2 1`
 
 Expected: PASS — `visible` is listed, `secret` is not.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add ng/c2 test/test.c2
@@ -390,7 +405,7 @@ git commit -m "feat(c2): hide @hidden methods from completion"
 - Modify: `test/test.install` (the deinstall assertions around lines 1157–1174)
 - Test: `test/test.user`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 First update the existing cleanup calls in `test/test.user` (before appending the new test, so the
 new `grep '^user\.linux\.delete()'` assertion below is not rewritten):
@@ -464,13 +479,13 @@ for m in user.password.set.darwin user.password.set.linux; do
 done
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `./test.suite run user 1`
 
 Expected: FAIL — `user.delete` does not exist, and `user.password.set.darwin`/`.linux` still exist.
 
-- [ ] **Step 3: Implement `user.delete`**
+- [x] **Step 3: Implement `user.delete`**
 
 Replace the current `user.linux.delete()` definition with:
 
@@ -489,7 +504,7 @@ user.delete() # <username> # removes the user and all its files; refuses no name
 
 Leave `private.user.delete.linux()` unchanged.
 
-- [ ] **Step 4: Merge `password.set`**
+- [x] **Step 4: Merge `password.set`**
 
 Replace the three public definitions (`user.password.set`, `.darwin`, `.linux`) and delete the four per-OS completion hooks, keeping only the dispatcher-level ones:
 
@@ -521,7 +536,7 @@ user.password.set.completion.password() { :; }
 
 Delete `user.password.set.darwin()`, `user.password.set.linux()`, and their four `.completion.` hooks.
 
-- [ ] **Step 5: Tag the remaining account methods**
+- [x] **Step 5: Tag the remaining account methods**
 
 Change these declaration lines in `user` (body unchanged):
 
@@ -532,7 +547,7 @@ user.as()     # <username> <command...> # run <command> as <username> # @group:a
 user.oosh.install() # <username> <?branch:$OOSH_MODE> # installs oosh for a local user from <branch> # @group:account
 ```
 
-- [ ] **Step 6: Update the deinstall caller and its test**
+- [x] **Step 6: Update the deinstall caller and its test**
 
 In `init/deinstall.oosh:3`, change:
 
@@ -552,7 +567,7 @@ In `test/test.install`, update the deinstall assertions:
 
 Update the test title and expectation message to say `user delete`.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run:
 
@@ -563,7 +578,7 @@ Run:
 
 Expected: PASS — delete guards pass, password merge tests pass, and the deinstall assertion passes.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add user init/deinstall.oosh test/test.install test/test.user
@@ -578,7 +593,7 @@ git commit -m "refactor(user): public delete and one password.set body"
 - Modify: `user` (lines 251–260, 523–560, 1446–1466, 1482–1541)
 - Test: `test/test.user`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Replace the old T5 block in `test/test.user` (which calls `user.list.groups`) with:
 
@@ -607,13 +622,13 @@ Replace the `user.group.list <group>` calls in the T-USER-GROUP-LIST block with 
 
 Update the block comment and test title to `user.group.member.list`.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `./test.suite run user 1`
 
 Expected: FAIL — `user.group.list` still lists members, and `user.group.member.list` does not exist.
 
-- [ ] **Step 3: Rename the group methods**
+- [x] **Step 3: Rename the group methods**
 
 Rename the definitions and their self-references:
 
@@ -646,7 +661,7 @@ user.group.check() # <groupName> # checks if a group exists # @group:groups
 user.group.member.pending() # <group> <?user> # rc 0 when <user> is in <group> per the group database but not yet in this process # @group:groups
 ```
 
-- [ ] **Step 4: Complete and tag the inspect methods**
+- [x] **Step 4: Complete and tag the inspect methods**
 
 Change these declaration lines in `user` (body unchanged):
 
@@ -658,13 +673,13 @@ user.list() # # lists local user accounts, system accounts (leading _) left out 
 user.list.all() # # lists all local user accounts, system accounts included # @group:inspect
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `./test.suite run user 1`
 
 Expected: PASS — `user.group.list` returns all groups; `user.group.member.list` returns members and keeps its rc guards.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add user test/test.user
@@ -679,7 +694,7 @@ git commit -m "refactor(user): split group list and member list"
 - Modify: `user` (lines 8–121, 256–330, 417, 1446–1466, 1624–1700, 1773)
 - Modify: `test/test.user` (identity and legacy calls)
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `test/test.user`:
 
@@ -720,13 +735,13 @@ sed -i \
   test/test.user
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `./test.suite run user 1`
 
 Expected: FAIL — the new names do not exist yet.
 
-- [ ] **Step 3: Rename the SSH methods**
+- [x] **Step 3: Rename the SSH methods**
 
 Change these declaration lines in `user`:
 
@@ -755,7 +770,7 @@ user.parameter.completion.sshId() {
 
 - `user.ssh.backup.legacy.status` and `.migrate` error messages: replace the literal `user.ssh.backup.status` / `user.ssh.backup.migrate` with the new names.
 
-- [ ] **Step 4: Rename the legacy methods**
+- [x] **Step 4: Rename the legacy methods**
 
 Change the declarations at the top of `user`:
 
@@ -766,7 +781,7 @@ user.ssh.backup.legacy.migrate() # <?home:$HOME> # moves the legacy ssh.* backup
 
 Keep the bodies; update the internal messages listed in Step 3.
 
-- [ ] **Step 5: Tag the lifecycle methods**
+- [x] **Step 5: Tag the lifecycle methods**
 
 Change the declarations:
 
@@ -775,13 +790,13 @@ user.start() # # # @hidden
 user.usage() # # # @hidden
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `./test.suite run user 1`
 
 Expected: PASS — all renamed methods exist; identity current returns a path; legacy tests use the new names.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add user test/test.user
@@ -796,7 +811,7 @@ git commit -m "refactor(user): ssh identity and legacy names"
 - Modify: `user` (`user.usage` around line 1806)
 - Test: `test/test.user`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `test/test.user`:
 
@@ -836,13 +851,13 @@ for hidden in start usage help.group.order; do
 done
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `./test.suite run user 1`
 
 Expected: FAIL — `user usage` still prints the hardcoded block, missing descriptions, and hidden methods.
 
-- [ ] **Step 3: Replace `user.usage` and add the order function**
+- [x] **Step 3: Replace `user.usage` and add the order function**
 
 Replace the whole `user.usage` body with:
 
@@ -866,13 +881,13 @@ user.help.group.order() # # # @hidden
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `./test.suite run user 1`
 
 Expected: PASS — every `c2`-visible method appears once, no "please add a description", and `start`, `usage`, `help.group.order` are absent.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add user test/test.user
@@ -887,7 +902,7 @@ git commit -m "feat(user): generated sectioned usage"
 - Modify: `templates/code/newMethod`
 - Modify: `docs/command-creation.md`
 
-- [ ] **Step 1: Update the template**
+- [x] **Step 1: Update the template**
 
 Append above the method in `templates/code/newMethod`:
 
@@ -898,7 +913,7 @@ Append above the method in `templates/code/newMethod`:
 newScript.newMethod()     # parameters # method description # an example
 ```
 
-- [ ] **Step 2: Update the docs**
+- [x] **Step 2: Update the docs**
 
 Add to `docs/command-creation.md` under "Adding Methods":
 
@@ -918,7 +933,7 @@ defining `<script>.help.group.order`, one group per line.
 oosh-architect. Regenerating them is out of scope for this plan; note that in the commit message or
 handoff so the next docs run picks up the new surface.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add templates/code/newMethod docs/command-creation.md
@@ -929,7 +944,7 @@ git commit -m "docs: document @group and @hidden help tags"
 
 ## Task 9: Full verification
 
-- [ ] **Step 1: Run the affected suites**
+- [x] **Step 1: Run the affected suites**
 
 ```bash
 ./test.suite run this 1
@@ -941,7 +956,7 @@ git commit -m "docs: document @group and @hidden help tags"
 
 Expected: all pass.
 
-- [ ] **Step 2: Inspect the generated help**
+- [x] **Step 2: Inspect the generated help**
 
 ```bash
 ./user usage
@@ -950,7 +965,7 @@ Expected: all pass.
 
 Expected: `user usage` prints `account`, `inspect`, `groups`, `ssh`, `legacy` sections with no stale `ssh.status`/`rootkey.*` lines; `user help ssh` prints a flat table containing the SSH methods with no `@group` text.
 
-- [ ] **Step 3: Confirm the worktree is clean**
+- [x] **Step 3: Confirm the worktree is clean**
 
 ```bash
 git status --short
@@ -958,7 +973,7 @@ git status --short
 
 Expected: no output.
 
-- [ ] **Step 4: Final commit (only if Step 2 required a fix)**
+- [x] **Step 4: Final commit (only if Step 2 required a fix)**
 
 ```bash
 git add -A
