@@ -494,7 +494,7 @@ Leave `private.user.delete.linux()` unchanged.
 Replace the three public definitions (`user.password.set`, `.darwin`, `.linux`) and delete the four per-OS completion hooks, keeping only the dispatcher-level ones:
 
 ```bash
-user.password.set()        # <username> <password> # sets or resets a user's password; an empty password is a no-op # @group:account
+user.password.set()        # <username> <password> # sets or resets the password of a user; an empty password is a no-op # @group:account
 {
   local username="$1"
   if [ -n "$1" ]; then
