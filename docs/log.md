@@ -327,7 +327,19 @@ source_file -> caller_file: function:line - stack
 
 ## Colors
 
-Colors are initialized from `$CONFIG_PATH/setup.color.env`. Available color variables:
+Colors are initialized from `$CONFIG_PATH/setup.color.env`. That file is
+written and sourced by `line.init`, but is **not** only a `line` concern: every
+`log` start asks `private.log.colors.ensure` for it, so a script that never
+sources `line` — `config`, `os`, `state` — logs in colour too. Before that,
+`log.init.colors` was reachable only from `log.init`'s cold-start arm, which
+`this` had already made unreachable; the level words appeared but their colour
+(and `BOLD_*`'s bold) was missing from those scripts' output.
+
+`line.init` derives `color.names.env` (`COLOR_` stripped) and
+`bold.color.names.env` (`BOLD_*`, with the bold attribute after the escape) from
+`color.env`, rewriting a file only when its text differs.
+
+Available color variables:
 
 | Variable | Description |
 |----------|-------------|
