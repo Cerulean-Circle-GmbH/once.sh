@@ -12,6 +12,16 @@ The oosh/once.sh project uses a modular, template-driven approach for creating n
 - Use `oo.method.new <script.method>` to interactively add new methods to scripts.
 - Methods are inserted using templates, ensuring consistent documentation and structure.
 
+### Help metadata
+
+An optional tag in the description field of the signature line controls the generated help:
+
+- `# @group:<name>` — render the method under that section in `this.help`.
+- `# @hidden` — omit the method from `this.help` and from `c2` completion; it stays callable.
+
+A script that uses no tags keeps the old flat, alphabetical table. A script can fix section order by
+defining `<script>.help.group.order`, one group per line.
+
 ## Templates
 - All new scripts and methods are based on templates in `templates/code/`.
 - Templates enforce best practices and modular design.
