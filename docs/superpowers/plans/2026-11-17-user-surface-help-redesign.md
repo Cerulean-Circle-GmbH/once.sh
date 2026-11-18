@@ -687,10 +687,13 @@ Append to `test/test.user`:
 # ============================================================================
 # T-USER-SSH-NAMES: identity and legacy names are the public surface
 # ============================================================================
-test.case $level "user.ssh.identity.current returns a path" \
+private.test.user.identityCurrent() {
   bash -c 'source this; source ossh; source user; user.ssh.identity.current'
+}
+test.case $level "user.ssh.identity.current returns a path" \
+  private.test.user.identityCurrent
 
-if [ -n "$(bash -c 'source this; source ossh; source user; user.ssh.identity.current 2>/dev/null')" ]; then
+if [ -n "$(private.test.user.identityCurrent 2>/dev/null)" ]; then
   expect.pass "user.ssh.identity.current returned a path"
 else
   expect.fail "user.ssh.identity.current should return a path"
@@ -710,6 +713,7 @@ Update the existing SSH calls in `test/test.user`:
 
 ```bash
 sed -i \
+  -e 's/user\.init "/user.ssh.init "/g' \
   -e 's/user\.get\.current\.identity/user.ssh.identity.current/g' \
   -e 's/user\.ssh\.backup\.status/user.ssh.backup.legacy.status/g' \
   -e 's/user\.ssh\.backup\.migrate/user.ssh.backup.legacy.migrate/g' \
