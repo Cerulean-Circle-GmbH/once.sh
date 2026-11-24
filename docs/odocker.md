@@ -578,7 +578,7 @@ The explicit 1:1 compose service lifecycle:
 | `compose.service.pull <service...>` | zero or more services | `docker compose pull` |
 | `compose.service.push <service...>` | zero or more services | `docker compose push` |
 | `compose.service.list <?args...>` | optional arguments | `docker compose ls` |
-| `compose.service.rm <service...>` | zero or more services | `docker compose rm` |
+| `compose.service.remove <service...>` | zero or more services | `docker compose rm` |
 | `compose.service.create <service...>` | zero or more services | `docker compose create` |
 | `compose.service.kill <service...>` | zero or more services | `docker compose kill` |
 | `compose.service.pause <service...>` | zero or more services | `docker compose pause` |
@@ -588,9 +588,9 @@ The explicit 1:1 compose service lifecycle:
 | `compose.service.images <service...>` | zero or more services | `docker compose images` |
 | `compose.service.events <?service...>` | optional services | `docker compose events` |
 | `compose.service.wait <service...>` | zero or more services | `docker compose wait` |
-| `compose.service.cp <src> <dst>` | source, destination | `docker compose cp` |
+| `compose.service.copy <src> <dst>` | source, destination | `docker compose cp` |
 | `compose.service.version` | | `docker compose version` |
-| `compose.raw <args...>` | any Compose arguments | Last resort: `docker compose -f <discovered file> <args...>` |
+| `compose.raw <command> <args...>` | Compose command and arguments | Last resort: `docker compose -f <discovered file> <command> <args...>`; Tab completes the command |
 
 All compose methods find the file with the same lookup: an explicit directory, the
 current directory, `$ODOCKER_WORKSPACES`, then a running compose container's
@@ -604,7 +604,7 @@ Every remaining Docker command is reachable through an explicit namespace or
 
 | Namespace | Covers |
 |-----------|--------|
-| `container.*` | start, restart, kill, pause, unpause, rename, update, port.show, top, stats, cp, inspect, prune.all |
+| `container.*` | start, restart, kill, pause, unpause, rename, update, port.show, top, stats, copy, inspect, prune.all |
 | `image.*` | pull, push, tag, history, inspect, prune, build |
 | `network.*` | list, create, remove, inspect, connect, disconnect, prune |
 | `volume.*` | list, create, remove, inspect, prune |
@@ -612,7 +612,7 @@ Every remaining Docker command is reachable through an explicit namespace or
 | `registry.*` | login, logout, search |
 | `buildx.*` | list, create, use, inspect, remove, build |
 | `context.*` | list, create, use, remove |
-| `raw <args...>` | any `docker <args...>` verbatim — the documented last resort |
+| `raw <command> <args...>` | any `docker <command> <args...>` verbatim — the documented last resort; Tab completes the command |
 
 `raw` is for the long tail: swarm, service, stack, node, secret, config,
 manifest, trust, plugin, checkpoint, save/load/import/export, and any
