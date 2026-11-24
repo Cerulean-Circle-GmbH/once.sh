@@ -597,6 +597,17 @@ current directory, `$ODOCKER_WORKSPACES`, then a running compose container's
 `com.docker.compose.project.working_dir` label. `compose.service.up` is the only
 foreground form; `compose.start` remains detached.
 
+If the Docker Compose plugin is missing, a compose method asks on a terminal:
+
+```text
+Docker Compose is not installed. Install it now? (y/N)
+```
+
+`y` installs `docker-compose-plugin` (apt/dnf), `docker-cli-compose` (apk) or
+`docker-compose` (brew) and verifies `docker compose version`. With `n`, a
+non-terminal, or `OOSH_NO_INSTALL`, it fails with `Docker Compose is not
+installed` instead of running `docker compose` and printing Docker's raw error.
+
 ### Full Docker surface
 
 Every remaining Docker command is reachable through an explicit namespace or
@@ -608,7 +619,7 @@ Every remaining Docker command is reachable through an explicit namespace or
 | `image.*` | pull, push, tag, history, inspect, prune, build |
 | `network.*` | list, create, remove, inspect, connect, disconnect, prune |
 | `volume.*` | list, create, remove, inspect, prune |
-| `system.*` | info, version, events, prune |
+| `system.*` | info, version, events, prune, installed, docker.installed, compose.installed |
 | `registry.*` | login, logout, search |
 | `buildx.*` | list, create, use, inspect, remove, build |
 | `context.*` | list, create, use, remove |
@@ -618,6 +629,14 @@ Every remaining Docker command is reachable through an explicit namespace or
 manifest, trust, plugin, checkpoint, save/load/import/export, and any
 command or flag combination without an explicit method. Compose has
 `compose.raw` for the same reason.
+
+Installed checks are rc-only predicates:
+
+| Method | rc 0 when |
+|--------|-----------|
+| `system.docker.installed` | the `docker` client is on `PATH` |
+| `system.compose.installed` | `docker compose version` answers, i.e. the Compose plugin odocker uses is present |
+| `system.installed <?what:both>` | both are present by default; `what=docker` or `what=compose` checks only that one. On rc 1 it echoes `missing: …` |
 
 ### Status & Maintenance
 

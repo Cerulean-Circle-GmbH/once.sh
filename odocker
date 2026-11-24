@@ -2802,6 +2802,84 @@ private.odocker.compose.services() {
   fi
 }
 
+private.odocker.compose.package.get() #  # echo the Docker Compose package of this package manager, or nothing when it is unknown #
+{
+  case "${OOSH_PM%% *}" in
+    apt-get|dpkg) echo "docker-compose-plugin" ;;
+    dnf|yum)      echo "docker-compose-plugin" ;;
+    apk)          echo "docker-cli-compose" ;;
+    brew)         echo "docker-compose" ;;
+    *)            echo "" ;;
+  esac
+}
+
+private.odocker.compose.install() #  # install the Docker Compose plugin for this package manager and verify `docker compose version`; rc 1 naming why not #
+{
+  local pm pkg plugin
+  [ -n "$OOSH_PM" ] || OOSH_PM=$(oo pm.get 2>/dev/null </dev/null)
+  pm="${OOSH_PM%% *}"
+  pkg=$(private.odocker.compose.package.get)
+  if [ -z "$pkg" ]; then
+    create.result 1 "cannot install Docker Compose for package manager '$pm' — install the compose plugin manually"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  case "$pm" in
+    apt-get|dpkg|dnf|yum) private.odocker.docker.repo.add >/dev/null || warn.log "$RESULT" ;;
+  esac
+  console.log "Installing Docker Compose ($pkg)..."
+  # A command name no package installs: oo cmd then always reaches the package
+  # manager. Its own `command -v` cannot see a docker subcommand; the real
+  # verification is `docker compose version` below.
+  oo cmd docker-compose-plugin "$pkg" >/dev/null 2>&1 </dev/null || true
+  if [ "$pm" = brew ] && command -v brew >/dev/null 2>&1; then
+    plugin=$(brew --prefix docker-compose 2>/dev/null)/bin/docker-compose
+    if [ -x "$plugin" ]; then
+      mkdir -p "$HOME/.docker/cli-plugins"
+      ln -sfn "$plugin" "$HOME/.docker/cli-plugins/docker-compose"
+    fi
+  fi
+  if odocker.system.compose.installed; then
+    create.result 0 "Docker Compose installed"
+    success.log "$RESULT"
+    return $(result)
+  fi
+  create.result 1 "Docker Compose is still not installed — install $pkg with $OOSH_PM"
+  error.log "$RESULT"
+  return $(result)
+}
+
+private.odocker.compose.ensure() #  # rc 0 when the docker compose plugin works; otherwise ask on a terminal whether to install it; rc 1 when declined, non-interactive, or the install fails #
+{
+  odocker.system.compose.installed && return 0
+  if ! odocker.system.docker.installed; then
+    create.result 1 "Docker is not installed — install it with: odocker prereqs.install"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  if [ -n "$OOSH_NO_INSTALL" ]; then
+    create.result 1 "Docker Compose is not installed (OOSH_NO_INSTALL is set)"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  if ! private.odocker.terminal.is; then
+    create.result 1 "Docker Compose is not installed — install the docker-compose plugin for this package manager"
+    error.log "$RESULT"
+    return $(result)
+  fi
+  local answer
+  read -r -p "Docker Compose is not installed. Install it now? (y/N) " answer
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *)
+      create.result 1 "Docker Compose is not installed"
+      error.log "$RESULT"
+      return $(result)
+      ;;
+  esac
+  private.odocker.compose.install
+}
+
 private.odocker.compose.run() # <args...> # run docker compose with the discovered compose file, through the keychain-aware registry helper #
 {
   # One compose file source for the whole class: the public compose.service.*
@@ -2815,6 +2893,7 @@ private.odocker.compose.run() # <args...> # run docker compose with the discover
     error.log "$RESULT"
     return $(result)
   fi
+  private.odocker.compose.ensure || return $(result)
   private.odocker.docker.registry compose -f "$composeFile" "$@"
 }
 
@@ -2829,6 +2908,7 @@ private.odocker.compose.run.tty() # <args...> # run docker compose with the disc
     error.log "$RESULT"
     return $(result)
   fi
+  private.odocker.compose.ensure || return $(result)
   docker compose -f "$composeFile" "$@"
 }
 
@@ -2846,6 +2926,7 @@ odocker.compose.status.show() # <?service> # show compose status or service deta
     error.log "No compose file found"
     return 1
   fi
+  private.odocker.compose.ensure || return $(result)
 
   if [ -n "$service" ]; then
     docker compose -f "$composeFile" ps "$service"
@@ -2924,6 +3005,7 @@ odocker.compose.start() # <container> <?portOrOffset:0> <?withDocker:no> # start
     local composeFile
     composeFile=$(private.odocker.compose.file.find)
     if [ $? -eq 0 ]; then
+      private.odocker.compose.ensure || return $(result)
       console.log "Starting compose service: $container"
       private.odocker.docker.registry compose -f "$composeFile" up -d "$container"
     else
@@ -2964,6 +3046,7 @@ odocker.compose.stop() # <container> # stop a container or compose service
     local composeFile
     composeFile=$(private.odocker.compose.file.find)
     if [ $? -eq 0 ]; then
+      private.odocker.compose.ensure || return $(result)
       console.log "Stopping compose service: $container"
       docker compose -f "$composeFile" stop "$container"
     else
@@ -3393,6 +3476,43 @@ odocker.system.version() # <?args...> # show the Docker version #
 odocker.system.events() # <?args...> # stream Docker system events #
 { docker system events "$@"; }
 
+odocker.system.docker.installed() #  # rc 0 when the docker client is on PATH; rc 1 when it is not #
+{ command -v docker >/dev/null 2>&1; }
+
+odocker.system.compose.installed() #  # rc 0 when the docker compose plugin answers `docker compose version`; rc 1 when it is not installed #
+{
+  command -v docker >/dev/null 2>&1 || return 1
+  docker compose version >/dev/null 2>&1
+}
+
+odocker.system.installed() # <?what:both> # rc 0 when docker and the compose plugin are installed, or only the named one; what is both, docker or compose; on rc 1 echoes what is missing #
+{
+  local what="${1:-both}" missing=""
+  case "$what" in
+    both|all)
+      odocker.system.docker.installed || missing="docker"
+      odocker.system.compose.installed || missing="${missing:+$missing }compose"
+      ;;
+    docker)
+      odocker.system.docker.installed || missing="docker"
+      ;;
+    compose|docker-compose)
+      odocker.system.compose.installed || missing="compose"
+      ;;
+    *)
+      echo "Usage: odocker system.installed <?what:both>  # both | docker | compose" >&2
+      return 1
+      ;;
+  esac
+  [ -z "$missing" ] && return 0
+  echo "missing: $missing"
+  return 1
+}
+
+odocker.system.installed.completion.what() {
+  printf '%s\n' both docker compose | grep "^${1:-}"
+}
+
 odocker.registry.login() # <registry> <?args...> # authenticate to a registry #
 { private.odocker.docker.registry login "$@"; }
 
@@ -3455,7 +3575,7 @@ odocker.compose.service.pull() # <service...> # pull compose service images #
 { private.odocker.compose.run pull "$@"; }
 
 odocker.compose.service.list() # <?args...> # list Compose projects #
-{ docker compose ls "$@"; }
+{ private.odocker.compose.ensure || return $(result); docker compose ls "$@"; }
 
 odocker.compose.service.remove() # <service...> # remove stopped compose service containers #
 { private.odocker.compose.run.tty rm "$@"; }
@@ -3494,7 +3614,7 @@ odocker.compose.service.push() # <service...> # push compose service images #
 { private.odocker.compose.run push "$@"; }
 
 odocker.compose.service.version() # <?args...> # show the Docker Compose version #
-{ docker compose version "$@"; }
+{ private.odocker.compose.ensure || return $(result); docker compose version "$@"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LAST RESORT

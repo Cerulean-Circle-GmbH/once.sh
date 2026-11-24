@@ -565,6 +565,64 @@ test.case $level "T-ODOCKER-COMPOSE-SERVICE-NO-FILE: a missing compose file fail
 expect 0 "no compose file: rc 1, docker untouched" \
   "a compose lifecycle verb reached docker without a compose file"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# T-ODOCKER-COMPOSE-ENSURE: a missing Compose plugin asks on a terminal and
+# installs on yes; no, non-interactive and OOSH_NO_INSTALL never install.
+# ─────────────────────────────────────────────────────────────────────────────
+test.odocker.composeEnsure() {
+  local fx bad="" out line
+  fx=$(test.suite.fixture.make odockercomposeensure) || return 1
+  out=$(FX="$fx" bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+    docker() {
+      if [ "$1" = compose ] && [ "$2" = version ]; then
+        [ -n "$FX_COMPOSE" ] && return 0
+        return 1
+      fi
+      return 0
+    }
+    private.odocker.terminal.is() { [ "$FX_TTY" = yes ]; }
+    private.odocker.compose.install() { touch "$FX/installed"; FX_COMPOSE=yes; create.result 0 installed; return 0; }
+    unset OOSH_NO_INSTALL
+    case_run() {
+      local label="$1" tty="$2" compose="$3" input="$4" noinstall="$5"
+      rm -f "$FX/installed"
+      FX_TTY="$tty" FX_COMPOSE="$compose"
+      if [ "$noinstall" = yes ]; then OOSH_NO_INSTALL=1; else unset OOSH_NO_INSTALL; fi
+      ( printf "%s" "$input" | odocker.compose.service.version ) >"$FX/out" 2>&1
+      local r=$?
+      printf "%s rc=%s marker=%s\n" "$label" "$r" "$([ -f "$FX/installed" ] && echo yes || echo no)"
+    }
+    case_run installed no yes ""
+    case_run yes yes "" "y
+"
+    case_run no yes "" "n
+"
+    case_run noninteractive no "" ""
+    case_run noinstall yes "" "" yes
+  ' </dev/null 2>/dev/null)
+  for line in \
+    "installed rc=0 marker=no" \
+    "yes rc=0 marker=yes" \
+    "no rc=1 marker=no" \
+    "noninteractive rc=1 marker=no" \
+    "noinstall rc=1 marker=no"; do
+    echo "$out" | grep -qx "$line" || bad="$bad missing[$line]"
+  done
+  [ "$(OOSH_PM='apt-get -y install' private.odocker.compose.package.get)" = docker-compose-plugin ] || bad="$bad apt-pkg"
+  [ "$(OOSH_PM='dnf -y install' private.odocker.compose.package.get)" = docker-compose-plugin ] || bad="$bad dnf-pkg"
+  [ "$(OOSH_PM='apk add' private.odocker.compose.package.get)" = docker-cli-compose ] || bad="$bad apk-pkg"
+  [ "$(OOSH_PM='brew install' private.odocker.compose.package.get)" = docker-compose ] || bad="$bad brew-pkg"
+  [ -z "$(OOSH_PM='unknown install' private.odocker.compose.package.get)" ] || bad="$bad unknown-pkg"
+  rm -rf "$fx"
+  [ -z "$bad" ] && create.result 0 "missing Compose prompts; yes installs; no/non-interactive do not" || create.result 1 "compose ensure:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-COMPOSE-ENSURE: missing Compose prompts and installs only on yes" \
+  test.odocker.composeEnsure
+expect 0 "missing Compose prompts; yes installs; no/non-interactive do not" \
+  "a missing Compose plugin was used without asking, or installed after no"
+
 # The service argument completes from the discovered compose file.
 for _composeMethod in up up.detached start stop restart; do
   set -- compose.service."$_composeMethod" service
@@ -3826,5 +3884,95 @@ test.odocker.supportCheck() {
 test.case $level "T-ODOCKER-SUPPORT-CHECK: odocker support.check says whether Docker can work here and installs nothing" test.odocker.supportCheck
 expect 0 "Docker can work with a socket or an engine; else rc 1 and why; nothing installed first" \
   "su/setup loaded odocker to ask two private functions"
+
+# T-ODOCKER-INSTALLED-PREDICATES: rc-only checks for the docker client and the
+# docker compose plugin odocker uses.
+test.odocker.installedPredicates() {
+  local bad="" out
+  out=$(bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+    docker() { return 1; }
+    odocker.system.docker.installed; echo "docker-function=$?"
+    docker() { return 0; }
+    odocker.system.compose.installed; echo "compose=$?"
+    docker() { [ "$1" = compose ] && [ "$2" = version ] && return 0; return 1; }
+    odocker.system.compose.installed; echo "compose-ok=$?"
+    docker() { return 1; }
+    odocker.system.compose.installed; echo "compose-no=$?"
+    unset -f docker
+    PATH=/nonexistent
+    odocker.system.docker.installed; echo "docker-no=$?"
+    odocker.system.compose.installed; echo "compose-no-docker=$?"' </dev/null 2>/dev/null | tr '\n' '|')
+  [ "$out" = "docker-function=0|compose=0|compose-ok=0|compose-no=1|docker-no=1|compose-no-docker=1|" ] \
+    || bad="$bad out=[$out]"
+  [ -z "$bad" ] && create.result 0 "docker and compose installed predicates answer by rc only" || create.result 1 "installed predicates:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-INSTALLED-PREDICATES: system.docker.installed and system.compose.installed are rc-only" \
+  test.odocker.installedPredicates
+expect 0 "docker and compose installed predicates answer by rc only" \
+  "an installed check printed output or ignored the docker/compose presence"
+
+# T-ODOCKER-INSTALLED-COMBINED: one default-both check with docker/compose
+test.odocker.installedCombined() {
+  local bad="" out
+  out=$(bash -c '
+    source "$OOSH_DIR/this" >/dev/null 2>&1; source "$OOSH_DIR/odocker" >/dev/null 2>&1
+    try() { local label="$1"; shift; local o r; o=$(odocker.system.installed "$@"); r=$?; printf "%s rc=%s out=[%s]\n" "$label" "$r" "$o"; }
+    docker() { return 0; }
+    try default
+    try docker-check docker
+    try compose-check compose
+    docker() { [ "$1" = compose ] && [ "$2" = version ] && return 1; return 0; }
+    try both-compose-missing
+    try compose-missing compose
+    unset -f docker
+    PATH=/nonexistent
+    try both-no-docker
+    try docker-no-docker docker
+    try compose-no-docker compose
+    try bogus nope' </dev/null 2>/dev/null)
+  local line
+  for line in \
+    'default rc=0 out=[]' \
+    'docker-check rc=0 out=[]' \
+    'compose-check rc=0 out=[]' \
+    'both-compose-missing rc=1 out=[missing: compose]' \
+    'compose-missing rc=1 out=[missing: compose]' \
+    'both-no-docker rc=1 out=[missing: docker compose]' \
+    'docker-no-docker rc=1 out=[missing: docker]' \
+    'compose-no-docker rc=1 out=[missing: compose]'; do
+    echo "$out" | grep -Fqx "$line" || bad="$bad missing[$line]"
+  done
+  echo "$out" | grep -q '^bogus rc=1' || bad="$bad bogus-not-rc1"
+  if test.suite.completion.get odocker system.installed what "" | grep -qx compose; then :; else bad="$bad no-completion"; fi
+  [ -z "$bad" ] && create.result 0 "one installed check: both by default, docker/compose by name" || create.result 1 "installed combined:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-INSTALLED-COMBINED: system.installed checks both by default and docker/compose on request" \
+  test.odocker.installedCombined
+expect 0 "one installed check: both by default, docker/compose by name" \
+  "the combined installed check did not report both, docker or compose"
+
+# T-ODOCKER-INSTALLED-TAB: c2 splits a method signature on "|", so a pipe in
+# the description became executable lines in current.method.env and Tab ran
+# `docker` (printing its help) instead of completing <what>.
+test.odocker.installedTab() {
+  local bad="" out want
+  out=$($OOSH_DIR/ng/c2 completion.discover 2 -- odocker system.installed - 2>&1)
+  echo "$out" | grep -q 'Usage:  docker' && bad="$bad docker-help"
+  for want in both docker compose; do
+    grep -qx "$want" "$CONFIG_PATH/completion.result.txt" 2>/dev/null || bad="$bad no-$want"
+  done
+  if grep -qE '^[[:space:]]*(docker|compose)([[:space:]]|;|$)' "$CONFIG_PATH/current.method.env" 2>/dev/null; then
+    bad="$bad executable-method-env"
+  fi
+  [ -z "$bad" ] && create.result 0 "system.installed Tab completes both, docker and compose" || create.result 1 "installed tab:$bad"
+  return $(result)
+}
+test.case $level "T-ODOCKER-INSTALLED-TAB: Tab for system.installed completes <what> without running docker" \
+  test.odocker.installedTab
+expect 0 "system.installed Tab completes both, docker and compose" \
+  "a pipe in the method description broke Tab completion"
 
 test.suite.save.results
