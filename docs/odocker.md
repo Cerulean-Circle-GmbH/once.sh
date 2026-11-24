@@ -619,7 +619,7 @@ Every remaining Docker command is reachable through an explicit namespace or
 | `image.*` | pull, push, tag, history, inspect, prune, build |
 | `network.*` | list, create, remove, inspect, connect, disconnect, prune |
 | `volume.*` | list, create, remove, inspect, prune |
-| `system.*` | info, version, events, prune, installed, docker.installed, compose.installed |
+| `system.*` | info, version, events, prune, installed |
 | `registry.*` | login, logout, search |
 | `buildx.*` | list, create, use, inspect, remove, build |
 | `context.*` | list, create, use, remove |
@@ -634,9 +634,10 @@ Installed checks are rc-only predicates:
 
 | Method | rc 0 when |
 |--------|-----------|
-| `system.docker.installed` | the `docker` client is on `PATH` |
-| `system.compose.installed` | `docker compose version` answers, i.e. the Compose plugin odocker uses is present |
 | `system.installed <?what:both>` | both are present by default; `what=docker` or `what=compose` checks only that one. On rc 1 it echoes `missing: …` |
+
+The individual docker and compose checks are private primitives used by
+`system.installed`; they are not separate public commands.
 
 ### Status & Maintenance
 
