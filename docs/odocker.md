@@ -552,25 +552,85 @@ in both places (T-ODOCKER-CONTAINER-NAME-NEW, -UNNAMED-GETS-NAME,
 
 ### Docker Compose
 
+The polymorphic convenience commands:
+
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `compose` | optional service name | Show compose status or service details |
-| `up <container>` | container/image/service, optional `<?portOrOffset:0>`, optional `docker` | Start a container, run an image (with port mappings), or start a compose service |
-| `down <container>` | container or service name | Stop a container or compose service |
+| `compose.status.show <?service>` | optional service name | Show compose status or service details (`docker compose ps`) |
+| `compose.start <container\|image\|service>` | target, optional `<?portOrOffset:0>`, optional `docker` | Start a container, run an image, or start a compose service with `up -d` |
+| `compose.stop <container\|service>` | container or service name | Stop a container or a compose service |
+
+The explicit 1:1 compose service lifecycle:
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `compose.service.up <service...>` | zero or more services | `docker compose up` in the foreground |
+| `compose.service.up.detached <service...>` | zero or more services | `docker compose up -d` |
+| `compose.service.down` | | `docker compose down` (stop and remove containers and networks) |
+| `compose.service.start <service...>` | zero or more services | `docker compose start` |
+| `compose.service.stop <service...>` | zero or more services | `docker compose stop` |
+| `compose.service.restart <service...>` | zero or more services | `docker compose restart` |
+| `compose.service.logs <service...>` | zero or more services | `docker compose logs` |
+| `compose.service.exec <args...>` | docker compose exec arguments | `docker compose exec` |
+| `compose.service.run <args...>` | docker compose run arguments | `docker compose run` |
+| `compose.service.config <?args...>` | optional arguments | `docker compose config` |
+| `compose.service.build <service...>` | zero or more services | `docker compose build` |
+| `compose.service.pull <service...>` | zero or more services | `docker compose pull` |
+| `compose.service.push <service...>` | zero or more services | `docker compose push` |
+| `compose.service.list <?args...>` | optional arguments | `docker compose ls` |
+| `compose.service.rm <service...>` | zero or more services | `docker compose rm` |
+| `compose.service.create <service...>` | zero or more services | `docker compose create` |
+| `compose.service.kill <service...>` | zero or more services | `docker compose kill` |
+| `compose.service.pause <service...>` | zero or more services | `docker compose pause` |
+| `compose.service.unpause <service...>` | zero or more services | `docker compose unpause` |
+| `compose.service.port <service> <privatePort>` | service, container port | `docker compose port` |
+| `compose.service.top <service...>` | zero or more services | `docker compose top` |
+| `compose.service.images <service...>` | zero or more services | `docker compose images` |
+| `compose.service.events <?service...>` | optional services | `docker compose events` |
+| `compose.service.wait <service...>` | zero or more services | `docker compose wait` |
+| `compose.service.cp <src> <dst>` | source, destination | `docker compose cp` |
+| `compose.service.version` | | `docker compose version` |
+| `compose.raw <args...>` | any Compose arguments | Last resort: `docker compose -f <discovered file> <args...>` |
+
+All compose methods find the file with the same lookup: an explicit directory, the
+current directory, `$ODOCKER_WORKSPACES`, then a running compose container's
+`com.docker.compose.project.working_dir` label. `compose.service.up` is the only
+foreground form; `compose.start` remains detached.
+
+### Full Docker surface
+
+Every remaining Docker command is reachable through an explicit namespace or
+`odocker.raw`:
+
+| Namespace | Covers |
+|-----------|--------|
+| `container.*` | start, restart, kill, pause, unpause, rename, update, port.show, top, stats, cp, inspect, prune.all |
+| `image.*` | pull, push, tag, history, inspect, prune, build |
+| `network.*` | list, create, remove, inspect, connect, disconnect, prune |
+| `volume.*` | list, create, remove, inspect, prune |
+| `system.*` | info, version, events, prune |
+| `registry.*` | login, logout, search |
+| `buildx.*` | list, create, use, inspect, remove, build |
+| `context.*` | list, create, use, remove |
+| `raw <args...>` | any `docker <args...>` verbatim — the documented last resort |
+
+`raw` is for the long tail: swarm, service, stack, node, secret, config,
+manifest, trust, plugin, checkpoint, save/load/import/export, and any
+command or flag combination without an explicit method. Compose has
+`compose.raw` for the same reason.
 
 ### Status & Maintenance
 
 | Method | Parameters | Description |
 |--------|-----------|-------------|
-| `ps` | | List running containers |
-| `list.running` | | List running containers (alias for ps) |
-| `container.list` | | List all containers (running and stopped) |
+| `container.list.running` | | List running containers |
+| `container.list.all` | | List all containers (running and stopped) |
 | `image.list` | | List all images |
-| `status` | | Show Docker overview: images, containers, disk usage |
-| `lifecycle` | | Check health of containers, images, and compose services |
-| `disk` | | Show Docker disk usage details |
-| `prune` | optional container name | Remove a stopped container and its image, or prune all if no arg |
-| `prune.all` | | Full system prune including unused images and volumes |
+| `status.show` | | Show Docker overview: images, containers, disk usage |
+| `health.check` | | Check health of containers, images, and compose services |
+| `disk.show` | | Show Docker disk usage details |
+| `container.prune <container>` | container name | Remove a stopped container and its image |
+| `system.prune <?force:no>` | optional force | Full system prune including unused images and volumes |
 
 ## Workspace Naming Convention
 
