@@ -335,6 +335,13 @@ sources `line` — `config`, `os`, `state` — logs in colour too. Before that,
 `this` had already made unreachable; the level words appeared but their colour
 (and `BOLD_*`'s bold) was missing from those scripts' output.
 
+When `$CONFIG_PATH/setup.color.env` is not readable — the usual shape after
+`su <user>` without `-`, where the caller's exported `CONFIG_PATH` survives —
+`private.log.colors.ensure` reads this user's `$HOME/config/setup.color.env`
+instead. The anchor is moved only for that source (the file chains
+`$CONFIG_PATH/…`) and put back afterwards, so loading colour never re-points a
+caller's config.
+
 `line.init` derives `color.names.env` (`COLOR_` stripped) and
 `bold.color.names.env` (`BOLD_*`, with the bold attribute after the escape) from
 `color.env`, rewriting a file only when its text differs.

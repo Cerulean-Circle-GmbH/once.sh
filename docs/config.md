@@ -127,6 +127,15 @@ and `: ${CONFIG_PATH:=$HOME/config}` in `this.init`), `log`, `ossh.start`.
 Switching branches (`oo mode`) moves only what `~/oosh` points at; the variable
 never changes.
 
+**After `su <user>`** — without `-` — the new shell is not a login shell: `su`
+sets `HOME`/`USER`/`SHELL` but keeps the caller's exported environment, anchors
+included. The `.bashrc` therefore drops an `OOSH_DIR`/`CONFIG_PATH` that does not
+name **this** `HOME`, and `this` re-derives the constants (pinned by
+`test/test.user` T-USER-BASHRC-REANCHOR). A process that never reads `.bashrc`
+is still covered for colour: `log` falls back to `$HOME/config` when the
+inherited anchor has no readable `setup.color.env`
+(T-LOG-COLOURS-STALE-ANCHOR).
+
 **When you need the physical directory**, resolve it at that spot with the
 portable `private.this.path.canonical` — never bake the resolution into the anchor:
 
