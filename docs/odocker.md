@@ -619,7 +619,7 @@ Every remaining Docker command is reachable through an explicit namespace or
 | `image.*` | pull, push, tag, history, inspect, prune, build |
 | `network.*` | list, create, remove, inspect, connect, disconnect, prune |
 | `volume.*` | list, create, remove, inspect, prune |
-| `system.*` | info, version, events, prune, installed |
+| `system.*` | info, version, events, prune, installed, container.is |
 | `registry.*` | login, logout, search |
 | `buildx.*` | list, create, use, inspect, remove, build |
 | `context.*` | list, create, use, remove |
@@ -638,6 +638,14 @@ Installed checks are rc-only predicates:
 
 The individual docker and compose checks are private primitives used by
 `system.installed`; they are not separate public commands.
+
+`system.container.is <?root:/>` is the container-detection check:
+
+| Situation | Output | rc |
+|---|---|---|
+| inside Docker | `inside a container (docker)` | 0 |
+| inside Podman | `inside a container (podman)` | 0 |
+| outside a container | `not a container` | 1 |
 
 ### Status & Maintenance
 
