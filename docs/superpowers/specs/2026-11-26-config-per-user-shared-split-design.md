@@ -307,11 +307,276 @@ Existing tests to update:
 ## 11. Out of scope
 
 - Moving `user.session.env` / `oosh.session.env` out of `~/.config/oosh`.
+  The one-file variant that keeps them in `~/.config/oosh` is recorded in
+  §12; neither move is part of this change.
 - Per-user custom `<name>.env` files (a later `config save --user` flag).
 - Encrypting per-user config.
 - Removing shared files that the split no longer imports.
 
-## 12. Acceptance mapping
+## 12. Alternative considered: one session file
+
+The accepted layout keeps two per-user session files. This section records the
+one-file alternative, so a later review does not have to rediscover it.
+
+The `log.session.env` → per-user `log.env` change is orthogonal: it applies to
+both layouts and is not counted as one of the session files here.
+
+### 12.1 The two layouts
+
+**Current (accepted):**
+
+```text
+$HOME/.config/oosh/
+  user.session.env    real PATH  (+ OOSH_MODE as a transition copy until the oosh gate opens)
+  oosh.session.env    OOSH_MODE
+  log.session.env     LOG_NAME / LOG_DEVICE / LOG_LIVE   (until the log move)
+```
+
+Chains:
+
+```sh
+# user.env
+. $HOME/.config/oosh/user.session.env
+
+# oosh.env
+. $HOME/.config/oosh/oosh.session.env
+
+# log.env
+. $HOME/.config/oosh/log.session.env
+```
+
+**Option 1 (one file):**
+
+```text
+$HOME/.config/oosh/
+  session.env         OOSH_MODE + PATH
+  log.session.env     unchanged / orthogonal
+```
+
+One file:
+
+```sh
+export OOSH_MODE="dev"
+export PATH="/usr/local/bin:/usr/bin:/bin:..."
+```
+
+`PATH` stays absolute — no `$HOME`, no `:$PATH` — as
+`private.config.path.line.absolute.get` already writes it. `OOSH_MODE` is
+omitted when no branch is derivable.
+
+Chains:
+
+```sh
+# user.env
+. $HOME/.config/oosh/session.env
+
+# oosh.env — only if OOSH_MODE must be available early
+. $HOME/.config/oosh/session.env
+```
+
+### 12.2 Side-by-side
+
+| Area | Current | Option 1 | Effect |
+|---|---|---|---|
+| Files for PATH + branch | 2 | 1 | less state, one source of truth |
+| Writes per shell | 2 (`user.session.env`, `oosh.session.env`) | 1 | fewer writes, one mtime/mode |
+| Chain lines | 2 for these values (`user.env` → user, `oosh.env` → oosh) | 1, or 2 if sourced from both | simpler, but see OOSH_MODE timing |
+| `OOSH_MODE` availability | set as soon as shared `oosh.env` is sourced | later if chained only from `user.env`; same if chained from both | behavioural risk |
+| Transition copy of `OOSH_MODE` | yes — duplicated into `user.session.env` until the oosh gate opens | not needed | removes a whole state |
+| Split predicates | `private.config.session.split.is` + `private.config.oosh.session.split.is` | one | less code |
+| Split gates | `private.config.session.chain.ready` for user and oosh | one | less code, same all-users prerequisite |
+| Migrations | `private.config.user.session.migrate` + `private.config.oosh.session.migrate` | one fold/migrate | simpler, fewer failure paths |
+| `config.session.save` | writes two files, computes fallback mode, conditionally duplicates | writes one file | roughly half the function |
+| `private.config.session.file.ensure` | creates/validates 3 files | creates/validates 1 session file | simpler first-shell path |
+| `config.validate.required` | `OOSH_MODE` lives in `oosh.session.env` | `OOSH_MODE` lives in `session.env` | one mapping change, no duplicate |
+| `config list` | `user.session` and `oosh.session` are separate names | `session` holds both | loses family-specific naming |
+| Compatibility | existing names | old names break unless aliased | medium migration work |
+| Removes `~/.config/oosh` | no | no | only a partial simplification |
+| Test churn | baseline | session/gate/migration tests + docs | medium risk |
+
+### 12.3 Advantages of Option 1
+
+1. **One source of truth.** PATH and `OOSH_MODE` cannot disagree; a branch
+   change and a PATH update are one write.
+2. **One write, one mtime, one mode.** No “PATH written, branch file failed”
+   state.
+3. **Less code.**
+   - one `session.file.get` instead of two;
+   - one `session.split.is` instead of two;
+   - one `session.migrate` instead of two;
+   - one `sessionSplit` flag in `config.save` instead of `sessionSplit` +
+     `ooshSplit`;
+   - `private.config.session.file.ensure` checks one file instead of two.
+4. **No transition copy.** Today `OOSH_MODE` is temporarily written into both
+   `user.session.env` and `oosh.session.env`; `private.config.oosh.session.migrate`
+   then removes it from `user.session.env`. Option 1 deletes that concept.
+5. **One gate instead of two.** The gate still has to wait until every linked
+   user has the file, but there is only one “everyone has it” check.
+6. **Easier inspection and backup.** `config list session`, one file to copy,
+   one file to diff, one file to fix.
+7. **Consistent with the target log move.** After `log.session.env` becomes
+   `$CONFIG_PATH/log.env`, the only remaining per-user session state is PATH
+   plus branch, so one file matches the model.
+
+### 12.4 Disadvantages of Option 1
+
+1. **`OOSH_MODE` timing changes.** Today the shared `oosh.env` chains
+   `oosh.session.env`, so `OOSH_MODE` is set immediately after `oosh.env` is
+   sourced. If Option 1 chains `session.env` only from `user.env` (last), then:
+   - `odocker.env` or any custom chain sourced before `session.env` will not
+     see `OOSH_MODE`;
+   - anything that sources `oosh.env` alone will not see it.
+
+   Chaining the same file from both `oosh.env` and `user.env` avoids the timing
+   change, but sources the file twice. That is harmless for PATH (the stored
+   PATH is absolute) and for `OOSH_MODE` (same value), but it is conceptually
+   less clean and `config list oosh` and `config list user` both show the same
+   file.
+
+2. **The migration gate does not disappear.** The shared `user.env`/`oosh.env`
+   still cannot chain a per-user file until every linked user has it. Option 1
+   merges two gates into one, but still needs:
+   - `ensure` to create the file for every user;
+   - a gate before the shared chain line changes;
+   - a migration path for hosts where the old chain lines still exist.
+
+   That is less work than two gates, but not “no gate”.
+
+3. **Compatibility breaks.** These stop resolving unless aliases or symlinks
+   are kept:
+   - `~/.config/oosh/user.session.env`
+   - `~/.config/oosh/oosh.session.env`
+   - `config list user.session`
+   - `config add user.session`
+   - scripts, docs, backups and test fixtures that name the old files.
+
+   A compatibility symlink from the old names to `session.env` is easy, but
+   the directory then still has three names (one real file, two links).
+
+4. **`config` naming becomes ambiguous.**
+   - `config list session` works;
+   - `config list oosh.session` and `config list user.session` no longer work
+     unless aliased;
+   - `config save session` may write a **shared** `session.env` per the
+     save-target rules, not the per-user file;
+   - `config delete session` and `config edit session` need guards so they do
+     not destroy generated state.
+
+5. **Failure blast radius.** A failed `> session.env` truncates one file that
+   holds both PATH and branch. Today a failed `oosh.session.env` write does not
+   lose the PATH file. The one-file writer must use an atomic write
+   (`private.this.file.write`, temp file + move) or the change makes one
+   failure worse.
+
+6. **Empty `OOSH_MODE` is no longer represented the same way.** Today an empty
+   `oosh.session.env` is legal and means “no branch derivable”. A one-file
+   `session.env` always has a PATH line, so it is never empty; if `OOSH_MODE`
+   is omitted, a stale exported `OOSH_MODE` from the parent could survive
+   unless the file explicitly clears it. Decide whether to write
+   `export OOSH_MODE=""` or rely on `this`/`bashrc` resetting it.
+
+7. **Test churn is broad.** `test/test.config` currently pins:
+   - `T-CONFIG-USER-SESSION-SAVE`
+   - `T-CONFIG-USER-SESSION-SAVE-CARRIES-MODE`
+   - `T-CONFIG-SESSION-FILE-ENSURE`
+   - `T-CONFIG-SESSION-WRITES-ONCE`
+   - `T-CONFIG-USER-SESSION-MIGRATE`
+   - `T-CONFIG-OOSH-SESSION-MIGRATE`
+   - the open/closed gate cases
+   - `config list log.session` and the per-user tier
+
+   All of those need rewriting around one file. The log tests are separate, but
+   the session/gate tests are not.
+
+8. **It does not remove `~/.config/oosh`.** It still leaves a second per-user
+   directory. If the original goal was “one private root”, Option 1 is only a
+   partial step.
+
+### 12.5 Advantages of the current two-file model
+
+- `OOSH_MODE` is available immediately after `oosh.env`, without sourcing
+  anything twice.
+- PATH and branch fail independently; one bad write does not take both.
+- `config list oosh.session` and `config list user.session` name exactly what
+  the user is looking at.
+- The gates and migrations already exist and are tested, including the
+  transition copy of `OOSH_MODE`.
+- The log family stays separate without fighting the design.
+
+### 12.6 Disadvantages of the current model
+
+- Two files, two writes, two mtimes, two backup entries.
+- `OOSH_MODE` is temporarily duplicated in `user.session.env`, then removed by
+  `private.config.oosh.session.migrate`.
+- Two gates and two migrations, with a lot of explanatory comments.
+- `config.session.save` is more complex than the problem requires.
+- The directory holds more names than values.
+
+### 12.7 Verdict
+
+Option 1 is a real simplification, but not a cheap one. It removes the
+duplicate `OOSH_MODE` state, one writer, one gate and one migration. In
+exchange it:
+
+- changes `OOSH_MODE` availability unless the file is sourced twice;
+- breaks the old file names unless aliases are kept;
+- still requires a migration gate;
+- still leaves `~/.config/oosh` in place;
+- rewrites a meaningful part of `test/test.config`.
+
+Recommendation:
+
+- If the goal is “one file for PATH + `OOSH_MODE`” while keeping the current
+  migration model: take Option 1, chain it from both `oosh.env` and `user.env`,
+  use an atomic writer, and keep `user.session.env`/`oosh.session.env` as
+  compatibility symlinks for one release.
+- If the goal is to remove `~/.config/oosh` entirely: do not stop at Option 1.
+  Do the split first, then move to `$CONFIG_PATH/session.env` in a second
+  migration; that gives the final minimal tree, but until the split completes
+  `$CONFIG_PATH` still resolves through the shared `~/config` symlink, so the
+  shared chain cannot point at a per-user file yet (see §6).
+- If stability is the priority: keep the current two files and revisit after
+  the `~/config` split. Option 1 is a middle step that pays most of the
+  compatibility cost without removing the directory.
+
+### 12.8 If Option 1 is taken later
+
+Layout and chains are in §12.1. The implementation surface:
+
+- `config.session.save`: write one `$HOME/.config/oosh/session.env` instead of
+  the two files; read `OOSH_MODE` fallback from the new file, then the old
+  `oosh.session.env`, old `user.session.env`, then shared `oosh.env`; write
+  PATH and, when non-empty, `OOSH_MODE`; use an atomic writer.
+- `private.config.session.file.ensure`: create/verify one session file; the
+  log file is handled by the separate log change.
+- `private.config.required.file.path.get`: map `session.env`,
+  `user.session.env` and `oosh.session.env` to the one path during migration.
+- `private.config.required.variables.get`: move the `OOSH_MODE` row to
+  `session.env`.
+- `config.save`: one `sessionSplit`; append
+  `. $HOME/.config/oosh/session.env`; exclude `OOSH_MODE` from the shared files
+  on the same flag; remove the `ooshSplit` branch and
+  `private.config.oosh.session.migrate` call.
+- `config.add session` cannot be reused: it writes
+  `. $CONFIG_PATH/session.env`, which is the wrong tier. Write the chain
+  explicitly (as `oosh.env`/`log.env` do) and skip `session` in the generic
+  `chainNames` loop.
+- Remove `private.config.oosh.session.file.get`,
+  `private.config.oosh.session.split.is` and
+  `private.config.oosh.session.migrate`; fold
+  `private.config.user.session.migrate` into one `private.config.session.migrate`.
+- `private.config.session.split.is` and
+  `private.config.session.chain.ready` check the one file.
+- Migration: create `session.env` from the old `user.session.env` (PATH) and
+  `oosh.session.env` (`OOSH_MODE`), mode 0600; keep the two old names as
+  symlinks for one release so old chain lines keep resolving; append the new
+  chain line only when every linked user has the file; then drop the old
+  chain lines and symlinks.
+- Tests/docs: the `test/test.config` cases listed in §12.4, the
+  `config list log.session`/per-user-tier test, and the session-file paths in
+  `docs/config.md`.
+
+## 13. Acceptance mapping
 
 | Acceptance criterion | Where it is met |
 |---|---|
